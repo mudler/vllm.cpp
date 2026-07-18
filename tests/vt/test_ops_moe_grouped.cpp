@@ -7,6 +7,7 @@
 // (skips cleanly with no GPU); MoeSiluMul runs on CPU and CUDA.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
+#include "vt/cuda/moe_decode_ref.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -438,6 +440,101 @@ TEST_CASE("moe_grouped_gemm_nvfp4 validates shapes loudly (CPU dispatch)") {
       std::runtime_error);
 }
 
+// ---------------------------------------------------------------------------
+// BYTE-EXACT routing parity (35B decode lever L1): the parallel greedy top-k
+// (production, the registered CUDA moe_router_topk) must select the identical
+// experts with the identical weights bits as the original single-threaded
+// serial reference. Bit-exactness is guaranteed by construction (untouched
+// softmax + comparison-only argmax with the same lowest-index tie-break); this
+// test pins it on adversarial inputs — exact ties, near-ties, uneven loads, and
+// M in {1,8,16}, for f32 and bf16 logits (bf16 rounding manufactures ties).
+TEST_CASE("CUDA moe_router_topk parallel == serial byte-for-byte (adversarial)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+
+  auto run = [&](int64_t T, int64_t E, int k, bool renorm, DType dt,
+                 const std::vector<float>& logits) {
+    QueueGuard gq(gpu);
+    const int64_t P = T * k;
+    DeviceTensor w_par(gpu, gq.q, DType::kF32, {T, k});
+    DeviceTensor i_par(gpu, gq.q, DType::kI32, {T, k});
+    DeviceTensor w_ser(gpu, gq.q, DType::kF32, {T, k});
+    DeviceTensor i_ser(gpu, gq.q, DType::kI32, {T, k});
+    std::unique_ptr<DeviceTensor> dlog;
+    std::vector<uint16_t> bf;
+    if (dt == DType::kF32) {
+      dlog = std::make_unique<DeviceTensor>(gpu, gq.q, DType::kF32,
+                                            std::vector<int64_t>{T, E}, logits.data());
+    } else {
+      bf = ToBf16(logits);
+      dlog = std::make_unique<DeviceTensor>(gpu, gq.q, DType::kBF16,
+                                            std::vector<int64_t>{T, E}, bf.data());
+    }
+    const vt::MoeRouterTopKArgs args{k, renorm};
+    vt::MoeRouterTopK(gq.q, w_par.tensor(), i_par.tensor(), dlog->tensor(), args);
+    vt::cuda::MoeRouterTopKSerialCuda(gq.q, w_ser.tensor(), i_ser.tensor(), dlog->tensor(), args);
+    gpu.Synchronize(gq.q);
+    std::vector<float> hp(static_cast<size_t>(P)), hs(static_cast<size_t>(P));
+    std::vector<int32_t> ip(static_cast<size_t>(P)), is(static_cast<size_t>(P));
+    w_par.Download(gq.q, hp.data());
+    w_ser.Download(gq.q, hs.data());
+    i_par.Download(gq.q, ip.data());
+    i_ser.Download(gq.q, is.data());
+    size_t wdiff = 0, idiff = 0;
+    for (int64_t x = 0; x < P; ++x) {
+      if (std::memcmp(&hp[static_cast<size_t>(x)], &hs[static_cast<size_t>(x)], sizeof(float)) != 0)
+        ++wdiff;  // strict bitwise weight equality
+      if (ip[static_cast<size_t>(x)] != is[static_cast<size_t>(x)]) ++idiff;
+    }
+    CAPTURE(T);
+    CAPTURE(E);
+    CAPTURE(k);
+    CAPTURE(renorm);
+    CAPTURE(static_cast<int>(dt));
+    CHECK(wdiff == 0);
+    CHECK(idiff == 0);
+  };
+
+  for (DType dt : {DType::kF32, DType::kBF16}) {
+    for (bool renorm : {true, false}) {
+      for (int64_t T : {int64_t{1}, int64_t{8}, int64_t{16}}) {
+        // 35B routing shape: E=128, top-8. Random distinct logits.
+        {
+          const int64_t E = 128;
+          std::vector<float> lg(static_cast<size_t>(T * E));
+          std::mt19937 rng(1234u + static_cast<uint32_t>(T));
+          std::uniform_real_distribution<float> d(-4.0f, 4.0f);
+          for (auto& v : lg) v = d(rng);
+          run(T, E, 8, renorm, dt, lg);
+        }
+        // Exact-tie storm: blocks of identical logits so many experts tie at
+        // the max; the tie-break (lowest index) must agree across paths.
+        {
+          const int64_t E = 128;
+          std::vector<float> lg(static_cast<size_t>(T * E));
+          for (int64_t t = 0; t < T; ++t)
+            for (int64_t e = 0; e < E; ++e)
+              lg[static_cast<size_t>(t * E + e)] = static_cast<float>((e / 4) % 5);  // 5 tie groups
+          run(T, E, 8, renorm, dt, lg);
+        }
+        // Uneven load + near-ties around the top-k boundary (E=256, top-8).
+        {
+          const int64_t E = 256;
+          std::vector<float> lg(static_cast<size_t>(T * E));
+          for (int64_t t = 0; t < T; ++t)
+            for (int64_t e = 0; e < E; ++e)
+              lg[static_cast<size_t>(t * E + e)] =
+                  (e < 12 ? 3.0f : 0.0f) + 1e-4f * static_cast<float>((e * 7 + t) % 3);
+          run(T, E, 8, renorm, dt, lg);
+        }
+      }
+    }
+  }
+}
+
 #ifdef VT_MARLIN_NVFP4
 #include "vt/cuda/marlin_repack.h"
 
@@ -623,5 +720,137 @@ TEST_CASE("CUDA marlin fused w13 (size_n=2N) is bit-exact vs split gate/up GEMMs
   CHECK(gate_diff == 0);
   CHECK(up_diff == 0);
   CHECK(act_diff == 0);
+}
+
+// ---------------------------------------------------------------------------
+// BYTE-EXACT align parity (35B decode lever L1): the parallel moe_align
+// (production) must produce the identical expert_ids, num_tokens_post_pad, and
+// per-expert padded-region token multiset as the original single-block serial
+// reference. Within-expert token ORDER is unspecified in BOTH paths (the serial
+// scatter already races a 256-thread atomicAdd; Marlin gathers each sorted row
+// independently), so sorted_ids is compared as a per-expert multiset, not
+// position-for-position. Adversarial inputs: empty experts, one hot expert,
+// uneven loads, ties on block boundaries, and M in {1,8,16}.
+TEST_CASE("CUDA moe_align parallel == serial (expert_ids/num_pad exact, per-expert multiset)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+
+  // Group a kernel's sorted_ids into expert -> sorted token-id list, using its
+  // expert_ids block map. Non-sentinel entries only (sentinel == numel).
+  auto group_by_expert = [](const std::vector<int32_t>& sorted, const std::vector<int32_t>& eids,
+                            int block, int numel, int num_experts) {
+    std::vector<std::vector<int32_t>> per(static_cast<size_t>(num_experts));
+    for (size_t b = 0; b < eids.size(); ++b) {
+      const int e = eids[b];
+      if (e < 0 || e >= num_experts) continue;
+      for (int i = 0; i < block; ++i) {
+        const size_t pos = b * static_cast<size_t>(block) + static_cast<size_t>(i);
+        if (pos >= sorted.size()) break;
+        const int32_t v = sorted[pos];
+        if (v != numel) per[static_cast<size_t>(e)].push_back(v);
+      }
+    }
+    for (auto& v : per) std::sort(v.begin(), v.end());
+    return per;
+  };
+
+  auto run = [&](int64_t T, int E, int top_k, const std::vector<int32_t>& topk_ids) {
+    QueueGuard gq(gpu);
+    void* stream = gq.q.handle;
+    const int block = vt::cuda::MarlinMoeAlignBlockSizeSelect(static_cast<int>(T), top_k, E);
+    int max_tok = 0, max_blk = 0;
+    vt::cuda::MarlinMoeAlignSizes(static_cast<int>(T), top_k, E, block, &max_tok, &max_blk);
+    const int numel = static_cast<int>(T) * top_k;
+
+    DeviceTensor dtid(gpu, gq.q, DType::kI32, {T, top_k}, topk_ids.data());
+    DeviceTensor s_par(gpu, gq.q, DType::kI32, {max_tok});
+    DeviceTensor e_par(gpu, gq.q, DType::kI32, {max_blk});
+    DeviceTensor n_par(gpu, gq.q, DType::kI32, {1});
+    DeviceTensor s_ser(gpu, gq.q, DType::kI32, {max_tok});
+    DeviceTensor e_ser(gpu, gq.q, DType::kI32, {max_blk});
+    DeviceTensor n_ser(gpu, gq.q, DType::kI32, {1});
+
+    vt::cuda::MarlinMoeAlignBlockSize(stream, static_cast<const int32_t*>(dtid.ptr()),
+                                      static_cast<int>(T), top_k, E, block,
+                                      static_cast<int32_t*>(s_par.ptr()),
+                                      static_cast<int32_t*>(e_par.ptr()),
+                                      static_cast<int32_t*>(n_par.ptr()));
+    vt::cuda::MarlinMoeAlignBlockSizeSerial(stream, static_cast<const int32_t*>(dtid.ptr()),
+                                            static_cast<int>(T), top_k, E, block,
+                                            static_cast<int32_t*>(s_ser.ptr()),
+                                            static_cast<int32_t*>(e_ser.ptr()),
+                                            static_cast<int32_t*>(n_ser.ptr()));
+    gpu.Synchronize(gq.q);
+
+    std::vector<int32_t> hsp(static_cast<size_t>(max_tok)), hss(static_cast<size_t>(max_tok));
+    std::vector<int32_t> hep(static_cast<size_t>(max_blk)), hes(static_cast<size_t>(max_blk));
+    std::vector<int32_t> hnp(1), hns(1);
+    s_par.Download(gq.q, hsp.data());
+    s_ser.Download(gq.q, hss.data());
+    e_par.Download(gq.q, hep.data());
+    e_ser.Download(gq.q, hes.data());
+    n_par.Download(gq.q, hnp.data());
+    n_ser.Download(gq.q, hns.data());
+
+    CAPTURE(T);
+    CAPTURE(E);
+    CAPTURE(top_k);
+    CAPTURE(block);
+    // expert_ids and num_tokens_post_pad are deterministic integer work: exact.
+    CHECK(hnp[0] == hns[0]);
+    size_t ediff = 0;
+    for (int b = 0; b < max_blk; ++b)
+      if (hep[static_cast<size_t>(b)] != hes[static_cast<size_t>(b)]) ++ediff;
+    CHECK(ediff == 0);
+    // Padding sentinel count must match (total slots - real tokens is fixed).
+    const size_t pad_par = static_cast<size_t>(std::count(hsp.begin(), hsp.end(), numel));
+    const size_t pad_ser = static_cast<size_t>(std::count(hss.begin(), hss.end(), numel));
+    CHECK(pad_par == pad_ser);
+    // Per-expert token multiset identical (order within an expert is free).
+    const auto gp = group_by_expert(hsp, hep, block, numel, E);
+    const auto gs = group_by_expert(hss, hes, block, numel, E);
+    bool multiset_equal = (gp == gs);
+    CHECK(multiset_equal);
+    // Self-consistency: every real token landed in ITS expert's region.
+    size_t misrouted = 0;
+    for (int e = 0; e < E; ++e)
+      for (int32_t p : gp[static_cast<size_t>(e)])
+        if (topk_ids[static_cast<size_t>(p)] != e) ++misrouted;
+    CHECK(misrouted == 0);
+  };
+
+  const int E = 128;
+  const int top_k = 8;
+  for (int64_t T : {int64_t{1}, int64_t{8}, int64_t{16}}) {
+    const int numel = static_cast<int>(T) * top_k;
+    // (a) strided spread over experts.
+    {
+      std::vector<int32_t> ids(static_cast<size_t>(numel));
+      for (int p = 0; p < numel; ++p) ids[static_cast<size_t>(p)] = (p * 5 + 3) % E;
+      run(T, E, top_k, ids);
+    }
+    // (b) one hot expert (all tokens -> expert 3): maximally uneven load.
+    {
+      std::vector<int32_t> ids(static_cast<size_t>(numel), 3);
+      run(T, E, top_k, ids);
+    }
+    // (c) two experts only, boundary-aligned counts to exercise block padding.
+    {
+      std::vector<int32_t> ids(static_cast<size_t>(numel));
+      for (int p = 0; p < numel; ++p) ids[static_cast<size_t>(p)] = (p % 2) ? 7 : 42;
+      run(T, E, top_k, ids);
+    }
+    // (d) pseudo-random loads (some experts empty, some heavy).
+    {
+      std::vector<int32_t> ids(static_cast<size_t>(numel));
+      std::mt19937 rng(77u + static_cast<uint32_t>(T));
+      std::uniform_int_distribution<int> d(0, E - 1);
+      for (auto& v : ids) v = d(rng);
+      run(T, E, top_k, ids);
+    }
+  }
 }
 #endif  // VT_MARLIN_NVFP4

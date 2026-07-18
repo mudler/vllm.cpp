@@ -946,6 +946,28 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   latency / memory scoreboard. Verified by `test_ops_glue` (`cast_f32` RED→GREEN)
   and the full CPU CTest suite.
 
+- **M=1 decode MoE routing/align parallelization (2026-07-18,
+  `CLAIM-MOE-DECODE-PARALLEL-1`).** The two MoE decode kernels that at M=1 (c1)
+  launched a single block and ran serially — MoeAlign (29.3 µs vs vLLM 3.6 µs,
+  8.2×) and MoeRouterTopK (20.2 µs vs vLLM 6.7 µs, 3.0×), together ~1.7 ms/tok ≈
+  63% of the grounded 2.7 ms 35B c1 TPOT gap — are parallelized (router →
+  per-thread argmax + tree reduction; align → one-thread-per-expert
+  `cub::BlockScan` prefix sum), mirroring vLLM `topk_softmax_kernels.cu` /
+  `moe_align_sum_kernels.cu`, plus L3 block_size_m 16→8 at low M and L4 removal of
+  4 redundant Marlin workspace memsets. **BYTE-EXACT** to the retained serial
+  reference (router 72/72 + align 60/60 parity), **27B 235/235 + 35B 315/315
+  token-exact**, memcheck-clean 35B decode; efficiency-only ⇒ shipped ON by
+  default. Per-kernel nsys same-box A/B (c1/M=1, `--cuda-graph-trace=node`,
+  baseline = serial-kernel build a7d08d7 on-box): **MoeAlign 29.5 µs → 3.0 µs
+  (9.8×, now below vLLM's 3.6 µs); MoeRouterTopK 20.2 µs → 12.3 µs (1.64×,** vs
+  vLLM's 6.7 µs — byte-exactness ties the softmax reduction to our tree order,
+  so vLLM's register-fused `topkGating` is off-limits). Combined excess vs vLLM
+  39.2 µs → 5.0 µs per invocation (~87% eliminated). memcheck 35B graph decode
+  0 errors. The in-situ c1/c8 TPOT recovery is `benchmark_binding=false` here —
+  the 35B v0.25.0 performance grid re-measures it (the ~1.7 ms/tok c1 target; no
+  regression at c16/c32, where the serial cost already amortized). Evidence
+  `dgx:~/work/vllm.cpp-moe-decode-par`.
+
 ## Benchmark policy
 
 - Correctness is a precondition and cannot be traded for speed.

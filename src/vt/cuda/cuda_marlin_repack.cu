@@ -18,6 +18,8 @@
 //
 // Gated by VT_MARLIN_NVFP4 (built only on sm_12xa with the vendored slice).
 
+#include <cub/cub.cuh>
+
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
@@ -200,20 +202,33 @@ float MarlinNvfp4ProcessGlobalScale(float scale2, float combined_sf) {
 }
 
 namespace {
+// Block width for the parallel align path: one thread per expert drives the
+// cub prefix scan, so it must exceed num_experts (35B: 128; padded_num_experts
+// < 1024 like vLLM). Mirrors moe_align_sum_kernels.cu:593 `threads = 1024`.
+constexpr int kAlignThreads = 1024;
+
 // Torch-free moe_align_block_size (mirror of csrc/moe/moe_align_sum_kernels.cu
 // semantics; the ordering within an expert is irrelevant to Marlin since each
 // sorted row is gathered independently and padding rows are masked). Single
-// block; dynamic shared holds counts[E], block-start[E], fill-counter[E]. Fills
+// block; dynamic shared holds counts[E] plus the per-path scratch. Fills
 // sorted_ids with the pair-flat index (t*top_k+k), padding-slots = numel.
+//
+// `Serial` = the original single-threaded prefix scan, kept as the byte-exact
+// parity reference. The default `Serial=false` path parallelizes the prefix sum
+// (one thread per expert + cub::BlockScan exclusive sum) and the expert_ids
+// fill, mirroring vLLM's _moe_align_block_size (:147-185) + count_and_sort
+// (:295-324). The scan/expert_ids/num_tokens_post_pad are pure integer work, so
+// they are byte-identical to the serial scan; within-expert token order is
+// unspecified in BOTH (the serial path already scatters via a 256-thread
+// atomicAdd race — Marlin gathers each sorted row independently).
+template <bool Serial>
 __global__ void MoeAlignKernel(const int32_t* __restrict__ topk_ids, int numel, int top_k,
                                int num_experts, int block_size, int32_t* __restrict__ sorted_ids,
                                int32_t* __restrict__ expert_ids,
                                int32_t* __restrict__ num_tokens_post_pad,
                                int max_num_tokens_padded, int max_num_blocks) {
   extern __shared__ int sh_align[];
-  int* counts = sh_align;                    // [E]
-  int* bstart = sh_align + num_experts;      // [E]
-  int* fillc = sh_align + 2 * num_experts;   // [E]
+  int* counts = sh_align;  // [E]
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
 
@@ -228,24 +243,62 @@ __global__ void MoeAlignKernel(const int32_t* __restrict__ topk_ids, int numel, 
   }
   __syncthreads();
 
-  if (tid == 0) {
-    int off = 0, blk = 0;
-    for (int e = 0; e < num_experts; ++e) {
-      bstart[e] = off;
-      fillc[e] = off;
-      int nb = (counts[e] + block_size - 1) / block_size;
-      for (int b = 0; b < nb; ++b) expert_ids[blk++] = e;
-      off += nb * block_size;
+  if constexpr (Serial) {
+    int* bstart = sh_align + num_experts;     // [E]
+    int* fillc = sh_align + 2 * num_experts;  // [E]
+    if (tid == 0) {
+      int off = 0, blk = 0;
+      for (int e = 0; e < num_experts; ++e) {
+        bstart[e] = off;
+        fillc[e] = off;
+        int nb = (counts[e] + block_size - 1) / block_size;
+        for (int b = 0; b < nb; ++b) expert_ids[blk++] = e;
+        off += nb * block_size;
+      }
+      num_tokens_post_pad[0] = off;
     }
-    num_tokens_post_pad[0] = off;
-  }
-  __syncthreads();
+    __syncthreads();
 
-  for (int p = tid; p < numel; p += nthreads) {
-    int e = topk_ids[p];
-    if (e >= 0 && e < num_experts) {
-      int pos = atomicAdd(&fillc[e], 1);
-      sorted_ids[pos] = p;
+    for (int p = tid; p < numel; p += nthreads) {
+      int e = topk_ids[p];
+      if (e >= 0 && e < num_experts) {
+        int pos = atomicAdd(&fillc[e], 1);
+        sorted_ids[pos] = p;
+      }
+    }
+  } else {
+    // Parallel exclusive prefix sum over padded per-expert counts (one thread
+    // per expert), mirror moe_align_sum_kernels.cu:147-168. cumsum[E+1] holds
+    // the per-expert base offsets; cumsum[E] is num_tokens_post_pad.
+    int* cumsum = sh_align + num_experts;  // [E + 1]
+    using BlockScan = cub::BlockScan<int, kAlignThreads>;
+    __shared__ typename BlockScan::TempStorage tmp;
+    int padded = 0;
+    if (tid < num_experts) padded = ((counts[tid] + block_size - 1) / block_size) * block_size;
+    int base = 0;
+    BlockScan(tmp).ExclusiveSum(padded, base);
+    if (tid <= num_experts) cumsum[tid] = base;
+    if (tid == num_experts) num_tokens_post_pad[0] = base;
+    __syncthreads();
+
+    // expert_ids: each expert writes its own block range (:172-177). cumsum is
+    // a multiple of block_size, so i / block_size is exact and consecutive —
+    // byte-identical to the serial `blk++` assignment.
+    if (tid < num_experts) {
+      for (int i = cumsum[tid]; i < cumsum[tid + 1]; i += block_size)
+        expert_ids[i / block_size] = tid;
+    }
+
+    // Scatter tokens with an atomicAdd cursor seeded at each expert's base
+    // (:295-324 count_and_sort). Reuse counts[] as the mutable cursor.
+    if (tid < num_experts) counts[tid] = cumsum[tid];
+    __syncthreads();
+    for (int p = tid; p < numel; p += nthreads) {
+      int e = topk_ids[p];
+      if (e >= 0 && e < num_experts) {
+        int pos = atomicAdd(&counts[e], 1);
+        sorted_ids[pos] = p;
+      }
     }
   }
 }
@@ -258,14 +311,16 @@ int MarlinDeviceSms(int device) {
 }
 
 int MarlinMoeAlignBlockSizeSelect(int num_tokens, int top_k, int num_experts) {
-  // vLLM marlin_moe.py block_size_m selection (bf16 path), clamped to >=16 to
-  // stay off the m_block_size_8 special kernel.
+  // vLLM marlin_moe.py block_size_m selection (bf16 path, marlin_moe.py:317-322
+  // @ e24d1b24). The m_block_size_8 kernels are compiled (kernel_selector.h) and
+  // the fp32-reduce C_tmp doubling is handled at cuda_moe_marlin.cu:144, so at
+  // low M we take block_size_m=8 exactly like vLLM (no >=16 clamp).
   int bs = 8;
   for (int cand : {8, 16, 32, 48, 64}) {
     bs = cand;
     if (static_cast<double>(num_tokens) * top_k / num_experts / cand < 0.9) break;
   }
-  return bs < 16 ? 16 : bs;
+  return bs;
 }
 
 void MarlinMoeAlignSizes(int num_tokens, int top_k, int num_experts, int block_size,
@@ -287,10 +342,29 @@ void MarlinMoeAlignBlockSize(void* stream, const int32_t* topk_ids, int num_toke
   int max_tok = 0, max_blk = 0;
   MarlinMoeAlignSizes(num_tokens, top_k, num_experts, block_size, &max_tok, &max_blk);
   const int numel = num_tokens * top_k;
+  // counts[E] + cumsum[E+1] < 3*E ints; keep the historical 3*E allocation.
   const size_t shmem = static_cast<size_t>(3) * num_experts * sizeof(int);
-  MoeAlignKernel<<<1, 256, shmem, s>>>(topk_ids, numel, top_k, num_experts, block_size, sorted_ids,
-                                       expert_ids, num_tokens_post_pad, max_tok, max_blk);
+  MoeAlignKernel<false><<<1, kAlignThreads, shmem, s>>>(topk_ids, numel, top_k, num_experts,
+                                                        block_size, sorted_ids, expert_ids,
+                                                        num_tokens_post_pad, max_tok, max_blk);
   RCheck(cudaGetLastError(), "moe_align launch");
+}
+
+// Test-only reference: the original single-block serial prefix scan. Used by the
+// byte-exact align parity test to prove the parallel path produces identical
+// expert_ids / num_tokens_post_pad / padding and per-expert token multisets.
+void MarlinMoeAlignBlockSizeSerial(void* stream, const int32_t* topk_ids, int num_tokens,
+                                   int top_k, int num_experts, int block_size, int32_t* sorted_ids,
+                                   int32_t* expert_ids, int32_t* num_tokens_post_pad) {
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  int max_tok = 0, max_blk = 0;
+  MarlinMoeAlignSizes(num_tokens, top_k, num_experts, block_size, &max_tok, &max_blk);
+  const int numel = num_tokens * top_k;
+  const size_t shmem = static_cast<size_t>(3) * num_experts * sizeof(int);
+  MoeAlignKernel<true><<<1, 256, shmem, s>>>(topk_ids, numel, top_k, num_experts, block_size,
+                                             sorted_ids, expert_ids, num_tokens_post_pad, max_tok,
+                                             max_blk);
+  RCheck(cudaGetLastError(), "moe_align serial launch");
 }
 
 }  // namespace vt::cuda

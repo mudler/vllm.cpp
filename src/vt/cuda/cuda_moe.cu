@@ -42,15 +42,23 @@ __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) {
 
 // ---------------------------------------------------------------------------
 // moe_router_topk (moe-semantics.md §3): one BLOCK per token. The softmax is a
-// block reduction (max-subtracted, f32, over all E experts); the greedy top-k
-// runs SINGLE-THREADED so the lowest-index tie-break matches the CPU reference
-// (cpu_ops.cpp MoeRouterTopKKernel) bit-for-bit — k linear scans over E masking
-// the winner each round (k <= 8, E <= 256: correctness-grade, cheap). The probs
-// live in dynamic shared memory [E]; `red[kBlock]` is the reduction scratch.
-// Upstream counterpart: layers/fused_moe/ (topk_softmax_kernels.cu topkGating /
-// moeSoftmax+moeTopK) — M2.2 replaces this correctness-grade path.
+// block reduction (max-subtracted, f32, over all E experts). The greedy top-k
+// is PARALLEL across the block (the default path), mirroring vLLM's
+// topk_softmax_kernels.cu moeTopK/topkGating argmax reduction
+// (csrc/libtorch_stable/moe/topk_softmax_kernels.cu:192-242, :494-537 @ vLLM
+// e24d1b24 — "We want lower indices to win in every thread so we break ties
+// this way"): each thread does a local strict-`>` argmax over its strided
+// experts, then a shared-memory tree reduction resolves the block argmax with
+// the identical lowest-index tie-break. The `Serial` template path keeps the
+// original single-threaded greedy scan as the byte-exact parity reference; the
+// two paths are byte-identical BY CONSTRUCTION — the softmax is untouched (so
+// sp[] is bit-identical), the argmax is comparison-only over those same values
+// with the same tie-break, and thread 0 accumulates the renorm denom in the
+// same k order. Probs live in dynamic shared memory [E]; `red[kBlock]` /
+// `redi[kBlock]` are the reduction scratch. lowest-index tie-break matches the
+// CPU reference (cpu_ops.cpp MoeRouterTopKKernel) bit-for-bit.
 
-template <typename Tin>
+template <typename Tin, bool Serial>
 __global__ void MoeRouterTopKKernel(float* weights, int32_t* indices, const Tin* logits,
                                     int64_t e, int k, bool renormalize) {
   const int64_t row = blockIdx.x;
@@ -94,26 +102,78 @@ __global__ void MoeRouterTopKKernel(float* weights, int32_t* indices, const Tin*
   }
   __syncthreads();
 
-  // Greedy argmax, k rounds, single-threaded. Strict `>` over ascending idx ->
-  // lowest expert index wins ties (matches cpu_ops.cpp exactly). Probs are
-  // finite >= 0; masking a winner with -INFINITY excludes it from later rounds.
-  if (threadIdx.x == 0) {
-    float denom = 0.0f;
+  if constexpr (Serial) {
+    // Reference path (retained for the byte-exact parity test): single-threaded
+    // greedy argmax, strict `>` over ascending idx -> lowest expert index wins
+    // ties. Probs are finite >= 0; masking a winner with -INFINITY excludes it.
+    if (threadIdx.x == 0) {
+      float denom = 0.0f;
+      for (int j = 0; j < k; ++j) {
+        int64_t best = -1;
+        float best_v = -INFINITY;
+        for (int64_t idx = 0; idx < e; ++idx) {
+          if (sp[idx] > best_v) {
+            best_v = sp[idx];
+            best = idx;
+          }
+        }
+        sp[best] = -INFINITY;  // exclude from subsequent rounds
+        weights[row * k + j] = best_v;
+        indices[row * k + j] = static_cast<int32_t>(best);
+        denom += best_v;
+      }
+      if (renormalize) {
+        if (!(denom > 0.0f)) denom = 1.0f;  // denom<=0 -> 1 guard (.cu:245-253)
+        for (int j = 0; j < k; ++j) weights[row * k + j] /= denom;
+      }
+    }
+  } else {
+    // Parallel greedy top-k (default). Each round: every thread computes a
+    // local argmax over its strided experts (ascending idx + strict `>` -> the
+    // lowest index at the subset max, matching the serial ascending scan), then
+    // a tree reduction resolves the block argmax with the same lower-index
+    // tie-break. Only thread 0 mutates sp[]/writes results and accumulates the
+    // renorm denom in k order, so the output is byte-identical to `Serial`.
+    __shared__ int redi[kBlock];
+    float denom = 0.0f;  // meaningful on thread 0 only
     for (int j = 0; j < k; ++j) {
-      int64_t best = -1;
-      float best_v = -INFINITY;
-      for (int64_t idx = 0; idx < e; ++idx) {
-        if (sp[idx] > best_v) {
-          best_v = sp[idx];
-          best = idx;
+      float lv = -INFINITY;
+      int li = -1;
+      for (int64_t idx = threadIdx.x; idx < e; idx += blockDim.x) {
+        const float v = sp[idx];
+        if (v > lv) {  // strict `>`, ascending stride -> lowest index at max
+          lv = v;
+          li = static_cast<int>(idx);
         }
       }
-      sp[best] = -INFINITY;  // exclude from subsequent rounds
-      weights[row * k + j] = best_v;
-      indices[row * k + j] = static_cast<int32_t>(best);
-      denom += best_v;
+      red[threadIdx.x] = lv;
+      redi[threadIdx.x] = li;
+      __syncthreads();
+      for (int s = kBlock / 2; s > 0; s /= 2) {
+        if (static_cast<int>(threadIdx.x) < s) {
+          const float ov = red[threadIdx.x + s];
+          const int oi = redi[threadIdx.x + s];
+          const float cv = red[threadIdx.x];
+          const int ci = redi[threadIdx.x];
+          // Higher value wins; on an exact tie the lower expert index wins.
+          if (ov > cv || (ov == cv && oi >= 0 && (ci < 0 || oi < ci))) {
+            red[threadIdx.x] = ov;
+            redi[threadIdx.x] = oi;
+          }
+        }
+        __syncthreads();
+      }
+      const float best_v = red[0];
+      const int best = redi[0];
+      if (threadIdx.x == 0) {
+        if (best >= 0) sp[best] = -INFINITY;  // exclude from subsequent rounds
+        weights[row * k + j] = best_v;
+        indices[row * k + j] = static_cast<int32_t>(best);
+        denom += best_v;
+      }
+      __syncthreads();  // sp[best]=-INF visible + red/redi reusable next round
     }
-    if (renormalize) {
+    if (threadIdx.x == 0 && renormalize) {
       if (!(denom > 0.0f)) denom = 1.0f;  // denom<=0 -> 1 guard (.cu:245-253)
       for (int j = 0; j < k; ++j) weights[row * k + j] /= denom;
     }
@@ -122,25 +182,36 @@ __global__ void MoeRouterTopKKernel(float* weights, int32_t* indices, const Tin*
 
 template <typename Tin>
 void LaunchRouter(cudaStream_t s, Tensor& weights, Tensor& indices, const Tensor& logits,
-                  int64_t t, int64_t e, int k, bool renorm) {
+                  int64_t t, int64_t e, int k, bool renorm, bool serial) {
   const size_t shmem = static_cast<size_t>(e) * sizeof(float);
-  MoeRouterTopKKernel<Tin><<<static_cast<unsigned>(t), kBlock, shmem, s>>>(
-      weights.Ptr<float>(), indices.Ptr<int32_t>(), logits.Ptr<Tin>(), e, k, renorm);
+  if (serial) {
+    MoeRouterTopKKernel<Tin, true><<<static_cast<unsigned>(t), kBlock, shmem, s>>>(
+        weights.Ptr<float>(), indices.Ptr<int32_t>(), logits.Ptr<Tin>(), e, k, renorm);
+  } else {
+    MoeRouterTopKKernel<Tin, false><<<static_cast<unsigned>(t), kBlock, shmem, s>>>(
+        weights.Ptr<float>(), indices.Ptr<int32_t>(), logits.Ptr<Tin>(), e, k, renorm);
+  }
   Check(cudaGetLastError(), "moe_router_topk launch");
 }
 
-void MoeRouterTopKKernelCuda(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
-                             const MoeRouterTopKArgs& args) {
+void RouterDispatch(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
+                    const MoeRouterTopKArgs& args, bool serial) {
   VT_CHECK(logits.dtype == DType::kF32 || logits.dtype == DType::kBF16,
            "cuda moe_router_topk: unsupported logits dtype (f32/bf16 only)");
   const int64_t t = logits.shape[0], e = logits.shape[1];
   if (t == 0 || e == 0) return;
   cudaStream_t s = AsStream(q);
   if (logits.dtype == DType::kF32) {
-    LaunchRouter<float>(s, weights, indices, logits, t, e, args.top_k, args.renormalize);
+    LaunchRouter<float>(s, weights, indices, logits, t, e, args.top_k, args.renormalize, serial);
   } else {
-    LaunchRouter<__nv_bfloat16>(s, weights, indices, logits, t, e, args.top_k, args.renormalize);
+    LaunchRouter<__nv_bfloat16>(s, weights, indices, logits, t, e, args.top_k, args.renormalize,
+                                serial);
   }
+}
+
+void MoeRouterTopKKernelCuda(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
+                             const MoeRouterTopKArgs& args) {
+  RouterDispatch(q, weights, indices, logits, args, /*serial=*/false);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,4 +431,13 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// Test-only reference (external linkage): launches the original single-threaded
+// greedy top-k so the byte-exact routing parity test can prove the parallel
+// production path is byte-identical. Declared in include/vt/cuda/moe_decode_ref.h.
+void MoeRouterTopKSerialCuda(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
+                             const MoeRouterTopKArgs& args) {
+  RouterDispatch(q, weights, indices, logits, args, /*serial=*/true);
+}
+
 }  // namespace vt::cuda

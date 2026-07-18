@@ -45,4 +45,11 @@ void MarlinMoeAlignBlockSize(void* stream, const int32_t* topk_ids, int num_toke
                              int num_experts, int block_size, int32_t* sorted_ids,
                              int32_t* expert_ids, int32_t* num_tokens_post_pad);
 
+// TEST-ONLY: the original single-block serial-scan align reference, kept so the
+// byte-exact parity test can assert the parallel default matches it. Same
+// outputs and sizing as MarlinMoeAlignBlockSize. Not on any production path.
+void MarlinMoeAlignBlockSizeSerial(void* stream, const int32_t* topk_ids, int num_tokens,
+                                   int top_k, int num_experts, int block_size, int32_t* sorted_ids,
+                                   int32_t* expert_ids, int32_t* num_tokens_post_pad);
+
 }  // namespace vt::cuda

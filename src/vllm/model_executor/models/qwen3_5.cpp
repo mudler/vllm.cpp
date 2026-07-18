@@ -3847,7 +3847,10 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
     Tensor sgu = MakeTensor(mr.s_gu, DType::kI8, d.q.device, {E, H / 16, 2 * I});
     Tensor ggu = MakeTensor(mr.g_gu, DType::kF32, d.q.device, {E});
     DBuf dgu(d, DType::kBF16, {P, 2 * I});
-    d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
+    // No workspace memset: Marlin self-resets its reduction locks to 0 at
+    // completion (marlin_template.h:200-205 barrier_release reset=true) and the
+    // buffer is zeroed once at build (BuildMoeMarlinResident), so it re-enters
+    // every GEMM all-zero. memcheck-verified redundant (L4).
     vt::MoeGroupedGemmNvfp4Marlin(d.q, dgu.t(), dh, wgu, sgu, ggu, ws, sorted_ids.t(),
                                   expert_ids.t(), num_pad.t(), dtw.t(),
                                   vt::MoeMarlinArgs{bi, tki, Ti, 2 * Ii, Hi, false});
@@ -3864,11 +3867,11 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
     Tensor gu = MakeTensor(mr.g_up, DType::kF32, d.q.device, {E});
     DBuf dgate(d, DType::kBF16, {P, I});
     DBuf dup_out(d, DType::kBF16, {P, I});
-    d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
+    // No workspace memset (L4): Marlin self-resets locks + build-time zero-init
+    // leave the buffer all-zero at every GEMM entry (see fused branch above).
     vt::MoeGroupedGemmNvfp4Marlin(d.q, dgate.t(), dh, wg, sg, gg, ws, sorted_ids.t(),
                                   expert_ids.t(), num_pad.t(), dtw.t(),
                                   vt::MoeMarlinArgs{bi, tki, Ti, Ii, Hi, false});
-    d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
     vt::MoeGroupedGemmNvfp4Marlin(d.q, dup_out.t(), dh, wu, su, gu, ws, sorted_ids.t(),
                                   expert_ids.t(), num_pad.t(), dtw.t(),
                                   vt::MoeMarlinArgs{bi, tki, Ti, Ii, Hi, false});
@@ -3876,7 +3879,8 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
   }
 
   DBuf ddown(d, DType::kBF16, {P, H});
-  d.b.Memset(d.q, mr.workspace, 0, static_cast<size_t>(mr.sms) * 4 * sizeof(int32_t));
+  // No workspace memset (L4): see the fused/split branches above — Marlin
+  // self-resets locks + build-time zero-init keep the buffer all-zero.
   vt::MoeGroupedGemmNvfp4Marlin(d.q, ddown.t(), dact.t(), wd, sd, gd, ws, sorted_ids.t(),
                                 expert_ids.t(), num_pad.t(), dtw.t(),
                                 vt::MoeMarlinArgs{bi, 1, Pi, Hi, Ii, false});

@@ -211,6 +211,13 @@ target_include_directories(test_rmsnorm_gated_fast PRIVATE ${CMAKE_SOURCE_DIR}/s
 # src/vt/cuda/cuda_gdn.cu (CausalConv1dUpdateFastKernel).
 vllm_cpp_add_test(test_conv_update_fast vt/test_conv_update_fast.cpp)
 target_include_directories(test_conv_update_fast PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier contract for the GDN PREFILL causal_conv1d forward register-window kernel
+# (VT_CONV_REG) and split fused post-conv kernel (VT_GDN_POSTCONV_SPLIT) A/B flags.
+# Reaches the internal header under src/ (not public API); the bit-identical fast
+# kernels they gate are CUDA-only and live in src/vt/cuda/cuda_gdn.cu
+# (CausalConv1dFwdRegKernel / GdnPostConvSplitKernel).
+vllm_cpp_add_test(test_gdn_prefill_conv vt/test_gdn_prefill_conv.cpp)
+target_include_directories(test_gdn_prefill_conv PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the CUDA-graph-safe grow-only device scratch bookkeeping
 # (src/vt/cuda/graph_safe_scratch.h): a grown-past scratch block is RETIRED (kept
 # resident), never freed, so a device pointer baked into a captured pure-decode CUDA

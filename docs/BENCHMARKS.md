@@ -78,6 +78,27 @@ re-measures the in-situ effect; characterize the c4 TTFT lottery vs run-noise.
 `benchmark_binding=false` for these levers — no isolated speed credit; the grid owns
 the in-situ number.
 
+### 35B PREFILL GDN conv-fwd + fused post-conv kernel efficiency (2026-07-18, `CLAIM-GDN-PREFILL-CONV-1`) — bit-exact, conv modest win / post-conv opt-in
+
+Component (NOT binding): the prefill `causal_conv1d` forward
+(`CausalConv1dFwdRegKernel`, `VT_CONV_REG` DEFAULT ON) and the fused post-conv split
+(`GdnPostConvSplitKernel`, `VT_GDN_POSTCONV_SPLIT` OPT-IN) mirror vLLM's FLA
+register-resident sliding-window conv (`causal_conv1d.py:397-452`) and per-V-head
+post-conv grid (`fused_gdn_prefill_post_conv.py:57-149`). Both **BIT-IDENTICAL
+(0-ulp)** to the shipped tiled/megablock kernels (DGX byte-exact reg==tiled +
+split==megablock **268** GPU assertions + full GDN 3081/3081; memcheck **0**; token
+27B **235/235** + 35B **315/315** on the final defaults). nsys per-call A/B on
+`nvidia/Qwen3.6-35B-A3B-NVFP4` (`--cuda-graph-trace=node`, evidence
+`dgx:~/work/prefill-attr-conv-35b`): **conv c1 337.1→321.1 µs (−4.7%), c6
+1036.4→960.3 µs (−7.3%)** — consistently faster ⇒ DEFAULT ON; post-conv split c1
+−3.8% / c6 **+4.7%** — near-neutral (GdnPostConv time is q/k-L2-norm-dominated, not
+the V-megablock) ⇒ OPT-IN. TTFT c1 A/B (3 reps): reg-ON 186.23 vs reg-OFF 186.96 ms
+(**−0.39%, within run-noise** — the conv kernel is ~2.5% of GPU time). **Finding:**
+the kernels are BANDWIDTH-bound (conv ~215 GB/s of GB10's ~273 peak, f32); the
+structural mirror is a real-but-modest win, and the larger vLLM conv gap is TRAFFIC
+(bf16 post-conv activations, `VT_GDN_IN_BF16`, task #40 sibling), not structure.
+`benchmark_binding=false`; the 35B binding grid re-measures the in-situ c1–c4 effect.
+
 ### Prior binding narrative (`246a23c`, superseded 2026-07-17, retained)
 
 The nominal 49 < 55 vs `3f256ab` was a

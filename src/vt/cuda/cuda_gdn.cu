@@ -33,6 +33,7 @@
 #include "vt/cuda/conv_update_fast.h"
 #include "vt/cuda/cuda_gdn_internal.h"
 #include "vt/cuda/gdn_packed_decode_triton.h"
+#include "vt/cuda/gdn_prefill_conv.h"
 #include "vt/cuda/gdn_packed_reg_tile.h"
 #include "vt/cuda/rmsnorm_gated_fast.h"
 #include "vt/cuda/tile/cp_async.cuh"
@@ -523,13 +524,171 @@ void LaunchConvFwdTiled(cudaStream_t s, Tensor& out, const Tensor& x, const Tens
   Check(cudaGetLastError(), "causal_conv1d_fwd(tiled) launch");
 }
 
-// Dispatch on the toggle. tiled == false forwards to the EXACT scalar launcher
-// (byte-identical grid/block/kernel), so VT_CONV_TILED unset/0 is a no-op.
+// ---------------------------------------------------------------------------
+// Register-resident sliding-window causal_conv1d_fwd (VT_CONV_REG, default ON) —
+// the 1:1 mirror of vLLM's FLA _causal_conv1d_fwd_kernel
+// (vllm/model_executor/layers/mamba/ops/causal_conv1d.py:397-452). One thread per
+// channel, sequential over its token chunk, with:
+//   * the k per-channel conv weights PRE-LOADED into registers ONCE (FLA
+//     w_col0..w_col3, causal_conv1d.py:399-409) — the tiled kernel re-reads w from
+//     GLOBAL on every tap of every output token;
+//   * a REGISTER sliding window of the (k-1) history taps (FLA col0..col3,
+//     causal_conv1d.py:414-452): each x element is loaded from global EXACTLY ONCE
+//     (coalesced across the channel dim), reused across the k taps, then the window
+//     shifts — no shared memory, no __syncthreads (the tiled kernel stages a shared
+//     x-tile with two barriers per token-tile);
+//   * the token axis parallelized into kConvRegM chunks over grid.z so a single long
+//     prefill sequence saturates the GPU (FLA parallelizes chunk_offset the same way).
+//
+// BIT-IDENTICAL (0-ulp) to CausalConv1dFwdTiledKernel and CausalConv1dFwdKernel: for
+// every output (token t, channel c) it accumulates acc = bias; for j in [0,k):
+// acc += w[c*k+j] * x_tap[j] in the SAME tap ORDER (j=0 oldest .. j=k-1 newest) over
+// the SAME f32 values (the register window is filled by the identical Load(x,...) /
+// conv_state reads), then the SAME silu/identity epilogue + round-to-store, and the
+// SAME (K-1) state write-back (ascending j, reading raw x / shifted conv_state
+// directly — never a value the window mutated). See gdn_prefill_conv.h.
+constexpr int kConvRegN = 128;    // channels per block (blockDim.x; coalesced x/out)
+constexpr int kConvRegM = 32;     // token chunk per block (grid.z parallelism)
+constexpr int kConvRegMaxW = 8;   // max supported width (k-1); Qwen GDN k=4 -> 3
+constexpr int64_t kConvRegChunkMaxSeqs = 4;  // chunk the token axis only for few seqs
+
+template <typename Tin, typename Tout, typename THas>
+__global__ void CausalConv1dFwdRegKernel(Tout* out, const Tin* x, const Tin* w,
+                                         const Tin* bias, float* conv_state,
+                                         const int32_t* qsl, const THas* his, int64_t c_dim,
+                                         int64_t x_row_stride, int64_t k, bool silu,
+                                         int chunked) {
+  const int64_t width = k - 1;
+  const int64_t s = blockIdx.y;                                                   // sequence
+  const int64_t c = static_cast<int64_t>(blockIdx.x) * kConvRegN + threadIdx.x;   // channel
+  const bool active = c < c_dim;
+  const int64_t begin = qsl[s];
+  const int64_t t_len = qsl[s + 1] - begin;
+
+  // Token range this block owns. chunked: [chunk*M, chunk*M+M); else whole sequence.
+  const int64_t token_offset = chunked ? static_cast<int64_t>(blockIdx.z) * kConvRegM : 0;
+  // Skip chunks past the sequence end — except chunk 0, which still runs the state
+  // write-back (also the only path when t_len == 0).
+  if (token_offset > 0 && token_offset >= t_len) return;
+  const int64_t token_end =
+      (chunked && token_offset + kConvRegM < t_len) ? token_offset + kConvRegM : t_len;
+
+  const bool init = his[s] != 0;
+  float* srow = active ? conv_state + (s * c_dim + c) * width : nullptr;
+  const float b = (active && bias != nullptr) ? Load(bias, c) : 0.0f;
+
+  if (active) {
+    // Pre-load the k per-channel weights (FLA w_col0..w_col3) once.
+    float wv[kConvRegMaxW + 1];
+#pragma unroll
+    for (int j = 0; j <= kConvRegMaxW; ++j)
+      if (j < k) wv[j] = Load(w, c * k + j);
+    // Register sliding window: window[0..width-1] = taps BEFORE token_offset,
+    // window[width] = token_offset. tap ti = token_offset - width + j.
+    float window[kConvRegMaxW + 1];
+    for (int64_t j = 0; j < width; ++j) {
+      const int64_t ti = token_offset - width + j;  // [token_offset-width, token_offset-1]
+      float v = 0.0f;
+      if (ti >= 0) {
+        v = Load(x, (begin + ti) * x_row_stride + c);
+      } else if (init) {
+        v = srow[width + ti];  // ti<0 only for chunk 0 (token_offset<width); col in [0,width)
+      }
+      window[j] = v;
+    }
+    window[width] =
+        (token_offset < t_len) ? Load(x, (begin + token_offset) * x_row_stride + c) : 0.0f;
+
+    for (int64_t t = token_offset; t < token_end; ++t) {
+      float acc = b;
+#pragma unroll
+      for (int j = 0; j <= kConvRegMaxW; ++j)  // SAME tap order as the scalar kernel
+        if (j < k) acc += wv[j] * window[j];
+      Store(out, (begin + t) * c_dim + c, silu ? Silu(acc) : acc);
+      // Advance the sliding window by one token.
+#pragma unroll
+      for (int j = 0; j < kConvRegMaxW; ++j)
+        if (j < width) window[j] = window[j + 1];
+      const int64_t nt = t + 1;
+      window[width] = (nt < t_len) ? Load(x, (begin + nt) * x_row_stride + c) : 0.0f;
+    }
+  }
+
+  // State write-back: only the block that reaches the sequence end (byte-identical to
+  // the scalar kernel — reads raw x / shifted conv_state directly, never the window).
+  if (active && token_end == t_len) {
+    for (int64_t j = 0; j < width; ++j) {
+      const int64_t tj = t_len - width + j;
+      float v = 0.0f;
+      if (tj >= 0) {
+        v = Load(x, (begin + tj) * x_row_stride + c);
+      } else if (init) {
+        v = srow[width + tj];
+      }
+      srow[j] = v;
+    }
+  }
+}
+
+// Toggle: DEFAULT ON (VT_CONV_REG=0 restores the tiled/scalar path). Read per call
+// (prefill dispatch is coarse — one launch/step — so the getenv is negligible and
+// in-process CUDA tests can flip the selection). Predicate factored to
+// gdn_prefill_conv.h for CPU-tier unit coverage.
+bool ConvRegEnabled() {
+  return ConvRegFlagIsOn(std::getenv("VT_CONV_REG"));
+}
+
+// Register-window launcher (VT_CONV_REG=1). grid = (channel-tiles, sequences, chunks).
+// grid.z chunks the token axis only for few (kConvRegChunkMaxSeqs) sequences, where
+// one block per (channel-tile, seq) would under-occupy on a long prefill; gridZ must
+// cover the LONGEST sequence — without a host-side max we bound it by
+// cdiv(total_tokens, M) (exact for n==1, over-provisions by <= n for n>1, and the
+// early-return blocks are ~free). For many sequences grid.z==1 and each block streams
+// its whole sequence (the channel-tile x seq grid already occupies).
 template <typename Tin, typename Tout>
-void DispatchConvFwd(bool tiled, cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
-                     const Tensor* bias, Tensor& conv_state, const Tensor& qsl, const Tensor& his,
-                     const CausalConv1dArgs& args) {
-  if (tiled) {
+void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                      const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
+                      const Tensor& his, const CausalConv1dArgs& args) {
+  const int64_t n = conv_state.shape[0], c = x.shape[1], k = w.shape[1];
+  const int64_t total_tokens = x.shape[0];
+  const int64_t x_rs = x.stride[0];  // padded-row (merged qkvz) x view honored
+  VT_CHECK(k - 1 <= kConvRegMaxW, "cuda causal_conv1d_fwd(reg): conv width exceeds kConvRegMaxW");
+  const int64_t chan_tiles = (c + kConvRegN - 1) / kConvRegN;
+  int64_t gridZ = 1;
+  int chunked = 0;
+  if (n <= kConvRegChunkMaxSeqs) {
+    const int64_t z = (total_tokens + kConvRegM - 1) / kConvRegM;
+    if (z >= 1 && z <= kMaxGridY) {
+      gridZ = z;
+      chunked = 1;
+    }
+  }
+  const dim3 grid(static_cast<unsigned>(chan_tiles), static_cast<unsigned>(n),
+                  static_cast<unsigned>(gridZ));
+  const dim3 block(kConvRegN);
+  if (his.dtype == DType::kI8) {
+    CausalConv1dFwdRegKernel<Tin, Tout, int8_t><<<grid, block, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+        bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+        qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, x_rs, k, args.silu_activation, chunked);
+  } else {
+    CausalConv1dFwdRegKernel<Tin, Tout, int32_t><<<grid, block, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+        bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+        qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, x_rs, k, args.silu_activation, chunked);
+  }
+  Check(cudaGetLastError(), "causal_conv1d_fwd(reg) launch");
+}
+
+// Dispatch on the toggles. reg (VT_CONV_REG, default ON) wins; else tiled
+// (VT_CONV_TILED); else the EXACT scalar launcher (byte-identical grid/block/kernel).
+template <typename Tin, typename Tout>
+void DispatchConvFwd(bool reg, bool tiled, cudaStream_t s, Tensor& out, const Tensor& x,
+                     const Tensor& w, const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
+                     const Tensor& his, const CausalConv1dArgs& args) {
+  if (reg) {
+    LaunchConvFwdReg<Tin, Tout>(s, out, x, w, bias, conv_state, qsl, his, args);
+  } else if (tiled) {
     LaunchConvFwdTiled<Tin, Tout>(s, out, x, w, bias, conv_state, qsl, his, args);
   } else {
     LaunchConvFwd<Tin, Tout>(s, out, x, w, bias, conv_state, qsl, his, args);
@@ -691,19 +850,22 @@ void ConvFwdKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
   if (n == 0 || x.shape[1] == 0) return;
   VT_CHECK(n <= kMaxGridY, "cuda causal_conv1d_fwd: too many sequences (grid.y limit)");
   cudaStream_t s = AsStream(q);
-  const bool tiled = ConvTiledEnabled();  // VT_CONV_TILED (default OFF)
+  const bool reg = ConvRegEnabled();      // VT_CONV_REG (default ON) — FLA register window
+  const bool tiled = ConvTiledEnabled();  // VT_CONV_TILED (default ON) — shared-mem tile
   if (x.dtype == DType::kF32) {
     if (out.dtype == DType::kF32) {
-      DispatchConvFwd<float, float>(tiled, s, out, x, w, bias, conv_state, qsl, his, args);
+      DispatchConvFwd<float, float>(reg, tiled, s, out, x, w, bias, conv_state, qsl, his, args);
     } else {
-      DispatchConvFwd<float, __nv_bfloat16>(tiled, s, out, x, w, bias, conv_state, qsl, his, args);
+      DispatchConvFwd<float, __nv_bfloat16>(reg, tiled, s, out, x, w, bias, conv_state, qsl, his,
+                                            args);
     }
   } else {
     if (out.dtype == DType::kF32) {
-      DispatchConvFwd<__nv_bfloat16, float>(tiled, s, out, x, w, bias, conv_state, qsl, his, args);
+      DispatchConvFwd<__nv_bfloat16, float>(reg, tiled, s, out, x, w, bias, conv_state, qsl, his,
+                                            args);
     } else {
-      DispatchConvFwd<__nv_bfloat16, __nv_bfloat16>(tiled, s, out, x, w, bias, conv_state, qsl,
-                                                    his, args);
+      DispatchConvFwd<__nv_bfloat16, __nv_bfloat16>(reg, tiled, s, out, x, w, bias, conv_state,
+                                                    qsl, his, args);
     }
   }
 }
@@ -871,6 +1033,85 @@ __global__ void GdnPostConvKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* 
   }
 }
 
+// Split post-conv (VT_GDN_POSTCONV_SPLIT, default ON) — grid (T, Hk+Hv), mirroring
+// vLLM's grid (ceil(L,BLOCK_T), H+HV) in _fused_post_conv_kernel:57-149 where each V
+// head is its own program. The shipped GdnPostConvKernel packs the ENTIRE
+// value_dim = Hv*Dv copy + all Hv gating scalars into ONE grid.y block per token
+// (head == Hk), serializing ~Hv× more work behind 1/Hv the blocks; this gives each
+// (token, v-head) its own block. BIT-IDENTICAL (0-ulp): the head<Hk q/k L2-norm
+// branch is byte-for-byte the shipped code; the V copy is the same per-element
+// Load/Store; the gating computes the same -exp(A_log)*softplus(a+dt_bias) and
+// sigmoid(b) per head over the same f32 inputs. See gdn_prefill_conv.h.
+template <typename Tqkv, typename Tconv, typename Tgate>
+__global__ void GdnPostConvSplitKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* g_out,
+                                       float* beta_out, const Tconv* conv, const Tgate* araw,
+                                       const Tgate* braw, const float* a_log,
+                                       const float* dt_bias, int64_t hk, int64_t dk,
+                                       int64_t hv, int64_t dv, int64_t a_row_stride,
+                                       int64_t b_row_stride, float eps) {
+  const int64_t key_dim = hk * dk, value_dim = hv * dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t tok = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t row = tok * conv_dim;
+  if (head < hk) {
+    // ---- q/k L2-norm (byte-for-byte the shipped GdnPostConvKernel head<hk path) ----
+    __shared__ float partial[kBlock];
+    const Tconv* qin = conv + row + head * dk;
+    const Tconv* kin = conv + row + key_dim + head * dk;
+    Tqkv* qo = q_out + (tok * hk + head) * dk;
+    Tqkv* ko = k_out + (tok * hk + head) * dk;
+    float acc = 0.0f;
+    for (int64_t j = threadIdx.x; j < dk; j += kBlock) {
+      const float v = Load(qin, j);
+      acc += v * v;
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = kBlock / 2; s > 0; s /= 2) {
+      if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+      __syncthreads();
+    }
+    const float qinv = 1.0f / sqrtf(partial[0] + eps);
+    for (int64_t j = threadIdx.x; j < dk; j += kBlock) Store(qo, j, Load(qin, j) * qinv);
+    __syncthreads();
+    acc = 0.0f;
+    for (int64_t j = threadIdx.x; j < dk; j += kBlock) {
+      const float v = Load(kin, j);
+      acc += v * v;
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = kBlock / 2; s > 0; s /= 2) {
+      if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+      __syncthreads();
+    }
+    const float kinv = 1.0f / sqrtf(partial[0] + eps);
+    for (int64_t j = threadIdx.x; j < dk; j += kBlock) Store(ko, j, Load(kin, j) * kinv);
+  } else {
+    // ---- single v-head copy + §6 g/beta gating for head i_hv = head - hk ----
+    const int64_t i_hv = head - hk;
+    const Tconv* vin = conv + row + 2 * key_dim + i_hv * dv;
+    Tqkv* vo = v_out + tok * value_dim + i_hv * dv;
+    for (int64_t j = threadIdx.x; j < dv; j += kBlock) Store(vo, j, Load(vin, j));
+    if (threadIdx.x == 0) {
+      const int64_t idx = tok * hv + i_hv;
+      const float av = Load(araw, tok * a_row_stride + i_hv);
+      const float bv = Load(braw, tok * b_row_stride + i_hv);
+      const float x = av + dt_bias[i_hv];
+      const float sp = x > 20.0f ? x : log1pf(expf(x));  // softplus, threshold 20
+      g_out[idx] = -expf(a_log[i_hv]) * sp;
+      beta_out[idx] = 1.0f / (1.0f + expf(-bv));
+    }
+  }
+}
+
+// Toggle: DEFAULT ON (VT_GDN_POSTCONV_SPLIT=0 restores the single-megablock kernel).
+// Read per call (post-conv dispatch is coarse — one launch/step).
+bool GdnPostConvSplitEnabled() {
+  return GdnPostConvSplitFlagIsOn(std::getenv("VT_GDN_POSTCONV_SPLIT"));
+}
+
 void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& g_out,
                            Tensor& beta_out, const Tensor& conv, const Tensor& araw,
                            const Tensor& braw, const Tensor& a_log, const Tensor& dt_bias,
@@ -885,7 +1126,10 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
            "cuda gdn_post_conv: q/k/v out must be f32 or bf16");
   VT_CHECK(conv.dtype == DType::kF32 || conv.dtype == DType::kBF16,
            "cuda gdn_post_conv: conv must be f32 or bf16");
-  dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(hk + 1));
+  // VT_GDN_POSTCONV_SPLIT (default ON): grid (T, Hk+Hv) — each V head its own block
+  // (mirrors vLLM). =0 restores the single-megablock grid (T, Hk+1).
+  const bool split = GdnPostConvSplitEnabled();
+  dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(split ? hk + hv : hk + 1));
   cudaStream_t s = AsStream(q);
   // Dispatch over (q/k/v out dtype) x (conv-in dtype). conv is bf16 under the
   // input-side bf16 GDN path (VT_GDN_IN_BF16); the conv read upcasts to f32.
@@ -893,11 +1137,19 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
     using Tqkv = decltype(qkv_tag);
     using Tconv = decltype(conv_tag);
     using Tgate = decltype(gate_tag);
-    GdnPostConvKernel<Tqkv, Tconv, Tgate><<<grid, kBlock, 0, s>>>(
-        q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
-        beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(),
-        braw.Ptr<Tgate>(), a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk,
-        hv, dv, araw.stride[0], braw.stride[0], args.eps);
+    if (split) {
+      GdnPostConvSplitKernel<Tqkv, Tconv, Tgate><<<grid, kBlock, 0, s>>>(
+          q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
+          beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(),
+          braw.Ptr<Tgate>(), a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk,
+          hv, dv, araw.stride[0], braw.stride[0], args.eps);
+    } else {
+      GdnPostConvKernel<Tqkv, Tconv, Tgate><<<grid, kBlock, 0, s>>>(
+          q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
+          beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(),
+          braw.Ptr<Tgate>(), a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk,
+          hv, dv, araw.stride[0], braw.stride[0], args.eps);
+    }
   };
   auto launch_gate = [&](auto qkv_tag, auto conv_tag) {
     if (araw.dtype == DType::kBF16)

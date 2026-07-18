@@ -2274,6 +2274,173 @@ TEST_CASE("CUDA causal_conv1d_update decode-fast (VT_CONV_UPDATE_FAST) matches r
                         /*indexed=*/true, seed);
 }
 
+// VT_CONV_REG: the register-resident sliding-window prefill conv kernel
+// (CausalConv1dFwdRegKernel) is BIT-IDENTICAL (0-ulp) to the shipped tiled kernel
+// (CausalConv1dFwdTiledKernel, VT_CONV_REG=0). It preserves shipped's exact per-output
+// float op order (bias init, j=0..k-1 tap accumulation over the same window values,
+// silu/identity epilogue, round-to-store) and the raw-copy (K-1) state write-back;
+// only the register sliding window (vs shared-mem tile) and the grid.z token-chunk
+// parallelism differ. So both the `out` activation AND the mutated conv_state MUST be
+// byte-identical vs the rollback kernel. Runs both arms with EXPLICIT env values
+// ("1" reg / "0" tiled; launcher reads getenv per call) so it is default-independent.
+void RunConvFwdRegByteExactCase(const std::vector<int32_t>& qsl, const std::vector<int32_t>& his,
+                                int64_t c, int64_t k, bool with_bias, bool silu, const Combo& cb,
+                                uint32_t seed, bool i8_mask = false) {
+  const int64_t n = static_cast<int64_t>(qsl.size()) - 1;
+  const int64_t t = qsl.back();
+  const auto xf = RandomF32(static_cast<size_t>(t * c), seed, -3.0f, 3.0f);
+  const auto wf = RandomF32(static_cast<size_t>(c * k), seed + 1, -1.0f, 1.0f);
+  const auto bf = RandomF32(static_cast<size_t>(c), seed + 2, -1.0f, 1.0f);
+  const auto stf = RandomF32(static_cast<size_t>(n * c * (k - 1)), seed + 3, -2.0f, 2.0f);
+  const auto xb = Pack(xf, cb.in);
+  const auto wb = Pack(wf, cb.in);
+  const auto bb = Pack(bf, cb.in);
+  const auto stb = Pack(stf, DType::kF32);
+  std::vector<int8_t> his_i8(his.begin(), his.end());
+  const CausalConv1dArgs args{silu};
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dx(gpu, gq.q, cb.in, {t, c}, xb.data());
+  DeviceTensor dw(gpu, gq.q, cb.in, {c, k}, wb.data());
+  DeviceTensor db(gpu, gq.q, cb.in, {c}, bb.data());
+  DeviceTensor dqsl(gpu, gq.q, DType::kI32, {n + 1}, qsl.data());
+  DeviceTensor dhis(gpu, gq.q, i8_mask ? DType::kI8 : DType::kI32, {n},
+                    i8_mask ? static_cast<const void*>(his_i8.data())
+                            : static_cast<const void*>(his.data()));
+
+  auto run = [&](bool reg, std::vector<uint8_t>& out_bytes, std::vector<uint8_t>& st_bytes) {
+    ::setenv("VT_CONV_REG", reg ? "1" : "0", 1);
+    DeviceTensor dst(gpu, gq.q, DType::kF32, {n, c, k - 1}, stb.data());  // fresh state per arm
+    DeviceTensor dout(gpu, gq.q, cb.out, {t, c});
+    gpu.Memset(gq.q, dout.tensor().data, 0x5a, static_cast<size_t>(t * c) * vt::SizeOf(cb.out));
+    vt::CausalConv1dFwd(gq.q, dout.tensor(), dx.tensor(), dw.tensor(),
+                        with_bias ? &db.tensor() : nullptr, dst.tensor(), dqsl.tensor(),
+                        dhis.tensor(), args);
+    out_bytes.resize(static_cast<size_t>(t * c) * vt::SizeOf(cb.out));
+    st_bytes.resize(stb.size());
+    dout.Download(gq.q, out_bytes.data());
+    dst.Download(gq.q, st_bytes.data());
+  };
+  std::vector<uint8_t> out_tiled, st_tiled, out_reg, st_reg;
+  run(/*reg=*/false, out_tiled, st_tiled);
+  run(/*reg=*/true, out_reg, st_reg);
+  ::unsetenv("VT_CONV_REG");
+  CHECK(out_reg == out_tiled);  // out activation byte-identical
+  CHECK(st_reg == st_tiled);    // rolled conv_state byte-identical
+}
+
+TEST_CASE("CUDA causal_conv1d_fwd register kernel (VT_CONV_REG) matches tiled 0-ulp") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  uint32_t seed = 9500;
+  for (const Combo& cb : kCudaCombos) {
+    CAPTURE(static_cast<int>(cb.in));
+    CAPTURE(static_cast<int>(cb.out));
+    for (int64_t k : {3, 4, 5}) {   // production Qwen GDN k=4; sweep neighbors
+      CAPTURE(k);
+      // Multi-seq varlen (n<=4 → chunked grid.z engages), mixed has_initial_state.
+      RunConvFwdRegByteExactCase({0, 5, 6, 9}, {1, 0, 1}, 2048, k, true, true, cb, seed);
+      // Single long sequence, T not a multiple of the token-chunk (partial last chunk
+      // + interior-chunk window seeding); real conv-dim scale.
+      RunConvFwdRegByteExactCase({0, 200}, {1}, 4096, k, false, true, cb, seed + 5);
+      // T < K-1 write-back (shifted old state / zero left-pad), identity activation.
+      RunConvFwdRegByteExactCase({0, 1, 3}, {1, 0}, 512, k, false, false, cb, seed + 10);
+      seed += 20;
+    }
+  }
+  // Many sequences (n > kConvRegChunkMaxSeqs → grid.z==1 whole-sequence path).
+  RunConvFwdRegByteExactCase({0, 3, 6, 9, 12, 40}, {1, 1, 0, 1, 1}, 2048, 4, false, true,
+                             kCudaCombos[0], seed);
+  // i8 has_initial_state mask, no bias, silu.
+  RunConvFwdRegByteExactCase({0, 33, 70}, {1, 0}, 1024, 4, false, true, kCudaCombos[0], seed + 30,
+                             /*i8_mask=*/true);
+}
+
+// VT_GDN_POSTCONV_SPLIT: the per-V-head split post-conv kernel (GdnPostConvSplitKernel)
+// is BIT-IDENTICAL (0-ulp) to the shipped single-megablock GdnPostConvKernel
+// (VT_GDN_POSTCONV_SPLIT=0). The q/k L2-norm branch is byte-for-byte identical; the V
+// copy and per-head gating are the same per-element ops split across Hv grid.y blocks.
+// So all five outputs (q/k/v/g/beta) MUST be byte-identical vs the rollback kernel.
+void RunGdnPostConvSplitByteExactCase(int64_t t, int64_t hk, int64_t hv, int64_t dk, int64_t dv,
+                                      DType qkv_dt, DType conv_dt, DType gate_dt, uint32_t seed) {
+  const int64_t key_dim = hk * dk, value_dim = hv * dv, conv_dim = 2 * key_dim + value_dim;
+  const auto convf = RandomF32(static_cast<size_t>(t * conv_dim), seed, -1.5f, 1.5f);
+  const auto araw = RandomF32(static_cast<size_t>(t * hv), seed + 1, -1.0f, 1.0f);
+  const auto braw = RandomF32(static_cast<size_t>(t * hv), seed + 2, -1.0f, 1.0f);
+  const auto alog = RandomF32(static_cast<size_t>(hv), seed + 3, -1.0f, 1.0f);
+  const auto dtb = RandomF32(static_cast<size_t>(hv), seed + 4, -1.0f, 1.0f);
+  const auto convb = Pack(convf, conv_dt);
+  const auto arawb = Pack(araw, gate_dt);
+  const auto brawb = Pack(braw, gate_dt);
+  const vt::L2NormArgs args{1e-6f};
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dconv(gpu, gq.q, conv_dt, {t, conv_dim}, convb.data());
+  DeviceTensor daraw(gpu, gq.q, gate_dt, {t, hv}, arawb.data());
+  DeviceTensor dbraw(gpu, gq.q, gate_dt, {t, hv}, brawb.data());
+  DeviceTensor dalog(gpu, gq.q, DType::kF32, {hv}, alog.data());
+  DeviceTensor ddtb(gpu, gq.q, DType::kF32, {hv}, dtb.data());
+
+  auto run = [&](bool split, std::vector<uint8_t>& q, std::vector<uint8_t>& k,
+                 std::vector<uint8_t>& v, std::vector<uint8_t>& g, std::vector<uint8_t>& b) {
+    ::setenv("VT_GDN_POSTCONV_SPLIT", split ? "1" : "0", 1);
+    DeviceTensor dq_(gpu, gq.q, qkv_dt, {t, hk, dk});
+    DeviceTensor dk_(gpu, gq.q, qkv_dt, {t, hk, dk});
+    DeviceTensor dv_(gpu, gq.q, qkv_dt, {t, hv, dv});
+    DeviceTensor dg_(gpu, gq.q, DType::kF32, {t, hv});
+    DeviceTensor db_(gpu, gq.q, DType::kF32, {t, hv});
+    vt::GdnPostConv(gq.q, dq_.tensor(), dk_.tensor(), dv_.tensor(), dg_.tensor(), db_.tensor(),
+                    dconv.tensor(), daraw.tensor(), dbraw.tensor(), dalog.tensor(), ddtb.tensor(),
+                    args);
+    q.resize(static_cast<size_t>(t * hk * dk) * vt::SizeOf(qkv_dt));
+    k.resize(q.size());
+    v.resize(static_cast<size_t>(t * value_dim) * vt::SizeOf(qkv_dt));
+    g.resize(static_cast<size_t>(t * hv) * vt::SizeOf(DType::kF32));
+    b.resize(g.size());
+    dq_.Download(gq.q, q.data());
+    dk_.Download(gq.q, k.data());
+    dv_.Download(gq.q, v.data());
+    dg_.Download(gq.q, g.data());
+    db_.Download(gq.q, b.data());
+  };
+  std::vector<uint8_t> q0, k0, v0, g0, b0, q1, k1, v1, g1, b1;
+  run(/*split=*/false, q0, k0, v0, g0, b0);
+  run(/*split=*/true, q1, k1, v1, g1, b1);
+  ::unsetenv("VT_GDN_POSTCONV_SPLIT");
+  CHECK(q1 == q0);
+  CHECK(k1 == k0);
+  CHECK(v1 == v0);
+  CHECK(g1 == g0);
+  CHECK(b1 == b0);
+}
+
+TEST_CASE("CUDA gdn_post_conv split kernel (VT_GDN_POSTCONV_SPLIT) matches megablock 0-ulp") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  uint32_t seed = 9700;
+  // Sweep (qkv-out, conv-in, gate) dtype over {f32, bf16} on 35B-scale GDN dims
+  // (Hk=16, Hv=32, Dk=Dv=128) and a strided Dk>blockDim case + a decode-shaped T==1.
+  for (DType qkv : {DType::kF32, DType::kBF16}) {
+    for (DType conv : {DType::kF32, DType::kBF16}) {
+      for (DType gate : {DType::kF32, DType::kBF16}) {
+        CAPTURE(static_cast<int>(qkv));
+        CAPTURE(static_cast<int>(conv));
+        CAPTURE(static_cast<int>(gate));
+        RunGdnPostConvSplitByteExactCase(24, 16, 32, 128, 128, qkv, conv, gate, seed);
+        RunGdnPostConvSplitByteExactCase(3, 4, 4, 300, 128, qkv, conv, gate, seed + 5);
+        RunGdnPostConvSplitByteExactCase(1, 1, 2, 64, 64, qkv, conv, gate, seed + 10);
+        seed += 20;
+      }
+    }
+  }
+}
+
 TEST_CASE("CUDA l2norm matches CPU (rank 2 and 3)") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");

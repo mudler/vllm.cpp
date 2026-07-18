@@ -35,11 +35,21 @@ closed it. Correctness holds — the full default set is 27B 235/235 + 35B 315/3
 batch-independent decode floor at **0.987–0.999** (c8 mean/median itl+tpot, c16
 median_itl 0.9983, c32 median_itl 0.9879 + median_tpot 0.9989 — a whisker under the
 strict ≥1.0 bar); two are **c4 TTFT** (mean 0.906 / median 0.943, the bimodal
-low-concurrency arrival lottery); one is the real **c8 p99_itl 0.86** wave-boundary
-prefill-co-schedule tail (ours 557 vs vLLM 479 ms). Closing path: fold in the landed
-bit-identical FP4-quant/SiLU glue kernels (`861b518`, opt-in) + the GDN conv-update
-lever for the decode-floor axes; characterize the c4 TTFT lottery vs run-noise;
-address the c8 p99 tail cadence.
+low-concurrency arrival lottery); one is the **c8 p99_itl 0.86** wave-boundary
+prefill-co-schedule tail (ours 557 vs vLLM 479 ms), now ROOT-CAUSED (2026-07-18,
+[spec](../.agents/specs/c8-p99-itl-tail-2026-07-18.md)) as the **honest residual —
+irreducible-as-mirrored**: at c8, ours' deterministic synchronous forward keeps
+co-admitted requests in byte-identical lockstep (22 uniform 840 ms two-full-prefill
+stalls/rep, lockstep 0.77) where vLLM's async-future runtime jitter de-phases them
+(11 + graded 440/660, lockstep 0.51); but ours BEATS vLLM on this same tail at c16
+(p99 1.055) and c32 (1.078) — vLLM's jitter spawns extreme 900-band outliers ours
+lacks — so it is the trailing edge of the per-step determinism that wins higher
+concurrency + throughput, not a capability gap. Scheduler + async placeholder are
+byte-identical (no vLLM policy to mirror); the only structural fix (true
+async-forward executor) risks the c16/c32 wins with no throughput basis, and forced
+de-phase is a fake fix — so NO code change. Closing path for the seven decode-floor
+axes: fold in the landed bit-identical FP4-quant/SiLU glue kernels (`861b518`,
+opt-in) + the GDN conv-update lever; characterize the c4 TTFT lottery vs run-noise.
 
 ### Prior binding narrative (`246a23c`, superseded 2026-07-17, retained)
 

@@ -12761,3 +12761,51 @@ Per-rep (3 reps) analysis of the 10 failing axes sorts them into three buckets �
 - **REAL STABLE LARGE TAIL (1):** c8 p99_itl 0.857/0.862/0.867 (ours ~557 vs vLLM ~479 ms) — the wave-boundary prefill-co-schedule single-prefill stall. async closed c16/c32 p99 tails but NOT c8's. THE hard remaining blocker.
 
 Effective standing: parity-or-better on ~119/124; genuine remaining work = 5 axes (4 small decode/ttft + 1 c8 p99 tail). Closure: (a) decode-glue medians → GDN conv-update lever (scan #5, conv 0.584 vs vLLM 0.432 µs) + fold-in the landed bit-identical FP4/SiLU (861b518) for headroom; (b) c8 p99_itl → mirror vLLM's c8 wave-boundary behavior (tail-stall-analysis-2026-07-16); (c) c4 median_ttft → characterize arrival-timing vs a real gap. Noise-band 5 close on evidence totality per the gate-statistics rule (do NOT chase coin-flips with levers).
+
+## 2026-07-18 — c8 p99_itl tail ROOT-CAUSED: irreducible-as-mirrored (honest residual) (`CLAIM-C8-P99-TAIL-1`)
+
+The ONLY large stable binding-`9ecd9d0` deficit — c8 `p99_itl` 0.857/0.862/0.867
+(ours ~557 vs vLLM ~479 ms) — is root-caused from the immutable binding evidence
+(read-only per-request `itls[]`, ours vs vLLM, c8/c16/c32; scripts in scratchpad:
+`c8_stall_locate.py`, `c8_events_detail.py`, `conc_compare.py`). Full spec:
+[c8-p99-itl-tail-2026-07-18.md](specs/c8-p99-itl-tail-2026-07-18.md).
+
+- **Mechanism (the smoking gun).** At c8, ours' deterministic single-stream
+  synchronous forward keeps co-admitted requests in perpetual **byte-identical
+  lockstep pairs** (req8 & req9 both 843.3 ms, req10 & req11 both 842.9, req12 &
+  req13 both 559.6 — admitted the SAME step, decoding in lockstep forever),
+  packing **22 uniform 2-full-prefill ~840 ms stalls/rep** (lockstep_frac 0.77,
+  bimodal 800+500 band). vLLM's async-future forward-overlap runtime JITTER
+  de-phases co-admitted requests (staggered by one step; all-different magnitudes
+  713/885/897/443) → only **11** such stalls + a graded 440/660 distribution
+  (lockstep 0.51). Budget 2048 = exactly two 1024 prefills: ours' lockstep wave
+  drains to ~0 residual decodes at the boundary → 2 FULL prefills packed (840 ms);
+  vLLM's residual decodes force the 2nd prefill to CHUNK (440 ms) + de-phase.
+  Ours total-stall +14.5% (32035 vs 27984 ms) → p99 557 vs 477.
+- **DECISIVE inversion — ours WINS the tail at c16/c32.** c16 p99 ours 859 vs
+  vLLM 906 (**1.055**); c32 927 vs 999 (**1.078**). vLLM's jitter spawns a large
+  extreme 900-band (157 events c16, 1764 c32) ours lacks; both engines equally
+  locked (0.89–0.98, batch-sharing dominates) so ours' lower per-step overhead
+  wins. The residual is c8-ONLY — if ours had a real async/scheduling deficiency
+  it would lose at c16/c32 too. It does not. So the c8 shortfall is NOT a
+  capability gap; it is the trailing edge of the SAME per-step determinism that
+  wins c16/c32 + throughput, at the one concurrency (8 == 2-prefill budget
+  granularity) where waves can drain to ~0 residual decodes.
+- **No code fix; no fake fix.** Scheduler + AsyncScheduler placeholder accounting
+  are byte-identical (re-verified `src/vllm/v1/core/sched/async_scheduler.cpp:10-76`
+  == `vllm/v1/core/sched/async_scheduler.py:19-74`; `test_scheduler_wave.cpp`) — no
+  vLLM policy to mirror. The de-phase is emergent runtime jitter from vLLM's
+  genuine `execute_model(non_block=True)` future (`vllm/v1/engine/core.py:549`);
+  ours is synchronous eager (`src/vllm/v1/engine/core.cpp:110-113`). The only
+  structural "fix" (a true async-forward executor) would (a) be minimized by our
+  deterministic graphed kernels, (b) RISK the c16/c32 tail wins via vLLM-like
+  outliers, (c) have no throughput basis (vLLM async −0.7%), (d) be a major
+  rearchitecture — a net-negative trade for one low-conc p99 axis. Forced de-phase
+  (jitter injection / prefill-split / release retiming) = the task's rejected fake
+  fix. VERDICT: irreducible-as-mirrored, the honest residual.
+- Reconciles the 2026-07-16 W3 discriminator's 0.906 (single interleaved run vs
+  old vLLM denom) with the binding's rock-steady 0.857 (co-measured, 3 reps) as
+  method/denominator variance; both agree on the mechanism (the uniform 800-band
+  persists under async-ON). No new GPU run needed. `benchmark_binding=false`;
+  binding stays 114/124. Records: spec, ledger 2026-07-18, engine-matrix
+  SERVE-GATE-ONLINE cell, README/BENCHMARKS, coordination `CLAIM-C8-P99-TAIL-1`.

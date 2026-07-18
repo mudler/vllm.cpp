@@ -13150,3 +13150,8 @@ Re-grid `df9a040` (FA2 prefill flip + plan-cache opt-in), evidence `dgx:~/work/v
 - Per-concurrency pass: c1 0/20, c2 1/20, c4 0/20, c8 7/20, c16 16/20, c32 16/20. High-concurrency strong (routing/align has c16/c32 decode winning); low-concurrency weak.
 - FA2 prefill flip (647b69e) delivered −5.7% isolated TTFT / +5.5% prefill tput → +3 valid axes net. It closed ~a third of the TTFT gap (was ~0.79-0.88×); the c1-c4 residual is TTFT (still ~0.83-0.88×) + low-batch decode.
 - Big 35B levers now banked (routing/align, host-free, FA2). Remaining smaller/harder: (1) c1-c4 prefill residual — the attribution's smaller levers (GDN conv/post-conv ~1.3× → ~2-3%, glue-chain fusion, MoE fused w13); (2) memory peak (streaming #40). The fp8 plan-cache was a measured NULL (opt-in).
+
+## 2026-07-18 — USER-DIRECTED SEQUENCE (post-35B)
+1. Settle 35B parity (in progress: GDN conv lever a0dda669 running; then memory-peak streaming #40 + c1-c4 prefill residual).
+2. **Then RE-BENCH 27B for REGRESSIONS** — the 35B-era changes touch shared/27B code (FA2 preamble default-flip now all-arches, Platform seam refactor, GDN conv/routing/host-free, plan-cache) and are all token-exact-gated, so a PERFORMANCE regression could hide behind the correctness gates. Run a fresh 27B binding grid on the settled SHA, compare vs the 115/124 two-grid totality (9ecd9d0/f0fb727); any axis that dropped is a regression to fix before roadmap_v1.
+3. **Then proceed to roadmap_v1** (extensibility-first: Platform-seam item 1 done; items 2 residency-policy consumption, 4 attn-backend registry, 5 model self-registration + qwen3_5 per-arch split; then the broader portfolio). See [[extensibility-first-additive-hw-models]].

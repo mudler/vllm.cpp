@@ -497,7 +497,7 @@ Both arms 18/18 legs, 12/12 binding-eligible; evidence
 sha256 `e7576e09…`. 35B correctness holds (315/315 token-exact throughout). The
 vLLM oracle arm required a disk reclaim (flashinfer sm120 GEMM JIT).
 
-**Disposition: 39/124** (first grid `69f2717` was 19/124; re-grid `6a8c5cf` after L1 MoE routing/align + L2 host-free = **39/124**). The routing/align lever closed the high-concurrency decode (c16/c32 now WIN); **TTFT/prefill (0.79–0.88× at every concurrency) is now the dominant gap**, plus c1–c4 low-batch decode and the load-time memory peak.
+**Disposition: 42/124** (valid binding `df9a040` after the FA2 prefill flip; first grid 19/124 → routing/align+host-free 39 → FA2 42). c16/c32 strong (16/20, decode winning); c1–c4 weak (0–1/20, TTFT still ~0.83–0.88× + low-batch decode). The FA2 flip (−5.7% isolated TTFT) closed ~⅓ of the TTFT gap; the remaining prefill residual + memory peak are the open 35B fronts.
 
 | Concurrency | Axes | Total tok/s ours / vLLM (ratio) | Mean TTFT (v/o) | Mean TPOT (v/o) |
 |---:|---:|---:|---:|---:|

@@ -772,11 +772,31 @@ __device__ inline float GemmaNormElem(float v, float inv, float w, bool gemma) {
   return v * inv * wj;
 }
 
-// Tqk = q_out/k_out store dtype, Tgate = gate_out store dtype. All math stays
-// f32; a bf16 Tqk store is the RN round of the exact f32 value, so (Tqk=bf16,
-// Tgate=f32) is bit-identical to the f32 path followed by CastBf16 on q/k — the
-// FA-2 prefill combo (bf16 q feeds FA-2, bf16 k feeds the bf16 KV-cache write,
-// gate stays f32 because sigmoid(gate) must see the un-rounded f32 value).
+// Round a normed f32 value through the q/k STORE dtype before the RoPE multiply,
+// exactly mirroring the unfused path's RmsNorm-store→RopeNeox-reload AND vLLM's
+// fused kernel `.to(INPUT_DTYPE).to(tl.float32)` (fused_qk_norm_rope.py:67,89-90).
+// For Tqk=float this is the identity (f32 path stays byte-identical); for
+// Tqk=bf16 it is one RN round-trip, so the RoPE FMA sees the SAME bf16-rounded
+// normed value a bf16 q/k store would persist — making the fused bf16 preamble
+// bit-identical to the unfused bf16 path (removes the ≤1-ULP tie-luck).
+template <typename T>
+__device__ inline float RoundToStore(float v);
+template <>
+__device__ inline float RoundToStore<float>(float v) {
+  return v;
+}
+template <>
+__device__ inline float RoundToStore<__nv_bfloat16>(float v) {
+  return __bfloat162float(__float2bfloat16(v));  // RN-to-bf16, matches Store(bf16)
+}
+
+// Tqk = q_out/k_out store dtype, Tgate = gate_out store dtype. RMSNorm variance
+// stays f32; the normed q/k are then ROUNDED to Tqk (RoundToStore) BEFORE the
+// RoPE multiply so the RoPE input matches the bf16-storage of the unfused path
+// (and vLLM's fused kernel). For Tqk=f32 the round is a no-op (byte-identical to
+// the four-op f32 path); for the FA-2 prefill combo (Tqk=bf16, Tgate=f32) it is
+// bit-identical to unfused bf16 (bf16 q feeds FA-2, bf16 k the bf16 KV-cache
+// write; gate stays f32 because sigmoid(gate) must see the un-rounded f32 value).
 template <typename Tsrc, typename Tqk, typename Tgate>
 __global__ void AttnQkNormRopeGateKernel(Tqk* q_out, Tqk* k_out, Tgate* gate_out,
                                          const Tsrc* qgate, const Tsrc* kf, const float* q_norm,
@@ -823,17 +843,21 @@ __global__ void AttnQkNormRopeGateKernel(Tqk* q_out, Tqk* k_out, Tgate* gate_out
 
   // ---- partial NeoX RoPE + write (recompute the paired normed elems; no shared
   // round-trip). Matches RopeNeoxKernel: out[i]=x*c - y*sn, out[i+half]=x*sn + y*c
-  // with x=normed[i], y=normed[i+half]; dims [rot,Dh) normed but unrotated. ----
+  // with x=normed[i], y=normed[i+half]; dims [rot,Dh) normed but unrotated. The
+  // normed elems are ROUNDED to the store dtype (RoundToStore<Tqk>) BEFORE the
+  // RoPE multiply — for bf16 out this is the bf16-rounded value the unfused
+  // RmsNorm-store→RopeNeox-reload feeds RoPE (and vLLM fused_qk_norm_rope.py:67);
+  // for f32 out it is a no-op (byte-identical to the four-op f32 path). ----
   const float* cs = cos_sin + tok * rot;
   for (int64_t j = threadIdx.x; j < dh; j += kBlock) {
     if (j < half) {
-      const float ni = GemmaNormElem(Load(src, j), inv, w[j], gemma);
-      const float nih = GemmaNormElem(Load(src, j + half), inv, w[j + half], gemma);
+      const float ni = RoundToStore<Tqk>(GemmaNormElem(Load(src, j), inv, w[j], gemma));
+      const float nih = RoundToStore<Tqk>(GemmaNormElem(Load(src, j + half), inv, w[j + half], gemma));
       Store(out, j, ni * cs[j] - nih * cs[half + j]);
     } else if (j < rot) {
       const int64_t i = j - half;
-      const float ni = GemmaNormElem(Load(src, i), inv, w[i], gemma);
-      const float nih = GemmaNormElem(Load(src, i + half), inv, w[i + half], gemma);
+      const float ni = RoundToStore<Tqk>(GemmaNormElem(Load(src, i), inv, w[i], gemma));
+      const float nih = RoundToStore<Tqk>(GemmaNormElem(Load(src, i + half), inv, w[i + half], gemma));
       Store(out, j, ni * cs[half + i] + nih * cs[i]);
     } else {
       Store(out, j, GemmaNormElem(Load(src, j), inv, w[j], gemma));

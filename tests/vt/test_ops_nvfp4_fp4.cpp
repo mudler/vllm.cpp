@@ -1129,8 +1129,9 @@ TEST_CASE("silu_and_mul_nvfp4_quant one-input CUDA is BYTE-EXACT") {
 // scalar loads; upstream vLLM nvfp4_quant_kernels.cu:56-80 ld256/ld128 pattern)
 // and keep the exact per-element math. Every fp4 nibble AND per-group fp8 scale
 // byte MUST equal the shipped scalar kernel on adversarial inputs — proved here
-// by running the SAME op with the flag OFF (default scalar) then ON (fast) and
-// asserting byte-exact packed + scale. Covers both dtypes (f32/bf16), both scale
+// by running the SAME op with the flag ROLLED BACK (=0, scalar) then DEFAULT
+// (fast) and asserting byte-exact packed + scale. Covers both dtypes (f32/bf16),
+// both scale
 // layouts (linear + swizzled, incl. padded rows/cols), decode + prefill shapes,
 // and a deliberately misaligned input that forces the fast kernel's scalar
 // fallback branch.
@@ -1247,8 +1248,8 @@ TEST_CASE("scaled_fp4_quant CUDA fast vectorized-load == scalar (BYTE-EXACT)") {
       b.Free(ds);
       return std::make_pair(hp, hs);
     };
-    const auto scalar = quant(nullptr);  // default OFF (shipped scalar kernel)
-    const auto fast = quant("1");        // opt-in ON (vectorized-load kernel)
+    const auto scalar = quant("0");      // rollback (shipped scalar kernel)
+    const auto fast = quant(nullptr);    // default ON (vectorized-load kernel)
     CHECK(fast.first == scalar.first);    // fp4 nibbles byte-exact
     CHECK(fast.second == scalar.second);  // fp8 group scales byte-exact
     b.Free(dx_alloc);
@@ -1332,8 +1333,8 @@ TEST_CASE("silu_and_mul_fp4_quant CUDA fast vectorized-load == scalar (BYTE-EXAC
       b.Free(ds);
       return std::make_pair(hp, hs);
     };
-    const auto scalar = quant(nullptr);  // default OFF (shipped scalar kernel)
-    const auto fast = quant("1");        // opt-in ON (vectorized-load kernel)
+    const auto scalar = quant("0");      // rollback (shipped scalar kernel)
+    const auto fast = quant(nullptr);    // default ON (vectorized-load kernel)
     CHECK(fast.first == scalar.first);    // fp4 nibbles byte-exact
     CHECK(fast.second == scalar.second);  // fp8 group scales byte-exact
     b.Free(dx_alloc);
@@ -1420,8 +1421,8 @@ TEST_CASE("fp4 quant fast microbench (VT_FP4_MB_RUN)") {
   };
   MESSAGE("microbench kernel=" << (silu ? "silu" : "scaled") << " M=" << m
                                << " inner=" << inner << " iters=" << iters);
-  loop(nullptr);  // scalar sibling
-  loop("1");      // vectorized-load fast kernel
+  loop("0");      // scalar sibling (rollback)
+  loop(nullptr);  // vectorized-load fast kernel (default ON)
   CHECK(true);
   b.Free(dx);
   b.Free(dp);

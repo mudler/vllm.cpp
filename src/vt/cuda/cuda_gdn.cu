@@ -30,6 +30,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "vt/cuda/conv_update_fast.h"
 #include "vt/cuda/cuda_gdn_internal.h"
 #include "vt/cuda/gdn_packed_decode_triton.h"
 #include "vt/cuda/gdn_packed_reg_tile.h"
@@ -575,10 +576,91 @@ __global__ void CausalConv1dUpdateKernel(Tout* out, const Tin* x, const Tin* w,
   }
 }
 
+// Decode-fast causal_conv1d_update variant (VT_CONV_UPDATE_FAST). BIT-IDENTICAL
+// (0-ulp) to CausalConv1dUpdateKernel above — same bias init, same left-to-right
+// conv accumulation, same `w[width]*x` tail, same silu/identity epilogue, same
+// round-to-store, same rolled conv_state bytes — differing ONLY in numerics-neutral
+// mechanics (see conv_update_fast.h): a 2D grid (blockIdx.y == token, x-dim ==
+// channel) that eliminates the shipped kernel's two int64 div/mod per thread, and
+// a register-cached state row (WIDTH == k-1 known at compile time so it stays
+// register-resident, mirroring the fla per-KERNEL_WIDTH col0..col3 specialization)
+// reused for both the accumulation and the roll-left instead of re-reading it from
+// global memory. Templated on WIDTH so the two short loops fully unroll and the
+// state array lives in registers.
+template <typename Tin, typename Tout, typename TState, int WIDTH>
+__global__ void CausalConv1dUpdateFastKernel(Tout* out, const Tin* x, const Tin* w,
+                                             const Tin* bias, TState* conv_state,
+                                             const int32_t* cache_idx, int64_t c_dim,
+                                             int64_t x_row_stride, bool silu) {
+  const int64_t c = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (c >= c_dim) return;
+  const int64_t bt = blockIdx.y;             // token — no idx/c_dim, idx%c_dim
+  const int64_t idx = bt * c_dim + c;        // contiguous out slot
+  const int k = WIDTH + 1;
+  int64_t srow_off = idx;                    // compact: row == bt
+  if (cache_idx != nullptr) {
+    const int32_t slot = cache_idx[bt];
+    if (slot < 0) return;                     // NULL block → leave out untouched
+    srow_off = static_cast<int64_t>(slot) * c_dim + c;
+  }
+  TState* srow = conv_state + srow_off * WIDTH;  // row [K-1]
+  // Load the state row ONCE into registers (shipped re-reads srow[j+1] in the roll).
+  float sreg[WIDTH];
+#pragma unroll
+  for (int j = 0; j < WIDTH; ++j) sreg[j] = Load(srow, j);
+  const float xt = Load(x, bt * x_row_stride + c);
+  float acc = bias != nullptr ? Load(bias, c) : 0.0f;
+#pragma unroll
+  for (int j = 0; j < WIDTH; ++j) acc += Load(w, c * k + j) * sreg[j];  // shipped order
+  acc += Load(w, c * k + WIDTH) * xt;
+  Store(out, idx, silu ? Silu(acc) : acc);
+#pragma unroll
+  for (int j = 0; j + 1 < WIDTH; ++j) Store(srow, j, sreg[j + 1]);  // roll left (cached bits)
+  Store(srow, WIDTH - 1, xt);                                       // raw x (WIDTH>=1)
+}
+
+// Runtime predicate + width-specialized launch for the decode conv-update fast
+// path. Returns true iff it ran (VT_CONV_UPDATE_FAST on, state width in the
+// specialized set, and num_tokens within the grid.y limit); false keeps the shipped
+// grid-stride CausalConv1dUpdateKernel. Bit-identical to shipped by construction.
+template <typename Tin, typename Tout, typename TState>
+bool TryLaunchConvUpdateFast(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
+                             const Tensor* bias, Tensor& conv_state, const int32_t* cache_idx,
+                             const CausalConv1dArgs& args) {
+  if (!ConvUpdateFastFlagIsOn(std::getenv("VT_CONV_UPDATE_FAST"))) return false;
+  const int64_t nt = x.shape[0], c = x.shape[1], k = w.shape[1];
+  const int64_t width = k - 1;
+  if (nt <= 0 || nt > kMaxGridY) return false;  // 2D grid.y == num_tokens
+  const int64_t x_rs = x.stride[0];             // padded-row (merged qkvz) x view honored
+  const Tin* wp = w.Ptr<Tin>();
+  const Tin* bp = bias != nullptr ? bias->Ptr<Tin>() : nullptr;
+  const dim3 grid(static_cast<unsigned>((c + kBlock - 1) / kBlock), static_cast<unsigned>(nt));
+  auto launch = [&](auto width_tag) {
+    constexpr int W = decltype(width_tag)::value;
+    CausalConv1dUpdateFastKernel<Tin, Tout, TState, W><<<grid, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), wp, bp, conv_state.Ptr<TState>(), cache_idx, c, x_rs,
+        args.silu_activation);
+  };
+  switch (width) {  // specialize the production widths (Qwen GDN k=4 → width 3)
+    case 1: launch(std::integral_constant<int, 1>{}); break;
+    case 2: launch(std::integral_constant<int, 2>{}); break;
+    case 3: launch(std::integral_constant<int, 3>{}); break;
+    case 4: launch(std::integral_constant<int, 4>{}); break;
+    default: return false;  // uncommon width → shipped kernel handles it
+  }
+  Check(cudaGetLastError(), "causal_conv1d_update fast launch");
+  return true;
+}
+
 template <typename Tin, typename Tout, typename TState>
 void LaunchConvUpdate(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                       const Tensor* bias, Tensor& conv_state, const int32_t* cache_idx,
                       const CausalConv1dArgs& args) {
+  // Decode conv-update fast path (VT_CONV_UPDATE_FAST): bit-identical to the shipped
+  // kernel; only engages for the specialized production widths within the grid.y
+  // limit, else falls through to CausalConv1dUpdateKernel.
+  if (TryLaunchConvUpdateFast<Tin, Tout, TState>(s, out, x, w, bias, conv_state, cache_idx, args))
+    return;
   const int64_t n = x.shape[0] * x.shape[1], c = x.shape[1], k = w.shape[1];
   const int64_t x_rs = x.stride[0];  // padded-row (merged qkvz) x view honored
   CausalConv1dUpdateKernel<Tin, Tout, TState><<<GridFor(n), kBlock, 0, s>>>(

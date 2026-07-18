@@ -12809,3 +12809,57 @@ The ONLY large stable binding-`9ecd9d0` deficit — c8 `p99_itl` 0.857/0.862/0.8
   persists under async-ON). No new GPU run needed. `benchmark_binding=false`;
   binding stays 114/124. Records: spec, ledger 2026-07-18, engine-matrix
   SERVE-GATE-ONLINE cell, README/BENCHMARKS, coordination `CLAIM-C8-P99-TAIL-1`.
+
+## 2026-07-18 — GDN decode conv-update BIT-IDENTICAL decode-fast + DEFAULT ON; FP4/SiLU default flip ON (`CLAIM-CONV-UPDATE-FAST-1`)
+
+Two decode-glue headroom levers, both landed BIT-IDENTICAL and DEFAULT ON toward
+closing the 114/124 binding's remaining noise-band decode axes.
+
+- **(1) GDN decode conv-update decode-fast (row `KERNEL-SSM-MAMBA`, the c16-trace
+  scan lever #5).** New `CausalConv1dUpdateFastKernel<Tin,Tout,TState,WIDTH>`
+  (`src/vt/cuda/cuda_gdn.cu`, behind `VT_CONV_UPDATE_FAST`, predicate header
+  `src/vt/cuda/conv_update_fast.h`) is a BIT-IDENTICAL (0-ulp) variant of the
+  shipped `CausalConv1dUpdateKernel` (`cuda_gdn.cu:549`). It keeps the EXACT float
+  op order (bias init, left-to-right `acc += w[j]*state[j]`, `w[width]*x` tail,
+  silu/identity epilogue, round-to-store, rolled `conv_state` bytes) and changes
+  ONLY two numerics-neutral mechanics: (a) a 2D grid (`blockIdx.y`=token,
+  x-dim=channel) that eliminates the shipped kernel's two int64 `idx/c_dim` +
+  `idx%c_dim` per thread; (b) the `k-1`-element state row register-cached
+  (WIDTH-templated {1,2,3,4} so it stays register-resident) and reused for both the
+  conv accumulation AND the roll-left instead of re-reading `state[j+1]` from
+  global. Grounded 1:1 in vLLM's FLA Triton `_causal_conv1d_update_kernel`
+  (`layers/mamba/ops/causal_conv1d.py:15-192` @ `e24d1b24`), which loads each
+  conv-state column ONCE into registers (`col0..col3`, per-`KERNEL_WIDTH`
+  specialized) and reuses them. Qwen GDN `linear_conv_kernel_dim=4` (state width
+  3), `conv_dim` 27B=10240, bf16 conv_state.
+- **DGX proof (flock, clean `-Werror` CUDA build 0 warnings, CUTLASS sm120a +
+  FA2 sm_121a hard-verified, `~/work/vllm.cpp-conv-update-fast`):** `test_ops_gdn`
+  conv-update decode-fast `fast==shipped` BYTE-EXACT (0-ulp) on BOTH `out` AND
+  rolled `conv_state` — 330/330 over k∈{3,4,5}, bf16+f32 state, both in/out dtypes,
+  ±bias, silu/identity, compact + scattered `cache_idx` (incl. NULL-block); full
+  `test_ops_gdn` 51/51 (2813); CPU flag test 10/10. ISOLATED nsys pure-kernel at
+  the 27B c16 decode shape (batch=16, conv_dim=10240, k=4, bf16, 8000 iters):
+  shipped median 7,072 ns (avg 7,229) vs fast 3,680 ns (avg 3,785) = **1.92×
+  median / 1.91× avg** — clears the ≥1.3× flip bar with margin (the win is
+  dominated by removing the int64 div/mod on this tiny latency-bound kernel plus
+  the register-cached state row). Default flipped ON per the parity-enabler policy.
+- **(2) FP4/SiLU default flip ON (row `KERNEL-GEMM-NVFP4-W4A4`).** The two
+  bit-identical decode-glue FP4-quant/SiLU fast kernels (`VT_FP4_QUANT_FAST`,
+  `VT_SILU_FP4_FAST`, landed OPT-IN at 861b518 because their ISOLATED speedup
+  missed the ≥1.3× bar at the dominant swizzled small-M shapes) are flipped DEFAULT
+  ON per the parity-enabler policy — byte-exact ⇒ never-slower + token-safe by
+  construction, and under the strict ≥1.0 gate every fraction counts. Predicate
+  parse in `fp4_quant_fast.h` inverted to default-ON `=0`-rollback; CPU flag test
+  RED→GREEN 20/20; CUDA byte-exact test scalar baseline arm → `=0`, re-verified
+  25/25 (26,976). No kernel-body change.
+- **FULL prospective default set (async + GDN cubin + RMSNorm-fast + gated-fast +
+  FP4-fast + SiLU-fast + conv-fast ALL ON):** `test_qwen27_paged_engine` **235/235**
+  (16/16 token-exact, token-6 near-tie = 198) + `test_qwen36_paged_engine`
+  **315/315**; combined `=0` rollback arms (conv/fp4/silu) 235/235 + 315/315. Every
+  kernel is bit-identical ⇒ the combined set stays token-exact (the a875397
+  all-bit-identical ⇒ safe lesson). Full ctest green; tools suite untouched
+  (no tools/ change; pytest not installed in any DGX venv → not re-run here).
+- Records: spec `specs/conv-update-decode-fast-2026-07-18.md`, kernel-matrix
+  (`KERNEL-SSM-MAMBA` + `KERNEL-GEMM-NVFP4-W4A4`), ledger 2026-07-18 (two rows),
+  README, BENCHMARKS, coordination `CLAIM-CONV-UPDATE-FAST-1`. `benchmark_binding=
+  false`; the orchestrator runs the binding re-grid to measure the in-situ effect.

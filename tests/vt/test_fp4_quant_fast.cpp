@@ -6,10 +6,11 @@
 //   VT_FP4_QUANT_FAST -> ScaledFp4QuantFastKernel
 //   VT_SILU_FP4_FAST  -> SiluAndMulFp4QuantFastKernel
 // The kernels themselves are CUDA-only; their BYTE-EXACT-vs-scalar bit-identity
-// and the default-off / "=1"-opt-in launch selection are DGX-gated CUDA cases in
-// tests/vt/test_ops_nvfp4_fp4.cpp. This suite pins the portable default-OFF /
-// '1'-opt-in parse so the opt-in contract is regression-covered on every
-// platform, not just DGX.
+// and the default-ON / "=0"-rollback launch selection are DGX-gated CUDA cases in
+// tests/vt/test_ops_nvfp4_fp4.cpp. This suite pins the portable default-ON /
+// '0'-rollback parse so the flip contract is regression-covered on every
+// platform, not just DGX. (2026-07-18, CLAIM-CONV-UPDATE-FAST-1: flipped ON per
+// the parity-enabler policy — bit-identical ⇒ never-slower + token-safe.)
 #include <doctest/doctest.h>
 
 #include "vt/cuda/fp4_quant_fast.h"
@@ -17,37 +18,36 @@
 using vt::cuda::Fp4QuantFastFlagIsOn;
 using vt::cuda::SiluFp4FastFlagIsOn;
 
-TEST_CASE("VT_FP4_QUANT_FAST defaults OFF; only a '1'-leading value opts in") {
-  // Default (unset) is OFF: the shipped scalar ScaledFp4QuantKernel stays the
-  // default; the orchestrator does the combined in-situ flip across the glue
-  // levers together.
-  CHECK_FALSE(Fp4QuantFastFlagIsOn(nullptr));
-  // Non-'1'-leading values stay OFF (the default).
-  CHECK_FALSE(Fp4QuantFastFlagIsOn(""));
-  CHECK_FALSE(Fp4QuantFastFlagIsOn("0"));
-  CHECK_FALSE(Fp4QuantFastFlagIsOn("off"));
-  CHECK_FALSE(Fp4QuantFastFlagIsOn("false"));
-  CHECK_FALSE(Fp4QuantFastFlagIsOn("2"));
-  CHECK_FALSE(Fp4QuantFastFlagIsOn(" 1"));  // leading space, not '1'
-  // Opt-in: FIRST character '1' selects the bit-identical vectorized-load fast
-  // kernel in the SAME binary.
+TEST_CASE("VT_FP4_QUANT_FAST defaults ON; only a '0'-leading value rolls back") {
+  // Default (unset) is ON: the bit-identical vectorized-load fast kernel is the
+  // production default per the parity-enabler policy.
+  CHECK(Fp4QuantFastFlagIsOn(nullptr));
+  // Non-'0'-leading values stay ON (the default).
+  CHECK(Fp4QuantFastFlagIsOn(""));
   CHECK(Fp4QuantFastFlagIsOn("1"));
-  CHECK(Fp4QuantFastFlagIsOn("1abc"));
-  CHECK(Fp4QuantFastFlagIsOn("11"));
+  CHECK(Fp4QuantFastFlagIsOn("off"));
+  CHECK(Fp4QuantFastFlagIsOn("false"));
+  CHECK(Fp4QuantFastFlagIsOn("2"));
+  CHECK(Fp4QuantFastFlagIsOn(" 0"));  // leading space, not '0'
+  // Rollback: FIRST character '0' selects the shipped scalar kernel in the SAME
+  // binary.
+  CHECK_FALSE(Fp4QuantFastFlagIsOn("0"));
+  CHECK_FALSE(Fp4QuantFastFlagIsOn("0abc"));
+  CHECK_FALSE(Fp4QuantFastFlagIsOn("00"));
 }
 
-TEST_CASE("VT_SILU_FP4_FAST defaults OFF; only a '1'-leading value opts in") {
-  // Default (unset) is OFF: the shipped scalar SiluAndMulFp4QuantKernel stays the
-  // default.
-  CHECK_FALSE(SiluFp4FastFlagIsOn(nullptr));
-  CHECK_FALSE(SiluFp4FastFlagIsOn(""));
-  CHECK_FALSE(SiluFp4FastFlagIsOn("0"));
-  CHECK_FALSE(SiluFp4FastFlagIsOn("off"));
-  CHECK_FALSE(SiluFp4FastFlagIsOn("false"));
-  CHECK_FALSE(SiluFp4FastFlagIsOn("2"));
-  CHECK_FALSE(SiluFp4FastFlagIsOn(" 1"));
-  // Opt-in: FIRST character '1'.
+TEST_CASE("VT_SILU_FP4_FAST defaults ON; only a '0'-leading value rolls back") {
+  // Default (unset) is ON: the shipped scalar SiluAndMulFp4QuantKernel is the
+  // rollback.
+  CHECK(SiluFp4FastFlagIsOn(nullptr));
+  CHECK(SiluFp4FastFlagIsOn(""));
   CHECK(SiluFp4FastFlagIsOn("1"));
-  CHECK(SiluFp4FastFlagIsOn("1abc"));
-  CHECK(SiluFp4FastFlagIsOn("11"));
+  CHECK(SiluFp4FastFlagIsOn("off"));
+  CHECK(SiluFp4FastFlagIsOn("false"));
+  CHECK(SiluFp4FastFlagIsOn("2"));
+  CHECK(SiluFp4FastFlagIsOn(" 0"));
+  // Rollback: FIRST character '0'.
+  CHECK_FALSE(SiluFp4FastFlagIsOn("0"));
+  CHECK_FALSE(SiluFp4FastFlagIsOn("0abc"));
+  CHECK_FALSE(SiluFp4FastFlagIsOn("00"));
 }

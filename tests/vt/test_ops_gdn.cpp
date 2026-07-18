@@ -1487,6 +1487,73 @@ void RunConvUpdateCudaCase(int64_t batch, int64_t c, int64_t k, bool with_bias, 
   CheckClose(st_gpu, st_cpu, 1e-6f, 0.0f);  // rolled raw values: exact
 }
 
+// VT_CONV_UPDATE_FAST: the fast decode conv-update kernel
+// (CausalConv1dUpdateFastKernel) is BIT-IDENTICAL (0-ulp) to the shipped
+// CausalConv1dUpdateKernel. It keeps shipped's exact float op order (bias init,
+// left-to-right conv accumulation, w[width]*x tail, silu/identity epilogue,
+// round-to-store) and rolled conv_state bytes; only the 2D-grid index math (no
+// int64 div/mod) and the register-cached state row differ. So both the `out`
+// activation AND the mutated conv_state MUST be byte-identical vs the rollback
+// kernel. Runs both arms with EXPLICIT env values ("1" fast / "0" rollback; the
+// launcher reads getenv per call) so the comparison is default-independent. Covers
+// the compact path and the scattered cache_idx path (incl. a NULL-block sentinel),
+// production bf16 state + f32 unit-test state, both in/out dtypes, and widths k in
+// {3,4,5} (the specialized fast widths; production Qwen GDN k=4). Skips w/o CUDA.
+void RunConvUpdateFastCase(int64_t batch, int64_t c, int64_t k, bool with_bias, bool silu,
+                           const Combo& cb, DType state_dtype, bool indexed, uint32_t seed) {
+  const int64_t width = k - 1;
+  const auto xf = RandomF32(static_cast<size_t>(batch * c), seed, -3.0f, 3.0f);
+  const auto wf = RandomF32(static_cast<size_t>(c * k), seed + 1, -1.0f, 1.0f);
+  const auto bf = RandomF32(static_cast<size_t>(c), seed + 2, -1.0f, 1.0f);
+  const auto xb = Pack(xf, cb.in);
+  const auto wb = Pack(wf, cb.in);
+  const auto bb = Pack(bf, cb.in);
+  const CausalConv1dArgs args{silu};
+
+  // Compact: one state row per token. Indexed: a larger cache with a NULL-block
+  // sentinel (slot -1) and one skipped physical slot, exercising the scatter path.
+  const int64_t slots = indexed ? batch + 1 : batch;
+  std::vector<int32_t> idx;
+  if (indexed) {
+    for (int64_t bt = 0; bt < batch; ++bt)
+      idx.push_back(bt == 1 ? -1 : static_cast<int32_t>(slots - 1 - bt));  // token 1 = NULL
+  }
+  const auto stf = RandomF32(static_cast<size_t>(slots * c * width), seed + 3, -2.0f, 2.0f);
+  const auto stb = Pack(stf, state_dtype);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard gq(gpu);
+  DeviceTensor dx(gpu, gq.q, cb.in, {batch, c}, xb.data());
+  DeviceTensor dw(gpu, gq.q, cb.in, {c, k}, wb.data());
+  DeviceTensor db(gpu, gq.q, cb.in, {c}, bb.data());
+  // cache_idx is read on-device (cache_idx[bt]); place it on the GPU.
+  DeviceTensor didx(gpu, gq.q, DType::kI32, {indexed ? batch : 1},
+                    indexed ? idx.data() : nullptr);
+
+  auto run = [&](bool fast, std::vector<uint8_t>& out_bytes, std::vector<uint8_t>& st_bytes) {
+    ::setenv("VT_CONV_UPDATE_FAST", fast ? "1" : "0", 1);
+    DeviceTensor dst(gpu, gq.q, state_dtype, {slots, c, width}, stb.data());
+    DeviceTensor dout(gpu, gq.q, cb.out, {batch, c});
+    // Preset out so the NULL-block token's untouched bytes are identical across arms.
+    gpu.Memset(gq.q, dout.tensor().data, 0x5a,
+               static_cast<size_t>(batch * c) * vt::SizeOf(cb.out));
+    vt::CausalConv1dUpdate(gq.q, dout.tensor(), dx.tensor(), dw.tensor(),
+                           with_bias ? &db.tensor() : nullptr, dst.tensor(), args,
+                           indexed ? &didx.tensor() : nullptr);
+    out_bytes.resize(static_cast<size_t>(batch * c) * vt::SizeOf(cb.out));
+    st_bytes.resize(static_cast<size_t>(slots * c * width) * vt::SizeOf(state_dtype));
+    dout.Download(gq.q, out_bytes.data());
+    dst.Download(gq.q, st_bytes.data());
+  };
+  std::vector<uint8_t> out_ref, st_ref, out_fast, st_fast;
+  run(/*fast=*/false, out_ref, st_ref);
+  run(/*fast=*/true, out_fast, st_fast);
+  ::unsetenv("VT_CONV_UPDATE_FAST");
+  // BIT-EXACT (0-ulp): fast==shipped by construction — raw bytes must match.
+  CHECK(out_fast == out_ref);  // out activation byte-identical
+  CHECK(st_fast == st_ref);    // rolled conv_state byte-identical
+}
+
 // l2norm CPU-vs-CUDA on one shape (rank 2 or 3).
 void RunL2NormCudaCase(const std::vector<int64_t>& shape, const Combo& cb, uint32_t seed) {
   size_t numel = 1;
@@ -2171,6 +2238,40 @@ TEST_CASE("CUDA causal_conv1d_update matches CPU") {
     seed += 10;
   }
   RunConvUpdateCudaCase(3, 512, 4, /*with_bias=*/false, /*silu=*/true, kCudaCombos[0], seed);
+}
+
+TEST_CASE("CUDA causal_conv1d_update decode-fast (VT_CONV_UPDATE_FAST) matches rollback 0-ulp") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  // fast==shipped BYTE-EXACT (0-ulp) on both `out` and the rolled conv_state.
+  // Production shape is Qwen GDN k=4 (state width 3), bf16 conv_state; also sweep
+  // k in {3,5} (the other specialized fast widths), f32 state (unit test), both
+  // in/out dtypes, with/without bias, silu/identity, compact + scattered cache.
+  uint32_t seed = 9300;
+  for (const Combo& cb : kCudaCombos) {
+    CAPTURE(static_cast<int>(cb.in));
+    CAPTURE(static_cast<int>(cb.out));
+    for (int64_t k : {3, 4, 5}) {
+      for (DType st : {DType::kBF16, DType::kF32}) {
+        for (bool bias : {false, true}) {
+          for (bool indexed : {false, true}) {
+            CAPTURE(k);
+            CAPTURE(static_cast<int>(st));
+            CAPTURE(bias);
+            CAPTURE(indexed);
+            // Real decode conv_dim scale (27B/35B conv_dim ~ thousands) + silu gate.
+            RunConvUpdateFastCase(16, 2048, k, bias, /*silu=*/true, cb, st, indexed, seed);
+            seed += 7;
+          }
+        }
+      }
+    }
+  }
+  // A single-token (c1) decode and a wider channel span, identity activation.
+  RunConvUpdateFastCase(1, 4096, 4, /*bias=*/true, /*silu=*/false, kCudaCombos[2], DType::kBF16,
+                        /*indexed=*/true, seed);
 }
 
 TEST_CASE("CUDA l2norm matches CPU (rank 2 and 3)") {

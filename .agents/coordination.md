@@ -256,3 +256,26 @@ This keeps `.agents/` focused on current work without losing the discoverable
 list of what the project supports.
 
 - 2026-07-17: `CLAIM-EW-NORM-ACT-1` RELEASED — `KERNEL-EW-NORM-ACT` decode-fast RMSNorm proof PASSED (gate3 token gates both flags/models; gate4 corrected-build c16 A/B +1.1% tput / −1.7 ms TPOT) and `VT_RMSNORM_DECODE_FAST` default flipped ON (`=0` rollback). Verdict in [the spec](specs/rmsnorm-decode-fast-2026-07-16.md) + ledger 2026-07-17 row; row `KERNEL-EW-NORM-ACT` → `DONE`. Finalized by the orchestrator after the owning agent was repeatedly terminated by API-529 overloads (work verified, not re-done).
+
+- 2026-07-18: `CLAIM-CONV-UPDATE-FAST-1` RELEASED — the two decode-glue headroom
+  levers LANDED bit-identical and DEFAULT ON. **(1)** GDN decode conv-update
+  decode-fast (`KERNEL-SSM-MAMBA` sub-lever; row stays `INVENTORIED`):
+  `CausalConv1dUpdateFastKernel` behind `VT_CONV_UPDATE_FAST` (default ON, `=0`
+  rollback) — 0-ulp bit-exact vs shipped (330/330 on `out`+`conv_state`), isolated
+  nsys **1.92×** at the 27B c16 shape (batch=16 conv_dim=10240 k=4 bf16: shipped
+  7,072 vs fast 3,680 ns median), clearing the ≥1.3× flip bar. **(2)**
+  `VT_FP4_QUANT_FAST` + `VT_SILU_FP4_FAST` flipped DEFAULT ON per the parity-enabler
+  policy (`KERNEL-GEMM-NVFP4-W4A4`; bit-identical bodies unchanged). Full prospective
+  default set (async + cubin + RMSNorm-fast + gated-fast + FP4-fast + SiLU-fast +
+  conv-fast ALL ON): 27B `test_qwen27_paged_engine` 235/235 (tok6=198) + 35B
+  `test_qwen36_paged_engine` 315/315; combined `=0` rollback arms 235/235 + 315/315;
+  `test_ops_gdn` 51/51, `test_ops_nvfp4_fp4` 25/25, flag tests 30/30; clean `-Werror`
+  CUDA build 0 warnings, CUTLASS sm120a + FA2 sm_121a hard-verified, one flock.
+  (Full ctest: the ONLY two failures — `test_capi` 107/109 + `test_op_parity` op-41
+  `kCastF32` no-CPU-kernel — are PRE-EXISTING on pristine `a7d08d7`, verified by a
+  stash-rebuild-run; independent of this CUDA-only diff.) Records: spec
+  [conv-update-decode-fast-2026-07-18.md](specs/conv-update-decode-fast-2026-07-18.md),
+  kernel-matrix (`KERNEL-SSM-MAMBA` + `KERNEL-GEMM-NVFP4-W4A4`), ledger 2026-07-18
+  (two rows), state, README, BENCHMARKS. `benchmark_binding=false`; the orchestrator
+  runs the binding re-grid for the in-situ effect. Evidence
+  `dgx:~/work/vllm.cpp-conv-update-fast`.

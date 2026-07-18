@@ -48,8 +48,17 @@ concurrency + throughput, not a capability gap. Scheduler + async placeholder ar
 byte-identical (no vLLM policy to mirror); the only structural fix (true
 async-forward executor) risks the c16/c32 wins with no throughput basis, and forced
 de-phase is a fake fix — so NO code change. Closing path for the seven decode-floor
-axes: fold in the landed bit-identical FP4-quant/SiLU glue kernels (`861b518`,
-opt-in) + the GDN conv-update lever; characterize the c4 TTFT lottery vs run-noise.
+axes: the batch-independent glue is now all landed BIT-IDENTICAL and DEFAULT ON
+(2026-07-18, `CLAIM-CONV-UPDATE-FAST-1`) — the two FP4-quant/SiLU fast kernels
+flipped ON (parity-enabler policy, `861b518` bodies unchanged, `=0` rollback) and
+the new GDN decode conv-update fast kernel (`CausalConv1dUpdateFastKernel`,
+`VT_CONV_UPDATE_FAST` default ON, 0-ulp bit-identical, **isolated 1.92×** at the 27B
+c16 shape via a 2D grid removing two int64 div/mod per thread + a register-cached
+state row; DGX byte-exact 330/330, full default set 27B 235/235 + 35B 315/315). The
+next binding grid runs the full bit-identical fast-decode stack by default and
+re-measures the in-situ effect; characterize the c4 TTFT lottery vs run-noise.
+`benchmark_binding=false` for these levers — no isolated speed credit; the grid owns
+the in-situ number.
 
 ### Prior binding narrative (`246a23c`, superseded 2026-07-17, retained)
 

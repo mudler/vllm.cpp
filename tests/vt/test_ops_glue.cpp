@@ -48,6 +48,23 @@ TEST_CASE("cast_bf16: f32 -> bf16 rounds each element") {
 }
 
 // ---------------------------------------------------------------------------
+// cast_f32: out[i] = f32(in[i]) (bf16 -> f32 widen). CPU sibling of the CUDA
+// CastF32 kernel; mirrors cast_bf16 so both cast directions are backend-complete
+// on CPU. Widening bf16 -> f32 is exact (no rounding), so out == BF16ToF32(in).
+TEST_CASE("cast_f32: bf16 -> f32 widens each element") {
+  std::vector<float> src = {1.0f, -2.5f, 0.333333f, 100.0f, -0.0f};
+  std::vector<uint16_t> in(src.size(), 0);
+  for (size_t i = 0; i < src.size(); ++i) in[i] = vt::F32ToBF16(src[i]);
+  std::vector<float> out(in.size(), 0.0f);
+  Tensor ti = Bf16(in, {1, static_cast<int64_t>(in.size())});
+  Tensor to = F32(out, {1, static_cast<int64_t>(out.size())});
+  Queue q = Q();
+  vt::CastF32(q, to, ti);
+  for (size_t i = 0; i < in.size(); ++i)
+    CHECK(out[i] == doctest::Approx(vt::BF16ToF32(in[i])));
+}
+
+// ---------------------------------------------------------------------------
 // attn_gate_split: qgate [T, Hq*2*Dh] -> q_out/gate_out [T,Hq,Dh].
 //   T=2, Hq=2, Dh=2. Row layout per (t,hq): [q0 q1 | g0 g1].
 TEST_CASE("attn_gate_split: splits [q|gate] per head") {

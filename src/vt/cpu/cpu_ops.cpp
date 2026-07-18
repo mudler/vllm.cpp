@@ -1187,6 +1187,16 @@ void CastBf16Kernel(Queue&, Tensor& out, const Tensor& in) {
   });
 }
 
+// out[i] = (float)in[i]; out f32, in bf16, same element count. CPU sibling of
+// the CUDA CastF32 kernel (bf16 -> f32 widen); LoadF32 reads the bf16 source as
+// f32 and StoreF32 writes it to the f32 destination (widening is exact).
+void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
+  const int64_t n = out.Numel();
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) StoreF32(out, i, LoadF32(in, i));
+  });
+}
+
 // Split fused [T, Hq*2*Dh] q/gate projection into q_out/gate_out [T,Hq,Dh].
 void AttnGateSplitKernel(Queue&, Tensor& q_out, Tensor& gate_out, const Tensor& qgate) {
   const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
@@ -1512,6 +1522,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
     RegisterOp(OpId::kCastBf16, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
+    RegisterOp(OpId::kCastF32, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastF32Kernel)));
     RegisterOp(OpId::kAttnGateSplit, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AttnGateSplitFn>(&AttnGateSplitKernel)));
     RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kCPU,

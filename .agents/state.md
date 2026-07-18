@@ -12877,3 +12877,50 @@ Two independent full binding grids now exist: `9ecd9d0` (114/124) and `f0fb727` 
 - c16/c32 median_itl (2): the median side of the same median-vs-tail tradeoff; we win the c16/c32 tails and throughput.
 
 **Verdict: effective PARITY-OR-BETTER reached.** No axis is meaningfully or closeably slower. The 9 residuals are the low-concurrency-median cost of deterministic graphed kernels that BUY tighter tails + better high-concurrency behavior + throughput. The only "fix" is injecting vLLM-like async-forward jitter, which forfeits those wins and has no throughput basis (vLLM's own async is −0.7%) — net-negative for low-conc medians we'd trade our tail wins to win. Correctness precondition holds throughout (full default set 27B 235/235 + 35B 315/315). A literal per-run 124/124 is gated by ~5 noise-band coin-flips + this favorable tradeoff, not by any real deficit.
+
+---
+
+## 2026-07-18 — CPU-test-debt sweep: `kCastF32` CPU kernel registered; `test_capi`/`test_op_parity` confirmed GREEN on origin/main
+
+**Task:** fix two reported PRE-EXISTING CPU test failures on `main` (`test_capi`
+107/109; `test_op_parity` op-41 `kCastF32` "no kernel on device type 0"). Worktree
+`agent-a09b0a9c7fc0b9af6`, base reset to `origin/main` = `bcf7df7`. CPU-only
+(nvcc absent → `VLLM_CPP_CUDA` AUTO→OFF), no GPU touched (35B grid untouched).
+
+**Environmental blocker found + remediated:** the box root FS was 100% full
+(3.6M free) → the first clean build died mid-compile with `No space left on
+device` (ENOSPC), leaving a PARTIAL binary — which is the most likely origin of
+the reported symptoms (missing kernel registrations → "no kernel on device 0";
+missing/failed assertions → 107/109). Reclaimed 14G via `go clean -cache`
+(`~/.cache/go-build`, purely regenerable); no user data or benchmark evidence
+touched.
+
+**Reproduction on a CLEAN build (disk freed):**
+- `test_capi` **PASSES 14 cases / 109 assertions** (0 fail).
+- `test_op_parity` **PASSES 10 cases / 123 assertions** (0 fail).
+- Full CTest green (the lone `test_openai_conformance` "failure" under `-j` is the
+  documented HTTP/engine-proc parallel port/timeout flake — 0.35s PASS in
+  isolation). So the two reported failures do NOT reproduce on `origin/main`;
+  the relevant sources are also unchanged across `a875397..bcf7df7` (10 commits),
+  and the prior `ctest-revert.log` recorded 117/117 green.
+
+**Real gap the task named (fixed test-first):** `kCastF32` genuinely had NO CPU
+kernel — only CUDA (`cuda_glue.cu:291`), while the sibling `kCastBf16` (f32→bf16)
+is registered on BOTH CPU (`cpu_ops.cpp`) and CUDA. Nothing in the CPU test paths
+exercised `vt::CastF32` (its two model call sites — MoE Marlin dequant and the
+bf16-V reference-attention upcast — are CUDA/config-guarded and unreached by the
+synthetic CPU engine), which is why the asymmetry never surfaced as a failing
+test. Added a `cast_f32` CPU op test in `tests/vt/test_ops_glue.cpp` that
+reproduced the EXACT reported error (`no kernel for op 41 on device type 0`, RED),
+then registered `CastF32Kernel` (mirror of `CastBf16Kernel`) in
+`src/vt/cpu/cpu_ops.cpp` → GREEN (`test_ops_glue` 8/8, 69 asserts). This makes the
+described op-41 failure impossible on CPU and makes both cast directions
+backend-complete on CPU.
+
+**Gates:** clean full `-Werror` CPU build 0 warnings; full CPU CTest green;
+tools `python3 -m unittest discover -s tests/tools -t . -q` **164/164**;
+`check-agent-record.py` + `check-doc-checkpoint.py` green. Records: this state
+entry, one append-only parity-ledger row, README kernel-coverage note,
+BENCHMARKS NOT-APPLICABLE note. No matrix/roadmap lifecycle shift
+(`KERNEL-EW-NORM-ACT` "casts and glue" is already `DONE`; this is CPU-side
+completeness within it). `benchmark_binding=false`, no speed credit.

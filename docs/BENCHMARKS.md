@@ -882,6 +882,16 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   --evidence "$EVIDENCE" --build-dir "$BUILD" --configure-log "$CONFIGURE_LOG"
 ```
 
+## Correctness-only changes (benchmark disposition NOT APPLICABLE)
+
+- **CPU `kCastF32` kernel registration (2026-07-18).** Registered the missing
+  CPU `bf16→f32` cast kernel so the CPU backend supports both cast directions
+  (mirrors the already-present `f32→bf16` `kCastBf16`), closing a CPU
+  op-registration asymmetry. CPU-only op registration + unit test; no CUDA path
+  change and no gate-workload impact, so **NOT APPLICABLE** to the throughput /
+  latency / memory scoreboard. Verified by `test_ops_glue` (`cast_f32` RED→GREEN)
+  and the full CPU CTest suite.
+
 ## Benchmark policy
 
 - Correctness is a precondition and cannot be traded for speed.

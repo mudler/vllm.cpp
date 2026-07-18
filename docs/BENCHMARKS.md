@@ -538,12 +538,16 @@ beats vLLM's 13.3 GB steady), token-neutral (315/315+235/235), memcheck clean.
 The grid's whole-window `peak_pss` (~20.2 GiB) load-phase coexistence — all
 routed-expert host copies coexisting during `LoadQwen3_5Moe` before
 `PrepareMarlinResident` freed them — is now addressed by the **load-time streaming
-interleave (2026-07-18, `ENG-MOE-LOADSTREAM`, CPU-gated; DGX peak-PSS A/B +
-token gate PENDING the orchestrator re-grid):** the loader DEFERS the routed
-experts and `PrepareMarlinResident` builds+frees them one layer at a time, so at
-most one layer's ~256 experts coexist on the host (device Marlin residents
-byte-identical — only the host-copy lifetime changes). Target peak PSS/RSS
-~19.8→~4-5 GiB (below vLLM 13.3). (2)
+interleave (2026-07-18, `ENG-MOE-LOADSTREAM`, DGX-PROVEN):** the loader DEFERS the
+routed experts and `PrepareMarlinResident` builds+frees them one layer at a time,
+so at most one layer's ~256 experts coexist on the host (device Marlin residents
+byte-identical — only the host-copy lifetime changes). DGX A/B (`~/work/vllm.cpp-mem35-loadstream`
+new vs `-parent` 7a1a6d6 eager, production flags, one flock): 35B load-to-ready
+**peak RSS (VmHWM) 21.43→4.19 GiB (−17.24 GiB / −80%, below vLLM 13.3)**; token
+byte-identical both binaries (315/315 + 235/235); 27B unaffected (24.8 GiB
+baseline, dense loader); `compute-sanitizer memcheck` on the deferred load path
+0 errors / 315. `benchmark_binding=false` — the orchestrator re-grids the binding
+`peak_pss`/`peak_rss` axes to confirm the FAIL→PASS flip. (2)
 **low-batch decode** — the
 Marlin MoE grouped-GEMM is inefficient at batch=1 (c1 TPOT 0.734×) but scales to
 WINNING at c16/c32 (TPOT 1.05×); (3) **TTFT** 0.80–0.86× at all concurrencies

@@ -13219,3 +13219,30 @@ Coordination note: shares `qwen3_5.cpp` / `model_registry.cpp` FILES with
 `CLAIM-MOE-DECODE-PARALLEL-1` (4 memset lines) but touches DISTINCT functions
 (`PrepareMarlinResident` / `MaterializeAllDeferredExperts` / `LoadQwen3_5MoeModel`
 / `ModelSource`) — no line overlap.
+
+### 2026-07-18 — `ENG-MOE-LOADSTREAM` DGX-PROVEN (A/B + token + memcheck)
+
+Landed `ce7e1a0`. DGX gates on GB10 (`~/work/vllm.cpp-mem35-loadstream` new vs
+`~/work/vllm.cpp-mem35-parent` @ 7a1a6d6 eager; both clean `-Werror` 0-warn CUDA
+builds, CUTLASS sm120a + Marlin NVFP4 + FA2 sm_121a hard-verified; one flock):
+- **Memory (the win):** 35B load-to-ready peak RSS (VmHWM via `/usr/bin/time -v`
+  on `test_qwen36_paged_engine`, which loads via `FromModelDir` = the deferred
+  interleave path): **parent (eager) 21.43 GiB → new (interleave) 4.19 GiB**
+  (−17.24 GiB, −80.4%; below vLLM's 13.3 GiB). Same VmHWM method as the
+  `LOAD-SAFETENSORS` windowed-load A/B.
+- **27B unaffected:** peak RSS 24.8 GiB (matches its ~24.88 GiB baseline) — the
+  27B uses the dense loader (`LoadQwen3_5Dense`, true-W4A4), no deferral.
+- **Token byte-identical:** both binaries — 35B `test_qwen36_paged_engine`
+  315/315 + 27B `test_qwen27_paged_engine` 235/235 (confirms the load-lifetime
+  change does not alter tokens).
+- **memcheck:** `compute-sanitizer --tool memcheck` on the full deferred load +
+  decode (`test_qwen36_paged_engine`) = **0 errors, 315/315** (no use-after-free
+  of the per-layer-freed host bytes; the multi-request batched decode is the
+  c2-equivalent concurrency smoke — clean).
+- **CPU:** clean `-Werror` build, full ctest (3 HTTP/engine-proc parallel-port
+  flakes pass isolated), tools 164/164, coexistence-bound contract test 127
+  assertions (peak==1, move-safe closure).
+
+VERDICT: the binding memory axes `peak_pss`/`peak_rss` (2/4 FAIL) should now
+FLIP to PASS — ours 35B load-to-ready peak ~4.19 GiB vs vLLM 13.3 GiB.
+`benchmark_binding=false`; the orchestrator re-grids the binding to confirm.

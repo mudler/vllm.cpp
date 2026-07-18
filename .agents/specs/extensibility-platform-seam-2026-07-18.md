@@ -8,12 +8,20 @@ is extracted: `include/vllm/platforms/interface.h` (`class Platform` composes
 `DeviceType`) + `tests/vllm/platforms/test_platform.cpp`. The 7 true
 platform/memory-model/residency `device.type == kCUDA` sites (runner KV-residency
 + async combine/scatter, model_registry decode-graph gate, qwen3_5
-`ResidentWeight`/`ResidentWeightF32`) route through `CurrentPlatform().is_cuda()`;
+`ResidentWeight`/`ResidentWeightF32`) route through
+**`GetPlatform(<obj>.device.type).is_cuda()`** — keyed on the OBJECT's own device;
 kernel-shape dispatch branches deliberately left for items 4/5;
 `get_attn_backend_priority()` is a stub for item 4; `qwen3_5.cpp` NOT split
 (item 5). Behavior-preserving: clean CPU `-Werror` build, `test_platform` PASS,
 full CPU CTest green, tools 164/164, checkers green; DGX 27B 235/235 + 35B
-315/315 is the pending confirmation. Items 2/4/5/6 build on this.
+315/315 confirmed. Items 2/4/5/6 build on this.
+
+**REGRESSION FIX 2026-07-18 (`CLAIM-BACKEND-PLATFORM-1`).** The 7 per-object
+sites were wrongly using the process-global `CurrentPlatform().is_cuda()`, which
+is accelerator-first and so mis-routes a CPU queue/tensor on a GPU box into the
+CUDA branch (red DGX CPU tests). Fixed to per-object
+`GetPlatform(<obj>.device.type).is_cuda()`; `test_platform` fallback assertion
+tier-guarded; see the Risks/decisions correction below and the parity ledger.
 
 
 **User directive (post-27B-parity):** make adding a new GPU/arch/model an
@@ -195,10 +203,20 @@ DGX model-gate confirmation. All landed in one change except the DGX gate.
 
 ### Risks/decisions
 
-`CurrentPlatform()` returns the process's single active compute device, so
-`CurrentPlatform().is_cuda()` is byte-equivalent to the old per-queue
-`device.type == kCUDA` in every real path (the engine runs on one device);
-recorded as behavior-preserving. Decision (not a product call): only
+**CORRECTION (2026-07-18, regression fix under `CLAIM-BACKEND-PLATFORM-1`).** The
+original migration routed the 7 per-object sites through
+`CurrentPlatform().is_cuda()` on the false premise that it is byte-equivalent to
+the old per-queue `device.type == kCUDA`. It is NOT: `CurrentPlatform()` is
+accelerator-first and process-global, so on ANY GPU box it returns the CUDA
+platform regardless of the tensor/queue being operated on — a CPU queue/tensor on
+a GPU box wrongly took the CUDA branch (red CPU tests on DGX: `test_platform`
+no-accelerator fallback, `test_qwen27_dense_forward` maxd=0). FIX: the 7 sites
+now key on the OBJECT's device via `GetPlatform(<obj>.device.type).is_cuda()`
+(per-tensor-correct, KEEPS the seam). `CurrentPlatform()` is reserved for genuine
+process-level "which accelerator is this process on" questions (none among the 7).
+The `test_platform` no-accelerator fallback assertion is now tier-guarded
+(CPU-only tier asserts CPU fallback; a GPU box asserts accelerator-first), with a
+device-correct `GetPlatform(kCPU).is_cpu()` invariant on every tier. Decision (not a product call): only
 memory-model/residency branches migrate now; kernel-shape dispatch is left for
 the attention/kernel-registry items — no vLLM-defined behavior is reopened.
 `residency_policy()` is advertisement only (item 2 wires it), so current

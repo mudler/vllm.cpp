@@ -54,12 +54,27 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   CHECK(cpu.get_attn_backend_priority() == 0);
 }
 
-TEST_CASE("CurrentPlatform falls back to CPU when no accelerator is registered") {
-  // On the CPU test tier no CUDA/XPU/etc. platform is registered, so the
-  // accelerator-first resolution lands on CPU.
+TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") {
+  // CurrentPlatform() answers the PROCESS-level "what accelerator is this
+  // process on" question (interface.h:104): accelerator-first, CPU fallback. It
+  // is NOT a per-tensor device test — a CPU queue/tensor on a GPU box keys on
+  // GetPlatform(device.type), never on this (see BACKEND-PLATFORM). So the
+  // fallback-to-CPU assertion can only hold on the CPU-only tier; on a GPU box
+  // (or the DGX CUDA build) an accelerator IS registered and wins.
   Platform& current = CurrentPlatform();
-  CHECK(current.is_cpu());
-  CHECK(&current == &GetPlatform(DeviceType::kCPU));
+  const bool has_accelerator =
+      HasPlatform(DeviceType::kCUDA) || HasPlatform(DeviceType::kXPU) ||
+      HasPlatform(DeviceType::kVULKAN) || HasPlatform(DeviceType::kMETAL);
+  if (has_accelerator) {
+    // Accelerator-first: the process platform is the accelerator, not CPU.
+    CHECK_FALSE(current.is_cpu());
+  } else {
+    // CPU-only tier: the resolution falls back to CPU.
+    CHECK(current.is_cpu());
+    CHECK(&current == &GetPlatform(DeviceType::kCPU));
+  }
+  // Device-correct invariant on every tier: the CPU platform is always CPU.
+  CHECK(GetPlatform(DeviceType::kCPU).is_cpu());
 }
 
 TEST_CASE("unregistered platform throws / HasPlatform reports false") {

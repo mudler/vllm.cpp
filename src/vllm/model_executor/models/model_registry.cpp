@@ -20,7 +20,7 @@
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
-#include "vllm/platforms/interface.h"  // CurrentPlatform() memory-model capability seam
+#include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor memory-model seam
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
 #include "vt/dtype.h"
@@ -229,7 +229,7 @@ ForwardLogits ForwardQwen3_5Moe(LoadedModel& model,
   auto& qwen = static_cast<Qwen3_5MoeLoadedModel&>(model);
   const Qwen3_5MoeWeights& weights = qwen.weights();
   const bool fp4_cuda =
-      vllm::platforms::CurrentPlatform().is_cuda() &&
+      vllm::platforms::GetPlatform(input.queue.device.type).is_cuda() &&
       !weights.layers.empty() &&
       !weights.layers.front().moe.expert_gate_fp4.empty();
   constexpr int kMaxDecodeGraphBatch = 64;
@@ -264,7 +264,7 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
   auto& qwen = static_cast<Qwen3_5DenseLoadedModel&>(model);
   const Qwen3_5DenseWeights& weights = qwen.weights();
   const bool fp4_cuda =
-      vllm::platforms::CurrentPlatform().is_cuda() &&
+      vllm::platforms::GetPlatform(input.queue.device.type).is_cuda() &&
       !weights.layers.empty() &&
       !weights.layers.front().mlp.gate_proj_fp4.Empty();
   constexpr int kMaxDecodeGraphBatch = 64;

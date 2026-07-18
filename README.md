@@ -187,13 +187,17 @@ a `Platform` composes the `vt::Backend` and answers the memory-model /
 capability queries the engine and model code used to branch on inline
 (`is_cuda()`, `is_unified_memory()`, `has_device_capability()`,
 `supported_dtypes()`, `residency_policy()`, `supports_graph_capture()`), self-registered
-per `DeviceType` (`CurrentPlatform()`). The residency/host-weight-release +
-device-pool memory-model conditionals now route through
-`CurrentPlatform()`, so a new discrete/unified GPU's memory model becomes one
-additive `platforms/<gpu>.cpp` rather than scattered engine/model edits. This is
-a behavior-preserving refactor (both gate models stay token-exact); kernel-shape
-dispatch branches are deliberately left for the later attention/kernel-registry
-items.
+per `DeviceType`. The residency/host-weight-release + device-pool memory-model
+conditionals branch **per object** through `GetPlatform(<obj>.device.type)` —
+keyed on the specific tensor/queue being dispatched, so a new discrete/unified
+GPU's memory model becomes one additive `platforms/<gpu>.cpp` rather than
+scattered engine/model edits. (`CurrentPlatform()` — the process-global
+accelerator-first resolver — is reserved for genuine process-level "which
+accelerator is this process on" questions; using it for per-object dispatch
+would misroute a CPU queue/tensor on a GPU box, so the memory-model/residency
+sites key on the object's own device.) This is a behavior-preserving refactor
+(both gate models stay token-exact); kernel-shape dispatch branches are
+deliberately left for the later attention/kernel-registry items.
 
 ### Kernel coverage on the gate path
 

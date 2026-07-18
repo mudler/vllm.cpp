@@ -12,7 +12,7 @@
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
-#include "vllm/platforms/interface.h"  // CurrentPlatform() memory-model residency seam
+#include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor residency seam
 
 #include <algorithm>
 #include <array>
@@ -676,7 +676,7 @@ std::vector<float> WeightF32(const OwnedTensor& w) {
 // the const_cast is safe. `shape` defaults to the owned shape.
 Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
-  if (!vllm::platforms::CurrentPlatform().is_cuda())
+  if (!vllm::platforms::GetPlatform(d.q.device.type).is_cuda())
     return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
                       shape);
   if (!w.d_dev) {
@@ -697,7 +697,7 @@ Tensor ResidentWeightF32(Dev d, const OwnedTensor& w,
                          const std::vector<int64_t>& shape) {
   if (!w.d_dev_f32) {
     std::vector<float> f = WeightF32(w);
-    if (!vllm::platforms::CurrentPlatform().is_cuda()) {
+    if (!vllm::platforms::GetPlatform(d.q.device.type).is_cuda()) {
       auto* buf = new std::vector<float>(std::move(f));
       w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
     } else {

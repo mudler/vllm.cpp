@@ -527,6 +527,8 @@ residency memory — a distinct campaign from the 27B decode-kernel close.
 
 **Platform seam (extensibility item 1) DGX-confirmed 2026-07-18** — behavior-preserving refactor, both model gates token-exact (27B 235/235 + 35B 315/315), CUDA -Werror-clean; NOT APPLICABLE to perf (no numeric change). See the parity ledger.
 
+**Platform seam per-tensor correctness regression FIXED 2026-07-18** — the 7 migrated sites were keyed on the process-global `CurrentPlatform().is_cuda()` (accelerator-first), which mis-routed a CPU queue/tensor on a GPU box into the CUDA branch (red DGX CPU tests). Fixed to per-object `GetPlatform(<obj>.device.type).is_cuda()`; also guarded a separate `6a8c5cf` CPU-build breakage (`test_ops_moe_grouped` unguarded CUDA symbol). Dual-config gate: CPU 122/122 CTest + tools 164/164 + checkers green; DGX CPU-tier tests on the GPU box + 27B 235/235 + 35B 315/315. NOT APPLICABLE to perf (correctness fix, no numeric change). See the parity ledger.
+
 ## Current checkpoint
 
 | Track | Disposition | Current evidence | Next binding gate |

@@ -103,9 +103,11 @@ bool HasPlatform(DeviceType type);
 
 // The process's active compute platform: the highest-priority registered
 // accelerator, else CPU — mirrors vLLM resolving `current_platform` by probing
-// for an accelerator and falling back to CPU. In our single-device builds this
-// is the device every engine queue runs on, so `CurrentPlatform().is_cuda()` is
-// exactly the old per-queue `device.type == kCUDA` test.
+// for an accelerator and falling back to CPU. This answers ONLY the process-level
+// "what accelerator is this process on" question. It is NOT a per-tensor device
+// test: on a GPU box it returns the CUDA platform regardless of the object being
+// operated on, so a CPU queue/tensor on a GPU box would wrongly read as CUDA. For
+// per-object device dispatch use `GetPlatform(<obj>.device.type)` (BACKEND-PLATFORM).
 Platform& CurrentPlatform();
 
 }  // namespace vllm::platforms

@@ -448,6 +448,11 @@ TEST_CASE("moe_grouped_gemm_nvfp4 validates shapes loudly (CPU dispatch)") {
 // softmax + comparison-only argmax with the same lowest-index tie-break); this
 // test pins it on adversarial inputs — exact ties, near-ties, uneven loads, and
 // M in {1,8,16}, for f32 and bf16 logits (bf16 rounding manufactures ties).
+// Guarded on VLLM_CPP_CUDA: the parallel-vs-serial cross-check calls the
+// CUDA-only reference vt::cuda::MoeRouterTopKSerialCuda (cuda_moe.cu), so a
+// runtime HasCuda() skip is not enough — the symbol is undefined at link time
+// on a CPU build. (Matches the CUDA-only guard on test_ops_gdn.cpp:1176.)
+#ifdef VLLM_CPP_CUDA
 TEST_CASE("CUDA moe_router_topk parallel == serial byte-for-byte (adversarial)") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");
@@ -534,6 +539,7 @@ TEST_CASE("CUDA moe_router_topk parallel == serial byte-for-byte (adversarial)")
     }
   }
 }
+#endif  // VLLM_CPP_CUDA
 
 #ifdef VT_MARLIN_NVFP4
 #include "vt/cuda/marlin_repack.h"

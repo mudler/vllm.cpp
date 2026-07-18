@@ -884,6 +884,21 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Platform seam extraction (2026-07-18, `BACKEND-PLATFORM`).** A
+  behavior-preserving refactor: added the C++ `Platform` capability seam
+  (`include/vllm/platforms/interface.h` + `src/vllm/platforms/{platform,cpu,cuda}.cpp`,
+  faithful mirror of `vllm/platforms/interface.py:134-229`) and migrated the 7
+  memory-model / residency conditionals (KV-cache device residency + async
+  device combine/scatter in `runner.cpp`, the decode-graph CUDA gate in
+  `model_registry.cpp`, the host→device weight-residency branches in
+  `qwen3_5.cpp`) from inline `device.type == kCUDA` tests to
+  `CurrentPlatform()` capability calls. No kernel/numeric/dispatch change (the
+  same branch is taken on CUDA/CPU as before), so **NOT APPLICABLE** to the
+  throughput / latency / memory scoreboard. Verified by the new `test_platform`
+  unit test, the full CPU CTest suite, and (behavior-preserving ⇒ must be
+  unchanged) both DGX model gates `test_qwen27_paged_engine` 235/235 +
+  `test_qwen36_paged_engine` 315/315.
+
 - **CPU `kCastF32` kernel registration (2026-07-18).** Registered the missing
   CPU `bf16→f32` cast kernel so the CPU backend supports both cast directions
   (mirrors the already-present `f32→bf16` `kCastBf16`), closing a CPU

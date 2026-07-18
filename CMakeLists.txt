@@ -201,6 +201,8 @@ add_library(vllm STATIC
   src/vllm/v1/worker/gpu/prepare_inputs.cpp
   src/vllm/v1/worker/gpu/async_output.cpp
   src/vllm/v1/worker/gpu/runner.cpp
+  src/vllm/platforms/platform.cpp
+  src/vllm/platforms/cpu.cpp
   src/vllm/v1/attention/backend.cpp
   src/vllm/v1/attention/backends/utils.cpp
   src/vllm/v1/attention/backends/gdn_attn.cpp
@@ -272,6 +274,7 @@ if(VLLM_CPP_CUDA)
     target_compile_definitions(vllm PUBLIC VT_BENCH_PROFILE_CONTROL=1)
   endif()
   target_sources(vllm PRIVATE
+    src/vllm/platforms/cuda.cpp
     src/vt/cuda/cuda_backend.cu
     src/vt/cuda/cuda_dropin.cu
     src/vt/cuda/cuda_matmul.cu

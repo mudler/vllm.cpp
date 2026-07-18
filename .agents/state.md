@@ -12977,3 +12977,51 @@ c2 35B 0 errors. `benchmark_binding=false` (correctness fix, no speed credit). T
 fallback (`python3 -m tools.bench.online_gate_summary` from `$SRC` with
 `PYTHONPATH` so `tools` is importable — was a path-run `ModuleNotFoundError`;
 regrid35.sh is not repo-tracked, so noted here, not committed).
+
+## 2026-07-18 — Platform seam EXTRACTED (the #1 extensibility item; `CLAIM-BACKEND-PLATFORM-1`)
+
+Landed the C++ Platform capability/memory-model seam — a faithful 1:1 mirror of
+`vllm/platforms/interface.py:134-229` (`class Platform`) — so adding a new
+GPU/arch's memory model is ONE additive `platforms/<gpu>.cpp`, not scattered
+`device.type == kCUDA` edits (the PR #4 scatter root cause). This is a
+behavior-preserving refactor: no kernel/numeric/dispatch change.
+
+New files: `include/vllm/platforms/interface.h` (`Platform` COMPOSES
+`vt::Backend`; `is_cuda`/`is_cpu`, `is_unified_memory`/`supports_graph_capture`
+delegating to the backend, `get_device_capability`/`has_device_capability`,
+`supported_dtypes`, `residency_policy` = the discrete-vs-unified host-weight-release
++ DevicePool policy as DATA (PR #4 debt), `get_attn_backend_priority()` STUB for
+item 4); `src/vllm/platforms/platform.cpp` (registry + `has_device_capability`
+lexicographic logic + `CurrentPlatform()` = accelerator-first / CPU-fallback,
+mirroring how vLLM resolves `current_platform`); `src/vllm/platforms/cpu.cpp`
+(`CpuPlatform`, self-registers kCPU) and `src/vllm/platforms/cuda.cpp`
+(`CudaPlatform`, probes compute capability at static init, self-registers kCUDA,
+silent on no-GPU like the cuda_backend registrar). New CPU unit test
+`tests/vllm/platforms/test_platform.cpp` (+ CMake row).
+
+Migrated the 7 TRUE platform/memory-model/residency sites to
+`CurrentPlatform().is_cuda()`: `runner.cpp` (KV-cache device residency :452 +
+`#ifdef VLLM_CPP_CUDA` async device combine :614 / scatter :954),
+`model_registry.cpp` (decode-graph CUDA gate `fp4_cuda` in `ForwardQwen3_5Moe`
+:231 + `ForwardQwen3_5Dense` :266), `qwen3_5.cpp` (`ResidentWeight` :678 +
+`ResidentWeightF32` :699 host→device weight residency). The ~30 kernel-shape
+`is_cuda() && <kernel-enable>` dispatch branches in `qwen3_5.cpp` (nvfp4/fp8 GEMM
+selection, fused-kernel gates, CUDA-only asserts) were DELIBERATELY LEFT per the
+scope discipline — they belong to the attention/kernel-registry items (4/5); the
+`qwen3_5.cpp` monolith was NOT split (item 5).
+
+"What does adding the next GPU's memory model now touch?" BEFORE: ~37 scattered
+`device.type`/`UnifiedMemory()` conditionals across runner/model_registry/qwen3_5;
+the memory-model/residency subset = the 7 migrated sites. AFTER: one additive
+`platforms/<gpu>.cpp` (a `Platform` subclass + one `RegisterPlatform`) plus its
+`vt::Backend` — zero engine/model edits for the memory model.
+
+Gate: clean CPU `-Werror` build 0 warnings; `test_platform` PASS; full CPU CTest
+green (the 2 HTTP/engine tests — `test_async_llm`, `test_openai_conformance` —
+pass in isolation, parallel-port-contention flake only); tools 164/164; record +
+doc-checkpoint checkers green. DGX behavior-preserving model gates (27B 235/235 +
+35B 315/315, production flags) are the pending confirmation, queued behind the
+35B perf grid. Records: porting-inventory §9 note 8 (faithful port, not a
+deviation), backend-matrix new `BACKEND-PLATFORM` row + Metal/Vulkan/ANE
+realization anchors flipped to the Platform seam, ledger, README, BENCHMARKS
+(NOT APPLICABLE), spec status, coordination claim. Foundation for items 2/4/5/6.

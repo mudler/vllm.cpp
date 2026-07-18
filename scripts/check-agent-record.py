@@ -17,7 +17,7 @@ MATRICES = {
     "MODEL": (AGENTS / "model-matrix.md", 326),
     "QUANT": (AGENTS / "quantization-matrix.md", 81),
     "KERNEL": (AGENTS / "kernel-matrix.md", 31),
-    "BACKEND": (AGENTS / "backend-matrix.md", 52),
+    "BACKEND": (AGENTS / "backend-matrix.md", 53),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

@@ -172,6 +172,21 @@ Only GB10/sm_121a counts as CUDA hardware support today. Source-level fallback
 paths do not become support claims until their build, correctness, trace, and
 performance gates pass.
 
+**Extensibility — the Platform seam is extracted (2026-07-18).** vLLM's
+`platforms/interface.py` capability seam is now mirrored 1:1 in C++
+(`include/vllm/platforms/interface.h` + `src/vllm/platforms/{platform,cpu,cuda}.cpp`):
+a `Platform` composes the `vt::Backend` and answers the memory-model /
+capability queries the engine and model code used to branch on inline
+(`is_cuda()`, `is_unified_memory()`, `has_device_capability()`,
+`supported_dtypes()`, `residency_policy()`, `supports_graph_capture()`), self-registered
+per `DeviceType` (`CurrentPlatform()`). The residency/host-weight-release +
+device-pool memory-model conditionals now route through
+`CurrentPlatform()`, so a new discrete/unified GPU's memory model becomes one
+additive `platforms/<gpu>.cpp` rather than scattered engine/model edits. This is
+a behavior-preserving refactor (both gate models stay token-exact); kernel-shape
+dispatch branches are deliberately left for the later attention/kernel-registry
+items.
+
 ### Kernel coverage on the gate path
 
 | Kernel family | CPU | CUDA · GB10 | Status |

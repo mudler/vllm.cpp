@@ -18,6 +18,7 @@
 #include <unordered_set>
 
 #include "vllm/model_executor/models/qwen3_5_internal.h"
+#include "vllm/platforms/interface.h"  // CurrentPlatform() memory-model capability seam
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
 #include "vllm/v1/worker/gpu/async_runner_flag.h"  // VT_ASYNC_RUNNER predicate
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
@@ -449,7 +450,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   const vt::Device dev = queue_.device;
   const char* device_cache_env = std::getenv("VT_DEVICE_KV_CACHE");
   kv_cache_backend_resident_ =
-      dev.type == vt::DeviceType::kCUDA &&
+      vllm::platforms::CurrentPlatform().is_cuda() &&
       (device_cache_env == nullptr || device_cache_env[0] != '0');
   full_attn_buf_.clear();
   ssm_buf_.clear();
@@ -611,7 +612,7 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // to token_ids_cpu and last_sampled_tokens).
   if (async_input_combine_ && num_reqs > 0) {
 #ifdef VLLM_CPP_CUDA
-    if (queue_.device.type == vt::DeviceType::kCUDA) {
+    if (vllm::platforms::CurrentPlatform().is_cuda()) {
       // DEVICE combine (W3 DGX leaf): splice each decode row's input id from the
       // device-resident-analog last_sampled_tokens on the MAIN queue, BEFORE the
       // forward (which embeds input_token_ids on the same queue → sees the patch)
@@ -951,7 +952,7 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   //
   skeleton.req_ids.reserve(static_cast<size_t>(num_reqs));
 #ifdef VLLM_CPP_CUDA
-  if (dev.type == vt::DeviceType::kCUDA) {
+  if (vllm::platforms::CurrentPlatform().is_cuda()) {
     // DEVICE scatter (W3 DGX leaf): write each row's sampled id into
     // last_sampled_tokens on the MAIN queue — main-stream-ordered with the next
     // step's device combine, so the sampled ids NEVER round-trip the host. This

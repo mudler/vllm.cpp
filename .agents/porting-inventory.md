@@ -365,6 +365,20 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    would. Intel is NOT a deviation (upstream `platforms/xpu.py` is ported
    loyally). Strategy, explorations (MLX, ANE), and binding vt:: interface
    requirements: `backends.md`.
+   **The Platform seam itself is now REALIZED and is a faithful port, NOT a
+   deviation (2026-07-18, `BACKEND-PLATFORM`).** `include/vllm/platforms/interface.h`
+   + `src/vllm/platforms/{platform,cpu,cuda}.cpp` mirror `vllm/platforms/interface.py:134-229`
+   1:1 (`class Platform`: `is_cuda`/`is_cpu`, `get_device_capability`/
+   `has_device_capability` :409-439, `supported_dtypes` :181-187), self-registered
+   per `DeviceType` via the RegisterBackend/GetBackend static-init idiom
+   (`CurrentPlatform()` = accelerator-first / CPU-fallback, mirroring how vLLM
+   resolves `current_platform`). A `Platform` COMPOSES `vt::Backend` (the vt
+   runtime of §9.1) — memory-model queries (`is_unified_memory`,
+   `supports_graph_capture`) delegate to the composed backend, so this is an
+   organizing seam over the existing deviations, introducing no new one. The
+   discrete-vs-unified `ResidencyPolicy` folds PR #4's host-weight-release +
+   DevicePool memory-model debt into one advertised policy object;
+   `get_attn_backend_priority()` is a stub for the later attention-registry item.
 9. **Vendored CUTLASS (sm120a NVFP4 GEMM)**: `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu`
    is a 1:1 lift of vLLM's `cutlass_scaled_fp4_mm_sm120a`
    (`csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu` @

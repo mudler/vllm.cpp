@@ -1,5 +1,21 @@
 # Extensibility-first plan — the Platform seam (order-1 priority, 2026-07-18)
 
+**STATUS 2026-07-18 — Item 1 LANDED (CPU-gated, DGX model-gate pending),
+`CLAIM-BACKEND-PLATFORM-1` / row `BACKEND-PLATFORM` `ACTIVE`.** The Platform seam
+is extracted: `include/vllm/platforms/interface.h` (`class Platform` composes
+`vt::Backend`) + `src/vllm/platforms/{platform,cpu,cuda}.cpp` (`CudaPlatform`/
+`CpuPlatform`, `RegisterPlatform`/`CurrentPlatform` self-registered per
+`DeviceType`) + `tests/vllm/platforms/test_platform.cpp`. The 7 true
+platform/memory-model/residency `device.type == kCUDA` sites (runner KV-residency
++ async combine/scatter, model_registry decode-graph gate, qwen3_5
+`ResidentWeight`/`ResidentWeightF32`) route through `CurrentPlatform().is_cuda()`;
+kernel-shape dispatch branches deliberately left for items 4/5;
+`get_attn_backend_priority()` is a stub for item 4; `qwen3_5.cpp` NOT split
+(item 5). Behavior-preserving: clean CPU `-Werror` build, `test_platform` PASS,
+full CPU CTest green, tools 164/164, checkers green; DGX 27B 235/235 + 35B
+315/315 is the pending confirmation. Items 2/4/5/6 build on this.
+
+
 **User directive (post-27B-parity):** make adding a new GPU/arch/model an
 ADDITIVE change (new files + one registration), not scattered edits — mirror
 vLLM so ports are mechanical copy-paste. HW-prioritized: GB10 (sm_121a) + M4
@@ -83,3 +99,107 @@ Item 1 touches `runner.cpp`/`model_registry.cpp`/`qwen3_5.cpp` heavily — it mu
 NOT race the concurrent 35B-IMA fix (which may touch `qwen3_5.cpp` MoE forward).
 Dispatch item 1 on clean main AFTER the 35B-IMA fix lands. Items 3/5 also touch
 shared files (op registry / model monolith) — sequence, don't stack.
+
+## Item 1 spike contract — `BACKEND-PLATFORM`
+
+### Scope
+
+In: the C++ Platform capability/memory-model seam for `BACKEND-PLATFORM` — a
+`Platform` interface composing `vt::Backend`, `CudaPlatform`/`CpuPlatform`
+impls, `RegisterPlatform`/`CurrentPlatform`/`GetPlatform` self-registered per
+`DeviceType`, and migration of the TRUE platform/memory-model/residency
+`device.type == kCUDA` branches (7 sites) to `CurrentPlatform()` calls.
+Behavior-preserving: no kernel/numeric/dispatch change. Out: kernel-shape
+dispatch branches (nvfp4/fp8 GEMM selection, fused-kernel gates — items 4/5),
+the attention-backend registry (`get_attn_backend_priority()` is a STUB), the
+`qwen3_5.cpp` per-arch TU split (item 5), and any residency behavior change
+(`residency_policy()` is advertisement only until item 2).
+
+### Upstream chain
+
+`vllm/platforms/interface.py:134-229` (`class Platform`: `is_cuda`/`is_cpu`
+:189-202, `supported_dtypes` :181-187, `get_device_capability`/
+`has_device_capability` :409-439, `uses_host_device_handling`), `:69-131`
+(`class DeviceCapability`) @ pin `e24d1b24`. `current_platform` resolution =
+accelerator-probe-then-CPU-fallback (`platforms/__init__.py`), mirrored by
+`CurrentPlatform()`. Composes the `vt::Backend` (`include/vt/backend.h:22-94`,
+`UnifiedMemory()` :45) and copies the `RegisterBackend`/`GetBackend` static-init
+idiom (`src/vt/backend.cpp`, registrars `cpu_backend.cpp:28-32` /
+`cuda_backend.cu:255-266`). No runtime-dynamic dispatch here (pure capability
+metadata), so no nsys trace plan is required.
+
+### Our baseline
+
+Before: ~37 inline `device.type`/`UnifiedMemory()` conditionals across
+`runner.cpp`, `model_registry.cpp`, `qwen3_5.cpp` (the PR #4 scatter). No
+`platforms/` tree existed. `vt::Backend` already provided `UnifiedMemory()` and
+`SupportsGraphCapture()`; the CUDA integrated-GPU probe lived in the backend
+registrar. Gap: the capability/residency/memory-model advertisement was not a
+seam — a new GPU's memory model meant editing every scattered site.
+
+### Port map
+
+`vllm/platforms/interface.py:134-229` -> `include/vllm/platforms/interface.h`
+(`Platform` + `DeviceCapability` + `ResidencyPolicy`);
+`platforms/__init__.py` current-platform resolution + registry ->
+`src/vllm/platforms/platform.cpp` (`RegisterPlatform`/`GetPlatform`/
+`CurrentPlatform`/`has_device_capability`); `platforms/cpu.py` ->
+`src/vllm/platforms/cpu.cpp`; `platforms/cuda.py` ->
+`src/vllm/platforms/cuda.cpp`. Migration sites -> `CurrentPlatform().is_cuda()`:
+`runner.cpp` (KV-cache device residency, async device combine/scatter),
+`model_registry.cpp` (`fp4_cuda` decode-graph gate), `qwen3_5.cpp`
+(`ResidentWeight`/`ResidentWeightF32`). Deviation: none new — this is a faithful
+port organizing existing seams (porting-inventory §9 note 8).
+
+### Tests to port
+
+vLLM has no standalone `Platform` unit test (it is exercised through
+integration); the executable spec here is the capability contract. Ported as a
+new CPU-tier `tests/vllm/platforms/test_platform.cpp` mirroring the
+backend-registry test style (`tests/vt/test_backend.cpp`): registration +
+`GetPlatform`/`HasPlatform`/`CurrentPlatform` resolution, the CPU capability
+values (`is_cpu`, `is_unified_memory`, `supported_dtypes` order,
+`residency_policy` defaults, `supports_graph_capture` false), the
+`get_attn_backend_priority` stub, and the `has_device_capability` lexicographic
+`(major, minor)` logic via a synthetic capability platform (no GPU on the CPU
+tier). Nothing is skipped.
+
+### Gates
+
+Correctness/behavior: clean CPU `-Werror` build 0 warnings; new `test_platform`
+PASS; full CPU CTest green (the 2 HTTP/engine tests pass in isolation —
+parallel-port-contention flake); tools `unittest discover` 164/164;
+`check-agent-record.py` + `check-doc-checkpoint.py` green. Behavior-preserving
+DGX model gates (production flags `-DVLLM_CPP_CUTLASS_DIR=… -DCMAKE_CUDA_COMPILER=
+/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON`, CUTLASS+FA2 verified):
+`test_qwen27_paged_engine` 235/235 + `test_qwen36_paged_engine` 315/315 token-
+exact (any delta = regression). Performance/memory: NOT APPLICABLE (no compute
+change).
+
+### Dependencies
+
+None blocking (developable on GB10+CPU). Toolchain: CUDA 13.0 for the CUDA leg.
+Sequences AFTER the 35B-IMA fix (`CLAIM-35B-GRAPH-SCRATCH-1`) to avoid racing
+`qwen3_5.cpp`. Foundation for item 2 (residency-as-capability), item 4 (attn
+registry, fills `get_attn_backend_priority()`), item 5 (model self-registration
++ per-arch TU split), item 6 (Metal/MLX bring-up, needs M4).
+
+### Work breakdown
+
+W1: `interface.h` (`Platform`/`DeviceCapability`/`ResidencyPolicy`) + registry
+`platform.cpp`. W2: `cpu.cpp` + `cuda.cpp` impls + registrars + CMake. W3: new
+`test_platform.cpp` + CMake row. W4: migrate the 7 memory-model/residency sites.
+W5: records (porting-inventory §9, backend-matrix `BACKEND-PLATFORM` +
+Metal/Vulkan/ANE anchors, ledger, README, BENCHMARKS, roadmap, coordination) +
+DGX model-gate confirmation. All landed in one change except the DGX gate.
+
+### Risks/decisions
+
+`CurrentPlatform()` returns the process's single active compute device, so
+`CurrentPlatform().is_cuda()` is byte-equivalent to the old per-queue
+`device.type == kCUDA` in every real path (the engine runs on one device);
+recorded as behavior-preserving. Decision (not a product call): only
+memory-model/residency branches migrate now; kernel-shape dispatch is left for
+the attention/kernel-registry items — no vLLM-defined behavior is reopened.
+`residency_policy()` is advertisement only (item 2 wires it), so current
+retain-host-weights behavior is unchanged.

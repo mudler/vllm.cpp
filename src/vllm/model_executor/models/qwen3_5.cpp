@@ -4491,13 +4491,44 @@ static ForwardLogits ViewDeviceLogits(void* base, vt::Device device, int64_t row
   return fl;
 }
 
+// Materialize every deferred layer's routed-expert host copies at once (the
+// non-interleaved fallback: CPU / wmma / VT_NVFP4_MARLIN=0 / no-VT_MARLIN_NVFP4
+// build — paths whose forward reads the host bytes and that never reach the
+// per-layer device build+free). No-op when experts were loaded eagerly.
+static void MaterializeAllDeferredExperts(const Qwen3_5MoeWeights& weights) {
+  if (!weights.load_layer_experts) return;
+  for (size_t l = 0; l < weights.layers.size(); ++l) {
+    weights.load_layer_experts(
+        static_cast<int64_t>(l),
+        const_cast<MoeBlockWeights&>(weights.layers[l].moe));
+  }
+  weights.load_layer_experts = nullptr;  // drop the shard keepalive
+}
+
 void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
                                          const HfConfig& config, vt::Queue& queue) {
 #ifdef VT_MARLIN_NVFP4
-  if (queue.device.type != vt::DeviceType::kCUDA || !MarlinMoeEnabled()) return;
+  if (queue.device.type != vt::DeviceType::kCUDA || !MarlinMoeEnabled()) {
+    // Not the committed Marlin path — no per-layer device build to interleave
+    // with, so materialize any deferred experts to host for the wmma/CPU forward.
+    MaterializeAllDeferredExperts(weights);
+    return;
+  }
+  // The routed-expert host copies dominate 35B load-phase peak PSS. When the
+  // loader deferred them (`load_layer_experts` set — the disk safetensors path),
+  // materialize EACH layer's experts here, immediately before that layer's device
+  // Marlin build + host free (BuildMoeMarlinResident frees the host bytes via
+  // ReleaseHost once the repack Synchronizes). At most ONE layer's ~256 experts
+  // coexist on the host, dropping whole-window peak host residency from all N
+  // layers toward one. Byte-identical device residents: the source bytes and the
+  // per-layer build order are unchanged — only the host-copy lifetime differs.
+  const bool interleave = static_cast<bool>(weights.load_layer_experts);
   Dev d{vt::GetBackend(queue.device.type), queue};
-  for (const auto& layer : weights.layers) {
-    const MoeBlockWeights& moe = layer.moe;
+  for (size_t li = 0; li < weights.layers.size(); ++li) {
+    const MoeBlockWeights& moe = weights.layers[li].moe;
+    if (interleave)
+      weights.load_layer_experts(static_cast<int64_t>(li),
+                                 const_cast<MoeBlockWeights&>(moe));
     if (!moe.expert_gate_fp4.empty())
       BuildMoeMarlinResident(d, moe, config, MoeMarlinResidentFor(&moe));
     if (SharedGateUpFusedEligible(moe.shared_gate_proj_fp4, moe.shared_up_proj_fp4)) {
@@ -4519,11 +4550,15 @@ void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
   }
   if (!weights.lm_head_fp4.Empty())
     BuildMarlinDenseResident(d, weights.lm_head_fp4, MarlinDenseResidentFor(&weights.lm_head_fp4));
+  // Every layer materialized + built + freed; drop the closure (returns the
+  // mmap'd shards it kept alive) so nothing else can re-stream the experts.
+  weights.load_layer_experts = nullptr;
   d.b.Synchronize(d.q);
 #else
-  (void)weights;
   (void)config;
   (void)queue;
+  // No Marlin build in this configuration — the forward reads host expert bytes.
+  MaterializeAllDeferredExperts(weights);
 #endif
 }
 

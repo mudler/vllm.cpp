@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -322,15 +323,13 @@ FullAttnLayerWeights LoadAttn(const TensorResolver& get,
   return a;
 }
 
-MoeBlockWeights LoadMoe(const TensorResolver& get, const std::string& base,
-                        int64_t num_experts) {
-  const std::string mlp = base + "mlp.";
-  MoeBlockWeights m;
-  m.router_gate = LoadBf16Transposed(get, mlp + "gate.weight");
-  m.shared_gate = LoadBf16Transposed(get, mlp + "shared_expert_gate.weight");
-  // M2.2b: the NVFP4 expert + shared projections are kept fp4-resident (raw
-  // packed + scales, no dequant/transpose); the bf16 expert_*/shared_*_proj
-  // fields stay EMPTY. The forward calls vt::MatmulNvfp4 on the fp4 fields.
+// The routed-expert host copies (E × gate/up/down NVFP4, MakeOwned+memcpy). Split
+// out so the 35B load-phase peak-PSS interleave can materialize EXACTLY ONE
+// layer's experts just before the device Marlin build + host free (the
+// `load_layer_experts` closure in LoadQwen3_5Moe), instead of all N layers'
+// experts coexisting on the host.
+void LoadMoeExpertsInto(const TensorResolver& get, const std::string& mlp,
+                        int64_t num_experts, MoeBlockWeights& m) {
   m.expert_gate_fp4.reserve(static_cast<size_t>(num_experts));
   m.expert_up_fp4.reserve(static_cast<size_t>(num_experts));
   m.expert_down_fp4.reserve(static_cast<size_t>(num_experts));
@@ -340,6 +339,21 @@ MoeBlockWeights LoadMoe(const TensorResolver& get, const std::string& base,
     m.expert_up_fp4.push_back(LoadNvfp4Raw(get, ex + "up_proj"));
     m.expert_down_fp4.push_back(LoadNvfp4Raw(get, ex + "down_proj"));
   }
+}
+
+MoeBlockWeights LoadMoe(const TensorResolver& get, const std::string& base,
+                        int64_t num_experts, bool with_experts) {
+  const std::string mlp = base + "mlp.";
+  MoeBlockWeights m;
+  m.router_gate = LoadBf16Transposed(get, mlp + "gate.weight");
+  m.shared_gate = LoadBf16Transposed(get, mlp + "shared_expert_gate.weight");
+  // M2.2b: the NVFP4 expert + shared projections are kept fp4-resident (raw
+  // packed + scales, no dequant/transpose); the bf16 expert_*/shared_*_proj
+  // fields stay EMPTY. The forward calls vt::MatmulNvfp4 on the fp4 fields.
+  // with_experts=false DEFERS the routed-expert loop (the ~16.9 GiB host
+  // consumer) to the per-layer streaming path; the small shared projections are
+  // always loaded eagerly (retained through the device build).
+  if (with_experts) LoadMoeExpertsInto(get, mlp, num_experts, m);
   const std::string se = mlp + "shared_expert.";
   m.shared_gate_proj_fp4 = LoadNvfp4Raw(get, se + "gate_proj");
   m.shared_up_proj_fp4 = LoadNvfp4Raw(get, se + "up_proj");
@@ -347,12 +361,12 @@ MoeBlockWeights LoadMoe(const TensorResolver& get, const std::string& base,
   return m;
 }
 
-}  // namespace
-
-Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
-                                           const std::string& layer_type,
-                                           int64_t layer_idx,
-                                           int64_t num_experts) {
+// Full decoder layer minus (optionally) the routed experts. Shared by the public
+// LoadQwen3_5MoeLayer (with_experts=true) and the deferred streaming load.
+Qwen3_5MoeLayerWeights LoadLayerImpl(const TensorResolver& get,
+                                     const std::string& layer_type,
+                                     int64_t layer_idx, int64_t num_experts,
+                                     bool with_experts) {
   const std::string base =
       "model.language_model.layers." + std::to_string(layer_idx) + ".";
   Qwen3_5MoeLayerWeights layer;
@@ -368,23 +382,38 @@ Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
   } else {
     VT_CHECK(false, "qwen3_5 weights: unknown layer_type " + layer_type);
   }
-  layer.moe = LoadMoe(get, base, num_experts);
+  layer.moe = LoadMoe(get, base, num_experts, with_experts);
   return layer;
 }
 
-Qwen3_5MoeWeights LoadQwen3_5Moe(const std::vector<SafetensorsFile>& shards,
-                                 const HfConfig& config) {
+}  // namespace
+
+Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
+                                           const std::string& layer_type,
+                                           int64_t layer_idx,
+                                           int64_t num_experts) {
+  return LoadLayerImpl(get, layer_type, layer_idx, num_experts,
+                       /*with_experts=*/true);
+}
+
+Qwen3_5MoeWeights LoadQwen3_5Moe(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config,
+    std::shared_ptr<const std::vector<SafetensorsFile>> shards_owner) {
   // Build a name -> shard index from each shard's own header. The target loader
   // does not request mtp.*: LoadQwen3_5MTP loads that optional draft head only
   // when speculative decoding is enabled. The resolver throws on missing names.
-  std::unordered_map<std::string, const SafetensorsFile*> where;
+  // The map is heap-owned (shared_ptr) so the deferred per-layer expert loader
+  // below can reuse it without rebuilding — its entries point into `shards`,
+  // which `shards_owner` keeps mmap'd.
+  auto where =
+      std::make_shared<std::unordered_map<std::string, const SafetensorsFile*>>();
   for (const SafetensorsFile& shard : shards) {
-    for (const std::string& name : shard.Names()) where[name] = &shard;
+    for (const std::string& name : shard.Names()) (*where)[name] = &shard;
   }
   const TensorResolver get =
-      [&where](const std::string& name) -> const StTensor& {
-    auto it = where.find(name);
-    VT_CHECK(it != where.end(), "qwen3_5 weights: tensor not found: " + name);
+      [where](const std::string& name) -> const StTensor& {
+    auto it = where->find(name);
+    VT_CHECK(it != where->end(), "qwen3_5 weights: tensor not found: " + name);
     return it->second->Get(name);
   };
 
@@ -395,6 +424,15 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(const std::vector<SafetensorsFile>& shards,
   VT_CHECK(config.num_experts > 0,
            "qwen3_5 weights: num_experts must be > 0 for the MoE model");
 
+  // With a shared owner we DEFER the routed-expert host copies: load every layer
+  // WITHOUT its experts now (small: norms, attn/GDN, router, shared expert), and
+  // install a closure that materializes ONE layer's experts on demand during
+  // PrepareMarlinResident — bounding peak host residency to a single layer's
+  // ~256 experts instead of all N layers coexisting (the 35B load-phase peak-PSS
+  // lever). Without an owner the shards may be released right after this returns,
+  // so the experts must be loaded eagerly (GGUF/synthetic/borrowed paths).
+  const bool defer_experts = shards_owner != nullptr;
+
   Qwen3_5MoeWeights w;
   w.embed_tokens =
       LoadBf16Direct(get, "model.language_model.embed_tokens.weight");
@@ -402,8 +440,32 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(const std::vector<SafetensorsFile>& shards,
   w.lm_head_fp4 = LoadNvfp4Raw(get, "lm_head");  // M2.2b fp4-resident
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
-    w.layers.push_back(LoadQwen3_5MoeLayer(
-        get, config.layer_types[static_cast<size_t>(l)], l, config.num_experts));
+    w.layers.push_back(LoadLayerImpl(get,
+                                     config.layer_types[static_cast<size_t>(l)],
+                                     l, config.num_experts,
+                                     /*with_experts=*/!defer_experts));
+  }
+
+  if (defer_experts) {
+    const int64_t num_experts = config.num_experts;
+    // Captures the shared name-map AND the shards owner (keepalive): the mmap'd
+    // shards stay valid until PrepareMarlinResident resets this closure after the
+    // last layer is built. Does NOT capture the (movable) Qwen3_5MoeWeights — the
+    // target MoE block is passed in by reference, so the closure survives the
+    // model's move into the LoadedModel.
+    w.load_layer_experts = [where, shards_owner, num_experts](
+                               int64_t layer, MoeBlockWeights& moe) {
+      const TensorResolver g =
+          [where](const std::string& name) -> const StTensor& {
+        auto it = where->find(name);
+        VT_CHECK(it != where->end(),
+                 "qwen3_5 weights: tensor not found: " + name);
+        return it->second->Get(name);
+      };
+      const std::string mlp = "model.language_model.layers." +
+                              std::to_string(layer) + ".mlp.";
+      LoadMoeExpertsInto(g, mlp, num_experts, moe);
+    };
   }
   return w;
 }

@@ -186,8 +186,12 @@ std::unique_ptr<LoadedModel> LoadQwen3_5MoeModel(
     if (source.safetensors == nullptr) {
       throw std::runtime_error("safetensors model source is empty");
     }
+    // Pass the shared shards owner (when the caller shared it, e.g. disk load):
+    // it enables the deferred per-layer routed-expert streaming that bounds the
+    // 35B load-phase peak host residency. Null → experts loaded eagerly.
     return std::make_unique<Qwen3_5MoeLoadedModel>(
-        registration, LoadQwen3_5Moe(*source.safetensors, config));
+        registration, LoadQwen3_5Moe(*source.safetensors, config,
+                                     source.safetensors_owned));
   }
   if (source.gguf == nullptr) {
     throw std::runtime_error("GGUF model source is empty");
@@ -401,6 +405,15 @@ ModelSource ModelSource::FromSafetensors(
   ModelSource source;
   source.kind = Kind::kSafetensors;
   source.safetensors = &shards;
+  return source;
+}
+
+ModelSource ModelSource::FromSafetensorsOwned(
+    std::shared_ptr<const std::vector<SafetensorsFile>> shards) {
+  ModelSource source;
+  source.kind = Kind::kSafetensors;
+  source.safetensors = shards.get();
+  source.safetensors_owned = std::move(shards);
   return source;
 }
 

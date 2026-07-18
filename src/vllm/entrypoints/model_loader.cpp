@@ -356,14 +356,20 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   (void)ModelRegistry::Resolve(config);
   tok::Tokenizer tokenizer = tok::Tokenizer::FromHfJson(tokenizer_path);
 
-  std::vector<vllm::SafetensorsFile> shards = LoadShards(model_dir);
+  // Shared ownership so a loader may retain the mmap'd shards past the load: the
+  // Qwen3.6-35B MoE loader defers its routed-expert host copies and streams them
+  // per layer during PrepareMarlinResident (bounds load-phase peak PSS). The
+  // deferred-expert closure holds the last reference and releases the shards once
+  // the device Marlin resident is built; loaders that don't retain it drop the
+  // shards when this local `shards` and the model's ModelSource go out of scope.
+  auto shards = std::make_shared<const std::vector<vllm::SafetensorsFile>>(
+      LoadShards(model_dir));
 
   // Live architecture dispatch: consume config.architectures in order and let
   // the matched registration own the weight-name map/loader. Unknown dense
   // configs now reject instead of falling through num_experts == 0.
   std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
-      config, ModelSource::FromSafetensors(shards));
-  shards.clear();  // the mmap'd shards may be released after the load.
+      config, ModelSource::FromSafetensorsOwned(shards));
   return std::unique_ptr<LoadedEngine>(new LoadedEngine(
       std::move(config), std::move(model), std::move(tokenizer), params));
 }

@@ -10,11 +10,13 @@
 // .agents/specs/qwen36-forward-notes.md §6). The full-model load is exercised in Task 5.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
@@ -269,6 +271,111 @@ TEST_CASE("Qwen3.6-35B loader: real-tensor resolve + dequant + transpose") {
 // PrepareMarlinResident hook (DGX): freed when the Marlin resident is the
 // committed path, RETAINED when the VT_NVFP4_MARLIN=0 wmma fallback
 // (MoeBlockFusedCuda) will re-read them.
+
+// --- Deferred routed-expert load: bounded load-phase coexistence -------------
+// The 35B load-phase peak-PSS lever. When the safetensors loader shares the
+// shards (disk path), LoadQwen3_5Moe DEFERS the routed-expert host copies and
+// installs `load_layer_experts`; PrepareMarlinResident materializes ONE layer's
+// experts immediately before that layer's device Marlin build + host free, so at
+// most one layer's ~256 experts coexist on the host (vs all N layers before).
+// This CPU test pins the CONTRACT that the interleave depends on — closure
+// move-safety and the per-layer materialize→free coexistence bound — without a
+// real NVFP4 checkpoint or a GPU. The end-to-end interleave on real weights is
+// exercised by the DGX token gate (full model via the deferred disk load) plus
+// memcheck (no use-after-free of the freed host bytes) and the peak-PSS A/B.
+namespace {
+
+// Stand-in for LoadMoeExpertsInto: fill `moe` with `e_count` routed experts,
+// each carrying small resident packed+scale host bytes tagged by layer.
+void FillFakeExperts(vllm::MoeBlockWeights& moe, int e_count, int layer) {
+  for (int e = 0; e < e_count; ++e) {
+    vllm::Nvfp4Weight g;
+    g.n = 8;
+    g.k = 16;
+    g.packed.dtype = vt::DType::kI8;
+    g.packed.rank = 2;
+    g.packed.shape[0] = 8;
+    g.packed.shape[1] = 8;
+    g.packed.bytes.assign(64, static_cast<uint8_t>(layer + 1));
+    g.scale.dtype = vt::DType::kI8;
+    g.scale.bytes.assign(8, 0x3C);
+    vllm::Nvfp4Weight u = g;
+    vllm::Nvfp4Weight d = g;
+    moe.expert_gate_fp4.push_back(std::move(g));
+    moe.expert_up_fp4.push_back(std::move(u));
+    moe.expert_down_fp4.push_back(std::move(d));
+  }
+}
+
+// Layers whose routed-expert host bytes are currently resident (peak-tracking).
+int LayersWithResidentExperts(const vllm::Qwen3_5MoeWeights& w) {
+  int n = 0;
+  for (const auto& layer : w.layers) {
+    bool any = false;
+    for (const auto& x : layer.moe.expert_gate_fp4)
+      if (!x.packed.bytes.empty()) any = true;
+    if (any) ++n;
+  }
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("deferred routed-expert load: move-safe closure + bounded coexistence") {
+  const int kLayers = 4;
+  const int kExperts = 3;
+
+  vllm::Qwen3_5MoeWeights loaded;
+  loaded.layers.resize(static_cast<size_t>(kLayers));  // deferred: experts empty
+  loaded.load_layer_experts = [kExperts](int64_t layer,
+                                         vllm::MoeBlockWeights& moe) {
+    FillFakeExperts(moe, kExperts, static_cast<int>(layer));
+  };
+
+  // Deferred precondition: every layer's routed experts are EMPTY at load, and
+  // the streaming closure is installed.
+  for (const auto& layer : loaded.layers)
+    CHECK(layer.moe.expert_gate_fp4.empty());
+  REQUIRE(static_cast<bool>(loaded.load_layer_experts));
+
+  // The closure MUST survive the model's move into the LoadedModel (it must not
+  // capture the Qwen3_5MoeWeights by address — it takes the target MoE by ref).
+  vllm::Qwen3_5MoeWeights w = std::move(loaded);
+  REQUIRE(static_cast<bool>(w.load_layer_experts));
+
+  // Drive the interleave contract: materialize layer l, then free its host bytes
+  // (mirrors BuildMoeMarlinResident's per-layer ReleaseHost after the device
+  // repack) BEFORE the next layer streams in.
+  int peak = 0;
+  for (int l = 0; l < kLayers; ++l) {
+    w.load_layer_experts(l, w.layers[static_cast<size_t>(l)].moe);
+    const auto& moe = w.layers[static_cast<size_t>(l)].moe;
+    REQUIRE(moe.expert_gate_fp4.size() == static_cast<size_t>(kExperts));
+    peak = std::max(peak, LayersWithResidentExperts(w));
+    // Simulate this layer's device build + host free.
+    auto& mmoe = w.layers[static_cast<size_t>(l)].moe;
+    for (auto& x : mmoe.expert_gate_fp4) {
+      x.packed.ReleaseHost();
+      x.scale.ReleaseHost();
+    }
+    for (auto& x : mmoe.expert_up_fp4) {
+      x.packed.ReleaseHost();
+      x.scale.ReleaseHost();
+    }
+    for (auto& x : mmoe.expert_down_fp4) {
+      x.packed.ReleaseHost();
+      x.scale.ReleaseHost();
+    }
+  }
+
+  // The whole-window peak host coexistence never exceeded ONE layer's experts.
+  CHECK(peak == 1);
+  // Every layer's experts were materialized (vectors present) yet the host bytes
+  // are all returned after the per-layer free.
+  for (const auto& layer : w.layers)
+    CHECK(layer.moe.expert_gate_fp4.size() == static_cast<size_t>(kExperts));
+  CHECK(LayersWithResidentExperts(w) == 0);
+}
 
 TEST_CASE("OwnedTensor::ReleaseHost frees the host buffer AND its capacity") {
   vllm::OwnedTensor t;

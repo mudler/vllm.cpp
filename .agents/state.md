@@ -13166,3 +13166,56 @@ Mirrored vLLM's FLA register-resident sliding-window prefill `causal_conv1d` fwd
 - **Perf (nsys --cuda-graph-trace=node, 35B NVFP4, evidence ~/work/prefill-attr-conv-35b).** Conv reg vs tiled: c1 337.1 -> 321.1 us/call (-4.7 pct), c6 1036.4 -> 960.3 us (-7.3 pct) -- consistently faster => DEFAULT ON. Post-conv split vs megablock: c1 83.1 -> 79.9 us (-3.8 pct), c6 384.1 -> 402.0 us (+4.7 pct) -- near-neutral/concurrency-dependent => OPT-IN (GdnPostConv time is dominated by the already-grid-parallel per-head q/k L2-norm, not the single V-megablock). TTFT c1 A/B 3 reps: reg-ON 186.23 vs reg-OFF 186.96 ms (-0.39 pct, WITHIN run-noise -- conv is ~2.5 pct of GPU, so a 5-7 pct kernel win is below TTFT noise; the kernel-level nsys A/B is the binding evidence).
 - **Finding.** The prefill conv + post-conv are BANDWIDTH-bound (conv ~215 GB/s of GB10 ~273 peak, f32 in/out). The register-window structural mirror gives a real but modest 5-7 pct kernel win; the larger vLLM conv gap (if any) is TRAFFIC -- the bf16 post-conv-activation path (VT_GDN_IN_BF16, task #40 sibling), which halves the bytes -- not kernel structure. Post-conv split does not attack its dominant cost and ships opt-in.
 - **Land.** `VT_CONV_REG` DEFAULT ON (bit-exact + consistently faster), `VT_GDN_POSTCONV_SPLIT` OPT-IN (bit-exact, neutral). Spec `.agents/specs/gdn-prefill-conv-reg-2026-07-18.md`. Next: the 35B binding grid re-measures the in-situ c1-c4 effect.
+
+## 2026-07-18 — 35B load-phase peak-PSS interleave: stream routed experts per layer (`ENG-MOE-LOADSTREAM`, `CLAIM-MEM35-LOADSTREAM`)
+
+Follow-up to `ENG-MOE-HOSTFREE` (`ac77bec`, steady free). That row returned the
+~16.9 GiB routed-expert host mirror only AFTER the whole model loads, so the
+binding grid's whole-window `peak_pss`/`peak_rss` (~19.8 GiB) was still set at
+LOAD time: every layer's ~256 experts host-coexisted (old flow: `LoadQwen3_5Moe`
+loaded ALL experts, then a separate `PrepareMarlinResident` pass built the device
+residents + freed per layer). This is why the binding memory axes stayed 2/4.
+
+**Change — interleave load+build+free per LAYER (deferred-expert streaming).**
+- `ModelSource::FromSafetensorsOwned` shares the mmap'd shards past the load;
+  `LoadFromDir` no longer `shards.clear()`s them (the deferred closure holds the
+  keepalive and drops it after the build).
+- `LoadQwen3_5Moe(shards, config, shards_owner)`: with an owner, load each layer
+  WITHOUT its routed experts (`LoadLayerImpl(with_experts=false)` — norms/attn/
+  GDN/router/shared only) and install `Qwen3_5MoeWeights::load_layer_experts`, a
+  `mutable std::function` capturing the shared name-map + shards owner that
+  materializes ONE layer's experts (`LoadMoeExpertsInto`) into a by-ref
+  `MoeBlockWeights`. It does NOT capture the movable weights struct, so it
+  survives the model's move into the LoadedModel.
+- `PrepareMarlinResident` calls the closure for layer `li` immediately before
+  `BuildMoeMarlinResident` (whose existing `ReleaseHost` frees that layer's host
+  bytes after the repack Synchronize), then resets the closure after the last
+  layer. Peak host coexistence = one layer's ~256 experts, not all N.
+- Non-CUDA / `VT_NVFP4_MARLIN=0` / no-`VT_MARLIN_NVFP4` → `MaterializeAllDeferredExperts`
+  bulk-loads to host (those forwards read the host bytes; not the production path).
+
+**Why per-layer granularity.** `MarlinNvfp4CombinedScaleFactor` (`qwen3_5.cpp:3665`)
+spans all E experts of a layer, so all E must coexist for that layer's build —
+which is unchanged and byte-identical. The finest lifetime unit that keeps the
+device residents byte-identical is therefore one layer.
+
+**Scope.** Device Marlin residents byte-identical (same source bytes, same
+per-layer build order; only the host-copy lifetime differs). 27B is a different
+loaded model (`LoadQwen3_5Dense`, true-W4A4) → untouched. GGUF/synthetic/borrowed
+pass no shards owner → experts load eagerly (unchanged). Item-2 link recorded;
+the platform flag stays with `CLAIM-BACKEND-PLATFORM-1`.
+
+**Gates.** CPU (dev box): clean `-Werror` build 0 warnings; full CPU ctest; tools
+164/164; new coexistence-bound contract test PASS (peak host coexistence == 1
+layer across the per-layer materialize→ReleaseHost loop; closure survives a
+`Qwen3_5MoeWeights` move). `benchmark_binding=false`. DGX (production flags,
+one flock): token 27B 235/235 + 35B 315/315, load-to-ready peak PSS/RSS A/B
+(target ~19.8→~4-5 GiB, below vLLM 13.3), c2 serving smoke, memcheck — PENDING;
+the orchestrator re-grids the binding memory axes to confirm the flip (the
+axes should now move `peak_pss`/`peak_rss` from FAIL toward PASS).
+
+Coordination note: shares `qwen3_5.cpp` / `model_registry.cpp` FILES with
+`CLAIM-BACKEND-PLATFORM-1` (residency/decode-graph sites) and
+`CLAIM-MOE-DECODE-PARALLEL-1` (4 memset lines) but touches DISTINCT functions
+(`PrepareMarlinResident` / `MaterializeAllDeferredExperts` / `LoadQwen3_5MoeModel`
+/ `ModelSource`) — no line overlap.

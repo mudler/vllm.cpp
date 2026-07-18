@@ -290,6 +290,21 @@ struct Qwen3_5MoeWeights {
   OwnedTensor lm_head;       // bf16 [H, vocab]  (bf16/GGUF path; empty when fp4)
   Nvfp4Weight lm_head_fp4;   // [N=vocab, K=H]   (M2.2b fp4-resident; else empty)
   std::vector<Qwen3_5MoeLayerWeights> layers;
+
+  // Deferred routed-expert host materialization — the 35B load-phase peak-PSS
+  // interleave (ENG-EXPERT-STREAM / ENG-MOE-HOSTFREE follow-up). When set, the
+  // per-layer `moe.expert_*_fp4` host copies are NOT loaded at Load time; instead
+  // PrepareMarlinResident calls this per layer IMMEDIATELY BEFORE the device
+  // Marlin build + host free, so at most ONE layer's routed-expert host copies
+  // coexist (peak host residency ~ one layer, not all N layers ×256 experts). The
+  // closure owns the mmap'd safetensors shards (its keepalive); resetting it after
+  // the whole model is built returns them. Null on the GGUF / synthetic / Borrow
+  // paths (experts already materialized eagerly at load). Non-marlin / non-CUDA /
+  // VT_NVFP4_MARLIN=0 falls back to a bulk host materialization (correctness for
+  // the wmma/CPU forward that reads these host bytes). `mutable`: materialization
+  // is a logically const residency op, like the lazy device-upload handles above.
+  mutable std::function<void(int64_t /*layer*/, MoeBlockWeights& /*moe*/)>
+      load_layer_experts;
 };
 
 // Resolves a tensor name to its StTensor (across shards). Throws if absent.
@@ -307,8 +322,18 @@ Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
 // Full-model load: resolves every param across the given shards (name -> shard
 // looked up from each file's own header), dequantizes/transposes, and returns
 // owned host bf16 tensors. Uses config.num_hidden_layers, config.layer_types,
-// config.num_experts. The mmap'd shards may be released after this returns.
-Qwen3_5MoeWeights LoadQwen3_5Moe(const std::vector<SafetensorsFile>& shards,
-                                 const HfConfig& config);
+// config.num_experts.
+//
+// `shards_owner` (optional): when non-null it SHARES ownership of `shards`
+// (`shards_owner.get() == &shards`), which lets the loader DEFER the routed-MoE
+// experts' host copies — the returned weights carry a `load_layer_experts`
+// closure (holding `shards_owner` as its keepalive) that PrepareMarlinResident
+// drives per layer to bound peak host residency (35B load-phase peak-PSS lever).
+// When null the experts are loaded EAGERLY (the mmap'd shards may then be
+// released as soon as this returns) — used by GGUF/synthetic/borrowed paths and
+// any caller that will drop the shards before Prepare.
+Qwen3_5MoeWeights LoadQwen3_5Moe(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config,
+    std::shared_ptr<const std::vector<SafetensorsFile>> shards_owner = nullptr);
 
 }  // namespace vllm

@@ -231,22 +231,39 @@ TEST_CASE("attn preamble fused == unfused (f32, gemma) bit-identity") {
   CHECK(dq > 0.0f);                  // documents the non-bit-identity (the NO-GO cause)
 }
 
-// The FA-2 prefill combo: bf16 q_out/k_out + f32 gate_out. After the tightening
-// (RoundToStore<Tqk> rounds the normed q/k to the STORE dtype BEFORE the RoPE
-// multiply — cuda_ops.cu, mirroring vLLM fused_qk_norm_rope.py:67,89-90), the
-// fused bf16 preamble is BIT-IDENTICAL to the UNFUSED bf16 four-op sequence that
-// FullAttnBlockPaged's `else` branch runs on the FA-2 path: AttnGateSplit +
-// RmsNorm(->bf16) + RmsNorm(->bf16) + RopeNeox(bf16). Both round the normed q/k
-// to bf16 and then feed RoPE the bf16 value. The f32 gate stays the exact
-// passthrough. This pins the numerics FA-2 prefill actually runs on the 27B AND
-// the 35B (2026-07-18 flip) — the razor-tie the old test documented is removed.
-TEST_CASE("attn preamble fused-bf16 == unfused-bf16 (FA-2 prefill, bit-identity)") {
+namespace {
+// f32 -> bf16 round-to-nearest-even bits (host mirror of the device
+// __float2bfloat16 store; same helper as test_ops_paged_attn.cpp).
+inline uint16_t F32ToBf16Bits(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof(x));
+  const uint32_t rounding = 0x7fffu + ((x >> 16) & 1u);
+  return static_cast<uint16_t>((x + rounding) >> 16);
+}
+}  // namespace
+
+// The FA-2 prefill combo: bf16 q_out/k_out + f32 gate_out. The kernel math is
+// f32 either way; the bf16 store is the RN round of the exact f32 value — so
+// (bf16 q/k, f32 gate) must be BIT-IDENTICAL to the f32 run followed by a host
+// RN cast of q/k, and the f32 gate must be bit-identical to the f32 run's gate.
+// This pins the claim FullAttnBlockPaged relies on: switching the preamble to
+// bf16 q/k for FA-2 changes NOTHING except where the (identical) rounding step
+// happens (in-kernel store vs the CastBf16 the KV-cache write used to do).
+//
+// NOTE (2026-07-18, CLAIM-35B-FA2-FLIP-1): a "round normed q/k to bf16 BEFORE
+// RoPE" tighten (mirror vLLM fused_qk_norm_rope.py:67) was tried here and DID
+// hold op-level bit-identity to the unfused bf16 path, but it flipped the 27B
+// tok6 whitespace near-tie away from the vLLM oracle in the full engine gate
+// (compensating-error, RMSNorm-saga lesson) so it was NOT shipped. The kernel
+// therefore keeps the normed q/k in f32 through RoPE; this test pins the
+// resulting (bf16 store == RN(f32 value)) contract that both models rely on.
+TEST_CASE("attn preamble bf16 q/k + f32 gate == f32 out + RN cast (bit-identity)") {
   if (!HasCuda()) return;
   Backend& b = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard g(b);
   Queue& q = g.q;
 
-  const int64_t T = 8, Hq = 16, Hkv = 2, Dh = 256;  // the 35B gate head shape (ratio-8)
+  const int64_t T = 8, Hq = 16, Hkv = 2, Dh = 256;  // the 27B gate head shape
   const int rot = 64;
   const float base = 1.0e7f, eps = 1.0e-6f;
 
@@ -262,37 +279,27 @@ TEST_CASE("attn preamble fused-bf16 == unfused-bf16 (FA-2 prefill, bit-identity)
   Dev qn(b, q, DType::kF32, {Dh}, qn_h.data());
   Dev kn(b, q, DType::kF32, {Dh}, kn_h.data());
   Dev pos(b, q, DType::kI32, {T}, pos_h.data());
-
-  // ---- unfused bf16: AttnGateSplit + RmsNorm(->bf16) + RmsNorm(->bf16) +
-  // RopeNeox(bf16) — the exact sequence FullAttnBlockPaged runs when the fused
-  // preamble is OFF but the FA-2 attn dtype is bf16 (dq3/dk3 allocated bf16). ----
-  Dev qf(b, q, DType::kF32, {T, Hq, Dh});
-  Dev gate_u(b, q, DType::kF32, {T, Hq, Dh});
-  Dev dq_u(b, q, DType::kBF16, {T, Hq, Dh});
-  Dev dk_u(b, q, DType::kBF16, {T, Hkv, Dh});
-  vt::AttnGateSplit(q, qf.t(), gate_u.t(), qgate.t());
-  Tensor dqn2d = MakeT(dq_u.t().data, DType::kBF16, Gpu(), {T * Hq, Dh});
-  Tensor qf2d = MakeT(qf.t().data, DType::kF32, Gpu(), {T * Hq, Dh});
-  vt::RmsNorm(q, dqn2d, qf2d, qn.t(), RmsNormArgs{eps, true});
-  Tensor dkn2d = MakeT(dk_u.t().data, DType::kBF16, Gpu(), {T * Hkv, Dh});
-  Tensor kf2d = MakeT(kf.t().data, DType::kF32, Gpu(), {T * Hkv, Dh});
-  vt::RmsNorm(q, dkn2d, kf2d, kn.t(), RmsNormArgs{eps, true});
-  vt::RopeNeox(q, dq_u.t(), dk_u.t(), pos.t(), RopeArgs{base, rot});
-  std::vector<uint16_t> qu(static_cast<size_t>(T * Hq * Dh));
-  std::vector<uint16_t> ku(static_cast<size_t>(T * Hkv * Dh));
-  std::vector<float> gu(static_cast<size_t>(T * Hq * Dh));
-  dq_u.Download(q, qu.data());
-  dk_u.Download(q, ku.data());
-  gate_u.Download(q, gu.data());
-
-  // ---- fused bf16: RopeCosSinCache + AttnQkNormRopeGate (bf16 q/k, f32 gate) ----
   Dev cos_sin(b, q, DType::kF32, {T, rot});
   vt::RopeCosSinCache(q, cos_sin.t(), pos.t(), RopeArgs{base, rot});
+
+  // ---- reference: all-f32 fused run ----
+  Dev dq_r(b, q, DType::kF32, {T, Hq, Dh});
+  Dev dk_r(b, q, DType::kF32, {T, Hkv, Dh});
+  Dev gate_r(b, q, DType::kF32, {T, Hq, Dh});
+  vt::AttnQkNormRopeGate(q, dq_r.t(), dk_r.t(), gate_r.t(), qgate.t(), kf.t(), qn.t(), kn.t(),
+                         cos_sin.t(), RmsNormArgs{eps, true}, RopeArgs{base, rot});
+  std::vector<float> qr(static_cast<size_t>(T * Hq * Dh));
+  std::vector<float> kr(static_cast<size_t>(T * Hkv * Dh));
+  std::vector<float> gr(static_cast<size_t>(T * Hq * Dh));
+  dq_r.Download(q, qr.data());
+  dk_r.Download(q, kr.data());
+  gate_r.Download(q, gr.data());
+
+  // ---- mixed run: bf16 q/k + f32 gate ----
   Dev dq_b(b, q, DType::kBF16, {T, Hq, Dh});
   Dev dk_b(b, q, DType::kBF16, {T, Hkv, Dh});
   Dev gate_b(b, q, DType::kF32, {T, Hq, Dh});
-  Tensor kf_view = MakeT(kf.t().data, DType::kF32, Gpu(), {T, Hkv * Dh});
-  vt::AttnQkNormRopeGate(q, dq_b.t(), dk_b.t(), gate_b.t(), qgate.t(), kf_view, qn.t(), kn.t(),
+  vt::AttnQkNormRopeGate(q, dq_b.t(), dk_b.t(), gate_b.t(), qgate.t(), kf.t(), qn.t(), kn.t(),
                          cos_sin.t(), RmsNormArgs{eps, true}, RopeArgs{base, rot});
   std::vector<uint16_t> qb(static_cast<size_t>(T * Hq * Dh));
   std::vector<uint16_t> kb(static_cast<size_t>(T * Hkv * Dh));
@@ -302,15 +309,15 @@ TEST_CASE("attn preamble fused-bf16 == unfused-bf16 (FA-2 prefill, bit-identity)
   gate_b.Download(q, gb.data());
 
   size_t qmis = 0, kmis = 0;
-  for (size_t i = 0; i < qu.size(); ++i)
-    if (qb[i] != qu[i]) ++qmis;
-  for (size_t i = 0; i < ku.size(); ++i)
-    if (kb[i] != ku[i]) ++kmis;
+  for (size_t i = 0; i < qr.size(); ++i)
+    if (qb[i] != F32ToBf16Bits(qr[i])) ++qmis;
+  for (size_t i = 0; i < kr.size(); ++i)
+    if (kb[i] != F32ToBf16Bits(kr[i])) ++kmis;
   size_t fg = 0;
-  const float dg = MaxAbsDiff(gu, gb, &fg);
-  MESSAGE("fused-bf16 vs unfused-bf16 mismatches: q=", qmis, "/", qu.size(), " k=", kmis, "/",
-          ku.size(), " gate max|diff|=", dg);
-  CHECK(qmis == 0);   // q: fused bf16 == unfused bf16, bit-identical (round-before-RoPE)
+  const float dg = MaxAbsDiff(gr, gb, &fg);
+  MESSAGE("bf16-q/k mismatches: q=", qmis, "/", qr.size(), " k=", kmis, "/", kr.size(),
+          " gate max|diff|=", dg);
+  CHECK(qmis == 0);   // q: bf16 store == RN(f32 value), bit-identical
   CHECK(kmis == 0);   // k: same
-  CHECK(dg == 0.0f);  // gate: exact f32 passthrough
+  CHECK(dg == 0.0f);  // gate: still the exact f32 passthrough
 }

@@ -1194,16 +1194,19 @@ bool FuseSiluQuantEnabled() {
 // DEFAULT ON, ALL ARCHES (2026-07-18, MIRROR vLLM). vLLM dispatches the fused
 // qk-norm-rope-gate preamble for EVERY Qwen3.5 full-attn layer (attn_output_gate
 // && neox && cuda && text_only — true for BOTH the 27B and the 35B; the fp4/fp8
-// split was OUR heuristic, not vLLM's). The bf16 q/k round-trip BEFORE RoPE is
-// now bit-identical to the unfused bf16 path (RoundToStore<Tqk> in
-// AttnQkNormRopeGateKernel, mirroring fused_qk_norm_rope.py:67), so the fused
-// preamble is the exact vLLM numerics. On the 35B (fp8 attn) this pairs with the
+// split was OUR heuristic, not vLLM's). On the 35B (fp8 attn) this pairs with the
 // FA-2 prefill (bf16 q feeds flash_fwd_splitkv) — the token-exact gate
-// test_qwen36_paged_engine holds 315/315 with the full default set. The old
+// test_qwen36_paged_engine holds 315/315 with the full default set (measured
+// 2026-07-18, CLAIM-35B-FA2-FLIP-1), and the 27B (fp4) stays 235/235. The old
 // "35B diverges within 16 tokens" (2026-07-09) is STALE (grounded in spec
 // qwen36-35b-fa2-prefill-oracle-2026-07-18: the stored oracle IS the graphed
-// vLLM production stream and FA2 bf16-q is the MOST vLLM-faithful path). Unset
-// env => ON; VT_FUSE_ATTN_PREAMBLE=1/0 force-overrides (same-binary A/B rollback).
+// vLLM production stream and FA2 bf16-q is the MOST vLLM-faithful path).
+// NOTE: the spec's "round normed q/k to bf16 before RoPE" tighten
+// (fused_qk_norm_rope.py:67) is op-level bit-identical but flips the 27B tok6
+// near-tie in combination (RMSNorm-saga), so the preamble ships UNTIGHTENED —
+// both arches are token-exact on their graphed oracles either way (see
+// AttnQkNormRopeGateKernel NOTE in cuda_ops.cu). Unset env => ON;
+// VT_FUSE_ATTN_PREAMBLE=1/0 force-overrides (same-binary A/B rollback).
 bool FuseAttnPreambleOn(bool /*fp4_attn*/) {
   static const char* e = std::getenv("VT_FUSE_ATTN_PREAMBLE");
   if (e != nullptr) return e[0] == '1';

@@ -1191,20 +1191,26 @@ bool FuseSiluQuantEnabled() {
 // fused_qk_norm_rope.py:95-102, zero in-kernel transcendentals). Measured 27B
 // site (2026-07-10): unfused preamble+rope 1.36 vs vLLM 0.27 us/tok/layer.
 //
-// PER-ARCH DEFAULT (2026-07-10). The fusion is NOT bit-identical: the gate
-// passthrough is exact, but the RoPE'd q/k differ by ONE f32 ULP because the
-// fused `ni*cs - nih*cs` contracts to a different FMA than the unfused
-// RmsNorm-store + RopeNeox `x*c - y*sn` (pinned by test_ops_attn_preamble). On
-// the 35B (fp8 attn) the deterministic greedy decode is 1-ULP-sensitive and
-// DIVERGED within 16 tokens (measured 2026-07-09) => fp8/bf16-attn default
-// stays OFF. On the 27B (fp4 attn) the token-exact gates PASS with it ON
-// (test_qwen27_paged_engine + the dense-logits deterministic span) => fp4-attn
-// default ON. Unset env => default ON iff fp4_attn; VT_FUSE_ATTN_PREAMBLE=1/0
-// force-overrides either way (same-binary A/B).
-bool FuseAttnPreambleOn(bool fp4_attn) {
+// DEFAULT ON, ALL ARCHES (2026-07-18, MIRROR vLLM). vLLM dispatches the fused
+// qk-norm-rope-gate preamble for EVERY Qwen3.5 full-attn layer (attn_output_gate
+// && neox && cuda && text_only — true for BOTH the 27B and the 35B; the fp4/fp8
+// split was OUR heuristic, not vLLM's). On the 35B (fp8 attn) this pairs with the
+// FA-2 prefill (bf16 q feeds flash_fwd_splitkv) — the token-exact gate
+// test_qwen36_paged_engine holds 315/315 with the full default set (measured
+// 2026-07-18, CLAIM-35B-FA2-FLIP-1), and the 27B (fp4) stays 235/235. The old
+// "35B diverges within 16 tokens" (2026-07-09) is STALE (grounded in spec
+// qwen36-35b-fa2-prefill-oracle-2026-07-18: the stored oracle IS the graphed
+// vLLM production stream and FA2 bf16-q is the MOST vLLM-faithful path).
+// NOTE: the spec's "round normed q/k to bf16 before RoPE" tighten
+// (fused_qk_norm_rope.py:67) is op-level bit-identical but flips the 27B tok6
+// near-tie in combination (RMSNorm-saga), so the preamble ships UNTIGHTENED —
+// both arches are token-exact on their graphed oracles either way (see
+// AttnQkNormRopeGateKernel NOTE in cuda_ops.cu). Unset env => ON;
+// VT_FUSE_ATTN_PREAMBLE=1/0 force-overrides (same-binary A/B rollback).
+bool FuseAttnPreambleOn(bool /*fp4_attn*/) {
   static const char* e = std::getenv("VT_FUSE_ATTN_PREAMBLE");
   if (e != nullptr) return e[0] == '1';
-  return fp4_attn;
+  return true;
 }
 
 // FA-2 PREFILL (the last measured 27B prefill gap): route the full-attn PREFILL
@@ -3246,8 +3252,11 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // (skipping the CastBf16 below — bit-identical, both are the RN round of the
   // same f32 value); bf16 attention out feeds SigmoidGateBf16 (exact upcast).
   // Eligibility MUST mirror cuda_paged_attn.cu so every bf16 query is consumed
-  // by FA2. Ratio-8 (35B), windows, non-causal calls and all other shapes stay
-  // f32 and use the existing graph-captured fallback.
+  // by FA2. The prefill FA2 dispatch (cuda_paged_attn.cu:2494) admits ANY GQA
+  // ratio at head_dim 256, so BOTH the 27B (ratio-6) and the 35B (ratio-8) take
+  // FA2 prefill (2026-07-18 flip, default-ON via FuseAttnPreambleOn). Pure
+  // decode FA2 remains ratio-6-only (27B); the 35B decode and all windows /
+  // non-causal / non-256 shapes stay f32 on the graph-captured fallback.
   const bool fa2_prefill = Fa2PrefillOn() && FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin &&
                            d.q.device.type == vt::DeviceType::kCUDA &&
                            kv.dtype == DType::kBF16 && Dh == 256 && T > meta.num_reqs;

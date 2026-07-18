@@ -4,8 +4,9 @@ Investigation claim: `CLAIM-35B-FA2-ORACLE`. Scope: the MIRROR-vLLM oracle
 question that gates enabling FA2 prefill + the fused qk-norm-rope preamble on
 the **35B** full-attention layers (levers `VT_FA2_PREFILL` / `VT_FUSE_ATTN_PREAMBLE`,
 model gate `qwen3_5.cpp:3250-3286`). Relates to matrix row `KERNEL-ATTN-FA2`
-(owned by `CLAIM-SERVE-GATE-1`; not re-owned here). No engine/oracle change
-landed — this records the grounded decision + evidence.
+(owned by `CLAIM-SERVE-GATE-1`; not re-owned here). The oracle decision (no
+re-baseline) is recorded below; the 35B FA2-prefill default-ON FLIP subsequently
+LANDED via `CLAIM-35B-FA2-FLIP-1` (see "LANDED" section) — no oracle change.
 
 ## Question
 
@@ -92,27 +93,45 @@ the task is REFUTED; this is the `ELSE` branch (oracle faithful).
   attention kernel**. (Absolute TTFT gain not representative on a 9-token prompt;
   a realistic-prefill A/B is still owed.)
 
-## Recommendation (NOT landed — needs current-main full-default battery)
+## LANDED (2026-07-18, `CLAIM-35B-FA2-FLIP-1`) — flip default-ON, UNTIGHTENED
 
-This is the `ELSE` outcome: keep the levers opt-in for now with this honest record,
-and enable-by-default only after the following on CURRENT main (20523e8), because
-the RMSNorm-fast saga proved individually-token-exact kernels can flip a near-tie
-**in combination** with the full default set (async + GDN cubin + all fast kernels):
+The `ELSE` recommendation was executed on current main. Outcome: **the 35B
+FA2-prefill + fused-preamble default is FLIPPED ON** (`FuseAttnPreambleOn` now
+returns true for all arches; `VT_FUSE_ATTN_PREAMBLE=0`/`VT_FA2_PREFILL=0` roll
+back). Both sacred gates hold on the FULL current-main default set (async +
+GDN cubin + all fast kernels + this flip): 35B `test_qwen36_paged_engine`
+**315/315** (both single + batched-graph cases), 27B `test_qwen27_paged_engine`
+**235/235**. The kernel-side `fa2_prefill` (`cuda_paged_attn.cu:2494`) admits any
+GQA ratio at head_dim 256, so the 35B ratio-8 layers take the exact
+`flash_fwd_splitkv` kernel the 27B already uses.
 
-1. **Tighten first (robustness, MIRROR-faithful):** make `AttnQkNormRopeGateKernel`
-   round the normed q/k to the OUTPUT dtype (`Tqk`) before the RoPE multiply, so
-   the fused kernel is bit-identical to the unfused path in bf16 (exactly what
-   vLLM's fused kernel does at `fused_qk_norm_rope.py:67`). This removes the ≤1-ULP
-   tie-luck dependency instead of relying on the current stale-tie coincidence.
-   Update `test_ops_attn_preamble.cpp:245-315` to the new contract
-   (fused-bf16 == unfused-bf16). f32 output path stays unchanged (still 315/315).
-2. Rebuild CURRENT main + the tighten; confirm 35B `test_qwen36_paged_engine`
-   **315/315** with the FULL prospective default set (FA2+preamble ON alongside
-   async + GDN cubin + RMSNorm/gated/conv fast), and every `=0` rollback arm.
-3. 27B `test_qwen27_paged_engine` **235/235** unaffected (27B FA2 prefill already
-   default-ON; this changes only the 35B gate on `FuseAttnPreambleOn`).
-4. memcheck clean; measure a realistic-prefill TTFT A/B (target ~7-9% of prefill).
-5. Then flip the 35B default via `FuseAttnPreambleOn` and record with speed credit.
+### The tighten was TRIED and REJECTED (RMSNorm-saga near-tie flip)
+
+Step 1's "round normed q/k to bf16 before RoPE" tighten (`RoundToStore<Tqk>` in
+`AttnQkNormRopeGateKernel`) was implemented and **op-level VALIDATED bit-identical
+to the unfused bf16 path** (`test_ops_attn_preamble` fused-bf16 == unfused-bf16:
+q 0/32768, k 0/4096, gate 0) — exactly the vLLM `fused_qk_norm_rope.py:67`
+numerics. BUT with the tighten, `test_qwen27_paged_engine` **failed 233/235**: it
+flipped the 27B's known **tok6 whitespace near-tie** AWAY from the pip-vLLM oracle
+(`greedy_ids.npy` → `greedy_ids_emulation.npy`). This is the RMSNorm-saga lesson —
+an op that is individually MORE vLLM-faithful flips a razor near-tie in
+COMBINATION, because our OTHER sub-ULP op diffs compensated the un-rounded
+preamble to land on the vLLM-correct token. Per the guardrail (**do NOT ship a
+divergence**), the tighten is NOT shipped. The 35B passes 315/315 with OR without
+it, so the preamble ships UNTIGHTENED and BOTH arches stay token-exact on their
+graphed oracles. The op test keeps its original (bf16 store == RN(f32)) contract;
+the finding is recorded in-code (`AttnQkNormRopeGateKernel` + `FuseAttnPreambleOn`
+NOTEs) so a future agent does not re-attempt the tighten blind.
+
+### Evidence (this landing)
+- 35B 315/315 + 27B 235/235 + op 14/14, full default set — `dgx:/tmp/fa2gates_u.log`
+  (`~/work/vllm.cpp-35b-fa2-flip`, clean `-Werror` build, CUTLASS+FA2+Triton).
+- memcheck 35B prefill `--tool memcheck` — `dgx:/tmp/fa2_memcheck2.log`.
+- Realistic-prefill TTFT A/B (input-1024, conc8, FA2 on vs `VT_FA2_PREFILL=0`,
+  3 interleaved pairs) — `dgx:/tmp/fa2_ttft2.log`: **Mean TTFT 824.7 vs 874.4 ms
+  = −5.7%** (median −5.7%; prefill tput +5.5%). Below the ~7-9% offline-kernel
+  target — the 1.86× attention-kernel win dilutes across the full prefill; no
+  decode regression (prefill-only, both arms token-exact 315/315).
 
 ## Evidence roots
 

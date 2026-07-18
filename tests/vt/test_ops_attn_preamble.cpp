@@ -249,6 +249,14 @@ inline uint16_t F32ToBf16Bits(float f) {
 // This pins the claim FullAttnBlockPaged relies on: switching the preamble to
 // bf16 q/k for FA-2 changes NOTHING except where the (identical) rounding step
 // happens (in-kernel store vs the CastBf16 the KV-cache write used to do).
+//
+// NOTE (2026-07-18, CLAIM-35B-FA2-FLIP-1): a "round normed q/k to bf16 BEFORE
+// RoPE" tighten (mirror vLLM fused_qk_norm_rope.py:67) was tried here and DID
+// hold op-level bit-identity to the unfused bf16 path, but it flipped the 27B
+// tok6 whitespace near-tie away from the vLLM oracle in the full engine gate
+// (compensating-error, RMSNorm-saga lesson) so it was NOT shipped. The kernel
+// therefore keeps the normed q/k in f32 through RoPE; this test pins the
+// resulting (bf16 store == RN(f32 value)) contract that both models rely on.
 TEST_CASE("attn preamble bf16 q/k + f32 gate == f32 out + RN cast (bit-identity)") {
   if (!HasCuda()) return;
   Backend& b = vt::GetBackend(DeviceType::kCUDA);

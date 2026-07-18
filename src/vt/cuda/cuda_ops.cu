@@ -777,6 +777,15 @@ __device__ inline float GemmaNormElem(float v, float inv, float w, bool gemma) {
 // Tgate=f32) is bit-identical to the f32 path followed by CastBf16 on q/k — the
 // FA-2 prefill combo (bf16 q feeds FA-2, bf16 k feeds the bf16 KV-cache write,
 // gate stays f32 because sigmoid(gate) must see the un-rounded f32 value).
+//
+// NOTE (2026-07-18, CLAIM-35B-FA2-FLIP-1): a "round normed q/k to bf16 BEFORE
+// RoPE" tighten (mirror of vLLM fused_qk_norm_rope.py:67) was implemented and
+// op-level VALIDATED bit-identical to the unfused bf16 path, but it flipped the
+// 27B's known tok6 whitespace near-tie AWAY from the vLLM oracle (want_prod →
+// want_emu) in COMBINATION with our other sub-ULP op diffs (a compensating-error
+// interaction — the RMSNorm-saga lesson). The 35B passes 315/315 with OR without
+// the round, so the round is NOT shipped: the untightened preamble keeps BOTH
+// the 27B (235/235) and the 35B (315/315) token-exact to their graphed oracles.
 template <typename Tsrc, typename Tqk, typename Tgate>
 __global__ void AttnQkNormRopeGateKernel(Tqk* q_out, Tqk* k_out, Tgate* gate_out,
                                          const Tsrc* qgate, const Tsrc* kf, const float* q_norm,

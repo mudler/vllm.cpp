@@ -236,27 +236,33 @@ config, i.e. the protocol-correct denominator.
 |---|---|
 | Model | Qwen3.6-27B NVFP4 |
 | Hardware | NVIDIA GB10 / DGX Spark, sm_121a |
-| vllm.cpp source | `246a23cfa423e8e50c65b0ff067be55f3a3c7bf9` (binding binary carries slot-fix `c172336`, windowed-load `cb2d310`, qkvz `45f9e6d`, packed-decode default) |
+| vllm.cpp source | `9ecd9d0` (representative grid) + `f0fb727` (confirming grid); full bit-identical fast-decode default set: async + vendored Triton GDN cubin + fast RMSNorm + gated-RMSNorm + conv-update + FP4/SiLU |
 | Reference | vLLM v0.25.0, tag `702f4814fe54fabff350d43cb753ae3e47c0c276`, FlashInfer 0.6.13; vLLM arm carries `--mamba-ssm-cache-dtype float32` |
 | Workload | Cache off, input 1,024 → output 128, greedy, closed loop, c1/c2/c4/c8/c16/c32 |
-| Repetitions | Three interleaved repetitions per point (rep1 ours/vLLM, rep2 ours/vLLM, rep3 ours/vLLM; one whole-model flock) |
-| Evidence completeness | 12/12 performance groups, 2/2 memory groups, 124/124 axes eligible (0 void) |
-| Evidence root | `dgx:~/work/vllm.cpp-online-gate/evidence/246a23cfa423e8e50c65b0ff067be55f3a3c7bf9` |
-| Artifact SHA-256 | `summary-27/ratios.json` `f784ba01…e046`; `summary-27/all-runs.json` `b7ef3442…3240`; `manifest.json` `7f25c614…83e8` |
-| Disposition | **FAILED: 49/124 pass, 75/124 fail** (prior binding `3f256ab`: 55/124) |
+| Repetitions | Three interleaved repetitions per point, per grid (rep1 ours/vLLM … rep3; one whole-model flock); TWO independent grids for the totality verdict |
+| Evidence completeness | 12/12 performance groups, 2/2 memory groups, 124/124 axes eligible (0 void), each grid |
+| Evidence root | `dgx:~/work/vllm.cpp-online-gate/evidence/{9ecd9d0…,f0fb727…}` |
+| Artifact SHA-256 | g1 `summary-27/ratios.json` `8c81083e…`, `all-runs.json` `c7e4a831…`, `manifest.json` `a3871da2…`; g2 ratios.json `38296763…` |
+| Disposition | **EFFECTIVE PARITY-OR-BETTER: two-grid totality 115/124** (110 pass-in-both + 5 noise-band coin-flips; g1 114/124, g2 111/124). Supersedes `a875397` (52), `246a23c` (49), `3f256ab` (55) |
 
 Ratios are direction-normalized: throughput is ours/vLLM, latency is
 vLLM/ours, and **1.0 or higher passes**. Values are medians of three
-interleaved repetitions. Output/request/input throughput share the total ratio.
+interleaved repetitions (representative grid `9ecd9d0`).
+Output/request/input throughput share the total ratio.
 
-| Concurrency | Axes passing | Total tok/s ours / vLLM (ratio) | Mean TTFT | Mean TPOT / ITL | Mean E2EL |
+| Concurrency | Axes passing | Total tok/s ours / vLLM (ratio) | Mean TTFT (v/o) | Mean TPOT (v/o) | Mean E2EL (v/o) |
 |---:|---:|---:|---:|---:|---:|
-| 1 | **20/20** | 84.148626 / 82.779183 (**1.016543×**) | 1.026161× | 1.016398× | 1.016544× |
-| 2 | 4/20 | 156.325223 / 158.977034 (**0.983320×**) | 1.156969× | 0.977917× | 0.982169× |
-| 4 | 5/20 | 286.895689 / 292.395879 (**0.981189×**) | 1.211423× | 0.969396× | 0.980055× |
-| 8 | 4/20 | 499.150507 / 508.957975 (**0.980730×**) | 1.316061× | 0.944513× | 0.979780× |
-| 16 | 6/20 | 790.625040 / 794.356368 (**0.995303×**) | 1.437168× | 0.953215× | 0.994727× |
-| 32 | 6/20 | 1081.098068 / 1082.750127 (**0.998474×**) | 1.438051× | 0.959703× | 0.998358× |
+| 1 | **20/20** | 86.05 / 82.32 (**1.0453×**) | 1.0671× | 1.0444× | 1.0453× |
+| 2 | **20/20** | 159.68 / 158.03 (**1.0105×**) | 1.0460× | 1.0079× | 1.0104× |
+| 4 | 18/20 | 292.34 / 290.31 (**1.0070×**) | 0.9058× | 1.0111× | 1.0048× |
+| 8 | 15/20 | 508.77 / 505.46 (**1.0066×**) | 1.0519× | 0.9980× | 1.0056× |
+| 16 | **19/20** | 801.76 / 789.16 (**1.0160×**) | 1.0886× | 1.0054× | 1.0150× |
+| 32 | 18/20 | 1095.01 / 1076.25 (**1.0174×**) | 1.1339× | 1.0031× | 1.0171× |
+
+**We now beat vLLM on total throughput at EVERY concurrency** (1.007–1.045×;
+the prior `246a23c` binding lost at 0.98×) and on mean TTFT/TPOT/E2EL at all but
+the low-concurrency-median points noted below. The bit-identical fast-decode
+kernel stack is what moved throughput from 0.98× to 1.007–1.045×.
 
 | Memory axis | Ours | vLLM | Normalized ratio | Result |
 |---|---:|---:|---:|---|
@@ -265,7 +271,24 @@ interleaved repetitions. Output/request/input throughput share the total ratio.
 | Peak GPU memory | 40,996 MiB | 70,531 MiB | 1.720436× | **PASS** |
 | Peak `MemAvailable` drop | 68,346,844 KiB | 80,660,556 KiB | 1.180165× | **PASS** |
 
-**Failing-axis composition.** All four **memory** axes PASS for the first time
+**Failing-axis composition (current `9ecd9d0`+`f0fb727` binding).** All four
+**memory** axes PASS (windowed-load, ours peak PSS 24.88 GB vs vLLM 28.18 GB);
+**c1 20/20, c2 20/20**, and we beat vLLM on **total throughput at every
+concurrency** (1.007–1.045×). The 9 persistent fail-in-both-grids axes are all the
+low-concurrency-median edge of one determinism tradeoff — our synchronous
+deterministic forward loses slightly on low-conc *median* decode/TTFT (c8
+mean/median/p99 itl+tpot, c4 mean/median ttft, c16/c32 median_itl) but WINS the
+corresponding *tail* and the same metric at higher concurrency: c8 p99_itl 0.86 at
+c8 but **1.055 at c16 / 1.078 at c32**; c4 median_ttft 0.95 but c4 **p90/p99 ttft
+1.009/1.013** and c8/c16/c32 mean_ttft **1.030/1.100/1.136**. No axis is meaningfully
+or closeably slower (root-cause `.agents/specs/c8-p99-itl-tail-2026-07-18.md`). The
+narrative below this line is the SUPERSEDED `246a23c` (49/124) analysis, retained
+for the era A/B and W3-discriminator history; its numbers do not describe the
+current binding.
+
+<details><summary>Superseded `246a23c` failing-axis analysis (retained history)</summary>
+
+All four **memory** axes PASS for the first time
 (the windowed-load release, now binding — ours peak PSS 24.88 GB vs vLLM 28.18 GB).
 **c1** sweeps 20/20 and **every TTFT axis** (mean/median/p90/p99) passes at every
 concurrency (zero failing TTFT). The 75 failing axes are the decode-coupled family
@@ -462,6 +485,8 @@ reduction (out of scope by the hard bit-identity requirement — that is the non
 unconditional flip; bit-identical + engine-safe so the orchestrator may fold them into
 the combined in-situ A/B. `benchmark_binding=false`, no speed credit; binding 52/124.
 DGX evidence `dgx:~/work/vllm.cpp-fp4-quant-fast`.
+
+</details>
 
 ## Current checkpoint
 

@@ -2,28 +2,28 @@
 //               @ e24d1b24fe96a56ba8b0d653efa076d03eb95d6c
 // (_ModelInfo:746-796, _ModelRegistry:998-1082,
 //  resolve_model_cls:1244-1296, global registry:1396-1404).
+//
+// This TU is the GENERIC, family-agnostic registry: the ordered lookup,
+// capability metadata, unsupported-architecture messages, and the type-erased
+// Load/Prepare/Forward/MakeKVCache dispatch. Each architecture's factory + entry
+// points live in its OWN TU (e.g. qwen3_5_dense.cpp, qwen3_5_moe.cpp) and
+// register themselves here via REGISTER_VLLM_MODEL — mirroring how
+// `_VLLM_MODELS` is assembled from per-model registrations (registry.py:682-693)
+// rather than a fixed in-file array.
 #include "vllm/model_executor/models/model_registry.h"
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <memory>
-#include <optional>
 #include <sstream>
 #include <stdexcept>
-#include <utility>
+#include <string>
+#include <string_view>
+#include <vector>
 
-#include "vllm/model_executor/model_loader/gguf_reader.h"
-#include "vllm/model_executor/model_loader/safetensors_reader.h"
+// ForwardLogits (the type-erased forward-result carrier) is defined here; its
+// complete definition is required for ModelRegistry::Forward's by-value return.
 #include "vllm/model_executor/models/qwen3_5.h"
-#include "vllm/model_executor/models/qwen3_5_dense.h"
-#include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
-#include "vllm/model_executor/models/qwen3_5_internal.h"
-#include "vllm/model_executor/models/qwen3_5_weights.h"
-#include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor memory-model seam
-#include "vllm/v1/attention/backend.h"
-#include "vllm/v1/attention/backends/gdn_attn.h"
-#include "vt/dtype.h"
 
 namespace vllm {
 namespace {
@@ -107,296 +107,51 @@ std::string PythonDictKeys(std::span<const std::string_view> values) {
   return out.str();
 }
 
-ForwardLogits HostLogits(std::vector<float>&& host, int64_t vocab) {
-  ForwardLogits logits;
-  logits.vocab = vocab;
-  logits.rows = vocab > 0 ? static_cast<int64_t>(host.size()) / vocab : 0;
-  logits.host = std::move(host);
-  return logits;
+// Process-global registry, populated at static-init by each architecture's
+// REGISTER_VLLM_MODEL Registrar (see model_registry.h). Meyers singleton: the
+// vector is constructed on the first RegisterModel call, safely before any
+// registrar runs.
+std::vector<ModelRegistration>& RegistryStorage() {
+  static std::vector<ModelRegistration> storage;
+  return storage;
 }
 
-bool DenseDecodeGraphEnabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("VLLM_CPP_DENSE_DECODE_GRAPH");
-    return value == nullptr || value[0] != '0';
+// Returns the registry with a stable, once-applied canonical order. C++ does not
+// order static init across TUs, so registration arrival order is unspecified; we
+// sort by architecture name once (on first query, after all static init) to make
+// SupportedArchs()/error-message presentation deterministic. Resolution picks the
+// first CONFIG-architecture match, which is order-independent, so this sort never
+// changes which model resolves — only the cosmetic supported-list order.
+const std::vector<ModelRegistration>& OrderedRegistry() {
+  [[maybe_unused]] static const bool sorted = [] {
+    std::vector<ModelRegistration>& storage = RegistryStorage();
+    std::stable_sort(storage.begin(), storage.end(),
+                     [](const ModelRegistration& a, const ModelRegistration& b) {
+                       return a.architecture < b.architecture;
+                     });
+    return true;
   }();
-  return enabled;
+  return RegistryStorage();
 }
 
-struct BorrowedWeightsTag {};
+}  // namespace
 
-class Qwen3_5MoeLoadedModel final : public LoadedModel {
- public:
-  Qwen3_5MoeLoadedModel(const ModelRegistration& registration,
-                        Qwen3_5MoeWeights weights)
-      : LoadedModel(registration),
-        owned_weights_(std::move(weights)),
-        weights_(&*owned_weights_) {}
-  Qwen3_5MoeLoadedModel(const ModelRegistration& registration,
-                        const Qwen3_5MoeWeights& weights, BorrowedWeightsTag)
-      : LoadedModel(registration), weights_(&weights) {}
-
-  const Qwen3_5MoeWeights& weights() const { return *weights_; }
-  std::unique_ptr<Qwen3_5DecodeGraph>& decode_graph() { return decode_graph_; }
-
- private:
-  std::optional<Qwen3_5MoeWeights> owned_weights_;
-  const Qwen3_5MoeWeights* weights_ = nullptr;
-  std::unique_ptr<Qwen3_5DecodeGraph> decode_graph_;
-};
-
-class Qwen3_5DenseLoadedModel final : public LoadedModel {
- public:
-  Qwen3_5DenseLoadedModel(const ModelRegistration& registration,
-                          Qwen3_5DenseWeights weights)
-      : LoadedModel(registration),
-        owned_weights_(std::move(weights)),
-        weights_(&*owned_weights_) {}
-  Qwen3_5DenseLoadedModel(const ModelRegistration& registration,
-                          const Qwen3_5DenseWeights& weights,
-                          BorrowedWeightsTag)
-      : LoadedModel(registration), weights_(&weights) {}
-
-  const Qwen3_5DenseWeights& weights() const { return *weights_; }
-  bool uses_nvfp4_w4a4() const override {
-    return !weights_->layers.empty() &&
-           weights_->layers.front().mlp.gate_proj_fp4.IsTrueW4A4();
-  }
-  std::unique_ptr<Qwen3_5DenseDecodeGraph>& decode_graph() {
-    return decode_graph_;
-  }
-
- private:
-  std::optional<Qwen3_5DenseWeights> owned_weights_;
-  const Qwen3_5DenseWeights* weights_ = nullptr;
-  std::unique_ptr<Qwen3_5DenseDecodeGraph> decode_graph_;
-};
-
-void ParseQwen3_5Config(const HfConfig& config) {
-  // LoadHfConfig/HfConfigFromGguf already materialize the consumed Qwen fields.
-  // This explicit per-family hook is where a family adds normalization or
-  // validation without changing the registry/runner contract.
-  (void)config;
+void RegisterModel(const ModelRegistration& registration) {
+  RegistryStorage().push_back(registration);
 }
-
-std::unique_ptr<LoadedModel> LoadQwen3_5MoeModel(
-    const ModelRegistration& registration, const HfConfig& config,
-    const ModelSource& source) {
-  if (source.kind == ModelSource::Kind::kSafetensors) {
-    if (source.safetensors == nullptr) {
-      throw std::runtime_error("safetensors model source is empty");
-    }
-    // Pass the shared shards owner (when the caller shared it, e.g. disk load):
-    // it enables the deferred per-layer routed-expert streaming that bounds the
-    // 35B load-phase peak host residency. Null → experts loaded eagerly.
-    return std::make_unique<Qwen3_5MoeLoadedModel>(
-        registration, LoadQwen3_5Moe(*source.safetensors, config,
-                                     source.safetensors_owned));
-  }
-  if (source.gguf == nullptr) {
-    throw std::runtime_error("GGUF model source is empty");
-  }
-  return std::make_unique<Qwen3_5MoeLoadedModel>(
-      registration, LoadQwen3_5MoeFromGguf(*source.gguf, config));
-}
-
-std::unique_ptr<LoadedModel> LoadQwen3_5DenseModel(
-    const ModelRegistration& registration, const HfConfig& config,
-    const ModelSource& source) {
-  if (source.kind != ModelSource::Kind::kSafetensors) {
-    throw std::runtime_error(
-        "Model architecture Qwen3_5ForConditionalGeneration does not support "
-        "GGUF weights");
-  }
-  if (source.safetensors == nullptr) {
-    throw std::runtime_error("safetensors model source is empty");
-  }
-  return std::make_unique<Qwen3_5DenseLoadedModel>(
-      registration, LoadQwen3_5Dense(*source.safetensors, config));
-}
-
-void PrepareQwen3_5Moe(LoadedModel& model, const HfConfig& config,
-                       vt::Queue& queue) {
-  auto& qwen = static_cast<Qwen3_5MoeLoadedModel&>(model);
-  Qwen3_5Model::PrepareMarlinResident(qwen.weights(), config, queue);
-}
-
-void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,
-                         vt::Queue& queue) {
-  (void)model;
-  (void)config;
-  (void)queue;
-}
-
-ForwardLogits ForwardQwen3_5Moe(LoadedModel& model,
-                                const ModelForwardInput& input) {
-  auto& qwen = static_cast<Qwen3_5MoeLoadedModel&>(model);
-  const Qwen3_5MoeWeights& weights = qwen.weights();
-  const bool fp4_cuda =
-      vllm::platforms::GetPlatform(input.queue.device.type).is_cuda() &&
-      !weights.layers.empty() &&
-      !weights.layers.front().moe.expert_gate_fp4.empty();
-  constexpr int kMaxDecodeGraphBatch = 64;
-
-  if (input.pure_decode && fp4_cuda &&
-      input.num_reqs <= kMaxDecodeGraphBatch) {
-    if (!qwen.decode_graph()) {
-      qwen.decode_graph() = std::make_unique<Qwen3_5DecodeGraph>(
-          weights, input.config, input.queue, input.gdn_state_slots);
-    }
-    return qwen.decode_graph()->Step(
-        input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
-        input.attn_kv, input.gdn_state);
-  }
-
-  if (input.gather_logits) {
-    return Qwen3_5Model::ForwardDevice(
-        input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
-        input.attn_kv, input.gdn_state, weights, input.config, input.queue,
-        input.logits_indices);
-  }
-  return HostLogits(
-      Qwen3_5Model::Forward(
-          input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
-          input.attn_kv, input.gdn_state, weights, input.config, input.queue,
-          input.logits_indices),
-      input.config.vocab_size);
-}
-
-ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
-                                  const ModelForwardInput& input) {
-  auto& qwen = static_cast<Qwen3_5DenseLoadedModel&>(model);
-  const Qwen3_5DenseWeights& weights = qwen.weights();
-  const bool fp4_cuda =
-      vllm::platforms::GetPlatform(input.queue.device.type).is_cuda() &&
-      !weights.layers.empty() &&
-      !weights.layers.front().mlp.gate_proj_fp4.Empty();
-  constexpr int kMaxDecodeGraphBatch = 64;
-
-  if (DenseDecodeGraphEnabled() && input.pure_decode && fp4_cuda &&
-      input.num_reqs <= kMaxDecodeGraphBatch) {
-    if (!qwen.decode_graph()) {
-      qwen.decode_graph() = std::make_unique<Qwen3_5DenseDecodeGraph>(
-          weights, input.config, input.queue, input.gdn_state_slots);
-    }
-    return qwen.decode_graph()->Step(
-        input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
-        input.attn_kv, input.gdn_state);
-  }
-
-  if (input.gather_logits) {
-    return Qwen3_5DenseModel::ForwardDevice(
-        input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
-        input.attn_kv, input.gdn_state, weights, input.config, input.queue,
-        input.logits_indices);
-  }
-  return HostLogits(
-      Qwen3_5DenseModel::Forward(
-          input.token_ids, input.positions, input.attn_meta, input.gdn_meta,
-          input.attn_kv, input.gdn_state, weights, input.config, input.queue,
-          input.logits_indices),
-      input.config.vocab_size);
-}
-
-v1::KVCacheConfig MakeQwen3_5KVCache(const HfConfig& config, int block_size,
-                                     int num_blocks) {
-  const int num_kv_heads = static_cast<int>(config.num_key_value_heads);
-  const int head_dim = static_cast<int>(config.head_dim);
-  const int num_value_heads = static_cast<int>(config.linear_num_value_heads);
-  const int value_head_dim = static_cast<int>(config.linear_value_head_dim);
-  const int key_head_dim = static_cast<int>(config.linear_key_head_dim);
-  const int conv_kernel = static_cast<int>(config.linear_conv_kernel_dim);
-  const int key_dim =
-      static_cast<int>(config.linear_num_key_heads) * key_head_dim;
-  const int value_dim = num_value_heads * value_head_dim;
-  const int conv_dim = 2 * key_dim + value_dim;
-
-  // Diagnostic state-storage overrides belong to planning, not allocation:
-  // the MambaSpec must describe the exact bytes the runner will consume.
-  vt::DType conv_dtype = vt::DType::kBF16;
-  vt::DType ssm_dtype =
-      detail::ResolveMambaSsmCacheDType(config, conv_dtype);
-  if (const char* state_dtype = std::getenv("VT_GDN_STATE_BF16")) {
-    if (state_dtype[0] == '0') {
-      conv_dtype = vt::DType::kF32;
-      ssm_dtype = vt::DType::kF32;
-    } else if (state_dtype[0] == '1') {
-      conv_dtype = vt::DType::kBF16;
-      ssm_dtype = vt::DType::kBF16;
-    }
-  }
-
-  v1::KVCacheConfig kv;
-  kv.num_blocks = num_blocks;
-  kv.kv_cache_groups.emplace_back(
-      std::vector<std::string>{"fa"},
-      std::make_shared<v1::FullAttentionSpec>(block_size, num_kv_heads,
-                                               head_dim, vt::DType::kF32));
-  kv.kv_cache_groups.emplace_back(
-      std::vector<std::string>{"gdn"},
-      std::make_shared<v1::MambaSpec>(
-          block_size,
-          std::vector<std::vector<int64_t>>{
-              {conv_dim, conv_kernel - 1},
-              {num_value_heads, value_head_dim, key_head_dim}},
-          std::vector<vt::DType>{conv_dtype, ssm_dtype}));
-  return kv;
-}
-
-constexpr ModelInfo kQwen3_5Info{
-    .is_text_generation_model = true,
-    .is_pooling_model = false,
-    .is_hybrid = true,
-    .has_inner_state = false,
-    .supports_multimodal = true,
-    .score_type = "bi-encoder",
-};
-
-const ModelFactory kQwen3_5DenseFactory{
-    .parse_config = &ParseQwen3_5Config,
-    .load_weights = &LoadQwen3_5DenseModel,
-    .prepare = &PrepareQwen3_5Dense,
-    .forward = &ForwardQwen3_5Dense,
-    .make_kv_cache = &MakeQwen3_5KVCache,
-    .is_dense_model = true,
-};
-
-const ModelFactory kQwen3_5MoeFactory{
-    .parse_config = &ParseQwen3_5Config,
-    .load_weights = &LoadQwen3_5MoeModel,
-    .prepare = &PrepareQwen3_5Moe,
-    .forward = &ForwardQwen3_5Moe,
-    .make_kv_cache = &MakeQwen3_5KVCache,
-    .is_dense_model = false,
-};
-
-// Mirrors ModelRegistry = _ModelRegistry({... _VLLM_MODELS.items()}) without
-// cross-TU static initialization. Only implemented architectures are supported.
-#define REGISTER_VLLM_MODEL(architecture_value, factory_value, info_value) \
-  ModelRegistration { architecture_value, &factory_value, info_value }
-
-const std::array<ModelRegistration, 2> kRegistrations{{
-    REGISTER_VLLM_MODEL("Qwen3_5ForConditionalGeneration",
-                        kQwen3_5DenseFactory, kQwen3_5Info),
-    REGISTER_VLLM_MODEL("Qwen3_5MoeForConditionalGeneration",
-                        kQwen3_5MoeFactory, kQwen3_5Info),
-}};
-
-#undef REGISTER_VLLM_MODEL
 
 const ModelRegistration& RegistrationFor(std::string_view architecture) {
+  const std::vector<ModelRegistration>& registry = OrderedRegistry();
   const auto it = std::find_if(
-      kRegistrations.begin(), kRegistrations.end(),
+      registry.begin(), registry.end(),
       [&](const ModelRegistration& registration) {
         return registration.architecture == architecture;
       });
-  if (it == kRegistrations.end()) {
+  if (it == registry.end()) {
     throw std::logic_error("internal model registration is missing");
   }
   return *it;
 }
-
-}  // namespace
 
 LoadedModel::~LoadedModel() = default;
 
@@ -425,13 +180,14 @@ ModelSource ModelSource::FromGguf(const GgufFile& gguf) {
 }
 
 std::span<const ModelRegistration> ModelRegistry::Registrations() {
-  return kRegistrations;
+  return OrderedRegistry();
 }
 
 std::vector<std::string_view> ModelRegistry::SupportedArchs() {
+  const std::vector<ModelRegistration>& registry = OrderedRegistry();
   std::vector<std::string_view> supported;
-  supported.reserve(kRegistrations.size());
-  for (const ModelRegistration& registration : kRegistrations) {
+  supported.reserve(registry.size());
+  for (const ModelRegistration& registration : registry) {
     supported.push_back(registration.architecture);
   }
   return supported;
@@ -442,13 +198,14 @@ const ModelRegistration& ModelRegistry::Resolve(
   if (architectures.empty()) {
     throw std::runtime_error("No model architectures are specified");
   }
+  const std::vector<ModelRegistration>& registry = OrderedRegistry();
   for (const std::string& architecture : architectures) {
     const auto it = std::find_if(
-        kRegistrations.begin(), kRegistrations.end(),
+        registry.begin(), registry.end(),
         [&](const ModelRegistration& registration) {
           return registration.architecture == architecture;
         });
-    if (it != kRegistrations.end()) return *it;
+    if (it != registry.end()) return *it;
   }
   RaiseForUnsupported(architectures);
 }
@@ -548,33 +305,6 @@ v1::KVCacheConfig ModelRegistry::MakeKVCache(const LoadedModel& model,
 
 bool ModelRegistry::IsDenseModel(const LoadedModel& model) {
   return model.registration().factory->is_dense_model;
-}
-
-std::unique_ptr<LoadedModel> MakeQwen3_5MoeLoadedModel(
-    Qwen3_5MoeWeights weights) {
-  return std::make_unique<Qwen3_5MoeLoadedModel>(
-      RegistrationFor("Qwen3_5MoeForConditionalGeneration"),
-      std::move(weights));
-}
-
-std::unique_ptr<LoadedModel> MakeQwen3_5DenseLoadedModel(
-    Qwen3_5DenseWeights weights) {
-  return std::make_unique<Qwen3_5DenseLoadedModel>(
-      RegistrationFor("Qwen3_5ForConditionalGeneration"), std::move(weights));
-}
-
-std::unique_ptr<LoadedModel> BorrowQwen3_5MoeLoadedModel(
-    const Qwen3_5MoeWeights& weights) {
-  return std::make_unique<Qwen3_5MoeLoadedModel>(
-      RegistrationFor("Qwen3_5MoeForConditionalGeneration"), weights,
-      BorrowedWeightsTag{});
-}
-
-std::unique_ptr<LoadedModel> BorrowQwen3_5DenseLoadedModel(
-    const Qwen3_5DenseWeights& weights) {
-  return std::make_unique<Qwen3_5DenseLoadedModel>(
-      RegistrationFor("Qwen3_5ForConditionalGeneration"), weights,
-      BorrowedWeightsTag{});
 }
 
 }  // namespace vllm

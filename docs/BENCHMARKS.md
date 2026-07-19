@@ -958,6 +958,28 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Model self-registration + per-arch entry-point TU split (2026-07-19,
+  extensibility item 5, `MODEL-FACTORY-registry` / `CLAIM-MODEL-SELFREG-1`).** A
+  behavior-preserving, code-organization-only refactor: the fixed
+  `constexpr std::array<ModelRegistration,2> kRegistrations` is replaced by a
+  `REGISTER_VLLM_MODEL(...)` static-`Registrar` self-registration idiom (copying
+  the `RegisterOp`/`RegisterBackend`/`RegisterPlatform` pattern), and the Qwen
+  dense/MoE arch-specific registry entry points move out of the
+  `model_registry.cpp` monolith into NEW per-variant TUs `qwen3_5_dense.cpp` +
+  `qwen3_5_moe.cpp` over a NEW shared `qwen3_5_common.{h,cpp}`. No
+  numeric/kernel/dispatch change (the same factory functions run, byte-for-byte;
+  `qwen3_5.cpp` is UNTOUCHED), so **NOT APPLICABLE** to the throughput / latency /
+  memory scoreboard. Verified by the extended `test_model_registry` (138
+  assertions + a new `self_registration` case), clean CPU `-Werror` build, full
+  CPU CTest (all 125 pass in isolation; 5 HTTP/bench/capi tests are parallel
+  port/resource-contention flakes — each PASSES isolated), tools 164/164, and
+  (behavior-preserving ⇒ must be unchanged) both DGX model gates
+  `test_qwen27_paged_engine` **235/235** + `test_qwen36_paged_engine` **315/315**
+  token-exact + `compute-sanitizer memcheck` 35B **0 errors** (DGX-confirmed
+  2026-07-19 @ `669679a`, production flags CUTLASS sm120a + FA2 sm_121a + Triton
+  AOT). The deeper `qwen3_5.cpp` DevicePool/matmul/GDN shared-machinery factoring
+  is a deferred follow-up.
+
 - **Platform seam extraction (2026-07-18, `BACKEND-PLATFORM`).** A
   behavior-preserving refactor: added the C++ `Platform` capability seam
   (`include/vllm/platforms/interface.h` + `src/vllm/platforms/{platform,cpu,cuda}.cpp`,

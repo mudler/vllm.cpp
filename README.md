@@ -201,6 +201,23 @@ sites key on the object's own device.) This is a behavior-preserving refactor
 (both gate models stay token-exact); kernel-shape dispatch branches are
 deliberately left for the later attention/kernel-registry items.
 
+**Extensibility — model self-registration landed (2026-07-19, CPU-gated).**
+Adding a model architecture is now additive. The fixed model-registry array is
+replaced by a `REGISTER_VLLM_MODEL(...)` static-registration idiom
+(`include/vllm/model_executor/models/model_registry.h`) copying the proven
+op/backend/platform self-registration pattern: each architecture registers
+itself from its own translation unit into the shared, type-erased
+`ModelFactory`. The Qwen3.6 dense and MoE variants now live in their own registry
+TUs (`qwen3_5_dense.cpp`, `qwen3_5_moe.cpp`) over a shared `qwen3_5_common`
+helper, and `model_registry.cpp` is the generic family-agnostic registry. **Net
+effect: adding the next model = one new TU + one `REGISTER_VLLM_MODEL` line, with
+zero edits to a shared array or to `model_registry.cpp`** (previously: edit the
+fixed `kRegistrations` array *and* add glue inside the shared monolith). A
+behavior-preserving refactor — no numeric/kernel/dispatch change, DGX-confirmed
+token-exact (27B 235/235 + 35B 315/315, memcheck 0 errors). The deeper
+`qwen3_5.cpp` forward-machinery (DevicePool/matmul/GDN) factoring is a deferred
+follow-up.
+
 ### Kernel coverage on the gate path
 
 | Kernel family | CPU | CUDA · GB10 | Status |

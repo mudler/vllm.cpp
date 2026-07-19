@@ -150,6 +150,44 @@ struct UnsupportedModelInfo {
   std::string_view detail;  // previous version or plugin URL
 };
 
+// Self-registration seam (mirrors REGISTER_VLLM_MODEL in
+// vllm/model_executor/models/registry.py:682-693 assembling `_VLLM_MODELS`).
+// Each architecture registers itself from its OWN translation unit via a static
+// `ModelRegistrar`, exactly like the RegisterOp/RegisterBackend/RegisterPlatform
+// static-init idiom (src/vt/ops.cpp, src/vt/backend.cpp,
+// src/vllm/platforms/platform.cpp). Adding a model = a new TU with one
+// REGISTER_VLLM_MODEL line — ZERO edit to a shared array.
+//
+// The passed ModelRegistration is copied into the process-global registry (its
+// string_view/factory members point at TU-static data with static lifetime, so
+// the copy stays valid). Registration order across TUs is unspecified under C++
+// static init, so the registry imposes a stable canonical sort by architecture
+// name on first query (see model_registry.cpp) — resolution semantics (first
+// config-architecture match) are order-independent and unchanged.
+void RegisterModel(const ModelRegistration& registration);
+
+// Internal adapter helper: returns the registry entry for an implemented
+// architecture (used by the synthetic in-memory Make/Borrow adapters below).
+const ModelRegistration& RegistrationFor(std::string_view architecture);
+
+// Static-init helper whose constructor performs the self-registration; used
+// only through the REGISTER_VLLM_MODEL macro.
+struct ModelRegistrar {
+  explicit ModelRegistrar(const ModelRegistration& registration) {
+    RegisterModel(registration);
+  }
+};
+
+// Registers one architecture's factory from its own TU. Place at namespace
+// scope inside `namespace vllm { ... }`; `unique_tag` is any TU-unique token.
+#define REGISTER_VLLM_MODEL(unique_tag, architecture_name, factory_ref,   \
+                            info_val)                                      \
+  namespace {                                                             \
+  const ::vllm::ModelRegistrar vllm_model_registrar_##unique_tag(         \
+      ::vllm::ModelRegistration{(architecture_name), &(factory_ref),      \
+                                (info_val)});                             \
+  } /* namespace */
+
 class ModelRegistry {
  public:
   // Mirrors get_supported_archs() and resolve_model_cls(): registrations are

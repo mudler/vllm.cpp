@@ -10,6 +10,7 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <span>
@@ -54,6 +55,38 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
     const HfConfig config = Config({std::string(registration.architecture)});
     CHECK(&ModelRegistry::Resolve(config) == &registration);
   }
+}
+
+TEST_CASE("self_registration: both Qwen archs self-register from their own TUs") {
+  // With the fixed kRegistrations array replaced by REGISTER_VLLM_MODEL
+  // static-init self-registration (qwen3_5_dense.cpp + qwen3_5_moe.cpp each
+  // register themselves), the process-global registry must still contain both
+  // implemented architectures with a complete factory — proving the static
+  // Registrars ran and populated the shared ModelFactory registry.
+  const auto registrations = ModelRegistry::Registrations();
+  const auto has_arch = [&](std::string_view arch) {
+    for (const ModelRegistration& r : registrations) {
+      if (r.architecture == arch) return r.factory != nullptr;
+    }
+    return false;
+  };
+  CHECK(has_arch("Qwen3_5ForConditionalGeneration"));
+  CHECK(has_arch("Qwen3_5MoeForConditionalGeneration"));
+
+  // Registration arrival order across TUs is unspecified under C++ static init,
+  // so the registry imposes a stable canonical sort by architecture name. This
+  // makes SupportedArchs()/error-message order deterministic ('F' < 'M' puts the
+  // dense variant first); resolution is order-independent regardless.
+  const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
+  REQUIRE(supported.size() == 2);
+  CHECK(std::is_sorted(supported.begin(), supported.end()));
+  CHECK(supported.front() == "Qwen3_5ForConditionalGeneration");
+  CHECK(supported.back() == "Qwen3_5MoeForConditionalGeneration");
+
+  // The dense/MoE scheduler policy split survives the per-variant TU move.
+  std::unique_ptr<vllm::LoadedModel> dense =
+      vllm::MakeQwen3_5DenseLoadedModel(vllm::Qwen3_5DenseWeights{});
+  CHECK(ModelRegistry::IsDenseModel(*dense));
 }
 
 TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo") {

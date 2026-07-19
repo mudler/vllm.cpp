@@ -379,6 +379,30 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    discrete-vs-unified `ResidencyPolicy` folds PR #4's host-weight-release +
    DevicePool memory-model debt into one advertised policy object;
    `get_attn_backend_priority()` is a stub for the later attention-registry item.
+   **Model self-registration is now REALIZED (2026-07-19, extensibility item 5,
+   `MODEL-FACTORY-registry` / `CLAIM-MODEL-SELFREG-1`) — faithful port, one small
+   recorded deviation.** The fixed `constexpr std::array<ModelRegistration,2>
+   kRegistrations` is replaced by a `REGISTER_VLLM_MODEL(...)` static-`Registrar`
+   idiom (`include/vllm/model_executor/models/model_registry.h:167-189`) that
+   copies the proven `RegisterOp`/`RegisterBackend`/`RegisterPlatform` static-init
+   pattern (`src/vt/ops.cpp`, `src/vt/backend.cpp`,
+   `src/vllm/platforms/platform.cpp`): each architecture registers itself from its
+   OWN TU into the type-erased `ModelFactory`, mirroring how `_VLLM_MODELS` is
+   assembled from per-model registrations (`registry.py:682-693`) rather than a
+   fixed in-file array. The Qwen dense/MoE arch-specific entry points moved out of
+   the `model_registry.cpp` monolith into per-variant TUs (`qwen3_5_dense.cpp`,
+   `qwen3_5_moe.cpp`) over a shared `qwen3_5_common.{h,cpp}` (ModelInfo, config
+   hook, KV-cache builder, host-logits carrier, borrowed-weights tag); the heavy
+   forward machinery (`Qwen3_5Model::`/`Qwen3_5DenseModel::` + DevicePool/matmul/
+   GDN) stays in `qwen3_5.cpp` (that deeper shared-machinery factoring is a
+   deferred follow-up — scope-disciplined out of this behavior-preserving pass).
+   **Deviation:** C++ does not order static init across TUs, so registration
+   arrival order is unspecified; the registry applies a stable canonical sort by
+   architecture name on first query so `SupportedArchs()`/the unsupported-arch
+   error message stay deterministic (vLLM relies on dict insertion order). This is
+   cosmetic only — resolution picks the first CONFIG-architecture match and is
+   order-independent, so no model resolves differently. Adding a model =
+   one new TU + one `REGISTER_VLLM_MODEL` line, ZERO edit to a shared array.
 9. **Vendored CUTLASS (sm120a NVFP4 GEMM)**: `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu`
    is a 1:1 lift of vLLM's `cutlass_scaled_fp4_mm_sm120a`
    (`csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu` @

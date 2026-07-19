@@ -24,6 +24,37 @@ CUDA branch (red DGX CPU tests). Fixed to per-object
 tier-guarded; see the Risks/decisions correction below and the parity ledger.
 
 
+**STATUS 2026-07-19 — Item 5 (model self-registration + per-arch entry-point TU
+split) LANDED (CPU-gated, DGX model-gate pending), `CLAIM-MODEL-SELFREG-1`,
+`MODEL-FACTORY-registry`.** The fixed `constexpr std::array<ModelRegistration,2>
+kRegistrations` (`model_registry.cpp`) is replaced by a `REGISTER_VLLM_MODEL(...)`
+static-`Registrar` self-registration idiom
+(`include/vllm/model_executor/models/model_registry.h:167-189`), copying the
+proven `RegisterOp`/`RegisterBackend`/`RegisterPlatform` pattern. The Qwen
+dense/MoE arch-specific registry entry points (LoadedModel subclass +
+load/prepare/forward + factory + Make/Borrow adapters) moved out of the
+`model_registry.cpp` monolith into NEW per-variant TUs
+`src/vllm/model_executor/models/qwen3_5_dense.cpp` + `qwen3_5_moe.cpp`, over a NEW
+shared `qwen3_5_common.{h,cpp}` (ModelInfo, config hook, KV-cache builder,
+host-logits carrier, borrowed-weights tag); `model_registry.{h,cpp}` is now the
+GENERIC family-agnostic registry. **Measured additive-ness: adding the next model
+= 1 new TU + 1 `REGISTER_VLLM_MODEL` line, ZERO edit to a shared array or to
+`model_registry.cpp` (before: edit the fixed `kRegistrations` array AND add glue
+inside the `model_registry.cpp`/`qwen3_5.cpp` monoliths).** Scope-disciplined: the
+DEEP `qwen3_5.cpp` shared-machinery factoring (DevicePool/matmul/GDN +
+`Qwen3_5Model::`/`Qwen3_5DenseModel::` bodies into `qwen3_5_common`) is a deferred
+follow-up — the prioritized deliverable was the self-registration + arch-entry-
+point separation, kept as a reviewable, byte-identical, no-numeric-change refactor
+(`qwen3_5.cpp` UNTOUCHED). Deviation: C++ static-init order across TUs is
+unspecified → the registry canonically sorts by architecture name on first query
+(cosmetic; resolution is order-independent). Behavior-preserving: clean CPU
+`-Werror` build, `test_model_registry` self-registration extension PASS, full CPU
+CTest green, tools 164/164, checkers green; **DGX-confirmed 2026-07-19 @ `669679a`
+(production flags CUTLASS sm120a + FA2 sm_121a + Triton AOT): clean CUDA `-Werror`
+build 0 warnings, 27B `test_qwen27_paged_engine` 235/235 + 35B
+`test_qwen36_paged_engine` 315/315 token-exact, `compute-sanitizer memcheck` 35B 0
+errors.** Items 2/4 remain.
+
 **User directive (post-27B-parity):** make adding a new GPU/arch/model an
 ADDITIVE change (new files + one registration), not scattered edits — mirror
 vLLM so ports are mechanical copy-paste. HW-prioritized: GB10 (sm_121a) + M4
@@ -68,7 +99,7 @@ GDN a/b stride bugfix (5 files) that would land regardless of architecture.
 | 2 | Residency/memory-model as a `Platform::residency_policy()` capability (folds PR #4's host-weight-release + DevicePool caps) | 1 | discrete/unified split = one policy object; new discrete GPU sets a flag, edits no model code | S–M | 1 |
 | 3 | Drop-in kernel ABI: finish `BACKEND-ABI-VT` W0 debts + migrate GEMM families | 3 (ABI leaf) | upstream/ROCm kernels drop in at the raw-pointer boundary | M–L | ABI spine `1141b79` |
 | 4 | Attention-backend registry + platform priority (mirror `platforms/cuda.py:89-160`) | 2 | new attn impl self-registers; selection is data, not a code edit | M | 1 |
-| 5 | Model self-registration (`REGISTER_VLLM_MODEL` static-init) + per-arch TU split of `qwen3_5.cpp` | 4 | "add a model = one additive TU + one registration" | M | none |
+| 5 | Model self-registration (`REGISTER_VLLM_MODEL` static-init) + per-arch TU split of `qwen3_5.cpp` **— LANDED CPU 2026-07-19 (`CLAIM-MODEL-SELFREG-1`); registration + arch-entry-point separation done, deep `qwen3_5.cpp` machinery factoring deferred** | 4 | "add a model = one additive TU + one registration" | M | none |
 | 6 | Metal/MLX bring-up (first non-CUDA PROOF the seams work) | 1+2+3 | the payoff: proves "add a GPU = add files only" | L | 1–4, **needs M4 Mac — defer** |
 
 Do-now (GB10/CPU): 1,2,3,4,5. Defer: 6 (M4 Mac), discrete-memory *validation* of #2, ROCm leg of #3.

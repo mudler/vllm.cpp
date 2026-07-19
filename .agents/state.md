@@ -13246,3 +13246,8 @@ builds, CUTLASS sm120a + Marlin NVFP4 + FA2 sm_121a hard-verified; one flock):
 VERDICT: the binding memory axes `peak_pss`/`peak_rss` (2/4 FAIL) should now
 FLIP to PASS — ours 35B load-to-ready peak ~4.19 GiB vs vLLM 13.3 GiB.
 `benchmark_binding=false`; the orchestrator re-grids the binding to confirm.
+
+## 2026-07-19 — 35B re-grid 43/124, MEMORY 4/4 FLIPPED (load-streaming); c1-c4 residual characterized
+Re-grid `4ef3b9f` (memory-streaming ce7e1a0 + GDN conv 7a1a6d6), evidence `dgx:~/work/vllm.cpp-online-gate/evidence/4ef3b9f22e2ad3342e314901be14c7891a03bcc9/summary-35` (ratios.json sha256 `2f35f394…`); 12/12 eligible, 0 void, **43/124 pass, mem 4/4** (peak_pss/peak_rss FLIPPED FAIL→PASS via the load-time interleave — ours load peak 4.19 vs vLLM 13.3 GiB). GDN conv sub-noise as expected (c2 flipped 1→0, coin-flip). Per-conc: c1 0/20, c2 0/20, c4 0/20, c8 7/20, c16 16/20, c32 16/20.
+- **c1-c4 residual = BOTH low-batch decode AND TTFT:** c1 TPOT/ITL **0.810×** (→ winning by c16/c32), TTFT 0.92-0.93×; c2 TPOT 0.846× / TTFT 0.85-0.91×; c4 TPOT 0.938× / TTFT 0.86-0.89×. The decode gap scaling 0.81×(c1)→winning(c32) is the FIXED-PER-STEP-OVERHEAD signature (launch/host amortized over batch) — same class as 27B's low-conc residual. TTFT is prefill (FA2 closed ~⅓).
+- Big 35B levers ALL banked (routing/align, host-free, FA2, GDN conv, load-stream). Kernel micro-levers now sub-noise. High-concurrency (c16/c32 serving point) STRONG (16/20, winning decode+throughput); memory beats vLLM; c1-c4 low-batch structural. Open question (attributing now): is the c1 decode 0.81× a closable engine/graph-capture lever or the MoE weight-read+launch floor?

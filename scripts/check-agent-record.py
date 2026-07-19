@@ -16,7 +16,7 @@ AGENTS = ROOT / ".agents"
 MATRICES = {
     "MODEL": (AGENTS / "model-matrix.md", 326),
     "QUANT": (AGENTS / "quantization-matrix.md", 81),
-    "KERNEL": (AGENTS / "kernel-matrix.md", 31),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 32),
     "BACKEND": (AGENTS / "backend-matrix.md", 54),
 }
 

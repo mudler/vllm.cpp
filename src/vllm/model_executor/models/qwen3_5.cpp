@@ -39,6 +39,7 @@
 #endif
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/recipes.h"
 #ifdef VT_MARLIN_NVFP4
 #include "vt/cuda/marlin_repack.h"
 #endif
@@ -1375,6 +1376,24 @@ DBuf MergedFp8QkvD(Dev d, const Tensor& x, const Tensor* h_fp8,
 bool FuseRmsNormFp8QuantEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FUSE_RMSNORM_FP8QUANT");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+// KERNEL-FUSION-FRAMEWORK W0 — route the plain add+residual+RMSNorm site through
+// the declared vt::FusedChain(kFusedAddRmsNorm) recipe seam instead of the direct
+// vt::RmsNorm(residual) hand-call. Behavior-preserving by construction: the recipe
+// encodes the exact op order (res += hidden; out = gemma-RMSNorm(res)) and the
+// default Tier-0 composite dispatches to the same vt::RmsNorm(residual) primitive,
+// so the FusedChain path is BIT-IDENTICAL to the prior hand-call (proven byte-exact
+// in tests/vt/test_ops_fused_chain.cpp). Default ON to exercise the production seam;
+// VT_FUSED_CHAIN_ADOPT=0 restores the exact prior hand-call as a same-binary
+// rollback. This is structural plumbing (the fusion framework's first real adoption),
+// NOT a perf lever — perf-neutral by construction.
+bool FusedChainAdoptEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FUSED_CHAIN_ADOPT");
     return e == nullptr || e[0] != '0';
   }();
   return on;
@@ -4756,7 +4775,17 @@ void RunLayerPaged(Dev d, const Qwen3_5MoeLayerWeights& layer, const HfConfig& c
 
   Tensor dw_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
-  vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
+  // KERNEL-FUSION-FRAMEWORK W0 — the first production adoption of the declared
+  // fusion seam. post_attention_layernorm is a plain add+residual+gemma-RMSNorm
+  // (res += attn; dh2 = norm(res)), the exact chain kFusedAddRmsNorm transcribes.
+  // The FusedChain path is bit-identical to the vt::RmsNorm(residual) hand-call
+  // (Tier-0 composite dispatches to the same primitive; byte-exact in
+  // test_ops_fused_chain.cpp). VT_FUSED_CHAIN_ADOPT=0 restores the hand-call.
+  if (FusedChainAdoptEnabled()) {
+    vt::FusedChain(d.q, dh2.t(), attn.t(), dw_post, &res.t(), vt::kFusedAddRmsNorm, eps);
+  } else {
+    vt::RmsNorm(d.q, dh2.t(), attn.t(), dw_post, vt::RmsNormArgs{eps, true}, &res.t());
+  }
 
   hidden = MoeBlock(d, layer.moe, cfg, dh2.t(), T);
 }

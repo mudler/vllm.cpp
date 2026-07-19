@@ -261,8 +261,8 @@ both gate models (DGX-confirmed token-exact: 27B 235/235 + 35B 315/315, memcheck
 0 errors). This completes the three-seam extensibility foundation (Platform,
 attention-backend registry, model self-registration).
 
-**Extensibility — next / roadmap_v1 ORDER-1: the portable op-fusion framework
-(SPIKED 2026-07-19).** The fourth and unifying seam: fusions **declared once**
+**Extensibility — roadmap_v1 ORDER-1: the portable op-fusion framework
+(SPIKED 2026-07-19; W0 ADOPTED 2026-07-19).** The fourth and unifying seam: fusions **declared once**
 (a backend-agnostic recipe catalog above `vt::`, transcribing vLLM's finite
 fusion-pass set) and **realized per-backend** through the `vt::` op table (a
 composite tier is the CPU oracle every backend inherits free; one interpreter
@@ -270,9 +270,16 @@ kernel per backend lights up every recipe). It makes a new vLLM fusion PR a
 one-declaration port, a new GPU a one-file catalog realization, and a new model
 an additive pattern declaration — the same additive pattern as the seams above,
 so upstream fusion PRs port mechanically instead of being hand-wired at call
-sites. A Phase-0 skeleton already exists in-tree (unadopted). Honest scope: this
-is an **extensibility + mechanical-upstream-sync** cornerstone, not a perf lever
-(the measured 35B prefill gap is compute-bound, ceiling ~3.5%/step). Spike:
+sites. **W0 landed (2026-07-19):** the Phase-0 skeleton is now ADOPTED at one
+real production site — the 35B post-attention layernorm routes its plain
+add+residual+RMSNorm through `vt::FusedChain(kFusedAddRmsNorm)` (behind
+`VT_FUSED_CHAIN_ADOPT`, default-ON, `=0` rollback), behaviour-preserving and
+byte-identical to the prior hand-call, proving the declare-once/realize-per-backend
+seam end-to-end in a real model forward (35B 315/315 + 27B 235/235 token-exact on
+both arms, memcheck 0 errors). Honest scope: this is an **extensibility +
+mechanical-upstream-sync** cornerstone, not a perf lever — W0 is perf-neutral by
+construction (the measured 35B prefill gap is compute-bound, ceiling ~3.5%/step).
+Spike + work breakdown (W0–Wn):
 [`.agents/specs/portable-fusion-framework.md`](.agents/specs/portable-fusion-framework.md).
 
 ### Kernel coverage on the gate path

@@ -122,7 +122,10 @@ void RunCpuCase(int64_t t, int64_t h, DType xdt, DType outdt, DType resdt, uint3
 }  // namespace
 
 TEST_CASE("fused_chain kFusedAddRmsNorm: Tier-0 == Tier-1 == RmsNorm(residual), bit-identical") {
-  const int64_t sizes[] = {1, 7, 8, 127, 128, 129, 512};
+  // 2048 = the 35B/27B hidden_size the W0 adoption site (RunLayerPaged
+  // post_attention_layernorm) actually hits in production — the shape the
+  // vt::FusedChain(kFusedAddRmsNorm) seam runs at token-exact.
+  const int64_t sizes[] = {1, 7, 8, 127, 128, 129, 512, 2048};
   uint32_t seed = 20;
   for (int64_t h : sizes) {
     CAPTURE(h);
@@ -259,7 +262,7 @@ TEST_CASE("CUDA fused_chain: Tier-0 == Tier-1 == RmsNorm(residual), bit-identica
     return;
   }
   uint32_t seed = 4000;
-  for (int64_t h : {1, 127, 128, 129, 512}) {
+  for (int64_t h : {1, 127, 128, 129, 512, 2048}) {
     CAPTURE(h);
     RunCudaCase(3, h, DType::kF32, DType::kF32, DType::kF32, seed);
     seed += 7;

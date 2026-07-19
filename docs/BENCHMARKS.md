@@ -40,7 +40,14 @@ roadmap_v1 ORDER-1 **portable op-fusion framework** (`KERNEL-FUSION-FRAMEWORK`, 
 [portable-fusion-framework.md](../.agents/specs/portable-fusion-framework.md)) —
 justified by EXTENSIBILITY + mechanical upstream-sync, NOT perf (the ceiling above is
 the honest cap; benchmark disposition = the framework must be perf NEUTRAL-OR-BETTER,
-not a speedup claim).
+not a speedup claim). **W0 landed (2026-07-19):** the first production adoption of the
+seam — the 35B post-attention layernorm routes its plain add+residual+RMSNorm through
+`vt::FusedChain(kFusedAddRmsNorm)` (`VT_FUSED_CHAIN_ADOPT`, default-ON, `=0` rollback),
+behaviour-preserving and byte-identical to the prior hand-call (35B 315/315 + 27B
+235/235 token-exact BOTH arms, byte-exact composite==interp==golden incl. the production
+H=2048 shape, memcheck 0 errors). **Benchmark disposition: perf-NEUTRAL by construction**
+(the default Tier-0 composite dispatches to the same primitive the hand-call used) ⇒ no
+re-grid; this is structural plumbing, not a speedup.
 
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid

@@ -13836,3 +13836,52 @@ byte-exact prefill-TTFT — but this fold is **SMALL** (~1% TTFT c1/c2, ~0.4% c8
 the stack is other norm/quant/cast producer-consumer folds + the harder Inductor-style
 horizontal combo_kernels). Continue the push only if that stacking math is acceptable;
 each fold is byte-exact + default-ON-able, so they compound cleanly.
+
+## 2026-07-19 — Portable fusion framework **W0**: adopt `kFusedAddRmsNorm` through `vt::FusedChain` at ONE production site (`CLAIM-FUSION-FRAMEWORK-W0`)
+
+**What landed.** The first PRODUCTION adoption of the landed Phase-0 fusion seam
+(`KERNEL-FUSION-FRAMEWORK`, spec `portable-fusion-framework.md` §10 W0). One real
+add+residual+RMSNorm call site — the `RunLayerPaged` post_attention_layernorm (35B
+MoE paged decoder, on the `test_qwen36_paged_engine` hot path) — now routes its plain
+`res += attn; dh2 = gemma-RMSNorm(res)` through
+`vt::FusedChain(d.q, dh2, attn, dw_post, &res, vt::kFusedAddRmsNorm, eps)` instead of
+the direct `vt::RmsNorm(residual)` hand-call, behind `FusedChainAdoptEnabled()`
+(`VT_FUSED_CHAIN_ADOPT`, **DEFAULT ON** to exercise the seam; `=0` restores the exact
+prior hand-call as a same-binary rollback). Site anchors: adoption
+`qwen3_5.cpp` `RunLayerPaged` (`vt::FusedChain(kFusedAddRmsNorm)`), flag
+`FusedChainAdoptEnabled` (`VT_FUSED_CHAIN_ADOPT`).
+
+**Semantics match (why this site, byte-identically).** The site is bf16 in/weight/out,
+f32 residual, `eps=rms_norm_eps`, gemma weight (`1+w`) — exactly what `kFusedAddRmsNorm`
+transcribes (step0 `kAdd res=in+res`; step1 `kRmsNorm gemma out=norm(res)*(1+w)`). The
+default Tier-0 composite walks the recipe through the SAME already-registered
+`vt::RmsNorm(residual)` primitive the hand-call used ⇒ the FusedChain path is
+**bit-identical by construction** (the recipe's fused kernel squares the bf16-rounded
+residual in f32 exactly as the shipped add+rmsnorm does). It is `post_attention_layernorm`
+(not the input layernorm) because the input site can take the `RmsNormQuantFp8` fp8-fuse
+branch on the 35B, while post-attn is always the plain path — so the adopted site is
+always exercised. **Behavior-preserving plumbing — the win is STRUCTURAL (the
+declare-once/realize-per-backend seam works in a real model forward), NOT perf; W0 is
+perf-neutral by design.**
+
+**POD sufficiency.** The current 3-opcode/4-role `FusedRecipe` POD expresses this plain
+add+rmsnorm site byte-identically — W0 needs NO POD generalization. W1's generalized POD
+(indexed multi-input operands + silu/sigmoid/rope/quant opcodes) is required only for the
+quant-fused sites (`kSiluMulFp4Quant`/`kRmsNormQuantFp8`/`kAttnQkNormRopeGate`/…), which
+this row does NOT touch. The other 3 identical plain sites
+(`RunLayer`/`RunDenseLayer`/`RunDenseLayerPaged` post-attn) are left on the hand-call —
+adopting ONE clean site is the whole point of W0.
+
+**Gates ALL GREEN** (dgx `~/work/vllm.cpp-fusion-w0`, production flags CUTLASS sm120a
+NVFP4 + Marlin + FA2 sm_121a + Triton AOT, clean CUDA `-Werror` build **0 warnings**,
+one flock). Byte-exact `test_ops_fused_chain` composite==interp==golden: CPU 137
+assertions + **CUDA-on-dgx 239 assertions** (extended with the production `H=2048` shape
+the W0 site runs at), 0 failed. Token-exact BOTH arms: `VT_FUSED_CHAIN_ADOPT=1` (default)
+35B **315/315** + 27B **235/235**; `=0` rollback 35B **315/315** + 27B **235/235**.
+`compute-sanitizer memcheck` on the adopted 35B path **0 errors**. Perf-neutral by
+construction ⇒ `benchmark_binding=false` (no re-grid).
+
+**Next.** W1 generalizes the POD (multi-input operands + new opcodes) so the quant-fused
+hand-ops become declarations; W2 migrates them one-by-one (byte-exact + token-exact each);
+W3 = a new vLLM pass ports as ONE declaration + its test; W4 = mock-backend additivity
+proof. See `portable-fusion-framework.md` §10.

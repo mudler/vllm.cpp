@@ -1514,7 +1514,19 @@ void CastBf16(Queue& q, Tensor& out, const Tensor& in) {
   VT_CHECK(out.dtype == DType::kBF16, "cast_bf16: out must be bf16");
   VT_CHECK(in.dtype == DType::kF32, "cast_bf16: in must be f32");
   VT_CHECK(out.Numel() == in.Numel(), "cast_bf16: out/in must have the same element count");
-  VT_CHECK(out.IsContiguous() && in.IsContiguous(), "cast_bf16: contiguous required");
+  // Input may be a torch.split-style packed view (the merged QKV path): each
+  // logical row is dense while the row stride spans the parent Q+K+V tensor.
+  // Symmetric with CastF32; strided inputs only arise on CUDA (the merge is
+  // CUDA-only), where the kernel honors the row stride.
+  int64_t inner = 1;
+  bool inner_contiguous = true;
+  for (int dim = in.rank - 1; dim >= 1; --dim) {
+    inner_contiguous = inner_contiguous && in.stride[dim] == inner;
+    inner *= in.shape[dim];
+  }
+  inner_contiguous = inner_contiguous && in.rank >= 1 && in.stride[0] >= inner;
+  VT_CHECK(out.IsContiguous() && inner_contiguous,
+           "cast_bf16: out must be contiguous and input rows inner-contiguous");
   VT_CHECK(out.device == q.device && in.device == q.device,
            "cast_bf16: device mismatch (out/in/queue)");
   reinterpret_cast<CastBf16Fn>(GetOp(OpId::kCastBf16, q.device.type))(q, out, in);

@@ -41,18 +41,26 @@ __device__ inline void Store(__nv_bfloat16* p, int64_t i, float v) { p[i] = __fl
 __device__ inline float SigmoidF(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 // ---------------------------------------------------------------------------
-// cast_bf16: out[i] = bf16(in[i]). Thread per element, grid-stride.
-__global__ void CastBf16Kernel(__nv_bfloat16* out, const float* in, int64_t n) {
+// cast_bf16: out[i] = bf16(in[i]). Thread per element, grid-stride. Input may be
+// a torch.split-style packed view (merged QKV): each logical row is dense while
+// row_stride spans the parent Q+K+V tensor (symmetric with CastF32Kernel).
+__global__ void CastBf16Kernel(__nv_bfloat16* out, const float* in, int64_t n,
+                               int64_t row_size, int64_t row_stride) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step)
-    Store(out, i, Load(in, i));
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step) {
+    const int64_t row = i / row_size;
+    const int64_t col = i - row * row_size;
+    Store(out, i, Load(in, row * row_stride + col));
+  }
 }
 
 void CastBf16KernelCuda(Queue& q, Tensor& out, const Tensor& in) {
   const int64_t n = out.Numel();
   if (n == 0) return;
+  const int64_t rows = in.shape[0];
+  const int64_t row_size = n / rows;
   CastBf16Kernel<<<GridFor(n), kBlock, 0, AsStream(q)>>>(out.Ptr<__nv_bfloat16>(), in.Ptr<float>(),
-                                                         n);
+                                                         n, row_size, in.stride[0]);
   Check(cudaGetLastError(), "cast_bf16 launch");
 }
 

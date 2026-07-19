@@ -13715,3 +13715,33 @@ Tree `dgx:~/work/vllm.cpp-gated-f32`; branch `worktree-agent-a6637db943a96bfb8`
 fp8-cutlass in_proj branch keeps f32 conv/post-conv, unlike the 27B bf16 path),
 and any remaining non-AOT GDN prefill kernel above the megablock post-conv now
 that both post-conv (d4363fe) and gated-norm (this change) are fast on both models.
+
+## 2026-07-19 — BINDING CHECKPOINT at `786aa0e` (both models) + the 35B verdict is TTFT-only
+
+Ran the full SERVE-GATE-ONLINE grid at HEAD `786aa0e` (after all GDN-glue wins),
+BOTH models, fresh 3-rep interleaved. **ZERO void, 12/12 binding-eligible each**
+(memory-return valid — disk had 284G free). Results:
+- **27B: 117/124.** 7 fails = c4 mean/median ttft (0.911/0.950) + 5 ITL/TPOT tail
+  axes at 0.93–1.00 (c8 p99_itl 0.929 / median_tpot 0.997; c16 median_itl 1.000;
+  c32 p90/median_itl 0.984/0.991) — all noise-band. Parity holds (≈ the 118 at
+  `fcfde41`; the 1-axis delta is a coin-flip).
+- **35B: 70/124** (unchanged vs prior). **PASS-by-concurrency: mem 4/4, c1 2/20,
+  c2 0/20, c4 16/20, c8 16/20, c16 16/20, c32 16/20.** DECISIVE: at c4–c32 the ONLY
+  failures are the 4 TTFT axes (mean/median/p90/p99 ttft), every decode axis
+  (tpot/itl/e2el/throughput) PASSES → **35B decode is at-or-beyond vLLM everywhere.**
+  c1/c2 are near-miss across the board (0.935–0.975) but TTFT-led (low-conc TTFT
+  dominates e2e). TTFT norm-ratios: c1~0.966-0.975, c2~0.935-0.986, c4~0.900-0.944,
+  c8~0.886-0.971, c16~0.910-0.971, c32~0.877-0.945.
+
+**CONCLUSION: the entire remaining 35B gap — and 27B's last residual — is PREFILL
+TTFT.** The GDN kernel-glue wins (post-conv `d4363fe` + gated-RMSNorm `786aa0e`,
+both byte-exact default-ON) held 70/124 but did NOT flip the TTFT axes → the TTFT
+gap is bigger than kernel-glue can close. The concurrency-dependence (worse at
+c2–c8/c32 than c1) points at batched-prefill SCHEDULING (chunked-prefill /
+continuous-batching / prefill-decode interleave), NOT single-stream kernel latency —
+the [[profile-full-step-not-just-kernels]] signature. NEXT (task #61, in flight):
+full-step prefill-TTFT attribution vs vLLM (host-side/scheduling vs kernel), grounded
+in vLLM's scheduler mechanism, to name the lever. Evidence
+`dgx:~/work/vllm.cpp-online-gate/evidence/786aa0e…/summary-{27,35}/{report.md,ratios.json}`.
+(Orchestration note: the grid script exits rc=1 on any "not 124/124" gate — that is
+the gate verdict, NOT a run failure; both grids collected full data + summaries.)

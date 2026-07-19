@@ -8,7 +8,23 @@ reproduction entry points. Attempt chronology and failure forensics live in the
 append-only within the current era and are frozen under `.agents/completed/`
 when the era is rolled up; this page never accumulates their run-by-run history.
 
-Last updated: **2026-07-18**. **27B has reached effective performance
+Last updated: **2026-07-19**. **Both gate models bound at HEAD `786aa0e`** (fresh
+fully-interleaved 3-rep grid, ZERO void, 12/12 binding-eligible both models): **27B
+117/124** (parity holds — the 7 fails are c4 mean/median TTFT 0.911/0.950 + 5 ITL/TPOT
+tail axes at 0.93–1.00, all noise-band; matches the regression-confirmed 118) and
+**35B 70/124**. The 35B result is now DECISIVELY characterized: **decode is at-or-beyond
+vLLM everywhere** — memory 4/4, and at c4/c8/c16/c32 the ONLY failures are the 4 TTFT
+axes (mean/median/p90/p99 ttft 0.877–0.971) with every decode axis (tpot/itl/e2el/
+throughput) PASSING; c1 (2/20) + c2 (0/20) are near-miss across the board (0.935–0.975)
+but TTFT-led (at low concurrency TTFT dominates e2e with no queuing to amortize). **The
+entire remaining 35B gap — and 27B's last residual — is PREFILL TTFT.** The GDN kernel-glue
+wins (post-conv + gated-RMSNorm, both default-ON, byte-exact) held 70/124 without flipping
+the TTFT axes → the TTFT gap is bigger than kernel-glue can close; the concurrency-dependence
+(worse at c2–c8/c32 than c1) points at batched-prefill SCHEDULING, not single-stream kernel
+latency. Active lever: prefill-TTFT full-step attribution (host-side / scheduling vs kernel).
+Evidence `dgx:~/work/vllm.cpp-online-gate/evidence/786aa0e…/summary-{27,35}/`.
+
+**27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
 reruns on the full production default set (async + vendored Triton GDN decode cubin
 + bit-identical fast RMSNorm + gated-RMSNorm + conv-update + FP4/SiLU) — `9ecd9d0`

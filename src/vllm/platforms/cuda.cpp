@@ -40,6 +40,26 @@ class CudaPlatform final : public Platform {
     return p;
   }
 
+  // Capability-ordered attention-backend priority — a faithful port of the
+  // non-MLA branch of vllm/platforms/cuda.py::_get_backend_priorities:154-166 @
+  // pin e24d1b24. Our gate models (Qwen3 dense + GDN) are non-MLA; the MLA
+  // branch (sparse/dense MLA orderings) is out of scope until an MLA model ports.
+  //   * device_capability.major == 10 (Blackwell datacenter, sm_100):
+  //         FLASHINFER, FLASH_ATTN, TRITON_ATTN, FLEX_ATTENTION, TURBOQUANT
+  //   * else (incl. GB10 sm_121 == major 12, and Ampere/Hopper):
+  //         FLASH_ATTN, FLASHINFER, TRITON_ATTN, FLEX_ATTENTION, TURBOQUANT
+  // On GB10 (major 12 → else branch) FLASH_ATTN is preferred; since it is the
+  // only registered CUDA backend today, selection is behavior-preserving
+  // (SelectAttentionBackendName walks this list and returns "FLASH_ATTN").
+  std::vector<std::string> get_attn_backend_priority() const override {
+    if (cap_.major == 10) {
+      return {"FLASHINFER", "FLASH_ATTN", "TRITON_ATTN", "FLEX_ATTENTION",
+              "TURBOQUANT"};
+    }
+    return {"FLASH_ATTN", "FLASHINFER", "TRITON_ATTN", "FLEX_ATTENTION",
+            "TURBOQUANT"};
+  }
+
  private:
   DeviceCapability cap_;
 };

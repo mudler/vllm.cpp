@@ -218,6 +218,24 @@ token-exact (27B 235/235 + 35B 315/315, memcheck 0 errors). The deeper
 `qwen3_5.cpp` forward-machinery (DevicePool/matmul/GDN) factoring is a deferred
 follow-up.
 
+**Extensibility — attention-backend registry landed (2026-07-19, CPU-gated).**
+The third and final portability seam is realized: *which* attention backend a
+platform selects is now data, not an inline code edit. Attention backends
+self-register per device (`include/vllm/v1/attention/registry.h`,
+`RegisterAttentionBackend` — the same static-registration idiom as the op /
+platform / model registries), each `Platform` advertises a capability-ordered
+priority list (`get_attn_backend_priority()`, a 1:1 mirror of vLLM
+`cuda.py::_get_backend_priorities` — FLASH_ATTN → FLASHINFER → TRITON → FLEX on
+GB10, FLASHINFER-first on sm_100), and a selector (mirror of
+`get_attn_backend_cls`) returns the first *registered* backend in that order.
+**Net effect: adding a new backend's attention = one self-registering TU + one
+priority slot, with zero edits to the selector, model, or runner.** The concrete
+attention *kernel* remains selected at the device-agnostic vt:: op table, so this
+is a behavior-preserving refactor — the same FlashAttention-2 path is selected on
+both gate models (DGX-confirmed token-exact: 27B 235/235 + 35B 315/315, memcheck
+0 errors). This completes the three-seam extensibility foundation (Platform,
+attention-backend registry, model self-registration).
+
 ### Kernel coverage on the gate path
 
 | Kernel family | CPU | CUDA · GB10 | Status |

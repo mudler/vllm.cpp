@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <vector>
 
 #include "vt/backend.h"
@@ -86,10 +87,15 @@ class Platform {
   // Discrete-vs-unified residency/memory-model policy (folds the PR #4 debt).
   virtual ResidencyPolicy residency_policy() const = 0;
 
-  // STUB — item 4 (attention-backend registry). Mirrors interface.py:362-370
-  // get_attn_backend_cls / platform-driven priority selection. No consumer yet;
-  // returns 0 (no preference) until the registry lands.
-  virtual int get_attn_backend_priority() const { return 0; }
+  // Capability-ordered attention-backend priority: the ordered list of backend
+  // NAMES this platform prefers, highest-priority first. Mirrors
+  // vllm/platforms/cuda.py::_get_backend_priorities (the ordered
+  // AttentionBackendEnum list) and is consumed by
+  // vllm::v1::SelectAttentionBackendName (mirror of get_attn_backend_cls), which
+  // returns the first REGISTERED name. The base default is empty (no preference);
+  // CudaPlatform/CpuPlatform override with the vLLM-mirrored lists. (Item 4 —
+  // attention-backend registry seam; formerly a stub returning 0.)
+  virtual std::vector<std::string> get_attn_backend_priority() const { return {}; }
 };
 
 // Self-registered per DeviceType, copying the RegisterBackend/GetBackend

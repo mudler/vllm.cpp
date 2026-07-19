@@ -2,7 +2,10 @@
 #include "vllm/v1/attention/backends/gdn_attn.h"
 
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
+
+#include "vllm/v1/attention/registry.h"
 
 namespace vllm::v1 {
 
@@ -148,5 +151,24 @@ std::vector<int64_t> GDNAttentionBackend::get_kv_cache_shape(
       "GDN_ATTN is an SSM backend; the mamba-state shape comes from MambaSpec, "
       "not get_kv_cache_shape.");
 }
+
+namespace {
+// GDN_ATTN self-registers for discoverability in the attention-backend registry
+// (mirrors upstream @register_backend(AttentionBackendEnum.GDN_ATTN),
+// registry.py:180). It is an SSM (mamba) backend selected PER LAYER by the model
+// architecture (the linear-attention layers), NOT via the paged-attention
+// priority walk — so it is intentionally absent from the CUDA/CPU
+// get_attn_backend_priority lists. Registration makes it constructible through
+// MakeAttentionBackend(kCUDA/kCPU, "GDN_ATTN") without an inline code edit.
+AttentionBackendFactory MakeGDNAttentionBackend = []() -> std::unique_ptr<AttentionBackend> {
+  return std::make_unique<GDNAttentionBackend>();
+};
+const AttentionBackendRegistrar kGdnAttnCuda{vt::DeviceType::kCUDA,
+                                             GDNAttentionBackend::kName,
+                                             MakeGDNAttentionBackend};
+const AttentionBackendRegistrar kGdnAttnCpu{vt::DeviceType::kCPU,
+                                            GDNAttentionBackend::kName,
+                                            MakeGDNAttentionBackend};
+}  // namespace
 
 }  // namespace vllm::v1

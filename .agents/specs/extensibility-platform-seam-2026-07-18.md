@@ -98,7 +98,7 @@ GDN a/b stride bugfix (5 files) that would land regardless of architecture.
 | **1** | **Extract the Platform seam** — `platforms/interface.h` + `{cuda,cpu}.cpp`, `CurrentPlatform()` self-registered per DeviceType; migrate the 37 `device.type`/`UnifiedMemory()` sites to capability calls | 1 | New GPU touches ONLY its `platforms/<gpu>.cpp` + kernel TUs; zero engine/model edits for memory-model/residency (~40 sites → 1 file) | M | none |
 | 2 | Residency/memory-model as a `Platform::residency_policy()` capability (folds PR #4's host-weight-release + DevicePool caps) | 1 | discrete/unified split = one policy object; new discrete GPU sets a flag, edits no model code | S–M | 1 |
 | 3 | Drop-in kernel ABI: finish `BACKEND-ABI-VT` W0 debts + migrate GEMM families | 3 (ABI leaf) | upstream/ROCm kernels drop in at the raw-pointer boundary | M–L | ABI spine `1141b79` |
-| 4 | Attention-backend registry + platform priority (mirror `platforms/cuda.py:89-160`) | 2 | new attn impl self-registers; selection is data, not a code edit | M | 1 |
+| 4 | Attention-backend registry + platform priority (mirror `platforms/cuda.py:89-160`) — **LANDED 2026-07-19 (`BACKEND-ATTN-REGISTRY`), see the Item 4 section below** | 2 | new attn impl self-registers; selection is data, not a code edit | M | 1 |
 | 5 | Model self-registration (`REGISTER_VLLM_MODEL` static-init) + per-arch TU split of `qwen3_5.cpp` **— LANDED CPU 2026-07-19 (`CLAIM-MODEL-SELFREG-1`); registration + arch-entry-point separation done, deep `qwen3_5.cpp` machinery factoring deferred** | 4 | "add a model = one additive TU + one registration" | M | none |
 | 6 | Metal/MLX bring-up (first non-CUDA PROOF the seams work) | 1+2+3 | the payoff: proves "add a GPU = add files only" | L | 1–4, **needs M4 Mac — defer** |
 
@@ -252,3 +252,75 @@ memory-model/residency branches migrate now; kernel-shape dispatch is left for
 the attention/kernel-registry items — no vLLM-defined behavior is reopened.
 `residency_policy()` is advertisement only (item 2 wires it), so current
 retain-host-weights behavior is unchanged.
+
+## Item 4 — LANDED 2026-07-19 (`CLAIM-ATTN-REGISTRY-1`, `BACKEND-ATTN-REGISTRY`)
+
+The attention-backend registry + Platform-driven priority — the SECOND
+portability seam — is realized. Behavior-preserving: no numeric/kernel/dispatch
+change; the SAME FA2 attention runs.
+
+**Mirror.** `vllm/v1/attention/backends/registry.py` (self-registration via
+`@register_backend(AttentionBackendEnum.X)`) + `vllm/platforms/cuda.py:361-470`
+(`get_valid_backends` / `get_attn_backend_cls`) + `:84-166`
+(`_get_backend_priorities`, non-MLA branch) + `cpu.py:75-87` (CPU_ATTN) @ pin
+`e24d1b24`.
+
+**Mechanism (file:line).**
+- Registry keyed on `(DeviceType, name)`:
+  `include/vllm/v1/attention/registry.h` (`RegisterAttentionBackend`,
+  `HasAttentionBackend`, `MakeAttentionBackend`, `AttentionBackendRegistrar`) +
+  `src/vllm/v1/attention/registry.cpp` (the `std::array<map>` table, copying the
+  vt-op `Table()` / platform `Registry()` static-init idiom).
+- Selector `SelectAttentionBackendName` / `SelectAttentionBackend`
+  (`registry.cpp:60`) — walks the platform's priority list and returns the first
+  REGISTERED name (upstream's min-priority valid backend; "registered" IS the
+  validity check, an unregistered name is skipped exactly as an ImportError-ing
+  backend is). Supports an explicit override arg (upstream `selected_backend` /
+  `VLLM_ATTENTION_BACKEND`).
+- Priority filled (was the item-1 STUB returning int 0):
+  `Platform::get_attn_backend_priority()` now `std::vector<std::string>`
+  (`interface.h:92`); `CudaPlatform` (`cuda.cpp`) returns the capability-ordered
+  non-MLA list — `major==10`: FLASHINFER, FLASH_ATTN, TRITON_ATTN,
+  FLEX_ATTENTION, TURBOQUANT; else (incl. GB10 sm_121 major 12): FLASH_ATTN
+  first. `CpuPlatform` (`cpu.cpp`): CPU_ATTN, FLASH_ATTN.
+- Self-registration: FLASH_ATTN for kCUDA+kCPU in `backend.cpp`; GDN_ATTN for
+  kCUDA+kCPU in `gdn_attn.cpp` (both retained past the linker via the vllm
+  `--whole-archive` INTERFACE option, same as the platform/model registrars).
+
+**Behavior-preserving proof.** On CUDA (every capability we ship on) the walk
+returns "FLASH_ATTN": on GB10 (major 12 → else branch) it is first; on major-10
+FLASHINFER is preferred but UNREGISTERED so the walk falls through to
+FLASH_ATTN. On CPU, CPU_ATTN is unregistered (our CPU paged-attn reuses the
+FlashAttention NHD layout — the recorded `cpu_paged_attn.cpp:6` deviation, not
+upstream's `[N,H,block,head]` CPU_ATTN layout) so the walk returns FLASH_ATTN.
+FLASHINFER/TRITON_ATTN/FLEX_ATTENTION/TURBOQUANT are named for upstream fidelity
+but unimplemented; each becomes auto-selected on the appropriate capability the
+moment its self-registering TU lands — ZERO selector edit. The MLA-branch
+priorities are deferred until an MLA model ports (our gate models are non-MLA).
+
+**Scope discipline.** PURE ENGINE-level SELECTION seam. The concrete attention
+KERNEL stays selected at seam 3 (the vt:: op table, `vt::PagedAttention` →
+`GetOp(kPagedAttention, device.type)`), already device-additive — untouched. No
+model/runner attention code edited; the runtime path is byte-identical, which is
+what the DGX token-exact gate proves.
+
+**Additive-ness (measured).** Adding a new backend's attention BEFORE: edit the
+inline selection + wherever the backend is constructed. AFTER: one
+self-registering TU (`AttentionBackendRegistrar`) + one slot in the owning
+platform's `get_attn_backend_priority()` — ZERO edit to the selector, model, or
+runner. Same "add files only" outcome as the Platform (item 1) and model-registry
+(item 5) seams; the 3-seam extensibility foundation is complete.
+
+**Gate.** CPU: clean `-Werror` build 0 warnings; new
+`tests/vllm/v1/attention/test_attn_backend_registry.cpp` (8 cases / 25
+assertions: self-register, Make/throw, CUDA major-10/else + CPU priority order,
+first-registered walk, explicit override, empty-priority throw) + updated
+`test_platform.cpp` (priority assertion) PASS; full CPU CTest green; tools
+164/164 + scripts 18/18; record/doc-checkpoint checkers green. **DGX
+behavior-preserving model gates PASSED** (`~/work/vllm.cpp-attn-registry` @
+`2c732e7`, production flags CUTLASS sm120a + FA2 sm_121a + Triton AOT verified,
+one flock): clean CUDA `-Werror` build 0 warnings; `test_qwen27_paged_engine`
+**235/235** + `test_qwen36_paged_engine` **315/315** token-exact (same FA2
+sm_121a path — byte-identical tokens prove attention unchanged);
+`compute-sanitizer memcheck` 35B **0 errors / 315**. Evidence
+`dgx:/tmp/attnreg_{cfg,build,gates,detail,memcheck}.log`.

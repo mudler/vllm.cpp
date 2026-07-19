@@ -3,7 +3,10 @@
 #include "vllm/v1/attention/backend.h"
 
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
+
+#include "vllm/v1/attention/registry.h"
 
 namespace vllm::v1 {
 
@@ -76,5 +79,26 @@ std::vector<int64_t> FlashAttentionBackend::get_kv_cache_shape(
   }
   return {num_blocks, 2, block_size, num_kv_heads, head_size};
 }
+
+namespace {
+// FLASH_ATTN self-registers for the device types whose paged-attention KV cache
+// uses its NHD (num_blocks,2,block,H,D) layout: CUDA (the gate) and, per the
+// cpu_paged_attn.cpp deviation, CPU. Mirrors upstream
+// @register_backend(AttentionBackendEnum.FLASH_ATTN) (registry.py) — self-
+// registration keeps the selection DATA-driven (registry + platform priority),
+// so adding a backend never edits the selector. The backend is device-agnostic
+// host metadata (get_kv_cache_shape), so registration lives here, not in a
+// device-gated TU. Retained past the linker via the vllm --whole-archive
+// INTERFACE option (same as the CPU/CUDA platform + model registrars).
+AttentionBackendFactory MakeFlashAttentionBackend = []() -> std::unique_ptr<AttentionBackend> {
+  return std::make_unique<FlashAttentionBackend>();
+};
+const AttentionBackendRegistrar kFlashAttnCuda{vt::DeviceType::kCUDA,
+                                               FlashAttentionBackend::kName,
+                                               MakeFlashAttentionBackend};
+const AttentionBackendRegistrar kFlashAttnCpu{vt::DeviceType::kCPU,
+                                              FlashAttentionBackend::kName,
+                                              MakeFlashAttentionBackend};
+}  // namespace
 
 }  // namespace vllm::v1

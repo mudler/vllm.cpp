@@ -24,6 +24,20 @@ class CpuPlatform final : public Platform {
 
   // Unified host memory: no host-weight release, no device pool.
   ResidencyPolicy residency_policy() const override { return {}; }
+
+  // Attention-backend priority. Upstream cpu.py::get_attn_backend_cls:75-87 @ pin
+  // e24d1b24 pins CPU to a single backend (AttentionBackendEnum.CPU_ATTN). Our
+  // CPU paged-attention kernel does NOT implement CPU_ATTN's [N,H,block,head]
+  // layout; it reuses the FlashAttention NHD layout (num_blocks,2,block,H,D) —
+  // the recorded deviation in src/vt/cpu/cpu_paged_attn.cpp:6. So CPU_ATTN is
+  // listed first for upstream fidelity but is unregistered; the walk falls through
+  // to FLASH_ATTN, the backend our CPU KV layout actually matches. This both
+  // mirrors upstream's CPU preference AND is behavior-preserving (selection
+  // returns "FLASH_ATTN", the layout used today), and demonstrates the
+  // first-registered-in-priority fallthrough that IS the selection mechanism.
+  std::vector<std::string> get_attn_backend_priority() const override {
+    return {"CPU_ATTN", "FLASH_ATTN"};
+  }
 };
 
 struct Registrar {

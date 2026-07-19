@@ -13283,3 +13283,77 @@ Made adding a MODEL architecture ADDITIVE (self-registration) and split the Qwen
 - **CPU gate (dev box, `-DVLLM_CPP_CUDA=OFF`):** clean `-Werror` build 0 warnings; `test_model_registry` 15 cases / 138 assertions + 1 skip PASS (adds `self_registration` case); full CPU CTest — all 125 pass in isolation (5 HTTP/bench/capi tests failed only under `-j nproc` parallel port/resource contention, each PASSES isolated, matching the documented HTTP-flake pattern); tools `unittest discover` 164/164; record + doc-checkpoint checkers green.
 - **DGX CUDA gate: PASSED** (`dgx:~/work/vllm.cpp-model-selfreg` @ `669679a`, production flags `-DVLLM_CPP_CUTLASS_DIR=$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON`; config log confirmed "CUTLASS found … sm120a NVFP4 cutlass GEMM" + "FlashAttention-2 sm_121a prefill/decode: ENABLED" + Triton AOT vendored). Clean CUDA `-Werror` build 0 warnings (the 3 new TUs are host-C++ in the same archive). 27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315** token-exact (byte-identical forward confirmed). `compute-sanitizer --tool memcheck` on the 35B engine test **0 errors / 315 SUCCESS**. Evidence `dgx:/tmp/selfreg_{cfg,build,memcheck}.log`.
 - Records same-change: model-matrix `MODEL-FACTORY-registry` anchors + owner, extensibility spec item-5 STATUS/plan-row, porting-inventory §9 note 8, roadmap ROAD-V1-C1, README extensibility section, docs/BENCHMARKS.md NOT-APPLICABLE disposition, parity-ledger 2026-07-19 row, coordination `CLAIM-MODEL-SELFREG-1`.
+
+## 2026-07-19 — Extensibility item 4 LANDED: attention-backend registry + Platform-driven priority (`CLAIM-ATTN-REGISTRY-1`, `BACKEND-ATTN-REGISTRY`)
+
+Completes the 3-seam extensibility foundation (Platform item 1 + attn-registry
+item 4 + model self-reg item 5). Realizes the SECOND `backends.md` portability
+seam — WHICH `AttentionBackend` is selected becomes DATA (a registered backend +
+a platform priority), not an inline code edit. PURE behavior-preserving
+ENGINE-level SELECTION refactor: no numeric/kernel/dispatch change, the SAME FA2
+attention runs.
+
+- **Registry (`(DeviceType, name)`):** NEW `include/vllm/v1/attention/registry.h`
+  + `src/vllm/v1/attention/registry.cpp` — `RegisterAttentionBackend` /
+  `HasAttentionBackend` / `MakeAttentionBackend` / `AttentionBackendRegistrar`
+  over a `std::array<std::map<string,factory>, kNumDeviceTypes>` function-local
+  static table, copying the proven vt-op `Table()` / platform `Registry()` /
+  `REGISTER_VLLM_MODEL` static-init idiom. Backends self-register per device.
+- **Selector (mirror `get_attn_backend_cls`):** `SelectAttentionBackendName` /
+  `SelectAttentionBackend` (`registry.cpp:60`) walk the platform's
+  capability-ordered priority list and return the FIRST registered name
+  (upstream's min-priority valid backend — "registered for this device" IS the
+  validity check, an unregistered name is skipped exactly as an ImportError-ing
+  backend is in `get_valid_backends`). Supports an explicit override arg
+  (upstream `selected_backend` / `VLLM_ATTENTION_BACKEND`).
+- **Priority filled (was the item-1 STUB):** `Platform::get_attn_backend_priority()`
+  changed from a stub `int` (returned 0) to `std::vector<std::string>`
+  (`interface.h:92`). `CudaPlatform` (`cuda.cpp`) returns the capability-ordered
+  non-MLA list — a faithful port of `cuda.py::_get_backend_priorities:154-166`:
+  `major==10` → FLASHINFER, FLASH_ATTN, TRITON_ATTN, FLEX_ATTENTION, TURBOQUANT;
+  else (incl. GB10 sm_121 == major 12) → FLASH_ATTN first. `CpuPlatform`
+  (`cpu.cpp`) → CPU_ATTN, FLASH_ATTN (mirror `cpu.py:75-87`).
+- **Self-registration:** FLASH_ATTN for kCUDA+kCPU in `backend.cpp`; GDN_ATTN for
+  kCUDA+kCPU in `gdn_attn.cpp` — retained past the linker by the existing vllm
+  `--whole-archive` INTERFACE option (same as the platform/model registrars).
+- **Behavior-preserving proof:** the walk returns "FLASH_ATTN" on CUDA (GB10 →
+  else branch, FLASH_ATTN first; on major-10 the preferred FLASHINFER is
+  unregistered so it falls through) AND on CPU (CPU_ATTN unregistered — our CPU
+  paged-attn reuses the FlashAttention NHD layout, the recorded
+  `cpu_paged_attn.cpp:6` deviation, not upstream's `[N,H,block,head]` CPU_ATTN —
+  so the walk returns FLASH_ATTN). FLASHINFER/TRITON_ATTN/FLEX_ATTENTION/
+  TURBOQUANT are named for upstream fidelity but unimplemented; each auto-selects
+  on the appropriate capability the moment its self-registering TU lands, ZERO
+  selector edit. MLA-branch priorities deferred until an MLA model ports.
+- **Scope discipline:** the concrete attention KERNEL stays selected at seam 3
+  (the vt:: op table, `vt::PagedAttention` → `GetOp(kPagedAttention, device.type)`,
+  already device-additive) — UNTOUCHED. No model/runner attention code edited; the
+  runtime path is byte-identical (what the DGX token-exact gate proves).
+- **Before/after "what does adding a backend's attention touch?":** BEFORE = edit
+  the inline selection + wherever the backend is constructed. AFTER = 1 new
+  self-registering TU (`AttentionBackendRegistrar`) + 1 slot in the owning
+  platform's `get_attn_backend_priority()`. ZERO selector/model/runner edit.
+- **CPU gate (dev box, `-DVLLM_CPP_CUDA=OFF`):** clean `-Werror` build 0 warnings;
+  NEW `tests/vllm/v1/attention/test_attn_backend_registry.cpp` (8 cases / 25
+  assertions: self-register, Make/throw, CUDA major-10/else + CPU priority order,
+  first-registered walk, explicit override, empty-priority throw) + updated
+  `test_platform.cpp` (28 assertions, priority assertion) PASS; full CPU CTest
+  126/126 in isolation (test_openai_conformance was a `-j nproc` HTTP-port flake,
+  passes isolated in 0.25s); tools `unittest discover` 164/164 + scripts 18/18;
+  record + doc-checkpoint checkers green.
+- **DGX CUDA gate: PASSED** (`dgx:~/work/vllm.cpp-attn-registry` @ `2c732e7`,
+  production flags `-DVLLM_CPP_CUTLASS_DIR=…flashinfer/data/cutlass
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON`;
+  config log confirmed "CUTLASS found … sm120a NVFP4 cutlass GEMM" +
+  "FlashAttention-2 sm_121a prefill/decode: ENABLED" + Triton AOT vendored). Clean
+  CUDA `-Werror` build 0 warnings; 27B `test_qwen27_paged_engine` **235/235** + 35B
+  `test_qwen36_paged_engine` **315/315** token-exact (27B run with
+  `VT_FA2_PREFILL=1 VT_FA2_DECODE=1` — the same FA2 sm_121a path; byte-identical
+  tokens prove attention is unchanged, since my change touches NO runtime attention
+  code); `compute-sanitizer memcheck` 35B **0 errors / 315 SUCCESS**. Evidence
+  `dgx:/tmp/attnreg_{cfg,build,gates,detail,memcheck}.log`.
+- Records same-change: backend-matrix `BACKEND-ATTN-REGISTRY` row + Metal/Vulkan/
+  ROCm anchors repointed at the realized seam, extensibility spec item-4 section +
+  plan-row, backends.md seam-2 REALIZED, roadmap ROAD-V1-C1, README extensibility
+  section, docs/BENCHMARKS.md NOT-APPLICABLE disposition, parity-ledger 2026-07-19
+  row, coordination `CLAIM-ATTN-REGISTRY-1`.

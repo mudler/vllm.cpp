@@ -12,7 +12,17 @@ nowhere else:
 2. **Attention/GDN backends** — mirror of `vllm/v1/attention/backends/`
    registry: each platform registers its paged-attention + GDN
    implementations behind the same `AttentionBackend/Impl/MetadataBuilder`
-   contract.
+   contract. **REALIZED (extensibility item 4, `BACKEND-ATTN-REGISTRY`):**
+   backends SELF-REGISTER per `(DeviceType, name)`
+   (`include/vllm/v1/attention/registry.h`, `RegisterAttentionBackend` /
+   `AttentionBackendRegistrar` — the same static-Registrar idiom as the vt op
+   table and the Platform registry); `Platform::get_attn_backend_priority()`
+   advertises a capability-ordered name list (mirror of
+   `cuda.py::_get_backend_priorities`); `SelectAttentionBackendName` (mirror of
+   `get_attn_backend_cls`) returns the first REGISTERED name. Adding a backend's
+   attention = one self-registering TU + one priority slot, ZERO selector/model/
+   runner edit. The concrete attention KERNEL remains selected at seam 3 (the
+   vt:: op table), which is already device-additive.
 3. **vt:: op tables** — our compute layer (deviation §9): per-device kernel
    registration for GEMM/norms/rope/activations/MoE/sampling ops.
 

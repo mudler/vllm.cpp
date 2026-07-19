@@ -5,6 +5,7 @@
 // platform (a CUDA device is not available on the CPU test tier).
 #include <doctest/doctest.h>
 
+#include <string>
 #include <vector>
 
 #include "vllm/platforms/interface.h"
@@ -50,8 +51,12 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   CHECK_FALSE(policy.uses_device_memory_pool);
   CHECK(policy.device_pool_cap_bytes == 0);
 
-  // Attention-backend priority is a stub until the registry lands (item 4).
-  CHECK(cpu.get_attn_backend_priority() == 0);
+  // Attention-backend priority (item 4): CPU mirrors cpu.py's single-backend
+  // preference (CPU_ATTN) then our FLASH_ATTN fallthrough (the layout the CPU
+  // paged-attn kernel actually uses). The registry-driven selection is covered
+  // in test_attn_backend_registry.cpp.
+  const std::vector<std::string> cpu_priority{"CPU_ATTN", "FLASH_ATTN"};
+  CHECK(cpu.get_attn_backend_priority() == cpu_priority);
 }
 
 TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") {

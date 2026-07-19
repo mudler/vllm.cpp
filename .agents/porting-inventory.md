@@ -403,6 +403,30 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
    cosmetic only — resolution picks the first CONFIG-architecture match and is
    order-independent, so no model resolves differently. Adding a model =
    one new TU + one `REGISTER_VLLM_MODEL` line, ZERO edit to a shared array.
+   **The attention-backend registry + Platform-driven priority is now REALIZED
+   (2026-07-19, extensibility item 4, `BACKEND-ATTN-REGISTRY` /
+   `CLAIM-ATTN-REGISTRY-1`) — faithful port, no new deviation.**
+   `include/vllm/v1/attention/registry.{h,cpp}` mirror
+   `vllm/v1/attention/backends/registry.py` (`@register_backend` self-registration)
+   1:1: a `(DeviceType, name)` registry (`RegisterAttentionBackend` /
+   `AttentionBackendRegistrar`) copying the same `RegisterOp`/`RegisterBackend`/
+   `RegisterPlatform`/`REGISTER_VLLM_MODEL` static-init pattern, plus
+   `SelectAttentionBackendName` — a faithful port of `cuda.py:361-470`
+   `get_valid_backends`/`get_attn_backend_cls` (walk the platform's
+   capability-ordered priority, return the first REGISTERED = valid backend). The
+   item-1 `Platform::get_attn_backend_priority()` stub is filled with the exact
+   `cuda.py::_get_backend_priorities:154-166` non-MLA lists (`CudaPlatform`,
+   major-10 vs else) and `cpu.py:75-87` (`CpuPlatform`). FLASH_ATTN/GDN_ATTN
+   self-register. It reuses (does not extend) the pre-existing CPU FA-NHD-layout
+   deviation (§9.1 / `cpu_paged_attn.cpp`): upstream CPU picks CPU_ATTN's
+   `[N,H,block,head]` layout, our CPU paged-attn reuses FlashAttention's NHD
+   layout, so CPU_ATTN is named-but-unregistered and the walk falls through to
+   FLASH_ATTN — behavior-preserving. The concrete attention KERNEL stays selected
+   at the vt:: op table (§9.1), so this is an organizing engine-SELECTION seam
+   over the existing runtime, introducing no new deviation. Adding a backend's
+   attention = one self-registering TU + one priority slot, ZERO selector/model/
+   runner edit. The three `backends.md` portability seams (Platform, attention
+   registry, model self-registration) are now all realized.
 9. **Vendored CUTLASS (sm120a NVFP4 GEMM)**: `src/vt/cuda/cuda_matmul_nvfp4_cutlass.cu`
    is a 1:1 lift of vLLM's `cutlass_scaled_fp4_mm_sm120a`
    (`csrc/libtorch_stable/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu` @

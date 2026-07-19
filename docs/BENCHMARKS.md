@@ -958,6 +958,31 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Attention-backend registry + Platform-driven priority (2026-07-19,
+  extensibility item 4, `BACKEND-ATTN-REGISTRY` / `CLAIM-ATTN-REGISTRY-1`).** A
+  behavior-preserving, engine-level SELECTION refactor: *which* `AttentionBackend`
+  a platform selects becomes data (a registered backend + a capability-ordered
+  platform priority), not an inline code edit. Added
+  `include/vllm/v1/attention/registry.{h,cpp}` (a `(DeviceType, name)` registry +
+  `SelectAttentionBackendName`/`SelectAttentionBackend` selector, mirror of
+  `vllm/v1/attention/backends/registry.py` self-registration +
+  `cuda.py::get_attn_backend_cls`/`_get_backend_priorities`), filled
+  `Platform::get_attn_backend_priority()` (the item-1 stub) with the vLLM-mirrored
+  capability-ordered lists on `CudaPlatform`/`CpuPlatform`, and self-registered
+  FLASH_ATTN + GDN_ATTN. No numeric/kernel/dispatch change — the concrete
+  attention KERNEL stays selected at the device-agnostic vt:: op table
+  (`GetOp(kPagedAttention)`, UNTOUCHED), and the walk resolves to the same
+  FlashAttention-2 path on both gate models — so **NOT APPLICABLE** to the
+  throughput / latency / memory scoreboard. Verified by the new
+  `test_attn_backend_registry` (8 cases / 25 assertions) + updated `test_platform`,
+  clean CPU `-Werror` build, full CPU CTest (126/126 in isolation;
+  test_openai_conformance was a `-j nproc` HTTP-port flake, passes isolated),
+  tools 164/164 + scripts 18/18. Behavior-preserving ⇒ both DGX model gates are
+  unchanged (**DGX-confirmed 2026-07-19 @ `2c732e7`, production flags CUTLASS
+  sm120a + FA2 sm_121a + Triton**: clean CUDA `-Werror`, 27B **235/235** + 35B
+  **315/315** token-exact with FA2 selected, `compute-sanitizer memcheck` 35B **0
+  errors**). MLA-branch priorities are deferred until an MLA model ports.
+
 - **Model self-registration + per-arch entry-point TU split (2026-07-19,
   extensibility item 5, `MODEL-FACTORY-registry` / `CLAIM-MODEL-SELFREG-1`).** A
   behavior-preserving, code-organization-only refactor: the fixed

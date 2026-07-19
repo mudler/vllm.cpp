@@ -207,6 +207,7 @@ add_library(vllm STATIC
   src/vllm/platforms/platform.cpp
   src/vllm/platforms/cpu.cpp
   src/vllm/v1/attention/backend.cpp
+  src/vllm/v1/attention/registry.cpp
   src/vllm/v1/attention/backends/utils.cpp
   src/vllm/v1/attention/backends/gdn_attn.cpp
   src/vllm/v1/structured_output/backend_types.cpp

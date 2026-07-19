@@ -518,7 +518,7 @@ Both arms 18/18 legs, 12/12 binding-eligible; evidence
 sha256 `e7576e09…`. 35B correctness holds (315/315 token-exact throughout). The
 vLLM oracle arm required a disk reclaim (flashinfer sm120 GEMM JIT).
 
-**Disposition: 57/124** (SETTLED at the kernel-lever ceiling; 19→57 over the 35B campaign). WINS: memory 4/4 (beats vLLM), the c8-c32 serving operating point (16/20 each — decode+throughput WINNING, TPOT 1.06-1.15×). Residual c1/c2 ~0.91-0.94 + c4 at the 0.99 edge — NOT kernel-closable per attribution: the multi-stream intra-step kernel overlap (vLLM hides ~3.2ms/step via concurrency vs our serial single-stream decode graph) + portable glue-fusion, both roadmap_v1 engine work. All kernel levers banked (routing/align, host-free, FA2 prefill+decode, GDN conv, load-stream).
+**Disposition: 70/124** (19→70; the MoE shared-expert aux-stream overlap flipped c4 to winning). c4-c32 ALL WIN vLLM (16/20 each, decode+throughput, TPOT 1.05-1.18×); memory 4/4 beats vLLM; only c1/c2 residual (~0.96-0.98, within 2-4%). Next: merged-projection fp8 glue-fusion + remaining aux-stream slices for c1/c2.
 
 | Concurrency | Axes | Total tok/s ours / vLLM (ratio) | Mean TTFT (v/o) | Mean TPOT (v/o) |
 |---:|---:|---:|---:|---:|

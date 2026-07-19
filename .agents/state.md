@@ -13481,3 +13481,8 @@ engine-matrix `ENG-MOE-SHARED-AUX`, README + docs/BENCHMARKS, parity-ledger
 2026-07-19 row, coordination `CLAIM-MOE-SHARED-AUX-1`, roadmap ROAD-V1 engine-lever
 note. Remaining overlap slices (routed/attention/prefill multi-stream) + the
 portable glue-fusion track stay the roadmap_v1 35B priority.
+
+## 2026-07-19 — 35B 57→70/124: MoE shared-expert aux-stream overlap (ENG-MOE-SHARED-AUX 5a679d6)
+Re-grid `5a679d6`, evidence `dgx:~/work/vllm.cpp-online-gate/evidence/5a679d65d35cb436aa4c31a4263406d33738d824/summary-35` (ratios.json sha256 `3a52980d…`); 12/12 eligible, **70/124 (+13)**. Per-conc: c1 2/20 (tput 0.978/tpot 0.983), c2 0/20 (0.965/0.969), **c4 16/20 (1.019/1.051 — FLIPPED to WIN)**, c8 16/20 (1.061/1.128), c16 16/20 (1.068/1.152), c32 16/20 (1.090/1.176), mem 4/4. The aux-stream overlap wins every concurrency in-situ (c1 -5.6% → c32 -1.5%) → c4 flipped, c8-c32 gained, c1/c2 close.
+- **35B now: c4-c32 ALL WIN vLLM (decode+throughput), memory beats vLLM, only c1/c2 residual (~0.96-0.98, within 2-4%).** Campaign 19→70.
+- Next 35B engine lever (glue-fusion track): extend the merged-QKV / merged-gate_up projection fusion to the 35B FP8 path (MergedQkvEligible is fp4-only, qwen3_5.cpp:1720; G1 GDN qkv/z/b/a 30 layers + F1 full-attn qkv 10 layers un-merged only because the merge is quant-arch-gated) — collapses the un-merged projection fans into single kernels (fewer launches + better SM fill at M=1), targeting the c1/c2 low-batch launch overhead. Portable ([[fusion-must-be-portable-reuse-patterns]]). Plus remaining aux-stream slices (routed/attention/prefill).

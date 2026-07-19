@@ -13357,3 +13357,9 @@ attention runs.
   plan-row, backends.md seam-2 REALIZED, roadmap ROAD-V1-C1, README extensibility
   section, docs/BENCHMARKS.md NOT-APPLICABLE disposition, parity-ledger 2026-07-19
   row, coordination `CLAIM-ATTN-REGISTRY-1`.
+
+## 2026-07-19 — USER PRIORITY (roadmap_v1 ordering): after extensibility, prioritize the 35B ENGINE LEVERS
+Sequence: (1) finish the extensibility seams (item 2 residency-consumption in flight a524c302; small follow-ups: item-4 KV-shape-through-selector wiring, the deferred qwen3_5.cpp deep forward-machinery split). (2) **THEN prioritize the roadmap_v1 items that improve 35B — the ENGINE LEVERS** (the c1/c2 residual closers the c1-c4 attribution named as NOT kernel-closable, i.e. genuinely engine work):
+- **Multi-stream intra-step kernel OVERLAP:** vLLM hides ~3.2 ms/step by overlapping decode (and prefill) kernels on multiple streams inside its graph; OURS is a serial single-stream decode graph (sum-of-durations ≈ device coverage). Redesign the decode/prefill graph to overlap independent kernels on multiple CUDA streams. This is THE largest remaining 35B c1/c2 lever (and helps 27B's residual + prefill TTFT). Attribution evidence: `dgx:~/work/vllm.cpp-35b-c1-attr/` (ours coverage≈sum 16.29/16.32; vLLM sum 15.7 > coverage 12.5 = ~1.26× overlap).
+- **Portable glue / EVT-epilogue FUSION:** the known 27B ~20% prefill-fusion pattern (Inductor whole-graph fusion vLLM does, we don't), diluted for 35B by MoE — the [[fusion-must-be-portable-reuse-patterns]] track (portable C++/vt:: fusion, cutlass EVT OK; NOT Triton/CuTe AOT lock-in).
+These two engine levers close the 35B low-concurrency residual and are the roadmap_v1 35B-improvement priority AFTER the extensibility seams. Then the broader portfolio.

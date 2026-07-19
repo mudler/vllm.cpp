@@ -29,7 +29,7 @@ A **22.920 GiB** steady CPU weight mirror remains (deeper streaming fix, for 35B
 
 | Area | Rows | `ANCHOR-BACKFILL` | `PARTIAL` | `SPIKE` | `READY` | `ACTIVE` | `GATING` | `DONE` | `INVENTORIED` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Engine and scheduling | 14 | 3 | 3 | 0 | 0 | 0 | 2 | 1 | 5 |
+| Engine and scheduling | 15 | 3 | 3 | 0 | 0 | 1 | 2 | 1 | 5 |
 | KV cache and memory | 20 | 2 | 2 | 0 | 2 | 2 | 2 | 0 | 10 |
 | Parallelism | 6 | 0 | 0 | 0 | 1 | 0 | 0 | 0 | 5 |
 | Sampling and generation | 13 | 0 | 4 | 0 | 0 | 0 | 0 | 0 | 9 |
@@ -39,7 +39,7 @@ A **22.920 GiB** steady CPU weight mirror remains (deeper streaming fix, for 35B
 | LoRA and adapters | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 2 |
 | Long context and attention | 10 | 0 | 0 | 0 | 1 | 0 | 6 | 0 | 3 |
 | Loading, tokenizer, config | 7 | 1 | 3 | 0 | 0 | 0 | 0 | 1 | 2 |
-| **Total** | **107** | **9** | **17** | **0** | **7** | **3** | **13** | **3** | **55** |
+| **Total** | **108** | **9** | **17** | **0** | **7** | **4** | **13** | **3** | **55** |
 
 ## Engine core and scheduling
 
@@ -59,6 +59,7 @@ A **22.920 GiB** steady CPU weight mirror remains (deeper streaming fix, for 35B
 | `ENG-SCHED-KNOBS` | Reserve-full-ISL, scheduler class seam, stream interval | T1 | `vllm/config/scheduler.py:26,127,140,163` | `include/vllm/config/scheduler.h:71,95`; `src/vllm/config/scheduler.cpp:43,52`; `src/vllm/v1/core/sched/scheduler.cpp:237`; `src/vllm/v1/engine/output_processor.cpp:68` | `tests/vllm/test_scheduler_config.cpp:10,20`; `tests/vllm/v1/test_kv_cache_manager.cpp:425` | `planned: specs/scheduler-knobs.md` | `PARTIAL` | - |
 | `ENG-CASCADE-ATTN` | Cascade attention for shared prefixes | T2 | `vllm/config/model.py:238` | - | - | `planned: specs/cascade-attention.md` | `INVENTORIED` | - |
 | `ENG-DBO-UBATCH` | DBO and ubatch overlap | T2 | `vllm/config/parallel.py:208,524` | - | - | `planned: specs/dbo-ubatch.md` | `INVENTORIED` | - |
+| `ENG-MOE-SHARED-AUX` | MoE shared-expert MLP on an aux CUDA stream concurrent with the routed-expert router/align/grouped-GEMMs (mirror vLLM's decode overlap; the largest remaining 35B c1/c2 engine lever). Fork the shared MLP onto a 2nd persistent per-device stream, join before the combine → byte-identical to serial (independent shared/routed paths both complete before combine; overlap changes WHEN not WHAT). Gated `T <= threshold` decode + CUDA. The aux stream draws scratch from a SEPARATE `AuxPool` so the concurrent main-stream routed allocations never share a live block with it (the `DevicePool` reuse invariant is single-stream ordering; vLLM sidesteps this with its stream-aware caching allocator's `record_stream`). `VT_MOE_SHARED_AUX_STREAM` **DEFAULT ON** (`=0` rollback); `VT_MOE_SHARED_AUX_THRESHOLD` (default 128; GB10 48-SM calibration). Captured in the decode CUDA-graph via the fork/join event edges (`ThreadLocal` capture, no abort). Only the committed Marlin MoE decode path; wmma fallback/CPU/GGUF and 27B dense unaffected | T1 | `vllm/model_executor/layers/fused_moe/runner/shared_experts.py:99-104,125-142`; `vllm/utils/multi_stream_utils.py:20-58` (`maybe_execute_in_parallel`, TRT-LLM port); `vllm/utils/torch_utils.py:736-756` (`aux_stream`); `vllm/envs.py:260` (threshold 256) | fork/join `src/vllm/model_executor/models/qwen3_5.cpp:3999,4114` (`MoeBlockFusedMarlinCuda`); aux stream+events `src/vllm/model_executor/models/qwen3_5.cpp:3575,3581` (`MoeAuxStream`/`MoeAuxStreamFor`); predicates `:3553,3560`; aux-pool isolation `:496,3538` (`AuxPool`/`ActivePool`/`ActivePoolScope`) + `DBuf pool_` routing `:645` | **DGX (prod flags, one flock):** overlap ON==OFF BYTE-IDENTICAL — `tests/parity/test_qwen36_paged_engine.cpp` 35B **315/315** + `tests/parity/test_qwen27_paged_engine.cpp` 27B **235/235** under `VT_MOE_SHARED_AUX_STREAM`∈{0,1}; captured-vs-eager (`VLLM_CPP_CUDAGRAPH=0`, ON) 315/315; shipping default (no env) 315/315+235/235, rollback `=0` 315/315+235/235; `compute-sanitizer memcheck` (default ON, captured) 0 errors; in-situ interleaved TPOT A/B (drop cold rep1) c1 −5.6% / c2 −2.7% / c4 −3.7% / c8 −3.4% / c16 −1.6% / c32 −1.5% (WINS every conc, zero regression); ledger [parity-ledger.md](parity-ledger.md) 2026-07-19 row | [moe-shared-aux-stream.md](specs/moe-shared-aux-stream.md) | `ACTIVE` | `CLAIM-MOE-SHARED-AUX-1` |
 
 ## KV cache and memory
 

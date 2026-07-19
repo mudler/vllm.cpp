@@ -492,6 +492,46 @@ DevicePool& Pool() {
   return p;
 }
 
+// --- Aux-stream scratch pool (ENG-MOE-SHARED-AUX) ----------------------------
+// The MoE shared-expert overlap (MoeBlockFusedMarlinCuda) issues the shared MLP
+// on a SECOND CUDA stream concurrent with the routed experts on the main stream.
+// The main `Pool()` above is only reuse-safe under SINGLE-stream ordering: a
+// block returned to the free list is handed back out on the same stream, so CUDA
+// stream ordering guarantees the block's last op has completed before any reuse.
+// Two streams sharing one pool BREAKS that invariant — a scratch block the aux
+// stream freed (e.g. the shared gate/up transient) could be handed to a routed
+// GEMM on the main stream and written WHILE the aux kernel still reads it (a
+// cross-stream RAW/WAR race compute-sanitizer flags). vLLM sidesteps this with
+// its STREAM-AWARE caching allocator (record_stream); we keep the simple pool and
+// instead give the aux stream its OWN pool. Each pool then only ever serves ONE
+// stream, so single-stream ordering holds within it and the two streams never
+// share a live block. Blocks are handed back to the pool they came from (DBuf
+// stores its owning pool), so a buffer allocated in the aux region and destroyed
+// after the join still returns to the aux pool.
+#ifdef VT_MARLIN_NVFP4  // only the Marlin MoE overlap path draws from AuxPool
+DevicePool& AuxPool() {
+  static DevicePool p;
+  return p;
+}
+#endif
+
+// Thread-local "active" scratch pool a DBuf constructs from. Defaults to the main
+// Pool(); the aux-stream overlap region swaps it to AuxPool() for the duration of
+// the shared-expert issue via ActivePoolScope. Single host thread drives the
+// forward, and the aux ops are issued in one contiguous block, so the swap is a
+// simple RAII stack.
+DevicePool*& ActivePool() {
+  thread_local DevicePool* p = &Pool();
+  return p;
+}
+struct ActivePoolScope {
+  DevicePool* prev;
+  explicit ActivePoolScope(DevicePool* p) : prev(ActivePool()) { ActivePool() = p; }
+  ~ActivePoolScope() { ActivePool() = prev; }
+  ActivePoolScope(const ActivePoolScope&) = delete;
+  ActivePoolScope& operator=(const ActivePoolScope&) = delete;
+};
+
 // The device-scratch residency policy (BACKEND-PLATFORM item 2), resolved from
 // the running device's platform (per-object: keyed on the DBuf's own
 // device.type, NOT the process-global CurrentPlatform). The DevicePool soft cap
@@ -642,24 +682,30 @@ class DBuf {
     // (BACKEND-PLATFORM item 2), not an inline constant. 0 == uncapped (GB10
     // today) ⇒ pool behavior is byte-for-byte unchanged.
     cap_ = ResolveDevicePoolPolicy(d).cap_bytes;
-    p_ = Pool().Get(*b_, alloc_bytes_);
+    // Draw from the thread-local active pool (main Pool() by default, AuxPool()
+    // inside the shared-expert overlap region), and REMEMBER it so the block
+    // returns to the same pool even when this DBuf outlives the ActivePoolScope
+    // (the aux region returns sd/gl, destroyed after the join). See AuxPool().
+    pool_ = ActivePool();
+    p_ = pool_->Get(*b_, alloc_bytes_);
     t_ = MakeTensor(p_, dt, d.q.device, shape);
     if (host != nullptr) b_->Copy(d.q, p_, host, bytes_);
   }
-  ~DBuf() { if (p_ != nullptr) Pool().Put(*b_, alloc_bytes_, p_, cap_); }
+  ~DBuf() { if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_); }
   DBuf(const DBuf&) = delete;
   DBuf& operator=(const DBuf&) = delete;
   // Movable so device-resident block helpers can RETURN a DBuf (the buffer
   // ownership transfers; the moved-from buffer is not returned to the pool).
   DBuf(DBuf&& o) noexcept
-      : b_(o.b_), p_(o.p_), bytes_(o.bytes_), alloc_bytes_(o.alloc_bytes_),
-        cap_(o.cap_), t_(o.t_) {
+      : b_(o.b_), pool_(o.pool_), p_(o.p_), bytes_(o.bytes_),
+        alloc_bytes_(o.alloc_bytes_), cap_(o.cap_), t_(o.t_) {
     o.p_ = nullptr;
   }
   DBuf& operator=(DBuf&& o) noexcept {
     if (this != &o) {
-      if (p_ != nullptr) Pool().Put(*b_, alloc_bytes_, p_, cap_);
+      if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_);
       b_ = o.b_;
+      pool_ = o.pool_;
       p_ = o.p_;
       bytes_ = o.bytes_;
       alloc_bytes_ = o.alloc_bytes_;
@@ -692,6 +738,7 @@ class DBuf {
 
  private:
   Backend* b_;
+  DevicePool* pool_ = &Pool();  // owning scratch pool (main Pool() or AuxPool())
   void* p_ = nullptr;
   size_t bytes_ = 0;
   size_t alloc_bytes_ = 0;
@@ -3485,6 +3532,73 @@ bool MoeGlueFuseEnabled() {
   return on;
 }
 
+// --- MoE shared-expert aux-stream overlap (ENG-MOE-SHARED-AUX) ----------------
+// Mirror of vLLM's decode overlap: run the shared-expert MLP on a SECOND CUDA
+// stream concurrent with the routed-expert router/align/grouped-GEMMs on the main
+// stream, then join before the combine so the output is BYTE-IDENTICAL to serial
+// (overlap changes WHEN the independent shared path runs, never WHAT it computes).
+// vLLM `fused_moe/runner/shared_experts.py:99-104,129-142` gates the aux stream on
+// `hidden_states.shape[0] <= VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD` (default
+// 256) AND cuda; the fork/join primitive is `maybe_execute_in_parallel`
+// (`utils/multi_stream_utils.py:20-58`, a TRT-LLM port): event0.record() on main,
+// aux waits event0, aux runs fn1 + records event1, main waits event1.
+//
+// VT_MOE_SHARED_AUX_STREAM gates the whole feature. DEFAULT ON, flipped per the
+// parity-enablers-ship-as-defaults policy after the in-situ 35B A/B: token-exact
+// (overlap ON == OFF byte-identical, 315/315) AND faster at EVERY tested decode
+// point with zero regression — same-binary interleaved TPOT (drop cold rep1)
+// c1 −5.6% / c2 −2.7% / c4 −3.7% / c8 −3.4% / c16 −1.6% / c32 −1.8% (GB10's 48 SMs
+// leave spare occupancy for the shared MLP to overlap the routed GEMMs across the
+// whole low-concurrency band). `VT_MOE_SHARED_AUX_STREAM=0` is the same-binary
+// rollback. VT_MOE_SHARED_AUX_THRESHOLD caps the token gate — vLLM's 256 is for
+// large-SM GPUs; 128 is the GB10 calibration: it covers every measured decode
+// point (T=C<=32 all win) while keeping large prefill/mixed steps (T>128, where
+// the routed GEMMs already saturate the GPU) on the serial path. 0 disables the
+// gate entirely (never overlap).
+#ifdef VT_MARLIN_NVFP4  // overlap is only wired into the Marlin MoE decode path
+bool MoeSharedAuxStreamEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_SHARED_AUX_STREAM");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 rolls back
+  }();
+  return on;
+}
+int MoeSharedAuxThreshold() {
+  static const int t = [] {
+    const char* e = std::getenv("VT_MOE_SHARED_AUX_THRESHOLD");
+    return (e != nullptr) ? std::atoi(e) : 128;  // GB10 48-SM calibration
+  }();
+  return t;
+}
+
+// Persistent per-device aux stream + two reusable cross-stream events for the
+// overlap fork/join. Created lazily on first use (during the eager pre-warm decode
+// step, so the queue/events exist BEFORE any CUDA-graph capture) and leaked at
+// process exit like the resident weights / cublasLt workspace. ONE global aux
+// stream per device mirrors vLLM's single `aux_stream()`
+// (utils/torch_utils.py:736-756) — not one per layer — to avoid a stream
+// explosion and keep profiling legible.
+struct MoeAuxStream {
+  Queue q;
+  vt::Event fork;  // recorded on main; aux waits it (shared input dh is ready)
+  vt::Event done;  // recorded on aux after the shared MLP; main waits it (join)
+  bool ready = false;
+};
+MoeAuxStream& MoeAuxStreamFor(Dev d) {
+  static std::mutex mu;
+  static std::unordered_map<int, MoeAuxStream> cache;  // key: device index
+  std::lock_guard<std::mutex> lk(mu);
+  MoeAuxStream& a = cache[d.q.device.index];
+  if (!a.ready) {
+    a.q = d.b.CreateQueue();
+    a.fork = d.b.CreateEvent();
+    a.done = d.b.CreateEvent();
+    a.ready = true;
+  }
+  return a;
+}
+#endif  // VT_MARLIN_NVFP4
+
 // Shared-expert pre-gate parts: sd [T,H] f32 (down projection) and gl [T,1] f32
 // (gate logit), before the sigmoid gate + bf16 round. The unfused SharedExpert
 // applies SharedExpertGate to these; the fused MoeBlock passes them straight to
@@ -3887,6 +4001,34 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
   MoeMarlinResident& mr = MoeMarlinResidentFor(&w);
   if (!mr.ready) BuildMoeMarlinResident(d, w, cfg, mr);
 
+  // --- Shared-expert overlap FORK (ENG-MOE-SHARED-AUX) -----------------------
+  // When gated ON (VT_MOE_SHARED_AUX_STREAM, T <= threshold), issue the shared-
+  // expert MLP on the aux stream NOW so it runs concurrently with the routed
+  // router/align/grouped-GEMMs issued on the main stream below. dh (the block
+  // input) is already resident on the main stream from the preceding norm, so the
+  // aux stream only needs to wait the main stream's fork point before reading it.
+  // The shared path and the routed path are INDEPENDENT (they read the same dh,
+  // write disjoint buffers) and both complete before the combine at the bottom,
+  // so the output is byte-identical to the serial order. Mirrors
+  // maybe_execute_in_parallel (multi_stream_utils.py:47-54): event0.record() on
+  // main, aux waits event0, aux runs fn1, aux records event1.
+  const bool aux_overlap = MoeSharedAuxStreamEnabled() &&
+                           d.q.device.type == vt::DeviceType::kCUDA &&
+                           T <= static_cast<int64_t>(MoeSharedAuxThreshold());
+  std::optional<SharedExpertParts> sp_aux;
+  MoeAuxStream* ax = nullptr;
+  if (aux_overlap) {
+    ax = &MoeAuxStreamFor(d);
+    d.b.RecordEvent(ax->fork, d.q);       // event0.record() on the main stream
+    d.b.QueueWaitEvent(ax->q, ax->fork);  // aux stream waits event0 (dh ready)
+    Dev auxd{d.b, ax->q};
+    // Draw the shared path's scratch from AuxPool so the concurrent main-stream
+    // routed allocations never share a live block with it (see AuxPool()).
+    ActivePoolScope guard(&AuxPool());
+    sp_aux.emplace(SharedExpertUngated(auxd, w, cfg, dh, T, true));
+    d.b.RecordEvent(ax->done, ax->q);     // event1.record() on the aux stream
+  }
+
   // Router (identical to MoeBlockFusedCuda).
   Tensor drg = ResidentWeight(d, w.router_gate);  // [H,E] bf16
   DBuf dlog(d, DType::kBF16, {T, E});
@@ -3972,11 +4114,26 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
                                 vt::MoeMarlinArgs{bi, 1, Pi, Hi, Ii, false});
   Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
 
+  // --- Shared-expert overlap JOIN (ENG-MOE-SHARED-AUX) -----------------------
+  // Make the main stream wait for the aux shared MLP (event1.wait) so the combine
+  // below reads a fully-computed sp.sd/sp.gl. Both the routed path (main) and the
+  // shared path (aux) are now complete → the combine result is byte-identical to
+  // the serial order. When overlap is OFF, the shared expert is computed inline on
+  // the main stream exactly as before (no fork/join, no aux pool).
+  if (aux_overlap) d.b.QueueWaitEvent(d.q, ax->done);  // event1.wait() on main
+
   DBuf dout(d, DType::kBF16, {T, H});
   if (MoeGlueFuseEnabled()) {
     // Fuse shared-expert gate into the combine (one launch, no shared round-trip).
-    SharedExpertParts sp = SharedExpertUngated(d, w, cfg, dh, T, true);
+    SharedExpertParts sp =
+        aux_overlap ? std::move(*sp_aux) : SharedExpertUngated(d, w, cfg, dh, T, true);
     vt::MoeCombineGate(d.q, dout.t(), expert_out, dtw.t(), sp.sd.t(), sp.gl.t());
+  } else if (aux_overlap) {
+    // Unfused A/B path with overlap: the aux stream produced the ungated parts;
+    // apply the sigmoid gate on the main stream (post-join) then combine.
+    DBuf shared(d, DType::kBF16, {T, H});
+    vt::SharedExpertGate(d.q, shared.t(), sp_aux->sd.t(), sp_aux->gl.t());
+    vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), &shared.t());
   } else {
     DBuf shared = SharedExpert(d, w, cfg, dh, T, true);
     vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), &shared.t());

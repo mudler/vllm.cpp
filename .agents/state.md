@@ -13424,3 +13424,60 @@ memory-behavior change on GB10; the SAME host-free + load-stream runs and the 35
   item-2 LANDED section, backends.md seam-1 residency-consumed, roadmap
   ROAD-V1-C1, README extensibility section, docs/BENCHMARKS.md disposition,
   parity-ledger 2026-07-19 row, coordination `CLAIM-BACKEND-PLATFORM-2`.
+
+## 2026-07-19 — 35B ENGINE LEVER LANDED: MoE shared-expert aux-stream decode overlap, default-ON (`CLAIM-MOE-SHARED-AUX-1`, `ENG-MOE-SHARED-AUX`)
+
+Realizes the FIRST slice of the multi-stream intra-step kernel OVERLAP named the
+largest remaining 35B c1/c2 lever in the USER PRIORITY entry above (vLLM's ~1.26×
+decode overlap). Runs the MoE **shared-expert MLP** (`SharedExpertUngated`) on a
+2nd persistent CUDA stream concurrent with the **routed-expert**
+router/align/grouped-Marlin-GEMMs on the main stream inside
+`MoeBlockFusedMarlinCuda`, joined before the combine — a 1:1 mirror of vLLM's
+`fused_moe/runner/shared_experts.py:99-104,125-142` overlap + the
+`maybe_execute_in_parallel` fork/join primitive (`multi_stream_utils.py:20-58`,
+TRT-LLM port). Fork: `RecordEvent(fork,main)` → aux `QueueWaitEvent(fork)` →
+aux issues the shared MLP → `RecordEvent(done,aux)`. Join: main
+`QueueWaitEvent(done)` before `MoeCombineGate`/`MoeCombine`.
+
+**Byte-identical by construction** — the shared and routed paths are independent
+(same `dh` in, disjoint buffers out) and both complete before the combine; overlap
+changes WHEN not WHAT. **The real hazard fixed:** the process-wide scratch
+`DevicePool` is only reuse-safe under SINGLE-stream ordering; two streams sharing
+it would race a freed-then-reused block. vLLM sidesteps this with its stream-aware
+caching allocator (`record_stream`); we keep the simple pool and give the aux
+stream its OWN `AuxPool` (thread-local `ActivePool()` set by `ActivePoolScope`
+during the aux issue; `DBuf` remembers its owning pool so a buffer allocated in the
+aux region and freed after the join returns to the right pool) — each pool serves
+one stream, so single-stream ordering holds and the streams never share a live
+block. ONE persistent per-device aux stream + two reusable events
+(`MoeAuxStreamFor`, mirror of vLLM's single `aux_stream()`), lazily created during
+the eager pre-warm decode step so they exist before any CUDA-graph capture; the
+fork/join joins the same `cudaStreamBeginCapture(ThreadLocal)` region via the event
+edges (no capture abort — ThreadLocal accepted; Relaxed fallback unused). Gated
+`T <= threshold` decode + CUDA. `VT_MOE_SHARED_AUX_STREAM` DEFAULT ON (`=0`
+rollback), `VT_MOE_SHARED_AUX_THRESHOLD` default 128 (GB10 48-SM calibration).
+Only the committed Marlin MoE decode path; wmma/CPU/GGUF + 27B dense untouched.
+
+Anchors: fork/join `src/vllm/model_executor/models/qwen3_5.cpp` `MoeBlockFusedMarlinCuda`
+(~3999 fork, ~4114 join); `MoeAuxStream`/`MoeAuxStreamFor` (~3575);
+`MoeSharedAuxStreamEnabled`/`MoeSharedAuxThreshold` (~3553); `AuxPool`/`ActivePool`/
+`ActivePoolScope` (~496) + `DBuf pool_` (~645); spec `moe-shared-aux-stream.md`.
+
+**Gates (DGX, production flags CUTLASS sm120a + Marlin + FA2 sm_121a + Triton AOT,
+one flock):** CPU clean `-Werror` build 0 warn (the aux helpers are
+`#ifdef VT_MARLIN_NVFP4`; the pool routing compiles unconditionally). overlap
+**ON == OFF BYTE-IDENTICAL** — `VT_MOE_SHARED_AUX_STREAM`∈{0,1} both 35B 315/315 +
+27B 235/235; captured-vs-eager (`VLLM_CPP_CUDAGRAPH=0`, ON) 315/315; shipping
+default (no env, overlap ON) 315/315 + 235/235, rollback `=0` 315/315 + 235/235;
+`compute-sanitizer memcheck` (default ON, captured graph) 0 errors. **In-situ
+same-binary interleaved TPOT A/B** (35B, input-1024/output-128, greedy, 3 reps/arm,
+cold rep1 dropped): c1 13.60 vs 14.40 ms **−5.6%**, c2 17.45/17.94 −2.7%, c4
+21.04/21.84 −3.7%, c8 30.47/31.55 −3.4%, c16 47.36/48.11 −1.6%, c32 72.30/73.43
+−1.5% — WINS at EVERY concurrency, zero regression. Token-exact + faster c1-c4 +
+non-regressing c8+ ⇒ **default flipped ON**. `benchmark_binding=false`; orchestrator
+re-grids 35B c1/c2/c4 TPOT. Evidence `dgx:~/work/vllm.cpp-moe-shared-aux`
+(`/tmp/moeaux_{correct,ab,gate,mc_full}.log`). Records same change: spec,
+engine-matrix `ENG-MOE-SHARED-AUX`, README + docs/BENCHMARKS, parity-ledger
+2026-07-19 row, coordination `CLAIM-MOE-SHARED-AUX-1`, roadmap ROAD-V1 engine-lever
+note. Remaining overlap slices (routed/attention/prefill multi-stream) + the
+portable glue-fusion track stay the roadmap_v1 35B priority.

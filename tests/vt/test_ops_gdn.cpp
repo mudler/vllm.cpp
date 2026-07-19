@@ -1625,29 +1625,31 @@ void RunRmsNormGatedCudaCase(int64_t t, int64_t d, bool sigmoid_gate, const Comb
 // values ("1" fast / "0" rollback; the launcher reads getenv per call) so the
 // comparison is default-independent. Covers the contiguous rank-2 gate (gate_group=1)
 // AND the padded rank-3 [T,Hv,Dv] strided gate (gate_group=Hv). Skips w/o CUDA.
-void RunRmsNormGatedFastContiguous(int64_t rows, bool sigmoid_gate, uint32_t seed) {
+void RunRmsNormGatedFastContiguous(int64_t rows, bool sigmoid_gate, uint32_t seed,
+                                   DType in_dt = DType::kBF16, DType out_dt = DType::kBF16) {
   constexpr int64_t d = 128;  // Dv, the only production gated-norm shape
   // Adversarial: wide x/z ranges exercise variance magnitude and silu/sigmoid
-  // saturation; w spans [-1,1] like the real norm weight.
+  // saturation; w spans [-1,1] like the real norm weight. in_dt=bf16 is the 27B
+  // dense core/z/weight; in_dt=f32 is the 35B MoE core/z/weight (GdnOutDType f32).
   const auto xf = RandomF32(static_cast<size_t>(rows * d), seed, -6.0f, 6.0f);
   const auto zf = RandomF32(static_cast<size_t>(rows * d), seed + 1, -6.0f, 6.0f);
   const auto wf = RandomF32(static_cast<size_t>(d), seed + 2, -1.0f, 1.0f);
-  const auto xb = Pack(xf, DType::kBF16);
-  const auto zb = Pack(zf, DType::kBF16);
-  const auto wb = Pack(wf, DType::kBF16);
+  const auto xb = Pack(xf, in_dt);
+  const auto zb = Pack(zf, in_dt);
+  const auto wb = Pack(wf, in_dt);
   const RmsNormGatedArgs args{1e-6f, sigmoid_gate};
 
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard gq(gpu);
-  DeviceTensor dx(gpu, gq.q, DType::kBF16, {rows, d}, xb.data());
-  DeviceTensor dz(gpu, gq.q, DType::kBF16, {rows, d}, zb.data());
-  DeviceTensor dw(gpu, gq.q, DType::kBF16, {d}, wb.data());
+  DeviceTensor dx(gpu, gq.q, in_dt, {rows, d}, xb.data());
+  DeviceTensor dz(gpu, gq.q, in_dt, {rows, d}, zb.data());
+  DeviceTensor dw(gpu, gq.q, in_dt, {d}, wb.data());
 
   auto run = [&](bool fast, std::vector<uint8_t>& out_bytes) {
     ::setenv("VT_RMSNORM_GATED_FAST", fast ? "1" : "0", 1);
-    DeviceTensor dout(gpu, gq.q, DType::kBF16, {rows, d});
+    DeviceTensor dout(gpu, gq.q, out_dt, {rows, d});
     vt::RmsNormGated(gq.q, dout.tensor(), dx.tensor(), dz.tensor(), dw.tensor(), args);
-    out_bytes.resize(static_cast<size_t>(rows * d) * vt::SizeOf(DType::kBF16));
+    out_bytes.resize(static_cast<size_t>(rows * d) * vt::SizeOf(out_dt));
     dout.Download(gq.q, out_bytes.data());
   };
   std::vector<uint8_t> out_ref, out_fast;
@@ -1655,7 +1657,7 @@ void RunRmsNormGatedFastContiguous(int64_t rows, bool sigmoid_gate, uint32_t see
   run(/*fast=*/true, out_fast);
   ::unsetenv("VT_RMSNORM_GATED_FAST");
   // BIT-EXACT (0-ulp): fast==shipped by construction.
-  CheckClose(Unpack(out_fast, DType::kBF16), Unpack(out_ref, DType::kBF16), 0.0f, 0.0f);
+  CheckClose(Unpack(out_fast, out_dt), Unpack(out_ref, out_dt), 0.0f, 0.0f);
 }
 
 // Gdn prefill/decode CPU-vs-CUDA. qsl empty => decode (batch single-token
@@ -1792,41 +1794,42 @@ Tensor Rank3RowView(void* data, DType dtype, Device device, int64_t t, int64_t h
 // padded-row view of the merged [T, qkvz_width] projection, gate_group=Hv). Proves
 // the VT_RMSNORM_GATED_FAST fast kernel's gate addressing is bit-identical to shipped
 // under a non-unit gate_group / padded gate_outer. fast==shipped 0-ulp.
-void RunRmsNormGatedFastPaddedRank3(int64_t t, int64_t hv, bool sigmoid_gate, uint32_t seed) {
+void RunRmsNormGatedFastPaddedRank3(int64_t t, int64_t hv, bool sigmoid_gate, uint32_t seed,
+                                    DType in_dt = DType::kBF16, DType out_dt = DType::kBF16) {
   constexpr int64_t d = 128;  // Dv
   const int64_t rows = t * hv, gate_cols = hv * d, stride = gate_cols + 11;  // pad canary tail
   const auto xf = RandomF32(static_cast<size_t>(rows * d), seed, -6.0f, 6.0f);
   const auto zf = RandomF32(static_cast<size_t>(t * gate_cols), seed + 1, -6.0f, 6.0f);
   const auto wf = RandomF32(static_cast<size_t>(d), seed + 2, -1.0f, 1.0f);
-  const auto xb = Pack(xf, DType::kBF16);
-  const auto wb = Pack(wf, DType::kBF16);
+  const auto xb = Pack(xf, in_dt);
+  const auto wb = Pack(wf, in_dt);
   // Padded z: each token's Hv*Dv gate lands in the first gate_cols of a wider row.
   std::vector<float> z_pad(static_cast<size_t>(t) * stride, -3.5f);
   for (int64_t tok = 0; tok < t; ++tok)
     for (int64_t j = 0; j < gate_cols; ++j)
       z_pad[tok * stride + j] = zf[static_cast<size_t>(tok * gate_cols + j)];
-  const auto zpb = Pack(z_pad, DType::kBF16);
+  const auto zpb = Pack(z_pad, in_dt);
   const RmsNormGatedArgs args{1e-6f, sigmoid_gate};
 
   Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
   QueueGuard gq(gpu);
-  DeviceTensor dx(gpu, gq.q, DType::kBF16, {t, hv, d}, xb.data());
-  DeviceTensor dz(gpu, gq.q, DType::kBF16, {t, stride}, zpb.data());
-  DeviceTensor dw(gpu, gq.q, DType::kBF16, {d}, wb.data());
-  Tensor tz3 = Rank3RowView(dz.tensor().data, DType::kBF16, Gpu(), t, hv, d, stride);
+  DeviceTensor dx(gpu, gq.q, in_dt, {t, hv, d}, xb.data());
+  DeviceTensor dz(gpu, gq.q, in_dt, {t, stride}, zpb.data());
+  DeviceTensor dw(gpu, gq.q, in_dt, {d}, wb.data());
+  Tensor tz3 = Rank3RowView(dz.tensor().data, in_dt, Gpu(), t, hv, d, stride);
 
   auto run = [&](bool fast, std::vector<uint8_t>& out_bytes) {
     ::setenv("VT_RMSNORM_GATED_FAST", fast ? "1" : "0", 1);
-    DeviceTensor dout(gpu, gq.q, DType::kBF16, {t, hv, d});
+    DeviceTensor dout(gpu, gq.q, out_dt, {t, hv, d});
     vt::RmsNormGated(gq.q, dout.tensor(), dx.tensor(), tz3, dw.tensor(), args);
-    out_bytes.resize(static_cast<size_t>(rows * d) * vt::SizeOf(DType::kBF16));
+    out_bytes.resize(static_cast<size_t>(rows * d) * vt::SizeOf(out_dt));
     dout.Download(gq.q, out_bytes.data());
   };
   std::vector<uint8_t> out_ref, out_fast;
   run(/*fast=*/false, out_ref);
   run(/*fast=*/true, out_fast);
   ::unsetenv("VT_RMSNORM_GATED_FAST");
-  CheckClose(Unpack(out_fast, DType::kBF16), Unpack(out_ref, DType::kBF16), 0.0f, 0.0f);
+  CheckClose(Unpack(out_fast, out_dt), Unpack(out_ref, out_dt), 0.0f, 0.0f);
 }
 
 TEST_CASE("causal_conv1d_fwd: padded-row strided x matches contiguous") {
@@ -2982,23 +2985,37 @@ TEST_CASE("CUDA rmsnorm_gated decode-fast (VT_RMSNORM_GATED_FAST) matches rollba
   }
   // Real GDN decode shapes: [T*Hv, Dv=128] (27B Hv=48, 35B Hv=32) at c1-c16, both
   // silu (sigmoid_gate=false, the production gate) and sigmoid. fast==shipped 0-ulp.
+  // dtype combos: bf16->bf16 (27B dense core/z), f32->bf16 (35B MoE core/z under
+  // GlueFuse — GdnOutDType f32, gated-norm stores bf16), f32->f32 (35B GlueFuse off).
+  struct DtCombo {
+    DType in, out;
+  };
+  const DtCombo combos[] = {{DType::kBF16, DType::kBF16},
+                            {DType::kF32, DType::kBF16},
+                            {DType::kF32, DType::kF32}};
   uint32_t seed = 7100;
-  for (bool sigmoid : {false, true}) {
-    // Contiguous rank-2 gate (gate_group=1): sweep the token count via rows=T*Hv.
-    for (int64_t rows : {48, 96, 512, 768}) {  // 27B c1/c2, 35B c16, 27B c16
-      CAPTURE(sigmoid);
-      CAPTURE(rows);
-      RunRmsNormGatedFastContiguous(rows, sigmoid, seed);
-      seed += 10;
-    }
-    // Padded rank-3 [T,Hv,Dv] strided gate (gate_group=Hv): the real z-slice geometry.
-    for (int64_t t : {1, 2, 16}) {
-      for (int64_t hv : {48, 32}) {  // 27B, 35B
+  for (const DtCombo& c : combos) {
+    for (bool sigmoid : {false, true}) {
+      // Contiguous rank-2 gate (gate_group=1): sweep the token count via rows=T*Hv.
+      for (int64_t rows : {48, 96, 512, 768}) {  // 27B c1/c2, 35B c16, 27B c16
+        CAPTURE(static_cast<int>(c.in));
+        CAPTURE(static_cast<int>(c.out));
         CAPTURE(sigmoid);
-        CAPTURE(t);
-        CAPTURE(hv);
-        RunRmsNormGatedFastPaddedRank3(t, hv, sigmoid, seed);
+        CAPTURE(rows);
+        RunRmsNormGatedFastContiguous(rows, sigmoid, seed, c.in, c.out);
         seed += 10;
+      }
+      // Padded rank-3 [T,Hv,Dv] strided gate (gate_group=Hv): the real z-slice geometry.
+      for (int64_t t : {1, 2, 16}) {
+        for (int64_t hv : {48, 32}) {  // 27B, 35B
+          CAPTURE(static_cast<int>(c.in));
+          CAPTURE(static_cast<int>(c.out));
+          CAPTURE(sigmoid);
+          CAPTURE(t);
+          CAPTURE(hv);
+          RunRmsNormGatedFastPaddedRank3(t, hv, sigmoid, seed, c.in, c.out);
+          seed += 10;
+        }
       }
     }
   }

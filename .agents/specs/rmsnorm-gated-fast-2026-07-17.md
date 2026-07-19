@@ -172,6 +172,64 @@ next `SERVE-GATE-ONLINE` binding grid. Does not touch any other claim's files.
   fewer threads would require a strided per-thread accumulation that changes the
   f32 sum order (not bit-identical), so 128 is the natural bit-identical choice.
 
+## Addendum 2026-07-19 (`CLAIM-EW-NORM-GATED-2`): extend the fast path to the 35B f32 gated norm
+
+**Why 35B took the SLOW path.** `GdnOutDType(dense_model)` (`qwen3_5.cpp:2608`)
+returns bf16 only for the DENSE 27B (`num_experts==0`); for the MoE 35B
+(`num_experts=256`) it returns **f32**. So the 35B's GDN recurrence output `dcore`,
+z-gate `z`, and gated-norm weight `dnw` are all **f32**, and `RmsNormGated` is called
+with f32 core/gate/weight (out bf16 under GlueFuse, else f32). The original
+`TryLaunchRmsNormGatedFast` guard required **bf16** in/out/gate/weight, so it returned
+false for the 35B and fell to the slow shipped `RmsNormGatedRowKernel<float,bf16>` — the
+same 256-thread-for-128-element + reload-x waste, profiled at **77.6 ms / 3.3% of 35B
+prefill** (task #57/#58). The 35B's Dv=128 (verified from config: `linear_value_head_dim=128`,
+`linear_num_value_heads=32`, `num_experts=256`), so only the dtype guard — not the shape —
+excluded it.
+
+**Fix.** `RmsNormGatedRowFastKernel` is now templated `<Tin,Tout>` using the SAME
+`Load`/`Store` helpers as the shipped `RmsNormGatedRowKernel<Tin,Tout>`. For every
+dispatched `(Tin,Tout)` the float op sequence is byte-for-byte identical to shipped
+(`Load(float)` is the identity read; `Load(bf16)` is the same `__bfloat162float`; `Store`
+the same rounding) — the bit-identity argument (variance order, `1.0f/sqrtf`, multiply
+order, act, gate addressing) holds unchanged. `TryLaunchRmsNormGatedFast` now dispatches
+the 4 combos: bf16→bf16 (27B), **f32→bf16 (35B GlueFuse-on)**, **f32→f32 (35B
+GlueFuse-off)**, bf16→f32. Guard: `d==128`, core/gate/weight one shared dtype in
+{f32,bf16} (the caller `VT_CHECK`s the equality), out in {f32,bf16}. Covers **prefill AND
+decode** (the 35B gated norm is f32 in both). Default already ON — no flag change; the
+35B simply now takes the fast path it was silently excluded from.
+
+**Gates (DGX, clean -Werror build 0 warnings, CUTLASS+FA2 hard-verified, one flock;
+evidence `dgx:~/work/vllm.cpp-gated-f32`):**
+- Build: clean `-Werror` CUDA build, 0 warnings.
+- Bit-exact: `test_ops_gdn` gated 0-ulp `fast==shipped` now **260/260** (adds f32→bf16 and
+  f32→f32 combos to the bf16→bf16 sweep, contiguous rank-2 + padded rank-3, silu/sigmoid,
+  c1–c16); full `test_ops_gdn` 53/53 (3201/3201).
+- Memcheck: `compute-sanitizer memcheck` **0 errors** on the gated kernel across all
+  combos/shapes.
+- Token-exact: **35B `test_qwen36_paged_engine` 315/315** fast-ON (now on the fast path) +
+  **315/315** `VT_RMSNORM_GATED_FAST=0` rollback; **27B 235/235** fast-ON + **235/235**
+  rollback (unchanged bits — regression check).
+
+**Isolated (nsys pure-kernel, in-situ 35B prefill `--input-len 1024 --output-len 1 -c1`,
+`--cuda-graph-trace=node`, 30 GDN layers/step):** the 35B now dispatches
+`RmsNormGatedRowFastKernel<float,__nv_bfloat16>` at **168.7 µs/call avg** (med 166.7,
+total 5.06 ms) vs the former slow `RmsNormGatedRowKernel<float,__nv_bfloat16>` **261.8
+µs/call** (med 254.8, total 7.86 ms) = **1.55× avg / 1.53× median**, saving **2.79 ms of
+GPU time per 1024-tok prefill**. ≥1.3× bar met.
+
+**In-situ TTFT A/B (interleaved ON/OFF, 3 reps/arm, `--input-len 1024 --output-len 1`):**
+35B c1 median **593.6 ON vs 621.9 OFF (−4.6%)** (2/3 reps ON-faster), c2 median 748.0 vs
+744.2 (+0.5%, within the ~±25 ms 35B TTFT noise); 27B (regression check — same kernel,
+bits unchanged) c1 **428.9 vs 439.3 (−2.4%, 3/3)**, c2 **792.5 vs 821.2 (−3.5%, 3/3)** —
+the pre-existing 27B gated-fast win, so no regression from the templating. The 35B in-situ
+signal is TTFT-noise-limited (the ~2.8 ms kernel saving is a small fraction of a ~600 ms
+prefill), the isolated 1.55× is the clean number.
+
+**Flip:** default stays **ON** (bit-identical ⇒ token-safe + strictly less GPU work; the
+flag `VT_RMSNORM_GATED_FAST` is unchanged — the 35B simply now takes the fast path it was
+guarded out of). No separate speed credit; the binding grid re-measures the production
+default.
+
 ## Decision
 
 Gates 1–4 PASS AND isolated ≥1.3× at every decode shape (c16 2.04×). Per the

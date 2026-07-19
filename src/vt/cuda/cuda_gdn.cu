@@ -1339,10 +1339,12 @@ __global__ void RmsNormGatedRowKernel(Tout* out, const Tin* x, const Tin* gate, 
 }
 
 // ---------------------------------------------------------------------------
-// Decode-fast gated-RMSNorm variant (VT_RMSNORM_GATED_FAST). BIT-IDENTICAL (0-ulp)
-// to the shipped RmsNormGatedRowKernel above for the bf16 gated-norm decode path
-// (d==128), mirroring the RMSNorm decode-fast bit-safety technique (cuda_ops.cu
-// RmsNormRowFastKernel, 348d12d).
+// Fast gated-RMSNorm variant (VT_RMSNORM_GATED_FAST). BIT-IDENTICAL (0-ulp) to the
+// shipped RmsNormGatedRowKernel above for the d==128 gated-norm path — covering BOTH
+// the 27B dense bf16 core/z/weight AND the 35B MoE f32 core/z/weight (GdnOutDType is
+// f32 for the MoE), mirroring the RMSNorm decode-fast bit-safety technique (cuda_ops.cu
+// RmsNormRowFastKernel, 348d12d). Templated over (Tin,Tout) via the shared Load/Store
+// helpers so a single kernel is bit-exact for every dispatched dtype pair.
 //
 // WHY BIT-IDENTICAL (not <=1-ulp): the gated norm feeds the SAME 27B forward as the
 // fast plain-RMSNorm + GDN decode cubin, all converging on the greedy RAZOR near-tie
@@ -1377,26 +1379,36 @@ __global__ void RmsNormGatedRowKernel(Tout* out, const Tin* x, const Tin* gate, 
 // Only the launch geometry (128 vs 256 threads) and the single register-cached x load
 // differ; the arithmetic is identical.
 //
-// Scope: bf16 in/out/gate/weight, d==128 (the only production gated-norm shape). Other
-// dtype/shape keep RmsNormGatedRowKernel.
+// Scope: d==128 (both gate models' Dv), core/gate/weight one shared dtype in {f32,bf16},
+// out in {f32,bf16}. Templated over (Tin,Tout) so ONE bit-identical kernel covers BOTH
+// the 27B dense bf16 core/z/weight path AND the 35B MoE f32 core/z/weight path:
+// GdnOutDType returns bf16 for the dense 27B but f32 for the MoE 35B, so the 35B's
+// gated-norm inputs are f32 and the former bf16-only guard sent it to the slow shipped
+// kernel. The kernel below uses the SAME Load/Store helpers as the shipped
+// RmsNormGatedRowKernel<Tin,Tout>, so for EVERY (Tin,Tout) the float op sequence is
+// byte-for-byte identical to shipped (Load(float) is the identity; Load(bf16) is the
+// same __bfloat162float; Store the same rounding) — the bit-identity argument above
+// holds unchanged. Only launch geometry (128 vs 256 threads) and the single
+// register-cached x load differ. Other dtype/shape keep RmsNormGatedRowKernel.
 constexpr int kGatedFastBlock = 128;   // one thread per Dv element (Dv==128)
 
-__global__ void RmsNormGatedRowFastKernel(__nv_bfloat16* __restrict__ out,
-                                          const __nv_bfloat16* __restrict__ x,
-                                          const __nv_bfloat16* __restrict__ gate,
-                                          const __nv_bfloat16* __restrict__ w, int64_t gate_group,
-                                          int64_t gate_outer, float eps, bool sigmoid_gate) {
+template <typename Tin, typename Tout>
+__global__ void RmsNormGatedRowFastKernel(Tout* __restrict__ out, const Tin* __restrict__ x,
+                                          const Tin* __restrict__ gate, const Tin* __restrict__ w,
+                                          int64_t gate_group, int64_t gate_outer, float eps,
+                                          bool sigmoid_gate) {
   constexpr int d = kGatedFastBlock;  // 128
   const int tid = static_cast<int>(threadIdx.x);
   const int64_t row = blockIdx.x;
-  const __nv_bfloat16* xrow = x + row * d;
-  const __nv_bfloat16* zrow = gate + (row / gate_group) * gate_outer + (row % gate_group) * d;
-  __nv_bfloat16* orow = out + row * d;
+  const Tin* xrow = x + row * d;
+  const Tin* zrow = gate + (row / gate_group) * gate_outer + (row % gate_group) * d;
+  Tout* orow = out + row * d;
 
   __shared__ float partial[kGatedFastBlock];
-  // Load x ONCE, cache in a register (shipped reloads it in the normalize pass).
-  const float xf = __bfloat162float(xrow[tid]);
-  partial[tid] = xf * xf;  // f32(bf16 x)^2 == shipped's per-element variance term
+  // Load x ONCE, cache in a register (shipped reloads it in the normalize pass); the
+  // cached value is the SAME Load(xrow,tid) shipped squares and later re-reads.
+  const float xf = Load(xrow, tid);  // f32 identity / f32(bf16 x) == shipped's term base
+  partial[tid] = xf * xf;            // per-element variance term == shipped's
   __syncthreads();
   // shared-memory binary tree from s=64 — reproduces shipped's kBlock=256 tree for
   // d==128 (its s=128 step only adds the provably-zero partials[128..255]).
@@ -1405,29 +1417,52 @@ __global__ void RmsNormGatedRowFastKernel(__nv_bfloat16* __restrict__ out,
     __syncthreads();
   }
   const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(d) + eps);  // NOT rsqrtf
-  const float z = __bfloat162float(zrow[tid]);
-  const float act = sigmoid_gate ? 1.0f / (1.0f + expf(-z)) : z / (1.0f + expf(-z));  // Silu
-  const float wf = __bfloat162float(w[tid]);
-  orow[tid] = __float2bfloat16(xf * inv * wf * act);  // ((x*inv)*w)*act, shipped order
+  const float z = Load(zrow, tid);
+  const float act = sigmoid_gate ? 1.0f / (1.0f + expf(-z)) : Silu(z);  // shipped act
+  const float wf = Load(w, tid);
+  Store(orow, tid, xf * inv * wf * act);  // ((x*inv)*w)*act, shipped multiply order
 }
 
-// Runtime predicate + launch for the gated decode-fast path. Returns true iff it ran.
-// Guard: bf16 in/out/gate/weight and d==128 (the GDN Dv used by both gate models);
-// out-of-scope shapes keep RmsNormGatedRowKernel. The launch uses kGatedFastBlock
-// (=128) threads and reproduces shipped's reduction ORDER, so the output is
-// bit-identical.
+template <typename Tin, typename Tout>
+inline void LaunchGatedFast(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& gate,
+                            const Tensor& w, const RmsNormGatedArgs& args, int64_t gate_group,
+                            int64_t gate_outer, unsigned grid) {
+  RmsNormGatedRowFastKernel<Tin, Tout><<<grid, kGatedFastBlock, 0, s>>>(
+      out.Ptr<Tout>(), x.Ptr<Tin>(), gate.Ptr<Tin>(), w.Ptr<Tin>(), gate_group, gate_outer,
+      args.eps, args.sigmoid_gate);
+}
+
+// Runtime predicate + launch for the gated fast path. Returns true iff it ran.
+// Guard: d==128 (the GDN Dv used by both gate models); core/gate/weight share one dtype
+// (the caller VT_CHECKs gate.dtype==x.dtype==w.dtype) in {f32,bf16}; out in {f32,bf16}.
+// This covers the 27B (bf16 core/z, bf16 out) AND the 35B (f32 core/z; bf16 out under
+// GlueFuse, else f32 out). Out-of-scope shapes keep RmsNormGatedRowKernel. The launch
+// uses kGatedFastBlock (=128) threads and reproduces shipped's reduction ORDER, so the
+// output is bit-identical for every dispatched (Tin,Tout).
 inline bool TryLaunchRmsNormGatedFast(cudaStream_t s, Tensor& out, const Tensor& x,
                                       const Tensor& gate, const Tensor& w,
                                       const RmsNormGatedArgs& args, int64_t d, int64_t gate_group,
                                       int64_t gate_outer, unsigned grid) {
   if (!RmsNormGatedFastFlagIsOn(std::getenv("VT_RMSNORM_GATED_FAST"))) return false;
   if (d != kGatedFastBlock) return false;
-  if (out.dtype != DType::kBF16 || x.dtype != DType::kBF16 || gate.dtype != DType::kBF16 ||
-      w.dtype != DType::kBF16)
-    return false;
-  RmsNormGatedRowFastKernel<<<grid, kGatedFastBlock, 0, s>>>(
-      out.Ptr<__nv_bfloat16>(), x.Ptr<__nv_bfloat16>(), gate.Ptr<__nv_bfloat16>(),
-      w.Ptr<__nv_bfloat16>(), gate_group, gate_outer, args.eps, args.sigmoid_gate);
+  const bool in_f32 = x.dtype == DType::kF32;
+  const bool in_bf16 = x.dtype == DType::kBF16;
+  if (!in_f32 && !in_bf16) return false;
+  if (gate.dtype != x.dtype || w.dtype != x.dtype) return false;
+  if (out.dtype != DType::kF32 && out.dtype != DType::kBF16) return false;
+  const bool out_f32 = out.dtype == DType::kF32;
+  if (in_f32) {
+    if (out_f32)
+      LaunchGatedFast<float, float>(s, out, x, gate, w, args, gate_group, gate_outer, grid);
+    else
+      LaunchGatedFast<float, __nv_bfloat16>(s, out, x, gate, w, args, gate_group, gate_outer, grid);
+  } else {
+    if (out_f32)
+      LaunchGatedFast<__nv_bfloat16, float>(s, out, x, gate, w, args, gate_group, gate_outer, grid);
+    else
+      LaunchGatedFast<__nv_bfloat16, __nv_bfloat16>(s, out, x, gate, w, args, gate_group,
+                                                    gate_outer, grid);
+  }
   return true;
 }
 

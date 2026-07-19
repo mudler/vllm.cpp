@@ -45,7 +45,10 @@ shipped reference's exact float-op order (so the fast set yields identical logit
 and can never cross the 27B tok6 razor near-tie) while vectorizing memory access.
 `RmsNormRowFastKernel` (2.41× isolated, `348d12d`) closed the c2 lanes entirely
 (3→20); `RmsNormGatedRowFastKernel` (2.04× at c16, `9ecd9d0`) closed the uniform
-c16 floor (6→19). This CONFIRMS the measured attribution: the uniform decode
+c16 floor (6→19); it was templated `<Tin,Tout>` (2026-07-19) so the 35B MoE **f32**
+gated norm — previously excluded to the slow shipped kernel (77.6 ms / 3.3% of 35B
+prefill) — now also takes the bit-identical fast path (1.55× isolated, token-exact 315/315).
+This CONFIRMS the measured attribution: the uniform decode
 deficit was the norm/quant/act kernel glue, and vectorizing it bit-identically
 closed it. Correctness holds — the full default set is 27B 235/235 + 35B 315/315.
 

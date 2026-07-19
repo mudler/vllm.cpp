@@ -13655,3 +13655,63 @@ ranking): the 35B slow gated-RMSNorm scalar variant (77.6 ms/3.3%; route to a
 bit-identical fast path like the 27B bf16 `RmsNormGatedRowFastKernel`), and the
 `VT_GDN_IN_BF16` conv-traffic sibling. The GDN chunk-COMPUTE front itself is closed
 (AOT parity); further portable vt::tile work on it only helps the non-Triton fallback.
+
+---
+
+## 2026-07-19 — GDN-glue prefill front: 35B f32 gated-RMSNorm routed to the bit-identical fast path (`CLAIM-EW-NORM-GATED-2`)
+
+Continuation of the GDN-glue prefill front (one bit-exact kernel at a time,
+after `GdnPostConvFastKernel` d4363fe). Ranked next target: the 35B's SLOW
+scalar-f32 gated-RMSNorm (task #57/#58 profile: 77.6 ms / 3.3% of 35B prefill),
+while the 27B already had the fast bf16 `RmsNormGatedRowFastKernel`.
+
+**WHY the 35B took the slow path (root cause).** `GdnOutDType(dense_model)`
+(`qwen3_5.cpp:2608`) returns bf16 ONLY for the dense 27B (`num_experts==0`) and
+**f32** for the MoE 35B (`num_experts=256`). So the 35B's GDN recurrence output
+`dcore`, z-gate `z`, and gated-norm weight `dnw` are all **f32**; the original
+`TryLaunchRmsNormGatedFast` guard required **bf16** in/out/gate/weight, returned
+false, and fell the 35B to the slow `RmsNormGatedRowKernel<float,bf16>` (256
+threads for a 128-element row, x reloaded). NOT a shape problem — the 35B's Dv is
+128 (verified `linear_value_head_dim=128`, `linear_num_value_heads=32`), only the
+dtype guard excluded it.
+
+**FIX (bit-identical by construction).** `RmsNormGatedRowFastKernel` is now
+templated `<Tin,Tout>` using the SAME `Load`/`Store` helpers as the shipped
+`RmsNormGatedRowKernel<Tin,Tout>` — so for EVERY dispatched `(Tin,Tout)` the float
+op sequence is byte-for-byte identical to shipped (`Load(float)` is the identity
+read, `Load(bf16)` the same `__bfloat162float`, `Store` the same rounding); the
+bit-identity argument (variance order, `1.0f/sqrtf`, `((x*inv)*w)*act` order, act,
+gate addressing) holds unchanged. `TryLaunchRmsNormGatedFast` dispatches the 4
+combos — bf16→bf16 (27B), **f32→bf16 (35B GlueFuse-on)**, **f32→f32 (35B
+GlueFuse-off)**, bf16→f32 — under `d==128` + core/gate/weight one shared dtype in
+{f32,bf16} + out in {f32,bf16}. Covers prefill AND decode. **No flag change** —
+`VT_RMSNORM_GATED_FAST` is still default ON; the 35B simply now takes the fast
+path it was guarded out of.
+
+**GATES ALL GREEN (dgx `~/work/vllm.cpp-gated-f32`, clean CUDA `-Werror` 0
+warnings, one flock).** Bit-exact `test_ops_gdn` gated 0-ulp `fast==shipped`
+**260/260** (now sweeps bf16→bf16, f32→bf16, f32→f32; contiguous rank-2 + padded
+rank-3 strided gate, silu/sigmoid, c1–c16); full `test_ops_gdn` 53/53
+(3201/3201). `compute-sanitizer memcheck` **0 errors** on the gated kernel all
+combos. Token-exact **35B `test_qwen36_paged_engine` 315/315** fast-ON (now on the
+fast path) + **315/315** `VT_RMSNORM_GATED_FAST=0`; **27B 235/235** + **235/235**
+(bits unchanged — regression check).
+
+**PERF.** Isolated nsys (35B prefill input-1024/output-1/c1, `--cuda-graph-trace=node`,
+30 GDN layers): fast `RmsNormGatedRowFastKernel<float,bf16>` **168.7 µs/call avg**
+(med 166.7, tot 5.06 ms) vs slow `RmsNormGatedRowKernel<float,bf16>` **261.8
+µs/call** (med 254.8, tot 7.86 ms) = **1.55× avg / 1.53× median**, saving **2.79
+ms GPU/1024-tok prefill** (≥1.3× bar met). In-situ TTFT A/B (interleaved 3
+reps/arm, input-1024/output-1): 35B c1 median 593.6 vs 621.9 (**−4.6%**, 2/3), c2
+748.0 vs 744.2 (+0.5%, within the ~±25 ms 35B TTFT noise — the ~2.8 ms saving is a
+small fraction of a ~600 ms prefill, so the isolated 1.55× is the clean number);
+27B (regression check, same kernel/bits) c1 428.9 vs 439.3 (**−2.4%**, 3/3), c2
+792.5 vs 821.2 (**−3.5%**, 3/3). Byte-identical + isolated 1.55× ⇒ DEFAULT stays
+ON (flag unchanged) per the parity-enabler policy.
+
+Tree `dgx:~/work/vllm.cpp-gated-f32`; branch `worktree-agent-a6637db943a96bfb8`
+(NOT pushed — SHA reported for review/fast-forward). **Next GDN-glue candidates**
+(from the ranking): the `VT_GDN_IN_BF16` conv-traffic sibling for the 35B (its
+fp8-cutlass in_proj branch keeps f32 conv/post-conv, unlike the 27B bf16 path),
+and any remaining non-AOT GDN prefill kernel above the megablock post-conv now
+that both post-conv (d4363fe) and gated-norm (this change) are fast on both models.

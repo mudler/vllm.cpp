@@ -25,7 +25,9 @@ OpenAI-compatible server.
 > reference's exact float-op order (so the fast set yields identical logits and
 > can never cross the 27B tok6 razor near-tie) while vectorizing memory access:
 > `RmsNormRowFastKernel` (2.41×, `348d12d`, closed c2 entirely), `RmsNormGatedRowFastKernel`
-> (2.04× at c16, `9ecd9d0`, closed the c16 floor), `CausalConv1dUpdateFastKernel`
+> (2.04× at c16, `9ecd9d0`, closed the c16 floor; templated `<Tin,Tout>` 2026-07-19 so the
+> 35B MoE **f32** gated norm also takes it — 1.55× isolated, was silently on the slow
+> kernel), `CausalConv1dUpdateFastKernel`
 > (1.92×, `f0fb727`), plus the flipped FP4-quant/SiLU fast kernels — all default
 > ON with `=0` rollback, on the async (`a0013a2`) + vendored GDN cubin (`a321d7c`)
 > defaults. Memory PASSES (windowed-load `cb2d310`, ours peak PSS 24.88 GB vs vLLM

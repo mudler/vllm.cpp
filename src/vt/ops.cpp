@@ -284,6 +284,47 @@ void SiluAndMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale,
       q, out_packed, out_scale, gate_up, input_global_scale_inv, scale_layout);
 }
 
+void SigmoidGateFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale,
+                         const Tensor& attn, const Tensor& gate,
+                         float input_global_scale_inv, Fp4ScaleLayout scale_layout) {
+  VT_CHECK(attn.rank == 2 && gate.rank == 2 && out_packed.rank == 2 && out_scale.rank == 2,
+           "sigmoid_gate_fp4_quant: attn/gate/out_packed/out_scale must be rank-2");
+  const int64_t m = attn.shape[0], i = attn.shape[1];
+  VT_CHECK(gate.shape[0] == m && gate.shape[1] == i,
+           "sigmoid_gate_fp4_quant: attn/gate shape mismatch");
+  VT_CHECK(i % 16 == 0, "sigmoid_gate_fp4_quant: K (inner dim) must be a multiple of 16");
+  VT_CHECK(out_packed.shape[0] == m && out_packed.shape[1] == i / 2,
+           "sigmoid_gate_fp4_quant: out_packed must be [M, K/2]");
+  const auto round_up = [](int64_t value, int64_t multiple) {
+    return (value + multiple - 1) / multiple * multiple;
+  };
+  if (scale_layout == Fp4ScaleLayout::kLinear) {
+    VT_CHECK(out_scale.shape[0] == m && out_scale.shape[1] == i / 16,
+             "sigmoid_gate_fp4_quant: linear out_scale must be [M, K/16]");
+  } else {
+    VT_CHECK(scale_layout == Fp4ScaleLayout::kCutlassSwizzled,
+             "sigmoid_gate_fp4_quant: invalid scale layout");
+    VT_CHECK(out_scale.shape[0] == round_up(m, 128) &&
+                 out_scale.shape[1] == round_up(i / 16, 4),
+             "sigmoid_gate_fp4_quant: swizzled out_scale must be "
+             "[round_up(M,128), round_up(K/16,4)]");
+  }
+  VT_CHECK(attn.dtype == DType::kF32 || attn.dtype == DType::kBF16,
+           "sigmoid_gate_fp4_quant: attn must be f32 or bf16");
+  VT_CHECK(gate.dtype == DType::kF32,
+           "sigmoid_gate_fp4_quant: gate must be f32 (sigmoid input unrounded)");
+  VT_CHECK(out_packed.dtype == DType::kI8 && out_scale.dtype == DType::kI8,
+           "sigmoid_gate_fp4_quant: out_packed/out_scale must be i8 (raw fp4/fp8 bytes)");
+  VT_CHECK(attn.IsContiguous() && gate.IsContiguous() && out_packed.IsContiguous() &&
+               out_scale.IsContiguous(),
+           "sigmoid_gate_fp4_quant: contiguous tensors required");
+  VT_CHECK(attn.device == q.device && gate.device == q.device &&
+               out_packed.device == q.device && out_scale.device == q.device,
+           "sigmoid_gate_fp4_quant: device mismatch");
+  reinterpret_cast<SigmoidGateFp4QuantFn>(GetOp(OpId::kSigmoidGateFp4Quant, q.device.type))(
+      q, out_packed, out_scale, attn, gate, input_global_scale_inv, scale_layout);
+}
+
 void MatmulNvfp4Fp4(Queue& q, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
                     const Tensor& b_packed, const Tensor& b_scale, float alpha) {
   VT_CHECK(out.rank == 2 && a_packed.rank == 2 && a_scale.rank == 2 && b_packed.rank == 2 &&

@@ -13566,3 +13566,38 @@ Memcheck (35B ON, full compute-sanitizer path): **0 errors**.
 c1/c2 axis breakdown (70/124 grid 5a679d6): DECODE nearly closed — c1 TPOT/ITL 0.983/0.987, c2 0.969/0.997 (aux-stream overlap did it; the fp8 merged-QKV launch-fusion measured NEUTRAL → launch overhead is NOT the c1/c2 bottleneck). The residual is PREFILL/TTFT: c1 mean/median/p90/p99 ttft 0.94/0.93/0.96/0.96; c2 0.91/0.94/0.91/0.89. So c1/c2 throughput/E2EL (0.965-0.978) is dragged by TTFT, not decode.
 - **The c1/c2 closer is the PORTABLE GLUE / EVT-EPILOGUE FUSION** (the whole-graph Inductor-fusion pattern vLLM does at prefill that we don't) — also the STANDING 27B prefill "next front" ([[prefill-gpu-bound-vt-tile-playbook]] "next front = glue/EVT-epilogue fusion"; [[fusion-must-be-portable-reuse-patterns]]). It helps BOTH models' prefill. Prefill multi-stream overlap does NOT apply (at 1024 tokens the GEMMs saturate → the aux-stream mechanism is decode-≤128-only).
 - 35B state: 70/124, c4-c32 ALL win vLLM (16/20 each) + memory 4/4; c1/c2 within 2-4% (decode near-floor, TTFT residual). The glue-fusion is the deep roadmap-v1 engine lever for the remaining c1/c2 (35B) + the 27B prefill residual — a portable fusion abstraction (reuse vLLM patterns per-backend in C++/vt::/cutlass EVT; NOT Triton/CuTe AOT). Scoping it next.
+
+## 2026-07-19 — Glue-fusion scoping task #57: lever 1 (sigmoid-gate fold) landed OPT-IN, lever 3 (Marlin repack) already-at-load SKIPPED (`CLAIM-SIGMOID-GATE-FOLD-1`)
+
+Implemented the two grounded prefill levers from the glue-fusion scoping.
+Branch/tree `dgx:~/work/vllm.cpp-sigmoid-fold` (production flags CUTLASS sm120a +
+Marlin + FA2 sm_121a + Triton AOT, clean CUDA `-Werror` 0 warnings, one flock).
+
+**Lever 1 — sigmoid-gate → o_proj fold (LANDED OPT-IN).** NEW `vt::SigmoidGateFp4Quant`
+op folds `attn*sigmoid(gate)` into the o_proj NVFP4 activation quant — one kernel,
+no bf16 `gated` intermediate — mirroring vLLM Inductor
+`triton_poi_fused_mul_scaled_fp4_quant_sigmoid` and the `SiluMulFp4Quant` precedent.
+`SigmoidGateOProjD` dispatch fires only on the **27B true-W4A4** o_proj (the 35B is
+W4A16-Marlin/fp8 → reads bf16 acts, fusion inert). BIT-IDENTICAL to
+`SigmoidGateBf16`+`ScaledFp4Quant` by construction (elementwise, non-reducing,
+bf16-rounded before quant). Gated `VT_FUSE_SIGMOID_QUANT=1` (default OFF).
+- Byte-exact op test `sigmoid_gate_fp4_quant` **14/14** (CPU f32/bf16 + CUDA, 3 shapes).
+- 27B `test_qwen27_paged_engine` **235/235 both arms**; 35B **315/315** (inert).
+- In-situ 27B TTFT A/B (input-1024, 3 reps): c1 −0.15%, c2 −0.03% — NEUTRAL within
+  ±0.5% rep noise (o_proj is a small slice of 27B prefill) ⇒ OPT-IN (mirror of the
+  perf-neutral fp8-merged-QKV disposition; flip only on a measured win).
+
+**Lever 3 — eager Marlin repack (35B): VERIFIED already-at-load-time, SKIPPED.** The
+routed/shared/lm_head Marlin repack (`BuildMoeMarlinResident`) already runs at engine
+init via `PrepareMarlinResident`, called from the `GPUModelRunner` ctor
+(`runner.cpp:302/321`) BEFORE warmup — mirroring vLLM's `process_weights_after_loading`.
+The forward first-touch build is a dead production fallback. An un-warmed 35B c1
+bench shows an elevated first-request TTFT (mean 247.9 / median 178.1 / p99 575.5 ms)
+= general warmup (autotune/plan-cache/graph-capture/page-in), NOT the multi-second
+repack (provably at construction); the grid warms with a 1×1024-token request before
+timing, excluding it. Repack is outside the measured c1/c2 window ⇒ no
+implementation. Spec `.agents/specs/glue-fusion-2026-07-19.md`; ledger 2026-07-19.
+
+Next glue/EVT-epilogue-fusion candidates for the c1/c2 (35B) + 27B prefill residual
+remain the roadmap_v1 portable-fusion front (the fold mechanism here is reusable for
+any future W4A4 gated-projection site).

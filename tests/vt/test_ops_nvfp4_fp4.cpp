@@ -728,6 +728,112 @@ TEST_CASE("scaled_fp4_quant CUDA direct scales match linear swizzle") {
   b.DestroyQueue(queue);
 }
 
+TEST_CASE("sigmoid_gate_fp4_quant CPU == SigmoidGateBf16 + ScaledFp4Quant (BYTE-EXACT)") {
+  Queue queue = CpuQueue();
+  constexpr float kInputGlobalScale = 6.7F;
+  for (DType attn_dtype : {DType::kF32, DType::kBF16}) {
+    for (const auto& [m, k] :
+         {std::pair<int64_t, int64_t>{1, 64}, {37, 128}}) {
+      CAPTURE(m);
+      CAPTURE(k);
+      CAPTURE(static_cast<int>(attn_dtype));
+      std::mt19937 rng(static_cast<unsigned>(701 + m * 131 + k));
+      std::normal_distribution<float> normal(0.0F, 2.0F);
+      std::vector<float> attn_f32(static_cast<size_t>(m * k));
+      std::vector<float> gate_f32(static_cast<size_t>(m * k));
+      for (float& value : attn_f32) value = normal(rng);
+      for (float& value : gate_f32) value = normal(rng);
+      std::vector<uint16_t> attn_bf16;
+      void* attn_data = attn_f32.data();
+      if (attn_dtype == DType::kBF16) {
+        attn_bf16.resize(attn_f32.size());
+        std::transform(attn_f32.begin(), attn_f32.end(), attn_bf16.begin(),
+                       FloatToBf16);
+        attn_data = attn_bf16.data();
+      }
+
+      std::vector<uint16_t> gated(static_cast<size_t>(m * k));
+      std::vector<uint8_t> reference_packed(static_cast<size_t>(m * k / 2));
+      std::vector<uint8_t> reference_scale(static_cast<size_t>(m * k / 16));
+      std::vector<uint8_t> fused_packed(reference_packed.size());
+      std::vector<uint8_t> fused_scale(reference_scale.size());
+      Tensor attn = Tensor::Contiguous(attn_data, attn_dtype, Cpu(), {m, k});
+      Tensor gate = Tensor::Contiguous(gate_f32.data(), DType::kF32, Cpu(), {m, k});
+      Tensor gated_t =
+          Tensor::Contiguous(gated.data(), DType::kBF16, Cpu(), {m, k});
+      Tensor ref_packed = Tensor::Contiguous(
+          reference_packed.data(), DType::kI8, Cpu(), {m, k / 2});
+      Tensor ref_scale = Tensor::Contiguous(
+          reference_scale.data(), DType::kI8, Cpu(), {m, k / 16});
+      Tensor got_packed = Tensor::Contiguous(
+          fused_packed.data(), DType::kI8, Cpu(), {m, k / 2});
+      Tensor got_scale = Tensor::Contiguous(
+          fused_scale.data(), DType::kI8, Cpu(), {m, k / 16});
+
+      vt::SigmoidGateBf16(queue, gated_t, attn, gate);
+      vt::ScaledFp4Quant(queue, ref_packed, ref_scale, gated_t, kInputGlobalScale);
+      vt::SigmoidGateFp4Quant(queue, got_packed, got_scale, attn, gate,
+                              kInputGlobalScale);
+      CHECK(fused_packed == reference_packed);
+      CHECK(fused_scale == reference_scale);
+    }
+  }
+}
+
+TEST_CASE("sigmoid_gate_fp4_quant CUDA == SigmoidGateBf16 + ScaledFp4Quant (BYTE-EXACT)") {
+  if (!HasCuda()) return;
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = b.CreateQueue();
+  const float input_global_scale = 6.7F;
+
+  auto run_check = [&](int64_t M, int64_t K) {
+    std::mt19937 rng(static_cast<unsigned>(707 + M * 131 + K));
+    std::normal_distribution<float> nd(0.0F, 2.0F);
+    std::vector<float> attn(static_cast<size_t>(M * K)), gate(static_cast<size_t>(M * K));
+    for (auto& v : attn) v = nd(rng);
+    for (auto& v : gate) v = nd(rng);
+
+    auto upl = [&](const void* h, size_t nb) { void* p = b.Alloc(nb); b.Copy(gq, p, h, nb); return p; };
+    void* dattn = upl(attn.data(), attn.size() * sizeof(float));
+    void* dgate = upl(gate.data(), gate.size() * sizeof(float));
+    Tensor tattn = GpuTensor({M, K}); tattn.data = dattn; tattn.dtype = DType::kF32; tattn.device = Gpu();
+    Tensor tgate = GpuTensor({M, K}); tgate.data = dgate; tgate.dtype = DType::kF32; tgate.device = Gpu();
+
+    // Unfused reference: SigmoidGateBf16 -> bf16 gated, then ScaledFp4Quant.
+    void* dgated = b.Alloc(static_cast<size_t>(M * K) * sizeof(uint16_t));
+    void* dref_ap = b.Alloc(static_cast<size_t>(M * K / 2));
+    void* dref_as = b.Alloc(static_cast<size_t>(M * K / 16));
+    Tensor tgated = GpuTensor({M, K}); tgated.data = dgated; tgated.dtype = DType::kBF16; tgated.device = Gpu();
+    Tensor tref_ap = GpuTensor({M, K / 2}); tref_ap.data = dref_ap; tref_ap.dtype = DType::kI8; tref_ap.device = Gpu();
+    Tensor tref_as = GpuTensor({M, K / 16}); tref_as.data = dref_as; tref_as.dtype = DType::kI8; tref_as.device = Gpu();
+    vt::SigmoidGateBf16(gq, tgated, tattn, tgate);
+    vt::ScaledFp4Quant(gq, tref_ap, tref_as, tgated, input_global_scale);
+
+    // Fused (linear scale layout).
+    void* dfu_ap = b.Alloc(static_cast<size_t>(M * K / 2));
+    void* dfu_as = b.Alloc(static_cast<size_t>(M * K / 16));
+    Tensor tfu_ap = GpuTensor({M, K / 2}); tfu_ap.data = dfu_ap; tfu_ap.dtype = DType::kI8; tfu_ap.device = Gpu();
+    Tensor tfu_as = GpuTensor({M, K / 16}); tfu_as.data = dfu_as; tfu_as.dtype = DType::kI8; tfu_as.device = Gpu();
+    vt::SigmoidGateFp4Quant(gq, tfu_ap, tfu_as, tattn, tgate, input_global_scale);
+    b.Synchronize(gq);
+
+    std::vector<uint8_t> ref_ap(static_cast<size_t>(M * K / 2)), fu_ap(ref_ap.size());
+    std::vector<uint8_t> ref_as(static_cast<size_t>(M * K / 16)), fu_as(ref_as.size());
+    b.Copy(gq, ref_ap.data(), dref_ap, ref_ap.size());
+    b.Copy(gq, fu_ap.data(), dfu_ap, fu_ap.size());
+    b.Copy(gq, ref_as.data(), dref_as, ref_as.size());
+    b.Copy(gq, fu_as.data(), dfu_as, fu_as.size());
+    b.Synchronize(gq);
+    CHECK(fu_ap == ref_ap);
+    CHECK(fu_as == ref_as);
+
+    for (void* p : {dattn, dgate, dgated, dref_ap, dref_as, dfu_ap, dfu_as}) b.Free(p);
+  };
+  run_check(1, 64);
+  run_check(37, 128);
+  run_check(128, 512);
+}
+
 TEST_CASE("silu_mul_fp4_quant CUDA == MoeSiluMul + ScaledFp4Quant (BYTE-EXACT)") {
   if (!HasCuda()) return;
   auto& b = vt::GetBackend(DeviceType::kCUDA);

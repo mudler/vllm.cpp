@@ -1382,6 +1382,113 @@ void SiluMulFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale,
   Check(cudaGetLastError(), "silu_mul_fp4_quant kernel launch");
 }
 
+// FUSED full-attention sigmoid output gate + NVFP4 activation quant. Mirror of
+// SiluMulFp4QuantKernel, substituting attn*sigmoid(gate) for silu(gate)*up — the
+// vLLM Inductor triton_poi_fused_mul_scaled_fp4_quant_sigmoid fold. attn is f32 OR
+// bf16 (FA-2 hands bf16; exact upcast); gate is always f32 (sigmoid input must not
+// round). Bit-identical to SigmoidGateBf16(attn,gate -> bf16) + ScaledFp4Quant.
+template <typename Tattn, bool kSwizzled>
+__global__ void SigmoidGateFp4QuantKernel(uint8_t* packed, uint8_t* scale, const Tattn* attn,
+                                          const float* gate, float input_global_scale,
+                                          int64_t m_rows, int64_t i_dim, int64_t scale_rows,
+                                          int64_t scale_cols, bool approx_recip) {
+  const int64_t groups = i_dim / 16;
+  const int64_t gid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t columns = kSwizzled ? scale_cols : groups;
+  const int64_t rows = kSwizzled ? scale_rows : m_rows;
+  if (gid >= rows * columns) return;
+  const int64_t row = gid / columns;
+  const int64_t g = gid % columns;
+  if constexpr (kSwizzled) {
+    if (row >= m_rows || g >= groups) {
+      StoreFp4Scale<true>(scale, row, g, groups, scale_cols, uint8_t{0});
+      return;
+    }
+  }
+  const int64_t base = row * i_dim + g * 16;
+  // attn*sigmoid(gate), rounded through bf16 (== SigmoidGateBf16 store to bf16,
+  // cuda_glue.cu:164). sigmoid(x)=1/(1+exp(-x)).
+  float v[16];
+#pragma unroll
+  for (int j = 0; j < 16; ++j) {
+    const float aa = Load(attn, base + j);
+    const float gg = Load(gate, base + j);
+    const float sm = aa * (1.0f / (1.0f + expf(-gg)));
+    v[j] = __bfloat162float(__float2bfloat16(sm));
+  }
+  // --- exact ScaledFp4QuantKernel epilogue (cuda_matmul_nvfp4.cu:960-989) over v ---
+  float vmax = 0.0f;
+#pragma unroll
+  for (int j = 0; j < 16; ++j) vmax = fmaxf(vmax, fabsf(v[j]));
+  const float inverse_six =
+      approx_recip ? ReciprocalApproximateFtz(6.0f) : (1.0f / 6.0f);
+  float sc = input_global_scale * (vmax * inverse_six);
+  sc = fminf(fmaxf(sc, -448.0f), 448.0f);
+  const uint8_t sc8 = F32ToFp8Dev(sc);
+  StoreFp4Scale<kSwizzled>(scale, row, g, groups, scale_cols, sc8);
+  const float sfv = F8E4M3ToF32Dev(sc8);
+  float out_scale = 0.0f;
+  if (sfv != 0.0f) {
+    if (approx_recip) {
+      out_scale = ReciprocalApproximateFtz(
+          sfv * ReciprocalApproximateFtz(input_global_scale));
+    } else {
+      out_scale = input_global_scale / sfv;
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < 16; j += 2) {
+    const float lo = fminf(fmaxf(v[j] * out_scale, -6.0f), 6.0f);
+    const float hi = fminf(fmaxf(v[j + 1] * out_scale, -6.0f), 6.0f);
+    packed[(base + j) / 2] =
+        static_cast<uint8_t>(CastToFp4NibbleDev(lo) | (CastToFp4NibbleDev(hi) << 4));
+  }
+}
+
+void SigmoidGateFp4QuantKernelCuda(Queue& q, Tensor& out_packed, Tensor& out_scale,
+                                   const Tensor& attn, const Tensor& gate,
+                                   float input_global_scale_inv, Fp4ScaleLayout scale_layout) {
+  const int64_t m = attn.shape[0], i = attn.shape[1];
+  if (m == 0 || i == 0) return;
+  cudaStream_t s = AsStream(q);
+  const bool swizzled = scale_layout == Fp4ScaleLayout::kCutlassSwizzled;
+  const int64_t scale_rows = out_scale.shape[0];
+  const int64_t scale_cols = out_scale.shape[1];
+  const int64_t total = swizzled ? out_scale.Numel() : m * (i / 16);
+  constexpr int kBlock = 256;
+  const dim3 grid(static_cast<unsigned>((total + kBlock - 1) / kBlock));
+  auto* pk = out_packed.Ptr<uint8_t>();
+  auto* sc = out_scale.Ptr<uint8_t>();
+  const bool approx = NativeFp4MmaEnabled();  // pair fused/unfused reciprocal choice
+  const float* gp = gate.Ptr<float>();
+  switch (attn.dtype) {
+    case DType::kF32:
+      if (swizzled) {
+        SigmoidGateFp4QuantKernel<float, true><<<grid, kBlock, 0, s>>>(
+            pk, sc, attn.Ptr<float>(), gp, input_global_scale_inv, m, i, scale_rows,
+            scale_cols, approx);
+      } else {
+        SigmoidGateFp4QuantKernel<float, false><<<grid, kBlock, 0, s>>>(
+            pk, sc, attn.Ptr<float>(), gp, input_global_scale_inv, m, i, scale_rows,
+            scale_cols, approx);
+      }
+      break;
+    case DType::kBF16:
+      if (swizzled) {
+        SigmoidGateFp4QuantKernel<__nv_bfloat16, true><<<grid, kBlock, 0, s>>>(
+            pk, sc, attn.Ptr<__nv_bfloat16>(), gp, input_global_scale_inv, m, i,
+            scale_rows, scale_cols, approx);
+      } else {
+        SigmoidGateFp4QuantKernel<__nv_bfloat16, false><<<grid, kBlock, 0, s>>>(
+            pk, sc, attn.Ptr<__nv_bfloat16>(), gp, input_global_scale_inv, m, i,
+            scale_rows, scale_cols, approx);
+      }
+      break;
+    default: VT_CHECK(false, "cuda sigmoid_gate_fp4_quant: unsupported attn dtype (f32/bf16)");
+  }
+  Check(cudaGetLastError(), "sigmoid_gate_fp4_quant kernel launch");
+}
+
 // W3-I1 specialization of vLLM@e24d1b24
 //   csrc/libtorch_stable/quantization/fp4/
 //     activation_nvfp4_quant_fusion_kernels.cu:30-116,120-163
@@ -2056,6 +2163,10 @@ struct Registrar {
         OpId::kSiluAndMulFp4Quant, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<SiluAndMulFp4QuantFn>(
             &SiluAndMulFp4QuantKernelCuda)));
+    RegisterOp(
+        OpId::kSigmoidGateFp4Quant, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<SigmoidGateFp4QuantFn>(
+            &SigmoidGateFp4QuantKernelCuda)));
     RegisterOp(OpId::kMatmulNvfp4Fp4, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulNvfp4Fp4Fn>(&MatmulNvfp4Fp4KernelCuda)));
     RegisterOp(OpId::kMoeGroupedGemmNvfp4, DeviceType::kCUDA,

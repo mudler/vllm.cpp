@@ -78,6 +78,51 @@ re-measures the in-situ effect; characterize the c4 TTFT lottery vs run-noise.
 `benchmark_binding=false` for these levers — no isolated speed credit; the grid owns
 the in-situ number.
 
+### 27B sigmoid-gate → o_proj fold (2026-07-19, `CLAIM-SIGMOID-GATE-FOLD-1`) — byte-exact, perf-NEUTRAL, opt-in
+
+Component (NOT binding). Folds the standalone full-attention sigmoid output gate
+(`attn*sigmoid(gate)`) into the o_proj NVFP4 activation quant on the 27B
+true-W4A4 path — one fused `vt::SigmoidGateFp4Quant` kernel replacing
+`SigmoidGateBf16` (bf16 `gated` intermediate) + `ScaledFp4Quant`, mirroring vLLM's
+Inductor `triton_poi_fused_mul_scaled_fp4_quant_sigmoid` and reusing the
+`SiluMulFp4Quant` precedent. Only the 27B (W4A4) o_proj quantizes its activation;
+the 35B (W4A16-Marlin / fp8 o_proj) reads bf16 activations, so the fusion is inert
+there. `VT_FUSE_SIGMOID_QUANT=1` opt-in (default OFF).
+
+Disposition: **byte-exact + perf-NEUTRAL ⇒ landed OPT-IN (default OFF).** DGX GREEN
+(`~/work/vllm.cpp-sigmoid-fold`, production flags CUTLASS sm120a + Marlin + FA2
+sm_121a + Triton AOT, clean CUDA `-Werror` **0 warnings**, one flock): byte-exact
+op test `sigmoid_gate_fp4_quant` **14/14** (CPU f32/bf16 + CUDA f32, 3 shapes,
+fused == `SigmoidGateBf16`+`ScaledFp4Quant`); 27B `test_qwen27_paged_engine`
+**235/235 token-exact BOTH arms** (fused default-ON build + `VT_FUSE_SIGMOID_QUANT=0`
+fallback); 35B `test_qwen36_paged_engine` **315/315** (fusion inert). In-situ 27B
+same-binary interleaved TTFT A/B (input-1024, output-8, greedy, 3 reps/arm): **c1
+med OFF 419.6 vs ON 419.0 ms (−0.15 %), c2 792.9 vs 792.7 ms (−0.03 %)** — both
+within ±0.5 % rep-to-rep noise, prefill tok/s indistinguishable (~914 c1 / ~1345
+c2). The full-attn o_proj is a small slice of 27B prefill (dominated by GDN + MoE +
+the QKV/gate/up GEMMs), so the one-launch + bf16-round-trip saving sits below the
+noise floor. Kept opt-in per "token-exact but not measurably faster". Repro: build
+branch with the flags above, `flock /tmp/gpu`, `test_ops_nvfp4_fp4 -tc="*sigmoid_gate_fp4_quant*"`
++ 27B/35B engine gates + `env VT_FUSE_SIGMOID_QUANT={0,1} vllm-bench --input-len 1024`.
+
+### Lever-3 eager Marlin repack (2026-07-19) — VERIFIED already-at-load-time, skipped
+
+Scoping premise: the first-touch Marlin repack was 42 % of a COLD (no-warmup) 35B
+prefill trace; does it leak into the binding grid's measured c1/c2 TTFT? **Verified
+NO — already moved to load-time.** `Qwen3_5Model::PrepareMarlinResident` builds all
+Marlin residents (routed experts `BuildMoeMarlinResident`, shared experts, lm_head)
+at engine init, called from the `GPUModelRunner` constructor (`runner.cpp:302/321`)
+BEFORE any warmup/serving — mirroring vLLM's `process_weights_after_loading`. The
+forward first-touch path (`if (!mr.ready) BuildMoeMarlinResident`) is a dead
+fallback in production. Empirically an un-warmed 35B c1 bench (6 reqs, input-1024)
+shows an elevated first-request TTFT (mean 247.9 / median 178.1 / p99 575.5 ms) —
+but that ~400 ms first-request delta is general warmup (FP4 autotune / plan-cache /
+CUDA-graph capture / page-in), NOT the multi-second expert repack (a repack leak
+would add seconds, not ~0.4 s, and is provably at construction anyway). The binding
+grid warms with a 1×1024-token request before timing, excluding even that general
+first-request cost, so the repack is OUTSIDE the measured c1/c2 window ⇒ lever
+skipped (no implementation needed).
+
 ### 35B FP8 merged-QKV projection (2026-07-19, `CLAIM-FP8-MERGED-QKV-1`) — token-exact, perf-NEUTRAL, opt-in
 
 Component (NOT binding). Extends the fp4-only merged-QKV fusion to the 35B FP8

@@ -411,6 +411,23 @@ void SiluAndMulFp4QuantKernel(Queue& q, Tensor& out_packed, Tensor& out_scale,
                        input_global_scale_inv, scale_layout);
 }
 
+void SigmoidGateBf16Kernel(Queue&, Tensor& out, const Tensor& attn,
+                           const Tensor& gate);  // defined below
+
+// SigmoidGateFp4Quant CPU fallback = the exact composite (bf16 intermediate then
+// quant) — the definition of correctness for the CUDA fused kernel. The bf16
+// scratch reproduces the round-through-bf16 the CUDA kernel folds in.
+void SigmoidGateFp4QuantKernel(Queue& q, Tensor& out_packed, Tensor& out_scale,
+                               const Tensor& attn, const Tensor& gate,
+                               float input_global_scale_inv, Fp4ScaleLayout scale_layout) {
+  const int64_t m = attn.shape[0], i = attn.shape[1];
+  std::vector<uint16_t> tmp(static_cast<size_t>(m) * static_cast<size_t>(i));
+  Tensor act = Tensor::Contiguous(tmp.data(), DType::kBF16, attn.device, {m, i});
+  SigmoidGateBf16Kernel(q, act, attn, gate);
+  ScaledFp4QuantKernel(q, out_packed, out_scale, act, input_global_scale_inv,
+                       scale_layout);
+}
+
 // MatmulNvfp4Fp4 CPU kernel: out[m,n] = alpha * Σ_k (a_fp4·f8(a_scale))·(b_fp4·
 // f8(b_scale)). Equals vllm::RunNvfp4Emulation up to K-reduction order.
 void MatmulNvfp4Fp4Kernel(Queue&, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
@@ -1488,6 +1505,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ScaledFp4QuantFn>(&ScaledFp4QuantKernel)));
     RegisterOp(OpId::kSiluMulFp4Quant, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SiluMulFp4QuantFn>(&SiluMulFp4QuantKernel)));
+    RegisterOp(OpId::kSigmoidGateFp4Quant, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<SigmoidGateFp4QuantFn>(&SigmoidGateFp4QuantKernel)));
     RegisterOp(
         OpId::kSiluAndMulFp4Quant, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<SiluAndMulFp4QuantFn>(

@@ -1406,6 +1406,27 @@ bool FuseSiluQuantEnabled() {
   return on;
 }
 
+// FUSE the full-attention sigmoid output gate with the o_proj activation quant
+// (mirror vLLM's Inductor triton_poi_fused_mul_scaled_fp4_quant_sigmoid) — one
+// kernel over attn*sigmoid(gate), no bf16 intermediate. Only the 27B true-W4A4
+// full-attention o_proj quantizes its activation, so only it is affected; the 35B
+// W4A16-Marlin (and any fp8/bf16 o_proj) reads bf16 activations and keeps the
+// standalone SigmoidGateBf16. sigmoid·mul is elementwise/non-reducing → the fused
+// producer is bit-identical to SigmoidGateBf16 -> ScaledFp4Quant (byte-exact op
+// test + 27B 235/235 both arms prove it). DEFAULT OFF (opt-in
+// VT_FUSE_SIGMOID_QUANT=1): the in-situ 27B c1/c2 TTFT A/B measured NEUTRAL (the
+// o_proj is a small slice of 27B prefill, dominated by GDN + MoE + the QKV/gate/up
+// GEMMs) — token-exact but not measurably faster, so it ships opt-in per the "flip
+// only on a measured win" rule (mirror of the perf-neutral fp8-merged-QKV
+// launch-fusion disposition).
+bool FuseSigmoidGateQuantEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FUSE_SIGMOID_QUANT");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 // FUSE the full-attention preamble (prefill-gap-scan dominant lever): the 4-5
 // separate f32 kernels before the attention kernel (AttnGateSplit + q-RMSNorm +
 // k-RMSNorm + partial NeoX RoPE, the last recomputing cos/sin transcendentals in
@@ -1917,6 +1938,43 @@ DBuf MatmulNvfp4Fp4D(Dev d, const Tensor& x, const Nvfp4Weight& w, DType out_dty
 // diagnostic still uses their normal model-side dispatch.
 DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w);
 DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w);
+
+bool FuseSigmoidGateQuantEnabled();
+
+// Full-attention sigmoid output gate (attn*sigmoid(gate)) folded into the o_proj.
+// attn2d/gate2d are [T, Hq*Dh] (attn f32 or bf16; gate f32). When the o_proj is
+// true-W4A4 fp4 (the 27B path) on CUDA, FUSE the gate into the fp4 activation
+// quant — one kernel, no bf16 gated intermediate — mirroring vLLM's Inductor
+// triton_poi_fused_mul_scaled_fp4_quant_sigmoid and our SiluMulFp4Quant precedent
+// (bit-identical to SigmoidGateBf16 -> MatmulNvfp4Fp4D). Every other o_proj dtype
+// (35B W4A16-Marlin fp4, fp8, bf16) reads a bf16 activation, so keep the standalone
+// SigmoidGateBf16 + the three-way GEMM there.
+DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
+                       const FullAttnLayerWeights& w, bool fp4) {
+  const int64_t T = attn2d.shape[0], K = attn2d.shape[1];
+#ifdef VT_CUTLASS_NVFP4
+  if (fp4 && w.o_proj_fp8.Empty() && FuseSigmoidGateQuantEnabled() &&
+      d.q.device.type == vt::DeviceType::kCUDA && !w.o_proj_fp4.Empty() &&
+      w.o_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled()) {
+    DBuf ap(d, DType::kI8, {T, K / 2});
+    const bool direct_scale = DirectFp4ScaleEligible(d);
+    DBuf as(d, DType::kI8,
+            direct_scale ? CutlassFp4ScaleShape(T, K)
+                         : std::vector<int64_t>{T, K / 16});
+    vt::SigmoidGateFp4Quant(d.q, ap.t(), as.t(), attn2d, gate2d,
+                            w.o_proj_fp4.input_global_scale_inv,
+                            direct_scale ? vt::Fp4ScaleLayout::kCutlassSwizzled
+                                         : vt::Fp4ScaleLayout::kLinear);
+    return MatmulNvfp4Fp4DirectD(d, ap.t(), as.t(), w.o_proj_fp4, DType::kBF16,
+                                 direct_scale ? &as.t() : nullptr);
+  }
+#endif
+  DBuf gated(d, DType::kBF16, {T, K});
+  vt::SigmoidGateBf16(d.q, gated.t(), attn2d, gate2d);
+  return !w.o_proj_fp8.Empty() ? MatmulFp8CutlassD(d, gated.t(), w.o_proj_fp8, DType::kBF16)
+         : fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
+               : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
+}
 
 // Owners plus logical views for full-attention Q/K/V. The packed path owns one
 // [T,Q+K+V] allocation and exposes row-strided inner-contiguous views; the
@@ -3463,13 +3521,10 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   const float scale = 1.0F / std::sqrt(SizeF(Dh));
   vt::Attention(d.q, dattn.t(), qn3, kn3, v3, vt::AttentionArgs{scale, true});
 
-  // Sigmoid output gate on the raw gate split, then o-project (§5) — device op.
-  DBuf gated(d, DType::kBF16, {T, Hq * Dh});
-  vt::SigmoidGateBf16(d.q, gated.t(), Reshape(dattn.t(), {T, Hq * Dh}),
-                      Reshape(gatef.t(), {T, Hq * Dh}));
-  return !w.o_proj_fp8.Empty() ? MatmulFp8CutlassD(d, gated.t(), w.o_proj_fp8, DType::kBF16)
-         : fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
-               : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
+  // Sigmoid output gate on the raw gate split, folded into the o_proj activation
+  // quant on the true-W4A4 path (§5) — see SigmoidGateOProjD.
+  return SigmoidGateOProjD(d, Reshape(dattn.t(), {T, Hq * Dh}),
+                           Reshape(gatef.t(), {T, Hq * Dh}), w, fp4);  // [T,H]
 }
 
 // --- Batched PAGED full_attention block (M1.8 Task 3). Identical q/k/v prep to
@@ -3636,13 +3691,10 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   pa_args.max_seq_len = meta.max_seq_len;
   vt::PagedAttention(d.q, dattn.t(), qn3, k_cache, v_cache, dblk, dsl, dqsl, pa_args);
 
-  // Sigmoid output gate then o-project (§5) — device op.
-  DBuf gated(d, DType::kBF16, {T, Hq * Dh});
-  vt::SigmoidGateBf16(d.q, gated.t(), Reshape(dattn.t(), {T, Hq * Dh}),
-                      Reshape(gatef.t(), {T, Hq * Dh}));
-  return !w.o_proj_fp8.Empty() ? MatmulFp8CutlassD(d, gated.t(), w.o_proj_fp8, DType::kBF16)
-         : fp4 ? MatmulNvfp4Bf16D(d, gated.t(), w.o_proj_fp4)
-               : MatmulBf16D(d, gated.t(), w.o_proj);  // [T,H]
+  // Sigmoid output gate, folded into the o_proj activation quant on the true-W4A4
+  // path (§5) — see SigmoidGateOProjD.
+  return SigmoidGateOProjD(d, Reshape(dattn.t(), {T, Hq * Dh}),
+                           Reshape(gatef.t(), {T, Hq * Dh}), w, fp4);  // [T,H]
 }
 
 // Per-expert silu-mul MLP over the gathered token rows `x` [n, H] bf16 ->

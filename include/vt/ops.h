@@ -117,6 +117,7 @@ enum class OpId : uint8_t {
   kScaledFp4Quant,
   kSiluMulFp4Quant,
   kSiluAndMulFp4Quant,
+  kSigmoidGateFp4Quant,
   kMatmulNvfp4Fp4,
   kMatmulNvfp4Cutlass,
   kMatmulFp8Cutlass,
@@ -329,6 +330,9 @@ using SiluMulFp4QuantFn =
              Fp4ScaleLayout);
 using SiluAndMulFp4QuantFn =
     void (*)(Queue&, Tensor&, Tensor&, const Tensor&, float, Fp4ScaleLayout);
+using SigmoidGateFp4QuantFn =
+    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, float,
+             Fp4ScaleLayout);
 using MatmulNvfp4Fp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, float);
 using MatmulNvfp4CutlassFn =
@@ -564,6 +568,22 @@ void SiluMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale, const Tens
 void SiluAndMulFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale,
                         const Tensor& gate_up, float input_global_scale_inv,
                         Fp4ScaleLayout scale_layout = Fp4ScaleLayout::kLinear);
+
+// SigmoidGateFp4Quant (mirror vllm Inductor triton_poi_fused_mul_scaled_fp4_quant
+// _sigmoid_view): FUSES the full-attention sigmoid output gate — attn*sigmoid(gate)
+// — with the NVFP4 activation quant of the o_proj into one kernel, removing the
+// bf16 intermediate that the unfused SigmoidGateBf16(->bf16 [M,K]) + ScaledFp4Quant
+// path writes+reads. attn is [M,K] f32 OR bf16 (the FA-2 prefill hands bf16; the
+// upcast is exact), gate is [M,K] f32 (sigmoid input must not be rounded). Outputs
+// match ScaledFp4Quant's selected linear or CUTLASS-swizzled scale layout:
+//   out_packed [M, K/2] i8 ; out_scale linear [M, K/16] or swizzled.
+// BIT-IDENTICAL to SigmoidGateBf16(attn,gate -> bf16) then ScaledFp4Quant(bf16):
+// the attn*sigmoid(gate) value is rounded through bf16 before quant. K a multiple
+// of 16. CPU+CUDA (CPU fallback = the composite sequence).
+void SigmoidGateFp4Quant(Queue& q, Tensor& out_packed, Tensor& out_scale,
+                         const Tensor& attn, const Tensor& gate,
+                         float input_global_scale_inv,
+                         Fp4ScaleLayout scale_layout = Fp4ScaleLayout::kLinear);
 
 // MatmulNvfp4Fp4 (mirror vllm cutlass_scaled_fp4_mm / ..._sm120a; notes §7.3):
 //   out[m,n] = alpha * Σ_k ( a_fp4[m,k]·a_scale_fp8[m,k/16] )

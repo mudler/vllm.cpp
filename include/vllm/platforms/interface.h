@@ -31,22 +31,48 @@ struct DeviceCapability {
 };
 
 // Discrete-vs-unified memory residency policy — the PR #4 discrete-memory debt
-// made DATA. Nothing branches on it yet: it is the advertisement item 2 wires
-// into the residency path. Current platforms RETAIN host weights (diagnostic
-// parity, qwen3_5.cpp:810), so `release_host_weights_after_upload` is false
-// everywhere today; item 2 flips it for a discrete GPU without touching model
-// code.
+// made DATA and, since item 2 (BACKEND-PLATFORM), CONSUMED by the model residency
+// path (qwen3_5.cpp) rather than decided inline. The host-free / load-stream /
+// device-scratch-pool decisions read these fields from
+// `GetPlatform(<obj>.device.type).residency_policy()`, so a new (e.g. discrete)
+// GPU changes ONLY its platform's policy values and the model code is UNCHANGED.
+// On GB10/unified today CUDA advertises release=true (the routed MoE experts'
+// host mirror IS freed after the device Marlin build — ENG-MOE-HOSTFREE /
+// -LOADSTREAM) + pool=true/uncapped (the DevicePool); CPU advertises the
+// unified-host retain/no-pool defaults below.
 struct ResidencyPolicy {
   // May host-side weight bytes be freed once a device-resident copy exists?
   // A discrete GPU reclaims host RAM; unified/host platforms keep the one copy.
+  // Consumed by ShouldReleaseHostWeights / ShouldInterleaveLoadStream below.
   bool release_host_weights_after_upload = false;
   // Is device scratch served from a reuse pool (qwen3_5.cpp DevicePool) rather
   // than freed straight to the driver? cudaMalloc/cudaFree are expensive and
   // illegal under graph capture, so CUDA pools; host platforms do not need it.
   bool uses_device_memory_pool = false;
-  // Optional soft cap (bytes) on pooled device scratch; 0 == uncapped.
+  // Optional soft cap (bytes) on pooled device scratch; 0 == uncapped (today).
+  // Consumed by the DevicePool: a discrete GPU sets a bound; GB10 leaves it 0.
   size_t device_pool_cap_bytes = 0;
 };
+
+// Residency DECISIONS derived from a ResidencyPolicy — the single, testable place
+// the host-weight-release and per-layer load-stream-interleave questions are
+// answered from platform data (BACKEND-PLATFORM item 2). Consumed by
+// qwen3_5.cpp; unit-tested in tests/vllm/platforms/test_platform.cpp so the
+// wiring the model uses is exercised on the CPU tier. The kernel-path predicate
+// `marlin_committed` (is the Marlin resident the committed compute path, so the
+// host-reading wmma fallback can never re-read the freed bytes) is ORTHOGONAL to
+// the platform POLICY and is supplied by the caller; `host_free_env` is the
+// VT_MOE_HOST_FREE same-binary A/B override (house convention). A discrete GPU
+// flips ResidencyPolicy and both this logic and the model are unchanged.
+inline bool ShouldReleaseHostWeights(const ResidencyPolicy& policy,
+                                     bool marlin_committed, bool host_free_env) {
+  return marlin_committed && policy.release_host_weights_after_upload &&
+         host_free_env;
+}
+inline bool ShouldInterleaveLoadStream(const ResidencyPolicy& policy,
+                                       bool marlin_committed) {
+  return marlin_committed && policy.release_host_weights_after_upload;
+}
 
 // Faithful port of vllm/platforms/interface.py:134-229 `class Platform`. Exposes
 // the capability queries the engine/model code branches on. A Platform COMPOSES

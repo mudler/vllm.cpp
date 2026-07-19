@@ -9,6 +9,16 @@ nowhere else:
 1. **Platform** — mirror of `vllm/platforms/` (`interface.py::Platform`;
    upstream ships cpu, cuda, rocm, tpu, **xpu**, zen_cpu). Device probing,
    memory model, stream/queue semantics, graph-capture capability.
+   **RESIDENCY CONSUMED (extensibility item 2, `BACKEND-PLATFORM`):** the
+   host-weight-release / load-stream-interleave / device-pool-cap decisions in
+   the model path READ `GetPlatform(<obj>.device.type).residency_policy()`
+   (via the pure `ShouldReleaseHostWeights` / `ShouldInterleaveLoadStream`
+   helpers + `device_pool_cap_bytes`) instead of an inline `device.type`/env
+   gate. The RESIDENCY POLICY (free host after upload? pool cap?) is platform
+   data; the orthogonal *kernel-path* question (is Marlin the committed path)
+   stays `MarlinMoeEnabled()`. `CudaPlatform` advertises the values reproducing
+   today's GB10 behavior exactly, so a new (discrete) GPU sets its
+   `residency_policy()` fields with ZERO model edit.
 2. **Attention/GDN backends** — mirror of `vllm/v1/attention/backends/`
    registry: each platform registers its paged-attention + GDN
    implementations behind the same `AttentionBackend/Impl/MetadataBuilder`

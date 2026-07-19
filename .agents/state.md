@@ -13363,3 +13363,64 @@ Sequence: (1) finish the extensibility seams (item 2 residency-consumption in fl
 - **Multi-stream intra-step kernel OVERLAP:** vLLM hides ~3.2 ms/step by overlapping decode (and prefill) kernels on multiple streams inside its graph; OURS is a serial single-stream decode graph (sum-of-durations ≈ device coverage). Redesign the decode/prefill graph to overlap independent kernels on multiple CUDA streams. This is THE largest remaining 35B c1/c2 lever (and helps 27B's residual + prefill TTFT). Attribution evidence: `dgx:~/work/vllm.cpp-35b-c1-attr/` (ours coverage≈sum 16.29/16.32; vLLM sum 15.7 > coverage 12.5 = ~1.26× overlap).
 - **Portable glue / EVT-epilogue FUSION:** the known 27B ~20% prefill-fusion pattern (Inductor whole-graph fusion vLLM does, we don't), diluted for 35B by MoE — the [[fusion-must-be-portable-reuse-patterns]] track (portable C++/vt:: fusion, cutlass EVT OK; NOT Triton/CuTe AOT lock-in).
 These two engine levers close the 35B low-concurrency residual and are the roadmap_v1 35B-improvement priority AFTER the extensibility seams. Then the broader portfolio.
+
+## 2026-07-19 — Extensibility item 2 LANDED: residency/memory-model as a CONSUMED `Platform::residency_policy()` capability (`CLAIM-BACKEND-PLATFORM-2`, `BACKEND-PLATFORM`)
+
+Completes the residency seam. The MoE host-weight-release + per-layer
+load-stream interleave + device-scratch-pool cap decisions are now CONSUMED FROM
+the platform capability (`residency_policy()`), not decided by an inline
+`device.type`/env gate. PURE behavior-preserving refactor — no numeric / kernel /
+memory-behavior change on GB10; the SAME host-free + load-stream runs and the 35B
+~4 GiB load peak is preserved.
+
+- **POLICY vs KERNEL-PATH split (the design point).** The two questions are
+  ORTHOGONAL and kept separate: the RESIDENCY POLICY (free host after upload?
+  pool cap?) is platform data (`residency_policy()`); WHETHER the Marlin resident
+  is the committed compute path (so the wmma fallback that re-reads the freed host
+  bytes can never run) stays the KERNEL gate `MarlinMoeEnabled()`.
+  `VT_MOE_HOST_FREE`/`VT_MOE_LOADSTREAM` env rollbacks stay as house-convention
+  overrides layered over the policy.
+- **Consumption (file:line).** host-free — `qwen3_5.cpp` `BuildMoeMarlinResident`
+  reads `GetPlatform(d.q.device.type).residency_policy()` through the pure helper
+  `vllm::platforms::ShouldReleaseHostWeights(policy, MarlinMoeEnabled(),
+  VT_MOE_HOST_FREE)` (`include/vllm/platforms/interface.h`); load-stream —
+  `Qwen3_5Model::PrepareMarlinResident` per-layer interleave gate reads it through
+  `ShouldInterleaveLoadStream(policy, MarlinMoeEnabled())` (reproduces the old
+  `queue.device.type != kCUDA || !MarlinMoeEnabled()` branch EXACTLY); DevicePool
+  scratch soft cap — `DBuf`/`DevicePool::Put` read `device_pool_cap_bytes` via the
+  memoized per-device `ResolveDevicePoolPolicy` (magic static — zero per-alloc
+  virtual dispatch; cap 0 today ⇒ pool byte-for-byte unchanged). All key on the
+  OBJECT's own `device.type` (the per-tensor lesson), never process-global
+  `CurrentPlatform()`.
+- **Reproduces today EXACTLY.** `CudaPlatform::residency_policy()` now returns
+  `release_host_weights_after_upload = true` (was `false`, UN-consumed — the routed
+  MoE experts' host mirror IS freed after the Marlin build today),
+  `uses_device_memory_pool = true`, `device_pool_cap_bytes = 0`. With these the
+  consuming code takes the identical branch it took inline: host-free fires
+  (`true && Marlin && env`), interleave fires (`policy && Marlin` == old `kCUDA &&
+  Marlin`), pool uncapped. CPU advertises retain/no-pool ⇒ materialize-all
+  fallback, exactly as `device.type != kCUDA` before.
+- **Additive-ness (measured).** BEFORE: a discrete GPU's residency behavior meant
+  editing the inline `device.type`/env gates in `qwen3_5.cpp`. AFTER: it sets its
+  platform's `residency_policy()` field values and the model code is UNCHANGED —
+  "a new GPU's residency behavior = set `residency_policy()` values, zero model
+  edit." The seam's three residency fields are all consumed.
+- **CPU gate: PASSED.** Clean `-Werror` build 0 warnings; `test_platform` residency
+  CONSUMPTION cases (7 cases / 43 assertions — helper truth-tables +
+  discrete-GPU policy round-trip + CPU retain) PASS; full CPU CTest 126/126 in
+  isolation (8 HTTP/engine/threadpool tests were `-j nproc` port/resource timeouts,
+  all PASS isolated in <1.1 s each); tools `unittest discover` 164/164; record +
+  doc-checkpoint checkers green.
+- **DGX CUDA gate: PASSED** (`~/work/vllm.cpp-residency-policy` @ `62fc0e0`,
+  production flags CUTLASS sm120a + FA2 sm_121a + Triton AOT verified in the config
+  log, one flock): clean CUDA `-Werror` build 0 warnings; 27B
+  `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine`
+  **315/315** token-exact; **35B load-to-ready peak RSS (VmHWM) 4,201,632 KB ≈ 4.0
+  GiB — the `ENG-MOE-LOADSTREAM` ~4.19 GiB load-stream memory win PRESERVED** (the
+  refactor is behavior-preserving as required); `compute-sanitizer memcheck` 35B
+  **0 errors / 315**. Evidence `dgx:/tmp/resid_{cfg,build,35b,27b,mc,gate_all}.log`.
+- Records same-change: backend-matrix `BACKEND-PLATFORM` item-2 note, engine-matrix
+  `ENG-MOE-HOSTFREE`/`ENG-MOE-LOADSTREAM` policy-driven notes, extensibility spec
+  item-2 LANDED section, backends.md seam-1 residency-consumed, roadmap
+  ROAD-V1-C1, README extensibility section, docs/BENCHMARKS.md disposition,
+  parity-ledger 2026-07-19 row, coordination `CLAIM-BACKEND-PLATFORM-2`.

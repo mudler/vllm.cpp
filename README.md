@@ -201,6 +201,24 @@ sites key on the object's own device.) This is a behavior-preserving refactor
 (both gate models stay token-exact); kernel-shape dispatch branches are
 deliberately left for the later attention/kernel-registry items.
 
+**Extensibility — residency is now a consumed Platform capability (2026-07-19,
+CPU-gated).** The MoE host-weight-release, per-layer load-stream interleave, and
+device-scratch-pool cap decisions are now *read from*
+`GetPlatform(<obj>.device.type).residency_policy()` instead of being decided by
+an inline `device.type`/env gate. The RESIDENCY POLICY (free host weights after
+the device upload? pool cap?) comes from the platform; whether the Marlin
+resident is the committed compute path stays an orthogonal *kernel* gate
+(`MarlinMoeEnabled()`) — the two questions are kept separate. `CudaPlatform`
+advertises the values that reproduce today's GB10 behavior exactly
+(`release_host_weights_after_upload = true`, device pool on, uncapped), so the
+same host-free + load-stream runs and the 35B ~4 GiB load-to-ready peak is
+preserved; `VT_MOE_HOST_FREE`/`VT_MOE_LOADSTREAM` stay as rollback overrides.
+**Net effect: a new (e.g. discrete) GPU's residency behavior = set its
+`residency_policy()` field values, with zero model-code edits.** A
+behavior-preserving refactor (no numeric/kernel/memory change on GB10), unit-tested
+on the CPU tier and DGX-confirmed token-exact (27B 235/235 + 35B 315/315, 35B
+load-to-ready peak ≈ 4.0 GiB preserved, memcheck 0 errors).
+
 **Extensibility — model self-registration landed (2026-07-19, CPU-gated).**
 Adding a model architecture is now additive. The fixed model-registry array is
 replaced by a `REGISTER_VLLM_MODEL(...)` static-registration idiom

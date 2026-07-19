@@ -55,6 +55,56 @@ build 0 warnings, 27B `test_qwen27_paged_engine` 235/235 + 35B
 `test_qwen36_paged_engine` 315/315 token-exact, `compute-sanitizer memcheck` 35B 0
 errors.** Items 2/4 remain.
 
+**STATUS 2026-07-19 — Item 2 (residency/memory-model as a CONSUMED
+`Platform::residency_policy()` capability) LANDED CPU-side (DGX gate PENDING),
+`CLAIM-BACKEND-PLATFORM-2`, `BACKEND-PLATFORM`.** The residency seam is
+COMPLETE: the host-weight-release / load-stream-interleave / DevicePool-cap
+decisions are now CONSUMED FROM the platform capability, not decided inline.
+- **Consumption (file:line).** `qwen3_5.cpp` host-free
+  (`BuildMoeMarlinResident`, the `release_host` decision) reads
+  `GetPlatform(d.q.device.type).residency_policy()` through the new pure helper
+  `vllm::platforms::ShouldReleaseHostWeights(policy, marlin_committed,
+  host_free_env)` (`include/vllm/platforms/interface.h`); load-stream
+  (`Qwen3_5Model::PrepareMarlinResident`, the per-layer interleave gate) reads it
+  through `ShouldInterleaveLoadStream(policy, marlin_committed)`; the DevicePool
+  scratch soft cap reads `residency_policy().device_pool_cap_bytes` (memoized
+  per-device `ResolveDevicePoolPolicy` → `DBuf`/`DevicePool::Put`). All key on the
+  OBJECT's own `device.type` (the per-tensor lesson), never process-global
+  `CurrentPlatform()`.
+- **POLICY vs KERNEL-PATH split (the design point).** The two are ORTHOGONAL and
+  kept separate: the RESIDENCY POLICY (free host after upload? pool cap?) comes
+  from the platform; whether Marlin is the committed compute path (so the wmma
+  fallback that re-reads the freed host bytes can never run) stays the KERNEL gate
+  `MarlinMoeEnabled()`. `VT_MOE_HOST_FREE`/`VT_MOE_LOADSTREAM` env rollbacks stay
+  as house-convention overrides layered over the policy.
+- **Reproduces today EXACTLY on GB10.** `CudaPlatform::residency_policy()` now
+  returns `release_host_weights_after_upload = true` (was `false`, un-consumed —
+  the routed MoE experts' host mirror IS freed after the Marlin build today),
+  `uses_device_memory_pool = true`, `device_pool_cap_bytes = 0` (uncapped). With
+  these, the consuming code takes the IDENTICAL branch it took inline: host-free
+  fires (`true && MarlinMoeEnabled() && env`), interleave fires (`policy && Marlin`
+  == old `kCUDA && Marlin`), pool uncapped. CPU advertises retain/no-pool ⇒ the
+  materialize-all fallback, exactly as `device.type != kCUDA` before.
+- **Additive-ness (measured).** BEFORE: a discrete GPU's residency behavior meant
+  editing the inline `device.type`/env gates in `qwen3_5.cpp`. AFTER: it sets
+  `CudaPlatform`/its-own-platform `residency_policy()` field values (e.g.
+  `device_pool_cap_bytes`, or `release_host_weights_after_upload=false` to retain)
+  and the model code is UNCHANGED — "a new GPU's residency behavior = set
+  `residency_policy()` values, zero model edit."
+- **Gate.** CPU: clean `-Werror` build 0 warnings; `test_platform` residency
+  CONSUMPTION cases (7 cases / 43 assertions — helper truth-tables +
+  discrete-GPU policy round-trip + CPU retain) PASS; full CPU CTest (8 HTTP/engine
+  parallel-port timeouts all pass isolated → 126/126); tools 164/164; record +
+  doc-checkpoint checkers green. DGX behavior-preserving gate (27B 235/235 + 35B
+  315/315 token-exact + 35B ~4 GiB load VmHWM preserved + memcheck) **PASSED**
+  (`~/work/vllm.cpp-residency-policy` @ `62fc0e0`, production flags CUTLASS sm120a
+  + FA2 sm_121a + Triton AOT verified, one flock): clean CUDA `-Werror` 0 warn; 27B
+  **235/235** + 35B **315/315** token-exact; 35B load-to-ready peak RSS (VmHWM)
+  **4,201,632 KB ≈ 4.0 GiB** — the `ENG-MOE-LOADSTREAM` ~4.19 GiB win PRESERVED;
+  `compute-sanitizer memcheck` 35B **0 errors / 315**. Completes the residency
+  seam; the 3 portability seams (Platform item 1 + attn-registry item 4 + model
+  self-reg item 5) plus this residency capability are now realized.
+
 **User directive (post-27B-parity):** make adding a new GPU/arch/model an
 ADDITIVE change (new files + one registration), not scattered edits — mirror
 vLLM so ports are mechanical copy-paste. HW-prioritized: GB10 (sm_121a) + M4

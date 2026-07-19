@@ -119,3 +119,80 @@ TEST_CASE("has_device_capability tests platform capability >= required") {
   CHECK_FALSE(sm121.has_device_capability(12, 2));
   CHECK_FALSE(sm121.has_device_capability(13, 0));
 }
+
+// --- BACKEND-PLATFORM item 2: residency-policy CONSUMPTION -------------------
+// The model (qwen3_5.cpp) no longer decides host-free / load-stream inline; it
+// reads GetPlatform(<obj>.device.type).residency_policy() and derives the
+// decision through ShouldReleaseHostWeights / ShouldInterleaveLoadStream — the
+// exact helpers exercised here. A new GPU changes ONLY residency_policy() values;
+// this logic and the model are unchanged.
+namespace {
+// A synthetic platform carrying an arbitrary ResidencyPolicy, so a discrete-GPU /
+// unified-GPU / retain-host policy can be exercised on the CPU tier without a GPU.
+class FakeResidencyPlatform final : public Platform {
+ public:
+  explicit FakeResidencyPlatform(ResidencyPolicy p) : policy_(p) {}
+  DeviceType device_type() const override { return DeviceType::kCUDA; }
+  vt::Backend& backend() const override { return vt::GetBackend(DeviceType::kCPU); }
+  DeviceCapability get_device_capability() const override { return {}; }
+  std::vector<DType> supported_dtypes() const override { return {DType::kBF16}; }
+  ResidencyPolicy residency_policy() const override { return policy_; }
+
+ private:
+  ResidencyPolicy policy_;
+};
+}  // namespace
+
+using vllm::platforms::ShouldInterleaveLoadStream;
+using vllm::platforms::ShouldReleaseHostWeights;
+
+TEST_CASE("residency helpers split POLICY (platform) from KERNEL-PATH (marlin)") {
+  // GB10/unified today: host weights freed after upload, pool on, uncapped.
+  ResidencyPolicy gb10;
+  gb10.release_host_weights_after_upload = true;
+  gb10.uses_device_memory_pool = true;
+  gb10.device_pool_cap_bytes = 0;
+
+  // Host-free = policy AND marlin-committed AND env-allow (the orthogonal AND).
+  CHECK(ShouldReleaseHostWeights(gb10, /*marlin=*/true, /*env=*/true));
+  // KERNEL-PATH gate off (wmma re-reads host) ⇒ never free, even with the policy.
+  CHECK_FALSE(ShouldReleaseHostWeights(gb10, /*marlin=*/false, /*env=*/true));
+  // House A/B override (VT_MOE_HOST_FREE=0) ⇒ retain, even with the policy.
+  CHECK_FALSE(ShouldReleaseHostWeights(gb10, /*marlin=*/true, /*env=*/false));
+  // Load-stream interleave = policy AND marlin-committed (reproduces the old
+  // `device==kCUDA && MarlinMoeEnabled()` gate for the CUDA platform).
+  CHECK(ShouldInterleaveLoadStream(gb10, /*marlin=*/true));
+  CHECK_FALSE(ShouldInterleaveLoadStream(gb10, /*marlin=*/false));
+
+  // A retain-host platform (unified/CPU semantics: policy false) ⇒ neither the
+  // host-free nor the interleave fires, regardless of the kernel path — the model
+  // takes the materialize-all / retain branch with NO code change.
+  ResidencyPolicy retain;  // all defaults false / 0
+  CHECK_FALSE(ShouldReleaseHostWeights(retain, /*marlin=*/true, /*env=*/true));
+  CHECK_FALSE(ShouldInterleaveLoadStream(retain, /*marlin=*/true));
+}
+
+TEST_CASE("residency_policy carries per-platform values the model consumes") {
+  // The seam is additive: a platform advertises its residency policy and the
+  // model reads it. Prove the policy round-trips through the Platform API and
+  // drives the decisions — the discrete-GPU case sets a pool cap with no model
+  // edit.
+  ResidencyPolicy discrete;
+  discrete.release_host_weights_after_upload = true;   // reclaim host RAM
+  discrete.uses_device_memory_pool = true;
+  discrete.device_pool_cap_bytes = size_t{1} << 30;    // 1 GiB soft cap
+  FakeResidencyPlatform gpu(discrete);
+  const ResidencyPolicy got = gpu.residency_policy();
+  CHECK(got.release_host_weights_after_upload);
+  CHECK(got.uses_device_memory_pool);
+  CHECK(got.device_pool_cap_bytes == (size_t{1} << 30));
+  CHECK(ShouldReleaseHostWeights(got, /*marlin=*/true, /*env=*/true));
+  CHECK(ShouldInterleaveLoadStream(got, /*marlin=*/true));
+
+  // CPU platform (the real one) advertises the unified-host retain/no-pool policy,
+  // so its derived decisions are always retain — the consumption is device-keyed.
+  const ResidencyPolicy cpu = GetPlatform(DeviceType::kCPU).residency_policy();
+  CHECK_FALSE(cpu.release_host_weights_after_upload);
+  CHECK_FALSE(ShouldReleaseHostWeights(cpu, /*marlin=*/true, /*env=*/true));
+  CHECK_FALSE(ShouldInterleaveLoadStream(cpu, /*marlin=*/true));
+}

@@ -28,13 +28,23 @@ class CudaPlatform final : public Platform {
     return {DType::kBF16, DType::kF16, DType::kF32};
   }
 
-  // The residency/memory-model advertisement (the PR #4 debt as data). Current
-  // behavior: host weights RETAINED (qwen3_5.cpp:810 diagnostic parity) and a
-  // device reuse pool (qwen3_5.cpp DevicePool). A discrete-GPU platform flips
-  // release_host_weights_after_upload without touching model code (item 2).
+  // The residency/memory-model policy (the PR #4 debt as data) — CONSUMED by the
+  // model residency path since item 2 (BACKEND-PLATFORM), no longer inline. These
+  // values REPRODUCE today's GB10 behavior EXACTLY:
+  //   * release_host_weights_after_upload = true: the routed MoE experts' ~16.9 GiB
+  //     host fp4 mirror is freed after the per-layer device Marlin build
+  //     (ENG-MOE-HOSTFREE ac77bec + ENG-MOE-LOADSTREAM ce7e1a0). qwen3_5.cpp's
+  //     host-free + load-stream sites read this via ShouldReleaseHostWeights /
+  //     ShouldInterleaveLoadStream; the wmma-fallback SAFETY gate stays
+  //     MarlinMoeEnabled() (orthogonal kernel-path question). VT_MOE_HOST_FREE=0
+  //     still overrides (house A/B convention).
+  //   * uses_device_memory_pool = true + device_pool_cap_bytes = 0: the DevicePool
+  //     scratch reuse, uncapped, exactly as today.
+  // A discrete GPU sets different values (e.g. a pool cap) and NO model code is
+  // touched — that is the item-2 additive win.
   ResidencyPolicy residency_policy() const override {
     ResidencyPolicy p;
-    p.release_host_weights_after_upload = false;  // retained today
+    p.release_host_weights_after_upload = true;   // freed after Marlin build (today)
     p.uses_device_memory_pool = true;             // qwen3_5.cpp DevicePool
     p.device_pool_cap_bytes = 0;                  // uncapped
     return p;

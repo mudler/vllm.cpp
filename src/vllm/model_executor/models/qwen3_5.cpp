@@ -417,6 +417,7 @@ class DevicePool {
       if (it != free_.end() && !it->second.empty()) {
         void* p = it->second.back();
         it->second.pop_back();
+        retained_ -= key;
         ++hits_;
         return p;
       }
@@ -424,9 +425,29 @@ class DevicePool {
     }
     return b.Alloc(key);
   }
+  // Uncapped retention (deliberately-retained cross-step buffers: the device
+  // logits / MTP hidden handed off via a shared_ptr deleter). Bytes are always
+  // returned to the free list — the cross-step buffers are not cap-evicted.
   void Put(size_t bytes, void* p) {
     const size_t key = ClassOf(bytes);
     std::lock_guard<std::mutex> lk(mu_);
+    retained_ += key;
+    free_[key].push_back(p);
+  }
+  // Cap-aware retention for the high-frequency forward scratch (DBuf). The soft
+  // cap comes from the platform's residency_policy().device_pool_cap_bytes
+  // (BACKEND-PLATFORM item 2). cap == 0 is UNCAPPED — the identical fast path as
+  // the uncapped Put above and thus behavior-preserving on GB10 (cap 0 today).
+  // When a discrete GPU sets a bound, scratch over the cap is freed to the driver
+  // rather than pooled, so the reuse pool self-limits without a model edit.
+  void Put(Backend& b, size_t bytes, void* p, size_t cap) {
+    const size_t key = ClassOf(bytes);
+    std::lock_guard<std::mutex> lk(mu_);
+    if (cap != 0 && retained_ + key > cap) {
+      b.Free(p);
+      return;
+    }
+    retained_ += key;
     free_[key].push_back(p);
   }
 
@@ -461,12 +482,33 @@ class DevicePool {
 
   std::mutex mu_;
   std::unordered_map<size_t, std::vector<void*>> free_;
+  size_t retained_ = 0;  // bytes (class-rounded) held in free_, for the soft cap
   std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> misses_{0};
 };
 
 DevicePool& Pool() {
   static DevicePool p;
+  return p;
+}
+
+// The device-scratch residency policy (BACKEND-PLATFORM item 2), resolved from
+// the running device's platform (per-object: keyed on the DBuf's own
+// device.type, NOT the process-global CurrentPlatform). The DevicePool soft cap
+// is now platform data, not an inline constant — a discrete GPU sets a bound and
+// this file is unchanged. Memoized in a function-local static because DBuf is a
+// per-op hot path and the process runs on ONE device (all DBufs share it), so the
+// virtual dispatch is paid exactly once; platforms are fixed at static
+// registration, so the value never changes afterward.
+struct DevicePoolPolicy {
+  size_t cap_bytes = 0;  // residency_policy().device_pool_cap_bytes (0 == uncapped)
+};
+DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
+  static const DevicePoolPolicy p = [&] {
+    const auto rp =
+        vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
+    return DevicePoolPolicy{rp.device_pool_cap_bytes};
+  }();
   return p;
 }
 
@@ -596,26 +638,32 @@ class DBuf {
     for (int64_t s : shape) numel *= s;
     bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
     alloc_bytes_ = bytes_ == 0 ? 1 : bytes_;
+    // Device-scratch soft cap comes from the platform residency policy
+    // (BACKEND-PLATFORM item 2), not an inline constant. 0 == uncapped (GB10
+    // today) ⇒ pool behavior is byte-for-byte unchanged.
+    cap_ = ResolveDevicePoolPolicy(d).cap_bytes;
     p_ = Pool().Get(*b_, alloc_bytes_);
     t_ = MakeTensor(p_, dt, d.q.device, shape);
     if (host != nullptr) b_->Copy(d.q, p_, host, bytes_);
   }
-  ~DBuf() { if (p_ != nullptr) Pool().Put(alloc_bytes_, p_); }
+  ~DBuf() { if (p_ != nullptr) Pool().Put(*b_, alloc_bytes_, p_, cap_); }
   DBuf(const DBuf&) = delete;
   DBuf& operator=(const DBuf&) = delete;
   // Movable so device-resident block helpers can RETURN a DBuf (the buffer
   // ownership transfers; the moved-from buffer is not returned to the pool).
   DBuf(DBuf&& o) noexcept
-      : b_(o.b_), p_(o.p_), bytes_(o.bytes_), alloc_bytes_(o.alloc_bytes_), t_(o.t_) {
+      : b_(o.b_), p_(o.p_), bytes_(o.bytes_), alloc_bytes_(o.alloc_bytes_),
+        cap_(o.cap_), t_(o.t_) {
     o.p_ = nullptr;
   }
   DBuf& operator=(DBuf&& o) noexcept {
     if (this != &o) {
-      if (p_ != nullptr) Pool().Put(alloc_bytes_, p_);
+      if (p_ != nullptr) Pool().Put(*b_, alloc_bytes_, p_, cap_);
       b_ = o.b_;
       p_ = o.p_;
       bytes_ = o.bytes_;
       alloc_bytes_ = o.alloc_bytes_;
+      cap_ = o.cap_;
       t_ = o.t_;
       o.p_ = nullptr;
     }
@@ -647,6 +695,7 @@ class DBuf {
   void* p_ = nullptr;
   size_t bytes_ = 0;
   size_t alloc_bytes_ = 0;
+  size_t cap_ = 0;  // device-pool soft cap from residency_policy() (0 == uncapped)
   Tensor t_;
 };
 
@@ -3773,24 +3822,32 @@ void BuildMoeMarlinResident(Dev d, const MoeBlockWeights& w, const HfConfig& cfg
   // item 2) for the dominant host consumer; see
   // .agents/specs/moe-marlin-host-free.md.
   //
-  // GUARD: the VT_NVFP4_MARLIN=0 wmma fallback (MoeBlockFusedCuda) re-reads these
-  // host bytes via ResidentNvfp4. Freeing is safe iff that path can never run in
-  // this process. MarlinMoeEnabled() is a process-static const and is TRUE here
-  // by construction (BuildMoeMarlinResident is reached only from
-  // MoeBlockFusedMarlinCuda, itself gated on MarlinMoeEnabled()); the explicit
-  // re-check enforces the invariant and gates the host free on the Marlin
-  // resident being the committed path (never the shared-expert bytes, which the
-  // forward still reads every step).
+  // POLICY vs KERNEL-PATH split (BACKEND-PLATFORM item 2): the two questions are
+  // ORTHOGONAL. (a) WHETHER the platform frees host weight bytes after the device
+  // upload is the residency POLICY — read from
+  // GetPlatform(d.q.device.type).residency_policy().release_host_weights_after_upload
+  // (true on GB10/CUDA today, so identical behavior; a discrete GPU or a future
+  // retain-host platform flips it with NO edit here). (b) WHETHER Marlin is the
+  // committed compute path is the KERNEL gate MarlinMoeEnabled(): the
+  // VT_NVFP4_MARLIN=0 wmma fallback (MoeBlockFusedCuda) re-reads these host bytes
+  // via ResidentNvfp4, so freeing is safe ONLY when that path can never run.
+  // MarlinMoeEnabled() is a process-static const and TRUE here by construction
+  // (BuildMoeMarlinResident is reached only from MoeBlockFusedMarlinCuda, itself
+  // gated on MarlinMoeEnabled()); the explicit re-check enforces the invariant.
+  // Only the routed experts' bytes are freed (never the shared-expert bytes, which
+  // the forward still reads every step).
   // Same-binary A/B rollback (default ON): VT_MOE_HOST_FREE=0 retains the host
   // copies on the Marlin compute path, isolating exactly the host-free effect
   // for a peak-PSS A/B without changing the device compute (unlike flipping
   // VT_NVFP4_MARLIN, which also swaps the GEMM path). Process-static like the
-  // Marlin gate.
+  // Marlin gate; consumed as the `host_free_env` override to the platform policy.
   static const bool host_free_on = [] {
     const char* e = std::getenv("VT_MOE_HOST_FREE");
     return !(e != nullptr && e[0] == '0');
   }();
-  const bool release_host = MarlinMoeEnabled() && host_free_on;
+  const bool release_host = vllm::platforms::ShouldReleaseHostWeights(
+      vllm::platforms::GetPlatform(d.q.device.type).residency_policy(),
+      /*marlin_committed=*/MarlinMoeEnabled(), /*host_free_env=*/host_free_on);
   for (int e = 0; e < E; ++e) {
     const size_t se = static_cast<size_t>(e);
     w.expert_gate_fp4[se].d_packed.reset();
@@ -4528,7 +4585,18 @@ static void MaterializeAllDeferredExperts(const Qwen3_5MoeWeights& weights) {
 void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
                                          const HfConfig& config, vt::Queue& queue) {
 #ifdef VT_MARLIN_NVFP4
-  if (queue.device.type != vt::DeviceType::kCUDA || !MarlinMoeEnabled()) {
+  // POLICY vs KERNEL-PATH split (BACKEND-PLATFORM item 2): the per-layer load
+  // interleave + host release runs when (a) the platform's residency POLICY frees
+  // host weights after upload (release_host_weights_after_upload — read per-device
+  // from the queue's platform; true on GB10/CUDA today, false on a retain-host /
+  // CPU platform) AND (b) Marlin is the committed KERNEL path (MarlinMoeEnabled()
+  // — there is a per-layer device build to interleave with and the host-reading
+  // wmma fallback can never run). ShouldInterleaveLoadStream reproduces the old
+  // `queue.device.type != kCUDA || !MarlinMoeEnabled()` gate exactly (CPU/unified
+  // retains ⇒ policy false ⇒ materialize-all), now driven by platform data.
+  if (!vllm::platforms::ShouldInterleaveLoadStream(
+          vllm::platforms::GetPlatform(queue.device.type).residency_policy(),
+          /*marlin_committed=*/MarlinMoeEnabled())) {
     // Not the committed Marlin path — no per-layer device build to interleave
     // with, so materialize any deferred experts to host for the wmma/CPU forward.
     MaterializeAllDeferredExperts(weights);

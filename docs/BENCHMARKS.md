@@ -958,6 +958,32 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Residency as a consumed `Platform::residency_policy()` capability (2026-07-19,
+  extensibility item 2, `BACKEND-PLATFORM` / `CLAIM-BACKEND-PLATFORM-2`).** A
+  behavior-preserving refactor: the MoE host-weight-release, per-layer load-stream
+  interleave, and device-scratch-pool cap decisions in `qwen3_5.cpp` now READ
+  `GetPlatform(<obj>.device.type).residency_policy()` (per-device) instead of an
+  inline `device.type`/env gate — host-free via `ShouldReleaseHostWeights`,
+  load-stream via `ShouldInterleaveLoadStream` (both `platforms/interface.h`),
+  DevicePool soft cap via `residency_policy().device_pool_cap_bytes`. The residency
+  POLICY comes from the platform; whether Marlin is the committed compute path
+  stays the orthogonal *kernel* gate `MarlinMoeEnabled()`.
+  `CudaPlatform::residency_policy().release_host_weights_after_upload` is flipped
+  false→true (now CONSUMED ⇒ reproduces today's GB10 host-free-after-Marlin-build
+  and the 35B ~4 GiB load-to-ready peak EXACTLY; `VT_MOE_HOST_FREE`/
+  `VT_MOE_LOADSTREAM` stay as rollback overrides). No numeric/kernel/memory-behavior
+  change on GB10 — so **NOT APPLICABLE** to the throughput / latency / memory
+  scoreboard. Verified by the `test_platform` residency-consumption cases (7 cases /
+  43 assertions), clean CPU `-Werror` build, full CPU CTest (126/126 in isolation;
+  8 HTTP/engine/threadpool tests were `-j nproc` port/resource timeouts, all pass
+  isolated), tools 164/164. **DGX behavior-preserving gate PASSED** (`~/work/vllm.cpp-residency-policy`
+  @ `62fc0e0`, production flags CUTLASS sm120a + FA2 sm_121a + Triton AOT verified,
+  one flock): clean CUDA `-Werror` 0 warn; 27B **235/235** + 35B **315/315**
+  token-exact; **35B load-to-ready peak RSS (VmHWM) 4,201,632 KB ≈ 4.0 GiB — the
+  ENG-MOE-LOADSTREAM ~4.19 GiB load-stream win PRESERVED**; `compute-sanitizer
+  memcheck` 35B **0 errors / 315**. Additive win: a new (discrete) GPU sets
+  `residency_policy()` field values with zero model-code edits.
+
 - **Attention-backend registry + Platform-driven priority (2026-07-19,
   extensibility item 4, `BACKEND-ATTN-REGISTRY` / `CLAIM-ATTN-REGISTRY-1`).** A
   behavior-preserving, engine-level SELECTION refactor: *which* `AttentionBackend`

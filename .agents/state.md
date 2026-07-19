@@ -13486,3 +13486,42 @@ portable glue-fusion track stay the roadmap_v1 35B priority.
 Re-grid `5a679d6`, evidence `dgx:~/work/vllm.cpp-online-gate/evidence/5a679d65d35cb436aa4c31a4263406d33738d824/summary-35` (ratios.json sha256 `3a52980d…`); 12/12 eligible, **70/124 (+13)**. Per-conc: c1 2/20 (tput 0.978/tpot 0.983), c2 0/20 (0.965/0.969), **c4 16/20 (1.019/1.051 — FLIPPED to WIN)**, c8 16/20 (1.061/1.128), c16 16/20 (1.068/1.152), c32 16/20 (1.090/1.176), mem 4/4. The aux-stream overlap wins every concurrency in-situ (c1 -5.6% → c32 -1.5%) → c4 flipped, c8-c32 gained, c1/c2 close.
 - **35B now: c4-c32 ALL WIN vLLM (decode+throughput), memory beats vLLM, only c1/c2 residual (~0.96-0.98, within 2-4%).** Campaign 19→70.
 - Next 35B engine lever (glue-fusion track): extend the merged-QKV / merged-gate_up projection fusion to the 35B FP8 path (MergedQkvEligible is fp4-only, qwen3_5.cpp:1720; G1 GDN qkv/z/b/a 30 layers + F1 full-attn qkv 10 layers un-merged only because the merge is quant-arch-gated) — collapses the un-merged projection fans into single kernels (fewer launches + better SM fill at M=1), targeting the c1/c2 low-batch launch overhead. Portable ([[fusion-must-be-portable-reuse-patterns]]). Plus remaining aux-stream slices (routed/attention/prefill).
+
+## 2026-07-19 — 35B ENGINE LEVER (glue-fusion track): FP8 merged-QKV projection IMPLEMENTED opt-in (`CLAIM-FP8-MERGED-QKV-1`, `KERNEL-GEMM-FP8`)
+
+Picked up the exact "next 35B engine lever" recorded above: extend the fp4-only
+merged-QKV projection fusion to the 35B FP8 W8A8 full-attn path (the 10 full-attn
+layers ran Q/K/V as 3 separate `MatmulFp8Cutlass` GEMMs; the fp4 27B path already
+merges them). Goal: ONE fp8 GEMM over the N-concatenated operand + split (30→10
+attn-QKV GEMMs/step) to cut the M=1 decode launch/heuristic overhead behind the
+last 35B c1/c2 residual (~2-4%).
+
+**KEY FINDING (refines the lever brief).** The brief assumed "concat weights +
+ONE fp8 GEMM + split = byte-identical, just extend the dtype gate". That premise
+does NOT hold as-is: the 35B fp8 weights are PER-TENSOR scaled (one scalar
+`weight_scale` + folded `alpha = input_scale*weight_scale` per `Fp8Weight`),
+unlike fp4's per-block scales that concatenate losslessly under one global alpha.
+A single-scalar-alpha GEMM over the concatenated Q/K/V weight is therefore
+incorrect. Two faithful realizations: (A) per-column dequant — concat RAW fp8
+bytes, GEMM `alpha=1`, apply each shard's folded scalar per output column (byte-
+exact to our separate path, needs a per-column scale op); (B) vLLM's
+`requantize_with_max_scale` (per-tensor mirror, NOT byte-exact vs separate, needs
+an fp8 requant pass). CHOSE (A): least numerics risk, mirrors the fp4 per-column
+philosophy, no fp8 host encoder.
+
+**Implemented (test-first).** NEW `vt::MulColVecF32` op (`x[m,n]*=col[n]`, f32,
+honors padded row stride) across ops.h/ops.cpp/cpu_ops.cpp/cuda_glue.cu; model
+glue `ResidentFp8Qkv` (byte-concat + resident per-column alpha), `MergedFp8QkvD`
+(one `MatmulFp8CublasLt` alpha=1 + `MulColVecF32`), `MergedFp8QkvEnabled`/
+`MergedFp8QkvEligible` (`VT_FP8_MERGED_QKV` opt-in), the fp8 branch in
+`ProjectFullAttnQkv` (row-strided Q/K/V views, gated on `packed_consumers` so only
+the fused attn preamble consumes them), resident fields in `qwen3_5_weights.h`.
+Byte-exact CPU tests in `test_ops_glue.cpp`.
+
+**Gates.** CPU GREEN (dev box `-DVLLM_CPP_CUDA=OFF`): clean build, `test_ops_glue`
+10/10 (2 new byte-exact MulColVecF32), `test_ops_fp8_cutlass` 6/6, `test_ops_matmul`
+7/7. **DGX PENDING** (crux — c1/c2 needs GB10): build current-main+branch, byte-exact
+`merged==separate`, 35B 315/315 (default OFF + ON arm) + 27B 235/235 (inert),
+in-situ c1/c2/c4 A/B, memcheck, one flock. Flip default-ON iff byte/token-exact +
+faster, else opt-in honest. Follow-up slice: GDN qkvz/BA fp8 merge (30 layers;
+same primitive, extra output-dtype split). Spec: `.agents/specs/fp8-merged-qkv-projection.md`.

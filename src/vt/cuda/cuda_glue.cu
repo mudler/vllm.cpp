@@ -80,6 +80,29 @@ void CastF32KernelCuda(Queue& q, Tensor& out, const Tensor& in) {
   Check(cudaGetLastError(), "cast_f32 launch");
 }
 
+// mul_col_vec_f32: x[m,n] *= col[n]. x f32 [M,N] with row stride row_stride
+// (inner-contiguous rows), col f32 [N]. Thread per logical element (flat over
+// M*N); recover (row,col-index) and apply the broadcast column scalar.
+__global__ void MulColVecF32Kernel(float* x, const float* col, int64_t n_elem,
+                                   int64_t row_size, int64_t row_stride) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n_elem; i += step) {
+    const int64_t row = i / row_size;
+    const int64_t c = i - row * row_size;
+    x[row * row_stride + c] *= col[c];
+  }
+}
+
+void MulColVecF32KernelCuda(Queue& q, Tensor& x, const Tensor& col) {
+  const int64_t rows = x.shape[0], row_size = x.shape[1];
+  const int64_t n_elem = rows * row_size;
+  if (n_elem == 0) return;
+  MulColVecF32Kernel<<<GridFor(n_elem), kBlock, 0, AsStream(q)>>>(
+      x.Ptr<float>(), col.Ptr<float>(), n_elem, row_size, x.stride[0]);
+  Check(cudaGetLastError(), "mul_col_vec_f32 launch");
+}
+
 // ---------------------------------------------------------------------------
 // attn_gate_split: qgate [T, Hq*2*Dh] -> q_out/gate_out [T,Hq,Dh]. Thread per
 // output element (flat index over T*Hq*Dh); (i,h,d) recovered from it.
@@ -290,6 +313,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16KernelCuda)));
     RegisterOp(OpId::kCastF32, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastF32KernelCuda)));
+    RegisterOp(OpId::kMulColVecF32, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MulColVecF32Fn>(&MulColVecF32KernelCuda)));
     RegisterOp(OpId::kAttnGateSplit, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<AttnGateSplitFn>(&AttnGateSplitKernelCuda)));
     RegisterOp(

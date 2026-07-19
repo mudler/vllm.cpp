@@ -78,6 +78,25 @@ re-measures the in-situ effect; characterize the c4 TTFT lottery vs run-noise.
 `benchmark_binding=false` for these levers — no isolated speed credit; the grid owns
 the in-situ number.
 
+### 35B FP8 merged-QKV projection (2026-07-19, `CLAIM-FP8-MERGED-QKV-1`) — PENDING DGX
+
+Component (NOT binding). Extends the fp4-only merged-QKV fusion to the 35B FP8
+W8A8 full-attn path: ONE fp8 GEMM over the N-concatenated Q/K/V operand + per-
+column dequant (`vt::MulColVecF32`) replacing 3 separate per-shard GEMMs (10
+attn layers, 30→10 attn-QKV GEMMs/step). `VT_FP8_MERGED_QKV` opt-in.
+
+Disposition: **PENDING**. CPU gates GREEN (`test_ops_glue` 10/10 incl. 2 new
+byte-exact MulColVecF32, `test_ops_fp8_cutlass` 6/6, `test_ops_matmul` 7/7,
+clean `-Werror`). DGX gate NOT YET RUN — required before any number or flip:
+(1) byte-exact `merged == separate` on the 35B q/k/v shapes at M=1 (else the
+315/315 token gate is the correctness bar); (2) 35B 315/315 (default OFF +
+`VT_FP8_MERGED_QKV=1` arm) + 27B 235/235 (fp8-gated, 27B inert); (3) in-situ
+same-binary 35B c1/c2/c4 TPOT A/B (`VT_FP8_MERGED_QKV` on/off) + c8+ neutral;
+(4) memcheck. Repro: build current-main + branch `kernel-gemm-fp8-merged-qkv`
+with `-DVLLM_CPP_CUTLASS_DIR=$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON`,
+one `flock /tmp/gpu`. Flip default-ON iff byte/token-exact + faster c1/c2; else
+land opt-in honest.
+
 ### 35B PREFILL GDN conv-fwd + fused post-conv kernel efficiency (2026-07-18, `CLAIM-GDN-PREFILL-CONV-1`) — bit-exact, conv modest win / post-conv opt-in
 
 Component (NOT binding): the prefill `causal_conv1d` forward

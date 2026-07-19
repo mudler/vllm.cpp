@@ -65,6 +65,48 @@ TEST_CASE("cast_f32: bf16 -> f32 widens each element") {
 }
 
 // ---------------------------------------------------------------------------
+// mul_col_vec_f32: x[m,n] *= col[n]. The per-column dequant for the merged fp8
+// QKV projection (one GEMM at alpha=1, then each shard's folded scalar applied
+// per output column). Exact f32 multiply, so byte-identical to scaling each
+// slice by its scalar.
+TEST_CASE("mul_col_vec_f32: scales each column by its scalar") {
+  const int64_t M = 3, N = 4;
+  std::vector<float> x = {1.0f, 2.0f, 3.0f, 4.0f,
+                          5.0f, 6.0f, 7.0f, 8.0f,
+                          9.0f, 10.0f, 11.0f, 12.0f};
+  std::vector<float> col = {0.5f, 2.0f, -1.0f, 0.25f};
+  std::vector<float> ref(x.size());
+  for (int64_t m = 0; m < M; ++m)
+    for (int64_t n = 0; n < N; ++n) ref[m * N + n] = x[m * N + n] * col[n];
+  Tensor tx = F32(x, {M, N});
+  Tensor tc = F32(col, {N});
+  Queue q = Q();
+  vt::MulColVecF32(q, tx, tc);
+  for (size_t i = 0; i < x.size(); ++i) CHECK(x[i] == ref[i]);  // exact
+}
+
+// mul_col_vec_f32 on a ROW-STRIDED view (the real merged-QKV case: x is a
+// [M,Ntot] buffer whose logical N is a shard slice, but here we exercise a padded
+// row stride to prove the kernel honors stride[0] and only touches [0,N) cols).
+TEST_CASE("mul_col_vec_f32: honors padded row stride") {
+  const int64_t M = 2, N = 3, RS = 5;  // 5-wide rows, only first 3 cols scaled
+  std::vector<float> buf(static_cast<size_t>(M) * RS, -7.0f);  // sentinel pad
+  for (int64_t m = 0; m < M; ++m)
+    for (int64_t n = 0; n < N; ++n) buf[m * RS + n] = static_cast<float>(m * 10 + n + 1);
+  std::vector<float> col = {3.0f, 0.5f, -2.0f};
+  Tensor tx = Tensor::Contiguous(buf.data(), DType::kF32, Cpu(), {M, RS});
+  tx.shape[1] = N;  // logical N < row stride (strided packed view)
+  Tensor tc = F32(col, {N});
+  Queue q = Q();
+  vt::MulColVecF32(q, tx, tc);
+  for (int64_t m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; ++n)
+      CHECK(buf[m * RS + n] == static_cast<float>(m * 10 + n + 1) * col[n]);
+    for (int64_t n = N; n < RS; ++n) CHECK(buf[m * RS + n] == -7.0f);  // pad intact
+  }
+}
+
+// ---------------------------------------------------------------------------
 // attn_gate_split: qgate [T, Hq*2*Dh] -> q_out/gate_out [T,Hq,Dh].
 //   T=2, Hq=2, Dh=2. Row layout per (t,hq): [q0 q1 | g0 g1].
 TEST_CASE("attn_gate_split: splits [q|gate] per head") {

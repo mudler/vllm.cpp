@@ -1197,6 +1197,19 @@ void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
   });
 }
 
+// x[m,n] *= col[n]; x f32 [M,N] (inner-contiguous rows, row stride x.stride[0]),
+// col f32 [N]. CPU sibling of the CUDA MulColVecF32 kernel.
+void MulColVecF32Kernel(Queue&, Tensor& x, const Tensor& col) {
+  const int64_t m = x.shape[0], n = x.shape[1], rs = x.stride[0];
+  const float* c = col.Ptr<float>();
+  ForRows(m, [&](int64_t r0, int64_t r1) {
+    for (int64_t i = r0; i < r1; ++i) {
+      float* row = x.Ptr<float>() + i * rs;
+      for (int64_t j = 0; j < n; ++j) row[j] *= c[j];
+    }
+  });
+}
+
 // Split fused [T, Hq*2*Dh] q/gate projection into q_out/gate_out [T,Hq,Dh].
 void AttnGateSplitKernel(Queue&, Tensor& q_out, Tensor& gate_out, const Tensor& qgate) {
   const int64_t t = q_out.shape[0], hq = q_out.shape[1], dh = q_out.shape[2];
@@ -1524,6 +1537,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16Kernel)));
     RegisterOp(OpId::kCastF32, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastF32Kernel)));
+    RegisterOp(OpId::kMulColVecF32, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MulColVecF32Fn>(&MulColVecF32Kernel)));
     RegisterOp(OpId::kAttnGateSplit, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AttnGateSplitFn>(&AttnGateSplitKernel)));
     RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kCPU,

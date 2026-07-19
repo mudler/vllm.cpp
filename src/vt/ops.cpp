@@ -1539,6 +1539,21 @@ void CastF32(Queue& q, Tensor& out, const Tensor& in) {
   reinterpret_cast<CastF32Fn>(GetOp(OpId::kCastF32, q.device.type))(q, out, in);
 }
 
+void MulColVecF32(Queue& q, Tensor& x, const Tensor& col) {
+  VT_CHECK(x.dtype == DType::kF32, "mul_col_vec_f32: x must be f32");
+  VT_CHECK(col.dtype == DType::kF32, "mul_col_vec_f32: col must be f32");
+  VT_CHECK(x.rank == 2, "mul_col_vec_f32: x must be rank-2 [M,N]");
+  VT_CHECK(col.rank == 1, "mul_col_vec_f32: col must be rank-1 [N]");
+  VT_CHECK(col.shape[0] == x.shape[1],
+           "mul_col_vec_f32: col length must equal x columns");
+  VT_CHECK(x.stride[1] == 1 && x.stride[0] >= x.shape[1],
+           "mul_col_vec_f32: x rows must be inner-contiguous");
+  VT_CHECK(col.IsContiguous(), "mul_col_vec_f32: col must be contiguous");
+  VT_CHECK(x.device == q.device && col.device == q.device,
+           "mul_col_vec_f32: device mismatch (x/col/queue)");
+  reinterpret_cast<MulColVecF32Fn>(GetOp(OpId::kMulColVecF32, q.device.type))(q, x, col);
+}
+
 void AttnGateSplit(Queue& q, Tensor& q_out, Tensor& gate_out, const Tensor& qgate) {
   VT_CHECK(q_out.rank == 3 && gate_out.rank == 3, "attn_gate_split: q_out/gate_out rank-3 [T,Hq,Dh]");
   VT_CHECK(qgate.rank == 2, "attn_gate_split: qgate rank-2 [T, Hq*2*Dh]");

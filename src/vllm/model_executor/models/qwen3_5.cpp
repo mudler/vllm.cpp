@@ -1231,6 +1231,133 @@ DBuf MatmulFp8CutlassPreQuantD(Dev d, const Tensor& a_fp8, const Fp8Weight& w, D
   return dout;
 }
 
+// --- Merged FP8 QKVParallelLinear (VT_FP8_MERGED_QKV, opt-in). The FP8 (W8A8)
+// analog of the fp4 MergedQkvCutlassD/ResidentNvfp4Qkv pair above: vLLM loads the
+// three logical Q/K/V shards into ONE QKVParallelLinear parameter and runs one
+// GEMM before splitting (`qwen3_5.py:279-288`, `linear.py:942-1050`). Our fp8
+// path stored per-tensor scales and ran three SEPARATE per-shard GEMMs; here we
+// N-concatenate the RAW fp8 bytes into one [Nq+Nk+Nv,K] operand and run ONE fp8
+// GEMM. Unlike fp4 (per-block scales that concatenate losslessly), fp8 here is
+// PER-TENSOR scaled — each shard has its own folded alpha (= shared input_scale *
+// that shard's weight_scale). We therefore run the merged GEMM with alpha=1 (raw
+// f32 accumulation) and apply each output column's shard alpha via the resident
+// per-column vector (vt::MulColVecF32). Because the three shards share one
+// input_scale (guarded), the activation quant is identical across them, so this
+// is byte-identical to the three separate MatmulFp8CutlassD/PreQuantD GEMMs when
+// the GEMM's per-column accumulation matches (the alpha multiply is the same IEEE
+// f32 op the folded-alpha GEMM would apply). Fewer launches + a larger-N GEMM
+// fills the SMs better at M=1 (the 35B c1/c2 decode residual).
+struct Fp8QkvDev {
+  Tensor packed;     // i8 [Nq+Nk+Nv, K] raw e4m3fn (K contiguous)
+  Tensor alpha_vec;  // f32 [Nq+Nk+Nv]  per-column folded alpha (input_scale*wscale)
+  int64_t qn = 0, kn = 0, vn = 0;
+};
+
+// Build (lazily, once) the resident N-concatenated fp8 QKV operand + per-column
+// alpha vector. Mirrors ResidentNvfp4Qkv's byte-concatenation (no swizzle: the
+// raw fp8 weight is read in [N,K] orientation directly by the fp8 GEMM).
+Fp8QkvDev ResidentFp8Qkv(Dev d, const FullAttnLayerWeights& w) {
+  const Fp8Weight& q = w.q_proj_fp8;
+  const Fp8Weight& k = w.k_proj_fp8;
+  const Fp8Weight& v = w.v_proj_fp8;
+  VT_CHECK(!q.Empty() && !k.Empty() && !v.Empty(),
+           "qwen3_5 packed FP8 QKV: empty logical shard");
+  VT_CHECK(q.k == k.k && q.k == v.k,
+           "qwen3_5 packed FP8 QKV: logical shard K mismatch");
+  const int64_t inner_k = q.k;
+  const int64_t total_n = q.n + k.n + v.n;
+  const size_t qpb = q.packed.bytes.size();
+  const size_t kpb = k.packed.bytes.size();
+  const size_t vpb = v.packed.bytes.size();
+  VT_CHECK(qpb == static_cast<size_t>(q.n * inner_k) &&
+               kpb == static_cast<size_t>(k.n * inner_k) &&
+               vpb == static_cast<size_t>(v.n * inner_k),
+           "qwen3_5 packed FP8 QKV: packed shard byte mismatch");
+
+  if (!w.d_qkv_fp8_packed || !w.d_qkv_fp8_alpha) {
+    VT_CHECK(!w.d_qkv_fp8_packed && !w.d_qkv_fp8_alpha,
+             "qwen3_5 packed FP8 QKV: partial resident state");
+    Backend* backend = &d.b;
+    void* packed_data = d.b.Alloc(qpb + kpb + vpb);
+    std::shared_ptr<void> packed_owner(
+        packed_data, [backend](void* pointer) { backend->Free(pointer); });
+    auto* dst = static_cast<uint8_t*>(packed_data);
+    d.b.Copy(d.q, dst, q.packed.bytes.data(), qpb);
+    d.b.Copy(d.q, dst + qpb, k.packed.bytes.data(), kpb);
+    d.b.Copy(d.q, dst + qpb + kpb, v.packed.bytes.data(), vpb);
+
+    std::vector<float> alpha_host(static_cast<size_t>(total_n));
+    std::fill(alpha_host.begin(), alpha_host.begin() + q.n, q.alpha);
+    std::fill(alpha_host.begin() + q.n, alpha_host.begin() + q.n + k.n, k.alpha);
+    std::fill(alpha_host.begin() + q.n + k.n, alpha_host.end(), v.alpha);
+    void* alpha_data = d.b.Alloc(static_cast<size_t>(total_n) * sizeof(float));
+    std::shared_ptr<void> alpha_owner(
+        alpha_data, [backend](void* pointer) { backend->Free(pointer); });
+    d.b.Copy(d.q, alpha_data, alpha_host.data(),
+             alpha_host.size() * sizeof(float));
+
+    w.d_qkv_fp8_packed = std::move(packed_owner);
+    w.d_qkv_fp8_alpha = std::move(alpha_owner);
+  }
+
+  return Fp8QkvDev{
+      MakeTensor(w.d_qkv_fp8_packed.get(), DType::kI8, d.q.device,
+                 {total_n, inner_k}),
+      MakeTensor(w.d_qkv_fp8_alpha.get(), DType::kF32, d.q.device, {total_n}),
+      q.n, k.n, v.n};
+}
+
+bool MergedFp8QkvEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_FP8_MERGED_QKV");
+    return e != nullptr && e[0] != '0';  // DEFAULT OFF (opt-in) until gated
+  }();
+  return on;
+}
+
+bool MergedFp8QkvEligible(const FullAttnLayerWeights& w, Dev d,
+                          bool packed_consumers) {
+  const Fp8Weight& q = w.q_proj_fp8;
+  const Fp8Weight& k = w.k_proj_fp8;
+  const Fp8Weight& v = w.v_proj_fp8;
+  // packed_consumers: the merged output exposes row-strided Q/K/V views, which
+  // only the fused attn preamble consumes correctly (the split AttnGateSplit path
+  // assumes contiguous rows). Shared per-tensor input_scale is required: the
+  // merged GEMM quantizes the activation ONCE, so all three shards must read the
+  // same activation scale (the real 35B q/k/v do; QKVParallelLinear is one input).
+  return packed_consumers && MergedFp8QkvEnabled() &&
+         d.q.device.type == vt::DeviceType::kCUDA && !q.Empty() && !k.Empty() &&
+         !v.Empty() && q.k == k.k && q.k == v.k &&
+         q.input_scale == k.input_scale && q.input_scale == v.input_scale;
+}
+
+// ONE fp8 GEMM over the N-concatenated QKV operand -> f32 [M,Nq+Nk+Nv]; the
+// per-column alpha applies each shard's folded scalar. h_fp8 is the shared
+// pre-quantized activation (quantize-once) when supplied, else quantize here
+// with the shared input_scale. Same GEMM backend as MatmulFp8CutlassD.
+DBuf MergedFp8QkvD(Dev d, const Tensor& x, const Tensor* h_fp8,
+                   const FullAttnLayerWeights& w) {
+  Fp8QkvDev qkv = ResidentFp8Qkv(d, w);
+  const int64_t total_n = qkv.qn + qkv.kn + qkv.vn;
+  const int64_t M = x.shape[0];
+  DBuf out(d, DType::kF32, {M, total_n});
+  const float one = 1.0F;
+  const Tensor* a_fp8_p = h_fp8;
+  std::optional<DBuf> a_fp8_owner;
+  if (a_fp8_p == nullptr) {
+    const int64_t K = x.shape[1];
+    a_fp8_owner.emplace(d, DType::kI8, std::vector<int64_t>{M, K});
+    vt::QuantFp8Static(d.q, a_fp8_owner->t(), x, w.q_proj_fp8.input_scale);
+    a_fp8_p = &a_fp8_owner->t();
+  }
+  if (DenseCublasLtFp8Enabled())
+    vt::MatmulFp8CublasLt(d.q, out.t(), *a_fp8_p, qkv.packed, one);
+  else
+    vt::MatmulFp8Cutlass(d.q, out.t(), *a_fp8_p, qkv.packed, one);
+  vt::MulColVecF32(d.q, out.t(), qkv.alpha_vec);
+  return out;
+}
+
 // FUSE fp8 RMSNorm -> static quant + quantize-once (35B W8A8): fold the input-
 // layernorm (residual-add + gemma RMSNorm) and the shared activation's fp8 quant
 // into ONE pass (vt::RmsNormQuantFp8, mirror vLLM Inductor
@@ -1828,6 +1955,23 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
     return out;
   }
 #endif
+
+  // Merged FP8 QKVParallelLinear (opt-in): ONE fp8 GEMM over the N-concatenated
+  // operand + per-column alpha, then row-strided views (mirror the fp4 branch).
+  // The F32 output matches the split fp8 path's F32 q/k/v (kF32 below).
+  if (fp8 && MergedFp8QkvEligible(w, d, packed_consumers)) {
+    out.packed_owner.emplace(MergedFp8QkvD(d, h, h_fp8, w));
+    Tensor all = out.packed_owner->t();
+    const int64_t qn = w.q_proj_fp8.n;
+    const int64_t kn = w.k_proj_fp8.n;
+    const int64_t vn = w.v_proj_fp8.n;
+    VT_CHECK(all.shape[1] == qn + kn + vn,
+             "qwen3_5 packed FP8 QKV: output shape mismatch");
+    out.qgate = all.Slice(1, 0, qn);
+    out.key = all.Slice(1, qn, qn + kn);
+    out.value = all.Slice(1, qn + kn, qn + kn + vn);
+    return out;
+  }
 
   // Split reference: quantize the shared activation once when the three input
   // divisors are equal, then retain one independently-scaled GEMM per shard.

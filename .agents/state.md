@@ -13746,6 +13746,42 @@ in vLLM's scheduler mechanism, to name the lever. Evidence
 (Orchestration note: the grid script exits rc=1 on any "not 124/124" gate — that is
 the gate verdict, NOT a run failure; both grids collected full data + summaries.)
 
+## 2026-07-19 — prefill-TTFT attribution CLOSED; 35B banked; roadmap_v1 pivots to the FUSION FRAMEWORK (ORDER-1)
+
+**Attribution (tasks #61/#62).** Full-step nsys both sides: 35B prefill is **99.4%
+GPU-BUSY** — NOT host/scheduling (the concurrency→scheduling prior was measured FALSE;
+the 43%-busy first trace was autotune/repack warmup). ~71% real compute at parity
+(Marlin MoE / FLA GDN / fp8 dense / flash-attn — same backends on GB10); the residual
+~20% is norm/quant/act GLUE we run as separate kernels vs vLLM Inductor combo_kernels
+fusion, a **~3.5%/step ceiling @ c1** (35B c1 190 vs 183 ms; 27B c1 ours-faster). The
+MIXED-step piecewise-cudagraph lever was SIZED and REJECTED (mixed steps 98.5-99.6%
+busy, ≤1.4% recoverable, flips 0 axes — our C++ async runner already keeps the GPU fed
+eagerly, doing what vLLM needs the graph for).
+
+**Fusion experiment (task #63, user-directed bounded).** One fold landed byte-exact
+default-ON — `RmsNormGatedQuantFp8` (`a83d93a`, folds 35B GDN out_proj fp8-quant into
+the gated-RMSNorm store): isolated chain −28.7%, in-situ TTFT c1 −1.4%/c2 −1.3%, zero
+regression, 315/315+235/235. Verdict: each clean fold ~1% TTFT, the big remaining glue
+kernels (MoeCombineGate/SiluAndMul) already match vLLM → fusion CANNOT cover the 3-14%
+tail gap. User chose KEEP the clean fold, STOP the push. **35B is banked: decode at/
+beyond parity everywhere + memory 4/4 + throughput WIN; prefill-TTFT is a compute-bound
+residual with no large closer.**
+
+**Roadmap_v1 pivot (user-directed).** Re-read AGENTS.md (gate #64). The user elevated
+the **PORTABLE AUTOMATIC OP-FUSION FRAMEWORK** to roadmap_v1 ORDER-1 and framed it as the
+EXTENSIBILITY-refactor cornerstone (declare-once/realize-per-backend = additive models/
+GPUs + mechanical upstream-sync — "apply it everywhere and port upstream PRs automatically
+rather than chasing small changes"). SPIKE written + wired this change:
+`.agents/specs/portable-fusion-framework.md` (`KERNEL-FUSION-FRAMEWORK`, kernel-matrix,
+`SPIKE`; roadmap_v1 ROAD-V1-C1 ORDER-1 head; engine-matrix cross-ref). Key finding: the
+TDR Phase-0 skeleton is ALREADY in-tree (`fused_recipe.h`/`recipes.h` one recipe +
+`OpId::kFusedChain` Tier-0/1 CPU+CUDA + byte-exact `test_ops_fused_chain.cpp`) but
+UNADOPTED + ungeneralized → W0 = adopt-one + backfill, not net-new. Honest: perf ceiling
+~3.5%/step (NOT a perf lever); primary value = extensibility + mechanical sync + CPU/CUDA
+oracle-drift elimination. Incremental W0→W1(generalize POD)→W2(migrate hand-fusions)→
+W3(mechanical-sync proof)→W4(mock-backend additivity)→Wn(honest re-measure). Awaiting user
+review of the spike before W0 implementation.
+
 
 ## 2026-07-19 — First stacked prefill glue-fusion: GDN out_proj gated-RMSNorm → fp8-quant fold (`CLAIM-GDN-OUT-FP8-FUSE-1`)
 

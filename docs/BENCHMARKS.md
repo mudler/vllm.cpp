@@ -24,6 +24,24 @@ the TTFT axes → the TTFT gap is bigger than kernel-glue can close; the concurr
 latency. Active lever: prefill-TTFT full-step attribution (host-side / scheduling vs kernel).
 Evidence `dgx:~/work/vllm.cpp-online-gate/evidence/786aa0e…/summary-{27,35}/`.
 
+**Prefill-TTFT attribution CLOSED (2026-07-19, tasks #61/#62) — no further perf lever
+banked.** Full-step nsys (both sides): 35B prefill is **99.4% GPU-BUSY** (not host/
+scheduling — the concurrency-scheduling hypothesis was measured false; mixed steps are
+98.5–99.6% busy, so mixed-step piecewise cudagraph was REJECTED — our C++ async runner
+already keeps the GPU fed). ~71% of prefill is real compute at parity (Marlin MoE / FLA
+GDN / fp8 dense / flash-attn); the residual is ~20% norm/quant/act "glue" we run as
+separate kernels vs vLLM Inductor's fused chains, worth a **~3.5%/step ceiling @ c1**
+(35B c1 190 vs 183 ms; 27B c1 is ours-faster). A one-fold fusion experiment
+(`RmsNormGatedQuantFp8`, `a83d93a`, byte-exact default-ON) confirmed each clean fold is
+~1% TTFT — real but bounded, and the big remaining glue kernels already match vLLM. So
+prefill-TTFT is a compute-bound residual with no large closer; 35B is banked as
+decode-at/beyond-parity + memory/throughput wins. The fusion work now proceeds as the
+roadmap_v1 ORDER-1 **portable op-fusion framework** (`KERNEL-FUSION-FRAMEWORK`, spike
+[portable-fusion-framework.md](../.agents/specs/portable-fusion-framework.md)) —
+justified by EXTENSIBILITY + mechanical upstream-sync, NOT perf (the ceiling above is
+the honest cap; benchmark disposition = the framework must be perf NEUTRAL-OR-BETTER,
+not a speedup claim).
+
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
 reruns on the full production default set (async + vendored Triton GDN decode cubin

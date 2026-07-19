@@ -7,6 +7,14 @@ remain in their own matrices. The inventory audit that established the 26
 code-bearing baselines is recorded in
 [feature-anchor-backfill.md](specs/feature-anchor-backfill.md).
 
+**Cross-ref (roadmap_v1 ORDER-1):** the portable automatic op-fusion framework —
+which binds fusion recipes to forward-pass sites at model build — is tracked as
+`KERNEL-FUSION-FRAMEWORK` in [kernel-matrix.md](kernel-matrix.md) (its evidence
+is per-backend fused-kernel dispatch), spike
+[portable-fusion-framework.md](specs/portable-fusion-framework.md). The build-time
+recipe→site binding surface touches the engine forward, but the row lives in the
+kernel matrix; not duplicated here.
+
 `ANCHOR-BACKFILL` means the named bounded slice has code and tests but still
 lacks its required leaf spike. `PARTIAL` means the implementation is also
 known to omit upstream behavior. Neither state is protocol-complete. A plain

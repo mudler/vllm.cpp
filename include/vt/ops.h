@@ -141,6 +141,7 @@ enum class OpId : uint8_t {
   kAttnQkNormRopeGate,
   kFusedChain,
   kRmsNormQuantFp8,
+  kRmsNormGatedQuantFp8,
   kMatmulBT,
   // W0-only raw-signature probe for the shared drop-in adapter boundary. It is
   // not a production kernel-family migration.
@@ -346,6 +347,9 @@ using QuantFp8StaticFn = void (*)(Queue&, Tensor&, const Tensor&, float);
 using RmsNormQuantFp8Fn = void (*)(Queue&, Tensor& /*out_fp8*/, Tensor* /*out_bf16*/,
                                    const Tensor& /*x*/, const Tensor& /*weight*/,
                                    const RmsNormArgs&, Tensor* /*residual*/, float /*input_scale*/);
+using RmsNormGatedQuantFp8Fn = void (*)(Queue&, Tensor& /*out_fp8*/, const Tensor& /*x*/,
+                                        const Tensor& /*gate*/, const Tensor& /*weight*/,
+                                        const RmsNormGatedArgs&, float /*input_scale*/);
 using SwizzleBlockscaleFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MoeGroupedGemmNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
@@ -652,6 +656,24 @@ void QuantFp8Static(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scal
 void RmsNormQuantFp8(Queue& q, Tensor& out_fp8, Tensor* out_bf16, const Tensor& x,
                      const Tensor& weight, const RmsNormArgs& args, Tensor* residual,
                      float input_scale);
+
+// RmsNormGatedQuantFp8 (fused gated-RMSNorm -> static per-tensor activation quant).
+// The gated-norm analog of RmsNormQuantFp8: the GDN gated-RMSNorm producer emits the
+// fp8 activation DIRECTLY, so the standalone QuantFp8Static pass (and the bf16
+// round-trip that the gated norm otherwise writes then the quant re-reads) disappear.
+// Mirrors vLLM's Inductor fusion of the gated-RMSNorm epilogue with the fp8 activation
+// quant of the following RowParallelLinear (fla layernorm_guard.py RMSNormGated ->
+// out_proj W8A8), the gated sibling of rms_quant_fusion.py's static-fp8 fusion.
+//   var = mean(x^2 over last dim);  n = x * (1/sqrt(var+eps)) * w * act(z);
+//   b = bf16(n);  out_fp8[i] = fp8_e4m3( b * (1/input_scale) )   // RNE hw cvt
+// BIT-IDENTICAL to RmsNormGated(bf16 out, x, gate, weight, args) followed by
+// QuantFp8Static(out_fp8, that bf16, input_scale): the fp8 is taken from the SAME
+// bf16-rounded value the split path already rounds through, and the variance reduction
+// ORDER is the shipped RmsNormGated order (fast d==128 path bit-identical to shipped).
+// out_fp8 same shape as x (rank-2 [rows,D] or rank-3 [T,Hv,D]) i8 (raw fp8-e4m3fn
+// bytes). x/weight float; gate may carry a padded outer (token) stride. CUDA + CPU.
+void RmsNormGatedQuantFp8(Queue& q, Tensor& out_fp8, const Tensor& x, const Tensor& gate,
+                          const Tensor& weight, const RmsNormGatedArgs& args, float input_scale);
 
 // MatmulFp8Cutlass (lift of vLLM cutlass_scaled_mm_sm120_fp8 — the per-tensor
 // W8A8 fp8 GEMM vLLM selects on sm120/GB10). Same math as vLLM's ScaledEpilogue

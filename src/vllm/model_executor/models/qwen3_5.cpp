@@ -2541,6 +2541,29 @@ bool GlueFuseEnabled() {
   return on;
 }
 
+// Prefill glue-fusion (35B GDN out_proj): fold the W8A8 out_proj's static fp8
+// activation quant INTO the gated-RMSNorm output store (vt::RmsNormGatedQuantFp8),
+// removing the standalone QuantFp8Static pass and the bf16 gated-norm output that it
+// would otherwise write then re-read. Byte-identical to the split
+// RmsNormGated(bf16)+QuantFp8Static path (the fp8 is quantized from the SAME bf16
+// value; the gated-norm variance reduction order is unchanged — the fused kernel
+// reproduces RmsNormGatedRowFastKernel's exact reduction). Only the 35B GDN out_proj
+// is W8A8 fp8 (27B's out_proj is W4A4 fp4 and is untouched), so this lever affects
+// the 35B alone — no 27B greedy-razor exposure. DEFAULT ON per the parity-enabler
+// policy (byte-exact + measured-faster: 35B 315/315 both arms, memcheck 0, isolated
+// −28.7% on the gated-norm+out_proj-quant chain — the fused fp8 1-byte store is even
+// cheaper than the unfused gated norm's bf16 store — and in-situ TTFT c1 −1.4% /
+// c2 −1.3% / c8 −0.4%, prefill tput +1%, zero regression). `VT_GDN_OUT_FP8_FUSE=0`
+// rolls back to the split RmsNormGated + QuantFp8Static path. The fused path also
+// requires VT_GLUE_FUSE on (bf16 gated store) — the production default.
+bool GdnOutFp8FuseEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GDN_OUT_FP8_FUSE");
+    return e == nullptr || e[0] != '0';  // default ON; =0 rolls back
+  }();
+  return on;
+}
+
 // Coupled GDN bf16 activations (the measured #1 prefill lever). Default ON. When
 // on, the GDN chunk-scan matmul-INPUT activations (q/k/v out of the post-conv
 // prep, hence the derived u/w/v_new/hstate scratch — those follow the input
@@ -2928,6 +2951,22 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // Gated RMSNorm writes bf16 directly (perf/glue-fuse: fold the CastBf16 into
   // the op store, mirror layernorm_guard.py:57 `out.to(dtype)`); VT_GLUE_FUSE=0
   // keeps the f32 RmsNormGated + separate CastBf16 pair.
+  // Prefill glue-fusion (VT_GDN_OUT_FP8_FUSE): when the out_proj is W8A8 fp8 (35B),
+  // fold its static fp8 activation quant INTO the gated-RMSNorm store — one launch
+  // emits the fp8 activation directly, removing the standalone QuantFp8Static pass
+  // and the bf16 gated-norm output it would write then re-read. Byte-identical to the
+  // split RmsNormGated(bf16)+QuantFp8Static path (the fp8 is quantized from the SAME
+  // bf16 value; the variance reduction order is unchanged). 27B's out_proj is fp4, so
+  // it never takes this branch.
+  if (!w.out_proj_fp8.Empty() && GdnOutFp8FuseEnabled() && GlueFuseEnabled() &&
+      d.q.device.type == vt::DeviceType::kCUDA) {
+    DBuf a_fp8(d, DType::kI8, {T, value_dim});
+    Tensor a_fp8_v = z_strided ? Reshape(a_fp8.t(), {T, Hv, Dv})
+                               : Reshape(a_fp8.t(), {T * Hv, Dv});
+    vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false},
+                             w.out_proj_fp8.input_scale);
+    return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
+  }
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
@@ -3405,6 +3444,22 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // Gated RMSNorm writes bf16 directly (perf/glue-fuse: fold the CastBf16 into
   // the op store, mirror layernorm_guard.py:57 `out.to(dtype)`); VT_GLUE_FUSE=0
   // keeps the f32 RmsNormGated + separate CastBf16 pair.
+  // Prefill glue-fusion (VT_GDN_OUT_FP8_FUSE): when the out_proj is W8A8 fp8 (35B),
+  // fold its static fp8 activation quant INTO the gated-RMSNorm store — one launch
+  // emits the fp8 activation directly, removing the standalone QuantFp8Static pass
+  // and the bf16 gated-norm output it would write then re-read. Byte-identical to the
+  // split RmsNormGated(bf16)+QuantFp8Static path (the fp8 is quantized from the SAME
+  // bf16 value; the variance reduction order is unchanged). 27B's out_proj is fp4, so
+  // it never takes this branch.
+  if (!w.out_proj_fp8.Empty() && GdnOutFp8FuseEnabled() && GlueFuseEnabled() &&
+      d.q.device.type == vt::DeviceType::kCUDA) {
+    DBuf a_fp8(d, DType::kI8, {T, value_dim});
+    Tensor a_fp8_v = z_strided ? Reshape(a_fp8.t(), {T, Hv, Dv})
+                               : Reshape(a_fp8.t(), {T * Hv, Dv});
+    vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false},
+                             w.out_proj_fp8.input_scale);
+    return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
+  }
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})

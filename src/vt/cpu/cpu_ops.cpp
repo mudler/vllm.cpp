@@ -829,6 +829,38 @@ void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate
   });
 }
 
+// RmsNormGated + static fp8 quant, fused (RmsNormGatedQuantFp8). Composite of
+// RmsNormGatedKernel (bf16-rounded output) + QuantFp8Static: bit-identical to the
+// split path because the fp8 is taken from the SAME bf16-rounded gated-norm value.
+// CUDA has the hot path; this keeps the op available on the host backend for tests.
+void RmsNormGatedQuantFp8Kernel(Queue&, Tensor& out_fp8, const Tensor& x, const Tensor& gate,
+                                const Tensor& w, const RmsNormGatedArgs& args, float input_scale) {
+  const int64_t d = x.shape[x.rank - 1];
+  const int64_t t = x.Numel() / d;
+  const float inv_scale = 1.0F / input_scale;
+  uint8_t* op = out_fp8.Ptr<uint8_t>();
+  const int64_t gate_group = gate.rank == 3 ? gate.shape[1] : 1;
+  const int64_t gate_outer = gate.stride[0];
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
+    float sumsq = 0.0F;
+    for (int64_t j = 0; j < d; ++j) {
+      const float v = LoadF32(x, i * d + j);
+      sumsq += v * v;
+    }
+    const float inv = 1.0F / std::sqrt(sumsq / static_cast<float>(d) + args.eps);
+    const int64_t gbase = (i / gate_group) * gate_outer + (i % gate_group) * d;
+    for (int64_t j = 0; j < d; ++j) {
+      const float z = LoadF32(gate, gbase + j);
+      const float act = args.sigmoid_gate ? 1.0f / (1.0f + std::exp(-z)) : Silu(z);
+      // bf16-intermediate (matches RmsNormGated's bf16 store then QuantFp8Static's load).
+      const uint16_t nb = F32ToBF16(LoadF32(x, i * d + j) * inv * LoadF32(w, j) * act);
+      op[i * d + j] = F32ToFp8(BF16ToF32(nb) * inv_scale);
+    }
+  }
+  });
+}
+
 // §7 gated-delta-rule token step, shared by prefill and decode. state points
 // at this sequence's [Hv,Dv,Dk] f32 block; tok indexes the packed q/k/v/g/beta
 // rows. GQA broadcast: v-head hv reads q/k head hv / (Hv/Hk).
@@ -1531,6 +1563,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<L2NormFn>(&L2NormKernel)));
     RegisterOp(OpId::kRmsNormGated, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RmsNormGatedFn>(&RmsNormGatedKernel)));
+    RegisterOp(
+        OpId::kRmsNormGatedQuantFp8, DeviceType::kCPU,
+        reinterpret_cast<void*>(
+            static_cast<RmsNormGatedQuantFp8Fn>(&RmsNormGatedQuantFp8Kernel)));
     RegisterOp(OpId::kGdnPrefill, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernel)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kCPU,

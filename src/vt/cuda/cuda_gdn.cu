@@ -14,6 +14,7 @@
 #include <cudaTypedefs.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -1511,6 +1512,142 @@ void RmsNormGatedKernelCuda(Queue& q, Tensor& out, const Tensor& x, const Tensor
     }
   }
   Check(cudaGetLastError(), "rmsnorm_gated launch");
+}
+
+// ---------------------------------------------------------------------------
+// rmsnorm_gated + static fp8 quant, fused (RmsNormGatedQuantFp8). The gated-norm
+// analog of cuda_ops.cu's RmsNormQuantFp8RowKernel: emit the fp8 activation directly
+// from the gated-norm normalize loop, so the standalone QuantFp8Static pass + its
+// bf16 round-trip disappear on the 35B GDN out_proj (W8A8) path. Mirrors vLLM's
+// Inductor fusion of the RMSNormGated epilogue with the following RowParallelLinear's
+// static-fp8 activation quant (fla layernorm_guard.py + rms_quant_fusion.py's
+// static-fp8 pattern applied to the GATED variant).
+//
+// BIT-IDENTICAL to RmsNormGated(bf16 out)+QuantFp8Static(input_scale): the fp8 is
+// taken from the SAME bf16-rounded value the split path quantizes
+// (F32ToFp8(__bfloat162float(__float2bfloat16(n)) * inv_scale)), and the variance
+// reduction ORDER is the shipped/fast RmsNormGated order (the fast d==128 kernel is
+// itself 0-ulp vs shipped, see RmsNormGatedRowFastKernel above). Only the store
+// changes (fp8 byte instead of bf16); the arithmetic is unchanged. Same conversion
+// as cuda_ops.cu RmsNormF32ToFp8Dev / QuantFp8StaticKernel.
+__device__ __forceinline__ uint8_t GatedNormF32ToFp8Dev(float f) {
+  return static_cast<uint8_t>(__nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3));
+}
+
+// General (shipped-order) fused kernel: reproduces RmsNormGatedRowKernel's kBlock=256
+// reduction + normalize, storing fp8 instead of Tout. Byte-identical to
+// RmsNormGatedRowKernel<Tin,bf16> followed by QuantFp8Static.
+template <typename Tin>
+__global__ void RmsNormGatedQuantFp8RowKernel(uint8_t* out_fp8, const Tin* x, const Tin* gate,
+                                              const Tin* w, int64_t d, int64_t gate_group,
+                                              int64_t gate_outer, float eps, bool sigmoid_gate,
+                                              float inv_scale) {
+  const int64_t row = blockIdx.x;
+  const Tin* xrow = x + row * d;
+  const Tin* zrow = gate + (row / gate_group) * gate_outer + (row % gate_group) * d;
+  uint8_t* orow = out_fp8 + row * d;
+  __shared__ float partial[kBlock];
+  float acc = 0.0f;
+  for (int64_t j = threadIdx.x; j < d; j += kBlock) {
+    const float v = Load(xrow, j);
+    acc += v * v;
+  }
+  partial[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s /= 2) {
+    if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(d) + eps);
+  for (int64_t j = threadIdx.x; j < d; j += kBlock) {
+    const float z = Load(zrow, j);
+    const float act = sigmoid_gate ? 1.0f / (1.0f + expf(-z)) : Silu(z);
+    // bf16-intermediate (matches RmsNormGated's bf16 store then QuantFp8Static's load).
+    const __nv_bfloat16 nb = __float2bfloat16(Load(xrow, j) * inv * Load(w, j) * act);
+    orow[j] = GatedNormF32ToFp8Dev(__bfloat162float(nb) * inv_scale);
+  }
+}
+
+// Fast d==128 fused kernel: reproduces RmsNormGatedRowFastKernel's 128-thread
+// reduction (0-ulp vs shipped) + normalize, storing fp8. This is the 35B GDN out_proj
+// production path (Dv==128, f32 core/gate/weight). Byte-identical to
+// RmsNormGatedRowFastKernel<Tin,bf16> followed by QuantFp8Static.
+template <typename Tin>
+__global__ void RmsNormGatedQuantFp8RowFastKernel(uint8_t* __restrict__ out_fp8,
+                                                  const Tin* __restrict__ x,
+                                                  const Tin* __restrict__ gate,
+                                                  const Tin* __restrict__ w, int64_t gate_group,
+                                                  int64_t gate_outer, float eps, bool sigmoid_gate,
+                                                  float inv_scale) {
+  constexpr int d = kGatedFastBlock;  // 128
+  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t row = blockIdx.x;
+  const Tin* xrow = x + row * d;
+  const Tin* zrow = gate + (row / gate_group) * gate_outer + (row % gate_group) * d;
+  uint8_t* orow = out_fp8 + row * d;
+
+  __shared__ float partial[kGatedFastBlock];
+  const float xf = Load(xrow, tid);
+  partial[tid] = xf * xf;
+  __syncthreads();
+  for (int s = kGatedFastBlock / 2; s > 0; s >>= 1) {
+    if (tid < s) partial[tid] += partial[tid + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(d) + eps);  // NOT rsqrtf
+  const float z = Load(zrow, tid);
+  const float act = sigmoid_gate ? 1.0f / (1.0f + expf(-z)) : Silu(z);
+  const float wf = Load(w, tid);
+  // Same value RmsNormGatedRowFastKernel stores as bf16, then re-quantized to fp8.
+  const __nv_bfloat16 nb = __float2bfloat16(xf * inv * wf * act);
+  orow[tid] = GatedNormF32ToFp8Dev(__bfloat162float(nb) * inv_scale);
+}
+
+// Dispatch mirroring RmsNormGatedKernelCuda exactly (same fast-path predicate + same
+// shipped-kernel fallback), but emitting fp8. Only f32/bf16 x is supported (the GDN
+// gated-norm inputs); the fast path engages for d==128 with VT_RMSNORM_GATED_FAST on,
+// so it is bit-identical to whichever RmsNormGated kernel the split path would run.
+void RmsNormGatedQuantFp8KernelCuda(Queue& q, Tensor& out_fp8, const Tensor& x, const Tensor& gate,
+                                    const Tensor& w, const RmsNormGatedArgs& args,
+                                    float input_scale) {
+  VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16,
+           "cuda rmsnorm_gated_quant_fp8: unsupported input dtype (f32/bf16 only)");
+  VT_CHECK(gate.dtype == x.dtype && w.dtype == x.dtype,
+           "cuda rmsnorm_gated_quant_fp8: gate/weight dtype must match x");
+  VT_CHECK(out_fp8.dtype == DType::kI8, "cuda rmsnorm_gated_quant_fp8: out_fp8 must be i8");
+  const int64_t d = x.shape[x.rank - 1];
+  const int64_t t = d == 0 ? 0 : x.Numel() / d;
+  if (t == 0 || d == 0) return;
+  const int64_t gate_group = gate.rank == 3 ? gate.shape[1] : 1;
+  const int64_t gate_outer = gate.stride[0];
+  cudaStream_t s = AsStream(q);
+  const unsigned grid = static_cast<unsigned>(t);
+  const float inv_scale = 1.0f / input_scale;
+  uint8_t* op = out_fp8.Ptr<uint8_t>();
+  // Fast d==128 path (matches TryLaunchRmsNormGatedFast's predicate for the fp8 case).
+  if (RmsNormGatedFastFlagIsOn(std::getenv("VT_RMSNORM_GATED_FAST")) && d == kGatedFastBlock) {
+    if (x.dtype == DType::kF32) {
+      RmsNormGatedQuantFp8RowFastKernel<float><<<grid, kGatedFastBlock, 0, s>>>(
+          op, x.Ptr<float>(), gate.Ptr<float>(), w.Ptr<float>(), gate_group, gate_outer, args.eps,
+          args.sigmoid_gate, inv_scale);
+    } else {
+      RmsNormGatedQuantFp8RowFastKernel<__nv_bfloat16><<<grid, kGatedFastBlock, 0, s>>>(
+          op, x.Ptr<__nv_bfloat16>(), gate.Ptr<__nv_bfloat16>(), w.Ptr<__nv_bfloat16>(),
+          gate_group, gate_outer, args.eps, args.sigmoid_gate, inv_scale);
+    }
+    Check(cudaGetLastError(), "rmsnorm_gated_quant_fp8 fast launch");
+    return;
+  }
+  if (x.dtype == DType::kF32) {
+    RmsNormGatedQuantFp8RowKernel<float><<<grid, kBlock, 0, s>>>(
+        op, x.Ptr<float>(), gate.Ptr<float>(), w.Ptr<float>(), d, gate_group, gate_outer, args.eps,
+        args.sigmoid_gate, inv_scale);
+  } else {
+    RmsNormGatedQuantFp8RowKernel<__nv_bfloat16><<<grid, kBlock, 0, s>>>(
+        op, x.Ptr<__nv_bfloat16>(), gate.Ptr<__nv_bfloat16>(), w.Ptr<__nv_bfloat16>(), d,
+        gate_group, gate_outer, args.eps, args.sigmoid_gate, inv_scale);
+  }
+  Check(cudaGetLastError(), "rmsnorm_gated_quant_fp8 launch");
 }
 
 // ---------------------------------------------------------------------------
@@ -5006,6 +5143,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPostConvFn>(&GdnPostConvKernelCuda)));
     RegisterOp(OpId::kRmsNormGated, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RmsNormGatedFn>(&RmsNormGatedKernelCuda)));
+    RegisterOp(
+        OpId::kRmsNormGatedQuantFp8, DeviceType::kCUDA,
+        reinterpret_cast<void*>(
+            static_cast<RmsNormGatedQuantFp8Fn>(&RmsNormGatedQuantFp8KernelCuda)));
     RegisterOp(OpId::kGdnPrefill, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernelCuda)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kCUDA,

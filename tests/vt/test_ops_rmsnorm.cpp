@@ -214,6 +214,50 @@ TEST_CASE("rmsnorm_quant_fp8 is bit-identical to RmsNorm(bf16)+static fp8 quant"
   run(/*bf16_residual=*/true, /*want_bf16_out=*/false);
 }
 
+// RmsNormGatedQuantFp8 (fused GDN gated-RMSNorm -> static fp8 quant) must be
+// BIT-IDENTICAL to the split path RmsNormGated(bf16 out) then static fp8 quant of that
+// bf16 (F32ToF8E4M3(BF16ToF32(bf16) / input_scale)) — the 35B GDN out_proj W8A8 path.
+// Covers both the silu and sigmoid gate, over a contiguous rank-2 [rows,D] gate.
+TEST_CASE("rmsnorm_gated_quant_fp8 is bit-identical to RmsNormGated(bf16)+static fp8 quant") {
+  const int64_t rows = 7, D = 128;  // D==128 is the GDN Dv (the production shape)
+  const float eps = 1e-6f, input_scale = 0.042f, inv_scale = 1.0f / input_scale;
+  std::mt19937 rng(20260719);
+  std::uniform_real_distribution<float> ux(-3.0f, 3.0f);
+
+  auto run = [&](bool sigmoid_gate) {
+    std::vector<float> x(static_cast<size_t>(rows) * D);
+    std::vector<float> gate(static_cast<size_t>(rows) * D);
+    std::vector<float> w(D);
+    for (auto& v : x) v = ux(rng);
+    for (auto& v : gate) v = ux(rng);
+    for (auto& v : w) v = ux(rng) * 0.1f;
+
+    Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {rows, D});
+    Tensor tg = Tensor::Contiguous(gate.data(), DType::kF32, Cpu(), {rows, D});
+    Tensor tw = Tensor::Contiguous(w.data(), DType::kF32, Cpu(), {D});
+    Queue q{Cpu(), nullptr};
+    vt::RmsNormGatedArgs args{eps, sigmoid_gate};
+
+    // Reference: vt::RmsNormGated to a bf16 output, then the static fp8 quant.
+    std::vector<uint16_t> ref_bf16(static_cast<size_t>(rows) * D, 0);
+    Tensor to_bf16 = Tensor::Contiguous(ref_bf16.data(), DType::kBF16, Cpu(), {rows, D});
+    vt::RmsNormGated(q, to_bf16, tx, tg, tw, args);
+    std::vector<uint8_t> ref_fp8(static_cast<size_t>(rows) * D);
+    for (size_t i = 0; i < ref_fp8.size(); ++i)
+      ref_fp8[i] = vllm::F32ToF8E4M3(vt::BF16ToF32(ref_bf16[i]) * inv_scale);
+
+    // Fused: RmsNormGatedQuantFp8 emitting the fp8 activation directly.
+    std::vector<uint8_t> got_fp8(static_cast<size_t>(rows) * D, 0);
+    Tensor tofp8 = Tensor::Contiguous(got_fp8.data(), DType::kI8, Cpu(), {rows, D});
+    vt::RmsNormGatedQuantFp8(q, tofp8, tx, tg, tw, args, input_scale);
+
+    CHECK(got_fp8 == ref_fp8);  // fp8 byte-exact vs the split RmsNormGated+quant path
+  };
+
+  run(/*sigmoid_gate=*/false);  // silu (Qwen GDN default)
+  run(/*sigmoid_gate=*/true);   // sigmoid
+}
+
 TEST_CASE("rmsnorm accepts bf16 inputs via f32 conversion") {
   // bf16(3.0)=0x4040, bf16(4.0)=0x4080 are exact; w bf16(1.0)=0x3F80
   std::vector<uint16_t> x = {0x4040, 0x4080};

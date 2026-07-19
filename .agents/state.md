@@ -13745,3 +13745,58 @@ in vLLM's scheduler mechanism, to name the lever. Evidence
 `dgx:~/work/vllm.cpp-online-gate/evidence/786aa0e…/summary-{27,35}/{report.md,ratios.json}`.
 (Orchestration note: the grid script exits rc=1 on any "not 124/124" gate — that is
 the gate verdict, NOT a run failure; both grids collected full data + summaries.)
+
+
+## 2026-07-19 — First stacked prefill glue-fusion: GDN out_proj gated-RMSNorm → fp8-quant fold (`CLAIM-GDN-OUT-FP8-FUSE-1`)
+
+Bounded measure-then-decide experiment (user-directed): implement the single
+highest-value byte-exact prefill glue-fusion for the 35B and measure it honestly.
+
+**Target chosen (value × byte-exact-achievability).** From the c8 production nsys
+(`dgx:~/prof-ttft/trace-c8clean`) the largest still-unfused glue kernels were
+`MoeCombineGate` (5.3%) and `SiluAndMul` (3.2%) — but both already match vLLM's
+structure (vLLM emits the same standalone ops; not a gap), and residual-add+RMSNorm
+(`RmsNorm(&res)`), rmsnorm+fp8-quant (`RmsNormQuantFp8Row`), silu+fp4 and
+sigmoid-gate+fp4 were already folded by prior tasks. The genuine remaining gap:
+the 35B GDN **gated**-RMSNorm (`RmsNormGatedRowFast`, 3.4%) writes bf16, then the
+W8A8 out_proj's `QuantFp8Static` re-reads it — vLLM/Inductor fuses that gated-norm
+epilogue with the RowParallelLinear's static-fp8 quant. Folding it is the gated
+sibling of the existing `RmsNormQuantFp8Row` and is byte-exact (static per-tensor
+quant is a non-reducing pointwise post-step; keep the exact gated reduction).
+
+**Implemented (portable).** New `vt::RmsNormGatedQuantFp8` op — CPU composite oracle
++ CUDA (`RmsNormGatedQuantFp8RowFastKernel` reproduces `RmsNormGatedRowFastKernel`'s
+0-ulp d==128 reduction, then the same bf16-round + `__nv_cvt_float_to_fp8` as
+`QuantFp8Static`; a general `…RowKernel` mirrors the shipped-order path). Wired into
+both `qwen3_5.cpp` GDN-attn out_proj sites behind `VT_GDN_OUT_FP8_FUSE` feeding
+`MatmulFp8CutlassPreQuantD`. 35B-only (27B out_proj is W4A4 fp4) ⇒ no 27B razor.
+
+**Gates ALL GREEN (dgx `~/work/vllm.cpp-gdn-fp8-fuse`, prod flags, clean CUDA
+`-Werror` 0 warn, one flock).** CPU byte-exact `rmsnorm_gated_quant_fp8` (silu +
+sigmoid) fused==`RmsNormGated(bf16)`+`QuantFp8Static`, `test_ops_rmsnorm` 36/36;
+`compute-sanitizer memcheck` 0 errors (fused ON); 35B `test_qwen36_paged_engine`
+**315/315** on default-ON + `VT_GDN_OUT_FP8_FUSE=0` rollback + pre-flip `=1`; 27B
+`test_qwen27_paged_engine` **235/235** (inert).
+
+**MEASURED (honest).** Isolated nsys (35B prefill c1 input-1024, 30 GDN layers):
+the gated-norm+out_proj-quant chain 6.43→**4.58 ms (−28.7%)** — the fused fp8
+1-byte store is even cheaper than the unfused gated norm's bf16 store — but only
+**~0.28%** of the ~655 ms total prefill GPU. In-situ 35B TTFT A/B (input-1024,
+output-8, 3 reps/arm interleaved, same binary): **c1 median −1.4% (3/3 reps favor
+ON), c2 −1.3% (3/3), c8 −0.4% (2/3; async-off arm)**, prefill tput +1.0%,
+zero regression. (c8 measured with `VT_ASYNC_RUNNER=0` because a PRE-EXISTING
+`async_scheduler.cpp:65 num_output_placeholders >= 0` assertion crashes c8 +
+short-output — unrelated to this fold; a separate bug to file.)
+
+**DECISION: DEFAULT ON** (byte-exact + consistently measured-faster + zero regression
++ 35B-only, matching the `GdnPostConvFast` precedent / parity-enabler policy);
+`VT_GDN_OUT_FP8_FUSE=0` rollback.
+
+**EXPERIMENT VERDICT (the signal the user asked for).** Fusion IS covering GENUINE,
+byte-exact prefill-TTFT — but this fold is **SMALL** (~1% TTFT c1/c2, ~0.4% c8;
+~0.28% of prefill GPU). It does NOT flip the 35B binding TTFT axes alone (they are
+3–14% off). So per-fold gains are ~1%; **closing the 35B prefill gap needs a STACK of
+~5–10 such folds** (the remaining `MoeCombineGate`/`SiluAndMul` match vLLM already, so
+the stack is other norm/quant/cast producer-consumer folds + the harder Inductor-style
+horizontal combo_kernels). Continue the push only if that stacking math is acceptable;
+each fold is byte-exact + default-ON-able, so they compound cleanly.

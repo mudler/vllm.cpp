@@ -484,6 +484,29 @@ void RmsNormQuantFp8(Queue& q, Tensor& out_fp8, Tensor* out_bf16, const Tensor& 
   reinterpret_cast<RmsNormQuantFp8Fn>(GetOp(OpId::kRmsNormQuantFp8, q.device.type))(
       q, out_fp8, out_bf16, x, weight, args, residual, input_scale);
 }
+void RmsNormGatedQuantFp8(Queue& q, Tensor& out_fp8, const Tensor& x, const Tensor& gate,
+                          const Tensor& weight, const RmsNormGatedArgs& args, float input_scale) {
+  const int64_t d = x.rank == 0 ? 0 : x.shape[x.rank - 1];
+  VT_CHECK(weight.rank == 1 && weight.shape[0] == d,
+           "rmsnorm_gated_quant_fp8: weight must be rank-1 [D] matching x's last dim");
+  VT_CHECK(out_fp8.rank == x.rank, "rmsnorm_gated_quant_fp8: out_fp8 rank must match x");
+  for (int i = 0; i < x.rank; ++i)
+    VT_CHECK(out_fp8.shape[i] == x.shape[i],
+             "rmsnorm_gated_quant_fp8: out_fp8 shape must match x");
+  VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsFloat(gate.dtype),
+           "rmsnorm_gated_quant_fp8: float x/gate/weight required");
+  VT_CHECK(gate.dtype == x.dtype && weight.dtype == x.dtype,
+           "rmsnorm_gated_quant_fp8: gate/weight dtype must match x");
+  VT_CHECK(out_fp8.dtype == DType::kI8,
+           "rmsnorm_gated_quant_fp8: out_fp8 must be i8 (raw fp8-e4m3fn bytes)");
+  VT_CHECK(x.IsContiguous() && out_fp8.IsContiguous() && weight.IsContiguous(),
+           "rmsnorm_gated_quant_fp8: contiguous x/out_fp8/weight required");
+  VT_CHECK(x.device == out_fp8.device && weight.device == x.device && gate.device == x.device &&
+               x.device == q.device,
+           "rmsnorm_gated_quant_fp8: device mismatch (x/out_fp8/gate/weight/queue)");
+  reinterpret_cast<RmsNormGatedQuantFp8Fn>(GetOp(OpId::kRmsNormGatedQuantFp8, q.device.type))(
+      q, out_fp8, x, gate, weight, args, input_scale);
+}
 void MatmulFp8Cutlass(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& b_fp8,
                       float alpha) {
   VT_CHECK(out.rank == 2 && a_fp8.rank == 2 && b_fp8.rank == 2,

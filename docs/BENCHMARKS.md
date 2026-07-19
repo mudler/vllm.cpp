@@ -124,6 +124,55 @@ noise floor. Kept opt-in per "token-exact but not measurably faster". Repro: bui
 branch with the flags above, `flock /tmp/gpu`, `test_ops_nvfp4_fp4 -tc="*sigmoid_gate_fp4_quant*"`
 + 27B/35B engine gates + `env VT_FUSE_SIGMOID_QUANT={0,1} vllm-bench --input-len 1024`.
 
+### 35B GDN out_proj gated-RMSNorm → fp8-quant fold (2026-07-19, `CLAIM-GDN-OUT-FP8-FUSE-1`) — byte-exact, measured-faster (small), DEFAULT ON
+
+Component (NOT binding). Folds the 35B GDN out_proj's static W8A8 fp8 activation
+quant INTO the gated-RMSNorm output store — a new `vt::RmsNormGatedQuantFp8`
+(CPU + CUDA) emits the fp8 activation directly (fed to `MatmulFp8CutlassPreQuantD`),
+removing the standalone `QuantFp8Static` pass AND the bf16 gated-norm output the
+split path writes then re-reads. It is the gated sibling of the existing
+`RmsNormQuantFp8Row` fusion, mirroring vLLM's Inductor fusion of the fla
+`layernorm_guard` RMSNormGated epilogue with the following RowParallelLinear's
+static-fp8 activation quant. Only the 35B GDN out_proj is fp8 (27B's out_proj is
+W4A4 fp4), so the fold is **35B-only** — no 27B greedy-razor exposure.
+`VT_GDN_OUT_FP8_FUSE=0` rolls back to the split path.
+
+Disposition: **byte-exact + measured-faster (small) ⇒ DEFAULT ON** (like
+`GdnPostConvFast`; the parity-enabler policy). **DGX GREEN** (`~/work/vllm.cpp-gdn-fp8-fuse`,
+production flags CUTLASS sm120a + Marlin + FA2 sm_121a + Triton AOT, clean CUDA
+`-Werror` **0 warnings**, one flock):
+
+- **Byte-exact.** CPU op test `rmsnorm_gated_quant_fp8` (silu + sigmoid gate) —
+  fused == `RmsNormGated(bf16)`+static fp8 quant, bit-for-bit; full `test_ops_rmsnorm`
+  36/36. The fused CUDA kernel reproduces `RmsNormGatedRowFastKernel`'s exact 0-ulp
+  variance reduction, then the same bf16-round + `__nv_cvt_float_to_fp8` the split
+  `QuantFp8Static` applies. `compute-sanitizer memcheck` **0 errors** (fused ON).
+- **Token-exact.** 35B `test_qwen36_paged_engine` **315/315** on the default-ON
+  build, on `VT_GDN_OUT_FP8_FUSE=0` rollback, AND on the pre-flip `=1` arm; 27B
+  `test_qwen27_paged_engine` **235/235** (inert — 27B out_proj is fp4).
+- **Isolated per-kernel** (nsys `--cuda-graph-trace=node`, 35B prefill c1 input-1024,
+  30 GDN layers): OFF = `RmsNormGatedRowFast` 4.989 ms (30) + the 30 out_proj
+  `QuantFp8Static` launches ≈ 1.45 ms = **6.43 ms**; ON = `RmsNormGatedQuantFp8RowFast`
+  **4.584 ms** (30) — the fused fp8 1-byte store is even cheaper than the unfused
+  gated norm's bf16 store, and absorbs the quant. **−28.7 % on the chain (≈ −1.85 ms /
+  1024-tok prefill)**, but only **~0.28 %** of the ~655 ms total prefill GPU.
+- **In-situ 35B TTFT A/B** (input-1024, output-8, greedy, 3 reps/arm interleaved,
+  same binary): **c1 median OFF 175.0 → ON 172.6 ms (−1.4 %, 3/3 reps favor ON),
+  c2 333.2 → 329.0 ms (−1.3 %, 3/3), c8 854.9 → 851.2 ms (−0.4 %, 2/3; one ON rep an
+  outlier)**; prefill throughput +1.0 % consistently; mean TTFT c1 −1.2 % / c2 −1.4 %.
+  c8 was measured with `VT_ASYNC_RUNNER=0` because a **pre-existing** async-scheduler
+  assertion (`async_scheduler.cpp:65 num_output_placeholders >= 0`) crashes c8 +
+  short-output — unrelated to this fold (which only touches a GDN kernel); a separate
+  bug to track.
+
+**Honest verdict:** a REAL, byte-exact prefill-TTFT win, but **SMALL** (~1 % of TTFT,
+~0.28 % of prefill GPU). It does NOT flip the 35B binding TTFT axes alone (they are
+3–14 % off). Fusion IS covering genuine prefill-TTFT, but per-fold gains are ~1 %, so
+closing the 35B prefill gap requires STACKING many such folds — this is the first of
+that push. Repro: build branch with the flags above, `flock /tmp/gpu`,
+`test_ops_rmsnorm -tc="*gated_quant_fp8*"` + 27B/35B engine gates +
+`env VT_GDN_OUT_FP8_FUSE={0,1} vllm-bench --input-len 1024 --output-len 8`.
+
 ### Lever-3 eager Marlin repack (2026-07-19) — VERIFIED already-at-load-time, skipped
 
 Scoping premise: the first-touch Marlin repack was 42 % of a COLD (no-warmup) 35B

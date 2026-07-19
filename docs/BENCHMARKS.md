@@ -172,6 +172,44 @@ structural mirror is a real-but-modest win, and the larger vLLM conv gap is TRAF
 (bf16 post-conv activations, `VT_GDN_IN_BF16`, task #40 sibling), not structure.
 `benchmark_binding=false`; the 35B binding grid re-measures the in-situ c1–c4 effect.
 
+### GDN prefill fused post-conv fast kernel (2026-07-19, `CLAIM-GDN-POSTCONV-FAST-1`) — bit-exact, DEFAULT ON, measured win BOTH models
+
+Follow-on to the split's near-neutral disposition above. A fresh production-path
+nsys profile (`--cuda-graph-trace=node`, VLLM_CPP_TRITON=ON, input-1024) confirmed
+the GDN chunk **compute** (delta_h / chunk_o / kkt / recompute_w_u) runs the vendored
+FLA Triton AOT cubins by default (`chunk_gated_delta_rule_fwd_kernel_h_blockdim64`,
+`chunk_fwd_kernel_o`, `recompute_w_u_fwd_kernel`, `chunk_scaled_dot_kkt_fwd_kernel`
+in the trace) — i.e. **at FLA parity by construction**. The #1 remaining NON-AOT
+GDN-specific kernel on BOTH models is the fused post-conv prep, and the shipped
+default is the single-megablock `GdnPostConvKernel` (the split `VT_GDN_POSTCONV_SPLIT`
+measured neutral/slower — 27B 175.6→201.4 µs SLOWER, 35B ~0%).
+
+`GdnPostConvFastKernel` (`VT_GDN_POSTCONV_FAST`, DEFAULT ON, `=0` rollback) keeps the
+shipped megablock grid `(T, Hk+1)` (the low-launch layout the split failed to beat)
+and makes two provably **BYTE-IDENTICAL** changes for the Dk==Dv==128 gate dims:
+(a) 128 threads/block instead of 256 — every lane owns one q/k element, so the
+128-wide L2-norm tree is the 256-wide tree minus a leading `+partial[t+128]` over the
+always-zero upper half (a no-op), same summation over the same squared values, +better
+reduction occupancy; (b) the V copy (the largest memory pass) is staged in 128-bit
+transactions (raw `int4` when conv/out dtypes match; the SAME per-element
+`__bfloat162float`/`__float2bfloat16` converts otherwise) instead of one per element.
+No arithmetic is reordered. Grounded in FLA `_fused_post_conv_kernel`
+(`fused_gdn_prefill_post_conv.py:57-149`, grid `(cdiv(L,BLOCK_T), H+HV)` per-head).
+
+**Isolated nsys per-call (`--cuda-graph-trace=node`, input-1024, evidence
+`dgx:~/work/vllm.cpp-gdn-chunk/prof`):** 27B `unsloth/Qwen3.6-27B-NVFP4`
+**175.6 → 133.0 ms (−24.3%)**; 35B `nvidia/Qwen3.6-35B-A3B-NVFP4`
+**93.5 → 70.3 ms (−24.8%)** (kernel totals over 10-prompt runs). **In-situ TTFT A/B
+(input-1024, output-8, greedy, 3 reps/arm, interleaved default-vs-`=0`):** 27B c1
+418.9→414.1 ms (**−1.14%**), c2 805.6→795.1 ms (**−1.31%**); 35B c1 232.0→230.3 ms
+(**−0.72%**), c2 387.7→383.9 ms (**−0.99%**) — every FAST rep below its paired BASE.
+**Bit-exact:** 27B `test_qwen27_paged_engine` **235/235** + 35B
+`test_qwen36_paged_engine` **315/315**, token-exact on BOTH the default (fast) and
+`=0` (megablock) arms; CPU predicate `test_gdn_prefill_conv` 28/28; clean CUDA
+`-Werror` 0 warnings. Per the parity-enabler policy (byte-exact ⇒ never-slower +
+token-safe, measured faster on BOTH models) it ships **DEFAULT ON**. `benchmark_binding=false`;
+the binding grid re-measures the in-situ effect.
+
 ### Prior binding narrative (`246a23c`, superseded 2026-07-17, retained)
 
 The nominal 49 < 55 vs `3f256ab` was a

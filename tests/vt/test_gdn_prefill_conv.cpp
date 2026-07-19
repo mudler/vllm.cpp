@@ -18,6 +18,7 @@
 #include "vt/cuda/gdn_prefill_conv.h"
 
 using vt::cuda::ConvRegFlagIsOn;
+using vt::cuda::GdnPostConvFastFlagIsOn;
 using vt::cuda::GdnPostConvSplitFlagIsOn;
 
 TEST_CASE("VT_CONV_REG defaults ON; only a '0'-leading value rolls back") {
@@ -55,4 +56,22 @@ TEST_CASE("VT_GDN_POSTCONV_SPLIT defaults OFF (opt-in); a non-'0' value enables 
   CHECK(GdnPostConvSplitFlagIsOn("on"));
   CHECK(GdnPostConvSplitFlagIsOn("2"));
   CHECK(GdnPostConvSplitFlagIsOn(" 0"));  // leading space, not '0'
+}
+
+TEST_CASE("VT_GDN_POSTCONV_FAST defaults ON; only a '0'-leading value rolls back") {
+  // Default (unset) is ON: GdnPostConvFastKernel is BIT-IDENTICAL (0-ulp) to the
+  // shipped GdnPostConvKernel for the Dk==Dv==128 gate dims (128-thread reduction is
+  // the 256-thread tree minus a leading +0 step; the V copy is a 128-bit-staged pure
+  // copy/convert), and it measured -24% per-call on GB10, so per the parity-enabler
+  // policy (byte-exact ⇒ never-slower + token-safe) it ships ON. It rolls back to the
+  // megablock only when the value is present AND its first character is '0'.
+  CHECK(GdnPostConvFastFlagIsOn(nullptr));  // unset → fast megablock
+  CHECK(GdnPostConvFastFlagIsOn(""));
+  CHECK(GdnPostConvFastFlagIsOn("1"));
+  CHECK(GdnPostConvFastFlagIsOn("on"));
+  CHECK(GdnPostConvFastFlagIsOn("2"));
+  CHECK(GdnPostConvFastFlagIsOn(" 0"));  // leading space, not '0'
+  CHECK_FALSE(GdnPostConvFastFlagIsOn("0"));
+  CHECK_FALSE(GdnPostConvFastFlagIsOn("0abc"));
+  CHECK_FALSE(GdnPostConvFastFlagIsOn("00"));
 }

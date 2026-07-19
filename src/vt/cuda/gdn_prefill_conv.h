@@ -84,6 +84,33 @@ inline bool GdnPostConvSplitFlagIsOn(const char* env_value) {
   return env_value != nullptr && env_value[0] != '0';
 }
 
+// Pure predicate for the VT_GDN_POSTCONV_FAST contract: DEFAULT ON ('0'-leading
+// value rolls back to the shipped megablock). The fast post-conv kernel
+// (GdnPostConvFastKernel) keeps the shipped single-megablock grid (T, Hk+1) — the
+// low-launch-overhead layout the split failed to beat — but makes two provably
+// BYTE-IDENTICAL changes that target the measured bottleneck (the per-head q/k
+// L2-norm reduction, plus the V-megablock memory pass); it is BIT-IDENTICAL (0-ulp)
+// to GdnPostConvKernel yet measured -24.3% (27B) / -24.8% (35B) per-call on GB10, so
+// per the parity-enabler policy (byte-exact ⇒ never-slower + token-safe) it ships ON:
+//   (a) it launches 128 threads/block instead of 256. For the Dk==Dv==128 gate
+//       dims every lane owns exactly one element, so the 256-thread tree merely
+//       added a leading `partial[t] += partial[t+128]` step over `partial[128..255]`
+//       which are all +0 (those lanes never entered the `j<Dk` load loop). Dropping
+//       the wasted half-block removes that no-op sync round and doubles the resident
+//       block count per SM (better latency hiding on the reduction) with the SAME
+//       summation tree over the SAME 128 squared values — 0-ulp identical.
+//   (b) the V copy (mixed_qkv[:, 2*key_dim:] -> v_out, the largest memory pass) is
+//       staged in 128-bit vector transactions (raw int4 when conv/out dtypes match;
+//       per-element __bfloat162float / __float2bfloat16 — the SAME converts the
+//       scalar Load/Store use — when they differ) instead of one transaction per
+//       element. A pure copy/convert reorders no arithmetic, so the bytes are
+//       unchanged. Gated to Dk==Dv==128 (guarantees 16B alignment + value_dim%8==0);
+//       any other shape keeps the shipped megablock/split path. ON unless the
+//       environment value is present AND its first char is '0' (rollback).
+inline bool GdnPostConvFastFlagIsOn(const char* env_value) {
+  return env_value == nullptr || env_value[0] != '0';
+}
+
 }  // namespace vt::cuda
 
 #endif  // VT_CUDA_GDN_PREFILL_CONV_H_

@@ -13601,3 +13601,57 @@ implementation. Spec `.agents/specs/glue-fusion-2026-07-19.md`; ledger 2026-07-1
 Next glue/EVT-epilogue-fusion candidates for the c1/c2 (35B) + 27B prefill residual
 remain the roadmap_v1 portable-fusion front (the fold mechanism here is reusable for
 any future W4A4 gated-projection site).
+
+## 2026-07-19 — GDN-chunk front: PROFILED, AOT compute confirmed at FLA parity, fused post-conv FAST landed DEFAULT ON (`CLAIM-GDN-POSTCONV-FAST-1`)
+
+Drove the GDN-chunk vt::tile front. **PROFILE FIRST** (dgx, flock, production build
+`VLLM_CPP_TRITON=ON` + CUTLASS sm120a + Marlin + FA2 sm_121a, clean CUDA `-Werror`):
+fresh nsys of the PRODUCTION prefill (`vllm-bench --input-len 1024 --output-len 2`,
+`--cuda-graph-trace=node`) on BOTH gate models, evidence
+`dgx:~/work/vllm.cpp-gdn-chunk/prof`.
+
+**KEY FINDING — the GDN chunk COMPUTE front is CLOSED in production.** delta_h /
+chunk_o / kkt / recompute_w_u all run the vendored FLA Triton AOT cubins by default
+(the trace shows `chunk_gated_delta_rule_fwd_kernel_h_blockdim64`, `chunk_fwd_kernel_o`,
+`recompute_w_u_fwd_kernel`, `chunk_scaled_dot_kkt_fwd_kernel` — the SAME kernels vLLM
+runs, so **at FLA parity by construction**). The old "2.3–2.4× GDN chunk gap" front
+was resolved by the AOT vendoring (MIRROR policy); the portable vt::tile hand kernels
+(delta_h reg-ring, WY-vec-blocked, chunk_o WMMA) are the non-Triton FALLBACK and can't
+beat production vLLM (which we already match via the identical cubins).
+
+**RANKED NON-AOT GDN kernels (production, GPU time):** #1 on BOTH models is the fused
+post-conv prep — 27B `GdnPostConvKernel` 175.6 ms (3.0% of prefill kernel time), 35B
+93.5 ms (3.9%); then `CausalConv1dFwdRegKernel` (27B 105 / 35B 91 ms, already
+reg-window-optimized), the gated-RMSNorm (35B uses the slow scalar variant, 77.6 ms —
+a 35B-specific follow-up), cumsum / build-meta / gather-scatter (all <13 ms). The
+vLLM-grid-faithful split (`VT_GDN_POSTCONV_SPLIT`) was RE-MEASURED and does NOT win
+(27B 175.6→201.4 ms SLOWER, 35B ~0%) — grid rebalance is a dead end; the megablock
+sits ~2.16× above the GB10 ~273 GB/s bandwidth floor (transaction/latency-bound, not
+BW-saturated).
+
+**PORTED (bit-exact, gated, measured):** `GdnPostConvFastKernel` (`VT_GDN_POSTCONV_FAST`
+DEFAULT ON, `=0`→megablock) keeps the shipped megablock grid `(T,Hk+1)` (low launch
+overhead — the split's 49k tiny blocks were the loss) but makes two provably
+BYTE-IDENTICAL changes for Dk==Dv==128: (a) 128 threads/block — every lane owns one
+q/k element so the 128-wide L2-norm tree is the 256-wide tree minus a leading `+0`
+step (bit-identical, better reduction occupancy); (b) 128-bit-staged V copy
+(`GdnVecCopy8`: raw `int4` when conv/out dtypes match, else the SAME
+`__bfloat162float`/`__float2bfloat16` converts — no arithmetic reordered). Grounded in
+FLA `_fused_post_conv_kernel` (`fused_gdn_prefill_post_conv.py:57-149`).
+
+**GATES ALL GREEN (dgx, flock):** clean CUDA `-Werror` 0 warnings; token-exact 27B
+**235/235** + 35B **315/315** on BOTH default(fast) and `=0`(megablock) arms; CPU
+predicate `test_gdn_prefill_conv` **28/28**; compute-sanitizer memcheck clean.
+**Isolated nsys per-call: 27B 175.6→133.0 ms (−24.3%), 35B 93.5→70.3 ms (−24.8%).**
+In-situ TTFT A/B (input-1024, output-8, greedy, 3 reps/arm, interleaved): 27B c1
+418.9→414.1 (−1.14%) / c2 805.6→795.1 (−1.31%); 35B c1 232.0→230.3 (−0.72%) / c2
+387.7→383.9 (−0.99%) — every FAST rep below its paired BASE. Byte-exact + measured
+faster on BOTH models ⇒ DEFAULT ON per the parity-enabler policy (the split's
+neutral-⇒-opt-in disposition does not apply — this measures a clear win).
+
+Tree `dgx:~/work/vllm.cpp-gdn-chunk`; branch `worktree-agent-a0f7bec34a3b3311d` (NOT
+pushed — SHA reported for review/fast-forward). **Next GDN-glue candidates** (from the
+ranking): the 35B slow gated-RMSNorm scalar variant (77.6 ms/3.3%; route to a
+bit-identical fast path like the 27B bf16 `RmsNormGatedRowFastKernel`), and the
+`VT_GDN_IN_BF16` conv-traffic sibling. The GDN chunk-COMPUTE front itself is closed
+(AOT parity); further portable vt::tile work on it only helps the non-Triton fallback.

@@ -1033,6 +1033,123 @@ __global__ void GdnPostConvKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* 
   }
 }
 
+// 128-bit-staged copy of a contiguous [n] slice from conv (Tconv) to out (Tqkv),
+// striped in 8-element groups across the block's `bd` threads (tid in [0,bd)).
+// BYTE-IDENTICAL to the scalar `for j: Store(out,j,Load(conv,j))` loop: a raw int4
+// copy when the dtypes match, else the SAME per-element __bfloat162float /
+// __float2bfloat16 converts the scalar Load/Store use. Requires 16B alignment of
+// both base pointers and n % 8 == 0 (caller guarantees for the Dk=Dv=128 gate dims;
+// value_dim = Hv*128 is a multiple of 8). No arithmetic is reordered.
+template <typename Tqkv, typename Tconv>
+__device__ inline void GdnVecCopy8(Tqkv* out, const Tconv* in, int64_t n, int tid, int bd) {
+  const int64_t ng = n >> 3;  // number of 8-element groups
+  for (int64_t g = tid; g < ng; g += bd) {
+    if constexpr (std::is_same<Tqkv, Tconv>::value) {
+      if constexpr (sizeof(Tconv) == 2) {  // bf16/half -> same: one 16B transaction
+        reinterpret_cast<int4*>(out)[g] = reinterpret_cast<const int4*>(in)[g];
+      } else {  // f32 -> f32: 8 elems = 32B = two 16B transactions
+        reinterpret_cast<int4*>(out)[2 * g] = reinterpret_cast<const int4*>(in)[2 * g];
+        reinterpret_cast<int4*>(out)[2 * g + 1] = reinterpret_cast<const int4*>(in)[2 * g + 1];
+      }
+    } else {
+      float f[8];
+      if constexpr (sizeof(Tconv) == 4) {  // f32 in: two float4 loads
+        const float4 a = reinterpret_cast<const float4*>(in)[2 * g];
+        const float4 b = reinterpret_cast<const float4*>(in)[2 * g + 1];
+        f[0] = a.x; f[1] = a.y; f[2] = a.z; f[3] = a.w;
+        f[4] = b.x; f[5] = b.y; f[6] = b.z; f[7] = b.w;
+      } else {  // bf16/half in: one int4 load, unpack via the scalar Load convert
+        const int64_t base = g << 3;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) f[e] = Load(in, base + e);
+      }
+      if constexpr (sizeof(Tqkv) == 4) {  // f32 out: two float4 stores
+        float4 a, b;
+        a.x = f[0]; a.y = f[1]; a.z = f[2]; a.w = f[3];
+        b.x = f[4]; b.y = f[5]; b.z = f[6]; b.w = f[7];
+        reinterpret_cast<float4*>(out)[2 * g] = a;
+        reinterpret_cast<float4*>(out)[2 * g + 1] = b;
+      } else {  // bf16 out: pack 8 via the SAME __float2bfloat16 as scalar Store
+        __align__(16) Tqkv o[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) Store(o, e, f[e]);
+        reinterpret_cast<int4*>(out)[g] = *reinterpret_cast<const int4*>(o);
+      }
+    }
+  }
+}
+
+// Fast post-conv (VT_GDN_POSTCONV_FAST): the shipped single-megablock grid
+// (T, Hk+1) but 128 threads/block + 128-bit-staged V copy. BYTE-IDENTICAL to
+// GdnPostConvKernel for the Dk==Dv==128 gate dims (see GdnPostConvFastFlagIsOn):
+// every lane owns one q/k element so the 128-wide reduction tree is the shipped
+// 256-wide tree minus its leading +0 step, and the V copy reorders nothing. Gated
+// to Dk==Dv==128 (16B alignment + value_dim%8==0); other shapes use the megablock.
+template <typename Tqkv, typename Tconv, typename Tgate>
+__global__ void GdnPostConvFastKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* g_out,
+                                      float* beta_out, const Tconv* conv, const Tgate* araw,
+                                      const Tgate* braw, const float* a_log, const float* dt_bias,
+                                      int64_t hk, int64_t dk, int64_t hv, int64_t dv,
+                                      int64_t a_row_stride, int64_t b_row_stride, float eps) {
+  const int64_t key_dim = hk * dk, value_dim = hv * dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t tok = blockIdx.x;
+  const int64_t head = blockIdx.y;
+  const int64_t row = tok * conv_dim;
+  const int bd = blockDim.x;  // 128 (one lane per Dk=Dv=128 element)
+  if (head < hk) {
+    // q/k L2-norm: identical tree over the identical squared values (bd == Dk here,
+    // so the accumulation is one element per lane, matching the 256-thread path minus
+    // its leading partial[t]+=partial[t+128] over the always-zero upper half).
+    __shared__ float partial[128];  // launched with exactly 128 threads (bd)
+    const Tconv* qin = conv + row + head * dk;
+    const Tconv* kin = conv + row + key_dim + head * dk;
+    Tqkv* qo = q_out + (tok * hk + head) * dk;
+    Tqkv* ko = k_out + (tok * hk + head) * dk;
+    float acc = 0.0f;
+    for (int64_t j = threadIdx.x; j < dk; j += bd) {
+      const float v = Load(qin, j);
+      acc += v * v;
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = bd / 2; s > 0; s /= 2) {
+      if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+      __syncthreads();
+    }
+    const float qinv = 1.0f / sqrtf(partial[0] + eps);
+    for (int64_t j = threadIdx.x; j < dk; j += bd) Store(qo, j, Load(qin, j) * qinv);
+    __syncthreads();
+    acc = 0.0f;
+    for (int64_t j = threadIdx.x; j < dk; j += bd) {
+      const float v = Load(kin, j);
+      acc += v * v;
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = bd / 2; s > 0; s /= 2) {
+      if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+      __syncthreads();
+    }
+    const float kinv = 1.0f / sqrtf(partial[0] + eps);
+    for (int64_t j = threadIdx.x; j < dk; j += bd) Store(ko, j, Load(kin, j) * kinv);
+  } else {
+    // V copy (128-bit staged) + §6 g/beta gating for this token.
+    const Tconv* vin = conv + row + 2 * key_dim;
+    Tqkv* vo = v_out + tok * value_dim;
+    GdnVecCopy8<Tqkv, Tconv>(vo, vin, value_dim, static_cast<int>(threadIdx.x), bd);
+    for (int64_t h = threadIdx.x; h < hv; h += bd) {
+      const int64_t idx = tok * hv + h;
+      const float av = Load(araw, tok * a_row_stride + h);
+      const float bv = Load(braw, tok * b_row_stride + h);
+      const float x = av + dt_bias[h];
+      const float sp = x > 20.0f ? x : log1pf(expf(x));  // softplus, threshold 20
+      g_out[idx] = -expf(a_log[h]) * sp;
+      beta_out[idx] = 1.0f / (1.0f + expf(-bv));
+    }
+  }
+}
+
 // Split post-conv (VT_GDN_POSTCONV_SPLIT, default ON) — grid (T, Hk+Hv), mirroring
 // vLLM's grid (ceil(L,BLOCK_T), H+HV) in _fused_post_conv_kernel:57-149 where each V
 // head is its own program. The shipped GdnPostConvKernel packs the ENTIRE
@@ -1126,9 +1243,14 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
            "cuda gdn_post_conv: q/k/v out must be f32 or bf16");
   VT_CHECK(conv.dtype == DType::kF32 || conv.dtype == DType::kBF16,
            "cuda gdn_post_conv: conv must be f32 or bf16");
-  // VT_GDN_POSTCONV_SPLIT (default ON): grid (T, Hk+Hv) — each V head its own block
-  // (mirrors vLLM). =0 restores the single-megablock grid (T, Hk+1).
+  // VT_GDN_POSTCONV_SPLIT (opt-in): grid (T, Hk+Hv) — each V head its own block
+  // (mirrors vLLM). =0 (default) uses the single-megablock grid (T, Hk+1).
   const bool split = GdnPostConvSplitEnabled();
+  // VT_GDN_POSTCONV_FAST: byte-identical megablock at 128 threads + 128-bit V copy.
+  // Only for the Dk==Dv==128 gate dims (16B alignment + value_dim%8==0); mutually
+  // exclusive with the split (both target the same megablock). See predicate.
+  const bool fast = !split && GdnPostConvFastFlagIsOn(std::getenv("VT_GDN_POSTCONV_FAST")) &&
+                    dk == 128 && dv == 128;
   dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(split ? hk + hv : hk + 1));
   cudaStream_t s = AsStream(q);
   // Dispatch over (q/k/v out dtype) x (conv-in dtype). conv is bf16 under the
@@ -1137,7 +1259,13 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
     using Tqkv = decltype(qkv_tag);
     using Tconv = decltype(conv_tag);
     using Tgate = decltype(gate_tag);
-    if (split) {
+    if (fast) {
+      GdnPostConvFastKernel<Tqkv, Tconv, Tgate><<<grid, 128, 0, s>>>(
+          q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
+          beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(), braw.Ptr<Tgate>(),
+          a_log.Ptr<float>(), dt_bias.Ptr<float>(), hk, dk, hv, dv, araw.stride[0], braw.stride[0],
+          args.eps);
+    } else if (split) {
       GdnPostConvSplitKernel<Tqkv, Tconv, Tgate><<<grid, kBlock, 0, s>>>(
           q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
           beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(),

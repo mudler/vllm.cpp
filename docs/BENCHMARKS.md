@@ -78,6 +78,33 @@ re-measures the in-situ effect; characterize the c4 TTFT lottery vs run-noise.
 `benchmark_binding=false` for these levers — no isolated speed credit; the grid owns
 the in-situ number.
 
+### 35B FP8 merged-QKV projection (2026-07-19, `CLAIM-FP8-MERGED-QKV-1`) — token-exact, perf-NEUTRAL, opt-in
+
+Component (NOT binding). Extends the fp4-only merged-QKV fusion to the 35B FP8
+W8A8 full-attn path: ONE fp8 GEMM over the N-concatenated Q/K/V operand + per-
+column dequant (`vt::MulColVecF32`) replacing 3 separate per-shard GEMMs (10
+attn layers, 30→10 attn-QKV GEMMs/step). `VT_FP8_MERGED_QKV` opt-in.
+
+Disposition: **token-exact + perf-NEUTRAL ⇒ landed OPT-IN (default OFF).** CPU
+gates GREEN (`test_ops_glue` 10/10 incl. 2 new byte-exact MulColVecF32,
+`test_ops_fp8_cutlass` 6/6, `test_ops_matmul` 7/7, clean `-Werror`). DGX GREEN
+(`~/work/vllm.cpp-fp8-merged-qkv` @ `e9ce593`, production flags, CUTLASS_OK,
+clean CUDA `-Werror` 0 warnings, one flock): 35B `test_qwen36_paged_engine`
+**315/315 token-exact both arms** (default OFF + `VT_FP8_MERGED_QKV=1`) + 27B
+`test_qwen27_paged_engine` **235/235 both arms** (inert). The merged path is
+proven to fire (its strided value view triggered — and was fixed for — a
+downstream `cast_bf16` contiguity check, which an inert merge could not produce).
+In-situ same-binary interleaved TPOT A/B (input-1024/output-128, greedy, 3
+reps/arm): c1 ~0% (ON 13.94 vs OFF 13.93 ms), c2 −0.5% (17.75 vs 17.84), c4
+−0.5% (21.40 vs 21.50), c8 ~0% (31.23 vs 31.21) — all ≤0.9% and within the
+~0.3-0.4 ms rep-to-rep noise (no clear win; the ~20-GEMM-launch saving over 10
+attn layers sits below the decode-step noise floor — the step is dominated by
+30 GDN layers + MoE). Kept opt-in per "token-exact but not measurably faster".
+Repro: build branch `kernel-gemm-fp8-merged-qkv` with
+`-DVLLM_CPP_CUTLASS_DIR=$HOME/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/data/cutlass -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON`,
+`/tmp/dgx_gate.sh` + `/tmp/dgx_ab2.sh`, one `flock /tmp/gpu`. Follow-up: GDN
+qkvz/BA fp8 merge (30 layers — larger launch slice — may clear the noise floor).
+
 ### 35B PREFILL GDN conv-fwd + fused post-conv kernel efficiency (2026-07-18, `CLAIM-GDN-PREFILL-CONV-1`) — bit-exact, conv modest win / post-conv opt-in
 
 Component (NOT binding): the prefill `causal_conv1d` forward

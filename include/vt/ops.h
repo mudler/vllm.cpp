@@ -127,6 +127,7 @@ enum class OpId : uint8_t {
   kMoeSiluMul,
   kCastBf16,
   kCastF32,
+  kMulColVecF32,
   kAttnGateSplit,
   kSigmoidGateBf16,
   kGdnGBeta,
@@ -364,6 +365,7 @@ using MoeSiluMulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 // All math in f32; dims are inferred from the tensor shapes (no args structs).
 using CastBf16Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using CastF32Fn = void (*)(Queue&, Tensor&, const Tensor&);
+using MulColVecF32Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using AttnGateSplitFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&);
 using SigmoidGateBf16Fn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using GdnGBetaFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
@@ -1178,6 +1180,18 @@ void CastBf16(Queue& q, Tensor& out, const Tensor& in);
 // upcast used to expose a bf16-only GEMM (Marlin) as an f32 result, matching the
 // value the bf16 output rounds to (mirror of the cutlass f32-output scratch cast).
 void CastF32(Queue& q, Tensor& out, const Tensor& in);
+
+// In-place per-output-column scale: x[m,n] *= col[n], with x an F32 [M,N]
+// (row-major, inner-contiguous rows; row stride may be padded) and col an F32
+// [N] contiguous broadcast vector. The load-time-free realization of a merged
+// per-tensor-fp8 projection's per-shard dequant: one fp8 GEMM over the
+// N-concatenated weight is run with alpha=1 (raw f32 accumulation), then this
+// applies each output column's folded scalar (= input_scale * that shard's
+// weight_scale) in f32 — byte-identical to the separate per-shard GEMMs when the
+// GEMM's accumulation matches (the alpha multiply is the same IEEE f32 op cuBLASLt
+// would fold). CPU + CUDA. (Mirrors the fp4 merge's per-column block-scale
+// concatenation, qwen3_5.cpp ResidentNvfp4Qkv.)
+void MulColVecF32(Queue& q, Tensor& x, const Tensor& col);
 
 // Splits the fused q/gate attention projection into its two halves. qgate is
 // [T, Hq*2*Dh] contiguous, laid out per (t,hq) as [q(Dh) | gate(Dh)]; q_out and

@@ -233,6 +233,18 @@ struct FullAttnLayerWeights {
   Fp8Weight k_proj_fp8;  // [N=Hkv*Dh,  K=H]
   Fp8Weight v_proj_fp8;  // [N=Hkv*Dh,  K=H]
   Fp8Weight o_proj_fp8;  // [N=H,       K=Hq*Dh]
+
+  // CUDA resident for the FP8 (W8A8) analog of QKVParallelLinear (VT_FP8_MERGED
+  // _QKV, opt-in). The checkpoint owns logical Q/K/V shards separately with a
+  // shared per-tensor input_scale but per-projection weight_scale; production
+  // N-concatenates their RAW fp8 bytes into one [Nq+Nk+Nv, K] operand kept
+  // resident (below), runs ONE fp8 GEMM with alpha=1 (raw f32 accumulation), and
+  // applies each output column's folded scalar (input_scale * that shard's
+  // weight_scale) through the resident per-column alpha vector — byte-identical
+  // to the three separate per-shard GEMMs when the GEMM accumulation matches.
+  // The split fp8 weights above remain available for VT_FP8_MERGED_QKV=0.
+  mutable std::shared_ptr<void> d_qkv_fp8_packed;  // i8 [Nq+Nk+Nv, K] raw e4m3fn
+  mutable std::shared_ptr<void> d_qkv_fp8_alpha;   // f32 [Nq+Nk+Nv] per-column
 };
 
 // Exact scalar processing for the three-shard CT NVFP4 QKVParallelLinear.

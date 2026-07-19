@@ -13560,4 +13560,4 @@ implementation, the new `vt::MulColVecF32` primitive, and the two glue fixes are
 merged; the merged-QKV sub-lever of `KERNEL-GEMM-FP8` is complete. **Next slice
 (higher launch leverage): GDN qkvz/BA fp8 merge — 30 layers vs 10, so ~60→30
 GDN-projection GEMMs/step may clear the noise floor the attn-only slice did not.**
-Memcheck (35B ON, full compute-sanitizer path) run separately.
+Memcheck (35B ON, full compute-sanitizer path): **0 errors**.

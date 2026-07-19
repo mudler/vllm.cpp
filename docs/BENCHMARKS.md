@@ -91,7 +91,8 @@ gates GREEN (`test_ops_glue` 10/10 incl. 2 new byte-exact MulColVecF32,
 (`~/work/vllm.cpp-fp8-merged-qkv` @ `e9ce593`, production flags, CUTLASS_OK,
 clean CUDA `-Werror` 0 warnings, one flock): 35B `test_qwen36_paged_engine`
 **315/315 token-exact both arms** (default OFF + `VT_FP8_MERGED_QKV=1`) + 27B
-`test_qwen27_paged_engine` **235/235 both arms** (inert). The merged path is
+`test_qwen27_paged_engine` **235/235 both arms** (inert); `compute-sanitizer
+memcheck` (35B ON) **0 errors**. The merged path is
 proven to fire (its strided value view triggered — and was fixed for — a
 downstream `cast_bf16` contiguity check, which an inert merge could not produce).
 In-situ same-binary interleaved TPOT A/B (input-1024/output-128, greedy, 3

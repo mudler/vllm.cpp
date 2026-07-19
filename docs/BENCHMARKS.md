@@ -16,7 +16,7 @@ reruns on the full production default set (async + vendored Triton GDN decode cu
 flips — the 111-vs-114 delta is pure noise-band coin-flip, which calibrates the
 noise floor) — establish by **two-grid per-axis totality: 110 axes pass in BOTH
 grids, 5 are noise-band coin-flips that flip between grids (at-parity by totality)
-→ 115/124 effective parity, and 9 fail in both.** They SUPERSEDE `a875397`
+→ 115/124 effective parity (REGRESSION-CONFIRMED 2026-07-19: a fresh 27B grid at `fcfde41`, after all 35B-era changes — Platform seam, GDN conv, FA2 preamble — binds 118/124 with throughput winning every concurrency, NO regression), and 9 fail in both.** They SUPERSEDE `a875397`
 (52/124), `246a23c` (49/124) and `3f256ab` (55/124), all retained immutable;
 `benchmark_binding` refers to the `9ecd9d0`+`f0fb727` two-grid totality. Evidence
 `dgx:~/work/vllm.cpp-online-gate/evidence/{9ecd9d0…,f0fb727…}` (immutable; g1

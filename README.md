@@ -46,7 +46,7 @@ OpenAI-compatible server.
 > throughput basis (vLLM's own async is −0.7%) — net-negative. A literal per-run
 > 124/124 is gated by ~5 noise-band coin-flips + this favorable tradeoff, not by
 > any real deficit; see `.agents/specs/c8-p99-itl-tail-2026-07-18.md` and the
-> parity ledger. **35B performance: 19→43/124** (2026-07-19; routing/align + host-free + FA2 + GDN-conv + load-streaming; memory 4/4 beats vLLM, c16/c32 16/20 winning decode+throughput; c1–c4 a structural low-batch regime — decode TPOT 0.81× at c1 amortizing to a win by c32, plus prefill TTFT).6-35B-A3B-NVFP4, MoE). The MoE routing/align + host-free levers closed the high-concurrency decode (c16/c32 now WIN throughput+TPOT); remaining: **MoE host double-store FIXED (2026-07-18)** — freeing the routed-expert
+> parity ledger. **35B performance: 19→57/124** (2026-07-19; MoE routing/align + host-free + FA2 prefill+decode + GDN-conv + load-streaming). Memory 4/4 beats vLLM; the c8/c16/c32 serving operating point WINS (16/20 each, TPOT 1.06-1.15×); c1/c2 residual (~0.91-0.94) is the multi-stream-overlap + glue-fusion engine work carried into roadmap_v1.81× at c1 amortizing to a win by c32, plus prefill TTFT).6-35B-A3B-NVFP4, MoE). The MoE routing/align + host-free levers closed the high-concurrency decode (c16/c32 now WIN throughput+TPOT); remaining: **MoE host double-store FIXED (2026-07-18)** — freeing the routed-expert
 > fp4 host mirror after the device Marlin resident is built (+`madvise`) drops
 > 35B STEADY serving PSS 20.17→**3.53 GiB** (beats vLLM's 13.3), token-neutral
 > 315/315+235/235; the whole-window `peak_pss` (~19.8 GiB load-phase

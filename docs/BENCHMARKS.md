@@ -518,7 +518,7 @@ Both arms 18/18 legs, 12/12 binding-eligible; evidence
 sha256 `e7576e09…`. 35B correctness holds (315/315 token-exact throughout). The
 vLLM oracle arm required a disk reclaim (flashinfer sm120 GEMM JIT).
 
-**Disposition: 43/124** (valid binding after memory-streaming flipped the 2 memory axes to 4/4; ours load peak 4.19 vs vLLM 13.3 GiB). High-concurrency STRONG (c16/c32 16/20, decode+throughput winning vLLM); memory beats vLLM (4/4); c1–c4 weak (0/20) — a structural low-batch regime (decode TPOT 0.81× at c1 scaling to winning at c32 = fixed per-step overhead; TTFT ~0.85–0.93× prefill). The big kernel levers (routing/align, host-free, FA2, GDN conv, load-stream) are banked; further micro-kernel levers measure sub-noise.
+**Disposition: 57/124** (SETTLED at the kernel-lever ceiling; 19→57 over the 35B campaign). WINS: memory 4/4 (beats vLLM), the c8-c32 serving operating point (16/20 each — decode+throughput WINNING, TPOT 1.06-1.15×). Residual c1/c2 ~0.91-0.94 + c4 at the 0.99 edge — NOT kernel-closable per attribution: the multi-stream intra-step kernel overlap (vLLM hides ~3.2ms/step via concurrency vs our serial single-stream decode graph) + portable glue-fusion, both roadmap_v1 engine work. All kernel levers banked (routing/align, host-free, FA2 prefill+decode, GDN conv, load-stream).
 
 | Concurrency | Axes | Total tok/s ours / vLLM (ratio) | Mean TTFT (v/o) | Mean TPOT (v/o) |
 |---:|---:|---:|---:|---:|

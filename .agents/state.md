@@ -13561,3 +13561,8 @@ merged; the merged-QKV sub-lever of `KERNEL-GEMM-FP8` is complete. **Next slice
 (higher launch leverage): GDN qkvz/BA fp8 merge — 30 layers vs 10, so ~60→30
 GDN-projection GEMMs/step may clear the noise floor the attn-only slice did not.**
 Memcheck (35B ON, full compute-sanitizer path): **0 errors**.
+
+## 2026-07-19 — 35B c1/c2 residual = PREFILL/TTFT (decode near-floor); next = portable glue-fusion
+c1/c2 axis breakdown (70/124 grid 5a679d6): DECODE nearly closed — c1 TPOT/ITL 0.983/0.987, c2 0.969/0.997 (aux-stream overlap did it; the fp8 merged-QKV launch-fusion measured NEUTRAL → launch overhead is NOT the c1/c2 bottleneck). The residual is PREFILL/TTFT: c1 mean/median/p90/p99 ttft 0.94/0.93/0.96/0.96; c2 0.91/0.94/0.91/0.89. So c1/c2 throughput/E2EL (0.965-0.978) is dragged by TTFT, not decode.
+- **The c1/c2 closer is the PORTABLE GLUE / EVT-EPILOGUE FUSION** (the whole-graph Inductor-fusion pattern vLLM does at prefill that we don't) — also the STANDING 27B prefill "next front" ([[prefill-gpu-bound-vt-tile-playbook]] "next front = glue/EVT-epilogue fusion"; [[fusion-must-be-portable-reuse-patterns]]). It helps BOTH models' prefill. Prefill multi-stream overlap does NOT apply (at 1024 tokens the GEMMs saturate → the aux-stream mechanism is decode-≤128-only).
+- 35B state: 70/124, c4-c32 ALL win vLLM (16/20 each) + memory 4/4; c1/c2 within 2-4% (decode near-floor, TTFT residual). The glue-fusion is the deep roadmap-v1 engine lever for the remaining c1/c2 (35B) + the 27B prefill residual — a portable fusion abstraction (reuse vLLM patterns per-backend in C++/vt::/cutlass EVT; NOT Triton/CuTe AOT). Scoping it next.

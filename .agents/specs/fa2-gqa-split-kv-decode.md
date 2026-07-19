@@ -1,5 +1,49 @@
 # W3-G — FlashAttention-2 GQA split-KV decode
 
+## 35B ratio-8 decode extension (`CLAIM-35B-FA2-DECODE-1`, 2026-07-19) — LANDED, DEFAULT-ON
+
+W3-G below shipped the 27B ratio-6 (Hq/Hkv=24/4) slice. This extension routes the
+**35B ratio-8 (Hq/Hkv=16/2) hd-256 full-attention decode** through the SAME vendored
+`flash_fwd_splitkv` main+combine path. The `LaunchDecodeFA2Bf16` body was already
+generic in the GQA ratio (the group-swap presents `[B,Hkv,G,D]` via independent
+strides for any `G`); only three gates hard-coded ratio-6. The 35B decode previously
+ran `PagedAttentionDecodeGqaKernel<...,(int)8,...>` at **grid=(num_reqs, num_kv_heads)
+= (1,2) = 2 blocks** at a single-request decode step (near-zero occupancy on the
+~100-SM GB10); split-KV adds the `num_splits` axis so the grid fills the machine.
+
+- **Files/gates widened (mirrored):** kernel dispatch `cuda_paged_attn.cu` `fa2_decode`
+  (ratio-8 arm + `Fa2Decode35BEnabled()`), adapter `cuda_flash_attn_fa2.cu`
+  `LaunchDecodeFA2Bf16` eligibility, model gate `qwen3_5.cpp` `fa2_decode` +
+  `Fa2Decode35BOn()`, operator tests `test_ops_paged_attn.cpp` (ratio-8 parity ladder
+  + toggle/window/ratio-4 fallback). New env `VT_FA2_DECODE_35B` (default ON) gates the
+  ratio-8 arm independently of the 27B `VT_FA2_DECODE`.
+- **Occupancy (nsys `--cuda-graph-trace=node`, `test_qwen36_paged_engine`):** OFF arm
+  decode = `PagedAttentionDecodeGqaKernel<...(int)8...>` ×300, grid=(1,2,1)=2 /
+  (8,2,1)=16 blocks, no combine. ON arm decode = `flash_fwd_splitkv_kernel<256,64,64,4>`
+  ×300 + `flash_fwd_splitkv_combine_kernel` ×300, `PagedAttentionDecodeGqaKernel`
+  absent — a clean 1:1 kernel swap; the split axis (GridZ up to 16) fills the machine.
+- **Token-exact on the FULL current-main default set (async ON + GDN cubin + all fast
+  kernels + FA2 prefill + FA2 decode-35B ON):** 35B `test_qwen36_paged_engine`
+  **315/315**, 27B `test_qwen27_paged_engine` **235/235** (unaffected). Operator
+  `test_ops_paged_attn` **21 cases / 454,358 assertions** (adds the ratio-8 parity
+  ladder B∈{1,2,4,8,16}). No near-tie flip. memcheck 35B decode **0 illegal-access
+  errors** (315/315; `--leak-check full` reports only engine exit-time model residency,
+  not safety); strict operator memcheck 0-err/0-leak.
+- **IN-SITU c1/c8 A/B (same binary `VT_FA2_DECODE_35B=1` vs `=0`, 35B NVFP4, input-1024
+  /output-128, greedy, one flock, 4 interleaved ON/OFF pairs, first dropped):**
+  **c1 TPOT 14.96→(off)16.72 ms = −10.5%** (total tput +10.4%); **c8 TPOT
+  33.02→34.12 ms = −3.2%** (+2.8% tput); TTFT neutral (~233/~826 ms both, decode-only
+  lever). Per-arm spread <0.15 ms, arms well-separated. The isolated ~1.86 ms/step
+  attention win translates nearly 1:1 at c1 and dilutes toward higher batch as the old
+  kernel's 2→16-block occupancy improves.
+- **Decision: token-exact AND faster in-situ at both points ⇒ DEFAULT-ON** (ships as
+  `VT_FA2_DECODE_35B` unset = ON; `=0` is the same-binary rollback). Evidence:
+  `dgx:~/work/vllm.cpp-35b-fa2-decode/{gates_default.log,gates_engine.log,gpu_series.log,
+  memcheck35.log,nsys_ON/OFF.*}`. This targets the state-log 35B c1 decode-TPOT 0.810×
+  residual (the biggest remaining low-batch c1–c4 lever); the orchestrator re-grids.
+
+---
+
 Status: **ACTIVE/GATING; PERFORMANCE FAILED** on 2026-07-13. W3-G1--G4 are
 complete at immutable `ae9e8ff`: clean sm_121a build, CUDA
 operator/capture/lifecycle, strict zero-error/zero-leak memcheck, both

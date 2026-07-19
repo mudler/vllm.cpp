@@ -2444,10 +2444,22 @@ bool Fa2PrefillEnabled() {
 }
 
 // vLLM v0.25's pure-decode group swap + split-KV route. Read fresh so one
-// process can run the exact same-binary fallback arm. The first slice is
-// deliberately ratio-6-only; other ratios retain LaunchDecode.
+// process can run the exact same-binary fallback arm. Governs the 27B ratio-6
+// (Hq/Hkv=24/4) arm; the 35B ratio-8 arm has its own toggle below.
 bool Fa2DecodeEnabled() {
   const char* e = std::getenv("VT_FA2_DECODE");
+  return e == nullptr || e[0] != '0';
+}
+
+// 35B ratio-8 (Hq/Hkv=16/2) hd-256 decode arm of the SAME vendored split-KV
+// path. The old ratio-6 decode launched only grid=(num_reqs,num_kv_heads) blocks
+// at c1 (2 blocks on a ~100-SM GB10 ⇒ near-zero occupancy); the split-KV kernel
+// splits the KV dimension so the grid fills the machine at low batch. Read fresh
+// so one process can A/B ON vs OFF. Independent of VT_FA2_DECODE so the ratio-8
+// default and fallback are controllable without disturbing the 27B ratio-6 arm.
+// MUST match qwen3_5.cpp Fa2Decode35BOn().
+bool Fa2Decode35BEnabled() {
+  const char* e = std::getenv("VT_FA2_DECODE_35B");
   return e == nullptr || e[0] != '0';
 }
 #endif  // VLLM_CPP_FLASH_ATTN
@@ -2495,14 +2507,22 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
                            std::is_same<TQ, __nv_bfloat16>::value &&
                            std::is_same<TKV, __nv_bfloat16>::value &&
                            out.dtype == DType::kBF16;
-  // Exact W3-G scope: pure decode, Hq/Hkv=24/4, D256, paged BF16, global
-  // causal attention and FA2-compatible page/block-table layout. q/out are
-  // selected BF16 by the matching model-side gate, so no cast kernel appears.
-  const bool fa2_decode = !is_prefill && num_tokens == num_reqs && hq == 24 &&
-                          num_kv_heads == 4 && qpk == 6 && d == 256 &&
+  // FA2 pure-decode scope: pure decode, D256, paged BF16, global causal
+  // attention and FA2-compatible page/block-table layout. q/out are selected
+  // BF16 by the matching model-side gate, so no cast kernel appears. Two
+  // independently-toggled topologies share the exact vendored split-KV path:
+  //   * 27B ratio-6 Hq/Hkv=24/4 (W3-G), gated by VT_FA2_DECODE;
+  //   * 35B ratio-8 Hq/Hkv=16/2 (CLAIM-35B-FA2-DECODE-1), gated by
+  //     VT_FA2_DECODE_35B — the old ratio-8 path launched only 2 blocks/step.
+  // The LaunchDecodeFA2Bf16 body is generic in groups/heads; only these gates
+  // and the model-side dtype selection need the ratio widened.
+  const bool fa2_decode_r6 = hq == 24 && num_kv_heads == 4 && qpk == 6 && Fa2DecodeEnabled();
+  const bool fa2_decode_r8 = hq == 16 && num_kv_heads == 2 && qpk == 8 && Fa2Decode35BEnabled();
+  const bool fa2_decode = !is_prefill && num_tokens == num_reqs && d == 256 &&
                           block_size % 16 == 0 && args.causal &&
                           !args.window_size.has_value() &&
-                          block_table.stride[1] == 1 && Fa2DecodeEnabled() &&
+                          block_table.stride[1] == 1 &&
+                          (fa2_decode_r6 || fa2_decode_r8) &&
                           std::is_same<TQ, __nv_bfloat16>::value &&
                           std::is_same<TKV, __nv_bfloat16>::value &&
                           out.dtype == DType::kBF16;

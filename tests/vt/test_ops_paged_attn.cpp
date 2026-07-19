@@ -1324,7 +1324,11 @@ Fa2DecodeRunStats RunFa2DecodeCase(Fa2DecodeCase& c, const char* toggle,
   DeviceTensor qsl(gpu, guard.q, DType::kI32, {c.batch + 1}, c.qsl.data());
   DeviceTensor out(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d});
 
+  // Both decode arms share this harness: VT_FA2_DECODE gates the 27B ratio-6
+  // topology, VT_FA2_DECODE_35B the 35B ratio-8 topology. Drive both from the
+  // same toggle so a case's expect_fa2 is honored regardless of its ratio.
   EnvGuard decode_toggle("VT_FA2_DECODE", toggle);
+  EnvGuard decode35_toggle("VT_FA2_DECODE_35B", toggle);
   vt::cuda::testing::ResetFa2DecodeDebugCounters();
   PagedAttentionArgs args{c.scale, true};
   args.window_size = window;
@@ -1386,6 +1390,23 @@ TEST_CASE("paged_attention CUDA FA-2 ratio-6 pure decode matches composed refere
   }
 }
 
+TEST_CASE("paged_attention CUDA FA-2 ratio-8 pure decode matches composed reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 ratio-8 decode parity (dgx-pending)");
+    return;
+  }
+  // Qwen3.6-35B Hq/Hkv=16/2 hd-256 (CLAIM-35B-FA2-DECODE-1): the same vendored
+  // split-KV path as ratio-6, now enabled for the 35B full-attention layers.
+  for (const int batch : {1, 2, 4, 8, 16}) {
+    CAPTURE(batch);
+    std::vector<int32_t> lengths(static_cast<size_t>(batch));
+    for (int i = 0; i < batch; ++i) lengths[static_cast<size_t>(i)] = 1024 + i * 7;
+    Fa2DecodeCase c(/*Hq=*/16, /*Hkv=*/2, std::move(lengths),
+                    6500U + static_cast<uint32_t>(batch));
+    RunFa2DecodeCase(c, "1", /*expect_fa2=*/true);
+  }
+}
+
 TEST_CASE("paged_attention CUDA FA-2 decode toggle and invalid eligibility use fallback") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend; skipping FA-2 decode fallback vectors (dgx-pending)");
@@ -1396,9 +1417,17 @@ TEST_CASE("paged_attention CUDA FA-2 decode toggle and invalid eligibility use f
   RunFa2DecodeCase(ratio6, "1", /*expect_fa2=*/false,
                    AttentionWindow{127, 0});
 
-  // The Qwen3.6-35B ratio-8 topology is deliberately inert in this slice.
+  // The 35B ratio-8 topology is now supported; VT_FA2_DECODE_35B=0 and a finite
+  // window each fall back to the paged kernel in the same binary.
   Fa2DecodeCase ratio8(/*Hq=*/16, /*Hkv=*/2, {1024, 1057}, 6310);
-  RunFa2DecodeCase(ratio8, "1", /*expect_fa2=*/false);
+  RunFa2DecodeCase(ratio8, "0", /*expect_fa2=*/false);
+  RunFa2DecodeCase(ratio8, "1", /*expect_fa2=*/false,
+                   AttentionWindow{127, 0});
+
+  // An unsupported GQA ratio (Hq/Hkv=8/2, ratio 4) stays on the fallback even
+  // with both decode toggles enabled.
+  Fa2DecodeCase ratio4(/*Hq=*/8, /*Hkv=*/2, {1024, 1057}, 6320);
+  RunFa2DecodeCase(ratio4, "1", /*expect_fa2=*/false);
 }
 
 TEST_CASE("paged_attention CUDA FA-2 decode scratch is capture-stable across replay") {

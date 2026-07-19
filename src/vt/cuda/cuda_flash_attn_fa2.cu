@@ -38,11 +38,14 @@
 // natively (fused preamble emits bf16 q/k, attention output is bf16 into the
 // sigmoid gate); anything else falls through to the WMMA ladder.
 //
-// VT_FA2_PREFILL and VT_FA2_DECODE are independent runtime toggles. Decode is
-// initially bounded to the Qwen3.6-27B ratio-6 BF16/D256 path. Its scratch is
-// keyed by device+stream+capture-stable shape and never moved until queue
-// teardown: the cold eager graph step allocates it, capture/replay only reuses
-// the same pointers. The 35B ratio-8 path remains on the existing fallback.
+// VT_FA2_PREFILL, VT_FA2_DECODE (27B ratio-6) and VT_FA2_DECODE_35B (35B
+// ratio-8) are independent runtime toggles. Decode covers the two hd-256 BF16
+// GQA topologies of the two gate models — Qwen3.6-27B Hq/Hkv=24/4 and
+// Qwen3.6-35B Hq/Hkv=16/2 — through the same vendored split-KV kernel; the
+// group-swap presentation is generic in the GQA ratio. Its scratch is keyed by
+// device+stream+capture-stable shape and never moved until queue teardown: the
+// cold eager graph step allocates it, capture/replay only reuses the same
+// pointers. Other ratios / windows / non-256 shapes remain on the fallback.
 #ifdef VLLM_CPP_FLASH_ATTN
 
 #include <cuda_bf16.h>
@@ -419,11 +422,12 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   Check(cudaGetLastError(), "splitkv dispatch launch");
 }
 
-// Launch the pinned FA2 pure-decode optimization for the first bounded slice:
-// bf16 paged KV, D256, Hq/Hkv=24/4 (G=6), one query per request, global causal
-// decoder attention. flash_api.cpp first normalizes max_seqlen_q==1 to
-// non-causal, then swaps query groups into the sequence dimension and applies
-// split-KV. Independent strides let us expose that logical swap without copies:
+// Launch the pinned FA2 pure-decode optimization: bf16 paged KV, D256, one
+// query per request, global causal decoder attention, for either Hq/Hkv=24/4
+// (G=6, 27B) or Hq/Hkv=16/2 (G=8, 35B). flash_api.cpp first normalizes
+// max_seqlen_q==1 to non-causal, then swaps query groups into the sequence
+// dimension and applies split-KV. Independent strides let us expose that
+// logical swap without copies:
 //   physical [B,Hkv,G,D] address = b*Hq*D + kv*G*D + g*D + d
 //   logical  [B,G,Hkv,D] strides = {Hq*D, D, G*D, 1}.
 void LaunchDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
@@ -434,13 +438,19 @@ void LaunchDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
                          int64_t block_size) {
   if (query.shape[0] == 0) return;
   const int64_t groups = hq / num_kv_heads;
+  // Two supported topologies, both hd-256 BF16 paged global-causal pure decode:
+  //   * 27B ratio-6 Hq/Hkv=24/4 (W3-G);
+  //   * 35B ratio-8 Hq/Hkv=16/2 (CLAIM-35B-FA2-DECODE-1).
+  // The split-KV group-swap below is generic in groups/heads, so the body is
+  // shared; only this admission and the caller gates encode the ratio.
+  const bool ratio6 = hq == 24 && num_kv_heads == 4 && groups == 6;
+  const bool ratio8 = hq == 16 && num_kv_heads == 2 && groups == 8;
   if (query.dtype != DType::kBF16 || k_cache.dtype != DType::kBF16 ||
       v_cache.dtype != DType::kBF16 || out.dtype != DType::kBF16 ||
-      query.shape[0] != num_reqs || hq != 24 || num_kv_heads != 4 ||
-      groups != 6 || d != 256 || block_size % 16 != 0 || !args.causal ||
-      args.window_size.has_value()) {
+      query.shape[0] != num_reqs || !(ratio6 || ratio8) || d != 256 ||
+      block_size % 16 != 0 || !args.causal || args.window_size.has_value()) {
     throw std::runtime_error(
-        "cuda flash-attn-2 decode: dispatch called outside ratio-6 BF16/D256 eligibility");
+        "cuda flash-attn-2 decode: dispatch called outside ratio-6/ratio-8 BF16/D256 eligibility");
   }
 
   const int batch = static_cast<int>(num_reqs);

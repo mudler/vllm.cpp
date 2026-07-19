@@ -1256,6 +1256,22 @@ bool Fa2DecodeOn() {
 #endif
 }
 
+// 35B ratio-8 (Hq/Hkv=16/2) hd-256 FA2 split-KV decode arm
+// (CLAIM-35B-FA2-DECODE-1). The old ratio-8 decode ran the fused GQA kernel with
+// grid=(num_reqs,num_kv_heads) = 2 blocks/step at c1 (near-zero GB10 occupancy);
+// the vendored split-KV kernel splits the KV dimension so the grid fills the
+// machine. Independent of VT_FA2_DECODE (the 27B ratio-6 arm) so the 35B default
+// and same-binary fallback are controllable on their own. MUST mirror
+// cuda_paged_attn.cu Fa2Decode35BEnabled().
+bool Fa2Decode35BOn() {
+#ifdef VLLM_CPP_FLASH_ATTN
+  const char* e = std::getenv("VT_FA2_DECODE_35B");
+  return e == nullptr || e[0] != '0';
+#else
+  return false;
+#endif
+}
+
 // QUANTIZE-ONCE: q/k/v (and gate/up) share their input activation AND their on-disk
 // input_global_scale (verified: 27B layer-3 q/k/v all 28.75; gate/up 812/476), so we
 // can ScaledFp4Quant the shared activation ONCE and feed each projection's fp4xfp4
@@ -3255,17 +3271,21 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // by FA2. The prefill FA2 dispatch (cuda_paged_attn.cu:2494) admits ANY GQA
   // ratio at head_dim 256, so BOTH the 27B (ratio-6) and the 35B (ratio-8) take
   // FA2 prefill (2026-07-18 flip, default-ON via FuseAttnPreambleOn). Pure
-  // decode FA2 remains ratio-6-only (27B); the 35B decode and all windows /
-  // non-causal / non-256 shapes stay f32 on the graph-captured fallback.
+  // decode FA2 now covers BOTH gate topologies through the same vendored
+  // split-KV kernel: 27B ratio-6 (Hq/Hkv=24/4, VT_FA2_DECODE) and 35B ratio-8
+  // (Hq/Hkv=16/2, VT_FA2_DECODE_35B — CLAIM-35B-FA2-DECODE-1). All windows /
+  // non-causal / non-256 / other-ratio shapes stay f32 on the graph-captured
+  // fallback.
   const bool fa2_prefill = Fa2PrefillOn() && FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin &&
                            d.q.device.type == vt::DeviceType::kCUDA &&
                            kv.dtype == DType::kBF16 && Dh == 256 && T > meta.num_reqs;
-  const bool fa2_decode = Fa2DecodeOn() && FuseAttnPreambleOn(fp4) &&
+  const bool fa2_decode_r6 = Hq == 24 && Hkv == 4 && Fa2DecodeOn();
+  const bool fa2_decode_r8 = Hq == 16 && Hkv == 2 && Fa2Decode35BOn();
+  const bool fa2_decode = (fa2_decode_r6 || fa2_decode_r8) && FuseAttnPreambleOn(fp4) &&
                           sdi.has_attn_cos_sin &&
                           d.q.device.type == vt::DeviceType::kCUDA &&
                           kv.dtype == DType::kBF16 && kv.block_size % 16 == 0 &&
-                          Dh == 256 && Hq == 24 && Hkv == 4 &&
-                          T == meta.num_reqs && meta.causal;
+                          Dh == 256 && T == meta.num_reqs && meta.causal;
   const bool fa2_attention = fa2_prefill || fa2_decode;
   const DType attn_dt = fa2_attention ? DType::kBF16 : DType::kF32;
   DBuf dq3(d, attn_dt, {T, Hq, Dh});

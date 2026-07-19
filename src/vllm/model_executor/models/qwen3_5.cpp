@@ -3444,6 +3444,20 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     v3f32.emplace(d, DType::kF32, std::vector<int64_t>{T, Hkv, Dh});
     vt::CastF32(d.q, v3f32->t(), v3);
     v3 = v3f32->t();
+  } else if (!v3.IsContiguous()) {
+    // Merged-QKV packed F32 value view: the token stride spans Q+K+V, but
+    // vt::Attention requires contiguous q/k/v. Materialize a dense [T,Hkv,Dh]
+    // copy (the reference non-paged path; the paged path instead round-trips
+    // through the KV cache). The inner [Hkv,Dh] block is already contiguous, so
+    // this is T per-row device copies — not perf-critical for the reference path.
+    v3f32.emplace(d, DType::kF32, std::vector<int64_t>{T, Hkv, Dh});
+    const int64_t inner = Hkv * Dh;
+    for (int64_t tok = 0; tok < T; ++tok) {
+      d.b.Copy(d.q, v3f32->t().Ptr<float>() + tok * inner,
+               vf.Ptr<float>() + tok * vf.stride[0],
+               static_cast<size_t>(inner) * sizeof(float));
+    }
+    v3 = v3f32->t();
   }
   DBuf dattn(d, DType::kF32, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(SizeF(Dh));

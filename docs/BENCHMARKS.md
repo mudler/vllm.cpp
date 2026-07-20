@@ -61,6 +61,20 @@ CPU-only `-Werror=unused-function` (`FuseSigmoidGateQuantEnabled`, used only und
 `#ifdef VT_CUTLASS_NVFP4`) fixed with `[[maybe_unused]]` — no behavior change,
 keeps the CPU CI build green.
 
+**W2 landed (2026-07-20):** the bespoke hand-fused ops are MIGRATED to
+`vt::FusedChain(recipe)` at six production call sites (`kSiluMulFp4Quant` MoE
+down-proj, `kSigmoidGateFp4Quant` full-attn o-proj, `kRmsNormGatedQuantFp8` ×2 GDN
+out-proj, `kRmsNormQuantFp8` input-layernorm, `kAttnQkNormRopeGate` ×2 attn preamble),
+behind `VT_FUSED_CHAIN_ADOPT` (`=0` restores the exact prior hand-calls). Each recipe
+binds (via a new backend-agnostic `FusedRecipe.fast_op`) to its EXISTING single-launch
+fused kernel, so `FusedChain(recipe)` dispatches to the SAME fast kernel the model
+called directly before migration. **Benchmark disposition: perf-NEUTRAL by construction**
+— the same fast `OpId` dispatches (no extra kernel, no per-forward getenv/alloc), so
+this is NOT a speedup and needs no re-grid. Gates (dgx `~/work/vllm.cpp-fusion-w2`,
+prod flags, clean CUDA `-Werror` 0-warn): byte-exact `test_ops_fused_chain` CPU 228 +
+CUDA 420 assertions (fast == Tier-0 composite == unfused-op-sequence golden per recipe),
+memcheck 0; token-exact 27B 235/235 + 35B 315/315 on BOTH `VT_FUSED_CHAIN_ADOPT` arms.
+
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
 reruns on the full production default set (async + vendored Triton GDN decode cubin

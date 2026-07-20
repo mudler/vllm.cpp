@@ -816,8 +816,22 @@ struct FusedParams {
 };
 
 // General entry: realize `recipe` over the bound operands with `params`.
+//
+// Realization order (W2): (1) if the recipe carries a fast_op (a bespoke single-
+// launch fused kernel, e.g. kSiluMulFp4Quant) AND that OpId is registered on the
+// device, dispatch to it — the SAME fast kernel the model called directly before
+// migration, so the migration is perf-neutral by construction; (2) else, for a
+// Tier-1-able recipe with VT_FUSED_TIER=1, the interpreter kernel; (3) else the
+// Tier-0 composite. Every tier is byte-exact to the others per the §5 discipline.
 void FusedChain(Queue& q, const FusedRecipe& recipe, const FusedBinding& binding,
                 const FusedParams& params);
+
+// Force the Tier-0 composite realization (the standalone-op-sequence oracle),
+// bypassing any fast_op / interpreter tier. This is the byte-exact golden the fast
+// realization is validated against; the parity tests call it to assert
+// fast == composite == the unfused sequence. Production code uses FusedChain.
+void FusedChainComposite(Queue& q, const FusedRecipe& recipe, const FusedBinding& binding,
+                         const FusedParams& params);
 
 // Narrow overload for the canonical (out, x, weight, residual) 4-operand shape —
 // the W0-adopted kFusedAddRmsNorm site. Binds [x, weight, residual, out] and
@@ -825,6 +839,41 @@ void FusedChain(Queue& q, const FusedRecipe& recipe, const FusedBinding& binding
 // {eps, gemma=true}, residual) for kFusedAddRmsNorm.
 void FusedChain(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, Tensor* residual,
                 const FusedRecipe& recipe, float eps);
+
+// --- W2 convenience overloads: keep each migrated model call site a SINGLE
+// FusedChain call (the bespoke fused-op call → one declarative recipe dispatch).
+// Each binds the recipe's indexed operand table positionally and forwards to the
+// general entry, which dispatches to the recipe's fast_op realization. The Tier-0
+// composite intermediate slot (tmp_bf16) is bound nullptr — these sites feed the
+// fast realization (which never materializes it); FusedChainComposite validates
+// the composite separately with caller-provided scratch.
+
+// Fp4-activation-quant shape (kSiluMulFp4Quant, kSigmoidGateFp4Quant): two float
+// inputs a,b -> out_packed[M,K/2] + out_scale. Binds [a, b, nullptr, packed, scale].
+void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& out_packed, Tensor& out_scale,
+                const Tensor& a, const Tensor& b, float quant_scale,
+                Fp4ScaleLayout scale_layout = Fp4ScaleLayout::kLinear);
+
+// RmsNorm->fp8 shape (kRmsNormQuantFp8): residual-add + gemma-RMSNorm -> static
+// fp8, with an optional bf16 normed output. Binds [x, weight, residual, out_bf16,
+// out_fp8]; residual/out_bf16 may be nullptr (matching the bespoke op contract).
+void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& out_fp8, Tensor* out_bf16,
+                const Tensor& x, const Tensor& weight, Tensor* residual, float eps,
+                float input_scale);
+
+// Gated-RmsNorm->fp8 shape (kRmsNormGatedQuantFp8): gated-RMSNorm -> static fp8.
+// Binds [x, gate, weight, nullptr, out_fp8].
+void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& out_fp8, const Tensor& x,
+                const Tensor& gate, const Tensor& weight, float eps, float input_scale);
+
+// Fused-attention-preamble MACRO shape (kAttnQkNormRopeGate): binds the recipe's
+// fixed 8-operand table [qgate, kf, q_norm, k_norm, cos_sin, q_out, k_out, gate_out]
+// and forwards to the general entry. This recipe has NO fast_op — its Tier-0
+// composite already dispatches the whole preamble to the single vt::AttnQkNormRopeGate
+// kernel, so the migration is perf-neutral by construction (same one launch).
+void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& q_out, Tensor& k_out,
+                Tensor& gate_out, const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
+                const Tensor& k_norm, const Tensor& cos_sin, float eps, const RopeArgs& rope);
 
 // out[T,D] = silu(x[:, :D]) * x[:, D:], x is [T, 2D]; out f32 or bf16.
 // Note: computes in f32 (upstream forward_native computes in x's dtype); bf16 parity tests need bf16-eps tolerance.

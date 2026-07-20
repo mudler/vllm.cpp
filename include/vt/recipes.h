@@ -15,6 +15,7 @@
 #pragma once
 
 #include "vt/fused_recipe.h"
+#include "vt/ops.h"  // OpId — for the per-recipe fast-realization binding (fast_op)
 
 namespace vt {
 
@@ -83,6 +84,7 @@ constexpr FusedRecipe kRmsNormQuantFp8 = {
     /*n=*/3,
     /*n_operands=*/5,
     /*name=*/"rms_norm_quant_fp8",
+    /*fast_op=*/static_cast<int>(OpId::kRmsNormQuantFp8),
 };
 
 // kRmsNormGatedQuantFp8 — gated-RMSNorm -> static per-tensor fp8 (the GDN
@@ -111,6 +113,7 @@ constexpr FusedRecipe kRmsNormGatedQuantFp8 = {
     /*n=*/2,
     /*n_operands=*/5,
     /*name=*/"rms_norm_gated_quant_fp8",
+    /*fast_op=*/static_cast<int>(OpId::kRmsNormGatedQuantFp8),
 };
 
 // kSiluMulFp4Quant — silu(gate)·up -> NVFP4 activation quant (the MoE gate·up
@@ -142,6 +145,7 @@ constexpr FusedRecipe kSiluMulFp4Quant = {
     /*n=*/2,
     /*n_operands=*/5,
     /*name=*/"silu_mul_fp4_quant",
+    /*fast_op=*/static_cast<int>(OpId::kSiluMulFp4Quant),
 };
 
 // kSigmoidGateFp4Quant — attn·sigmoid(gate) -> NVFP4 activation quant (the
@@ -172,6 +176,7 @@ constexpr FusedRecipe kSigmoidGateFp4Quant = {
     /*n=*/2,
     /*n_operands=*/5,
     /*name=*/"sigmoid_gate_fp4_quant",
+    /*fast_op=*/static_cast<int>(OpId::kSigmoidGateFp4Quant),
 };
 
 // kAttnQkNormRopeGate — gemma-RMSNorm(q) + gemma-RMSNorm(k) + partial NeoX RoPE

@@ -13962,3 +13962,42 @@ changed) ⇒ `benchmark_binding=false`.
 **Next.** W2 migrates the hand-fused ops to these declarations one-by-one (each
 byte-exact + token-exact), and `qwen3_5.cpp` shrinks. See `portable-fusion-framework.md`
 §10 W2.
+
+## 2026-07-20 — KERNEL-FUSION-FRAMEWORK W2: hand-fusions MIGRATED to `vt::FusedChain(recipe)` (`CLAIM-FUSION-FRAMEWORK-W2`)
+
+**What.** W2 of the portable op-fusion framework: the model's bespoke hand-fused
+ops are now MIGRATED to declarative `vt::FusedChain(recipe)` calls — the framework
+OWNS the fusion dispatch, byte-identical and perf-neutral by construction.
+
+**The perf-neutral realization pattern (the core W2 design).** W1's Tier-0 composite
+for a quant-fused recipe is the standalone-op SEQUENCE (e.g. `RmsNorm`→`QuantFp8Static`
+= TWO kernels), but the model calls a FAST SINGLE fused kernel. Migrating to the
+composite would REGRESS perf. So each recipe binds to its EXISTING fast kernel via a
+new backend-agnostic `FusedRecipe.fast_op` field (the raw `OpId`; realized per-backend
+through the op table). `FusedChain` dispatches recipe→fast_op when the backend registers
+that OpId — the SAME kernel the model called directly before migration → byte-identical
++ perf-neutral (no extra kernel, no per-forward getenv/alloc). A backend without the
+fast kernel falls through to the byte-exact Tier-0 composite (graceful degradation,
+now exposed as `vt::FusedChainComposite`, the oracle the fast path is validated against).
+This is the "fast realization" tier the spike §3c reserved, added as legitimate W2
+infra: `fast_op` + a non-throwing `OpRegistered` probe + a per-recipe `DispatchFusedFast`
+adapter switch (O(1) per fast op, mirrors the composite's per-opcode switch) + three
+convenience overloads keeping each site a single call.
+
+**Sites migrated (6, all behind `VT_FUSED_CHAIN_ADOPT`, `=0` = exact prior hand-call,
+same binary):** `kSiluMulFp4Quant` (MoE down-proj), `kSigmoidGateFp4Quant` (full-attn
+o-proj gate), `kRmsNormGatedQuantFp8` ×2 (GDN out-proj), `kRmsNormQuantFp8`
+(input-layernorm fp8 producer), `kAttnQkNormRopeGate` ×2 (attn preamble — composite
+MACRO = the single fused op, no fast_op needed). All 5 W1 recipes' sites migrated;
+none deferred. qwen3_5.cpp net +61 lines (call-for-call neutral; growth is the mandated
+rollback `else` branches — true shrinkage lands when those + the bespoke `OpId`s retire).
+
+**Gates (dgx `~/work/vllm.cpp-fusion-w2`, prod flags, clean CUDA `-Werror` 0 warnings,
+CUTLASS+Triton AOT engaged, one flock).** Byte-exact `test_ops_fused_chain`: CPU 228 +
+CUDA 420 assertions, 0 failed (each migrated recipe asserts fast == composite ==
+unfused-sequence golden). Token-exact BOTH `VT_FUSED_CHAIN_ADOPT` arms: 27B 235/235 +
+35B 315/315 on `=1` (fast-realization path) AND `=0` (rollback). memcheck 0 errors.
+Perf-neutral by construction (same fast OpId dispatches) ⇒ `benchmark_binding=false`.
+
+**Next.** W3 mechanical-sync proof (a new vLLM pass ports as ONE declaration + its
+byte-exact test); W4 mock-backend additivity. See `portable-fusion-framework.md` §10.

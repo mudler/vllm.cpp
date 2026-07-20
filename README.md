@@ -262,7 +262,7 @@ both gate models (DGX-confirmed token-exact: 27B 235/235 + 35B 315/315, memcheck
 attention-backend registry, model self-registration).
 
 **Extensibility — roadmap_v1 ORDER-1: the portable op-fusion framework
-(SPIKED 2026-07-19; W0 ADOPTED 2026-07-19; W1 POD GENERALIZED 2026-07-20).** The fourth and unifying seam: fusions **declared once**
+(SPIKED 2026-07-19; W0 ADOPTED; W1 POD GENERALIZED; W2 HAND-FUSIONS MIGRATED 2026-07-20).** The fourth and unifying seam: fusions **declared once**
 (a backend-agnostic recipe catalog above `vt::`, transcribing vLLM's finite
 fusion-pass set) and **realized per-backend** through the `vt::` op table (a
 composite tier is the CPU oracle every backend inherits free; one interpreter
@@ -284,8 +284,20 @@ quant-fused W2 target chains (`kRmsNormQuantFp8`, `kRmsNormGatedQuantFp8`,
 as `constexpr` recipes whose Tier-0 composite is byte-exact to the standalone-op
 sequence the model hand-calls today (proven CPU + CUDA; 35B 315/315 + 27B 235/235
 token-exact regression on the W0 site, memcheck 0). W1 is infrastructure only — no
-model call site changed; W2 migrates the hand-fused ops to these declarations.
-Honest scope: this is an **extensibility +
+model call site changed. **W2 landed (2026-07-20):** the bespoke hand-fused ops are
+now MIGRATED to `vt::FusedChain(recipe)` at six production call sites
+(`kSiluMulFp4Quant` MoE down-proj, `kSigmoidGateFp4Quant` full-attn o-proj gate,
+`kRmsNormGatedQuantFp8` ×2 GDN out-proj, `kRmsNormQuantFp8` input-layernorm,
+`kAttnQkNormRopeGate` ×2 attn preamble) — the framework now OWNS the fusion dispatch.
+Each recipe carries a `fast_op` binding to its existing single-launch fused kernel, so
+`FusedChain(recipe)` dispatches to the SAME fast kernel the model called directly
+before migration: **byte-identical AND perf-neutral by construction** (no extra
+kernel, no per-forward getenv/alloc). The Tier-0 composite is the byte-exact oracle the
+fast kernel is validated against (`test_ops_fused_chain` proves fast == composite ==
+unfused sequence). Gates: clean CUDA `-Werror` 0-warn, byte-exact CUDA 420/420, and
+token-exact 27B 235/235 + 35B 315/315 on BOTH `VT_FUSED_CHAIN_ADOPT` arms (`=0`
+restores the exact prior hand-calls, same binary). Honest scope: this is an
+**extensibility +
 mechanical-upstream-sync** cornerstone, not a perf lever — W0/W1 are perf-neutral by
 construction (the measured 35B prefill gap is compute-bound, ceiling ~3.5%/step).
 Spike + work breakdown (W0–Wn):

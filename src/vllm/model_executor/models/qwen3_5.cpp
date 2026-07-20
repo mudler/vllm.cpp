@@ -1983,10 +1983,19 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
     DBuf as(d, DType::kI8,
             direct_scale ? CutlassFp4ScaleShape(T, K)
                          : std::vector<int64_t>{T, K / 16});
-    vt::SigmoidGateFp4Quant(d.q, ap.t(), as.t(), attn2d, gate2d,
-                            w.o_proj_fp4.input_global_scale_inv,
-                            direct_scale ? vt::Fp4ScaleLayout::kCutlassSwizzled
-                                         : vt::Fp4ScaleLayout::kLinear);
+    const vt::Fp4ScaleLayout lay =
+        direct_scale ? vt::Fp4ScaleLayout::kCutlassSwizzled : vt::Fp4ScaleLayout::kLinear;
+    // KERNEL-FUSION-FRAMEWORK W2 — route attn·sigmoid(gate) + NVFP4 quant through
+    // vt::FusedChain(kSigmoidGateFp4Quant); its fast_op binds the SAME bespoke
+    // SigmoidGateFp4Quant kernel (byte-identical + perf-neutral). VT_FUSED_CHAIN_ADOPT=0
+    // restores the direct hand-call.
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(d.q, vt::kSigmoidGateFp4Quant, ap.t(), as.t(), attn2d, gate2d,
+                     w.o_proj_fp4.input_global_scale_inv, lay);
+    } else {
+      vt::SigmoidGateFp4Quant(d.q, ap.t(), as.t(), attn2d, gate2d,
+                              w.o_proj_fp4.input_global_scale_inv, lay);
+    }
     return MatmulNvfp4Fp4DirectD(d, ap.t(), as.t(), w.o_proj_fp4, DType::kBF16,
                                  direct_scale ? &as.t() : nullptr);
   }
@@ -2985,8 +2994,17 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     DBuf a_fp8(d, DType::kI8, {T, value_dim});
     Tensor a_fp8_v = z_strided ? Reshape(a_fp8.t(), {T, Hv, Dv})
                                : Reshape(a_fp8.t(), {T * Hv, Dv});
-    vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false},
-                             w.out_proj_fp8.input_scale);
+    // KERNEL-FUSION-FRAMEWORK W2 — route gated-RMSNorm + static fp8 quant through
+    // vt::FusedChain(kRmsNormGatedQuantFp8); its fast_op binds the SAME bespoke
+    // RmsNormGatedQuantFp8 kernel (byte-identical + perf-neutral). VT_FUSED_CHAIN_ADOPT=0
+    // restores the direct hand-call.
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(d.q, vt::kRmsNormGatedQuantFp8, a_fp8_v, core2, z2, dnw, eps,
+                     w.out_proj_fp8.input_scale);
+    } else {
+      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false},
+                               w.out_proj_fp8.input_scale);
+    }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
@@ -3478,8 +3496,17 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     DBuf a_fp8(d, DType::kI8, {T, value_dim});
     Tensor a_fp8_v = z_strided ? Reshape(a_fp8.t(), {T, Hv, Dv})
                                : Reshape(a_fp8.t(), {T * Hv, Dv});
-    vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false},
-                             w.out_proj_fp8.input_scale);
+    // KERNEL-FUSION-FRAMEWORK W2 — route gated-RMSNorm + static fp8 quant through
+    // vt::FusedChain(kRmsNormGatedQuantFp8); its fast_op binds the SAME bespoke
+    // RmsNormGatedQuantFp8 kernel (byte-identical + perf-neutral). VT_FUSED_CHAIN_ADOPT=0
+    // restores the direct hand-call.
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(d.q, vt::kRmsNormGatedQuantFp8, a_fp8_v, core2, z2, dnw, eps,
+                     w.out_proj_fp8.input_scale);
+    } else {
+      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false},
+                               w.out_proj_fp8.input_scale);
+    }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
   }
   DBuf gated_bf16(d, DType::kBF16, {T, value_dim});
@@ -3540,9 +3567,17 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     vt::RopeCosSinCache(d.q, cos_sin.t(), dpos.t(), vt::RopeArgs{base, rot});
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
-    vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate,
-                           kf, dqw, dkw, cos_sin.t(),
-                           vt::RmsNormArgs{eps, true}, vt::RopeArgs{base, rot});
+    // KERNEL-FUSION-FRAMEWORK W2 — route the fused attn preamble through
+    // vt::FusedChain(kAttnQkNormRopeGate). The recipe has no fast_op; its composite
+    // MACRO dispatches to the SAME single vt::AttnQkNormRopeGate launch, so this is
+    // perf-neutral + byte-identical. VT_FUSED_CHAIN_ADOPT=0 restores the hand-call.
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(d.q, vt::kAttnQkNormRopeGate, dq3.t(), dk3.t(), gatef.t(), qgate, kf, dqw,
+                     dkw, cos_sin.t(), eps, vt::RopeArgs{base, rot});
+    } else {
+      vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate, kf, dqw, dkw, cos_sin.t(),
+                             vt::RmsNormArgs{eps, true}, vt::RopeArgs{base, rot});
+    }
   } else {
     DBuf qf(d, DType::kF32, {T, Hq, Dh});
     vt::AttnGateSplit(d.q, qf.t(), gatef.t(), qgate);
@@ -3680,9 +3715,17 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   if (FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin) {
     Tensor dqw = ResidentWeightF32(d, w.q_norm, {Dh});
     Tensor dkw = ResidentWeightF32(d, w.k_norm, {Dh});
-    vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate,
-                           kf, dqw, dkw, sdi.attn_cos_sin.t(),
-                           vt::RmsNormArgs{eps, true}, vt::RopeArgs{base, rot});
+    // KERNEL-FUSION-FRAMEWORK W2 — route the fused attn preamble through
+    // vt::FusedChain(kAttnQkNormRopeGate); composite MACRO = the SAME single
+    // vt::AttnQkNormRopeGate launch (perf-neutral + byte-identical). ADOPT=0 rolls back.
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(d.q, vt::kAttnQkNormRopeGate, dq3.t(), dk3.t(), gatef.t(), qgate, kf, dqw,
+                     dkw, sdi.attn_cos_sin.t(), eps, vt::RopeArgs{base, rot});
+    } else {
+      vt::AttnQkNormRopeGate(d.q, dq3.t(), dk3.t(), gatef.t(), qgate, kf, dqw, dkw,
+                             sdi.attn_cos_sin.t(), vt::RmsNormArgs{eps, true},
+                             vt::RopeArgs{base, rot});
+    }
   } else {
     DBuf qf(d, DType::kF32, {T, Hq, Dh});
     vt::AttnGateSplit(d.q, qf.t(), gatef.t(), qgate);
@@ -4555,8 +4598,17 @@ std::optional<DBuf> InputLayernormFp8(Dev d, const Qwen3_5MoeLayerWeights& layer
     std::optional<DBuf> dhn_fp8;
     dhn_fp8.emplace(d, DType::kI8, std::vector<int64_t>{T, H});
     Tensor* out_bf16 = layer.is_linear_attention ? &dhn.t() : nullptr;
-    vt::RmsNormQuantFp8(d.q, dhn_fp8->t(), out_bf16, hidden.t(), dw_in,
-                        vt::RmsNormArgs{eps, true}, &res.t(), fp8_scale);
+    // KERNEL-FUSION-FRAMEWORK W2 — route residual-add + gemma-RMSNorm + static fp8
+    // quant through vt::FusedChain(kRmsNormQuantFp8); its fast_op binds the SAME
+    // bespoke RmsNormQuantFp8 kernel (byte-identical + perf-neutral; the optional
+    // bf16 normed output is preserved). VT_FUSED_CHAIN_ADOPT=0 restores the hand-call.
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(d.q, vt::kRmsNormQuantFp8, dhn_fp8->t(), out_bf16, hidden.t(), dw_in,
+                     &res.t(), eps, fp8_scale);
+    } else {
+      vt::RmsNormQuantFp8(d.q, dhn_fp8->t(), out_bf16, hidden.t(), dw_in,
+                          vt::RmsNormArgs{eps, true}, &res.t(), fp8_scale);
+    }
     return dhn_fp8;
   }
   // Qwen3NextRMSNorm == GemmaRMSNorm (weight applied as 1+w). res += hidden.
@@ -4709,11 +4761,20 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     DBuf as(d, DType::kI8,
             direct_scale ? CutlassFp4ScaleShape(T, I)
                          : std::vector<int64_t>{T, I / 16});
-    vt::SiluMulFp4Quant(d.q, ap.t(), as.t(), gate.t(), up.t(),
-                        w.down_proj_fp4.input_global_scale_inv,
-                        direct_scale
-                            ? vt::Fp4ScaleLayout::kCutlassSwizzled
-                            : vt::Fp4ScaleLayout::kLinear);
+    const vt::Fp4ScaleLayout lay =
+        direct_scale ? vt::Fp4ScaleLayout::kCutlassSwizzled : vt::Fp4ScaleLayout::kLinear;
+    // KERNEL-FUSION-FRAMEWORK W2 — route silu·up + NVFP4 quant through the declared
+    // vt::FusedChain(kSiluMulFp4Quant) recipe. The recipe's fast_op binds the SAME
+    // bespoke SiluMulFp4Quant kernel, so dispatch is byte-identical AND perf-neutral
+    // by construction (no extra kernel). VT_FUSED_CHAIN_ADOPT=0 restores the direct
+    // hand-call (same-binary rollback).
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(d.q, vt::kSiluMulFp4Quant, ap.t(), as.t(), gate.t(), up.t(),
+                     w.down_proj_fp4.input_global_scale_inv, lay);
+    } else {
+      vt::SiluMulFp4Quant(d.q, ap.t(), as.t(), gate.t(), up.t(),
+                          w.down_proj_fp4.input_global_scale_inv, lay);
+    }
     return MatmulNvfp4Fp4DirectD(
         d, ap.t(), as.t(), w.down_proj_fp4, DType::kBF16,
         direct_scale ? &as.t() : nullptr);

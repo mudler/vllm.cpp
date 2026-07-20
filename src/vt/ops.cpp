@@ -652,8 +652,8 @@ Tensor* FusedOp(const FusedBinding& b, uint8_t idx, const char* what) {
 // The residual-add idiom (kAdd writing the residual) folds into the following
 // norm's RmsNorm(residual) call — the only form whose f32 add-then-normalize the
 // standalone op reproduces bit-for-bit.
-void FusedChainComposite(Queue& q, const FusedRecipe& r, const FusedBinding& b,
-                         const FusedParams& p) {
+void FusedChainCompositeImpl(Queue& q, const FusedRecipe& r, const FusedBinding& b,
+                             const FusedParams& p) {
   Tensor* add_x = nullptr;    // pending residual-add: x operand
   Tensor* add_res = nullptr;  // pending residual-add: residual operand (also the out)
   bool add_pending = false;
@@ -748,7 +748,75 @@ void FusedChainComposite(Queue& q, const FusedRecipe& r, const FusedBinding& b,
   VT_CHECK(!add_pending, "fused_chain composite: residual-add without a following rmsnorm");
 }
 
+// Non-throwing probe: is `op` realized on `device`? (GetOp throws; the fast-
+// realization dispatch must degrade GRACEFULLY to the composite when a backend
+// lacks the bespoke fused kernel, so it probes the table directly.)
+bool OpRegistered(OpId op, DeviceType device) {
+  return Table()[static_cast<size_t>(op)][static_cast<size_t>(device)] != nullptr;
+}
+
+// FAST realization (W2): dispatch a recipe bound to a bespoke single-launch fused
+// kernel (recipe.fast_op) to that kernel via its existing vt:: wrapper. One switch
+// case per fast realization — the additive surface (O(1), mirrors the composite's
+// per-opcode switch). Each case unpacks the recipe's indexed operand table into the
+// wrapper's arguments; the wrapper self-dispatches on q.device. Byte-exact to the
+// composite by construction (it IS the kernel the composite is validated against).
+void DispatchFusedFast(Queue& q, const FusedRecipe& r, const FusedBinding& b,
+                       const FusedParams& p) {
+  switch (static_cast<OpId>(r.fast_op)) {
+    case OpId::kRmsNormQuantFp8: {
+      // operands: 0=x, 1=weight, 2=residual?, 3=tmp_bf16 (optional out_bf16), 4=out_fp8
+      Tensor* out_fp8 = FusedOp(b, 4, "fused_chain fast: null fp8 out");
+      Tensor* x = FusedOp(b, 0, "fused_chain fast: null x");
+      Tensor* w = FusedOp(b, 1, "fused_chain fast: null weight");
+      Tensor* residual = b.op[2];  // optional
+      Tensor* out_bf16 = b.op[3];  // optional (bf16 normed activation consumer)
+      RmsNormQuantFp8(q, *out_fp8, out_bf16, *x, *w, RmsNormArgs{p.eps, r.steps[1].gemma},
+                      residual, p.quant_scale);
+      break;
+    }
+    case OpId::kRmsNormGatedQuantFp8: {
+      // operands: 0=x, 1=gate, 2=weight, 3=tmp_bf16 (unused), 4=out_fp8
+      Tensor* out_fp8 = FusedOp(b, 4, "fused_chain fast: null gated fp8 out");
+      Tensor* x = FusedOp(b, 0, "fused_chain fast: null gated x");
+      Tensor* gate = FusedOp(b, 1, "fused_chain fast: null gated gate");
+      Tensor* w = FusedOp(b, 2, "fused_chain fast: null gated weight");
+      RmsNormGatedQuantFp8(q, *out_fp8, *x, *gate, *w,
+                           RmsNormGatedArgs{p.eps, r.steps[0].sigmoid_gate}, p.quant_scale);
+      break;
+    }
+    case OpId::kSiluMulFp4Quant: {
+      // operands: 0=gate, 1=up, 2=tmp_bf16 (unused), 3=out_packed, 4=out_scale
+      Tensor* packed = FusedOp(b, 3, "fused_chain fast: null silu_mul packed");
+      Tensor* scale = FusedOp(b, 4, "fused_chain fast: null silu_mul scale");
+      Tensor* gate = FusedOp(b, 0, "fused_chain fast: null silu_mul gate");
+      Tensor* up = FusedOp(b, 1, "fused_chain fast: null silu_mul up");
+      SiluMulFp4Quant(q, *packed, *scale, *gate, *up, p.quant_scale, p.fp4_layout);
+      break;
+    }
+    case OpId::kSigmoidGateFp4Quant: {
+      // operands: 0=attn, 1=gate, 2=tmp_bf16 (unused), 3=out_packed, 4=out_scale
+      Tensor* packed = FusedOp(b, 3, "fused_chain fast: null sigmoid_gate packed");
+      Tensor* scale = FusedOp(b, 4, "fused_chain fast: null sigmoid_gate scale");
+      Tensor* attn = FusedOp(b, 0, "fused_chain fast: null sigmoid_gate attn");
+      Tensor* gate = FusedOp(b, 1, "fused_chain fast: null sigmoid_gate gate");
+      SigmoidGateFp4Quant(q, *packed, *scale, *attn, *gate, p.quant_scale, p.fp4_layout);
+      break;
+    }
+    default:
+      VT_CHECK(false, "fused_chain: recipe.fast_op has no fast-realization case");
+  }
+}
+
 }  // namespace
+
+void FusedChainComposite(Queue& q, const FusedRecipe& recipe, const FusedBinding& binding,
+                         const FusedParams& params) {
+  VT_CHECK(recipe.n >= 1 && recipe.n <= kMaxFusedSteps, "fused_chain: empty/oversized recipe");
+  VT_CHECK(recipe.n_operands == binding.n && binding.n <= kMaxFusedOperands,
+           "fused_chain: binding size must match recipe operand count");
+  FusedChainCompositeImpl(q, recipe, binding, params);
+}
 
 void FusedChain(Queue& q, const FusedRecipe& recipe, const FusedBinding& binding,
                 const FusedParams& params) {
@@ -756,10 +824,21 @@ void FusedChain(Queue& q, const FusedRecipe& recipe, const FusedBinding& binding
   VT_CHECK(recipe.n_operands == binding.n && binding.n <= kMaxFusedOperands,
            "fused_chain: binding size must match recipe operand count");
 
+  // FAST realization: a recipe bound to an existing bespoke fused kernel dispatches
+  // to it whenever the backend provides that OpId — the SAME single-launch kernel the
+  // model called directly before W2 migration, so this is perf-neutral by
+  // construction (no extra kernel, no getenv, no allocation on the path). A backend
+  // that lacks the fast kernel falls through to the byte-exact composite below.
+  if (recipe.fast_op != kNoFastOp &&
+      OpRegistered(static_cast<OpId>(recipe.fast_op), q.device.type)) {
+    DispatchFusedFast(q, recipe, binding, params);
+    return;
+  }
+
   // Tier-1 interpreter path: only for Tier-1-able recipes (all elementwise/rms)
   // over the canonical operand order [x, weight, residual?, out]. Everything else
   // (quant/rope/gated/attn) runs through the byte-exact composite.
-  if (FusedTier() == 1 && RecipeIsTier1Able(recipe)) {
+  if (RecipeIsTier1Able(recipe) && FusedTier() == 1) {
     Tensor* x = FusedOp(binding, 0, "fused_chain: null x");
     Tensor* weight = FusedOp(binding, 1, "fused_chain: null weight");
     Tensor* residual =
@@ -804,6 +883,71 @@ void FusedChain(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, Te
   binding.op[3] = &out;
   binding.n = 4;
   FusedChain(q, recipe, binding, FusedParams{eps, 1.0f, Fp4ScaleLayout::kLinear, RopeArgs{}});
+}
+
+void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& out_packed, Tensor& out_scale,
+                const Tensor& a, const Tensor& b, float quant_scale,
+                Fp4ScaleLayout scale_layout) {
+  // Fp4-activation-quant shape (kSiluMulFp4Quant, kSigmoidGateFp4Quant): bind the
+  // recipe's [a, b, tmp_bf16, out_packed, out_scale] table (tmp_bf16 = nullptr; the
+  // fast realization never materializes it) and dispatch to the recipe's fast_op.
+  FusedBinding binding;
+  binding.op[0] = const_cast<Tensor*>(&a);
+  binding.op[1] = const_cast<Tensor*>(&b);
+  binding.op[2] = nullptr;  // tmp_bf16 (composite-only scratch)
+  binding.op[3] = &out_packed;
+  binding.op[4] = &out_scale;
+  binding.n = 5;
+  FusedChain(q, recipe, binding, FusedParams{1e-6f, quant_scale, scale_layout, RopeArgs{}});
+}
+
+void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& out_fp8, Tensor* out_bf16,
+                const Tensor& x, const Tensor& weight, Tensor* residual, float eps,
+                float input_scale) {
+  // RmsNorm->fp8 shape (kRmsNormQuantFp8): bind [x, weight, residual, out_bf16,
+  // out_fp8]. residual / out_bf16 pass through as-is (may be nullptr), matching the
+  // bespoke RmsNormQuantFp8 contract; tmp_bf16 slot IS the optional out_bf16 here.
+  FusedBinding binding;
+  binding.op[0] = const_cast<Tensor*>(&x);
+  binding.op[1] = const_cast<Tensor*>(&weight);
+  binding.op[2] = residual;
+  binding.op[3] = out_bf16;
+  binding.op[4] = &out_fp8;
+  binding.n = 5;
+  FusedChain(q, recipe, binding, FusedParams{eps, input_scale, Fp4ScaleLayout::kLinear, RopeArgs{}});
+}
+
+void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& out_fp8, const Tensor& x,
+                const Tensor& gate, const Tensor& weight, float eps, float input_scale) {
+  // Gated-RmsNorm->fp8 shape (kRmsNormGatedQuantFp8): bind [x, gate, weight,
+  // tmp_bf16, out_fp8] (tmp_bf16 = nullptr; fast realization skips it).
+  FusedBinding binding;
+  binding.op[0] = const_cast<Tensor*>(&x);
+  binding.op[1] = const_cast<Tensor*>(&gate);
+  binding.op[2] = const_cast<Tensor*>(&weight);
+  binding.op[3] = nullptr;  // tmp_bf16 (composite-only scratch)
+  binding.op[4] = &out_fp8;
+  binding.n = 5;
+  FusedChain(q, recipe, binding, FusedParams{eps, input_scale, Fp4ScaleLayout::kLinear, RopeArgs{}});
+}
+
+void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& q_out, Tensor& k_out,
+                Tensor& gate_out, const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
+                const Tensor& k_norm, const Tensor& cos_sin, float eps, const RopeArgs& rope) {
+  // Attn-preamble MACRO shape (kAttnQkNormRopeGate): bind the fixed operand table
+  // [qgate, kf, q_norm, k_norm, cos_sin, q_out, k_out, gate_out]. No fast_op — the
+  // composite macro dispatches to the single vt::AttnQkNormRopeGate kernel.
+  FusedBinding binding;
+  binding.op[0] = const_cast<Tensor*>(&qgate);
+  binding.op[1] = const_cast<Tensor*>(&kf);
+  binding.op[2] = const_cast<Tensor*>(&q_norm);
+  binding.op[3] = const_cast<Tensor*>(&k_norm);
+  binding.op[4] = const_cast<Tensor*>(&cos_sin);
+  binding.op[5] = &q_out;
+  binding.op[6] = &k_out;
+  binding.op[7] = &gate_out;
+  binding.n = 8;
+  FusedChain(q, recipe, binding, FusedParams{eps, 1.0f, Fp4ScaleLayout::kLinear, rope});
 }
 
 void SiluAndMul(Queue& q, Tensor& out, const Tensor& x) {

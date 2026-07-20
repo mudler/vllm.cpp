@@ -94,6 +94,10 @@ enum class FKind : uint8_t {
 // Sentinel for FStep::out2 (a step with no secondary output).
 constexpr uint8_t kNoOperand = 0xFF;
 
+// Sentinel for FusedRecipe::fast_op — the recipe has no bespoke fast realization,
+// so it realizes purely through the Tier-0 composite / Tier-1 interpreter.
+constexpr int kNoFastOp = -1;
+
 // Max structural sizes. A recipe holds a fixed step list + operand table (POD,
 // no heap). The slack is headroom for the finite Class-A pattern set.
 constexpr int kMaxFusedSteps = 8;
@@ -126,12 +130,26 @@ struct FStep {
 
 // The declaration: a fixed-size step list + an indexed operand table + live
 // counts + a debug name. POD, constexpr-constructible, no heap.
+//
+// fast_op (W2, KERNEL-FUSION-FRAMEWORK): the raw `OpId` value (see vt/ops.h) of an
+// EXISTING single-launch bespoke fused kernel that realizes this whole recipe in
+// one pass — the recipe's FAST realization. It is a backend-AGNOSTIC binding (it
+// names WHICH abstract op realizes the recipe, not a kernel); realization stays
+// per-backend through the op table. When a backend registers that OpId, FusedChain
+// dispatches to it (perf-neutral: the same fast kernel the model called directly
+// before migration); a backend without it inherits the Tier-0 composite, which is
+// byte-exact to that fast kernel by the §5 discipline. kNoFastOp = realize via the
+// composite/interpreter only (e.g. kFusedAddRmsNorm, whose fast tier IS the
+// interpreter; and composite-macro recipes whose composite already dispatches to a
+// single fused op). Stored as `int` (not OpId) to keep this POD free of an ops.h
+// dependency — recipes.h sets it with static_cast<int>(OpId::k...).
 struct FusedRecipe {
   FStep steps[kMaxFusedSteps] = {};
   FOperandSlot operands[kMaxFusedOperands] = {};
   int n = 0;           // number of steps
   int n_operands = 0;  // number of bound operand slots
   const char* name = nullptr;
+  int fast_op = kNoFastOp;  // raw OpId of the bespoke fast realization, or kNoFastOp
 };
 
 // Runtime tier selector. Default 0 = Tier-0 composite (the safe default: reuses

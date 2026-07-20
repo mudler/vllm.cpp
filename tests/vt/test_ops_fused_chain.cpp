@@ -326,8 +326,15 @@ void RunSiluMulFp4Cpu(int64_t m, int64_t i, uint32_t seed, int tier) {
   bind.n = 5;
   FusedParams p;
   p.quant_scale = gs;
+  // W2: FusedChain now dispatches to the FAST realization (the bespoke
+  // SiluMulFp4Quant kernel, recipe.fast_op) — must equal the standalone-op golden.
   vt::FusedChain(q, vt::kSiluMulFp4Quant, bind, p);
   SetTier(0);
+  CHECK(pk_f == pk_g);
+  CHECK(sc_f == sc_g);
+  // ...and the Tier-0 composite oracle (bind carries tmp_bf16 = op[2]) must ALSO
+  // equal the golden, byte-for-byte (fast == composite == unfused sequence, §5).
+  vt::FusedChainComposite(q, vt::kSiluMulFp4Quant, bind, p);
   CHECK(pk_f == pk_g);
   CHECK(sc_f == sc_g);
 }
@@ -365,8 +372,13 @@ void RunSigmoidGateFp4Cpu(int64_t m, int64_t k, uint32_t seed, int tier) {
   bind.n = 5;
   FusedParams p;
   p.quant_scale = gs;
+  // W2: FusedChain dispatches the FAST realization (bespoke SigmoidGateFp4Quant).
   vt::FusedChain(q, vt::kSigmoidGateFp4Quant, bind, p);
   SetTier(0);
+  CHECK(pk_f == pk_g);
+  CHECK(sc_f == sc_g);
+  // Tier-0 composite oracle must also match byte-for-byte.
+  vt::FusedChainComposite(q, vt::kSigmoidGateFp4Quant, bind, p);
   CHECK(pk_f == pk_g);
   CHECK(sc_f == sc_g);
 }
@@ -413,11 +425,13 @@ void RunSiluMulFp4Cuda(int64_t m, int64_t i, uint32_t seed) {
   DeviceTensor dg(gpu, g.q, DType::kBF16, {m, i}, gb.data());
   DeviceTensor du(gpu, g.q, DType::kBF16, {m, i}, ub.data());
 
-  auto run = [&](bool golden, std::vector<uint8_t>& pk, std::vector<uint8_t>& sc) {
+  // mode 0 = golden standalone sequence, 1 = FusedChain FAST realization, 2 = Tier-0
+  // composite. All three must produce byte-identical packed/scale streams.
+  auto run = [&](int mode, std::vector<uint8_t>& pk, std::vector<uint8_t>& sc) {
     DeviceTensor dtmp(gpu, g.q, DType::kBF16, {m, i});
     DeviceTensor dpk(gpu, g.q, DType::kI8, {m, i / 2});
     DeviceTensor dsc(gpu, g.q, DType::kI8, {m, i / 16});
-    if (golden) {
+    if (mode == 0) {
       vt::MoeSiluMul(g.q, dtmp.tensor(), dg.tensor(), du.tensor());
       vt::ScaledFp4Quant(g.q, dpk.tensor(), dsc.tensor(), dtmp.tensor(), gs);
     } else {
@@ -430,18 +444,25 @@ void RunSiluMulFp4Cuda(int64_t m, int64_t i, uint32_t seed) {
       b.n = 5;
       FusedParams p;
       p.quant_scale = gs;
-      vt::FusedChain(g.q, vt::kSiluMulFp4Quant, b, p);
+      if (mode == 1) {
+        vt::FusedChain(g.q, vt::kSiluMulFp4Quant, b, p);
+      } else {
+        vt::FusedChainComposite(g.q, vt::kSiluMulFp4Quant, b, p);
+      }
     }
     pk.assign(static_cast<size_t>(m * i / 2), 0);
     sc.assign(static_cast<size_t>(m * i / 16), 0);
     dpk.Download(g.q, pk.data());
     dsc.Download(g.q, sc.data());
   };
-  std::vector<uint8_t> pk_g, sc_g, pk_f, sc_f;
-  run(true, pk_g, sc_g);
-  run(false, pk_f, sc_f);
+  std::vector<uint8_t> pk_g, sc_g, pk_f, sc_f, pk_c, sc_c;
+  run(0, pk_g, sc_g);
+  run(1, pk_f, sc_f);
+  run(2, pk_c, sc_c);
   CHECK(pk_f == pk_g);
   CHECK(sc_f == sc_g);
+  CHECK(pk_c == pk_g);
+  CHECK(sc_c == sc_g);
 }
 
 // kSigmoidGateFp4Quant on CUDA.
@@ -455,11 +476,11 @@ void RunSigmoidGateFp4Cuda(int64_t m, int64_t k, uint32_t seed) {
   DeviceTensor dattn(gpu, g.q, DType::kBF16, {m, k}, ab.data());
   DeviceTensor dgate(gpu, g.q, DType::kF32, {m, k}, gatef.data());
 
-  auto run = [&](bool golden, std::vector<uint8_t>& pk, std::vector<uint8_t>& sc) {
+  auto run = [&](int mode, std::vector<uint8_t>& pk, std::vector<uint8_t>& sc) {
     DeviceTensor dtmp(gpu, g.q, DType::kBF16, {m, k});
     DeviceTensor dpk(gpu, g.q, DType::kI8, {m, k / 2});
     DeviceTensor dsc(gpu, g.q, DType::kI8, {m, k / 16});
-    if (golden) {
+    if (mode == 0) {
       vt::SigmoidGateBf16(g.q, dtmp.tensor(), dattn.tensor(), dgate.tensor());
       vt::ScaledFp4Quant(g.q, dpk.tensor(), dsc.tensor(), dtmp.tensor(), gs);
     } else {
@@ -472,18 +493,25 @@ void RunSigmoidGateFp4Cuda(int64_t m, int64_t k, uint32_t seed) {
       b.n = 5;
       FusedParams p;
       p.quant_scale = gs;
-      vt::FusedChain(g.q, vt::kSigmoidGateFp4Quant, b, p);
+      if (mode == 1) {
+        vt::FusedChain(g.q, vt::kSigmoidGateFp4Quant, b, p);
+      } else {
+        vt::FusedChainComposite(g.q, vt::kSigmoidGateFp4Quant, b, p);
+      }
     }
     pk.assign(static_cast<size_t>(m * k / 2), 0);
     sc.assign(static_cast<size_t>(m * k / 16), 0);
     dpk.Download(g.q, pk.data());
     dsc.Download(g.q, sc.data());
   };
-  std::vector<uint8_t> pk_g, sc_g, pk_f, sc_f;
-  run(true, pk_g, sc_g);
-  run(false, pk_f, sc_f);
+  std::vector<uint8_t> pk_g, sc_g, pk_f, sc_f, pk_c, sc_c;
+  run(0, pk_g, sc_g);
+  run(1, pk_f, sc_f);
+  run(2, pk_c, sc_c);
   CHECK(pk_f == pk_g);
   CHECK(sc_f == sc_g);
+  CHECK(pk_c == pk_g);
+  CHECK(sc_c == sc_g);
 }
 
 // kRmsNormQuantFp8 on CUDA: RmsNorm(bf16,+residual) then QuantFp8Static.
@@ -500,11 +528,11 @@ void RunRmsNormQuantFp8Cuda(int64_t t, int64_t h, DType resdt, uint32_t seed) {
   DeviceTensor dx(gpu, g.q, DType::kBF16, {t, h}, xb.data());
   DeviceTensor dw(gpu, g.q, DType::kBF16, {h}, wb.data());
 
-  auto run = [&](bool golden, std::vector<uint8_t>& fp8, std::vector<uint8_t>& res) {
+  auto run = [&](int mode, std::vector<uint8_t>& fp8, std::vector<uint8_t>& res) {
     DeviceTensor dres(gpu, g.q, resdt, {t, h}, rb.data());
     DeviceTensor dtmp(gpu, g.q, DType::kBF16, {t, h});
     DeviceTensor dfp8(gpu, g.q, DType::kI8, {t, h});
-    if (golden) {
+    if (mode == 0) {
       vt::RmsNorm(g.q, dtmp.tensor(), dx.tensor(), dw.tensor(), RmsNormArgs{eps, true},
                   &dres.tensor());
       vt::QuantFp8Static(g.q, dfp8.tensor(), dtmp.tensor(), scale);
@@ -519,18 +547,25 @@ void RunRmsNormQuantFp8Cuda(int64_t t, int64_t h, DType resdt, uint32_t seed) {
       FusedParams p;
       p.eps = eps;
       p.quant_scale = scale;
-      vt::FusedChain(g.q, vt::kRmsNormQuantFp8, b, p);
+      if (mode == 1) {
+        vt::FusedChain(g.q, vt::kRmsNormQuantFp8, b, p);
+      } else {
+        vt::FusedChainComposite(g.q, vt::kRmsNormQuantFp8, b, p);
+      }
     }
     fp8.assign(static_cast<size_t>(t * h), 0);
     res.assign(rb.size(), 0);
     dfp8.Download(g.q, fp8.data());
     dres.Download(g.q, res.data());
   };
-  std::vector<uint8_t> fp8_g, res_g, fp8_f, res_f;
-  run(true, fp8_g, res_g);
-  run(false, fp8_f, res_f);
+  std::vector<uint8_t> fp8_g, res_g, fp8_f, res_f, fp8_c, res_c;
+  run(0, fp8_g, res_g);
+  run(1, fp8_f, res_f);
+  run(2, fp8_c, res_c);
   CHECK(fp8_f == fp8_g);
   CHECK(res_f == res_g);
+  CHECK(fp8_c == fp8_g);
+  CHECK(res_c == res_g);
 }
 
 // kRmsNormGatedQuantFp8 on CUDA: RmsNormGated(bf16) then QuantFp8Static.
@@ -548,10 +583,10 @@ void RunRmsNormGatedQuantFp8Cuda(int64_t rows, int64_t d, uint32_t seed) {
   DeviceTensor dgate(gpu, g.q, DType::kBF16, {rows, d}, gb.data());
   DeviceTensor dw(gpu, g.q, DType::kBF16, {d}, wb.data());
 
-  auto run = [&](bool golden, std::vector<uint8_t>& fp8) {
+  auto run = [&](int mode, std::vector<uint8_t>& fp8) {
     DeviceTensor dtmp(gpu, g.q, DType::kBF16, {rows, d});
     DeviceTensor dfp8(gpu, g.q, DType::kI8, {rows, d});
-    if (golden) {
+    if (mode == 0) {
       vt::RmsNormGated(g.q, dtmp.tensor(), dx.tensor(), dgate.tensor(), dw.tensor(),
                        RmsNormGatedArgs{eps, false});
       vt::QuantFp8Static(g.q, dfp8.tensor(), dtmp.tensor(), scale);
@@ -566,15 +601,21 @@ void RunRmsNormGatedQuantFp8Cuda(int64_t rows, int64_t d, uint32_t seed) {
       FusedParams p;
       p.eps = eps;
       p.quant_scale = scale;
-      vt::FusedChain(g.q, vt::kRmsNormGatedQuantFp8, b, p);
+      if (mode == 1) {
+        vt::FusedChain(g.q, vt::kRmsNormGatedQuantFp8, b, p);
+      } else {
+        vt::FusedChainComposite(g.q, vt::kRmsNormGatedQuantFp8, b, p);
+      }
     }
     fp8.assign(static_cast<size_t>(rows * d), 0);
     dfp8.Download(g.q, fp8.data());
   };
-  std::vector<uint8_t> fp8_g, fp8_f;
-  run(true, fp8_g);
-  run(false, fp8_f);
+  std::vector<uint8_t> fp8_g, fp8_f, fp8_c;
+  run(0, fp8_g);
+  run(1, fp8_f);
+  run(2, fp8_c);
   CHECK(fp8_f == fp8_g);
+  CHECK(fp8_c == fp8_g);
 }
 
 }  // namespace

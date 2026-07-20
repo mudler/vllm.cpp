@@ -14046,3 +14046,78 @@ regression: 27B `test_qwen27_paged_engine` 235/235 + 35B `test_qwen36_paged_engi
 315/315. memcheck 0 errors. NOT a perf change (§11) ⇒ `benchmark_binding=false`, no re-grid.
 
 **Next.** W4 mock-backend additivity proof. See `portable-fusion-framework.md` §10.
+
+## 2026-07-20 — KERNEL-FUSION-FRAMEWORK W4: the EXECUTABLE BACKEND-ADDITIVITY PROOF — W-series milestone DONE (`CLAIM-FUSION-FRAMEWORK-W4`)
+
+**What.** W4 closes the W-series: it makes the BACKEND-ADDITIVITY claim EXECUTABLE — "a
+new backend registers `kFusedChain` (Tier-0 composite) ONCE and inherits the ENTIRE
+recipe catalog correct, with ZERO per-recipe work; adding a recipe requires zero backend
+edits." Delivered as an explicit test + the touched-file evidence that catalog growth ⇒
+zero backend growth. Test-only + record change; the engine/kernels/headers are byte-
+identical (git diff = `tests/CMakeLists.txt` + the new test only).
+
+**Proof approach chosen (spec §10 W4, PREFERRED option b) + why.** Treat the EXISTING CPU
+backend AS the 'second backend' relative to CUDA — no mock `DeviceType` (which would have
+to edit the core enum + every switch, and be ironically NON-additive; the spike itself
+warns against it). The CPU backend registers exactly ONE `OpId::kFusedChain`
+(`src/vt/cpu/cpu_ops.cpp:1578`) plus the standalone primitive ops; the Tier-0 composite is
+ONE device-agnostic walker (`FusedChainCompositeImpl`, `src/vt/ops.cpp:655`) whose
+per-opcode switch self-dispatches each step to `q.device`'s standalone op. So the CPU
+backend realizes EVERY catalog recipe through that one path with NO per-recipe code.
+
+**The executable assertion.** New test `tests/vt/test_fused_chain_additivity.cpp` enumerates
+the WHOLE catalog (`kCatalog`, all 7 recipes) and, in ONE generic loop, asserts each runs
+CORRECT on the CPU 'second backend' via the Tier-0 composite (`vt::FusedChainComposite`),
+BYTE-EXACT vs the standalone-op-sequence golden, over the CPU-expressible scope:
+- CPU-FULL (fp4 + attn-macro + plain add-rmsnorm terminals are CPU-expressible): end-to-end
+  byte-exact — `kFusedAddRmsNorm`, `kSiluMulFp4Quant`, `kSigmoidGateFp4Quant`,
+  `kAttnQkNormRopeGate`.
+- CPU-PREFIX (static-fp8 quant terminal `vt::QuantFp8Static` is CUDA-only, §3b/§6): the
+  composite runs the CPU-expressible PREFIX byte-exact, AND the test asserts the FULL
+  composite THROWS on CPU — documenting the backend-negotiated tail rather than silently
+  skipping — `kRmsNormQuantFp8`, `kRmsNormGatedQuantFp8`, `kSiluMulQuantFp8`. The prefix is
+  formed structurally (`CpuExpressiblePrefix`: drop the trailing fp8 step + fp8 operand),
+  no per-recipe knowledge in the backend.
+A count guard (`==7`) ties catalog growth to test growth so a future recipe cannot escape
+the proof.
+
+**Additivity evidence (catalog GROWS ⇒ backend does NOT).**
+- Catalog `include/vt/recipes.h`: 1 (W0) → 6 (W1) → 7 (W3) `constexpr FusedRecipe`.
+- Backend did NOT grow per-recipe: `FusedChainCompositeImpl` is ONE function with a
+  per-OPCODE switch (12 `FOp::` cases = the 12 opcodes, NOT per-recipe); the CPU/CUDA
+  `kFusedChain` registration is ONE line each; `src/vt/cpu/cpu_ops.cpp` does NOT even
+  `#include "vt/recipes.h"` — the backend never sees the catalog.
+- W3's whole new recipe `kSiluMulQuantFp8` appears in ZERO backend TUs (`grep` over
+  `src/vt/cpu/`, `src/vt/cuda/` = 0) and ZERO in the `ops.cpp` dispatch (fast tier) — it
+  runs purely through the shared per-opcode walker. That is why W3 touched exactly 2 files
+  and no `src/vt/`: the CPU 'second backend' inherited it for free. W4's generic loop drives
+  `kSiluMulQuantFp8` on CPU alongside every other recipe — inheritance is real, executed.
+
+**Gates.** (1) Clean CPU `-Werror` build (dev box, `build-w4-cpu`) — 0 warnings; no `.cu`,
+no header, no CUDA TU touched, so the CPU build is the valid green per protocol. (2) The
+additivity test passes: `test_fused_chain_additivity` 1 case / **17 assertions** 0 failed;
+sibling `test_ops_fused_chain` still **228/228** CPU. (3) No token regression: the engine
+binary is byte-identical (git diff = a test file + its CMake registration + records only —
+zero `src/`/`include/` change), so 27B `test_qwen27_paged_engine` 235/235 + 35B
+`test_qwen36_paged_engine` 315/315 are structurally unchanged (no rebuilt-engine behavior
+delta; same reasoning as W3's declared-only recipe). memcheck N/A (no CUDA touched). NOT a
+perf change (§11) ⇒ `benchmark_binding=false`, no re-grid.
+
+**KERNEL-FUSION-FRAMEWORK ORDER-1 milestone: DONE.** The W-series PROOF is complete —
+W0 adopt + W1 POD generalize + W2 migrate + W3 mechanical-sync + W4 backend-additivity.
+The framework delivers NOW: declare-once (`constexpr FusedRecipe` catalog) + realize-
+per-backend (op-table, Tier-0 composite inherited free) + mechanical upstream-sync (a new
+vLLM pass = ONE declaration, W3) + backend-additivity (a new backend = ONE `kFusedChain`
+registration, zero per-recipe work, W4) + CPU/CUDA oracle-drift elimination.
+**Honest deferred / future (named, not blocking the milestone):** (a) the Tier-1 PERF
+interpreter currently covers only the elementwise/rmsnorm subset — the quant/activation
+chains realize composite-only (correct, byte-exact, but the single-pass fused perf kernel
+for the quant chains is future work); (b) a REAL second hardware backend (Metal/Vulkan)
+realizing the catalog needs the M4 dev-box (HW-blocked); (c) per-recipe fast single-launch
+kernels for the composite-only recipes (e.g. `kSiluMulQuantFp8`) are separate later perf
+steps. Perf itself is NOT the framework's value (§11: 35B ceiling ~3.5%/step, compute-bound);
+the ORDER-1 value = extensibility + mechanical-sync + additivity, delivered + demonstrated.
+
+**Next.** Wn honest perf re-measure is OPTIONAL and not on the extensibility critical path
+(the framework is perf-neutral by construction). The KERNEL-FUSION-FRAMEWORK ORDER-1
+milestone is closed; the claim closes with W4.

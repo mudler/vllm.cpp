@@ -274,6 +274,7 @@ set_tests_properties(test_ops_fp8_cutlass_plan_cache_on PROPERTIES
 vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
+vllm_cpp_add_test(test_fused_chain_additivity vt/test_fused_chain_additivity.cpp)
 vllm_cpp_add_test(test_ops_activation vt/test_ops_activation.cpp)
 vllm_cpp_add_test(test_ops_rope vt/test_ops_rope.cpp)
 vllm_cpp_add_test(test_ops_rope_cache vt/test_ops_rope_cache.cpp)

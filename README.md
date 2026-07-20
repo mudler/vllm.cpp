@@ -262,7 +262,7 @@ both gate models (DGX-confirmed token-exact: 27B 235/235 + 35B 315/315, memcheck
 attention-backend registry, model self-registration).
 
 **Extensibility — roadmap_v1 ORDER-1: the portable op-fusion framework
-(SPIKED 2026-07-19; W0 ADOPTED; W1 POD GENERALIZED; W2 HAND-FUSIONS MIGRATED; W3 MECHANICAL-SYNC PROVEN 2026-07-20).** The fourth and unifying seam: fusions **declared once**
+(SPIKED 2026-07-19; W0 ADOPTED; W1 POD GENERALIZED; W2 HAND-FUSIONS MIGRATED; W3 MECHANICAL-SYNC PROVEN; W4 BACKEND-ADDITIVITY PROVEN 2026-07-20 — the W-series ORDER-1 proof milestone is DONE).** The fourth and unifying seam: fusions **declared once**
 (a backend-agnostic recipe catalog above `vt::`, transcribing vLLM's finite
 fusion-pass set) and **realized per-backend** through the `vt::` op table (a
 composite tier is the CPU oracle every backend inherits free; one interpreter
@@ -307,10 +307,27 @@ realizes through the existing `vt::MoeSiluMul` + `vt::QuantFp8Static` ops). `git
 --stat main` = those two files, nothing else — the PR-#4 additivity test made concrete:
 adding a whole new fusion pattern is one declaration. Gates: clean CUDA `-Werror` 0-warn,
 byte-exact CUDA 432/432, and — because the recipe is declared, not wired into any model —
-no token regression (27B 235/235 + 35B 315/315), memcheck 0. Honest scope: this is an
-**extensibility +
-mechanical-upstream-sync** cornerstone, not a perf lever — W0–W3 are perf-neutral by
-construction (the measured 35B prefill gap is compute-bound, ceiling ~3.5%/step).
+no token regression (27B 235/235 + 35B 315/315), memcheck 0. **W4 landed (2026-07-20) —
+the backend-additivity PROOF, closing the W-series:** the additivity claim ("a new backend
+registers `kFusedChain` once and inherits the ENTIRE catalog correct, zero per-recipe
+work") is now EXECUTABLE. A new test (`tests/vt/test_fused_chain_additivity.cpp`) treats the
+existing **CPU backend as the 'second backend'** relative to CUDA (no mock `DeviceType` —
+that would edit the core enum + every switch, ironically non-additive) and, in one generic
+loop over the whole catalog (all 7 recipes), asserts each runs **byte-exact on the CPU
+backend via the Tier-0 composite** — 4 end-to-end + 3 whose CUDA-only static-fp8 terminal
+is backend-negotiated (byte-exact prefix; the full composite is asserted to throw on CPU,
+documenting the tail). The additivity is real: the catalog (`recipes.h`) grew 1→6→7 recipes
+while the composite walker stayed **one per-opcode function** and each backend's `kFusedChain`
+registration stayed **one line** — `cpu_ops.cpp` never even includes `recipes.h`, and W3's
+whole new recipe appears in zero backend files, inherited for free. Gates: clean CPU
+`-Werror` 0-warn, `test_fused_chain_additivity` 17/17 + `test_ops_fused_chain` 228/228; the
+change is test-only (engine byte-identical) so 27B 235/235 + 35B 315/315 are structurally
+unchanged. Honest scope: this is an **extensibility +
+mechanical-upstream-sync + backend-additivity** cornerstone, not a perf lever — W0–W4 are
+perf-neutral by construction (the measured 35B prefill gap is compute-bound, ceiling
+~3.5%/step). Named future/HW-blocked work (does not gate the ORDER-1 milestone): the Tier-1
+single-pass perf interpreter for the quant chains (composite-only today), and a real
+Metal/Vulkan realization of the catalog (needs the M4 dev-box).
 Spike + work breakdown (W0–Wn):
 [`.agents/specs/portable-fusion-framework.md`](.agents/specs/portable-fusion-framework.md).
 Build hygiene alongside W1: a pre-existing CPU-only `-Werror=unused-function`

@@ -91,6 +91,28 @@ No re-grid. Gates (dgx `~/w3_fusion_sync/build-w3`, prod flags, clean CUDA `-Wer
 FusedChain==composite==golden arm; CPU 228 unchanged), memcheck 0; no token regression
 27B 235/235 + 35B 315/315.
 
+**W4 landed (2026-07-20) — the backend-additivity PROOF, closing the W-series (NOT a perf
+change).** The additivity claim ("a new backend registers `kFusedChain` once and inherits
+the ENTIRE catalog correct, zero per-recipe work") is made EXECUTABLE. Approach (spec §10
+W4): treat the existing CPU backend AS the 'second backend' relative to CUDA (no mock
+`DeviceType` — that would edit the core enum + every switch, ironically non-additive). New
+test `tests/vt/test_fused_chain_additivity.cpp` enumerates the whole catalog (all 7 recipes)
+and in ONE generic loop asserts each runs byte-exact on the CPU backend via the Tier-0
+composite: 4 CPU-full end-to-end + 3 CPU-prefix (static-fp8 terminal `vt::QuantFp8Static`
+CUDA-only per §3b/§6 — byte-exact prefix, plus the full composite asserted to THROW on CPU,
+documenting the backend-negotiated tail). Additivity evidence: `recipes.h` grew 1→6→7
+recipes while `FusedChainCompositeImpl` stayed ONE per-opcode function (12 `FOp::` cases) and
+the CPU/CUDA `kFusedChain` registration stayed ONE line each; `cpu_ops.cpp` never `#include`s
+`recipes.h`; W3's whole new `kSiluMulQuantFp8` appears in zero backend TUs — inherited free.
+**Benchmark disposition: NOT APPLICABLE / perf-neutral** — test-only + record change, the
+engine binary is byte-identical; no re-grid. Gates (dev box `build-w4-cpu`, clean CPU
+`-Werror` 0-warn — no `.cu`/header/CUDA TU touched, so CPU is the valid green): `test_fused_chain_additivity`
+17 assertions 0 failed, `test_ops_fused_chain` 228/228 unchanged; engine byte-identical ⇒
+27B 235/235 + 35B 315/315 structurally unchanged; memcheck N/A. **KERNEL-FUSION-FRAMEWORK
+ORDER-1 proof milestone DONE (W0+W1+W2+W3+W4).** Named future/HW-blocked (does not gate the
+milestone): the Tier-1 single-pass perf interpreter for the quant chains (composite-only
+today), a real Metal/Vulkan realization (needs the M4 dev-box), and per-recipe fast kernels.
+
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
 reruns on the full production default set (async + vendored Triton GDN decode cubin

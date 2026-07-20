@@ -76,6 +76,33 @@ unified-memory box. Repro + raw logs:
 [bench-evidence/qwen3-4b-vllm-series-fa2prefill-20260720.log](bench-evidence/qwen3-4b-vllm-series-fa2prefill-20260720.log);
 full recipe in the [parity ledger](../.agents/parity-ledger.md) 2026-07-20 FA2-prefill SPEED row.
 
+**Qwen3-dense TTFT levers — DevicePool (neutral) + RoPE cos|sin cache (opt-in), 2026-07-20
+(`Qwen3-4B` BF16, base `812a57a`).** Two profile-#81 levers, measure-first. Recipe here:
+`examples/vllm-bench --input-len 1024 --output-len 128 --concurrency {1,8}` (ours) vs
+`vllm serve` + `vllm bench serve --dataset-name random --random-input-len 1024
+--random-output-len 128 --random-range-ratio 0 --max-concurrency {1,8}` (graphed vLLM
+0.25.0); idle box, 2 reps steady-state median. NOTE: this is NOT the `--ignore-eos`
+closed-loop recipe of the FA2-prefill row above, so ABSOLUTE vLLM ratios differ (that
+row's TTFT gap is larger); the recipe-robust signal is the **relative same-binary A/B**.
+
+- **LEVER 1 — DevicePool extraction: byte-identical, MEASURED PERF-NEUTRAL.** Same-binary
+  A/B (pooled vs baseline naive Alloc/Free), Qwen3-4B: c1 median TTFT 208 vs 209 ms, c8
+  316 vs 317 ms, TPOT/tput within noise — the "~44% GPU-idle from cudaMalloc/cudaFree"
+  premise is DISPROVEN (async scheduler overlaps the host-side alloc syncs). Kept as
+  byte-safe hygiene + code sharing, not a TTFT lever.
+- **LEVER 2 — RoPE cos|sin cache (`VT_QWEN3_ROPE_CACHE`, opt-in): the real TTFT lever.**
+  Same-binary A/B (cache vs RopeNeox): **c1 median TTFT 209 → 135 ms (−35%); c8 316 → 144
+  ms (−54%)**; TPOT/tput flat (prefill-only win). Under this recipe that is 0.87× (c1) /
+  0.38× (c8) vs vLLM's median TTFT (135 vs 156 ms; 144 vs 383 ms) — at/beyond median
+  parity — while P99 TTFT tail (748 vs 258 ms c1), total tput (0.92–0.97×) and c8 TPOT
+  (1.12×) still lag. Shipped OPT-IN (default RopeNeox) because byte-identity is unreachable
+  on CUDA (RopeNeox vs RopeFromCache FMA-contract differently) and the 1-ULP shift exposes
+  the engine's FA2-split-KV near-tie NONDETERMINISM → strict-anchor gate flakiness
+  (RopeNeox deterministic 4/4, RopeFromCache flips). Forward-correctness of the opt-in path
+  proven by vLLM teacher-forcing (0.6B max gap 0.0000 nats, 4B 0.25 nats, 0
+  forward-divergent). Repro + full recipe: [parity ledger](../.agents/parity-ledger.md)
+  2026-07-20 TTFT-levers row.
+
 **Strict-decode razor — investigation, no perf claim (2026-07-20).** An attempt to
 tighten the Qwen3 near-tie band to strict token-exact 16/16 by routing d128 decode
 through the vendored FA2 group-swap split-KV kernel (`LaunchDecodeFA2Bf16`) built

@@ -22,11 +22,16 @@
 // (down-cast K/V) while the query stays f32 into vt::PagedAttention; o_proj and
 // the whole MLP flow bf16. Returns [n_out, vocab] f32 logits.
 //
-// Self-contained device glue (Dev/DBuf/ResidentWeight): the qwen3_5.cpp forward's
-// pooled DevicePool/DBuf/matmul helpers live in ITS anonymous namespace and are
-// not shared, so this new TU carries its own thin correctness-grade glue over the
-// public vt::Backend (direct Alloc/Free; the DevicePool perf tier is a follow-on,
-// not needed for the token-exact gate). This keeps the bring-up ADDITIVE.
+// Self-contained device glue (Dev/DBuf/ResidentWeight): the DBuf here draws its
+// scratch from the SHARED DevicePool (include/vllm/model_executor/models/
+// device_pool.h — extracted verbatim from qwen3_5.cpp), so the dense forward
+// reuses freed blocks instead of a per-op cudaMalloc/cudaFree. This is a pure
+// allocation-source change (identical computation ⇒ byte-identical output; all
+// gate models unchanged). NOTE: a clean same-binary A/B (Qwen3-4B c1+c8)
+// measured the pool PERF-NEUTRAL on this model — the async scheduler already
+// overlaps the host-side alloc syncs with GPU compute; it is kept as byte-safe
+// hygiene + code sharing, not a measured TTFT lever. The real dense-TTFT lever
+// is the RoPE cos|sin cache below.
 #include "vllm/model_executor/models/qwen3.h"
 
 #include <cmath>
@@ -35,6 +40,7 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/models/device_pool.h"     // DevicePool/Pool/ActivePool (shared)
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
@@ -59,6 +65,27 @@ bool FusedChainAdoptEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FUSED_CHAIN_ADOPT");
     return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+// VT_QWEN3_ROPE_CACHE (default OFF) — route the bf16 attention preamble's RoPE
+// through the per-step cos|sin cache (RopeFromCache) instead of RopeNeox's
+// per-element fp64 pow/cos/sin recompute. MEASURED the dominant dense-TTFT lever
+// (Qwen3-4B c1 median TTFT 209->135 ms = median parity vs graphed vLLM; c8 316->
+// 144 ms), and vLLM-faithful (bf16 cos|sin cache == vLLM RotaryEmbedding). It is
+// OPT-IN, NOT default, for TWO reasons the campaign proved: (1) RopeNeox and
+// RopeFromCache are distinct CUDA __global__s so nvcc contracts `x*c - y*sn` to
+// FMA differently — a 1-ULP shift that is NOT byte-identical to RopeNeox and
+// requires regenerating the near-tie goldens; (2) that 1-ULP shift lands a token
+// on the engine's ~1-ULP near-tie nondeterminism (FA2 split-KV combine), making
+// the strict-anchor SACRED gate FLAKY (RopeNeox is stable 4/4, RopeFromCache
+// flips run-to-run). Default-flipping this lever is gated on making that engine
+// path deterministic + a golden regen. Read once (process-stable).
+bool RopeCacheEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_QWEN3_ROPE_CACHE");
+    return e != nullptr && e[0] == '1';
   }();
   return on;
 }
@@ -88,33 +115,59 @@ Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
   return MakeTensor(src.data, src.dtype, src.device, shape);
 }
 
-// Minimal correctness-grade device buffer over the public Backend (direct
-// Alloc/Free; no DevicePool). Move-only, RAII.
+// The device-scratch residency policy (BACKEND-PLATFORM item 2), resolved from
+// the running device's platform. The DevicePool soft cap is platform data (0 ==
+// uncapped, GB10 today ⇒ pool behavior byte-for-byte unchanged). Memoized in a
+// function-local static: DBuf is a per-op hot path and the process runs on ONE
+// device, so the virtual dispatch is paid exactly once. Mirrors qwen3_5.cpp.
+struct DevicePoolPolicy {
+  size_t cap_bytes = 0;  // residency_policy().device_pool_cap_bytes (0 == uncapped)
+};
+DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
+  static const DevicePoolPolicy p = [&] {
+    const auto rp =
+        vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
+    return DevicePoolPolicy{rp.device_pool_cap_bytes};
+  }();
+  return p;
+}
+
+// Owned device allocation + tensor view, routed through the SHARED DevicePool so
+// the buffer's storage is reused rather than freed to the driver (avoiding the
+// per-op cudaMalloc/cudaFree sync). Move-only, RAII. Ported verbatim from the
+// qwen3_5.cpp pooled DBuf (device_pool.h Pool()/ActivePool()).
 class DBuf {
  public:
-  DBuf(Dev d, DType dt, const std::vector<int64_t>& shape, const void* host = nullptr)
+  DBuf(Dev d, DType dt, const std::vector<int64_t>& shape,
+       const void* host = nullptr)
       : b_(&d.b) {
     int64_t numel = 1;
     for (int64_t s : shape) numel *= s;
     bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
-    p_ = d.b.Alloc(bytes_ == 0 ? 1 : bytes_);
+    alloc_bytes_ = bytes_ == 0 ? 1 : bytes_;
+    cap_ = ResolveDevicePoolPolicy(d).cap_bytes;
+    pool_ = ActivePool();
+    p_ = pool_->Get(*b_, alloc_bytes_);
     t_ = MakeTensor(p_, dt, d.q.device, shape);
-    if (host != nullptr && bytes_ > 0) d.b.Copy(d.q, p_, host, bytes_);
+    if (host != nullptr && bytes_ > 0) b_->Copy(d.q, p_, host, bytes_);
   }
-  ~DBuf() {
-    if (p_ != nullptr) b_->Free(p_);
-  }
+  ~DBuf() { if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_); }
   DBuf(const DBuf&) = delete;
   DBuf& operator=(const DBuf&) = delete;
-  DBuf(DBuf&& o) noexcept : b_(o.b_), p_(o.p_), bytes_(o.bytes_), t_(o.t_) {
+  DBuf(DBuf&& o) noexcept
+      : b_(o.b_), pool_(o.pool_), p_(o.p_), bytes_(o.bytes_),
+        alloc_bytes_(o.alloc_bytes_), cap_(o.cap_), t_(o.t_) {
     o.p_ = nullptr;
   }
   DBuf& operator=(DBuf&& o) noexcept {
     if (this != &o) {
-      if (p_ != nullptr) b_->Free(p_);
+      if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_);
       b_ = o.b_;
+      pool_ = o.pool_;
       p_ = o.p_;
       bytes_ = o.bytes_;
+      alloc_bytes_ = o.alloc_bytes_;
+      cap_ = o.cap_;
       t_ = o.t_;
       o.p_ = nullptr;
     }
@@ -125,11 +178,14 @@ class DBuf {
   const Tensor& t() const { return t_; }
   void* ptr() { return p_; }
   size_t bytes() const { return bytes_; }
+  size_t alloc_bytes() const { return alloc_bytes_; }
   void Zero(Dev d) { b_->Memset(d.q, p_, 0, bytes_); }
   void Download(Dev d, void* host) {
     b_->Copy(d.q, host, p_, bytes_);
     b_->Synchronize(d.q);
   }
+  // Relinquish the pool block WITHOUT returning it (dtor becomes a no-op); the
+  // caller takes over the Pool().Put obligation for alloc_bytes().
   void* Release() {
     void* p = p_;
     p_ = nullptr;
@@ -138,8 +194,11 @@ class DBuf {
 
  private:
   Backend* b_;
+  DevicePool* pool_ = &Pool();
   void* p_ = nullptr;
   size_t bytes_ = 0;
+  size_t alloc_bytes_ = 0;
+  size_t cap_ = 0;
   Tensor t_;
 };
 
@@ -217,13 +276,24 @@ struct StepInputs {
   DBuf block_table;      // i32 [num_reqs, cols]
   DBuf seq_lens;         // i32 [num_reqs]
   DBuf query_start_loc;  // i32 [num_reqs+1]
-  DBuf cos_sin;          // f32 [T, rotary_dim]
+  DBuf cos_sin;          // f32 [T, rotary_dim]   (per-step cos|sin, f32 A/B path)
+  DBuf cos_sin_bf16;     // bf16 [T, rotary_dim]  (vLLM-dtype cache, bf16 rope)
+  DBuf rope_row_idx;     // i32 [T] = 0..T-1 (token-index lookup into the cache)
 };
 
 StepInputs BuildStepInputs(Dev d, const std::vector<int32_t>& positions,
                            const CommonAttentionMetadata& am, const HfConfig& cfg) {
   const int64_t T = static_cast<int64_t>(positions.size());
   const int rot = static_cast<int>(cfg.rotary_dim);
+  // Identity row index 0..T-1: the per-step cos|sin cache is TOKEN-indexed (row t
+  // already holds f(positions[t])), so RopeFromCache — which looks the cache up by
+  // its `positions` argument — must be fed the identity so it reads cache[t], the
+  // correct angle for token t at ANY real position (prefill AND decode). Feeding
+  // the real positions would double-apply the position map (and skip decode rows
+  // whose position >= T, the cache row count). Mirrors the token-indexed fused
+  // AttnQkNormRope(Gate) consumer used by the 27B/35B forward.
+  std::vector<int32_t> row_idx(static_cast<size_t>(T));
+  for (int64_t i = 0; i < T; ++i) row_idx[static_cast<size_t>(i)] = static_cast<int32_t>(i);
   StepInputs s{
       DBuf(d, DType::kI32, {T}, positions.data()),
       DBuf(d, DType::kI64, {T}, am.slot_mapping.data()),
@@ -232,10 +302,23 @@ StepInputs BuildStepInputs(Dev d, const std::vector<int32_t>& positions,
       DBuf(d, DType::kI32, {am.num_reqs}, am.seq_lens.data()),
       DBuf(d, DType::kI32, {am.num_reqs + 1}, am.query_start_loc.data()),
       DBuf(d, DType::kF32, {T, rot > 0 ? rot : 1}),
+      DBuf(d, DType::kBF16, {T, rot > 0 ? rot : 1}),
+      DBuf(d, DType::kI32, {T}, row_idx.data()),
   };
   if (rot > 0) {
+    // Build the per-step cos|sin cache ONCE (RopeCosSinCache does the fp64
+    // pow/cos/sin over T*rot/2 elements, keyed by the REAL positions), so the
+    // per-layer attention preamble reads it via RopeFromCache instead of
+    // recomputing the fp64 transcendentals N times (the old RopeNeox). The cache
+    // is f32; RopeCosSinCacheKernel uses the SAME double-angle math as
+    // RopeNeoxKernel, so an f32-precision RoPE off this cache is BIT-IDENTICAL to
+    // RopeNeox (cuda_ops.cu:720).
     vt::RopeCosSinCache(d.q, s.cos_sin.t(), s.positions.t(),
                         vt::RopeArgs{static_cast<float>(cfg.rope_theta), rot});
+    // The bf16 model-dtype cache is only consumed by the opt-in RopeFromCache
+    // path; skip the cast on the default (RopeNeox) path so default-OFF stays
+    // perf-neutral vs baseline.
+    if (RopeCacheEnabled()) vt::CastBf16(d.q, s.cos_sin_bf16.t(), s.cos_sin.t());
   }
   return s;
 }
@@ -314,17 +397,41 @@ DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg,
     p.rope = vt::RopeArgs{base, rot};
     vt::FusedChain(d.q, vt::kAttnQkNormRope, b, p);
   } else {
-    // BF16 default (token-exact vs the bf16 oracle): standalone per-head RMSNorm
-    // (weight dtype == q dtype) + in-place NeoX RoPE. The norm weight follows q's
-    // dtype so bf16 q · bf16 q_norm; RopeNeox computes cos/sin in f32 and rounds
-    // the rotated value back to bf16, mirroring vLLM's rotary_emb on bf16 q/k.
+    // BF16 attention preamble: standalone per-head RMSNorm (weight dtype == q
+    // dtype) then partial NeoX RoPE. The norm weight follows q's dtype so bf16 q ·
+    // bf16 q_norm, matching vLLM's per-op bf16 stores.
+    //
+    // RoPE has two paths (RopeCacheEnabled / VT_QWEN3_ROPE_CACHE):
+    //  - DEFAULT (OFF): in-place RopeNeox — byte-identical + deterministic (the
+    //    committed near-tie goldens + the stable SACRED gate).
+    //  - OPT-IN (ON): RopeFromCache off the per-step cos|sin cache — MEASURED the
+    //    dominant dense-TTFT lever (recomputing fp64 pow/cos/sin per element per
+    //    layer, RopeNeox, is 36.5% of prefill GPU-busy; fp64 ≈ 1/64 fp32 on GB10).
+    //    The cache is cast to BF16 so bf16 q/k rotate against a bf16 cos|sin —
+    //    EXACTLY vLLM's RotaryEmbedding (base.cpp initialize_cache()), the
+    //    vLLM-FAITHFUL rope. See RopeCacheEnabled() for why it is opt-in (CUDA
+    //    FMA non-byte-identity + engine near-tie nondeterminism → flaky gate).
+    //
+    // Token-indexed lookup (opt-in path): cache row t already encodes positions[t], so
+    // RopeFromCache is fed the identity row index (si.rope_row_idx) — NOT the
+    // real positions — so cache[t] is read for token t at ANY position (the
+    // position map is already applied when the cache is built), correct for
+    // prefill AND decode.
     Tensor wqn = attn_f32 ? ResidentWeightF32(d, w.q_norm, {Dh})
                           : ResidentWeight(d, w.q_norm, {Dh});
     Tensor wkn = attn_f32 ? ResidentWeightF32(d, w.k_norm, {Dh})
                           : ResidentWeight(d, w.k_norm, {Dh});
     vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
     vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
-    vt::RopeNeox(d.q, q3, k3, si.positions.t(), vt::RopeArgs{base, rot});
+    if (RopeCacheEnabled() && rot > 0) {
+      Tensor k3v = k3;
+      vt::RopeFromCache(d.q, q3, &k3v, si.rope_row_idx.t(), si.cos_sin_bf16.t(),
+                        vt::RopeArgs{base, rot});
+    } else {
+      // DEFAULT (byte-identical, deterministic): in-place bf16 NeoX RoPE with
+      // per-element fp64 cos/sin, mirroring vLLM's rotary_emb bf16 rounding.
+      vt::RopeNeox(d.q, q3, k3, si.positions.t(), vt::RopeArgs{base, rot});
+    }
   }
 
   // v [T,Hkv,Dh] view.
@@ -511,9 +618,14 @@ ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t voca
   fl.rows = rows;
   fl.vocab = vocab;
   fl.device_tensor = dlogits.t();
-  Backend* bk = &d.b;
+  // The pool block's lifetime moves into a shared_ptr whose deleter returns it to
+  // the DevicePool — no per-step cudaMalloc/cudaFree, and the buffer safely
+  // outlives sampling (mirrors qwen3_5.cpp WrapDeviceLogits).
+  const size_t alloc = dlogits.alloc_bytes();
   void* p = dlogits.Release();
-  fl.device_storage = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+  fl.device_storage =
+      std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+  (void)d;
   return fl;
 }
 

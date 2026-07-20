@@ -127,3 +127,34 @@ Net new catalog work: **≈2 one-line `constexpr FusedRecipe` declarations**, ea
 3. **The honest additivity gaps are in the RUNNER, not the registry:** `runner.cpp:458-460` (layer_types indexing crashes on pure-dense) and `:645-730` (unconditional GDN metadata/step path) hardcode the Qwen3.6 hybrid topology. The first pure-dense bring-up is the forcing function that must generalize them — small, one-time, model-agnostic — after which Llama/Mistral add with new-files-only.
 4. **Fusion catalog reuses everything**; net-new = ≈2 one-line recipe declarations (standard/non-gemma add-rmsnorm + non-gated qk-norm-rope); the `gemma` flag already exists.
 5. **Sacred gate:** token-exact greedy `Qwen3-0.6B` vs vLLM 0.25.0 oracle 16/16; regression gate = 27B 235/235 + 35B 315/315 unchanged after the runner generalization.
+
+## 9. Structured spike contract (stable rows `MODEL-TEXT-qwen3-qwen3-for-causal-lm` + `ENG-RUNNER-MODELSHAPE`)
+
+The prose above (§0–§8) is the full spike; this section restates it in the record-checker's structured fields. Two stable rows share this spec: the model row `MODEL-TEXT-qwen3-qwen3-for-causal-lm` (the arch bring-up) and the engine row `ENG-RUNNER-MODELSHAPE` (the runner generalization the bring-up forces — a first-class extensibility deliverable).
+
+### Scope
+Add `Qwen3ForCausalLM` (pure standard-dense transformer: no GDN, no MoE, standard non-gemma RMSNorm, per-head q/k norm, tied lm_head, `sliding_window: null`) as MOSTLY NEW FILES, and generalize the `GPUModelRunner` so a full-attention-only KV config is first-class. In scope: config hook, registry TU, full-attention-only KV spec, runner generalization, weight loader, dense forward, token-exact gate. Out of scope: vision tower, NVFP4 (32B follow-on), Llama/Mistral (W-next).
+
+### Upstream chain
+`vllm/model_executor/models/qwen3.py::Qwen3ForCausalLM` @ `e24d1b24` (§2: `Qwen3Attention` qkv+per-head q/k RMSNorm+RoPE+`o_proj`; `Qwen3MLP`=`Qwen2MLP` SwiGLU; standard `RMSNorm`; tied `lm_head`); `registry.py:191` (`REGISTER_MODEL`); config `Qwen3-0.6B/config.json`. Runner ground: `vllm/v1/worker/gpu/model_runner.py` `initialize_kv_cache` drives layer typing off `kv_cache_config.kv_cache_groups` (never a hardcoded hybrid) — the model-agnostic pattern `ENG-RUNNER-MODELSHAPE` restores.
+
+### Our baseline
+Template = the Qwen3.6 dense path: `qwen3_5_dense.cpp` (registry TU idiom), `qwen3_5_common.*` (config hook + KV spec), `model_registry.h` `REGISTER_VLLM_MODEL`. Runner = `src/vllm/v1/worker/gpu/runner.cpp` (the KV-buffer alloc loop + the forward-step GDN path). Qwen3 dense is a strict subset of our 27B dense full-attention path minus GDN, minus the multimodal prefix, minus NVFP4, minus the attention gate, plus tied embeddings and non-gemma RMSNorm.
+
+### Port map
+New files: `include/vllm/model_executor/models/qwen3.h`, `src/vllm/model_executor/models/qwen3_dense.cpp` (registry TU: `REGISTER_VLLM_MODEL(qwen3,"Qwen3ForCausalLM")` + `MakeQwen3ForCausalLMKVCache` full-attn-only + `ParseQwen3ForCausalLMConfig` + stub factory), then W2 `qwen3_weights.cpp` + W3 `qwen3.cpp`. Shared touches (classified §3b): `CMakeLists.txt` (TU add, unavoidable build-glue), the in-TU REGISTER line (designed seam), and THE ONE generalization `runner.cpp` (`ENG-RUNNER-MODELSHAPE`, seam gaps #1 alloc-loop `layer_types` index, #2 GDN metadata/step) driven off a model-agnostic `has_mamba_group`/`gdn_group_id_>=0` predicate.
+
+### Tests to port
+(a) registry resolution `tests/vllm/models/test_model_registry.cpp` (`Qwen3ForCausalLM` resolves to the dense factory; FA-only KV spec); (b) runner generalization `tests/vllm/v1/worker/test_runner.cpp` (full-attention-only KV alloc + step, RED→GREEN vs the pre-generalization crash); (c) W3 forward doctest `test_qwen3_forward.cpp`; (d) W4 SACRED token-exact `test_qwen3_paged_engine.cpp` vs the vLLM 0.25.0 oracle. Mirrors the qwen27 test family.
+
+### Gates
+W0: CPU build + registry test green. W1: dgx CUDA `-Werror` 0-warn; BEHAVIOUR-PRESERVING 27B `test_qwen27_paged_engine` 235/235 + 35B `test_qwen36_paged_engine` 315/315 token-exact UNCHANGED; new CPU runner tests RED→GREEN; memcheck 0 on the affected paths. W4 SACRED: token-exact greedy `Qwen3-0.6B` vs vLLM 0.25.0 oracle 16/16 (precondition for any perf claim).
+
+### Dependencies
+Builds on the delivered extensibility seams: model self-registration (item 5), Platform/residency (items 1-2), attn-registry (item 4), the fusion catalog (W0-W4). The only NEW dependency work is the runner generalization (`ENG-RUNNER-MODELSHAPE`, gaps #1/#2). Checkpoint `Qwen3-0.6B` (BF16) + oracle `~/venvs/vllm-oracle` (vLLM 0.25.0) present on dgx; no download, no multi-GPU.
+
+### Work breakdown
+W0 config + registry stub (LANDED 2026-07-20). W1 runner generalization / `ENG-RUNNER-MODELSHAPE` (LANDED 2026-07-20, behaviour-preserving). W2 weight loader (extract shared BF16 loader helpers; Qwen3 name map + tied lm_head). W3 forward (compose vt ops + ≈2 new one-line fusion recipes). W4 SACRED correctness gate + row → `DONE`. W-next: NVFP4 32B, then Llama-3.2-1B (download) as the genuine cross-family additivity proof.
+
+### Risks/decisions
+Decision: gate on `Qwen3-0.6B` because it is the only standard-dense arch with both a dgx checkpoint and a runnable 0.25.0 oracle today (Llama needs a download). Risk: Qwen3 dense's closeness to Qwen3.6 dense under-stresses weight-name/config divergence → Llama-3.2-1B recommended as the immediate W-next for a genuine cross-family test. Honest additional seam gap found in W1 (beyond #1/#2): the SHARED 27B `Qwen3_5DenseModel::Forward` asserts `gdn_meta.num_actual_tokens == T` (`qwen3_5.cpp:5463`) — a FORWARD-side hybrid assumption, resolved by Qwen3's own W3 forward (not a runner gap). Numerics decision: confirm non-gemma RMSNorm (`weight*hidden`) at W3.

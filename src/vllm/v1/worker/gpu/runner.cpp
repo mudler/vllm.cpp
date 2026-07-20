@@ -455,8 +455,16 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   full_attn_buf_.clear();
   ssm_buf_.clear();
   conv_buf_.clear();
+  // A full-attention-only model (e.g. dense Qwen3ForCausalLM) has NO
+  // linear-attention (GDN/Mamba) KV group and an EMPTY layer_types — indexing
+  // layer_types[l] would be out of bounds. Drive "is this layer GDN?" off the
+  // resolved KV-group structure (gdn_group_id_ >= 0 ⇔ the model has a mamba
+  // group), then the per-layer layer_types tag. This is model-shape-agnostic:
+  // the hybrid gate models keep a GDN group, so their path is byte-identical.
+  const bool has_mamba_group = gdn_group_id_ >= 0;
   for (int64_t l = 0; l < config_.num_hidden_layers; ++l) {
     const bool is_gdn =
+        has_mamba_group && !config_.layer_types.empty() &&
         config_.layer_types[static_cast<size_t>(l)] == "linear_attention";
     if (is_gdn) {
       VT_CHECK(mamba_spec != nullptr,
@@ -647,26 +655,35 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       step, fa_bt, fa_cols, /*causal=*/true, full_attn_group_id_);
 
   // GDN KV group metadata: the same step over the GDN group's block table,
-  // segmented decode-first by the GDN builder (M1.6 Task 4).
-  int gdn_cols = 0;
-  std::vector<int32_t> gdn_bt =
-      gather_block_table(gdn_group_id_, num_reqs, &gdn_cols);
-  // Remap col 0 to a compact per-sequence state slot in [0, gdn_state_slots_),
-  // keyed on the request identity so the GDN state cache is sized by
-  // max_num_reqs (one recurrent state per sequence) rather than the attention
-  // num_blocks, and no two live sequences ever collide on one slot. Only col 0
-  // (state indices) is read downstream.
-  remap_gdn_state_slots(gdn_bt, gdn_cols, num_reqs, input_batch_.req_ids);
-  if (GdnDiagStepLogEnabled()) {
-    std::cerr << "[VT_GDN_DIAG] step num_reqs=" << num_reqs
-              << " gdn_free_slots=" << gdn_free_slots_.size()
-              << " gdn_live_slots=" << gdn_slot_of_req_.size() << "\n";
+  // segmented decode-first by the GDN builder (M1.6 Task 4). GATED on the model
+  // HAVING a linear-attention (GDN/Mamba) KV group: a full-attention-only model
+  // (dense Qwen3ForCausalLM) has gdn_group_id_ < 0 and no GDN block-table group,
+  // so gather_block_table(gdn_group_id_) / remap / the metadata build must be
+  // skipped — gdn_meta stays default-empty (num_prefill_tokens == 0, all state
+  // arrays nullopt) and no GDN state is wired. The hybrid gate models keep a GDN
+  // group (gdn_group_id_ >= 0), so this block runs exactly as before —
+  // behavior-preserving / byte-identical for the hybrid path.
+  GDNAttentionMetadata gdn_meta;
+  if (gdn_group_id_ >= 0) {
+    int gdn_cols = 0;
+    std::vector<int32_t> gdn_bt =
+        gather_block_table(gdn_group_id_, num_reqs, &gdn_cols);
+    // Remap col 0 to a compact per-sequence state slot in [0, gdn_state_slots_),
+    // keyed on the request identity so the GDN state cache is sized by
+    // max_num_reqs (one recurrent state per sequence) rather than the attention
+    // num_blocks, and no two live sequences ever collide on one slot. Only col 0
+    // (state indices) is read downstream.
+    remap_gdn_state_slots(gdn_bt, gdn_cols, num_reqs, input_batch_.req_ids);
+    if (GdnDiagStepLogEnabled()) {
+      std::cerr << "[VT_GDN_DIAG] step num_reqs=" << num_reqs
+                << " gdn_free_slots=" << gdn_free_slots_.size()
+                << " gdn_live_slots=" << gdn_slot_of_req_.size() << "\n";
+    }
+    const CommonAttentionMetadata gdn_cam = MakeCommonAttentionMetadata(
+        step, gdn_bt, gdn_cols, /*causal=*/true, gdn_group_id_);
+    GDNAttentionMetadataBuilder gdn_builder;
+    gdn_meta = gdn_builder.build(/*common_prefix_len=*/0, gdn_cam);
   }
-  const CommonAttentionMetadata gdn_cam = MakeCommonAttentionMetadata(
-      step, gdn_bt, gdn_cols, /*causal=*/true, gdn_group_id_);
-  GDNAttentionMetadataBuilder gdn_builder;
-  GDNAttentionMetadata gdn_meta =
-      gdn_builder.build(/*common_prefix_len=*/0, gdn_cam);
 
   // Flattened dense-order forward inputs (positions int64 -> int32 for RoPE).
   const std::vector<int32_t>& token_ids = step.input_token_ids;

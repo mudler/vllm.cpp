@@ -24,10 +24,12 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3_5.h"
+#include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/sampling_params.h"
@@ -42,6 +44,7 @@ using vllm::GdnStateCache;
 using vllm::HfConfig;
 using vllm::OwnedTensor;
 using vllm::PagedKvCache;
+using vllm::Qwen3_5DenseWeights;
 using vllm::Qwen3_5Model;
 using vllm::Qwen3_5MoeWeights;
 using vllm::SamplingParams;
@@ -277,6 +280,95 @@ int GreedyArgmax(const std::vector<float>& logits, int64_t row, int64_t vocab) {
     }
   }
   return best;
+}
+
+// ─── W1 runner-generalization fixtures: a FULL-ATTENTION-ONLY (non-hybrid)
+// model. layer_types is EMPTY (pure dense, e.g. Qwen3ForCausalLM) and the KV
+// config carries exactly ONE full-attention group with NO MambaSpec/GDN group.
+// Pre-generalization, runner.cpp indexed config_.layer_types[l] (out of bounds
+// on empty) and unconditionally gather_block_table(gdn_group_id_ == -1) →
+// input_batch_.block_table[-1] (out of bounds). Both must now be skipped.
+
+HfConfig MakeDenseOnlyConfig() {
+  HfConfig c;
+  c.model_type = "qwen3";
+  c.architectures = {"Qwen3ForCausalLM"};
+  c.hidden_size = 32;
+  c.num_hidden_layers = 2;  // both FULL-ATTENTION
+  c.vocab_size = 40;
+  c.num_attention_heads = 6;
+  c.num_key_value_heads = 2;
+  c.head_dim = 8;
+  c.layer_types = {};  // EMPTY → pure dense (all full-attention, no GDN)
+  c.intermediate_size = 16;
+  c.num_experts = 0;
+  // GDN-shape fields are unused by a full-attention-only model, but stay valid
+  // so the runner's (now guarded) conv_dim arithmetic is well-formed.
+  c.linear_num_key_heads = 2;
+  c.linear_num_value_heads = 6;
+  c.linear_key_head_dim = 8;
+  c.linear_value_head_dim = 8;
+  c.linear_conv_kernel_dim = 4;
+  c.rope_theta = 10000.0;
+  c.rotary_dim = 4;
+  c.rms_norm_eps = 1e-6;
+  c.max_position_embeddings = 64;
+  return c;
+}
+
+Qwen3_5DenseWeights MakeDenseOnlyWeights(const HfConfig& c) {
+  Qwen3_5DenseWeights w;
+  const int64_t H = c.hidden_size, V = c.vocab_size;
+  const int64_t Hq = c.num_attention_heads, Hkv = c.num_key_value_heads,
+                Dh = c.head_dim, I = c.intermediate_size;
+  w.embed_tokens = MakeOwned(DType::kBF16, {V, H}, 11);
+  w.final_norm = MakeOwned(DType::kBF16, {H}, 12);
+  w.lm_head = MakeOwned(DType::kBF16, {H, V}, 13);
+  for (int64_t l = 0; l < c.num_hidden_layers; ++l) {
+    const uint64_t s = 1000 + static_cast<uint64_t>(l) * 5000;
+    vllm::Qwen3_5DenseLayerWeights lw;
+    lw.is_linear_attention = false;  // every layer full-attention
+    lw.input_layernorm = MakeOwned(DType::kBF16, {H}, s + 1);
+    lw.post_attention_layernorm = MakeOwned(DType::kBF16, {H}, s + 2);
+    lw.attn.q_proj = MakeOwned(DType::kBF16, {H, 2 * Hq * Dh}, s + 10);
+    lw.attn.k_proj = MakeOwned(DType::kBF16, {H, Hkv * Dh}, s + 20);
+    lw.attn.v_proj = MakeOwned(DType::kBF16, {H, Hkv * Dh}, s + 30);
+    lw.attn.o_proj = MakeOwned(DType::kBF16, {Hq * Dh, H}, s + 40);
+    lw.attn.q_norm = MakeOwned(DType::kBF16, {Dh}, s + 50);
+    lw.attn.k_norm = MakeOwned(DType::kBF16, {Dh}, s + 60);
+    lw.mlp.gate_proj = MakeOwned(DType::kBF16, {H, I}, s + 100);
+    lw.mlp.up_proj = MakeOwned(DType::kBF16, {H, I}, s + 200);
+    lw.mlp.down_proj = MakeOwned(DType::kBF16, {I, H}, s + 300);
+    w.layers.push_back(std::move(lw));
+  }
+  return w;
+}
+
+// A full-attention-ONLY KVCacheConfig: one FA group, NO mamba group (mirrors
+// MakeQwen3ForCausalLMKVCache).
+KVCacheConfig MakeFaOnlyKvConfig(const HfConfig& c) {
+  const int Hkv = static_cast<int>(c.num_key_value_heads);
+  const int Dh = static_cast<int>(c.head_dim);
+  KVCacheConfig kv;
+  kv.num_blocks = kNumBlocks;
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"fa"},
+      std::make_shared<FullAttentionSpec>(kBlockSize, Hkv, Dh, DType::kF32));
+  return kv;
+}
+
+// A NewRequestData with a SINGLE (full-attention) block-table group.
+NewRequestData MakeFaNewReq(const std::string& id, std::vector<int32_t> prompt,
+                            int num_computed, std::vector<int> fa_blocks,
+                            const SamplingParams& sp) {
+  NewRequestData nr;
+  nr.req_id = id;
+  nr.prompt_token_ids = prompt;
+  nr.sampling_params = sp;
+  nr.block_ids = {std::move(fa_blocks)};  // ONE group only (no GDN group)
+  nr.num_computed_tokens = num_computed;
+  nr.prefill_token_ids = std::move(prompt);
+  return nr;
 }
 
 }  // namespace
@@ -938,4 +1030,62 @@ TEST_CASE("runner: sample_tokens_async decode is token-identical to sync") {
   const std::vector<int32_t> sync = run(false);
   const std::vector<int32_t> async_out = run(true);
   CHECK(async_out == sync);  // token-for-token identical
+}
+
+// ─── W1: runner generalization to a FULL-ATTENTION-ONLY model ────────────────
+// The first additive-model bring-up (Qwen3ForCausalLM) forces the runner to
+// stop assuming the Qwen3.6 hybrid KV topology. These two cases pin the fix:
+// pre-generalization both crash (empty layer_types[] index; block_table[-1]).
+
+TEST_CASE("runner: full-attention-only KV config allocates without the GDN path") {
+  const HfConfig c = MakeDenseOnlyConfig();
+  const Qwen3_5DenseWeights w = MakeDenseOnlyWeights(c);
+  // Pre-fix: initialize_kv_cache indexed config_.layer_types[l] with an EMPTY
+  // layer_types (out of bounds). Post-fix: no mamba group ⇒ every layer is
+  // full-attention and one PagedKvCache is allocated per layer.
+  GPUModelRunner runner(c, w, MakeFaOnlyKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64);
+
+  CHECK(runner.full_attn_group_id() == 0);
+  CHECK(runner.gdn_group_id() == -1);          // NO GDN group
+  CHECK(runner.num_blocks() == kNumBlocks);
+
+  // One PagedKvCache per (full-attention) layer, and ZERO GDN state caches.
+  REQUIRE(runner.attn_kv().size() ==
+          static_cast<size_t>(c.num_hidden_layers));
+  CHECK(runner.gdn_state().empty());
+  const PagedKvCache& kv = runner.attn_kv()[0];
+  CHECK(kv.num_blocks == kNumBlocks);
+  CHECK(kv.block_size == kBlockSize);
+  CHECK(kv.num_kv_heads == c.num_key_value_heads);
+  CHECK(kv.head_size == c.head_dim);
+  CHECK(kv.data != nullptr);
+}
+
+TEST_CASE("runner: full-attention-only step skips GDN metadata build (no OOB)") {
+  const HfConfig c = MakeDenseOnlyConfig();
+  const Qwen3_5DenseWeights w = MakeDenseOnlyWeights(c);
+  GPUModelRunner runner(c, w, MakeFaOnlyKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64);
+
+  const std::vector<int32_t> prompt = {5, 9, 2, 31, 17};
+  const int P = static_cast<int>(prompt.size());
+  SchedulerOutput s1 =
+      NewStep({MakeFaNewReq("A", prompt, 0, {0, 1}, Greedy())}, {{"A", P}});
+
+  // Pre-generalization, execute_model called gather_block_table(gdn_group_id_ ==
+  // -1) → input_batch_.block_table[-1] (out-of-bounds → crash) BEFORE reaching
+  // the model forward. Post-generalization the whole GDN metadata build is gated
+  // on gdn_group_id_ >= 0, so a full-attention-only step builds a default-empty
+  // gdn_meta and reaches the model forward WITHOUT any out-of-bounds.
+  //
+  // The forward it reaches here is the BORROWED 27B *dense* forward, which
+  // carries its OWN hybrid assumption (gdn_meta must describe every token —
+  // qwen3_5.cpp:5463). That is a FORWARD-side seam gap, NOT a runner one:
+  // Qwen3ForCausalLM's own dense forward (W3) will not assume a GDN group. So we
+  // assert only that control reached the forward via a clean, CATCHABLE throw
+  // (not an uncatchable OOB), which proves the runner's GDN path was skipped.
+  CHECK_THROWS_WITH_AS(runner.execute_model(s1),
+                       doctest::Contains("qwen3_5 dense paged forward"),
+                       std::runtime_error);
 }

@@ -76,7 +76,7 @@ unified-memory box. Repro + raw logs:
 [bench-evidence/qwen3-4b-vllm-series-fa2prefill-20260720.log](bench-evidence/qwen3-4b-vllm-series-fa2prefill-20260720.log);
 full recipe in the [parity ledger](../.agents/parity-ledger.md) 2026-07-20 FA2-prefill SPEED row.
 
-**Qwen3-dense TTFT levers — DevicePool (neutral) + RoPE cos|sin cache (opt-in), 2026-07-20
+**Qwen3-dense TTFT levers — DevicePool (neutral) + RoPE cos/sin cache (opt-in), 2026-07-20
 (`Qwen3-4B` BF16, base `812a57a`).** Two profile-#81 levers, measure-first. Recipe here:
 `examples/vllm-bench --input-len 1024 --output-len 128 --concurrency {1,8}` (ours) vs
 `vllm serve` + `vllm bench serve --dataset-name random --random-input-len 1024
@@ -90,7 +90,7 @@ row's TTFT gap is larger); the recipe-robust signal is the **relative same-binar
   316 vs 317 ms, TPOT/tput within noise — the "~44% GPU-idle from cudaMalloc/cudaFree"
   premise is DISPROVEN (async scheduler overlaps the host-side alloc syncs). Kept as
   byte-safe hygiene + code sharing, not a TTFT lever.
-- **LEVER 2 — RoPE cos|sin cache (`VT_QWEN3_ROPE_CACHE`, opt-in): the real TTFT lever.**
+- **LEVER 2 — RoPE cos/sin cache (`VT_QWEN3_ROPE_CACHE`, opt-in): the real TTFT lever.**
   Same-binary A/B (cache vs RopeNeox): **c1 median TTFT 209 → 135 ms (−35%); c8 316 → 144
   ms (−54%)**; TPOT/tput flat (prefill-only win). Under this recipe that is 0.87× (c1) /
   0.38× (c8) vs vLLM's median TTFT (135 vs 156 ms; 144 vs 383 ms) — at/beyond median

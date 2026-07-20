@@ -452,9 +452,12 @@ using ApplyMinPFn = void (*)(Queue&, Tensor&, const Tensor&);
 using ApplyLogitBiasFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&);
 using ApplyTokenMaskFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using ApplyAllowedTokenIdsFn = void (*)(Queue&, Tensor&, const Tensor&);
-// --- Fused declarative recipe (TDR Phase 0). One op dispatches ANY FusedRecipe
-// through the existing table; the recipe is the single source of truth walked by
-// the backend's Tier-0 composite / Tier-1 interpreter (see FusedChain below).
+// --- Fused declarative recipe (TDR; the portable fusion framework). The
+// registered per-backend op is the Tier-1 single-pass INTERPRETER, over the
+// canonical (out, x, weight, residual) 4-operand shape it serves (kFusedAddRmsNorm
+// and any future all-elementwise recipe). Tier-0 composite is device-agnostic and
+// lives in ops.cpp (it walks the recipe dispatching each opcode to the standalone
+// vt:: op, so it is byte-exact to the unfused sequence — see FusedChain below).
 using FusedChainFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, Tensor*, const FusedRecipe&, float);
 using DropinProbeFn = void (*)(Queue&, Tensor&, const Tensor&, const DropinProbeArgs&);
@@ -777,21 +780,49 @@ void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
 
-// --- Fused declarative recipe (TDR Phase 0; see include/vt/recipes.h and
-// .agents/specs/fusion-architecture-2026-07-08.md). Runs `recipe` — a backend-agnostic
-// constexpr FusedRecipe — over its operands, producing `out`. The op is realized
-// per backend in tiers selected by VT_FUSED_TIER (default 0 = Tier-0 composite,
-// which walks the recipe through the already-registered primitives; 1 = Tier-1
-// single-pass interpreter). Every tier is bit-identical (f32 accumulation order,
-// gemma (1+w), residual-add rounding) — the recipe is the single source of truth.
+// --- Fused declarative recipe (TDR; see include/vt/recipes.h and
+// .agents/specs/portable-fusion-framework.md). A recipe (a backend-agnostic
+// constexpr FusedRecipe) is realized in tiers selected by VT_FUSED_TIER:
+//   Tier 0 (default, composite): a device-agnostic walker (ops.cpp) dispatches
+//     each opcode to the already-registered standalone vt:: op — BYTE-EXACT to the
+//     unfused sequence the model hand-calls (kRmsNorm->RmsNorm, kSiluMul->
+//     MoeSiluMul, kQuantFp4->ScaledFp4Quant, ...). Correct on every backend that
+//     registers the constituent ops; the fp8 quant terminal is CUDA-only.
+//   Tier 1 (interpreter): a single-pass backend kernel for Tier-1-able recipes
+//     (all steps elementwise/kRmsNorm, e.g. kFusedAddRmsNorm); the perf tier.
 //
-// Operand contract (Phase-0 vocabulary): out [T,H] f32/bf16, x [T,H] float,
-// weight [H] float, optional residual [T,H] f32/bf16 (in/out, updated in place by
-// a kAdd->kResidual step). `eps` is the runtime RMSNorm epsilon (the only runtime
-// scalar; structural constants like gemma live in the recipe). For
-// kFusedAddRmsNorm this is bit-identical to RmsNorm(out, x, weight, {eps, gemma=
-// true}, residual). NOT YET wired into any model forward (Phase 0 is framework +
-// op + test only) — the engine stays byte-identical.
+// Runtime scalars travel in FusedParams (structural constants like gemma live in
+// the recipe). Tensors are bound positionally to the recipe's indexed operand
+// table via FusedBinding (op[i] is the tensor for operand slot i; nullptr for an
+// absent optional slot). Intermediate slots (a bf16 norm/activation result the
+// next step quantizes) are caller-bound scratch — exactly as the unfused sequence
+// materializes them.
+
+// Physical tensors bound to a recipe's indexed operand table (op[i] == slot i).
+struct FusedBinding {
+  Tensor* op[kMaxFusedOperands] = {};
+  int n = 0;
+};
+
+// Runtime scalars a recipe's opcodes consume (structural constants stay in the
+// recipe). eps: RMSNorm/gated epsilon. quant_scale: the fp8 input_scale OR the
+// fp4 input_global_scale_inv. fp4_layout: ScaledFp4Quant scale layout. rope: the
+// kRope / kAttnQkNormRopeGate RoPE args.
+struct FusedParams {
+  float eps = 1e-6f;
+  float quant_scale = 1.0f;
+  Fp4ScaleLayout fp4_layout = Fp4ScaleLayout::kLinear;
+  RopeArgs rope{};
+};
+
+// General entry: realize `recipe` over the bound operands with `params`.
+void FusedChain(Queue& q, const FusedRecipe& recipe, const FusedBinding& binding,
+                const FusedParams& params);
+
+// Narrow overload for the canonical (out, x, weight, residual) 4-operand shape —
+// the W0-adopted kFusedAddRmsNorm site. Binds [x, weight, residual, out] and
+// forwards to the general entry; bit-identical to RmsNorm(out, x, weight,
+// {eps, gemma=true}, residual) for kFusedAddRmsNorm.
 void FusedChain(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, Tensor* residual,
                 const FusedRecipe& recipe, float eps);
 

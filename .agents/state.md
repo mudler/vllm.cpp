@@ -13885,3 +13885,80 @@ construction ⇒ `benchmark_binding=false` (no re-grid).
 hand-ops become declarations; W2 migrates them one-by-one (byte-exact + token-exact each);
 W3 = a new vLLM pass ports as ONE declaration + its test; W4 = mock-backend additivity
 proof. See `portable-fusion-framework.md` §10.
+
+## 2026-07-20 — Portable fusion framework **W1**: GENERALIZE the `FusedRecipe` POD so all quant-fused chains become expressible (`CLAIM-FUSION-FRAMEWORK-W1`)
+
+**What landed (infrastructure only — perf-neutral; NO model call site changed).**
+W1 generalizes the Phase-0 `FusedRecipe` POD from `{kAdd,kMul,kRmsNorm}` + a fixed
+4-role operand model to the full activation/norm/quant/rope vocabulary + a small
+INDEXED operand table, so all five W2 migration-target chains are now expressible as
+`constexpr` recipes. W2 wires them at call sites (this row does not).
+
+**Generalized POD (`include/vt/fused_recipe.h`).**
+- **Opcodes (`FOp`).** Granular elementwise/reduce (Tier-1 interpreter vocabulary):
+  `kAdd, kMul, kSilu, kSigmoid, kRmsNorm`. Fused-primitive opcodes that map 1:1 to a
+  standalone `vt::` op (so the composite is byte-exact by construction): `kSiluMul`→
+  `vt::MoeSiluMul`, `kSigmoidGate`→`vt::SigmoidGateBf16`, `kRmsNormGated`→
+  `vt::RmsNormGated`, `kRope`→`vt::RopeFromCache`, `kQuantFp8`→`vt::QuantFp8Static`,
+  `kQuantFp4`→`vt::ScaledFp4Quant`, `kAttnQkNormRopeGate`→`vt::AttnQkNormRopeGate`.
+  Design note: I use FUSED macro-opcodes (`kSiluMul`/`kSigmoidGate`) rather than a
+  granular `kSilu`+`kMul` split for the activation chains, because the byte-exact
+  golden IS the fused standalone op (`MoeSiluMul`/`SigmoidGateBf16` round through a
+  single bf16 store; a granular split would round differently). `kSilu`/`kSigmoid`
+  remain in the enum as Tier-1 elementwise vocabulary.
+- **Operands.** The fixed `{kIn,kResidual,kWeight,kOut}` roles become an INDEXED
+  `FOperandSlot operands[8]` table; each `FStep` names input operand indices
+  (`in[3]`,`nin`) + a primary output (`out`) + optional secondary output (`out2`, the
+  fp4 scale stream). Tensors bind positionally at the call via `FusedBinding`;
+  runtime scalars (eps, quant scale, fp4 layout, rope args) travel in `FusedParams`.
+  INTERMEDIATE operands (a bf16 norm/activation result the next step quantizes) are
+  caller-bound scratch slots — exactly as the unfused standalone sequence
+  materializes them — so the composite is alloc-free and byte-exact to that sequence.
+  POD/constexpr, no heap.
+
+**Realization restructure.** The Tier-0 COMPOSITE is now a single DEVICE-AGNOSTIC
+walker in `src/vt/ops.cpp` (`FusedChainComposite`): it dispatches each opcode to the
+standalone `vt::` op, which self-dispatches per device — so ONE walker realizes CPU
+and CUDA, structurally eliminating the CPU/CUDA drift (the framework's stated goal).
+The per-backend registered `kFusedChain` op is now ONLY the Tier-1 interpreter, over
+the canonical `[x, weight, residual, out]` shape (`cpu_ops.cpp`/`cuda_ops.cu`,
+extended with `kSilu`/`kSigmoid`). A recipe runs Tier-1 iff every step is in
+`{kAdd,kMul,kSilu,kSigmoid,kRmsNorm}` (only `kFusedAddRmsNorm` qualifies today);
+every other recipe runs the byte-exact composite regardless of `VT_FUSED_TIER`.
+
+**Five recipes declared (`include/vt/recipes.h`), each citing the vLLM pass it
+transcribes.** `kRmsNormQuantFp8` (RMSNormQuantFusionPass static-FP8+res,
+`rms_quant_fusion.py:226`), `kRmsNormGatedQuantFp8` (gated-RMSNorm epilogue + FP8),
+`kSiluMulFp4Quant` (ActivationQuantFusionPass NVFP4, `act_quant_fusion.py:128`),
+`kSigmoidGateFp4Quant` (Inductor sigmoid-gate NVFP4), `kAttnQkNormRopeGate`
+(QKNormRoPEFusionPass, `qk_norm_rope_fusion.py:188`).
+
+**Tier coverage (honest).** Composite realizes ALL five byte-exact. Tier-1
+interpreter covers only the elementwise/rmsnorm subset (the W0 `kFusedAddRmsNorm`
+regression); the four activation/quant chains + the attn preamble are
+COMPOSITE-ONLY (Tier-1 is the perf tier, not needed for W2 correctness). Two
+backend-negotiation facts recorded per spec §3b/§6: (1) the fp8 quant terminal
+(`vt::QuantFp8Static`) is CUDA-only (no CPU kernel), so the two fp8-terminating
+recipes' composite runs end-to-end on CUDA (their CPU byte-exact gate covers up to
+the bf16 norm; the fp8 tail is dgx-only). (2) `kAttnQkNormRopeGate` is a
+composite-only MACRO: its per-head 3-D q/k/gate rope operands are outside the
+generic 2-D row interpreter, so its composite dispatches the whole preamble to the
+single `vt::AttnQkNormRopeGate` standalone op (the op the model hand-calls today,
+itself bit-for-bit equal to the RmsNorm+RmsNorm+RopeFromCache+gate split). **All
+five target chains ARE byte-exact expressible — none was forced or approximated.**
+
+**Gates ALL GREEN** (dgx `~/work/vllm-w1-fusion`, production flags CUTLASS sm120a
+NVFP4 + Marlin + FA2 sm_121a + Triton AOT, clean CUDA `-Werror` build **0 warnings**,
+one flock). Byte-exact `test_ops_fused_chain`: CPU 196 assertions + **CUDA-on-dgx
+361 assertions**, 0 failed — regression `kFusedAddRmsNorm` composite==interp==golden
+still holds AND each new recipe's Tier-0 composite (Tier-1 where implemented) ==
+its standalone-op-sequence golden, byte-exact (fp4 chains + attn on CPU+CUDA; fp8
+chains CUDA-only). `compute-sanitizer memcheck` **0 errors** (361 assertions under
+memcheck). Token-exact regression (the W0-adopted site must not regress):
+`test_qwen36_paged_engine` **315/315** + `test_qwen27_paged_engine` **235/235**,
+BOTH `VT_FUSED_CHAIN_ADOPT=1` (default) AND `=0` arms. Perf-neutral (no call site
+changed) ⇒ `benchmark_binding=false`.
+
+**Next.** W2 migrates the hand-fused ops to these declarations one-by-one (each
+byte-exact + token-exact), and `qwen3_5.cpp` shrinks. See `portable-fusion-framework.md`
+§10 W2.

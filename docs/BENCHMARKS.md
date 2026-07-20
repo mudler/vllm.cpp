@@ -49,6 +49,15 @@ H=2048 shape, memcheck 0 errors). **Benchmark disposition: perf-NEUTRAL by const
 (the default Tier-0 composite dispatches to the same primitive the hand-call used) ⇒ no
 re-grid; this is structural plumbing, not a speedup.
 
+**W1 landed (2026-07-20):** the `FusedRecipe` POD is generalized (full
+activation/norm/quant/rope opcodes + an indexed operand table) so all five quant-fused
+W2 target chains are expressible as `constexpr` recipes whose Tier-0 composite is
+byte-exact to the standalone-op sequence the model hand-calls today. Infrastructure
+only — NO model call site changed. Byte-exact `test_ops_fused_chain` CPU 196 + CUDA 361
+assertions, memcheck 0; token-exact regression (the W0-adopted site) 35B 315/315 + 27B
+235/235 on both `VT_FUSED_CHAIN_ADOPT` arms. **Benchmark disposition: perf-NEUTRAL**
+(no call site changed) ⇒ no re-grid.
+
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
 reruns on the full production default set (async + vendored Triton GDN decode cubin

@@ -636,13 +636,149 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                                                                     residual);
 }
 
+namespace {
+
+// Fetch the tensor bound to operand slot `idx`, checked non-null.
+Tensor* FusedOp(const FusedBinding& b, uint8_t idx, const char* what) {
+  VT_CHECK(idx < b.n, "fused_chain: operand index out of range");
+  VT_CHECK(b.op[idx] != nullptr, what);
+  return b.op[idx];
+}
+
+// Tier-0 composite: walk the recipe DISPATCHING each opcode to the already-
+// registered standalone vt:: op. Device-agnostic — every op self-dispatches on
+// q.device, so the same walker realizes CPU and CUDA. Byte-exact by construction
+// to the unfused standalone-op sequence the model hand-calls (that IS the golden).
+// The residual-add idiom (kAdd writing the residual) folds into the following
+// norm's RmsNorm(residual) call — the only form whose f32 add-then-normalize the
+// standalone op reproduces bit-for-bit.
+void FusedChainComposite(Queue& q, const FusedRecipe& r, const FusedBinding& b,
+                         const FusedParams& p) {
+  Tensor* add_x = nullptr;    // pending residual-add: x operand
+  Tensor* add_res = nullptr;  // pending residual-add: residual operand (also the out)
+  bool add_pending = false;
+  for (int s = 0; s < r.n; ++s) {
+    const FStep& st = r.steps[s];
+    switch (st.op) {
+      case FOp::kAdd:
+        // Residual-add producing the residual stream: fold into the next kRmsNorm.
+        VT_CHECK(st.nin == 2 && st.out == st.in[1],
+                 "fused_chain composite: kAdd must be residual-add (out==in[1])");
+        add_x = FusedOp(b, st.in[0], "fused_chain: null add input");
+        add_res = FusedOp(b, st.out, "fused_chain: null residual");
+        add_pending = true;
+        break;
+      case FOp::kRmsNorm: {
+        Tensor* out = FusedOp(b, st.out, "fused_chain: null rmsnorm out");
+        Tensor* w = FusedOp(b, st.in[1], "fused_chain: null rmsnorm weight");
+        if (add_pending) {
+          RmsNorm(q, *out, *add_x, *w, RmsNormArgs{p.eps, st.gemma}, add_res);
+          add_pending = false;
+        } else {
+          Tensor* a = FusedOp(b, st.in[0], "fused_chain: null rmsnorm input");
+          RmsNorm(q, *out, *a, *w, RmsNormArgs{p.eps, st.gemma}, nullptr);
+        }
+        break;
+      }
+      case FOp::kRmsNormGated: {
+        Tensor* out = FusedOp(b, st.out, "fused_chain: null gated-norm out");
+        Tensor* x = FusedOp(b, st.in[0], "fused_chain: null gated-norm x");
+        Tensor* gate = FusedOp(b, st.in[1], "fused_chain: null gated-norm gate");
+        Tensor* w = FusedOp(b, st.in[2], "fused_chain: null gated-norm weight");
+        RmsNormGated(q, *out, *x, *gate, *w, RmsNormGatedArgs{p.eps, st.sigmoid_gate});
+        break;
+      }
+      case FOp::kSiluMul: {
+        Tensor* out = FusedOp(b, st.out, "fused_chain: null silu_mul out");
+        Tensor* gate = FusedOp(b, st.in[0], "fused_chain: null silu_mul gate");
+        Tensor* up = FusedOp(b, st.in[1], "fused_chain: null silu_mul up");
+        MoeSiluMul(q, *out, *gate, *up);
+        break;
+      }
+      case FOp::kSigmoidGate: {
+        Tensor* out = FusedOp(b, st.out, "fused_chain: null sigmoid_gate out");
+        Tensor* attn = FusedOp(b, st.in[0], "fused_chain: null sigmoid_gate attn");
+        Tensor* gate = FusedOp(b, st.in[1], "fused_chain: null sigmoid_gate gate");
+        SigmoidGateBf16(q, *out, *attn, *gate);
+        break;
+      }
+      case FOp::kRope: {
+        Tensor* qs = FusedOp(b, st.out, "fused_chain: null rope q");
+        Tensor* cos_sin = FusedOp(b, st.in[1], "fused_chain: null rope cos_sin cache");
+        Tensor* pos = FusedOp(b, st.in[2], "fused_chain: null rope positions");
+        Tensor* ks = (st.out2 == kNoOperand) ? nullptr : b.op[st.out2];
+        RopeFromCache(q, *qs, ks, *pos, *cos_sin, p.rope);
+        break;
+      }
+      case FOp::kQuantFp8: {
+        Tensor* out = FusedOp(b, st.out, "fused_chain: null fp8 out");
+        Tensor* a = FusedOp(b, st.in[0], "fused_chain: null fp8 input");
+        QuantFp8Static(q, *out, *a, p.quant_scale);
+        break;
+      }
+      case FOp::kQuantFp4: {
+        Tensor* packed = FusedOp(b, st.out, "fused_chain: null fp4 packed out");
+        VT_CHECK(st.out2 != kNoOperand, "fused_chain: kQuantFp4 needs an out_scale (out2)");
+        Tensor* scale = FusedOp(b, st.out2, "fused_chain: null fp4 scale out");
+        Tensor* a = FusedOp(b, st.in[0], "fused_chain: null fp4 input");
+        ScaledFp4Quant(q, *packed, *scale, *a, p.quant_scale, p.fp4_layout);
+        break;
+      }
+      case FOp::kAttnQkNormRopeGate: {
+        // Composite MACRO: dispatch the whole fused preamble to the one standalone
+        // op. Operand order is fixed (recipes.h): [qgate, kf, q_norm, k_norm,
+        // cos_sin, q_out, k_out, gate_out].
+        VT_CHECK(r.n_operands == 8 && b.n == 8, "fused_chain: attn preamble needs 8 operands");
+        AttnQkNormRopeGate(q, *FusedOp(b, 5, "q_out"), *FusedOp(b, 6, "k_out"),
+                           *FusedOp(b, 7, "gate_out"), *FusedOp(b, 0, "qgate"),
+                           *FusedOp(b, 1, "kf"), *FusedOp(b, 2, "q_norm"),
+                           *FusedOp(b, 3, "k_norm"), *FusedOp(b, 4, "cos_sin"),
+                           RmsNormArgs{p.eps, st.gemma}, p.rope);
+        break;
+      }
+      case FOp::kMul:
+      case FOp::kSilu:
+      case FOp::kSigmoid:
+        VT_CHECK(false,
+                 "fused_chain composite: granular kMul/kSilu/kSigmoid have no standalone op "
+                 "(Tier-1 vocabulary only)");
+        break;
+    }
+  }
+  VT_CHECK(!add_pending, "fused_chain composite: residual-add without a following rmsnorm");
+}
+
+}  // namespace
+
+void FusedChain(Queue& q, const FusedRecipe& recipe, const FusedBinding& binding,
+                const FusedParams& params) {
+  VT_CHECK(recipe.n >= 1 && recipe.n <= kMaxFusedSteps, "fused_chain: empty/oversized recipe");
+  VT_CHECK(recipe.n_operands == binding.n && binding.n <= kMaxFusedOperands,
+           "fused_chain: binding size must match recipe operand count");
+
+  // Tier-1 interpreter path: only for Tier-1-able recipes (all elementwise/rms)
+  // over the canonical operand order [x, weight, residual?, out]. Everything else
+  // (quant/rope/gated/attn) runs through the byte-exact composite.
+  if (FusedTier() == 1 && RecipeIsTier1Able(recipe)) {
+    Tensor* x = FusedOp(binding, 0, "fused_chain: null x");
+    Tensor* weight = FusedOp(binding, 1, "fused_chain: null weight");
+    Tensor* residual =
+        (binding.n >= 3 && recipe.operands[2].kind == FKind::kResidual) ? binding.op[2] : nullptr;
+    Tensor* out = FusedOp(binding, static_cast<uint8_t>(recipe.steps[recipe.n - 1].out),
+                          "fused_chain: null out");
+    reinterpret_cast<FusedChainFn>(GetOp(OpId::kFusedChain, q.device.type))(
+        q, *out, *x, *weight, residual, recipe, params.eps);
+    return;
+  }
+  FusedChainComposite(q, recipe, binding, params);
+}
+
 void FusedChain(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, Tensor* residual,
                 const FusedRecipe& recipe, float eps) {
-  // Phase-0 operand contract mirrors RmsNorm(residual): x/out [T,H], weight [H],
-  // optional residual [T,H] f32/bf16. Recipe structure is validated by the
-  // backend realization; here we gate the tensor shapes/dtypes/devices so a bad
-  // call fails at the chokepoint, not inside a kernel.
-  VT_CHECK(recipe.n >= 1 && recipe.n <= kMaxFusedSteps, "fused_chain: empty/oversized recipe");
+  // Canonical 4-operand shape (the W0-adopted kFusedAddRmsNorm site): x/out [T,H],
+  // weight [H], optional residual [T,H] f32/bf16. Validate at the chokepoint so a
+  // bad call fails here, not inside a kernel, then bind [x, weight, residual, out]
+  // and forward to the general entry.
   VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 1,
            "fused_chain: x/out rank-2, weight rank-1");
   VT_CHECK(x.shape[0] == out.shape[0] && x.shape[1] == out.shape[1],
@@ -661,8 +797,13 @@ void FusedChain(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, Te
   }
   VT_CHECK(x.device == out.device && weight.device == x.device && x.device == q.device,
            "fused_chain: device mismatch (x/out/weight/queue)");
-  reinterpret_cast<FusedChainFn>(GetOp(OpId::kFusedChain, q.device.type))(q, out, x, weight,
-                                                                          residual, recipe, eps);
+  FusedBinding binding;
+  binding.op[0] = const_cast<Tensor*>(&x);
+  binding.op[1] = const_cast<Tensor*>(&weight);
+  binding.op[2] = residual;
+  binding.op[3] = &out;
+  binding.n = 4;
+  FusedChain(q, recipe, binding, FusedParams{eps, 1.0f, Fp4ScaleLayout::kLinear, RopeArgs{}});
 }
 
 void SiluAndMul(Queue& q, Tensor& out, const Tensor& x) {

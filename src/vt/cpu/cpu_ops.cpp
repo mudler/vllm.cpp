@@ -1381,16 +1381,15 @@ void SharedExpertGateKernel(Queue&, Tensor& out, const Tensor& sd, const Tensor&
   });
 }
 
-// --- Fused declarative recipe (TDR Phase 0). Two realizations of ANY
-// FusedRecipe over the Phase-0 vocabulary {kAdd, kMul, kRmsNorm}, selected at
-// runtime by VT_FUSED_TIER (FusedTier()):
-//   Tier 0 (default, safe): walk the steps, calling the ALREADY-REGISTERED
-//     vt::RmsNorm primitive for the reduce step (composite over existing ops).
-//   Tier 1: a single scalar pass per row that walks the recipe inline.
-// Both are bit-identical to vt::RmsNorm(residual) for kFusedAddRmsNorm — same
-// f32 variance accumulation, gemma (1+w), and residual-add rounding. Operand
-// ROLES resolve to physical tensors: kIn->x, kResidual->residual (in/out),
-// kWeight->weight ([H], per-column), kOut->out. Row tensors are [T,H].
+// --- Fused declarative recipe (TDR): the Tier-1 single-pass INTERPRETER over the
+// canonical (out, x, weight, residual) 4-operand shape. The Tier-0 composite is
+// device-agnostic and lives in ops.cpp (it dispatches each opcode to the
+// standalone vt:: op). This kernel is reached ONLY for Tier-1-able recipes (all
+// steps in {kAdd,kMul,kSilu,kSigmoid,kRmsNorm}) when VT_FUSED_TIER=1; the general
+// FusedChain wrapper resolves the canonical operand order [0=x,1=weight,
+// 2=residual,3=out] and forwards here. Bit-identical to vt::RmsNorm(residual) for
+// kFusedAddRmsNorm — same f32 variance accumulation, gemma (1+w), residual-add
+// rounding.
 //
 // Bit-identity across SEPARATELY COMPILED loops (here vs RmsNormKernel) holds
 // because the build pins -ffp-contract=off (top-level CMakeLists): under the
@@ -1398,30 +1397,32 @@ void SharedExpertGateKernel(Queue&, Tensor& out, const Tensor& sd, const Tensor&
 // and not the other (observed: RmsNormKernel's residual path contracted, this
 // interpreter not, on FMA-capable ISAs), skewing inv by 1 ulp on ~half the rows.
 
-// Read one operand element (row, column j). kWeight is per-column ([H]); the
-// [T,H] roles index row*h + j.
-float FusedLoad(FOperand o, int64_t row, int64_t j, int64_t h, const Tensor& x,
+// Read one operand element by its CANONICAL index. Index 1 (weight) is per-column
+// ([H]); the [T,H] operands index row*h + j.
+float FusedLoad(uint8_t idx, int64_t row, int64_t j, int64_t h, const Tensor& x,
                 const Tensor& weight, const Tensor* residual, const Tensor& out) {
-  switch (o) {
-    case FOperand::kIn: return LoadF32(x, row * h + j);
-    case FOperand::kResidual: return LoadF32(*residual, row * h + j);
-    case FOperand::kWeight: return LoadF32(weight, j);
-    case FOperand::kOut: return LoadF32(out, row * h + j);
+  switch (idx) {
+    case 0: return LoadF32(x, row * h + j);
+    case 1: return LoadF32(weight, j);
+    case 2: return LoadF32(*residual, row * h + j);
+    case 3: return LoadF32(out, row * h + j);
+    default: VT_CHECK(false, "fused_chain interp: operand index out of canonical range"); return 0.0f;
   }
-  return 0.0f;
 }
 
-// Store one element into a WRITABLE operand (kResidual/kOut only), rounding to
+// Store one element into a WRITABLE operand (residual=2 / out=3 only), rounding to
 // that operand's dtype (bf16 residual mirrors vLLM's model-dtype residual).
-void FusedStore(FOperand o, int64_t row, int64_t j, int64_t h, float v, Tensor* residual,
+void FusedStore(uint8_t idx, int64_t row, int64_t j, int64_t h, float v, Tensor* residual,
                 Tensor& out) {
-  switch (o) {
-    case FOperand::kResidual: StoreF32(*residual, row * h + j, v); break;
-    case FOperand::kOut: StoreF32(out, row * h + j, v); break;
-    case FOperand::kIn:
-    case FOperand::kWeight: VT_CHECK(false, "fused_chain: step writes a read-only operand");
+  switch (idx) {
+    case 2: StoreF32(*residual, row * h + j, v); break;
+    case 3: StoreF32(out, row * h + j, v); break;
+    default: VT_CHECK(false, "fused_chain interp: step writes a read-only operand");
   }
 }
+
+// silu(x) = x * sigmoid(x); sigmoid in f32 (matches the standalone kernels' math).
+inline float FSigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 // Tier 1 — scalar interpreter: walk the recipe over EACH ROW in one pass.
 void FusedChainInterpKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
@@ -1435,86 +1436,48 @@ void FusedChainInterpKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& 
         case FOp::kAdd:
         case FOp::kMul:
           for (int64_t j = 0; j < h; ++j) {
-            const float a = FusedLoad(st.a, row, j, h, x, weight, residual, out);
-            const float b = FusedLoad(st.b, row, j, h, x, weight, residual, out);
+            const float a = FusedLoad(st.in[0], row, j, h, x, weight, residual, out);
+            const float b = FusedLoad(st.in[1], row, j, h, x, weight, residual, out);
             FusedStore(st.out, row, j, h, st.op == FOp::kAdd ? a + b : a * b, residual, out);
+          }
+          break;
+        case FOp::kSilu:
+        case FOp::kSigmoid:
+          for (int64_t j = 0; j < h; ++j) {
+            const float a = FusedLoad(st.in[0], row, j, h, x, weight, residual, out);
+            FusedStore(st.out, row, j, h, st.op == FOp::kSilu ? a * FSigmoid(a) : FSigmoid(a),
+                       residual, out);
           }
           break;
         case FOp::kRmsNorm: {
           VT_CHECK(st.reduce == FReduce::kMeanSquare, "fused_chain: rmsnorm needs kMeanSquare");
           float sumsq = 0.0f;
           for (int64_t j = 0; j < h; ++j) {
-            const float v = FusedLoad(st.a, row, j, h, x, weight, residual, out);
+            const float v = FusedLoad(st.in[0], row, j, h, x, weight, residual, out);
             sumsq += v * v;  // f32 variance accumulation
           }
           const float inv = 1.0f / std::sqrt(sumsq / static_cast<float>(h) + eps);
           for (int64_t j = 0; j < h; ++j) {
-            const float v = FusedLoad(st.a, row, j, h, x, weight, residual, out);
-            float wj = FusedLoad(st.b, row, j, h, x, weight, residual, out);
+            const float v = FusedLoad(st.in[0], row, j, h, x, weight, residual, out);
+            float wj = FusedLoad(st.in[1], row, j, h, x, weight, residual, out);
             if (st.gemma) wj += 1.0f;
             FusedStore(st.out, row, j, h, v * inv * wj, residual, out);
           }
           break;
         }
+        default:
+          VT_CHECK(false, "fused_chain interp: non-Tier-1 opcode reached the interpreter");
       }
     }
   }
   });
 }
 
-// Tier 0 — composite: walk the steps and realize them through the ALREADY-
-// REGISTERED vt:: primitives (re-dispatched through the op table). The residual-
-// add + RMSNorm idiom collapses onto vt::RmsNorm(residual) — the registered
-// fused_add_rms_norm primitive, which does add-then-normalize in f32. Folding the
-// add INTO that call (rather than a naive add-then-RmsNorm(no-residual) split)
-// both matches the golden bit-for-bit and keeps operand dtypes intact: RmsNorm
-// takes x + weight in one dtype and the residual separately, so a bf16 x with a
-// f32 residual works — a split would hand RmsNorm an x(=f32 residual)/weight(bf16)
-// dtype mismatch that the CUDA kernel rejects. Same realization on both backends.
-void FusedChainCompositeKernel(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
-                               Tensor* residual, const FusedRecipe& r, float eps) {
-  bool residual_add_pending = false;
-  for (int s = 0; s < r.n; ++s) {
-    const FStep& st = r.steps[s];
-    switch (st.op) {
-      case FOp::kAdd:
-        // Residual-add producing the residual stream: fold it into the next
-        // kRmsNorm's registered RmsNorm(residual) call.
-        VT_CHECK(st.out == FOperand::kResidual && st.a == FOperand::kIn &&
-                     st.b == FOperand::kResidual && residual != nullptr,
-                 "fused_chain composite: only residual-add (out=res,a=in,b=res) is supported");
-        residual_add_pending = true;
-        break;
-      case FOp::kMul:
-        VT_CHECK(false, "fused_chain composite: kMul has no registered primitive yet (Phase 1)");
-        break;
-      case FOp::kRmsNorm:
-        VT_CHECK(st.reduce == FReduce::kMeanSquare && st.out == FOperand::kOut &&
-                     st.b == FOperand::kWeight,
-                 "fused_chain composite: rmsnorm must write kOut with a kWeight");
-        if (residual_add_pending) {
-          VT_CHECK(st.a == FOperand::kResidual,
-                   "fused_chain composite: rmsnorm after residual-add must read kResidual");
-          vt::RmsNorm(q, out, x, weight, RmsNormArgs{eps, st.gemma}, residual);
-          residual_add_pending = false;
-        } else {
-          // Plain RMSNorm (no preceding add): a is kIn or the raw residual.
-          const Tensor& a = (st.a == FOperand::kIn) ? x : *residual;
-          vt::RmsNorm(q, out, a, weight, RmsNormArgs{eps, st.gemma}, nullptr);
-        }
-        break;
-    }
-  }
-}
-
-// Registered kernel: pick the tier (default Tier-0 composite for safety).
+// Registered kernel: the Tier-1 interpreter (the general wrapper only dispatches
+// here for Tier-1-able recipes; Tier-0 composite is device-agnostic in ops.cpp).
 void FusedChainKernel(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                       Tensor* residual, const FusedRecipe& r, float eps) {
-  if (FusedTier() == 1) {
-    FusedChainInterpKernel(q, out, x, weight, residual, r, eps);
-  } else {
-    FusedChainCompositeKernel(q, out, x, weight, residual, r, eps);
-  }
+  FusedChainInterpKernel(q, out, x, weight, residual, r, eps);
 }
 
 struct Registrar {

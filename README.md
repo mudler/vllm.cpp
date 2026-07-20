@@ -262,7 +262,7 @@ both gate models (DGX-confirmed token-exact: 27B 235/235 + 35B 315/315, memcheck
 attention-backend registry, model self-registration).
 
 **Extensibility — roadmap_v1 ORDER-1: the portable op-fusion framework
-(SPIKED 2026-07-19; W0 ADOPTED 2026-07-19).** The fourth and unifying seam: fusions **declared once**
+(SPIKED 2026-07-19; W0 ADOPTED 2026-07-19; W1 POD GENERALIZED 2026-07-20).** The fourth and unifying seam: fusions **declared once**
 (a backend-agnostic recipe catalog above `vt::`, transcribing vLLM's finite
 fusion-pass set) and **realized per-backend** through the `vt::` op table (a
 composite tier is the CPU oracle every backend inherits free; one interpreter
@@ -276,8 +276,17 @@ add+residual+RMSNorm through `vt::FusedChain(kFusedAddRmsNorm)` (behind
 `VT_FUSED_CHAIN_ADOPT`, default-ON, `=0` rollback), behaviour-preserving and
 byte-identical to the prior hand-call, proving the declare-once/realize-per-backend
 seam end-to-end in a real model forward (35B 315/315 + 27B 235/235 token-exact on
-both arms, memcheck 0 errors). Honest scope: this is an **extensibility +
-mechanical-upstream-sync** cornerstone, not a perf lever — W0 is perf-neutral by
+both arms, memcheck 0 errors). **W1 landed (2026-07-20):** the `FusedRecipe` POD is
+generalized — from `{kAdd,kMul,kRmsNorm}` + a fixed 4-role operand model to the full
+activation/norm/quant/rope opcode set + a small indexed operand table — so all five
+quant-fused W2 target chains (`kRmsNormQuantFp8`, `kRmsNormGatedQuantFp8`,
+`kSiluMulFp4Quant`, `kSigmoidGateFp4Quant`, `kAttnQkNormRopeGate`) are now expressible
+as `constexpr` recipes whose Tier-0 composite is byte-exact to the standalone-op
+sequence the model hand-calls today (proven CPU + CUDA; 35B 315/315 + 27B 235/235
+token-exact regression on the W0 site, memcheck 0). W1 is infrastructure only — no
+model call site changed; W2 migrates the hand-fused ops to these declarations.
+Honest scope: this is an **extensibility +
+mechanical-upstream-sync** cornerstone, not a perf lever — W0/W1 are perf-neutral by
 construction (the measured 35B prefill gap is compute-bound, ceiling ~3.5%/step).
 Spike + work breakdown (W0–Wn):
 [`.agents/specs/portable-fusion-framework.md`](.agents/specs/portable-fusion-framework.md).

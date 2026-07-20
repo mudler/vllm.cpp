@@ -260,18 +260,29 @@ DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg,
   VT_CHECK(kv.num_kv_heads == Hkv && kv.head_size == Dh,
            "qwen3 dense: KV cache head dims mismatch config");
 
+  // vLLM runs Qwen3-0.6B in BF16: the qkv GEMM, per-head q/k RMSNorm (variance in
+  // f32, result rounded to bf16), RoPE, and flash attention all flow bf16. Token-
+  // exactness with the bf16 oracle requires mirroring that rounding exactly, so
+  // the DEFAULT path keeps q/k/v/query/attn in bf16 (matching vLLM's per-op bf16
+  // stores). VT_QWEN3_ATTN_F32=1 selects the f32 A/B path (q/k RMSNorm+RoPE in
+  // f32, exercising the kAttnQkNormRope catalog recipe via cos/sin cache) — a
+  // more-precise deviation, kept for diagnostics.
+  const bool attn_f32 = [] {
+    const char* e = std::getenv("VT_QWEN3_ATTN_F32");
+    return e != nullptr && e[0] == '1';
+  }();
+  const DType adt = attn_f32 ? DType::kF32 : DType::kBF16;
+
   // Merged QKVParallelLinear executed as its logical [q|k|v] shards: slice the
   // ONE raw-NK [qdim+2kdim, H] owner's output rows (contiguous sub-blocks) and
-  // project each into a contiguous f32 buffer via MatmulBT. Bit-equivalent to one
-  // merged GEMM + split (each output element is the same dot product), and gives
-  // the contiguous q/k/v the per-head norm/rope require.
+  // project each into a contiguous buffer via MatmulBT (bf16 in, bf16/f32 out).
   Tensor wqkv = ResidentWeight(d, w.qkv_proj);
   Tensor wq = wqkv.Slice(0, 0, qdim);
   Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
   Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
-  DBuf q(d, DType::kF32, {T, qdim});
-  DBuf k(d, DType::kF32, {T, kdim});
-  DBuf v(d, DType::kF32, {T, kdim});
+  DBuf q(d, adt, {T, qdim});
+  DBuf k(d, adt, {T, kdim});
+  DBuf v(d, adt, {T, kdim});
   vt::MatmulBT(d.q, q.t(), dhn, wq);
   vt::MatmulBT(d.q, k.t(), dhn, wk);
   vt::MatmulBT(d.q, v.t(), dhn, wv);
@@ -281,13 +292,13 @@ DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg,
   Tensor k2 = Reshape(k.t(), {T * Hkv, Dh});
   Tensor q3 = Reshape(q.t(), {T, Hq, Dh});
   Tensor k3 = Reshape(k.t(), {T, Hkv, Dh});
-  Tensor wqn = ResidentWeightF32(d, w.q_norm, {Dh});
-  Tensor wkn = ResidentWeightF32(d, w.k_norm, {Dh});
-  if (FusedChainAdoptEnabled() && rot > 0) {
-    // ADOPT: the whole preamble through vt::FusedChain(kAttnQkNormRope) — the
-    // Tier-0 composite = RmsNorm(q,false) + RmsNorm(k,false) + RopeFromCache,
-    // byte-identical to the hand-call below (test_ops_fused_chain.cpp). This is
-    // Qwen3's reuse of the fusion catalog's non-gated qk-norm-rope recipe.
+  if (attn_f32 && FusedChainAdoptEnabled() && rot > 0) {
+    // f32 A/B ADOPT: the whole preamble through vt::FusedChain(kAttnQkNormRope) —
+    // the Tier-0 composite = RmsNorm(q,false) + RmsNorm(k,false) + RopeFromCache,
+    // byte-identical to the hand-call (test_ops_fused_chain.cpp). Qwen3's reuse of
+    // the fusion catalog's non-gated qk-norm-rope recipe (f32 cos/sin cache).
+    Tensor wqn = ResidentWeightF32(d, w.q_norm, {Dh});
+    Tensor wkn = ResidentWeightF32(d, w.k_norm, {Dh});
     vt::FusedBinding b;
     b.op[0] = &q2;
     b.op[1] = &wqn;
@@ -303,6 +314,14 @@ DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg,
     p.rope = vt::RopeArgs{base, rot};
     vt::FusedChain(d.q, vt::kAttnQkNormRope, b, p);
   } else {
+    // BF16 default (token-exact vs the bf16 oracle): standalone per-head RMSNorm
+    // (weight dtype == q dtype) + in-place NeoX RoPE. The norm weight follows q's
+    // dtype so bf16 q · bf16 q_norm; RopeNeox computes cos/sin in f32 and rounds
+    // the rotated value back to bf16, mirroring vLLM's rotary_emb on bf16 q/k.
+    Tensor wqn = attn_f32 ? ResidentWeightF32(d, w.q_norm, {Dh})
+                          : ResidentWeight(d, w.q_norm, {Dh});
+    Tensor wkn = attn_f32 ? ResidentWeightF32(d, w.k_norm, {Dh})
+                          : ResidentWeight(d, w.k_norm, {Dh});
     vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
     vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
     vt::RopeNeox(d.q, q3, k3, si.positions.t(), vt::RopeArgs{base, rot});
@@ -311,23 +330,33 @@ DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg,
   // v [T,Hkv,Dh] view.
   Tensor v3 = Reshape(v.t(), {T, Hkv, Dh});
 
-  // Write the rope'd K + V into the paged cache (down-cast to bf16 when the cache
-  // is bf16), then run causal GQA paged attention over the cache (query f32).
+  // Write the rope'd K + V into the paged cache, then run causal GQA paged
+  // attention over the cache. On the bf16 default the K/V/query are ALREADY bf16
+  // (matching the bf16 cache directly, no cast); the f32 A/B down-casts K/V for a
+  // bf16 cache.
+  // The "auto" ReshapeAndCache copy requires the K/V dtype == cache dtype. Cast
+  // K/V to the cache dtype only when they differ (bf16 default + bf16 cache =
+  // no-op, the common production case).
   Tensor kw = k3;
   Tensor vw = v3;
-  DBuf kbf(d, DType::kBF16, {T, Hkv, Dh});
-  DBuf vbf(d, DType::kBF16, {T, Hkv, Dh});
-  if (kv.dtype == DType::kBF16) {
-    vt::CastBf16(d.q, kbf.t(), k3);
-    vt::CastBf16(d.q, vbf.t(), v3);
-    kw = kbf.t();
-    vw = vbf.t();
+  DBuf kcast(d, kv.dtype, {T, Hkv, Dh});
+  DBuf vcast(d, kv.dtype, {T, Hkv, Dh});
+  if (kv.dtype != adt) {
+    if (kv.dtype == DType::kBF16) {
+      vt::CastBf16(d.q, kcast.t(), k3);
+      vt::CastBf16(d.q, vcast.t(), v3);
+    } else {
+      vt::CastF32(d.q, kcast.t(), k3);
+      vt::CastF32(d.q, vcast.t(), v3);
+    }
+    kw = kcast.t();
+    vw = vcast.t();
   }
   Tensor k_cache = KvSlice(kv, d.q.device, 0);
   Tensor v_cache = KvSlice(kv, d.q.device, 1);
   vt::ReshapeAndCache(d.q, kw, vw, k_cache, v_cache, si.slot_mapping.t());
 
-  DBuf attn(d, DType::kF32, {T, Hq, Dh});
+  DBuf attn(d, adt, {T, Hq, Dh});
   const float scale = 1.0F / std::sqrt(static_cast<float>(Dh));
   vt::PagedAttentionArgs pa{scale, meta.causal};
   pa.query_start_loc_host = meta.query_start_loc.data();
@@ -335,10 +364,18 @@ DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg,
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 
-  // o_proj (RowParallelLinear, no bias): [T, Hq*Dh] f32 -> [T,H] bf16.
+  // o_proj (RowParallelLinear, no bias): [T, Hq*Dh] -> [T,H] bf16. The attention
+  // output is already bf16 on the default path (matching vLLM's bf16 flash-attn
+  // output); the f32 A/B down-casts it so MatmulBT's inputs share dtype.
+  Tensor o_in = Reshape(attn.t(), {T, Hq * Dh});
+  DBuf attn_bf(d, DType::kBF16, {T, Hq * Dh});
+  if (adt != DType::kBF16) {
+    vt::CastBf16(d.q, attn_bf.t(), Reshape(attn.t(), {T, Hq * Dh}));
+    o_in = attn_bf.t();
+  }
   Tensor wo = ResidentWeight(d, w.o_proj);
   DBuf o(d, DType::kBF16, {T, H});
-  vt::MatmulBT(d.q, o.t(), Reshape(attn.t(), {T, Hq * Dh}), wo);
+  vt::MatmulBT(d.q, o.t(), o_in, wo);
   (void)rot;
   return o;
 }

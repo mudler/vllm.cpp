@@ -327,9 +327,12 @@ TEST_CASE("loader failure modes throw with actionable messages") {
                                    R"("type": "Unigram")")); },
         "Unigram");
   }
-  SUBCASE("classic qwen2 regex is rejected, not silently accepted") {
-    CheckThrowsContains([&] { LoadTiny(WithRegex(kClassicQwen2RegexJson)); },
-                        "add kQwen2Classic before accepting");
+  SUBCASE("classic qwen2 regex resolves to kQwen2Classic") {
+    // The first additive model (Qwen/Qwen3-0.6B, MODEL-TEXT-qwen3) forced classic
+    // qwen2 pre-tokenizer support in: it is now ACCEPTED as SplitPattern::
+    // kQwen2Classic (single-\p{N}, no \p{M} awareness), not rejected.
+    const Tokenizer tok = LoadTiny(WithRegex(kClassicQwen2RegexJson));
+    CHECK(tok.Pattern() == SplitPattern::kQwen2Classic);
   }
   SUBCASE("unrecognized split regex names the regex") {
     CheckThrowsContains(
@@ -494,10 +497,11 @@ TEST_CASE("FromGguf failure modes throw with actionable messages") {
     kvs[1] = gguf_test::StrKv("tokenizer.ggml.pre", "gpt-2");
     CheckThrowsContains([&] { LoadGguf(kvs); }, "gpt-2");
   }
-  SUBCASE("classic \"qwen2\" pre is rejected, not silently accepted") {
+  SUBCASE("classic \"qwen2\" pre resolves to kQwen2Classic") {
     auto kvs = TinyGgufKvs();
     kvs[1] = gguf_test::StrKv("tokenizer.ggml.pre", "qwen2");
-    CheckThrowsContains([&] { LoadGguf(kvs); }, "kQwen2Classic");
+    const Tokenizer tok = LoadGguf(kvs);
+    CHECK(tok.Pattern() == SplitPattern::kQwen2Classic);
   }
   SUBCASE("missing tokens array") {
     auto kvs = TinyGgufKvs();

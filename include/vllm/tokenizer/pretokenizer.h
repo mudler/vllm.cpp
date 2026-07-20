@@ -12,8 +12,14 @@ namespace vllm::tok {
 
 // Which pre-tokenizer Split regex to emulate.
 enum class SplitPattern {
-  kQwen2,   // Qwen family: single-codepoint \p{N} (regex from Qwen3.6-27B)
-  kLlama3,  // Llama-3 family: \p{N}{1,3} digit groups
+  kQwen2,   // Qwen3.6 family: single-codepoint \p{N}, \p{M}-aware letter/punct
+            // runs (regex from Qwen3.6-27B, marks fold into letter runs).
+  kQwen2Classic,  // CLASSIC Qwen2/Qwen3 family (e.g. Qwen/Qwen3-0.6B,
+                  // Qwen3-Coder): single-codepoint \p{N} like kQwen2 but WITHOUT
+                  // \p{M} in the letter run / punct-negation (marks fall into the
+                  // punct run, exactly like Llama-3's classes but with 1-digit
+                  // number grouping).
+  kLlama3,  // Llama-3 family: \p{N}{1,3} digit groups, no \p{M} awareness.
 };
 
 // Splits `text` into pretoken byte spans [first, second), exactly as HF

@@ -14171,3 +14171,76 @@ milestone is closed; the claim closes with W4.
 **Additivity (W2).** NEW files: `dense_weight_loaders.h` (shared toolkit), `qwen3_weights.cpp` (loader), `test_qwen3_load.cpp` (gate) — plus the struct flesh-out in the already-owned `qwen3.h`. SHARED touches: `qwen3_5_dense_weights.cpp` (the ONE behaviour-preserving extraction — the designed SEAM GAP #3), `qwen3_dense.cpp` (wire the loader into the existing stub), `CMakeLists.txt` + `tests/CMakeLists.txt` (build-glue TU/test adds). No runner/registry/config-parse edits (tie/attention_bias read from `config.raw`, not new HfConfig fields). Verdict: W2 is new-files + the single designed extraction + build-glue — exactly the additive shape the spike predicted.
 
 **Remaining:** W3 forward (`qwen3.cpp`: compose vt ops + ≈2 new one-line fusion recipes — non-gemma add-rmsnorm + non-gated qk-norm-rope) → W4 SACRED token-exact `Qwen3-0.6B` vs vLLM 0.25.0 oracle 16/16. Committed on this worktree branch (NOT pushed — SHA reported to the caller).
+
+
+## 2026-07-20 — First additive-model bring-up W3 forward + W4 SACRED gate (GATING 11/16) — Qwen3 dense
+
+**W3 (dense forward) LANDED.** `src/vllm/model_executor/models/qwen3.cpp`
+(`Qwen3DenseModel::Forward`/`ForwardDevice`, decl in `qwen3.h`) — the pure
+standard-dense `Qwen3ForCausalLM` forward composed from public vt:: ops + the
+fusion catalog, wired into the `qwen3_dense.cpp` factory (the W3 stub is gone).
+Structure per layer: std add+RMSNorm (input) → merged qkv (bf16 MatmulBT over
+[q,k,v]-sliced raw-NK shards) → per-head q/k RMSNorm (non-gemma) + NeoX RoPE
+(theta 1e6), **no attention gate** → causal GQA paged attention → o_proj → std
+add+RMSNorm (post) → merged gate_up → SiluAndMul → down; final std RMSNorm →
+**tied lm_head** (MatmulBT over `embed_tokens`). Attention flows **bf16**
+(qkv/q-k-norm/RoPE/query/attn) to mirror vLLM's per-op bf16 rounding; residual
+bf16. Self-contained device glue (Dev/DBuf/ResidentWeight) — qwen3_5.cpp's pooled
+helpers are anon-namespace, so this new TU carries its own thin correctness-grade
+glue over `vt::Backend` (DevicePool perf tier is a follow-on).
+
+**2 NEW fusion recipes** (`include/vt/recipes.h`), each byte-exact composite-tested
+(`test_ops_fused_chain.cpp`, CPU 145/145): `kFusedAddRmsNormStd` (gemma=false
+add+RMSNorm — used at the 3 std-norm sites via `vt::FusedChain`) and
+`kAttnQkNormRope` (non-gated qk-norm-rope = Tier-0 composite RmsNorm(q)+RmsNorm(k)
++RopeFromCache, in-place 2-D norm views aliasing 3-D rope views to fit 8 operands).
+
+**2 GENUINE latent bugs the first pure-dense BF16 model forced out + FIXED**
+(generalizing, gate models byte-identical): (1) the tokenizer HARD-REJECTED the
+classic Qwen2/Qwen3 pre-tokenizer regex — added `SplitPattern::kQwen2Classic`
+(single-\p{N} like kQwen2 but marks fall into the punct run, not the letter run)
+in `pretokenizer.{h,cpp}` + accept in `tokenizer.cpp` (HfJson + GGUF `pre=qwen2`);
+(2) `cuda_paged_attn.cu` WMMA prefill was gated only on the CACHE dtype, so a
+head_dim-128 model slipped into the tensor-core ladder validated ONLY for the
+gate models' head_dim 256 → it MISTOKENIZED; re-gated to `d==256 && TQ/TKV==bf16`
+(d≠256 uses the correctness-grade CUDA-core flash).
+
+**W4 SACRED GATE — NOT PASSED (GATING): 11/16 prompts token-exact** vs the vLLM
+0.25.0 `Qwen3-0.6B` greedy oracle (16-token continuations; oracle captured by
+`scripts/qwen3-oracle-capture.py`, golden `tests/parity/goldens/qwen3_greedy_0_6b/`).
+ALL 16 first-tokens exact; the 5 failures diverge at LATE-DECODE SEMANTIC
+NEAR-TIES (first-mismatch tok∈{2,5,10,10,13}, e.g. "question"↔"answer").
+**ISOLATED as per-op bf16-rounding drift vs vLLM's exact kernels, NOT a structural
+bug:** a CPU-exact-f32 greedy-loop ALSO gets 10/16 with OVERLAPPING divergences,
+and vLLM's `rms_norm_kernel` rounding was verified matching ours. Debug trail:
+0/16 (f32 attn + wmma-mistokenize) → fixed WMMA gate → 11/16 (f32 attn, structural
+correct) → bf16 attn → 11/16 with different (fewer-drift) near-ties. Closing to
+16/16 is a follow-on bit-matching pass (flash-exact d=128 attention + bf16-matmul
+cuBLASLt-vs-F.linear parity) — the same campaign the gate models underwent.
+
+**GATES.** dgx `~/work/vllm-cpp-qwen3-dense-a6e` (production flags): CLEAN CUDA
+`-Werror` rebuild **0 warnings**. **REGRESSION 27B 235/235 + 35B 315/315 token-exact
+UNCHANGED** (WMMA re-gate + tokenizer add are byte-identical for d=256/bf16-query).
+`compute-sanitizer memcheck` **0 errors** on the Qwen3 CUDA forward AND the full
+paged-engine forward+decode path. Recipes byte-exact CPU; `test_qwen3_forward`
+(synthetic + dgx prefill-argmax==12095 CPU/CUDA + ADOPT==fallback byte-exact);
+`test_bpe`/`test_pretokenizer` updated green.
+
+**Additivity FINAL count (W0-W4, the PR-#4 verdict).** NEW FILES (8): `qwen3.h`,
+`qwen3_dense.cpp`, `qwen3_weights.cpp`, `qwen3.cpp`, `dense_weight_loaders.h`,
+`test_qwen3_forward.cpp`, `test_qwen3_paged_engine.cpp`, `qwen3-oracle-capture.py`
+(+ `test_qwen3_load.cpp` from W2). SHARED TOUCHES: designed/unavoidable = the
+in-TU `REGISTER_VLLM_MODEL` line + `CMakeLists.txt`/`tests/CMakeLists.txt`
+build-glue + 2 one-line recipe decls in `recipes.h` (+ its test); the W1
+runner generalization (`runner.cpp`, model-shape-agnostic — one-time, unblocks all
+future dense archs); the W2 loader-helper extraction (`qwen3_5_dense_weights.cpp`,
+behaviour-preserving). The bring-up ALSO forced 2 generalizing engine/kernel fixes
+(tokenizer `kQwen2Classic`, WMMA d≠256 fallback) — one-time latent-bug fixes, not
+per-model scatter. VERDICT: the model itself is new-files + ~1 REGISTER + build-glue
+(clean PR-#4 shape); the shared touches are the DESIGNED extensibility deliverables
++ 2 latent bugs the first pure-dense bf16 model was the forcing function to expose.
+After them, Llama/Mistral add with new-files-only.
+
+**Committed on this worktree branch (NOT pushed — SHA reported to the caller).**
+Remaining: the 16/16 bit-matching follow-on (flash-exact d=128 attention), then
+Llama dense (download) as the genuine cross-family additivity proof.

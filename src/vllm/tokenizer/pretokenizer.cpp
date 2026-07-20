@@ -5,12 +5,14 @@
 //
 // kQwen2 — unsloth/Qwen3.6-27B-NVFP4 tokenizer.json (fetched 2026-07-03):
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
-//   NOTE: classic Qwen2/Qwen3 (e.g. Qwen/Qwen3-0.6B, Qwen3-Coder-30B) uses
+// kQwen2Classic — classic Qwen2/Qwen3 (e.g. Qwen/Qwen3-0.6B, Qwen3-Coder-30B):
 //   the same pattern WITHOUT \p{M} in the letter-run and punct classes:
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
-//   We implement the Qwen3.6 (\p{M}-aware) variant — the milestone's target
-//   model. The two differ only on combining marks adjacent to letter or
-//   punctuation runs.
+//   We implement BOTH: kQwen2 (\p{M}-aware) and kQwen2Classic differ only on
+//   combining marks adjacent to letter/punctuation runs (kQwen2Classic treats
+//   a mark like ordinary punct-run text, exactly as Llama-3 does, but keeps the
+//   single-codepoint \p{N} number grouping). The first ADDITIVE model
+//   (Qwen3-0.6B, MODEL-TEXT-qwen3) forced kQwen2Classic in.
 //
 // kLlama3 — PROVISIONAL: no Llama-3 checkpoint exists in the DGX HF cache to
 // read verbatim (checked 2026-07-03); pattern from public knowledge of
@@ -214,15 +216,19 @@ size_t MatchWs(std::string_view t, size_t pos) {
 
 std::vector<std::pair<size_t, size_t>> Pretokenize(std::string_view text,
                                                    SplitPattern pattern) {
-  const bool qwen = pattern == SplitPattern::kQwen2;
-  const int max_digits = qwen ? 1 : 3;
+  // \p{M} awareness (letter runs absorb marks; punct runs exclude them) is
+  // UNIQUE to the Qwen3.6 regex. Classic Qwen2/Qwen3 and Llama-3 both treat
+  // marks like ordinary punct-run codepoints. Number grouping is single-digit
+  // for BOTH Qwen variants; only Llama-3 groups \p{N}{1,3}.
+  const bool marks_aware = pattern == SplitPattern::kQwen2;
+  const int max_digits = pattern == SplitPattern::kLlama3 ? 3 : 1;
   std::vector<std::pair<size_t, size_t>> spans;
   size_t pos = 0;
   while (pos < text.size()) {
     size_t end = MatchContraction(text, pos);
-    if (end == 0) end = MatchLetterRun(text, pos, /*marks_in_run=*/qwen);
+    if (end == 0) end = MatchLetterRun(text, pos, /*marks_in_run=*/marks_aware);
     if (end == 0) end = MatchNumbers(text, pos, max_digits);
-    if (end == 0) end = MatchPunctRun(text, pos, /*marks_excluded=*/qwen);
+    if (end == 0) end = MatchPunctRun(text, pos, /*marks_excluded=*/marks_aware);
     if (end == 0) end = MatchWsNewlines(text, pos);
     if (end == 0) end = MatchWsNotBeforeNonSpace(text, pos);
     if (end == 0) end = MatchWs(text, pos);

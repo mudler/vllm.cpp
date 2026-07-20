@@ -110,10 +110,7 @@ SplitPattern DetectPattern(const json& doc) {
   }
   const std::string& re = regexes[0];
   if (re == kQwen36Regex) return SplitPattern::kQwen2;
-  if (re == kClassicQwen2Regex) {
-    Fail("classic qwen2 pre-tokenizer differs on combining marks; add "
-         "kQwen2Classic before accepting");
-  }
+  if (re == kClassicQwen2Regex) return SplitPattern::kQwen2Classic;
   if (re.find(R"(\p{N}{1,3})") != std::string::npos) {
     return SplitPattern::kLlama3;
   }
@@ -364,8 +361,7 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
   if (pre == "qwen35") {
     tok.pattern_ = SplitPattern::kQwen2;
   } else if (pre == "qwen2") {
-    Fail("classic qwen2 pre-tokenizer differs on combining marks; add "
-         "kQwen2Classic before accepting");
+    tok.pattern_ = SplitPattern::kQwen2Classic;
   } else if (pre == "llama-bpe") {
     tok.pattern_ = SplitPattern::kLlama3;
   } else {

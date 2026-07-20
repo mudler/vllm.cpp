@@ -70,14 +70,6 @@ std::string Find06BSnapshot() {
   return "";
 }
 
-std::vector<int32_t> LoadI32Npy(const fs::path& p) {
-  const parity::NpyArray a = parity::LoadNpy(p.string());
-  REQUIRE(a.dtype == "<i4");
-  const size_t n = a.data.size() / sizeof(int32_t);
-  const auto* src = reinterpret_cast<const int32_t*>(a.data.data());
-  return std::vector<int32_t>(src, src + n);
-}
-
 vllm::SamplingParams Greedy(int max_tokens) {
   vllm::SamplingParams sp;
   sp.temperature = 0.0;
@@ -129,10 +121,15 @@ TEST_CASE("qwen3-0.6B dense paged-engine greedy token-exact gate (dgx-only, SACR
     const std::vector<int32_t>& got = out.outputs[0].token_ids;
     const bool ok = static_cast<int64_t>(got.size()) == T && got == want;
     if (ok) ++pass;
-    else
-      MESSAGE("qwen3 DIVERGED prompt[" << i << "]=\"" << Prompts()[static_cast<size_t>(i)]
-              << "\" got.size=" << got.size() << " continuation=\""
-              << out.outputs[0].text << "\"");
+    else {
+      int first = -1;
+      for (int64_t j = 0; j < T && j < static_cast<int64_t>(got.size()); ++j)
+        if (got[static_cast<size_t>(j)] != want[static_cast<size_t>(j)]) { first = static_cast<int>(j); break; }
+      MESSAGE("qwen3 DIVERGED prompt[" << i << "] first-mismatch@tok=" << first
+              << " got=" << (first >= 0 ? got[static_cast<size_t>(first)] : -1)
+              << " want=" << (first >= 0 ? want[static_cast<size_t>(first)] : -1)
+              << " \"" << out.outputs[0].text << "\"");
+    }
     CHECK(ok);
   }
   MESSAGE("qwen3-0.6B SACRED gate: " << pass << "/" << N

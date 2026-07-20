@@ -44,6 +44,9 @@ std::vector<std::string> QwenPieces(std::string_view t) {
 std::vector<std::string> LlamaPieces(std::string_view t) {
   return Pieces(t, SplitPattern::kLlama3);
 }
+std::vector<std::string> ClassicPieces(std::string_view t) {
+  return Pieces(t, SplitPattern::kQwen2Classic);
+}
 
 using V = std::vector<std::string>;
 
@@ -87,6 +90,20 @@ TEST_CASE("CJK letters take an optional space prefix") {
 
 TEST_CASE("punct run between letters") {
   CHECK(QwenPieces("a...b") == V{"a", "...", "b"});
+}
+
+TEST_CASE("kQwen2Classic: combining marks split off the letter run (unlike kQwen2)") {
+  // The ONLY behavioral difference between kQwen2 (\p{M}-aware, Qwen3.6) and
+  // kQwen2Classic (classic Qwen2/Qwen3, e.g. Qwen3-0.6B) is \p{M} handling:
+  // kQwen2 folds a combining mark into the adjacent letter run; kQwen2Classic
+  // treats it as ordinary punct-run text. "e" + U+0301 (combining acute):
+  const std::string em = "e\xCC\x81";
+  CHECK(QwenPieces(em) == V{"e\xCC\x81"});         // one \p{M}-aware run
+  CHECK(ClassicPieces(em) == V{"e", "\xCC\x81"});  // classic: mark splits off
+  // Number grouping is single-codepoint for BOTH Qwen variants (only Llama-3
+  // groups \p{N}{1,3}); the plain ASCII split is otherwise identical to kQwen2.
+  CHECK(ClassicPieces("x123") == V{"x", "1", "2", "3"});
+  CHECK(ClassicPieces("Hello world") == V{"Hello", " world"});
 }
 
 TEST_CASE("punct run absorbs trailing newlines") {

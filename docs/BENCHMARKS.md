@@ -10,10 +10,17 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 
 **Roadmap note (2026-07-20):** the first additive-model bring-up (Qwen3 dense on
 `Qwen3-0.6B`, [spike](../.agents/specs/first-additive-model-qwen3-dense.md)) is a
-CORRECTNESS deliverable — its gate is token-exact greedy vs the vLLM 0.25.0 oracle
-(16/16), not a perf benchmark; no binding number is claimed for it. Its regression
-bar is the two gate models staying token-exact (27B 235/235 + 35B 315/315) after the
-runner generalization it forces.
+CORRECTNESS deliverable — its gate is token-exact greedy vs the vLLM 0.25.0 oracle,
+not a perf benchmark; no binding number is claimed for it. **W3 forward landed;
+W4 SACRED gate is GATING (NOT passed): 11/16 prompts token-exact** (all 16
+first-tokens exact; 5 fail at late-decode semantic near-ties = per-op bf16-rounding
+drift vs vLLM's kernels, confirmed structural-correctness via CPU-exact-f32 10/16 —
+16/16 needs a follow-on flash-exact-d128-attention / bf16-matmul bit-matching pass).
+Benchmark disposition NOT APPLICABLE until the correctness gate passes;
+`benchmark_binding=false`. Its regression bar HOLDS: the two gate models stay
+token-exact (27B `test_qwen27_paged_engine` **235/235** + 35B
+`test_qwen36_paged_engine` **315/315**) after the WMMA-prefill re-gate (d==256 only)
+and tokenizer `kQwen2Classic` add this bring-up forced.
 
 Last updated: **2026-07-19**. **Both gate models bound at HEAD `786aa0e`** (fresh
 fully-interleaved 3-rep grid, ZERO void, 12/12 binding-eligible both models): **27B

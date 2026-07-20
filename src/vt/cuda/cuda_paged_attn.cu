@@ -2480,11 +2480,17 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // large for the register-tiled flash path: keep the graph-safe block kernel.
   // Otherwise PREFILL → flash. num_tokens/num_reqs are host-known (no device read).
   const bool is_prefill = num_tokens > num_reqs;
-  // bf16 tensor-core prefill: head_dim a multiple of the WMMA tile (gate d=256),
-  // and only for a bf16 KV cache — the deployment path (vLLM's bf16 flash_attn
-  // KV store). An f32 cache keeps the f32 CUDA-core flash (unit-test anchors).
-  const bool wmma = is_prefill && (d % kWmmaM == 0) && PrefillWmmaEnabled() &&
-                    std::is_same<TKV, __nv_bfloat16>::value;
+  // bf16 tensor-core prefill. The whole WMMA ladder (flash2vec/BM GQA kernels,
+  // kGqaQG shared-memory sizing, the QKᵀ/PV WMMA tile counts) was tuned and
+  // validated ONLY for the gate models' head_dim 256 with a bf16 query + bf16 KV
+  // cache (vLLM's bf16 flash_attn store). Other head_dims (e.g. Qwen3 dense's
+  // head_dim 128) mistokenize on this path — the tensor-core staging is wrong —
+  // so they fall through to the correctness-grade f32 CUDA-core flash below.
+  // (Latent bug the first additive dense model, MODEL-TEXT-qwen3, forced out; the
+  // gate models keep the WMMA path unchanged — they run d=256, TQ/TKV=bf16.)
+  const bool wmma = is_prefill && d == 256 && PrefillWmmaEnabled() &&
+                    std::is_same<TKV, __nv_bfloat16>::value &&
+                    std::is_same<TQ, __nv_bfloat16>::value;
   // GQA K/V reuse: eligible when qpk = hq/num_kv_heads is a multiple of the reuse
   // group size (else a group would span two KV heads). Mirrors flash_attn's
   // load-K/V-once-per-KV-head GQA loop; halves redundant K/V traffic vs per-head.

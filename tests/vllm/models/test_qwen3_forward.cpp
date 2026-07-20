@@ -21,7 +21,15 @@
 #include <random>
 #include <vector>
 
+#include <algorithm>
+#include <filesystem>
+#include <string>
+#include <system_error>
+
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3.h"
+#include "vllm/transformers_utils/hf_config.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
 
@@ -156,6 +164,163 @@ TEST_CASE("qwen3 dense forward: CPU synthetic runs, finite, deterministic") {
   // Determinism: a re-run is bit-identical.
   const std::vector<float> b = RunForward(c, w);
   CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+}
+
+namespace {
+namespace fs = std::filesystem;
+std::string FindQwen3Snap() {
+  const char* home = std::getenv("HOME");
+  if (home == nullptr) return "";
+  const fs::path snaps = fs::path(home) /
+                         ".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots";
+  std::error_code ec;
+  if (!fs::is_directory(snaps, ec)) return "";
+  for (const auto& e : fs::directory_iterator(snaps, ec))
+    if (fs::exists(e.path() / "model.safetensors", ec)) return e.path().string();
+  return "";
+}
+}  // namespace
+
+// DIAGNOSTIC (dgx-only): load the REAL Qwen3-0.6B and run a single-sequence CPU
+// prefill over prompt0 = "The capital of France is" [785,6722,315,9625,374];
+// the last-token argmax must be 12095 (" Paris"), the oracle's first greedy
+// token. Isolates the forward from the paged engine / sampler / KV growth.
+TEST_CASE("qwen3 dense forward: real Qwen3-0.6B prefill argmax vs oracle (dgx-only)") {
+  const std::string snap = FindQwen3Snap();
+  if (snap.empty()) {
+    MESSAGE("SKIP: Qwen3-0.6B checkpoint absent (dgx-only forward argmax check)");
+    return;
+  }
+  const vllm::HfConfig cfg = vllm::LoadHfConfig(snap + "/config.json");
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(snap + "/model.safetensors"));
+  const vllm::Qwen3DenseWeights w = vllm::LoadQwen3ForCausalLMWeights(shards, cfg);
+
+  const std::vector<int32_t> tokens = {785, 6722, 315, 9625, 374};
+  const std::vector<int32_t> positions = {0, 1, 2, 3, 4};
+  const int64_t T = static_cast<int64_t>(tokens.size());
+
+  // Single-seq prefill CPU KV cache: one block, block_size >= T. The cache dtype
+  // mirrors the production runner (bf16 by default; VT_KV_CACHE_F32=0). Exercise
+  // the SAME bf16 cache path the GPU engine uses.
+  const bool bf16_cache = std::getenv("VT_KV_CACHE_F32") == nullptr;
+  const DType cdt = bf16_cache ? DType::kBF16 : DType::kF32;
+  const int64_t bs = 16, Hkv = cfg.num_key_value_heads, Dh = cfg.head_dim;
+  std::vector<std::vector<uint8_t>> buf;
+  std::vector<PagedKvCache> attn_kv;
+  const size_t cbytes = static_cast<size_t>(1 * 2 * bs * Hkv * Dh) * vt::SizeOf(cdt);
+  for (int64_t l = 0; l < cfg.num_hidden_layers; ++l) buf.emplace_back(cbytes, 0);
+  for (auto& b : buf) {
+    PagedKvCache kv;
+    kv.data = b.data();
+    kv.dtype = cdt;
+    kv.num_blocks = 1;
+    kv.block_size = bs;
+    kv.num_kv_heads = Hkv;
+    kv.head_size = Dh;
+    attn_kv.push_back(kv);
+  }
+  CommonAttentionMetadata m;
+  m.num_reqs = 1;
+  m.num_actual_tokens = static_cast<int>(T);
+  m.query_start_loc = {0, static_cast<int32_t>(T)};
+  m.query_start_loc_cpu = m.query_start_loc;
+  m.seq_lens = {static_cast<int32_t>(T)};
+  m.seq_lens_cpu = m.seq_lens;
+  m.max_query_len = static_cast<int>(T);
+  m.max_seq_len = static_cast<int>(T);
+  m.block_table_num_cols = 1;
+  m.block_table_tensor = {0};
+  for (int64_t t = 0; t < T; ++t) m.slot_mapping.push_back(t);
+  m.causal = true;
+
+  vt::Queue q = Q();
+  const std::vector<float> logits =
+      vllm::Qwen3DenseModel::Forward(tokens, positions, m, attn_kv, w, cfg, q);
+  REQUIRE(logits.size() == static_cast<size_t>(T) * cfg.vocab_size);
+
+  const int64_t V = cfg.vocab_size;
+  const float* last = logits.data() + (T - 1) * V;
+  int argmax = 0;
+  for (int64_t v = 1; v < V; ++v)
+    if (last[v] > last[argmax]) argmax = static_cast<int>(v);
+  // top-5 for diagnostics
+  std::vector<int> idx(static_cast<size_t>(V));
+  for (int64_t v = 0; v < V; ++v) idx[static_cast<size_t>(v)] = static_cast<int>(v);
+  std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
+                    [&](int a, int b) { return last[a] > last[b]; });
+  MESSAGE("qwen3 prefill argmax=" << argmax << " top5=[" << idx[0] << "," << idx[1]
+          << "," << idx[2] << "," << idx[3] << "," << idx[4] << "] (want 12095)");
+  CHECK(argmax == 12095);
+}
+
+// DIAGNOSTIC (dgx-only, GPU): the SAME prompt0 prefill but on a CUDA queue with a
+// device-resident bf16 KV cache — isolates whether a CUDA-kernel numeric bug (vs
+// the engine wiring) breaks the forward. argmax must again be 12095.
+TEST_CASE("qwen3 dense forward: real Qwen3-0.6B CUDA prefill argmax (dgx-only)") {
+  const std::string snap = FindQwen3Snap();
+  if (snap.empty()) {
+    MESSAGE("SKIP: Qwen3-0.6B checkpoint absent (CUDA forward argmax check)");
+    return;
+  }
+  vt::Backend* cuda = nullptr;
+  try {
+    cuda = &vt::GetBackend(vt::DeviceType::kCUDA);
+  } catch (...) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  const vllm::HfConfig cfg = vllm::LoadHfConfig(snap + "/config.json");
+  std::vector<vllm::SafetensorsFile> shards;
+  shards.push_back(vllm::SafetensorsFile::Open(snap + "/model.safetensors"));
+  const vllm::Qwen3DenseWeights w = vllm::LoadQwen3ForCausalLMWeights(shards, cfg);
+
+  const std::vector<int32_t> tokens = {785, 6722, 315, 9625, 374};
+  const std::vector<int32_t> positions = {0, 1, 2, 3, 4};
+  const int64_t T = static_cast<int64_t>(tokens.size());
+  vt::Queue q = cuda->CreateQueue();
+
+  const int64_t bs = 16, Hkv = cfg.num_key_value_heads, Dh = cfg.head_dim;
+  const size_t cbytes = static_cast<size_t>(1 * 2 * bs * Hkv * Dh) * vt::SizeOf(DType::kBF16);
+  std::vector<void*> devbuf;
+  std::vector<PagedKvCache> attn_kv;
+  for (int64_t l = 0; l < cfg.num_hidden_layers; ++l) {
+    void* p = cuda->Alloc(cbytes);
+    cuda->Memset(q, p, 0, cbytes);
+    devbuf.push_back(p);
+    PagedKvCache kv;
+    kv.data = p;
+    kv.dtype = DType::kBF16;
+    kv.num_blocks = 1;
+    kv.block_size = bs;
+    kv.num_kv_heads = Hkv;
+    kv.head_size = Dh;
+    attn_kv.push_back(kv);
+  }
+  CommonAttentionMetadata m;
+  m.num_reqs = 1;
+  m.num_actual_tokens = static_cast<int>(T);
+  m.query_start_loc = {0, static_cast<int32_t>(T)};
+  m.query_start_loc_cpu = m.query_start_loc;
+  m.seq_lens = {static_cast<int32_t>(T)};
+  m.seq_lens_cpu = m.seq_lens;
+  m.max_query_len = static_cast<int>(T);
+  m.max_seq_len = static_cast<int>(T);
+  m.block_table_num_cols = 1;
+  m.block_table_tensor = {0};
+  for (int64_t t = 0; t < T; ++t) m.slot_mapping.push_back(t);
+  m.causal = true;
+
+  const std::vector<float> logits =
+      vllm::Qwen3DenseModel::Forward(tokens, positions, m, attn_kv, w, cfg, q);
+  const int64_t V = cfg.vocab_size;
+  const float* last = logits.data() + (T - 1) * V;
+  int argmax = 0;
+  for (int64_t v = 1; v < V; ++v)
+    if (last[v] > last[argmax]) argmax = static_cast<int>(v);
+  MESSAGE("qwen3 CUDA prefill argmax=" << argmax << " (want 12095)");
+  for (void* p : devbuf) cuda->Free(p);
+  CHECK(argmax == 12095);
 }
 
 TEST_CASE("qwen3 dense forward: fusion-catalog ADOPT == hand-call fallback (byte-exact)") {

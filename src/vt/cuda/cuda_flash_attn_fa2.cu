@@ -270,7 +270,9 @@ void RecordDecodeLaunch(bool split, bool allocated) {
 }  // namespace
 
 // Launch FA-2 paged varlen prefill for a bf16 query + bf16 KV cache + bf16 out,
-// head_dim 256. Layouts (elements, matching our LaunchPaged dispatch):
+// head_dim 256 (gate models) or 128 (Qwen3-dense — vLLM runs its prefill on the
+// SAME flash_attn_varlen_func FA2 family). Layouts (elements, matching our
+// LaunchPaged dispatch):
 //   query [total_q, hq, d]                          (varlen-packed, bf16)
 //   k/v   [num_blocks, block_size, num_kv_heads, d] (paged, NHD block layout, bf16)
 //   out   [total_q, hq, d]                          (varlen-packed, bf16)
@@ -287,6 +289,15 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   if (query.dtype != DType::kBF16 || out.dtype != DType::kBF16) {
     throw std::runtime_error(
         "cuda flash-attn-2 prefill: bf16 query/out required (dispatch gate must enforce)");
+  }
+  // head_dim 256 (gate models Qwen3.6-27B/35B) and head_dim 128 (Qwen3-dense —
+  // vLLM runs its prefill on the SAME flash_attn_varlen_func FA2 family) share
+  // this launcher; both split-KV instantiations are vendored + compiled. The
+  // d128 arm NEVER engages the d256 gate models (they are d256 by construction),
+  // so the d256 arm is byte-identical.
+  if (d != 128 && d != 256) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 prefill: head_dim 128 or 256 only (dispatch gate must enforce)");
   }
 
   // FA-2 needs max_seqlen_q/max_seqlen_k on the host — for GRID SIZING and the
@@ -411,16 +422,25 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.num_splits = 1;
   p.o_batch_stride = static_cast<int64_t>(max_seqlen_q) * p.o_row_stride;
 
-  // head_dim 256 is gated by the caller. Causal is per-layer (qwen3.5 mixes full-
-  // attn causal / GDN); a finite decoder or encoder window dispatches the
+  // head_dim {128,256} is gated by the caller. Causal is per-layer (qwen3.5 mixes
+  // full-attn causal / GDN); a finite decoder or encoder window dispatches the
   // non-causal template so its runtime LOCAL_SWITCH selects the exact local
-  // mask. Both instantiations are compiled for sm_121a.
+  // mask. All instantiations are compiled for sm_121a.
   // With num_splits==1 run_mha_fwd_splitkv_dispatch runs the Split=false kernel
   // only — no combine pass, exactly vLLM's varlen prefill.
-  if (args.causal && !is_local) {
-    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, s);
+  const bool run_causal = args.causal && !is_local;
+  if (d == 128) {
+    if (run_causal) {
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, s);
+    } else {
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, s);
+    }
   } else {
-    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, s);
+    if (run_causal) {
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(p, s);
+    } else {
+      FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, false>(p, s);
+    }
   }
   Check(cudaGetLastError(), "splitkv dispatch launch");
 }

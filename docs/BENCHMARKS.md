@@ -31,42 +31,50 @@ is COMPLETE. Its regression bar HOLDS: the two gate models stay token-exact (27B
 `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (this change touches no engine source).
 
-**Qwen3-dense SPEED benchmark vs vLLM 0.25.0 production — every-axis FAIL,
-`benchmark_binding=true` (2026-07-20, HEAD `a59b735`, `Qwen3-4B` BF16).** The
-DONE=correctness+speed deliverable is MEASURED: below vLLM on EVERY axis, at both
-concurrencies, in both engine configs → `MODEL-TEXT-qwen3-qwen3-for-causal-lm` stays
-**`ACTIVE` (NOT `DONE`)**. Workload: random in1024/out128 (range-ratio 0),
-`--ignore-eos`, closed-loop (`--request-rate inf --max-concurrency C`); denominator is
-vLLM PRODUCTION (graphed, async default — NOT `--enforce-eager`), `vllm serve` +
-`vllm bench serve`. Ours = `examples/vllm-bench`, mean of 2 reps (<1% noise). Ratio =
-ours/vLLM (throughput ≥1 wins, latency ≤1 wins).
+**Qwen3-dense SPEED benchmark vs vLLM 0.25.0 production — d128 FA2 prefill + decode
+default-ON, `benchmark_binding=true` (2026-07-20, `Qwen3-4B` BF16).** The dominant
+PREFILL lever (a d128 FlashAttention-2 varlen prefill — vLLM runs Qwen3 prefill on
+the same `flash_attn_varlen_func` family) is now IMPLEMENTED and default-ON, and the
+FA2 varlen d128 DECODE default is flipped ON (near-tie gate re-passes 16/16, below).
+This CLOSES most of the gap but Qwen3-4B is STILL below vLLM on total throughput and
+TTFT → `MODEL-TEXT-qwen3-qwen3-for-causal-lm` stays **`ACTIVE` (NOT `DONE`)**.
+Workload: random in1024/out128 (range-ratio 0), `--ignore-eos`, closed-loop
+(`--request-rate inf --max-concurrency C`); denominator is vLLM PRODUCTION (graphed,
+async default — NOT `--enforce-eager`), `vllm serve` + `vllm bench serve`. Ours =
+`examples/vllm-bench`. Clean same-session A/B, mean of reps 2-3 (cold rep 1 dropped;
+<1% noise). Ratio = ours/vLLM (throughput ≥1 wins, latency ≤1 wins).
 
-| axis | c1 vLLM | c1 ours-default | ratio | c1 ours-FA2dec | ratio | c8 vLLM | c8 ours-default | ratio | c8 ours-FA2dec | ratio |
-|---|---|---|---|---|---|---|---|---|---|---|
-| total tput tok/s | 199.8 | 74.6 | **0.37×** | 160.6 | **0.80×** | 1500.8 | 426 | **0.28×** | 719 | **0.48×** |
-| output tput tok/s | 22.2 | 8.28 | 0.37× | 17.85 | 0.80× | 166.8 | 47.3 | 0.28× | 79.8 | 0.48× |
-| TTFT median ms | 143 | 846 | **5.9×** | 841 | 5.9× | 426 | 2289 | **5.4×** | 2287 | 5.4× |
-| TPOT mean ms | 44.24 | 114.3 | **2.58×** | 49.1 | **1.11×** | 45.03 | 147 | **3.3×** | 77.9 | **1.73×** |
-| ITL P99 ms | 46.3 | 118.0 | 2.55× | 50.6 | 1.09× | 130.6 | 1604 | 12.3× | 1595 | 12.2× |
+| axis | c1 vLLM | c1 ours | ratio | c8 vLLM | c8 ours | ratio |
+|---|---|---|---|---|---|---|
+| total tput tok/s | 191.6 | 173.1 | **0.90×** | 1631.4 | 1013.7 | **0.62×** |
+| output tput tok/s | 21.3 | 19.2 | 0.90× | 181.3 | 112.6 | 0.62× |
+| TTFT median ms | 61.6 | 360.6 | **5.85×** | 121.3 | 1232.7 | **10.2×** |
+| TPOT mean ms | 46.8 | 48.8 | **1.04×** | 43.4 | 60.0 | **1.38×** |
+| ITL P99 ms | 50.6 | 49.8 | **0.98× ✓** | 47.7 | 690.1 | 14.5× |
 
-**Verdict: FAIL** — correctness-complete but NOT at vLLM speed. **Named levers
-(ranked): (1) PREFILL, dominant** — TTFT ~5.4-5.9× vLLM at all points because
-head_dim-128 prefill falls through to the scalar CUDA-core `LaunchPrefillFlash`
-fallback (the tensor-core WMMA prefill AND the vendored FA2 prefill are gated to
-`d==256`, `cuda_paged_attn.cu:2511,2532` — the tensor-core tiling mistokenizes at
-d≠256). This caps total throughput at ~0.80×/0.48× even after the decode lever. Fix =
-a d128-correct tensor-core/FA2 prefill kernel. **(2) DECODE, measured opt-in** — the
-already-vendored FA2 varlen d128 decode (`VT_FA2_DECODE_QWEN3=1`) is a **2.15× (c1) /
-1.69× (c8)** decode speedup that nearly closes TPOT at c1 (1.11×) but not at c8
-(1.73×, split-KV batch efficiency); flipping its default requires re-passing the
-near-tie gate 16/16 with FA2-ON. Both are follow-on fixes (measure-first task).
-**Memory** (unified GB10, `nvidia-smi` memory `N/A`): ours peak RSS 8.5 GB, vLLM
-weights 7.56 GiB + EngineCore RSS 5.3 GiB; vLLM's 101 GiB KV is policy-reserved
-(gpu-mem-util 0.9), not need — both fit; a strict peak-device-memory ratio is not
-measurable on this unified-memory box. Repro + raw logs:
-[bench-evidence/qwen3-4b-ours-ab-20260720.log](bench-evidence/qwen3-4b-ours-ab-20260720.log),
-[bench-evidence/qwen3-4b-vllm-series-20260720.log](bench-evidence/qwen3-4b-vllm-series-20260720.log);
-full recipe in the [parity ledger](../.agents/parity-ledger.md) 2026-07-20 SPEED row.
+**Prefill-lever isolation (same binary, FA2 prefill ON vs `VT_FA2_PREFILL_QWEN3=0`;
+decode ON both):** c1 total 173.1 vs 161.9 (**+7%**), TTFT 360.6 vs 800.9 (**−55%**);
+c8 total 1013.7 vs 719.4 (**+41%**), TTFT 1232.7 vs 2381 (**−48%**), TPOT 60.0 vs 76.9
+(**−22%**). vs the prior `a59b735` opt-in-decode baseline, total tput improves
+**0.80×→0.90×** (c1) / **0.48×→0.62×** (c8): the d128 FA2 prefill kernel is a real,
+correctly-attributed win.
+
+**Verdict: still FAIL (not every-axis).** DECODE reaches parity at c1 (TPOT 1.04×,
+ITL P99 **0.98× — WIN**) thanks to the FA2 decode default flip. **The dominant
+residual is the PREFILL STEP as a whole, NOT the attention kernel:** the d128
+attention now runs vLLM's exact FA2 family, yet the full 1024-token prefill step is
+still ~6× vLLM (TTFT 360 vs 61 ms at c1) → the residual is non-attention prefill glue
+(GEMM/MLP fusion) + host-side per-kernel launch overhead (un-graphed prefill), the
+[[profile-full-step-not-just-kernels]] / [[fusion-must-be-portable-reuse-patterns]]
+front. Secondary residual: c8 decode batch efficiency (TPOT 1.38×, ITL P99 14.5× —
+split-KV low-batch occupancy + async scheduling), even though c1 decode is at parity.
+**Memory** (unified GB10, `nvidia-smi` memory `N/A`): ours peak RSS ~8.5 GB, vLLM
+weights 7.56 GiB + EngineCore RSS 5.3 GiB; vLLM's KV is policy-reserved (gpu-mem-util
+0.9), not need — both fit; a strict peak-device-memory ratio is not measurable on this
+unified-memory box. Repro + raw logs:
+[bench-evidence/qwen3-4b-ours-fa2prefill-20260720.log](bench-evidence/qwen3-4b-ours-fa2prefill-20260720.log),
+[bench-evidence/qwen3-4b-vllm-series-fa2prefill-20260720.log](bench-evidence/qwen3-4b-vllm-series-fa2prefill-20260720.log);
+full recipe in the [parity ledger](../.agents/parity-ledger.md) 2026-07-20 FA2-prefill SPEED row.
 
 **Strict-decode razor — investigation, no perf claim (2026-07-20).** An attempt to
 tighten the Qwen3 near-tie band to strict token-exact 16/16 by routing d128 decode

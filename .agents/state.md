@@ -14513,3 +14513,62 @@ peak-device-memory ratio is not measurable on this unified-memory box.
 Regression preserved by construction: no engine source touched (only benchmark-harness
 `ignore_eos`); 27B 235/235 + 35B 315/315 unchanged. `benchmark_binding=true`. Repro +
 full table in the parity-ledger 2026-07-20 SPEED row + `docs/BENCHMARKS.md`.
+
+## 2026-07-20 — Qwen3-dense SPEED: d128 FA2 PREFILL implemented + FA2 decode default-ON — big gap-close, still ACTIVE (MODEL-TEXT-qwen3-qwen3-for-causal-lm, CLAIM-MODEL-QWEN3-DENSE, worktree agent-a66cb35cac4b31eee)
+
+Implemented the DOMINANT prefill lever from the 7a8795b benchmark and re-measured
+`Qwen3-4B` vs vLLM 0.25.0 production (graphed).
+
+**Implementation (this worktree):**
+- **d128 FA2 varlen PREFILL.** Generalized the vendored FA2 launcher
+  `LaunchPrefillFA2Bf16` (`src/vt/cuda/cuda_flash_attn_fa2.cu`) from d256-only to
+  head_dim {128,256}: it now switches the compile-time template on `d`, dispatching
+  `run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t,128,causal>` (num_splits=1,
+  Split=false — exactly vLLM's `flash_attn_varlen_func`). The d128 split-KV
+  instantiations were ALREADY vendored + compiled (they back the d128 decode from
+  `a59b735`), so NO new kernel was needed — only the launcher generalization + a
+  dispatch route. Routed by a NEW d128-scoped gate `fa2_prefill_qwen3` +
+  `Fa2PrefillQwen3Enabled` (`VT_FA2_PREFILL_QWEN3`, DEFAULT-ON, mirrors the d256
+  `VT_FA2_PREFILL` pattern) in `src/vt/cuda/cuda_paged_attn.cu`. The d256 gate arm
+  is byte-identical (the qwen3 arm admits ONLY head_dim 128; the gate models are
+  d256) → 27B/35B never touched.
+- **FA2 decode default flip.** `Fa2DecodeQwen3Enabled` OFF→ON (`VT_FA2_DECODE_QWEN3`
+  now default-ON), the shipped Qwen3-dense decode.
+- **Op-parity test** `tests/vt/test_ops_paged_attn.cpp`: new `*head_dim 128*` prefill
+  case at both Qwen3 ratios (0.6B 16/8, 4B 32/8) vs the f32 `ComposedPagedRef`
+  (max_abs ~0.006), host-metadata==D2H-fallback bit-identical, same-binary opt-out
+  (`VT_FA2_PREFILL_QWEN3=0`) correct. All 24 op cases pass; `memcheck` 0 errors.
+
+**Correctness with FA2 prefill+decode ON (CRITICAL — no regression traded for speed):**
+- Near-tie gate `test_qwen3_paged_engine.cpp` RE-PASSES **16/16 on 0.6B** (strict
+  token-exact 10/16 + near-tie 6/16, max gap 0.125 nats) **AND 16/16 on 4B** (strict
+  10/16 + near-tie 6/16, max gap 0.125 nats), **0 forward-divergent** both. The
+  committed `our_ids`/`neartie_gap_mnats` goldens were refreshed (bootstrap-dump the
+  FA2-ON ids → `qwen3-neartie-gap.py` teacher-forces vLLM on OUR new sequence): the
+  teacher-forced gap is **0.0000 nats at all-but-2 positions on each model** (vLLM's
+  OWN argmax given our prefix IS our token, bit-identical logprobs) — this PROVES the
+  FA2 d128 prefill reproduces vLLM's prefill logits (vLLM prefill IS FA2 varlen). 4B
+  max gap TIGHTENED 0.25→0.125 nats vs the prior scalar-prefill goldens.
+- Regression: **27B `test_qwen27_paged_engine` 235/235 + 35B `test_qwen36_paged_engine`
+  315/315 UNCHANGED** (d256 arms byte-identical). CUDA `-Werror` 0-warn clean build.
+
+**SPEED (clean same-session, idle GB10, one flock/series, mean reps 2-3, cold rep dropped):**
+- vLLM (production/graphed): c1 total 191.6 tok/s, TTFT med 61.6 ms, TPOT 46.8, ITL
+  P99 50.6; c8 total 1631.4, TTFT 121.3, TPOT 43.4, ITL P99 47.7.
+- OURS (FA2 prefill+decode ON): c1 total 173.1 (**0.90×**), TTFT 360.6 (5.85×), TPOT
+  48.8 (**1.04×**), ITL P99 49.8 (**0.98× WIN**); c8 total 1013.7 (**0.62×**), TTFT
+  1232.7 (10.2×), TPOT 60.0 (1.38×), ITL P99 690.1 (14.5×).
+- Prefill-kernel A/B (same binary, `VT_FA2_PREFILL_QWEN3=0`, decode ON both): c1 total
+  +7% / TTFT −55%; c8 total **+41%** / TTFT **−48%** / TPOT −22% — the d128 FA2 prefill
+  is a real, correctly-attributed win. Total tput 0.80×→0.90× (c1) / 0.48×→0.62× (c8)
+  vs the prior `a59b735` opt-in-decode baseline.
+
+**VERDICT: still FAIL (not every-axis) → row stays ACTIVE (NOT DONE).** DECODE reaches
+parity at c1 (TPOT 1.04×, ITL P99 0.98× WIN) via the FA2 decode default flip. The
+DOMINANT RESIDUAL is the full prefill STEP, NOT the attention kernel (now vLLM's exact
+FA2 family): a 1024-token prefill is still ~6× vLLM (TTFT 360 vs 61 ms c1) = non-attention
+prefill glue (GEMM/MLP fusion) + host-side per-kernel launch overhead (un-graphed
+prefill) — the profile-full-step-not-just-kernels / portable-fusion front. Secondary
+residual: c8 split-KV decode batch efficiency (TPOT 1.38×, ITL P99 14.5× at low batch).
+`benchmark_binding=true`. Repro + table: parity-ledger 2026-07-20 FA2-prefill SPEED row
++ `docs/BENCHMARKS.md`; raw logs `docs/bench-evidence/qwen3-4b-{ours,vllm-series}-fa2prefill-20260720.log`.

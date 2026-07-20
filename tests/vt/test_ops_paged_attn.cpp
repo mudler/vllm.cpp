@@ -1173,6 +1173,140 @@ TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at 
               "FA-2 symmetric encoder local window");
 }
 
+// Qwen3-dense VARLEN d128 prefill parity (the DOMINANT TTFT lever): vLLM runs
+// Qwen3 prefill on the same flash_attn_varlen_func FA2 family, so the generalized
+// LaunchPrefillFA2Bf16 (num_splits=1, Split=false) must reproduce the paged
+// causal GQA reduction. Validate at both Qwen3 ratios (0.6B Hq/Hkv=16/8, 4B 32/8)
+// against the f32 composed reference on the SAME bf16-rounded q/K/V; pin the
+// sync-free host-metadata path (bit-identical to the D2H+sync fallback), and the
+// same-binary opt-out (VT_FA2_PREFILL_QWEN3=0 -> scalar CUDA-core prefill).
+TEST_CASE("paged_attention CUDA FA-2 prefill (bf16 q/kv/out) matches f32 ref at head_dim 128") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 d128 prefill parity (dgx-pending)");
+    return;
+  }
+  const int64_t D = 128, block_size = 16;
+  const float scale = std::pow(static_cast<float>(D), -0.5f);
+  // Ragged 3-req prefill batch: a long prefill, a decode row, and a short
+  // chunked-prefill tail — the mixed batch LaunchPaged treats as one prefill.
+  const std::vector<int32_t> qsl = {0, 100, 101, 104};
+  const std::vector<int32_t> seq_lens = {100, 133, 140};
+  const int64_t num_tokens = 104, num_reqs = 3;
+  // kBlockN=128 for d128: covers up to ceil(140/128)*128 = 256 keys = 16 pages;
+  // size the block table to that so no column is read past its row (memcheck).
+  const int64_t max_blocks = 16, num_blocks = 64;
+  for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
+                            std::pair<int64_t, int64_t>{32, 8}}) {
+    const int64_t Hq = ratio.first, Hk = ratio.second, page = Hk * D;
+    CAPTURE(Hq);
+    auto qf = RandF32(static_cast<size_t>(num_tokens * Hq * D),
+                      5024U + static_cast<uint32_t>(Hq));
+    auto kc = RandF32(static_cast<size_t>(num_blocks * block_size * page),
+                      337U + static_cast<uint32_t>(Hq));
+    auto vc = RandF32(static_cast<size_t>(num_blocks * block_size * page),
+                      379U + static_cast<uint32_t>(Hq));
+    std::vector<int32_t> block_table(static_cast<size_t>(num_reqs * max_blocks));
+    for (int64_t r = 0; r < num_reqs; ++r)
+      for (int64_t b = 0; b < max_blocks; ++b)
+        block_table[static_cast<size_t>(r * max_blocks + b)] =
+            static_cast<int32_t>((r * 13 + b * 7) % num_blocks);
+
+    std::vector<uint16_t> q_b(qf.size()), kc_b(kc.size()), vc_b(vc.size());
+    std::vector<float> q_r(qf.size()), kc_r(kc.size()), vc_r(vc.size());
+    for (size_t i = 0; i < qf.size(); ++i) {
+      q_b[i] = F32ToBf16Bits(qf[i]);
+      q_r[i] = Bf16BitsToF32(q_b[i]);
+    }
+    for (size_t i = 0; i < kc.size(); ++i) {
+      kc_b[i] = F32ToBf16Bits(kc[i]);
+      kc_r[i] = Bf16BitsToF32(kc_b[i]);
+      vc_b[i] = F32ToBf16Bits(vc[i]);
+      vc_r[i] = Bf16BitsToF32(vc_b[i]);
+    }
+    const std::vector<float> ref =
+        ComposedPagedRef(q_r, kc_r, vc_r, block_table, max_blocks, seq_lens, qsl,
+                         Hq, Hk, D, block_size, scale, true);
+
+    const int64_t within = block_size * Hk * D;
+    std::vector<uint16_t> combined(static_cast<size_t>(num_blocks * 2 * within), 0);
+    for (int64_t b = 0; b < num_blocks; ++b)
+      for (int64_t e = 0; e < within; ++e) {
+        combined[static_cast<size_t>((b * 2 + 0) * within + e)] =
+            kc_b[static_cast<size_t>(b * within + e)];
+        combined[static_cast<size_t>((b * 2 + 1) * within + e)] =
+            vc_b[static_cast<size_t>(b * within + e)];
+      }
+
+    Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+    QueueGuard g(gpu);
+    DeviceTensor dq(gpu, g.q, DType::kBF16, {num_tokens, Hq, D}, q_b.data());
+    DeviceTensor dcache(gpu, g.q, DType::kBF16, {num_blocks * 2 * within}, combined.data());
+    auto SliceView = [&](int which) {
+      Tensor t = dcache.tensor();
+      t.data = static_cast<char*>(t.data) +
+               static_cast<size_t>(which) * static_cast<size_t>(within) *
+                   vt::SizeOf(DType::kBF16);
+      t.rank = 4;
+      t.shape[0] = num_blocks;
+      t.shape[1] = block_size;
+      t.shape[2] = Hk;
+      t.shape[3] = D;
+      t.stride[0] = 2 * within;
+      t.stride[1] = Hk * D;
+      t.stride[2] = D;
+      t.stride[3] = 1;
+      return t;
+    };
+    Tensor kview = SliceView(0), vview = SliceView(1);
+    DeviceTensor dbt(gpu, g.q, DType::kI32, {num_reqs, max_blocks}, block_table.data());
+    DeviceTensor dsl(gpu, g.q, DType::kI32, {num_reqs}, seq_lens.data());
+    DeviceTensor dqsl(gpu, g.q, DType::kI32, {num_reqs + 1}, qsl.data());
+
+    EnvGuard fa2_on("VT_FA2_PREFILL_QWEN3", "1");
+    // Run 1: no host metadata -> the launcher's D2H+sync fallback sizes the grid.
+    DeviceTensor dout1(gpu, g.q, DType::kBF16, {num_tokens, Hq, D});
+    vt::PagedAttention(g.q, dout1.tensor(), dq.tensor(), kview, vview, dbt.tensor(),
+                       dsl.tensor(), dqsl.tensor(), PagedAttentionArgs{scale, true});
+    std::vector<uint16_t> got1(static_cast<size_t>(num_tokens * Hq * D), 0);
+    dout1.Download(g.q, got1.data());
+
+    // Run 2: sync-free host metadata, max_seq_len an UPPER BOUND (160 > 140) —
+    // must be bit-identical to run 1 (host values size grids, not geometry).
+    PagedAttentionArgs host_args{scale, true};
+    host_args.query_start_loc_host = qsl.data();
+    host_args.max_seq_len = 160;
+    DeviceTensor dout2(gpu, g.q, DType::kBF16, {num_tokens, Hq, D});
+    vt::PagedAttention(g.q, dout2.tensor(), dq.tensor(), kview, vview, dbt.tensor(),
+                       dsl.tensor(), dqsl.tensor(), host_args);
+    std::vector<uint16_t> got2(static_cast<size_t>(num_tokens * Hq * D), 0);
+    dout2.Download(g.q, got2.data());
+
+    double max_abs = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i)
+      max_abs = std::max(max_abs,
+                         std::abs(static_cast<double>(Bf16BitsToF32(got1[i])) - ref[i]));
+    MESSAGE("FA-2 bf16 d128 prefill max_abs_err vs f32 ref = " << max_abs);
+    CHECK(max_abs < 5e-2);
+    size_t mism = 0;
+    for (size_t i = 0; i < got1.size(); ++i)
+      if (got1[i] != got2[i]) ++mism;
+    CHECK(mism == 0);
+
+    // Same-binary opt-out: toggle 0 -> scalar CUDA-core prefill, still correct.
+    EnvGuard fa2_off("VT_FA2_PREFILL_QWEN3", "0");
+    DeviceTensor dout3(gpu, g.q, DType::kBF16, {num_tokens, Hq, D});
+    vt::PagedAttention(g.q, dout3.tensor(), dq.tensor(), kview, vview, dbt.tensor(),
+                       dsl.tensor(), dqsl.tensor(), host_args);
+    std::vector<uint16_t> got3(static_cast<size_t>(num_tokens * Hq * D), 0);
+    dout3.Download(g.q, got3.data());
+    double fb_max = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i)
+      fb_max = std::max(fb_max,
+                        std::abs(static_cast<double>(Bf16BitsToF32(got3[i])) - ref[i]));
+    CHECK(fb_max < 5e-2);
+  }
+}
+
 namespace {
 
 // Host/device fixture for the pure-decode vectors ported from
@@ -1436,9 +1570,10 @@ TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode matches composed referen
   }
 }
 
-// Opt-in default: with VT_FA2_DECODE_QWEN3 unset/0 the d128 decode stays on the
-// portable fallback (no varlen-FA2 launch), proving the gate is same-binary A/B.
-TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode is opt-in (default fallback)") {
+// Same-binary A/B off arm: with VT_FA2_DECODE_QWEN3=0 the d128 decode stays on
+// the portable fallback (no varlen-FA2 launch). The default is now ON (the
+// shipped Qwen3-dense decode), so this pins the explicit-off toggle path.
+TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode toggle-off uses fallback") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend; skipping FA-2 varlen d128 opt-in check (dgx-pending)");
     return;

@@ -1,0 +1,85 @@
+=== OURS[prodON] c=1 rep=1 (21:12:55) ===
+Total generated tokens:                    1024        
+Output token throughput (tok/s):           19.25       
+Total token throughput (tok/s):            173.29      
+Median TTFT (ms):                          360.04      
+Mean TPOT (ms):                            48.78       
+P99 ITL (ms):                              49.77       
+=== OURS[prodON] c=1 rep=2 (21:13:53) ===
+Total generated tokens:                    1024        
+Output token throughput (tok/s):           19.24       
+Total token throughput (tok/s):            173.22      
+Median TTFT (ms):                          361.63      
+Mean TPOT (ms):                            48.79       
+P99 ITL (ms):                              49.76       
+=== OURS[prodON] c=1 rep=3 (21:14:50) ===
+Total generated tokens:                    1024        
+Output token throughput (tok/s):           19.21       
+Total token throughput (tok/s):            172.98      
+Median TTFT (ms):                          359.60      
+Mean TPOT (ms):                            48.86       
+P99 ITL (ms):                              49.78       
+=== OURS[prodON] c=8 rep=1 (21:15:48) ===
+Total generated tokens:                    3072        
+Output token throughput (tok/s):           112.66      
+Total token throughput (tok/s):            1014.27     
+Median TTFT (ms):                          1223.54     
+Mean TPOT (ms):                            59.95       
+P99 ITL (ms):                              686.86      
+=== OURS[prodON] c=8 rep=2 (21:16:21) ===
+Total generated tokens:                    3072        
+Output token throughput (tok/s):           112.53      
+Total token throughput (tok/s):            1013.11     
+Median TTFT (ms):                          1236.38     
+Mean TPOT (ms):                            59.95       
+P99 ITL (ms):                              691.80      
+=== OURS[prodON] c=8 rep=3 (21:16:55) ===
+Total generated tokens:                    3072        
+Output token throughput (tok/s):           112.66      
+Total token throughput (tok/s):            1014.30     
+Median TTFT (ms):                          1229.03     
+Mean TPOT (ms):                            59.95       
+P99 ITL (ms):                              688.47      
+=== OURS[prefOFF] c=1 rep=1 (21:17:28) ===
+Total generated tokens:                    1024        
+Output token throughput (tok/s):           18.01       
+Total token throughput (tok/s):            162.15      
+Median TTFT (ms):                          802.53      
+Mean TPOT (ms):                            48.86       
+P99 ITL (ms):                              50.39       
+=== OURS[prefOFF] c=1 rep=2 (21:18:29) ===
+Total generated tokens:                    1024        
+Output token throughput (tok/s):           17.97       
+Total token throughput (tok/s):            161.77      
+Median TTFT (ms):                          801.31      
+Mean TPOT (ms):                            48.99       
+P99 ITL (ms):                              50.53       
+=== OURS[prefOFF] c=1 rep=3 (21:19:31) ===
+Total generated tokens:                    1024        
+Output token throughput (tok/s):           17.98       
+Total token throughput (tok/s):            161.92      
+Median TTFT (ms):                          798.85      
+Mean TPOT (ms):                            48.96       
+P99 ITL (ms):                              50.74       
+=== OURS[prefOFF] c=8 rep=1 (21:20:32) ===
+Total generated tokens:                    3072        
+Output token throughput (tok/s):           79.92       
+Total token throughput (tok/s):            719.57      
+Median TTFT (ms):                          2379.66     
+Mean TPOT (ms):                            76.92       
+P99 ITL (ms):                              1582.76     
+=== OURS[prefOFF] c=8 rep=2 (21:21:17) ===
+Total generated tokens:                    3072        
+Output token throughput (tok/s):           79.85       
+Total token throughput (tok/s):            718.95      
+Median TTFT (ms):                          2382.19     
+Mean TPOT (ms):                            76.98       
+P99 ITL (ms):                              1584.24     
+=== OURS[prefOFF] c=8 rep=3 (21:22:01) ===
+Total generated tokens:                    3072        
+Output token throughput (tok/s):           79.95       
+Total token throughput (tok/s):            719.81      
+Median TTFT (ms):                          2381.09     
+Mean TPOT (ms):                            76.88       
+P99 ITL (ms):                              1581.99     
+=== OURS DONE ===

@@ -1,0 +1,51 @@
+serve PID 1260466; waiting for ready...
+READY after 120s
+=== VLLM c=1 rep=1 (21:25:16) ===
+Total generated tokens:                  1024      
+Output token throughput (tok/s):         20.72     
+Peak output token throughput (tok/s):    22.00     
+Total token throughput (tok/s):          186.50    
+Median TTFT (ms):                        162.78    
+Mean TPOT (ms):                          46.81     
+P99 ITL (ms):                            54.14     
+=== VLLM c=1 rep=2 (21:26:16) ===
+Total generated tokens:                  1024      
+Output token throughput (tok/s):         21.29     
+Peak output token throughput (tok/s):    22.00     
+Total token throughput (tok/s):          191.57    
+Median TTFT (ms):                        69.32     
+Mean TPOT (ms):                          46.78     
+P99 ITL (ms):                            48.44     
+=== VLLM c=1 rep=3 (21:27:12) ===
+Total generated tokens:                  1024      
+Output token throughput (tok/s):         21.30     
+Peak output token throughput (tok/s):    22.00     
+Total token throughput (tok/s):          191.67    
+Median TTFT (ms):                        53.81     
+Mean TPOT (ms):                          46.90     
+P99 ITL (ms):                            52.70     
+=== VLLM c=8 rep=1 (21:28:07) ===
+Total generated tokens:                  3072      
+Output token throughput (tok/s):         164.48    
+Peak output token throughput (tok/s):    184.00    
+Total token throughput (tok/s):          1480.28   
+Median TTFT (ms):                        469.15    
+Mean TPOT (ms):                          44.93     
+P99 ITL (ms):                            49.64     
+=== VLLM c=8 rep=2 (21:28:43) ===
+Total generated tokens:                  3072      
+Output token throughput (tok/s):         181.51    
+Peak output token throughput (tok/s):    184.00    
+Total token throughput (tok/s):          1633.59   
+Median TTFT (ms):                        112.12    
+Mean TPOT (ms):                          43.41     
+P99 ITL (ms):                            47.32     
+=== VLLM c=8 rep=3 (21:29:07) ===
+Total generated tokens:                  3072      
+Output token throughput (tok/s):         181.03    
+Peak output token throughput (tok/s):    184.00    
+Total token throughput (tok/s):          1629.27   
+Median TTFT (ms):                        130.43    
+Mean TPOT (ms):                          43.42     
+P99 ITL (ms):                            48.10     
+=== VLLM DONE ===

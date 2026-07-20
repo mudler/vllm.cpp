@@ -46,8 +46,9 @@ namespace vt::cuda {
 // (cuda_flash_attn_fa2.cu).
 // Declared at vt::cuda scope (external linkage) — the definition lives in a
 // separate TU. Torch-free drop-in for the full-attn causal + paged-KV + GQA +
-// head_dim-256 + bf16 prefill path (the exact FA-2 flash_fwd_splitkv kernel vLLM
-// runs on GB10). Runtime toggle VT_FA2_PREFILL (see Fa2PrefillEnabled()).
+// head_dim {256,128} + bf16 prefill path (the exact FA-2 flash_fwd_splitkv kernel
+// vLLM runs on GB10). Runtime toggles VT_FA2_PREFILL (d256) +
+// VT_FA2_PREFILL_QWEN3 (d128 Qwen3-dense, see Fa2PrefillQwen3Enabled()).
 void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
                           const Tensor& k_cache, const Tensor& v_cache,
                           const Tensor& block_table, const Tensor& seq_lens,
@@ -2452,6 +2453,18 @@ bool Fa2PrefillEnabled() {
   return e == nullptr || e[0] != '0';
 }
 
+// Qwen3-dense (head_dim 128) VARLEN prefill: the exact flash_attn_varlen_func
+// FA2 reduction vLLM runs for Qwen3 prefill (same FA2 family / same vendored
+// split-KV kernel as the d128 decode, num_splits=1 Split=false). Distinct toggle
+// from the d256 VT_FA2_PREFILL — this admits ONLY d128 so it can NEVER touch the
+// d256 gate models. DEFAULT ON (dominant Qwen3-dense TTFT lever; the d128 scalar
+// fallback was ~5.9x vLLM's TTFT). =0 restores the scalar CUDA-core prefill for a
+// same-binary A/B. Read fresh each call (host path, once per full-attn layer/step).
+bool Fa2PrefillQwen3Enabled() {
+  const char* e = std::getenv("VT_FA2_PREFILL_QWEN3");
+  return e == nullptr || e[0] != '0';
+}
+
 // vLLM v0.25's pure-decode group swap + split-KV route. Read fresh so one
 // process can run the exact same-binary fallback arm. Governs the 27B ratio-6
 // (Hq/Hkv=24/4) arm; the 35B ratio-8 arm has its own toggle below.
@@ -2473,14 +2486,17 @@ bool Fa2Decode35BEnabled() {
 }
 
 // Qwen3-dense (head_dim 128) VARLEN decode: the exact non-swap
-// flash_attn_varlen_func reduction order vLLM runs for decode. Distinct from the
-// d256 group-swap arms (VT_FA2_DECODE / VT_FA2_DECODE_35B) — this NEVER touches
-// the d256 codepaths. OPT-IN (default OFF) until the strict decode bit-match is
-// confirmed on dgx vs the vLLM 0.25.0 oracle; flipped to default-ON once 16/16
-// and regression-safe (see .agents/specs/qwen3-decode-strict-bitmatch.md).
+// flash_attn_varlen_func reduction order vLLM runs for decode (bit-matches vLLM's
+// decode attention OUTPUT, teacher-forced gap 0.0000). Distinct from the d256
+// group-swap arms (VT_FA2_DECODE / VT_FA2_DECODE_35B) — this NEVER touches the
+// d256 codepaths. DEFAULT ON (Qwen3-dense decode lever: 2.15x c1 / 1.69x c8 vs
+// the scalar fallback; holds the near-tie-robust gate 16/16 on both sizes — the
+// SHIPPED gate, strict-16/16 is bf16-tie-bounded and NOT the closure). =0
+// restores the scalar CUDA-core decode for a same-binary A/B. See
+// .agents/specs/qwen3-decode-strict-bitmatch.md.
 bool Fa2DecodeQwen3Enabled() {
   const char* e = std::getenv("VT_FA2_DECODE_QWEN3");
-  return e != nullptr && e[0] != '0';
+  return e == nullptr || e[0] != '0';
 }
 #endif  // VLLM_CPP_FLASH_ATTN
 
@@ -2529,7 +2545,14 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // with cast kernels and measurably erased the win (parity-ledger 2026-07-06
   // FA-2 split-KV row); the production 27B preamble now emits bf16 q and the
   // sigmoid gate consumes bf16 attention out, so no casts exist on this path.
-  const bool fa2_prefill = is_prefill && d == 256 && Fa2PrefillEnabled() &&
+  // d256: the two gate models (VT_FA2_PREFILL). d128: Qwen3-dense, the dominant
+  // TTFT lever — vLLM runs Qwen3 prefill on the same flash_attn_varlen_func FA2
+  // family (VT_FA2_PREFILL_QWEN3). The d128 arm is scoped to head_dim 128 (only
+  // Qwen3-dense; the gate models are d256) so it can NEVER touch the d256 arm.
+  const bool fa2_prefill_d256 = d == 256 && Fa2PrefillEnabled();
+  const bool fa2_prefill_qwen3 = d == 128 && num_kv_heads > 0 && hq % num_kv_heads == 0 &&
+                                 (!args.window_size.has_value()) && Fa2PrefillQwen3Enabled();
+  const bool fa2_prefill = is_prefill && (fa2_prefill_d256 || fa2_prefill_qwen3) &&
                            std::is_same<TQ, __nv_bfloat16>::value &&
                            std::is_same<TKV, __nv_bfloat16>::value &&
                            out.dtype == DType::kBF16;

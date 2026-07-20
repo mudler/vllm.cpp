@@ -141,6 +141,145 @@ TEST_CASE("fused_chain kFusedAddRmsNorm: Tier-0 == Tier-1 == RmsNorm(residual), 
   }
 }
 
+namespace {
+
+// --- kFusedAddRmsNormStd (ADDITIVE-MODEL W3): the gemma=false sibling. Same
+// three-way bit-identity as above but the golden RmsNorm is STANDARD (weight
+// `w`, not `1+w`) — the Qwen3 dense input/post/final norm.
+void RunCpuCaseStd(int64_t t, int64_t h, DType xdt, DType outdt, DType resdt, uint32_t seed) {
+  const auto xf = RandF32(static_cast<size_t>(t * h), seed);
+  const auto wf = RandF32(static_cast<size_t>(h), seed + 1);
+  const auto rf = RandF32(static_cast<size_t>(t * h), seed + 2);
+  const auto xb = Pack(xf, xdt);
+  const auto wb = Pack(wf, xdt);
+  const auto rb = Pack(rf, resdt);
+  const float eps = 1e-6f;
+  const size_t obytes = static_cast<size_t>(t * h) * vt::SizeOf(outdt);
+  const size_t rbytes = rb.size();
+
+  Tensor tx = MakeTensor(const_cast<uint8_t*>(xb.data()), xdt, Cpu(), {t, h});
+  Tensor tw = MakeTensor(const_cast<uint8_t*>(wb.data()), xdt, Cpu(), {h});
+  Queue q{Cpu(), nullptr};
+
+  // Golden: standard (non-gemma) add+RMSNorm.
+  std::vector<uint8_t> out_g(obytes), res_g = rb;
+  Tensor tog = MakeTensor(out_g.data(), outdt, Cpu(), {t, h});
+  Tensor trg = MakeTensor(res_g.data(), resdt, Cpu(), {t, h});
+  vt::RmsNorm(q, tog, tx, tw, RmsNormArgs{eps, /*gemma=*/false}, &trg);
+
+  SetTier(0);
+  std::vector<uint8_t> out_0(obytes), res_0 = rb;
+  Tensor to0 = MakeTensor(out_0.data(), outdt, Cpu(), {t, h});
+  Tensor tr0 = MakeTensor(res_0.data(), resdt, Cpu(), {t, h});
+  vt::FusedChain(q, to0, tx, tw, &tr0, vt::kFusedAddRmsNormStd, eps);
+
+  SetTier(1);
+  std::vector<uint8_t> out_1(obytes), res_1 = rb;
+  Tensor to1 = MakeTensor(out_1.data(), outdt, Cpu(), {t, h});
+  Tensor tr1 = MakeTensor(res_1.data(), resdt, Cpu(), {t, h});
+  vt::FusedChain(q, to1, tx, tw, &tr1, vt::kFusedAddRmsNormStd, eps);
+  SetTier(0);
+
+  CHECK(std::memcmp(out_0.data(), out_g.data(), obytes) == 0);
+  CHECK(std::memcmp(out_1.data(), out_g.data(), obytes) == 0);
+  CHECK(std::memcmp(res_0.data(), res_g.data(), rbytes) == 0);
+  CHECK(std::memcmp(res_1.data(), res_g.data(), rbytes) == 0);
+}
+
+}  // namespace
+
+TEST_CASE("fused_chain kFusedAddRmsNormStd: Tier-0 == Tier-1 == RmsNorm(std,residual), bit-identical") {
+  // 1024 = the Qwen3-0.6B hidden_size the W3 adoption site (input/post/final
+  // norm) actually hits — the vt::FusedChain(kFusedAddRmsNormStd) seam runs at
+  // token-exact.
+  const int64_t sizes[] = {1, 7, 8, 127, 128, 129, 512, 1024};
+  uint32_t seed = 120;
+  for (int64_t h : sizes) {
+    CAPTURE(h);
+    RunCpuCaseStd(3, h, DType::kF32, DType::kF32, DType::kF32, seed);
+    seed += 7;
+    RunCpuCaseStd(3, h, DType::kBF16, DType::kBF16, DType::kF32, seed);
+    seed += 7;
+    RunCpuCaseStd(3, h, DType::kBF16, DType::kBF16, DType::kBF16, seed);
+    seed += 7;
+  }
+}
+
+namespace {
+
+// kAttnQkNormRope composite == standalone RmsNorm(q)+RmsNorm(k)+RopeFromCache,
+// byte-exact. The non-gated per-head preamble the Qwen3 dense attention uses
+// (qwen3.py::Qwen3Attention.forward). The two q/k norms run IN PLACE over the
+// 2-D [T*H,Dh] view; kRope rotates the same buffers viewed 3-D [T,H,Dh].
+void RunCpuAttnQkNormRope(int64_t t, int64_t hq, int64_t hk, int64_t dh, uint32_t seed) {
+  const int rot = static_cast<int>(dh);
+  const float eps = 1e-6f;
+  const auto qf = RandF32(static_cast<size_t>(t * hq * dh), seed);
+  const auto kf = RandF32(static_cast<size_t>(t * hk * dh), seed + 1);
+  const auto qnf = RandF32(static_cast<size_t>(dh), seed + 2);
+  const auto knf = RandF32(static_cast<size_t>(dh), seed + 3);
+  std::vector<int32_t> pos(static_cast<size_t>(t));
+  for (int64_t i = 0; i < t; ++i) pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  const vt::RopeArgs rope{1000000.0f, rot, /*is_neox_style=*/true};
+
+  Queue q{Cpu(), nullptr};
+  Tensor tpos = MakeTensor(pos.data(), DType::kI32, Cpu(), {t});
+  Tensor tqn = MakeTensor(const_cast<float*>(qnf.data()), DType::kF32, Cpu(), {dh});
+  Tensor tkn = MakeTensor(const_cast<float*>(knf.data()), DType::kF32, Cpu(), {dh});
+  std::vector<float> cs(static_cast<size_t>(t) * rot);
+  Tensor tcs = MakeTensor(cs.data(), DType::kF32, Cpu(), {t, rot});
+  vt::RopeCosSinCache(q, tcs, tpos, rope);
+
+  // Golden: standalone in-place norms + RopeFromCache.
+  std::vector<float> qg = qf, kg = kf;
+  Tensor qg2 = MakeTensor(qg.data(), DType::kF32, Cpu(), {t * hq, dh});
+  Tensor kg2 = MakeTensor(kg.data(), DType::kF32, Cpu(), {t * hk, dh});
+  vt::RmsNorm(q, qg2, qg2, tqn, RmsNormArgs{eps, false});
+  vt::RmsNorm(q, kg2, kg2, tkn, RmsNormArgs{eps, false});
+  Tensor qg3 = MakeTensor(qg.data(), DType::kF32, Cpu(), {t, hq, dh});
+  Tensor kg3 = MakeTensor(kg.data(), DType::kF32, Cpu(), {t, hk, dh});
+  vt::RopeFromCache(q, qg3, &kg3, tpos, tcs, rope);
+
+  // Composite via the declared recipe.
+  std::vector<float> qc = qf, kc = kf;
+  Tensor qc2 = MakeTensor(qc.data(), DType::kF32, Cpu(), {t * hq, dh});
+  Tensor kc2 = MakeTensor(kc.data(), DType::kF32, Cpu(), {t * hk, dh});
+  Tensor qc3 = MakeTensor(qc.data(), DType::kF32, Cpu(), {t, hq, dh});
+  Tensor kc3 = MakeTensor(kc.data(), DType::kF32, Cpu(), {t, hk, dh});
+  vt::FusedBinding b;
+  b.op[0] = &qc2;
+  b.op[1] = &tqn;
+  b.op[2] = &kc2;
+  b.op[3] = &tkn;
+  b.op[4] = &qc3;
+  b.op[5] = &kc3;
+  b.op[6] = &tcs;
+  b.op[7] = &tpos;
+  b.n = 8;
+  vt::FusedParams p;
+  p.eps = eps;
+  p.rope = rope;
+  SetTier(0);
+  vt::FusedChain(q, vt::kAttnQkNormRope, b, p);
+
+  const size_t qb = qc.size() * sizeof(float), kb = kc.size() * sizeof(float);
+  CHECK(std::memcmp(qc.data(), qg.data(), qb) == 0);
+  CHECK(std::memcmp(kc.data(), kg.data(), kb) == 0);
+}
+
+}  // namespace
+
+TEST_CASE("fused_chain kAttnQkNormRope composite == RmsNorm(q)+RmsNorm(k)+RopeFromCache (CPU, byte-exact)") {
+  // Qwen3-0.6B attention shape: 16 q / 8 kv heads, head_dim 128.
+  RunCpuAttnQkNormRope(/*t=*/5, /*hq=*/16, /*hk=*/8, /*dh=*/128, 300);
+  RunCpuAttnQkNormRope(/*t=*/1, /*hq=*/16, /*hk=*/8, /*dh=*/128, 311);
+  RunCpuAttnQkNormRope(/*t=*/3, /*hq=*/4, /*hk=*/2, /*dh=*/64, 322);
+}
+
+namespace {
+
+}  // namespace
+
 TEST_CASE("fused_chain validates operands at the chokepoint") {
   Queue q{Cpu(), nullptr};
   std::vector<float> x(4, 1.0f), w(2, 1.0f), out(4, 0.0f);

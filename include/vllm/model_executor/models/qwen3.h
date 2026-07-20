@@ -18,9 +18,12 @@
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/model_executor/models/qwen3_5.h"          // PagedKvCache, ForwardLogits
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/v1/attention/backend.h"  // CommonAttentionMetadata
 #include "vllm/v1/kv_cache_interface.h"
+#include "vt/device.h"
 
 namespace vllm {
 
@@ -89,6 +92,52 @@ struct Qwen3DenseWeights {
 // only; no vision tower (Qwen3-0.6B is text-only).
 Qwen3DenseWeights LoadQwen3ForCausalLMWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+
+// The DENSE Qwen3 (`Qwen3ForCausalLM`) forward — the additive-model W3 capstone.
+// A pure standard-dense transformer built by COMPOSING the public vt:: ops + the
+// fusion catalog (kFusedAddRmsNormStd / kAttnQkNormRope, recipes.h), with NO GDN,
+// NO MoE and NO attention gate. Structurally the Qwen3.6-dense full-attention
+// path minus the hybrid extras (mirrors qwen3_5.cpp's DenseForwardLayers /
+// FullAttnBlockPaged, stripped to one full-attention KV group, standard
+// (non-gemma) RMSNorm, per-head q/k RMSNorm before RoPE, and a tied lm_head).
+//
+// Per decoder layer (qwen3.py::Qwen3DecoderLayer @ e24d1b24):
+//   input_layernorm (std add+RMSNorm) -> qkv_proj (BF16 MatmulBT) -> split q/k/v
+//   -> per-head q_norm/k_norm (RMSNorm(head_dim), non-gemma) BEFORE RoPE
+//   -> RoPE (NeoX, theta 1e6) -> FA2 causal paged attention -> o_proj
+//   -> post_attention_layernorm (std add+RMSNorm) -> gate_up_proj -> SiluAndMul
+//   -> down_proj. Then final_norm (std RMSNorm) -> lm_head (TIED to embed_tokens).
+//
+// The residual stream is kept in the model dtype (bf16, matching vLLM's
+// fused_add_rms_norm residual); q/k-norm + RoPE run in f32 (the qwen3_5 fallback
+// numeric anchor); the paged KV cache is written bf16; the query stays f32 into
+// vt::PagedAttention. Returns [n_out, vocab] f32 logits (n_out == num_reqs when
+// logits_indices gather-before-lm_head, else num_actual_tokens).
+class Qwen3DenseModel {
+ public:
+  // Batched PAGED dense forward. token_ids/positions are the flattened
+  // length-num_actual_tokens step inputs; attn_meta the full-attention KV group's
+  // CommonAttentionMetadata; attn_kv one PagedKvCache per layer (all layers are
+  // full-attention). `logits_indices` (optional): the per-request last-token row
+  // indices — when a proper subset of the T rows, the final hidden rows are
+  // gathered on-device BEFORE lm_head so the return is [num_reqs, vocab].
+  static std::vector<float> Forward(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
+      const HfConfig& config, vt::Queue& queue,
+      const std::vector<int32_t>& logits_indices = {});
+
+  // DEVICE-resident variant (sampler-on-device hot path): same contract as
+  // Forward but returns the lm_head output as a device buffer with no full-logits
+  // D2H (ForwardLogits::device_*).
+  static ForwardLogits ForwardDevice(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const std::vector<PagedKvCache>& attn_kv, const Qwen3DenseWeights& weights,
+      const HfConfig& config, vt::Queue& queue,
+      const std::vector<int32_t>& logits_indices = {});
+};
 
 // Per-family config hook (mirrors ParseQwen3_5Config). LoadHfConfig already
 // materializes the consumed Qwen3 fields (num_key_value_heads, head_dim,

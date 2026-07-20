@@ -20,7 +20,8 @@
 #include <vector>
 
 #include "vllm/model_executor/models/qwen3.h"
-#include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits (shared carrier)
+#include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits (shared carrier)
+#include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
 
@@ -77,12 +78,21 @@ void PrepareQwen3ForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardQwen3ForCausalLM(LoadedModel& model,
                                       const ModelForwardInput& input) {
-  (void)model;
-  (void)input;
-  // W3 lands the dense decode graph (vt:: ops + the 2 new catalog recipes).
-  throw std::runtime_error(
-      "Qwen3ForCausalLM forward is not implemented yet "
-      "(additive-model bring-up W3)");
+  const auto& qwen = static_cast<Qwen3DenseLoadedModel&>(model);
+  const Qwen3DenseWeights& weights = qwen.weights();
+  // DEVICE-resident logits (sampler-on-device) on the gather path; HOST logits
+  // on the opt-out. Qwen3 dense is pure full-attention (input.gdn_* unused).
+  if (input.gather_logits) {
+    return Qwen3DenseModel::ForwardDevice(input.token_ids, input.positions,
+                                          input.attn_meta, input.attn_kv, weights,
+                                          input.config, input.queue,
+                                          input.logits_indices);
+  }
+  return HostLogits(
+      Qwen3DenseModel::Forward(input.token_ids, input.positions, input.attn_meta,
+                               input.attn_kv, weights, input.config, input.queue,
+                               input.logits_indices),
+      input.config.vocab_size);
 }
 
 const ModelFactory kQwen3DenseFactory{

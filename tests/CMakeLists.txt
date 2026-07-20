@@ -40,6 +40,8 @@ vllm_cpp_add_test(test_decode_graph_sizes vllm/models/test_decode_graph_sizes.cp
 vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forward.cpp)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
+vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
+target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forward.cpp)
 target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)
@@ -316,6 +318,15 @@ vllm_cpp_add_test(test_qwen36_paged_engine parity/test_qwen36_paged_engine.cpp)
 target_compile_definitions(test_qwen36_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen36_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# ADDITIVE-MODEL W4 — the SACRED token-exact gate: Qwen3-0.6B (dense) greedy
+# decode vs the vLLM 0.25.0 oracle, through the full paged engine
+# (checkpoint-gated, dgx-only; skips on CPU/CI when the snapshot is absent).
+vllm_cpp_add_test(test_qwen3_paged_engine parity/test_qwen3_paged_engine.cpp)
+target_compile_definitions(test_qwen3_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen3_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # GGUF 35B greedy acceptance gate (checkpoint-gated, dgx-only; skips when the

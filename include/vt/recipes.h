@@ -264,4 +264,89 @@ constexpr FusedRecipe kAttnQkNormRopeGate = {
     /*name=*/"attn_qk_norm_rope_gate",
 };
 
+// kFusedAddRmsNormStd — residual-add + STANDARD (non-gemma) RMSNorm, the
+// fused_add_rms_norm chain for a plain (weight `w`, NOT `1+w`) RMSNorm. The
+// gemma=false sibling of kFusedAddRmsNorm above: the ONLY difference is the
+// rms-norm step's `gemma` flag (fused_recipe.h:127). This is the ADDITIVE-MODEL
+// bring-up W3 one-declaration pattern — Qwen3 dense (`Qwen3ForCausalLM`) uses
+// STANDARD RMSNorm at its input/post/final norms (HF `Qwen3RMSNorm.forward =
+// weight * hidden`, i.e. weight `w` not `1+w`), unlike the Qwen3.6/Gemma
+// (1+w) family.
+//
+// Transcribes the SAME vLLM add+RMSNorm fusion pattern
+// (vllm/model_executor/layers/layernorm.py::RMSNorm.forward_* with `residual`,
+// gemma=false variant used by vllm/model_executor/models/qwen3.py's plain
+// RMSNorm decoder norms): residual = x + residual; out = rms_norm(residual)*w.
+//
+// Golden (byte-exact): vt::RmsNorm(out, x, weight, {eps, gemma=false}, residual)
+// — the standalone add+RMSNorm call at the Qwen3 dense norm sites (qwen3.cpp).
+//
+// operands: 0=x[T,H], 1=weight[H], 2=residual[T,H] (in/out), 3=out[T,H]
+// step0 kAdd  out=2(residual) in=[0(x),2(residual)]     residual = x + residual
+// step1 kRmsNorm out=3(out) in=[2(residual),1(weight)]  out = rms_norm(residual)*w
+constexpr FusedRecipe kFusedAddRmsNormStd = {
+    {
+        {FOp::kAdd, /*out=*/2, /*in=*/{0, 2}, /*nin=*/2, kNoOperand, FReduce::kNone, false, false},
+        {FOp::kRmsNorm, /*out=*/3, /*in=*/{2, 1}, /*nin=*/2, kNoOperand, FReduce::kMeanSquare,
+         /*gemma=*/false, false},
+    },
+    {
+        {FKind::kRow, "x"},
+        {FKind::kWeight, "weight"},
+        {FKind::kResidual, "residual"},
+        {FKind::kRow, "out"},
+    },
+    /*n=*/2,
+    /*n_operands=*/4,
+    /*name=*/"fused_add_rms_norm_std",
+};
+
+// kAttnQkNormRope — per-head STANDARD (non-gemma) RMSNorm(q) + RMSNorm(k) +
+// partial NeoX RoPE (from a precomputed cos/sin cache), the fused full-attention
+// preamble for an arch with NO attention output gate. The non-gated sibling of
+// kAttnQkNormRopeGate above (Qwen3 dense has no attention gate, unlike the
+// Qwen3.6 gated full-attention). Transcribes the SAME vLLM QKNormRoPE pattern
+// (vllm/model_executor/models/qwen3.py::Qwen3Attention.forward @ e24d1b24:
+// `q = q_norm(q); k = k_norm(k); q, k = rotary_emb(positions, q, k)`), with the
+// standard (weight `w`) RMSNorm the plain Qwen3RMSNorm applies.
+//
+// Realized as a Tier-0 COMPOSITE of three EXISTING standalone vt:: ops (no new
+// primitive): the two q/k RMSNorms run IN PLACE over their [T*H,Dh] 2-D row view
+// (RmsNorm reads the whole row before storing → aliasing out==x is safe), then
+// kRope rotates the SAME buffers viewed as [T,H,Dh] 3-D (RopeFromCache). The
+// 2-D norm view and the 3-D rope view are DISTINCT operand slots that alias the
+// same device buffer, so the whole preamble fits kMaxFusedOperands=8:
+//   0=q[T*Hq,Dh] (normed in place), 1=q_norm[Dh], 2=k[T*Hkv,Dh] (normed in place),
+//   3=k_norm[Dh], 4=q3[T,Hq,Dh] (rope view of buf 0), 5=k3[T,Hkv,Dh] (rope view
+//   of buf 2), 6=cos_sin[T,rot], 7=positions[T].
+//
+// Golden (byte-exact): vt::RmsNorm(q, q, q_norm, {eps,false}) then
+// vt::RmsNorm(k, k, k_norm, {eps,false}) then vt::RopeFromCache(q3, &k3,
+// positions, cos_sin, rope) — exactly the standalone sequence the composite
+// dispatches to. Tier: composite-only (per-head 3-D rope operands are outside
+// the generic 2-D Tier-1 interpreter). fast_op = kNoFastOp.
+constexpr FusedRecipe kAttnQkNormRope = {
+    {
+        {FOp::kRmsNorm, /*out=*/0, /*in=*/{0, 1}, /*nin=*/2, kNoOperand, FReduce::kMeanSquare,
+         /*gemma=*/false, false},
+        {FOp::kRmsNorm, /*out=*/2, /*in=*/{2, 3}, /*nin=*/2, kNoOperand, FReduce::kMeanSquare,
+         /*gemma=*/false, false},
+        {FOp::kRope, /*out=*/4, /*in=*/{4, 6, 7}, /*nin=*/3, /*out2=*/5, FReduce::kNone, false,
+         false},
+    },
+    {
+        {FKind::kRow, "q"},
+        {FKind::kWeight, "q_norm"},
+        {FKind::kRow, "k"},
+        {FKind::kWeight, "k_norm"},
+        {FKind::kAux, "q3"},
+        {FKind::kAux, "k3"},
+        {FKind::kAux, "cos_sin"},
+        {FKind::kAux, "positions"},
+    },
+    /*n=*/3,
+    /*n_operands=*/8,
+    /*name=*/"attn_qk_norm_rope",
+};
+
 }  // namespace vt

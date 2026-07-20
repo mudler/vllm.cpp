@@ -60,6 +60,15 @@ void LaunchDecodeFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
                          const PagedAttentionArgs& args, int64_t hq, int64_t d,
                          int64_t num_reqs, int64_t num_kv_heads,
                          int64_t block_size);
+// VARLEN d128 decode — the exact non-swap flash_attn_varlen_func reduction vLLM
+// runs for Qwen3-dense DECODE (bf16 paged KV, head_dim 128). Toggle
+// VT_FA2_DECODE_QWEN3 (see Fa2DecodeQwen3Enabled()).
+void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
+                               const Tensor& k_cache, const Tensor& v_cache,
+                               const Tensor& block_table, const Tensor& seq_lens,
+                               const Tensor& query_start_loc, const PagedAttentionArgs& args,
+                               int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
+                               int64_t block_size);
 #endif  // VLLM_CPP_FLASH_ATTN
 
 namespace {
@@ -2462,6 +2471,17 @@ bool Fa2Decode35BEnabled() {
   const char* e = std::getenv("VT_FA2_DECODE_35B");
   return e == nullptr || e[0] != '0';
 }
+
+// Qwen3-dense (head_dim 128) VARLEN decode: the exact non-swap
+// flash_attn_varlen_func reduction order vLLM runs for decode. Distinct from the
+// d256 group-swap arms (VT_FA2_DECODE / VT_FA2_DECODE_35B) — this NEVER touches
+// the d256 codepaths. OPT-IN (default OFF) until the strict decode bit-match is
+// confirmed on dgx vs the vLLM 0.25.0 oracle; flipped to default-ON once 16/16
+// and regression-safe (see .agents/specs/qwen3-decode-strict-bitmatch.md).
+bool Fa2DecodeQwen3Enabled() {
+  const char* e = std::getenv("VT_FA2_DECODE_QWEN3");
+  return e != nullptr && e[0] != '0';
+}
 #endif  // VLLM_CPP_FLASH_ATTN
 
 // TQ = query dtype, TKV = KV-cache dtype (decoupled: Phase-1 bf16 KV cache keeps
@@ -2532,11 +2552,26 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
                           std::is_same<TQ, __nv_bfloat16>::value &&
                           std::is_same<TKV, __nv_bfloat16>::value &&
                           out.dtype == DType::kBF16;
+  // Qwen3-dense (head_dim 128) VARLEN decode: the exact non-swap
+  // flash_attn_varlen_func reduction vLLM runs for decode. Scoped to bf16
+  // head_dim-128 paged causal pure-decode (only Qwen3-dense hits this; the two
+  // gate models are d256) so it can never engage the d256 arms. OPT-IN.
+  const bool fa2_decode_qwen3 = !is_prefill && num_tokens == num_reqs && d == 128 &&
+                                block_size % 16 == 0 && args.causal &&
+                                !args.window_size.has_value() &&
+                                block_table.stride[1] == 1 &&
+                                num_kv_heads > 0 && hq % num_kv_heads == 0 &&
+                                Fa2DecodeQwen3Enabled() &&
+                                std::is_same<TQ, __nv_bfloat16>::value &&
+                                std::is_same<TKV, __nv_bfloat16>::value &&
+                                out.dtype == DType::kBF16;
 #else
   const bool fa2_prefill = false;
   const bool fa2_decode = false;
+  const bool fa2_decode_qwen3 = false;
   (void)fa2_prefill;
   (void)fa2_decode;
+  (void)fa2_decode_qwen3;
 #endif
   switch (out.dtype) {
     case DType::kF32:
@@ -2575,6 +2610,10 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
       } else if (fa2_decode) {
         LaunchDecodeFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
                             args, hq, d, num_reqs, num_kv_heads, block_size);
+      } else if (fa2_decode_qwen3) {
+        LaunchDecodeVarlenFA2Bf16(s, out, query, k_cache, v_cache, block_table, seq_lens,
+                                  query_start_loc, args, hq, d, num_reqs, num_kv_heads,
+                                  block_size);
       } else  // NOLINT(readability/braces) — chains into the flash2vec ladder below
 #endif
       if (flash2vec) {

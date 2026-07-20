@@ -176,6 +176,9 @@ struct Fa2StreamScratch {
   std::mutex submit_mu;
   ScratchBuffer prefill_lse;
   std::unordered_map<DecodeShapeKey, DecodeScratch, DecodeShapeKeyHash> decode;
+  // VARLEN d128 decode (Qwen3-dense) scratch — separate map so it can never
+  // alias the d256 group-swap decode arms above (byte-identical d256 required).
+  std::unordered_map<DecodeShapeKey, DecodeScratch, DecodeShapeKeyHash> varlen_decode;
   int num_sms = 0;
 };
 
@@ -587,6 +590,206 @@ void LaunchDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
   Check(cudaGetLastError(), "decode splitkv dispatch launch");
 }
 
+// Launch the pinned FA2 VARLEN decode — the EXACT reduction vLLM's
+// flash_attn_varlen_func runs for a paged bf16 KV cache at head_dim 128
+// (Qwen3-dense). Unlike LaunchDecodeFA2Bf16 (the d256 group-swap
+// seqlenq_ngroups_swapped route), this presents the decode batch as PLAIN
+// varlen: one query row per request (cu_seqlens_q = query_start_loc), full
+// query heads (h = hq, h_h_k_ratio = groups), per-request K length via
+// seqused_k, causal = true, NO group swap. Because a block_table is present,
+// upstream forces the split-KV kernel even at num_splits==1, so we dispatch
+// run_mha_fwd_splitkv_dispatch<..., 128, causal> exactly like the varlen
+// prefill launcher (Split=false when num_splits==1). num_splits is the exact
+// port of upstream num_splits_heuristic (=1 for the short gate contexts), and
+// for num_splits>1 the split combine addresses O via batch_idx*o_batch_stride;
+// with seqlen_q==1 per request that equals o_row_stride, so we set
+// o_batch_stride = o_row_stride and the combine writes the packed [total_q,Hq,D]
+// output correctly (this is why the packed-prefill combine restriction —
+// seqlen_q>1, irregular row spacing — does NOT apply to decode).
+// Ported from vllm-project/flash-attention @ 2c839c33 (mha_varlen_fwd paged
+// path + set_params_splitkv) and vLLM v0.25.0 flash_attn.py flash_attn_varlen_func.
+void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
+                               const Tensor& k_cache, const Tensor& v_cache,
+                               const Tensor& block_table, const Tensor& seq_lens,
+                               const Tensor& query_start_loc, const PagedAttentionArgs& args,
+                               int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
+                               int64_t block_size) {
+  const int64_t total_q = query.shape[0];
+  if (total_q == 0 || num_reqs == 0 || hq == 0 || d == 0) return;
+  if (query.dtype != DType::kBF16 || out.dtype != DType::kBF16 ||
+      k_cache.dtype != DType::kBF16 || v_cache.dtype != DType::kBF16) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 varlen decode: bf16 q/kv/out required (dispatch gate must enforce)");
+  }
+  if (d != 128) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 varlen decode: head_dim 128 only (dispatch gate must enforce)");
+  }
+
+  // Host UPPER BOUNDS for grid sizing + rounded dims only; per-request geometry
+  // reads device cu_seqlens_q/seqused_k via BlockInfo (same as the prefill
+  // launcher). Production callers hand query_start_loc_host + max_seq_len;
+  // op-test callers without them fall back to a small D2H + sync.
+  int max_seqlen_q = 0;
+  int max_seqlen_k = args.max_seq_len;
+  if (args.query_start_loc_host != nullptr) {
+    for (int64_t i = 0; i < num_reqs; ++i) {
+      max_seqlen_q = std::max(
+          max_seqlen_q, args.query_start_loc_host[i + 1] - args.query_start_loc_host[i]);
+    }
+  }
+  if (max_seqlen_q <= 0 || max_seqlen_k <= 0) {
+    std::vector<int32_t> qsl(static_cast<size_t>(num_reqs) + 1);
+    std::vector<int32_t> sk(static_cast<size_t>(num_reqs));
+    Check(cudaMemcpyAsync(qsl.data(), query_start_loc.Ptr<int32_t>(),
+                          sizeof(int32_t) * (num_reqs + 1), cudaMemcpyDeviceToHost, s),
+          "varlen decode query_start_loc D2H");
+    Check(cudaMemcpyAsync(sk.data(), seq_lens.Ptr<int32_t>(), sizeof(int32_t) * num_reqs,
+                          cudaMemcpyDeviceToHost, s),
+          "varlen decode seq_lens D2H");
+    Check(cudaStreamSynchronize(s), "varlen decode seqlen sync");
+    max_seqlen_q = 0;
+    max_seqlen_k = 0;
+    for (int64_t i = 0; i < num_reqs; ++i) {
+      max_seqlen_q = std::max(max_seqlen_q, qsl[i + 1] - qsl[i]);
+      max_seqlen_k = std::max(max_seqlen_k, sk[i]);
+    }
+  }
+  if (max_seqlen_q == 0 || max_seqlen_k == 0) return;
+
+  const int batch = static_cast<int>(num_reqs);
+  const int heads = static_cast<int>(hq);
+  const int kv_heads = static_cast<int>(num_kv_heads);
+  const int head_dim = static_cast<int>(d);
+  const int max_blocks = static_cast<int>(block_table.shape[1]);
+
+  const auto stream_scratch = Fa2ScratchFor(query.device.index, s);
+  std::lock_guard<std::mutex> submit_lock(stream_scratch->submit_mu);
+
+  // Exact port of set_params_splitkv for head_dim 128: block-N is 128, block-M
+  // is 64, and the heuristic receives 2*numSM for the 128-thread CTA occupancy
+  // model. For the gate contexts (<=2 key blocks, batch 1) this yields 1.
+  constexpr int kBlockN = 128;  // Headdim <= 128
+  constexpr int kBlockM = 64;
+  const int num_n_blocks = (max_seqlen_k + kBlockN - 1) / kBlockN;
+  const int num_m_blocks = (max_seqlen_q + kBlockM - 1) / kBlockM;
+  const int num_splits = NumSplitsHeuristic(
+      batch * heads * num_m_blocks, stream_scratch->num_sms * 2, num_n_blocks, 128);
+
+  // softmax_lse is [nheads, total_q] f32 (unpadded/varlen LSE, written+consumed
+  // by the combine). oaccum/lseaccum only when the KV dimension is split.
+  const DecodeShapeKey key{batch,     heads,     kv_heads,  0,
+                           head_dim,  max_blocks, static_cast<int>(block_size), num_splits};
+  auto [it, inserted] = stream_scratch->varlen_decode.try_emplace(key);
+  DecodeScratch& scratch = it->second;
+  if (inserted) {
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    Check(cudaStreamIsCapturing(s, &capture_status), "varlen decode capture-status query");
+    if (capture_status != cudaStreamCaptureStatusNone) {
+      stream_scratch->varlen_decode.erase(it);
+      throw std::runtime_error(
+          "cuda flash-attn-2 varlen decode: scratch miss during CUDA graph capture");
+    }
+    const size_t rows = static_cast<size_t>(heads) * static_cast<size_t>(total_q);
+    try {
+      AllocateFixed(scratch.softmax_lse, rows * sizeof(float), s,
+                    "varlen decode softmax_lse alloc");
+      if (num_splits > 1) {
+        const size_t split_rows = static_cast<size_t>(num_splits) * rows;
+        const int head_dim_rounded = RoundMultiple(head_dim, 64);
+        AllocateFixed(scratch.softmax_lse_accum, split_rows * sizeof(float), s,
+                      "varlen decode partial LSE alloc");
+        AllocateFixed(scratch.out_accum,
+                      split_rows * static_cast<size_t>(head_dim_rounded) * sizeof(float), s,
+                      "varlen decode partial output alloc");
+      }
+    } catch (...) {
+      if (scratch.softmax_lse.ptr != nullptr) cudaFreeAsync(scratch.softmax_lse.ptr, s);
+      if (scratch.softmax_lse_accum.ptr != nullptr) cudaFreeAsync(scratch.softmax_lse_accum.ptr, s);
+      if (scratch.out_accum.ptr != nullptr) cudaFreeAsync(scratch.out_accum.ptr, s);
+      stream_scratch->varlen_decode.erase(it);
+      throw;
+    }
+  }
+
+  FLASH_NAMESPACE::Flash_fwd_params p{};  // zero-init nulls knew/rotary/alibi/leftpad
+  p.is_bf16 = true;
+  p.q_ptr = query.data;
+  p.k_ptr = k_cache.data;
+  p.v_ptr = v_cache.data;
+  p.o_ptr = out.data;
+
+  // Varlen q/o: cu_seqlens_q drives the row offset; batch strides are ignored on
+  // the non-split path but MUST equal o_row_stride so the split combine (which
+  // writes O via batch_idx*o_batch_stride, seqlen_q==1) lands each request's row.
+  p.q_batch_stride = query.stride[0];
+  p.q_row_stride = query.stride[0];
+  p.q_head_stride = query.stride[1];
+  p.o_batch_stride = out.stride[0];
+  p.o_row_stride = out.stride[0];
+  p.o_head_stride = out.stride[1];
+  // Paged k/v [num_blocks, block_size, num_kv_heads, d].
+  p.k_batch_stride = k_cache.stride[0];
+  p.k_row_stride = k_cache.stride[1];
+  p.k_head_stride = k_cache.stride[2];
+  p.v_batch_stride = v_cache.stride[0];
+  p.v_row_stride = v_cache.stride[1];
+  p.v_head_stride = v_cache.stride[2];
+
+  p.cu_seqlens_q = query_start_loc.Ptr<int32_t>();  // [0,1,2,...,num_reqs]
+  p.cu_seqlens_k = nullptr;                          // paged: block_table + seqused_k
+  p.seqused_k = seq_lens.Ptr<int32_t>();
+  p.softmax_lse_ptr = scratch.softmax_lse.ptr;
+  p.softmax_lseaccum_ptr = scratch.softmax_lse_accum.ptr;
+  p.oaccum_ptr = scratch.out_accum.ptr;
+
+  p.b = batch;
+  p.h = heads;
+  p.h_k = kv_heads;
+  p.h_h_k_ratio = static_cast<int>(hq / num_kv_heads);
+  p.seqlen_q = max_seqlen_q;  // 1 per decode request
+  p.seqlen_k = max_seqlen_k;
+  p.seqlen_q_rounded = RoundMultiple(max_seqlen_q, 128);
+  p.seqlen_k_rounded = RoundMultiple(max_seqlen_k, 128);
+  p.d = head_dim;
+  p.d_rounded = RoundMultiple(head_dim, 64);
+  p.total_q = static_cast<int>(total_q);
+
+  p.scale_softmax = args.scale;
+  p.scale_softmax_log2 = args.scale * static_cast<float>(M_LOG2E);
+  p.softcap = 0.0F;
+  p.p_dropout = 1.0F;
+  p.p_dropout_in_uint8_t = uint8_t(255);
+  p.rp_dropout = 1.0F;
+  p.scale_softmax_rp_dropout = args.scale;
+  p.philox_args = at::PhiloxCudaState(0, 0);
+
+  // Plain causal decode (NO group-swap normalization): vLLM passes causal=True to
+  // flash_attn_varlen_func; with seqlen_q==1 the single query still sees the full
+  // context, and the causal template selects the exact n_block geometry vLLM runs.
+  p.is_causal = args.causal;
+  p.window_size_left = -1;
+  p.window_size_right = args.causal ? 0 : -1;
+  p.is_seqlens_k_cumulative = true;  // ignored while cu_seqlens_k == nullptr
+  p.is_rotary_interleaved = false;
+  p.rotary_dim = 0;
+
+  p.block_table = block_table.Ptr<int32_t>();
+  p.block_table_batch_stride = block_table.stride[0];
+  p.page_block_size = static_cast<int>(block_size);
+  p.unpadded_lse = true;             // LSE is [nheads, total_q]
+  p.seqlenq_ngroups_swapped = false;  // the whole point: no group swap
+  p.num_splits = num_splits;
+
+  RecordDecodeLaunch(num_splits > 1, inserted);
+  if (args.causal) {
+    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(p, s);
+  } else {
+    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(p, s);
+  }
+  Check(cudaGetLastError(), "varlen decode splitkv dispatch launch");
+}
+
 void ReleaseFa2Scratch(int device, void* stream_handle) {
   const cudaStream_t stream = static_cast<cudaStream_t>(stream_handle);
   std::shared_ptr<Fa2StreamScratch> scratch;
@@ -613,6 +816,12 @@ void ReleaseFa2Scratch(int device, void* stream_handle) {
     release(entry.second.out_accum);
   }
   scratch->decode.clear();
+  for (auto& entry : scratch->varlen_decode) {
+    release(entry.second.softmax_lse);
+    release(entry.second.softmax_lse_accum);
+    release(entry.second.out_accum);
+  }
+  scratch->varlen_decode.clear();
 }
 
 namespace testing {

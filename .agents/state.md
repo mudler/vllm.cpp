@@ -14417,3 +14417,47 @@ under `VT_DUMP_IDS=1`, then `qwen3-neartie-gap.py`; run
   d128 path, re-measure BEFORE tightening the gate; if the exact varlen kernel
   still rounds the ties the other way, the near-tie-robust gate is the correct
   closure.
+
+- **2026-07-20 (later still)** — Qwen3-dense DECODE strict-16/16 razor:
+  **FA2 VARLEN d128 VENDORED + ROUTED + MEASURED — escape hatch CONFIRMED, shipped
+  OPT-IN.** Row `MODEL-TEXT-qwen3-qwen3-for-causal-lm`, `CLAIM-MODEL-QWEN3-DENSE`,
+  worktree `agent-a31b006ff4766f03b`, dgx tree `~/work/vllm-cpp-decode-varlen-a31`.
+  Implemented the remaining-scope FA2 VARLEN d128 decode: NEW d128 bf16 split-KV
+  instantiations `flash_fwd_split_hdim128_bf16_{,causal_}sm80.cu` (mirror the d256
+  pair, CMake `_FA2_KERNEL_SRCS`) + NEW `LaunchDecodeVarlenFA2Bf16`
+  (`src/vt/cuda/cuda_flash_attn_fa2.cu`) = PLAIN varlen decode (cu_seqlens_q =
+  query_start_loc, 1 q-row/req, h=hq, h_h_k_ratio=groups, seqused_k,
+  is_causal=true, **NO group swap**; num_splits = exact `num_splits_heuristic`
+  port; split-combine correct for decode via `o_batch_stride:=o_row_stride` since
+  seqlen_q==1) + routing gate `Fa2DecodeQwen3Enabled`/`fa2_decode_qwen3`
+  (`VT_FA2_DECODE_QWEN3`, **default OFF**, scoped d128-bf16-paged-causal-decode so
+  the d256 27B/35B arms are NEVER touched). KEY: vLLM's paged decode ALWAYS runs
+  the split-KV kernel (the non-split `flash_fwd_kernel` doesn't read `block_table`);
+  paged KV forces the split kernel even at num_splits==1, so this IS the
+  `flash_fwd_splitkv` Split=false kernel `flash_attn_varlen_func` resolves to.
+  **BIT-MATCH vLLM's attention OUTPUT: YES** — teacher-forcing vLLM
+  (`scripts/qwen3-neartie-gap.py`) on OUR new-path sequence, our token IS vLLM's
+  argmax at gap **0.0000 nats** at all-but-the-near-tie positions; real
+  first-divergences are bf16 near-ties only (4B p12 tok11=0.250, p11 tok12=0.062;
+  0.6B p5 tok10=0.125; max any-pos 0.375). **STRICT vs `greedy_ids` (same-binary
+  A/B via bootstrap-dump): fallback (default) 0.6B 12/16 & 4B 10/16; FA2-varlen
+  0.6B 11/16 & 4B 9/16** — 16/16 NOT reached; the exact kernel is ONE WORSE than
+  the fallback (bf16-tie luck: it rounds p0-tok5-type ties toward vLLM's PREFILL
+  argmax, e.g. 0.6B p0 tok5 our=15344=vLLM_argmax gap 0.0000 but vLLM's INCREMENTAL
+  decode chose 9625 — vLLM self-inconsistent, no fixed decode token to match).
+  Escape hatch CONFIRMED: strict-16/16 is bf16-tie-bounded, not closable by the
+  kernel. GATES: dgx `-Werror` **0-warn**; op-parity `test_ops_paged_attn`
+  **23/23 cases, 454433 assertions** (varlen d128 byte-exact vs f32 ref incl.
+  num_splits>1) + NEW `*varlen d128*` cases; **`compute-sanitizer memcheck` 0
+  errors** (test block_table sized to the kBlockN-rounded page count the real KV
+  allocator over-provisions — engine passes block_table at full
+  `max_num_blocks_per_req` width, so the production varlen path is memcheck-safe).
+  **REGRESSION: 27B `test_qwen27_paged_engine` 235/235 + 35B
+  `test_qwen36_paged_engine` 315/315 UNCHANGED** (d256 arms byte-identical, opt-in
+  default OFF); default Qwen3 near-tie gate `test_qwen3_paged_engine` **16/16 both**
+  (0.6B strict 12/16, 4B strict 10/16). **DISPOSITION:** kept as OPT-IN faithful
+  vLLM-exact-decode mirror; default NOT flipped (default-ON regresses strict + flips
+  the committed near-tie anchor → violates the parity-enabler "no regressing
+  default"); engine gate NOT tightened to strict equality; near-tie-robust gate
+  stays the closure. Row stays `ACTIVE` (correctness complete; vLLM-throughput SPEED
+  benchmark is the remaining Qwen3-dense deliverable).

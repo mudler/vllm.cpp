@@ -1200,14 +1200,25 @@ struct Fa2DecodeCase {
 
   Fa2DecodeCase(int64_t query_heads, int64_t kv_heads,
                 std::vector<int32_t> lengths, uint32_t seed,
-                int64_t capacity_blocks = 0)
+                int64_t capacity_blocks = 0, int64_t head_dim = 256)
       : hq(query_heads),
         hk(kv_heads),
         batch(static_cast<int64_t>(lengths.size())),
         seq_lens(std::move(lengths)) {
+    d = head_dim;
+    scale = std::pow(static_cast<float>(head_dim), -0.5F);
     const int32_t max_seq = *std::max_element(seq_lens.begin(), seq_lens.end());
     max_blocks = std::max<int64_t>(capacity_blocks,
                                    (max_seq + block_size - 1) / block_size);
+    // FA-2's split-KV kernel resolves the last (partial) kBlockN tile at
+    // kGmemRowsPerThread granularity, so it can index a block_table column up to
+    // the kBlockN-rounded page count (kBlockN=128 for d128, 64 for d256 => up to
+    // 128/block_size pages). A real KV allocator (vLLM) sizes the block table to
+    // cover that rounding; mirror it here so short sequences don't read a column
+    // past a tightly-sized row (the extra pages are masked out of the softmax).
+    const int64_t pages_per_tile = 128 / block_size;  // >= any kBlockN/page_size
+    if (pages_per_tile > 0)
+      max_blocks = (max_blocks + pages_per_tile - 1) / pages_per_tile * pages_per_tile;
     num_blocks = max_blocks + 17;
     qsl.resize(static_cast<size_t>(batch + 1));
     for (int64_t i = 0; i <= batch; ++i)
@@ -1353,7 +1364,89 @@ Fa2DecodeRunStats RunFa2DecodeCase(Fa2DecodeCase& c, const char* toggle,
   return stats;
 }
 
+// VARLEN d128 decode harness (Qwen3-dense): the exact non-swap
+// flash_attn_varlen_func path (VT_FA2_DECODE_QWEN3). Same host/device fixture,
+// but head_dim 128 and the plain-varlen launcher (cu_seqlens_q = qsl, causal,
+// no group swap). Validated against the same f32 ComposedPagedRef.
+Fa2DecodeRunStats RunFa2VarlenDecodeCase(Fa2DecodeCase& c, const char* toggle,
+                                         bool expect_fa2) {
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard guard(gpu);
+  DeviceTensor query(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d},
+                     c.query_bf16.data());
+  DeviceTensor cache(gpu, guard.q, DType::kBF16,
+                     {static_cast<int64_t>(c.combined_cache.size())},
+                     c.combined_cache.data());
+  Tensor key = c.CacheView(cache, 0);
+  Tensor value = c.CacheView(cache, 1);
+  DeviceTensor block_table(gpu, guard.q, DType::kI32,
+                           {c.batch, c.max_blocks}, c.block_table.data());
+  DeviceTensor seq_lens(gpu, guard.q, DType::kI32, {c.batch}, c.seq_lens.data());
+  DeviceTensor qsl(gpu, guard.q, DType::kI32, {c.batch + 1}, c.qsl.data());
+  DeviceTensor out(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d});
+
+  EnvGuard qwen3_toggle("VT_FA2_DECODE_QWEN3", toggle);
+  vt::cuda::testing::ResetFa2DecodeDebugCounters();
+  PagedAttentionArgs args{c.scale, true};
+  args.query_start_loc_host = c.qsl.data();
+  args.max_seq_len = static_cast<int>(c.max_blocks * c.block_size);
+  vt::PagedAttention(guard.q, out.tensor(), query.tensor(), key, value,
+                     block_table.tensor(), seq_lens.tensor(), qsl.tensor(), args);
+  std::vector<uint16_t> got(c.query_bf16.size(), 0);
+  out.Download(guard.q, got.data());
+
+  const Fa2DecodeRunStats stats{
+      vt::cuda::testing::Fa2DecodeLaunchesForTesting(),
+      vt::cuda::testing::Fa2DecodeSplitLaunchesForTesting(),
+      vt::cuda::testing::Fa2DecodeNoSplitLaunchesForTesting()};
+  vt::cuda::testing::DisableFa2DecodeDebugCounters();
+  CheckBf16AgainstReference(got, c.Reference(c.seq_lens),
+                            expect_fa2 ? "FA2 varlen decode d128" : "paged fallback");
+  CHECK(stats.launches == (expect_fa2 ? 1U : 0U));
+  return stats;
+}
+
 }  // namespace
+
+// Qwen3-dense VARLEN d128 decode parity: matches the f32 composed reference at
+// both gate configs (0.6B Hq/Hkv=16/8, 4B 32/8), across batch sizes and context
+// lengths short (num_splits==1, the strict-gate regime) and long (num_splits>1,
+// exercising the split combine). Opt-in via VT_FA2_DECODE_QWEN3.
+TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode matches composed reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 varlen d128 decode parity (dgx-pending)");
+    return;
+  }
+  for (const auto& ratio : {std::pair<int64_t, int64_t>{16, 8},
+                            std::pair<int64_t, int64_t>{32, 8}}) {
+    for (const int batch : {1, 2, 4, 8}) {
+      for (const int base_len : {5, 21, 1024}) {  // short => num_splits==1; long => split
+        CAPTURE(ratio.first);
+        CAPTURE(batch);
+        CAPTURE(base_len);
+        std::vector<int32_t> lengths(static_cast<size_t>(batch));
+        for (int i = 0; i < batch; ++i)
+          lengths[static_cast<size_t>(i)] = base_len + i * 3;
+        Fa2DecodeCase c(ratio.first, ratio.second, std::move(lengths),
+                        7100U + static_cast<uint32_t>(batch * 31 + base_len),
+                        /*capacity_blocks=*/0, /*head_dim=*/128);
+        RunFa2VarlenDecodeCase(c, "1", /*expect_fa2=*/true);
+      }
+    }
+  }
+}
+
+// Opt-in default: with VT_FA2_DECODE_QWEN3 unset/0 the d128 decode stays on the
+// portable fallback (no varlen-FA2 launch), proving the gate is same-binary A/B.
+TEST_CASE("paged_attention CUDA FA-2 varlen d128 decode is opt-in (default fallback)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 varlen d128 opt-in check (dgx-pending)");
+    return;
+  }
+  Fa2DecodeCase c(/*Hq=*/16, /*Hkv=*/8, {21, 24, 27}, 7333,
+                  /*capacity_blocks=*/0, /*head_dim=*/128);
+  RunFa2VarlenDecodeCase(c, "0", /*expect_fa2=*/false);
+}
 
 TEST_CASE("paged_attention CUDA FA-2 split heuristic mirrors upstream") {
   using vt::cuda::testing::Fa2DecodeNumSplitsForTesting;

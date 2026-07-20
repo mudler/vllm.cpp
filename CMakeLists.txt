@@ -610,7 +610,12 @@ if(VLLM_CPP_CUDA)
     set(_FA2_ROOT "${CMAKE_SOURCE_DIR}/src/vt/cuda/flash_attn")
     set(_FA2_KERNEL_SRCS
       src/vt/cuda/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu
-      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu)
+      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu
+      # d128 bf16 split-KV: the exact varlen (non-swap) reduction vLLM's
+      # flash_attn_varlen_func runs for Qwen3-dense DECODE (paged KV forces the
+      # split kernel even at num_splits==1). MODEL-TEXT-qwen3 strict bit-match.
+      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu
+      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu)
     target_sources(vllm PRIVATE
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})

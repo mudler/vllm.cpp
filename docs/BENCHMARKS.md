@@ -45,6 +45,24 @@ group-swap changes the reduction order. Remaining bit-match target = an FA2 varl
 d128 decode ([spec](../.agents/specs/qwen3-decode-strict-bitmatch.md)).
 `benchmark_binding=false` (investigation only, binary byte-identical to HEAD).
 
+**FA2 VARLEN d128 decode — vendored + measured, correctness only, no perf claim
+(2026-07-20).** The remaining bit-match target above is now implemented
+(`LaunchDecodeVarlenFA2Bf16`, opt-in `VT_FA2_DECODE_QWEN3`, default OFF): the EXACT
+vLLM varlen decode (plain varlen, no group swap, num_splits=exact heuristic). It
+BIT-MATCHES vLLM's decode attention OUTPUT — teacher-forcing vLLM on our new-path
+sequence, our token IS vLLM's argmax at gap **0.0000 nats** at all-but-the-near-tie
+positions — but STRICT 16/16 is **bf16-tie-bounded and NOT reached**: FA2-varlen
+0.6B **11/16** & 4B **9/16**, ONE WORSE than the CUDA-core fallback (12/16 & 10/16),
+because the residual ≤0.375-nat ties are ones vLLM itself resolves differently
+between its prefill argmax and its incremental decode. Op-parity byte-exact vs the
+f32 reference (`test_ops_paged_attn` 23/23 cases, 454433 assertions, incl.
+num_splits>1 split-combine); `compute-sanitizer memcheck` **0 errors**; `-Werror`
+0-warn. **Regression 27B 235/235 + 35B 315/315 + default Qwen3 gate 16/16 UNCHANGED**
+(d256 arms byte-identical, opt-in default OFF). Shipped opt-in; the near-tie-robust
+gate stays the closure; the engine gate is NOT tightened to strict equality.
+`benchmark_binding=false` (correctness campaign; the vLLM-throughput SPEED benchmark
+remains the open Qwen3-dense deliverable).
+
 Last updated: **2026-07-19**. **Both gate models bound at HEAD `786aa0e`** (fresh
 fully-interleaved 3-rep grid, ZERO void, 12/12 binding-eligible both models): **27B
 117/124** (parity holds — the 7 fails are c4 mean/median TTFT 0.911/0.950 + 5 ITL/TPOT

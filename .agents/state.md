@@ -14381,3 +14381,39 @@ precondition).** NO push — SHA reported to caller. Repro: capture with
 under `VT_DUMP_IDS=1`, then `qwen3-neartie-gap.py`; run
 `./tests/test_qwen3_paged_engine` under `flock /tmp/gpu` + PATH incl.
 `~/venvs/vllm-oracle/bin`.
+
+- **2026-07-20 (later)** — Qwen3-dense DECODE strict-16/16 razor: INVESTIGATION
+  DONE, group-swap FA2-d128 route DISPROVEN, reverted to baseline (no
+  regression) — worktree `agent-a7e66dd02ed286cb2`. Task: bit-match Qwen3 d128
+  decode to vLLM 0.25.0 to reach STRICT token-exact 16/16 (tighten the near-tie
+  band). Baseline (HEAD ade97ac, CUDA-core d128 decode): STRICT 0.6B **12/16** /
+  4B **10/16** (near-tie band PASSES 16/16). ATTEMPTED the task's prime
+  hypothesis — route d128 decode through the vendored FA2 split-KV kernel
+  (`LaunchDecodeFA2Bf16`, the `seqlenq_ngroups_swapped` `flash_attn_with_kvcache`
+  path the 27B/35B d256 arms use): added a d128 non-causal split-KV `.cu`
+  instantiation + CMake + head-dim-dependent `kBlockN`(128) + `head_dim==128`
+  dispatch + a `VT_FA2_DECODE_QWEN3` gate. Built clean on dgx
+  (`~/work/vllm-cpp-decode-a7e`, `-Werror` 0-warn, d128 kernel compiled).
+  **MEASURED WORSE**: STRICT 0.6B **11/16** / 4B **9/16** with early cascading
+  flips (e.g. 0.6B p0 tok5 our=15344 vs vLLM=9625) — the vendored FA2 split-KV
+  computes correct attention but a bf16 reduction order FURTHER from vLLM than
+  the CUDA-core fallback. ROOT CAUSE (source-confirmed in the oracle venv, per
+  AGENTS.md "trace the execution"): GB10 is sm_121 → `get_flash_attn_version`
+  (`fa_utils.py`) falls through `==9`/`==10` to **fa_version 2**; vLLM v1
+  FLASH_ATTN calls **`flash_attn_varlen_func`** (`flash_attn.py`), the unified
+  VARLEN forward — NOT the group-swap `flash_attn_with_kvcache` path; the
+  group-swap changes the M-tiling/accumulation order. Oracle is
+  `enforce_eager=True` and the gate seqlens give `num_n_blocks=1` ⇒ vLLM decode
+  is a single non-split FA2 varlen reduction. d256 (27B/35B) passes strict
+  through the group-swap path only because those larger models have SPARSE
+  near-ties the rounding difference never flips; the dense d128 small-model
+  near-ties (≤0.125–0.25 nats) do flip. REMAINING SCOPE (spec
+  `.agents/specs/qwen3-decode-strict-bitmatch.md`): vendor + route an FA2 VARLEN
+  d128 decode (no group-swap, num_splits matching vLLM) — a scoped sub-campaign;
+  prefill already bit-matches vLLM (teacher-forced gap 0.0000, do NOT touch).
+  Reverted ALL code to HEAD ⇒ 27B `test_qwen27_paged_engine` 235/235 + 35B
+  `test_qwen36_paged_engine` 315/315 + the near-tie band gate UNCHANGED BY
+  CONSTRUCTION (zero source delta). Resume: read the spec, implement the varlen
+  d128 path, re-measure BEFORE tightening the gate; if the exact varlen kernel
+  still rounds the ties the other way, the near-tie-robust gate is the correct
+  closure.

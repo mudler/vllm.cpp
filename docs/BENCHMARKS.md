@@ -33,6 +33,18 @@ regression bar HOLDS: the two gate models stay token-exact (27B
 `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (this change touches no engine source).
 
+**Strict-decode razor — investigation, no perf claim (2026-07-20).** An attempt to
+tighten the Qwen3 near-tie band to strict token-exact 16/16 by routing d128 decode
+through the vendored FA2 group-swap split-KV kernel (`LaunchDecodeFA2Bf16`) built
+clean on dgx (`-Werror` 0-warn, d128 kernel compiled) but measured WORSE than the
+CUDA-core baseline — STRICT 0.6B 12→**11/16**, 4B 10→**9/16** (both vs the same
+`greedy_ids` oracle) — and was reverted. Source-confirmed root cause: GB10 is sm_121
+so vLLM selects fa_version 2 and runs the unified FA2 **varlen** path
+(`flash_attn_varlen_func`), NOT the group-swap `flash_attn_with_kvcache` kernel; the
+group-swap changes the reduction order. Remaining bit-match target = an FA2 varlen
+d128 decode ([spec](../.agents/specs/qwen3-decode-strict-bitmatch.md)).
+`benchmark_binding=false` (investigation only, binary byte-identical to HEAD).
+
 Last updated: **2026-07-19**. **Both gate models bound at HEAD `786aa0e`** (fresh
 fully-interleaved 3-rep grid, ZERO void, 12/12 binding-eligible both models): **27B
 117/124** (parity holds — the 7 fails are c4 mean/median TTFT 0.911/0.950 + 5 ITL/TPOT

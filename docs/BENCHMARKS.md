@@ -56,7 +56,10 @@ byte-exact to the standalone-op sequence the model hand-calls today. Infrastruct
 only — NO model call site changed. Byte-exact `test_ops_fused_chain` CPU 196 + CUDA 361
 assertions, memcheck 0; token-exact regression (the W0-adopted site) 35B 315/315 + 27B
 235/235 on both `VT_FUSED_CHAIN_ADOPT` arms. **Benchmark disposition: perf-NEUTRAL**
-(no call site changed) ⇒ no re-grid.
+(no call site changed) ⇒ no re-grid. Build-hygiene follow-up: a pre-existing
+CPU-only `-Werror=unused-function` (`FuseSigmoidGateQuantEnabled`, used only under
+`#ifdef VT_CUTLASS_NVFP4`) fixed with `[[maybe_unused]]` — no behavior change,
+keeps the CPU CI build green.
 
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid

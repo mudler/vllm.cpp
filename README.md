@@ -290,6 +290,10 @@ mechanical-upstream-sync** cornerstone, not a perf lever — W0/W1 are perf-neut
 construction (the measured 35B prefill gap is compute-bound, ceiling ~3.5%/step).
 Spike + work breakdown (W0–Wn):
 [`.agents/specs/portable-fusion-framework.md`](.agents/specs/portable-fusion-framework.md).
+Build hygiene alongside W1: a pre-existing CPU-only `-Werror=unused-function`
+(the `FuseSigmoidGateQuantEnabled` helper is used only under `#ifdef
+VT_CUTLASS_NVFP4`, so a CUDA-off build compiled it out) is fixed with
+`[[maybe_unused]]` — keeps the `build-test-cpu` CI job green; no behavior change.
 
 ### Kernel coverage on the gate path
 

@@ -1438,7 +1438,10 @@ bool FuseSiluQuantEnabled() {
 // GEMMs) — token-exact but not measurably faster, so it ships opt-in per the "flip
 // only on a measured win" rule (mirror of the perf-neutral fp8-merged-QKV
 // launch-fusion disposition).
-bool FuseSigmoidGateQuantEnabled() {
+// [[maybe_unused]]: the sole caller (SigmoidGateOProjD) is under #ifdef
+// VT_CUTLASS_NVFP4, so a CPU-only build compiles this out and would otherwise
+// trip -Werror=unused-function on this anonymous-namespace function.
+[[maybe_unused]] bool FuseSigmoidGateQuantEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FUSE_SIGMOID_QUANT");
     return e != nullptr && e[0] == '1';

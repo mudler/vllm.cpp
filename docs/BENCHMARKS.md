@@ -8,6 +8,13 @@ reproduction entry points. Attempt chronology and failure forensics live in the
 append-only within the current era and are frozen under `.agents/completed/`
 when the era is rolled up; this page never accumulates their run-by-run history.
 
+**Roadmap note (2026-07-20):** the first additive-model bring-up (Qwen3 dense on
+`Qwen3-0.6B`, [spike](../.agents/specs/first-additive-model-qwen3-dense.md)) is a
+CORRECTNESS deliverable — its gate is token-exact greedy vs the vLLM 0.25.0 oracle
+(16/16), not a perf benchmark; no binding number is claimed for it. Its regression
+bar is the two gate models staying token-exact (27B 235/235 + 35B 315/315) after the
+runner generalization it forces.
+
 Last updated: **2026-07-19**. **Both gate models bound at HEAD `786aa0e`** (fresh
 fully-interleaved 3-rep grid, ZERO void, 12/12 binding-eligible both models): **27B
 117/124** (parity holds — the 7 fails are c4 mean/median TTFT 0.911/0.950 + 5 ITL/TPOT

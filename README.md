@@ -170,8 +170,8 @@ concurrent streams.
 | Architecture | Families | Safetensors | GGUF | Status |
 |---|---|:---:|:---:|---|
 | Qwen3.5/3.6 hybrid text | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ | 35B only | 🟡 Token-exact correctness passes on GB10; 27B performance is `GATING` at 49/124 axes (new binding `246a23c`); vision paths are not implemented |
-| Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | — | — | 🗓 Post-parity roadmap |
-| Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 Post-parity roadmap |
+| Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | 🚧 | — | 🚧 **First additive-model bring-up — SPIKED 2026-07-20** ([spike](.agents/specs/first-additive-model-qwen3-dense.md)): `Qwen3ForCausalLM` on `Qwen3-0.6B` (BF16). The model-factory seam is clean (new TU + 1 REGISTER); the bring-up forces the runner-generalization that makes the runner model-shape-agnostic (unblocks all future dense archs). W0 stub → W1 runner-generalization → W2 loader → W3 forward → W4 token-exact gate vs the vLLM 0.6B oracle |
+| Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 Post-parity roadmap (W-next after Qwen3-dense; needs a checkpoint download — none on dgx) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 Post-parity roadmap |
 
 ## Acceleration

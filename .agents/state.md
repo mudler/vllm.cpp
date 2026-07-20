@@ -14001,3 +14001,48 @@ Perf-neutral by construction (same fast OpId dispatches) ⇒ `benchmark_binding=
 
 **Next.** W3 mechanical-sync proof (a new vLLM pass ports as ONE declaration + its
 byte-exact test); W4 mock-backend additivity. See `portable-fusion-framework.md` §10.
+
+## 2026-07-20 — KERNEL-FUSION-FRAMEWORK W3: the MECHANICAL-UPSTREAM-SYNC PROOF (`CLAIM-FUSION-FRAMEWORK-W3`)
+
+**What.** W3 delivers the framework's PRIMARY-value proof (spec §4/§10): a NEW,
+previously-unported vLLM fusion pass ports as ONE `constexpr FusedRecipe` declaration +
+its byte-exact test, touching only `recipes.h` + the test — no kernel, no dispatch, no
+composite-walker case, no model-site edit, and (for this pass) NO new primitive.
+
+**The pass ported.** `SiluMulFp8StaticQuantPattern` — vLLM ActivationQuantFusionPass's
+ALWAYS-ON static-per-tensor-FP8 activation variant (matches `_C.silu_and_mul` + fp8
+static quant, fuses to `_C.silu_and_mul_quant`): `vllm/compilation/passes/fusion/
+act_quant_fusion.py:81` (fused op at `:34` `FUSED_OPS[kFp8StaticTensorSym]`; registered
+unconditionally in `ActivationQuantFusionPass.__init__` `:296`) @ pin `e24d1b24`. It is
+the static-FP8 sibling of our NVFP4 `kSiluMulFp4Quant`.
+
+**Why it is genuinely additive (no new primitive).** The pass's Tier-0 composite is
+expressible ENTIRELY from EXISTING standalone `vt::` ops added in W1: `kSiluMul`→
+`vt::MoeSiluMul` (silu(gate)·up → bf16), then `kQuantFp8`→`vt::QuantFp8Static` (static
+per-tensor fp8). The device-agnostic composite walker (`ops.cpp`) already handles both
+opcodes, so the recipe is byte-exact by construction with ZERO machinery added. The
+declaration is `kSiluMulQuantFp8` (steps: kSiluMul out=tmp_bf16 in=[gate,up]; kQuantFp8
+out=out_fp8 in=[tmp_bf16]; operands 0=gate,1=up,2=tmp_bf16,3=out_fp8).
+
+**The honest boundary.** `fast_op = kNoFastOp` — no bespoke silu·mul→static-fp8 fused
+`OpId` exists in-tree (every existing silu-mul fused op is NVFP4). So the recipe realizes
+composite-only; a fast single-launch kernel would be a separate later perf step (§10),
+not part of this additive port. The fp8 quant terminal is CUDA-only (backend-negotiated
+quant tail, §3b/§6), so the full-chain byte-exact test is CUDA-only, exactly like the
+sibling `kRmsNormQuantFp8`. The recipe is DECLARED, not wired into any model — so the
+engine is unchanged and the token gates are a no-regression check, not a behavior change.
+
+**Additivity evidence (the PR-#4 test).** `git diff --stat main` = exactly 2 shared
+files: `include/vt/recipes.h` (+49, one declaration) + `tests/vt/test_ops_fused_chain.cpp`
+(+50, one byte-exact CUDA test `RunSiluMulQuantFp8Cuda`). Contrast the pre-framework cost
+of a new fusion (~5 shared files: new OpId+Fn in ops.h, CUDA kernel, CPU oracle, model
+call site). HEADLINE: adding a whole new fusion pattern touched 2 files.
+
+**Gates (dgx `~/w3_fusion_sync/build-w3`, prod flags CUTLASS sm120a + FA2 sm_121a +
+Triton AOT, clean CUDA `-Werror` 0 warnings, one flock).** Byte-exact `test_ops_fused_chain`
+CUDA 432 assertions 0 failed (the new `kSiluMulQuantFp8` arm asserts FusedChain ==
+FusedChainComposite == MoeSiluMul+QuantFp8Static golden; CPU 228 unchanged). No token
+regression: 27B `test_qwen27_paged_engine` 235/235 + 35B `test_qwen36_paged_engine`
+315/315. memcheck 0 errors. NOT a perf change (§11) ⇒ `benchmark_binding=false`, no re-grid.
+
+**Next.** W4 mock-backend additivity proof. See `portable-fusion-framework.md` §10.

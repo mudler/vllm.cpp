@@ -262,7 +262,7 @@ both gate models (DGX-confirmed token-exact: 27B 235/235 + 35B 315/315, memcheck
 attention-backend registry, model self-registration).
 
 **Extensibility — roadmap_v1 ORDER-1: the portable op-fusion framework
-(SPIKED 2026-07-19; W0 ADOPTED; W1 POD GENERALIZED; W2 HAND-FUSIONS MIGRATED 2026-07-20).** The fourth and unifying seam: fusions **declared once**
+(SPIKED 2026-07-19; W0 ADOPTED; W1 POD GENERALIZED; W2 HAND-FUSIONS MIGRATED; W3 MECHANICAL-SYNC PROVEN 2026-07-20).** The fourth and unifying seam: fusions **declared once**
 (a backend-agnostic recipe catalog above `vt::`, transcribing vLLM's finite
 fusion-pass set) and **realized per-backend** through the `vt::` op table (a
 composite tier is the CPU oracle every backend inherits free; one interpreter
@@ -296,9 +296,20 @@ kernel, no per-forward getenv/alloc). The Tier-0 composite is the byte-exact ora
 fast kernel is validated against (`test_ops_fused_chain` proves fast == composite ==
 unfused sequence). Gates: clean CUDA `-Werror` 0-warn, byte-exact CUDA 420/420, and
 token-exact 27B 235/235 + 35B 315/315 on BOTH `VT_FUSED_CHAIN_ADOPT` arms (`=0`
-restores the exact prior hand-calls, same binary). Honest scope: this is an
+restores the exact prior hand-calls, same binary). **W3 landed (2026-07-20) — the
+mechanical-upstream-sync PROOF:** a NEW, previously-unported vLLM fusion pass
+(`SiluMulFp8StaticQuantPattern`, the static-per-tensor-FP8 activation variant of
+`ActivationQuantFusionPass`, `act_quant_fusion.py:81` → `_C.silu_and_mul_quant`) was
+ported as **ONE `constexpr FusedRecipe kSiluMulQuantFp8` declaration + its byte-exact
+test — touching exactly two files** (`include/vt/recipes.h` + `tests/vt/test_ops_fused_chain.cpp`),
+with **no kernel, no dispatch, no model-site edit, and no new primitive** (its composite
+realizes through the existing `vt::MoeSiluMul` + `vt::QuantFp8Static` ops). `git diff
+--stat main` = those two files, nothing else — the PR-#4 additivity test made concrete:
+adding a whole new fusion pattern is one declaration. Gates: clean CUDA `-Werror` 0-warn,
+byte-exact CUDA 432/432, and — because the recipe is declared, not wired into any model —
+no token regression (27B 235/235 + 35B 315/315), memcheck 0. Honest scope: this is an
 **extensibility +
-mechanical-upstream-sync** cornerstone, not a perf lever — W0/W1 are perf-neutral by
+mechanical-upstream-sync** cornerstone, not a perf lever — W0–W3 are perf-neutral by
 construction (the measured 35B prefill gap is compute-bound, ceiling ~3.5%/step).
 Spike + work breakdown (W0–Wn):
 [`.agents/specs/portable-fusion-framework.md`](.agents/specs/portable-fusion-framework.md).

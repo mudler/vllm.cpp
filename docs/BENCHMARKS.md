@@ -75,6 +75,22 @@ prod flags, clean CUDA `-Werror` 0-warn): byte-exact `test_ops_fused_chain` CPU 
 CUDA 420 assertions (fast == Tier-0 composite == unfused-op-sequence golden per recipe),
 memcheck 0; token-exact 27B 235/235 + 35B 315/315 on BOTH `VT_FUSED_CHAIN_ADOPT` arms.
 
+**W3 landed (2026-07-20) — the mechanical-upstream-sync PROOF (NOT a perf change).**
+A NEW, previously-unported vLLM fusion pass — `SiluMulFp8StaticQuantPattern`, the
+static-per-tensor-FP8 activation variant of `ActivationQuantFusionPass`
+(`act_quant_fusion.py:81` → `_C.silu_and_mul_quant`) — was ported as ONE `constexpr
+FusedRecipe kSiluMulQuantFp8` + its byte-exact test, touching EXACTLY TWO files
+(`include/vt/recipes.h` + `tests/vt/test_ops_fused_chain.cpp`): no kernel, no dispatch,
+no model-site edit, no new primitive (its Tier-0 composite realizes through the existing
+`vt::MoeSiluMul` + `vt::QuantFp8Static` ops). **Benchmark disposition: NOT APPLICABLE /
+perf-neutral** — the recipe is DECLARED, not wired into any model, so the engine is
+byte-for-byte unchanged; W3 is the extensibility/mechanical-sync deliverable (a new
+upstream fusion PR = one declaration), explicitly not a perf lever (§ the ceiling above).
+No re-grid. Gates (dgx `~/w3_fusion_sync/build-w3`, prod flags, clean CUDA `-Werror`
+0-warn): byte-exact `test_ops_fused_chain` CUDA 432 assertions (the new `kSiluMulQuantFp8`
+FusedChain==composite==golden arm; CPU 228 unchanged), memcheck 0; no token regression
+27B 235/235 + 35B 315/315.
+
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
 reruns on the full production default set (async + vendored Triton GDN decode cubin

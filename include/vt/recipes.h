@@ -148,6 +148,55 @@ constexpr FusedRecipe kSiluMulFp4Quant = {
     /*fast_op=*/static_cast<int>(OpId::kSiluMulFp4Quant),
 };
 
+// kSiluMulQuantFp8 — silu(gate)·up -> static per-tensor fp8 activation quant.
+//
+// W3 MECHANICAL-UPSTREAM-SYNC PROOF (.agents/specs/portable-fusion-framework.md
+// §10 W3): a NEW vLLM fusion-pass variant we did NOT previously have a recipe for,
+// ported as ONE declaration + its byte-exact test — touching only recipes.h + the
+// test (no kernel/dispatch/model-site edits). This is the static-FP8 sibling of
+// kSiluMulFp4Quant, transcribing vLLM ActivationQuantFusionPass's ALWAYS-ON
+// static-FP8 activation pattern:
+//   SiluMulFp8StaticQuantPattern
+//   (vllm/compilation/passes/fusion/act_quant_fusion.py:81 -> _C.silu_and_mul_quant;
+//    registered unconditionally at act_quant_fusion.py:296; csrc activation_kernels)
+// It matches `_C.silu_and_mul` + static-per-tensor-fp8 quant (kFp8StaticTensorSym).
+//
+// Its Tier-0 composite is expressible ENTIRELY from EXISTING standalone vt:: ops —
+// vt::MoeSiluMul (kSiluMul) then vt::QuantFp8Static (kQuantFp8) — so the port needs
+// NO new primitive and NO composite-walker case (both opcodes were already added in
+// W1). Realization: composite-only (there is no bespoke silu·mul→static-fp8 fused
+// OpId in our tree; every existing silu-mul fused op is NVFP4), so fast_op is
+// kNoFastOp — the recipe realizes through the byte-exact Tier-0 composite. A fast
+// single-launch kernel is a separate later perf step (§10), not part of this port.
+//
+// Golden (byte-exact): vt::MoeSiluMul(tmp_bf16, gate, up) then
+// vt::QuantFp8Static(out_fp8, tmp_bf16, input_scale) — the silu·up value rounded
+// through bf16 before the fp8 quant, exactly as the unfused standalone sequence
+// materializes it (mirrors the kSiluMulFp4Quant bf16-intermediate discipline, §5).
+// The fp8 terminal is a CUDA-only vt:: op (no CPU kernel), so this recipe's
+// composite runs end-to-end on CUDA; the portable silu·mul prefix is the same
+// MoeSiluMul the kSiluMulFp4Quant CPU test already pins. Tier: composite-only
+// (backend-negotiated quant tail, §3b/§6), exactly like kRmsNormQuantFp8.
+//
+// operands: 0=gate[M,I], 1=up[M,I], 2=tmp[M,I] bf16, 3=out_fp8[M,I] i8
+constexpr FusedRecipe kSiluMulQuantFp8 = {
+    {
+        {FOp::kSiluMul, /*out=*/2, /*in=*/{0, 1}, /*nin=*/2, kNoOperand, FReduce::kNone, false,
+         false},
+        {FOp::kQuantFp8, /*out=*/3, /*in=*/{2}, /*nin=*/1, kNoOperand, FReduce::kNone, false,
+         false},
+    },
+    {
+        {FKind::kRow, "gate"},
+        {FKind::kRow, "up"},
+        {FKind::kRow, "tmp_bf16"},
+        {FKind::kAux, "out_fp8"},
+    },
+    /*n=*/2,
+    /*n_operands=*/4,
+    /*name=*/"silu_mul_quant_fp8",
+};
+
 // kSigmoidGateFp4Quant — attn·sigmoid(gate) -> NVFP4 activation quant (the
 // full-attention output-gate o_proj epilogue). Transcribes vLLM Inductor
 // triton_poi_fused_mul_scaled_fp4_quant_sigmoid_view (glue-fusion-2026-07-19.md;

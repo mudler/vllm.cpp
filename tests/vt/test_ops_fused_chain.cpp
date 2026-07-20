@@ -514,6 +514,53 @@ void RunSigmoidGateFp4Cuda(int64_t m, int64_t k, uint32_t seed) {
   CHECK(sc_c == sc_g);
 }
 
+// kSiluMulQuantFp8 (W3 mechanical-sync proof) on CUDA: MoeSiluMul(gate,up->bf16)
+// then QuantFp8Static. Composite-only (no fast_op) — mode 1 (FusedChain) falls
+// through to the Tier-0 composite; mode 2 calls it explicitly. Both must equal the
+// standalone-op-sequence golden byte-for-byte (the fp8 terminal is CUDA-only).
+void RunSiluMulQuantFp8Cuda(int64_t m, int64_t i, uint32_t seed) {
+  const float scale = 0.125f;
+  const auto gf = RandF32(static_cast<size_t>(m * i), seed);
+  const auto uf = RandF32(static_cast<size_t>(m * i), seed + 1);
+  const auto gb = Pack(gf, DType::kBF16);
+  const auto ub = Pack(uf, DType::kBF16);
+  Backend& gpu = GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dg(gpu, g.q, DType::kBF16, {m, i}, gb.data());
+  DeviceTensor du(gpu, g.q, DType::kBF16, {m, i}, ub.data());
+
+  auto run = [&](int mode, std::vector<uint8_t>& fp8) {
+    DeviceTensor dtmp(gpu, g.q, DType::kBF16, {m, i});
+    DeviceTensor dfp8(gpu, g.q, DType::kI8, {m, i});
+    if (mode == 0) {
+      vt::MoeSiluMul(g.q, dtmp.tensor(), dg.tensor(), du.tensor());
+      vt::QuantFp8Static(g.q, dfp8.tensor(), dtmp.tensor(), scale);
+    } else {
+      FusedBinding b;
+      b.op[0] = &dg.tensor();
+      b.op[1] = &du.tensor();
+      b.op[2] = &dtmp.tensor();
+      b.op[3] = &dfp8.tensor();
+      b.n = 4;
+      FusedParams p;
+      p.quant_scale = scale;
+      if (mode == 1) {
+        vt::FusedChain(g.q, vt::kSiluMulQuantFp8, b, p);
+      } else {
+        vt::FusedChainComposite(g.q, vt::kSiluMulQuantFp8, b, p);
+      }
+    }
+    fp8.assign(static_cast<size_t>(m * i), 0);
+    dfp8.Download(g.q, fp8.data());
+  };
+  std::vector<uint8_t> fp8_g, fp8_f, fp8_c;
+  run(0, fp8_g);
+  run(1, fp8_f);
+  run(2, fp8_c);
+  CHECK(fp8_f == fp8_g);
+  CHECK(fp8_c == fp8_g);
+}
+
 // kRmsNormQuantFp8 on CUDA: RmsNorm(bf16,+residual) then QuantFp8Static.
 void RunRmsNormQuantFp8Cuda(int64_t t, int64_t h, DType resdt, uint32_t seed) {
   const float scale = 0.125f, eps = 1e-6f;
@@ -631,6 +678,9 @@ TEST_CASE("CUDA fused_chain new recipes composite == standalone-op-sequence (byt
     RunSiluMulFp4Cuda(4, i, seed);
     seed += 7;
     RunSigmoidGateFp4Cuda(4, i, seed);
+    seed += 7;
+    // W3: the newly-ported kSiluMulQuantFp8 (silu·mul -> static per-tensor fp8).
+    RunSiluMulQuantFp8Cuda(4, i, seed);
     seed += 7;
   }
   for (int64_t h : {128, 256, 2048}) {

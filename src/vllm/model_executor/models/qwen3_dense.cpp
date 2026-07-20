@@ -38,13 +38,15 @@ inline constexpr ModelInfo kQwen3Info{
     .score_type = "bi-encoder",
 };
 
-// Opaque owned model. W0/W1: holds the placeholder weights only; the forward is
+// Opaque owned model. W2: holds the loaded Qwen3 dense weights; the forward is
 // not yet wired (throws until W3).
 class Qwen3DenseLoadedModel final : public LoadedModel {
  public:
   Qwen3DenseLoadedModel(const ModelRegistration& registration,
                         Qwen3DenseWeights weights)
       : LoadedModel(registration), weights_(std::move(weights)) {}
+
+  const Qwen3DenseWeights& weights() const { return weights_; }
 
  private:
   Qwen3DenseWeights weights_;
@@ -53,13 +55,17 @@ class Qwen3DenseLoadedModel final : public LoadedModel {
 std::unique_ptr<LoadedModel> LoadQwen3ForCausalLM(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
-  (void)registration;
-  (void)config;
-  (void)source;
-  // W2 lands the safetensors name map + tied lm_head. Fail loudly until then.
-  throw std::runtime_error(
-      "Qwen3ForCausalLM weight loading is not implemented yet "
-      "(additive-model bring-up W2)");
+  // W2: safetensors name map + tied lm_head. Qwen3 dense is text-only BF16
+  // safetensors (no GGUF path yet).
+  if (source.kind != ModelSource::Kind::kSafetensors) {
+    throw std::runtime_error(
+        "Model architecture Qwen3ForCausalLM does not support GGUF weights");
+  }
+  if (source.safetensors == nullptr) {
+    throw std::runtime_error("safetensors model source is empty");
+  }
+  return std::make_unique<Qwen3DenseLoadedModel>(
+      registration, LoadQwen3ForCausalLMWeights(*source.safetensors, config));
 }
 
 void PrepareQwen3ForCausalLM(LoadedModel& model, const HfConfig& config,

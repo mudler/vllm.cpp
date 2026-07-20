@@ -11,25 +11,20 @@
 #include <vector>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
+#include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vt/dtype.h"
 
 namespace vllm {
 
-namespace {
+// The generic BF16 copy/transpose/merge routines now live in the shared
+// dense_weight_loaders.h (SEAM GAP #3 extraction) so qwen3_weights.cpp reuses
+// them. Re-expose them unqualified for the 27B call sites below — behavior and
+// loaded bytes are byte-identical to the former anon-namespace copies.
+using dense_loaders::LoadBf16Direct;
+using dense_loaders::LoadBf16Transposed;
+using dense_loaders::MakeOwned;
 
-OwnedTensor MakeOwned(vt::DType dt, const std::vector<int64_t>& shape) {
-  OwnedTensor o;
-  o.dtype = dt;
-  o.rank = static_cast<int>(shape.size());
-  VT_CHECK(o.rank <= vt::kMaxRank, "qwen3_5 dense: rank exceeds kMaxRank");
-  int64_t n = 1;
-  for (int i = 0; i < o.rank; ++i) {
-    o.shape[i] = shape[static_cast<size_t>(i)];
-    n *= shape[static_cast<size_t>(i)];
-  }
-  o.bytes.resize(static_cast<size_t>(n) * vt::SizeOf(dt));
-  return o;
-}
+namespace {
 
 float ReadF32Scalar(const StTensor& t) {
   VT_CHECK(t.data != nullptr && t.nbytes >= sizeof(float),
@@ -37,47 +32,6 @@ float ReadF32Scalar(const StTensor& t) {
   float v = 0.0F;
   std::memcpy(&v, t.data, sizeof(float));
   return v;
-}
-
-// src bf16 [rows, cols] -> dst bf16 [cols, rows].
-void TransposeBf16(const uint16_t* src, int64_t rows, int64_t cols,
-                   uint16_t* dst) {
-  for (int64_t r = 0; r < rows; ++r) {
-    const uint16_t* src_row = src + r * cols;
-    for (int64_t c = 0; c < cols; ++c) dst[c * rows + r] = src_row[c];
-  }
-}
-
-// BF16 tensor copied verbatim (optionally reshaped).
-OwnedTensor LoadBf16Direct(const TensorResolver& get, const std::string& name,
-                           const std::vector<int64_t>& shape_override = {}) {
-  const StTensor& t = get(name);
-  VT_CHECK(t.dtype == "BF16", "qwen3_5 dense: expected BF16 for " + name);
-  std::vector<int64_t> shape = shape_override.empty() ? t.shape : shape_override;
-  OwnedTensor o = MakeOwned(vt::DType::kBF16, shape);
-  VT_CHECK(t.nbytes == o.bytes.size(),
-           "qwen3_5 dense: byte-size mismatch for " + name);
-  std::memcpy(o.bytes.data(), t.data, t.nbytes);
-  // LOAD-SAFETENSORS: source range now copied-then-dead; drop its resident pages
-  // so the owned mirror never double-resides with the mmap (spec §page-lifetime).
-  MaybeReleaseSourcePages(t.data, t.nbytes);
-  return o;
-}
-
-// BF16 [out, in] -> owned bf16 [in, out] (Matmul-B layout).
-OwnedTensor LoadBf16Transposed(const TensorResolver& get,
-                               const std::string& name) {
-  const StTensor& t = get(name);
-  VT_CHECK(t.dtype == "BF16", "qwen3_5 dense: expected BF16 for " + name);
-  VT_CHECK(t.shape.size() == 2,
-           "qwen3_5 dense: expected 2-D weight for " + name);
-  const int64_t out_dim = t.shape[0];
-  const int64_t in_dim = t.shape[1];
-  OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-  TransposeBf16(reinterpret_cast<const uint16_t*>(t.data), out_dim, in_dim,
-                reinterpret_cast<uint16_t*>(o.bytes.data()));
-  MaybeReleaseSourcePages(t.data, t.nbytes);
-  return o;
 }
 
 // The GDN in-projections stay RAW in the on-disk torch Linear [out, in]
@@ -214,55 +168,10 @@ DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const std::string& base)
 
 OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
                                 const std::vector<std::string>& names) {
-  VT_CHECK(!names.empty(),
-           "qwen3_5 dense: merged BF16 projection requires at least one shard");
-  int64_t in_dim = -1;
-  int64_t out_dim = 0;
-  std::vector<const StTensor*> shards;
-  shards.reserve(names.size());
-  for (const std::string& name : names) {
-    const StTensor& tensor = get(name);
-    VT_CHECK(tensor.dtype == "BF16",
-             "qwen3_5 dense: expected BF16 for " + name);
-    VT_CHECK(tensor.shape.size() == 2,
-             "qwen3_5 dense: expected 2-D weight for " + name);
-    VT_CHECK(tensor.shape[0] > 0 && tensor.shape[1] > 0,
-             "qwen3_5 dense: merged BF16 shard has an empty dimension: " +
-                 name);
-    VT_CHECK(tensor.data != nullptr,
-             "qwen3_5 dense: merged BF16 shard has null data: " + name);
-    if (in_dim < 0) in_dim = tensor.shape[1];
-    VT_CHECK(tensor.shape[1] == in_dim,
-             "qwen3_5 dense: merged BF16 shards must share input width");
-    VT_CHECK(out_dim <= std::numeric_limits<int64_t>::max() - tensor.shape[0],
-             "qwen3_5 dense: merged BF16 output width overflow");
-    out_dim += tensor.shape[0];
-    shards.push_back(&tensor);
-  }
-
-  VT_CHECK(out_dim <= std::numeric_limits<int64_t>::max() / in_dim,
-           "qwen3_5 dense: merged BF16 element count overflow");
-  const auto elements = static_cast<uint64_t>(out_dim) *
-                        static_cast<uint64_t>(in_dim);
-  VT_CHECK(elements <=
-               std::numeric_limits<size_t>::max() / sizeof(uint16_t),
-           "qwen3_5 dense: merged BF16 byte count overflow");
-  OwnedTensor merged = MakeOwned(vt::DType::kBF16, {out_dim, in_dim});
-  size_t offset = 0;
-  for (size_t i = 0; i < shards.size(); ++i) {
-    const StTensor& shard = *shards[i];
-    const size_t expected = static_cast<size_t>(shard.shape[0]) *
-                            static_cast<size_t>(in_dim) * sizeof(uint16_t);
-    VT_CHECK(shard.nbytes == expected,
-             "qwen3_5 dense: byte-size mismatch for " + names[i]);
-    std::memcpy(merged.bytes.data() + offset, shard.data, expected);
-    MaybeReleaseSourcePages(shard.data, expected);
-    offset += expected;
-  }
-  VT_CHECK(offset == merged.bytes.size(),
-           "qwen3_5 dense: merged BF16 byte accounting mismatch");
-  merged.nk = true;
-  return merged;
+  // Extracted to the shared dense_weight_loaders.h (SEAM GAP #3); this retains
+  // the public vllm::LoadMergedBf16RawNK API (used by the 27B GDN loader below
+  // and test_qwen27_dense_forward) as a byte-identical thin forward.
+  return dense_loaders::LoadMergedBf16RawNK(get, names);
 }
 
 GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,

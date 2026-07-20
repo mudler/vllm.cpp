@@ -1244,24 +1244,32 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
-- **First additive-model bring-up W0+W1 — Qwen3 dense (`Qwen3ForCausalLM`) +
-  the runner generalization (2026-07-20, `CLAIM-MODEL-QWEN3-DENSE`,
-  `ENG-RUNNER-MODELSHAPE`).** Infrastructure + a behaviour-preserving runner
-  generalization; NO forward yet (the Qwen3 dense forward lands W2/W3), so there
-  is nothing to benchmark and no perf claim. W0 adds a new registry TU
-  (`qwen3_dense.cpp` + `qwen3.h`, one `REGISTER_VLLM_MODEL`, a full-attention-only
-  KV spec, a clear-throwing forward stub). W1 makes `GPUModelRunner`
-  **model-shape-agnostic**: a full-attention-only (empty `layer_types`, no GDN
-  group) KV config allocates + steps without the hybrid GDN metadata path, gated
-  on the model-agnostic `has_mamba_group`/`gdn_group_id_ >= 0` predicate. **The
-  hybrid path is byte-identical** — the behaviour-preservation gate is DGX 27B
-  `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine`
-  **315/315** token-exact UNCHANGED (one flock, prod flags CUTLASS sm120a + FA2
-  sm_121a + Triton AOT). Clean CUDA `-Werror` **0 warnings**; new CPU runner
-  tests RED(SIGSEGV)→GREEN; registry resolves `Qwen3ForCausalLM`; ASan/UBSan
-  clean on the affected paths. ⇒ **NOT APPLICABLE** to the throughput / latency /
-  memory scoreboard; `benchmark_binding=false`. The SACRED token-exact
-  `Qwen3-0.6B` vs vLLM 0.25.0 oracle gate lands at W4.
+- **First additive-model bring-up W0+W1+W2 — Qwen3 dense (`Qwen3ForCausalLM`) +
+  the runner generalization + the weight loader (2026-07-20,
+  `CLAIM-MODEL-QWEN3-DENSE`, `ENG-RUNNER-MODELSHAPE`).** Infrastructure + a
+  behaviour-preserving runner generalization + a host-only weight loader; NO
+  forward yet (the Qwen3 dense forward lands W3), so there is nothing to
+  benchmark and no perf claim. W0 adds a new registry TU (`qwen3_dense.cpp` +
+  `qwen3.h`, one `REGISTER_VLLM_MODEL`, a full-attention-only KV spec, a
+  clear-throwing forward stub). W1 makes `GPUModelRunner` **model-shape-agnostic**:
+  a full-attention-only (empty `layer_types`, no GDN group) KV config allocates +
+  steps without the hybrid GDN metadata path, gated on the model-agnostic
+  `has_mamba_group`/`gdn_group_id_ >= 0` predicate. **The hybrid path is
+  byte-identical.** W2 adds the **weight loader** (`qwen3_weights.cpp`): Qwen3-0.6B
+  safetensors → `Qwen3DenseWeights` (merged qkv/gate_up per vLLM
+  `packed_modules_mapping`, per-head q/k norm, tied `lm_head` aliasing
+  `embed_tokens` with the checkpoint's `lm_head.weight` skipped — vLLM
+  `skip_prefixes`); shared BF16 loader helpers extracted to
+  `dense_weight_loaders.h` (27B load byte-identical). The behaviour-preservation
+  gate is DGX 27B `test_qwen27_paged_engine` **235/235** + 35B
+  `test_qwen36_paged_engine` **315/315** token-exact UNCHANGED (one flock, prod
+  flags CUTLASS sm120a + FA2 sm_121a + Triton AOT). Clean CUDA `-Werror` **0
+  warnings**; the W2 load gate `test_qwen3_load` loads all 311 Qwen3-0.6B tensors
+  (**1567/1567** asserts, no leftover, tied lm_head resolves) on dgx,
+  `compute-sanitizer memcheck` **0 errors / 0 leaks** on the load path; full CPU
+  ctest **125/125**. ⇒ **NOT APPLICABLE** to the throughput / latency / memory
+  scoreboard; `benchmark_binding=false`. The SACRED token-exact `Qwen3-0.6B` vs
+  vLLM 0.25.0 oracle gate lands at W4.
 
 - **Residency as a consumed `Platform::residency_policy()` capability (2026-07-19,
   extensibility item 2, `BACKEND-PLATFORM` / `CLAIM-BACKEND-PLATFORM-2`).** A

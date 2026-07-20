@@ -1,0 +1,121 @@
+=== OURS[prod fa2=0] c=1 rep=1 (20:21:35) ===
+  Benchmark duration (s):                    123.46      
+  Total generated tokens:                    1024        
+  Request throughput (req/s):                0.06        
+  Output token throughput (tok/s):           8.29        
+  Total token throughput (tok/s):            74.67       
+  Mean TTFT (ms):                            916.70      
+  Median TTFT (ms):                          828.77      
+  P99 TTFT (ms):                             1499.15     
+  Mean TPOT (ms):                            114.30      
+  Median TPOT (ms):                          114.29      
+  P99 TPOT (ms):                             114.34      
+  Mean ITL (ms):                             114.30      
+  P99 ITL (ms):                              118.05      
+  	Maximum resident set size (kbytes): 8513016
+=== OURS[prod fa2=0] c=1 rep=2 (20:23:43) ===
+  Benchmark duration (s):                    123.76      
+  Total generated tokens:                    1024        
+  Request throughput (req/s):                0.06        
+  Output token throughput (tok/s):           8.27        
+  Total token throughput (tok/s):            74.50       
+  Mean TTFT (ms):                            952.14      
+  Median TTFT (ms):                          864.24      
+  P99 TTFT (ms):                             1573.01     
+  Mean TPOT (ms):                            114.31      
+  Median TPOT (ms):                          114.32      
+  P99 TPOT (ms):                             114.37      
+  Mean ITL (ms):                             114.31      
+  P99 ITL (ms):                              118.05      
+  	Maximum resident set size (kbytes): 8513296
+=== OURS[fa2dec fa2=1] c=1 rep=1 (20:25:51) ===
+  Benchmark duration (s):                    57.34       
+  Total generated tokens:                    1024        
+  Request throughput (req/s):                0.14        
+  Output token throughput (tok/s):           17.86       
+  Total token throughput (tok/s):            160.78      
+  Mean TTFT (ms):                            929.27      
+  Median TTFT (ms):                          833.36      
+  P99 TTFT (ms):                             1557.16     
+  Mean TPOT (ms):                            49.12       
+  Median TPOT (ms):                          49.06       
+  P99 TPOT (ms):                             49.48       
+  Mean ITL (ms):                             49.12       
+  P99 ITL (ms):                              50.53       
+  	Maximum resident set size (kbytes): 8528784
+=== OURS[fa2dec fa2=1] c=1 rep=2 (20:26:53) ===
+  Benchmark duration (s):                    57.44       
+  Total generated tokens:                    1024        
+  Request throughput (req/s):                0.14        
+  Output token throughput (tok/s):           17.83       
+  Total token throughput (tok/s):            160.51      
+  Mean TTFT (ms):                            937.19      
+  Median TTFT (ms):                          849.40      
+  P99 TTFT (ms):                             1561.33     
+  Mean TPOT (ms):                            49.16       
+  Median TPOT (ms):                          49.16       
+  P99 TPOT (ms):                             49.18       
+  Mean ITL (ms):                             49.16       
+  P99 ITL (ms):                              50.65       
+  	Maximum resident set size (kbytes): 8528508
+=== OURS[prod fa2=0] c=8 rep=1 (20:27:55) ===
+  Benchmark duration (s):                    64.86       
+  Total generated tokens:                    3072        
+  Request throughput (req/s):                0.37        
+  Output token throughput (tok/s):           47.36       
+  Total token throughput (tok/s):            426.42      
+  Mean TTFT (ms):                            2895.35     
+  Median TTFT (ms):                          2278.31     
+  P99 TTFT (ms):                             7168.40     
+  Mean TPOT (ms):                            146.70      
+  Median TPOT (ms):                          148.85      
+  P99 TPOT (ms):                             160.14      
+  Mean ITL (ms):                             146.70      
+  P99 ITL (ms):                              1602.73     
+  	Maximum resident set size (kbytes): 8515740
+=== OURS[prod fa2=0] c=8 rep=2 (20:29:06) ===
+  Benchmark duration (s):                    64.90       
+  Total generated tokens:                    3072        
+  Request throughput (req/s):                0.37        
+  Output token throughput (tok/s):           47.34       
+  Total token throughput (tok/s):            426.20      
+  Mean TTFT (ms):                            2907.46     
+  Median TTFT (ms):                          2299.93     
+  P99 TTFT (ms):                             7207.39     
+  Mean TPOT (ms):                            146.69      
+  Median TPOT (ms):                          148.77      
+  P99 TPOT (ms):                             160.19      
+  Mean ITL (ms):                             146.69      
+  P99 ITL (ms):                              1606.41     
+  	Maximum resident set size (kbytes): 8515856
+=== OURS[fa2dec fa2=1] c=8 rep=1 (20:30:17) ===
+  Benchmark duration (s):                    38.50       
+  Total generated tokens:                    3072        
+  Request throughput (req/s):                0.62        
+  Output token throughput (tok/s):           79.79       
+  Total token throughput (tok/s):            718.33      
+  Mean TTFT (ms):                            2898.26     
+  Median TTFT (ms):                          2290.71     
+  P99 TTFT (ms):                             7189.00     
+  Mean TPOT (ms):                            77.92       
+  Median TPOT (ms):                          80.32       
+  P99 TPOT (ms):                             92.06       
+  Mean ITL (ms):                             77.92       
+  P99 ITL (ms):                              1597.38     
+  	Maximum resident set size (kbytes): 8533208
+=== OURS[fa2dec fa2=1] c=8 rep=2 (20:31:02) ===
+  Benchmark duration (s):                    38.46       
+  Total generated tokens:                    3072        
+  Request throughput (req/s):                0.62        
+  Output token throughput (tok/s):           79.89       
+  Total token throughput (tok/s):            719.25      
+  Mean TTFT (ms):                            2889.92     
+  Median TTFT (ms):                          2282.52     
+  P99 TTFT (ms):                             7174.31     
+  Mean TPOT (ms):                            77.86       
+  Median TPOT (ms):                          80.23       
+  P99 TPOT (ms):                             91.84       
+  Mean ITL (ms):                             77.86       
+  P99 ITL (ms):                              1593.09     
+  	Maximum resident set size (kbytes): 8533068
+=== AB DONE ===

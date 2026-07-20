@@ -1,0 +1,145 @@
+=== VLLM c=1 rep=1 (19:53:04) ===
+  Benchmark duration (s):                  92.53     
+  Request throughput (req/s):              0.17      
+  Output token throughput (tok/s):         22.13     
+  Total token throughput (tok/s):          199.19    
+  Mean TTFT (ms):                          167.34    
+  Median TTFT (ms):                        159.38    
+  P90 TTFT (ms):                           181.23    
+  P99 TTFT (ms):                           279.65    
+  Mean TPOT (ms):                          44.20     
+  Median TPOT (ms):                        44.21     
+  P90 TPOT (ms):                           44.29     
+  P99 TPOT (ms):                           44.32     
+  Mean ITL (ms):                           44.20     
+  P90 ITL (ms):                            45.28     
+  P99 ITL (ms):                            47.12     
+=== VLLM c=1 rep=2 (19:54:43) ===
+  Benchmark duration (s):                  92.32     
+  Request throughput (req/s):              0.17      
+  Output token throughput (tok/s):         22.18     
+  Total token throughput (tok/s):          199.66    
+  Mean TTFT (ms):                          153.51    
+  Median TTFT (ms):                        146.44    
+  P90 TTFT (ms):                           177.79    
+  P99 TTFT (ms):                           178.72    
+  Mean TPOT (ms):                          44.22     
+  Median TPOT (ms):                        44.21     
+  P90 TPOT (ms):                           44.25     
+  P99 TPOT (ms):                           44.32     
+  Mean ITL (ms):                           44.22     
+  P90 ITL (ms):                            45.19     
+  P99 ITL (ms):                            46.13     
+=== VLLM c=1 rep=3 (19:56:22) ===
+  Benchmark duration (s):                  92.21     
+  Request throughput (req/s):              0.17      
+  Output token throughput (tok/s):         22.21     
+  Total token throughput (tok/s):          199.89    
+  Mean TTFT (ms):                          141.22    
+  Median TTFT (ms):                        139.98    
+  P90 TTFT (ms):                           141.15    
+  P99 TTFT (ms):                           164.64    
+  Mean TPOT (ms):                          44.25     
+  Median TPOT (ms):                        44.25     
+  P90 TPOT (ms):                           44.27     
+  P99 TPOT (ms):                           44.30     
+  Mean ITL (ms):                           44.25     
+  P90 ITL (ms):                            45.19     
+  P99 ITL (ms):                            46.39     
+=== VLLM c=8 rep=1 (19:57:59) ===
+  Benchmark duration (s):                  73.61     
+  Request throughput (req/s):              1.30      
+  Output token throughput (tok/s):         166.93    
+  Total token throughput (tok/s):          1502.35   
+  Mean TTFT (ms):                          399.39    
+  Median TTFT (ms):                        386.84    
+  P90 TTFT (ms):                           633.52    
+  P99 TTFT (ms):                           1010.21   
+  Mean TPOT (ms):                          45.06     
+  Median TPOT (ms):                        45.27     
+  P90 TPOT (ms):                           46.95     
+  P99 TPOT (ms):                           47.58     
+  Mean ITL (ms):                           45.06     
+  P90 ITL (ms):                            43.36     
+  P99 ITL (ms):                            130.20    
+=== VLLM c=8 rep=2 (19:59:18) ===
+  Benchmark duration (s):                  73.75     
+  Request throughput (req/s):              1.30      
+  Output token throughput (tok/s):         166.62    
+  Total token throughput (tok/s):          1499.56   
+  Mean TTFT (ms):                          423.58    
+  Median TTFT (ms):                        465.17    
+  P90 TTFT (ms):                           634.98    
+  P99 TTFT (ms):                           1000.42   
+  Mean TPOT (ms):                          44.98     
+  Median TPOT (ms):                        45.29     
+  P90 TPOT (ms):                           46.82     
+  P99 TPOT (ms):                           47.65     
+  Mean ITL (ms):                           44.98     
+  P90 ITL (ms):                            43.44     
+  P99 ITL (ms):                            130.91    
+=== VLLM c=8 rep=3 (20:00:38) ===
+  Benchmark duration (s):                  73.63     
+  Request throughput (req/s):              1.30      
+  Output token throughput (tok/s):         166.89    
+  Total token throughput (tok/s):          1501.98   
+  Mean TTFT (ms):                          400.60    
+  Median TTFT (ms):                        386.93    
+  P90 TTFT (ms):                           634.17    
+  P99 TTFT (ms):                           1016.62   
+  Mean TPOT (ms):                          45.07     
+  Median TPOT (ms):                        45.29     
+  P90 TPOT (ms):                           46.94     
+  P99 TPOT (ms):                           47.63     
+  Mean ITL (ms):                           45.07     
+  P90 ITL (ms):                            43.45     
+  P99 ITL (ms):                            130.37    
+=== VLLM c=16 rep=1 (20:01:57) ===
+  Benchmark duration (s):                  85.42     
+  Request throughput (req/s):              2.25      
+  Output token throughput (tok/s):         287.70    
+  Total token throughput (tok/s):          2589.27   
+  Mean TTFT (ms):                          462.20    
+  Median TTFT (ms):                        227.61    
+  P90 TTFT (ms):                           1023.70   
+  P99 TTFT (ms):                           1535.17   
+  Mean TPOT (ms):                          52.28     
+  Median TPOT (ms):                        50.10     
+  P90 TPOT (ms):                           58.15     
+  P99 TPOT (ms):                           60.39     
+  Mean ITL (ms):                           52.28     
+  P90 ITL (ms):                            49.56     
+  P99 ITL (ms):                            255.48    
+=== VLLM c=16 rep=2 (20:03:28) ===
+  Benchmark duration (s):                  85.44     
+  Request throughput (req/s):              2.25      
+  Output token throughput (tok/s):         287.63    
+  Total token throughput (tok/s):          2588.65   
+  Mean TTFT (ms):                          463.14    
+  Median TTFT (ms):                        232.28    
+  P90 TTFT (ms):                           1024.49   
+  P99 TTFT (ms):                           1532.73   
+  Mean TPOT (ms):                          52.28     
+  Median TPOT (ms):                        49.69     
+  P90 TPOT (ms):                           58.14     
+  P99 TPOT (ms):                           60.30     
+  Mean ITL (ms):                           52.28     
+  P90 ITL (ms):                            49.61     
+  P99 ITL (ms):                            255.88    
+=== VLLM c=16 rep=3 (20:05:00) ===
+  Benchmark duration (s):                  85.27     
+  Request throughput (req/s):              2.25      
+  Output token throughput (tok/s):         288.21    
+  Total token throughput (tok/s):          2593.86   
+  Mean TTFT (ms):                          465.02    
+  Median TTFT (ms):                        227.72    
+  P90 TTFT (ms):                           1023.98   
+  P99 TTFT (ms):                           1686.05   
+  Mean TPOT (ms):                          52.15     
+  Median TPOT (ms):                        48.90     
+  P90 TPOT (ms):                           57.97     
+  P99 TPOT (ms):                           60.30     
+  Mean ITL (ms):                           52.15     
+  P90 ITL (ms):                            49.53     
+  P99 ITL (ms):                            255.26    
+=== ALL VLLM DONE ===

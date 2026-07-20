@@ -14461,3 +14461,55 @@ under `VT_DUMP_IDS=1`, then `qwen3-neartie-gap.py`; run
   default"); engine gate NOT tightened to strict equality; near-tie-robust gate
   stays the closure. Row stays `ACTIVE` (correctness complete; vLLM-throughput SPEED
   benchmark is the remaining Qwen3-dense deliverable).
+
+## 2026-07-20 — Qwen3-dense SPEED benchmark vs vLLM 0.25.0 production — EVERY-AXIS FAIL, stays ACTIVE (MODEL-TEXT-qwen3-qwen3-for-causal-lm, CLAIM-MODEL-QWEN3-DENSE, worktree agent-a8f38c9806b1830f3)
+
+The DONE=correctness+speed deliverable MEASURED. Built THIS worktree HEAD `a59b735`
+on dgx (`~/work/vllm.cpp-qwen3dense-speed`, production flags CUTLASS sm120a + FA2
+sm_121a + Triton AOT verified in the configure log) and benchmarked `Qwen3-4B`
+(BF16, head_dim 128) against **vLLM 0.25.0 PRODUCTION (graphed, async default — NOT
+`--enforce-eager`)**. Workload random in1024/out128 (range-ratio 0), `--ignore-eos`,
+closed-loop (`--request-rate inf --max-concurrency C`); denominator via `vllm serve`
++ `vllm bench serve`, ours via `examples/vllm-bench`. Added `ignore_eos=true` to the
+bench harness (`bench_core.h`) so both engines emit exactly output_len (fixed-length
+parity). One `flock /tmp/gpu` per series on an idle box; 2-3 reps/point, <1% noise;
+raw logs archived `docs/bench-evidence/qwen3-4b-{ours-ab,vllm-series}-20260720.log`.
+
+**vLLM denominator (mean reps 2-3):** c1 total 199.8 tok/s, out 22.2, TTFT med 143 ms,
+TPOT mean 44.24, ITL P99 46.3; c8 total 1500.8, out 166.8, TTFT med 426, TPOT 45.03,
+ITL P99 130.6; c16 total 2591, out 287.7, TPOT 52.2.
+
+**RESULT — every axis BELOW vLLM (ratio ours/vLLM; throughput want ≥1, latency ≤1):**
+- **Production default** (VT_FA2_DECODE_QWEN3 OFF, CUDA-core d128 decode): c1 total
+  **0.37×**, TPOT **2.58×**, TTFT med **5.9×**; c8 total **0.28×**, TPOT **3.3×**,
+  TTFT med **5.4×**.
+- **Opt-in FA2-varlen-d128 decode** (VT_FA2_DECODE_QWEN3=1): c1 total **0.80×**, TPOT
+  **1.11×**, TTFT med 5.9×; c8 total **0.48×**, TPOT **1.73×**, TTFT med 5.4×. The
+  vendored FA2 decode is a **2.15× (c1) / 1.69× (c8) DECODE speedup** that nearly
+  closes TPOT at c1 but does NOT touch prefill.
+
+**VERDICT: FAIL — Qwen3 dense is correctness-complete but NOT at vLLM speed.** Row
+stays `ACTIVE` (NOT `DONE`) per DONE=correctness+speed; claim does NOT close.
+
+**Named levers (source-grounded, ranked):**
+1. **PREFILL — DOMINANT.** TTFT ~5.4-5.9× vLLM at both arms/concurrencies (FA2-decode
+   doesn't touch it). head_dim-128 prefill falls through to the scalar CUDA-core
+   `LaunchPrefillFlash` fallback because the tensor-core WMMA prefill AND the vendored
+   FA2 prefill are both gated to `d==256` (`cuda_paged_attn.cu:2511,2532` — the
+   tensor-core staging mistokenizes at d≠256, a latent bug the first dense model
+   forced out; see the W3 ledger). This caps total throughput at ~0.80×/0.48× even
+   with the decode lever. FIX = a d128-correct tensor-core/FA2 prefill kernel.
+2. **DECODE — measured, opt-in, near-closable.** The already-vendored FA2 varlen d128
+   decode (`LaunchDecodeVarlenFA2Bf16`) gives the 2.15×/1.69× above. Flipping its
+   default needs (a) re-passing the near-tie gate 16/16 with FA2-ON (not re-run here)
+   and (b) closing the residual TPOT gap (1.11× c1 fine; 1.73× c8 = split-KV batch
+   efficiency). Both are FOLLOW-ON fixes — this task is measure-first, no fix forced.
+
+**Memory** (unified GB10, `nvidia-smi` memory `N/A`, device KV not in RSS): ours peak
+RSS 8.5 GB; vLLM model weights 7.56 GiB + EngineCore RSS 5.3 GiB; vLLM's 101 GiB KV is
+policy-reserved (gpu-mem-util 0.9), not need. Both fit; not a differentiator; a strict
+peak-device-memory ratio is not measurable on this unified-memory box.
+
+Regression preserved by construction: no engine source touched (only benchmark-harness
+`ignore_eos`); 27B 235/235 + 35B 315/315 unchanged. `benchmark_binding=true`. Repro +
+full table in the parity-ledger 2026-07-20 SPEED row + `docs/BENCHMARKS.md`.

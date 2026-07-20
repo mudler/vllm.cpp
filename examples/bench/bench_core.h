@@ -351,6 +351,11 @@ inline SamplingParams MakeSampling(const BenchConfig& cfg, int req_index) {
   SamplingParams sp;
   sp.temperature = cfg.temperature;  // <= 0 => greedy.
   sp.max_tokens = cfg.output_len;
+  // Fixed-length workload: generate EXACTLY output_len tokens (never stop early
+  // on EOS), so throughput/latency are measured on the intended token budget and
+  // match `vllm bench serve --ignore-eos` apples-to-apples. This makes the
+  // harness's documented "greedy => exactly O" contract actually hold.
+  sp.ignore_eos = true;
   sp.output_kind = RequestOutputKind::kDelta;  // observe TTFT/ITL like a client.
   if (cfg.temperature > 0.0) {
     sp.seed = static_cast<int64_t>(cfg.seed + static_cast<uint64_t>(req_index));

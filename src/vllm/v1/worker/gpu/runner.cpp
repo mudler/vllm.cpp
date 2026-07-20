@@ -733,6 +733,24 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     exec_state_.req_ids.push_back(*input_batch_.req_ids[static_cast<size_t>(i)]);
   }
 
+  // discard_request_mask (gpu_model_runner.py:2029-2051): a scheduled request
+  // whose optimistic seq_len (num_computed + num_scheduled == step.seq_lens[i])
+  // has not yet reached its total known token count (num_tokens_no_spec[i] ==
+  // request.num_tokens) is still consuming prefill and must NOT sample this step.
+  // NOTE: under async scheduling step.seq_lens[i] == num_tokens + placeholders
+  // for a decode request (the reserved in-flight token), so `< num_tokens`
+  // strictly selects prefill chunks only. sample_tokens / get_output() clear the
+  // sampled token for these rows, honoring the scheduler contract that a
+  // still-prefilling request returns EMPTY token ids (scheduler.py:1888-1890).
+  exec_state_.discard.assign(static_cast<size_t>(num_reqs), 0);
+  for (int i = 0; i < num_reqs; ++i) {
+    const int32_t seq_len = exec_state_.step.seq_lens[static_cast<size_t>(i)];
+    const int32_t num_tokens =
+        input_batch_.num_tokens_no_spec[static_cast<size_t>(i)];
+    exec_state_.discard[static_cast<size_t>(i)] =
+        (seq_len < num_tokens) ? 1 : 0;
+  }
+
   return std::nullopt;  // MRV2 split: forward done, sample separately.
 }
 
@@ -832,6 +850,17 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
     out.req_ids.push_back(req_id);
     out.req_id_to_index[req_id] = i;
+
+    // discard_request_mask (vllm/v1/outputs.py:303 valid_sampled_token_ids[i]
+    // .clear()): a request still consuming prefill tokens samples a garbage
+    // token at its prefill position — emit EMPTY and skip the write-back, so the
+    // scheduler appends no output token for it (scheduler.py:1888-1890).
+    if (i < static_cast<int>(exec_state_.discard.size()) &&
+        exec_state_.discard[static_cast<size_t>(i)]) {
+      out.sampled_token_ids.push_back({});
+      continue;
+    }
+
     const std::vector<int32_t>& toks = sampler_output.sampled_token_ids[
         static_cast<size_t>(i)];
     out.sampled_token_ids.push_back(toks);
@@ -968,6 +997,15 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
       const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
       skeleton.req_ids.push_back(req_id);
       skeleton.req_id_to_index[req_id] = i;
+      // discard_request_mask: a still-prefilling request produced no output
+      // token this step, so do NOT advance its write-back column (bumping it
+      // would desync num_tokens from the scheduler). The stale last_sampled row
+      // the scatter wrote is never read while the request is prefilling (combine
+      // skips seq_len <= prefill_len) and is overwritten on its first decode.
+      if (i < static_cast<int>(exec_state_.discard.size()) &&
+          exec_state_.discard[static_cast<size_t>(i)]) {
+        continue;
+      }
       input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] += 1;
     }
   } else
@@ -984,9 +1022,26 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
       const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
       skeleton.req_ids.push_back(req_id);
       skeleton.req_id_to_index[req_id] = i;
+      // discard_request_mask: skip the write-back for a still-prefilling request
+      // (no output token generated this step).
+      if (i < static_cast<int>(exec_state_.discard.size()) &&
+          exec_state_.discard[static_cast<size_t>(i)]) {
+        continue;
+      }
       input_batch_.last_sampled_tokens[static_cast<size_t>(i)] =
           static_cast<int32_t>(ids[i]);
       input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] += 1;
+    }
+  }
+
+  // discard_request_mask (gpu_model_runner.py:3625-3628 -> outputs.py:303): the
+  // rows get_output() must clear to empty. Prefill-chunk requests sampled a
+  // garbage token at their prefill position; the scheduler must see EMPTY ids.
+  std::vector<int32_t> invalid_req_indices;
+  for (int i = 0; i < num_reqs; ++i) {
+    if (i < static_cast<int>(exec_state_.discard.size()) &&
+        exec_state_.discard[static_cast<size_t>(i)]) {
+      invalid_req_indices.push_back(i);
     }
   }
 
@@ -994,7 +1049,8 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   // The async output BORROWS the pool slot (device buffer already holds the
   // argmax ids) and releases it on consume — no per-step free.
   return std::make_unique<AsyncGPUModelRunnerOutput>(
-      std::move(skeleton), dev, pool, slot, num_reqs, queue_, copy_q);
+      std::move(skeleton), dev, pool, slot, num_reqs, queue_, copy_q,
+      std::move(invalid_req_indices));
 }
 
 }  // namespace vllm::v1

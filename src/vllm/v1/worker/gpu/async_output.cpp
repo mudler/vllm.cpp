@@ -72,13 +72,15 @@ void AsyncOutputPool::Release(AsyncOutputSlot* slot) {
 
 AsyncGPUModelRunnerOutput::AsyncGPUModelRunnerOutput(
     ModelRunnerOutput skeleton, vt::Device device, AsyncOutputPool& pool,
-    AsyncOutputSlot* slot, int num_reqs, vt::Queue& main_q, vt::Queue& copy_q)
+    AsyncOutputSlot* slot, int num_reqs, vt::Queue& main_q, vt::Queue& copy_q,
+    std::vector<int32_t> invalid_req_indices)
     : output_(std::move(skeleton)),
       backend_(&vt::GetBackend(device.type)),
       device_(device),
       pool_(&pool),
       slot_(slot),
-      num_reqs_(num_reqs) {
+      num_reqs_(num_reqs),
+      invalid_req_indices_(std::move(invalid_req_indices)) {
   // copy_stream.wait_stream(default_stream) (async_utils.py:29): make the copy
   // queue wait for the sampling work on the main queue, WITHOUT blocking the
   // host. Implemented as record-on-main + queue-wait-on-copy using the slot's
@@ -121,6 +123,17 @@ ModelRunnerOutput AsyncGPUModelRunnerOutput::get_output() {
   for (int i = 0; i < num_reqs_; ++i) {
     output_.sampled_token_ids[static_cast<size_t>(i)] = {
         static_cast<int32_t>(slot_->pinned_host[i])};
+  }
+  // discard_request_mask (vllm/v1/outputs.py:303-304): clear the sampled token
+  // for any request still consuming its known prefill tokens this step. The
+  // scheduler expects EMPTY token ids for a still-prefilling request
+  // (scheduler.py:1888-1890); leaving the (garbage) prefill-position sample in
+  // would append a spurious output token and, under async scheduling, underflow
+  // num_output_placeholders.
+  for (const int32_t i : invalid_req_indices_) {
+    if (i >= 0 && i < num_reqs_) {
+      output_.sampled_token_ids[static_cast<size_t>(i)].clear();
+    }
   }
   consumed_ = true;
   // Return the slot to the pool now that both its device buffer (copied) and its

@@ -380,6 +380,11 @@ class GPUModelRunner final : public ModelRunnerBase {
     CommonAttentionMetadata attn_meta;
     GDNAttentionMetadata gdn_meta;
     std::vector<std::string> req_ids;  // dense order (== input_batch order)
+    // discard_request_mask (gpu_model_runner.py:2048): per dense batch row, 1 iff
+    // the request is still consuming its known prefill tokens this step
+    // (optimistic seq_len < num_tokens) and so must NOT sample — its sampled
+    // token is cleared to empty before returning.
+    std::vector<uint8_t> discard;
   } exec_state_;
 };
 

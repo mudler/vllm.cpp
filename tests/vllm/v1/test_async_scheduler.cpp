@@ -26,6 +26,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -131,6 +132,44 @@ ModelRunnerOutput MakeModelRunnerOutput(const SchedulerOutput& out) {
     ++idx;
   }
   return mro;
+}
+
+// A FAITHFUL model-runner output honoring the discard_request_mask contract
+// (gpu_model_runner.py:2048 + outputs.py:303): a scheduled request still
+// consuming its known prefill tokens this step returns EMPTY sampled ids, per
+// scheduler.py:1888-1890. `discard` is the set of req ids the runner suppresses,
+// captured at schedule time (when the request's seq_len state is current).
+ModelRunnerOutput MakeModelRunnerOutput(const SchedulerOutput& out,
+                                        const std::set<std::string>& discard) {
+  ModelRunnerOutput mro;
+  int idx = 0;
+  for (const auto& [req_id, n] : out.num_scheduled_tokens) {
+    (void)n;
+    mro.req_ids.push_back(req_id);
+    mro.req_id_to_index[req_id] = idx;
+    if (discard.count(req_id)) {
+      mro.sampled_token_ids.push_back({});  // still prefilling: no sampled token
+    } else {
+      mro.sampled_token_ids.push_back({idx});
+    }
+    ++idx;
+  }
+  return mro;
+}
+
+// The runner discard mask for a freshly-scheduled batch: a scheduled request
+// whose computed tokens have not yet reached its total token count is still
+// being prefilled and must not sample (optimistic seq_len < num_tokens).
+std::set<std::string> DiscardMask(Scheduler& sched, const SchedulerOutput& so) {
+  std::set<std::string> discard;
+  for (const auto& [req_id, n] : so.num_scheduled_tokens) {
+    (void)n;
+    auto it = sched.requests.find(req_id);
+    if (it == sched.requests.end()) continue;
+    Request* r = it->second.get();
+    if (r->num_computed_tokens < r->NumTokens()) discard.insert(req_id);
+  }
+  return discard;
 }
 
 // Accumulate produced output-token counts per request id (survives request
@@ -426,4 +465,61 @@ TEST_CASE(
   CHECK(scheduler->requests.count(req_id) == 0);
   CHECK(scheduler->running.empty());
   CHECK(scheduler->get_num_unfinished_requests() == 0);
+}
+
+// ─── c8 + short-output + chunked prefill + preemption (ENG-ASYNC-SCHED) ───────
+// Regression for the depth-2 async placeholder underflow observed during the 35B
+// c8 in-situ A/B: with a tight token budget (chunked prefill) AND KV pressure
+// (preemption), a short-output request that is preempted and re-prefilled must
+// not underflow num_output_placeholders. This drives the depth-2 loop with a
+// FAITHFUL runner (empty tokens for still-prefilling requests, mirroring
+// gpu_model_runner.py's discard_request_mask). It asserts the scheduler
+// accounting stays correct (assert num_output_placeholders >= 0 never trips) and
+// every request produces exactly its max_tokens outputs. Before the runner
+// discard_request_mask fix the engine returned a token for prefill chunks, which
+// drained a placeholder that was never reserved -> assertion abort.
+TEST_CASE("AsyncScheduler: c8 short-output chunked-prefill + preemption stays balanced") {
+  const int num_requests = 8;
+  const int prompt_len = 30;   // > max_batched -> chunked prefill
+  const int max_tokens = 4;    // short output
+  const int block_size = 16;
+  // Tight KV forces preemption during decode; tight batched-token budget forces
+  // chunked prefill.
+  auto scheduler = CreateAsyncScheduler(/*max_num_seqs=*/num_requests,
+                                        /*max_num_batched_tokens=*/32,
+                                        /*num_blocks=*/6, block_size);
+  auto requests = CreateRequests(num_requests, prompt_len, max_tokens);
+  for (auto& r : requests) scheduler->add_request(std::move(r));
+
+  struct Frame {
+    SchedulerOutput so;
+    std::set<std::string> discard;
+  };
+  auto do_sched = [&]() {
+    SchedulerOutput so = scheduler->schedule();
+    std::set<std::string> d = DiscardMask(*scheduler, so);
+    return Frame{std::move(so), std::move(d)};
+  };
+
+  std::deque<Frame> sched_outputs;
+  std::map<std::string, int> out_counts;
+  sched_outputs.push_back(do_sched());  // depth-2 priming
+  sched_outputs.push_back(do_sched());
+
+  int guard = 0;
+  while (!sched_outputs.empty() && guard++ < 100000) {
+    Frame f = std::move(sched_outputs.front());
+    sched_outputs.pop_front();
+    ModelRunnerOutput mro = MakeModelRunnerOutput(f.so, f.discard);
+    AccumulateOutputs(scheduler->update_from_output(f.so, mro), out_counts);
+    Frame next = do_sched();
+    if (!next.so.num_scheduled_tokens.empty()) {
+      sched_outputs.push_back(std::move(next));
+    }
+  }
+
+  CHECK(scheduler->get_num_unfinished_requests() == 0);
+  for (int i = 0; i < num_requests; ++i) {
+    CHECK(out_counts[std::to_string(i)] == max_tokens);
+  }
 }

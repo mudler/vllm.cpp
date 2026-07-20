@@ -146,7 +146,8 @@ class AsyncGPUModelRunnerOutput final : public AsyncModelRunnerOutput {
   // The MAIN queue is never synchronized here.
   AsyncGPUModelRunnerOutput(ModelRunnerOutput skeleton, vt::Device device,
                             AsyncOutputPool& pool, AsyncOutputSlot* slot,
-                            int num_reqs, vt::Queue& main_q, vt::Queue& copy_q);
+                            int num_reqs, vt::Queue& main_q, vt::Queue& copy_q,
+                            std::vector<int32_t> invalid_req_indices = {});
   ~AsyncGPUModelRunnerOutput() override;
 
   AsyncGPUModelRunnerOutput(const AsyncGPUModelRunnerOutput&) = delete;
@@ -172,6 +173,11 @@ class AsyncGPUModelRunnerOutput final : public AsyncModelRunnerOutput {
   AsyncOutputPool* pool_;      // borrowed: returns `slot_` on consume/destroy
   AsyncOutputSlot* slot_;      // borrowed: persistent device+pinned buffers+events
   int num_reqs_;
+  // discard_request_mask indices (gpu_model_runner.py:3625-3628): the scheduled
+  // requests still consuming known prefill tokens this step, whose sampled tokens
+  // get_output() must CLEAR to empty (vllm/v1/outputs.py:303-304
+  // valid_sampled_token_ids[i].clear()).
+  std::vector<int32_t> invalid_req_indices_;
   bool consumed_ = false;
 };
 

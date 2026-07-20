@@ -458,6 +458,50 @@ TEST_CASE("runner: four-way ordering identity (mixed decode+prefill)") {
   CHECK(ib2.token_id(1, p_tokens_before) == mro.sampled_token_ids[1][0]);
 }
 
+// ─── discard_request_mask (chunked prefill returns EMPTY tokens) ─────────────
+// A partial prefill chunk (num_scheduled < num_tokens => optimistic seq_len <
+// num_tokens) must NOT sample: gpu_model_runner.py:2048 discard_request_mask +
+// outputs.py:303 valid_sampled_token_ids[i].clear(). The scheduler REQUIRES the
+// runner to return empty token ids for a still-prefilling request
+// (scheduler.py:1888-1890) — otherwise the spurious token is appended as output,
+// and under async scheduling it underflows num_output_placeholders (the c8 +
+// short-output crash, ENG-ASYNC-SCHED). This test is RED without the discard
+// mask (the chunk samples a garbage token and its row grows) and GREEN with it.
+TEST_CASE("runner: chunked prefill returns empty sampled tokens (discard_request_mask)") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), 8, kMaxModelLen, 64);
+
+  // C: a 10-token prompt scheduled in a FIRST chunk of only 5 tokens. seq_len ==
+  // 5 < num_tokens == 10, so this step is still consuming prefill tokens.
+  NewRequestData ch =
+      MakeNewReq("C", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, {}, /*num_computed=*/0,
+                 /*fa_blocks=*/{2, 3}, /*gdn_block=*/1, Greedy());
+  SchedulerOutput so = NewStep({ch}, {{"C", 5}});
+
+  auto out_opt = runner.execute_model(so);
+  CHECK_FALSE(out_opt.has_value());
+
+  const auto& ib = runner.input_batch();
+  REQUIRE(ib.num_reqs() == 1);
+  CHECK(*ib.req_ids[0] == "C");
+  const int c_tokens_before = ib.num_tokens_no_spec[0];  // prompt 10, no output
+  CHECK(c_tokens_before == 10);
+
+  ModelRunnerOutput mro = runner.sample_tokens(std::nullopt);
+
+  // The request is still present in the output (order/index preserved) but its
+  // sampled token list is EMPTY — the scheduler appends no output token.
+  REQUIRE(mro.req_ids.size() == 1);
+  CHECK(mro.req_ids[0] == "C");
+  REQUIRE(mro.sampled_token_ids.size() == 1);
+  CHECK(mro.sampled_token_ids[0].empty());
+
+  // No write-back: the prefill chunk generated no token, so its row must not grow.
+  const auto& ib2 = runner.input_batch();
+  CHECK(ib2.num_tokens_no_spec[0] == c_tokens_before);
+}
+
 // A 3-request mixed batch admitted [P0 prefill, P1 prefill, D decode]. The
 // decode-first reorder must pull D to the front, moving ≥2 requests. Rather than
 // hard-code the exact post-partition permutation (upstream does a MINIMUM-SWAP

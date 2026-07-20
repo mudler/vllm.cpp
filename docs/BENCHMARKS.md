@@ -24,6 +24,16 @@ the TTFT axes → the TTFT gap is bigger than kernel-glue can close; the concurr
 latency. Active lever: prefill-TTFT full-step attribution (host-side / scheduling vs kernel).
 Evidence `dgx:~/work/vllm.cpp-online-gate/evidence/786aa0e…/summary-{27,35}/`.
 
+**Async robustness fix (2026-07-20, not a perf change).** A pre-existing
+`async_scheduler` `num_output_placeholders >= 0` assertion could crash the engine at
+concurrency-8 with short output lengths when `VT_ASYNC_RUNNER` is ON (the binding grid
+runs async-ON). Root cause was a missing `discard_request_mask` in the model runner: it
+emitted a sampled token for prefill-CHUNK requests, so under chunked-prefill + preemption
+the async placeholder count underflowed. Fixed by mirroring vLLM (runner returns empty
+tokens for still-prefilling requests; scheduler unchanged). Byte-identical on the
+non-chunked gates (27B 235/235 + 35B 315/315); `vllm-bench` c8 + short-output + chunked +
+KV-pressure with async ON now completes, `compute-sanitizer memcheck` 0 errors.
+
 **Prefill-TTFT attribution CLOSED (2026-07-19, tasks #61/#62) — no further perf lever
 banked.** Full-step nsys (both sides): 35B prefill is **99.4% GPU-BUSY** (not host/
 scheduling — the concurrency-scheduling hypothesis was measured false; mixed steps are

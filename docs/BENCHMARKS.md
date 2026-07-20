@@ -12,11 +12,16 @@ when the era is rolled up; this page never accumulates their run-by-run history.
 `Qwen3-0.6B`, [spike](../.agents/specs/first-additive-model-qwen3-dense.md)) is a
 CORRECTNESS deliverable — its gate is token-exact greedy vs the vLLM 0.25.0 oracle,
 not a perf benchmark; no binding number is claimed for it. **W3 forward landed;
-W4 SACRED gate is GATING (NOT passed): 11/16 prompts token-exact** (all 16
-first-tokens exact; 5 fail at late-decode semantic near-ties = per-op bf16-rounding
-drift vs vLLM's kernels, confirmed structural-correctness via CPU-exact-f32 10/16 —
-16/16 needs a follow-on flash-exact-d128-attention / bf16-matmul bit-matching pass).
-Benchmark disposition NOT APPLICABLE until the correctness gate passes;
+W4 SACRED gate = 11/16 prompts token-exact, and the 16/16-EXACT gate is ILL-POSED
+(2026-07-20 near-tie razor):** all 16 first-tokens exact; the 5 divergences are bf16
+greedy near-ties (top-1↔top-2 gap ≤0.125 nats; one EXACT 0.0 tie) that vLLM's OWN
+FlashAttention-2 reference does not reproduce run-to-run — vLLM ↔ its committed
+golden = 16·15·16 (N=3) and flips 7/16 prompts over N=10 (p6 4/10, p15 3/10). Our
+11/16 lies inside vLLM's own run-to-run band and emits vLLM's MAJORITY token on 2 of
+the 5 (the golden token is the minority). NOT a kernel bug and no fixed golden to
+bit-match to; correct closure is a near-tie-robust distributional gate (accept if our
+output ∈ vLLM's K-run output set), a gate-DESIGN decision deferred to the user.
+Benchmark disposition NOT APPLICABLE until the correctness gate is well-posed;
 `benchmark_binding=false`. Its regression bar HOLDS: the two gate models stay
 token-exact (27B `test_qwen27_paged_engine` **235/235** + 35B
 `test_qwen36_paged_engine` **315/315**) after the WMMA-prefill re-gate (d==256 only)

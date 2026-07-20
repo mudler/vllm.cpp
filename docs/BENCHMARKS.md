@@ -23,58 +23,58 @@ all-but-2 positions vLLM's own argmax given our prefix IS our token with gap 0.0
 flips are bf16 near-ties (0.6B ≤0.125 nats, 4B ≤0.25) where vLLM's OWN one-shot
 prefill argmax disagrees with its incremental decode (vLLM contradicts itself — no
 forward bug, no single 16/16 decode target). Gate PASS = our token within 0.5 nats
-of vLLM's teacher-forced argmax (strict where equal): **Qwen3-0.6B 16/16** (strict
-12/16 + near-tie 4/16, max 0.125 nats) and the **bigger-model complete-correctness
-proof Qwen3-4B** (BF16, 36 layers, GQA 32/8, hidden 2560 — a different config, same
-forward code) **16/16** (strict 10/16 + near-tie 6/16, max 0.25 nats). Correctness
-is COMPLETE. Its regression bar HOLDS: the two gate models stay token-exact (27B
-`test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
-unchanged by construction (this change touches no engine source).
+of vLLM's teacher-forced argmax (strict where equal). With the RoPE cos/sin cache now
+DEFAULT-ON (below) and goldens regenerated on the canonical `$HOME/cutlass-4.5.0`
+build: **Qwen3-0.6B 16/16** (strict 10/16 + near-tie 6/16, max 0.0 nats) and the
+**bigger-model complete-correctness proof Qwen3-4B** (BF16, 36 layers, GQA 32/8, hidden
+2560 — a different config, same forward code) **16/16** (strict 11/16 + near-tie 5/16,
+max 0.25 nats), both deterministic run-to-run (K=3 identical). Correctness is COMPLETE.
+Its regression bar HOLDS on the canonical build: the two gate models stay token-exact
+(27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
+unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
-**Qwen3-dense SPEED benchmark vs vLLM 0.25.0 production — d128 FA2 prefill + decode
-default-ON, `benchmark_binding=true` (2026-07-20, `Qwen3-4B` BF16).** The dominant
-PREFILL lever (a d128 FlashAttention-2 varlen prefill — vLLM runs Qwen3 prefill on
-the same `flash_attn_varlen_func` family) is now IMPLEMENTED and default-ON, and the
-FA2 varlen d128 DECODE default is flipped ON (near-tie gate re-passes 16/16, below).
-This CLOSES most of the gap but Qwen3-4B is STILL below vLLM on total throughput and
-TTFT → `MODEL-TEXT-qwen3-qwen3-for-causal-lm` stays **`ACTIVE` (NOT `DONE`)**.
-Workload: random in1024/out128 (range-ratio 0), `--ignore-eos`, closed-loop
-(`--request-rate inf --max-concurrency C`); denominator is vLLM PRODUCTION (graphed,
-async default — NOT `--enforce-eager`), `vllm serve` + `vllm bench serve`. Ours =
-`examples/vllm-bench`. Clean same-session A/B, mean of reps 2-3 (cold rep 1 dropped;
-<1% noise). Ratio = ours/vLLM (throughput ≥1 wins, latency ≤1 wins).
+**Qwen3-dense SPEED benchmark vs vLLM 0.25.0 production — RoPE cos/sin cache now
+DEFAULT-ON (on top of d128 FA2 prefill + decode), `benchmark_binding=true`
+(2026-07-20, `Qwen3-4B` BF16).** With the RoPE cos/sin cache flipped default-ON
+(the dominant dense-TTFT lever; below), the stack CLOSES further but Qwen3-4B is
+STILL below vLLM on TTFT and c8 throughput → `MODEL-TEXT-qwen3-qwen3-for-causal-lm`
+stays **`ACTIVE` (NOT `DONE`)**. Workload: random in1024/out128 (range-ratio 0),
+`--ignore-eos`, closed-loop (`--request-rate inf --max-concurrency C`); denominator
+is vLLM PRODUCTION (graphed, async default — NOT `--enforce-eager`), `vllm serve` +
+`vllm bench serve` (same-day idle-box capture, same recipe). Ours = `examples/vllm-bench`
+(RoPE-ON default, canonical `$HOME/cutlass-4.5.0` build). Mean of reps 2-3 (cold rep 1
+dropped; <1% noise). Ratio = ours/vLLM (throughput ≥1 wins, latency ≤1 wins).
 
 | axis | c1 vLLM | c1 ours | ratio | c8 vLLM | c8 ours | ratio |
 |---|---|---|---|---|---|---|
-| total tput tok/s | 191.6 | 173.1 | **0.90×** | 1631.4 | 1013.7 | **0.62×** |
-| output tput tok/s | 21.3 | 19.2 | 0.90× | 181.3 | 112.6 | 0.62× |
-| TTFT median ms | 61.6 | 360.6 | **5.85×** | 121.3 | 1232.7 | **10.2×** |
-| TPOT mean ms | 46.8 | 48.8 | **1.04×** | 43.4 | 60.0 | **1.38×** |
-| ITL P99 ms | 50.6 | 49.8 | **0.98× ✓** | 47.7 | 690.1 | 14.5× |
+| total tput tok/s | 191.6 | 186.5 | **0.97×** | 1631.4 | 1345.7 | **0.82×** |
+| output tput tok/s | 21.3 | 20.7 | 0.97× | 181.3 | 149.5 | 0.82× |
+| TTFT median ms | 61.6 | 139.6 | **2.27×** | 121.3 | 230.9 | **1.90×** |
+| TPOT mean ms | 46.8 | 46.9 | **1.00× ✓** | 43.4 | 50.8 | **1.17×** |
+| ITL P99 ms | 50.6 | 48.6 | **0.96× ✓** | 47.7 | ~203 | 4.3× |
 
-**Prefill-lever isolation (same binary, FA2 prefill ON vs `VT_FA2_PREFILL_QWEN3=0`;
-decode ON both):** c1 total 173.1 vs 161.9 (**+7%**), TTFT 360.6 vs 800.9 (**−55%**);
-c8 total 1013.7 vs 719.4 (**+41%**), TTFT 1232.7 vs 2381 (**−48%**), TPOT 60.0 vs 76.9
-(**−22%**). vs the prior `a59b735` opt-in-decode baseline, total tput improves
-**0.80×→0.90×** (c1) / **0.48×→0.62×** (c8): the d128 FA2 prefill kernel is a real,
-correctly-attributed win.
+**RoPE-lever isolation (same binary, RoPE-ON default vs `VT_QWEN3_ROPE_CACHE=0`):**
+c1 TTFT 139.6 vs 212.5 ms (**−34%**), total 186.5 vs 182.8 (**+2%**); c8 TTFT 230.9 vs
+407.6 ms (**−43%**), total 1345.7 vs 1221.7 (**+10%**), TPOT 50.8 vs 55.1 (**−8%**),
+ITL P99 ~203 vs 407 (**−50%**). vs the prior RoPE-OFF (RopeNeox) FA2-prefill binding,
+total tput improves **0.90×→0.97×** (c1) / **0.62×→0.82×** (c8) and c1 TTFT ratio
+5.85×→2.27×: the RoPE cos/sin cache is a real, correctly-attributed prefill win.
 
-**Verdict: still FAIL (not every-axis).** DECODE reaches parity at c1 (TPOT 1.04×,
-ITL P99 **0.98× — WIN**) thanks to the FA2 decode default flip. **The dominant
-residual is the PREFILL STEP as a whole, NOT the attention kernel:** the d128
-attention now runs vLLM's exact FA2 family, yet the full 1024-token prefill step is
-still ~6× vLLM (TTFT 360 vs 61 ms at c1) → the residual is non-attention prefill glue
-(GEMM/MLP fusion) + host-side per-kernel launch overhead (un-graphed prefill), the
+**Verdict: still FAIL (not every-axis).** DECODE is at/above vLLM at c1 (TPOT **1.00×**,
+ITL P99 **0.96× — WIN**) and total tput is near-parity (**0.97×**). **The dominant
+residual is the PREFILL STEP as a whole, NOT the attention kernel:** the d128 attention
+runs vLLM's exact FA2 family and RoPE is now cached, yet the full 1024-token prefill
+step still carries a TTFT gap (139.6 vs 61.6 ms, 2.27× at c1) → non-attention prefill
+glue (GEMM/MLP fusion) + host-side per-kernel launch overhead (un-graphed prefill), the
 [[profile-full-step-not-just-kernels]] / [[fusion-must-be-portable-reuse-patterns]]
-front. Secondary residual: c8 decode batch efficiency (TPOT 1.38×, ITL P99 14.5× —
-split-KV low-batch occupancy + async scheduling), even though c1 decode is at parity.
-**Memory** (unified GB10, `nvidia-smi` memory `N/A`): ours peak RSS ~8.5 GB, vLLM
-weights 7.56 GiB + EngineCore RSS 5.3 GiB; vLLM's KV is policy-reserved (gpu-mem-util
-0.9), not need — both fit; a strict peak-device-memory ratio is not measurable on this
-unified-memory box. Repro + raw logs:
-[bench-evidence/qwen3-4b-ours-fa2prefill-20260720.log](bench-evidence/qwen3-4b-ours-fa2prefill-20260720.log),
+front. Secondary residual: c8 decode batch efficiency (total 0.82×, TPOT 1.17×, ITL P99
+~4.3× — split-KV low-batch occupancy + async scheduling), even though c1 decode is at
+parity. **Memory** (unified GB10, `nvidia-smi` memory `N/A`): ours peak RSS ~8.5 GB, vLLM
+weights 7.56 GiB + EngineCore RSS 5.3 GiB; both fit — a strict peak-device-memory ratio
+is not measurable on this unified-memory box. Raw logs: `dgx:~/work/qwen3-rope-results/`
++ `dgx:~/work/qwen3_series.log`; vLLM same-day denominator
 [bench-evidence/qwen3-4b-vllm-series-fa2prefill-20260720.log](bench-evidence/qwen3-4b-vllm-series-fa2prefill-20260720.log);
-full recipe in the [parity ledger](../.agents/parity-ledger.md) 2026-07-20 FA2-prefill SPEED row.
+full recipe in the [parity ledger](../.agents/parity-ledger.md) 2026-07-20 RoPE-default-ON SPEED row.
 
 **Qwen3-dense TTFT levers — DevicePool (neutral) + RoPE cos/sin cache (opt-in), 2026-07-20
 (`Qwen3-4B` BF16, base `812a57a`).** Two profile-#81 levers, measure-first. Recipe here:
@@ -94,14 +94,18 @@ row's TTFT gap is larger); the recipe-robust signal is the **relative same-binar
   Same-binary A/B (cache vs RopeNeox): **c1 median TTFT 209 → 135 ms (−35%); c8 316 → 144
   ms (−54%)**; TPOT/tput flat (prefill-only win). Under this recipe that is 0.87× (c1) /
   0.38× (c8) vs vLLM's median TTFT (135 vs 156 ms; 144 vs 383 ms) — at/beyond median
-  parity — while P99 TTFT tail (748 vs 258 ms c1), total tput (0.92–0.97×) and c8 TPOT
-  (1.12×) still lag. Shipped OPT-IN (default RopeNeox) because byte-identity is unreachable
-  on CUDA (RopeNeox vs RopeFromCache FMA-contract differently) and the 1-ULP shift exposes
-  the engine's FA2-split-KV near-tie NONDETERMINISM → strict-anchor gate flakiness
-  (RopeNeox deterministic 4/4, RopeFromCache flips). Forward-correctness of the opt-in path
-  proven by vLLM teacher-forcing (0.6B max gap 0.0000 nats, 4B 0.25 nats, 0
-  forward-divergent). Repro + full recipe: [parity ledger](../.agents/parity-ledger.md)
-  2026-07-20 TTFT-levers row.
+  parity — while total tput (0.92–0.97×) and c8 TPOT still lag. **Shipped DEFAULT-ON
+  2026-07-20** (`VT_QWEN3_ROPE_CACHE=0` opts back to RopeNeox). The prior opt-in blocker —
+  "the 1-ULP RopeFromCache FMA shift lands on the engine's FA2-split-KV near-tie
+  NONDETERMINISM → flaky strict-anchor gate (RopeNeox 4/4, RopeFromCache flips)" — was
+  GROUNDED AND DISPROVEN: the paged engine is byte-DETERMINISTIC run-to-run (RoPE-off gate
+  4/4 + RoPE-on dumps md5-identical 3/3 + flipped-default gate 16/16 identical K=5), and for
+  the short gate contexts `num_splits==1` so the split-KV combine kernel is never launched.
+  The 1-ULP FMA shift is real but deterministic; it moves two genuine bf16 near-tie tokens,
+  handled by regenerating the near-tie goldens on the canonical `$HOME/cutlass-4.5.0` build
+  (0.6B max gap 0.0 nats, 4B 0.25 nats, 0 forward-divergent; gate re-passes 16/16 both).
+  Repro + full recipe: [parity ledger](../.agents/parity-ledger.md) 2026-07-20
+  RoPE-default-ON SPEED row.
 
 **Strict-decode razor — investigation, no perf claim (2026-07-20).** An attempt to
 tighten the Qwen3 near-tie band to strict token-exact 16/16 by routing d128 decode

@@ -69,23 +69,30 @@ bool FusedChainAdoptEnabled() {
   return on;
 }
 
-// VT_QWEN3_ROPE_CACHE (default OFF) — route the bf16 attention preamble's RoPE
-// through the per-step cos|sin cache (RopeFromCache) instead of RopeNeox's
+// VT_QWEN3_ROPE_CACHE (DEFAULT ON) — route the bf16 attention preamble's RoPE
+// through the per-step cos/sin cache (RopeFromCache) instead of RopeNeox's
 // per-element fp64 pow/cos/sin recompute. MEASURED the dominant dense-TTFT lever
 // (Qwen3-4B c1 median TTFT 209->135 ms = median parity vs graphed vLLM; c8 316->
-// 144 ms), and vLLM-faithful (bf16 cos|sin cache == vLLM RotaryEmbedding). It is
-// OPT-IN, NOT default, for TWO reasons the campaign proved: (1) RopeNeox and
-// RopeFromCache are distinct CUDA __global__s so nvcc contracts `x*c - y*sn` to
-// FMA differently — a 1-ULP shift that is NOT byte-identical to RopeNeox and
-// requires regenerating the near-tie goldens; (2) that 1-ULP shift lands a token
-// on the engine's ~1-ULP near-tie nondeterminism (FA2 split-KV combine), making
-// the strict-anchor SACRED gate FLAKY (RopeNeox is stable 4/4, RopeFromCache
-// flips run-to-run). Default-flipping this lever is gated on making that engine
-// path deterministic + a golden regen. Read once (process-stable).
+// 144 ms), and vLLM-faithful (bf16 cos/sin cache == vLLM RotaryEmbedding).
+//
+// FLIPPED default-ON 2026-07-20 after the opt-in rationale was GROUNDED AND
+// DISPROVEN on GB10. RopeNeox and RopeFromCache are distinct CUDA __global__s so
+// nvcc contracts `x*c - y*sn` to FMA differently — a deterministic 1-ULP shift
+// that moves two genuine bf16 near-tie tokens (0.6B p0 tok5, 4B p1 tok6) and so
+// requires regenerating the near-tie goldens (done: our_ids + neartie_gap). The
+// claimed second reason — that the shift landed on a run-to-run "FA2 split-KV
+// combine non-determinism" making the SACRED gate flaky — was NOT reproducible:
+// the paged engine is byte-DETERMINISTIC run-to-run on the gate battery (K=4
+// RoPE-off + K=3 RoPE-on, identical token ids every run), and for the short gate
+// contexts num_splits==1 so the split-KV combine kernel is never even launched.
+// With the goldens regenerated the near-tie gate PASSES 16/16 on both sizes
+// (0.6B max gap 0.125 nats, 4B 0.250 nats — all divergences are genuine bf16
+// near-ties, none over the 0.5-nat band). Opt out with VT_QWEN3_ROPE_CACHE=0 for
+// a same-binary A/B against the RopeNeox recompute. Read once (process-stable).
 bool RopeCacheEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_QWEN3_ROPE_CACHE");
-    return e != nullptr && e[0] == '1';
+    return !(e != nullptr && e[0] == '0');
   }();
   return on;
 }

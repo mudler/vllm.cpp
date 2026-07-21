@@ -1370,8 +1370,8 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 - **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0 (grounding) + W1
   (spec-driven KV allocation) (2026-07-21, `CLAIM-MLA-DEEPSEEK`,
-- **Qwen3-32B-NVFP4A16 (compressed-tensors W4A16) W0–W4 — SPEED PENDING
-  (2026-07-21, `CLAIM-QUANT-NVFP4-CT-W4A16`,
+- **Qwen3-32B-NVFP4A16 (compressed-tensors W4A16) W0–W4b — CORRECTNESS COMPLETE,
+  SPEED PENDING (2026-07-21, `CLAIM-QUANT-NVFP4-CT-W4A16`,
   [spike](../.agents/specs/sweep-qwen3-32b-nvfp4a16.md)).**
   `benchmark_binding=false`; **PENDING — deliberately not measured.** This change
   adds a new quantization scheme (compressed-tensors NVFP4A16 / W4A16) to the
@@ -1383,11 +1383,23 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   Qwen3-dense **664/664**, OPT **36/36**, all UNCHANGED; plus
   `test_ops_nvfp4_fp4` 27002/27002, `test_ops_moe_grouped` 146/146,
   `test_ops_moe_grouped_bf16` 19/19, and `compute-sanitizer memcheck` 0 errors).
-  **Speed is not reported because correctness is not yet met**, and this project
-  does not publish a throughput number for a model that fails its correctness
-  gate. The SACRED strict token-exact gate currently scores **4/6 prompts
-  (67/96 tokens)** against the deterministic vLLM 0.25.0 oracle and was NOT
-  loosened; see the spike §6b for the isolation.
+  **Correctness is now MET (W4b, 2026-07-21) and speed is STILL not measured** —
+  the two are separate gates and this entry stays `PENDING` until the throughput
+  run below is executed. The strict token-exact bar scored **4/6 prompts (67/96
+  tokens)** against the deterministic vLLM 0.25.0 oracle and was NOT loosened on
+  that evidence; the ratified TEACHER-FORCING isolation
+  (`scripts/qwen3-32b-nvfp4a16-neartie-gap.py`) was then run and measured **all
+  29 divergent positions within 0.0625 nats of vLLM's own argmax given OUR
+  prefix, with 28/29 EXACTLY 0.0** — one root flip being an exact bf16 tie at
+  which vLLM's teacher-forced argmax is OUR token while its incremental greedy
+  chose the other (vLLM contradicts itself). The residual is therefore the
+  PRE-EXISTING dense-forward bf16 near-tie drift, recorded against the dense
+  `Qwen3ForCausalLM` row, not the quantization — which is separately exonerated
+  by the bit-exact CPU proof, `fallback_gemms=0`, and invariance across both of
+  our quantized GEMMs. The gate now closes **6/6 (strict 4/6 + near-tie band 2/6,
+  max gap 0.062 nats vs the 0.5-nat bar shared with the BF16 Qwen3 gates, 0
+  forward-divergent)** with the per-position nats evidence committed as goldens;
+  see the spike §6c.
   The future benchmark disposition is fixed now so it cannot be quietly loosened
   later: the vehicle is **`RedHatAI/Qwen3-32B-NVFP4A16`** measured against
   **graphed** vLLM 0.25.0 (`enforce_eager=False`,

@@ -15916,3 +15916,57 @@ That measurement is NOT run. Until it is, the row is failing a strict gate for a
 unproven reason and must be reported that way.
 
 Row lands `ACTIVE`/correctness-GATING. Speed was never started and is explicitly pending.
+
+## 2026-07-21 — Qwen3-32B-NVFP4A16 W4b: the teacher-forcing diagnosis (correctness CLOSED)
+
+Worktree `agent-aa857f4152f4e9b03`, base `80d1da0`. Task: diagnose why the
+compressed-tensors W4A16 strict gate failed 4/6, and fix it if the cause was ours.
+
+**Ran the named measurement first, before any speculative fixing** — as directed.
+New `scripts/qwen3-32b-nvfp4a16-neartie-gap.py` (mirror of the Coder/dense
+scripts) plus a `VT_DUMP_IDS=1` bootstrap in the gate to dump our exact ids.
+
+**Result — decisive.** All 29 token-divergent positions gap <= 0.0625 nats;
+**28 of 29 are EXACTLY 0.0** (our token IS vLLM's own argmax given our prefix).
+
+- `prompt[5]` tok1 (`" moon"` vs `" Moon"`) is an **EXACT bf16 tie**: vLLM's own
+  logprobs are bit-identical (-0.727154 each), its teacher-forced argmax is OUR
+  token, and its incremental greedy chose the other. vLLM contradicts itself.
+- `prompt[2]` tok1 gaps 0.0625 nats. Calibration probe: vLLM's OWN separation at
+  that same position moves **0.125 nats** purely from batch composition
+  (0.1875 alone -> 0.0625 with fillers). Our gap is below the oracle's own jitter,
+  and below the 0.25-nat gap already ratified on the UNQUANTIZED 4B.
+- The other 27 are downstream cascade, all gap 0.0.
+
+Sharpness note worth reusing: because every prefill argmax is exact, the prefix
+at both root flips is BIT-IDENTICAL to vLLM's, so the gap is a direct
+single-position logit comparison rather than a prefix-drift artefact. Check for
+that property before interpreting any gap.
+
+**Verdict: NOT a W4A16 defect.** It is the pre-existing dense-forward bf16
+near-tie drift run 64 layers deep, and it is recorded against the DENSE row
+`MODEL-TEXT-qwen3-qwen3-for-causal-lm`, not the quant row. The quant path is
+exonerated four ways (bit-exact CPU proof, `fallback_gemms=0`, invariance across
+both quantized GEMMs, <=0.0625-nat gaps). No fix was needed and none was invented.
+
+**Gate.** Converted to the ratified near-tie-robust bar (`kNearTieMnats = 500`,
+same as the dense Qwen3 / Qwen3-Coder gates) ONLY after that proof, with the
+per-position nats evidence committed as goldens (`our_ids.npy`,
+`neartie_gap_mnats.npy`) and a hard `REQUIRE` anchor pinning the band to the exact
+sequence we emit. **6/6 PASS — strict 4/6 (67/96 tokens) + band 2/6, max gap
+0.062 nats, 0 forward-divergent, 142/142 assertions.**
+
+**Scope discipline:** zero `src/`/`include/` delta — the whole change is one test,
+one script, two goldens. Regressions re-confirmed anyway: 27B 235/235, 35B
+315/315, Coder 138/138, Qwen3-dense 664/664, OPT 36/36, loader 5144/5144, forward
+doctest 1031/1031, ops suites green, `-Werror` 0-warn. memcheck 0 preserved by
+construction.
+
+**Environment hazard hit three times:** dgx hard-rebooted at 23:10, 23:48 and
+23:53 (`last reboot`), killing a build and a regression batch. Ran the oracle at
+`gpu_memory_utilization=0.40` throughout and re-ran the lost work individually
+under `flock /tmp/gpu`. GB10's 119 GiB unified pool remains the standing risk
+with concurrent agents active.
+
+**NEXT for this row: W5 SPEED** — every-axis parity vs graphed vLLM 0.25.0 on the
+64L dense W4A16 at small M. Not started; the row stays `ACTIVE`, never `DONE`.

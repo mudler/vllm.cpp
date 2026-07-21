@@ -15793,3 +15793,70 @@ existing non-MLA selection unchanged. Committed on the worktree branch;
   attention kernel — only a registry TU, the loader's `fused_qkv_a_proj` merge, and
   the shared router extension. If it needs a new kernel, the MLA block was
   over-specialized to DeepSeek-V2-Lite and that is worth knowing early.
+
+## 2026-07-21 — MLA W1 INTEGRATION FIX: the OPT KV spec must carry the resolved cache dtype (`CLAIM-MLA-DEEPSEEK`, main repo, commit `888fbcc`)
+
+**A hazard that existed only in the COMBINATION of two independently-correct
+changes, caught by verifying the MERGED state rather than the worktree.**
+
+OPT-125m (`b8358a5` / `aa65ce7`) landed between the MLA campaign's base
+(`fb3fd5d`) and its merge. `MakeOPTKVCache` (`opt_registry.cpp`) builds its
+`FullAttentionSpec` with a hardcoded `vt::DType::kF32`.
+
+- **Before W1 this was INERT.** The runner ignored the spec's dtype entirely and
+  always allocated bf16 (unless `VT_KV_CACHE_F32=1`), so the `kF32` was purely
+  decorative — as it was in all three Qwen factories too.
+- **After W1 the runner takes the dtype FROM the spec.** OPT would therefore
+  have silently received an **f32 paged KV cache**: double the KV memory, and
+  different attention numerics than the ones its **STRICT 6/6 token-exact** gate
+  was captured with.
+
+Neither change is wrong in isolation, and neither author could have seen it
+alone — which is precisely the silent drift W1 exists to prevent. `MakeOPTKVCache`
+now uses `v1::ResolveKvCacheDType()` like the other three factories, so **all
+four spec producers agree** and the spec is genuinely the single source of truth
+for the paged-KV storage dtype.
+
+**Generalized rule for every future model TU** (the reason this is worth a state
+entry rather than a one-line fix): since W1, a KV-spec producer that publishes a
+dtype the engine was not actually going to allocate is no longer harmless — it
+CHANGES BEHAVIOUR. Any new `MakeXxxKVCache` must build its attention spec with
+`v1::ResolveKvCacheDType()`, never a literal dtype. A grep of
+`make_shared<v1::FullAttentionSpec>` across `src/vllm/model_executor/models/`
+should return only `ResolveKvCacheDType()` call sites.
+
+**GATES — re-run in full, not spot-checked.** Clean dgx build, CUDA `-Werror`,
+**0 warnings / 0 errors**; whole series under ONE `flock /tmp/gpu` via the
+purpose-built `scripts/opt-dgx-gate.sh`, which md5-verifies the OPT goldens
+BEFORE and AFTER (identical both times):
+
+- **OPT W4 SACRED gate: STRICT 6/6 prompts, 96/96 tokens** token-exact vs the
+  vLLM 0.25.0 oracle (vLLM self-determinism: 0 multi-valued cells).
+- OPT W2 loader gate + the new LayerNorm/ReLU/Add op tests (29966 assertions)
+  green.
+- **REGRESSIONS UNCHANGED:** 27B **235/235**; 35B **315/315**; Qwen3-Coder
+  **6/6** (strict 5/6, near-tie 1/6, 0 forward-divergent); Qwen3-dense **664
+  assertions** (0.6B 16/16, 4B 16/16).
+- model registry 231, pretokenizer 97926, gguf model loader 3 assertions green.
+- `compute-sanitizer memcheck` on the OPT engine path: **0 errors**.
+- Series overall exit **0**.
+
+**RECORD HONESTY — the commit subject is a placeholder and this is why.** The
+fix was committed properly (message with full justification + gate evidence +
+`Assisted-by:` trailer) as `a191ef6`, but a CONCURRENT reset in the shared main
+repo replaced it with the earlier throwaway transfer commit `888fbcc`
+(`wip: opt kv dtype`, no `Assisted-by:` trailer). The **code content in `HEAD` is
+the correct, gated version** — verified: the explanatory comment, the
+`vllm/v1/kv_cache_dtype.h` include, and the `ResolveKvCacheDType()` call are all
+present. History was **NOT rewritten**: two commits from another agent
+(`d4bd4ac`, `a05437f`) already build on `888fbcc`, and rewriting shared history
+under an active concurrent agent is worse than a bad commit subject. The
+justification and evidence therefore live HERE and in the ledger row for
+`888fbcc`. **Whoever pushes should be aware `888fbcc` lacks the `Assisted-by:`
+trailer** required by the AI-contribution policy.
+
+**Also open at handoff (NOT mine to fix):** `scripts/check-doc-checkpoint.py` is
+currently RED for `a05437f` (another agent's record commit changed
+`.agents/model-matrix.md` + `.agents/roadmap_v1.md` without touching README /
+docs/BENCHMARKS). `scripts/check-agent-record.py` is green. That must be cleared
+before push.

@@ -1385,6 +1385,13 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   the **FlashInfer CUTLASS** backend, not Triton `fused_moe`, so the "our grouped
   MoE GEMM runs ~1.2x vLLM's Triton `fused_moe`" figure from the 35B work does NOT
   transfer to this model's speed denominator and must be re-measured.
+  **Integration fix folded in (`888fbcc`), also NOT APPLICABLE:** OPT-125m's KV
+  factory published a decorative `float32` spec dtype that was inert before the
+  W1 refactor and would have allocated an f32 KV cache after it. Corrected to the
+  resolved dtype (bf16 default), which RESTORES OPT's pre-existing allocation
+  rather than changing it, so no OPT number is created or invalidated. Re-gated:
+  OPT STRICT 6/6 (96/96 tokens), 27B 235/235, 35B 315/315, Qwen3-Coder 6/6,
+  Qwen3-dense 664 assertions, memcheck 0, goldens md5-identical before and after.
   **Benchmarks are PENDING and cannot begin until the implementation does.** The
   future benchmark disposition is fixed now so it cannot be quietly loosened
   later: the MLA gate vehicle is **DeepSeek-V2-Lite bf16**, measured against

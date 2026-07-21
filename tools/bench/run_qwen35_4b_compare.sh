@@ -135,7 +135,8 @@ finish_leg() {
 }
 
 run_cpp() {
-  local phase=$1 mode=$2 rep=$3 direct=$4 name="$phase-cpp-$mode-r$rep"
+  local phase=$1 mode=$2 rep=$3 direct=$4
+  local name="$phase-cpp-$mode-r$rep"
   prepare_leg "$name"
   printf '%q ' env VT_RELEASE_HOST_WEIGHTS=1 VT_DIRECT_DEVICE_LOAD="$direct" \
     "$cpp" "${cpp_args[@]}" --output-token-ids "$out/$name.tokens.json" \
@@ -155,7 +156,8 @@ run_cpp() {
 }
 
 run_vllm() {
-  local phase=$1 rep=$2 name="$phase-vllm-r$rep"
+  local phase=$1 rep=$2
+  local name="$phase-vllm-r$rep"
   prepare_leg "$name"
   printf '%q ' env "${vllm_env[@]}" "$vllm_python" "${vllm_args[@]}" \
     --request-id-base "$((rep * 1000))" \

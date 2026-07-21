@@ -41,7 +41,7 @@ HfConfig Config(std::vector<std::string> architectures) {
 
 TEST_CASE("registry_imports: every registered architecture has a complete factory") {
   const auto registrations = ModelRegistry::Registrations();
-  REQUIRE(registrations.size() == 3);
+  REQUIRE(registrations.size() == 4);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -71,18 +71,21 @@ TEST_CASE("self_registration: both Qwen archs self-register from their own TUs")
     return false;
   };
   CHECK(has_arch("Qwen3ForCausalLM"));
+  CHECK(has_arch("Qwen3MoeForCausalLM"));
   CHECK(has_arch("Qwen3_5ForConditionalGeneration"));
   CHECK(has_arch("Qwen3_5MoeForConditionalGeneration"));
 
   // Registration arrival order across TUs is unspecified under C++ static init,
   // so the registry imposes a stable canonical sort by architecture name. This
   // makes SupportedArchs()/error-message order deterministic. Byte order puts
-  // "Qwen3ForCausalLM" first ('F' (0x46) < '_' (0x5F) after the "Qwen3" prefix),
-  // then the two hybrid Qwen3.5 wrappers; resolution is order-independent.
+  // "Qwen3ForCausalLM" first ('F' (0x46) < 'M' (0x4D) < '_' (0x5F) after the
+  // "Qwen3" prefix), then the full-attention MoE "Qwen3MoeForCausalLM", then the
+  // two hybrid Qwen3.5 wrappers; resolution is order-independent.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 3);
+  REQUIRE(supported.size() == 4);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   CHECK(supported.front() == "Qwen3ForCausalLM");
+  CHECK(supported[1] == "Qwen3MoeForCausalLM");
   CHECK(supported.back() == "Qwen3_5MoeForConditionalGeneration");
 
   // The dense/MoE scheduler policy split survives the per-variant TU move.
@@ -98,8 +101,10 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
     CHECK_FALSE(registration.info.is_pooling_model);
     CHECK_FALSE(registration.info.has_inner_state);
     CHECK(registration.info.score_type == "bi-encoder");
-    if (registration.architecture == "Qwen3ForCausalLM") {
-      // Pure dense text-only arch: NOT hybrid (no GDN), NOT multimodal.
+    if (registration.architecture == "Qwen3ForCausalLM" ||
+        registration.architecture == "Qwen3MoeForCausalLM") {
+      // Pure text-only full-attention arch (dense OR MoE): NOT hybrid (no GDN),
+      // NOT multimodal (no vision tower).
       CHECK_FALSE(registration.info.is_hybrid);
       CHECK_FALSE(registration.info.supports_multimodal);
     } else {
@@ -131,6 +136,36 @@ TEST_CASE("resolve_model_cls: Qwen3ForCausalLM resolves to the dense additive fa
   // NO MambaSpec/GDN group (the topology that forces the runner generalization).
   HfConfig kv_config = config;
   kv_config.num_key_value_heads = 8;
+  kv_config.head_dim = 128;
+  const vllm::v1::KVCacheConfig kv =
+      reg.factory->make_kv_cache(kv_config, /*block_size=*/16, /*num_blocks=*/8);
+  REQUIRE(kv.kv_cache_groups.size() == 1);
+  CHECK(kv.kv_cache_groups[0].kv_cache_spec->kind() ==
+        vllm::v1::KVCacheSpecKind::kFullAttention);
+}
+
+TEST_CASE("resolve_model_cls: Qwen3MoeForCausalLM resolves to the full-attention MoE factory") {
+  // W0 of the first full-attention MoE bring-up: the new TU
+  // (qwen3_moe_registry.cpp) self-registers "Qwen3MoeForCausalLM" with ZERO edit
+  // to a shared array. It must resolve to a complete factory whose KV-cache
+  // builder is present and, unlike the 35B hybrid MoE, is full-attention ONLY.
+  const HfConfig config = Config({"Qwen3MoeForCausalLM"});
+  const ModelRegistration& reg = ModelRegistry::Resolve(config);
+  CHECK(reg.architecture == "Qwen3MoeForCausalLM");
+  REQUIRE(reg.factory != nullptr);
+  CHECK(reg.factory->parse_config != nullptr);
+  CHECK(reg.factory->load_weights != nullptr);
+  CHECK(reg.factory->prepare != nullptr);
+  CHECK(reg.factory->forward != nullptr);
+  CHECK(reg.factory->make_kv_cache != nullptr);
+  // MoE, not dense: the scheduler-policy split flags it non-dense.
+  CHECK_FALSE(reg.factory->is_dense_model);
+
+  // Full-attention MoE KV-cache spec: exactly one FA group, NO MambaSpec/GDN
+  // group (Qwen3-Coder has no linear-attention layers — the runner's
+  // full-attention-only path covers it with zero runner change).
+  HfConfig kv_config = config;
+  kv_config.num_key_value_heads = 4;
   kv_config.head_dim = 128;
   const vllm::v1::KVCacheConfig kv =
       reg.factory->make_kv_cache(kv_config, /*block_size=*/16, /*num_blocks=*/8);
@@ -214,8 +249,9 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 3> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 4> kExampleConfigArchitectures{
       "Qwen3ForCausalLM",
+      "Qwen3MoeForCausalLM",
       "Qwen3_5ForConditionalGeneration",
       "Qwen3_5MoeForConditionalGeneration",
   };
@@ -285,7 +321,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(unknown),
       "Model architectures ['LlamaForCausalLM'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['Qwen3ForCausalLM', 'Qwen3_5ForConditionalGeneration', "
+      "dict_keys(['Qwen3ForCausalLM', 'Qwen3MoeForCausalLM', "
+      "'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForConditionalGeneration'])",
       std::runtime_error);
 
@@ -294,7 +331,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(multiple),
       "Model architectures ['UnknownA', 'UnknownB'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['Qwen3ForCausalLM', 'Qwen3_5ForConditionalGeneration', "
+      "dict_keys(['Qwen3ForCausalLM', 'Qwen3MoeForCausalLM', "
+      "'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForConditionalGeneration'])",
       std::runtime_error);
 }

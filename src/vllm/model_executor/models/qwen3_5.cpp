@@ -12,6 +12,7 @@
 
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
+#include "vllm/model_executor/models/qwen3_5_moe_block.h"  // RunMoeBlock (SEAM GAP #2 exposure)
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor residency seam
 
@@ -4397,14 +4398,24 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
     }
   }
 
-  // Shared expert (moe-semantics.md §5): device-resident (takes dh).
-  DBuf shared = SharedExpert(d, w, cfg, dh, T, fp4);
+  // Shared expert (moe-semantics.md §5): device-resident (takes dh). GUARDED on
+  // shared_expert_intermediate_size>0 — the 35B has a gated shared expert (runs
+  // exactly as before, byte-identical), but a full-attention MoE with NO shared
+  // expert (Qwen3-Coder `Qwen3MoeForCausalLM`, shared_expert_intermediate_size==0,
+  // no shared weights) SKIPS it and passes a nullptr shared term to MoeCombine
+  // (which treats a null shared as the pure routed sum). Mirrors vLLM
+  // Qwen3MoeSparseMoeBlock: `shared_expert = None` when the size is 0
+  // (qwen3_moe.py:180-202). SEAM GAP #3, sweep-qwen3-coder-30b.md §3b.
+  const bool has_shared = cfg.shared_expert_intermediate_size > 0;
+  std::optional<DBuf> shared;
+  if (has_shared) shared.emplace(SharedExpert(d, w, cfg, dh, T, fp4));
 
   // Combine (moe-semantics.md §6): out = shared + sum_j w_j * expert_out_j.
   DBuf deo(d, DType::kBF16, {T, top_k, H}, expert_out.data());
   DBuf dwt(d, DType::kF32, {T, top_k}, weights.data());
   DBuf dout(d, DType::kBF16, {T, H});
-  vt::MoeCombine(d.q, dout.t(), deo.t(), dwt.t(), &shared.t());
+  vt::MoeCombine(d.q, dout.t(), deo.t(), dwt.t(),
+                 has_shared ? &shared->t() : nullptr);
   return dout;
 }
 
@@ -4746,6 +4757,25 @@ void RunDenseLayerPaged(Dev d, const Qwen3_5DenseLayerWeights& layer,
 }
 
 }  // namespace
+
+// Exposed wrapper over the anon-ns `MoeBlock` (SEAM GAP #2) so a full-attention
+// MoE in another TU (qwen3_moe.cpp, W3) can reuse the exact same sparse-MoE block.
+// Builds the internal Dev, runs MoeBlock, and releases the combined DBuf into an
+// owning MoeBlockOutput whose deleter returns the pool block to the DevicePool
+// (the WrapDeviceLogits release pattern). The 35B path never calls this — it is a
+// pure ADD, so Qwen3.6-35B remains byte-identical.
+MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
+                           const HfConfig& config, const vt::Tensor& dh, int64_t T) {
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf out = MoeBlock(d, weights, config, dh, T);
+  MoeBlockOutput r;
+  r.tensor = out.t();
+  const size_t alloc = out.alloc_bytes();
+  void* p = out.Release();  // dtor now a no-op; we own the Pool().Put obligation
+  r.storage =
+      std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+  return r;
+}
 
 // Embed: hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident table).
 // KEPT OUTSIDE THE CUDA-GRAPH (M2.5 Phase 2): the CUDA Embedding op allocates a

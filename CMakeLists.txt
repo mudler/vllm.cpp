@@ -178,6 +178,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_dense.cpp
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
+  src/vllm/model_executor/models/qwen3_moe_registry.cpp
   src/vllm/model_executor/models/model_registry.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp

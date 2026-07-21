@@ -1361,6 +1361,22 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Sweep model #1 W0+W1 — Qwen3-Coder-30B-A3B (`Qwen3MoeForCausalLM`) registry
+  stub + reusable-piece refactors (2026-07-21, `CLAIM-MODEL-QWEN3-CODER`).**
+  Infrastructure + three behaviour-preserving refactors; NO forward yet (W3), so
+  nothing to benchmark and no perf claim. W0 = a new registry TU
+  (`qwen3_moe_registry.cpp` + `qwen3_moe.h`, one `REGISTER_VLLM_MODEL`, a
+  full-attention-only KV spec, `is_dense_model=false`, clear-throwing W2/W3
+  load/forward stubs). W1 = (#1) the dense self-attention block + device glue
+  EXTRACTED verbatim to `dense_attn_block.h` (Qwen3-dense byte-identical), (#2)
+  the bf16 `MoeBlock` EXPOSED cross-TU via `RunMoeBlock` (`qwen3_5_moe_block.h`;
+  35B untouched), (#3) a no-shared-expert guard in `MoeBlock`
+  (`shared_expert_intermediate_size==0` → skip shared + nullptr to `MoeCombine`;
+  inert for the shared-expert-having 35B). **Regression UNCHANGED** (the whole
+  point of "behaviour-preserving"): Qwen3-dense 0.6B+4B near-tie 16/16, 27B
+  235/235, 35B 315/315, dgx CUDA `-Werror` 0-warn, memcheck 0. The SPEED
+  deliverable (a fast BF16 grouped-MoE GEMM — only NVFP4-Marlin exists) is W5 and
+  will be benchmarked then.
 - **First additive-model bring-up W0+W1+W2 — Qwen3 dense (`Qwen3ForCausalLM`) +
   the runner generalization + the weight loader (2026-07-20,
   `CLAIM-MODEL-QWEN3-DENSE`, `ENG-RUNNER-MODELSHAPE`).** Infrastructure + a
@@ -1524,4 +1540,4 @@ The complete contract is in the
 
 **Breadth sweep note (2026-07-21):** the active phase is model-architecture breadth (recent-first), each held to token-exact + vLLM-speed on every axis. Ranked queue + CUDA-arch additivity audit: [.agents/specs/breadth-sweep-plan.md](../.agents/specs/breadth-sweep-plan.md). CUDA archs beyond same-family sm_120 are HW-blocked (only GB10 testable).
 
-**Sweep model #1 SPIKED (2026-07-21): Qwen3-Coder-30B-A3B** (`Qwen3MoeForCausalLM`, BF16 full-attention MoE) — [spike](../.agents/specs/sweep-qwen3-coder-30b.md). Composes the done Qwen3-dense attention + the done 35B MoE experts (zero runner change); 4 model-layer seams (extract/expose/guard + a new bf16-expert loader); the SPEED gap is a fast bf16 grouped-MoE GEMM (W5). No quant (correctness covered by the reference MoE path).
+**Sweep model #1 — W0+W1 LANDED (2026-07-21): Qwen3-Coder-30B-A3B** (`Qwen3MoeForCausalLM`, BF16 full-attention MoE) — [spike](../.agents/specs/sweep-qwen3-coder-30b.md). Composes the done Qwen3-dense attention + the done 35B MoE experts (zero runner change); 4 model-layer seams (extract/expose/guard + a new bf16-expert loader); the SPEED gap is a fast bf16 grouped-MoE GEMM (W5). No quant (correctness covered by the reference MoE path). W0 (registry stub) + W1 (extract `dense_attn_block.h` / expose `RunMoeBlock` / no-shared guard) landed behaviour-preserving — regression UNCHANGED (Qwen3-dense 16/16, 27B 235/235, 35B 315/315); see the NOT-APPLICABLE disposition above. W2 loader → W3 forward → W4 near-tie token-exact → W5 fast-MoE + every-axis speed remain.

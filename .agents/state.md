@@ -15135,3 +15135,127 @@ doc-checkpoint checks pass; the three directly relevant Python modules pass
 47 environment-only errors on this restricted NixOS session (`/usr/bin/true`
 absent, loopback sockets denied, and clean-PATH `python3` absent); no assertion
 failure touches the benchmark driver/collector/sampler change.
+
+## 2026-07-21 — PR #5 (Blackwell dGPU bringup) REBASED onto `a63c497` + FULL GATE RUN
+
+Rebase of `local-blackwell-main-transplant` (12 commits, richiejp) from its
+merge-base `a1611c7` onto current `origin/main` `a63c497`. Authorship preserved
+on all 12 commits (`git rebase --onto`, no squash, no author rewrite).
+
+**CONFLICTS AND RESOLUTIONS.** Only two files conflicted, both append-only
+records, both at the tail: `.agents/parity-ledger.md` and `.agents/state.md`
+(commit `d8c4164`). Resolved as a UNION (main's Qwen3-Coder W5/W6 entries kept
+verbatim, the PR's Blackwell entries appended after) via a worktree-local
+`info/attributes` `merge=union` driver for exactly those two files; the
+remaining 11 commits applied clean. The three high-value code files main
+rewrote the same day auto-merged with ZERO overlap and were verified by
+inspection afterwards:
+- `src/vt/cuda/cuda_matmul_nvfp4.cu` — main's entire new bf16 grouped-MoE GEMM
+  survives intact (`MoeGroupedGemmBf16` 13 refs, `EnsureMoePartials` 2 refs,
+  `...Wmma`/`...WmmaPipe`/`...NaiveSplitK`/`EnsureMoeScratch` all present). The
+  PR's only edit to this TU is wrapping the already-`__CUDA_ARCH_SPECIFIC__`-only
+  helper `GetNib` in the same `#if`, so a non-`a` arch build stops failing
+  `-Werror` on an unused static function. No-op at `12[01]a`.
+- `src/vllm/model_executor/models/qwen3_5.cpp` — main's `MoeBlockBf16Cuda` (2
+  refs) and the per-layer `ReleaseHost()` memory fix (12 refs) both survive
+  intact; the PR adds only plain-BF16-gated code (`MatmulBf16LogitsF32D`,
+  `DenseLmHead`, `PrepareBf16Resident`, and `plain_weight.nk` /
+  `!w.gate_up_proj.Empty()` branches).
+- `tests/CMakeLists.txt` + `.agents/coordination.md` / `model-matrix.md` /
+  `README.md` / `docs/BENCHMARKS.md` — both sides' rows present; no
+  model-matrix column merged or dropped. `scripts/check-agent-record.py`
+  `ENGINE_ROWS` reconciled to **110** (main 109 + the PR's one new engine row);
+  checker reports `ENGINE=110 MODEL=326 QUANT=81 KERNEL=32 BACKEND=54`.
+
+**GATES (dgx GB10, CUDA 13.0, clean full rebuild from scratch,
+`-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON
+-DCMAKE_CUDA_ARCHITECTURES=121a`, scratch tree `~/scratch_pr5_gate/vllm.cpp`,
+goldens md5-verified identical to the committed tree before running).** CUDA
+`-Werror` **0 warnings / 0 errors**. All results on the FINAL binary:
+
+| gate | result |
+| --- | --- |
+| 27B `test_qwen27_paged_engine` | **235/235** |
+| 35B `test_qwen36_paged_engine` | **315/315** (2 cases) |
+| Qwen3-Coder `test_qwen3coder_paged_engine` | **6/6** (138 assertions; STRICT token-exact 5/6, near-tie-band 1/6, max gap 0.0000 nats, 0 forward-divergent) |
+| `test_ops_moe_grouped_bf16` | 7/7 cases, 19 assertions |
+| NVFP4 `test_ops_moe_grouped` | 9/9 cases, 146 assertions |
+| `test_qwen3_moe_forward` | 3/3 cases, 760,186 assertions |
+| `test_model_registry` (PR) | 18/18 cases, 194 assertions (1 skipped) |
+| `test_cuda_backend` (PR) | 5/5 cases, 19 assertions — logs `pageable=1 integrated=1 UnifiedMemory=true` |
+| `test_bench` (PR) | 4/4 cases, 33 assertions |
+| `test_qwen35_plain_weights` (PR) | 3/3 cases, 4 assertions — **the real-checkpoint leg SKIPPED**: `Qwen/Qwen3.5-4B` is absent from dgx, so the PR's headline direct-device gate is NOT exercised on this hardware |
+| `compute-sanitizer memcheck` on the 27B engine path | **0 errors** (`ERROR SUMMARY: 0 errors`, 235/235 still pass under the sanitizer) |
+| `scripts/check-agent-record.py` / `check-doc-checkpoint.py` | green |
+
+`test_cuda_backend` empirically confirms the discrete-Blackwell memory
+classification fix (`pageable != 0` -> `pageable != 0 && integrated != 0`,
+`src/vt/cuda/cuda_backend.cu`) is **behavior-NEUTRAL on GB10**, which reports
+both attributes set; it only withdraws the zero-copy DeviceScratch/KV/GDN
+contract on discrete GPUs that report PageableMemoryAccess through HMM/UVM
+without being unified.
+
+**REGRESSION ADJUDICATION — the PR's declared −6.84%.** The PR attributes it to
+a CMake CUDA arch difference (`120a` now required vs a preserved `120` cache)
+rather than code. Two measurements settle the merge-relevant question.
+
+1. **No code regression.** Same-arch (`121a`), same-workload, interleaved
+   same-box A/B of `origin/main` vs this rebased head, both clean-built, 27B
+   NVFP4, input-1024/output-128, c8/32 prompts, 4 pairs under ONE
+   `flock /tmp/gpu`, cold first pair dropped (evidence `dgx:/tmp/ab_c8.log`,
+   `~/scratch_pr5_gate/ab/`). Medians over reps 2–4, PR/main: output throughput
+   58.27/58.30 tok/s = **0.9995x**; median TPOT 128.51/128.47 ms = **+0.03%**;
+   median TTFT 825.04/826.18 ms = **−0.14%** (PR faster). Every axis is inside
+   ±0.15%, well under the ~0.3% per-arm spread. The PR is **performance-NEUTRAL
+   on the production paths main already had.**
+2. **The arch flag IS a first-order lever, mechanism confirmed.**
+   `CMakeLists.txt:71,88,97,137,612` gate FOUR kernel families on
+   `VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a"`: `VT_FP4_MMA_SM120A` (native
+   block-scaled fp4 MMA), the CUTLASS NVFP4 GEMM, the vendored Marlin NVFP4 MoE
+   GEMM, and — transitively via `VLLM_CPP_CUTLASS` — the vendored
+   FlashAttention-2 prefill/decode. `cmake/TritonAOT.cmake:98-101` additionally
+   derives the vendored Triton AOT arch subdir as `sm_<arch>`, so `120` and
+   `120a` select different AOT trees. A non-`a` build therefore runs a
+   materially different kernel set from the SAME sources. Magnitude, measured
+   same-binary on the 27B (c1, 1024/128, 4 interleaved pairs, first dropped;
+   `dgx:/tmp/fa2ab.log`): FA2 ON vs OFF — output throughput **9.64 vs 9.28
+   tok/s (+3.9%)**, median TTFT **403.7 vs 634.5 ms (−36.4%)**, median TPOT
+   **101.29 vs 103.52 ms (−2.2%)**. FA2 is only ONE of the four families the
+   arch suffix switches, and by itself it already exceeds the 6.84% in
+   aggregate effect. A build-flag origin for a 6.84% swing is therefore
+   **mechanistically established**.
+
+**HONEST LIMITS of that adjudication.** (a) The specific −6.84% CANNOT be
+reproduced here: `Qwen/Qwen3.5-4B` is not on dgx and dgx is sm_121, not the
+sm_120 discrete Blackwell the number was taken on. (b) The PR's own stated
+argument ("current local vLLM is 1.002x the previous reference, so the residual
+is project/build-side") does not carry: an unchanged vLLM arm proves the BOX is
+unchanged, not that OUR delta is build- rather than code-side. (c) The stated
+direction is counter-intuitive — `120a` compiles IN more fast kernels than
+`120`, so on the naive reading the newer build should be faster, not 6.84%
+slower; the plausible readings are that an sm_121a-tuned FA2/CUTLASS path is a
+pessimization at the 4B's small shapes on sm_120, or that the regenerated AOT
+tree differs. Both are still build-configuration, not code. The PR has NOT
+performed the same-source `120`-vs-`120a` A/B that would close it, and that A/B
+remains the outstanding item — but it is scoped ENTIRELY to the PR's own new
+plain-BF16 4B path on hardware we do not have, and cannot touch main's paths,
+which measurement (1) shows are untouched.
+
+**Structural confirmation that (1) is not luck.** The new code is gated so it
+cannot reach an existing model: `DirectDeviceLoadEligible`
+(`qwen3_5_dense_weights.cpp`) requires `!platform.is_unified_memory()`, false on
+GB10; `IsPlainBf16Qwen3_5Dense` requires every projection to be non-fp4/non-fp8;
+the forward branches take `plain_weight.nk` / `!w.gate_up_proj.Empty()` /
+`weights.tied_lm_head`, none true for the 27B NVFP4 checkpoint; and the
+loader's new `has(name + ".weight_packed")` / `has("lm_head.weight")` probes
+resolve to the pre-existing branch on that checkpoint. `LoadModelBf16Direct`
+and `LoadToF32` are byte-identical to the `LoadBf16Direct`/`LoadBf16ToF32` they
+replace when the input dtype is BF16. The 35B and Qwen3-Coder are
+`is_dense_model=false` and never enter the new `FromModelDir` branch at all.
+
+**STILL PENDING after this run** (unchanged by the rebase, carried forward):
+the current-v0.25 correctness oracle for the 4B, strict ON<=OFF VRAM (+8 MiB),
+and the same-source `120`-vs-`120a` A/B — all requiring richiejp's
+sm_120 discrete Blackwell box and the `Qwen/Qwen3.5-4B` checkpoint. No 4B
+result implies 27B/35B support.

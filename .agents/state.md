@@ -14677,3 +14677,25 @@ Worktree `agent-acd65100650905428`, base main HEAD `673b2a8`, `CLAIM-MODEL-QWEN3
 **GATES (dgx GB10, CUDA 13.0, canonical `~/cutlass-4.5.0` build flags `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON -DCMAKE_CUDA_ARCHITECTURES=121a`, sole GPU owner):** CUDA `-Werror` **0 warnings / 0 errors** (test target rebuild). Gate 6/6 above. REGRESSION UNCHANGED: **27B `test_qwen27_paged_engine` 235/235** + **35B `test_qwen36_paged_engine` 315/315** token-exact. `compute-sanitizer memcheck` **0 memory-access errors** (ERROR SUMMARY 0) on the Coder paged-engine gate path.
 
 **ADDITIVITY:** 1 NEW test file (`tests/vllm/models/test_qwen3coder_paged_engine.cpp`) + 2 NEW oracle scripts (`scripts/qwen3coder-oracle-capture.py`, `scripts/qwen3coder-neartie-gap.py`) + committed goldens `tests/parity/goldens/qwen3coder_greedy/{greedy_ids,greedy_dist,our_ids,neartie_gap_mnats}.npy` + `p{0..5}_prompt.i32` + CMake TU glue (`tests/CMakeLists.txt`) — NO production code touched. Row → correctness-DONE; W5 fast BF16 grouped-MoE GEMM + every-axis speed (the largest item; gates DONE) remains. Committed on worktree branch `worktree-agent-acd65100650905428` (base `673b2a8`); NOT pushed.
+
+### 2026-07-21 — local Blackwell branch transplant spike (`ACTIVE`)
+
+User requested aborting the obsolete 34-commit rebase and transplanting only
+still-relevant work onto a fork of current main. The interrupted rebase was
+aborted; `local-blackwell-main-transplant` was created at `a1611c73`, while
+`local-blackwell-environment` remains intact at `42a2c897` as the source record.
+
+Review selected the distinct plain-BF16 Qwen3.5 dense loader, tied-weight
+ownership, bounded direct-device loading, Nix environment and safe diagnostics.
+It rejected/superseded the branch's global random-sampler scratch, broad
+irregular-BF16 matmul fallback, decomposed h32 GDN kernel, tensor-range page
+advice, old registry, and stale FP8-off attention policy. Main's windowed source
+release, owned safetensors, self-registration, merged GDN projections, packed
+decode and default-on preamble remain binding.
+
+Accepted spike: [qwen35-plain-bf16-direct-load.md](specs/qwen35-plain-bf16-direct-load.md).
+Active row `LOAD-SAFETENSORS-DIRECT-DENSE`; the related
+`MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation` row remains unclaimed and
+`PARTIAL` for the pre-existing text-only implementation. Claim
+`CLAIM-LOCAL-BF16-TRANSPLANT`. No production code, GPU command, model gate or
+benchmark ran. Implementation and every current-oracle axis are `PENDING`.

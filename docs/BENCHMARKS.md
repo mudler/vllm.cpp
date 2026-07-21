@@ -1366,6 +1366,33 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **MLA + DeepSeek/Kimi/MiniMax campaign — SPIKE ONLY (2026-07-21,
+  `CLAIM-MLA-DEEPSEEK`,
+  [spike](../.agents/specs/mla-deepseek-campaign.md)).**
+  `benchmark_binding=false`; **NOT APPLICABLE.** This change is a specification
+  and record update only — **no code, no kernels, no build, no GPU run** — so
+  there is nothing to measure and no binding number is created, re-based or
+  invalidated. Every existing binding result stands unchanged.
+  **Benchmarks are PENDING and cannot begin until the implementation does.** The
+  future benchmark disposition is fixed now so it cannot be quietly loosened
+  later: the MLA gate vehicle is **DeepSeek-V2-Lite bf16**, measured against
+  **graphed** vLLM 0.25.0 (`enforce_eager=False`, `CUDAGraphMode.FULL_AND_PIECEWISE`,
+  Inductor `VLLM_COMPILE`) on **every axis** (median TTFT, TPOT, ITL, output
+  throughput, peak memory) at c1/c2/c4/c8, with a **fresh `vllm serve` per
+  concurrency** at a **verified 0.0% prefix-cache hit rate**, on an idle box under
+  one `flock /tmp/gpu`, 2 reps with the cold first leg discarded, and every parity
+  lever shipped DEFAULT-ON before the binding run.
+  **Reproduction entry point (once W8 lands):**
+  `examples/vllm-bench --input-len 1024 --output-len 128 --concurrency C` against
+  `vllm bench serve --dataset-name random --random-input-len 1024
+  --random-output-len 128 --random-range-ratio 0 --ignore-eos --max-concurrency C`.
+  **Explicitly HW-BLOCKED — no benchmark will ever be run here for these:**
+  DeepSeek-V3/V3.2 (~1250 GiB bf16 / ~640 GiB fp8), Kimi-K2/K2.5 (~2000 GiB),
+  MiniMax-M2 (~428 GiB) and MiniMax-M3 do not fit GB10's 119 GiB unified memory,
+  and two of them do not fit dgx's 238 GiB of free disk. Kimi-Linear-48B
+  (~89.4 GiB) is marginal and would need a memory-pressure check before any
+  number from it counted. These are recorded as hardware-blocked, not pending.
+
 - **CUDA-arch additivity seams — per-arch build feature table, capability
   threading, runtime SM-dispatch registry, queried smem ceiling (2026-07-21,
   `BACKEND-CUDA-ARCH-ADDITIVITY`, `CLAIM-CUDA-ARCH-ADDITIVITY`).**

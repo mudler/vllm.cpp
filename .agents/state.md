@@ -15330,3 +15330,99 @@ failure rather than a silent capability drop. Closing it needs (i) per-source ge
 has no per-source equivalent) and (ii) the per-arch kernel bodies (Hopper wgmma / sm_100
 tcgen05). Both are **HW-BLOCKED**: dgx has no sm_90/sm_100/sm_80 board. Cross-family bring-up
 remains a kernel campaign, not an additive drop-in. Committed on the worktree branch; NOT pushed.
+
+---
+
+## 2026-07-21 — MLA + DeepSeek/Kimi/MiniMax campaign SPIKE (`CLAIM-MLA-DEEPSEEK`, base `b4f14ee`)
+
+**SPIKE ONLY. No code, no kernels, no build, no dgx GPU work. Nothing claims READY/ACTIVE/DONE.**
+Deliverable: [`.agents/specs/mla-deepseek-campaign.md`](specs/mla-deepseek-campaign.md).
+Rows `INVENTORIED` -> `SPIKE`: `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm`,
+`MODEL-TEXT-deepseek-v2-deepseek-v3-for-causal-lm`,
+`MODEL-TEXT-deepseek-v2-deepseek-for-causal-lm`,
+`MODEL-TEXT-kimi-linear-kimi-linear-for-causal-lm`,
+`MODEL-TEXT-minimax-m2-mini-max-m2-for-causal-lm`.
+
+**THE BACKEND ANSWER (read from source, not inferred).** On GB10
+(`device_capability.major == 12`) vLLM's MLA priority list is exactly
+`[TRITON_MLA, FLASHINFER_MLA_SPARSE_SM120]` (`vllm/platforms/cuda.py:129-133`), and the second
+is sparse-only. So the dense-MLA decode path we must mirror is **`TRITON_MLA`**
+(`triton_mla.py:81,130-131,134,189` -> `decode_attention_fwd`), whose real kernel is not
+vLLM's at all: `vllm/v1/attention/ops/triton_decode_attention.py:1-11` records the chain
+vLLM <- SGLang <- lightllm `deepseek2` two-stage split-KV flash-decode. MLA **prefill** on GB10
+is `FLASH_ATTN` alone (`mla/prefill/selector.py:74-77`), with `requires_v_padding` True
+(`prefill/flash_attn.py:88-99`) so V is zero-padded 128 -> 192. **FlashMLA, CUTLASS MLA,
+FlashInfer MLA and TokenSpeed MLA are sm90/sm100-gated and never even appear on the
+major-12 candidate list** — an entire class of kernel ports is out of scope.
+
+**THE CROSS-CUTTING COST — the compressed-latent KV cache.** MLA caches ONE latent + rope row
+per token: `num_kv_heads == 1`, `head_size == kv_lora_rank + qk_rope_head_dim == 576`, and
+**no separate V** (V is a slice of the same buffer — `triton_mla.py:236,242-259` literally
+passes it twice). Upstream's cache shape is 3D with no K/V axis
+(`mla_attention.py:1216-1224`) and the page formula drops the factor 2
+(`kv_cache_interface.py:380-398`). Our tree cannot express this:
+`src/vllm/v1/worker/gpu/runner.cpp:487-492` hardcodes `num_blocks * 2 * block * Hkv * Dh` and
+`:399-400` reconstructs the shape from `config_` instead of from the KV spec, while
+`vt::ReshapeAndCache` / `vt::PagedAttention` (`include/vt/ops.h:1167,1201`) have K/V-pair
+signatures. **Good news, and it is cited rather than assumed:** the block manager, prefix
+caching and eviction are UNAFFECTED — upstream maps MLA onto the stock `FullAttentionManager`
+(`single_type_kv_cache_manager.py:1539`) and `gpu_model_runner.py` has no `use_mla` branch at
+all. So the cost is concentrated in the ALLOCATOR and the OPS, which is why W1 is a
+behaviour-preserving "size every buffer from `spec->page_size_bytes()`" change with the
+existing gates required byte-identical, landed before any MLA math exists.
+
+**HARDWARE — one vehicle, and the rest is blocked.** dgx.casa (`promaxgb10-4ad8`; note the
+hostname `dgx` does not resolve, use `dgx.casa`) has 119 GiB unified and a single root
+filesystem at **94% full, 238 GiB free** — there is no separate model volume, and none of
+the campaign checkpoints are present. **DeepSeek-V2-Lite ~15.7B / ~29.3 GiB bf16 fits
+comfortably and is the MLA gate vehicle.** DeepSeek-V3/V3.2 (~1250 GiB bf16, ~640 GiB fp8),
+Kimi-K2/K2.5 (~2000 GiB), MiniMax-M2 (~428 GiB) and MiniMax-M3 are **HW-BLOCKED e2e** — two of
+them do not even fit the free disk. Kimi-Linear-48B (~89.4 GiB) is **HW-MARGINAL** (~20 GiB
+left for KV + activations). For the blocked rows we will gate config/registry resolution,
+weight-map + single-layer-slice loading, and unit parity at their dimensions, and record the
+rest as HW-BLOCKED rather than proposing a gate we cannot run.
+
+**FOUR INVENTORY CORRECTIONS** (dependency cells are source-scan hypotheses the target spike
+must correct — row contract): **Kimi-Linear IS MLA** (NoPE variant; `kimi_linear.py:310` builds
+`KimiMLAAttention` around the shared `MLAModules`, `:213` asserts `use_nope`), so the MLA
+unlock reaches the Kimi line. **MiniMax is NOT MLA** — M2 is plain dense GQA + MoE + partial
+RoPE + sliding window (`minimax_m2.py:139,206-214`), M3 is GQA + a learned sparse indexer
+(`minimax_m3/nvidia/model.py:286,386,673-690`); both M3 rows' `MLA/latent KV` cells corrected
+here (they stay `INVENTORIED`). Lightning attention is dead in the MiniMax line
+(`registry.py:721-724` lists M1/Text01 as REMOVED). **`DeepseekForCausalLM` is NOT MLA** —
+`deepseek_v2.py:1201-1211` selects plain MHA for `model_type == "deepseek"`. And the
+user-premise correction: **there is no "Kimi K3" at the pin**; K2.5 is the newest
+(`registry.py:448`).
+
+**KDA vs GDN — honest split, not a hand-wave.** `KimiGatedDeltaNetAttention` subclasses our
+GDN's upstream base (`kimi_gdn_linear_attn.py:85`) and reuses `GDNAttentionMetadata`, the conv
+update, the chunked delta recurrence and the WY/UT triangular solve (`fla/ops/kda.py:19-26`).
+But KDA's decay is **per-channel** `[H, D]` from a low-rank `f_a_proj`/`f_b_proj` bottleneck
+(`kda.py:1603-1617`), which forces the gated-linear-attention output kernel
+(`kda.py:1019,1126`) that plain GDN does not have, plus three separate q/k/v convs. So the
+state machinery is reusable; the decay/gate and output kernels are NOT. Kimi-Linear is two
+campaigns, not one.
+
+**HONEST COVERAGE GAP IN THE CHOSEN GATE.** DeepSeek-V2-Lite has `q_lora_rank=null` AND
+`n_group=topk_group=1` with `softmax`/`greedy` — so it exercises **neither** the
+`fused_qkv_a_proj`/`q_a_layernorm`/`q_b_proj` path **nor** any of the `noaux_tc` router
+(it has no `e_score_correction_bias` at all). Both must be BUILT for V3 and are **unit-gated
+only**. The MLA geometry itself is identical between V2-Lite and V3 (same 576-wide latent),
+which is what makes it a legitimate vehicle. Free bring-up oracle noted: `VLLM_MLA_DISABLE=1`
+routes the same checkpoint through `DeepseekV2Attention` with `head_size` 192, giving a
+same-checkpoint latent-vs-materialized A/B.
+
+**W-PLAN (spike §10, ranked so the shared unlock lands first on the vehicle that fits).**
+W0 ground the facts (checkpoint + real config + OBSERVED backend selection + determinism
+probe) -> W1 spec-driven KV allocation + `MLAAttentionSpec` (behaviour-preserving, zero MLA
+math) -> W2 platform MLA backend priorities + prefill selector -> W3 `vt::ConcatAndCacheMla` +
+the grouped-topk router extension -> W4 `vt::MlaDecodeAttention` -> W5 MLA prefill (FA-2
+generalized to qk 192 / v 128 + the workspace-bounded chunked-context loop) -> W6 the MLA
+block + weight absorption -> W7 the DeepSeek-V2 model TU -> W8 the SACRED gate on
+DeepSeek-V2-Lite -> W9 speed close -> W10 the blocked-row honesty pass.
+
+**NEXT / RESUME.** Fetch DeepSeek-V2-Lite to dgx (~29.3 GiB; watch the 94%-full root), run the
+oracle and CONFIRM by observation that it selects `TRITON_MLA` + FA-2 MLA prefill on sm_121
+(this spike read the logic; the runtime confirmation is still owed per
+[[profile-vllm-actual-kernels-port-1to1]]), then claim W1. Committed on the worktree branch;
+**NOT pushed**.

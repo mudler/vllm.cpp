@@ -14879,3 +14879,77 @@ One earlier real-model retry OOM was non-evidence: an unrelated
 process exited, the identical clean test passed under the GPU lock. Next:
 commit the classifier repair, bind a new commit-named root, and rerun all 18
 benchmark legs. `benchmark_binding=false` remains.
+
+### 2026-07-21 — corrected local Qwen3.5-4B series and graph-node traces complete
+
+The immutable classifier-fixed project commit is
+`647a2a6a978b3f47c80d8be9249f5f740299da1a`. Root
+`/tmp/qwen35-transplant-4b-647a2a6a` completed the full 18-leg direct-ON /
+local-vLLM-0.24 / direct-OFF comparison under one `flock /tmp/gpu`. Workload:
+Qwen3.5-4B plain BF16, ShareGPT corpus
+`/tmp/qwen35-4b-sharegpt-1024.json` SHA-256
+`9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`,
+128 requests, 131,784 actual input tokens, 16,384 output tokens (128 each),
+concurrency 32, greedy ignore-EOS, seed 0, max-num-batched-tokens 2048,
+1,280 blocks and max-model-len 4,096. Each arm has three memory and three
+unmonitored timing repetitions. All cache/mincore proofs succeeded, all 18
+pre-leg compute-app snapshots were empty, and the temperature/power/throttle
+guards remained clean.
+
+Direct ON / direct OFF / local vLLM-0.24 means:
+
+- request throughput: **3.913 / 3.870 / 5.814 req/s**;
+- output throughput: **501.40 / 495.39 / 744.22 tok/s**;
+- total throughput: **4534.38 / 4480.04 / 6730.37 tok/s**;
+- mean/median/p99 TTFT: **1114.40/688.75/5304.86** /
+  **1210.83/688.57/5687.61** / **904.74/675.53/3109.33 ms**;
+- mean/median/p99 TPOT: **55.30/60.15/62.71** /
+  **55.32/60.20/62.76** / **33.54/34.95/45.90 ms**;
+- mean/median/p99 ITL: **55.30/21.71/346.86** /
+  **55.32/21.78/347.19** / **33.54/16.84/190.55 ms**;
+- mean/median/p99 E2EL: **8136.94/8109.18/12929.95** /
+  **8235.81/8195.93/13310.76** / **5164.79/5097.28/7562.28 ms**;
+- peak PSS: **2.606 / 8.559 / 7.671 GiB**; stable PSS:
+  **0.727 / 8.558 / 4.058 GiB**; peak VRAM:
+  **12944 / 12936 / 12957 MiB**.
+
+The direct loader is active: ON improves total/output throughput **1.21%** over
+the same-binary OFF arm, cuts peak PSS **69.6%** and stable PSS **91.5%**, and
+lowers mean TTFT **8.0%**. It does not close the spec: ON peak VRAM is 8 MiB
+worse than OFF. Direct ON and OFF output IDs match 128/128 in every paired
+repetition and each project arm is internally stable.
+
+The comparison to the preserved branch is a clear regression signal. Current
+ON is **0.686x** historical ON (4534.38 vs 6607.04, **-31.4%**), current OFF is
+**0.678x** historical OFF (4480.04 vs 6603.28, **-32.2%**), while current local
+vLLM is **1.002x** historical vLLM (6730.37 vs 6716.47, **+0.2%**). Current ON
+is **0.674x** local vLLM. The regression is therefore project-side rather than
+a broad machine/reference slowdown. Main now defaults async scheduling whereas
+the historical project log was synchronous; that is a named same-binary A/B
+candidate, not yet a proven sole cause.
+
+Cross-engine correctness does not bind: the available reference is vLLM 0.24,
+not current v0.25, and vLLM repetition 2 matches repetition 1 on only 102/128
+requests (repetitions 1 and 3 match 128/128). Current direct ON matches the
+vLLM token files for 94/128 requests. No support or current-oracle claim follows.
+
+Matching traces completed under the same exact workload with
+`nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none
+--cuda-graph-trace=node`. Project trace
+`trace-cpp-on.nsys-rep` SHA-256
+`86f0946ecb9d6e05caf4d7082ebbfeb0045df62dbee2aa88a67c3e5414e1aae0`;
+vLLM trace `trace-vllm.nsys-rep` SHA-256
+`3b4d811488044c2bcc08de68997f264871611392a1c38d92479eaa8930b73ea8`.
+Graph-node kernel rows are present. Project GPU time is led by bf16 CUTLASS
+GEMM 27.2%, custom `PagedFlashKernel` 24.3%, packed GDN 8.0%, another CUTLASS
+GEMM 7.1% and small WMMA GEMMs 6.5%; vLLM is led by bf16 CUTLASS GEMM 23.5%,
+FA2 `flash_fwd_kernel` 16.1%, WMMA/GEMM tactics 12.9%/10.6%, and fused recurrent
+GDN 5.3%, with `flash_fwd_splitkv` and Triton/FLA kernels also observed. This
+proves materially different executed paths, but trace percentages include the
+whole exact run and do not assign the regression to one change.
+
+Aggregate SHA-256:
+`0f95d6763e1a87d6b6e9e4028d33a84ae9351c5495703d4f2a13dc3d81a9b749`.
+The local benchmark claim is released. `LOAD-SAFETENSORS-DIRECT-DENSE` returns
+to `GATING`; current-v0.25 correctness/performance, sanitizer, strict ON<=OFF
+VRAM and 27B/35B external-hardware regressions remain open.

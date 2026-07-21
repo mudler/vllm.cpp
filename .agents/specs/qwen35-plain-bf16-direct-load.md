@@ -2,8 +2,8 @@
 
 **Rows:** `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation`,
 `LOAD-SAFETENSORS-DIRECT-DENSE`
-**Lifecycle:** `ACTIVE`
-**Owner:** `CLAIM-LOCAL-BF16-AOT-BENCH`
+**Lifecycle:** `GATING`
+**Owner:** unassigned
 
 ## Scope
 
@@ -127,52 +127,47 @@ checked in with an explicit model/backend skip.
    `scripts/check-doc-checkpoint.py`, README, BENCHMARKS, matrices, roadmap,
    ledger and state agree at every checkpoint.
 
-Current checkpoint: `ACTIVE` on the corrected Triton-AOT local 4B comparison. Clean CPU build and focused 6/6 are green; the real cached
-`Qwen/Qwen3.5-4B` gate passes 3/3 cases and 1656/1656 assertions on CPU. The
-parallel 134-test CPU sweep passes 131/134; the two socket suites re-pass 2/2
-in isolation, leaving only the unrelated NixOS `/usr/bin/true`/restricted-PATH
-failure in `test_serve_low_tools`. CUDA 12.9/GCC 14 configures for sm_120a and
-the production library compiles. On the local RTX 5070 Ti, the real 4B CUDA
-gate passes 3/3 and 1664/1664, including identical retained-host/direct-device
-prompt and output token IDs; the five focused transplant tests pass. The
-broader `test_op_parity` is 259/261 on sm_120 because two existing GB10-specific
-GDN BA BF16 hashes differ on this architecture. Current-oracle tokens, 27B/35B
-regressions and sanitizer remain pending. The preserved previous 4B
-recipe/results are recovered. The
-exact-corpus/output-ID benchmark hooks are restored and pass **4/4 cases,
-33/33 assertions** in both CPU and local CUDA builds. The committed reference
-collector reports the matching closed-loop TTFT/TPOT/ITL families and exact
-tokens; its production-graphed vLLM 0.24 two-token preflight is green after the
-driver derives Nix's split nvcc/cudart/cuRAND toolchain into a symlink-only
-`CUDA_HOME`. The corrected immutable root
-`/tmp/qwen35-transplant-4b-647a2a6a` completed all 18
+Current checkpoint: `GATING` after the corrected Triton-AOT local 4B
+comparison. Clean CPU gates remain green. CUDA 12.9/GCC 14 uses CMake CUDA arch
+`120a` (required by current Blackwell sources), generated Triton target
+`sm_120`, FlashInfer CUTLASS, `VLLM_CPP_TRITON=ON` and regeneration ON. The real
+cached `Qwen/Qwen3.5-4B` CUDA gate passes 3/3 cases and 1664/1664 assertions;
+the seven Triton-specific GDN cases execute 378/378 assertions; direct ON/OFF
+outputs are identical.
+
+Immutable root `/tmp/qwen35-transplant-4b-aot-557ab41d` completed all 18
 cache/idle/thermal-guarded legs at 128 requests, 131,784 actual input tokens,
 128 output tokens/request and concurrency 32. Direct ON/OFF/local-vLLM-0.24
-means are **4534.38/4480.04/6730.37 total tok/s** and
-**501.40/495.39/744.22 output tok/s**. ON improves over the same binary OFF arm
-by **1.21%**, but is only **0.686x** the previous branch ON (6607.04 tok/s) and
-**0.674x** local vLLM; local vLLM itself is **1.002x** its previous 6716.47
-tok/s result. That cross-build performance conclusion is **VOID**: the current
-project binary had `VLLM_CPP_TRITON=OFF`, while the previous 6607.04 tok/s
-binary had `VLLM_CPP_TRITON=ON`, `VT_GDN_DECODE_TRITON_AOT=1`, sm_120 and the
-FlashInfer CUTLASS tree. The same-binary loader evidence remains valid. Direct-load
-ON reduces peak PSS **8.559 -> 2.606 GiB (-69.6%)** and stable PSS
-**8.558 -> 0.727 GiB (-91.5%)**, and lowers mean TTFT
-**1210.83 -> 1114.40 ms (-8.0%)**. Peak VRAM is **12944 MiB ON vs 12936 MiB
-OFF**, so the spec's strict no-worse-than-OFF VRAM gate remains open. Direct ON
-and OFF output IDs match 128/128 in all three pairs and are stable within each
-arm. The local vLLM arm is not a correctness denominator: it is v0.24 rather
-than current v0.25 and its second repetition matches its first for only 102/128
-requests. Matching graph-node nsys captures completed for both engines; they
-confirm different executed attention/GDN/GEMM paths, but do not by themselves
-assign the regression to one change. Aggregate SHA-256 is
-`0f95d6763e1a87d6b6e9e4028d33a84ae9351c5495703d4f2a13dc3d81a9b749`.
+means are **6155.10/6064.06/6730.46 total tok/s**,
+**680.61/670.54/744.24 output tok/s**, **5.317/5.240/5.814 req/s**,
+**722.56/815.05/903.20 ms mean TTFT**, **41.44/41.43/33.56 ms mean
+TPOT/ITL**, and **5985.90/6076.37/5164.87 ms mean E2EL**. Peak PSS is
+**2.405/8.571/7.569 GiB**, stable PSS **0.733/8.571/4.066 GiB**, and peak VRAM
+**12892/12884/12942.7 MiB**. ON is **+1.50%** total over same-binary OFF and
+cuts peak/stable PSS **71.9%/91.4%**; ON=OFF output IDs match 128/128 in all
+three pairs. The +8 MiB ON-vs-OFF VRAM delta keeps the strict VRAM gate open.
+
+Current AOT ON is **0.9316x** the previous AOT ON (**6155.10 vs 6607.04,
+-6.84%**) and **0.9145x** local vLLM; current vLLM is 1.002x the previous
+reference, so the residual is project-side. Matching nsys captures show the
+generated AOT GDN chunk kernels executing. The packed-decode AOT cubin is
+27B-only by contract and is ineligible for the 4B geometry, whose trace
+correctly contains `GdnPackedDecodeKernel`. vLLM graph launches include
+304,746 graph-node kernel rows; the project 4B path makes no graph launch, so
+there are no omitted project child kernels. Aggregate SHA-256 is
+`6ff009822cda2dc146301ebbd0f4adbf76d3e341c6f0eff2542dbb38c25798ed`;
+project/vLLM trace SHA-256 values are `f2e73f4b...681` and `cbe2afbc...9a9`.
+The local vLLM arm remains a performance reference only: it is v0.24, not the
+current v0.25 correctness oracle. Current-v0.25 correctness, sanitizer,
+current-vs-previous AOT attribution and external 27B/35B regressions remain.
 
 Corrected AOT reproduction entry point:
 
 ```sh
-nix develop .#cuda --command cmake -S . -B build-nix-cuda-transplant-triton -G Ninja \
-  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=120 \
+flock /tmp/gpu nix develop .#cuda --command bash -c '
+export LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH"
+cmake -S . -B build-nix-cuda-transplant-triton -G Ninja \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=120a \
   -DCMAKE_CUDA_COMPILER="$CMAKE_CUDA_COMPILER" \
   -DCMAKE_CUDA_HOST_COMPILER="$CMAKE_CUDA_HOST_COMPILER" \
   -DVLLM_CPP_CUTLASS_DIR="$PWD/.venv-vllm/lib/python3.12/site-packages/flashinfer/data/cutlass" \
@@ -181,12 +176,20 @@ nix develop .#cuda --command cmake -S . -B build-nix-cuda-transplant-triton -G N
   -DVLLM_CPP_TRITON_PYTHON="$PWD/.venv-vllm/bin/python" \
   -DVLLM_CPP_TRITON_VENDORED_DIR=/tmp/vllm-cpp-triton-aot \
   -DVLLM_CPP_TRITON_VENDORED_ARCH=sm_120 -DCMAKE_BUILD_TYPE=RelWithDebInfo
+'
 nix develop .#cuda --command cmake --build build-nix-cuda-transplant-triton -j4
-HF_HOME=$PWD/.hf-cache nix develop .#cuda --command \
+flock /tmp/gpu env LD_LIBRARY_PATH=/run/opengl-driver/lib \
+  HF_HOME=$PWD/.hf-cache \
   build-nix-cuda-transplant-triton/tests/test_qwen35_plain_weights --no-skip
-nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant-triton \
+flock /tmp/gpu env LD_LIBRARY_PATH=/run/opengl-driver/lib \
+  ctest --test-dir build-nix-cuda-transplant-triton \
   -R 'test_(qwen36_weights|model_registry|qwen27_dense_forward|qwen35_plain_weights|loaded_engine_dense)' \
   --output-on-failure
+REQUIRE_TRITON_AOT=1 \
+  CPP_BENCH=$PWD/build-nix-cuda-transplant-triton/examples/vllm-bench \
+  CMAKE_CACHE=$PWD/build-nix-cuda-transplant-triton/CMakeCache.txt \
+  flock /tmp/gpu tools/bench/run_qwen35_4b_compare.sh \
+  /tmp/qwen35-transplant-4b-aot-<commit>
 ```
 
 ## Dependencies
@@ -211,11 +214,10 @@ nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant-triton \
    current preamble/GDN dispatch; regression tests.
 4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
    queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
-5. `W4` gates: **ACTIVE** — the non-AOT same-binary loader correctness/memory
-   result remains valid, but its cross-build speed conclusion is VOID because
-   the previous project arm used Triton AOT. Rebuild current source with the
-   matching sm_120 AOT/FlashInfer-CUTLASS flags, rerun the full locked series
-   and graph-node traces, then compare every axis. Current-v0.25 correctness,
+5. `W4` gates: **GATING / LOCAL AOT 4B COMPLETE** — 18/18 guarded legs and
+   matching traces bind the current 4B diagnostic. Current is 0.9316x the
+   previous AOT result and 0.9145x local vLLM; direct loading remains exact and
+   memory-positive. Current-v0.25 correctness, regression attribution,
    sanitizer, strict ON<=OFF VRAM and external 27B/35B remain follow-ups.
 
 ## Risks and decisions

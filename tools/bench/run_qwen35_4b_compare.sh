@@ -12,6 +12,7 @@ dataset=${DATASET:-/tmp/qwen35-4b-sharegpt-1024.json}
 cpp=${CPP_BENCH:-$root/build-nix-cuda-transplant/examples/vllm-bench}
 vllm_python=${VLLM_PYTHON:-$root/.venv-vllm/bin/python}
 cmake_cache=${CMAKE_CACHE:-$(dirname "$(dirname "$cpp")")/CMakeCache.txt}
+require_triton_aot=${REQUIRE_TRITON_AOT:-0}
 
 test ! -e "$out" || { echo "refusing to overwrite $out" >&2; exit 2; }
 test -x "$cpp"
@@ -19,8 +20,21 @@ test -x "$vllm_python"
 test -d "$model"
 test -f "$dataset"
 test -f "$cmake_cache"
+test -e /run/opengl-driver/lib/libcuda.so.1
 git -C "$root" diff --quiet
+if test "$require_triton_aot" = 1; then
+  grep -qx 'VLLM_CPP_TRITON:BOOL=ON' "$cmake_cache"
+  grep -qx 'VLLM_CPP_TRITON_REGEN:BOOL=ON' "$cmake_cache"
+fi
 mkdir -p "$out"
+
+# Triton AOT objects use the CUDA driver API directly. Nix's CUDA toolkit also
+# contains a link-only libcuda stub; put the live host driver first so an AOT
+# binary cannot silently miss CUDA registration and fall back to CPU.
+cpp_ld_library_path=/run/opengl-driver/lib
+if test -n "${LD_LIBRARY_PATH:-}"; then
+  cpp_ld_library_path="$cpp_ld_library_path:$LD_LIBRARY_PATH"
+fi
 
 # Run vLLM in its host virtualenv (the Nix shell's CUDA runtime masks the
 # system driver for this PyTorch build), while deriving the exact compiler/JIT
@@ -101,7 +115,10 @@ vllm_env=(
 
 git -C "$root" rev-parse HEAD >"$out/commit.txt"
 git -C "$root" status --porcelain=v1 >"$out/git-status.txt"
-sha256sum "$dataset" "$cpp" >"$out/sha256.txt"
+sha256sum "$dataset" "$cpp" "$cmake_cache" >"$out/sha256.txt"
+grep -E '^(CMAKE_BUILD_TYPE|VLLM_CPP_CUDA_ARCHITECTURES|VLLM_CPP_CUTLASS_DIR|VLLM_CPP_FLASH_ATTN|VLLM_CPP_TRITON|VLLM_CPP_TRITON_REGEN|VLLM_CPP_TRITON_VENDORED_ARCH):' \
+  "$cmake_cache" >"$out/cpp-build-config.txt"
+ldd "$cpp" >"$out/cpp-ldd.txt"
 env "${vllm_env[@]}" "$vllm_python" -c \
   'import vllm; print(vllm.__version__)' >"$out/vllm-version.txt"
 
@@ -138,11 +155,13 @@ run_cpp() {
   local phase=$1 mode=$2 rep=$3 direct=$4
   local name="$phase-cpp-$mode-r$rep"
   prepare_leg "$name"
-  printf '%q ' env VT_RELEASE_HOST_WEIGHTS=1 VT_DIRECT_DEVICE_LOAD="$direct" \
+  printf '%q ' env LD_LIBRARY_PATH="$cpp_ld_library_path" \
+    VT_RELEASE_HOST_WEIGHTS=1 VT_DIRECT_DEVICE_LOAD="$direct" \
     "$cpp" "${cpp_args[@]}" --output-token-ids "$out/$name.tokens.json" \
     >"$out/$name.command"
   printf '\n' >>"$out/$name.command"
-  env VT_RELEASE_HOST_WEIGHTS=1 VT_DIRECT_DEVICE_LOAD="$direct" \
+  env LD_LIBRARY_PATH="$cpp_ld_library_path" \
+    VT_RELEASE_HOST_WEIGHTS=1 VT_DIRECT_DEVICE_LOAD="$direct" \
     "$cpp" "${cpp_args[@]}" --output-token-ids "$out/$name.tokens.json" \
     >"$out/$name.log" 2>&1 &
   local pid=$!

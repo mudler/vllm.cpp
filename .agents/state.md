@@ -15710,3 +15710,86 @@ the five model rows stay `SPIKE` — W0/W1 make no model supported.
 now targeting the **OBSERVED** `TRITON_MLA` / `FLASH_ATTN` pair, with the
 existing non-MLA selection unchanged. Committed on the worktree branch;
 **NOT pushed**.
+- **2026-07-21** — **GLM family + DSA (sparse MLA) + latest DeepSeek (V3.2, V4)
+  SPIKE committed** (`CLAIM-GLM-DSA-LATEST-DEEPSEEK`, worktree
+  `agent-aea3b1eba5776ab41`, base `aa65ce7`). Spec-only: no code, no kernels, no
+  build, no GPU work, nothing downloaded. Answers the user's 2026-07-21 priority
+  "also glm, and deepseek we should look also at the latest versions." Seven rows
+  move `INVENTORIED` -> `SPIKE`: ChatGLM, Glm, Glm4, Glm4Moe, Glm4MoeLite,
+  GlmMoeDsa, DeepSeek-V4.
+
+  **Deliberate non-collision.** A concurrent agent owns
+  `.agents/specs/mla-deepseek-campaign.md` and the five rows including
+  `MODEL-TEXT-deepseek-v2-deepseek-v3-for-causal-lm` (which carries DeepSeek-V3.2).
+  That file was NOT edited. The new spec cross-references it and enumerates in its
+  §0.1 the three places where it corrects or extends it, for the user to reconcile.
+
+  **The headline finding is a gate vehicle, not an architecture.**
+  `Glm4MoeLiteForCausalLM` / `zai-org/GLM-4.7-Flash` is 31.2B / **58.2 GiB bf16 and
+  FITS GB10's ~119 GiB**. Upstream it is DeepSeek-V2 in a trench coat —
+  `glm4_moe_lite.py:94-95` and `:98-99` are literal zero-override subclasses of
+  `DeepseekV2Attention` / `DeepseekV2MLAAttention`. Its live `config.json` (fetched
+  as metadata; nothing downloaded) has `q_lora_rank: 768` and
+  `topk_method: noaux_tc`, which means it exercises e2e BOTH paths the MLA campaign
+  spike explicitly listed as unit-gated-only on its single vehicle DeepSeek-V2-Lite
+  (`q_lora_rank=null`; no `e_score_correction_bias`). So GLM is not a parallel
+  campaign competing with the MLA work — it is the thing that raises that campaign's
+  own correctness coverage, at the cost of a dependency on its W6. It also has **no
+  `index_topk`**, so `is_v32 == False`: this is DENSE MLA, not DSA. The residual
+  blind spot is honest and stated: all three live GLM MoE configs have
+  `n_group = topk_group = 1`, so group-limited greedy routing stays degenerate at
+  every gate.
+
+  **DSA is doubly blocked on GB10, and one of the two reasons corrects the campaign
+  spike's reasoning.** For a sparse model the XOR filter at
+  `vllm/v1/attention/backend.py:345-350` eliminates `TRITON_MLA` — it has zero
+  indexer/topk handling — leaving `FLASHINFER_MLA_SPARSE_SM120` as the SOLE
+  candidate, not an optional extra that can be waved off as "sparse-only, out of
+  scope". But the path is non-functional anyway: vLLM's capability probe
+  (`vllm/utils/flashinfer.py:216-231`) only checks that three symbols import, while
+  the function actually called dispatches to flashinfer's XQA backend on sm12x
+  (`mla/_core.py:1169-1172`), which is dense-only, discards `sparse_mla_top_k`
+  (`:1483`), rejects the uint8 view, and dereferences a `seq_lens` vLLM passes as
+  `None`. Upstream's only test of this path monkeypatches the probe to `True` and
+  asserts nothing numerical. So the out-of-scope conclusion survives — for a
+  dependency reason, not the reason given. This is a flashinfer watch item with an
+  explicit falsifiable reopen condition, not work we can plan.
+
+  **Two facts were re-measured rather than inherited.** dgx free disk is **184 GiB**
+  (95% full), not the 238 GiB the campaign spike cites — the blocked-row conclusions
+  are unaffected, by more. And **no GLM checkpoint of any kind is present** on dgx,
+  checked directly rather than read from a table, per the lesson that
+  `breadth-sweep-plan.md` §B.1's "present" column was wrong for OPT. The three
+  proposed gate checkpoints total 93.2 GiB against 184 GiB free, so the download
+  plan must stage them sequentially; an ENOSPC mid-download presents as bogus test
+  failures.
+
+  **DeepSeek-V4 is a new architecture and its risk is not where it was expected.**
+  The worry was the tokenizer, because a silently-unapplied BOS scored OPT 0/6 while
+  emitting fluent English. It is not the risk: `vllm/tokenizers/deepseek_v4.py:95`
+  is plain `PreTrainedTokenizerFast` over an ordinary HF fast BPE, and upstream
+  ships golden fixtures (`tests/tokenizers_/test_deepseek_v4.py:286`) that make the
+  BOS/EOS placement gateable offline with no GPU and no weights. The real risk is
+  Manifold Hyper-Connections: the residual stream becomes 4-way expanded and is
+  Sinkhorn-normalized 20 iterations every forward inside TileLang kernels that also
+  swallow the RMSNorms, with **zero upstream numerical tests and no eager reference
+  in the repo**. Porting V4 would mean building our own reference for its most novel
+  subsystem — which compounds the hardware block (148.7 GiB vs 119 GiB) rather than
+  being independent of it.
+
+  **NEXT, and the ordering is the point.** Start with the primitives, not the
+  headline: partial rotary factor and sandwich norms (`post_self_attn_layernorm` /
+  `post_mlp_layernorm` applied to the sublayer OUTPUT before the residual add) are
+  fully independent of MLA, we have literally none of either in `src/`/`include/`,
+  and they unblock four rows plus MiniMax-M2's partial RoPE. `Glm4MoeLite` is more
+  valuable but is blocked behind another claim's W6, so leading with it would put
+  this campaign on the critical path of the campaign it depends on. The one piece
+  that must be coordinated rather than duplicated is the `vt::MoeRouterTopK`
+  extension — sigmoid, `e_score_correction_bias`, group masking,
+  `routed_scaling_factor` — which both campaigns independently identified as the
+  same two-field gap. The falsifiable prediction this spike leaves behind: because
+  `Glm4MoeLite` is a zero-override subclass of DeepSeek-V2's attention, once the MLA
+  campaign's W6 lands, GLM-4.7-Flash should reach a token-exact gate with NO new
+  attention kernel — only a registry TU, the loader's `fused_qkv_a_proj` merge, and
+  the shared router extension. If it needs a new kernel, the MLA block was
+  over-specialized to DeepSeek-V2-Lite and that is worth knowing early.

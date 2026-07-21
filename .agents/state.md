@@ -14767,3 +14767,18 @@ the claim is therefore the narrow, test-covered restoration of those two
 measurement hooks only; no old sampler or engine implementation returns. Then
 commit an immutable sm_120 binary and run the complete interleaved ON/OFF/
 available-vLLM series under one `/tmp/gpu` lock with thermal and memory evidence.
+
+### 2026-07-21 — exact 4B benchmark I/O hooks restored (`ACTIVE`)
+
+The benchmark-only ShareGPT input and generated-token capture hooks from the
+preserved branch are restored on current main. `vllm-bench` now accepts the
+exact first-turn corpus through `--dataset-path` and writes per-request token
+IDs in submission order through `--output-token-ids`; no sampler, scheduler or
+model execution code changed. The focused harness passes **4/4 cases and 33/33
+assertions** in both `build-nix-cpu` and the sm_120 CUDA build, including exact
+corpus use, fixed output length and JSON ordering.
+
+No performance number is published at this checkpoint (`benchmark_binding=false`).
+Next: commit the immutable harness binary, name its evidence root by commit,
+then hold one `flock /tmp/gpu` across three interleaved direct-ON/direct-OFF/
+available-vLLM repetitions for the recovered 128x1024→128 c32 greedy workload.

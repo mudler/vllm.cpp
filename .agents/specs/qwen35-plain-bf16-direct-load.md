@@ -100,6 +100,7 @@ requires matching nsys traces under the project parity protocol.
 | target-device construction/lifetime | `tests/vllm/models/test_model_registry.cpp` covers queue propagation; the real 4B CUDA case compares retained-host and direct-device full-engine execution in one binary. |
 | released-host safety | Unit-test logical presence, byte count, invalid host access, and resident-only forward behavior. |
 | full model | `tests/vllm/models/test_qwen35_plain_weights.cpp:162-196` skips without CUDA/the cached 4B model; when available it compares prompt/output token IDs for both direct-load arms. Current-vLLM oracle comparison remains a separate W4 gate. |
+| exact benchmark corpus and output capture | `tests/examples/test_bench.cpp` covers first-turn ShareGPT loading, exact request count, fixed output length and submission-order JSON token-ID serialization; the same header-only path is compiled into `vllm-bench`. |
 
 No upstream test is dropped. GPU/model tests that cannot run in CI remain
 checked in with an explicit model/backend skip.
@@ -137,8 +138,10 @@ prompt and output token IDs; the five focused transplant tests pass. The
 broader `test_op_parity` is 259/261 on sm_120 because two existing GB10-specific
 GDN BA BF16 hashes differ on this architecture. Current-oracle tokens, 27B/35B
 regressions, sanitizer, matching traces, memory and every performance axis
-remain pending. The preserved previous 4B recipe/results are recovered; the
-exact-corpus/output-ID benchmark hooks and immutable comparison run are next.
+remain pending. The preserved previous 4B recipe/results are recovered. The
+exact-corpus/output-ID benchmark hooks are restored and pass **4/4 cases,
+33/33 assertions** in both CPU and local CUDA builds; the immutable lock-held
+comparison run is next.
 
 Reproduction entry point:
 
@@ -177,8 +180,8 @@ nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant \
    current preamble/GDN dispatch; regression tests.
 4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
    queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
-5. `W4` gates: **ACTIVE** — local direct ON/OFF correctness is green; restore the
-   exact ShareGPT/output-ID measurement hooks, then run the lock-held 4B ON/OFF/reference
+5. `W4` gates: **ACTIVE** — local direct ON/OFF correctness is green and the
+   exact ShareGPT/output-ID measurement hooks pass CPU/CUDA; run the lock-held 4B ON/OFF/reference
    series and compare every axis with the preserved 4B branch result. Sanitizer/traces
    and external 27B/35B regressions remain named follow-ups.
 

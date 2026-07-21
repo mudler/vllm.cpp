@@ -8,6 +8,9 @@
 
 #include <doctest/doctest.h>
 
+#include <filesystem>
+#include <fstream>
+
 using vllm::bench::BenchConfig;
 using vllm::bench::BenchResult;
 using vllm::bench::RunBench;
@@ -33,6 +36,10 @@ TEST_CASE("bench: synthetic engine completes all requests with sane metrics") {
   CHECK(r.input_throughput > 0.0);
   // Token accounting: greedy w/ no eos => exactly output_len tokens per request.
   CHECK(r.total_output == static_cast<int64_t>(cfg.num_prompts) * cfg.output_len);
+  REQUIRE(r.output_token_ids.size() == static_cast<size_t>(cfg.num_prompts));
+  for (const auto& ids : r.output_token_ids) {
+    CHECK(ids.size() == static_cast<size_t>(cfg.output_len));
+  }
   CHECK(r.total_input > 0);
   CHECK(r.total_token_throughput ==
         doctest::Approx(r.input_throughput + r.output_throughput));
@@ -43,6 +50,26 @@ TEST_CASE("bench: synthetic engine completes all requests with sane metrics") {
   CHECK(r.mean_itl_ms > 0.0);
   CHECK(r.mean_e2el_ms >= r.mean_ttft_ms);
   CHECK(r.mean_per_stream_decode > 0.0);
+}
+
+TEST_CASE("bench: output token IDs serialize in submission order") {
+  BenchConfig cfg;
+  cfg.num_prompts = 3;
+  cfg.input_len = 8;
+  cfg.output_len = 4;
+  cfg.concurrency = 2;
+
+  const BenchResult r = RunBench(cfg);
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() / "vllm_cpp_bench_token_ids.json";
+  vllm::bench::WriteOutputTokenIds(path.string(), r);
+
+  nlohmann::json saved;
+  std::ifstream(path) >> saved;
+  std::filesystem::remove(path);
+  REQUIRE(saved.is_array());
+  REQUIRE(saved.size() == 3);
+  CHECK(saved == nlohmann::json(r.output_token_ids));
 }
 
 TEST_CASE("bench: concurrency=1 (serial) also completes and is coherent") {
@@ -59,4 +86,26 @@ TEST_CASE("bench: concurrency=1 (serial) also completes and is coherent") {
   CHECK(r.total_output == 4 * 8);
   CHECK(r.request_throughput > 0.0);
   CHECK(r.mean_ttft_ms > 0.0);
+}
+
+TEST_CASE("bench: ShareGPT dataset supplies exact prompts") {
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() / "vllm_cpp_bench_sharegpt.json";
+  {
+    std::ofstream out(path);
+    out << R"json([{"conversations":[{"from":"human","value":"hello world"},{"from":"gpt","value":"ok"}]},{"conversations":[{"from":"human","value":"world hello"},{"from":"gpt","value":"ok"}]}])json";
+  }
+
+  BenchConfig cfg;
+  cfg.dataset_path = path.string();
+  cfg.num_prompts = 2;
+  cfg.input_len = 8;
+  cfg.output_len = 4;
+  cfg.concurrency = 2;
+  const BenchResult r = RunBench(cfg);
+  std::filesystem::remove(path);
+
+  CHECK(r.completed == 2);
+  CHECK(r.total_output == 8);
+  CHECK(r.total_input > 0);
 }

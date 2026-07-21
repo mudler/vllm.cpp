@@ -26,6 +26,7 @@
 //   model.layers.N.mlp.down_proj.weight               -> down_proj (raw-NK)
 #include "vllm/model_executor/models/qwen3.h"
 
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -39,9 +40,14 @@
 namespace vllm {
 namespace {
 
+using dense_loaders::IsCtNvfp4Projection;
 using dense_loaders::LoadBf16Direct;
 using dense_loaders::LoadBf16Transposed;
+using dense_loaders::LoadCtNvfp4W4A16;
 using dense_loaders::LoadMergedBf16RawNK;
+using dense_loaders::LoadMergedCtNvfp4W4A16;
+
+using TensorExists = std::function<bool(const std::string&)>;
 
 // Read a top-level boolean from the raw config.json doc (Qwen3 dense configs are
 // flat — no text_config nesting), defaulting when absent/null/non-boolean.
@@ -51,7 +57,8 @@ bool RawBool(const nlohmann::json& doc, const char* key, bool fallback) {
   return it->get<bool>();
 }
 
-Qwen3DenseLayerWeights LoadQwen3Layer(const TensorResolver& get, int64_t layer,
+Qwen3DenseLayerWeights LoadQwen3Layer(const TensorResolver& get,
+                                      const TensorExists& has, int64_t layer,
                                       bool attention_bias) {
   const std::string base = "model.layers." + std::to_string(layer) + ".";
   const std::string sa = base + "self_attn.";
@@ -62,13 +69,29 @@ Qwen3DenseLayerWeights LoadQwen3Layer(const TensorResolver& get, int64_t layer,
   w.post_attention_layernorm =
       LoadBf16Direct(get, base + "post_attention_layernorm.weight");
 
+  // QUANT-SCHEME PROBE (per Linear, exactly like vLLM's per-layer
+  // `get_scheme()`): a compressed-tensors NVFP4 checkpoint stores
+  // `<proj>.weight_packed` instead of `<proj>.weight`. The norms and the embed
+  // table stay BF16 either way (they are not Linears, so no config group targets
+  // them), and `lm_head` is in the checkpoint's `ignore` list.
+  const bool fp4 = IsCtNvfp4Projection(has, sa + "q_proj");
+
   // QKVParallelLinear: one merged owner in exact [q,k,v] output-row order
   // (packed_modules_mapping qkv_proj<-[q,k,v]_proj), kept raw-NK for MatmulBT.
-  w.attn.qkv_proj = LoadMergedBf16RawNK(
-      get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "v_proj.weight"});
-  // RowParallelLinear o_proj — single raw-NK owner.
-  w.attn.o_proj = LoadMergedBf16RawNK(get, {sa + "o_proj.weight"});
-  // Per-head q/k RMSNorm (RMSNorm(head_dim)), applied before RoPE.
+  // The NVFP4 arm merges the SAME three shards into one fp4 operand (row-stacked
+  // packed + scale, max-then-reciprocate global scale) — the same single merged
+  // parameter vLLM owns.
+  if (fp4) {
+    w.attn.qkv_proj_fp4 = LoadMergedCtNvfp4W4A16(
+        get, has, {sa + "q_proj", sa + "k_proj", sa + "v_proj"});
+    w.attn.o_proj_fp4 = LoadCtNvfp4W4A16(get, has, sa + "o_proj");
+  } else {
+    w.attn.qkv_proj = LoadMergedBf16RawNK(
+        get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "v_proj.weight"});
+    // RowParallelLinear o_proj — single raw-NK owner.
+    w.attn.o_proj = LoadMergedBf16RawNK(get, {sa + "o_proj.weight"});
+  }
+  // Per-head q/k RMSNorm (RMSNorm(head_dim)), applied before RoPE. Always BF16.
   w.attn.q_norm = LoadBf16Direct(get, sa + "q_norm.weight");
   w.attn.k_norm = LoadBf16Direct(get, sa + "k_norm.weight");
   if (attention_bias) {
@@ -77,9 +100,18 @@ Qwen3DenseLayerWeights LoadQwen3Layer(const TensorResolver& get, int64_t layer,
   }
 
   // MergedColumnParallelLinear gate_up in exact [gate,up] order, then down_proj.
-  w.mlp.gate_up_proj = LoadMergedBf16RawNK(
-      get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
-  w.mlp.down_proj = LoadMergedBf16RawNK(get, {mlp + "down_proj.weight"});
+  // The NVFP4 arm keeps gate/up as SEPARATE operands: the forward fuses them into
+  // vLLM's single merged Marlin operand (size_n=2I) at repack time, or runs the
+  // split two-GEMM A/B — both from the same loaded bytes.
+  if (fp4) {
+    w.mlp.gate_proj_fp4 = LoadCtNvfp4W4A16(get, has, mlp + "gate_proj");
+    w.mlp.up_proj_fp4 = LoadCtNvfp4W4A16(get, has, mlp + "up_proj");
+    w.mlp.down_proj_fp4 = LoadCtNvfp4W4A16(get, has, mlp + "down_proj");
+  } else {
+    w.mlp.gate_up_proj = LoadMergedBf16RawNK(
+        get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
+    w.mlp.down_proj = LoadMergedBf16RawNK(get, {mlp + "down_proj.weight"});
+  }
   return w;
 }
 
@@ -95,6 +127,9 @@ Qwen3DenseWeights LoadQwen3ForCausalLMWeights(
     auto it = where.find(name);
     VT_CHECK(it != where.end(), "qwen3 dense: tensor not found: " + name);
     return it->second->Get(name);
+  };
+  const TensorExists has = [&where](const std::string& name) {
+    return where.find(name) != where.end();
   };
 
   VT_CHECK(config.num_hidden_layers > 0,
@@ -116,7 +151,7 @@ Qwen3DenseWeights LoadQwen3ForCausalLMWeights(
 
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
-    w.layers.push_back(LoadQwen3Layer(get, l, w.attention_bias));
+    w.layers.push_back(LoadQwen3Layer(get, has, l, w.attention_bias));
   return w;
 }
 

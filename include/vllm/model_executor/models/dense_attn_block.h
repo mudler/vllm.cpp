@@ -32,6 +32,8 @@
 #include <mutex>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_device_glue.h"  // Dev/DBuf/MakeTensor/Reshape
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"   // NVFP4 W4A16 dispatch
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/ActivePool (shared)
 #include "vllm/model_executor/models/qwen3.h"         // Qwen3DenseAttnWeights, PagedKvCache
 #include "vllm/platforms/interface.h"
@@ -118,117 +120,10 @@ inline bool Qwen3QkvMergeEnabled() {
   return on;
 }
 
-struct Dev {
-  Backend& b;
-  Queue& q;
-};
-
-inline Tensor MakeTensor(void* data, DType dt, vt::Device dev,
-                         const std::vector<int64_t>& shape) {
-  Tensor t;
-  t.data = data;
-  t.dtype = dt;
-  t.device = dev;
-  t.rank = static_cast<int>(shape.size());
-  int64_t acc = 1;
-  for (int i = t.rank - 1; i >= 0; --i) {
-    t.shape[i] = shape[static_cast<size_t>(i)];
-    t.stride[i] = acc;
-    acc *= t.shape[i];
-  }
-  return t;
-}
-
-inline Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
-  return MakeTensor(src.data, src.dtype, src.device, shape);
-}
-
-// The device-scratch residency policy (BACKEND-PLATFORM item 2), resolved from
-// the running device's platform. The DevicePool soft cap is platform data (0 ==
-// uncapped, GB10 today ⇒ pool behavior byte-for-byte unchanged). Memoized in a
-// function-local static: DBuf is a per-op hot path and the process runs on ONE
-// device, so the virtual dispatch is paid exactly once. Mirrors qwen3_5.cpp.
-struct DevicePoolPolicy {
-  size_t cap_bytes = 0;  // residency_policy().device_pool_cap_bytes (0 == uncapped)
-};
-inline DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
-  static const DevicePoolPolicy p = [&] {
-    const auto rp =
-        vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
-    return DevicePoolPolicy{rp.device_pool_cap_bytes};
-  }();
-  return p;
-}
-
-// Owned device allocation + tensor view, routed through the SHARED DevicePool so
-// the buffer's storage is reused rather than freed to the driver (avoiding the
-// per-op cudaMalloc/cudaFree sync). Move-only, RAII. Ported verbatim from the
-// qwen3_5.cpp pooled DBuf (device_pool.h Pool()/ActivePool()).
-class DBuf {
- public:
-  DBuf(Dev d, DType dt, const std::vector<int64_t>& shape,
-       const void* host = nullptr)
-      : b_(&d.b) {
-    int64_t numel = 1;
-    for (int64_t s : shape) numel *= s;
-    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
-    alloc_bytes_ = bytes_ == 0 ? 1 : bytes_;
-    cap_ = ResolveDevicePoolPolicy(d).cap_bytes;
-    pool_ = ActivePool();
-    p_ = pool_->Get(*b_, alloc_bytes_);
-    t_ = MakeTensor(p_, dt, d.q.device, shape);
-    if (host != nullptr && bytes_ > 0) b_->Copy(d.q, p_, host, bytes_);
-  }
-  ~DBuf() { if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_); }
-  DBuf(const DBuf&) = delete;
-  DBuf& operator=(const DBuf&) = delete;
-  DBuf(DBuf&& o) noexcept
-      : b_(o.b_), pool_(o.pool_), p_(o.p_), bytes_(o.bytes_),
-        alloc_bytes_(o.alloc_bytes_), cap_(o.cap_), t_(o.t_) {
-    o.p_ = nullptr;
-  }
-  DBuf& operator=(DBuf&& o) noexcept {
-    if (this != &o) {
-      if (p_ != nullptr) pool_->Put(*b_, alloc_bytes_, p_, cap_);
-      b_ = o.b_;
-      pool_ = o.pool_;
-      p_ = o.p_;
-      bytes_ = o.bytes_;
-      alloc_bytes_ = o.alloc_bytes_;
-      cap_ = o.cap_;
-      t_ = o.t_;
-      o.p_ = nullptr;
-    }
-    return *this;
-  }
-
-  Tensor& t() { return t_; }
-  const Tensor& t() const { return t_; }
-  void* ptr() { return p_; }
-  size_t bytes() const { return bytes_; }
-  size_t alloc_bytes() const { return alloc_bytes_; }
-  void Zero(Dev d) { b_->Memset(d.q, p_, 0, bytes_); }
-  void Download(Dev d, void* host) {
-    b_->Copy(d.q, host, p_, bytes_);
-    b_->Synchronize(d.q);
-  }
-  // Relinquish the pool block WITHOUT returning it (dtor becomes a no-op); the
-  // caller takes over the Pool().Put obligation for alloc_bytes().
-  void* Release() {
-    void* p = p_;
-    p_ = nullptr;
-    return p;
-  }
-
- private:
-  Backend* b_;
-  DevicePool* pool_ = &Pool();
-  void* p_ = nullptr;
-  size_t bytes_ = 0;
-  size_t alloc_bytes_ = 0;
-  size_t cap_ = 0;
-  Tensor t_;
-};
+// Dev / MakeTensor / Reshape / DevicePoolPolicy / DBuf were RELOCATED VERBATIM
+// to dense_device_glue.h (included above) so dense_nvfp4_gemm.h can layer
+// beneath AttnBlock without an include cycle. They remain in namespace
+// `vllm::dense_attn`, so every consumer resolves them exactly as before.
 
 inline std::vector<float> WeightF32(const OwnedTensor& w) {
   const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
@@ -418,21 +313,34 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   //    wide, tensor-core-efficient GEMM. Byte-affecting (near-tie-gated).
   //  - 3-SHARD (VT_QWEN3_QKV_MERGE=0): slice the owner's output rows and project
   //    each shard separately (the byte-identical baseline for the A/B).
-  Tensor wqkv = ResidentWeight(d, w.qkv_proj);
   DBuf q(d, adt, {T, qdim});
   DBuf k(d, adt, {T, kdim});
   DBuf v(d, adt, {T, kdim});
-  if (Qwen3QkvMergeEnabled()) {
-    DBuf qkv(d, adt, {T, qdim + 2 * kdim});
-    vt::MatmulBT(d.q, qkv.t(), dhn, wqkv);
+  if (w.IsNvfp4()) {
+    // NVFP4 W4A16 qkv — ALWAYS the merged form: vLLM owns exactly one merged
+    // `qkv_proj` parameter and repacks it WHOLE into one Marlin operand
+    // (marlin_utils_fp4.py:221-306), so there is no 3-shard analog to A/B here
+    // (slicing a Marlin-interleaved operand is not row-addressable). The a16
+    // activation must be bf16, which is the default path's dtype.
+    VT_CHECK(adt == DType::kBF16,
+             "qwen3 dense: NVFP4 W4A16 qkv requires a bf16 activation "
+             "(VT_QWEN3_ATTN_F32=1 is not supported on the quantized path)");
+    DBuf qkv = dense_nvfp4::MatmulNvfp4W4A16D(d, dhn, w.qkv_proj_fp4, adt);
     vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
   } else {
-    Tensor wq = wqkv.Slice(0, 0, qdim);
-    Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
-    Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
-    vt::MatmulBT(d.q, q.t(), dhn, wq);
-    vt::MatmulBT(d.q, k.t(), dhn, wk);
-    vt::MatmulBT(d.q, v.t(), dhn, wv);
+    Tensor wqkv = ResidentWeight(d, w.qkv_proj);
+    if (Qwen3QkvMergeEnabled()) {
+      DBuf qkv(d, adt, {T, qdim + 2 * kdim});
+      vt::MatmulBT(d.q, qkv.t(), dhn, wqkv);
+      vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
+    } else {
+      Tensor wq = wqkv.Slice(0, 0, qdim);
+      Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
+      Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
+      vt::MatmulBT(d.q, q.t(), dhn, wq);
+      vt::MatmulBT(d.q, k.t(), dhn, wk);
+      vt::MatmulBT(d.q, v.t(), dhn, wv);
+    }
   }
 
   // Per-head q/k RMSNorm (RMSNorm(head_dim), non-gemma) BEFORE partial NeoX RoPE.
@@ -544,6 +452,12 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   if (adt != DType::kBF16) {
     vt::CastBf16(d.q, attn_bf.t(), Reshape(attn.t(), {T, Hq * Dh}));
     o_in = attn_bf.t();
+  }
+  if (w.IsNvfp4()) {
+    // NVFP4 W4A16 o_proj — the bf16 attention output IS the a16 activation.
+    DBuf o = dense_nvfp4::MatmulNvfp4W4A16D(d, o_in, w.o_proj_fp4, DType::kBF16);
+    (void)rot;
+    return o;
   }
   Tensor wo = ResidentWeight(d, w.o_proj);
   DBuf o(d, DType::kBF16, {T, H});

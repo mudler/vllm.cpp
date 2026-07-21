@@ -15860,3 +15860,59 @@ currently RED for `a05437f` (another agent's record commit changed
 `.agents/model-matrix.md` + `.agents/roadmap_v1.md` without touching README /
 docs/BENCHMARKS). `scripts/check-agent-record.py` is green. That must be cleared
 before push.
+## 2026-07-21 — Qwen3-32B-NVFP4A16 (compressed-tensors W4A16): quant-scheme additivity, strict gate FAILS 4/6
+
+Breadth-sweep rank 3 (`QUANT-NVFP4-CT-W4A16`, spike
+[`specs/sweep-qwen3-32b-nvfp4a16.md`](specs/sweep-qwen3-32b-nvfp4a16.md), base `aa65ce7`,
+worktree `agent-a141e107f210eb6c6`). The point of this row was to be a CONTROLLED
+EXPERIMENT: the dense `Qwen3ForCausalLM` forward is already done, so the only new
+variable is the Linear storage/compute scheme.
+
+**Premise verified first.** After the OPT row (where the plan claimed a checkpoint was
+present but only a 36 KB `config.json` existed), the checkpoint was checked BEFORE any
+code. Here the plan was CORRECT: 5 real shards / 20.6 GB / 1603 tensors, oracle loads
+and generates coherently. Verifying cost minutes; it is now a standing first step.
+
+**Two upstream findings worth carrying forward.** (1) vLLM has no W4A16 NVFP4 scheme
+class at all — it is `CompressedTensorsW4A4Fp4(use_a16=True)`; searching for a "W4A16
+scheme" finds nothing. (2) `use_a16` FORCES Marlin and bypasses the capability kernel
+registry, so on sm_121 there is no alternative. Both were then CONFIRMED
+OBSERVATIONALLY — vLLM names its selected linear kernel in its own startup log
+(`Using MarlinNvFp4LinearKernel for NVFP4 GEMM`), which is cheaper and stronger
+evidence than an nsys kernel diff.
+
+**Additivity verdict.** The kernel layer was fully additive: ZERO new kernel code,
+because the scheme vLLM forces is the Marlin W4A16 GEMM we already vendored for the
+35B. The real leak is the one this row re-confirms rather than fixes — there is still
+no `QuantizationConfig`/`LinearMethod` abstraction, so scheme selection is a per-model
+`.weight_packed` tensor-name probe and `quantization_config` is never parsed. With the
+kernel layer proven additive, that config/dispatch layer is now THE load-bearing
+quant-additivity seam and is the natural next piece of work.
+
+**The gate FAILS 4/6, and it was not loosened.** vLLM is deterministic here (K=5, 0
+multi-valued cells), so strict token-exactness is the honest bar and we do not meet it.
+What the failure signature rules out is as informative as the failure: prefill argmax is
+exact on ALL SIX prompts, all six tokenizations match, and `fallback_gemms=0` against
+18432 Marlin GEMMs proves the new path is what ran — so this is not a loader, scale,
+layout, tokenization or silent-fallback bug. Both divergences sit at token 1, the first
+decode step, on semantic near-ties.
+
+**The A/B reframed the diagnosis, which is why it was worth running.** The initial
+hypothesis was the obvious structural one: we route a DENSE W4A16 linear through the MoE
+grouped Marlin entry (`num_experts=1`) whereas vLLM uses the dense `ops.marlin_gemm`.
+But `VT_NVFP4_MARLIN=0` scored 3/6 — WORSE than Marlin's 4/6 — and reproduced the SAME
+two divergences. A difference invariant across both of our quantized GEMMs is unlikely
+to originate in the quantized GEMM. It also says something useful in its own right:
+mirroring vLLM's LOSSY S0E5M3 scale re-encode beats a mathematically purer dequant,
+i.e. fidelity to the oracle is the target, not numerical purity.
+
+**Leading hypothesis, explicitly unproven.** The dense Qwen3 forward is not bit-identical
+to vLLM — it closes under the near-tie-robust gate (strict only 10-12/16 on 0.6B/4B).
+This row inherits that forward and runs it 64 layers deep, so 2/6 prompts landing on
+near-ties is in family with the documented baseline. The ratified way to settle it is the
+teacher-forcing `prompt_logprobs` isolation (as `scripts/qwen3-neartie-gap.py` does):
+feed vLLM our exact prefix and ask whether our token is its own argmax and with what gap.
+That measurement is NOT run. Until it is, the row is failing a strict gate for an
+unproven reason and must be reported that way.
+
+Row lands `ACTIVE`/correctness-GATING. Speed was never started and is explicitly pending.

@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/dense_attn_block.h"  // shared AttnBlock + device glue
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // NVFP4 W4A16 dispatch
 #include "vllm/model_executor/models/device_pool.h"     // DevicePool/Pool/ActivePool (shared)
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/platforms/interface.h"
@@ -74,6 +75,36 @@ DBuf MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const HfConfig& cfg,
               const Tensor& dh2, int64_t T) {
   const int64_t H = cfg.hidden_size;
   const int64_t I = cfg.intermediate_size;
+  if (w.IsNvfp4()) {
+    // NVFP4 W4A16 MLP (compressed-tensors `nvfp4-pack-quantized`). The activation
+    // is bf16 throughout, which is exactly the a16 contract; the ONLY change vs
+    // the BF16 arm above is which GEMM the same [T,H]/[T,I] activations flow
+    // through — the SwiGLU, shapes and residual handling are untouched.
+    DBuf act = [&] {
+#ifdef VT_MARLIN_NVFP4
+      if (d.q.device.type == vt::DeviceType::kCUDA &&
+          dense_nvfp4::MarlinW4A16Enabled() &&
+          dense_nvfp4::GateUpFusedEligible(w.gate_proj_fp4, w.up_proj_fp4)) {
+        // vLLM's shape: ONE Marlin GEMM over the merged gate_up operand
+        // (size_n = 2I) + SiluAndMul on the halves.
+        return dense_nvfp4::GateUpFusedMarlinD(d, dh2, w.gate_proj_fp4,
+                                               w.up_proj_fp4);
+      }
+#endif
+      // SPLIT A/B fallback (and the CPU reference path): two separate GEMMs fed
+      // to the two-input MoeSiluMul — bit-identical to the fused arm's
+      // SiluAndMul over the merged halves (test_ops_moe_grouped probe).
+      DBuf gate = dense_nvfp4::MatmulNvfp4W4A16D(d, dh2, w.gate_proj_fp4,
+                                                 DType::kBF16);
+      DBuf up = dense_nvfp4::MatmulNvfp4W4A16D(d, dh2, w.up_proj_fp4,
+                                               DType::kBF16);
+      DBuf a(d, DType::kBF16, {T, I});
+      vt::MoeSiluMul(d.q, a.t(), gate.t(), up.t());
+      return a;
+    }();
+    return dense_nvfp4::MatmulNvfp4W4A16D(d, act.t(), w.down_proj_fp4,
+                                          DType::kBF16);
+  }
   Tensor wgu = ResidentWeight(d, w.gate_up_proj);  // [2I, H] raw-NK
   DBuf gate_up(d, DType::kBF16, {T, 2 * I});
   vt::MatmulBT(d.q, gate_up.t(), dh2, wgu);

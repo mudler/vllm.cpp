@@ -195,11 +195,18 @@ Runnable oracle: `~/venvs/vllm-oracle` = **vLLM 0.25.0** (loads every arch below
 |---|---|---|---|---|
 | `Qwen--Qwen3-0.6B` | `Qwen3ForCausalLM` | 28L dense | none/bf16 | `qwen3` — **DONE** |
 | `Qwen--Qwen3-4B` | `Qwen3ForCausalLM` | 36L dense GQA 32/8 | none/bf16 | `qwen3` — **DONE** |
-| `RedHatAI--Qwen3-32B-NVFP4A16` | `Qwen3ForCausalLM` | 64L dense | compressed-tensors NVFP4A16 (W4A16) | `qwen3` + new quant loader |
+| `RedHatAI--Qwen3-32B-NVFP4A16` | `Qwen3ForCausalLM` | 64L dense | compressed-tensors NVFP4A16 (W4A16) | `qwen3` + new quant loader — **RE-VERIFIED 2026-07-21: this row's "present" claim is CORRECT** (5 real shards / 20.6 GB / 1603 tensors / index / tokenizer; oracle loads and generates). Bring-up landed W0-W3, strict gate GATING 4/6 — see [sweep-qwen3-32b-nvfp4a16](sweep-qwen3-32b-nvfp4a16.md) |
 | `Qwen--Qwen3-Coder-30B-A3B-Instruct` | `Qwen3MoeForCausalLM` | 48L, 128 experts | none/bf16 | `qwen3_moe` (`registry.py:192`) |
 | `facebook--opt-125m` | `OPTForCausalLM` | 12L dense | none | `opt` (`registry.py:176`) |
 | `unsloth--Qwen3.6-27B-NVFP4` | `Qwen3_5ForConditionalGeneration` | dense+GDN | compressed-tensors NVFP4 | gate — **DONE** |
 | `nvidia--Qwen3.6-35B-A3B-NVFP4` | `Qwen3_5MoeForConditionalGeneration` | 40L, 256 experts | modelopt NVFP4 | gate — **DONE** |
+
+> **VERIFICATION NOTE (2026-07-21).** The "present" column of this table is NOT
+> self-certifying and must be re-checked before any row is started. It was WRONG
+> for OPT — listed as present when only a 36 KB `config.json` existed — which cost
+> a materialization detour on that row. Each row now records its own re-verification
+> when it is picked up: `RedHatAI--Qwen3-32B-NVFP4A16` was re-verified complete on
+> 2026-07-21 (rank 3) and the claim held. Verify weight FILES, not just a config.
 
 Also on disk but **metadata-only (no snapshot `config.json` resolved → not fully
 downloaded / unusable as-is):** `RedHatAI/Qwen3-32B-NVFP4`, `Ornith-1.0-35B`,

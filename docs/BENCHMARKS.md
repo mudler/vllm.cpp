@@ -1370,6 +1370,40 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 - **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0 (grounding) + W1
   (spec-driven KV allocation) (2026-07-21, `CLAIM-MLA-DEEPSEEK`,
+- **Qwen3-32B-NVFP4A16 (compressed-tensors W4A16) W0–W4 — SPEED PENDING
+  (2026-07-21, `CLAIM-QUANT-NVFP4-CT-W4A16`,
+  [spike](../.agents/specs/sweep-qwen3-32b-nvfp4a16.md)).**
+  `benchmark_binding=false`; **PENDING — deliberately not measured.** This change
+  adds a new quantization scheme (compressed-tensors NVFP4A16 / W4A16) to the
+  already-done dense `Qwen3ForCausalLM` forward. It creates, re-bases and
+  invalidates **no** existing binding number: the BF16 path is selected by a
+  per-Linear `.weight_packed` probe that is false on every previously benchmarked
+  checkpoint, and the 27B/35B hot path is byte-untouched by construction
+  (verified: 27B **235/235**, 35B **315/315**, Qwen3-Coder **138/138**,
+  Qwen3-dense **664/664**, OPT **36/36**, all UNCHANGED; plus
+  `test_ops_nvfp4_fp4` 27002/27002, `test_ops_moe_grouped` 146/146,
+  `test_ops_moe_grouped_bf16` 19/19, and `compute-sanitizer memcheck` 0 errors).
+  **Speed is not reported because correctness is not yet met**, and this project
+  does not publish a throughput number for a model that fails its correctness
+  gate. The SACRED strict token-exact gate currently scores **4/6 prompts
+  (67/96 tokens)** against the deterministic vLLM 0.25.0 oracle and was NOT
+  loosened; see the spike §6b for the isolation.
+  The future benchmark disposition is fixed now so it cannot be quietly loosened
+  later: the vehicle is **`RedHatAI/Qwen3-32B-NVFP4A16`** measured against
+  **graphed** vLLM 0.25.0 (`enforce_eager=False`,
+  `CUDAGraphMode.FULL_AND_PIECEWISE`, `linear_backend='auto'` — which resolves to
+  `MarlinNvFp4LinearKernel`, confirmed from the oracle's own startup log), via
+  `vllm serve` + `vllm bench serve --dataset-name random --random-input-len 1024
+  --random-output-len 128 --random-range-ratio 0 --ignore-eos --max-concurrency C`
+  against our `examples/vllm-bench --input-len 1024 --output-len 128
+  --concurrency C` at production defaults, on an idle box under `flock /tmp/gpu`
+  with a fresh server per concurrency at a verified 0% prefix-cache hit rate.
+  The bar is the standing one: **match or beat vLLM on EVERY axis** (total and
+  output throughput, req/s, TTFT, TPOT/ITL, peak memory) at c1/c2/c4/c8, with
+  token-exact correctness as a precondition that may never be traded off.
+
+- **MLA + DeepSeek/Kimi/MiniMax campaign — SPIKE ONLY (2026-07-21,
+  `CLAIM-MLA-DEEPSEEK`,
   [spike](../.agents/specs/mla-deepseek-campaign.md)).**
   `benchmark_binding=false`; **NOT APPLICABLE.** W0 ran the vLLM oracle on
   DeepSeek-V2-Lite purely to OBSERVE backend selection and greedy self-consistency

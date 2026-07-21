@@ -375,3 +375,18 @@ target_compile_definitions(test_opt_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_opt_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# ADDITIVE-QUANT W2/W4 (Qwen3-32B-NVFP4A16, Qwen3ForCausalLM + compressed-tensors
+# NVFP4A16 / W4A16) — the QUANT-SCHEME additivity row: the SAME already-token-exact
+# dense forward with only the Linear storage/compute scheme changed. A host-only
+# loader gate plus the SACRED greedy correctness gate, which is STRICT token-exact
+# because the vLLM 0.25.0 oracle measured DETERMINISTIC on this checkpoint (K=5,
+# 0 multi-valued cells). Checkpoint-gated, dgx-only.
+vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_load
+  vllm/models/test_qwen3_32b_nvfp4a16_load.cpp)
+vllm_cpp_add_test(test_qwen3_32b_nvfp4a16_paged_engine
+  vllm/models/test_qwen3_32b_nvfp4a16_paged_engine.cpp)
+target_compile_definitions(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen3_32b_nvfp4a16_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)

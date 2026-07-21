@@ -46,6 +46,18 @@ struct Qwen3DenseAttnWeights {
   // Merged QKV bias [Hq*Dh + 2*Hkv*Dh], present only when config attention_bias
   // is true. EMPTY for Qwen3-0.6B (attention_bias=false).
   OwnedTensor qkv_bias;
+
+  // NVFP4 W4A16 alternatives to the two BF16 projections above (compressed-
+  // tensors `nvfp4-pack-quantized`, e.g. RedHatAI/Qwen3-32B-NVFP4A16). EXACTLY
+  // ONE of {qkv_proj, qkv_proj_fp4} is populated per layer, likewise
+  // {o_proj, o_proj_fp4} — the loader probes `.weight_packed` and the forward
+  // dispatches on `Empty()`. Same merged ownership as the BF16 fields: the
+  // fp4 qkv is ONE [Hq*Dh + 2*Hkv*Dh, H] operand (rows q|k|v).
+  Nvfp4Weight qkv_proj_fp4;  // [N=Hq*Dh + 2*Hkv*Dh, K=H]
+  Nvfp4Weight o_proj_fp4;    // [N=H, K=Hq*Dh]
+
+  // True when this block's projections are NVFP4 W4A16.
+  bool IsNvfp4() const { return !qkv_proj_fp4.Empty(); }
 };
 
 // Dense SwiGLU MLP. Mirrors vLLM `Qwen3MLP` = `Qwen2MLP` (qwen3.py:58): merged
@@ -54,6 +66,17 @@ struct Qwen3DenseAttnWeights {
 struct Qwen3DenseMlpWeights {
   OwnedTensor gate_up_proj;  // bf16 raw-NK [2*I, H] (rows gate|up), nk
   OwnedTensor down_proj;     // bf16 raw-NK [H, I], nk
+
+  // NVFP4 W4A16 alternatives (see Qwen3DenseAttnWeights). gate and up are kept
+  // as SEPARATE fp4 operands so the forward can choose vLLM's fused merged
+  // gate_up Marlin layout (ONE GEMM, size_n=2I — what
+  // prepare_fp4_layer_for_marlin does to the merged parameter) or the split
+  // two-GEMM A/B fallback, exactly like the 35B shared expert.
+  Nvfp4Weight gate_proj_fp4;  // [N=I, K=H]
+  Nvfp4Weight up_proj_fp4;    // [N=I, K=H]
+  Nvfp4Weight down_proj_fp4;  // [N=H, K=I]
+
+  bool IsNvfp4() const { return !down_proj_fp4.Empty(); }
 };
 
 // One Qwen3 dense decoder layer: input/post standard (non-gemma) RMSNorm +

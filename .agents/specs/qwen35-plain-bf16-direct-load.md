@@ -137,18 +137,28 @@ gate passes 3/3 and 1664/1664, including identical retained-host/direct-device
 prompt and output token IDs; the five focused transplant tests pass. The
 broader `test_op_parity` is 259/261 on sm_120 because two existing GB10-specific
 GDN BA BF16 hashes differ on this architecture. Current-oracle tokens, 27B/35B
-regressions, sanitizer, matching traces, memory and every performance axis
-remain pending. The preserved previous 4B recipe/results are recovered. The
+regressions, sanitizer and matching traces remain pending. The preserved
+previous 4B recipe/results are recovered. The
 exact-corpus/output-ID benchmark hooks are restored and pass **4/4 cases,
 33/33 assertions** in both CPU and local CUDA builds. The committed reference
 collector reports the matching closed-loop TTFT/TPOT/ITL families and exact
 tokens; its production-graphed vLLM 0.24 two-token preflight is green after the
 driver derives Nix's split nvcc/cudart/cuRAND toolchain into a symlink-only
 `CUDA_HOME`. First full-series root `/tmp/qwen35-transplant-4b-b0a520f1` is
-**VOID before any model leg**: Bash expanded `name` inside the same `local`
-declaration before `phase` was assigned under `set -u`. Both declarations are
-split/fixed in `98dc954a`; corrected root
-`/tmp/qwen35-transplant-4b-98dc954a` is next.
+**VOID before any model leg**. Corrected root
+`/tmp/qwen35-transplant-4b-98dc954a` completed all 18 cache/idle-guarded legs,
+but is a **FAILED intended-direct diagnostic**: main's CUDA backend treated
+pageable-memory access alone as unified memory on the discrete RTX 5070 Ti, so
+both ON and OFF retained host weights. Means were ON/OFF/vLLM-0.24
+**4485.15/4484.23/6733.37 tok/s**, peak PSS **8.562/8.557/7.792 GiB**, with
+direct ON=OFF token IDs 128/128 in every repetition. Historical means were
+**6607.04/6603.28/6716.47 tok/s** and peak PSS
+**1.768/8.168/6.773 GiB**. The previously selected old-branch classifier fix
+was inadvertently omitted from the transplant; `UnifiedMemory()` now again
+requires both pageable-memory access and `cudaDevAttrIntegrated`. The local
+attribute test reports pageable=1/integrated=0/UnifiedMemory=false, CPU tests
+pass, and the clean rebuilt real direct-OFF/ON 4B gate passes 1664/1664. Commit
+the immutable fix and rerun under a new evidence root.
 
 Reproduction entry point:
 
@@ -188,10 +198,11 @@ nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant \
 4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
    queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
 5. `W4` gates: **ACTIVE** — local direct ON/OFF correctness, exact
-   ShareGPT/output-ID hooks and the production-vLLM collector preflight are green;
-   run the lock-held 4B ON/OFF/reference
-   series and compare every axis with the preserved 4B branch result. Sanitizer/traces
-   and external 27B/35B regressions remain named follow-ups.
+   ShareGPT/output-ID hooks and the production-vLLM collector preflight are green.
+   The first completed series exposed and repaired the discrete-CUDA classifier
+   omission; rebuild and rerun the lock-held 4B ON/OFF/reference series, then
+   compare every axis with the preserved 4B branch result. Sanitizer/traces and
+   external 27B/35B regressions remain named follow-ups.
 
 ## Risks and decisions
 

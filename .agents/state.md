@@ -14878,3 +14878,59 @@ and retry the complete lock-held series.
 Driver fix `98dc954a` is immutable and the claim now binds the retry to
 `/tmp/qwen35-transplant-4b-98dc954a`. The prior `b0a520f1` root remains VOID;
 no result is claimed until the corrected full series completes.
+
+### 2026-07-21 — completed 4B series exposes omitted CUDA classifier fix (`ACTIVE`)
+
+Root `/tmp/qwen35-transplant-4b-98dc954a` completed all 18 legs under one GPU
+lock: three monitored memory and three unmonitored performance repetitions for
+direct ON, vLLM 0.24 production graphs, and direct OFF. Every per-leg cold-page
+mincore check succeeded and every pre-leg compute-app snapshot was empty.
+
+The intended direct ON arm did not activate. Current main's CUDA registrar
+equates `cudaDevAttrPageableMemoryAccess` with unified memory, but the local
+discrete RTX 5070 Ti reports pageable access through HMM/UVM. Consequently
+`DirectDeviceLoadEligible()` rejected both ON and OFF. This is the relevant
+old-branch `3d0f91b2` hunk accidentally omitted during the selective transplant:
+the unified-memory contract must require both pageable access and
+`cudaDevAttrIntegrated`.
+
+Measured current means at commit `596dca8d`, exact ShareGPT
+128x1024→128, concurrency 32, greedy, MNB 2048:
+
+- total throughput ON/OFF/vLLM: **4485.15 / 4484.23 / 6733.37 tok/s**;
+- output throughput: **495.96 / 495.85 / 744.56 tok/s**;
+- request throughput: **3.873 / 3.873 / 5.817 req/s**;
+- mean TTFT: **1209.60 / 1210.23 / 904.56 ms**;
+- mean TPOT: **55.25 / 55.26 / 33.53 ms**;
+- peak PSS: **8.562 / 8.557 / 7.792 GiB**;
+- peak VRAM: **12936 / 12936 / 12946.7 MiB**.
+
+Direct ON and OFF are byte-stable within each arm and match 128/128 requests
+in every paired repetition. vLLM's third token file matches its first for only
+102/128 requests, so no cross-engine correctness result binds. Relative to the
+historical branch ON/OFF/vLLM totals **6607.04 / 6603.28 / 6716.47**, current
+intended ON is 0.679x historical and 0.666x current vLLM while the reference
+holds at 1.003x historical. The log also identifies current default async
+scheduling, absent from the historical project log, as the leading throughput
+delta to isolate after direct load actually activates.
+
+Disposition: the root is valid evidence of the classifier failure but
+**FAILED** as an intended direct-load comparison; `benchmark_binding=false`.
+Restore the already-proven `pageable && integrated` classifier plus its runtime
+attribute test, rebuild, commit an immutable binary, and rerun all 18 legs at a
+new root. Preserve this root; do not overwrite or publish it as support.
+
+### 2026-07-21 — discrete-CUDA classifier repair locally gated
+
+The sm_120 CUDA rebuild is warning-clean. The runtime attribute test passes
+3/3 assertions and proves `pageable=1`, `integrated=0`,
+`UnifiedMemory=false`. The real cached Qwen3.5-4B loader suite then passes
+3/3 cases and 1664/1664 assertions, including direct-OFF/direct-ON identical
+prompt and four output token IDs. CPU `test_cuda_backend` passes 5/5 and the
+plain-weight suite passes 1656/1656.
+
+One earlier real-model retry OOM was non-evidence: an unrelated
+`trellis2cpp` process held 9,194 MiB. No benchmark was launched; after that
+process exited, the identical clean test passed under the GPU lock. Next:
+commit the classifier repair, bind a new commit-named root, and rerun all 18
+benchmark legs. `benchmark_binding=false` remains.

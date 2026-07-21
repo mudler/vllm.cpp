@@ -6,6 +6,10 @@
 #include <stdexcept>
 #include <vector>
 
+#ifdef VLLM_CPP_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include "vt/backend.h"
 
 namespace {
@@ -147,13 +151,23 @@ TEST_CASE("CUDA backend: graph capture/replay re-executes captured ops") {
 }
 
 TEST_CASE("CUDA backend: unified-memory flag report") {
+#ifndef VLLM_CPP_CUDA
+  MESSAGE("CUDA support not built; skipping");
+  CHECK(true);
+#else
   if (!HasCuda()) {
     MESSAGE("no CUDA backend registered; skipping");
     return;
   }
   Backend& cuda = vt::GetBackend(DeviceType::kCUDA);
-  // Informational: GB10 is expected to report true (pageable memory access);
-  // discrete GPUs report false. Either value is valid.
-  MESSAGE("CUDA UnifiedMemory() = " << (cuda.UnifiedMemory() ? "true" : "false"));
-  CHECK(true);
+  int pageable = 0;
+  int integrated = 0;
+  REQUIRE(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, 0) ==
+          cudaSuccess);
+  REQUIRE(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0) == cudaSuccess);
+  MESSAGE("CUDA memory attributes: pageable=" << pageable << " integrated=" << integrated
+                                                << " UnifiedMemory="
+                                                << cuda.UnifiedMemory());
+  CHECK(cuda.UnifiedMemory() == (pageable != 0 && integrated != 0));
+#endif
 }

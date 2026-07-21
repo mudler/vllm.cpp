@@ -350,3 +350,14 @@ target_compile_definitions(test_qwen27_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen27_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# ADDITIVE-MODEL W4 (Qwen3-Coder-30B-A3B, Qwen3MoeForCausalLM) — the SACRED
+# full-attention BF16 MoE greedy correctness gate: drives a compact prompt
+# battery through the paged engine and checks per-(prompt,pos) set membership vs
+# the vLLM 0.25.0 oracle's K-run greedy set (STRICT where vLLM is deterministic).
+# Checkpoint-gated, dgx-only; skips on CPU/CI when the snapshot/goldens are absent.
+vllm_cpp_add_test(test_qwen3coder_paged_engine vllm/models/test_qwen3coder_paged_engine.cpp)
+target_compile_definitions(test_qwen3coder_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_qwen3coder_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)

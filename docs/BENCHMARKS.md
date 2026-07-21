@@ -1361,22 +1361,28 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
-- **Sweep model #1 W0+W1 — Qwen3-Coder-30B-A3B (`Qwen3MoeForCausalLM`) registry
-  stub + reusable-piece refactors (2026-07-21, `CLAIM-MODEL-QWEN3-CODER`).**
-  Infrastructure + three behaviour-preserving refactors; NO forward yet (W3), so
-  nothing to benchmark and no perf claim. W0 = a new registry TU
-  (`qwen3_moe_registry.cpp` + `qwen3_moe.h`, one `REGISTER_VLLM_MODEL`, a
-  full-attention-only KV spec, `is_dense_model=false`, clear-throwing W2/W3
-  load/forward stubs). W1 = (#1) the dense self-attention block + device glue
-  EXTRACTED verbatim to `dense_attn_block.h` (Qwen3-dense byte-identical), (#2)
-  the bf16 `MoeBlock` EXPOSED cross-TU via `RunMoeBlock` (`qwen3_5_moe_block.h`;
-  35B untouched), (#3) a no-shared-expert guard in `MoeBlock`
-  (`shared_expert_intermediate_size==0` → skip shared + nullptr to `MoeCombine`;
-  inert for the shared-expert-having 35B). **Regression UNCHANGED** (the whole
-  point of "behaviour-preserving"): Qwen3-dense 0.6B+4B near-tie 16/16, 27B
-  235/235, 35B 315/315, dgx CUDA `-Werror` 0-warn, memcheck 0. The SPEED
-  deliverable (a fast BF16 grouped-MoE GEMM — only NVFP4-Marlin exists) is W5 and
-  will be benchmarked then.
+- **Sweep model #1 W0-W3 — Qwen3-Coder-30B-A3B (`Qwen3MoeForCausalLM`) registry
+  stub + reusable-piece refactors + BF16 loader + forward (2026-07-21,
+  `CLAIM-MODEL-QWEN3-CODER`).** Infrastructure + behaviour-preserving refactors +
+  a host-only loader + a correctness forward; the SPEED deliverable is W5, so
+  there is still nothing to benchmark and no perf claim. W0 = a new registry TU
+  (`qwen3_moe_registry.cpp` + `qwen3_moe.h`). W1 = (#1) the dense self-attention
+  block EXTRACTED verbatim to `dense_attn_block.h`, (#2) the bf16 `MoeBlock`
+  EXPOSED cross-TU via `RunMoeBlock` (`qwen3_5_moe_block.h`), (#3) a
+  no-shared-expert guard in `MoeBlock`. W2 = the BF16 loader
+  (`qwen3_moe_weights.cpp`): merged qkv/o + per-head q/k norm + a NEW bf16
+  per-expert loader (router + 128 experts × gate/up/down in Matmul-B layout, no
+  shared expert) + UNTIED `lm_head` loaded separately. W3 = the forward
+  (`qwen3_moe.cpp` `Qwen3MoeModel::Forward/ForwardDevice`) = the dense forward
+  body with the per-layer MLP replaced by the MoE block, composing the reused
+  `AttnBlock` + `RunMoeBlock`, wired into the factory. **Regression UNCHANGED**:
+  Qwen3-dense 0.6B+4B near-tie 16/16, 27B 235/235, 35B 315/315, dgx CUDA
+  `-Werror` 0-warn, memcheck 0. Load gate: all 18867 tensors mapped (131746
+  assertions). Forward doctest: real-checkpoint prefill argmax = 12095 (" Paris")
+  for "The capital of France is" — correct, a strong W3 sanity (the token-exact
+  vs-oracle bar is W4). The SPEED deliverable (a fast BF16 grouped-MoE GEMM — only
+  NVFP4-Marlin exists; the bf16 path is the slow per-expert reference loop) is W5
+  and will be benchmarked then.
 - **First additive-model bring-up W0+W1+W2 — Qwen3 dense (`Qwen3ForCausalLM`) +
   the runner generalization + the weight loader (2026-07-20,
   `CLAIM-MODEL-QWEN3-DENSE`, `ENG-RUNNER-MODELSHAPE`).** Infrastructure + a
@@ -1540,6 +1546,6 @@ The complete contract is in the
 
 **Breadth sweep note (2026-07-21):** the active phase is model-architecture breadth (recent-first), each held to token-exact + vLLM-speed on every axis. Ranked queue + CUDA-arch additivity audit: [.agents/specs/breadth-sweep-plan.md](../.agents/specs/breadth-sweep-plan.md). CUDA archs beyond same-family sm_120 are HW-blocked (only GB10 testable).
 
-**Sweep model #1 — W0+W1 LANDED (2026-07-21): Qwen3-Coder-30B-A3B** (`Qwen3MoeForCausalLM`, BF16 full-attention MoE) — [spike](../.agents/specs/sweep-qwen3-coder-30b.md). Composes the done Qwen3-dense attention + the done 35B MoE experts (zero runner change); 4 model-layer seams (extract/expose/guard + a new bf16-expert loader); the SPEED gap is a fast bf16 grouped-MoE GEMM (W5). No quant (correctness covered by the reference MoE path). W0 (registry stub) + W1 (extract `dense_attn_block.h` / expose `RunMoeBlock` / no-shared guard) landed behaviour-preserving — regression UNCHANGED (Qwen3-dense 16/16, 27B 235/235, 35B 315/315); see the NOT-APPLICABLE disposition above. W2 loader → W3 forward → W4 near-tie token-exact → W5 fast-MoE + every-axis speed remain.
+**Sweep model #1 — W0-W3 LANDED (2026-07-21): Qwen3-Coder-30B-A3B** (`Qwen3MoeForCausalLM`, BF16 full-attention MoE) — [spike](../.agents/specs/sweep-qwen3-coder-30b.md). Composes the done Qwen3-dense attention + the done 35B MoE experts (zero runner change); 4 model-layer seams (extract/expose/guard + a new bf16-expert loader); the SPEED gap is a fast bf16 grouped-MoE GEMM (W5). No quant (correctness covered by the reference MoE path). W0 (registry stub) + W1 (extract `dense_attn_block.h` / expose `RunMoeBlock` / no-shared guard) + W2 (bf16 loader `qwen3_moe_weights.cpp` — router + 128 experts + untied lm_head) + W3 (forward `qwen3_moe.cpp` composing `AttnBlock`+`RunMoeBlock`) landed behaviour-preserving — regression UNCHANGED (Qwen3-dense 16/16, 27B 235/235, 35B 315/315); load gate all 18867 tensors mapped; forward doctest real-ckpt prefill argmax=12095 (" Paris", correct); see the NOT-APPLICABLE disposition above. W4 near-tie token-exact vs vLLM 0.25.0 → W5 fast-MoE + every-axis speed remain.
 
-**Qwen3-Coder-30B W0+W1 landed (2026-07-21):** registry stub + the extract/expose/guard refactors (dense `AttnBlock`→`dense_attn_block.h`, bf16 `MoeBlock`→`qwen3_5_moe_block.h`, no-shared-expert guard) — behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W2 bf16 loader → W3 forward → W4 near-tie token-exact → W5 bf16-fast-MoE next.
+**Qwen3-Coder-30B W0-W3 landed (2026-07-21):** registry stub + the extract/expose/guard refactors (dense `AttnBlock`→`dense_attn_block.h`, bf16 `MoeBlock`→`qwen3_5_moe_block.h`, no-shared-expert guard) + bf16 loader (`qwen3_moe_weights.cpp`) + forward (`qwen3_moe.cpp` composing `AttnBlock`+`RunMoeBlock`, untied lm_head) — behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED); load gate 18867 tensors mapped; real-ckpt prefill argmax=12095 (" Paris"). W4 near-tie token-exact → W5 bf16-fast-MoE next.

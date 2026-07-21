@@ -6,14 +6,12 @@
 // subclass, and the factory. Mirrors the qwen3_dense.cpp seam (new TU + one in-TU
 // REGISTER line -> ZERO shared-array edit).
 //
-// W0/W1 scope: the weight loader (W2) and the forward (W3) are NOT implemented —
-// the registered load_weights + forward hooks are clear-throwing stubs so the
-// registry resolves and the KV-cache/runner generalization can be gated on CPU,
-// while any attempt to actually load/run the model fails loudly with a "W2"/"W3"
-// message rather than silently. The reusable dense `AttnBlock`
-// (dense_attn_block.h) + the exposed `RunMoeBlock` (qwen3_5_moe_block.h) + the
-// no-shared-expert guard land in W1 as behavior-preserving refactors that W3 then
-// composes. See .agents/specs/sweep-qwen3-coder-30b.md §3, §7.
+// W2/W3 landed: load_weights dispatches to the BF16 per-expert safetensors loader
+// (qwen3_moe_weights.cpp), and forward dispatches to Qwen3MoeModel (qwen3_moe.cpp)
+// which composes the reusable dense `AttnBlock` (dense_attn_block.h) + the exposed
+// `RunMoeBlock` (qwen3_5_moe_block.h) per layer, with NO GDN, NO shared expert, and
+// an untied lm_head. See .agents/specs/sweep-qwen3-coder-30b.md §3, §7. The
+// correctness gate (near-tie token-exact vs vLLM 0.25.0) is W4.
 #include "vllm/model_executor/models/model_registry.h"
 
 #include <memory>
@@ -59,18 +57,17 @@ class Qwen3MoeLoadedModel final : public LoadedModel {
 std::unique_ptr<LoadedModel> LoadQwen3MoeForCausalLM(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
-  (void)registration;
-  (void)config;
+  // W2: BF16 safetensors name map + NEW bf16 per-expert loader + untied lm_head.
+  // Qwen3-Coder is text-only BF16 safetensors (no GGUF path yet).
   if (source.kind != ModelSource::Kind::kSafetensors) {
     throw std::runtime_error(
         "Model architecture Qwen3MoeForCausalLM does not support GGUF weights");
   }
-  // W2 stub: the BF16 safetensors expert loader (per-expert
-  // mlp.experts.E.{gate,up,down}_proj + router gate + untied lm_head) is not yet
-  // implemented — fail loudly rather than construct an empty model.
-  throw std::runtime_error(
-      "Qwen3MoeForCausalLM weight loading is not implemented yet (W2): the BF16 "
-      "per-expert safetensors loader lands in a follow-up change");
+  if (source.safetensors == nullptr) {
+    throw std::runtime_error("safetensors model source is empty");
+  }
+  return std::make_unique<Qwen3MoeLoadedModel>(
+      registration, LoadQwen3MoeForCausalLMWeights(*source.safetensors, config));
 }
 
 void PrepareQwen3MoeForCausalLM(LoadedModel& model, const HfConfig& config,
@@ -82,13 +79,21 @@ void PrepareQwen3MoeForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardQwen3MoeForCausalLM(LoadedModel& model,
                                          const ModelForwardInput& input) {
-  (void)model;
-  (void)input;
-  // W3 stub: the forward (dense AttnBlock + RunMoeBlock per layer, no GDN, no
-  // shared expert, untied lm_head) is not yet wired.
-  throw std::runtime_error(
-      "Qwen3MoeForCausalLM forward is not implemented yet (W3): composes the "
-      "shared dense AttnBlock + the exposed RunMoeBlock per layer");
+  const auto& qwen = static_cast<Qwen3MoeLoadedModel&>(model);
+  const Qwen3MoeWeights& weights = qwen.weights();
+  // DEVICE-resident logits (sampler-on-device) on the gather path; HOST logits on
+  // the opt-out. Qwen3-Coder is pure full-attention MoE (input.gdn_* unused).
+  if (input.gather_logits) {
+    return Qwen3MoeModel::ForwardDevice(input.token_ids, input.positions,
+                                        input.attn_meta, input.attn_kv, weights,
+                                        input.config, input.queue,
+                                        input.logits_indices);
+  }
+  return HostLogits(
+      Qwen3MoeModel::Forward(input.token_ids, input.positions, input.attn_meta,
+                             input.attn_kv, weights, input.config, input.queue,
+                             input.logits_indices),
+      input.config.vocab_size);
 }
 
 const ModelFactory kQwen3MoeFactory{

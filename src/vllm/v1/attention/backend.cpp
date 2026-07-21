@@ -80,7 +80,37 @@ std::vector<int64_t> FlashAttentionBackend::get_kv_cache_shape(
   return {num_blocks, 2, block_size, num_kv_heads, head_size};
 }
 
+std::vector<int64_t> TritonMLABackend::get_kv_cache_shape(
+    int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
+    int64_t head_size, const std::string& /*cache_dtype_str*/) const {
+  // triton_mla.py:100-103 supports_block_size.
+  if (!supports_block_size(block_size)) {
+    throw std::invalid_argument("Block size must be a multiple of 16.");
+  }
+  // mla_attention.py:1219 — "num_kv_heads ... assumed to be 1 for MLA". Upstream
+  // ignores the argument; we REFUSE a non-1 value so a caller that wired a
+  // GQA-shaped spec into an MLA layer fails loudly instead of allocating a cache
+  // the MQA decode cannot read.
+  if (num_kv_heads != 1) {
+    throw std::invalid_argument(
+        "MLA kv cache requires num_kv_heads == 1 (the latent is one head).");
+  }
+  // THREE dims: no K/V axis (mla_attention.py:1216-1224).
+  return {num_blocks, block_size, head_size};
+}
+
 namespace {
+// TRITON_MLA self-registers for CUDA only — it is a CUDA-capability backend
+// (cuda.py:129-133) and there is no CPU MLA backend upstream at the pin, so a
+// CPU MLA request correctly finds nothing and throws. Registering the NAME is
+// what lets SelectAttentionBackendName resolve use_mla=true on GB10 today; the
+// impl arrives at W4/W6.
+const AttentionBackendRegistrar kTritonMlaCuda{
+    vt::DeviceType::kCUDA, TritonMLABackend::kName,
+    []() -> std::unique_ptr<AttentionBackend> {
+      return std::make_unique<TritonMLABackend>();
+    }};
+
 // FLASH_ATTN self-registers for the device types whose paged-attention KV cache
 // uses its NHD (num_blocks,2,block,H,D) layout: CUDA (the gate) and, per the
 // cpu_paged_attn.cpp deviation, CPU. Mirrors upstream

@@ -35,7 +35,13 @@ class CpuPlatform final : public Platform {
   // mirrors upstream's CPU preference AND is behavior-preserving (selection
   // returns "FLASH_ATTN", the layout used today), and demonstrates the
   // first-registered-in-priority fallthrough that IS the selection mechanism.
-  std::vector<std::string> get_attn_backend_priority() const override {
+  // MLA is not reachable on the CPU platform (no CPU MLA backend upstream at the
+  // pin), so the list is the same for both cfg values — an MLA request simply
+  // finds no is_mla() backend registered and the selector throws, rather than
+  // silently returning a dense backend.
+  std::vector<std::string> get_attn_backend_priority(
+      const AttnSelectorConfig& cfg) const override {
+    (void)cfg;
     return {"CPU_ATTN", "FLASH_ATTN"};
   }
 };

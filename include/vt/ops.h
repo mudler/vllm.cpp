@@ -101,6 +101,7 @@ enum class OpId : uint8_t {
   kMoeCombine,
   kAttention,
   kReshapeAndCache,
+  kConcatAndCacheMla,
   kPagedAttention,
   kApplyTemperature,
   kGreedyArgmax,
@@ -330,13 +331,42 @@ struct PagedAttentionArgs {
   int32_t max_seq_len = 0;
 };
 
+// Router SCORING function. softmax over all E is the Qwen3.6 / DeepSeek-V2
+// behavior; sigmoid (elementwise, NOT normalized across experts) is what
+// DeepSeek-V3 / R1 use with `topk_method == "noaux_tc"`. Mirrors
+// vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:110-117.
+enum class MoeScoringFunc {
+  kSoftmax,  // scores = softmax(gating_output, dim=-1)      (:111-112)
+  kSigmoid,  // scores = gating_output.sigmoid()             (:113-114)
+};
+
 // MoE router top-k args (.agents/specs/moe-semantics.md §3 is the formula reference).
+//
+// The four fields below `renormalize` are the W3 GROUPED-TOPK (`noaux_tc`)
+// extension, ported from grouped_topk_router.py:80-161 @ pin e24d1b24. They are
+// ADDITIVE: every field defaults to the pre-W3 behavior, and `num_expert_group
+// == 0` selects the original ungrouped softmax+top-k path VERBATIM (a separate
+// kernel — the existing one is not touched), so the 27B / 35B / Coder / dense
+// routers stay byte-identical.
 struct MoeRouterTopKArgs {
   // Number of experts selected per token (top_k = num_experts_per_tok).
   int top_k = 0;
   // renormalize = norm_topk_prob (True for Qwen3.6, moe-semantics.md §1/§3):
   // divide the k selected softmax probs by their sum (denom>0 guard).
   bool renormalize = true;
+
+  // --- grouped-topk (`noaux_tc`) extension ---------------------------------
+  // scoring_func: softmax (V2 / Qwen) vs sigmoid (V3 / R1).
+  MoeScoringFunc scoring_func = MoeScoringFunc::kSoftmax;
+  // num_expert_group == config.n_group. 0 DISABLES grouping entirely (the
+  // pre-W3 path). When > 0 it must divide num_experts exactly.
+  int num_expert_group = 0;
+  // topk_group == config.topk_group: how many expert GROUPS survive the
+  // first-level mask. Must be in [1, num_expert_group] when grouping is on.
+  int topk_group = 0;
+  // routed_scaling_factor: a final multiply on the routing weights
+  // (grouped_topk_router.py:159-160; deepseek_v2.py:288). 1.0 == no-op.
+  float routed_scaling_factor = 1.0f;
 };
 
 // Kernel registration contract. Backends register one kernel per (OpId,
@@ -458,8 +488,8 @@ using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
-using MoeRouterTopKFn =
-    void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const MoeRouterTopKArgs&);
+using MoeRouterTopKFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
+                                 const MoeRouterTopKArgs&, const Tensor*);
 using MoeCombineFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using MoeCombineGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
@@ -468,6 +498,8 @@ using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, cons
                              const AttentionArgs&);
 using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, Tensor&,
                                    const Tensor&);
+using ConcatAndCacheMlaFn =
+    void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, const Tensor&);
 using PagedAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&, const Tensor&, const Tensor&,
                                   const PagedAttentionArgs&);
@@ -1165,8 +1197,41 @@ void GdnStateScatter(Queue& q, Tensor& cache, const Tensor& working,
 // greedy top-k (weights emitted in descending order per token), lowest expert
 // index wins ties, then optional renormalize (divide the k probs by their sum,
 // denom<=0 -> 1 guard). weights [T,top_k] f32, indices [T,top_k] i32.
+//
+// --- GROUPED-TOPK / `noaux_tc` (W3) ----------------------------------------
+// When `args.num_expert_group > 0` this instead runs the DeepSeek grouped-topk
+// router, a 1:1 port of
+// vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:80-161 @
+// pin e24d1b24 (the `native_impl`/`forward_native` path — the fully fused
+// `ops.grouped_topk` CUDA path at `:28-70` is an OPTIMIZATION of the same
+// formula, gated on `VLLM_USE_FUSED_MOE_GROUPED_TOPK` + sigmoid + a bias, and is
+// not a different result):
+//   1. scores = softmax(logits, -1) | sigmoid(logits)          (:110-117)
+//   2. with a bias: original_scores = scores; scores += bias    (:120-124)
+//        group_score[g] = SUM of the TOP-2 scores in group g    (:124-126)
+//      without a bias:
+//        group_score[g] = MAX score in group g                  (:128-131)
+//   3. keep the top `topk_group` groups, mask the rest to -inf  (:133-145)
+//   4. top-k over the masked scores; with a bias the WEIGHT is read from the
+//      UNBIASED `original_scores` at the selected ids — the biased score selects,
+//      the unbiased score weights                               (:147-150)
+//   5. optional renormalize (:156-157), then routed_scaling_factor (:159-160).
+//
+// `e_score_correction_bias` [E] f32 is upstream's optional learned gate bias
+// (deepseek_v2.py:313-318 — created ONLY for `topk_method == "noaux_tc"`, hence
+// nullptr for DeepSeek-V2-Lite and for every Qwen model). Passing it with
+// `num_expert_group == 0` is rejected: upstream only ever reaches the bias
+// asymmetry through the grouped path.
+//
+// DETERMINISM DEVIATION (recorded): upstream uses `torch.topk`, whose tie order
+// is unspecified (`sorted=` is only forced under VLLM_BATCH_INVARIANT). We keep
+// our house convention — greedy selection with a strict `>` scan over ascending
+// index, so the LOWEST expert index wins an exact tie — for BOTH the group
+// selection and the expert selection. This is the same rule the ungrouped router
+// already uses, and it is what makes CPU and CUDA agree bit-for-bit.
 void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
-                   const MoeRouterTopKArgs& args);
+                   const MoeRouterTopKArgs& args,
+                   const Tensor* e_score_correction_bias = nullptr);
 
 // Weighted scatter-combine of the per-expert outputs (moe-semantics.md §4/§6).
 //   out[t,:] = sum_j weights[t,j] * expert_out[t,j,:]   (f32 accumulation)
@@ -1226,6 +1291,53 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
 // fp8 scaling — fp8 KV cache is out of T0 scope).
 void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                      Tensor& v_cache, const Tensor& slot_mapping);
+
+// --- MLA paged KV-cache write (W3). The MLA counterpart of ReshapeAndCache.
+// Ported 1:1 from vllm/csrc/libtorch_stable/cache_kernels.cu:401-442
+// (`concat_and_cache_mla_kernel`) + its host wrapper `:842-905`
+// (`concat_and_cache_mla`) @ pin e24d1b24, reached from
+// vllm/_custom_ops.py:2532 and called at vllm/v1/attention/backend.py:995,1075.
+//
+// WHAT ACTUALLY RUNS UPSTREAM (verified, not assumed — AGENTS.md "ground every
+// check in the whole execution chain"): unlike the GEMM/attention families,
+// this one is NOT delegated to a dependency. `concat_and_cache_mla` binds
+// straight to `torch.ops._C_cache_ops.concat_and_cache_mla`
+// (`_custom_ops.py:2540-2542`), registered from vLLM's OWN
+// csrc/libtorch_stable/torch_bindings.cpp over the kernel above. There is no
+// flashinfer / cutlass / TRT-LLM variant in the dense-bf16 path — the only
+// alternative in that TU is `concat_and_cache_ds_mla_kernel` (`:445+`), which is
+// the fp8_ds_mla 656-byte V3.2 layout, out of campaign scope. The one thing that
+// can displace it is the COMPILE-TIME fusion pass
+// vllm/compilation/passes/fusion/mla_rope_kvcache_cat_fusion.py:40, which folds
+// RoPE into `concat_and_cache_mla_rope_fused` (`_custom_ops.py:2545`) — same
+// math, one launch; our fusion-catalog analogue is deferred to W9, exactly as
+// the campaign spec sequences it (unfused byte-exact first).
+//
+// MLA caches ONE row per token: the compressed latent CONCATENATED with the
+// decoupled rope part, `kv_lora_rank + qk_rope_head_dim` wide (512 + 64 == 576
+// for every DeepSeek variant and for Kimi Linear's MLA layers), with
+// num_kv_heads == 1 and NO separate V — V is reconstructed from the same latent
+// via W_UV at decode. That is why the cache is 3-D
+// (num_blocks, block_size, head_size; mla_attention.py:1216-1224) and why
+// ReshapeAndCache's (k, v, k_cache, v_cache) signature cannot express this write.
+//
+//   kv_c         [num_tokens, kv_lora_rank]        (post-`kv_a_layernorm` latent)
+//   k_pe         [num_tokens, qk_rope_head_dim]    (the shared single-head rope part)
+//   kv_cache     [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+//   slot_mapping [num_slots] i64  (num_slots <= num_tokens; the tail of kv_c/k_pe
+//                is CUDA-graph padding and is ignored — upstream uses
+//                slot_mapping.size(0) as the token count, `:855-863`)
+// For token t with slot s = slot_mapping[t]: block = s / block_size,
+// offset = s % block_size; kv_c[t] lands at columns [0, kv_lora_rank) of that
+// entry and k_pe[t] at [kv_lora_rank, kv_lora_rank + pe_dim). A slot s < 0 skips
+// token t (padding). Indexing is driven by the tensor STRIDES (upstream reads
+// kv_cache.stride(0)/stride(1) and kv_c/k_pe.stride(0)), so a strided cache view
+// or a split-projection source view is handled without a copy.
+// The "auto" path only: cache dtype == kv_c dtype, no fp8 scaling — the
+// `fp8_ds_mla` / int4 layouts are out of scope and are REFUSED loudly rather
+// than silently mis-written.
+void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor& kv_cache,
+                       const Tensor& slot_mapping);
 
 // --- Paged attention (M1.6). Correctness-grade varlen prefill + paged decode.
 // Semantics ported from the FlashAttention path

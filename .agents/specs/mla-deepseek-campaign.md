@@ -1,12 +1,16 @@
 # SPIKE — MLA (Multi-head Latent Attention) + the DeepSeek / Kimi / MiniMax families
 
-**Status:** **W0 + W1 LANDED** (see `### Work breakdown`). W0 grounded every
-fact the spike flagged as an unverified source read — all CONFIRMED by runtime
-observation, nothing contradicted. W1 landed the behaviour-preserving
-spec-driven KV allocation + `MLAAttentionSpec` with **zero MLA math**. W2-W10
-remain plan only. No model row moves off `SPIKE` — W0/W1 make no model
-supported.
-**Base:** `b4f14ee` (spike) / `fb3fd5d` (W0+W1).
+**Status:** **W0 + W1 + W2 + W3 LANDED** (see `### Work breakdown`). W0 grounded
+every fact the spike flagged as an unverified source read — all CONFIRMED by
+runtime observation, nothing contradicted. W1 landed the behaviour-preserving
+spec-driven KV allocation + `MLAAttentionSpec`. W2 landed the MLA branch of the
+backend selector as a DATA table plus the `is_mla()`/`is_sparse()` filter that
+leaves a zero-edit seam for DSA. W3 landed the two new `vt::` ops —
+`ConcatAndCacheMla` and the grouped-topk (`noaux_tc`) router extension — each
+CPU-reference-gated. **There is still no MLA attention math, no MLA model and no
+MLA forward**: W4-W10 remain plan only, and **no model row moves off `SPIKE`** —
+W0-W3 make no model supported.
+**Base:** `b4f14ee` (spike) / `fb3fd5d` (W0+W1) / `a05437f` (W2+W3).
 **Pinned oracle:** `/home/mudler/_git/vllm` @ `e24d1b24` (v0.25.0 audit target
 `702f4814fe54`). The executable oracle venv `~/venvs/vllm-oracle` lives on
 **dgx.casa**. Every claim below is grounded in repo source; the two claims that
@@ -916,8 +920,8 @@ hardware. **Nothing below is implemented; this is the plan.**
 |---|---|---|---|
 | **W0** ✅ **DONE 2026-07-21** | **Ground the facts.** Download DeepSeek-V2-Lite; confirm its real `config.json` against §5 (especially `q_lora_rank is None`); run the vLLM oracle on it and CONFIRM from its logs that `TRITON_MLA` + FA-2 MLA prefill are selected on sm_121; capture a K=5 greedy determinism probe to fix the gate form. | checkpoint | **PASSED** — checkpoint fetched (29.26 GiB, 4 shards) and generating in the oracle; `TRITON_MLA` + `FLASH_ATTN` MLA prefill OBSERVED on sm_121 (3 runs) and the two-stage decode kernels seen executing; every §5.1 config number confirmed, none corrected; determinism = **DETERMINISTIC 8/8 at batch=1** ⇒ STRICT gate |
 | **W1** ✅ **DONE 2026-07-21** | **Spec-driven KV allocation (behaviour-preserving, no MLA).** Size every cache buffer from `spec->page_size_bytes()`; stop reconstructing shape from `config_`; add `KVCacheSpecKind::kMlaAttention` + `MLAAttentionSpec` with the single-tensor formula (merge assertions deferred with `merge()` itself; the distinct `kind()` is what a future `merge()` keys on). | — | **PASSED** — 27B 235/235, 35B 315/315, Coder 6/6, Qwen3-dense 16/16 all UNCHANGED; CUDA `-Werror` 0 warn/0 err; `test_kv_cache_interface` 21/21 (4 new MLA-spec cases), `test_runner` 15/15, `test_llm_engine` 5/5; new path proven EXERCISED via `fa_page_size_bytes()` + a `page_size_padded` case |
-| **W2** | **Platform MLA backend priorities + registry.** Port the `use_mla` branch of `_get_backend_priorities` (`cuda.py:93-142`) and the MLA prefill selector; register an `MLA` attention backend name resolving to TRITON_MLA on major 12. | W1 | ports of `test_attention_backends_selection.py` (MLA cases), `test_mla_prefill_selector.py`, `test_mla_prefill_registry.py`; existing non-MLA selection unchanged |
-| **W3** | **New `vt::` ops — cache write + router.** `vt::ConcatAndCacheMla` (CPU ref + CUDA) mirroring `concat_and_cache_mla`; extend `MoeRouterTopKArgs` with `scoring_func` / `e_score_correction_bias` / `num_expert_group` / `topk_group` / `routed_scaling_factor` and implement the grouped-topk selection rule. | W1 | op parity tests vs CPU reference; grouped-topk unit test vs the upstream formula; existing router byte-identical |
+| **W2** ✅ **DONE 2026-07-21** | **Platform MLA backend priorities + registry.** Port the `use_mla` branch of `_get_backend_priorities` (`cuda.py:93-142`) and the MLA prefill selector; register an `MLA` attention backend name resolving to TRITON_MLA on major 12. | W1 | **PASSED** — ports of `test_attention_backends_selection.py` (MLA cases), `test_mla_prefill_selector.py`, `test_mla_prefill_registry.py` in `tests/vllm/v1/attention/test_attn_backend_registry.cpp`; non-MLA selection byte-identical; `use_mla=true` on sm_121 RESOLVES to `TRITON_MLA` |
+| **W3** ✅ **DONE 2026-07-21** | **New `vt::` ops — cache write + router.** `vt::ConcatAndCacheMla` (CPU ref + CUDA) mirroring `concat_and_cache_mla`; extend `MoeRouterTopKArgs` with `scoring_func` / `e_score_correction_bias` / `num_expert_group` / `topk_group` / `routed_scaling_factor` and implement the grouped-topk selection rule. | W1 | **PASSED** — `tests/vt/test_ops_mla_cache.cpp` + `tests/vt/test_ops_moe_router_grouped.cpp`; CPU-vs-CUDA parity (exact on the cache write, exact ids on the router); grouped-topk gated at REAL V3 dims (256 experts, n_group=8, topk_group=4, sigmoid, WITH `e_score_correction_bias`); ungrouped router byte-identical |
 | **W4** | **MLA decode attention op.** `vt::MlaDecodeAttention` — the two-stage split-KV MQA decode over the latent (QK 576 / V 512), structurally mirroring `decode_attention_fwd` (vLLM <- SGLang <- lightllm) and reusing our FA-2 split+deterministic-combine pattern; registered via `cuda_arch_tactics`. | W3 | port of `test_mla_decode_cpu.py`; CPU-ref parity; run-to-run bit-reproducibility |
 | **W5** | **MLA prefill.** Generalize the vendored FA-2 varlen launcher to qk 192 / v 128 (the GB10 MLA prefill backend is FLASH_ATTN, §2.3) and implement the compute-friendly materialized form plus the workspace-bounded chunked-context loop with LSE merge. | W4 | ports of `test_mla_backends.py`, `test_mla_prefill_quant_output.py` |
 | **W6** | **MLA attention block + weight absorption.** `mla_attention.{h,cpp}`: projections (both `q_lora_rank` branches), the two RMSNorms, decoupled RoPE, the load-time `kv_b_proj -> W_UK/W_UV` split, and the prefill-MHA / decode-MQA dispatch. | W5 | forward doctest; absorption round-trip vs the unabsorbed form |
@@ -1234,9 +1238,134 @@ Hkv * Dh` arithmetic and HF-config reconstruction:
   `test_kv_cache_interface` 21/21 (incl. 4 new MLA-spec cases),
   `test_llm_engine` 5/5.
 
-W2 platform MLA
-backend priorities + prefill selector + registry. W3 `vt::ConcatAndCacheMla` +
-the grouped-topk router extension. W4 `vt::MlaDecodeAttention` (two-stage
+**W2 — LANDED 2026-07-21 (behaviour-preserving for every dense model).** The MLA
+branch of `_get_backend_priorities` that `src/vllm/platforms/cuda.cpp:54-56`
+deliberately skipped is now ported, and it is DATA:
+- `include/vllm/platforms/cuda_attn_priority.h` (NEW) holds the whole of
+  `vllm/platforms/cuda.py:84-176` as a TABLE — one row per upstream
+  `if device_capability.major == N` arm, keyed on `(use_mla, major)`, with
+  `kAnyMajor` for the `else` arm. **BOTH** branches are ported, not just ours:
+  MLA sm_100 (`:117-131`, including the `:96-115` adaptive sparse tail — the
+  FlashInfer-vs-FlashMLA swap on fp8 KV or `num_heads <= 16`), MLA sm_12x
+  (`:129-133`), MLA `else` (`:134-142`), and the two pre-existing non-MLA arms
+  moved verbatim from the old inline if-chain. A new arch is a ROW, not a code
+  path. The table lives in a header (not the CUDA-only TU) so the CPU test tier
+  asserts the REAL table — the pre-W2 `FakeCudaPlatform` was a hand-copied
+  duplicate carrying a "keep in sync" comment, and that duplicate is now gone.
+- `AttnSelectorConfig` (`include/vllm/platforms/interface.h`) carries upstream's
+  `use_mla` / `num_heads` / `kv_cache_dtype` inputs plus `use_sparse`. Every
+  field defaults to the pre-W2 dense answer, so the zero-argument call sites are
+  unchanged.
+- **The sparse/DSA SEAM.** GB10's MLA list keeps BOTH upstream entries
+  (`[TRITON_MLA, FLASHINFER_MLA_SPARSE_SM120]`). The sparse one is eliminated not
+  by omission but by a real FILTER: `AttentionBackend::is_mla()` / `is_sparse()`
+  (mirroring `vllm/v1/attention/backend.py:307-360 validate_configuration`) are
+  compared against the request in `SelectAttentionBackendName`. That is exactly
+  why the oracle's candidate list printed a SINGLE entry at W0. A future DSA
+  backend therefore needs **no edit to the table and no edit to the selector** —
+  it registers with `is_sparse() == true` and a `use_sparse=true` request selects
+  it. This is unit-proven, not asserted: the test registers a stand-in sparse
+  backend and shows the dense request still gets `TRITON_MLA` while a sparse
+  request gets the sparse entry. (The concurrent `CLAIM-GLM-DSA-LATEST-DEEPSEEK`
+  spike scopes DSA itself; none of it is implemented here.)
+- `TritonMLABackend` (`include/vllm/v1/attention/backend.h`,
+  `src/vllm/v1/attention/backend.cpp`) — the NAME + the selection-relevant
+  surface only, ported from `triton_mla.py:81` over `mla_attention.py:1206`. Its
+  `get_kv_cache_shape` returns upstream's **3-D** `(num_blocks, block_size,
+  head_size)` (`mla_attention.py:1216-1224`) with no K/V axis, and REFUSES
+  `num_kv_heads != 1` rather than ignoring it as upstream does. `get_impl_cls()`
+  stays the base `nullptr` — the impl is W4/W6.
+- MLA PREFILL priority (`get_mla_prefill_backend_priority`,
+  `mla/prefill/selector.py:47-76`): sm_100 gets the four-entry list, everything
+  else — including GB10 — gets `[FLASH_ATTN]` ALONE, matching the W0 observation.
+  The ROCm arm is recorded as not-ported rather than dropped.
+
+**W3 — LANDED 2026-07-21. Two new numerics, both CPU-reference-gated.**
+
+*(a) `vt::ConcatAndCacheMla`* — `OpId::kConcatAndCacheMla`, validation in
+`src/vt/ops.cpp`, CPU reference in `src/vt/cpu/cpu_cache.cpp`, CUDA kernel in
+`src/vt/cuda/cuda_cache.cu`. Ported 1:1 from
+`vllm/csrc/libtorch_stable/cache_kernels.cu:401-442`
+(`concat_and_cache_mla_kernel`) + its host wrapper `:842-905`.
+**WHAT ACTUALLY RUNS UPSTREAM — verified, not assumed** (AGENTS.md "ground every
+check in the whole execution chain"): unlike the GEMM/attention families, this op
+is NOT delegated to a dependency. `vllm/_custom_ops.py:2532` binds straight to
+`torch.ops._C_cache_ops.concat_and_cache_mla` (`:2540-2542`), registered from
+vLLM's OWN `csrc/libtorch_stable/torch_bindings.cpp` over that kernel. No
+flashinfer / cutlass / TRT-LLM variant exists in the dense-bf16 path; the only
+sibling in that TU is `concat_and_cache_ds_mla_kernel` (`:445+`), the fp8_ds_mla
+656-byte V3.2 layout, which is out of campaign scope and which our wrapper
+REFUSES via its dtype check rather than mis-sizing. The one thing that can
+displace it is the COMPILE-TIME pass
+`compilation/passes/fusion/mla_rope_kvcache_cat_fusion.py:40` folding RoPE into
+`concat_and_cache_mla_rope_fused` — same math, one launch; our fusion-catalog
+analogue stays deferred to W9 exactly as §10 sequences it.
+Semantics: the latent (`kv_lora_rank`) and the decoupled rope part
+(`qk_rope_head_dim`) are CONCATENATED into ONE 576-wide entry — this is the write
+`vt::ReshapeAndCache`'s `(k, v, k_cache, v_cache)` signature cannot express.
+Indexing is STRIDE-driven on every operand, so (i) a per-layer slice of a
+multi-layer allocation and (ii) the two column halves of the single
+`kv_a_proj_with_mqa` output (`deepseek_v2.py:511`) both work with no copy — both
+exercised in the tests.
+
+*(b) grouped-topk (`noaux_tc`) router* — `MoeRouterTopKArgs` EXTENDED additively
+with `scoring_func` (new `MoeScoringFunc` enum), `num_expert_group`,
+`topk_group`, `routed_scaling_factor`, plus an optional trailing
+`e_score_correction_bias` tensor argument on `vt::MoeRouterTopK` (mirroring how
+`MoeCombine` takes its optional `shared`). Ported 1:1 from
+`fused_moe/router/grouped_topk_router.py:106-161` (the `forward_native` path; the
+`ops.grouped_topk` CUDA path at `:28-70` is an optimization of the SAME formula,
+gated on an env flag + sigmoid + a bias, not a different result).
+**The existing router is untouched**: `num_expert_group == 0` (the default)
+dispatches to the ORIGINAL kernel on both devices — a separate
+`MoeRouterGroupedTopKKernel` implements the new path — so the 27B / 35B / Coder /
+Qwen3-dense routers are byte-identical by construction, not by measurement.
+Recorded DETERMINISM DEVIATION: upstream uses `torch.topk`, whose tie order is
+unspecified unless `VLLM_BATCH_INVARIANT` forces `sorted=True`; we keep the house
+lowest-index-wins rule for both the group and the expert selection, which is what
+makes CPU and CUDA agree bit-for-bit.
+**The `noaux_tc` correctness evidence is UNIT-ONLY, and this is stated plainly
+rather than papered over.** DeepSeek-V2-Lite — the campaign's only e2e vehicle —
+has `n_group=topk_group=1`, softmax/greedy and therefore **no
+`e_score_correction_bias` parameter at all** (§5.1, W0-confirmed), so the e2e gate
+exercises NONE of this: not sigmoid scoring, not the biased-select /
+unbiased-weight asymmetry, not the two-level group mask, not routed scaling.
+`tests/vt/test_ops_moe_router_grouped.cpp` is the whole of the evidence, and it
+runs at DeepSeek-V3's REAL dimensions (256 experts, `n_group=8`,
+`topk_group=4`, `top_k=8`, sigmoid, `routed_scaling_factor=2.5`, WITH the bias)
+against an INDEPENDENT transcription of the upstream formula that uses a
+sort-based top-k rather than the kernel's greedy scan — so agreement is evidence,
+not a restatement of the same code. Each new rule is additionally isolated in its
+own hand-computed case: the bias selects but the unbiased score weights; the
+group score is top-2-SUM with a bias and MAX without (a case where the two rules
+disagree about which group survives); the mask really excludes the GLOBAL argmax
+when it sits in a losing group; renormalize happens BEFORE routed scaling.
+**Measured CPU-vs-CUDA agreement, corrected mid-gate rather than assumed:** the
+first version of the test asserted the router weights were BIT-identical across
+devices on the sigmoid path, reasoning that sigmoid has no cross-expert
+reduction. dgx disproved it — 7 of 192 weights differed by exactly one ULP. The
+cause is not reduction order but the TRANSCENDENTAL: the CPU reference uses the
+host `std::exp` and the kernel uses the device `expf`, separately-rounded
+implementations of the same function. The test now asserts the accurate property
+(a 1-ULP bound), and the claim that IS exact is the one that matters for routing
+— the SELECTION (expert ids), which is pure comparison over the same values and
+cannot legitimately differ, plus run-to-run bit-reproducibility on a device.
+**COORDINATION:** `.agents/coordination.md` records the
+`vt::MoeRouterTopK` extension as SHARED with `CLAIM-GLM-DSA-LATEST-DEEPSEEK`
+("must not be implemented twice"). It is landed HERE; that claim consumes it.
+
+**A real bug memcheck caught, recorded because the lesson generalizes.** The
+grouped-router CUDA kernel's dynamic shared memory is laid out
+`[sel(e) | orig(e) | gscore(G) | gkeep(G)]`, but the launch initially sized it as
+`2*e + G` floats — one per-group array short — so every write to the `gkeep` mask
+ran off the end of the allocation. `compute-sanitizer memcheck` reported 26
+`Invalid __shared__ write` errors. **The unit tests passed both before and after
+the fix**, because the stray write landed outside the live data. That is the
+argument for memcheck being a per-step gate rather than a formality, and it is
+the same shape as the standing "prove the new path RAN, a green gate does not
+prove it" rule: a passing test does not prove memory safety either.
+
+W4 `vt::MlaDecodeAttention` (two-stage
 split-KV MQA over the latent, deterministic combine, `cuda_arch_tactics`-
 registered). W5 MLA prefill (FA-2 varlen generalized to qk 192 / v 128 + the
 workspace-bounded chunked-context loop with LSE merge). W6 the MLA attention

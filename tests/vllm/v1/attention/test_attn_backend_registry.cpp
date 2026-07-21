@@ -16,9 +16,11 @@
 #include <doctest/doctest.h>
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "vllm/platforms/cuda_attn_priority.h"
 #include "vllm/platforms/interface.h"
 #include "vllm/v1/attention/backend.h"
 #include "vllm/v1/attention/backends/gdn_attn.h"
@@ -27,6 +29,7 @@
 #include "vt/device.h"
 #include "vt/dtype.h"
 
+using vllm::platforms::AttnSelectorConfig;
 using vllm::platforms::DeviceCapability;
 using vllm::platforms::Platform;
 using vllm::platforms::ResidencyPolicy;
@@ -42,10 +45,11 @@ using vt::DType;
 namespace {
 
 // A synthetic CUDA platform with a fixed compute capability, so the
-// capability-ordered priority + selection can be exercised without a GPU. It
-// reuses the real CudaPlatform priority lists (copied here) — the point under
-// test is the registry + selector, not CudaPlatform's construction (which needs
-// a device). Keep in sync with src/vllm/platforms/cuda.cpp.
+// capability-ordered priority + selection can be exercised without a GPU. Since
+// W2 it delegates to the REAL shared table (cuda_attn_priority.h) that
+// src/vllm/platforms/cuda.cpp uses, so there is no hand-copied duplicate to keep
+// in sync — the only thing this class fakes is the capability probe (which needs
+// a device) and the composed backend.
 class FakeCudaPlatform final : public Platform {
  public:
   explicit FakeCudaPlatform(int major, int minor) : cap_{major, minor} {}
@@ -54,13 +58,12 @@ class FakeCudaPlatform final : public Platform {
   DeviceCapability get_device_capability() const override { return cap_; }
   std::vector<DType> supported_dtypes() const override { return {DType::kBF16}; }
   ResidencyPolicy residency_policy() const override { return {}; }
-  std::vector<std::string> get_attn_backend_priority() const override {
-    if (cap_.major == 10) {
-      return {"FLASHINFER", "FLASH_ATTN", "TRITON_ATTN", "FLEX_ATTENTION",
-              "TURBOQUANT"};
-    }
-    return {"FLASH_ATTN", "FLASHINFER", "TRITON_ATTN", "FLEX_ATTENTION",
-            "TURBOQUANT"};
+  std::vector<std::string> get_attn_backend_priority(
+      const AttnSelectorConfig& cfg) const override {
+    return vllm::platforms::LookupAttnPriority(cap_.major, cfg);
+  }
+  std::vector<std::string> get_mla_prefill_backend_priority() const override {
+    return vllm::platforms::LookupMlaPrefillPriority(cap_.major);
   }
 
  private:
@@ -77,7 +80,9 @@ class TopIsTestBackendPlatform final : public Platform {
   DeviceCapability get_device_capability() const override { return {10, 0}; }
   std::vector<DType> supported_dtypes() const override { return {DType::kBF16}; }
   ResidencyPolicy residency_policy() const override { return {}; }
-  std::vector<std::string> get_attn_backend_priority() const override {
+  std::vector<std::string> get_attn_backend_priority(
+      const AttnSelectorConfig& cfg) const override {
+    (void)cfg;
     return {"TEST_ONLY_ATTN", "FLASH_ATTN"};
   }
 };
@@ -119,17 +124,207 @@ TEST_CASE("MakeAttentionBackend constructs the named backend / throws when absen
 }
 
 TEST_CASE("CUDA priority order mirrors _get_backend_priorities (non-MLA)") {
+  // BEHAVIOR-PRESERVING across W2: these two lists are byte-identical to the
+  // pre-W2 assertions; the default AttnSelectorConfig{} is use_mla=false.
   // major != 10 (incl. GB10 sm_121 == major 12): FLASH_ATTN first.
   FakeCudaPlatform sm121(12, 1);
   const std::vector<std::string> else_order{
       "FLASH_ATTN", "FLASHINFER", "TRITON_ATTN", "FLEX_ATTENTION", "TURBOQUANT"};
-  CHECK(sm121.get_attn_backend_priority() == else_order);
+  CHECK(sm121.get_attn_backend_priority(AttnSelectorConfig{}) == else_order);
 
   // major == 10 (Blackwell datacenter): FLASHINFER first.
   FakeCudaPlatform sm100(10, 0);
   const std::vector<std::string> major10_order{
       "FLASHINFER", "FLASH_ATTN", "TRITON_ATTN", "FLEX_ATTENTION", "TURBOQUANT"};
-  CHECK(sm100.get_attn_backend_priority() == major10_order);
+  CHECK(sm100.get_attn_backend_priority(AttnSelectorConfig{}) == major10_order);
+}
+
+// ─── W2: the MLA branch of _get_backend_priorities (cuda.py:93-142) ─────────
+// Ported from tests/v1/attention/test_attention_backends_selection.py (its MLA
+// cases) @ pin e24d1b24.
+
+TEST_CASE("MLA priority on GB10 (major 12) is exactly [TRITON_MLA, SPARSE_SM120]") {
+  // cuda.py:129-133. TWO entries, that order, nothing else — the single most
+  // plan-shaping fact of the MLA campaign, and the reason the whole
+  // sm90/sm100-only MLA kernel class (FlashMLA / CUTLASS MLA / FlashInfer MLA /
+  // TokenSpeed MLA) is out of scope on our hardware.
+  FakeCudaPlatform sm121(12, 1);
+  AttnSelectorConfig mla;
+  mla.use_mla = true;
+  const std::vector<std::string> expected{"TRITON_MLA", "FLASHINFER_MLA_SPARSE_SM120"};
+  CHECK(sm121.get_attn_backend_priority(mla) == expected);
+}
+
+TEST_CASE("MLA priority on sm_100 mirrors the adaptive sparse tail") {
+  // cuda.py:117-131 + the :96-115 sparse ordering rule.
+  FakeCudaPlatform sm100(10, 0);
+  const std::vector<std::string> head{"FLASHINFER_MLA", "TOKENSPEED_MLA",
+                                      "CUTLASS_MLA",    "FLASH_ATTN_MLA",
+                                      "FLASHMLA",       "TRITON_MLA"};
+
+  // bf16 KV, head count unknown (upstream None) -> FlashMLA leads the tail.
+  AttnSelectorConfig plain;
+  plain.use_mla = true;
+  std::vector<std::string> expected = head;
+  expected.emplace_back("FLASHMLA_SPARSE");
+  expected.emplace_back("FLASHINFER_MLA_SPARSE");
+  CHECK(sm100.get_attn_backend_priority(plain) == expected);
+
+  // fp8 KV cache -> FlashInfer leads (cuda.py:96-102).
+  AttnSelectorConfig quant = plain;
+  quant.quantized_kv_cache = true;
+  std::vector<std::string> expected_q = head;
+  expected_q.emplace_back("FLASHINFER_MLA_SPARSE");
+  expected_q.emplace_back("FLASHMLA_SPARSE");
+  CHECK(sm100.get_attn_backend_priority(quant) == expected_q);
+
+  // bf16 KV with num_heads <= 16 -> FlashInfer leads (cuda.py:105-110). 16 is
+  // DeepSeek-V2-Lite's head count, so this is the boundary that matters.
+  AttnSelectorConfig few = plain;
+  few.num_heads = 16;
+  CHECK(sm100.get_attn_backend_priority(few) == expected_q);
+  // 17 heads crosses back (strict `<= 16`).
+  AttnSelectorConfig many = plain;
+  many.num_heads = 17;
+  CHECK(sm100.get_attn_backend_priority(many) == expected);
+}
+
+TEST_CASE("MLA priority on sm_90 and older is the `else` arm") {
+  // cuda.py:134-142.
+  FakeCudaPlatform sm90(9, 0);
+  AttnSelectorConfig mla;
+  mla.use_mla = true;
+  const std::vector<std::string> expected{"FLASH_ATTN_MLA", "FLASHMLA",
+                                          "FLASHINFER_MLA", "TRITON_MLA",
+                                          "FLASH_ATTN_MLA_SPARSE", "FLASHMLA_SPARSE"};
+  CHECK(sm90.get_attn_backend_priority(mla) == expected);
+}
+
+TEST_CASE("MLA selection on GB10 resolves to TRITON_MLA (the W0 observation)") {
+  // THE W2 POSITIVE SIGNAL: the new MLA path is not merely compiled — a
+  // use_mla=true request walks the new table, applies the new is_mla/is_sparse
+  // filter, and lands on TRITON_MLA, exactly what the vLLM 0.25.0 oracle logged
+  // on sm_121 at W0 ("Using TRITON_MLA attention backend out of potential
+  // backends: ['TRITON_MLA']").
+  FakeCudaPlatform sm121(12, 1);
+  AttnSelectorConfig mla;
+  mla.use_mla = true;
+  CHECK(SelectAttentionBackendName(sm121, "", mla) == "TRITON_MLA");
+
+  std::unique_ptr<AttentionBackend> b = SelectAttentionBackend(sm121, "", mla);
+  REQUIRE(b != nullptr);
+  CHECK(b->get_name() == "TRITON_MLA");
+  CHECK(b->is_mla());
+  CHECK_FALSE(b->is_sparse());
+  // mla_attention.py:1216-1224 — THREE dims, no K/V axis. DeepSeek-V2-Lite's
+  // real geometry: block 16, one kv head, head_size 512+64 == 576.
+  const std::vector<int64_t> shape = b->get_kv_cache_shape(10, 16, 1, 576);
+  const std::vector<int64_t> expected{10, 16, 576};
+  CHECK(shape == expected);
+  // num_kv_heads != 1 is refused rather than silently ignored.
+  CHECK_THROWS_AS(b->get_kv_cache_shape(10, 16, 8, 576), std::invalid_argument);
+  // triton_mla.py:100-103 supports_block_size.
+  CHECK_THROWS_AS(b->get_kv_cache_shape(10, 24, 1, 576), std::invalid_argument);
+}
+
+TEST_CASE("the sparse/DSA seam: is_sparse() filters SPARSE_SM120 out of the dense walk") {
+  // FLASHINFER_MLA_SPARSE_SM120 sits in GB10's list at position 2 but loses on
+  // is_sparse() (flashinfer_mla_sparse.py:67) vs use_sparse=false — the exact
+  // reason the oracle's candidate list printed a SINGLE entry. Registering a
+  // stand-in sparse backend proves the filter is real and that a future DSA
+  // backend needs NO selector edit: it is selected purely by declaring
+  // is_sparse() == true.
+  class FakeSparseMlaBackend final : public AttentionBackend {
+   public:
+    std::string get_name() const override { return "FLASHINFER_MLA_SPARSE_SM120"; }
+    std::vector<int64_t> get_kv_cache_shape(int64_t nb, int64_t bs, int64_t,
+                                            int64_t hs,
+                                            const std::string& = "auto") const override {
+      return {nb, bs, hs};
+    }
+    bool is_mla() const override { return true; }
+    bool is_sparse() const override { return true; }
+  };
+  RegisterAttentionBackend(DeviceType::kCUDA, "FLASHINFER_MLA_SPARSE_SM120",
+                           []() -> std::unique_ptr<AttentionBackend> {
+                             return std::make_unique<FakeSparseMlaBackend>();
+                           });
+
+  FakeCudaPlatform sm121(12, 1);
+  AttnSelectorConfig dense_mla;
+  dense_mla.use_mla = true;
+  // Even with the sparse backend REGISTERED, a dense-MLA request still gets
+  // TRITON_MLA — the filter, not mere absence, is what excludes it.
+  CHECK(SelectAttentionBackendName(sm121, "", dense_mla) == "TRITON_MLA");
+
+  // A sparse request skips TRITON_MLA (is_sparse() false) and takes the sparse
+  // entry — the seam working end to end, with zero selector code keyed on DSA.
+  AttnSelectorConfig sparse_mla;
+  sparse_mla.use_mla = true;
+  sparse_mla.use_sparse = true;
+  CHECK(SelectAttentionBackendName(sm121, "", sparse_mla) == "FLASHINFER_MLA_SPARSE_SM120");
+
+  // An explicit override that contradicts the request is rejected, mirroring
+  // upstream validate_configuration rather than being silently honored.
+  CHECK_THROWS_AS(SelectAttentionBackendName(sm121, "TRITON_MLA", sparse_mla),
+                  std::invalid_argument);
+}
+
+TEST_CASE("a dense request never selects an MLA backend, and vice versa") {
+  FakeCudaPlatform sm121(12, 1);
+  // Dense (the gate models): unchanged FLASH_ATTN, even though TRITON_MLA is now
+  // registered — it is not in the non-MLA priority list AND would fail is_mla().
+  CHECK(SelectAttentionBackendName(sm121) == "FLASH_ATTN");
+
+  // MLA on CPU: no CPU MLA backend exists upstream at the pin, so the walk
+  // yields nothing and throws rather than falling back to a dense backend.
+  class FakeCpuMlaPlatform final : public Platform {
+   public:
+    DeviceType device_type() const override { return DeviceType::kCPU; }
+    vt::Backend& backend() const override { return vt::GetBackend(DeviceType::kCPU); }
+    DeviceCapability get_device_capability() const override { return {}; }
+    std::vector<DType> supported_dtypes() const override { return {DType::kBF16}; }
+    ResidencyPolicy residency_policy() const override { return {}; }
+    std::vector<std::string> get_attn_backend_priority(
+        const AttnSelectorConfig& cfg) const override {
+      (void)cfg;
+      return {"CPU_ATTN", "FLASH_ATTN"};
+    }
+  } cpu;
+  AttnSelectorConfig mla;
+  mla.use_mla = true;
+  CHECK_THROWS_AS(SelectAttentionBackendName(cpu, "", mla), std::runtime_error);
+}
+
+TEST_CASE("MLA prefill backend priority mirrors the prefill selector") {
+  // Ports tests/v1/attention/test_mla_prefill_selector.py +
+  // test_mla_prefill_registry.py (the capability-ordering cases) @ e24d1b24.
+  // selector.py:66-76. GB10 (major 12) falls in the `else` arm: FLASH_ATTN
+  // ALONE — OBSERVED at W0 ("Using FLASH_ATTN MLA prefill backend."). There is
+  // no safety net below it: selector.py:191-194 hard-raises rather than falling
+  // back, which is why W5's FA-2 generalization is mandatory, not optional.
+  FakeCudaPlatform sm121(12, 1);
+  const std::vector<std::string> gb10{"FLASH_ATTN"};
+  CHECK(sm121.get_mla_prefill_backend_priority() == gb10);
+
+  FakeCudaPlatform sm90(9, 0);
+  CHECK(sm90.get_mla_prefill_backend_priority() == gb10);
+
+  FakeCudaPlatform sm100(10, 0);
+  const std::vector<std::string> blackwell{"FLASH_ATTN", "TRTLLM_RAGGED",
+                                           "FLASHINFER", "TOKENSPEED_MLA"};
+  CHECK(sm100.get_mla_prefill_backend_priority() == blackwell);
+
+  // The base Platform default is empty (no MLA prefill preference).
+  class NoMlaPlatform final : public Platform {
+   public:
+    DeviceType device_type() const override { return DeviceType::kMETAL; }
+    vt::Backend& backend() const override { return vt::GetBackend(DeviceType::kCPU); }
+    DeviceCapability get_device_capability() const override { return {}; }
+    std::vector<DType> supported_dtypes() const override { return {DType::kBF16}; }
+    ResidencyPolicy residency_policy() const override { return {}; }
+  } none;
+  CHECK(none.get_mla_prefill_backend_priority().empty());
 }
 
 TEST_CASE("selection walks priority and returns the first REGISTERED backend") {
@@ -171,7 +366,9 @@ TEST_CASE("CPU selection: CPU_ATTN preference falls through to FLASH_ATTN") {
     DeviceCapability get_device_capability() const override { return {}; }
     std::vector<DType> supported_dtypes() const override { return {DType::kBF16}; }
     ResidencyPolicy residency_policy() const override { return {}; }
-    std::vector<std::string> get_attn_backend_priority() const override {
+    std::vector<std::string> get_attn_backend_priority(
+        const AttnSelectorConfig& cfg) const override {
+      (void)cfg;
       return {"CPU_ATTN", "FLASH_ATTN"};
     }
   } cpu;
@@ -197,6 +394,6 @@ TEST_CASE("empty priority yields no backend (base Platform default)") {
     ResidencyPolicy residency_policy() const override { return {}; }
     // Uses the base default get_attn_backend_priority() == {}.
   } none;
-  CHECK(none.get_attn_backend_priority().empty());
+  CHECK(none.get_attn_backend_priority(AttnSelectorConfig{}).empty());
   CHECK_THROWS_AS(SelectAttentionBackendName(none), std::runtime_error);
 }

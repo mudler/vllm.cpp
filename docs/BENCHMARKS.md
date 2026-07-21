@@ -1369,8 +1369,8 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
 - **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0 (grounding) + W1
-  (spec-driven KV allocation) (2026-07-21, `CLAIM-MLA-DEEPSEEK`,
-- **Qwen3-32B-NVFP4A16 (compressed-tensors W4A16) W0–W4b — CORRECTNESS COMPLETE,
+  (spec-driven KV allocation) + W2 (MLA backend selection) + W3 (MLA cache write
+  + grouped-topk router) (2026-07-21, `CLAIM-MLA-DEEPSEEK`,
   SPEED PENDING (2026-07-21, `CLAIM-QUANT-NVFP4-CT-W4A16`,
   [spike](../.agents/specs/sweep-qwen3-32b-nvfp4a16.md)).**
   `benchmark_binding=false`; **PENDING — deliberately not measured.** This change
@@ -1425,6 +1425,17 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   byte-for-byte the same number for every existing model by construction, and the
   four correctness gates (27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense
   16/16) came back UNCHANGED, confirming no behavioural or allocation-size drift.
+  W2 and W3 are likewise **NOT APPLICABLE** and for a stronger reason than "we
+  did not measure": neither can appear on any existing hot path. W2 changes only
+  which backend NAME a `use_mla=true` request resolves to — a startup-time
+  selection decision, and no gate model is MLA, so every dense selection is
+  byte-identical (asserted, not assumed). W3's two ops are NEW `OpId`s with no
+  caller in any model TU: `vt::ConcatAndCacheMla` is unreachable until the W6 MLA
+  block exists, and the grouped-topk router is reached only when
+  `num_expert_group > 0`, which the default-constructed args never set — the
+  existing routers dispatch to the ORIGINAL kernel, unmodified. So there is no
+  MoE-router or cache-write throughput delta to measure on 27B/35B/Coder/dense,
+  by construction rather than by benchmark.
   Therefore **no binding number is created, re-based or invalidated, and every
   existing binding result stands unchanged.** One forward-looking observation
   recorded from W0 so it cannot surprise W9: the oracle resolves DeepSeek's MoE to
@@ -1577,7 +1588,9 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   unchanged (**DGX-confirmed 2026-07-19 @ `2c732e7`, production flags CUTLASS
   sm120a + FA2 sm_121a + Triton**: clean CUDA `-Werror`, 27B **235/235** + 35B
   **315/315** token-exact with FA2 selected, `compute-sanitizer memcheck` 35B **0
-  errors**). MLA-branch priorities are deferred until an MLA model ports.
+  errors**). MLA-branch priorities were deferred here and are now COMPLETE — see
+  the MLA campaign W2 entry above (the whole of `_get_backend_priorities`, both
+  branches, ported as a per-architecture data table; dense selection unchanged).
 
 - **Model self-registration + per-arch entry-point TU split (2026-07-19,
   extensibility item 5, `MODEL-FACTORY-registry` / `CLAIM-MODEL-SELFREG-1`).** A

@@ -53,37 +53,71 @@ std::unique_ptr<AttentionBackend> MakeAttentionBackend(vt::DeviceType device,
   return it->second();
 }
 
+namespace {
+
+// The capability half of vllm/v1/attention/backend.py:307-360
+// validate_configuration: a candidate must agree with the request on is_mla()
+// and is_sparse(). Backends are stateless descriptors, so constructing one to
+// ask is cheap and mirrors upstream querying the CLASS. This is the ONLY place
+// sparse/DSA needs to be understood — see registry.h "the DSA seam".
+bool CandidateMatchesConfig(vt::DeviceType device, const std::string& name,
+                            const platforms::AttnSelectorConfig& cfg) {
+  const std::unique_ptr<AttentionBackend> backend = MakeAttentionBackend(device, name);
+  return backend->is_mla() == cfg.use_mla && backend->is_sparse() == cfg.use_sparse;
+}
+
+}  // namespace
+
 std::string SelectAttentionBackendName(const platforms::Platform& platform,
-                                       const std::string& selected) {
+                                       const std::string& selected,
+                                       const platforms::AttnSelectorConfig& cfg) {
   const vt::DeviceType device = platform.device_type();
 
   // Explicit override (upstream get_attn_backend_cls's selected_backend arg /
-  // VLLM_ATTENTION_BACKEND). It must be registered for this device.
+  // VLLM_ATTENTION_BACKEND). It must be registered for this device AND still
+  // satisfy validate_configuration — upstream raises on an override whose
+  // capabilities do not match the request, it does not silently honor it.
   if (!selected.empty()) {
-    if (HasAttentionBackend(device, selected)) return selected;
-    throw std::invalid_argument(
-        std::string("selected attention backend '") + selected +
-        "' is not registered for device type " +
-        std::to_string(static_cast<int>(device)));
+    if (!HasAttentionBackend(device, selected)) {
+      throw std::invalid_argument(
+          std::string("selected attention backend '") + selected +
+          "' is not registered for device type " +
+          std::to_string(static_cast<int>(device)));
+    }
+    if (!CandidateMatchesConfig(device, selected, cfg)) {
+      throw std::invalid_argument(
+          std::string("selected attention backend '") + selected +
+          "' does not satisfy the request (use_mla=" +
+          (cfg.use_mla ? "true" : "false") +
+          ", use_sparse=" + (cfg.use_sparse ? "true" : "false") + ")");
+    }
+    return selected;
   }
 
   // Walk the platform's capability-ordered priority list; the first name that is
-  // registered wins (upstream's min-priority valid backend). An unregistered name
-  // is skipped, exactly as an ImportError-ing backend is in get_valid_backends.
-  for (const std::string& name : platform.get_attn_backend_priority()) {
-    if (HasAttentionBackend(device, name)) return name;
+  // registered AND valid for this request wins (upstream's min-priority valid
+  // backend). An unregistered name is skipped exactly as an ImportError-ing
+  // backend is in get_valid_backends; a registered-but-mismatched one is skipped
+  // exactly as validate_configuration's "invalid reasons" reject it.
+  for (const std::string& name : platform.get_attn_backend_priority(cfg)) {
+    if (!HasAttentionBackend(device, name)) continue;
+    if (!CandidateMatchesConfig(device, name, cfg)) continue;
+    return name;
   }
 
   throw std::runtime_error(
       std::string("no valid attention backend registered for device type ") +
       std::to_string(static_cast<int>(device)) +
-      " (priority list yielded no registered backend)");
+      " (priority list yielded no registered backend; use_mla=" +
+      (cfg.use_mla ? "true" : "false") +
+      ", use_sparse=" + (cfg.use_sparse ? "true" : "false") + ")");
 }
 
 std::unique_ptr<AttentionBackend> SelectAttentionBackend(
-    const platforms::Platform& platform, const std::string& selected) {
+    const platforms::Platform& platform, const std::string& selected,
+    const platforms::AttnSelectorConfig& cfg) {
   return MakeAttentionBackend(platform.device_type(),
-                              SelectAttentionBackendName(platform, selected));
+                              SelectAttentionBackendName(platform, selected, cfg));
 }
 
 }  // namespace vllm::v1

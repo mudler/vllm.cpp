@@ -180,6 +180,176 @@ __global__ void MoeRouterTopKKernel(float* weights, int32_t* indices, const Tin*
   }
 }
 
+// ─── Grouped-topk (`noaux_tc`) router (W3) ─────────────────────────────────
+// Mirrors the CPU reference (cpu_ops.cpp MoeRouterGroupedTopKKernel), itself a
+// 1:1 port of grouped_topk_router.py:106-161 @ e24d1b24. This is a SEPARATE
+// kernel from MoeRouterTopKKernel above: the ungrouped path is not touched, so
+// the 27B / 35B / Coder / Qwen3-dense routers stay byte-identical.
+//
+// Structure: the SCORING pass is parallel (identical shape to the ungrouped
+// kernel, so the softmax tree-sum matches it); the group scoring, group mask,
+// top-k and renorm/scale run on thread 0. At DeepSeek-V3's real dimensions
+// (E=256, n_group=8, topk_group=4, top_k=8) that is a few thousand serial ops
+// per token — correctness-grade, deterministic, and bit-identical to the CPU
+// reference by construction. Speed work belongs to W9, after the numerics are
+// gated. Dynamic shared memory holds [sel(e) | orig(e) | gscore(n_group)].
+template <typename Tin>
+__global__ void MoeRouterGroupedTopKKernel(float* weights, int32_t* indices,
+                                           const Tin* logits, const float* bias, int64_t e,
+                                           int k, bool renormalize, bool sigmoid,
+                                           int64_t n_group, int topk_group,
+                                           float routed_scaling_factor) {
+  const int64_t row = blockIdx.x;
+  const Tin* lrow = logits + row * e;
+  extern __shared__ float smem[];
+  float* sel = smem;              // [e] SELECTION score (biased)
+  float* orig = smem + e;         // [e] WEIGHT score (unbiased)
+  float* gscore = smem + 2 * e;             // [n_group]
+  float* gkeep = smem + 2 * e + n_group;    // [n_group] 0/1 mask
+  __shared__ float red[kBlock];
+
+  // (1) scores = softmax(logits, -1) | sigmoid(logits)  (:110-117)
+  if (sigmoid) {
+    // ELEMENTWISE — no cross-expert normalization (the V3/R1 path), so no
+    // reduction and nothing to diverge from the CPU reference on.
+    for (int64_t j = threadIdx.x; j < e; j += blockDim.x) {
+      orig[j] = 1.0f / (1.0f + expf(-Load(lrow, j)));
+    }
+  } else {
+    float m = -INFINITY;
+    for (int64_t j = threadIdx.x; j < e; j += blockDim.x) m = fmaxf(m, Load(lrow, j));
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int s = kBlock / 2; s > 0; s /= 2) {
+      if (static_cast<int>(threadIdx.x) < s) {
+        red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+      }
+      __syncthreads();
+    }
+    const float mx = red[0];
+    __syncthreads();
+    float acc = 0.0f;
+    for (int64_t j = threadIdx.x; j < e; j += blockDim.x) {
+      const float ex = expf(Load(lrow, j) - mx);
+      orig[j] = ex;
+      acc += ex;
+    }
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = kBlock / 2; s > 0; s /= 2) {
+      if (static_cast<int>(threadIdx.x) < s) red[threadIdx.x] += red[threadIdx.x + s];
+      __syncthreads();
+    }
+    const float sum = red[0];
+    __syncthreads();
+    for (int64_t j = threadIdx.x; j < e; j += blockDim.x) {
+      float pj = sum > 0.0f ? orig[j] / sum : 0.0f;
+      if (!isfinite(pj)) pj = 0.0f;
+      orig[j] = pj;
+    }
+  }
+  __syncthreads();
+
+  // (2) the bias shifts the SELECTION score only; the WEIGHT stays unbiased.
+  for (int64_t j = threadIdx.x; j < e; j += blockDim.x) {
+    sel[j] = orig[j] + (bias != nullptr ? bias[j] : 0.0f);
+  }
+  __syncthreads();
+
+  if (threadIdx.x != 0) return;
+
+  const int64_t group_size = e / n_group;
+  // Group score: top-2 SUM with a bias (:124-126), else the group MAX (:128-131).
+  for (int64_t g = 0; g < n_group; ++g) {
+    const int64_t base = g * group_size;
+    if (bias != nullptr) {
+      float b0 = -INFINITY, b1 = -INFINITY;
+      for (int64_t j = 0; j < group_size; ++j) {
+        const float v = sel[base + j];
+        if (v > b0) {
+          b1 = b0;
+          b0 = v;
+        } else if (v > b1) {
+          b1 = v;
+        }
+      }
+      gscore[g] = b0 + b1;
+    } else {
+      float m = -INFINITY;
+      for (int64_t j = 0; j < group_size; ++j) m = fmaxf(m, sel[base + j]);
+      gscore[g] = m;
+    }
+  }
+  // (3) keep the top `topk_group` groups, mask the rest to -inf (:133-145).
+  // Strict `>` over ascending g -> lowest group index wins an exact tie. Uses an
+  // explicit keep mask (NOT an in-place sentinel), matching the CPU reference
+  // exactly — an all-`-inf` group row must still be selectable.
+  for (int64_t g = 0; g < n_group; ++g) gkeep[g] = 0.0f;
+  for (int gi = 0; gi < topk_group; ++gi) {
+    int64_t best = -1;
+    float best_v = -INFINITY;
+    for (int64_t g = 0; g < n_group; ++g) {
+      if (gkeep[g] != 0.0f) continue;
+      if (best < 0 || gscore[g] > best_v) {  // first unkept index seeds the scan
+        best_v = gscore[g];
+        best = g;
+      }
+    }
+    if (best < 0) break;  // fewer groups than topk_group (wrapper forbids it)
+    gkeep[best] = 1.0f;
+  }
+  for (int64_t g = 0; g < n_group; ++g) {
+    if (gkeep[g] != 0.0f) continue;
+    for (int64_t j = 0; j < group_size; ++j) sel[g * group_size + j] = -INFINITY;
+  }
+  // (4) top-k over the masked selection scores; weight from the unbiased score.
+  float denom = 0.0f;
+  for (int j = 0; j < k; ++j) {
+    int64_t best = -1;
+    float best_v = -INFINITY;
+    for (int64_t idx = 0; idx < e; ++idx) {
+      if (sel[idx] > best_v) {
+        best_v = sel[idx];
+        best = idx;
+      }
+    }
+    if (best < 0) best = 0;
+    sel[best] = -INFINITY;
+    const float w = orig[best];
+    weights[row * k + j] = w;
+    indices[row * k + j] = static_cast<int32_t>(best);
+    denom += w;
+  }
+  // (5) renormalize (:156-157) THEN routed_scaling_factor (:159-160).
+  if (renormalize) {
+    if (!(denom > 0.0f)) denom = 1.0f;
+    for (int j = 0; j < k; ++j) weights[row * k + j] /= denom;
+  }
+  if (routed_scaling_factor != 1.0f) {
+    for (int j = 0; j < k; ++j) weights[row * k + j] *= routed_scaling_factor;
+  }
+}
+
+template <typename Tin>
+void LaunchGroupedRouter(cudaStream_t s, Tensor& weights, Tensor& indices,
+                         const Tensor& logits, const float* bias, int64_t t, int64_t e,
+                         const MoeRouterTopKArgs& args) {
+  // Dynamic shared memory layout, in floats: [sel(e) | orig(e) | gscore(G) |
+  // gkeep(G)]. BOTH per-group arrays must be counted — an earlier version
+  // allocated only ONE of them and `compute-sanitizer memcheck` caught the
+  // resulting out-of-bounds __shared__ write on gkeep (the unit tests still
+  // PASSED, since the stray write landed outside the live data; a green test is
+  // not evidence of memory safety).
+  const size_t shmem = (static_cast<size_t>(2 * e) +
+                        2 * static_cast<size_t>(args.num_expert_group)) *
+                       sizeof(float);
+  MoeRouterGroupedTopKKernel<Tin><<<static_cast<unsigned>(t), kBlock, shmem, s>>>(
+      weights.Ptr<float>(), indices.Ptr<int32_t>(), logits.Ptr<Tin>(), bias, e, args.top_k,
+      args.renormalize, args.scoring_func == MoeScoringFunc::kSigmoid,
+      args.num_expert_group, args.topk_group, args.routed_scaling_factor);
+  Check(cudaGetLastError(), "moe_router_grouped_topk launch");
+}
+
 template <typename Tin>
 void LaunchRouter(cudaStream_t s, Tensor& weights, Tensor& indices, const Tensor& logits,
                   int64_t t, int64_t e, int k, bool renorm, bool serial) {
@@ -195,12 +365,21 @@ void LaunchRouter(cudaStream_t s, Tensor& weights, Tensor& indices, const Tensor
 }
 
 void RouterDispatch(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
-                    const MoeRouterTopKArgs& args, bool serial) {
+                    const MoeRouterTopKArgs& args, const Tensor* bias_t, bool serial) {
   VT_CHECK(logits.dtype == DType::kF32 || logits.dtype == DType::kBF16,
            "cuda moe_router_topk: unsupported logits dtype (f32/bf16 only)");
   const int64_t t = logits.shape[0], e = logits.shape[1];
   if (t == 0 || e == 0) return;
   cudaStream_t s = AsStream(q);
+  if (args.num_expert_group > 0) {  // W3 grouped-topk (`noaux_tc`) path
+    const float* bias = bias_t != nullptr ? bias_t->Ptr<float>() : nullptr;
+    if (logits.dtype == DType::kF32) {
+      LaunchGroupedRouter<float>(s, weights, indices, logits, bias, t, e, args);
+    } else {
+      LaunchGroupedRouter<__nv_bfloat16>(s, weights, indices, logits, bias, t, e, args);
+    }
+    return;
+  }
   if (logits.dtype == DType::kF32) {
     LaunchRouter<float>(s, weights, indices, logits, t, e, args.top_k, args.renormalize, serial);
   } else {
@@ -210,8 +389,8 @@ void RouterDispatch(Queue& q, Tensor& weights, Tensor& indices, const Tensor& lo
 }
 
 void MoeRouterTopKKernelCuda(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
-                             const MoeRouterTopKArgs& args) {
-  RouterDispatch(q, weights, indices, logits, args, /*serial=*/false);
+                             const MoeRouterTopKArgs& args, const Tensor* bias) {
+  RouterDispatch(q, weights, indices, logits, args, bias, /*serial=*/false);
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +616,7 @@ struct Registrar {
 // production path is byte-identical. Declared in include/vt/cuda/moe_decode_ref.h.
 void MoeRouterTopKSerialCuda(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
                              const MoeRouterTopKArgs& args) {
-  RouterDispatch(q, weights, indices, logits, args, /*serial=*/true);
+  RouterDispatch(q, weights, indices, logits, args, /*bias_t=*/nullptr, /*serial=*/true);
 }
 
 }  // namespace vt::cuda

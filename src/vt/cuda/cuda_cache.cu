@@ -94,11 +94,85 @@ void ReshapeAndCacheKernelCuda(Queue& q, const Tensor& k, const Tensor& v, Tenso
   Check(cudaGetLastError(), "reshape_and_cache launch");
 }
 
+// ─── MLA cache write (W3) ──────────────────────────────────────────────────
+// Ported 1:1 from vllm/csrc/libtorch_stable/cache_kernels.cu:401-442
+// `concat_and_cache_mla_kernel` @ e24d1b24 — ONE block per token, threads stride
+// over the copied run, exactly upstream's `copy` lambda (`:426-438`). Upstream
+// launches `grid(num_tokens), block(min(kv_lora_rank, 512))` (`:899-900`); we
+// mirror that. The "auto" path is a bit-exact element copy, so Word is the raw
+// storage type and no dtype conversion appears — the fp8 `scaled_convert` branch
+// is out of scope and refused by the op wrapper.
+//
+// Destination arithmetic mirrors upstream `:431-433`:
+//   dst = block_idx*block_stride + block_offset*entry_stride + i + offset
+// with offset 0 for the latent and `kv_lora_rank` for the rope part, i.e. the
+// two source tensors are CONCATENATED into one 576-wide cache entry. This
+// matches the CPU reference (cpu_cache.cpp ConcatAndCacheMlaKernel) bit-for-bit:
+// it is a pure copy, so there is no reduction order to diverge on.
+template <typename Word>
+__global__ void ConcatAndCacheMlaKernel(
+    const Word* __restrict__ kv_c, const Word* __restrict__ k_pe,
+    Word* __restrict__ kv_cache, const int64_t* __restrict__ slot_mapping,
+    int64_t block_size, int64_t kv_lora_rank, int64_t pe_dim, int64_t block_stride,
+    int64_t entry_stride, int64_t kv_c_stride, int64_t k_pe_stride) {
+  const int64_t token = blockIdx.x;
+  const int64_t slot = slot_mapping[token];
+  if (slot < 0) return;  // padded token → skip (upstream `:419-422`)
+  const int64_t block = slot / block_size;
+  const int64_t offset = slot % block_size;
+  const int64_t entry = block * block_stride + offset * entry_stride;
+  const int64_t csrc = token * kv_c_stride;
+  const int64_t psrc = token * k_pe_stride;
+  for (int64_t i = threadIdx.x; i < kv_lora_rank; i += blockDim.x) {
+    kv_cache[entry + i] = kv_c[csrc + i];
+  }
+  for (int64_t i = threadIdx.x; i < pe_dim; i += blockDim.x) {
+    kv_cache[entry + kv_lora_rank + i] = k_pe[psrc + i];
+  }
+}
+
+void ConcatAndCacheMlaKernelCuda(Queue& q, const Tensor& kv_c, const Tensor& k_pe,
+                                 Tensor& kv_cache, const Tensor& slot_mapping) {
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t block_size = kv_cache.shape[1];
+  const int64_t kv_lora_rank = kv_c.shape[1];
+  const int64_t pe_dim = k_pe.shape[1];
+  if (num_slots == 0) return;
+  const int64_t block_stride = kv_cache.stride[0];
+  const int64_t entry_stride = kv_cache.stride[1];
+  const int64_t kv_c_stride = kv_c.stride[0];
+  const int64_t k_pe_stride = k_pe.stride[0];
+  const unsigned grid = static_cast<unsigned>(num_slots);
+  // Upstream `:899-900`: block(min(kv_lora_rank, 512)).
+  const unsigned block = static_cast<unsigned>(kv_lora_rank < 512 ? kv_lora_rank : 512);
+  const cudaStream_t s = AsStream(q);
+  const int64_t* slots = slot_mapping.Ptr<int64_t>();
+  switch (SizeOf(kv_c.dtype)) {
+    case 4:
+      ConcatAndCacheMlaKernel<uint32_t><<<grid, block, 0, s>>>(
+          kv_c.Ptr<uint32_t>(), k_pe.Ptr<uint32_t>(), kv_cache.Ptr<uint32_t>(), slots,
+          block_size, kv_lora_rank, pe_dim, block_stride, entry_stride, kv_c_stride,
+          k_pe_stride);
+      break;
+    case 2:
+      ConcatAndCacheMlaKernel<uint16_t><<<grid, block, 0, s>>>(
+          kv_c.Ptr<uint16_t>(), k_pe.Ptr<uint16_t>(), kv_cache.Ptr<uint16_t>(), slots,
+          block_size, kv_lora_rank, pe_dim, block_stride, entry_stride, kv_c_stride,
+          k_pe_stride);
+      break;
+    default: VT_CHECK(false, "cuda concat_and_cache_mla: unsupported dtype element size");
+  }
+  Check(cudaGetLastError(), "concat_and_cache_mla launch");
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(
         OpId::kReshapeAndCache, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernelCuda)));
+    RegisterOp(
+        OpId::kConcatAndCacheMla, DeviceType::kCUDA,
+        reinterpret_cast<void*>(static_cast<ConcatAndCacheMlaFn>(&ConcatAndCacheMlaKernelCuda)));
   }
 } registrar;
 

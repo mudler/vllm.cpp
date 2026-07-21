@@ -1559,10 +1559,47 @@ void GdnStateScatter(Queue& q, Tensor& cache, const Tensor& working,
 }
 
 void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
-                   const MoeRouterTopKArgs& args) {
+                   const MoeRouterTopKArgs& args,
+                   const Tensor* e_score_correction_bias) {
   VT_CHECK(logits.rank == 2 && weights.rank == 2 && indices.rank == 2,
            "moe_router_topk: logits/weights/indices rank-2");
   const int64_t t = logits.shape[0], e = logits.shape[1];
+  // --- grouped-topk (`noaux_tc`) argument contract (W3). num_expert_group == 0
+  // is the pre-W3 ungrouped path and must reject every grouped-only knob, so an
+  // args struct that was half-filled fails loudly instead of silently ignoring
+  // the grouping the caller asked for.
+  if (args.num_expert_group > 0) {
+    VT_CHECK(e % args.num_expert_group == 0,
+             "moe_router_topk: num_experts must be divisible by num_expert_group");
+    VT_CHECK(args.topk_group >= 1 && args.topk_group <= args.num_expert_group,
+             "moe_router_topk: topk_group must be in [1, num_expert_group]");
+    // grouped_topk_router.py masks all but topk_group groups, so at most
+    // topk_group * (E / n_group) experts remain selectable.
+    VT_CHECK(static_cast<int64_t>(args.top_k) <=
+                 static_cast<int64_t>(args.topk_group) * (e / args.num_expert_group),
+             "moe_router_topk: top_k exceeds the experts surviving the group mask");
+  } else {
+    VT_CHECK(args.topk_group == 0,
+             "moe_router_topk: topk_group requires num_expert_group > 0");
+    VT_CHECK(args.scoring_func == MoeScoringFunc::kSoftmax,
+             "moe_router_topk: sigmoid scoring is only defined on the grouped "
+             "(noaux_tc) path");
+    VT_CHECK(args.routed_scaling_factor == 1.0f,
+             "moe_router_topk: routed_scaling_factor requires num_expert_group > 0");
+    VT_CHECK(e_score_correction_bias == nullptr,
+             "moe_router_topk: e_score_correction_bias requires num_expert_group > 0");
+  }
+  if (e_score_correction_bias != nullptr) {
+    const Tensor& bias = *e_score_correction_bias;
+    VT_CHECK(bias.rank == 1 && bias.shape[0] == e,
+             "moe_router_topk: e_score_correction_bias must be [num_experts]");
+    VT_CHECK(bias.dtype == DType::kF32,
+             "moe_router_topk: e_score_correction_bias must be f32");
+    VT_CHECK(bias.IsContiguous(),
+             "moe_router_topk: e_score_correction_bias must be contiguous");
+    VT_CHECK(bias.device == q.device,
+             "moe_router_topk: device mismatch (e_score_correction_bias/queue)");
+  }
   VT_CHECK(args.top_k >= 1 && args.top_k <= e,
            "moe_router_topk: top_k must be in [1, num_experts]");
   VT_CHECK(weights.shape[0] == t && weights.shape[1] == args.top_k,
@@ -1578,7 +1615,7 @@ void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& log
                indices.device == q.device,
            "moe_router_topk: device mismatch (logits/weights/indices/queue)");
   reinterpret_cast<MoeRouterTopKFn>(GetOp(OpId::kMoeRouterTopK, q.device.type))(
-      q, weights, indices, logits, args);
+      q, weights, indices, logits, args, e_score_correction_bias);
 }
 
 void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
@@ -1714,6 +1751,58 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
            "reshape_and_cache: device mismatch (k/v/k_cache/v_cache/slot_mapping/queue)");
   reinterpret_cast<ReshapeAndCacheFn>(GetOp(OpId::kReshapeAndCache, q.device.type))(
       q, k, v, k_cache, v_cache, slot_mapping);
+}
+
+void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor& kv_cache,
+                       const Tensor& slot_mapping) {
+  VT_CHECK(kv_c.rank == 2 && k_pe.rank == 2,
+           "concat_and_cache_mla: kv_c/k_pe must be rank-2 "
+           "[num_tokens, kv_lora_rank] / [num_tokens, qk_rope_head_dim]");
+  VT_CHECK(kv_cache.rank == 3,
+           "concat_and_cache_mla: kv_cache must be rank-3 "
+           "[num_blocks, block_size, kv_lora_rank + qk_rope_head_dim] — MLA has "
+           "NO K/V axis (mla_attention.py:1216-1224)");
+  VT_CHECK(slot_mapping.rank == 1,
+           "concat_and_cache_mla: slot_mapping must be rank-1 [num_slots]");
+  const int64_t kv_lora_rank = kv_c.shape[1];
+  const int64_t pe_dim = k_pe.shape[1];
+  VT_CHECK(kv_c.shape[0] == k_pe.shape[0],
+           "concat_and_cache_mla: kv_c and k_pe must share num_tokens");
+  // Upstream's host-side contract, cache_kernels.cu:876
+  // (`STD_TORCH_CHECK(kv_cache.size(2) == kv_lora_rank + pe_dim)`).
+  VT_CHECK(kv_cache.shape[2] == kv_lora_rank + pe_dim,
+           "concat_and_cache_mla: kv_cache entry width must equal "
+           "kv_lora_rank + qk_rope_head_dim");
+  VT_CHECK(kv_lora_rank > 0 && pe_dim > 0,
+           "concat_and_cache_mla: kv_lora_rank and qk_rope_head_dim must be > 0");
+  // Upstream uses slot_mapping.size(0) as the token count (`:855-863`): kv_c/k_pe
+  // may carry extra trailing rows (CUDA-graph padding) that are ignored.
+  VT_CHECK(kv_c.shape[0] >= slot_mapping.shape[0],
+           "concat_and_cache_mla: num_tokens must be >= slot_mapping length");
+  // The "auto" cache path ONLY. fp8_ds_mla (the 656-byte V3.2 layout,
+  // cache_kernels.cu:866-875) and int4 are out of campaign scope, so a mismatched
+  // cache dtype is REFUSED rather than silently mis-written.
+  VT_CHECK(IsFloat(kv_c.dtype) && kv_c.dtype == k_pe.dtype && kv_cache.dtype == kv_c.dtype,
+           "concat_and_cache_mla: kv_c/k_pe/kv_cache must share one float dtype "
+           "(the auto cache path; fp8_ds_mla is out of scope)");
+  VT_CHECK(slot_mapping.dtype == DType::kI64,
+           "concat_and_cache_mla: slot_mapping must be i64");
+  // Indexing is stride-driven (upstream reads kv_cache.stride(0)/stride(1) and
+  // kv_c/k_pe.stride(0)), so the cache need not be contiguous — a strided view
+  // and a split-projection source row are both fine. We require only what the
+  // copy actually needs: unit innermost stride on every operand.
+  VT_CHECK(kv_c.stride[1] == 1 && k_pe.stride[1] == 1 && kv_cache.stride[2] == 1 &&
+               slot_mapping.IsContiguous(),
+           "concat_and_cache_mla: kv_c/k_pe/kv_cache innermost stride must be 1 "
+           "and slot_mapping contiguous");
+  VT_CHECK(kv_c.stride[0] >= kv_lora_rank && k_pe.stride[0] >= pe_dim,
+           "concat_and_cache_mla: kv_c/k_pe token rows must not overlap");
+  VT_CHECK(kv_c.device == q.device && k_pe.device == q.device &&
+               kv_cache.device == q.device && slot_mapping.device == q.device,
+           "concat_and_cache_mla: device mismatch "
+           "(kv_c/k_pe/kv_cache/slot_mapping/queue)");
+  reinterpret_cast<ConcatAndCacheMlaFn>(GetOp(OpId::kConcatAndCacheMla, q.device.type))(
+      q, kv_c, k_pe, kv_cache, slot_mapping);
 }
 
 void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,

@@ -74,6 +74,33 @@ inline bool ShouldInterleaveLoadStream(const ResidencyPolicy& policy,
   return marlin_committed && policy.release_host_weights_after_upload;
 }
 
+// The selection inputs of vllm/platforms/cuda.py::_get_backend_priorities @ pin
+// e24d1b24 (`use_mla`, `device_capability`, `num_heads`, `kv_cache_dtype`) plus
+// the sparse flag that `AttentionBackend.is_sparse()` /
+// `vllm/v1/attention/backend.py:307-360 validate_configuration` keys on. The
+// capability itself is NOT a field — it is the platform's own
+// `get_device_capability()`, exactly as upstream passes it in.
+//
+// Defaults reproduce today's non-MLA dense selection EXACTLY, so every existing
+// caller (`get_attn_backend_priority()` with no argument) is unchanged.
+struct AttnSelectorConfig {
+  // model_config.use_mla — the MLA branch of _get_backend_priorities:93-142.
+  // On our gate models (Qwen3 dense / GDN) this is false.
+  bool use_mla = false;
+  // Sparse (DSA / V3.2 indexer) attention. NOT a _get_backend_priorities input
+  // upstream — it is the `is_sparse()` check in validate_configuration that
+  // REJECTS a sparse backend for a dense request and vice versa. Carried here so
+  // the selector can apply that filter (see SelectAttentionBackendName): this is
+  // the seam a future DSA/sparse-MLA backend slots into with ZERO selector edit.
+  bool use_sparse = false;
+  // cuda.py:105 `num_heads is not None and num_heads <= 16` (sm_100 sparse-MLA
+  // ordering only). 0 == unknown, upstream's `None`.
+  int num_heads = 0;
+  // cuda.py:96 `is_quantized_kv_cache(kv_cache_dtype)` (sm_100 sparse-MLA
+  // ordering only). Our KV cache is bf16/f32 today, so false.
+  bool quantized_kv_cache = false;
+};
+
 // Faithful port of vllm/platforms/interface.py:134-229 `class Platform`. Exposes
 // the capability queries the engine/model code branches on. A Platform COMPOSES
 // a vt::Backend (include/vt/backend.h) for the concrete device ops — it does NOT
@@ -121,7 +148,25 @@ class Platform {
   // returns the first REGISTERED name. The base default is empty (no preference);
   // CudaPlatform/CpuPlatform override with the vLLM-mirrored lists. (Item 4 —
   // attention-backend registry seam; formerly a stub returning 0.)
-  virtual std::vector<std::string> get_attn_backend_priority() const { return {}; }
+  //
+  // `cfg` carries upstream's `use_mla` (+ the sparse/num_heads/kv-dtype inputs).
+  // The DEFAULT argument lives here only: overrides declare the parameter
+  // without a default, and every call through a `Platform&` picks this one up,
+  // so the pre-MLA zero-argument call sites are unchanged.
+  virtual std::vector<std::string> get_attn_backend_priority(
+      const AttnSelectorConfig& cfg = AttnSelectorConfig{}) const {
+    (void)cfg;
+    return {};
+  }
+
+  // Capability-ordered MLA *prefill* backend priority — a separate selector
+  // upstream: vllm/v1/attention/backends/mla/prefill/selector.py:47-76
+  // `_get_mla_prefill_backend_priorities`. Distinct from the decode/dense list
+  // above because MLA runs a materialized-MHA prefill against a different
+  // backend family. Base default empty; CudaPlatform mirrors the upstream lists.
+  virtual std::vector<std::string> get_mla_prefill_backend_priority() const {
+    return {};
+  }
 };
 
 // Self-registered per DeviceType, copying the RegisterBackend/GetBackend

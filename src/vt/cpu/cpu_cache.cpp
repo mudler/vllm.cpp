@@ -71,10 +71,64 @@ void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_c
   }
 }
 
+// MLA cache write — the CPU REFERENCE for vt::ConcatAndCacheMla, ported 1:1 from
+// vllm/csrc/libtorch_stable/cache_kernels.cu:401-442
+// (`concat_and_cache_mla_kernel`) @ e24d1b24. Upstream is literally two strided
+// `copy(...)` lambda calls into one destination entry:
+//   copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, 0);       (:440)
+//   copy(k_pe, kv_cache, k_pe_stride, block_stride, pe_dim, kv_lora_rank);  (:441)
+// with dst_idx = block_idx*block_stride + block_offset*entry_stride + i + offset
+// (`:431-433`) — note upstream passes `block_stride` as the SOURCE-side
+// dst_stride argument and never uses it, the real destination stride pair is
+// (block_stride, entry_stride). We reproduce the destination arithmetic exactly.
+//
+// The "auto" path (kv_dt == kAuto, `:435-436`) is a raw element copy, so we copy
+// BYTES: f32/f16/bf16 are all bit-exact. The fp8 `scaled_convert` branch
+// (`:437-440`) is out of scope and is refused by the op wrapper's dtype check.
+// This is a CONCATENATION, not two writes to two tensors: the latent occupies
+// columns [0, kv_lora_rank) of the single 576-wide entry and the decoupled rope
+// part occupies [kv_lora_rank, kv_lora_rank + pe_dim).
+void ConcatAndCacheMlaKernel(Queue&, const Tensor& kv_c, const Tensor& k_pe, Tensor& kv_cache,
+                             const Tensor& slot_mapping) {
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t block_size = kv_cache.shape[1];
+  const int64_t kv_lora_rank = kv_c.shape[1];
+  const int64_t pe_dim = k_pe.shape[1];
+  // Destination strides from the TENSOR (upstream `:882-884`), so a strided
+  // cache view works without a copy.
+  const int64_t block_stride = kv_cache.stride[0];
+  const int64_t entry_stride = kv_cache.stride[1];
+  const int64_t kv_c_stride = kv_c.stride[0];
+  const int64_t k_pe_stride = k_pe.stride[0];
+  const size_t elem = SizeOf(kv_c.dtype);
+
+  const int64_t* slots = slot_mapping.Ptr<int64_t>();
+  const auto* csrc = static_cast<const uint8_t*>(kv_c.data);
+  const auto* psrc = static_cast<const uint8_t*>(k_pe.data);
+  auto* dst = static_cast<uint8_t*>(kv_cache.data);
+
+  for (int64_t t = 0; t < num_slots; ++t) {
+    const int64_t slot = slots[t];
+    if (slot < 0) continue;  // padded token → skip (upstream `:419-422`)
+    const int64_t block = slot / block_size;
+    const int64_t offset = slot % block_size;
+    const int64_t entry = block * block_stride + offset * entry_stride;  // elements
+    std::memcpy(dst + static_cast<size_t>(entry) * elem,
+                csrc + static_cast<size_t>(t * kv_c_stride) * elem,
+                static_cast<size_t>(kv_lora_rank) * elem);
+    std::memcpy(dst + static_cast<size_t>(entry + kv_lora_rank) * elem,
+                psrc + static_cast<size_t>(t * k_pe_stride) * elem,
+                static_cast<size_t>(pe_dim) * elem);
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kReshapeAndCache, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
+    RegisterOp(
+        OpId::kConcatAndCacheMla, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<ConcatAndCacheMlaFn>(&ConcatAndCacheMlaKernel)));
   }
 } registrar;
 

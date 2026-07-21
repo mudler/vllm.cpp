@@ -1099,10 +1099,148 @@ void GdnStateScatterKernel(Queue&, Tensor& cache, const Tensor& working,
   });
 }
 
+// Grouped-topk (`noaux_tc`) router — the CPU REFERENCE and the executable spec
+// for the DeepSeek router. 1:1 port of
+// vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:106-161
+// (`grouped_topk`, the `forward_native` path) @ pin e24d1b24. Step numbering in
+// the comments matches the ops.h contract. Reached ONLY when
+// args.num_expert_group > 0; the ungrouped kernel below is untouched.
+void MoeRouterGroupedTopKKernel(Tensor& weights, Tensor& indices, const Tensor& logits,
+                                const MoeRouterTopKArgs& args, const Tensor* bias_t) {
+  const int64_t t = logits.shape[0], e = logits.shape[1];
+  const int k = args.top_k;
+  const int64_t n_group = args.num_expert_group;
+  const int64_t group_size = e / n_group;  // wrapper checked divisibility
+  const float* bias = bias_t != nullptr ? bias_t->Ptr<float>() : nullptr;
+
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+    std::vector<float> sel(static_cast<size_t>(e));   // SELECTION score (biased)
+    std::vector<float> orig(static_cast<size_t>(e));  // WEIGHT score (unbiased)
+    std::vector<float> gscore(static_cast<size_t>(n_group));
+    std::vector<char> gkeep(static_cast<size_t>(n_group));
+    for (int64_t row = r0; row < r1; ++row) {
+      // (1) scores = softmax(logits, -1) | sigmoid(logits)   (:110-117)
+      if (args.scoring_func == MoeScoringFunc::kSigmoid) {
+        // ELEMENTWISE — not normalized across experts. This is the V3/R1 path.
+        for (int64_t j = 0; j < e; ++j) {
+          orig[static_cast<size_t>(j)] = 1.0f / (1.0f + std::exp(-LoadF32(logits, row * e + j)));
+        }
+      } else {
+        float mx = -INFINITY;
+        for (int64_t j = 0; j < e; ++j) mx = std::max(mx, LoadF32(logits, row * e + j));
+        float sum = 0.0f;
+        for (int64_t j = 0; j < e; ++j) {
+          const float ex = std::exp(LoadF32(logits, row * e + j) - mx);
+          orig[static_cast<size_t>(j)] = ex;
+          sum += ex;
+        }
+        for (int64_t j = 0; j < e; ++j) {
+          float& pj = orig[static_cast<size_t>(j)];
+          pj = sum > 0.0f ? pj / sum : 0.0f;
+          if (!std::isfinite(pj)) pj = 0.0f;
+        }
+      }
+      // (2) The BIAS asymmetry (:120-124): the bias shifts the score used for
+      // SELECTION only; the routing WEIGHT is always read from the unbiased
+      // score. Getting this backwards is a silent accuracy bug.
+      for (int64_t j = 0; j < e; ++j) {
+        sel[static_cast<size_t>(j)] =
+            orig[static_cast<size_t>(j)] + (bias != nullptr ? bias[j] : 0.0f);
+      }
+      // Group score: SUM of the top-2 in the group when a bias is present
+      // (:124-126), else the group MAX (:128-131).
+      for (int64_t g = 0; g < n_group; ++g) {
+        const int64_t base = g * group_size;
+        if (bias != nullptr) {
+          float b0 = -INFINITY, b1 = -INFINITY;
+          for (int64_t j = 0; j < group_size; ++j) {
+            const float v = sel[static_cast<size_t>(base + j)];
+            if (v > b0) {
+              b1 = b0;
+              b0 = v;
+            } else if (v > b1) {
+              b1 = v;
+            }
+          }
+          // group_size >= 2 whenever a bias is used in practice (V3: 32); if it
+          // were 1, torch's topk(2) would fail upstream too, so b1 stays -inf
+          // and the sum is -inf — an honest propagation, not a silent 0.
+          gscore[static_cast<size_t>(g)] = b0 + b1;
+        } else {
+          float m = -INFINITY;
+          for (int64_t j = 0; j < group_size; ++j) {
+            m = std::max(m, sel[static_cast<size_t>(base + j)]);
+          }
+          gscore[static_cast<size_t>(g)] = m;
+        }
+      }
+      // (3) keep the top `topk_group` groups, mask the rest to -inf (:133-145).
+      // Greedy argmax with a strict `>` ascending scan — lowest group index wins
+      // an exact tie (our determinism convention; see the ops.h deviation note).
+      for (int64_t g = 0; g < n_group; ++g) gkeep[static_cast<size_t>(g)] = 0;
+      for (int gi = 0; gi < args.topk_group; ++gi) {
+        int64_t best = -1;
+        float best_v = -INFINITY;
+        for (int64_t g = 0; g < n_group; ++g) {
+          if (gkeep[static_cast<size_t>(g)]) continue;
+          // The FIRST unkept index seeds the scan, so an all-`-inf` group row
+          // still selects (the lowest unkept index) instead of falling through.
+          if (best < 0 || gscore[static_cast<size_t>(g)] > best_v) {
+            best_v = gscore[static_cast<size_t>(g)];
+            best = g;
+          }
+        }
+        if (best < 0) break;  // fewer groups than topk_group (wrapper forbids it)
+        gkeep[static_cast<size_t>(best)] = 1;
+      }
+      for (int64_t g = 0; g < n_group; ++g) {
+        if (gkeep[static_cast<size_t>(g)]) continue;
+        for (int64_t j = 0; j < group_size; ++j) {
+          sel[static_cast<size_t>(g * group_size + j)] = -INFINITY;
+        }
+      }
+      // (4) top-k over the masked SELECTION scores; the weight comes from the
+      // UNBIASED score at the selected id (:147-150).
+      float denom = 0.0f;
+      for (int j = 0; j < k; ++j) {
+        int64_t best = -1;
+        float best_v = -INFINITY;
+        for (int64_t idx = 0; idx < e; ++idx) {
+          if (sel[static_cast<size_t>(idx)] > best_v) {
+            best_v = sel[static_cast<size_t>(idx)];
+            best = idx;
+          }
+        }
+        if (best < 0) best = 0;
+        sel[static_cast<size_t>(best)] = -INFINITY;  // exclude from later rounds
+        const float w = orig[static_cast<size_t>(best)];
+        weights.Ptr<float>()[row * k + j] = w;
+        indices.Ptr<int32_t>()[row * k + j] = static_cast<int32_t>(best);
+        denom += w;
+      }
+      // (5) renormalize (:156-157) then routed_scaling_factor (:159-160). Order
+      // matters: upstream scales AFTER the renormalize divide.
+      if (args.renormalize) {
+        if (!(denom > 0.0f)) denom = 1.0f;
+        for (int j = 0; j < k; ++j) weights.Ptr<float>()[row * k + j] /= denom;
+      }
+      if (args.routed_scaling_factor != 1.0f) {
+        for (int j = 0; j < k; ++j) {
+          weights.Ptr<float>()[row * k + j] *= args.routed_scaling_factor;
+        }
+      }
+    }
+  });
+}
+
 // §3 router: softmax (f32, over all E) -> greedy top-k (lowest-index tie-break)
 // -> optional renormalize. weights [T,K] f32, indices [T,K] i32.
 void MoeRouterTopKKernel(Queue&, Tensor& weights, Tensor& indices, const Tensor& logits,
-                         const MoeRouterTopKArgs& args) {
+                         const MoeRouterTopKArgs& args, const Tensor* bias) {
+  if (args.num_expert_group > 0) {  // W3 grouped-topk (`noaux_tc`) path
+    MoeRouterGroupedTopKKernel(weights, indices, logits, args, bias);
+    return;
+  }
   const int64_t t = logits.shape[0], e = logits.shape[1];
   const int k = args.top_k;
   ForRows(t, [&](int64_t r0, int64_t r1) {

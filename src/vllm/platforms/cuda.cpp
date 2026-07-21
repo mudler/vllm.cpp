@@ -5,6 +5,9 @@
 // usable GPU). Compiled only in CUDA builds (CMake target_sources gate).
 #include <cuda_runtime.h>
 
+#include <vector>
+
+#include "vllm/platforms/cuda_attn_priority.h"
 #include "vllm/platforms/interface.h"
 
 #include "vt/backend.h"
@@ -50,24 +53,27 @@ class CudaPlatform final : public Platform {
     return p;
   }
 
-  // Capability-ordered attention-backend priority — a faithful port of the
-  // non-MLA branch of vllm/platforms/cuda.py::_get_backend_priorities:154-166 @
-  // pin e24d1b24. Our gate models (Qwen3 dense + GDN) are non-MLA; the MLA
-  // branch (sparse/dense MLA orderings) is out of scope until an MLA model ports.
-  //   * device_capability.major == 10 (Blackwell datacenter, sm_100):
-  //         FLASHINFER, FLASH_ATTN, TRITON_ATTN, FLEX_ATTENTION, TURBOQUANT
-  //   * else (incl. GB10 sm_121 == major 12, and Ampere/Hopper):
-  //         FLASH_ATTN, FLASHINFER, TRITON_ATTN, FLEX_ATTENTION, TURBOQUANT
-  // On GB10 (major 12 → else branch) FLASH_ATTN is preferred; since it is the
-  // only registered CUDA backend today, selection is behavior-preserving
-  // (SelectAttentionBackendName walks this list and returns "FLASH_ATTN").
-  std::vector<std::string> get_attn_backend_priority() const override {
-    if (cap_.major == 10) {
-      return {"FLASHINFER", "FLASH_ATTN", "TRITON_ATTN", "FLEX_ATTENTION",
-              "TURBOQUANT"};
-    }
-    return {"FLASH_ATTN", "FLASHINFER", "TRITON_ATTN", "FLEX_ATTENTION",
-            "TURBOQUANT"};
+  // Capability-ordered attention-backend priority — a faithful port of
+  // vllm/platforms/cuda.py::_get_backend_priorities:84-176 @ pin e24d1b24, BOTH
+  // branches, expressed as the data table above (W2 completes the MLA branch the
+  // pre-W2 comment here deferred).
+  //   * cfg.use_mla == false (our Qwen3 dense + GDN gate models): unchanged —
+  //       major 10 → FLASHINFER, FLASH_ATTN, TRITON_ATTN, FLEX_ATTENTION, TURBOQUANT
+  //       else (incl. GB10 sm_121 == major 12) → FLASH_ATTN first.
+  //     Behavior-preserving: FLASH_ATTN is the only registered CUDA backend, so
+  //     SelectAttentionBackendName still returns "FLASH_ATTN".
+  //   * cfg.use_mla == true, major 12 (GB10) → [TRITON_MLA,
+  //     FLASHINFER_MLA_SPARSE_SM120]; the sparse entry is filtered by the
+  //     selector for a dense request, so TRITON_MLA is the answer — matching the
+  //     W0 runtime OBSERVATION from the vLLM 0.25.0 oracle on sm_121.
+  std::vector<std::string> get_attn_backend_priority(
+      const AttnSelectorConfig& cfg) const override {
+    return LookupAttnPriority(cap_.major, cfg);
+  }
+
+  // MLA prefill selector (mla/prefill/selector.py:47-76). GB10 → [FLASH_ATTN].
+  std::vector<std::string> get_mla_prefill_backend_priority() const override {
+    return LookupMlaPrefillPriority(cap_.major);
   }
 
  private:

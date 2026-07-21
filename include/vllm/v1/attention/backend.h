@@ -217,6 +217,22 @@ class AttentionBackend {
   // CLASS; here a factory returning an instance). Task-3 backends override; the
   // base returns nullptr.
   virtual std::unique_ptr<AttentionImpl> get_impl_cls() const { return nullptr; }
+
+  // ─── Capability predicates consumed by the SELECTOR (W2) ──────────────────
+  // Ported from vllm/v1/attention/backend.py:307-360 `validate_configuration`,
+  // the two checks that decide selection on GB10:
+  //   * `is_mla()` — mla_attention.py:1240-1242 `MLACommonBackend.is_mla()`
+  //     returns True; every dense backend inherits False. Must EQUAL the
+  //     request's `use_mla`.
+  //   * `is_sparse()` — True only for the DSA / sparse-MLA family
+  //     (flashinfer_mla_sparse.py:67). Must EQUAL the request's `use_sparse`.
+  //     This is precisely why FLASHINFER_MLA_SPARSE_SM120 is filtered out of
+  //     GB10's two-entry MLA list for a dense request, leaving TRITON_MLA — the
+  //     behavior OBSERVED from the vLLM 0.25.0 oracle at W0.
+  // Defaults are the dense/non-sparse answer, so every backend registered before
+  // W2 keeps its exact selection behavior.
+  virtual bool is_mla() const { return false; }
+  virtual bool is_sparse() const { return false; }
 };
 
 // The T0 concrete full-attention backend. Ports the FlashAttention V1 paged KV
@@ -237,6 +253,47 @@ class FlashAttentionBackend final : public AttentionBackend {
       int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
       int64_t head_size,
       const std::string& cache_dtype_str = "auto") const override;
+};
+
+// The dense-MLA backend, and the ONLY one reachable on GB10 — read from
+// vllm/platforms/cuda.py:129-133 (sm_12x → [TRITON_MLA,
+// FLASHINFER_MLA_SPARSE_SM120]) and OBSERVED at W0 from the vLLM 0.25.0 oracle
+// on sm_121 ("Using TRITON_MLA attention backend out of potential backends:
+// ['TRITON_MLA']"). Ported from
+// vllm/v1/attention/backends/mla/triton_mla.py:81 TritonMLABackend, whose
+// shape/flags come from its base
+// vllm/model_executor/layers/attention/mla_attention.py:1206 MLACommonBackend.
+//
+// W2 lands the NAME + the selection-relevant capability surface only: this is
+// what makes `use_mla=true` resolve to TRITON_MLA. The impl (get_impl_cls) is
+// W4/W6 (the two-stage split-KV MQA decode over the latent) and deliberately
+// stays nullptr here — the base default.
+class TritonMLABackend final : public AttentionBackend {
+ public:
+  static constexpr const char* kName = "TRITON_MLA";
+
+  std::string get_name() const override { return kName; }
+
+  // mla_attention.py:1216-1224 MLACommonBackend.get_kv_cache_shape:
+  //     (num_blocks, block_size, head_size)
+  // THREE dimensions — no leading K/V axis, because MLA caches ONE latent row
+  // per token (kv_lora_rank + qk_rope_head_dim == 576) and reconstructs V from
+  // it. `num_kv_heads` is accepted and IGNORED (`:1219`: "assumed to be 1 for
+  // MLA"); we assert it rather than ignore it silently.
+  std::vector<int64_t> get_kv_cache_shape(
+      int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
+      int64_t head_size,
+      const std::string& cache_dtype_str = "auto") const override;
+
+  // mla_attention.py:1240-1242 is_mla() -> True; TritonMLABackend is the DENSE
+  // MLA backend, so is_sparse() keeps the base False (that False is exactly what
+  // makes FLASHINFER_MLA_SPARSE_SM120 lose and TRITON_MLA win on GB10).
+  bool is_mla() const override { return true; }
+
+  // triton_mla.py:100-103 supports_block_size — block_size % 16 == 0. Exposed as
+  // a plain predicate (the full supports_* surface is still deferred, see the
+  // header note) because get_kv_cache_shape enforces it.
+  static bool supports_block_size(int64_t block_size) { return block_size % 16 == 0; }
 };
 
 }  // namespace vllm::v1

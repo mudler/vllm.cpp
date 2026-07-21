@@ -64,12 +64,26 @@ std::unique_ptr<AttentionBackend> MakeAttentionBackend(vt::DeviceType device,
 // backend. Behavior-preserving today: on CUDA (every capability we ship on) and
 // CPU this returns "FLASH_ATTN" — the backend whose NHD KV layout the runtime
 // already uses.
-std::string SelectAttentionBackendName(const platforms::Platform& platform,
-                                        const std::string& selected = "");
+// `cfg` (W2) carries upstream's `use_mla` plus the `use_sparse` flag. It selects
+// which priority list the platform hands back (the MLA vs non-MLA branch of
+// _get_backend_priorities) AND is applied as a per-candidate FILTER mirroring
+// vllm/v1/attention/backend.py:307-360 validate_configuration: a candidate whose
+// `is_mla()` / `is_sparse()` disagrees with the request is skipped exactly as an
+// unregistered name is. Defaulted, so pre-W2 dense call sites are unchanged.
+//
+// THE DSA / SPARSE-MLA SEAM: GB10's MLA list is [TRITON_MLA,
+// FLASHINFER_MLA_SPARSE_SM120]. Today the sparse entry is unregistered AND would
+// be filtered on is_sparse(); when the sparse-MLA campaign lands its backend, it
+// registers with `is_sparse() == true` and is selected for `use_sparse=true`
+// requests with NO edit to this selector or to the platform priority table.
+std::string SelectAttentionBackendName(
+    const platforms::Platform& platform, const std::string& selected = "",
+    const platforms::AttnSelectorConfig& cfg = platforms::AttnSelectorConfig{});
 
 // SelectAttentionBackendName + construct the instance.
 std::unique_ptr<AttentionBackend> SelectAttentionBackend(
-    const platforms::Platform& platform, const std::string& selected = "");
+    const platforms::Platform& platform, const std::string& selected = "",
+    const platforms::AttnSelectorConfig& cfg = platforms::AttnSelectorConfig{});
 
 // Static-init self-registration helper (copies the vt-op / platform Registrar
 // idiom). Declare one file-scope instance per (device, backend) in the backend's

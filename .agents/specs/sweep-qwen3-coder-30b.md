@@ -138,3 +138,47 @@ So quant is not a coverage gap (bf16 is simpler than NVFP4) — it is a **perfor
 4. **Quant = the headline SPEED gap, not coverage.** BF16 correctness covered by the reference path; no fast BF16 grouped-MoE GEMM (only NVFP4-Marlin) + no bf16 decode graph. Porting a bf16 grouped-MoE (vLLM fused_moe) is the crux of the speed bar.
 5. Router/attention numerics already match; d128 FA2 + non-square o_proj proven on Qwen3-4B.
 6. Row `MODEL-TEXT-qwen3-moe-qwen3-moe-for-causal-lm` (`INVENTORIED` → `SPIKE`). Gate: near-tie-robust token-exact + every-axis vLLM speed; regression 27B 235/235 + 35B 315/315.
+
+---
+
+## 9. Structured spike contract (stable row `MODEL-TEXT-qwen3-moe-qwen3-moe-for-causal-lm`)
+
+The prose above (§0–§8) is the full spike; this restates it in the record-checker's structured fields.
+
+### Scope
+Add `Qwen3MoeForCausalLM` (non-hybrid, full-attention, BF16 MoE: standard per-head q/k-norm+RoPE attention, 128 experts top-8, NO shared expert, untied lm_head, NO GDN) as MOSTLY NEW FILES by composing the done Qwen3-dense attention + the done 35B MoE `MoeBlock`. In scope: config hook, registry TU, full-attention-only KV spec, the extract/expose/guard refactors, bf16 expert loader, forward, near-tie token-exact gate, and the bf16-fast-MoE speed kernel. Out of scope: quant (Coder is bf16), MLA, sliding-window.
+
+### Upstream chain
+`vllm/model_executor/models/qwen3_moe.py::Qwen3MoeForCausalLM` @ `e24d1b24` (§2: `Qwen3MoeAttention` = same shape as `qwen3.py::Qwen3Attention`; `Qwen3MoeSparseMoeBlock` router+FusedMoE, shared expert only when `shared_expert_intermediate_size>0`; standard RMSNorm; untied lm_head); `registry.py:192`; config `Qwen3-Coder-30B-A3B-Instruct/config.json`.
+
+### Our baseline
+Templates: `qwen3.cpp`/`qwen3_dense.cpp` (the DONE Qwen3-dense standard-attention path), `qwen3_5.cpp` `MoeBlock` (the DONE 35B MoE experts), the model-shape-agnostic runner (`ENG-RUNNER-MODELSHAPE`), the fusion catalog, `dense_weight_loaders.h`. Coder = Qwen3-dense attention + 35B MoE experts, minus GDN/shared-expert/NVFP4/multimodal-prefix, plus untied lm_head + bf16 experts.
+
+### Port map
+New files (§3a): `qwen3_moe.h`, `qwen3_moe_registry.cpp`, `qwen3_moe_weights.cpp`, `qwen3_moe.cpp`, tests. Shared touches (§3b): in-TU REGISTER (designed seam), CMake TU glue, and the 4 model-layer seams — #1 extract file-static dense `AttnBlock` → `dense_attn_block.h`, #2 expose file-static bf16 `MoeBlock` → `qwen3_5_moe_block.h`, #3 no-shared-expert guard, #4 NEW bf16 safetensors expert loader. ZERO runner change (the shape-agnostic runner covers full-attn MoE).
+
+### Tests to port
+(a) registry resolution (`Qwen3MoeForCausalLM` → the MoE factory, full-attn-only KV spec); (b) forward doctest `test_qwen3_moe_forward.cpp`; (c) near-tie token-exact `test_qwen3_moe_paged_engine.cpp` vs the vLLM 0.25.0 oracle. Mirrors the qwen3/qwen27 test family.
+
+### Gates
+W0: CPU build + registry test. W1: dgx CUDA `-Werror` 0-warn; BEHAVIOUR-PRESERVING — Qwen3-dense 0.6B/4B near-tie 16/16 + 27B 235/235 + 35B 315/315 UNCHANGED (the extract/expose/guard are pure moves + an inert guard). W4 SACRED: near-tie-robust token-exact vs vLLM 0.25.0. W5: every-axis vLLM speed parity. memcheck 0 throughout.
+
+### Dependencies
+Builds on the delivered seams (model self-reg item 5, Platform/residency, attn-registry, fusion catalog, `ENG-RUNNER-MODELSHAPE`). New work = the 4 model-layer seams + the W5 bf16-fast-MoE kernel. Checkpoint present (bf16, ~60 GB, fits GB10 128 GB unified); oracle vLLM 0.25.0 present; no download/multi-GPU.
+
+### Work breakdown
+W0 config + registry stub (LANDED 2026-07-21: `qwen3_moe_registry.cpp` REGISTER + full-attn-only KV + stub factory + `ParseQwen3MoeConfig`; registry resolves 189/189; no runner change). W1 extract/expose/guard (LANDED 2026-07-21: dense `AttnBlock`→`dense_attn_block.h`, bf16 `MoeBlock`→`qwen3_5_moe_block.h` `RunMoeBlock`, no-shared-expert guard; BEHAVIOR-PRESERVING — Qwen3-dense 0.6B/4B 16/16 + 27B 235/235 + 35B 315/315 UNCHANGED, `-Werror` 0-warn, memcheck 0). W2 bf16 per-expert loader (`qwen3_moe_weights.cpp`; untied lm_head). W3 forward (`qwen3_moe.cpp` composing `AttnBlock`+`RunMoeBlock`). W4 near-tie token-exact vs vLLM 0.25.0 (correctness). W5 bf16-fast-MoE grouped GEMM + every-axis speed (the largest item; gates DONE).
+
+### Risks/decisions
+
+**Decision — BF16 unquantized.** Coder's `quantization_config` is absent (`torch_dtype: bfloat16`), so no quant loader/kernel coverage is needed; correctness is covered by the existing bf16 `MoeBlock` reference path. Simpler than the 35B's `W4A16_NVFP4` Marlin experts.
+
+**Decision — compose, don't rebuild.** The runner is already model-shape-agnostic (`ENG-RUNNER-MODELSHAPE`) and `MoeBlock` takes no GDN metadata, so Coder reuses the done dense attention + the done 35B MoE experts with ZERO runner change. The 35B hybrid assumptions live in `Qwen3_5Model::Forward`, which Coder does not call.
+
+**Decision — near-tie-robust gate** ([[near-tie-distributional-gate]]): correctness = our token within 0.5 nats of vLLM's teacher-forced argmax, strict where equal (the Qwen3-established bar). A3B decode is fast → cheap capture.
+
+**Risk (headline) — the SPEED gap is a real new kernel.** There is no fast BF16 grouped-MoE GEMM (only NVFP4-Marlin), and the 35B decode CUDA-graph is fp4-gated → a bf16 Coder gets no decode graph. W5 (port a bf16 grouped-MoE GEMM, e.g. vLLM fused_moe, + review the eager-decode host tax) is the largest item and the crux of the every-axis speed bar. Correctness can land (W4) before speed (W5) as separate rows.
+
+**Risk — the W1 refactors must be byte-identical.** #1 extract (dense `AttnBlock` → shared header) must keep Qwen3-dense 0.6B/4B byte-identical; #2 expose (bf16 `MoeBlock`) is a pure add (35B never calls it); #3 the no-shared-expert guard must be inert for the 35B/27B (shared>0, fp4 path). Verified via unchanged token-exact gates on all existing models.
+
+**Risk — bf16 MoE reference-path perf.** The bf16 correctness path is a per-expert host-gather loop; it is correct but slow — acceptable for W4 (correctness) but is exactly what W5 must replace.

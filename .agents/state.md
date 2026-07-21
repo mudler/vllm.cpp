@@ -15426,3 +15426,105 @@ oracle and CONFIRM by observation that it selects `TRITON_MLA` + FA-2 MLA prefil
 (this spike read the logic; the runtime confirmation is still owed per
 [[profile-vllm-actual-kernels-port-1to1]]), then claim W1. Committed on the worktree branch;
 **NOT pushed**.
+## 2026-07-21 — OPT-125m (`OPTForCausalLM`) W0-W4: the CROSS-FAMILY additivity canary lands, STRICT token-exact 6/6
+
+**WHAT.** Brought up `OPTForCausalLM` (facebook/opt-125m, 12L dense, BF16) end to
+end — registry, config parse, safetensors loader, paged forward, correctness gate
+— as rank 4 of the breadth sweep (`.agents/specs/breadth-sweep-plan.md` §B.3).
+OPT was chosen deliberately as the HONEST test of "a new model family = new
+files", because it is the first model we have ported that is not a Qwen variant:
+no RoPE (learned absolute positions with the fairseq offset of 2), biased
+q/k/v/out/fc1/fc2 projections, LayerNorm-with-bias instead of RMSNorm, a plain
+ReLU fc1/fc2 MLP instead of SwiGLU, a `do_layer_norm_before` pre/post-LN switch,
+and tied embeddings by default. Spec: `.agents/specs/sweep-opt-125m.md`.
+
+**GATE SELECTION (measured, not assumed).** Per the ratified methodology
+([[near-tie-distributional-gate]]) the first step is measuring whether vLLM's OWN
+greedy is deterministic. `scripts/opt-oracle-capture.py --runs 5` reported **all
+6 prompts deterministic over K=5 runs, 0 multi-valued (prompt,pos) cells** ⇒ the
+honest bar is **STRICT token-exact**, no near-tie band. Evidence committed in
+`tests/parity/goldens/opt_greedy/greedy_dist.npy` and re-asserted by the test.
+
+**RESULT: `test_opt_paged_engine` 6/6 prompts, 96/96 tokens, 36/36 assertions.**
+This is the "real strict pass on a deterministic model" half of the ratified
+ambition, achieved on a family we had never ported.
+
+**ADDITIVITY VERDICT (the primary deliverable).** The MODEL seams held 100%: the
+whole model layer landed as 4 new files with ZERO edit to the runner, the
+scheduler, the platforms, the attention-backend registry, `hf_config.{h,cpp}`,
+any CUDA kernel, or any existing model file. `REGISTER_VLLM_MODEL` absorbed a
+non-Qwen family with one macro line; `HfConfig::raw` absorbed all eight OPT-only
+config fields without widening the shared typed POD; the model-shape-agnostic
+runner needed no change; `dense_weight_loaders.h` and the `dense_attn_block.h`
+DEVICE GLUE were reused verbatim across the family boundary; and head_dim 64 ran
+through the generic `LaunchPaged` path with no kernel edit.
+
+**WHAT LEAKED — one layer down, in two vocabularies that had been silently
+specialized to Qwen.** (1) The `vt::` op table had no LayerNorm, no ReLU and no
+elementwise/bias Add — three new ops, absorbed append-only through the op-table
+extension point (two NEW self-registering TUs; only enum/typedef/wrapper
+additions to the two shared files). (2) The tokenizer had TWO gaps, both
+correctness-fatal: the ORIGINAL GPT-2 byte-level split
+(`ByteLevel{use_regex:true}` with no explicit Split component) was an outright
+`Fail`, needing a new `SplitPattern::kGpt2` with its own scanner because four of
+six alternatives differ; and the `TemplateProcessing` post-processor BOS was
+PARSED but NEVER APPLIED, because `Encode` was documented "no BOS/EOS (caller
+policy)" and no caller had a policy — no Qwen tokenizer declares one. Also
+recorded but not fixed: `HfConfig` unconditionally synthesizes RoPE fields
+(`rotary_dim` comes out 64 for a model with no rotary embedding), and
+`dense_attn::AttnBlock` does NOT stretch across families (it hard-codes q/k
+RMSNorm + NeoX RoPE + `VT_CHECK(qkv_bias.Empty())`), so OPT has its own attention
+block and reuses only the glue underneath. That was a deliberate decision (spec
+D3), not a workaround: flag-generalizing the shared Qwen block would have risked
+the 27B/35B numerics for ~40 lines of duplication.
+
+**THE NEAR-MISS WORTH REMEMBERING.** Without the BOS fix the gate scored **0/6
+prompts while emitting fluent, plausible English**. It was localized in a single
+run only because vLLM's own `prompt_token_ids` are committed as goldens and
+compared per prompt — the diff was `{1121,...}` vs `{2,1121,...}`. **Capturing
+the oracle's TOKENIZATION, not just its continuations, is what turned a silent
+whole-model failure into a one-line fix.** Every future cross-family row should
+do the same. A second self-inflicted bug reinforces the same discipline: the
+first cut of `EncodeWithSpecialTokens` used the tokenizer's `bos_id_`/`eos_id_`,
+which the GGUF loader sets from `tokenizer.ggml.*` — that would have APPENDED an
+EOS to every GGUF prompt. The full CPU CTest caught it (4 failures), and the fix
+was to keep `template_bos_`/`template_eos_` (what the post-processor ADDS)
+strictly distinct from the model's special-token ids (what they ARE).
+
+**CHECKPOINT REALITY CORRECTION.** `breadth-sweep-plan.md` §B.1 lists
+`facebook--opt-125m` as "present on dgx". It was not: the HF cache held only a
+`config.json` symlink (36 KB, no weights). After downloading, the snapshot turned
+out to ship a torch-pickle `pytorch_model.bin` (fp16) and GPT-2
+`vocab.json`/`merges.txt` with NO `tokenizer.json` — our loader reads neither.
+Handled OUT of tree by the committed, reproducible
+`scripts/opt-materialize-checkpoint.py` (pickle+fp16 -> safetensors+bf16 + a fast
+tokenizer) rather than by teaching the loader to read pickles (spec D2).
+
+**DTYPE (recorded deviation, spec D1).** OPT ships `torch_dtype: float16`, but
+`kF16` is unimplemented across our CUDA compute path (it appears only in
+`cuda_gdn.cu`). `--dtype bfloat16` is a first-class vLLM production mode, so BOTH
+arms run bf16 and our checkpoint was materialized with the SAME single fp16->bf16
+rounding vLLM applies at load — apples-to-apples, but fp16-native coverage
+remains genuinely absent.
+
+**GATES.** CPU `-Werror` 0-warn + full CPU CTest green. dgx: clean CUDA
+`-Werror` 0 warnings; `test_opt_paged_engine` 6/6 and `test_opt_load` green on
+the FINAL binary; `test_ops_layernorm` green on CUDA; **REGRESSIONS UNCHANGED —
+27B `test_qwen27_paged_engine` 235/235, 35B `test_qwen36_paged_engine` 315/315,
+Qwen3-Coder `test_qwen3coder_paged_engine` 6/6, Qwen3-dense
+`test_qwen3_paged_engine`**; `compute-sanitizer memcheck` 0 errors on the OPT
+engine path. Both record checkers green.
+
+**NEXT.** SPEED is explicitly PENDING and nothing is claimed — the row stays
+`ACTIVE`, not `DONE`. Known structural gaps before a throughput run is worth
+doing: head_dim 64 falls to the generic paged path rather than FA2 (the fast
+kernels are d128/d256-gated), there is no decode CUDA graph for OPT (the
+Qwen3-Coder W7 pattern is the template), and the new LayerNorm/Add/Relu kernels
+are plain correctness-grade grid-stride launches with no fusion into the
+surrounding GEMMs. Also tracked debt: the POST-LN
+(`do_layer_norm_before=false`, OPT-350m) branch is implemented from upstream but
+UNGATED, and `word_embed_proj_dim != hidden_size` plus non-relu activations are
+rejected loudly rather than shipped untested. The next non-Qwen family (GPT-2,
+BLOOM, Falcon, Llama) inherits LayerNorm/ReLU/Add, the merged-bias loader, the
+GPT-2 pre-tokenizer and the special-token encode path, so its leak surface should
+be materially smaller — that is the falsifiable prediction this row leaves behind.

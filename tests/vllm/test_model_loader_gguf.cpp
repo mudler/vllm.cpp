@@ -68,7 +68,7 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       LoadedEngine::FromModelDir(dir.path().string(), EngineParams{}),
       "Model architectures ['LlamaForCausalLM'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['Qwen3ForCausalLM', 'Qwen3MoeForCausalLM', "
+      "dict_keys(['OPTForCausalLM', 'Qwen3ForCausalLM', 'Qwen3MoeForCausalLM', "
       "'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForConditionalGeneration'])",
       std::runtime_error);

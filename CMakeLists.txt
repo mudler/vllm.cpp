@@ -198,6 +198,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_moe_registry.cpp
   src/vllm/model_executor/models/qwen3_moe_weights.cpp
   src/vllm/model_executor/models/qwen3_moe.cpp
+  src/vllm/model_executor/models/opt_registry.cpp
+  src/vllm/model_executor/models/opt_weights.cpp
+  src/vllm/model_executor/models/opt.cpp
   src/vllm/model_executor/models/model_registry.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp
@@ -278,6 +281,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
+  src/vt/cpu/cpu_layernorm.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_paged_attn.cpp
   src/vt/cpu/cpu_sample.cpp)
@@ -311,6 +315,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_gdn.cu
     src/vt/cuda/cuda_moe.cu
     src/vt/cuda/cuda_glue.cu
+    src/vt/cuda/cuda_layernorm.cu
     src/vt/cuda/cuda_cache.cu
     src/vt/cuda/cuda_paged_attn.cu
     src/vt/cuda/cuda_combine_tokens.cu

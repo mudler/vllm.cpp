@@ -57,7 +57,7 @@ void InsertMerge(MergeRanks& ranks, const std::string& left,
 // Walks a pre_tokenizer node collecting Split regexes and checking that
 // every component is one we can emulate.
 void WalkPreTokenizer(const json& node, std::vector<std::string>& regexes,
-                      bool& saw_byte_level) {
+                      bool& saw_byte_level, bool& byte_level_use_regex) {
   if (!node.is_object()) Fail("pre_tokenizer entry is not an object");
   const std::string type = node.value("type", "");
   if (type == "Sequence") {
@@ -65,7 +65,8 @@ void WalkPreTokenizer(const json& node, std::vector<std::string>& regexes,
     if (it == node.end() || !it->is_array()) {
       Fail("pre_tokenizer Sequence without \"pretokenizers\" array");
     }
-    for (const auto& sub : *it) WalkPreTokenizer(sub, regexes, saw_byte_level);
+    for (const auto& sub : *it)
+      WalkPreTokenizer(sub, regexes, saw_byte_level, byte_level_use_regex);
     return;
   }
   if (type == "Split") {
@@ -86,11 +87,11 @@ void WalkPreTokenizer(const json& node, std::vector<std::string>& regexes,
     if (node.value("add_prefix_space", true)) {
       Fail("ByteLevel pre-tokenizer with add_prefix_space=true unsupported");
     }
-    // use_regex=true would apply the GPT-2 split regex INSIDE ByteLevel; the
-    // models we support carry the split in an explicit Split component.
-    if (node.value("use_regex", false)) {
-      Fail("ByteLevel pre-tokenizer with use_regex=true unsupported");
-    }
+    // use_regex=true applies the ORIGINAL GPT-2 split regex INSIDE ByteLevel
+    // instead of carrying it in an explicit Split component. The Qwen/Llama-3
+    // checkpoints use the Split form; the pre-Llama byte-level BPE family (OPT,
+    // GPT-2, ...) uses this one, so it selects SplitPattern::kGpt2 below.
+    if (node.value("use_regex", false)) byte_level_use_regex = true;
     saw_byte_level = true;
     return;
   }
@@ -102,8 +103,12 @@ SplitPattern DetectPattern(const json& doc) {
   if (it == doc.end() || it->is_null()) Fail("missing pre_tokenizer");
   std::vector<std::string> regexes;
   bool saw_byte_level = false;
-  WalkPreTokenizer(*it, regexes, saw_byte_level);
+  bool byte_level_use_regex = false;
+  WalkPreTokenizer(*it, regexes, saw_byte_level, byte_level_use_regex);
   if (!saw_byte_level) Fail("pre_tokenizer has no ByteLevel component");
+  // ByteLevel(use_regex=true) with NO explicit Split component == the original
+  // GPT-2 byte-level BPE split (facebook/opt-125m, gpt2, ...).
+  if (byte_level_use_regex && regexes.empty()) return SplitPattern::kGpt2;
   if (regexes.size() != 1) {
     Fail("expected exactly one Split pre-tokenizer, found " +
          std::to_string(regexes.size()));
@@ -335,6 +340,12 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
   }
 
   ExtractBosEos(doc, tok.bos_id_, tok.eos_id_);
+  // The HF post_processor template is the ONLY thing that licenses adding
+  // special tokens at encode time (see EncodeWithSpecialTokens). Capture it
+  // separately from the model's bos/eos ids so the GGUF path — where those ids
+  // are declared but nothing is auto-added — is unaffected.
+  tok.template_bos_ = tok.bos_id_;
+  tok.template_eos_ = tok.eos_id_;
   tok.FinalizeTables();
   return tok;
 }
@@ -502,6 +513,22 @@ std::vector<int32_t> Tokenizer::Encode(std::string_view text) const {
     out.push_back(best->id);
     pos = best_pos + best->text.size();
   }
+  return out;
+}
+
+std::vector<int32_t> Tokenizer::EncodeWithSpecialTokens(
+    std::string_view text) const {
+  // Realize the TemplateProcessing "single" template ExtractBosEos parsed: a
+  // leading SpecialToken is prepended, a trailing one appended; -1 means the
+  // template has no such step. Both are -1 for every Qwen tokenizer (their
+  // post_processor is ByteLevel, not TemplateProcessing) AND for every GGUF
+  // tokenizer (no HF post_processor exists there at all), so this reduces to
+  // Encode() for every model that predates the OPT bring-up.
+  std::vector<int32_t> out;
+  if (template_bos_ >= 0) out.push_back(template_bos_);
+  const std::vector<int32_t> body = Encode(text);
+  out.insert(out.end(), body.begin(), body.end());
+  if (template_eos_ >= 0) out.push_back(template_eos_);
   return out;
 }
 

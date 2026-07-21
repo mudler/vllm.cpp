@@ -987,6 +987,63 @@ void SiluAndMul(Queue& q, Tensor& out, const Tensor& x) {
   reinterpret_cast<SiluAndMulFn>(GetOp(OpId::kSiluAndMul, q.device.type))(q, out, x);
 }
 
+void LayerNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor* weight,
+               const Tensor* bias, const LayerNormArgs& args) {
+  VT_CHECK(x.rank >= 1 && out.rank == x.rank, "layer_norm: out rank must match x");
+  for (int i = 0; i < x.rank; ++i)
+    VT_CHECK(out.shape[i] == x.shape[i], "layer_norm: out shape must match x");
+  const int64_t d = x.shape[x.rank - 1];
+  VT_CHECK(d > 0, "layer_norm: last dim must be non-empty");
+  VT_CHECK(IsFloat(x.dtype) && IsOutFloat(out.dtype), "layer_norm: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous(), "layer_norm: contiguous required");
+  VT_CHECK(x.device == out.device && x.device == q.device, "layer_norm: device mismatch");
+  for (const Tensor* p : {weight, bias}) {
+    if (p == nullptr) continue;
+    VT_CHECK(p->rank == 1 && p->shape[0] == d,
+             "layer_norm: weight/bias must be rank-1 [D] matching x's last dim");
+    VT_CHECK(IsFloat(p->dtype), "layer_norm: float weight/bias required");
+    VT_CHECK(p->IsContiguous() && p->device == x.device,
+             "layer_norm: weight/bias must be contiguous on x's device");
+  }
+  VT_CHECK(args.eps >= 0.0f, "layer_norm: eps must be non-negative");
+  reinterpret_cast<LayerNormFn>(GetOp(OpId::kLayerNorm, q.device.type))(q, out, x, weight, bias,
+                                                                       args);
+}
+
+void Relu(Queue& q, Tensor& out, const Tensor& x) {
+  VT_CHECK(out.rank == x.rank, "relu: out rank must match x");
+  for (int i = 0; i < x.rank; ++i)
+    VT_CHECK(out.shape[i] == x.shape[i], "relu: out shape must match x");
+  VT_CHECK(IsFloat(x.dtype) && IsOutFloat(out.dtype), "relu: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous(), "relu: contiguous required");
+  VT_CHECK(x.device == out.device && x.device == q.device, "relu: device mismatch");
+  reinterpret_cast<ReluFn>(GetOp(OpId::kRelu, q.device.type))(q, out, x);
+}
+
+void Add(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  VT_CHECK(a.rank >= 1 && out.rank == a.rank, "add: out rank must match a");
+  for (int i = 0; i < a.rank; ++i)
+    VT_CHECK(out.shape[i] == a.shape[i], "add: out shape must match a");
+  const int64_t d = a.shape[a.rank - 1];
+  // Two accepted b shapes: a's exact shape (elementwise) or rank-1 [D] over the
+  // last dim (a nn.Linear bias row-broadcast).
+  const bool broadcast = b.rank == 1 && a.rank != 1;
+  if (broadcast) {
+    VT_CHECK(b.shape[0] == d, "add: rank-1 b must match a's last dim (bias broadcast)");
+  } else {
+    VT_CHECK(b.rank == a.rank, "add: b must match a's rank or be rank-1 [D]");
+    for (int i = 0; i < a.rank; ++i)
+      VT_CHECK(b.shape[i] == a.shape[i], "add: b shape must match a");
+  }
+  VT_CHECK(IsFloat(a.dtype) && IsFloat(b.dtype) && IsOutFloat(out.dtype),
+           "add: float in, f32/bf16 out");
+  VT_CHECK(a.IsContiguous() && b.IsContiguous() && out.IsContiguous(),
+           "add: contiguous required");
+  VT_CHECK(a.device == out.device && b.device == a.device && a.device == q.device,
+           "add: device mismatch");
+  reinterpret_cast<AddFn>(GetOp(OpId::kAdd, q.device.type))(q, out, a, b);
+}
+
 void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
   VT_CHECK(table.rank == 2 && ids.rank == 1 && out.rank == 2, "embedding: bad ranks");
   VT_CHECK(out.shape[0] == ids.shape[0] && out.shape[1] == table.shape[1],

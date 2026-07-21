@@ -106,8 +106,13 @@ EngineCoreRequest InputProcessor::process_inputs(
 
   const double t = arrival_time.has_value() ? *arrival_time : NowSeconds();
 
-  // input_preprocessor.preprocess -> tokenize (text path only).
-  std::vector<int32_t> prompt_token_ids = tokenizer_.Encode(prompt);
+  // input_preprocessor.preprocess -> tokenize (text path only). vLLM tokenizes
+  // prompts with HF's default `add_special_tokens=True`, so the tokenizer's
+  // post_processor template is APPLIED here. This is a no-op for every Qwen
+  // tokenizer (their ByteLevel post_processor declares no bos/eos) and supplies
+  // the prepended `</s>` that OPT's TemplateProcessing declares.
+  std::vector<int32_t> prompt_token_ids =
+      tokenizer_.EncodeWithSpecialTokens(prompt);
 
   // params is already our clone (passed by value). If unset max_tokens, then
   // generate up to the max_model_len (input_processor.py:317-321).

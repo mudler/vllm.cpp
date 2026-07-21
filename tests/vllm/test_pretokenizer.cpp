@@ -47,6 +47,9 @@ std::vector<std::string> LlamaPieces(std::string_view t) {
 std::vector<std::string> ClassicPieces(std::string_view t) {
   return Pieces(t, SplitPattern::kQwen2Classic);
 }
+std::vector<std::string> Gpt2Pieces(std::string_view t) {
+  return Pieces(t, SplitPattern::kGpt2);
+}
 
 using V = std::vector<std::string>;
 
@@ -213,4 +216,72 @@ TEST_CASE("empty and single-char inputs") {
   CHECK(QwenPieces("'") == V{"'"});
   CHECK(QwenPieces("a") == V{"a"});
   CHECK(QwenPieces("7") == V{"7"});
+}
+
+// ---------------------------------------------------------------------------
+// kGpt2 — the ORIGINAL GPT-2 byte-level split, added by the OPT
+// (`OPTForCausalLM`) bring-up. OPT's tokenizer.json carries no explicit Split
+// component; it sets ByteLevel `use_regex: true`, which applies:
+//
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+//
+// EVERY expectation below is oracle-generated, NOT hand-guessed: produced by
+// HF tokenizers itself via
+//   tok.pre_tokenizer.pre_tokenize_str(case)
+// on ~/models/opt-125m-bf16-st/tokenizer.json (run on dgx with the vllm-oracle
+// venv), with the byte-level alphabet un-mapped back to raw bytes
+// (Ġ -> ' ', Ċ -> '\n', č -> '\r', ĉ -> '\t').
+
+TEST_CASE("kGpt2: basic words, and the four rules that differ from Qwen/Llama-3") {
+  CHECK(Gpt2Pieces("Hello world") == V{"Hello", " world"});
+
+  // (1) Digit runs are UNBOUNDED `\p{N}+` — not Qwen's single codepoint and not
+  // Llama-3's groups of three.
+  CHECK(Gpt2Pieces("abc123def4567890") == V{"abc", "123", "def", "4567890"});
+  CHECK(Gpt2Pieces("The year 2024 had 365 days.") ==
+        V{"The", " year", " 2024", " had", " 365", " days", "."});
+
+  // (2) The letter-run prefix is a plain ` ?`, not `[^\r\n\p{L}\p{N}]?`, so a
+  // punctuation character before a word does NOT get absorbed into the word.
+  CHECK(Gpt2Pieces("punct!!!between???letters") ==
+        V{"punct", "!!!", "between", "???", "letters"});
+
+  // (3) There is NO `\s*[\r\n]+` rule and NO `[\r\n]*` punct tail: newlines
+  // fall through to the two whitespace rules.
+  CHECK(Gpt2Pieces("tabs\tand\nnewlines\r\n here") ==
+        V{"tabs", "\t", "and", "\n", "newlines", "\r\n", " here"});
+  CHECK(Gpt2Pieces("\n\n\n") == V{"\n\n\n"});
+
+  // (4) Contractions are CASE-SENSITIVE (no `(?i:)` wrapper): 't matches, 'S
+  // does not, and an apostrophe not directly after a letter run is punctuation.
+  CHECK(Gpt2Pieces("don't stop  believing\n\n") ==
+        V{"don", "'t", " stop", " ", " believing", "\n\n"});
+  CHECK(Gpt2Pieces("It'S a 'Test' 'll 'RE") ==
+        V{"It", "'", "S", " a", " '", "Test", "'", " '", "ll", " '", "RE"});
+}
+
+TEST_CASE("kGpt2: whitespace runs, marks and non-ASCII") {
+  // `\s+(?!\S)` leaves the LAST whitespace codepoint attached to the following
+  // token; a run at end of input matches whole.
+  CHECK(Gpt2Pieces("  leading and trailing   ") ==
+        V{" ", " leading", " and", " trailing", "   "});
+  CHECK(Gpt2Pieces("x  \n  y") == V{"x", "  \n ", " y"});
+
+  // Combining marks are NOT part of the letter run (GPT-2 has no \p{M}
+  // awareness); they land in the punct-run class. "áb" here is DECOMPOSED
+  // (a + U+0301).
+  CHECK(Gpt2Pieces("a\u0301b combining") == V{"a", "\u0301", "b", " combining"});
+
+  // CJK are letters, so they form one run behind the optional space prefix.
+  CHECK(Gpt2Pieces("CJK \u4f60\u597d\u4e16\u754c test") ==
+        V{"CJK", " \u4f60\u597d\u4e16\u754c", " test"});
+}
+
+TEST_CASE("kGpt2: empty and single-char inputs tile exactly") {
+  CHECK(Pretokenize("", SplitPattern::kGpt2).empty());
+  CHECK(Gpt2Pieces(" ") == V{" "});
+  CHECK(Gpt2Pieces("\n") == V{"\n"});
+  CHECK(Gpt2Pieces("'") == V{"'"});
+  CHECK(Gpt2Pieces("a") == V{"a"});
+  CHECK(Gpt2Pieces("7") == V{"7"});
 }

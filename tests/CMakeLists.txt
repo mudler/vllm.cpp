@@ -282,6 +282,7 @@ vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
+vllm_cpp_add_test(test_ops_layernorm vt/test_ops_layernorm.cpp)
 vllm_cpp_add_test(test_fused_chain_additivity vt/test_fused_chain_additivity.cpp)
 vllm_cpp_add_test(test_ops_activation vt/test_ops_activation.cpp)
 vllm_cpp_add_test(test_ops_rope vt/test_ops_rope.cpp)
@@ -362,4 +363,15 @@ vllm_cpp_add_test(test_qwen3coder_paged_engine vllm/models/test_qwen3coder_paged
 target_compile_definitions(test_qwen3coder_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_qwen3coder_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# ADDITIVE-MODEL W2/W4 (OPT-125m, OPTForCausalLM) — the CROSS-FAMILY additivity
+# canary: a host-only loader gate plus the SACRED greedy correctness gate, which
+# is STRICT token-exact because the vLLM 0.25.0 oracle measured DETERMINISTIC on
+# this model (K=5, 0 multi-valued cells). Checkpoint-gated, dgx-only.
+vllm_cpp_add_test(test_opt_load vllm/models/test_opt_load.cpp)
+vllm_cpp_add_test(test_opt_paged_engine vllm/models/test_opt_paged_engine.cpp)
+target_compile_definitions(test_opt_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_opt_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)

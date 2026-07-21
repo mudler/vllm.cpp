@@ -212,10 +212,89 @@ size_t MatchWs(std::string_view t, size_t pos) {
   return p > pos ? p : 0;
 }
 
+// ---------------------------------------------------------------------------
+// GPT-2 rules. The ORIGINAL byte-level BPE split, applied implicitly by HF's
+// ByteLevel pre-tokenizer when `use_regex: true` and no explicit Split
+// component is present (facebook/opt-125m, gpt2, and friends):
+//
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+//
+// Four of the six alternatives differ from the Qwen/Llama-3 family above, so
+// they get their own matchers rather than extra flags on the existing ones.
+
+// GPT-2 rule 1: 's|'t|'re|'ve|'m|'ll|'d — CASE-SENSITIVE (no `(?i:)` wrapper),
+// so ASCII lowercase only and no U+017F long-s fold.
+size_t MatchGpt2Contraction(std::string_view t, size_t pos) {
+  if (t[pos] != '\'' || pos + 1 >= t.size()) return 0;
+  const char c1 = t[pos + 1];
+  if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') return pos + 2;
+  if (pos + 2 >= t.size()) return 0;
+  const char c2 = t[pos + 2];
+  if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') ||
+      (c1 == 'l' && c2 == 'l')) {
+    return pos + 3;
+  }
+  return 0;
+}
+
+// GPT-2 rules 2 and 3: ` ?\p{L}+` and ` ?\p{N}+`.
+// An optional single literal ASCII space, then a MAXIMAL run of the wanted
+// category. Note both differences vs the Qwen form: the prefix is a plain space
+// (not "any non-letter/number codepoint"), and digit runs are unbounded rather
+// than grouped.
+size_t MatchGpt2CategoryRun(std::string_view t, size_t pos, UCat want) {
+  size_t p = pos;
+  if (t[p] == ' ') ++p;
+  const size_t run_begin = p;
+  while (p < t.size()) {
+    const Cp c = DecodeAt(t, p);
+    if (Category(c.cp) != want) break;
+    p = c.end;
+  }
+  return p == run_begin ? 0 : p;
+}
+
+// GPT-2 rule 4: ` ?[^\s\p{L}\p{N}]+` — as MatchPunctRun but with NO trailing
+// `[\r\n]*` (GPT-2 has no newline-absorbing tail and no `\s*[\r\n]+` rule, so
+// newlines fall through to the two whitespace rules).
+size_t MatchGpt2PunctRun(std::string_view t, size_t pos) {
+  size_t p = pos;
+  if (t[p] == ' ') ++p;
+  const size_t run_begin = p;
+  while (p < t.size()) {
+    const Cp c = DecodeAt(t, p);
+    if (IsRegexSpace(c.cp)) break;
+    const UCat cat = Category(c.cp);
+    if (cat == UCat::kLetter || cat == UCat::kNumber) break;
+    p = c.end;
+  }
+  return p == run_begin ? 0 : p;
+}
+
+std::vector<std::pair<size_t, size_t>> PretokenizeGpt2(std::string_view text) {
+  std::vector<std::pair<size_t, size_t>> spans;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t end = MatchGpt2Contraction(text, pos);
+    if (end == 0) end = MatchGpt2CategoryRun(text, pos, UCat::kLetter);
+    if (end == 0) end = MatchGpt2CategoryRun(text, pos, UCat::kNumber);
+    if (end == 0) end = MatchGpt2PunctRun(text, pos);
+    if (end == 0) end = MatchWsNotBeforeNonSpace(text, pos);
+    if (end == 0) end = MatchWs(text, pos);
+    if (end == 0) end = DecodeAt(text, pos).end;  // forward-progress guarantee
+    spans.emplace_back(pos, end);
+    pos = end;
+  }
+  return spans;
+}
+
 }  // namespace
 
 std::vector<std::pair<size_t, size_t>> Pretokenize(std::string_view text,
                                                    SplitPattern pattern) {
+  // GPT-2's alternation differs in four of six rules, so it runs its own
+  // scanner rather than threading more flags through the Qwen/Llama-3 one.
+  if (pattern == SplitPattern::kGpt2) return PretokenizeGpt2(text);
   // \p{M} awareness (letter runs absorb marks; punct runs exclude them) is
   // UNIQUE to the Qwen3.6 regex. Classic Qwen2/Qwen3 and Llama-3 both treat
   // marks like ordinary punct-run codepoints. Number grouping is single-digit

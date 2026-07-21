@@ -142,5 +142,49 @@ inline OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
   return merged;
 }
 
+// Load and concatenate rank-1 BF16 tensors in the listed order — the vector
+// analog of LoadMergedBf16RawNK, for merging the per-shard BIAS terms of a
+// MergedColumnParallelLinear/QKVParallelLinear whose weights were merged by it.
+// ADDED (append-only, no existing helper touched) by the OPT (`OPTForCausalLM`)
+// bring-up: OPT is the first family we port whose projections carry bias
+// (`config.enable_bias`, opt.py:90-104), so its merged qkv needs a merged
+// [3*H] bias to go with the merged [3*H, H] weight. Generic — every future
+// biased family (GPT-2, BLOOM, Falcon, ...) reuses it.
+inline OwnedTensor LoadMergedBf16Vector(const TensorResolver& get,
+                                        const std::vector<std::string>& names) {
+  VT_CHECK(!names.empty(),
+           "dense loader: merged BF16 vector requires at least one shard");
+  int64_t total = 0;
+  std::vector<const StTensor*> shards;
+  shards.reserve(names.size());
+  for (const std::string& name : names) {
+    const StTensor& tensor = get(name);
+    VT_CHECK(tensor.dtype == "BF16", "dense loader: expected BF16 for " + name);
+    VT_CHECK(tensor.shape.size() == 1,
+             "dense loader: expected 1-D vector for " + name);
+    VT_CHECK(tensor.shape[0] > 0, "dense loader: merged BF16 vector shard is empty: " + name);
+    VT_CHECK(tensor.data != nullptr,
+             "dense loader: merged BF16 vector shard has null data: " + name);
+    VT_CHECK(total <= std::numeric_limits<int64_t>::max() - tensor.shape[0],
+             "dense loader: merged BF16 vector length overflow");
+    total += tensor.shape[0];
+    shards.push_back(&tensor);
+  }
+  OwnedTensor merged = MakeOwned(vt::DType::kBF16, {total});
+  size_t offset = 0;
+  for (size_t i = 0; i < shards.size(); ++i) {
+    const StTensor& shard = *shards[i];
+    const size_t expected = static_cast<size_t>(shard.shape[0]) * sizeof(uint16_t);
+    VT_CHECK(shard.nbytes == expected,
+             "dense loader: byte-size mismatch for " + names[i]);
+    std::memcpy(merged.bytes.data() + offset, shard.data, expected);
+    MaybeReleaseSourcePages(shard.data, expected);
+    offset += expected;
+  }
+  VT_CHECK(offset == merged.bytes.size(),
+           "dense loader: merged BF16 vector byte accounting mismatch");
+  return merged;
+}
+
 }  // namespace dense_loaders
 }  // namespace vllm

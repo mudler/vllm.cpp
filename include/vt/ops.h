@@ -156,6 +156,21 @@ enum class OpId : uint8_t {
   // BF16 grouped-MoE GEMM: the dtype-native analog of kMoeGroupedGemmNvfp4 (no
   // fp4 decode). Powers the Qwen3-Coder (Qwen3MoeForCausalLM) fast bf16 MoE path.
   kMoeGroupedGemmBf16,
+  // Cross-family dense primitives introduced by the OPT (`OPTForCausalLM`)
+  // bring-up — the pre-RMSNorm/pre-SwiGLU transformer vocabulary every
+  // non-Qwen family needs. All three mirror torch/vLLM semantics exactly:
+  //   kLayerNorm — `nn.LayerNorm` (mean+variance normalization with a BIAS
+  //                term), as used by opt.py:146-148,164-166,248-251. Distinct
+  //                from kRmsNorm, which subtracts no mean and has no bias.
+  //   kRelu      — `get_act_fn("relu")` (opt.py:156), i.e. ReLU rather than the
+  //                SwiGLU every Qwen model uses.
+  //   kAdd       — elementwise add, plus the rank-1 row-BROADCAST form that
+  //                applies a `nn.Linear` bias (opt.py:90-104,149-163: OPT's
+  //                q/k/v/out/fc1/fc2 all carry `enable_bias` bias terms, which
+  //                the bias-free Qwen projections never needed).
+  kLayerNorm,
+  kRelu,
+  kAdd,
   kCount
 };
 
@@ -203,6 +218,14 @@ struct DropinProbeArgs {
 struct RmsNormArgs {
   float eps = 1e-6f;
   bool gemma = false;  // weight applied as (1 + w), GemmaRMSNorm style
+};
+
+// torch `nn.LayerNorm` arguments (opt.py:146-148,164-166,248-251 construct it
+// with the default eps=1e-5 and `elementwise_affine=config.
+// layer_norm_elementwise_affine`). Unlike RmsNormArgs there is no gemma variant:
+// LayerNorm subtracts the mean and applies weight AND bias.
+struct LayerNormArgs {
+  float eps = 1e-5f;
 };
 
 struct RopeArgs {
@@ -404,6 +427,10 @@ using SharedExpertGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
+using LayerNormFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor*, const Tensor*,
+                             const LayerNormArgs&);
+using ReluFn = void (*)(Queue&, Tensor&, const Tensor&);
+using AddFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using EmbeddingFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using RopeFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const RopeArgs&);
 using RopeFromCacheFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&,
@@ -903,6 +930,39 @@ void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& q_out, Tensor& k_ou
 // out[T,D] = silu(x[:, :D]) * x[:, D:], x is [T, 2D]; out f32 or bf16.
 // Note: computes in f32 (upstream forward_native computes in x's dtype); bf16 parity tests need bf16-eps tolerance.
 void SiluAndMul(Queue& q, Tensor& out, const Tensor& x);
+
+// out[..,D] = (x - mean(x)) * rsqrt(var(x) + eps) * weight + bias — torch
+// `nn.LayerNorm` over the LAST dim (ported from ATen `native_layer_norm` /
+// `vectorized_layer_norm_kernel`, the kernel `nn.LayerNorm` dispatches to for a
+// CUDA half/bfloat16 input). `weight`/`bias` are optional rank-1 [D] tensors:
+// both null == `elementwise_affine=False`. `var` is the BIASED (1/N) variance,
+// as torch uses. x/out f32 or bf16; the mean/variance accumulation, the
+// normalization and the affine are all computed in f32 and rounded once on
+// store — matching torch's `acc_type<bfloat16> == float` contract, so a bf16
+// LayerNorm here rounds exactly where torch's does.
+//
+// This is the mean-subtracting, bias-carrying sibling of vt::RmsNorm. It is
+// what every pre-Llama-era family (OPT, GPT-2, BLOOM, ...) normalizes with;
+// vllm/model_executor/models/opt.py:146-148,164-166,248-251. CPU + CUDA.
+void LayerNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor* weight,
+               const Tensor* bias, const LayerNormArgs& args);
+
+// out[i] = max(x[i], 0) — torch `F.relu`, i.e. vLLM `get_act_fn("relu")`
+// (vllm/model_executor/layers/activation.py) as selected by OPT's
+// `config.activation_function` (opt.py:156). Computed in f32, rounded on store;
+// `out` may alias `x` (in-place). x/out f32 or bf16. CPU + CUDA.
+void Relu(Queue& q, Tensor& out, const Tensor& x);
+
+// out = a + b, in two shapes:
+//   ELEMENTWISE  — b has a's exact shape (OPT's `residual + hidden_states`
+//                  residual joins, opt.py:178,191, and the
+//                  `inputs_embeds + pos_embeds` embedding join, opt.py:279).
+//   ROW-BROADCAST — b is rank-1 [D] matching a's LAST dim, applied to every row
+//                  (a `nn.Linear` bias term: OPT's q/k/v/out_proj/fc1/fc2 all
+//                  carry one under `config.enable_bias`, opt.py:90-104,149-163).
+// Computed in f32, rounded on store; `out` may alias `a` (in-place). All of
+// a/b/out f32 or bf16. CPU + CUDA.
+void Add(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 
 // out[T,H] = table[ids[t], :]; ids i32/i64, bounds-checked; out f32 or bf16.
 // CUDA note (M0.6 decision): ids live on the device, so the CUDA kernel clamps

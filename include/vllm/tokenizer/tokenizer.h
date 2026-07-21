@@ -43,6 +43,20 @@ class Tokenizer {
   // matched leftmost-longest against the raw text before pretokenization.
   std::vector<int32_t> Encode(std::string_view text) const;
 
+  // Encodes UTF-8 text and APPLIES the post_processor's special tokens —
+  // HF tokenizers' `encode(text, add_special_tokens=True)`, which is what vLLM
+  // tokenizes prompts with. Concretely it realizes the TemplateProcessing
+  // "single" template that ExtractBosEos already parses: prepend BosId() when
+  // >= 0, append EosId() when >= 0.
+  //
+  // ADDED by the OPT (`OPTForCausalLM`) bring-up. Every Qwen tokenizer in the
+  // tree has a ByteLevel post_processor carrying NEITHER id, so both are -1 and
+  // this is byte-identical to Encode() for them — but OPT's post_processor DOES
+  // declare `[SpecialToken </s>, Sequence A]`, i.e. a prepended BOS (id 2). We
+  // parsed that field but never applied it, so OPT prompts came out one token
+  // short and every continuation diverged (spec "seams that leaked" L4).
+  std::vector<int32_t> EncodeWithSpecialTokens(std::string_view text) const;
+
   // Full (non-incremental) decode: ids -> raw UTF-8 bytes. Added tokens
   // contribute their literal content. Throws on unknown ids.
   std::string Decode(const std::vector<int32_t>& ids) const;
@@ -86,6 +100,14 @@ class Tokenizer {
   SplitPattern pattern_ = SplitPattern::kQwen2;
   int32_t eos_id_ = -1;
   int32_t bos_id_ = -1;
+  // The tokens the POST-PROCESSOR itself prepends/appends, which is a strictly
+  // narrower thing than "this model's bos/eos ids". Set ONLY from an HF
+  // TemplateProcessing "single" template (FromHfJson); left -1 by FromGguf,
+  // whose `tokenizer.ggml.{bos,eos}_token_id` merely NAME the special tokens
+  // and do NOT imply the tokenizer adds them to a prompt. Conflating the two
+  // would append an EOS to every GGUF prompt.
+  int32_t template_bos_ = -1;
+  int32_t template_eos_ = -1;
   bool ignore_merges_ = false;  // BPE option: whole-pretoken vocab hit wins
 };
 

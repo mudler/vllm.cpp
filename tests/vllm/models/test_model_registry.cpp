@@ -5,6 +5,7 @@
 // Negative cases additionally pin registry.py:_raise_for_unsupported:1051-1082,
 // which has no direct upstream test at this commit.
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/model_executor/models/opt.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 
@@ -41,7 +42,7 @@ HfConfig Config(std::vector<std::string> architectures) {
 
 TEST_CASE("registry_imports: every registered architecture has a complete factory") {
   const auto registrations = ModelRegistry::Registrations();
-  REQUIRE(registrations.size() == 4);
+  REQUIRE(registrations.size() == 5);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -57,7 +58,7 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
   }
 }
 
-TEST_CASE("self_registration: both Qwen archs self-register from their own TUs") {
+TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // With the fixed kRegistrations array replaced by REGISTER_VLLM_MODEL
   // static-init self-registration (qwen3_5_dense.cpp + qwen3_5_moe.cpp each
   // register themselves), the process-global registry must still contain both
@@ -72,6 +73,9 @@ TEST_CASE("self_registration: both Qwen archs self-register from their own TUs")
   };
   CHECK(has_arch("Qwen3ForCausalLM"));
   CHECK(has_arch("Qwen3MoeForCausalLM"));
+  // The CROSS-FAMILY canary: OPT is not a Qwen variant at all, and it still
+  // needed nothing but its own TU + one REGISTER_VLLM_MODEL line.
+  CHECK(has_arch("OPTForCausalLM"));
   CHECK(has_arch("Qwen3_5ForConditionalGeneration"));
   CHECK(has_arch("Qwen3_5MoeForConditionalGeneration"));
 
@@ -82,10 +86,11 @@ TEST_CASE("self_registration: both Qwen archs self-register from their own TUs")
   // "Qwen3" prefix), then the full-attention MoE "Qwen3MoeForCausalLM", then the
   // two hybrid Qwen3.5 wrappers; resolution is order-independent.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 4);
+  REQUIRE(supported.size() == 5);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
-  CHECK(supported.front() == "Qwen3ForCausalLM");
-  CHECK(supported[1] == "Qwen3MoeForCausalLM");
+  CHECK(supported.front() == "OPTForCausalLM");  // 'O' (0x4F) < 'Q' (0x51)
+  CHECK(supported[1] == "Qwen3ForCausalLM");
+  CHECK(supported[2] == "Qwen3MoeForCausalLM");
   CHECK(supported.back() == "Qwen3_5MoeForConditionalGeneration");
 
   // The dense/MoE scheduler policy split survives the per-variant TU move.
@@ -102,7 +107,8 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
     CHECK_FALSE(registration.info.has_inner_state);
     CHECK(registration.info.score_type == "bi-encoder");
     if (registration.architecture == "Qwen3ForCausalLM" ||
-        registration.architecture == "Qwen3MoeForCausalLM") {
+        registration.architecture == "Qwen3MoeForCausalLM" ||
+        registration.architecture == "OPTForCausalLM") {
       // Pure text-only full-attention arch (dense OR MoE): NOT hybrid (no GDN),
       // NOT multimodal (no vision tower).
       CHECK_FALSE(registration.info.is_hybrid);
@@ -142,6 +148,77 @@ TEST_CASE("resolve_model_cls: Qwen3ForCausalLM resolves to the dense additive fa
   REQUIRE(kv.kv_cache_groups.size() == 1);
   CHECK(kv.kv_cache_groups[0].kv_cache_spec->kind() ==
         vllm::v1::KVCacheSpecKind::kFullAttention);
+}
+
+TEST_CASE("resolve_model_cls: OPTForCausalLM resolves to the cross-family dense factory") {
+  // The CROSS-FAMILY additivity canary (registry.py:176). OPT shares no
+  // attention preamble, no norm, no activation and no positional scheme with
+  // any Qwen variant in the tree — and the model-registry seam still absorbed
+  // it as ONE new TU carrying its own REGISTER_VLLM_MODEL line, with ZERO edit
+  // to a shared registration array.
+  const HfConfig config = Config({"OPTForCausalLM"});
+  const ModelRegistration& reg = ModelRegistry::Resolve(config);
+  CHECK(reg.architecture == "OPTForCausalLM");
+  REQUIRE(reg.factory != nullptr);
+  CHECK(reg.factory->parse_config != nullptr);
+  CHECK(reg.factory->load_weights != nullptr);
+  CHECK(reg.factory->prepare != nullptr);
+  CHECK(reg.factory->forward != nullptr);
+  CHECK(reg.factory->make_kv_cache != nullptr);
+  CHECK(reg.factory->is_dense_model);
+
+  // Pure full attention: one FA group, no MambaSpec/GDN group. OPT predates
+  // GQA, so num_key_value_heads == num_attention_heads (12 x 64 for opt-125m).
+  HfConfig kv_config = config;
+  kv_config.num_key_value_heads = 12;
+  kv_config.head_dim = 64;
+  const vllm::v1::KVCacheConfig kv =
+      reg.factory->make_kv_cache(kv_config, /*block_size=*/16, /*num_blocks=*/8);
+  REQUIRE(kv.kv_cache_groups.size() == 1);
+  CHECK(kv.kv_cache_groups[0].kv_cache_spec->kind() ==
+        vllm::v1::KVCacheSpecKind::kFullAttention);
+}
+
+TEST_CASE("parse_config: OPT reads its family fields out of the raw config doc") {
+  // OPT names its FFN width `ffn_dim`, not `intermediate_size`, and carries five
+  // switches our typed HfConfig does not model — so its config hook reads
+  // `HfConfig::raw`. That escape hatch is what let a new family land without
+  // widening the shared HfConfig POD (spec "seams that held" S2).
+  HfConfig config = Config({"OPTForCausalLM"});
+  config.hidden_size = 768;
+  config.num_attention_heads = 12;
+  config.max_position_embeddings = 2048;
+  config.raw = nlohmann::json{{"ffn_dim", 3072},
+                              {"word_embed_proj_dim", 768},
+                              {"do_layer_norm_before", true},
+                              {"activation_function", "relu"}};
+  const ModelRegistration& reg = ModelRegistry::Resolve(config);
+  REQUIRE_NOTHROW(reg.factory->parse_config(config));
+
+  const vllm::OPTConfigExtras extras = vllm::GetOPTConfigExtras(config);
+  CHECK(extras.ffn_dim == 3072);
+  CHECK(extras.word_embed_proj_dim == 768);
+  CHECK(extras.do_layer_norm_before);
+  // Keys facebook/opt-125m omits fall back to the transformers OPTConfig
+  // defaults, not to zero.
+  CHECK(extras.enable_bias);
+  CHECK(extras.layer_norm_elementwise_affine);
+  CHECK(extras.tie_word_embeddings);
+  CHECK_FALSE(extras.remove_final_layer_norm);
+
+  // A missing ffn_dim is a hard error rather than a silently-zero FFN.
+  HfConfig bad = config;
+  bad.raw.erase("ffn_dim");
+  CHECK_THROWS(reg.factory->parse_config(bad));
+
+  // The two upstream variants we have no checkpoint to gate are REJECTED
+  // loudly rather than shipped untested (spec R2).
+  HfConfig proj = config;
+  proj.raw["word_embed_proj_dim"] = 512;
+  CHECK_THROWS(reg.factory->parse_config(proj));
+  HfConfig act = config;
+  act.raw["activation_function"] = "gelu";
+  CHECK_THROWS(reg.factory->parse_config(act));
 }
 
 TEST_CASE("resolve_model_cls: Qwen3MoeForCausalLM resolves to the full-attention MoE factory") {
@@ -266,7 +343,8 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 4> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 5> kExampleConfigArchitectures{
+      "OPTForCausalLM",
       "Qwen3ForCausalLM",
       "Qwen3MoeForCausalLM",
       "Qwen3_5ForConditionalGeneration",
@@ -338,7 +416,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(unknown),
       "Model architectures ['LlamaForCausalLM'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['Qwen3ForCausalLM', 'Qwen3MoeForCausalLM', "
+      "dict_keys(['OPTForCausalLM', 'Qwen3ForCausalLM', 'Qwen3MoeForCausalLM', "
       "'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForConditionalGeneration'])",
       std::runtime_error);
@@ -348,7 +426,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(multiple),
       "Model architectures ['UnknownA', 'UnknownB'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['Qwen3ForCausalLM', 'Qwen3MoeForCausalLM', "
+      "dict_keys(['OPTForCausalLM', 'Qwen3ForCausalLM', 'Qwen3MoeForCausalLM', "
       "'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForConditionalGeneration'])",
       std::runtime_error);

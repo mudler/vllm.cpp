@@ -20,6 +20,13 @@ enum class SplitPattern {
                   // punct run, exactly like Llama-3's classes but with 1-digit
                   // number grouping).
   kLlama3,  // Llama-3 family: \p{N}{1,3} digit groups, no \p{M} awareness.
+  kGpt2,    // ORIGINAL GPT-2 byte-level BPE (OPT, GPT-2, and every other
+            // pre-Llama HF checkpoint whose tokenizer.json carries NO explicit
+            // Split component and instead sets ByteLevel `use_regex: true`).
+            // Materially different from all three above, not a variant of them:
+            // case-SENSITIVE contractions, a plain ` ?` space prefix instead of
+            // the `[^\r\n\p{L}\p{N}]?` prefix, UNBOUNDED `\p{N}+` digit runs,
+            // no `[\r\n]*` punct tail and no `\s*[\r\n]+` rule at all.
 };
 
 // Splits `text` into pretoken byte spans [first, second), exactly as HF

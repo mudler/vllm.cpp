@@ -14837,3 +14837,21 @@ No performance number is published at this checkpoint (`benchmark_binding=false`
 Next: commit the immutable harness binary, name its evidence root by commit,
 then hold one `flock /tmp/gpu` across three interleaved direct-ON/direct-OFF/
 available-vLLM repetitions for the recovered 128x1024→128 c32 greedy workload.
+
+### 2026-07-21 — exact 4B lock-held driver and vLLM collector preflight (`ACTIVE`)
+
+The 4B comparison now has a committed reference-side closed-loop collector and
+a single-lock driver. The collector uses DELTA outputs and bounded concurrency,
+retains submission-order IDs, and reports total/output/request throughput plus
+mean/median/P99 TTFT, TPOT, ITL and E2EL. The driver interleaves three memory and
+three unmonitored performance repetitions per direct-ON/direct-OFF/vLLM arm,
+proves cold model pages with fadvise+mincore before every leg, samples PSS/RSS/
+MemAvailable/VRAM, and captures pre/post thermal and clock-throttle state.
+
+The local vLLM 0.24 production-graph preflight passes 1x1028→2 and returns IDs
+`[220,16]` with all metric families. Environment finding: the host virtualenv
+needs the system NVIDIA driver plus Nix libstdc++, while FlashInfer JIT assumes
+a monolithic CUDA toolkit; the driver derives nvcc, cudart and cuRAND from the
+immutable CMake cache and assembles a symlink-only `CUDA_HOME` in `/tmp`.
+Helper/unit checks are green (shell syntax, Python compile, 2/2 pure tests).
+No benchmark result is claimed yet; the full 18-leg series is next.

@@ -140,8 +140,11 @@ GDN BA BF16 hashes differ on this architecture. Current-oracle tokens, 27B/35B
 regressions, sanitizer, matching traces, memory and every performance axis
 remain pending. The preserved previous 4B recipe/results are recovered. The
 exact-corpus/output-ID benchmark hooks are restored and pass **4/4 cases,
-33/33 assertions** in both CPU and local CUDA builds; the immutable lock-held
-comparison run is next.
+33/33 assertions** in both CPU and local CUDA builds. The committed reference
+collector reports the matching closed-loop TTFT/TPOT/ITL families and exact
+tokens; its production-graphed vLLM 0.24 two-token preflight is green after the
+driver derives Nix's split nvcc/cudart/cuRAND toolchain into a symlink-only
+`CUDA_HOME`. The immutable lock-held comparison run is next.
 
 Reproduction entry point:
 
@@ -180,8 +183,9 @@ nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant \
    current preamble/GDN dispatch; regression tests.
 4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
    queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
-5. `W4` gates: **ACTIVE** — local direct ON/OFF correctness is green and the
-   exact ShareGPT/output-ID measurement hooks pass CPU/CUDA; run the lock-held 4B ON/OFF/reference
+5. `W4` gates: **ACTIVE** — local direct ON/OFF correctness, exact
+   ShareGPT/output-ID hooks and the production-vLLM collector preflight are green;
+   run the lock-held 4B ON/OFF/reference
    series and compare every axis with the preserved 4B branch result. Sanitizer/traces
    and external 27B/35B regressions remain named follow-ups.
 

@@ -412,6 +412,52 @@ This is the "real strict pass on a deterministic model" half of the ratified
 ambition ([[near-tie-distributional-gate]]) — achieved on a model from a family
 we had never ported.
 
+### 5a. dgx gate series (production flags, one `flock /tmp/gpu`)
+
+Tree transferred by `git archive` (never rsync); goldens md5-verified identical
+BEFORE and AFTER the series (`3909e6ac…` / `42b783ac…`, matching the committed
+hashes). Configure log confirms CUTLASS sm120a + Marlin NVFP4 MoE + FA2 sm_121a +
+vendored Triton AOT. Runner: `scripts/opt-dgx-gate.sh`.
+
+| Gate | Result |
+|---|---|
+| Clean full CUDA rebuild, `-Werror` | **0 warnings / 0 errors** |
+| `test_ops_layernorm` (CUDA leg live) | 5 cases / **29966 assertions** |
+| `test_opt_load` | **958 assertions** |
+| `test_opt_paged_engine` (SACRED) | **6/6 prompts, 96/96 tokens**, 36 assertions |
+| REGRESSION 27B `test_qwen27_paged_engine` | **235/235 UNCHANGED** |
+| REGRESSION 35B `test_qwen36_paged_engine` | **315/315 UNCHANGED** |
+| REGRESSION `test_qwen3coder_paged_engine` | **6/6 (138 assertions) UNCHANGED** |
+| REGRESSION `test_qwen3_paged_engine` | **664 assertions UNCHANGED** |
+| REGRESSION `test_model_registry` | 20 cases / 231 assertions |
+| REGRESSION `test_pretokenizer` | 18 cases / **97926 assertions** |
+| REGRESSION `test_model_loader_gguf` | 3/3 |
+
+**memcheck — stated precisely rather than as a bare "0".**
+`compute-sanitizer --tool memcheck --leak-check=full` on the OPT engine path:
+**0 invalid reads, 0 invalid writes, 0 invalid `__global__` accesses** (zero
+memory errors in the meaningful sense), with the gate still passing 6/6 under the
+sanitizer. It does print 66 leak reports (34.4 MB) — these are NOT an OPT leak.
+63 of 66 trace to `dense_attn::DBuf`, i.e. the shared `DevicePool`, whose `Put`
+returns blocks to a free list and never calls `Backend::Free` when uncapped (cap
+0 on GB10, `device_pool.h:65-77`); every pooled block is therefore retained for
+the process lifetime BY DESIGN and is necessarily reported at exit. Measured
+against the pre-existing baseline on the SAME binary:
+
+| Binary under memcheck | invalid accesses | leak reports | from `DBuf` | bytes |
+|---|---|---|---|---|
+| `test_opt_paged_engine` (NEW) | **0** | 66 | 63 | 34.4 MB |
+| `test_qwen3_paged_engine -tc=qwen3-0.6B*` (pre-existing) | **0** | 125 | 98 | 35.9 MB |
+| `test_qwen3_paged_engine` full (pre-existing) | **0** | 184 | all | 39.7 MB |
+
+OPT retains FEWER pool blocks than the dense model that preceded it — same class
+as the retained allocations already documented for the Qwen3-Coder gate.
+
+**CPU suite:** `-Werror` 0-warn; full CTest 136/138, the two misses being
+`test_openai_api_server` + `test_openai_conformance`, which PASS re-run isolated
+(2/2) — the documented `-j` port-contention flake for that suite, not a
+regression from this change.
+
 ---
 
 ## 6. Diagnosis log (what broke, and how it was found)

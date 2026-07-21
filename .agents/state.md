@@ -15507,13 +15507,41 @@ arms run bf16 and our checkpoint was materialized with the SAME single fp16->bf1
 rounding vLLM applies at load — apples-to-apples, but fp16-native coverage
 remains genuinely absent.
 
-**GATES.** CPU `-Werror` 0-warn + full CPU CTest green. dgx: clean CUDA
-`-Werror` 0 warnings; `test_opt_paged_engine` 6/6 and `test_opt_load` green on
-the FINAL binary; `test_ops_layernorm` green on CUDA; **REGRESSIONS UNCHANGED —
-27B `test_qwen27_paged_engine` 235/235, 35B `test_qwen36_paged_engine` 315/315,
-Qwen3-Coder `test_qwen3coder_paged_engine` 6/6, Qwen3-dense
-`test_qwen3_paged_engine`**; `compute-sanitizer memcheck` 0 errors on the OPT
-engine path. Both record checkers green.
+**GATES.** CPU: `-Werror` 0-warn; full CPU CTest 136/138, the two misses being
+`test_openai_api_server` + `test_openai_conformance`, which PASS when re-run
+isolated (the documented `-j` port-contention flake, already noted in
+`coordination.md` for this suite) — verified isolated 2/2 green at this commit.
+
+dgx (`~/work/vllm.cpp-opt125m`, transferred by `git archive` NOT rsync, goldens
+md5-verified identical before AND after the series; production flags CUTLASS
+sm120a + Marlin + FA2 sm_121a + Triton AOT confirmed in the configure log; whole
+series under one `flock /tmp/gpu`): clean full CUDA rebuild **0 warnings / 0
+errors** under `-Werror`. On the FINAL binary — `test_ops_layernorm` **5 cases /
+29966 assertions** (the CUDA leg now runs, vs 9230 CPU-only on the dev box),
+`test_opt_load` **958 assertions**, `test_opt_paged_engine` **6/6 prompts, 96/96
+tokens, 36 assertions**. **REGRESSIONS ALL UNCHANGED: 27B
+`test_qwen27_paged_engine` 235/235, 35B `test_qwen36_paged_engine` 315/315,
+Qwen3-Coder `test_qwen3coder_paged_engine` 6/6 (138 assertions), Qwen3-dense
+`test_qwen3_paged_engine` 664 assertions, `test_model_registry` 20 cases /
+231 assertions, `test_pretokenizer` 18 cases / 97926 assertions,
+`test_model_loader_gguf` 3/3.**
+
+**memcheck, stated precisely.** `compute-sanitizer --tool memcheck
+--leak-check=full` on the OPT engine path reports **0 invalid reads, 0 invalid
+writes, 0 invalid `__global__` accesses** — i.e. zero memory errors in the
+meaningful sense — while the gate itself still passes 6/6 under the sanitizer.
+It DOES print 66 `--leak-check=full` reports (34.4 MB), and those are NOT an OPT
+leak: 63 of 66 trace to `dense_attn::DBuf`, i.e. the shared `DevicePool`, whose
+`Put` returns blocks to a free list and never calls `Backend::Free` when uncapped
+(cap 0 on GB10, `device_pool.h:65-77`), so every pooled block is retained for the
+process lifetime BY DESIGN and is necessarily reported at exit. Measured against
+the pre-existing baseline on the SAME binary: Qwen3-0.6B alone reports **125**
+such allocations (98 from `DBuf`, 35.9 MB) and the full Qwen3-dense test **184**
+(39.7 MB) — both also with 0 invalid accesses. OPT therefore retains FEWER pool
+blocks than the dense model that preceded it. Same class as the retained
+allocations already documented for the Qwen3-Coder gate.
+
+Both record checkers green.
 
 **NEXT.** SPEED is explicitly PENDING and nothing is claimed — the row stays
 `ACTIVE`, not `DONE`. Known structural gaps before a throughput run is worth

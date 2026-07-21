@@ -54,6 +54,8 @@
 #include <string>
 #include <type_traits>
 
+#include "vt/cuda/cuda_arch_tactics.h"
+#include "vt/cuda/cuda_device_caps.h"
 #include "vt/cuda/fp4_quant_fast.h"
 #include "vt/cuda/graph_safe_scratch.h"
 #include "vt/ops.h"
@@ -2632,22 +2634,91 @@ __global__ void MatmulNvfp4Fp4Native(Tout* out, const uint8_t* a_packed, const u
   if (r8 < M && c1 < N) Store(out, r8 * N + c1, alpha * d3);
 }
 
+// ── RUNTIME SM-DISPATCH TACTIC — the ONE tactic registered today ─────────────
+// BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #2 (.agents/specs/cuda-arch-additivity.md).
+// The native block-scaled fp4xfp4 path used to be reachable only through a bare
+// `#if defined(VT_FP4_MMA_SM120A)` inside LaunchFp4Fp4 — a COMPILE-time arch
+// assumption with no runtime check, so a fat binary that also targeted another
+// architecture would have entered this path on a device whose tensor cores do
+// not implement `mma.sync ... kind::mxf4nvf4`. It is now a registered tactic
+// with an explicit capability predicate, selected at launch time.
+//
+// ADDING AN ARCHITECTURE: write its kernel body in its OWN TU, give it a
+// `supports`/`launch` pair over the same Nvfp4Fp4MmaArgs, and call
+// RegisterArchTactic() from a static registrar there. Nothing in THIS file, and
+// nothing in LaunchFp4Fp4, changes. (Hopper wgmma / sm_100 tcgen05 bodies are a
+// separate, hardware-blocked kernel campaign — see the spec's Risks section.)
+#if defined(VT_FP4_MMA_SM120A)
+bool Sm12xFp4MmaSupports(const DeviceCaps& caps) {
+  // `mma.sync ... kind::mxf4nvf4` is consumer-Blackwell (sm_120/sm_121) only and
+  // is emitted only for the architecture-SPECIFIC 'a' target that the CMake
+  // `fp4-mma` FEATURE-TABLE row gates VT_FP4_MMA_SM120A on. The env A/B toggle
+  // stays INSIDE the predicate so VT_NVFP4_FP4_NATIVE keeps exactly its previous
+  // same-binary meaning (default OFF -> tactic not selected -> portable path).
+  return caps.valid && caps.sm_major == 12 && NativeFp4MmaEnabled();
+}
+
+bool Sm12xFp4MmaLaunch(const DeviceCaps&, void* args_v) {
+  const auto& a = *static_cast<const Nvfp4Fp4MmaArgs*>(args_v);
+  auto* s = static_cast<cudaStream_t>(a.stream);
+  const dim3 grid(static_cast<unsigned>((a.n + 7) / 8), static_cast<unsigned>((a.m + 15) / 16));
+  switch (a.out_dtype) {
+    case DType::kF32:
+      MatmulNvfp4Fp4Native<float><<<grid, 32, 0, s>>>(static_cast<float*>(a.out), a.a_packed,
+                                                      a.a_scale, a.b_packed, a.b_scale, a.alpha,
+                                                      a.m, a.n, a.k);
+      break;
+    case DType::kBF16:
+      MatmulNvfp4Fp4Native<__nv_bfloat16><<<grid, 32, 0, s>>>(
+          static_cast<__nv_bfloat16*>(a.out), a.a_packed, a.a_scale, a.b_packed, a.b_scale, a.alpha,
+          a.m, a.n, a.k);
+      break;
+    default:
+      return false;  // declined -> launcher keeps its portable path
+  }
+  Check(cudaGetLastError(), "matmul_nvfp4_fp4 kernel launch (native sm120a)");
+  return true;
+}
+#endif  // VT_FP4_MMA_SM120A
+
+// Table fill only — no CUDA API calls before main() (cuda_ops.cu discipline).
+struct Fp4MmaTacticRegistrar {
+  Fp4MmaTacticRegistrar() {
+#if defined(VT_FP4_MMA_SM120A)
+    RegisterArchTactic(
+        TacticFamily::kNvfp4Fp4Mma,
+        ArchTactic{"nvfp4-fp4-mma/sm12x", &Sm12xFp4MmaSupports, &Sm12xFp4MmaLaunch});
+#endif
+  }
+} fp4_mma_tactic_registrar;
+
 template <typename Tout>
-void LaunchFp4Fp4(cudaStream_t s, Tensor& out, const Tensor& a_packed, const Tensor& a_scale,
-                  const Tensor& b_packed, const Tensor& b_scale, float alpha, int64_t m, int64_t n,
-                  int64_t k) {
+void LaunchFp4Fp4(cudaStream_t s, const DeviceCaps& caps, Tensor& out, const Tensor& a_packed,
+                  const Tensor& a_scale, const Tensor& b_packed, const Tensor& b_scale, float alpha,
+                  int64_t m, int64_t n, int64_t k) {
   auto* ap = a_packed.Ptr<uint8_t>();
   auto* as = a_scale.Ptr<uint8_t>();
   auto* bp = b_packed.Ptr<uint8_t>();
   auto* bs = b_scale.Ptr<uint8_t>();
-#if defined(VT_FP4_MMA_SM120A)
-  if (NativeFp4MmaEnabled()) {
-    const dim3 grid(static_cast<unsigned>((n + 7) / 8), static_cast<unsigned>((m + 15) / 16));
-    MatmulNvfp4Fp4Native<Tout><<<grid, 32, 0, s>>>(out.Ptr<Tout>(), ap, as, bp, bs, alpha, m, n, k);
-    Check(cudaGetLastError(), "matmul_nvfp4_fp4 kernel launch (native sm120a)");
-    return;
+  // Runtime SM dispatch: ask the registry for a tactic that supports THIS device.
+  // With one registered tactic and GB10's sm_121 this reduces exactly to the old
+  // `#if VT_FP4_MMA_SM120A && NativeFp4MmaEnabled()` test — same kernel, same
+  // grid, same stream, bit-identical output.
+  if (const ArchTactic* tactic = SelectArchTactic(TacticFamily::kNvfp4Fp4Mma, caps)) {
+    Nvfp4Fp4MmaArgs args;
+    args.stream = s;
+    args.out = out.Ptr<Tout>();
+    args.out_dtype = out.dtype;
+    args.a_packed = ap;
+    args.a_scale = as;
+    args.b_packed = bp;
+    args.b_scale = bs;
+    args.alpha = alpha;
+    args.m = m;
+    args.n = n;
+    args.k = k;
+    if (tactic->launch(caps, &args)) return;
   }
-#endif
   if (m < kTileMinRows || !WmmaEnabled()) {
     constexpr int kBlock = 256;
     const dim3 grid(static_cast<unsigned>((n + kBlock - 1) / kBlock), static_cast<unsigned>(m));
@@ -2669,12 +2740,17 @@ void MatmulNvfp4Fp4KernelCuda(Queue& q, Tensor& out, const Tensor& a_packed, con
   const int64_t m = a_packed.shape[0], k = a_packed.shape[1] * 2, n = b_packed.shape[0];
   if (m == 0 || n == 0) return;
   cudaStream_t s = AsStream(q);
+  // The capability is resolved ONCE per process (cached probe) and threaded into
+  // the launcher — seam-gap #4: before this, the kernel layer had no access to
+  // the (major, minor) that only CudaPlatform knew.
+  const DeviceCaps& caps = GetDeviceCaps();
   switch (out.dtype) {
     case DType::kF32:
-      LaunchFp4Fp4<float>(s, out, a_packed, a_scale, b_packed, b_scale, alpha, m, n, k);
+      LaunchFp4Fp4<float>(s, caps, out, a_packed, a_scale, b_packed, b_scale, alpha, m, n, k);
       break;
     case DType::kBF16:
-      LaunchFp4Fp4<__nv_bfloat16>(s, out, a_packed, a_scale, b_packed, b_scale, alpha, m, n, k);
+      LaunchFp4Fp4<__nv_bfloat16>(s, caps, out, a_packed, a_scale, b_packed, b_scale, alpha, m, n,
+                                  k);
       break;
     default: VT_CHECK(false, "cuda matmul_nvfp4_fp4: unsupported out dtype (f32/bf16 only)");
   }

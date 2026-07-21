@@ -36,6 +36,10 @@
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"  // F8E4M3ToF32, kE2M1Lut
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vt/backend.h"
+#ifdef VLLM_CPP_CUDA
+#include "vt/cuda/cuda_arch_tactics.h"
+#include "vt/cuda/cuda_device_caps.h"
+#endif
 #include "vt/cuda/nvfp4_autotune.h"
 #include "vt/cuda/nvfp4_plan_cache.h"
 #include "vt/cuda/nvfp4_tactic_ids.h"
@@ -2456,3 +2460,112 @@ TEST_CASE("NVFP4 persistent runtime publishes only completed warmup") {
   backend.DestroyQueue(queue);
 }
 #endif  // VT_CUTLASS_NVFP4
+
+// ── BACKEND-CUDA-ARCH-ADDITIVITY: the runtime SM-dispatch seam is EXERCISED ──
+// A passing correctness gate does NOT prove a new code path ran (the W7 decode
+// graph taught us that: graph-ON and graph-OFF logs were byte-identical until a
+// stats counter proved capture happened). So this case asserts on the tactic
+// registry's OWN counters, which only move when SelectArchTactic actually runs:
+//
+//   * the capability probe (seam-gap #4) returns a REAL architecture, not zeros,
+//     and agrees with the backend's newly-carried DeviceCapabilityMajor/Minor;
+//   * exactly one tactic is registered for the nvfp4 fp4xfp4 family (seam-gap #2)
+//     — the additivity counter: it rises by one per architecture brought up;
+//   * with VT_NVFP4_FP4_NATIVE unset (the production default, the arm the gate
+//     models run) the launcher consults the registry, no tactic supports the
+//     device, and `fallbacks` advances -> the portable path ran, as before;
+//   * with VT_NVFP4_FP4_NATIVE=1 the sm_12x tactic IS selected on a sm_12x
+//     device and `selections` advances with `last_selected` naming it.
+// The A/B is same-binary.
+#ifdef VLLM_CPP_CUDA
+TEST_CASE("CUDA arch tactic registry is exercised by the fp4xfp4 launcher") {
+  if (!HasCuda()) return;
+  const vt::cuda::DeviceCaps& caps = vt::cuda::GetDeviceCaps();
+  REQUIRE(caps.valid);
+  CHECK(caps.sm_major > 0);
+  CHECK(caps.max_shared_memory_per_block_optin >= 48 * 1024);
+  CHECK(caps.multiprocessor_count > 0);
+
+  auto& b = vt::GetBackend(DeviceType::kCUDA);
+  // seam-gap #4: the kernel-layer backend now CARRIES the capability, from the
+  // same cached probe the platform seam reports.
+  CHECK(b.DeviceCapabilityMajor() == caps.sm_major);
+  CHECK(b.DeviceCapabilityMinor() == caps.sm_minor);
+
+  const int registered =
+      vt::cuda::RegisteredArchTacticCount(vt::cuda::TacticFamily::kNvfp4Fp4Mma);
+#ifdef VT_FP4_MMA_SM120A
+  CHECK(registered == 1);  // exactly the one tactic this change registers
+#else
+  CHECK(registered == 0);
+#endif
+
+  Queue gq = b.CreateQueue();
+  const int64_t M = 40, K = 128, N = 33;
+  std::mt19937 rng(11);
+  std::normal_distribution<float> nd(0.0F, 2.0F);
+  std::uniform_int_distribution<int> byte_d(0, 255);
+  std::uniform_real_distribution<float> scale_d(0.05F, 4.0F);
+  std::vector<float> x(static_cast<size_t>(M * K));
+  for (auto& v : x) v = nd(rng);
+  std::vector<uint8_t> w_packed(static_cast<size_t>(N * K / 2));
+  for (auto& v : w_packed) v = static_cast<uint8_t>(byte_d(rng));
+  std::vector<uint8_t> w_scale(static_cast<size_t>(N * K / 16));
+  for (auto& v : w_scale) v = vllm::F32ToF8E4M3(scale_d(rng));
+  const float input_global_scale = 8.2F, weight_global_scale = 5.5F;
+  const float alpha = (1.0F / input_global_scale) * (1.0F / weight_global_scale);
+
+  auto up = [&](const void* h, size_t nb) {
+    void* p = b.Alloc(nb);
+    b.Copy(gq, p, h, nb);
+    return p;
+  };
+  void* dx = up(x.data(), x.size() * sizeof(float));
+  void* dbp = up(w_packed.data(), w_packed.size());
+  void* dbs = up(w_scale.data(), w_scale.size());
+  void* dap = b.Alloc(static_cast<size_t>(M * K / 2));
+  void* das = b.Alloc(static_cast<size_t>(M * K / 16));
+  void* dout = b.Alloc(static_cast<size_t>(M * N) * sizeof(float));
+  Tensor tx = GpuTensor({M, K}); tx.data = dx; tx.dtype = DType::kF32; tx.device = Gpu();
+  Tensor tap = GpuTensor({M, K / 2}); tap.data = dap; tap.dtype = DType::kI8; tap.device = Gpu();
+  Tensor tas = GpuTensor({M, K / 16}); tas.data = das; tas.dtype = DType::kI8; tas.device = Gpu();
+  Tensor tbp = GpuTensor({N, K / 2}); tbp.data = dbp; tbp.dtype = DType::kI8; tbp.device = Gpu();
+  Tensor tbs = GpuTensor({N, K / 16}); tbs.data = dbs; tbs.dtype = DType::kI8; tbs.device = Gpu();
+  Tensor to = GpuTensor({M, N}); to.data = dout; to.dtype = DType::kF32; to.device = Gpu();
+  vt::ScaledFp4Quant(gq, tap, tas, tx, input_global_scale);
+
+  // ARM A — production default (VT_NVFP4_FP4_NATIVE unset).
+  const vt::cuda::ArchTacticStats before =
+      vt::cuda::GetArchTacticStats(vt::cuda::TacticFamily::kNvfp4Fp4Mma);
+  {
+    ScopedEnv off("VT_NVFP4_FP4_NATIVE", nullptr);
+    vt::MatmulNvfp4Fp4(gq, to, tap, tas, tbp, tbs, alpha);
+    b.Synchronize(gq);
+  }
+  const vt::cuda::ArchTacticStats after_default =
+      vt::cuda::GetArchTacticStats(vt::cuda::TacticFamily::kNvfp4Fp4Mma);
+  CHECK(after_default.fallbacks > before.fallbacks);     // the seam RAN
+  CHECK(after_default.selections == before.selections);  // and chose nothing
+
+#ifdef VT_FP4_MMA_SM120A
+  // ARM B — the sm_12x tactic is selected on a sm_12x device.
+  {
+    ScopedEnv on("VT_NVFP4_FP4_NATIVE", "1");
+    vt::MatmulNvfp4Fp4(gq, to, tap, tas, tbp, tbs, alpha);
+    b.Synchronize(gq);
+  }
+  const vt::cuda::ArchTacticStats after_native =
+      vt::cuda::GetArchTacticStats(vt::cuda::TacticFamily::kNvfp4Fp4Mma);
+  if (caps.sm_major == 12) {
+    CHECK(after_native.selections == after_default.selections + 1);
+    REQUIRE(after_native.last_selected != nullptr);
+    CHECK(std::string(after_native.last_selected) == "nvfp4-fp4-mma/sm12x");
+  } else {
+    CHECK(after_native.fallbacks > after_default.fallbacks);
+  }
+#endif  // VT_FP4_MMA_SM120A
+
+  for (void* p : {dx, dbp, dbs, dap, das, dout}) b.Free(p);
+  b.DestroyQueue(gq);
+}
+#endif  // VLLM_CPP_CUDA

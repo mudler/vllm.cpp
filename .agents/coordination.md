@@ -243,6 +243,8 @@ capture/replay-mode scope remains). `benchmark_binding=false`, no speed credit �
 payoff measured by the c2/c8 probe + the next authorized exact grid. Rescan §1
 items a-runner/b stay with the async/GDN `runner.cpp` owners.
 
+| `CLAIM-CUDA-ARCH-ADDITIVITY` | `BACKEND-CUDA-ARCH-ADDITIVITY` | Claude Code (opus-4-8) | worktree `agent-a19d3c1e79b99c4f9`; dgx scratch `~/work/vllm.cpp-arch-additivity` | worktree branch, base `c56ab28` | `cmake/CudaArchFeatures.cmake`, the CUDA block of `CMakeLists.txt`, `src/vt/cuda/cuda_device_caps.h`, `src/vt/cuda/cuda_arch_tactics.{h,cu}`, the `LaunchFp4Fp4` seam in `src/vt/cuda/cuda_matmul_nvfp4.cu`, the smem opt-in helper in `src/vt/cuda/cuda_paged_attn.cu`, the capability virtuals in `include/vt/backend.h`, the registrar in `src/vt/cuda/cuda_backend.cu`, `tests/vt/test_cuda_backend.cpp`, `tests/vt/test_ops_nvfp4_fp4.cpp`, `.agents/specs/cuda-arch-additivity.md` | `IMPLEMENTED` — the four §A.2 seam-gaps landed, behavior-preserving on GB10 by construction; ONE tactic registered. Per-source gencode narrowing and every cross-family tactic body remain HW-blocked (`ROAD-V1-D1`). Does NOT move any arch off `INVENTORIED`. | 2026-07-21 |
+
 ## Handoff queue
 
 | Priority | Row/block | Dependency | Next handoff | State |

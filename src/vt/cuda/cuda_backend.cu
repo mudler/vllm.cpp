@@ -10,6 +10,7 @@
 #include <string>
 
 #include "vt/backend.h"
+#include "vt/cuda/cuda_device_caps.h"
 #ifdef VT_BENCH_PROFILE_CONTROL
 #include "vt/cuda/cuda_profiler_control.h"
 #endif
@@ -54,8 +55,20 @@ class CudaBackend final : public Backend {
  public:
   // Non-throwing by design: constructed during static init by the registrar,
   // which probes device presence and attributes itself beforehand.
-  CudaBackend(int device, bool unified_memory) noexcept
-      : device_(device), unified_memory_(unified_memory) {}
+  CudaBackend(int device, bool unified_memory, int sm_major, int sm_minor) noexcept
+      : device_(device),
+        unified_memory_(unified_memory),
+        sm_major_(sm_major),
+        sm_minor_(sm_minor) {}
+
+  // BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #4: the kernel-layer backend now
+  // CARRIES the compute capability. It used to hold none, so the authoritative
+  // (major, minor) — probed on the engine side by CudaPlatform
+  // (src/vllm/platforms/cuda.cpp:88-91) — was invisible below vt::. Both sides
+  // now read the SAME cached probe (vt/cuda/cuda_device_caps.h), so there is one
+  // source of truth and a runtime tactic selector has something to select on.
+  int DeviceCapabilityMajor() const override { return sm_major_; }
+  int DeviceCapabilityMinor() const override { return sm_minor_; }
 
   // cudaMalloc returns allocations aligned to at least 256 bytes, which
   // satisfies the >=64B contract on Backend::Alloc (StepArena depends on it).
@@ -245,6 +258,8 @@ class CudaBackend final : public Backend {
  private:
   int device_ = 0;
   bool unified_memory_ = false;
+  int sm_major_ = 0;
+  int sm_minor_ = 0;
   cudaGraphExec_t exec_ = nullptr;  // last instantiated captured graph
 };
 
@@ -256,18 +271,19 @@ struct Registrar {
   Registrar() noexcept {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) return;
-    // PageableMemoryAccess alone means the driver can service ordinary host
-    // pointers through HMM/UVM. Discrete Blackwell reports it too; that does
-    // not make pageable system RAM equivalent to device-local memory. Require
-    // an integrated GPU as well before exposing the zero-copy contract used by
-    // DeviceScratch and the persistent KV/GDN caches.
-    int pageable = 0;
-    int integrated = 0;
-    if (cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, 0) != cudaSuccess) {
-      return;
-    }
-    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0) != cudaSuccess) return;
-    static CudaBackend backend(0, pageable != 0 && integrated != 0);  // device 0 only for now
+    // ONE device probe for the whole kernel layer (seam-gap #4): the residency
+    // attributes this registrar always needed AND the compute capability it
+    // never carried, cached together in vt/cuda/cuda_device_caps.h. The
+    // residency semantics are unchanged: PageableMemoryAccess alone means the
+    // driver can service ordinary host pointers through HMM/UVM, and discrete
+    // Blackwell reports it too — that does not make pageable system RAM
+    // equivalent to device-local memory, so an integrated GPU is still required
+    // before exposing the zero-copy contract used by DeviceScratch and the
+    // persistent KV/GDN caches.
+    const DeviceCaps& caps = GetDeviceCaps(0);  // device 0 only for now
+    if (!caps.valid) return;
+    static CudaBackend backend(0, caps.pageable_memory_access && caps.integrated, caps.sm_major,
+                               caps.sm_minor);
     RegisterBackend(DeviceType::kCUDA, &backend);
   }
 } registrar;

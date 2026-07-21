@@ -171,3 +171,31 @@ TEST_CASE("CUDA backend: unified-memory flag report") {
   CHECK(cuda.UnifiedMemory() == (pageable != 0 && integrated != 0));
 #endif
 }
+
+// BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #4: the CUDA backend now carries the
+// compute capability, so the kernel layer can dispatch per architecture instead
+// of baking sm_121a in at compile time. Before this change the vt:: backend had
+// no SM state at all — the authoritative (major, minor) lived only on the
+// engine-side CudaPlatform (src/vllm/platforms/cuda.cpp:88-91). Assert the
+// backend reports exactly what the driver reports, so a zeroed/never-probed
+// capability can never pass silently.
+TEST_CASE("CUDA backend reports the device compute capability") {
+#ifndef VLLM_CPP_CUDA
+  MESSAGE("CUDA support not built; skipping");
+  CHECK(true);
+#else
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend registered; skipping");
+    return;
+  }
+  Backend& cuda = vt::GetBackend(DeviceType::kCUDA);
+  int major = 0;
+  int minor = 0;
+  REQUIRE(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) == cudaSuccess);
+  REQUIRE(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0) == cudaSuccess);
+  MESSAGE("CUDA compute capability: sm_" << major << minor);
+  CHECK(major > 0);
+  CHECK(cuda.DeviceCapabilityMajor() == major);
+  CHECK(cuda.DeviceCapabilityMinor() == minor);
+#endif
+}

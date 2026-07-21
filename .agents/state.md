@@ -15277,3 +15277,56 @@ result implies 27B/35B support.
 **GATES.** dgx CUDA `-Werror` **0-warn** (clean full rebuild); on the FINAL binary `test_qwen3coder_paged_engine` **6/6** graph-ON and **6/6** graph-OFF, `test_ops_moe_grouped_bf16` **7/7**, NVFP4 `test_ops_moe_grouped` **9/9**, `test_qwen3_moe_forward` **3/3**, `test_decode_graph_sizes` + Qwen3-dense `test_qwen3_paged_engine` green; **27B 235/235 + 35B 315/315 UNCHANGED**; `compute-sanitizer memcheck` **0 errors** on the runner decode path (`test_runner` 14/14), the engine path (`test_llm_engine` 5/5) AND the full Coder decode-graph gate.
 
 **NEXT.** To close the row to `DONE`: (i) a CPU-side profile of the engine's per-step host bookkeeping at c1 (the last ~2.7 ms/step = the whole c1 deficit), (ii) the non-MoE prefill glue at c2 (TTFT + the throughput cell that follows), (iii) optionally the dual-operand w13 fusion. Rollback: `VLLM_CPP_CUDAGRAPH=0` or `VT_QWEN3MOE_CUDAGRAPH=0`; `VT_DECODE_GRAPH_STATS=1` prints each capture. Committed on the worktree branch (base `a63c497`); NOT pushed.
+
+## 2026-07-21 — `BACKEND-CUDA-ARCH-ADDITIVITY`: the CUDA-arch expansion framework is now ADDITIVE (mechanism only, no new support)
+
+Base `c56ab28`, worktree `agent-a19d3c1e79b99c4f9`, claim `CLAIM-CUDA-ARCH-ADDITIVITY`.
+Executes the four seam-gaps the completed audit already named
+([breadth-sweep-plan](specs/breadth-sweep-plan.md) §A.2) — no re-audit.
+Full detail: [cuda-arch-additivity spike](specs/cuda-arch-additivity.md).
+
+**WHAT LANDED.** **#1** the four hardcoded `MATCHES "12[01]a"` CMake guards became
+a per-arch **FEATURE TABLE** (`cmake/CudaArchFeatures.cmake`; `cuda_archs_loose_intersection()`
+is a 1:1 port of vLLM `cmake/utils.cmake:376-485`, the `<F>_ARCHS` gating idiom mirrors
+vLLM `CMakeLists.txt:949-953,963 / :775-787 / :556-558`). **#4** one cached device probe
+(`cuda_device_caps.h`) threaded to the kernel layer, and the CUDA backend now CARRIES the
+capability via new `vt::Backend::DeviceCapabilityMajor/Minor()`. **#2** a runtime SM-dispatch
+tactic registry (`cuda_arch_tactics.{h,cu}`); `LaunchFp4Fp4` takes the capability and selects,
+with **exactly ONE tactic registered** (the pre-existing `sm_12x` fp4 path). **#3** the paged-attn
+opt-in shared-memory ceiling is the **queried** `cudaDevAttrMaxSharedMemoryPerBlockOptin`
+(cached) instead of a hardcoded GB10 comment-assumption; the `d==256` shape gate is untouched.
+
+**AUDIT CLAIM CORRECTED (measured, not assumed).** §A.2's specific claim that adding `90a`
+"silently disables fp4/fp8-cutlass/Marlin for *all* archs" is **FALSE** — `MATCHES` is a
+substring search, so `"90a;121a"` still matched. Verified with `cmake -P` BEFORE implementing.
+The real defects: no per-arch resolution and no auditable report; a genuine SILENT capability
+drop on the legitimate spellings `"121"` and `"12.1a"`; no enforcement that the load-bearing `a`
+target was requested; and no place to declare arch support. All four are fixed.
+
+**GATES (dgx GB10, `git archive` transfer NOT rsync, clean build, FINAL binary).** CUDA
+`-Werror` 33 CUDA objects **0 warnings / 0 errors**. Goldens md5 IDENTICAL before AND after
+(`b2590d2b417a03fa9f8f494d0847e638`, 442 files). **27B 235/235 + 35B 315/315 + Qwen3-Coder
+138/138 assertions — ALL UNCHANGED.** `test_ops_nvfp4_fp4` 28/28, `test_ops_fp8_cutlass` 6/6,
+`test_ops_moe_grouped` 9/9, `test_ops_moe_grouped_bf16` 7/7, `test_ops_paged_attn` 24/24,
+`test_cuda_backend` 6/6. memcheck 0 errors on the 27B engine path. Both record checkers green.
+
+**GAP #1 CONFIGURE EVIDENCE.** `-DVLLM_CPP_CUDA_ARCHITECTURES="90a;121a"` →
+`fp4-mma / cutlass-nvfp4 / cutlass-fp8 / marlin-nvfp4 / fa2: ENABLED for [121a]`, each with a
+named WARNING that `90a` has no tactic. Single-arch `121a` → all five ENABLED, no warning,
+identical feature set to before.
+
+**SEAM-EXERCISED EVIDENCE** (a passing gate does not prove a new path ran — the W7 lesson):
+same-binary A/B on the registry's own counters. Production default → `fallbacks 0->1,
+selections 0->0` (consulted, portable path ran, as before). `VT_NVFP4_FP4_NATIVE=1` →
+`selections 0->1`, `last_selected == "nvfp4-fp4-mma/sm12x"`. `VT_ARCH_TACTIC_STATS=1` prints
+`family=nvfp4-fp4-mma sm=12.1 registered=1` — the capability probe resolved a REAL arch at the
+kernel layer. `benchmark_binding=false`, no speed credit.
+
+**HONEST RESIDUAL / NEXT.** ONE tactic is registered and **no architecture moved off
+`INVENTORIED`** — this makes expansion mechanical, it does not confer support. A heterogeneous
+fat build still cannot COMPILE (sources compile for the whole arch list); that is now a LOUD
+failure rather than a silent capability drop. Closing it needs (i) per-source gencode narrowing
+(vLLM `cmake/utils.cmake:265-345`, which requires target-level `CUDA_ARCHITECTURES OFF` — CMake
+has no per-source equivalent) and (ii) the per-arch kernel bodies (Hopper wgmma / sm_100
+tcgen05). Both are **HW-BLOCKED**: dgx has no sm_90/sm_100/sm_80 board. Cross-family bring-up
+remains a kernel campaign, not an additive drop-in. Committed on the worktree branch; NOT pushed.

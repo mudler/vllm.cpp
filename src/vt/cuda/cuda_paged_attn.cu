@@ -37,6 +37,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "vt/cuda/cuda_device_caps.h"
 #include "vt/ops.h"
 
 namespace vt::cuda {
@@ -90,6 +91,40 @@ void Check(cudaError_t err, const char* what) {
 }
 
 cudaStream_t AsStream(const Queue& q) { return static_cast<cudaStream_t>(q.handle); }
+
+// Opt a kernel into more dynamic shared memory than the 48 KiB every CUDA
+// architecture guarantees without an opt-in.
+//
+// BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #3 (.agents/specs/cuda-arch-additivity.md):
+// the opt-in CEILING used to be a hardcoded GB10 assumption living in comments
+// ("GB10/sm_121 caps opt-in shared at ~99 KiB") with nothing in the code
+// actually checking it — a kernel whose tile did not fit would fail deep inside
+// cudaFuncSetAttribute with an opaque `invalid argument`. It is now the QUERIED
+// `cudaDevAttrMaxSharedMemoryPerBlockOptin`, cached once per device in
+// vt/cuda/cuda_device_caps.h — never re-queried per launch, since an attribute
+// query is a driver round-trip on the attention hot path.
+//
+// BEHAVIOR ON GB10 IS UNCHANGED: the queried ceiling is 101376 B and every tile
+// the WMMA ladder selects (the largest is the QG=2 flash2vec shape at ~83 KiB)
+// already fits, so this takes the same branch and makes the same call as before.
+// On an architecture with a smaller ceiling it turns a cryptic driver error into
+// a diagnosis that names the device and the shortfall.
+void SetDynamicSmemOptIn(const void* kernel, size_t bytes, const char* what) {
+  if (bytes <= 48u * 1024u) return;  // guaranteed everywhere; no opt-in needed
+  if (!DynamicSmemFits(static_cast<long long>(bytes))) {
+    const DeviceCaps& caps = GetDeviceCaps();
+    throw std::runtime_error(
+        std::string("vt cuda: ") + what + ": kernel needs " + std::to_string(bytes) +
+        " B of dynamic shared memory, but sm_" + std::to_string(caps.sm_arch()) +
+        " caps opt-in shared memory at " +
+        std::to_string(caps.max_shared_memory_per_block_optin) +
+        " B; this shape needs an architecture-specific tile (see "
+        ".agents/specs/cuda-arch-additivity.md)");
+  }
+  Check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(bytes)),
+        what);
+}
 
 __device__ inline float Load(const float* p, int64_t i) { return p[i]; }
 __device__ inline float Load(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
@@ -867,10 +902,15 @@ __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_ca
 //
 // Why QG=2 and not the full qpk=8: online softmax must keep each q-head's f32 O
 // accumulator [16,d] resident across the whole key-tile loop (it is updated per
-// tile). At d=256 that is 16 KiB per head. GB10/sm_121 caps opt-in shared at
-// ~99 KiB/block (cudaDevAttrMaxSharedMemoryPerBlockOptin=101376), so 8 O buffers
-// (128 KiB) alone exceed the ceiling — full 8x reuse is physically impossible on
-// this GPU. QG=2 (BN=32) fits at ~83 KiB and halves the redundant K/V traffic;
+// tile). At d=256 that is 16 KiB per head. The opt-in shared-memory ceiling is
+// QUERIED, not assumed — cudaDevAttrMaxSharedMemoryPerBlockOptin, cached in
+// vt/cuda/cuda_device_caps.h and enforced by SetDynamicSmemOptIn above; GB10/
+// sm_121 measures 101376 B (~99 KiB/block), so 8 O buffers (128 KiB) alone
+// exceed the ceiling — full 8x reuse is physically impossible on this GPU. The
+// QG below is still a COMPILE-time constant tuned to that measured ceiling: an
+// architecture with a materially different budget wants its own tile choice,
+// which is a per-arch tactic (cuda_arch_tactics.h), not a constant to retune
+// here. QG=2 (BN=32) fits at ~83 KiB and halves the redundant K/V traffic;
 // per-head Q is kept resident (no per-tile Q re-read). Ssm/Pb are single buffers
 // reused per head in the inner loop. All QK^T/softmax/P·V math is byte-identical
 // to PagedFlashWmmaKernel — only the K/V staging is shared across QG heads.
@@ -1909,12 +1949,8 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
       auto* gkernel = args.window_size.has_value()
                           ? PagedAttentionDecodeGqaKernel<TQ, TKV, Tout, QG, true>
                           : PagedAttentionDecodeGqaKernel<TQ, TKV, Tout, QG, false>;
-      if (gshmem > 48u * 1024u) {
-        Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(gkernel),
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   static_cast<int>(gshmem)),
-              "paged decode-gqa smem opt-in");
-      }
+      SetDynamicSmemOptIn(reinterpret_cast<const void*>(gkernel), gshmem,
+                          "paged decode-gqa smem opt-in");
       const dim3 gqa_grid(static_cast<unsigned>(num_tokens),
                           static_cast<unsigned>(num_kv_heads));
       gkernel<<<gqa_grid, gblock, gshmem, s>>>(
@@ -2068,12 +2104,7 @@ void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const 
   auto* kernel = args.window_size.has_value()
                      ? PagedFlashKernel<TQ, TKV, Tout, true>
                      : PagedFlashKernel<TQ, TKV, Tout, false>;
-  if (shmem > 48u * 1024u) {
-    Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
-                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(shmem)),
-          "paged flash smem opt-in");
-  }
+  SetDynamicSmemOptIn(reinterpret_cast<const void*>(kernel), shmem, "paged flash smem opt-in");
   const dim3 grid(static_cast<unsigned>(num_tiles), static_cast<unsigned>(hq));
   const dim3 block(32, kBM);
   kernel<<<grid, block, shmem, s>>>(
@@ -2108,12 +2139,7 @@ void LaunchPrefillWmma(cudaStream_t s, Tensor& out, const Tensor& query, const T
   auto* kernel = args.window_size.has_value()
                      ? PagedFlashWmmaKernel<TQ, TKV, Tout, true>
                      : PagedFlashWmmaKernel<TQ, TKV, Tout, false>;
-  if (shmem > 48u * 1024u) {
-    Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
-                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(shmem)),
-          "paged wmma smem opt-in");
-  }
+  SetDynamicSmemOptIn(reinterpret_cast<const void*>(kernel), shmem, "paged wmma smem opt-in");
   const dim3 grid(static_cast<unsigned>(num_tiles), static_cast<unsigned>(hq));
   const dim3 block(32 * kWmmaWarps);
   kernel<<<grid, block, shmem, s>>>(
@@ -2151,12 +2177,7 @@ void LaunchPrefillWmmaGqa(cudaStream_t s, Tensor& out, const Tensor& query, cons
   auto* kernel = args.window_size.has_value()
                      ? PagedFlashWmmaGqaKernel<TQ, TKV, Tout, QG, true>
                      : PagedFlashWmmaGqaKernel<TQ, TKV, Tout, QG, false>;
-  if (shmem > 48u * 1024u) {
-    Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
-                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(shmem)),
-          "paged wmma-gqa smem opt-in");
-  }
+  SetDynamicSmemOptIn(reinterpret_cast<const void*>(kernel), shmem, "paged wmma-gqa smem opt-in");
   const int num_groups = static_cast<int>(hq) / QG;
   const dim3 grid(static_cast<unsigned>(num_tiles), static_cast<unsigned>(num_groups));
   const dim3 block(32 * kWmmaWarps);
@@ -2198,12 +2219,8 @@ void LaunchPrefillWmmaGqaFlash2(cudaStream_t s, Tensor& out, const Tensor& query
   auto* kernel = args.window_size.has_value()
                      ? PagedFlashWmmaGqaFlash2Kernel<TQ, TKV, Tout, QG, true>
                      : PagedFlashWmmaGqaFlash2Kernel<TQ, TKV, Tout, QG, false>;
-  if (shmem > 48u * 1024u) {
-    Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
-                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(shmem)),
-          "paged wmma-flash2 smem opt-in");
-  }
+  SetDynamicSmemOptIn(reinterpret_cast<const void*>(kernel), shmem,
+                      "paged wmma-flash2 smem opt-in");
   const int num_groups = static_cast<int>(hq) / QG;
   const dim3 grid(static_cast<unsigned>(num_tiles), static_cast<unsigned>(num_groups));
   const dim3 block(32 * kWmmaWarps);
@@ -2243,12 +2260,8 @@ void LaunchPrefillWmmaGqaFlash2Vec(cudaStream_t s, Tensor& out, const Tensor& qu
   auto* kernel = args.window_size.has_value()
                      ? PagedFlashWmmaGqaFlash2VecKernel<TQ, TKV, Tout, QG, true>
                      : PagedFlashWmmaGqaFlash2VecKernel<TQ, TKV, Tout, QG, false>;
-  if (shmem > 48u * 1024u) {
-    Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
-                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(shmem)),
-          "paged wmma-flash2vec smem opt-in");
-  }
+  SetDynamicSmemOptIn(reinterpret_cast<const void*>(kernel), shmem,
+                      "paged wmma-flash2vec smem opt-in");
   const int num_groups = static_cast<int>(hq) / QG;
   const dim3 grid(static_cast<unsigned>(num_tiles), static_cast<unsigned>(num_groups));
   const dim3 block(32 * kWmmaWarps);
@@ -2289,12 +2302,8 @@ void LaunchPrefillWmmaGqaFlash2VecBM(cudaStream_t s, Tensor& out, const Tensor& 
   auto* kernel = args.window_size.has_value()
                      ? PagedFlashWmmaGqaFlash2VecBMKernel<TQ, TKV, Tout, QG, MT, true>
                      : PagedFlashWmmaGqaFlash2VecBMKernel<TQ, TKV, Tout, QG, MT, false>;
-  if (shmem > 48u * 1024u) {
-    Check(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
-                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                               static_cast<int>(shmem)),
-          "paged wmma-flash2vec-bm smem opt-in");
-  }
+  SetDynamicSmemOptIn(reinterpret_cast<const void*>(kernel), shmem,
+                      "paged wmma-flash2vec-bm smem opt-in");
   const int num_groups = static_cast<int>(hq) / QG;
   const dim3 grid(static_cast<unsigned>(num_tiles), static_cast<unsigned>(num_groups));
   const dim3 block(32 * kWmmaWarps);
@@ -2398,9 +2407,11 @@ int PrefillBM() {
 
 // GQA reuse group size: how many consecutive q-heads share one staged K/V tile.
 // Must divide qpk = hq/num_kv_heads. Bounded by shared memory: at d=256 each
-// head's f32 O accumulator is 16 KiB, and GB10/sm_121 caps opt-in shared at
-// ~99 KiB/block, so QG=2 (~83 KiB) is the largest that fits with a full BN=32
-// K/V tile. See PagedFlashWmmaGqaKernel header.
+// head's f32 O accumulator is 16 KiB, and the device's QUERIED opt-in ceiling
+// (cudaDevAttrMaxSharedMemoryPerBlockOptin; 101376 B ~ 99 KiB/block on GB10/
+// sm_121) leaves QG=2 (~83 KiB) as the largest that fits with a full BN=32 K/V
+// tile. SetDynamicSmemOptIn enforces the queried ceiling at launch. See
+// PagedFlashWmmaGqaKernel header.
 constexpr int kGqaQG = 2;
 
 // Select the Flash2Vec prefill kernel by VT_ATTN_PREFILL_BM (see PrefillBM()).

@@ -44,6 +44,19 @@ class Backend {
   // True when host and device share one memory space (CPU, GB10, Apple).
   virtual bool UnifiedMemory() const = 0;
 
+  // --- Device compute capability (BACKEND-CUDA-ARCH-ADDITIVITY seam-gap #4) ---
+  // The architecture the backend is actually running on, as the familiar
+  // `(major, minor)` pair (GB10/sm_121 -> {12, 1}). Before this, the capability
+  // existed ONLY on the engine-side Platform seam
+  // (src/vllm/platforms/cuda.cpp:88-91) and the kernel layer could not see it,
+  // so no host launcher could dispatch per architecture. `{0, 0}` means "no
+  // meaningful compute capability" and is the default for backends where the
+  // notion does not apply (CPU). Mirrors vLLM's
+  // `Platform.get_device_capability()` (vllm/platforms/cuda.py @ e24d1b24),
+  // which likewise exposes one cached probe to everything downstream.
+  virtual int DeviceCapabilityMajor() const { return 0; }
+  virtual int DeviceCapabilityMinor() const { return 0; }
+
   // --- Async-output primitives (ENG-ASYNC-SCHED W3, async_utils.py:12-70) ------
   // The sampler-output overlap needs (a) page-locked host memory a copy engine
   // can DMA into without a staging bounce and (b) cross-stream events so a copy

@@ -1366,6 +1366,27 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **CUDA-arch additivity seams — per-arch build feature table, capability
+  threading, runtime SM-dispatch registry, queried smem ceiling (2026-07-21,
+  `BACKEND-CUDA-ARCH-ADDITIVITY`, `CLAIM-CUDA-ARCH-ADDITIVITY`).**
+  `benchmark_binding=false`; **NOT APPLICABLE, and deliberately so.** This is a
+  structural/mechanical change with no new kernel, no numerics change and no
+  dispatch change on GB10: exactly ONE tactic is registered (the pre-existing
+  `sm_12x` native fp4 path, still behind its default-OFF `VT_NVFP4_FP4_NATIVE`
+  toggle), so on the gate models the new selector chooses nothing and the same
+  portable kernels run as before, bit-identically. The only per-launch cost added
+  is one cached-struct read plus a predicate over an 8-entry table, on a path the
+  gate models do not take. **No speed credit is taken and no binding number is
+  re-based.** The gate is behavior PRESERVATION, verified on the final binary:
+  27B `test_qwen27_paged_engine` 235/235, 35B `test_qwen36_paged_engine` 315/315,
+  Qwen3-Coder `test_qwen3coder_paged_engine` 6/6 — all UNCHANGED — plus the
+  configure-level multi-arch evidence and the tactic-registry counters that prove
+  the new seam actually executed. Reproduce:
+  `cmake -S . -B build -DVLLM_CPP_CUDA_ARCHITECTURES="90a;121a"` (configure only)
+  for the feature report, and `VT_ARCH_TACTIC_STATS=1 ./tests/test_ops_nvfp4_fp4`
+  for the selection signal. Detail: [arch additivity
+  spike](../.agents/specs/cuda-arch-additivity.md).
+
 - **Sweep model #1 W0-W3 — Qwen3-Coder-30B-A3B (`Qwen3MoeForCausalLM`) registry
   stub + reusable-piece refactors + BF16 loader + forward (2026-07-21,
   `CLAIM-MODEL-QWEN3-CODER`).** Infrastructure + behaviour-preserving refactors +

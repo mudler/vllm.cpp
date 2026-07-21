@@ -180,7 +180,10 @@ same bar: token-exact vs vLLM (near-tie-robust where vLLM's own greedy is self-i
 vLLM-speed on every axis. Ranked queue + the CUDA-arch additivity audit:
 [`.agents/specs/breadth-sweep-plan.md`](.agents/specs/breadth-sweep-plan.md). Note: adding a new
 CUDA *arch* beyond the same-family sm_120 is HW-blocked (only GB10 sm_121 is testable here), so the
-actionable sweep is model breadth on GB10; Metal/Intel/Vulkan/CPU follow.
+actionable sweep is model breadth on GB10; Metal/Intel/Vulkan/CPU follow. The audit's four
+CUDA-arch seam-gaps are now CLOSED as mechanism (see Acceleration below,
+[spike](.agents/specs/cuda-arch-additivity.md)) — expansion is additive, but validation of any
+non-sm_121 target remains hardware-blocked.
 
 ## Acceleration
 
@@ -188,7 +191,7 @@ actionable sweep is model breadth on GB10; Metal/Intel/Vulkan/CPU follow.
 |---|---|---|
 | CPU | x86-64 reference | 🟡 Correctness/CI implementation with native threadpool; real-file GGUF speed/RSS and compute-in-quant gates remain open |
 | CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance is `GATING` at **49/124** (new binding `246a23c`; memory + c1 + TTFT clean, decode c2–c32 open). Packed GDN decode is **CLOSED on equivalence** (`KERNEL-GDN-PACKED-DECODE` `DONE`): the c16 slot defect was fixed test-first (request-identity keying) and proven at `c172336`, and W1D3/G3 closed over eight seals + the 8-pair A/B (−0.205% ± 0.30, <1σ) + a trace showing packed is GPU-cheaper. qkvz DGX gates closed green at `45f9e6d` and ride this binding |
-| Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet fully built, traced, or gated here |
+| Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet built, traced, or gated here. The **expansion framework is now additive** (2026-07-21, see below) — adding one is a table row + a tactic registration rather than a scattered multi-file edit — but no architecture has moved off `INVENTORIED`, because none can be executed on this hardware |
 | ROCm / Intel XPU | AMD / Intel GPUs | 🗓 Post-parity roadmap |
 | Metal / ANE | Apple Silicon | 🗓 Post-parity roadmap; M4 bring-up host available |
 | Vulkan | Portable GPU | 🗓 Post-parity roadmap |
@@ -196,6 +199,28 @@ actionable sweep is model breadth on GB10; Metal/Intel/Vulkan/CPU follow.
 Only GB10/sm_121a counts as CUDA hardware support today. Source-level fallback
 paths do not become support claims until their build, correctness, trace, and
 performance gates pass.
+
+**CUDA-arch expansion is now ADDITIVE — mechanism only, no new support
+(`BACKEND-CUDA-ARCH-ADDITIVITY`, LANDED + GATED 2026-07-21,
+[spike](.agents/specs/cuda-arch-additivity.md)).** The four seam-gaps the
+breadth-sweep audit named are closed: (1) the four hardcoded
+`MATCHES "12[01]a"` CMake guards became a **per-arch FEATURE TABLE**
+([`cmake/CudaArchFeatures.cmake`](cmake/CudaArchFeatures.cmake), a 1:1 port of
+vLLM's `cuda_archs_loose_intersection`, `cmake/utils.cmake:376-485`) that
+resolves each capability against the requested target list and REPORTS the
+result, so a multi-arch build can no longer silently drop fp4 / cutlass-nvfp4 /
+cutlass-fp8 / Marlin / FA2; (2) the device capability is probed once, cached,
+threaded into the kernel layer and **carried by the CUDA backend** (it previously
+existed only on the engine-side Platform seam); (3) host launchers now select a
+**runtime tactic** from a registration point, so a future architecture ADDS a
+tactic instead of editing the launcher; (4) the opt-in shared-memory ceiling in
+paged attention is the **queried** `cudaDevAttrMaxSharedMemoryPerBlockOptin`
+rather than a hardcoded GB10 assumption. **This is behavior-preserving by
+construction and confers no support:** exactly ONE tactic is registered (the
+existing `sm_12x` fp4 path), GB10 output is bit-identical, and no architecture
+moved off `INVENTORIED`. Building a genuinely heterogeneous fat binary still
+needs per-source gencode narrowing plus the per-arch kernel bodies — that
+remains a **hardware-blocked kernel campaign, not an additive drop-in**.
 
 **Extensibility — the Platform seam is extracted + DGX-confirmed (2026-07-18).** vLLM's
 `platforms/interface.py` capability seam is now mirrored 1:1 in C++

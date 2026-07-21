@@ -65,10 +65,27 @@ if(VLLM_CPP_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 20)
   set(CMAKE_CUDA_ARCHITECTURES ${VLLM_CPP_CUDA_ARCHITECTURES})
+  # Per-arch capability resolution (BACKEND-CUDA-ARCH-ADDITIVITY). Every
+  # arch-gated feature below asks the FEATURE TABLE instead of regex-matching the
+  # whole arch list, so adding an architecture cannot silently disable fp4 /
+  # cutlass-nvfp4 / cutlass-fp8 / Marlin / FA2 for the archs that DO support them.
+  # Mirrors vLLM's cuda_archs_loose_intersection idiom; see the module header.
+  include(cmake/CudaArchFeatures.cmake)
+  message(STATUS "CUDA target architectures: ${VLLM_CPP_CUDA_ARCHITECTURES}")
+  vt_cuda_feature_archs(VT_FP4_MMA_ARCHS       "fp4-mma")
+  vt_cuda_feature_archs(VT_CUTLASS_NVFP4_ARCHS "cutlass-nvfp4")
+  vt_cuda_feature_archs(VT_CUTLASS_FP8_ARCHS   "cutlass-fp8")
+  vt_cuda_feature_archs(VT_MARLIN_NVFP4_ARCHS  "marlin-nvfp4")
+  vt_cuda_feature_archs(VT_FA2_ARCHS           "fa2")
+  vt_cuda_report_feature("fp4-mma"       "${VT_FP4_MMA_ARCHS}")
+  vt_cuda_report_feature("cutlass-nvfp4" "${VT_CUTLASS_NVFP4_ARCHS}")
+  vt_cuda_report_feature("cutlass-fp8"   "${VT_CUTLASS_FP8_ARCHS}")
+  vt_cuda_report_feature("marlin-nvfp4"  "${VT_MARLIN_NVFP4_ARCHS}")
+  vt_cuda_report_feature("fa2"           "${VT_FA2_ARCHS}")
   # The native block-scaled fp4xfp4 MMA (cuda_matmul_nvfp4.cu) needs the
   # architecture-specific sm_12xa target. Advertise it to the code so the host
   # launcher enables the native path only when it was actually compiled in.
-  if(VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a")
+  if(VT_FP4_MMA_ARCHS)
     add_compile_definitions(VT_FP4_MMA_SM120A=1)
   endif()
   # CUTLASS (header-only, >=v4.5.0) for the sm120a NVFP4 block-scaled fp4xfp4 GEMM
@@ -85,7 +102,7 @@ if(VLLM_CPP_CUDA)
   # v4.5.0 (header-only). Default OFF so a tight-disk box (dgx) builds against an
   # existing clone via -DVLLM_CPP_CUTLASS_DIR instead of a 200MB download.
   option(VLLM_CPP_CUTLASS_FETCH "FetchContent CUTLASS v4.5.0 if not found locally" OFF)
-  if(VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a"
+  if(VT_CUTLASS_NVFP4_ARCHS
      AND NOT EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h"
      AND VLLM_CPP_CUTLASS_FETCH)
     include(FetchContent)
@@ -94,7 +111,7 @@ if(VLLM_CPP_CUDA)
     FetchContent_MakeAvailable(cutlass)
     set(VLLM_CPP_CUTLASS_DIR "${cutlass_SOURCE_DIR}")
   endif()
-  if(VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a"
+  if(VT_CUTLASS_NVFP4_ARCHS
      AND EXISTS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h")
     file(STRINGS "${VLLM_CPP_CUTLASS_DIR}/include/cutlass/version.h"
       _CUTLASS_VERSION_LINES
@@ -134,7 +151,7 @@ if(VLLM_CPP_CUDA)
   # SASS). The two vendored TUs + the vt launcher are isolated with their own
   # compile options (see below); gated by VT_MARLIN_NVFP4.
   option(VLLM_CPP_MARLIN "Build the vendored Marlin NVFP4 W4A16 MoE GEMM (sm_12xa)" ON)
-  if(VLLM_CPP_MARLIN AND VLLM_CPP_CUDA_ARCHITECTURES MATCHES "12[01]a"
+  if(VLLM_CPP_MARLIN AND VT_MARLIN_NVFP4_ARCHS
      AND EXISTS "${CMAKE_SOURCE_DIR}/src/vt/cuda/marlin/core/scalar_type.hpp")
     set(VLLM_CPP_MARLIN ON)
     message(STATUS "Marlin NVFP4 W4A16 MoE GEMM enabled (vendored, sm_12xa)")
@@ -285,6 +302,7 @@ if(VLLM_CPP_CUDA)
   endif()
   target_sources(vllm PRIVATE
     src/vllm/platforms/cuda.cpp
+    src/vt/cuda/cuda_arch_tactics.cu
     src/vt/cuda/cuda_backend.cu
     src/vt/cuda/cuda_dropin.cu
     src/vt/cuda/cuda_matmul.cu
@@ -341,10 +359,21 @@ if(VLLM_CPP_CUDA)
         "${_NVFP4_CACHE_ABI_SOURCE}=${_NVFP4_CACHE_ABI_SHA};")
     endforeach()
     string(SHA256 _NVFP4_CACHE_BUILD_ID "${_NVFP4_CACHE_BUILD_INPUT}")
+    # cutlass-fp8 is its own FEATURE-TABLE row: its ArchTag=Sm120 scaled-mm has a
+    # different upstream arch set from the NVFP4 block-scaled collective (vLLM
+    # keeps them as separate SCALED_MM_ARCHS / FP4_SM120_ARCHS intersections), so
+    # it is resolved separately here rather than riding on the NVFP4 gate.
+    set(_FP8_CUTLASS_SOURCES)
+    if(VT_CUTLASS_FP8_ARCHS)
+      set(_FP8_CUTLASS_SOURCES src/vt/cuda/cuda_matmul_fp8_cutlass.cu)
+    endif()
     target_sources(vllm PRIVATE
       ${_NVFP4_CUTLASS_SOURCES}
-      src/vt/cuda/cuda_matmul_fp8_cutlass.cu)
-    target_compile_definitions(vllm PUBLIC VT_CUTLASS_NVFP4=1 VT_CUTLASS_FP8=1)
+      ${_FP8_CUTLASS_SOURCES})
+    target_compile_definitions(vllm PUBLIC VT_CUTLASS_NVFP4=1)
+    if(VT_CUTLASS_FP8_ARCHS)
+      target_compile_definitions(vllm PUBLIC VT_CUTLASS_FP8=1)
+    endif()
     target_compile_definitions(vllm PRIVATE
       VT_CUTLASS_VERSION_STRING="${_CUTLASS_MAJOR}.${_CUTLASS_MINOR}.${_CUTLASS_PATCH}"
       VT_NVFP4_CACHE_BUILD_ID="${_NVFP4_CACHE_BUILD_ID}")
@@ -353,7 +382,7 @@ if(VLLM_CPP_CUDA)
     # strict). --expt-relaxed-constexpr/--expt-extended-lambda: cutlass needs them.
     set_source_files_properties(
       ${_NVFP4_CUTLASS_SOURCES}
-      src/vt/cuda/cuda_matmul_fp8_cutlass.cu PROPERTIES
+      ${_FP8_CUTLASS_SOURCES} PROPERTIES
       COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--expt-extended-lambda;-isystem;${VLLM_CPP_CUTLASS_DIR}/include;-isystem;${VLLM_CPP_CUTLASS_DIR}/tools/util/include>")
     # Keep the split 32-tactic family on FlashInfer's semantic CUDA compile
@@ -609,7 +638,7 @@ if(VLLM_CPP_CUDA)
   # =0 restores its same-binary fallback). Prefill was validated token-for-token
   # + over the throughput bar on GB10 2026-07-10; ratio-6 decode remains GATING.
   option(VLLM_CPP_FLASH_ATTN "Build vendored FlashAttention-2 sm_121a prefill/decode kernels (needs CUTLASS)" ON)
-  if(VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS)
+  if(VLLM_CPP_FLASH_ATTN AND VLLM_CPP_CUTLASS AND VT_FA2_ARCHS)
     set(_FA2_ROOT "${CMAKE_SOURCE_DIR}/src/vt/cuda/flash_attn")
     set(_FA2_KERNEL_SRCS
       src/vt/cuda/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu

@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
@@ -87,6 +88,56 @@ class Qwen3MoeModel {
       const std::vector<PagedKvCache>& attn_kv, const Qwen3MoeWeights& weights,
       const HfConfig& config, vt::Queue& queue,
       const std::vector<int32_t>& logits_indices = {});
+};
+
+// BF16 full-attention-MoE decode CUDA-graph driver (W7) — the Qwen3-Coder sibling
+// of `Qwen3_5DecodeGraph` (35B hybrid MoE) and `Qwen3_5DenseDecodeGraph` (27B
+// dense), with the SAME cold -> warm -> capture -> replay state machine, the same
+// padded-batch capture set (`DecodeGraphSizes` / `PadToCaptureSize`, mirroring
+// vLLM `_set_cudagraph_sizes` reduced to the full-decode-cudagraph regime), and
+// the same persistent fixed-address host inputs + persistent embed/logits buffers.
+//
+// It differs from both siblings in exactly two ways: (a) there is NO GDN metadata
+// or state cache to pad/validate (Qwen3-Coder is pure full attention), so the
+// padded-input builder is attention-only; (b) the captured region is the BF16 MoE
+// forward (`RunMoeBlock` -> `MoeBlockBf16Cuda` -> `vt::MoeGroupedGemmBf16`), whose
+// per-call index scratch (`EnsureMoeScratch`) and split-K partials
+// (`EnsureMoePartials`) already follow the graph-safe retire-don't-free contract,
+// and whose per-layer expert device-pointer arrays are uploaded once at first
+// touch (the cold pre-warm step) so nothing dangles inside a captured graph.
+//
+// Ported from: vllm/v1/worker/gpu_model_runner.py::GPUModelRunner (the
+// capture/replay dispatch, `_dummy_run` warm-up then `capture_model`) +
+// vllm/compilation/cuda_graph.py (pad-to-nearest-captured-size dispatch) @
+// e24d1b24; in-repo template `Qwen3_5DecodeGraph` (qwen3_5.cpp).
+//
+// Enabled on CUDA when the backend supports capture; `VLLM_CPP_CUDAGRAPH=0`
+// (the framework-wide graph switch) or `VT_QWEN3MOE_CUDAGRAPH=0` rolls it back to
+// the eager forward for a same-binary A/B.
+class Qwen3MoeDecodeGraph {
+ public:
+  Qwen3MoeDecodeGraph(const Qwen3MoeWeights& weights, const HfConfig& config,
+                      vt::Queue queue, int64_t max_num_reqs);
+  ~Qwen3MoeDecodeGraph();
+  Qwen3MoeDecodeGraph(const Qwen3MoeDecodeGraph&) = delete;
+  Qwen3MoeDecodeGraph& operator=(const Qwen3MoeDecodeGraph&) = delete;
+
+  // ONE pure-decode step for `token_ids.size()` requests (one token each). Pads
+  // to the nearest captured size, replays that size's graph and returns a
+  // NON-OWNING device view over the first B (real) rows of the slot's persistent
+  // [S, vocab] f32 logits. Falls back to the eager forward (owning logits) when
+  // graphs are disabled or the batch exceeds the capture set.
+  ForwardLogits Step(const std::vector<int32_t>& token_ids,
+                     const std::vector<int32_t>& positions,
+                     const v1::CommonAttentionMetadata& attn_meta,
+                     const std::vector<PagedKvCache>& attn_kv);
+
+  bool captured() const;        // diagnostics: at least one live graph
+  int64_t replay_count() const;  // diagnostics: total replays
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 // Load `Qwen3MoeForCausalLM` (Qwen3-Coder-30B-A3B) safetensors into

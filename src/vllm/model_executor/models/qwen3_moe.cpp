@@ -21,11 +21,16 @@
 // norm_topk_prob=true. Returns [n_out, vocab] f32 logits.
 #include "vllm/model_executor/models/qwen3_moe.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/models/decode_graph_sizes.h"  // DecodeGraphSizes/PadToCaptureSize
 #include "vllm/model_executor/models/dense_attn_block.h"    // shared AttnBlock + device glue
 #include "vllm/model_executor/models/device_pool.h"         // DevicePool/Pool/ActivePool (shared)
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"   // RunMoeBlock (SEAM GAP #2)
@@ -100,15 +105,43 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
     d.b.Copy(d.q, dp + s * rb, sp + static_cast<size_t>(idx[s]) * rb, rb);
 }
 
-// embed -> N MoE layers -> final RMSNorm -> untied lm_head. Returns [n_out, vocab]
-// f32 as a device DBuf (no host Download; the caller Downloads or wraps it).
-DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
-                 const std::vector<int32_t>& positions,
-                 const CommonAttentionMetadata& attn_meta,
-                 const std::vector<PagedKvCache>& attn_kv,
-                 const Qwen3MoeWeights& weights, const HfConfig& config,
-                 const std::vector<int32_t>& logits_indices) {
+// Embed: hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident table).
+// KEPT OUTSIDE THE CUDA-GRAPH (mirrors qwen3_5.cpp `EmbedInto`): the CUDA
+// Embedding op allocates a device bounds-check flag (cudaMalloc/cudaFree) and
+// syncs the stream (cuda_ops.cu:525,535), all illegal inside a capture region —
+// and it consumes the HOST token_ids. The graph driver runs this per step into
+// its PERSISTENT hidden buffer, then captures/replays ForwardLayers over that
+// fixed hidden address.
+void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
+               const Qwen3MoeWeights& weights, const HfConfig& config) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
+  Tensor dtab = ResidentWeight(d, weights.embed_tokens,
+                               {config.vocab_size, config.hidden_size});
+  DBuf dids(d, DType::kI32, {T}, token_ids.data());
+  vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+}
+
+// The CAPTURABLE region: everything AFTER the embedding — the residual stream
+// (res=0), the N full-attention MoE decoder layers, the final RMSNorm and the
+// untied lm_head — returning [n_out, vocab] f32 as a device DBuf (no host
+// Download). Split out of ForwardBody (W7) so the exact op sequence is what the
+// graph captures/replays; every per-step-varying input is read from a HOST vector
+// argument (positions / the attention-metadata vectors) whose host->device copies
+// are capturable on GB10, and which the graph driver keeps persistent + mutates
+// in place so a replay picks up the new step's inputs.
+//
+// `hidden_in` is the embedded input (a view over the graph's persistent hidden
+// buffer on the replay path). The layer loop only ever READS it (the first fused
+// add+RMSNorm accumulates into `res` and reassigns `hidden` to the MoE output), so
+// unlike the 35B — whose RunLayerPaged writes the residual stream in place — no
+// defensive copy of the persistent buffer is needed.
+DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
+                   const std::vector<int32_t>& positions,
+                   const CommonAttentionMetadata& attn_meta,
+                   const std::vector<PagedKvCache>& attn_kv,
+                   const Qwen3MoeWeights& weights, const HfConfig& config,
+                   const std::vector<int32_t>& logits_indices) {
+  const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
   const float eps = static_cast<float>(config.rms_norm_eps);
@@ -117,15 +150,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   VT_CHECK(attn_kv.size() == static_cast<size_t>(config.num_hidden_layers),
            "qwen3 moe: one PagedKvCache per layer required");
 
-  // Embed: hidden[T,H] bf16 = embed_tokens[token_ids]. The embedding buffer holds
-  // the layer-0 input delta; it stays alive (embed_buf) until layer 0 consumes it.
-  DBuf embed_buf(d, DType::kBF16, {T, H});
-  {
-    Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
-    DBuf dids(d, DType::kI32, {T}, token_ids.data());
-    vt::Embedding(d.q, embed_buf.t(), dtab, dids.t());
-  }
-  Tensor hidden = embed_buf.t();
+  Tensor hidden = hidden_in;
   std::shared_ptr<void> hidden_hold;  // owns the current MoE-output delta storage
 
   DBuf res(d, DType::kBF16, {T, H});
@@ -172,6 +197,22 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   return logits;
 }
 
+// Full eager forward body: embed (host token_ids) then the capturable layer
+// region. Used by Qwen3MoeModel::Forward/ForwardDevice and by the graph driver's
+// eager fallback / cold-size pre-warm step (one contiguous stream, no capture).
+DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
+                 const std::vector<int32_t>& positions,
+                 const CommonAttentionMetadata& attn_meta,
+                 const std::vector<PagedKvCache>& attn_kv,
+                 const Qwen3MoeWeights& weights, const HfConfig& config,
+                 const std::vector<int32_t>& logits_indices) {
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  DBuf hidden(d, DType::kBF16, {T, config.hidden_size});
+  EmbedInto(d, hidden, token_ids, weights, config);
+  return ForwardLayers(d, hidden.t(), positions, attn_meta, attn_kv, weights,
+                       config, logits_indices);
+}
+
 ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t vocab) {
   ForwardLogits fl;
   fl.rows = rows;
@@ -185,6 +226,79 @@ ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t voca
       std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
   (void)d;
   return fl;
+}
+
+// NON-OWNING [rows, vocab] f32 view over a buffer the graph slot keeps alive
+// (mirrors qwen3_5.cpp:5177 ViewDeviceLogits). Stream ordering guarantees the
+// sampler's later reads see the replay's writes; the next same-size replay
+// overwrites the buffer, so in-place sampler mutation is safe.
+ForwardLogits ViewDeviceLogits(void* base, vt::Device device, int64_t rows,
+                               int64_t vocab) {
+  ForwardLogits fl;
+  fl.rows = rows;
+  fl.vocab = vocab;
+  fl.device_tensor = MakeTensor(base, DType::kF32, device, {rows, vocab});
+  fl.device_storage = std::shared_ptr<void>(base, [](void*) {});
+  return fl;
+}
+
+// Overwrite dst's CONTENTS from src WITHOUT changing dst.data() when the sizes
+// already match (preserves the fixed address a captured host->device copy reads
+// from); reallocate only when the shape actually changed. (qwen3_5.cpp:5800.)
+template <typename T>
+void CopyInPlace(std::vector<T>& dst, const std::vector<T>& src) {
+  if (dst.size() != src.size()) {
+    dst = src;
+  } else {
+    std::copy(src.begin(), src.end(), dst.begin());
+  }
+}
+
+// Build the S-padded PURE-DECODE inputs from the real B-request step (B<=S). The
+// ATTENTION-ONLY analog of qwen3_5.cpp's BuildPaddedDecode — Qwen3-Coder has no
+// GDN metadata, so only CommonAttentionMetadata is padded.
+//
+// The decode forward is ROW-INDEPENDENT (paged attention is per-request causal;
+// the router/grouped-MoE GEMM/norm/lm_head are per-token with no cross-row
+// reduction — the grouped GEMM's counting sort groups (token,expert) PAIRS and
+// each output row reduces only over its own K), so appending S-B INERT rows
+// cannot perturb the real rows' logits. The padding rows are made inert exactly
+// as vLLM's cudagraph padding:
+//   * token id / position 0 (the embed row is discarded);
+//   * slot_mapping = -1 -> ReshapeAndCache skips the KV write (cuda_cache.cu:50),
+//     so no real KV block is touched;
+//   * seq_lens = 1 + block_table row 0 -> paged attention does a valid in-bounds
+//     read of block 0 whose output row is discarded (never returned).
+// The real prefix [0,B) is copied verbatim, so at S==B this is a bit-identical
+// rebuild of the eager inputs.
+void BuildPaddedDecodeAttn(int64_t S, const std::vector<int32_t>& tok,
+                           const std::vector<int32_t>& pos,
+                           const CommonAttentionMetadata& am,
+                           std::vector<int32_t>& tok_out,
+                           std::vector<int32_t>& pos_out,
+                           CommonAttentionMetadata& am_out) {
+  const int64_t cols = am.block_table_num_cols;
+
+  tok_out.assign(static_cast<size_t>(S), 0);
+  pos_out.assign(static_cast<size_t>(S), 0);
+  std::copy(tok.begin(), tok.end(), tok_out.begin());
+  std::copy(pos.begin(), pos.end(), pos_out.begin());
+
+  am_out = am;  // carries causal + block_table_num_cols + max_seq_len
+  am_out.num_reqs = static_cast<int>(S);
+  am_out.num_actual_tokens = static_cast<int>(S);
+  am_out.max_query_len = 1;  // pure decode
+  am_out.slot_mapping.assign(static_cast<size_t>(S), -1);
+  std::copy(am.slot_mapping.begin(), am.slot_mapping.end(),
+            am_out.slot_mapping.begin());
+  am_out.seq_lens.assign(static_cast<size_t>(S), 1);
+  std::copy(am.seq_lens.begin(), am.seq_lens.end(), am_out.seq_lens.begin());
+  am_out.block_table_tensor.assign(static_cast<size_t>(S * cols), 0);
+  std::copy(am.block_table_tensor.begin(), am.block_table_tensor.end(),
+            am_out.block_table_tensor.begin());
+  am_out.query_start_loc.resize(static_cast<size_t>(S + 1));
+  for (int64_t i = 0; i <= S; ++i)
+    am_out.query_start_loc[static_cast<size_t>(i)] = static_cast<int32_t>(i);
 }
 
 }  // namespace
@@ -213,6 +327,214 @@ ForwardLogits Qwen3MoeModel::ForwardDevice(
                              config, logits_indices);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(d, std::move(dlogits), n_out, config.vocab_size);
+}
+
+// ─── Qwen3MoeDecodeGraph (BF16 full-attention-MoE decode CUDA-graph driver) ───
+// The Qwen3-Coder sibling of Qwen3_5DecodeGraph (qwen3_5.cpp:5902) and
+// Qwen3_5DenseDecodeGraph (qwen3_5.cpp:6104): SAME cold -> warm -> capture ->
+// replay state machine, SAME padded-batch capture set (decode_graph_sizes.h,
+// mirroring vLLM `_set_cudagraph_sizes` reduced to the full-decode-cudagraph
+// regime + `cuda_graph.py`'s pad-to-nearest dispatch), SAME persistent
+// fixed-address host inputs and persistent embed/logits buffers — driving the
+// BF16 full-attention MoE forward (ForwardLayers over EmbedInto) with NO GDN.
+//
+// Ported from: vllm/v1/worker/gpu_model_runner.py::GPUModelRunner @ e24d1b24
+//   (`_dummy_run` warm-up then capture, then graph dispatch per decode step) +
+//   vllm/compilation/cuda_graph.py (`CUDAGraphWrapper.__call__`: pad the batch to
+//   a captured size, replay, else run eager).
+//
+// WHY THIS IS THE C1 LEVER (spec §9 W6 residual 1): at concurrency 1 the summed
+// decode GPU kernel time is ~31 ms against a 36.22 ms TPOT (~86% GPU-busy), i.e.
+// ~5 ms/step of pure host/launch tax — essentially the entire 4.5 ms/step deficit
+// vs GRAPHED vLLM. The kernels are already at 70-77% of GB10 memory peak, so the
+// win is removing per-step launch overhead, not making kernels faster.
+//
+// GRAPH-SAFETY AUDIT of the bf16 decode path (capture requires stable pointers
+// and no host sync / stream-ordered alloc inside the region):
+//   * Embedding (device flag cudaMalloc + stream sync) stays OUTSIDE (EmbedInto).
+//   * All device scratch comes from the shared DevicePool, whose blocks are
+//     recycled (never returned to the driver) — the cold pre-warm step at this
+//     exact size populates every size class the capture then reuses, so capture
+//     itself performs no cudaMalloc.
+//   * The grouped-MoE index scratch (`EnsureMoeScratch`) and split-K partials
+//     (`EnsureMoePartials`) are graph-safe BY DESIGN (retire-don't-free, so a
+//     later growth never dangles a baked pointer — cuda_matmul_nvfp4.cu:767,986).
+//   * The per-layer expert device-pointer arrays + pair->token row map
+//     (`MoeBf16Resident`) are uploaded ONCE at first touch and the token map is
+//     memoized per T, both during the pre-warm step (qwen3_5.cpp:4436-4505).
+//   * ResidentWeight uploads every weight once, on first touch (pre-warm).
+//   * The FA-2 varlen-decode launcher's per-shape scratch throws if it misses
+//     during capture (cuda_flash_attn_fa2.cu:706) — the pre-warm step at the same
+//     padded size populates it. Its host `max_seq_len` only sizes the split-KV
+//     grid; the per-request causal geometry is read from the DEVICE seq_lens, and
+//     each split's KV range is derived in-kernel from `seqused_k`, so a captured
+//     graph stays CORRECT as the sequences grow (identical contract to the
+//     already-gated 35B/27B decode graphs).
+//   * cuBLASLt's workspace is a one-time per-context cudaMalloc (cuda_matmul.cu:101).
+struct Qwen3MoeDecodeGraph::Impl {
+  Impl(const Qwen3MoeWeights& w, const HfConfig& c, vt::Queue q, int64_t max_reqs)
+      : weights(w), config(c), queue(q), max_num_reqs(max_reqs) {
+    // The framework-wide graph switch, plus a Qwen3-Coder-local rollback for a
+    // same-binary A/B of exactly this lever.
+    const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
+    const bool env_on = (env == nullptr) || std::string(env) != "0";
+    const char* local = std::getenv("VT_QWEN3MOE_CUDAGRAPH");
+    const bool local_on = (local == nullptr) || local[0] != '0';
+    Backend& b = vt::GetBackend(queue.device.type);
+    enabled = env_on && local_on && queue.device.type == vt::DeviceType::kCUDA &&
+              b.SupportsGraphCapture();
+  }
+  ~Impl() {
+    Backend& b = vt::GetBackend(queue.device.type);
+    for (auto& kv : slots)
+      if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
+  }
+
+  // One captured padded batch size. Owns its OWN persistent host inputs (the
+  // captured graph's host->device copies bake these addresses, so each size needs
+  // its own fixed-address buffers), its persistent embed target + logits output,
+  // and its instantiated graph.
+  struct SizeSlot {
+    std::vector<int32_t> token_ids;  // [S]
+    std::vector<int32_t> positions;  // [S]
+    CommonAttentionMetadata attn_meta;
+    std::unique_ptr<DBuf> hidden;  // [S,H] bf16 persistent embed target
+    std::unique_ptr<DBuf> logits;  // [S,vocab] f32 held graph output
+    void* graph = nullptr;         // instantiated cudaGraphExec (opaque)
+    int fa_cols = -1;              // captured block-table column count
+    bool captured = false;
+    bool warm = false;
+    int64_t replays = 0;
+
+    // In-place refresh of the persistent host inputs (fixed addresses once the
+    // slot's vectors reach size S) so a replay re-reads this step's tokens.
+    void Refresh(const std::vector<int32_t>& tok, const std::vector<int32_t>& pos,
+                 const CommonAttentionMetadata& am) {
+      CopyInPlace(token_ids, tok);
+      CopyInPlace(positions, pos);
+      CopyInPlace(attn_meta.slot_mapping, am.slot_mapping);
+      CopyInPlace(attn_meta.block_table_tensor, am.block_table_tensor);
+      CopyInPlace(attn_meta.seq_lens, am.seq_lens);
+      CopyInPlace(attn_meta.query_start_loc, am.query_start_loc);
+      attn_meta.num_reqs = am.num_reqs;
+      attn_meta.num_actual_tokens = am.num_actual_tokens;
+      attn_meta.max_query_len = am.max_query_len;
+      attn_meta.max_seq_len = am.max_seq_len;
+      attn_meta.block_table_num_cols = am.block_table_num_cols;
+      attn_meta.causal = am.causal;
+    }
+  };
+
+  const Qwen3MoeWeights& weights;
+  const HfConfig& config;
+  vt::Queue queue;
+  int64_t max_num_reqs = 0;  // == max_num_seqs; padded decode batch cap
+  bool enabled = false;
+
+  std::map<int64_t, SizeSlot> slots;  // padded size S -> slot
+  int64_t replays = 0;                // total replays (diagnostics)
+  bool any_captured = false;          // diagnostics: at least one live graph
+};
+
+Qwen3MoeDecodeGraph::Qwen3MoeDecodeGraph(const Qwen3MoeWeights& weights,
+                                         const HfConfig& config, vt::Queue queue,
+                                         int64_t max_num_reqs)
+    : impl_(std::make_unique<Impl>(weights, config, queue, max_num_reqs)) {}
+
+Qwen3MoeDecodeGraph::~Qwen3MoeDecodeGraph() = default;
+
+bool Qwen3MoeDecodeGraph::captured() const { return impl_->any_captured; }
+int64_t Qwen3MoeDecodeGraph::replay_count() const { return impl_->replays; }
+
+ForwardLogits Qwen3MoeDecodeGraph::Step(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta,
+    const std::vector<PagedKvCache>& attn_kv) {
+  const int64_t B = static_cast<int64_t>(token_ids.size());
+  Backend& b = vt::GetBackend(impl_->queue.device.type);
+  Dev d{b, impl_->queue};
+  const int64_t vocab = impl_->config.vocab_size;
+  const int64_t H = impl_->config.hidden_size;
+
+  // Pure decode passes identity logits_indices (gather is a no-op), so the
+  // capturable region returns the full [S,vocab].
+  const std::vector<int32_t> kNoGather;
+  const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
+  if (!impl_->enabled || S < 0) {
+    DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, attn_kv,
+                          impl_->weights, impl_->config, kNoGather);
+    return WrapDeviceLogits(d, std::move(lg), B, vocab);
+  }
+
+  // Pad this step's real B-request inputs up to S (inert padding rows), then
+  // refresh THIS size's persistent host buffers in place.
+  Impl::SizeSlot& s = impl_->slots[S];
+  const int cols = attn_meta.block_table_num_cols;
+  std::vector<int32_t> ptok, ppos;
+  CommonAttentionMetadata pam;
+  BuildPaddedDecodeAttn(S, token_ids, positions, attn_meta, ptok, ppos, pam);
+
+  // A block-table column-count change reallocates the persistent block_table (the
+  // captured H2D copy's source address moves) -> invalidate this slot's graph and
+  // re-warm/re-capture.
+  const bool cols_changed = (s.fa_cols != -1 && s.fa_cols != cols);
+  s.Refresh(ptok, ppos, pam);
+  s.fa_cols = cols;
+  if (cols_changed && s.graph != nullptr) {
+    b.DestroyGraph(s.graph);
+    s.graph = nullptr;
+    s.captured = false;
+    s.warm = false;
+  }
+
+  // Fast path: this size's graph is captured. Embed OUTSIDE the graph into the
+  // persistent hidden buffer, then relaunch the captured layer region.
+  if (s.captured) {
+    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    b.ReplayGraph(impl_->queue, s.graph);
+    ++s.replays;
+    ++impl_->replays;
+    return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
+  }
+
+  // Warm: the pool + weight residency + per-shape kernel scratch were warmed for
+  // this size by the previous (eager) step. CAPTURE the layer region once,
+  // instantiate the graph, then launch it.
+  if (s.warm) {
+    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    b.BeginCapture(impl_->queue);
+    DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
+                            impl_->weights, impl_->config, kNoGather);
+    s.graph = b.EndCaptureGraph(impl_->queue);
+    s.logits = std::make_unique<DBuf>(std::move(lg));
+    s.captured = true;
+    impl_->any_captured = true;
+    if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
+      std::fprintf(stderr,
+                   "[Qwen3MoeDecodeGraph] captured bf16 MoE decode graph for "
+                   "padded size S=%lld (real B=%lld)\n",
+                   static_cast<long long>(S), static_cast<long long>(B));
+    b.ReplayGraph(impl_->queue, s.graph);
+    s.replays = 1;
+    ++impl_->replays;
+    return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
+  }
+
+  // Cold size: run one EAGER step (pre-warms the DevicePool size classes, the
+  // resident weights / MoE expert pointer arrays + token map, and the FA-2
+  // per-shape scratch for this size) and defer capture to the next same-size
+  // step. This is a real decode step — nothing is wasted.
+  s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
+  EmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+  DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
+                          impl_->weights, impl_->config, kNoGather);
+  s.warm = true;
+  s.captured = false;
+  // lg is [S,vocab]; hand ownership out but expose only the first B (real) rows.
+  ForwardLogits fl = WrapDeviceLogits(d, std::move(lg), B, vocab);
+  fl.device_tensor =
+      MakeTensor(fl.device_storage.get(), DType::kF32, d.q.device, {B, vocab});
+  return fl;
 }
 
 }  // namespace vllm

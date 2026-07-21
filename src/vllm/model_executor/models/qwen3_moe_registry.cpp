@@ -23,6 +23,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"           // ForwardLogits (shared carrier)
 #include "vllm/model_executor/models/qwen3_5_common.h"    // HostLogits (W3)
 #include "vllm/model_executor/models/qwen3_moe.h"
+#include "vllm/platforms/interface.h"  // GetPlatform(device.type).is_cuda()
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
 
@@ -40,8 +41,9 @@ inline constexpr ModelInfo kQwen3MoeInfo{
     .score_type = "bi-encoder",
 };
 
-// Opaque owned model. W2: holds the loaded Qwen3-Coder MoE weights; the forward
-// is not yet wired (throws until W3).
+// Opaque owned model: the loaded Qwen3-Coder MoE weights plus (W7) the model's
+// decode CUDA-graph driver state, held here exactly as the 35B/27B registrations
+// hold theirs (the graph outlives a single forward call).
 class Qwen3MoeLoadedModel final : public LoadedModel {
  public:
   Qwen3MoeLoadedModel(const ModelRegistration& registration,
@@ -49,9 +51,11 @@ class Qwen3MoeLoadedModel final : public LoadedModel {
       : LoadedModel(registration), weights_(std::move(weights)) {}
 
   const Qwen3MoeWeights& weights() const { return weights_; }
+  std::unique_ptr<Qwen3MoeDecodeGraph>& decode_graph() { return decode_graph_; }
 
  private:
   Qwen3MoeWeights weights_;
+  std::unique_ptr<Qwen3MoeDecodeGraph> decode_graph_;
 };
 
 std::unique_ptr<LoadedModel> LoadQwen3MoeForCausalLM(
@@ -79,8 +83,33 @@ void PrepareQwen3MoeForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardQwen3MoeForCausalLM(LoadedModel& model,
                                          const ModelForwardInput& input) {
-  const auto& qwen = static_cast<Qwen3MoeLoadedModel&>(model);
+  auto& qwen = static_cast<Qwen3MoeLoadedModel&>(model);
   const Qwen3MoeWeights& weights = qwen.weights();
+
+  // DECODE CUDA-GRAPH path (W7): route a PURE-DECODE CUDA step through the
+  // model's graph driver, which pads the batch up to the nearest captured size
+  // and replays that size's graph (mirrors vLLM's FULL_AND_PIECEWISE decode
+  // graphs — gpu_model_runner.py capture/replay + compilation/cuda_graph.py
+  // pad-to-nearest dispatch @ e24d1b24). Real-row output is bit-identical to the
+  // eager forward: the same kernels in the same order over the same buffers, with
+  // inert padding rows. This closes the measured ~5 ms/step host/launch tax at
+  // concurrency 1 (spec §9 W6 residual 1). Batches above the capture set
+  // (max_num_seqs), prefill and mixed steps, and CPU stay eager — the driver
+  // itself falls back internally, so this is the single dispatch point.
+  //
+  // gdn_state_slots carries max_num_reqs for EVERY arch (runner.cpp:374 sets it
+  // from max_num_reqs_ regardless of whether the model has GDN layers), so a
+  // pure full-attention model reads its capture-size cap from it unchanged.
+  if (input.pure_decode &&
+      platforms::GetPlatform(input.queue.device.type).is_cuda()) {
+    if (!qwen.decode_graph()) {
+      qwen.decode_graph() = std::make_unique<Qwen3MoeDecodeGraph>(
+          weights, input.config, input.queue, input.gdn_state_slots);
+    }
+    return qwen.decode_graph()->Step(input.token_ids, input.positions,
+                                     input.attn_meta, input.attn_kv);
+  }
+
   // DEVICE-resident logits (sampler-on-device) on the gather path; HOST logits on
   // the opt-out. Qwen3-Coder is pure full-attention MoE (input.gdn_* unused).
   if (input.gather_logits) {

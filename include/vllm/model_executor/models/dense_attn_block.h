@@ -27,7 +27,9 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/ActivePool (shared)
@@ -318,8 +320,34 @@ inline StepInputs BuildStepInputs(Dev d, const std::vector<int32_t>& positions,
   // the real positions would double-apply the position map (and skip decode rows
   // whose position >= T, the cache row count). Mirrors the token-indexed fused
   // AttnQkNormRope(Gate) consumer used by the 27B/35B forward.
-  std::vector<int32_t> row_idx(static_cast<size_t>(T));
-  for (int64_t i = 0; i < T; ++i) row_idx[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  // CUDA-GRAPH SAFETY (W7): the identity row index is uploaded by a host->device
+  // copy that a decode CUDA graph CAPTURES as a memcpy node, baking this host
+  // SOURCE ADDRESS and re-reading it on every replay. A stack-local vector here
+  // (the pre-W7 form) is destroyed the moment BuildStepInputs returns, so every
+  // replay would read freed stack memory — MEASURED as a wrong RoPE and a wrong
+  // token on the first captured decode step of Qwen3-Coder. It is instead served
+  // from a process-persistent per-T table: the contents are a pure function of T
+  // (row_idx[i] == i), the storage is created once per distinct T and NEVER
+  // resized or moved (a std::map node's vector never reallocates), so a captured
+  // pointer stays valid for the process lifetime. Byte-identical contents to the
+  // stack-local form, so the eager (non-graph) dense path is unchanged.
+  //
+  // Same discipline as the graph-safe persistent scratch on the device side
+  // (EnsureMoeScratch / EnsureMoePartials, cuda_matmul_nvfp4.cu:767,986: RETIRE,
+  // never free/move, because the pointer is baked into a captured graph).
+  static std::mutex row_idx_mu;
+  static std::map<int64_t, std::vector<int32_t>> row_idx_by_t;
+  const std::vector<int32_t>* row_idx = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(row_idx_mu);
+    auto it = row_idx_by_t.find(T);
+    if (it == row_idx_by_t.end()) {
+      std::vector<int32_t> v(static_cast<size_t>(T));
+      for (int64_t i = 0; i < T; ++i) v[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+      it = row_idx_by_t.emplace(T, std::move(v)).first;
+    }
+    row_idx = &it->second;
+  }
   StepInputs s{
       DBuf(d, DType::kI32, {T}, positions.data()),
       DBuf(d, DType::kI64, {T}, am.slot_mapping.data()),
@@ -329,7 +357,7 @@ inline StepInputs BuildStepInputs(Dev d, const std::vector<int32_t>& positions,
       DBuf(d, DType::kI32, {am.num_reqs + 1}, am.query_start_loc.data()),
       DBuf(d, DType::kF32, {T, rot > 0 ? rot : 1}),
       DBuf(d, DType::kBF16, {T, rot > 0 ? rot : 1}),
-      DBuf(d, DType::kI32, {T}, row_idx.data()),
+      DBuf(d, DType::kI32, {T}, row_idx->data()),
   };
   if (rot > 0) {
     // Build the per-step cos|sin cache ONCE (RopeCosSinCache does the fp64

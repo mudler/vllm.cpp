@@ -41,6 +41,7 @@
 // kernel (graph-safe). Measured GB10: 1024-token prefill TTFT 14.4s -> 6.1s.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <mma.h>
@@ -924,6 +925,100 @@ __global__ void MoeGroupedGemmBf16Naive(Tout* out, const __nv_bfloat16* act,
   }
 }
 
+// --- W6: DETERMINISTIC split-K for the small-P (decode) grouped GEMM ----------
+// At Qwen3-Coder decode the naive kernel is launched with grid (ceil(N/256), P).
+// For c=1 that is P = 1 token x top_k 8 = 8 pairs and N = 768 (gate/up), i.e.
+// THREE x EIGHT = 24 thread blocks — a handful of SMs, against a kernel that is
+// pure weight streaming (8 experts x [2048,768] bf16 = 25.2 MB per launch).
+// MEASURED at W5: 151 GB/s = 55% of GB10's ~273 GB/s for gate/up (N=768, 24
+// blocks) vs 211 GB/s = 77% for down (N=2048, 64 blocks) — the SAME bytes, so
+// the deficit is block-parallelism starvation, not the memory system.
+//
+// Fix: partition the K reduction across SPLITS blocks, mirroring vLLM's
+// `SPLIT_K` knob on the same kernel (`vllm/model_executor/layers/fused_moe/
+// fused_moe.py:338` `SPLIT_K: tl.constexpr`, threaded through `get_default_config`
+// at :1254/:1300/:1350). We deliberately do NOT mirror an atomicAdd accumulation:
+// float atomics reduce in nondeterministic ORDER, which would make greedy decode
+// non-reproducible run-to-run and break the token-exact gate. Instead each split
+// writes an f32 PARTIAL and a second pass sums the partials in FIXED ascending
+// split order — bit-reproducible, and (unlike a serial-k dot) the partial sums
+// are a strict re-association, so only the near-tie band can move.
+template <typename Tacc>
+__global__ void MoeGroupedGemmBf16NaiveSplitK(Tacc* partials, const __nv_bfloat16* act,
+                                              const int32_t* expert_ids, const int32_t* row_map,
+                                              const int64_t* weight_ptrs, int64_t p_rows,
+                                              int64_t n_cols, int64_t k_dim, int64_t k_chunk) {
+  const int64_t n = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (n >= n_cols) return;
+  const int64_t split = blockIdx.z;
+  const int64_t k0 = split * k_chunk;
+  if (k0 >= k_dim) return;
+  const int64_t k1 = (k0 + k_chunk < k_dim) ? (k0 + k_chunk) : k_dim;
+  for (int64_t p = blockIdx.y; p < p_rows; p += gridDim.y) {
+    const int64_t e = expert_ids[p];
+    const int64_t r = row_map != nullptr ? row_map[p] : p;
+    const auto* w = reinterpret_cast<const __nv_bfloat16*>(static_cast<uintptr_t>(weight_ptrs[e]));
+    const __nv_bfloat16* arow = act + r * k_dim;
+    float acc = 0.0f;
+    for (int64_t kk = k0; kk < k1; ++kk)
+      acc += __bfloat162float(arow[kk]) * __bfloat162float(w[kk * n_cols + n]);
+    partials[(split * p_rows + p) * n_cols + n] = acc;
+  }
+}
+
+// Fixed ascending-split reduction of the split-K partials (deterministic).
+template <typename Tout>
+__global__ void MoeGroupedGemmBf16SplitKReduce(Tout* out, const float* partials, int64_t p_rows,
+                                               int64_t n_cols, int splits) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = p_rows * n_cols;
+  if (idx >= total) return;
+  float acc = 0.0f;
+  for (int s = 0; s < splits; ++s) acc += partials[static_cast<int64_t>(s) * total + idx];
+  Store(out, idx, acc);
+}
+
+// Graph-safe persistent f32 partial buffer for the split-K decode path — same
+// retire-don't-free contract as EnsureMoeScratch (the pointer is baked into the
+// captured pure-decode graph).
+float* g_moe_partials = nullptr;
+size_t g_moe_partials_cap = 0;
+float* EnsureMoePartials(int64_t elems) {
+  if (static_cast<size_t>(elems) > g_moe_partials_cap) {
+    RetireGraphScratch(g_moe_partials);
+    Check(cudaMalloc(&g_moe_partials, static_cast<size_t>(elems) * sizeof(float)),
+          "moe split-k persistent partials");
+    g_moe_partials_cap = static_cast<size_t>(elems);
+  }
+  return g_moe_partials;
+}
+
+// Split count: purely a function of the (deterministic) launch SHAPE, so the
+// reduction tree — and therefore the emitted token — is reproducible. Targets
+// ~4 blocks per SM on GB10 while keeping each split's K run long enough
+// (>= kMoeSplitKMinChunk) that the per-split launch/reduce overhead stays small.
+constexpr int kMoeSplitKTargetBlocks = 256;
+constexpr int64_t kMoeSplitKMinChunk = 256;
+int MoeSplitKCount(int64_t p, int64_t n, int64_t k, int block) {
+  const int64_t base = ((n + block - 1) / block) * (p < 65535 ? p : 65535);
+  if (base <= 0) return 1;
+  int64_t want = (kMoeSplitKTargetBlocks + base - 1) / base;
+  const int64_t cap = k / kMoeSplitKMinChunk;
+  if (want > cap) want = cap;
+  if (want < 1) want = 1;
+  if (want > 16) want = 16;
+  return static_cast<int>(want);
+}
+
+// VT_MOE_SPLIT_K=0 rolls back to the single-pass naive kernel (same-binary A/B).
+bool Bf16SplitKEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_SPLIT_K");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
 // Expert-grouped tensor-core (bf16 WMMA) grouped GEMM: byte-for-byte the same
 // tiling/MMA as MoeGroupedGemmNvfp4Wmma (counting-sorted pair rows, ragged
 // per-BM-tile expert map), but the weight tile is read directly from the bf16
@@ -1008,12 +1103,214 @@ __global__ void MoeGroupedGemmBf16Wmma(Tout* out, const __nv_bfloat16* act, cons
   }
 }
 
-template <typename Tout, int BM, int WARPS_M, int WARPS_N>
+// --- W6: PIPELINED bf16 grouped-MoE WMMA tile (the tuned prefill/decode GEMM) --
+//
+// The W5 tile above is a first-cut GEMM: BN=64, BK=32, ONE stage, and — the
+// dominant defect — its weight stage reads `w[gk * n_cols + gn]` with the
+// FASTEST-VARYING loop index on `gk`, i.e. consecutive lanes of a warp touch
+// addresses `n_cols` elements apart. That is a fully UNCOALESCED global read of
+// the [K,N] expert weight (32 distinct 32-byte sectors per warp, 2 useful bytes
+// each). Since a 1024-token Qwen3-Coder prefill streams ~1.2 GB of expert weight
+// per layer against GB10's ~273 GB/s, the MoE GEMM is WEIGHT-BANDWIDTH bound
+// (arithmetic intensity ~64 flop/byte vs the machine's ~900), so the uncoalesced
+// weight stage — not the MMA — is what pinned the W5 kernel at ~4.3 TFLOP/s.
+//
+// This kernel keeps the SAME per-output K-reduction ORDER (ascending k, one
+// m16n16k16 wmma accumulate per 16 k, accumulator carried across K-tiles), so it
+// is BIT-IDENTICAL to the W5 tile — only the staging is rewritten:
+//   (1) COALESCED + VECTORIZED weight stage — shared `Ws` is [BK][BN] (k-major)
+//       and the fragment is loaded as `wmma::matrix_b` in ROW_MAJOR (which for
+//       matrix_b means K-major, element (k,n) at ptr[k*ldm+n]), so the global
+//       read runs along N, which is contiguous in the [K,N] weight. Each lane
+//       moves 16 bytes (8 bf16).
+//   (2) 16-byte VECTORIZED activation stage, likewise.
+//   (3) MULTI-STAGE `cp.async` PIPELINE (STAGES deep) so the DRAM latency of
+//       k-tile t+STAGES-1 overlaps the MMA of tile t, replacing the W5 kernel's
+//       full `__syncthreads` stall per k-tile.
+//   (4) BN 64 -> 128 (wider weight tile per block => fewer redundant weight
+//       streams) and 4 warps.
+//   (5) SHARED-MEMORY PADDING (+8 halves per row, 16-byte aligned) so the wmma
+//       fragment loads are at most 2-way bank conflicted.
+//
+// Upstream grounding: the tile/pipeline SHAPE mirrors vLLM's Triton grouped-MoE
+// GEMM — `vllm/model_executor/layers/fused_moe/fused_moe.py:294` (`fused_moe_kernel`:
+// the `for k in range(cdiv(K, BLOCK_SIZE_K))` accumulate-into-f32 mainloop over
+// [BLOCK_SIZE_M, BLOCK_SIZE_K] x [BLOCK_SIZE_K, BLOCK_SIZE_N] tiles) with the tile
+// constants from `fused_moe.py:1238` (`get_default_config`, the bf16 branch:
+// `block_n = 64 if M <= 64 else 128`, `block_k = 128 if fp8 or M <= 64 else 64`,
+// `num_stages = 4 if M <= 32 else 3`, `num_warps = 4 if M <= 128 else 8`).
+// Triton's `num_stages` lowers to exactly this `cp.async` multistage mainloop,
+// whose C++ form is CUTLASS `include/cutlass/gemm/threadblock/mma_multistage.h`
+// (prologue of STAGES-1 `cp.async` groups, then `cp_async_wait<STAGES-2>` +
+// issue-next-inside-the-loop). We keep BK=32 rather than vLLM's 64 because at
+// BN=128/STAGES=3 that is what fits the 48 KB static shared-memory budget while
+// still holding a 3-deep pipeline (a 2-stage BK=64 variant needs 52 KB and is
+// strictly shallower).
+//
+// `sp`/`sr`/`tile_*` are the counting-sort outputs, identical to the W5 tile.
+template <typename Tout, int BM, int BN, int BK, int WARPS_M, int WARPS_N, int STAGES>
+__global__ __launch_bounds__(WARPS_M* WARPS_N * 32) void MoeGroupedGemmBf16WmmaPipe(
+    Tout* out, const __nv_bfloat16* act, const int32_t* sp, const int32_t* sr,
+    const int64_t* weight_ptrs, const int32_t* tile_expert, const int32_t* tile_row0,
+    const int32_t* tile_rows, int64_t n_cols, int64_t k_dim) {
+  const int rcount = tile_rows[blockIdx.y];
+  if (rcount == 0) return;
+  constexpr int kThreads = WARPS_M * WARPS_N * 32;
+  constexpr int WMPER = BM / WARPS_M, WNPER = BN / WARPS_N;
+  constexpr int MF = WMPER / 16, NF = WNPER / 16;
+  constexpr int kVec = 8;              // 8 bf16 = the 16-byte cp.async granule
+  constexpr int kPad = kVec;           // row padding, keeps every row 16B-aligned
+  constexpr int ALD = BK + kPad;       // As row stride, halves (m-major)
+  constexpr int WLD = BN + kPad;       // Ws row stride, halves (k-major)
+  constexpr int kASize = BM * ALD, kWSize = BK * WLD;
+  constexpr int kAChunks = BM * (BK / kVec), kWChunks = BK * (BN / kVec);
+  // One block-wide arena: the staging buffers during the mainloop, reinterpreted
+  // as the f32 output tile in the epilogue (the epilogue runs after the last
+  // consumer sync, so the two lifetimes never overlap).
+  constexpr int kStageBytes = STAGES * (kASize + kWSize) * static_cast<int>(sizeof(__nv_bfloat16));
+  constexpr int kOutBytes = BM * BN * static_cast<int>(sizeof(float));
+  constexpr int kSmemBytes = kStageBytes > kOutBytes ? kStageBytes : kOutBytes;
+  __shared__ __align__(16) char smem[kSmemBytes];
+  auto* As = reinterpret_cast<__nv_bfloat16*>(smem);
+  auto* Ws = As + STAGES * kASize;
+  auto* Cs = reinterpret_cast<float*>(smem);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / 32, wm = warp / WARPS_N, wn = warp % WARPS_N;
+  const int e = tile_expert[blockIdx.y];
+  const int row0 = tile_row0[blockIdx.y];
+  const int64_t col0 = static_cast<int64_t>(blockIdx.x) * BN;
+  const auto* w = reinterpret_cast<const __nv_bfloat16*>(static_cast<uintptr_t>(weight_ptrs[e]));
+
+  // Stage k-tile `kt` into buffer `st`. Every lane issues 16-byte `cp.async`
+  // copies; out-of-range TAIL elements use the primitive's `zfill` (which zeroes
+  // the trailing bytes of the granule) so ragged K/N/row counts stay exact
+  // without a masked scalar path. `src` for a fully-invalid granule points at the
+  // buffer base (always readable; nothing is copied when zfill == 16).
+  auto stage_in = [&](int st, int64_t kt) {
+    __nv_bfloat16* Ad = As + st * kASize;
+    __nv_bfloat16* Wd = Ws + st * kWSize;
+    for (int idx = tid; idx < kAChunks; idx += kThreads) {
+      const int r = idx / (BK / kVec), c0 = (idx % (BK / kVec)) * kVec;
+      const int64_t gk = kt + c0;
+      const __nv_bfloat16* src = act;
+      int valid = 0;
+      if (r < rcount && gk < k_dim) {
+        src = act + static_cast<int64_t>(sr[row0 + r]) * k_dim + gk;
+        const int64_t rem = k_dim - gk;
+        valid = static_cast<int>(rem < kVec ? rem : kVec);
+      }
+      __pipeline_memcpy_async(Ad + r * ALD + c0, src, 16,
+                              static_cast<size_t>((kVec - valid) * 2));
+    }
+    for (int idx = tid; idx < kWChunks; idx += kThreads) {
+      const int kl = idx / (BN / kVec), n0 = (idx % (BN / kVec)) * kVec;
+      const int64_t gk = kt + kl, gn = col0 + n0;
+      const __nv_bfloat16* src = w;
+      int valid = 0;
+      if (gk < k_dim && gn < n_cols) {
+        src = w + gk * n_cols + gn;
+        const int64_t rem = n_cols - gn;
+        valid = static_cast<int>(rem < kVec ? rem : kVec);
+      }
+      __pipeline_memcpy_async(Wd + kl * WLD + n0, src, 16,
+                              static_cast<size_t>((kVec - valid) * 2));
+    }
+    __pipeline_commit();
+  };
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MF][NF];
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni) wmma::fill_fragment(acc[mi][ni], 0.0f);
+
+  const int64_t ktiles = (k_dim + BK - 1) / BK;
+  // Prologue: always commit STAGES-1 groups (empty ones past the last k-tile) so
+  // the `__pipeline_wait_prior(STAGES-2)` accounting below is uniform.
+  for (int s = 0; s < STAGES - 1; ++s) {
+    if (s < ktiles)
+      stage_in(s, static_cast<int64_t>(s) * BK);
+    else
+      __pipeline_commit();
+  }
+
+  for (int64_t t = 0; t < ktiles; ++t) {
+    __pipeline_wait_prior(STAGES - 2);
+    __syncthreads();  // stage t's copies visible; stage (t-1)'s readers all done
+    const int64_t nt = t + STAGES - 1;
+    // Past the last k-tile we still COMMIT an empty group: `__pipeline_wait_prior`
+    // counts committed groups, so the commit count must stay 1:1 with the loop
+    // index or the final tiles would be consumed before their copies land
+    // (CUTLASS mma_multistage.h does the same — it issues the tail iterations
+    // with all predicates false rather than skipping the commit).
+    if (nt < ktiles)
+      stage_in(static_cast<int>(nt % STAGES), nt * BK);
+    else
+      __pipeline_commit();
+
+    const __nv_bfloat16* Ac = As + static_cast<int>(t % STAGES) * kASize;
+    const __nv_bfloat16* Wc = Ws + static_cast<int>(t % STAGES) * kWSize;
+#pragma unroll
+    for (int kk = 0; kk < BK / 16; ++kk) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af[MF];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bf[NF];
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+        wmma::load_matrix_sync(af[mi], Ac + (wm * WMPER + mi * 16) * ALD + kk * 16, ALD);
+#pragma unroll
+      for (int ni = 0; ni < NF; ++ni)
+        wmma::load_matrix_sync(bf[ni], Wc + (kk * 16) * WLD + (wn * WNPER + ni * 16), WLD);
+#pragma unroll
+      for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < NF; ++ni) wmma::mma_sync(acc[mi][ni], af[mi], bf[ni], acc[mi][ni]);
+    }
+  }
+
+  __syncthreads();  // mainloop readers done before the arena becomes the C tile
+#pragma unroll
+  for (int mi = 0; mi < MF; ++mi)
+#pragma unroll
+    for (int ni = 0; ni < NF; ++ni)
+      wmma::store_matrix_sync(&Cs[(wm * WMPER + mi * 16) * BN + (wn * WNPER + ni * 16)],
+                              acc[mi][ni], BN, wmma::mem_row_major);
+  __syncthreads();
+
+  for (int idx = tid; idx < BM * BN; idx += kThreads) {
+    const int r = idx / BN, c = idx % BN;
+    const int64_t gc = col0 + c;
+    if (r < rcount && gc < n_cols)
+      Store(out, static_cast<int64_t>(sp[row0 + r]) * n_cols + gc, Cs[idx]);
+  }
+}
+
+// The W6 pipelined tile stages 16-byte granules, so it requires the activation
+// row pitch and the weight row pitch to be 8-bf16 multiples (every granule base
+// is then 16-byte aligned). Production Qwen3-Coder shapes always are (K/N in
+// {2048, 768}); ragged test/other shapes fall back to the W5 tile, which stays
+// live as the layout-agnostic reference.
+inline bool Bf16PipeShapeOk(int64_t n, int64_t k) { return (n % 8) == 0 && (k % 8) == 0; }
+
+// VT_MOE_BF16_PIPE=0 rolls back to the W5 tile (same-binary A/B; the two are
+// bit-identical, so this is a pure performance toggle).
+bool Bf16PipeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_BF16_PIPE");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return on;
+}
+
+// PIPE_WN: the N-warp split of the W6 pipelined tile (BN=128); the W5 fallback
+// tile keeps its own (BN=64, WARPS_M x WARPS_N) shape.
+template <typename Tout, int BM, int WARPS_M, int WARPS_N, int PIPE_WM, int PIPE_WN>
 void LaunchGroupedBf16Wmma(cudaStream_t s, Tensor& out, const Tensor& act,
                            const Tensor& expert_ids, const Tensor* row_map,
                            const Tensor& weight_ptrs, int64_t p, int64_t n, int64_t k,
                            int64_t e_count) {
   constexpr int BN = 64, BK = 32;
+  constexpr int kPipeBN = 128, kPipeBK = 32, kPipeStages = 3;
   const int max_tiles = static_cast<int>((p + BM - 1) / BM + e_count);
   const int64_t n_i32 = 3 * e_count + 2 * p + 3 * max_tiles;
   int32_t* scratch = EnsureMoeScratch(n_i32);
@@ -1040,6 +1337,17 @@ void LaunchGroupedBf16Wmma(cudaStream_t s, Tensor& out, const Tensor& act,
   MoeTileMapKernel<<<1, 1, 0, s>>>(count, offset, tile_expert, tile_row0, tile_rows,
                                    static_cast<int>(e_count), BM, max_tiles);
 
+  if (Bf16PipeEnabled() && Bf16PipeShapeOk(n, k)) {
+    constexpr int kPipeThreads = PIPE_WM * PIPE_WN * 32;
+    const dim3 pgrid(static_cast<unsigned>((n + kPipeBN - 1) / kPipeBN),
+                     static_cast<unsigned>(max_tiles));
+    MoeGroupedGemmBf16WmmaPipe<Tout, BM, kPipeBN, kPipeBK, PIPE_WM, PIPE_WN, kPipeStages>
+        <<<pgrid, kPipeThreads, 0, s>>>(out.Ptr<Tout>(), act.Ptr<__nv_bfloat16>(), sp, sr,
+                                        weight_ptrs.Ptr<int64_t>(), tile_expert, tile_row0,
+                                        tile_rows, n, k);
+    Check(cudaGetLastError(), "moe_grouped_gemm_bf16 kernel launch (wmma pipe)");
+    return;
+  }
   constexpr int kThreads = WARPS_M * WARPS_N * 32;
   const dim3 grid(static_cast<unsigned>((n + BN - 1) / BN), static_cast<unsigned>(max_tiles));
   MoeGroupedGemmBf16Wmma<Tout, BM, BN, BK, WARPS_M, WARPS_N><<<grid, kThreads, 0, s>>>(
@@ -1056,6 +1364,24 @@ void LaunchGroupedBf16(cudaStream_t s, Tensor& out, const Tensor& act, const Ten
     const int64_t y = p < 65535 ? p : 65535;
     constexpr int kBlock = 256;
     const dim3 grid(static_cast<unsigned>((n + kBlock - 1) / kBlock), static_cast<unsigned>(y));
+    const int splits = Bf16SplitKEnabled() ? MoeSplitKCount(p, n, k, kBlock) : 1;
+    if (splits > 1) {
+      const int64_t total = p * n;
+      float* partials = EnsureMoePartials(total * splits);
+      const int64_t k_chunk = (k + splits - 1) / splits;
+      const dim3 sgrid(grid.x, grid.y, static_cast<unsigned>(splits));
+      MoeGroupedGemmBf16NaiveSplitK<float><<<sgrid, kBlock, 0, s>>>(
+          partials, act.Ptr<__nv_bfloat16>(), expert_ids.Ptr<int32_t>(),
+          row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr, weight_ptrs.Ptr<int64_t>(), p, n,
+          k, k_chunk);
+      Check(cudaGetLastError(), "moe_grouped_gemm_bf16 kernel launch (naive split-k)");
+      constexpr int kRB = 256;
+      MoeGroupedGemmBf16SplitKReduce<Tout>
+          <<<static_cast<unsigned>((total + kRB - 1) / kRB), kRB, 0, s>>>(out.Ptr<Tout>(), partials,
+                                                                         p, n, splits);
+      Check(cudaGetLastError(), "moe_grouped_gemm_bf16 split-k reduce launch");
+      return;
+    }
     MoeGroupedGemmBf16Naive<Tout><<<grid, kBlock, 0, s>>>(
         out.Ptr<Tout>(), act.Ptr<__nv_bfloat16>(), expert_ids.Ptr<int32_t>(),
         row_map != nullptr ? row_map->Ptr<int32_t>() : nullptr, weight_ptrs.Ptr<int64_t>(), p, n, k);
@@ -1066,11 +1392,11 @@ void LaunchGroupedBf16(cudaStream_t s, Tensor& out, const Tensor& act, const Ten
   // runs the BM=16 decode tile (vLLM BLOCK_SIZE_M=16 for small M); prefill/large-M
   // keeps the byte-identical BM=64 tile.
   if (MoeDecodeEnabled() && p <= kMoeDecodeMaxP) {
-    LaunchGroupedBf16Wmma<Tout, kMoeDecodeBM, 1, 2>(s, out, act, expert_ids, row_map, weight_ptrs,
-                                                    p, n, k, e_count);
+    LaunchGroupedBf16Wmma<Tout, kMoeDecodeBM, 1, 2, 1, 4>(s, out, act, expert_ids, row_map,
+                                                          weight_ptrs, p, n, k, e_count);
   } else {
-    LaunchGroupedBf16Wmma<Tout, kGroupBM, 2, 2>(s, out, act, expert_ids, row_map, weight_ptrs, p, n,
-                                                k, e_count);
+    LaunchGroupedBf16Wmma<Tout, kGroupBM, 2, 2, 2, 2>(s, out, act, expert_ids, row_map, weight_ptrs,
+                                                      p, n, k, e_count);
   }
 }
 

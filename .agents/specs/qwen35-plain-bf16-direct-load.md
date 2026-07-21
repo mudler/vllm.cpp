@@ -2,8 +2,8 @@
 
 **Rows:** `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation`,
 `LOAD-SAFETENSORS-DIRECT-DENSE`
-**Lifecycle:** `GATING`
-**Owner:** unassigned after `CLAIM-LOCAL-BF16-TRANSPLANT` release
+**Lifecycle:** `ACTIVE`
+**Owner:** `CLAIM-LOCAL-BF16-BENCH`
 
 ## Scope
 
@@ -35,6 +35,14 @@ Out of scope: replacing `VT_LOAD_WINDOWED_RELEASE`, the old tensor-range
 random-sampler scratch implementation, the unrestricted irregular-BF16 GEMM
 fallback, changing the 27B/35B fusion defaults, GGUF, MoE, CPU offload, or a
 support/performance claim before current-oracle gates pass.
+
+User-directed local gate (2026-07-21): this 16-GiB machine cannot execute the
+27B/35B checkpoints, so the active benchmark is the available plain-BF16 4B on
+the preserved exact workload. Compare the current direct ON/OFF binary against
+the prior 4B branch evidence and the locally available vLLM arm. The unavailable
+27B/35B regressions remain explicit external-hardware follow-ups; they do not
+prevent publishing an honest 4B diagnostic/result, but no 4B result is promoted
+into a 27B/35B support claim.
 
 ## Upstream chain
 
@@ -100,8 +108,9 @@ checked in with an explicit model/backend skip.
 
 1. CPU configure/build and focused loader/registry/forward tests are warning
    clean; full CPU CTest is run or every unrelated failure is isolated.
-2. CUDA compile and focused op/model tests pass on sm_120. Existing 27B
-   235/235 and 35B 315/315 gates remain unchanged before local-model credit.
+2. CUDA compile and focused op/model tests pass on sm_120. The local benchmark
+   target is Qwen3.5-4B; existing 27B 235/235 and 35B 315/315 gates remain
+   unchanged external-hardware regressions, not local prerequisites.
 3. Direct ON/OFF outputs are byte-identical for the same binary. Cross-engine
    correctness uses the current pinned/v0.25 oracle and cannot inherit v0.24
    branch numbers.
@@ -117,7 +126,7 @@ checked in with an explicit model/backend skip.
    `scripts/check-doc-checkpoint.py`, README, BENCHMARKS, matrices, roadmap,
    ledger and state agree at every checkpoint.
 
-Current checkpoint: clean CPU build and focused 6/6 are green; the real cached
+Current checkpoint: `ACTIVE` on the exact 4B comparison. Clean CPU build and focused 6/6 are green; the real cached
 `Qwen/Qwen3.5-4B` gate passes 3/3 cases and 1656/1656 assertions on CPU. The
 parallel 134-test CPU sweep passes 131/134; the two socket suites re-pass 2/2
 in isolation, leaving only the unrelated NixOS `/usr/bin/true`/restricted-PATH
@@ -128,7 +137,8 @@ prompt and output token IDs; the five focused transplant tests pass. The
 broader `test_op_parity` is 259/261 on sm_120 because two existing GB10-specific
 GDN BA BF16 hashes differ on this architecture. Current-oracle tokens, 27B/35B
 regressions, sanitizer, matching traces, memory and every performance axis
-remain pending; no benchmark or support claim is made.
+remain pending. The preserved previous 4B recipe/results are recovered; the
+exact-corpus/output-ID benchmark hooks and immutable comparison run are next.
 
 Reproduction entry point:
 
@@ -153,7 +163,7 @@ nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant \
 - Toolchain: Nix CUDA shell, CUDA 12.9/native sm_120 locally; production gates
   still require the canonical CUDA/CUTLASS/Triton configurations.
 - Data/hardware: local RTX 5070 Ti 16 GiB plus `Qwen/Qwen3.5-4B`; GB10 gate
-  models remain separate mandatory regressions.
+  models remain separate external-hardware regressions.
 - License: behavior-only port from vLLM; no generated dependency kernel is
   copied by this leaf.
 
@@ -167,8 +177,10 @@ nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant \
    current preamble/GDN dispatch; regression tests.
 4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
    queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
-5. `W4` gates: **PARTIAL** — local direct ON/OFF correctness is green; current-oracle correctness,
-   27B/35B regressions, sanitizer, matching traces and the full memory/performance series remain pending.
+5. `W4` gates: **ACTIVE** — local direct ON/OFF correctness is green; restore the
+   exact ShareGPT/output-ID measurement hooks, then run the lock-held 4B ON/OFF/reference
+   series and compare every axis with the preserved 4B branch result. Sanitizer/traces
+   and external 27B/35B regressions remain named follow-ups.
 
 ## Risks and decisions
 

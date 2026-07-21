@@ -14799,3 +14799,26 @@ sanitizer the release boundary; capture matching `nsys --cuda-graph-trace=node`
 ON/OFF/vLLM traces; then run at least three uncontended interleaved repetitions
 covering PSS/RSS, VRAM, startup, total/output throughput, request rate, TTFT,
 TPOT and ITL. No historical local performance number receives credit.
+
+### 2026-07-21 — user redirects the local W4 gate to the runnable 4B (`ACTIVE`)
+
+The local RTX 5070 Ti cannot run the 27B/35B checkpoints. Per user direction,
+`LOAD-SAFETENSORS-DIRECT-DENSE` returns to `ACTIVE` under
+`CLAIM-LOCAL-BF16-BENCH` to benchmark `Qwen/Qwen3.5-4B` and compare it with the
+preserved 4B branch evidence. The larger-model checks remain external-hardware
+follow-ups; no 4B result is extrapolated into their support status.
+
+Recovered exact prior recipe: snapshot `851bf6e…`, deterministic ShareGPT,
+128 requests, concurrency 32, 1024 input / 128 output, greedy, MNB 2048,
+1,280 cache blocks. Latest preserved branch result (`829883d`) was direct ON
+**6607.04**, OFF **6603.28**, and vLLM 0.24 **6716.47 total tok/s**; peak PSS
+was **1.768/8.168/6.773 GiB**. Those numbers are the requested historical
+comparison, not a fresh denominator, and were diagnostic because old-project
+128-request output files matched only 121-125/128 across repetitions.
+
+Current main's benchmark harness retains all aggregate axes but no longer
+accepts the exact ShareGPT file or writes request token IDs. First action under
+the claim is therefore the narrow, test-covered restoration of those two
+measurement hooks only; no old sampler or engine implementation returns. Then
+commit an immutable sm_120 binary and run the complete interleaved ON/OFF/
+available-vLLM series under one `/tmp/gpu` lock with thermal and memory evidence.

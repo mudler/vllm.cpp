@@ -1521,3 +1521,5 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 The complete contract is in the
 [benchmark protocol](../.agents/benchmark-protocol.md) and
 [online serving gate spec](../.agents/specs/cuda-online-serving-gate.md).
+
+**Breadth sweep note (2026-07-21):** the active phase is model-architecture breadth (recent-first), each held to token-exact + vLLM-speed on every axis. Ranked queue + CUDA-arch additivity audit: [.agents/specs/breadth-sweep-plan.md](../.agents/specs/breadth-sweep-plan.md). CUDA archs beyond same-family sm_120 are HW-blocked (only GB10 testable).

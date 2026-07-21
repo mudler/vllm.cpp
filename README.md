@@ -174,6 +174,14 @@ concurrent streams.
 | Llama-family dense | Llama 3.x, Mistral | — | — | 🗓 Post-parity roadmap (W-next after Qwen3-dense; needs a checkpoint download — none on dgx) |
 | MoE decoders | Mixtral, Qwen3-MoE | — | — | 🗓 Post-parity roadmap |
 
+**Breadth sweep — ACTIVE (2026-07-21).** With the first additive model (Qwen3 dense) validated
+end-to-end, the active priority is adding more model architectures (recent-first), each held to the
+same bar: token-exact vs vLLM (near-tie-robust where vLLM's own greedy is self-inconsistent) AND
+vLLM-speed on every axis. Ranked queue + the CUDA-arch additivity audit:
+[`.agents/specs/breadth-sweep-plan.md`](.agents/specs/breadth-sweep-plan.md). Note: adding a new
+CUDA *arch* beyond the same-family sm_120 is HW-blocked (only GB10 sm_121 is testable here), so the
+actionable sweep is model breadth on GB10; Metal/Intel/Vulkan/CPU follow.
+
 ## Acceleration
 
 | Backend | Hardware | Status |

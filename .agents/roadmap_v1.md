@@ -66,6 +66,26 @@ low-conc medians forfeits the tail/high-conc/throughput wins (net-negative). NEX
 the append-only state/ledger and the specs; not re-copied here per the compaction
 directive.*
 
+**★ ACTIVE PHASE (user-directed 2026-07-20/21) — the BREADTH SWEEP.** With 27B/35B parity,
+the `KERNEL-FUSION-FRAMEWORK` extensibility cornerstone (W0-W4), and the FIRST additive model
+(Qwen3 dense: correctness-complete + c1 effective every-axis parity, c8 within a cross-cutting
+decode-GEMM residual) all landed, the active priority is BREADTH: "more models and architectures",
+recent-first. Plan + audit: [breadth-sweep-plan.md](specs/breadth-sweep-plan.md). Key findings:
+(A) CUDA-ARCH additivity — the POLICY/selection layer is clean+additive (PR-#4 debt paid; a
+same-family sm_120 GPU = ~2 additive touches); the COMPUTE-KERNEL layer is a single-arch sm_121a
+monolith with no runtime SM selector, so different families (sm_90/100/80) need new kernel bodies +
+the named seam-gap fixes (CMake arch-guard→feature-table, a kernel SM selector, the paged-attn
+d==256 hardcode). CRITICAL: only GB10 sm_121 is testable on dgx — the CUDA device sweep beyond
+sm_120 is HW-BLOCKED (build/gencode-only), so it is NOT the actionable breadth. (B) The actionable
+breadth is the MODEL sweep on GB10. RANKED QUEUE (recent + present + additive first): Tier 1 =
+Qwen3-Coder-30B-A3B (`Qwen3MoeForCausalLM`, present, recent-MoE flagship, reuses the MoE path),
+Qwen3-32B dense/NVFP4A16 (dense forward done + W4A16 loader), OPT-125m cross-family canary; Tier 2
+(download) = Llama-3.x → Mistral → Gemma3 → GLM4/Olmo → Qwen3-Next; Tier 3 (campaigns) = MLA
+(DeepSeek), Mamba/SSM hybrids. Each model held to the Qwen3-established bar: token-exact
+(near-tie-robust where vLLM is self-inconsistent) AND vLLM-speed on every axis. This drives
+`ROAD-V1-C2` (model half, actionable) + `ROAD-V1-D1` (device half, HW-blocked). AFTER the first
+sweep: Metal/MLX (M4), Intel XPU, Vulkan, CPU-opt (benchmark vs llama.cpp, steal faster ideas).
+
 ## Top-level portfolio
 
 This is the single ordered roadmap table. Detailed capability/status rows live

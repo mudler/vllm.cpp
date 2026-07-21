@@ -15038,3 +15038,100 @@ FlashInfer-CUTLASS and Triton-AOT flags, gate exact tokens, and rerun the whole
 18-leg series plus graph-node traces. The driver now derives its CMake cache
 from `CPP_BENCH` (or explicit `CMAKE_CACHE`) so the reference toolchain and
 evidence metadata cannot silently bind to a different build directory.
+
+### 2026-07-21 — corrected Triton-AOT Qwen3.5-4B series complete
+
+Current source commit `557ab41d4ee02a3e5e42ffc96918baa369c22569` was
+configured in `build-nix-cuda-transplant-triton` with FlashInfer CUTLASS,
+`VLLM_CPP_TRITON=ON`, `VLLM_CPP_TRITON_REGEN=ON`, generated target `sm_120`,
+and CMake CUDA arch `120a`. The preserved prior build used CMake arch `120`;
+current main cannot cleanly compile that spelling because its current
+sm120a-only CUTLASS path is disabled and two helper functions then fail the
+global unused-function `-Werror`. No source was weakened for an obsolete build
+flag. Triton itself compiled against the actual RTX 5070 Ti target, arch 120.
+Binary SHA-256 is
+`fc3d0e157b9d578e8479fbbc61d2f90656a307d8a52da1bd315aba0749c7d6f1`.
+
+The first AOT series attempt is VOID and preserved as
+`/tmp/qwen35-transplant-4b-aot-557ab41d-void-cuda-stub`. Adding Triton AOT C
+launchers created a direct `libcuda.so.1` dependency; Nix resolved its link-only
+stub, CUDA registration failed silently, and the engine selected CPU (zero GPU
+process/memory, ~23 CPU cores). It was interrupted before the first leg
+finished. With `/run/opengl-driver/lib` first, CUDA backend tests executed
+19/19 rather than skipping, Triton-specific GDN tests executed 378/378, and the
+real 4B gate passed 3/3 cases / 1664/1664 assertions. The benchmark driver now
+puts the live driver first, supports `REQUIRE_TRITON_AOT=1`, records the
+selected build configuration/hash and fails closed when the requested AOT
+flags are absent.
+
+Immutable root `/tmp/qwen35-transplant-4b-aot-557ab41d` completed the full
+18-leg direct-ON / local-vLLM-0.24 / direct-OFF comparison under one
+`flock /tmp/gpu`. Workload and reference denominator are unchanged: Qwen3.5-4B
+plain BF16, ShareGPT SHA-256
+`9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`,
+128 requests, 131,784 actual input tokens, 16,384 output tokens, c32, greedy
+ignore-EOS, seed 0, MNB 2048, 1,280 blocks, max-len 4,096. All pre-leg compute
+snapshots were empty; each arm has three memory and three unmonitored timing
+repetitions.
+
+Direct ON / direct OFF / local vLLM-0.24 means:
+
+- request throughput: **5.317 / 5.240 / 5.814 req/s**;
+- output throughput: **680.61 / 670.54 / 744.24 tok/s**;
+- total throughput: **6155.10 / 6064.06 / 6730.46 tok/s**;
+- mean TTFT: **722.56 / 815.05 / 903.20 ms**;
+- mean TPOT/ITL: **41.44 / 41.43 / 33.56 ms**;
+- mean E2EL: **5985.90 / 6076.37 / 5164.87 ms**;
+- peak PSS: **2.405 / 8.571 / 7.569 GiB**; stable PSS:
+  **0.733 / 8.571 / 4.066 GiB**; peak VRAM:
+  **12892 / 12884 / 12942.7 MiB**.
+
+Direct ON improves total/output throughput **1.50%** over same-binary OFF,
+cuts peak/stable PSS **71.9%/91.4%**, and lowers mean TTFT **11.35%**. It
+remains 8 MiB above OFF peak VRAM, so the strict VRAM gate stays open. Direct
+ON and OFF output IDs match 128/128 in every pair and both project arms are
+internally stable. Cross-engine tokens do not bind: the available reference is
+vLLM 0.24, ON matches it for 89/89/87 requests, and vLLM repetition 3 matches
+its first repetition for only 102/128.
+
+The matching-AOT historical comparison now binds as a local regression
+diagnostic: current ON is **0.931598x** previous ON (6155.10 vs 6607.04,
+**-6.84%**); current OFF is **0.918340x** previous OFF (6064.06 vs 6603.28,
+**-8.17%**); current ON is **0.914514x** local vLLM. Current local vLLM is
+1.002x the previous 6716.47 result, so the residual is project-side rather than
+machine/reference drift. This supersedes only the void non-AOT speed
+comparison; the earlier non-AOT same-binary loader evidence remains valid.
+
+Matching exact-workload nsys traces completed with
+`--trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none
+--cuda-graph-trace=node`. Project trace SHA-256 is
+`f2e73f4ba006637986d64efda0a13070319d36d27b68bcc0b1d52b16effe7681`;
+vLLM is `cbe2afbc6b7257027b41be92806552b34bbfccf64065d0ac46a7c2476ce219a9`.
+The project trace proves AOT `chunk_gated_delta_rule_fwd_kernel_h_blockdim64`,
+`chunk_fwd_kernel_o`, `recompute_w_u_fwd_kernel`, and
+`chunk_scaled_dot_kkt_fwd_kernel` executed. Its largest buckets are BF16
+CUTLASS GEMM 37.1%, hand packed decode 11.0%, the second BF16 GEMM 9.7%, WMMA
+GEMM 8.8% and paged decode 4.2%. The packed-decode cubin is deliberately
+27B-only (`H=48`) and cannot fire for the 4B geometry, hence the hand kernel is
+expected even in an AOT build. vLLM is led by BF16 CUTLASS 23.5%, FA2 prefill
+16.1%, WMMA/GEMM tactics 12.9%/10.6%, and fused recurrent GDN 5.3%. The 4B
+project path issues no `cudaGraphLaunch`; vLLM issues 569 graph launches and
+its export contains 304,746 graph-node kernel rows, so attribution is complete
+for every graphed arm.
+
+Aggregate SHA-256 is
+`6ff009822cda2dc146301ebbd0f4adbf76d3e341c6f0eff2542dbb38c25798ed`.
+The first vLLM trace attempt is VOID because a newly uncached FlashInfer
+sampling extension exposed a manually mistyped compiler PATH; the valid rerun
+overwrote that report after using the exact driver-generated PATH. The local
+AOT claim is released and `LOAD-SAFETENSORS-DIRECT-DENSE` returns to `GATING`.
+Next gates: attribute the 6.84% current-vs-previous AOT gap, run the current
+v0.25 correctness oracle, sanitizer, strict ON<=OFF VRAM, and external 27B/35B
+regressions. No 4B result implies 27B/35B support.
+
+Checkpoint validation: driver `bash -n`, diff whitespace, agent-record and
+doc-checkpoint checks pass; the three directly relevant Python modules pass
+7/7 tests. The unrestricted `tests/tools` discovery completes 166 tests with
+47 environment-only errors on this restricted NixOS session (`/usr/bin/true`
+absent, loopback sockets denied, and clean-PATH `python3` absent); no assertion
+failure touches the benchmark driver/collector/sampler change.

@@ -52,13 +52,15 @@ struct ModelSource {
   enum class Kind { kSafetensors, kGguf };
 
   static ModelSource FromSafetensors(
-      const std::vector<SafetensorsFile>& shards);
+      const std::vector<SafetensorsFile>& shards,
+      vt::Queue* load_queue = nullptr);
   // Shares ownership of the mmap'd shards so a loader may keep them alive past
   // the load (e.g. the Qwen3.6-35B MoE deferred-expert streaming that
   // materializes routed experts per layer during PrepareMarlinResident). The
   // borrowing `safetensors` pointer is set to the owned vector.
   static ModelSource FromSafetensorsOwned(
-      std::shared_ptr<const std::vector<SafetensorsFile>> shards);
+      std::shared_ptr<const std::vector<SafetensorsFile>> shards,
+      vt::Queue* load_queue = nullptr);
   static ModelSource FromGguf(const GgufFile& gguf);
 
   Kind kind = Kind::kSafetensors;
@@ -66,6 +68,9 @@ struct ModelSource {
   // Non-null only for FromSafetensorsOwned: shared ownership a loader can retain.
   std::shared_ptr<const std::vector<SafetensorsFile>> safetensors_owned;
   const GgufFile* gguf = nullptr;
+  // Non-owning queue selected by the entrypoint. Dense plain-BF16 loaders may
+  // stage completed layers here and the runner then reuses the same queue.
+  vt::Queue* load_queue = nullptr;
 };
 
 struct ModelFactory;

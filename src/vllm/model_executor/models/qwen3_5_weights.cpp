@@ -34,6 +34,7 @@ void OwnedTensor::ReleaseHost() const {
   // item 2). Logically const — only the dead host buffer is reclaimed — so a
   // narrow const_cast, consistent with the mutable lazy-device-residency design.
   auto& self = *const_cast<OwnedTensor*>(this);
+  if (self.bytes.empty()) return;
 #if defined(__unix__) || defined(__APPLE__)
   // RETURN THE PHYSICAL PAGES TO THE OS NOW. std::vector's free() alone does not:
   // glibc raises its dynamic mmap threshold as large blocks are freed, so the
@@ -60,9 +61,12 @@ void OwnedTensor::ReleaseHost() const {
 #endif
   // swap-with-empty forces the vector to deallocate its capacity.
   std::vector<uint8_t>().swap(self.bytes);
+  self.host_released = true;
 }
 
 vt::Tensor OwnedTensor::View() const {
+  VT_CHECK(!host_released,
+           "OwnedTensor::View: host bytes were released after device upload");
   vt::Tensor t;
   t.data = const_cast<uint8_t*>(bytes.data());
   t.dtype = dtype;

@@ -37,12 +37,18 @@
 
 namespace vllm {
 
-// Dense SwiGLU MLP (replaces the 35B MoE block). Projections in Matmul-B layout
-// [in, out]; W4A4-materialized to bf16 at load. down( silu(gate(x)) * up(x) ).
+// Dense SwiGLU MLP (replaces the 35B MoE block). Synthetic/legacy projections
+// use Matmul-B [in,out], ordinary BF16 checkpoints use one raw-NK gate/up
+// owner, and compressed checkpoints retain NVFP4 residents.
 struct DenseMlpWeights {
   OwnedTensor gate_proj;  // bf16 [H, I]
   OwnedTensor up_proj;    // bf16 [H, I]
   OwnedTensor down_proj;  // bf16 [I, H]
+
+  // Plain-BF16 vLLM topology: gate/up checkpoint rows concatenated into one raw
+  // torch-Linear [2I,H] owner (nk=true), consumed by one MatmulBT + SiluAndMul.
+  // The legacy split fields above remain the synthetic-test/diagnostic fallback.
+  OwnedTensor gate_up_proj;
 
   // W4A4 fp4-resident variants (compressed-tensors NVFP4, notes §5 step-6a). On
   // the real 27B CUDA load these are populated (kept in the on-disk [N=out,K=in]
@@ -93,6 +99,9 @@ struct Qwen3_5DenseWeights {
   OwnedTensor embed_tokens;  // bf16 [vocab, H]  (NOT transposed; embed lookup)
   OwnedTensor final_norm;    // bf16 [H]
   OwnedTensor lm_head;       // bf16 [H, vocab]  (unquantized -> Matmul-B layout)
+  // Mirrors tie_word_embeddings: logits reuse embed_tokens as raw [V,H]
+  // torch-Linear storage, so no second host/device owner is created.
+  bool tied_lm_head = false;
   std::vector<Qwen3_5DenseLayerWeights> layers;
 };
 
@@ -130,7 +139,7 @@ GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
 
 // Load one dense decoder layer. `layer_type` is "linear_attention" or
 // "full_attention". Prefix is "model.language_model.layers.{layer_idx}.". Routes
-// each Linear to bf16 vs W4A4-materialized-to-bf16 per IsQwen27QuantizedLinear.
+// each Linear to ordinary BF16 or compressed NVFP4 based on tensor presence.
 Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
                                                const std::string& layer_type,
                                                int64_t layer_idx);
@@ -141,7 +150,14 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
 // head is intentionally loaded on demand by LoadQwen3_5MTP when speculative
 // decoding is enabled; it is not part of the always-resident target weights.
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
-                                     const HfConfig& config);
+                                     const HfConfig& config,
+                                     vt::Queue* load_queue = nullptr);
+
+// Host-lifetime helpers for ordinary dense CUDA models. The release function
+// drops only tensors whose authoritative raw/F32 device representation exists;
+// unused fallbacks stay host-resident. The caller synchronizes first.
+bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights);
+size_t ReleaseResidentQwen3_5DenseHostWeights(Qwen3_5DenseWeights& weights);
 
 // Dense single-sequence reference forward (text path). Mirrors
 // Qwen3_5Model::ForwardDense but runs the dense SwiGLU MLP in place of the MoE
@@ -149,6 +165,12 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
 // logits [T, vocab] f32 (T = token_ids.size()). CPU or CUDA per `queue`.
 class Qwen3_5DenseModel {
  public:
+  // Eagerly create every raw/F32 resident needed by the currently loaded dense
+  // layers. Used by the bounded direct-device loader before releasing host
+  // staging bytes; normal forwards remain lazy.
+  static void PrepareBf16Resident(const Qwen3_5DenseWeights& weights,
+                                  vt::Queue& queue);
+
   // Batched PAGED dense forward — the 27B analogue of Qwen3_5Model::Forward.
   // Same signature/structure (paged KV cache for the full-attn layers, batched
   // GDN recurrent state for the GDN layers, the f32 residual thread), reusing the

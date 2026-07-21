@@ -156,19 +156,22 @@ const ModelRegistration& RegistrationFor(std::string_view architecture) {
 LoadedModel::~LoadedModel() = default;
 
 ModelSource ModelSource::FromSafetensors(
-    const std::vector<SafetensorsFile>& shards) {
+    const std::vector<SafetensorsFile>& shards, vt::Queue* load_queue) {
   ModelSource source;
   source.kind = Kind::kSafetensors;
   source.safetensors = &shards;
+  source.load_queue = load_queue;
   return source;
 }
 
 ModelSource ModelSource::FromSafetensorsOwned(
-    std::shared_ptr<const std::vector<SafetensorsFile>> shards) {
+    std::shared_ptr<const std::vector<SafetensorsFile>> shards,
+    vt::Queue* load_queue) {
   ModelSource source;
   source.kind = Kind::kSafetensors;
   source.safetensors = shards.get();
   source.safetensors_owned = std::move(shards);
+  source.load_queue = load_queue;
   return source;
 }
 

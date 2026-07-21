@@ -6,6 +6,12 @@ compile_commands.json
 *.a
 *.so
 .venv/
+.venv-vllm/
+.hf-cache/
+.torchinductor-cache/
+.triton-cache/
+.vllm-cache/
+.flashinfer-cache/
 __pycache__/
 
 # stray compiler output

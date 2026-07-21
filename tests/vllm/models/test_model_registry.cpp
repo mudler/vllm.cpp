@@ -188,6 +188,23 @@ TEST_CASE("runtime quant capability distinguishes true W4A4 from dense BF16") {
   CHECK(w4a4_model->uses_nvfp4_w4a4());
 }
 
+TEST_CASE("safetensors model source propagates the selected load queue") {
+  std::vector<vllm::SafetensorsFile> shards;
+  vt::Queue queue;
+  vllm::ModelSource borrowed =
+      vllm::ModelSource::FromSafetensors(shards, &queue);
+  CHECK(borrowed.safetensors == &shards);
+  CHECK(borrowed.load_queue == &queue);
+
+  auto owned_shards =
+      std::make_shared<const std::vector<vllm::SafetensorsFile>>();
+  vllm::ModelSource owned =
+      vllm::ModelSource::FromSafetensorsOwned(owned_shards, &queue);
+  CHECK(owned.safetensors == owned_shards.get());
+  CHECK(owned.safetensors_owned == owned_shards);
+  CHECK(owned.load_queue == &queue);
+}
+
 TEST_CASE("Qwen3.5 KV spec mirrors independent conv and SSM cache dtypes") {
   HfConfig config = Config({"Qwen3_5ForConditionalGeneration"});
   config.num_key_value_heads = 2;

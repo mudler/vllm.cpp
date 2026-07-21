@@ -14699,3 +14699,48 @@ Active row `LOAD-SAFETENSORS-DIRECT-DENSE`; the related
 `PARTIAL` for the pre-existing text-only implementation. Claim
 `CLAIM-LOCAL-BF16-TRANSPLANT`. No production code, GPU command, model gate or
 benchmark ran. Implementation and every current-oracle axis are `PENDING`.
+
+### 2026-07-21 — local Blackwell plain-BF16 transplant implemented and locally CUDA-gated (`GATING`)
+
+The selected work now lives on `local-blackwell-main-transplant`, forked from
+main `a1611c73`; the source branch remains unchanged at `42a2c897`. W0-W3 are
+implemented without reviving the superseded branch machinery: the checked-in
+Nix CPU/CUDA shells and diagnostic tools; the NVFP4 device-compile guard;
+ordinary BF16/F32 Qwen3.5 dense loading; raw-NK Q/K/V/O, merged QKVZ/BA and
+merged gate/up owners; tied embedding/logits; logical weight presence after
+host-byte release; and layer-bounded same-queue staging whose queue is handed
+to the runner. The current merged-GDN, fusion, async, windowed-source-release,
+self-registration, Qwen3 and Qwen3-MoE implementations stay binding.
+
+Validation:
+
+- CPU clean build succeeds. Focused loader/registry/forward selection is 6/6.
+  With `HF_HOME=$PWD/.hf-cache`, the real Qwen3.5-4B test is 3/3 cases and
+  1656/1656 assertions. The full parallel sweep is 131/134; the API and
+  conformance socket tests re-pass 2/2 serially in isolation, while
+  `test_serve_low_tools` remains an unrelated NixOS portability failure because
+  it assumes `/usr/bin/true` and a `/usr/bin` Python PATH.
+- The Nix CUDA 12.9.86/GCC14 build configures for sm_120a and the full production
+  `vllm` target compiles, including `cuda_matmul_nvfp4.cu` and the transplanted
+  Qwen3.5 paths. Host driver 595.71.05 reports an idle RTX 5070 Ti outside the
+  restricted workspace sandbox.
+- On that RTX, the real Qwen3.5-4B CUDA test passes 3/3 and 1664/1664. Its
+  full-engine case loads the same model twice in one binary with
+  `VT_DIRECT_DEVICE_LOAD=0` and `=1`, then proves identical prompt and four
+  greedy output token IDs. The focused CUDA transplant selection is 5/5.
+- The broader CUDA `test_op_parity` is 259/261: two existing GDN BA BF16
+  projection snapshots are GB10-specific and differ on sm_120. Neither path is
+  modified by this loader leaf. Python diagnostic scripts compile and the
+  production CUDA target is warning-clean.
+
+Disposition: `LOAD-SAFETENSORS-DIRECT-DENSE` is `GATING`, not supported/DONE,
+and `benchmark_binding=false`; the completed transplant claim is released.
+This machine lacks the required current pinned
+vLLM/v0.25 oracle and the 27B/35B checkpoints; the available vLLM 0.24
+environment is explicitly `VOID`. The local shell also lacks the
+`compute-sanitizer` CLI. Exact resume order: supply the current oracle and gate
+snapshots; run current-oracle 4B tokens plus 27B 235/235 and 35B 315/315;
+sanitizer the release boundary; capture matching `nsys --cuda-graph-trace=node`
+ON/OFF/vLLM traces; then run at least three uncontended interleaved repetitions
+covering PSS/RSS, VRAM, startup, total/output throughput, request rate, TTFT,
+TPOT and ITL. No historical local performance number receives credit.

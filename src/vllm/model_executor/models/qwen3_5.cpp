@@ -1011,6 +1011,20 @@ DBuf MatmulBf16D(Dev d, const Tensor& x, const OwnedTensor& w) {
   return dout;
 }
 
+// A tied BF16 lm_head follows torch Linear's model-dtype output, then the
+// engine exposes f32 logits to the sampler. Explicit 27B heads retain the
+// existing f32-output MatmulF32D path.
+DBuf MatmulBf16LogitsF32D(Dev d, const Tensor& x, const OwnedTensor& w) {
+  DBuf bf16 = MatmulBf16D(d, x, w);
+  DBuf f32(d, DType::kF32, {bf16.t().shape[0], bf16.t().shape[1]});
+  vt::CastF32(d.q, f32.t(), bf16.t());
+  return f32;
+}
+
+const OwnedTensor& DenseLmHead(const Qwen3_5DenseWeights& weights) {
+  return weights.tied_lm_head ? weights.embed_tokens : weights.lm_head;
+}
+
 // Device-resident view over an Fp8Weight's raw fp8 [N,K] bytes, uploaded ONCE
 // (lazily) and reused across every forward step (mirror ResidentNvfp4). The
 // shared_ptr in the (const) weight owns the device buffer for the model lifetime.
@@ -1979,7 +1993,11 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
                  ? MatmulNvfp4Bf16D(d, h, fp4_weight)
                  : MatmulNvfp4F32D(d, h, fp4_weight);
     }
-    return MatmulF32D(d, h, plain_weight);
+    // Ordinary Qwen3.5 safetensors retain raw torch BF16 weights and therefore
+    // torch Linear's BF16 output. Existing transposed GGUF/synthetic paths keep
+    // their established f32 output.
+    return plain_weight.nk ? MatmulBf16D(d, h, plain_weight)
+                           : MatmulF32D(d, h, plain_weight);
   };
   out.q_owner.emplace(
       project(w.q_proj_fp4, w.q_proj_fp8, w.q_proj));
@@ -4558,6 +4576,14 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
     return MatmulNvfp4Bf16D(d, act.t(), w.down_proj_fp4);
   }
 #endif
+  if (!fp4 && !w.gate_up_proj.Empty()) {
+    // Qwen3.5's MergedColumnParallelLinear: one raw-NK [2I,H] projection,
+    // followed by SiluAndMul and the raw-NK down projection.
+    DBuf gate_up = MatmulBf16D(d, dh, w.gate_up_proj);
+    DBuf act(d, DType::kBF16, {T, I});
+    vt::SiluAndMul(d.q, act.t(), gate_up.t());
+    return MatmulBf16D(d, act.t(), w.down_proj);
+  }
   // QUANTIZE-ONCE for gate/up: shared activation dh + shared input_global_scale ->
   // one ScaledFp4Quant feeding both fp4 GEMMs (removes 1 redundant [T,H] quant).
   const bool fuse_gu =
@@ -5048,6 +5074,61 @@ void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
 #endif
 }
 
+void Qwen3_5DenseModel::PrepareBf16Resident(
+    const Qwen3_5DenseWeights& weights, vt::Queue& queue) {
+  VT_CHECK(platforms::GetPlatform(queue.device.type).is_cuda(),
+           "PrepareBf16Resident: CUDA queue required");
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const auto raw = [&d](const OwnedTensor& tensor) {
+    if (!tensor.Empty()) (void)ResidentWeight(d, tensor);
+  };
+  const auto f32 = [&d](const OwnedTensor& tensor) {
+    if (!tensor.Empty()) {
+      const std::vector<int64_t> shape(tensor.shape,
+                                       tensor.shape + tensor.rank);
+      (void)ResidentWeightF32(d, tensor, shape);
+    }
+  };
+
+  raw(weights.embed_tokens);
+  raw(weights.final_norm);
+  raw(DenseLmHead(weights));
+  for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
+    raw(layer.input_layernorm);
+    raw(layer.post_attention_layernorm);
+    if (layer.is_linear_attention) {
+      const GdnLayerWeights& gdn = layer.gdn;
+      raw(gdn.in_proj_qkv);
+      raw(gdn.in_proj_z);
+      raw(gdn.in_proj_qkvz);
+      raw(gdn.in_proj_b);
+      raw(gdn.in_proj_a);
+      raw(gdn.in_proj_ba);
+      raw(gdn.conv1d_weight);
+      f32(gdn.conv1d_weight);
+      raw(gdn.a_log);
+      raw(gdn.dt_bias);
+      raw(gdn.norm_weight);
+      f32(gdn.norm_weight);
+      raw(gdn.out_proj);
+    } else {
+      const FullAttnLayerWeights& attn = layer.attn;
+      raw(attn.q_proj);
+      raw(attn.k_proj);
+      raw(attn.v_proj);
+      raw(attn.o_proj);
+      raw(attn.q_norm);
+      raw(attn.k_norm);
+      f32(attn.q_norm);
+      f32(attn.k_norm);
+    }
+    raw(layer.mlp.gate_proj);
+    raw(layer.mlp.up_proj);
+    raw(layer.mlp.gate_up_proj);
+    raw(layer.mlp.down_proj);
+  }
+}
+
 std::vector<float> Qwen3_5Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
@@ -5166,7 +5247,9 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
 
   // lm_head is unquantized bf16 in the 27B (notes §3.6): the one host Download.
-  DBuf dlogits = MatmulF32D(d, dnorm.t(), weights.lm_head);
+  const OwnedTensor& lm_head = DenseLmHead(weights);
+  DBuf dlogits = lm_head.nk ? MatmulBf16LogitsF32D(d, dnorm.t(), lm_head)
+                            : MatmulF32D(d, dnorm.t(), lm_head);
   std::vector<float> logits(static_cast<size_t>(T) * vocab);
   dlogits.Download(d, logits.data());
   return logits;
@@ -5178,7 +5261,7 @@ Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
     : weights_(&weights),
       config_(&config),
       embed_tokens_(&target.embed_tokens),
-      lm_head_(&target.lm_head) {
+      lm_head_(&DenseLmHead(target)) {
   VT_CHECK(weights.kind == Qwen3_5MTPKind::kDense,
            "qwen3_5 MTP: dense target requires dense MTP weights");
 }
@@ -5453,9 +5536,13 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
     const int64_t n_out = static_cast<int64_t>(logits_indices.size());
     DBuf dgather(d, DType::kBF16, {n_out, H});
     GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
-    return MatmulF32D(d, dgather.t(), weights.lm_head);
+    const OwnedTensor& lm_head = DenseLmHead(weights);
+    return lm_head.nk ? MatmulBf16LogitsF32D(d, dgather.t(), lm_head)
+                      : MatmulF32D(d, dgather.t(), lm_head);
   }
-  return MatmulF32D(d, dnorm.t(), weights.lm_head);
+  const OwnedTensor& lm_head = DenseLmHead(weights);
+  return lm_head.nk ? MatmulBf16LogitsF32D(d, dnorm.t(), lm_head)
+                    : MatmulF32D(d, dnorm.t(), lm_head);
 }
 
 // Full eager dense paged forward body: embed (host token_ids) then the capturable

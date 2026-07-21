@@ -298,6 +298,16 @@ list of what the project supports.
   result is binding as a local 4B diagnostic, not as support: v0.25 correctness,
   sanitizer, strict ON<=OFF VRAM (+8 MiB currently), and external 27B/35B gates
   remain. Row returns to `GATING`.
+- 2026-07-21: `CLAIM-LOCAL-BF16-AOT-PROFILE` RELEASED — five matched
+  exact-workload node-mode nsys captures at
+  `/tmp/qwen35-transplant-4b-aot-profile-832ff89d` attribute the 4B regression
+  to the missing current-ABI H=32 packed Triton AOT realization: current sync
+  GPU time is 23.307 vs previous 21.960 s, led by hand recurrence 2.580 s /
+  234.2 us-call versus previous Triton 0.602 s / 47.7 us-call. Async is a
+  secondary 2.20%; pool-cap mismatch is speed-neutral; packed-off is invalid
+  (117/128 outputs). No engine change or speed credit. The row stays `GATING`;
+  H=32 implementation/A-B, current-v0.25, sanitizer, strict VRAM and external
+  27B/35B remain separately claimable.
 - 2026-07-18: `CLAIM-MEM35-HOSTFREE` RELEASED — `ENG-MOE-HOSTFREE` → `DONE` (closing `ac77bec`). The 35B MoE Marlin host-weight free (`OwnedTensor::ReleaseHost` = `madvise(MADV_DONTNEED)`+swap, gated on `MarlinMoeEnabled()`, `VT_MOE_HOST_FREE=0` rollback) returns the ~16.9 GiB routed-expert fp4 host mirror after the device Marlin resident is built → 35B STEADY serving PSS 20.17→**3.53 GiB** (clean same-binary A/B, DGX `~/work/mem35-hostfree`), token-neutral 315/315+235/235, c2 smoke + memcheck clean, load-path release/retention 27/27+15/15. Realizes item-2 `release_host_weights_after_upload` for the dominant host consumer (flag stays with `CLAIM-BACKEND-PLATFORM-1`). Scoped to the STEADY mirror; the whole-window load-phase PEAK remains for the streaming follow-on (`ENG-EXPERT-STREAM`). Spec [moe-marlin-host-free.md](specs/moe-marlin-host-free.md), ledger 2026-07-18 row, worktree `agent-adaf49c4fc639d5ab` released.
 - 2026-07-17: `CLAIM-EW-NORM-ACT-1` RELEASED — `KERNEL-EW-NORM-ACT` decode-fast RMSNorm proof PASSED (gate3 token gates both flags/models; gate4 corrected-build c16 A/B +1.1% tput / −1.7 ms TPOT) and `VT_RMSNORM_DECODE_FAST` default flipped ON (`=0` rollback). Verdict in [the spec](specs/rmsnorm-decode-fast-2026-07-16.md) + ledger 2026-07-17 row; row `KERNEL-EW-NORM-ACT` → `DONE`. Finalized by the orchestrator after the owning agent was repeatedly terminated by API-529 overloads (work verified, not re-done).
 

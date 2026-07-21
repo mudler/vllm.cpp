@@ -15080,3 +15080,57 @@ doc-checkpoint checks pass; the three directly relevant Python modules pass
 47 environment-only errors on this restricted NixOS session (`/usr/bin/true`
 absent, loopback sockets denied, and clean-PATH `python3` absent); no assertion
 failure touches the benchmark driver/collector/sampler change.
+
+### 2026-07-21 — Qwen3.5-4B AOT regression profile attribution complete
+
+`CLAIM-LOCAL-BF16-AOT-PROFILE` ran five exact-workload project profiles under
+one `flock /tmp/gpu` on the idle RTX 5070 Ti. Immutable root:
+`/tmp/qwen35-transplant-4b-aot-profile-832ff89d`. All captures used
+`nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none
+--cuda-graph-trace=node --stats=false`; the project recorded no CUDA graph
+launch, so no child kernel is omitted. Workload stayed the binding local 4B
+diagnostic: ShareGPT SHA
+`9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`,
+128 requests / 131,784 input / 16,384 output tokens, c32, MNB 2048 and 1,280
+blocks. Previous/current binaries are SHA
+`2ecb5f97…60c0`/`fc3d0e15…6f1`, both Triton-AOT sm_120; previous CMake arch
+was 120 and current is 120a.
+
+Profiler results (total tok/s / GPU-kernel seconds): old capped
+**6560.73/21.944263**, old uncapped **6586.39/21.960202**, current shipping
+async **6079.71/23.637218**, current sync (`VT_ASYNC_RUNNER=0`)
+**6213.75/23.306561**, current sync + packed-off
+**6266.92/23.091041**. Current async and sync outputs match 128/128. Async-off
+recovers 2.20% under profiler but current sync remains 5.66% below old
+uncapped. Old cap removal is only +0.39%; pool evidence (374→0 evictions,
+~1,014→1,123 MiB cached) explains the prior +1,200-MiB memory denominator,
+not speed.
+
+The matched synchronous traces prove a GPU regression: total kernel time grows
+**+1.346360 s**. The dominant executed-path change is old sm120 Triton
+`gdn_decode_kernel` **0.601555 s / 12,624 / 47.652 us-call** disappearing and
+current hand `GdnPackedDecodeKernel<bf16,float,8>` taking **2.579749 s / 11,016
+/ 234.182 us-call**. The raw recurrence delta is +1.978 s; current FA2 prefill
+and fusion improvements offset part of it. Secondary, not-yet-isolated deltas
+include slower common small GEMMs and current prefill convolution. CUDA API
+blocking sites merely move between sync/copy/free calls and do not refute the
+GPU-total result.
+
+Packed-off is rejected: it improves only 0.86% over current sync, matches
+shipping outputs only 117/128, and swaps the packed kernel for **2.652254 s**
+of `GdnDecodeFusedKernel` plus glue. Source/runtime grounding identifies the
+real gap: current AOT declares only the 27B Hk=16/Hv=48 packed specialization
+(`cmake/TritonAOTKernels.cmake:76-86`); `TryTritonPackedDecode`
+(`cuda_gdn.cu:4316-4380`) rejects Qwen3.5-4B H=32 and falls through to the hand
+kernel. vLLM's exact trace executes
+`fused_recurrent_gated_delta_rule_packed_decode_kernel` at **1.451278 s /
+13,872 / 104.619 us-call**, confirming the H=32 packed Triton target.
+
+Disposition: diagnosis complete, no engine change and no speed credit. The
+next separately claimed implementation must specialize the current generic
+raw-packed/f32-state Triton shim for H=32, extend exact guards, and prove
+same-binary token identity plus repeated A/B. Do not restore the old decomposed
+H=32 ABI: it consumed precomputed q/k/v/g/beta and BF16 state. Full evidence
+and SHA-256s: `docs/bench-evidence/qwen35-4b-aot-regression-profile-20260721.md`.
+`LOAD-SAFETENSORS-DIRECT-DENSE` stays `GATING`; current-v0.25 correctness,
+sanitizer, strict VRAM and external 27B/35B remain open. Claim released.

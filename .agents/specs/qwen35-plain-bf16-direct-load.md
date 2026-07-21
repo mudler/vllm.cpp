@@ -149,17 +149,28 @@ three pairs. The +8 MiB ON-vs-OFF VRAM delta keeps the strict VRAM gate open.
 
 Current AOT ON is **0.9316x** the previous AOT ON (**6155.10 vs 6607.04,
 -6.84%**) and **0.9145x** local vLLM; current vLLM is 1.002x the previous
-reference, so the residual is project-side. Matching nsys captures show the
-generated AOT GDN chunk kernels executing. The packed-decode AOT cubin is
-27B-only by contract and is ineligible for the 4B geometry, whose trace
-correctly contains `GdnPackedDecodeKernel`. vLLM graph launches include
-304,746 graph-node kernel rows; the project 4B path makes no graph launch, so
-there are no omitted project child kernels. Aggregate SHA-256 is
-`6ff009822cda2dc146301ebbd0f4adbf76d3e341c6f0eff2542dbb38c25798ed`;
-project/vLLM trace SHA-256 values are `f2e73f4b...681` and `cbe2afbc...9a9`.
+reference, so the residual is project-side. Attribution is now complete in
+[the matched profile report](../../docs/bench-evidence/qwen35-4b-aot-regression-profile-20260721.md).
+The lock-held node-mode nsys series holds the workload and AOT stack fixed and
+shows synchronous current/previous GPU kernel time **23.306561/21.960202 s**.
+The dominant executed-path swap is the previous H=32 sm120 Triton recurrence
+at **0.601555 s / 47.652 us-call** becoming the current hand packed recurrence
+at **2.579749 s / 234.182 us-call**. Shipping async is a secondary 2.20%
+penalty. The old 1,024-MiB pool cap changes speed only 0.39%, so it explains
+the memory denominator rather than throughput. Packed-off is not a remedy:
+it gains only 0.86%, changes 11/128 outputs, and remains a 2.652-s recurrence.
+The exact vLLM trace executes its H=32 packed Triton body at 104.619 us/call.
+
+The next implementation checkpoint must add an H=32 sm120 specialization of
+the **current** raw-packed/f32-state Triton ABI, extend the exact-shape launcher
+guard and prove token identity plus repeated same-binary A/B. The old
+decomposed H=32 cubin remains out of scope because it consumed precomputed
+q/k/v/g/beta and BF16 state, which no longer matches main. Generated AOT GDN
+chunk kernels remain trace-proven. The project path has no graph launch, so
+node-mode captured all its kernels; the vLLM trace contains graph-node rows.
 The local vLLM arm remains a performance reference only: it is v0.24, not the
-current v0.25 correctness oracle. Current-v0.25 correctness, sanitizer,
-current-vs-previous AOT attribution and external 27B/35B regressions remain.
+current v0.25 correctness oracle. Current-v0.25 correctness, sanitizer, strict
+VRAM closure and external 27B/35B regressions remain.
 
 Corrected AOT reproduction entry point:
 
@@ -214,10 +225,11 @@ REQUIRE_TRITON_AOT=1 \
    current preamble/GDN dispatch; regression tests.
 4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
    queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
-5. `W4` gates: **GATING / LOCAL AOT 4B COMPLETE** — 18/18 guarded legs and
-   matching traces bind the current 4B diagnostic. Current is 0.9316x the
-   previous AOT result and 0.9145x local vLLM; direct loading remains exact and
-   memory-positive. Current-v0.25 correctness, regression attribution,
+5. `W4` gates: **GATING / LOCAL AOT 4B PROFILE COMPLETE** — 18/18 guarded
+   legs bind the current 4B diagnostic; a matched five-arm nsys series
+   attributes the regression to the missing current-ABI H=32 packed Triton AOT
+   path, with async secondary. Direct loading remains exact and memory-positive.
+   The H=32 implementation/same-binary A/B, current-v0.25 correctness,
    sanitizer, strict ON<=OFF VRAM and external 27B/35B remain follow-ups.
 
 ## Risks and decisions
@@ -230,5 +242,6 @@ REQUIRE_TRITON_AOT=1 \
   is transferred exactly once to the runner; exceptions destroy it locally.
 - Main's FP8/NVFP4/GGUF branches are numerically gated. Plain behavior is keyed
   by actual tensor presence/orientation, never by `num_experts == 0` alone.
-- Historical branch benchmarks are not current evidence. README and
-  BENCHMARKS carry `PENDING` until rerun.
+- Historical numbers bind only through the matched AOT workload/build audit;
+  the current checkpoint keeps implementation and external-hardware gates
+  explicitly `PENDING` in README and BENCHMARKS.

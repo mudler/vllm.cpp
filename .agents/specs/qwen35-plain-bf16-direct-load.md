@@ -144,7 +144,8 @@ exact-corpus/output-ID benchmark hooks are restored and pass **4/4 cases,
 collector reports the matching closed-loop TTFT/TPOT/ITL families and exact
 tokens; its production-graphed vLLM 0.24 two-token preflight is green after the
 driver derives Nix's split nvcc/cudart/cuRAND toolchain into a symlink-only
-`CUDA_HOME`. The immutable lock-held comparison run is next.
+`CUDA_HOME`. The immutable lock-held comparison run is next at evidence root
+`/tmp/qwen35-transplant-4b-b0a520f1` using driver commit `b0a520f1`.
 
 Reproduction entry point:
 

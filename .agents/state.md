@@ -14800,3 +14800,9 @@ a monolithic CUDA toolkit; the driver derives nvcc, cudart and cuRAND from the
 immutable CMake cache and assembles a symlink-only `CUDA_HOME` in `/tmp`.
 Helper/unit checks are green (shell syntax, Python compile, 2/2 pure tests).
 No benchmark result is claimed yet; the full 18-leg series is next.
+
+### 2026-07-21 — exact 4B evidence root bound (`ACTIVE`)
+
+The committed series tooling is `b0a520f1`; the active claim now binds its
+single-lock output to `/tmp/qwen35-transplant-4b-b0a520f1`. No result is claimed
+by this administrative checkpoint; the full series is the immediate next command.

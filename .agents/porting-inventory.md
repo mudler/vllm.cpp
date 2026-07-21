@@ -706,10 +706,12 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     the FIRST landed under a MEASURED-not-inferred codegen proof.
     `triton_kernels/fused_recurrent_packed_decode.py` (FLA body VERBATIM; AOT
     adaptations: scale pinned to Dk^-0.5 in-kernel — same fp32-scalar mis-pack as
-    chunk_o; constexpr dims/strides pinned per-shape to the 27B call site; one dead
+    chunk_o; constexpr dims/strides pinned per-shape to the supported dense call
+    sites; one dead
     grid-carrier `NBH`=B*HV; state-index ABI adapter `state_idx < 0` for our
-    slot-0-valid cache ABI vs FLA's `<= 0`). One specialization gdn_decode_h48
-    (27B: H=16, HV=48, K=V=128, BK=128, BV=32; 35B does NOT select packed decode);
+    slot-0-valid cache ABI vs FLA's `<= 0`). Exact specializations
+    `gdn_decode_h48` (27B) and `gdn_decode_h32` (dense 4B), both H=16, K=V=128,
+    BK=128, BV=32; 35B does NOT select packed decode;
     dispatch `TryTritonPackedDecode` in `cuda_gdn.cu` behind runtime toggle
     `VT_GDN_PACKED_DECODE_TRITON` (**default ON since the 2026-07-16 flip** —
     MIRROR policy: it is vLLM's exact token-identical FLA kernel; `=0` rolls back

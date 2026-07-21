@@ -15134,3 +15134,34 @@ H=32 ABI: it consumed precomputed q/k/v/g/beta and BF16 state. Full evidence
 and SHA-256s: `docs/bench-evidence/qwen35-4b-aot-regression-profile-20260721.md`.
 `LOAD-SAFETENSORS-DIRECT-DENSE` stays `GATING`; current-v0.25 correctness,
 sanitizer, strict VRAM and external 27B/35B remain open. Claim released.
+
+## 2026-07-21 — dense-4B current-ABI H=32 packed Triton repair checkpoint
+
+User authorized the repair identified by the matched regression profile.
+`CLAIM-LOCAL-BF16-H32-AOT` is active on
+`local-blackwell-main-transplant`. The implementation extends the existing
+verbatim vLLM/FLA raw-packed decode shim with one exact Hk=16/Hv=32/Dk=Dv=128
+specialization: mixed/BA/state strides 8192/64/524288, warps1/stages3, grid
+`4,NBH,1`. `TryTritonPackedDecode` now accepts Hv in {48,32}, lazily loads and
+dispatches the matching stable launcher, and retains every dtype/stride/scale
+guard plus the hand-kernel rollback. Dense-only model selection means the new
+Hv=32 cubin serves Qwen3.5-4B while Qwen3.6-35B-A3B remains inert. The obsolete
+old-branch decomposed q/k/v/g/beta and BF16-state ABI was not restored.
+
+Canonical regeneration produced the new local sm_120 and checked-in sm_121a
+dispatcher/cubin/manifest artifacts. Local AOT gates are green:
+`test_gdn_packed_decode_triton` **1/1, 10/10**; focused exact Hv=48+32
+AOT-vs-hand-vs-CPU **1/1, 56/56**; full `test_ops_gdn` **53/53,
+3,229/3,229**; `scripts/check-triton-aot-drift.sh` and its mutation suite pass.
+The implementation tree has no performance number by design: the benchmark
+harness requires an immutable clean commit.
+
+Next: commit this implementation checkpoint, create evidence root
+`/tmp/qwen35-h32-aot-<commit>`, then hold one `flock /tmp/gpu` across the 4B
+default/`VT_GDN_PACKED_DECODE_TRITON=0` token/sanitizer/repeated A/B and
+`nsys --cuda-graph-trace=node` series. Resume with
+`git status --short && git rev-parse HEAD`, then rebuild/gate
+`build-nix-cuda-transplant-triton` and run the exact compare driver recorded in
+`docs/BENCHMARKS.md`. Current-v0.25 correctness, strict VRAM and external
+27B/35B follow-ups remain open; no H32 speed credit is claimed at this
+checkpoint.

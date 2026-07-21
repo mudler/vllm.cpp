@@ -161,16 +161,18 @@ the memory denominator rather than throughput. Packed-off is not a remedy:
 it gains only 0.86%, changes 11/128 outputs, and remains a 2.652-s recurrence.
 The exact vLLM trace executes its H=32 packed Triton body at 104.619 us/call.
 
-The next implementation checkpoint must add an H=32 sm120 specialization of
-the **current** raw-packed/f32-state Triton ABI, extend the exact-shape launcher
-guard and prove token identity plus repeated same-binary A/B. The old
-decomposed H=32 cubin remains out of scope because it consumed precomputed
-q/k/v/g/beta and BF16 state, which no longer matches main. Generated AOT GDN
-chunk kernels remain trace-proven. The project path has no graph launch, so
-node-mode captured all its kernels; the vLLM trace contains graph-node rows.
-The local vLLM arm remains a performance reference only: it is v0.24, not the
-current v0.25 correctness oracle. Current-v0.25 correctness, sanitizer, strict
-VRAM closure and external 27B/35B regressions remain.
+The current raw-packed/FP32-state H=32 specialization is now implemented:
+Hk=16/Hv=32/Dk=Dv=128, mixed/BA/state strides 8192/64/524288 and the upstream
+warps1/stages3 launch. The launcher guard dispatches Hv in {48,32}; dense-only
+model selection keeps 35B inert. Local sm_120 and vendored sm_121a generation
+pass drift validation; exact two-shape AOT-vs-hand-vs-CPU is 56/56, full GDN
+53/53 (3,229/3,229), and flag parsing 10/10. The old decomposed H=32 cubin
+remains absent because it consumed precomputed q/k/v/g/beta and BF16 state,
+which no longer matches main. The clean-commit 4B token/sanitizer/repeated A/B
+and graph-node profile are next; no new speed binds yet. The local vLLM arm
+remains a performance reference only: it is v0.24, not the current v0.25
+correctness oracle. Current-v0.25 correctness, strict VRAM closure and external
+27B/35B regressions remain.
 
 Corrected AOT reproduction entry point:
 
@@ -225,12 +227,13 @@ REQUIRE_TRITON_AOT=1 \
    current preamble/GDN dispatch; regression tests.
 4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
    queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
-5. `W4` gates: **GATING / LOCAL AOT 4B PROFILE COMPLETE** — 18/18 guarded
+5. `W4` gates: **ACTIVE / H32 IMPLEMENTED, PERFORMANCE PENDING** — 18/18 guarded
    legs bind the current 4B diagnostic; a matched five-arm nsys series
    attributes the regression to the missing current-ABI H=32 packed Triton AOT
    path, with async secondary. Direct loading remains exact and memory-positive.
-   The H=32 implementation/same-binary A/B, current-v0.25 correctness,
-   sanitizer, strict ON<=OFF VRAM and external 27B/35B remain follow-ups.
+   The current-ABI H32 specialization and exact operator/drift gates are green;
+   clean-commit same-binary A/B/profile, current-v0.25 correctness, sanitizer,
+   strict ON<=OFF VRAM and external 27B/35B remain follow-ups.
 
 ## Risks and decisions
 

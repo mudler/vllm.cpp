@@ -3,7 +3,7 @@
 // CPU-tier contract for the env-flag plumbing that selects the vendored Triton
 // AOT packed-decode fast-path (src/vt/cuda/gdn_packed_decode_triton.h): the
 // VT_GDN_PACKED_DECODE_TRITON flag predicate. The cubin itself is CUDA-only and
-// lives in cuda_gdn.cu (TryTritonPackedDecode -> gdn_decode_h48); its
+// lives in cuda_gdn.cu (TryTritonPackedDecode -> gdn_decode_h{48,32}); its
 // bit-exactness and the default-fires / "=0"-rollback launch check are DGX-gated
 // CUDA cases in tests/vt/test_ops_gdn.cpp. This suite pins the portable
 // default-ON / '0'-off parse so the rollback contract is regression-covered on

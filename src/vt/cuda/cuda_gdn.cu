@@ -72,11 +72,12 @@ extern "C" {
 #include "gdn_wu_h48.h"
 #include "gdn_wu_h32.h"
 // GDN packed pure-decode recurrence (fused_recurrent_gated_delta_rule packed
-// decode): gdn_decode_h48_default. 27B ONLY. See
+// decode): gdn_decode_h48_default / gdn_decode_h32_default. See
 // triton_kernels/fused_recurrent_packed_decode.py. The MEASURED codegen-bound
 // lever (dgx phase1 2026-07-16): REG:205/0-spill under Triton vs REG:255+STACK:48
 // (spills) as hand-CUDA at BK=128.
 #include "gdn_decode_h48.h"
+#include "gdn_decode_h32.h"
 }
 #endif
 
@@ -4247,6 +4248,7 @@ struct GdnAotModuleOnce {
   std::once_flag tril_h32;
   std::once_flag wu_h32;
   std::once_flag decode_h48;
+  std::once_flag decode_h32;
 };
 
 GdnAotModuleOnce& GdnAotModules() {
@@ -4296,9 +4298,15 @@ void EnsureGdnWULoaded(int64_t hv_n) {
   }
 }
 
-// 27B-only vendored packed-decode cubin (H=48). 35B does not select packed decode.
-void EnsureGdnPackedDecodeLoaded() {
-  std::call_once(GdnAotModules().decode_h48, load_gdn_decode_h48);
+// Dense packed-decode cubins cover Hv={48,32}. The 35B MoE model does not
+// select packed decode; Hv=32 serves the dense 4B model.
+void EnsureGdnPackedDecodeLoaded(int64_t hv_n) {
+  auto& modules = GdnAotModules();
+  if (hv_n == 48) {
+    std::call_once(modules.decode_h48, load_gdn_decode_h48);
+  } else {
+    std::call_once(modules.decode_h32, load_gdn_decode_h32);
+  }
 }
 
 void EnsureAllGdnAotModulesLoaded() {
@@ -4310,7 +4318,7 @@ void EnsureAllGdnAotModulesLoaded() {
 #endif
     EnsureGdnWULoaded(hv_n);
   }
-  EnsureGdnPackedDecodeLoaded();  // 27B-only (H=48)
+  for (const int64_t hv_n : {48, 32}) EnsureGdnPackedDecodeLoaded(hv_n);
 }
 
 // SANCTIONED Triton AOT fast-path dispatch for the GDN packed pure-decode
@@ -4319,15 +4327,15 @@ void EnsureAllGdnAotModulesLoaded() {
 // toggle VT_GDN_PACKED_DECODE_TRITON: DEFAULT ON — the vendored kernel IS vLLM's
 // exact token-identical FLA kernel (MIRROR policy; the sibling GDN Triton kernels
 // VT_GDN_DELTAH/CHUNKO/WU_TRITON are default-ON the same way). '0' rolls back to
-// the hand GdnPackedDecodeKernel in the SAME binary. Fires ONLY for the exact 27B
-// gate-model packed-decode call site the single AOT specialization was baked to
-// (bf16 mixed_qkv/a/b/out, f32 A_log/dt_bias/state, dk=dv=128, hk=16, hv=48,
-// scale=Dk^-0.5, and the pinned strides mixed_qkv=10240, a/b=2*hv=96,
-// state=hv*dv*dk, indices=1); ANY dtype/shape/stride mismatch returns false so
+// the hand GdnPackedDecodeKernel in the SAME binary. Fires ONLY for the exact
+// dense packed-decode call sites the two AOT specializations were baked to
+// (bf16 mixed_qkv/a/b/out, f32 A_log/dt_bias/state, dk=dv=128, hk=16,
+// hv in {48,32}, scale=Dk^-0.5, and the pinned contiguous strides); ANY
+// dtype/shape/stride mismatch returns false so
 // the preserved hand-C++ GdnPackedDecodeKernel (and the CPU reference) still
 // handle it — the portable contract is intact. 35B (Hv=32, MoE) never selects
 // packed decode at all (ShouldUsePackedGdnDecode requires a dense model,
-// qwen3_5.cpp), and would fall back here on the hv_n!=48 guard even if it did.
+// qwen3_5.cpp); Hv=32 is the dense 4B specialization.
 // The state-index ABI adapter lives in the shim (skip `state_idx < 0`, slot 0
 // valid) matching our cache ABI.
 bool TryTritonPackedDecode(cudaStream_t stream, Tensor& out,
@@ -4345,8 +4353,10 @@ bool TryTritonPackedDecode(cudaStream_t stream, Tensor& out,
   const int64_t dv = state.shape[2];
   const int64_t dk = state.shape[3];
   const int64_t hk_n = (mixed_qkv.shape[1] - hv_n * dv) / (2 * dk);
-  // 27B packed-decode geometry ONLY (the single baked specialization).
-  if (dk != 128 || dv != 128 || hk_n != 16 || hv_n != 48) return false;
+  // Exact dense packed-decode geometries covered by the baked specializations.
+  if (dk != 128 || dv != 128 || hk_n != 16 ||
+      (hv_n != 48 && hv_n != 32))
+    return false;
   // Baked dtypes: bf16 activations/BA/out, f32 SSM state + A_log/dt_bias.
   if (mixed_qkv.dtype != DType::kBF16 || out.dtype != DType::kBF16 ||
       a.dtype != DType::kBF16 || b.dtype != DType::kBF16 ||
@@ -4365,16 +4375,22 @@ bool TryTritonPackedDecode(cudaStream_t stream, Tensor& out,
   const float baked_scale = 1.0F / std::sqrt(static_cast<float>(dk));
   if (std::fabs(args.scale - baked_scale) > 1e-6F * baked_scale) return false;
 
-  EnsureGdnPackedDecodeLoaded();
+  EnsureGdnPackedDecodeLoaded(hv_n);
   auto D = [](const void* p) { return reinterpret_cast<CUdeviceptr>(p); };
   const int32_t NBH = static_cast<int32_t>(batch * hv_n);  // grid-y carrier
   // state aliases h0 (read) and ht (written); the full h0 read of a (seq, head)
   // tile precedes its ht write, so passing one pointer for both is safe (mirrors
   // TryTritonDeltaH and FLA's initial_state==final_state packed-decode launch).
-  const CUresult r = gdn_decode_h48_default(
-      stream, D(mixed_qkv.data), D(a.data), D(b.data), D(a_log.data),
-      D(dt_bias.data), D(out.data), D(state.data), D(state.data),
-      D(state_idx.data), NBH);
+  const CUresult r =
+      hv_n == 48
+          ? gdn_decode_h48_default(
+                stream, D(mixed_qkv.data), D(a.data), D(b.data), D(a_log.data),
+                D(dt_bias.data), D(out.data), D(state.data), D(state.data),
+                D(state_idx.data), NBH)
+          : gdn_decode_h32_default(
+                stream, D(mixed_qkv.data), D(a.data), D(b.data), D(a_log.data),
+                D(dt_bias.data), D(out.data), D(state.data), D(state.data),
+                D(state_idx.data), NBH);
   VT_CHECK(r == CUDA_SUCCESS,
            "cuda gdn packed decode(triton): launcher returned non-success");
   return true;

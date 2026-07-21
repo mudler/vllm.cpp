@@ -39,6 +39,15 @@ migrates incrementally to the common raw pointer/shape/stride/scalar/layout/
 workspace/stream adapter and completes its own correctness, trace, every-axis
 performance, and memory checkpoint before the next migration stacks.
 
+Current `KERNEL-GDN-PACKED-DECODE` extension checkpoint (2026-07-21): the
+historical Hv=32-launcher-rejection text embedded in that completed 27B row is
+superseded for **dense 4B only**. `CLAIM-LOCAL-BF16-H32-AOT` adds the current
+raw-packed/FP32-state `gdn_decode_h32` specialization; 35B remains inert through
+the dense-only model selector. Exact Hv=48/32 AOT-vs-hand-vs-CPU is **56/56**,
+full GDN is **53/53 (3,229/3,229)**, the flag test is **10/10**, and sm_120 plus
+sm_121a manifest drift checks pass. 4B token, sanitizer, repeated A/B and
+node-mode profile gates are pending, so no H32 speed credit is current.
+
 | ID | Item | Upstream | Our code | Tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|
 | `KERNEL-CUDA-DISPATCH-AOT` | CUDA runtime, streams, graphs, per-arch dispatch, and generated/AOT artifact selection | platform selection `vllm/platforms/cuda.py:205-493`; gencode handling `CMakeLists.txt:201-220`; JIT packages `cmake/external_projects/triton_kernels.cmake:1-28` | [cuda_backend.cu:20](../src/vt/cuda/cuda_backend.cu#L20), [CMakeLists.txt:37](../CMakeLists.txt#L37), [TritonAOT.cmake:57](../cmake/TritonAOT.cmake#L57) | [CUDA backend tests](../tests/vt/test_cuda_backend.cpp#L31); only SM121 AOT artifacts are evidenced | [inventory](specs/kernel-family-inventory.md) | `ANCHOR-BACKFILL` | - |

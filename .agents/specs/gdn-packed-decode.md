@@ -240,13 +240,13 @@ kernel joins the vendored AOT set:
 - `triton_kernels/fused_recurrent_packed_decode.py` — FLA body VERBATIM. AOT
   adaptations (documented in the header + porting-inventory §9): scale pinned to
   `Dk^-0.5` in-kernel (Triton AOT mis-packs fp32 scalars — same as chunk_o);
-  constexpr dims/strides pinned per-shape to the 27B call site; one dead
+  constexpr dims/strides pinned per-shape to the supported dense call sites; one dead
   grid-carrier `NBH` (= B·HV); **state-index ABI adapter** `state_idx < 0` (our
   slot-0-valid cache ABI) vs FLA's `<= 0`.
-- `cmake/TritonAOTKernels.cmake` + `CMakeLists.txt` declare one specialization
-  `gdn_decode_h48` (27B: H=16, HV=48, K=V=128, BK=128, BV=32, warps1/stages3,
-  grid `4,NBH,1`); regenerated cubin vendored at
-  `src/vt/cuda/triton_aot_vendored/sm_121a/gdn_decode_h48.*` (+ MANIFEST).
+- `cmake/TritonAOTKernels.cmake` + `CMakeLists.txt` declare exact-shape
+  specializations `gdn_decode_h48` (27B) and `gdn_decode_h32` (dense 4B), both
+  H=16, K=V=128, BK=128, BV=32, warps1/stages3, grid `4,NBH,1`; regenerated
+  cubins live under `src/vt/cuda/triton_aot_vendored/sm_121a/` (+ MANIFEST).
 - `TryTritonPackedDecode` in `cuda_gdn.cu`, behind runtime toggle
   **`VT_GDN_PACKED_DECODE_TRITON` (default ON since the 2026-07-16 flip — MIRROR
   policy; `=0` rolls back to the hand `GdnPackedDecodeKernel` in the same
@@ -260,16 +260,16 @@ kernel joins the vendored AOT set:
 
 **Bit-exactness / correctness.** The vendored kernel IS vLLM's exact kernel, so
 it is token-identical to vLLM. Because the tiny oracle boundary fixture (HV=3)
-does not match the 27B-baked cubin, the guard routes it to the legacy kernel;
-the AOT kernel's correctness is proven by (a) an AOT-vs-legacy-vs-CPU op test at
-the exact 27B config (merged-BA stride-96 views, f32 state/A_log/dt_bias), and
-(b) the **235/235 token-exact 27B model gate with the Triton path ON**.
+does not match either baked cubin, the guard routes it to the legacy kernel;
+the AOT kernels' correctness is proven by (a) AOT-vs-legacy-vs-CPU op coverage
+at both exact dense configs (merged-BA stride-96/64 views, f32
+state/A_log/dt_bias), (b) the **235/235 token-exact 27B model gate with the
+Triton path ON**, and (c) the 4B token/performance gates recorded below.
 
-**Tests.** `tests/vt/test_ops_gdn.cpp` AOT case
-("VT_GDN_PACKED_DECODE_TRITON=1 fires the vendored 27B cubin and matches the CPU
-reference", 28 assertions): proves default stays on the legacy kernel
-(`triton_launches==0`), `=1` fires the cubin (`triton_launches==1`), and both AOT
-and legacy match the portable CPU reference and each other. The reg-tile
+**Tests.** `tests/vt/test_ops_gdn.cpp` AOT case covers both Hv=48 and Hv=32:
+default fires the matching cubin (`triton_launches==1`), `=0` fires the hand
+kernel (`legacy_launches==1`), and AOT and legacy match the portable CPU
+reference and each other. The reg-tile
 selection case + flag-parse test remain for the retired experiment.
 
 **Result / gates (GB10 sm_121a, `~/work/vllm.cpp-gdn-recurrence`, one flock per
@@ -290,15 +290,12 @@ Test-first: new default-ON pure-header predicate
 `src/vt/cuda/gdn_packed_decode_triton.h` + CPU flag test
 `tests/vt/test_gdn_packed_decode_triton.cpp` (RED→GREEN 10/10, `nullptr`/non-`0`
 → ON, `0`-leading → rollback), launcher predicate + AOT-case + all comments
-flipped. **35B decision — NO specialization added:** 35B (Qwen3.6-35B-A3B, MoE)
+flipped. **35B decision — no executable packed path:** 35B (Qwen3.6-35B-A3B, MoE)
 is excluded at the MODEL level — `detail::ShouldUsePackedGdnDecode` requires
 `e.dense_model` = `cfg.num_experts == 0` (`qwen3_5.cpp:49`, populated `:2802-2806`),
 so 35B never selects packed decode (spec-confirmed "35B selects zero packed
-calls") and never reaches `GdnPackedDecodeKernelCuda`. As defense-in-depth the
-launcher guard `if (dk != 128 || dv != 128 || hk_n != 16 || hv_n != 48) return
-false;` (`cuda_gdn.cu`) also rejects the 35B GDN shape (`Hv=32`, per
-`cmake/TritonAOTKernels.cmake:41` "H=48 (27B) and H=32 (35B)") → clean fallback.
-The guard does not misfire, so a 35B cubin would be dead code. **Flip gates —
+calls") and never reaches `GdnPackedDecodeKernelCuda`. The later Hv=32 cubin is
+therefore a dense-4B specialization, not a 35B path. **Flip gates —
 ALL EIGHT PASS, exit 0 each (GB10 sm_121a, `~/work/vllm.cpp-gdn-decode-triton-flip`
 `gates.verdict`/`gates.out`, one flock, build `-DVLLM_CPP_TRITON=ON` +
 CUTLASS-4.5.0 + nvcc-13.0, configure-log CUTLASS/FA2 lines verified):** 27B
@@ -311,6 +308,21 @@ memcheck **28/28, 0 errors**. No new A/B (9dd7d3f's +5.48 tok/s / TPOT −1.26 m
 stands). The **next binding grid runs the Triton decode path by default** (in
 the production-default set async-ON + Triton-decode-ON + RMSNorm-fast opt-in);
 no separate binding speed credit is claimed at the flip.
+
+**Phase 4 — dense 4B Hv=32 extension (2026-07-21,
+`CLAIM-LOCAL-BF16-H32-AOT`, ACTIVE).** Matched node-mode profiles isolated the
+4B regression to loss of the packed recurrence specialization: the current
+hand kernel used 2.580 s / 234.2 us-call versus the previous H=32 Triton kernel
+at 0.602 s / 47.7 us-call. The repair adds `gdn_decode_h32` using the current
+raw-packed/BF16-activation/FP32-state ABI, exact strides 8192/64/524288, and the
+same upstream warps1/stages3 launch. The old decomposed q/k/v/g/beta BF16-state
+ABI remains prohibited. Dispatch now accepts Hv in {48,32}; model-level
+dense-only selection keeps 35B inert. Local sm_120 and vendored sm_121a
+generation pass the manifest drift contract; the focused default/rollback
+operator test is **56/56**, the full GDN suite is **53/53 (3,229/3,229)**, and
+the portable flag test is **10/10**. Full 4B token, sanitizer, repeated
+same-binary A/B and node-mode profile gates remain pending on the clean
+checkpoint commit; no speed credit is claimed yet.
 
 **Reproduce.**
 

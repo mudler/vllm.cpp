@@ -190,7 +190,7 @@ target_include_directories(test_gdn_packed_reg_tile PRIVATE ${CMAKE_SOURCE_DIR}/
 # CPU-tier contract for the vendored Triton AOT packed-decode fast-path flag
 # (VT_GDN_PACKED_DECODE_TRITON, default ON). Reaches the internal header under
 # src/ (not public API); the vendored cubin it gates is CUDA-only and lives in
-# src/vt/cuda/cuda_gdn.cu (TryTritonPackedDecode -> gdn_decode_h48).
+# src/vt/cuda/cuda_gdn.cu (TryTritonPackedDecode -> gdn_decode_h{48,32}).
 vllm_cpp_add_test(test_gdn_packed_decode_triton vt/test_gdn_packed_decode_triton.cpp)
 target_include_directories(test_gdn_packed_decode_triton PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the two NUMERICS-NEUTRAL FP4-quant vectorized-load

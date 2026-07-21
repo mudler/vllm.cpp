@@ -48,7 +48,14 @@ struct OwnedTensor {
   // via vt::MatmulBT, the cuBLASLt TN fast path (see ops.h MatmulBT).
   bool nk = false;
 
-  bool Empty() const { return bytes.empty(); }
+  // A synchronized direct-device load may discard the host staging buffer while
+  // retaining an authoritative d_dev/d_dev_f32 copy. Empty() is used as model
+  // dispatch metadata, so host reclamation must not make a populated weight look
+  // absent. Mutable because ReleaseHost is logically const, like lazy residency.
+  mutable bool host_released = false;
+
+  bool Empty() const { return bytes.empty() && !host_released; }
+  bool HasHostBytes() const { return !bytes.empty(); }
   int64_t Numel() const;
   // Contiguous view over the current buffer (host/CPU device).
   vt::Tensor View() const;
@@ -61,7 +68,8 @@ struct OwnedTensor {
   // mirrors the existing mutable lazy-device-upload residency design (d_dev/
   // d_packed above are populated on a const weight). swap-with-empty (not
   // clear()) guarantees the std::vector capacity is actually deallocated. After
-  // release View()/bytes must not be read; shape/dtype metadata is retained.
+  // release View()/bytes must not be read; shape/dtype metadata is retained and
+  // Empty() remains false so device-resident dispatch continues to see it.
   void ReleaseHost() const;
 
   // Lazily-populated device-resident copies (CUDA forward only; null on host or

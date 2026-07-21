@@ -2548,10 +2548,13 @@ __global__ void MatmulNvfp4Fp4Wmma(Tout* out, const uint8_t* a_packed, const uin
 //   D       d0(g,t*2) d1(g,t*2+1) d2(g+8,t*2) d3(g+8,t*2+1)
 //   A scale: row r held in lane (r%8)*4 + (r>=8?1:0), byte b = k-block b
 //   B scale: col n held in lane n*4,                  byte b = k-block b
-__device__ __forceinline__ uint8_t GetNib(const uint8_t* p, int64_t row, int64_t col, int64_t k) {
+#if defined(__CUDA_ARCH_SPECIFIC__)
+__device__ __forceinline__ uint8_t GetNib(const uint8_t* p, int64_t row,
+                                          int64_t col, int64_t k) {
   const uint8_t byte = p[row * (k / 2) + col / 2];
   return (col & 1) ? static_cast<uint8_t>(byte >> 4) : static_cast<uint8_t>(byte & 0xFu);
 }
+#endif
 
 template <typename Tout>
 __global__ void MatmulNvfp4Fp4Native(Tout* out, const uint8_t* a_packed, const uint8_t* a_scale,

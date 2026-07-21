@@ -1,0 +1,35 @@
+#!/usr/bin/env bpftrace
+
+/*
+ * Low-overhead sentinel for the NVIDIA UVM failure observed on the local
+ * discrete-Blackwell host. Observational only: it cannot repair or abort a
+ * corrupted driver eviction path.
+ */
+BEGIN
+{
+  printf("watching NVIDIA UVM lazy-free activity and vllm-bench PMA eviction\n");
+}
+
+kprobe:process_lazy_free
+/comm == "vidmem lazy fre"/
+{
+  @lazy_free_calls = count();
+}
+
+kprobe:uvm_pmm_gpu_pma_evict_range
+/comm == "vllm-bench"/
+{
+  time("%H:%M:%S ");
+  printf("WARNING: vllm-bench entered UVM PMA eviction pid=%d tid=%d args=%p,%p,%p,%p\n",
+         pid, tid, arg0, arg1, arg2, arg3);
+  print(kstack);
+  @pma_evictions = count();
+}
+
+interval:s:5
+{
+  print(@lazy_free_calls);
+  print(@pma_evictions);
+  clear(@lazy_free_calls);
+  clear(@pma_evictions);
+}

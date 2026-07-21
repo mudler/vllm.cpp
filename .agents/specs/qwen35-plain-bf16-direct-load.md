@@ -2,8 +2,8 @@
 
 **Rows:** `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation`,
 `LOAD-SAFETENSORS-DIRECT-DENSE`
-**Lifecycle:** `ACTIVE`
-**Owner:** `CLAIM-LOCAL-BF16-TRANSPLANT`
+**Lifecycle:** `GATING`
+**Owner:** unassigned after `CLAIM-LOCAL-BF16-TRANSPLANT` release
 
 ## Scope
 
@@ -87,11 +87,11 @@ requires matching nsys traces under the project parity protocol.
 
 | Upstream/branch contract | Local tier |
 |---|---|
-| Qwen3.5 stacked mapping in `qwen3_5.py:276-303` | Extend `tests/vllm/models/test_qwen27_dense_forward.cpp` with ordinary BF16 attention/GDN/MLP fixtures, merged order and F32 state-parameter conversion. |
-| tied parameter initialization | Assert one logical owner and identical logits operand; exercise repeated forward after host release. |
-| target-device construction/lifetime | Extend `tests/vllm/models/test_model_registry.cpp` and `tests/vllm/entrypoints/test_loaded_engine_dense.cpp` for queue propagation, exclusions and queue reuse. |
+| Qwen3.5 stacked mapping in `qwen3_5.py:276-303` | `tests/vllm/models/test_qwen35_plain_weights.cpp` loads the real 4B checkpoint and checks ordinary BF16 attention/GDN/MLP owners, merged order and F32 state-parameter conversion. |
+| tied parameter initialization | The real-checkpoint gate asserts one logical embedding/head owner; the CUDA full-engine ON/OFF case exercises that owner through repeated logits. |
+| target-device construction/lifetime | `tests/vllm/models/test_model_registry.cpp` covers queue propagation; the real 4B CUDA case compares retained-host and direct-device full-engine execution in one binary. |
 | released-host safety | Unit-test logical presence, byte count, invalid host access, and resident-only forward behavior. |
-| full model | Local RTX test remains SKIPPED without `Qwen/Qwen3.5-4B`; when present, compare current vLLM oracle tokens and both direct-load arms. |
+| full model | `tests/vllm/models/test_qwen35_plain_weights.cpp:162-196` skips without CUDA/the cached 4B model; when available it compares prompt/output token IDs for both direct-load arms. Current-vLLM oracle comparison remains a separate W4 gate. |
 
 No upstream test is dropped. GPU/model tests that cannot run in CI remain
 checked in with an explicit model/backend skip.
@@ -117,16 +117,31 @@ checked in with an explicit model/backend skip.
    `scripts/check-doc-checkpoint.py`, README, BENCHMARKS, matrices, roadmap,
    ledger and state agree at every checkpoint.
 
-Reproduction entry point after implementation:
+Current checkpoint: clean CPU build and focused 6/6 are green; the real cached
+`Qwen/Qwen3.5-4B` gate passes 3/3 cases and 1656/1656 assertions on CPU. The
+parallel 134-test CPU sweep passes 131/134; the two socket suites re-pass 2/2
+in isolation, leaving only the unrelated NixOS `/usr/bin/true`/restricted-PATH
+failure in `test_serve_low_tools`. CUDA 12.9/GCC 14 configures for sm_120a and
+the production library compiles. On the local RTX 5070 Ti, the real 4B CUDA
+gate passes 3/3 and 1664/1664, including identical retained-host/direct-device
+prompt and output token IDs; the five focused transplant tests pass. The
+broader `test_op_parity` is 259/261 on sm_120 because two existing GB10-specific
+GDN BA BF16 hashes differ on this architecture. Current-oracle tokens, 27B/35B
+regressions, sanitizer, matching traces, memory and every performance axis
+remain pending; no benchmark or support claim is made.
+
+Reproduction entry point:
 
 ```sh
-nix develop .#cuda --command cmake -S . -B build-nix-cuda -G Ninja \
+nix develop .#cuda --command cmake -S . -B build-nix-cuda-transplant -G Ninja \
   -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=native \
   -DCMAKE_CUDA_COMPILER="$CMAKE_CUDA_COMPILER" \
   -DCMAKE_CUDA_HOST_COMPILER="$CMAKE_CUDA_HOST_COMPILER"
-nix develop .#cuda --command cmake --build build-nix-cuda -j4
-nix develop .#cuda --command ctest --test-dir build-nix-cuda \
-  -R 'test_(model_registry|qwen27_dense_forward|loaded_engine_dense)' \
+nix develop .#cuda --command cmake --build build-nix-cuda-transplant -j4
+HF_HOME=$PWD/.hf-cache nix develop .#cuda --command \
+  build-nix-cuda-transplant/tests/test_qwen35_plain_weights --no-skip
+nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant \
+  -R 'test_(qwen36_weights|model_registry|qwen27_dense_forward|qwen35_plain_weights|loaded_engine_dense)' \
   --output-on-failure
 ```
 
@@ -144,16 +159,16 @@ nix develop .#cuda --command ctest --test-dir build-nix-cuda \
 
 ## Work breakdown
 
-1. `W0` environment: transplant and compact the Nix/local reproduction files,
+1. `W0` environment: **COMPLETE** — transplant and compact the Nix/local reproduction files,
    the NVFP4 device-compile guard, and safe diagnostic scripts.
-2. `W1` loader: ordinary BF16/F32 detection, merged raw-NK physical owners,
+2. `W1` loader: **COMPLETE** — ordinary BF16/F32 detection, merged raw-NK physical owners,
    tied logits, and focused loader tests.
-3. `W2` execution: plain raw-NK branches and packed MLP use composed with
+3. `W2` execution: **COMPLETE / CUDA-COMPILED** — plain raw-NK branches and packed MLP use composed with
    current preamble/GDN dispatch; regression tests.
-4. `W3` residency: logical host-release state, dense prepare/release traversal,
-   queue propagation/reuse, exclusion tests and sanitizer checks.
-5. `W4` gates: current-oracle local correctness, matching traces and the full
-   memory/performance series; update lifecycle honestly.
+4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
+   queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
+5. `W4` gates: **PARTIAL** — local direct ON/OFF correctness is green; current-oracle correctness,
+   27B/35B regressions, sanitizer, matching traces and the full memory/performance series remain pending.
 
 ## Risks and decisions
 

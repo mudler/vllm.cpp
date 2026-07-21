@@ -4,7 +4,9 @@
 // by name (notes §3.6) and swaps the MoE block for the dense SwiGLU MLP.
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -12,6 +14,8 @@
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
+#include "vllm/platforms/interface.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -25,6 +29,8 @@ using dense_loaders::LoadBf16Transposed;
 using dense_loaders::MakeOwned;
 
 namespace {
+
+using TensorExists = std::function<bool(const std::string&)>;
 
 float ReadF32Scalar(const StTensor& t) {
   VT_CHECK(t.data != nullptr && t.nbytes >= sizeof(float),
@@ -42,19 +48,87 @@ float ReadF32Scalar(const StTensor& t) {
 // 27B GDN in_proj site 2.29 vs vLLM 1.80 us/tok. Raw NK also skips the
 // load-time host transpose.
 
-// BF16 [n] -> owned f32 [n] (A_log / dt_bias; upcast is lossless).
-OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
+// Model-dtype vectors are BF16 in the NVFP4 gate checkpoint but F32 in ordinary
+// Qwen3.5 dense checkpoints. Normalize them to the representation consumed by
+// the existing forward without changing the quantized path.
+OwnedTensor LoadModelBf16Direct(
+    const TensorResolver& get, const std::string& name,
+    const std::vector<int64_t>& shape_override = {}) {
   const StTensor& t = get(name);
-  VT_CHECK(t.dtype == "BF16", "qwen3_5 dense: expected BF16 for " + name);
+  VT_CHECK(t.dtype == "BF16" || t.dtype == "F32",
+           "qwen3_5 dense: expected BF16 or F32 for " + name);
+  const std::vector<int64_t> shape =
+      shape_override.empty() ? t.shape : shape_override;
+  OwnedTensor o = MakeOwned(vt::DType::kBF16, shape);
+  if (t.dtype == "BF16") {
+    VT_CHECK(t.nbytes == o.bytes.size(),
+             "qwen3_5 dense: byte-size mismatch for " + name);
+    std::memcpy(o.bytes.data(), t.data, t.nbytes);
+  } else {
+    VT_CHECK(t.nbytes == static_cast<size_t>(o.Numel()) * sizeof(float),
+             "qwen3_5 dense: byte-size mismatch for " + name);
+    auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
+    const auto* src = static_cast<const uint8_t*>(t.data);
+    for (int64_t i = 0; i < o.Numel(); ++i) {
+      float value = 0.0F;
+      std::memcpy(&value, src + static_cast<size_t>(i) * sizeof(value),
+                  sizeof(value));
+      dst[i] = vt::F32ToBF16(value);
+    }
+  }
+  MaybeReleaseSourcePages(t.data, t.nbytes);
+  return o;
+}
+
+OwnedTensor LoadBf16RawNK(const TensorResolver& get,
+                          const std::string& name) {
+  OwnedTensor out = LoadBf16Direct(get, name);
+  VT_CHECK(out.rank == 2,
+           "qwen3_5 dense: expected 2-D weight for " + name);
+  out.nk = true;
+  return out;
+}
+
+// BF16/F32 [n] -> owned f32 [n] (A_log / dt_bias).
+OwnedTensor LoadToF32(const TensorResolver& get, const std::string& name) {
+  const StTensor& t = get(name);
+  VT_CHECK(t.dtype == "BF16" || t.dtype == "F32",
+           "qwen3_5 dense: expected BF16 or F32 for " + name);
   VT_CHECK(t.shape.size() == 1,
            "qwen3_5 dense: expected 1-D tensor for " + name);
   const int64_t n = t.shape[0];
   OwnedTensor o = MakeOwned(vt::DType::kF32, {n});
-  const auto* src = reinterpret_cast<const uint16_t*>(t.data);
   auto* dst = reinterpret_cast<float*>(o.bytes.data());
-  for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+  if (t.dtype == "F32") {
+    VT_CHECK(t.nbytes == o.bytes.size(),
+             "qwen3_5 dense: byte-size mismatch for " + name);
+    std::memcpy(dst, t.data, t.nbytes);
+  } else {
+    const auto* src = reinterpret_cast<const uint16_t*>(t.data);
+    for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+  }
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
+}
+
+bool DirectDeviceLoadEligible(vt::Queue* queue) {
+  if (queue == nullptr || queue->device.type != vt::DeviceType::kCUDA) {
+    return false;
+  }
+  const char* release = std::getenv("VT_RELEASE_HOST_WEIGHTS");
+  if (release != nullptr && release[0] == '0') return false;
+  const char* direct = std::getenv("VT_DIRECT_DEVICE_LOAD");
+  if (direct != nullptr && direct[0] == '0') return false;
+  const auto& platform = platforms::GetPlatform(queue->device.type);
+  return !platform.is_unified_memory() &&
+         platform.residency_policy().release_host_weights_after_upload;
+}
+
+void StageAndReleaseLoadedDense(Qwen3_5DenseWeights& weights,
+                                vt::Queue& queue) {
+  Qwen3_5DenseModel::PrepareBf16Resident(weights, queue);
+  vt::GetBackend(queue.device.type).Synchronize(queue);
+  (void)ReleaseResidentQwen3_5DenseHostWeights(weights);
 }
 
 // One compressed-tensors NVFP4 W4A4 Linear -> RAW fp4-resident Nvfp4Weight kept
@@ -112,7 +186,8 @@ Nvfp4Weight LoadCtNvfp4Raw(const TensorResolver& get, const std::string& proj) {
   return r;
 }
 
-GdnLayerWeights LoadGdnDense(const TensorResolver& get, const std::string& base) {
+GdnLayerWeights LoadGdnDense(const TensorResolver& get, const TensorExists& has,
+                             const std::string& base) {
   const std::string la = base + "linear_attn.";
   GdnLayerWeights g;
   // in_proj_{qkv,z,a,b}: bf16 (ignore list, notes §3.6). Kept raw [N,K]
@@ -126,41 +201,60 @@ GdnLayerWeights LoadGdnDense(const TensorResolver& get, const std::string& base)
       get, {la + "in_proj_qkv.weight", la + "in_proj_z.weight"});
   g.in_proj_ba = LoadMergedBf16RawNK(
       get, {la + "in_proj_b.weight", la + "in_proj_a.weight"});
-  // out_proj: W4A4-quantized -> fp4-resident (throughput path, notes §5 step-6a).
-  g.out_proj_fp4 = LoadCtNvfp4Raw(get, la + "out_proj");
+  // NVFP4 checkpoints use compressed tensors; ordinary checkpoints use raw
+  // torch-Linear BF16 [N,K].
+  if (has(la + "out_proj.weight_packed")) {
+    g.out_proj_fp4 = LoadCtNvfp4Raw(get, la + "out_proj");
+  } else {
+    g.out_proj = LoadBf16RawNK(get, la + "out_proj.weight");
+  }
   // conv1d.weight ships [conv_dim,1,K]; collapse the singleton to [conv_dim,K].
   const StTensor& conv = get(la + "conv1d.weight");
   VT_CHECK(conv.shape.size() == 3 && conv.shape[1] == 1,
            "qwen3_5 dense: unexpected conv1d shape");
   g.conv1d_weight =
       LoadBf16Direct(get, la + "conv1d.weight", {conv.shape[0], conv.shape[2]});
-  g.a_log = LoadBf16ToF32(get, la + "A_log");
-  g.dt_bias = LoadBf16ToF32(get, la + "dt_bias");
-  g.norm_weight = LoadBf16Direct(get, la + "norm.weight");
+  g.a_log = LoadToF32(get, la + "A_log");
+  g.dt_bias = LoadToF32(get, la + "dt_bias");
+  g.norm_weight = LoadModelBf16Direct(get, la + "norm.weight");
   return g;
 }
 
 FullAttnLayerWeights LoadAttnDense(const TensorResolver& get,
+                                   const TensorExists& has,
                                    const std::string& base) {
   const std::string sa = base + "self_attn.";
   FullAttnLayerWeights a;
-  // q/k/v/o_proj: all W4A4-quantized -> fp4-resident (throughput path, §5 6a).
-  a.q_proj_fp4 = LoadCtNvfp4Raw(get, sa + "q_proj");
-  a.k_proj_fp4 = LoadCtNvfp4Raw(get, sa + "k_proj");
-  a.v_proj_fp4 = LoadCtNvfp4Raw(get, sa + "v_proj");
-  a.o_proj_fp4 = LoadCtNvfp4Raw(get, sa + "o_proj");
-  a.q_norm = LoadBf16Direct(get, sa + "q_norm.weight");
-  a.k_norm = LoadBf16Direct(get, sa + "k_norm.weight");
+  const auto load_projection = [&](const std::string& name, Nvfp4Weight& fp4,
+                                   OwnedTensor& plain) {
+    if (has(name + ".weight_packed"))
+      fp4 = LoadCtNvfp4Raw(get, name);
+    else
+      plain = LoadBf16RawNK(get, name + ".weight");
+  };
+  load_projection(sa + "q_proj", a.q_proj_fp4, a.q_proj);
+  load_projection(sa + "k_proj", a.k_proj_fp4, a.k_proj);
+  load_projection(sa + "v_proj", a.v_proj_fp4, a.v_proj);
+  load_projection(sa + "o_proj", a.o_proj_fp4, a.o_proj);
+  a.q_norm = LoadModelBf16Direct(get, sa + "q_norm.weight");
+  a.k_norm = LoadModelBf16Direct(get, sa + "k_norm.weight");
   return a;
 }
 
 // Dense SwiGLU MLP: gate/up/down all W4A4-quantized -> fp4-resident (§5 6a).
-DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const std::string& base) {
+DenseMlpWeights LoadDenseMlp(const TensorResolver& get, const TensorExists& has,
+                             const std::string& base) {
   const std::string mlp = base + "mlp.";
   DenseMlpWeights m;
-  m.gate_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "gate_proj");
-  m.up_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "up_proj");
-  m.down_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "down_proj");
+  if (has(mlp + "gate_proj.weight_packed")) {
+    m.gate_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "gate_proj");
+    m.up_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "up_proj");
+    m.down_proj_fp4 = LoadCtNvfp4Raw(get, mlp + "down_proj");
+  } else {
+    m.gate_up_proj = dense_loaders::LoadMergedBf16RawNK(
+        get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
+    m.down_proj = LoadBf16RawNK(get, mlp + "down_proj.weight");
+  }
   return m;
 }
 
@@ -176,7 +270,9 @@ OwnedTensor LoadMergedBf16RawNK(const TensorResolver& get,
 
 GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
                                     const std::string& layer_base) {
-  return LoadGdnDense(get, layer_base);
+  // Public focused-loader seam historically describes the 27B checkpoint.
+  const TensorExists has = [](const std::string&) { return true; };
+  return LoadGdnDense(get, has, layer_base);
 }
 
 bool IsQwen27QuantizedLinear(const std::string& name) {
@@ -237,29 +333,41 @@ OwnedTensor MaterializeCtNvfp4Bf16Transposed(const TensorResolver& get,
 }
 
 Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
+                                               const TensorExists& has,
                                                const std::string& layer_type,
                                                int64_t layer_idx) {
   const std::string base =
       "model.language_model.layers." + std::to_string(layer_idx) + ".";
   Qwen3_5DenseLayerWeights layer;
-  layer.input_layernorm = LoadBf16Direct(get, base + "input_layernorm.weight");
+  layer.input_layernorm =
+      LoadModelBf16Direct(get, base + "input_layernorm.weight");
   layer.post_attention_layernorm =
-      LoadBf16Direct(get, base + "post_attention_layernorm.weight");
+      LoadModelBf16Direct(get, base + "post_attention_layernorm.weight");
   if (layer_type == "linear_attention") {
     layer.is_linear_attention = true;
-    layer.gdn = LoadQwen3_5DenseGdn(get, base);
+    layer.gdn = LoadGdnDense(get, has, base);
   } else if (layer_type == "full_attention") {
     layer.is_linear_attention = false;
-    layer.attn = LoadAttnDense(get, base);
+    layer.attn = LoadAttnDense(get, has, base);
   } else {
     VT_CHECK(false, "qwen3_5 dense: unknown layer_type " + layer_type);
   }
-  layer.mlp = LoadDenseMlp(get, base);
+  layer.mlp = LoadDenseMlp(get, has, base);
   return layer;
 }
 
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
+                                               const std::string& layer_type,
+                                               int64_t layer_idx) {
+  // The public resolver-only seam is used by the compressed-tensors parity
+  // fixture, where every routed projection is NVFP4.
+  const TensorExists has = [](const std::string&) { return true; };
+  return LoadQwen3_5DenseLayer(get, has, layer_type, layer_idx);
+}
+
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
-                                     const HfConfig& config) {
+                                     const HfConfig& config,
+                                     vt::Queue* load_queue) {
   std::unordered_map<std::string, const SafetensorsFile*> where;
   for (const SafetensorsFile& shard : shards)
     for (const std::string& name : shard.Names()) where[name] = &shard;
@@ -268,6 +376,9 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
     auto it = where.find(name);
     VT_CHECK(it != where.end(), "qwen3_5 dense: tensor not found: " + name);
     return it->second->Get(name);
+  };
+  const TensorExists has = [&where](const std::string& name) {
+    return where.find(name) != where.end();
   };
 
   VT_CHECK(config.num_hidden_layers > 0 &&
@@ -278,14 +389,103 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   Qwen3_5DenseWeights w;
   w.embed_tokens =
       LoadBf16Direct(get, "model.language_model.embed_tokens.weight");
-  w.final_norm = LoadBf16Direct(get, "model.language_model.norm.weight");
-  // lm_head is UNQUANTIZED bf16 in the 27B (notes §3.6) -> Matmul-B layout.
-  w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
+  w.final_norm =
+      LoadModelBf16Direct(get, "model.language_model.norm.weight");
+  // The 27B owns an explicit head; smaller Qwen3.5 checkpoints tie logits to
+  // the embedding table and omit lm_head.weight.
+  if (has("lm_head.weight")) {
+    w.lm_head = LoadBf16Transposed(get, "lm_head.weight");
+  } else {
+    w.tied_lm_head = true;
+    w.embed_tokens.nk = true;
+  }
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
-  for (int64_t l = 0; l < config.num_hidden_layers; ++l)
+  bool direct_device = DirectDeviceLoadEligible(load_queue);
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadQwen3_5DenseLayer(
-        get, config.layer_types[static_cast<size_t>(l)], l));
+        get, has, config.layer_types[static_cast<size_t>(l)], l));
+    if (direct_device) {
+      direct_device = IsPlainBf16Qwen3_5Dense(w);
+      if (direct_device) StageAndReleaseLoadedDense(w, *load_queue);
+    }
+  }
   return w;
+}
+
+bool IsPlainBf16Qwen3_5Dense(const Qwen3_5DenseWeights& weights) {
+  for (const Qwen3_5DenseLayerWeights& layer : weights.layers) {
+    if (!layer.mlp.gate_proj_fp4.Empty() || !layer.mlp.up_proj_fp4.Empty() ||
+        !layer.mlp.down_proj_fp4.Empty()) {
+      return false;
+    }
+    if (layer.is_linear_attention) {
+      if (!layer.gdn.out_proj_fp4.Empty() ||
+          !layer.gdn.in_proj_qkv_fp8.Empty() ||
+          !layer.gdn.in_proj_z_fp8.Empty() ||
+          !layer.gdn.out_proj_fp8.Empty()) {
+        return false;
+      }
+    } else if (!layer.attn.q_proj_fp4.Empty() ||
+               !layer.attn.k_proj_fp4.Empty() ||
+               !layer.attn.v_proj_fp4.Empty() ||
+               !layer.attn.o_proj_fp4.Empty() ||
+               !layer.attn.q_proj_fp8.Empty() ||
+               !layer.attn.k_proj_fp8.Empty() ||
+               !layer.attn.v_proj_fp8.Empty() ||
+               !layer.attn.o_proj_fp8.Empty()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+size_t ReleaseResidentQwen3_5DenseHostWeights(
+    Qwen3_5DenseWeights& weights) {
+  size_t released = 0;
+  const auto release = [&released](OwnedTensor& tensor) {
+    if (tensor.HasHostBytes() && (tensor.d_dev || tensor.d_dev_f32)) {
+      released += tensor.bytes.size();
+      tensor.ReleaseHost();
+    }
+  };
+  const auto release_gdn = [&release](GdnLayerWeights& gdn) {
+    release(gdn.in_proj_qkv);
+    release(gdn.in_proj_z);
+    release(gdn.in_proj_qkvz);
+    release(gdn.in_proj_b);
+    release(gdn.in_proj_a);
+    release(gdn.in_proj_ba);
+    release(gdn.conv1d_weight);
+    release(gdn.a_log);
+    release(gdn.dt_bias);
+    release(gdn.norm_weight);
+    release(gdn.out_proj);
+  };
+  const auto release_attn = [&release](FullAttnLayerWeights& attn) {
+    release(attn.q_proj);
+    release(attn.k_proj);
+    release(attn.v_proj);
+    release(attn.o_proj);
+    release(attn.q_norm);
+    release(attn.k_norm);
+  };
+
+  release(weights.embed_tokens);
+  release(weights.final_norm);
+  release(weights.lm_head);
+  for (Qwen3_5DenseLayerWeights& layer : weights.layers) {
+    release(layer.input_layernorm);
+    release(layer.post_attention_layernorm);
+    if (layer.is_linear_attention)
+      release_gdn(layer.gdn);
+    else
+      release_attn(layer.attn);
+    release(layer.mlp.gate_proj);
+    release(layer.mlp.up_proj);
+    release(layer.mlp.gate_up_proj);
+    release(layer.mlp.down_proj);
+  }
+  return released;
 }
 
 }  // namespace vllm

@@ -377,7 +377,7 @@ TEST_CASE("deferred routed-expert load: move-safe closure + bounded coexistence"
   CHECK(LayersWithResidentExperts(w) == 0);
 }
 
-TEST_CASE("OwnedTensor::ReleaseHost frees the host buffer AND its capacity") {
+TEST_CASE("OwnedTensor::ReleaseHost frees host bytes but preserves logical presence") {
   vllm::OwnedTensor t;
   t.dtype = vt::DType::kI8;
   t.rank = 2;
@@ -389,13 +389,18 @@ TEST_CASE("OwnedTensor::ReleaseHost frees the host buffer AND its capacity") {
 
   t.ReleaseHost();
 
-  CHECK(t.Empty());
+  // Dispatch metadata remains populated: the authoritative device resident may
+  // still be selected after host staging is reclaimed.
+  CHECK_FALSE(t.Empty());
+  CHECK_FALSE(t.HasHostBytes());
   CHECK(t.bytes.empty());
   // swap-with-empty (not clear()) must actually deallocate the capacity.
   CHECK(t.bytes.capacity() == 0u);
   // Shape/dtype metadata is retained (only the host buffer is reclaimed).
   CHECK(t.rank == 2);
   CHECK(t.shape[0] == 64);
+  CHECK_THROWS_WITH_AS(t.View(), doctest::Contains("released"),
+                       std::runtime_error);
 }
 
 namespace {

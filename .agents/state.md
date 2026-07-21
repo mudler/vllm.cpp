@@ -14733,3 +14733,24 @@ Worktree `agent-acd65100650905428`, base main HEAD `673b2a8`, `CLAIM-MODEL-QWEN3
 **GATES.** dgx CUDA `-Werror` **0-warn** (clean full rebuild from scratch, RC=0); on the FINAL binary `test_qwen3coder_paged_engine` **6/6**, `test_ops_moe_grouped_bf16` **7/7**, NVFP4 `test_ops_moe_grouped` **9/9**, `test_qwen3_moe_forward` **3/3**; **27B 235/235 + 35B 315/315 UNCHANGED**; `compute-sanitizer memcheck` **0 memory errors** on the MoE GEMM and the engine path (`test_llm_engine` 5/5, `test_runner` 14/14) — only the by-design graph-safe `EnsureMoeScratch`/`EnsureMoePartials` retained blocks are reported.
 
 **NEXT.** To close the row to `DONE`: (i) the bf16 decode CUDA graph (largest; closes the c1 cells), (ii) a non-MoE prefill-glue profile at c2, (iii) optionally the dual-operand w13 fusion. Committed on the worktree branch (base `bb5d842`); NOT pushed.
+### 2026-07-21 — local Blackwell branch transplant spike (`ACTIVE`)
+
+User requested aborting the obsolete 34-commit rebase and transplanting only
+still-relevant work onto a fork of current main. The interrupted rebase was
+aborted; `local-blackwell-main-transplant` was created at `a1611c73`, while
+`local-blackwell-environment` remains intact at `42a2c897` as the source record.
+
+Review selected the distinct plain-BF16 Qwen3.5 dense loader, tied-weight
+ownership, bounded direct-device loading, Nix environment and safe diagnostics.
+It rejected/superseded the branch's global random-sampler scratch, broad
+irregular-BF16 matmul fallback, decomposed h32 GDN kernel, tensor-range page
+advice, old registry, and stale FP8-off attention policy. Main's windowed source
+release, owned safetensors, self-registration, merged GDN projections, packed
+decode and default-on preamble remain binding.
+
+Accepted spike: [qwen35-plain-bf16-direct-load.md](specs/qwen35-plain-bf16-direct-load.md).
+Active row `LOAD-SAFETENSORS-DIRECT-DENSE`; the related
+`MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation` row remains unclaimed and
+`PARTIAL` for the pre-existing text-only implementation. Claim
+`CLAIM-LOCAL-BF16-TRANSPLANT`. No production code, GPU command, model gate or
+benchmark ran. Implementation and every current-oracle axis are `PENDING`.

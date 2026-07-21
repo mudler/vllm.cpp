@@ -14861,3 +14861,14 @@ No benchmark result is claimed yet; the full 18-leg series is next.
 The committed series tooling is `b0a520f1`; the active claim now binds its
 single-lock output to `/tmp/qwen35-transplant-4b-b0a520f1`. No result is claimed
 by this administrative checkpoint; the full series is the immediate next command.
+
+### 2026-07-21 — first exact 4B series root `VOID` prelaunch
+
+Root `/tmp/qwen35-transplant-4b-b0a520f1` stopped before the first model leg:
+with `set -u`, Bash expands all right-hand sides in one `local` command before
+assigning any of them, so `local phase=$1 ... name="$phase-..."` referenced an
+unbound `phase`. The root contains only immutable metadata and a series-before
+GPU snapshot; no throughput, correctness or memory sample exists and no number
+is publishable. The two affected functions now assign arguments and composed
+names in separate declarations. Next: commit the fix, bind a new evidence root,
+and retry the complete lock-held series.

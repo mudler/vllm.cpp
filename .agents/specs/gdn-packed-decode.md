@@ -309,8 +309,8 @@ stands). The **next binding grid runs the Triton decode path by default** (in
 the production-default set async-ON + Triton-decode-ON + RMSNorm-fast opt-in);
 no separate binding speed credit is claimed at the flip.
 
-**Phase 4 — dense 4B Hv=32 extension (2026-07-21,
-`CLAIM-LOCAL-BF16-H32-AOT`, ACTIVE).** Matched node-mode profiles isolated the
+**Phase 4 — dense 4B Hv=32 extension (2026-07-21, repair checkpoint complete;
+owning loader row remains `GATING`).** Matched node-mode profiles isolated the
 4B regression to loss of the packed recurrence specialization: the current
 hand kernel used 2.580 s / 234.2 us-call versus the previous H=32 Triton kernel
 at 0.602 s / 47.7 us-call. The repair adds `gdn_decode_h32` using the current
@@ -319,10 +319,17 @@ same upstream warps1/stages3 launch. The old decomposed q/k/v/g/beta BF16-state
 ABI remains prohibited. Dispatch now accepts Hv in {48,32}; model-level
 dense-only selection keeps 35B inert. Local sm_120 and vendored sm_121a
 generation pass the manifest drift contract; the focused default/rollback
-operator test is **56/56**, the full GDN suite is **53/53 (3,229/3,229)**, and
-the portable flag test is **10/10**. Full 4B token, sanitizer, repeated
-same-binary A/B and node-mode profile gates remain pending on the clean
-checkpoint commit; no speed credit is claimed yet.
+operator test is **56/56**, the full GDN suite is **53/53 (3,229/3,229)**, the
+portable flag test is **10/10**, real-4B default/rollback tests are each
+1,664/1,664, and focused memcheck is clean. The exact locked A/B proves an
+attributable **+4.41% total/output throughput** and **-4.78% TPOT**; node-mode
+nsys measures the AOT recurrence at **1.467331 s / 133.200 us-call** versus
+hand fallback **2.585435 s / 234.698 us-call** (-43.25% total recurrence time).
+The extension's performance repair is accepted, but no overall parity closure
+is claimed: fresh vLLM 0.25.0 total is still 0.9517x, the deterministic eager
+oracle matches both local long-stream arms only 97/128, and strict loader VRAM
+plus external 27B/35B remain open. Evidence:
+[repair report](../../docs/bench-evidence/qwen35-4b-h32-aot-repair-20260721.md).
 
 **Reproduce.**
 

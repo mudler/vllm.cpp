@@ -41,12 +41,18 @@ performance, and memory checkpoint before the next migration stacks.
 
 Current `KERNEL-GDN-PACKED-DECODE` extension checkpoint (2026-07-21): the
 historical Hv=32-launcher-rejection text embedded in that completed 27B row is
-superseded for **dense 4B only**. `CLAIM-LOCAL-BF16-H32-AOT` adds the current
+superseded for **dense 4B only**. Immutable `176d4926` adds the current
 raw-packed/FP32-state `gdn_decode_h32` specialization; 35B remains inert through
 the dense-only model selector. Exact Hv=48/32 AOT-vs-hand-vs-CPU is **56/56**,
-full GDN is **53/53 (3,229/3,229)**, the flag test is **10/10**, and sm_120 plus
-sm_121a manifest drift checks pass. 4B token, sanitizer, repeated A/B and
-node-mode profile gates are pending, so no H32 speed credit is current.
+full GDN is **53/53 (3,229/3,229)**, the flag test is **10/10**, real-4B
+default/rollback is 1,664/1,664 per arm, memcheck is clean, and sm_120 plus
+sm_121a manifest drift checks pass. A locked same-binary A/B proves **+4.41%
+total/output throughput** and **-4.78% TPOT**; node-mode nsys attributes it to
+recurrence time **1.467331/2.585435 s (-43.25%)**. This accepts the dense-4B
+kernel repair without reopening the completed 27B row or claiming overall
+parity: fresh vLLM 0.25.0 total remains 0.9517x, deterministic eager-oracle
+long-stream agreement is 97/128 for both local arms, and strict loader VRAM plus
+external 27B/35B remain open. [Evidence](../docs/bench-evidence/qwen35-4b-h32-aot-repair-20260721.md).
 
 | ID | Item | Upstream | Our code | Tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|

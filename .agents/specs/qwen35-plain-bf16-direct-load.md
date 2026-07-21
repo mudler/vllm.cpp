@@ -127,52 +127,36 @@ checked in with an explicit model/backend skip.
    `scripts/check-doc-checkpoint.py`, README, BENCHMARKS, matrices, roadmap,
    ledger and state agree at every checkpoint.
 
-Current checkpoint: `GATING` after the corrected Triton-AOT local 4B
-comparison. Clean CPU gates remain green. CUDA 12.9/GCC 14 uses CMake CUDA arch
-`120a` (required by current Blackwell sources), generated Triton target
-`sm_120`, FlashInfer CUTLASS, `VLLM_CPP_TRITON=ON` and regeneration ON. The real
-cached `Qwen/Qwen3.5-4B` CUDA gate passes 3/3 cases and 1664/1664 assertions;
-the seven Triton-specific GDN cases execute 378/378 assertions; direct ON/OFF
-outputs are identical.
+Current checkpoint: `GATING` with the H32 repair performance-proven and the
+end-to-end oracle/every-axis gate open. Clean CPU gates remain green. CUDA
+12.9/GCC 14 uses CMake CUDA arch `120a` (required by current Blackwell
+sources), generated Triton target `sm_120`, FlashInfer CUTLASS,
+`VLLM_CPP_TRITON=ON` and regeneration ON.
 
-Immutable root `/tmp/qwen35-transplant-4b-aot-557ab41d` completed all 18
-cache/idle/thermal-guarded legs at 128 requests, 131,784 actual input tokens,
-128 output tokens/request and concurrency 32. Direct ON/OFF/local-vLLM-0.24
-means are **6155.10/6064.06/6730.46 total tok/s**,
-**680.61/670.54/744.24 output tok/s**, **5.317/5.240/5.814 req/s**,
-**722.56/815.05/903.20 ms mean TTFT**, **41.44/41.43/33.56 ms mean
-TPOT/ITL**, and **5985.90/6076.37/5164.87 ms mean E2EL**. Peak PSS is
-**2.405/8.571/7.569 GiB**, stable PSS **0.733/8.571/4.066 GiB**, and peak VRAM
-**12892/12884/12942.7 MiB**. ON is **+1.50%** total over same-binary OFF and
-cuts peak/stable PSS **71.9%/91.4%**; ON=OFF output IDs match 128/128 in all
-three pairs. The +8 MiB ON-vs-OFF VRAM delta keeps the strict VRAM gate open.
+The current raw-packed/FP32-state H=32 specialization is implemented and
+measured at immutable `176d4926`: Hk=16/Hv=32/Dk=Dv=128,
+mixed/BA/state strides 8192/64/524288 and the upstream warps1/stages3 launch.
+The launcher guard dispatches Hv in {48,32}; dense-only model selection keeps
+35B inert. Local sm_120 and vendored sm_121a generation pass drift validation;
+exact two-shape AOT-vs-hand-vs-CPU is 56/56, full GDN 53/53 (3,229/3,229),
+flag parsing 10/10, real-4B default/rollback tests are each 1,664/1,664 and
+focused memcheck is 0-error/0-leak. The old decomposed H=32 cubin remains absent
+because it consumed precomputed q/k/v/g/beta and BF16 state, which no longer
+matches main.
 
-Current AOT ON is **0.9316x** the previous AOT ON (**6155.10 vs 6607.04,
--6.84%**) and **0.9145x** local vLLM; current vLLM is 1.002x the previous
-reference, so the residual is project-side. Attribution is now complete in
-[the matched profile report](../../docs/bench-evidence/qwen35-4b-aot-regression-profile-20260721.md).
-The lock-held node-mode nsys series holds the workload and AOT stack fixed and
-shows synchronous current/previous GPU kernel time **23.306561/21.960202 s**.
-The dominant executed-path swap is the previous H=32 sm120 Triton recurrence
-at **0.601555 s / 47.652 us-call** becoming the current hand packed recurrence
-at **2.579749 s / 234.182 us-call**. Shipping async is a secondary 2.20%
-penalty. The old 1,024-MiB pool cap changes speed only 0.39%, so it explains
-the memory denominator rather than throughput. Packed-off is not a remedy:
-it gains only 0.86%, changes 11/128 outputs, and remains a 2.652-s recurrence.
-The exact vLLM trace executes its H=32 packed Triton body at 104.619 us/call.
-
-The current raw-packed/FP32-state H=32 specialization is now implemented:
-Hk=16/Hv=32/Dk=Dv=128, mixed/BA/state strides 8192/64/524288 and the upstream
-warps1/stages3 launch. The launcher guard dispatches Hv in {48,32}; dense-only
-model selection keeps 35B inert. Local sm_120 and vendored sm_121a generation
-pass drift validation; exact two-shape AOT-vs-hand-vs-CPU is 56/56, full GDN
-53/53 (3,229/3,229), and flag parsing 10/10. The old decomposed H=32 cubin
-remains absent because it consumed precomputed q/k/v/g/beta and BF16 state,
-which no longer matches main. The clean-commit 4B token/sanitizer/repeated A/B
-and graph-node profile are next; no new speed binds yet. The local vLLM arm
-remains a performance reference only: it is v0.24, not the current v0.25
-correctness oracle. Current-v0.25 correctness, strict VRAM closure and external
-27B/35B regressions remain.
+The locked same-binary A/B proves the repair: H32 AOT/fallback means are
+**6427.07/6155.57 tok/s (+4.41%)**, mean TPOT **39.457/41.437 ms (-4.78%)**,
+and mean E2EL **5733.27/5985.83 ms (-4.22%)**. Node-mode nsys attributes the
+gain to recurrence time **1.467331/2.585435 s (-43.25%)** over the same 11,016
+calls. The fresh 18-leg vLLM 0.25.0 checkpoint is still open: direct
+ON/OFF/vLLM total **6418.26/6316.05/6744.29 tok/s**, so ON is **0.9517x**
+vLLM and fails TPOT/E2EL despite winning TTFT and PSS. Direct ON/OFF remain
+128/128 identical, but AOT/fallback differ 9/128 on the long stream; the
+deterministic eager vLLM 0.25.0 oracle matches each local arm only 97/128.
+Operator correctness is green, while end-to-end oracle closure, strict loader
+VRAM (fresh mean ON/OFF 12890/12870 MiB), remaining decode performance and
+external 27B/35B regressions stay open. Full evidence and hashes are in the
+[repair report](../../docs/bench-evidence/qwen35-4b-h32-aot-repair-20260721.md).
 
 Corrected AOT reproduction entry point:
 
@@ -198,11 +182,14 @@ flock /tmp/gpu env LD_LIBRARY_PATH=/run/opengl-driver/lib \
   ctest --test-dir build-nix-cuda-transplant-triton \
   -R 'test_(qwen36_weights|model_registry|qwen27_dense_forward|qwen35_plain_weights|loaded_engine_dense)' \
   --output-on-failure
-REQUIRE_TRITON_AOT=1 \
-  CPP_BENCH=$PWD/build-nix-cuda-transplant-triton/examples/vllm-bench \
-  CMAKE_CACHE=$PWD/build-nix-cuda-transplant-triton/CMakeCache.txt \
-  flock /tmp/gpu tools/bench/run_qwen35_4b_compare.sh \
-  /tmp/qwen35-transplant-4b-aot-<commit>
+flock /tmp/gpu nix develop .#cuda --command bash -c '
+  export PYTHONPATH="/tmp/vllm25-site${PYTHONPATH:+:$PYTHONPATH}"
+  REQUIRE_TRITON_AOT=1 \
+    CPP_BENCH="$PWD/build-nix-cuda-transplant-triton/examples/vllm-bench" \
+    CMAKE_CACHE="$PWD/build-nix-cuda-transplant-triton/CMakeCache.txt" \
+    tools/bench/run_qwen35_4b_compare.sh \
+      /tmp/qwen35-h32-aot-vllm25-176d4926
+'
 ```
 
 ## Dependencies
@@ -227,13 +214,13 @@ REQUIRE_TRITON_AOT=1 \
    current preamble/GDN dispatch; regression tests.
 4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
    queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
-5. `W4` gates: **ACTIVE / H32 IMPLEMENTED, PERFORMANCE PENDING** — 18/18 guarded
-   legs bind the current 4B diagnostic; a matched five-arm nsys series
-   attributes the regression to the missing current-ABI H=32 packed Triton AOT
-   path, with async secondary. Direct loading remains exact and memory-positive.
-   The current-ABI H32 specialization and exact operator/drift gates are green;
-   clean-commit same-binary A/B/profile, current-v0.25 correctness, sanitizer,
-   strict ON<=OFF VRAM and external 27B/35B remain follow-ups.
+5. `W4` gates: **GATING / H32 REPAIR PERFORMANCE-PROVEN** — immutable
+   `176d4926` passes exact operator, real-model, drift and sanitizer gates; the
+   locked same-binary A/B is +4.41% total and the node-mode profile attributes
+   it to -43.25% recurrence time. Fresh vLLM 0.25.0 total remains 0.9517x and
+   the long deterministic eager-oracle comparison is 97/128 for both AOT and
+   fallback. End-to-end oracle, every-axis parity, strict loader VRAM and
+   external 27B/35B remain follow-ups; claim released.
 
 ## Risks and decisions
 

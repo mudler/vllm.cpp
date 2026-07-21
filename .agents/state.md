@@ -15165,3 +15165,59 @@ default/`VT_GDN_PACKED_DECODE_TRITON=0` token/sanitizer/repeated A/B and
 `docs/BENCHMARKS.md`. Current-v0.25 correctness, strict VRAM and external
 27B/35B follow-ups remain open; no H32 speed credit is claimed at this
 checkpoint.
+
+## 2026-07-21 — dense-4B H32 AOT repair measured; claim released
+
+Immutable implementation commit `176d4926d5c5c4579b1f598604f512c7320dbd51`
+was gated without further production edits. The focused flag test is 10/10;
+exact Hv=48/Hv=32 AOT-vs-hand-vs-CPU is 56/56; full `test_ops_gdn` is 53/53
+(3,229/3,229); local sm_120 and checked-in sm_121a drift checks pass. Real-4B
+default and `VT_GDN_PACKED_DECODE_TRITON=0` model tests are each 3/3,
+1,664/1,664, and their short logs are byte-identical. Focused compute-sanitizer
+memcheck passes 56/56 with 0 errors and 0 leaks (SHA
+`c778b3652b1cce29b697e23deceee2fde3e292cd945b56c771af6099e3bed938`).
+
+The exact alternating same-binary A/B under one `flock /tmp/gpu` is rooted at
+`/tmp/qwen35-h32-aot-ab-176d4926`: AOT total
+6436.76/6412.70/6431.76, mean **6427.07 tok/s**; fallback
+6159.83/6155.38/6151.51, mean **6155.57 tok/s**. The repair is **+4.41%**
+total/output, **-4.78%** mean TPOT/ITL and **-4.22%** mean E2EL, with neutral
+TTFT. Each arm is internally deterministic; AOT and fallback differ on 9/128
+requests (119/128 equal), so the long stream is not a token-equivalence proof.
+
+Matched nsys root `/tmp/qwen35-h32-aot-profile-176d4926` uses
+`--cuda-graph-trace=node` for both arms. Total GPU kernel time is
+22.527458/23.595950 s AOT/fallback. The exact recurrence is
+`fused_recurrent_gated_delta_rule_packed_decode_kernel` **1.467331 s / 11,016 /
+133.200 us** versus hand `GdnPackedDecodeKernel` **2.585435 s / 11,016 /
+234.698 us**: AOT is 1.762x and saves **1.118103 s / 43.25%**. Kernel CSV SHAs
+are `7943943f2e3fa9faaadd09fcb3644e6a706526d364cdbf28d3973763851b3dbb`
+and `193c466c7522010edb56df05be2c2bc61c9f81070b4c05d275583c9ee094ab22`.
+
+The fresh isolated-vLLM-0.25 production comparison root
+`/tmp/qwen35-h32-aot-vllm25-176d4926` completed all 18 guarded legs. Exact
+direct ON/OFF/vLLM means: total **6418.26/6316.05/6744.29 tok/s**, output
+**709.71/698.41/745.76**, request **5.547/5.460/5.826 req/s**, TTFT
+**722.68/819.49/900.04 ms**, TPOT/ITL **39.513/39.487/33.492 ms**, E2EL
+**5741.03/5834.21/5153.57 ms**, peak PSS **2.573/8.571/7.636 GiB**, stable PSS
+**0.739/8.571/4.334 GiB**, peak VRAM **12890/12870/12956 MiB**. Direct ON is
+**0.951659x** vLLM and **0.971428x** historical AOT. It wins TTFT and memory
+against vLLM but fails throughput, TPOT/ITL and E2EL; direct ON/OFF mean VRAM
+also exceeds the strict +8-MiB loader allowance by 12 MiB. Aggregate SHA is
+`9d09c8ee984407d76e5bed4c367619618448e75d6f75f3a11af9897c977a1ab7`.
+
+Production-graphed vLLM tokens are unstable on this batch (same-arm 128/95/95),
+so a separate vLLM 0.25.0 eager + async-off series ran under one lock at
+`/tmp/qwen35-h32-vllm25-eager-176d4926`. All three oracle token files are
+identical (SHA
+`3ac9cc31cd9719b11b89aeb6adc6fc238ba69ce2af5793d97662a645d65bb22a`),
+but AOT and fallback each match only 97/128 requests. Operator correctness is
+green; the free-running end-to-end oracle gate is not closed.
+
+Disposition: the H32 specialization is a proven performance repair and stays
+default-on, but `LOAD-SAFETENSORS-DIRECT-DENSE` remains `GATING` with
+`benchmark_binding=false`. `CLAIM-LOCAL-BF16-H32-AOT` is released. Full report:
+`docs/bench-evidence/qwen35-4b-h32-aot-repair-20260721.md`. Next work must
+resolve the end-to-end oracle divergence, profile/repair the remaining vLLM
+decode-path gap, re-close strict loader VRAM, and run the unavailable 27B/35B
+regressions; no 4B-to-gate-model support extrapolation.

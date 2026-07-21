@@ -1321,6 +1321,23 @@ void GdnConvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, con
   });
 }
 
+// QkvSplit: GQA merged-qkv split with INDEPENDENT q/k/v dims (q_dim != k_dim).
+void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
+  const int64_t t = qkv.shape[0], q_dim = q_out.Numel() / t, k_dim = k_out.Numel() / t,
+                v_dim = v_out.Numel() / t;
+  const int64_t total = q_dim + k_dim + v_dim;
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
+    const int64_t row = i * total;
+    for (int64_t j = 0; j < q_dim; ++j) StoreF32(q_out, i * q_dim + j, LoadF32(qkv, row + j));
+    for (int64_t j = 0; j < k_dim; ++j)
+      StoreF32(k_out, i * k_dim + j, LoadF32(qkv, row + q_dim + j));
+    for (int64_t j = 0; j < v_dim; ++j)
+      StoreF32(v_out, i * v_dim + j, LoadF32(qkv, row + q_dim + k_dim + j));
+  }
+  });
+}
+
 // Fused GDN post-conv prep: GdnConvSplit + L2Norm(q) + L2Norm(k) + GdnGBeta in
 // one pass (mirror of fla fused_gdn_prefill_post_conv). Bit-for-bit equal to
 // composing those four ops (same f32 math, same softplus threshold 20).
@@ -1566,6 +1583,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnGBetaFn>(&GdnGBetaKernel)));
     RegisterOp(OpId::kGdnConvSplit, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<GdnConvSplitFn>(&GdnConvSplitKernel)));
+    RegisterOp(OpId::kQkvSplit, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
     RegisterOp(OpId::kGdnPostConv, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<GdnPostConvFn>(&GdnPostConvKernel)));
     RegisterOp(OpId::kRopeCosSinCache, DeviceType::kCPU,

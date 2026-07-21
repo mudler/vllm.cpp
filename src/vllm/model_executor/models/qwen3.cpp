@@ -97,6 +97,33 @@ bool RopeCacheEnabled() {
   return on;
 }
 
+// Merged QKVParallelLinear: issue ONE [q|k|v] GEMM over the merged qkv weight
+// (mirror vLLM qwen3.py Qwen3Attention.qkv_proj, one F.linear then split via
+// QkvSplit), replacing the three per-shard MatmulBT GEMMs. It folds the two tiny
+// GQA k/v GEMMs (N=Hkv*Dh) into one wide, tensor-core-efficient GEMM and cuts 2
+// GEMM launches/layer.
+//
+// MEASURED NEUTRAL (2026-07-21, Qwen3-4B GB10, merge ON vs OFF same binary):
+// c1 tput 187.1 vs 185.7 (+0.8%), TPOT 46.8 vs 47.2; c8 tput 1314 vs 1308
+// (+0.4%), TPOT 50.0 vs 50.4, P99 ITL 266 vs 258 — all within run-to-run noise.
+// c8 decode is 93% GPU-busy (compute-bound); merging does not cut FLOPs and the
+// launch saving is negligible against ~82k decode launches, so there is no win.
+// It is also byte-AFFECTING (cuBLASLt picks a different K-reduction for the wider
+// merged N, flipping ONE Qwen3-0.6B near-tie token — Qwen3-4B stays 16/16 exact),
+// which would force regenerating the SACRED 0.6B near-tie golden for no benefit.
+//
+// So it ships DEFAULT OFF (opt-in): the default path is the byte-identical
+// 3-shard GEMM that matches the committed near-tie goldens. Set VT_QWEN3_QKV_MERGE=1
+// to exercise the vLLM-structural merged path (the QkvSplit primitive stays
+// available for a future decode-fusion that could make it pay). Read once.
+bool Qwen3QkvMergeEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_QWEN3_QKV_MERGE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
 struct Dev {
   Backend& b;
   Queue& q;
@@ -363,19 +390,30 @@ DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg,
   }();
   const DType adt = attn_f32 ? DType::kF32 : DType::kBF16;
 
-  // Merged QKVParallelLinear executed as its logical [q|k|v] shards: slice the
-  // ONE raw-NK [qdim+2kdim, H] owner's output rows (contiguous sub-blocks) and
-  // project each into a contiguous buffer via MatmulBT (bf16 in, bf16/f32 out).
+  // Merged QKVParallelLinear. The weight owner is ONE raw-NK [qdim+2kdim, H]
+  // tensor (vLLM's stacked qkv_proj). Two dispatch paths:
+  //  - MERGE (default): one MatmulBT over the whole owner -> [T, qdim+2kdim],
+  //    then QkvSplit into the contiguous q/k/v shards. Mirrors vLLM's single
+  //    qkv GEMM + .split([q,kv,kv]) and folds the tiny GQA k/v GEMMs into one
+  //    wide, tensor-core-efficient GEMM. Byte-affecting (near-tie-gated).
+  //  - 3-SHARD (VT_QWEN3_QKV_MERGE=0): slice the owner's output rows and project
+  //    each shard separately (the byte-identical baseline for the A/B).
   Tensor wqkv = ResidentWeight(d, w.qkv_proj);
-  Tensor wq = wqkv.Slice(0, 0, qdim);
-  Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
-  Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
   DBuf q(d, adt, {T, qdim});
   DBuf k(d, adt, {T, kdim});
   DBuf v(d, adt, {T, kdim});
-  vt::MatmulBT(d.q, q.t(), dhn, wq);
-  vt::MatmulBT(d.q, k.t(), dhn, wk);
-  vt::MatmulBT(d.q, v.t(), dhn, wv);
+  if (Qwen3QkvMergeEnabled()) {
+    DBuf qkv(d, adt, {T, qdim + 2 * kdim});
+    vt::MatmulBT(d.q, qkv.t(), dhn, wqkv);
+    vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
+  } else {
+    Tensor wq = wqkv.Slice(0, 0, qdim);
+    Tensor wk = wqkv.Slice(0, qdim, qdim + kdim);
+    Tensor wv = wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim);
+    vt::MatmulBT(d.q, q.t(), dhn, wq);
+    vt::MatmulBT(d.q, k.t(), dhn, wk);
+    vt::MatmulBT(d.q, v.t(), dhn, wv);
+  }
 
   // Per-head q/k RMSNorm (RMSNorm(head_dim), non-gemma) BEFORE partial NeoX RoPE.
   Tensor q2 = Reshape(q.t(), {T * Hq, Dh});

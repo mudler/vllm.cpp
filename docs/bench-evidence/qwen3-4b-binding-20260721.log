@@ -1,0 +1,51 @@
+# Qwen3-4B dense SPEED binding — same-session, matching-recipe (2026-07-21)
+#
+# Build: HEAD e510e85 + QkvSplit op (opt-in merge default-OFF), flashinfer cutlass
+#   (-DVLLM_CPP_CUTLASS_DIR=.../flashinfer/data/cutlass), CUDA 13.0, arch 121a, TRITON ON.
+# Box: dgx.casa GB10, idle (no LocalAI worker, nvidia-smi 0%). GPU flock held whole series.
+# Workload: random in1024 / out128 (range-ratio 0), --ignore-eos, closed-loop
+#   (--request-rate inf --max-concurrency C). num-prompts 16 (c1) / 96 (c8).
+# vLLM = 0.25.0 PRODUCTION (graphed/async default), `vllm serve` + `vllm bench serve`.
+# Ours = examples/vllm-bench (RoPE-cache default-ON, FA2 prefill+decode default-ON,
+#   qkv-merge default-OFF). Same recipe, same session, 2 reps each.
+# Ratio = ours/vLLM (throughput >=1 wins, latency <=1 wins).
+#
+# NOTE — this SUPERSEDES the 20260720 binding table in docs/BENCHMARKS.md, whose
+# vLLM c1 TTFT (61.6 ms => "2.27x") and c8 ITL P99 ("4.3x") were denominator /
+# num-prompts artifacts. Fresh same-session vLLM c1 TTFT is ~152 ms and c8 ITL
+# P99 ~130 ms; ours BEATS vLLM on both TTFT axes and ties ITL at c1.
+
+=== VLLM (fresh same-session 02:31-02:36) ===
+c1 rep1: tput 192.37  TTFTmed 151.38  TPOTmed 45.92  P99ITL 48.62
+c1 rep2: tput 191.90  TTFTmed 152.63  TPOTmed 45.97  P99ITL 48.05
+c8 rep1: tput 1472.81 TTFTmed 380.50  TPOTmed 46.66  P99ITL 130.26
+c8 rep2: tput 1471.83 TTFTmed 384.96  TPOTmed 46.14  P99ITL 130.00
+
+=== OURS (fresh same-session 02:38-02:43) ===
+c1 rep1: tput 188.80  TTFTmed 133.88  TPOTmed 46.59  P99ITL 48.15
+c1 rep2: tput 189.22  TTFTmed 139.03  TPOTmed 46.56  P99ITL 48.14
+c8 rep1: tput 1372.08 TTFTmed 144.07  TPOTmed 50.99  P99ITL 144.66
+c8 rep2: tput 1371.89 TTFTmed 143.82  TPOTmed 51.03  P99ITL 145.63
+
+=== RATIOS (ours/vLLM, mean of 2 reps) ===
+c1: tput 0.984x | TTFTmed 0.898x WIN | TPOTmed 1.014x | P99ITL 0.996x WIN
+c8: tput 0.932x | TTFTmed 0.376x WIN | TPOTmed 1.099x | P99ITL 1.115x
+
+=== VERDICT ===
+c1: effective every-axis parity (TTFT + ITL wins; tput 0.98x, TPOT 1.01x within ~1.5%).
+c8: NOT every-axis — residual = decode throughput/latency: tput 0.93x, TPOT 1.10x,
+    P99 ITL 1.12x (TTFT is a big WIN 0.38x). Decode is 93% GPU-busy (compute-bound),
+    dominated by small-M=8 cutlass_80_wmma projection GEMMs; ~7-10% GEMM-efficiency gap.
+    The qkv-merge (QkvSplit) was measured NEUTRAL here (doesn't cut decode FLOPs).
+=> MODEL-TEXT-qwen3 stays ACTIVE; named residual = c8 decode-GEMM efficiency.
+
+=== cutlass verification (open question RESOLVED) ===
+test_qwen27_paged_engine on the flashinfer cutlass build = 235/235 token-exact
+(full production stream 16/16). The prior "flashinfer cutlass gives 27B 234/235"
+claim is DISPROVEN — a build artifact. Build is production-consistent.
+
+=== A/B: qkv-merge ON vs OFF (same binary, VT_QWEN3_QKV_MERGE, num-prompts 8/24) ===
+c1: tput 187.1 (on) vs 185.7 (off) +0.8%; TPOT 46.8 vs 47.2
+c8: tput 1314 (on) vs 1308 (off) +0.4%; TPOT 50.0 vs 50.4; P99 ITL 266 vs 258
+=> NEUTRAL (within noise). Merge is byte-affecting (flips ONE 0.6B near-tie token;
+   4B stays 16/16 exact) so it ships DEFAULT-OFF to keep the SACRED goldens intact.

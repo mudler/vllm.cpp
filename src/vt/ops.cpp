@@ -2007,6 +2007,28 @@ void GdnConvSplit(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const T
                                                                               v_out, conv);
 }
 
+void QkvSplit(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
+  VT_CHECK(qkv.rank == 2, "qkv_split: qkv rank-2 [T, q_dim+k_dim+v_dim]");
+  const int64_t t = qkv.shape[0];
+  VT_CHECK(t > 0, "qkv_split: T must be > 0");
+  VT_CHECK(q_out.Numel() % t == 0 && k_out.Numel() % t == 0 && v_out.Numel() % t == 0,
+           "qkv_split: q_out/k_out/v_out element counts must be divisible by T");
+  const int64_t q_dim = q_out.Numel() / t, k_dim = k_out.Numel() / t, v_dim = v_out.Numel() / t;
+  VT_CHECK(qkv.shape[1] == q_dim + k_dim + v_dim,
+           "qkv_split: qkv inner dim must be q_dim + k_dim + v_dim");
+  VT_CHECK((q_out.dtype == DType::kF32 || q_out.dtype == DType::kBF16) &&
+               k_out.dtype == q_out.dtype && v_out.dtype == q_out.dtype &&
+               qkv.dtype == q_out.dtype,
+           "qkv_split: q/k/v out and qkv must share dtype (f32 or bf16)");
+  VT_CHECK(q_out.IsContiguous() && k_out.IsContiguous() && v_out.IsContiguous() &&
+               qkv.IsContiguous(),
+           "qkv_split: contiguous required");
+  VT_CHECK(q_out.device == q.device && k_out.device == q.device && v_out.device == q.device &&
+               qkv.device == q.device,
+           "qkv_split: device mismatch (q_out/k_out/v_out/qkv/queue)");
+  reinterpret_cast<QkvSplitFn>(GetOp(OpId::kQkvSplit, q.device.type))(q, q_out, k_out, v_out, qkv);
+}
+
 void GdnPostConv(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, Tensor& g_out,
                  Tensor& beta_out, const Tensor& conv, const Tensor& araw, const Tensor& braw,
                  const Tensor& a_log, const Tensor& dt_bias, const L2NormArgs& args) {

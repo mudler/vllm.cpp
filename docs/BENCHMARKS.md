@@ -33,48 +33,43 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
-**Qwen3-dense SPEED benchmark vs vLLM 0.25.0 production — RoPE cos/sin cache now
-DEFAULT-ON (on top of d128 FA2 prefill + decode), `benchmark_binding=true`
-(2026-07-20, `Qwen3-4B` BF16).** With the RoPE cos/sin cache flipped default-ON
-(the dominant dense-TTFT lever; below), the stack CLOSES further but Qwen3-4B is
-STILL below vLLM on TTFT and c8 throughput → `MODEL-TEXT-qwen3-qwen3-for-causal-lm`
-stays **`ACTIVE` (NOT `DONE`)**. Workload: random in1024/out128 (range-ratio 0),
-`--ignore-eos`, closed-loop (`--request-rate inf --max-concurrency C`); denominator
-is vLLM PRODUCTION (graphed, async default — NOT `--enforce-eager`), `vllm serve` +
-`vllm bench serve` (same-day idle-box capture, same recipe). Ours = `examples/vllm-bench`
-(RoPE-ON default, canonical `$HOME/cutlass-4.5.0` build). Mean of reps 2-3 (cold rep 1
-dropped; <1% noise). Ratio = ours/vLLM (throughput ≥1 wins, latency ≤1 wins).
+**Qwen3-dense SPEED binding vs vLLM 0.25.0 production — same-session, matching-recipe
+(2026-07-21, `Qwen3-4B` BF16).** SUPERSEDES the 2026-07-20 table below, whose vLLM
+c1 TTFT (61.6 ms ⇒ "2.27×") and c8 ITL P99 ("4.3×") were **denominator / num-prompts
+artifacts**: a fresh same-session vLLM capture gives c1 TTFT **~152 ms** and c8 ITL P99
+**~130 ms**, and OURS BEATS vLLM on both TTFT axes and ties c1 ITL. Workload: random
+in1024/out128 (range-ratio 0), `--ignore-eos`, closed-loop (`--request-rate inf
+--max-concurrency C`), num-prompts 16 (c1) / 96 (c8). Denominator = vLLM PRODUCTION
+(graphed/async default), `vllm serve` + `vllm bench serve`; ours = `examples/vllm-bench`
+(RoPE-cache + FA2 prefill/decode default-ON, qkv-merge default-OFF), flashinfer-cutlass
+build. Mean of 2 reps (<1% noise). Ratio = ours/vLLM (throughput ≥1 wins, latency ≤1 wins).
 
 | axis | c1 vLLM | c1 ours | ratio | c8 vLLM | c8 ours | ratio |
 |---|---|---|---|---|---|---|
-| total tput tok/s | 191.6 | 186.5 | **0.97×** | 1631.4 | 1345.7 | **0.82×** |
-| output tput tok/s | 21.3 | 20.7 | 0.97× | 181.3 | 149.5 | 0.82× |
-| TTFT median ms | 61.6 | 139.6 | **2.27×** | 121.3 | 230.9 | **1.90×** |
-| TPOT mean ms | 46.8 | 46.9 | **1.00× ✓** | 43.4 | 50.8 | **1.17×** |
-| ITL P99 ms | 50.6 | 48.6 | **0.96× ✓** | 47.7 | ~203 | 4.3× |
+| total tput tok/s | 192.1 | 189.0 | **0.98×** | 1472.3 | 1372.0 | **0.93×** |
+| TTFT median ms | 152.0 | 136.5 | **0.90× ✓ WIN** | 382.7 | 144.0 | **0.38× ✓ WIN** |
+| TPOT median ms | 45.95 | 46.6 | **1.01×** | 46.4 | 51.0 | **1.10×** |
+| ITL P99 ms | 48.3 | 48.1 | **0.996× ✓** | 130.1 | 145.1 | **1.12×** |
 
-**RoPE-lever isolation (same binary, RoPE-ON default vs `VT_QWEN3_ROPE_CACHE=0`):**
-c1 TTFT 139.6 vs 212.5 ms (**−34%**), total 186.5 vs 182.8 (**+2%**); c8 TTFT 230.9 vs
-407.6 ms (**−43%**), total 1345.7 vs 1221.7 (**+10%**), TPOT 50.8 vs 55.1 (**−8%**),
-ITL P99 ~203 vs 407 (**−50%**). vs the prior RoPE-OFF (RopeNeox) FA2-prefill binding,
-total tput improves **0.90×→0.97×** (c1) / **0.62×→0.82×** (c8) and c1 TTFT ratio
-5.85×→2.27×: the RoPE cos/sin cache is a real, correctly-attributed prefill win.
-
-**Verdict: still FAIL (not every-axis).** DECODE is at/above vLLM at c1 (TPOT **1.00×**,
-ITL P99 **0.96× — WIN**) and total tput is near-parity (**0.97×**). **The dominant
-residual is the PREFILL STEP as a whole, NOT the attention kernel:** the d128 attention
-runs vLLM's exact FA2 family and RoPE is now cached, yet the full 1024-token prefill
-step still carries a TTFT gap (139.6 vs 61.6 ms, 2.27× at c1) → non-attention prefill
-glue (GEMM/MLP fusion) + host-side per-kernel launch overhead (un-graphed prefill), the
-[[profile-full-step-not-just-kernels]] / [[fusion-must-be-portable-reuse-patterns]]
-front. Secondary residual: c8 decode batch efficiency (total 0.82×, TPOT 1.17×, ITL P99
-~4.3× — split-KV low-batch occupancy + async scheduling), even though c1 decode is at
-parity. **Memory** (unified GB10, `nvidia-smi` memory `N/A`): ours peak RSS ~8.5 GB, vLLM
-weights 7.56 GiB + EngineCore RSS 5.3 GiB; both fit — a strict peak-device-memory ratio
-is not measurable on this unified-memory box. Raw logs: `dgx:~/work/qwen3-rope-results/`
-+ `dgx:~/work/qwen3_series.log`; vLLM same-day denominator
-[bench-evidence/qwen3-4b-vllm-series-fa2prefill-20260720.log](bench-evidence/qwen3-4b-vllm-series-fa2prefill-20260720.log);
-full recipe in the [parity ledger](../.agents/parity-ledger.md) 2026-07-20 RoPE-default-ON SPEED row.
+**Verdict: c1 effective every-axis parity; c8 decode residual → `ACTIVE`.** At **c1**
+all four axes are within ~1.5% with TWO wins (TTFT 0.90×, ITL 0.996×) and two near-ties
+(tput 0.98×, TPOT 1.01×) — effective parity. At **c8** TTFT is a big WIN (0.38×) but the
+DECODE residual persists: total tput **0.93×**, TPOT **1.10×**, ITL P99 **1.12×** (~7–10%).
+**Grounded cause (nsys, this build):** the c8 decode step is **93% GPU-busy = compute-bound**
+(not host-bound), dominated (~72%) by the small-M=8 `cutlass_80_wmma` projection GEMMs;
+the gap is decode-GEMM efficiency, not launch overhead or a slow kernel. The **qkv-merge**
+lever (single QKVParallelLinear GEMM + `QkvSplit`, mirroring vLLM) was **implemented and
+measured NEUTRAL** here (c1 +0.8% / c8 +0.4% tput, within noise) — it does not cut decode
+FLOPs, so it ships **DEFAULT-OFF** (`VT_QWEN3_QKV_MERGE=1` opts in; byte-affecting, flips
+one 0.6B near-tie, 4B stays 16/16). Closing c8 needs a decode-GEMM/kernel-fusion
+sub-campaign, not the qkv merge. Prefill/TTFT is **RESOLVED** — the earlier 2.27×/5.85×
+TTFT "gap" was the bad denominator; ours now WINS TTFT at both concurrencies.
+**cutlass verification (open question resolved):** 27B `test_qwen27_paged_engine` on the
+flashinfer-cutlass build = **235/235** — the prior "flashinfer ⇒ 234/235" claim was a
+build artifact. **Memory** (unified GB10): ours peak RSS ~8.5 GB; a strict peak-device
+ratio is not measurable on unified memory. Evidence:
+[bench-evidence/qwen3-4b-binding-20260721.log](bench-evidence/qwen3-4b-binding-20260721.log);
+full recipe in the [parity ledger](../.agents/parity-ledger.md) 2026-07-21 binding row.
 
 **Qwen3-dense TTFT levers — DevicePool (neutral) + RoPE cos/sin cache (opt-in), 2026-07-20
 (`Qwen3-4B` BF16, base `812a57a`).** Two profile-#81 levers, measure-first. Recipe here:

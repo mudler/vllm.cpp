@@ -133,6 +133,7 @@ enum class OpId : uint8_t {
   kSigmoidGateBf16,
   kGdnGBeta,
   kGdnConvSplit,
+  kQkvSplit,
   kSharedExpertGate,
   kMoeCombineGate,
   kMoeGroupedGemmNvfp4Marlin,
@@ -379,6 +380,7 @@ using SigmoidGateBf16Fn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&
 using GdnGBetaFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                             const Tensor&);
 using GdnConvSplitFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&);
+using QkvSplitFn = void (*)(Queue&, Tensor&, Tensor&, Tensor&, const Tensor&);
 // Fused GDN post-conv prep (mirror of fla fused_gdn_prefill_post_conv):
 // conv-split + q/k l2norm + g/beta gating in ONE launch. eps travels in
 // L2NormArgs (the q/k l2norm eps; softplus threshold 20 baked in as in GdnGBeta).
@@ -1353,6 +1355,18 @@ void GdnGBeta(Queue& q, Tensor& g_out, Tensor& beta_out, const Tensor& araw, con
 // T = conv.shape[0]; key_dim = q_out.Numel()/T, value_dim = v_out.Numel()/T
 // (rows treated row-major). All f32.
 void GdnConvSplit(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& conv);
+
+// Splits a merged QKVParallelLinear projection into its q/k/v parts with
+// INDEPENDENT head dims (GQA: q_dim != k_dim, unlike the GDN GdnConvSplit which
+// assumes q_dim == k_dim). qkv is [T, q_dim + k_dim + v_dim] contiguous, laid
+// out per row as [q(q_dim) | k(k_dim) | v(v_dim)]; q_out [T,q_dim], k_out
+// [T,k_dim], v_out [T,v_dim], all contiguous, same dtype as qkv (f32 or bf16).
+// For each row t: q_out row = qkv row [0,q_dim); k_out row = qkv row
+// [q_dim, q_dim+k_dim); v_out row = qkv row [q_dim+k_dim, q_dim+k_dim+v_dim).
+// q_dim/k_dim/v_dim are inferred from q_out/k_out/v_out.Numel()/T. Mirrors
+// vLLM's qkv_proj output split (qwen3.py Qwen3Attention: one qkv GEMM then
+// .split([q_size, kv_size, kv_size], dim=-1)). CPU + CUDA.
+void QkvSplit(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv);
 
 // Fused GDN post-conv preparation (launch-count fusion; mirror of upstream
 // vllm/model_executor/layers/fla/ops/fused_gdn_prefill_post_conv.py

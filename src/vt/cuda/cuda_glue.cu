@@ -289,6 +289,55 @@ void GdnConvSplitKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_ou
 }
 
 // ---------------------------------------------------------------------------
+// qkv_split: split a merged QKVParallelLinear projection with INDEPENDENT head
+// dims (GQA: q_dim != k_dim). qkv is [T, q_dim+k_dim+v_dim]; q/k/v out are the
+// three contiguous shards. Thread per element over the widest shard; each shard
+// computes its own (row, col) since the dims differ (unlike GdnConvSplit).
+template <typename T>
+__global__ void QkvSplitKernel(T* q_out, T* k_out, T* v_out, const T* qkv, int64_t t,
+                               int64_t q_dim, int64_t k_dim, int64_t v_dim) {
+  const int64_t total = q_dim + k_dim + v_dim;
+  const int64_t nq = t * q_dim, nk = t * k_dim, nv = t * v_dim;
+  const int64_t n = nq > nk ? (nq > nv ? nq : nv) : (nk > nv ? nk : nv);
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
+       idx += step) {
+    if (idx < nq) {
+      const int64_t i = idx / q_dim, j = idx % q_dim;
+      q_out[idx] = qkv[i * total + j];
+    }
+    if (idx < nk) {
+      const int64_t i = idx / k_dim, j = idx % k_dim;
+      k_out[idx] = qkv[i * total + q_dim + j];
+    }
+    if (idx < nv) {
+      const int64_t i = idx / v_dim, j = idx % v_dim;
+      v_out[idx] = qkv[i * total + q_dim + k_dim + j];
+    }
+  }
+}
+
+void QkvSplitKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
+  const int64_t t = qkv.shape[0];
+  if (t == 0) return;
+  const int64_t q_dim = q_out.Numel() / t, k_dim = k_out.Numel() / t, v_dim = v_out.Numel() / t;
+  const int64_t nmax = q_dim > k_dim ? (q_dim > v_dim ? q_dim : v_dim) : (k_dim > v_dim ? k_dim : v_dim);
+  const int64_t n = t * nmax;
+  if (n == 0) return;
+  cudaStream_t s = AsStream(q);
+  if (q_out.dtype == DType::kF32) {
+    QkvSplitKernel<float><<<GridFor(n), kBlock, 0, s>>>(
+        q_out.Ptr<float>(), k_out.Ptr<float>(), v_out.Ptr<float>(), qkv.Ptr<float>(), t, q_dim,
+        k_dim, v_dim);
+  } else {
+    QkvSplitKernel<__nv_bfloat16><<<GridFor(n), kBlock, 0, s>>>(
+        q_out.Ptr<__nv_bfloat16>(), k_out.Ptr<__nv_bfloat16>(), v_out.Ptr<__nv_bfloat16>(),
+        qkv.Ptr<__nv_bfloat16>(), t, q_dim, k_dim, v_dim);
+  }
+  Check(cudaGetLastError(), "qkv_split launch");
+}
+
+// ---------------------------------------------------------------------------
 // shared_expert_gate: out[t,c] = bf16(sigmoid(gl[t]) * sd[t*H+c]). Thread per
 // output element (flat idx over T*H); the token index t = idx / H picks gl[t].
 __global__ void SharedExpertGateKernel(__nv_bfloat16* out, const float* sd, const float* gl,
@@ -332,6 +381,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnGBetaFn>(&GdnGBetaKernelCuda)));
     RegisterOp(OpId::kGdnConvSplit, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<GdnConvSplitFn>(&GdnConvSplitKernelCuda)));
+    RegisterOp(OpId::kQkvSplit, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernelCuda)));
     RegisterOp(
         OpId::kSharedExpertGate, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<SharedExpertGateFn>(&SharedExpertGateKernelCuda)));

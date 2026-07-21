@@ -14817,3 +14817,9 @@ GPU snapshot; no throughput, correctness or memory sample exists and no number
 is publishable. The two affected functions now assign arguments and composed
 names in separate declarations. Next: commit the fix, bind a new evidence root,
 and retry the complete lock-held series.
+
+### 2026-07-21 — corrected exact 4B retry root bound (`ACTIVE`)
+
+Driver fix `98dc954a` is immutable and the claim now binds the retry to
+`/tmp/qwen35-transplant-4b-98dc954a`. The prior `b0a520f1` root remains VOID;
+no result is claimed until the corrected full series completes.

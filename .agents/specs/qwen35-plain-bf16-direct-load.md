@@ -147,7 +147,8 @@ driver derives Nix's split nvcc/cudart/cuRAND toolchain into a symlink-only
 `CUDA_HOME`. First full-series root `/tmp/qwen35-transplant-4b-b0a520f1` is
 **VOID before any model leg**: Bash expanded `name` inside the same `local`
 declaration before `phase` was assigned under `set -u`. Both declarations are
-split/fixed; an immutable corrected-driver root is next.
+split/fixed in `98dc954a`; corrected root
+`/tmp/qwen35-transplant-4b-98dc954a` is next.
 
 Reproduction entry point:
 

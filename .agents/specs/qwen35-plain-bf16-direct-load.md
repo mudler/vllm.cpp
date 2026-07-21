@@ -2,8 +2,8 @@
 
 **Rows:** `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation`,
 `LOAD-SAFETENSORS-DIRECT-DENSE`
-**Lifecycle:** `GATING`
-**Owner:** -
+**Lifecycle:** `ACTIVE`
+**Owner:** `CLAIM-LOCAL-BF16-AOT-BENCH`
 
 ## Scope
 
@@ -127,7 +127,7 @@ checked in with an explicit model/backend skip.
    `scripts/check-doc-checkpoint.py`, README, BENCHMARKS, matrices, roadmap,
    ledger and state agree at every checkpoint.
 
-Current checkpoint: `GATING` after the exact local 4B comparison. Clean CPU build and focused 6/6 are green; the real cached
+Current checkpoint: `ACTIVE` on the corrected Triton-AOT local 4B comparison. Clean CPU build and focused 6/6 are green; the real cached
 `Qwen/Qwen3.5-4B` gate passes 3/3 cases and 1656/1656 assertions on CPU. The
 parallel 134-test CPU sweep passes 131/134; the two socket suites re-pass 2/2
 in isolation, leaving only the unrelated NixOS `/usr/bin/true`/restricted-PATH
@@ -152,7 +152,10 @@ means are **4534.38/4480.04/6730.37 total tok/s** and
 **501.40/495.39/744.22 output tok/s**. ON improves over the same binary OFF arm
 by **1.21%**, but is only **0.686x** the previous branch ON (6607.04 tok/s) and
 **0.674x** local vLLM; local vLLM itself is **1.002x** its previous 6716.47
-tok/s result, isolating the large regression to the project arm. Direct-load
+tok/s result. That cross-build performance conclusion is **VOID**: the current
+project binary had `VLLM_CPP_TRITON=OFF`, while the previous 6607.04 tok/s
+binary had `VLLM_CPP_TRITON=ON`, `VT_GDN_DECODE_TRITON_AOT=1`, sm_120 and the
+FlashInfer CUTLASS tree. The same-binary loader evidence remains valid. Direct-load
 ON reduces peak PSS **8.559 -> 2.606 GiB (-69.6%)** and stable PSS
 **8.558 -> 0.727 GiB (-91.5%)**, and lowers mean TTFT
 **1210.83 -> 1114.40 ms (-8.0%)**. Peak VRAM is **12944 MiB ON vs 12936 MiB
@@ -165,17 +168,23 @@ confirm different executed attention/GDN/GEMM paths, but do not by themselves
 assign the regression to one change. Aggregate SHA-256 is
 `0f95d6763e1a87d6b6e9e4028d33a84ae9351c5495703d4f2a13dc3d81a9b749`.
 
-Reproduction entry point:
+Corrected AOT reproduction entry point:
 
 ```sh
-nix develop .#cuda --command cmake -S . -B build-nix-cuda-transplant -G Ninja \
-  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=native \
+nix develop .#cuda --command cmake -S . -B build-nix-cuda-transplant-triton -G Ninja \
+  -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=120 \
   -DCMAKE_CUDA_COMPILER="$CMAKE_CUDA_COMPILER" \
-  -DCMAKE_CUDA_HOST_COMPILER="$CMAKE_CUDA_HOST_COMPILER"
-nix develop .#cuda --command cmake --build build-nix-cuda-transplant -j4
+  -DCMAKE_CUDA_HOST_COMPILER="$CMAKE_CUDA_HOST_COMPILER" \
+  -DVLLM_CPP_CUTLASS_DIR="$PWD/.venv-vllm/lib/python3.12/site-packages/flashinfer/data/cutlass" \
+  -DVLLM_CPP_FLASH_ATTN=ON -DVLLM_CPP_TRITON=ON \
+  -DVLLM_CPP_TRITON_REGEN=ON \
+  -DVLLM_CPP_TRITON_PYTHON="$PWD/.venv-vllm/bin/python" \
+  -DVLLM_CPP_TRITON_VENDORED_DIR=/tmp/vllm-cpp-triton-aot \
+  -DVLLM_CPP_TRITON_VENDORED_ARCH=sm_120 -DCMAKE_BUILD_TYPE=RelWithDebInfo
+nix develop .#cuda --command cmake --build build-nix-cuda-transplant-triton -j4
 HF_HOME=$PWD/.hf-cache nix develop .#cuda --command \
-  build-nix-cuda-transplant/tests/test_qwen35_plain_weights --no-skip
-nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant \
+  build-nix-cuda-transplant-triton/tests/test_qwen35_plain_weights --no-skip
+nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant-triton \
   -R 'test_(qwen36_weights|model_registry|qwen27_dense_forward|qwen35_plain_weights|loaded_engine_dense)' \
   --output-on-failure
 ```
@@ -202,12 +211,12 @@ nix develop .#cuda --command ctest --test-dir build-nix-cuda-transplant \
    current preamble/GDN dispatch; regression tests.
 4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
    queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
-5. `W4` gates: **GATING** — the corrected lock-held 4B ON/OFF/reference series,
-   exact output comparison, every requested timing/memory axis and matching
-   graph-node traces are complete. The loader improves throughput 1.21% and
-   sharply lowers host memory, while current main remains 31.4% below the
-   previous 4B result. Current-v0.25 correctness/performance, sanitizer, strict
-   ON<=OFF VRAM, and external 27B/35B regressions remain named follow-ups.
+5. `W4` gates: **ACTIVE** — the non-AOT same-binary loader correctness/memory
+   result remains valid, but its cross-build speed conclusion is VOID because
+   the previous project arm used Triton AOT. Rebuild current source with the
+   matching sm_120 AOT/FlashInfer-CUTLASS flags, rerun the full locked series
+   and graph-node traces, then compare every axis. Current-v0.25 correctness,
+   sanitizer, strict ON<=OFF VRAM and external 27B/35B remain follow-ups.
 
 ## Risks and decisions
 

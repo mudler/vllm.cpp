@@ -15008,3 +15008,33 @@ Aggregate SHA-256:
 The local benchmark claim is released. `LOAD-SAFETENSORS-DIRECT-DENSE` returns
 to `GATING`; current-v0.25 correctness/performance, sanitizer, strict ON<=OFF
 VRAM and 27B/35B external-hardware regressions remain open.
+
+### 2026-07-21 — non-AOT 4B speed comparison void; matching-AOT rerun active
+
+User review exposed a build-config mismatch that the prior checkpoint failed to
+audit. The current project benchmark binary came from
+`build-nix-cuda-transplant`, whose immutable cache says
+`VLLM_CPP_TRITON:BOOL=OFF` and `VLLM_CPP_TRITON_REGEN:BOOL=OFF`. The preserved
+previous project commands invoke
+`build-nix-cuda-triton-sm120-debug/examples/vllm-bench`; that cache says
+`VLLM_CPP_TRITON:BOOL=ON`, `VLLM_CPP_TRITON_REGEN:BOOL=ON`,
+`VLLM_CPP_TRITON_VENDORED_ARCH=sm_120`, and its compile commands define
+`VLLM_CPP_TRITON=1`, `VLLM_CPP_TRITON_CHUNKO_BF16=1` and
+`VT_GDN_DECODE_TRITON_AOT=1`. It also uses FlashInfer's CUTLASS tree rather
+than the non-AOT build's `third_party/cutlass`. The vLLM arm loaded a Torch AOT
+model and executed Triton/FLA kernels.
+
+Disposition correction: the `647a2a6a` same-binary direct ON/OFF correctness
+and memory evidence remains valid, including ON=OFF 128/128 and peak PSS
+2.606 vs 8.559 GiB. The 4534.38-vs-6607.04 current/previous comparison and the
+0.674x current/vLLM ratio are **VOID as code-regression/parity evidence**. They
+measure different project kernel stacks and cannot locate a regression in
+current main. The earlier state entry remains append-only and is superseded by
+this correction.
+
+`CLAIM-LOCAL-BF16-AOT-BENCH` reactivates the row. Build current source in
+`build-nix-cuda-transplant-triton` with the previous project's sm_120,
+FlashInfer-CUTLASS and Triton-AOT flags, gate exact tokens, and rerun the whole
+18-leg series plus graph-node traces. The driver now derives its CMake cache
+from `CPP_BENCH` (or explicit `CMAKE_CACHE`) so the reference toolchain and
+evidence metadata cannot silently bind to a different build directory.

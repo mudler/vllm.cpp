@@ -11,7 +11,7 @@ model=${MODEL:-$root/.hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806
 dataset=${DATASET:-/tmp/qwen35-4b-sharegpt-1024.json}
 cpp=${CPP_BENCH:-$root/build-nix-cuda-transplant/examples/vllm-bench}
 vllm_python=${VLLM_PYTHON:-$root/.venv-vllm/bin/python}
-cmake_cache=$root/build-nix-cuda-transplant/CMakeCache.txt
+cmake_cache=${CMAKE_CACHE:-$(dirname "$(dirname "$cpp")")/CMakeCache.txt}
 
 test ! -e "$out" || { echo "refusing to overwrite $out" >&2; exit 2; }
 test -x "$cpp"

@@ -278,6 +278,7 @@ add_test(NAME test_ops_fp8_cutlass_plan_cache_on
 set_tests_properties(test_ops_fp8_cutlass_plan_cache_on PROPERTIES
   ENVIRONMENT "VT_FP8_PLAN_CACHE=1")
 vllm_cpp_add_test(test_ops_moe_grouped vt/test_ops_moe_grouped.cpp)
+vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
 vllm_cpp_add_test(test_ops_fused_chain vt/test_ops_fused_chain.cpp)
 vllm_cpp_add_test(test_fused_chain_additivity vt/test_fused_chain_additivity.cpp)

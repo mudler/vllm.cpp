@@ -440,6 +440,80 @@ MoeFusedResident& MoeResidentFor(const MoeBlockWeights* w) {
   return cache[w];
 }
 
+// --- BF16 fast-MoE per-layer resident constants (Qwen3-Coder Qwen3MoeForCausalLM,
+// W5). The bf16 analog of MoeFusedResident: the E per-expert bf16 [K,N] weight
+// DEVICE pointers (gate/up/down) + the pair->token row map, uploaded ONCE during
+// the pre-warm forward so the captured decode region only reads resident device
+// buffers (no host-sourced copy to dangle on graph replay). The device pointers
+// are the stable ResidentWeight uploads (each OwnedTensor's d_dev owns the copy
+// for process lifetime); we capture them once. Leaked at process exit like the
+// fp4 resident arrays / cublasLt workspace.
+struct MoeBf16Resident {
+  void* gate = nullptr;  // i64 [E] device: per-expert gate weight ptrs ([H,I] bf16)
+  void* up = nullptr;    // i64 [E] device: per-expert up weight ptrs   ([H,I] bf16)
+  void* down = nullptr;  // i64 [E] device: per-expert down weight ptrs  ([I,H] bf16)
+  std::unordered_map<int64_t, void*> tok_map;  // T -> i32 [T*top_k] device
+  bool ready = false;
+};
+
+MoeBf16Resident& MoeBf16ResidentFor(const MoeBlockWeights* w) {
+  static std::mutex mu;
+  static std::unordered_map<const MoeBlockWeights*, MoeBf16Resident> cache;
+  std::lock_guard<std::mutex> lk(mu);
+  return cache[w];
+}
+
+// Fast BF16 grouped-MoE path (Qwen3-Coder). DEFAULT ON per the parity-enablers-
+// ship-as-defaults policy: the lever the every-axis speed parity depends on ships
+// default-ON, gated, BEFORE the binding speed run. VT_MOE_BF16_FAST=0 restores the
+// per-expert host-gather reference loop (the correctness oracle) for same-binary
+// A/B. Only consulted for bf16 experts on CUDA (fp4 experts always take the fused
+// Marlin/wmma path; CPU/GGUF keeps the reference loop regardless).
+bool MoeBf16FastEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MOE_BF16_FAST");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 rolls back
+  }();
+  return on;
+}
+
+// LAYOUT PRECONDITION for the fast bf16 grouped-MoE path. The grouped kernel reads
+// each expert weight as a bf16 [K,N] Matmul-B buffer (element (k,n) at k*N+n) and
+// the router gate through the plain `vt::Matmul` (B = [H,E]) — i.e. the
+// `LoadBf16Transposed` orientation (`nk == false`) produced by the Qwen3-Coder
+// safetensors loader (qwen3_moe_weights.cpp:77-85) and the GGUF loader
+// (qwen3_5_gguf_weights.cpp:403-422, `LoadExpertsT` transposes to [in,out]).
+// It CANNOT read the raw torch-Linear orientation (`nk == true`, [N,K]), which the
+// 35B MTP loader produces (`LoadBf16RawNK`/`CopyRawNK`, qwen3_5_mtp.cpp:109-133) —
+// the reference loop below handles that via MatmulF32/MatmulBf16's `w.nk` branch
+// (qwen3_5.cpp:721-737). So the fast path is taken ONLY when every weight it reads
+// is in the layout it supports; anything else falls through to the reference loop
+// (correct on every layout). This keeps the new path provably inert for the 35B
+// (fp4 experts), the MTP module (nk=true), and any future nk=true producer instead
+// of silently transposing their math.
+bool MoeBf16FastLayoutOk(const MoeBlockWeights& w, const HfConfig& cfg) {
+  const int64_t H = cfg.hidden_size, I = cfg.moe_intermediate_size;
+  const int64_t E = cfg.num_experts;
+  if (w.router_gate.nk || w.router_gate.rank != 2 || w.router_gate.shape[0] != H ||
+      w.router_gate.shape[1] != cfg.num_experts)
+    return false;
+  if (w.expert_gate.size() != static_cast<size_t>(E) ||
+      w.expert_up.size() != static_cast<size_t>(E) ||
+      w.expert_down.size() != static_cast<size_t>(E))
+    return false;
+  auto ok = [](const OwnedTensor& t, int64_t k, int64_t n) {
+    return !t.nk && t.rank == 2 && t.shape[0] == k && t.shape[1] == n &&
+           t.dtype == vt::DType::kBF16;
+  };
+  for (int64_t e = 0; e < E; ++e) {
+    const size_t se = static_cast<size_t>(e);
+    if (!ok(w.expert_gate[se], H, I) || !ok(w.expert_up[se], H, I) ||
+        !ok(w.expert_down[se], I, H))
+      return false;
+  }
+  return true;
+}
+
 #ifdef VT_MARLIN_NVFP4
 // --- Marlin NVFP4 W4A16 MoE: per-layer resident repacked weights (M0.8 drop-in).
 // When VT_NVFP4_MARLIN=1, the routed experts are repacked ONCE at first touch
@@ -4326,6 +4400,141 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
 }
 #endif  // VT_MARLIN_NVFP4
 
+// --- Fast BF16 grouped MoE block (Qwen3-Coder Qwen3MoeForCausalLM, W5). The
+// bf16-native analog of MoeBlockFusedCuda: replaces the per-expert host-gather
+// loop of MoeBlock's reference branch (download hidden -> host router gather ->
+// E serialized cuBLASLt ExpertMlp launches) with ~3 GROUPED bf16 GEMM launches
+// kept entirely on-device (no host round-trip in the expert compute). The router
+// top-k ids [T,top_k] ARE the per-pair expert ids (viewed [P=T*top_k]); gate/up
+// read the token hidden via the resident pair->token row map, down reads the
+// per-pair silu output. Structurally mirrors MoeBlockFusedCuda; the fp4 on-the-fly
+// decode is replaced by a direct bf16 weight read (vt::MoeGroupedGemmBf16). f32
+// gate/up outputs + f32 silu match the reference ExpertMlp (MatmulF32 then
+// F32ToBF16(silu*up)), so each output row stays within the near-tie band of the
+// reference path it replaces. Shared expert GUARDED on
+// shared_expert_intermediate_size>0 (Coder has none; SEAM GAP #3). CUDA only.
+DBuf MoeBlockBf16Cuda(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                      const Tensor& dh, int64_t T) {
+  const int64_t H = cfg.hidden_size;
+  const int64_t E = cfg.num_experts;
+  const int64_t top_k = cfg.num_experts_per_tok;
+  const int64_t I = cfg.moe_intermediate_size;
+  const int64_t P = T * top_k;
+
+  // Router: logits = dh @ gate (bf16), softmax/top-k/renormalize — all on device.
+  Tensor drg = ResidentWeight(d, w.router_gate);  // [H,E] bf16
+  DBuf dlog(d, DType::kBF16, {T, E});
+  vt::Matmul(d.q, dlog.t(), dh, drg);
+  DBuf dtw(d, DType::kF32, {T, top_k});
+  DBuf dtid(d, DType::kI32, {T, top_k});
+  vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),
+                    vt::MoeRouterTopKArgs{static_cast<int>(top_k), true});
+  Tensor eids = Reshape(dtid.t(), {P});  // [P] i32 expert ids
+
+  // Per-layer RESIDENT expert device-pointer arrays + pair->token row map,
+  // uploaded ONCE (first touch, during the pre-warm forward) — nothing dangles
+  // inside a captured graph.
+  MoeBf16Resident& mr = MoeBf16ResidentFor(&w);
+  if (!mr.ready) {
+    std::vector<int64_t> gp(static_cast<size_t>(E)), up(static_cast<size_t>(E)),
+        dp(static_cast<size_t>(E));
+    for (int64_t e = 0; e < E; ++e) {
+      const size_t se = static_cast<size_t>(e);
+      gp[se] = reinterpret_cast<int64_t>(ResidentWeight(d, w.expert_gate[se]).data);
+      up[se] = reinterpret_cast<int64_t>(ResidentWeight(d, w.expert_up[se]).data);
+      dp[se] = reinterpret_cast<int64_t>(ResidentWeight(d, w.expert_down[se]).data);
+    }
+    const size_t eb = static_cast<size_t>(E) * sizeof(int64_t);
+    auto up_i64 = [&](const std::vector<int64_t>& h) {
+      void* p = d.b.Alloc(eb);
+      d.b.Copy(d.q, p, h.data(), eb);
+      return p;
+    };
+    mr.gate = up_i64(gp);
+    mr.up = up_i64(up);
+    mr.down = up_i64(dp);
+
+    // HOST-MIRROR RELEASE (the decisive Qwen3-Coder host-memory lever; the bf16
+    // analog of the 35B Marlin release above, same mechanism/policy). The routed
+    // experts ARE essentially the whole model: 128 experts x 3 x [2048,768] bf16 x
+    // 48 layers = ~57 GiB, i.e. ~94% of the checkpoint. On GB10 the host `.bytes`
+    // and the device `d_dev` (ResidentWeight Alloc+Copy) are DISTINCT allocations
+    // out of ONE 119 GiB unified pool, so retaining both made the model cost ~114
+    // GiB and left nothing for KV cache/activations — MEASURED: the box ran at
+    // free=1 GiB and c>=2 collapsed into thrash (c2 output throughput BELOW c1;
+    // c4 never completed). Once the device copy exists it is authoritative and
+    // nothing reads the host bytes again: every consumer of an expert weight goes
+    // through ResidentWeight, which returns `d_dev` when populated.
+    //
+    // ORDERING: d.b.Copy is stream-async, so Synchronize FIRST — freeing the host
+    // source under an in-flight H2D copy would corrupt the device weights.
+    //
+    // POLICY vs KERNEL-PATH split (BACKEND-PLATFORM item 2), identical to Marlin:
+    // (a) WHETHER to free is the platform residency policy
+    // (release_host_weights_after_upload); (b) WHETHER the host bytes can ever be
+    // re-read is the KERNEL gate — here MoeBf16FastEnabled(), a process-static
+    // const that is TRUE by construction (this function is reached only from the
+    // MoeBlock branch gated on it), so the reference loop that would re-read them
+    // can never run in this process. VT_MOE_HOST_FREE=0 retains the host copies
+    // for a same-binary peak-memory A/B without changing the device compute.
+    static const bool host_free_on = [] {
+      const char* e = std::getenv("VT_MOE_HOST_FREE");
+      return !(e != nullptr && e[0] == '0');
+    }();
+    if (vllm::platforms::ShouldReleaseHostWeights(
+            vllm::platforms::GetPlatform(d.q.device.type).residency_policy(),
+            /*committed_compute_path=*/MoeBf16FastEnabled(),
+            /*host_free_env=*/host_free_on)) {
+      d.b.Synchronize(d.q);  // all E x 3 H2D uploads complete before any free
+      for (int64_t e = 0; e < E; ++e) {
+        const size_t se = static_cast<size_t>(e);
+        w.expert_gate[se].ReleaseHost();
+        w.expert_up[se].ReleaseHost();
+        w.expert_down[se].ReleaseHost();
+      }
+    }
+    mr.ready = true;
+  }
+  auto tok_it = mr.tok_map.find(T);
+  if (tok_it == mr.tok_map.end()) {
+    std::vector<int32_t> tok_map(static_cast<size_t>(P));
+    for (int64_t p = 0; p < P; ++p)
+      tok_map[static_cast<size_t>(p)] = static_cast<int32_t>(p / top_k);
+    const size_t tb = static_cast<size_t>(P) * sizeof(int32_t);
+    void* p = d.b.Alloc(tb);
+    d.b.Copy(d.q, p, tok_map.data(), tb);
+    tok_it = mr.tok_map.emplace(T, p).first;
+  }
+  Tensor dgate_ptrs = MakeTensor(mr.gate, DType::kI64, d.q.device, {E});
+  Tensor dup_ptrs = MakeTensor(mr.up, DType::kI64, d.q.device, {E});
+  Tensor ddown_ptrs = MakeTensor(mr.down, DType::kI64, d.q.device, {E});
+  Tensor dtok = MakeTensor(tok_it->second, DType::kI32, d.q.device, {P});
+
+  // Grouped gate/up GEMM over all pairs (one launch each, f32 out to match the
+  // reference MatmulF32), silu-mul (f32 silu -> bf16, matches ExpertMlp), grouped
+  // down GEMM (act = per-pair silu output, identity row-map). expert_out lands as
+  // [T,top_k,H] contiguous — exactly what MoeCombine consumes.
+  DBuf dgate(d, DType::kF32, {P, I});
+  DBuf dup_out(d, DType::kF32, {P, I});
+  vt::MoeGroupedGemmBf16(d.q, dgate.t(), dh, eids, &dtok, dgate_ptrs);
+  vt::MoeGroupedGemmBf16(d.q, dup_out.t(), dh, eids, &dtok, dup_ptrs);
+  DBuf dact(d, DType::kBF16, {P, I});
+  vt::MoeSiluMul(d.q, dact.t(), dgate.t(), dup_out.t());
+  DBuf ddown(d, DType::kBF16, {P, H});
+  vt::MoeGroupedGemmBf16(d.q, ddown.t(), dact.t(), eids, nullptr, ddown_ptrs);
+  Tensor expert_out = Reshape(ddown.t(), {T, top_k, H});
+
+  // Shared expert (SEAM GAP #3): Coder has none (shared_expert_intermediate_size
+  // == 0) -> null shared term to MoeCombine (pure routed sum). A bf16 full-attn
+  // MoE with a shared expert would run it here (bf16 path, fp4=false).
+  const bool has_shared = cfg.shared_expert_intermediate_size > 0;
+  std::optional<DBuf> shared;
+  if (has_shared) shared.emplace(SharedExpert(d, w, cfg, dh, T, false));
+  DBuf dout(d, DType::kBF16, {T, H});
+  vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(), has_shared ? &shared->t() : nullptr);
+  return dout;
+}
+
 DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
               const Tensor& dh, int64_t T) {
   const int64_t H = cfg.hidden_size;
@@ -4347,6 +4556,16 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
 #endif
     return MoeBlockFusedCuda(d, w, cfg, dh, T);
   }
+
+  // Fast BF16 grouped-MoE (Qwen3-Coder): CUDA + bf16 experts -> ~3 grouped bf16
+  // GEMM launches fully on-device (W5). DEFAULT ON (VT_MOE_BF16_FAST); =0 falls
+  // through to the reference loop below (same-binary A/B / correctness oracle).
+  // LAYOUT-GUARDED (MoeBf16FastLayoutOk): only the [K,N] Matmul-B (`nk == false`)
+  // orientation the grouped kernel can read; nk=true producers (35B MTP) fall
+  // through to the reference loop.
+  if (!fp4 && d.q.device.type == vt::DeviceType::kCUDA && MoeBf16FastEnabled() &&
+      !w.expert_gate.empty() && MoeBf16FastLayoutOk(w, cfg))
+    return MoeBlockBf16Cuda(d, w, cfg, dh, T);
 
   // Reference path: download the hidden once, then gather + per-expert MLP.
   std::vector<uint16_t> h(static_cast<size_t>(T) * H);

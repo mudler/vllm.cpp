@@ -153,6 +153,9 @@ enum class OpId : uint8_t {
   // per-row copies plus a separate BF16<->F32 cast.
   kGdnStateGather,
   kGdnStateScatter,
+  // BF16 grouped-MoE GEMM: the dtype-native analog of kMoeGroupedGemmNvfp4 (no
+  // fp4 decode). Powers the Qwen3-Coder (Qwen3MoeForCausalLM) fast bf16 MoE path.
+  kMoeGroupedGemmBf16,
   kCount
 };
 
@@ -355,6 +358,8 @@ using SwizzleBlockscaleFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MoeGroupedGemmNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
              const Tensor&, const Tensor&);
+using MoeGroupedGemmBf16Fn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&);
 // Marlin NVFP4 W4A16 grouped-MoE GEMM (lift of vLLM moe_wna16_marlin_gemm; see
 // MoeGroupedGemmNvfp4Marlin below). Scalar params travel in MoeMarlinArgs.
 struct MoeMarlinArgs {
@@ -738,6 +743,24 @@ void MatmulFp8CublasLt(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor&
 void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
                          const Tensor* row_map, const Tensor& packed_ptrs,
                          const Tensor& scale_ptrs, const Tensor& scale2s);
+
+// BF16 grouped-MoE GEMM (the fast bf16 MoE path, Qwen3-Coder Qwen3MoeForCausalLM).
+// out[p, n] = sum_k act[row(p), k] * W_e[k, n], where e = expert_ids[p], W_e =
+// weight_ptrs[e] is a bf16 [K, N] (Matmul-B / loader-transposed) weight, and
+// row(p) = row_map ? row_map[p] : p. Structurally identical scheduling to
+// MoeGroupedGemmNvfp4 (naive one-thread-per-output for small/decode P; expert-
+// counting-sort + bf16 WMMA tensor-core tiles for large/prefill P) — the fp4
+// on-the-fly decode is replaced by a direct bf16 weight read. f32 accumulation,
+// out f32 (gate/up, matching the reference MatmulF32) or bf16 (down). CUDA only
+// (the CPU/GGUF MoE path keeps the per-expert MatmulBf16 reference).
+//   act          [*, K] bf16 (row(p) selects the source row)
+//   expert_ids   [P] i32 (device) — per-pair expert id (router top-k, viewed [P])
+//   row_map      [P] i32 (device) or nullptr — pair p -> source act row
+//   weight_ptrs  [E] i64 (device) — each entry = (uintptr_t) of expert e's bf16
+//                [K, N] weight buffer
+// K = act.shape[1], N = out.shape[1], P = out.shape[0].
+void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                        const Tensor* row_map, const Tensor& weight_ptrs);
 
 // MoeGroupedGemmNvfp4Marlin (lift of vLLM moe_wna16_marlin_gemm, ops.cu:543 —
 // the Marlin W4A16 kernel vLLM selects for the 35B's NVFP4 MoE experts). One

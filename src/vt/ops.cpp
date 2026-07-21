@@ -579,6 +579,32 @@ void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor&
       q, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs, scale2s);
 }
 
+void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                        const Tensor* row_map, const Tensor& weight_ptrs) {
+  VT_CHECK(out.rank == 2 && act.rank == 2, "moe_grouped_gemm_bf16: out/act must be rank-2");
+  const int64_t p = out.shape[0], e = weight_ptrs.shape[0];
+  VT_CHECK(act.dtype == DType::kBF16, "moe_grouped_gemm_bf16: act must be bf16");
+  VT_CHECK(IsOutFloat(out.dtype), "moe_grouped_gemm_bf16: out must be f32/bf16");
+  VT_CHECK(expert_ids.Numel() == p,
+           "moe_grouped_gemm_bf16: expert_ids must have P entries (one per out row)");
+  VT_CHECK(expert_ids.dtype == DType::kI32, "moe_grouped_gemm_bf16: expert_ids must be i32");
+  VT_CHECK(weight_ptrs.Numel() == e && weight_ptrs.dtype == DType::kI64,
+           "moe_grouped_gemm_bf16: weight_ptrs must be i64 [E] (device pointers)");
+  VT_CHECK(act.IsContiguous() && out.IsContiguous() && expert_ids.IsContiguous() &&
+               weight_ptrs.IsContiguous(),
+           "moe_grouped_gemm_bf16: contiguous tensors required");
+  VT_CHECK(act.device == q.device && out.device == q.device && expert_ids.device == q.device &&
+               weight_ptrs.device == q.device,
+           "moe_grouped_gemm_bf16: device mismatch");
+  if (row_map != nullptr) {
+    VT_CHECK(row_map->Numel() == p && row_map->dtype == DType::kI32 && row_map->IsContiguous() &&
+                 row_map->device == q.device,
+             "moe_grouped_gemm_bf16: row_map must be contiguous i32 [P] on the queue device");
+  }
+  reinterpret_cast<MoeGroupedGemmBf16Fn>(GetOp(OpId::kMoeGroupedGemmBf16, q.device.type))(
+      q, out, act, expert_ids, row_map, weight_ptrs);
+}
+
 void MoeGroupedGemmNvfp4Marlin(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_weight,
                                const Tensor& b_scales, const Tensor& global_scale,
                                Tensor& workspace, const Tensor& sorted_token_ids,

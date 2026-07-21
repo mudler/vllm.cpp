@@ -5,9 +5,19 @@
 // Drives a compact prompt battery through the FULL PAGED LLMEngine stack
 // (InputProcessor -> Scheduler -> paged attention + KV-cache growth + MoE forward
 // + Sampler -> OutputProcessor) via LoadedEngine::FromModelDir, and checks the
-// greedy (temperature-0) decode against the pinned vLLM 0.25.0 oracle. The bf16
-// MoE runs the SLOW per-expert reference loop (W5 fixes speed) — correctness is
-// speed-independent, so the battery is small + decode bounded (16 tokens).
+// greedy (temperature-0) decode against the pinned vLLM 0.25.0 oracle. The battery
+// is small + decode bounded (16 tokens).
+//
+// W5 UPDATE: the bf16 MoE now runs the FAST grouped bf16 GEMM path
+// (`vt::MoeGroupedGemmBf16`, default ON — VT_MOE_BF16_FAST=0 restores the per-expert
+// reference loop for a same-binary A/B). Swapping the per-expert cuBLASLt loop for a
+// grouped tensor-core GEMM changes the f32 ACCUMULATION ORDER, which re-resolves
+// bf16 near-ties — so the goldens below were re-captured against the fast path. The
+// gate got STRICTER, not looser: STRICT token-exact went 4/6 -> 5/6 and the max
+// teacher-forced gap 0.125 nats -> 0.0000 nats (our one divergent token IS vLLM's own
+// argmax on our prefix). That is expected: vLLM computes these experts with its own
+// Triton GROUPED fused_moe GEMM, so a grouped GEMM lands closer to vLLM than a
+// per-expert loop does.
 //
 // GATE (identical ratified methodology to test_qwen3_paged_engine.cpp; see
 // [[near-tie-distributional-gate]]). vLLM 0.25.0 greedy on Qwen3-Coder is
@@ -223,7 +233,8 @@ TEST_CASE("qwen3-coder-30B-A3B paged-engine greedy near-tie correctness gate (dg
   if (dump) our_dump.assign(static_cast<size_t>(N * T), -1);
 
   MESSAGE("qwen3-coder: loading full 30B via FromModelDir(" << snap
-          << ") — bf16 MoE (SLOW per-expert reference loop) + engine stack...");
+          << ") — bf16 MoE (FAST grouped bf16 GEMM, VT_MOE_BF16_FAST default ON) "
+             "+ engine stack...");
   std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
       vllm::entrypoints::LoadedEngine::FromModelDir(
           snap, vllm::entrypoints::EngineParams{});

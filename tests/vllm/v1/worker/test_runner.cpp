@@ -35,6 +35,7 @@
 #include "vllm/sampling_params.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/sched/output.h"
+#include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -205,7 +206,8 @@ KVCacheConfig MakeKvConfig(const HfConfig& c,
   kv.num_blocks = kNumBlocks;
   kv.kv_cache_groups.emplace_back(
       std::vector<std::string>{"fa3"},
-      std::make_shared<FullAttentionSpec>(kBlockSize, Hkv, Dh, DType::kF32));
+      std::make_shared<FullAttentionSpec>(kBlockSize, Hkv, Dh,
+                                          vllm::v1::ResolveKvCacheDType()));
   kv.kv_cache_groups.emplace_back(
       std::vector<std::string>{"gdn0", "gdn1", "gdn2"},
       std::make_shared<MambaSpec>(
@@ -353,7 +355,8 @@ KVCacheConfig MakeFaOnlyKvConfig(const HfConfig& c) {
   kv.num_blocks = kNumBlocks;
   kv.kv_cache_groups.emplace_back(
       std::vector<std::string>{"fa"},
-      std::make_shared<FullAttentionSpec>(kBlockSize, Hkv, Dh, DType::kF32));
+      std::make_shared<FullAttentionSpec>(kBlockSize, Hkv, Dh,
+                                          vllm::v1::ResolveKvCacheDType()));
   return kv;
 }
 
@@ -372,6 +375,50 @@ NewRequestData MakeFaNewReq(const std::string& id, std::vector<int32_t> prompt,
 }
 
 }  // namespace
+
+// ─── 0. The attention cache is sized from the KV SPEC, not the HF config ─────
+//
+// MLA campaign W1. Upstream sizes every KV buffer from
+// `spec.page_size_bytes()` (vllm/v1/kv_cache_interface.py:380-398) and shapes
+// it from the backend, which is why `vllm/v1/worker/gpu_model_runner.py` needs
+// no `use_mla` branch at all. We used to compute
+// `num_blocks * 2 * block * config.num_key_value_heads * config.head_dim`.
+// These two cases are the POSITIVE SIGNAL that the spec now drives it:
+//   (a) the default spec reproduces the old bytes EXACTLY (byte-identity), and
+//   (b) a `page_size_padded` spec — a value the old HF-config arithmetic could
+//       not produce under ANY config — is honoured, which is only possible if
+//       the allocator actually asked the spec.
+TEST_CASE("runner: attention cache page size comes from the KV spec") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const int64_t Hkv = c.num_key_value_heads;
+  const int64_t Dh = c.head_dim;
+  const DType kv_dtype = vllm::v1::ResolveKvCacheDType();
+
+  SUBCASE("default spec == the pre-refactor hardcoded arithmetic") {
+    GPUModelRunner runner(c, w, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                          kMaxModelLen, /*max_num_batched_tokens=*/64);
+    // The exact expression the runner used to hardcode (factor 2 = K+V).
+    const int64_t legacy_page_bytes =
+        2 * kBlockSize * Hkv * Dh * static_cast<int64_t>(vt::SizeOf(kv_dtype));
+    CHECK(runner.fa_page_size_bytes() == legacy_page_bytes);
+    CHECK(runner.attn_kv()[0].dtype == kv_dtype);
+  }
+
+  SUBCASE("page_size_padded from the spec is honoured (proves the spec ran)") {
+    KVCacheConfig kv = MakeFaOnlyKvConfig(c);
+    const int64_t real =
+        2 * kBlockSize * Hkv * Dh * static_cast<int64_t>(vt::SizeOf(kv_dtype));
+    const int64_t padded = real + 512;  // unreachable by any HF-config formula
+    kv.kv_cache_groups[0].kv_cache_spec = std::make_shared<FullAttentionSpec>(
+        kBlockSize, static_cast<int>(Hkv), static_cast<int>(Dh), kv_dtype,
+        /*head_size_v=*/std::nullopt, vllm::v1::KVQuantMode::kNone, padded);
+    GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                          /*max_num_batched_tokens=*/64);
+    CHECK(runner.fa_page_size_bytes() == padded);
+    CHECK(runner.fa_page_size_bytes() != real);
+  }
+}
 
 // ─── 1. KV allocation shape from a fake KVCacheConfig ────────────────────────
 TEST_CASE("runner: KV allocation from KVCacheConfig (full-attn + GDN state)") {

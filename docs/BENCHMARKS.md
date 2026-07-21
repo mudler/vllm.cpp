@@ -1367,13 +1367,23 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
-- **MLA + DeepSeek/Kimi/MiniMax campaign — SPIKE ONLY (2026-07-21,
-  `CLAIM-MLA-DEEPSEEK`,
+- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0 (grounding) + W1
+  (spec-driven KV allocation) (2026-07-21, `CLAIM-MLA-DEEPSEEK`,
   [spike](../.agents/specs/mla-deepseek-campaign.md)).**
-  `benchmark_binding=false`; **NOT APPLICABLE.** This change is a specification
-  and record update only — **no code, no kernels, no build, no GPU run** — so
-  there is nothing to measure and no binding number is created, re-based or
-  invalidated. Every existing binding result stands unchanged.
+  `benchmark_binding=false`; **NOT APPLICABLE.** W0 ran the vLLM oracle on
+  DeepSeek-V2-Lite purely to OBSERVE backend selection and greedy self-consistency
+  — no timing was taken and none may be quoted. W1 is a **behaviour-preserving
+  allocator refactor with zero MLA math**: the attention cache is sized from
+  `spec->page_size_bytes()` instead of hardcoded `2 * block * Hkv * Dh`, which is
+  byte-for-byte the same number for every existing model by construction, and the
+  four correctness gates (27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense
+  16/16) came back UNCHANGED, confirming no behavioural or allocation-size drift.
+  Therefore **no binding number is created, re-based or invalidated, and every
+  existing binding result stands unchanged.** One forward-looking observation
+  recorded from W0 so it cannot surprise W9: the oracle resolves DeepSeek's MoE to
+  the **FlashInfer CUTLASS** backend, not Triton `fused_moe`, so the "our grouped
+  MoE GEMM runs ~1.2x vLLM's Triton `fused_moe`" figure from the 35B work does NOT
+  transfer to this model's speed denominator and must be re-measured.
   **Benchmarks are PENDING and cannot begin until the implementation does.** The
   future benchmark disposition is fixed now so it cannot be quietly loosened
   later: the MLA gate vehicle is **DeepSeek-V2-Lite bf16**, measured against

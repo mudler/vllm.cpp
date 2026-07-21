@@ -7,6 +7,7 @@
 
 #include "vllm/model_executor/models/qwen3_5.h"           // ForwardLogits
 #include "vllm/model_executor/models/qwen3_5_internal.h"  // ResolveMambaSsmCacheDType
+#include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
 
@@ -59,8 +60,11 @@ v1::KVCacheConfig MakeQwen3_5KVCache(const HfConfig& config, int block_size,
   kv.num_blocks = num_blocks;
   kv.kv_cache_groups.emplace_back(
       std::vector<std::string>{"fa"},
-      std::make_shared<v1::FullAttentionSpec>(block_size, num_kv_heads,
-                                               head_dim, vt::DType::kF32));
+      // The spec is the SINGLE source of truth for the paged-KV storage dtype
+      // and layout: the runner sizes the buffer from spec->page_size_bytes()
+      // and builds its cache view from the spec's fields (MLA campaign W1).
+      std::make_shared<v1::FullAttentionSpec>(
+          block_size, num_kv_heads, head_dim, v1::ResolveKvCacheDType()));
   kv.kv_cache_groups.emplace_back(
       std::vector<std::string>{"gdn"},
       std::make_shared<v1::MambaSpec>(

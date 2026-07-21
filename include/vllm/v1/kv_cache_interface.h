@@ -23,7 +23,10 @@
 //   FullAttentionSpec.real_page_size_bytes =
 //       block_size * num_kv_heads * (head_size + head_size_v) * dtype_size
 //       (identical to the base when head_size_v == head_size, the default; the
-//        split exists so MLA/asymmetric-V layers can differ — deferred here)
+//        split exists so MLA/asymmetric-V layers can differ)
+//   MLAAttentionSpec.real_page_size_bytes =
+//       storage_block_size * num_kv_heads(1) * head_size * dtype_size
+//       (NO factor 2, NO separate V — see the MLAAttentionSpec comment)
 //   SlidingWindowSpec.real_page_size_bytes = the same asymmetric K+V formula;
 //       its window changes allocation lifetime, not bytes per stored token.
 //   ChunkedLocalAttentionSpec inherits AttentionSpec's symmetric K+V formula;
@@ -41,10 +44,12 @@
 //
 // DEFERRED (marked stubs / omissions; the gate models never exercise these, and
 // later units fill them in without reshaping the base):
-//   - MLAAttentionSpec / SlidingWindowMLASpec / SinkFullAttentionSpec / RSWASpec /
+//   - SlidingWindowMLASpec / SinkFullAttentionSpec / RSWASpec /
 //     EncoderOnlyAttentionSpec / CrossAttentionSpec / UniformTypeKVCacheSpecs /
 //     TQFullAttentionSpec / HiddenStateCacheSpec (T1/T2) — omitted. The base
 //     stays extensible (virtual page_size_bytes/kind/storage_block_size).
+//     `MLAAttentionSpec` LANDED (MLA campaign W1): allocation metadata only —
+//     no MLA math, no MLA ops, no model consumes it yet.
 //   - kv_quant_mode != NONE page-size math (per-token-head scale bytes, nvfp4 /
 //     int4 packed layouts): the `kv_quant_mode` field is carried for fidelity
 //     but any non-NONE mode throws in real_page_size_bytes (T1). The gate models
@@ -178,6 +183,57 @@ struct FullAttentionSpec : AttentionSpec {
   int64_t real_page_size_bytes() const override;
   KVCacheSpecKind kind() const override {
     return KVCacheSpecKind::kFullAttention;
+  }
+};
+
+// The compressed-latent (Multi-head Latent Attention) paged cache.
+// (Upstream: vllm/v1/kv_cache_interface.py:363 MLAAttentionSpec(FullAttentionSpec),
+// page formula :380-398.)
+//
+// MLA stores ONE latent row per token per layer — `kv_lora_rank +
+// qk_rope_head_dim` elements (512 + 64 = 576 for every DeepSeek variant and for
+// Kimi Linear's MLA layers) — with `num_kv_heads == 1` and **no V tensor at
+// all**: V is reconstructed on the fly from the same latent via `W_UV`. So the
+// page formula DROPS the factor 2 that every other attention spec carries:
+//
+//   real_page_size_bytes = storage_block_size * num_kv_heads * head_size * es
+//
+// mirroring upstream `kv_cache_interface.py:397-398`. The out-of-scope special
+// cases upstream guards above that line (`fp8_ds_mla`: V3.2 = 656 B/token,
+// V4 = 584 B/token at :381-388; INT4 per-token-head at :389-390) are NOT ported
+// and throw via the shared kv_quant_mode guard rather than silently mis-sizing.
+//
+// MLA-ness is a page-SIZE and tensor-SHAPE concern ONLY: upstream maps
+// `MLAAttentionSpec -> FullAttentionManager` with
+// `uniform_type_base_spec=FullAttentionSpec`
+// (`vllm/v1/core/single_type_kv_cache_manager.py:1539`), and
+// `vllm/v1/worker/gpu_model_runner.py` has **no `use_mla` branch at all** — so
+// the block table, prefix caching and eviction are untouched. We mirror that by
+// deriving from FullAttentionSpec and registering the same manager kind
+// (see kv_cache_spec_registry.cpp).
+//
+// Upstream also asserts MLA and full-attention layers can NEVER share a KV
+// group (`kv_cache_interface.py:277-279` and `:400-403`, the two `merge`
+// asserts). We have not ported `merge()` (see the DEFERRED note above); the
+// distinct `kind()` below is what a future `merge()` will key that assert on.
+struct MLAAttentionSpec : FullAttentionSpec {
+  // num_kv_heads is accepted for field fidelity but is 1 for MLA — upstream
+  // states it in three places (`mla_attention.py:390`, `:1004-1009`,
+  // `vllm/config/model.py:1270-1274` "When using MLA during decode it becomes
+  // MQA") and `MLACommonBackend.get_kv_cache_shape` accepts and IGNORES the
+  // argument (`mla_attention.py:1219`).
+  MLAAttentionSpec(int block_size, int head_size, vt::DType dtype,
+                   int num_kv_heads = 1,
+                   KVQuantMode kv_quant_mode = KVQuantMode::kNone,
+                   std::optional<int64_t> page_size_padded = std::nullopt,
+                   bool indexes_kv_by_block_stride = false)
+      : FullAttentionSpec(block_size, num_kv_heads, head_size, dtype,
+                          /*head_size_v=*/head_size, kv_quant_mode,
+                          page_size_padded, indexes_kv_by_block_stride) {}
+
+  int64_t real_page_size_bytes() const override;
+  KVCacheSpecKind kind() const override {
+    return KVCacheSpecKind::kMlaAttention;
   }
 };
 

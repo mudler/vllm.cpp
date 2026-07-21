@@ -1,12 +1,17 @@
 # SPIKE — MLA (Multi-head Latent Attention) + the DeepSeek / Kimi / MiniMax families
 
-**Status:** SPIKE ONLY. No implementation, no kernels, no build. Nothing in this
-change claims `READY`/`ACTIVE`/`DONE`.
-**Base:** `b4f14ee` (`origin/main`).
+**Status:** **W0 + W1 LANDED** (see `### Work breakdown`). W0 grounded every
+fact the spike flagged as an unverified source read — all CONFIRMED by runtime
+observation, nothing contradicted. W1 landed the behaviour-preserving
+spec-driven KV allocation + `MLAAttentionSpec` with **zero MLA math**. W2-W10
+remain plan only. No model row moves off `SPIKE` — W0/W1 make no model
+supported.
+**Base:** `b4f14ee` (spike) / `fb3fd5d` (W0+W1).
 **Pinned oracle:** `/home/mudler/_git/vllm` @ `e24d1b24` (v0.25.0 audit target
 `702f4814fe54`). The executable oracle venv `~/venvs/vllm-oracle` lives on
-**dgx.casa**, not on the dev box — every claim below is grounded in repo source;
-the two claims that need a RUNTIME observation are flagged in §9/§12.
+**dgx.casa**. Every claim below is grounded in repo source; the two claims that
+needed a RUNTIME observation (§9/§12) were OBSERVED at W0 on 2026-07-21 and are
+recorded in `### Work breakdown`.
 **Rows covered:** `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm`,
 `MODEL-TEXT-deepseek-v2-deepseek-v3-for-causal-lm`,
 `MODEL-TEXT-deepseek-v2-deepseek-for-causal-lm`,
@@ -850,12 +855,14 @@ mirroring the Qwen3-Coder pair.
 
 ## 8. Gates
 
-**Correctness (SACRED).** Per [[near-tie-distributional-gate]]: first establish
-by K=5 per-prompt capture whether vLLM's own greedy is deterministic on
-DeepSeek-V2-Lite; if yes (expected — it is a 16B model but MoE routing is
-deterministic), the STRICT-where-well-posed near-tie-robust gate applies —
-our token within 0.5 nats of vLLM's teacher-forced argmax, strict where equal,
-0 forward-divergent. **The vehicle is DeepSeek-V2-Lite bf16.** V3/V3.2/K2.5/M2
+**Correctness (SACRED). SETTLED AT W0 — the gate is the STRICT form.** The K=5
+probe was run and, **at batch=1 (the gate regime), vLLM's own greedy on
+DeepSeek-V2-Lite is DETERMINISTIC on 8/8 prompts**. So the STRICT-where-
+well-posed near-tie-robust gate applies — our token within 0.5 nats of vLLM's
+teacher-forced argmax, strict where equal, 0 forward-divergent. **Caveat that
+must not be lost:** the SAME battery run as ONE BATCH looks non-deterministic on
+3/8 prompts. That is a batching artifact (re-ordered reductions), not model
+non-determinism; every determinism claim on this model must be made at batch=1. **The vehicle is DeepSeek-V2-Lite bf16.** V3/V3.2/K2.5/M2
 get **no e2e gate — HW-BLOCKED (§5.2)**, only the config/loader-slice/unit gates.
 
 **Per-step gates.** Every W-step: dgx CUDA `-Werror` 0-warn on a clean build;
@@ -907,8 +914,8 @@ hardware. **Nothing below is implemented; this is the plan.**
 
 | W | Item | Depends on | Gate |
 |---|---|---|---|
-| **W0** | **Ground the facts.** Download DeepSeek-V2-Lite; confirm its real `config.json` against §5 (especially `q_lora_rank is None`); run the vLLM oracle on it and CONFIRM from its logs that `TRITON_MLA` + FA-2 MLA prefill are selected on sm_121; capture a K=5 greedy determinism probe to fix the gate form. | checkpoint | oracle runs; selection confirmed by observation |
-| **W1** | **Spec-driven KV allocation (behaviour-preserving, no MLA).** Size every cache buffer from `spec->page_size_bytes()`; stop reconstructing shape from `config_`; add `KVCacheSpecKind::kMLA` + `MLAAttentionSpec` with the single-tensor formula + merge assertions. | — | 27B 235/235, 35B 315/315, Coder 6/6, Qwen3 16/16 **byte-identical**; new spec unit tests |
+| **W0** ✅ **DONE 2026-07-21** | **Ground the facts.** Download DeepSeek-V2-Lite; confirm its real `config.json` against §5 (especially `q_lora_rank is None`); run the vLLM oracle on it and CONFIRM from its logs that `TRITON_MLA` + FA-2 MLA prefill are selected on sm_121; capture a K=5 greedy determinism probe to fix the gate form. | checkpoint | **PASSED** — checkpoint fetched (29.26 GiB, 4 shards) and generating in the oracle; `TRITON_MLA` + `FLASH_ATTN` MLA prefill OBSERVED on sm_121 (3 runs) and the two-stage decode kernels seen executing; every §5.1 config number confirmed, none corrected; determinism = **DETERMINISTIC 8/8 at batch=1** ⇒ STRICT gate |
+| **W1** ✅ **DONE 2026-07-21** | **Spec-driven KV allocation (behaviour-preserving, no MLA).** Size every cache buffer from `spec->page_size_bytes()`; stop reconstructing shape from `config_`; add `KVCacheSpecKind::kMlaAttention` + `MLAAttentionSpec` with the single-tensor formula (merge assertions deferred with `merge()` itself; the distinct `kind()` is what a future `merge()` keys on). | — | **PASSED** — 27B 235/235, 35B 315/315, Coder 6/6, Qwen3-dense 16/16 all UNCHANGED; CUDA `-Werror` 0 warn/0 err; `test_kv_cache_interface` 21/21 (4 new MLA-spec cases), `test_runner` 15/15, `test_llm_engine` 5/5; new path proven EXERCISED via `fa_page_size_bytes()` + a `page_size_padded` case |
 | **W2** | **Platform MLA backend priorities + registry.** Port the `use_mla` branch of `_get_backend_priorities` (`cuda.py:93-142`) and the MLA prefill selector; register an `MLA` attention backend name resolving to TRITON_MLA on major 12. | W1 | ports of `test_attention_backends_selection.py` (MLA cases), `test_mla_prefill_selector.py`, `test_mla_prefill_registry.py`; existing non-MLA selection unchanged |
 | **W3** | **New `vt::` ops — cache write + router.** `vt::ConcatAndCacheMla` (CPU ref + CUDA) mirroring `concat_and_cache_mla`; extend `MoeRouterTopKArgs` with `scoring_func` / `e_score_correction_bias` / `num_expert_group` / `topk_group` / `routed_scaling_factor` and implement the grouped-topk selection rule. | W1 | op parity tests vs CPU reference; grouped-topk unit test vs the upstream formula; existing router byte-identical |
 | **W4** | **MLA decode attention op.** `vt::MlaDecodeAttention` — the two-stage split-KV MQA decode over the latent (QK 576 / V 512), structurally mirroring `decode_attention_fwd` (vLLM <- SGLang <- lightllm) and reusing our FA-2 split+deterministic-combine pattern; registered via `cuda_arch_tactics`. | W3 | port of `test_mla_decode_cpu.py`; CPU-ref parity; run-to-run bit-reproducibility |
@@ -1060,10 +1067,13 @@ aiter MLA set. New (no upstream twin): `test_deepseek_v2_load.cpp`,
 `scripts/deepseekv2-oracle-capture.py`, `scripts/deepseekv2-neartie-gap.py`.
 
 ### Gates
-Per §8. SACRED correctness on **DeepSeek-V2-Lite bf16** under the
-[[near-tie-distributional-gate]] form determined at W0 (K=5 determinism probe;
-strict where well-posed, else our token within 0.5 nats of vLLM's teacher-forced
-argmax, 0 forward-divergent). Every W-step: dgx CUDA `-Werror` 0-warn on a clean
+Per §8. SACRED correctness on **DeepSeek-V2-Lite bf16**. The W0 K=5 probe
+SETTLED the form: at **batch=1 (the gate regime) vLLM's own greedy is
+DETERMINISTIC 8/8**, so the **STRICT** where-well-posed gate applies (our token
+within 0.5 nats of vLLM's teacher-forced argmax, strict where equal, 0
+forward-divergent) — NOT the distributional form. The same battery run as one
+BATCH looks non-deterministic 3/8; that is a batching artifact and every
+determinism claim here must be made at batch=1. Every W-step: dgx CUDA `-Werror` 0-warn on a clean
 build, `memcheck` 0, and the regression set UNCHANGED (Qwen3-dense 16/16,
 Qwen3-Coder 6/6, 27B 235/235, 35B 315/315). W1/W2 are behaviour-preserving and
 must prove byte-identity. New `vt::` ops gate against a CPU reference before any
@@ -1086,9 +1096,145 @@ allocator blocks every other W. Single-GPU only (no TP/EP/multi-GPU). All dgx
 runs take `flock /tmp/gpu`. Upstream pin stays `e24d1b24`.
 
 ### Work breakdown
-W0 ground the facts (checkpoint + real config + observed backend selection +
-determinism probe). W1 spec-driven KV allocation + `MLAAttentionSpec` +
-`KVCacheSpecKind::kMLA` (behaviour-preserving, zero MLA math). W2 platform MLA
+
+**W0 — LANDED 2026-07-21. Every flagged source read CONFIRMED by observation;
+nothing contradicted.** Evidence root on dgx: `~/scratch_mla_w1/w0_probe.{py,log,json}`.
+
+*(a) Checkpoint.* `deepseek-ai/DeepSeek-V2-Lite` fetched to dgx
+(`~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V2-Lite`, snapshot
+`604d5664dddd88a0433dbae533b7fe9472482de0`, 4 safetensors shards, **30 GB on
+disk**; root went 94% -> 95%, 207 GiB free). It loads in the vLLM 0.25.0 oracle
+(`~/venvs/vllm-oracle`) as `DeepseekV2ForCausalLM`, bf16, V2 Model Runner.
+**Operational note:** the oracle needs `ninja` on `PATH` for the FlashInfer JIT —
+`PATH=$HOME/venvs/vllm-oracle/bin:$PATH`, else engine-core init dies with
+`FileNotFoundError: 'ninja'` during `determine_available_memory`.
+
+*(b) BACKEND SELECTION — OBSERVED, matches the source read exactly.* From the
+oracle's own `VLLM_LOGGING_LEVEL=DEBUG` startup on sm_121, reproduced on two
+independent runs:
+```
+INFO [platforms/cuda.py:476] Using TRITON_MLA attention backend
+                             out of potential backends: ['TRITON_MLA'].
+INFO [v1/attention/.../prefill/selector.py:174] Using FLASH_ATTN MLA prefill backend.
+```
+This confirms §0.2 and §0.3 as OBSERVATION, not inference: dense-MLA decode is
+`TRITON_MLA` and MLA prefill is `FLASH_ATTN` on GB10, so the **entire
+sm90/sm100-only MLA kernel class (FlashMLA, CUTLASS MLA, FlashInfer MLA,
+TokenSpeed MLA) stays out of scope** and W4's two-stage split-KV decode plan
+stands. Note the candidate list printed is `['TRITON_MLA']` — a SINGLE entry:
+`FLASHINFER_MLA_SPARSE_SM120` is filtered out before selection on
+`is_sparse()` vs `use_sparse=False`, exactly as §2.3 predicted.
+**Bonus observation for W9 (not a W0 deliverable):** the MoE backend resolves to
+`FlashInfer CUTLASS Unquantized MoE` out of
+`['FlashInfer TRTLLM', 'FlashInfer CUTLASS', 'TRITON', 'BATCHED_TRITON']` — i.e.
+the DeepSeek MoE denominator is NOT vLLM's Triton `fused_moe`. The §3 claim that
+`vt::MoeGroupedGemmBf16` runs "~1.2x vLLM's Triton fused_moe rate" therefore does
+NOT transfer to this model's speed bar and must be re-measured at W9.
+
+*(c) REAL CONFIG — every §5.1 V2-Lite number CONFIRMED against the shipped
+`config.json`, none corrected.* `hidden_size=2048`, `num_attention_heads=16`,
+`num_hidden_layers=27`, **`kv_lora_rank=512`**, **`qk_nope_head_dim=128`**,
+**`qk_rope_head_dim=64`** (so the latent is **512+64 = 576** wide, matching V3),
+**`v_head_dim=128`**, **`q_lora_rank=null`**, `n_routed_experts=64`,
+`n_shared_experts=2`, `num_experts_per_tok=6`, **`n_group=1`,
+`topk_group=1`**, **`scoring_func="softmax"`, `topk_method="greedy"`**,
+`routed_scaling_factor=1.0`, `first_k_dense_replace=1`, `moe_intermediate_size=1408`,
+`intermediate_size=10944`, `vocab_size=102400`, `rope_theta=10000`,
+`max_position_embeddings=163840`, `torch_dtype=bfloat16`.
+`rope_scaling = {type: yarn, factor: 40, mscale: 0.707, mscale_all_dim: 0.707,
+beta_fast: 32, beta_slow: 1, original_max_position_embeddings: 4096}`.
+Code-side constants re-read at the pin and confirmed: `is_neox_style=False`
+(`deepseek_v2.py:1059-1064`, rope built over `qk_rope_head_dim` only) and the
+**mscale² softmax-scale correction** (`:1071-1074`
+`self.scaling = self.scaling * mscale * mscale`) — for this checkpoint
+`yarn_get_mscale(40, 0.707) = 0.1*0.707*ln(40)+1 ≈ 1.2608`, so the effective
+scale is `192**-0.5 * 1.5896`. **Concrete MLA page size for the W1 spec:
+`16 * 1 * 576 * 2 = 18,432 B` per block per layer.**
+
+*(d) COVERAGE GAPS — both §5.1 gaps CONFIRMED against the real config, neither
+disappeared.* `q_lora_rank` really is `null`, so the gate vehicle never
+exercises `fused_qkv_a_proj` / `q_a_layernorm` / `q_b_proj` nor the
+`packed_modules_mapping` un-fusing (`deepseek_v2.py:1812-1820`). And
+`n_group == topk_group == 1` with `softmax`/`greedy` means there is **no
+`e_score_correction_bias` parameter in the checkpoint at all**, so the whole
+`noaux_tc` router — sigmoid scoring, biased-select/unbiased-weight asymmetry,
+two-level group mask — is **unit-gated only**. Both remain stated in the rows.
+
+*(e) DETERMINISM PROBE — the W8 gate is **STRICT token-exact**, and the batching
+trap was hit and avoided.* A first K=5 greedy probe over an 8-prompt battery
+generated all 8 prompts in ONE batch and reported vLLM self-inconsistent on
+**3/8** prompts (2 distinct outputs each), which per
+[[near-tie-distributional-gate]] would have forced the weaker distributional
+form. That is the SAME artifact the Qwen3-dense razor hit: batched generation
+re-orders reductions, and the SACRED gate runs **one prompt at a time**.
+Re-probed at **batch=1, K=5 — the actual gate regime — vLLM's own greedy is
+DETERMINISTIC on 8/8 prompts** (`ALL_PROMPTS_DETERMINISTIC: True`).
+**=> The W8 SACRED gate is the STRICT token-exact form** (strict-where-
+well-posed, per-prompt batch=1), NOT the distributional one. Recorded here so W8
+cannot quietly loosen it. Any future determinism claim on this model MUST be
+made at batch=1 or it is measuring the wrong thing.
+Evidence: `~/scratch_mla_w1/w0_probe{,_b1}.{py,log,json}` on dgx.
+
+*(f) BONUS OBSERVATION — the W4 target kernels were seen EXECUTING, not just
+selected.* vLLM's JIT monitor named them during generation:
+`_fwd_grouped_kernel_stage1` and `_fwd_kernel_stage2` — the **two-stage split-KV
+flash-decode** of `vllm/v1/attention/ops/triton_decode_attention.py`
+(vLLM <- SGLang <- lightllm). This is direct runtime confirmation of the §2.3
+finding that the decode kernel is structurally the same split-partial +
+deterministic-combine shape as our existing FA-2 split-KV decode, i.e. W4's
+single most important reuse premise is now observed rather than read.
+
+*(g) Engine-resolved KV geometry, straight from the oracle's own config:*
+`use_mla=True`, `get_head_size()=576`, `get_num_kv_heads()=1`, `block_size=16` —
+so upstream's page is `16 * 1 * 576 * 2 = 18,432 B`, the exact number the W1
+`MLAAttentionSpec` unit test asserts.
+
+**W1 — LANDED 2026-07-21 (behaviour-preserving, ZERO MLA math).** Allocation and
+cache shape now derive from the **KV spec** instead of hardcoded `2 * block *
+Hkv * Dh` arithmetic and HF-config reconstruction:
+- `MLAAttentionSpec : FullAttentionSpec` (`include/vllm/v1/kv_cache_interface.h`,
+  math in `src/vllm/v1/kv_cache_interface.cpp`) overriding
+  `real_page_size_bytes()` to upstream's single-tensor formula
+  `storage_block_size * num_kv_heads * head_size * dtype_size`
+  (`vllm/v1/kv_cache_interface.py:397-398` — **no factor 2, no separate V**),
+  with `KVCacheSpecKind::kMlaAttention`. The out-of-scope `fp8_ds_mla` / int4
+  layouts (`:381-390`) throw rather than mis-size.
+- Registered against the **ORDINARY** full-attention manager with
+  `uniform_type_base_spec = FullAttentionSpec`
+  (`src/vllm/v1/kv_cache_spec_registry.cpp`), mirroring
+  `vllm/v1/core/single_type_kv_cache_manager.py:1539`. This is the spike's key
+  finding made executable: because upstream maps MLA onto
+  `FullAttentionManager` and `vllm/v1/worker/gpu_model_runner.py` has **no
+  `use_mla` branch at all** (only an import at `:58`, an `isinstance` at `:977`,
+  comments at `:1085`/`:7133`), block manager, prefix caching and eviction need
+  NO change — the cost concentrates in the allocator and the ops.
+- `src/vllm/v1/worker/gpu/runner.cpp`: the attention buffer is now
+  `num_blocks * spec->page_size_bytes()`, and `block_size` / `num_kv_heads` /
+  `head_size` / `dtype` for the `PagedKvCache` view all come from the spec
+  instead of `config_.num_key_value_heads` / `config_.head_dim`. An
+  asymmetric-`head_size_v` full-attention spec is REFUSED (the single-`head_size`
+  view cannot express it) rather than silently mis-viewed.
+- The paged-KV storage dtype moved into the spec, resolved once by
+  `include/vllm/v1/kv_cache_dtype.h::ResolveKvCacheDType()` (our `VT_KV_CACHE_F32`
+  A/B, default bf16 — unchanged semantics), and every producer (the three model
+  KV-cache factories + the runner tests) builds its spec with it.
+- **Proof the new path is EXERCISED, not merely compiled** (the W7 decode-graph
+  lesson): `GPUModelRunner::fa_page_size_bytes()` reports the byte cost the
+  allocator actually used, sourced from the spec, plus an opt-in
+  `VT_KV_ALLOC_LOG=1` stderr line. The new `test_runner` case asserts (i) the
+  default spec reproduces the pre-refactor arithmetic EXACTLY and (ii) a
+  `page_size_padded` spec — a value **no HF-config formula can produce** — is
+  honoured, which is only possible if the allocator asked the spec. Observed:
+  `[kv-alloc] source=spec ... page_size_bytes=512` then `...=1024`.
+- **Behaviour-preservation PROVEN on GB10**, all four gates byte-identical on a
+  clean `-Werror` build (0 warnings, 0 errors): 27B `235/235`, 35B `315/315`,
+  Qwen3-Coder `6/6` (STRICT 5/6, near-tie-band 1/6, 0 forward-divergent —
+  identical to the pre-change record), Qwen3-dense `16/16` (STRICT 11/16,
+  max gap 0.25 nats, 0 forward-divergent — identical). `test_runner` 15/15,
+  `test_kv_cache_interface` 21/21 (incl. 4 new MLA-spec cases),
+  `test_llm_engine` 5/5.
+
+W2 platform MLA
 backend priorities + prefill selector + registry. W3 `vt::ConcatAndCacheMla` +
 the grouped-topk router extension. W4 `vt::MlaDecodeAttention` (two-stage
 split-KV MQA over the latent, deterministic combine, `cuda_arch_tactics`-

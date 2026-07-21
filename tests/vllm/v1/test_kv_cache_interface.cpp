@@ -154,6 +154,68 @@ TEST_CASE("FullAttentionSpec quantized page-size math is deferred") {
   CHECK_THROWS_AS(spec.real_page_size_bytes(), std::runtime_error);
 }
 
+// ─── MLAAttentionSpec (MLA campaign W1 — allocation metadata only) ───────────
+//
+// Upstream oracle: vllm/v1/kv_cache_interface.py:363 MLAAttentionSpec, page
+// formula :380-398 =
+//   storage_block_size * num_kv_heads * head_dim * dtype_size
+// i.e. NO factor 2 and NO separate V, unlike every other attention spec.
+// The DeepSeek geometry (confirmed against the real
+// deepseek-ai/DeepSeek-V2-Lite config.json at W0) is kv_lora_rank=512 +
+// qk_rope_head_dim=64 = a 576-wide latent with num_kv_heads == 1.
+TEST_CASE("MLAAttentionSpec page_size_bytes: DeepSeek 576-wide latent") {
+  // DeepSeek-V2-Lite / V3 / Kimi-Linear MLA layers, bf16, block 16.
+  vllm::v1::MLAAttentionSpec spec(/*block_size=*/16, /*head_size=*/576,
+                                  DType::kBF16);
+  CHECK(spec.num_kv_heads == 1);
+  CHECK(spec.head_size == 576);
+  CHECK(spec.head_size_v == 576);
+  CHECK(spec.kind() == KVCacheSpecKind::kMlaAttention);
+  // 16 * 1 * 576 * 2 = 18432 — the number quoted in the campaign spike §4.1.
+  CHECK(spec.real_page_size_bytes() == 18432);
+  CHECK(spec.page_size_bytes() == 18432);
+}
+
+TEST_CASE("MLAAttentionSpec drops the K+V factor 2") {
+  // Same dims through FullAttentionSpec would double the page — that doubling
+  // is exactly what the MLA override removes.
+  vllm::v1::MLAAttentionSpec mla(/*block_size=*/16, /*head_size=*/576,
+                                 DType::kBF16);
+  FullAttentionSpec full(/*block_size=*/16, /*num_kv_heads=*/1,
+                         /*head_size=*/576, DType::kBF16);
+  CHECK(full.real_page_size_bytes() == 2 * mla.real_page_size_bytes());
+}
+
+TEST_CASE("MLAAttentionSpec page_size_padded and quantized guard") {
+  vllm::v1::MLAAttentionSpec padded(/*block_size=*/16, /*head_size=*/576,
+                                    DType::kBF16, /*num_kv_heads=*/1,
+                                    KVQuantMode::kNone,
+                                    /*page_size_padded=*/20480);
+  CHECK(padded.real_page_size_bytes() == 18432);
+  CHECK(padded.page_size_bytes() == 20480);
+
+  // fp8_ds_mla (V3.2 656 B/token, V4 584 B/token) and int4 per-token-head are
+  // OUT OF SCOPE for this campaign and must throw, never silently mis-size.
+  vllm::v1::MLAAttentionSpec quantized(/*block_size=*/16, /*head_size=*/576,
+                                       DType::kBF16, /*num_kv_heads=*/1,
+                                       KVQuantMode::kFp8PerTensor);
+  CHECK_THROWS_AS(quantized.real_page_size_bytes(), std::runtime_error);
+}
+
+TEST_CASE("MLAAttentionSpec maps to the ORDINARY full-attention manager") {
+  // Upstream vllm/v1/core/single_type_kv_cache_manager.py:1539 registers
+  // MLAAttentionSpec -> FullAttentionManager with
+  // uniform_type_base_spec=FullAttentionSpec: MLA-ness is a page-SIZE and
+  // tensor-SHAPE concern only, so block table / prefix caching / eviction are
+  // untouched.
+  vllm::v1::MLAAttentionSpec spec(/*block_size=*/16, /*head_size=*/576,
+                                  DType::kBF16);
+  CHECK(KVCacheSpecRegistry::get_manager_kind(spec) ==
+        KVCacheManagerKind::kFullAttention);
+  CHECK(KVCacheSpecRegistry::get_uniform_type_base_spec(spec) ==
+        std::optional<std::type_index>{typeid(FullAttentionSpec)});
+}
+
 TEST_CASE("SlidingWindowSpec page size, head_size_v, and admission cap") {
   SlidingWindowSpec spec(/*block_size=*/16, /*num_kv_heads=*/2,
                          /*head_size=*/64, DType::kF32,

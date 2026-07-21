@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -19,6 +20,7 @@
 
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor memory-model seam
+#include "vllm/v1/kv_cache_dtype.h"  // ResolveKvCacheDType (VT_KV_CACHE_F32 A/B)
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
 #include "vllm/v1/worker/gpu/async_runner_flag.h"  // VT_ASYNC_RUNNER predicate
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
@@ -396,14 +398,6 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // layer, in LAYER ORDER (matches Qwen3_5Model::Forward's per-layer fa_idx /
   // gdn_idx indexing). As in upstream, MambaSpec is the source of truth for the
   // recurrent tensors' order, shapes, dtypes, and page bytes.
-  const int64_t Hkv = config_.num_key_value_heads;
-  const int64_t Dh = config_.head_dim;
-  // Paged KV-cache dtype: bf16 (vLLM's bf16 flash_attn KV store — halves KV
-  // memory) unless VT_KV_CACHE_F32 is set (same-binary f32-vs-bf16 A/B).
-  const char* kv_f32_env = std::getenv("VT_KV_CACHE_F32");
-  const vt::DType kv_dtype =
-      (kv_f32_env != nullptr && kv_f32_env[0] == '1') ? vt::DType::kF32
-                                                      : vt::DType::kBF16;
   const int64_t Hk = config_.linear_num_key_heads;
   const int64_t Hv = config_.linear_num_value_heads;
   const int64_t Dk = config_.linear_key_head_dim;
@@ -439,13 +433,75 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
              "runner: Qwen3.5 MambaSpec state dtypes must be floating");
   }
 
-  // Full-attn block size from the full-attn group's spec (its paged layout).
+  // SPEC-DRIVEN attention-cache sizing and layout (MLA campaign W1).
+  //
+  // Upstream never reconstructs the KV shape from the HF config: every layer's
+  // cache bytes come from its SPEC (`vllm/v1/kv_cache_interface.py:380-398`
+  // `real_page_size_bytes` -> `page_size_bytes`), and the tensor shape comes
+  // from the BACKEND (`get_kv_cache_shape`). That abstraction is exactly why
+  // `vllm/v1/worker/gpu_model_runner.py` contains **no `use_mla` branch at all**
+  // (only an import at :58, an isinstance at :977 and comments at :1085/:7133)
+  // even though MLA's cache is 1-head, 576-wide and has NO separate V — MLA is
+  // registered against the ordinary `FullAttentionManager`
+  // (`vllm/v1/core/single_type_kv_cache_manager.py:1539`), so block table,
+  // prefix caching and eviction are untouched and the whole cost lands in the
+  // ALLOCATOR and the ops.
+  //
+  // We previously hardcoded `num_blocks * 2 * block * Hkv * Dh` with Hkv/Dh
+  // read from `config_` — the factor 2 (K+V) and the HF-config reconstruction
+  // are the two things MLA cannot express. Now: bytes come from
+  // `spec->page_size_bytes()` and the cache VIEW comes from the spec's own
+  // fields. Behaviour-preserving by construction for every existing model —
+  // `FullAttentionSpec::real_page_size_bytes` is
+  // `block * num_kv_heads * (head_size + head_size_v) * es`, which with
+  // `head_size_v == head_size` is byte-for-byte the old expression.
   int64_t fa_block_size = 0;
+  int64_t Hkv = 0;
+  int64_t Dh = 0;
+  int64_t fa_page_bytes = 0;
+  vt::DType kv_dtype = ResolveKvCacheDType();
   if (full_attn_group_id_ >= 0) {
-    fa_block_size =
+    const KVCacheSpec* fa_spec =
         kv_cache_config.kv_cache_groups[static_cast<size_t>(full_attn_group_id_)]
-            .kv_cache_spec->block_size;
+            .kv_cache_spec.get();
+    const auto* attn_spec = dynamic_cast<const AttentionSpec*>(fa_spec);
+    VT_CHECK(attn_spec != nullptr,
+             "runner: full-attention cache group must carry an AttentionSpec");
+    fa_block_size = attn_spec->block_size;
+    Hkv = attn_spec->num_kv_heads;
+    Dh = attn_spec->head_size;
+    kv_dtype = attn_spec->dtype;
+    fa_page_bytes = attn_spec->page_size_bytes();
+    // The PagedKvCache view carries ONE head_size, so an asymmetric-V full
+    // attention layer cannot be viewed by it. MLA's own view (a later W) is a
+    // sibling struct; until then, refuse rather than mis-view.
+    if (const auto* full_spec = dynamic_cast<const FullAttentionSpec*>(fa_spec)) {
+      VT_CHECK(full_spec->head_size_v == full_spec->head_size,
+               "runner: asymmetric head_size_v is not expressible in the "
+               "PagedKvCache view");
+    }
+    VT_CHECK(fa_page_bytes > 0,
+             "runner: full-attention spec reported a non-positive page size");
+    // Positive signal that the SPEC (not the HF config) drove this allocation:
+    // opt-in, one line, never on the hot path.
+    if (const char* dbg = std::getenv("VT_KV_ALLOC_LOG");
+        dbg != nullptr && dbg[0] == '1') {
+      std::fprintf(stderr,
+                   "[kv-alloc] source=spec kind=%d block_size=%lld "
+                   "num_kv_heads=%lld head_size=%lld dtype=%d "
+                   "page_size_bytes=%lld num_blocks=%lld\n",
+                   static_cast<int>(fa_spec->kind()),
+                   static_cast<long long>(fa_block_size),
+                   static_cast<long long>(Hkv), static_cast<long long>(Dh),
+                   static_cast<int>(kv_dtype),
+                   static_cast<long long>(fa_page_bytes),
+                   static_cast<long long>(num_blocks_));
+    }
   }
+  // Recorded for the gates: the exact per-block byte cost the allocator used,
+  // sourced from the spec. `fa_page_size_bytes() > 0` is the runtime proof that
+  // the spec-driven path RAN (a compiled-but-unexercised path leaves it 0).
+  fa_page_size_bytes_ = fa_page_bytes;
 
   const vt::Device dev = queue_.device;
   const char* device_cache_env = std::getenv("VT_DEVICE_KV_CACHE");
@@ -484,12 +540,16 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
           static_cast<size_t>(gdn_state_slots_ * conv_row_elems) * conv_es,
           kv_cache_backend_resident_));
     } else {
-      // KV cache stored in kv_dtype (bf16 default; f32 if VT_KV_CACHE_F32). 0
-      // bytes == 0.0 in both bf16 and f32. bf16 halves KV memory vs f32.
+      // Bytes come from the SPEC, not from HF-config arithmetic: exactly
+      // `num_blocks * spec->page_size_bytes()`, mirroring upstream's
+      // `kv_cache_interface.py:380-398` sizing contract. For a symmetric
+      // FullAttentionSpec this is byte-identical to the old
+      // `num_blocks * 2 * block * Hkv * Dh * sizeof(kv_dtype)`; for a future
+      // MLAAttentionSpec it drops the factor 2 with no allocator change.
+      // 0 bytes == 0.0 in both bf16 and f32.
       full_attn_buf_.push_back(std::make_unique<CacheBuffer>(
           dev, queue_,
-          static_cast<size_t>(num_blocks_ * 2 * fa_block_size * Hkv * Dh) *
-              static_cast<size_t>(vt::SizeOf(kv_dtype)),
+          static_cast<size_t>(num_blocks_) * static_cast<size_t>(fa_page_bytes),
           kv_cache_backend_resident_));
     }
   }

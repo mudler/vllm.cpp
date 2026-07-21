@@ -207,6 +207,14 @@ class GPUModelRunner final : public ModelRunnerBase {
   int full_attn_group_id() const { return full_attn_group_id_; }
   int gdn_group_id() const { return gdn_group_id_; }
   int64_t num_blocks() const { return num_blocks_; }
+  // The per-block byte cost the attention-cache allocator ACTUALLY used, taken
+  // from the KV SPEC (`spec->page_size_bytes()`, upstream
+  // vllm/v1/kv_cache_interface.py:380-398) rather than reconstructed from the
+  // HF config. 0 when the model has no full-attention group. This is the
+  // positive signal that the spec-driven allocation path RAN — a compiled but
+  // unexercised path leaves it 0, and a `page_size_padded` spec produces a
+  // value the old HF-config arithmetic could not.
+  int64_t fa_page_size_bytes() const { return fa_page_size_bytes_; }
 
   // Async-scheduling device-input path (ENG-ASYNC-SCHED W3 runner leaf). When
   // ON, execute_model rebuilds each decode row's input token id from the
@@ -302,6 +310,9 @@ class GPUModelRunner final : public ModelRunnerBase {
   int full_attn_group_id_ = -1;
   int gdn_group_id_ = -1;
   int64_t num_blocks_ = 0;
+  // Per-block attention-cache bytes as reported by the KV spec (see the
+  // fa_page_size_bytes() accessor).
+  int64_t fa_page_size_bytes_ = 0;
   // Persistent-batch capacity = max concurrent sequences. The GDN mamba-state
   // cache is sized by this (one recurrent state per sequence), decoupled from
   // the attention num_blocks. See remap_gdn_state_slots.

@@ -57,6 +57,22 @@ int64_t FullAttentionSpec::real_page_size_bytes() const {
          static_cast<int64_t>(vt::SizeOf(dtype));
 }
 
+// Upstream kv_cache_interface.py:397-398 — the MLA page formula. ONE latent row
+// per token (kv_lora_rank + qk_rope_head_dim wide), num_kv_heads == 1, and NO
+// separate V: the factor 2 every other attention spec carries is absent.
+int64_t MLAAttentionSpec::real_page_size_bytes() const {
+  if (needs_deferred_quant_math(kv_quant_mode)) {
+    // Upstream's fp8_ds_mla (V3.2 656 B/token, V4 584 B/token) and INT4
+    // per-token-head layouts (kv_cache_interface.py:381-390) are OUT OF SCOPE
+    // for this campaign; throw loudly rather than silently mis-size.
+    throw std::runtime_error(
+        "MLAAttentionSpec: kv_quant_mode != NONE page-size math (fp8_ds_mla / "
+        "int4) is out of scope");
+  }
+  return static_cast<int64_t>(storage_block_size()) * num_kv_heads * head_size *
+         static_cast<int64_t>(vt::SizeOf(dtype));
+}
+
 int64_t SlidingWindowSpec::real_page_size_bytes() const {
   if (needs_deferred_quant_math(kv_quant_mode)) {
     throw std::runtime_error(

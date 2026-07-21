@@ -24,6 +24,7 @@
 #include "vllm/model_executor/models/qwen3_5_common.h"    // HostLogits (W3)
 #include "vllm/model_executor/models/qwen3_moe.h"
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type).is_cuda()
+#include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
 
@@ -170,8 +171,10 @@ v1::KVCacheConfig MakeQwen3MoeKVCache(const HfConfig& config, int block_size,
   kv.num_blocks = num_blocks;
   kv.kv_cache_groups.emplace_back(
       std::vector<std::string>{"fa"},
-      std::make_shared<v1::FullAttentionSpec>(block_size, num_kv_heads, head_dim,
-                                              vt::DType::kF32));
+      // Spec-driven allocation (MLA campaign W1): the spec carries the paged-KV
+      // storage dtype the runner allocates and views with.
+      std::make_shared<v1::FullAttentionSpec>(
+          block_size, num_kv_heads, head_dim, v1::ResolveKvCacheDType()));
   return kv;
 }
 

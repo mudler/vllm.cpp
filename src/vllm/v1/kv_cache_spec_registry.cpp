@@ -30,6 +30,8 @@ std::type_index built_in_type_for_kind(KVCacheSpecKind kind) {
   switch (kind) {
     case KVCacheSpecKind::kFullAttention:
       return typeid(FullAttentionSpec);
+    case KVCacheSpecKind::kMlaAttention:
+      return typeid(MLAAttentionSpec);
     case KVCacheSpecKind::kSlidingWindow:
       return typeid(SlidingWindowSpec);
     case KVCacheSpecKind::kChunkedLocalAttention:
@@ -65,6 +67,12 @@ void KVCacheSpecRegistry::register_spec_type(
 void KVCacheSpecRegistry::ensure_registered() {
   std::call_once(registration_once(), [] {
     register_spec<FullAttentionSpec, FullAttentionSpec>(
+        KVCacheManagerKind::kFullAttention);
+    // Upstream vllm/v1/core/single_type_kv_cache_manager.py:1539 registers
+    // MLAAttentionSpec against the ORDINARY FullAttentionManager with
+    // uniform_type_base_spec=FullAttentionSpec — MLA changes the page SIZE and
+    // tensor SHAPE, never the block table / prefix caching / eviction.
+    register_spec<MLAAttentionSpec, FullAttentionSpec>(
         KVCacheManagerKind::kFullAttention);
     register_spec<SlidingWindowSpec, SlidingWindowSpec>(
         KVCacheManagerKind::kSlidingWindow);

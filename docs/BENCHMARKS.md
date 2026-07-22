@@ -1846,30 +1846,37 @@ The complete contract is in the
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
 
-## GGUF compute-in-quant track — roots landed, `NOT APPLICABLE` for benchmarking (2026-07-22)
+## GGUF compute-in-quant track — roots + tier-0 kernels landed, `NOT APPLICABLE` for benchmarking (2026-07-22)
 
 `QUANT-GGUF-KEEPQ-LOADER` **L1** (bench-branch merge: dense-`qwen35` GGUF loader
-+ F16/BF16 row dequant) and `QUANT-GGUF-CIQ-GEMM` **G1** (block `vt::DType`
-entries, the llama.cpp `type_traits_cpu` mirror, and the `kMatmulBTQuant` op
-skeleton with a generic dequant-composite fallback) are on main.
++ F16/BF16 row dequant) and `QUANT-GGUF-CIQ-GEMM` **G1+G2+G3** are on main: the
+block `vt::DType` entries and the llama.cpp `type_traits_cpu` mirror, the Q8_0 /
+Q8_K activation quantizers, the six generic `vec_dot` (Q4_0, Q8_0, Q3_K, Q4_K,
+Q5_K, Q6_K), and `kMatmulBTQuant` wired onto them — the complete PORTABLE tier-0
+compute-in-quant GEMM.
 
 **Disposition: `NOT APPLICABLE` — no benchmark is owed or claimed at this
-checkpoint, and none was run.** The increment adds types, a traits table and an
-UNROUTED op: no model forward calls `MatmulBTQuant`, every GGUF weight still
-expands to bf16 at load, and no encoding computes in its native blocks. There is
-therefore no speed or memory delta to measure — publishing one would be
-measuring the fallback against itself. `test_gguf_dequant` staying green is the
+checkpoint, and none was run.** The kernels exist and are correctness-gated at
+the OP level, but the op is still UNROUTED: no model forward calls
+`MatmulBTQuant` (verified by grep over `src/vllm/`), every GGUF weight still
+expands to bf16 at load, and no encoding computes in its native blocks end to
+end. There is therefore no speed or memory delta to measure — timing a kernel
+that nothing executes would be a number with no workload behind it. This is
+deliberately NOT a claim that the kernels are fast enough: their speed is simply
+not yet measurable on any real path, and the portable tier is expected to fall
+well short of the floor until the SIMD (G5/G6) and repack (G7) tiers land. `test_gguf_dequant` staying green is the
 evidence that the decoder move changed nothing, together with the dgx `test_qwen36_gguf_engine` standalone run against the real APEX files (28/28 assertions, 16/16 tokens on both Compact and Balanced) and the full unchanged model regression set on a clean `-Werror` CUDA build.
 
 **The denominator is unchanged and still binding:** llama.cpp on the same file
 at the same pin (`237ad9b96`), from the B4 decision row **B4 provenance (2026-07-22):** the loader arm that made this floor reproducible landed on main as a SQUASH (`66233e6`), so the bench commit `7c91a42` is NOT an ancestor of main — the row's "cited-not-merged" flag resolves by CONTENT (tree hash verified byte-identical to the gated tree), not by ancestry.
 ([parity-ledger.md](../.agents/parity-ledger.md)) — we are behind by decode
 **54-75x**, prefill **~1,480x**, and peak RSS **2.7x** (7.43 GiB vs 2.80 GiB on
-a 2.68 GiB file). Nothing in G1/L1 moves those numbers.
+a 2.68 GiB file). Nothing in G1/G2/G3/L1 moves those numbers, because none of it is on an executed path yet.
 
-**Next benchmark checkpoint** is CIQ gate 4 tier-0 at work row **G4** (the first
-increment where a call site actually routes to the quantized GEMM), on the B4
-recipe: same box, same file, threadpool active, 20 threads, >=2 reproducing
+**Next benchmark checkpoint** is CIQ gate 4 tier-0 at work row **G4** — now the
+immediate next increment, and the first where a call site actually routes to the
+quantized GEMM (it additionally needs loader **L2-L3** and threadpool **W2**) —
+on the B4 recipe: same box, same file, threadpool active, 20 threads, >=2 reproducing
 runs, idle host. Milestone there is decode >= 0.25x llama.cpp tg32 and prefill
 >= 0.1x pp128; the row closes only when the repack tier (G7) matches or beats
 llama.cpp on decode t/s, prefill t/s AND peak RSS.

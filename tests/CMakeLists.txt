@@ -191,6 +191,14 @@ vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
 # cross-check against the GGUF reader's GgmlTraits, and the kMatmulBTQuant
 # skeleton's generic-composite fallback. CPU-only.
 vllm_cpp_add_test(test_ops_quant_traits vt/test_ops_quant_traits.cpp)
+# QUANT-GGUF-CIQ-GEMM G2/G3: the activation quantizers (quantize_row_q8_0/q8_K)
+# and the six tier-0 generic vec_dot kernels plus their kMatmulBTQuant wiring.
+# Gated against an INDEPENDENT f64 dequantize-then-dot reference, upstream's
+# test-quantize-fns/test-backend-ops thresholds, block-boundary/ragged-K shapes
+# and run-to-run + thread-count bit-exactness. Reaches src/ for the threadpool
+# header (SwapForTesting) used by the thread-count determinism case. CPU-only.
+vllm_cpp_add_test(test_ops_quant_dot vt/test_ops_quant_dot.cpp)
+target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the env-gated cuBLASLt GEMM algo-selection diagnostic
 # helpers. Reaches the internal header under src/ (not public API); the cuBLASLt
 # emit it gates is CUDA-only and lives in src/vt/cuda/cuda_matmul.cu.

@@ -184,11 +184,19 @@ TEST_CASE("quant traits mirror type_traits_cpu (ggml-cpu.c:211-406)") {
     CHECK(t.nrows == 1);
     // Every executable block type must decode.
     CHECK(t.to_float != nullptr);
-    // G1 is the skeleton: no quantized dot exists yet, so every type must route
-    // to the generic composite. This CHECK is what G2/G3 flip.
-    CHECK(t.vec_dot == nullptr);
-    CHECK(t.from_float == nullptr);
-    CHECK_FALSE(vt::cpu::HasQuantDotKernel(c.dtype));
+    // G2/G3 populated the remaining columns: the six executable WEIGHT types
+    // now have a vec_dot and can execute a quantized dot; Q8_K is the
+    // ACTIVATION encoding, so it has a from_float but deliberately no vec_dot
+    // (upstream gives it no type_traits_cpu row) and stays on the composite.
+    // The full population contract is gated in test_ops_quant_dot.cpp.
+    if (c.dtype == vt::DType::kQ8_K) {
+      CHECK(t.vec_dot == nullptr);
+      CHECK(t.from_float != nullptr);
+      CHECK_FALSE(vt::cpu::HasQuantDotKernel(c.dtype));
+    } else {
+      CHECK(t.vec_dot != nullptr);
+      CHECK(vt::cpu::HasQuantDotKernel(c.dtype));
+    }
   }
   CHECK_THROWS(vt::cpu::QuantTraits(vt::DType::kF32));
 }
@@ -241,43 +249,49 @@ std::vector<float> ReferenceMatmul(const std::vector<float>& a,
 }  // namespace
 
 TEST_CASE("MatmulBTQuant generic-composite fallback == dequant-then-matmul") {
+  // G2/G3 gave the six executable WEIGHT encodings a real vec_dot, so they now
+  // take the quantized path (gated in test_ops_quant_dot.cpp against an
+  // independent f64 reference). The generic composite this case covers remains
+  // the fallback for any block dtype WITHOUT a vec_dot — today that is Q8_K,
+  // the activation-only encoding — and it stays in the tree as the reference
+  // the ported MUL_MAT NMSE cases measure the quantized path against.
   vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
-  for (const BlockCase& c : kBlockCases) {
-    CAPTURE(c.name);
-    if (c.dtype == vt::DType::kQ8_K) continue;  // activation-only
+  const BlockCase& c = kBlockCases[6];  // q8_K
+  REQUIRE(c.dtype == vt::DType::kQ8_K);
+  REQUIRE_FALSE(vt::cpu::HasQuantDotKernel(c.dtype));
 
-    // N weight rows of K elements each; M activation rows. K spans several
-    // blocks so the per-row block walk is exercised.
-    const int64_t k = 4 * c.block_elems;
-    const int64_t n = 3;
-    for (int64_t m : {int64_t{1}, int64_t{4}}) {
-      CAPTURE(m);
-      const std::vector<uint8_t> wq =
-          RandomBlocks(c, n * (k / c.block_elems), 99U);
+  // N weight rows of K elements each; M activation rows. K spans several
+  // blocks so the per-row block walk is exercised.
+  const int64_t k = 4 * c.block_elems;
+  const int64_t n = 3;
+  for (int64_t m : {int64_t{1}, int64_t{4}}) {
+    CAPTURE(m);
+    const std::vector<uint8_t> wq = RandomBlocks(c, n * (k / c.block_elems), 99U);
 
-      std::vector<float> a(static_cast<size_t>(m * k));
-      std::mt19937 rng(7U);
-      std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
-      for (float& v : a) v = dist(rng);
+    std::vector<float> a(static_cast<size_t>(m * k));
+    std::mt19937 rng(7U);
+    std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
+    for (float& v : a) v = dist(rng);
 
-      // The reference decodes the SAME bytes through the loader path.
-      const std::vector<float> w =
-          vllm::DequantGgufRowToF32(c.ggml_type, wq.data(), n * k);
-      const std::vector<float> expected = ReferenceMatmul(a, w, m, k, n);
+    // The reference decodes the SAME bytes through the traits `to_float`.
+    // (Q8_K never appears in a GGUF file, so the loader's DequantGgufRowToF32
+    // correctly refuses it — see the GgmlTraits cross-check above.)
+    std::vector<float> w(static_cast<size_t>(n * k));
+    vt::cpu::BlockToFloat(c.dtype)(wq.data(), w.data(), n * k);
+    const std::vector<float> expected = ReferenceMatmul(a, w, m, k, n);
 
-      vt::Tensor at = vt::Tensor::Contiguous(a.data(), vt::DType::kF32,
-                                             q.device, {m, k});
-      vt::Tensor bt = vt::Tensor::Contiguous(const_cast<uint8_t*>(wq.data()),
-                                             vt::DType::kF32, q.device, {n, k});
-      bt.dtype = c.dtype;  // block dtype: strides are not meaningful
-      std::vector<float> got(static_cast<size_t>(m * n));
-      vt::Tensor ot = vt::Tensor::Contiguous(got.data(), vt::DType::kF32,
-                                             q.device, {m, n});
+    vt::Tensor at =
+        vt::Tensor::Contiguous(a.data(), vt::DType::kF32, q.device, {m, k});
+    vt::Tensor bt = vt::Tensor::Contiguous(const_cast<uint8_t*>(wq.data()),
+                                           vt::DType::kF32, q.device, {n, k});
+    bt.dtype = c.dtype;  // block dtype: strides are not meaningful
+    std::vector<float> got(static_cast<size_t>(m * n));
+    vt::Tensor ot =
+        vt::Tensor::Contiguous(got.data(), vt::DType::kF32, q.device, {m, n});
 
-      vt::MatmulBTQuant(q, ot, at, bt);
-      for (size_t i = 0; i < got.size(); ++i) {
-        CHECK(got[i] == doctest::Approx(expected[i]).epsilon(1e-6));
-      }
+    vt::MatmulBTQuant(q, ot, at, bt);
+    for (size_t i = 0; i < got.size(); ++i) {
+      CHECK(got[i] == doctest::Approx(expected[i]).epsilon(1e-6));
     }
   }
 }

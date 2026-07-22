@@ -17109,3 +17109,109 @@ then `cd build-cpu && ctest -j2` (expect 151/151) and
 `python3 scripts/check-agent-record.py` and `python3 scripts/check-doc-checkpoint.py`
 must both be green.
 
+
+## 2026-07-22 — GGUF compute-in-quant **G2 + G3**: the portable tier-0 quant GEMM (`CLAIM-QUANT-GGUF-COMPUTE-1`, base `66233e6`, worktree `agent-a10a8849ecd9c6664`)
+
+**What landed.** The portable C++ tier of the compute-in-quant GEMM is complete
+at the OP level. **G2** ports the two activation quantizers into
+`src/vt/cpu/cpu_quant_act.cpp` — `quantize_row_q8_0_ref` (llama.cpp `237ad9b96`
+`ggml/src/ggml-quants.c:238`), `quantize_row_q8_K_ref` (`:2696`, bsums included)
+and `nearest_int` (`:563`); the CPU-tier wrappers they sit behind
+(`ggml-cpu/quants.c:45,117`) are bare calls to the `_ref` forms on the generic
+tier. Scratch sizing (`QuantActRowBytes` / `QuantActScratchBytes`) mirrors
+`ggml_row_size` plus the mul_mat `wdata` computation in `ggml_graph_plan`
+(`ggml-cpu.c:1313-1349, 2752-2980`). Only Q8_0 and Q8_K get a `from_float`: they
+are the only two `vec_dot_type`s, and nothing here ever quantizes an activation
+into a k-quant, so upstream's k-quant encoders stay unported (recorded scope).
+
+**G3** ports the six generic `vec_dot` into `src/vt/cpu/cpu_quant_dot.cpp` from
+`ggml/src/ggml-cpu/quants.c`: `:174` q4_0·q8_0, `:400` q8_0·q8_0, `:566`
+q3_K·q8_K, `:645` q4_K·q8_K, `:720` q5_K·q8_K, `:800` q6_K·q8_K. Upstream's
+deliberately odd scalar structure (decode into `aux8`, 8-wide `aux16`/`aux32`
+staging, deferred `sums[8]` reduction — its own comment at `quants.c:583-590`
+explains it is shaped for auto-vectorization) is preserved verbatim; it also
+FIXES the reduction order, which is what makes the GEMM bit-reproducible. Every
+kernel asserts `nrc == 1`, so upstream's `nrows == 2` mmla rows stay unreachable
+until G6 brings both the i8mm kernels and the `ggml-cpu.c:1426-1433` boundary
+guards. `src/vt/cpu/cpu_quant_blocks.h` is a new `static_assert`ed mirror of the
+`ggml-common.h` block structs, so a padding surprise is a compile error rather
+than a mis-strided buffer. `src/vt/cpu/cpu_quant_gemm.cpp` now takes the
+quantized path for the six types (quantize src1 ONCE into scratch, then one
+integer `vec_dot` per output — `ggml-cpu.c:1313-1443`); the generic
+dequant-composite remains for any block dtype without a `vec_dot`, today only
+Q8_K, which is activation-only.
+
+**The correctness bar, and why it is not a self-comparison.** A `vec_dot` is
+exactly where a subtle block-decode slip produces plausible-but-wrong numbers,
+so the primary gate in the new `tests/vt/test_ops_quant_dot.cpp` dequantizes
+BOTH operands through `BlockToFloat` — the loader-side `dequantize_row_*`
+decoders, a SEPARATE port that walks the layout differently from each kernel's
+inline decode — and dots them in **f64**. The tolerance is relative to the dot's
+L1 magnitude (`|got - ref| <= 1e-5 * L1`), so sign cancellation cannot hide an
+error behind a small sum; measured agreement is ~1e-6. Coverage is all six types
+× nblocks {1, 2, 3, 5, 7, 16}: single-block rows, ODD multiples that catch an
+unroll-by-2 assumption, and the Q6_K/Q3_K super-block structure. Ragged K (not a
+whole number of blocks) is gated to THROW at every layer — `from_float`,
+`vec_dot`, `QuantActRowBytes`, `kMatmulBTQuant` — rather than round down. The
+G2→G3 handoff is covered by feeding real `from_float` output into every
+`vec_dot` case. Upstream's own thresholds are ported UNWIDENED:
+`tests/test-quantize-fns.cpp:17-28` (total 0.002, reference 0.0001, dot-product
+0.02) and `tests/test-backend-ops.cpp:4277` MUL_MAT NMSE ≤ 5e-4 at
+M {1,4,32,512} × N {1,7,16}. Determinism: `vec_dot` and the whole GEMM are
+asserted **bit-identical** run-to-run and across thread counts 1/2/4 by byte
+`memcmp` (not `Approx`), and the GEMM is asserted bit-equal to a hand-driven
+per-element `vec_dot`, proving the wiring adds no reordering or stride slip.
+
+**Mutation-tested, because a passing test is not a proving test.** 14 deliberate
+kernel corruptions: q6_K −32 bias→−31, q4_K `mins[j/2]`→`[j/4]`, q3_K hmask
+polarity flip, q5_K high-bit 16→8, q4_0 nibble bias −8→−7, q8_0 dropped
+activation delta, q4_K `kmask1` corruption, q3_K scale bias −32→−31, q8_K bsums
+short and doubled, q8_K `iscale` −127→−128, q8_0 `amax/127`→`/128`, q8_0
+stored-delta fed back into the quants — **13 caught**. One mutant
+(`roundf`→truncation in Q8_0) initially PASSED every statistical bound: upstream's
+8-bit RMSE/NMSE thresholds genuinely cannot distinguish rounding modes, which is
+a real property of those bounds, not a flaw in this port. Closed by adding a
+**byte-exact encoder gate** that compares `from_float` output against a reference
+written from upstream's prose (round-half-away-from-zero for Q8_0,
+round-half-to-even for `nearest_int`) rather than by calling the same library
+function; it also catches the `nearest_int`→truncation and stored-delta mutants.
+The single remaining uncaught mutant is Q8_K's `MIN(127, v)`, which is
+**provably unreachable** (|iscale| = 127/amax and |x| ≤ amax ⇒ |iscale·x| ≤ 127);
+it is kept for upstream fidelity and the test records why no case can
+distinguish it. Writing this file also caught a real layout error — in the TEST's
+own offset table, where q6_K's delta was placed at 0 instead of 208 (q4_K/q5_K
+lead with the delta, q3_K/q6_K trail it); the NaN guard localized it immediately,
+which is the behaviour the guard exists for.
+
+**Nothing existing moved.** No model call site routes to `kMatmulBTQuant` —
+verified by `grep` over `src/vllm/`, which finds no reference at all; every GGUF
+weight still expands to bf16 at load; the per-encoding matrix `C` cells stay `-`.
+`test_gguf_dequant` (11 cases / 202 assertions) and the `BlockToFloat` ==
+loader-dequant byte-for-byte case are green, so decode numerics are untouched.
+`test_ops_quant_traits` is 8 cases / **5,615** assertions, down from 5,694: its
+composite-fallback case now covers Q8_K alone, because the six weight types
+legitimately no longer take the composite path. That drop is the retarget, not
+lost coverage — those types' GEMM behaviour moved to the new file's
+independent-reference and NMSE cases, which are far stronger.
+
+**Gates.** Clean CPU `-Werror` build, 0 warnings. Full CPU ctest **153/153**.
+New `test_ops_quant_dot` **16 cases / 78,052 assertions**.
+
+**DGX CONFIRMATION RUN (`dgx.casa`, `~/work/vllm.cpp-ciq-g3`, transferred by `git archive` — never rsync — production flags `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON -DCMAKE_CUDA_ARCHITECTURES=121a`, GPU verified idle by `nvidia-smi` with no compute apps, every stage under `flock $HOME/gpu.lock`):** clean CUDA `-Werror` build to 100%, **0 warnings**. Regression set ALL UNCHANGED, each gate run STANDALONE — 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6** (138 assertions; strict 5/6, max gap 0 nats), Qwen3-dense **16/16** on BOTH 0.6B and 4B (664 assertions; strict 10/16 and 11/16, max gap 0.25 nats), OPT **6/6** (36 assertions), DeepSeek-V2-Lite **8/8** (223 assertions; strict 5/8, 92/128 tokens strictly exact, 0 forward-divergent). `test_qwen36_gguf_engine` run STANDALONE on the real APEX files: **28/28 assertions, 2/2 cases, 16/16 tokens each on Compact and Balanced**. The three new/updated CPU units also pass on dgx's **aarch64** with identical counts (`test_ops_quant_dot` 16 cases / 78,052 assertions, `test_ops_quant_traits` 8 / 5,615, `test_gguf_dequant` 11 / 202) — the portable tier is architecture-independent, as intended. Golden corpus md5 (475 files under `tests/parity/goldens`) **identical before and after the series**: `2965ef5772b556d3f3f86fedf4221b2f`. **One transient to record honestly:** a first pass that ran four engine gates back-to-back inside a single shell aborted DeepSeek-V2 partway (95 of 223 assertions, 1 failure); re-run STANDALONE it passes 223/223 / 8/8, which is the known co-scheduled-memory effect on this box, not a regression.
+
+**NEXT, in dependency order:** CIQ **G4** — route `MatmulBT` call sites onto the
+quant path. It needs loader **L2-L3** (quant residency + the `VT_CPU_REF`
+oracle switch) and threadpool **W2**, it is the first increment that changes what
+a model executes, and it is the first that owes a benchmark (the B4 recipe, tier-0
+milestone: decode ≥ 0.25× llama.cpp tg32, prefill ≥ 0.1× pp128). **G5** (x86
+AVX2) and **G6** (Arm NEON/i8mm, which is what unpins `nrows == 2`) are parallel
+and unblocked by G3. The threadpool leaf's idle-host B4 gate is still owed and
+remains the perf denominator.
+
+First verification commands:
+`cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF && cmake --build build-cpu -j16`,
+then `cd build-cpu && ctest -j2` (expect 153/153),
+`./tests/test_ops_quant_dot` (expect 16 cases / 78,052 assertions) and
+`./tests/test_ops_quant_traits` (expect 8 cases / 5,615 assertions).
+`python3 scripts/check-agent-record.py` and `python3 scripts/check-doc-checkpoint.py`
+must both be green.

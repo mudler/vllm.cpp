@@ -1,23 +1,33 @@
-// CPU compute-in-quant GEMM (`OpId::kMatmulBTQuant`) — the skeleton and its
-// GENERIC COMPOSITE fallback (QUANT-GGUF-CIQ-GEMM work row G1).
+// CPU compute-in-quant GEMM (`OpId::kMatmulBTQuant`) — QUANT-GGUF-CIQ-GEMM
+// work rows G1 (skeleton + composite fallback) and G3 (the quantized path).
 //
 // Structure mirrors llama.cpp @ 237ad9b96
 // `ggml/src/ggml-cpu/ggml-cpu.c:1245-1443` (`ggml_compute_forward_mul_mat`):
 // src0 is the [N,K] block-quantized weight, src1 the f32/bf16 activation, and
-// the output is produced one row-dot at a time. The two pieces upstream puts
-// in front of that dot — quantizing src1 into `wdata` with the weight type's
-// `vec_dot_type` (:1313-1349) and the per-type integer `vec_dot` (:1426-1433)
-// — are work rows G2 and G3. Until BOTH exist for a type, this kernel takes
-// the composite path: decode the weight row to f32 through the traits table's
-// `to_float` and take the plain f32 dot. That is the same arithmetic the
-// current dequant-to-bf16 loader path performs, just without materializing the
-// whole tensor, so it is a correct (if unaccelerated) executor for every block
-// dtype and it is exactly the reference the ported MUL_MAT NMSE tests measure
-// the quantized path against.
+// the output is produced one row-dot at a time.
 //
-// Parallelism partitions OUTPUT ROWS only and each output keeps its own
-// sequential K reduction, so results are bit-identical to single-thread by
-// construction (same rule as every other kernel in cpu_ops.cpp).
+// TWO PATHS, selected by `HasQuantDotKernel(b.dtype)`:
+//
+//  1. QUANTIZED (the point of the track) — for the six executable GGUF weight
+//     encodings. Mirrors upstream exactly: quantize src1 ONCE into a scratch
+//     `wdata` buffer using the weight type's `vec_dot_type`
+//     (:1313-1349), then run one integer `vec_dot` per output element
+//     (:1426-1433). The weight blocks are never expanded.
+//
+//  2. GENERIC COMPOSITE (G1's fallback) — for any block dtype without a
+//     `vec_dot` (today only Q8_K, which is activation-only). Decodes the
+//     weight row to f32 via the traits table's `to_float` and takes the plain
+//     f32 dot. It stays in the tree permanently because it is the INDEPENDENT
+//     reference the ported MUL_MAT NMSE tests measure path 1 against — a
+//     different decode (the loader's `dequantize_row_*`) reaching the same
+//     mathematical answer, so a block-decode bug in a `vec_dot` cannot hide.
+//
+// DETERMINISM (project rule: no atomicAdd-style nondeterminism). Both paths
+// partition OUTPUT ROWS only; every output element keeps its own sequential K
+// reduction in a fixed order, and the activation scratch is written once per
+// row before any dot reads it. Results are therefore bit-identical run to run
+// and independent of thread count — asserted directly in
+// tests/vt/test_ops_quant_dot.cpp.
 #include <vector>
 
 #include "vt/quant.h"
@@ -72,15 +82,69 @@ void ComposeChunk(Tensor& out, const Tensor& a, const Tensor& b,
   }
 }
 
+// Quantized path — ggml-cpu.c:1313-1349 (src1 -> wdata) + :1155-1243 / :1426
+// (one vec_dot per output). `act` holds the M quantized activation rows, laid
+// out contiguously at `act_row_bytes` stride exactly like upstream's wdata.
+void QuantChunk(Tensor& out, const std::vector<uint8_t>& act,
+                size_t act_row_bytes, const Tensor& b, VecDotFn vec_dot,
+                int64_t k, int64_t j0, int64_t j1) {
+  const int64_t m = out.shape[0];
+  const int64_t n = b.shape[0];
+  const size_t w_row_bytes = RowSizeBytes(b.dtype, k);
+  const uint8_t* w = b.Ptr<const uint8_t>();
+
+  for (int64_t j = j0; j < j1; ++j) {
+    const uint8_t* w_row = w + static_cast<size_t>(j) * w_row_bytes;
+    for (int64_t i = 0; i < m; ++i) {
+      const uint8_t* a_row = act.data() + static_cast<size_t>(i) * act_row_bytes;
+      float acc = 0.0f;
+      // nrc == 1: the generic tier dots exactly one row pair, so the row
+      // strides bs/bx/by are inert (upstream passes 0 the same way outside its
+      // mmla path). G6's nrows==2 kernels are what give them meaning.
+      vec_dot(static_cast<int>(k), &acc, /*bs=*/0, w_row, /*bx=*/0, a_row,
+              /*by=*/0, /*nrc=*/1);
+      StoreOutF32(out, i * n + j, acc);
+    }
+  }
+}
+
 void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a,
                          const Tensor& b) {
   (void)q;
   const QuantTypeTraits& traits = QuantTraits(b.dtype);
-  // G2/G3 flip this on per type; when they do, the quantize-src1-once + integer
-  // vec_dot path from ggml-cpu.c:1313-1443 replaces the composite below.
-  VT_CHECK(!HasQuantDotKernel(b.dtype),
-           "matmul_bt_quant: a vec_dot kernel is registered for this dtype but "
-           "the quantized GEMM path is not wired yet (CIQ work rows G2/G3)");
+  const int64_t m = a.shape[0];
+  const int64_t k = a.shape[1];
+
+  if (HasQuantDotKernel(b.dtype)) {
+    // `QuantActRowBytes` throws unless k is a whole number of ACTIVATION
+    // blocks (256 for the K-quants, 32 otherwise); RowSizeBytes on the weight
+    // side enforces the same for its own block size. A ragged K therefore
+    // fails loudly here instead of mis-striding scratch.
+    const size_t act_row_bytes = QuantActRowBytes(b.dtype, k);
+    const FromFloatFn from_float = QuantTraits(traits.vec_dot_type).from_float;
+
+    // Widen src1 to f32 and quantize it once, mirroring ggml-cpu.c:1313-1349.
+    // ggml's src1 is already f32; ours may be bf16/f16, so the widen is the
+    // one extra step — it is exact (both widen losslessly into f32).
+    std::vector<uint8_t> act(QuantActScratchBytes(b.dtype, m, k));
+    std::vector<float> row(static_cast<size_t>(k));
+    const int64_t a_rs = a.stride[0];
+    for (int64_t i = 0; i < m; ++i) {
+      for (int64_t p = 0; p < k; ++p) {
+        row[static_cast<size_t>(p)] = LoadActF32(a, i * a_rs + p);
+      }
+      from_float(row.data(), act.data() + static_cast<size_t>(i) * act_row_bytes,
+                 k);
+    }
+
+    ParallelForRows(CurrentThreadpool(), b.shape[0],
+                    [&](int64_t j0, int64_t j1) {
+                      QuantChunk(out, act, act_row_bytes, b, traits.vec_dot, k,
+                                 j0, j1);
+                    });
+    return;
+  }
+
   VT_CHECK(traits.to_float != nullptr,
            "matmul_bt_quant: no to_float decoder for this weight dtype");
 

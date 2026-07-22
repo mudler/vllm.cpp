@@ -18,7 +18,9 @@ namespace {
 // silent correctness bug, so the generic tier pins 1.
 QuantTypeTraits MakeTraits(DType dtype, DType vec_dot_type) {
   QuantTypeTraits t;
-  t.to_float = BlockToFloat(dtype);
+  t.to_float = BlockToFloat(dtype);        // cpu_quant_dequant.cpp (G1)
+  t.from_float = BlockFromFloat(dtype);    // cpu_quant_act.cpp   (G2)
+  t.vec_dot = BlockVecDot(dtype);          // cpu_quant_dot.cpp   (G3)
   t.vec_dot_type = vec_dot_type;
   t.nrows = 1;
   return t;

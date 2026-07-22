@@ -1,7 +1,7 @@
 # Leaf spec: GGUF compute-in-quant GEMM — ggml tensor-traits port into vt::cpu
 
 **Row:** `QUANT-GGUF-CIQ-GEMM` (quantization-matrix.md, leaf of the
-`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **G1 landed** (2026-07-22, `CLAIM-QUANT-GGUF-COMPUTE-1`); G2-G8 open, so no encoding computes in quant yet ·
+`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **G1+G2+G3 landed** (2026-07-22, `CLAIM-QUANT-GGUF-COMPUTE-1`): the portable tier-0 quant GEMM is complete and gated at the OP level, but **no model call site routes to it** and every GGUF weight still expands to bf16 at load, so **no encoding computes in quant end to end** — that is G4 (with loader L2-L3 + threadpool W2). G4-G8 open ·
 **upstream pin:** llama.cpp local fork `237ad9b96` (b9892) ·
 **parent evidence:** B4 decision row
 ([parity-ledger.md L290](../parity-ledger.md#L290)) — the "vendor IF proven
@@ -153,8 +153,8 @@ there (i8mm repack expected) before comparing.
 | W | Row (claim-sized) | Content | Depends | Status |
 |---|---|---|---|---|
 | G1 | block dtypes + traits | `vt::DType` block entries, traits table, `kMatmulBTQuant` op skeleton + generic-composite fallback, trait cross-check vs `GgmlTraits` | - | **DONE** 2026-07-22 |
-| G2 | activation quant | `quantize_row_q8_0/q8_K` ports + scratch sizing; unit tests | G1 | open |
-| G3 | tier-0 vec_dot kernels | the six generic `vec_dot` ports + GEMM wiring + test-quantize-fns/backend-ops ports + parity goldens | G1, G2 | open |
+| G2 | activation quant | `quantize_row_q8_0/q8_K` ports + scratch sizing; unit tests | G1 | **DONE** 2026-07-22 |
+| G3 | tier-0 vec_dot kernels | the six generic `vec_dot` ports + GEMM wiring + test-quantize-fns/backend-ops ports + parity goldens | G1, G2 | **DONE** 2026-07-22 |
 | G4 | e2e enablement | route `MatmulBT` call sites on block dtype; engine gates (3) + `VT_CPU_REF` A/B; first B4-recipe measurement (tier-0 milestone) | G3, loader L2-L3, threadpool W2 | open |
 | G5 | x86 AVX2 tier | `arch/x86` vec_dot ports + feature probe; tier-1 milestone measurement | G3 | open |
 | G6 | Arm NEON/i8mm tier | `arch/arm` ports incl. `nrows==2` mmla; GB10 measurement | G3 | open |
@@ -220,6 +220,85 @@ written out from `ggml-common.h`. All seven types agree on block_elems,
 block_bytes and type id; the id map round-trips; `Q8_K` (id 15) is correctly
 absent from the reader's table because it is activation-only. 8 cases /
 5,694 assertions green.
+
+## G2 + G3 result (2026-07-22)
+
+**Landed together.** The portable tier-0 compute-in-quant GEMM is complete.
+
+**G2 — activation quant.** [cpu_quant_act.cpp](../../src/vt/cpu/cpu_quant_act.cpp#L1)
+ports `quantize_row_q8_0_ref` (`ggml-quants.c:238`) and `quantize_row_q8_K_ref`
+(`ggml-quants.c:2696`, bsums included) plus `nearest_int` (`:563`); the CPU-tier
+wrappers those sit behind are `ggml-cpu/quants.c:45,117`, which on the generic
+tier are bare calls to the `_ref` forms. Scratch sizing (`QuantActRowBytes` /
+`QuantActScratchBytes`) mirrors `ggml_row_size` + the mul_mat `wdata`
+computation in `ggml_graph_plan` (`ggml-cpu.c:1313-1349, 2752-2980`). Only the
+two ACTIVATION encodings get a `from_float`: nothing in this project quantizes
+an activation into a k-quant, so upstream's k-quant encoders stay unported.
+
+**G3 — the six generic `vec_dot`.** [cpu_quant_dot.cpp](../../src/vt/cpu/cpu_quant_dot.cpp#L1)
+ports `ggml-cpu/quants.c` `:174` (q4_0·q8_0), `:400` (q8_0·q8_0), `:566`
+(q3_K·q8_K), `:645` (q4_K·q8_K), `:720` (q5_K·q8_K), `:800` (q6_K·q8_K), with
+upstream's auto-vectorization-shaped structure (`aux8` decode split, 8-wide
+`aux16`/`aux32` staging, deferred `sums[8]`) preserved verbatim — that structure
+also FIXES the reduction order, which is what makes the GEMM bit-reproducible.
+Each kernel asserts `nrc == 1`; `nrows == 2` stays unreachable until G6 brings
+the mmla kernels AND the `ggml-cpu.c:1426-1433` boundary guards.
+[cpu_quant_blocks.h](../../src/vt/cpu/cpu_quant_blocks.h#L1) is a `static_assert`ed
+mirror of the `ggml-common.h` block structs.
+[cpu_quant_gemm.cpp](../../src/vt/cpu/cpu_quant_gemm.cpp#L1) now takes the
+quantized path (quantize src1 ONCE into scratch, then one integer `vec_dot` per
+output) for the six types; the generic dequant-composite remains for any block
+dtype without a `vec_dot` (today only Q8_K, activation-only).
+
+**Correctness — gated against an INDEPENDENT reference, not a second copy.**
+[test_ops_quant_dot.cpp](../../tests/vt/test_ops_quant_dot.cpp#L1), 16 cases /
+78,052 assertions green. The primary gate dequantizes BOTH operands through
+`BlockToFloat` (the loader-side `dequantize_row_*` decoders — a separate port
+that walks the layout differently from each `vec_dot`'s inline decode) and dots
+them in **f64**, with the tolerance set relative to the dot's L1 magnitude so
+sign cancellation cannot hide an error (`|got - ref| <= 1e-5 * L1`, actual
+agreement ~1e-6). Coverage: all six types × nblocks ∈ {1, 2, 3, 5, 7, 16} —
+single-block rows, ODD multiples that catch an unroll-by-2 assumption, and the
+Q6_K/Q3_K super-block structure. Ragged K (not a whole number of blocks) is
+gated to THROW at every layer (`from_float`, `vec_dot`, `QuantActRowBytes`,
+`kMatmulBTQuant`) rather than round down. The G2→G3 handoff is covered by
+feeding real `from_float` output into every `vec_dot` case. Upstream's own
+thresholds are ported unwidened: `test-quantize-fns.cpp:17-28`
+(total 0.002 / reference 0.0001 / dot-product 0.02) and
+`test-backend-ops.cpp:4277` MUL_MAT NMSE ≤ 5e-4 at M ∈ {1,4,32,512} ×
+N ∈ {1,7,16}. Determinism: `vec_dot` and the full GEMM are asserted
+**bit-identical** run-to-run and across thread counts 1/2/4 (byte `memcmp`, not
+`Approx`), and the GEMM is asserted bit-equal to a hand-driven per-element
+`vec_dot` so the wiring provably adds no reordering or stride slip.
+
+**Mutation-tested (14 mutants, 13 caught).** To prove the gate has teeth rather
+than merely passing: q6_K −32 bias→−31, q4_K `mins[j/2]`→`[j/4]`, q3_K hmask
+polarity flip, q5_K high-bit 16→8, q4_0 nibble bias −8→−7, q8_0 dropped
+activation delta, q4_K `kmask1` corruption, q3_K scale bias −32→−31, q8_K bsums
+short/doubled, q8_K `iscale` −127→−128, q8_0 `amax/127`→`/128`, q8_0 stored-delta
+fed back into the quants — **all caught**. One mutant (`roundf`→truncation in
+Q8_0) initially PASSED every statistical bound: upstream's 8-bit RMSE/NMSE
+thresholds genuinely cannot distinguish rounding modes. That gap is closed by an
+added **byte-exact encoder gate** comparing `from_float` output against a
+reference written from upstream's prose (round-half-away-from-zero for Q8_0,
+round-half-to-even for `nearest_int`) rather than by calling the same library
+function; it also catches the `nearest_int`→truncation and stored-delta mutants.
+The single uncaught mutant is Q8_K's `MIN(127, v)`, which is **provably
+unreachable** (|iscale| = 127/amax and |x| ≤ amax ⇒ |iscale·x| ≤ 127); it is kept
+for upstream fidelity and the test records why no case can distinguish it.
+
+**DGX CONFIRMATION RUN (`dgx.casa`, `~/work/vllm.cpp-ciq-g3`, transferred by `git archive` — never rsync — production flags `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON -DCMAKE_CUDA_ARCHITECTURES=121a`, GPU verified idle by `nvidia-smi` with no compute apps, every stage under `flock $HOME/gpu.lock`):** clean CUDA `-Werror` build to 100%, **0 warnings**. Regression set ALL UNCHANGED, each gate run STANDALONE — 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6** (138 assertions; strict 5/6, max gap 0 nats), Qwen3-dense **16/16** on BOTH 0.6B and 4B (664 assertions; strict 10/16 and 11/16, max gap 0.25 nats), OPT **6/6** (36 assertions), DeepSeek-V2-Lite **8/8** (223 assertions; strict 5/8, 92/128 tokens strictly exact, 0 forward-divergent). `test_qwen36_gguf_engine` run STANDALONE on the real APEX files: **28/28 assertions, 2/2 cases, 16/16 tokens each on Compact and Balanced**. The three new/updated CPU units also pass on dgx's **aarch64** with identical counts (`test_ops_quant_dot` 16 cases / 78,052 assertions, `test_ops_quant_traits` 8 / 5,615, `test_gguf_dequant` 11 / 202) — the portable tier is architecture-independent, as intended. Golden corpus md5 (475 files under `tests/parity/goldens`) **identical before and after the series**: `2965ef5772b556d3f3f86fedf4221b2f`. **One transient to record honestly:** a first pass that ran four engine gates back-to-back inside a single shell aborted DeepSeek-V2 partway (95 of 223 assertions, 1 failure); re-run STANDALONE it passes 223/223 / 8/8, which is the known co-scheduled-memory effect on this box, not a regression.
+
+**Nothing existing moved.** No model call site routes to `kMatmulBTQuant`
+(`grep` over `src/vllm/` finds no reference — G4 owns that), every GGUF weight
+still expands to bf16 at load, and the per-encoding `C` cells therefore stay `-`.
+`test_gguf_dequant` 11 cases / 202 assertions and the `BlockToFloat` ==
+loader-dequant byte-for-byte case remain green, so the decode numerics are
+untouched. `test_ops_quant_traits` is 8 cases / **5,615** assertions (was 5,694):
+its composite-fallback case now covers Q8_K alone, because the six weight types
+legitimately no longer take the composite path — the drop is that retarget, not
+lost coverage, and the six types' GEMM behaviour moved to the new file's
+independent-reference and NMSE cases.
 
 **Gates at G1:** clean CPU `-Werror` build (0 warnings); full CPU ctest
 **151/151**; gguf ctest 4/4. **DGX CONFIRMATION RUN (`dgx.casa`, `~/work/vllm.cpp-ciq-g1`, production flags `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_CUTLASS_DIR=/home/mudler/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON`, one `flock $HOME/gpu.lock` for the whole series):** clean CUDA `-Werror` build to 100%, **0 warnings**. Regression set ALL UNCHANGED — 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6** (strict 5/6, max gap 0 nats), Qwen3-dense **16/16** (strict 11/16, max gap 0.25 nats), OPT **6/6** (36 assertions), DeepSeek-V2-Lite **8/8** (223 assertions). `test_qwen36_gguf_engine` run STANDALONE (it OOMs co-scheduled) on the real APEX files: **28/28 assertions, 2/2 cases, 16/16 tokens each on Compact and Balanced** — the k-quant dequant path is byte-stable across the decoder move. Gates 1-5 of this spec are

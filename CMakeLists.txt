@@ -286,6 +286,8 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
   src/vt/cpu/cpu_quant_dequant.cpp
+  src/vt/cpu/cpu_quant_act.cpp
+  src/vt/cpu/cpu_quant_dot.cpp
   src/vt/cpu/cpu_quant_traits.cpp
   src/vt/cpu/cpu_quant_gemm.cpp
   src/vt/cpu/cpu_layernorm.cpp

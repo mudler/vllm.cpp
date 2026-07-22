@@ -16568,3 +16568,82 @@ parse, the MLA-only KV group, the per-expert bf16 loader with shared experts and
 forward composing W6's `ForwardMlaAttentionBlock` with `RunMoeBlock` and the first
 `first_k_dense_replace` dense layers. First verification commands:
 `ssh dgx.casa 'cd ~/w6mla/src/build && ./tests/test_mla_attention_block && ./tests/test_ops_mla_absorb'`.
+
+## 2026-07-22 — MLA campaign **W7**: the DeepSeek-V2 MODEL (registry + config parse + loader + forward)
+
+**Claim:** `CLAIM-MLA-DEEPSEEK`. **Base:** `ce43c51` (W6). **Worktree:**
+`agent-a06bba75ea226aadc`. **dgx evidence root:** `~/w7mla_src` (source + build +
+gate logs `~/w7mla_build*.log`, `~/w7mla_fwd.log`).
+
+**What landed.** The first MLA MODEL in this tree — the thing W1-W6 existed to
+make possible. Four new files
+(`include/vllm/model_executor/models/deepseek_v2.h`,
+`src/vllm/model_executor/models/deepseek_v2_weights.cpp`,
+`src/vllm/model_executor/models/deepseek_v2.cpp`,
+`src/vllm/model_executor/models/deepseek_v2_registry.cpp`) plus exactly ONE
+shared-code edit: a two-line additive condition in `runner.cpp` so a
+`KVCacheSpecKind::kMlaAttention` group is recognised as the model's attention
+group. Upstream registers MLA against the ordinary `FullAttentionManager`
+(`single_type_kv_cache_manager.py:1539`), so block tables, prefix caching and
+eviction are untouched and the spec-driven allocation W1 landed already produces
+the right 1-head / 576-wide / factor-1 pages with no allocator change.
+
+**Gates (all on dgx sm_121, clean CUDA build 0 warnings / 0 errors).**
+- **Loader:** the REAL 4-shard DeepSeek-V2-Lite. `test_deepseek_v2_load` 4/4
+  cases / **37,331 assertions**; **5291/5291 checkpoint tensors accounted for,
+  ZERO unmapped, ZERO leftover**. Every shape asserted, including the LOAD-TIME
+  `kv_b_proj -> W_UK_T [16,128,512]` / `W_UV [16,512,128]` absorption split (the
+  same transform as upstream's `process_weights_after_loading`, at the same
+  lifecycle point) and the shared-expert MLP.
+- **The query branch, asserted not assumed:** `q_lora_rank: null` -> the DIRECT
+  `q_proj` path, with `fused_qkv_a_proj`/`q_a_layernorm`/`q_b_proj` EMPTY on every
+  layer. The fused branch is implemented but stays e2e-uncovered on this box,
+  exactly as the spike §5.1 recorded.
+- **Forward:** the real checkpoint prefill of `The capital of France is` ->
+  **argmax ` Paris`**, top-5 `[' Paris',' the',' a',' one',' also']`, finite,
+  re-run bit-identical. The direct analogue of the Qwen3-Coder W3 sanity case.
+- **Batch ordering:** `BuildMlaBatchSplit` reproduces `split_decodes_and_prefills`
+  and `prefill_tokens_with_context` and THROWS on either violation — the exact
+  ordering W6 measured **0.86 relative error** from is now unrepresentable.
+- **Shared experts (new for this family):** zeroed-routed MoE layer is
+  BIT-IDENTICAL to a dense layer with the same MLP; shared-off CHANGES the
+  logits. Equivalence and exercise, both asserted.
+- **CUDA exercised, not merely compiled:** a case at the REAL MLA head geometry
+  drives the CUDA MLA kernels and the CUDA-only grouped bf16 MoE GEMM — bit-exact
+  on device, **0.0061** worst relative logit error vs the CPU reference path.
+  `test_deepseek_v2_forward` **11/11 cases**.
+- **Sanitizers:** memcheck **0 errors**, racecheck **0 hazards**, synccheck
+  **0 errors** (`--num-cuda-barriers 65536`).
+- **REGRESSIONS UNCHANGED:** 27B **235/235**, 35B **315/315**, Qwen3-Coder
+  **138/138**, Qwen3-dense **664/664**, OPT **36/36**.
+- **Full `ctest`: 182/184.** `test_capi` is the documented pre-existing flake,
+  signature CONFIRMED at `test_capi.cpp:353` (partial-UTF-8 first byte,
+  `\ufffd oollllll` vs `loollllll`). `test_qwen36_gguf_engine` died with
+  `CombineKernel launch: out of memory` under `ctest -j2` — the documented
+  unified-memory hazard of scheduling two ~30 GB model tests together — and
+  PASSES standalone (334 s). Neither is a W7 defect.
+
+**Registered surface, honestly.** Only `DeepseekV2ForCausalLM`. The other three
+upstream aliases are REFUSED BY NAME in the config parse: `DeepseekForCausalLM`
+is plain MHA (`deepseek_v2.py:1201-1211`), V3 is fp8/671B, V3.2 needs the DSA
+indexer. W10 owns their rows.
+
+**Finding worth carrying forward (pre-existing, NOT MLA).** The shared
+`DevicePool` (`device_pool.h`) is a process-wide singleton keyed only on a byte
+size class and documents itself "backend-agnostic". Safe for the engine (one
+device per process) but NOT for a process running both a CPU and a CUDA forward —
+the second backend gets the first's recycled pointers (observed as a SIGSEGV
+dereferencing a CUDA block on the host). Worked around test-locally with a
+per-arm `DevicePool` via the existing `ActivePoolScope`.
+
+**Row state: STILL `SPIKE`.** A loading, forwarding model is not a supported
+model. The SACRED token-exact gate is W8.
+
+**NEXT — W8: the SACRED correctness gate on DeepSeek-V2-Lite.** Wire the paged
+engine to PRODUCE the MLA batch order the model already VALIDATES (decodes first;
+with-context prefills leading the prefill tail — i.e. port
+`reorder_batch_to_split_decodes_and_prefills`), capture goldens from the vLLM
+0.25.0 oracle, and run the STRICT token-exact form W0 determined (V2-Lite greedy
+is DETERMINISTIC at batch=1, 8/8), with the regression set unchanged and memcheck
+0. First verification commands:
+`ssh dgx.casa 'cd ~/w7mla_src/build/tests && ./test_deepseek_v2_load && VT_DEEPSEEK_PROMPT_IDS=549,6077,280,7239,317 ./test_deepseek_v2_forward'`.

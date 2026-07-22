@@ -1414,7 +1414,7 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   output throughput, req/s, TTFT, TPOT/ITL, peak memory) at c1/c2/c4/c8, with
   token-exact correctness as a precondition that may never be traded off.
 
-- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W6 (2026-07-22,
+- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W7 (2026-07-22,
   `CLAIM-MLA-DEEPSEEK`,
   [spike](../.agents/specs/mla-deepseek-campaign.md)).**
   `benchmark_binding=false`; **NOT APPLICABLE.** W0 ran the vLLM oracle on
@@ -1505,6 +1505,33 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   128/256-bit vectorized; and the decode path materializes an intermediate
   `ql_nope` buffer before the concat exactly as upstream does, rather than having
   the batched GEMM write straight into the query's leading columns.
+  `benchmark_binding=false`.
+  **W7 is the first entry with a REACHABLE MLA path, and it is STILL NOT
+  APPLICABLE — for a different and weaker reason, so the reason is stated
+  explicitly rather than reused.** W7 adds the DeepSeek-V2 MODEL: registry, config
+  parse, weight loader and forward. So for the first time the MLA block, the MLA
+  decode and prefill kernels, the MLA cache write and the grouped router all have
+  a real caller, and the real DeepSeek-V2-Lite checkpoint runs through them
+  ("The capital of France is" -> " Paris"). **But no number is created, because
+  correctness precedes speed unconditionally**: the SACRED token-exact gate
+  against the vLLM 0.25.0 oracle is W8, and benchmarking a model whose correctness
+  is not yet gated would produce a number nobody may cite. The forward is also
+  explicitly correctness-first — there is no decode CUDA-graph sibling (the lever
+  worth ~5 ms/step at concurrency 1 on every sibling model that has one), the
+  A-projections are still per-row-slice rather than one fused GEMM, and the MLA
+  fusion recipes (RoPE + concat-cache, dual-RMSNorm) are not written — so any
+  measurement now would be of a deliberately untuned path and would become a stale
+  denominator the moment W9 lands. **The claim W7 DID have to prove is that
+  nothing existing moved**, because it touches shared surfaces: the runner's KV
+  group resolution gains a two-line additive condition, and the DeepSeek MoE block
+  activates the shared-expert path for the first time. Proved two ways rather than
+  assumed — STRUCTURALLY, because the runner change is an added `||` clause for a
+  spec kind no existing model produces, and the DeepSeek MoE block is written
+  directly over the `vt::` ops rather than reusing `RunMoeBlock`, so the
+  27B/35B/Qwen3-Coder MoE code is textually untouched; and EMPIRICALLY — 27B
+  **235/235**, 35B **315/315**, Qwen3-Coder **138/138**, Qwen3-dense **664/664**,
+  OPT **36/36** all token-exact UNCHANGED. `compute-sanitizer` memcheck 0,
+  racecheck 0 hazards, synccheck 0 on the new model's CUDA case.
   `benchmark_binding=false`.
   **Integration fix folded in (`888fbcc`), also NOT APPLICABLE:** OPT-125m's KV
   factory published a decorative `float32` spec dtype that was inert before the

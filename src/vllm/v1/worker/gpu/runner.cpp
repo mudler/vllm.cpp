@@ -387,7 +387,14 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     const KVCacheSpecKind kind =
         kv_cache_config.kv_cache_groups[static_cast<size_t>(g)]
             .kv_cache_spec->kind();
-    if (kind == KVCacheSpecKind::kFullAttention) {
+    // MLA campaign W7: an `MLAAttentionSpec` group IS the model's attention
+    // group. Upstream registers MLA against the ordinary FullAttentionManager
+    // (`vllm/v1/core/single_type_kv_cache_manager.py:1539`), so block table,
+    // prefix caching and eviction are identical and the ONLY difference is the
+    // page cost/shape — which the spec-driven allocation below already reads
+    // off the spec. Additive condition: no existing arch changes group.
+    if (kind == KVCacheSpecKind::kFullAttention ||
+        kind == KVCacheSpecKind::kMlaAttention) {
       full_attn_group_id_ = g;
     } else if (kind == KVCacheSpecKind::kMamba) {
       gdn_group_id_ = g;

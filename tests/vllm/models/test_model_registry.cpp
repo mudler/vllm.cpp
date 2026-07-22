@@ -42,7 +42,7 @@ HfConfig Config(std::vector<std::string> architectures) {
 
 TEST_CASE("registry_imports: every registered architecture has a complete factory") {
   const auto registrations = ModelRegistry::Registrations();
-  REQUIRE(registrations.size() == 5);
+  REQUIRE(registrations.size() == 6);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -78,6 +78,9 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   CHECK(has_arch("OPTForCausalLM"));
   CHECK(has_arch("Qwen3_5ForConditionalGeneration"));
   CHECK(has_arch("Qwen3_5MoeForConditionalGeneration"));
+  // MLA campaign W7: the DeepSeek-V2 MLA model, likewise one new TU + one
+  // REGISTER_VLLM_MODEL line and ZERO edit to a shared array.
+  CHECK(has_arch("DeepseekV2ForCausalLM"));
 
   // Registration arrival order across TUs is unspecified under C++ static init,
   // so the registry imposes a stable canonical sort by architecture name. This
@@ -86,11 +89,13 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // "Qwen3" prefix), then the full-attention MoE "Qwen3MoeForCausalLM", then the
   // two hybrid Qwen3.5 wrappers; resolution is order-independent.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 5);
+  REQUIRE(supported.size() == 6);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
-  CHECK(supported.front() == "OPTForCausalLM");  // 'O' (0x4F) < 'Q' (0x51)
-  CHECK(supported[1] == "Qwen3ForCausalLM");
-  CHECK(supported[2] == "Qwen3MoeForCausalLM");
+  // MLA campaign W7 adds the first non-Qwen/non-OPT family; 'D' sorts first.
+  CHECK(supported.front() == "DeepseekV2ForCausalLM");
+  CHECK(supported[1] == "OPTForCausalLM");  // 'O' (0x4F) < 'Q' (0x51)
+  CHECK(supported[2] == "Qwen3ForCausalLM");
+  CHECK(supported[3] == "Qwen3MoeForCausalLM");
   CHECK(supported.back() == "Qwen3_5MoeForConditionalGeneration");
 
   // The dense/MoE scheduler policy split survives the per-variant TU move.
@@ -108,6 +113,7 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
     CHECK(registration.info.score_type == "bi-encoder");
     if (registration.architecture == "Qwen3ForCausalLM" ||
         registration.architecture == "Qwen3MoeForCausalLM" ||
+        registration.architecture == "DeepseekV2ForCausalLM" ||
         registration.architecture == "OPTForCausalLM") {
       // Pure text-only full-attention arch (dense OR MoE): NOT hybrid (no GDN),
       // NOT multimodal (no vision tower).
@@ -343,7 +349,8 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 5> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 6> kExampleConfigArchitectures{
+      "DeepseekV2ForCausalLM",
       "OPTForCausalLM",
       "Qwen3ForCausalLM",
       "Qwen3MoeForCausalLM",
@@ -416,7 +423,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(unknown),
       "Model architectures ['LlamaForCausalLM'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['OPTForCausalLM', 'Qwen3ForCausalLM', 'Qwen3MoeForCausalLM', "
+      "dict_keys(['DeepseekV2ForCausalLM', 'OPTForCausalLM', 'Qwen3ForCausalLM', "
+      "'Qwen3MoeForCausalLM', "
       "'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForConditionalGeneration'])",
       std::runtime_error);
@@ -426,7 +434,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(multiple),
       "Model architectures ['UnknownA', 'UnknownB'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['OPTForCausalLM', 'Qwen3ForCausalLM', 'Qwen3MoeForCausalLM', "
+      "dict_keys(['DeepseekV2ForCausalLM', 'OPTForCausalLM', 'Qwen3ForCausalLM', "
+      "'Qwen3MoeForCausalLM', "
       "'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForConditionalGeneration'])",
       std::runtime_error);

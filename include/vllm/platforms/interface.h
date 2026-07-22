@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "vt/backend.h"
@@ -139,6 +140,34 @@ class Platform {
 
   // Discrete-vs-unified residency/memory-model policy (folds the PR #4 debt).
   virtual ResidencyPolicy residency_policy() const = 0;
+
+  // Can this platform actually RUN the model registered under `architecture`?
+  //
+  // WHY THIS EXISTS (BACKEND-METAL-MLX work row M3a). "A partial backend is a
+  // supported, tested state" (src/vt/ops.cpp:104-111) has always been true one
+  // layer down — `vt::GetOp` throws for an unregistered op. But once
+  // model_loader.cpp::SelectQueue started asking the Platform seam instead of
+  // hardcoding kCUDA, "which device does this process run on" stopped being the
+  // same question as "which device can run THIS model". Metal implements exactly
+  // the ops OPT-125m needs; pointing a Qwen3-dense engine at it produces a
+  // late, obscure failure inside a kernel bind ("table points outside every
+  // Metal allocation") instead of a clean fall-back to the CPU reference.
+  //
+  // The default is TRUE and is the right default for a COMPLETE backend: CUDA
+  // (74/75 ops) and CPU keep their exact behaviour, and this is never consulted
+  // for them in any way that changes an outcome. A PARTIAL backend overrides it
+  // and names the architectures whose ops it has actually registered — which is
+  // a claim the backend can honour, and which shrinks to nothing the moment the
+  // remaining kernels land.
+  //
+  // Deliberately keyed on the ARCHITECTURE STRING rather than an OpId manifest:
+  // the registration already carries the architecture, the manifest would have
+  // to be maintained in lockstep with every forward, and a stale manifest would
+  // fail in exactly the silent way this is meant to prevent.
+  virtual bool supports_model_architecture(std::string_view architecture) const {
+    (void)architecture;
+    return true;
+  }
 
   // Capability-ordered attention-backend priority: the ordered list of backend
   // NAMES this platform prefers, highest-priority first. Mirrors

@@ -19,11 +19,25 @@ includes 5 sites of which 3 strictly unconditional, the public
 implementation facts, not encoding facts), and **merges W0b item 8 into the
 provider seam** (they are the same work). Read it before starting M3 or W0b.
 
-**`ACTIVE` here means a gated SKELETON, not a supported backend.** No model runs
-on Metal OR on Vulkan: GEMM, attention, KV cache, quant and sampling are
-unregistered on both. Do not read the state as capability — read § Work breakdown
-"W0 landed" / "V1 landed" -> "still stubbed" for the exact surface, which
-`tests/vt/test_metal_backend.cpp` and `tests/vt/test_vulkan_backend.cpp` assert.
+**UPDATE 2026-07-22 — METAL NOW RUNS A MODEL; VULKAN DOES NOT.** Work row `M3a`
+landed OPT-125m (`OPTForCausalLM`) end to end on Apple GPU, **STRICT token-exact
+6/6 prompts / 96/96 tokens** vs the committed vLLM 0.25.0 goldens, taking Metal's
+registered set to **15 of 75** ops. Details, the seam fixes it forced, and the
+one bug this spike and the companion study both MISSED are in
+[metal-mlx-reuse-study.md §12](metal-mlx-reuse-study.md). **Vulkan is unchanged
+and remains a gated SKELETON** (8 of 75 ops, no GEMM, no attention, no model).
+**Neither backend has a SPEED number, and none is owed** — correctness and speed
+are separate bars.
+
+**`ACTIVE` still means less than it sounds for both rows.** For Vulkan it means a
+gated skeleton. For Metal it means ONE model, at correctness only: quant, MoE,
+GDN/MLA, RoPE and every sampler op beyond greedy argmax are still unregistered,
+so most models still cannot run on it — which
+`MetalPlatform::supports_model_architecture()` now states as an executable fact
+rather than leaving to a kernel-bind failure. Do not read the state as capability
+— read § Work breakdown "W0 landed" / "V1 landed" -> "still stubbed" for the
+exact surface, which `tests/vt/test_metal_backend.cpp` and
+`tests/vt/test_vulkan_backend.cpp` assert.
 
 **MLX is the named COMPETITOR FLOOR for Metal** (user directive 2026-07-22) while
 remaining DEMOTED as an implementation path — see § Gates for why those are not

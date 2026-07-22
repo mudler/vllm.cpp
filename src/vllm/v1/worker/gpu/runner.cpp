@@ -512,8 +512,20 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
 
   const vt::Device dev = queue_.device;
   const char* device_cache_env = std::getenv("VT_DEVICE_KV_CACHE");
+  // W0b-1 / work row M3a: this read `is_cuda()`, which is the SAME defect the
+  // `dense_attn_block.h` ResidentWeight fix corrected — "not NVIDIA" was being
+  // used to mean "no device memory". On kMETAL (and kVULKAN, kXPU) the KV cache
+  // fell into `host_data_`, and the first device kernel to touch it —
+  // vt::ReshapeAndCache — was handed a HOST pointer. On Metal that surfaces as
+  // "k_cache points outside every Metal allocation"; on a discrete-memory
+  // backend it would be a silent wrong answer or a fault.
+  //
+  // Device residency is a property of HAVING a device, not of the vendor, so the
+  // predicate is `!is_cpu()`. kCPU keeps the host vector (it has no device pool
+  // and the host IS the device) and kCUDA behaviour is bit-identical — the dgx
+  // regression set is the evidence, not this comment.
   kv_cache_backend_resident_ =
-      vllm::platforms::GetPlatform(dev.type).is_cuda() &&
+      !vllm::platforms::GetPlatform(dev.type).is_cpu() &&
       (device_cache_env == nullptr || device_cache_env[0] != '0');
   full_attn_buf_.clear();
   ssm_buf_.clear();

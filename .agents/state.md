@@ -19019,3 +19019,80 @@ Metal or Vulkan capability from this audit — no model runs on either; do not
 promote any row on the strength of this document, which produced no code, no
 test, and no measurement of behaviour.
 
+## 2026-07-22 — `M3a`: OPT-125m runs on Apple GPU, STRICT token-exact (`CLAIM-BACKEND-METAL-M3A-1`)
+
+**The first model in this tree to run on a non-CUDA backend.** Row
+`BACKEND-METAL-MLX` stays `ACTIVE`: correctness is met, SPEED is a separate bar
+and is not. Base `72f5db2`, worktree `agent-a5bedee70b3431835`.
+
+**Result.** OPT-125m (`OPTForCausalLM`, bf16) generates end to end on the M4
+through the ordinary engine stack and is **STRICT token-exact 6/6 prompts /
+96/96 tokens** against the SAME committed dgx-captured vLLM 0.25.0 goldens the
+CUDA arm is gated on. Those goldens are device-INDEPENDENT, so Metal met the bar
+CUDA already met rather than one re-derived on Metal.
+
+**Five new MSL kernels**, Metal registered ops **10 -> 15 of 75**: `kEmbedding`,
+`kQkvSplit`, `kReshapeAndCache`, `kPagedAttention`, `kGreedyArgmax`. Four are
+**BIT-EXACT** vs the CPU oracle (non-reducing gather/layout/selection ops, plus
+an argmax whose (value, lowest-index) max is genuinely order-independent);
+`kPagedAttention` is **NMSE 4.99e-13** against the 5e-4 bar and bit-exactness is
+explicitly NOT claimed for it, because it is the online-softmax form where the
+CPU reference is a materialized 3-pass.
+
+**The Metal path is PROVEN to have executed**, not inferred: the gate asserts
+`runner().device().type == kMETAL` plus `selections > 0` AND `declines == 0` for
+all nine ops OPT dispatches (`kPagedAttention` selections 1152). `last_selected`
+alone is insufficient — a provider can decline inside its kernel and forward
+down. Per-op tests NaN-poison every output buffer as a second, independent check.
+
+**Seam work: the study predicted 4 fixes; reality was 2 confirmed, 1 refuted,
+1 new.**
+* FIXED: `SelectQueue` hardcoded `GetBackend(kCUDA)` — the single line keeping
+  every non-NVIDIA accelerator on the CPU reference no matter how complete it
+  was. Now asks `CurrentPlatform()`.
+* FIXED: Metal `get_attn_backend_priority()` was `{}` -> `{"FLASH_ATTN"}`, with
+  a NAME-only registration of `FlashAttentionBackend` for `kMETAL`. MLA stays
+  unoffered.
+* REFUTED BY MEASUREMENT: the runner's unguarded `vt/cuda/` include is
+  declaration-only and links fine on a Metal-only macOS build. No change made.
+* **NEW BUG THE STUDY MISSED:** `runner.cpp:516` gated KV-cache DEVICE RESIDENCY
+  on `is_cuda()`, so on Metal the cache fell into a host vector and
+  `vt::ReshapeAndCache` got a HOST pointer. Fixed to `!is_cpu()`. Same class as
+  the earlier `dense_attn_block.h` bug, invisible for the same reason.
+
+**New seam, forced and not foreseen:** `Platform::supports_model_architecture()`
+(default `true`, CUDA/CPU byte-unchanged). Once `SelectQueue` asks the platform,
+"which device am I on" stops being "which device can run THIS model" — a
+distinction that could not arise while CUDA at 74/75 ops was the only
+accelerator. Metal answers exactly `{"OPTForCausalLM"}`. **Caught by the macOS
+regression suite, not by design**, and recorded as such.
+
+**Tree friction, re-judged.** OPT-on-Metal needed **2 of the study's 13**
+`is_cuda()` sites and **0 of the 5** CUDA includes. The honest headline is not
+"67 sites to unpick" but "2 of 13 `is_cuda()` sites encoded *not-NVIDIA means no
+device memory*, and both were real bugs". No tree-wide campaign started.
+
+**Gates.** M4: clean `-Werror` 0 warn on a CLEAN FULL rebuild (CLT-only, MSL at
+runtime); `test_metal_backend` 12 cases / 18,535 assertions; ctest **154/156**
+(both misses documented pre-existing platform gaps; `test_capi`'s standalone
+failure PROVEN pre-existing on an unmodified `72f5db2` build on the same box).
+Linux CPU: clean 0 warn, 153/156 with two `-j` flakes passing isolated and
+`test_openai_conformance` proven pre-existing by the same baseline A/B. dgx:
+clean CUDA 0 warn; **ALL SIX REGRESSIONS UNCHANGED, each STANDALONE — 27B
+235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6 (96/96),
+DeepSeek-V2 8/8**; OPT goldens md5-identical before and after.
+
+**Trap worth recording:** the first dgx pass was configured WITHOUT the
+production flags (`VLLM_CPP_FLASH_ATTN`, `VLLM_CPP_TRITON`) and showed four
+"regressions". Every one reproduced identically on unmodified `72f5db2`, and all
+disappeared under the correct flags. A mis-flagged build that looks like a
+regression is exactly what the standing baseline-A/B rule exists to catch.
+
+**NOT claimed: any Metal speed number.** The M4 could not be quieted (root
+LaunchDaemon needs interactive sudo; the desktop aerial wallpaper is the larger
+contender), so any timing would be void. `BACKEND-GATE-METAL-MLXLM` stays
+`INVENTORIED` — it binds on Qwen3-dense (`M3b`), the model MLX also runs.
+
+**Next.** `M3b` (Qwen3-dense on Metal: +`kRopeCosSinCache`, `kRopeFromCache` —
+and it is what unlocks the MLX competitor gate), `M3c` (batched encoders +
+hazard barriers, replacing one-command-buffer-per-op), `M2r`, `M4`, `W0b-3`.

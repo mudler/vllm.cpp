@@ -13,6 +13,7 @@
 // so the engine-side platform tree stays free of Metal headers.
 #include "vllm/platforms/interface.h"
 
+#include <string_view>
 #include <vector>
 
 #include "vt/backend.h"
@@ -50,18 +51,43 @@ class MetalPlatform final : public Platform {
   // pools and host-frees for reasons specific to the CUDA allocator.
   ResidencyPolicy residency_policy() const override { return {}; }
 
-  // Attention-backend priority. There is NO Metal attention kernel in this
-  // skeleton — kPagedAttention is not registered for kMETAL — so returning a
-  // name would be a claim we cannot honour. The EMPTY list is the honest and
-  // mechanically correct answer: SelectAttentionBackendName walks the list and
-  // takes the first REGISTERED name (include/vllm/v1/attention/registry.h:59-78),
-  // so an empty list makes selection throw loudly instead of silently handing
-  // back a backend whose kernels do not exist on this device. Work row M3 adds
-  // the kernel and the one-line name here in the same change.
+  // The architectures this backend has actually registered the ops for (work
+  // row M3a). Metal is a PARTIAL backend — 15 of 75 ops — so the honest answer
+  // is an explicit allow-list, not `true`.
+  //
+  // OPT-125m (`OPTForCausalLM`) is the whole list today, and that is a MEASURED
+  // choice rather than an arbitrary one: the reuse study found all four OPT TUs
+  // contain zero CUDA references and that OPT needs the fewest new kernels of
+  // any model in the tree. Anything else pointed at Metal falls back to the CPU
+  // reference in model_loader.cpp::SelectQueue and runs correctly, just slowly —
+  // which is strictly better than dying inside a kernel bind.
+  //
+  // Qwen3-dense (`Qwen3ForCausalLM`) is the NEXT entry and is deliberately NOT
+  // here yet: it additionally needs kRopeCosSinCache + kRopeFromCache, which are
+  // unregistered (work row M3b). Adding an architecture to this list without its
+  // kernels would recreate exactly the silent-failure mode the seam removes.
+  bool supports_model_architecture(std::string_view architecture) const override {
+    return architecture == "OPTForCausalLM";
+  }
+
+  // Attention-backend priority (W0b-1 item 4, closed by work row M3a). The W0
+  // skeleton returned {} because kPagedAttention was not registered for kMETAL
+  // and naming a backend would have been a claim we could not honour. It IS
+  // registered now (src/vt/metal/metal_ops.mm), against the same NHD
+  // (num_blocks, 2, block_size, num_kv_heads, head_size) cache layout
+  // FlashAttentionBackend::get_kv_cache_shape allocates and our CPU reference
+  // reads — so FLASH_ATTN is the correct and only name, exactly as on CPU
+  // (src/vllm/platforms/cpu.cpp) and CUDA. The backend itself is device-agnostic
+  // host metadata, so it self-registers for kMETAL in
+  // src/vllm/v1/attention/backend.cpp alongside kCUDA/kCPU.
+  //
+  // MLA is NOT offered: no Metal MLA kernel exists, so a use_mla request must
+  // keep finding nothing and throwing rather than selecting a backend whose
+  // kernels are unregistered.
   std::vector<std::string> get_attn_backend_priority(
       const AttnSelectorConfig& cfg) const override {
-    (void)cfg;
-    return {};
+    if (cfg.use_mla) return {};
+    return {"FLASH_ATTN"};
   }
 };
 

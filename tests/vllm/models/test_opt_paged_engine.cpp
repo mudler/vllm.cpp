@@ -29,11 +29,24 @@
 // with the SAME single fp16->bf16 rounding. See
 // .agents/specs/sweep-opt-125m.md decision D1.
 //
-// Checkpoint-GATED + dgx-only: resolves the materialized bf16-safetensors dir
-// from scripts/opt-materialize-checkpoint.py (the HF snapshot ships a
-// torch-pickle `pytorch_model.bin` our loader cannot read — decision D2). On
-// CPU/CI the dir and goldens are absent, so the body emits a loud SKIP —
-// compiles + links on CPU, RUNS only on dgx.casa (GB10).
+// Checkpoint-GATED: resolves the materialized bf16-safetensors dir from
+// scripts/opt-materialize-checkpoint.py (the HF snapshot ships a torch-pickle
+// `pytorch_model.bin` our loader cannot read — decision D2). Where the dir and
+// goldens are absent the body emits a loud SKIP, so it compiles + links
+// everywhere and RUNS wherever the checkpoint is staged.
+//
+// MULTI-BACKEND (BACKEND-METAL-MLX work row M3a). This was dgx-only. It is now
+// the SAME gate on two accelerators from one source: model_loader.cpp's
+// SelectQueue asks the Platform seam instead of hardcoding kCUDA, so this runs
+// on CUDA on dgx.casa (GB10) and on Metal on the Apple M4, both against the SAME
+// committed dgx-captured vLLM 0.25.0 goldens. That is what makes it a real
+// cross-backend gate rather than two separately-baselined tests: the goldens are
+// device-INDEPENDENT (they are vLLM's tokens, not ours), so Metal has to match
+// the bar CUDA already met, not a bar re-derived on Metal.
+//
+// The token comparison alone does not say WHICH device executed — every backend
+// computes the same function — so the body also asserts the op-provider
+// selection/decline counters for all nine OPT ops on the running device.
 #include <doctest/doctest.h>
 
 #include <cstdint>
@@ -49,6 +62,8 @@
 #include "npy.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/sampling_params.h"
+#include "vt/op_provider.h"  // the "which backend actually ran" proof
+#include "vt/ops.h"
 
 namespace fs = std::filesystem;
 
@@ -116,7 +131,7 @@ std::vector<int32_t> LoadI32File(const fs::path& p) {
 
 }  // namespace
 
-TEST_CASE("opt-125m paged-engine greedy STRICT token-exact gate (dgx-only, SACRED)") {
+TEST_CASE("opt-125m paged-engine greedy STRICT token-exact gate (CUDA + Metal, SACRED)") {
   const std::string dir = FindOptModelDir();
   if (dir.empty()) {
     MESSAGE(
@@ -174,6 +189,40 @@ TEST_CASE("opt-125m paged-engine greedy STRICT token-exact gate (dgx-only, SACRE
       vllm::entrypoints::LoadedEngine::FromModelDir(dir,
                                                     vllm::entrypoints::EngineParams{});
 
+  // ---- WHICH BACKEND ACTUALLY RAN (BACKEND-METAL-MLX work row M3a) ---------
+  // A passing token comparison does NOT prove which device executed: every
+  // backend computes the same function, so a silent fall-back to the CPU
+  // reference would produce an IDENTICAL green result. Since
+  // model_loader.cpp::SelectQueue now asks the Platform seam rather than
+  // hardcoding kCUDA, this test runs on CUDA on dgx and on Metal on the M4 from
+  // the same source — so the device is recorded, and on an accelerator the
+  // op-provider DECLINE counters are asserted zero.
+  //
+  // `declines == 0` is the load-bearing half. `last_selected` alone is
+  // insufficient: a provider can be selected and then decline INSIDE its kernel
+  // and forward down the stack, which is exactly the fan-out spike's Risk 4
+  // (a probe failing silently into the slow path).
+  const vt::DeviceType run_dev = loaded->runner().device().type;
+  MESSAGE("opt-125m: the engine selected device type " << static_cast<int>(run_dev)
+          << " (0=CPU, 1=CUDA, 2=METAL, 3=VULKAN, 4=XPU)");
+  // The nine ops OPT's forward + greedy sampling dispatch. Every one must be
+  // REGISTERED for the running device, must actually be SELECTED at least once,
+  // and must never DECLINE.
+  const std::vector<vt::OpId> kOptOps = {
+      vt::OpId::kEmbedding,        vt::OpId::kMatmulBT,       vt::OpId::kAdd,
+      vt::OpId::kLayerNorm,        vt::OpId::kRelu,           vt::OpId::kQkvSplit,
+      vt::OpId::kReshapeAndCache,  vt::OpId::kPagedAttention, vt::OpId::kGreedyArgmax};
+  if (run_dev != vt::DeviceType::kCPU) {
+    for (vt::OpId op : kOptOps) {
+      CHECK(vt::OpRegistered(op, run_dev));
+      vt::ResetOpProviderStats(op, run_dev);
+    }
+    // Per-call selection counting is OFF by default (the hot path is a cached
+    // pointer load); turn it on EXPLICITLY here rather than depending on the
+    // environment, so the proof below is a property of the test.
+    vt::EnableOpProviderCallStats(true);
+  }
+
   int exact_prompts = 0;
   int64_t exact_tokens = 0;
   int64_t total_tokens = 0;
@@ -217,6 +266,28 @@ TEST_CASE("opt-125m paged-engine greedy STRICT token-exact gate (dgx-only, SACRE
     }
     CHECK_MESSAGE(exact, "opt-125m prompt[" << i << "] is not token-exact vs the "
                                                "deterministic vLLM 0.25.0 oracle");
+  }
+
+  // ---- the backend proof, now that work has actually been dispatched -------
+  if (run_dev != vt::DeviceType::kCPU) {
+    vt::EnableOpProviderCallStats(false);
+    for (vt::OpId op : kOptOps) {
+      const auto st = vt::GetOpProviderStats(op, run_dev);
+      // SELECTED at least once: the device kernel really served this op during
+      // the 96 generated tokens, rather than the op never being reached.
+      CHECK_MESSAGE(st.selections > 0,
+                    "opt-125m: op " << static_cast<int>(op)
+                                    << " was never dispatched on the running device — the "
+                                       "token match cannot be attributed to this backend");
+      // NEVER DECLINED: no silent forward down the provider stack.
+      CHECK_MESSAGE(st.declines == 0,
+                    "opt-125m: op " << static_cast<int>(op)
+                                    << " DECLINED on the running device and fell back");
+    }
+    MESSAGE("opt-125m: BACKEND PROOF — all 9 OPT ops dispatched on device type "
+            << static_cast<int>(run_dev) << " with 0 declines "
+            << "(kPagedAttention selections="
+            << vt::GetOpProviderStats(vt::OpId::kPagedAttention, run_dev).selections << ")");
   }
 
   MESSAGE("opt-125m STRICT correctness gate: " << exact_prompts << "/" << N

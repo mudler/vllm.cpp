@@ -1,11 +1,14 @@
 # Metal/MLX reuse study + the acceleration-provider seam (`BACKEND-ACCEL-PROVIDER`)
 
-Status: **STUDY + MEASURED MLX BASELINE, 2026-07-22** — and, since 2026-07-22,
-**PARTLY IMPLEMENTED**: work rows `W0b-2` (the `vt::OpProvider` seam), the
-`dense_attn_block.h` half of `W0b-1`, and `M5` (MLX as a registered provider for
-the dense GEMM) are LANDED AND GATED, together with a native MSL GEMM that `M5`
-needed in order to have anything to be an alternative *to*. See §10 for exactly
-what landed, what it corrected in this document, and what is still owed.
+Status: **STUDY + MEASURED MLX BASELINE + FIRST MODEL RUNNING, 2026-07-22.**
+Work rows `W0b-2` (the `vt::OpProvider` seam), `W0b-1`, `M5` (MLX as a registered
+provider for the dense GEMM) and — since 2026-07-22 — **`M3a`: OPT-125m running
+END TO END ON APPLE GPU, STRICT token-exact 6/6 (96/96 tokens) against the
+committed vLLM 0.25.0 goldens** are LANDED AND GATED, together with a native MSL
+GEMM that `M5` needed in order to have anything to be an alternative *to*.
+§10 records the seam work; **§12 records `M3a`** — what was implemented, which of
+this document's predictions held, the one it got wrong, and the one seam bug it
+did not anticipate. **No Metal SPEED number is claimed or owed** (§12.5).
 Owners: `CLAIM-BACKEND-FANOUT-1` (the study) and
 `CLAIM-BACKEND-ACCEL-PROVIDER-1` (the implementation).
 Rows: `BACKEND-METAL-MLX` (unchanged `ACTIVE`), `BACKEND-GATE-METAL-MLXLM`
@@ -542,7 +545,7 @@ MLX is one row.
 | **W0b-2** (LANDED 2026-07-22) | `vt::OpProvider` + device-neutral `DeviceCaps` (= old W0b item 8) | W0b-1 | do it BEFORE three backends each invent one. Behavior-preserving: register every existing kernel as a single priority-0 provider whose `supports()` returns true |
 | **W0b-3** | Split `QuantTypeTraits` per §3.4 (= old W0b item 7, corrected — split, do not lift) | W0b-2 | keys on the same predicate |
 | **M2r** | M2 residue: the ~12 remaining elementwise/rope/gated ops | W0b-1 | |
-| **M3a** | **OPT on Metal** — 6 new kernels, incl. `kMatmulBT` + `kPagedAttention` | M2r | the only CUDA-free model TU in the tree; cheapest correct first model. Gate: token-exact vs our own CPU backend on the same M4 |
+| **M3a** (LANDED 2026-07-22) | **OPT on Metal** — 5 new kernels (`kMatmulBT` had already landed with the seam), plus `W0b-1` items 1/3/4 and one NEW seam bug the study did not predict | M2r | the only CUDA-free model TU in the tree; cheapest correct first model. **Gate MET, and at a STRONGER bar than this row asked for**: the row proposed token-exactness vs our own CPU backend on the M4; what shipped is token-exactness vs the COMMITTED dgx-captured vLLM 0.25.0 goldens — 6/6 prompts, 96/96 tokens — because those goldens are device-INDEPENDENT (they are vLLM's tokens, not ours), so Metal had to meet the bar CUDA already met rather than one re-derived on Metal. See §12 |
 | **M3b** | **Qwen3-dense on Metal** — +`kRopeCosSinCache`, `kRopeFromCache`, `kRmsNorm` path | M3a | the model MLX also runs -> unlocks `BACKEND-GATE-METAL-MLXLM` against §7 |
 | **M3c** | Batched encoders + hazard barriers (§1.3), replacing one-command-buffer-per-op | M3a | pure win for OUR kernels, no dependency. Port `device.cpp:264-273` |
 | **M5** (LANDED 2026-07-22, gated `VLLM_CPP_MLX`) | **MLX as a registered provider** (`VLLM_CPP_MLX`, default OFF) for `kMatmul`/`kMatmulBT`, measured A/B against M3's own MSL via `VT_OP_PROVIDER_STATS` | W0b-2, M3b | this is where the §5 bridge is built, and it is now a *configuration*, not a rewrite. Adopt only where it measures faster |
@@ -719,11 +722,18 @@ path and its costs), §6 (the design and its five-platform generalization test),
 | new | **Native MSL dense GEMM** `kMatmul`/`kMatmulBT`. Not in the original plan; required, because a seam that selects between providers needs a second provider to select. Stays the DEFAULT | `src/vt/metal/metal_msl.h`, `src/vt/metal/metal_ops.mm` |
 | `M5` | **MLX as a registered provider** for the dense GEMM, `VLLM_CPP_MLX` default OFF | `src/vt/metal/metal_mlx_provider.mm` |
 
-**Still owed, unchanged by this:** `W0b-1` items 1/3/4, `W0b-3` (the
+**Still owed as of that change:** `W0b-1` items 1/3/4, `W0b-3` (the
 `QuantTypeTraits` split, which keys on the same predicate the seam now provides),
 `M2r`, `M3a` (OPT on Metal — still the right first model), `M3b`, `M3c`, `M4`.
-**No model runs on Metal**, so no Metal speed number is claimed or owed, and
-`BACKEND-GATE-METAL-MLXLM` correctly stays `INVENTORIED`.
+
+> **SUPERSEDED IN PART, 2026-07-22.** `M3a` LANDED and with it `W0b-1` items 1
+> and 4; item 3 was found to be a NON-ISSUE by measurement (the `vt/cuda/`
+> include in the runner is declaration-only and compiles and links on a
+> Metal-only macOS build — the study's "strictly unconditional" count was
+> correct about the include and wrong about its consequence). **A model now RUNS
+> on Metal.** Still no Metal SPEED number is claimed or owed, and
+> `BACKEND-GATE-METAL-MLXLM` correctly stays `INVENTORIED` — it binds on
+> Qwen3-dense (`M3b`), which is the model MLX also runs. See §12.
 
 **§6.1's generalization claim, re-judged against the implementation.** Of the
 five rows in that table, exactly one is now POPULATED (Metal/MLX) and the other
@@ -858,3 +868,126 @@ The rows owned here are `W0b-2` (LANDED), the `dense_attn_block.h` half of
 | **MLX becoming a hard dependency** (`discipline.md` prefers header-only) | Build-gated, default OFF, native MSL is the default and ships; `VT_OP_PROVIDER_DISABLE=mlx` switches it off in an existing binary |
 | **Claiming bit-exactness across providers** | Refused. MLX-vs-MSL measured 0 on the tested shapes and is recorded explicitly as an observation, not a promise; the gate is NMSE |
 | **Publishing a contended MLX timing** | Refused. The M4 could not be quieted; no MLX-vs-MSL speed number is published, and the commands the user must run first are in `docs/BENCHMARKS.md` |
+
+---
+
+## 12. `M3a` — OPT-125m on Apple GPU (LANDED 2026-07-22)
+
+**The first model to run on a non-CUDA backend in this tree.** Row:
+`BACKEND-METAL-MLX` (stays `ACTIVE` — correctness is met, speed is a separate
+and unmet bar). Owner: `CLAIM-BACKEND-METAL-M3A-1`.
+
+### 12.1 What was implemented
+
+Five MSL kernels, which is exactly what §3.2 predicted MINUS `kMatmulBT` (that
+landed early with the provider seam, because a seam selecting between providers
+needed a second provider to select). Each transcribes the PER-ELEMENT MATH of our
+own CPU reference — itself the vLLM-parity golden — and takes only its dispatch
+shape from llama.cpp's Metal backend:
+
+| Op | Ported from | Dispatch shape | Bar met |
+|---|---|---|---|
+| `kEmbedding` | `cpu_ops.cpp:531-543` | one thread per output element | **bit-exact** |
+| `kQkvSplit` | `cpu_ops.cpp:1529-1543` | one thread per merged element | **bit-exact** |
+| `kReshapeAndCache` | `cpu_cache.cpp:33-72` | one thread per (token, page element); RAW element copy, not via LoadF32/StoreF32, because upstream is a `memcpy` | **bit-exact**, incl. the `slot < 0` padded-token skip |
+| `kPagedAttention` | `cpu_paged_attn.cpp:51-131` | one THREADGROUP per (query token, q-head), request resolved by an in-kernel scan of `query_start_loc` | **NMSE 4.99e-13** (bar 5e-4) |
+| `kGreedyArgmax` | `cpu_sample.cpp:40-57` | one threadgroup per logits row | **bit-exact** |
+
+**The one algorithmic deviation, stated plainly.** The CPU `PagedAttentionKernel`
+is a three-pass softmax that MATERIALIZES the whole score row. On a GPU that row
+is unbounded, so the Metal kernel is the algebraically identical ONLINE (flash)
+form: keys in chunks of 256 with a running (max, denominator) and a rescaled
+accumulator. Same f32 accumulation, same single rounding on store, DIFFERENT
+reduction order — so the bar is NMSE and **no bit-exactness is claimed for it**.
+The measured 4.99e-13 is eleven orders inside the bar, but that is an
+observation, not a promise.
+
+**Why four of the five ARE bit-exact and that is not a stronger claim than it
+looks:** they perform no floating-point reduction, so a GPU implementation has no
+reordering freedom at all. `kGreedyArgmax` does reduce, but over a max with an
+explicit lowest-index tie-break, which is associative and commutative on the
+(value, index) pair — genuinely order-independent, which is why the tree
+reduction reproduces `torch.argmax`'s first-maximum rule exactly. The test pins
+this with a deliberate two-position tie and an all-equal row.
+
+### 12.2 Seam fixes — the study predicted 4, reality was 3 real + 1 NEW
+
+| # | Study's claim | What was actually found |
+|---|---|---|
+| 1 | `model_loader.cpp` hardcodes `GetBackend(kCUDA)` | **CONFIRMED and fixed.** This was THE single line keeping every non-NVIDIA accelerator on the CPU reference regardless of how complete it was. Now asks `CurrentPlatform()` |
+| 2 | `dense_attn_block.h` host-pointer bug | already fixed 2026-07-22 (§9 item 5) |
+| 3 | `runner.cpp:30` unguarded `vt/cuda/` include is a blocker | **REFUTED BY MEASUREMENT.** The header is declaration-only and both COMPILES and LINKS in a Metal-only macOS build; the call sites are `is_cuda()`-guarded. The study was right that the include is unconditional and wrong that it blocks anything. No change was needed and none was made |
+| 4 | Metal `get_attn_backend_priority()` returns `{}` | **CONFIRMED and fixed** — now `{"FLASH_ATTN"}`, with `FlashAttentionBackend` self-registering for `kMETAL` (a NAME registration only: its host metadata is device-agnostic and the Metal kernels read the same NHD layout). MLA stays unoffered so a `use_mla` request keeps failing loudly |
+| **NEW** | *(not predicted)* | **`runner.cpp:516` gated KV-cache DEVICE RESIDENCY on `is_cuda()`.** On Metal the cache fell into a host `std::vector` and `vt::ReshapeAndCache` was handed a HOST pointer. This is the SAME defect class as item 2 and was invisible to inspection for the same reason: no test can see it until a model runs on a non-NVIDIA device. Fixed to `!is_cpu()` — device residency is a property of HAVING a device, not of the vendor |
+
+**The study's tree-friction counts, re-judged.** The 54 raw `kCUDA` comparisons
+and 13 `is_cuda()` sites are accurate as counts, but they are NOT uniform in
+severity, and OPT-on-Metal needed only **2 of the 13** `is_cuda()` sites changed.
+The rest are legitimate: registrar/priority keys, and CUDA-only fast paths that
+correctly no-op elsewhere. The 5 CUDA includes needed **zero** changes. So the
+honest headline is not "54+13 sites of coupling to unpick" but **"2 of 13
+`is_cuda()` sites encoded 'not NVIDIA means no device memory', and both were real
+bugs"**. No tree-wide unpicking campaign was started, and none is warranted on
+this evidence.
+
+### 12.3 A NEW seam the study did not anticipate: `Platform::supports_model_architecture`
+
+Making `SelectQueue` platform-aware exposed a question that could not arise while
+only CPU and CUDA existed: **"which device is this process running on" is not the
+same question as "which device can run THIS model".** CUDA is 74/75 ops, so the
+two questions had the same answer for its whole life. Metal is 15/75, and
+pointing a Qwen3-dense engine at it produced a late, obscure failure inside a
+kernel bind rather than a clean fall-back.
+
+The fix is a `Platform` virtual defaulting to `true` — so CUDA and CPU are
+byte-unchanged — which a PARTIAL backend overrides with the architectures whose
+ops it has actually registered. Metal's list is exactly `{"OPTForCausalLM"}` and
+shrinks to nothing as kernels land. This is the "a partial backend is a
+supported, tested state" contract (`ops.cpp:104-111`) lifted one layer up, and it
+is keyed on the architecture string rather than an OpId manifest deliberately: a
+manifest would have to track every forward and would fail in exactly the silent
+way this prevents.
+
+**This was caught by the macOS regression suite, not by design** — three
+previously-green tests went red the moment `SelectQueue` started selecting Metal.
+Recorded as such rather than presented as foresight.
+
+### 12.4 Evidence
+
+* **Correctness:** `test_opt_paged_engine` on the M4 — **6/6 prompts token-exact,
+  96/96 tokens**, against the committed dgx-captured vLLM 0.25.0 goldens
+  (md5-verified identical before and after the run). The gate-selection evidence
+  (vLLM self-determinism, 0 multi-valued cells over K=5) is re-asserted in the
+  same test, so the STRICT bar remains the derived bar and not an assumption.
+* **The Metal path PROVABLY executed.** A green token comparison does not say
+  which device ran — every backend computes the same function. The test asserts
+  `runner().device().type == kMETAL` and, for all NINE ops OPT dispatches,
+  `selections > 0` AND `declines == 0` (`kPagedAttention` selections = **1152**).
+  `last_selected` alone would NOT be sufficient: a provider can be selected and
+  then decline INSIDE its kernel and forward down (fan-out spike Risk 4). The
+  per-op unit tests additionally NaN-POISON every output buffer, so a kernel that
+  never ran cannot pass a numeric check by accident.
+* **Per-op vs the CPU oracle on the same M4:** the four layout/selection ops
+  bit-exact; `kPagedAttention` NMSE 4.99e-13.
+* **Suites:** macOS `-Werror` 0 warnings on a CLEAN full rebuild (AppleClang 21,
+  CLT-only, no offline `metal`); `test_metal_backend` **12 cases / 18,535
+  assertions**; full macOS ctest **154/156**, the two misses being the documented
+  pre-existing platform gaps (`test_serve_low_tools`, `test_safetensors` —
+  Linux-only `sched_getaffinity` and `/proc/self/smaps`). `test_capi` was
+  separately observed failing STANDALONE on macOS and was proven PRE-EXISTING by
+  building unmodified `origin/main` on the same box and reproducing the identical
+  `CHECK(1 == 2)`; it passes under ctest.
+
+### 12.5 What is NOT claimed
+
+**No Metal speed number, and none is owed.** The M4 could not be quieted (the
+root `com.localai.worker` LaunchDaemon needs interactive sudo; the desktop aerial
+wallpaper is the larger contender at 8.2% CPU), so any timing would be void under
+the standing contended-run rule. Correctness and speed are separate bars and only
+correctness is met. `BACKEND-GATE-METAL-MLXLM` therefore stays `INVENTORIED`: it
+binds on Qwen3-dense (`M3b`), the model MLX also runs, because the arms must be
+comparable.
+
+Dispatch is still one command buffer per op with commit+wait (`M3c` is the
+batched-encoder work), the GEMM is a plain threadgroup-tiled loop with no
+simdgroup matrix use, and nothing here should be read as a performance result.

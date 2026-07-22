@@ -199,6 +199,17 @@ const AttentionBackendRegistrar kFlashAttnCuda{vt::DeviceType::kCUDA,
 const AttentionBackendRegistrar kFlashAttnCpu{vt::DeviceType::kCPU,
                                               FlashAttentionBackend::kName,
                                               MakeFlashAttentionBackend};
+// ...and kMETAL (BACKEND-METAL-MLX work row M3a). The Metal kPagedAttention /
+// kReshapeAndCache kernels (src/vt/metal/metal_ops.mm) read and write the SAME
+// NHD (num_blocks, 2, block_size, num_kv_heads, head_size) layout
+// get_kv_cache_shape allocates, so this is a NAME registration only — not one
+// line of the backend's host metadata is device-specific. Registering here
+// rather than in a Metal-gated TU is deliberate and matches the CUDA/CPU rows:
+// the shape/metadata logic is device-agnostic, and MetalPlatform::
+// get_attn_backend_priority is what decides whether the name is ever reached.
+const AttentionBackendRegistrar kFlashAttnMetal{vt::DeviceType::kMETAL,
+                                                FlashAttentionBackend::kName,
+                                                MakeFlashAttentionBackend};
 }  // namespace
 
 }  // namespace vllm::v1

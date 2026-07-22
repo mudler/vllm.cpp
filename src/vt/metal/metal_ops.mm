@@ -3,21 +3,26 @@
 // skeleton. Self-registering TU, copying the `src/vt/cpu/cpu_ops.cpp` Registrar
 // idiom exactly, so adding this backend edited NO existing kernel file.
 //
-// WHAT THIS TU COVERS (deliberately a SEAM PROOF, not a model):
-//   kAdd, kRelu, kSiluAndMul, kCastBf16, kCastF32, kLayerNorm, kRmsNorm, the
-//   dense GEMM pair kMatmul/kMatmulBT, and the single kFusedChain registration
-//   that inherits the portable fusion catalog.
-// That set spans every structural class the seam has to get right: flat
-// elementwise, a rank-1 broadcast, a dtype-converting copy, TWO different row
-// reductions, an optional in-place residual stream, and the recipe interpreter.
+// WHAT THIS TU COVERS.
+//   W0 seam proof: kAdd, kRelu, kSiluAndMul, kCastBf16, kCastF32, kLayerNorm,
+//   kRmsNorm, the dense GEMM pair kMatmul/kMatmulBT, and the single kFusedChain
+//   registration that inherits the portable fusion catalog. That set spans every
+//   structural class the seam has to get right: flat elementwise, a rank-1
+//   broadcast, a dtype-converting copy, TWO different row reductions, an optional
+//   in-place residual stream, and the recipe interpreter.
+//   M3a (THE FIRST MODEL): kEmbedding, kQkvSplit, kReshapeAndCache,
+//   kPagedAttention, kGreedyArgmax — exactly the five ops OPT-125m
+//   (`OPTForCausalLM`) needs beyond the W0 set, and no more. With these,
+//   src/vllm/model_executor/models/opt.cpp runs END TO END on Apple GPU through
+//   the ordinary engine stack. NOTE kPagedAttention is OURS regardless of MLX:
+//   MLX has no paged-KV attention primitive at all
+//   (.agents/specs/metal-mlx-reuse-study.md §5.3).
 //
-// WHAT IS STILL STUBBED: everything else. `kPagedAttention`,
-// `kReshapeAndCache`, the whole quant tier and the sampler ops are NOT
-// registered, so `vt::GetOp` throws its normal "no kernel for op N on device
-// type 2" for them (a partial backend is a supported, tested state). No model
-// runs on this backend. NOTE `kPagedAttention` stays OURS regardless of MLX:
-// MLX has no paged-KV attention primitive at all
-// (.agents/specs/metal-mlx-reuse-study.md §5.3).
+// WHAT IS STILL STUBBED: everything else — the whole quant tier, the GDN/MoE/MLA
+// families, RoPE, and every sampler op except greedy argmax. `vt::GetOp` throws
+// its normal "no kernel for op N on device type 2" for them (a partial backend is
+// a supported, tested state). Qwen3-dense needs kRopeCosSinCache + kRopeFromCache
+// on top of this set (work row M3b).
 //
 // DISPATCH MODEL: one command buffer per op, committed and waited. See
 // metal_backend.mm § SCOPE for why, and what it costs.
@@ -58,11 +63,36 @@ struct LayerNormParams {
   float eps;
 };
 struct GemmParams { uint32_t m, n, k, lda, a_dt, b_dt, out_dt, bt; };
+struct EmbedParams { uint32_t rows, h, vocab, id_i64, tab_dt, out_dt; };
+struct QkvSplitParams { uint32_t t, q_dim, k_dim, v_dim, in_dt, q_dt, k_dt, v_dt; };
+// MSL `ulong` is 8-byte with 8-byte alignment, exactly like uint64_t here. Both
+// structs below put ALL 8-byte members FIRST and then an even number of 4-byte
+// members, so neither side can insert interior padding and the layouts coincide
+// by construction rather than by coincidence (the static_asserts below pin it).
+struct CacheParams {
+  uint64_t k_blk_stride, k_pg_stride, v_blk_stride, v_pg_stride, k_tok_stride, v_tok_stride;
+  uint32_t num_slots, n_elems, block_size, esz;
+};
+struct PagedAttnParams {
+  uint64_t kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd;
+  uint32_t num_reqs, hq, d, qpk, block_size, causal, tg;
+  int32_t window_left, window_right, bt_row, bt_col;
+  uint32_t q_dt, kc_dt, vc_dt, out_dt;
+  float scale;
+};
+struct ArgmaxParams { uint32_t n, v, tg; };
 struct FStepGpu { uint32_t op, out, in0, in1, gemma, pad; };
 struct FcParams { uint32_t t, h, nsteps, x_dt, w_dt, res_dt, out_dt, tg; float eps; };
 
 static_assert(sizeof(ElemParams) == 24, "ElemParams layout must match the MSL struct");
 static_assert(sizeof(FStepGpu) == 24, "FStepGpu layout must match the MSL struct");
+static_assert(sizeof(CacheParams) == 64, "CacheParams layout must match the MSL struct");
+// 6 x 8B + 16 x 4B = 112, with no trailing pad: the 4-byte member COUNT is even,
+// which is what keeps the 8-byte alignment satisfied without either side
+// inventing padding the other does not have.
+static_assert(sizeof(PagedAttnParams) == 112, "PagedAttnParams layout must match the MSL struct");
+static_assert(offsetof(PagedAttnParams, num_reqs) == 48, "PagedAttnParams: no interior padding");
+static_assert(offsetof(CacheParams, num_slots) == 48, "CacheParams: no interior padding");
 
 // A small RAII-ish encode helper: opens a command buffer + compute encoder for
 // `fn_name`, lets the caller bind, then dispatches and BLOCKS.
@@ -123,6 +153,16 @@ class Encoder {
   void DispatchRows(int64_t rows, uint32_t tg) {
     if (rows <= 0) { Finish(); return; }
     [enc_ dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(rows), 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    Finish();
+  }
+  // 2-D threadgroup grid: EXACTLY (gx, gy) threadgroups of `tg` threads each,
+  // with no tiling arithmetic — the paged-attention shape, where one threadgroup
+  // owns one (q-head, query token) pair and cooperatively reduces over keys.
+  void DispatchGrid2D(int64_t gx, int64_t gy, uint32_t tg) {
+    if (gx <= 0 || gy <= 0) { Finish(); return; }
+    [enc_ dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(gx),
+                                           static_cast<NSUInteger>(gy), 1)
          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     Finish();
   }
@@ -364,6 +404,137 @@ void FusedChainKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight
   e.DispatchRows(t, tg);
 }
 
+// ---------------------------------------------------------------------------
+// M3a — the five ops OPT-125m needs beyond the W0 set.
+// ---------------------------------------------------------------------------
+
+// cpu_ops.cpp:531-543 EmbeddingKernel.
+void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
+  const int64_t rows = ids.shape[0], h = table.shape[1], vocab = table.shape[0];
+  VT_CHECK(ids.dtype == DType::kI32 || ids.dtype == DType::kI64,
+           "metal embedding: ids must be i32 or i64");
+  EmbedParams p{static_cast<uint32_t>(rows),
+                static_cast<uint32_t>(h),
+                static_cast<uint32_t>(vocab),
+                ids.dtype == DType::kI64 ? 1u : 0u,
+                DtypeCode(table.dtype),
+                DtypeCode(out.dtype)};
+  Encoder e("vt_embedding");
+  e.BindTensor(table, 0, "embedding: table");
+  e.BindTensor(ids, 1, "embedding: ids");
+  e.BindTensor(out, 2, "embedding: out");
+  e.BindBytes(&p, sizeof(p), 3);
+  e.DispatchFlat(rows * h);
+}
+
+// cpu_ops.cpp:1529-1543 QkvSplitKernel.
+void QkvSplitKernel(Queue&, Tensor& q_out, Tensor& k_out, Tensor& v_out, const Tensor& qkv) {
+  const int64_t t = qkv.shape[0];
+  VT_CHECK(t > 0, "metal qkv_split: empty batch");
+  const int64_t q_dim = q_out.Numel() / t, k_dim = k_out.Numel() / t, v_dim = v_out.Numel() / t;
+  QkvSplitParams p{static_cast<uint32_t>(t),   static_cast<uint32_t>(q_dim),
+                   static_cast<uint32_t>(k_dim), static_cast<uint32_t>(v_dim),
+                   DtypeCode(qkv.dtype),       DtypeCode(q_out.dtype),
+                   DtypeCode(k_out.dtype),     DtypeCode(v_out.dtype)};
+  Encoder e("vt_qkv_split");
+  e.BindTensor(qkv, 0, "qkv_split: qkv");
+  e.BindTensor(q_out, 1, "qkv_split: q");
+  e.BindTensor(k_out, 2, "qkv_split: k");
+  e.BindTensor(v_out, 3, "qkv_split: v");
+  e.BindBytes(&p, sizeof(p), 4);
+  e.DispatchFlat(t * (q_dim + k_dim + v_dim));
+}
+
+// cpu_cache.cpp:33-72 ReshapeAndCacheKernel. Raw-element copy => BIT-EXACT.
+void ReshapeAndCacheKernel(Queue&, const Tensor& k, const Tensor& v, Tensor& k_cache,
+                           Tensor& v_cache, const Tensor& slot_mapping) {
+  const int64_t num_slots = slot_mapping.shape[0];
+  const int64_t block_size = k_cache.shape[1];
+  const int64_t n_elems = k_cache.shape[2] * k_cache.shape[3];  // one NHD page
+  const size_t esz = SizeOf(k.dtype);
+  VT_CHECK(esz == 2 || esz == 4, "metal reshape_and_cache: 2- or 4-byte elements only");
+  VT_CHECK(SizeOf(k_cache.dtype) == esz && SizeOf(v.dtype) == esz &&
+               SizeOf(v_cache.dtype) == esz,
+           "metal reshape_and_cache: k/v and their caches must share an element width");
+  CacheParams p{static_cast<uint64_t>(k_cache.stride[0]),
+                static_cast<uint64_t>(k_cache.stride[1]),
+                static_cast<uint64_t>(v_cache.stride[0]),
+                static_cast<uint64_t>(v_cache.stride[1]),
+                static_cast<uint64_t>(k.stride[0]),
+                static_cast<uint64_t>(v.stride[0]),
+                static_cast<uint32_t>(num_slots),
+                static_cast<uint32_t>(n_elems),
+                static_cast<uint32_t>(block_size),
+                static_cast<uint32_t>(esz)};
+  Encoder e("vt_reshape_and_cache");
+  e.BindTensor(k, 0, "reshape_and_cache: k");
+  e.BindTensor(v, 1, "reshape_and_cache: v");
+  e.BindTensor(k_cache, 2, "reshape_and_cache: k_cache");
+  e.BindTensor(v_cache, 3, "reshape_and_cache: v_cache");
+  e.BindTensor(slot_mapping, 4, "reshape_and_cache: slot_mapping");
+  e.BindBytes(&p, sizeof(p), 5);
+  e.DispatchFlat(num_slots * n_elems);
+}
+
+// cpu_paged_attn.cpp:51-131 PagedAttentionKernel, in the algebraically identical
+// ONLINE-softmax form (see metal_msl.h vt_paged_attention).
+void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& k_cache,
+                          const Tensor& v_cache, const Tensor& block_table,
+                          const Tensor& seq_lens, const Tensor& query_start_loc,
+                          const PagedAttentionArgs& args) {
+  const int64_t num_reqs = seq_lens.shape[0];
+  const int64_t tq = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t num_kv_heads = k_cache.shape[2];
+  // The shader's threadgroup accumulator is a fixed VT_PA_MAXD-wide array; an
+  // over-wide head must be a loud vt:: error, never a silent truncation.
+  VT_CHECK(d <= 256, "metal paged_attention: head_size > 256 is not implemented "
+                     "(the threadgroup accumulator is VT_PA_MAXD wide)");
+  VT_CHECK(num_kv_heads > 0 && hq % num_kv_heads == 0,
+           "metal paged_attention: q-heads must be a multiple of kv-heads");
+  const uint32_t tg =
+      ChooseThreadgroupSize(d, MetalContext::Get().PipelineMaxThreads("vt_paged_attention"));
+  PagedAttnParams p{
+      static_cast<uint64_t>(k_cache.stride[0]), static_cast<uint64_t>(k_cache.stride[1]),
+      static_cast<uint64_t>(k_cache.stride[2]), static_cast<uint64_t>(v_cache.stride[0]),
+      static_cast<uint64_t>(v_cache.stride[1]), static_cast<uint64_t>(v_cache.stride[2]),
+      static_cast<uint32_t>(num_reqs),          static_cast<uint32_t>(hq),
+      static_cast<uint32_t>(d),                 static_cast<uint32_t>(hq / num_kv_heads),
+      static_cast<uint32_t>(k_cache.shape[1]),  args.causal ? 1u : 0u,
+      tg,
+      args.window_size.has_value() ? static_cast<int32_t>(args.window_size->left) : -1,
+      args.window_size.has_value() ? static_cast<int32_t>(args.window_size->right) : -1,
+      static_cast<int32_t>(block_table.stride[0]),
+      static_cast<int32_t>(block_table.stride[1]),
+      DtypeCode(query.dtype),                   DtypeCode(k_cache.dtype),
+      DtypeCode(v_cache.dtype),                 DtypeCode(out.dtype),
+      args.scale};
+  Encoder e("vt_paged_attention");
+  e.BindTensor(query, 0, "paged_attention: query");
+  e.BindTensor(k_cache, 1, "paged_attention: k_cache");
+  e.BindTensor(v_cache, 2, "paged_attention: v_cache");
+  e.BindTensor(block_table, 3, "paged_attention: block_table");
+  e.BindTensor(seq_lens, 4, "paged_attention: seq_lens");
+  e.BindTensor(query_start_loc, 5, "paged_attention: query_start_loc");
+  e.BindTensor(out, 6, "paged_attention: out");
+  e.BindBytes(&p, sizeof(p), 7);
+  // One threadgroup per (q-head, query token). Both extents are FULL
+  // threadgroups, so dispatchThreadgroups (not dispatchThreads).
+  e.DispatchGrid2D(hq, tq, tg);
+}
+
+// cpu_sample.cpp:40-57 GreedyArgmaxKernel — one threadgroup per logits row.
+void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  const uint32_t tg =
+      ChooseThreadgroupSize(v, MetalContext::Get().PipelineMaxThreads("vt_greedy_argmax"));
+  ArgmaxParams p{static_cast<uint32_t>(n), static_cast<uint32_t>(v), tg};
+  Encoder e("vt_greedy_argmax");
+  e.BindTensor(logits, 0, "greedy_argmax: logits");
+  e.BindTensor(token_ids, 1, "greedy_argmax: token_ids");
+  e.BindBytes(&p, sizeof(p), 2);
+  e.DispatchRows(n, tg);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Metal-enabled build on a device-less
@@ -391,6 +562,17 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kFusedChain, DeviceType::kMETAL,
                reinterpret_cast<void*>(static_cast<FusedChainFn>(&FusedChainKernel)));
+    // --- M3a: the OPT-125m set.
+    RegisterOp(OpId::kEmbedding, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
+    RegisterOp(OpId::kQkvSplit, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
+    RegisterOp(OpId::kReshapeAndCache, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
+    RegisterOp(OpId::kPagedAttention, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<PagedAttentionFn>(&PagedAttentionKernel)));
+    RegisterOp(OpId::kGreedyArgmax, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<GreedyArgmaxFn>(&GreedyArgmaxKernel)));
   }
 } registrar;
 

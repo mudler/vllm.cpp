@@ -11,11 +11,13 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
 #include "vt/dtype.h"
 #include "vt/tensor.h"
 #if defined(VLLM_CPP_CUDA) && defined(VT_CUTLASS_NVFP4)
@@ -28,19 +30,39 @@ namespace fs = std::filesystem;
 
 namespace {
 
-vt::Queue SelectQueue() {
-  // M2.2b: run the engine forward on the CUDA device when the backend is
-  // available (GB10), so the fp4-resident MoE/lm_head weights hit vt::MatmulNvfp4
-  // on-device instead of the CPU dequant reference. Falls back to the reference
-  // CPU backend when built without CUDA or when no usable GPU is present at
-  // runtime (GetBackend(kCUDA) throws if the probe left it unregistered).
-#ifdef VLLM_CPP_CUDA
+// `architecture` is the model's registered architecture string. It is what lets
+// a PARTIAL backend decline a model whose kernels it has not registered, instead
+// of being selected and then failing deep inside a kernel bind. Empty means "no
+// model resolved yet", which is treated as no constraint.
+vt::Queue SelectQueue(std::string_view architecture) {
+  // M2.2b: run the engine forward on the ACCELERATOR when one is available, so
+  // (on CUDA/GB10) the fp4-resident MoE/lm_head weights hit vt::MatmulNvfp4
+  // on-device instead of the CPU dequant reference.
+  //
+  // W0b-1 item 1 (.agents/specs/metal-mlx-reuse-study.md §3.3), closed by work
+  // row M3a: this hardcoded `GetBackend(kCUDA)`, which made the engine CPU-only
+  // on every non-NVIDIA accelerator no matter how complete that backend was —
+  // the single line that stood between the Metal backend and running a model.
+  // It now asks the PLATFORM seam, which is the tree's own answer to "which
+  // device is this process running on": CurrentPlatform() walks
+  // {kCUDA, kXPU, kVULKAN, kMETAL, kCPU} and returns the first whose backend
+  // actually probed a device (src/vllm/platforms/platform.cpp:38-40), so on a
+  // CUDA box this selects EXACTLY the queue the old code did, byte for byte,
+  // and on the M4 it selects Metal. The try/catch stays: a platform can be
+  // registered while CreateQueue still fails, and CPU must remain reachable.
   try {
-    return vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue();
+    const vllm::platforms::Platform& plat = vllm::platforms::CurrentPlatform();
+    const vt::DeviceType dev = plat.device_type();
+    // A PARTIAL backend (Metal today: 15 of 75 ops) must be able to decline a
+    // model whose kernels it has not registered. The default answer is `true`,
+    // so CUDA and CPU selection is byte-unchanged.
+    if (dev != vt::DeviceType::kCPU &&
+        (architecture.empty() || plat.supports_model_architecture(architecture))) {
+      return vt::GetBackend(dev).CreateQueue();
+    }
   } catch (const std::exception&) {
-    // No usable GPU; fall through to CPU.
+    // No usable accelerator; fall through to CPU.
   }
-#endif
   return vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 }
 
@@ -222,7 +244,9 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // runner_ FIRST (W3): the async-scheduling flip reads
       // runner_.runner_supports_async().
       runner_(config_, *model_, kv_cfg_,
-              preselected_queue != nullptr ? *preselected_queue : SelectQueue(),
+              preselected_queue != nullptr
+                  ? *preselected_queue
+                  : SelectQueue(model_->registration().architecture),
               /*max_num_reqs=*/params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_model_len_,
               /*max_num_batched_tokens=*/max_num_batched_tokens_),
@@ -392,7 +416,7 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   // Select before loading so an eligible discrete-CUDA dense loader stages each
   // completed layer to the exact queue the runner will use. If construction
   // fails before the runner takes over, destroy the selected native stream.
-  vt::Queue load_queue = SelectQueue();
+  vt::Queue load_queue = SelectQueue(registration.architecture);
   try {
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(
         config, ModelSource::FromSafetensorsOwned(shards, &load_queue));

@@ -284,6 +284,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_layernorm.cpp
   src/vt/cpu/cpu_cache.cpp
   src/vt/cpu/cpu_mla_attn.cpp
+  src/vt/cpu/cpu_mla_prefill.cpp
   src/vt/cpu/cpu_paged_attn.cpp
   src/vt/cpu/cpu_sample.cpp)
 add_library(vllm::vllm ALIAS vllm)
@@ -319,6 +320,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_layernorm.cu
     src/vt/cuda/cuda_cache.cu
     src/vt/cuda/cuda_mla_attn.cu
+    src/vt/cuda/cuda_mla_prefill.cu
     src/vt/cuda/cuda_paged_attn.cu
     src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu)
@@ -654,7 +656,14 @@ if(VLLM_CPP_CUDA)
       # flash_attn_varlen_func runs for Qwen3-dense DECODE (paged KV forces the
       # split kernel even at num_splits==1). MODEL-TEXT-qwen3 strict bit-match.
       src/vt/cuda/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu
-      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu)
+      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu
+      # d192 bf16 split-KV (MLA campaign W5): the MLA PREFILL QK head dim
+      # (qk_nope 128 + qk_rope 64). V is zero-padded 128 -> 192 exactly as
+      # upstream does (mla/prefill/flash_attn.py:164-168), so the kernel stays a
+      # symmetric instantiation of the SAME generic template — no template edit,
+      # hence the d128/d256 kernels the 27B/35B/dense paths call are unchanged.
+      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim192_bf16_causal_sm80.cu
+      src/vt/cuda/flash_attn/src/flash_fwd_split_hdim192_bf16_sm80.cu)
     target_sources(vllm PRIVATE
       src/vt/cuda/cuda_flash_attn_fa2.cu
       ${_FA2_KERNEL_SRCS})

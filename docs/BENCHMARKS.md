@@ -1414,7 +1414,7 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   output throughput, req/s, TTFT, TPOT/ITL, peak memory) at c1/c2/c4/c8, with
   token-exact correctness as a precondition that may never be traded off.
 
-- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W4 (2026-07-22,
+- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W5 (2026-07-22,
   `CLAIM-MLA-DEEPSEEK`,
   [spike](../.agents/specs/mla-deepseek-campaign.md)).**
   `benchmark_binding=false`; **NOT APPLICABLE.** W0 ran the vLLM oracle on
@@ -1459,6 +1459,26 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   the **FlashInfer CUTLASS** backend, not Triton `fused_moe`, so the "our grouped
   MoE GEMM runs ~1.2x vLLM's Triton `fused_moe`" figure from the 35B work does NOT
   transfer to this model's speed denominator and must be re-measured.
+  **W5 is NOT APPLICABLE for the same structural reason, PLUS one additional
+  claim that DOES have to be proved rather than argued.** `vt::MlaPrefillAttention`,
+  `vt::GatherMlaCache` and `vt::MergeAttnStates` are new `OpId`s with **no caller
+  in any model TU** (only their unit tests and the W6-pending MLA block), and the
+  chunked-context driver is a header nothing yet includes outside its test — so no
+  existing hot path moved. **The claim that needed proof is the FA-2 launcher
+  generalization**, because that TU is SHARED with the 27B / 35B / Qwen3-dense
+  prefill paths. It was proved two ways, not assumed: STRUCTURALLY — the diff of
+  `src/vt/cuda/cuda_flash_attn_fa2.cu` is **211 insertions / 0 deletions**, the
+  paged launcher `LaunchPrefillFA2Bf16` those models call is textually untouched,
+  and the vendored FA-2 tree gains only two NEW files that instantiate the
+  UNCHANGED generic `run_mha_fwd_splitkv_dispatch<bf16, 192, ...>` template at one
+  more head dim; and EMPIRICALLY — 27B **235/235**, 35B **315/315**, Qwen3-Coder
+  **138/138**, Qwen3-dense **664/664**, OPT **36/36** all token-exact UNCHANGED.
+  **NO SPEED NUMBER IS CLAIMED FOR MLA PREFILL, and none is owed yet.** The V
+  zero-pad allocates and writes a 192-wide staging copy of V (upstream does the
+  same `torch.nn.functional.pad`), `vt::MergeAttnStates` is scalar rather than
+  upstream's 128-bit-packed form, and the chunk grid is upstream's equal-share
+  heuristic rather than a measured one — all three are deliberate
+  correctness-first choices and all three are **W9** levers. `benchmark_binding=false`.
   **Integration fix folded in (`888fbcc`), also NOT APPLICABLE:** OPT-125m's KV
   factory published a decorative `float32` spec dtype that was inert before the
   W1 refactor and would have allocated an f32 KV cache after it. Corrected to the

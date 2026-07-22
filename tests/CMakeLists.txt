@@ -305,6 +305,10 @@ vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.
 vllm_cpp_add_test(test_ops_mla_attn vt/test_ops_mla_attn.cpp)
+# MLA campaign W5: the FLASH_ATTN MLA prefill (QK 192 / V 128) ...
+vllm_cpp_add_test(test_ops_mla_prefill vt/test_ops_mla_prefill.cpp)
+# ... and the workspace-bounded chunked-context loop (gather + LSE merge).
+vllm_cpp_add_test(test_ops_mla_chunked_context vt/test_ops_mla_chunked_context.cpp)
 vllm_cpp_add_test(test_ops_moe_router_grouped vt/test_ops_moe_router_grouped.cpp)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)

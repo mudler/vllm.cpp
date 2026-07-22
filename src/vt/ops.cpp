@@ -1867,6 +1867,174 @@ void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
       q, out, lse, query, kv_cache, block_table, seq_lens, args);
 }
 
+void MlaPrefillAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
+                         const Tensor& key, const Tensor& value, const Tensor& cu_seqlens_q,
+                         const Tensor& cu_seqlens_k, const MlaPrefillAttentionArgs& args) {
+  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
+           "mla_prefill_attention: query/key/value/out must be rank-3 "
+           "[total_q|total_k, num_heads, head_dim]");
+  VT_CHECK(cu_seqlens_q.rank == 1 && cu_seqlens_k.rank == 1,
+           "mla_prefill_attention: cu_seqlens_q/cu_seqlens_k must be rank-1 [num_reqs+1]");
+  const int64_t total_q = query.shape[0];
+  const int64_t total_k = key.shape[0];
+  const int64_t num_heads = query.shape[1];
+  const int64_t qk_head_dim = query.shape[2];
+  const int64_t v_head_dim = value.shape[2];
+  VT_CHECK(num_heads > 0 && qk_head_dim > 0 && v_head_dim > 0,
+           "mla_prefill_attention: num_heads/qk_head_dim/v_head_dim must be > 0");
+  VT_CHECK(key.shape[1] == num_heads && value.shape[1] == num_heads,
+           "mla_prefill_attention: key/value must carry the SAME head count as query "
+           "(MLA prefill is multi-head on both sides — the latent is up-projected; "
+           "mla_attention.py:315-318)");
+  VT_CHECK(key.shape[2] == qk_head_dim,
+           "mla_prefill_attention: key head_dim must equal query head_dim "
+           "(qk_nope_head_dim + qk_rope_head_dim)");
+  VT_CHECK(value.shape[0] == total_k,
+           "mla_prefill_attention: key and value must share total_k");
+  VT_CHECK(out.shape[0] == total_q && out.shape[1] == num_heads && out.shape[2] == v_head_dim,
+           "mla_prefill_attention: out must be [total_q, num_heads, v_head_dim]");
+  // Upstream pads V UP to the QK width (flash_attn.py:164-168), so V may never
+  // be WIDER than QK. For DeepSeek v_head_dim 128 <= qk_head_dim 192.
+  VT_CHECK(v_head_dim <= qk_head_dim,
+           "mla_prefill_attention: v_head_dim must be <= qk_head_dim (upstream ZERO-PADS "
+           "V up to the QK width, flash_attn.py:164-168)");
+  VT_CHECK(cu_seqlens_q.shape[0] >= 2 && cu_seqlens_q.shape[0] == cu_seqlens_k.shape[0],
+           "mla_prefill_attention: cu_seqlens_q/cu_seqlens_k must both be [num_reqs+1]");
+  VT_CHECK(cu_seqlens_q.dtype == DType::kI32 && cu_seqlens_k.dtype == DType::kI32,
+           "mla_prefill_attention: cu_seqlens_q/cu_seqlens_k must be i32");
+  VT_CHECK(cu_seqlens_q.IsContiguous() && cu_seqlens_k.IsContiguous(),
+           "mla_prefill_attention: cu_seqlens_q/cu_seqlens_k must be contiguous");
+  VT_CHECK(IsFloat(query.dtype) && key.dtype == query.dtype && value.dtype == query.dtype &&
+               out.dtype == query.dtype,
+           "mla_prefill_attention: query/key/value/out must share one float dtype "
+           "(the fp8-prefill branch needs device-capability family 100 and is "
+           "UNREACHABLE on sm_121 — mla_attention.py:1382-1385)");
+  VT_CHECK(args.scale > 0.0f, "mla_prefill_attention: args.scale must be > 0");
+  VT_CHECK(args.max_seqlen_q >= 0 && args.max_seqlen_k >= 0,
+           "mla_prefill_attention: args.max_seqlen_q/max_seqlen_k must be >= 0");
+  // Stride-driven on the token/head axes (a workspace slice is a strided view);
+  // the innermost head_dim must be packed.
+  VT_CHECK(query.stride[2] == 1 && key.stride[2] == 1 && value.stride[2] == 1 &&
+               out.stride[2] == 1,
+           "mla_prefill_attention: query/key/value/out innermost stride must be 1");
+  if (lse != nullptr) {
+    // UNPADDED varlen LSE, upstream's [num_heads, total_q] layout.
+    VT_CHECK(lse->rank == 2 && lse->shape[0] == num_heads && lse->shape[1] == total_q,
+             "mla_prefill_attention: lse must be rank-2 [num_heads, total_q] (upstream's "
+             "unpadded varlen LSE layout)");
+    VT_CHECK(lse->dtype == DType::kF32, "mla_prefill_attention: lse must be f32");
+    VT_CHECK(lse->stride[1] == 1, "mla_prefill_attention: lse innermost stride must be 1");
+    VT_CHECK(lse->device == q.device, "mla_prefill_attention: lse device mismatch");
+  }
+  VT_CHECK(out.device == q.device && query.device == q.device && key.device == q.device &&
+               value.device == q.device && cu_seqlens_q.device == q.device &&
+               cu_seqlens_k.device == q.device,
+           "mla_prefill_attention: device mismatch "
+           "(out/query/key/value/cu_seqlens_q/cu_seqlens_k/queue)");
+  reinterpret_cast<MlaPrefillAttentionFn>(GetOp(OpId::kMlaPrefillAttention, q.device.type))(
+      q, out, lse, query, key, value, cu_seqlens_q, cu_seqlens_k, args);
+}
+
+void GatherMlaCache(Queue& q, Tensor& dst, const Tensor& src_cache, const Tensor& block_table,
+                    const Tensor& cu_seq_lens, const Tensor& token_to_seq,
+                    const Tensor* seq_starts, int64_t num_tokens) {
+  VT_CHECK(dst.rank == 2, "gather_mla_cache: dst must be rank-2 [tot_tokens, head_dim]");
+  VT_CHECK(src_cache.rank == 3,
+           "gather_mla_cache: src_cache must be rank-3 [num_blocks, block_size, head_dim] "
+           "— the 3-D MLA cache (mla_attention.py:1216-1224)");
+  VT_CHECK(block_table.rank == 2, "gather_mla_cache: block_table rank-2 [batch, max_blocks]");
+  VT_CHECK(cu_seq_lens.rank == 1, "gather_mla_cache: cu_seq_lens rank-1 [batch+1]");
+  VT_CHECK(token_to_seq.rank == 1, "gather_mla_cache: token_to_seq rank-1 [max_tokens]");
+  const int64_t batch = block_table.shape[0];
+  const int64_t head_dim = src_cache.shape[2];
+  VT_CHECK(batch > 0 && head_dim > 0, "gather_mla_cache: batch/head_dim must be > 0");
+  VT_CHECK(dst.shape[1] == head_dim,
+           "gather_mla_cache: dst entry width must equal the cache entry width");
+  VT_CHECK(cu_seq_lens.shape[0] == batch + 1,
+           "gather_mla_cache: cu_seq_lens must be [batch+1]");
+  VT_CHECK(num_tokens >= 0, "gather_mla_cache: num_tokens must be >= 0");
+  VT_CHECK(dst.shape[0] >= num_tokens, "gather_mla_cache: dst must hold num_tokens rows");
+  VT_CHECK(token_to_seq.shape[0] >= num_tokens,
+           "gather_mla_cache: token_to_seq must hold num_tokens entries");
+  VT_CHECK(src_cache.shape[1] > 0, "gather_mla_cache: block_size must be > 0");
+  VT_CHECK(block_table.dtype == DType::kI32 && cu_seq_lens.dtype == DType::kI32 &&
+               token_to_seq.dtype == DType::kI32,
+           "gather_mla_cache: block_table/cu_seq_lens/token_to_seq must be i32");
+  // The auto path only — the fp8 dequant branch (cache_kernels.cu:1039-1047) is
+  // out of campaign scope, exactly as the W3 cache write refuses fp8_ds_mla.
+  VT_CHECK(IsFloat(dst.dtype) && src_cache.dtype == dst.dtype,
+           "gather_mla_cache: dst/src_cache must share one float dtype (the auto path; "
+           "the fp8 dequant branch is out of scope)");
+  VT_CHECK(dst.stride[1] == 1 && src_cache.stride[2] == 1,
+           "gather_mla_cache: dst/src_cache innermost stride must be 1");
+  VT_CHECK(block_table.stride[1] == 1 && cu_seq_lens.IsContiguous() &&
+               token_to_seq.IsContiguous(),
+           "gather_mla_cache: block_table rows / cu_seq_lens / token_to_seq must be contiguous");
+  VT_CHECK(dst.device == q.device && src_cache.device == q.device &&
+               block_table.device == q.device && cu_seq_lens.device == q.device &&
+               token_to_seq.device == q.device,
+           "gather_mla_cache: device mismatch");
+  if (seq_starts != nullptr) {
+    VT_CHECK(seq_starts->rank == 1 && seq_starts->shape[0] == batch,
+             "gather_mla_cache: seq_starts must be rank-1 [batch]");
+    VT_CHECK(seq_starts->dtype == DType::kI32, "gather_mla_cache: seq_starts must be i32");
+    VT_CHECK(seq_starts->IsContiguous(), "gather_mla_cache: seq_starts must be contiguous");
+    VT_CHECK(seq_starts->device == q.device, "gather_mla_cache: seq_starts device mismatch");
+  }
+  reinterpret_cast<GatherMlaCacheFn>(GetOp(OpId::kGatherMlaCache, q.device.type))(
+      q, dst, src_cache, block_table, cu_seq_lens, token_to_seq, seq_starts, num_tokens);
+}
+
+void MergeAttnStates(Queue& q, Tensor& output, Tensor* output_lse, const Tensor& prefix_output,
+                     const Tensor& prefix_lse, const Tensor& suffix_output,
+                     const Tensor& suffix_lse, int64_t prefill_tokens_with_context) {
+  VT_CHECK(output.rank == 3 && prefix_output.rank == 3 && suffix_output.rank == 3,
+           "merge_attn_states: output/prefix_output/suffix_output must be rank-3 "
+           "[num_tokens, num_heads, head_size]");
+  VT_CHECK(prefix_lse.rank == 2 && suffix_lse.rank == 2,
+           "merge_attn_states: prefix_lse/suffix_lse must be rank-2 [num_heads, num_tokens]");
+  const int64_t num_tokens = output.shape[0];
+  const int64_t num_heads = output.shape[1];
+  const int64_t head_size = output.shape[2];
+  VT_CHECK(num_heads > 0 && head_size > 0,
+           "merge_attn_states: num_heads/head_size must be > 0");
+  VT_CHECK(prefix_output.shape[0] == num_tokens && prefix_output.shape[1] == num_heads &&
+               prefix_output.shape[2] == head_size,
+           "merge_attn_states: prefix_output shape must match output");
+  VT_CHECK(suffix_output.shape[0] == num_tokens && suffix_output.shape[1] == num_heads &&
+               suffix_output.shape[2] == head_size,
+           "merge_attn_states: suffix_output shape must match output");
+  VT_CHECK(prefix_lse.shape[0] == num_heads && prefix_lse.shape[1] == num_tokens &&
+               suffix_lse.shape[0] == num_heads && suffix_lse.shape[1] == num_tokens,
+           "merge_attn_states: prefix_lse/suffix_lse must be [num_heads, num_tokens]");
+  VT_CHECK(prefix_lse.dtype == DType::kF32 && suffix_lse.dtype == DType::kF32,
+           "merge_attn_states: prefix_lse/suffix_lse must be f32");
+  VT_CHECK(IsFloat(output.dtype) && prefix_output.dtype == output.dtype &&
+               suffix_output.dtype == output.dtype,
+           "merge_attn_states: output/prefix_output/suffix_output must share one float dtype "
+           "(the USE_FP8_OUTPUT branch is out of scope)");
+  VT_CHECK(output.stride[2] == 1 && prefix_output.stride[2] == 1 &&
+               suffix_output.stride[2] == 1 && prefix_lse.stride[1] == 1 &&
+               suffix_lse.stride[1] == 1,
+           "merge_attn_states: innermost strides must be 1");
+  VT_CHECK(output.device == q.device && prefix_output.device == q.device &&
+               prefix_lse.device == q.device && suffix_output.device == q.device &&
+               suffix_lse.device == q.device,
+           "merge_attn_states: device mismatch");
+  if (output_lse != nullptr) {
+    VT_CHECK(output_lse->rank == 2 && output_lse->shape[0] == num_heads &&
+                 output_lse->shape[1] == num_tokens,
+             "merge_attn_states: output_lse must be [num_heads, num_tokens]");
+    VT_CHECK(output_lse->dtype == DType::kF32, "merge_attn_states: output_lse must be f32");
+    VT_CHECK(output_lse->stride[1] == 1,
+             "merge_attn_states: output_lse innermost stride must be 1");
+    VT_CHECK(output_lse->device == q.device, "merge_attn_states: output_lse device mismatch");
+  }
+  reinterpret_cast<MergeAttnStatesFn>(GetOp(OpId::kMergeAttnStates, q.device.type))(
+      q, output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse,
+      prefill_tokens_with_context);
+}
+
 void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
                     const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                     const Tensor& query_start_loc, const PagedAttentionArgs& args) {

@@ -445,6 +445,217 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   Check(cudaGetLastError(), "splitkv dispatch launch");
 }
 
+// ─── MLA PREFILL (MLA campaign W5) ──────────────────────────────────────────
+// Launch FA-2 over CONTIGUOUS varlen q/k/v at head_dim 192 — the MLA prefill
+// call `FlashAttnPrefillBackend` makes on GB10
+// (vllm/v1/attention/backends/mla/prefill/flash_attn.py:182-188 @ e24d1b24,
+// reached from `:205 run_prefill_new_tokens` causal / `:229
+// run_prefill_context_chunk` non-causal). OBSERVED, not inferred: the oracle
+// logs `Using FLASH_ATTN MLA prefill backend` on sm_121, and the MLA prefill
+// selector gives major != 10 that single entry (`prefill/selector.py:66-76`).
+//
+// THIS IS A SEPARATE ENTRY POINT ON PURPOSE. `LaunchPrefillFA2Bf16` above is the
+// PAGED launcher (block_table + seqused_k, 4-D k/v caches, head_dim {128,256});
+// nothing in it is touched by this addition, so the 27B / 35B / Qwen3-dense
+// prefill paths are byte-identical by construction rather than by measurement.
+// What the two share is the vendored kernel template, which already supports the
+// contiguous varlen mode (`block_info.h` k_offset via `sum_s_k` when
+// `block_table == nullptr`, `flash_fwd_kernel.h:584-590`) and every head dim
+// upstream FA-2 supports; W5 added only the two head_dim-192 explicit
+// instantiations.
+//
+//   query/out    [total_q, h, d]  (out at the SAME d — the caller pads V and
+//                                  slices the output back, mirroring
+//                                  `_flash_attn_varlen_diff_headdims`)
+//   k/v          [total_k, h, d]  contiguous varlen, cu_seqlens_k-addressed
+//   lse_out      [h, total_q] f32 or nullptr
+//
+// LSE LAYOUT — a deliberate deviation from upstream's call, forced by an upstream
+// FA-2 quirk. With `unpadded_lse = true` the MAIN path writes LSE at the
+// unpadded offset (`flash_fwd_kernel.h:1038-1041`) but the EMPTY-K EARLY EXIT
+// (`:1039` in the `n_block_min >= n_block_max` branch, `:1030-1043`) ignores
+// `unpadded_lse` and always writes at the PADDED
+// `((split*b + bidb)*h + bidh)*seqlen_q` offset. A request with ZERO keys in a
+// chunk is REACHABLE in the chunked-context loop — it is exactly the case
+// `merge_attn_states.cu:100-106` documents — so that mixed layout would both
+// clobber valid rows and write past an `[h, total_q]` buffer. We therefore run
+// the kernel with `unpadded_lse = false` (BOTH paths then use the padded layout,
+// consistently and in-bounds) into a `[b, h, max_seqlen_q]` scratch, and convert
+// to the caller's unpadded `[h, total_q]` afterwards. The conversion also
+// normalizes the `+INFINITY` FA-2 writes for an empty-K row (`:573`) to `-inf`,
+// which is the value our CPU reference produces and the value
+// `merge_attn_states.cu:97-98` normalizes it to anyway.
+__global__ void Fa2UnpadLseKernel(float* __restrict__ dst, const float* __restrict__ src,
+                                  const int32_t* __restrict__ cu_seqlens_q, int num_reqs,
+                                  int num_heads, int max_seqlen_q, int total_q,
+                                  int64_t dst_row_stride) {
+  const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int total = num_reqs * num_heads * max_seqlen_q;
+  if (idx >= total) return;
+  const int iq = idx % max_seqlen_q;
+  const int h = (idx / max_seqlen_q) % num_heads;
+  const int b = idx / (max_seqlen_q * num_heads);
+  const int q_begin = cu_seqlens_q[b];
+  const int len_q = cu_seqlens_q[b + 1] - q_begin;
+  if (iq >= len_q) return;
+  const int t = q_begin + iq;
+  if (t >= total_q) return;
+  const float v = src[(static_cast<int64_t>(b) * num_heads + h) * max_seqlen_q + iq];
+  dst[static_cast<int64_t>(h) * dst_row_stride + t] =
+      isinf(v) ? -INFINITY : v;
+}
+
+void LaunchMlaPrefillFA2Bf16(cudaStream_t s, Tensor& out, float* lse_out,
+                             int64_t lse_row_stride, const Tensor& query, const Tensor& key,
+                             const Tensor& value, const Tensor& cu_seqlens_q,
+                             const Tensor& cu_seqlens_k,
+                             const MlaPrefillAttentionArgs& args, int64_t num_reqs,
+                             int64_t hq, int64_t d) {
+  const int64_t total_q = query.shape[0];
+  const int64_t total_k = key.shape[0];
+  if (total_q == 0 || num_reqs == 0 || hq == 0 || d == 0) return;
+  if (query.dtype != DType::kBF16 || out.dtype != DType::kBF16 ||
+      key.dtype != DType::kBF16 || value.dtype != DType::kBF16) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 MLA prefill: bf16 query/key/value/out required "
+        "(dispatch gate must enforce)");
+  }
+  // The one head_dim the MLA prefill path needs: qk_nope 128 + qk_rope 64.
+  // V arrives already zero-padded to the SAME width by the caller, mirroring
+  // `requires_v_padding` (flash_attn.py:88-99 — TRUE on GB10 because FA3-on-SM90
+  // and FA4 are the only exemptions).
+  if (d != 192) {
+    throw std::runtime_error(
+        "cuda flash-attn-2 MLA prefill: head_dim 192 only (dispatch gate must enforce)");
+  }
+
+  // max_seqlen_q / max_seqlen_k: host UPPER BOUNDS are safe for grid sizing and
+  // the rounded dims (the per-request geometry reads the DEVICE cu_seqlens via
+  // BlockInfo). max_seqlen_q additionally sizes the padded LSE scratch, where an
+  // upper bound only over-allocates.
+  int max_seqlen_q = args.max_seqlen_q;
+  int max_seqlen_k = args.max_seqlen_k;
+  if (max_seqlen_q <= 0 || max_seqlen_k <= 0) {
+    std::vector<int32_t> qsl(static_cast<size_t>(num_reqs) + 1);
+    std::vector<int32_t> ksl(static_cast<size_t>(num_reqs) + 1);
+    Check(cudaMemcpyAsync(qsl.data(), cu_seqlens_q.Ptr<int32_t>(),
+                          sizeof(int32_t) * (num_reqs + 1), cudaMemcpyDeviceToHost, s),
+          "cu_seqlens_q D2H");
+    Check(cudaMemcpyAsync(ksl.data(), cu_seqlens_k.Ptr<int32_t>(),
+                          sizeof(int32_t) * (num_reqs + 1), cudaMemcpyDeviceToHost, s),
+          "cu_seqlens_k D2H");
+    Check(cudaStreamSynchronize(s), "mla prefill seqlen sync");
+    max_seqlen_q = 0;
+    max_seqlen_k = 0;
+    for (int64_t i = 0; i < num_reqs; ++i) {
+      max_seqlen_q = std::max(max_seqlen_q, qsl[i + 1] - qsl[i]);
+      max_seqlen_k = std::max(max_seqlen_k, ksl[i + 1] - ksl[i]);
+    }
+  }
+  if (max_seqlen_q == 0) return;
+  // Every request may legitimately have ZERO keys in a context chunk; FA-2's
+  // early-exit writes zeros to O and +INFINITY to LSE, which is exactly what the
+  // merge expects. Guard only against a degenerate rounded dim.
+  if (max_seqlen_k == 0) max_seqlen_k = 1;
+
+  const auto scratch = Fa2ScratchFor(query.device.index, s);
+  std::lock_guard<std::mutex> submit_lock(scratch->submit_mu);
+  const size_t lse_elems =
+      static_cast<size_t>(num_reqs) * static_cast<size_t>(hq) * static_cast<size_t>(max_seqlen_q);
+  float* softmax_lse = static_cast<float*>(
+      EnsureGrowOnly(scratch->prefill_lse, lse_elems * sizeof(float), s,
+                     "mla prefill softmax_lse alloc"));
+
+  FLASH_NAMESPACE::Flash_fwd_params p{};  // zero-init: nulls knew/rotary/alibi/accum/leftpad
+  p.is_bf16 = true;
+
+  p.q_ptr = query.data;
+  p.k_ptr = key.data;
+  p.v_ptr = value.data;
+  p.o_ptr = out.data;
+
+  // Contiguous varlen on ALL of q/k/v/o: cu_seqlens drive the row offsets, so
+  // the batch strides are unused. Strides are in ELEMENTS.
+  p.q_row_stride = query.stride[0];
+  p.q_head_stride = query.stride[1];
+  p.o_row_stride = out.stride[0];
+  p.o_head_stride = out.stride[1];
+  p.k_row_stride = key.stride[0];
+  p.k_head_stride = key.stride[1];
+  p.v_row_stride = value.stride[0];
+  p.v_head_stride = value.stride[1];
+  p.k_batch_stride = 0;
+  p.v_batch_stride = 0;
+
+  p.cu_seqlens_q = cu_seqlens_q.Ptr<int32_t>();
+  p.cu_seqlens_k = cu_seqlens_k.Ptr<int32_t>();
+  p.seqused_k = nullptr;  // contiguous varlen: cu_seqlens_k IS the K geometry
+  p.softmax_lse_ptr = softmax_lse;
+
+  p.b = static_cast<int>(num_reqs);
+  p.h = static_cast<int>(hq);
+  p.h_k = static_cast<int>(hq);  // MLA prefill is multi-head on BOTH sides
+  p.h_h_k_ratio = 1;
+  p.seqlen_q = max_seqlen_q;
+  p.seqlen_k = max_seqlen_k;
+  p.seqlen_q_rounded = RoundMultiple(max_seqlen_q, 128);
+  p.seqlen_k_rounded = RoundMultiple(max_seqlen_k, 128);
+  p.d = static_cast<int>(d);
+  p.d_rounded = RoundMultiple(static_cast<int>(d), 32);
+  p.total_q = static_cast<int>(total_q);
+  (void)total_k;
+
+  p.scale_softmax = args.scale;
+  p.scale_softmax_log2 = args.scale * static_cast<float>(M_LOG2E);
+  p.softcap = 0.0f;
+
+  p.p_dropout = 1.0f;
+  p.p_dropout_in_uint8_t = uint8_t(255);
+  p.rp_dropout = 1.0f;
+  p.scale_softmax_rp_dropout = args.scale;
+  p.philox_args = at::PhiloxCudaState(0, 0);
+
+  // `causal=True` for new tokens (flash_attn.py:223), `causal=False` for a
+  // context chunk (`:246`). No local window on any MLA path — TritonMLAImpl
+  // rejects `sliding_window` outright (triton_mla.py:165-171).
+  p.is_causal = args.causal;
+  p.window_size_left = -1;
+  p.window_size_right = args.causal ? 0 : -1;
+  p.is_seqlens_k_cumulative = true;
+  p.is_rotary_interleaved = false;
+  p.rotary_dim = 0;
+
+  p.block_table = nullptr;  // contiguous, NOT paged
+  p.block_table_batch_stride = 0;
+  p.page_block_size = 1;
+
+  p.unpadded_lse = false;  // see the LSE LAYOUT note above
+  p.seqlenq_ngroups_swapped = false;
+
+  // num_splits == 1 => the Split=false kernel writes O directly through
+  // cu_seqlens_q with no combine pass — vLLM's varlen prefill exactly, and our
+  // fixed-order determinism convention for free.
+  p.num_splits = 1;
+  p.o_batch_stride = static_cast<int64_t>(max_seqlen_q) * p.o_row_stride;
+
+  if (args.causal) {
+    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 192, true>(p, s);
+  } else {
+    FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 192, false>(p, s);
+  }
+  Check(cudaGetLastError(), "mla prefill splitkv dispatch launch");
+
+  if (lse_out != nullptr) {
+    const int total = static_cast<int>(lse_elems);
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    Fa2UnpadLseKernel<<<blocks, threads, 0, s>>>(
+        lse_out, softmax_lse, cu_seqlens_q.Ptr<int32_t>(), static_cast<int>(num_reqs),
+        static_cast<int>(hq), max_seqlen_q, static_cast<int>(total_q), lse_row_stride);
+    Check(cudaGetLastError(), "mla prefill lse unpad launch");
+  }
+}
+
 // Launch the pinned FA2 pure-decode optimization: bf16 paged KV, D256, one
 // query per request, global causal decoder attention, for either Hq/Hkv=24/4
 // (G=6, 27B) or Hq/Hkv=16/2 (G=8, 35B). flash_api.cpp first normalizes

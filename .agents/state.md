@@ -16352,3 +16352,114 @@ W5 — MLA prefill: generalize the vendored FA-2 varlen launcher to qk 192 / v 1
 `requires_v_padding` (V zero-padded 128 -> 192 and sliced back), and implement the
 workspace-bounded chunked-context loop with the LSE merge. Ports of
 `test_mla_backends.py` and `test_mla_prefill_quant_output.py`.
+
+## 2026-07-22 — MLA campaign **W5**: MLA PREFILL + the chunked-context loop (`CLAIM-MLA-DEEPSEEK`)
+
+Worktree `agent-a43819c9776dc1585`, base `5395203` (W4), dgx evidence root
+`~/w5mla` (`build.log`, `memcheck_{prefill,chunked}.log`,
+`racecheck_{prefill,chunked}.log`, `synccheck_{prefill,chunked}.log`,
+`regressions.log`, `ctest.log`). **Rows STAY `SPIKE`** — W5 completes the MLA
+ATTENTION FAMILY (decode from W4 + prefill from W5) but nothing composes it:
+there is no MLA block, no weight absorption, no model, no forward.
+
+**What landed.** Three new `vt::` ops plus a device-agnostic driver, each cited
+`file:line` on both sides at pin `e24d1b24`:
+
+- `vt::MlaPrefillAttention` <- `vllm/v1/attention/backends/mla/prefill/flash_attn.py:153-248`
+  (`FlashAttnPrefillBackend`), the ONLY MLA prefill backend reachable on sm_121
+  (`mla/prefill/selector.py:66-76`; `:191-194` hard-raises rather than falling
+  back) and the one W0 OBSERVED the oracle logging. QK 192 (qk_nope 128 +
+  qk_rope 64) / V 128, multi-head on BOTH sides (the latent has been
+  up-projected), contiguous varlen with independent `cu_seqlens_q`/`cu_seqlens_k`
+  — causal for the new tokens (`:223`), NON-causal for a context chunk (`:246`,
+  "Context is unmasked").
+- `vt::GatherMlaCache` <- `csrc/libtorch_stable/cache_kernels.cu:992-1064`.
+- `vt::MergeAttnStates` <- `csrc/libtorch_stable/attention/merge_attn_states.cu:18-192`,
+  including BOTH `-inf` edge cases verbatim.
+- `include/vllm/model_executor/layers/attention/mla_chunked_context.h` <-
+  `mla_attention.py:1422-1451` (workspace sizing), `:1667-1745` + `:1837-1855`
+  (the chunk grid), `:2094-2199` (`_compute_prefill_context`), `:2344-2425`
+  (`forward_mha`).
+
+**Whole-chain check gave THREE different answers, and they mattered.** The
+prefill ATTENTION is not vLLM's csrc at all — it is FlashAttention through
+`vllm_flash_attn`. The gather and the merge ARE vLLM's own `libtorch_stable`
+csrc, with no flashinfer/cutlass/TRT-LLM variant in the dense-bf16 path; their
+fp8 siblings (`cp_gather_cache`, `USE_FP8_OUTPUT`) are out of scope and refused.
+Reading the wrapper alone would have produced a plausible, wrong port.
+
+**The FA-2 launcher generalization W4 deferred to W5 — done, and the reason it
+was tractable is itself the finding.** Upstream does not ask FA-2 for asymmetric
+head dims either: `requires_v_padding` is TRUE on GB10 (`flash_attn.py:88-99`
+exempts only FA3-on-SM90 and FA4), so it ZERO-PADS V from 128 to 192 (`:164-168`)
+and slices the output back (`:196-197`), leaving a plain SYMMETRIC head_dim-192
+kernel. So the generalization is exactly three small things: two NEW explicit
+instantiations of the UNCHANGED generic
+`run_mha_fwd_splitkv_dispatch<bf16, 192, {true,false}>`; a NEW entry point
+`LaunchMlaPrefillFA2Bf16` for the CONTIGUOUS-varlen mode (`cu_seqlens_k` instead
+of `block_table` + `seqused_k`, which the vendored kernel already supports at
+`flash_fwd_kernel.h:584-590`); and the pad/slice pair. **The paged launcher
+`LaunchPrefillFA2Bf16` that every non-MLA prefill calls is textually untouched.**
+
+**An upstream FA-2 defect found on the way, worked around explicitly.** With
+`unpadded_lse = true` the MAIN path writes LSE at the unpadded offset
+(`flash_fwd_kernel.h:1038-1041`) but the EMPTY-K EARLY EXIT (`:1030-1043`)
+IGNORES the flag and always writes at the PADDED
+`((split*b + bidb)*h + bidh)*seqlen_q` offset. A request with ZERO keys in a
+chunk is REACHABLE in the chunked loop — it is precisely the case
+`merge_attn_states.cu:100-106` documents — so the mixed layout would clobber
+valid LSE rows and write past an `[h, total_q]` buffer. We run with
+`unpadded_lse = false` into a `[b, h, max_seqlen_q]` scratch (both paths then
+agree and stay in bounds) and convert, which also normalizes FA-2's `+INFINITY`
+empty-row LSE to `-inf` — the value `merge_attn_states.cu:97-98` normalizes it to
+anyway. Recorded as a deviation.
+
+**Evidence — unit-level, held to the W4 bar.**
+`tests/vt/test_ops_mla_prefill.cpp` **4/4 cases / 2,377,052 assertions**;
+`tests/vt/test_ops_mla_chunked_context.cpp` **5/5 / 306,037 assertions**; both on
+dgx sm_121 at the real V2-Lite prefill geometry. The oracle is a DOUBLE-precision
+TWO-PASS softmax — a different algorithm from FlashAttention's streaming
+online-softmax. The chunked loop is additionally gated against a SINGLE-SHOT
+whole-sequence oracle that NEVER CHUNKS, over: a context ending EXACTLY on a
+chunk boundary, one over, one under; a request with NO context (its tokens must
+take the suffix verbatim via `prefill_tokens_with_context`); a chunk in which a
+request contributes ZERO keys; ragged multi-chunk; V3's 128 heads. The metadata
+builder is checked against upstream's own worked example at
+`mla_attention.py:1696-1700`, the page-alignment round-down, and the
+`assert max_context_chunk > 0` refusal. ADVERSARIAL reverse-interleaved block
+tables throughout. NaN-poisoned output AND LSE buffers. Run-to-run BIT-exact over
+5 runs. `compute-sanitizer` memcheck **0**, racecheck **0 hazards**, synccheck
+**0** on BOTH binaries. Clean dgx CUDA build **0 warnings / 0 errors**. Full `ctest`
+**179/180** — the one failure is `test_capi`, the DOCUMENTED pre-existing dgx
+detokenizer UTF-8 flake, and its signature was CONFIRMED rather than assumed
+(`test_capi.cpp:353`: two greedy completions of the same prompt differing only in
+a partial-UTF-8 first byte, `\xef..oollllll` vs `loollllll` — the C-API
+detokenizer, not the attention path).
+
+**Regressions — the real risk, since the FA-2 TU is SHARED with the 27B / 35B /
+Qwen3-dense prefill paths — proved two ways.** STRUCTURALLY: the diff of
+`cuda_flash_attn_fa2.cu` is **211 insertions / 0 deletions**, the vendored tree
+gains only two new files, `LaunchPrefillFA2Bf16` untouched. EMPIRICALLY: 27B
+**235/235**, 35B **315/315**, Qwen3-Coder **138/138**, Qwen3-dense **664/664**,
+OPT **36/36** — all token-exact UNCHANGED.
+
+**Deviations beyond the LSE one:** `MergeAttnStates` is SCALAR, not upstream's
+128-bit-packed form (same arithmetic, but accepts any head_size and any strided
+layout; vectorization is W9). The `kv_b_proj` up-projection + `_concat_k_nope_k_pe`
+are a CALLBACK, not inlined — they are a MODEL weight, i.e. W6. DCP /
+context-parallel (`_context_parallel_compute_prefill_context`, `reorg_kvcache`)
+is out of scope (single-GPU), and the fp8-prefill arms need
+`is_device_capability_family(100)` (`mla_attention.py:1382-1385`) and are
+unreachable on sm_121. No speed number: MLA prefill perf is W9.
+
+**RESUME HERE — next is W6: the MLA attention BLOCK + load-time weight
+absorption.** `include/vllm/model_executor/models/mla_attention.{h,cpp}` per the
+spike's port map: the projections (BOTH `q_lora_rank` branches — V2-Lite is the
+`null` one, V3 needs `fused_qkv_a_proj` + `q_a_layernorm` + `q_b_proj`), the two
+RMSNorms (`q_a_layernorm` over `q_lora_rank`, `kv_a_layernorm` over
+`kv_lora_rank` only — the rope part is NOT normed), decoupled RoPE over
+`qk_rope_head_dim` with `is_neox_style=False`, the load-time
+`kv_b_proj -> W_UK/W_UV` split (`mla_attention.py:892-900, 959-962`), and the
+prefill-MHA / decode-MQA dispatch (`forward_impl:624-874`, decode tokens packed
+FIRST) that finally composes W4 with W5. First verification commands:
+`ssh dgx.casa 'cd ~/w5mla/src/build && ./tests/test_ops_mla_prefill && ./tests/test_ops_mla_chunked_context'`.

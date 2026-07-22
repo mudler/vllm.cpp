@@ -103,6 +103,9 @@ enum class OpId : uint8_t {
   kReshapeAndCache,
   kConcatAndCacheMla,
   kMlaDecodeAttention,
+  kMlaPrefillAttention,
+  kGatherMlaCache,
+  kMergeAttnStates,
   kPagedAttention,
   kApplyTemperature,
   kGreedyArgmax,
@@ -352,6 +355,28 @@ struct MlaDecodeAttentionArgs {
   int32_t max_seq_len = 0;
 };
 
+// Arguments for vt::MlaPrefillAttention (MLA campaign W5). Mirrors the scalar
+// arguments `FlashAttnPrefillBackend` passes to `flash_attn_varlen_func`
+// (vllm/v1/attention/backends/mla/prefill/flash_attn.py:205-248 @ e24d1b24).
+struct MlaPrefillAttentionArgs {
+  // `self.scale` — head_dim^-0.5 TIMES the YaRN mscale^2 correction for
+  // DeepSeek, handed to the kernel as a plain float (`flash_attn.py:222,245`).
+  float scale = 0.0f;
+  // `causal=True` for the NEW-TOKENS call (`flash_attn.py:223`), `causal=False`
+  // for every CONTEXT-CHUNK call (`:246`, "Context is unmasked"). Causal here is
+  // FlashAttention's BOTTOM-RIGHT alignment: query index i of a request whose
+  // query length is Lq and key length is Lk sees keys j <= i + (Lk - Lq).
+  bool causal = true;
+  // Host-known max over the per-request query / key lengths
+  // (`max_seqlen_q` / `max_seqlen_k`, `flash_attn.py:220-221,243-244`). Used for
+  // GRID SIZING and the rounded dims only — the per-request geometry reads the
+  // DEVICE cu_seqlens, so an UPPER BOUND is safe. 0 => the launcher falls back
+  // to a small D2H + sync (op unit tests / callers without host lengths), the
+  // same fallback the FA-2 paged prefill launcher uses.
+  int32_t max_seqlen_q = 0;
+  int32_t max_seqlen_k = 0;
+};
+
 // Router SCORING function. softmax over all E is the Qwen3.6 / DeepSeek-V2
 // behavior; sigmoid (elementwise, NOT normalized across experts) is what
 // DeepSeek-V3 / R1 use with `topk_method == "noaux_tc"`. Mirrors
@@ -524,6 +549,13 @@ using ConcatAndCacheMlaFn =
 using MlaDecodeAttentionFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, const Tensor&,
                                       const Tensor&, const Tensor&,
                                       const MlaDecodeAttentionArgs&);
+using MlaPrefillAttentionFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, const Tensor&,
+                                       const Tensor&, const Tensor&, const Tensor&,
+                                       const MlaPrefillAttentionArgs&);
+using GatherMlaCacheFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                  const Tensor&, const Tensor*, int64_t);
+using MergeAttnStatesFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, const Tensor&,
+                                   const Tensor&, const Tensor&, int64_t);
 using PagedAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&, const Tensor&, const Tensor&,
                                   const PagedAttentionArgs&);
@@ -1418,6 +1450,138 @@ void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor&
 void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
                         const Tensor& kv_cache, const Tensor& block_table,
                         const Tensor& seq_lens, const MlaDecodeAttentionArgs& args);
+
+// --- MLA prefill attention (MLA campaign W5) --------------------------------
+// The MHA prefill half of Multi-head Latent Attention — upstream's
+// "Compute Friendly Approach" (mla_attention.py:66-89): `kv_b_proj` has already
+// MATERIALIZED per-head K `[total_k, H, qk_nope+qk_rope]` and V
+// `[total_k, H, v_head_dim]` from the latent, so this is an ordinary varlen MHA
+// with an ASYMMETRIC pair of head dims — QK 192 (128 nope + 64 rope) and V 128
+// for every DeepSeek variant — over CONTIGUOUS (not paged) k/v.
+//
+// WHAT ACTUALLY RUNS UPSTREAM ON GB10 (OBSERVED at W0, not inferred: the oracle
+// logs `Using FLASH_ATTN MLA prefill backend` on sm_121). The MLA prefill
+// selector gives major != 10 the single entry `[FLASH_ATTN]`
+// (vllm/v1/attention/backends/mla/prefill/selector.py:66-76) and hard-raises if
+// it is unavailable (`:191-194`) — there is no fallback below FA on sm_121.
+// That backend is
+// vllm/v1/attention/backends/mla/prefill/flash_attn.py:40 FlashAttnPrefillBackend,
+// whose two entry points are `:205 run_prefill_new_tokens` (causal, over the new
+// tokens' own K/V) and `:229 run_prefill_context_chunk` (NON-causal, over one
+// gathered context chunk), both funnelled through
+// `:153 _flash_attn_varlen_diff_headdims` into `flash_attn_varlen_func`.
+//
+// V ZERO-PADDING IS UPSTREAM BEHAVIOUR, ported exactly. `requires_v_padding` is
+// TRUE on GB10 (`flash_attn.py:88-99` clears it only for FA3-on-SM90 or FA4), so
+// upstream pads V from v_head_dim to the QK head dim with ZEROS
+// (`:164-168 torch.nn.functional.pad(v, [0, q.shape[-1] - v.shape[-1]], value=0)`)
+// and slices the output back to v_head_dim afterwards (`:196-197`). We do the
+// same, inside the op: the caller passes V at its true width and gets `out` at
+// its true width; the padded staging buffer is an implementation detail. Zero
+// padding is exact — the padded output columns are sum_j p[j]*0 == 0 — so the
+// slice loses nothing.
+//
+//   out          [total_q, H, Dv]     (Dv == v_head_dim == 128)
+//   lse          [H, total_q] f32 or nullptr — upstream's UNPADDED varlen LSE
+//                layout (`Flash_fwd_params::unpadded_lse`), which is what
+//                vt::MergeAttnStates consumes. `return_softmax_lse` is True for
+//                every context chunk and for the new-tokens call WHEN there is
+//                context to merge with (`mla_attention.py:2385`).
+//   query        [total_q, H, Dqk]    (Dqk == qk_nope_head_dim + qk_rope_head_dim == 192)
+//   key          [total_k, H, Dqk]
+//   value        [total_k, H, Dv]
+//   cu_seqlens_q [B+1] i32            (`_prefill_metadata.query_start_loc`)
+//   cu_seqlens_k [B+1] i32            (the SAME tensor for the new-tokens call,
+//                `chunked_context.cu_seq_lens[chunk_idx]` for a context chunk —
+//                flash_attn.py:218-219 vs :241-242)
+//
+// H is the QUERY head count and is also the K/V head count: MLA prefill is
+// genuinely multi-head on both sides (the latent has been up-projected), so
+// there is no GQA grouping here — mla_attention.py:315-318 records the shape as
+// K `[S, 128, 192]` / V `[S, 128, 128]` with 128 KV heads.
+//
+// dtypes: query/key/value/out share one float dtype. The CUDA path is bf16 only
+// (the vendored FA-2 instantiations); the CPU reference also accepts f32/f16.
+// The fp8-prefill branch (`use_fp8_prefill`, mla_attention.py:2360-2379) needs
+// `is_device_capability_family(100)` (`mla_attention.py:1382-1385`) and is
+// therefore UNREACHABLE on GB10 — not ported, refused by the dtype check.
+void MlaPrefillAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
+                         const Tensor& key, const Tensor& value, const Tensor& cu_seqlens_q,
+                         const Tensor& cu_seqlens_k, const MlaPrefillAttentionArgs& args);
+
+// --- MLA chunked-context cache gather (MLA campaign W5) ---------------------
+// Ported 1:1 from vllm/csrc/libtorch_stable/cache_kernels.cu:992-1064
+// (`vllm::gather_and_maybe_dequant_cache`) + its host wrapper `:1099-1157`,
+// reached from vllm/_custom_ops.py and called at
+// mla_attention.py:2119-2129 (`ops.gather_and_maybe_dequant_cache`) — the FIRST
+// step of every chunked-context iteration.
+//
+// WHAT ACTUALLY RUNS UPSTREAM (whole-chain rule): like the W3 cache write this
+// is vLLM's OWN csrc kernel, not a dependency. The sibling `cp_gather_cache`
+// (`:1237`) is the fp8/DCP path (`mla_attention.py:2132-2139`), out of scope.
+//
+// It gathers, for each prefill request b, the context rows
+// [seq_starts[b], seq_starts[b] + chunk_seq_lens[b]) out of the PAGED 3-D MLA
+// cache into a CONTIGUOUS varlen workspace laid out by cu_seq_lens:
+//
+//   dst          [>= num_tokens, D]                the chunk workspace
+//   src_cache    [num_blocks, block_size, D]       the 3-D MLA cache
+//   block_table  [B, max_blocks] i32
+//   cu_seq_lens  [B+1] i32   cumulative per-request token counts IN THIS CHUNK
+//   token_to_seq [>= num_tokens] i32  back-map token index -> request (`:1015`)
+//   seq_starts   [B] i32 or nullptr — the chunk's start offset within each
+//                request's context (`chunked_context.starts[i]`). Upstream
+//                rounds `max_context_chunk` DOWN to a multiple of page_size
+//                (mla_attention.py:1687-1690) precisely because this kernel
+//                indexes `(seq_starts[b] + within_chunk) / block_size` into the
+//                block table; we mirror the requirement and REFUSE a
+//                non-page-aligned start rather than silently mis-gather.
+//   num_tokens   the chunk's total token count (`chunk_total_token[i]`)
+//
+// Everything is STRIDE-driven exactly as upstream (`:1150-1153` reads
+// block_table.stride(0), src_cache.stride(0)/stride(1), dst.stride(0)), so a
+// per-layer cache slice and a workspace slice both work copy-free. The fp8
+// dequant branch (`kv_dt != kAuto`) is out of scope and refused.
+void GatherMlaCache(Queue& q, Tensor& dst, const Tensor& src_cache, const Tensor& block_table,
+                    const Tensor& cu_seq_lens, const Tensor& token_to_seq,
+                    const Tensor* seq_starts, int64_t num_tokens);
+
+// --- Attention-state LSE merge (MLA campaign W5) ----------------------------
+// Ported 1:1 from vllm/csrc/libtorch_stable/attention/merge_attn_states.cu:18-192
+// (`vllm::merge_attn_states_kernel`), reached from
+// vllm/v1/attention/ops/merge_attn_states.py:9 — which selects the CUDA kernel
+// on CUDA for f32/f16/bf16 with a head_size divisible by the 128-bit pack
+// (`:59-77`), i.e. exactly our case, and only falls back to the Triton
+// transcription otherwise. Call sites: mla_attention.py:2188-2195 (merging
+// consecutive CONTEXT CHUNKS) and `:2413-2420` (merging the whole context result
+// with the new-tokens result).
+//
+// Implements §2.2 of https://www.arxiv.org/pdf/2501.01005: two partial softmax
+// attention results over DISJOINT key sets are combined by their log-sum-exps.
+//   m = max(p_lse, s_lse); ps = exp(p_lse-m); ss = exp(s_lse-m); t = ps+ss
+//   out = prefix_out * (ps/t) + suffix_out * (ss/t)
+//   out_lse = log(t) + m
+// Arithmetic is f32 regardless of the tensor dtype (upstream converts through
+// `to_float`/`from_float`, `:158-171`).
+//
+//   output       [num_tokens, H, Dv]
+//   output_lse   [H, num_tokens] f32 or nullptr
+//   prefix_output/suffix_output [num_tokens, H, Dv]
+//   prefix_lse/suffix_lse       [H, num_tokens] f32
+//   prefill_tokens_with_context — tokens at index >= this take the SUFFIX
+//     output verbatim with no merge (`:66-89`); < 0 means "all tokens have
+//     context", upstream's `prefill_tokens_with_context=None`.
+//
+// TWO EDGE CASES PORTED VERBATIM, both of which a naive merge gets wrong:
+//   * `+inf` LSE is normalized to `-inf` first (`:97-98`);
+//   * when BOTH are `-inf` (a chunk in which a request has no keys at all —
+//     upstream's comment at `:100-106` describes exactly the chunked-prefill
+//     situation that produces it) the merge would be 0/0 => NaN, so upstream
+//     emits the PREFIX output and `-inf` LSE instead. We do the same.
+// The fp8-output branch (`USE_FP8_OUTPUT`) is out of scope and not ported.
+void MergeAttnStates(Queue& q, Tensor& output, Tensor* output_lse, const Tensor& prefix_output,
+                     const Tensor& prefix_lse, const Tensor& suffix_output,
+                     const Tensor& suffix_lse, int64_t prefill_tokens_with_context);
 
 // --- Paged attention (M1.6). Correctness-grade varlen prefill + paged decode.
 // Semantics ported from the FlashAttention path

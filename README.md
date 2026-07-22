@@ -324,9 +324,10 @@ assembled from — so its model files barely mention any particular GPU vendor a
 all: across 287 of them, only 9 do, and the one matching our largest model
 mentions NVIDIA exactly **once** in 802 lines. We never built that shared library;
 we wrote those building blocks straight into the model files instead. The result
-is that our matching model file is 6,389 lines and mentions NVIDIA **67 times**,
-and that single file holds **71%** of all the NVIDIA-specific code left in the
-supposedly shared part of the project (94 places in total, counted this session).
+is that our matching model file is 6,389 lines and mentions NVIDIA dozens of
+times, and that single file holds **77%** of all the NVIDIA-specific code left in
+the supposedly shared part of the project (**86** places in total; see the
+automated count below).
 So a new accelerator today inherits the engine, the scheduler, the memory
 manager, the sampler and the fused-operation catalogue for free — and then meets
 a model file written for NVIDIA. Two further gaps were confirmed: we have no
@@ -336,9 +337,30 @@ accelerator here that is missing an operation cannot fall back to a slow but
 correct version — it simply stops. That last one is why the Apple and Vulkan
 backends need a handful of GPU programs before they can produce a single token,
 rather than needing them only to be fast. The audit records a ranked eight-step
-plan to close all of this, plus an automated check to stop the leakage growing
-back — it had already grown measurably in the days before the audit, with no
-mistake by anyone. **Nothing was built or changed by the audit itself.**
+plan to close all of this. **Nothing was built or changed by the audit itself.**
+
+**The first of those eight steps is now in place (2026-07-22): the leakage is
+counted automatically on every push, and the count can only go down.** It had
+already grown measurably in the days before the audit, with no mistake by anyone
+— three separate well-executed pieces of work each added a device check in
+passing. So the fix is a ratchet rather than a one-off cleanup: a small script
+counts the NVIDIA-specific references in the parts of the code that are supposed
+to work on any accelerator, compares that to a committed number, and fails the
+build if it has risen. Lowering it requires updating the committed number in the
+same change, so the figure cannot drift. Sites that legitimately *are* the NVIDIA
+implementation — the handful of lines that register it as an available device —
+are listed by name with a written reason each, so adding a new accelerator never
+trips the check. Deliberate exceptions are possible but are printed on every run
+rather than hidden. The check itself is covered by 24 tests that each plant a
+device reference and require it to be caught, because a check nobody checks is
+worse than none. Re-counting from scratch as part of this work put the real
+figure at **86**, not the audit's 94: four of the problems the audit reported did
+not exist, two mentions it counted were comments rather than code, and two were
+genuinely fixed in the meantime. Of the 86, only **3** turn out to be real
+per-device behaviour — the rest are questions the code could ask its own
+operation table instead, or build-time switches. **This step added a script, a
+test suite and a build check; it changed no engine, model or kernel code, so
+nothing about how the project runs has changed.**
 
 **What was actually built for Apple.** The GPU is opened and memory allocated on
 it; GPU programs are compiled at run time from source embedded in the binary, so

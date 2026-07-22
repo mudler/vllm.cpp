@@ -1,12 +1,18 @@
 # Accelerator seam audit — do MLX/Vulkan ride vLLM's CUDA-path logic? (`BACKEND-SEAM-AUDIT`)
 
-Status: **AUDIT + PLAN, 2026-07-22. NO IMPLEMENTATION.** No code changed, no
-build run, no GPU used. Owner: `CLAIM-BACKEND-SEAM-AUDIT-1`.
-Row: **`BACKEND-SEAM-AUDIT`** (`SPIKE`). No other row moves.
+Status: **AUDIT + PLAN (2026-07-22) with work row `S1` LANDED (2026-07-22).**
+`S1` — the DSR ratchet — is implemented and CI-gated; see **§8** for the as-built
+metric, the re-derived baseline (**86**, not 94) and the re-verified class
+composition. `S2`–`S8` remain plan only; no source file under `src/`/`include/`
+has been changed by this row and no build or GPU run is owed.
+Owners: `CLAIM-BACKEND-SEAM-AUDIT-1` (audit), `CLAIM-BACKEND-SEAM-S1-1` (`S1`).
+Row: **`BACKEND-SEAM-AUDIT`** (`ACTIVE` — `S1` landed, `S2`–`S8` owed). No other
+row moves.
 
-Base: `72f5db2`. Pins: vLLM `/home/mudler/_git/vllm` @ `e24d1b24`;
-llama.cpp `237ad9b96`; MLX `v0.29.3`. Every count below was **re-measured on
-this tree in this session**, not carried over — several had drifted (§3.1).
+Audit base: `72f5db2`; `S1` base: `18094ee`. Pins: vLLM
+`/home/mudler/_git/vllm` @ `e24d1b24`; llama.cpp `237ad9b96`; MLX `v0.29.3`.
+Every count in §§0–7 was measured at `72f5db2`; **§8 supersedes the numeric
+claims** where the two differ.
 
 **The user's question, verbatim:** *"In the architecture for MLX and Vulkan, are
 we 'porting' the same strategy of the CUDA path of vLLM? Does it map correctly?"*
@@ -150,6 +156,12 @@ device legs by definition and are excluded.
 | `#ifdef VT_*` kernel-feature gates | 32 | 0 | **32** |
 | **Device-Specific References (DSR) total** | | | **94** |
 
+> **Superseded by §8.1.** Re-derived by the as-built checker: **88 at this same
+> `72f5db2`**, **86 at `18094ee`**. The `kCUDA` bucket here counts comment
+> mentions (the `is_cuda()` bucket does not — an internal inconsistency), and the
+> "unconditional CUDA includes" bucket is a measurement error: all 4 were already
+> `#ifdef`-guarded.
+
 Allowlist (these ARE the CUDA leg, and counting them would be wrong):
 `platforms/cuda.cpp` (6), `platforms/platform.cpp:39` (the device priority
 list), `platforms/vulkan.cpp:85` + `platforms/metal.cpp:74` (comments naming the
@@ -259,20 +271,26 @@ benchmark — nothing was implemented. `docs/BENCHMARKS.md` records this as
 
 **The gates the PLAN must meet**, per work row:
 
-1. **The tracked metric — DSR (Device-Specific References in the shared layer).**
-   `scripts/check-device-leakage.py` counts, over `src/vllm/` + `include/vllm/`,
-   the four buckets of §"Our baseline" 2 minus the allowlist, and compares to a
-   committed baseline file. **Baseline at `72f5db2` = 94** (47 + 11 + 4 + 32).
-   CI **fails on any increase**; a decrease requires the baseline be lowered in
-   the same commit (a ratchet, not a threshold). The allowlist is explicit,
-   per-file, and each entry carries a one-line reason, so "add a backend" never
-   trips it and "branch a model on CUDA" always does.
+1. **The tracked metric — DSR (Device-Specific References in the shared layer).
+   LANDED 2026-07-22 — see §8 for the as-built definition and the re-derived
+   baseline.** `scripts/check-device-leakage.py` counts, over `src/vllm/` +
+   `include/vllm/`, the four buckets of §"Our baseline" 2 minus the allowlist, and
+   compares to `scripts/device-leakage-baseline.json`. **Baseline at `18094ee` =
+   86** (44 + 10 + 0 + 32); the audit's `72f5db2` figure of 94 was 6 too high for
+   composition reasons and 2 too high because main has since reduced real leakage
+   (§8.1). CI **fails on any increase**, per bucket and in total; a decrease
+   requires the baseline be lowered in the same commit (a ratchet, not a
+   threshold). The allowlist is explicit, per-file, per-bucket, with an **exact
+   expected count** and a stated reason, so "add a backend" never trips it and
+   "branch a model on CUDA" always does.
    *Precedent:* `cmake/CudaArchFeaturesTest.cmake` driven by `cmake -P` in
    `.github/workflows/ci.yml:96` — a structural property enforced in CI with no
    GPU. *Escape hatch:* an explicit `// DSR-ALLOW(<row-id>): <reason>` comment,
-   which the checker counts separately and reports, so a justified exception is
-   visible rather than invisible. Per-row targets: `S2` → 90, `S3` → 84,
-   `S6` → ~39, `S4`+`S7` → **< 10, all of it class C/D**.
+   which the checker counts separately and reports on every run, so a justified
+   exception is visible rather than invisible. **0 in force today.**
+   Per-row targets, restated against the corrected baseline: `S2` → 86 (its
+   include/queue half is already done, §8.2), `S3` → 83, `S6` → ~37,
+   `S4`+`S7` → **< 10, all of it class C/D**.
 2. **Behaviour preservation is absolute on every row.** `S3`–`S7` are all
    refactors of code on the 27B/35B hot path. Each requires, STANDALONE:
    dgx 27B 235/235 + 35B 315/315 token-exact, Qwen3-Coder 6/6, Qwen3-dense
@@ -317,12 +335,12 @@ claim; none is claimed by this audit.
 
 | Rank | ID | Work | DSR after | Depends | Why here |
 |---:|---|---|---:|---|---|
-| **1** | `S1` | **The DSR metric + CI ratchet.** `scripts/check-device-leakage.py`, explicit allowlist with per-entry reasons, `DSR-ALLOW` escape hatch, baseline 94, plus its mutation suite | 94 (baseline) | — | Cheapest row in the plan and it guards every row after it. **The counts already regrew 54→63 and 13→16 in days of well-executed work** — without this, every reduction below decays |
-| **2** | `S2` | **Reuse-study `W0b-1` residue**: `model_loader.cpp:39` hard-coded CUDA queue; guard `model_loader.cpp:22`, `runner.cpp:30`, `qwen3_5.cpp:40,46`; Metal `get_attn_backend_priority()` | 90 | `S1` | Already owed, small, and it is the literal blocker for a model on any non-CUDA backend. Class E is a defect, not polish |
-| **3** | `S3` | **Platform capability fields** mirroring `interface.py:914,933,977,1058,1133,1153` + `is_device_capability_family:466`; migrate the 6 class-D sites off `is_cuda()` | 84 | `S2` | Pure mirror of upstream, mechanical, and it is what makes ROCm a *config* rather than a port. Highest fidelity-per-line in the plan |
+| **1** | `S1` | **The DSR metric + CI ratchet — `DONE` 2026-07-22 (`CLAIM-BACKEND-SEAM-S1-1`).** [`scripts/check-device-leakage.py`](../../scripts/check-device-leakage.py) + [baseline](../../scripts/device-leakage-baseline.json) + CI job `device-leakage` + [24-case mutation suite](../../tests/scripts/test_device_leakage.py). Per-file/per-bucket allowlist with exact counts and reasons, `DSR-ALLOW` escape hatch, per-bucket AND total monotonic decrease | **86** (baseline, §8) | — | Cheapest row in the plan and it guards every row after it. **The counts already regrew 54→63 and 13→16 in days of well-executed work** — without this, every reduction below decays |
+| **2** | `S2` | **Reuse-study `W0b-1` residue** — **the include + hard-coded-queue half is ALREADY DONE on main** (§8.2): `model_loader.cpp` now calls `SelectQueue()`, and all four "unconditional" CUDA includes were in fact already `#ifdef`-guarded (an audit measurement error). Remaining: Metal `get_attn_backend_priority()` | 86 | `S1` | Class E and class F are both empty at `18094ee`; what is left is the Metal priority list, which the metric does not count |
+| **3** | `S3` | **Platform capability fields** mirroring `interface.py:914,933,977,1058,1133,1153` + `is_device_capability_family:466`; migrate the **3** remaining class-D sites off `is_cuda()`/`kCUDA` (`runner.cpp:702,1080`, `qwen3_5_dense_weights.cpp:115` — §8.3) | 83 | `S2` | Pure mirror of upstream, mechanical, and it is what makes ROCm a *config* rather than a port. Highest fidelity-per-line in the plan |
 | **4** | `S5` | **Portable reference tier** — register CPU kernels as negative-priority `OpProvider` entries on unified-memory devices, so an unregistered op FALLS BACK instead of throwing. Mirrors `CustomOp.forward_native` | 84 | `S3` | **Changes the economics of every future backend**: op count stops being a correctness gate. Uses only the mechanism we already shipped. Gate = OPT on Metal token-exact with today's 10 kernels |
 | **5** | `S4` | **`QuantizationConfig` + `LinearMethod`/`QuantMethod`** keyed `(scheme, DeviceType)`, mirroring `base_config.py:20-229` + `linear.py:141-230`. Absorbs the `QuantTypeTraits` split (`W0b-3`) and replaces `IsNvfp4()` tensor-name probes | ~55 | `S3` | **The missing coarse seam** (§5). Biggest single leakage reduction available, and the only one that makes a new accelerator's quant work O(1) per scheme instead of O(models) |
-| **6** | `S6` | **Class A + B: fast-path gates become capability queries.** `env && device==kCUDA && shape` → `OpRegistered(op, device) && supports(shape)`; delete the 5 `VT_CHECK(device==kCUDA)` | ~39 | `S4`, `S5` | Removes the largest single class (~50 sites). Deferred to rank 6 only because it is hot-path-sensitive and needs `S5` as the safety net and `S4` for the quant half |
+| **6** | `S6` | **Class A + B: fast-path gates become capability queries.** `env && device==kCUDA && shape` → `OpRegistered(op, device) && supports(shape)`; delete the 5 `VT_CHECK(device==kCUDA)` | ~37 | `S4`, `S5` | Removes the largest single class (**46 sites**, re-measured §8.3). Deferred to rank 6 only because it is hot-path-sensitive and needs `S5` as the safety net and `S4` for the quant half |
 | **7** | `S7` | **Extract the layer library** — `layers/{linear,layernorm,rotary,activation,fused_moe,gdn}` mirroring `model_executor/layers/`, shrinking `qwen3_5.cpp` toward `qwen3_next.py`'s shape | **< 10** | `S4`, `S6` | The structural end-state and the literal answer to "ride the same logical implementations". Largest and riskiest; must be split per family and scheduled against `qwen3_5.cpp` claim windows |
 | **8** | `S8` | **XPU platform, data only** (`xpu.py:121-167` selector policy, no kernels) | < 10 | `S3` | The cheap falsification test: if a THIRD upstream platform ports mechanically with no engine edit, the seam claim is proven rather than argued. Needs no hardware |
 
@@ -513,3 +531,113 @@ a further reason `S4` outranks convenience.
 - The DSR baseline of **94** is a static count over `src/vllm/` + `include/vllm/`
   at `72f5db2` under the stated allowlist. It is a metric definition, not a
   quality score, and it is meaningless without the allowlist that accompanies it.
+  **Superseded by §8: the as-built metric measures 86, and 6 of the 8-point
+  difference is a correction to this audit's own composition, not progress.**
+
+---
+
+## 8. `S1` LANDED — the as-built ratchet (2026-07-22, `CLAIM-BACKEND-SEAM-S1-1`)
+
+Ships `scripts/check-device-leakage.py`, `scripts/device-leakage-baseline.json`,
+CI job `device-leakage` (`.github/workflows/ci.yml`), and
+`tests/scripts/test_device_leakage.py` (24 hard expectations). **No file under
+`src/` or `include/` was touched**, so no behaviour changed and no build or GPU
+run is owed. The checker runs standalone with no CUDA toolkit and no GPU, exactly
+like `cmake/CudaArchFeaturesTest.cmake`.
+
+### 8.1 The baseline moved 94 → 86, and most of that is a correction
+
+The audit instructed that the count be re-derived rather than carried. It was.
+Running the as-built checker at the audit's own base `72f5db2` yields **88**, and
+at `18094ee` **86**. So the 8-point difference splits cleanly:
+
+| Bucket | Audit @ `72f5db2` | As-built @ `72f5db2` | As-built @ `18094ee` | Why it moved |
+|---|---:|---:|---:|---|
+| `kCUDA` | 47 | 45 | **44** | −2 **composition**: the audit counted `kCUDA` appearing in COMMENTS while excluding comments from its `is_cuda()` bucket. −1 **real**: `model_loader.cpp`'s hard-coded `GetBackend(kCUDA)` became `SelectQueue()` |
+| `is_cuda()` | 11 | 11 | **10** | −1 **real**: `runner.cpp:516` migrated off `is_cuda()` |
+| unconditional CUDA includes | 4 | 0 | **0** | −4 **composition — an audit measurement ERROR.** All four cited sites (`model_loader.cpp:22`, `runner.cpp:30`, `qwen3_5.cpp:40,46`) were ALREADY inside `#ifdef VLLM_CPP_CUDA` / `#ifdef VT_*` guards at `72f5db2`. The audit grepped for the include without reading the surrounding preprocessor context |
+| `#ifdef VT_*` | 32 | 32 | **32** | unchanged |
+| **DSR** | **94** | **88** | **86** | **−6 composition, −2 real reduction on main** |
+
+**Two deliberate corrections to the audit's composition**, both in the direction
+of making the metric mean what it says:
+
+1. **Comments and string literals are stripped before matching, uniformly.** A
+   prose mention of a device name, or a `VT_CHECK` diagnostic that says "needs
+   kCUDA", is not a branch. The audit applied this rule to `is_cuda()` and not to
+   `kCUDA`; applying it to both is what makes the number a count of *behaviour*.
+   A useful side effect: the allowlist shrank from **16 sites to 10**, because 6
+   of the audit's allowlisted entries were comments that now need no exemption at
+   all — and an exemption that exists only to excuse a comment is an exemption
+   that could later shelter a real branch.
+2. **An include inside a CUDA/`VT_*` preprocessor guard is not counted.** The
+   bucket's stated meaning is "a non-CUDA build does not compile"; a guarded
+   include compiles fine. The checker tracks `#if`/`#elif`/`#else`/`#endif` depth,
+   and — asserted by mutant `M5` — a CUDA include in the `#else` (portable) arm
+   of such a guard **is** counted, because that arm is the non-CUDA build.
+
+### 8.2 The seven-class composition, re-verified against `18094ee`
+
+The audit's classification was checked site-by-site, not assumed. It holds, with
+three corrections — all of which *strengthen* its central argument:
+
+| Class | Audit | Re-measured | Verdict |
+|---|---:|---:|---|
+| **A** — fast-path availability (`env && device==kCUDA && shape`) | ~45 | **46** | **Confirmed.** Still the largest class and still not a device question — it asks whether a fused/quant kernel is available, which the op/provider table already answers |
+| **B** — `VT_CHECK(device == kCUDA)` duplicating `GetOp`'s own throw | 5 | **5** | **Confirmed exactly** — `qwen3_5.cpp:1144,1166,2780,3151` + `:5298` |
+| **C** — platform-definition keys (allowlisted) | 16 | **10** | **Corrected down.** 6 of the audit's 16 were comments; the as-built metric ignores comments entirely, so they need no allowlist entry. The remaining 10 are real code: 4 in `platforms/cuda.cpp`, 1 priority walk, 2 for the `is_cuda()` definition, 3 registrar keys |
+| **D** — real platform capability asked via the wrong predicate | 6 | **3** | **Corrected down.** `runner.cpp:516` was migrated off `is_cuda()` on main; and `deepseek_v2.cpp:311` (`GroupedMoeEligible`) reads as class **A** on inspection, not D — it gates the availability of `vt::MoeGroupedGemmBf16`, not a device policy. Genuine class D is `runner.cpp:702,1080` (device combine/scatter residency) and `qwen3_5_dense_weights.cpp:115` (direct-device-load residency) |
+| **E** — hard-coded device choice | 1 | **0** | **Fixed on main** since the audit |
+| **F** — unconditional CUDA includes | 4 | **0** | **Never existed** — audit measurement error (§8.1) |
+| **G** — `#ifdef VT_*` build gates | 32 | **32** | **Confirmed exactly** |
+
+**The audit's headline verdict survives its own corrections, and gets sharper.**
+It said "only 6 of 94 are genuinely device-dependent behaviour". The re-measured
+answer is **3 of 86** — 46 are class A, 5 are class B, 32 are class G. So
+**96.5% of the shared layer's device references are not device policy**: they are
+build config, or a duplicated throw, or the shared layer asking a question
+`vt::GetOp`/`OpProvider` already answers. That is the argument for `S4`/`S6`/`S7`,
+stated more strongly than the audit could state it.
+
+### 8.3 How the ratchet enforces monotonic decrease
+
+- **Per bucket AND in total.** Any bucket above its baseline fails. This is
+  stricter than the audit specified, deliberately: a total-only check would let a
+  removed `#ifdef VT_*` pay for a newly added `kCUDA`, which is precisely the
+  silent regrowth the row exists to stop.
+- **A reduction fails too, until the baseline is lowered in the same commit.**
+  A bucket *below* its baseline is an error naming the exact command
+  (`--write-baseline`). That is what makes it a ratchet rather than a threshold:
+  the number cannot drift down informally and then drift back up unnoticed.
+- **`--write-baseline` refuses to write a higher number** even when asked
+  directly (mutant `M12`), so the one move the ratchet must never make is not
+  available through the tool that maintains it.
+- **The allowlist is itself a ratchet.** Entries carry an *exact* expected count,
+  not a blanket file exemption. A third `kCUDA` in a two-registrar file fails
+  (`M8`); so does removing one of the two (`M9`). Only `platforms/cuda.cpp` — the
+  file that IS the CUDA platform — is exempt wholesale.
+- **The escape hatch is loud.** `// DSR-ALLOW(<row-id>): <reason>` is printed on
+  every run, pass or fail, with its count; a marker without a row id and a reason
+  grants no exemption (`M15`). **0 are in force today.**
+
+### 8.4 Mutation evidence — the checker demonstrably catches leaks
+
+24/24 in `tests/scripts/test_device_leakage.py`, each planting one defect in a
+synthetic shared-layer tree and requiring the specific error:
+
+| Proves | Mutants |
+|---|---|
+| an added device reference FAILS | `M1` `kCUDA`, `M2` `is_cuda()`, `M3` unguarded CUDA include, `M6` `#ifdef VT_*`, `M18` the same test hidden behind a helper (audit Risk 2 — the metric is not gameable by indirection, because the helper is in the shared layer too) |
+| adding a BACKEND never trips it | `M7` (new platform file + extra methods on the CUDA leg → still green) |
+| the allowlist cannot rot into a blanket exemption | `M8` (extra ref in a budgeted file fails), `M9` (stale-wide allowlist fails) |
+| monotonic decrease | `M10` (reduction fails until declared), `M11` (same-commit lowering passes), `M12` (upward write refused) |
+| the escape hatch is real, bounded, loud | `M13`, `M14`, `M15` |
+| composition is honest in both directions | `M4`/`M5` (guarded vs `#else`-arm include), `M16`/`M17` (comment and string mentions not counted), `M19` (`src/vt/cuda/` device legs not scanned at all) |
+| the real tree, not just mutants | baseline matches exactly; every allowlisted path exists; every allowlist entry states a reason; **`qwen3_5.cpp` holds a strict majority of all DSR** — the audit's headline finding asserted as an executable fact, so if it ever stops being true the `S4`/`S7` plan is known to be mis-aimed |
+
+### 8.5 Where the leakage sits at `18094ee` (`--report`)
+
+`qwen3_5.cpp` = **66 of 86 (77%)** — up from the audit's 71% share, because the
+two real reductions since `72f5db2` both landed *outside* it. Everything else:
+`dense_nvfp4_gemm.h` 5, `deepseek_v2.cpp` 2, `qwen3.cpp` 2, `runner.cpp` 2, and
+seven files with 1 each.

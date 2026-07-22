@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "DSR baseline for scripts/check-device-leakage.py (work row S1 of",
+    ".agents/specs/accelerator-seam-audit.md). Device-Specific References",
+    "in the device-agnostic shared layer (src/vllm/ + include/vllm/),",
+    "net of the checker's per-file platform-leg allowlist.",
+    "THIS NUMBER MAY ONLY EVER GO DOWN. Lower it in the SAME commit as the",
+    "reduction that earned it, by running:",
+    "  python3 scripts/check-device-leakage.py --write-baseline",
+    "It is a leakage budget, never to be raised to make a failing check pass."
+  ],
+  "total": 86,
+  "buckets": {
+    "kcuda": 44,
+    "is_cuda": 10,
+    "cuda_inc": 0,
+    "vt_ifdef": 32
+  }
+}

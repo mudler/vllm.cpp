@@ -19181,3 +19181,80 @@ run as evidence about the CPU quant path. Do not benchmark llama.cpp immediately
 after one of our 6.4 GiB arms without letting the page cache settle — two `tg32`
 legs in this series returned 17.40±9.70 and 3.95±1.83 under exactly that
 pressure and were discarded, not averaged.
+
+## 2026-07-22 — `S1`: the DSR device-leakage ratchet (`BACKEND-SEAM-AUDIT`, `CLAIM-BACKEND-SEAM-S1-1`)
+
+Base `18094ee`, worktree `agent-aa66b10e5d9fcf1f8`. Work row `S1` of
+[accelerator-seam-audit.md](specs/accelerator-seam-audit.md) — the cheapest row in
+that plan and the one that guards every row after it. **Tooling and records only:
+not one file under `src/` or `include/` was touched**, so there is no behaviour
+change, and no build, model gate or benchmark is owed or claimed. No GPU, nothing
+downloaded.
+
+**What landed.** `scripts/check-device-leakage.py` (four buckets over
+`src/vllm/` + `include/vllm/`, comment/string-stripping, preprocessor-guard
+aware), `scripts/device-leakage-baseline.json`, the `device-leakage` job in
+`.github/workflows/ci.yml`, and `tests/scripts/test_device_leakage.py` (24 cases).
+The checker runs standalone with no CUDA toolkit and no GPU, exactly like the
+`cmake/CudaArchFeaturesTest.cmake` precedent it was modelled on.
+
+**The baseline was re-derived rather than carried, and it MOVED: 94 -> 86.**
+Running the as-built checker at the audit's own base `72f5db2` yields **88**,
+which splits the delta cleanly and honestly:
+- **-6 is a composition correction to the audit itself.** (a) It counted `kCUDA`
+  appearing inside COMMENTS while explicitly excluding comments from its
+  `is_cuda()` bucket — an internal inconsistency; the metric now strips comments
+  and string literals uniformly, because a prose mention or a `VT_CHECK` message
+  is not a branch. (b) Its "4 unconditional CUDA includes" were **all already
+  `#ifdef VLLM_CPP_CUDA` / `#ifdef VT_*` guarded** at `72f5db2` — a measurement
+  error (the audit grepped the include without reading the surrounding
+  preprocessor context), so class F never existed and that part of `S2` is not
+  owed.
+- **-2 is real reduction** landed on main since: `model_loader.cpp`'s hard-coded
+  `GetBackend(kCUDA)` became `SelectQueue()` (emptying class E), and
+  `runner.cpp:516` came off `is_cuda()`.
+
+**The seven-class composition was re-verified site-by-site, and it SHARPENS the
+audit rather than softening it.** B=5 and G=32 exact; C 16->10 (6 of the audit's
+allowlist entries were comments, which the as-built metric ignores outright — a
+strictly better outcome, since an exemption that exists only to excuse a comment
+could later shelter a real branch); D 6->**3** (`runner.cpp:516` fixed, and
+`deepseek_v2.cpp:311` `GroupedMoeEligible` reads as class A on inspection, not D
+— it gates the availability of `vt::MoeGroupedGemmBf16`, not a device policy);
+E 1->0; F 4->0; A=46. So **3 of 86 are genuine device policy** where the audit
+said 6 of 94 — 96.5% of the shared layer's device references are build config, a
+duplicated `GetOp` throw, or the shared layer asking a question the op/provider
+table already answers.
+
+**How the ratchet enforces monotonic decrease.** Per bucket AND in total (the
+audit specified total only; per-bucket is stricter on purpose, because a
+total-only check would let a removed `#ifdef VT_*` pay for a newly added
+`kCUDA`). A bucket *below* baseline also fails, naming the exact command, so a
+reduction must lower the baseline in the same commit. `--write-baseline` refuses
+to write a higher number even when asked directly. The allowlist carries EXACT
+per-file/per-bucket counts with stated reasons, so it cannot rot into a blanket
+exemption — only `platforms/cuda.cpp`, the file that IS the CUDA platform, is
+exempt wholesale. `// DSR-ALLOW(<row-id>): <reason>` is counted and printed on
+every run; **0 in force**.
+
+**Mutation evidence 24/24** (`python3 tests/scripts/test_device_leakage.py`):
+planted `kCUDA` / `is_cuda()` / unguarded CUDA include / `#ifdef VT_*` each FAIL
+with their specific error; a device test hidden behind a shared-layer helper
+still FAILS (audit Risk 2 — the metric is not gameable by indirection); adding a
+backend leg PASSES; a third `kCUDA` in a two-registrar file FAILS and so does
+removing one of the two; a reduction FAILS until declared; an upward baseline
+write is REFUSED; comment/string mentions and `src/vt/cuda/` device legs are
+correctly not counted. Four real-tree assertions too, including that
+`qwen3_5.cpp` holds a strict majority of all DSR — the audit's headline finding
+asserted as an executable fact, so if it ever stops being true we learn that
+`S4`/`S7` are mis-aimed.
+
+**Deliberately NOT done.** `qwen3_5.cpp` — 66 of 86 DSR (77%), and the tree's most
+contended file — is measured by this row and not edited by it. `S2`–`S8` remain
+unclaimed; no implementation row moved.
+
+**Resume/verify.** `python3 scripts/check-device-leakage.py --report` (add
+`--list` for every counted site), `python3 tests/scripts/test_device_leakage.py`,
+`python3 scripts/check-agent-record.py`, `python3 scripts/check-doc-checkpoint.py`.
+Next: `S2` residue is now just Metal `get_attn_backend_priority()`, then `S3`
+(platform capability fields, which retires the 3 remaining class-D sites).

@@ -94,6 +94,28 @@ jobs:
       - uses: actions/checkout@v4
       - name: CUDA feature table resolves per architecture
         run: cmake -P cmake/CudaArchFeaturesTest.cmake
+  device-leakage:
+    # The DSR RATCHET (work row `S1` of .agents/specs/accelerator-seam-audit.md).
+    # Counts device-specific references in `src/vllm/` + `include/vllm/` — the
+    # layer that is supposed to be device-agnostic — and fails on ANY increase
+    # over scripts/device-leakage-baseline.json. A reduction must lower the
+    # baseline in the SAME commit, so the number can only ever move down.
+    #
+    # It exists because the audit re-measured the leakage and found it had DRIFTED
+    # UPWARD with no bad commit: DeepSeek-V2, Qwen3-Coder and the attention-registry
+    # work each added a device test in passing. Leakage grows silently under
+    # well-executed work, which is a job for a ratchet, not a cleanup.
+    #
+    # Needs neither a CUDA toolkit nor a GPU — pure static analysis, like the
+    # cuda-arch-features job above. The mutation suite proves the checker actually
+    # catches a planted leak; an unpoliced checker is worse than none.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shared-layer device leakage does not grow (DSR ratchet)
+        run: |
+          python3 scripts/check-device-leakage.py --report
+          python3 tests/scripts/test_device_leakage.py
   build-test-cpu:
     runs-on: ubuntu-latest
     steps:

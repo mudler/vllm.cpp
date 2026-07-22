@@ -39,7 +39,22 @@ set(VLLM_CPP_CUDA "AUTO" CACHE STRING "Build the CUDA backend: ON, OFF, or AUTO 
 # a macOS developer and is invisible everywhere else. Resolved to a plain ON/OFF
 # a few lines below the CUDA resolution.
 set(VLLM_CPP_METAL "AUTO" CACHE STRING "Build the Metal backend: ON, OFF, or AUTO (detect)")
-set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_121)")
+# Supported values today are the sm_12x (consumer/GB10 Blackwell) family:
+#   121a          GB10 / DGX Spark — the default and the only arch with a GATED
+#                 runtime here (every gate model, every benchmark).
+#   120a          consumer Blackwell (RTX 5070/5080/5090 class). Same family, same
+#                 kernel bodies, same FEATURE-TABLE cells; BUILD-supported and
+#                 verified to emit sm_120a SASS, but NOT runtime-gated here — no
+#                 sm_120 board exists on this hardware. See backend-matrix.md
+#                 BACKEND-CUDA-SM120 for exactly what is and is not proven.
+#   120a;121a     same-family FAT binary; builds clean and carries both SASS
+#                 targets. NOTE: incompatible with -DVLLM_CPP_TRITON=ON, because a
+#                 vendored AOT cubin is single-arch (TritonAOT.cmake explains and
+#                 diagnoses this); the portable CUDA kernels cover the fat build.
+# A cross-FAMILY list (e.g. "90a;121a") resolves its features honestly but does
+# NOT compile — the sources are gencode'd for the whole list and no cross-family
+# tactic body exists. See .agents/specs/cuda-arch-additivity.md.
+set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a, consumer Blackwell=120a, same-family fat binary=120a;121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_120/sm_121)")
 option(VLLM_CPP_BENCH_PROFILE_CONTROL
   "Compile trace-only SIGUSR2/cudaProfiler replay control plus FIFO graceful shutdown (never for production timing builds)"
   OFF)

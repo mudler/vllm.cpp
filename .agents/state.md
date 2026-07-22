@@ -17606,3 +17606,101 @@ flock $HOME/gpu.lock ./tests/test_qwen36_paged_engine     # 315/315
 
 python3 scripts/check-agent-record.py && python3 scripts/check-doc-checkpoint.py
 ```
+
+## 2026-07-22 — sm_120a (consumer Blackwell) brought up as a BUILD-supported CUDA target (`CLAIM-CUDA-SM120-BRINGUP`, base `13bb724`, worktree `agent-a4e52891bbc7e9ac7`)
+
+**USER PRIORITY 1 ("mechanically add the CUDA architectures vLLM supports") had
+built the framework and added zero actual architectures. This adds the first
+one.** `BACKEND-CUDA-SM120` moves `PARTIAL` -> `ACTIVE`, meaning **claimed and
+BUILD-supported** — the same sense in which the Metal row is `ACTIVE` for a gated
+skeleton. It is deliberately NOT a runtime-support claim.
+
+**The headline is what sm_120a did NOT need: zero kernel, model, runner, sampler
+or feature-table edits.** The breadth-sweep audit's §A.3 predicted a same-family
+target would be "one line plus a Triton directory, zero kernel/model edits". That
+prediction is now CONFIRMED BY MEASUREMENT and was, if anything, pessimistic —
+even the feature table needed no widening, because W1 wrote its cells as
+`12.0a,12.1a` from the start (mirroring vLLM's own `FP4_SM120_ARCHS "12.0a;12.1a"`,
+which groups 12.0 and 12.1 as ONE capability set). The runtime seams were already
+family-keyed rather than GB10-keyed: the fp4 tactic predicate is
+`caps.sm_major == 12`, attention priority is `LookupAttnPriority(major)`, and the
+residency classification is `pageable && integrated` — which is exactly the
+discrete-sm_120 case PR #5 fixed against richiejp's RTX 5070 Ti.
+
+**THE CRUX — the recorded "heterogeneous fat build cannot compile" obstacle is
+FAMILY-SCOPED, and the same-family case does not hit it.** This was determined
+empirically before anything was written, because it decided the shape of the
+whole task. `-DVLLM_CPP_CUDA_ARCHITECTURES="120a;121a"` configures, compiles and
+links `-Werror` clean, **0 warnings**, `FAT_BUILD_EXIT=0`. The reason is concrete:
+the sm12x-only PTX (`mma.sync ... kind::mxf4nvf4`), its `__CUDA_ARCH_SPECIFIC__`
+guard, and the CUTLASS `Sm120` arch tag are all satisfied by BOTH `120a` and
+`121a`. `cuobjdump -lelf libvllm.a` proves the fat binary is real: **38 TUs carry
+an `sm_120a` cubin and the same 38 carry `sm_121a`**, `cuda_matmul_nvfp4.cu` among
+them. The cross-family case is UNCHANGED — `"90a;121a"` still cannot compile, and
+per-source gencode narrowing (vLLM's `set_gencode_flags_for_srcs`) remains W7's
+HW-blocked job. The spec's Risks #1 is amended to say family-scoped, not repealed.
+
+**Triton AOT: an honest NO, with a clear diagnostic.** A vendored AOT artifact
+embeds a cubin for exactly one `sm_<cc>`; `cuModuleLoadData` rejects it on any
+other SM, so **no single vendored tree can be correct for a fat build**. The old
+derivation joined the arch list into a nonexistent `sm_120a_121a` and then failed
+with a misleading "regenerate this arch" hint. `_triton_aot_arch_name` now detects
+the multi-arch case and names the three real options. **The build degrades
+gracefully:** `VLLM_CPP_TRITON` defaults OFF and the hand C++/CUDA kernels are the
+always-available fallback, which is how the fat build above was produced.
+`triton_aot_vendored/sm_120a/` is **deliberately absent — no cubins were faked for
+hardware we cannot run**; producing it requires `-DVLLM_CPP_TRITON_REGEN=ON` ON an
+sm_120 card.
+
+**GB10 REGRESSION PROOF — the real risk here, and it is clean.** A fat build
+changes codegen for the architecture we DO run, so the full set was re-run ON the
+fat binary, built with the production flags and differing from production in the
+arch list ALONE (`-DVLLM_CPP_TRITON=ON -DVLLM_CPP_TRITON_VENDORED_ARCH=sm_121a`),
+each gate STANDALONE, GPU verified idle, every stage under `flock $HOME/gpu.lock`:
+**27B 235/235 · 35B 315/315 · Qwen3-Coder 138/138 (6/6) · Qwen3-dense 664/664
+(16/16 on both 0.6B and 4B) · OPT 36/36 (6/6) · DeepSeek-V2-Lite 223/223 (8/8) —
+ALL UNCHANGED**, 0 warnings on the clean `-Werror` build. Golden corpus (475
+files) md5 identical before AND after: `2965ef5772b556d3f3f86fedf4221b2f`.
+
+**Landed, and nothing more:** `cmake/CudaArchFeaturesTest.cmake` (NEW — 35 hard
+expectations on the per-arch resolution, `cmake -P`, no CUDA toolkit and no GPU
+needed, mutant-checked, wired into CI as the `cuda-arch-features` job); the
+TritonAOT multi-arch diagnostic; a documented `VLLM_CPP_CUDA_ARCHITECTURES` cache
+entry. **The default stays `121a`** — making the fat binary the default would
+double every build for no GB10 benefit.
+
+**HONESTY LINE — what is NOT proven.** No gate model, kernel suite or benchmark
+has ever executed on sm_120 hardware, because none exists here. A green fatbinary
+link is not execution evidence. The only sm_120 runtime evidence in the tree is
+the external RTX 5070 Ti loader/backend leaf result (PR #5), cited rather than
+re-derived. `docs/BENCHMARKS.md` records `NOT APPLICABLE`: there is nothing to
+benchmark and no number is owed.
+
+**What an RTX 50-series owner must do to validate it** (spec §W8 has the full
+list): configure with `-DVLLM_CPP_CUDA_ARCHITECTURES=120a -DVLLM_CPP_TRITON=OFF`,
+run the unit tier (`test_cuda_backend` — a discrete 5070 must classify as
+NON-unified — plus `test_ops_nvfp4_fp4`, `test_ops_fp8_cutlass`,
+`test_ops_paged_attn`, `test_ops_moe_grouped`), then a gate model end to end
+against its golden, and report the counts. Only that last step would move this row
+past a build-supported claim.
+
+**NEXT for `ROAD-V1-D1`:** the remaining CUDA fan-out is cross-family and stays
+HW-blocked — it needs per-arch tactic bodies plus the W7 gencode restructure, not
+another table row. The additive contract is now demonstrated end to end, so the
+actionable breadth remains the MODEL sweep (Deliverable B) and the non-CUDA
+backends.
+
+```
+# Resume / re-verify
+cmake -P cmake/CudaArchFeaturesTest.cmake                    # 35/35, no GPU needed
+ssh dgx.casa
+cd ~/work/sm120a
+cmake -S src2 -B bfat -DCMAKE_BUILD_TYPE=Release \
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+  -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_CUDA_ARCHITECTURES="120a;121a"
+cmake --build bfat -j20                                      # 0 warnings
+cuobjdump -lelf bfat/libvllm.a | grep -oE 'sm_[0-9]+a?' | sort | uniq -c   # 38 sm_120a, 38 sm_121a
+
+python3 scripts/check-agent-record.py && python3 scripts/check-doc-checkpoint.py
+```

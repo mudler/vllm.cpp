@@ -83,6 +83,17 @@ jobs:
             exit 1
           fi
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
+  cuda-arch-features:
+    # Configure-tier assertions on the CUDA per-arch FEATURE TABLE. Needs neither
+    # a CUDA toolkit nor a GPU: it drives cmake/CudaArchFeatures.cmake directly,
+    # so the resolution that decides which architectures get fp4-mma /
+    # cutlass-nvfp4 / cutlass-fp8 / marlin-nvfp4 / fa2 (whose historical failure
+    # mode was a SILENT capability drop) is checked on every push.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CUDA feature table resolves per architecture
+        run: cmake -P cmake/CudaArchFeaturesTest.cmake
   build-test-cpu:
     runs-on: ubuntu-latest
     steps:

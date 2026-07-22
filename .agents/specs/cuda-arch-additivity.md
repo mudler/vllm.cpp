@@ -1,6 +1,8 @@
 # CUDA-architecture additivity — implementation spike
 
-Status: **IMPLEMENTED (framework seams only)**. Owner: `CLAIM-CUDA-ARCH-ADDITIVITY`.
+Status: **IMPLEMENTED — framework seams (W1-W6) plus the FIRST architecture brought
+up through them (W8: `sm_120a`, BUILD-supported, runtime HW-blocked)**.
+Owners: `CLAIM-CUDA-ARCH-ADDITIVITY` (the seams), `CLAIM-CUDA-SM120-BRINGUP` (W8).
 Rows: **`BACKEND-CUDA-ARCH-ADDITIVITY`** (new, the seam row), advancing
 `BACKEND-CUDA-SM120` / `BACKEND-CUDA-SM121` / `BACKEND-CUDA-COMP-FP4` /
 `BACKEND-CUDA-COMP-MARLIN` / `BACKEND-CUDA-COMP-SCALEDMM-C3X` / `BACKEND-CUDA-COMP-FA`.
@@ -16,10 +18,15 @@ registration**, instead of a hunt through four CMake regexes and three host
 launchers.
 
 **What this change is NOT.** It does not make any untested architecture
-supported. No non-`sm_121` target has hardware here, so nothing moves off
-`INVENTORIED`. In the audit's own words, cross-family bring-up "is a kernel
-campaign, not an additive drop-in" (§A.4); this spec builds the seams that
-campaign will plug into, and nothing more.
+supported. In the audit's own words, cross-family bring-up "is a kernel
+campaign, not an additive drop-in" (§A.4); the W1-W6 body of this spec builds the
+seams that campaign will plug into, and nothing more.
+
+**W8 AMENDS ONE SENTENCE OF THAT, and only one.** `BACKEND-CUDA-SM120` has moved
+off `INVENTORIED` — but to **BUILD-supported**, not to runtime support. sm_120a
+compiles, emits real SASS, and resolves every feature; it has never executed a
+gate model here and cannot until someone owns the hardware. Everything else above
+stands. See §W8 in the work breakdown.
 
 ---
 
@@ -141,7 +148,7 @@ and by `tests/kernels/` skipping on capability). The equivalent local coverage:
 
 | Case | Local tier | Anchor |
 |---|---|---|
-| CMake feature resolution across single-arch, multi-arch, unsupported-arch and base-suffix target lists | configure-tier, run as the GAP #1 gate | `cmake -P` over `cmake/CudaArchFeatures.cmake`, plus the real `cmake -S . -B` configures in Gates |
+| CMake feature resolution across single-arch, multi-arch, unsupported-arch and base-suffix target lists | configure-tier, run as the GAP #1 gate | `cmake/CudaArchFeaturesTest.cmake` (W8) — `cmake -P`, no CUDA toolkit and no GPU needed, 35 hard expectations over `121a` / `120a` / `120a;121a` / base `120`,`121` / `90a;121a` / `80`; wired into CI as the `cuda-arch-features` job. Mutant-checked: narrowing the `fp4-mma` row to `12.1a` fails it (exit 1, 2 mismatches). Plus the real `cmake -S . -B` configures in Gates |
 | backend carries the driver-reported capability | doctest | `tests/vt/test_cuda_backend.cpp` — "CUDA backend reports the device compute capability" |
 | capability probe is real; registry is registered, consulted, and SELECTS | doctest | `tests/vt/test_ops_nvfp4_fp4.cpp` — "CUDA arch tactic registry is exercised by the fp4xfp4 launcher" |
 | the smem opt-in ceiling is the queried attribute | exercised by every WMMA path in | `tests/vt/test_ops_paged_attn.cpp` |
@@ -174,6 +181,7 @@ cmake --build <scratch>/build -j20
 | memcheck | 0 errors on the engine path |
 | record checkers | `scripts/check-agent-record.py`, `scripts/check-doc-checkpoint.py` |
 | **GAP #1 evidence** | configure with `-DVLLM_CPP_CUDA_ARCHITECTURES="90a;121a"` and capture the STATUS block showing fp4-mma / cutlass-nvfp4 / cutlass-fp8 / marlin-nvfp4 / fa2 **ENABLED for [121a]** with a named WARNING for `90a`; and a single-arch `121a` configure producing an identical feature set to before |
+| **W8 sm_120a evidence** | (a) `cmake -P cmake/CudaArchFeaturesTest.cmake` — 35/35 expectations, no CUDA toolkit and no GPU; (b) configure `120a` and `120a;121a` showing all five features `ENABLED for [120a]` with no missing-tactic warning; (c) fat `"120a;121a"` build to 100%, `-Werror` **0 warnings** (`FAT_BUILD_EXIT=0`) AND single-arch `"120a"` build to 100%, `-Werror` **0 warnings** (`BUILD_C_EXIT=0`) — the configuration a 5070 owner would actually use; (d) `cuobjdump -lelf libvllm.a` showing **38 `sm_120a` + 38 `sm_121a`** cubins on the fat build and **38 `sm_120a` alone** on the single-arch build, the fp4-MMA TU among them; (e) the whole GB10 regression set re-run ON the fat binary at production flags, each STANDALONE: 27B 235/235, 35B 315/315, Coder 138/138, Qwen3-dense 664/664, OPT 36/36, DeepSeek-V2 223/223 — ALL UNCHANGED; goldens md5 `2965ef5772b556d3f3f86fedf4221b2f` before AND after |
 | **seam-exercised evidence** | the registry counters must MOVE — a passing gate is not proof a new path ran (the W7 decode graph: graph-ON and graph-OFF logs were byte-identical until a stats counter proved capture). `VT_ARCH_TACTIC_STATS=1` prints the selected tactic; the doctest asserts `fallbacks` advances on the production default and `selections` advances with `last_selected == "nvfp4-fp4-mma/sm12x"` under `VT_NVFP4_FP4_NATIVE=1` |
 
 **Performance.** `benchmark_binding=false`. This change adds no kernel and
@@ -203,11 +211,82 @@ predicate over an 8-entry table, off the gate models' default path entirely
 | W5 | positive-signal tests | `tests/vt/test_cuda_backend.cpp`, `tests/vt/test_ops_nvfp4_fp4.cpp` | DONE |
 | W6 | dgx gate battery + multi-arch configure evidence | — | see ledger |
 | W7 | **FUTURE, HW-BLOCKED** — per-source `-gencode` narrowing + the first cross-family tactic body | `cmake/CudaArchFeatures.cmake`, a new per-arch TU | NOT STARTED |
+| W8 | **sm_120a bring-up — the first ADDITIVE architecture exercised end to end.** Same-family fat build proven to compile; Triton-AOT multi-arch diagnosis; configure-tier feature-table test + CI job | `cmake/TritonAOT.cmake`, `cmake/CudaArchFeaturesTest.cmake` (new), `CMakeLists.txt`, `.github/workflows/ci.yml` | DONE (BUILD-supported; runtime UNPROVEN — no sm_120 board here) |
+
+### W8 — sm_120a, measured
+
+The audit's §A.3 template predicted a same-family target would be "zero
+kernel/model edits". **Measured, that prediction holds, and the arch needed ZERO
+edits to the feature table or to any kernel** — the `12.0a` cells were already
+written into `VT_CUDA_FEATURE_TABLE` when W1 landed, so `sm_120a` was already
+resolvable; what was missing was the evidence, the Triton-AOT answer, and the
+record. All three land here.
+
+**The heterogeneous-fat-build obstacle (Risks #1) is FAMILY-SCOPED, and the
+same-family case does NOT hit it.** `"120a;121a"` configures, compiles and links
+`-Werror` clean, 0 warnings, on dgx with nvcc 13.0 (`~/work/sm120a/bfat`,
+`FAT_BUILD_EXIT=0`) — and so does the single-arch `"120a"` build a 5070 owner
+would actually use (`~/work/sm120a/bc120`, `BUILD_C_EXIT=0`, 0 warnings, 38 TUs
+carrying `sm_120a` and nothing else). `cuobjdump -lelf` over the resulting `libvllm.a` reports
+**38 TUs carrying an `sm_120a` cubin and the same 38 carrying `sm_121a`** — the
+fp4-MMA TU among them (`cuda_matmul_nvfp4.cu.1.sm_120a.cubin` /
+`.2.sm_121a.cubin`). This is exactly what Risks #1 said could not be assumed for
+a cross-family list and deliberately did not claim either way for a same-family
+one: the sm12x-only PTX (`mma.sync ... kind::mxf4nvf4`) and the `__CUDA_ARCH_SPECIFIC__`
+guard are satisfied by BOTH `120a` and `121a`, so per-source gencode narrowing is
+not needed here. Risks #1 stands unchanged for cross-family lists (`"90a;121a"`
+still cannot compile, and W7 still owns that).
+
+**Triton AOT does NOT extend to a fat build, and that is a cubin property, not a
+gap to fix.** Each vendored artifact embeds a cubin built for one `sm_<cc>`;
+`cuModuleLoadData` rejects it on any other SM, so no single vendored tree is
+correct for `"120a;121a"`. Previously the arch-dir derivation joined the list into
+a nonexistent `sm_120a_121a` and failed with a misleading "regenerate this arch"
+hint; `_triton_aot_arch_name` now detects the multi-arch case and says what is
+actually wrong plus the three honest options. **The build degrades gracefully:**
+`VLLM_CPP_TRITON` defaults OFF, the hand C++/CUDA kernels are the always-available
+fallback, and the fat build above was produced with `-DVLLM_CPP_TRITON=OFF` with
+no loss of correctness. A single-arch `sm_120a` build with Triton AOT requires a
+`triton_aot_vendored/sm_120a/` tree, which can only be produced ON an sm_120
+board (`scripts/regen-triton-aot.sh`, `-DVLLM_CPP_TRITON_REGEN=ON`, needs
+Python+Triton+ptxas). **No cubins were faked**; the directory is deliberately
+absent and configuration fails loudly rather than shipping an sm_121a cubin to an
+sm_120 device.
+
+**What is PROVEN for sm_120a:** configure-time feature resolution (fp4-mma,
+cutlass-nvfp4, cutlass-fp8, marlin-nvfp4, fa2 all ENABLED for `[120a]` and for
+`[120a;121a]`, with no missing-tactic warning), a clean `-Werror` compile, real
+`sm_120a` SASS in the archive, and the runtime seams being capability-keyed on
+`major == 12` (`Sm12xFp4MmaSupports`, `LookupAttnPriority`) rather than on 121.
+`BACKEND-CUDA-SM120` additionally carries an external contributor's RTX 5070 Ti
+result (the discrete-Blackwell `pageable && integrated` memory classification,
+PR #5) — a real sm_120 device exercising the loader/backend leaf.
+
+**What is NOT proven:** any sm_120 execution of the gate models, kernels, or
+throughput. No sm_120 board exists on this hardware. A green fatbinary link is
+not execution evidence and this row does not treat it as such.
+
+**What an RTX 50-series owner must do to validate it:**
+1. `cmake -S . -B build -DVLLM_CPP_CUDA_ARCHITECTURES=120a -DVLLM_CPP_TRITON=OFF`
+   (plus `-DVLLM_CPP_CUTLASS_DIR=<cutlass >=4.5.0>`), then build.
+2. Run the unit tier first — `test_cuda_backend` (expects `pageable && integrated`
+   to classify a discrete 5070 as NON-unified), `test_ops_nvfp4_fp4`,
+   `test_ops_fp8_cutlass`, `test_ops_paged_attn`, `test_ops_moe_grouped`.
+3. Run a gate model end to end against its golden and report token counts.
+4. Optionally `-DVLLM_CPP_TRITON_REGEN=ON` on the device to produce
+   `triton_aot_vendored/sm_120a/`, then rebuild with `-DVLLM_CPP_TRITON=ON`.
+Only step 3, reported with its counts, would move `BACKEND-CUDA-SM120` past a
+build-supported claim.
 
 ### Risks/decisions
 
-1. **A heterogeneous fat build still cannot COMPILE, and that is now loud rather
-   than silent.** Feature ENABLEMENT is resolved per arch, but the sources are
+1. **A CROSS-FAMILY fat build still cannot COMPILE, and that is now loud rather
+   than silent.** (AMENDED at W8, by measurement: this limitation is
+   **family-scoped**. A SAME-FAMILY fat build — `"120a;121a"` — configures,
+   compiles and links `-Werror` clean and carries both SASS targets, because the
+   sm12x-only PTX, its `__CUDA_ARCH_SPECIFIC__` guard and the CUTLASS `Sm120` arch
+   tag are satisfied by both. The paragraph below stands unchanged for a
+   cross-family list such as `"90a;121a"`.) Feature ENABLEMENT is resolved per arch, but the sources are
    still compiled for the whole `CMAKE_CUDA_ARCHITECTURES` list, so a
    `"90a;121a"` *build* fails on the sm12x-only PTX. Narrowing gencode per source
    requires vLLM's `set_gencode_flags_for_srcs`

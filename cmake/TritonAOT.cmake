@@ -92,12 +92,38 @@ set(VLLM_CPP_TRITON_TARGET "" CACHE STRING
 set_property(GLOBAL PROPERTY VLLM_TRITON_AOT_EXPECTED_BASE_LINES "")
 
 # _triton_aot_arch_name(OUTVAR) -> active vendored arch directory name.
+#
+# MULTI-ARCH (fat-binary) BUILDS ARE NOT SUPPORTED BY THE AOT TREE, and that is a
+# PROPERTY OF CUBINS, not a missing feature here. Every vendored artifact embeds
+# a cubin compiled for exactly one `sm_<cc>` target; `cuModuleLoadData` rejects it
+# on any other SM. A fat CUDA build (e.g. `-DVLLM_CPP_CUDA_ARCHITECTURES="120a;121a"`)
+# therefore has NO single correct AOT tree: pinning it to one arch would silently
+# ship a binary whose Triton realizations fault on the other target. The
+# derivation used to produce a nonexistent joined name ("sm_120a_121a") and fail
+# downstream with a misleading "regenerate this arch" hint; it now says exactly
+# what is wrong and what the two honest options are. The hand C++/CUDA kernels are
+# always-available fallbacks, so `-DVLLM_CPP_TRITON=OFF` degrades gracefully with
+# no loss of correctness (see .agents/specs/cuda-arch-additivity.md).
 function(_triton_aot_arch_name OUTVAR)
   if(VLLM_CPP_TRITON_VENDORED_ARCH)
     set(_a "${VLLM_CPP_TRITON_VENDORED_ARCH}")
   else()
-    string(REPLACE ";" "_" _a "${VLLM_CPP_CUDA_ARCHITECTURES}")
-    set(_a "sm_${_a}")
+    list(LENGTH VLLM_CPP_CUDA_ARCHITECTURES _n_archs)
+    if(_n_archs GREATER 1)
+      message(FATAL_ERROR
+        "VLLM_CPP_TRITON=ON is incompatible with the multi-architecture (fat) CUDA "
+        "build VLLM_CPP_CUDA_ARCHITECTURES='${VLLM_CPP_CUDA_ARCHITECTURES}'.\n"
+        "Vendored Triton AOT artifacts embed a cubin built for ONE sm_<cc> target; "
+        "the CUDA driver refuses to load it on any other SM, so no single vendored "
+        "tree is correct for this build.\n"
+        "Options:\n"
+        "  * build the fat binary with -DVLLM_CPP_TRITON=OFF (the portable C++/CUDA\n"
+        "    kernels are the always-available fallback; correctness is unaffected), or\n"
+        "  * build one single-arch binary per target with -DVLLM_CPP_TRITON=ON, or\n"
+        "  * set -DVLLM_CPP_TRITON_VENDORED_ARCH=sm_<cc> to pin ONE tree, which is\n"
+        "    only sound when every device you will run on matches that cubin.")
+    endif()
+    set(_a "sm_${VLLM_CPP_CUDA_ARCHITECTURES}")
   endif()
   set(${OUTVAR} "${_a}" PARENT_SCOPE)
 endfunction()

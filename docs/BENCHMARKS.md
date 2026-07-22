@@ -1538,6 +1538,22 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **sm_120a (consumer Blackwell) as a BUILD-supported CUDA target — `NOT
+  APPLICABLE` (2026-07-22, `CLAIM-CUDA-SM120-BRINGUP`,
+  [spec §W8](../.agents/specs/cuda-arch-additivity.md)).**
+  `benchmark_binding=false`. **No sm_120 hardware exists here, so there is
+  nothing to benchmark and no number is owed, pending, or claimed.** The change
+  is build-configuration plus records: a configure-tier feature-table test and
+  its CI job, a precise Triton-AOT multi-arch diagnostic, and a documented cache
+  entry. It adds no kernel, changes no dispatch and touches no numeric path.
+  The GB10 relevance is purely negative and was verified, not assumed: the
+  same-family fat binary `"120a;121a"` changes CODEGEN for the architecture we
+  do run, so the full regression set was re-run ON the fat binary and is
+  unchanged (see the ledger row). No existing binding number is created,
+  re-based or invalidated. The first sm_120 speed number this project could ever
+  publish requires an actual RTX 50-series card; the validation steps for an
+  owner are in the spec.
+
 - **Qwen3-32B NVFP4A16 (compressed-tensors W4A16) — CORRECTNESS MET,
   SPEED PENDING (2026-07-21, `CLAIM-QUANT-NVFP4-CT-W4A16`,
   [spike](../.agents/specs/sweep-qwen3-32b-nvfp4a16.md)).**

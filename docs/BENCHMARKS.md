@@ -1414,7 +1414,7 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   output throughput, req/s, TTFT, TPOT/ITL, peak memory) at c1/c2/c4/c8, with
   token-exact correctness as a precondition that may never be traded off.
 
-- **MLA + DeepSeek/Kimi/MiniMax campaign — SPIKE ONLY (2026-07-21,
+- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W4 (2026-07-22,
   `CLAIM-MLA-DEEPSEEK`,
   [spike](../.agents/specs/mla-deepseek-campaign.md)).**
   `benchmark_binding=false`; **NOT APPLICABLE.** W0 ran the vLLM oracle on
@@ -1436,6 +1436,23 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   existing routers dispatch to the ORIGINAL kernel, unmodified. So there is no
   MoE-router or cache-write throughput delta to measure on 27B/35B/Coder/dense,
   by construction rather than by benchmark.
+  **W4 is NOT APPLICABLE for the same structural reason, and this is worth being
+  explicit about because W4 is the first entry that adds a real GPU KERNEL.**
+  `vt::MlaDecodeAttention` is a NEW `OpId` with **no caller in any model TU** —
+  the only things that invoke it are its own unit test and `TritonMLAImpl`, which
+  itself has no caller until the W7 DeepSeek-V2 forward exists. Filling
+  `TritonMLABackend::get_impl_cls()` changes what an `use_mla=true` request would
+  get, and no gate model is MLA. So no existing kernel, dispatch path or hot loop
+  moved: 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6**, Qwen3-dense
+  **16/16**, OPT **6/6** all UNCHANGED, and the full `ctest` sweep came back
+  **178/178, 0 failed** (the documented `test_capi` signature flake did not fire
+  this run). **NO SPEED NUMBER IS CLAIMED FOR THE NEW KERNEL, and none is owed
+  yet.** It is written to be CORRECT, not fast: shared-memory tiling is sized for
+  generality rather than tuned, there is no tensor-core path, and the split
+  heuristic is upstream's occupancy formula rather than a measured one. MLA decode
+  throughput is **W9**, is measured against graphed vLLM per the disposition
+  below, and until then any number from this kernel would be a
+  stale-denominator artifact. `benchmark_binding=false`.
   Therefore **no binding number is created, re-based or invalidated, and every
   existing binding result stands unchanged.** One forward-looking observation
   recorded from W0 so it cannot surprise W9: the oracle resolves DeepSeek's MoE to

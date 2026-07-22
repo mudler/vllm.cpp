@@ -1,16 +1,17 @@
 # SPIKE — MLA (Multi-head Latent Attention) + the DeepSeek / Kimi / MiniMax families
 
-**Status:** **W0 + W1 + W2 + W3 LANDED** (see `### Work breakdown`). W0 grounded
+**Status:** **W0 + W1 + W2 + W3 + W4 LANDED** (see `### Work breakdown`). W0 grounded
 every fact the spike flagged as an unverified source read — all CONFIRMED by
 runtime observation, nothing contradicted. W1 landed the behaviour-preserving
 spec-driven KV allocation + `MLAAttentionSpec`. W2 landed the MLA branch of the
 backend selector as a DATA table plus the `is_mla()`/`is_sparse()` filter that
 leaves a zero-edit seam for DSA. W3 landed the two new `vt::` ops —
 `ConcatAndCacheMla` and the grouped-topk (`noaux_tc`) router extension — each
-CPU-reference-gated. **There is still no MLA attention math, no MLA model and no
-MLA forward**: W4-W10 remain plan only, and **no model row moves off `SPIKE`** —
-W0-W3 make no model supported.
-**Base:** `b4f14ee` (spike) / `fb3fd5d` (W0+W1) / `a05437f` (W2+W3).
+CPU-reference-gated. W4 landed the MLA DECODE kernel `vt::MlaDecodeAttention` and filled
+`TritonMLABackend::get_impl_cls()`. **There is still no MLA PREFILL, no MLA model
+and no MLA forward**: W5-W10 remain plan only, and **no model row moves off
+`SPIKE`** — W0-W4 make no model supported.
+**Base:** `b4f14ee` (spike) / `fb3fd5d` (W0+W1) / `a05437f` (W2+W3) / `ed2c342` (W4).
 **Pinned oracle:** `/home/mudler/_git/vllm` @ `e24d1b24` (v0.25.0 audit target
 `702f4814fe54`). The executable oracle venv `~/venvs/vllm-oracle` lives on
 **dgx.casa**. Every claim below is grounded in repo source; the two claims that
@@ -922,7 +923,7 @@ hardware. **Nothing below is implemented; this is the plan.**
 | **W1** ✅ **DONE 2026-07-21** | **Spec-driven KV allocation (behaviour-preserving, no MLA).** Size every cache buffer from `spec->page_size_bytes()`; stop reconstructing shape from `config_`; add `KVCacheSpecKind::kMlaAttention` + `MLAAttentionSpec` with the single-tensor formula (merge assertions deferred with `merge()` itself; the distinct `kind()` is what a future `merge()` keys on). | — | **PASSED** — 27B 235/235, 35B 315/315, Coder 6/6, Qwen3-dense 16/16 all UNCHANGED; CUDA `-Werror` 0 warn/0 err; `test_kv_cache_interface` 21/21 (4 new MLA-spec cases), `test_runner` 15/15, `test_llm_engine` 5/5; new path proven EXERCISED via `fa_page_size_bytes()` + a `page_size_padded` case |
 | **W2** ✅ **DONE 2026-07-21** | **Platform MLA backend priorities + registry.** Port the `use_mla` branch of `_get_backend_priorities` (`cuda.py:93-142`) and the MLA prefill selector; register an `MLA` attention backend name resolving to TRITON_MLA on major 12. | W1 | **PASSED** — ports of `test_attention_backends_selection.py` (MLA cases), `test_mla_prefill_selector.py`, `test_mla_prefill_registry.py` in `tests/vllm/v1/attention/test_attn_backend_registry.cpp`; non-MLA selection byte-identical; `use_mla=true` on sm_121 RESOLVES to `TRITON_MLA` |
 | **W3** ✅ **DONE 2026-07-21** | **New `vt::` ops — cache write + router.** `vt::ConcatAndCacheMla` (CPU ref + CUDA) mirroring `concat_and_cache_mla`; extend `MoeRouterTopKArgs` with `scoring_func` / `e_score_correction_bias` / `num_expert_group` / `topk_group` / `routed_scaling_factor` and implement the grouped-topk selection rule. | W1 | **PASSED** — `tests/vt/test_ops_mla_cache.cpp` + `tests/vt/test_ops_moe_router_grouped.cpp`; CPU-vs-CUDA parity (exact on the cache write, exact ids on the router); grouped-topk gated at REAL V3 dims (256 experts, n_group=8, topk_group=4, sigmoid, WITH `e_score_correction_bias`); ungrouped router byte-identical |
-| **W4** | **MLA decode attention op.** `vt::MlaDecodeAttention` — the two-stage split-KV MQA decode over the latent (QK 576 / V 512), structurally mirroring `decode_attention_fwd` (vLLM <- SGLang <- lightllm) and reusing our FA-2 split+deterministic-combine pattern; registered via `cuda_arch_tactics`. | W3 | port of `test_mla_decode_cpu.py`; CPU-ref parity; run-to-run bit-reproducibility |
+| **W4** ✅ **DONE 2026-07-22** | **MLA decode attention op.** `vt::MlaDecodeAttention` — the two-stage split-KV MQA decode over the latent (QK 576 / V 512), structurally mirroring `decode_attention_fwd` (vLLM <- SGLang <- lightllm) and reusing our FA-2 split+deterministic-combine pattern; registered via `cuda_arch_tactics`. | W3 | **PASSED** — [`tests/vt/test_ops_mla_attn.cpp`](../../tests/vt/test_ops_mla_attn.cpp) (port of `test_mla_decode_cpu.py` incl. its `ref_mla` two-pass oracle, its bs=4/256/16/576/512/16 parametrization, both `varlen` arms and its NaN-padding out-of-bounds detector; plus the `test_mla_backends.py` shape sweep). dgx sm_121: 11/11 cases, 2,303,193 assertions at the REAL V2-Lite geometry (576/512/64, block 16, mscale^2 scale) over ragged / multi-block / single-block / EVERY split boundary / 128-head V3 / non-BLOCK_H head counts / a 288-256 block-32 geometry / bf16 + f32; run-to-run BIT-exact over 5 runs; memcheck **0**, racecheck **0 hazards**, synccheck **0**; clean CUDA build 0 warn/0 err; 27B 235/235 + 35B 315/315 + Coder 6/6 + Qwen3-dense 16/16 + OPT 6/6 UNCHANGED. Deviation from the plan cell: registered via the ordinary `RegisterOp` table (the W3 pattern), NOT `cuda_arch_tactics` — there is no per-arch tactic to choose between yet, and adding an empty selector would be ceremony; the tactic seam is a W9 concern when a second kernel exists |
 | **W5** | **MLA prefill.** Generalize the vendored FA-2 varlen launcher to qk 192 / v 128 (the GB10 MLA prefill backend is FLASH_ATTN, §2.3) and implement the compute-friendly materialized form plus the workspace-bounded chunked-context loop with LSE merge. | W4 | ports of `test_mla_backends.py`, `test_mla_prefill_quant_output.py` |
 | **W6** | **MLA attention block + weight absorption.** `mla_attention.{h,cpp}`: projections (both `q_lora_rank` branches), the two RMSNorms, decoupled RoPE, the load-time `kv_b_proj -> W_UK/W_UV` split, and the prefill-MHA / decode-MQA dispatch. | W5 | forward doctest; absorption round-trip vs the unabsorbed form |
 | **W7** | **DeepSeek-V2 model: registry + loader + forward.** New TU, config parse, KV spec (MLA-only group), per-expert bf16 loader + shared experts + `e_score_correction_bias`, forward composing the MLA block + `RunMoeBlock` + the first `first_k_dense_replace` dense layers. Registers all four aliases; `DeepseekForCausalLM` takes the **MHA** branch (§0.7). | W6, W3 | load gate (all tensors mapped, none left over); real-checkpoint prefill argmax |
@@ -1365,9 +1366,102 @@ argument for memcheck being a per-step gate rather than a formality, and it is
 the same shape as the standing "prove the new path RAN, a green gate does not
 prove it" rule: a passing test does not prove memory safety either.
 
-W4 `vt::MlaDecodeAttention` (two-stage
-split-KV MQA over the latent, deterministic combine, `cuda_arch_tactics`-
-registered). W5 MLA prefill (FA-2 varlen generalized to qk 192 / v 128 + the
+**W4 LANDED 2026-07-22** (base `ed2c342`). `vt::MlaDecodeAttention` — the MQA
+decode over the compressed latent (QK 576 / V 512, `num_kv_heads == 1`), reading
+the paged 3-D cache W3 writes.
+
+*(a) WHAT WAS PORTED, both sides.* `MlaDecodeStage1` <-
+`triton_decode_attention.py:278-458 _fwd_grouped_kernel_stage1` (the `IS_MLA`
+branch); `MlaDecodeStage2` <- `:575-639 _fwd_kernel_stage2`; the launch pair <-
+`:470-573 _decode_grouped_att_m_fwd` + `:642-682 _decode_softmax_reducev_fwd` +
+`:719-754 decode_attention_fwd_grouped`; `ComputeNumKvSplits` <-
+`triton_mla.py:40-47 _compute_num_kv_splits`; the caller contract <-
+`:189-260 forward_mqa`; the split workspace <- `:57-78
+_reserve_attn_logits_workspace`, realized as the house grow-only per-stream
+scratch with `RetireGraphScratch` (upstream's workspace manager has no C++
+twin, and a captured decode graph bakes the pointer). The ACTUAL Triton source
+was read, not the Python wrapper — which is how the one non-obvious thing in
+the kernel was ported correctly: at `:424-431`, under `IS_MLA` the kernel loads
+NO V tile at all, it does `v = tl.trans(k)`. V is the leading 512 columns of the
+SAME latent row already loaded as K, so our one shared-memory tile is both the K
+and the V tile. Upstream's 512+64 `BLOCK_DMODEL`/`BLOCK_DPE` two-tile split
+(`:494-496`) exists only because Triton needs power-of-two tile shapes; the
+arithmetic is one 576-wide dot either way, so we load one 576-wide row.
+
+*(b) WHERE OUR FA-2 SPLIT+COMBINE FIT, AND WHERE IT DID NOT — stated plainly
+rather than forced.* It FIT at the ALGORITHM level, exactly as W0's observation
+predicted: the split-KV schedule (partition `[0, seq_len)` into `num_kv_splits`
+contiguous chunks, one normalized partial + its LSE each), the combine algebra
+(online-softmax rescale), and our fixed-ascending / never-atomicAdd determinism
+rule all transfer unchanged. It did NOT fit at the CODE level and the vendored
+launcher is not reused: (1) `cuda_flash_attn_fa2.cu` consumes SEPARATE 4-D
+`k_cache`/`v_cache` tensors, while MLA's cache is 3-D with no K/V and no head
+axis and K and V are the same bytes; (2) its CUTLASS instantiations are compiled
+for symmetric head_dim {128, 256}, and MLA needs the ASYMMETRIC QK 576 / V 512
+(576 is not a supported FA-2 head_dim at all); (3) its combine addresses the
+output through the FA-2 params struct, which has no notion of a V width
+different from the QK width. Generalizing that launcher is tractable for W5's
+PREFILL (qk 192 / v 128) and is W5's job. This verdict is recorded in the TU
+header so the next reader does not re-litigate it.
+
+*(c) THE EVIDENCE, unit-level and deliberately strong* (there is no e2e model
+until W7, so this is the whole spine). `tests/vt/test_ops_mla_attn.cpp` ports
+`tests/kernels/attention/test_mla_decode_cpu.py`: its `ref_mla` (`:13-33`)
+becomes an INDEPENDENT TWO-PASS softmax oracle — a different algorithm from the
+streaming online-softmax BOTH of our impls use, so a bug in the streaming
+rescale cannot hide behind a matching reference — and its NaN-padding trick
+(`:71-73`, every cache row past `seq_len` poisoned, then "Likely read out of
+bounds") is ported verbatim as a real out-of-bounds detector. Its parametrization
+is ported too (bs=4, mean_seq_len=256, h_q=16, d=576, dv=512, block_size=16, BOTH
+`varlen` arms), and the `test_mla_backends.py` shape sweep is covered by: ragged
+lengths straddling every boundary (1/15/16/17/255/256/257/300), multi-block, the
+single-block single-token case, EVERY split boundary (`num_kv_splits` in
+{1,2,3,4,5,8,16,17,64,300,512} — including splits > seq_len, i.e. the empty-split
+path both stages must skip identically), 128-head DeepSeek-V3 geometry (which
+exercises head_tiles > 1, and V2-Lite's 16 heads does not), head counts 1/3/17
+that do not fill a `BLOCK_H` tile (the `mask_h` path, `:321-323`), a 288/256
+block-32 non-V2-Lite geometry, bf16 AND f32, and run-to-run BIT-exactness over 5
+runs. The block table is deliberately REVERSE-INTERLEAVED (descending,
+non-contiguous pages) so any stride assumption fails; upstream's own test uses a
+plain arange and cannot catch that. The `scale` used is the REAL mscale^2-
+corrected value, not `1/sqrt(576)`. dgx/sm_121: **11/11 cases, 2,303,193
+assertions**; the 7 CUDA cases were confirmed to EXECUTE (2,106,080 assertions
+when run alone), not skip, and the output buffer is pre-poisoned with NaN so a
+kernel that fails to write an element is caught.
+
+*(d) MEMORY SAFETY, run deliberately per the W3 lesson.* `compute-sanitizer
+memcheck` **0 errors** over the CUDA case set, and because the new kernel is a
+`__syncthreads`-coordinated shared-memory kernel — a hazard class memcheck does
+NOT cover — `racecheck` (**0 hazards**) and `synccheck` (**0 errors**) were run
+too. The W3 note that "unit tests passing does not mean the kernel is
+memory-safe" is exactly why the shared-memory tile bounds, the `mask_h` early
+return placement relative to both `__syncthreads` calls, and the opt-in dynamic
+shared-memory ceiling are all checked by tooling and not by inspection.
+
+*(e) THE ENGINE SEAM.* `TritonMLABackend::get_impl_cls()` is no longer
+`nullptr`: it returns a real `TritonMLAImpl` (`triton_mla.py:126-128,134`) whose
+`forward_mqa` is the 1:1 counterpart of `:189-260`, driven by a new
+`MLACommonMetadata` carrying exactly the two device tensors upstream reads
+(`:245-246`) plus the host `max_seq_len` that sizes the split heuristic. It
+refuses what upstream refuses (`window_size`, `:165-171`) and — importantly — a
+prefill-shaped batch throws BY NAME ("MLA prefill is campaign step W5") rather
+than silently producing wrong numbers. Recorded deviations: (i) upstream launches
+on torch's AMBIENT CUDA stream, which has no C++ twin, so `TritonMLAImpl::queue`
+is a settable field defaulting to the (correct but serializing) default stream,
+wired properly at W7; (ii) fp8 KV cache (`:390-391`) and `logit_cap` (`:404-405`)
+are NOT ported — the former is out of campaign scope and refused loudly by the op
+wrapper, the latter is unreachable because `TritonMLAImpl` rejects
+`logits_soft_cap`; (iii) `seq_len == 0` writes zeros where upstream's stage 2
+would divide by zero — unreachable upstream, and matched exactly by our CPU
+reference.
+
+*(f) NOT IN W4, on purpose.* No weight absorption (folding `W_UK` into the query
+and un-projecting with `W_UV` is W6 — `forward_mqa` takes the query already in
+latent space and returns the output still in latent space, exactly like
+upstream). No prefill. No model. No speed number: decode perf is W9, and this
+kernel is correctness-graded, not tuned.
+
+W5 MLA prefill (FA-2 varlen generalized to qk 192 / v 128 + the
 workspace-bounded chunked-context loop with LSE merge). W6 the MLA attention
 block + load-time weight absorption (`kv_b_proj -> W_UK`/`W_UV`) + the
 prefill-MHA / decode-MQA dispatch. W7 the DeepSeek-V2 model TU (registry all four

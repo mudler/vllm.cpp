@@ -34,6 +34,10 @@ using vllm::platforms::DeviceCapability;
 using vllm::platforms::Platform;
 using vllm::platforms::ResidencyPolicy;
 using vllm::v1::AttentionBackend;
+using vllm::v1::AttentionImpl;
+using vllm::v1::AttentionLayer;
+using vllm::v1::MLACommonMetadata;
+using vllm::v1::TritonMLAImpl;
 using vllm::v1::HasAttentionBackend;
 using vllm::v1::MakeAttentionBackend;
 using vllm::v1::RegisterAttentionBackend;
@@ -43,6 +47,28 @@ using vt::DeviceType;
 using vt::DType;
 
 namespace {
+
+// Host-tensor helpers for the W4 TritonMLAImpl contract cases below.
+vt::Tensor MakeTensor(void* data, DType dt, const std::vector<int64_t>& shape) {
+  vt::Tensor t;
+  t.data = data;
+  t.dtype = dt;
+  t.device = vt::Device{DeviceType::kCPU, 0};
+  t.rank = static_cast<int>(shape.size());
+  int64_t stride = 1;
+  for (int i = t.rank - 1; i >= 0; --i) {
+    t.shape[i] = shape[static_cast<size_t>(i)];
+    t.stride[i] = stride;
+    stride *= shape[static_cast<size_t>(i)];
+  }
+  return t;
+}
+vt::Tensor MakeF32(float* d, const std::vector<int64_t>& s) {
+  return MakeTensor(d, DType::kF32, s);
+}
+vt::Tensor MakeI32(int32_t* d, const std::vector<int64_t>& s) {
+  return MakeTensor(d, DType::kI32, s);
+}
 
 // A synthetic CUDA platform with a fixed compute capability, so the
 // capability-ordered priority + selection can be exercised without a GPU. Since
@@ -225,6 +251,59 @@ TEST_CASE("MLA selection on GB10 resolves to TRITON_MLA (the W0 observation)") {
   CHECK_THROWS_AS(b->get_kv_cache_shape(10, 16, 8, 576), std::invalid_argument);
   // triton_mla.py:100-103 supports_block_size.
   CHECK_THROWS_AS(b->get_kv_cache_shape(10, 24, 1, 576), std::invalid_argument);
+
+  // ─── W4: get_impl_cls() is no longer nullptr ─────────────────────────────
+  // triton_mla.py:126-128 returns TritonMLAImpl. THE W4 POSITIVE SIGNAL for the
+  // engine seam: the backend the selector resolves now hands back a real impl,
+  // so the MLA path is SELECTABLE end-to-end, not just compiled.
+  std::unique_ptr<AttentionImpl> impl = b->get_impl_cls();
+  REQUIRE(impl != nullptr);
+  auto* mla_impl = dynamic_cast<TritonMLAImpl*>(impl.get());
+  REQUIRE(mla_impl != nullptr);
+  CHECK(TritonMLAImpl::kCanReturnLseForDecode);  // triton_mla.py:135
+
+  // Every other registered backend still returns the base nullptr — W4 filled
+  // exactly one hook and moved nothing else.
+  std::unique_ptr<AttentionBackend> dense = SelectAttentionBackend(sm121, "", AttnSelectorConfig{});
+  REQUIRE(dense != nullptr);
+  CHECK(dense->get_name() == "FLASH_ATTN");
+  CHECK(dense->get_impl_cls() == nullptr);
+}
+
+TEST_CASE("TritonMLAImpl refuses what upstream refuses, and names W5 for prefill") {
+  // triton_mla.py:165-179 — the impl's constructor rejects alibi_slopes /
+  // sliding_window / logits_soft_cap and any non-decoder attention type. Of
+  // those, `window_size` is the one our AttentionImpl surface can carry, so it
+  // is the one we refuse; the others are unreachable by construction.
+  TritonMLAImpl impl;
+  impl.num_heads = 16;
+  impl.head_size = 576;
+  impl.scale = 0.05f;
+
+  std::vector<int32_t> block_ids{0, 1};
+  std::vector<int32_t> lens{16, 16};
+  MLACommonMetadata md;
+  md.block_table = MakeI32(block_ids.data(), {2, 1});
+  md.seq_lens = MakeI32(lens.data(), {2});
+  md.max_seq_len = 16;
+
+  std::vector<float> cache(static_cast<size_t>(2) * 16 * 576, 0.0f);
+  std::vector<float> q(static_cast<size_t>(2) * 16 * 576, 0.0f);
+  std::vector<float> out(static_cast<size_t>(2) * 16 * 512, 0.0f);
+  vt::Tensor t_cache = MakeF32(cache.data(), {2, 16, 576});
+  vt::Tensor t_q = MakeF32(q.data(), {2, 16, 576});
+  vt::Tensor t_out = MakeF32(out.data(), {2, 16, 512});
+
+  AttentionLayer layer;
+  layer.window_size = vt::AttentionWindow{128, 0};
+  CHECK_THROWS_AS(impl.forward_mqa(layer, t_q, t_cache, md, t_out), std::invalid_argument);
+
+  // A prefill-shaped batch (more query tokens than requests) is W5, and says so.
+  AttentionLayer plain;
+  std::vector<float> q_prefill(static_cast<size_t>(8) * 16 * 576, 0.0f);
+  vt::Tensor t_q_prefill = MakeF32(q_prefill.data(), {8, 16, 576});
+  CHECK_THROWS_AS(impl.forward(plain, t_q_prefill, t_q_prefill, t_q_prefill, t_cache, md, t_out),
+                  std::invalid_argument);
 }
 
 TEST_CASE("the sparse/DSA seam: is_sparse() filters SPARSE_SM120 out of the dense walk") {

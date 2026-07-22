@@ -102,6 +102,7 @@ enum class OpId : uint8_t {
   kAttention,
   kReshapeAndCache,
   kConcatAndCacheMla,
+  kMlaDecodeAttention,
   kPagedAttention,
   kApplyTemperature,
   kGreedyArgmax,
@@ -331,6 +332,26 @@ struct PagedAttentionArgs {
   int32_t max_seq_len = 0;
 };
 
+// Arguments for vt::MlaDecodeAttention (MLA campaign W4). Mirrors the scalar
+// arguments `TritonMLAImpl.forward_mqa` passes to `decode_attention_fwd`
+// (vllm/v1/attention/backends/mla/triton_mla.py:242-259 @ e24d1b24).
+struct MlaDecodeAttentionArgs {
+  // `self.scale` — for DeepSeek this is head_dim^-0.5 TIMES the YaRN mscale^2
+  // correction (mla_attention.py computes it once and hands it to the kernel as
+  // a plain float; the kernel itself knows nothing about mscale). Must be > 0.
+  float scale = 0.0f;
+  // NUM_KV_SPLITS. 0 (the default) => the impl computes it exactly like
+  // `_compute_num_kv_splits` (triton_mla.py:40-47):
+  //     min(next_pow2(max(1, max_seq_len // 512)), sm_count * 2)
+  // from `max_seq_len` below. 1 forces the single-split (batch-invariant)
+  // reduction upstream uses under VLLM_BATCH_INVARIANT (triton_mla.py:212-213).
+  int32_t num_kv_splits = 0;
+  // Host-known max over `seq_lens` (CommonAttentionMetadata::max_seq_len). Only
+  // used to derive `num_kv_splits` when that is 0; an upper bound is safe. When
+  // both are 0 the impl falls back to 1 split.
+  int32_t max_seq_len = 0;
+};
+
 // Router SCORING function. softmax over all E is the Qwen3.6 / DeepSeek-V2
 // behavior; sigmoid (elementwise, NOT normalized across experts) is what
 // DeepSeek-V3 / R1 use with `topk_method == "noaux_tc"`. Mirrors
@@ -500,6 +521,9 @@ using ReshapeAndCacheFn = void (*)(Queue&, const Tensor&, const Tensor&, Tensor&
                                    const Tensor&);
 using ConcatAndCacheMlaFn =
     void (*)(Queue&, const Tensor&, const Tensor&, Tensor&, const Tensor&);
+using MlaDecodeAttentionFn = void (*)(Queue&, Tensor&, Tensor*, const Tensor&, const Tensor&,
+                                      const Tensor&, const Tensor&,
+                                      const MlaDecodeAttentionArgs&);
 using PagedAttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&, const Tensor&, const Tensor&,
                                   const PagedAttentionArgs&);
@@ -1338,6 +1362,62 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
 // than silently mis-written.
 void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor& kv_cache,
                        const Tensor& slot_mapping);
+
+// --- MLA decode attention (MLA campaign W4) ---------------------------------
+// The MQA decode half of Multi-head Latent Attention: every one of the Hq query
+// heads attends to the SAME single-head compressed latent row in the 3-D MLA
+// cache, and V is the leading `v_head_dim` slice of that same row — there is no
+// V tensor. Upstream calls this `forward_mqa`
+// (vllm/v1/attention/backends/mla/triton_mla.py:189-260 @ e24d1b24), which hands
+// the SAME buffer to `decode_attention_fwd` twice
+// (`kv_c_and_k_pe_cache` as K, `kv_c_and_k_pe_cache[..., :kv_lora_rank]` as V,
+// `:236-244`) with `is_mla=True` and `layer._k_scale` used for BOTH k_scale and
+// v_scale (`:256-257`). vt::PagedAttention's (k_cache, v_cache) signature cannot
+// express that, which is why this is its own op.
+//
+//   out          [B, Hq, Dv]           (Dv == kv_lora_rank == 512 for DeepSeek)
+//   lse          [B, Hq] or nullptr    (upstream `can_return_lse_for_decode`)
+//   query        [B, Hq, D]            (D == kv_lora_rank + qk_rope_head_dim == 576)
+//   kv_cache     [num_blocks, block_size, D]   — the 3-D MLA cache
+//                (mla_attention.py:1216-1224), i.e. exactly what
+//                vt::ConcatAndCacheMla writes
+//   block_table  [B, max_blocks_per_seq] i32   (upstream `Req_to_tokens`)
+//   seq_lens     [B] i32                       (upstream `B_Seqlen`)
+//
+// SEMANTICS (the numbers, independent of the split schedule) — for request b and
+// head h, over key positions j in [0, seq_lens[b]) with
+// entry = kv_cache[block_table[b, j / block_size], j % block_size, :]:
+//     qk[j] = scale * dot(query[b,h,:], entry[:])          (the FULL D == 576)
+//     p     = softmax_j(qk)                                (f32, online/streaming)
+//     out[b,h,:]  = sum_j p[j] * entry[:Dv]                (V is the Dv PREFIX)
+//     lse[b,h]    = log(sum_j exp(qk[j] - max)) + max
+// There is NO causal mask: decode has exactly one query token per request whose
+// position is seq_lens[b]-1, so the whole context is visible. `logit_cap` is 0
+// on every reachable MLA path (TritonMLAImpl rejects `logits_soft_cap`,
+// triton_mla.py:165-171) and is therefore not ported.
+//
+// TWO-STAGE SPLIT-KV (the CUDA impl; ported from the upstream Triton pair
+// `_fwd_grouped_kernel_stage1` triton_decode_attention.py:278-458 and
+// `_fwd_kernel_stage2` `:575-639`). Stage 1 partitions [0, seq_len) into
+// `num_kv_splits` contiguous chunks of `cdiv(seq_len, num_kv_splits)` and emits
+// one NORMALIZED partial `acc/e_sum` plus its `e_max + log(e_sum)` per split;
+// stage 2 merges them with the same online-softmax rescale. A split whose
+// [start, end) is empty is SKIPPED by both stages (upstream `:361`, `:610`), so
+// the scratch row for it is never written and never read.
+//
+// DETERMINISM: stage 2 merges splits in a fixed ASCENDING split order (upstream
+// `:607` `for split_kv_id in range(0, NUM_KV_SPLITS)`) — no atomicAdd anywhere,
+// so the result is run-to-run bit-reproducible for a fixed `num_kv_splits`, our
+// house convention. Changing `num_kv_splits` changes the f32 summation order and
+// therefore may change the last bits; that is upstream's behavior too.
+//
+// dtypes: query/kv_cache/out share one float dtype (f32 or bf16 — upstream's
+// `supported_dtypes` are fp16/bf16, `triton_mla.py:82`); all accumulation is f32.
+// The fp8 KV-cache branch (`if k.dtype.is_fp8()`, `:390-391`) is out of scope and
+// refused, exactly as the W3 cache write refuses `fp8_ds_mla`.
+void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
+                        const Tensor& kv_cache, const Tensor& block_table,
+                        const Tensor& seq_lens, const MlaDecodeAttentionArgs& args);
 
 // --- Paged attention (M1.6). Correctness-grade varlen prefill + paged decode.
 // Semantics ported from the FlashAttention path

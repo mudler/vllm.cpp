@@ -264,10 +264,11 @@ class FlashAttentionBackend final : public AttentionBackend {
 // shape/flags come from its base
 // vllm/model_executor/layers/attention/mla_attention.py:1206 MLACommonBackend.
 //
-// W2 lands the NAME + the selection-relevant capability surface only: this is
-// what makes `use_mla=true` resolve to TRITON_MLA. The impl (get_impl_cls) is
-// W4/W6 (the two-stage split-KV MQA decode over the latent) and deliberately
-// stays nullptr here — the base default.
+// W2 landed the NAME + the selection-relevant capability surface (that is what
+// makes `use_mla=true` resolve to TRITON_MLA). W4 fills `get_impl_cls()` with
+// `TritonMLAImpl` below — the two-stage split-KV MQA decode over the latent.
+// The PREFILL half is W5, and `TritonMLAImpl::forward` says so explicitly rather
+// than silently producing wrong numbers.
 class TritonMLABackend final : public AttentionBackend {
  public:
   static constexpr const char* kName = "TRITON_MLA";
@@ -294,6 +295,78 @@ class TritonMLABackend final : public AttentionBackend {
   // a plain predicate (the full supports_* surface is still deferred, see the
   // header note) because get_kv_cache_shape enforces it.
   static bool supports_block_size(int64_t block_size) { return block_size % 16 == 0; }
+
+  // W4: the MLA decode impl. Upstream `get_impl_cls` returns the CLASS
+  // (triton_mla.py:126-128 -> TritonMLAImpl); here a factory returning an
+  // instance whose num_heads / head_size / scale the layer fills in, exactly as
+  // upstream's layer passes them to the constructor.
+  std::unique_ptr<AttentionImpl> get_impl_cls() const override;
+};
+
+// Decode-side attention metadata for the MLA backends. Upstream this is
+// `MLACommonMetadata` / `MLACommonDecodeMetadata`
+// (vllm/model_executor/layers/attention/mla_attention.py); W4 carries EXACTLY the
+// fields `TritonMLAImpl.forward_mqa` reads —
+//   * `attn_metadata.decode.block_table` and `.seq_lens` (triton_mla.py:245-246),
+//   * `attn_metadata.max_seq_len`, which sizes the split heuristic (`:214-216`).
+// Both tensors are DEVICE tensors here (not the host arrays
+// CommonAttentionMetadata carries): the decode kernel reads them on the GPU with
+// no host round-trip, which is what keeps the path CUDA-graph capturable.
+struct MLACommonMetadata : AttentionMetadata {
+  vt::Tensor block_table;  // [num_reqs, max_blocks] i32, device
+  vt::Tensor seq_lens;     // [num_reqs] i32, device
+  // Host-known max over seq_lens. 0 => the impl falls back to 1 split.
+  int max_seq_len = 0;
+  // 0 => `_compute_num_kv_splits` (triton_mla.py:40-47). 1 forces the
+  // batch-invariant single-split reduction (`:212-213`).
+  int num_kv_splits = 0;
+};
+
+// The dense-MLA attention impl. Ported from
+// vllm/v1/attention/backends/mla/triton_mla.py:134 `TritonMLAImpl` @ e24d1b24,
+// whose decode entry point is `:189 forward_mqa`. W4 implements the DECODE half
+// (`vt::MlaDecodeAttention`); the prefill half is W5.
+//
+// Upstream's constructor REJECTS `alibi_slopes`, `sliding_window` and
+// `logits_soft_cap` (`:165-171`) and any non-decoder attention type
+// (`:173-179`). Our AttentionImpl surface carries only `window_size` of those,
+// on the per-layer AttentionLayer, so forward() rejects a set window there — the
+// same refusal at the only place we can see it.
+class TritonMLAImpl final : public AttentionImpl {
+ public:
+  // triton_mla.py:135 `can_return_lse_for_decode = True`.
+  static constexpr bool kCanReturnLseForDecode = true;
+
+  // DEVIATION (recorded): upstream launches on torch's AMBIENT CUDA stream, which
+  // a C++ port has no equivalent of. The runner sets this to its per-step queue
+  // before calling forward; nullptr means the DEFAULT stream, which is correct
+  // but serializing — fine for unit tests, wrong for the hot path. W7 wires the
+  // runner's queue in when the DeepSeek-V2 forward lands.
+  vt::Queue* queue = nullptr;
+
+  // The DECODE entry point — the 1:1 counterpart of `forward_mqa`
+  // (triton_mla.py:189-260). `q` is the already-concatenated
+  // [num_reqs, num_heads, kv_lora_rank + qk_rope_head_dim] query (upstream
+  // concatenates a tuple at `:200-201`); `kv_c_and_k_pe_cache` is the 3-D MLA
+  // cache; `out` is [num_reqs, num_heads, kv_lora_rank] and `lse` (optional) is
+  // [num_reqs, num_heads] f32.
+  //
+  // NOT weight absorption: folding W_UK into the query and un-projecting the
+  // output with W_UV is W6. This method takes the query already in latent space
+  // and returns the output still in latent space, exactly like `forward_mqa`.
+  void forward_mqa(const AttentionLayer& layer, const vt::Tensor& q,
+                   const vt::Tensor& kv_c_and_k_pe_cache, const MLACommonMetadata& metadata,
+                   vt::Tensor& out, vt::Tensor* lse = nullptr) const;
+
+  // The generic AttentionImpl entry. `key`/`value` are unused: MLA's cache write
+  // is the separate `vt::ConcatAndCacheMla` (W3), never a (k, v) pair. Routes to
+  // forward_mqa; a prefill-shaped batch throws with the W5 reason rather than
+  // silently producing wrong numbers.
+  void forward(const AttentionLayer& layer, const vt::Tensor& query, const vt::Tensor& key,
+               const vt::Tensor& value, const vt::Tensor& kv_cache,
+               const AttentionMetadata& attn_metadata, vt::Tensor& output,
+               const vt::Tensor* output_scale = nullptr,
+               const vt::Tensor* output_block_scale = nullptr) override;
 };
 
 }  // namespace vllm::v1

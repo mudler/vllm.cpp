@@ -1805,6 +1805,68 @@ void ConcatAndCacheMla(Queue& q, const Tensor& kv_c, const Tensor& k_pe, Tensor&
       q, kv_c, k_pe, kv_cache, slot_mapping);
 }
 
+void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
+                        const Tensor& kv_cache, const Tensor& block_table,
+                        const Tensor& seq_lens, const MlaDecodeAttentionArgs& args) {
+  VT_CHECK(query.rank == 3 && out.rank == 3,
+           "mla_decode_attention: query/out must be rank-3 "
+           "[batch, num_q_heads, head_size] / [batch, num_q_heads, v_head_dim]");
+  // The MLA cache has NO K/V axis and NO head axis (mla_attention.py:1216-1224).
+  VT_CHECK(kv_cache.rank == 3,
+           "mla_decode_attention: kv_cache must be rank-3 "
+           "[num_blocks, block_size, head_size] — MLA has no K/V and no head axis");
+  VT_CHECK(block_table.rank == 2, "mla_decode_attention: block_table rank-2 [batch, max_blocks]");
+  VT_CHECK(seq_lens.rank == 1, "mla_decode_attention: seq_lens rank-1 [batch]");
+  const int64_t batch = query.shape[0];
+  const int64_t num_q_heads = query.shape[1];
+  const int64_t head_size = query.shape[2];
+  const int64_t v_head_dim = out.shape[2];
+  VT_CHECK(batch > 0 && num_q_heads > 0 && head_size > 0 && v_head_dim > 0,
+           "mla_decode_attention: batch/num_q_heads/head_size/v_head_dim must be > 0");
+  VT_CHECK(out.shape[0] == batch && out.shape[1] == num_q_heads,
+           "mla_decode_attention: out must be [batch, num_q_heads, v_head_dim]");
+  VT_CHECK(kv_cache.shape[2] == head_size,
+           "mla_decode_attention: kv_cache entry width must equal query head_size "
+           "(kv_lora_rank + qk_rope_head_dim)");
+  // V is the LEADING v_head_dim slice of the same latent row (triton_mla.py:236,
+  // `kv_c_cache = kv_c_and_k_pe_cache[..., :self.kv_lora_rank]`).
+  VT_CHECK(v_head_dim <= head_size,
+           "mla_decode_attention: v_head_dim must be <= head_size (V is the leading "
+           "kv_lora_rank slice of the SAME cache row)");
+  VT_CHECK(kv_cache.shape[1] > 0, "mla_decode_attention: block_size must be > 0");
+  VT_CHECK(block_table.shape[0] == batch && seq_lens.shape[0] == batch,
+           "mla_decode_attention: block_table/seq_lens must have `batch` rows");
+  VT_CHECK(block_table.dtype == DType::kI32 && seq_lens.dtype == DType::kI32,
+           "mla_decode_attention: block_table/seq_lens must be i32");
+  VT_CHECK(IsFloat(query.dtype) && kv_cache.dtype == query.dtype && out.dtype == query.dtype,
+           "mla_decode_attention: query/kv_cache/out must share one float dtype "
+           "(the auto cache path; the fp8 KV-cache branch is out of scope)");
+  VT_CHECK(args.scale > 0.0f, "mla_decode_attention: args.scale must be > 0");
+  VT_CHECK(args.num_kv_splits >= 0, "mla_decode_attention: args.num_kv_splits must be >= 0");
+  // Indexing is stride-driven on the leading dims (a cross-layer cache view has
+  // gaps — cf. upstream `_page_stride`, triton_decode_attention.py:59-65), so we
+  // require only unit innermost strides.
+  VT_CHECK(query.stride[2] == 1 && out.stride[2] == 1 && kv_cache.stride[2] == 1,
+           "mla_decode_attention: query/out/kv_cache innermost stride must be 1");
+  VT_CHECK(block_table.stride[1] == 1 && seq_lens.IsContiguous(),
+           "mla_decode_attention: block_table rows must be contiguous and seq_lens contiguous");
+  if (lse != nullptr) {
+    VT_CHECK(lse->rank == 2 && lse->shape[0] == batch && lse->shape[1] == num_q_heads,
+             "mla_decode_attention: lse must be rank-2 [batch, num_q_heads]");
+    VT_CHECK(lse->dtype == DType::kF32,
+             "mla_decode_attention: lse must be f32 (we keep the LSE in the "
+             "accumulation dtype; upstream stores it in q.dtype)");
+    VT_CHECK(lse->stride[1] == 1, "mla_decode_attention: lse innermost stride must be 1");
+    VT_CHECK(lse->device == q.device, "mla_decode_attention: lse device mismatch");
+  }
+  VT_CHECK(out.device == q.device && query.device == q.device && kv_cache.device == q.device &&
+               block_table.device == q.device && seq_lens.device == q.device,
+           "mla_decode_attention: device mismatch "
+           "(out/query/kv_cache/block_table/seq_lens/queue)");
+  reinterpret_cast<MlaDecodeAttentionFn>(GetOp(OpId::kMlaDecodeAttention, q.device.type))(
+      q, out, lse, query, kv_cache, block_table, seq_lens, args);
+}
+
 void PagedAttention(Queue& q, Tensor& out, const Tensor& query, const Tensor& k_cache,
                     const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
                     const Tensor& query_start_loc, const PagedAttentionArgs& args) {

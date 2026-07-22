@@ -303,6 +303,8 @@ vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)
 # MLA campaign W3: the compressed-latent cache write + the grouped-topk router.
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
+# MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.
+vllm_cpp_add_test(test_ops_mla_attn vt/test_ops_mla_attn.cpp)
 vllm_cpp_add_test(test_ops_moe_router_grouped vt/test_ops_moe_router_grouped.cpp)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)

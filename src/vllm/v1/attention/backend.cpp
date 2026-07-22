@@ -99,6 +99,76 @@ std::vector<int64_t> TritonMLABackend::get_kv_cache_shape(
   return {num_blocks, block_size, head_size};
 }
 
+std::unique_ptr<AttentionImpl> TritonMLABackend::get_impl_cls() const {
+  // triton_mla.py:126-128 `get_impl_cls() -> type[TritonMLAImpl]`. Upstream
+  // returns the CLASS and the layer constructs it with num_heads/head_size/scale;
+  // we return the instance and the layer fills those public fields.
+  return std::make_unique<TritonMLAImpl>();
+}
+
+void TritonMLAImpl::forward_mqa(const AttentionLayer& layer, const vt::Tensor& q,
+                                const vt::Tensor& kv_c_and_k_pe_cache,
+                                const MLACommonMetadata& metadata, vt::Tensor& out,
+                                vt::Tensor* lse) const {
+  // triton_mla.py:165-171 — the impl rejects a sliding window outright.
+  if (layer.window_size.has_value()) {
+    throw std::invalid_argument(
+        "TritonMLAImpl: sliding window is not supported by MLA "
+        "(triton_mla.py:165-171).");
+  }
+  // `:190` assert kv_c_and_k_pe_cache.numel() > 0
+  if (kv_c_and_k_pe_cache.rank != 3 || kv_c_and_k_pe_cache.shape[0] <= 0) {
+    throw std::invalid_argument(
+        "TritonMLAImpl::forward_mqa: kv cache must be the 3-D MLA cache "
+        "(num_blocks, block_size, kv_lora_rank + qk_rope_head_dim).");
+  }
+  if (scale <= 0.0f) {
+    throw std::invalid_argument(
+        "TritonMLAImpl::forward_mqa: scale must be set (it carries the mscale^2 "
+        "correction for the DeepSeek YaRN configs).");
+  }
+  vt::MlaDecodeAttentionArgs args;
+  args.scale = scale;  // `:253` self.scale
+  args.num_kv_splits = metadata.num_kv_splits;
+  args.max_seq_len = metadata.max_seq_len;
+  // `:242-259` decode_attention_fwd(q, kv_c_and_k_pe_cache, kv_c_cache, o, lse,
+  //   block_table, seq_lens, attn_logits, num_kv_splits, scale, PAGE_SIZE, ...)
+  // — the two "K" and "V" arguments are the SAME buffer, which our single
+  // kv_cache argument expresses directly.
+  vt::Queue default_stream{q.device, nullptr};
+  vt::Queue& qq = queue != nullptr ? *queue : default_stream;
+  vt::MlaDecodeAttention(qq, out, lse, q, kv_c_and_k_pe_cache, metadata.block_table,
+                         metadata.seq_lens, args);
+}
+
+void TritonMLAImpl::forward(const AttentionLayer& layer, const vt::Tensor& query,
+                            const vt::Tensor& /*key*/, const vt::Tensor& /*value*/,
+                            const vt::Tensor& kv_cache, const AttentionMetadata& attn_metadata,
+                            vt::Tensor& output, const vt::Tensor* output_scale,
+                            const vt::Tensor* output_block_scale) {
+  if (output_scale != nullptr || output_block_scale != nullptr) {
+    throw std::invalid_argument(
+        "TritonMLAImpl: fused output quantization is not ported "
+        "(backend_supports_prefill_query_quantization() is False on sm_12x, "
+        "mla_attention.py:1382-1385).");
+  }
+  const auto* md = dynamic_cast<const MLACommonMetadata*>(&attn_metadata);
+  if (md == nullptr) {
+    throw std::invalid_argument(
+        "TritonMLAImpl: attn_metadata must be an MLACommonMetadata.");
+  }
+  // Decode is one query token per request: query.shape[0] must equal the number
+  // of requests the metadata describes. Anything longer is a prefill / chunked
+  // batch, which is W5 (the FLASH_ATTN MLA prefill backend), not W4.
+  if (query.rank != 3 || md->seq_lens.rank != 1 || query.shape[0] != md->seq_lens.shape[0]) {
+    throw std::invalid_argument(
+        "TritonMLAImpl::forward: only the pure-DECODE shape is implemented "
+        "(one query token per request). MLA prefill is campaign step W5 — see "
+        ".agents/specs/mla-deepseek-campaign.md.");
+  }
+  forward_mqa(layer, query, kv_cache, *md, output, nullptr);
+}
+
 namespace {
 // TRITON_MLA self-registers for CUDA only — it is a CUDA-capability backend
 // (cuda.py:129-133) and there is no CPU MLA backend upstream at the pin, so a

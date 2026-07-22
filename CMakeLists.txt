@@ -283,6 +283,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_ops.cpp
   src/vt/cpu/cpu_layernorm.cpp
   src/vt/cpu/cpu_cache.cpp
+  src/vt/cpu/cpu_mla_attn.cpp
   src/vt/cpu/cpu_paged_attn.cpp
   src/vt/cpu/cpu_sample.cpp)
 add_library(vllm::vllm ALIAS vllm)
@@ -317,6 +318,7 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_glue.cu
     src/vt/cuda/cuda_layernorm.cu
     src/vt/cuda/cuda_cache.cu
+    src/vt/cuda/cuda_mla_attn.cu
     src/vt/cuda/cuda_paged_attn.cu
     src/vt/cuda/cuda_combine_tokens.cu
     src/vt/cuda/cuda_sample.cu)

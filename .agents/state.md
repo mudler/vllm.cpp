@@ -17259,3 +17259,82 @@ weights staying quantized is not computing in quant.
 co-scheduled run is a known memory effect on that box, not a regression.
 `python3 scripts/check-agent-record.py` and
 `python3 scripts/check-doc-checkpoint.py` must both be green.
+
+## 2026-07-22 — NON-CUDA BACKEND FAN-OUT SPIKE (Metal/MLX, Vulkan, Intel XPU), `CLAIM-BACKEND-FANOUT-1`
+
+**SPIKE ONLY. No source file, no CMake edit, no kernel, no shader, no benchmark,
+nothing downloaded.** Base `429e19d`, worktree `agent-afaddd725a246ee5b`.
+Committed [`.agents/specs/backend-fanout-metal-vulkan-xpu.md`](specs/backend-fanout-metal-vulkan-xpu.md).
+`BACKEND-METAL-MLX`, `BACKEND-VULKAN`, `BACKEND-XPU` move `INVENTORIED` -> `SPIKE`.
+This was USER PRIORITY 3 and had received no prior work.
+
+**Why one spec for three backends.** The dominant near-term work (`W0`, the
+shared seam repair) is identical for all three and blocks each; splitting would
+triplicate it and hide that Metal's blocker is also CPU-on-macOS's blocker.
+
+**Hardware verdicts — MEASURED this session, not inferred.**
+
+- **Metal: REACHABLE and GATEABLE today.** On the M4 (`192.168.68.103`) the tree
+  configures AND builds under brew cmake 4.1.0 + AppleClang 21 with exactly
+  THREE Clang-only `-Werror` suppressions. As shipped `test_backend` FAILS 5/7
+  with `vt: no backend registered for device type 0`, because
+  `CMakeLists.txt:304-306` gates the registrar force-link behind
+  `UNIX AND NOT APPLE`; the one-line `-force_load` fix was applied on the probe
+  tree and re-run **GREEN 7/7**. Then 108,952 portable-tier assertions passed on
+  Apple arm64 across 7 suites (incl. `test_ops_quant_dot` 78,052 and
+  `test_gguf_keep_quant` 5,574) — a **third-architecture** confirmation of the
+  GGUF quant tier. `newLibraryWithSource:` compiles MSL at runtime and a
+  dispatched compute kernel returned numerically correct results with
+  **Command-Line-Tools only** — no full Xcode, no MLX, zero installs.
+- **Vulkan: REACHABLE and GATEABLE.** GB10 enumerates as `NVIDIA GB10`,
+  `INTEGRATED_GPU`, Vulkan API 1.4.312, with `VK_KHR_cooperative_matrix` v2 AND
+  `VK_NV_cooperative_matrix2` among 249 device extensions, and one 89.72 GiB
+  unified `DEVICE_LOCAL`/`HOST_VISIBLE` heap. The dev box separately enumerates
+  `llvmpipe` for GPU-free CI. llama.cpp `ggml/src/ggml-vulkan/` is locally
+  readable at `237ad9b96` — our own pin — as the port source.
+- **XPU: HW-BLOCKED**, and doubly so — no Intel GPU here, AND vLLM has no
+  in-tree SYCL source to mirror (kernels live in the external
+  `vllm_xpu_kernels` package). Only policy port / compile coverage / oneAPI
+  CPU-device unit numerics are proposed; **no e2e or perf gate is offered.**
+
+**Ranking: Metal > Vulkan > XPU.** Bring-up order for Metal is REVERSED to
+native MSL (E2) first, with MLX (E1) demoted to work row `M5` — grounded in the
+measured fact that MSL needs nothing installed while MLX adds a dependency and
+re-introduces the lazy-eval impedance `backends.md` itself flags.
+
+**Correctness bars proposed (none unrunnable).** Vulkan gates against **our own
+CUDA backend on the same GB10 box** (the strongest cross-backend oracle in the
+project, with vLLM still reachable transitively). Metal gates against **our own
+CPU backend on the M4**, since vLLM cannot run there; llama.cpp Metal is the
+native speed floor. XPU gets no e2e gate. Bit-exactness is explicitly NOT
+promised across CPU/GPU for reductions — the bar is the already-ported
+NMSE <= 5e-4 — while pure copy/layout ops stay bit-exact.
+
+**Seam assessment (quantified).** A new backend implements **6 pure
+`vt::Backend` virtuals** (CPU reference: 36 lines) + **5 pure `Platform`
+virtuals** (57 lines) + op kernels + 1 attention registration + 1
+`kFusedChain` registration + CMake. It gets free: the whole engine (~80 TUs),
+all three `DeviceType` slots pre-reserved, the accelerator priority already
+ordered, 20 of 26 `Backend` virtuals defaulted, all op validation, and the
+entire 10-recipe fusion catalog. Honest counterweight: 4 unconditional
+`vt/cuda/` includes in `src/vllm/` (worst is the public
+`dense_nvfp4_gemm.h:66`) must be guarded, and `qwen3_5.cpp` holds 37 of 43 raw
+`kCUDA` comparisons — hence the mandate to bring up **OPT or Qwen3-dense, never
+Qwen3.5-Next**, first.
+
+**Records corrected.** `.agents/environment.md:52-56` was stale (CMake IS
+installed; full Xcode is NOT) and its "Bootstrap CMake + MLX" TODO is
+superseded — the real prerequisite is `W0`.
+
+**Rows deliberately NOT moved:** `BACKEND-ROCM`, `BACKEND-ANE`, and every
+native-competitor gate row (`BACKEND-GATE-METAL-*`,
+`BACKEND-GATE-VULKAN-LLAMACPP`, `BACKEND-GATE-XPU-VLLM`) stay `INVENTORIED` —
+they need a pinned harness no implementation exists to drive.
+
+**Resume commands.** Implementation starts at `W0` (8 shared seam items, the
+first already verified). Re-derive the hardware evidence with the throwaway
+probes: `ssh 192.168.68.103` then `export PATH=/opt/homebrew/bin:$PATH` and
+build in `~/vllmcpp-probe` (source-only, deletable); Vulkan via
+`ssh dgx.casa 'flock -w 60 $HOME/gpu.lock -c /tmp/vkprobe'` and `/tmp/vkext`.
+`python3 scripts/check-agent-record.py` and
+`python3 scripts/check-doc-checkpoint.py` must both be green.

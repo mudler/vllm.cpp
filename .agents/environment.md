@@ -53,7 +53,20 @@
   cores), 16 GB unified memory, arm64, macOS 26.5.2. Use it for the MLX-backed
   `vt::` backend, Metal op parity, and small-model bring-up. It cannot hold the
   27B/35B gate models; gate-scale Apple performance needs a larger-memory Mac.
-  Verified 2026-07-10: Xcode is installed; CMake and MLX are not yet installed.
+  **Re-verified 2026-07-22 (`CLAIM-BACKEND-FANOUT-1`), correcting the stale
+  2026-07-10 line:** only the **Command Line Tools** are installed, NOT full
+  Xcode — so the offline `metal` shader compiler is absent (`xcrun -sdk macosx
+  metal` fails). That does **not** block MSL: runtime compilation via
+  `newLibraryWithSource:` was verified working, together with a numerically
+  correct dispatched compute kernel. **CMake IS already installed** (brew
+  4.1.0 at `/opt/homebrew/bin`, missing from the non-interactive PATH — always
+  `export PATH=/opt/homebrew/bin:$PATH` in remote commands); `ninja` is not
+  (make works). **MLX is NOT installed** (`brew install mlx` -> 0.32.0, pulls
+  `python@3.14`) and is not required for native-MSL bring-up. Device facts:
+  `hasUnifiedMemory=YES`, `MTLGPUFamilyApple9` + `Metal3`, SIMD width 32,
+  32 KiB threadgroup memory, 11.84 GiB recommended max working set, ~30 GiB
+  free disk. Our tree configures AND builds there under AppleClang 21 with
+  three Clang-only `-Werror` fixes, and 108,952 portable-tier assertions pass.
 
 ## Benchmark models on dgx.casa
 
@@ -103,4 +116,21 @@ inner 4096, state 128; context 262144.
   cache-off closure. Write the dedicated `KV-MAMBA-ALIGN` spike before PX2,
   then require matched BF16/no-spec capacity, native hit/no-eviction evidence,
   full axes and traces. Never mutate the vLLM oracle while provisioning SGLang.
-- Bootstrap CMake + MLX on the M4 host before the Metal backend bring-up.
+- ~~Bootstrap CMake + MLX on the M4 host before the Metal backend bring-up.~~
+  **RESOLVED/SUPERSEDED 2026-07-22** by the [backend fan-out
+  spike](specs/backend-fanout-metal-vulkan-xpu.md): CMake is already present,
+  and MLX is **not** a bring-up prerequisite (native MSL compiles at runtime
+  with CLT only, so E2 precedes E1). The real prerequisite is spike work item
+  `W0` — chiefly the `CMakeLists.txt:304-306` Apple `-force_load` fix, without
+  which every static registrar is silently dropped on macOS and even the CPU
+  backend fails to register. `brew install mlx` is deferred to work row `M5`.
+- **Vulkan runtime is already usable and needs no acquisition.** dgx GB10
+  enumerates as a real Vulkan `INTEGRATED_GPU` at API 1.4.312 (loader 1.4.328 +
+  NVIDIA ICD) with `VK_KHR_cooperative_matrix` v2 and `VK_NV_cooperative_matrix2`;
+  the dev box enumerates `llvmpipe` (Vulkan 1.4.318, CPU) for GPU-free CI. Still
+  to install before Vulkan work: `libvulkan-dev`, `vulkan-tools`, and a
+  **current-SDK** `glslc` — Ubuntu's shaderc 2023.8 is too old for the coopmat2
+  feature probe and fails silently into the slow path.
+- **No Intel GPU exists on any box here**, so `BACKEND-XPU` end-to-end work is
+  HW-BLOCKED; only policy-port, compile coverage and oneAPI CPU-device unit
+  numerics are available.

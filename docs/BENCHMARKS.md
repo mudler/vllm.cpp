@@ -1537,9 +1537,7 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
-- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0 (grounding) + W1
-  (spec-driven KV allocation) + W2 (MLA backend selection) + W3 (MLA cache write
-  + grouped-topk router) (2026-07-21, `CLAIM-MLA-DEEPSEEK`,
+- **Qwen3-32B NVFP4A16 (compressed-tensors W4A16) — CORRECTNESS MET,
   SPEED PENDING (2026-07-21, `CLAIM-QUANT-NVFP4-CT-W4A16`,
   [spike](../.agents/specs/sweep-qwen3-32b-nvfp4a16.md)).**
   `benchmark_binding=false`; **PENDING — deliberately not measured.** This change
@@ -1583,178 +1581,58 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   output throughput, req/s, TTFT, TPOT/ITL, peak memory) at c1/c2/c4/c8, with
   token-exact correctness as a precondition that may never be traded off.
 
-- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W8 (2026-07-22,
-  `CLAIM-MLA-DEEPSEEK`,
+- **MLA + DeepSeek/Kimi/MiniMax campaign — W0-W8 (2026-07-22, `CLAIM-MLA-DEEPSEEK`,
   [spike](../.agents/specs/mla-deepseek-campaign.md)).**
-  **SUPERSEDED 2026-07-22 by W9** — the DeepSeek-V2-Lite track now HAS a binding
-  number; see "Binding DeepSeek-V2-Lite (MLA) every-axis grid — MLA campaign W9"
-  above. The W0-W8 disposition below is retained because it remains correct FOR
-  W0-W8 (they were correctness-only), and because the CUTLASS-MoE denominator
-  question it flagged is exactly what W9 had to settle.
-  `benchmark_binding=false`; **NOT APPLICABLE.** W0 ran the vLLM oracle on
-  DeepSeek-V2-Lite purely to OBSERVE backend selection and greedy self-consistency
-  — no timing was taken and none may be quoted. W1 is a **behaviour-preserving
-  allocator refactor with zero MLA math**: the attention cache is sized from
-  `spec->page_size_bytes()` instead of hardcoded `2 * block * Hkv * Dh`, which is
-  byte-for-byte the same number for every existing model by construction, and the
-  four correctness gates (27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense
-  16/16) came back UNCHANGED, confirming no behavioural or allocation-size drift.
-  W2 and W3 are likewise **NOT APPLICABLE** and for a stronger reason than "we
-  did not measure": neither can appear on any existing hot path. W2 changes only
-  which backend NAME a `use_mla=true` request resolves to — a startup-time
-  selection decision, and no gate model is MLA, so every dense selection is
-  byte-identical (asserted, not assumed). W3's two ops are NEW `OpId`s with no
-  caller in any model TU: `vt::ConcatAndCacheMla` is unreachable until the W6 MLA
-  block exists, and the grouped-topk router is reached only when
-  `num_expert_group > 0`, which the default-constructed args never set — the
-  existing routers dispatch to the ORIGINAL kernel, unmodified. So there is no
-  MoE-router or cache-write throughput delta to measure on 27B/35B/Coder/dense,
-  by construction rather than by benchmark.
-  **W4 is NOT APPLICABLE for the same structural reason, and this is worth being
-  explicit about because W4 is the first entry that adds a real GPU KERNEL.**
-  `vt::MlaDecodeAttention` is a NEW `OpId` with **no caller in any model TU** —
-  the only things that invoke it are its own unit test and `TritonMLAImpl`, which
-  itself has no caller until the W7 DeepSeek-V2 forward exists. Filling
-  `TritonMLABackend::get_impl_cls()` changes what an `use_mla=true` request would
-  get, and no gate model is MLA. So no existing kernel, dispatch path or hot loop
-  moved: 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6**, Qwen3-dense
-  **16/16**, OPT **6/6** all UNCHANGED, and the full `ctest` sweep came back
-  **178/178, 0 failed** (the documented `test_capi` signature flake did not fire
-  this run). **NO SPEED NUMBER IS CLAIMED FOR THE NEW KERNEL, and none is owed
-  yet.** It is written to be CORRECT, not fast: shared-memory tiling is sized for
-  generality rather than tuned, there is no tensor-core path, and the split
-  heuristic is upstream's occupancy formula rather than a measured one. MLA decode
-  throughput is **W9**, is measured against graphed vLLM per the disposition
-  below, and until then any number from this kernel would be a
-  stale-denominator artifact. `benchmark_binding=false`.
-  Therefore **no binding number is created, re-based or invalidated, and every
-  existing binding result stands unchanged.** One forward-looking observation
-  recorded from W0 so it cannot surprise W9: the oracle resolves DeepSeek's MoE to
-  the **FlashInfer CUTLASS** backend, not Triton `fused_moe`, so the "our grouped
-  MoE GEMM runs ~1.2x vLLM's Triton `fused_moe`" figure from the 35B work does NOT
-  transfer to this model's speed denominator and must be re-measured.
-  **W5 is NOT APPLICABLE for the same structural reason, PLUS one additional
-  claim that DOES have to be proved rather than argued.** `vt::MlaPrefillAttention`,
-  `vt::GatherMlaCache` and `vt::MergeAttnStates` are new `OpId`s with **no caller
-  in any model TU** (only their unit tests and the W6-pending MLA block), and the
-  chunked-context driver is a header nothing yet includes outside its test — so no
-  existing hot path moved. **The claim that needed proof is the FA-2 launcher
-  generalization**, because that TU is SHARED with the 27B / 35B / Qwen3-dense
-  prefill paths. It was proved two ways, not assumed: STRUCTURALLY — the diff of
-  `src/vt/cuda/cuda_flash_attn_fa2.cu` is **211 insertions / 0 deletions**, the
-  paged launcher `LaunchPrefillFA2Bf16` those models call is textually untouched,
-  and the vendored FA-2 tree gains only two NEW files that instantiate the
-  UNCHANGED generic `run_mha_fwd_splitkv_dispatch<bf16, 192, ...>` template at one
-  more head dim; and EMPIRICALLY — 27B **235/235**, 35B **315/315**, Qwen3-Coder
-  **138/138**, Qwen3-dense **664/664**, OPT **36/36** all token-exact UNCHANGED.
-  **NO SPEED NUMBER IS CLAIMED FOR MLA PREFILL, and none is owed yet.** The V
-  zero-pad allocates and writes a 192-wide staging copy of V (upstream does the
-  same `torch.nn.functional.pad`), `vt::MergeAttnStates` is scalar rather than
-  upstream's 128-bit-packed form, and the chunk grid is upstream's equal-share
-  heuristic rather than a measured one — all three are deliberate
-  correctness-first choices and all three are **W9** levers. `benchmark_binding=false`.
-  **W6 is NOT APPLICABLE for the same structural reason, plus one shared-op claim
-  that had to be proved rather than argued.** W6 adds the MLA attention BLOCK and
-  LOAD-TIME WEIGHT ABSORPTION — an attention LAYER, not a model — so the block
-  itself still has **no caller in any model TU**: only its own unit test
-  instantiates it, and it stays unreachable until the W7 DeepSeek-V2 forward
-  exists. Its two new `OpId`s (`vt::BatchedMatmul`, `vt::ConcatMlaNopeRope`) are
-  likewise called by nothing on any existing hot path. **The claim that needed
-  proof is the pair of relaxations to SHARED ops**, because `vt::RopeFromCache`
-  and `vt::MatmulBT` are on the 27B / 35B / Qwen3-Coder / Qwen3-dense / OPT hot
-  paths: `RopeFromCache` became stride-driven on q/k, and `MatmulBT` now accepts
-  a row-strided ACTIVATION. Both were proved two ways rather than assumed —
-  STRUCTURALLY, because for a CONTIGUOUS tensor the strided offsets are
-  INTEGER-IDENTICAL to the previous closed-form arithmetic (`row stride == K`,
-  `(token * heads + head) * head_dim`), so contiguous callers hand the kernels and
-  cuBLASLt byte-identical arguments and therefore get the same algo and the same
-  bits; and EMPIRICALLY — 27B **235/235**, 35B **315/315**, Qwen3-Coder
-  **138/138**, Qwen3-dense **664/664**, OPT **36/36** all token-exact UNCHANGED.
-  **NO SPEED NUMBER IS CLAIMED FOR THE MLA BLOCK, and none is owed yet.** Three
-  deliberate correctness-first choices are named here so W9 inherits them as
-  explicit levers rather than discovering them: the A-projections are issued as
-  one GEMM per weight ROW-SLICE instead of one fused GEMM (a launch-count and
-  cuBLASLt-shape trade, taken because `vt::RmsNorm` requires contiguous inputs);
-  `vt::ConcatMlaNopeRope` is scalar where upstream's `concat_mla_q` is
-  128/256-bit vectorized; and the decode path materializes an intermediate
-  `ql_nope` buffer before the concat exactly as upstream does, rather than having
-  the batched GEMM write straight into the query's leading columns.
-  `benchmark_binding=false`.
-  **W7 is the first entry with a REACHABLE MLA path, and it is STILL NOT
-  APPLICABLE — for a different and weaker reason, so the reason is stated
-  explicitly rather than reused.** W7 adds the DeepSeek-V2 MODEL: registry, config
-  parse, weight loader and forward. So for the first time the MLA block, the MLA
-  decode and prefill kernels, the MLA cache write and the grouped router all have
-  a real caller, and the real DeepSeek-V2-Lite checkpoint runs through them
-  ("The capital of France is" -> " Paris"). **But no number is created, because
-  correctness precedes speed unconditionally**: the SACRED token-exact gate
-  against the vLLM 0.25.0 oracle is W8, and benchmarking a model whose correctness
-  is not yet gated would produce a number nobody may cite. The forward is also
-  explicitly correctness-first — there is no decode CUDA-graph sibling (the lever
-  worth ~5 ms/step at concurrency 1 on every sibling model that has one), the
-  A-projections are still per-row-slice rather than one fused GEMM, and the MLA
-  fusion recipes (RoPE + concat-cache, dual-RMSNorm) are not written — so any
-  measurement now would be of a deliberately untuned path and would become a stale
-  denominator the moment W9 lands. **The claim W7 DID have to prove is that
-  nothing existing moved**, because it touches shared surfaces: the runner's KV
-  group resolution gains a two-line additive condition, and the DeepSeek MoE block
-  activates the shared-expert path for the first time. Proved two ways rather than
-  assumed — STRUCTURALLY, because the runner change is an added `||` clause for a
-  spec kind no existing model produces, and the DeepSeek MoE block is written
-  directly over the `vt::` ops rather than reusing `RunMoeBlock`, so the
-  27B/35B/Qwen3-Coder MoE code is textually untouched; and EMPIRICALLY — 27B
-  **235/235**, 35B **315/315**, Qwen3-Coder **138/138**, Qwen3-dense **664/664**,
-  OPT **36/36** all token-exact UNCHANGED. `compute-sanitizer` memcheck 0,
-  racecheck 0 hazards, synccheck 0 on the new model's CUDA case.
-  `benchmark_binding=false`.
-  **Integration fix folded in (`888fbcc`), also NOT APPLICABLE:** OPT-125m's KV
-  factory published a decorative `float32` spec dtype that was inert before the
-  W1 refactor and would have allocated an f32 KV cache after it. Corrected to the
-  resolved dtype (bf16 default), which RESTORES OPT's pre-existing allocation
-  rather than changing it, so no OPT number is created or invalidated. Re-gated:
-  OPT STRICT 6/6 (96/96 tokens), 27B 235/235, 35B 315/315, Qwen3-Coder 6/6,
-  Qwen3-dense 664 assertions, memcheck 0, goldens md5-identical before and after.
-  **W8 (the SACRED correctness gate) is likewise `benchmark_binding=false` /
-  NOT APPLICABLE — but for the first time the reason is "correctness, not
-  speed", NOT "unreachable".** W8 adds no kernel and no forward-path code at
-  all: a paged-engine correctness gate, its vLLM 0.25.0 goldens, two oracle
-  scripts, a serialized dgx series runner, DIAGNOSTIC-only `MlaBatchSplitStats`
-  counters that nothing in the forward reads, and a new tokenizer pre-tokenizer
-  family (`SplitPattern::kDeepSeek`) reached only by DeepSeek checkpoints. **The
-  correctness result is 8/8** (STRICT token-exact 5/8, near-tie band 3/8, max
-  teacher-forced gap 0.25 nats, 0 forward-divergent), which is what moves the row
-  to `ACTIVE`; **the row is explicitly NOT `DONE`, because `DONE` requires
-  vLLM-speed parity on every axis and there is still NO SPEED NUMBER of any kind
-  for this model.** The tokenizer change touches shared code, so the
-  no-movement claim was proved rather than assumed: 27B **235/235**, 35B
-  **315/315**, Qwen3-Coder **6/6**, Qwen3-dense **16/16**, OPT **6/6**, plus the
-  Qwen3.6 tokenizer parity corpus and every other tokenizer test, all UNCHANGED.
-  One W9-relevant measurement fell out of the capture and is recorded so it is
-  not re-litigated later: **the oracle here must run `moe_backend='triton'`** —
-  vLLM's auto-selected FlashInfer CUTLASS unquantized MoE backend REBOOTED dgx
-  three times during the capture (GB10's 119 GiB is UNIFIED memory), and
-  `triton` is the same first-class substitution the Qwen3-Coder oracle scripts
-  already make. W9's binding grid must use one consistent oracle configuration
-  and state which.
-  **Benchmarks are PENDING and cannot begin until the implementation does.** The
-  future benchmark disposition is fixed now so it cannot be quietly loosened
-  later: the MLA gate vehicle is **DeepSeek-V2-Lite bf16**, measured against
-  **graphed** vLLM 0.25.0 (`enforce_eager=False`, `CUDAGraphMode.FULL_AND_PIECEWISE`,
-  Inductor `VLLM_COMPILE`) on **every axis** (median TTFT, TPOT, ITL, output
-  throughput, peak memory) at c1/c2/c4/c8, with a **fresh `vllm serve` per
-  concurrency** at a **verified 0.0% prefix-cache hit rate**, on an idle box under
-  one `flock /tmp/gpu`, 2 reps with the cold first leg discarded, and every parity
-  lever shipped DEFAULT-ON before the binding run.
-  **Reproduction entry point (once W8 lands):**
-  `examples/vllm-bench --input-len 1024 --output-len 128 --concurrency C` against
-  `vllm bench serve --dataset-name random --random-input-len 1024
-  --random-output-len 128 --random-range-ratio 0 --ignore-eos --max-concurrency C`.
-  **Explicitly HW-BLOCKED — no benchmark will ever be run here for these:**
-  DeepSeek-V3/V3.2 (~1250 GiB bf16 / ~640 GiB fp8), Kimi-K2/K2.5 (~2000 GiB),
-  MiniMax-M2 (~428 GiB) and MiniMax-M3 do not fit GB10's 119 GiB unified memory,
-  and two of them do not fit dgx's 238 GiB of free disk. Kimi-Linear-48B
-  (~89.4 GiB) is marginal and would need a memory-pressure check before any
-  number from it counted. These are recorded as hardware-blocked, not pending.
+  `benchmark_binding=false`; **NOT APPLICABLE — SUPERSEDED 2026-07-22 by W9**, which
+  gave this track its binding number (see "Binding DeepSeek-V2-Lite (MLA) every-axis
+  grid — MLA campaign W9" above; that entry is the current scoreboard for the
+  track). W0-W7 were correctness-only and **unreachable from any existing hot
+  path** — every new `vt::` op had no caller in any model TU until W7, the W1
+  allocator refactor is byte-for-byte identical for every existing model by
+  construction, and W2 changes only which backend NAME a `use_mla=true` request
+  resolves to. W8 was the SACRED correctness gate (**8/8**: STRICT 5/8, near-tie
+  3/8, max teacher-forced gap 0.25 nats, 0 forward-divergent), which is what moved
+  the row to `ACTIVE` and explicitly NOT to `DONE`. The no-movement claim was
+  proved, not assumed, at every step: 27B **235/235**, 35B **315/315**,
+  Qwen3-Coder, Qwen3-dense and OPT all token-exact UNCHANGED, memcheck/racecheck/
+  synccheck 0. One W9 input recorded here: the oracle must run
+  `moe_backend='triton'`, because vLLM's auto-selected FlashInfer CUTLASS
+  unquantized MoE backend REBOOTS dgx. Per-W chronology and evidence anchors live
+  in the append-only [state log](../.agents/state.md) and
+  [parity ledger](../.agents/parity-ledger.md), not here.
+
+- **MLA campaign W10 — the blocked-row honesty pass (2026-07-22,
+  `CLAIM-MLA-DEEPSEEK`, [spike](../.agents/specs/mla-deepseek-campaign.md)).**
+  `benchmark_binding=false`; **NOT APPLICABLE — RECORDS ONLY. No code, no build, no
+  GPU work, nothing downloaded, and NO NUMBER MEASURED, CREATED OR INVALIDATED.**
+  Because no source file is touched, every binding result stands unchanged — the
+  W9 DeepSeek-V2-Lite grid above remains the current scoreboard for this track
+  (tok/s 0.87/0.95/0.86/0.88, TTFT 1.06/1.14/**0.96**/**0.88**, TPOT
+  1.11/**0.97**/1.16/1.17, peak memory **0.46** at c1/c2/c4/c8 vs graphed vLLM
+  0.25.0 `--moe-backend triton`), and the row stays `ACTIVE`, not `DONE`.
+  **The benchmark-relevant output of this step is a permanent NO-BENCHMARK
+  verdict per family, so no future session re-opens it as "pending":**
+  DeepSeek-V3/V3.2 (671B, ~642 GiB fp8 / ~1250 GiB bf16), Kimi-K2/K2.5
+  (~2000 GiB), MiniMax-M2 (~428 GiB), MiniMax-M3 and GLM-5 (1404 GiB) **do not fit
+  GB10's 119 GiB of unified memory** (several also miss dgx's ~184 GiB of free
+  disk — corrected down from the 238 GiB measured before the V2-Lite download), so
+  **no benchmark will ever be run here for them**; V3.2 and GLM-5 are additionally
+  DEP-BLOCKED because DSA's sole sm_121 backend candidate dispatches to
+  flashinfer's dense-only XQA kernel, which discards `sparse_mla_top_k`.
+  Kimi-Linear-48B (~89.4 GiB) stays HW-MARGINAL and would need a memory-pressure
+  check before any number from it counted. **The one number this track can still
+  produce beyond the `gemvx` lever is a GLM-4.7-Flash grid**
+  (`Glm4MoeLiteForCausalLM`, 31.2B / **58.2 GiB — FITS**), which is also the only
+  reachable vehicle that converts the campaign's two permanent unit-only coverage
+  gaps (`noaux_tc` router, `q_lora` query branch) into e2e coverage; it is gated
+  behind a staged download that must free disk first. **Next binding run for this
+  track (unchanged):** land the named `gemvx` -> tensor-core dispatch lever
+  DEFAULT-ON, then re-run the identical c1..c8 recipe recorded in the W9 section
+  above (`~/w9mla/w9_ab.sh` + `~/w9mla/w9_vllm.sh`, idle box, one `flock /tmp/gpu`,
+  fresh server per concurrency, 0.0% prefix-cache hit rate, cold leg discarded).
+  Repro for THIS entry: none — nothing was executed; re-verify with
+  `python3 scripts/check-agent-record.py` and
+  `python3 scripts/check-doc-checkpoint.py`.
 
 - **CUDA-arch additivity seams — per-arch build feature table, capability
   threading, runtime SM-dispatch registry, queried smem ceiling (2026-07-21,

@@ -1,6 +1,15 @@
 # SPIKE — MLA (Multi-head Latent Attention) + the DeepSeek / Kimi / MiniMax families
 
-**Status:** **W0 + W1 + W2 + W3 + W4 + W5 + W6 + W7 LANDED** (see `### Work breakdown`). W0 grounded
+**Status:** **THE W-PLAN IS COMPLETE — W0 through W10 have landed** (see `### Work breakdown` and
+the per-step sections below). The campaign's ONE e2e-gateable member, **DeepSeek-V2-Lite, is
+CORRECTNESS-COMPLETE (SACRED gate 8/8) and SPEED-SHORT (0.86-0.95x vLLM tok/s)**, so its row is
+`ACTIVE`, not `DONE`, with one named open lever (batch-1 dense projections off cuBLAS `gemvx` onto a
+tensor-core GEMM). W10 set every other row to its final honest state: V3/V3.2, MiniMax-M2 and (cross-
+claim) GLM-5 are **`BLOCKED`** — hardware, and for the DSA models a dependency dead-end as well;
+`DeepseekForCausalLM` (plain MHA, not MLA) and Kimi-Linear stay `SPIKE`. **The block is NOT closeable
+and this spec stays LIVE.** Two coverage gaps are PERMANENT on this hardware (`noaux_tc` router and
+the `q_lora` query branch, both unit-gated only); **GLM-4.7-Flash (31.2B, 58.2 GiB) fits GB10 and
+would close both** — it is the named next vehicle. Historical detail follows. W0 grounded
 every fact the spike flagged as an unverified source read — all CONFIRMED by
 runtime observation, nothing contradicted. W1 landed the behaviour-preserving
 spec-driven KV allocation + `MLAAttentionSpec`. W2 landed the MLA branch of the
@@ -947,7 +956,7 @@ hardware. **Nothing below is implemented; this is the plan.**
 | **W7** ✅ **DONE 2026-07-22** | **DeepSeek-V2 model: registry + loader + forward.** New TU, config parse, KV spec (MLA-only group), per-expert bf16 loader + shared experts + `e_score_correction_bias`, forward composing the MLA block + the MoE block + the first `first_k_dense_replace` dense layers. | W6, W3 | **PASSED** — see the `### Work breakdown` W7 entry. Loader gate on the REAL 4-shard DeepSeek-V2-Lite: **5291/5291 checkpoint tensors accounted for, none unmapped and none leftover**, every shape asserted incl. the load-time `W_UK [16,128,512]` / `W_UV [16,512,128]` absorption split and the shared-expert MLP; **forward gate: `The capital of France is` -> argmax ` Paris`** (top-5 ` Paris`, ` the`, ` a`, ` one`, ` also`), run-to-run bit-exact. Batch-ordering gate + shared-expert gates + a CUDA-vs-CPU agreement case (0.0061 worst relative logit error, bit-exact run to run on device). memcheck / racecheck / synccheck all **0**. **DEVIATION from the plan cell: only `DeepseekV2ForCausalLM` is REGISTERED, not all four aliases** — `DeepseekForCausalLM` is plain MHA (§0.7) and would be a false support claim, V3 is fp8/671B (no bf16 loader path, no hardware), V3.2 needs the DSA indexer we do not have; W10 owns those rows. Second deviation: the MoE block is written against the `vt::` ops DIRECTLY rather than reusing `RunMoeBlock`, because DeepSeek's shared expert has NO sigmoid gate and its router is grouped — reusing Qwen's block would have applied Qwen's semantics, and writing it separately also means ZERO edit to the 27B/35B/Coder MoE paths |
 | **W8** | **SACRED correctness gate — DeepSeek-V2-Lite.** Paged-engine greedy vs the vLLM 0.25.0 oracle under the W0-determined gate form; goldens + capture/near-tie scripts. | W7 | the gate; regression set UNCHANGED; memcheck 0 |
 | **W9** ⚠️ **LANDED 2026-07-22 — ATTRIBUTED MISS, row stays `ACTIVE`** | **Speed close.** Decode CUDA-graph sibling; the MLA fusion recipes (RoPE+concat-cache, dual-RMSNorm) as byte-exact catalog entries; then the binding every-axis grid vs graphed vLLM at c1/c2/c4/c8. | W8 | every-axis parity or an honest attributed miss — **RESULT: HONEST MISS** — see the `### Work breakdown` W9 entry and [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md) § "Binding DeepSeek-V2-Lite (MLA) every-axis grid". Decode throughput went **0.50x -> 0.87x** of vLLM at c1 and TTFT now BEATS vLLM at c4/c8, but throughput is short at every concurrency, so the row does NOT reach `DONE`. **DEVIATION from the plan cell: the two levers actually driven were NOT the ones planned.** The planned MLA fusion recipes were not built, because `nsys` said they were not the lever; what the trace found instead was `MlaDecodeStage1` at **44.7% of all GPU time and ~180x off its own memory-bound floor** (a 2-CTA grid at batch 1), fixed by an occupancy-fill of the split-KV count for **+69.5%/+53.3%/+32.0%/+19.5%** at c1/c2/c4/c8 — an order of magnitude more than the planned work would have been worth. The planned decode CUDA-graph sibling WAS built and is worth only ~+2%: this model's decode is GPU-bound, not host-bound |
-| **W10** | **Blocked-row honesty pass.** Config/registry resolution + weight-map + unit parity at V3 dimensions (§5.2) for V3/V3.2; record `HW-BLOCKED` where e2e cannot run. Kimi-Linear and MiniMax-M2 assessments per §11 stay separate rows. | W8 | config/loader-slice/unit gates only |
+| **W10** ✅ **DONE 2026-07-22 — the campaign's W-plan is COMPLETE** | **Blocked-row honesty pass.** Config/registry resolution + weight-map + unit parity at V3 dimensions (§5.2) for V3/V3.2; record `HW-BLOCKED` where e2e cannot run. Kimi-Linear and MiniMax-M2 assessments per §11 stay separate rows. | W8 | config/loader-slice/unit gates only — **RESULT: RECORDS ONLY, no code, no build, no GPU work, nothing downloaded, no number claimed.** Two campaign rows move `SPIKE` -> `BLOCKED` (V3/V3.2 HW+DEP; MiniMax-M2 HW+disjoint), one cross-claim row moves `SPIKE` -> `BLOCKED` (GLM-5, HW+DEP), and the two rows that are neither blocked nor supported (`DeepseekForCausalLM`, Kimi-Linear) keep `SPIKE` with their records repaired. The DeepSeek-V2 row stays `ACTIVE`. **The block is NOT closeable** and nothing is archived — see `## W10` below. **Deviation from the plan cell: the config/loader-slice/unit gates for V3 were NOT newly built.** The only one that was ever cheap enough to be honest — unit parity of the `noaux_tc` router at V3's real dimensions — ALREADY EXISTS from W3 (`tests/vt/test_ops_moe_router_grouped.cpp` at 256 experts / `n_group=8` / `topk_group=4` / sigmoid / bias) and the `q_lora` branch is likewise already unit-gated at V3 dims from W6; adding a config-resolution test for an architecture whose config parse deliberately REFUSES it by name would assert our own refusal, not upstream parity, and a weight-map slice test needs a 642 GiB checkpoint's shard we have neither downloaded nor can justify downloading. What CAN still be gated is therefore stated in the row as a named, unbuilt option rather than silently claimed as coverage |
 
 **Ranked rationale.** W1-W2 are pure engine seams with zero MLA math and must not
 be entangled with model work. W3-W5 are the three genuinely new kernels/ops. W6-W8
@@ -2218,6 +2227,91 @@ registration stays deferred: there is still exactly one MLA decode kernel.
 *(i) WHAT THIS LICENSES.* The row stays **`ACTIVE`** with the residual named per
 axis and attributed to specific kernels. It reaches `DONE` when the c1..c8 grid
 passes on EVERY axis. Both §5.1 coverage gaps are unchanged.
+
+## W10 — the blocked-row honesty pass (DONE 2026-07-22): the campaign's W-plan is COMPLETE
+
+*(a) WHAT THIS STEP IS.* Records only — **no code, no kernels, no build, no GPU work, nothing
+downloaded, and no benchmark number produced or claimed.** Its job is to leave every row this campaign
+touched in the state the EVIDENCE supports, and to mark the ones that are hardware- or
+dependency-blocked as such rather than leaving them in a state that implies a gate we cannot run.
+
+*(b) ROW DISPOSITIONS — final honest state.*
+
+| Row | Was | Now | Why |
+|---|---|---|---|
+| `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` | `ACTIVE` | `ACTIVE` | Correctness COMPLETE (SACRED 8/8), speed SHORT (0.86-0.95x tok/s). `DONE` needs BOTH. One named open lever |
+| `MODEL-TEXT-deepseek-v2-deepseek-v3-for-causal-lm` (V3, V3.2, and K2/K2.5's text backbone) | `SPIKE` | **`BLOCKED`** | **HW** ~642 GiB fp8 / ~1250 GiB bf16 (671B) vs 119 GiB unified; **DEP** (V3.2 only) DSA has no working sm_121 backend |
+| `MODEL-TEXT-minimax-m2-mini-max-m2-for-causal-lm` | `SPIKE` | **`BLOCKED`** | **HW** ~428 GiB vs 119 GiB; and DISJOINT from MLA — it belongs behind the sliding-window track `ROAD-V1-C5` |
+| `MODEL-TEXT-deepseek-v2-deepseek-for-causal-lm` | `SPIKE` | `SPIKE` | **NOT an MLA row.** Plain MHA (`deepseek_v2.py:1201-1211`); needs our existing dense attention + the DeepSeek MoE block. The 16B variant would fit GB10, so it is not blocked — just not started |
+| `MODEL-TEXT-kimi-linear-kimi-linear-for-causal-lm` | `SPIKE` | `SPIKE` | MLA half unlocked (NoPE = a simplification of what we built); KDA is a SEPARATE kernel campaign; HW-MARGINAL at ~89.4 GiB of ~110 |
+| `MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm` (GLM-5) — **cross-claim** | `SPIKE` | **`BLOCKED`** | **HW** 1404.2 GiB; **DEP** GLM-5.x is V3.2 verbatim (`deepseek_v2.py:1917-1918`), so the same DSA dead-end. Edited from this claim with the disposition recorded in BOTH coordination rows |
+
+Per the record contract a claim may hold only `SPIKE`/`ACTIVE` rows, so each `BLOCKED` row is
+RELEASED from its claim's row list in the same change (the checker enforces this, and it is the right
+semantics: a blocked row is not work anyone is doing).
+
+*(c) THE DSA DEP-BLOCK, stated once so both rows can cite it.* For a SPARSE model the backend filter
+(`is_sparse()` XOR `use_sparse`) eliminates `TRITON_MLA`, so of the two entries in sm_121's MLA
+priority list (`cuda.py:129-133`) exactly ONE candidate survives:
+`FLASHINFER_MLA_SPARSE_SM120`. That path is non-functional on the flashinfer available here — its
+sm12x dispatch goes to **XQA** (`flashinfer/mla/_core.py:1169-1172`), which is DENSE-ONLY and
+hardcodes `0` for `sparse_mla_top_k` (`_core.py:1483`), while vLLM's probe
+`has_flashinfer_sparse_mla_sm120()` (`vllm/utils/flashinfer.py:216-231`) only checks that three
+symbols import and never the function actually called; upstream's single test
+(`tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py:37`) MONKEYPATCHES that probe to `True`
+and asserts nothing numerical. **This is a DEPENDENCY gap to watch, not work we close by porting
+harder.** (Full four-failure analysis: [glm-dsa-latest-deepseek](glm-dsa-latest-deepseek.md) §0.2.)
+Recorded alongside it so nobody ports the wrong file: **`vllm/models/deepseek_v32/` is UNREGISTERED
+DEAD CODE** upstream — `registry.py:92-93` routes both V3 and V3.2 to `deepseek_v2.py`.
+
+*(d) WHAT CAN STILL BE GATED ON A BLOCKED ROW, versus what cannot.* CAN: config/registry resolution
+against the real `config.json` (kilobytes, no weights); a weight-map/loader assertion on a single-layer
+SLICE from the safetensors index; unit parity at the real dimensions. CANNOT: any end-to-end
+token-exact or speed gate, now or after any amount of software work. Of the "CAN" list, the two pieces
+that matter are ALREADY GATED from W3/W6 (the `noaux_tc` router and the `q_lora` branch, both at V3's
+real dimensions); the rest is recorded as a named, UNBUILT option rather than claimed as coverage —
+see the W10 row of §10 for why building them now would have asserted our own refusal rather than
+upstream parity.
+
+*(e) THE TWO PERMANENT COVERAGE GAPS — now stated in the ROWS, not only here.* Both are properties of
+this hardware, not of our port: (1) the `noaux_tc` grouped router has **no e2e coverage** — V2-Lite is
+`n_group=topk_group=1` with softmax/greedy and has no `e_score_correction_bias` at all
+(`deepseek_v2.py:315-320`); (2) the `q_lora` query branch has **no e2e coverage** — V2-Lite is
+`q_lora_rank=null`, so `fused_qkv_a_proj`/`q_a_layernorm`/`q_b_proj` and the `packed_modules_mapping`
+un-fusing exist only under unit test. **Neither closes by porting harder — it needs a different
+checkpoint, and exactly one reachable checkpoint closes BOTH:**
+
+> **NAMED NEXT VEHICLE — GLM-4.7-Flash (`Glm4MoeLiteForCausalLM`, `zai-org/GLM-4.7-Flash`, 31.2B,
+> 58.2 GiB bf16) FITS GB10** (~110 GiB usable) and has **`q_lora_rank=768`** AND **`noaux_tc` with an
+> `e_score_correction_bias`**, so it converts both unit-only gaps into e2e coverage. Upstream it is a
+> zero-override subclass of DeepSeek-V2's MLA attention, so it lands as a pure addition on top of
+> W1-W7. Row: `MODEL-TEXT-glm4-moe-lite-glm4-moe-lite-for-causal-lm`, spike
+> [glm-dsa-latest-deepseek](glm-dsa-latest-deepseek.md).
+
+*(f) THE DEVIATIONS LEDGER, swept into the rows.* Every deviation this campaign recorded is now
+discoverable from the DeepSeek-V2 matrix row itself rather than only from this spec: the upstream FA-2
+empty-K / `unpadded_lse` defect W5 works around (`flash_fwd_kernel.h:1030-1043`); scalar
+`vt::MergeAttnStates` and `vt::ConcatMlaNopeRope` where upstream is vectorized; per-row-slice
+A-projections rather than one fused GEMM; the `cuda_arch_tactics` registration deferral; DCP/
+context-parallel and fp8-prefill not ported; the W9 split-KV occupancy fill as a recorded deviation
+from upstream's `max_seq_len`-only heuristic; and the PRE-EXISTING, tree-wide, non-MLA `DevicePool`
+singleton hazard (byte-size-class keying -> cross-backend recycled pointers -> SIGSEGV in a mixed
+CPU/CUDA test binary; worked around test-locally with `ActivePoolScope`).
+
+*(g) NUMBERS CORRECTED IN PASSING.* §5's disk figure of "238 GiB free" was measured before the
+V2-Lite download; dgx's root filesystem was re-measured at **184 GiB free / 95% full** on 2026-07-21.
+Neither number changes any verdict — every HW-BLOCKED member misses on MEMORY first — but the smaller
+one is the live figure for any future download, per [[grid-per-sha-trees-fill-disk]].
+
+*(h) BLOCK CLOSURE — NOT YET, and nothing is archived.* Every row in the block is at its final honest
+state, but `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` is `ACTIVE`, not `DONE`: `DONE` requires
+BOTH token-exact correctness (have it) AND vLLM-speed parity on EVERY axis (0.86-0.95x on throughput,
+so no). The coordination rule is "when EVERY row in an execution block is `DONE`, move the block
+plan/report to `.agents/completed/`", so **this spec and its claim STAY LIVE**. Archiving now would
+put load-bearing content under `completed/`, which the doc-lifecycle rule forbids. The claim remains
+open with exactly ONE open item: route the batch-1 dense projections off cuBLAS `gemvx` (31.8% of our
+GPU time) onto a tensor-core GEMM — vLLM splits the same work `gemvx` 12.7% + `nvjet_sm121_tst_mma_*`
+6.6%. That is a DISPATCH change, not a new kernel.
 
 ### Risks/decisions
 

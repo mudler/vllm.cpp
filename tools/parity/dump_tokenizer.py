@@ -66,6 +66,10 @@ def main() -> int:
     ap.add_argument("--tokenizer-json", type=pathlib.Path,
                     default=DEFAULT_TOKENIZER_JSON)
     ap.add_argument("--golden-dir", type=pathlib.Path, default=GOLDEN_DIR)
+    # Provenance string recorded in encodings.json. Defaulted to the original
+    # Qwen3.6 oracle so the existing regeneration command is unchanged; the
+    # DeepSeek-V2 corpus (MLA campaign W8) passes its own.
+    ap.add_argument("--label", default="unsloth/Qwen3.6-27B-NVFP4 @ 890bdef7")
     args = ap.parse_args()
 
     import tokenizers
@@ -91,7 +95,7 @@ def main() -> int:
     doc = {
         "oracle": {
             "tokenizers": tokenizers.__version__,
-            "tokenizer_json": "unsloth/Qwen3.6-27B-NVFP4 @ 890bdef7",
+            "tokenizer_json": args.label,
             "tokenizer_json_sha256": sha,
             "add_special_tokens": False,
             "regenerate": "~/venvs/vllm-oracle/bin/python tools/parity/dump_tokenizer.py",

@@ -248,6 +248,36 @@ struct MlaBatchSplit {
 // no device, no weights — so the batch-ordering invariant is directly gateable.
 MlaBatchSplit BuildMlaBatchSplit(const v1::CommonAttentionMetadata& meta);
 
+// ─── MLA campaign W8: PROOF the split ran, and WHAT SHAPES the engine produced ─
+//
+// A passing correctness gate does not prove the interesting path executed — the
+// W1 lesson (`GPUModelRunner::fa_page_size_bytes()` was added for exactly this
+// reason: "proof the new path is EXERCISED, not merely compiled"). W8 wires a
+// real PAGED ENGINE over this model, so the question it must answer is not only
+// "are the tokens right" but "did the scheduler/runner actually hand the MLA
+// block MIXED batches, in the legal order, with a with-context prefill in them".
+//
+// These counters are accumulated inside the per-step split build (one call per
+// forward). They are DIAGNOSTIC ONLY — nothing in the forward reads them — and
+// they are written from the single forward thread the runner drives, so they
+// carry no synchronization. The paged-engine gate resets them, runs the battery,
+// and ASSERTS on the shapes observed (see
+// tests/vllm/models/test_deepseek_v2_paged_engine.cpp).
+struct MlaBatchSplitStats {
+  int64_t steps = 0;                   // BuildMlaStep invocations (= forwards)
+  int64_t decode_only_steps = 0;       // num_prefills == 0 && num_decodes > 0
+  int64_t prefill_only_steps = 0;      // num_decodes == 0 && num_prefills > 0
+  int64_t mixed_steps = 0;             // BOTH halves non-empty in one step
+  int64_t with_context_prefill_steps = 0;  // num_prefills_with_context > 0
+  int64_t max_num_decodes = 0;
+  int64_t max_num_prefills = 0;
+  int64_t max_num_reqs = 0;
+  int64_t total_decode_tokens = 0;
+  int64_t total_prefill_tokens = 0;
+};
+const MlaBatchSplitStats& GetMlaBatchSplitStats();
+void ResetMlaBatchSplitStats();
+
 // The DeepSeek-V2 forward: embed -> N decoder layers (std add+RMSNorm ->
 // mla::ForwardMlaAttentionBlock -> std add+RMSNorm -> dense MLP or MoE block) ->
 // final RMSNorm -> untied lm_head. `attn_kv` carries ONE MLA cache per layer,

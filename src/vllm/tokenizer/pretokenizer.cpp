@@ -288,10 +288,227 @@ std::vector<std::pair<size_t, size_t>> PretokenizeGpt2(std::string_view text) {
   return spans;
 }
 
+// ---------------------------------------------------------------------------
+// DeepSeek rules (DeepSeek-V2 / V2-Lite / V3). MLA campaign W8.
+//
+// This family is NOT another alternation regex. Its tokenizer.json declares a HF
+// `Sequence` PIPELINE of seven pre-tokenizers, and HF applies them in order,
+// each one further splitting the pieces the previous one produced:
+//
+//   0. Split(Regex("[\r\n]"),        Isolated)
+//   1. Split(Regex("\s?[<cased letters>]+"), Isolated)
+//   2. Split(Regex("\s?[<ascii + fullwidth + CJK punctuation>]+"), Isolated)
+//   3. Split(Regex("\s+$"),          Isolated)
+//   4. Split(Regex("[<CJK ideographs + Hangul>]+"), Isolated)
+//   5. Digits(individual_digits=true)
+//   6. ByteLevel(add_prefix_space=false, trim_offsets=true, use_regex=false)
+//
+// Two consequences worth stating, because they are what make a single-pass
+// alternation scanner the WRONG shape here:
+//  * stage 2's class `[!-/:-~…]+` spans 0x3A-0x7E, which CONTAINS A-Z and a-z.
+//    It is only correct because stage 1 already isolated the letter runs. Order
+//    is load-bearing, so the implementation is a genuine pipeline.
+//  * stage 3's `\s+$` anchors to the end of the PIECE. `$` in onig is
+//    end-of-LINE, not end-of-string — but stage 0 has already isolated every
+//    \r and \n into its own piece, so no piece reaching stage 3 contains a
+//    newline and the two readings coincide. (Recorded rather than relied on
+//    silently.)
+//
+// The classes are ENUMERATED codepoint ranges in the checkpoint, not `\p{...}`
+// properties, so they are transcribed here verbatim from
+// deepseek-ai/DeepSeek-V2-Lite tokenizer.json (snapshot 604d5664, read
+// 2026-07-22) and the tokenizer loader compares the checkpoint's regex strings
+// against the same verbatim patterns before selecting this family — a DeepSeek
+// variant that ships different ranges is REFUSED loudly instead of being
+// mis-tokenized.
+
+// Stage 1: "\s?[A-Za-zµÀ-Ö…]+" — 87 ranges, ascending and disjoint as shipped.
+constexpr uint32_t kDsLetterRanges[][2] = {
+    {0x0041, 0x005A}, {0x0061, 0x007A}, {0x00B5, 0x00B5}, {0x00C0, 0x00D6},
+    {0x00D8, 0x00F6}, {0x00F8, 0x01BA}, {0x01BC, 0x01BF}, {0x01C4, 0x0293},
+    {0x0295, 0x02AF}, {0x0370, 0x0373}, {0x0376, 0x0376}, {0x0377, 0x0377},
+    {0x037B, 0x037D}, {0x037F, 0x037F}, {0x0386, 0x0386}, {0x0388, 0x038A},
+    {0x038C, 0x038C}, {0x038E, 0x03A1}, {0x03A3, 0x03F5}, {0x03F7, 0x0481},
+    {0x048A, 0x052F}, {0x0531, 0x0556}, {0x10A0, 0x10C5}, {0x13A0, 0x13F5},
+    {0x13F8, 0x13FD}, {0x1C90, 0x1CBA}, {0x1CBD, 0x1CBF}, {0x1D00, 0x1D2B},
+    {0x1D6B, 0x1D77}, {0x1D79, 0x1D9A}, {0x1E00, 0x1F15}, {0x1F18, 0x1F1D},
+    {0x1F20, 0x1F45}, {0x1F48, 0x1F4D}, {0x1F50, 0x1F57}, {0x1F59, 0x1F59},
+    {0x1F5B, 0x1F5B}, {0x1F5D, 0x1F5D}, {0x1F5F, 0x1F7D}, {0x1F80, 0x1FB4},
+    {0x1FB6, 0x1FBC}, {0x1FBE, 0x1FBE}, {0x1FC2, 0x1FC4}, {0x1FC6, 0x1FCC},
+    {0x1FD0, 0x1FD3}, {0x1FD6, 0x1FDB}, {0x1FE0, 0x1FEC}, {0x1FF2, 0x1FF4},
+    {0x1FF6, 0x1FFC}, {0x2102, 0x2102}, {0x2107, 0x2107}, {0x210A, 0x2113},
+    {0x2115, 0x2115}, {0x2119, 0x211D}, {0x2124, 0x2124}, {0x2126, 0x2126},
+    {0x2128, 0x2128}, {0x212A, 0x212D}, {0x212F, 0x2134}, {0x2139, 0x2139},
+    {0x213C, 0x213F}, {0x2145, 0x2149}, {0x214E, 0x214E}, {0x2183, 0x2183},
+    {0x2184, 0x2184}, {0x2C00, 0x2C7B}, {0x2C7E, 0x2CE4}, {0x2CEB, 0x2CEE},
+    {0x2CF2, 0x2CF2}, {0x2CF3, 0x2CF3}, {0xA640, 0xA66D}, {0xA680, 0xA69B},
+    {0xA722, 0xA76F}, {0xA771, 0xA787}, {0xA78B, 0xA78E}, {0xAB70, 0xABBF},
+    {0xFB00, 0xFB06}, {0xFB13, 0xFB17}, {0xFF21, 0xFF3A}, {0xFF41, 0xFF5A},
+    {0x10400, 0x1044F}, {0x104B0, 0x104D3}, {0x104D8, 0x104FB},
+    {0x10C80, 0x10CB2}, {0x10CC0, 0x10CF2}, {0x118A0, 0x118DF},
+    {0x1E900, 0x1E943},
+};
+
+// Stage 2: "\s?[!-/:-~！-／：-～‘-‟　-。]+", sorted here (the checkpoint lists the
+// two General-Punctuation/CJK ranges after the fullwidth ones).
+constexpr uint32_t kDsPunctRanges[][2] = {
+    {0x0021, 0x002F}, {0x003A, 0x007E}, {0x2018, 0x201F},
+    {0x3000, 0x3002}, {0xFF01, 0xFF0F}, {0xFF1A, 0xFF5E},
+};
+
+// Stage 4: "[一-龥ࠀ-一가-퟿]+" = {0x4E00-0x9FA5, 0x0800-0x4E00, 0xAC00-0xD7FF}.
+// The first two OVERLAP at 0x4E00 and are contiguous, so they are merged here
+// into 0x0800-0x9FA5; the raw shipped form is recorded above.
+constexpr uint32_t kDsCjkRanges[][2] = {
+    {0x0800, 0x9FA5},
+    {0xAC00, 0xD7FF},
+};
+
+template <size_t N>
+bool InRanges(uint32_t cp, const uint32_t (&ranges)[N][2]) {
+  size_t lo = 0, hi = N;
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (cp < ranges[mid][0]) {
+      hi = mid;
+    } else if (cp > ranges[mid][1]) {
+      lo = mid + 1;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+using Span = std::pair<size_t, size_t>;
+
+// One HF `Split(behavior=Isolated)` stage. For every current piece, scan left to
+// right; at each position ask `match` for the end of a match STARTING THERE
+// (0 = no match, and matches are never empty). A match is emitted as its own
+// piece and the unmatched text before it is emitted as a piece too — that is
+// exactly what "Isolated" means. Pieces with no match at all pass through whole.
+template <typename Match>
+void ApplySplitIsolated(std::string_view text, std::vector<Span>& pieces,
+                        Match match) {
+  std::vector<Span> out;
+  out.reserve(pieces.size());
+  for (const Span& piece : pieces) {
+    size_t gap_begin = piece.first;
+    size_t pos = piece.first;
+    while (pos < piece.second) {
+      const size_t end = match(text, pos, piece.second);
+      if (end == 0) {
+        pos = DecodeAt(text, pos).end;
+        continue;
+      }
+      if (pos > gap_begin) out.emplace_back(gap_begin, pos);
+      out.emplace_back(pos, end);
+      pos = end;
+      gap_begin = pos;
+    }
+    if (piece.second > gap_begin) out.emplace_back(gap_begin, piece.second);
+  }
+  pieces.swap(out);
+}
+
+// `Digits(individual_digits=true)`: HF splits on the digit predicate with
+// Isolated behaviour, so EACH digit codepoint becomes its own piece and the
+// non-digit stretches between them stay whole. Rust's `char::is_numeric()` is
+// the Unicode N category — our UCat::kNumber.
+void ApplyDigitsIndividual(std::string_view text, std::vector<Span>& pieces) {
+  std::vector<Span> out;
+  out.reserve(pieces.size());
+  for (const Span& piece : pieces) {
+    size_t gap_begin = piece.first;
+    size_t pos = piece.first;
+    while (pos < piece.second) {
+      const Cp c = DecodeAt(text, pos);
+      if (Category(c.cp) == UCat::kNumber) {
+        if (pos > gap_begin) out.emplace_back(gap_begin, pos);
+        out.emplace_back(pos, c.end);
+        gap_begin = c.end;
+      }
+      pos = c.end;
+    }
+    if (piece.second > gap_begin) out.emplace_back(gap_begin, piece.second);
+  }
+  pieces.swap(out);
+}
+
+// Stage 0: `[\r\n]` — a single newline codepoint.
+size_t MatchDsNewline(std::string_view t, size_t pos, size_t /*piece_end*/) {
+  return IsNewlineByte(t[pos]) ? pos + 1 : 0;
+}
+
+// Stages 1/2: `\s?[CLASS]+` — one OPTIONAL whitespace codepoint (any Unicode
+// White_Space, not just ASCII space), then a maximal run of class members.
+template <size_t N>
+size_t MatchDsWsClassRun(std::string_view t, size_t pos, size_t piece_end,
+                         const uint32_t (&ranges)[N][2]) {
+  size_t p = pos;
+  const Cp c0 = DecodeAt(t, p);
+  if (c0.end <= piece_end && IsRegexSpace(c0.cp) && !InRanges(c0.cp, ranges)) {
+    p = c0.end;
+  }
+  const size_t run_begin = p;
+  while (p < piece_end) {
+    const Cp c = DecodeAt(t, p);
+    if (c.end > piece_end || !InRanges(c.cp, ranges)) break;
+    p = c.end;
+  }
+  return p == run_begin ? 0 : p;
+}
+
+// Stage 3: `\s+$` — a whitespace run that reaches the END of the piece.
+size_t MatchDsTrailingWs(std::string_view t, size_t pos, size_t piece_end) {
+  size_t p = pos;
+  while (p < piece_end) {
+    const Cp c = DecodeAt(t, p);
+    if (c.end > piece_end || !IsRegexSpace(c.cp)) break;
+    p = c.end;
+  }
+  return (p > pos && p == piece_end) ? p : 0;
+}
+
+// Stage 4: `[CLASS]+` — a maximal class run with NO whitespace prefix.
+template <size_t N>
+size_t MatchDsClassRun(std::string_view t, size_t pos, size_t piece_end,
+                       const uint32_t (&ranges)[N][2]) {
+  size_t p = pos;
+  while (p < piece_end) {
+    const Cp c = DecodeAt(t, p);
+    if (c.end > piece_end || !InRanges(c.cp, ranges)) break;
+    p = c.end;
+  }
+  return p == pos ? 0 : p;
+}
+
+std::vector<Span> PretokenizeDeepSeek(std::string_view text) {
+  std::vector<Span> pieces;
+  if (text.empty()) return pieces;
+  pieces.emplace_back(0, text.size());
+  ApplySplitIsolated(text, pieces, MatchDsNewline);
+  ApplySplitIsolated(text, pieces, [](std::string_view t, size_t p, size_t e) {
+    return MatchDsWsClassRun(t, p, e, kDsLetterRanges);
+  });
+  ApplySplitIsolated(text, pieces, [](std::string_view t, size_t p, size_t e) {
+    return MatchDsWsClassRun(t, p, e, kDsPunctRanges);
+  });
+  ApplySplitIsolated(text, pieces, MatchDsTrailingWs);
+  ApplySplitIsolated(text, pieces, [](std::string_view t, size_t p, size_t e) {
+    return MatchDsClassRun(t, p, e, kDsCjkRanges);
+  });
+  ApplyDigitsIndividual(text, pieces);
+  // Stage 6 is ByteLevel(use_regex=false): it maps bytes, it does not split.
+  return pieces;
+}
+
 }  // namespace
 
 std::vector<std::pair<size_t, size_t>> Pretokenize(std::string_view text,
                                                    SplitPattern pattern) {
+  // DeepSeek is a Sequence PIPELINE, not an alternation (see above).
+  if (pattern == SplitPattern::kDeepSeek) return PretokenizeDeepSeek(text);
   // GPT-2's alternation differs in four of six rules, so it runs its own
   // scanner rather than threading more flags through the Qwen/Llama-3 one.
   if (pattern == SplitPattern::kGpt2) return PretokenizeGpt2(text);

@@ -27,6 +27,18 @@ enum class SplitPattern {
             // case-SENSITIVE contractions, a plain ` ?` space prefix instead of
             // the `[^\r\n\p{L}\p{N}]?` prefix, UNBOUNDED `\p{N}+` digit runs,
             // no `[\r\n]*` punct tail and no `\s*[\r\n]+` rule at all.
+  kDeepSeek,  // DeepSeek family (DeepSeek-V2/V2-Lite/V3). STRUCTURALLY UNLIKE
+              // every pattern above: not ONE alternation regex but a HF
+              // `Sequence` PIPELINE of seven pre-tokenizers, each further
+              // splitting the pieces the previous one produced — five
+              // `Split(behavior=Isolated)` stages over EXPLICIT codepoint
+              // classes (newlines; cased letters; ASCII+fullwidth+CJK
+              // punctuation; trailing whitespace; CJK/Hangul), then
+              // `Digits(individual_digits=true)`, then a
+              // `ByteLevel(use_regex=false)` that splits nothing. The classes
+              // are enumerated codepoint ranges in the checkpoint rather than
+              // `\p{...}` properties, so they are transcribed verbatim in
+              // src/vllm/tokenizer/pretokenizer.cpp with their provenance.
 };
 
 // Splits `text` into pretoken byte spans [first, second), exactly as HF

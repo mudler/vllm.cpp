@@ -16647,3 +16647,181 @@ with-context prefills leading the prefill tail — i.e. port
 is DETERMINISTIC at batch=1, 8/8), with the regression set unchanged and memcheck
 0. First verification commands:
 `ssh dgx.casa 'cd ~/w7mla_src/build/tests && ./test_deepseek_v2_load && VT_DEEPSEEK_PROMPT_IDS=549,6077,280,7239,317 ./test_deepseek_v2_forward'`.
+
+## 2026-07-22 — MLA campaign **W8**: the SACRED correctness gate on DeepSeek-V2-Lite — **PASSES 8/8**
+
+Worktree `agent-a5c1b57e0f74e4423`, base main HEAD `04f5c01`, `CLAIM-MLA-DEEPSEEK`.
+Row `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` moves **`SPIKE` ->
+`ACTIVE` (correctness COMPLETE, speed PENDING)** — and *only* that far: `DONE`
+requires vLLM-speed parity on every axis, which is W9 and has no number yet.
+Evidence root on dgx: `~/w8mla` (`goldens/`, `src2/` build, `capture.log`,
+`gate5.log`, `neartie.log`, `regress.log`).
+
+### Result
+
+**8/8 prompts PASS** — STRICT token-exact **5/8**, near-tie band **3/8**,
+**92/128 tokens strictly exact**, **max teacher-forced gap 0.25 nats**
+@ prompt[3] tok 9, **0 forward-divergent**. `test_deepseek_v2_paged_engine`
+**1/1 case / 223 assertions**.
+
+### The bar was ARRIVED AT by measurement, twice — it was not chosen
+
+1. **vLLM is DETERMINISTIC here at batch=1.** W0's K=5 8/8 is re-confirmed by
+   W8's own capture at T=16: **0 multi-valued (prompt,pos) cells**
+   (`greedy_dist.npy`, re-asserted by the gate at run time). The W0 BATCHED
+   probe's 3/8 "self-inconsistency" is the known batching artifact and is
+   explicitly not used.
+2. **The STRICT gate was therefore run FIRST, and came out 5/8** (prompts 2, 3,
+   5 diverged).
+3. **The ratified TEACHER-FORCING diagnostic was then run**
+   (`scripts/deepseek-v2-neartie-gap.py`, mirroring `qwen3coder-neartie-gap.py`):
+   **36 divergent positions, 35 of them at gap EXACTLY 0.0000 nats** — vLLM's own
+   logits on OUR prefix pick OUR token, so they are the downstream tail of a
+   single earlier flip, not independent errors. **Exactly ONE root flip carries
+   any gap at all: prompt[3] tok 9 at 0.2500 nats**, inside the ratified 0.5-nat
+   band and equal to the worst gap the landed Qwen3-dense 4B gate carries.
+   **ZERO tokens outside vLLM's top-20.** Two of the three root flips sit at gap
+   0.0000, i.e. vLLM's incremental DECODE argmax disagrees with vLLM's OWN
+   teacher-forced PREFILL argmax and our token is the one vLLM's logits prefer.
+4. The per-position nats are **COMMITTED** (`neartie_gap_mnats.npy`, anchored by
+   `our_ids.npy`); anything beyond 0.5 nats or outside vLLM's top-K still FAILS,
+   and an engine change that moves a token trips the anchor check.
+
+### W8's first job — the scheduler/runner wiring — needed NO new code
+
+Reading the runner before writing a reorder showed the order was already
+MLA-legal, and for a non-accidental reason: `runner.cpp:671` calls
+`reorder_batch_to_split_decodes_and_prefills` unconditionally with
+`decode_threshold = 1` — exactly MLA's `reorder_batch_threshold`
+(`mla_attention.py:1420`) — and its four-way target ordering
+`decode -> short_extend -> long_extend -> pure_prefill` satisfies BOTH MLA
+invariants: regions 0/1 have `query_len <= 1` so `split_decodes_and_prefills`
+decodes form a batch PREFIX, and region 2 (has context) precedes region 3
+(context-free) so with-context prefills LEAD the prefill tail
+(`prefill_tokens_with_context` is a prefix length, `:1806-1810`). The port made
+for GDN is exactly MLA's contract.
+**That is a claim, so it is PROVEN end to end** with new diagnostic
+`MlaBatchSplitStats` counters (deepseek_v2.h; nothing in the forward reads them
+— the W1 `fa_page_size_bytes()` "proof the path is EXERCISED" pattern) and a
+non-vacuity bar, because a legal order over batch-of-1 steps would prove nothing:
+- **phase 2** admits the battery CONCURRENTLY with STAGGERED admission:
+  **steps=30, MIXED=7, max_num_reqs=8, max_num_decodes=8**, with
+  `BuildMlaBatchSplit` (which THROWS naming the request and citing the upstream
+  line) never firing;
+- **phase 3** submits a 91-token prompt twice so the PREFIX CACHE produces a real
+  **with-context prefill** (`with_context_prefill_steps=1`), the cached run
+  reproducing the uncached one exactly;
+- **phase 0** asserts a genuine MLA cache was allocated:
+  `fa_page_size_bytes = 36864 = block 32 x 576 x 2B`, the factor 2 every other
+  attention spec carries simply absent;
+- **phase 1** reports steps=128, prefill_only=8, decode_only=120.
+
+### The real blocker was the TOKENIZER, not the model
+
+The first gate run did not diverge — it REFUSED to load:
+`tokenizer: unsupported normalizer "Sequence"`. W7's forward gate uses hard-coded
+ids, so the tokenizer had never been exercised on this checkpoint. Behind the
+normalizer sat a pre-tokenizer we could not express at all.
+**DeepSeek's is not an alternation regex like Qwen/Llama-3/GPT-2 — it is a HF
+`Sequence` PIPELINE of SEVEN stages:** five `Split(Isolated)` over ENUMERATED
+codepoint ranges (newlines; cased letters; ASCII+fullwidth+CJK punctuation;
+trailing whitespace; CJK/Hangul), then `Digits(individual_digits=true)`, then
+`ByteLevel(use_regex=false)`. Landed as `SplitPattern::kDeepSeek`, with the five
+patterns compared VERBATIM at load so a variant shipping different ranges fails
+loudly instead of mis-tokenizing. Three findings kept:
+1. **Stage ORDER is load-bearing** — stage 2's punctuation class spans
+   0x3A-0x7E and therefore CONTAINS A-Z/a-z; it is only correct because stage 1
+   already isolated the letter runs. A single-pass alternation scanner is the
+   wrong shape.
+2. **Stage 3's `\s+$` anchors to end-of-PIECE**; onig's end-of-LINE reading of
+   `$` coincides only because stage 0 already isolated every newline into its own
+   piece. Recorded rather than silently relied on.
+3. **The empty `Sequence` normalizer is a genuine no-op** and is accepted; a
+   non-empty one still fails.
+**It is MEASURED, not argued:** new `test_tokenizer_parity_deepseek.cpp` checks
+Encode / Decode round-trip / incremental detokenization against the REAL HF
+`tokenizers` library over 98 corpus entries extended with pipeline-stress cases
+(individual-digit splitting, the letter/punct class overlap, fullwidth and CJK
+punctuation, CJK/Hangul, the cased-letter class boundaries — Greek, Cyrillic,
+Armenian, Georgian, Cherokee, Coptic, Deseret are IN while Arabic, Hebrew,
+Devanagari and Han are OUT — newline isolation, trailing whitespace, `\s?`-prefix
+attachment): **6/6 cases, 2461 assertions, token-for-token**. A transcription
+hazard was hit and designed out: the class literals first picked up **U+03CE
+where the checkpoint has U+1F7D** (visually identical glyphs), so they are now
+written as explicit `\u`/`\U` escapes.
+
+### The tokenization goldens EARNED their place — by refuting a fix already written
+
+`tokenizer_config.json` declares `tokenizer_class: LlamaTokenizerFast` and
+**`add_bos_token: true`** with `bos_token <|begin of sentence|>` (id 100000),
+while tokenizer.json's post_processor is a plain ByteLevel declaring no special
+tokens. That reads as a certain OPT-style missing-BOS bug, and a
+tokenizer_config.json reader was written to "fix" it. **The oracle capture then
+showed vLLM's own `prompt_token_ids` carry NO BOS** (`[549,6077,280,7239,317]`),
+and a direct probe confirmed why: `AutoTokenizer.from_pretrained(...,
+trust_remote_code=True)` resolves to class `TokenizersBackend` with
+`add_bos_token` **False**, and `encode(add_special_tokens=True)` adds nothing.
+Our loader already matched bit-for-bit; **the "fix" would have BROKEN a passing
+gate.** Reverted, with the measured behaviour PINNED by a guard case in
+`test_bpe.cpp` so the next reader must re-measure first
+([[ground-premises-before-dispatching]]). The `p{i}_prompt.i32` goldens are
+asserted with `REQUIRE`, not advisory, and all 8 match.
+
+### Gates
+
+- **Clean dgx CUDA rebuild: RC=0, 0 warnings / 0 errors** (`-Werror`, sm_121).
+- **REGRESSIONS UNCHANGED, run SERIALLY** (never `ctest -j` for big-model tests
+  — GB10's unified memory): 27B **235/235**, 35B **315/315**, Qwen3-Coder
+  **6/6**, Qwen3-dense **16/16**, OPT **6/6**. W8 touches SHARED TOKENIZER code,
+  so the Qwen3.6 tokenizer parity corpus, `test_bpe` 17/17, `test_pretokenizer`,
+  `test_detokenizer`, `test_input_processor` and `test_op_parity` are unchanged
+  too.
+- Local CPU suite **151/151** (one parallel-contention flake,
+  `test_openai_api_server`, passes standalone).
+- `compute-sanitizer` memcheck / racecheck / synccheck **0** on the MLA path
+  (synccheck needs `--num-cuda-barriers 65536`).
+
+### Deviations, recorded not glossed
+
+1. **The oracle runs `moe_backend='triton'`.** vLLM auto-selects the FlashInfer
+   CUTLASS unquantized MoE backend, whose expert workspace **REBOOTED dgx three
+   times** on 2026-07-22 — GB10's 119 GiB is UNIFIED, so weights + the 0.40
+   reservation + profiling activations + the 30 GB checkpoint page cache all draw
+   on one pool. Capping `max_num_batched_tokens` to 2048 did NOT help, and the
+   third attempt died alone on a freshly-rebooted box with an empty page cache.
+   `triton` is a first-class vLLM backend computing the SAME bf16 grouped MoE —
+   the identical substitution `scripts/qwen3coder-*.py` already make — and it is
+   used CONSISTENTLY by the capture AND the teacher-forcing run.
+2. **`gpu_memory_utilization=0.40` is HELD** as mandated; the memory lever used
+   was the MoE backend, not the reservation.
+3. The capture caps `max_model_len` / `max_num_batched_tokens` at 2048 and
+   `max_num_seqs` at 4. The battery's longest prompt is ~20 tokens generating 16,
+   and nothing about the greedy result depends on these (DeepSeek's YaRN scaling
+   reads `original_max_position_embeddings`/`factor` from config.json).
+4. **Batch invariance is REPORTED (6/8), deliberately NOT asserted.** Asserting
+   8/8 would hold us to a standard the ORACLE does not meet: W0 measured vLLM's
+   OWN greedy changing on **3/8** of this same battery under batched generation
+   while being deterministic 8/8 at batch=1. What IS asserted is the batch ORDER,
+   because an illegal order does not re-resolve a tie — it produces the 0.86
+   relative error W6 measured.
+5. **No new reorder code.** The existing GDN-motivated reorder already satisfies
+   MLA's contract; W8 proves that end to end instead of duplicating it.
+
+### Coverage stated plainly (unchanged from the spike)
+
+Both §5.1 gaps stand: `q_lora_rank=null` and `n_group=topk_group=1` with
+softmax/greedy, so the `fused_qkv_a_proj` query branch and the entire `noaux_tc`
+router (sigmoid scoring, biased-select/unbiased-weight asymmetry, two-level group
+mask) remain **unit-gated only** on this box. GLM-4.7-Flash (`q_lora_rank=768`,
+`noaux_tc`, 58.2 GiB) is the checkpoint that would close both.
+
+### Next
+
+**W9 — the speed close:** the decode CUDA-graph sibling, the MLA fusion recipes
+(RoPE+concat-cache, dual-RMSNorm) as byte-exact catalog entries, then the binding
+every-axis grid vs graphed vLLM at c1/c2/c4/c8. W9 must state which oracle MoE
+backend it uses (see deviation 1). **W10 — the blocked-row honesty pass.**
+First verification commands:
+`ssh dgx.casa 'cd ~/w8mla/src2 && ./build/tests/test_deepseek_v2_paged_engine'`
+and `scripts/deepseek-v2-dgx-gate.sh ~/w8mla/src2/build` for the full serialized
+series.

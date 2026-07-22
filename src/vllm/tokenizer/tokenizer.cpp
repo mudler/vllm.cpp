@@ -56,6 +56,78 @@ void InsertMerge(MergeRanks& ranks, const std::string& left,
 
 // Walks a pre_tokenizer node collecting Split regexes and checking that
 // every component is one we can emulate.
+// The DeepSeek family's pre_tokenizer is a `Sequence` PIPELINE, not a single
+// alternation regex (see src/vllm/tokenizer/pretokenizer.cpp for the full
+// semantics). Its five Split stages carry EXPLICIT enumerated codepoint classes
+// rather than `\p{...}` properties, so the classes we compiled into
+// SplitPattern::kDeepSeek are only valid for a checkpoint that ships exactly
+// these patterns. They are therefore compared VERBATIM — a DeepSeek variant with
+// different ranges must fail loudly, not tokenize subtly wrong.
+//
+// Transcribed from deepseek-ai/DeepSeek-V2-Lite tokenizer.json (snapshot
+// 604d5664dddd88a0433dbae533b7fe9472482de0, read 2026-07-22).
+// Written with explicit \u / \U escapes rather than literal UTF-8: several of
+// these codepoints have visually IDENTICAL lookalikes in other Unicode blocks
+// (a first transcription silently picked up U+03CE where the checkpoint has
+// U+1F7D — same glyph, different character, and the pattern comparison below
+// then rejected the real DeepSeek tokenizer). Escapes make the bytes auditable.
+constexpr const char* kDsNewlineRegex = "[\r\n]";
+constexpr const char* kDsLettersRegex =
+    "\\s?[A-Za-z\u00B5\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u01BA\u01BC-"
+    "\u01BF\u01C4-\u0293\u0295-\u02AF\u0370-\u0373\u0376\u0377\u037B-"
+    "\u037D\u037F\u0386\u0388-\u038A\u038C\u038E-\u03A1\u03A3-\u03F5"
+    "\u03F7-\u0481\u048A-\u052F\u0531-\u0556\u10A0-\u10C5\u13A0-\u13F5"
+    "\u13F8-\u13FD\u1C90-\u1CBA\u1CBD-\u1CBF\u1D00-\u1D2B\u1D6B-\u1D77"
+    "\u1D79-\u1D9A\u1E00-\u1F15\u1F18-\u1F1D\u1F20-\u1F45\u1F48-\u1F4D"
+    "\u1F50-\u1F57\u1F59\u1F5B\u1F5D\u1F5F-\u1F7D\u1F80-\u1FB4\u1FB6-"
+    "\u1FBC\u1FBE\u1FC2-\u1FC4\u1FC6-\u1FCC\u1FD0-\u1FD3\u1FD6-\u1FDB"
+    "\u1FE0-\u1FEC\u1FF2-\u1FF4\u1FF6-\u1FFC\u2102\u2107\u210A-\u2113"
+    "\u2115\u2119-\u211D\u2124\u2126\u2128\u212A-\u212D\u212F-\u2134"
+    "\u2139\u213C-\u213F\u2145-\u2149\u214E\u2183\u2184\u2C00-\u2C7B"
+    "\u2C7E-\u2CE4\u2CEB-\u2CEE\u2CF2\u2CF3\uA640-\uA66D\uA680-\uA69B"
+    "\uA722-\uA76F\uA771-\uA787\uA78B-\uA78E\uAB70-\uABBF\uFB00-\uFB06"
+    "\uFB13-\uFB17\uFF21-\uFF3A\uFF41-\uFF5A\U00010400-\U0001044F"
+    "\U000104B0-\U000104D3\U000104D8-\U000104FB\U00010C80-\U00010CB2"
+    "\U00010CC0-\U00010CF2\U000118A0-\U000118DF\U0001E900-\U0001E943]+";
+constexpr const char* kDsPunctRegex =
+    "\\s?[!-/:-~\uFF01-\uFF0F\uFF1A-\uFF5E\u2018-\u201F\u3000-\u3002]+";
+constexpr const char* kDsTrailWsRegex = "\\s+$";
+constexpr const char* kDsCjkRegex = "[\u4E00-\u9FA5\u0800-\u4E00\uAC00-\uD7FF]+";
+
+// Recognizes the DeepSeek `Sequence` pre_tokenizer EXACTLY: five Splits with the
+// verbatim patterns above (all Isolated, non-inverted), then
+// Digits(individual_digits=true), then ByteLevel(add_prefix_space=false,
+// use_regex=false). Returns false (not "fail") for anything else, so the
+// ordinary single-Split path still gets its own diagnostics.
+bool IsDeepSeekPreTokenizer(const json& node) {
+  if (!node.is_object() || node.value("type", "") != "Sequence") return false;
+  const auto it = node.find("pretokenizers");
+  if (it == node.end() || !it->is_array() || it->size() != 7) return false;
+  const char* want[5] = {kDsNewlineRegex, kDsLettersRegex, kDsPunctRegex,
+                         kDsTrailWsRegex, kDsCjkRegex};
+  for (int i = 0; i < 5; ++i) {
+    const json& s = (*it)[static_cast<size_t>(i)];
+    if (!s.is_object() || s.value("type", "") != "Split") return false;
+    if (s.value("behavior", "") != "Isolated" || s.value("invert", false)) {
+      return false;
+    }
+    const auto pat = s.find("pattern");
+    if (pat == s.end() || !pat->is_object() || !pat->contains("Regex") ||
+        !(*pat)["Regex"].is_string()) {
+      return false;
+    }
+    if ((*pat)["Regex"].get<std::string>() != want[i]) return false;
+  }
+  const json& digits = (*it)[5];
+  if (!digits.is_object() || digits.value("type", "") != "Digits" ||
+      !digits.value("individual_digits", false)) {
+    return false;
+  }
+  const json& bl = (*it)[6];
+  return bl.is_object() && bl.value("type", "") == "ByteLevel" &&
+         !bl.value("add_prefix_space", true) && !bl.value("use_regex", false);
+}
+
 void WalkPreTokenizer(const json& node, std::vector<std::string>& regexes,
                       bool& saw_byte_level, bool& byte_level_use_regex) {
   if (!node.is_object()) Fail("pre_tokenizer entry is not an object");
@@ -101,6 +173,9 @@ void WalkPreTokenizer(const json& node, std::vector<std::string>& regexes,
 SplitPattern DetectPattern(const json& doc) {
   const auto it = doc.find("pre_tokenizer");
   if (it == doc.end() || it->is_null()) Fail("missing pre_tokenizer");
+  // Checked BEFORE the single-Split walk: the DeepSeek family is a seven-stage
+  // pipeline whose components (Digits, five Splits) the walk cannot express.
+  if (IsDeepSeekPreTokenizer(*it)) return SplitPattern::kDeepSeek;
   std::vector<std::string> regexes;
   bool saw_byte_level = false;
   bool byte_level_use_regex = false;
@@ -131,6 +206,14 @@ void CheckNormalizer(const json& doc) {
   // but do NOT apply NFC — inputs are assumed already NFC-normalized (true
   // for the parity corpus; divergence is only possible on decomposed input).
   if (type == "NFC") return;
+  // DeepSeek-V2 declares `{"type": "Sequence", "normalizers": []}` — an EMPTY
+  // pipeline, i.e. a genuine no-op. Accept exactly that; a Sequence with any
+  // component still fails, because we would then be skipping real work.
+  if (type == "Sequence") {
+    const auto sub = it->find("normalizers");
+    if (sub != it->end() && sub->is_array() && sub->empty()) return;
+    Fail("unsupported non-empty normalizer Sequence");
+  }
   Fail("unsupported normalizer \"" + type + "\"");
 }
 

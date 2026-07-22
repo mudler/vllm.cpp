@@ -1414,7 +1414,7 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   output throughput, req/s, TTFT, TPOT/ITL, peak memory) at c1/c2/c4/c8, with
   token-exact correctness as a precondition that may never be traded off.
 
-- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W7 (2026-07-22,
+- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W8 (2026-07-22,
   `CLAIM-MLA-DEEPSEEK`,
   [spike](../.agents/specs/mla-deepseek-campaign.md)).**
   `benchmark_binding=false`; **NOT APPLICABLE.** W0 ran the vLLM oracle on
@@ -1540,6 +1540,28 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   rather than changing it, so no OPT number is created or invalidated. Re-gated:
   OPT STRICT 6/6 (96/96 tokens), 27B 235/235, 35B 315/315, Qwen3-Coder 6/6,
   Qwen3-dense 664 assertions, memcheck 0, goldens md5-identical before and after.
+  **W8 (the SACRED correctness gate) is likewise `benchmark_binding=false` /
+  NOT APPLICABLE — but for the first time the reason is "correctness, not
+  speed", NOT "unreachable".** W8 adds no kernel and no forward-path code at
+  all: a paged-engine correctness gate, its vLLM 0.25.0 goldens, two oracle
+  scripts, a serialized dgx series runner, DIAGNOSTIC-only `MlaBatchSplitStats`
+  counters that nothing in the forward reads, and a new tokenizer pre-tokenizer
+  family (`SplitPattern::kDeepSeek`) reached only by DeepSeek checkpoints. **The
+  correctness result is 8/8** (STRICT token-exact 5/8, near-tie band 3/8, max
+  teacher-forced gap 0.25 nats, 0 forward-divergent), which is what moves the row
+  to `ACTIVE`; **the row is explicitly NOT `DONE`, because `DONE` requires
+  vLLM-speed parity on every axis and there is still NO SPEED NUMBER of any kind
+  for this model.** The tokenizer change touches shared code, so the
+  no-movement claim was proved rather than assumed: 27B **235/235**, 35B
+  **315/315**, Qwen3-Coder **6/6**, Qwen3-dense **16/16**, OPT **6/6**, plus the
+  Qwen3.6 tokenizer parity corpus and every other tokenizer test, all UNCHANGED.
+  One W9-relevant measurement fell out of the capture and is recorded so it is
+  not re-litigated later: **the oracle here must run `moe_backend='triton'`** —
+  vLLM's auto-selected FlashInfer CUTLASS unquantized MoE backend REBOOTED dgx
+  three times during the capture (GB10's 119 GiB is UNIFIED memory), and
+  `triton` is the same first-class substitution the Qwen3-Coder oracle scripts
+  already make. W9's binding grid must use one consistent oracle configuration
+  and state which.
   **Benchmarks are PENDING and cannot begin until the implementation does.** The
   future benchmark disposition is fixed now so it cannot be quietly loosened
   later: the MLA gate vehicle is **DeepSeek-V2-Lite bf16**, measured against

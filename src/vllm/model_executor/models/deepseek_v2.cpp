@@ -102,6 +102,29 @@ struct MlaStep {
   const Tensor* rope_cache = nullptr;
 };
 
+// ─── W8 diagnostic counters (deepseek_v2.h `MlaBatchSplitStats`) ─────────────
+// Written once per forward from the runner's single forward thread; read only by
+// the paged-engine gate, which uses them to PROVE the engine actually produced
+// mixed / with-context MLA batches rather than a stream of trivial ones.
+MlaBatchSplitStats& MutableMlaBatchSplitStats() {
+  static MlaBatchSplitStats stats;
+  return stats;
+}
+
+void RecordMlaBatchSplit(const MlaBatchSplit& sp, int num_reqs) {
+  MlaBatchSplitStats& st = MutableMlaBatchSplitStats();
+  ++st.steps;
+  if (sp.num_prefills == 0 && sp.num_decodes > 0) ++st.decode_only_steps;
+  if (sp.num_decodes == 0 && sp.num_prefills > 0) ++st.prefill_only_steps;
+  if (sp.num_decodes > 0 && sp.num_prefills > 0) ++st.mixed_steps;
+  if (sp.num_prefills_with_context > 0) ++st.with_context_prefill_steps;
+  st.max_num_decodes = std::max<int64_t>(st.max_num_decodes, sp.num_decodes);
+  st.max_num_prefills = std::max<int64_t>(st.max_num_prefills, sp.num_prefills);
+  st.max_num_reqs = std::max<int64_t>(st.max_num_reqs, num_reqs);
+  st.total_decode_tokens += sp.num_decode_tokens;
+  st.total_prefill_tokens += sp.num_prefill_tokens;
+}
+
 template <typename T>
 Tensor UploadInto(Dev d, std::vector<DBuf>& owned, DType dt,
                   const std::vector<int64_t>& shape, const std::vector<T>& host) {
@@ -116,6 +139,7 @@ MlaStep BuildMlaStep(Dev d, const std::vector<int32_t>& positions,
   MlaStep s;
   s.split = BuildMlaBatchSplit(am);
   const MlaBatchSplit& sp = s.split;
+  RecordMlaBatchSplit(sp, am.num_reqs);
   const int64_t T = static_cast<int64_t>(positions.size());
 
   s.positions = UploadInto(d, s.owned, DType::kI32, {T}, positions);
@@ -543,6 +567,12 @@ ForwardLogits WrapDeviceLogits(DBuf&& dlogits, int64_t rows, int64_t vocab) {
 }
 
 }  // namespace
+
+// ─── W8: the split-shape counters (deepseek_v2.h) ───────────────────────────
+const MlaBatchSplitStats& GetMlaBatchSplitStats() {
+  return MutableMlaBatchSplitStats();
+}
+void ResetMlaBatchSplitStats() { MutableMlaBatchSplitStats() = MlaBatchSplitStats{}; }
 
 // ─── the batch split + its ORDERING invariant ───────────────────────────────
 MlaBatchSplit BuildMlaBatchSplit(const CommonAttentionMetadata& am) {

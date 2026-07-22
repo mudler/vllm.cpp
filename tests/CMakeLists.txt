@@ -49,6 +49,20 @@ target_include_directories(test_qwen3_moe_forward PRIVATE ${CMAKE_SOURCE_DIR}/sr
 vllm_cpp_add_test(test_deepseek_v2_load vllm/models/test_deepseek_v2_load.cpp)
 vllm_cpp_add_test(test_deepseek_v2_forward vllm/models/test_deepseek_v2_forward.cpp)
 target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MLA CAMPAIGN W8 (DeepSeek-V2-Lite, DeepseekV2ForCausalLM) — the SACRED MLA
+# greedy correctness gate: drives a compact prompt battery through the paged
+# engine and checks STRICT token-exact agreement with the vLLM 0.25.0 oracle
+# (which W0 measured DETERMINISTIC on this model at batch=1, K=5, 8/8 prompts).
+# Also gates the SCHEDULER/RUNNER batch ORDER MLA requires (decodes first,
+# with-context prefills leading the prefill tail) with staggered concurrent
+# requests + a prefix-cache-driven with-context prefill.
+# Checkpoint-gated, dgx-only; skips on CPU/CI when the snapshot/goldens are absent.
+vllm_cpp_add_test(test_deepseek_v2_paged_engine vllm/models/test_deepseek_v2_paged_engine.cpp)
+target_compile_definitions(test_deepseek_v2_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_deepseek_v2_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forward.cpp)
 target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)
@@ -332,6 +346,15 @@ target_compile_definitions(test_npy PRIVATE
 
 vllm_cpp_add_test(test_tokenizer_parity vllm/test_tokenizer_parity.cpp)
 target_compile_definitions(test_tokenizer_parity PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+
+# MLA CAMPAIGN W8 — the DeepSeek family's tokenizer parity gate. DeepSeek's
+# pre_tokenizer is a seven-stage HF `Sequence` PIPELINE over enumerated
+# codepoint ranges (not an alternation regex like every family before it), so
+# it is MEASURED against HF `tokenizers` over a stage-stress corpus rather than
+# argued. This is what unblocked the DeepSeek-V2-Lite paged-engine gate.
+vllm_cpp_add_test(test_tokenizer_parity_deepseek vllm/test_tokenizer_parity_deepseek.cpp)
+target_compile_definitions(test_tokenizer_parity_deepseek PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 
 vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)

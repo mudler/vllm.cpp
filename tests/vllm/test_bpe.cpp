@@ -554,3 +554,124 @@ TEST_CASE("FromGguf failure modes throw with actionable messages") {
     CheckThrowsContains([&] { LoadGguf(kvs); }, "out of range");
   }
 }
+
+// ─── tokenizer_config.json is NOT a special-token source (MLA campaign W8) ───
+//
+// This test exists to STOP a plausible-looking "fix" that measurement refuted.
+//
+// DeepSeek-V2-Lite's `tokenizer_config.json` says `tokenizer_class:
+// LlamaTokenizerFast` and **`add_bos_token: true`** with `bos_token`
+// `<|begin of sentence|>` (id 100000), while its tokenizer.json post_processor
+// is a plain ByteLevel declaring no special tokens. Reading only those files it
+// looks certain that a prompt must be BOS-prefixed, and that our loader — which
+// takes special tokens ONLY from the post_processor — is one token short: the
+// exact silent, correctness-fatal failure OPT hit from the other direction
+// (post_processor BOS parsed but never applied, 0/6 prompts on fluent English).
+//
+// It is not. MEASURED on dgx against the pinned vLLM 0.25.0 oracle's own
+// tokenizer (2026-07-22):
+//   AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V2-Lite",
+//                                 trust_remote_code=True)
+//     class:                     TokenizersBackend
+//     add_bos_token (resolved):  False        <-- NOT the config.json value
+//     encode("The capital of France is", add_special_tokens=True)
+//                             -> [549, 6077, 280, 7239, 317]   (NO BOS)
+// The class HF actually instantiates is driven by tokenizer.json and does not
+// honour tokenizer_config.json's `add_bos_token`, so vLLM's `prompt_token_ids`
+// carry no BOS — as the committed `p{i}_prompt.i32` goldens of the DeepSeek-V2
+// gate independently show. Our loader already matches, bit for bit, and a
+// "helpful" tokenizer_config.json reader would have BROKEN a passing gate.
+//
+// So: the post_processor stays the ONLY special-token source, and this test
+// pins that, so a future reader of tokenizer_config.json has to come here and
+// re-measure first ([[ground-premises-before-dispatching]]).
+namespace {
+
+// A temp DIRECTORY holding tokenizer.json plus (optionally) its sibling
+// tokenizer_config.json. A directory rather than the shared temp dir on
+// purpose: a stray tokenizer_config.json next to every other fixture would
+// silently change what those tests load.
+class TempTokenizerDir {
+ public:
+  TempTokenizerDir(const std::string& tokenizer_json,
+                   const std::string& tokenizer_config_json) {
+    static int counter = 0;
+    dir_ = std::filesystem::temp_directory_path() /
+           ("vllm_tokcfg_test_" + std::to_string(counter++));
+    std::filesystem::create_directories(dir_);
+    std::ofstream(tokenizer_path(), std::ios::binary) << tokenizer_json;
+    if (!tokenizer_config_json.empty()) {
+      std::ofstream(dir_ / "tokenizer_config.json", std::ios::binary)
+          << tokenizer_config_json;
+    }
+  }
+  ~TempTokenizerDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(dir_, ec);
+  }
+  std::string tokenizer_path() const {
+    return (dir_ / "tokenizer.json").string();
+  }
+
+ private:
+  std::filesystem::path dir_;
+};
+
+// kTinyJson's added token id 19 is "<|end|>" (special) — used here as a
+// stand-in BOS/EOS so the fixture needs no new vocab.
+constexpr int32_t kTinySpecialId = 19;
+
+}  // namespace
+
+TEST_CASE("tokenizer_config.json add_bos_token is NOT applied (DeepSeek-V2 shape)") {
+  SUBCASE("the exact DeepSeek-V2 shape adds no BOS") {
+    // Byte-for-byte the DeepSeek-V2-Lite situation: an AddedToken OBJECT for
+    // bos_token, `add_bos_token: true`, `tokenizer_class: LlamaTokenizerFast`,
+    // and a tokenizer.json whose post_processor is a plain ByteLevel. HF's
+    // resolved tokenizer adds NOTHING here (measured — see the block comment
+    // above), so neither may we.
+    const TempTokenizerDir d(kTinyJson, R"json({
+      "tokenizer_class": "LlamaTokenizerFast",
+      "add_bos_token": true,
+      "add_eos_token": false,
+      "bos_token": {"__type": "AddedToken", "content": "<|end|>", "normalized": true}
+    })json");
+    const Tokenizer t = Tokenizer::FromHfJson(d.tokenizer_path());
+    CHECK(t.BosId() == -1);
+    CHECK(t.EncodeWithSpecialTokens("hello world") == t.Encode("hello world"));
+  }
+
+  SUBCASE("add_eos_token=true likewise appends nothing") {
+    const TempTokenizerDir d(kTinyJson, R"json({
+      "add_bos_token": false, "add_eos_token": true, "eos_token": "<|end|>"
+    })json");
+    const Tokenizer t = Tokenizer::FromHfJson(d.tokenizer_path());
+    CHECK(t.EncodeWithSpecialTokens("hello") == t.Encode("hello"));
+  }
+
+  SUBCASE("no tokenizer_config.json at all is likewise a no-op") {
+    const TempTokenizerDir d(kTinyJson, "");
+    const Tokenizer t = Tokenizer::FromHfJson(d.tokenizer_path());
+    CHECK(t.EncodeWithSpecialTokens("hello world") == t.Encode("hello world"));
+  }
+
+  SUBCASE("the post_processor REMAINS the sole special-token source (OPT)") {
+    // OPT's shape: a TemplateProcessing post_processor declaring the BOS, plus
+    // an add_bos_token in the config naming a DIFFERENT token. The
+    // post_processor is what applies — this is what keeps OPT's committed
+    // 6/6 STRICT gate where it is.
+    const std::string tpl_json = ReplaceOnce(
+        kTinyJson,
+        R"("post_processor": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})",
+        R"("post_processor": {"type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "<tool>", "type_id": 0}},
+                       {"Sequence": {"id": "A", "type_id": 0}}],
+            "pair": [], "special_tokens": {"<tool>": {"id": "<tool>", "ids": [20], "tokens": ["<tool>"]}}})");
+    const TempTokenizerDir d(tpl_json, R"json({
+      "add_bos_token": true, "bos_token": "<|end|>"
+    })json");
+    const Tokenizer t = Tokenizer::FromHfJson(d.tokenizer_path());
+    CHECK(t.BosId() == 20);  // the post_processor's token; 19 is never used
+    CHECK(t.EncodeWithSpecialTokens("hello world")[0] == 20);
+  }
+}

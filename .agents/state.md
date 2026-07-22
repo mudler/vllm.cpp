@@ -18898,3 +18898,124 @@ as evidence about the quant path** — keep-quant is off there by design, so onl
 a CPU build exercises it. And do not treat "no token moved" as a general
 guarantee: it is a result about these files, on a favourable encoding, not a
 proof that no k-quant file can ever differ.
+
+## 2026-07-22 — Accelerator-seam AUDIT: do MLX/Vulkan ride vLLM's CUDA-path strategy? (`BACKEND-SEAM-AUDIT`, `CLAIM-BACKEND-SEAM-AUDIT-1`)
+
+**AUDIT + PLAN ONLY. No source file, no CMake, no kernel, no test, no build, no
+GPU, nothing downloaded, no benchmark.** Worktree `agent-a7de00dcf55081cc4`,
+base `72f5db2`. `src/vllm/` was concurrently owned by the OPT-on-Metal bring-up
+and was not touched.
+
+**The question (user, verbatim):** *"In the architecture for MLX and Vulkan, are
+we 'porting' the same strategy of the CUDA path of vLLM? Does it map correctly?"*
+and *"I would like us to ride the same logical implementations so we do not have
+to re-implement all, but maybe just the equivalent ops per accelerator."*
+
+**Answer: PARTIAL, and the failing part is the one the goal depends on.**
+
+*Where we MIRROR.* `Platform` (`vllm/platforms/interface.py:134-229` ->
+`include/vllm/platforms/interface.h:109`), its capability queries, the CUDA
+attention-priority tables (`cuda.py::_get_backend_priorities:84-176` ->
+`include/vllm/platforms/cuda_attn_priority.h`), and the attention-backend
+registry. The registry is a divergence IN OUR FAVOUR: upstream's
+`AttentionBackendEnum` (`registry.py:34-120`) is a CLOSED enum that must be
+edited centrally to add a backend; ours is OPEN self-registration keyed
+`(DeviceType, name)`. This half of the architecture works and it is measured, not
+argued — Vulkan V1 added 11 files and edited ZERO pre-existing `src/`/`include/`
+source files.
+
+*Where we do NOT.* vLLM's device branching lives in `model_executor/layers/` —
+Linear, QuantMethod, CustomOp, FusedMoE — a shared library all 287 models and all
+6 platforms reuse. **We never ported that library; we inlined it into the model
+TUs.** So our shared logical layer is thinner than vLLM's by exactly one library,
+and the branching it was meant to absorb landed in the models.
+
+**The measurements that settle it (static analysis at `72f5db2`).**
+Shared-layer **DSR = 94** over `src/vllm/` + `include/vllm/`, excluding an
+explicit 16-site allowlist of platform legs and registrars: 47 `DeviceType::kCUDA`
++ 11 real `is_cuda()` call sites + 4 unconditional CUDA includes + 32
+`#ifdef VT_*`. **67 of the 94 (71%) are in `src/vllm/model_executor/models/qwen3_5.cpp`
+alone** (38 + 3 + 26, in 6,389 lines). Its upstream twin
+`vllm/model_executor/models/qwen3_next.py` is **802 lines with ONE** device
+predicate (`:321`). Tree-wide, vLLM carries 544 `current_platform.is_*` sites —
+far more than ours — but **199 in `layers/` and only 14 across 287 model files**
+(9 files touched). Ours is the inverse distribution.
+
+**Granularity — the working premise was wrong, stated plainly.** Our 75-entry
+`vt::OpId` table is NOT finer-grained than vLLM's seam: upstream has **42
+`@CustomOp.register`** sites, the same kind of object at the same level. The real
+asymmetry is the FALLBACK: `custom_op.py:138 forward_native` is a pure-torch
+implementation of every CustomOp, so a brand-new vLLM platform implementing ZERO
+kernels is still CORRECT. `vt::GetOp` (`src/vt/ops.cpp:104-111`) throws, so ours
+needs 6-7 ops before a model emits a token. **6 kernels to be FAST is the right
+number; 6 kernels to be CORRECT is a needless cliff** — and it is why Metal and
+Vulkan have sat as `ACTIVE` skeletons (10 and 8 registered ops) with no model.
+Fix is a portable reference tier — CPU kernels registered as negative-priority
+`vt::OpProvider` entries on unified-memory backends — **not** a coarser seam.
+
+**The missing coarse seam IS `LinearMethod`.** We have no
+`QuantizationConfig`/`LinearMethodBase` (`base_config.py:20-229`,
+`linear.py:141-230`); scheme selection is a per-model tensor-name probe,
+`include/vllm/model_executor/models/qwen3.h:60`
+`IsNvfp4() { return !qkv_proj_fp4.Empty(); }`. So adding a SCHEME costs an edit
+per model, adding an ACCELERATOR costs an edit at every `device == kCUDA` quant
+gate in every model, and `W0b-3`'s `QuantTypeTraits` split has nowhere to land.
+That is why the reuse study found the quant tier and the tactic registry "want
+the same seam" — they want `LinearMethod`.
+
+**`vt::OpProvider` — improvement AND bounded risk.** Upstream has no counterpart;
+it solves this three separate ways (quant-method capability gates, the attention
+registry, torch/vendor dispatch). Ours unifies them. Mechanical porting is not
+harmed, because `OpProvider` sits UNDER the op table with
+`RegisterOp`/`GetOp`/`OpRegistered` signature-identical and all ~70 wrappers
+byte-unchanged — nothing upstream ports TO it. **Binding rule now recorded:**
+`OpProvider` selects among implementations of an op that is already defined; it
+must NEVER host a policy decision (which quant scheme, which attention backend,
+which dtype, which block size) — those map to `Platform`, the attention registry,
+and `LinearMethod`, which are upstream's own seams. Without `S4` that drift is
+likely, since quant selection has nowhere else to go today.
+
+**The counts REGREW, and that is the argument for the metric.**
+`metal-mlx-reuse-study.md` §3.3 measured, days ago: 54 `kCUDA` / 13 `is_cuda()` /
+5 includes / 37 in `qwen3_5.cpp`. Today: **63 / 16 / 6 / 38**. No bad commit was
+involved — DeepSeek-V2, Qwen3-Coder and the registry work each added a device
+test in passing. Leakage grows silently under well-executed work.
+
+**Proposed metric (work row `S1`).** `scripts/check-device-leakage.py` +
+a CI job: count the four buckets over `src/vllm/` + `include/vllm/` minus a
+per-file allowlist with stated reasons (the platform legs + the `(kCUDA, name)`
+registrar keys — 16 sites), compare against a committed baseline of **94**, FAIL
+on any increase, require the baseline be lowered in the same commit as any
+reduction. Ratchet, not threshold. Escape hatch `// DSR-ALLOW(<row-id>): reason`,
+counted and printed separately so exceptions are visible. Mandatory mutation
+suite, mirroring `check-agent-record.py`'s. Precedent:
+`cmake/CudaArchFeaturesTest.cmake` at `.github/workflows/ci.yml:96` — a
+structural property enforced in CI with no GPU.
+
+**Ranked plan (none claimed; each needs its own claim).**
+`S1` DSR ratchet (DSR 94, guards everything after) ->
+`S2` the still-owed `W0b-1` residue: `model_loader.cpp:39` hard-coded CUDA queue
++ guard `model_loader.cpp:22`, `runner.cpp:30`, `qwen3_5.cpp:40,46` + Metal attn
+priority (-> 90) ->
+`S3` platform capability fields mirroring `interface.py:914,933,977,1058,1133,1153`
+and `is_device_capability_family:466`, migrating the 6 class-D `is_cuda()` sites
+(-> 84; buys the ROCm port) ->
+`S5` portable reference tier over `OpProvider`, unified-memory only, gate = OPT
+token-exact on Metal with today's 10 kernels ->
+`S4` `QuantizationConfig`/`LinearMethod` keyed `(scheme, DeviceType)`, absorbing
+`W0b-3` (-> ~55) ->
+`S6` fast-path gates become `OpRegistered(op, device) && supports(shape)`, delete
+the 5 `VT_CHECK(device==kCUDA)` (-> ~39) ->
+`S7` extract the `layers/` library (-> DSR < 10) ->
+`S8` XPU platform data-only, the third-platform falsification test (no hardware).
+
+**Next session / resume.** Start at `S1`; it is self-contained and blocks
+nothing. `S2` is already specced as reuse-study `W0b-1` items 1/3/4 and is
+unclaimed. **Scheduling constraint:** `S6` and `S7` touch `qwen3_5.cpp`, the most
+contended file in the tree, and must be scheduled in a window with no active
+`qwen3_5.cpp` claim or they will lose every merge. **Prohibitions:** do not read
+DSR = 94 without its allowlist (the number is meaningless alone); do not cite any
+Metal or Vulkan capability from this audit — no model runs on either; do not
+promote any row on the strength of this document, which produced no code, no
+test, and no measurement of behaviour.
+

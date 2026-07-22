@@ -30,7 +30,11 @@ MATRICES = {
     "KERNEL": (AGENTS / "kernel-matrix.md", 33),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
-    "BACKEND": (AGENTS / "backend-matrix.md", 56),
+    # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
+    # our MLX/Vulkan/Metal architecture actually port vLLM's CUDA-path strategy, and
+    # what is the shared layer's device-leakage budget. A cross-backend structural
+    # concern that owns no kernel and no platform, hence its own row).
+    "BACKEND": (AGENTS / "backend-matrix.md", 57),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

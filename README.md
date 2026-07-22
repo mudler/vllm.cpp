@@ -311,6 +311,30 @@ Intel were reserved in the core enumeration long ago, so none of this requires
 editing shared code. Building the Apple skeleton confirmed that in practice:
 turning it on adds files and changes no existing source file.
 
+**The discouraging finding, from an architecture audit completed 2026-07-22
+([audit](.agents/specs/accelerator-seam-audit.md)).** That encouraging picture is
+true of the *engine* and false of the *models*. vLLM keeps its device-specific
+choices in a shared library of model building blocks — the pieces every model is
+assembled from — so its model files barely mention any particular GPU vendor at
+all: across 287 of them, only 9 do, and the one matching our largest model
+mentions NVIDIA exactly **once** in 802 lines. We never built that shared library;
+we wrote those building blocks straight into the model files instead. The result
+is that our matching model file is 6,389 lines and mentions NVIDIA **67 times**,
+and that single file holds **71%** of all the NVIDIA-specific code left in the
+supposedly shared part of the project (94 places in total, counted this session).
+So a new accelerator today inherits the engine, the scheduler, the memory
+manager, the sampler and the fused-operation catalogue for free — and then meets
+a model file written for NVIDIA. Two further gaps were confirmed: we have no
+shared notion of "how is this compressed weight format multiplied on this
+device", so that decision is re-made inside every model; and unlike vLLM, an
+accelerator here that is missing an operation cannot fall back to a slow but
+correct version — it simply stops. That last one is why the Apple and Vulkan
+backends need a handful of GPU programs before they can produce a single token,
+rather than needing them only to be fast. The audit records a ranked eight-step
+plan to close all of this, plus an automated check to stop the leakage growing
+back — it had already grown measurably in the days before the audit, with no
+mistake by anyone. **Nothing was built or changed by the audit itself.**
+
 **What was actually built for Apple.** The GPU is opened and memory allocated on
 it; GPU programs are compiled at run time from source embedded in the binary, so
 nothing extra has to be installed — which matters, because the Mac here has only

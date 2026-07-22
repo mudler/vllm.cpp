@@ -1414,7 +1414,7 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   output throughput, req/s, TTFT, TPOT/ITL, peak memory) at c1/c2/c4/c8, with
   token-exact correctness as a precondition that may never be traded off.
 
-- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W5 (2026-07-22,
+- **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W6 (2026-07-22,
   `CLAIM-MLA-DEEPSEEK`,
   [spike](../.agents/specs/mla-deepseek-campaign.md)).**
   `benchmark_binding=false`; **NOT APPLICABLE.** W0 ran the vLLM oracle on
@@ -1479,6 +1479,33 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   upstream's 128-bit-packed form, and the chunk grid is upstream's equal-share
   heuristic rather than a measured one — all three are deliberate
   correctness-first choices and all three are **W9** levers. `benchmark_binding=false`.
+  **W6 is NOT APPLICABLE for the same structural reason, plus one shared-op claim
+  that had to be proved rather than argued.** W6 adds the MLA attention BLOCK and
+  LOAD-TIME WEIGHT ABSORPTION — an attention LAYER, not a model — so the block
+  itself still has **no caller in any model TU**: only its own unit test
+  instantiates it, and it stays unreachable until the W7 DeepSeek-V2 forward
+  exists. Its two new `OpId`s (`vt::BatchedMatmul`, `vt::ConcatMlaNopeRope`) are
+  likewise called by nothing on any existing hot path. **The claim that needed
+  proof is the pair of relaxations to SHARED ops**, because `vt::RopeFromCache`
+  and `vt::MatmulBT` are on the 27B / 35B / Qwen3-Coder / Qwen3-dense / OPT hot
+  paths: `RopeFromCache` became stride-driven on q/k, and `MatmulBT` now accepts
+  a row-strided ACTIVATION. Both were proved two ways rather than assumed —
+  STRUCTURALLY, because for a CONTIGUOUS tensor the strided offsets are
+  INTEGER-IDENTICAL to the previous closed-form arithmetic (`row stride == K`,
+  `(token * heads + head) * head_dim`), so contiguous callers hand the kernels and
+  cuBLASLt byte-identical arguments and therefore get the same algo and the same
+  bits; and EMPIRICALLY — 27B **235/235**, 35B **315/315**, Qwen3-Coder
+  **138/138**, Qwen3-dense **664/664**, OPT **36/36** all token-exact UNCHANGED.
+  **NO SPEED NUMBER IS CLAIMED FOR THE MLA BLOCK, and none is owed yet.** Three
+  deliberate correctness-first choices are named here so W9 inherits them as
+  explicit levers rather than discovering them: the A-projections are issued as
+  one GEMM per weight ROW-SLICE instead of one fused GEMM (a launch-count and
+  cuBLASLt-shape trade, taken because `vt::RmsNorm` requires contiguous inputs);
+  `vt::ConcatMlaNopeRope` is scalar where upstream's `concat_mla_q` is
+  128/256-bit vectorized; and the decode path materializes an intermediate
+  `ql_nope` buffer before the concat exactly as upstream does, rather than having
+  the batched GEMM write straight into the query's leading columns.
+  `benchmark_binding=false`.
   **Integration fix folded in (`888fbcc`), also NOT APPLICABLE:** OPT-125m's KV
   factory published a decorative `float32` spec dtype that was inert before the
   W1 refactor and would have allocated an f32 KV cache after it. Corrected to the

@@ -139,11 +139,82 @@ void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
            "matmul_bt: output shape mismatch");
   VT_CHECK(IsFloat(a.dtype) && IsFloat(b.dtype) && IsOutFloat(out.dtype),
            "matmul_bt: float inputs and f32/bf16 output required");
-  VT_CHECK(a.IsContiguous() && b.IsContiguous() && out.IsContiguous(),
-           "matmul_bt: contiguous tensors required");
+  // The ACTIVATION may be ROW-STRIDED (relaxed at MLA campaign W6): upstream's
+  // `kv_b_proj(kv_c)` inside `_compute_prefill_context`
+  // (mla_attention.py:2141-2160) is applied to a COLUMN SLICE of the 576-wide
+  // chunked-prefill workspace, i.e. a torch view whose row stride is 576 while
+  // K is 512 — and `F.linear` accepts exactly that. Only the innermost dim must
+  // be packed; for a CONTIGUOUS activation the row stride IS K, so every
+  // existing caller passes byte-identical arguments (same cuBLASLt ld, so the
+  // same algo, so bit-identical results).
+  VT_CHECK(a.stride[1] == 1 && a.stride[0] >= a.shape[1],
+           "matmul_bt: activation rows must be packed (innermost stride 1) and "
+           "non-overlapping");
+  VT_CHECK(b.IsContiguous() && out.IsContiguous(),
+           "matmul_bt: contiguous weight and output required");
   VT_CHECK(a.device == b.device && a.device == out.device && a.device == q.device,
            "matmul_bt: device mismatch");
   reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmulBT, q.device.type))(q, out, a, b);
+}
+
+// vt::BatchedMatmul — `torch.bmm` (mla_attention.py:789 q-side W_UK absorption,
+// :1034 W_UV v-up-projection). Stride-driven on every operand because BOTH
+// upstream call sites pass transposed views; only the innermost dim must be
+// unit-stride.
+void BatchedMatmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  VT_CHECK(a.rank == 3 && b.rank == 3 && out.rank == 3,
+           "batched_matmul: rank-3 tensors required (out[G,M,N] = a[G,M,K] @ b[G,K,N])");
+  VT_CHECK(a.shape[0] == b.shape[0] && a.shape[0] == out.shape[0],
+           "batched_matmul: batch dim mismatch");
+  VT_CHECK(a.shape[2] == b.shape[1], "batched_matmul: inner dims mismatch");
+  VT_CHECK(out.shape[1] == a.shape[1] && out.shape[2] == b.shape[2],
+           "batched_matmul: output shape mismatch");
+  VT_CHECK(IsFloat(a.dtype) && IsFloat(b.dtype) && IsOutFloat(out.dtype),
+           "batched_matmul: float inputs and f32/bf16 output required");
+  VT_CHECK(a.dtype == b.dtype, "batched_matmul: a/b dtype must match");
+  // Only the innermost stride is constrained; the batch/row strides are free so
+  // a transposed view (upstream's `q_nope.transpose(0,1)` / `out.transpose(0,1)`)
+  // is consumed without a copy.
+  VT_CHECK(a.stride[2] == 1 && b.stride[2] == 1 && out.stride[2] == 1,
+           "batched_matmul: innermost dimension must be unit-stride");
+  VT_CHECK(a.stride[1] >= a.shape[2] && b.stride[1] >= b.shape[2] &&
+               out.stride[1] >= out.shape[2],
+           "batched_matmul: row stride must not overlap the next row");
+  VT_CHECK(a.device == b.device && a.device == out.device && a.device == q.device,
+           "batched_matmul: device mismatch");
+  GetTypedOp<BatchedMatmulFn>(OpId::kBatchedMatmul, q.device.type)(q, out, a, b);
+}
+
+// vt::ConcatMlaNopeRope — the generalization of upstream's two MLA head-concat
+// sites: `concat_mla_q` (cache_kernels.cu:1555-1600, the decode 512+64 query)
+// and `_concat_k_nope_k_pe` (mla_attention.py:2063-2092, the prefill 128+64 key
+// with a head-BROADCAST rope part). Stride checks mirror
+// cache_kernels.cu:1572-1577.
+void ConcatMlaNopeRope(Queue& q, Tensor& out, const Tensor& nope, const Tensor& rope) {
+  VT_CHECK(out.rank == 3 && nope.rank == 3 && rope.rank == 3,
+           "concat_mla_nope_rope: rank-3 [tokens, heads, dim] tensors required");
+  const int64_t tokens = out.shape[0], heads = out.shape[1];
+  const int64_t dn = nope.shape[2], dr = rope.shape[2];
+  VT_CHECK(nope.shape[0] == tokens && rope.shape[0] == tokens,
+           "concat_mla_nope_rope: token count mismatch");
+  VT_CHECK(nope.shape[1] == heads, "concat_mla_nope_rope: nope head count mismatch");
+  VT_CHECK(rope.shape[1] == heads || rope.shape[1] == 1,
+           "concat_mla_nope_rope: rope must carry `heads` heads or exactly 1 "
+           "(the single shared k_pe head, broadcast — mla_attention.py:2063-2092)");
+  VT_CHECK(out.shape[2] == dn + dr,
+           "concat_mla_nope_rope: out last dim must be nope_dim + rope_dim");
+  VT_CHECK(dn > 0 && dr > 0, "concat_mla_nope_rope: both parts must be non-empty");
+  VT_CHECK(out.dtype == nope.dtype && out.dtype == rope.dtype,
+           "concat_mla_nope_rope: all tensors must share one dtype");
+  VT_CHECK(IsOutFloat(out.dtype) || out.dtype == DType::kF16,
+           "concat_mla_nope_rope: f32/bf16/f16 only");
+  VT_CHECK(out.stride[2] == 1 && nope.stride[2] == 1 && rope.stride[2] == 1,
+           "concat_mla_nope_rope: innermost dimension must be unit-stride "
+           "(upstream cache_kernels.cu:1572-1577)");
+  VT_CHECK(out.device == q.device && nope.device == q.device && rope.device == q.device,
+           "concat_mla_nope_rope: device mismatch");
+  if (tokens == 0 || heads == 0) return;  // `if (num_tokens == 0) return;` (:1584)
+  GetTypedOp<ConcatMlaNopeRopeFn>(OpId::kConcatMlaNopeRope, q.device.type)(q, out, nope, rope);
 }
 
 void MatmulNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor& weight_packed,
@@ -1093,8 +1164,12 @@ void RopeFromCache(Queue& q, Tensor& q_states, Tensor* k_states,
              "rope_from_cache: k must be [T,Hk,D] matching q");
     VT_CHECK(k_states->dtype == q_states.dtype,
              "rope_from_cache: q/k dtype mismatch");
-    VT_CHECK(k_states->IsContiguous(),
-             "rope_from_cache: contiguous k required");
+    // MLA campaign W6: only the innermost dim must be unit-stride. DeepSeek's
+    // k_pe is the trailing column block of the single fused
+    // `kv_a_proj_with_mqa` output (deepseek_v2.py:511, mla.py:155-162), i.e. a
+    // STRIDED view; requiring contiguity would force a copy per layer per step.
+    VT_CHECK(k_states->stride[2] == 1,
+             "rope_from_cache: k innermost dimension must be unit-stride");
     VT_CHECK(k_states->device == q.device,
              "rope_from_cache: k/queue device mismatch");
   }
@@ -1126,9 +1201,15 @@ void RopeFromCache(Queue& q, Tensor& q_states, Tensor* k_states,
   VT_CHECK(args.rotary_dim > 0 && args.rotary_dim % 2 == 0 &&
                args.rotary_dim <= head_dim,
            "rope_from_cache: rotary_dim must be even and <= head_dim");
-  VT_CHECK(q_states.IsContiguous() && positions.IsContiguous() &&
-               cos_sin_cache.IsContiguous(),
-           "rope_from_cache: contiguous tensors required");
+  // q likewise only needs a unit-stride innermost dim: DeepSeek rotates the
+  // TRAILING qk_rope_head_dim slice of each query head
+  // (mla.py:160-167 passes `q[..., qk_nope_head_dim:]`), a strided view of the
+  // [T, num_heads, qk_head_dim] query. For contiguous tensors the kernels'
+  // strided offsets are integer-identical to the pre-W6 formula.
+  VT_CHECK(q_states.stride[2] == 1,
+           "rope_from_cache: q innermost dimension must be unit-stride");
+  VT_CHECK(positions.IsContiguous() && cos_sin_cache.IsContiguous(),
+           "rope_from_cache: contiguous positions/cache required");
   VT_CHECK(q_states.device == q.device && positions.device == q.device &&
                cos_sin_cache.device == q.device,
            "rope_from_cache: q/positions/cache/queue device mismatch");

@@ -84,6 +84,7 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
@@ -498,11 +499,84 @@ void MlaDecodeAttentionKernelCuda(Queue& q, Tensor& out, Tensor* lse, const Tens
   }
 }
 
+// ─── vt::ConcatMlaNopeRope (MLA campaign W6) ────────────────────────────────
+// 1:1 port of `ConcatMLAQKernel` (csrc/libtorch_stable/concat_mla_q.cuh) + its
+// host wrapper `concat_mla_q` (csrc/libtorch_stable/cache_kernels.cu:1555-1600),
+// GENERALIZED to arbitrary nope/rope widths and a head-BROADCAST rope operand so
+// the SAME op also serves `_concat_k_nope_k_pe` (mla_attention.py:2063-2092),
+// upstream's other MLA head-concat site.
+//
+// Upstream's warp-per-(token,head) decomposition and its STRIDE-driven
+// addressing (`nope_stride_0/1`, `pe_stride_0/1`, `out_stride_0/1`,
+// concat_mla_q.cuh:16-19,31-35,49-53) are ported verbatim — the strides are the
+// whole point, because the decode `ql_nope` is the TRANSPOSED output of the
+// W_UK bmm and is non-contiguous by construction (test_concat_mla_q.py:37-52
+// exists for exactly that case).
+//
+// RECORDED DEVIATION: upstream vectorizes at 128/256 bits and is instantiated
+// only for NOPE_DIM=512 / rope 64 (`concat_mla_q.cuh:13,21-24,50-53`); ours is
+// SCALAR and width-generic. A concat is a pure copy, so the bytes written are
+// identical either way; vectorization is a W9 concern (same disposition as W5's
+// scalar MergeAttnStates).
+template <typename T>
+__global__ void ConcatMlaNopeRopeKernel(T* __restrict__ out, const T* __restrict__ nope,
+                                        const T* __restrict__ rope, int64_t tokens,
+                                        int64_t heads, int64_t dn, int64_t dr,
+                                        int64_t out_s0, int64_t out_s1, int64_t nope_s0,
+                                        int64_t nope_s1, int64_t rope_s0, int64_t rope_s1,
+                                        bool rope_broadcast, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  const int64_t width = dn + dr;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
+       idx += step) {
+    const int64_t d = idx % width;
+    const int64_t h = (idx / width) % heads;
+    const int64_t t = idx / (width * heads);
+    T* dst = out + t * out_s0 + h * out_s1 + d;
+    if (d < dn) {
+      *dst = nope[t * nope_s0 + h * nope_s1 + d];
+    } else {
+      const int64_t rh = rope_broadcast ? 0 : h;
+      *dst = rope[t * rope_s0 + rh * rope_s1 + (d - dn)];
+    }
+  }
+}
+
+template <typename T>
+void LaunchConcatMlaNopeRope(cudaStream_t stream, Tensor& out, const Tensor& nope,
+                             const Tensor& rope) {
+  const int64_t tokens = out.shape[0], heads = out.shape[1];
+  const int64_t dn = nope.shape[2], dr = rope.shape[2];
+  const int64_t n = tokens * heads * (dn + dr);
+  if (n == 0) return;
+  constexpr int kBlock = 256;
+  const int64_t blocks = std::min<int64_t>((n + kBlock - 1) / kBlock, 65535);
+  ConcatMlaNopeRopeKernel<T><<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(
+      out.Ptr<T>(), nope.Ptr<T>(), rope.Ptr<T>(), tokens, heads, dn, dr, out.stride[0],
+      out.stride[1], nope.stride[0], nope.stride[1], rope.stride[0], rope.stride[1],
+      rope.shape[1] == 1 && heads > 1, n);
+  Check(cudaGetLastError(), "concat_mla_nope_rope launch");
+}
+
+void ConcatMlaNopeRopeKernelCuda(Queue& q, Tensor& out, const Tensor& nope,
+                                 const Tensor& rope) {
+  cudaStream_t stream = static_cast<cudaStream_t>(q.handle);
+  switch (out.dtype) {
+    case DType::kF32: LaunchConcatMlaNopeRope<float>(stream, out, nope, rope); break;
+    case DType::kBF16: LaunchConcatMlaNopeRope<__nv_bfloat16>(stream, out, nope, rope); break;
+    case DType::kF16: LaunchConcatMlaNopeRope<__half>(stream, out, nope, rope); break;
+    default: VT_CHECK(false, "cuda concat_mla_nope_rope: unsupported dtype");
+  }
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(
         OpId::kMlaDecodeAttention, DeviceType::kCUDA,
         reinterpret_cast<void*>(static_cast<MlaDecodeAttentionFn>(&MlaDecodeAttentionKernelCuda)));
+    RegisterOp(OpId::kConcatMlaNopeRope, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<ConcatMlaNopeRopeFn>(&ConcatMlaNopeRopeKernelCuda)));
   }
 } registrar;
 

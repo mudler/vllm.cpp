@@ -54,6 +54,11 @@ void StoreF32(const Tensor& t, int64_t elem_offset, float v) {
 template <bool kBT>
 void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, int64_t n,
                     int64_t ir0_start, int64_t ir0_end, int64_t ir1_start, int64_t ir1_end) {
+  // MLA campaign W6: the activation may be ROW-STRIDED (a column slice of a
+  // wider buffer — see vt::MatmulBT). For a contiguous activation `a_rs == k`,
+  // so the offsets are integer-identical to the pre-W6 `i * k + p` form and
+  // every existing model is bit-identical by construction.
+  const int64_t a_rs = a.stride[0];
   // threads with no work simply yield
   if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
     return;
@@ -69,7 +74,7 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
         for (int64_t j = iir0; j < iir0 + blck_0 && j < ir0_end; ++j) {
           float acc = 0.0f;
           for (int64_t p = 0; p < k; ++p) {
-            acc += LoadF32(a, i * k + p) * LoadF32(b, kBT ? j * k + p : p * n + j);
+            acc += LoadF32(a, i * a_rs + p) * LoadF32(b, kBT ? j * k + p : p * n + j);
           }
           StoreF32(out, i * n + j, acc);
         }
@@ -159,6 +164,60 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 // orientations are bit-identical for the same logical weight.
 void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   MatmulChunked<true>(out, a, b);
+}
+
+// vt::BatchedMatmul (`torch.bmm`) CPU reference — out[G,M,N] = a[G,M,K] @
+// b[G,K,N]. Sequential f32 accumulation over K, exactly like MatmulOneChunk's
+// per-element dot, so the reference and the cuBLASLt CUDA path share the same
+// numeric contract (f32 accumulate, round on store). Every operand is addressed
+// through its STRIDES: the MLA absorption call sites (mla_attention.py:789,
+// :1034) pass transposed views whose batch axis is not the outermost storage
+// axis. Parallelized over the flattened (batch, row) output space, which leaves
+// each output element's K reduction on one thread — bit-identical to a serial
+// run and run-to-run reproducible.
+void BatchedMatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
+  const int64_t g = out.shape[0], m = out.shape[1], n = out.shape[2];
+  const int64_t k = a.shape[2];
+  const int64_t rows = g * m;
+  if (rows == 0 || n == 0) return;
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t bi = r / m, i = r % m;
+      const int64_t a_row = bi * a.stride[0] + i * a.stride[1];
+      const int64_t b_base = bi * b.stride[0];
+      const int64_t o_row = bi * out.stride[0] + i * out.stride[1];
+      for (int64_t j = 0; j < n; ++j) {
+        float acc = 0.0f;
+        for (int64_t p = 0; p < k; ++p) {
+          acc += LoadF32(a, a_row + p) * LoadF32(b, b_base + p * b.stride[1] + j);
+        }
+        StoreF32(out, o_row + j, acc);
+      }
+    }
+  });
+}
+
+// vt::ConcatMlaNopeRope CPU reference — the scalar, width-generic form of
+// upstream's `ConcatMLAQKernel` (csrc/libtorch_stable/concat_mla_q.cuh) and of
+// the `_concat_k_nope_k_pe` slice assignments (mla_attention.py:2085-2090).
+// Pure copy: no arithmetic, so it is exact for every dtype. `rope.shape[1] == 1`
+// with more output heads is the broadcast form the prefill K concat needs.
+void ConcatMlaNopeRopeKernel(Queue&, Tensor& out, const Tensor& nope, const Tensor& rope) {
+  const int64_t tokens = out.shape[0], heads = out.shape[1];
+  const int64_t dn = nope.shape[2], dr = rope.shape[2];
+  const bool rope_broadcast = rope.shape[1] == 1 && heads > 1;
+  ForRows(tokens, [&](int64_t t0, int64_t t1) {
+    for (int64_t t = t0; t < t1; ++t) {
+      for (int64_t h = 0; h < heads; ++h) {
+        const int64_t o = t * out.stride[0] + h * out.stride[1];
+        const int64_t n = t * nope.stride[0] + h * nope.stride[1];
+        const int64_t r =
+            t * rope.stride[0] + (rope_broadcast ? 0 : h) * rope.stride[1];
+        for (int64_t d = 0; d < dn; ++d) StoreF32(out, o + d, LoadF32(nope, n + d));
+        for (int64_t d = 0; d < dr; ++d) StoreF32(out, o + dn + d, LoadF32(rope, r + d));
+      }
+    }
+  });
 }
 
 void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& w,
@@ -542,9 +601,16 @@ void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks,
   const int64_t tokens = qs.shape[0];
   const int64_t hq = qs.shape[1];
   const int64_t hk = ks == nullptr ? 0 : ks->shape[1];
-  const int64_t head_dim = qs.shape[2];
   const int64_t half = args.rotary_dim / 2;
   const bool is_mrope = positions.rank == 2;
+  // MLA campaign W6: q/k are addressed through their STRIDES, not a contiguous
+  // (token * heads + head) * head_dim formula. DeepSeek's DECOUPLED RoPE rotates
+  // only the trailing qk_rope_head_dim slice of the query head
+  // (deepseek_v2.py:580-595 / mla.py:160-167 pass `q[..., qk_nope_head_dim:]`),
+  // and its k_pe is the trailing column block of the single fused
+  // kv_a_proj_with_mqa output — both are STRIDED VIEWS. For a contiguous tensor
+  // the strided offsets are integer-identical to the old formula, so every
+  // existing caller is bit-identical by construction.
   ForRows(tokens, [&](int64_t row_start, int64_t row_end) {
     for (int64_t token = row_start; token < row_end; ++token) {
       for (int64_t pair = 0; pair < half; ++pair) {
@@ -564,7 +630,7 @@ void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks,
         const int64_t second =
             args.is_neox_style ? pair + half : pair * 2 + 1;
         for (int64_t head = 0; head < hq; ++head) {
-          const int64_t off = (token * hq + head) * head_dim;
+          const int64_t off = token * qs.stride[0] + head * qs.stride[1];
           const float x = LoadF32(qs, off + first);
           const float y = LoadF32(qs, off + second);
           StoreF32(qs, off + first, x * c - y * s);
@@ -572,7 +638,7 @@ void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks,
         }
         if (ks != nullptr) {
           for (int64_t head = 0; head < hk; ++head) {
-            const int64_t off = (token * hk + head) * head_dim;
+            const int64_t off = token * ks->stride[0] + head * ks->stride[1];
             const float x = LoadF32(*ks, off + first);
             const float y = LoadF32(*ks, off + second);
             StoreF32(*ks, off + first, x * c - y * s);
@@ -1643,6 +1709,11 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernel)));
     RegisterOp(OpId::kMatmulBT, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTKernel)));
+    RegisterOp(OpId::kBatchedMatmul, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<BatchedMatmulFn>(&BatchedMatmulKernel)));
+    RegisterOp(
+        OpId::kConcatMlaNopeRope, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<ConcatMlaNopeRopeFn>(&ConcatMlaNopeRopeKernel)));
     RegisterOp(OpId::kRmsNorm, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernel)));
     RegisterOp(OpId::kRmsNormQuantFp8, DeviceType::kCPU,

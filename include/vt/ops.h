@@ -176,6 +176,14 @@ enum class OpId : uint8_t {
   kLayerNorm,
   kRelu,
   kAdd,
+  // Batched dense GEMM (`torch.bmm`). The primitive MLA weight absorption is
+  // expressed in — mla_attention.py:789 (q-side W_UK fold) and :1034 (W_UV
+  // v-up-projection). See vt::BatchedMatmul.
+  kBatchedMatmul,
+  // MLA nope|rope head concatenation — upstream `concat_mla_q`
+  // (csrc/libtorch_stable/concat_mla_q.cuh) and `_concat_k_nope_k_pe`
+  // (mla_attention.py:2063-2092). See vt::ConcatMlaNopeRope.
+  kConcatMlaNopeRope,
   kCount
 };
 
@@ -454,6 +462,11 @@ using RmsNormGatedQuantFp8Fn = void (*)(Queue&, Tensor& /*out_fp8*/, const Tenso
                                         const Tensor& /*gate*/, const Tensor& /*weight*/,
                                         const RmsNormGatedArgs&, float /*input_scale*/);
 using SwizzleBlockscaleFn = void (*)(Queue&, Tensor&, const Tensor&);
+// vt::BatchedMatmul (`torch.bmm`) — same shape as MatmulFn but rank-3 and
+// stride-driven; a distinct alias so registrations read unambiguously.
+using BatchedMatmulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+// vt::ConcatMlaNopeRope — out[..., :Dn] = nope, out[..., Dn:] = rope.
+using ConcatMlaNopeRopeFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using MoeGroupedGemmNvfp4Fn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
              const Tensor&, const Tensor&);
@@ -626,6 +639,82 @@ void DropinProbe(Queue& q, Tensor& out, const Tensor& in,
 // cuBLASLt algo — and so the K-reduction split — differs); token-exact gates
 // decide call-site adoption.
 void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+
+// --- Batched dense GEMM (MLA campaign W6) -----------------------------------
+// out[G,M,N] = a[G,M,K] @ b[G,K,N] — one independent row-major GEMM per batch
+// entry. The 1:1 counterpart of `torch.bmm`, which is the primitive MLA WEIGHT
+// ABSORPTION is expressed in upstream:
+//   * vllm/model_executor/layers/attention/mla_attention.py:789
+//       torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
+//     — (N,B,P) x (N,P,L) -> (N,B,L), folding W_UK into the decode QUERY so the
+//     MQA runs directly against the 576-wide cached latent;
+//   * mla_attention.py:1034 (`_v_up_proj`)
+//       torch.bmm(x, self.W_UV, out=out.transpose(0, 1))
+//     — (N,B,L) x (N,L,V) -> (N,B,V), un-projecting the latent-space attention
+//     output back to `v_head_dim`.
+// Upstream's absorption is therefore a LOAD-TIME weight transform plus these two
+// batched GEMMs — not a fused kernel (the spike's §2.2 finding), which is why a
+// portable port needs exactly this one new primitive.
+//
+// WHAT ACTUALLY RUNS UPSTREAM, per the whole-chain rule: `torch.bmm` on a CUDA
+// bf16 tensor dispatches to ATen's `baddbmm_out_cuda_impl`, which for a
+// non-broadcast, equal-strided batch calls cuBLAS
+// `gemmStridedBatchedEx` (CUDA_R_16BF operands, CUBLAS_COMPUTE_32F). Our CUDA
+// impl is the cuBLASLt strided-batched form of exactly that GEMM, reusing the
+// same handle/workspace as vt::Matmul; the CPU impl is the sequential-over-K f32
+// reference. No flashinfer / cutlass / TRT-LLM variant participates: the
+// ROCm-only aiter fp8/fp4 bmm branches (`:766-776`, `:1024-1032`) are the only
+// alternatives upstream has and they are unreachable on CUDA.
+//
+// STRIDE-DRIVEN on every operand. Both upstream call sites pass TRANSPOSED VIEWS
+// (`mqa_q_nope = q_nope.transpose(0,1)`, `out.transpose(0,1)`), i.e. tensors
+// whose batch axis is NOT the outermost storage axis, so a contiguity-only op
+// would force two extra copies per layer per step. Only the innermost dimension
+// must be unit-stride; `stride[0]` (batch) and `stride[1]` (row) are free.
+//
+// a/b share f32 or bf16; out is f32 or bf16; accumulation is f32. G/M/N may be 0
+// (no-op); K == 0 zero-fills, mirroring an empty contraction.
+void BatchedMatmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+
+// --- MLA nope|rope head concatenation (MLA campaign W6) ---------------------
+//   out[t, h, 0 : Dn)       = nope[t, h, :]
+//   out[t, h, Dn : Dn + Dr) = rope[t, (Dr broadcast head), :]
+//
+// MLA has TWO places that build a head by concatenating a "nope" part with the
+// decoupled rope part, and upstream implements both as a pre-allocated output
+// plus direct copies rather than a `torch.cat` over an expanded non-contiguous
+// tensor (which is why this is an op and not a view):
+//
+//   1. DECODE q — `torch.cat([q_nope, q_pe], dim=-1)`
+//      (vllm/v1/attention/backends/mla/triton_mla.py:200-201) building the
+//      576-wide MQA query out of the ABSORBED `ql_nope` (512, the transposed
+//      output of the W_UK bmm — NON-CONTIGUOUS) and `q_pe` (64). vLLM ships a
+//      dedicated csrc kernel for exactly this, `concat_mla_q`
+//      (csrc/libtorch_stable/concat_mla_q.cuh `ConcatMLAQKernel`, host wrapper
+//      csrc/libtorch_stable/cache_kernels.cu:1555-1600, bound at
+//      torch_bindings.cpp:841,905 and reached from _custom_ops.py:2696-2708);
+//      it is stride-driven on the token and head axes precisely so the
+//      transposed bmm output needs no `.contiguous()`.
+//   2. PREFILL k — `_concat_k_nope_k_pe` (mla_attention.py:2063-2092),
+//      concatenating the materialized per-head `k_nope` (qk_nope_head_dim) with
+//      the SINGLE-head `k_pe` (qk_rope_head_dim) BROADCAST across all heads.
+//      Its docstring states the reason verbatim: "avoids the performance penalty
+//      of torch.cat with expanded non-contiguous tensors by pre-allocating the
+//      output and using direct copies".
+//
+// This op is the single generalization of both: stride-driven on the token and
+// head axes of every operand, the nope/rope widths taken from the SHAPES rather
+// than a compile-time template, and `rope.shape[1] == 1` with `out.shape[1] > 1`
+// meaning the head-BROADCAST form case 2 needs. Only the innermost dimension
+// must be unit-stride, exactly as upstream asserts
+// (cache_kernels.cu:1572-1577). All three tensors share one f32/bf16/f16 dtype.
+//
+// DEVIATION (recorded, same shape as W5's MergeAttnStates note): upstream's
+// kernel is 128/256-bit vectorized and instantiated only for NOPE_DIM=512 /
+// rope 64 (`concat_mla_q.cuh:13,21-24,50-53`). Ours is SCALAR and width-generic
+// so it serves the prefill K concat (nope 128) as well; the arithmetic is a pure
+// copy either way, so the results are identical. Vectorization is a W9 concern.
+void ConcatMlaNopeRope(Queue& q, Tensor& out, const Tensor& nope, const Tensor& rope);
 
 // out[M,N] = act[M,K] @ dequant(w).T  — the modelopt W4A16_NVFP4 dequant-GEMM
 // (M2.2a). The NVFP4 weight is read DIRECTLY from device memory and dequantized
@@ -1076,6 +1165,17 @@ void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positi
 // layouts use the exact pinned selection rules. args.is_neox_style selects
 // half-split NeoX or adjacent-pair GPT-J rotation. Formula construction is not
 // part of this op: the hot path only gathers cache values and rotates.
+//
+// STRIDE-DRIVEN q/k (relaxed at MLA campaign W6; positions/cache stay
+// contiguous). Only the innermost dimension must be unit-stride. DeepSeek's
+// DECOUPLED RoPE rotates the TRAILING qk_rope_head_dim slice of each query head
+// (`q[..., qk_nope_head_dim:]`, mla.py:160-167) with `is_neox_style=False`, and
+// its k_pe is the trailing column block of the single fused
+// `kv_a_proj_with_mqa` output (deepseek_v2.py:511) — both are strided views, so
+// a contiguity requirement would cost two copies per layer per step. For a
+// CONTIGUOUS tensor the strided offsets are integer-identical to the pre-W6
+// (token * heads + head) * head_dim formula, so every existing caller (the
+// Qwen3 dense/MoE preamble) is bit-identical by construction.
 void RopeFromCache(Queue& q, Tensor& q_states, Tensor* k_states,
                    const Tensor& positions, const Tensor& cos_sin_cache,
                    const RopeArgs& args);

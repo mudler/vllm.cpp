@@ -626,9 +626,11 @@ __device__ inline int MropeAxisForPair(int64_t pair, int section_t,
 template <typename T, typename Tid>
 __global__ void RopeFromCacheKernel(
     T* qs, T* ks, const Tid* positions, const T* cache, int64_t cache_rows,
-    int64_t tokens, int64_t hq, int64_t hk, int64_t head_dim, int rotary_dim,
-    int64_t half, bool is_neox_style, bool is_mrope, int section_t,
-    int section_h, int section_w, bool mrope_interleaved, int64_t n) {
+    int64_t tokens, int64_t hq, int64_t hk, int64_t q_tok_stride,
+    int64_t q_head_stride, int64_t k_tok_stride, int64_t k_head_stride,
+    int rotary_dim, int64_t half, bool is_neox_style, bool is_mrope,
+    int section_t, int section_h, int section_w, bool mrope_interleaved,
+    int64_t n) {
   const int64_t heads = hq + hk;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x +
@@ -652,10 +654,17 @@ __global__ void RopeFromCacheKernel(
     const float c = Load(cache, cache_offset + pair);
     const float sn = Load(cache, cache_offset + half + pair);
 
+    // MLA campaign W6: STRIDE-driven addressing. DeepSeek's decoupled RoPE
+    // rotates only the trailing rope slice of each query head and its k_pe is a
+    // column block of the fused kv_a projection — both are strided views. For a
+    // contiguous tensor these offsets are integer-identical to the previous
+    // (token * heads + head) * head_dim formula, so existing callers are
+    // bit-identical by construction.
     T* states = head < hq ? qs : ks;
     const int64_t local_head = head < hq ? head : head - hq;
-    const int64_t local_heads = head < hq ? hq : hk;
-    const int64_t row = (token * local_heads + local_head) * head_dim;
+    const int64_t row = head < hq
+                            ? token * q_tok_stride + local_head * q_head_stride
+                            : token * k_tok_stride + local_head * k_head_stride;
     const int64_t first = is_neox_style ? pair : pair * 2;
     const int64_t second = is_neox_style ? pair + half : pair * 2 + 1;
     const float x = Load(states, row + first);
@@ -678,9 +687,10 @@ void LaunchRopeFromCacheTyped(cudaStream_t stream, Tensor& qs, Tensor* ks,
   RopeFromCacheKernel<T, Tid><<<GridFor(n), kBlock, 0, stream>>>(
       qs.Ptr<T>(), ks == nullptr ? nullptr : ks->Ptr<T>(),
       positions.Ptr<Tid>(), cache.Ptr<T>(), cache.shape[0], tokens, hq, hk,
-      qs.shape[2], args.rotary_dim, half, args.is_neox_style,
-      positions.rank == 2, args.mrope_section[0], args.mrope_section[1],
-      args.mrope_section[2], args.mrope_interleaved, n);
+      qs.stride[0], qs.stride[1], ks == nullptr ? 0 : ks->stride[0],
+      ks == nullptr ? 0 : ks->stride[1], args.rotary_dim, half,
+      args.is_neox_style, positions.rank == 2, args.mrope_section[0],
+      args.mrope_section[1], args.mrope_section[2], args.mrope_interleaved, n);
 }
 
 template <typename T>

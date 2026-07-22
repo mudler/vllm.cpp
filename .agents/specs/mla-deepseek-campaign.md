@@ -1,6 +1,6 @@
 # SPIKE — MLA (Multi-head Latent Attention) + the DeepSeek / Kimi / MiniMax families
 
-**Status:** **W0 + W1 + W2 + W3 + W4 + W5 LANDED** (see `### Work breakdown`). W0 grounded
+**Status:** **W0 + W1 + W2 + W3 + W4 + W5 + W6 LANDED** (see `### Work breakdown`). W0 grounded
 every fact the spike flagged as an unverified source read — all CONFIRMED by
 runtime observation, nothing contradicted. W1 landed the behaviour-preserving
 spec-driven KV allocation + `MLAAttentionSpec`. W2 landed the MLA branch of the
@@ -10,10 +10,15 @@ leaves a zero-edit seam for DSA. W3 landed the two new `vt::` ops —
 CPU-reference-gated. W4 landed the MLA DECODE kernel `vt::MlaDecodeAttention` and filled
 `TritonMLABackend::get_impl_cls()`. W5 landed MLA PREFILL (the FA-2 launcher
 generalized to QK 192 / V 128) plus the workspace-bounded CHUNKED-CONTEXT loop
-and its two supporting ops. **There is still no MLA model and no MLA forward**:
-the attention family exists but nothing composes it — W6-W10 remain plan only,
-and **no model row moves off `SPIKE`** — W0-W5 make no model supported.
-**Base:** `b4f14ee` (spike) / `fb3fd5d` (W0+W1) / `a05437f` (W2+W3) / `ed2c342` (W4) / `5395203` (W5).
+and its two supporting ops. W6 landed the MLA ATTENTION BLOCK + LOAD-TIME WEIGHT
+ABSORPTION — the layer that finally COMPOSES W3's cache write, W4's decode and
+W5's prefill, with both `q_lora_rank` query branches, the decoupled RoPE, the
+`kv_b_proj -> W_UK/W_UV` split, and the prefill-MHA / decode-MQA dispatch; the
+absorbed-vs-unabsorbed equivalence is proven numerically three ways.
+**There is still no MLA MODEL and no MODEL forward**: a layer exists, but nothing
+registers, loads or runs a checkpoint — W7-W10 remain plan only, and **no model
+row moves off `SPIKE`** — W0-W6 make no model supported.
+**Base:** `b4f14ee` (spike) / `fb3fd5d` (W0+W1) / `a05437f` (W2+W3) / `ed2c342` (W4) / `5395203` (W5) / `2846467` (W6).
 **Pinned oracle:** `/home/mudler/_git/vllm` @ `e24d1b24` (v0.25.0 audit target
 `702f4814fe54`). The executable oracle venv `~/venvs/vllm-oracle` lives on
 **dgx.casa**. Every claim below is grounded in repo source; the two claims that
@@ -806,8 +811,9 @@ New files (all additive; the model TU pattern is already proven):
 | Path | Contents |
 |---|---|
 | `include/vllm/v1/kv_cache_interface.h` (EDIT) | `MLAAttentionSpec` + `KVCacheSpecKind::kMLA` + the merge assertions |
-| `include/vllm/model_executor/models/mla_attention.h` | the MLA block: projections, decoupled RoPE, absorption state, the MHA-prefill / MQA-decode forms — the analog of `dense_attn_block.h`, ported from `mla_attention.py` |
-| `src/vllm/model_executor/models/mla_attention.cpp` | its implementation |
+| `include/vllm/model_executor/models/mla_attention.h` **(W6 — LANDED)** | the MLA block: projections (both `q_lora_rank` branches), decoupled RoPE + the YaRN cos\|sin cache + the mscale^2 scale, the load-time absorption transform, and the MHA-prefill / MQA-decode forms — the analog of `dense_attn_block.h`, ported from `mla_attention.py` + `mla.py` |
+| `src/vllm/model_executor/layers/attention/mla_attention.cpp` **(W6 — LANDED)** | its implementation (it sits under `layers/attention/` beside W5's `mla_chunked_context.h`, not under `models/`) |
+| `include/vt/ops.h`, `src/vt/ops.cpp`, `src/vt/cpu/cpu_ops.cpp`, `src/vt/cuda/{cuda_matmul.cu,cuda_mla_attn.cu}` **(W6 — EDIT)** | `vt::BatchedMatmul` (`torch.bmm`, the two absorption GEMMs) + `vt::ConcatMlaNopeRope` (`concat_mla_q` generalized to serve `_concat_k_nope_k_pe`), plus the two additive relaxations `vt::RopeFromCache` (stride-driven q/k) and `vt::MatmulBT` (row-strided activation) |
 | `include/vllm/model_executor/models/deepseek_v2.h` | `DeepseekV2Weights`, model decls |
 | `src/vllm/model_executor/models/deepseek_v2_registry.cpp` | `REGISTER_VLLM_MODEL(deepseek_v2, "DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM", "DeepseekForCausalLM")` + `ParseDeepseekV2Config` + `MakeDeepseekV2KVCache` |
 | `src/vllm/model_executor/models/deepseek_v2_weights.cpp` | loader: the optional `q_lora_rank` branch, `kv_a_proj_with_mqa`, `kv_b_proj` **split into `W_UK`/`W_UV` at load time** (`mla_attention.py:899,960,962`), the two norms, per-expert MoE + shared experts, `e_score_correction_bias` |
@@ -840,7 +846,7 @@ module. Inventory from the pin (`/home/mudler/_git/vllm/tests`):
 | `tests/kernels/attention/test_mla_decode_cpu.py:47` | MLA decode against a CPU reference — **device-independent, so it is the numerical ORACLE to port FIRST**, before any CUDA work | doctest + parity | W4 |
 | `tests/kernels/moe/test_grouped_topk.py:46` and `tests/kernels/moe/test_routing.py:441` | the dedicated grouped-topk correctness cases | doctest `tests/vt/test_ops_moe_router_grouped.cpp` | W3 |
 | `tests/evals/gsm8k/configs/DeepSeek-V2-Lite-Instruct-FP8.yaml` | upstream's own V2-Lite accuracy target | secondary e2e sanity (our SACRED gate remains token-exact) | W8 |
-| `tests/kernels/test_concat_mla_q.py` | the q concat helper | doctest | W4 |
+| `tests/kernels/test_concat_mla_q.py` | the q concat helper | doctest `tests/vt/test_ops_mla_absorb.cpp` — **PORTED** (W6). BOTH arms: `test_concat_mla_q_contiguous` (`:22-34`) and `test_concat_mla_q_transposed_nope` (`:37-63`), the latter being the case that exists because the real nope operand is the NON-CONTIGUOUS transposed `torch.bmm` output. Its `atol=0, rtol=0` comparison is ported as bit-exactness, since a concat is a pure copy. Our op is the generalization that ALSO serves `_concat_k_nope_k_pe` (broadcast-rope arm added) | W6 |
 | `tests/kernels/core/test_rotary_embedding_mla_cache_fused.py` | fused RoPE + MLA cache write | doctest (unfused first, fusion later) | W3/W8 |
 | `tests/compile/passes/test_mla_rope_kvcache_cat_fusion.py` | the RoPE+concat-cache fusion pass | fusion-catalog recipe test | W8 |
 | `tests/compile/passes/test_fuse_mla_dual_rms_norm.py` | dual-RMSNorm fusion (`q_a_layernorm`+`kv_a_layernorm`) | fusion-catalog recipe test | W8 |
@@ -850,6 +856,9 @@ module. Inventory from the pin (`/home/mudler/_git/vllm/tests`):
 | `tests/models/test_deepseek_v4_mega_moe.py`, `tests/v1/attention/test_dspark_noncausal_sparse_mla.py`, `test_sparse_mla_backends.py`, `test_flashinfer_sparse_mla_sm120_api.py`, `test_indexer_deepseek_v4_slot_mapping.py`, `tests/kernels/test_fused_deepseek_v32_norm_rope.py`, `test_fused_deepseek_v4_qnorm_rope_kv_insert.py` | V3.2/V4 sparse + DSA | **OUT OF SCOPE** — checked in SKIPPED with the reason "sparse MLA / V4 not spiked" | — |
 | `tests/kernels/attention/test_flashmla.py`, `test_cutlass_mla_decode.py`, `tests/rocm/aiter/*`, `test_rocm_aiter_mla_decode_metadata.py` | sm90/sm100/ROCm-only MLA kernels | **NOT PORTED** — unreachable on GB10 per §2.3; recorded, not silently dropped | — |
 | tool/reasoning parsers (`tests/tool_parsers/test_deepseekv3_tool_parser.py` and siblings, `tests/reasoning/test_deepseekr1_reasoning_parser.py`) | DeepSeek chat/tool/reasoning formats | separate serving row, inventoried not spiked | — |
+
+| `torch.bmm` at `mla_attention.py:789`, `:1034` (no dedicated upstream test module — absorption is covered only through `test_mla_backends.py`) | the two batched GEMMs weight absorption is made of | doctest `tests/vt/test_ops_mla_absorb.cpp` (`vt::BatchedMatmul` vs a double-precision oracle, both absorption shapes at V2-Lite AND V3 dims, the transposed views both call sites pass) + the block-level equivalence gate in `tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp` — **PORTED** | W6 |
+| `mla_attention.py:875-962 process_weights_after_loading` (upstream exercises it only indirectly via the backend tests) | the load-time `kv_b_proj -> W_UK/W_UV` split | `tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp` — **PORTED**: `AbsorbKvBProjBf16` vs an independent literal `.T -> view -> split -> permute` transcription, plus the three-way absorbed-vs-unabsorbed equivalence proof | W6 |
 
 New tests with no single upstream twin (our own gate protocol):
 `tests/vllm/models/test_deepseek_v2_load.cpp` (every tensor mapped, none left
@@ -927,7 +936,7 @@ hardware. **Nothing below is implemented; this is the plan.**
 | **W3** ✅ **DONE 2026-07-21** | **New `vt::` ops — cache write + router.** `vt::ConcatAndCacheMla` (CPU ref + CUDA) mirroring `concat_and_cache_mla`; extend `MoeRouterTopKArgs` with `scoring_func` / `e_score_correction_bias` / `num_expert_group` / `topk_group` / `routed_scaling_factor` and implement the grouped-topk selection rule. | W1 | **PASSED** — `tests/vt/test_ops_mla_cache.cpp` + `tests/vt/test_ops_moe_router_grouped.cpp`; CPU-vs-CUDA parity (exact on the cache write, exact ids on the router); grouped-topk gated at REAL V3 dims (256 experts, n_group=8, topk_group=4, sigmoid, WITH `e_score_correction_bias`); ungrouped router byte-identical |
 | **W4** ✅ **DONE 2026-07-22** | **MLA decode attention op.** `vt::MlaDecodeAttention` — the two-stage split-KV MQA decode over the latent (QK 576 / V 512), structurally mirroring `decode_attention_fwd` (vLLM <- SGLang <- lightllm) and reusing our FA-2 split+deterministic-combine pattern; registered via `cuda_arch_tactics`. | W3 | **PASSED** — [`tests/vt/test_ops_mla_attn.cpp`](../../tests/vt/test_ops_mla_attn.cpp) (port of `test_mla_decode_cpu.py` incl. its `ref_mla` two-pass oracle, its bs=4/256/16/576/512/16 parametrization, both `varlen` arms and its NaN-padding out-of-bounds detector; plus the `test_mla_backends.py` shape sweep). dgx sm_121: 11/11 cases, 2,303,193 assertions at the REAL V2-Lite geometry (576/512/64, block 16, mscale^2 scale) over ragged / multi-block / single-block / EVERY split boundary / 128-head V3 / non-BLOCK_H head counts / a 288-256 block-32 geometry / bf16 + f32; run-to-run BIT-exact over 5 runs; memcheck **0**, racecheck **0 hazards**, synccheck **0**; clean CUDA build 0 warn/0 err; 27B 235/235 + 35B 315/315 + Coder 6/6 + Qwen3-dense 16/16 + OPT 6/6 UNCHANGED. Deviation from the plan cell: registered via the ordinary `RegisterOp` table (the W3 pattern), NOT `cuda_arch_tactics` — there is no per-arch tactic to choose between yet, and adding an empty selector would be ceremony; the tactic seam is a W9 concern when a second kernel exists |
 | **W5** ✅ **DONE 2026-07-22** | **MLA prefill + the chunked-context loop.** Generalize the vendored FA-2 varlen launcher to qk 192 / v 128 (the GB10 MLA prefill backend is FLASH_ATTN, §2.3) and implement the compute-friendly materialized form plus the workspace-bounded chunked-context loop with LSE merge. | W4 | **PASSED** — three new ops + the driver, all `file:line`-cited both sides: `vt::MlaPrefillAttention` <- `mla/prefill/flash_attn.py:153-248` over the vendored FA-2; `vt::GatherMlaCache` <- `cache_kernels.cu:992-1064`; `vt::MergeAttnStates` <- `merge_attn_states.cu:18-192`; `BuildMlaChunkedContext`/`ComputeMlaPrefillContext`/`ForwardMlaPrefillMha` <- `mla_attention.py:1422-1451,1667-1745,2094-2199,2344-2425` in the new header [`mla_chunked_context.h`](../../include/vllm/model_executor/layers/attention/mla_chunked_context.h). **The FA-2 launcher WAS generalized, and it was tractable exactly as W4 predicted** — because upstream does not ask FA-2 for asymmetric head dims either: `requires_v_padding` is TRUE on GB10 (`flash_attn.py:88-99`), so V is ZERO-PADDED 128 -> 192 and the output sliced back (`:164-168`, `:196-197`), leaving a plain SYMMETRIC head_dim-192 kernel. The generalization is therefore (a) two new explicit instantiations of the UNCHANGED generic `run_mha_fwd_splitkv_dispatch<bf16,192,{true,false}>` template, (b) a NEW launcher entry `LaunchMlaPrefillFA2Bf16` for the CONTIGUOUS-varlen mode (`cu_seqlens_k` instead of `block_table`+`seqused_k`, already supported by the vendored kernel at `flash_fwd_kernel.h:584-590`), (c) the pad/slice pair. **Existing models proven byte-identical structurally AND by gate:** the diff of `cuda_flash_attn_fa2.cu` is 211 insertions / **0 deletions**, the vendored tree gains only 2 new files, `LaunchPrefillFA2Bf16` (the paged launcher every non-MLA prefill calls) is textually untouched — and 27B 235/235 + 35B 315/315 + Coder 138/138 + Qwen3-dense 664/664 + OPT 36/36 all UNCHANGED. Evidence: [`test_ops_mla_prefill.cpp`](../../tests/vt/test_ops_mla_prefill.cpp) 4/4 cases / **2,377,052 assertions** and [`test_ops_mla_chunked_context.cpp`](../../tests/vt/test_ops_mla_chunked_context.cpp) 5/5 / **306,037 assertions** on dgx sm_121, at the REAL V2-Lite geometry (QK 192 / V 128 / latent 576, block 16, mscale²-corrected scale), against an INDEPENDENT double-precision two-pass oracle; the chunked loop is gated against a SINGLE-SHOT whole-sequence oracle that never chunks, over exact / +1 / −1 chunk boundaries, a request with no context, ragged multi-chunk, and V3's 128 heads; ADVERSARIAL reverse-interleaved block tables throughout; NaN-poisoned outputs; run-to-run BIT-exact over 5 runs. `compute-sanitizer` memcheck **0**, racecheck **0 hazards**, synccheck **0** on both binaries. Clean dgx CUDA build **0 warn / 0 err**. **Deviations, recorded not glossed:** (1) the FA-2 kernel is driven with `unpadded_lse = false` into a `[b,h,max_seqlen_q]` scratch which we then convert to the caller's `[h,total_q]` — because upstream FA-2's EMPTY-K early exit (`flash_fwd_kernel.h:1030-1043`) ignores `unpadded_lse` and always writes at the PADDED offset, and a zero-key request IS reachable in the chunked loop (it is the very case `merge_attn_states.cu:100-106` documents), so the mixed layout would clobber valid rows and write out of bounds; the conversion also normalizes FA-2's `+INFINITY` empty-row LSE to `-inf`, the value `merge_attn_states.cu:97-98` normalizes it to anyway. (2) `MergeAttnStates` is SCALAR, not upstream's 128-bit-packed form — same arithmetic, any head_size/stride; vectorization is a W9 concern. (3) The up-projection (`kv_b_proj` + `_concat_k_nope_k_pe`) is a CALLBACK, not inlined: it is the MODEL's weight, i.e. W6. (4) DCP/context-parallel (`_context_parallel_compute_prefill_context`, `reorg_kvcache`) and the fp8-prefill arms NOT ported — single-GPU only, and fp8 prefill needs device-capability family 100 (`mla_attention.py:1382-1385`), unreachable on sm_121. **NO MLA MODEL and NO MLA FORWARD — rows stay `SPIKE`** |
-| **W6** | **MLA attention block + weight absorption.** `mla_attention.{h,cpp}`: projections (both `q_lora_rank` branches), the two RMSNorms, decoupled RoPE, the load-time `kv_b_proj -> W_UK/W_UV` split, and the prefill-MHA / decode-MQA dispatch. | W5 | forward doctest; absorption round-trip vs the unabsorbed form |
+| **W6** ✅ **DONE 2026-07-22** | **MLA attention block + weight absorption.** `mla_attention.{h,cpp}`: projections (both `q_lora_rank` branches), the two RMSNorms, decoupled RoPE, the load-time `kv_b_proj -> W_UK/W_UV` split, and the prefill-MHA / decode-MQA dispatch. | W5 | **PASSED** — the block ([`mla_attention.h`](../../include/vllm/model_executor/models/mla_attention.h) + [`mla_attention.cpp`](../../src/vllm/model_executor/layers/attention/mla_attention.cpp)) plus TWO new `vt::` primitives, all `file:line`-cited both sides: `vt::BatchedMatmul` <- `torch.bmm` at `mla_attention.py:789` (the q-side W_UK fold) and `:1034` (`_v_up_proj`'s W_UV un-projection), and `vt::ConcatMlaNopeRope` <- `concat_mla_q` (`csrc/libtorch_stable/concat_mla_q.cuh` + `cache_kernels.cu:1555-1600`) generalized to also serve `_concat_k_nope_k_pe` (`:2063-2092`). **ABSORPTION IS A LOAD-TIME TRANSFORM PLUS TWO BATCHED GEMMs, exactly as §2.2 predicted** — no new attention kernel was needed for it. **The equivalence is PROVEN NUMERICALLY, three independent ways** (see the `### Work breakdown` entry): the identity itself in double precision (< 1e-11 rel), ours vs the UNABSORBED double oracle (< 2e-4 rel in f32), and — the strongest — the SAME batch driven once through our ABSORBED MQA decode kernel and once through our UNABSORBED materialized-MHA prefill path, agreeing to < 3e-4 (CPU f32) / < 4e-2 (CUDA bf16). Evidence: [`test_mla_attention_block.cpp`](../../tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp) **10/10 cases / 2,372,644 assertions** and [`test_ops_mla_absorb.cpp`](../../tests/vt/test_ops_mla_absorb.cpp) **9/9 / 1,644,807 assertions** on dgx sm_121. Clean dgx CUDA build **0 warn / 0 err**; `compute-sanitizer` memcheck / racecheck / synccheck all **0** on both binaries; regression set UNCHANGED. **Deviations, recorded not glossed:** (1) the A-projections are issued as one GEMM per weight ROW-SLICE rather than one fused GEMM, because `vt::RmsNorm` requires contiguous inputs and relaxing the hottest op in every model for no MLA-specific gain is the wrong trade — the checkpoint PACKING is unchanged (`fused_qkv_a_proj` stays one weight per `packed_modules_mapping`, `deepseek_v2.py:1812-1820`) and the dense block already defaults to exactly this 3-shard form; (2) `vt::ConcatMlaNopeRope` is SCALAR and width-generic where upstream's is 128/256-bit vectorized and templated on NOPE_DIM=512 (a concat is a pure copy, so the bytes are identical; vectorization is W9, same disposition as W5's `MergeAttnStates`); (3) two ADDITIVE relaxations of existing ops — `vt::RopeFromCache` is now stride-driven on q/k and `vt::MatmulBT` accepts a row-strided ACTIVATION — both integer-identical for contiguous tensors, hence bit-identical for every existing model by construction and by gate. **NO MLA MODEL and NO MLA FORWARD — rows stay `SPIKE`** |
 | **W7** | **DeepSeek-V2 model: registry + loader + forward.** New TU, config parse, KV spec (MLA-only group), per-expert bf16 loader + shared experts + `e_score_correction_bias`, forward composing the MLA block + `RunMoeBlock` + the first `first_k_dense_replace` dense layers. Registers all four aliases; `DeepseekForCausalLM` takes the **MHA** branch (§0.7). | W6, W3 | load gate (all tensors mapped, none left over); real-checkpoint prefill argmax |
 | **W8** | **SACRED correctness gate — DeepSeek-V2-Lite.** Paged-engine greedy vs the vLLM 0.25.0 oracle under the W0-determined gate form; goldens + capture/near-tie scripts. | W7 | the gate; regression set UNCHANGED; memcheck 0 |
 | **W9** | **Speed close.** Decode CUDA-graph sibling; the MLA fusion recipes (RoPE+concat-cache, dual-RMSNorm) as byte-exact catalog entries; then the binding every-axis grid vs graphed vLLM at c1/c2/c4/c8. | W8 | every-axis parity or an honest attributed miss |
@@ -1542,9 +1551,198 @@ forward. DCP/context-parallel (`_context_parallel_compute_prefill_context`,
 device-capability family 100 (`mla_attention.py:1382-1385`) and are unreachable
 on sm_121. No speed number: prefill perf is W9.
 
-W6 the MLA attention
-block + load-time weight absorption (`kv_b_proj -> W_UK`/`W_UV`) + the
-prefill-MHA / decode-MQA dispatch. W7 the DeepSeek-V2 model TU (registry all four
+**W6 — LANDED 2026-07-22. THE MLA ATTENTION BLOCK + WEIGHT ABSORPTION.** Evidence
+root on dgx: `~/w6mla/` (`build.log`, `memcheck_*.log`, `racecheck_*.log`,
+`synccheck_*.log`, `regressions.log`, `ctest.log`). The attention family is no
+longer a pile of ops: W3's cache write, W4's MQA decode and W5's MHA prefill are
+now composed by ONE layer.
+
+*(a) WHAT WAS PORTED, both sides.* The block is
+[`mla_attention.h`](../../include/vllm/model_executor/models/mla_attention.h) +
+[`mla_attention.cpp`](../../src/vllm/model_executor/layers/attention/mla_attention.cpp):
+`AbsorbKvBProjBf16` <- `mla_attention.py:875-962 process_weights_after_loading`
+(the split at `:892-900`, the two permutes at `:959-962`); `MakeMlaUpProjectFn`
+<- `:2141-2170` — **the `kv_b_proj` callback W5 deliberately left open, now
+wired**; `ForwardMlaAttentionBlock` <- `mla.py:119-181`
+(`MultiHeadLatentAttentionWrapper.forward` — the projections, both query
+branches, the two RMSNorms and the decoupled RoPE) over `mla_attention.py:553-620`
+(`forward`, which fixes the cache-update-BEFORE-attention ORDER), `:624-874`
+(`forward_impl`, the dispatch and the absorbed decode) and `:2344-2425`
+(`forward_mha`); `BuildDeepseekRopeCosSinCache` <- `deepseek_scaling_rope.py:76-118`
+over `rotary_embedding/common.py:34-70`; `YarnGetMscale` <- `:20-23`;
+`MlaAttentionScale` <- `deepseek_v2.py:995` + `:1067-1075`.
+
+*(b) ABSORPTION NEEDED NO NEW ATTENTION KERNEL — §2.2's most useful prediction
+held.* It is a LOAD-TIME weight transform plus TWO BATCHED GEMMs, so the whole
+new-kernel surface is two general primitives:
+- **`vt::BatchedMatmul`** <- `torch.bmm` at `mla_attention.py:789`
+  (`torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)`, the q-side W_UK fold)
+  and `:1034` (`_v_up_proj`'s W_UV un-projection). **Whole-chain check:** on CUDA
+  `torch.bmm` over bf16 resolves to ATen's `baddbmm_out_cuda_impl` -> cuBLAS
+  `gemmStridedBatchedEx` (CUDA_R_16BF, CUBLAS_COMPUTE_32F); our CUDA impl is the
+  cuBLASLt strided-batched form of that same GEMM on the SAME handle/workspace as
+  `vt::Matmul`. The only alternatives upstream has are the ROCm-only aiter
+  fp8/fp4 bmm branches (`:766-776`, `:1024-1032`), unreachable on CUDA. It is
+  STRIDE-DRIVEN because BOTH upstream call sites pass `.transpose(0,1)` views.
+- **`vt::ConcatMlaNopeRope`** <- `ConcatMLAQKernel`
+  (`csrc/libtorch_stable/concat_mla_q.cuh`) + host wrapper
+  `cache_kernels.cu:1555-1600` (bound at `torch_bindings.cpp:841,905`, reached
+  from `_custom_ops.py:2696-2708`), GENERALIZED to arbitrary nope/rope widths and
+  a head-BROADCAST rope operand so the SAME op also serves upstream's OTHER
+  head-concat site, `_concat_k_nope_k_pe` (`mla_attention.py:2063-2092`).
+
+*(c) THE ABSORBED-vs-UNABSORBED EQUIVALENCE, PROVEN NUMERICALLY THREE WAYS.* This
+is the heart of W6, and it is measured rather than argued
+([`test_mla_attention_block.cpp`](../../tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp)):
+1. **The identity itself.** An INDEPENDENT double-precision block oracle computes
+   the attention BOTH ways from the same weights — unabsorbed (materialize
+   `k_nope = W_UK^T kv_c` and `v = W_UV^T kv_c`, then MHA at QK 192 / V 128) and
+   absorbed (fold W_UK into the query, MQA against the raw 576-wide latent, then
+   un-project with W_UV) — and they agree to **< 1e-11 relative**, at BOTH query
+   branches. That is `q_nope.(W_UK^T kv_c) == (q_nope W_UK).kv_c` and
+   `sum_s p_s (W_UV^T kv_c_s) == W_UV^T (sum_s p_s kv_c_s)` made executable.
+2. **Ours vs the UNABSORBED oracle.** Our block's absorbed decode reproduces the
+   double oracle to **< 2e-4 relative in f32** across decode-only, prefill-only,
+   chunked-prefill-with-context and MIXED batches (**< 3e-2 in bf16**, where bf16
+   storage of every intermediate over ~2k-wide reductions is the binding limit —
+   the f32 arm is what pins the MATH).
+3. **Ours vs ours, THROUGH TWO GENUINELY DIFFERENT CODE PATHS.** The SAME batch —
+   every request one new token over cached context, so it is legally either shape
+   — is run once labelled all-DECODE (our `vt::MlaDecodeAttention` MQA kernel,
+   QK 576 / V 512, one KV head, K/V never materialized, W_UK folded into the
+   query and W_UV un-projecting the output) and once labelled all-PREFILL (our
+   `vt::MlaPrefillAttention` MHA at QK 192 / V 128 over K/V materialized by
+   `kv_b_proj`, plus the chunked-context loop over the cached latent). They agree
+   to **< 3e-4 (CPU f32)** and **< 4e-2 (CUDA bf16)**. Nothing but the weights is
+   shared between those paths, so an absorption bug cannot cancel out — this is
+   the strongest of the three, and it is the one that would catch a transposed
+   permute that happened to be self-consistent.
+`AbsorbKvBProjBf16` is additionally gated on its own against an INDEPENDENT
+transcription that performs `.T -> view -> split -> permute` literally, step by
+step, rather than the folded index arithmetic production uses.
+
+*(d) BOTH QUERY BRANCHES — and the one that has NO e2e coverage, said plainly.*
+With `q_lora_rank` set the path is `fused_qkv_a_proj` (q_a FUSED with kv_a — there
+is no standalone `q_a_proj` module upstream, `deepseek_v2.py:905-950`, and
+`:1812-1820` registers the `packed_modules_mapping` un-fusing) ->
+`q_a_layernorm` -> `q_b_proj`; without it, a direct `q_proj`
+(`:1010-1016`, `:1028-1034`). Both are implemented and both are gated at REAL
+dimensions — the non-lora branch at DeepSeek-V2-Lite's geometry and the lora
+branch at DeepSeek-V3's (hidden 7168, 128 heads, `q_lora_rank=1536`). **The lora
+branch has NO END-TO-END COVERAGE and cannot get any on this hardware**:
+DeepSeek-V2-Lite, the campaign's only e2e vehicle, has `q_lora_rank=null`
+(W0-confirmed against the shipped `config.json`), so W8's gate will exercise none
+of it. It is UNIT-GATED ONLY, exactly like the `noaux_tc` router W3 landed.
+GLM-4.7-Flash (58.2 GiB, `q_lora_rank=768`) is the checkpoint that would close it
+e2e and it FITS GB10 — noted for a later step, deliberately NOT attempted here
+(`CLAIM-GLM-DSA-LATEST-DEEPSEEK` scopes that family).
+
+*(e) DISPATCH, mirrored exactly.* `num_mqa_tokens = attn_metadata.num_decode_tokens`
+and the rest are MHA (`mla_attention.py:700-709`), with DECODE TOKENS PACKED
+FIRST, so MHA takes the tail `q[num_mqa_tokens:]` (`:722-737`) and MQA the head
+`q[:num_mqa_tokens]` (`:739+`); the MHA call is issued FIRST, as upstream does.
+Upstream's own note at `:19-22` that this split is a tunable heuristic rather
+than an invariant is recorded in the header rather than silently hardened. The
+MIXED case is gated (2 decode + 2 prefill, decode first, ragged query lengths,
+one prefill with context and one without), as are decode-only, prefill-only-with-
+no-context (the `:2421-2425` path that skips the chunk loop entirely) and
+chunked prefill over multiple chunks. **One upstream ORDERING INVARIANT was found
+the hard way and is now documented:** within the prefill tail the WITH-CONTEXT
+requests must come first, because `prefill_tokens_with_context` is
+`query_start_loc[num_prefills_with_context]` (`:1806-1810`) and every query row
+past it takes the suffix result verbatim. A test batch that violated it produced
+a wrong answer (0.86 relative error) — the gate caught it, and W7 must build its
+batches accordingly.
+
+*(f) DECOUPLED RoPE + the mscale^2 scale.* Only the `qk_rope_head_dim` (64) slice
+rotates, `is_neox_style=False` (adjacent-pair GPT-J), applied to
+`q[..., qk_nope_head_dim:]` and to the SINGLE shared `k_pe` head
+(`mla.py:158-167`, `deepseek_v2.py:1053-1064`). The YaRN cos|sin cache carries the
+ROTATION mscale `yarn_get_mscale(f, mscale) / yarn_get_mscale(f, mscale_all_dim) *
+attn_factor` (`deepseek_scaling_rope.py:55-59`), while the SOFTMAX scale carries
+the SQUARE of `yarn_get_mscale(f, mscale_all_dim)` (`deepseek_v2.py:1067-1075`).
+Conflating those two mscales is the classic DeepSeek RoPE bug; they are separate
+functions here and each is gated against an independent transcription of its
+formula.
+
+*(g) THE EVIDENCE.* On dgx sm_121:
+[`test_mla_attention_block.cpp`](../../tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp)
+**10/10 cases / 2,372,644 assertions** and
+[`test_ops_mla_absorb.cpp`](../../tests/vt/test_ops_mla_absorb.cpp) **9/9 /
+1,644,807 assertions**. The CUDA cases were confirmed to EXECUTE rather than skip
+(2 cases / 124,941 assertions and 3 / 290,835 when run alone). Every output buffer
+is NaN-POISONED before the call, so a path that fails to write a token fails the
+gate. Run-to-run BIT-exactness over repeated runs on both devices. Full dgx `ctest`
+**181/182**, the single failure being the DOCUMENTED `test_capi` flake — verified
+by signature rather than assumed: its `:353` case fails on
+`M-oM-?M-=oollllll` vs `loollllll` (a U+FFFD partial-UTF-8 first byte, exactly the
+recorded signature) and its `:453` streaming case fails alongside it, and BOTH
+appear identically in the W5 baseline log (`~/w5mla/ctest.log`, "1 tests failed out
+of 180"), so nothing about it moved. Upstream test
+modules ported: `tests/kernels/test_concat_mla_q.py` (BOTH arms, including
+`test_concat_mla_q_transposed_nope:37-63`, whose docstring exists precisely because
+the real nope operand is the non-contiguous transposed bmm output — compared
+EXACTLY, `atol=0, rtol=0`, since a concat is a pure copy), plus the MLA-geometry
+sweep of `tests/v1/attention/test_mla_backends.py` and the two-pass-oracle
+discipline of `tests/kernels/attention/test_mla_decode_cpu.py`.
+
+*(h) MEMORY SAFETY — and a compute-sanitizer LIMITATION worth recording.*
+`compute-sanitizer` memcheck **0 errors** and racecheck **0 hazards** on both new
+binaries. synccheck initially reported `1 error` on the block binary, and the
+cause was NOT a barrier defect: the tool printed
+`Warning: Detected overflow of tracked cuda::barrier structures. Results might be
+incorrect. Try using --num-cuda-barriers to fix the issue`, after which the run
+died with `unspecified launch failure`. The block drives far more distinct kernels
+per process than any previous MLA test (cuBLASLt dense + strided-batched, the
+vendored FA-2, the MLA decode pair, the cache write, the gather/merge), which
+overflows synccheck's default barrier table and corrupts its own instrumentation.
+With `--num-cuda-barriers 65536` synccheck reports **0 errors**. Recorded because
+the failure mode is indistinguishable from a real defect at first glance, and
+because every future test that composes this many kernel families will hit it.
+**A second operational lesson from the same run:** `ctest -j4` on dgx is
+OOM-KILLED partway through the heavy tail — it schedules two ~30 GiB paged-engine
+model tests concurrently against 119 GiB of UNIFIED memory, and the whole ctest
+process disappears with a truncated log that looks like a hang rather than a
+failure. `-j2` completes. Recorded next to the disk-space hazard already in the
+operational notes, because the symptom (a log that simply stops) invites the wrong
+diagnosis.
+
+*(i) DEVIATIONS, recorded not glossed.*
+1. **The A-projections are issued per weight ROW-SLICE, not as one fused GEMM.**
+   Upstream runs one GEMM per A-projection module and `.split(...)`s the result
+   into views; we slice the single fused WEIGHT's output rows and issue one GEMM
+   per slice, so every downstream consumer gets a CONTIGUOUS buffer. The reason is
+   concrete: `vt::RmsNorm` requires contiguous inputs, and relaxing the hottest op
+   in every existing model to save one MLA copy is the wrong trade. The checkpoint
+   PACKING is unchanged — `fused_qkv_a_proj` remains ONE weight, exactly as
+   `packed_modules_mapping` (`deepseek_v2.py:1812-1820`) requires — so only the
+   launch granularity differs, and that is the same trade the dense block already
+   makes BY DEFAULT (`dense_attn_block.h`'s 3-shard qkv path,
+   `VT_QWEN3_QKV_MERGE` default OFF). A truly fused A-GEMM is a W9 A/B.
+2. **`vt::ConcatMlaNopeRope` is SCALAR and width-generic** where upstream's is
+   128/256-bit vectorized and instantiated only for NOPE_DIM=512 / rope 64
+   (`concat_mla_q.cuh:13,21-24,50-53`). A concat is a pure copy, so the bytes
+   written are identical; the generality is what lets one op serve the prefill K
+   concat (nope 128) too. Vectorization is W9 — the same disposition as W5's
+   scalar `MergeAttnStates`.
+3. **Two ADDITIVE relaxations of existing ops**, both integer-identical for
+   contiguous tensors and therefore bit-identical for every existing model BY
+   CONSTRUCTION (and confirmed BY GATE): `vt::RopeFromCache` is now stride-driven
+   on q/k (DeepSeek rotates the TRAILING slice of each query head and its `k_pe`
+   is a column block of the fused kv_a projection — both strided views), and
+   `vt::MatmulBT` accepts a ROW-STRIDED activation (upstream applies `kv_b_proj`
+   to a 512-column slice of the 576-wide chunked-prefill workspace,
+   `mla_attention.py:2160`, and `F.linear` takes exactly that).
+4. **fp8 output quant, DCP/context-parallel and the sparse/indexer branches are
+   NOT ported** — out of campaign scope or unreachable on sm_121, and refused
+   loudly rather than mis-computed.
+
+*(j) NOT IN W6, on purpose.* No model, no registry entry, no loader, no config
+parse, no forward over layers — that is W7. No CUDA-graph sibling and no speed
+number: W9 owns tuning, and the A-projection granularity above is explicitly left
+as one of its A/Bs. **NO MODEL ROW MOVES OFF `SPIKE`.**
+
+W7 the DeepSeek-V2 model TU (registry all four
 aliases, loader, forward). W8 the SACRED gate on DeepSeek-V2-Lite. W9 speed close
 (decode-graph sibling + MLA fusion recipes + the binding every-axis grid). W10
 the blocked-row honesty pass (config/loader-slice/unit parity for V3/V3.2;

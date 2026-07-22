@@ -137,6 +137,27 @@ void MakeRowMajor(LayoutGuard& l, cudaDataType_t t, int64_t rows, int64_t cols) 
           "set CUBLASLT_MATRIX_LAYOUT_ORDER");
 }
 
+// Row-major layout with an EXPLICIT leading dimension (the tensor's row stride,
+// which may exceed `cols` for a strided view) plus strided-batch metadata. The
+// batch stride is in ELEMENTS, matching vt::Tensor::stride.
+void MakeRowMajorBatched(LayoutGuard& l, cudaDataType_t t, int64_t rows, int64_t cols,
+                         int64_t ld, int32_t batch, int64_t batch_stride) {
+  CheckLt(cublasLtMatrixLayoutCreate(&l.v, t, static_cast<uint64_t>(rows),
+                                     static_cast<uint64_t>(cols), ld),
+          "cublasLtMatrixLayoutCreate (batched)");
+  const cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+  CheckLt(cublasLtMatrixLayoutSetAttribute(l.v, CUBLASLT_MATRIX_LAYOUT_ORDER, &order,
+                                           sizeof(order)),
+          "set CUBLASLT_MATRIX_LAYOUT_ORDER (batched)");
+  CheckLt(cublasLtMatrixLayoutSetAttribute(l.v, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch,
+                                           sizeof(batch)),
+          "set CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT");
+  CheckLt(cublasLtMatrixLayoutSetAttribute(
+              l.v, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &batch_stride,
+              sizeof(batch_stride)),
+          "set CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET");
+}
+
 std::string ComboName(const Tensor& a, const Tensor& b, const Tensor& out) {
   return std::string("(") + Name(a.dtype) + "," + Name(b.dtype) + ")->" + Name(out.dtype);
 }
@@ -295,8 +316,11 @@ void MatmulBTKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   CheckLt(cublasLtMatrixLayoutCreate(&la.v, ab_type, static_cast<uint64_t>(k),
                                      static_cast<uint64_t>(n), k),
           "bt Adesc (weight)");
+  // ld = the activation's ROW stride (== k for a contiguous activation, so
+  // contiguous callers hand cuBLASLt byte-identical layouts and get the same
+  // algo). A wider stride is the MLA chunked-prefill column slice, W6.
   CheckLt(cublasLtMatrixLayoutCreate(&lb.v, ab_type, static_cast<uint64_t>(k),
-                                     static_cast<uint64_t>(m), k),
+                                     static_cast<uint64_t>(m), a.stride[0]),
           "bt Bdesc (act)");
   CheckLt(cublasLtMatrixLayoutCreate(&lc.v, out_type, static_cast<uint64_t>(n),
                                      static_cast<uint64_t>(m), n),
@@ -328,6 +352,90 @@ void MatmulBTKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
                          out.data, lc.v, out.data, lc.v, &heur.algo, ctx.workspace,
                          kWorkspaceBytes, s),
           "bt cublasLtMatmul");
+}
+
+// ---- cuBLASLt strided-batched bf16/f32 GEMM (vt::BatchedMatmul) ------------
+// out[G,M,N] = a[G,M,K] @ b[G,K,N] — the 1:1 counterpart of `torch.bmm`, the
+// primitive MLA weight absorption is expressed in upstream
+// (mla_attention.py:789 folds W_UK into the decode query, :1034 un-projects the
+// latent output with W_UV). torch.bmm on CUDA bf16 resolves to cuBLAS
+// `gemmStridedBatchedEx` (CUDA_R_16BF, CUBLAS_COMPUTE_32F); this is the
+// cuBLASLt strided-batched form of exactly that GEMM, reusing the same handle
+// and 32 MB workspace as the dense paths above.
+//
+// Row-major NN layouts with an EXPLICIT leading dimension, so a transposed view
+// (both upstream call sites pass one) is consumed with no copy: the batch axis
+// need not be the outermost storage axis, only the innermost dim must be
+// unit-stride (enforced in ops.cpp).
+void BatchedMatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  const bool bf16_in = a.dtype == DType::kBF16 && b.dtype == DType::kBF16 &&
+                       (out.dtype == DType::kF32 || out.dtype == DType::kBF16);
+  const bool f32_in = a.dtype == DType::kF32 && b.dtype == DType::kF32 &&
+                      (out.dtype == DType::kF32 || out.dtype == DType::kBF16);
+  if (!bf16_in && !f32_in) {
+    throw std::runtime_error("vt cuda: batched_matmul: unsupported dtype combo " +
+                             ComboName(a, b, out) +
+                             "; supported: (bf16,bf16)->f32|bf16, (f32,f32)->f32|bf16");
+  }
+  const int64_t g = out.shape[0], m = out.shape[1], n = out.shape[2], k = a.shape[2];
+  if (g == 0 || m == 0 || n == 0) return;
+  cudaStream_t s = static_cast<cudaStream_t>(q.handle);
+  if (k == 0) {
+    // Empty contraction: out = 0. Only safe to memset wholesale when `out` owns
+    // a dense span; a strided view is zeroed row by row.
+    if (out.IsContiguous()) {
+      CheckCuda(cudaMemsetAsync(out.data, 0, out.Bytes(), s), "batched k=0 memset");
+    } else {
+      const size_t esz = SizeOf(out.dtype);
+      for (int64_t bi = 0; bi < g; ++bi) {
+        for (int64_t i = 0; i < m; ++i) {
+          char* row = static_cast<char*>(out.data) +
+                      static_cast<size_t>(bi * out.stride[0] + i * out.stride[1]) * esz;
+          CheckCuda(cudaMemsetAsync(row, 0, static_cast<size_t>(n) * esz, s),
+                    "batched k=0 row memset");
+        }
+      }
+    }
+    return;
+  }
+
+  const LtContext ctx = GetContext(q.device.index);
+  const cudaDataType_t ab_type = a.dtype == DType::kF32 ? CUDA_R_32F : CUDA_R_16BF;
+  const cudaDataType_t out_type = out.dtype == DType::kF32 ? CUDA_R_32F : CUDA_R_16BF;
+
+  DescGuard desc;
+  CheckLt(cublasLtMatmulDescCreate(&desc.v, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+          "batched cublasLtMatmulDescCreate");
+  LayoutGuard la, lb, lc;
+  const int32_t batch = static_cast<int32_t>(g);
+  MakeRowMajorBatched(la, ab_type, m, k, a.stride[1], batch, a.stride[0]);
+  MakeRowMajorBatched(lb, ab_type, k, n, b.stride[1], batch, b.stride[0]);
+  MakeRowMajorBatched(lc, out_type, m, n, out.stride[1], batch, out.stride[0]);
+
+  PrefGuard pref;
+  CheckLt(cublasLtMatmulPreferenceCreate(&pref.v), "batched cublasLtMatmulPreferenceCreate");
+  CheckLt(cublasLtMatmulPreferenceSetAttribute(pref.v, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                               &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
+          "batched set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES");
+
+  cublasLtMatmulHeuristicResult_t heur{};
+  int returned = 0;
+  CheckLt(cublasLtMatmulAlgoGetHeuristic(ctx.handle, desc.v, la.v, lb.v, lc.v, lc.v, pref.v,
+                                         /*requestedAlgoCount=*/1, &heur, &returned),
+          "batched cublasLtMatmulAlgoGetHeuristic");
+  if (returned == 0) {
+    throw std::runtime_error("vt cuda: batched_matmul: no cublasLt heuristic for g=" +
+                             std::to_string(g) + " [" + std::to_string(m) + "," +
+                             std::to_string(k) + "]x[" + std::to_string(k) + "," +
+                             std::to_string(n) + "] " + ComboName(a, b, out));
+  }
+  MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "rowmajor-NN-batched");
+
+  const float alpha = 1.0f, beta = 0.0f;
+  CheckLt(cublasLtMatmul(ctx.handle, desc.v, &alpha, a.data, la.v, b.data, lb.v, &beta,
+                         out.data, lc.v, out.data, lc.v, &heur.algo, ctx.workspace,
+                         kWorkspaceBytes, s),
+          "batched cublasLtMatmul");
 }
 
 // ---- cuBLASLt FP8 (e4m3) dense GEMM ---------------------------------------
@@ -524,6 +632,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernelCuda)));
     RegisterOp(OpId::kMatmulBT, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTKernelCuda)));
+    RegisterOp(OpId::kBatchedMatmul, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<BatchedMatmulFn>(&BatchedMatmulKernelCuda)));
     RegisterOp(OpId::kMatmulFp8CublasLt, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulFp8CublasLtFn>(&MatmulFp8CublasLtKernelCuda)));
   }

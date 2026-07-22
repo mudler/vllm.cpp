@@ -253,6 +253,7 @@ add_library(vllm STATIC
   src/vllm/v1/executor/executor.cpp
   src/vllm/model_executor/layers/attention/attention.cpp
   src/vllm/model_executor/layers/attention/chunked_local_attention.cpp
+  src/vllm/model_executor/layers/attention/mla_attention.cpp
   src/vllm/model_executor/layers/rotary_embedding/base.cpp
   src/vllm/model_executor/layers/rotary_embedding/common.cpp
   src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_alpha_rope.cpp

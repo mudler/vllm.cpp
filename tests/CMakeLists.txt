@@ -309,6 +309,15 @@ vllm_cpp_add_test(test_ops_mla_attn vt/test_ops_mla_attn.cpp)
 vllm_cpp_add_test(test_ops_mla_prefill vt/test_ops_mla_prefill.cpp)
 # ... and the workspace-bounded chunked-context loop (gather + LSE merge).
 vllm_cpp_add_test(test_ops_mla_chunked_context vt/test_ops_mla_chunked_context.cpp)
+# MLA campaign W6: the two primitives weight ABSORPTION is built out of —
+# vt::BatchedMatmul (torch.bmm) and vt::ConcatMlaNopeRope (concat_mla_q /
+# _concat_k_nope_k_pe).
+vllm_cpp_add_test(test_ops_mla_absorb vt/test_ops_mla_absorb.cpp)
+# MLA campaign W6: the MLA attention BLOCK — projections, both q_lora branches,
+# decoupled RoPE, the load-time kv_b_proj -> W_UK/W_UV split, and the
+# prefill-MHA / decode-MQA dispatch, incl. the absorbed-vs-unabsorbed proof.
+vllm_cpp_add_test(test_mla_attention_block
+  vllm/model_executor/layers/attention/test_mla_attention_block.cpp)
 vllm_cpp_add_test(test_ops_moe_router_grouped vt/test_ops_moe_router_grouped.cpp)
 vllm_cpp_add_test(test_ops_paged_attn vt/test_ops_paged_attn.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)

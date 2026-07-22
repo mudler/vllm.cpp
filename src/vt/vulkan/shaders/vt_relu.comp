@@ -1,0 +1,27 @@
+#version 450
+// vt::Relu — flat elementwise. Math ported 1:1 from
+// src/vt/cpu/cpu_layernorm.cpp:75-85 ReluKernel.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(binding = 2) buffer Db32 { uint v[]; } D32;
+layout(binding = 3) buffer Db16 { uint16_t v[]; } D16;
+
+layout(push_constant) uniform Params {
+  uint n;
+  uint a_dt;
+  uint out_dt;
+  uint a_off;
+  uint out_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.n) { return; }
+  float v = VT_LOAD(A32, A16, p.a_dt, p.a_off, gid);
+  VT_STORE(D32, D16, p.out_dt, p.out_off, gid, v > 0.0 ? v : 0.0);
+}

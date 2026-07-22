@@ -1,0 +1,74 @@
+#version 450
+// vt::RmsNorm, including the in-place residual stream. Math ported 1:1 from
+// src/vt/cpu/cpu_ops.cpp:225-250 RmsNormKernel — the residual idiom is
+// reproduced EXACTLY, including the deliberate store-then-RE-READ that makes a
+// bf16 residual stream bit-faithful (cpu_ops.cpp:235-237): add in f32, round
+// into the residual's OWN dtype, then read the ROUNDED value back for both the
+// variance and the scale.
+//
+// Dispatch shape (one workgroup per row + shared-memory tree reduction) from
+// llama.cpp `vulkan-shaders/rms_norm.comp:37-83` @ 237ad9b96. Note the scale is
+// `1.0 / sqrt(...)`, NOT llama.cpp's `inversesqrt` (rms_norm.comp:86) — see
+// vt_common.glsl § DELIBERATE DIVERGENCES.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Xb32 { uint v[]; } X32;
+layout(binding = 1) readonly buffer Xb16 { uint16_t v[]; } X16;
+layout(binding = 2) readonly buffer Wb32 { uint v[]; } W32;
+layout(binding = 3) readonly buffer Wb16 { uint16_t v[]; } W16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+layout(binding = 6) buffer Rb32 { uint v[]; } R32;
+layout(binding = 7) buffer Rb16 { uint16_t v[]; } R16;
+
+layout(push_constant) uniform Params {
+  uint t;
+  uint h;
+  uint x_dt;
+  uint w_dt;
+  uint out_dt;
+  uint res_dt;
+  uint has_res;
+  uint gemma;
+  uint x_off;
+  uint w_off;
+  uint out_off;
+  uint res_off;
+  float eps;
+} p;
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  uint rbase = row * p.h;
+
+  float partial = 0.0;
+  for (uint j = tid; j < p.h; j += VT_TG) {
+    float v = VT_LOAD(X32, X16, p.x_dt, p.x_off, rbase + j);
+    if (p.has_res != 0u) {
+      v += VT_LOAD(R32, R16, p.res_dt, p.res_off, rbase + j);
+      VT_STORE(R32, R16, p.res_dt, p.res_off, rbase + j, v);
+      v = VT_LOAD(R32, R16, p.res_dt, p.res_off, rbase + j);  // re-read ROUNDED
+    }
+    partial += v * v;
+  }
+  // Each lane re-reads only slots it wrote itself (same `j` stride), so this is
+  // not a cross-lane dependency; the barrier inside vt_tg_sum orders the shared
+  // memory, and this one makes the residual writes visible for the SECOND loop
+  // below, which does read them back.
+  if (p.has_res != 0u) { memoryBarrierBuffer(); }
+
+  float sumsq = vt_tg_sum(tid, partial);
+  float inv = 1.0 / sqrt(sumsq / float(p.h) + p.eps);
+
+  for (uint j = tid; j < p.h; j += VT_TG) {
+    float v = p.has_res != 0u ? VT_LOAD(R32, R16, p.res_dt, p.res_off, rbase + j)
+                              : VT_LOAD(X32, X16, p.x_dt, p.x_off, rbase + j);
+    float wj = VT_LOAD(W32, W16, p.w_dt, p.w_off, j);
+    if (p.gemma != 0u) { wj += 1.0; }
+    VT_STORE(D32, D16, p.out_dt, p.out_off, rbase + j, v * inv * wj);
+  }
+}

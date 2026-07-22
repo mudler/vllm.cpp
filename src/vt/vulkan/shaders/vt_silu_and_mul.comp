@@ -1,0 +1,33 @@
+#version 450
+// vt::SiluAndMul — out[i,j] = silu(x[i,j]) * x[i,d+j], where x is [t, 2*d].
+// Math ported 1:1 from src/vt/cpu/cpu_ops.cpp:252-264 SiluAndMulKernel,
+// including its `gate / (1 + exp(-gate))` spelling of silu.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(binding = 2) buffer Db32 { uint v[]; } D32;
+layout(binding = 3) buffer Db16 { uint16_t v[]; } D16;
+
+layout(push_constant) uniform Params {
+  uint t;
+  uint d;      // HALF the input inner dim
+  uint x_dt;
+  uint out_dt;
+  uint x_off;
+  uint out_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.t * p.d) { return; }
+  uint i = gid / p.d;
+  uint j = gid % p.d;
+  uint base = i * (2u * p.d);
+  float gate = VT_LOAD(A32, A16, p.x_dt, p.x_off, base + j);
+  float up = VT_LOAD(A32, A16, p.x_dt, p.x_off, base + p.d + j);
+  VT_STORE(D32, D16, p.out_dt, p.out_off, i * p.d + j, gate * vt_sigmoid(gate) * up);
+}

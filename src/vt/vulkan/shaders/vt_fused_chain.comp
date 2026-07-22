@@ -1,0 +1,125 @@
+#version 450
+// The Tier-1 FusedChain interpreter — the ONE registration that earns this
+// backend the whole portable fusion catalog (include/vt/fused_recipe.h).
+// Structural mirror of src/vt/cpu/cpu_ops.cpp:1649-1695 FusedChainInterpKernel,
+// including its canonical operand indexing (cpu_ops.cpp:1621-1643
+// FusedLoad/FusedStore):
+//   0 = x [t,h]   1 = weight [h]   2 = residual [t,h]   3 = out [t,h]
+// with 2 and 3 the only WRITABLE slots. Opcodes mirror vt::FOp; only the
+// Tier-1-able subset {kAdd,kMul,kSilu,kSigmoid,kRmsNorm} can reach here — the
+// device-agnostic Tier-0 composite in src/vt/ops.cpp handles everything else by
+// re-entering this backend's STANDALONE ops, so both fusion tiers are covered by
+// this one kernel plus the seven elementwise/norm shaders.
+//
+// llama.cpp has no equivalent (its fusion is graph-level, chosen in
+// ggml-vulkan.cpp, not a shader-level interpreter), so only the workgroup-per-row
+// + tree-reduction dispatch shape is shared with it.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Xb32 { uint v[]; } X32;
+layout(binding = 1) readonly buffer Xb16 { uint16_t v[]; } X16;
+layout(binding = 2) readonly buffer Wb32 { uint v[]; } W32;
+layout(binding = 3) readonly buffer Wb16 { uint16_t v[]; } W16;
+layout(binding = 4) buffer Rb32 { uint v[]; } R32;
+layout(binding = 5) buffer Rb16 { uint16_t v[]; } R16;
+layout(binding = 6) buffer Db32 { uint v[]; } D32;
+layout(binding = 7) buffer Db16 { uint16_t v[]; } D16;
+
+// The recipe step list. A storage buffer rather than push constants because
+// kMaxFusedSteps (8) x 5 words is 160 bytes and Vulkan only GUARANTEES 128 bytes
+// of push-constant space (maxPushConstantsSize).
+layout(binding = 8) readonly buffer StepsBuf { uint v[]; } S;
+
+#define VT_FOP_ADD     0u
+#define VT_FOP_MUL     1u
+#define VT_FOP_SILU    2u
+#define VT_FOP_SIGMOID 3u
+#define VT_FOP_RMSNORM 4u
+
+// Words per step, matching the host-side FStepGpu in vulkan_ops.cpp.
+#define VT_STEP_WORDS 5u
+
+layout(push_constant) uniform Params {
+  uint t;
+  uint h;
+  uint nsteps;
+  uint x_dt;
+  uint w_dt;
+  uint res_dt;
+  uint out_dt;
+  uint x_off;
+  uint w_off;
+  uint res_off;
+  uint out_off;
+  float eps;
+} p;
+
+// GLSL cannot pass a buffer as a function argument, so the operand switch is a
+// macro over the four named blocks. `?:` evaluates ONLY the selected operand
+// (GLSL spec), so no out-of-range access is performed for the untaken arms.
+#define FC_LOAD(IDX, RBASE, J)                                              \
+  ((IDX) == 0u   ? VT_LOAD(X32, X16, p.x_dt, p.x_off, (RBASE) + (J))        \
+   : (IDX) == 1u ? VT_LOAD(W32, W16, p.w_dt, p.w_off, (J))                  \
+   : (IDX) == 2u ? VT_LOAD(R32, R16, p.res_dt, p.res_off, (RBASE) + (J))    \
+                 : VT_LOAD(D32, D16, p.out_dt, p.out_off, (RBASE) + (J)))
+
+#define FC_STORE(IDX, RBASE, J, V)                                          \
+  do {                                                                      \
+    if ((IDX) == 2u) {                                                      \
+      VT_STORE(R32, R16, p.res_dt, p.res_off, (RBASE) + (J), V);            \
+    } else {                                                                \
+      VT_STORE(D32, D16, p.out_dt, p.out_off, (RBASE) + (J), V);            \
+    }                                                                       \
+  } while (false)
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  uint rbase = row * p.h;
+
+  for (uint s = 0u; s < p.nsteps; ++s) {
+    uint sb = s * VT_STEP_WORDS;
+    uint op = S.v[sb + 0u];
+    uint o = S.v[sb + 1u];
+    uint i0 = S.v[sb + 2u];
+    uint i1 = S.v[sb + 3u];
+    uint gemma = S.v[sb + 4u];
+
+    if (op == VT_FOP_ADD || op == VT_FOP_MUL) {
+      for (uint j = tid; j < p.h; j += VT_TG) {
+        float a = FC_LOAD(i0, rbase, j);
+        float b = FC_LOAD(i1, rbase, j);
+        FC_STORE(o, rbase, j, op == VT_FOP_ADD ? a + b : a * b);
+      }
+    } else if (op == VT_FOP_SILU || op == VT_FOP_SIGMOID) {
+      for (uint j = tid; j < p.h; j += VT_TG) {
+        float a = FC_LOAD(i0, rbase, j);
+        float sg = vt_sigmoid(a);
+        FC_STORE(o, rbase, j, op == VT_FOP_SILU ? a * sg : sg);
+      }
+    } else {  // VT_FOP_RMSNORM (the host validated reduce == kMeanSquare)
+      float partial = 0.0;
+      for (uint j = tid; j < p.h; j += VT_TG) {
+        float v = FC_LOAD(i0, rbase, j);
+        partial += v * v;  // f32 variance accumulation
+      }
+      float inv = 1.0 / sqrt(vt_tg_sum(tid, partial) / float(p.h) + p.eps);
+      for (uint j = tid; j < p.h; j += VT_TG) {
+        float v = FC_LOAD(i0, rbase, j);
+        float wj = FC_LOAD(i1, rbase, j);
+        if (gemma != 0u) { wj += 1.0; }
+        FC_STORE(o, rbase, j, v * inv * wj);
+      }
+    }
+    // A later step may read what this step wrote (the interpreter is a chain)
+    // and the rmsnorm step's two phases genuinely read ACROSS lanes, so every
+    // step boundary needs both the buffer-memory visibility and the execution
+    // barrier. Mirrors the Metal interpreter's step-boundary barrier
+    // (src/vt/metal/metal_msl.h vt_fused_chain).
+    memoryBarrierBuffer();
+    barrier();
+  }
+}

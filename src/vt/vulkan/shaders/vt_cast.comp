@@ -1,0 +1,30 @@
+#version 450
+// vt::CastBf16 / vt::CastF32 — a dtype-converting copy. ONE shader serves both,
+// exactly as the CPU pair is the same LoadF32/StoreF32 body twice
+// (src/vt/cpu/cpu_ops.cpp:1436-1451 CastBf16Kernel / CastF32Kernel).
+// When src and dst dtype are equal this is a bit-exact copy, and the
+// f32<->bf16 round trip is gated with memcmp, not NMSE
+// (tests/vt/test_backend_cross_device.cpp).
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(binding = 2) buffer Db32 { uint v[]; } D32;
+layout(binding = 3) buffer Db16 { uint16_t v[]; } D16;
+
+layout(push_constant) uniform Params {
+  uint n;
+  uint a_dt;
+  uint out_dt;
+  uint a_off;
+  uint out_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.n) { return; }
+  VT_STORE(D32, D16, p.out_dt, p.out_off, gid, VT_LOAD(A32, A16, p.a_dt, p.a_off, gid));
+}

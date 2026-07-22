@@ -1,0 +1,64 @@
+#version 450
+// vt::LayerNorm. Math ported 1:1 from src/vt/cpu/cpu_layernorm.cpp:49-73
+// LayerNormKernel — the two-pass numerically stable form (mean, THEN squared
+// deviations about that mean), BIASED (1/N) variance, f32 accumulation, one
+// rounding on store. This deliberately does NOT follow llama.cpp's norm.comp:
+// that computes E[x^2]-E[x]^2 in one pass (norm.comp:37-38) and uses
+// `inversesqrt` (norm.comp:39); see vt_common.glsl § DELIBERATE DIVERGENCES.
+// Only the DISPATCH SHAPE — one workgroup per row, shared-memory halving tree
+// reduction — is llama.cpp's (`vulkan-shaders/norm.comp:9-35` @ 237ad9b96).
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Xb32 { uint v[]; } X32;
+layout(binding = 1) readonly buffer Xb16 { uint16_t v[]; } X16;
+layout(binding = 2) readonly buffer Wb32 { uint v[]; } W32;
+layout(binding = 3) readonly buffer Wb16 { uint16_t v[]; } W16;
+layout(binding = 4) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 5) readonly buffer Bb16 { uint16_t v[]; } B16;
+layout(binding = 6) buffer Db32 { uint v[]; } D32;
+layout(binding = 7) buffer Db16 { uint16_t v[]; } D16;
+
+layout(push_constant) uniform Params {
+  uint rows;
+  uint d;
+  uint x_dt;
+  uint w_dt;
+  uint b_dt;
+  uint out_dt;
+  uint has_w;
+  uint has_b;
+  uint x_off;
+  uint w_off;
+  uint b_off;
+  uint out_off;
+  float eps;
+} p;
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  uint base = row * p.d;
+
+  float psum = 0.0;
+  for (uint i = tid; i < p.d; i += VT_TG) {
+    psum += VT_LOAD(X32, X16, p.x_dt, p.x_off, base + i);
+  }
+  float mean = vt_tg_sum(tid, psum) / float(p.d);
+
+  float psq = 0.0;
+  for (uint i = tid; i < p.d; i += VT_TG) {
+    float dv = VT_LOAD(X32, X16, p.x_dt, p.x_off, base + i) - mean;
+    psq += dv * dv;
+  }
+  float rstd = 1.0 / sqrt(vt_tg_sum(tid, psq) / float(p.d) + p.eps);
+
+  for (uint i = tid; i < p.d; i += VT_TG) {
+    float v = (VT_LOAD(X32, X16, p.x_dt, p.x_off, base + i) - mean) * rstd;
+    if (p.has_w != 0u) { v *= VT_LOAD(W32, W16, p.w_dt, p.w_off, i); }
+    if (p.has_b != 0u) { v += VT_LOAD(B32, B16, p.b_dt, p.b_off, i); }
+    VT_STORE(D32, D16, p.out_dt, p.out_off, base + i, v);
+  }
+}

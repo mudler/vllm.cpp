@@ -1,0 +1,36 @@
+#version 450
+// vt::Add — flat elementwise, including the rank-1 nn.Linear bias row-broadcast.
+// Math ported 1:1 from src/vt/cpu/cpu_layernorm.cpp:87-99 AddKernel.
+// Dispatch shape (one invocation per element) from llama.cpp
+// `ggml/src/ggml-vulkan/vulkan-shaders/add.comp` @ 237ad9b96.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(binding = 2) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 3) readonly buffer Bb16 { uint16_t v[]; } B16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+
+layout(push_constant) uniform Params {
+  uint n;       // total elements
+  uint d;       // last-dim extent (for the rank-1 bias broadcast)
+  uint a_dt;
+  uint b_dt;
+  uint out_dt;
+  uint bcast;   // 1 => b is rank-1 [d] and is indexed by (i % d)
+  uint a_off;   // byte offsets of each operand within its whole-bound buffer
+  uint b_off;
+  uint out_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.n) { return; }
+  uint bi = p.bcast != 0u ? (gid % p.d) : gid;
+  float v = VT_LOAD(A32, A16, p.a_dt, p.a_off, gid) + VT_LOAD(B32, B16, p.b_dt, p.b_off, bi);
+  VT_STORE(D32, D16, p.out_dt, p.out_off, gid, v);
+}

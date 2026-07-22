@@ -39,6 +39,16 @@ set(VLLM_CPP_CUDA "AUTO" CACHE STRING "Build the CUDA backend: ON, OFF, or AUTO 
 # a macOS developer and is invisible everywhere else. Resolved to a plain ON/OFF
 # a few lines below the CUDA resolution.
 set(VLLM_CPP_METAL "AUTO" CACHE STRING "Build the Metal backend: ON, OFF, or AUTO (detect)")
+# Tri-state like the two above (BACKEND-VULKAN W0), but AUTO deliberately
+# resolves OFF rather than probing for a Vulkan loader. Rationale, recorded
+# because it is a DIFFERENT choice from Metal's AUTO: Metal AUTO-enables on an
+# Apple host because there is no other GPU backend there, so turning it on cannot
+# perturb anything. Vulkan OVERLAPS CUDA on the very box the CUDA gate models run
+# on (GB10 enumerates as a Vulkan device), and silently enabling a second GPU
+# backend in the gate build would register kVULKAN into the op/platform tables
+# and into tests/vt/test_backend_cross_device.cpp during the CUDA regressions it
+# must not touch. So Vulkan is opt-in: -DVLLM_CPP_VULKAN=ON.
+set(VLLM_CPP_VULKAN "AUTO" CACHE STRING "Build the Vulkan backend: ON, OFF, or AUTO (=OFF)")
 # Supported values today are the sm_12x (consumer/GB10 Blackwell) family:
 #   121a          GB10 / DGX Spark — the default and the only arch with a GATED
 #                 runtime here (every gate model, every benchmark).
@@ -112,6 +122,22 @@ elseif(VLLM_CPP_METAL)
 else()
   set(VLLM_CPP_METAL OFF)
 endif()
+# Resolve the tri-state VLLM_CPP_VULKAN (BACKEND-VULKAN W0). There is nothing to
+# DETECT at configure time: the backend needs no SDK, no shader compiler and no
+# link-time library — the Khronos headers are vendored (third_party/vulkan/), the
+# SPIR-V is committed (src/vt/vulkan/vulkan_spirv.h), and libvulkan.so.1 is
+# opened with dlopen at run time. Whether a Vulkan DEVICE exists is therefore a
+# RUNTIME question, answered by vt::vulkan::VulkanContext::Available(), which is
+# what decides whether kVULKAN registers. So ON always succeeds and AUTO means
+# OFF (see the option's comment for why AUTO does not probe).
+if(VLLM_CPP_VULKAN STREQUAL "AUTO")
+  set(VLLM_CPP_VULKAN OFF)
+elseif(VLLM_CPP_VULKAN)
+  set(VLLM_CPP_VULKAN ON)
+else()
+  set(VLLM_CPP_VULKAN OFF)
+endif()
+
 if(VLLM_CPP_METAL)
   enable_language(OBJCXX)
   set(CMAKE_OBJCXX_STANDARD 20)
@@ -397,6 +423,29 @@ if(VLLM_CPP_METAL)
     src/vt/metal/metal_backend.mm
     src/vt/metal/metal_ops.mm)
   target_link_libraries(vllm PUBLIC "-framework Metal" "-framework Foundation")
+endif()
+# --- Vulkan backend (BACKEND-VULKAN W0 skeleton) -----------------------------
+# Purely ADDITIVE, exactly like the Metal block above: a `target_sources` list, a
+# PUBLIC compile definition tests can gate on, and `${CMAKE_DL_LIBS}` for dlopen.
+# No existing source file, and no line of the CPU/CUDA/Metal build, is touched by
+# turning it on.
+#
+# NOTHING is needed at build time: the Khronos headers are vendored under
+# third_party/ (single-header-adjacent, Apache-2.0, see third_party/README.md),
+# the GLSL is compiled AHEAD OF TIME into the committed
+# src/vt/vulkan/vulkan_spirv.h (regenerate with scripts/gen-vulkan-spirv.py), and
+# libvulkan.so.1 is resolved with dlopen at run time rather than linked. That is
+# a deliberate divergence from llama.cpp, which requires `glslc` on every build
+# machine; neither of our boxes has one and neither grants sudo to install one.
+if(VLLM_CPP_VULKAN)
+  target_compile_definitions(vllm PUBLIC VLLM_CPP_VULKAN)
+  target_sources(vllm PRIVATE
+    src/vllm/platforms/vulkan.cpp
+    src/vt/vulkan/vulkan_loader.cpp
+    src/vt/vulkan/vulkan_context.cpp
+    src/vt/vulkan/vulkan_backend.cpp
+    src/vt/vulkan/vulkan_ops.cpp)
+  target_link_libraries(vllm PUBLIC ${CMAKE_DL_LIBS})
 endif()
 if(VLLM_CPP_CUDA)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_CUDA)

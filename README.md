@@ -191,10 +191,14 @@ Apple-GPU backend is built and checked in** (2026-07-22,
 compile at run time, and eight operations plus the fusion catalogue agree with our CPU
 results. **No model runs on it and no speed is claimed**; matrix multiply, attention and the
 KV cache are still missing. The same work fixed a real defect that had silently disabled
-**every** self-registering component on macOS, including the CPU backend. Vulkan is spiked
-against verified hardware and is the next parallel track; Intel XPU is spiked but
-hardware-blocked. From now on the Apple backend must also match or beat **MLX** on the same
-model — see Acceleration below. The audit's four
+**every** self-registering component on macOS, including the CPU backend. **The Vulkan track
+has now started too, to the same shape and standard**: eight operations plus the fusion
+catalogue run on the GB10 GPU and are checked against both our CPU and our own CUDA results
+in the same program, its GPU programs ship pre-compiled so no graphics toolchain is needed to
+build, and it also runs on a software GPU with no graphics hardware at all. Again **no model
+runs on it and no speed is claimed**, and it is off unless explicitly requested. Intel XPU is
+spiked but hardware-blocked. From now on the Apple backend must also match or beat **MLX** on
+the same model — see Acceleration below. The audit's four
 CUDA-arch seam-gaps are now CLOSED as mechanism (see Acceleration below,
 [spike](.agents/specs/cuda-arch-additivity.md)) — expansion is additive, but validation of any
 non-sm_121 target remains hardware-blocked.
@@ -275,7 +279,7 @@ next vehicle for this track.
 | Intel XPU | Intel GPUs | 🔬 **SPIKED ONLY — and HW-BLOCKED** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). No Intel GPU exists on any machine here, and vLLM has no in-tree SYCL kernel source to copy (its XPU kernels ship as a separate package), so there is nothing to port loyally either. Only the backend-selection policy, compile coverage, and running SYCL kernels on a CPU device for unit checks remain possible. No end-to-end or speed gate is proposed, because none can be run |
 | ROCm / ANE | AMD GPUs / Apple Neural Engine | 🗓 Post-parity roadmap; not spiked |
 | Metal | Apple Silicon | 🟡 **SKELETON BUILT AND CHECKED — but no model runs on it yet, so this is NOT usable support** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). What exists: the Mac GPU is opened, memory is allocated on it, GPU programs are compiled at run time (no extra tooling needed, verified on-device), and eight small operations plus the whole fusion catalogue run there and agree with our CPU results to within the required tolerance — worst case eleven orders of magnitude better than the bar, with byte-for-byte agreement on the pure copy and number-format conversion paths. What does NOT exist: matrix multiply, attention, the KV cache, quantization and sampling are all absent, so **no model can run**, and no speed number is measured or claimed. One real defect was found and fixed along the way: on macOS the build silently discarded every self-registering component, so even the **CPU backend** failed to appear — that fix makes macOS a usable CPU target too. Cannot hold the 27B/35B gate models (16 GB), so no Apple result may ever be extrapolated to them. **MLX is now the named speed floor** for this backend: when a model does run here it must match or beat MLX on the same model and workload |
-| Vulkan | Portable GPU | 🔬 **SPIKED ONLY — no implementation, hardware verified** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). The GB10 box already exposes a working Vulkan device with both matrix-acceleration extensions the fast paths need, and the dev box exposes a software device so tests can run with no GPU at all. This is the one backend we can check against our own CUDA results on the same machine with the same weights |
+| Vulkan | Portable GPU | 🟡 **SKELETON BUILT AND CHECKED — but no model runs on it yet, so this is NOT usable support** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). What exists: the GPU is opened, memory is allocated on it, eight small operations plus the whole fusion catalogue run there, and their results are compared against **both** our CPU results **and our own CUDA results on the very same machine** — the strongest cross-check available anywhere in this project, and one the Apple backend cannot have. Agreement is far inside the required tolerance, with byte-for-byte agreement on the pure copy and number-format conversion paths. The GPU programs are compiled ahead of time and shipped with the source, so building needs no graphics toolchain at all. It also runs on a software GPU on the dev box, which means these checks can run with **no GPU hardware present**. What does NOT exist: matrix multiply, attention, the KV cache, quantization and sampling are all absent, so **no model can run**, and no speed number is measured or claimed. Turned off by default — it must be asked for explicitly, so that the NVIDIA gate builds are untouched. When a model does run here, llama.cpp's own Vulkan backend is the speed floor |
 
 Only GB10/sm_121a counts as CUDA hardware support today. Source-level fallback
 paths do not become support claims until their build, correctness, trace, and
@@ -284,11 +288,12 @@ performance gates pass. sm_120a is the one architecture that has moved past
 weaker and different claim than hardware support, and it stays that way until
 someone runs the gates on an actual card.
 
-**Non-NVIDIA backends — Metal now has a checked skeleton; Vulkan and Intel XPU remain spiked only (2026-07-22,
-[spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)).** The Apple backend
-has moved from plan to code: it is built, it runs, and its results are checked
-against our own CPU results. It is **not** usable support, and the section below
-is explicit about what is missing.
+**Non-NVIDIA backends — Metal and Vulkan now both have checked skeletons; Intel XPU remains spiked only (2026-07-22,
+[spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)).** Both backends have
+moved from plan to code: they are built, they run, and their results are checked
+against our own CPU results — and, for Vulkan, against our own CUDA results on
+the same machine. Neither is **usable support**, and the section below is
+explicit about what is missing.
 
 The encouraging finding is how little of this project is actually
 NVIDIA-specific. The engine — scheduling, memory management, batching, the
@@ -335,12 +340,18 @@ never had — **all seven were fixed rather than silenced**, including a genuine
 latent bug on every platform: a base class was being deleted through a pointer
 without a virtual destructor, so the derived class's cleanup never ran.
 
-Vulkan was checked the same way: the GB10 machine already exposes a full Vulkan
-device including both matrix-acceleration extensions the fast paths depend on,
-and the development box exposes a software implementation, so tests can run
-without a GPU. Intel is the honest disappointment — there is no Intel GPU here,
-and vLLM keeps its Intel kernels in a separate package, so there is neither
-hardware to test on nor source to copy from.
+Vulkan now has a skeleton too, built to the same shape and to the same standard.
+Its one structural difference from Apple is worth stating: the GPU programs are
+compiled to their portable binary form **ahead of time and checked in with the
+source**, because none of our machines has a shader compiler installed and none
+of them lets us install one. That turned out better than the alternative — the
+build now needs no graphics toolchain whatsoever, on any machine, including
+continuous integration. The development box also has a software GPU, so the
+whole check can run with no graphics hardware at all, which we verified. Vulkan
+is off unless explicitly requested, so the NVIDIA gate builds are byte-for-byte
+unaffected. Intel is the honest disappointment — there is no Intel GPU here, and
+vLLM keeps its Intel kernels in a separate package, so there is neither hardware
+to test on nor source to copy from.
 
 **How correctness will be judged matters here**, because vLLM — our usual
 reference — does not run on Apple at all and has no Vulkan support anywhere. So
@@ -350,8 +361,9 @@ Metal against our own CPU results on the Mac. Exact agreement is required where
 the operation is a plain data copy, but not for arithmetic that sums numbers in
 a different order on a GPU — there the existing numerical-accuracy threshold
 applies. Intel gets no end-to-end gate at all, because none is runnable. That
-standard is no longer hypothetical for Apple: it is what the skeleton above was
-measured against.
+standard is no longer hypothetical for either: it is what both skeletons above
+were measured against, and on the GB10 machine the Vulkan and CUDA results are
+produced by the same program in the same run.
 
 **Speed on Apple will be judged against MLX** (Apple's own array framework),
 decided 2026-07-22. Whenever a model does run on the Apple backend, it must match
@@ -522,8 +534,10 @@ unchanged. Honest scope: this is an **extensibility +
 mechanical-upstream-sync + backend-additivity** cornerstone, not a perf lever — W0–W4 are
 perf-neutral by construction (the measured 35B prefill gap is compute-bound, ceiling
 ~3.5%/step). Named future/HW-blocked work (does not gate the ORDER-1 milestone): the Tier-1
-single-pass perf interpreter for the quant chains (composite-only today), and a real
-Metal/Vulkan realization of the catalog (needs the M4 dev-box).
+single-pass perf interpreter for the quant chains (composite-only today). The **Metal and
+Vulkan realizations of the catalog are no longer future work** — both skeletons register a
+single-pass `kFusedChain` interpreter and inherit the whole catalog, and both realization
+tiers are checked against the CPU results (2026-07-22).
 Spike + work breakdown (W0–Wn):
 [`.agents/specs/portable-fusion-framework.md`](.agents/specs/portable-fusion-framework.md).
 Build hygiene alongside W1: a pre-existing CPU-only `-Werror=unused-function`

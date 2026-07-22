@@ -1,15 +1,17 @@
 # Non-CUDA backend fan-out — Metal/MLX, Vulkan, Intel XPU
 
 Status: **W0 LANDED 2026-07-22** (shared seam repair + the Metal skeleton — see
-§ Work breakdown "W0 landed"). Vulkan and XPU remain **SPIKE ONLY**.
+§ Work breakdown "W0 landed") and **V1 LANDED 2026-07-22** (the Vulkan skeleton —
+see § Work breakdown "V1 landed"). XPU remains **SPIKE ONLY**.
 Owner: `CLAIM-BACKEND-FANOUT-1`.
-Rows: **`BACKEND-METAL-MLX`** (`SPIKE` -> `ACTIVE`), **`BACKEND-VULKAN`**,
-**`BACKEND-XPU`** (both stay `SPIKE`).
+Rows: **`BACKEND-METAL-MLX`** and **`BACKEND-VULKAN`** (both `SPIKE` -> `ACTIVE`),
+**`BACKEND-XPU`** (stays `SPIKE`).
 
 **`ACTIVE` here means a gated SKELETON, not a supported backend.** No model runs
-on Metal: GEMM, attention, KV cache, quant and sampling are all unregistered. Do
-not read the state as capability — read § Work breakdown "W0 landed" -> "still
-stubbed" for the exact surface, which `tests/vt/test_metal_backend.cpp` asserts.
+on Metal OR on Vulkan: GEMM, attention, KV cache, quant and sampling are
+unregistered on both. Do not read the state as capability — read § Work breakdown
+"W0 landed" / "V1 landed" -> "still stubbed" for the exact surface, which
+`tests/vt/test_metal_backend.cpp` and `tests/vt/test_vulkan_backend.cpp` assert.
 
 **MLX is the named COMPETITOR FLOOR for Metal** (user directive 2026-07-22) while
 remaining DEMOTED as an implementation path — see § Gates for why those are not
@@ -432,8 +434,8 @@ immediately.
 | **M3** | Metal GEMM + paged attention (`kMatmul`, `kMatmulBT`, `kPagedAttention`, `kReshapeAndCache`) | `BACKEND-METAL-MLX` | M2 | first small model (OPT or Qwen3-dense) token-exact vs our CPU reference |
 | **M4** | Metal GGUF k-quant shaders (reusing the W0-lifted traits) | `BACKEND-METAL-MLX`, `QUANT-GGUF-CIQ-GEMM` | M3, G4 | NMSE <= 5e-4 vs the f64 oracle |
 | **M5** | MLX (E1) evaluation as an ALTERNATIVE kernel source, measured against M2/M3 | `BACKEND-METAL-MLX` | M3 | a decision record, not necessarily an adoption |
-| **V1** | Vulkan device/queue/buffer bring-up + `vt::Backend` + `Platform`; shader build plumbing (`vulkan-shaders-gen` equivalent) | `BACKEND-VULKAN` | W0 | `test_backend` passes for `kVULKAN` on **both** llvmpipe (dev box) and GB10 |
-| **V2** | Vulkan op tier 1 (elementwise/norm/rope/activation `.comp` shaders) + `kFusedChain` | `BACKEND-VULKAN` | V1 | op parity **vs our own CUDA backend on the same GB10 box** |
+| **V1** | Vulkan device/queue/buffer bring-up + `vt::Backend` + `Platform`; shader build plumbing (`vulkan-shaders-gen` equivalent) | `BACKEND-VULKAN` | W0 | **LANDED 2026-07-22** — see § V1 landed below |
+| **V2** | Vulkan op tier 1 (elementwise/norm/rope/activation `.comp` shaders) + `kFusedChain` | `BACKEND-VULKAN` | V1 | **PARTIAL** — V1 landed 8 of them (`kAdd`, `kRelu`, `kSiluAndMul`, `kCastBf16`, `kCastF32`, `kLayerNorm`, `kRmsNorm`, `kFusedChain`) with the fusion catalog inherited and op parity MEASURED against both the CPU oracle and our own CUDA backend on GB10; the remaining ~12 (rope/gated/l2norm/moe-glue) are V2's residue |
 | **V3** | Vulkan GEMM: scalar `mul_mm` first, then the `coopmat`/`coopmat2` tactic via the W0-generalized arch-tactic registry | `BACKEND-VULKAN` | V2 | measured coopmat selection, with the `launch()->false` portable fallback proven |
 | **V4** | Vulkan paged attention (port `flash_attn.comp` family) | `BACKEND-VULKAN` | V3 | small model token-exact vs our CUDA backend |
 | **X1** | XPU `Platform` + attention-selector policy port (`xpu.py:121-167`) — **DATA ONLY, no kernels** | `BACKEND-XPU` | W0 | selector unit tests pass with **no Intel hardware** |
@@ -566,6 +568,155 @@ it returns 0 and the RSS assertions cannot hold). Both are recorded as debt, NOT
 fixed here — they are portability of the benchmark/RSS tooling, orthogonal to W0.
 `test_capi`/`test_openai_conformance` flaked under ctest parallelism on both
 Linux and macOS and pass on rerun. **dgx:** see the ledger row.
+
+#### V1 landed — 2026-07-22 (`CLAIM-BACKEND-FANOUT-1`)
+
+**Delivered.** The Vulkan `vt::Backend`/`Platform` SKELETON with runtime SPIR-V
+compute, gated on GB10 AND on the dev box's `llvmpipe`. `BACKEND-VULKAN` moves
+`SPIKE` -> `ACTIVE`; it is emphatically **NOT** a supported backend (no model
+runs on it — see "still stubbed"). Everything is ADDITIVE: **no existing source
+file was changed to enable it**, and the tri-state `VLLM_CPP_VULKAN` resolves
+**OFF** under `AUTO`, so the CUDA gate builds are untouched by construction.
+
+*Shader-compilation route — DETERMINED AND RECORDED, and it is NOT llama.cpp's.*
+llama.cpp runs a host tool (`vulkan-shaders-gen`) that shells out to `glslc` AT
+BUILD TIME (`ggml/src/ggml-vulkan/CMakeLists.txt:21-31,141-188`). **We cannot**:
+neither box has `glslc`, `glslangValidator` or `libshaderc`, neither has the
+Vulkan dev package, and neither grants sudo (`sudo -n true` -> "a password is
+required" on both, measured 2026-07-22). Runtime GLSL compilation would require
+linking libshaderc, a COMPILED third-party dependency that
+[discipline.md](../discipline.md) forbids. So the route is **GLSL compiled
+AHEAD OF TIME and the SPIR-V COMMITTED** as a generated header
+(`src/vt/vulkan/vulkan_spirv.h`, 7 modules / 109,436 bytes), regenerated by
+`scripts/gen-vulkan-spirv.py` — the vllm.cpp equivalent of `vulkan-shaders-gen`,
+but run by hand instead of by the build. **The build therefore needs NO shader
+toolchain on any machine, which is strictly better than llama.cpp's arrangement
+for CI.** The generator was run with **glslang 16.4.0** (a current release
+fetched for the purpose), which also side-steps § Risks/decisions 4: Ubuntu's
+shaderc 2023.8 never touches our SPIR-V. `--check` re-derives the header and
+fails if it is stale.
+
+| File | What |
+|---|---|
+| `src/vt/vulkan/shaders/*.comp` + `vt_common.glsl` | 7 compute shaders. PER-ELEMENT MATH ported 1:1 from OUR CPU kernels (cited per kernel); DISPATCH SHAPE from llama.cpp `vulkan-shaders/rms_norm.comp:37-83` and `norm.comp:9-35` |
+| `scripts/gen-vulkan-spirv.py` -> `src/vt/vulkan/vulkan_spirv.h` | the AOT shader build (see above) |
+| `src/vt/vulkan/vulkan_loader.{h,cpp}` | `dlopen("libvulkan.so.1")` + X-macro entry-point resolution. Mirrors llama.cpp's dynamic dispatcher (`ggml_vk_instance_init`), but chosen here because there is no `libvulkan.so` link name to link against, and because it keeps the library loadable on a box with no Vulkan at all |
+| `src/vt/vulkan/vulkan_context.{h,cpp}` | instance/physical-device/device/queue singleton (llama.cpp `ggml_vk_instance_init`/`ggml_vk_device_init`), memory-type selection with ordered fallback (`ggml_vk_find_memory_properties`, ggml-vulkan.cpp:2957; `ggml_vk_create_buffer`, :2971-3100), name->pipeline cache (`ggml_vk_create_pipeline_func`, :2460-2560), push-constant dispatch (`ggml_vk_dispatch_pipeline`, :7507-7530) |
+| `src/vt/vulkan/vulkan_buffers.h` + registry in `vulkan_backend.cpp` | interior-pointer -> (VkBuffer, byte offset) resolution — llama.cpp's `ggml_vk_host_get` (:7416) / `ggml_vk_tensor_subbuffer` (:7431) problem, which Vulkan has identically to Metal |
+| `src/vt/vulkan/vulkan_backend.cpp` | the 6 pure `vt::Backend` virtuals + registrar |
+| `src/vt/vulkan/vulkan_ops.cpp` | descriptor binding + dispatch + `RegisterOp` for 8 ops |
+| `src/vllm/platforms/vulkan.cpp` | the 5 pure `Platform` virtuals + registrar. Plain C++: everything Vulkan-specific goes through the `vt::Backend` virtuals |
+| `third_party/vulkan/` | the Khronos headers at `vulkan-sdk-1.4.328.1` (matching dgx's loader), compiled with `VK_NO_PROTOTYPES` — TYPES ONLY, nothing linked. Hand-declaring the subset was rejected: one wrong struct field is silent memory corruption, not a compile error |
+
+*Ops registered (the SAME EIGHT as the Metal skeleton, deliberately, so the two
+are directly comparable through one harness):* `kAdd` (incl. the rank-1 bias
+broadcast), `kRelu`, `kSiluAndMul`, `kCastBf16`, `kCastF32`, `kLayerNorm`,
+`kRmsNorm` (incl. the in-place residual stream), and **one `kFusedChain`** — the
+Tier-1 interpreter, so the backend inherits the whole portable fusion catalog.
+
+*Still stubbed — NO MODEL RUNS ON VULKAN.* `kMatmul`/`kMatmulBT`,
+`kPagedAttention`, `kReshapeAndCache`, `kEmbedding`, the entire quant tier and
+all sampler ops are UNREGISTERED (`vt::GetOp` throws), asserted as an executable
+fact in `tests/vt/test_vulkan_backend.cpp`. `SupportsGraphCapture()` is FALSE (a
+pre-recorded `VkCommandBuffer` is the eventual mapping). Dispatch is SYNCHRONOUS
+and mutex-serialized (one command buffer + one descriptor set per pipeline,
+re-recorded, submit + fence wait) — correct, not fast. There is no staging path
+for non-host-visible memory, so a discrete GPU would work but slowly.
+`VulkanPlatform::get_attn_backend_priority()` returns EMPTY deliberately.
+
+*Three design points that differ from llama.cpp, each for a stated reason.*
+1. **Whole-buffer binding.** `ggml_vk_tensor_subbuffer` puts the offset in the
+   DESCRIPTOR and must therefore assert `minStorageBufferOffsetAlignment`
+   (:7448-7451), rejecting misaligned views. We bind every buffer WHOLE and pass
+   the byte offset in push constants, so no interior tensor pointer is ever
+   rejected for alignment. `test_vulkan_backend` gates a 32-byte interior offset
+   precisely because that is below a typical 256-byte alignment.
+2. **Two descriptor bindings per operand** (a `uint[]` view and a `uint16_t[]`
+   view onto the same buffer, needing `VK_KHR_16bit_storage`). A single 32-bit
+   view would force a read-modify-write for 16-bit stores, and two threads
+   writing the two halves of one word would RACE and silently lose data. This is
+   a hazard the Metal port did not have (MSL has native `device ushort*`).
+3. **`1.0 / sqrt(x)`, not `inversesqrt`.** llama.cpp uses `inversesqrt` in both
+   norm shaders (`rms_norm.comp:86`, `norm.comp:39`); GLSL permits ~2 ULP there
+   and drivers lower it to the hardware reciprocal-sqrt approximation. This is
+   the Vulkan analogue of the Metal skeleton's `MTLMathModeSafe` pin — see below.
+
+*Relaxed-precision knobs, pinned or probed.* Metal's default fast-math would have
+voided its CPU comparison; Vulkan's equivalents were found and handled:
+(a) `inversesqrt` — avoided in the SHADER, so no driver flag can undo it;
+(b) `RelaxedPrecision` — never emitted (no `mediump`/`lowp`), and glslang applies
+no fast-math of its own, so the COMMITTED SPIR-V is IEEE-as-written by
+construction; (c) fp32 **float controls** (denormal flush-to-zero, signed-zero /
+Inf / NaN preservation) are implementation-defined and cannot be pinned from GLSL
+without `SPV_KHR_float_controls` execution modes — so they are PROBED, recorded
+on the context, and PRINTED by the unit gate rather than assumed. Measured:
+llvmpipe reports `shaderDenormPreserveFloat32=false`,
+`shaderSignedZeroInfNanPreserveFloat32=true`. Neither can move a gated result
+here: the bf16/f16 codecs are INTEGER arithmetic (transcribed from
+`src/vt/dtype.cpp` rather than using `packHalf2x16`), which is why the bit-exact
+tier holds regardless.
+
+*Hazards from the Metal W0, both addressed deliberately rather than
+rediscovered.* (1) The `vt_tg_sum` LEADING BARRIER is present and documented in
+`vt_common.glsl` — `vt_layer_norm` calls the reduction twice and
+`vt_fused_chain` once per `kRmsNorm` step, so without it a thread racing ahead
+would overwrite `smem[0]` while a slower thread still read the previous result.
+Every `barrier()` sits in dynamically-uniform control flow, which Vulkan
+requires. (2) The REGISTRAR LINKING was verified rather than assumed:
+`test_vulkan_backend` asserts `GetBackend(kVULKAN)` and
+`GetPlatform(kVULKAN)` actually resolve and that the 8 ops are registered, and
+`test_backend`/`test_platform` on GB10 (7/7 and 7/7) confirm the Vulkan build
+does not disturb the existing registrar set.
+
+*Gate results.* **Dev box (llvmpipe, `Vulkan 1.4`, `mesa-vulkan-drivers`):** clean
+`-Werror` 0 warnings; `test_vulkan_backend` **8/8 (82/82)**;
+`test_backend_cross_device` **5/5 (73/73)**; full CPU+Vulkan ctest **GREEN** — so
+**a GPU-FREE CI PATH WORKS and is recorded as such.** **GB10:** clean CUDA
+`-Werror` 0 warnings on BOTH the production (Vulkan-OFF) and the Vulkan-ON
+builds; `test_vulkan_backend` **8/8 (82/82)**; `test_backend_cross_device`
+**5/5 (144/144)** — twice the dev-box assertion count because the SAME BINARY
+compares the CPU oracle against **both CUDA and Vulkan**, which is the
+cross-backend gate this spike promised and the strongest one in the project.
+
+*Op NMSE on GB10, CPU oracle, BOTH device backends measured in the SAME BINARY*
+(`NVIDIA GB10`, Vulkan API 1.4; widths {128, 100, 17} = power-of-two, ragged,
+sub-subgroup). The CUDA column is the point of the exercise — it is the parity
+band a real, production backend sits in on this box, and Vulkan lands inside it:
+
+| Op | CUDA vs CPU | **VULKAN vs CPU** | Bar |
+|---|---|---|---|
+| `kAdd`, `kAdd` (bias broadcast), `kRelu` | **0** (exact) | **0** (exact) | 5e-4 |
+| `kSiluAndMul` | 4.17e-16 | 3.23e-15 | 5e-4 |
+| `kRmsNorm` (128 / 100 / 17) | 2.37e-14 / 1.61e-14 / 2.59e-15 | 2.92e-14 / 1.23e-14 / 3.77e-15 | 5e-4 |
+| `kRmsNorm` + residual, output | 0 / 8.73e-15 / 1.34e-15 | 5.20e-15 / 6.21e-15 / 7.55e-15 | 5e-4 |
+| `kRmsNorm` residual stream (written operand) | **0** (exact) | **0** (exact) | 5e-4 |
+| `kLayerNorm` (128 / 100 / 17) | 8.82e-15 / 7.48e-15 / 3.64e-15 | 8.31e-15 / 8.02e-15 / 1.75e-15 | 5e-4 |
+| `kFusedChain` (`kFusedAddRmsNorm`, Tier-0 AND Tier-1), output | 1.08e-14 | 1.05e-14 | 5e-4 |
+| `kFusedChain` residual | **0** (exact) | **0** (exact) | 5e-4 |
+| `Copy`/`Memset`; bf16<->f32 codec incl. +-inf/+-0 and all 16 ties | bit-exact | bit-exact (`memcmp`) | bit-exact |
+
+**Worst-case Vulkan 2.92e-14 against the 5e-4 bar — ten orders of magnitude
+inside it, and within a factor of 1.3 of CUDA's own worst case on the same box.**
+No bit-exactness is claimed for the reducing ops. It IS claimed, and MEASURED by
+`memcmp`, for the pure byte and codec paths — with the harness's PRE-EXISTING
+NaN-payload carve-out (added for CUDA's `__float2bfloat16` 0x7FFF) applying to
+every device, so that one bit was not separately measured for Vulkan; our GLSL
+codec is a literal transcription of `vt::F32ToBF16` including its NaN branch, so
+0x7FC0 is expected there, and the quiet-NaN-ness IS asserted.
+
+*One relaxed-precision knob deliberately NOT pinned, recorded rather than
+hidden.* GLSL/SPIR-V permit `a*b+c` to be CONTRACTED into an FMA unless the
+`NoContraction` decoration is applied, and we do not apply it. The evidence that
+this actually happens is right here: the same committed SPIR-V gives
+`kRmsNorm`@128 = 2.37e-14 on llvmpipe and 2.92e-14 on GB10 — bitwise-identical
+inputs, identical reduction order, different result, i.e. the NVIDIA compiler
+contracted where llvmpipe did not. This is the ONE place a Vulkan result is not
+reproducible across implementations. It is left as-is on purpose: it is inside
+the NMSE bar by ten orders of magnitude, our CUDA kernels contract too, and
+decorating every multiply-add would cost real performance for a backend whose
+whole point is eventually to be fast. If a future work row ever needs
+cross-implementation bit-reproducibility, `NoContraction` is the lever, and this
+paragraph is where to start.
 
 ---
 

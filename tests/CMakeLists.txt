@@ -193,6 +193,14 @@ vllm_cpp_add_test(test_backend_cross_device vt/test_backend_cross_device.cpp)
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)
 endif()
+if(VLLM_CPP_VULKAN)
+  vllm_cpp_add_test(test_vulkan_backend vt/test_vulkan_backend.cpp)
+  # Reaches the backend-internal vulkan_context.h / vulkan_spirv.h (both under
+  # src/, both plain C++ with no Vulkan headers in their interface) to gate the
+  # COMMITTED SPIR-V table and the probed float-controls. Same escape hatch
+  # test_model_registry already uses above.
+  target_include_directories(test_vulkan_backend PRIVATE ${CMAKE_SOURCE_DIR}/src)
+endif()
 vllm_cpp_add_test(test_tensor vt/test_tensor.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)

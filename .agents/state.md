@@ -18166,3 +18166,123 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.localai.worker.plist 
 # re-read the MLX sources the study cites: clone ml-explore/mlx, then check out
 # tag v0.29.3 (commit 4bce5f9b2dc4743b9e0bdf101a0d593053f4f099)
 ```
+## 2026-07-22 — Prompt / prefix caching: full vLLM parity surface established (SPIKE ONLY)
+
+**Claim `CLAIM-PREFIX-PROMPT-CACHING`; worktree `agent-af1befeda4d311f2c`; base
+`1cb5f64`. No code, no build, no GPU, nothing downloaded, no benchmark.**
+
+Driver: the user asked whether we support prompt caching "like llama.cpp does",
+what vLLM has, and whether it is in roadmap_v1 — then set the bar explicitly:
+**"same featureset of vLLM and better."** roadmap_v1 mentioned prefix caching
+essentially once, which is thin for a shipped, default-ON feature. New umbrella
+spike `.agents/specs/prefix-prompt-caching-parity.md` enumerates the complete
+pinned-vLLM caching surface (38 features, `file:line` both sides) with a
+per-feature DONE / PARTIAL / MISSING verdict read out of OUR source.
+
+**Answer to the user, in one line:** yes, we have prefix caching, it is ON by
+default for dense models exactly as upstream, and it is DEEPER than our own
+record claimed — but it has never been gated end to end, and it cannot currently
+be benchmarked correctly.
+
+**What is actually ported** (verified by reading source, not the matrix):
+parent-chained block hashing with the incremental request hasher; the block pool
+— free list, refcounts, group-aware hash map, LRU eviction, reset with the
+null-block invariant, usage; all three coordinators; the ENTIRE hybrid
+cross-group intersection (iterate-to-fixed-point, full-attention memoized fast
+path, EAGLE extra-block/drop bookkeeping, truncation,
+`num_uncached_common_prefix_tokens`); four single-type managers; and
+prefix-cache-aware scheduling with chunked prefill, preemption reuse and the
+"recompute at least one token" rule.
+
+**The real gaps, which differ from what the matrix implied.**
+1. `generate_block_hash_extra_keys` is a **hardcoded no-op**
+   (`src/vllm/v1/core/kv_cache_utils.cpp:323-329`) — multimodal hashes, LoRA and
+   `cache_salt` never enter a block hash. This is a LATENT CORRECTNESS TRAP, not
+   a feature gap: it is inert today only because we have no mm path, no LoRA and
+   no `cache_salt` field, and it becomes a wrong-output bug the moment any of the
+   three lands. It must precede multimodal/LoRA work.
+2. **No prefix-cache statistics at any level** — `PrefixCacheStats` unported, the
+   record call is a comment at `kv_cache_manager.cpp:139`, and there is no
+   `/metrics` endpoint at all. This is a HARD BLOCKER on
+   `BACKEND-GATE-CUDA-SGLANG-PREFIX`, which must prove cache hits in every arm.
+3. KV events inert; `cache_salt` absent; only 1 of upstream's 4 hash algos
+   (`sha256_cbor`, and note upstream's DEFAULT is `sha256`, so our block keys
+   differ from a stock vLLM — relevant to any future LMCache interop claim);
+   `skip_reading_prefix_cache` absent; `reset_prefix_cache` implemented at both
+   pool and manager level but UNREACHABLE (no CLI, no route, no RPC).
+
+**Three record corrections — two in our favour, one against.**
+- `KV-BLOCK-POOL` `ANCHOR-BACKFILL` -> `PARTIAL`: this spike closes its spike
+  gap, and its stated scope undersold the port (13 tests, group-aware hashing,
+  the free-ordering that is what actually makes eviction LRU).
+- `KV-HYBRID-COORD` stays `PARTIAL`, but its residue is re-stated as a narrow
+  assert-guarded set rather than missing breadth.
+- `KV-MAMBA-ALIGN` was `INVENTORIED` with no code anchor and that was **wrong
+  against us**: the align allocator is already substantially ported. Missing is
+  precisely (a) no config path selects `align` (`MambaSpec` defaults `"none"`),
+  (b) no runner-side recurrent state copy, (c) no align-mode test.
+
+**Two dispositions that REMOVE planned work.**
+- `ENG-CASCADE-ATTN` is **not owed**, on three independent grounds:
+  `disable_cascade_attn` defaults True; a recursive grep for `cascade` over the
+  MRV2 tree `vllm/v1/worker/gpu/` returns ZERO hits (it lives only on the legacy
+  V1 runner, and we port MRV2); and FlashAttention is the sole implementing
+  backend while Blackwell resolves FlashInfer first, making it unreachable on
+  GB10. Not scheduled.
+- Upstream `cache_partial_block` is **dead code** (`block_pool.py:358-457`, no
+  caller in `vllm/`). We port the primitive plus its ten tests and wire NOTHING —
+  giving it a call site would diverge from vLLM while appearing to mirror it.
+
+**Stale blocker cleared.** `prefix-caching.md`:112 parks model-positive APC as
+"blocked on a supported non-hybrid model family". False since Qwen3-dense,
+Qwen3-32B-NVFP4A16, Qwen3-Coder-30B, OPT and DeepSeek-V2-Lite landed — and dense
+models default APC **ON** (`model_loader.cpp:137`). A cache-ON gate is runnable
+today and has simply never been run.
+
+**llama.cpp (`237ad9b96`, note: this checkout is the mudler FORK — one
+prefix-sharing path in it is a local patch, not upstream).** Its prompt caching
+is session/slot state serialization: `--prompt-cache` is CLI-only and
+whole-context with strict linear prefix reuse; the server's
+`/slots/{id}?action=save|restore` writes `GGSQ` v2 per-sequence files (~8.2
+KB/token, 49.9 ms save / 42.9 ms restore for 1745 tokens). It is strictly weaker
+than APC on every reuse axis — whole-prefix-of-one-sequence granularity, entries
+MOVED not shared, no refcount dedup, no cross-request fan-out — and vLLM already
+covers disk persistence at finer granularity via the `kv_offload` `fs` tier.
+**Exactly one genuine capability exists in llama.cpp and not in vLLM:** an
+imperative, caller-addressable NAMED per-sequence save/restore. That is the only
+true beyond-parity target, and it is sequenced LAST precisely because it has no
+upstream oracle to mirror.
+
+**Ranked W-plan** (hardware in brackets). W1 prefix-cache statistics [CPU] —
+first because it unblocks a binding gate. W2 block-hash extra keys +
+`cache_salt` [CPU] — the latent correctness trap. W3 first-ever cache-ON model
+gate on a dense model [DGX]. W4 KV events [CPU]. W5 partial-block primitives,
+unwired [CPU]. W6 Mamba `align` completion [DGX] — what
+`BACKEND-GATE-CUDA-SGLANG-PREFIX` needs. W7 reset reachability + hash-algo CLI
+[CPU]. W8 beyond-parity: native xxhash then named session save/restore [DGX].
+W9 eviction-policy study [DGX].
+
+**Beyond-vLLM axes, each with a measurement plan and an honest prior.** B1 native
+fast hashing with no optional dependency (vLLM's xxhash needs an optional Python
+package) — **closed as NEUTRAL unless hashing is measured above ~1% of prefill**,
+because a faster hash of a negligible cost is not a win. B2 deterministic
+cross-process block hashes: vLLM seeds `NONE_HASH` with `os.urandom(32)` unless
+`PYTHONHASHSEED` is set, so its own docs require an env var or cross-process
+sharing silently yields zero hits; ours is deterministic by construction —
+measured as a cross-process hit-rate, not a throughput claim. B3 the named
+save/restore above. B4 smarter-than-LRU eviction — a measured STUDY, not a plan;
+eviction is semantically transparent (it can only lose a hit, never change a
+token), so it is a safe pure-perf lever. B5 cache-on hybrid where vLLM defaults
+off — constrained by the standing rule that a cache-ON arm may never be scored
+against a cache-OFF vLLM denominator.
+
+**Resume commands.**
+```sh
+# nothing was built or run; the spike is records-only
+python3 scripts/check-agent-record.py
+python3 scripts/check-doc-checkpoint.py
+# W1 starts here (CPU only, no GPU needed):
+#   src/vllm/v1/core/kv_cache_manager.cpp:139  <- the deferred stats record call
+#   upstream vllm/v1/metrics/stats.py:115      <- PrefixCacheStats to port
+```
+

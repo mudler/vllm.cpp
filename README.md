@@ -615,8 +615,32 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
   implement that format.
 - `/health` currently reports process liveness rather than a full engine-health
   probe.
-- Prefix caching is configurable and mirrors the supported default policy, but
-  the binding SGLang/vLLM shared-prefix competitor gate is still pending.
+- **Prompt / prefix caching (automatic prefix caching, APC) is implemented and
+  is ON by default for ordinary dense models**, mirroring vLLM's own per-model
+  default (hybrid/GDN and attention-free models default OFF, exactly as
+  upstream). Block chain-hashing, the block pool with refcounts and LRU
+  eviction, all three cache-hit coordinators and the hybrid cross-group
+  intersection are ported and unit-tested. A full parity audit against pinned
+  vLLM landed 2026-07-22
+  ([spike](.agents/specs/prefix-prompt-caching-parity.md)) and the honest
+  remaining gaps are: **no cache hit-rate statistics or metrics of any kind**;
+  block-hash extra keys (multimodal / LoRA / `cache_salt`) are stubbed, so
+  `cache_salt` is unsupported and this must be completed before any multimodal
+  or LoRA support lands; KV-cache events are inert; only one of vLLM's four
+  hash algorithms is shipped; and `reset_prefix_cache` exists in the engine but
+  is not reachable from the API. **No end-to-end gate has yet been run with
+  caching ON**, so APC currently has unit-test evidence only and no measured
+  speed or correctness result — treat it as functional but ungated. The binding
+  SGLang/vLLM shared-prefix competitor gate remains pending and is blocked on
+  the missing hit-rate counters.
+- Cascade attention (vLLM's shared-prefix batch attention) is **not
+  implemented, and after audit is not planned**: upstream disables it by
+  default, it exists only on the legacy V1 runner rather than the V2 runner we
+  mirror, and on Blackwell the attention backend that implements it is never
+  selected.
+- llama.cpp-style **persistent prompt caching to disk (slot save/restore) is not
+  supported**, by either us or vLLM, and is tracked as a possible
+  beyond-parity feature rather than a parity gap.
 - External KV-cache connectors, including LMCache interoperability, are
   roadmap-only and are not implemented or benchmarked yet.
 - Speculative decoding is not user-visible yet. MTP foundations exist, while

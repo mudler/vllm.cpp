@@ -18481,3 +18481,274 @@ the connector plugin mechanism: vLLM's dynamic Python module-path import has no
 C++ equivalent worth having and is replaced by compile-time registration, a
 recorded deviation. Do not schedule layerwise `save_kv_layer` — it forces
 PIECEWISE cudagraphs and would forfeit our measured decode-graph win.
+## 2026-07-22 — the `vt::OpProvider` acceleration-provider SEAM + the MLX GEMM provider on Metal + two bug fixes (`CLAIM-BACKEND-ACCEL-PROVIDER-1`, base `c603ebc`, worktree `agent-aa2995d59156dd2b5`)
+
+**USER PRIORITY: "Metal support via MLX, with verification against the mac", and
+"build it so we can extend acceleration easily to other platforms."** The second
+half is the substantial one, and it is what this change is mostly about. Two new
+rows: `BACKEND-ACCEL-PROVIDER` and `KERNEL-ACCEL-PROVIDER-SELECT`, both `ACTIVE`.
+
+### The defect, stated exactly
+
+`src/vt/ops.cpp` held a flat `std::array<std::array<void*, kNumDeviceTypes>,
+OpId::kCount>` — **one** `void*` per (OpId, DeviceType) — and `RegisterOp`
+assigned into it with **no check and no warning**. Two implementations of one op
+on one device therefore resolved by **static-initialization order across
+translation units**, which the standard leaves unspecified. "Register MLX's
+matmul alongside our MSL matmul" was not a configuration; it was a
+**nondeterministic build**. Adding a PLATFORM was already additive and measured
+so (Vulkan V1 edited exactly two pre-existing files); adding a second PROVIDER
+within a platform was structurally impossible. That, not MLX, was the gap.
+
+### The seam — `vt::OpProvider` (`include/vt/op_provider.h`, `src/vt/op_provider.cpp`)
+
+Generalized out of `src/vt/cuda/cuda_arch_tactics.{h,cu}`, which already had
+every property the op table lacked, lifted out of `vt::cuda` and keyed on
+(OpId, DeviceType):
+
+- **capacity-bounded static storage**; registration is table-fill only, never
+  allocates, never throws, safe from any static-init order (registrars run
+  before `main`, where a throw has no receiver — the `RegisterArchTactic`
+  contract, kept);
+- **deterministic selection** — `(priority DESC, name ASC by strcmp)`. Both keys
+  are compile-time constants of the registering TU, so the winner is a pure
+  function of WHICH providers are linked in, never of the order their
+  initializers ran. Duplicate names are rejected so the order stays total. This
+  is the actual fix;
+- a **device-neutral capability predicate** over a new `vt::ProviderCaps` — the
+  one genuine CUDA coupling of the tactic registry (`DeviceCaps`, which is
+  `sm_major`/`sm_minor`-shaped) generalized away. Backends publish theirs with
+  `SetDeviceProviderCaps`, which invalidates the selection cache;
+- **per-call decline-and-fall-back** — `GetOpFallback(op, device, my-name)`
+  returns the provider immediately below the caller in the deterministic order.
+  This is the `ArchTacticLaunchFn`-returns-`false` axis, expressed where a shape
+  is actually visible (inside the kernel), which is precisely what keeps the
+  ~70 op entry points edit-free: `GetOp` never sees a shape, so it cannot decide;
+- **observability is not optional** — `GetOpProviderStats` reports
+  `last_selected` / `selections` / `declines` / `fallbacks`;
+  `VT_OP_PROVIDER_STATS=1` announces once per (op, device);
+  `VT_OP_PROVIDER_DISABLE=<name>[,<name>]` (and `DisableOpProvider`) is a
+  **same-binary A/B lever**, which is what the benchmark protocol asks for.
+
+**`RegisterOp` / `GetOp` / `OpRegistered` keep their exact signatures and
+semantics** and merely change translation unit — `RegisterOp` is now literally
+"the priority-0, unconditional, `vt-native` provider". Consequently **all ~70 op
+wrappers in `ops.cpp` are byte-unchanged**; the study's "zero call-site edits"
+estimate held.
+
+**Reconciled with `.agents/specs/dropin-kernel-abi.md`, not rivalling it.** That
+spec is the ARGUMENT half of a provider seam (raw pointer/shape/stride/workspace/
+stream, for CUTLASS/Marlin/cuBLASLt/flashinfer) and is silent on WHICH launcher
+runs. This is the SELECTION half and is silent on argument shape — `fn` is the
+same type-erased `void*` the op table always held, so a drop-in adapter
+registered through `RegisterTypedOp` is a provider like any other. They compose.
+
+**Why this is not an MLX seam.** Of the §6.1 table's five platforms, one row is
+POPULATED (Metal/MLX) and four are designed for but empty. What the
+implementation settles is the row that `dropin-kernel-abi.md` provably could
+*not* express: a C++ **object-model** library, whose objects stay entirely inside
+the provider's own TU. That was the open question. Whether cuBLASLt, llama.cpp
+`vec_dot` and Vulkan coopmat fit as cleanly is a claim this change does not yet
+get to make, and does not make.
+
+### Hot-path discipline (the real risk — `ops.cpp` is the hottest shared file)
+
+`GetOp` steady state is **one relaxed atomic load** of a resolved-selection
+cache, replacing one array load; resolution happens once. Negative resolution is
+**memoized**, because `OpRegistered` is consulted per call by the fused-recipe
+fast-realization ladder for ops a backend does NOT have — without that, the seam
+would have put a capability scan on the 35B decode path. The provider-disable
+lookup short-circuits **lock-free** when nothing is disabled. Per-call
+`selections` counting is OFF unless asked for. This was proven by the regression
+set, not argued.
+
+### The Metal side
+
+**A native MSL dense GEMM was written FIRST** (`vt_matmul` in `metal_msl.h`,
+registered for `kMatmul` and `kMatmulBT`) — not in the study's plan, but
+required: a seam that selects between providers needs a second provider to
+select, and Metal had no GEMM at all. Threadgroup-tiled 16x16, f32 accumulation
+regardless of storage dtype, one kernel for both orientations via a `bt` flag,
+carrying `lda` because `vt::MatmulBT` explicitly admits a row-strided
+activation. It is the DEFAULT and is what ships.
+
+**The MLX provider** (`src/vt/metal/metal_mlx_provider.mm`, `-DVLLM_CPP_MLX=ON
+-DMLX_ROOT=...`, default OFF) registers at priority 100 for the same two ops.
+Inputs are **zero-copy** exactly as the study described — `array::set_data` over
+our own `MTLBuffer` with a no-op deleter, `MTL::Buffer*` and `id<MTLBuffer>`
+being the same pointer. `mlx::core::matmul` + an explicit `eval()` is the
+boundary: **the lazy-eval objection is refuted in practice, not just on paper.**
+The kernel DECLINES mixed dtypes, row-strided activations and interior-pointer
+activations, and forwards to ours.
+
+**Two corrections to the study, both measured, neither cosmetic:**
+
+1. §5.2 proposed calling `steel_matmul` directly with a pre-bound output.
+   `nm -gU libmlx.dylib` shows **`steel_matmul_axpby<false>` is NOT an exported
+   symbol** of the shipped wheel (only the `get_steel_*_kernel` helpers are), so
+   that entry point is declared in the installed header but is **not linkable**
+   against the prebuilt artifact; and `Matmul::eval_gpu` re-`set_data`s its
+   output from MLX's own allocator anyway. The output is therefore a **host
+   memcpy** on unified memory — O(M*N) against an O(M*N*K) GEMM. Real, recorded,
+   and never described as zero-copy.
+2. An `array` built via `set_data` starts `Status::unscheduled`, so MLX's
+   evaluator throws *"Attempting to eval an array without a primitive"* unless it
+   is marked `available`. Not in the study; found by running it.
+
+`kPagedAttention` stays OURS regardless, as the study required: MLX has no
+paged-KV primitive anywhere.
+
+### The two bug fixes
+
+1. **`dense_attn_block.h:140,157` — a real portability bug.** `ResidentWeight`
+   and `ResidentWeightF32` selected host-pointer aliasing on `!is_cuda()`, which
+   is TRUE for kMETAL, kVULKAN and kXPU as well as kCPU — so any device backend
+   other than CUDA would have handed a **HOST pointer to a DEVICE kernel**. Now
+   `is_cpu()`: aliasing is a property of the host, not of "not NVIDIA". kCPU and
+   kCUDA behaviour is bit-identical by inspection and by the unchanged
+   regression set. Latent only because no model runs on a non-CUDA device
+   backend; a hard blocker for the Metal/Vulkan bring-up.
+2. **`test_fused_chain_additivity.cpp` — a drifted guard.** Its count guard
+   exists to "tie catalog growth to test growth" and had drifted to 7 while
+   `recipes.h` declared 9: `kFusedAddRmsNormStd` and `kAttnQkNormRope` were added
+   without catalog rows. Both now have byte-exact CPU drivers (each running the
+   standalone-op golden and the Tier-0 composite through the same public entry
+   and asserting bit-identical), and the guard reads 9.
+
+### Verification
+
+**Builds — clean `-Werror`, 0 warnings, on all three toolchains.** AppleClang
+21.0.0 on macOS 26.5.2, **CLT only** (no Xcode, hence no offline `metal`
+compiler — MSL compiles at runtime, which MLX itself maintains as a first-class
+mode), in BOTH the Metal build and the Metal+MLX build; GCC on the Linux dev box
+(CPU only); nvcc 13.0 `sm_121a` on dgx with `VLLM_CPP_TRITON=ON` and CUTLASS.
+
+**Correctness on the Mac — MLX vs native MSL vs the CPU oracle, per op, at real
+projection widths.** Bar is the ported **NMSE <= 5e-4**; bit-exactness across
+providers is NOT promised and is not claimed.
+
+| GEMM | shape / dtype | MSL vs CPU | MLX vs CPU | MLX vs MSL |
+|---|---|---:|---:|---:|
+| `kMatmul` | 1x2048x2048 bf16 (decode) | 2.80e-06 | 2.80e-06 | 0 |
+| `kMatmulBT` | 1x2048x2048 bf16 (decode) | 2.76e-06 | 2.76e-06 | 0 |
+| `kMatmul` | 32x2048x6144 bf16 (prefill) | 2.75e-06 | 2.75e-06 | 0 |
+| `kMatmulBT` | 32x2048x6144 bf16 (prefill) | 2.74e-06 | 2.74e-06 | 0 |
+| `kMatmul` | 128x512x512 f32 | 3.81e-14 | 3.81e-14 | 0 |
+| `kMatmulBT` | 128x512x512 f32 | 3.74e-14 | 3.74e-14 | 0 |
+
+**The zeros are an OBSERVATION, not a promise.** Both providers run IEEE (MLX
+pins `setFastMathEnabled(false)`, we pin `MTLMathModeSafe`) and both accumulate
+in f32 ascending-k, which is enough to coincide on these shapes; nothing depends
+on it, and the gate is the NMSE columns.
+
+**BOTH PATHS ARE PROVEN TO HAVE RUN — and the first attempt at that proof was
+INSUFFICIENT, which is worth recording.** `last_selected == "mlx"` alone does not
+prove MLX computed anything: a selected provider may still decline inside its
+kernel and forward down, and the numeric result would be identical either way.
+The `declines` counter is the second half, and every accelerator arm now asserts
+it is zero. Before that assertion existed, an `MLX-vs-MSL == 0` reading was
+correctly treated as suspicious and chased with a temporary instrumented build
+(which confirmed MLX really executes: `[MLX-RAN] m=128 n=512 k=512 ...`). This is
+exactly the fan-out spike's Risk 4 — a probe failing SILENTLY into the slow path.
+
+**Suites.**
+
+- Linux dev box, CPU-only build: `ctest -j2` **156/156**.
+- Mac: `test_metal_backend` **7 cases / 77 assertions** in the Metal-only build and
+  **9 / 108** in the Metal+MLX build (the two extra cases are the MLX arms),
+  `test_op_provider` **11 / 47**, `test_fused_chain_additivity` **1 / 21**
+  (the repaired 9-recipe catalog), `test_ops_fused_chain` green.
+- Mac, full `ctest -j2`, BOTH the Metal and the Metal+MLX builds: matches a
+  same-box **`c603ebc` baseline build** exactly. Four pre-existing failures
+  (`test_triton_aot_drift_contract`, `test_serve_low_tools`, `test_safetensors`,
+  and `test_capi`) reproduce identically on the baseline tree; `test_capi` and
+  `test_openai_api_server` are flaky under `-j2` and pass standalone on BOTH
+  trees. **No failure is introduced by this change**, and that was established by
+  building and running the base commit on the same box rather than by assertion.
+- Vulkan (dev box, `-DVLLM_CPP_VULKAN=ON`, software device): `test_vulkan_backend`
+  **8 / 82**, `test_backend_cross_device` **5 / 73**, `test_op_provider`
+  **11 / 47**, `test_fused_chain_additivity` **1 / 21** — clean `-Werror`.
+
+**dgx regressions — ALL UNCHANGED, each gate STANDALONE.** GB10 sm_121a, nvcc
+13.0, run sequentially inside ONE `flock $HOME/gpu.lock` after a ~70-minute
+foreground wait for a concurrent agent's benchmark series to release the lock
+(the serialization protocol working as designed — it is what stopped the
+co-scheduled-run box reboots). Box verified idle before the series (GPU 0%,
+no other CUDA process). `ops.cpp` is the TU every op in the tree routes
+through, so this set is the load-bearing evidence for the seam, not a formality:
+
+| gate | result |
+|---|---|
+| `test_qwen27_paged_engine` (Gemma-3 27B) | rc=0, **235/235** assertions |
+| `test_qwen36_paged_engine` (Qwen3.5-Next 35B) | rc=0, **315/315** assertions, 2/2 cases |
+| `test_qwen3coder_paged_engine` | rc=0, **138/138**, **6/6 prompts token-exact** (96/96 tokens) vs the vLLM 0.25.0 oracle |
+| `test_qwen3_paged_engine` (Qwen3 dense) | rc=0, **664/664**, **16/16 prompts PASS** on both cases (strict 10/16 and 11/16, remainder near-tie-band, 0 forward-divergent) |
+| `test_opt_paged_engine` | rc=0, **36/36**, **6/6 prompts PASS** (strict 5/6, 1 near-tie-band, max gap 0 nats) |
+| `test_deepseek_v2_paged_engine` (MLA) | rc=0, **223/223**, **8/8 prompts PASS** (strict 5/8, 3 near-tie-band, 0 forward-divergent) |
+
+Golden corpus md5 over the 475 files under `tests/parity/goldens`:
+`2965ef5772b556d3f3f86fedf4221b2f`, **unchanged**.
+
+### Timing — DELIBERATELY ABSENT, and what the user must do
+
+**No MLX-vs-MSL speed number is published, because the M4 could not be quieted.**
+`sudo -n true` still answers *"a password is required"*, so the
+`com.localai.worker` root LaunchDaemon is still up; and the desktop **aerial
+video wallpaper** (`WallpaperAerialsExtension`, ~8.2% CPU, plus
+`VTDecoderXPCService`) still decodes video onto the same GPU — which §8 of the
+study identified as the box's real source of load. A GEMM A/B is exactly the
+measurement those perturb. Nothing contended was published or laundered.
+
+To make an MLX-vs-MSL timing bindable, the user must run:
+
+```sh
+ssh 192.168.68.103
+sudo launchctl bootout system/com.localai.worker
+# System Settings -> Wallpaper: replace the AERIAL wallpaper with a static one
+#   (or log the console user out)
+# ... A/B below ...
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.localai.worker.plist
+```
+
+The A/B itself needs **no rebuild** — that is what the seam bought:
+
+```sh
+cd ~/vllmcpp-accel/build-mlx
+export DYLD_LIBRARY_PATH=$HOME/mlx-venv/lib/python3.9/site-packages/mlx/lib
+VT_OP_PROVIDER_STATS=1 ./tests/test_metal_backend                      # arm A: MLX
+VT_OP_PROVIDER_DISABLE=mlx VT_OP_PROVIDER_STATS=1 ./tests/test_metal_backend  # arm B: MSL
+```
+
+### Resume commands
+
+```sh
+# Mac (192.168.68.103) — CLT only; keep brew's python@3.14 OFF the build PATH
+cd ~/vllmcpp-accel
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin /opt/homebrew/bin/cmake \
+  -S . -B build-mlx -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF \
+  -DVLLM_CPP_METAL=ON -DVLLM_CPP_MLX=ON \
+  -DMLX_ROOT=$HOME/mlx-venv/lib/python3.9/site-packages/mlx
+PATH=/usr/bin:/bin:/opt/homebrew/bin /opt/homebrew/bin/cmake --build build-mlx -j6
+DYLD_LIBRARY_PATH=$HOME/mlx-venv/lib/python3.9/site-packages/mlx/lib \
+  ./build-mlx/tests/test_metal_backend
+
+# dgx.casa — every GPU stage under one flock; each model gate STANDALONE
+cd ~/vllmcpp-accel && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+  -DVLLM_CPP_TRITON=ON -DCMAKE_CUDA_ARCHITECTURES=121a && cmake --build build -j12
+cd build && for t in test_qwen27_paged_engine test_qwen36_paged_engine \
+  test_qwen3coder_paged_engine test_qwen3_paged_engine test_opt_paged_engine \
+  test_deepseek_v2_paged_engine; do flock $HOME/gpu.lock ./tests/$t; done
+```
+
+### Prohibitions carried forward
+
+Do NOT claim bit-exactness between the MLX and MSL providers — measured 0 on
+these shapes, promised nowhere, and the reduction orders are free to diverge. Do
+NOT quote any Metal or MLX *speed* number from this change; none was taken. Do
+NOT promote `BACKEND-GATE-METAL-MLXLM` — no model runs on Metal, so there is
+still no "ours" column. Do NOT treat the §6.1 generalization table as proven for
+CUDA/CPU/Vulkan; only the Metal/MLX row is populated. Do NOT weaken the
+`declines` assertions: without them, a silent MLX fall-back is indistinguishable
+from an MLX pass.

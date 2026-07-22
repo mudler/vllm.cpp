@@ -4,17 +4,20 @@
 // idiom exactly, so adding this backend edited NO existing kernel file.
 //
 // WHAT THIS TU COVERS (deliberately a SEAM PROOF, not a model):
-//   kAdd, kRelu, kSiluAndMul, kCastBf16, kCastF32, kLayerNorm, kRmsNorm and the
-//   single kFusedChain registration that inherits the portable fusion catalog.
+//   kAdd, kRelu, kSiluAndMul, kCastBf16, kCastF32, kLayerNorm, kRmsNorm, the
+//   dense GEMM pair kMatmul/kMatmulBT, and the single kFusedChain registration
+//   that inherits the portable fusion catalog.
 // That set spans every structural class the seam has to get right: flat
 // elementwise, a rank-1 broadcast, a dtype-converting copy, TWO different row
 // reductions, an optional in-place residual stream, and the recipe interpreter.
 //
-// WHAT IS STILL STUBBED: everything else. `kMatmul`/`kMatmulBT`,
-// `kPagedAttention`, `kReshapeAndCache`, the whole quant tier and the sampler
-// ops are NOT registered, so `vt::GetOp` throws its normal "no kernel for op N
-// on device type 2" for them (src/vt/ops.cpp:104-111 — a partial backend is a
-// supported, tested state). No model runs on this backend.
+// WHAT IS STILL STUBBED: everything else. `kPagedAttention`,
+// `kReshapeAndCache`, the whole quant tier and the sampler ops are NOT
+// registered, so `vt::GetOp` throws its normal "no kernel for op N on device
+// type 2" for them (a partial backend is a supported, tested state). No model
+// runs on this backend. NOTE `kPagedAttention` stays OURS regardless of MLX:
+// MLX has no paged-KV attention primitive at all
+// (.agents/specs/metal-mlx-reuse-study.md §5.3).
 //
 // DISPATCH MODEL: one command buffer per op, committed and waited. See
 // metal_backend.mm § SCOPE for why, and what it costs.
@@ -54,6 +57,7 @@ struct LayerNormParams {
   uint32_t rows, d, x_dt, w_dt, b_dt, out_dt, has_w, has_b, tg;
   float eps;
 };
+struct GemmParams { uint32_t m, n, k, lda, a_dt, b_dt, out_dt, bt; };
 struct FStepGpu { uint32_t op, out, in0, in1, gemma, pad; };
 struct FcParams { uint32_t t, h, nsteps, x_dt, w_dt, res_dt, out_dt, tg; float eps; };
 
@@ -122,6 +126,17 @@ class Encoder {
          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     Finish();
   }
+  // 2-D tile dispatch: one threadgroup per (tile x tile) output tile, which is
+  // the GEMM shape. dispatchThreadgroups (not dispatchThreads) because the tile
+  // loop needs FULL threadgroups — the kernel bounds-checks its own edges.
+  void DispatchTiles(int64_t cols, int64_t rows, uint32_t tile) {
+    if (cols <= 0 || rows <= 0) { Finish(); return; }
+    const NSUInteger gx = static_cast<NSUInteger>((cols + tile - 1) / tile);
+    const NSUInteger gy = static_cast<NSUInteger>((rows + tile - 1) / tile);
+    [enc_ dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+         threadsPerThreadgroup:MTLSizeMake(tile, tile, 1)];
+    Finish();
+  }
 
  private:
   void Finish() {
@@ -158,6 +173,42 @@ void AddKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   e.BindTensor(out, 2, "add: out");
   e.BindBytes(&p, sizeof(p), 3);
   e.DispatchFlat(n);
+}
+
+// Dense GEMM, the NATIVE MSL provider for kMatmul / kMatmulBT (metal_msl.h
+// vt_matmul). Registered at the default priority under vt::kNativeProviderName,
+// so it stays the DEFAULT on Metal and the optional MLX provider
+// (metal_mlx_provider.mm, VLLM_CPP_MLX) only displaces it when explicitly built
+// in — and can be switched back off in the same binary with
+// VT_OP_PROVIDER_DISABLE=mlx.
+constexpr uint32_t kGemmTile = 16;
+
+void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
+  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[1];
+  GemmParams p{static_cast<uint32_t>(m),       static_cast<uint32_t>(n),
+               static_cast<uint32_t>(k),       static_cast<uint32_t>(a.stride[0]),
+               DtypeCode(a.dtype),             DtypeCode(b.dtype),
+               DtypeCode(out.dtype),           0u};
+  Encoder e("vt_matmul");
+  e.BindTensor(a, 0, "matmul: a");
+  e.BindTensor(b, 1, "matmul: b");
+  e.BindTensor(out, 2, "matmul: out");
+  e.BindBytes(&p, sizeof(p), 3);
+  e.DispatchTiles(n, m, kGemmTile);
+}
+
+void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
+  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
+  GemmParams p{static_cast<uint32_t>(m),       static_cast<uint32_t>(n),
+               static_cast<uint32_t>(k),       static_cast<uint32_t>(a.stride[0]),
+               DtypeCode(a.dtype),             DtypeCode(b.dtype),
+               DtypeCode(out.dtype),           1u};
+  Encoder e("vt_matmul");
+  e.BindTensor(a, 0, "matmul_bt: a");
+  e.BindTensor(b, 1, "matmul_bt: b");
+  e.BindTensor(out, 2, "matmul_bt: out");
+  e.BindBytes(&p, sizeof(p), 3);
+  e.DispatchTiles(n, m, kGemmTile);
 }
 
 // cpu_layernorm.cpp:75-85 ReluKernel.
@@ -320,6 +371,10 @@ struct Registrar {
     if (!MetalContext::Available()) return;
     // static_cast against the ops.h aliases ties every kernel signature to the
     // registration contract at COMPILE time (the cpu_ops.cpp idiom).
+    RegisterOp(OpId::kMatmul, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernel)));
+    RegisterOp(OpId::kMatmulBT, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTKernel)));
     RegisterOp(OpId::kAdd, DeviceType::kMETAL,
                reinterpret_cast<void*>(static_cast<AddFn>(&AddKernel)));
     RegisterOp(OpId::kRelu, DeviceType::kMETAL,

@@ -22,8 +22,15 @@ MATRICES = {
     # bumped when a genuinely new scheme is inventoried — never to make a failing
     # state transition pass.
     "QUANT": (AGENTS / "quantization-matrix.md", 82),
-    "KERNEL": (AGENTS / "kernel-matrix.md", 32),
-    "BACKEND": (AGENTS / "backend-matrix.md", 55),
+    # 33 since 2026-07-22: +`KERNEL-ACCEL-PROVIDER-SELECT` (which IMPLEMENTATION of an
+    # op runs when a device has more than one — the selection layer above every
+    # kernel family here, distinct from `KERNEL-CUDA-DISPATCH-AOT`, which selects an
+    # ARCH for one implementation). Inventory size, bumped for a genuinely new
+    # family — never to make a failing state transition pass.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 33),
+    # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
+    # itself, which is a cross-backend platform concern rather than a platform).
+    "BACKEND": (AGENTS / "backend-matrix.md", 56),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

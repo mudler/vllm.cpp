@@ -7,13 +7,13 @@
 namespace vt {
 
 namespace {
-using OpTable =
-    std::array<std::array<void*, kNumDeviceTypes>, static_cast<size_t>(OpId::kCount)>;
-OpTable& Table() {
-  static OpTable table{};
-  return table;
-}
-
+// The op table itself moved to src/vt/op_provider.cpp — it is now the
+// acceleration-provider registry (include/vt/op_provider.h,
+// .agents/specs/metal-mlx-reuse-study.md §6), not a flat one-slot-per-device
+// array with silent last-writer-wins. `RegisterOp`, `GetOp` and `OpRegistered`
+// keep their exact signatures and semantics, so every one of the ~70 op wrappers
+// below is UNCHANGED: the seam is inserted at `GetOp` and picked up by all of
+// them at once with zero call-site edits.
 bool IsFloat(DType d) { return d == DType::kF32 || d == DType::kF16 || d == DType::kBF16; }
 bool IsOutFloat(DType d) { return d == DType::kF32 || d == DType::kBF16; }
 }  // namespace
@@ -93,33 +93,6 @@ KernelTensorDesc Describe(const Tensor& tensor, ScalarTypeId semantic_type,
 WorkspaceKey MakeWorkspaceKey(const Queue& q, OpId op, WorkspaceSlot slot) {
   VT_CHECK(q.id != 0, "workspace key requires a live queue identity");
   return WorkspaceKey{q.device, q.id, reinterpret_cast<uintptr_t>(q.handle), op, slot};
-}
-
-void RegisterOp(OpId op, DeviceType device, void* fn) {
-  VT_CHECK(static_cast<size_t>(op) < static_cast<size_t>(OpId::kCount), "invalid op id");
-  VT_CHECK(static_cast<size_t>(device) < kNumDeviceTypes, "invalid device type");
-  Table()[static_cast<size_t>(op)][static_cast<size_t>(device)] = fn;
-}
-
-void* GetOp(OpId op, DeviceType device) {
-  VT_CHECK(static_cast<size_t>(device) < kNumDeviceTypes, "invalid device type");
-  void* fn = Table()[static_cast<size_t>(op)][static_cast<size_t>(device)];
-  VT_CHECK(fn != nullptr, std::string("no kernel for op ") +
-                              std::to_string(static_cast<int>(op)) + " on device type " +
-                              std::to_string(static_cast<int>(device)));
-  return fn;
-}
-
-// Non-throwing probe: is `op` realized on `device`? (GetOp throws; the fast-
-// realization dispatch must degrade GRACEFULLY to the composite when a backend
-// lacks the bespoke fused kernel, so it probes the table directly.) Moved out of
-// this file's anonymous namespace and DECLARED in vt/ops.h (BACKEND-METAL-MLX
-// W0) so the cross-device test harness can enumerate a partial backend's op
-// coverage without using exceptions as control flow. Behaviour is unchanged.
-bool OpRegistered(OpId op, DeviceType device) {
-  VT_CHECK(static_cast<size_t>(op) < static_cast<size_t>(OpId::kCount), "invalid op id");
-  VT_CHECK(static_cast<size_t>(device) < kNumDeviceTypes, "invalid device type");
-  return Table()[static_cast<size_t>(op)][static_cast<size_t>(device)] != nullptr;
 }
 
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {

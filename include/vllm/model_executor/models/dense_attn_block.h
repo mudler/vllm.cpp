@@ -137,7 +137,15 @@ inline std::vector<float> WeightF32(const OwnedTensor& w) {
 // reused across every forward step (mirrors qwen3_5.cpp ResidentWeight).
 inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
-  if (!vllm::platforms::GetPlatform(d.q.device.type).is_cuda())
+  // HOST-POINTER ALIASING IS A CPU PROPERTY, NOT A "NOT-CUDA" PROPERTY.
+  // This read `!is_cuda()`, which is true for kMETAL, kVULKAN and kXPU as well
+  // as kCPU — so any DEVICE backend other than CUDA aliased the host weight
+  // bytes straight into a tensor and handed a HOST pointer to a DEVICE kernel.
+  // Latent only because no model runs on a non-CUDA device backend yet; a hard
+  // blocker for the Metal/Vulkan model bring-up
+  // (.agents/specs/metal-mlx-reuse-study.md §3.3 item 2). The correct predicate
+  // is `is_cpu()`: alias when the "device" IS the host, upload otherwise.
+  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu())
     return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device, shape);
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
@@ -154,7 +162,9 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
 inline Tensor ResidentWeightF32(Dev d, const OwnedTensor& w, const std::vector<int64_t>& shape) {
   if (!w.d_dev_f32) {
     std::vector<float> f = WeightF32(w);
-    if (!vllm::platforms::GetPlatform(d.q.device.type).is_cuda()) {
+    // Same defect, same fix as ResidentWeight above: `!is_cuda()` aliased a
+    // host std::vector<float> into a tensor for kMETAL/kVULKAN/kXPU.
+    if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
       auto* buf = new std::vector<float>(std::move(f));
       w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
     } else {

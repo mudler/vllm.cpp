@@ -14,7 +14,12 @@
 
 #include <cstdint>
 #include <cstring>
+#include <random>
+#include <string>
 #include <vector>
+
+#include "vt/dtype.h"
+#include "vt/op_provider.h"
 
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
@@ -158,15 +163,286 @@ TEST_CASE("Metal registers the W0 op set and NOT the unimplemented rest") {
   // work row cannot quietly claim more than it implements.
   for (vt::OpId op : {vt::OpId::kAdd, vt::OpId::kRelu, vt::OpId::kSiluAndMul,
                       vt::OpId::kCastBf16, vt::OpId::kCastF32, vt::OpId::kLayerNorm,
-                      vt::OpId::kRmsNorm, vt::OpId::kFusedChain}) {
+                      vt::OpId::kRmsNorm, vt::OpId::kFusedChain,
+                      // Added with the provider seam: the native MSL dense GEMM
+                      // pair, which is what makes MLX a CONFIGURATION rather
+                      // than the only way to get a GEMM on this backend.
+                      vt::OpId::kMatmul, vt::OpId::kMatmulBT}) {
     CHECK(vt::OpRegistered(op, DeviceType::kMETAL));
   }
-  // Still stubbed — GEMM, attention, KV cache, quant, sampling. A partial
-  // backend is a supported state (src/vt/ops.cpp:104-111 throws on lookup).
-  for (vt::OpId op : {vt::OpId::kMatmul, vt::OpId::kMatmulBT, vt::OpId::kPagedAttention,
-                      vt::OpId::kReshapeAndCache, vt::OpId::kEmbedding,
-                      vt::OpId::kGreedyArgmax}) {
+  // Still stubbed — attention, KV cache, quant, sampling. A partial backend is a
+  // supported state (vt::GetOp throws on lookup). kPagedAttention stays OURS
+  // even once MLX is enabled: MLX has no paged-KV primitive at all.
+  for (vt::OpId op : {vt::OpId::kPagedAttention, vt::OpId::kReshapeAndCache,
+                      vt::OpId::kEmbedding, vt::OpId::kGreedyArgmax}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kMETAL));
   }
-  CHECK_THROWS_AS(vt::GetOp(vt::OpId::kMatmul, DeviceType::kMETAL), std::runtime_error);
+  CHECK_THROWS_AS(vt::GetOp(vt::OpId::kPagedAttention, DeviceType::kMETAL),
+                  std::runtime_error);
 }
+
+// ===========================================================================
+// Dense GEMM: the native MSL provider vs the CPU oracle, and — when the optional
+// MLX provider is built in (-DVLLM_CPP_MLX=ON) — MLX vs MSL vs the CPU oracle,
+// per op, at real shapes.
+//
+// THE BAR IS NMSE <= 5e-4, NOT BIT-EXACTNESS, and that is a deliberate and
+// stated position, not a tolerance chosen to make a test pass: the CPU tier's
+// reproducibility comes from a fixed SEQUENTIAL accumulation
+// (src/vt/cpu/cpu_quant_dot.cpp:22-28) and no GPU tile reduction preserves that
+// order. MLX pins `setFastMathEnabled(false)` and we pin MTLMathModeSafe, so
+// both are IEEE — but they are DIFFERENT reduction orders, and bit-exactness
+// across providers is not on offer. Nothing here claims it.
+//
+// AND THE TEST PROVES WHICH PROVIDER RAN. A passing assertion does not: both
+// providers compute the same GEMM, so a silent fall-back to MSL would look
+// identical to MLX succeeding. `vt::GetOpProviderStats(...).last_selected` is
+// checked on every arm, which is exactly the fan-out spike's Risk 4
+// (a probe failing SILENTLY into the slow path) made detectable.
+namespace {
+
+double Nmse(const std::vector<float>& got, const std::vector<float>& ref) {
+  double num = 0.0, den = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double d = static_cast<double>(got[i]) - static_cast<double>(ref[i]);
+    num += d * d;
+    den += static_cast<double>(ref[i]) * static_cast<double>(ref[i]);
+  }
+  return den > 0.0 ? num / den : num;
+}
+
+// bf16 round-trip so every arm consumes the IDENTICAL input bits — otherwise a
+// dtype-conversion difference would masquerade as a kernel difference.
+float Bf16RT(float v) { return vt::BF16ToF32(vt::F32ToBF16(v)); }
+
+struct GemmCase {
+  const char* name;
+  int64_t m, k, n;
+  vt::DType dt;
+};
+
+// Run one GEMM on Metal with the currently-selected provider and return the
+// result in f32, plus the provider name that actually served it.
+std::vector<float> RunMetalGemm(const GemmCase& c, bool bt, const std::vector<float>& a_h,
+                                const std::vector<float>& b_h, std::string* provider,
+                                unsigned long long* declines) {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+  const size_t esz = vt::SizeOf(c.dt);
+
+  auto upload = [&](const std::vector<float>& h) {
+    void* p = metal.Alloc(h.size() * esz);
+    if (c.dt == vt::DType::kF32) {
+      metal.Copy(q, p, h.data(), h.size() * esz);
+    } else {
+      std::vector<uint16_t> packed(h.size());
+      for (size_t i = 0; i < h.size(); ++i) packed[i] = vt::F32ToBF16(h[i]);
+      metal.Copy(q, p, packed.data(), packed.size() * esz);
+    }
+    return p;
+  };
+
+  void* da = upload(a_h);
+  void* db = upload(b_h);
+  void* dc = metal.Alloc(static_cast<size_t>(c.m * c.n) * esz);
+  metal.Synchronize(q);
+
+  Tensor ta = Tensor::Contiguous(da, c.dt, d, {c.m, c.k});
+  Tensor tb = bt ? Tensor::Contiguous(db, c.dt, d, {c.n, c.k})
+                 : Tensor::Contiguous(db, c.dt, d, {c.k, c.n});
+  Tensor tc = Tensor::Contiguous(dc, c.dt, d, {c.m, c.n});
+
+  const vt::OpId op = bt ? vt::OpId::kMatmulBT : vt::OpId::kMatmul;
+  vt::ResetOpProviderStats(op, DeviceType::kMETAL);
+  if (bt) {
+    vt::MatmulBT(q, tc, ta, tb);
+  } else {
+    vt::Matmul(q, tc, ta, tb);
+  }
+  metal.Synchronize(q);
+
+  const auto stats = vt::GetOpProviderStats(op, DeviceType::kMETAL);
+  *provider = stats.last_selected != nullptr ? stats.last_selected : "<none>";
+  // `last_selected` alone is NOT proof that the accelerator COMPUTED anything —
+  // a selected provider may still decline the call inside its kernel and forward
+  // down. `declines` is that second half, and without it a silent fall-back
+  // would be indistinguishable from success (fan-out spike Risk 4).
+  *declines = stats.declines;
+
+  std::vector<float> out(static_cast<size_t>(c.m * c.n));
+  if (c.dt == vt::DType::kF32) {
+    metal.Copy(q, out.data(), dc, out.size() * esz);
+    metal.Synchronize(q);
+  } else {
+    std::vector<uint16_t> packed(out.size());
+    metal.Copy(q, packed.data(), dc, packed.size() * esz);
+    metal.Synchronize(q);
+    for (size_t i = 0; i < out.size(); ++i) out[i] = vt::BF16ToF32(packed[i]);
+  }
+
+  metal.Free(da);
+  metal.Free(db);
+  metal.Free(dc);
+  metal.DestroyQueue(q);
+  return out;
+}
+
+// The oracle: our own CPU backend, through the SAME public vt:: entry point.
+std::vector<float> RunCpuGemm(const GemmCase& c, bool bt, const std::vector<float>& a_h,
+                              const std::vector<float>& b_h) {
+  Queue q{Device{DeviceType::kCPU, 0}, nullptr};
+  std::vector<float> a = a_h, b = b_h, out(static_cast<size_t>(c.m * c.n), 0.0f);
+  const Device d{DeviceType::kCPU, 0};
+  Tensor ta = Tensor::Contiguous(a.data(), vt::DType::kF32, d, {c.m, c.k});
+  Tensor tb = bt ? Tensor::Contiguous(b.data(), vt::DType::kF32, d, {c.n, c.k})
+                 : Tensor::Contiguous(b.data(), vt::DType::kF32, d, {c.k, c.n});
+  Tensor tc = Tensor::Contiguous(out.data(), vt::DType::kF32, d, {c.m, c.n});
+  if (bt) {
+    vt::MatmulBT(q, tc, ta, tb);
+  } else {
+    vt::Matmul(q, tc, ta, tb);
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("Metal dense GEMM matches the CPU oracle, and the provider that ran is named") {
+  // Decode-shaped (M=1), prefill-shaped, and a square f32 arm. Sizes are the
+  // real projection widths a 1.7B-class dense model uses, not toy shapes.
+  const GemmCase cases[] = {
+      {"decode bf16 1x2048x2048", 1, 2048, 2048, vt::DType::kBF16},
+      {"prefill bf16 32x2048x6144", 32, 2048, 6144, vt::DType::kBF16},
+      {"square f32 128x512x512", 128, 512, 512, vt::DType::kF32},
+  };
+
+  for (const GemmCase& c : cases) {
+    for (bool bt : {false, true}) {
+      CAPTURE(c.name);
+      CAPTURE(bt);
+      std::mt19937 rng(0xC0FFEEu);
+      std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+      std::vector<float> a(static_cast<size_t>(c.m * c.k));
+      std::vector<float> b(static_cast<size_t>(c.k * c.n));
+      for (auto& x : a) x = c.dt == vt::DType::kBF16 ? Bf16RT(dist(rng)) : dist(rng);
+      for (auto& x : b) x = c.dt == vt::DType::kBF16 ? Bf16RT(dist(rng)) : dist(rng);
+
+      const std::vector<float> ref = RunCpuGemm(c, bt, a, b);
+
+      // --- arm 1: the NATIVE MSL provider, with any accelerator forced off.
+      vt::DisableOpProvider("mlx", true);
+      std::string msl_provider;
+      unsigned long long msl_declines = 0;
+      const std::vector<float> msl = RunMetalGemm(c, bt, a, b, &msl_provider, &msl_declines);
+      vt::DisableOpProvider("mlx", false);
+      CHECK(msl_provider == std::string(vt::kNativeProviderName));
+      CHECK(msl_declines == 0);
+      const double msl_nmse = Nmse(msl, ref);
+      CAPTURE(msl_nmse);
+      CHECK(msl_nmse <= 5e-4);
+
+#ifdef VLLM_CPP_MLX
+      // --- arm 2: the MLX provider. Same binary, same inputs, same entry point;
+      // the ONLY difference is which provider the seam selected. If MLX had
+      // silently declined this shape, `mlx_provider` would read "vt-native" and
+      // this check — not the numeric one — is what would catch it.
+      std::string mlx_provider;
+      unsigned long long mlx_declines = 0;
+      const std::vector<float> mlx = RunMetalGemm(c, bt, a, b, &mlx_provider, &mlx_declines);
+      CHECK(mlx_provider == std::string("mlx"));
+      // MLX was selected AND did not decline: the delegated GEMM really ran.
+      CHECK(mlx_declines == 0);
+      const double mlx_vs_cpu = Nmse(mlx, ref);
+      const double mlx_vs_msl = Nmse(mlx, msl);
+      CAPTURE(mlx_vs_cpu);
+      CAPTURE(mlx_vs_msl);
+      CHECK(mlx_vs_cpu <= 5e-4);
+      CHECK(mlx_vs_msl <= 5e-4);
+      MESSAGE("GEMM [" << std::string(c.name) << "] bt=" << bt << " NMSE msl-vs-cpu=" << msl_nmse
+                       << " mlx-vs-cpu=" << mlx_vs_cpu << " mlx-vs-msl=" << mlx_vs_msl);
+#else
+      MESSAGE("GEMM [" << std::string(c.name) << "] bt=" << bt << " NMSE msl-vs-cpu=" << msl_nmse
+                       << " (MLX provider not built: -DVLLM_CPP_MLX=OFF)");
+#endif
+    }
+  }
+}
+
+#ifdef VLLM_CPP_MLX
+TEST_CASE("MLX DECLINES a shape it cannot express and the native MSL GEMM serves it") {
+  // The decline-and-fall-back axis, exercised END TO END on a real accelerator
+  // rather than only on the synthetic providers in tests/vt/test_op_provider.cpp.
+  //
+  // The shape chosen is one MLX genuinely cannot take through its public API:
+  // an activation that is an INTERIOR view of a larger allocation.
+  // `mlx::core::array::set_data` sets `data_ptr` to the buffer's `contents()`,
+  // so a non-zero buffer offset is not expressible, and the provider declines
+  // rather than silently reading from row 0. `vt::Tensor::Slice`/`View` produce
+  // exactly this pointer, so it is not a contrived case.
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+  const int64_t m = 8, k = 256, n = 128;
+
+  std::mt19937 rng(7u);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  std::vector<float> a_full(static_cast<size_t>((m + 1) * k));
+  std::vector<float> b_h(static_cast<size_t>(n * k));
+  for (auto& x : a_full) x = dist(rng);
+  for (auto& x : b_h) x = dist(rng);
+
+  auto* da = static_cast<float*>(metal.Alloc(a_full.size() * sizeof(float)));
+  auto* db = static_cast<float*>(metal.Alloc(b_h.size() * sizeof(float)));
+  auto* dc = static_cast<float*>(metal.Alloc(static_cast<size_t>(m * n) * sizeof(float)));
+  metal.Copy(q, da, a_full.data(), a_full.size() * sizeof(float));
+  metal.Copy(q, db, b_h.data(), b_h.size() * sizeof(float));
+  metal.Synchronize(q);
+
+  // Rows [1, m+1) — an interior pointer at a non-zero offset.
+  Tensor ta = Tensor::Contiguous(da + k, vt::DType::kF32, d, {m, k});
+  Tensor tb = Tensor::Contiguous(db, vt::DType::kF32, d, {n, k});
+  Tensor tc = Tensor::Contiguous(dc, vt::DType::kF32, d, {m, n});
+
+  vt::ResetOpProviderStats(vt::OpId::kMatmulBT, DeviceType::kMETAL);
+  vt::MatmulBT(q, tc, ta, tb);
+  metal.Synchronize(q);
+
+  const auto stats = vt::GetOpProviderStats(vt::OpId::kMatmulBT, DeviceType::kMETAL);
+  CHECK(std::string(stats.last_selected) == "mlx");  // MLX WAS selected...
+  CHECK(stats.declines == 1);                        // ... and declined exactly once.
+
+  std::vector<float> got(static_cast<size_t>(m * n));
+  metal.Copy(q, got.data(), dc, got.size() * sizeof(float));
+  metal.Synchronize(q);
+
+  // And the fall-back produced the RIGHT answer, not just an answer.
+  Queue cq{Device{DeviceType::kCPU, 0}, nullptr};
+  std::vector<float> a_slice(a_full.begin() + k, a_full.end());
+  std::vector<float> b_cpu = b_h, ref(static_cast<size_t>(m * n), 0.0f);
+  const Device cd{DeviceType::kCPU, 0};
+  Tensor ca = Tensor::Contiguous(a_slice.data(), vt::DType::kF32, cd, {m, k});
+  Tensor cb = Tensor::Contiguous(b_cpu.data(), vt::DType::kF32, cd, {n, k});
+  Tensor cc = Tensor::Contiguous(ref.data(), vt::DType::kF32, cd, {m, n});
+  vt::MatmulBT(cq, cc, ca, cb);
+  CHECK(Nmse(got, ref) <= 5e-4);
+
+  metal.Free(da);
+  metal.Free(db);
+  metal.Free(dc);
+  metal.DestroyQueue(q);
+}
+
+TEST_CASE("MLX registers as a SECOND provider and the native MSL GEMM survives it") {
+  // The precise property the old flat op table could not give: two providers of
+  // ONE op on ONE device coexisting, ordered deterministically rather than by
+  // static-init order, with the loser still reachable.
+  CHECK(vt::OpProviderCount(vt::OpId::kMatmul, DeviceType::kMETAL) == 2);
+  CHECK(std::string(vt::OpProviderNameAt(vt::OpId::kMatmul, DeviceType::kMETAL, 0)) == "mlx");
+  CHECK(std::string(vt::OpProviderNameAt(vt::OpId::kMatmul, DeviceType::kMETAL, 1)) ==
+        std::string(vt::kNativeProviderName));
+  // And the decline path resolves to ours, which is what MlxMatmulKernel calls
+  // when it meets a shape or dtype it will not take.
+  CHECK(vt::GetOpFallback(vt::OpId::kMatmul, DeviceType::kMETAL, "mlx") != nullptr);
+}
+#endif

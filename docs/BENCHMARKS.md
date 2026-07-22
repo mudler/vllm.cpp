@@ -1044,9 +1044,74 @@ run-noise.
 **What this is sufficient for today:** it prices the §5 decision in the
 [reuse study](../.agents/specs/metal-mlx-reuse-study.md) — whether delegating
 GEMM to MLX is worth its ~105 MB `mlx.metallib` + `libmlx.dylib` dependency is a
-question our own M3 MSL GEMM must answer *by measurement against this line*.
-That is why the proposed `vt::OpProvider` seam carries mandatory
+question our own MSL GEMM must answer *by measurement against this line*.
+That is why the `vt::OpProvider` seam carries mandatory
 `VT_OP_PROVIDER_STATS` instrumentation.
+
+### MLX-as-a-PROVIDER (2026-07-22) — **NO TIMING, and why**
+
+The seam and the MLX GEMM provider are now landed and correctness-gated
+(`BACKEND-ACCEL-PROVIDER`; `-DVLLM_CPP_MLX=ON`, default OFF). **No MLX-vs-MSL
+speed number is published here, and none was taken as binding**, for the reason
+already recorded in §8 of the study and unchanged since: the M4 could not be
+quieted. `sudo -n true` still answers *"a password is required"*, so the
+`com.localai.worker` root LaunchDaemon is still up, and the desktop **aerial
+video wallpaper** (`WallpaperAerialsExtension`, ~8.2% CPU, plus
+`VTDecoderXPCService`) still decodes video onto the same GPU. A GEMM A/B is
+exactly the kind of measurement those perturb, so publishing one would be
+laundering a contended number.
+
+**What the user must run before any MLX-vs-MSL timing can bind:**
+
+```sh
+ssh 192.168.68.103
+sudo launchctl bootout system/com.localai.worker      # stop the worker
+# System Settings -> Wallpaper: replace the AERIAL wallpaper with a static one
+#   (or log the console user out entirely)
+# ... then the A/B below ...
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.localai.worker.plist   # RESTORE
+```
+
+**The A/B itself needs no rebuild** — that is what the seam bought. One binary,
+one lever, and the run *proves which provider executed* rather than assuming it:
+
+```sh
+cd ~/vllmcpp-accel/build-mlx
+export DYLD_LIBRARY_PATH=$HOME/mlx-venv/lib/python3.9/site-packages/mlx/lib
+VT_OP_PROVIDER_STATS=1 ./tests/test_metal_backend        # arm A: MLX selected
+VT_OP_PROVIDER_DISABLE=mlx VT_OP_PROVIDER_STATS=1 \
+  ./tests/test_metal_backend                             # arm B: native MSL
+```
+
+Build recipe (Metal + the optional MLX provider, CLT-only, no Xcode, brew's
+`python@3.14` kept off the build PATH):
+
+```sh
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin cmake -S . -B build-mlx \
+  -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_METAL=ON \
+  -DVLLM_CPP_MLX=ON -DMLX_ROOT=$HOME/mlx-venv/lib/python3.9/site-packages/mlx
+```
+
+**Correctness IS recorded (it does not need a quiet box).** Per op, at real
+projection widths, against our own CPU backend as the oracle; bar
+**NMSE <= 5e-4**; bit-exactness across providers is explicitly *not* promised:
+
+| GEMM | shape / dtype | native MSL vs CPU | MLX vs CPU | MLX vs MSL |
+|---|---|---:|---:|---:|
+| `kMatmul` | 1x2048x2048 bf16 (decode) | 2.80e-06 | 2.80e-06 | 0 |
+| `kMatmulBT` | 1x2048x2048 bf16 (decode) | 2.76e-06 | 2.76e-06 | 0 |
+| `kMatmul` | 32x2048x6144 bf16 (prefill) | 2.75e-06 | 2.75e-06 | 0 |
+| `kMatmulBT` | 32x2048x6144 bf16 (prefill) | 2.74e-06 | 2.74e-06 | 0 |
+| `kMatmul` | 128x512x512 f32 | 3.81e-14 | 3.81e-14 | 0 |
+| `kMatmulBT` | 128x512x512 f32 | 3.74e-14 | 3.74e-14 | 0 |
+
+The zeros are an **observation on these shapes, not a promise** — both providers
+run IEEE (MLX pins `setFastMathEnabled(false)`, we pin `MTLMathModeSafe`) and
+both accumulate in f32 ascending k, which is enough to coincide here; nothing in
+the design relies on it and the gate is the NMSE column. **Both paths are proven
+to have run**: the test asserts `last_selected` names the provider AND that its
+`declines` counter is zero, so a silent fall-back to MSL cannot masquerade as an
+MLX pass.
 
 ## Binding DeepSeek-V2-Lite (MLA) every-axis grid — MLA campaign W9 (2026-07-22)
 

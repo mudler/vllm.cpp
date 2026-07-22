@@ -49,6 +49,16 @@ set(VLLM_CPP_METAL "AUTO" CACHE STRING "Build the Metal backend: ON, OFF, or AUT
 # and into tests/vt/test_backend_cross_device.cpp during the CUDA regressions it
 # must not touch. So Vulkan is opt-in: -DVLLM_CPP_VULKAN=ON.
 set(VLLM_CPP_VULKAN "AUTO" CACHE STRING "Build the Vulkan backend: ON, OFF, or AUTO (=OFF)")
+# The MLX acceleration PROVIDER for the Metal dense GEMM (BACKEND-ACCEL-PROVIDER
+# work row M5, .agents/specs/metal-mlx-reuse-study.md §6.2). Default OFF and
+# deliberately NOT tri-state: unlike a PLATFORM, a provider is a CONFIGURATION
+# CHOICE, and it drags in a ~19 MB libmlx.dylib plus a ~105 MB mlx.metallib —
+# a real deviation from discipline.md's header-only preference, accepted only as
+# an opt-in exactly like VLLM_CPP_TRITON. Native MSL stays the default and is
+# what ships. Point -DMLX_ROOT at an MLX install (the pip wheel's
+# `site-packages/mlx` directory works: it ships include/, lib/ and the metallib).
+set(VLLM_CPP_MLX OFF CACHE BOOL "Build the optional MLX GEMM provider for the Metal backend")
+set(MLX_ROOT "" CACHE PATH "Root of an MLX install (include/ + lib/) for VLLM_CPP_MLX")
 # Supported values today are the sm_12x (consumer/GB10 Blackwell) family:
 #   121a          GB10 / DGX Spark — the default and the only arch with a GATED
 #                 runtime here (every gate model, every benchmark).
@@ -367,6 +377,7 @@ add_library(vllm STATIC
   src/vt/backend.cpp
   src/vt/tensor.cpp
   src/vt/arena.cpp
+  src/vt/op_provider.cpp
   src/vt/ops.cpp
   src/vt/cuda/nvfp4_persistent_cache.cpp
   src/vt/cpu/cpu_backend.cpp
@@ -423,6 +434,29 @@ if(VLLM_CPP_METAL)
     src/vt/metal/metal_backend.mm
     src/vt/metal/metal_ops.mm)
   target_link_libraries(vllm PUBLIC "-framework Metal" "-framework Foundation")
+  # --- optional MLX GEMM provider (BACKEND-ACCEL-PROVIDER M5) ----------------
+  # ONE additive block: one source file, one define, one include dir, one link.
+  # Turning it OFF leaves the Metal build byte-for-byte what it was — which is
+  # the point of the provider seam. The provider registers ALONGSIDE the native
+  # MSL GEMM and wins by priority, deterministically, instead of racing it
+  # through static-init order the way the old flat op table would have.
+  if(VLLM_CPP_MLX)
+    if(NOT MLX_ROOT)
+      message(FATAL_ERROR "VLLM_CPP_MLX=ON requires -DMLX_ROOT=<mlx install root> "
+        "(the pip wheel's site-packages/mlx directory works).")
+    endif()
+    find_library(MLX_LIBRARY NAMES mlx PATHS "${MLX_ROOT}/lib" NO_DEFAULT_PATH)
+    if(NOT MLX_LIBRARY OR NOT EXISTS "${MLX_ROOT}/include/mlx/array.h")
+      message(FATAL_ERROR "VLLM_CPP_MLX=ON but no libmlx + include/mlx/array.h under "
+        "MLX_ROOT=${MLX_ROOT}")
+    endif()
+    target_compile_definitions(vllm PUBLIC VLLM_CPP_MLX)
+    target_sources(vllm PRIVATE src/vt/metal/metal_mlx_provider.mm)
+    # SYSTEM so MLX's own headers cannot break our -Werror build.
+    target_include_directories(vllm SYSTEM PRIVATE "${MLX_ROOT}/include")
+    target_link_libraries(vllm PUBLIC ${MLX_LIBRARY})
+    message(STATUS "MLX GEMM provider enabled: ${MLX_LIBRARY}")
+  endif()
 endif()
 # --- Vulkan backend (BACKEND-VULKAN W0 skeleton) -----------------------------
 # Purely ADDITIVE, exactly like the Metal block above: a `target_sources` list, a

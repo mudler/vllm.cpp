@@ -1,7 +1,13 @@
 # Metal/MLX reuse study + the acceleration-provider seam (`BACKEND-ACCEL-PROVIDER`)
 
-Status: **STUDY + MEASURED MLX BASELINE, 2026-07-22.** No source file changed.
-Owner: `CLAIM-BACKEND-FANOUT-1`.
+Status: **STUDY + MEASURED MLX BASELINE, 2026-07-22** — and, since 2026-07-22,
+**PARTLY IMPLEMENTED**: work rows `W0b-2` (the `vt::OpProvider` seam), the
+`dense_attn_block.h` half of `W0b-1`, and `M5` (MLX as a registered provider for
+the dense GEMM) are LANDED AND GATED, together with a native MSL GEMM that `M5`
+needed in order to have anything to be an alternative *to*. See §10 for exactly
+what landed, what it corrected in this document, and what is still owed.
+Owners: `CLAIM-BACKEND-FANOUT-1` (the study) and
+`CLAIM-BACKEND-ACCEL-PROVIDER-1` (the implementation).
 Rows: `BACKEND-METAL-MLX` (unchanged `ACTIVE`), `BACKEND-GATE-METAL-MLXLM`
 (**stays `INVENTORIED`** — the MLX arm is now installed, pinned and measured, but
 a competitor baseline is not a gate: there is no implementation code and no
@@ -435,6 +441,23 @@ deleter -> call the free function -> `end_encoding` + commit + wait on our
 `vt::Queue`. **An explicit eval/sync boundary per op — no graph, no copy, no
 allocator surrender.**
 
+> **CORRECTION FROM THE IMPLEMENTATION (2026-07-22).** The *input* half of this
+> is exactly right and is what shipped: `array::set_data` over our own
+> `MTL::Buffer*` with a no-op deleter works, and MLX never owns our memory. The
+> *output* half does not survive contact with the shipped wheel. Two measured
+> facts: (a) `nm -gU libmlx.dylib` shows **`steel_matmul_axpby<false>` is not an
+> exported symbol** — only the `get_steel_*_kernel` helpers are — so the free
+> function above is declared in the installed header but is **not linkable**
+> against the prebuilt artifact; (b) even if it were, `Matmul::eval_gpu`
+> re-`set_data`s its output from MLX's own allocator, so a pre-bound output
+> buffer would be discarded. The provider therefore calls the exported
+> `mlx::core::matmul` and `memcpy`s the result into our tensor — a host copy of
+> M*N elements against an O(M*N*K) GEMM on unified memory. Real, cheap, and
+> **not** to be described as zero-copy. One further practical detail the study
+> could not have known: an `array` built this way starts `unscheduled`, so it
+> must be marked `Status::available` or MLX's evaluator throws
+> "Attempting to eval an array without a primitive".
+
 ### 5.3 What it costs, honestly
 
 | Cost | Detail |
@@ -515,14 +538,14 @@ MLX is one row.
 
 | ID | Work | Depends | Why here |
 |---|---|---|---|
-| **W0b-1** | Seam fixes 1-4 of §3.3 — **incl. the `dense_attn_block.h:140,157` host-pointer BUG** | — | blocks ANY model on ANY non-CUDA backend. The bug is a correctness defect, not portability polish |
-| **W0b-2** | `vt::OpProvider` + device-neutral `DeviceCaps` (= old W0b item 8) | W0b-1 | do it BEFORE three backends each invent one. Behavior-preserving: register every existing kernel as a single priority-0 provider whose `supports()` returns true |
+| **W0b-1** (PARTLY LANDED) | Seam fixes 1-4 of §3.3 — **incl. the `dense_attn_block.h:140,157` host-pointer BUG** | — | blocks ANY model on ANY non-CUDA backend. The bug is a correctness defect, not portability polish |
+| **W0b-2** (LANDED 2026-07-22) | `vt::OpProvider` + device-neutral `DeviceCaps` (= old W0b item 8) | W0b-1 | do it BEFORE three backends each invent one. Behavior-preserving: register every existing kernel as a single priority-0 provider whose `supports()` returns true |
 | **W0b-3** | Split `QuantTypeTraits` per §3.4 (= old W0b item 7, corrected — split, do not lift) | W0b-2 | keys on the same predicate |
 | **M2r** | M2 residue: the ~12 remaining elementwise/rope/gated ops | W0b-1 | |
 | **M3a** | **OPT on Metal** — 6 new kernels, incl. `kMatmulBT` + `kPagedAttention` | M2r | the only CUDA-free model TU in the tree; cheapest correct first model. Gate: token-exact vs our own CPU backend on the same M4 |
 | **M3b** | **Qwen3-dense on Metal** — +`kRopeCosSinCache`, `kRopeFromCache`, `kRmsNorm` path | M3a | the model MLX also runs -> unlocks `BACKEND-GATE-METAL-MLXLM` against §7 |
 | **M3c** | Batched encoders + hazard barriers (§1.3), replacing one-command-buffer-per-op | M3a | pure win for OUR kernels, no dependency. Port `device.cpp:264-273` |
-| **M5** | **MLX as a registered provider** (`VLLM_CPP_MLX`, default OFF) for `kMatmul`/`kMatmulBT`, measured A/B against M3's own MSL via `VT_OP_PROVIDER_STATS` | W0b-2, M3b | this is where the §5 bridge is built, and it is now a *configuration*, not a rewrite. Adopt only where it measures faster |
+| **M5** (LANDED 2026-07-22, gated `VLLM_CPP_MLX`) | **MLX as a registered provider** (`VLLM_CPP_MLX`, default OFF) for `kMatmul`/`kMatmulBT`, measured A/B against M3's own MSL via `VT_OP_PROVIDER_STATS` | W0b-2, M3b | this is where the §5 bridge is built, and it is now a *configuration*, not a rewrite. Adopt only where it measures faster |
 | **M4** | GGUF k-quant Metal shaders | M3b, W0b-3, `QUANT-GGUF-CIQ-GEMM` G4 | |
 
 ---
@@ -662,10 +685,176 @@ Landed with this spec:
    `#ifdef VT_*` in `qwen3_5.cpp` **26**.
 2. W0b item 7 restated: `QuantTypeTraits` must be **SPLIT, not lifted** (§3.4).
 3. W0b item 8 and this seam are **the same work** (§6).
-4. **Open defect, not fixed here:** `test_fused_chain_additivity.cpp:420-439`
-   gates 7 of the 9 declared recipes; the `CHECK(... == 7)` count guard whose
-   stated purpose is "tie catalog growth to test growth" has drifted. Repair owed
-   under the fusion row.
-5. **Open defect, not fixed here:** `dense_attn_block.h:140,157` hands a HOST
-   pointer to a DEVICE kernel on any non-CUDA device backend (§3.3 item 2).
-   Latent today because no model runs on one; a hard blocker for M3.
+4. ~~**Open defect, not fixed here:**~~ **FIXED 2026-07-22.**
+   `test_fused_chain_additivity.cpp` gated 7 of the 9 declared recipes; the count
+   guard whose stated purpose is "tie catalog growth to test growth" had drifted.
+   `kFusedAddRmsNormStd` and `kAttnQkNormRope` now have byte-exact CPU drivers in
+   the catalog and the guard reads 9.
+5. ~~**Open defect, not fixed here:**~~ **FIXED 2026-07-22.**
+   `dense_attn_block.h:140,157` handed a HOST pointer to a DEVICE kernel on any
+   non-CUDA device backend (§3.3 item 2). Both `ResidentWeight` and
+   `ResidentWeightF32` now test `is_cpu()` rather than `!is_cuda()` — host-pointer
+   aliasing is a property of the host, not of "not NVIDIA". kCPU and kCUDA
+   behaviour is bit-identical, evidenced by the unchanged dgx regression set.
+
+---
+
+## 10. What actually landed (2026-07-22, `CLAIM-BACKEND-ACCEL-PROVIDER-1`)
+
+Rows this section is the spike for: **`BACKEND-ACCEL-PROVIDER`** (the seam as a
+cross-backend platform concern) and **`KERNEL-ACCEL-PROVIDER-SELECT`** (the same
+seam viewed as the selection layer sitting above every kernel family), plus the
+already-owned `BACKEND-METAL-MLX`. The full spike contract for both — upstream
+surface, dispatch rules, files to port, tests, hardware, gates, dependencies and
+the row-sized work breakdown — is §4 (the structural gap), §5 (MLX as a compute
+path and its costs), §6 (the design and its five-platform generalization test),
+§6.2 (the ranked work breakdown) and the table below (what landed, what is owed).
+
+**Landed and gated:**
+
+| Row | What | Where |
+|---|---|---|
+| `W0b-2` | **`vt::OpProvider`** — the seam. Capacity-bounded static storage, device-neutral `ProviderCaps`, capability predicate, per-call decline-and-fall-back (`GetOpFallback`), selection stats, `VT_OP_PROVIDER_STATS` / `VT_OP_PROVIDER_DISABLE`. Selection is `(priority DESC, name ASC)` — **deterministic**, which was the actual defect. `RegisterOp`/`GetOp`/`OpRegistered` kept their exact signatures and merely changed TU, so **all ~70 op wrappers are byte-unchanged** | `include/vt/op_provider.h`, `src/vt/op_provider.cpp`, `tests/vt/test_op_provider.cpp` |
+| `W0b-1` (part) | The `dense_attn_block.h` **host-pointer bug**. The other three seam fixes (model-loader queue, runner include, Metal attn priority) are still owed and are only reachable once a model runs | `include/vllm/model_executor/models/dense_attn_block.h` |
+| new | **Native MSL dense GEMM** `kMatmul`/`kMatmulBT`. Not in the original plan; required, because a seam that selects between providers needs a second provider to select. Stays the DEFAULT | `src/vt/metal/metal_msl.h`, `src/vt/metal/metal_ops.mm` |
+| `M5` | **MLX as a registered provider** for the dense GEMM, `VLLM_CPP_MLX` default OFF | `src/vt/metal/metal_mlx_provider.mm` |
+
+**Still owed, unchanged by this:** `W0b-1` items 1/3/4, `W0b-3` (the
+`QuantTypeTraits` split, which keys on the same predicate the seam now provides),
+`M2r`, `M3a` (OPT on Metal — still the right first model), `M3b`, `M3c`, `M4`.
+**No model runs on Metal**, so no Metal speed number is claimed or owed, and
+`BACKEND-GATE-METAL-MLXLM` correctly stays `INVENTORIED`.
+
+**§6.1's generalization claim, re-judged against the implementation.** Of the
+five rows in that table, exactly one is now POPULATED (Metal/MLX) and the other
+four are DESIGNED FOR but empty. What the implementation *does* settle is that
+the object-model shape — the row `dropin-kernel-abi.md` could not express — fits
+the same `OpProvider` struct a raw-C launcher uses, with the C++ objects confined
+entirely to the provider's own TU. That was the open question; it is answered.
+Whether cuBLASLt, llama.cpp and coopmat fit as cleanly is a claim this change
+does not yet get to make.
+
+---
+
+## 11. Structured spike contract — `BACKEND-ACCEL-PROVIDER` / `KERNEL-ACCEL-PROVIDER-SELECT`
+
+The narrative above is the study. This section is the same material in the
+canonical spike shape, so the two rows this document now owns are grounded
+field-by-field rather than by cross-reference.
+
+### Scope
+
+One mechanism by which **two or more implementations of a single `vt::` op on a
+single `DeviceType` coexist**, with a deterministic, observable, per-call-
+refusable selection between them. In scope: the registry, the selection rule,
+the device-neutral capability record, the decline-and-fall-back path, the
+instrumentation, and the first two providers (`vt-native`, `mlx`). Explicitly
+OUT of scope: any change to op semantics, argument validation, or any op
+wrapper body; any model; `kPagedAttention`/`kReshapeAndCache` delegation (MLX
+has no paged-KV primitive at all, §5.3); and any speed claim.
+
+### Upstream chain
+
+vLLM has no single file to mirror here, because this is the shape its *whole
+runtime chain* already uses instead of compile-time pinning, and which we are
+adopting one layer up:
+
+- **flashinfer** — per-arch tactic registry plus runtime selection,
+  `flashinfer/gemm/fp4_gemm_cutlass_template_sm120.h:187-220` (the 32 SM12
+  tactics already mirrored in our `nvfp4_tactic_ids.h`).
+- **cuBLASLt / CUTLASS** — `cublasLtMatmulAlgoGetHeuristic` resolves the kernel
+  *per call* from device properties, never from `__CUDA_ARCH__`.
+- **vLLM itself** — `vllm/platforms/cuda.py::CudaPlatform.get_device_capability`
+  (`cuda.py:154-166`) gates which kernel family is reachable at all; ported in
+  `src/vllm/platforms/cuda.cpp:64-71`.
+- **MLX** (the first non-CUDA provider) — `mlx/backend/metal/eval.cpp:32-48`,
+  `mlx/array.h:417-422`, `mlx/allocator.h:12-29`, pinned at `v0.29.3`.
+
+### Our baseline
+
+`src/vt/ops.cpp` held `std::array<std::array<void*, kNumDeviceTypes>, OpId::kCount>`
+— **one** `void*` per (OpId, DeviceType) — and `RegisterOp` assigned into it with
+no check and no warning (§4.2). The contract was stated outright at
+`include/vt/ops.h:47-55`: "Backends register **one** kernel per (OpId,
+DeviceType)". The right shape already existed one layer down and inside
+`vt::cuda`: `src/vt/cuda/cuda_arch_tactics.{h,cu}` (§4.3(a)), whose CUDA
+couplings are exactly three and all shallow. `DeviceResourceOps`
+(`backend.h:114-138`) proves a C-ABI provider table is already accepted in-tree
+(§4.3(c)); `dropin-kernel-abi.md` covers the ARGUMENT half for raw-C launchers
+and cannot express an object-model library (§4.3(d)).
+
+### Port map
+
+| File | Action |
+|---|---|
+| `include/vt/op_provider.h` | NEW — `OpProvider`, `ProviderCaps`, the registry/lookup/stats API, and the declarations of `RegisterOp`/`GetOp`/`OpRegistered` moved here |
+| `src/vt/op_provider.cpp` | NEW — registry, deterministic selection, `GetOpFallback`, caps publication, stats, `VT_OP_PROVIDER_STATS` / `VT_OP_PROVIDER_DISABLE`. Structure ported from `cuda_arch_tactics.cu:64-170` |
+| `src/vt/ops.cpp` | Table + three symbols DELETED (they moved); every op wrapper untouched |
+| `include/vt/ops.h` | Includes `vt/op_provider.h`; the three declarations replaced by a pointer to it |
+| `src/vt/metal/metal_msl.h`, `metal_ops.mm` | NEW `vt_matmul` MSL kernel + `kMatmul`/`kMatmulBT` registration (the native default provider) |
+| `src/vt/metal/metal_mlx_provider.mm` | NEW — the MLX provider, `VLLM_CPP_MLX` |
+| `CMakeLists.txt` | `src/vt/op_provider.cpp`; the additive `VLLM_CPP_MLX` / `MLX_ROOT` block inside the existing Metal block |
+| `include/vllm/model_executor/models/dense_attn_block.h` | `!is_cuda()` -> `is_cpu()` (§3.3 item 2) |
+
+### Tests to port
+
+vLLM has no analogue to port: it has no C++ op table, and its equivalent
+selection lives in Python dispatch plus vendor heuristics. The tests are
+therefore newly authored against the *properties* the upstream mechanisms
+guarantee, and are named for them:
+
+- `tests/vt/test_op_provider.cpp` — deterministic selection under REVERSED
+  registration order; equal-priority name tie-break; duplicate-name rejection;
+  capability-predicate skip; re-resolution after `SetDeviceProviderCaps`;
+  decline-and-fall-back down a three-deep stack; the `declines` counter;
+  per-call `selections`; the runtime disable lever; behaviour preservation of
+  plain `RegisterOp`; unrealized (op, device) still probing false and throwing.
+- `tests/vt/test_metal_backend.cpp` — the same properties on a real accelerator,
+  plus MLX-vs-MSL-vs-CPU NMSE per op at real shapes, plus an end-to-end DECLINE.
+- `tests/vt/test_fused_chain_additivity.cpp` — the drifted count guard repaired
+  to the full 9-recipe catalog (§9 item 4).
+
+### Gates
+
+1. Clean `-Werror`, **0 warnings**, on AppleClang (CLT-only, Metal ON and
+   Metal+MLX ON), GCC/Linux CPU, and nvcc 13.0 `sm_121a` on dgx.
+2. Metal, Vulkan and CPU backend unit suites green; the seam's own tests green,
+   including decline-and-fallback and deterministic selection.
+3. **Correctness bar NMSE <= 5e-4** for the GEMM arms, against our CPU backend
+   as the oracle, at real projection widths. Bit-exactness across providers is
+   **not** promised and must not be claimed unmeasured.
+4. Every arm must PROVE which provider executed (`last_selected` *and*
+   `declines`), because both providers compute the same function.
+5. dgx regressions, each STANDALONE, ALL UNCHANGED: 27B 235/235 · 35B 315/315 ·
+   Qwen3-Coder 6/6 · Qwen3-dense 16/16 · OPT 6/6 · DeepSeek-V2 8/8. `ops.cpp` is
+   the hottest shared file in the tree, so this is the real risk and is proven,
+   not assumed.
+6. Both record checkers.
+
+### Dependencies
+
+Depends on nothing. **Depended on by** work rows `W0b-3` (the `QuantTypeTraits`
+split, §3.4, which keys on the same predicate), `M5` (satisfied here), the
+Vulkan coopmat tactic (fan-out spike V3), and any future CUDA vendor-library
+provider — whose argument half is `dropin-kernel-abi.md`. Optional build
+dependency for the MLX provider only: `libmlx.dylib` + `mlx.metallib`
+(~19 MB + ~105 MB), default OFF, precedent `VLLM_CPP_TRITON`.
+
+### Work breakdown
+
+See §6.2 for the full ranked plan and §10 for exactly which of its rows landed.
+The rows owned here are `W0b-2` (LANDED), the `dense_attn_block.h` half of
+`W0b-1` (LANDED), the native MSL GEMM (LANDED, unplanned but required), and `M5`
+(LANDED, gated). `W0b-1` items 1/3/4, `W0b-3`, `M2r`, `M3a`, `M3b`, `M3c` and
+`M4` are unchanged and still owed.
+
+### Risks/decisions
+
+| Risk | Disposition |
+|---|---|
+| **Hot-path regression in `ops.cpp`** — `GetOp` is called by every op in the tree, and `OpRegistered` per step by the fused-recipe ladder | Selection is RESOLVED ONCE and cached in a relaxed atomic; negative resolution is memoized so a missing op stays O(1); the disable-list lookup short-circuits lock-free. Proven by the unchanged dgx regression set, not by argument |
+| **A provider silently declining into the slow path** (fan-out spike Risk 4) | `declines` is a first-class counter and every accelerator arm asserts it is zero. A green numeric test alone would NOT have caught this |
+| **Ties broken by registration order** would reintroduce the very nondeterminism being fixed | Ties break on `name` by `strcmp`; duplicate names are rejected so the order stays total |
+| **MLX becoming a hard dependency** (`discipline.md` prefers header-only) | Build-gated, default OFF, native MSL is the default and ships; `VT_OP_PROVIDER_DISABLE=mlx` switches it off in an existing binary |
+| **Claiming bit-exactness across providers** | Refused. MLX-vs-MSL measured 0 on the tested shapes and is recorded explicitly as an observation, not a promise; the gate is NMSE |
+| **Publishing a contended MLX timing** | Refused. The M4 could not be quieted; no MLX-vs-MSL speed number is published, and the commands the user must run first are in `docs/BENCHMARKS.md` |

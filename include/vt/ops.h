@@ -8,6 +8,7 @@
 #include <type_traits>
 
 #include "vt/fused_recipe.h"
+#include "vt/op_provider.h"
 #include "vt/tensor.h"
 
 namespace vt {
@@ -601,14 +602,13 @@ using FusedChainFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, Tensor*, const FusedRecipe&, float);
 using DropinProbeFn = void (*)(Queue&, Tensor&, const Tensor&, const DropinProbeArgs&);
 
-void RegisterOp(OpId op, DeviceType device, void* fn);
-void* GetOp(OpId op, DeviceType device);
-// Non-throwing probe: is `op` realized on `device`? Already the mechanism behind
-// the fused-recipe fast-realization fallback (src/vt/ops.cpp) — DECLARED here so
-// the cross-device test harness can ask which ops a PARTIAL backend implements
-// without using exceptions as control flow. A partial backend is a supported,
-// tested state; GetOp throwing is how that is enforced at a call site.
-bool OpRegistered(OpId op, DeviceType device);
+// `RegisterOp`, `GetOp`, `OpRegistered` and the acceleration-provider seam they
+// now dispatch through are declared in vt/op_provider.h, included at the top of
+// this header. Their signatures and semantics are unchanged: RegisterOp still
+// installs one kernel for (OpId, DeviceType) — it is simply the priority-0
+// "vt-native" provider now, and a SECOND provider (MLX on Metal, cuBLASLt on
+// CUDA, llama.cpp on CPU/Vulkan) can coexist deterministically instead of
+// silently overwriting it under unspecified static-init order.
 
 template <typename Fn>
 void RegisterTypedOp(OpId op, DeviceType device, Fn fn) {

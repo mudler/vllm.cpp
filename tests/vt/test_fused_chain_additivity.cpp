@@ -17,7 +17,7 @@
 // each step to `q.device`'s standalone op. So the CPU backend realizes EVERY catalog
 // recipe through that one path with NO per-recipe code.
 //
-// This test enumerates the WHOLE catalog (`kCatalog`, all 7 recipes) and, in ONE
+// This test enumerates the WHOLE catalog (`kCatalog`, all 9 recipes) and, in ONE
 // generic loop, asserts each runs CORRECT on the CPU 'second backend' via the Tier-0
 // composite — BYTE-EXACT vs the standalone-op-sequence golden, over the CPU-expressible
 // scope. For recipes whose quant terminal is CPU-expressible (fp4 + the attn macro +
@@ -148,6 +148,102 @@ void CheckFusedAddRmsNorm() {
   vt::FusedChainComposite(q, vt::kFusedAddRmsNorm, b, p);
   CHECK(out_c == out_g);
   CHECK(res_c == res_g);
+}
+
+// kFusedAddRmsNormStd — full: the gemma=false sibling of kFusedAddRmsNorm (weight `w`,
+// not `1+w`) used by the Qwen3 DENSE decoder norms. It was declared in recipes.h without
+// a catalog row, which is exactly what the count guard below exists to prevent — the
+// guard had drifted to 7 while the catalog declared 9
+// (.agents/specs/metal-mlx-reuse-study.md §4.3(b), §9 item 4). Repaired here.
+void CheckFusedAddRmsNormStd() {
+  const int64_t t = 3, h = 512;
+  const float eps = 1e-6f;
+  const auto xf = RandF32(static_cast<size_t>(t * h), 111);
+  const auto wf = RandF32(static_cast<size_t>(h), 112);
+  const auto rf = RandF32(static_cast<size_t>(t * h), 113);
+  const auto xb = PackBf16(xf), wb = PackBf16(wf);
+  std::vector<float> res_g = rf, res_c = rf;
+  std::vector<uint8_t> out_g(static_cast<size_t>(t * h) * vt::SizeOf(DType::kBF16));
+  std::vector<uint8_t> out_c(out_g.size());
+  Tensor tx = MakeTensor(const_cast<uint8_t*>(xb.data()), DType::kBF16, {t, h});
+  Tensor tw = MakeTensor(const_cast<uint8_t*>(wb.data()), DType::kBF16, {h});
+  Queue q{Cpu(), nullptr};
+
+  Tensor tog = MakeTensor(out_g.data(), DType::kBF16, {t, h});
+  Tensor trg = MakeTensor(res_g.data(), DType::kF32, {t, h});
+  vt::RmsNorm(q, tog, tx, tw, RmsNormArgs{eps, /*gemma=*/false}, &trg);
+
+  Tensor toc = MakeTensor(out_c.data(), DType::kBF16, {t, h});
+  Tensor trc = MakeTensor(res_c.data(), DType::kF32, {t, h});
+  FusedBinding b;
+  b.op[0] = &tx;
+  b.op[1] = &tw;
+  b.op[2] = &trc;
+  b.op[3] = &toc;
+  b.n = 4;
+  FusedParams p;
+  p.eps = eps;
+  vt::FusedChainComposite(q, vt::kFusedAddRmsNormStd, b, p);
+  CHECK(out_c == out_g);
+  CHECK(res_c == res_g);
+}
+
+// kAttnQkNormRope — full: the NON-gated sibling of kAttnQkNormRopeGate (Qwen3 dense has
+// no attention output gate). Composite-only MACRO realized as three EXISTING standalone
+// ops: RmsNorm(q) in place, RmsNorm(k) in place, RopeFromCache over the 3-D views that
+// alias the same buffers. Second half of the count-guard repair.
+void CheckAttnQkNormRope() {
+  const int64_t T = 8, Hq = 16, Hkv = 2, Dh = 128;
+  const int rot = 64;
+  const float base = 1.0e7f, eps = 1e-6f;
+  const auto q_h = RandF32(static_cast<size_t>(T * Hq * Dh), 310);
+  const auto k_h = RandF32(static_cast<size_t>(T * Hkv * Dh), 320);
+  const auto qn_h = RandF32(static_cast<size_t>(Dh), 330, -0.5f, 0.5f);
+  const auto kn_h = RandF32(static_cast<size_t>(Dh), 340, -0.5f, 0.5f);
+  std::vector<int32_t> pos_h(static_cast<size_t>(T));
+  for (int64_t x = 0; x < T; ++x) pos_h[static_cast<size_t>(x)] = static_cast<int32_t>(x);
+
+  Queue q{Cpu(), nullptr};
+  Tensor tqn = MakeTensor(const_cast<float*>(qn_h.data()), DType::kF32, {Dh});
+  Tensor tkn = MakeTensor(const_cast<float*>(kn_h.data()), DType::kF32, {Dh});
+  Tensor tpos = MakeTensor(pos_h.data(), DType::kI32, {T});
+  std::vector<float> cs(static_cast<size_t>(T * rot));
+  Tensor tcs = MakeTensor(cs.data(), DType::kF32, {T, rot});
+  vt::RopeCosSinCache(q, tcs, tpos, RopeArgs{base, rot});
+
+  auto run = [&](bool golden, std::vector<float>& qo, std::vector<float>& ko) {
+    qo = q_h;
+    ko = k_h;
+    Tensor tq2 = MakeTensor(qo.data(), DType::kF32, {T * Hq, Dh});
+    Tensor tk2 = MakeTensor(ko.data(), DType::kF32, {T * Hkv, Dh});
+    Tensor tq3 = MakeTensor(qo.data(), DType::kF32, {T, Hq, Dh});
+    Tensor tk3 = MakeTensor(ko.data(), DType::kF32, {T, Hkv, Dh});
+    if (golden) {
+      vt::RmsNorm(q, tq2, tq2, tqn, RmsNormArgs{eps, /*gemma=*/false}, nullptr);
+      vt::RmsNorm(q, tk2, tk2, tkn, RmsNormArgs{eps, /*gemma=*/false}, nullptr);
+      vt::RopeFromCache(q, tq3, &tk3, tpos, tcs, RopeArgs{base, rot});
+    } else {
+      FusedBinding b;
+      b.op[0] = &tq2;
+      b.op[1] = &tqn;
+      b.op[2] = &tk2;
+      b.op[3] = &tkn;
+      b.op[4] = &tq3;
+      b.op[5] = &tk3;
+      b.op[6] = &tcs;
+      b.op[7] = &tpos;
+      b.n = 8;
+      FusedParams p;
+      p.eps = eps;
+      p.rope = RopeArgs{base, rot};
+      vt::FusedChainComposite(q, vt::kAttnQkNormRope, b, p);
+    }
+  };
+  std::vector<float> qg, kg, qc, kc;
+  run(true, qg, kg);
+  run(false, qc, kc);
+  CHECK(qc == qg);
+  CHECK(kc == kg);
 }
 
 // kSiluMulFp4Quant — full: MoeSiluMul(bf16) + ScaledFp4Quant (fp4 terminal is CPU-ok).
@@ -419,6 +515,8 @@ struct CatalogEntry {
 
 const CatalogEntry kCatalog[] = {
     {&vt::kFusedAddRmsNorm, "kFusedAddRmsNorm", true, &CheckFusedAddRmsNorm},
+    {&vt::kFusedAddRmsNormStd, "kFusedAddRmsNormStd", true, &CheckFusedAddRmsNormStd},
+    {&vt::kAttnQkNormRope, "kAttnQkNormRope", true, &CheckAttnQkNormRope},
     {&vt::kSiluMulFp4Quant, "kSiluMulFp4Quant", true, &CheckSiluMulFp4Quant},
     {&vt::kSigmoidGateFp4Quant, "kSigmoidGateFp4Quant", true, &CheckSigmoidGateFp4Quant},
     {&vt::kAttnQkNormRopeGate, "kAttnQkNormRopeGate", true, &CheckAttnQkNormRopeGate},
@@ -436,7 +534,11 @@ const CatalogEntry kCatalog[] = {
 // registers one kFusedChain + the standalone primitives). The count guard ties catalog
 // growth to test growth so a future recipe cannot silently escape the additivity proof.
 TEST_CASE("W4 additivity: every catalog recipe runs correct on the CPU 'second backend' via composite") {
-  CHECK(sizeof(kCatalog) / sizeof(kCatalog[0]) == 7);
+  // The guard is the mechanism, so it must equal the number of recipes DECLARED in
+  // include/vt/recipes.h — it had drifted to 7 against a 9-recipe catalog, which is
+  // precisely the silent escape it exists to prevent. Repaired to 9 with the two
+  // missing rows (kFusedAddRmsNormStd, kAttnQkNormRope) added above.
+  CHECK(sizeof(kCatalog) / sizeof(kCatalog[0]) == 9);
   for (const auto& e : kCatalog) {
     CAPTURE(e.name);
     CAPTURE(e.cpu_full);

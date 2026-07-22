@@ -12,6 +12,7 @@
 //   src/vt/cpu/cpu_layernorm.cpp:49-73 LayerNormKernel   -> vt_layer_norm
 //   src/vt/cpu/cpu_layernorm.cpp:75-85 ReluKernel        -> vt_relu
 //   src/vt/cpu/cpu_layernorm.cpp:87-99 AddKernel         -> vt_add
+//   src/vt/cpu/cpu_ops.cpp MatmulKernel/MatmulBTKernel  -> vt_matmul
 //   src/vt/dtype.cpp:224-233        BF16<->F32 codec     -> vt_bf16_to_f32 /
 //                                                           vt_f32_to_bf16
 //
@@ -296,6 +297,80 @@ struct VtFStep {
   uint gemma;
   uint pad;
 };
+
+// ===========================================================================
+// Dense GEMM — the NATIVE MSL provider for kMatmul and kMatmulBT.
+//
+// This is the DEFAULT on Metal. It exists so the MLX provider
+// (src/vt/metal/metal_mlx_provider.mm) is a CONFIGURATION rather than the only
+// way to get a GEMM: the provider seam's whole premise is that two providers of
+// one op coexist and can be A/B'd against each other, which requires ours to be
+// there. It also gives the correctness gate its middle column
+// (MLX vs native MSL vs the CPU oracle).
+//
+// Math ported FROM src/vt/cpu/cpu_ops.cpp MatmulKernel / MatmulBTKernel: f32
+// accumulation over K regardless of storage dtype, one rounding on store.
+// Dispatch shape is the classic threadgroup-tiled GEMM (llama.cpp
+// ggml-metal `kernel_mul_mm` uses the same 2-D tile-per-threadgroup structure
+// over simdgroup_matrix; we stay on plain threadgroup memory because the W0
+// build compiles MSL at RUNTIME with no offline `metal`, and a portable tile
+// loop is what the CPU-reference math transcribes to directly).
+//
+// ORIENTATION. One kernel serves both ops via `bt`:
+//   bt == 0 (kMatmul):   B is [K,N] row-major, element (kk,col) at kk*N + col
+//   bt == 1 (kMatmulBT): B is [N,K] row-major, element (col,kk) at col*K + kk
+// `lda` is the ACTIVATION's row stride in elements — kMatmulBT explicitly admits
+// a row-strided activation (src/vt/ops.cpp MatmulBT: `a.stride[0] >= a.shape[1]`),
+// so it cannot be assumed equal to K.
+#define VT_GEMM_TILE 16u
+
+struct VtGemmParams {
+  uint m;
+  uint n;
+  uint k;
+  uint lda;     // activation row stride, in ELEMENTS
+  uint a_dt;
+  uint b_dt;
+  uint out_dt;
+  uint bt;      // 0 => b is [K,N]; 1 => b is [N,K] (the torch Linear orientation)
+};
+
+kernel void vt_matmul(device const uchar* a   [[buffer(0)]],
+                      device const uchar* b   [[buffer(1)]],
+                      device uchar*       out [[buffer(2)]],
+                      constant VtGemmParams& p [[buffer(3)]],
+                      uint2 tgid [[threadgroup_position_in_grid]],
+                      uint2 lid  [[thread_position_in_threadgroup]]) {
+  threadgroup float as[VT_GEMM_TILE][VT_GEMM_TILE];
+  threadgroup float bs[VT_GEMM_TILE][VT_GEMM_TILE];
+
+  const uint row = tgid.y * VT_GEMM_TILE + lid.y;
+  const uint col = tgid.x * VT_GEMM_TILE + lid.x;
+  const uint ntiles = (p.k + VT_GEMM_TILE - 1u) / VT_GEMM_TILE;
+
+  float acc = 0.0f;
+  for (uint t = 0u; t < ntiles; ++t) {
+    const uint ka = t * VT_GEMM_TILE + lid.x;
+    as[lid.y][lid.x] =
+        (row < p.m && ka < p.k) ? vt_load(a, p.a_dt, ulong(row) * ulong(p.lda) + ulong(ka)) : 0.0f;
+
+    const uint kb = t * VT_GEMM_TILE + lid.y;
+    float bv = 0.0f;
+    if (col < p.n && kb < p.k) {
+      bv = (p.bt != 0u) ? vt_load(b, p.b_dt, ulong(col) * ulong(p.k) + ulong(kb))
+                        : vt_load(b, p.b_dt, ulong(kb) * ulong(p.n) + ulong(col));
+    }
+    bs[lid.y][lid.x] = bv;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0u; i < VT_GEMM_TILE; ++i) { acc += as[lid.y][i] * bs[i][lid.x]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (row < p.m && col < p.n) {
+    vt_store(out, p.out_dt, ulong(row) * ulong(p.n) + ulong(col), acc);
+  }
+}
 
 struct VtFcParams {
   uint  t;

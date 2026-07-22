@@ -202,6 +202,10 @@ if(VLLM_CPP_VULKAN)
   target_include_directories(test_vulkan_backend PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_tensor vt/test_tensor.cpp)
+# BACKEND-ACCEL-PROVIDER: the acceleration-provider seam (include/vt/op_provider.h)
+# — deterministic selection, capability predicates, decline-and-fall-back and the
+# selection stats. Device-independent (registers onto the unused kXPU slots).
+vllm_cpp_add_test(test_op_provider vt/test_op_provider.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
 # QUANT-GGUF-CIQ-GEMM G1: block dtypes, the quant traits table and its

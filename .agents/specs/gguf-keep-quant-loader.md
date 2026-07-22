@@ -1,7 +1,7 @@
 # Leaf spec: GGUF keep-quantized loader — quantized weights resident, dequant as oracle
 
 **Row:** `QUANT-GGUF-KEEPQ-LOADER` (quantization-matrix.md, leaf of the
-`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **L1+L2+L3 landed** (2026-07-22, `CLAIM-QUANT-GGUF-COMPUTE-1`): block residency, the total per-tensor routing policy and the `VT_CPU_REF` oracle switch all exist and are gated, but keep-quant is **DEFAULT OFF** (nothing can consume a block-typed weight until CIQ G4 routes the call sites), so a production load still expands every weight to bf16. L4 (the RSS gate) open ·
+`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **L1+L2+L3 landed** (2026-07-22, `CLAIM-QUANT-GGUF-COMPUTE-1`): block residency, the total per-tensor routing policy and the `VT_CPU_REF` oracle switch all exist and are gated. **Keep-quant is now DEFAULT ON wherever the running device can execute the quant GEMM** (CIQ G4 flipped it, `CLAIM-QUANT-GGUF-CIQ-G4-1`), so a CPU load keeps its blocks and a CUDA load still expands. L4 (the RSS gate) **open and NOT met**: peak RSS fell 7.428 → 6.401 GiB (1.16×), still **2.29× llama.cpp** against a ≤1.15× bar — the residual is diagnosed below ·
 **upstream pin:** llama.cpp local fork `237ad9b96` (b9892) ·
 **parent evidence:** B4 decision row
 ([parity-ledger.md L290](../parity-ledger.md#L290)): load-time bf16 expansion
@@ -122,7 +122,8 @@ Pinned local fork `/home/mudler/_git/llama.cpp` @ `237ad9b96`.
 | L1 | merge bench branch | merge `7c91a42` (`bench/quant-gguf-compute-b4-cpu-floor`) into main: dense-arch `qwen35` GGUF loader + F16/BF16 row dequant; gguf ctest green; ledger note that B4 loader arm is now on main | - | **DONE** 2026-07-22 |
 | L2 | quant residency | `GgufQuantWeight`/block-`OwnedTensor` storage + loader keep-quant path + losslessness units (gate 1) | CIQ G1 | **DONE** 2026-07-22 |
 | L3 | routing + oracle switch | per-tensor policy table, `VT_CPU_REF` env, oracle-stability gate 2, routing units | L2 | **DONE** 2026-07-22 |
-| L4 | memory gate + closure | RSS measurement (gate 3), matrix `M`-cell notes, ledger row | L2, L3 | open |
+| L4 | memory gate + closure | RSS measurement (gate 3), matrix `M`-cell notes, ledger row | L2, L3 | **MEASURED, NOT MET** 2026-07-22 (see below) |
+| L5 | mmap residency + tied-head sharing | stop COPYING block bytes out of the mapped file (llama.cpp supports both; L2 chose copy deliberately) and stop materialising the vocab matrix twice for a tied `lm_head` — the two changes L4's measurement identifies as ~1.9 GiB of the remaining 3.6 GiB gap | L4 | open |
 
 ## Risks/decisions
 
@@ -300,3 +301,46 @@ L4's and cannot be measured until keep-quant is ON, which needs CIQ G4; gate 4
 (no behavior change while inert) is met as stated above. Weights STAYING
 quantized is not the same as COMPUTING in quant: the per-encoding `C` cells stay
 `-` until G4.
+
+## L4 result (2026-07-22) — the default is ON, gate 3 is MEASURED and NOT MET
+
+CIQ **G4** routed `vt::MatmulBT` onto `kMatmulBTQuant` and flipped this leaf's
+master switch: [`GgufLoadPolicy::FromEnv`](../../src/vllm/model_executor/model_loader/gguf_keep_quant.cpp#L95)
+now defaults `keep_quant` to `GgufQuantComputeAvailable()` — "is
+`kMatmulBTQuant` registered for the device this process will run on" — instead
+of `false`. `VT_GGUF_KEEP_QUANT=0` remains the opt-out and `VT_CPU_REF=1` still
+overrides everything. G4 also added `expand_nk`, which stops TRANSPOSING a
+matmul weight that has to expand (see the CIQ leaf); it rides the same
+availability condition, is off under `VT_CPU_REF`, and is bit-exact on the CPU
+GEMM by construction.
+
+**Gate 3 measured (binding recipe, idle `dgx.casa` aarch64, one `flock`, 3 reps,
+`Qwen3.5-2B-UD-Q8_K_XL.gguf`):** peak RSS **7,788,196 KB → 6,712,368 KB**, i.e.
+**7.428 → 6.401 GiB**, a 1.16× reduction. The bar (file size + activations +
+15 %, ≈ 3.1 GiB) is **NOT met**, and the competitor ratio is **2.29× llama.cpp**
+(2.798 GiB) against the CIQ leaf's gate-5 bar of 1.15×.
+
+**The residual is fully accounted for, and only ~25 % of it is the bf16
+expansion this leaf was about.** On this file:
+
+| term | size | why it is still resident |
+|---|---|---|
+| touched file pages | 2.68 GiB | L2 COPIES blocks into owned buffers; the mapped source pages stay resident for the copy |
+| f16 → bf16 expansion | 1.615 GiB | 56 of the file's tensors are `f16`, which is not a block encoding, so keep-quant cannot apply |
+| second copy of the tied head | 0.947 GiB | `token_embd.weight` is materialised once as the embedding table and again as `lm_head` |
+| kept `q8_0` blocks | 1.062 GiB | the intended residency — this is the part that WORKED |
+| **total** | **≈ 6.35 GiB** | vs 6.401 GiB measured |
+
+So the two loader changes worth doing next (work row **L5**) are
+**mmap-in-place residency** (removes the 2.68 GiB double-count; recorded as a
+follow-up in Risks/decisions from the start) and **sharing the tied `lm_head`
+with the embedding table** (removes 0.947 GiB). Together ≈ 1.9 GiB of the
+3.6 GiB that separates us from llama.cpp. The remaining 1.6 GiB is the f16
+expansion, which disappears if the elementwise GEMM learns to consume f16 rows
+directly — that is the CPU track's new #1 lever, not this leaf's.
+
+**Nothing else moved.** The oracle arm (`VT_CPU_REF=1`) reproduces the pre-G4
+RSS to 256 KB (7,787,940 vs 7,788,196) and the pre-G4 latency to 0.15 %, and its
+output token stream is byte-identical to both the BEFORE and the AFTER arm (one
+md5, `d235db12f2cd304007530286a1755c95`) — gate 2 holds end to end with the
+default flipped.

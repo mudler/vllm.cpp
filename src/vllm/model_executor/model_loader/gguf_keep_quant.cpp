@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "vllm/platforms/interface.h"
+#include "vt/ops.h"
 #include "vt/quant.h"
 
 namespace vllm {
@@ -41,7 +43,17 @@ bool EnvOn(const char* name) {
            std::strcmp(v, "false") == 0 || std::strcmp(v, "off") == 0);
 }
 
+// Tri-state: unset -> `fallback`; "0"/"false"/"off"/"" -> false; else true.
+bool EnvOnOr(const char* name, bool fallback) {
+  return std::getenv(name) == nullptr ? fallback : EnvOn(name);
+}
+
 }  // namespace
+
+bool GgufQuantComputeAvailable() {
+  return vt::OpRegistered(vt::OpId::kMatmulBTQuant,
+                   vllm::platforms::CurrentPlatform().device_type());
+}
 
 const char* Name(GgufTensorRole role) {
   switch (role) {
@@ -95,7 +107,14 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool cpu_ref,
 GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   GgufLoadPolicy p;
   p.cpu_ref = EnvOn("VT_CPU_REF");
-  p.keep_quant = EnvOn("VT_GGUF_KEEP_QUANT");
+  // CIQ G4 flipped this default: keep-quant is ON wherever the running device
+  // can execute the quantized GEMM. VT_GGUF_KEEP_QUANT is the two-way
+  // override that survives the flip (=0 is the opt-out the spec promised).
+  p.keep_quant = EnvOnOr("VT_GGUF_KEEP_QUANT", GgufQuantComputeAvailable());
+  // The orientation win rides the same availability condition, and the oracle
+  // switch turns it off with everything else so VT_CPU_REF=1 reproduces the
+  // historical load byte for byte.
+  p.expand_nk = p.keep_quant && !p.cpu_ref;
   return p;
 }
 

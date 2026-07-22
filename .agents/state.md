@@ -18718,6 +18718,125 @@ export DYLD_LIBRARY_PATH=$HOME/mlx-venv/lib/python3.9/site-packages/mlx/lib
 VT_OP_PROVIDER_STATS=1 ./tests/test_metal_backend                      # arm A: MLX
 VT_OP_PROVIDER_DISABLE=mlx VT_OP_PROVIDER_STATS=1 ./tests/test_metal_backend  # arm B: MSL
 ```
+---
+
+## 2026-07-22 — `QUANT-GGUF-CIQ-GEMM` **G4** + `QUANT-GGUF-KEEPQ-LOADER` **L4**: GGUF compute-in-quant ROUTED and DEFAULT-ON (`CLAIM-QUANT-GGUF-CIQ-G4-1`, base `c603ebc`)
+
+**The machinery built by G1-G3 and L1-L3 is now on the executed path, and the
+first real benchmark for this track is on record.**
+
+### What changed (three edits, no model forward touched)
+
+1. **The routing point.** `vt::MatmulBT` (`src/vt/ops.cpp`) dispatches a
+   block-dtype `b` to `MatmulBTQuant`; everything else falls through to its
+   unchanged validation and `kMatmulBT`. ONE branch routes the whole model,
+   because every matmul helper already sends an `nk == true` weight to
+   `MatmulBT` (`qwen3_5.cpp:1067,1078` device-in/out, `:743,760` host) and the
+   keep-quant loader already produces exactly that. Safetensors paths are
+   unreachable from the branch by construction — no safetensors loader emits a
+   block dtype.
+2. **The default flip.** `GgufLoadPolicy::FromEnv` defaults `keep_quant` to the
+   new `GgufQuantComputeAvailable()` =
+   `vt::OpRegistered(kMatmulBTQuant, CurrentPlatform().device_type())` instead
+   of `false`. That is the honest condition — "does a block weight have a
+   consumer on the device this process will run on" — so a CUDA build still
+   expands (CUDA GGUF compute is a future backend row) and the default will
+   follow the kernel wherever it is registered next, with no edit here.
+   `VT_GGUF_KEEP_QUANT=0/off/false` is the opt-out; `VT_CPU_REF=1` still wins
+   over everything.
+3. **Orientation (`expand_nk`).** A matmul weight that must EXPAND is now
+   materialised in the file's own `[N,K]` order with `nk=true` instead of being
+   transposed into Matmul-B `[K,N]`. This was the floor re-measurement's lever 2
+   (1.3-3.0× measured). It is numerically free on the CPU tier by construction
+   (`MatmulOneChunk<kBT>` differs from `<false>` ONLY in the weight offset, same
+   sequential f32 K reduction) and deliberately NOT applied where the GEMM picks
+   its algorithm from the operand layout (cuBLASLt).
+
+**Why (3) mattered more than expected:** published quants are MIXED. The bench
+file is 103 `q8_0` **and 56 `f16`** tensors — 1.615 GiB of f16, including the
+970 MiB tied `token_embd`/`lm_head` and whole ffn layers. Without `expand_nk`
+the largest GEMM in the model would still have paid the slow orientation.
+
+### Correctness — NO TOKEN MOVED ANYWHERE
+
+- `test_qwen36_gguf_engine`, quant path DEFAULT-ON, run **STANDALONE on a
+  CPU-only dgx build** (which is where keep-quant is live): **PASSES** on the
+  real APEX files — 2/2 cases, 16/16 greedy tokens each on Compact
+  (`{F32,Q3_K,Q4_K,Q6_K}`) and Balanced (`{F32,Q8_0,Q5_K,Q6_K}`) vs the
+  same-file llama.cpp oracle, exercising 5 of the 6 routed encodings end to end.
+  Peak RSS during it was 18.7 GiB on the 17.3 GiB Compact file — visibly the
+  file, not an expansion of it.
+- Bench-model oracle A/B: the pre-G4 (`VT_GGUF_KEEP_QUANT=0`), post-G4 default
+  and `VT_CPU_REF=1` output token streams are **byte-identical**, one md5
+  `d235db12f2cd304007530286a1755c95`. The spec reserved latitude for legitimate
+  bf16-vs-quant drift; it was **not needed and no golden was regenerated**.
+- **Regressions ALL UNCHANGED**, each STANDALONE on a clean CUDA `-Werror` build
+  (0 warnings, production flags, one `flock $HOME/gpu.lock`, `git archive`
+  transfer, goldens md5 `2965ef5772b556d3f3f86fedf4221b2f` identical before and
+  after): 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6** (138), Qwen3-dense
+  **16/16** on both 0.6B and 4B (664), OPT **6/6** (36), DeepSeek-V2-Lite
+  **8/8** (223), `test_qwen36_gguf_engine` **28/28** and **28/28** under
+  `VT_CPU_REF=1`.
+- Dev box: clean CPU `-Werror` 0 warnings, full CPU ctest **155/155** (one
+  co-scheduling flake, `test_openai_conformance`, green standalone). dgx aarch64
+  CPU units all green.
+- **One control worth naming.** A CPU-ONLY build fails four SACRED gates
+  (`test_qwen36_weights`, `test_qwen3_paged_engine`, `test_qwen27_paged_engine`,
+  `test_deepseek_v2_paged_engine`) because their goldens were captured on CUDA
+  and a CPU forward is not bit-identical to it. The BASE tree `c603ebc` was
+  built CPU-only on the same box and run against the same four: **identical
+  failures, identical assertion counts** (51/2, 245/2, 11/2, 95/1). None of the
+  four loads a GGUF file and all four pass on the CUDA build. Pre-existing, not
+  a G4 regression — but expect it whenever you run the CPU-only build, which is
+  the only configuration that exercises the quant path.
+
+### The benchmark, and the honest answer on the projection
+
+Binding, idle `dgx.casa` (GB10 aarch64, 20 cores), load 0.11 at series start,
+whole series under one `flock`, SAME binary, 3 reps, medians. llama.cpp
+`237ad9b96` re-run in the same series: pp128 **175.71 ± 2.54**, tg32 **25.87 ±
+1.36**, peak RSS **2.798 GiB**.
+
+| arm | TTFT (ms) | TPOT (ms) | peak RSS (KB) |
+|---|---|---|---|
+| pre-G4 (`VT_GGUF_KEEP_QUANT=0`) | 24,859.25 | 451.27 | 7,788,196 |
+| **post-G4 (default)** | **5,970.21** | **130.72** | **6,712,368** |
+| oracle (`VT_CPU_REF=1`) | 24,822.20 | 451.89 | 7,787,940 |
+
+**A/B: decode 2.216 → 7.650 t/s (3.45×), prefill 5.149 → 21.44 t/s (4.16×),
+peak RSS 7.428 → 6.401 GiB (1.16× less). vs llama.cpp: 11.7× → 3.38× behind on
+decode, 34.1× → 8.20× on prefill, 2.66× → 2.29× worse on RSS.**
+
+**The 9-17× projection did NOT hold.** It applied the quant GEMM's op-level
+throughput to the whole model, assuming every GEMM could take it. On this file
+only 1.062 GiB / 1.073 B params are `q8_0` and routable, while **1.615 GiB /
+0.867 B params are `f16`** — no block encoding covers f16 — so 60 % of the
+weight bytes, including the model's biggest GEMM, still run the elementwise bf16
+kernel at 17-25 GFLOP/s. 3.4-4.2× is exactly what that mixture predicts; the
+quant kernels did not under-deliver. The same mixture accounts for the RSS floor
+to 0.8 %: 2.68 GiB touched file pages (blocks are COPIED, not mmapped) + 1.615
+GiB f16→bf16 + 0.947 GiB second copy of the tied head + 1.062 GiB kept blocks
+= 6.35 GiB vs 6.401 measured.
+
+CIQ gate 4's tier-0 milestone (decode ≥ 0.25× tg32, prefill ≥ 0.1× pp128) is
+**MET** at 0.296× / 0.122×. Gate 5 / loader gate 3 (RSS) is **MEASURED and NOT
+MET**.
+
+### Next steps, re-ranked by this measurement
+
+1. **The elementwise bf16/f16 GEMM is now the #1 CPU lever** — SIMD
+   `vec_dot_bf16/f16` plus hoisting `MatmulOneChunk`'s per-element `LoadF32`
+   dtype switch out of the K loop (floor-remeasurement lever 3). It owns the
+   60 % the quant path cannot reach, every safetensors CPU path, and every mixed
+   GGUF, which is what published quants actually are.
+2. **Loader L5 (new)** — mmap-in-place residency instead of copying, and sharing
+   the tied `lm_head` with the embedding table: together ≈1.9 GiB of the 3.6 GiB
+   RSS gap. Neither is a kernel change.
+3. **G5/G6 drop below both** (they only speed the 40 % already fast) and **G7
+   (repack) stays parked** — prefill is 8.2× behind and the quant GEMM is not
+   what is holding it.
+4. Threadpool **W4** still open: its reproduction exists (prefill 12.47×, decode
+   8.05×, RSS 1.000×) but decode misses the ≥10× bar.
 
 ### Resume commands
 
@@ -18752,3 +18871,30 @@ still no "ours" column. Do NOT treat the §6.1 generalization table as proven fo
 CUDA/CPU/Vulkan; only the Metal/MLX row is populated. Do NOT weaken the
 `declines` assertions: without them, a silent MLX fall-back is indistinguishable
 from an MLX pass.
+# binding arm (dgx, idle, ONE flock for the whole series; three arms, same binary)
+R=$HOME/work/bench-cpu-llama; M=$R/models/Qwen3.5-2B-UD-Q8_K_XL.gguf
+LB=$R/llamacpp/build/bin      # llama.cpp 237ad9b96 Release GGML_CUDA=OFF GGML_NATIVE=ON
+B=$HOME/work/vllm.cpp-ciq-g4/build-cpu/examples/vllm-bench
+flock $HOME/gpu.lock sh -c '
+  uptime; nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+  LD_LIBRARY_PATH='"$LB"' '"$LB"'/llama-bench -m '"$M"' -p 512,128 -n 128,32 -t 20 -r 5 -ngl 0
+  for arm in "VT_GGUF_KEEP_QUANT=0" "" "VT_CPU_REF=1"; do
+    for rep in 1 2 3; do
+      env $arm VLLM_CPP_CPU_THREADS=20 /usr/bin/time -v '"$B"' --model '"$M"' \
+        --num-prompts 1 --input-len 128 --output-len 32 --concurrency 1 --seed 0 \
+        --temperature 0 --output-token-ids /tmp/ids.$rep.txt
+    done
+  done'
+# the e2e quant-path gate needs a CPU-ONLY build (a CUDA build expands by design):
+cd $HOME/work/vllm.cpp-ciq-g4/build-cpu && ./tests/test_qwen36_gguf_engine   # STANDALONE
+```
+
+**Prohibitions carried forward.** Do not quote the B4 54-75× / ≈1,480× ratios,
+nor the morning's 11.6× / 33.5× / 2.65×, as current — both are superseded by the
+post-G4 3.38× / 8.20× / 2.29×. Do not treat the x86 dev box as binding until it
+is exclusively idle. Do not run `test_qwen36_gguf_engine` co-scheduled (it OOMs;
+a co-scheduled failure is not a regression). **Do not read a CUDA-build GGUF run
+as evidence about the quant path** — keep-quant is off there by design, so only
+a CPU build exercises it. And do not treat "no token moved" as a general
+guarantee: it is a result about these files, on a favourable encoding, not a
+proof that no k-quant file can ever differ.

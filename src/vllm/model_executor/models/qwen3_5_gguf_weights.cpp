@@ -188,9 +188,24 @@ OwnedTensor OwnNormMinus1(const GgufFile& g, const std::string& name) {
 // an explicit role, so the policy's audit hook observes the complete tensor
 // list and no tensor can reach a residency by omission.
 
-// A 2-D GEMM weight taken verbatim from the file. keep-quant -> raw blocks in
-// the file's [N, K] order (nk = true); otherwise TODAY'S EXACT path — dequant
-// to bf16 and transpose to Matmul-B [K, N] — byte for byte unchanged.
+// A 2-D GEMM weight taken verbatim from the file. Three outcomes, in order:
+//
+//  1. keep-quant       -> raw blocks in the file's [N, K] order (nk = true);
+//  2. expand, nk       -> bf16 in the file's OWN [N, K] order (nk = true), so
+//                         the GEMM is the contiguous-weight-row kMatmulBT
+//                         instead of the N-striding kMatmul, with NO transpose
+//                         at load. Bit-identical to (3) on the CPU kernels
+//                         (cpu_ops.cpp MatmulOneChunk<kBT> differs only in the
+//                         weight offset) — see GgufLoadPolicy::expand_nk;
+//  3. expand, Matmul-B -> TODAY'S EXACT path, dequant to bf16 and transpose to
+//                         [K, N], byte for byte unchanged. This is what
+//                         VT_CPU_REF=1 and every non-CPU device get.
+//
+// (2) matters because a "mixed" GGUF is the normal case, not the exception:
+// the Unsloth Qwen3.5-2B-UD-Q8_K_XL bench file is 103 q8_0 tensors but ALSO 56
+// f16 ones, including the tied token_embd/lm_head and whole layers of ffn — no
+// encoding keeps those blocks, so without (2) the biggest GEMM in the model
+// would still be paying the slow orientation.
 OwnedTensor OwnMatmulWeight(const GgufFile& g, const std::string& name,
                             const GgufLoadPolicy& pol) {
   const GgufTensorInfo& t = g.Get(name);
@@ -198,6 +213,12 @@ OwnedTensor OwnMatmulWeight(const GgufFile& g, const std::string& name,
       GgufResidency::kKeepQuant) {
     VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
     return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1]);
+  }
+  if (pol.expand_nk) {
+    VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
+    OwnedTensor o = OwnBf16(g, name, t.shape);
+    o.nk = true;
+    return o;
   }
   return OwnBf16T(g, name);
 }

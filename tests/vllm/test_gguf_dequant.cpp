@@ -31,6 +31,37 @@ TEST_CASE("DequantGgufRowToF32 F32 passthrough") {
   for (int i = 0; i < 4; ++i) CHECK(out[i] == src[i]);
 }
 
+// --- F16 (1) / BF16 (30): unquantized rows in a MIXED file. Not an academic
+// case: `Qwen3.5-2B-UD-Q8_K_XL.gguf` stores 56 of its 335 tensors as f16,
+// 1.615 GiB of them including the tied token_embd/lm_head, and those are the
+// tensors no block encoding can cover — see the CIQ G4 result. ---
+TEST_CASE("DequantGgufRowToF32 F16 row") {
+  const float src[6] = {1.5F, -2.25F, 0.0F, 100.0F, 0.00006103515625F, -1.0F};
+  std::vector<uint8_t> b;
+  for (float f : src) PushF16(b, f);
+  const std::vector<float> out = DequantGgufRowToF32(1, b.data(), 6);
+  REQUIRE(out.size() == 6);
+  // Every value above is exactly representable in IEEE half (the fifth is the
+  // smallest normal), so the decode must be EXACT, not approximate.
+  for (int i = 0; i < 6; ++i) CHECK(out[i] == src[i]);
+  // Unquantized rows have block_elems == 1, so unlike the block encodings there
+  // is no "whole number of blocks" precondition to violate: ANY length decodes.
+  CHECK(DequantGgufRowToF32(1, b.data(), 5).size() == 5);
+}
+
+TEST_CASE("DequantGgufRowToF32 BF16 row") {
+  const float src[4] = {1.5F, -2.25F, 0.0F, 100.0F};
+  std::vector<uint8_t> b;
+  for (float f : src) {
+    const uint16_t h = vt::F32ToBF16(f);
+    b.push_back(static_cast<uint8_t>(h & 0xff));
+    b.push_back(static_cast<uint8_t>(h >> 8));
+  }
+  const std::vector<float> out = DequantGgufRowToF32(30, b.data(), 4);
+  REQUIRE(out.size() == 4);
+  for (int i = 0; i < 4; ++i) CHECK(out[i] == src[i]);
+}
+
 // --- Q8_0 (8): block = { f16 d; i8 qs[32]; } (34 bytes). y = d * qs[i]. ---
 TEST_CASE("DequantGgufRowToF32 Q8_0 synthetic block") {
   std::vector<uint8_t> b;

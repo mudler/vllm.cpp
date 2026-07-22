@@ -37,7 +37,10 @@
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "vllm/platforms/interface.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/ops.h"
 #include "vt/quant.h"
 
 using gguf_test::F32Kv;
@@ -110,7 +113,10 @@ size_t BlockBytesFor(uint32_t ggml_type, int64_t numel) {
   return vt::RowSizeBytes(dt, numel);
 }
 
-// A policy with keep-quant forced ON (what G4 will make the default).
+// A policy with keep-quant forced ON (what G4 made the default wherever the
+// running device can execute kMatmulBTQuant). `expand_nk` is left OFF here so
+// the pre-existing L2/L3 losslessness cases keep comparing against the
+// historical Matmul-B expansion; the orientation switch has its own cases.
 GgufLoadPolicy KeepQuantOn() {
   GgufLoadPolicy p;
   p.keep_quant = true;
@@ -345,32 +351,56 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   ::unsetenv("VT_CPU_REF");
   ::unsetenv("VT_GGUF_KEEP_QUANT");
   {
-    // PRODUCTION DEFAULT (L2/L3): keep-quant OFF until CIQ G4 routes the model
-    // call sites onto kMatmulBTQuant. This is what makes L2/L3 inert.
+    // PRODUCTION DEFAULT SINCE CIQ G4: keep-quant follows the running device's
+    // ability to EXECUTE the quantized GEMM. The expectation is derived from
+    // the op registry, not hardcoded to a build flavour, so this case states
+    // the same rule on a CPU-only build (available -> ON) and on a CUDA build
+    // (kMatmulBTQuant unregistered for kCUDA -> OFF, and the loader keeps
+    // expanding to bf16 exactly as before).
     const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
-    CHECK_FALSE(p.keep_quant);
+    CHECK(p.keep_quant == vllm::GgufQuantComputeAvailable());
+    CHECK(p.expand_nk == vllm::GgufQuantComputeAvailable());
     CHECK_FALSE(p.cpu_ref);
   }
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   CHECK(GgufLoadPolicy::FromEnv().keep_quant);
+  CHECK(GgufLoadPolicy::FromEnv().expand_nk);
+  // The OPT-OUT the spec promised must survive the default flip.
   for (const char* off : {"0", "false", "off", ""}) {
     ::setenv("VT_GGUF_KEEP_QUANT", off, 1);
     CAPTURE(off);
     CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_quant);
+    CHECK_FALSE(GgufLoadPolicy::FromEnv().expand_nk);
   }
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   ::setenv("VT_CPU_REF", "1", 1);
   {
-    // The oracle switch: keep-quant requested, oracle wins.
+    // The oracle switch: keep-quant requested, oracle wins — and it takes the
+    // orientation with it, so VT_CPU_REF=1 is the FULL historical load.
     const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
     CHECK(p.keep_quant);
     CHECK(p.cpu_ref);
+    CHECK_FALSE(p.expand_nk);
     CHECK(p.Route(vllm::GgufTensorInfo{"w", {8, 256}, kQ4_K, nullptr, 0},
                   GgufTensorRole::kMatmulWeight) ==
           GgufResidency::kExpandBf16);
   }
   ::unsetenv("VT_CPU_REF");
   ::unsetenv("VT_GGUF_KEEP_QUANT");
+}
+
+// The default is only correct if it means "a block weight has a consumer". On
+// this CPU test binary the quantized GEMM IS registered, so the availability
+// probe must say so — otherwise the flip above would be vacuous.
+TEST_CASE("GgufQuantComputeAvailable tracks the kMatmulBTQuant registration") {
+  CHECK(vllm::GgufQuantComputeAvailable() ==
+        vt::OpRegistered(vt::OpId::kMatmulBTQuant,
+                         vllm::platforms::CurrentPlatform().device_type()));
+  if (vllm::platforms::CurrentPlatform().is_cpu()) {
+    // CPU-only build: the CPU kernel IS registered, so keep-quant is live and
+    // the default flip is not vacuous.
+    CHECK(vllm::GgufQuantComputeAvailable());
+  }
 }
 
 // ===========================================================================
@@ -808,10 +838,10 @@ TEST_CASE("loader keep-quant expert split is lossless per expert") {
   }
 }
 
-TEST_CASE("production default leaves the GGUF load unchanged") {
-  // The inertness argument for L2/L3: with no environment set, the loader
-  // produces exactly what it produced before this change — bf16 everywhere,
-  // Matmul-B orientation, nothing block-typed.
+// CIQ G4. The production default is no longer "expand everything": where the
+// device can run the quantized GEMM, an env-driven load must equal a load
+// under an explicitly-ON policy, block dtypes and orientation included.
+TEST_CASE("production default is keep-quant wherever the quant GEMM exists") {
   ::unsetenv("VT_CPU_REF");
   ::unsetenv("VT_GGUF_KEEP_QUANT");
   const DenseDims d;
@@ -819,22 +849,149 @@ TEST_CASE("production default leaves the GGUF load unchanged") {
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
 
-  const GgufLoadPolicy explicit_off;
+  GgufLoadPolicy expect;
+  expect.keep_quant = vllm::GgufQuantComputeAvailable();
+  expect.expand_nk = expect.keep_quant;
+
   const vllm::Qwen3_5DenseWeights from_env =
       vllm::LoadQwen3_5DenseFromGguf(g, c, /*policy=*/nullptr);
   const vllm::Qwen3_5DenseWeights from_policy =
-      vllm::LoadQwen3_5DenseFromGguf(g, c, &explicit_off);
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &expect);
 
+  const vt::DType want =
+      expect.keep_quant ? vt::DType::kQ8_0 : vt::DType::kBF16;
   CHECK(from_env.lm_head.bytes == from_policy.lm_head.bytes);
-  CHECK(from_env.lm_head.dtype == vt::DType::kBF16);
-  CHECK_FALSE(from_env.lm_head.nk);
+  CHECK(from_env.lm_head.dtype == want);
+  CHECK(from_env.lm_head.nk == expect.keep_quant);
   REQUIRE(from_env.layers.size() == from_policy.layers.size());
   for (size_t il = 0; il < from_env.layers.size(); ++il) {
     const auto& a = from_env.layers[il];
     const auto& b = from_policy.layers[il];
     CHECK(a.attn.q_proj.bytes == b.attn.q_proj.bytes);
     CHECK(a.mlp.down_proj.bytes == b.mlp.down_proj.bytes);
-    CHECK(a.attn.q_proj.dtype == vt::DType::kBF16);
-    CHECK_FALSE(a.attn.q_proj.nk);
+    CHECK(a.attn.q_proj.dtype == want);
+    CHECK(a.attn.q_proj.nk == expect.keep_quant);
   }
+}
+
+// ===========================================================================
+// G4 — orientation: an EXPANDED matmul weight keeps the file's [N, K] order.
+// ===========================================================================
+
+// The measured 1.3-3.0x lever. Its correctness argument is that the two CPU
+// GEMM kernels differ ONLY in the weight offset, so this must be BIT-EXACT
+// against the transposed load, element by element — not merely "close".
+TEST_CASE("expand_nk is the untransposed view of the SAME expanded weight") {
+  const DenseDims d;
+  const TempFile f(BuildDenseQ8Gguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+
+  // keep_quant OFF so every matmul weight EXPANDS; only the orientation moves.
+  const GgufLoadPolicy transposed;
+  GgufLoadPolicy raw;
+  raw.expand_nk = true;
+
+  const vllm::Qwen3_5DenseWeights t =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &transposed);
+  const vllm::Qwen3_5DenseWeights r = vllm::LoadQwen3_5DenseFromGguf(g, c, &raw);
+
+  auto same_weight = [](const vllm::OwnedTensor& kn,
+                        const vllm::OwnedTensor& nk) {
+    REQUIRE(kn.rank == 2);
+    REQUIRE(nk.rank == 2);
+    CHECK_FALSE(kn.nk);
+    CHECK(nk.nk);
+    CHECK(kn.dtype == vt::DType::kBF16);
+    CHECK(nk.dtype == vt::DType::kBF16);
+    // [K, N] vs [N, K]: the same matrix, transposed.
+    REQUIRE(kn.shape[0] == nk.shape[1]);
+    REQUIRE(kn.shape[1] == nk.shape[0]);
+    const auto* a = reinterpret_cast<const uint16_t*>(kn.bytes.data());
+    const auto* b = reinterpret_cast<const uint16_t*>(nk.bytes.data());
+    const int64_t K = kn.shape[0], N = kn.shape[1];
+    REQUIRE(kn.bytes.size() == nk.bytes.size());
+    for (int64_t i = 0; i < K; ++i) {
+      for (int64_t j = 0; j < N; ++j) {
+        // A single mismatched element fails loudly with its index.
+        if (a[i * N + j] != b[j * K + i]) {
+          CAPTURE(i);
+          CAPTURE(j);
+          REQUIRE(a[i * N + j] == b[j * K + i]);
+        }
+      }
+    }
+  };
+
+  same_weight(t.lm_head, r.lm_head);
+  REQUIRE(t.layers.size() == r.layers.size());
+  for (size_t il = 0; il < t.layers.size(); ++il) {
+    CAPTURE(il);
+    same_weight(t.layers[il].attn.q_proj, r.layers[il].attn.q_proj);
+    same_weight(t.layers[il].attn.o_proj, r.layers[il].attn.o_proj);
+    same_weight(t.layers[il].mlp.gate_proj, r.layers[il].mlp.gate_proj);
+    same_weight(t.layers[il].mlp.down_proj, r.layers[il].mlp.down_proj);
+    // Tensors that are NOT matmul weights are untouched by the orientation
+    // switch — it must not leak into the norm/embedding/conv paths.
+    CHECK(t.layers[il].input_layernorm.bytes ==
+          r.layers[il].input_layernorm.bytes);
+  }
+  CHECK(t.embed_tokens.bytes == r.embed_tokens.bytes);
+  CHECK_FALSE(r.embed_tokens.nk);
+  CHECK(t.final_norm.bytes == r.final_norm.bytes);
+}
+
+// ===========================================================================
+// G4 — the ROUTING itself: vt::MatmulBT consumes a block weight.
+// ===========================================================================
+
+// The whole enablement in one assertion: a block-typed [N, K] weight handed to
+// the SAME entry point every model matmul helper already calls must produce
+// the quantized GEMM's answer, not throw. Before G4 this threw
+// "matmul_bt: float inputs and f32/bf16 output required".
+TEST_CASE("vt::MatmulBT routes a block-quantized weight to MatmulBTQuant") {
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue q = backend.CreateQueue();
+
+  const int64_t M = 3, N = 5, K = 64;
+  std::vector<float> act(static_cast<size_t>(M) * K);
+  for (size_t i = 0; i < act.size(); ++i) {
+    act[i] = 0.25F * static_cast<float>((i % 17)) - 1.5F;
+  }
+  std::vector<float> w(static_cast<size_t>(N) * K);
+  for (size_t i = 0; i < w.size(); ++i) {
+    w[i] = 0.125F * static_cast<float>((i % 23)) - 1.0F;
+  }
+  // Quantize the weight rows to Q8_0 exactly as a GGUF file stores them.
+  std::vector<uint8_t> blocks(vt::RowSizeBytes(vt::DType::kQ8_0, K) *
+                              static_cast<size_t>(N));
+  for (int64_t j = 0; j < N; ++j) {
+    vt::cpu::QuantTraits(vt::DType::kQ8_0)
+        .from_float(w.data() + j * K,
+                    blocks.data() + static_cast<size_t>(j) *
+                                        vt::RowSizeBytes(vt::DType::kQ8_0, K),
+                    K);
+  }
+
+  vt::Tensor a = vt::Tensor::Contiguous(act.data(), vt::DType::kF32,
+                                        q.device, {M, K});
+  vt::Tensor b = vt::Tensor::Contiguous(blocks.data(), vt::DType::kQ8_0,
+                                        q.device, {N, K});
+  std::vector<float> got(static_cast<size_t>(M) * N, 0.0F);
+  std::vector<float> want(static_cast<size_t>(M) * N, 0.0F);
+  vt::Tensor og = vt::Tensor::Contiguous(got.data(), vt::DType::kF32,
+                                         q.device, {M, N});
+  vt::Tensor ow = vt::Tensor::Contiguous(want.data(), vt::DType::kF32,
+                                         q.device, {M, N});
+
+  vt::MatmulBT(q, og, a, b);        // the routed call site
+  vt::MatmulBTQuant(q, ow, a, b);   // the op it must have reached
+  backend.Synchronize(q);
+
+  // Bit-identical: MatmulBT must DELEGATE, not approximate.
+  CHECK(std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) == 0);
+  // ...and the answer is a real GEMM, not zeros.
+  bool nonzero = false;
+  for (float v : got) nonzero = nonzero || v != 0.0F;
+  CHECK(nonzero);
 }

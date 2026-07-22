@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "gguf_builder.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vt/dtype.h"
@@ -28,6 +29,15 @@ using gguf_test::TempFile;
 using gguf_test::U32Kv;
 
 namespace {
+
+// This file is the regression net for the DEQUANT-TO-BF16 EXPANSION path: it
+// asserts the Matmul-B [K, N] transposes, the (w-1) norm rewrite, the V-head
+// reorders and the expert split. Since CIQ G4 the loader's ENVIRONMENT default
+// on a CPU build is keep-quant + the untransposed [N, K] orientation, so the
+// expansion is named EXPLICITLY here (a default-constructed policy is
+// all-expand, Matmul-B) rather than assumed. What the new default produces is
+// covered by test_gguf_keep_quant.cpp.
+const vllm::GgufLoadPolicy kExpandAll;
 
 // Little-endian f32 bytes for `n` values from fill(idx).
 template <typename F>
@@ -189,7 +199,7 @@ TEST_CASE("LoadQwen3_5MoeFromGguf: names, transposes, expert split, transforms")
   TempFile f(BuildGguf(d));
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
-  const vllm::Qwen3_5MoeWeights w = vllm::LoadQwen3_5MoeFromGguf(g, c);
+  const vllm::Qwen3_5MoeWeights w = vllm::LoadQwen3_5MoeFromGguf(g, c, &kExpandAll);
 
   SUBCASE("model-level tensors") {
     // embed_tokens [vocab, H] direct.
@@ -313,7 +323,7 @@ TEST_CASE("LoadQwen3_5MoeFromGguf: V-head reorder when num_v != num_k") {
   const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
   REQUIRE(c.layer_types.size() == 1);
   REQUIRE(c.layer_types[0] == "linear_attention");
-  const vllm::Qwen3_5MoeWeights w = vllm::LoadQwen3_5MoeFromGguf(g, c);
+  const vllm::Qwen3_5MoeWeights w = vllm::LoadQwen3_5MoeFromGguf(g, c, &kExpandAll);
   const auto& gdn = w.layers[0].gdn;
 
   // ssm_a tiled = -exp(t); a_log grouped = [t0,t2,t1,t3] = [0,2,1,3].

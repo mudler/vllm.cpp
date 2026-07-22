@@ -129,6 +129,21 @@ void DropinProbe(Queue& q, Tensor& out, const Tensor& in,
 }
 
 void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  // GGUF compute-in-quant (QUANT-GGUF-CIQ-GEMM work row G4). A block-quantized
+  // weight is NOT an elementwise tensor — it has no per-element stride and
+  // cannot be read by kMatmulBT — but it IS in exactly the [N, K] orientation
+  // this entry point defines, which is ggml's src0 layout and GGUF's disk
+  // order (ggml-cpu.c:1245-1443). Dispatching it to kMatmulBTQuant here is
+  // what routes the MODEL: every matmul helper already sends an `nk == true`
+  // weight to MatmulBT (qwen3_5.cpp:1067,1078 device-in/out and :743,760
+  // host), so the keep-quant loader's block-typed OwnedTensor reaches the
+  // quantized GEMM with no signature, call-site or forward change. Elementwise
+  // weights fall through to the unchanged validation + kMatmulBT below, so
+  // every safetensors path is bit-identical by construction.
+  if (IsBlockQuant(b.dtype)) {
+    MatmulBTQuant(q, out, a, b);
+    return;
+  }
   VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2, "matmul_bt: rank-2 tensors required");
   VT_CHECK(a.shape[1] == b.shape[1], "matmul_bt: inner dims mismatch (b is [N,K])");
   VT_CHECK(out.shape[0] == a.shape[0] && out.shape[1] == b.shape[0],

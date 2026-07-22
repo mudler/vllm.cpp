@@ -89,14 +89,38 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool cpu_ref,
                               GgufTensorRole role, uint32_t ggml_type,
                               const std::vector<int64_t>& shape);
 
+// True when the device this process will actually run the forward on can
+// execute `OpId::kMatmulBTQuant` — i.e. when a block-typed weight has a
+// consumer. This is the condition CIQ G4 flipped the keep-quant default onto:
+// today only the CPU backend registers the quantized GEMM, so a CUDA build
+// keeps expanding to bf16 (CUDA GGUF compute-in-quant is a future backend
+// row), and the day that kernel is registered for another device this default
+// follows it with no edit here.
+bool GgufQuantComputeAvailable();
+
 // Loader-wide residency policy.
 struct GgufLoadPolicy {
-  // Master switch for keep-quant residency. DEFAULT OFF: until CIQ work row
-  // G4 routes the model's MatmulBT call sites onto kMatmulBTQuant, nothing can
-  // CONSUME a block-typed weight, so enabling it by default would break the
-  // forward rather than speed it up. G4 flips this default; VT_GGUF_KEEP_QUANT
-  // =1 opts in today (that is what the residency/losslessness tests use).
+  // Master switch for keep-quant residency. The STRUCT default stays false so
+  // a default-constructed policy is the historical all-expand load; the
+  // PRODUCTION default is decided by FromEnv(), which turns it ON wherever
+  // GgufQuantComputeAvailable() holds (CIQ G4). VT_GGUF_KEEP_QUANT=1 forces it
+  // on, =0/off/false forces it off (the opt-out).
   bool keep_quant = false;
+  // When a matmul weight CANNOT keep its blocks (an f16/f32 file tensor, or an
+  // encoding without a vec_dot) but the quantized path is otherwise active,
+  // expand it to bf16 in the file's OWN [N, K] order with nk = true instead of
+  // transposing it to Matmul-B [K, N]. GGUF's disk order is already [N, K], so
+  // the transpose was extra load-time work to reach the SLOWER kernel:
+  // `kMatmulBT` reads the weight row contiguously while `kMatmul` strides by N
+  // down the K loop, measured at 1.3-3.0x on aarch64
+  // (specs/cpu-llamacpp-floor-remeasure-2026-07-22.md lever 2). The CPU
+  // kernels differ ONLY in that weight offset — `MatmulOneChunk<kBT>`
+  // (cpu_ops.cpp:70-83) keeps the same sequential f32 K reduction — so the
+  // result is bit-identical to the transposed load. It is tied to the same
+  // availability condition as keep_quant (and forced off by cpu_ref) because
+  // on a device whose GEMM is not that shared kernel — cuBLASLt picks its algo
+  // from the operand layout — orientation is NOT numerically free.
+  bool expand_nk = false;
   // VT_CPU_REF=1 — the parity ORACLE switch (spec gate 2). Forces the full
   // dequant-to-bf16 load path regardless of `keep_quant`, so the bit-stable
   // reference numerics stay reachable once keep-quant becomes the default.
@@ -105,7 +129,8 @@ struct GgufLoadPolicy {
   GgufRoutingAudit audit;
 
   // Reads VT_CPU_REF and VT_GGUF_KEEP_QUANT. A variable set to "0", "false",
-  // "off" or empty is OFF; any other value is ON.
+  // "off" or empty is OFF; any other value is ON. VT_GGUF_KEEP_QUANT UNSET
+  // means "decide by GgufQuantComputeAvailable()" — the G4 default.
   static GgufLoadPolicy FromEnv();
 
   // Route one tensor and notify `audit`. This is the ONLY entry point the

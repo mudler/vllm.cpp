@@ -1,7 +1,7 @@
 # Leaf spec: GGUF compute-in-quant GEMM — ggml tensor-traits port into vt::cpu
 
 **Row:** `QUANT-GGUF-CIQ-GEMM` (quantization-matrix.md, leaf of the
-`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **G1+G2+G3 landed** (2026-07-22, `CLAIM-QUANT-GGUF-COMPUTE-1`): the portable tier-0 quant GEMM is complete and gated at the OP level, but **no model call site routes to it** and every GGUF weight still expands to bf16 at load, so **no encoding computes in quant end to end** — that is G4 (with loader L2-L3 + threadpool W2). G4-G8 open ·
+`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **G1-G4 landed** (2026-07-22): the portable tier-0 quant GEMM is complete, gated at the OP level, and **now routed end to end** — `vt::MatmulBT` dispatches a block-dtype weight to `kMatmulBTQuant`, keep-quant is the production DEFAULT wherever that op is registered, and the six routed encodings compute in quant. Measured on the binding host: decode **3.45×**, prefill **4.16×**, peak RSS **1.16×** less, output tokens **byte-identical**. G5-G8 open, and the measurement RE-RANKS them (see the G4 result below: the remaining CPU gap is now the ELEMENTWISE bf16/f16 GEMM, not the quant one) ·
 **upstream pin:** llama.cpp local fork `237ad9b96` (b9892) ·
 **parent evidence:** B4 decision row
 ([parity-ledger.md L290](../parity-ledger.md#L290)) — the "vendor IF proven
@@ -155,7 +155,7 @@ there (i8mm repack expected) before comparing.
 | G1 | block dtypes + traits | `vt::DType` block entries, traits table, `kMatmulBTQuant` op skeleton + generic-composite fallback, trait cross-check vs `GgmlTraits` | - | **DONE** 2026-07-22 |
 | G2 | activation quant | `quantize_row_q8_0/q8_K` ports + scratch sizing; unit tests | G1 | **DONE** 2026-07-22 |
 | G3 | tier-0 vec_dot kernels | the six generic `vec_dot` ports + GEMM wiring + test-quantize-fns/backend-ops ports + parity goldens | G1, G2 | **DONE** 2026-07-22 |
-| G4 | e2e enablement | route `MatmulBT` call sites on block dtype; engine gates (3) + `VT_CPU_REF` A/B; first B4-recipe measurement (tier-0 milestone) | G3, loader L2-L3, threadpool W2 | open |
+| G4 | e2e enablement | route `MatmulBT` call sites on block dtype; engine gates (3) + `VT_CPU_REF` A/B; first B4-recipe measurement (tier-0 milestone) | G3, loader L2-L3, threadpool W2 | **DONE** 2026-07-22 |
 | G5 | x86 AVX2 tier | `arch/x86` vec_dot ports + feature probe; tier-1 milestone measurement | G3 | open |
 | G6 | Arm NEON/i8mm tier | `arch/arm` ports incl. `nrows==2` mmla; GB10 measurement | G3 | open |
 | G7 | repack tier | repack-at-load + gemv/gemm + `quantize_mat_t`; selection parity vs `:4528`; closes gates 4-5 | G4 + loader L2 | open |
@@ -353,6 +353,197 @@ work to reach the slower kernel.
 ([ops.cpp:163](../../src/vt/ops.cpp#L163)) hard-requires `IsFloat(b.dtype)` with
 no block branch; and `VT_GGUF_KEEP_QUANT=1` **fails at load on both boxes** with
 `vt: matmul_bt: float inputs and f32/bf16 output required`.
+
+## G4 result (2026-07-22) — routed, default-ON, measured
+
+**Landed.** The machinery G1-G3 and L1-L3 built is now on the executed path.
+
+**What routes.** ONE dispatch point does the whole job:
+[`vt::MatmulBT`](../../src/vt/ops.cpp#L158) sends a block-dtype `b` to
+`MatmulBTQuant` and falls through to its unchanged validation + `kMatmulBT` for
+everything else. That is sufficient because every model matmul helper already
+routes an `nk == true` weight to `MatmulBT`
+([qwen3_5.cpp:1067,1078](../../src/vllm/model_executor/models/qwen3_5.cpp#L1067)
+device-in/out, [:743,760](../../src/vllm/model_executor/models/qwen3_5.cpp#L743)
+host), and the keep-quant loader already produces exactly that: a block-typed
+`OwnedTensor` in the file's `[N,K]` order. No forward, no signature and no call
+site changed. Safetensors paths are unreachable from the new branch by
+construction — no safetensors loader produces a block dtype.
+
+**The default flip.** [`GgufLoadPolicy::FromEnv`](../../src/vllm/model_executor/model_loader/gguf_keep_quant.cpp#L95)
+now defaults `keep_quant` to `GgufQuantComputeAvailable()` — `vt::OpRegistered(kMatmulBTQuant, CurrentPlatform().device_type())`
+— rather than to `false`. The condition is the honest one ("does a block weight
+have a consumer on the device this process will run on"), so a CUDA build keeps
+expanding to bf16 (CUDA GGUF compute-in-quant remains a future backend row) and
+the day that kernel is registered elsewhere the default follows with no edit.
+`VT_GGUF_KEEP_QUANT=0/off/false` is the opt-out; `VT_CPU_REF=1` still wins over
+everything.
+
+**The transpose is gone — for BOTH residencies.** Kept blocks never had one
+(L2). The measurement's lever 2 was folded in as
+`GgufLoadPolicy::expand_nk`: a matmul weight that must EXPAND (an f16/f32 file
+tensor, or an unported encoding) is now materialised in the file's own `[N,K]`
+order with `nk = true` instead of being transposed into Matmul-B `[K,N]`. It
+rides the same availability condition and is forced off by `VT_CPU_REF`. This
+is numerically free on the CPU tier by construction —
+[`MatmulOneChunk<kBT>`](../../src/vt/cpu/cpu_ops.cpp#L70) differs from `<false>`
+ONLY in the weight offset, keeping the same sequential f32 K reduction — and a
+unit asserts the two loads are element-for-element transposes of each other. It
+is deliberately NOT applied on a device whose GEMM picks its algorithm from the
+operand layout (cuBLASLt), where orientation is not numerically free.
+
+**This mattered more than expected.** The bench file is MIXED, which is the
+normal case: `Qwen3.5-2B-UD-Q8_K_XL.gguf` is 103 `q8_0` + **56 `f16`** + 176
+`f32` tensors, and the f16 side is not small tensors — it is 1.615 GiB
+including the 970 MiB tied `token_embd`/`lm_head` and whole layers of ffn.
+Without `expand_nk` the largest GEMM in the model would still have been paying
+the slow orientation.
+
+### Correctness — NO token movement anywhere
+
+- **E2E gate, quant path DEFAULT-ON, run STANDALONE on a CPU-only dgx build**
+  (which is where keep-quant is live): `test_qwen36_gguf_engine` **PASSES** on
+  the real APEX files — 2/2 cases, 16/16 greedy tokens each on Compact
+  (`{F32,Q3_K,Q4_K,Q6_K}`) and Balanced (`{F32,Q8_0,Q5_K,Q6_K}`) against the
+  same-file llama.cpp oracle. Five of the six routed encodings are exercised
+  end to end by that pair. Peak RSS during it was 18.7 GiB on the 17.3 GiB
+  Compact file — visibly the file, not a bf16 expansion of it.
+- **Oracle A/B on the bench model:** the output token streams of the BEFORE
+  arm (`VT_GGUF_KEEP_QUANT=0`), the AFTER arm (production default) and the
+  ORACLE arm (`VT_CPU_REF=1`) are **byte-identical** — one md5,
+  `d235db12f2cd304007530286a1755c95`, across all three. So `VT_CPU_REF`
+  reproduces the historical result exactly, and compute-in-quant did not move a
+  single token on this file.
+- **A CPU-only build fails four SACRED gates — CONTROLLED as pre-existing, not
+  a G4 regression.** Running the full dgx ctest against a CPU-only build (the
+  configuration that exercises the quant path) fails `test_qwen36_weights`,
+  `test_qwen3_paged_engine`, `test_qwen27_paged_engine` and
+  `test_deepseek_v2_paged_engine`, because those gates' goldens were captured on
+  CUDA and a CPU forward is not bit-identical to it. The BASE tree (`c603ebc`)
+  was built CPU-only on the same box and run against the same four: **identical
+  failures, identical assertion counts** (51/2, 245/2, 11/2, 95/1). None of the
+  four loads a GGUF file, and all four pass on the CUDA build (235/235, 315/315,
+  664/664, 223/223). The regression bar for this repo is the CUDA build; a
+  CPU-only run of a CUDA-goldened gate is not one.
+- The spec anticipated that quantized compute "is NOT bit-identical to the
+  dequant path by design". On the measured workloads it did not need the
+  latitude: **zero divergence, so nothing had to be diagnosed and no golden was
+  regenerated.** Q8_0 · bf16 is the favourable case (the weight values are
+  identical either way; only the accumulation differs, and the integer path is
+  the more accurate one), so this is a result about these files, not a proof
+  that no k-quant file can ever differ.
+
+### Benchmark — binding, dgx.casa (GB10, aarch64, 20 cores), idle
+
+Whole series under one `flock $HOME/gpu.lock`; load average 0.11 at series
+start, `nvidia-smi` reporting no compute apps; transferred by `git archive`;
+goldens md5-verified 475 files / `2965ef5772b556d3f3f86fedf4221b2f` before and
+after. Model `Qwen3.5-2B-UD-Q8_K_XL.gguf`, llama.cpp `237ad9b96` (b9892).
+
+**llama.cpp** (`llama-bench -t 20 -ngl 0 -r 5`): pp512 212.49±0.74, **pp128
+175.71±2.54**, tg128 25.90±0.69, **tg32 25.87±1.36**; isolated tg32
+25.26±1.34 with peak RSS 2,934,124 KB = **2.798 GiB**. (Yesterday's numbers on
+this box reproduce to within noise, so the denominator is fresh, not carried.)
+
+**Ours — SAME BINARY, three arms**, `VLLM_CPP_CPU_THREADS=20`,
+`--input-len 128 --output-len 32 --concurrency 1 --seed 0 --temperature 0`,
+3 reps each, medians:
+
+| arm | TTFT (ms) | TPOT (ms) | peak RSS (KB) |
+|---|---|---|---|
+| BEFORE — `VT_GGUF_KEEP_QUANT=0` (the historical path) | 24,859.25 | 451.27 | 7,788,196 |
+| **AFTER — production default** | **5,970.21** | **130.72** | **6,712,368** |
+| ORACLE — `VT_CPU_REF=1` | 24,822.20 | 451.89 | 7,787,940 |
+
+Rep spread on the AFTER arm: TTFT 1.41 %, TPOT 2.03 %. The BEFORE arm
+reproduces the 2026-07-22 binding baseline (24,594 ms / 450.7 ms / 7,788,220 KB)
+to 1.1 % / 0.1 % / 24 KB, which is what makes this a valid same-binary A/B.
+
+| axis | BEFORE | AFTER | ours: A/B | vs llama.cpp BEFORE | **vs llama.cpp AFTER** |
+|---|---|---|---|---|---|
+| Prefill (128 / TTFT) | 5.149 t/s | **21.44 t/s** | **4.16×** | 34.1× behind | **8.20× behind** |
+| Decode (1000 / TPOT) | 2.216 t/s | **7.650 t/s** | **3.45×** | 11.7× behind | **3.38× behind** (3.30× vs isolated tg32) |
+| Peak RSS | 7.428 GiB | **6.401 GiB** | **1.16× less** | 2.66× worse | **2.29× worse** |
+
+### Did the 9-17× projection hold? NO — and the reason is measurable
+
+**It did not.** The projection was 9-17× end to end with RSS falling to
+~2.9 GiB; the measurement is **3.45× decode / 4.16× prefill and RSS 6.40 GiB**.
+The projection was arithmetic over the quant GEMM's op-level throughput applied
+to the WHOLE model, and that step is where it broke: it assumed every GEMM takes
+the quant path. On this file most of the weight mass cannot.
+
+| | bytes in file | params | routed to `kMatmulBTQuant`? |
+|---|---|---|---|
+| `q8_0` (103 tensors) | 1.062 GiB | 1.073 B | **yes** |
+| `f16` (56 tensors, incl. the 970 MiB tied `token_embd`/`lm_head`) | 1.615 GiB | 0.867 B | **no** — f16 is not a block encoding |
+| `f32` (176 tensors) | 0.006 GiB | — | no (norms/vectors, never eligible) |
+
+So **60 % of the weight bytes and 45 % of the parameters — including the single
+biggest GEMM in the model — kept running the elementwise bf16 kernel at
+17-25 GFLOP/s** while the routed 40 % moved to 211-417 GFLOP/s. The measured
+3.4-4.2× is what that mixture predicts; the projection's 9-17× is what a
+fully-q8_0 file would have given. Nothing about the quant kernels
+under-delivered.
+
+The same mixture explains the RSS floor: 2.68 GiB of touched file pages (blocks
+are COPIED, not mmapped in place — the recorded L2 follow-up) + 1.615 GiB of
+f16→bf16 expansion + a SECOND 970 MiB copy of the tied head + 1.06 GiB of kept
+blocks ≈ 6.35 GiB, against 6.401 GiB measured.
+
+### Consequences for the plan (supersedes the ranking in the floor re-measurement)
+
+1. **The elementwise bf16/f16 GEMM is now the #1 CPU lever, ahead of G5-G7.**
+   It owns 60 % of this file's weight mass, EVERY safetensors CPU path, and
+   every mixed GGUF (which is what published quants actually are). Its two known
+   defects are stated in
+   [the floor re-measurement lever 3](cpu-llamacpp-floor-remeasure-2026-07-22.md):
+   no SIMD `vec_dot_bf16/f16`, and `MatmulOneChunk`'s per-element `LoadF32`
+   dtype switch INSIDE the K loop. Closing it is what would let this file
+   approach llama.cpp, which computes those same f16 rows with
+   `ggml_vec_dot_f16`.
+2. **G5/G6 (SIMD quant tiers) now improve only the 40 % that is already fast**,
+   so their end-to-end share on a mixed file is bounded by Amdahl at well under
+   what the spec assumed. **G7 (repack) should stay parked**: prefill is 8.2×
+   behind and the quant GEMM is not what is holding it.
+3. **RSS needs two loader changes, not a kernel:** mmap-in-place residency
+   instead of copying (already recorded as an L2 follow-up, llama.cpp supports
+   both), and sharing the tied `lm_head` with the embedding table instead of
+   materialising the vocab matrix twice. Together they are ~1.9 GiB of the
+   3.6 GiB that separates us from llama.cpp; the rest is the f16 expansion,
+   which the lever-1 work removes as a side effect if f16 weights stay f16.
+4. **Gate 4's tier-0 milestone is MET.** Its bar is decode ≥ 0.25× tg32 and
+   prefill ≥ 0.1× pp128: measured **0.296×** (7.650 / 25.87) and **0.122×**
+   (21.44 / 175.71), against 0.086× and 0.029× before G4. **Gate 5 (peak RSS
+   ≤ 1.15× llama.cpp) is NOT met** — 2.29× — and stays open with L4 plus the two
+   loader changes in item 3.
+
+### Reproduction
+
+```sh
+# dgx.casa, aarch64, idle, ONE flock for the whole series
+R=$HOME/work/bench-cpu-llama
+M=$R/models/Qwen3.5-2B-UD-Q8_K_XL.gguf
+LB=$R/llamacpp/build/bin
+B=$HOME/work/vllm.cpp-ciq-g4/build-cpu/examples/vllm-bench
+
+cmake -S vllmcpp -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
+cmake --build build-cpu -j 20 --target vllm-bench
+
+flock $HOME/gpu.lock sh -c '
+  uptime; nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+  LD_LIBRARY_PATH='"$LB"' '"$LB"'/llama-bench -m '"$M"' -p 512,128 -n 128,32 -t 20 -r 5 -ngl 0
+  LD_LIBRARY_PATH='"$LB"' /usr/bin/time -v '"$LB"'/llama-bench -m '"$M"' -p 0 -n 32 -t 20 -r 3 -ngl 0
+  for arm in "VT_GGUF_KEEP_QUANT=0" "" "VT_CPU_REF=1"; do
+    for rep in 1 2 3; do
+      env $arm VLLM_CPP_CPU_THREADS=20 /usr/bin/time -v '"$B"' --model '"$M"' \
+        --num-prompts 1 --input-len 128 --output-len 32 --concurrency 1 \
+        --seed 0 --temperature 0 --output-token-ids /tmp/ids.$rep.txt
+    done
+  done
+'
+# The three arms MUST agree on /tmp/ids.*.txt (md5 d235db12f2cd304007530286a1755c95).
+```
 
 **Gates at G1:** clean CPU `-Werror` build (0 warnings); full CPU ctest
 **151/151**; gguf ctest 4/4. **DGX CONFIRMATION RUN (`dgx.casa`, `~/work/vllm.cpp-ciq-g1`, production flags `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_CUTLASS_DIR=/home/mudler/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON`, one `flock $HOME/gpu.lock` for the whole series):** clean CUDA `-Werror` build to 100%, **0 warnings**. Regression set ALL UNCHANGED — 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6** (strict 5/6, max gap 0 nats), Qwen3-dense **16/16** (strict 11/16, max gap 0.25 nats), OPT **6/6** (36 assertions), DeepSeek-V2-Lite **8/8** (223 assertions). `test_qwen36_gguf_engine` run STANDALONE (it OOMs co-scheduled) on the real APEX files: **28/28 assertions, 2/2 cases, 16/16 tokens each on Compact and Balanced** — the k-quant dequant path is byte-stable across the decoder move. Gates 1-5 of this spec are

@@ -36,12 +36,35 @@
 //                             reordered grouped->tiled.
 #pragma once
 
+#include <cstdint>
+
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/transformers_utils/hf_config.h"
 
 namespace vllm {
+
+// L2 (keep-quant residency, .agents/specs/gguf-keep-quant-loader.md). Copy `n`
+// rows of `k` elements of `tensor`'s RAW ggml blocks — starting at row
+// `row_offset`, which is how a stacked [E, out, in] expert tensor is split —
+// into an owned block-typed tensor.
+//
+// The result is [N = n, K = k] with `nk = true` and `dtype` the block dtype:
+// GGUF's on-disk [out, in] row-major order IS ggml's src0 layout and IS our
+// MatmulBT orientation, so keep-quant needs NO transpose. It could not do one
+// anyway — transposing a block encoding would require requantizing.
+//
+// Bytes are COPIED (uniform with every other weight path, no coupling to the
+// mmap's lifetime); llama.cpp supports both copy and mmap residency, so either
+// mirrors upstream. mmap zero-copy is a recorded follow-up.
+//
+// Throws when the tensor's encoding is not keep-quant capable, when `k` is not
+// a whole number of blocks (ggml_row_size's precondition), or when the
+// requested rows fall outside the tensor's validated byte span.
+OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
+                               int64_t k, int64_t row_offset = 0);
 
 // Build the HfConfig from a GGUF file's metadata (arch prefix qwen35moe /
 // qwen3next / qwen35 [dense]). vocab_size is taken from token_embd's shape
@@ -56,8 +79,14 @@ HfConfig HfConfigFromGguf(const GgufFile& gguf);
 // Uses config.num_hidden_layers, layer_types, num_experts and the GDN head
 // dims. MTP/nextn blocks are ignored (as in the safetensors path). Throws on a
 // missing tensor or an unsupported ggml quant type (i-quants are Task 3+).
+//
+// `policy` (optional) selects per-tensor residency: null reads the process
+// environment (GgufLoadPolicy::FromEnv — VT_CPU_REF / VT_GGUF_KEEP_QUANT),
+// which with today's defaults reproduces the historical all-bf16 load exactly.
+// Tests pass an explicit policy (and may attach a routing audit hook).
 Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
-                                         const HfConfig& config);
+                                         const HfConfig& config,
+                                         const GgufLoadPolicy* policy = nullptr);
 
 // DENSE-arch (`qwen35`, e.g. Qwen3.5-2B) analogue of LoadQwen3_5MoeFromGguf:
 // same GDN / full-attention block loaders (identical tensor names + convert
@@ -66,7 +95,8 @@ Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
 // SwiGLU MLP ("blk.%d.ffn_{gate,up,down}"). Targets the same
 // Qwen3_5DenseWeights the 27B safetensors loader produces (bf16 fields; the
 // fp4 variants stay empty).
-Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
-                                             const HfConfig& config);
+Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(
+    const GgufFile& gguf, const HfConfig& config,
+    const GgufLoadPolicy* policy = nullptr);
 
 }  // namespace vllm

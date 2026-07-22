@@ -12,9 +12,37 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vt/dtype.h"
 
 namespace vllm {
+
+OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
+                               int64_t k, int64_t row_offset) {
+  vt::DType dt = vt::DType::kF32;
+  VT_CHECK(KeepQuantDType(tensor.ggml_type, &dt),
+           "qwen3_5 gguf: keep-quant on a non-keep-quant encoding for " +
+               tensor.name);
+  VT_CHECK(n > 0 && k > 0 && row_offset >= 0,
+           "qwen3_5 gguf: bad keep-quant slice for " + tensor.name);
+  // Throws when k is not a whole number of blocks (ggml_row_size contract).
+  const size_t row_bytes = vt::RowSizeBytes(dt, k);
+  const size_t begin = static_cast<size_t>(row_offset) * row_bytes;
+  const size_t bytes = static_cast<size_t>(n) * row_bytes;
+  VT_CHECK(begin + bytes <= tensor.nbytes,
+           "qwen3_5 gguf: keep-quant slice exceeds the tensor span for " +
+               tensor.name);
+
+  OwnedTensor o;
+  o.dtype = dt;
+  o.rank = 2;
+  o.shape[0] = n;  // N = out features (ggml src0 rows)
+  o.shape[1] = k;  // K = in features
+  // GGUF disk order [out, in] IS the MatmulBT [N, K] orientation: no transpose.
+  o.nk = true;
+  o.bytes.assign(tensor.data + begin, tensor.data + begin + bytes);
+  return o;
+}
 
 namespace {
 
@@ -152,6 +180,38 @@ OwnedTensor OwnNormMinus1(const GgufFile& g, const std::string& name) {
   auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
   for (size_t i = 0; i < dq.size(); ++i) dst[i] = vt::F32ToBF16(dq[i] - 1.0F);
   return o;
+}
+
+// --- residency routing (L3) ----------------------------------------------
+//
+// EVERY tensor this loader touches passes through GgufLoadPolicy::Route with
+// an explicit role, so the policy's audit hook observes the complete tensor
+// list and no tensor can reach a residency by omission.
+
+// A 2-D GEMM weight taken verbatim from the file. keep-quant -> raw blocks in
+// the file's [N, K] order (nk = true); otherwise TODAY'S EXACT path — dequant
+// to bf16 and transpose to Matmul-B [K, N] — byte for byte unchanged.
+OwnedTensor OwnMatmulWeight(const GgufFile& g, const std::string& name,
+                            const GgufLoadPolicy& pol) {
+  const GgufTensorInfo& t = g.Get(name);
+  if (pol.Route(t, GgufTensorRole::kMatmulWeight) ==
+      GgufResidency::kKeepQuant) {
+    VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
+    return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1]);
+  }
+  return OwnBf16T(g, name);
+}
+
+// Route a tensor that can NEVER keep its blocks (a value/layout rewrite, a
+// gather table, a conv filter or a 1-D vector) and assert the policy agrees.
+// This is the runtime half of the totality contract: the audit hook still sees
+// the tensor, and a policy that ever tried to keep such a tensor quantized
+// would fail LOUDLY here rather than silently skip its transform.
+void RequireExpand(const GgufLoadPolicy& pol, const GgufFile& g,
+                   const std::string& name, GgufTensorRole role) {
+  VT_CHECK(pol.Route(g.Get(name), role) == GgufResidency::kExpandBf16,
+           std::string("qwen3_5 gguf: a ") + Name(role) +
+               " tensor must not keep quant blocks: " + name);
 }
 
 // --- config --------------------------------------------------------------
@@ -299,44 +359,70 @@ std::string Blk(int64_t il, const std::string& suffix) {
   return "blk." + std::to_string(il) + "." + suffix;
 }
 
-GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c) {
+GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
+                            const GgufLoadPolicy& pol) {
   const int64_t num_k = c.linear_num_key_heads;
   const int64_t num_v = c.linear_num_value_heads;
   const int64_t dv = c.linear_value_head_dim;
   const int64_t key_dim = num_k * c.linear_key_head_dim;
   const bool reorder = num_v != num_k && num_k > 0 && (num_v % num_k) == 0;
   const int64_t rpk = num_k > 0 ? num_v / num_k : 1;  // num_v_per_k
+  // When the V-head reorder is active these projections are LAYOUT-rewritten
+  // at load, so they are kTransformedWeight and can never keep their blocks;
+  // without it they are ordinary verbatim GEMM weights. (out_proj's reorder
+  // permutes COLUMNS, which live inside a block, so it is unconditionally
+  // block-unsafe when active — same rule, stated per tensor below.)
+  const GgufTensorRole proj_role = reorder
+                                       ? GgufTensorRole::kTransformedWeight
+                                       : GgufTensorRole::kMatmulWeight;
 
   GdnLayerWeights gdn;
 
   // in_proj_qkv <- attn_qkv [conv_dim, H]; only the trailing V rows reorder.
   {
-    const GgufTensorInfo* t = nullptr;
-    std::vector<uint16_t> dq = DqBf16(g, Blk(il, "attn_qkv.weight"), &t);
-    const int64_t out_dim = t->shape[0];
-    const int64_t in_dim = t->shape[1];
-    if (reorder) ReorderVRows(dq, in_dim, /*row_off=*/2 * key_dim, num_k, rpk, dv);
-    gdn.in_proj_qkv = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-    TransposeBf16(dq.data(), out_dim, in_dim,
-                  reinterpret_cast<uint16_t*>(gdn.in_proj_qkv.bytes.data()));
+    const std::string nm = Blk(il, "attn_qkv.weight");
+    if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
+      const GgufTensorInfo& ti = g.Get(nm);
+      gdn.in_proj_qkv = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1]);
+    } else {
+      const GgufTensorInfo* t = nullptr;
+      std::vector<uint16_t> dq = DqBf16(g, nm, &t);
+      const int64_t out_dim = t->shape[0];
+      const int64_t in_dim = t->shape[1];
+      if (reorder) ReorderVRows(dq, in_dim, /*row_off=*/2 * key_dim, num_k, rpk, dv);
+      gdn.in_proj_qkv = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
+      TransposeBf16(dq.data(), out_dim, in_dim,
+                    reinterpret_cast<uint16_t*>(gdn.in_proj_qkv.bytes.data()));
+    }
   }
   // in_proj_z <- attn_gate [value_dim, H]; all rows are V.
   {
-    const GgufTensorInfo* t = nullptr;
-    std::vector<uint16_t> dq = DqBf16(g, Blk(il, "attn_gate.weight"), &t);
-    const int64_t out_dim = t->shape[0];
-    const int64_t in_dim = t->shape[1];
-    if (reorder) ReorderVRows(dq, in_dim, 0, num_k, rpk, dv);
-    gdn.in_proj_z = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-    TransposeBf16(dq.data(), out_dim, in_dim,
-                  reinterpret_cast<uint16_t*>(gdn.in_proj_z.bytes.data()));
+    const std::string nm = Blk(il, "attn_gate.weight");
+    if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
+      const GgufTensorInfo& ti = g.Get(nm);
+      gdn.in_proj_z = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1]);
+    } else {
+      const GgufTensorInfo* t = nullptr;
+      std::vector<uint16_t> dq = DqBf16(g, nm, &t);
+      const int64_t out_dim = t->shape[0];
+      const int64_t in_dim = t->shape[1];
+      if (reorder) ReorderVRows(dq, in_dim, 0, num_k, rpk, dv);
+      gdn.in_proj_z = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
+      TransposeBf16(dq.data(), out_dim, in_dim,
+                    reinterpret_cast<uint16_t*>(gdn.in_proj_z.bytes.data()));
+    }
   }
   // in_proj_b <- ssm_beta, in_proj_a <- ssm_alpha [num_v, H]; rows are V heads.
   for (auto* pr : {&gdn.in_proj_b, &gdn.in_proj_a}) {
     const std::string nm =
-        pr == &gdn.in_proj_b ? "ssm_beta.weight" : "ssm_alpha.weight";
+        Blk(il, pr == &gdn.in_proj_b ? "ssm_beta.weight" : "ssm_alpha.weight");
+    if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
+      const GgufTensorInfo& ti = g.Get(nm);
+      *pr = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1]);
+      continue;
+    }
     const GgufTensorInfo* t = nullptr;
-    std::vector<uint16_t> dq = DqBf16(g, Blk(il, nm), &t);
+    std::vector<uint16_t> dq = DqBf16(g, nm, &t);
     const int64_t out_dim = t->shape[0];
     const int64_t in_dim = t->shape[1];
     if (reorder) ReorderVRows(dq, in_dim, 0, num_k, rpk, 1);
@@ -346,6 +432,8 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c) {
   }
   // conv1d <- ssm_conv1d [conv_dim, K]; only V channels reorder. NOT transposed.
   {
+    RequireExpand(pol, g, Blk(il, "ssm_conv1d.weight"),
+                  GgufTensorRole::kConvWeight);
     const GgufTensorInfo* t = nullptr;
     std::vector<uint16_t> dq = DqBf16(g, Blk(il, "ssm_conv1d.weight"), &t);
     VT_CHECK(t->shape.size() == 2, "qwen3_5 gguf: ssm_conv1d must be 2-D");
@@ -357,18 +445,28 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c) {
                 dq.size() * sizeof(uint16_t));
   }
   // out_proj <- ssm_out [H, value_dim]; reorder V columns, then transpose.
+  // The COLUMN reorder cuts across block boundaries, so when it is active this
+  // tensor is kTransformedWeight and must expand.
   {
-    const GgufTensorInfo* t = nullptr;
-    std::vector<uint16_t> dq = DqBf16(g, Blk(il, "ssm_out.weight"), &t);
-    const int64_t out_dim = t->shape[0];
-    const int64_t in_dim = t->shape[1];
-    if (reorder) ReorderVCols(dq, out_dim, in_dim, num_k, rpk, dv);
-    gdn.out_proj = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-    TransposeBf16(dq.data(), out_dim, in_dim,
-                  reinterpret_cast<uint16_t*>(gdn.out_proj.bytes.data()));
+    const std::string nm = Blk(il, "ssm_out.weight");
+    if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
+      const GgufTensorInfo& ti = g.Get(nm);
+      gdn.out_proj = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1]);
+    } else {
+      const GgufTensorInfo* t = nullptr;
+      std::vector<uint16_t> dq = DqBf16(g, nm, &t);
+      const int64_t out_dim = t->shape[0];
+      const int64_t in_dim = t->shape[1];
+      if (reorder) ReorderVCols(dq, out_dim, in_dim, num_k, rpk, dv);
+      gdn.out_proj = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
+      TransposeBf16(dq.data(), out_dim, in_dim,
+                    reinterpret_cast<uint16_t*>(gdn.out_proj.bytes.data()));
+    }
   }
   // a_log <- ssm_a = -exp(A_log): recover A_log = log(-value). f32 [num_v].
   {
+    RequireExpand(pol, g, Blk(il, "ssm_a"),
+                  GgufTensorRole::kTransformedWeight);
     const GgufTensorInfo* t = nullptr;
     std::vector<float> dq = DqF32(g, Blk(il, "ssm_a"), &t);
     if (reorder) ReorderVRows(dq, 1, 0, num_k, rpk, 1);
@@ -378,6 +476,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c) {
   }
   // dt_bias <- ssm_dt.bias (unchanged value). f32 [num_v].
   {
+    RequireExpand(pol, g, Blk(il, "ssm_dt.bias"), GgufTensorRole::kVector);
     const GgufTensorInfo* t = nullptr;
     std::vector<float> dq = DqF32(g, Blk(il, "ssm_dt.bias"), &t);
     if (reorder) ReorderVRows(dq, 1, 0, num_k, rpk, 1);
@@ -385,17 +484,24 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c) {
     std::memcpy(gdn.dt_bias.bytes.data(), dq.data(), dq.size() * sizeof(float));
   }
   // norm_weight <- ssm_norm: raw HF (convert does NOT add 1 here). bf16 [Dv].
+  RequireExpand(pol, g, Blk(il, "ssm_norm.weight"), GgufTensorRole::kVector);
   gdn.norm_weight = OwnBf16(g, Blk(il, "ssm_norm.weight"), {dv});
   return gdn;
 }
 
-FullAttnLayerWeights LoadAttnGguf(const GgufFile& g, int64_t il) {
+FullAttnLayerWeights LoadAttnGguf(const GgufFile& g, int64_t il,
+                                  const GgufLoadPolicy& pol) {
   FullAttnLayerWeights a;
-  a.q_proj = OwnBf16T(g, Blk(il, "attn_q.weight"));
-  a.k_proj = OwnBf16T(g, Blk(il, "attn_k.weight"));
-  a.v_proj = OwnBf16T(g, Blk(il, "attn_v.weight"));
-  a.o_proj = OwnBf16T(g, Blk(il, "attn_output.weight"));
+  a.q_proj = OwnMatmulWeight(g, Blk(il, "attn_q.weight"), pol);
+  a.k_proj = OwnMatmulWeight(g, Blk(il, "attn_k.weight"), pol);
+  a.v_proj = OwnMatmulWeight(g, Blk(il, "attn_v.weight"), pol);
+  a.o_proj = OwnMatmulWeight(g, Blk(il, "attn_output.weight"), pol);
+  // (w - 1) rewrite: a VALUE transform, so never keep-quant.
+  RequireExpand(pol, g, Blk(il, "attn_q_norm.weight"),
+                GgufTensorRole::kTransformedWeight);
   a.q_norm = OwnNormMinus1(g, Blk(il, "attn_q_norm.weight"));
+  RequireExpand(pol, g, Blk(il, "attn_k_norm.weight"),
+                GgufTensorRole::kTransformedWeight);
   a.k_norm = OwnNormMinus1(g, Blk(il, "attn_k_norm.weight"));
   return a;
 }
@@ -404,16 +510,32 @@ FullAttnLayerWeights LoadAttnGguf(const GgufFile& g, int64_t il) {
 // into E owned bf16 [in, out] (transposed to Matmul-B layout).
 std::vector<OwnedTensor> LoadExpertsT(const GgufFile& g, int64_t il,
                                       const std::string& stem,
-                                      int64_t num_experts) {
-  const GgufTensorInfo* t = nullptr;
-  std::vector<uint16_t> dq = DqBf16(g, Blk(il, stem), &t);
-  VT_CHECK(t->shape.size() == 3 && t->shape[0] == num_experts,
+                                      int64_t num_experts,
+                                      const GgufLoadPolicy& pol) {
+  const std::string name = Blk(il, stem);
+  const GgufTensorInfo& ti = g.Get(name);
+  VT_CHECK(ti.shape.size() == 3 && ti.shape[0] == num_experts,
            "qwen3_5 gguf: expected [E,out,in] expert tensor " + stem);
-  const int64_t out_dim = t->shape[1];
-  const int64_t in_dim = t->shape[2];
-  const int64_t per = out_dim * in_dim;
+  const int64_t out_dim = ti.shape[1];
+  const int64_t in_dim = ti.shape[2];
+
   std::vector<OwnedTensor> experts;
   experts.reserve(static_cast<size_t>(num_experts));
+
+  if (pol.Route(ti, GgufTensorRole::kStackedExpertWeight) ==
+      GgufResidency::kKeepQuant) {
+    // Each expert occupies `out_dim` WHOLE rows, i.e. a whole number of
+    // blocks, so the split is a byte range and no block is ever cut.
+    for (int64_t e = 0; e < num_experts; ++e) {
+      experts.push_back(
+          OwnGgufQuantBlocks(ti, out_dim, in_dim, /*row_offset=*/e * out_dim));
+    }
+    return experts;
+  }
+
+  const GgufTensorInfo* t = nullptr;
+  std::vector<uint16_t> dq = DqBf16(g, name, &t);
+  const int64_t per = out_dim * in_dim;
   for (int64_t e = 0; e < num_experts; ++e) {
     OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
     TransposeBf16(dq.data() + e * per, out_dim, in_dim,
@@ -423,25 +545,35 @@ std::vector<OwnedTensor> LoadExpertsT(const GgufFile& g, int64_t il,
   return experts;
 }
 
-MoeBlockWeights LoadMoeGguf(const GgufFile& g, int64_t il, const HfConfig& c) {
+MoeBlockWeights LoadMoeGguf(const GgufFile& g, int64_t il, const HfConfig& c,
+                            const GgufLoadPolicy& pol) {
   MoeBlockWeights m;
-  m.router_gate = OwnBf16T(g, Blk(il, "ffn_gate_inp.weight"));
+  m.router_gate = OwnMatmulWeight(g, Blk(il, "ffn_gate_inp.weight"), pol);
   // shared gate: 1-D [H] in GGUF -> [H, 1] (matches the safetensors [H,1]).
+  RequireExpand(pol, g, Blk(il, "ffn_gate_inp_shexp.weight"),
+                GgufTensorRole::kVector);
   m.shared_gate =
       OwnBf16(g, Blk(il, "ffn_gate_inp_shexp.weight"), {c.hidden_size, 1});
-  m.expert_gate = LoadExpertsT(g, il, "ffn_gate_exps.weight", c.num_experts);
-  m.expert_up = LoadExpertsT(g, il, "ffn_up_exps.weight", c.num_experts);
-  m.expert_down = LoadExpertsT(g, il, "ffn_down_exps.weight", c.num_experts);
-  m.shared_gate_proj = OwnBf16T(g, Blk(il, "ffn_gate_shexp.weight"));
-  m.shared_up_proj = OwnBf16T(g, Blk(il, "ffn_up_shexp.weight"));
-  m.shared_down_proj = OwnBf16T(g, Blk(il, "ffn_down_shexp.weight"));
+  m.expert_gate =
+      LoadExpertsT(g, il, "ffn_gate_exps.weight", c.num_experts, pol);
+  m.expert_up = LoadExpertsT(g, il, "ffn_up_exps.weight", c.num_experts, pol);
+  m.expert_down =
+      LoadExpertsT(g, il, "ffn_down_exps.weight", c.num_experts, pol);
+  m.shared_gate_proj = OwnMatmulWeight(g, Blk(il, "ffn_gate_shexp.weight"), pol);
+  m.shared_up_proj = OwnMatmulWeight(g, Blk(il, "ffn_up_shexp.weight"), pol);
+  m.shared_down_proj = OwnMatmulWeight(g, Blk(il, "ffn_down_shexp.weight"), pol);
   return m;
 }
 
 }  // namespace
 
 Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
-                                         const HfConfig& config) {
+                                         const HfConfig& config,
+                                         const GgufLoadPolicy* policy) {
+  // Null policy => the process environment, whose defaults reproduce the
+  // historical all-bf16 expansion byte for byte.
+  const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv();
+  const GgufLoadPolicy& pol = policy != nullptr ? *policy : env_policy;
   VT_CHECK(config.num_hidden_layers > 0 &&
                static_cast<int64_t>(config.layer_types.size()) ==
                    config.num_hidden_layers,
@@ -450,41 +582,58 @@ Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
            "qwen3_5 gguf: num_experts must be > 0 for the MoE model");
 
   Qwen3_5MoeWeights w;
-  // embed_tokens [vocab, H] (NOT transposed); final_norm (w+1); lm_head + T.
+  // embed_tokens [vocab, H] (NOT transposed): a GATHER table, never a GEMM.
+  RequireExpand(pol, gguf, "token_embd.weight",
+                GgufTensorRole::kEmbeddingTable);
   w.embed_tokens =
       OwnBf16(gguf, "token_embd.weight", gguf.Get("token_embd.weight").shape);
+  RequireExpand(pol, gguf, "output_norm.weight",
+                GgufTensorRole::kTransformedWeight);
   w.final_norm = OwnNormMinus1(gguf, "output_norm.weight");
   // lm_head [H, vocab] (+T). Tied-embedding GGUFs omit output.weight; then the
   // head is the transposed token_embd (same [vocab,H] source), as llama.cpp
-  // does (TENSOR_DUPLICATED from token_embd).
-  w.lm_head = OwnBf16T(gguf, HasTensor(gguf, "output.weight")
-                                 ? "output.weight"
-                                 : "token_embd.weight");
+  // does (TENSOR_DUPLICATED from token_embd). When tied, token_embd is routed
+  // TWICE — once as the gather table, once as this GEMM weight — which is the
+  // correct answer for both uses.
+  w.lm_head = OwnMatmulWeight(gguf,
+                              HasTensor(gguf, "output.weight")
+                                  ? "output.weight"
+                                  : "token_embd.weight",
+                              pol);
 
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t il = 0; il < config.num_hidden_layers; ++il) {
     Qwen3_5MoeLayerWeights layer;
+    RequireExpand(pol, gguf, Blk(il, "attn_norm.weight"),
+                  GgufTensorRole::kTransformedWeight);
     layer.input_layernorm = OwnNormMinus1(gguf, Blk(il, "attn_norm.weight"));
+    RequireExpand(pol, gguf, Blk(il, "post_attention_norm.weight"),
+                  GgufTensorRole::kTransformedWeight);
     layer.post_attention_layernorm =
         OwnNormMinus1(gguf, Blk(il, "post_attention_norm.weight"));
     const std::string& lt = config.layer_types[static_cast<size_t>(il)];
     if (lt == "linear_attention") {
       layer.is_linear_attention = true;
-      layer.gdn = LoadGdnGguf(gguf, il, config);
+      layer.gdn = LoadGdnGguf(gguf, il, config, pol);
     } else if (lt == "full_attention") {
       layer.is_linear_attention = false;
-      layer.attn = LoadAttnGguf(gguf, il);
+      layer.attn = LoadAttnGguf(gguf, il, pol);
     } else {
       VT_CHECK(false, "qwen3_5 gguf: unknown layer_type " + lt);
     }
-    layer.moe = LoadMoeGguf(gguf, il, config);
+    layer.moe = LoadMoeGguf(gguf, il, config, pol);
     w.layers.push_back(std::move(layer));
   }
   return w;
 }
 
 Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
-                                             const HfConfig& config) {
+                                             const HfConfig& config,
+                                             const GgufLoadPolicy* policy) {
+  // Null policy => the process environment, whose defaults reproduce the
+  // historical all-bf16 expansion byte for byte.
+  const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv();
+  const GgufLoadPolicy& pol = policy != nullptr ? *policy : env_policy;
   VT_CHECK(config.num_hidden_layers > 0 &&
                static_cast<int64_t>(config.layer_types.size()) ==
                    config.num_hidden_layers,
@@ -493,35 +642,45 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
            "qwen3_5 gguf: num_experts must be 0 for the dense model");
 
   Qwen3_5DenseWeights w;
+  RequireExpand(pol, gguf, "token_embd.weight",
+                GgufTensorRole::kEmbeddingTable);
   w.embed_tokens =
       OwnBf16(gguf, "token_embd.weight", gguf.Get("token_embd.weight").shape);
+  RequireExpand(pol, gguf, "output_norm.weight",
+                GgufTensorRole::kTransformedWeight);
   w.final_norm = OwnNormMinus1(gguf, "output_norm.weight");
   // Tied-embedding GGUFs (the 2B) omit output.weight; the head is then the
   // transposed token_embd, as llama.cpp does (TENSOR_DUPLICATED).
-  w.lm_head = OwnBf16T(gguf, HasTensor(gguf, "output.weight")
-                                 ? "output.weight"
-                                 : "token_embd.weight");
+  w.lm_head = OwnMatmulWeight(gguf,
+                              HasTensor(gguf, "output.weight")
+                                  ? "output.weight"
+                                  : "token_embd.weight",
+                              pol);
 
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t il = 0; il < config.num_hidden_layers; ++il) {
     Qwen3_5DenseLayerWeights layer;
+    RequireExpand(pol, gguf, Blk(il, "attn_norm.weight"),
+                  GgufTensorRole::kTransformedWeight);
     layer.input_layernorm = OwnNormMinus1(gguf, Blk(il, "attn_norm.weight"));
+    RequireExpand(pol, gguf, Blk(il, "post_attention_norm.weight"),
+                  GgufTensorRole::kTransformedWeight);
     layer.post_attention_layernorm =
         OwnNormMinus1(gguf, Blk(il, "post_attention_norm.weight"));
     const std::string& lt = config.layer_types[static_cast<size_t>(il)];
     if (lt == "linear_attention") {
       layer.is_linear_attention = true;
-      layer.gdn = LoadGdnGguf(gguf, il, config);
+      layer.gdn = LoadGdnGguf(gguf, il, config, pol);
     } else if (lt == "full_attention") {
       layer.is_linear_attention = false;
-      layer.attn = LoadAttnGguf(gguf, il);
+      layer.attn = LoadAttnGguf(gguf, il, pol);
     } else {
       VT_CHECK(false, "qwen3_5 gguf: unknown layer_type " + lt);
     }
     // Dense SwiGLU MLP (bf16 fields; the fp4 variants stay empty).
-    layer.mlp.gate_proj = OwnBf16T(gguf, Blk(il, "ffn_gate.weight"));
-    layer.mlp.up_proj = OwnBf16T(gguf, Blk(il, "ffn_up.weight"));
-    layer.mlp.down_proj = OwnBf16T(gguf, Blk(il, "ffn_down.weight"));
+    layer.mlp.gate_proj = OwnMatmulWeight(gguf, Blk(il, "ffn_gate.weight"), pol);
+    layer.mlp.up_proj = OwnMatmulWeight(gguf, Blk(il, "ffn_up.weight"), pol);
+    layer.mlp.down_proj = OwnMatmulWeight(gguf, Blk(il, "ffn_down.weight"), pol);
     w.layers.push_back(std::move(layer));
   }
   return w;

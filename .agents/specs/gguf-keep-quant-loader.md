@@ -1,7 +1,7 @@
 # Leaf spec: GGUF keep-quantized loader — quantized weights resident, dequant as oracle
 
 **Row:** `QUANT-GGUF-KEEPQ-LOADER` (quantization-matrix.md, leaf of the
-`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **L1 landed** (2026-07-22, `CLAIM-QUANT-GGUF-COMPUTE-1`); L2-L4 open, so weights are still bf16-expanded at load ·
+`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **L1+L2+L3 landed** (2026-07-22, `CLAIM-QUANT-GGUF-COMPUTE-1`): block residency, the total per-tensor routing policy and the `VT_CPU_REF` oracle switch all exist and are gated, but keep-quant is **DEFAULT OFF** (nothing can consume a block-typed weight until CIQ G4 routes the call sites), so a production load still expands every weight to bf16. L4 (the RSS gate) open ·
 **upstream pin:** llama.cpp local fork `237ad9b96` (b9892) ·
 **parent evidence:** B4 decision row
 ([parity-ledger.md L290](../parity-ledger.md#L290)): load-time bf16 expansion
@@ -120,8 +120,8 @@ Pinned local fork `/home/mudler/_git/llama.cpp` @ `237ad9b96`.
 | W | Row (claim-sized) | Content | Depends | Status |
 |---|---|---|---|---|
 | L1 | merge bench branch | merge `7c91a42` (`bench/quant-gguf-compute-b4-cpu-floor`) into main: dense-arch `qwen35` GGUF loader + F16/BF16 row dequant; gguf ctest green; ledger note that B4 loader arm is now on main | - | **DONE** 2026-07-22 |
-| L2 | quant residency | `GgufQuantWeight`/block-`OwnedTensor` storage + loader keep-quant path + losslessness units (gate 1) | CIQ G1 | open |
-| L3 | routing + oracle switch | per-tensor policy table, `VT_CPU_REF` env, oracle-stability gate 2, routing units | L2 | open |
+| L2 | quant residency | `GgufQuantWeight`/block-`OwnedTensor` storage + loader keep-quant path + losslessness units (gate 1) | CIQ G1 | **DONE** 2026-07-22 |
+| L3 | routing + oracle switch | per-tensor policy table, `VT_CPU_REF` env, oracle-stability gate 2, routing units | L2 | **DONE** 2026-07-22 |
 | L4 | memory gate + closure | RSS measurement (gate 3), matrix `M`-cell notes, ledger row | L2, L3 | open |
 
 ## Risks/decisions
@@ -202,3 +202,101 @@ regression set is unchanged (27B 235/235, 35B 315/315, Qwen3-Coder 6/6,
 Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8) on a clean `-Werror` CUDA build.
 The B4 loader arm is reproducible from main; the branch may be deleted. Gates
 1-4 remain owed by L2/L3.
+
+## L2 + L3 result (2026-07-22)
+
+**Landed together.** GGUF weights can now stay in their native ggml blocks from
+file to weight struct, every tensor the loader touches is routed by an explicit
+total policy, and the dequant path is reachable as an oracle. What has NOT
+changed is what a production load does: keep-quant is default OFF.
+
+**L2 — residency.** The spec's preferred shape was taken: ONE struct, no
+parallel type. [`OwnGgufQuantBlocks`](../../src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp#L20)
+copies a tensor's raw blocks into an `OwnedTensor` whose `dtype` is the block
+`vt::DType` (CIQ G1) and whose orientation is the file's own `[N=out, K=in]`
+with `nk = true` — GGUF disk order IS ggml's src0 layout IS our `MatmulBT`
+orientation, so residency needs no transpose and performs none (a block
+encoding cannot be transposed without requantizing). It refuses, loudly, a
+non-keep-quant encoding, a `K` that is not a whole number of blocks
+(`ggml_row_size`'s precondition), and any slice outside the reader's validated
+tensor span. Stacked `[E, out, in]` expert tensors split by BYTE RANGE: an
+expert is a whole number of rows, hence of blocks, so no block is ever cut.
+Bytes are COPIED, uniform with every other weight path (mmap zero-copy stays a
+recorded follow-up; llama.cpp supports both).
+
+**L3 — routing + oracle.** [`gguf_keep_quant.{h,cpp}`](../../src/vllm/model_executor/model_loader/gguf_keep_quant.cpp#L1)
+owns the decision as a pure function of `(role, encoding, shape)` plus two
+switches. Six roles partition every tensor in the file:
+`kMatmulWeight` and `kStackedExpertWeight` (taken verbatim — the only two that
+can keep blocks), `kTransformedWeight` (the `(w-1)` RMSNorm rewrite,
+`ssm_a = log(-x)`, and the V-head reorders), `kEmbeddingTable` (a gather, not a
+GEMM), `kConvWeight` and `kVector`. Keeping blocks additionally requires the
+right rank, one of the six executable encodings, an executable `vec_dot`, and
+`K % BlockElems == 0`. `VT_CPU_REF=1` forces expansion regardless — the parity
+oracle the parent row promised. `VT_GGUF_KEEP_QUANT=1` opts INTO residency;
+**its default is OFF and CIQ G4 owns flipping it**, because until the model's
+`MatmulBT` call sites route on block dtype nothing can consume a block-typed
+weight.
+
+**Totality is proven three ways, not asserted.** (1) The role switch carries no
+`default:` label, so a new role that forgets to state its residency is a
+`-Werror=switch` BUILD failure. (2) Every tensor the loader touches goes through
+`GgufLoadPolicy::Route` — the verbatim GEMM weights via `OwnMatmulWeight`, and
+everything else via a `RequireExpand` assertion that fails loudly if the policy
+ever tried to keep a value-rewritten tensor — and the policy's `audit` hook
+records what it saw, so the test asserts `routed == the file's complete tensor
+list` on both a dense and a MoE fixture. (3) A unit walks 6 roles × 12 ggml
+encodings × 6 shapes and compares against an expectation written out LONGHAND,
+never derived from the implementation, with both outcomes shown to occur
+(12 keep / 420 expand) so the table cannot pass vacuously.
+
+**Gate 1 (losslessness) — PROVEN PER ENCODING.** `Q4_0, Q8_0, Q3_K, Q4_K, Q5_K,
+Q6_K` each get their OWN test case (a failure names the encoding): resident
+bytes `memcmp`-equal to the file span, and dequantizing the resident blocks
+BYTE-IDENTICAL to the direct-from-file expansion in both f32 and bf16. Block
+bytes are pseudo-random rather than encoder-produced, because the property must
+hold for every bit pattern a file can contain; all six block structs place
+their f16 fields at even offsets and all six block sizes are even, so clearing
+bit 6 of every odd-indexed byte bounds every scale finite (asserted) without
+otherwise restricting the data. At LOADER level the same gate runs end to end:
+dequantizing a kept weight and applying the loader's own transpose reproduces
+the expanded `[K,N]` bf16 tensor byte for byte, per weight, on both a dense and
+a MoE fixture (including per-expert, which is what catches a wrong stacked
+slice offset).
+
+**Gate 2 (oracle stability) — MET.** With `VT_CPU_REF=1` and keep-quant
+REQUESTED, nothing stays quantized and every weight is bit-identical to the
+historical load; on dgx `test_qwen36_gguf_engine` under `VT_CPU_REF=1` is
+**28/28 assertions, 2/2 cases, 16/16 tokens** on both APEX files — the same
+result as without it.
+
+**Mutation-tested (10 mutants, 10 caught).** Residency byte corruption; the
+embedding table skipping the policy; the oracle switch ignored; the master
+switch ignored; the stacked-expert K taken from the wrong axis; the ragged-K
+guard dropped; value-transformed tensors made keep-quant eligible; the stacked
+slice always reading expert 0; a dropped `nk` flag; a swapped shape order — all
+caught. The expert-offset mutant SURVIVED the first battery and exposed a real
+coverage hole (the dense fixture has no experts); the MoE fixture and its
+per-expert byte-range assertions were added in response, and it is caught now.
+
+**Nothing moved.** Keep-quant is default OFF, and a `nullptr` policy reads the
+environment, so a production GGUF load is byte-for-byte what it was — asserted
+directly by a case comparing the env-driven load against an explicit
+all-expand policy. On dgx the full regression set is UNCHANGED, each gate run
+STANDALONE: 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6** (138
+assertions), Qwen3-dense **16/16** on both 0.6B and 4B (664), OPT **6/6** (36),
+DeepSeek-V2-Lite **8/8** (223), and `test_qwen36_gguf_engine` **28/28** with
+16/16 tokens on Compact and Balanced. Clean CUDA `-Werror` build to 100%,
+**0 warnings**, production flags. Golden corpus md5 (475 files) identical
+before and after: `2965ef5772b556d3f3f86fedf4221b2f`. Dev box: clean CPU
+`-Werror` full rebuild, 0 warnings, full CPU ctest **154/154** (153 + the new
+suite). The new units are green on dgx's **aarch64** with identical counts
+(17 cases / 5,574 assertions), and `test_gguf_dequant` (11/202),
+`test_ops_quant_traits` (8/5,615) and `test_ops_quant_dot` (16/78,052) are
+unchanged.
+
+**Gates 3-5 remain owed.** Gate 3 (peak RSS ≤ file size + activations + 15%) is
+L4's and cannot be measured until keep-quant is ON, which needs CIQ G4; gate 4
+(no behavior change while inert) is met as stated above. Weights STAYING
+quantized is not the same as COMPUTING in quant: the per-encoding `C` cells stay
+`-` until G4.

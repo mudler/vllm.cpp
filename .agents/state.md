@@ -17215,3 +17215,47 @@ then `cd build-cpu && ctest -j2` (expect 153/153),
 `./tests/test_ops_quant_traits` (expect 8 cases / 5,615 assertions).
 `python3 scripts/check-agent-record.py` and `python3 scripts/check-doc-checkpoint.py`
 must both be green.
+
+## 2026-07-22 — GGUF keep-quant loader L2 + L3 (`CLAIM-QUANT-GGUF-COMPUTE-1`)
+
+Worktree `agent-ae5d96e258c4c6369`, base `29e07a8`. Executed work rows **L2**
+(quant residency) and **L3** (routing policy + `VT_CPU_REF` oracle switch) of
+[gguf-keep-quant-loader.md](specs/gguf-keep-quant-loader.md). Not G4, not L4.
+
+**What changed.** GGUF weights can now stay in their native ggml blocks:
+`OwnGgufQuantBlocks` copies the raw blocks into an `OwnedTensor` with a block
+`vt::DType`, the file's `[N=out, K=in]` orientation and `nk = true` — no
+transpose, because a block encoding cannot be transposed without requantizing,
+and GGUF disk order is already ggml's src0 layout and our `MatmulBT`
+orientation. Stacked `[E, out, in]` expert tensors split by byte range. A new
+`gguf_keep_quant.{h,cpp}` owns the per-tensor decision as a pure function of
+`(role, encoding, shape)` over six roles, and EVERY tensor the loader touches
+goes through it — the verbatim GEMM weights via `OwnMatmulWeight`, everything
+else via a `RequireExpand` assertion.
+
+**What did NOT change: what a production load does.** Keep-quant is DEFAULT
+OFF. Nothing can consume a block-typed weight until CIQ **G4** routes the
+model's `MatmulBT` call sites onto `kMatmulBTQuant`, so turning residency on by
+default would break the forward rather than speed it up. `VT_GGUF_KEEP_QUANT=1`
+opts in (what the tests use); `VT_CPU_REF=1` forces expansion regardless. A
+test asserts the env-driven default load is byte-identical to an explicit
+all-expand policy.
+
+**Evidence.** Gate 1 (losslessness) proven PER ENCODING, six separate cases;
+gate 2 (oracle stability) met, including `VT_CPU_REF=1` on the real APEX files;
+totality proven at compile time (`-Werror=switch`), at runtime (audit hook ==
+the file's complete tensor list), and combinatorially (6 roles × 12 encodings ×
+6 shapes vs a longhand expectation). 10 mutants, 10 caught — one SURVIVED the
+first battery and exposed a genuine coverage hole (no experts in the dense
+fixture), which is why the MoE fixture exists.
+
+**Honest gaps.** No RSS number and none owed here (gate 3 is L4's and needs G4
+first); no throughput number (G4's); per-encoding `C` cells stay `-` because
+weights staying quantized is not computing in quant.
+
+**Resume commands.** From the repo root: `cmake --build build -j 20` then
+`cd build && ctest -j2` (expect 154/154), and `./tests/test_gguf_keep_quant`
+(expect 17 cases / 5,574 assertions). On dgx, each engine gate STANDALONE — a
+co-scheduled run is a known memory effect on that box, not a regression.
+`python3 scripts/check-agent-record.py` and
+`python3 scripts/check-doc-checkpoint.py` must both be green.

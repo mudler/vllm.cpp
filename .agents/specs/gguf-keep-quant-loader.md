@@ -126,11 +126,28 @@ Pinned local fork `/home/mudler/_git/llama.cpp` @ `237ad9b96`.
 
 ## Risks/decisions
 
-- **DECISION — bench-branch fate:** merge `7c91a42` into main (L1). It is
-  loader-only, tested, and the B4 evidence row cites it; leaving
+- **DECISION — bench-branch fate:** land `7c91a42`'s content on main (L1). It
+  is loader-only, tested, and the B4 evidence row cites it; leaving
   measurement-enabling code unmerged makes the recorded floor
-  non-reproducible from main. The branch is deleted after merge. (This
-  resolves the "cited-not-merged" flag in the B4 ledger row.)
+  non-reproducible from main.
+  **LANDED 2026-07-22 as a SQUASH, not a merge — `66233e6`, single parent
+  `2ff7252`.** `7c91a42` is therefore NOT an ancestor of main. Two reasons it
+  could not be a true merge: it was cut at `83010c7`, **422 commits** behind,
+  and did not apply cleanly (main had replaced `FromModelDir`'s hardcoded
+  dense-vs-MoE GGUF split with the `ModelRegistry` seam, so the branch's
+  `LoadedEngine::IsDenseArch` no longer exists — its intent was re-expressed
+  through that seam); and as a standalone commit it fails the
+  documentation-checkpoint gate it predates, which would redden CI on any push
+  range containing it. Provenance is cited in the `66233e6` commit message
+  instead.
+  Consequences, recorded so they do not surprise anyone: the
+  **"cited-not-merged" flag in the B4 ledger row resolves by CONTENT, not by
+  ancestry**; `git branch -d bench/quant-gguf-compute-b4-cpu-floor` will
+  **refuse** (not merged by ancestry) and needs `-D`, which is safe because the
+  content is on main; and the local ref `quant-gguf-compute-g1-l1` → `9bc86f0`
+  is retained deliberately as the only record of the true merge lineage (both
+  `2ff7252` and `7c91a42` as parents) and the only thing keeping `7c91a42`
+  reachable if the bench branch is deleted.
 - **Copy vs mmap residency:** start with copied owned buffers (uniform with
   every existing weight path, no file-lifetime coupling); mmap zero-copy is
   a recorded follow-up if load-time RSS or load latency matters later —

@@ -1862,7 +1862,7 @@ measuring the fallback against itself. `test_gguf_dequant` staying green is the
 evidence that the decoder move changed nothing, together with the dgx `test_qwen36_gguf_engine` standalone run against the real APEX files (28/28 assertions, 16/16 tokens on both Compact and Balanced) and the full unchanged model regression set on a clean `-Werror` CUDA build.
 
 **The denominator is unchanged and still binding:** llama.cpp on the same file
-at the same pin (`237ad9b96`), from the B4 decision row
+at the same pin (`237ad9b96`), from the B4 decision row **B4 provenance (2026-07-22):** the loader arm that made this floor reproducible landed on main as a SQUASH (`66233e6`), so the bench commit `7c91a42` is NOT an ancestor of main — the row's "cited-not-merged" flag resolves by CONTENT (tree hash verified byte-identical to the gated tree), not by ancestry.
 ([parity-ledger.md](../.agents/parity-ledger.md)) — we are behind by decode
 **54-75x**, prefill **~1,480x**, and peak RSS **2.7x** (7.43 GiB vs 2.80 GiB on
 a 2.68 GiB file). Nothing in G1/L1 moves those numbers.

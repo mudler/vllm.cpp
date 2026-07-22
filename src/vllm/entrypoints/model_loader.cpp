@@ -349,6 +349,11 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // later source-specific missing-tensor/tokenizer error.
     (void)ModelRegistry::Resolve(config);
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
+    // Dense-vs-MoE GGUF dispatch now happens through the registry: the bench
+    // branch's inline `IsDenseArch` split is superseded by
+    // `HfConfigFromGguf` mapping the GGUF `general.architecture` key
+    // (`qwen35` dense / `qwen35moe` / `qwen3next`) onto the registered
+    // architecture ID, which resolves to the owning arch TU's GGUF loader.
     std::unique_ptr<LoadedModel> model =
         ModelRegistry::Load(config, ModelSource::FromGguf(gguf));
     return std::unique_ptr<LoadedEngine>(new LoadedEngine(

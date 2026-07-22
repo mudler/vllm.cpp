@@ -37,15 +37,16 @@
 #pragma once
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/transformers_utils/hf_config.h"
 
 namespace vllm {
 
 // Build the HfConfig from a GGUF file's metadata (arch prefix qwen35moe /
-// qwen3next). vocab_size is taken from token_embd's shape when the kv is
-// absent; layer_types is derived from the recurrent-layers kv or the
-// full_attention_interval (default 4: every interval-th layer is full
+// qwen3next / qwen35 [dense]). vocab_size is taken from token_embd's shape
+// when the kv is absent; layer_types is derived from the recurrent-layers kv
+// or the full_attention_interval (default 4: every interval-th layer is full
 // attention, the rest linear/GDN). Throws std::runtime_error on a missing
 // required key or an unexpected architecture.
 HfConfig HfConfigFromGguf(const GgufFile& gguf);
@@ -57,5 +58,15 @@ HfConfig HfConfigFromGguf(const GgufFile& gguf);
 // missing tensor or an unsupported ggml quant type (i-quants are Task 3+).
 Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
                                          const HfConfig& config);
+
+// DENSE-arch (`qwen35`, e.g. Qwen3.5-2B) analogue of LoadQwen3_5MoeFromGguf:
+// same GDN / full-attention block loaders (identical tensor names + convert
+// transforms — llama.cpp's Qwen3_5TextModel shares the Qwen3NextModel convert
+// base with the MoE), with the per-layer MoE block replaced by the dense
+// SwiGLU MLP ("blk.%d.ffn_{gate,up,down}"). Targets the same
+// Qwen3_5DenseWeights the 27B safetensors loader produces (bf16 fields; the
+// fp4 variants stay empty).
+Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
+                                             const HfConfig& config);
 
 }  // namespace vllm

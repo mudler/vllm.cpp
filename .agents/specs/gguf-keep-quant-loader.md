@@ -1,7 +1,7 @@
 # Leaf spec: GGUF keep-quantized loader — quantized weights resident, dequant as oracle
 
 **Row:** `QUANT-GGUF-KEEPQ-LOADER` (quantization-matrix.md, leaf of the
-`QUANT-GGUF-COMPUTE` block) · **status:** spike complete, `READY` ·
+`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **L1 landed** (2026-07-22, `CLAIM-QUANT-GGUF-COMPUTE-1`); L2-L4 open, so weights are still bf16-expanded at load ·
 **upstream pin:** llama.cpp local fork `237ad9b96` (b9892) ·
 **parent evidence:** B4 decision row
 ([parity-ledger.md L290](../parity-ledger.md#L290)): load-time bf16 expansion
@@ -53,7 +53,7 @@ Pinned local fork `/home/mudler/_git/llama.cpp` @ `237ad9b96`.
   — type recognition + `GgmlTraits` block geometry; tensor data pointers into
   the mapped file.
 - Dequant kernels (stay, as oracle):
-  [gguf_dequant.cpp:246-279](../../src/vllm/model_executor/model_loader/gguf_dequant.cpp#L246).
+  [gguf_dequant.cpp:246-279](../../src/vllm/model_executor/model_loader/gguf_dequant.cpp#L53).
 - Weight structs precedent:
   [qwen3_5_weights.h:37-80](../../include/vllm/model_executor/models/qwen3_5_weights.h#L37)
   — `OwnedTensor.nk` orientation flag; `Nvfp4Weight` already proves the
@@ -117,12 +117,12 @@ Pinned local fork `/home/mudler/_git/llama.cpp` @ `237ad9b96`.
 
 ## Work breakdown
 
-| W | Row (claim-sized) | Content | Depends |
-|---|---|---|---|
-| L1 | merge bench branch | merge `7c91a42` (`bench/quant-gguf-compute-b4-cpu-floor`) into main: dense-arch `qwen35` GGUF loader + F16/BF16 row dequant; gguf ctest green; ledger note that B4 loader arm is now on main | - |
-| L2 | quant residency | `GgufQuantWeight`/block-`OwnedTensor` storage + loader keep-quant path + losslessness units (gate 1) | CIQ G1 |
-| L3 | routing + oracle switch | per-tensor policy table, `VT_CPU_REF` env, oracle-stability gate 2, routing units | L2 |
-| L4 | memory gate + closure | RSS measurement (gate 3), matrix `M`-cell notes, ledger row | L2, L3 |
+| W | Row (claim-sized) | Content | Depends | Status |
+|---|---|---|---|---|
+| L1 | merge bench branch | merge `7c91a42` (`bench/quant-gguf-compute-b4-cpu-floor`) into main: dense-arch `qwen35` GGUF loader + F16/BF16 row dequant; gguf ctest green; ledger note that B4 loader arm is now on main | - | **DONE** 2026-07-22 |
+| L2 | quant residency | `GgufQuantWeight`/block-`OwnedTensor` storage + loader keep-quant path + losslessness units (gate 1) | CIQ G1 | open |
+| L3 | routing + oracle switch | per-tensor policy table, `VT_CPU_REF` env, oracle-stability gate 2, routing units | L2 | open |
+| L4 | memory gate + closure | RSS measurement (gate 3), matrix `M`-cell notes, ledger row | L2, L3 | open |
 
 ## Risks/decisions
 
@@ -146,3 +146,42 @@ Pinned local fork `/home/mudler/_git/llama.cpp` @ `237ad9b96`.
   units.
 - No product calls beyond the branch-merge decision; residency semantics
   mirror llama.cpp throughout.
+
+## L1 result (2026-07-22) — the bench-branch merge
+
+`7c91a42` (`bench/quant-gguf-compute-b4-cpu-floor`) did **not** apply cleanly:
+main has moved 422 commits since the branch point (`83010c7`), and one of those
+replaced `LoadedEngine::FromModelDir`'s hardcoded dense-vs-MoE GGUF split with
+the `ModelRegistry` seam. Three of the branch's four files auto-merged;
+`src/vllm/entrypoints/model_loader.cpp` conflicted.
+
+**Resolution.** Main's side was kept in full — the branch's inline
+`LoadedEngine::IsDenseArch(config)` split is obsolete machinery (the symbol no
+longer exists). The branch's INTENT was re-expressed through the seam that
+replaced it:
+
+- [`HfConfigFromGguf`](../../src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp#L212)
+  now maps the GGUF `general.architecture` key onto the registered architecture
+  ID — `qwen35` (dense) to `Qwen3_5ForConditionalGeneration`, the MoE keys to
+  `Qwen3_5MoeForConditionalGeneration` — instead of unconditionally claiming the
+  MoE wrapper.
+- [`LoadQwen3_5DenseModel`](../../src/vllm/model_executor/models/qwen3_5_dense.cpp#L60)
+  gains a `ModelSource::Kind::kGguf` branch calling the branch's
+  `LoadQwen3_5DenseFromGguf`, replacing its blanket "does not support GGUF
+  weights" throw.
+
+That is strictly better than the branch's version: dense GGUF dispatch now goes
+through the same registry every other architecture uses, so it composes with
+the arch-additivity work that landed in the interim. The branch's other three
+files (the dense weight loader, the header declaration, and the F16/BF16 row
+dequant cases) merged unchanged.
+
+**Gate 5 met:** gguf ctest **4/4** green on main after the merge (`test_gguf`,
+`test_gguf_dequant`, `test_gguf_qwen36_loader`, `test_model_loader_gguf`) and
+full CPU ctest 151/151. On dgx, `test_qwen36_gguf_engine` run STANDALONE (it
+OOMs co-scheduled) against the real APEX files passes **28/28 assertions, 2/2
+cases, 16/16 tokens each on Compact and Balanced**, and the full model
+regression set is unchanged (27B 235/235, 35B 315/315, Qwen3-Coder 6/6,
+Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8) on a clean `-Werror` CUDA build.
+The B4 loader arm is reproducible from main; the branch may be deleted. Gates
+1-4 remain owed by L2/L3.

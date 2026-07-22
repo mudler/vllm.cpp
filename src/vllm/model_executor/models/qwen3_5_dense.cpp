@@ -17,6 +17,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits
 #include "vllm/model_executor/models/qwen3_5_common.h"  // kQwen3_5Info, helpers
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) memory-model seam
 
 namespace vllm {
@@ -60,10 +61,19 @@ class Qwen3_5DenseLoadedModel final : public LoadedModel {
 std::unique_ptr<LoadedModel> LoadQwen3_5DenseModel(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
+  if (source.kind == ModelSource::Kind::kGguf) {
+    // Dense-arch (`qwen35`, e.g. Qwen3.5-2B) GGUF: same GDN / full-attention
+    // block loaders as the MoE path with a dense SwiGLU MLP per layer.
+    if (source.gguf == nullptr) {
+      throw std::runtime_error("GGUF model source is empty");
+    }
+    return std::make_unique<Qwen3_5DenseLoadedModel>(
+        registration, LoadQwen3_5DenseFromGguf(*source.gguf, config));
+  }
   if (source.kind != ModelSource::Kind::kSafetensors) {
     throw std::runtime_error(
         "Model architecture Qwen3_5ForConditionalGeneration does not support "
-        "GGUF weights");
+        "this weight source");
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");

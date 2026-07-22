@@ -1845,3 +1845,32 @@ The complete contract is in the
 **Sweep model #1 — W0-W4 LANDED / CORRECTNESS-DONE (2026-07-21): Qwen3-Coder-30B-A3B** (`Qwen3MoeForCausalLM`, BF16 full-attention MoE) — [spike](../.agents/specs/sweep-qwen3-coder-30b.md). Composes the done Qwen3-dense attention + the done 35B MoE experts (zero runner change); 4 model-layer seams (extract/expose/guard + a new bf16-expert loader); the SPEED gap is a fast bf16 grouped-MoE GEMM (W5). No quant (correctness covered by the reference MoE path). W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) landed behaviour-preserving; load gate all 18867 tensors mapped; forward doctest real-ckpt prefill argmax=12095 (" Paris"). **W4 SACRED correctness gate PASSES 6/6** (`test_qwen3coder_paged_engine.cpp`, paged-engine greedy vs vLLM 0.25.0): vLLM's own greedy is DETERMINISTIC (K=5, 0 multi-valued cells) → STRICT-where-well-posed near-tie-robust gate (dense methodology) — STRICT token-exact 4/6 + near-tie-band 2/6, max teacher-forced gap 0.125 nats, 0 forward-divergent; regression UNCHANGED (27B 235/235, 35B 315/315), `-Werror` 0-warn, memcheck 0. The bf16-MoE reference-loop SPEED benchmark stays NOT-APPLICABLE/PENDING until W5 (the fast grouped-MoE GEMM). Oracle used vLLM's TRITON MoE backend (FlashInfer-CUTLASS OOMs the 57 GiB model on GB10's 119 GiB unified pool). W5 fast-MoE + every-axis speed remain.
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
+
+## GGUF compute-in-quant track — roots landed, `NOT APPLICABLE` for benchmarking (2026-07-22)
+
+`QUANT-GGUF-KEEPQ-LOADER` **L1** (bench-branch merge: dense-`qwen35` GGUF loader
++ F16/BF16 row dequant) and `QUANT-GGUF-CIQ-GEMM` **G1** (block `vt::DType`
+entries, the llama.cpp `type_traits_cpu` mirror, and the `kMatmulBTQuant` op
+skeleton with a generic dequant-composite fallback) are on main.
+
+**Disposition: `NOT APPLICABLE` — no benchmark is owed or claimed at this
+checkpoint, and none was run.** The increment adds types, a traits table and an
+UNROUTED op: no model forward calls `MatmulBTQuant`, every GGUF weight still
+expands to bf16 at load, and no encoding computes in its native blocks. There is
+therefore no speed or memory delta to measure — publishing one would be
+measuring the fallback against itself. `test_gguf_dequant` staying green is the
+evidence that the decoder move changed nothing, together with the dgx `test_qwen36_gguf_engine` standalone run against the real APEX files (28/28 assertions, 16/16 tokens on both Compact and Balanced) and the full unchanged model regression set on a clean `-Werror` CUDA build.
+
+**The denominator is unchanged and still binding:** llama.cpp on the same file
+at the same pin (`237ad9b96`), from the B4 decision row
+([parity-ledger.md](../.agents/parity-ledger.md)) — we are behind by decode
+**54-75x**, prefill **~1,480x**, and peak RSS **2.7x** (7.43 GiB vs 2.80 GiB on
+a 2.68 GiB file). Nothing in G1/L1 moves those numbers.
+
+**Next benchmark checkpoint** is CIQ gate 4 tier-0 at work row **G4** (the first
+increment where a call site actually routes to the quantized GEMM), on the B4
+recipe: same box, same file, threadpool active, 20 threads, >=2 reproducing
+runs, idle host. Milestone there is decode >= 0.25x llama.cpp tg32 and prefill
+>= 0.1x pp128; the row closes only when the repack tier (G7) matches or beats
+llama.cpp on decode t/s, prefill t/s AND peak RSS.
+

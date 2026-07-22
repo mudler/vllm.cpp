@@ -203,17 +203,19 @@ HfConfig HfConfigFromGguf(const GgufFile& gguf) {
   VT_CHECK(arch_v != nullptr && arch_v->TypeId() == kGgufString,
            "qwen3_5 gguf: general.architecture must be a string");
   const std::string arch = std::get<std::string>(arch_v->v);
-  VT_CHECK(arch == "qwen35moe" || arch == "qwen3next",
+  VT_CHECK(arch == "qwen35moe" || arch == "qwen3next" || arch == "qwen35",
            "qwen3_5 gguf: unexpected architecture '" + arch + "'");
   const std::string p = arch + ".";
 
   HfConfig c;
   c.model_type = arch;
   // `general.architecture` is llama.cpp's GGUF family key, not the HuggingFace
-  // model-class ID consumed by vLLM's ModelRegistry. This loader implements the
-  // Qwen3.5 MoE wrapper, so expose its canonical registered architecture while
-  // retaining the GGUF key in model_type for metadata lookup.
-  c.architectures = {"Qwen3_5MoeForConditionalGeneration"};
+  // model-class ID consumed by vLLM's ModelRegistry. Map it onto the canonical
+  // registered architecture (dense `qwen35` -> the 27B-family dense wrapper,
+  // the MoE keys -> the MoE wrapper) while retaining the GGUF key in
+  // model_type for metadata lookup.
+  c.architectures = {arch == "qwen35" ? "Qwen3_5ForConditionalGeneration"
+                                      : "Qwen3_5MoeForConditionalGeneration"};
 
   c.hidden_size = ReqInt(gguf, p + "embedding_length");
   const int64_t block_count = ReqInt(gguf, p + "block_count");
@@ -476,6 +478,50 @@ Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
       VT_CHECK(false, "qwen3_5 gguf: unknown layer_type " + lt);
     }
     layer.moe = LoadMoeGguf(gguf, il, config);
+    w.layers.push_back(std::move(layer));
+  }
+  return w;
+}
+
+Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
+                                             const HfConfig& config) {
+  VT_CHECK(config.num_hidden_layers > 0 &&
+               static_cast<int64_t>(config.layer_types.size()) ==
+                   config.num_hidden_layers,
+           "qwen3_5 gguf: layer_types size must equal num_hidden_layers");
+  VT_CHECK(config.num_experts == 0,
+           "qwen3_5 gguf: num_experts must be 0 for the dense model");
+
+  Qwen3_5DenseWeights w;
+  w.embed_tokens =
+      OwnBf16(gguf, "token_embd.weight", gguf.Get("token_embd.weight").shape);
+  w.final_norm = OwnNormMinus1(gguf, "output_norm.weight");
+  // Tied-embedding GGUFs (the 2B) omit output.weight; the head is then the
+  // transposed token_embd, as llama.cpp does (TENSOR_DUPLICATED).
+  w.lm_head = OwnBf16T(gguf, HasTensor(gguf, "output.weight")
+                                 ? "output.weight"
+                                 : "token_embd.weight");
+
+  w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
+  for (int64_t il = 0; il < config.num_hidden_layers; ++il) {
+    Qwen3_5DenseLayerWeights layer;
+    layer.input_layernorm = OwnNormMinus1(gguf, Blk(il, "attn_norm.weight"));
+    layer.post_attention_layernorm =
+        OwnNormMinus1(gguf, Blk(il, "post_attention_norm.weight"));
+    const std::string& lt = config.layer_types[static_cast<size_t>(il)];
+    if (lt == "linear_attention") {
+      layer.is_linear_attention = true;
+      layer.gdn = LoadGdnGguf(gguf, il, config);
+    } else if (lt == "full_attention") {
+      layer.is_linear_attention = false;
+      layer.attn = LoadAttnGguf(gguf, il);
+    } else {
+      VT_CHECK(false, "qwen3_5 gguf: unknown layer_type " + lt);
+    }
+    // Dense SwiGLU MLP (bf16 fields; the fp4 variants stay empty).
+    layer.mlp.gate_proj = OwnBf16T(gguf, Blk(il, "ffn_gate.weight"));
+    layer.mlp.up_proj = OwnBf16T(gguf, Blk(il, "ffn_up.weight"));
+    layer.mlp.down_proj = OwnBf16T(gguf, Blk(il, "ffn_down.weight"));
     w.layers.push_back(std::move(layer));
   }
   return w;

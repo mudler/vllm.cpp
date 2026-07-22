@@ -187,6 +187,10 @@ vllm_cpp_add_test(test_backend vt/test_backend.cpp)
 vllm_cpp_add_test(test_tensor vt/test_tensor.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
+# QUANT-GGUF-CIQ-GEMM G1: block dtypes, the quant traits table and its
+# cross-check against the GGUF reader's GgmlTraits, and the kMatmulBTQuant
+# skeleton's generic-composite fallback. CPU-only.
+vllm_cpp_add_test(test_ops_quant_traits vt/test_ops_quant_traits.cpp)
 # CPU-tier contract for the env-gated cuBLASLt GEMM algo-selection diagnostic
 # helpers. Reaches the internal header under src/ (not public API); the cuBLASLt
 # emit it gates is CUDA-only and lives in src/vt/cuda/cuda_matmul.cu.

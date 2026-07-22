@@ -16998,3 +16998,114 @@ First verification commands (records-only change, so these are the standing ones
 must both be green; the last binding gate remains
 `ssh dgx.casa 'cd ~/w9mla/src && ./build-clean/tests/test_deepseek_v2_paged_engine'`
 (must print `8/8 prompts PASS`). Evidence root: `~/w9mla/logs/` on dgx.
+
+## 2026-07-22 — GGUF quantization compute track: the two dependency-graph ROOTS (`CLAIM-QUANT-GGUF-COMPUTE-1`)
+
+**Why this track.** Today we DEQUANT the GGUF k-quants correctly — Q8_0, Q4_0,
+Q3_K, Q4_K, Q5_K, Q6_K and F32 all have gated dequant kernels — but every
+executable GGUF weight expands to bf16 at load
+(`src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp:105`), so we get the
+file-size benefit and none of the runtime memory or bandwidth benefit. This
+track fixes that, and it is also the opening of the CPU-optimization priority:
+the CIQ leaf spec names llama.cpp on the same file as the floor to match or
+beat.
+
+**Scope this session: exactly the two rows with no dependencies** — loader
+**L1** (merge the bench branch) and CIQ **G1** (block dtypes + traits + op
+skeleton). Nothing past them: L2 depends on G1, G2/G3 follow G1, G4 needs
+loader L2-L3 plus threadpool W2. Landing the root cleanly beats a rushed stack.
+
+**L1 — the merge did NOT apply cleanly, and the resolution matters.**
+`7c91a42` (`bench/quant-gguf-compute-b4-cpu-floor`) was cut at `83010c7`, 422
+commits behind current main. Three of its four files auto-merged
+(`qwen3_5_gguf_weights.{h,cpp}` dense loader + arch key, `gguf_dequant.cpp`
+F16/BF16 row cases). `src/vllm/entrypoints/model_loader.cpp` conflicted because
+main replaced the hardcoded dense-vs-MoE GGUF split the branch was patching with
+the `ModelRegistry` seam — the branch's `LoadedEngine::IsDenseArch` symbol no
+longer exists at all.
+
+Resolved by keeping main's registry path in full and re-expressing the branch's
+INTENT through the seam that replaced it: `HfConfigFromGguf` now maps the GGUF
+`general.architecture` key onto the REGISTERED architecture ID (`qwen35` ->
+`Qwen3_5ForConditionalGeneration`, `qwen35moe`/`qwen3next` ->
+`Qwen3_5MoeForConditionalGeneration`) instead of unconditionally claiming the
+MoE wrapper, and `LoadQwen3_5DenseModel` gains a `ModelSource::Kind::kGguf`
+branch in place of its blanket "does not support GGUF weights" throw. This is
+strictly better than the branch's version — dense GGUF now dispatches through
+the same registry every other architecture uses, so it composes with the
+arch-additivity work that landed in the interim.
+
+**G1 — what landed.** `vt::DType` gains the seven ggml block encodings
+(`kQ4_0 kQ8_0 kQ3_K kQ4_K kQ5_K kQ6_K kQ8_K`) with geometry in `src/vt/dtype.cpp`,
+ported from `ggml/include/ggml.h:390-432` + the `ggml-common.h` block structs
+@ `237ad9b96`. They are STORAGE-ONLY and that is enforced, not just documented:
+`SizeOf` on a block dtype THROWS, so any elementwise kernel that reaches one
+fails loudly instead of mis-striding a packed buffer. `RowSizeBytes` mirrors
+`ggml_row_size` (rows are whole blocks — which is also the keep-quant
+eligibility rule). New public `include/vt/quant.h` +
+`src/vt/cpu/cpu_quant_traits.cpp` mirror `type_traits_cpu[]`
+(`ggml-cpu.c:211-406`) one row per type; `vec_dot_type` and `nrows` are
+populated, `vec_dot`/`from_float` stay `nullptr` until G3/G2. `nrows` is pinned
+to 1 deliberately — upstream's `nrows == 2` rows are `__ARM_FEATURE_MATMUL_INT8`
+only and enabling them without the mmla kernels and their odd-shape boundary
+guards (`ggml-cpu.c:1426-1433`) would be a silent correctness bug.
+`OpId::kMatmulBTQuant` + `vt::MatmulBTQuant` + `src/vt/cpu/cpu_quant_gemm.cpp`
+give the op skeleton, structured like `ggml_compute_forward_mul_mat`
+(`ggml-cpu.c:1245-1443`) with the two pieces upstream puts in front of the dot
+(src1 quantization, integer `vec_dot`) left for G2/G3.
+
+**One design call worth flagging: the decoders MOVED, they were not
+duplicated.** The generic-composite fallback needs a block->f32 decode, and vt
+is the lower layer, so the six `dequantize_row_*` ports moved from
+`src/vllm/model_executor/model_loader/gguf_dequant.cpp` to
+`src/vt/cpu/cpu_quant_dequant.cpp` as the traits table's `to_float` column, and
+the loader now delegates. One implementation serves both the loader oracle and
+the GEMM fallback instead of two copies drifting apart. The code is byte-identical
+to what it replaced and `test_gguf_dequant` gates that. (Upstream keeps
+`to_float` in `ggml.c`'s device-neutral `type_traits`; vt has no such second
+table, so it rides the CPU one — recorded in the spec's port map.)
+
+**TRAIT CROSS-CHECK — NO MISMATCH FOUND.** This was the one place a silent bug
+would corrupt everything downstream, so the new
+`tests/vt/test_ops_quant_traits.cpp` compares THREE independent statements of
+the same llama.cpp facts: vt's new geometry table, the GGUF reader's
+long-standing `GgmlTraits`, and the block-struct arithmetic written out fresh
+from `ggml-common.h` in the test itself. All seven types agree on block_elems,
+block_bytes and ggml type id; the id map round-trips; and `Q8_K` (id 15) is
+correctly ABSENT from the reader's table, because it is the K-quant activation
+encoding and never appears in a file. 8 cases / 5,694 assertions.
+
+**Nothing changes numerics, by construction.** No model forward calls
+`MatmulBTQuant`; every GGUF weight still expands to bf16 at load; no encoding is
+compute-in-quant (that is G4+). The per-encoding matrix `C` cells stay `-`.
+
+**Gates.** Clean CPU `-Werror` build, 0 warnings. Full CPU ctest **151/151**.
+gguf ctest 4/4 (`test_gguf`, `test_gguf_dequant`, `test_gguf_qwen36_loader`,
+`test_model_loader_gguf`) — loader spec gate 5 met. `test_qwen36_gguf_engine`
+is checkpoint-SKIPPED on the dev box (the APEX
+GGUFs live on dgx), so it is not evidence from here — it was run on dgx
+instead, see below. CUDA build: COMPILED CLEAN on dgx — the
+new enumerators are APPENDED so every existing ordinal is unchanged, and a
+tree-wide scan found every `switch` over `DType` outside the three files edited
+here carries a `default:`. The three exhaustive ones (`SizeOf`, `Name`,
+`ToScalarType`) were extended explicitly.
+
+**DGX CONFIRMATION RUN (`dgx.casa`, `~/work/vllm.cpp-ciq-g1`, production flags `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_CUTLASS_DIR=/home/mudler/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON`, one `flock $HOME/gpu.lock` for the whole series):** clean CUDA `-Werror` build to 100%, **0 warnings**. Regression set ALL UNCHANGED — 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6** (strict 5/6, max gap 0 nats), Qwen3-dense **16/16** (strict 11/16, max gap 0.25 nats), OPT **6/6** (36 assertions), DeepSeek-V2-Lite **8/8** (223 assertions). `test_qwen36_gguf_engine` run STANDALONE (it OOMs co-scheduled) on the real APEX files: **28/28 assertions, 2/2 cases, 16/16 tokens each on Compact and Balanced** — the k-quant dequant path is byte-stable across the decoder move. The change is CPU-side and structurally
+cannot reach the GPU numerics, but "cannot" is an argument, not a measurement,
+so it was measured.
+
+**NEXT, in dependency order:** CIQ **G2** (activation quant — port
+`quantize_row_q8_0` / `quantize_row_q8_K` incl. the Q8_K bsums, plus scratch
+sizing), then **G3** (the six generic `vec_dot` ports + GEMM wiring + the ported
+test-quantize-fns / backend-ops bounds) and loader **L2** (quant residency).
+`G4` is the first increment that changes what a model actually executes, and the
+first that owes a benchmark. The threadpool leaf's idle-host B4 gate is still
+owed and remains the perf denominator.
+
+First verification commands:
+`cmake -S . -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF && cmake --build build-cpu -j16`,
+then `cd build-cpu && ctest -j2` (expect 151/151) and
+`./tests/test_ops_quant_traits` (expect 8 cases / 5,694 assertions).
+`python3 scripts/check-agent-record.py` and `python3 scripts/check-doc-checkpoint.py`
+must both be green.
+

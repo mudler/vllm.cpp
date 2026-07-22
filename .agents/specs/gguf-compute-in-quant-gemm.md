@@ -1,7 +1,7 @@
 # Leaf spec: GGUF compute-in-quant GEMM — ggml tensor-traits port into vt::cpu
 
 **Row:** `QUANT-GGUF-CIQ-GEMM` (quantization-matrix.md, leaf of the
-`QUANT-GGUF-COMPUTE` block) · **status:** spike complete, `READY` ·
+`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **G1 landed** (2026-07-22, `CLAIM-QUANT-GGUF-COMPUTE-1`); G2-G8 open, so no encoding computes in quant yet ·
 **upstream pin:** llama.cpp local fork `237ad9b96` (b9892) ·
 **parent evidence:** B4 decision row
 ([parity-ledger.md L290](../parity-ledger.md#L290)) — the "vendor IF proven
@@ -67,7 +67,7 @@ there (i8mm repack expected) before comparing.
   [cpu_ops.cpp:30-57](../../src/vt/cpu/cpu_ops.cpp#L30).
 - Dequant kernels (weight-side block decode, byte-for-byte ports already
   reviewed against the same pin):
-  [gguf_dequant.cpp:43-219](../../src/vllm/model_executor/model_loader/gguf_dequant.cpp#L43),
+  [gguf_dequant.cpp:43-219](../../src/vt/cpu/cpu_quant_dequant.cpp#L48),
   dispatch `:246-279` — reuse their layout knowledge; they REMAIN as the
   `VT_CPU_REF` oracle path.
 - `vt::` typing: [include/vt/dtype.h:21](../../include/vt/dtype.h#L21) has no
@@ -150,16 +150,16 @@ there (i8mm repack expected) before comparing.
 
 ## Work breakdown
 
-| W | Row (claim-sized) | Content | Depends |
-|---|---|---|---|
-| G1 | block dtypes + traits | `vt::DType` block entries, traits table, `kMatmulBTQuant` op skeleton + generic-composite fallback, trait cross-check vs `GgmlTraits` | - |
-| G2 | activation quant | `quantize_row_q8_0/q8_K` ports + scratch sizing; unit tests | G1 |
-| G3 | tier-0 vec_dot kernels | the six generic `vec_dot` ports + GEMM wiring + test-quantize-fns/backend-ops ports + parity goldens | G1, G2 |
-| G4 | e2e enablement | route `MatmulBT` call sites on block dtype; engine gates (3) + `VT_CPU_REF` A/B; first B4-recipe measurement (tier-0 milestone) | G3, loader L2-L3, threadpool W2 |
-| G5 | x86 AVX2 tier | `arch/x86` vec_dot ports + feature probe; tier-1 milestone measurement | G3 |
-| G6 | Arm NEON/i8mm tier | `arch/arm` ports incl. `nrows==2` mmla; GB10 measurement | G3 |
-| G7 | repack tier | repack-at-load + gemv/gemm + `quantize_mat_t`; selection parity vs `:4528`; closes gates 4-5 | G4 + loader L2 |
-| G8 | ledger + matrix closure | full A/B series, ledger row, flip `C`/`E`/`P` cells per encoding row (Q8_0/Q4_K/Q5_K/Q6_K/Q3_K/Q4_0), roadmap update | G4-G7 |
+| W | Row (claim-sized) | Content | Depends | Status |
+|---|---|---|---|---|
+| G1 | block dtypes + traits | `vt::DType` block entries, traits table, `kMatmulBTQuant` op skeleton + generic-composite fallback, trait cross-check vs `GgmlTraits` | - | **DONE** 2026-07-22 |
+| G2 | activation quant | `quantize_row_q8_0/q8_K` ports + scratch sizing; unit tests | G1 | open |
+| G3 | tier-0 vec_dot kernels | the six generic `vec_dot` ports + GEMM wiring + test-quantize-fns/backend-ops ports + parity goldens | G1, G2 | open |
+| G4 | e2e enablement | route `MatmulBT` call sites on block dtype; engine gates (3) + `VT_CPU_REF` A/B; first B4-recipe measurement (tier-0 milestone) | G3, loader L2-L3, threadpool W2 | open |
+| G5 | x86 AVX2 tier | `arch/x86` vec_dot ports + feature probe; tier-1 milestone measurement | G3 | open |
+| G6 | Arm NEON/i8mm tier | `arch/arm` ports incl. `nrows==2` mmla; GB10 measurement | G3 | open |
+| G7 | repack tier | repack-at-load + gemv/gemm + `quantize_mat_t`; selection parity vs `:4528`; closes gates 4-5 | G4 + loader L2 | open |
+| G8 | ledger + matrix closure | full A/B series, ledger row, flip `C`/`E`/`P` cells per encoding row (Q8_0/Q4_K/Q5_K/Q6_K/Q3_K/Q4_0), roadmap update | G4-G7 | open |
 
 G5/G6 are parallel; G7 may start once G4's layout is fixed.
 
@@ -188,3 +188,39 @@ G5/G6 are parallel; G7 may start once G4's layout is fixed.
 - Upstream behavior is not reopened: quant math, thresholds, and tier
   selection all mirror llama.cpp; the only product-ish calls are the two
   recorded above (enum design, golden regeneration protocol).
+
+## G1 result (2026-07-22)
+
+**Landed.** `vt::DType` gains the seven block entries (`kQ4_0 kQ8_0 kQ3_K kQ4_K
+kQ5_K kQ6_K kQ8_K`) with block geometry in
+[dtype.cpp](../../src/vt/dtype.cpp#L32) and the storage-only rule enforced —
+`SizeOf` on a block dtype THROWS, so any elementwise kernel that reaches one
+fails loudly. `RowSizeBytes` mirrors `ggml_row_size` (rows are whole blocks).
+The `type_traits_cpu` mirror is [cpu_quant_traits.cpp](../../src/vt/cpu/cpu_quant_traits.cpp#L1)
+behind the new public [vt/quant.h](../../include/vt/quant.h#L1); `vec_dot_type`
+and `nrows` are populated, `vec_dot`/`from_float` stay `nullptr` until G3/G2.
+`OpId::kMatmulBTQuant` + [the CPU kernel](../../src/vt/cpu/cpu_quant_gemm.cpp#L1)
+run the generic dequant-composite fallback for every type.
+
+**Deviation from the port map (recorded).** The six `dequantize_row_*` decoders
+were MOVED, not duplicated: they now live at
+[cpu_quant_dequant.cpp](../../src/vt/cpu/cpu_quant_dequant.cpp#L1) as the traits
+table's `to_float` column (upstream keeps `to_float` in `ggml.c`'s
+device-neutral `type_traits`; vt has no such second table, so it rides the CPU
+one), and the GGUF loader
+[delegates](../../src/vllm/model_executor/model_loader/gguf_dequant.cpp#L75).
+One implementation serves both the loader oracle and the GEMM fallback. The
+code is byte-identical to what it replaced, so numerics are unchanged, and
+`test_gguf_dequant` plus a new byte-for-byte equivalence case gate that.
+
+**Trait cross-check — NO mismatch.** [test_ops_quant_traits.cpp](../../tests/vt/test_ops_quant_traits.cpp#L1)
+compares THREE independent statements of the same llama.cpp facts: vt's block
+geometry table, the GGUF reader's `GgmlTraits`, and the block-struct arithmetic
+written out from `ggml-common.h`. All seven types agree on block_elems,
+block_bytes and type id; the id map round-trips; `Q8_K` (id 15) is correctly
+absent from the reader's table because it is activation-only. 8 cases /
+5,694 assertions green.
+
+**Gates at G1:** clean CPU `-Werror` build (0 warnings); full CPU ctest
+**151/151**; gguf ctest 4/4. **DGX CONFIRMATION RUN (`dgx.casa`, `~/work/vllm.cpp-ciq-g1`, production flags `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_CUTLASS_DIR=/home/mudler/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON`, one `flock $HOME/gpu.lock` for the whole series):** clean CUDA `-Werror` build to 100%, **0 warnings**. Regression set ALL UNCHANGED — 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6** (strict 5/6, max gap 0 nats), Qwen3-dense **16/16** (strict 11/16, max gap 0.25 nats), OPT **6/6** (36 assertions), DeepSeek-V2-Lite **8/8** (223 assertions). `test_qwen36_gguf_engine` run STANDALONE (it OOMs co-scheduled) on the real APEX files: **28/28 assertions, 2/2 cases, 16/16 tokens each on Compact and Balanced** — the k-quant dequant path is byte-stable across the decoder move. Gates 1-5 of this spec are
+untouched: they need G2/G3 (op correctness) and the loader leaf (e2e/perf/RSS).

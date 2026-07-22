@@ -149,6 +149,10 @@ enum class OpId : uint8_t {
   kRmsNormQuantFp8,
   kRmsNormGatedQuantFp8,
   kMatmulBT,
+  // kMatmulBT with a BLOCK-QUANTIZED [N,K] weight kept in its native ggml
+  // encoding — llama.cpp's `ggml_compute_forward_mul_mat`
+  // (ggml/src/ggml-cpu/ggml-cpu.c:1245-1443 @ 237ad9b96).
+  kMatmulBTQuant,
   // W0-only raw-signature probe for the shared drop-in adapter boundary. It is
   // not a production kernel-family migration.
   kDropinProbe,
@@ -639,6 +643,29 @@ void DropinProbe(Queue& q, Tensor& out, const Tensor& in,
 // cuBLASLt algo — and so the K-reduction split — differs); token-exact gates
 // decide call-site adoption.
 void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+
+// --- Compute-in-quant GEMM (QUANT-GGUF-CIQ-GEMM) ----------------------------
+// out[M,N] = a[M,K] @ b^T where the WEIGHT `b` is [N,K] row-major kept in its
+// native ggml BLOCK encoding (a block `DType`), never expanded to bf16. The
+// 1:1 counterpart of llama.cpp's `ggml_compute_forward_mul_mat`
+// (ggml/src/ggml-cpu/ggml-cpu.c:1245-1443 @ 237ad9b96): GGUF's on-disk
+// [out_features, in_features] row-major order IS ggml's src0 layout and IS
+// this `[N,K]` orientation, so keep-quant needs no transpose (block rows
+// cannot be transposed without requantizing).
+//
+// Because `b` is block-typed, its `Tensor.shape` is in ELEMENTS but its bytes
+// are `RowSizeBytes(b.dtype, K)` per row; `b.stride` is not meaningful and
+// `b` must be block-contiguous. K must be a whole number of blocks.
+//
+// Dispatch (mirrors ggml, and is why this is a separate OpId rather than a
+// dtype branch inside MatmulBT): when the weight type has both a `vec_dot`
+// kernel and its `vec_dot_type`'s activation quantizer, the activation is
+// quantized once and each output is one integer block-dot. Until those land
+// (work rows G2/G3) the CPU kernel runs the GENERIC COMPOSITE fallback —
+// decode the weight row to f32 via the traits table's `to_float` and take the
+// f32 dot — which is numerically the dequant-to-f32 reference the ported
+// MUL_MAT tests measure the quantized path against.
+void MatmulBTQuant(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 
 // --- Batched dense GEMM (MLA campaign W6) -----------------------------------
 // out[G,M,N] = a[G,M,K] @ b[G,K,N] — one independent row-major GEMM per batch

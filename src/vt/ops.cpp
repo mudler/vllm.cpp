@@ -26,6 +26,17 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kI8: return scalar_type::kI8;
     case DType::kI32: return scalar_type::kI32;
     case DType::kI64: return scalar_type::kI64;
+    // Block-quantized encodings have no single scalar type: a block mixes
+    // scales and packed codes. Kernels consume them through the quant traits
+    // table, never through a KernelTensorDesc scalar type.
+    case DType::kQ4_0:
+    case DType::kQ8_0:
+    case DType::kQ3_K:
+    case DType::kQ4_K:
+    case DType::kQ5_K:
+    case DType::kQ6_K:
+    case DType::kQ8_K:
+      break;
   }
   VT_CHECK(false, "unsupported storage dtype for scalar-type conversion");
   return scalar_type::kF32;
@@ -155,6 +166,35 @@ void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   VT_CHECK(a.device == b.device && a.device == out.device && a.device == q.device,
            "matmul_bt: device mismatch");
   reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmulBT, q.device.type))(q, out, a, b);
+}
+
+// vt::MatmulBTQuant — see ops.h. Validation mirrors MatmulBT except for the
+// weight, whose block layout replaces the elementwise stride contract.
+void MatmulBTQuant(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2,
+           "matmul_bt_quant: rank-2 tensors required");
+  VT_CHECK(a.shape[1] == b.shape[1],
+           "matmul_bt_quant: inner dims mismatch (b is [N,K])");
+  VT_CHECK(out.shape[0] == a.shape[0] && out.shape[1] == b.shape[0],
+           "matmul_bt_quant: output shape mismatch");
+  VT_CHECK(IsBlockQuant(b.dtype),
+           "matmul_bt_quant: weight must be a block-quantized dtype (use "
+           "MatmulBT for elementwise weights)");
+  VT_CHECK(IsFloat(a.dtype) && IsOutFloat(out.dtype),
+           "matmul_bt_quant: float activation and f32/bf16 output required");
+  // ggml_row_size asserts the row is whole blocks; a GEMM weight whose K is
+  // not block-aligned is not keep-quant eligible in the first place.
+  VT_CHECK(b.shape[1] % BlockElems(b.dtype) == 0,
+           "matmul_bt_quant: K must be a whole number of weight blocks");
+  // Same relaxed activation contract as MatmulBT: only the innermost dim must
+  // be packed, so a column slice of a wider workspace is consumed as-is.
+  VT_CHECK(a.stride[1] == 1 && a.stride[0] >= a.shape[1],
+           "matmul_bt_quant: activation rows must be packed (innermost stride "
+           "1) and non-overlapping");
+  VT_CHECK(out.IsContiguous(), "matmul_bt_quant: contiguous output required");
+  VT_CHECK(a.device == b.device && a.device == out.device && a.device == q.device,
+           "matmul_bt_quant: device mismatch");
+  reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmulBTQuant, q.device.type))(q, out, a, b);
 }
 
 // vt::BatchedMatmul — `torch.bmm` (mla_attention.py:789 q-side W_UK absorption,

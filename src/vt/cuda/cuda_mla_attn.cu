@@ -86,6 +86,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -341,9 +342,25 @@ StreamScratch& ScratchFor(cudaStream_t s) {
   return m[s];
 }
 
+// MLA campaign W9: growth is FORBIDDEN while the stream is capturing. Retiring
+// the old block keeps ALREADY-captured graphs valid, but the NEW block would be
+// allocated by a `cudaMallocAsync` that capture turns into a graph-owned MEMORY
+// ALLOCATION NODE — memory whose lifetime is the graph execution, so every later
+// replay reads a pointer the graph itself freed ("an illegal memory access was
+// encountered", surfaced at the next CUDA call). The house discipline for exactly
+// this is an explicit capture guard, not a silent fault: mirrors
+// cuda_dropin.cu:124 ("workspace growth is forbidden during CUDA graph capture")
+// and the FA-2 decode launcher's per-shape scratch guard
+// (cuda_flash_attn_fa2.cu:717-720). The decode-graph driver pre-warms every
+// captured size with one EAGER step, so a correct driver never trips this.
 float* EnsureMidScratch(size_t need, cudaStream_t s) {
   StreamScratch& sc = ScratchFor(s);
   if (need > sc.bytes) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    Check(cudaStreamIsCapturing(s, &capture), "attn-logits capture-status query");
+    VT_CHECK(capture == cudaStreamCaptureStatusNone,
+             "vt::MlaDecodeAttention: attn-logits workspace growth is forbidden "
+             "during CUDA graph capture (pre-warm this decode size eagerly first)");
     RetireGraphScratch(sc.buf);
     Check(cudaMallocAsync(&sc.buf, need, s), "cudaMallocAsync attn-logits workspace");
     sc.bytes = need;
@@ -365,6 +382,67 @@ int ComputeNumKvSplits(int max_seq_len, int sm_count) {
   while (ideal < target) ideal <<= 1;
   const int max_splits = sm_count > 0 ? sm_count * 2 : 1;
   return ideal < max_splits ? ideal : max_splits;
+}
+
+// ─── OCCUPANCY FILL (MLA campaign W9) — a RECORDED DEVIATION from upstream ───
+//
+// MEASURED (nsys, DeepSeek-V2-Lite, c1, 1024-in/128-out, `--cuda-graph-trace=node`):
+// `MlaDecodeStage1` was **44.7% of ALL GPU time** at **837 us per instance** —
+// 27 layers x 837 us = ~22.6 ms of a ~47.7 ms TPOT. The KV latent a batch-1
+// step reads is seq_len x 576 x 2B ~ 1.25 MiB per layer, i.e. ~5 us at GB10's
+// memory rate: the kernel was running about TWO ORDERS OF MAGNITUDE off its own
+// memory-bound floor, and the reason is pure under-occupancy, not arithmetic.
+//
+// `_compute_num_kv_splits` derives the split count from `max_seq_len` ALONE:
+// at seq ~1088 it returns 2. Upstream's grid is
+// `(batch, cdiv(head_num, min(BLOCK_H, kv_group_num)), NUM_KV_SPLITS)`, and MLA
+// has ONE kv head, so `kv_group_num == num_heads` and the head dimension
+// collapses to a SINGLE tile. At batch 1 that is a grid of **2 CTAs** — on a GPU
+// with `sm_count` multiprocessors. The kernel cannot go faster because it is
+// using ~4% of the machine.
+//
+// Upstream can afford that because `_MIN_WORK_PER_SPLIT = 512` is tuned for the
+// serving regime it targets (large batch), where `batch` alone fills the grid;
+// and because its Triton CTA does the whole head block with `tl.dot`. Our CTA is
+// the same shape, so at batch 1 we inherit the same 2-CTA grid with none of the
+// batch parallelism that hides it.
+//
+// THE FIX IS UPSTREAM'S OWN OCCUPANCY TARGET, APPLIED. `_compute_num_kv_splits`
+// already names `maximum = sm_count * _SPLIT_OCCUPANCY_MULTIPLIER` as the
+// occupancy bound; it simply never REACHES it when the sequence is short. We
+// raise the split count until the grid actually has that many CTAs, given how
+// many CTAs the OTHER two grid dimensions contribute — never exceeding upstream's
+// own `maximum`, and never splitting finer than one `kNTile` tile of work.
+//
+// CORRECTNESS: the code above already states it — "Any value >= 1 is CORRECT (the
+// partition always covers [0, seq_len))". Splits beyond a request's own seq_len
+// early-exit block-uniformly (`split_end <= split_start`). What DOES change is
+// the stage-2 online-softmax REDUCTION ORDER, so this is a numerics-visible
+// (though mathematically equivalent) change and it is gated on the SACRED
+// DeepSeek-V2-Lite battery, not assumed.
+//
+// Rollback for a same-binary A/B: `VT_MLA_SPLIT_FILL=0` restores the
+// upstream-exact `ComputeNumKvSplits` value.
+bool MlaSplitFillEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_MLA_SPLIT_FILL");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+int ComputeNumKvSplitsFilled(int max_seq_len, int sm_count, int ctas_per_split) {
+  const int upstream = ComputeNumKvSplits(max_seq_len, sm_count);
+  if (!MlaSplitFillEnabled() || sm_count <= 0 || ctas_per_split <= 0) return upstream;
+  const int max_splits = sm_count * 2;  // upstream's `maximum`
+  // How many splits it takes for the grid to reach `max_splits` CTAs.
+  const int fill = (max_splits + ctas_per_split - 1) / ctas_per_split;
+  // Never finer than one kNTile tile of keys per split.
+  const int work_cap = max_seq_len / kNTile > 1 ? max_seq_len / kNTile : 1;
+  int splits = fill < work_cap ? fill : work_cap;
+  if (splits < upstream) splits = upstream;
+  if (splits > max_splits) splits = max_splits;
+  return splits < 1 ? 1 : splits;
 }
 
 template <typename T, int DVREGS>
@@ -411,15 +489,40 @@ void LaunchMlaDecode(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
   const int block_size = static_cast<int>(kv_cache.shape[1]);
 
   const DeviceCaps& caps = GetDeviceCaps();
+  // The head dimension of the grid, needed by the occupancy fill below (MLA has
+  // ONE kv head, so `min(BLOCK_H, kv_group_num) == num_heads` collapses it to a
+  // single tile whenever num_heads <= kBlockH).
+  const int valid_h_pre = num_heads < kBlockH ? num_heads : kBlockH;
+  const int head_tiles_pre = (num_heads + valid_h_pre - 1) / valid_h_pre;
   int num_splits = args.num_kv_splits;
   if (num_splits <= 0) {
-    num_splits = ComputeNumKvSplits(args.max_seq_len, caps.multiprocessor_count);
+    num_splits = ComputeNumKvSplitsFilled(args.max_seq_len, caps.multiprocessor_count,
+                                          batch * head_tiles_pre);
   }
 
   // The [B, Hq, S, Dv+1] f32 workspace — upstream's `logits_shape`
   // (triton_mla.py:228 `(B, q_num_heads, num_kv_splits, kv_lora_rank + 1)`).
+  //
+  // CUDA-GRAPH INVARIANCE (MLA campaign W9): the split dimension is sized at the
+  // WORST CASE upstream itself admits (`maximum = sm_count * 2`), NOT at this
+  // call's chosen `num_splits`. `num_splits` legitimately varies step to step —
+  // with `max_seq_len` upstream, and additionally with the decode batch once the
+  // occupancy fill is on — so sizing the workspace from it makes the buffer GROW
+  // mid-run. A grow inside a capture region is forbidden (EnsureMidScratch says
+  // so explicitly), and the decode graph would otherwise have to re-capture on
+  // every sequence-length or batch change. Sizing on the constant bound makes the
+  // allocation depend only on (batch, num_heads), which IS constant for a captured
+  // size, so the pre-warm step's allocation always suffices.
+  //
+  // The cost is bounded and small: `batch * num_splits` is ~`2 * sm_count` by
+  // construction under the fill, so this is a few MiB — one allocation for the
+  // process, retired-not-freed on the rare growth.
+  const int alloc_splits = [&] {
+    const int cap = caps.multiprocessor_count > 0 ? caps.multiprocessor_count * 2 : 1;
+    return num_splits > cap ? num_splits : cap;
+  }();
   const int64_t mid_s2 = static_cast<int64_t>(v_head_dim) + 1;
-  const int64_t mid_s1 = mid_s2 * num_splits;
+  const int64_t mid_s1 = mid_s2 * alloc_splits;
   const int64_t mid_s0 = mid_s1 * num_heads;
   const size_t need = static_cast<size_t>(mid_s0) * static_cast<size_t>(batch) * sizeof(float);
   float* mid = EnsureMidScratch(need, s);

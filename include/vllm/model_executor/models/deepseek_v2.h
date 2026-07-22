@@ -299,6 +299,41 @@ class DeepseekV2Model {
       vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
 };
 
+// ─── MLA campaign W9: the decode CUDA-graph sibling ─────────────────────────
+//
+// The MLA member of the decode-graph driver family (Qwen3_5DecodeGraph,
+// Qwen3_5DenseDecodeGraph, Qwen3MoeDecodeGraph). Owned by the LoadedModel so it
+// outlives a single forward, it routes PURE-DECODE CUDA steps through a captured
+// graph per padded batch size, mirroring vLLM's full-decode-cudagraph regime
+// (gpu_model_runner.py capture/replay + compilation/cuda_graph.py's
+// pad-to-nearest dispatch @ e24d1b24). Prefill, mixed steps, batches above
+// max_num_seqs and CPU fall back to the eager forward INTERNALLY, so the caller
+// has exactly one dispatch point. Real-row output is bit-identical to eager.
+//
+// Rollback for a same-binary A/B: `VT_DEEPSEEK_CUDAGRAPH=0` (model-local) or
+// `VLLM_CPP_CUDAGRAPH=0` (framework-wide).
+class DeepseekV2DecodeGraph {
+ public:
+  DeepseekV2DecodeGraph(const DeepseekV2Weights& weights, vt::Queue queue,
+                        int64_t max_num_reqs);
+  ~DeepseekV2DecodeGraph();
+  DeepseekV2DecodeGraph(const DeepseekV2DecodeGraph&) = delete;
+  DeepseekV2DecodeGraph& operator=(const DeepseekV2DecodeGraph&) = delete;
+
+  // One pure-decode step. Falls back to the eager forward internally.
+  ForwardLogits Step(const std::vector<int32_t>& token_ids,
+                     const std::vector<int32_t>& positions,
+                     const v1::CommonAttentionMetadata& attn_meta,
+                     const std::vector<PagedKvCache>& attn_kv);
+
+  bool captured() const;         // diagnostics: at least one live graph
+  int64_t replay_count() const;  // diagnostics: total replays
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 // Load `DeepseekV2ForCausalLM` safetensors into DeepseekV2Weights, INCLUDING the
 // `kv_b_proj -> W_UK / W_UV` absorption split (mla_attention.py:875-962 is a
 // `process_weights_after_loading` hook upstream; doing it at load time is the

@@ -16825,3 +16825,81 @@ First verification commands:
 `ssh dgx.casa 'cd ~/w8mla/src2 && ./build/tests/test_deepseek_v2_paged_engine'`
 and `scripts/deepseek-v2-dgx-gate.sh ~/w8mla/src2/build` for the full serialized
 series.
+
+## 2026-07-22 — MLA campaign **W9: the SPEED CLOSE for DeepSeek-V2-Lite** (`CLAIM-MLA-DEEPSEEK`, base `66a44f9`, worktree `agent-a11c510f7af15f680`)
+
+**VERDICT: an ATTRIBUTED MISS. The row STAYS `ACTIVE` (correctness COMPLETE,
+speed SHORT) and does NOT move to `DONE`.** Two optimizations landed, both
+default-ON, both leaving the SACRED gate at 8/8 character-for-character. Together
+they took decode throughput from **0.50x to 0.87x** of vLLM at c1 and made our
+TTFT **beat** vLLM at c4 and c8 — but output/total/request throughput is short at
+every concurrency (0.86-0.95x) and TPOT/ITL is short at c1/c4/c8, so "match or
+beat on EVERY axis" is not met.
+
+**The denominator, settled with evidence.** vLLM AUTO-selects the FlashInfer
+CUTLASS unquantized MoE backend for this model and it CANNOT run on GB10: **five
+hard reboots** now (three at W8, two at W9). W9's attempts applied the
+Qwen3-Coder mitigations deliberately, and the second ran on a PRISTINE
+freshly-rebooted box with a **0 GiB page cache** and 116 GiB free at
+`gmu=0.40`/`max-model-len 2048`/`max-num-batched-tokens 1024`/`max-num-seqs 4` —
+the strongest available form of the page-cache-evictor mitigation, since `sudo` is
+password-gated here so `drop_caches` never actually worked. Both W9 deaths land at
+the IDENTICAL phase: immediately after `torch.compile`, in the memory-profiling
+dummy run where the CUTLASS MoE workspace is first allocated. So
+`--moe-backend triton` IS vLLM's best STABLE graphed/production configuration
+here and is the legitimate bar — said openly, because the substitution does not
+flatter us: we LOSE to it.
+
+**The lever was found by the trace, not by the plan.** §10's W9 cell planned MLA
+fusion recipes. `nsys --cuda-graph-trace=node` on BOTH sides refuted that
+priority before a line of it was written: `MlaDecodeStage1` was **44.7% of ALL
+GPU time at 837 us/instance** and about **two orders of magnitude off its own
+memory-bound floor**, because `_compute_num_kv_splits` derives the split count
+from `max_seq_len` alone (returned 2), MLA has one KV head so the head dimension
+collapses to a single tile, and at batch 1 the grid was **2 CTAs on the whole
+GPU**. Applying **upstream's own occupancy target** (`maximum = sm_count *
+_SPLIT_OCCUPANCY_MULTIPLIER`, which the length-only heuristic never reaches on
+short sequences) gave **837 us -> 45.8 us, 18.3x**, and **+69.5% / +53.3% /
++32.0% / +19.5%** end-to-end at c1/c2/c4/c8. Rollback `VT_MLA_SPLIT_FILL=0`.
+The planned decode CUDA-graph sibling WAS built (`DeepseekV2DecodeGraph`,
+rollback `VT_DEEPSEEK_CUDAGRAPH=0`) and is worth only **~+2%** — an order of
+magnitude less than its Qwen3-Coder analogue, because this model's decode is
+GPU-bound, not host-bound.
+
+**A real latent CUDA-graph use-after-free was found and fixed.** `BuildMlaStep`
+uploaded the decode `block_table`/`seq_lens` from FUNCTION-LOCAL TEMPORARIES —
+correct eagerly, a use-after-free under capture (the copy becomes a graph node
+that bakes the source address). It produced a CORRECT first replay and then
+silently wrong output, finally faulting with an illegal memory access, and
+**`compute-sanitizer` serialized enough to HIDE it entirely** (0 memory errors,
+wrong tokens). A `VT_DEEPSEEK_GRAPH_VERIFY=1` diagnostic kept in the tree
+localized it in one run; `UploadRange` fixes it and the replay is now
+`max abs(graph - eager) = 0`, i.e. BIT-IDENTICAL to eager. A second hazard — the
+split-KV workspace growing inside a capture once the fill made its size
+batch-dependent — is closed by the house capture guard on `EnsureMidScratch` plus
+sizing the workspace at the constant bound `sm_count * 2`.
+
+**Gates.** `test_deepseek_v2_paged_engine` **8/8** with every optimization
+default-ON, identical to W8 including all `MlaBatchSplitStats`; capture set
+`S={1,2,4,8}`. `test_ops_mla_attn` 11/11 / 2,303,193 assertions. Regression set
+UNCHANGED (27B 235/235, 35B 315/315, Coder 138/138, Qwen3-dense 664/664, OPT
+36/36, run SERIALLY). Clean full CUDA rebuild **0 warn / 0 err**. memcheck /
+racecheck / synccheck **0**.
+
+**The residual, attributed.** (1) batch-1 dense projections fall to cuBLAS
+`gemvx` for **31.8%** of our GPU time where vLLM splits the same work `gemvx`
+12.7% + tensor-core `nvjet_sm121_tst_mma_*` 6.6% — the LARGEST single difference
+and the NEXT LEVER (a dispatch change, not a new kernel); (2) our MoE grouped
+GEMM is now the top kernel at 40.5%, ~1.2x its own bandwidth floor; (3) vLLM runs
+Inductor-codegenned fused norm/act/residual glue we lack (~7-8% of its profile);
+(4) our MLA decode is still ~2.3x vLLM's per call.
+
+**NEXT: the `gemvx` -> tensor-core dispatch lever, then re-run the c1..c8 grid.**
+Then **W10 — the blocked-row honesty pass** (config/loader-slice/unit parity at V3
+dimensions; `HW-BLOCKED` recorded where e2e cannot run).
+
+First verification commands:
+`ssh dgx.casa 'cd ~/w9mla/src && ./build-clean/tests/test_deepseek_v2_paged_engine'`
+(must print `8/8 prompts PASS`), then `~/w9mla/w9_ab.sh` and `~/w9mla/w9_vllm.sh`
+for the full grid, and `~/w9mla/regress.sh` for the serialized regression battery.
+Evidence root: `~/w9mla/logs/` on dgx.

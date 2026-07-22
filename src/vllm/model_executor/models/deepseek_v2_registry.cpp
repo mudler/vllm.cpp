@@ -25,6 +25,7 @@
 #include "vllm/model_executor/models/deepseek_v2.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
+#include "vllm/platforms/interface.h"  // GetPlatform(device.type).is_cuda()
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
@@ -51,9 +52,13 @@ class DeepseekV2LoadedModel final : public LoadedModel {
       : LoadedModel(registration), weights_(std::move(weights)) {}
 
   const DeepseekV2Weights& weights() const { return weights_; }
+  // W9: the model's decode CUDA-graph driver state (the graph outlives a single
+  // forward), held exactly as the 35B/27B/Coder registrations hold theirs.
+  std::unique_ptr<DeepseekV2DecodeGraph>& decode_graph() { return decode_graph_; }
 
  private:
   DeepseekV2Weights weights_;
+  std::unique_ptr<DeepseekV2DecodeGraph> decode_graph_;
 };
 
 std::unique_ptr<LoadedModel> LoadDeepseekV2ForCausalLM(
@@ -81,8 +86,31 @@ ForwardLogits ForwardDeepseekV2ForCausalLM(LoadedModel& model,
                                            const ModelForwardInput& input) {
   auto& ds = static_cast<DeepseekV2LoadedModel&>(model);
   const DeepseekV2Weights& weights = ds.weights();
-  // No decode CUDA-graph sibling yet (W9); MLA is a pure full-attention arch, so
-  // input.gdn_* are unused.
+
+  // DECODE CUDA-GRAPH path (W9): route a PURE-DECODE CUDA step through the
+  // model's graph driver, which pads the batch up to the nearest captured size
+  // and replays that size's graph (mirrors vLLM's full-decode cudagraphs —
+  // gpu_model_runner.py capture/replay + compilation/cuda_graph.py pad-to-nearest
+  // dispatch @ e24d1b24). Real-row output is bit-identical to the eager forward:
+  // the same kernels in the same order over the same buffers, with inert padding
+  // rows. Prefill, mixed steps, batches above max_num_seqs and CPU fall back
+  // INSIDE the driver, so this is the single dispatch point.
+  //
+  // `gdn_state_slots` carries max_num_reqs for EVERY arch (runner.cpp sets it
+  // from max_num_reqs_ regardless of whether the model has GDN layers), so this
+  // pure-MLA model reads its capture-size cap from it unchanged — the same seam
+  // Qwen3-Coder uses.
+  if (input.pure_decode &&
+      platforms::GetPlatform(input.queue.device.type).is_cuda()) {
+    if (!ds.decode_graph()) {
+      ds.decode_graph() = std::make_unique<DeepseekV2DecodeGraph>(
+          weights, input.queue, input.gdn_state_slots);
+    }
+    return ds.decode_graph()->Step(input.token_ids, input.positions,
+                                   input.attn_meta, input.attn_kv);
+  }
+
+  // MLA is a pure full-attention arch, so input.gdn_* are otherwise unused.
   if (input.gather_logits) {
     return DeepseekV2Model::ForwardDevice(input.token_ids, input.positions,
                                           input.attn_meta, input.attn_kv, weights,

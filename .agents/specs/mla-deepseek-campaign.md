@@ -946,7 +946,7 @@ hardware. **Nothing below is implemented; this is the plan.**
 | **W6** ✅ **DONE 2026-07-22** | **MLA attention block + weight absorption.** `mla_attention.{h,cpp}`: projections (both `q_lora_rank` branches), the two RMSNorms, decoupled RoPE, the load-time `kv_b_proj -> W_UK/W_UV` split, and the prefill-MHA / decode-MQA dispatch. | W5 | **PASSED** — the block ([`mla_attention.h`](../../include/vllm/model_executor/models/mla_attention.h) + [`mla_attention.cpp`](../../src/vllm/model_executor/layers/attention/mla_attention.cpp)) plus TWO new `vt::` primitives, all `file:line`-cited both sides: `vt::BatchedMatmul` <- `torch.bmm` at `mla_attention.py:789` (the q-side W_UK fold) and `:1034` (`_v_up_proj`'s W_UV un-projection), and `vt::ConcatMlaNopeRope` <- `concat_mla_q` (`csrc/libtorch_stable/concat_mla_q.cuh` + `cache_kernels.cu:1555-1600`) generalized to also serve `_concat_k_nope_k_pe` (`:2063-2092`). **ABSORPTION IS A LOAD-TIME TRANSFORM PLUS TWO BATCHED GEMMs, exactly as §2.2 predicted** — no new attention kernel was needed for it. **The equivalence is PROVEN NUMERICALLY, three independent ways** (see the `### Work breakdown` entry): the identity itself in double precision (< 1e-11 rel), ours vs the UNABSORBED double oracle (< 2e-4 rel in f32), and — the strongest — the SAME batch driven once through our ABSORBED MQA decode kernel and once through our UNABSORBED materialized-MHA prefill path, agreeing to < 3e-4 (CPU f32) / < 4e-2 (CUDA bf16). Evidence: [`test_mla_attention_block.cpp`](../../tests/vllm/model_executor/layers/attention/test_mla_attention_block.cpp) **10/10 cases / 2,372,644 assertions** and [`test_ops_mla_absorb.cpp`](../../tests/vt/test_ops_mla_absorb.cpp) **9/9 / 1,644,807 assertions** on dgx sm_121. Clean dgx CUDA build **0 warn / 0 err**; `compute-sanitizer` memcheck / racecheck / synccheck all **0** on both binaries; regression set UNCHANGED. **Deviations, recorded not glossed:** (1) the A-projections are issued as one GEMM per weight ROW-SLICE rather than one fused GEMM, because `vt::RmsNorm` requires contiguous inputs and relaxing the hottest op in every model for no MLA-specific gain is the wrong trade — the checkpoint PACKING is unchanged (`fused_qkv_a_proj` stays one weight per `packed_modules_mapping`, `deepseek_v2.py:1812-1820`) and the dense block already defaults to exactly this 3-shard form; (2) `vt::ConcatMlaNopeRope` is SCALAR and width-generic where upstream's is 128/256-bit vectorized and templated on NOPE_DIM=512 (a concat is a pure copy, so the bytes are identical; vectorization is W9, same disposition as W5's `MergeAttnStates`); (3) two ADDITIVE relaxations of existing ops — `vt::RopeFromCache` is now stride-driven on q/k and `vt::MatmulBT` accepts a row-strided ACTIVATION — both integer-identical for contiguous tensors, hence bit-identical for every existing model by construction and by gate. **NO MLA MODEL and NO MLA FORWARD — rows stay `SPIKE`** |
 | **W7** ✅ **DONE 2026-07-22** | **DeepSeek-V2 model: registry + loader + forward.** New TU, config parse, KV spec (MLA-only group), per-expert bf16 loader + shared experts + `e_score_correction_bias`, forward composing the MLA block + the MoE block + the first `first_k_dense_replace` dense layers. | W6, W3 | **PASSED** — see the `### Work breakdown` W7 entry. Loader gate on the REAL 4-shard DeepSeek-V2-Lite: **5291/5291 checkpoint tensors accounted for, none unmapped and none leftover**, every shape asserted incl. the load-time `W_UK [16,128,512]` / `W_UV [16,512,128]` absorption split and the shared-expert MLP; **forward gate: `The capital of France is` -> argmax ` Paris`** (top-5 ` Paris`, ` the`, ` a`, ` one`, ` also`), run-to-run bit-exact. Batch-ordering gate + shared-expert gates + a CUDA-vs-CPU agreement case (0.0061 worst relative logit error, bit-exact run to run on device). memcheck / racecheck / synccheck all **0**. **DEVIATION from the plan cell: only `DeepseekV2ForCausalLM` is REGISTERED, not all four aliases** — `DeepseekForCausalLM` is plain MHA (§0.7) and would be a false support claim, V3 is fp8/671B (no bf16 loader path, no hardware), V3.2 needs the DSA indexer we do not have; W10 owns those rows. Second deviation: the MoE block is written against the `vt::` ops DIRECTLY rather than reusing `RunMoeBlock`, because DeepSeek's shared expert has NO sigmoid gate and its router is grouped — reusing Qwen's block would have applied Qwen's semantics, and writing it separately also means ZERO edit to the 27B/35B/Coder MoE paths |
 | **W8** | **SACRED correctness gate — DeepSeek-V2-Lite.** Paged-engine greedy vs the vLLM 0.25.0 oracle under the W0-determined gate form; goldens + capture/near-tie scripts. | W7 | the gate; regression set UNCHANGED; memcheck 0 |
-| **W9** | **Speed close.** Decode CUDA-graph sibling; the MLA fusion recipes (RoPE+concat-cache, dual-RMSNorm) as byte-exact catalog entries; then the binding every-axis grid vs graphed vLLM at c1/c2/c4/c8. | W8 | every-axis parity or an honest attributed miss |
+| **W9** ⚠️ **LANDED 2026-07-22 — ATTRIBUTED MISS, row stays `ACTIVE`** | **Speed close.** Decode CUDA-graph sibling; the MLA fusion recipes (RoPE+concat-cache, dual-RMSNorm) as byte-exact catalog entries; then the binding every-axis grid vs graphed vLLM at c1/c2/c4/c8. | W8 | every-axis parity or an honest attributed miss — **RESULT: HONEST MISS** — see the `### Work breakdown` W9 entry and [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md) § "Binding DeepSeek-V2-Lite (MLA) every-axis grid". Decode throughput went **0.50x -> 0.87x** of vLLM at c1 and TTFT now BEATS vLLM at c4/c8, but throughput is short at every concurrency, so the row does NOT reach `DONE`. **DEVIATION from the plan cell: the two levers actually driven were NOT the ones planned.** The planned MLA fusion recipes were not built, because `nsys` said they were not the lever; what the trace found instead was `MlaDecodeStage1` at **44.7% of all GPU time and ~180x off its own memory-bound floor** (a 2-CTA grid at batch 1), fixed by an occupancy-fill of the split-KV count for **+69.5%/+53.3%/+32.0%/+19.5%** at c1/c2/c4/c8 — an order of magnitude more than the planned work would have been worth. The planned decode CUDA-graph sibling WAS built and is worth only ~+2%: this model's decode is GPU-bound, not host-bound |
 | **W10** | **Blocked-row honesty pass.** Config/registry resolution + weight-map + unit parity at V3 dimensions (§5.2) for V3/V3.2; record `HW-BLOCKED` where e2e cannot run. Kimi-Linear and MiniMax-M2 assessments per §11 stay separate rows. | W8 | config/loader-slice/unit gates only |
 
 **Ranked rationale.** W1-W2 are pure engine seams with zero MLA math and must not
@@ -2071,6 +2071,153 @@ W9 speed close (decode-graph sibling + MLA fusion recipes + the binding
 every-axis grid). W10 the blocked-row honesty pass (config/loader-slice/unit
 parity for V3/V3.2; `HW-BLOCKED` recorded where e2e cannot run). Full table with
 per-W gates in §10.
+
+---
+
+## W9 — the speed close (LANDED 2026-07-22): an ATTRIBUTED MISS
+
+*(a) VERDICT FIRST.* **The row does NOT reach `DONE`.** It stays `ACTIVE` with a
+measured, attributed residual. Two optimizations landed; together they moved
+decode throughput from **0.50x to 0.87x** of vLLM at c1 (+73.6% over the W8
+baseline) and made our **TTFT BEAT vLLM at c4 and c8**. But output / total /
+request throughput is short at all four concurrencies (0.86-0.95x) and TPOT/ITL
+is short at c1/c4/c8, so "match or beat on EVERY axis" is NOT met. The full grid,
+the denominator justification, the nsys diff and the repro recipe are the binding
+record in [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md).
+
+*(b) THE DENOMINATOR — settled, with evidence, not assumed.* vLLM AUTO-selects
+the **FlashInfer CUTLASS Unquantized MoE** backend for DeepSeek-V2-Lite. It
+**cannot run on GB10**: it has now hard-rebooted dgx **five times** (three at W8,
+two more at W9). W9's two attempts deliberately applied the Qwen3-Coder
+mitigations — `gpu_memory_utilization=0.40`, `max-model-len 2048`,
+`max-num-batched-tokens` 2048 then 1024, `max-num-seqs` 8 then 4 — and the second
+ran on a **pristine freshly-rebooted box with a 0 GiB page cache and 116 GiB
+free**, which is the strongest form of the page-cache-evictor mitigation
+available (`sudo` is password-gated here, so `drop_caches` itself never worked).
+Both died at the IDENTICAL phase: immediately after `torch.compile`, in the
+memory-profiling dummy run / FlashInfer autotune where the CUTLASS MoE expert
+workspace is first allocated. So **`--moe-backend triton` IS vLLM's best STABLE
+graphed/production configuration on this hardware and is the legitimate bar** —
+and it is worth saying plainly that this substitution does not flatter us: we
+LOSE to it. Both sides otherwise resolve identically (`TRITON_MLA` decode +
+`FLASH_ATTN` MLA prefill), and vLLM runs GRAPHED
+(`cudagraph_mode=FULL_AND_PIECEWISE`, capture sizes `[1,2,4,8,16]`).
+
+*(c) THE LEVER `nsys` FOUND — and it was NOT the planned one.* §10's W9 cell
+planned "the MLA fusion recipes (RoPE+concat-cache, dual-RMSNorm)". The trace
+refuted that priority before a line of it was written. `nsys profile
+--cuda-graph-trace=node` on OURS at c1 showed **`MlaDecodeStage1` at 44.7% of ALL
+GPU time, 837 us per instance** — 27 layers x 837 us = ~22.6 ms of a ~47.7 ms
+TPOT. A batch-1 step reads ~1.25 MiB of KV latent per layer, i.e. ~5 us at GB10's
+memory rate, so the kernel was running about **two orders of magnitude off its own
+memory-bound floor**. The cause is pure occupancy: `_compute_num_kv_splits`
+(`triton_mla.py:40-47`) derives the split count from `max_seq_len` ALONE and
+returned **2**; MLA has exactly ONE kv head so `min(BLOCK_H, kv_group_num)`
+collapses the head dimension to a single tile; at batch 1 the grid was therefore
+**2 CTAs on the entire GPU**.
+
+The fix is **upstream's own occupancy target, actually applied**:
+`_compute_num_kv_splits` already names `maximum = sm_count *
+_SPLIT_OCCUPANCY_MULTIPLIER` as its occupancy bound but never REACHES it on short
+sequences. `ComputeNumKvSplitsFilled` (`cuda_mla_attn.cu`) raises the split count
+until the grid actually has that many CTAs given what the other two grid
+dimensions contribute, never exceeding upstream's own `maximum` and never
+splitting finer than one `kNTile` of work. Result: **837 us -> 45.8 us, an 18.3x
+kernel speedup**, 44.7% -> 3.9% of GPU time.
+
+This is a **RECORDED DEVIATION** from upstream, not a mirror: upstream can afford
+the `max_seq_len`-only heuristic because it targets a large-batch serving regime
+where `batch` alone fills the grid, and because its Triton CTA does the whole head
+block with `tl.dot`. It is numerics-visible (the stage-2 online-softmax reduction
+order changes), so it was GATED, not assumed — see (e). Rollback:
+`VT_MLA_SPLIT_FILL=0`.
+
+*(d) THE DECODE CUDA-GRAPH SIBLING — built as planned, worth ~+2%.*
+`DeepseekV2DecodeGraph` (`deepseek_v2.cpp`) is the MLA member of the driver family
+(`Qwen3_5DecodeGraph` / `Qwen3_5DenseDecodeGraph` / `Qwen3MoeDecodeGraph`): same
+cold -> warm -> capture -> replay machine, same `decode_graph_sizes.h` padded
+capture set, same persistent fixed-address host inputs. It required splitting
+`ForwardBody` into `EmbedInto` + a capturable `ForwardLayers`, and it measures
+**+2.5% / +2.5% / +1.8% / +2.0%** at c1/c2/c4/c8. **That is an order of magnitude
+less than the Qwen3-Coder analogue** (which was worth that model's entire c1
+deficit), and the reason is now measured rather than guessed: DeepSeek-V2-Lite's
+decode step is GPU-BOUND, so there is only ~1.2 ms/step of host launch tax to
+remove, not ~5 ms.
+
+*(e) A REAL CUDA-GRAPH SAFETY BUG THE GRAPH EXPOSED — and the guard that now
+catches its whole class.* The first capture produced a graph that was CORRECT on
+the replay issued immediately after capture and then diverged by ~19 logits on
+replay #2 onwards, eventually faulting with "an illegal memory access was
+encountered". `compute-sanitizer` serialized enough to HIDE the fault and showed
+only wrong numbers — 0 memory errors, wrong tokens. A `VT_DEEPSEEK_GRAPH_VERIFY=1`
+diagnostic (kept in the tree) that runs the eager forward alongside each replay
+localized it in one run.
+
+Root cause: `BuildMlaStep` uploaded the decode half's `block_table` and `seq_lens`
+from **function-local temporary vectors**. Eagerly that is fine — the
+`cudaMemcpyAsync` is issued before the temporary dies. Under CAPTURE it is a
+use-after-free: the copy becomes a graph node that BAKES the source address, and
+every later replay copies whatever now occupies that freed heap block into the
+decode metadata. The fix is `UploadRange`, which uploads a contiguous range of the
+CALLER's persistent vector with no temporary — legitimate here because the decode
+half is a batch PREFIX by the scheduler's own reorder contract
+(`mla_attention.py:1420`), and the prefill half is a SUFFIX, so neither needs a
+copy at all. After the fix the verify hook reports **`max abs(graph - eager) = 0`**:
+the replay is BIT-IDENTICAL to eager.
+
+A second, independent capture hazard surfaced once the occupancy fill made the
+split-KV workspace size batch-dependent: it GREW inside a capture region, which
+turns `cudaMallocAsync` into a graph-owned allocation node whose memory the graph
+frees. Two changes close it: `EnsureMidScratch` now carries the house capture
+guard (mirroring `cuda_dropin.cu:124` and the FA-2 decode launcher at
+`cuda_flash_attn_fa2.cu:717-720`) so growth-under-capture is a loud error instead
+of a silent fault, and the workspace is sized at the CONSTANT bound `sm_count * 2`
+splits rather than at the call's chosen `num_splits`, which makes the allocation
+depend only on `(batch, num_heads)` — constant for a captured size, so the
+pre-warm step's allocation always suffices.
+
+*(f) CORRECTNESS IS INTACT — the SACRED gate is 8/8 with EVERY optimization
+DEFAULT-ON, with IDENTICAL results.* `test_deepseek_v2_paged_engine`: **8/8
+prompts PASS, STRICT token-exact 5/8, near-tie band 3/8, 92/128 tokens strictly
+exact, max teacher-forced gap 0.25 nats @ prompt[3] tok=9, 0 forward-divergent,
+vLLM self-determinism 0 multi-valued cells** — character-for-character the W8
+result, so neither lever moved a token. The `MlaBatchSplitStats` diagnostics are
+also unchanged (phase 1 steps=128 / decode_only=120; phase 2 MIXED=7,
+max_num_reqs=8; phase 3 with_context_prefill_steps=1), which required the graph
+driver to record the split on the REPLAY path too, since `BuildMlaStep` does not
+run there. The capture set exercised is `S = {1, 2, 4, 8}`.
+`test_ops_mla_attn` stays **11/11 / 2,303,193 assertions**.
+
+*(g) THE RESIDUAL, ATTRIBUTED TO KERNELS.* From the same nsys diff, after the fix:
+1. **MoE grouped GEMM is now our top kernel at 40.5%** — ~1.2x its own bandwidth
+   floor, so close but not free. vLLM runs one `fused_moe_kernel` family.
+2. **Dense projections at batch 1 fall to cuBLAS `gemvx` for 31.8% of our GPU
+   time; vLLM splits the same work between `gemvx` (12.7%) and tensor-core
+   `nvjet_sm121_tst_mma_*` (6.6%).** This is the LARGEST single attributable
+   difference and the **next lever by gain/effort** — it is a dispatch change, not
+   a new kernel.
+3. **vLLM runs Inductor-codegenned FUSED glue we do not have**
+   (`triton_red_fused_add_fused_add_rms_norm_1`,
+   `triton_red_fused_fused_add_rms_norm_moe_forward_shared_0`,
+   `triton_poi_fused_mul_silu_slice_0`, `triton_poi_fused_2`), ~7-8% of its
+   profile — the same glue-fusion theme the 35B campaign recorded.
+4. Our MLA decode attention is still ~2.3x vLLM's per call (45.8 + 22.6 us vs its
+   `_fwd_grouped_kernel_stage1` at 29.6 us) — small in absolute terms now.
+
+*(h) WHAT WAS NOT DONE, said plainly.* The planned MLA fusion catalog entries
+(RoPE+concat-cache, dual-RMSNorm) were NOT built — the trace ranked them far below
+the occupancy fix, and building them anyway would have been ceremony. The three
+W4-W7 deviations listed as W9 candidates were re-examined and left alone on the
+same evidence: `vt::MergeAttnStates` is chunked-prefill-only and does not appear
+in the decode profile at all; `vt::ConcatMlaNopeRope` is 0.1% of GPU time
+(vectorizing it cannot pay); the fused A-projection GEMM addresses part of the
+`gemvx` line but the bigger half of that line is the tensor-core dispatch, so it
+is folded into lever (2) above rather than done blind. `cuda_arch_tactics`
+registration stays deferred: there is still exactly one MLA decode kernel.
+
+*(i) WHAT THIS LICENSES.* The row stays **`ACTIVE`** with the residual named per
+axis and attributed to specific kernels. It reaches `DONE` when the c1..c8 grid
+passes on EVERY axis. Both §5.1 coverage gaps are unchanged.
 
 ### Risks/decisions
 

@@ -54,10 +54,14 @@
 //     `max_num_seqs := this step's num_reqs`, because the model forward has no
 //     VllmConfig. With the default (unclamped) `--max-model-len` those are the
 //     same numbers upstream uses.
-// (c) No decode CUDA-graph sibling and no fused A-projection GEMM: both are W9.
+// (c) W9 landed the decode CUDA-graph sibling (`DeepseekV2DecodeGraph`, at the
+//     bottom of this TU). The per-row-slice A-projection issue recorded at W6 was
+//     re-measured at W9 and is discussed there.
 #include "vllm/model_executor/models/deepseek_v2.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -67,6 +71,7 @@
 #include <vector>
 
 #include "vllm/model_executor/layers/attention/mla_chunked_context.h"
+#include "vllm/model_executor/models/decode_graph_sizes.h"  // DecodeGraphSizes/PadToCaptureSize
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev/DBuf/ResidentWeight glue
 #include "vllm/model_executor/models/device_pool.h"
 #include "vllm/model_executor/models/mla_attention.h"
@@ -132,6 +137,40 @@ Tensor UploadInto(Dev d, std::vector<DBuf>& owned, DType dt,
   return owned.back().t();
 }
 
+// Upload a CONTIGUOUS RANGE of a caller-owned vector without materializing a
+// temporary copy of it.
+//
+// ─── WHY THIS EXISTS: THE CUDA-GRAPH DANGLING-SOURCE BUG (MLA campaign W9) ───
+// The obvious spelling of a sub-range upload is
+//     std::vector<int32_t> slice(v.begin() + a, v.begin() + b);
+//     UploadInto(..., slice);
+// and under EAGER execution it is correct: `Copy` is a cudaMemcpyAsync issued
+// before `slice` dies, and on GB10 the host pointer is device-addressable so the
+// copy reads it in stream order.
+//
+// Under CUDA-GRAPH CAPTURE it is a USE-AFTER-FREE. The capture turns that
+// cudaMemcpyAsync into a graph node that BAKES the source address, and `slice`
+// is destroyed the moment BuildMlaStep returns. Every subsequent REPLAY then
+// copies whatever now occupies that freed heap block into the decode
+// `block_table` / `seq_lens`. The observed signature was exactly this: the first
+// replay (issued immediately after capture, before the block was reused) is
+// CORRECT, replay #2 onwards diverges by ~19 logits, and once the garbage
+// block-table entry goes out of range the KV gather faults with "an illegal
+// memory access was encountered". compute-sanitizer serializes enough to hide
+// the fault and shows only the wrong numbers.
+//
+// So the whole captured region must upload ONLY from storage whose address the
+// graph driver keeps alive and refreshes IN PLACE across replays — i.e. the
+// caller's own metadata vectors (the driver's persistent per-size SizeSlot). This
+// helper is how the decode half does that.
+template <typename T>
+Tensor UploadRange(Dev d, std::vector<DBuf>& owned, DType dt,
+                   const std::vector<int64_t>& shape, const std::vector<T>& host,
+                   size_t offset) {
+  owned.emplace_back(d, dt, shape, host.data() + offset);
+  return owned.back().t();
+}
+
 // `MLACommonMetadataBuilder.build` (mla_attention.py:1652-1830), non-DCP branch.
 MlaStep BuildMlaStep(Dev d, const std::vector<int32_t>& positions,
                      const CommonAttentionMetadata& am, int64_t block_size,
@@ -150,31 +189,32 @@ MlaStep BuildMlaStep(Dev d, const std::vector<int32_t>& positions,
 
   // --- decode half (triton_mla.py:214-216, 245-246) ---
   if (sp.num_decodes > 0) {
-    std::vector<int32_t> bt(am.block_table_tensor.begin(),
-                            am.block_table_tensor.begin() +
-                                static_cast<std::ptrdiff_t>(sp.num_decodes * cols));
-    std::vector<int32_t> sl(am.seq_lens.begin(),
-                            am.seq_lens.begin() +
-                                static_cast<std::ptrdiff_t>(sp.num_decodes));
-    s.meta.decode.block_table =
-        UploadInto(d, s.owned, DType::kI32, {sp.num_decodes, cols}, bt);
-    s.meta.decode.seq_lens =
-        UploadInto(d, s.owned, DType::kI32, {sp.num_decodes}, sl);
+    // The decode half is a PREFIX of the batch (the scheduler reorders decodes
+    // first — mla_attention.py:1420 `reorder_batch_threshold = 1`), so both
+    // sources are a prefix of the caller's own persistent vectors and need NO
+    // temporary. This is load-bearing for CUDA-graph capture: see UploadRange.
+    s.meta.decode.block_table = UploadRange(d, s.owned, DType::kI32,
+                                            {sp.num_decodes, cols},
+                                            am.block_table_tensor, /*offset=*/0);
+    s.meta.decode.seq_lens = UploadRange(d, s.owned, DType::kI32, {sp.num_decodes},
+                                         am.seq_lens, /*offset=*/0);
     s.meta.decode.max_seq_len = sp.decode_max_seq_len;
   }
 
   // --- prefill half (mla_attention.py:1652-1682) ---
+  // The prefill block table is the SUFFIX of the batch's block table, so it too
+  // uploads straight out of the caller's vector (no temporary). `prefill_cu_seqlens_q`
+  // is DERIVED data owned by `s.split`, which lives inside this MlaStep for the
+  // whole forward — safe eagerly, and never reached under capture because the
+  // graph driver only ever captures PURE-DECODE steps (num_prefills == 0).
   if (sp.num_prefills > 0) {
-    std::vector<int32_t> bt(
-        am.block_table_tensor.begin() +
-            static_cast<std::ptrdiff_t>(sp.num_decodes * cols),
-        am.block_table_tensor.begin() +
-            static_cast<std::ptrdiff_t>((sp.num_decodes + sp.num_prefills) * cols));
     s.meta.prefill_cu_seqlens_q = UploadInto(d, s.owned, DType::kI32,
                                              {sp.num_prefills + 1},
                                              sp.prefill_cu_seqlens_q);
     s.meta.prefill_block_table =
-        UploadInto(d, s.owned, DType::kI32, {sp.num_prefills, cols}, bt);
+        UploadRange(d, s.owned, DType::kI32, {sp.num_prefills, cols},
+                    am.block_table_tensor,
+                    static_cast<size_t>(sp.num_decodes * cols));
     s.meta.max_query_len = sp.prefill_max_query_len;
 
     if (sp.num_prefills_with_context > 0) {
@@ -474,14 +514,31 @@ void GatherRows(Dev d, void* dst, const Tensor& src, const std::vector<int32_t>&
     d.b.Copy(d.q, dp + s * rb, sp + static_cast<size_t>(idx[s]) * rb, rb);
 }
 
-DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
-                 const std::vector<int32_t>& positions,
-                 const CommonAttentionMetadata& am,
-                 const std::vector<PagedKvCache>& attn_kv,
-                 const DeepseekV2Weights& weights,
-                 const std::vector<int32_t>& logits_indices) {
+// The EMBED step, hoisted out of the layer region so it can stay OUTSIDE a CUDA
+// graph capture (the embedding path takes a device flag through a cudaMalloc +
+// stream sync — the same reason qwen3_moe.cpp:200 keeps `EmbedInto` outside).
+void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
+               const DeepseekV2Weights& weights) {
   const DeepseekV2Params& p = weights.params;
   const int64_t T = static_cast<int64_t>(token_ids.size());
+  Tensor dtab = ResidentWeight(d, weights.embed_tokens, {p.vocab_size, p.hidden_size});
+  DBuf dids(d, DType::kI32, {T}, token_ids.data());
+  Tensor h = hidden.t();
+  vt::Embedding(d.q, h, dtab, dids.t());
+}
+
+// The CAPTURABLE region: everything after the embedding — the MLA step metadata
+// upload, the 27 decoder layers, the final norm and the lm_head GEMM. Takes the
+// already-embedded hidden states as a Tensor so the graph driver can hand it a
+// PERSISTENT buffer whose address the captured kernels bake in.
+DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
+                   const std::vector<int32_t>& positions,
+                   const CommonAttentionMetadata& am,
+                   const std::vector<PagedKvCache>& attn_kv,
+                   const DeepseekV2Weights& weights,
+                   const std::vector<int32_t>& logits_indices) {
+  const DeepseekV2Params& p = weights.params;
+  const int64_t T = hidden_in.shape[0];
   const int64_t H = p.hidden_size;
   const int64_t vocab = p.vocab_size;
   const float eps = p.rms_norm_eps;
@@ -491,14 +548,7 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
            "deepseek-v2: one MLA PagedKvCache per layer required");
   VT_CHECK(T > 0, "deepseek-v2: empty batch");
 
-  DBuf hidden_buf(d, DType::kBF16, {T, H});
-  {
-    Tensor dtab = ResidentWeight(d, weights.embed_tokens, {vocab, H});
-    DBuf dids(d, DType::kI32, {T}, token_ids.data());
-    Tensor h = hidden_buf.t();
-    vt::Embedding(d.q, h, dtab, dids.t());
-  }
-  Tensor hidden = hidden_buf.t();
+  Tensor hidden = hidden_in;
   std::shared_ptr<void> hidden_hold;
 
   DBuf res(d, DType::kBF16, {T, H});
@@ -554,6 +604,22 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   return logits;
 }
 
+// Full eager forward: embed then the capturable layer region. Used by
+// DeepseekV2Model::Forward/ForwardDevice and by the graph driver's eager
+// fallback + cold-size pre-warm step.
+DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
+                 const std::vector<int32_t>& positions,
+                 const CommonAttentionMetadata& am,
+                 const std::vector<PagedKvCache>& attn_kv,
+                 const DeepseekV2Weights& weights,
+                 const std::vector<int32_t>& logits_indices) {
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  DBuf hidden(d, DType::kBF16, {T, weights.params.hidden_size});
+  EmbedInto(d, hidden, token_ids, weights);
+  return ForwardLayers(d, hidden.t(), positions, am, attn_kv, weights,
+                       logits_indices);
+}
+
 ForwardLogits WrapDeviceLogits(DBuf&& dlogits, int64_t rows, int64_t vocab) {
   ForwardLogits fl;
   fl.rows = rows;
@@ -564,6 +630,89 @@ ForwardLogits WrapDeviceLogits(DBuf&& dlogits, int64_t rows, int64_t vocab) {
   fl.device_storage =
       std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
   return fl;
+}
+
+// ─── W9 decode-CUDA-graph support helpers ───────────────────────────────────
+// Byte-for-byte the qwen3_moe.cpp:232-303 helpers (ViewDeviceLogits /
+// CopyInPlace / BuildPaddedDecodeAttn), re-expressed here because they are file
+// -local to that TU. The padding contract is IDENTICAL and it is identical for a
+// reason: it is the contract of `CommonAttentionMetadata` itself, not of any
+// particular attention backend.
+
+// NON-OWNING [rows, vocab] f32 view over a buffer the graph slot keeps alive.
+// Stream ordering guarantees the sampler's later reads see the replay's writes;
+// the next same-size replay overwrites the buffer, so in-place sampler mutation
+// is safe.
+ForwardLogits ViewDeviceLogits(void* base, vt::Device device, int64_t rows,
+                               int64_t vocab) {
+  ForwardLogits fl;
+  fl.rows = rows;
+  fl.vocab = vocab;
+  fl.device_tensor = MakeTensor(base, DType::kF32, device, {rows, vocab});
+  fl.device_storage = std::shared_ptr<void>(base, [](void*) {});
+  return fl;
+}
+
+// Overwrite dst's CONTENTS without moving dst.data() when the sizes already
+// match — the captured host->device copies bake the source address in.
+template <typename T>
+void CopyInPlace(std::vector<T>& dst, const std::vector<T>& src) {
+  if (dst.size() != src.size()) {
+    dst = src;
+  } else {
+    std::copy(src.begin(), src.end(), dst.begin());
+  }
+}
+
+// Build the S-padded PURE-DECODE inputs from the real B-request step (B <= S).
+//
+// WHY THE PADDING IS INERT FOR **MLA** SPECIFICALLY (this is the part that does
+// NOT come for free from the Qwen3-Coder argument, and it was re-derived rather
+// than assumed):
+//   * `BuildMlaBatchSplit` sees query_len == 1 for EVERY row (real and padded),
+//     so the split is `num_decodes == S, num_prefills == 0` — the padded rows
+//     land in the DECODE half, the only half a pure-decode step has, and the
+//     with-context prefill ordering invariant is vacuous.
+//   * The absorbed MQA decode kernel (`vt::MlaDecodeAttention`) is per-request:
+//     each query row reduces only over ITS OWN `seq_lens[r]` tokens taken through
+//     ITS OWN `block_table[r]` row. `seq_lens = 1` + block-table row 0 is an
+//     in-bounds single-token read whose output row is discarded.
+//   * `slot_mapping = -1` makes the MLA cache write (`vt::MlaCacheWrite`, the W3
+//     op) SKIP the row exactly as `ReshapeAndCache` does, so no real KV page is
+//     perturbed — this is the property that makes padding safe to REPLAY, not
+//     merely safe to compute.
+//   * Everything else in the step (both RMSNorms, the A/B projections, the two
+//     batched absorption GEMMs, the router, the grouped MoE GEMM, the shared
+//     expert, the lm_head) is per-token with no cross-row reduction.
+// At S == B this is a bit-identical rebuild of the eager inputs.
+void BuildPaddedDecodeAttn(int64_t S, const std::vector<int32_t>& tok,
+                           const std::vector<int32_t>& pos,
+                           const CommonAttentionMetadata& am,
+                           std::vector<int32_t>& tok_out,
+                           std::vector<int32_t>& pos_out,
+                           CommonAttentionMetadata& am_out) {
+  const int64_t cols = am.block_table_num_cols;
+
+  tok_out.assign(static_cast<size_t>(S), 0);
+  pos_out.assign(static_cast<size_t>(S), 0);
+  std::copy(tok.begin(), tok.end(), tok_out.begin());
+  std::copy(pos.begin(), pos.end(), pos_out.begin());
+
+  am_out = am;  // carries causal + block_table_num_cols + max_seq_len
+  am_out.num_reqs = static_cast<int>(S);
+  am_out.num_actual_tokens = static_cast<int>(S);
+  am_out.max_query_len = 1;  // pure decode
+  am_out.slot_mapping.assign(static_cast<size_t>(S), -1);
+  std::copy(am.slot_mapping.begin(), am.slot_mapping.end(),
+            am_out.slot_mapping.begin());
+  am_out.seq_lens.assign(static_cast<size_t>(S), 1);
+  std::copy(am.seq_lens.begin(), am.seq_lens.end(), am_out.seq_lens.begin());
+  am_out.block_table_tensor.assign(static_cast<size_t>(S * cols), 0);
+  std::copy(am.block_table_tensor.begin(), am.block_table_tensor.end(),
+            am_out.block_table_tensor.begin());
+  am_out.query_start_loc.resize(static_cast<size_t>(S + 1));
+  for (int64_t i = 0; i <= S; ++i)
+    am_out.query_start_loc[static_cast<size_t>(i)] = static_cast<int32_t>(i);
 }
 
 }  // namespace
@@ -673,6 +822,233 @@ ForwardLogits DeepseekV2Model::ForwardDevice(
       ForwardBody(d, token_ids, positions, attn_meta, attn_kv, weights, logits_indices);
   const int64_t n_out = dlogits.t().shape[0];
   return WrapDeviceLogits(std::move(dlogits), n_out, weights.params.vocab_size);
+}
+
+// ─── DeepseekV2DecodeGraph (MLA decode CUDA-graph driver) — MLA campaign W9 ───
+//
+// The MLA sibling of Qwen3MoeDecodeGraph (qwen3_moe.cpp:374), Qwen3_5DecodeGraph
+// (qwen3_5.cpp:5902) and Qwen3_5DenseDecodeGraph (qwen3_5.cpp:6104): the SAME
+// cold -> warm -> capture -> replay state machine, the SAME padded-batch capture
+// set (decode_graph_sizes.h, mirroring vLLM `_set_cudagraph_sizes` reduced to the
+// full-decode-cudagraph regime + `compilation/cuda_graph.py`'s pad-to-nearest
+// dispatch), the SAME persistent fixed-address host inputs and persistent
+// embed/logits buffers — driving the MLA + DeepSeek-MoE decode forward.
+//
+// Ported from: vllm/v1/worker/gpu_model_runner.py::GPUModelRunner @ e24d1b24
+//   (`_dummy_run` warm-up then capture, then graph dispatch per decode step) +
+//   vllm/compilation/cuda_graph.py (`CUDAGraphWrapper.__call__`: pad the batch to
+//   a captured size, replay, else run eager).
+//
+// GRAPH-SAFETY AUDIT of the MLA decode path (capture requires stable pointers, no
+// host sync and no stream-ordered alloc inside the region). What is NEW versus
+// the three existing drivers is the MLA half; the rest is shared machinery:
+//   * Embedding (device flag cudaMalloc + stream sync) stays OUTSIDE (EmbedInto).
+//   * `BuildMlaStep`'s metadata uploads all come from the slot's PERSISTENT host
+//     vectors, so the captured H2D copies read fixed addresses. A block-table
+//     column-count change reallocates one of them -> the slot's graph is dropped
+//     and re-captured (the `cols_changed` guard below), exactly as the FA-2
+//     drivers do.
+//   * On a PURE-DECODE step the split is num_prefills == 0, so the ENTIRE chunked
+//     -context branch of BuildMlaStep (the workspace sizing, the per-chunk
+//     descriptor uploads, `ComputeMlaPrefillContext`) is not reached. The
+//     capturable region is therefore only the decode half — no data-dependent
+//     chunk count, no host-visible loop bound.
+//   * `vt::MlaDecodeAttention`'s split-KV partial workspace comes from the shared
+//     DevicePool, whose blocks are recycled and never returned to the driver; the
+//     cold pre-warm step at this exact padded size populates every size class the
+//     capture then reuses, so the capture itself performs no cudaMalloc. Its
+//     split count is derived from the HOST `max_seq_len`, which only sizes the
+//     grid — each split's KV range is recomputed in-kernel from the DEVICE
+//     `seq_lens`, so a captured graph stays CORRECT as sequences grow. This is
+//     the identical contract the already-gated FA-2 decode graphs rely on.
+//   * The MoE grouped-GEMM index scratch and split-K partials are graph-safe by
+//     design (retire-don't-free), and the per-layer expert device-pointer arrays
+//     + pair->token row map (`MoePtrs`) are uploaded once at first touch during
+//     the pre-warm step.
+//   * `ResidentWeight` uploads every weight once, on first touch (pre-warm) —
+//     including the load-time-absorbed `W_UK`/`W_UV` and the YaRN rope cache.
+//   * cuBLASLt's workspace is a one-time per-context cudaMalloc.
+//
+// NUMERICS: a replay is the same kernels in the same order over the same buffers,
+// so the real rows are BIT-IDENTICAL to the eager forward. The W8 SACRED gate is
+// re-run with this default-ON and must stay 8/8; it does.
+struct DeepseekV2DecodeGraph::Impl {
+  Impl(const DeepseekV2Weights& w, vt::Queue q, int64_t max_reqs)
+      : weights(w), queue(q), max_num_reqs(max_reqs) {
+    // The framework-wide graph switch, plus a DeepSeek-local rollback so W9 can
+    // run a same-binary A/B of exactly this lever.
+    const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
+    const bool env_on = (env == nullptr) || std::string(env) != "0";
+    const char* local = std::getenv("VT_DEEPSEEK_CUDAGRAPH");
+    const bool local_on = (local == nullptr) || local[0] != '0';
+    Backend& b = vt::GetBackend(queue.device.type);
+    enabled = env_on && local_on && queue.device.type == vt::DeviceType::kCUDA &&
+              b.SupportsGraphCapture();
+  }
+  ~Impl() {
+    Backend& b = vt::GetBackend(queue.device.type);
+    for (auto& kv : slots)
+      if (kv.second.graph != nullptr) b.DestroyGraph(kv.second.graph);
+  }
+
+  struct SizeSlot {
+    std::vector<int32_t> token_ids;  // [S]
+    std::vector<int32_t> positions;  // [S]
+    CommonAttentionMetadata attn_meta;
+    std::unique_ptr<DBuf> hidden;  // [S,H] bf16 persistent embed target
+    std::unique_ptr<DBuf> logits;  // [S,vocab] f32 held graph output
+    void* graph = nullptr;         // instantiated cudaGraphExec (opaque)
+    int bt_cols = -1;              // captured block-table column count
+    bool captured = false;
+    bool warm = false;
+    int64_t replays = 0;
+
+    void Refresh(const std::vector<int32_t>& tok, const std::vector<int32_t>& pos,
+                 const CommonAttentionMetadata& am) {
+      CopyInPlace(token_ids, tok);
+      CopyInPlace(positions, pos);
+      CopyInPlace(attn_meta.slot_mapping, am.slot_mapping);
+      CopyInPlace(attn_meta.block_table_tensor, am.block_table_tensor);
+      CopyInPlace(attn_meta.seq_lens, am.seq_lens);
+      CopyInPlace(attn_meta.query_start_loc, am.query_start_loc);
+      attn_meta.num_reqs = am.num_reqs;
+      attn_meta.num_actual_tokens = am.num_actual_tokens;
+      attn_meta.max_query_len = am.max_query_len;
+      attn_meta.max_seq_len = am.max_seq_len;
+      attn_meta.block_table_num_cols = am.block_table_num_cols;
+      attn_meta.causal = am.causal;
+    }
+  };
+
+  const DeepseekV2Weights& weights;
+  vt::Queue queue;
+  int64_t max_num_reqs = 0;  // == max_num_seqs; padded decode batch cap
+  bool enabled = false;
+
+  std::map<int64_t, SizeSlot> slots;  // padded size S -> slot
+  int64_t replays = 0;
+  bool any_captured = false;
+};
+
+DeepseekV2DecodeGraph::DeepseekV2DecodeGraph(const DeepseekV2Weights& weights,
+                                             vt::Queue queue, int64_t max_num_reqs)
+    : impl_(std::make_unique<Impl>(weights, queue, max_num_reqs)) {}
+
+DeepseekV2DecodeGraph::~DeepseekV2DecodeGraph() = default;
+
+bool DeepseekV2DecodeGraph::captured() const { return impl_->any_captured; }
+int64_t DeepseekV2DecodeGraph::replay_count() const { return impl_->replays; }
+
+ForwardLogits DeepseekV2DecodeGraph::Step(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta,
+    const std::vector<PagedKvCache>& attn_kv) {
+  const int64_t B = static_cast<int64_t>(token_ids.size());
+  Backend& b = vt::GetBackend(impl_->queue.device.type);
+  Dev d{b, impl_->queue};
+  const int64_t vocab = impl_->weights.params.vocab_size;
+  const int64_t H = impl_->weights.params.hidden_size;
+
+  // Pure decode passes identity logits_indices (gather is a no-op), so the
+  // capturable region returns the full [S,vocab].
+  const std::vector<int32_t> kNoGather;
+  const int64_t S = PadToCaptureSize(B, impl_->max_num_reqs);
+  if (!impl_->enabled || S < 0) {
+    DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, attn_kv,
+                          impl_->weights, kNoGather);
+    return WrapDeviceLogits(std::move(lg), B, vocab);
+  }
+
+  Impl::SizeSlot& s = impl_->slots[S];
+  const int cols = attn_meta.block_table_num_cols;
+  std::vector<int32_t> ptok, ppos;
+  CommonAttentionMetadata pam;
+  BuildPaddedDecodeAttn(S, token_ids, positions, attn_meta, ptok, ppos, pam);
+
+  const bool cols_changed = (s.bt_cols != -1 && s.bt_cols != cols);
+  s.Refresh(ptok, ppos, pam);
+  s.bt_cols = cols;
+  if (cols_changed && s.graph != nullptr) {
+    b.DestroyGraph(s.graph);
+    s.graph = nullptr;
+    s.captured = false;
+    s.warm = false;
+  }
+
+  // Fast path: replay. `BuildMlaStep` (and with it `RecordMlaBatchSplit`) does
+  // NOT run on a replay, so the W8 split-shape counters are recorded here from
+  // the SAME padded metadata the captured region was built from — the diagnostic
+  // stays exactly as informative as it is on the eager path, which is what the
+  // paged-engine gate asserts on.
+  if (s.captured) {
+    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights);
+    RecordMlaBatchSplit(BuildMlaBatchSplit(s.attn_meta), s.attn_meta.num_reqs);
+    b.ReplayGraph(impl_->queue, s.graph);
+    ++s.replays;
+    ++impl_->replays;
+    // DIAGNOSTIC (VT_DEEPSEEK_GRAPH_VERIFY=1, off by default, dev-only): run the
+    // EAGER forward on the SAME padded inputs and report the divergence. This is
+    // the bisect harness for graph-safety work — it answers "is replay N wrong,
+    // and by how much" without a second process.
+    if (std::getenv("VT_DEEPSEEK_GRAPH_VERIFY") != nullptr) {
+      DBuf ref = ForwardBody(d, s.token_ids, s.positions, s.attn_meta, attn_kv,
+                             impl_->weights, kNoGather);
+      std::vector<float> a(static_cast<size_t>(S) * vocab), e(a.size());
+      d.b.Copy(d.q, a.data(), s.logits->ptr(), a.size() * sizeof(float));
+      ref.Download(d, e.data());
+      double worst = 0.0;
+      int amax_g = 0, amax_e = 0;
+      for (int64_t j = 0; j < vocab; ++j) {
+        const size_t idx = static_cast<size_t>(j);
+        worst = std::max(worst, static_cast<double>(std::abs(a[idx] - e[idx])));
+        if (a[idx] > a[static_cast<size_t>(amax_g)]) amax_g = static_cast<int>(j);
+        if (e[idx] > e[static_cast<size_t>(amax_e)]) amax_e = static_cast<int>(j);
+      }
+      std::fprintf(stderr,
+                   "[DeepseekV2DecodeGraph:VERIFY] S=%lld replay#%lld max|graph-eager|"
+                   "=%.6g argmax graph=%d eager=%d %s\n",
+                   static_cast<long long>(S), static_cast<long long>(s.replays), worst,
+                   amax_g, amax_e, amax_g == amax_e ? "" : "  <<< ARGMAX DIVERGED");
+    }
+    return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
+  }
+
+  // Warm: the pool, weight residency and per-shape kernel scratch were warmed for
+  // this size by the previous (eager) step. CAPTURE the layer region once.
+  if (s.warm) {
+    EmbedInto(d, *s.hidden, s.token_ids, impl_->weights);
+    b.BeginCapture(impl_->queue);
+    DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
+                            impl_->weights, kNoGather);
+    s.graph = b.EndCaptureGraph(impl_->queue);
+    s.logits = std::make_unique<DBuf>(std::move(lg));
+    s.captured = true;
+    impl_->any_captured = true;
+    if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
+      std::fprintf(stderr,
+                   "[DeepseekV2DecodeGraph] captured MLA decode graph for padded "
+                   "size S=%lld (real B=%lld)\n",
+                   static_cast<long long>(S), static_cast<long long>(B));
+    b.ReplayGraph(impl_->queue, s.graph);
+    s.replays = 1;
+    ++impl_->replays;
+    return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
+  }
+
+  // Cold size: run one EAGER step (pre-warms the DevicePool size classes, the
+  // resident weights / MoE expert pointer arrays + token map, and the MLA decode
+  // split workspace for this size) and defer capture to the next same-size step.
+  // This is a real decode step — nothing is wasted.
+  s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
+  EmbedInto(d, *s.hidden, s.token_ids, impl_->weights);
+  DBuf lg = ForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta, attn_kv,
+                          impl_->weights, kNoGather);
+  s.warm = true;
+  s.captured = false;
+  ForwardLogits fl = WrapDeviceLogits(std::move(lg), B, vocab);
+  fl.device_tensor =
+      MakeTensor(fl.device_storage.get(), DType::kF32, d.q.device, {B, vocab});
+  return fl;
 }
 
 }  // namespace vllm

@@ -965,6 +965,175 @@ The local Qwen3.5-4B checkpoint corpus is exactly
 `/tmp/qwen35-4b-sharegpt-1024.json`, SHA-256
 `9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`.
 
+## Binding DeepSeek-V2-Lite (MLA) every-axis grid — MLA campaign W9 (2026-07-22)
+
+**Verdict: NOT every-axis parity. The row stays `ACTIVE`.** Two optimizations
+landed and are measured below; they took decode throughput from **0.50x to 0.87x**
+of vLLM at c1, and TTFT now BEATS vLLM at c4/c8 — but output/total/request
+throughput is short at every concurrency and TPOT/ITL is short at c1/c4/c8, so
+this is an **attributed miss**, not a pass.
+
+### The denominator, and why it is `--moe-backend triton`
+
+vLLM AUTO-selects the **FlashInfer CUTLASS Unquantized MoE** backend for this
+model (`unquantized.py:262`, out of
+`['FlashInfer TRTLLM', 'FlashInfer CUTLASS', 'TRITON', 'BATCHED_TRITON']`).
+**It cannot run on GB10.** It has now HARD-REBOOTED dgx **five times** — three at
+W8, and twice more at W9 with the Qwen3-Coder mitigations deliberately applied:
+
+| attempt | config | outcome |
+|---|---|---|
+| W8 x3 | `gpu_memory_utilization=0.40`, `max_num_batched_tokens` capped to 2048; third attempt on a freshly-rebooted box with an empty page cache | box reboot |
+| W9 #1 | `gmu=0.40`, `max-model-len 2048`, `max-num-batched-tokens 2048`, `max-num-seqs 8` | box reboot at 07:59 (log ends 07:58:49 right after `torch.compile took 9.23 s`; `uptime` then read `up 0 min`) |
+| W9 #2 | PRISTINE freshly-rebooted box, page cache **0 GiB**, 116 GiB free, `gmu=0.40`, `max-model-len 2048`, `max-num-batched-tokens 1024`, `max-num-seqs 4` | box reboot at ~08:08 (log ends 08:05:24, same phase) |
+
+Both W9 deaths land at the IDENTICAL phase — immediately after `torch.compile`,
+in the memory-profiling dummy run / FlashInfer autotune where the CUTLASS MoE
+expert workspace is first allocated and exercised. GB10's 119 GiB is UNIFIED, so
+that workspace competes with the weights, the reservation and the page cache in
+one pool. `sudo` is password-gated on this box, so `drop_caches` was never
+actually available; W9 #2 substitutes for it exactly by starting from a 0 GiB
+page cache. Evidence: `~/w9mla/logs/cutlass_serve.log`,
+`cutlass_serve2.log`, `cutlass_probe.stamp`, `cutlass_probe2.stamp`.
+
+**Therefore `--moe-backend triton` IS vLLM's best STABLE, GRAPHED, production
+configuration on this hardware, and it is the legitimate bar.** This is stated
+rather than quietly assumed, because picking the slower backend to flatter our
+numbers would be exactly the wrong move — and note that the substitution does not
+flatter us: we LOSE against it. The oracle logs confirm the arms are otherwise
+matched — both sides resolve `TRITON_MLA` decode + `FLASH_ATTN` MLA prefill, and
+vLLM runs GRAPHED (`cudagraph_mode=FULL_AND_PIECEWISE`, capture sizes
+`[1,2,4,8,16]`), never `--enforce-eager`.
+
+### Methodology
+
+Fresh `vllm serve` **per concurrency** (driving several concurrencies at one
+server replays identical `RandomDataset` prompts into the prefix cache).
+**Prefix-cache hit rate VERIFIED in every serve log: 0.0% at c1/c2/c4**; c8
+drifted to **1.1%** across its 3 reps (96 prompts, a small `RandomDataset`
+collision) — reported, not hidden; it slightly favours vLLM at the one
+concurrency where our TTFT already wins. Medians of 3 reps per cell, idle box,
+same-binary A/B for every lever.
+
+### The grid (medians of 3 reps; 1024-in / 128-out; ratio = ours ÷ vLLM)
+
+Throughput wants ratio >= 1.00; latency wants <= 1.00. **Bold = FAILS the axis.**
+
+| c | metric | vLLM 0.25.0 | ours (W9 prod) | ratio |
+|---|---|---|---|---|
+| 1 | output tok/s | 38.17 | 33.18 | **0.87** |
+| 1 | request req/s | 0.30 | 0.26 | **0.87** |
+| 1 | median TTFT ms | 214.85 | 227.14 | **1.06** |
+| 1 | median TPOT ms | 24.71 | 27.51 | **1.11** |
+| 1 | median ITL ms | 24.69 | 27.46 | **1.11** |
+| 2 | output tok/s | 55.27 | 52.63 | **0.95** |
+| 2 | request req/s | 0.43 | 0.41 | **0.95** |
+| 2 | median TTFT ms | 329.80 | 374.67 | **1.14** |
+| 2 | median TPOT ms | 33.94 | 33.03 | 0.97 |
+| 2 | median ITL ms | 33.32 | 33.27 | 1.00 |
+| 4 | output tok/s | 81.51 | 70.36 | **0.86** |
+| 4 | request req/s | 0.64 | 0.55 | **0.86** |
+| 4 | median TTFT ms | 549.05 | 528.49 | 0.96 |
+| 4 | median TPOT ms | 45.19 | 52.38 | **1.16** |
+| 4 | median ITL ms | 43.35 | 50.38 | **1.16** |
+| 8 | output tok/s | 116.35 | 102.37 | **0.88** |
+| 8 | request req/s | 0.91 | 0.80 | **0.88** |
+| 8 | median TTFT ms | 605.46 | 533.48 | 0.88 |
+| 8 | median TPOT ms | 63.62 | 74.20 | **1.17** |
+| 8 | median ITL ms | 59.34 | 67.10 | **1.13** |
+
+Axes PASSED: **TTFT at c4 and c8** (we are 4% / 12% faster), **TPOT and ITL at
+c2**. Everything else is short. Total-token throughput tracks request throughput
+exactly (identical 1152-token request shape), so it fails with the same ratios.
+
+**Peak memory — the one axis we win decisively.** Ours: **31.38 GB** peak RSS
+(`/usr/bin/time -v`, c8, 1024-in/128-out). vLLM: **68.5 GiB** (29.34 GiB weights +
+39.15 GiB KV, from its own startup log at `gpu_memory_utilization=0.58`), i.e.
+ratio **0.46**. Stated with its caveat rather than banked uncritically: vLLM
+PRE-RESERVES a fixed fraction of memory up front and then serves KV out of it,
+whereas we allocate the KV blocks the configured concurrency actually needs, so
+this is a real difference in operating footprint at this workload but NOT evidence
+that our per-token KV cost is lower — the MLA page geometry is identical on both
+sides (36864 B = block 32 x 576 x 2B, no factor 2).
+
+### The two optimizations, with their measured deltas
+
+Same binary, same workload, medians of 3, rollback envs recorded.
+
+| lever | rollback | c1 | c2 | c4 | c8 |
+|---|---|---|---|---|---|
+| decode CUDA graph | `VT_DEEPSEEK_CUDAGRAPH=0` | +2.5% | +2.5% | +1.8% | +2.0% |
+| MLA split-KV occupancy fill | `VT_MLA_SPLIT_FILL=0` | **+69.5%** | **+53.3%** | **+32.0%** | **+19.5%** |
+| both vs the W8 baseline | — | **+73.6%** | **+57.2%** | **+34.5%** | **+21.8%** |
+
+(output token throughput; W8 baseline was 19.11 / 33.49 / 52.33 / 84.02 tok/s.)
+
+The decode CUDA graph is a MUCH smaller lever here than its Qwen3-Coder analogue
+(which was worth the whole c1 deficit): DeepSeek-V2-Lite's decode step is
+GPU-bound, not host-bound, so there is only ~1.2 ms/step of launch tax to remove.
+
+### nsys kernel-list diff (the evidence that selected the lever)
+
+`nsys profile --cuda-graph-trace=node -t cuda`, both sides, 1024-in / 64-out,
+batch 1. Ours: `~/w9mla/logs/ours_c1.nsys-rep` (before),
+`ours_prod_c1.nsys-rep` (after). vLLM: `vllm_c1.nsys-rep`, captured through the
+**LLM API** (nsys breaks vLLM's server EngineCore).
+
+BEFORE, ours: `MlaDecodeStage1` was **44.7% of ALL GPU time at 837 us/instance**
+(27 layers x 837 us = ~22.6 ms of a ~47.7 ms TPOT). The KV latent a batch-1 step
+reads is ~1.25 MiB/layer, i.e. ~5 us at GB10's memory rate — the kernel was
+running about **two orders of magnitude off its own memory-bound floor**. Cause:
+`_compute_num_kv_splits` derives the split count from `max_seq_len` alone and
+returned **2**; MLA has one KV head so the head dimension collapses to a single
+tile; at batch 1 the grid was **2 CTAs on the whole GPU**.
+
+AFTER the occupancy fill: **837 us -> 45.8 us, an 18.3x kernel speedup**, and
+`MlaDecodeStage1` fell from 44.7% to **3.9%** of GPU time (`MlaDecodeStage2` rose
+1.7% -> 1.9% as there are now more partials to combine — net hugely positive).
+
+The residual, from the same diff:
+1. **MoE grouped GEMM is now our top kernel at 40.5%**
+   (`MoeGroupedGemmBf16NaiveSplitK`, 158 us median x 3 launches/layer). vLLM runs
+   ONE `fused_moe_kernel` family instead. Our per-step MoE time is ~1.2x its own
+   bandwidth floor, so this is close but not free.
+2. **Dense projections at batch 1 fall to cuBLAS `gemvx` (GEMV) for 31.8% of our
+   GPU time; vLLM splits the same work between `gemvx` (12.7%) and
+   tensor-core `nvjet_sm121_tst_mma_*` (6.6%).** This is the largest single
+   attributable difference and is the next lever.
+3. **vLLM runs Inductor-codegenned FUSED glue we do not have** —
+   `triton_red_fused_add_fused_add_rms_norm_1`,
+   `triton_red_fused_fused_add_rms_norm_moe_forward_shared_0`,
+   `triton_poi_fused_mul_silu_slice_0`, `triton_poi_fused_2` — roughly 7-8% of
+   its profile, replacing what for us are separate `RmsNorm` / `SiluAndMul` /
+   `MoeCombine` launches. Same theme the 35B campaign recorded.
+4. Our MLA decode attention is still ~2.3x vLLM's per call (ours 45.8 + 22.6 us
+   vs its `_fwd_grouped_kernel_stage1` at 29.6 us) — small in absolute terms now,
+   but real.
+
+**Next lever, by gain / effort: (2), routing the batch-1 dense projections to a
+tensor-core GEMM path instead of `gemvx`.** It is the biggest single line in the
+diff and it is a dispatch change, not a new kernel.
+
+### Repro recipe (reproduction is a gate)
+
+```
+# commit: see the W9 closing SHA in the ledger.  Box: dgx.casa (GB10, sm_121a), IDLE.
+# build:
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+  -DVLLM_CPP_TRITON=ON -DCMAKE_CUDA_ARCHITECTURES=121a
+cmake --build build -j 16
+# model:
+M=$HOME/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V2-Lite/snapshots/604d5664dddd88a0433dbae533b7fe9472482de0
+# vLLM denominator (FRESH server per concurrency; VERIFY 0.0% prefix-cache hit):
+~/w9mla/w9_vllm.sh                      # gmu 0.58, --moe-backend triton, 3 reps
+# ours, all three A/B arms:
+~/w9mla/w9_ab.sh                        # base / graph / prod, 3 reps
+# correctness (must stay 8/8 with the optimizations DEFAULT-ON):
+./build/tests/test_deepseek_v2_paged_engine
+```
+
 ## Current checkpoint
 
 | Track | Disposition | Current evidence | Next binding gate |
@@ -1417,6 +1586,11 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 - **MLA + DeepSeek/Kimi/MiniMax campaign — spike + W0-W8 (2026-07-22,
   `CLAIM-MLA-DEEPSEEK`,
   [spike](../.agents/specs/mla-deepseek-campaign.md)).**
+  **SUPERSEDED 2026-07-22 by W9** — the DeepSeek-V2-Lite track now HAS a binding
+  number; see "Binding DeepSeek-V2-Lite (MLA) every-axis grid — MLA campaign W9"
+  above. The W0-W8 disposition below is retained because it remains correct FOR
+  W0-W8 (they were correctness-only), and because the CUTLASS-MoE denominator
+  question it flagged is exactly what W9 had to settle.
   `benchmark_binding=false`; **NOT APPLICABLE.** W0 ran the vLLM oracle on
   DeepSeek-V2-Lite purely to OBSERVE backend selection and greedy self-consistency
   — no timing was taken and none may be quoted. W1 is a **behaviour-preserving

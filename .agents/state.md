@@ -18373,3 +18373,111 @@ current; they are superseded (the RSS 2.65–2.7× figure is NOT — it still ho
 Do not treat the x86 arm as binding until that box is exclusively idle. Do not
 claim any RSS win from the keep-quant loader until G4 puts it on an executed
 path.
+
+## 2026-07-22 — KV persistent state to disk + external KV providers (LMCache): SPIKE ONLY
+
+**Claim** `CLAIM-KV-PERSISTENCE-LMCACHE`. **Rows** `KV-OFFLOAD`,
+`KV-EXTERNAL-CACHE`, `KV-CONNECTORS`, all `INVENTORIED` -> `SPIKE`. Worktree
+`agent-a0a07f4da68dc4a66`, base `c603ebc`. **No code, no build, no GPU work,
+nothing downloaded, no benchmark number produced or implied.** Spec:
+[specs/kv-persistence-lmcache.md](specs/kv-persistence-lmcache.md).
+
+**What the user asked** — "let's do the KV persistent state to disk support, and
+LMCache support too", under the standing same-featureset-as-vLLM-and-better bar.
+
+**The answer, in one line each.** *Disk persistence* is a faithful MIRROR job and
+is tractable: vLLM's `fs` secondary tier is about 101 lines of `open`/`write`/
+`readv` (`vllm/v1/kv_offload/tiering/fs/io.py:32-101`) — one raw file per block,
+no container, no index, temp-file plus atomic rename under `O_DIRECT`, and
+self-healing by deleting any file that fails to read. There is nothing
+Python-specific in the byte path, so it ports near-verbatim. *LMCache* is a
+different kind of problem: vLLM vendors ~2396 lines of `lmcache_integration/`
+glue, which reads like a portable contract and is not one — every file imports
+the EXTERNAL PyPI package at module scope, and the storage engine, the
+paged-memory GPU connectors, the config schema, the ZMQ message queue and the
+CUDA-IPC handoff all live outside the vLLM tree
+(`lmcache_integration/vllm_v1_adapter.py:11-35`,
+`multi_process_adapter.py:11-18`). `lmcache >= 0.3.9` is an opt-in extras entry
+(`requirements/kv_connectors.txt:1`) that `setup.py`/`pyproject.toml` never
+reference, and it is installed nowhere on this project's boxes. There is no
+upstream test we could port that does not itself `import lmcache`. It is
+therefore scoped as a W6 go/no-go STUDY over a ported connector seam, never a
+from-scratch client.
+
+**BLOCKING FINDING, and it corrects a spike that landed hours earlier.** Our
+`NONE_HASH` is filled with 32 bytes from `std::random_device` whenever no seed is
+passed (`src/vllm/v1/core/kv_cache_utils.cpp:307-319`, random branch `:312-318`),
+and the sole production caller passes none
+(`src/vllm/entrypoints/model_loader.cpp:144`). Hashes chain from it, so EVERY
+block hash of every request differs across processes — a content-addressed disk
+tier would score 0% hits on restart.
+[specs/prefix-prompt-caching-parity.md](specs/prefix-prompt-caching-parity.md)
+section B2 claimed the opposite ("ours is deterministic by construction") and
+offered it as a beyond-parity win; its feature row 5 likewise recorded the seed
+as `DONE (and deterministic)`. Both are false, and the truth is the reverse of
+the claim: we are WORSE than vLLM here, because upstream at least exposes
+`PYTHONHASHSEED` as an escape hatch and warns when it is unset
+(`vllm/v1/core/kv_cache_utils.py:102-114`) while we expose neither. This is W1
+and it gates every row after it. The seam already accepts a seed, so the fix is
+cheap.
+
+**Two upstream weaknesses we deliberately do NOT copy.** (1) The `fs` tier writes
+`config.json` once and NEVER READS IT (`file_mapper.py:122-126`,
+`tiering/fs/manager.py:131-137`); its only identity check is a 12-hex path digest
+whose field set omits checkpoint content, WEIGHT quantization, rope/context
+config and `sliding_window`. Loading a block written under a different model or
+dtype produces plausible tokens that are simply wrong — no crash, no warning. Our
+design makes the identity block a VERIFIED header read on every open that
+REFUSES on mismatch, with one negative test per field; that is the safety
+property that makes the feature shippable, and it is where "better than vLLM" is
+a correctness claim rather than a speed claim. (2) The disk tier has no capacity
+accounting and no eviction at all — files accumulate until reclaimed externally,
+which on this 16 GiB dev box and a 95%-full dgx would present as unrelated bogus
+test failures.
+
+**Stale record corrected.** `KV-OFFLOAD`'s row named an `LRUOffloadingManager`
+that does not exist at this pin (LRU and ARC are pluggable `CachePolicy` objects
+behind one `CPUOffloadingManager`, `cpu/manager.py:30-33`) and its scope omitted
+the entire secondary-tier half — the filesystem tier the user actually asked
+about. `SharedStorageConnector` has been RENAMED to `ExampleConnector` and
+`P2pNcclConnector` has been DELETED at the pin; both names were stale. There is
+no `vllm/v1/offloading/` directory, and `vllm/config/offload.py` is model-WEIGHT
+offloading, unrelated to KV.
+
+**Interaction risks against our real cache shapes.** MLA stores ONE 576-wide
+latent per token with `num_kv_heads == 1` and no V, viewed rank-3
+(`src/vllm/model_executor/models/deepseek_v2.cpp:570-571`, asserted `:549-552`),
+while full attention is rank-4 with an interleaved K-then-V page carrying a
+factor of 2 in the block stride
+(`src/vllm/model_executor/models/qwen3_5.cpp:2408-2426`). Upstream independently
+confirms MLA is the exception by excluding it from `parallel_agnostic` folder
+sharing (`file_mapper.py:88-96`). Decision: the on-disk block is OPAQUE BYTES of
+exactly `page_size_bytes()`, with the spec kind and every shape parameter in the
+verified header — no layout interpretation at the IO layer. `SlidingWindowSpec`
+has no production construction site in our tree, so it is untested for
+persistence and its upstream cases are SKIP-marked to `KV-SLIDING-WINDOW-SPEC`.
+GDN/Mamba state is addressed by a remapped compact slot rather than a block id
+(`src/vllm/v1/worker/gpu/runner.cpp:602-653`), so recurrent state is a separate
+persistence problem, out of scope for W2-W5. Quantized KV cannot be persisted at
+all today — every spec throws when `kv_quant_mode != kNone`
+(`src/vllm/v1/kv_cache_interface.cpp:18-20`).
+
+**Next.** W1 deterministic block hashes (CPU, gates everything after it) -> W2
+CPU primary tier (upstream's disk tier is only reachable through it) -> W3 the
+disk tier with the verified identity header (CPU) -> W4 tiering manager plus the
+offload connector's scheduler half (CPU, then DGX) -> W5 the connector seam
+generalized for `KV-CONNECTORS` -> W6 the LMCache go/no-go -> W7 imperative named
+per-sequence save/restore, the one genuine beyond-parity item, sequenced last
+because it has no upstream oracle.
+
+**Prohibitions.** No offload benchmark may be run or quoted yet: this track
+INHERITS the caching spike's W1 blocker (no prefix-cache hit counters exist at
+any level, so no arm can prove a hit and every arm is void), and it adds its own
+(per-process-random hashes make a persisted tier score 0% on restart). Do not
+claim LMCache interop anywhere without also stating the two blockers we own —
+our `sha256_cbor` block hashes are not byte-compatible with vLLM's default
+`sha256`-over-pickle, and our hashes are not stable across processes. Do not port
+the connector plugin mechanism: vLLM's dynamic Python module-path import has no
+C++ equivalent worth having and is replaced by compile-time registration, a
+recorded deviation. Do not schedule layerwise `save_kv_layer` — it forces
+PIECEWISE cudagraphs and would forfeit our measured decode-graph win.

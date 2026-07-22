@@ -638,11 +638,30 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
   default, it exists only on the legacy V1 runner rather than the V2 runner we
   mirror, and on Blackwell the attention backend that implements it is never
   selected.
-- llama.cpp-style **persistent prompt caching to disk (slot save/restore) is not
-  supported**, by either us or vLLM, and is tracked as a possible
-  beyond-parity feature rather than a parity gap.
-- External KV-cache connectors, including LMCache interoperability, are
-  roadmap-only and are not implemented or benchmarked yet.
+- **Persisting the KV cache to disk is not supported yet**, and neither are
+  external KV-cache connectors or LMCache. Both were audited against pinned vLLM
+  on 2026-07-22 ([spike](.agents/specs/kv-persistence-lmcache.md)); the earlier
+  note here that vLLM also lacks disk persistence was **wrong** and is corrected:
+  vLLM has covered it since its `kv_offload` filesystem tier landed, storing one
+  raw file per KV block. That tier is a near-verbatim port for us and is
+  scheduled; what blocks it first is on our side — our block hashes are seeded
+  randomly per process, so a cache written to disk would find nothing on restart.
+  Fixing that is the first work item. Note also that a disk cache written by
+  vllm.cpp will not interoperate with a stock vLLM unless that vLLM is launched
+  with `--prefix-caching-hash-algo sha256_cbor`, because our block-hash algorithm
+  deviates from upstream's default by design.
+- **LMCache is an external Python package, not a vLLM component.** vLLM ships
+  only the adapter glue; the cache engine, wire protocol and transport all live
+  in the separate `lmcache` package. Interoperating from a pure-C++ engine is
+  therefore a research question rather than a port, and it is currently scoped as
+  a go/no-go study rather than planned work. No LMCache support is implemented or
+  benchmarked.
+- llama.cpp-style **imperative named session save/restore** — "save this
+  conversation's cache to a file, reload it later" — is supported by neither us
+  nor vLLM. It is the one caching capability llama.cpp genuinely has and vLLM
+  does not, and it is tracked as a beyond-parity feature rather than a parity
+  gap. If it is built, a restored cache will be refused rather than used when the
+  model, dtype, quantization or context configuration has changed.
 - Speculative decoding is not user-visible yet. MTP foundations exist, while
   MTP integration, DFlash, DSpark, TLI, n-gram, and EAGLE3 remain roadmap work.
 - Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and

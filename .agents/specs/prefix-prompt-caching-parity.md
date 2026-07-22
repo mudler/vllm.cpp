@@ -65,7 +65,7 @@ mirror.
 | 2 | Per-model default (`is_prefix_caching_supported`; hybrid + attention-free OFF) | `vllm/config/model.py:1805-1854` | same predicate over `ModelInfo` `model_loader.cpp:134-137` | **DONE** |
 | 3 | Tri-state `--[no-]enable-prefix-caching` | `vllm/engine/arg_utils.py:1158-1165,2470-2510` | `examples/server/main.cpp:158-163`, duplicate-rejecting | **DONE** |
 | 4 | `prefix_caching_hash_algo` — FOUR algos, default `sha256` | `vllm/config/cache.py:39,95`; `vllm/utils/hashing.py:26,43,70,76` | only `sha256_cbor`, hardwired `model_loader.cpp:145`; no CLI flag | **PARTIAL** — 3 of 4 absent, and our default deviates from upstream's |
-| 5 | `init_none_hash` / `NONE_HASH` chain seed | `vllm/v1/core/kv_cache_utils.py:99-114` (`os.urandom(32)` unless `PYTHONHASHSEED`) | `kv_cache_utils.cpp:305,307`; seeded once `model_loader.cpp:140-146` | **DONE** (and deterministic — see §Risks B2) |
+| 5 | `init_none_hash` / `NONE_HASH` chain seed | `vllm/v1/core/kv_cache_utils.py:99-114` (`os.urandom(32)` unless `PYTHONHASHSEED`) | `kv_cache_utils.cpp:305,307`; called UNSEEDED at `model_loader.cpp:140-146` | **PARTIAL — CORRECTED 2026-07-22.** This cell previously read "DONE (and deterministic)" and that was FALSE: the unseeded branch fills `NONE_HASH` from `std::random_device` (`kv_cache_utils.cpp:312-318`) and the only production caller passes no seed (`model_loader.cpp:144`), so block hashes differ across processes exactly as upstream's do — and we lack upstream's `PYTHONHASHSEED` escape hatch and its unset-warning. See [kv-persistence-lmcache.md](kv-persistence-lmcache.md) §Our baseline Correction 1 |
 | 6 | `hash_block_tokens` (parent-chained, falls back to `NONE_HASH` on falsy parent) | `vllm/v1/core/kv_cache_utils.py:577-604` | `kv_cache_utils.cpp:331` | **DONE** |
 | 7 | `hash_request_tokens` | **REMOVED at this pin** — superseded by the closure factory below | `kv_cache_utils.cpp:363` still ports it | **STALE** — we mirror a function upstream deleted (see §Risks R6) |
 | 8 | `get_request_block_hasher` closure factory — incremental, resumes at `len(block_hashes) * hash_block_size`, trailing partial block never hashed | `vllm/v1/core/kv_cache_utils.py:673-730,688,709-711` | `kv_cache_utils.cpp:392`; `request.cpp:57,66,72,127,134,139-143` | **DONE** |
@@ -518,16 +518,25 @@ justifies it, a TTFT/prefill A/B on the cache-on dense gate. Honest position:
 this is a candidate lever whose value is unknown until (b) is measured, and the
 portable-lever history on this project says most such levers measure neutral.
 
-**B2 — deterministic cross-process block hashes, with no environment footgun.**
-vLLM seeds `NONE_HASH` with `os.urandom(32)` unless `PYTHONHASHSEED` is set
-(`kv_cache_utils.py:99-114`), so its own documentation requires operators to set
-that variable on every instance or cross-process cache sharing silently produces
-zero hits (`docs/features/kv_offloading_usage.md:117-120`). Ours is deterministic
-by construction. *Measurement:* two independently launched processes over the
-same corpus emit byte-identical block-hash lists with zero configuration; and on
-a shared tier, an unconfigured vLLM pair scores 0% cross-process hit rate while
-ours scores the full shared prefix. This is a correctness/usability win reported
-as a hit-rate number, not a throughput claim.
+**B2 — deterministic cross-process block hashes, with no environment footgun.
+CORRECTED 2026-07-22: this was recorded as an existing advantage and it is
+actually a DEFICIT.** vLLM seeds `NONE_HASH` with `os.urandom(32)` unless
+`PYTHONHASHSEED` is set (`kv_cache_utils.py:99-114`), so its own documentation
+requires operators to set that variable on every instance or cross-process cache
+sharing silently produces zero hits
+(`docs/features/kv_offloading_usage.md:117-120`). The original claim here —
+"ours is deterministic by construction" — is **false**: we mirror the random
+branch (`kv_cache_utils.cpp:312-318`), our only production caller passes no seed
+(`model_loader.cpp:144`), and we expose neither the escape hatch nor the
+warning, so we are strictly WORSE than upstream on this axis. The seam already
+accepts a seed, so the fix is cheap; it is owned by
+[kv-persistence-lmcache.md](kv-persistence-lmcache.md) W1, where it is a hard
+blocker on any persisted cache. *Measurement (unchanged, now a target rather
+than a claim):* two independently launched processes over the same corpus emit
+byte-identical block-hash lists with zero configuration; on a shared tier, an
+unconfigured vLLM pair scores 0% cross-process hit rate while ours scores the
+full shared prefix. This is a correctness/usability win reported as a hit-rate
+number, not a throughput claim.
 
 **B3 — imperative named session save/restore: the one thing vLLM lacks.** Per
 §Upstream chain, vLLM has no caller-addressable per-sequence KV export;

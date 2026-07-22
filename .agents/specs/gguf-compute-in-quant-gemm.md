@@ -300,6 +300,60 @@ legitimately no longer take the composite path — the drop is that retarget, no
 lost coverage, and the six types' GEMM behaviour moved to the new file's
 independent-reference and NMSE cases.
 
+## G4 grounding — what the measurement says it is worth (2026-07-22)
+
+`CLAIM-BENCH-CPU-LLAMA-REMEASURE-1` re-measured the floor and profiled the
+engine. Full write-up:
+[CPU floor re-measurement](cpu-llamacpp-floor-remeasure-2026-07-22.md). Three
+results change how this row should be planned and judged.
+
+**1. G4 is not an increment — it is most of the gap.** An op-dispatch profile
+that accounted for 100.0 % of wall time found **`kMatmul` at 95.37 %** (748
+calls, 10.915 ms/call); attention, the GDN recurrence, norms, conv, sampling and
+all host glue are under 5 % combined. The CPU plan is a GEMM plan.
+
+**2. The tier-0 kernels this row already landed are 14–44× faster than the GEMM
+production runs.** Op-level harness at this model's shapes (aarch64, 20 threads,
+best of 3):
+
+| shape (M×N×K) | production `kMatmul` `[K,N]` bf16 | `kMatmulBT` `[N,K]` bf16 | tier-0 `kMatmulBTQuant` Q8_0 | ratio |
+|---|---|---|---|---|
+| decode qkv 1×3072×2048 | 11.79 GFLOP/s | 17.91 | **287.54** | 24.4× |
+| decode down 1×2048×6144 | 6.11 | 18.48 | **266.50** | 43.6× |
+| decode lm_head 1×248320×2048 | 14.66 | 24.68 | **211.43** | 14.4× |
+| prefill qkv 128×3072×2048 | 18.42 | 24.62 | **416.79** | 22.6× |
+| prefill gate_up 128×12288×2048 | 14.86 | 24.52 | **393.48** | 26.5× |
+
+x86 (indicative, contended box): production 6.1–12.6, Q8_0 tier-0 130–200, so
+13–20×.
+
+**3. Gate 4's tier-0 milestone is set far too low.** Projecting the table above
+onto this model (arithmetic on measured op throughput, NOT an end-to-end run):
+per-token decode GEMM 24 × (0.044+0.032+0.226+0.094) + 4.811 = **14.3 ms ⇒
+~70 t/s** cache-warm, bounded in practice by DRAM at llama.cpp's own **25.80
+t/s**; 128-token prefill GEMM 24 × (3.864+2.710+16.373+8.295) = **750 ms ⇒ ~171
+t/s** against llama.cpp pp128 **174.63**; peak RSS ≈ file + activations ≈
+**2.9–3.0 GiB** against llama.cpp's **2.798**. The stated tier-0 milestone
+(decode ≥ 0.25× tg32, prefill ≥ 0.1× pp128) should be cleared by a wide margin.
+**Measure G4 against PARITY, not against the milestone** — and re-scope **G7**
+afterwards, because tier-0 at M=128 is already within ~2 % of pp128 on GEMM
+alone, which is far less headroom than the repack tier was budgeted for.
+
+**Orientation is a G4 PREREQUISITE, newly identified.** The GGUF loader today
+dequantises to bf16 **and transposes** into `[K,N]`
+([qwen3_5_gguf_weights.cpp:192](../../src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp#L192)
+— "dequant to bf16 and transpose to Matmul-B [K, N]"), so the hot path runs
+`kMatmul`, whose inner loop strides by N down K. Measured, that orientation
+alone costs **1.3–3.0×**. GGUF's native layout is already `[N,K]` — exactly what
+`MatmulBTQuant` requires — so G4's first step is to stop doing extra load-time
+work to reach the slower kernel.
+
+**Inertness re-confirmed at `1cb5f64`** by three independent checks: no
+`MatmulBTQuant` reference under `src/vllm/`; `vt::MatmulBT`
+([ops.cpp:163](../../src/vt/ops.cpp#L163)) hard-requires `IsFloat(b.dtype)` with
+no block branch; and `VT_GGUF_KEEP_QUANT=1` **fails at load on both boxes** with
+`vt: matmul_bt: float inputs and f32/bf16 output required`.
+
 **Gates at G1:** clean CPU `-Werror` build (0 warnings); full CPU ctest
 **151/151**; gguf ctest 4/4. **DGX CONFIRMATION RUN (`dgx.casa`, `~/work/vllm.cpp-ciq-g1`, production flags `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_CUTLASS_DIR=/home/mudler/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON`, one `flock $HOME/gpu.lock` for the whole series):** clean CUDA `-Werror` build to 100%, **0 warnings**. Regression set ALL UNCHANGED — 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6** (strict 5/6, max gap 0 nats), Qwen3-dense **16/16** (strict 11/16, max gap 0.25 nats), OPT **6/6** (36 assertions), DeepSeek-V2-Lite **8/8** (223 assertions). `test_qwen36_gguf_engine` run STANDALONE (it OOMs co-scheduled) on the real APEX files: **28/28 assertions, 2/2 cases, 16/16 tokens each on Compact and Balanced** — the k-quant dequant path is byte-stable across the decoder move. Gates 1-5 of this spec are
 untouched: they need G2/G3 (op correctness) and the loader leaf (e2e/perf/RSS).

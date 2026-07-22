@@ -211,6 +211,40 @@ flock /tmp/vllm-cpp-cpu-bench.lock sh -c '
 '
 ```
 
+## W4 RESULT — reproduction TAKEN 2026-07-22, PARTIAL (`CLAIM-BENCH-CPU-LLAMA-REMEASURE-1`)
+
+The idle-host window finally happened, on **`dgx.casa` (GB10, aarch64, 20
+cores)** rather than the chronically co-tenanted x86 box: load average 0.01
+before the series, `nvidia-smi` reporting no compute apps, the whole series
+under one `flock $HOME/gpu.lock`. Same-binary A/B at `1cb5f64`, B4 recipe,
+`Qwen3.5-2B-UD-Q8_K_XL.gguf`. Full context:
+[CPU floor re-measurement](cpu-llamacpp-floor-remeasure-2026-07-22.md).
+
+| | 1 thread | 20 threads | speed-up | bar | verdict |
+|---|---|---|---|---|---|
+| Prefill (TTFT) | 306,623.09 ms (0.4175 t/s) | 24,594.52 ms (5.205 t/s) | **12.47×** | ≥ 10× | **PASS** |
+| Decode (TPOT) | 3,629.84 ms (0.2755 t/s) | 450.68 ms (2.219 t/s) | **8.05×** | ≥ 10× | **MISS** |
+| Peak RSS | 7,788,056 KB | 7,788,220 KB | **1.000×** | ≤ 1.05× | **PASS** |
+
+20-thread reproduction across 3 reps: TTFT spread **0.36 %**, TPOT **0.59 %**,
+peak RSS identical to 12 KB. The x86 arm gives a consistent 13.6× / 7.8× but is
+`VOID` for binding (co-tenant load).
+
+**The row stays `GATING` on the decode axis.** 8.05× against a 10× bar is a
+real miss, not a rounding one, and it is not noise. The most likely cause is
+this leaf's own recorded risk — the **per-op kick** at M=1 decode shapes, where
+the chunk grid is small and wake-up cost is a larger fraction of the op. The
+spec already names the fallback (`n_chunks == 1` → run inline); that is now a
+concrete, measured work item rather than a hypothetical.
+
+**What this row is NOT responsible for.** The threadpool is the entire reason
+the recorded CPU floor moved (decode 54–75× → 11.6×, prefill ≈1,480× → 33.5×
+against llama.cpp), and the current binary at 1 thread reproduces the original
+B4 numbers on B4's own box within 4.8 %/5.5 % — so W1–W3 are doing exactly what
+they claimed. The *remaining* 11.6×/33.5× gap is attributed to `kMatmul` being
+95.4 % of wall time at 6–18 GFLOP/s, which belongs to `QUANT-GGUF-CIQ-GEMM`
+**G4**, not here.
+
 Acceptance remains: both prefill and decode throughput at
 20 threads are at least 10x their same-binary 1-thread arms, peak RSS is no
 more than 1.05x, and outputs remain token-exact. In the same idle window,

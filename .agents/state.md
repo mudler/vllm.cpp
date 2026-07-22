@@ -18286,3 +18286,90 @@ python3 scripts/check-doc-checkpoint.py
 #   upstream vllm/v1/metrics/stats.py:115      <- PrefixCacheStats to port
 ```
 
+## 2026-07-22 — CPU vs llama.cpp floor RE-MEASURED; gap attributed to one op (`CLAIM-BENCH-CPU-LLAMA-REMEASURE-1`)
+
+**Measurement and attribution only — zero code changed.** Worktree
+`agent-ad202ba3182da19dd`, base `1cb5f64`. Full write-up:
+[.agents/specs/cpu-llamacpp-floor-remeasure-2026-07-22.md](specs/cpu-llamacpp-floor-remeasure-2026-07-22.md).
+
+**Direct answer to "are we better than llama.cpp anywhere": no — behind on
+every axis, better on none.** But two of the three ratios moved a long way, and
+the third did not move at all.
+
+| Axis | recorded (B4, 2026-07-10) | measured now (binding, aarch64) |
+|---|---|---|
+| Decode | 54–75× behind | **11.6×** |
+| Prefill | ≈1,480× behind | **33.5×** |
+| Peak RSS | 2.7× worse | **2.65× — UNMOVED** |
+
+**Binding host is dgx, not the dev box.** `dgx.casa` (GB10, aarch64, 20 cores)
+was genuinely idle (load 0.01, no GPU compute apps); the series ran under one
+`flock $HOME/gpu.lock` with ours transferred by `git archive`. Reps agree to
+0.36 % (TTFT) / 0.59 % (TPOT), peak RSS to 12 KB. **The x86 dev box is `VOID`
+for binding** — co-tenant load from other agents (a 19-hour `python3` watcher,
+a Go/postgres/`oci.test` suite, docker/k8s) gave llama.cpp ±11.8 % on pp128,
+±24 % on tg128, and a 1.9× outlier inside our own 3-rep series.
+
+**What moved is the threadpool, and W4's reproduction now exists.** Same-binary
+`VLLM_CPP_CPU_THREADS=1` vs `=20` on aarch64: prefill **12.47×**, decode
+**8.05×**, RSS **1.000×**. Against `QUANT-GGUF-CPU-THREADPOOL` W4's bar (both
+axes ≥ 10×, RSS ≤ 1.05×) **prefill and RSS pass, decode misses** — the row stays
+`GATING` on that axis. And B4 is *validated*, not refuted: the current binary at
+1 thread on B4's own box returns TTFT 586,745 ms / TPOT 6,170 ms against B4's
+559,724 / 5,848 (4.8 % / 5.5 %).
+
+**The whole CPU gap is one op.** `perf` is unusable here
+(`perf_event_paranoid=4`, no sudo, no gdb), so a temporary uncommitted hook in
+`vt::GetOp` was used and reverted before every binding run. It accounted for
+100.0 % of wall time: **`kMatmul` 95.37 %**, everything else (attention, GDN,
+norms, conv, sampling, host glue) under 5 % combined.
+
+**The landed-but-unrouted quant GEMM is already 14–44× faster than the op that
+is 95.4 % of the time** (aarch64, 20 threads, this model's shapes: production
+`kMatmul` 6.1–18.4 GFLOP/s vs tier-0 `kMatmulBTQuant` Q8_0 211–417 GFLOP/s).
+**Confirmed inert three ways:** no `MatmulBTQuant` reference under `src/vllm/`;
+`vt::MatmulBT` hard-requires `IsFloat(b.dtype)`; `VT_GGUF_KEEP_QUANT=1` fails at
+load on both boxes with `matmul_bt: float inputs and f32/bf16 output required`.
+
+**Two new findings not previously on the plan.** (1) The GGUF loader dequantises
+to bf16 *and transposes* out of GGUF's native `[N,K]` into `[K,N]`
+(`qwen3_5_gguf_weights.cpp:192`), which costs a further **1.3–3.0×** because
+`kMatmul` strides by N down the K loop — and `[N,K]` is exactly what
+`MatmulBTQuant` needs, so this is a G4 prerequisite, not a separate lever.
+(2) `MatmulOneChunk` (`cpu_ops.cpp:54-83`) calls `LoadF32`, which switches on
+`t.dtype` **inside the K loop**, giving 0.77–0.84 GFLOP/s single-thread — no
+SIMD at all on the elementwise path, where llama.cpp has `ggml_vec_dot_bf16`.
+
+**NEXT — do G4 and nothing before it.** Every dependency is already done
+(loader L2/L3, threadpool W1–W3, kernels G1–G3); the work is to stop the
+loader's dequant+transpose for GEMM weights, dispatch `MatmulF32`/`MatmulBf16`
+on `IsBlockQuant(w.dtype)`, regenerate the GGUF engine goldens against the
+llama.cpp oracle, and flip the keep-quant default. Projected from the measured
+op throughput (NOT an end-to-end run): decode at llama.cpp's DRAM-bound rate,
+prefill ~171 t/s against pp128 174.63, peak RSS ~2.9–3.0 GiB against 2.798 —
+i.e. **G4 should be measured against parity, not against its 0.25×/0.1×
+milestone**. G7 (repack) should be RE-SCOPED afterwards, since tier-0 at M=128
+is already within ~2 % of pp128 on GEMM alone.
+
+**Resume commands.**
+
+```sh
+# binding arm (dgx, idle, one flock for the whole series)
+R=$HOME/work/bench-cpu-llama; M=$R/models/Qwen3.5-2B-UD-Q8_K_XL.gguf
+LB=$R/llamacpp/build/bin      # llama.cpp 237ad9b96 Release GGML_CUDA=OFF GGML_NATIVE=ON
+flock $HOME/gpu.lock sh -c '
+  LD_LIBRARY_PATH=$LB $LB/llama-bench -m $M -p 512,128 -n 128,32 -t 20 -r 5 -ngl 0
+  for rep in 1 2 3; do
+    VLLM_CPP_CPU_THREADS=20 /usr/bin/time -v ./build-cpu/examples/vllm-bench --model $M \
+      --num-prompts 1 --input-len 128 --output-len 32 --concurrency 1 --seed 0 --temperature 0
+  done'
+# inertness check (expected to FAIL at load until G4)
+VT_GGUF_KEEP_QUANT=1 ./build-cpu/examples/vllm-bench --model "$M" \
+  --num-prompts 1 --input-len 8 --output-len 1 --concurrency 1 --seed 0 --temperature 0
+```
+
+**Prohibitions carried forward.** Do not quote the B4 54–75× / ≈1,480× ratios as
+current; they are superseded (the RSS 2.65–2.7× figure is NOT — it still holds).
+Do not treat the x86 arm as binding until that box is exclusively idle. Do not
+claim any RSS win from the keep-quant loader until G4 puts it on an executed
+path.

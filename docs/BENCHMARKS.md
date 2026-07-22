@@ -1948,49 +1948,106 @@ The complete contract is in the
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
 
-## GGUF compute-in-quant track — roots, tier-0 kernels and the keep-quant loader landed, `NOT APPLICABLE` for benchmarking (2026-07-22)
+## CPU vs llama.cpp — floor RE-MEASURED, `ACCEPTED` / binding (2026-07-22)
 
-`QUANT-GGUF-KEEPQ-LOADER` **L1+L2+L3** (bench-branch merge: dense-`qwen35` GGUF
-loader + F16/BF16 row dequant; then block residency, the total per-tensor
-routing policy and the `VT_CPU_REF` dequant-oracle switch — all **DEFAULT OFF**)
-and `QUANT-GGUF-CIQ-GEMM` **G1+G2+G3** are on main: the
-block `vt::DType` entries and the llama.cpp `type_traits_cpu` mirror, the Q8_0 /
-Q8_K activation quantizers, the six generic `vec_dot` (Q4_0, Q8_0, Q3_K, Q4_K,
-Q5_K, Q6_K), and `kMatmulBTQuant` wired onto them — the complete PORTABLE tier-0
-compute-in-quant GEMM.
+`BENCH-CPU-LLAMA` / `BACKEND-GATE-CPU-LLAMACPP`. Full measurement, attribution
+and ranked plan: [floor re-measurement](../.agents/specs/cpu-llamacpp-floor-remeasure-2026-07-22.md).
+This **SUPERSEDES** the B4 decision row's ratios
+([parity-ledger.md](../.agents/parity-ledger.md)), which predated the CPU
+threadpool.
 
-**Disposition: `NOT APPLICABLE` — no benchmark is owed or claimed at this
-checkpoint, and none was run.** The kernels exist and are correctness-gated at
-the OP level, but the op is still UNROUTED: no model forward calls
-`MatmulBTQuant` (verified by grep over `src/vllm/`), and although a GGUF weight
-CAN now stay in its native blocks (loader L2/L3), that path is DEFAULT OFF —
-nothing could consume a block-typed weight until G4 routes the call sites — so a
-production load still expands every weight to bf16 and no encoding computes in
-its native blocks end to end. There is therefore no speed or memory delta to measure — timing a kernel
-that nothing executes would be a number with no workload behind it. This is
-deliberately NOT a claim that the kernels are fast enough: their speed is simply
-not yet measurable on any real path, and the portable tier is expected to fall
-well short of the floor until the SIMD (G5/G6) and repack (G7) tiers land. `test_gguf_dequant` staying green is the
-evidence that the decoder move changed nothing, together with the dgx `test_qwen36_gguf_engine` standalone run against the real APEX files (28/28 assertions, 16/16 tokens on both Compact and Balanced) and the full unchanged model regression set on a clean `-Werror` CUDA build.
+**We are behind llama.cpp on every axis. We are better on none.**
 
-**The denominator is unchanged and still binding:** llama.cpp on the same file
-at the same pin (`237ad9b96`), from the B4 decision row **B4 provenance (2026-07-22):** the loader arm that made this floor reproducible landed on main as a SQUASH (`66233e6`), so the bench commit `7c91a42` is NOT an ancestor of main — the row's "cited-not-merged" flag resolves by CONTENT (tree hash verified byte-identical to the gated tree), not by ancestry.
-([parity-ledger.md](../.agents/parity-ledger.md)) — we are behind by decode
-**54-75x**, prefill **~1,480x**, and peak RSS **2.7x** (7.43 GiB vs 2.80 GiB on
-a 2.68 GiB file). Nothing in G1/G2/G3/L1/L2/L3 moves those numbers, because none of it is on an
-executed path yet. **In particular the peak-RSS figure is UNCHANGED and the
-keep-quant loader does not yet improve it:** residency is inert while the switch
-is off, so spec gate 3 (peak RSS <= file size + activations + 15%) belongs to
-work row **L4** and is `PENDING` until G4 turns the path on. Claiming an RSS win
-from code that no production load executes would be exactly the kind of number
-this document exists to refuse.
+| Axis | llama.cpp `237ad9b96` | ours `1cb5f64` | ratio | vs recorded B4 |
+|---|---|---|---|---|
+| Prefill (pp128) | 174.63 ± 1.75 t/s | 5.205 t/s | **33.5× behind** | was ≈1,480× — moved |
+| Decode (tg32) | 25.80 ± 1.03 t/s (isolated 25.16 ± 0.36) | 2.219 t/s | **11.6× behind** | was 54–75× — moved |
+| TPOT | 38.8 ms | 450.7 ms | 11.6× worse | — |
+| Peak RSS | 2,934,068 KB = **2.798 GiB** | 7,788,220 KB = **7.427 GiB** | **2.65× worse** | was 2.7× — **UNMOVED** |
 
-**Next benchmark checkpoint** is CIQ gate 4 tier-0 at work row **G4** — now the
-immediate next increment, and the first where a call site actually routes to the
-quantized GEMM (loader **L2-L3** are now landed, so it needs only threadpool
-**W2**) —
-on the B4 recipe: same box, same file, threadpool active, 20 threads, >=2 reproducing
-runs, idle host. Milestone there is decode >= 0.25x llama.cpp tg32 and prefill
->= 0.1x pp128; the row closes only when the repack tier (G7) matches or beats
-llama.cpp on decode t/s, prefill t/s AND peak RSS.
+**Binding arm = `dgx.casa` (GB10, aarch64, 20 cores), genuinely idle** (load
+average 0.01 before the series, `nvidia-smi` reporting no compute apps), whole
+series under one `flock $HOME/gpu.lock`. Model `Qwen3.5-2B-UD-Q8_K_XL.gguf`
+(`qwen35` dense, 1.94 B, 2.68 GiB; 103 `q8_0` + 56 `f16` + 176 `f32` tensors).
+Reproduction across 3 reps: TTFT 24,594.52 / 24,545.16 / 24,633.13 ms
+(**0.36 %** spread), TPOT 450.68 / 453.05 / 450.39 ms (**0.59 %**), peak RSS
+identical to 12 KB.
+
+**The x86 dev-box arm is `VOID` for binding** — persistent co-tenant load
+produced llama.cpp `pp128` ±11.8 % / `tg128` ±24 % and a 1.9× outlier inside our
+own 3-rep series. Recorded as indicative only (decode ~6.5×, prefill ~88×, peak
+RSS 2.65× — the RSS figure agrees with aarch64 exactly). Rerun when the box is
+exclusively idle.
+
+**The threadpool is what moved, and it is now measured.** Same-binary A/B,
+aarch64, `VLLM_CPP_CPU_THREADS=1` vs `=20`: prefill **12.47×**, decode
+**8.05×**, peak RSS **1.000×**. This is the reproduction
+`QUANT-GGUF-CPU-THREADPOOL` **W4** has owed since its 2026-07-10 contended-host
+abort: against its acceptance bar (both axes ≥ 10×, RSS ≤ 1.05×) **prefill and
+RSS PASS, decode MISSES at 8.05×**. Independent confirmation that this is the
+whole story: the *current* binary at 1 thread on the *same x86 box* B4 used
+returns TTFT 586,745.67 ms / TPOT 6,170.50 ms against B4's 559,724 / 5,848 —
+**4.8 % / 5.5 % agreement**, so B4 was sound and nothing but the threadpool has
+changed.
+
+**Attribution — the entire gap is ONE op.** `perf` is unavailable on the dev box
+(`perf_event_paranoid=4`, no sudo, no gdb), so a temporary uncommitted
+op-dispatch hook in `vt::GetOp` was used; it accounted for 100.0 % of wall time
+(8.560 s attributed against 8.56 s reported) and was reverted before the binding
+runs. **`kMatmul` = 95.37 %** (748 calls, 10.915 ms/call). Everything else —
+attention, the GDN recurrence, norms, conv, sampling, all host glue — is under
+5 % combined, the largest single entry being `kMoeSiluMul` at 0.99 %.
+
+**What the unrouted kernels are already worth.** Op-level microbenchmark at this
+model's shapes (aarch64, 20 threads, best of 3): the production `kMatmul` bf16
+path runs at **6.1–18.4 GFLOP/s**, while the landed-but-uncalled tier-0
+`kMatmulBTQuant` Q8_0 path runs at **211–417 GFLOP/s** — **14–44× (typically
+~24×) on the op that is 95.4 % of the time**. Separately, orientation alone
+costs 1.3–3.0×: the GGUF loader dequantises to bf16 *and transposes* into the
+slower `[K,N]` layout, though GGUF's native layout is already the `[N,K]` the
+quant GEMM wants.
+
+**Projection for G4** (arithmetic on those measured op numbers, explicitly NOT
+an end-to-end run): decode ≈ llama.cpp's own DRAM-bound rate, prefill ~171 t/s
+against pp128 174.63, peak RSS ≈ 2.9–3.0 GiB against 2.798. G4 therefore looks
+like most of the remaining gap, not an increment.
+
+### The quant machinery is CONFIRMED INERT
+
+Three independent checks on `1cb5f64`: `grep -rn MatmulBTQuant src/vllm/` finds
+nothing; `vt::MatmulBT` hard-requires `IsFloat(b.dtype)` with no block branch;
+and `VT_GGUF_KEEP_QUANT=1` **fails at load on both boxes** with
+`vt: matmul_bt: float inputs and f32/bf16 output required`. Peak RSS being
+byte-identical to B4's on both architectures and both thread counts is the same
+fact seen from the memory side. `QUANT-GGUF-KEEPQ-LOADER` gate 3 (peak RSS ≤
+file size + activations + 15 %) stays `PENDING` at work row **L4** until G4
+turns the path on.
+
+### Next benchmark checkpoint
+
+CIQ gate 4 tier-0 at work row **G4** — the first increment where a call site
+actually routes to the quantized GEMM (loader **L2–L3** and threadpool **W1–W3**
+are all landed, so nothing blocks it) — on this exact recipe: same file, idle
+host, 20 threads, ≥ 3 reproducing runs, `flock`-held. Its milestone (decode
+≥ 0.25× llama.cpp tg32, prefill ≥ 0.1× pp128) is now expected to be cleared by a
+wide margin on the evidence above, so **G4 should be measured against parity,
+not against the milestone**. The row closes only when the SIMD/repack tiers
+match or beat llama.cpp on decode t/s, prefill t/s AND peak RSS.
+
+**Repro (binding arm).**
+
+```sh
+R=$HOME/work/bench-cpu-llama; M=$R/models/Qwen3.5-2B-UD-Q8_K_XL.gguf
+LB=$R/llamacpp/build/bin       # llama.cpp 237ad9b96, Release, GGML_CUDA=OFF, GGML_NATIVE=ON
+# ours: 1cb5f64, Release, -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_SERVER=OFF
+flock $HOME/gpu.lock sh -c '
+  LD_LIBRARY_PATH='"$LB"' '"$LB"'/llama-bench -m '"$M"' -p 512,128 -n 128,32 -t 20 -r 5 -ngl 0
+  LD_LIBRARY_PATH='"$LB"' /usr/bin/time -v '"$LB"'/llama-bench -m '"$M"' -p 0 -n 32 -t 20 -r 3 -ngl 0
+  for rep in 1 2 3; do
+    VLLM_CPP_CPU_THREADS=20 /usr/bin/time -v ./build-cpu/examples/vllm-bench --model '"$M"' \
+      --num-prompts 1 --input-len 128 --output-len 32 --concurrency 1 --seed 0 --temperature 0
+  done
+  VLLM_CPP_CPU_THREADS=1 /usr/bin/time -v ./build-cpu/examples/vllm-bench --model '"$M"' \
+    --num-prompts 1 --input-len 128 --output-len 32 --concurrency 1 --seed 0 --temperature 0'
+```
 

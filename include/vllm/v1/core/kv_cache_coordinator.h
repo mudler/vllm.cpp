@@ -279,8 +279,12 @@ class HybridKVCacheCoordinator : public KVCacheCoordinator {
 
  private:
   void verify_and_split_kv_cache_groups();
-
-  int hash_block_size_h_;
+  // NOTE: this class deliberately holds NO `hash_block_size` member. It used to
+  // carry a private `hash_block_size_h_` copy that duplicated the protected
+  // `KVCacheCoordinator::hash_block_size_` it already inherits and that nothing
+  // ever read — Clang's -Wunused-private-field flagged it on macOS
+  // (BACKEND-METAL-MLX W0 item 2). Removed rather than suppressed; use the
+  // inherited `hash_block_size_` if this class ever needs the value.
 };
 
 // Select + construct the coordinator for a config. (Upstream

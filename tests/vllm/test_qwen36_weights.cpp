@@ -327,8 +327,11 @@ TEST_CASE("deferred routed-expert load: move-safe closure + bounded coexistence"
 
   vllm::Qwen3_5MoeWeights loaded;
   loaded.layers.resize(static_cast<size_t>(kLayers));  // deferred: experts empty
-  loaded.load_layer_experts = [kExperts](int64_t layer,
-                                         vllm::MoeBlockWeights& moe) {
+  // kExperts is a const int with a constant initializer, so the lambda may name
+  // it WITHOUT capturing it ([expr.prim.lambda.capture]/7 — no odr-use). The
+  // redundant explicit capture drew -Wunused-lambda-capture from Clang on macOS
+  // (BACKEND-METAL-MLX W0); dropped rather than suppressed, no behaviour change.
+  loaded.load_layer_experts = [](int64_t layer, vllm::MoeBlockWeights& moe) {
     FillFakeExperts(moe, kExperts, static_cast<int>(layer));
   };
 

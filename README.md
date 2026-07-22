@@ -185,10 +185,16 @@ same bar: token-exact vs vLLM (near-tie-robust where vLLM's own greedy is self-i
 vLLM-speed on every axis. Ranked queue + the CUDA-arch additivity audit:
 [`.agents/specs/breadth-sweep-plan.md`](.agents/specs/breadth-sweep-plan.md). Note: adding a new
 CUDA *arch* beyond the same-family sm_120 is HW-blocked (only GB10 sm_121 is testable here), so the
-actionable sweep is model breadth on GB10. **Metal and Vulkan are no longer merely "later": both are
-now spiked against hardware we actually own** (2026-07-22,
-[spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)) and form a parallel, actionable track —
-see Acceleration below. Intel XPU is spiked but hardware-blocked. The audit's four
+actionable sweep is model breadth on GB10. **The Metal track has started: a first skeleton of the
+Apple-GPU backend is built and checked in** (2026-07-22,
+[spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)) — the GPU is opened, GPU programs
+compile at run time, and eight operations plus the fusion catalogue agree with our CPU
+results. **No model runs on it and no speed is claimed**; matrix multiply, attention and the
+KV cache are still missing. The same work fixed a real defect that had silently disabled
+**every** self-registering component on macOS, including the CPU backend. Vulkan is spiked
+against verified hardware and is the next parallel track; Intel XPU is spiked but
+hardware-blocked. From now on the Apple backend must also match or beat **MLX** on the same
+model — see Acceleration below. The audit's four
 CUDA-arch seam-gaps are now CLOSED as mechanism (see Acceleration below,
 [spike](.agents/specs/cuda-arch-additivity.md)) — expansion is additive, but validation of any
 non-sm_121 target remains hardware-blocked.
@@ -267,18 +273,18 @@ next vehicle for this track.
 | Other NVIDIA SMs | sm70 through sm120 families inventoried from vLLM | 🗓 Not yet built, traced, or gated here. The **expansion framework is now additive** (2026-07-21, see below) — adding one is a table row + a tactic registration rather than a scattered multi-file edit — but no architecture has moved off `INVENTORIED`, because none can be executed on this hardware |
 | Intel XPU | Intel GPUs | 🔬 **SPIKED ONLY — and HW-BLOCKED** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). No Intel GPU exists on any machine here, and vLLM has no in-tree SYCL kernel source to copy (its XPU kernels ship as a separate package), so there is nothing to port loyally either. Only the backend-selection policy, compile coverage, and running SYCL kernels on a CPU device for unit checks remain possible. No end-to-end or speed gate is proposed, because none can be run |
 | ROCm / ANE | AMD GPUs / Apple Neural Engine | 🗓 Post-parity roadmap; not spiked |
-| Metal | Apple Silicon | 🔬 **SPIKED ONLY — no implementation, but the hardware is real and already runs our portable code** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). On the M4 host the project configures, builds and passes **108,952 assertions** — including the whole GGUF quantization tier — which is the third processor architecture to give identical results. One real defect was found and fixed in the process: on macOS the build silently discarded every self-registering component, so even the CPU backend failed to appear. Writing GPU shaders needs no extra tooling: they compile at run time, verified on-device. Cannot hold the 27B/35B gate models (16 GB), so no Apple result may be extrapolated to them |
+| Metal | Apple Silicon | 🟡 **SKELETON BUILT AND CHECKED — but no model runs on it yet, so this is NOT usable support** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). What exists: the Mac GPU is opened, memory is allocated on it, GPU programs are compiled at run time (no extra tooling needed, verified on-device), and eight small operations plus the whole fusion catalogue run there and agree with our CPU results to within the required tolerance — worst case eleven orders of magnitude better than the bar, with byte-for-byte agreement on the pure copy and number-format conversion paths. What does NOT exist: matrix multiply, attention, the KV cache, quantization and sampling are all absent, so **no model can run**, and no speed number is measured or claimed. One real defect was found and fixed along the way: on macOS the build silently discarded every self-registering component, so even the **CPU backend** failed to appear — that fix makes macOS a usable CPU target too. Cannot hold the 27B/35B gate models (16 GB), so no Apple result may ever be extrapolated to them. **MLX is now the named speed floor** for this backend: when a model does run here it must match or beat MLX on the same model and workload |
 | Vulkan | Portable GPU | 🔬 **SPIKED ONLY — no implementation, hardware verified** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). The GB10 box already exposes a working Vulkan device with both matrix-acceleration extensions the fast paths need, and the dev box exposes a software device so tests can run with no GPU at all. This is the one backend we can check against our own CUDA results on the same machine with the same weights |
 
 Only GB10/sm_121a counts as CUDA hardware support today. Source-level fallback
 paths do not become support claims until their build, correctness, trace, and
 performance gates pass.
 
-**Non-NVIDIA backends — spiked, not built (2026-07-22,
-[spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)).** Nothing here is
-implemented; what changed is that the plan is now grounded in measurements
-rather than assumptions, and two of the three targets turned out to be testable
-on hardware already in the house.
+**Non-NVIDIA backends — Metal now has a checked skeleton; Vulkan and Intel XPU remain spiked only (2026-07-22,
+[spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)).** The Apple backend
+has moved from plan to code: it is built, it runs, and its results are checked
+against our own CPU results. It is **not** usable support, and the section below
+is explicit about what is missing.
 
 The encouraging finding is how little of this project is actually
 NVIDIA-specific. The engine — scheduling, memory management, batching, the
@@ -289,18 +295,41 @@ platform descriptions; the existing CPU backend does that in 36 and 57 lines
 respectively. It then inherits argument validation, the whole fused-operation
 catalogue, and attention-backend selection for free. Slots for Metal, Vulkan and
 Intel were reserved in the core enumeration long ago, so none of this requires
-editing shared code.
+editing shared code. Building the Apple skeleton confirmed that in practice:
+turning it on adds files and changes no existing source file.
 
-That was tested, not assumed. The project was copied to the Apple M4 machine and
-built there: it compiles with three small fixes, one of which is a genuine latent
-bug (a base class deleted through a pointer without a virtual destructor — the
-Linux compiler never warned). It then passed 108,952 assertions on Apple
-silicon, including the entire GGUF quantization tier, which now gives identical
-results on three different processor architectures. A real defect surfaced too:
-on macOS the build was quietly throwing away every self-registering component,
-so the CPU backend did not even appear at runtime; a one-line build fix was
-written and confirmed to restore it. Apple GPU shaders were also shown to
-compile at run time and produce correct results without installing anything.
+**What was actually built for Apple.** The GPU is opened and memory allocated on
+it; GPU programs are compiled at run time from source embedded in the binary, so
+nothing extra has to be installed — which matters, because the Mac here has only
+Apple's command-line tools, not the full development suite that ships the offline
+shader compiler. Eight operations are implemented (addition including the
+bias form, ReLU, the gated activation, two number-format conversions, both
+normalisation kinds) plus a single entry point that gives the backend the entire
+fused-operation catalogue at once. Deliberately absent: matrix multiply,
+attention, the KV cache, quantization and sampling — **so no model runs on Apple
+yet**, work is submitted one command at a time rather than pipelined, and no
+speed figure is measured or claimed.
+
+**How it was checked.** Since vLLM cannot run on a Mac, the reference is our own
+CPU backend on the same machine, same binary, same inputs. Exact agreement is
+neither promised nor claimed for anything that sums across the GPU's parallel
+lanes, because our CPU results get their reproducibility from summing in a fixed
+order that no GPU preserves; the bar there is a relative-error measure, and the
+worst result came in about eleven orders of magnitude inside it. Where exactness
+*is* the right bar — plain copies, fills, and number-format conversion including
+the awkward cases (not-a-number, infinities, negative zero, and values sitting
+exactly on a rounding boundary) — the results match byte for byte. A new
+cross-device comparison harness was written for this and immediately paid for
+itself, catching two bugs in the new Apple code and one genuine difference
+between our CPU and NVIDIA number-format conversion.
+
+Two things were fixed that had nothing to do with Apple GPUs. On macOS the build
+was quietly throwing away every self-registering component, so even the **CPU
+backend** did not appear at runtime; that is now fixed, and macOS is a usable
+CPU target. And the Apple compiler flagged seven warnings the Linux compiler
+never had — **all seven were fixed rather than silenced**, including a genuine
+latent bug on every platform: a base class was being deleted through a pointer
+without a virtual destructor, so the derived class's cleanup never ran.
 
 Vulkan was checked the same way: the GB10 machine already exposes a full Vulkan
 device including both matrix-acceleration extensions the fast paths depend on,
@@ -316,7 +345,19 @@ against our own CUDA results on the same machine with the same weights, and
 Metal against our own CPU results on the Mac. Exact agreement is required where
 the operation is a plain data copy, but not for arithmetic that sums numbers in
 a different order on a GPU — there the existing numerical-accuracy threshold
-applies. Intel gets no end-to-end gate at all, because none is runnable.
+applies. Intel gets no end-to-end gate at all, because none is runnable. That
+standard is no longer hypothetical for Apple: it is what the skeleton above was
+measured against.
+
+**Speed on Apple will be judged against MLX** (Apple's own array framework),
+decided 2026-07-22. Whenever a model does run on the Apple backend, it must match
+or beat MLX running the *same* model on the *same* machine, on every axis we
+measure elsewhere — throughput, latency and peak memory — with correctness as a
+precondition that is never traded away. That is the same standard vLLM sets for
+our NVIDIA path. Note this is purely a *comparison* choice: the Apple backend is
+being written directly against Apple's GPU programming language, not built on
+MLX. It also fixes which model comes first — it has to be one MLX can run too, or
+the comparison is meaningless.
 
 **CUDA-arch expansion is now ADDITIVE — mechanism only, no new support
 (`BACKEND-CUDA-ARCH-ADDITIVITY`, LANDED + GATED 2026-07-21,

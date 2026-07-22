@@ -617,9 +617,12 @@ class TempTokenizerDir {
   std::filesystem::path dir_;
 };
 
-// kTinyJson's added token id 19 is "<|end|>" (special) — used here as a
-// stand-in BOS/EOS so the fixture needs no new vocab.
-constexpr int32_t kTinySpecialId = 19;
+// NOTE: there is deliberately no `kTinySpecialId` constant here. It named
+// kTinyJson's added token id 19 ("<|end|>") as a stand-in BOS/EOS, but no case
+// below ever referenced it — the tests that use that id spell it literally
+// (see the Encode/Decode cases above). Clang's -Wunused-const-variable flagged
+// it while building on macOS (BACKEND-METAL-MLX W0); dead code, so it was
+// deleted rather than suppressed.
 
 }  // namespace
 

@@ -185,6 +185,14 @@ target_include_directories(test_dropin_abi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_cuda_ops vt/test_cuda_ops.cpp)
 vllm_cpp_add_test(test_dtype vt/test_dtype.cpp)
 vllm_cpp_add_test(test_backend vt/test_backend.cpp)
+# CPU-vs-device op-equality harness (BACKEND-METAL-MLX W0). Unconditional: it
+# discovers which non-CPU backends this build registered and compares only those,
+# so it is meaningful on a CUDA box, on the Metal M4, and inert (CPU-only bit-
+# exactness checks) on a plain CPU build.
+vllm_cpp_add_test(test_backend_cross_device vt/test_backend_cross_device.cpp)
+if(VLLM_CPP_METAL)
+  vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)
+endif()
 vllm_cpp_add_test(test_tensor vt/test_tensor.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)

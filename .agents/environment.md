@@ -67,6 +67,70 @@
   32 KiB threadgroup memory, 11.84 GiB recommended max working set, ~30 GiB
   free disk. Our tree configures AND builds there under AppleClang 21 with
   three Clang-only `-Werror` fixes, and 108,952 portable-tier assertions pass.
+  **Updated 2026-07-22 (W0 landed):** the FULL tree (library + every test) now
+  builds `-Werror`-clean on the M4 with the Metal backend ON, and the fix count
+  is **seven**, not three — a full build surfaced four more than the spike's
+  lib-only probe (see the fan-out spec § Work breakdown "W0 landed"). Configure
+  with plain `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release`: `VLLM_CPP_METAL`
+  defaults to `AUTO` and turns itself ON for an Apple host with an ObjC++
+  compiler. Add `-DVLLM_CPP_METAL=OFF` for a CPU-only A/B.
+
+  **TWO PRE-EXISTING macOS TEST GAPS — expected failures, not regressions.**
+  Both fail identically with `-DVLLM_CPP_METAL=OFF`, i.e. they are unrelated to
+  Metal, and neither is fixed yet:
+  - `test_serve_low_tools` — the Python bench tooling calls Linux-only
+    `os.sched_getaffinity` (`tests/tools/test_gdn_packed_component.py`) and
+    `POSIX_FADV_DONTNEED` (`tools/bench/drop_file_cache.py`).
+  - `test_safetensors` — `MappingRssKb` reads `/proc/self/smaps`, which macOS
+    does not provide, so it returns 0 and the RSS assertions cannot hold.
+
+  `test_capi` and `test_openai_conformance` are ctest-PARALLELISM flakes on this
+  box (and on Linux); they pass on rerun. Prefer `ctest -j 3`.
+
+  **LOCALAI WORKER — must be DOWN for any timing/benchmark work on this box
+  (user-directed 2026-07-22).** It is a **root LaunchDaemon**, not a container
+  and not a user LaunchAgent:
+
+  | | |
+  |---|---|
+  | Unit | `system/com.localai.worker` |
+  | Plist | `/Library/LaunchDaemons/com.localai.worker.plist` (root:wheel) |
+  | Program | `/Users/mudler/local-ai/local-ai worker` (a NATS-driven worker) |
+  | Properties | `keepalive | runatload` — so `kill`ing the PID is NOT enough, launchd restarts it |
+  | Log | `/Users/mudler/local-ai/worker.log` |
+  | State observed 2026-07-22 | **running**, PID 327, RSS ~51 MB, up 1d06h, idle (log shows only periodic `NATS backend.list` events; no model loaded) |
+
+  ```sh
+  # inspect (works WITHOUT root)
+  launchctl print system/com.localai.worker
+  # stop  (NEEDS root; bootout, because KeepAlive would restart a killed process)
+  sudo launchctl bootout system/com.localai.worker
+  # restore to the observed state
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.localai.worker.plist
+  launchctl print system/com.localai.worker | grep state   # expect: running
+  ```
+
+  **NOT STOPPED during W0**, for two reasons, both recorded deliberately:
+  (1) stopping it needs an interactive `sudo` password and this box has no
+  passwordless sudo (`sudo -n true` -> "a password is required"), so an agent
+  cannot do it unattended; (2) W0 took **no timing measurement whatsoever** —
+  every gate is a functional/correctness assertion — so contention could not
+  affect any recorded result. **The next agent doing MLX-vs-ours benchmarking
+  MUST get the user to run the bootout above first; any Metal timing taken with
+  this daemon up is VOID.** Note also three `actions.runner.localai-org-*` GitHub
+  Actions runners as user LaunchAgents (PIDs 599/600/601) which can start CI jobs
+  on this box at any time — quiesce those too before a benchmark series
+  (`launchctl bootout gui/$UID/actions.runner.localai-org-<name>.<label>`).
+
+  **MLX is NOT installed** and was deliberately left uninstalled by W0 (the brew
+  formula pulls `python@3.14` into `/opt/homebrew/bin`, which is first on the
+  PATH our builds use, so it would perturb `find_package(Python3)` and the very
+  gates W0 was proving). Since 2026-07-22 MLX is the **named competitor floor**
+  for Metal (`BACKEND-GATE-METAL-MLXLM`), so it WILL be needed as a benchmark
+  arm. Prefer the venv route over brew, which avoids the PATH hazard entirely:
+  `python3 -m venv ~/mlx-venv && ~/mlx-venv/bin/pip install -U pip mlx-lm`
+  (system python is CLT 3.9.6, `venv` present, ~28 GiB free; `brew info mlx`
+  reports 0.32.0). Record the exact resolved version in the benchmark row.
 
 ## Benchmark models on dgx.casa
 
@@ -124,6 +188,13 @@ inner 4096, state 128; context 262144.
   `W0` — chiefly the `CMakeLists.txt:304-306` Apple `-force_load` fix, without
   which every static registrar is silently dropped on macOS and even the CPU
   backend fails to register. `brew install mlx` is deferred to work row `M5`.
+  **CLOSED 2026-07-22: `W0` LANDED** — the `-force_load` fix is in and
+  `test_backend` is 7/7 on the M4, so the M4 is fully usable for backend work.
+  **REOPENED in a different role:** MLX must now be installed on the M4 as the
+  **competitor BENCHMARK arm** (user directive; `BACKEND-GATE-METAL-MLXLM`),
+  which is independent of its demotion as an implementation path. Use the venv
+  route recorded in the M4 entry above, and stop the LocalAI worker daemon
+  first.
 - **Vulkan runtime is already usable and needs no acquisition.** dgx GB10
   enumerates as a real Vulkan `INTEGRATED_GPU` at API 1.4.312 (loader 1.4.328 +
   NVIDIA ICD) with `VK_KHR_cooperative_matrix` v2 and `VK_NV_cooperative_matrix2`;

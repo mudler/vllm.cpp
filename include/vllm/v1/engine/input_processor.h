@@ -62,8 +62,10 @@ namespace vllm::v1 {
 
 class InputProcessor {
  public:
-  // __init__ (T0 deps): the tokenizer + HfConfig the processor reads. Both must
-  // outlive the InputProcessor. Derives max_model_len + eos ids up front.
+  // __init__ (T0 deps): the tokenizer + HfConfig the processor reads. The
+  // TOKENIZER must outlive the InputProcessor; the HfConfig need not — it is
+  // fully consumed here (max_model_len + eos ids are derived up front and the
+  // config is not retained).
   InputProcessor(const tok::Tokenizer& tokenizer, const HfConfig& config);
 
   // process_inputs (text path): validate + tokenize + build the request.
@@ -88,7 +90,13 @@ class InputProcessor {
   void UpdateFromTokenizer(SamplingParams& params) const;
 
   const tok::Tokenizer& tokenizer_;
-  const HfConfig& config_;
+  // NOTE: no `const HfConfig&` member. The constructor consumes the HfConfig
+  // ENTIRELY at construction — max_model_len_, eos_token_id_ and
+  // generation_config_eos_ids_ below are everything this class needs from it —
+  // so the reference it used to hold was never read. Clang's
+  // -Wunused-private-field flagged it while building on macOS
+  // (BACKEND-METAL-MLX W0). Removed rather than suppressed, which also drops a
+  // lifetime obligation: the HfConfig no longer has to outlive the processor.
   // model_config.max_model_len (T0: HfConfig.max_position_embeddings).
   int64_t max_model_len_ = 0;
   // The primary eos id (renderer.get_eos_token_id()): the eos_ids list head, or

@@ -1,8 +1,19 @@
-# Non-CUDA backend fan-out — Metal/MLX, Vulkan, Intel XPU (SPIKE)
+# Non-CUDA backend fan-out — Metal/MLX, Vulkan, Intel XPU
 
-Status: **SPIKE ONLY — no implementation.** Owner: `CLAIM-BACKEND-FANOUT-1`.
-Rows: **`BACKEND-METAL-MLX`**, **`BACKEND-VULKAN`**, **`BACKEND-XPU`**
-(`INVENTORIED` -> `SPIKE`).
+Status: **W0 LANDED 2026-07-22** (shared seam repair + the Metal skeleton — see
+§ Work breakdown "W0 landed"). Vulkan and XPU remain **SPIKE ONLY**.
+Owner: `CLAIM-BACKEND-FANOUT-1`.
+Rows: **`BACKEND-METAL-MLX`** (`SPIKE` -> `ACTIVE`), **`BACKEND-VULKAN`**,
+**`BACKEND-XPU`** (both stay `SPIKE`).
+
+**`ACTIVE` here means a gated SKELETON, not a supported backend.** No model runs
+on Metal: GEMM, attention, KV cache, quant and sampling are all unregistered. Do
+not read the state as capability — read § Work breakdown "W0 landed" -> "still
+stubbed" for the exact surface, which `tests/vt/test_metal_backend.cpp` asserts.
+
+**MLX is the named COMPETITOR FLOOR for Metal** (user directive 2026-07-22) while
+remaining DEMOTED as an implementation path — see § Gates for why those are not
+in tension.
 Roadmap wiring: **`ROAD-V1-D1`** (NVIDIA target fan-out, ROCm, MLX, Vulkan, XPU, ANE)
 — this spike covers the **non-CUDA, non-ROCm** half. `BACKEND-ROCM` and
 `BACKEND-ANE` are NOT covered here and stay `INVENTORIED`.
@@ -312,6 +323,54 @@ Native floors when they are: llama.cpp Vulkan
 (`BACKEND-GATE-VULKAN-LLAMACPP`), llama.cpp Metal / MLX-LM / oMLX
 (`BACKEND-GATE-METAL-*`) — all still `INVENTORIED`.
 
+**MLX IS THE NAMED COMPETITOR FLOOR FOR METAL (USER DIRECTIVE, 2026-07-22):**
+*"We should do benchmark testing against MLX for the same model."* MLX therefore
+binds for `BACKEND-METAL-MLX` in exactly the sense AGENTS.md § Acceptance rule
+defines for vLLM on CUDA and SGLang/llama.cpp elsewhere: **same model, same
+workload, same box, and ours must match or beat it on EVERY axis** (total +
+output throughput, req/s, TTFT, TPOT/ITL, peak memory), with correctness as a
+precondition that is never traded off. The row is `BACKEND-GATE-METAL-MLXLM`.
+
+Note the two DISTINCT roles MLX now plays, which must not be conflated:
+- **as an IMPLEMENTATION path** — still DEMOTED to work row **M5**, per
+  § Risks/decisions 1. Bring-up stays native MSL (zero installs, no lazy-eval
+  impedance). This directive does not reverse that.
+- **as a BENCHMARK ARM** — NEW and binding, from the first Metal model onward.
+  This is why MLX does after all need to be installed on the M4, purely as the
+  reference arm.
+
+**Consequence for model selection, and it is a HARD constraint on M3:** the first
+Metal bring-up model must be one **MLX can also run**, or the arms are not
+comparable and the floor cannot be measured. This composes cleanly with
+§ Risks/decisions 3 ("OPT or Qwen3-dense first, NEVER Qwen3.5-Next") — MLX-LM
+ships Qwen3 dense support, so **Qwen3-dense is the pairing that satisfies both
+constraints** and is the recommended M3 target. Any MLX-vs-ours timing on the M4
+is VOID if the LocalAI worker daemon is up (see [environment.md](../environment.md)).
+
+**MLX availability on the M4, probed 2026-07-22 (read-only; NOT installed).**
+Deliberately not installed during W0: `brew install mlx` pulls **`python@3.14`**
+into `/opt/homebrew/bin`, which is FIRST on the PATH our macOS builds use, so
+`find_package(Python3)` would resolve differently and perturb the very gates W0
+was proving. Facts for the next agent:
+
+| Fact | Value |
+|---|---|
+| `brew info mlx` | `mlx 0.32.0` (bottled), **not installed**; sole dependency `python@3.14` |
+| System python | `/usr/bin/python3` = **3.9.6** (Command Line Tools); `pip 21.2.4`; `venv` module **present** |
+| MLX importable today? | **No** (`import mlx` -> ModuleNotFoundError) |
+| Disk free on the M4 | ~28 GiB |
+
+**Recommended install (venv route, avoids the brew python@3.14 PATH hazard
+entirely):**
+```sh
+ssh 192.168.68.103
+python3 -m venv ~/mlx-venv && ~/mlx-venv/bin/pip install -U pip mlx-lm
+~/mlx-venv/bin/python -c 'import mlx.core as mx; print(mx.__version__ if hasattr(mx,"__version__") else "ok", mx.default_device())'
+~/mlx-venv/bin/mlx_lm.generate --model <hf-repo> --prompt "..." --max-tokens 128
+```
+Verify the resolved `mlx` version against `brew info`'s 0.32.0 and RECORD the
+exact version in the benchmark row — an unpinned competitor arm is not a floor.
+
 ---
 
 ### Dependencies
@@ -366,9 +425,10 @@ immediately.
 
 | ID | Work | Rows | Blocked by | Deliverable |
 |---|---|---|---|---|
-| **W0** | Shared seam repair: 8 items in § Port map. Behavior-preserving on Linux/CUDA by construction | all three | — | macOS builds `-Werror`-clean and `test_backend` 7/7; Linux 27B/35B gates byte-identical |
-| **M1** | Metal `vt::Backend` (6 pure virtuals) + `Platform` + registrars; NO kernels | `BACKEND-METAL-MLX` | W0 | `test_backend`/`test_platform` pass for `kMETAL` on the M4 |
-| **M2** | Metal op tier 1: the ~20 elementwise/norm/rope/activation ops as runtime-compiled MSL; `kFusedChain` registration | `BACKEND-METAL-MLX` | M1 | op parity vs our CPU backend on the M4; all 10 fusion recipes inherited |
+| **W0** | Shared seam repair (items 1-4 of § Port map) + the Metal `vt::Backend`/`Platform` SKELETON. Behavior-preserving on Linux/CUDA by construction | all three | — | **LANDED 2026-07-22** — see § W0 landed below |
+| **W0b** | The DEFERRED half of § Port map: items 5 (guard the 4 `vt/cuda/` includes + the public `dense_nvfp4_gemm.h:66`), 6 (`model_loader.cpp:39` hardcoded `kCUDA` queue), 7 (lift `QuantTypeTraits` out of `vt::cpu`), 8 (`vt::arch_tactics`) | all three | W0 | not yet needed: those four items block a MODEL on a non-CUDA backend, and W0 ships no model. Do them with M3/V4 |
+| **M1** | Metal `vt::Backend` (6 pure virtuals) + `Platform` + registrars; NO kernels | `BACKEND-METAL-MLX` | W0 | **SUBSUMED INTO W0** (landed) |
+| **M2** | Metal op tier 1: the ~20 elementwise/norm/rope/activation ops as runtime-compiled MSL; `kFusedChain` registration | `BACKEND-METAL-MLX` | M1 | **PARTIAL** — W0 landed 8 of them (`kAdd`, `kRelu`, `kSiluAndMul`, `kCastBf16`, `kCastF32`, `kLayerNorm`, `kRmsNorm`, `kFusedChain`) with the fusion catalog inherited; the remaining ~12 (rope/gated/l2norm/moe-glue) are M2's residue |
 | **M3** | Metal GEMM + paged attention (`kMatmul`, `kMatmulBT`, `kPagedAttention`, `kReshapeAndCache`) | `BACKEND-METAL-MLX` | M2 | first small model (OPT or Qwen3-dense) token-exact vs our CPU reference |
 | **M4** | Metal GGUF k-quant shaders (reusing the W0-lifted traits) | `BACKEND-METAL-MLX`, `QUANT-GGUF-CIQ-GEMM` | M3, G4 | NMSE <= 5e-4 vs the f64 oracle |
 | **M5** | MLX (E1) evaluation as an ALTERNATIVE kernel source, measured against M2/M3 | `BACKEND-METAL-MLX` | M3 | a decision record, not necessarily an adoption |
@@ -378,6 +438,134 @@ immediately.
 | **V4** | Vulkan paged attention (port `flash_attn.comp` family) | `BACKEND-VULKAN` | V3 | small model token-exact vs our CUDA backend |
 | **X1** | XPU `Platform` + attention-selector policy port (`xpu.py:121-167`) — **DATA ONLY, no kernels** | `BACKEND-XPU` | W0 | selector unit tests pass with **no Intel hardware** |
 | **X2** | SYCL op skeleton + oneAPI CPU-device execution for unit gating | `BACKEND-XPU` | X1 | compile coverage + unit numerics; **e2e stays HW-BLOCKED** |
+
+#### W0 landed — 2026-07-22 (`CLAIM-BACKEND-FANOUT-1`)
+
+**Delivered.** The three enabling fixes plus the Metal skeleton, gated on all
+three boxes. `BACKEND-METAL-MLX` moves `SPIKE` -> `ACTIVE`; it is emphatically
+**NOT** a supported backend (no model runs on it — see "still stubbed").
+
+*Enabling fix 1 — the macOS registrar bug (`CMakeLists.txt`).* `if(UNIX AND NOT
+APPLE)` is TRUE on Linux and FALSE on macOS, so ld64 dropped every static
+registrar. Now `if(APPLE) -force_load elseif(UNIX) --whole-archive`. `test_backend`
+on the M4: **5/7 FAIL -> 7/7 PASS, 18/18 assertions.** This unblocks
+**`BACKEND-CPU` on macOS**, not just Metal. CORRECTION to the spike's § Port map
+item 1: the other two `UNIX AND NOT APPLE` guards it named (`CMakeLists.txt`
+`vllm_shared` version-script and the matching `tests/CMakeLists.txt`
+`capi_shared_exports_only_abi` gate) are **CORRECT as written** — a linker
+version script is a GNU-ld/ELF feature with no ld64 spelling. They were annotated,
+not changed.
+
+*Enabling fix 2 — the Clang-only diagnostics. Every one was FIXED, none
+suppressed.* The spike predicted three; a full build (it had only built the lib +
+`test_backend`) surfaced **seven**:
+
+| # | Diagnostic | Site | Disposition |
+|---|---|---|---|
+| 1 | `-Wdelete-non-abstract-non-virtual-dtor` | `sched/scheduler.h` | **REAL UB on every platform, fixed:** `AsyncScheduler` is owned through `unique_ptr<Scheduler>` (`model_loader.h:206`, `model_loader.cpp:176`, `test_async_admission_timing.cpp:167-170`); deleting it through a base with a non-virtual dtor is UB ([expr.delete]/3). Added `virtual ~Scheduler() = default`. Behaviourally inert TODAY only because `AsyncScheduler` adds no members (its dtor is trivial) — the latent trap is removed |
+| 2 | `-Wunused-private-field` | `kv_cache_coordinator.h:283` | dead `hash_block_size_h_` DUPLICATED the inherited protected `hash_block_size_`; member + initializer removed |
+| 3 | `-Wpotentially-evaluated-expression` | `chunked_local_attention.cpp:92` | `typeid(*shared_ptr)` — the dynamic type IS wanted; bound the dereference to a named reference so the operand is a plain glvalue, not an `operator*` call. Same dynamic type, still evaluated |
+| 4 | `-Wunused-private-field` | `v1/engine/input_processor.h:91` | **NOT predicted by the spike.** Dead `const HfConfig& config_`; the ctor consumes the config entirely. Removal also drops a lifetime obligation |
+| 5 | `-Wunused-lambda-capture` x2 | `test_qwen36_weights.cpp:330`, `test_ops_gdn.cpp:3131` | **NOT predicted.** const-integral captures that are not odr-used; captures dropped |
+| 6 | `-Wunused-const-variable` | `test_bpe.cpp:622` | **NOT predicted.** Genuinely dead `kTinySpecialId`; deleted |
+| 7 | `mkdtemp` not declared | `test_nvfp4_persistent_cache.cpp` | **NOT predicted.** POSIX/Apple put it in `<unistd.h>`, glibc in `<stdlib.h>`; include added |
+
+`cmake/CompilerWarnings.cmake` additionally gained an `OBJCXX` arm: `.mm` is a
+separate `COMPILE_LANGUAGE` from `CXX`, so without it the Metal TUs would have
+been the only unwarned code in the tree.
+
+*Enabling fix 3 — the Metal skeleton.* All ADDITIVE (`VLLM_CPP_METAL` tri-state,
+AUTO-on for an Apple host with an ObjC++ compiler; no existing source file
+changed to enable it):
+
+| File | What |
+|---|---|
+| `src/vt/metal/metal_context.{h,mm}` | singleton `MTLDevice` + `MTLCommandQueue`; **runtime MSL compilation via `newLibraryWithSource:`** with `MTLMathModeSafe` (NOT Metal's default fast-math — reassociation and an approximate rsqrt would void the CPU comparison); pipeline cache; capability probe |
+| `src/vt/metal/metal_msl.h` | the embedded MSL. Per-element math ported 1:1 from OUR CPU kernels (cited per kernel); dispatch shape from llama.cpp `ggml-metal` (`kernel_add` flat, `kernel_rms_norm` threadgroup-per-row) |
+| `src/vt/metal/metal_backend.mm` | the 6 pure `vt::Backend` virtuals + registrar + the allocation registry that resolves an INTERIOR `vt::Tensor::data` pointer to (MTLBuffer, offset) — llama.cpp's `ggml_metal_get_buffer` problem, since `Tensor::Slice`/`View` hand out interior pointers but Metal binds resources |
+| `src/vt/metal/metal_ops.mm` | encode/dispatch + `RegisterOp` for 8 ops |
+| `src/vllm/platforms/metal.cpp` | the 5 pure `Platform` virtuals + registrar. Plain C++: everything Apple-specific goes through the `vt::Backend` virtuals |
+
+*Ops registered:* `kAdd` (incl. the rank-1 bias broadcast), `kRelu`,
+`kSiluAndMul`, `kCastBf16`, `kCastF32`, `kLayerNorm`, `kRmsNorm` (incl. the
+in-place residual stream), and **one `kFusedChain`** — the Tier-1 interpreter, so
+the backend inherits the whole portable fusion catalog; non-Tier-1 recipes come
+free through the device-agnostic Tier-0 composite. That set was chosen to span
+every STRUCTURAL class the seam must get right (flat elementwise, broadcast,
+dtype-converting copy, two different row reductions, an in-place read-write
+operand, the recipe interpreter) rather than to maximize op count.
+
+*Still stubbed — no model runs on Metal.* `kMatmul`/`kMatmulBT`,
+`kPagedAttention`, `kReshapeAndCache`, `kEmbedding`, the entire quant tier and all
+sampler ops are UNREGISTERED (`vt::GetOp` throws — a partial backend is a
+supported state, `src/vt/ops.cpp:104-111`), asserted as an executable fact in
+`tests/vt/test_metal_backend.cpp`. `SupportsGraphCapture()` is FALSE
+(`MTLIndirectCommandBuffer` not implemented). Dispatch is SYNCHRONOUS (one
+command buffer per op, commit + wait) — correct, not fast. `MetalPlatform::
+get_attn_backend_priority()` returns EMPTY deliberately: with no Metal attention
+kernel, naming a backend would make selection hand back something whose kernels
+do not exist.
+
+*Harness built (the § Gates "harness gap", now closed).*
+`tests/vt/test_backend_cross_device.cpp` — CPU-oracle op equality against EVERY
+registered non-CPU backend, so it serves Metal today and CUDA/Vulkan/XPU
+unchanged. Bit-exact tier for `Copy`/`Memset`/the bf16<->f32 codec; NMSE <= 5e-4
+tier for everything arithmetic.
+
+*Measured on the M4 (Apple M4, macOS 26.5.2, AppleClang 21, brew cmake 4.1.0).*
+Clean `-Werror` build of the WHOLE tree (lib + all tests), Metal ON. Op NMSE vs
+the CPU oracle, over widths {128, 100, 17} (power-of-two, ragged, sub-simd):
+
+| Op | NMSE vs CPU | Bar |
+|---|---|---|
+| `kAdd`, `kAdd` (bias broadcast), `kRelu` | **0** (exact) | 5e-4 |
+| `kSiluAndMul` | 2.50e-15 | 5e-4 |
+| `kRmsNorm` | 5.30e-15 .. 1.90e-14 | 5e-4 |
+| `kRmsNorm` residual stream (written operand) | **0** (exact) | 5e-4 |
+| `kLayerNorm` | 3.86e-15 .. 9.95e-15 | 5e-4 |
+| `kFusedChain` (`kFusedAddRmsNorm`, Tier-0 AND Tier-1) | 9.05e-15 | 5e-4 |
+| `Copy`/`Memset`; bf16<->f32 codec incl. NaN/inf/+-0/ties | **bit-exact** (`memcmp`) | bit-exact |
+
+Worst case is **1.9e-14 — eleven orders of magnitude inside the 5e-4 bar.** No
+bit-exactness is claimed for the reducing ops; it is claimed, and MEASURED by
+`memcmp`, only for the pure byte and codec paths.
+
+**Three defects found and fixed in the skeleton before landing.** One was found
+by REVIEW rather than by the tests, and is worth naming because the tests were
+green over it: `vt_tg_sum` (the threadgroup tree reduction) had no LEADING
+barrier, so a kernel calling it twice — `vt_layer_norm` does, for mean then
+variance, and `vt_fused_chain` can, one per `kRmsNorm` step — raced: a thread
+running ahead into the second call could overwrite `smem[0]` while a slower
+thread was still reading the first call's result. It passed because small
+threadgroups execute close to lockstep; it would bite at larger widths. The other
+two came from the new harness: (a) Metal aborts the process if a command encoder is released
+without `endEncoding`, so a throwing bind turned a catchable `vt::` error into
+SIGABRT — the encoder now closes on the unwind path; (b) the first cast test was
+written as f32->f32, which `vt::CastF32` rejects (it is specifically the bf16
+widen) — rewritten as the real bf16<->f32 round trip, which is a STRONGER gate
+(bit-exact, with tie/NaN coverage) than the one it replaced.
+
+*Test-suite adjustments.* `test_backend.cpp` and `test_platform.cpp` asserted
+"kMETAL is unregistered" as their stand-in for a reserved-but-unimplemented slot.
+A Metal build now genuinely registers it, so both switched to **kXPU** — which is
+HW-BLOCKED with no implementation, so the property keeps a live subject on BOTH
+platforms instead of being compiled away on macOS. `vt::OpRegistered` was moved
+out of `ops.cpp`'s anonymous namespace and DECLARED in `vt/ops.h` so the harness
+can enumerate a partial backend's coverage without exceptions as control flow.
+
+*Gate results.* **Linux/dev box:** clean CPU `-Werror` 0 warnings; full CPU ctest
+**155/155** (154 pre-existing + the new cross-device harness). **M4:** clean
+`-Werror` 0 warnings; `test_backend` **7/7 (18/18)**; `test_metal_backend`
+**6/6 (59/59)**; `test_backend_cross_device` **5/5 (65/65)**; full ctest 153/155.
+The two persistent macOS failures are **PRE-EXISTING platform gaps, PROVEN
+unrelated to Metal by a `-DVLLM_CPP_METAL=OFF` A/B on the same tree (they fail
+identically there)**: `test_serve_low_tools` (the Python bench tooling calls
+Linux-only `os.sched_getaffinity` and `POSIX_FADV_DONTNEED`) and
+`test_safetensors` (`MappingRssKb` reads `/proc/self/smaps`, absent on macOS, so
+it returns 0 and the RSS assertions cannot hold). Both are recorded as debt, NOT
+fixed here — they are portability of the benchmark/RSS tooling, orthogonal to W0.
+`test_capi`/`test_openai_conformance` flaked under ctest parallelism on both
+Linux and macOS and pass on rerun. **dgx:** see the ledger row.
 
 ---
 

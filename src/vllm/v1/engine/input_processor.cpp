@@ -22,7 +22,7 @@ double NowSeconds() {
 
 InputProcessor::InputProcessor(const tok::Tokenizer& tokenizer,
                                const HfConfig& config)
-    : tokenizer_(tokenizer), config_(config) {
+    : tokenizer_(tokenizer) {
   // model_config.max_model_len. HfConfig has no dedicated max_model_len (rope
   // scaling etc. are deferred), so max_position_embeddings stands in at T0.
   max_model_len_ = config.max_position_embeddings;

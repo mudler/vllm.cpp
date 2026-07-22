@@ -335,8 +335,7 @@ HybridKVCacheCoordinator::HybridKVCacheCoordinator(
     : KVCacheCoordinator(std::move(kv_cache_config), max_model_len,
                          max_num_batched_tokens, use_eagle, enable_caching,
                          enable_kv_cache_events, dcp_world_size, pcp_world_size,
-                         scheduler_block_size, hash_block_size),
-      hash_block_size_h_(hash_block_size) {
+                         scheduler_block_size, hash_block_size) {
   for (const auto& g : this->kv_cache_config.kv_cache_groups) {
     assert(g.kv_cache_spec->block_size % hash_block_size == 0 &&
            "block_size must be divisible by hash_block_size");

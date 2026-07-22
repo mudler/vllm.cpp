@@ -34,6 +34,11 @@ if(VLLM_CPP_SERVER AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/httpl
   set(VLLM_CPP_SERVER OFF)
 endif()
 set(VLLM_CPP_CUDA "AUTO" CACHE STRING "Build the CUDA backend: ON, OFF, or AUTO (detect)")
+# Tri-state exactly like VLLM_CPP_CUDA above (BACKEND-METAL-MLX W0). AUTO means
+# "on when the host is Apple and OBJCXX is usable" — i.e. it turns itself on for
+# a macOS developer and is invisible everywhere else. Resolved to a plain ON/OFF
+# a few lines below the CUDA resolution.
+set(VLLM_CPP_METAL "AUTO" CACHE STRING "Build the Metal backend: ON, OFF, or AUTO (detect)")
 set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_121)")
 option(VLLM_CPP_BENCH_PROFILE_CONTROL
   "Compile trace-only SIGUSR2/cudaProfiler replay control plus FIFO graceful shutdown (never for production timing builds)"
@@ -61,6 +66,46 @@ elseif(VLLM_CPP_CUDA)
 else()
   set(VLLM_CPP_CUDA OFF)
 endif()
+
+# Resolve the tri-state VLLM_CPP_METAL the same way (BACKEND-METAL-MLX W0). The
+# Metal backend is ObjC++ against the Metal/Foundation frameworks, so it needs
+# APPLE plus a working OBJCXX compiler; on any other host AUTO resolves OFF and
+# nothing about the build changes.
+if(VLLM_CPP_METAL STREQUAL "AUTO")
+  if(APPLE)
+    check_language(OBJCXX)
+    if(CMAKE_OBJCXX_COMPILER)
+      message(STATUS "Apple host with an ObjC++ compiler; enabling Metal backend")
+      set(VLLM_CPP_METAL ON)
+    else()
+      set(VLLM_CPP_METAL OFF)
+    endif()
+  else()
+    set(VLLM_CPP_METAL OFF)
+  endif()
+elseif(VLLM_CPP_METAL)
+  if(NOT APPLE)
+    message(FATAL_ERROR "VLLM_CPP_METAL=ON but this is not an Apple host. "
+      "Configure with -DVLLM_CPP_METAL=OFF (or AUTO).")
+  endif()
+  check_language(OBJCXX)
+  if(NOT CMAKE_OBJCXX_COMPILER)
+    message(FATAL_ERROR "VLLM_CPP_METAL=ON but no ObjC++ compiler was found. "
+      "Install the Xcode Command Line Tools, or configure with -DVLLM_CPP_METAL=OFF.")
+  endif()
+  set(VLLM_CPP_METAL ON)
+else()
+  set(VLLM_CPP_METAL OFF)
+endif()
+if(VLLM_CPP_METAL)
+  enable_language(OBJCXX)
+  set(CMAKE_OBJCXX_STANDARD 20)
+  set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+  # Same IEEE-as-written pin the CXX sources get (see the -ffp-contract note at
+  # the top of this file): the Metal HOST code shares the vt:: numeric contracts.
+  add_compile_options($<$<COMPILE_LANGUAGE:OBJCXX>:-ffp-contract=off>)
+endif()
+
 if(VLLM_CPP_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 20)
@@ -298,10 +343,21 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_paged_attn.cpp
   src/vt/cpu/cpu_sample.cpp)
 add_library(vllm::vllm ALIAS vllm)
-# Static-init registrars (e.g. the CPU backend) live in archive members no
-# consumer references directly; force-link the whole vllm archive so every
-# consumer (tests, C API shared lib, benchmarks) gets backend registration.
-if(UNIX AND NOT APPLE)
+# Static-init registrars (e.g. the CPU backend, the platform table, the op
+# table, the attention backends) live in archive members no consumer references
+# directly; force-link the whole vllm archive so every consumer (tests, C API
+# shared lib, benchmarks) gets registration.
+#
+# BACKEND-METAL-MLX W0 item 1: this was `if(UNIX AND NOT APPLE)`, which is TRUE
+# on Linux and FALSE on macOS (Apple is UNIX), so on macOS the force-link was
+# silently skipped and EVERY static registrar was dropped by ld64 — measured as
+# `test_backend` failing 5/7 with `vt: no backend registered for device type 0`
+# (.agents/specs/backend-fanout-metal-vulkan-xpu.md § Our baseline). ld64 has no
+# `--whole-archive`; the equivalent is `-force_load <archive>`. This unblocks the
+# CPU backend on macOS as well as any future Metal backend.
+if(APPLE)
+  target_link_options(vllm INTERFACE "LINKER:-force_load,$<TARGET_FILE:vllm>")
+elseif(UNIX)
   target_link_options(vllm INTERFACE "LINKER:--whole-archive,$<TARGET_FILE:vllm>,--no-whole-archive")
 endif()
 target_include_directories(vllm
@@ -311,6 +367,22 @@ target_include_directories(vllm
 target_include_directories(vllm PRIVATE src)
 target_include_directories(vllm SYSTEM PUBLIC third_party)
 vllm_cpp_set_warnings(vllm)
+# --- Metal backend (BACKEND-METAL-MLX W0 skeleton) --------------------------
+# Purely ADDITIVE, exactly like the CUDA block below: a `target_sources` list, a
+# PUBLIC compile definition tests can gate on, and two framework links. No
+# existing source file, and no line of the CPU/CUDA build, is touched by turning
+# it on. The MSL is compiled at RUN TIME from an embedded string
+# (src/vt/metal/metal_msl.h), so there is NO offline shader-compilation step and
+# no dependency on a `metal` compiler this build could fail to find.
+if(VLLM_CPP_METAL)
+  target_compile_definitions(vllm PUBLIC VLLM_CPP_METAL)
+  target_sources(vllm PRIVATE
+    src/vllm/platforms/metal.cpp
+    src/vt/metal/metal_context.mm
+    src/vt/metal/metal_backend.mm
+    src/vt/metal/metal_ops.mm)
+  target_link_libraries(vllm PUBLIC "-framework Metal" "-framework Foundation")
+endif()
 if(VLLM_CPP_CUDA)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_CUDA)
   if(VLLM_CPP_BENCH_PROFILE_CONTROL)
@@ -735,6 +807,11 @@ target_include_directories(vllm_shared PUBLIC
 # static registrar) and inherit its PUBLIC deps (CUDA::cudart, Threads, ...).
 target_link_libraries(vllm_shared PRIVATE vllm)
 # Export only the C ABI: `vllm_*` stays global, everything else is localized.
+# UNLIKE the force-link guard above, `UNIX AND NOT APPLE` is CORRECT here: a
+# linker version script is a GNU-ld/ELF feature with no ld64 spelling (ld64 uses
+# -exported_symbols_list). The macOS dylib therefore exports its default symbol
+# set; tests/CMakeLists.txt gates the matching `capi_shared_exports_only_abi`
+# check on the same condition for the same reason.
 if(UNIX AND NOT APPLE)
   target_link_options(vllm_shared PRIVATE
     "LINKER:--version-script,${CMAKE_CURRENT_SOURCE_DIR}/cmake/vllm_export.map")

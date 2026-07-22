@@ -603,6 +603,12 @@ using DropinProbeFn = void (*)(Queue&, Tensor&, const Tensor&, const DropinProbe
 
 void RegisterOp(OpId op, DeviceType device, void* fn);
 void* GetOp(OpId op, DeviceType device);
+// Non-throwing probe: is `op` realized on `device`? Already the mechanism behind
+// the fused-recipe fast-realization fallback (src/vt/ops.cpp) — DECLARED here so
+// the cross-device test harness can ask which ops a PARTIAL backend implements
+// without using exceptions as control flow. A partial backend is a supported,
+// tested state; GetOp throwing is how that is enforced at a call site.
+bool OpRegistered(OpId op, DeviceType device);
 
 template <typename Fn>
 void RegisterTypedOp(OpId op, DeviceType device, Fn fn) {

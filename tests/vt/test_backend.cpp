@@ -34,8 +34,21 @@ TEST_CASE("CPU backend is registered and allocates usable memory") {
   cpu.Free(p);
 }
 
+// A DeviceType slot with no backend behind it must throw rather than hand back a
+// null/garbage backend. kMETAL was the stand-in for "reserved but unimplemented"
+// — but a VLLM_CPP_METAL build on a Metal-capable host now genuinely registers
+// it, so the case picks a slot that is still empty there. kXPU is the right
+// stand-in: it is HW-BLOCKED with no local target and no implementation
+// (.agents/specs/backend-fanout-metal-vulkan-xpu.md § Scope), so the property
+// under test — reserved-but-unregistered throws — keeps a live subject on both
+// platforms rather than being compiled away on macOS.
 TEST_CASE("unregistered backend throws") {
+#ifdef VLLM_CPP_METAL
+  CHECK_THROWS_AS(vt::GetBackend(DeviceType::kXPU), std::runtime_error);
+#else
   CHECK_THROWS_AS(vt::GetBackend(DeviceType::kMETAL), std::runtime_error);
+  CHECK_THROWS_AS(vt::GetBackend(DeviceType::kXPU), std::runtime_error);
+#endif
 }
 
 TEST_CASE("graph capture unsupported on CPU throws loud") {

@@ -82,9 +82,21 @@ TEST_CASE("CurrentPlatform resolves accelerator-first, else falls back to CPU") 
   CHECK(GetPlatform(DeviceType::kCPU).is_cpu());
 }
 
+// A reserved DeviceType with no platform behind it must throw, never hand back a
+// null/garbage Platform. kMETAL was the stand-in for "reserved but
+// unimplemented" — but a VLLM_CPP_METAL build on a Metal-capable host now
+// genuinely registers it, so the case uses a slot that is still empty there.
+// kXPU is the right stand-in: it is HW-BLOCKED with no local target and no
+// implementation (.agents/specs/backend-fanout-metal-vulkan-xpu.md § Scope), so
+// the property under test keeps a live subject on BOTH platforms instead of
+// being compiled away on macOS. Mirrors tests/vt/test_backend.cpp.
 TEST_CASE("unregistered platform throws / HasPlatform reports false") {
+#ifndef VLLM_CPP_METAL
   CHECK_FALSE(HasPlatform(DeviceType::kMETAL));
   CHECK_THROWS_AS(GetPlatform(DeviceType::kMETAL), std::runtime_error);
+#endif
+  CHECK_FALSE(HasPlatform(DeviceType::kXPU));
+  CHECK_THROWS_AS(GetPlatform(DeviceType::kXPU), std::runtime_error);
 }
 
 TEST_CASE("DeviceCapability comparison is lexicographic on (major, minor)") {

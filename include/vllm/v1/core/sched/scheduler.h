@@ -100,6 +100,22 @@ class Scheduler {
             int block_size, bool enable_caching = false,
             StructuredOutputManager* structured_output_manager = nullptr);
 
+  // VIRTUAL destructor — REQUIRED, not cosmetic. `AsyncScheduler` derives from
+  // this class and production/test code owns the derived object through a
+  // `std::unique_ptr<Scheduler>` base pointer (src/vllm/entrypoints/
+  // model_loader.cpp:176 `MakeScheduler`, include/vllm/entrypoints/
+  // model_loader.h:206 `scheduler_`, tests/vllm/v1/
+  // test_async_admission_timing.cpp:167-170). Deleting a derived object through
+  // a base pointer whose destructor is non-virtual is UNDEFINED BEHAVIOUR
+  // ([expr.delete]/3) — the derived destructor never runs. GCC does not
+  // diagnose it; Clang's -Wdelete-non-abstract-non-virtual-dtor caught it while
+  // building on macOS (BACKEND-METAL-MLX W0 item 4). This is a latent
+  // correctness fix on EVERY platform, not a macOS accommodation, so it is
+  // FIXED rather than suppressed. Declaring it also suppresses the implicit
+  // move operations, which is harmless here: `Scheduler` owns a
+  // `unique_ptr<KVCacheManager>` and was already documented non-movable.
+  virtual ~Scheduler() = default;
+
   // add_request: enqueue a new request into waiting_ and register it in the
   // requests_ map (the scheduler takes ownership). (Upstream add_request T0
   // branch — no streaming/resumable/connector.)

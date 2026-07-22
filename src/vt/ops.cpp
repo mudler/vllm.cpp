@@ -110,6 +110,18 @@ void* GetOp(OpId op, DeviceType device) {
   return fn;
 }
 
+// Non-throwing probe: is `op` realized on `device`? (GetOp throws; the fast-
+// realization dispatch must degrade GRACEFULLY to the composite when a backend
+// lacks the bespoke fused kernel, so it probes the table directly.) Moved out of
+// this file's anonymous namespace and DECLARED in vt/ops.h (BACKEND-METAL-MLX
+// W0) so the cross-device test harness can enumerate a partial backend's op
+// coverage without using exceptions as control flow. Behaviour is unchanged.
+bool OpRegistered(OpId op, DeviceType device) {
+  VT_CHECK(static_cast<size_t>(op) < static_cast<size_t>(OpId::kCount), "invalid op id");
+  VT_CHECK(static_cast<size_t>(device) < kNumDeviceTypes, "invalid device type");
+  return Table()[static_cast<size_t>(op)][static_cast<size_t>(device)] != nullptr;
+}
+
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2, "matmul: rank-2 tensors required");
   VT_CHECK(a.shape[1] == b.shape[0], "matmul: inner dims mismatch");
@@ -883,13 +895,6 @@ void FusedChainCompositeImpl(Queue& q, const FusedRecipe& r, const FusedBinding&
     }
   }
   VT_CHECK(!add_pending, "fused_chain composite: residual-add without a following rmsnorm");
-}
-
-// Non-throwing probe: is `op` realized on `device`? (GetOp throws; the fast-
-// realization dispatch must degrade GRACEFULLY to the composite when a backend
-// lacks the bespoke fused kernel, so it probes the table directly.)
-bool OpRegistered(OpId op, DeviceType device) {
-  return Table()[static_cast<size_t>(op)][static_cast<size_t>(device)] != nullptr;
 }
 
 // FAST realization (W2): dispatch a recipe bound to a bespoke single-launch fused

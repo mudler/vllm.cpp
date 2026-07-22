@@ -3128,7 +3128,10 @@ TEST_CASE("CUDA gdn decode: bf16 state cache drift vs f32 (real dims, chained st
     // makes the rank-1 delta updates blow up, which is not the real workload).
     auto qf = RandomF32(static_cast<size_t>(t * hk * dk), 7100u + s, -1.0f, 1.0f);
     auto kf = RandomF32(static_cast<size_t>(t * hk * dk), 7200u + s, -1.0f, 1.0f);
-    auto l2norm_rows = [dk](std::vector<float>& x) {
+    // `dk` is a const integral with a constant initializer, so naming it inside
+    // the lambda is not an odr-use and no capture is needed — Clang's
+    // -Wunused-lambda-capture on macOS (BACKEND-METAL-MLX W0). No behaviour change.
+    auto l2norm_rows = [](std::vector<float>& x) {
       for (size_t r = 0; r + static_cast<size_t>(dk) <= x.size(); r += static_cast<size_t>(dk)) {
         float ss = 0.0f;
         for (int64_t c = 0; c < dk; ++c) ss += x[r + c] * x[r + c];

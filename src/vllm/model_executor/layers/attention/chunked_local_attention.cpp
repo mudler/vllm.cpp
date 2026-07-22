@@ -89,7 +89,17 @@ CreateChunkedLocalAttentionBackend(
   if (attention_chunk_size <= 0) {
     throw std::invalid_argument("attention chunk size must be positive");
   }
-  const BackendCacheKey key{std::type_index(typeid(*underlying_backend)),
+  // The DYNAMIC type of the underlying backend is deliberately part of the cache
+  // key, so this typeid IS meant to be evaluated at run time. Binding the
+  // dereference to a named reference first makes the typeid operand a plain
+  // glvalue instead of a `shared_ptr::operator*` call expression — Clang's
+  // -Wpotentially-evaluated-expression fires on the latter ("expression with
+  // side effects will be evaluated despite being used as an operand to
+  // 'typeid'"), which on macOS is a -Werror build break (BACKEND-METAL-MLX W0
+  // item 3). Behaviour is unchanged: same polymorphic operand, same dynamic
+  // type, still evaluated.
+  const v1::AttentionBackend& underlying_ref = *underlying_backend;
+  const BackendCacheKey key{std::type_index(typeid(underlying_ref)),
                             attention_chunk_size};
   std::lock_guard<std::mutex> lock(backend_cache_mutex());
   auto& cache = backend_cache();

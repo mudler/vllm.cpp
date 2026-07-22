@@ -4,6 +4,11 @@
 // module; its source lifecycle plus the immutable GB10 cache are the spec.
 #include <doctest/doctest.h>
 
+// mkdtemp: declared in <stdlib.h> by glibc but in <unistd.h> by POSIX and by
+// Apple's libc, so a macOS build fails to find it without this
+// (BACKEND-METAL-MLX W0). Harmless on Linux.
+#include <unistd.h>
+
 #include <array>
 #include <atomic>
 #include <cstdlib>

@@ -17338,3 +17338,271 @@ build in `~/vllmcpp-probe` (source-only, deletable); Vulkan via
 `ssh dgx.casa 'flock -w 60 $HOME/gpu.lock -c /tmp/vkprobe'` and `/tmp/vkext`.
 `python3 scripts/check-agent-record.py` and
 `python3 scripts/check-doc-checkpoint.py` must both be green.
+
+---
+
+## 2026-07-22 — Metal backend bring-up **W0 LANDED**: enabling fixes + the `vt::Backend`/`Platform` skeleton (`CLAIM-BACKEND-FANOUT-1`)
+
+Worktree `agent-a030355a8517870f9`, base `fe53176`. Implements work row **W0** of
+[backend-fanout-metal-vulkan-xpu.md](specs/backend-fanout-metal-vulkan-xpu.md).
+`BACKEND-METAL-MLX` moves `SPIKE` -> `ACTIVE`; `BACKEND-VULKAN` and `BACKEND-XPU`
+are untouched and stay `SPIKE`.
+
+**`ACTIVE` means a GATED SKELETON, not a supported backend.** No model runs on
+Metal. GEMM, attention, KV cache, the whole quant tier and every sampler op are
+UNREGISTERED, and `tests/vt/test_metal_backend.cpp` asserts that as an executable
+fact so a later row cannot quietly claim more than it implements.
+
+### 1. The macOS registrar bug — it blocked the CPU backend too
+
+`CMakeLists.txt` gated the static-registrar force-link behind `if(UNIX AND NOT
+APPLE)`. Apple IS Unix, so that is TRUE on Linux and FALSE on macOS: ld64 dropped
+every static registrar (backend, platform, op table, attention backends) and
+`test_backend` failed 5/7 with `vt: no backend registered for device type 0`.
+Fixed to `if(APPLE) LINKER:-force_load elseif(UNIX) LINKER:--whole-archive`
+(ld64 has no `--whole-archive`). **`test_backend`: 5/7 FAIL -> 7/7 PASS, 18/18
+assertions on the M4.**
+
+This is recorded against `BACKEND-CPU` as well as Metal: the CPU backend was
+silently broken on macOS, and macOS is now a usable CPU-tier target.
+
+**Correction to the spike's port map item 1.** It said the same guard needed
+fixing at two more sites. It does not: those two (`vllm_shared`'s
+`--version-script` and the matching `capi_shared_exports_only_abi` test) are
+CORRECT as written — a linker version script is a GNU-ld/ELF feature with no ld64
+spelling. Annotated in place, not changed.
+
+### 2. Seven Clang-only `-Werror` diagnostics — every one FIXED, none suppressed
+
+The spike predicted three; it had built only the library plus one test. A full
+build (library + every test) surfaced **seven**. The brief allowed narrowly-scoped
+suppression as a fallback; none was needed.
+
+| Diagnostic | Site | Disposition |
+|---|---|---|
+| `-Wdelete-non-abstract-non-virtual-dtor` | `sched/scheduler.h` | **REAL UB on EVERY platform.** `AsyncScheduler` is owned through `unique_ptr<Scheduler>` (`model_loader.h:206`, `model_loader.cpp:176`, `test_async_admission_timing.cpp:167-170`); deleting it through a base with a non-virtual dtor is UB ([expr.delete]/3) and the derived dtor never ran. GCC never warned. Added `virtual ~Scheduler() = default`. Inert TODAY only because `AsyncScheduler` adds no members (trivial dtor) — the trap is what mattered |
+| `-Wunused-private-field` | `kv_cache_coordinator.h:283` | dead `hash_block_size_h_` duplicating the inherited protected `hash_block_size_`; removed |
+| `-Wpotentially-evaluated-expression` | `chunked_local_attention.cpp:92` | `typeid(*shared_ptr)`; the dynamic type IS wanted, so bound the dereference to a named reference — operand becomes a glvalue instead of an `operator*` call. Same type, still evaluated |
+| `-Wunused-private-field` | `v1/engine/input_processor.h:91` | **not predicted.** Dead `const HfConfig&`; the ctor consumes the config entirely. Removal also drops a lifetime obligation |
+| `-Wunused-lambda-capture` x2 | `test_qwen36_weights.cpp:330`, `test_ops_gdn.cpp:3131` | **not predicted.** const-integral captures that are not odr-used |
+| `-Wunused-const-variable` | `test_bpe.cpp:622` | **not predicted.** Genuinely dead |
+| `mkdtemp` undeclared | `test_nvfp4_persistent_cache.cpp` | **not predicted.** POSIX/Apple `<unistd.h>` vs glibc `<stdlib.h>` |
+
+`cmake/CompilerWarnings.cmake` also gained an `OBJCXX` arm: `.mm` is a separate
+`COMPILE_LANGUAGE` from `CXX`, so without it the new Metal TUs would have been the
+only unwarned code in the tree.
+
+### 3. The Metal skeleton
+
+Entirely ADDITIVE behind a tri-state `VLLM_CPP_METAL` (AUTO-on for an Apple host
+with an ObjC++ compiler). **No existing source file was changed to enable it.**
+
+- `src/vt/metal/metal_context.{h,mm}` — singleton `MTLDevice` + `MTLCommandQueue`;
+  **MSL compiled AT RUNTIME via `newLibraryWithSource:`**, which is not a
+  convenience but a requirement (the CLT-only M4 has no offline `metal`
+  compiler); `MTLMathModeSafe` pinned so Metal's default fast-math cannot
+  reassociate or substitute an approximate rsqrt and quietly void the CPU
+  comparison; pipeline cache; capability probe.
+- `src/vt/metal/metal_msl.h` — the embedded MSL. Per-kernel math transcribed 1:1
+  from our own CPU kernels with `file:line` cited per kernel; dispatch shape from
+  llama.cpp `ggml-metal` @ `237ad9b96`.
+- `src/vt/metal/metal_backend.mm` — the 6 pure `vt::Backend` virtuals, plus an
+  allocation registry mapping a raw pointer back to (MTLBuffer, offset). That
+  registry is the non-obvious part: `vt::Tensor::Slice`/`View` hand out INTERIOR
+  pointers while Metal binds RESOURCES, which is the same problem llama.cpp
+  solves with `ggml_metal_get_buffer`.
+- `src/vt/metal/metal_ops.mm` — encode/dispatch + `RegisterOp`.
+- `src/vllm/platforms/metal.cpp` — the 5 pure `Platform` virtuals. Deliberately
+  plain C++: everything Apple-specific goes through `vt::Backend` virtuals, so
+  the engine-side platform tree stays free of Metal headers.
+
+**Registered (8):** `kAdd` (incl. the rank-1 `nn.Linear` bias broadcast),
+`kRelu`, `kSiluAndMul`, `kCastBf16`, `kCastF32`, `kLayerNorm`, `kRmsNorm` (incl.
+the in-place residual stream), and **one `kFusedChain`** Tier-1 interpreter which
+inherits the whole portable fusion catalog. That set was chosen to span every
+STRUCTURAL class the seam must get right — flat elementwise, a broadcast, a
+dtype-converting copy, two different row reductions, an in-place read-write
+operand, and the recipe interpreter — rather than to maximise op count.
+
+**Deliberately still stubbed:** `kMatmul`/`kMatmulBT`, `kPagedAttention`,
+`kReshapeAndCache`, `kEmbedding`, quant, sampling. `SupportsGraphCapture()` is
+FALSE (`MTLIndirectCommandBuffer` unimplemented). Dispatch is SYNCHRONOUS (one
+command buffer per op, commit + wait) — correct, not fast.
+`get_attn_backend_priority()` returns EMPTY on purpose: with no Metal attention
+kernel, naming a backend would make selection hand back one whose kernels do not
+exist, so an empty list makes it fail loudly instead.
+
+### 4. The cross-device harness — the spike's named gap, now closed
+
+NEW `tests/vt/test_backend_cross_device.cpp`: CPU-oracle op equality against
+EVERY registered non-CPU backend, so one file serves Metal today and
+CUDA/Vulkan/XPU with no edit. Bit-exact tier for `Copy`/`Memset` and the
+bf16<->f32 codec; NMSE <= 5e-4 tier for everything arithmetic.
+
+**It immediately caught three real defects**, which is the argument for building
+it rather than hand-checking:
+1. Metal aborts the process if a command encoder is released without
+   `endEncoding` — a throwing bind turned a catchable `vt::` error into SIGABRT.
+   The encoder now closes on the unwind path.
+2. The first cast case was written f32->f32, which `vt::CastF32` correctly
+   rejects (it is specifically the bf16 widen). Replaced with the real
+   bf16<->f32 round trip — a STRONGER gate than the one it replaced.
+3. **A genuine CPU-vs-CUDA difference on dgx:** `__float2bfloat16` emits NaN
+   payload `0x7FFF` where our CPU codec emits `0x7FC0`. Diagnosed rather than
+   assumed (a standalone bit-dump narrowed it to exactly one element): every
+   finite value, +-0, +-inf and all 16 exact rounding ties are BIT-IDENTICAL, so
+   this is an architectural NaN-payload difference — IEEE-754 does not specify
+   payload propagation across a narrowing conversion — not a rounding defect.
+   Carved out narrowly, with quiet-NaN-ness still asserted and the rounding gate
+   left fully strict. Metal, whose MSL codec transcribes `vt::F32ToBF16`
+   including its NaN branch, is bit-exact even here; only CUDA differs.
+
+`vt::OpRegistered` was moved out of `ops.cpp`'s anonymous namespace and declared
+in `vt/ops.h` so the harness can enumerate a partial backend's coverage without
+exceptions as control flow.
+
+`test_backend.cpp` and `test_platform.cpp` used "kMETAL is unregistered" as their
+stand-in for a reserved-but-unimplemented slot; a Metal build now genuinely
+registers it, so both switched to **kXPU**, which is HW-BLOCKED with no
+implementation — keeping the property under test alive on BOTH platforms rather
+than compiling it away on macOS.
+
+### 5. Gate results
+
+- **Linux/dev box:** clean CPU `-Werror` **0 warnings**; full CPU ctest
+  **155/155** (154 pre-existing + the new harness). Three server/engine tests
+  flaked at `-j8` and pass at `-j4`/on rerun.
+- **M4** (Apple M4, 16 GB, macOS 26.5.2, AppleClang 21, brew cmake 4.1.0): clean
+  `-Werror` **0 warnings** on the WHOLE tree with Metal ON; `test_backend`
+  **7/7 (18/18)**; `test_metal_backend` **6/6 (59/59)**;
+  `test_backend_cross_device` **5/5 (73/73)**; ctest 153/155.
+  **Op NMSE vs the CPU oracle**, widths {128, 100, 17}: `kAdd`/broadcast/`kRelu`
+  **0 (exact)**; `kSiluAndMul` 2.50e-15; `kRmsNorm` 5.30e-15..1.90e-14; residual
+  stream **0 (exact)**; `kLayerNorm` 3.86e-15..9.95e-15; `kFusedChain` both tiers
+  9.05e-15. **Worst case 1.9e-14 against the 5e-4 bar.** Bit-exact where promised.
+  The 2 remaining ctest failures are PRE-EXISTING macOS platform gaps, **PROVEN
+  unrelated by a `-DVLLM_CPP_METAL=OFF` A/B on the same tree** (they fail
+  identically there): `test_serve_low_tools` (Linux-only `os.sched_getaffinity`
+  and `POSIX_FADV_DONTNEED` in the Python bench tooling) and `test_safetensors`
+  (`MappingRssKb` reads `/proc/self/smaps`). Recorded as debt in
+  [environment.md](environment.md); NOT fixed here — they are benchmark/RSS
+  tooling portability, orthogonal to W0.
+- **dgx** (GB10, CUTLASS 4.5.0 + nvcc 13.0 + `VLLM_CPP_TRITON=ON` + sm_121a; one
+  `$HOME/gpu.lock`; `git archive` transfer, never rsync; goldens md5-verified
+  `2965ef5772b556d3f3f86fedf4221b2f` over 475 files BOTH before and after
+  transfer): clean CUDA `-Werror` **0 warnings**, and **ALL SIX REGRESSIONS
+  UNCHANGED, each run STANDALONE**: 27B **235/235**, 35B **315/315**,
+  Qwen3-Coder **6/6 prompts**, Qwen3-32B-NVFP4A16 dense **6/6 prompts (142
+  assertions)**, OPT **6/6 prompts / 96/96 tokens strict**, DeepSeek-V2 **8/8
+  prompts**; `test_backend_cross_device` **5/5 (73/73)** CPU-vs-CUDA. The FULL dgx ctest
+  suite also ran clean: **190/190, 100% passed**.
+
+**Performance: nothing measured, nothing claimed, nothing owed** — the backend
+runs no model and dispatch is deliberately synchronous. `docs/BENCHMARKS.md`
+records `NOT APPLICABLE`.
+
+### 6. MLX is now the named COMPETITOR FLOOR (user directive, 2026-07-22)
+
+*"We should do benchmark testing against MLX for the same model."* MLX therefore
+binds for `BACKEND-METAL-MLX` exactly as AGENTS.md defines competitor floors:
+same model, same workload, same box, match-or-beat on EVERY axis. Recorded in the
+spike § Gates and in the `BACKEND-GATE-METAL-MLXLM` row.
+
+**This does NOT reverse the spike's ranking.** MLX has two distinct roles:
+as an IMPLEMENTATION path it stays demoted to work row M5 (bring-up remains
+native MSL, zero installs); as a BENCHMARK ARM it is binding from the first Metal
+model onward.
+
+**Hard constraint on M3:** the first Metal bring-up model must be one MLX can also
+run, or the arms are incomparable. That composes with the spike's "OPT or
+Qwen3-dense first, never Qwen3.5-Next" — MLX-LM ships Qwen3 dense support, so
+**Qwen3-dense is the pairing that satisfies both** and is the recommended M3
+target.
+
+**MLX was deliberately NOT installed** during W0: `brew install mlx` pulls
+`python@3.14` into `/opt/homebrew/bin`, which is first on the PATH our macOS
+builds use, so `find_package(Python3)` would resolve differently and perturb the
+very gates W0 was proving. Probed read-only instead — `brew info mlx` 0.32.0 (not
+installed, sole dep `python@3.14`); system python `/usr/bin/python3` 3.9.6 (CLT)
+with `venv` present; `import mlx` fails; ~28 GiB free. **Recommended venv route,
+which avoids the PATH hazard entirely:** `python3 -m venv ~/mlx-venv &&
+~/mlx-venv/bin/pip install -U pip mlx-lm`. Record the exact resolved version — an
+unpinned competitor arm is not a floor.
+
+### 7. LocalAI worker on the M4 — NOT stopped, and why (user instruction)
+
+The user directed that the LocalAI worker be stopped before Metal/GPU work and
+restored afterwards. **It was NOT stopped. Stated plainly so nobody assumes
+otherwise.** Discovered (not assumed) to be a **root LaunchDaemon**, not a
+container and not a user LaunchAgent:
+
+- unit `system/com.localai.worker`, plist
+  `/Library/LaunchDaemons/com.localai.worker.plist` (root:wheel)
+- program `/Users/mudler/local-ai/local-ai worker` (NATS-driven)
+- properties `keepalive | runatload` — so killing the PID is not enough
+- observed state: **running**, PID 327, RSS ~51 MB, up 1d06h, idle (log shows
+  only periodic `NATS backend.list` events; no model loaded)
+
+```sh
+launchctl print system/com.localai.worker                                   # inspect, no root
+sudo launchctl bootout system/com.localai.worker                            # stop
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.localai.worker.plist  # restore
+```
+
+Two reasons it was not stopped, both deliberate: (a) it needs an interactive
+`sudo` password and the box has no passwordless sudo (`sudo -n true` -> "a
+password is required"), so an unattended agent cannot do it; (b) **W0 took no
+timing measurement of any kind** — every gate is a functional/correctness
+assertion — so contention could not have affected a single recorded result. The
+box is therefore left exactly as found.
+
+**This becomes load-bearing at M3:** any MLX-vs-ours timing with this daemon up is
+VOID. Also note three `actions.runner.localai-org-*` GitHub Actions runners
+(user LaunchAgents, PIDs 599/600/601) that can start CI jobs on the box at any
+moment — quiesce those too before a benchmark series.
+
+### 8. Deferred, and what is next
+
+The spike's W0 items **5-8** are deliberately DEFERRED to a new **W0b** row:
+guarding the 4 unconditional `vt/cuda/` includes (worst is the PUBLIC
+`dense_nvfp4_gemm.h:66`), de-hardcoding `model_loader.cpp:39`'s
+`GetBackend(kCUDA).CreateQueue()`, lifting `QuantTypeTraits` out of `vt::cpu`,
+and generalizing the arch-tactic registry. Rationale: those four block a MODEL on
+a non-CUDA backend, and W0 ships no model — but they are a hard PREREQUISITE for
+M3. None of them was tripped over during W0, because nothing here loads a model.
+
+**Next:** `M2` residue (~12 remaining elementwise/rope/gated ops) -> `W0b` -> `M3`
+(GEMM + paged attention -> Qwen3-dense token-exact vs our own CPU backend, and
+benchmarked against MLX-LM on the same M4 with the worker daemon down).
+
+**Resume commands.**
+```sh
+# M4
+ssh 192.168.68.103
+export PATH=/opt/homebrew/bin:$PATH
+cd ~/vllmcpp-metal-w0 && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j 10
+./build/tests/test_backend && ./build/tests/test_metal_backend && ./build/tests/test_backend_cross_device
+ctest --test-dir build -j 3          # expect 153/155; the 2 are the recorded macOS gaps
+
+# dgx — the ~13 GiB build tree was DELETED after gating (the box runs at 96-97%
+# full and partial ENOSPC builds produce bogus test failures). Re-transfer with
+# git archive, NEVER rsync (it silently overwrote goldens twice -> FALSE passes),
+# and md5-verify the 475 goldens BOTH before and after:
+#   find tests/parity/goldens -type f | sort | xargs md5sum | md5sum
+#   -> 2965ef5772b556d3f3f86fedf4221b2f
+git archive --format=tar HEAD -o /tmp/w.tar && scp /tmp/w.tar dgx.casa:/tmp/
+ssh dgx.casa 'mkdir -p ~/vllmcpp-metal-w0 && tar -xf /tmp/w.tar -C ~/vllmcpp-metal-w0'
+# then, on dgx:
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+  -DVLLM_CPP_TRITON=ON -DCMAKE_CUDA_ARCHITECTURES=121a
+cmake --build build -j 12
+# Run each model gate STANDALONE — co-scheduled big-model runs OOM the box, and a
+# co-scheduled failure is not a regression.
+cd build
+flock $HOME/gpu.lock ./tests/test_qwen27_paged_engine     # 235/235
+flock $HOME/gpu.lock ./tests/test_qwen36_paged_engine     # 315/315
+
+python3 scripts/check-agent-record.py && python3 scripts/check-doc-checkpoint.py
+```

@@ -7,6 +7,18 @@ Owner: `CLAIM-BACKEND-FANOUT-1`.
 Rows: **`BACKEND-METAL-MLX`** and **`BACKEND-VULKAN`** (both `SPIKE` -> `ACTIVE`),
 **`BACKEND-XPU`** (stays `SPIKE`).
 
+**COMPANION SPEC (2026-07-22): [metal-mlx-reuse-study.md](metal-mlx-reuse-study.md)**
+— the MLX source study, the ranked reuse map, the quantified first-model cost,
+the **`vt::OpProvider` acceleration-provider seam** proposal, and the measured
+MLX competitor baseline. It **CORRECTS several counts in this file** (CUDA op
+coverage 74/75 not 73; `vt::Backend` 6 pure + 18 defaulted, not 6 + 20 of 26; raw
+`kCUDA` comparisons 54 not 43, plus 13 uncounted `is_cuda()` call sites; CUDA
+includes 5 sites of which 3 strictly unconditional, the public
+`dense_nvfp4_gemm.h:66` already being `#ifdef`-guarded), **restates W0b item 7**
+(`QuantTypeTraits` must be SPLIT, not lifted — two of its five fields are
+implementation facts, not encoding facts), and **merges W0b item 8 into the
+provider seam** (they are the same work). Read it before starting M3 or W0b.
+
 **`ACTIVE` here means a gated SKELETON, not a supported backend.** No model runs
 on Metal OR on Vulkan: GEMM, attention, KV cache, quant and sampling are
 unregistered on both. Do not read the state as capability — read § Work breakdown

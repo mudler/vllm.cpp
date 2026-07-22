@@ -17964,3 +17964,205 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 # and a SECOND dir with -DVLLM_CPP_VULKAN=ON for the backend gates.
 # Run each model gate STANDALONE under one flock; co-scheduled big-model runs OOM.
 ```
+
+---
+
+## 2026-07-22 — Metal/MLX reuse study + the `vt::OpProvider` acceleration-provider seam, and an MLX competitor baseline (`CLAIM-BACKEND-FANOUT-1`)
+
+Base `1cb5f64`, worktree `agent-a35b37f8bb1e496c7`. **STUDY + MEASUREMENT ONLY —
+no source file, no CMake, no kernel, no test was changed.** Existing gates
+therefore stand by construction; nothing was rebuilt and nothing of OURS was
+benchmarked. New spec: `.agents/specs/metal-mlx-reuse-study.md`.
+
+### 1. Why a separate spec
+
+The fan-out spike is a per-backend port map ("what files does Metal need").
+The user's directive — *"we need to build it in a way that we can extend
+acceleration easily to other platforms, and e.g. integrate with MLX"* — is a
+question about the SEAM, and its answer binds CUDA and CPU as much as Apple.
+Folding it into a 762-line port map would have buried it. The spike keeps the
+M/V/X work rows; the study owns the provider seam and the MLX evidence.
+
+### 2. The reuse map (MLX read at pinned `v0.29.3` / `4bce5f9b`)
+
+Running a first model on Apple GPU needs **10 ops for Qwen3-dense (7 new)** and
+**9 for OPT (6 new)**. Everything else transfers unchanged: the engine, all
+argument validation (`ops.cpp`, 2,630 lines — a backend writes ZERO), the whole
+9-recipe fusion catalog, the sampler source (zero CUDA refs across 4 TUs),
+weight loading (**0 OpIds** — host memcpy/transpose only), block geometry, block
+structs, dequant math, keep-quant routing.
+
+**OPT is the right first non-CUDA model**: all four of its TUs contain literally
+zero CUDA references, verified case-insensitively. Qwen3-dense follows because it
+is the one MLX also runs, which the competitor gate requires.
+
+### 3. What the study found that the spike had wrong
+
+Counts corrected: CUDA coverage **74/75 not 73** (`kDropinProbe` registers via
+`RegisterTypedOp`); `vt::Backend` is **6 pure + 18 defaulted (24 virtuals)**, not
+6 + 20 of 26; raw `kCUDA` comparisons **54 not 43**, **plus 13 uncounted
+`is_cuda()` call sites**; CUDA includes are 5 sites of which only **3 are
+strictly unconditional** — the public `dense_nvfp4_gemm.h:66` is already
+`#ifdef VT_MARLIN_NVFP4`-guarded, i.e. LESS severe than the spike claimed.
+
+**Two open defects found by inspection, neither fixed here:**
+- `include/vllm/model_executor/models/dense_attn_block.h:140,157` — a **REAL
+  PORTABILITY BUG**. `if (!GetPlatform(...).is_cuda())` selects host-pointer
+  aliasing, so a Metal/Vulkan run hands a HOST pointer to a DEVICE kernel. Latent
+  only because no model runs on a non-CUDA device backend. Hard blocker for M3.
+- `tests/vt/test_fused_chain_additivity.cpp:420-439` gates **7 of the 9** declared
+  recipes; `kFusedAddRmsNormStd` and `kAttnQkNormRope` were added to `recipes.h`
+  without catalog rows, so the `CHECK(... == 7)` guard whose stated purpose is
+  "tie catalog growth to test growth" has drifted.
+
+### 4. The seam verdict — a PLATFORM plugs in, a PROVIDER does not
+
+Platform additivity is **measured, not projected**: Vulkan V1 added 11 files + 8
+shaders and edited exactly TWO pre-existing files (`CMakeLists.txt`,
+`tests/CMakeLists.txt`) — zero pre-existing `src/`/`include/` source edits — and
+`test_backend_cross_device.cpp` picked it up **unmodified**. PR-#4 additivity
+holds.
+
+But `src/vt/ops.cpp:10-15,98-102` is a flat `[OpId][DeviceType]` table of ONE
+`void*`, **last writer wins silently**, with static-init order unspecified. Two
+implementations of one op on one device cannot coexist — "register MLX's matmul
+alongside ours" would be a nondeterministic BUILD, not a configuration. No
+priority, no capability predicate, no decline, no provenance.
+
+**We already built exactly that mechanism one layer down.**
+`src/vt/cuda/cuda_arch_tactics.{h,cu}` has all of it: capacity-bounded static
+storage (safe static-init), registration that never throws, first-`supports()`-
+wins linear scan with `nullptr` -> caller's portable fallback, DOUBLE type
+erasure, a `bool` return as a *second* fallback axis ("I decline this shape"),
+and selection instrumentation. Its CUDA couplings are **exactly 3 and all
+shallow**, as the spike claimed — verified. The fusion dispatcher
+(`ops.cpp:963-995`) is independently a three-rung fallback ladder with the same
+semantics. And `DeviceResourceOps` (`backend.h:114-138`) is already a C-ABI
+provider table in the tree.
+
+**Recommendation: `vt::OpProvider` — generalize the tactic registry INTO the op
+table.** ~50 lines, **zero call-site edits** (all ~70 entry points are
+`validate; GetOp(...)(...)`), and it serves MLX-on-Metal, cuBLASLt/CUTLASS/
+flashinfer-on-CUDA, llama.cpp-on-CPU/Vulkan with ONE mechanism. This merges
+fan-out spike W0b item 8 — they are the same work.
+
+Note `dropin-kernel-abi.md` (`BACKEND-ABI-VT`) is already a provider seam, but
+for RAW-C-LAUNCHER providers only. MLX's entry points take `const array&`,
+`metal::Device&`, `Stream` — a C++ object model. That is the precise gap.
+
+### 5. MLX integration — the lazy-eval objection is REFUTED by source
+
+`backends.md:84-90` calls MLX's lazy graph "the same impedance class that
+disqualified ggml". Reading the source, that is wrong. The graph terminates at
+`mlx/backend/metal/eval.cpp:32-48`, which calls `primitive().eval_gpu()` — an
+**eager, per-op encode into the stream's command buffer**. Below that line there
+is no tape at all. And the compute entry points are FREE FUNCTIONS:
+`steel_matmul` (`matmul.h:105-142`), `sdpa_vector`/`sdpa_full_self_attention_metal`
+(`scaled_dot_product_attention.cpp:16,151,240`), `qmv`/`qmm`/`qvm`
+(`quantized.cpp:165,458,405`). `Matmul::eval_gpu` is merely one caller; we can be
+another.
+
+**The zero-copy bridge is three facts wide:** `allocator::Buffer` is a bare
+`void*` which for Metal IS the `MTL::Buffer*` (`allocator.h:12-29`,
+`allocator.cpp:146-149`); `array::set_data(Buffer, size, strides, flags, Deleter)`
+(`array.h:417-422`) takes a caller-supplied deleter, so pass a no-op and MLX
+never owns our memory; and `set_input_array` binds at
+`a.data<char>() - buffer->contents()` (`device.cpp:238-239`), which is correct on
+our `StorageModeShared` buffers **unmodified**.
+
+Honest costs: `libmlx.dylib` + a **104,894,650-byte `mlx.metallib`** (measured on
+the M4) — a real deviation from `discipline.md:86-92`, so it must be GATED and
+optional, precedent `VLLM_CPP_TRITON`; building MLX from source needs `xcrun
+metal` i.e. full Xcode, which the M4 lacks; a commit+wait sync tax per delegated
+op that must be MEASURED not assumed; and **MLX has NO paged-KV attention** —
+`use_fallback` (`scaled_dot_product_attention.cpp:375-412`) gates on contiguity
+and head-dim, there is no block-table concept in the file, so `kPagedAttention`
+and `kReshapeAndCache` are OURS regardless. MLX's quant convention
+(`(group_size, bits, mode)`, `quantized.h:17-25`) is not GGUF k-quant either.
+
+**Verdict: viable for GEMM as an OPTIONAL GATED PROVIDER; native MSL stays the
+default bring-up path.**
+
+### 6. Two free wins found in MLX that need no MLX
+
+- **Batched encoders + hazard barriers.** MLX uses ONE command buffer per stream
+  with `memoryBarrier` inserted only when a read aliases a prior write
+  (`device.cpp:264-273`). Our W0 is one command buffer PER OP, commit+wait. Port
+  the pattern — it is purely OUR kernels running faster, zero dependency.
+- **Function-constant specialization** (`device.cpp:540-580`) — MLX builds kernel
+  names as strings and specializes. Our W0 compiles one fixed variant per op.
+  The technique ports to our own MSL for free.
+
+Also validated: MLX pins `setFastMathEnabled(false)` (`device.cpp:512`) and
+`-fno-fast-math` (`kernels/CMakeLists.txt:12`) — **independent convergence on our
+`MTLMathModeSafe` decision**. And MLX maintains runtime `newLibrary(source)` as a
+first-class build mode, so W0's runtime-MSL route is not a workaround.
+
+One place OUR design is better, worth recording since it looked like a wart:
+MLX resolves an interior pointer by subtracting `contents()` because its `array`
+is fused to its allocator. Our `vt::Tensor` is allocator-agnostic (same type on
+CPU and CUDA), so an allocation registry is the correct price of that
+generality — and Vulkan V1 hit the identical problem and reached the identical
+solution independently. **The registry is the portable answer, now confirmed
+twice.**
+
+### 7. MLX baseline — UNOPPOSED FLOOR, `BLOCKED-ON-SUDO`
+
+MLX installed on the M4 via the **venv route** (brew NOT used, so `python@3.14`
+never entered the build PATH): `mlx` 0.29.3 / `mlx-metal` 0.29.3 / `mlx-lm`
+0.29.1 (CLT python 3.9.6 caps the resolve below brew's 0.32.0 — recorded).
+Model `mlx-community/Qwen3-1.7B-bf16` @ `9cd6692855d3e06772228e9a962b2606359b2d24`
+— 1.7B not 4B/8B because the desktop already holds ~13 of 17.2 GB and the b=16
+arm must not page. Harness is **MLX-LM's OWN** `mlx_lm.benchmark`, p=512 g=128,
+1 warmup + 3 timed trials.
+
+| b | out tok/s agg | TTFT | ITL | peak | spread |
+|---:|---:|---:|---:|---:|---|
+| 1 | 27.57 | 470 ms | 36.3 ms | 3.78 GB | 0.12% |
+| 4 | 90.15 | 1,738 ms | 44.4 ms | 4.18 GB | 0.63% |
+| 16 | 213.39 | 6,857 ms | 75.0 ms | 5.28 GB | 0.14% |
+
+Prefill saturates ~1,200 tok/s by b=8 (compute roof); decode scales **7.74x**
+b=1 -> b=16 (bandwidth-bound). **There is NO "ours" column and none was
+manufactured — no model runs on Metal and no Metal speed result is claimed.**
+
+**Status `BLOCKED-ON-SUDO`.** The `com.localai.worker` root LaunchDaemon could
+NOT be stopped (`sudo -n true` -> "a password is required"). It WAS measured
+genuinely idle — 0.0% CPU, and `ioreg IOAccelerator` reports Device/Renderer/
+Tiler Utilization all **0**, i.e. it holds no GPU — consistent with the sub-1%
+spread. But idle is not stopped, so the numbers are INDICATIVE, not binding.
+**A second contender the brief did not anticipate was found**: the desktop
+**aerial video wallpaper** (`WallpaperAerialsExtension` PID 472, **8.2% CPU**, +
+`VTDecoderXPCService` 2.2%), which decodes video continuously and touches the
+GPU — it is the real source of the ~1.47 load average. Disable it too for a
+binding run. Nothing was stopped, killed or uninstalled; the box was left as
+found, plus `~/mlx-venv` and `~/hf-cache` (both off every build PATH,
+`rm -rf`-removable).
+
+### 8. Next — the ranked W-plan
+
+`W0b-1` (the 4 seam fixes, **including the `dense_attn_block.h` host-pointer
+BUG**) -> `W0b-2` (`vt::OpProvider` + device-neutral `DeviceCaps`; register every
+existing kernel as a single priority-0 always-supported provider, so it is
+behavior-preserving) -> `W0b-3` (SPLIT `QuantTypeTraits`, do not lift it) ->
+`M2r` (the ~12 remaining elementwise/rope/gated ops) -> **`M3a` OPT on Metal**
+(6 new kernels; token-exact vs our own CPU backend on the same M4) -> **`M3b`
+Qwen3-dense** (unlocks the MLX floor above) -> `M3c` (batched encoders) ->
+`M5` (**MLX as a registered provider**, `VLLM_CPP_MLX` default OFF, A/B'd against
+our own MSL via `VT_OP_PROVIDER_STATS` — now a CONFIGURATION, not a rewrite) ->
+`M4` (GGUF k-quant Metal shaders).
+
+**Resume commands.**
+```sh
+# re-run the MLX baseline (do the two preconditions FIRST for a binding result)
+ssh 192.168.68.103
+sudo launchctl bootout system/com.localai.worker      # needs an interactive password
+# ...disable the aerial wallpaper (System Settings -> Wallpaper)...
+export HF_HOME=$HOME/hf-cache
+for B in 1 2 4 8 16; do ~/mlx-venv/bin/python -m mlx_lm.benchmark \
+    --model mlx-community/Qwen3-1.7B-bf16 -p 512 -g 128 -b $B -n 3; done
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.localai.worker.plist   # RESTORE
+
+# re-read the MLX sources the study cites: clone ml-explore/mlx, then check out
+# tag v0.29.3 (commit 4bce5f9b2dc4743b9e0bdf101a0d593053f4f099)
+```

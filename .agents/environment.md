@@ -98,7 +98,7 @@
   | Program | `/Users/mudler/local-ai/local-ai worker` (a NATS-driven worker) |
   | Properties | `keepalive | runatload` — so `kill`ing the PID is NOT enough, launchd restarts it |
   | Log | `/Users/mudler/local-ai/worker.log` |
-  | State observed 2026-07-22 | **running**, PID 327, RSS ~51 MB, up 1d06h, idle (log shows only periodic `NATS backend.list` events; no model loaded) |
+  | State observed 2026-07-22 | **running**, PID 327, RSS ~51 MB, up 1d08h, **MEASURED idle: 0.0% CPU, and `ioreg IOAccelerator PerformanceStatistics` reports `Device Utilization % = 0`, `Renderer Utilization % = 0`, `Tiler Utilization % = 0` — it holds NO GPU work.** Log shows only periodic `NATS backend.list` events (~1 per 6 h); no model loaded |
 
   ```sh
   # inspect (works WITHOUT root)
@@ -122,15 +122,34 @@
   on this box at any time — quiesce those too before a benchmark series
   (`launchctl bootout gui/$UID/actions.runner.localai-org-<name>.<label>`).
 
-  **MLX is NOT installed** and was deliberately left uninstalled by W0 (the brew
-  formula pulls `python@3.14` into `/opt/homebrew/bin`, which is first on the
-  PATH our builds use, so it would perturb `find_package(Python3)` and the very
-  gates W0 was proving). Since 2026-07-22 MLX is the **named competitor floor**
-  for Metal (`BACKEND-GATE-METAL-MLXLM`), so it WILL be needed as a benchmark
-  arm. Prefer the venv route over brew, which avoids the PATH hazard entirely:
-  `python3 -m venv ~/mlx-venv && ~/mlx-venv/bin/pip install -U pip mlx-lm`
-  (system python is CLT 3.9.6, `venv` present, ~28 GiB free; `brew info mlx`
-  reports 0.32.0). Record the exact resolved version in the benchmark row.
+  **STILL NOT STOPPED as of the 2026-07-22 MLX baseline run** — same reason
+  (no passwordless sudo). The MLX numbers in
+  [docs/BENCHMARKS.md](../docs/BENCHMARKS.md) are therefore recorded
+  **`BLOCKED-ON-SUDO` / INDICATIVE, not binding**; the recipe is a one-command
+  re-run once the user boots the daemon out. **Second contender found the same
+  session and not anticipated by the earlier note:** the desktop **aerial video
+  wallpaper** — `WallpaperAerialsExtension` (PID 472, **8.2% CPU**) plus
+  `VTDecoderXPCService` (PID 518, 2.2%) — decodes video continuously and touches
+  the GPU; it is the actual source of the ~1.47 load average on an otherwise idle
+  box. Disable it (System Settings -> Wallpaper, or log the console user out)
+  before any binding run. It was left untouched.
+
+  **MLX IS NOW INSTALLED (2026-07-22), via the venv route as recommended** —
+  brew was NOT used, so `python@3.14` never entered `/opt/homebrew/bin` and the
+  PATH our macOS builds use is unchanged:
+
+  ```sh
+  /usr/bin/python3 -m venv ~/mlx-venv && ~/mlx-venv/bin/pip install -U pip mlx-lm
+  ```
+
+  | | |
+  |---|---|
+  | Resolved versions | **`mlx` 0.29.3, `mlx-metal` 0.29.3, `mlx-lm` 0.29.1** — the CLT python 3.9.6 caps the resolve BELOW brew's 0.32.0. Record this: an unpinned competitor arm is not a floor |
+  | Location | `~/mlx-venv` (off every build PATH), `~/hf-cache` (3.2 GB model cache) |
+  | Model | `mlx-community/Qwen3-1.7B-bf16` @ rev `9cd6692855d3e06772228e9a962b2606359b2d24` |
+  | Ships prebuilt | `mlx/lib/mlx.metallib` **104,894,650 bytes** + `libmlx.dylib` — so CONSUMING MlX needs no Xcode, but BUILDING it from source does (`xcrun metal`), which this box cannot do |
+  | Device probe | `mx.metal.device_info()` -> `applegpu_g16g`, `max_recommended_working_set_size` 12,713,115,648 (11.84 GiB), `max_buffer_length` 9,534,832,640 |
+  | Removal | `rm -rf ~/mlx-venv ~/hf-cache` — neither is on any PATH our builds consult |
 
 ## Benchmark models on dgx.casa
 

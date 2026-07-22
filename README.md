@@ -278,7 +278,7 @@ next vehicle for this track.
 | Other NVIDIA SMs | sm70 through sm110 families inventoried from vLLM | 🗓 Not yet built, traced, or gated here. The **expansion framework is additive** (2026-07-21, see below) — adding one is a table row + a tactic registration rather than a scattered multi-file edit, as the sm_120a row above now demonstrates end to end — but no architecture in a *different* family has moved off `INVENTORIED`: none can be executed on this hardware, and a mixed-family build (say Hopper + Blackwell) does not even compile yet, because the per-architecture kernel bodies do not exist |
 | Intel XPU | Intel GPUs | 🔬 **SPIKED ONLY — and HW-BLOCKED** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). No Intel GPU exists on any machine here, and vLLM has no in-tree SYCL kernel source to copy (its XPU kernels ship as a separate package), so there is nothing to port loyally either. Only the backend-selection policy, compile coverage, and running SYCL kernels on a CPU device for unit checks remain possible. No end-to-end or speed gate is proposed, because none can be run |
 | ROCm / ANE | AMD GPUs / Apple Neural Engine | 🗓 Post-parity roadmap; not spiked |
-| Metal | Apple Silicon | 🟡 **SKELETON BUILT AND CHECKED — but no model runs on it yet, so this is NOT usable support** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). What exists: the Mac GPU is opened, memory is allocated on it, GPU programs are compiled at run time (no extra tooling needed, verified on-device), and eight small operations plus the whole fusion catalogue run there and agree with our CPU results to within the required tolerance — worst case eleven orders of magnitude better than the bar, with byte-for-byte agreement on the pure copy and number-format conversion paths. What does NOT exist: matrix multiply, attention, the KV cache, quantization and sampling are all absent, so **no model can run**, and no speed number is measured or claimed. One real defect was found and fixed along the way: on macOS the build silently discarded every self-registering component, so even the **CPU backend** failed to appear — that fix makes macOS a usable CPU target too. Cannot hold the 27B/35B gate models (16 GB), so no Apple result may ever be extrapolated to them. **MLX is now the named speed floor** for this backend: when a model does run here it must match or beat MLX on the same model and workload |
+| Metal | Apple Silicon | 🟡 **SKELETON BUILT AND CHECKED — but no model runs on it yet, so this is NOT usable support** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). What exists: the Mac GPU is opened, memory is allocated on it, GPU programs are compiled at run time (no extra tooling needed, verified on-device), and eight small operations plus the whole fusion catalogue run there and agree with our CPU results to within the required tolerance — worst case eleven orders of magnitude better than the bar, with byte-for-byte agreement on the pure copy and number-format conversion paths. What does NOT exist: matrix multiply, attention, the KV cache, quantization and sampling are all absent, so **no model can run**, and no speed number is measured or claimed. One real defect was found and fixed along the way: on macOS the build silently discarded every self-registering component, so even the **CPU backend** failed to appear — that fix makes macOS a usable CPU target too. Cannot hold the 27B/35B gate models (16 GB), so no Apple result may ever be extrapolated to them. **MLX is now the named speed floor** for this backend: when a model does run here it must match or beat MLX on the same model and workload — and MLX's own numbers are now measured and on record as a target (about 28 tokens/second single-request, 213 at sixteen at once, on a small Qwen3 model), marked *not yet binding* because a background service on that Mac could not be stopped. A [source study of MLX](.agents/specs/metal-mlx-reuse-study.md) also settled how much of our code transfers: a first model needs only **six or seven new GPU programs**, everything else runs unchanged, and integrating MLX for the operations where it wins is possible after all — as an optional, switchable provider rather than a dependency |
 | Vulkan | Portable GPU | 🟡 **SKELETON BUILT AND CHECKED — but no model runs on it yet, so this is NOT usable support** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). What exists: the GPU is opened, memory is allocated on it, eight small operations plus the whole fusion catalogue run there, and their results are compared against **both** our CPU results **and our own CUDA results on the very same machine** — the strongest cross-check available anywhere in this project, and one the Apple backend cannot have. Agreement is far inside the required tolerance, with byte-for-byte agreement on the pure copy and number-format conversion paths. The GPU programs are compiled ahead of time and shipped with the source, so building needs no graphics toolchain at all. It also runs on a software GPU on the dev box, which means these checks can run with **no GPU hardware present**. What does NOT exist: matrix multiply, attention, the KV cache, quantization and sampling are all absent, so **no model can run**, and no speed number is measured or claimed. Turned off by default — it must be asked for explicitly, so that the NVIDIA gate builds are untouched. When a model does run here, llama.cpp's own Vulkan backend is the speed floor |
 
 Only GB10/sm_121a counts as CUDA hardware support today. Source-level fallback
@@ -374,6 +374,44 @@ our NVIDIA path. Note this is purely a *comparison* choice: the Apple backend is
 being written directly against Apple's GPU programming language, not built on
 MLX. It also fixes which model comes first — it has to be one MLX can run too, or
 the comparison is meaningless.
+
+**MLX's own numbers are now on record, and we studied its source to see how much
+of our code can be reused (2026-07-22,
+[study](.agents/specs/metal-mlx-reuse-study.md)).** Two results are worth stating
+plainly. First, **the reuse is very high**: getting a first model onto the Apple
+GPU needs **nine to ten** of our seventy-five operations, of which the skeleton
+already has three — so **six or seven new GPU programs**, and everything else
+(the engine, the scheduler, the KV cache, all argument checking, the whole fusion
+catalogue, the model files themselves, and weight loading, which needs no GPU
+operation at all) runs unchanged. The small text-generation model OPT turns out
+to contain **no NVIDIA-specific code whatsoever**, which makes it the cheapest
+correct first target. The study also found a **real latent defect** on the shared
+path: on any non-NVIDIA GPU the code would hand a CPU memory address to a GPU
+program. It cannot bite today because no model runs there yet, and it is now
+recorded as a blocker to fix before one does.
+
+Second, **integrating MLX turns out to be genuinely possible**, which contradicts
+our earlier assumption. We had assumed MLX's deferred, build-a-graph-then-run-it
+style would clash with our immediate, run-it-now design. Reading the source shows
+the graph sits *above* MLX's actual GPU code, and the GPU code underneath is
+plain, immediate function calls we can make directly, on memory we already own,
+without copying. So the sensible design is to make MLX an **optional, switchable
+provider** for the few operations where it wins, rather than a dependency or a
+rewrite. That needs one thing we do not have: today each operation has exactly
+one implementation per device, with no way for two to coexist and the faster one
+to be chosen. We already built that mechanism once, for picking between NVIDIA
+chip generations; the recommendation is to generalise it so it serves every
+backend — Apple delegating to MLX, NVIDIA to its vendor libraries, and the CPU to
+llama.cpp's hand-tuned routines — with one mechanism instead of three.
+
+Finally, **MLX has been installed on the Mac and measured**: on a small Qwen3
+model it produces about 28 tokens/second for a single request, rising to about
+213 tokens/second at sixteen at once. Those are **MLX's numbers alone** — we have
+nothing to compare them with yet, and none of them is a claim about our speed.
+They are recorded as a target to design against, and marked *not yet binding*
+because a background service on that Mac could not be stopped without a password.
+The exact commands to reproduce them are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 **CUDA-arch expansion is now ADDITIVE — mechanism only, no new support
 (`BACKEND-CUDA-ARCH-ADDITIVITY`, LANDED + GATED 2026-07-21,

@@ -55,13 +55,17 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
   waiting = create_request_queue(ToQueuePolicy(scheduler_config.policy));
 
   // Build the KV cache manager (upstream scheduler.py ctor). hash_block_size
-  // defaults to block_size; use_eagle / log_stats / kv_cache_events off and
-  // dcp/pcp world sizes 1 at T0.
+  // defaults to block_size; use_eagle / kv_cache_events off and dcp/pcp world
+  // sizes 1 at T0.
+  //
+  // log_stats is ON: upstream's `disable_log_stats` defaults False, and the
+  // benchmark protocol VOIDS any caching arm that cannot report queries/hits.
+  // Cost is three integer adds per admitted request.
   kv_cache_manager = std::make_unique<KVCacheManager>(
       kv_cache_config_, max_model_len, /*scheduler_block_size=*/block_size,
       /*hash_block_size=*/block_size,
       /*max_num_batched_tokens=*/scheduler_config.max_num_batched_tokens,
-      enable_caching, /*use_eagle=*/false, /*log_stats=*/false,
+      enable_caching, /*use_eagle=*/false, /*log_stats=*/true,
       /*enable_kv_cache_events=*/false, /*dcp_world_size=*/1,
       /*pcp_world_size=*/1, scheduler_config.watermark);
 }
@@ -106,6 +110,9 @@ void Scheduler::preempt_request(Request* request) {
   kv_cache_manager->free(*request);
   request->status = RequestStatus::kPreempted;
   request->num_computed_tokens = 0;
+  // Upstream Request.num_preemptions (read by PrefixCacheStats.record at
+  // vllm/v1/core/kv_cache_manager.py:239).
+  request->num_preemptions += 1;
   // Put the request back to the FRONT of the waiting queue (FCFS retry).
   waiting->prepend_request(request);
   reset_preempted_req_ids.insert(request->request_id);
@@ -385,6 +392,18 @@ SchedulerOutput Scheduler::schedule() {
   // free_encoder_mm_hashes stays empty (encoder deferred).
 
   update_after_schedule(scheduler_output);
+
+  // Fold this step's prefix-cache lookups into the sliding-window hit-rate
+  // aggregate. Upstream does this in the FRONTEND (SchedulerStats ->
+  // LoggingStatLogger.observe, vllm/v1/metrics/loggers.py); we have no
+  // SchedulerStats plumbing, so the aggregation lives on the Scheduler.
+  // Behaviourally identical: make_prefix_cache_stats() is a take-and-swap of
+  // the SAME per-step delta upstream ships to the logger, and CachingMetrics
+  // ignores empty observations, so idle steps are free and cannot slide useful
+  // history out of the window.
+  if (auto stats = kv_cache_manager->make_prefix_cache_stats()) {
+    prefix_cache_metrics_.observe(*stats);
+  }
   return scheduler_output;
 }
 

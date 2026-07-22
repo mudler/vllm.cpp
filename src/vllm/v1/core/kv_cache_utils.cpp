@@ -6,8 +6,10 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -274,6 +276,8 @@ std::string CborValue::Encode() const {
 
 BlockHash sha256_cbor(const CborValue& value) { return Sha256(value.Encode()); }
 
+std::string sha256_bytes(const std::string& data) { return Sha256(data); }
+
 // --- Block-hash packing ------------------------------------------------------
 
 BlockHashWithGroupId make_block_hash_with_group_id(const BlockHash& block_hash,
@@ -304,18 +308,76 @@ uint32_t get_group_id(const BlockHashWithGroupId& key) {
 
 BlockHash NONE_HASH;
 
+namespace {
+NoneHashProvenance g_none_hash_provenance;
+
+// getenv, treating an empty value as unset (an exported-but-empty variable is
+// the same "not configured" state as an absent one).
+std::optional<std::string> GetEnvNonEmpty(const char* name) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || *v == '\0') {
+    return std::nullopt;
+  }
+  return std::string(v);
+}
+}  // namespace
+
+const char* NoneHashProvenance::source_name() const {
+  switch (source) {
+    case NoneHashSeedSource::kExplicit:
+      return "explicit";
+    case NoneHashSeedSource::kEnvVllmCpp:
+      return "VLLM_PREFIX_CACHING_HASH_SEED";
+    case NoneHashSeedSource::kEnvPythonHashSeed:
+      return "PYTHONHASHSEED";
+    case NoneHashSeedSource::kDefault:
+      return "default";
+    case NoneHashSeedSource::kRandom:
+      return "random";
+  }
+  return "unknown";
+}
+
+const NoneHashProvenance& none_hash_provenance() {
+  return g_none_hash_provenance;
+}
+
 void init_none_hash(const HashFn& hash_fn, std::optional<std::string> seed) {
-  if (seed.has_value()) {
-    NONE_HASH = hash_fn(CborValue::Text(*seed));
-    return;
+  NoneHashSeedSource source = NoneHashSeedSource::kExplicit;
+
+  if (!seed.has_value()) {
+    // Our escape hatch first: it is the one that can also SELECT upstream's
+    // random behaviour, so it must be able to override the default.
+    if (auto env = GetEnvNonEmpty("VLLM_PREFIX_CACHING_HASH_SEED")) {
+      if (*env == "random") {
+        // Opt in to upstream's os.urandom(32) branch
+        // (vllm/v1/core/kv_cache_utils.py:111-112). Block hashes then differ
+        // across processes and no persisted cache can be shared.
+        std::random_device rd;
+        std::string bytes(32, '\0');
+        for (int i = 0; i < 32; ++i) {
+          bytes[i] = static_cast<char>(rd() & 0xff);
+        }
+        NONE_HASH = bytes;
+        g_none_hash_provenance =
+            NoneHashProvenance{NoneHashSeedSource::kRandom, std::string()};
+        return;
+      }
+      seed = *env;
+      source = NoneHashSeedSource::kEnvVllmCpp;
+    } else if (auto py = GetEnvNonEmpty("PYTHONHASHSEED")) {
+      // Upstream's escape hatch, mirrored so an operator who already sets
+      // PYTHONHASHSEED across a vLLM fleet gets the same block hashes here.
+      seed = *py;
+      source = NoneHashSeedSource::kEnvPythonHashSeed;
+    } else {
+      seed = std::string(kDefaultNoneHashSeed);
+      source = NoneHashSeedSource::kDefault;
+    }
   }
-  // No seed (upstream os.urandom(32)): 32 random bytes.
-  std::random_device rd;
-  std::string bytes(32, '\0');
-  for (int i = 0; i < 32; ++i) {
-    bytes[i] = static_cast<char>(rd() & 0xff);
-  }
-  NONE_HASH = bytes;
+
+  NONE_HASH = hash_fn(CborValue::Text(*seed));
+  g_none_hash_provenance = NoneHashProvenance{source, *seed};
 }
 
 // --- Hashing -----------------------------------------------------------------

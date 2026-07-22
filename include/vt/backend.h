@@ -84,6 +84,13 @@ class Backend {
   // copy_event.synchronize — the ONLY blocking sync, and it waits the COPY
   // queue's event, so the main queue never blocks).
   virtual void SynchronizeEvent(Event& e);
+  // NON-BLOCKING completion test: has `e` already completed? Mirrors
+  // torch.Event.query, which vLLM's KV-offload worker polls per step instead of
+  // synchronizing (vllm/v1/kv_offload/cpu/gpu_worker.py:395-404) — a blocking
+  // check there would stall the engine on every transfer. The base
+  // implementation returns true, which is correct on synchronous backends (CPU):
+  // all prior work has completed by the time the host can observe the event.
+  virtual bool QueryEvent(Event& e);
   // Make later work on `q` wait for `e` WITHOUT blocking the host — the ordering
   // primitive behind `copy_stream.wait_stream(main_stream)` (record an event on
   // the main queue, then QueueWaitEvent it on the copy queue).

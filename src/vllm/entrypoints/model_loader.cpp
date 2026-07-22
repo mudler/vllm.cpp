@@ -160,9 +160,16 @@ bool LoadedEngine::ResolveEnablePrefixCaching(const EngineParams& params,
 }
 
 bool LoadedEngine::EnsureNoneHash() {
-  // Idempotent: init_none_hash just (re)assigns the NONE_HASH global. Prefix
-  // caching stays inert for prompts shorter than a block, so the (unseeded)
-  // NONE_HASH value does not affect determinism here.
+  // Idempotent: init_none_hash just (re)assigns the NONE_HASH global.
+  //
+  // The seed is resolved INSIDE init_none_hash (explicit >
+  // $VLLM_PREFIX_CACHING_HASH_SEED > $PYTHONHASHSEED > the fixed built-in
+  // default), so block hashes are DETERMINISTIC ACROSS PROCESSES by default.
+  // The previous comment here claimed the unseeded value "does not affect
+  // determinism" because prefix caching is inert below one block; that is true
+  // only for the sub-block case and does not generalise — every full block
+  // hash chains from NONE_HASH, so a per-process-random seed makes any
+  // content-addressed persisted cache score 0% on restart.
   vllm::v1::init_none_hash(vllm::v1::sha256_cbor);
   return true;
 }

@@ -113,6 +113,12 @@ class LLMEngine {
   RequestOutput generate(const std::string& prompt, SamplingParams params,
                          const std::string& request_id = "0", int priority = 0);
 
+  // The rolling prefix-cache hit rate (queries/hits in TOKENS over the most
+  // recent 1000 requests). See EngineCore::prefix_cache_metrics.
+  const CachingMetrics& prefix_cache_metrics() const {
+    return engine_core_.prefix_cache_metrics();
+  }
+
  private:
   InputProcessor& input_processor_;
   EngineCore& engine_core_;

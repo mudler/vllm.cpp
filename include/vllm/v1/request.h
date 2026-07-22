@@ -18,7 +18,11 @@
 //     kv_transfer_params, spec_token_ids,
 //     client_index, streaming / resumable
 //     state, prefill_stats, last_sched_seq (defer_block_free fence),
-//     num_nans_in_logits, num_preemptions.
+//     num_nans_in_logits.
+//     (num_preemptions is un-deferred below: PrefixCacheStats.record needs it
+//     to route a lookup into the mutually-exclusive preempted_* counters —
+//     vllm/v1/metrics/stats.py:130-142, called at
+//     vllm/v1/core/kv_cache_manager.py:234-240.)
 //     (The async-scheduling counters num_output_placeholders /
 //     async_tokens_to_discard / next_decode_eligible_step and max_tokens are
 //     un-deferred below for ENG-ASYNC-SCHED — spec async-serving.md W3.)
@@ -147,6 +151,12 @@ struct Request {
   // Appended to during decode via AppendOutputToken.
   std::vector<int32_t> output_token_ids;
   int num_computed_tokens = 0;
+  // How many times this request has been preempted (upstream
+  // Request.num_preemptions). Incremented by Scheduler::preempt_request; read
+  // by KVCacheManager::get_computed_blocks to route the lookup into
+  // PrefixCacheStats' preempted_* counters, so a preempted request's
+  // guaranteed second-pass hit cannot inflate the headline hit rate.
+  int num_preemptions = 0;
   RequestStatus status = RequestStatus::kWaiting;
   // stop_reason (upstream Request.stop_reason: int | str | None = None). Set by
   // check_stop (sched/utils) when a stop_token_ids match ends the request — it

@@ -136,7 +136,14 @@ std::pair<KVCacheBlocks, int> KVCacheManager::get_computed_blocks(
       coordinator->find_longest_cache_hit(request.block_hashes,
                                           max_cache_hit_length);
 
-  // log_stats / prefix_cache_stats.record(...) is DEFERRED (see header).
+  // Upstream vllm/v1/core/kv_cache_manager.py:234-240. queries/hits count
+  // TOKENS; a previously-preempted request is routed into the
+  // mutually-exclusive preempted_* triple so its guaranteed second-pass hit
+  // does not inflate the headline rate.
+  if (log_stats) {
+    prefix_cache_stats.record(request.NumTokens(), num_new_computed_tokens,
+                              request.num_preemptions > 0);
+  }
 
   return {create_kv_cache_blocks(computed_blocks), num_new_computed_tokens};
 }
@@ -265,8 +272,22 @@ bool KVCacheManager::reset_prefix_cache() {
   if (!block_pool.reset_prefix_cache()) {
     return false;
   }
-  // log_stats / prefix_cache_stats.reset is DEFERRED (see header).
+  // Upstream vllm/v1/core/kv_cache_manager.py:522-524: flag the RESET so the
+  // consuming CachingMetrics window clears before folding in the next
+  // observation, rather than blending pre- and post-reset hit rates.
+  if (log_stats) {
+    prefix_cache_stats.reset = true;
+  }
   return true;
+}
+
+std::optional<PrefixCacheStats> KVCacheManager::make_prefix_cache_stats() {
+  if (!log_stats) {
+    return std::nullopt;
+  }
+  PrefixCacheStats stats = prefix_cache_stats;
+  prefix_cache_stats = PrefixCacheStats();
+  return stats;
 }
 
 std::vector<int> KVCacheManager::get_num_common_prefix_blocks(

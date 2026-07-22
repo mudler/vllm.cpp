@@ -320,6 +320,12 @@ add_library(vllm STATIC
   src/vllm/v1/core/single_type_kv_cache_manager.cpp
   src/vllm/v1/core/kv_cache_coordinator.cpp
   src/vllm/v1/core/kv_cache_manager.cpp
+  src/vllm/v1/kv_offload/cache_identity.cpp
+  src/vllm/v1/kv_offload/cache_policy.cpp
+  src/vllm/v1/kv_offload/cpu_manager.cpp
+  src/vllm/v1/kv_offload/kv_block_transfer.cpp
+  src/vllm/v1/kv_offload/fs_io.cpp
+  src/vllm/v1/kv_offload/fs_tier.cpp
   src/vllm/v1/core/sched/request_queue.cpp
   src/vllm/v1/core/sched/output.cpp
   src/vllm/v1/core/sched/scheduler.cpp

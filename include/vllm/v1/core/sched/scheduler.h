@@ -197,6 +197,14 @@ class Scheduler {
   // The KV cache manager the scheduler drives (heap-owned; non-movable).
   std::unique_ptr<KVCacheManager> kv_cache_manager;
 
+  // The rolling prefix-cache hit rate over the most recent 1000 REQUESTS.
+  // schedule() folds each step's take-and-swap delta in. This is the engine's
+  // answer to "prove the cache is being hit", which the benchmark protocol
+  // requires of every caching/offloading arm.
+  const CachingMetrics& prefix_cache_metrics() const {
+    return prefix_cache_metrics_;
+  }
+
  protected:
   // _update_after_schedule (scheduler.py:1166-1213): advance num_computed_tokens
   // for every scheduled request, refresh is_prefill_chunk (num_computed <
@@ -222,6 +230,9 @@ class Scheduler {
   int current_step() const { return current_step_; }
 
  private:
+  // Backing store for prefix_cache_metrics(); written only by schedule().
+  CachingMetrics prefix_cache_metrics_;
+
   // _preempt_request: free the request's KV, mark it PREEMPTED, reset its
   // computed tokens, and re-queue it to the FRONT of waiting (FCFS retry). The
   // request must already have been popped from running by the caller.

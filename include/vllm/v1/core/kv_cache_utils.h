@@ -149,6 +149,12 @@ using HashFn = std::function<BlockHash(const CborValue&)>;
 // identical to upstream `vllm.utils.hashing.sha256_cbor`.
 BlockHash sha256_cbor(const CborValue& value);
 
+// Raw SHA-256 of a byte string, returned as 32 RAW bytes (not hex). Exposed so
+// the KV-offload identity header digests its canonical JSON with the SAME
+// implementation the block hashes use — there must never be a second SHA-256 in
+// this tree.
+std::string sha256_bytes(const std::string& data);
+
 // A single extra key for a block hash: either a text string (a LoRA name or a
 // cache salt) or an (identifier, offset) pair (a multi-modal input). Mirrors the
 // heterogeneous Python objects upstream places in the extra_keys tuple.
@@ -162,11 +168,57 @@ using ExtraKeys = std::optional<std::vector<ExtraKey>>;
 // by init_none_hash. Upstream: module-global `NONE_HASH`.
 extern BlockHash NONE_HASH;
 
-// Initialize NONE_HASH. Mirrors upstream init_none_hash: with a seed (upstream's
-// PYTHONHASHSEED), NONE_HASH = hash_fn(text(seed)) for reproducibility; without
-// one, NONE_HASH = 32 random bytes (upstream os.urandom(32)).
+// Where the NONE_HASH chain seed came from. Recorded so the value's provenance
+// is auditable and can be written into a persisted-cache identity header (a
+// cache written under one seed must never be read under another).
+enum class NoneHashSeedSource : int {
+  // An explicit seed argument was passed to init_none_hash.
+  kExplicit = 0,
+  // From VLLM_PREFIX_CACHING_HASH_SEED (our escape hatch).
+  kEnvVllmCpp = 1,
+  // From PYTHONHASHSEED (upstream's escape hatch, mirrored for parity so an
+  // operator's existing vLLM deployment recipe keeps working).
+  kEnvPythonHashSeed = 2,
+  // No seed anywhere: the fixed built-in default (DETERMINISTIC BY DEFAULT).
+  kDefault = 3,
+  // VLLM_PREFIX_CACHING_HASH_SEED=random: 32 bytes of std::random_device.
+  kRandom = 4,
+};
+
+// The provenance of the current NONE_HASH.
+struct NoneHashProvenance {
+  NoneHashSeedSource source = NoneHashSeedSource::kDefault;
+  // The seed text that was hashed (empty for kRandom).
+  std::string seed;
+  // A short stable name for the source, for logs/records/headers.
+  const char* source_name() const;
+};
+
+// The fixed built-in chain seed used when nothing else supplies one.
+// DEVIATION FROM UPSTREAM, deliberate and recorded (kv-persistence-lmcache.md
+// §B5): upstream falls back to os.urandom(32)
+// (vllm/v1/core/kv_cache_utils.py:111-112), which makes block hashes differ
+// across processes and silently yields a 0% hit rate on any content-addressed
+// persisted cache unless the operator sets PYTHONHASHSEED identically
+// everywhere (vllm/docs/features/kv_offloading_usage.md:117-120). Our threat
+// model (a local library plus server) has no hash-DoS concern, so the
+// deterministic value is the DEFAULT and randomness is the opt-in. This string
+// is part of our on-disk cache identity: NEVER change it.
+inline constexpr const char* kDefaultNoneHashSeed = "vllm.cpp/none_hash/v1";
+
+// Initialize NONE_HASH. Mirrors upstream init_none_hash
+// (vllm/v1/core/kv_cache_utils.py:99-114) with the seed resolution order:
+//   1. the explicit `seed` argument, if given;
+//   2. $VLLM_PREFIX_CACHING_HASH_SEED — the literal value "random" selects
+//      upstream's os.urandom(32) behaviour, anything else is used as the seed;
+//   3. $PYTHONHASHSEED — upstream's own escape hatch, mirrored;
+//   4. kDefaultNoneHashSeed (deterministic; see the deviation note above).
+// In every seeded case NONE_HASH = hash_fn(text(seed)), exactly as upstream.
 void init_none_hash(const HashFn& hash_fn,
                     std::optional<std::string> seed = std::nullopt);
+
+// The provenance of the NONE_HASH set by the last init_none_hash call.
+const NoneHashProvenance& none_hash_provenance();
 
 // KV-cache block metadata. Mirrors upstream's @dataclass(slots=True)
 // KVCacheBlock. The prev_free_block / next_free_block links form the intrusive

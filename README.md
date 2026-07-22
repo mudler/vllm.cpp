@@ -697,34 +697,60 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
   eviction, all three cache-hit coordinators and the hybrid cross-group
   intersection are ported and unit-tested. A full parity audit against pinned
   vLLM landed 2026-07-22
-  ([spike](.agents/specs/prefix-prompt-caching-parity.md)) and the honest
-  remaining gaps are: **no cache hit-rate statistics or metrics of any kind**;
+  ([spike](.agents/specs/prefix-prompt-caching-parity.md)).
+  **Cache hit-rate statistics now exist and are on by default** (2026-07-22),
+  mirroring vLLM's own counters: queries and hits are counted in tokens over a
+  rolling window of the most recent 1000 requests, with previously-preempted
+  requests kept in separate counters so their guaranteed re-hit cannot inflate
+  the headline number. The first measurement confirms the cache genuinely
+  works: a repeated-prefix workload of 16 requests sharing a 128-token system
+  prompt reports a **0.75 hit rate (1920 of 2560 queried tokens served from
+  cache)**, against 0.0 with caching turned off. The honest remaining gaps are:
   block-hash extra keys (multimodal / LoRA / `cache_salt`) are stubbed, so
   `cache_salt` is unsupported and this must be completed before any multimodal
   or LoRA support lands; KV-cache events are inert; only one of vLLM's four
-  hash algorithms is shipped; and `reset_prefix_cache` exists in the engine but
-  is not reachable from the API. **No end-to-end gate has yet been run with
-  caching ON**, so APC currently has unit-test evidence only and no measured
-  speed or correctness result — treat it as functional but ungated. The binding
-  SGLang/vLLM shared-prefix competitor gate remains pending and is blocked on
-  the missing hit-rate counters.
+  hash algorithms is shipped; `reset_prefix_cache` exists in the engine but is
+  not reachable from the API; and there is still no `/metrics` endpoint, so the
+  hit rate is readable from the engine API rather than scraped. **No end-to-end
+  model gate has yet been run with caching ON**, so APC still has no measured
+  speed or correctness result on real hardware — treat it as functional and now
+  measurable, but ungated. The binding SGLang/vLLM shared-prefix competitor
+  gate remains pending; it is no longer blocked on missing counters.
 - Cascade attention (vLLM's shared-prefix batch attention) is **not
   implemented, and after audit is not planned**: upstream disables it by
   default, it exists only on the legacy V1 runner rather than the V2 runner we
   mirror, and on Blackwell the attention backend that implements it is never
   selected.
-- **Persisting the KV cache to disk is not supported yet**, and neither are
-  external KV-cache connectors or LMCache. Both were audited against pinned vLLM
-  on 2026-07-22 ([spike](.agents/specs/kv-persistence-lmcache.md)); the earlier
-  note here that vLLM also lacks disk persistence was **wrong** and is corrected:
-  vLLM has covered it since its `kv_offload` filesystem tier landed, storing one
-  raw file per KV block. That tier is a near-verbatim port for us and is
-  scheduled; what blocks it first is on our side — our block hashes are seeded
-  randomly per process, so a cache written to disk would find nothing on restart.
-  Fixing that is the first work item. Note also that a disk cache written by
-  vllm.cpp will not interoperate with a stock vLLM unless that vLLM is launched
-  with `--prefix-caching-hash-algo sha256_cbor`, because our block-hash algorithm
-  deviates from upstream's default by design.
+- **Persisting the KV cache to disk: the storage layer is built, but it is not
+  yet wired into the engine, so there is no user-facing option to switch on.**
+  Audited against pinned vLLM on 2026-07-22
+  ([spike](.agents/specs/kv-persistence-lmcache.md)); the earlier note here that
+  vLLM also lacks disk persistence was **wrong** and is corrected: vLLM has
+  covered it since its `kv_offload` filesystem tier landed, storing one raw file
+  per KV block.
+  What now exists on our side: **block hashes are deterministic across
+  processes by default** (this was the blocker — they were previously seeded
+  randomly per process, so a cache written to disk would have found nothing on
+  restart; the fix is proven by a test that compares hashes produced by
+  separately launched processes); a **CPU offload tier** with LRU and ARC
+  replacement; and a **disk tier** that writes one raw file per block, publishes
+  it atomically, and deletes any file it cannot read so a corrupt entry becomes
+  a clean miss rather than a permanent error.
+  Two things here are deliberately **better than vLLM**. First, every block
+  file carries an identity header that is **read and checked on every open**,
+  covering the model, its full configuration digest, weight quantization, KV
+  dtype, rope configuration, sliding window, cache shape and the hash seed; if
+  any of them differs the cache is **refused outright** rather than silently
+  serving another model's data as plausible but wrong tokens. vLLM writes a
+  configuration file it never reads back, and its only check omits most of
+  those fields. Second, our disk tier honours a **size budget** and evicts, so
+  it cannot fill the disk; vLLM's grows without limit.
+  What is still missing: nothing connects these tiers to the running engine
+  yet, so there is no flag to enable them and no measured speed benefit. Note
+  also that a disk cache written by vllm.cpp will not interoperate with a stock
+  vLLM unless that vLLM is launched with `--prefix-caching-hash-algo
+  sha256_cbor`, because our block-hash algorithm deviates from upstream's
+  default by design.
 - **LMCache is an external Python package, not a vLLM component.** vLLM ships
   only the adapter glue; the cache engine, wire protocol and transport all live
   in the separate `lmcache` package. Interoperating from a pure-C++ engine is

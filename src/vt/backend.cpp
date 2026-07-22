@@ -22,6 +22,8 @@ Event Backend::CreateEvent() { return Event{}; }
 void Backend::DestroyEvent(Event&) {}
 void Backend::RecordEvent(Event&, Queue&) {}
 void Backend::SynchronizeEvent(Event&) {}
+// Synchronous backends: every previously submitted op has already completed.
+bool Backend::QueryEvent(Event&) { return true; }
 void Backend::QueueWaitEvent(Queue&, Event&) {}
 
 void Backend::BeginCapture(Queue&) { VT_CHECK(false, "graph capture unsupported on this backend"); }

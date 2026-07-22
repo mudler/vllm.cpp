@@ -144,6 +144,18 @@ class CudaBackend final : public Backend {
     Check(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(e.handle)),
           "cudaEventSynchronize");
   }
+  bool QueryEvent(Event& e) override {
+    // cudaEventQuery returns cudaErrorNotReady (NOT an error) while the event
+    // is outstanding; anything else is a real failure. Clear the sticky
+    // not-ready status so it cannot be mistaken for a later launch error.
+    const cudaError_t status = cudaEventQuery(reinterpret_cast<cudaEvent_t>(e.handle));
+    if (status == cudaErrorNotReady) {
+      (void)cudaGetLastError();
+      return false;
+    }
+    Check(status, "cudaEventQuery");
+    return true;
+  }
   void QueueWaitEvent(Queue& q, Event& e) override {
     Check(cudaStreamWaitEvent(AsStream(q),
                               reinterpret_cast<cudaEvent_t>(e.handle), 0),

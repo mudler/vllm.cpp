@@ -133,6 +133,15 @@ class EngineCore {
   // stepping to drain it even after the scheduler has no more requests.
   bool has_batch_queue_work() const { return !batch_queue_.empty(); }
 
+  // The engine's rolling prefix-cache hit rate (queries/hits in TOKENS over the
+  // most recent 1000 requests). Upstream surfaces the same numbers as the
+  // Prometheus counters vllm:prefix_cache_queries / vllm:prefix_cache_hits
+  // (vllm/v1/metrics/loggers.py:547,558); we have no /metrics route yet
+  // (SERVE-METRICS), so this accessor is the engine-side evidence surface.
+  const CachingMetrics& prefix_cache_metrics() const {
+    return scheduler_.prefix_cache_metrics();
+  }
+
  protected:
   // Protected (not private) because EngineCoreProc subclasses EngineCore
   // exactly as upstream (core.py:896 `class EngineCoreProc(EngineCore)`) and

@@ -19258,3 +19258,182 @@ unclaimed; no implementation row moved.
 `python3 scripts/check-agent-record.py`, `python3 scripts/check-doc-checkpoint.py`.
 Next: `S2` residue is now just Metal `get_attn_backend_priority()`, then `S3`
 (platform capability fields, which retires the 3 remaining class-D sites).
+## 2026-07-22 — KV persistence W1–W3 + prefix-cache statistics: hashes made deterministic, the CPU and disk tiers built, and the first cache-hit rate this project has ever measured (`CLAIM-KV-PERSISTENCE-LMCACHE` W1–W3 + `CLAIM-PREFIX-PROMPT-CACHING` W1, base `72f5db2`, worktree `agent-a39bc43d3e973d12a`)
+
+Four things landed in one change, in strict dependency order. Three of them are
+storage machinery; the first is a live defect fix that everything else was
+blocked on, and the second is the reason any of it can be measured at all.
+
+### A — deterministic block hashes (KV spike W1). A DEFECT, not a feature.
+
+`init_none_hash` filled `NONE_HASH` from `std::random_device` whenever no seed
+was passed, and the only production caller — `LoadedEngine::EnsureNoneHash` —
+passed none. Block hashes **chain** from `NONE_HASH`, so every block hash of
+every request differed between processes. The comment justifying the unseeded
+call ("prefix caching stays inert for prompts shorter than a block") is true
+only for the sub-block case and does not generalise; it has been replaced.
+
+Consequence, and why this had to be first: any content-addressed persisted
+cache would have scored **0% hits on restart**. This also falsified the caching
+spike's §B2 claim that "ours is deterministic by construction" was a
+beyond-parity win — we were **worse** than vLLM, which at least exposes
+`PYTHONHASHSEED` and warns when it is unset.
+
+The fix resolves the seed inside `init_none_hash`: explicit argument >
+`$VLLM_PREFIX_CACHING_HASH_SEED` > `$PYTHONHASHSEED` > a fixed built-in default.
+Upstream's `os.urandom(32)` branch survives as the opt-in
+`VLLM_PREFIX_CACHING_HASH_SEED=random`. `PYTHONHASHSEED` is mirrored so an
+operator with an existing vLLM fleet recipe gets the same hashes here.
+Provenance is recorded (`none_hash_provenance()`) and written into the disk
+identity header, so a cache written under one seed can never be read under
+another. We now **beat** upstream on this axis instead of trailing it.
+
+**The proof is cross-PROCESS, which is the whole point.** An in-process loop
+would have agreed with the old random seed perfectly.
+`tests/vllm/v1/test_none_hash_determinism.cpp` resolves its own path via
+`/proc/self/exe`, re-execs itself twice with `--no-skip --test-case=…`, and
+compares the chained hash lists the children print. Both env hatches are
+covered, and the negative control confirms `=random` genuinely makes two
+processes disagree — without it, "the hashes match" would prove nothing.
+
+### B — prefix-cache statistics (caching spike W1). The measurement blocker.
+
+There were **no prefix-cache statistics at any level** before this. That made
+every caching and offloading benchmark unrunnable, because the protocol voids
+any arm that cannot prove a hit, and it blocked
+`BACKEND-GATE-CUDA-SGLANG-PREFIX` outright.
+
+`BaseCacheStats`, `PrefixCacheStats` and `CachingMetrics` are ported 1:1 from
+`vllm/v1/metrics/stats.py:18-142` into `include/vllm/v1/metrics/stats.h`, wired
+into `KVCacheManager::get_computed_blocks` (record), `reset_prefix_cache` (the
+reset flag), `make_prefix_cache_stats()` (take-and-swap) and the end of
+`Scheduler::schedule()` (fold one step's delta into the window), and exposed as
+`Scheduler`/`EngineCore`/`LLMEngine::prefix_cache_metrics()`.
+`Request::num_preemptions` is un-deferred to feed the mutually-exclusive
+`preempted_*` triple. Per the standing parity-enabler rule **`log_stats`
+defaults ON**, mirroring upstream's `disable_log_stats=False`; the cost is three
+integer adds per admitted request.
+
+**MEASURED, and predicted before it was observed: a 0.75 hit rate — 1920 of
+2560 queried tokens served from cache over 16 requests** sharing a 128-token
+system prompt with 32 unique tokens each. The arithmetic is forced (request 0
+populates, 15 × 128 hit tokens, 16 × 160 queried), so this is a prediction the
+engine confirmed rather than a number we read off. The **caching-OFF control
+reports 0.0**, which is what makes it evidence about the cache rather than
+about the counter.
+
+### C and D — the CPU tier and the disk tier
+
+CPU tier: a pluggable `CachePolicy` seam with LRU and ARC, the `ref_cnt == -1`
+not-ready sentinel (overloaded onto the refcount, exactly as upstream — a port
+with a separate `bool ready` desynchronizes), the ATOMIC `evict` (a partial
+eviction is wrong), `CPUOffloadingManager` with the four-state lookup and the
+`prepare_store -> nullopt` **skip** control path (not an error), a pinned
+`CPUBackingStore`, and a side-queue event-polled `KVBlockTransferWorker`. The
+transfer worker needed one additive vt seam: a non-blocking
+`vt::Backend::QueryEvent` (base returns true, CUDA overrides with
+`cudaEventQuery`), because upstream polls completion per step and a blocking
+check there would stall the engine.
+
+Disk tier: one raw file per block under upstream's exact fan-out, temp-file +
+atomic rename publish, short read/write treated as an error, self-healing unlink
+of anything unreadable, and a dual-queue read/write pool where each worker
+drains the other's queue.
+
+**Two places we deliberately exceed upstream, both because copying it would be
+unsafe or unshippable:**
+
+1. **A VERIFIED identity header, read on EVERY open, that REFUSES on mismatch.**
+   Upstream's `fs` tier writes a `config.json` it never reads — there is no
+   reader anywhere in its repo — and its only check is a 12-hex path digest
+   that omits checkpoint content, weight quantization, rope config and
+   `sliding_window`. Loading a block from a different model there produces
+   plausible tokens that are simply wrong: no crash, no warning. We verify at
+   two levels: `config.json` is read back and compared field by field at tier
+   open (the error names the field), and every block file carries a header whose
+   identity digest, payload size and own key are checked before a single payload
+   byte is trusted. **27 fields, one negative test each, plus a positive
+   control** so the matrix cannot be passing by rejecting everything.
+2. **A bounded, evicting tier.** Upstream's has no capacity accounting and no
+   eviction, so it fills the disk — which on these boxes presents as unrelated
+   bogus test failures (the recorded ENOSPC lesson). Ours holds a byte budget
+   over the same `CachePolicy` seam, honoured across restarts by rebuilding its
+   index from the headers on disk. Safe to add because eviction is semantically
+   transparent: it loses a hit, never changes a token.
+
+The on-disk payload is **opaque bytes of exactly `page_size_bytes()`** with the
+spec kind in the header, so one code path serves full attention (rank-4,
+interleaved `[K|V]`, factor-2 block stride) and MLA (rank-3, one 576-wide
+latent, no separate V). Both are round-tripped byte-exactly in the suite.
+
+### Not ported, each with its reason
+
+`O_DIRECT` — a `[header][payload]` file breaks its buffer/offset/length
+alignment requirement; buffered IO is the correct first implementation and
+reinstating it is a measured optimization, not a correctness item. The
+GIL-releasing `faccessat` C extension — unconditionally unnecessary without a
+GIL. `cuMemcpyBatchAsync`/Triton copy-kernel selection — upstream's own
+`cudaMemcpyAsync` fallback is the correct first implementation.
+`GPULoadStoreSpec`'s `group_sizes`/`block_indices` — they describe an unaligned
+case that cannot arise while `block_size == hash_block_size`. The `/dev/shm`
+multi-worker region — single-rank today.
+
+**R4 is resolved on the safe side.** Upstream's
+`is_src_access_order_any = not gpu_to_cpu` is a correctness requirement wearing
+the costume of a knob: a GPU→CPU copy must keep stream source ordering because
+the compute stream is still writing the source, and getting it backwards gives
+torn blocks under load and nothing under a light test. `vt::Backend::Copy` is
+stream-ordered in both directions, so we give up an optimization on the H2D leg
+and never a guarantee on the D2H leg. Documented at the call site so a future
+batched fast path re-derives the flag from the direction rather than exposing it.
+
+### Gates
+
+Clean CPU `-Werror` build, **0 warnings**; full CPU ctest green; CUDA build
+unbroken. New suites: determinism 7/7, statistics 12/12, CPU tier 21/21, disk
+tier 22/22 + 3 SKIPs. dgx regressions all **UNCHANGED**, each run standalone:
+27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6,
+DeepSeek-V2 8/8.
+
+**No model numerics moved.** Every edit to shared code is additive — a stats
+struct, a `num_preemptions` counter, a `QueryEvent` virtual with a
+true-returning base — plus the `NONE_HASH` seed change, which alters block-hash
+*values* but not the hashing algorithm, the cache-hit logic, or any tensor.
+
+### Resume point and prohibitions
+
+**Nothing in the scheduler or the runner consumes these tiers yet.** W4 (the
+tiering manager plus the `OffloadingConnector` scheduler half) is the resume
+point; W5 generalizes the connector seam. Until W4 lands there is no
+user-facing flag, no engine path whose latency could change, and **no speed
+number is owed** — do not publish a synthetic file-IO rate as a benchmark
+result; it would be a number without a workload.
+
+Do NOT claim disk KV persistence is "supported" in a user-facing sense: the
+storage layer exists and is gated, but it is unreachable from the engine. Do
+NOT weaken the identity refusal to a warning under any circumstances — it is
+the property that makes this feature shippable, and it is the one place where
+"better than vLLM" is a correctness claim rather than a speed claim. Do NOT
+treat `SlidingWindowSpec`, quantized KV, or GDN/Mamba recurrent state as
+covered: all three are SKIP-marked with their owning rows
+(`KV-SLIDING-WINDOW-SPEC`; `KV-FP8`/`KV-NVFP4-TURBO`, since every spec's
+`real_page_size_bytes()` throws for quantized KV; `KV-MAMBA-ALIGN`, since GDN
+state is addressed by a remapped slot rather than a block id). Do NOT change
+`kDefaultNoneHashSeed` — it is part of the on-disk cache identity, and changing
+it silently invalidates every persisted cache.
+
+Note for the record: a disk cache written by vllm.cpp will not interoperate
+with a stock vLLM unless that vLLM is launched with
+`--prefix-caching-hash-algo sha256_cbor`, because our block-hash algorithm
+deviates from upstream's default by design. The identity header writes
+`inference_engine: "vllm.cpp"` so the two can never be confused.
+
+```bash
+# reproduce the CPU evidence
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j20
+cd build && ctest -j2
+./tests/test_none_hash_determinism            # cross-process hash determinism
+./tests/test_prefix_cache_stats -s            # prints the measured 0.75 hit rate
+./tests/test_kv_offload_cpu
+./tests/test_kv_offload_fs
+```

@@ -65,13 +65,19 @@
 //     the gate models use the defaults (metrics_collector omitted, world sizes
 //     == 1, watermark 0.0).
 //
-// DEFERRED (marked; the gate models never exercise these):
+// PORTED (was DEFERRED):
 //   - PrefixCacheStats / make_prefix_cache_stats / the log_stats record() path
-//     in get_computed_blocks: log_stats defaults false; prefix_cache_stats is
-//     not materialized. Upstream vllm/v1/metrics/stats.py.
-//   - request.skip_reading_prefix_cache (prompt-logprobs / all-pooling skip) and
-//     request.num_preemptions: not on the T0 Request (deferred there); the
-//     get_computed_blocks early-out is on enable_caching only.
+//     in get_computed_blocks (upstream vllm/v1/metrics/stats.py:115-142,
+//     vllm/v1/core/kv_cache_manager.py:190-200,234-240,522-524). log_stats now
+//     DEFAULTS ON (mirroring upstream's `disable_log_stats=False`), because a
+//     benchmark arm without a hit counter is void under
+//     .agents/benchmark-protocol.md. The recording cost is three integer adds
+//     per admitted request.
+//
+// DEFERRED (marked; the gate models never exercise these):
+//   - request.skip_reading_prefix_cache (prompt-logprobs / all-pooling skip):
+//     not on the T0 Request; the get_computed_blocks early-out is on
+//     enable_caching only.
 //   - take_events()' kv_cache_event_metadata annotation (BlockStored group-idx
 //     spec-kind / sliding-window tagging): events are deferred at the BlockPool
 //     (M1.2), so take_events() forwards block_pool.take_events() unannotated.
@@ -88,6 +94,7 @@
 
 #include "vllm/v1/core/block_pool.h"
 #include "vllm/v1/core/kv_cache_coordinator.h"
+#include "vllm/v1/metrics/stats.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/kv_cache_interface.h"
 
@@ -134,7 +141,7 @@ class KVCacheManager {
                  int scheduler_block_size, int hash_block_size,
                  std::optional<int> max_num_batched_tokens = std::nullopt,
                  bool enable_caching = true, bool use_eagle = false,
-                 bool log_stats = false, bool enable_kv_cache_events = false,
+                 bool log_stats = true, bool enable_kv_cache_events = false,
                  int dcp_world_size = 1, int pcp_world_size = 1,
                  double watermark = 0.0);
 
@@ -181,6 +188,13 @@ class KVCacheManager {
   // Reset the prefix cache. Returns false (no-op) if any block is still in use.
   bool reset_prefix_cache();
 
+  // Take (and reset) the prefix-cache statistics accumulated since the last
+  // call. Returns std::nullopt when log_stats is off. Upstream:
+  // make_prefix_cache_stats (vllm/v1/core/kv_cache_manager.py:190-200) — the
+  // take-and-swap is load-bearing: the caller aggregates DELTAS into a
+  // CachingMetrics window, so a non-destructive read would double count.
+  std::optional<PrefixCacheStats> make_prefix_cache_stats();
+
   // Number of common prefix blocks per kv cache group for a running request.
   std::vector<int> get_num_common_prefix_blocks(
       const std::string& running_request_id);
@@ -226,6 +240,9 @@ class KVCacheManager {
   BlockPool& block_pool;
   // Pre-constructed empty result (num_kv_cache_groups empty groups).
   KVCacheBlocks empty_kv_cache_blocks;
+  // Statistics accumulated since the last make_prefix_cache_stats(). Only
+  // written when log_stats is true. Upstream self.prefix_cache_stats.
+  PrefixCacheStats prefix_cache_stats;
 };
 
 }  // namespace vllm::v1

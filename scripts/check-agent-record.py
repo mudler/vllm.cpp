@@ -22,12 +22,16 @@ MATRICES = {
     # bumped when a genuinely new scheme is inventoried — never to make a failing
     # state transition pass.
     "QUANT": (AGENTS / "quantization-matrix.md", 82),
-    # 33 since 2026-07-22: +`KERNEL-ACCEL-PROVIDER-SELECT` (which IMPLEMENTATION of an
-    # op runs when a device has more than one — the selection layer above every
-    # kernel family here, distinct from `KERNEL-CUDA-DISPATCH-AOT`, which selects an
-    # ARCH for one implementation). Inventory size, bumped for a genuinely new
-    # family — never to make a failing state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 33),
+    # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
+    # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
+    # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block
+    # tensor of a mixed GGUF). 33 since 2026-07-22: +`KERNEL-ACCEL-PROVIDER-SELECT`
+    # (which IMPLEMENTATION of an op runs when a device has more than one — the
+    # selection layer above every kernel family here, distinct from
+    # `KERNEL-CUDA-DISPATCH-AOT`, which selects an ARCH for one implementation).
+    # Inventory size, bumped for a genuinely new family — never to make a failing
+    # state transition pass.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 34),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

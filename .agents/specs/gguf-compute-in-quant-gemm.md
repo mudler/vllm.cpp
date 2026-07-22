@@ -156,9 +156,9 @@ there (i8mm repack expected) before comparing.
 | G2 | activation quant | `quantize_row_q8_0/q8_K` ports + scratch sizing; unit tests | G1 | **DONE** 2026-07-22 |
 | G3 | tier-0 vec_dot kernels | the six generic `vec_dot` ports + GEMM wiring + test-quantize-fns/backend-ops ports + parity goldens | G1, G2 | **DONE** 2026-07-22 |
 | G4 | e2e enablement | route `MatmulBT` call sites on block dtype; engine gates (3) + `VT_CPU_REF` A/B; first B4-recipe measurement (tier-0 milestone) | G3, loader L2-L3, threadpool W2 | **DONE** 2026-07-22 |
-| G5 | x86 AVX2 tier | `arch/x86` vec_dot ports + feature probe; tier-1 milestone measurement | G3 | open |
-| G6 | Arm NEON/i8mm tier | `arch/arm` ports incl. `nrows==2` mmla; GB10 measurement | G3 | open |
-| G7 | repack tier | repack-at-load + gemv/gemm + `quantize_mat_t`; selection parity vs `:4528`; closes gates 4-5 | G4 + loader L2 | open |
+| G5 | x86 AVX2 tier | `arch/x86` vec_dot ports + feature probe; tier-1 milestone measurement | G3 | open — **BLOCKED on a fresh profile** (see G4 §Consequences item 0) and on a non-`VOID` x86 host |
+| G6 | Arm NEON/i8mm tier | `arch/arm` ports incl. `nrows==2` mmla; GB10 measurement | G3 | open — **BLOCKED on a fresh profile** (see G4 §Consequences item 0); a prefill candidate, but no longer ranked on the stale attribution |
+| G7 | repack tier | repack-at-load + gemv/gemm + `quantize_mat_t`; selection parity vs `:4528`; closes gates 4-5 | G4 + loader L2 | open — parked; **BLOCKED on a fresh profile** (see G4 §Consequences item 0) |
 | G8 | ledger + matrix closure | full A/B series, ledger row, flip `C`/`E`/`P` cells per encoding row (Q8_0/Q4_K/Q5_K/Q6_K/Q3_K/Q4_0), roadmap update | G4-G7 | open |
 
 G5/G6 are parallel; G7 may start once G4's layout is fixed.
@@ -493,6 +493,17 @@ blocks ≈ 6.35 GiB, against 6.401 GiB measured.
 
 ### Consequences for the plan (supersedes the ranking in the floor re-measurement)
 
+0. **RESOLVED (2026-07-22, later the same day).** Item 1 below was acted on
+   immediately and is now the landed row
+   [`KERNEL-GEMM-CPU-ELEM`](cpu-elementwise-gemm.md) **E1-E4**: the elementwise
+   GEMM went 18-24 -> 69-351 GFLOP/s **bit-exactly** (memcmp gate, same token
+   md5), taking the CPU position from 3.38x / 8.20x / 2.29x to **decode 1.03x
+   (parity within 3.1 %) / prefill 2.34x / RSS 2.29x**. Its own measured
+   negative re-ranks items 2-3 once more: M-blocking that kernel bought 1.63x at
+   the op level and **0.0 % end to end**, so prefill is no longer GEMM-bound of
+   EITHER kind, and the 95.37 % `kMatmul` attribution below is **STALE**. **G5,
+   G6 and G7 must not be started against it** — a fresh op-dispatch profile of
+   the current binary is owed first.
 1. **The elementwise bf16/f16 GEMM is now the #1 CPU lever, ahead of G5-G7.**
    It owns 60 % of this file's weight mass, EVERY safetensors CPU path, and
    every mixed GGUF (which is what published quants actually are). Its two known

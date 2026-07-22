@@ -19096,3 +19096,88 @@ contender), so any timing would be void. `BACKEND-GATE-METAL-MLXLM` stays
 **Next.** `M3b` (Qwen3-dense on Metal: +`kRopeCosSinCache`, `kRopeFromCache` —
 and it is what unlocks the MLX competitor gate), `M3c` (batched encoders +
 hazard barriers, replacing one-command-buffer-per-op), `M2r`, `M4`, `W0b-3`.
+## 2026-07-22 — `KERNEL-GEMM-CPU-ELEM` **E1-E4**: the elementwise CPU GEMM specialized + SIMD-vectorized, BIT-EXACT (`CLAIM-KERNEL-CPU-ELEM-GEMM-1`, base `72f5db2`, worktree `agent-a0080369412fcd2a7`)
+
+**What this closed.** The CIQ **G4** result promoted the elementwise bf16/f16
+GEMM to the #1 CPU lever on measured grounds: the bench GGUF is MIXED — 1.062
+GiB of `q8_0` that G4 routed to the quant GEMM, but 1.615 GiB of `f16` that no
+block encoding covers, including the 970 MiB tied `token_embd`/`lm_head`, the
+biggest GEMM in the model. That 60 % of the weight bytes, plus EVERY safetensors
+CPU path, ran a kernel measured at 0.77-0.84 GFLOP/s/thread.
+
+**The two defects were both inside the K loop, and the second one was the big
+one.** `MatmulOneChunk` called `LoadF32(t, off)` — a `switch` on `t.dtype` — for
+BOTH operands per ELEMENT, and it accumulated into ONE f32 variable. That single
+accumulator is a loop-carried dependency on one adder, so the loop ran at one
+multiply-accumulate per FP-add latency; 0.8 GFLOP/s/thread is exactly what a
+~4-cycle latency predicts. The kernel was never ISA-bound or bandwidth-bound, it
+was latency-bound, which is why the PORTABLE tier — 16 independent accumulators,
+no intrinsics at all — is already ~2.1x on its own.
+
+**The design decision that made this shippable.** llama.cpp's
+`ggml_vec_dot_bf16`/`_f16` (`vec.cpp:139,264`) vectorize each dot ALONG K and
+finish with a horizontal reduce. That REASSOCIATES the sum, so a direct port
+would not have been bit-comparable to our scalar kernel, and every CPU golden,
+the `VT_CPU_REF` oracle and the thread-count determinism contract would have had
+to be re-argued. We instead took ggml's SIMD PRIMITIVES (the bf16
+shift-left-16 widen, the f16 hardware convert, separate mul+add and never FMA)
+and vectorized ACROSS OUTPUT COLUMNS — one output per SIMD lane, 16 at a time —
+so every output keeps its strictly sequential f32 reduction. On the `[N,K]`
+weight that costs a 4x4 transpose per 4 elements of K, which E4's M-blocking
+then amortizes over 4 activation rows. Result: **byte-identical output, zero
+goldens regenerated, zero tolerances widened**.
+
+**Correctness is gated by `memcmp`, not by NMSE.** New
+[test_ops_matmul_elem](../tests/vt/test_ops_matmul_elem.cpp), 5 cases / 654
+assertions: 3 activation x 3 weight x 2 output dtypes x 2 orientations x 14
+shapes (ragged K, ragged N, row-strided activations), thread counts 1/2/4/8, and
+the entire 16-bit domain — all 65,536 f16 and bf16 patterns through the op, with
+the inf/NaN patterns isolated so a NaN cannot swallow a sum. That case answers
+the one open question we had going in: the hardware converts agree with
+`vt::F16ToF32` on **every** pattern including signaling NaNs, so there was no
+divergence to quantify and the NMSE ≤ 5e-4 fallback was never needed. Green on
+x86-64 AND dgx aarch64, and under all three `VT_CPU_MATMUL_TIER` settings.
+
+**Binding measurement (idle dgx.casa aarch64, 20 cores, one `flock` for the
+whole build+measure series, `git archive` transfer, SAME binary, 3 reps,
+keep-quant ON in every arm so the A/B isolates this kernel).** TTFT 5,907.66 ->
+**1,730.38 ms**, TPOT 130.74 -> **42.03 ms**, peak RSS unchanged. Prefill 21.67
+-> **73.97 t/s (3.41x)**, decode 7.649 -> **23.79 t/s (3.11x)**. Against
+llama.cpp `237ad9b96` (pp128 173.28±1.75, tg32 24.52±0.45, RSS 2.798 GiB):
+**decode 3.21x -> 1.03x behind, i.e. AT PARITY within 3.1 % and inside
+llama.cpp's own run spread**; prefill 8.00x -> **2.34x**; RSS **2.29x**, unmoved.
+Op-level bf16 `[N,K]`: ref 18-24 -> portable 35-52 -> NEON 69-351 GFLOP/s.
+
+**The finding that should drive the next session, and it is a NEGATIVE one.**
+E4 (M-blocking) raised prefill op-level throughput **1.63x** (216 -> 351
+GFLOP/s) and moved end-to-end TTFT by **0.0 %**. Prefill is therefore no longer
+bound by this kernel. The consequence is bigger than the lever: the
+`kMatmul = 95.37 % of wall time` attribution that the whole CPU plan — G5, G6,
+G7, this row's own ranking — was ordered against was taken when the elementwise
+GEMM ran at 24 GFLOP/s. It now runs at 351. **That attribution is STALE and must
+not be reused.** The next CPU step is a fresh op-dispatch profile of the current
+binary at the prefill operating point (the same temporary `vt::GetOp` hook the
+floor re-measurement used, instrumentation reverted before any binding run), and
+nothing else should be started before it.
+
+**Standing facts for whoever picks this up.** RSS at 2.29x is now the largest
+single deficit and it is LOADER work, not kernel work — `QUANT-GGUF-KEEPQ-LOADER`
+**L5** (mmap-in-place residency + sharing the tied `lm_head` with the embedding
+table) is ~1.9 GiB of the 3.6 GiB gap. Decode is at parity and DRAM-bound; do
+not spend kernel effort there. FMA (`vfmaq_f32`/`_mm_fmadd_ps`) is the obvious
+remaining ~2x on the ALU-bound path and was deliberately NOT taken: it breaks the
+byte-identity that let this ship clean, and E4 already showed that path is not
+the bottleneck — if it is ever wanted it needs its own opt-in row gated on
+NMSE ≤ 5e-4 with tokens re-verified against the llama.cpp oracle. `E5`/`G5`
+(x86 AVX2/AVX512) stay open with real headroom — the x86 tier shipped here is
+SSE2 4-wide — but they CANNOT be gated: the x86 dev box is `VOID` for timing.
+
+**Do not.** Do not cite 3.38x / 8.20x / 2.29x as the current CPU position — that
+was G4's; it is now 1.03x / 2.34x / 2.29x. Do not run
+`test_qwen36_gguf_engine` co-scheduled (it OOMs; a co-scheduled failure is not a
+regression), and expect the two HTTP-server tests to flake under `ctest -j2` on
+the co-tenanted dev box (both green standalone). Do not read a CUDA-build GGUF
+run as evidence about the CPU quant path. Do not benchmark llama.cpp immediately
+after one of our 6.4 GiB arms without letting the page cache settle — two `tg32`
+legs in this series returned 17.40±9.70 and 3.95±1.83 under exactly that
+pressure and were discarded, not averaged.

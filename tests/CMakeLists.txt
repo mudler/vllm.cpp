@@ -220,6 +220,13 @@ vllm_cpp_add_test(test_ops_quant_traits vt/test_ops_quant_traits.cpp)
 # header (SwapForTesting) used by the thread-count determinism case. CPU-only.
 vllm_cpp_add_test(test_ops_quant_dot vt/test_ops_quant_dot.cpp)
 target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-ELEM-GEMM: the specialized + SIMD elementwise (bf16/f16/f32) GEMM. The
+# gate is BYTE-IDENTITY against an independent scalar reference across every
+# dtype combination, both weight orientations, ragged K/N, row-strided
+# activations, thread counts, and the exhaustive 16-bit f16/bf16 widening
+# domain. Reaches src/ for the tier header and the threadpool test hook.
+vllm_cpp_add_test(test_ops_matmul_elem vt/test_ops_matmul_elem.cpp)
+target_include_directories(test_ops_matmul_elem PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the env-gated cuBLASLt GEMM algo-selection diagnostic
 # helpers. Reaches the internal header under src/ (not public API); the cuBLASLt
 # emit it gates is CUDA-only and lives in src/vt/cuda/cuda_matmul.cu.

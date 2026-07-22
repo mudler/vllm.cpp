@@ -2015,97 +2015,127 @@ The complete contract is in the
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
 
-## CPU vs llama.cpp — compute-in-quant ROUTED, `ACCEPTED` / binding (2026-07-22)
+## CPU vs llama.cpp — elementwise GEMM vectorized, `ACCEPTED` / binding (2026-07-22)
 
-`BENCH-CPU-LLAMA` / `BACKEND-GATE-CPU-LLAMACPP` / `QUANT-GGUF-CIQ-GEMM` **G4**.
-Full result: [CIQ G4](../.agents/specs/gguf-compute-in-quant-gemm.md); the
-attribution that selected the lever:
+`BENCH-CPU-LLAMA` / `BACKEND-GATE-CPU-LLAMACPP` / `KERNEL-GEMM-CPU-ELEM`
+**E1-E4** (this checkpoint) on top of `QUANT-GGUF-CIQ-GEMM` **G4**.
+Full result: [elementwise CPU GEMM](../.agents/specs/cpu-elementwise-gemm.md);
+the quant-routing step under it: [CIQ G4](../.agents/specs/gguf-compute-in-quant-gemm.md);
+the attribution that selected both levers:
 [floor re-measurement](../.agents/specs/cpu-llamacpp-floor-remeasure-2026-07-22.md).
 
-**We are still behind llama.cpp on every axis and better on none — but by 2.9×
-to 4.1× less than this morning, and the residual is now a DIFFERENT op.**
+**Decode is now AT PARITY with llama.cpp (1.03×, inside its own run spread).
+Prefill is 2.34× behind and peak RSS 2.29× worse — those two remain open.**
 
-| Axis | llama.cpp `237ad9b96` | ours, pre-G4 | **ours, post-G4** | **ratio now** | ratio before |
+| Axis | llama.cpp `237ad9b96` | ours, before | **ours, now** | **ratio now** | ratio before |
 |---|---|---|---|---|---|
-| Prefill (pp128 vs 128/TTFT) | 175.71 ± 2.54 t/s | 5.149 t/s | **21.44 t/s** | **8.20× behind** | 34.1× |
-| Decode (tg32 vs 1000/TPOT) | 25.87 ± 1.36 t/s (isolated 25.26 ± 1.34) | 2.216 t/s | **7.650 t/s** | **3.38× behind** (3.30× vs isolated) | 11.7× |
-| Peak RSS | 2,934,124 KB = **2.798 GiB** | 7.428 GiB | **6.401 GiB** | **2.29× worse** | 2.66× |
+| Prefill (pp128 vs 128/TTFT) | 173.28 ± 1.75 t/s | 21.67 t/s | **73.97 t/s** | **2.34× behind** | 8.00× |
+| Decode (tg32 vs 1000/TPOT) | 24.52 ± 0.45 t/s (isolated 24.54 ± 0.79) | 7.649 t/s | **23.79 t/s** | **1.03× behind** (3.1 %; 1.032× vs isolated) | 3.21× |
+| Peak RSS | 2,934,136 KB = **2.798 GiB** | 6.401 GiB | **6.401 GiB** | **2.29× worse** | 2.29× |
 
-**Same-binary A/B gains: decode 3.45×, prefill 4.16×, peak RSS 1.16× less —
-with output tokens BYTE-IDENTICAL** across the pre-G4 arm, the post-G4 default
-and the `VT_CPU_REF=1` oracle (one md5, `d235db12f2cd304007530286a1755c95`).
+**Same-binary A/B gains: prefill 3.41×, decode 3.11×, peak RSS unchanged — with
+output tokens BYTE-IDENTICAL** across the BEFORE arm, the production default and
+the `VT_CPU_REF=1` oracle (one md5, `d235db12f2cd304007530286a1755c95` — the
+same md5 the previous CPU checkpoint recorded, so the CPU token stream has been
+stable across two consecutive kernel rewrites).
 
-**Binding arm = `dgx.casa` (GB10, aarch64, 20 cores), idle** (load average 0.11
-at series start, `nvidia-smi` reporting no compute apps), whole series under one
-`flock $HOME/gpu.lock`, source transferred by `git archive`, goldens md5-verified
-(475 files, `2965ef5772b556d3f3f86fedf4221b2f`) before and after. Model
-`Qwen3.5-2B-UD-Q8_K_XL.gguf` (`qwen35` dense, 1.94 B, 2.68 GiB; 103 `q8_0` +
-56 `f16` + 176 `f32` tensors). Three arms of the SAME binary, 3 reps each,
+**Binding arm = `dgx.casa` (GB10, aarch64, 20 cores), idle** (no co-tenant CPU
+process, `nvidia-smi` reporting no compute apps), whole build+measure series
+under one `flock $HOME/gpu.lock`, source transferred by `git archive`, goldens
+md5-verified (475 files, `2965ef5772b556d3f3f86fedf4221b2f`) before and after.
+Model `Qwen3.5-2B-UD-Q8_K_XL.gguf` (`qwen35` dense, 1.94 B, 2.68 GiB; 103
+`q8_0` + 56 `f16` + 176 `f32` tensors). Keep-quant is ON in every arm, so this
+A/B isolates the ELEMENTWISE kernel. Three arms of the SAME binary, 3 reps,
 medians:
 
 | arm | TTFT (ms) | TPOT (ms) | peak RSS (KB) |
 |---|---|---|---|
-| pre-G4 — `VT_GGUF_KEEP_QUANT=0` | 24,859.25 | 451.27 | 7,788,196 |
-| **post-G4 — production default** | **5,970.21** | **130.72** | **6,712,368** |
-| oracle — `VT_CPU_REF=1` | 24,822.20 | 451.89 | 7,787,940 |
+| BEFORE — `VT_CPU_MATMUL_TIER=ref` (the historical scalar kernel) | 5,907.66 | 130.74 | 6,712,412 |
+| **AFTER — production default** | **1,730.38** | **42.03** | **6,712,340** |
+| oracle — `VT_CPU_REF=1` | 2,977.07 | 92.18 | 7,788,252 |
 
-Post-G4 rep spread: TTFT 1.41 %, TPOT 2.03 %. The pre-G4 arm reproduces the
-morning's binding baseline (24,594 ms / 450.7 ms / 7,788,220 KB) to
-1.1 % / 0.1 % / 24 KB, which is what makes the A/B valid.
+AFTER rep spread: TTFT 0.70 %, TPOT 2.3 %. The BEFORE arm reproduces the
+previous checkpoint's published AFTER arm (5,970.21 ms / 130.72 ms /
+6,712,368 KB) to 1.1 % / 0.02 % / 28 KB, which is what makes the A/B valid.
+The llama.cpp denominator reproduced across three series on the box (pp128
+173.28 ± 1.75, 171.27 ± 3.40, 173.68 ± 2.22); two `tg32` legs that returned
+17.40 ± 9.70 and 3.95 ± 1.83 under page-cache pressure from our own 6.4 GiB
+arms are DISCARDED as contaminated rather than averaged in.
 
-### The 9–17× projection did NOT hold — and the reason is measured
+### What changed, and the bit-exactness claim
 
-The projection came from applying the quant GEMM's op-level throughput
-(211–417 GFLOP/s vs the production `kMatmul`'s 6.1–18.4) to the whole model. It
-assumed every GEMM could take the quant path. On this file — and on published
-"UD"/mixed quants generally — most of the weight mass cannot:
+The elementwise CPU GEMM had two defects, both in the K loop: a per-ELEMENT
+dtype switch (`LoadF32`) for both operands, and a SINGLE serial f32
+accumulator, i.e. one multiply-accumulate per FP-add latency. The fix
+specializes the dtypes out of the loop and runs 16 independent accumulator
+chains, vectorized per architecture (AArch64 NEON; x86-64 SSE2 with F16C
+probed), with M-blocking so several activation rows share one weight load.
 
-| | bytes in file | params | routed to the quant GEMM? |
+The SIMD is ported from llama.cpp's `ggml_vec_dot_bf16`/`_f16`
+(`ggml/src/ggml-cpu/vec.cpp:139,264`) with one deliberate deviation: ggml
+vectorizes ALONG K and horizontally reduces, which reassociates the sum, while
+we vectorize ACROSS OUTPUT COLUMNS so each output keeps its sequential
+reduction. The result is **byte-identical to the historical kernel** — gated by
+`memcmp` (not NMSE) over every dtype pair, both orientations, ragged shapes,
+thread counts 1/2/4/8, and the exhaustive 65,536-pattern f16/bf16 widening
+domain including every inf/NaN. No golden was regenerated and no tolerance was
+widened.
+
+### Op-level GFLOP/s (bf16 × bf16, 20 threads, best of 3, aarch64)
+
+| shape (M×N×K) | before | portable tier | **NEON tier** |
 |---|---|---|---|
-| `q8_0` (103 tensors) | 1.062 GiB | 1.073 B | **yes** |
-| `f16` (56 tensors, incl. the 970 MiB tied `token_embd`/`lm_head`) | 1.615 GiB | 0.867 B | **no** — `f16` has no block form |
-| `f32` (176 tensors) | 0.006 GiB | — | no (norms/vectors) |
+| decode qkv 1×3072×2048 | 18.39 | 35.17 | **81.44** |
+| decode down 1×2048×6144 | 18.20 | 34.75 | **68.80** |
+| decode lm_head 1×248320×2048 | 24.40 | 52.20 | **133.99** |
+| prefill qkv 128×3072×2048 | 24.29 | 51.46 | **351.11** |
+| prefill gate_up 128×12288×2048 | 24.28 | 51.57 | **349.98** |
 
-**60 % of the weight bytes — including the single largest GEMM in the model —
-still run the elementwise bf16 kernel at 17–25 GFLOP/s.** The measured 3.4–4.2×
-is exactly what that mixture predicts; nothing about the quant kernels
-under-delivered. The same mixture accounts for the RSS floor to within 0.8 %:
-2.68 GiB touched file pages (blocks are COPIED, not mmapped) + 1.615 GiB
-`f16`→bf16 expansion + 0.947 GiB second copy of the tied head + 1.062 GiB kept
-blocks ≈ 6.35 GiB against 6.401 measured.
+The portable tier alone is ~2.1× — that is the multi-accumulator fix, with no
+intrinsics, and every backend inherits it. At prefill shapes the elementwise
+GEMM now reaches 347–351 GFLOP/s against the quant tier-0's 388–417, so a mixed
+GGUF no longer has a slow half.
 
-**Consequence — the CPU plan changes.** The residual is the ELEMENTWISE bf16/f16
-GEMM, not the quant one, so SIMD `vec_dot_bf16/f16` plus hoisting
-`MatmulOneChunk`'s per-element dtype switch out of the K loop is now the #1 CPU
-lever, ahead of the quant SIMD tiers (**G5**/**G6**, which only speed up the 40 %
-that is already fast) and the repack tier (**G7**, which should stay parked). RSS
-needs two loader changes, not a kernel: mmap-in-place residency and sharing the
-tied `lm_head` with the embedding table (≈ 1.9 GiB of the remaining 3.6 GiB).
+### Next benchmark checkpoint — a FRESH profile, not a lever
+
+The most useful result here is a negative one: M-blocking raised prefill
+op-level throughput 1.63× (216 → 351 GFLOP/s) and moved end-to-end TTFT by
+**0.0 %**. Prefill is therefore no longer bound by this kernel, and the
+`kMatmul = 95.37 % of wall time` attribution that ranked the whole CPU plan is
+STALE. The next checkpoint is an op-dispatch profile of the CURRENT binary at
+the prefill operating point; no further CPU lever should be started before it.
+Standing facts for that ranking: RSS (loader row **L5** — mmap-in-place
+residency + tied-head sharing, ≈1.9 GiB of the 3.6 GiB gap) is now the largest
+single deficit; decode needs no further kernel work; the quant SIMD/repack tiers
+(**G5**–**G7**) are candidates for the prefill residual but must be confirmed
+against the new profile, not against the old one.
+
+`BACKEND-GATE-CPU-LLAMACPP` closes only when decode t/s, prefill t/s AND peak
+RSS all match or beat llama.cpp on the same file. Decode now does; the other two
+do not.
 
 ### Superseded, retained as disposition
 
-- **B4 (2026-07-10)**: 54–75× decode / ≈1,480× prefill / 2.7× RSS. Superseded
-  twice; validated as sound (the current binary at 1 thread on B4's own box
-  reproduces its TTFT/TPOT to 4.8 %/5.5 %).
+- **B4 (2026-07-10)**: 54–75× decode / ≈1,480× prefill / 2.7× RSS. Validated as
+  sound (the current binary at 1 thread on B4's own box reproduces its
+  TTFT/TPOT to 4.8 %/5.5 %), then superseded three times.
 - **Floor re-measurement (2026-07-22, morning)**: 11.6× / 33.5× / 2.65×. Its
   movement over B4 was entirely the **threadpool** (same-binary 1-vs-20-thread
   A/B: prefill 12.47×, decode 8.05×, RSS 1.000×) — which remains
-  `QUANT-GGUF-CPU-THREADPOOL` **W4**'s owed reproduction, and still **MISSES**
-  W4's ≥10× decode bar at 8.05×, so W4 stays open. Its attribution stands and
-  selected this lever: `kMatmul` was **95.37 %** of wall time, everything else
-  under 5 % combined.
+  `QUANT-GGUF-CPU-THREADPOOL` **W4**'s owed reproduction and still **MISSES**
+  W4's ≥10× decode bar at 8.05×, so W4 stays open.
+- **CIQ G4 (2026-07-22, afternoon)**: routed the block-quantized weights onto
+  the quant GEMM — 3.38× decode / 8.20× prefill / 2.29× RSS behind. Its
+  projected 9–17× did not hold because only 1.062 GiB of that file's weight
+  bytes are `q8_0` while 1.615 GiB are `f16` (including the 970 MiB tied
+  `token_embd`/`lm_head`), so ~60 % of the mass could not take the quant path.
+  This checkpoint is what fixed that 60 %.
 - The **x86 dev-box arm remains `VOID`** for binding (co-tenant load: llama.cpp
-  ±11.8 %/±24 %, a 1.9× outlier inside our own series). Rerun only when that box
-  is exclusively idle.
-- `QUANT-GGUF-KEEPQ-LOADER` gate 3 moves from `PENDING` to **MEASURED / NOT
-  MET** (work row **L4**): 6.401 GiB against a ≈3.1 GiB bar.
-
-### Next benchmark checkpoint
-
-The elementwise-GEMM lever, on **this exact recipe** (same file, same idle host,
-20 threads, ≥3 reproducing reps, one `flock`, same-binary A/B). The
-`BACKEND-GATE-CPU-LLAMACPP` row closes only when decode t/s, prefill t/s AND
-peak RSS all match or beat llama.cpp on the same file.
+  ±11.8 %/±24 %, a 1.9× outlier inside our own series). It shipped an SSE2
+  4-wide tier here, so real x86 headroom exists but cannot be gated until that
+  box is exclusively idle or another x86 host appears.
+- `QUANT-GGUF-KEEPQ-LOADER` gate 3 stays **MEASURED / NOT MET** (work row
+  **L4**): 6.401 GiB against a ≈3.1 GiB bar.
 
 **Repro (binding arm).**
 
@@ -2119,13 +2149,12 @@ flock $HOME/gpu.lock sh -c '
   LD_LIBRARY_PATH='"$LB"' '"$LB"'/llama-bench -m '"$M"' -p 512,128 -n 128,32 -t 20 -r 5 -ngl 0
   LD_LIBRARY_PATH='"$LB"' /usr/bin/time -v '"$LB"'/llama-bench -m '"$M"' -p 0 -n 32 -t 20 -r 3 -ngl 0
   # three arms of the SAME binary; arm 2 is the production default
-  for arm in "VT_GGUF_KEEP_QUANT=0" "" "VT_CPU_REF=1"; do
+  for arm in "VT_CPU_MATMUL_TIER=ref" "" "VT_CPU_REF=1"; do
     for rep in 1 2 3; do
       env $arm VLLM_CPP_CPU_THREADS=20 /usr/bin/time -v '"$B"' --model '"$M"' \
         --num-prompts 1 --input-len 128 --output-len 32 --concurrency 1 \
-        --seed 0 --temperature 0 --output-token-ids /tmp/ids.$arm.$rep.txt
+        --seed 0 --temperature 0 --output-token-ids /tmp/ids.$arm.$rep.json
     done
   done'
-# All three arms MUST agree on the token ids (md5 d235db12f2cd304007530286a1755c95).
+# All nine token files MUST be md5 d235db12f2cd304007530286a1755c95.
 ```
-

@@ -13,6 +13,7 @@
 #include <limits>
 #include <vector>
 
+#include "cpu_matmul_elem.h"
 #include "cpu_threadpool.h"
 
 namespace vt::cpu {
@@ -52,8 +53,8 @@ void StoreF32(const Tensor& t, int64_t elem_offset, float v) {
 // output ROWS i (ggml nr1 = src1 rows = M). kBT selects the [N,K] row-major
 // weight orientation (MatmulBT) vs [K,N] (Matmul).
 template <bool kBT>
-void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, int64_t n,
-                    int64_t ir0_start, int64_t ir0_end, int64_t ir1_start, int64_t ir1_end) {
+void MatmulOneChunkRef(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, int64_t n,
+                       int64_t ir0_start, int64_t ir0_end, int64_t ir1_start, int64_t ir1_end) {
   // MLA campaign W6: the activation may be ROW-STRIDED (a column slice of a
   // wider buffer — see vt::MatmulBT). For a contiguous activation `a_rs == k`,
   // so the offsets are integer-identical to the pre-W6 `i * k + p` form and
@@ -77,6 +78,97 @@ void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, in
             acc += LoadF32(a, i * a_rs + p) * LoadF32(b, kBT ? j * k + p : p * n + j);
           }
           StoreF32(out, i * n + j, acc);
+        }
+      }
+    }
+  }
+}
+
+// Byte offset of element `off` of an ELEMENTWISE tensor.
+inline const void* ElemPtr(const Tensor& t, int64_t off) {
+  return static_cast<const uint8_t*>(t.data) + static_cast<size_t>(off) * SizeOf(t.dtype);
+}
+
+// Specialized/vectorized elementwise GEMM chunk (row `CPU-ELEM-GEMM`,
+// .agents/specs/cpu-elementwise-gemm.md). Structurally identical to
+// MatmulOneChunkRef — same 16x16 tile from ggml_compute_forward_mul_mat_one_chunk
+// (ggml-cpu.c:1155-1243), same output set, same strictly sequential f32
+// accumulation per output element — with two defects removed:
+//   1. the per-ELEMENT `LoadF32` dtype switch is hoisted out of the K loop
+//      (the activation row is widened to f32 ONCE per 16-row tile; the weight
+//      dtype is resolved once per chunk into a typed micro-kernel), and
+//   2. the single serial accumulator becomes 16 independent ones, vectorized
+//      ACROSS OUTPUT COLUMNS so no reduction is reassociated.
+// Both are bit-exact by construction; tests/vt/test_ops_matmul_elem.cpp
+// asserts equality against MatmulOneChunkRef byte-for-byte.
+template <bool kBT>
+void MatmulOneChunk(Tensor& out, const Tensor& a, const Tensor& b, int64_t k, int64_t n,
+                    int64_t ir0_start, int64_t ir0_end, int64_t ir1_start, int64_t ir1_end) {
+  if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
+    return;
+  }
+  ElemKind bk;
+  ElemKind ak;
+  if (!ElemKindOf(b.dtype, &bk) || !ElemKindOf(a.dtype, &ak) || k <= 0 || ElemGemmUseRef()) {
+    MatmulOneChunkRef<kBT>(out, a, b, k, n, ir0_start, ir0_end, ir1_start, ir1_end);
+    return;
+  }
+  const ElemGemmTierTable& tier = ElemGemmTier();
+  const int bi = static_cast<int>(bk);
+  const int64_t a_rs = a.stride[0];
+  const int64_t blck_0 = kElemLanes;
+  const int64_t blck_1 = 16;
+
+  // Widened activation rows for the current 16-row tile, reused across every
+  // column block of the chunk. Thread-local so the buffer is allocated once
+  // per worker for the process lifetime (no per-chunk allocation).
+  static thread_local std::vector<float> af;
+
+  for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+    const int64_t i_hi = std::min(iir1 + blck_1, ir1_end);
+    const int64_t nrows = i_hi - iir1;
+    af.resize(static_cast<size_t>(nrows * k));
+    for (int64_t i = iir1; i < i_hi; ++i) {
+      WidenRowToF32(a.dtype, ElemPtr(a, i * a_rs), k, af.data() + (i - iir1) * k);
+    }
+    const int mr = (kBT && tier.btm[bi] != nullptr) ? tier.mr : 1;
+    for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+      const int64_t j_hi = std::min(iir0 + blck_0, ir0_end);
+      int64_t i = iir1;
+      // M-blocked fast path: `mr` activation rows share one weight load +
+      // transpose per column block (see ElemBtMFn).
+      if (j_hi - iir0 == blck_0 && mr > 1) {
+        float accm[kElemLanes * 8];
+        for (; i + mr <= i_hi; i += mr) {
+          tier.btm[bi](af.data() + (i - iir1) * k, k, ElemPtr(b, iir0 * k), k, accm);
+          for (int r = 0; r < mr; ++r) {
+            for (int64_t j = iir0; j < j_hi; ++j) {
+              StoreF32(out, (i + r) * n + j, accm[r * kElemLanes + (j - iir0)]);
+            }
+          }
+        }
+      }
+      for (; i < i_hi; ++i) {
+        const float* arow = af.data() + (i - iir1) * k;
+        float acc[kElemLanes];
+        if (j_hi - iir0 == blck_0) {
+          if (kBT) {
+            tier.bt[bi](arow, ElemPtr(b, iir0 * k), k, acc);
+          } else {
+            tier.nk[bi](arow, ElemPtr(b, iir0), k, n, acc);
+          }
+        } else {
+          // Ragged column tail: the scalar form, identical accumulation order.
+          for (int64_t j = iir0; j < j_hi; ++j) {
+            float s = 0.0f;
+            for (int64_t p = 0; p < k; ++p) {
+              s += arow[p] * LoadF32(b, kBT ? j * k + p : p * n + j);
+            }
+            acc[j - iir0] = s;
+          }
+        }
+        for (int64_t j = iir0; j < j_hi; ++j) {
+          StoreF32(out, i * n + j, acc[j - iir0]);
         }
       }
     }

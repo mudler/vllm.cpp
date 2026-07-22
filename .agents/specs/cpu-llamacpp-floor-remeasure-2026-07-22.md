@@ -238,7 +238,7 @@ counts, which is the same fact seen from the memory side.
 |---|---|---|---|---|
 | **1** | **`QUANT-GGUF-CIQ-GEMM` G4** — route model GEMM call sites onto `MatmulBTQuant` + flip keep-quant default ON for GGUF | **14–44× on 95.4 % of wall time ⇒ ~9–17× e2e**, plus peak RSS 7.43 → ~2.9 GiB (2.65× deficit → ~1.05×). Projects to decode ≈ llama.cpp's bandwidth rate and prefill within ~2 % of pp128 | MEDIUM — **every dependency is already DONE** (loader L2/L3, threadpool W1–W3, kernels G1–G3). Work is: stop the loader dequant+transpose for GEMM weights, dispatch `MatmulF32`/`MatmulBf16` on `IsBlockQuant(w.dtype)`, regenerate GGUF engine goldens against the llama.cpp oracle, flip the default | **Do this first, and nothing else before it.** It is the only lever that moves all three axes at once |
 | **2** | **Weight orientation** — stop transposing GGUF weights out of their native `[N,K]` into `[K,N]` | **1.3–3.0×** on the same 95.4 % (aarch64; 1.2–1.5× x86) | LOW | **NEW FINDING**, not previously on the plan. It is also a *prerequisite* of lever 1 (`MatmulBTQuant` is BT-only), so fold it into G4 rather than shipping it separately. As a standalone it is a free ~1.5–2× for the bf16 path |
-| **3** | **SIMD `vec_dot` for the elementwise bf16/f16 GEMM** | Production GEMM measures 0.77–0.84 GFLOP/s single-thread — roughly two orders of magnitude under one AVX2 core. `MatmulOneChunk` (`cpu_ops.cpp:54-83`) calls `LoadF32(t, off)`, which switches on `t.dtype` **inside the K loop**; llama.cpp has `ggml_vec_dot_bf16`/`_f16` SIMD kernels for exactly this | LOW–MEDIUM | **NEW FINDING.** Covers everything G4 does not: the 56 `f16` tensors in this very file, every safetensors CPU path, and any non-block-quant GEMM. Independent of the quant track |
+| **3** | **SIMD `vec_dot` for the elementwise bf16/f16 GEMM** — **LANDED 2026-07-22 as [`KERNEL-GEMM-CPU-ELEM`](cpu-elementwise-gemm.md) E1-E4; both defects named here were real and both are fixed, bit-exactly** | Production GEMM measures 0.77–0.84 GFLOP/s single-thread — roughly two orders of magnitude under one AVX2 core. `MatmulOneChunk` (`cpu_ops.cpp:54-83`) calls `LoadF32(t, off)`, which switches on `t.dtype` **inside the K loop**; llama.cpp has `ggml_vec_dot_bf16`/`_f16` SIMD kernels for exactly this | LOW–MEDIUM | **NEW FINDING.** Covers everything G4 does not: the 56 `f16` tensors in this very file, every safetensors CPU path, and any non-block-quant GEMM. Independent of the quant track |
 | **4** | **G5 x86 AVX2/AVX512 tier** | tier-0 measures 130–200 GFLOP/s on x86; llama.cpp's x86 arm is well above that. Expect 2–4× on the quant path | MEDIUM | Mechanical port of `arch/x86/quants.c`. Ranks above G6 because the x86 tier-0 numbers are *relatively* further from the floor than the aarch64 ones |
 | **5** | **G6 Arm NEON/dotprod/i8mm tier** | Smaller marginal gain than the spec assumed: aarch64 tier-0 already reaches 211–417 GFLOP/s. Its real value is unlocking `nrows==2` mmla and the GB10/Apple tier | MEDIUM | `nrows` stays pinned at 1 until this lands, with the `ggml-cpu.c:1426-1433` boundary guards |
 | **6** | **G7 repack-at-load** | **Re-scope after G4.** Tier-0 Q8_0 at M=128 already hits 388–417 GFLOP/s on aarch64, ~2 % off pp128 parity, so the prefill headroom repack was budgeted for is much smaller than assumed | MEDIUM–HIGH | Do not start before G4's measurement replaces this projection with a number |
@@ -246,6 +246,15 @@ counts, which is the same fact seen from the memory side.
 
 Levers 4–6 should be re-ranked against a real G4 measurement rather than
 against this projection.
+
+**UPDATE 2026-07-22 (evening) — this whole ranking is now SUPERSEDED.** Levers 1,
+2 and 3 all landed (G4 folded lever 2 in; `KERNEL-GEMM-CPU-ELEM` E1-E4 is lever
+3). The CPU position is **decode 1.03× (parity), prefill 2.34×, RSS 2.29×**. More
+importantly the ATTRIBUTION this table rests on — `kMatmul` at 95.37 % of wall
+time — was taken when the elementwise GEMM ran at 24 GFLOP/s; it now runs at 351,
+and M-blocking it moved end-to-end prefill by 0.0 %. **Do not rank levers 4–7
+against this table.** A fresh op-dispatch profile of the current binary is owed
+first; RSS (loader **L5**) is the largest remaining single deficit.
 
 ## Reproduction
 

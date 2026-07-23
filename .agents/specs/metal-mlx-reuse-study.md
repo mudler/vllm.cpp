@@ -1,6 +1,6 @@
 # Metal/MLX reuse study + the acceleration-provider seam (`BACKEND-ACCEL-PROVIDER`)
 
-Status: **STUDY + MLX BASELINE + TWO MODELS RUNNING (OPT M3a, Qwen3-dense M3b) + FIRST OURS-VS-MLX BENCHMARK, 2026-07-23.** §13 records `M3b` — Qwen3-dense on Apple GPU (16/16), the corrected op count (3 new RoPE kernels, Metal 18/75), and the INDICATIVE ours-vs-MLX numbers.
+Status: **STUDY + MLX BASELINE + TWO MODELS RUNNING (OPT M3a, Qwen3-dense M3b) + FIRST OURS-VS-MLX BENCHMARK, 2026-07-23.** §13 records `M3b` — Qwen3-dense on Apple GPU: the forward is ORACLE-CONFIRMED CORRECT (near-tie-robust — vLLM teacher-forced on the Metal prefix, all divergences within 0.5 nats, max 0.125), gated 16/16 against Metal's own oracle golden; NOT strict-token-exact (0.6B is a near-tie model, a strict gate needs Qwen3-4B — deferred). The corrected op count (3 new RoPE kernels, Metal 18/75) and the INDICATIVE ours-vs-MLX numbers stand. The CUDA gate is GREEN (the France/Italy tie is build-sensitive; production build → France 9625, portable-only → Italy — the "stale golden" claim is disproven).
 Earlier status line: **STUDY + MEASURED MLX BASELINE + FIRST MODEL RUNNING, 2026-07-22.**
 Work rows `W0b-2` (the `vt::OpProvider` seam), `W0b-1`, `M5` (MLX as a registered
 provider for the dense GEMM) and — since 2026-07-22 — **`M3a`: OPT-125m running
@@ -995,7 +995,7 @@ simdgroup matrix use, and nothing here should be read as a performance result.
 
 ---
 
-## 13. `M3b` — Qwen3-dense on Apple GPU + the first ours-vs-MLX benchmark (LANDED 2026-07-23)
+## 13. `M3b` — Qwen3-dense on Apple GPU (forward oracle-confirmed correct, near-tie-robust) + the first ours-vs-MLX benchmark (LANDED 2026-07-23)
 
 **The SECOND model on a non-CUDA backend, and the model MLX also runs — so the
 native-competitor arms are finally comparable.** Row: `BACKEND-METAL-MLX` (stays
@@ -1021,30 +1021,61 @@ covers the opt-out. Metal is now **18 of 75**. All three transcribe our own CPU
 reference math; `kRopeFromCache` moves the transcendental OUT of the kernel (it is
 in the cache) so it stays bit-exact, which is why it is the one the gate leans on.
 
-### 13.2 Correctness — 16/16 on the SACRED gate, device-aware
+### 13.2 Correctness — forward ORACLE-CONFIRMED CORRECT (near-tie-robust), NOT strict-token-exact
 
-`test_qwen3_paged_engine` (Qwen3-0.6B, real HF checkpoint on the M4) passes
-**16/16**: 10 STRICT token-exact vs the vLLM 0.25.0 per-prompt greedy golden, 2
-near-tie-band, 4 Metal-vs-CUDA cross-device near-ties **all at gap 0 nats**, 0
-forward-divergent. The gate was made device-aware WITHOUT changing CUDA behaviour:
-the CUDA/CPU our_ids anchor stays a hard `REQUIRE`; on Metal a divergence from the
-CUDA-captured anchor is classified against the committed gap (near-tie → reported,
-well-separated → hard fail). Metal execution PROVEN: `device == kMETAL` +
-`selections > 0 ∧ declines == 0` for all 9 ops (`kRopeFromCache`/`kPagedAttention`
-7168 each); per-op unit tests NaN-poison outputs.
+**HONEST STATE (2026-07-23, supersedes an earlier "16/16 strict / 4 near-ties at
+gap-0" claim that was UNSUBSTANTIATED — the branch test had no teeth; see the RCA +
+oracle ledger rows).** Qwen3-0.6B is a NEAR-TIE MODEL: at ~4 first-divergence
+positions its top-2 tokens are separated by thousandths of a nat, so a correct
+backend can legitimately pick either. The Metal forward diverges from the CUDA
+golden at p0 tok5 (15344 " Italy" vs 9625 " France"), p5 tok10, p10 tok10, p11 tok1.
 
-### 13.3 A pre-existing stale-golden finding (NOT an M3b regression)
+**THE DECISIVE MEASUREMENT (the vLLM oracle teacher-forced on the METAL prefix).**
+Captured the Metal token sequence on the M4, transferred to dgx, and teacher-forced
+vLLM 0.25.0 (`scripts/qwen3-neartie-gap.py`, batch=1, `gpu_memory_utilization=0.40`,
+`enforce_eager`) on the Metal prefix. RESULT: **every one of the 60 Metal-vs-CUDA
+divergent positions is within 0.5 nats of vLLM's OWN argmax given the Metal prefix —
+max gap 0.125 nats, none outside vLLM's top-20.** Per-position nats at the 4
+first-divergences: **p0 tok5 gap 0.0000** (vLLM's teacher-forced argmax on the
+identical prefix IS 15344 " Italy" — it CONTRADICTS its own CUDA-capture " France"
+pick; the France/Italy top-2 margin is 0.003–0.007 nats), **p5 tok10 0.1250**,
+**p10 tok10 0.0000**, **p11 tok1 metal=11 0.1250** (Metal here matches vLLM's greedy
+where CUDA didn't). ⇒ the Metal forward is CORRECT by the ratified near-tie-robust
+bar, oracle-backed.
 
-The dgx CUDA gate is currently RED at the hard anchor — dgx CUDA produces **15344**
-at prompt[0] tok=5 where the committed golden says **9625**. This is a
-PRE-EXISTING cutlass-sensitive drift (the Qwen3-dense row itself documents "Qwen3
-near-ties are cutlass-sensitive"; the goldens were captured 2026-07-20 `e510e85`
-"on canonical cutlass-4.5.0"), NOT M3b: `git diff 4884d03 HEAD` is 5 files (3
-Metal-only not compiled on Linux + 2 tests), the CUDA engine is byte-identical to
-base, and — decisively — the M4 **Metal** run produced the SAME **15344**, so two
-independent devices corroborate the golden is stale. This actually STRENGTHENS the
-Metal result: Metal reproduces the CURRENT CUDA engine's exact near-tie tokens.
-Goldens were NOT modified (a refresh needs a fresh dgx vLLM-oracle capture).
+**THE GATE (landed, honest).** Device-appropriate ORACLE goldens:
+`goldens/qwen3_greedy_0_6b/our_ids_metal.npy` (the Metal forward's deterministic
+greedy) + `neartie_gap_mnats_metal.npy` (vLLM teacher-forced on the Metal prefix).
+The gate is IDENTICAL logic on every device — hard anchor `REQUIRE` + ≤0.5-nat
+near-tie band — differing ONLY in which device's oracle golden it loads; NO
+cross-device latitude (Metal gated against Metal's OWN golden). Metal PASSES
+**16/16** (10 strict token-exact vs vLLM greedy + 6 near-tie-band, max gap 0.125, 0
+forward-divergent). PROVEN to have TEETH: perturbing the committed Metal anchor →
+hard anchor-drift FAILURE; perturbing a gap to 0.6 nats (>0.5 band) →
+FORWARD-DIVERGENCE band FAILURE; both restore to PASS. Metal execution PROVEN:
+`device == kMETAL` + `selections > 0 ∧ declines == 0` for all 9 ops
+(`kRopeFromCache`/`kPagedAttention` 7168 each); per-op tests NaN-poison outputs.
+Per-op correctness stays the NMSE ≤5e-4-vs-CPU proof (RCA, all 28 layers).
+
+**STRICT token-exactness on Qwen3-0.6B is ILL-POSED (near-tie model); a strict Metal
+gate needs a bigger DETERMINISTIC dense model (Qwen3-4B) — not present on the M4 —
+DEFERRED.**
+
+### 13.3 The France/Italy tie is BUILD-SENSITIVE on CUDA too (the "stale golden" claim DISPROVEN)
+
+An earlier note claimed the dgx CUDA gate was RED with a stale golden. **DISPROVEN.**
+The France/Italy tie is BUILD-SENSITIVE: the PRODUCTION dgx build (FA2+Marlin+Triton
++CUTLASS, `-DCMAKE_CUDA_ARCHITECTURES=121a`) resolves p0 tok5 → **France 9625** and
+the CUDA gate passes **16/16** (Qwen3-0.6B: 10 strict + 6 near-tie, max gap 0;
+Qwen3-4B: 16/16, 11 strict + 5 near-tie, max 0.25 nats), `-Werror` 0 warn. Only a
+PORTABLE-KERNEL-ONLY CUDA build (FA2/Marlin/Triton OFF) resolves it → **Italy 15344**
+(the same as Metal). So the committed golden is the production build's resolution of
+a genuine numerical near-tie, NOT stale — and Metal picking Italy is the correct
+near-tie resolution its own numerical path produces, oracle-confirmed in §13.2.
+Regressions GREEN (OPT 6/6, Qwen3-Coder 6/6; 27B/35B/DeepSeek binaries
+byte-identical — only the one parity test .cpp compiles differently on dgx-CUDA).
+Goldens md5 `2965ef5772b556d3f3f86fedf4221b2f` UNCHANGED (the 2 Metal files are
+additive).
 
 ### 13.4 The benchmark — INDICATIVE / BLOCKED-ON-SUDO, and it is a FLOOR
 

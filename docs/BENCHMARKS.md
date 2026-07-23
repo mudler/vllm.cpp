@@ -977,6 +977,18 @@ device=2/Metal confirmed via `VT_OP_PROVIDER_STATS` — every op `vt-native`); M
 `python -m mlx_lm.benchmark` (`mlx-community/Qwen3-1.7B-bf16`), re-run the same
 session (it reproduced the committed baseline below).
 
+**Correctness basis (2026-07-23, updated — speed numbers below UNCHANGED).** The
+Metal Qwen3-dense forward is CONFIRMED CORRECT by the vLLM oracle teacher-forced on
+the Metal prefix (`scripts/qwen3-neartie-gap.py`, vLLM 0.25.0, batch=1,
+`gpu_memory_utilization=0.40`): all 60 Metal-vs-CUDA divergent positions on
+Qwen3-0.6B are within 0.5 nats of vLLM's own argmax given the Metal prefix, **max
+0.125 nats**, none outside top-20 (the p0 tok5 France→Italy flip is gap 0.0000 —
+vLLM's teacher-forced argmax on the identical prefix is itself Italy). The e2e gate
+is therefore near-tie-robust, NOT strict token-exact (0.6B is a near-tie model;
+strict wants a bigger deterministic dense model, Qwen3-4B, not on this Mac —
+deferred). This SUPERSEDES the earlier "strict 16/16 token-exact on Metal" claim.
+This is a correctness disposition; no Metal speed number is affected.
+
 | B | ours decode tok/s/stream | MLX gen tok/s (agg) | ours TTFT | MLX TTFT | ours peak | MLX peak |
 |--:|--:|--:|--:|--:|--:|--:|
 | 1 | 4.29 | 27.77 | 4.86 s | 0.47 s | 7.36 GB | 3.78 GB |

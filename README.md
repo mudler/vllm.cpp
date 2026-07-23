@@ -186,14 +186,22 @@ vLLM-speed on every axis. Ranked queue + the CUDA-arch additivity audit:
 [`.agents/specs/breadth-sweep-plan.md`](.agents/specs/breadth-sweep-plan.md). Note: adding a new
 CUDA *arch* beyond the same-family sm_120 is HW-blocked (only GB10 sm_121 is testable here), so the
 actionable sweep is model breadth on GB10. **The Metal track now runs its SECOND model: Qwen3-dense
-(Qwen3-0.6B) generates on the Apple GPU and PASSES its full 16-prompt correctness gate — the same
-device-independent reference tokens our NVIDIA path is held to** (2026-07-23,
-[state](.agents/state.md)); OPT-125m was the first (2026-07-22, token-exact 6/6,
-[study §12](.agents/specs/metal-mlx-reuse-study.md)). Both are measured against the same recorded
-reference-implementation answers, which do not depend on which device runs them, so Apple had to
-meet the bar NVIDIA already met rather than a new bar invented for it. Attention, the KV cache,
-rotary position encoding and greedy sampling now exist on Apple GPU (eighteen operations of
-seventy-five). **AND the first ours-vs-MLX benchmark exists** — on the SAME small Qwen3 model (1.7B),
+(Qwen3-0.6B) generates on the Apple GPU and its forward is CONFIRMED CORRECT against the vLLM oracle**
+(2026-07-23, [state](.agents/state.md)). The honest bar here is subtle and worth stating plainly:
+Qwen3-0.6B is a *near-tie model* — at a handful of positions its top two tokens are separated by only
+thousandths of a nat, and which one wins depends on the exact numerical path, so a correct backend can
+legitimately pick either. (The same flip happens on NVIDIA: our production CUDA build says " France",
+a portable-kernel CUDA build and Apple both say " Italy" — and vLLM itself, asked to score the Apple
+prefix, agrees " Italy" is its own top choice there.) So the Apple gate is not strict token-for-token
+equality — that would be ill-posed on this model — but a *near-tie-robust* check backed by the oracle:
+every token Apple produces must sit within half a nat of vLLM's own most-likely token given Apple's
+own prefix, which we measured by having vLLM 0.25.0 score Apple's exact output. All sixty divergent
+positions pass, the worst just an eighth of a nat, and the gate is proven to bite (perturbing any token
+fails it). OPT-125m, the first Metal model, IS strict token-exact 6/6 (2026-07-22,
+[study §12](.agents/specs/metal-mlx-reuse-study.md)) because OPT has no such ties. The definitive
+strict-token-exact Apple proof wants a bigger *deterministic* dense model (Qwen3-4B) — not present on
+this Mac — and is deferred. Attention, the KV cache, rotary position encoding and greedy sampling now
+exist on Apple GPU (eighteen operations of seventy-five). **AND the first ours-vs-MLX benchmark exists** — on the SAME small Qwen3 model (1.7B),
 same box, same workload: **ours is a knowingly-unoptimised FLOOR, about 6–11× slower on decode and
 7–10× on time-to-first-token than MLX, at roughly twice the memory**, because our Metal path still
 uses one command buffer per operation and a naive matrix-multiply with none of MLX's tiled GPU

@@ -32,9 +32,27 @@
 // Goldens (committed under tests/parity/goldens/<subdir>/, captured on dgx):
 //   greedy_ids.npy         [N,T]   i32  vLLM per-prompt deterministic greedy.
 //   greedy_dist.npy        [N,T,K] i32  K per-prompt runs (determinism evidence).
-//   our_ids.npy            [N,T]   i32  OUR engine's greedy (anchor for the gaps).
+//   our_ids.npy            [N,T]   i32  OUR CUDA engine's greedy (anchor for gaps).
 //   neartie_gap_mnats.npy  [N,T]   i32  vLLM teacher-forced gap (milli-nats) for
-//                                       OUR token given OUR prefix.
+//                                       OUR CUDA token given OUR CUDA prefix.
+//
+// DEVICE-AWARE goldens (Metal, Qwen3-0.6B). SelectQueue runs Metal on the Apple M4;
+// the Metal forward is a DIFFERENT but equally correct bf16 decoder that resolves
+// the model's genuine near-ties the other way (e.g. p0 tok5 France 9625 vs Italy
+// 15344, top-2 margin 0.003-0.007 nats; vLLM's OWN teacher-forced argmax on the
+// identical prefix flips to Italy at gap 0.0000, contradicting its CUDA-capture
+// pick). So Metal is gated against ITS OWN oracle-backed golden, captured exactly
+// like the base pair but teacher-forcing vLLM on the METAL sequence:
+//   our_ids_metal.npy           [N,T] i32  the Metal forward's deterministic greedy.
+//   neartie_gap_mnats_metal.npy [N,T] i32  vLLM teacher-forced gap for the Metal
+//                                          token given the Metal prefix (max 0.125
+//                                          nats over all 60 Metal-vs-CUDA
+//                                          divergences => oracle-confirmed near-tie;
+//                                          strict token-exactness on 0.6B is
+//                                          ill-posed, it is a near-tie model). The
+//                                          gate logic is IDENTICAL on every device
+//                                          (hard anchor + <=0.5-nat band); only the
+//                                          golden pair is device-appropriate.
 //
 // Checkpoint-GATED + dgx-only: resolves the real HF snapshots under
 // ~/.cache/huggingface/hub/. On CPU/CI the snapshots + goldens are absent, so each
@@ -206,10 +224,8 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
   // near-tie band). On the Apple M4 it is kMETAL, and two things change: (1) the
   // Qwen3-dense ops must PROVE they ran on the Metal provider (selections > 0,
   // declines == 0 — `last_selected` alone is insufficient, fan-out spike Risk 4);
-  // (2) the our_ids anchor was captured on CUDA, so a Metal divergence AT a
-  // committed near-tie (gap <= kNearTieMnats) is the SAME bf16 tie the gate already
-  // tolerates across decoders, not an anchor drift — it is reported, not required
-  // away, while a divergence at a well-separated position is still a hard fail.
+  // (2) the gate is held against Metal's OWN oracle-backed golden (see below), not
+  // against CUDA's — the identical anchor+band logic, device-appropriate goldens.
   const vt::DeviceType run_dev = loaded->runner().device().type;
   const bool metal = run_dev == vt::DeviceType::kMETAL;
   // The forward + greedy ops Qwen3-dense dispatches on the DEFAULT
@@ -228,12 +244,46 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
     }
     vt::EnableOpProviderCallStats(true);
     MESSAGE(label << ": running on device type " << static_cast<int>(run_dev)
-            << " (2=METAL) — the our_ids anchor is CUDA-captured, so Metal near-tie "
-               "divergences are reported, not required away");
+            << " (2=METAL) — gated against Metal's OWN oracle-backed golden "
+               "(our_ids_metal.npy + neartie_gap_mnats_metal.npy)");
   }
 
-  int metal_neartie_div = 0;  // Metal-only: prompts that diverge from CUDA our_ids
-                              // at a committed near-tie position
+  // Device-appropriate anchor + teacher-forced gap goldens. The base golden
+  // (our_ids.npy / neartie_gap_mnats.npy) is the CUDA-captured sequence: vLLM 0.25.0
+  // teacher-forced on OUR CUDA tokens. The Metal forward is a DIFFERENT but equally
+  // correct bf16 decoder: it resolves the model's genuine near-ties the other way
+  // (e.g. p0 tok5 France 9625 vs Italy 15344, a 0.003-0.007-nat top-2 margin —
+  // vLLM's OWN teacher-forced argmax on the identical prefix is Italy here at gap
+  // 0.0000, contradicting its CUDA-capture pick of France), so it emits its OWN
+  // deterministic sequence with its OWN teacher-forced gaps (our_ids_metal.npy /
+  // neartie_gap_mnats_metal.npy, produced by qwen3-neartie-gap.py teacher-forcing
+  // vLLM on the METAL prefix; every Metal token there is within 0.5 nats of vLLM's
+  // argmax, max 0.125). Gate the running device against ITS device's oracle golden.
+  const int32_t* anchor_ids = od;   // hard anchor for THIS device
+  const int32_t* gap_ids = gapd;    // vLLM teacher-forced gaps for THIS device
+  parity::NpyArray o_metal, gap_metal;  // keep the metal arrays alive for the loop
+  if (metal) {
+    const bool metal_goldens = fs::exists(gdir / "our_ids_metal.npy") &&
+                               fs::exists(gdir / "neartie_gap_mnats_metal.npy");
+    REQUIRE_MESSAGE(metal_goldens,
+                    label << ": Metal oracle golden absent — capture the Metal "
+                          "sequence on the M4 (VT_DUMP_IDS bootstrap), then on dgx "
+                          "teacher-force vLLM on it: qwen3-neartie-gap.py over the "
+                          "Metal our_ids -> *_metal.npy");
+    o_metal = parity::LoadNpy((gdir / "our_ids_metal.npy").string());
+    gap_metal = parity::LoadNpy((gdir / "neartie_gap_mnats_metal.npy").string());
+    REQUIRE(o_metal.dtype == "<i4");
+    REQUIRE(gap_metal.dtype == "<i4");
+    REQUIRE(o_metal.shape.size() == 2);
+    REQUIRE(o_metal.shape[0] == N);
+    REQUIRE(o_metal.shape[1] == T);
+    REQUIRE(gap_metal.shape.size() == 2);
+    REQUIRE(gap_metal.shape[0] == N);
+    REQUIRE(gap_metal.shape[1] == T);
+    anchor_ids = AsI32(o_metal);
+    gap_ids = AsI32(gap_metal);
+  }
+
   int strict_exact = 0;   // prompts where our tokens == vLLM greedy exactly
   int neartie_only = 0;   // prompts that pass only via the near-tie band
   int fail = 0;           // prompts with a token beyond the near-tie band
@@ -252,73 +302,36 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
         our_dump[static_cast<size_t>(i * T + j)] = got[static_cast<size_t>(j)];
     }
 
-    // Anchor: the committed gaps describe OUR engine's exact (CUDA-captured)
-    // sequence. On CUDA/CPU a drift is a hard REQUIRE (the engine changed and the
-    // gap golden must be re-captured). On Metal the anchor was captured on a
-    // DIFFERENT device, so a divergence is classified against the committed gap:
-    // at a near-tie it is the expected cross-decoder bf16 behaviour, at a
-    // well-separated position it is a real forward bug.
+    // Anchor: the committed anchor is the exact deterministic sequence THIS device
+    // produces (CUDA base golden on CUDA/CPU; Metal golden on Metal), and the
+    // committed gaps are vLLM 0.25.0 teacher-forced on THAT device's own prefix. A
+    // drift from the anchor is a hard REQUIRE on EVERY device — this is what gives
+    // the gate teeth: a real Metal forward bug flips a token off the anchor and
+    // fails HERE, and the near-tie band below then independently proves each token
+    // is one vLLM's own logits cannot separate from its argmax. No cross-device
+    // latitude is taken: Metal is gated against Metal's OWN oracle-backed golden,
+    // never excused against CUDA's.
     int first_div = -1;
     for (int64_t j = 0; j < T; ++j) {
-      if (got[static_cast<size_t>(j)] != od[i * T + j]) { first_div = static_cast<int>(j); break; }
+      if (got[static_cast<size_t>(j)] != anchor_ids[i * T + j]) { first_div = static_cast<int>(j); break; }
     }
-    if (!metal) {
-      REQUIRE_MESSAGE(first_div < 0,
-                      label << " anchor drift prompt[" << i << "] tok=" << first_div
-                      << " engine=" << (first_div < 0 ? -1 : got[static_cast<size_t>(first_div)])
-                      << " committed our_ids=" << (first_div < 0 ? -1 : od[i * T + first_div])
-                      << " — re-run qwen3-neartie-gap.py to refresh the gap golden");
-    } else if (first_div >= 0) {
-      const int32_t mn = gapd[i * T + first_div];
-      if (mn > worst_gap) { worst_gap = mn; worst_i = static_cast<int>(i); worst_j = first_div; }
-      // HONEST device-awareness (repaired): the committed gap is vLLM's logit
-      // margin of OUR token BELOW vLLM's argmax, teacher-forced on OUR sequence.
-      // A gap of 0 means our token IS vLLM's argmax — it records NO runner-up
-      // margin, so it carries ZERO near-tie evidence. A divergence at a gap-0
-      // position is therefore a hard REQUIRE failure on EVERY device (CUDA and
-      // Metal alike): treating gap-0 as "within the near-tie band" would excuse an
-      // arbitrary forward error (the whole golden here is gap-0, so the old
-      // `mn <= band` relaxation excused EVERYTHING — a gate with no teeth). The
-      // device-awareness may ONLY relax a GENUINE near-tie: a strictly-positive
-      // committed gap within the band (0 < gap <= kNearTieMnats), where vLLM's own
-      // logits place our token below its argmax by a hair and two bf16 decoders may
-      // land either side. That is the sole cross-device latitude; gap-0 and
-      // above-band are both real divergences.
-      const bool genuine_neartie = (mn > 0 && mn <= kNearTieMnats);
-      if (genuine_neartie) {
-        ++metal_neartie_div;
-        MESSAGE(label << " metal near-tie divergence prompt[" << i << "] tok=" << first_div
-                << " metal=" << got[static_cast<size_t>(first_div)]
-                << " cuda_our_ids=" << od[i * T + first_div]
-                << " gap=" << (mn / 1000.0) << " nats (0 < gap <= band) — accepted (vLLM's "
-                   "own logits place our token a hair below its argmax; two bf16 "
-                   "decoders may land either side)");
-        continue;  // committed gaps past first_div describe a DIFFERENT sequence
-      }
-      ++fail;
-      MESSAGE(label << " FORWARD DIVERGENCE prompt[" << i << "] tok=" << first_div
-              << " metal=" << got[static_cast<size_t>(first_div)]
-              << " cuda_our_ids=" << od[i * T + first_div]
-              << " vLLM_greedy=" << gd[i * T + first_div]
-              << " gap=" << (mn / 1000.0)
-              << (mn == 0 ? " nats (gap-0 = our token IS vLLM's argmax; a divergence "
-                            "here is a hard REQUIRE on EVERY device, NOT a near-tie)"
-                          : " nats (> band = a real forward divergence)"));
-      // Hard failure on gap-0 or above-band, identical bar on every device.
-      REQUIRE_MESSAGE(genuine_neartie,
-                      label << " gap-0/above-band divergence prompt[" << i << "] tok="
-                      << first_div << " is a forward error, not a tolerated near-tie");
-      continue;  // committed gaps past first_div describe a DIFFERENT sequence
-    }
+    REQUIRE_MESSAGE(first_div < 0,
+                    label << " anchor drift prompt[" << i << "] tok=" << first_div
+                    << " engine=" << (first_div < 0 ? -1 : got[static_cast<size_t>(first_div)])
+                    << " committed anchor=" << (first_div < 0 ? -1 : anchor_ids[i * T + first_div])
+                    << (metal ? " — re-capture the Metal golden (our_ids_metal.npy + "
+                                "neartie_gap_mnats_metal.npy) via qwen3-neartie-gap.py"
+                              : " — re-run qwen3-neartie-gap.py to refresh the gap golden"));
 
-    // No divergence from the anchor: the committed gaps describe our sequence, so
-    // the near-tie band check below is well-posed on every device.
+    // Anchor holds: the committed gaps describe our exact sequence, so the near-tie
+    // band check below is well-posed on every device. PASS iff every one of our
+    // tokens is within kNearTieMnats of vLLM's teacher-forced argmax on our prefix.
     bool exact = true;
     bool prompt_ok = true;
     int first_bad = -1;
     for (int64_t j = 0; j < T; ++j) {
       if (got[static_cast<size_t>(j)] != gd[i * T + j]) exact = false;
-      const int32_t mn = gapd[i * T + j];
+      const int32_t mn = gap_ids[i * T + j];
       if (mn > worst_gap) { worst_gap = mn; worst_i = static_cast<int>(i); worst_j = static_cast<int>(j); }
       if (mn > kNearTieMnats) { prompt_ok = false; if (first_bad < 0) first_bad = static_cast<int>(j); }
     }
@@ -327,7 +340,7 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
       MESSAGE(label << " FORWARD DIVERGENCE prompt[" << i << "] tok=" << first_bad
               << " our=" << got[static_cast<size_t>(first_bad)]
               << " vLLM_greedy=" << gd[i * T + first_bad]
-              << " gap=" << (gapd[i * T + first_bad] / 1000.0) << " nats (> "
+              << " gap=" << (gap_ids[i * T + first_bad] / 1000.0) << " nats (> "
               << (kNearTieMnats / 1000.0) << ") \"" << out.outputs[0].text << "\"");
     } else if (exact) {
       ++strict_exact;
@@ -370,15 +383,13 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
       MESSAGE(label << " dumped our token ids -> " << path);
     }
   }
-  MESSAGE(label << " correctness gate: "
-          << (strict_exact + neartie_only + metal_neartie_div) << "/" << N
+  MESSAGE(label << " correctness gate: " << (strict_exact + neartie_only) << "/" << N
           << " prompts PASS  (STRICT token-exact vs vLLM per-prompt greedy: "
           << strict_exact << "/" << N << "; near-tie-band only: " << neartie_only
-          << "/" << N << "; " << (metal ? "metal cross-device near-tie: " : "")
-          << (metal ? std::to_string(metal_neartie_div) : std::string())
-          << (metal ? "/" + std::to_string(N) + "; " : "; ") << "max gap "
-          << (worst_gap / 1000.0) << " nats @ prompt[" << worst_i << "] tok=" << worst_j
-          << "; " << fail << " forward-divergent)");
+          << "/" << N << "; max gap " << (worst_gap / 1000.0) << " nats @ prompt["
+          << worst_i << "] tok=" << worst_j << "; " << fail << " forward-divergent"
+          << (metal ? "; anchor+gaps = Metal oracle-backed golden (vLLM teacher-"
+                      "forced on the Metal prefix)" : "") << ")");
   REQUIRE(fail == 0);
 }
 

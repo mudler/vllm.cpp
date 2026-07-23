@@ -19786,3 +19786,41 @@ The Metal gate (`test_qwen3_paged_engine`, M4) passes 16/16 because its anchor i
 device-aware (a divergence from the CUDA-captured anchor at a committed near-tie
 is reported, not required away) — which is exactly the correct handling once the
 anchor is known to be stale on the current runtime for BOTH devices.
+
+- **2026-07-23 (Metal Qwen3-dense — ORACLE-BACKED near-tie confirmation + honest
+  gate LANDED; `CLAIM-BACKEND-METAL-M3B-RCA`, worktree `metal-qwen3-dense-rca`).**
+  The one measurement the RCA left CPU-backed is now oracle-backed and it CONFIRMS
+  the near-tie (no forward bug). Captured the Metal token sequence for all 16 gate
+  prompts on a clean M4 build, transferred to dgx, teacher-forced vLLM 0.25.0
+  (`~/venvs/vllm-oracle`, batch=1, `gpu_memory_utilization=0.40`, `enforce_eager`)
+  on the METAL prefix (`scripts/qwen3-neartie-gap.py`). RESULT: every one of the 60
+  Metal-vs-CUDA divergent positions is within 0.5 nats of vLLM's OWN argmax given
+  the Metal prefix — **max gap 0.125 nats, none outside top-20**. First-divergences:
+  p0 tok5 metal=15344 " Italy" **gap 0.0000** (vLLM's teacher-forced argmax on the
+  identical prefix IS 15344 — it contradicts its own CUDA-capture " France" pick;
+  the France/Italy top-2 margin is 0.003–0.007 nats), p5 tok10 0.1250, p10 tok10
+  0.0000, p11 tok1 metal=11 0.1250 (Metal matches vLLM's greedy where CUDA didn't).
+  KEY: the France/Italy tie is BUILD-SENSITIVE on CUDA too — the production dgx
+  build (FA2+Marlin+Triton+CUTLASS) picks France 9625; a portable-kernel-only CUDA
+  build picks Italy 15344 (same as Metal). Dispositive: numerical near-tie, not a
+  Metal defect. The golden is NOT stale (the previous state entry's "stale on both
+  devices" read was the portable-build artifact).
+  GATE LANDED (`tests/parity/test_qwen3_paged_engine.cpp`): replaced the RCA's
+  CUDA-anchor special-case with **device-appropriate ORACLE goldens** —
+  `goldens/qwen3_greedy_0_6b/our_ids_metal.npy` + `neartie_gap_mnats_metal.npy`.
+  Identical gate logic on every device (hard anchor REQUIRE + ≤0.5-nat near-tie
+  band), differing only in which device's oracle golden it loads; NO cross-device
+  latitude. Metal PASSES 16/16 (10 strict + 6 near-tie, max 0.125, 0 divergent;
+  backend proof all 9 ops selections>0 ∧ declines==0). TEETH proven: perturbed
+  anchor → drift FAIL; perturbed gap→0.6 nats → band FAIL; restore → PASS.
+  CUDA GREEN (production 121a build, `-Werror` 0 warn): Qwen3-0.6B 16/16 (France
+  anchor held), Qwen3-4B 16/16 (max 0.25). Regressions: OPT 6/6, Qwen3-Coder 6/6;
+  27B/35B/DeepSeek binaries byte-identical (only this test .cpp compiles on
+  dgx-CUDA; Metal TUs AUTO→OFF). Goldens md5 `2965ef5772b556d3f3f86fedf4221b2f`
+  unchanged (2 Metal files additive). Mac + Linux-CPU + dgx-CUDA `-Werror` clean.
+  MILESTONE WALKED BACK: not "strict 16/16 token-exact on Metal" but "forward
+  CORRECT — per-op NMSE ≤5e-4 vs CPU + oracle-confirmed near-tie-robust e2e; strict
+  token-exactness on 0.6B is ill-posed, a strict Metal gate needs Qwen3-4B (not on
+  the M4) — DEFERRED." `scripts/qwen3-neartie-gap.py` gained `--gpu-mem-util`
+  (default 0.40, GB10-safe). Not pushed. NEXT: user review; Qwen3-4B on a Mac for
+  the strict proof; Metal speed (`M3c`).

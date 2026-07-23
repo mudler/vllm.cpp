@@ -361,6 +361,17 @@ correct version — it simply stops. That last one is why the Apple and Vulkan
 backends need a handful of GPU programs before they can produce a single token,
 rather than needing them only to be fast. The audit records a ranked eight-step
 plan to close all of this. **Nothing was built or changed by the audit itself.**
+Since then, steps one, four and five landed (the automated count, the reference
+fallback, and a first shared "how is this weight format multiplied" object), and
+the count of NVIDIA-specific places dropped from 86 to **67**. Step six — moving
+the remaining compressed-weight fast-path switches off an explicit "is this
+NVIDIA" test — was assessed on 2026-07-23 and found to have **no byte-identical
+move available**: those specific switches pick a genuinely different numerical
+path on a non-NVIDIA device, so flipping them would change results rather than
+preserve them, and the reference fallback does not help because the relevant
+non-NVIDIA routines already exist. It therefore changed nothing (the count stays
+67) and its work was folded into steps three and seven. This is recorded honestly
+as a no-op rather than forced into a result-changing refactor.
 
 **The first of those eight steps is now in place (2026-07-22): the leakage is
 counted automatically on every push, and the count can only go down.** It had

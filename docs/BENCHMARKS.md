@@ -302,6 +302,26 @@ and that is expected.** The one number this row will ever own is a CORRECTNESS g
 speed gate — OPT token-exact on Metal via the tier — and observability (`GetReferenceTierHits`)
 enforces that any performance arm reads 0 reference-tier hits.
 
+### Accelerator-seam `S6` — convert the S4-deferred fp4/fp8 device gates (2026-07-23, `CLAIM-BACKEND-SEAM-S6-1`) — ASSESSED NO-OP, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE — assessment/records-only, no code changed, no
+performance claim owed.** `S6` was to convert the S4-deferred fp4/fp8 `device==kCUDA`
+gates behind `S5`'s reference tier, driving DSR down. It lands **no byte-identical
+conversion**: every remaining deferred fp4/fp8 gate bottoms out at a **dual-registered**
+(CPU+CUDA) bespoke op (`kMatmulNvfp4Fp4`/`kScaledFp4Quant`/`kSiluMulFp4Quant`/
+`kSigmoidGateFp4Quant`/`kRmsNormQuantFp8`/`kRmsNormGatedQuantFp8` — none CUDA-only, unlike
+S4's convertible gates), so `vt::OpRegistered(op,dev)` is TRUE on `kCPU` and the class-A
+swap flips the CPU reference/emulation path to a different numeric path — the task's
+"irreducible residual" rule. S5's reference tier does not change this (those CPU kernels
+are present natively, never a `GetOp` miss). **No `src/`/`include/`/test byte changed, DSR
+stays 67, no baseline moved.** Since the binary is untouched, every SACRED gate is
+byte-identical by construction (27B 235/235 · 35B 315/315 · Qwen3-Coder 6/6 · Qwen3-dense
+16/16 · OPT 6/6 · DeepSeek-V2 8/8 · Llama 16/16, no golden touched); no dgx build or GPU
+run is owed. Genuine byte-identical unlock re-scoped to `S3` (Platform capability fields
+mirroring `supports_fp8`/`cutlass_fp4_supported`) + `S7` (layer extraction). Bare-RC
+checkers on the dev box: `check-device-leakage.py` RC=0 (DSR 67 == baseline 67), 24-case
+mutation suite 24/24, `check-agent-record.py` + `check-doc-checkpoint.py` RC=0.
+
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
 reruns on the full production default set (async + vendored Triton GDN decode cubin

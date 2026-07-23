@@ -20060,3 +20060,54 @@ kMatmul 16 % + kMatmulBT 14 % = 80 %). G6 ports llama.cpp's Arm i8mm `nrc==2`
   the gated weight download). Row `ACTIVE` (correctness DONE), SPEED explicitly
   PENDING (head_dim 64 → generic paged path; Llama-3.2-3B head_dim-128 is the
   FA2-toggle W-next). Not pushed — report FULL SHA to the caller.
+
+## 2026-07-23 — accelerator-seam `S6`: convert the S4-deferred fp4/fp8 device gates → ASSESSED NO-OP / BLOCKED (`CLAIM-BACKEND-SEAM-S6-1`, base `34057d6`, worktree `/home/mudler/s6-worktree` branch `seam-s6`)
+
+- **Outcome: NO byte-identical conversion exists under S6's scoped seams
+  (LinearMethod/QuantMethod, OpProvider-mediated dispatch, S5 reference tier).
+  S6 is a documented no-op — DSR stays 67, baseline NOT moved, NO file under
+  `src/`/`include/`/`tests/` touched.** This is the explicitly-sanctioned honest
+  outcome ("if NOTHING converts safely, report S6 blocked and why"). Records-only.
+- **The decisive measurement.** S4 could convert its 18 gates only because each
+  bottomed out at a **CUDA-only** op (`kMoeGroupedGemmNvfp4Marlin`,
+  `kMatmulNvfp4Cutlass`, `kMatmulNvfp4`) — for a CUDA-only op
+  `vt::OpRegistered(op,dev)` is bit-for-bit `dev==kCUDA`. A registration audit at
+  `34057d6` proves EVERY remaining deferred fp4/fp8 gate bottoms out at a
+  **dual-registered** (CPU+CUDA) bespoke op: `kMatmulNvfp4Fp4`
+  (cpu_ops.cpp:1882 / cuda_matmul_nvfp4.cu:2794), `kScaledFp4Quant` (:1871),
+  `kSiluMulFp4Quant` (:1873), `kSigmoidGateFp4Quant` (:1875 /
+  cuda_matmul_nvfp4.cu:2791), `kRmsNormQuantFp8` (:1865), `kRmsNormGatedQuantFp8`
+  (:1902 / cuda_gdn.cu:5147). None is CUDA-only.
+- **Why the swap is bit-changing.** For a dual-registered op
+  `OpRegistered(op,kCPU)==true`, so `device==kCUDA → OpRegistered(op,device)`
+  FLIPS the CPU path. Concretely `qwen3_5.cpp:2343/2370`: on CPU the gate today
+  takes the bf16 reference (`DequantNvfp4ToBLayout`+`vt::Matmul`, :2358-2360); the
+  swap would take `MatmulNvfp4Fp4D` (fp4-quantized activation) — TWO DIFFERENT
+  numerics per device ⇒ the task's rule-3 "irreducible residual, LEAVE it".
+- **S5's reference tier does not help.** It installs a CPU fallback only on a
+  `GetOp` MISS on a unified non-CPU device; these CPU kernels are PRESENT natively
+  (they back the CPU nvfp4/fp8/ct-nvfp4 unit controls + the 27B NVFP4-emulation
+  reference), so there is never a miss and the tier never fires for them. It makes
+  a swap *correct*, not *byte-identical* — S6's bar is byte-identical.
+- **FusedChain `fast_op` offers nothing** — `kRmsNormGatedQuantFp8`'s fast
+  realization (`ops.cpp:618`) dispatches the SAME dual-registered bespoke op.
+- **CORRECTION** to spec §9.3/§10.4 (and the S6 task premise): `kRmsNormGatedQuantFp8`
+  was called "recipe-realized, NOT directly registered" and `kSigmoidGateFp4Quant`
+  "kCPU-only"; BOTH are in fact directly DUAL-registered. The deferral conclusion
+  (leave them) is unchanged and correct — the mechanism was mis-stated.
+- **Re-scoping.** The audit's `~37` S6 target assumed the class-A
+  `OpRegistered && supports(shape)` fix byte-identical for the class-A residue;
+  post-S4 that residue is CUDA-only-op-free. The genuine byte-identical unlock is
+  the audit's own class-D fix = **`S3`** (Platform capability fields mirroring
+  `supports_fp8`/`cutlass_fp4_supported` — call sites lose textual `kCUDA`, the
+  def lives in the allowlisted CUDA leg ⇒ DSR drops AND it decouples), plus **`S7`**
+  (layer extraction). Both out of S6's scope and unlanded. Declined the cosmetic
+  `device==kCUDA`-helper consolidation (drops the raw count without decoupling —
+  the audit Risk 3 / mutation M18 "rubber stamp").
+- **Gates.** No `src/`/`include/`/test byte changed ⇒ every SACRED gate
+  byte-identical by construction (27B 235/235, 35B 315/315, Coder 6/6, dense
+  16/16, OPT 6/6, DeepSeek-V2 8/8, Llama 16/16 — all UNCHANGED, no golden
+  touched). Bare-RC checkers on the dev box: `check-device-leakage.py` RC=0
+  (DSR 67 == baseline 67, no bucket moved), 24-case mutation suite 24/24,
+  `check-agent-record.py` RC=0, `check-doc-checkpoint.py` RC=0. Not pushed —
+  report FULL SHA to the caller.

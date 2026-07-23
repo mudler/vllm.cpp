@@ -95,6 +95,10 @@ vllm_cpp_add_test(test_kv_offload_connector vllm/v1/test_kv_offload_connector.cp
 vllm_cpp_add_test(test_lmcache_codec vllm/v1/kv_offload/lmcache/test_lmcache_codec.cpp)
 target_compile_definitions(test_lmcache_codec PRIVATE
   TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
+# LMCache MODE-1 (lm://) blocking TCP client — KV-EXTERNAL-CACHE W2. Round-trip
+# vs an in-process C++ mock server (always), and vs a REAL lmcache.v1.server
+# when VT_LMCACHE_LIVE_HOST/PORT are set (scripts/lmcache/run_live_roundtrip.sh).
+vllm_cpp_add_test(test_lmcache_client vllm/v1/kv_offload/lmcache/test_lmcache_client.cpp)
 vllm_cpp_add_test(test_scheduler_config vllm/test_scheduler_config.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)

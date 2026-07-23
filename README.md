@@ -30,6 +30,7 @@ vllm.cpp implements an intentionally focused subset of vLLM, held to token-for-t
 | CPU backend vs llama.cpp | At or ahead on every axis (GGUF) | Prefill 1.18x ahead, decode at parity, peak memory 1.01x, byte-identical greedy tokens |
 | Paged KV cache + prefix caching | Supported | Block-paged full attention, hybrid full-attention + GDN state groups, automatic prefix caching (APC) on by default for dense models |
 | KV offload to CPU / disk | Built, opt-in, off by default | CPU and disk tiers with identity-checked blocks; scheduler connector wired, worker-side GPU load pending |
+| LMCache client (`lm://` remote KV) | Client built, engine wiring pending | Pure-C++ `lm://` TCP client; PUT/GET byte-identical against a real `lmcache.v1.server` and bidirectional with LMCache's own Python codec, no `lmcache` package in-process |
 | Sampling | Supported | Greedy, temperature, top-k, top-p, min-p, penalties, allowed-token / bad-word masks |
 | Structured output | Supported (subset) | JSON schema, JSON object, regex, choice, GBNF grammar, Hermes-style tool-call subset |
 | OpenAI server | Supported (subset) | `/v1/completions`, `/v1/chat/completions`, streaming SSE, `/v1/models`, `/health`, `/version` |

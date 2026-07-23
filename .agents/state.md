@@ -20526,6 +20526,76 @@ inventory §9 item 13; ledger row; README; `docs/BENCHMARKS.md` (NOT APPLICABLE)
 today; a throwaway venv stood the fixtures up but a running server is the go/no-go
 precondition). Then W3 wires it as a `KVConnector` subclass over the parent
 claim's W5 abstract seam.
+
+## 2026-07-23 — LMCache C++ CLIENT W2: the blocking TCP `lm://` client + a REAL-server round-trip (go/no-go PASSED) — `CLAIM-LMCACHE-CPP-CLIENT`, base `9d2b8ba`
+
+**What landed.** The LMCache TRANSPORT — a blocking POSIX-socket
+`LMCacheRemoteClient` (`src/vllm/v1/kv_offload/lmcache/remote_client.{h,cpp}`)
+speaking the `lm://` wire, and the W2 go/no-go: our C++ client interoperates with
+a REAL `lmcache.v1.server`, byte-identical, in BOTH directions. Mirrors LMCache
+`8570aad` `storage_backend/connector/lm_connector.py:28-177` (the client loop)
+and `server/__main__.py:34-135` (the server loop):
+- `Connect` (getaddrinfo, retry/backoff for a not-yet-listening server,
+  TCP_NODELAY); `Put`/`Get`/`Exist`/`Health`/`List`; `SendAll`/`RecvAll` loop
+  over partial reads/writes (TCP is a stream) and treat a short read as an error
+  (mirrors the server's `receive_all`).
+- `PutKv2ltd`/`GetKv2ltd` wire W1's `KV_2LTD` `[2,L,T,D]` repack into PUT/GET so
+  our paged per-layer K/V planes ship EXACTLY the layout LMCache stores and read
+  back byte-identically; `GetKv2ltd` REFUSES a payload whose byte-count/shape
+  disagrees with the expected layout (gate-5 identity safety).
+- `LmcacheClientConfig` (host/port + the `blake3`/`vllm` hash-algo selection
+  matching the peer's `pre_caching_hash_algorithm`) from `VT_LMCACHE_HOST`/
+  `VT_LMCACHE_PORT`/`VT_LMCACHE_HASH_ALGO`.
+- HEALTH/LIST send a valid placeholder `CacheEngineKey` — the real server
+  `parse_cache_key`s EVERY header before the command switch, so an empty key
+  crashes its handler thread (found the hard way, then fixed).
+
+**Did the REAL server run, and did it need torch?** YES it ran, and YES it needs
+torch — but headless on CPU with two documented workarounds. `pip install
+lmcache` backtracked for minutes and never resolved; instead the server was run
+from the cloned `8570aad` source with a throwaway venv holding torch-CPU +
+py-cpuinfo/aiohttp/cachetools/prometheus_client/psutil/requests/sortedcontainers/
+pyyaml/msgspec. TWO headless snags, both real findings for W3's live infra: (1)
+lmcache's lazy device-detect `import torch` trips a torch-internal circular
+import unless torch is imported BEFORE lmcache; (2) the compiled `lmcache.c_ops`
+native ext is not published as a CPU wheel, so it is stubbed — legitimate because
+the lm:// CPU store (`LMSLocalBackend`) only stores bytearrays and never calls
+its pinned-memory alloc/free ops. With those, the UNMODIFIED upstream
+`LMCacheServer` runs (CLI-only mode, `StubCPUDevice`). `scripts/lmcache/
+{lm_server,lm_interop_client}.py` + `run_live_roundtrip.sh` capture the recipe.
+
+**The gate — REAL server, byte-identical, BIDIRECTIONAL.** `test_lmcache_client`
+REAL-server case **36/36 assertions** against a live `lmcache.v1.server`:
+PUT→GET byte-identical across 1 B / 4 KiB / 64 KiB+ payloads (the last forces
+multiple `recv()` chunks), EXIST true for stored + false for absent, absent-GET
+returns absent (not garbage), the `KV_2LTD` per-layer-plane repack round-trips
+byte-identical, no server-thread crash. **True bidirectional wire interop with
+LMCache's OWN protocol codec on the Python side:** a chunk written by a Python
+`lmcache.v1.protocol.ClientMetaMessage(...).serialize()` client is read
+byte-identical by our C++ client (Python→C++), and a chunk our C++ client writes
+is read byte-identical by the Python real-codec client (C++→Python). This proves
+interop with the real serialization, not just our own codec.
+
+**Always-on CI gate (no Python).** A same-binary in-process C++ mock server
+faithfully re-expressing `__main__.py`'s 186/36-byte protocol runs under ctest —
+the full round-trip incl. LIST (which the real server currently no-ops, so it is
+mock-only), **45/45 assertions**. So the gate holds in CI without a venv, and the
+SAME test doubles as the live gate when `VT_LMCACHE_LIVE_HOST/PORT` are set.
+
+**Gates.** Clean CPU `-Werror` 0 warnings; `test_lmcache_client` 45/45 (mock) +
+36/36 (real server); W1 `test_lmcache_codec` still 6/6, 2074/2074. INERT by
+construction — grep confirms NO engine/model/scheduler path references the
+client; the change is new files + two additive CMake lines only, so every
+existing TU (and the model gates) is byte-identical. CUDA build untouched
+(host-only POSIX sockets). `check-device-leakage.py` DSR 32 unchanged (no device
+code). Throwaway venv + server torn down; disk cleaned.
+
+**Next / open.** W3 — wire the client as a `KVConnector` subclass over the parent
+claim's W5 abstract seam (opt-in, default-off), then the key-agreement gate
+against a Python vLLM+LMCache peer and the DGX every-axis grid. The live infra
+W3 needs is now recorded: a real `lmcache.v1.server` needs torch (import-ordered)
+and either a real `c_ops` build or the CPU-store stub.
+
 ## 2026-07-23 — Mistral (`MistralForCausalLM`) fifth-family dense bring-up (`CLAIM-MODEL-MISTRAL`)
 
 Base `96c5cbb`, worktree `/home/mudler/_git/vllm.cpp-sweep-mistral`, branch

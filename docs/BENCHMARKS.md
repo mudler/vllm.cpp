@@ -2193,6 +2193,66 @@ The complete contract is in the
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
 
+## CPU vs llama.cpp — GDN split-projection orientation (last slow-orientation GEMM), `ACCEPTED` / binding (2026-07-23)
+
+`BACKEND-GATE-CPU-LLAMACPP` / `QUANT-GGUF-KEEPQ-LOADER`
+(`CLAIM-CPU-GDN-ORIENT-1`; [spec](../.agents/specs/cpu-gdn-proj-orientation-2026-07-23.md)).
+Base `bead27d`, binding host idle-gated `dgx.casa` (GB10, aarch64, 20 cores),
+one `flock $HOME/gpu.lock` (loadavg 0.43 at series start, gated < 1.2),
+`git archive` transfer, `Qwen3.5-2B-UD-Q8_K_XL.gguf`, same-binary A/B.
+
+**Ranked by a FRESH op-dispatch profile of the current binary** (temporary
+`vt::GetOp` wall-time hook + a per-GEMM shape histogram, reverted before the
+binding run). Warm prefill (`--input-len 128 --output-len 1`, 20 threads, total
+1070 ms = TTFT): kMatmulBTQuant **50.7 %**, **kMatmul (slow [K,N]) 17.9 % / 72
+calls**, kMatmulBT ([N,K]) 14.9 % / 20, kGdnPrefill 5.2 %, kPagedAttention 3.2 %.
+The histogram pinned the 72 `kMatmul` calls EXACTLY: `M=128 N=2048 K=2048 ×36`
++ `M=128 N=16 K=2048 ×36` = the four GDN split projections (`in_proj_qkv/z/b/a`)
+across all 18 GDN layers, the ONE weight family the loader still transposed into
+Matmul-B [K,N] (nk=false) after G4 gave every other expanded weight the file's
+own [N,K] order. **Gain ÷ effort #1**: LOW effort, bit-identical, moves 18 % of
+prefill to the M-blocked kernel (G7 repack of the 50.7 % quant GEMM is larger but
+MEDIUM–HIGH effort — the NEXT lever, not this one).
+
+**The fix:** `GgufLoadPolicy::gdn_expand_nk` (rides `expand_nk`; `VT_GGUF_GDN_NK=0`
+the A/B opt-out, `VT_CPU_REF=1` the historical transpose) keeps those projections
+in [N,K] nk=true so they reach `vt::MatmulBT`. Bit-identical, not near-tie:
+`MatmulBT` and `Matmul` are the same sequential f32 K-reduction differing only in
+the weight memory offset. Grounded in llama.cpp keeping every GGUF weight in its
+native `[out,in]` disk order (`ggml/src/ggml-cpu/ggml-cpu.c:1245-1443 @ 237ad9b96`).
+
+**Correctness — NO token movement:** output-token md5
+`d235db12f2cd304007530286a1755c95` byte-identical across AFTER (default), BEFORE
+(`VT_GGUF_GDN_NK=0`) and ORACLE (`VT_CPU_REF=1`), and at thread counts 1/4/20.
+`test_qwen36_gguf_engine` STANDALONE **2/2 cases, 28/28 assertions, 16/16 tokens**
+on APEX-Compact AND APEX-Balanced vs the same-file llama.cpp oracle.
+
+**Prefill e2e A/B** (`--output-len 32`, `VLLM_CPP_CPU_THREADS=20`, 5 reps, cold
+rep discarded, median 2–5). llama.cpp refreshed same session (`-t20 -r5 -ngl0`):
+pp512 211.25, **pp128 176.01±2.04**, tg32 24.93.
+
+| arm | TTFT median (ms) | prefill t/s | TPOT (ms) |
+|---|---|---|---|
+| BEFORE `VT_GGUF_GDN_NK=0` | 1125.05 | 113.8 | 44.1 |
+| **AFTER (default)** | **1031.94** | **124.0** | **40.4** |
+
+**Same-binary prefill 1.090×** (box-state-robust; a second gated run corroborates
+1.091×). Decode 1.09× (TPOT 44.1→40.4 ms → 24.75 t/s = **1.01× llama tg32, at
+parity**). RSS 3.884 GiB both arms (transpose removed, resident bytes identical).
+This session's absolute t/s ran ~7 % below the idle G6 baseline (residual
+same-session load), so the vs-llama absolute uses that recorded idle baseline:
+122.2 t/s (1.44×) × 1.090 = **133 t/s ≈ 1.32× behind**.
+
+**Fresh post-change profile:** `kMatmul` **17.9 % → 0 % (72 → 0 calls, ELIMINATED)**;
+`kMatmulBT` **14.9 % → 27.7 % (20 → 92 calls)** — it absorbed the 72. Next CPU
+prefill lever = the quant GEMM (kMatmulBTQuant, now 55 %): G7 repack-at-load.
+
+Gates: clean CPU `-Werror` 0 warnings; CPU unit ctest 136/136; CUDA clean
+`-Werror` 0 warnings (change is CUDA-inert: `gdn_expand_nk` is false off the CPU
+quant path, safetensors never reaches `LoadGdnGguf`); regression set UNCHANGED,
+each STANDALONE (27B 235/235, 35B 315/315, Coder 6/6, Qwen3-dense 16/16, OPT 6/6,
+DeepSeek-V2 8/8, Llama 16/16).
+
 ## CPU vs llama.cpp — Arm i8mm (mmla) quant-GEMM tier (CIQ G6), `ACCEPTED` / binding (2026-07-23)
 
 `CLAIM-QUANT-GGUF-CIQ-G6-1`, base `93b55c0`, binding host idle-gated `dgx.casa`

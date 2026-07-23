@@ -120,6 +120,10 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // reproducing the historical load byte for byte and allocation for allocation.
   p.mmap_residency = EnvOnOr("VT_GGUF_MMAP", p.keep_quant) && !p.cpu_ref;
   p.share_tied_head = EnvOnOr("VT_GGUF_SHARE_TIED_HEAD", p.expand_nk) && p.expand_nk;
+  // GDN split-projection orientation. Rides expand_nk (so VT_CPU_REF=1
+  // reproduces the historical transpose); VT_GGUF_GDN_NK=0 is the narrow
+  // same-binary A/B that reverts only the GDN projections to [K, N].
+  p.gdn_expand_nk = EnvOnOr("VT_GGUF_GDN_NK", p.expand_nk) && p.expand_nk;
   return p;
 }
 

@@ -136,6 +136,31 @@ void TransposeBf16(const uint16_t* src, int64_t rows, int64_t cols,
   }
 }
 
+// Materialize an expanded GDN projection from its dequantized [out, in] = [N, K]
+// row-major bf16 buffer `dq`. With `nk` (GgufLoadPolicy::gdn_expand_nk) the
+// weight is KEPT in that native [N, K] order (nk = true), so it reaches the
+// M-blocked vt::MatmulBT instead of the N-striding vt::Matmul — the same
+// orientation win GgufLoadPolicy::expand_nk already gives every other expanded
+// weight, and bit-identical for the same reason (the CPU kernels differ only in
+// the weight offset, MatmulOneChunk keeps its sequential f32 K reduction).
+// Without it, TODAY's transpose to Matmul-B [K, N] is preserved (nk = false),
+// which VT_CPU_REF=1 and VT_GGUF_GDN_NK=0 select for the A/B oracle. Any V-head
+// reorder is applied to `dq` (rows or cols) by the caller BEFORE this, so it is
+// orthogonal to the orientation chosen here.
+OwnedTensor MakeGdnProj(const std::vector<uint16_t>& dq, int64_t out_dim,
+                        int64_t in_dim, bool nk) {
+  if (nk) {
+    OwnedTensor o = MakeOwned(vt::DType::kBF16, {out_dim, in_dim});  // [N, K]
+    std::memcpy(o.bytes.data(), dq.data(), dq.size() * sizeof(uint16_t));
+    o.nk = true;
+    return o;
+  }
+  OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});  // [K, N]
+  TransposeBf16(dq.data(), out_dim, in_dim,
+                reinterpret_cast<uint16_t*>(o.bytes.data()));
+  return o;
+}
+
 // Reorder the V-head rows in [row_off, row_off + num_v*head_rows) of a
 // [rows, cols] row-major buffer from GGUF tiled order back to HF grouped order
 // (inverse of conversion/qwen.py _reorder_v_heads). grouped head g=k*R+r reads
@@ -522,9 +547,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
       const int64_t out_dim = t->shape[0];
       const int64_t in_dim = t->shape[1];
       if (reorder) ReorderVRows(dq, in_dim, /*row_off=*/2 * key_dim, num_k, rpk, dv);
-      gdn.in_proj_qkv = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-      TransposeBf16(dq.data(), out_dim, in_dim,
-                    reinterpret_cast<uint16_t*>(gdn.in_proj_qkv.bytes.data()));
+      gdn.in_proj_qkv = MakeGdnProj(dq, out_dim, in_dim, pol.gdn_expand_nk);
     }
   }
   // in_proj_z <- attn_gate [value_dim, H]; all rows are V.
@@ -539,9 +562,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
       const int64_t out_dim = t->shape[0];
       const int64_t in_dim = t->shape[1];
       if (reorder) ReorderVRows(dq, in_dim, 0, num_k, rpk, dv);
-      gdn.in_proj_z = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-      TransposeBf16(dq.data(), out_dim, in_dim,
-                    reinterpret_cast<uint16_t*>(gdn.in_proj_z.bytes.data()));
+      gdn.in_proj_z = MakeGdnProj(dq, out_dim, in_dim, pol.gdn_expand_nk);
     }
   }
   // in_proj_b <- ssm_beta, in_proj_a <- ssm_alpha [num_v, H]; rows are V heads.
@@ -558,9 +579,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     const int64_t out_dim = t->shape[0];
     const int64_t in_dim = t->shape[1];
     if (reorder) ReorderVRows(dq, in_dim, 0, num_k, rpk, 1);
-    *pr = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-    TransposeBf16(dq.data(), out_dim, in_dim,
-                  reinterpret_cast<uint16_t*>(pr->bytes.data()));
+    *pr = MakeGdnProj(dq, out_dim, in_dim, pol.gdn_expand_nk);
   }
   // conv1d <- ssm_conv1d [conv_dim, K]; only V channels reorder. NOT transposed.
   {
@@ -590,9 +609,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
       const int64_t out_dim = t->shape[0];
       const int64_t in_dim = t->shape[1];
       if (reorder) ReorderVCols(dq, out_dim, in_dim, num_k, rpk, dv);
-      gdn.out_proj = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-      TransposeBf16(dq.data(), out_dim, in_dim,
-                    reinterpret_cast<uint16_t*>(gdn.out_proj.bytes.data()));
+      gdn.out_proj = MakeGdnProj(dq, out_dim, in_dim, pol.gdn_expand_nk);
     }
   }
   // a_log <- ssm_a = -exp(A_log): recover A_log = log(-value). f32 [num_v].

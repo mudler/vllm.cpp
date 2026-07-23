@@ -145,6 +145,20 @@ struct GgufLoadPolicy {
   // are elementwise IDENTICAL to the embedding table's; the transposing
   // Matmul-B path builds genuinely different bytes and shares nothing.
   bool share_tied_head = false;
+  // GDN split-projection orientation (CPU prefill lever, 2026-07-23). The GDN
+  // linear-attention layers' expanded in_proj_qkv / in_proj_z / in_proj_b /
+  // in_proj_a and out_proj were the ONE family of matmul weights that
+  // LoadGdnGguf still transposed into Matmul-B [K, N] (nk = false) after G4
+  // gave every OTHER expanded weight the [N, K] treatment via expand_nk — a
+  // fresh op-dispatch profile of the current binary put those 4x18 = 72 GEMMs
+  // at 17.9 % of prefill, running the N-striding `kMatmul` instead of the
+  // M-blocked `kMatmulBT`. This flag keeps them in the file's own [N, K] order
+  // (nk = true) exactly as expand_nk does for the rest, which is bit-identical
+  // for the same reason (the CPU kernels differ only in the weight offset, same
+  // sequential f32 K reduction). Rides expand_nk (so cpu_ref reproduces the
+  // historical transpose path), with VT_GGUF_GDN_NK=0 the narrow same-binary
+  // A/B opt-out that reverts ONLY the GDN projections.
+  bool gdn_expand_nk = false;
   // Optional observer; null in production.
   GgufRoutingAudit audit;
 

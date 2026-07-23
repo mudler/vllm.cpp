@@ -20160,3 +20160,47 @@ kMatmul 16 % + kMatmulBT 14 % = 80 %). G6 ports llama.cpp's Arm i8mm `nrc==2`
   CPU+CUDA; `compute-sanitizer memcheck` 0 errors on `test_platform` +
   `test_ops_nvfp4_fp4`. `check-device-leakage.py` RC=0 (DSR 55 == baseline 55),
   24-case mutation suite 24/24. Not pushed — report FULL SHA to the caller.
+
+## 2026-07-23 — CPU prefill: GDN split-projection orientation, the last slow-orientation GEMM (`CLAIM-CPU-GDN-ORIENT-1`, base `bead27d`, worktree `/home/mudler/_git/vllm.cpp-cpu-prefill-lever` branch `cpu-prefill-lever-2026-07-23`)
+
+- **Task:** close more of the CPU prefill gap vs llama.cpp — fresh-profile the
+  current binary, implement the single top gain÷effort prefill lever.
+- **The fresh profile (ranked the work).** Temporary `vt::GetOp` wall-time hook
+  (accounts ~100% of wall time) + a per-GEMM shape histogram, built on dgx
+  aarch64, warm page cache, `--input-len 128 --output-len 1` (pure 128-token
+  prefill), 20 threads, reverted before any binding run. Warm prefill (total
+  1070 ms = TTFT): **kMatmulBTQuant 50.7% (q8_0 quant GEMM) · kMatmul ([K,N]
+  slow) 17.9% / 72 calls · kMatmulBT ([N,K]) 14.9% / 20 · kGdnPrefill 5.2% ·
+  kPagedAttention 3.2%** (GEMMs 83%). The shape histogram pinned the 72
+  `kMatmul` calls EXACTLY: `M=128 N=2048 K=2048 ×36` + `M=128 N=16 K=2048 ×36`
+  = the four GDN split projections (`in_proj_qkv/z/b/a`) × 18 GDN layers.
+- **Root cause + lever (gain÷effort #1).** Those GDN projections were the ONE
+  expanded weight family `LoadGdnGguf` still `TransposeBf16`-ed into Matmul-B
+  [K,N] (nk=false → the N-striding `kMatmul`, no M-blocking), after G4's
+  `expand_nk` gave every other expanded weight the file's own [N,K] order. LOW
+  effort, bit-identical, moves 17.9% of prefill to the M-blocked `kMatmulBT`
+  (G7 repack of the 50.7% quant GEMM is bigger but MEDIUM–HIGH effort — the NEXT
+  lever). Fix: `GgufLoadPolicy::gdn_expand_nk` (rides `expand_nk`;
+  `VT_GGUF_GDN_NK=0` the A/B opt-out, `VT_CPU_REF=1` the historical transpose)
+  + `MakeGdnProj` in `qwen3_5_gguf_weights.cpp` keep `in_proj_qkv/z/b/a` +
+  `out_proj` in [N,K] nk=true (V-head reorder applied first, orthogonal to
+  orientation). Mirrors llama.cpp keeping every GGUF weight in native `[out,in]`
+  order (`ggml-cpu.c:1245-1443 @ 237ad9b96`).
+- **Bit-identical, not near-tie.** `MatmulBT`/`Matmul` are the same sequential
+  f32 K-reduction differing only in the weight offset; token md5
+  `d235db12f2cd304007530286a1755c95` byte-identical across AFTER/BEFORE
+  (`VT_GGUF_GDN_NK=0`)/ORACLE (`VT_CPU_REF=1`) and threads 1/4/20.
+- **Binding (dgx aarch64, idle-gated loadavg 0.43 < 1.2, one flock, git
+  archive, 5-rep same-binary A/B, cold discarded).** Prefill **1.090×** (a 2nd
+  gated run corroborates 1.091×); decode 1.09× (TPOT 44.1→40.4 ms = 24.75 t/s =
+  1.01× llama tg32, at parity); **1.44× → 1.32× behind** llama.cpp pp128
+  (176.01 this session); peak RSS 3.884 GiB unchanged. Fresh post-change
+  profile: `kMatmul` **17.9%→0% (72→0 calls, ELIMINATED)**, `kMatmulBT`
+  14.9%→27.7% (20→92, absorbed the 72). **Next CPU prefill lever = the quant
+  GEMM (kMatmulBTQuant, now 55%): G7 repack-at-load.**
+- **Gates.** CPU `-Werror` 0-warn; CPU unit ctest 136/136; `test_qwen36_gguf_engine`
+  STANDALONE 2/2 · 28/28 · 16/16 on APEX-Compact+Balanced. CUDA `-Werror`
+  0-warn (change is CUDA-inert: `gdn_expand_nk` false off the CPU quant path,
+  safetensors never reaches `LoadGdnGguf`). Regression set UNCHANGED, each
+  STANDALONE — 27B 235/235, 35B 315/315, Coder 6/6, dense 16/16, OPT 6/6,
+  DeepSeek-V2 8/8, Llama 16/16. Not pushed — report FULL SHA to the caller.

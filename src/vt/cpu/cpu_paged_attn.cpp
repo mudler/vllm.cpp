@@ -18,6 +18,7 @@
 #include <limits>
 #include <vector>
 
+#include "cpu_threadpool.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -53,6 +54,7 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
                           const Tensor& seq_lens, const Tensor& query_start_loc,
                           const PagedAttentionArgs& args) {
   const int64_t num_reqs = seq_lens.shape[0];
+  const int64_t total_q = query.shape[0];
   const int64_t hq = query.shape[1], d = query.shape[2];
   const int64_t block_size = k_cache.shape[1];
   const int64_t num_kv_heads = k_cache.shape[2];
@@ -71,9 +73,17 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   const int64_t kc_blk = k_cache.stride[0], kc_pg = k_cache.stride[1], kc_hd = k_cache.stride[2];
   const int64_t vc_blk = v_cache.stride[0], vc_pg = v_cache.stride[1], vc_hd = v_cache.stride[2];
 
-  std::vector<float> probs;
-  std::vector<float> acc(static_cast<size_t>(d));
-
+  // Flatten the (request, local-token) nest into the global query-token index so
+  // the work is one embarrassingly-parallel axis: at c1 prefill num_reqs==1, so
+  // the request loop alone is serial (kPagedAttention profiled at 10% of prefill,
+  // single-threaded). Precompute each token's absolute position p, its request's
+  // seqlen, and its request row (for the block table) once on the caller — cheap
+  // O(total_q) — then chunk the token rows across the pool. Each output row
+  // out[(t*hq+h)*d] is produced by exactly one thread with the same per-element
+  // math and j-reduction order as the serial code: bit-identical by construction.
+  std::vector<int32_t> tok_pos(static_cast<size_t>(total_q));
+  std::vector<int32_t> tok_slen(static_cast<size_t>(total_q));
+  std::vector<int32_t> tok_req(static_cast<size_t>(total_q));
   for (int64_t r = 0; r < num_reqs; ++r) {
     const int64_t q0 = qsl[r], q1 = qsl[r + 1];
     const int64_t query_len = q1 - q0;
@@ -81,8 +91,19 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
     const int64_t seqlen = slens[r];
     const int64_t context = seqlen - query_len;  // past positions before this chunk
     for (int64_t local = 0; local < query_len; ++local) {
-      const int64_t t = q0 + local;
-      const int64_t p = context + local;  // absolute position of this query token
+      tok_pos[static_cast<size_t>(q0 + local)] = static_cast<int32_t>(context + local);
+      tok_slen[static_cast<size_t>(q0 + local)] = static_cast<int32_t>(seqlen);
+      tok_req[static_cast<size_t>(q0 + local)] = static_cast<int32_t>(r);
+    }
+  }
+
+  ParallelForRows(CurrentThreadpool(), total_q, [&](int64_t t0, int64_t t1) {
+    std::vector<float> probs;
+    std::vector<float> acc(static_cast<size_t>(d));
+    for (int64_t t = t0; t < t1; ++t) {
+      const int64_t r = tok_req[static_cast<size_t>(t)];
+      const int64_t p = tok_pos[static_cast<size_t>(t)];  // absolute position
+      const int64_t seqlen = tok_slen[static_cast<size_t>(t)];
       const int64_t jmin = window_left >= 0 ? std::max<int64_t>(0, p - window_left) : 0;
       int64_t jmax = args.causal ? p : seqlen - 1;
       if (window_right >= 0) jmax = std::min(jmax, p + window_right);
@@ -126,7 +147,7 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
         for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
       }
     }
-  }
+  });
 }
 
 struct Registrar {

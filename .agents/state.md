@@ -19631,3 +19631,29 @@ runs are VOID per protocol.
 # all — even a Hopper owner gets only the portable path. A green single-arch link
 # is not execution evidence. benchmark_binding=false (no Hopper to benchmark).
 # NOT pushed. Full SHA reported to the caller.
+- **2026-07-23** — **CPU prefill: threaded the two serial non-GEMM kernels
+  (`CLAIM-CPU-THREAD-GDN-PAGED-1`, base `4884d03`, isolated worktree).** After L5
+  + elementwise GEMM, CPU decode is at llama.cpp parity (1.03×) but **prefill is
+  2.34× behind**; a fresh op-dispatch profile ranked prefill as kMatmulBTQuant
+  37% / **kGdnPrefill 25%** / kMatmul 12% / kMatmulBT 10% / **kPagedAttention
+  10%** — the GEMMs run at 211–417 GFLOP/s (not the bottleneck), and the 35% that
+  was single-threaded was the gap. **kGdnPrefill** now chunks over the
+  (sequence, value-head) axis via the existing `ParallelForRows` — value-heads
+  own disjoint state blocks (the same axis the GPU GDN uses; vLLM fla
+  parallelizes `batch*heads`), so the per-head time-sequential recurrence is
+  untouched and c1 (n=1) goes from 1-way to `Hv`-way (16 on qwen35-2B).
+  **kPagedAttention** (previously no pool) now chunks over query-token rows
+  (num_reqs==1 at c1 ⇒ tokens are the parallel axis, mirroring ggml
+  `flash_attn_ext`'s query-pos×head×batch chunking); the per-token request/pos
+  lookup is precomputed once O(total_q). Both partition OUTPUT elements only (no
+  reduction reassociation, no atomicAdd) ⇒ **bit-identical** to single-thread by
+  construction. Refactor: extracted `GdnHeadTokenStep` (one head, one token);
+  `GdnTokenStep` (decode kernel, batch-parallel) now loops it. **Correctness
+  PROVEN:** real qwen35 GGUF output-token md5 `d235db12f2cd304007530286a1755c95`
+  unchanged at threads 1/4/20 and under `VT_CPU_REF=1`; determinism battery
+  extended (single-seq `Hv=20` GdnPrefill + 37-token causal PagedAttention)
+  byte-identical at 1/3/20; full CPU ctest 158/158; clean CPU `-Werror`. Binding
+  dgx prefill A/B (before `4884d03` / after), op-level 1→20 thread-scaling for
+  both kernels, and the fresh post-change profile: see
+  `.agents/specs/cpu-thread-gdn-paged-2026-07-23.md` +
+  `docs/BENCHMARKS.md`.

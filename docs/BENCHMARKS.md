@@ -2040,6 +2040,30 @@ The complete contract is in the
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
 
+## CPU vs llama.cpp — thread kGdnPrefill + kPagedAttention, `ACTIVE` / dgx binding in progress (2026-07-23)
+
+`BENCH-CPU-LLAMA` / `BACKEND-GATE-CPU-LLAMACPP` / `QUANT-GGUF-CPU-THREADPOOL`
+(`CLAIM-CPU-THREAD-GDN-PAGED-1`; [spec](../.agents/specs/cpu-thread-gdn-paged-2026-07-23.md)).
+
+**The two serial non-GEMM kernels on the prefill hot path are now threaded.** A
+fresh op-dispatch profile of the current binary ranked prefill as kMatmulBTQuant
+37 % / **kGdnPrefill 25 %** / kMatmul 12 % / kMatmulBT 10 % / **kPagedAttention
+10 %** — the GEMMs already run at 211–417 GFLOP/s, and the 35 % that was
+single-threaded (GDN recurrence chunked over sequences = n=1 at c1; paged
+attention with no pool) was the gap. kGdnPrefill now chunks over the independent
+(sequence, value-head) axis, kPagedAttention over query-token rows; both stay
+**bit-identical** to single-thread (disjoint output/state partition, no reduction
+reassociation). Correctness proven: benchmark output-token md5
+`d235db12f2cd304007530286a1755c95` unchanged at threads 1/4/20 and under
+`VT_CPU_REF=1`; `test_cpu_threadpool` determinism battery (extended with a
+single-sequence `Hv=20` GdnPrefill case + a 37-token causal PagedAttention case)
+byte-identical at 1/3/20; full CPU ctest 158/158.
+
+**Binding numbers (dgx aarch64, idle, flock, foreground) — PENDING this run:**
+prefill before(`4884d03`)/after, new ratio vs llama.cpp pp128 173.28±1.75,
+op-level 1→20 thread-scaling for both kernels, fresh post-change profile + new
+bottleneck. Recipe = the floor-remeasurement recipe below.
+
 ## CPU vs llama.cpp — keep-quant loader RSS (L5), `ACCEPTED` / binding (2026-07-23)
 
 `BENCH-CPU-LLAMA` / `BACKEND-GATE-CPU-LLAMACPP` / `QUANT-GGUF-KEEPQ-LOADER`

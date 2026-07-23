@@ -1019,11 +1019,53 @@ void RmsNormGatedQuantFp8Kernel(Queue&, Tensor& out_fp8, const Tensor& x, const 
   });
 }
 
-// §7 gated-delta-rule token step, shared by prefill and decode. state points
-// at this sequence's [Hv,Dv,Dk] f32 block; tok indexes the packed q/k/v/g/beta
-// rows. GQA broadcast: v-head hv reads q/k head hv / (Hv/Hk).
+// §7 gated-delta-rule step for ONE value-head at ONE token. s_head points at
+// this (sequence, head) [Dv,Dk] f32 block; tok indexes the packed q/k/v/g/beta
+// rows; hk = hv / (Hv/Hk) is the GQA-broadcast key/query head.
 //   q' = q * scale;  S *= exp(g[hv]);  v' = (v - S @ k) * beta[hv];
 //   S += outer(v', k);  out = S @ q'      (k is NOT scaled)
+// The per-head recurrence is sequential in `tok` (S carries forward), but
+// distinct heads (and distinct sequences) touch disjoint state blocks and
+// disjoint output rows — so heads are the parallel axis (GdnPrefillKernel),
+// matching how the GPU GDN chunks over heads. Same instruction sequence and
+// f32 reduction order regardless of which thread runs it: bit-identical.
+void GdnHeadTokenStep(Tensor& out, const Tensor& q_in, const Tensor& k_in, const Tensor& v_in,
+                      const Tensor& g, const Tensor& beta, float* s_head, int64_t tok,
+                      int64_t hv, int64_t hk, int64_t hk_n, int64_t hv_n, int64_t dk, int64_t dv,
+                      float scale, std::vector<float>& qbuf, std::vector<float>& kbuf,
+                      std::vector<float>& vbuf) {
+  const float g_t = g.Ptr<float>()[tok * hv_n + hv];
+  const float beta_t = beta.Ptr<float>()[tok * hv_n + hv];
+  const float decay = std::exp(g_t);
+  for (int64_t i = 0; i < dk; ++i) {
+    qbuf[static_cast<size_t>(i)] = LoadF32(q_in, (tok * hk_n + hk) * dk + i) * scale;
+    kbuf[static_cast<size_t>(i)] = LoadF32(k_in, (tok * hk_n + hk) * dk + i);
+  }
+  for (int64_t vi = 0; vi < dv; ++vi) {
+    float* s_row = s_head + vi * dk;
+    float dot = 0.0f;  // (S * exp(g)) @ k, fused with the decay pass
+    for (int64_t ki = 0; ki < dk; ++ki) {
+      s_row[ki] *= decay;
+      dot += s_row[ki] * kbuf[static_cast<size_t>(ki)];
+    }
+    vbuf[static_cast<size_t>(vi)] =
+        (LoadF32(v_in, (tok * hv_n + hv) * dv + vi) - dot) * beta_t;
+  }
+  for (int64_t vi = 0; vi < dv; ++vi) {
+    float* s_row = s_head + vi * dk;
+    float o = 0.0f;  // (S + outer(v',k)) @ q', fused with the rank-1 update
+    for (int64_t ki = 0; ki < dk; ++ki) {
+      s_row[ki] += vbuf[static_cast<size_t>(vi)] * kbuf[static_cast<size_t>(ki)];
+      o += s_row[ki] * qbuf[static_cast<size_t>(ki)];
+    }
+    StoreF32(out, (tok * hv_n + hv) * dv + vi, o);
+  }
+}
+
+// All value-heads for one token, `state` at this sequence's [Hv,Dv,Dk] block.
+// Used by the decode kernel (which parallelizes over the batch, so a whole
+// token is one work item). Loop order (head-outer here, head-outer in prefill)
+// is irrelevant to the result: each head owns a disjoint state block.
 void GdnTokenStep(Tensor& out, const Tensor& q_in, const Tensor& k_in, const Tensor& v_in,
                   const Tensor& g, const Tensor& beta, float* state, int64_t tok, float scale,
                   std::vector<float>& qbuf, std::vector<float>& kbuf,
@@ -1033,33 +1075,8 @@ void GdnTokenStep(Tensor& out, const Tensor& q_in, const Tensor& k_in, const Ten
   const int64_t ratio = hv_n / hk_n;
   for (int64_t hv = 0; hv < hv_n; ++hv) {
     const int64_t hk = hv / ratio;
-    float* s_head = state + hv * dv * dk;  // [Dv, Dk]
-    const float g_t = g.Ptr<float>()[tok * hv_n + hv];
-    const float beta_t = beta.Ptr<float>()[tok * hv_n + hv];
-    const float decay = std::exp(g_t);
-    for (int64_t i = 0; i < dk; ++i) {
-      qbuf[static_cast<size_t>(i)] = LoadF32(q_in, (tok * hk_n + hk) * dk + i) * scale;
-      kbuf[static_cast<size_t>(i)] = LoadF32(k_in, (tok * hk_n + hk) * dk + i);
-    }
-    for (int64_t vi = 0; vi < dv; ++vi) {
-      float* s_row = s_head + vi * dk;
-      float dot = 0.0f;  // (S * exp(g)) @ k, fused with the decay pass
-      for (int64_t ki = 0; ki < dk; ++ki) {
-        s_row[ki] *= decay;
-        dot += s_row[ki] * kbuf[static_cast<size_t>(ki)];
-      }
-      vbuf[static_cast<size_t>(vi)] =
-          (LoadF32(v_in, (tok * hv_n + hv) * dv + vi) - dot) * beta_t;
-    }
-    for (int64_t vi = 0; vi < dv; ++vi) {
-      float* s_row = s_head + vi * dk;
-      float o = 0.0f;  // (S + outer(v',k)) @ q', fused with the rank-1 update
-      for (int64_t ki = 0; ki < dk; ++ki) {
-        s_row[ki] += vbuf[static_cast<size_t>(vi)] * kbuf[static_cast<size_t>(ki)];
-        o += s_row[ki] * qbuf[static_cast<size_t>(ki)];
-      }
-      StoreF32(out, (tok * hv_n + hv) * dv + vi, o);
-    }
+    GdnHeadTokenStep(out, q_in, k_in, v_in, g, beta, state + hv * dv * dk, tok, hv, hk, hk_n,
+                     hv_n, dk, dv, scale, qbuf, kbuf, vbuf);
   }
 }
 
@@ -1074,15 +1091,28 @@ void GdnPrefillKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k, 
   for (int64_t s = 0; s < n; ++s) {
     VT_CHECK(qslp[s + 1] >= qslp[s], "gdn_prefill: query_start_loc not monotonic");
   }
-  // Row-chunked over SEQUENCES (spec W3): each sequence owns its state block
-  // and its token range's outputs; the in-sequence recurrence stays sequential.
-  ForRows(n, [&](int64_t r0, int64_t r1) {
+  // Row-chunked over the (SEQUENCE, VALUE-HEAD) product. At c1 prefill there is
+  // one sequence but hv_n independent heads; sequences alone (spec W3's original
+  // axis) left the whole recurrence single-threaded (kGdnPrefill profiled at 25%
+  // of prefill). Each (s, hv) item owns a disjoint state block
+  // state[(s*hv_n + hv)] and disjoint output rows out[(t*hv_n + hv)]; the
+  // in-sequence, in-head recurrence stays sequential in tok. Byte-identical to
+  // the single-thread order by construction (disjoint outputs, no shared
+  // reduction) — matches the GPU GDN's head chunking.
+  const int64_t hk_n = q_in.shape[1];
+  const int64_t ratio = hv_n / hk_n;
+  const int64_t nitems = n * hv_n;
+  ForRows(nitems, [&](int64_t r0, int64_t r1) {
   std::vector<float> qbuf(static_cast<size_t>(dk)), kbuf(static_cast<size_t>(dk)),
       vbuf(static_cast<size_t>(dv));
-  for (int64_t s = r0; s < r1; ++s) {
-    float* s_state = state.Ptr<float>() + s * hv_n * dv * dk;
+  for (int64_t item = r0; item < r1; ++item) {
+    const int64_t s = item / hv_n;
+    const int64_t hv = item % hv_n;
+    const int64_t hk = hv / ratio;
+    float* s_head = state.Ptr<float>() + (s * hv_n + hv) * dv * dk;
     for (int64_t t = qslp[s]; t < qslp[s + 1]; ++t)
-      GdnTokenStep(out, q_in, k, v, g, beta, s_state, t, args.scale, qbuf, kbuf, vbuf);
+      GdnHeadTokenStep(out, q_in, k, v, g, beta, s_head, t, hv, hk, hk_n, hv_n, dk, dv,
+                       args.scale, qbuf, kbuf, vbuf);
   }
   });
 }

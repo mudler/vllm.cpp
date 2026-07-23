@@ -347,6 +347,64 @@ std::vector<std::vector<uint8_t>> RunBattery(Threadpool& pool) {
     outs.push_back(Bytes(out.data(), out.size() * sizeof(float)));
     outs.push_back(Bytes(state.data(), state.size() * sizeof(float)));
   }
+  // GdnPrefill SINGLE sequence, Hv=20 > nth: exercises the (seq,head) parallel
+  // axis at c1 (n==1, so heads are the only partitionable dimension). Hv=20 with
+  // Hk=4 (ratio 5) and non-multiple-of-16 head dims stresses chunk boundaries.
+  {
+    const int64_t total = 23, Hk = 4, Hv = 20, Dk = 8, Dv = 8;
+    std::vector<float> qq(total * Hk * Dk), kk(total * Hk * Dk), vv(total * Hv * Dv),
+        g(total * Hv), beta(total * Hv), state(1 * Hv * Dv * Dk, 0.0f), out(total * Hv * Dv);
+    FillF32(qq, 27);
+    FillF32(kk, 28);
+    FillF32(vv, 29);
+    FillF32(g, 30);
+    FillF32(beta, 31);
+    std::vector<int32_t> qsl = {0, total};
+    Tensor tq = Tensor::Contiguous(qq.data(), DType::kF32, Cpu(), {total, Hk, Dk});
+    Tensor tk = Tensor::Contiguous(kk.data(), DType::kF32, Cpu(), {total, Hk, Dk});
+    Tensor tv = Tensor::Contiguous(vv.data(), DType::kF32, Cpu(), {total, Hv, Dv});
+    Tensor tg = Tensor::Contiguous(g.data(), DType::kF32, Cpu(), {total, Hv});
+    Tensor tb = Tensor::Contiguous(beta.data(), DType::kF32, Cpu(), {total, Hv});
+    Tensor ts = Tensor::Contiguous(state.data(), DType::kF32, Cpu(), {1, Hv, Dv, Dk});
+    Tensor tqsl = Tensor::Contiguous(qsl.data(), DType::kI32, Cpu(), {2});
+    Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {total, Hv, Dv});
+    vt::GdnArgs args;
+    args.scale = 0.353553f;
+    vt::GdnPrefill(q, to, tq, tk, tv, tg, tb, ts, tqsl, args);
+    outs.push_back(Bytes(out.data(), out.size() * sizeof(float)));
+    outs.push_back(Bytes(state.data(), state.size() * sizeof(float)));
+  }
+  // PagedAttention: one prefill sequence of 37 tokens (c1 prefill shape) — the
+  // query-token rows are the parallel axis. Causal GQA Hq=4, Hk=2, D=8,
+  // block_size=4, spanning 10 blocks. K/V live in a contiguous NHD cache filled
+  // deterministically; block_table maps j → its cache block.
+  {
+    const int64_t T = 37, Hq = 4, Hk = 2, D = 8, bs = 4;
+    const int64_t nblocks = (T + bs - 1) / bs;  // 10
+    std::vector<float> query(T * Hq * D), out(T * Hq * D);
+    // NHD cache (nblocks, bs, Hk, D) — one blocks-axis slice (unbind stride
+    // matches the contiguous single-slice case).
+    std::vector<float> kc(nblocks * bs * Hk * D), vc(nblocks * bs * Hk * D);
+    FillF32(query, 32);
+    FillF32(kc, 33);
+    FillF32(vc, 34);
+    std::vector<int32_t> block_table(nblocks);
+    for (int64_t b = 0; b < nblocks; ++b) block_table[static_cast<size_t>(b)] = static_cast<int32_t>(b);
+    std::vector<int32_t> seq_lens = {static_cast<int32_t>(T)};
+    std::vector<int32_t> qsl = {0, static_cast<int32_t>(T)};
+    Tensor tq = Tensor::Contiguous(query.data(), DType::kF32, Cpu(), {T, Hq, D});
+    Tensor tkc = Tensor::Contiguous(kc.data(), DType::kF32, Cpu(), {nblocks, bs, Hk, D});
+    Tensor tvc = Tensor::Contiguous(vc.data(), DType::kF32, Cpu(), {nblocks, bs, Hk, D});
+    Tensor tbt = Tensor::Contiguous(block_table.data(), DType::kI32, Cpu(), {1, nblocks});
+    Tensor tsl = Tensor::Contiguous(seq_lens.data(), DType::kI32, Cpu(), {1});
+    Tensor tqsl = Tensor::Contiguous(qsl.data(), DType::kI32, Cpu(), {2});
+    Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {T, Hq, D});
+    vt::PagedAttentionArgs args;
+    args.scale = 0.353553f;
+    args.causal = true;
+    vt::PagedAttention(q, to, tq, tkc, tvc, tbt, tsl, tqsl, args);
+    outs.push_back(Bytes(out.data(), out.size() * sizeof(float)));
+  }
   // MoeRouterTopK t=29, E=16, k=4 (renormalize).
   {
     std::vector<float> logits(29 * 16), weights(29 * 4);

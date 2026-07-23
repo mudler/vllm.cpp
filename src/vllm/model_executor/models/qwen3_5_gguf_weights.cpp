@@ -76,6 +76,47 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
   return o;
 }
 
+OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
+                       int64_t row_offset, const GgufFile* mmap_src, bool nk) {
+  VT_CHECK(KeepF16DType(tensor.ggml_type),
+           "qwen3_5 gguf: keep-f16 on a non-f16 encoding for " + tensor.name);
+  VT_CHECK(n > 0 && k > 0 && row_offset >= 0,
+           "qwen3_5 gguf: bad keep-f16 slice for " + tensor.name);
+  const size_t row_bytes = vt::RowSizeBytes(vt::DType::kF16, k);  // 2 * k
+  const size_t begin = static_cast<size_t>(row_offset) * row_bytes;
+  const size_t bytes = static_cast<size_t>(n) * row_bytes;
+  VT_CHECK(begin + bytes <= tensor.nbytes,
+           "qwen3_5 gguf: keep-f16 slice exceeds the tensor span for " +
+               tensor.name);
+
+  OwnedTensor o;
+  o.dtype = vt::DType::kF16;
+  o.rank = 2;
+  o.shape[0] = n;  // N = out features (ggml src0 rows), or vocab for a gather
+  o.shape[1] = k;  // K = in features, or H for a gather
+  // nk = true: the file's [N, K] MatmulBT orientation, no transpose. nk = false:
+  // a [vocab, H] gather table (embedding), read row-wise by EmbeddingKernel.
+  o.nk = nk;
+  const uint8_t* src = tensor.data + begin;
+
+  if (mmap_src == nullptr) {
+    o.bytes.assign(src, src + bytes);  // copy into an owned buffer
+    return o;
+  }
+  // Borrow in place out of the read-only mapping (L5 residency, L6 dtype). The
+  // f16 bytes need only 2-byte alignment, which GGUF's tensor-data alignment
+  // guarantees; re-validate against the MAPPING so a mismatched file can never
+  // hand out a view outside it.
+  VT_CHECK(mmap_src->OwnsSpan(src, bytes),
+           "qwen3_5 gguf: keep-f16 mmap span is outside the file mapping for " +
+               tensor.name);
+  VT_CHECK(reinterpret_cast<uintptr_t>(src) % alignof(uint16_t) == 0,
+           "qwen3_5 gguf: keep-f16 mmap span is not 2-byte aligned for " +
+               tensor.name);
+  o.bytes = OwnedBytes::Borrow(src, bytes, mmap_src->Mapping());
+  return o;
+}
+
 namespace {
 
 // --- small helpers -------------------------------------------------------
@@ -112,6 +153,23 @@ class GgufPageReleaseScope {
 // which `VT_GGUF_MMAP=0` and `VT_CPU_REF=1` both select).
 const GgufFile* MmapSrc(const GgufFile& g, const GgufLoadPolicy& pol) {
   return pol.mmap_residency ? &g : nullptr;
+}
+
+// L6: keep a verbatim 2-D / stacked-expert weight slice resident — quant blocks
+// or native f16 — in [N, K] nk=true order. Precondition: the policy already
+// routed this (tensor, role) to a KEEP residency (`r != kExpandBf16`).
+// Centralizes the block-vs-f16 dispatch so every keep call site is one line.
+OwnedTensor OwnGgufKeptSlice(const GgufFile& g, const GgufLoadPolicy& pol,
+                             const GgufTensorInfo& t, GgufResidency r, int64_t n,
+                             int64_t k, int64_t row_offset) {
+  if (r == GgufResidency::kKeepQuant) {
+    return OwnGgufQuantBlocks(t, n, k, row_offset, MmapSrc(g, pol),
+                              pol.quant_repack);
+  }
+  VT_CHECK(r == GgufResidency::kKeepF16,
+           "qwen3_5 gguf: OwnGgufKeptSlice called for a non-keep residency on " +
+               t.name);
+  return OwnGgufF16(t, n, k, row_offset, MmapSrc(g, pol), /*nk=*/true);
 }
 
 bool HasTensor(const GgufFile& g, const std::string& name) {
@@ -310,11 +368,11 @@ OwnedTensor OwnNormMinus1(const GgufFile& g, const std::string& name) {
 OwnedTensor OwnMatmulWeight(const GgufFile& g, const std::string& name,
                             const GgufLoadPolicy& pol) {
   const GgufTensorInfo& t = g.Get(name);
-  if (pol.Route(t, GgufTensorRole::kMatmulWeight) ==
-      GgufResidency::kKeepQuant) {
+  const GgufResidency r = pol.Route(t, GgufTensorRole::kMatmulWeight);
+  if (r != GgufResidency::kExpandBf16) {
+    // keep-quant blocks OR keep-f16, both in the file's own [N, K] order.
     VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
-    return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1], 0, MmapSrc(g, pol),
-                              pol.quant_repack);
+    return OwnGgufKeptSlice(g, pol, t, r, t.shape[0], t.shape[1], 0);
   }
   if (pol.expand_nk) {
     VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
@@ -337,43 +395,72 @@ void RequireExpand(const GgufLoadPolicy& pol, const GgufFile& g,
                " tensor must not keep quant blocks: " + name);
 }
 
-// --- embedding + lm_head, with tied-head sharing (L5) ---------------------
+// --- embedding + lm_head, with tied-head sharing (L5 bf16 / L6 f16) --------
 //
 // A tied-embedding GGUF omits `output.weight`: the head IS `token_embd.weight`,
 // and llama.cpp materializes no second copy — it aliases the head onto the
-// embedding (TENSOR_DUPLICATED). Until L5 we materialized it twice, which on the
-// 2B bench file is a whole extra 0.947 GiB bf16 vocab matrix (248320 x 2048).
+// embedding (TENSOR_DUPLICATED). Materialized twice, that is a whole extra
+// vocab matrix (248320 x 2048 = 0.947 GiB on the 2B bench file).
 //
 // The two uses want the SAME bytes in the SAME order and differ only in
-// metadata: the gather table is [vocab, H] with nk = false, and the GEMM weight
-// is [N = vocab, K = H] with nk = true. `expand_nk` is exactly the condition
-// under which the head is materialized in the file's own [N, K] order, so it is
-// also exactly the condition under which the two byte images coincide and one
-// buffer can serve both. Without it (VT_CPU_REF, or any non-CPU device) the head
-// is TRANSPOSED to Matmul-B [K, N] — genuinely different bytes — and this falls
-// through to the historical two-buffer path, unchanged.
+// metadata: the gather table is [vocab, H] with nk = false, the GEMM weight is
+// [N = vocab, K = H] with nk = true. They coincide — so ONE resident matrix can
+// serve both — in exactly two configurations, which is what this function picks:
 //
-// Both tensors then BORROW one shared, refcounted expansion; neither owns it, so
-// there is no "which one frees it" question and no double free.
+//   * L6 keep-f16: token_embd is F16 and stays F16 for both uses. The gather
+//     table borrows the file's f16 bytes (or a copy) and the head borrows the
+//     SAME bytes with nk = true. This is the cheapest — no bf16 re-expansion at
+//     all — and matches llama.cpp, which keeps token_embd f16 and gathers/GEMMs
+//     on it directly.
+//   * L5 expand-bf16: both expand to bf16 in the file's own [N, K] order, which
+//     is the `expand_nk` case; the transposing Matmul-B path (VT_CPU_REF, or a
+//     non-CPU device) builds genuinely different bytes and shares nothing.
+//
+// Either way both tensors BORROW one shared, refcounted buffer (the mmap, or one
+// bf16/f16 expansion via OwnedBytes::KeepAlive); neither owns it, so there is no
+// "which one frees it" question and no double free. If the two do not coincide,
+// the head falls through to OwnMatmulWeight — its own residency, a second buffer
+// — exactly as before L5. token_embd is routed TWICE when tied (once as the
+// gather table, once as the GEMM head), which is the correct answer for both.
 void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
                       OwnedTensor* embed, OwnedTensor* head) {
   const std::string kEmbed = "token_embd.weight";
-  RequireExpand(pol, g, kEmbed, GgufTensorRole::kEmbeddingTable);
-  *embed = OwnBf16(g, kEmbed, g.Get(kEmbed).shape);
+  const GgufTensorInfo& et = g.Get(kEmbed);
+  const GgufResidency embed_r =
+      pol.Route(et, GgufTensorRole::kEmbeddingTable);  // the embed's audit event
+
+  // Build the gather table in its chosen residency: keep-f16 in place, else the
+  // historical bf16 expansion. A quantized embedding is never keep-eligible.
+  if (embed_r == GgufResidency::kKeepF16) {
+    VT_CHECK(et.shape.size() == 2, "qwen3_5 gguf: token_embd must be 2-D");
+    *embed = OwnGgufF16(et, et.shape[0], et.shape[1], 0, MmapSrc(g, pol),
+                        /*nk=*/false);
+  } else {
+    VT_CHECK(embed_r == GgufResidency::kExpandBf16,
+             "qwen3_5 gguf: the embedding table cannot keep quant blocks");
+    *embed = OwnBf16(g, kEmbed, et.shape);
+  }
 
   const bool tied = !HasTensor(g, "output.weight");
   const std::string head_name = tied ? kEmbed : "output.weight";
   const GgufTensorInfo& ht = g.Get(head_name);
   // Ask the PURE decision function, not `pol.Route`, so probing the head here
   // does not fire the audit hook a second time: the head is routed EXACTLY ONCE
-  // on both branches below, as it was before L5.
-  const bool head_expands =
-      RouteGgufTensor(pol.keep_quant, pol.cpu_ref, GgufTensorRole::kMatmulWeight,
-                      ht.ggml_type, ht.shape) == GgufResidency::kExpandBf16;
+  // on both branches below.
+  const GgufResidency head_r =
+      RouteGgufTensor(pol.keep_quant, pol.keep_f16, pol.cpu_ref,
+                      GgufTensorRole::kMatmulWeight, ht.ggml_type, ht.shape);
 
-  if (tied && pol.share_tied_head && head_expands && pol.expand_nk) {
+  // The two coincide (share one buffer) iff both kept f16, OR both expanded in
+  // the file's own [N, K] order (expand_nk). share_tied_head already implies
+  // expand_nk (FromEnv), which is why the bf16 arm needs no extra check.
+  const bool f16_share = embed_r == GgufResidency::kKeepF16 &&
+                         head_r == GgufResidency::kKeepF16;
+  const bool bf16_share = embed_r == GgufResidency::kExpandBf16 &&
+                          head_r == GgufResidency::kExpandBf16 && pol.expand_nk;
+  if (tied && pol.share_tied_head && (f16_share || bf16_share)) {
     (void)pol.Route(ht, GgufTensorRole::kMatmulWeight);  // the head's one audit event
-    std::shared_ptr<const void> owner = embed->bytes.Share();
+    std::shared_ptr<const void> owner = embed->bytes.KeepAlive();
     OwnedTensor h;
     h.dtype = embed->dtype;
     h.rank = embed->rank;
@@ -553,10 +640,11 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   // in_proj_qkv <- attn_qkv [conv_dim, H]; only the trailing V rows reorder.
   {
     const std::string nm = Blk(il, "attn_qkv.weight");
-    if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
+    const GgufResidency r = pol.Route(g.Get(nm), proj_role);
+    if (r != GgufResidency::kExpandBf16) {
       const GgufTensorInfo& ti = g.Get(nm);
-      gdn.in_proj_qkv = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0,
-                                           MmapSrc(g, pol), pol.quant_repack);
+      gdn.in_proj_qkv =
+          OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -569,10 +657,11 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   // in_proj_z <- attn_gate [value_dim, H]; all rows are V.
   {
     const std::string nm = Blk(il, "attn_gate.weight");
-    if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
+    const GgufResidency r = pol.Route(g.Get(nm), proj_role);
+    if (r != GgufResidency::kExpandBf16) {
       const GgufTensorInfo& ti = g.Get(nm);
-      gdn.in_proj_z = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0,
-                                         MmapSrc(g, pol), pol.quant_repack);
+      gdn.in_proj_z =
+          OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -586,10 +675,10 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   for (auto* pr : {&gdn.in_proj_b, &gdn.in_proj_a}) {
     const std::string nm =
         Blk(il, pr == &gdn.in_proj_b ? "ssm_beta.weight" : "ssm_alpha.weight");
-    if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
+    const GgufResidency r = pol.Route(g.Get(nm), proj_role);
+    if (r != GgufResidency::kExpandBf16) {
       const GgufTensorInfo& ti = g.Get(nm);
-      *pr = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0, MmapSrc(g, pol),
-                               pol.quant_repack);
+      *pr = OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
       continue;
     }
     const GgufTensorInfo* t = nullptr;
@@ -618,10 +707,11 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   // tensor is kTransformedWeight and must expand.
   {
     const std::string nm = Blk(il, "ssm_out.weight");
-    if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
+    const GgufResidency r = pol.Route(g.Get(nm), proj_role);
+    if (r != GgufResidency::kExpandBf16) {
       const GgufTensorInfo& ti = g.Get(nm);
-      gdn.out_proj = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0,
-                                        MmapSrc(g, pol), pol.quant_repack);
+      gdn.out_proj =
+          OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -690,14 +780,14 @@ std::vector<OwnedTensor> LoadExpertsT(const GgufFile& g, int64_t il,
   std::vector<OwnedTensor> experts;
   experts.reserve(static_cast<size_t>(num_experts));
 
-  if (pol.Route(ti, GgufTensorRole::kStackedExpertWeight) ==
-      GgufResidency::kKeepQuant) {
-    // Each expert occupies `out_dim` WHOLE rows, i.e. a whole number of
-    // blocks, so the split is a byte range and no block is ever cut.
+  const GgufResidency r = pol.Route(ti, GgufTensorRole::kStackedExpertWeight);
+  if (r != GgufResidency::kExpandBf16) {
+    // keep-quant blocks OR keep-f16. Each expert occupies `out_dim` WHOLE rows,
+    // i.e. a whole number of blocks (and any whole number of f16 rows), so the
+    // split is a byte range and no block is ever cut.
     for (int64_t e = 0; e < num_experts; ++e) {
-      experts.push_back(
-          OwnGgufQuantBlocks(ti, out_dim, in_dim, /*row_offset=*/e * out_dim,
-                             MmapSrc(g, pol), pol.quant_repack));
+      experts.push_back(OwnGgufKeptSlice(g, pol, ti, r, out_dim, in_dim,
+                                         /*row_offset=*/e * out_dim));
     }
     return experts;
   }

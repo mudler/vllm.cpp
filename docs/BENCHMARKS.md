@@ -2546,6 +2546,59 @@ EMULATION path on this box's CUDA-13.0/cutlass-4.5.0 runtime (`got == want_emu`)
 BYTE-IDENTICALLY with and without L5 (base `18094ee` reproduces the same tokens),
 a pre-existing environment condition, not an L5 regression.
 
+## CPU vs llama.cpp — keep-f16 residency (L6): premise REFUTED, `ACCEPTED` / binding (2026-07-23)
+
+`BENCH-CPU-LLAMA` / `QUANT-GGUF-KEEPQ-LOADER` **L6** (`CLAIM-QUANT-GGUF-KEEPF16-L6-1`).
+Full result: [keep-quant loader leaf](../.agents/specs/gguf-keep-quant-loader.md)
+§ L6 result. **This entry records a NEGATIVE / refutation, and it is why keep-f16
+ships DEFAULT OFF.**
+
+**keep-f16 (keep the file's F16 weights resident as F16 and compute on them, like
+llama.cpp) is RSS-NEUTRAL (3.884 → 3.832 GiB, −52 MB) and regresses prefill. It
+does NOT close the CPU RSS gap.** The hypothesis (L4/L5) that the residual gap was
+the f16→bf16 expansion is DISPROVEN: L5's read-once page-release had already
+dropped the f16 FILE pages, so keeping f16 resident merely swaps an anonymous
+bf16 buffer for an equal-size file-backed f16 page set.
+
+**Binding arm = `dgx.casa` (GB10, aarch64, 20 cores), idle**, whole series one
+`flock $HOME/gpu.lock`, same binary, 3 reps, medians, `Qwen3.5-2B-UD-Q8_K_XL.gguf`
+(176 F32 + 56 F16 + 103 Q8_0). llama.cpp `237ad9b96` fresh on the same host:
+pp128 177.5±1.5, tg32 24.3–25.2, peak RSS 2,934,316 KB = 2.798 GiB.
+
+| arm | TTFT (ms) | TPOT (ms) | peak RSS (KB) | token md5 |
+|---|---|---|---|---|
+| BEFORE — L5 state (`VT_GGUF_KEEP_F16=0`) | 577 | 40.7 | 4,072,976 | `d235db1…` |
+| keep-f16 (`VT_GGUF_KEEP_F16=1`) | ~1000 | 41.0 | 4,017,668 | `d235db1…` |
+| oracle (`VT_CPU_REF=1`) | 2490 | 95 | 7,788,404 | `d235db1…` |
+
+**Peak-RSS attribution (`/proc/PID/smaps_rollup` at peak, output-len 400):**
+
+| arm | peak RSS | file-backed | anonymous |
+|---|---|---|---|
+| keep-f16 | 3.834 GiB | **2.634 GiB** (≈ llama.cpp's 2.68 file) | 1.200 GiB |
+| bf16 (L5) | 3.885 GiB | 0.961 GiB | 2.923 GiB |
+
+keep-f16 moves ~1.8 GiB from anonymous bf16 buffers to file-backed f16 mmap pages,
+bringing WEIGHT residency to llama.cpp parity (file-backed 2.63 ≈ 2.68 GiB) — but
+total RSS is unchanged because the f16 mass is 2 bytes/elem either way. **The
+remaining ~1.08 GiB gap vs llama.cpp is the engine's ANONYMOUS activation/KV
+workspace** (keep-f16 anon 1.20 vs llama-bench's ~0.12), which no loader residency
+change can touch — the real, separate CPU RSS lever. keep-f16 also REGRESSES
+prefill: borrowing f16 out of the mmap moves its first-touch faults into the timed
+prefill, TTFT 577 → ~1000 ms (prefill 222 → 128 tok/s, from **1.25× AHEAD** of
+llama.cpp to **0.72× BEHIND**); decode TPOT stays at parity (~41 ms). **Output
+token md5 `d235db12f2cd304007530286a1755c95` is byte-identical across all three
+arms** — the same golden the prior CPU checkpoints recorded; keep-f16 computes on
+native f16 (closer to the file's values than the lossy bf16 re-round) with zero
+greedy movement. Ships DEFAULT OFF; retained as an opt-in llama.cpp-faithful
+residency (multi-process weight sharing is its only real, unmeasured benefit).
+
+**Repro:** the L4/G4 recipe with a third A/B axis `VT_GGUF_KEEP_F16 ∈ {unset,1}`;
+attribution polls `/proc/PID/smaps_rollup` `Anonymous:`/`Rss:` at peak.
+Regressions (CUDA build, standalone, default keep-f16 off = inert): 27B **235/235**,
+35B **315/315**, GGUF engine **28/28** (16/16 both APEX files) — UNCHANGED.
+`test_gguf_keep_quant` **35/35** (7 new L6 cases) on x86 AND aarch64.
+
 ## CPU vs llama.cpp — elementwise GEMM vectorized, `ACCEPTED` / binding (2026-07-22)
 
 `BENCH-CPU-LLAMA` / `BACKEND-GATE-CPU-LLAMACPP` / `KERNEL-GEMM-CPU-ELEM`

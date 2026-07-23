@@ -109,6 +109,18 @@ class OwnedBytes {
     return owner_;
   }
 
+  // Return a keep-alive handle for the CURRENT bytes, whatever their residency,
+  // so a SECOND OwnedBytes can Borrow(data(), size(), handle) and view the exact
+  // same bytes with no copy. A BORROWED buffer already carries such a handle (its
+  // mmap or shared expansion) and returns it directly; an OWNED buffer is turned
+  // into a shared read-only holder via Share() (after which it too is borrowed and
+  // reads the same bytes). This is how a tied token_embd/lm_head becomes ONE
+  // resident vocab matrix in EITHER residency — an mmap-borrowed embedding hands
+  // both views the file mapping, a copied one hands both a single shared buffer.
+  std::shared_ptr<const void> KeepAlive() {
+    return borrowed() ? owner_ : Share();
+  }
+
   // Drop the payload: frees an owned vector's capacity outright, and releases a
   // borrowed view's keep-alive (which may drop the last reference to the mmap or
   // the shared expansion). Both leave an empty, OWNED buffer.

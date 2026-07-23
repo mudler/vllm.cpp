@@ -20292,3 +20292,52 @@ CUDA regression set UNCHANGED, each STANDALONE (27B 235/235, 35B 315/315, Coder
 content-hash identical; clean CPU+CUDA `-Werror` 0-warn; checkers RC=0. Records:
 spec G7 result, quantization-matrix CIQ-GEMM row, kernel-matrix, roadmap C4,
 ledger, README §CPU, BENCHMARKS. Not pushed — report FULL SHA to the caller.
+
+## 2026-07-23 — keep-f16 resident loader (QUANT-GGUF-KEEPQ-LOADER L6): RSS premise REFUTED, ships DEFAULT OFF (`CLAIM-QUANT-GGUF-KEEPF16-L6-1`, base `c24f819`, worktree `/home/mudler/_git/vllm.cpp-keepf16` branch `feat/gguf-keep-f16-l6`)
+
+**Task:** implement the keep-f16 resident loader path — keep the 2B bench file's
+56 F16 matmul weights (+ the F16 embed/tied-head) resident as F16 rather than
+dequantizing to bf16 at load, consumed by the existing elementwise f16 GEMM,
+premised on closing the last CPU RSS gap (L5 left it at 1.39× llama.cpp).
+
+**Implemented (correct, gated).** `GgufResidency::kKeepF16` + `GgufLoadPolicy::keep_f16`;
+`OwnGgufF16` (mmap-borrow or copy, byte-lossless, `[N,K]` nk=true) dispatched from
+every keep site via `OwnGgufKeptSlice` (attn/ffn/expert/GDN). F16 embedding table
+made keep-eligible so a tied `token_embd`/`lm_head` shares ONE resident f16 vocab
+matrix (`LoadEmbedAndHead` + new `OwnedBytes::KeepAlive`). `RouteGgufTensor` grew
+a `keep_f16` arg. CUDA-inert (rides `expand_nk`). 7 new unit cases.
+
+**THE PREMISE IS REFUTED (binding, idle dgx aarch64, one flock, same-binary A/B).**
+- peak RSS: BEFORE/L5 (`VT_GGUF_KEEP_F16=0`) **3.884 GiB** → keep-f16 **3.832 GiB**,
+  **−52 MB, RSS-NEUTRAL**. ORACLE (`VT_CPU_REF=1`) 7.428 GiB.
+- smaps attribution at peak: keep-f16 file-backed **2.634 GiB** (≈ llama.cpp's
+  2.68 file), anon **1.20 GiB**; bf16 file-backed 0.96, anon 2.92. keep-f16 moves
+  ~1.8 GiB from anonymous bf16 buffers to file-backed f16 pages → weight residency
+  now at llama.cpp parity, but total RSS unchanged (f16 mass is 2 bytes either way).
+- **Why:** L5's read-once page-release ALREADY dropped the f16 file pages, so the
+  L4/L5 attribution of the residual to "the f16→bf16 expansion" is WRONG — it is a
+  bf16 BUFFER of the same size, and keep-f16 just swaps it for f16 pages. **The real
+  ~1.08 GiB gap vs llama.cpp is the engine's ANONYMOUS activation/KV workspace, not
+  weights** — the sole open CPU RSS lever, out of this leaf's scope.
+- prefill REGRESSES: TTFT 577 → ~1000 ms (222 → 128 tok/s, from 1.25× ahead of
+  llama.cpp to 0.72× behind) — borrowed f16 first-touch faults enter the timed
+  prefill. Decode TPOT at parity (~41 ms).
+- tokens BYTE-IDENTICAL (md5 `d235db12f2cd304007530286a1755c95`) across keep-f16 /
+  bf16 / oracle — native-f16 compute, zero greedy movement.
+
+**Disposition: DEFAULT OFF** (`VT_GGUF_KEEP_F16=1` opt-in), overriding the task's
+"default ON" (predicated on the refuted premise) per the "never regress an axis"
+rule. Retained as a correct, llama.cpp-faithful, opt-in residency (only real
+benefit = multi-process weight sharing, unmeasured here). README §CPU + BENCHMARKS
++ spec L6 corrected to attribute the residual to engine workspace, not f16.
+
+**Gates.** CUDA + CPU `-Werror` clean (0 warnings). `test_gguf_keep_quant` 35/35
+(x86 + aarch64). Fixed a pre-existing aarch64-only bug in the "production default"
+case (`expect` policy omitted `quant_repack`, which permutes q8_0 on i8mm).
+Regressions standalone (CUDA build, keep-f16 default-off = inert): 27B 235/235,
+35B 315/315, APEX GGUF engine 28/28 (16/16 both files) — UNCHANGED.
+
+**Next / open:** the CPU RSS gap is now correctly attributed to the engine's
+anonymous activation/KV workspace (~1.08 GiB over llama.cpp). A future row should
+profile and shrink that workspace (KV pool sizing / activation reuse), which is
+where the remaining 1.39× actually lives — NOT the weight loader.

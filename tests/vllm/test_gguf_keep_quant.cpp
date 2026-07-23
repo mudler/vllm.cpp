@@ -246,7 +246,7 @@ TEST_CASE("keep-quant residency refuses ragged K and out-of-span slices") {
   CHECK_THROWS(OwnGgufQuantBlocks(t, n, k, /*row_offset=*/1));
   // A ragged-K weight is not merely refused at residency: the POLICY routes it
   // to expansion, so the loader never reaches the throw.
-  CHECK(RouteGgufTensor(true, false, GgufTensorRole::kMatmulWeight, kQ8_0,
+  CHECK(RouteGgufTensor(true, false, false, GgufTensorRole::kMatmulWeight, kQ8_0,
                         {n, 33}) == GgufResidency::kExpandBf16);
 }
 
@@ -311,15 +311,17 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
                                            ? GgufResidency::kKeepQuant
                                            : GgufResidency::kExpandBf16;
 
-        CHECK(RouteGgufTensor(/*keep_quant=*/true, /*cpu_ref=*/false, role,
-                              type, shape) == expected);
+        CHECK(RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
+                              /*cpu_ref=*/false, role, type, shape) == expected);
         (expect_keep ? kept : expanded)++;
 
         // The master switch OFF expands everything, always.
-        CHECK(RouteGgufTensor(/*keep_quant=*/false, /*cpu_ref=*/false, role,
-                              type, shape) == GgufResidency::kExpandBf16);
+        CHECK(RouteGgufTensor(/*keep_quant=*/false, /*keep_f16=*/false,
+                              /*cpu_ref=*/false, role, type,
+                              shape) == GgufResidency::kExpandBf16);
         // The VT_CPU_REF oracle wins over keep-quant, always.
-        CHECK(RouteGgufTensor(/*keep_quant=*/true, /*cpu_ref=*/true, role, type,
+        CHECK(RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/false,
+                              /*cpu_ref=*/true, role, type,
                               shape) == GgufResidency::kExpandBf16);
       }
     }
@@ -340,10 +342,10 @@ TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {
          {GgufTensorRole::kTransformedWeight, GgufTensorRole::kEmbeddingTable,
           GgufTensorRole::kConvWeight, GgufTensorRole::kVector}) {
       CAPTURE(vllm::Name(role));
-      CHECK(RouteGgufTensor(true, false, role, e.ggml_type, {8, e.k}) ==
+      CHECK(RouteGgufTensor(true, false, false, role, e.ggml_type, {8, e.k}) ==
             GgufResidency::kExpandBf16);
-      CHECK(RouteGgufTensor(true, false, role, e.ggml_type, {2, 8, e.k}) ==
-            GgufResidency::kExpandBf16);
+      CHECK(RouteGgufTensor(true, false, false, role, e.ggml_type,
+                            {2, 8, e.k}) == GgufResidency::kExpandBf16);
     }
   }
 }
@@ -361,27 +363,49 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
     const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
     CHECK(p.keep_quant == vllm::GgufQuantComputeAvailable());
     CHECK(p.expand_nk == vllm::GgufQuantComputeAvailable());
+    // L6: keep-f16 is OPT-IN (default OFF) — the binding measurement refuted the
+    // RSS-closing premise and it regresses prefill, so it never defaults on.
+    CHECK_FALSE(p.keep_f16);
     CHECK_FALSE(p.cpu_ref);
   }
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   CHECK(GgufLoadPolicy::FromEnv().keep_quant);
   CHECK(GgufLoadPolicy::FromEnv().expand_nk);
+  CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_f16);  // opt-in, still off
   // The OPT-OUT the spec promised must survive the default flip.
   for (const char* off : {"0", "false", "off", ""}) {
     ::setenv("VT_GGUF_KEEP_QUANT", off, 1);
     CAPTURE(off);
     CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_quant);
     CHECK_FALSE(GgufLoadPolicy::FromEnv().expand_nk);
+    CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_f16);
   }
+  // VT_GGUF_KEEP_F16=1 opts IN, but ONLY where expand_nk holds (CPU, not oracle);
+  // it is inert with keep-quant off (nothing to keep) or under VT_CPU_REF.
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
+  ::setenv("VT_GGUF_KEEP_F16", "1", 1);
+  CHECK(GgufLoadPolicy::FromEnv().keep_f16 ==
+        vllm::GgufQuantComputeAvailable());
+  for (const char* on : {"1", "true", "on"}) {
+    ::setenv("VT_GGUF_KEEP_F16", on, 1);
+    CAPTURE(on);
+    CHECK(GgufLoadPolicy::FromEnv().keep_f16 ==
+          vllm::GgufQuantComputeAvailable());
+  }
+  ::unsetenv("VT_GGUF_KEEP_F16");
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   ::setenv("VT_CPU_REF", "1", 1);
   {
     // The oracle switch: keep-quant requested, oracle wins — and it takes the
-    // orientation with it, so VT_CPU_REF=1 is the FULL historical load.
+    // orientation and keep-f16 with it, so VT_CPU_REF=1 is the FULL historical
+    // load.
+    ::setenv("VT_GGUF_KEEP_F16", "1", 1);
     const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
     CHECK(p.keep_quant);
     CHECK(p.cpu_ref);
     CHECK_FALSE(p.expand_nk);
+    CHECK_FALSE(p.keep_f16);
+    ::unsetenv("VT_GGUF_KEEP_F16");
     CHECK(p.Route(vllm::GgufTensorInfo{"w", {8, 256}, kQ4_K, nullptr, 0},
                   GgufTensorRole::kMatmulWeight) ==
           GgufResidency::kExpandBf16);
@@ -852,9 +876,19 @@ TEST_CASE("production default is keep-quant wherever the quant GEMM exists") {
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
 
+  // The explicit policy must mirror FromEnv's FULL CPU default, otherwise the
+  // byte comparison below is not apples-to-apples. On an i8mm box (dgx aarch64)
+  // FromEnv turns quant_repack ON, which PERMUTES the q8_0 bytes, so an `expect`
+  // that leaves it off would differ from the env load on the repacked weights
+  // (this bit was invisible on x86 CI, where repack is off — L6 fix).
   GgufLoadPolicy expect;
   expect.keep_quant = vllm::GgufQuantComputeAvailable();
   expect.expand_nk = expect.keep_quant;
+  // keep_f16 is opt-in (default OFF), so FromEnv leaves it off here too.
+  expect.mmap_residency = expect.keep_quant;
+  expect.share_tied_head = expect.keep_quant;
+  expect.gdn_expand_nk = expect.keep_quant;
+  expect.quant_repack = expect.keep_quant && vt::cpu::QuantRepackActive();
 
   const vllm::Qwen3_5DenseWeights from_env =
       vllm::LoadQwen3_5DenseFromGguf(g, c, /*policy=*/nullptr);
@@ -1023,6 +1057,7 @@ GgufLoadPolicy ProductionCpu() {
   p.expand_nk = true;
   p.mmap_residency = true;
   p.share_tied_head = true;
+  // keep_f16 stays OFF: it is opt-in (default OFF), see FromEnv / L6.
   return p;
 }
 
@@ -1325,4 +1360,305 @@ TEST_CASE("OwnedBytes::Share hands the SAME bytes to a second viewer") {
   a.Reset();  // the first viewer goes; the second still reads
   REQUIRE(rb.size() == want.size());
   CHECK(std::memcmp(rb.data(), want.data(), want.size()) == 0);
+}
+
+// ===========================================================================
+// L6 — keep-f16 residency. An F16 file weight stays F16 (no bf16 re-expansion),
+// resident in the file's own [N, K] order, consumed by the elementwise f16 GEMM.
+// The residency is byte-lossless; the compute dtype changes bf16 -> f16, which
+// the engine gate (test_qwen36_gguf_engine, same-file llama.cpp oracle) covers.
+// These units gate the LOADER: routing, byte-identity, borrow/lifetime, sharing.
+// ===========================================================================
+
+namespace {
+
+// F16 bit patterns for a torch [n, k] tensor, ggml dims reversed (ne0 = k).
+std::string F16Bytes(int64_t n, float base) {
+  std::string s;
+  s.reserve(static_cast<size_t>(n) * 2);
+  for (int64_t i = 0; i < n; ++i) {
+    const float v = base + 0.25F * static_cast<float>(i % 7) -
+                    0.125F * static_cast<float>(i % 3);
+    const uint16_t h = vt::F32ToF16(v);
+    s.push_back(static_cast<char>(h & 0xFF));
+    s.push_back(static_cast<char>((h >> 8) & 0xFF));
+  }
+  return s;
+}
+
+void AddF16T(GgufModelBuilder& b, const std::string& name, int64_t out_dim,
+             int64_t in_dim, float base) {
+  b.AddTensor(name,
+              {static_cast<uint64_t>(in_dim), static_cast<uint64_t>(out_dim)},
+              kF16, F16Bytes(out_dim * in_dim, base));
+}
+
+// A tiny DENSE GGUF whose GEMM weights AND token_embd are F16 (norms stay F32) —
+// the "56 f16 tensors" shape of the real 2B bench file, the case keep-f16 exists
+// for. `tied` omits output.weight so the head IS the f16 token_embd.
+std::string BuildDenseF16Gguf(const DenseDims& d, bool tied = false) {
+  GgufModelBuilder b;
+  b.AddKv(StrKv("general.architecture", "qwen35"));
+  b.AddKv(U32Kv("qwen35.embedding_length", static_cast<uint32_t>(d.H)));
+  b.AddKv(U32Kv("qwen35.block_count", static_cast<uint32_t>(d.n_layer)));
+  b.AddKv(U32Kv("qwen35.attention.head_count", static_cast<uint32_t>(d.n_head)));
+  b.AddKv(U32Kv("qwen35.attention.head_count_kv",
+                static_cast<uint32_t>(d.n_head_kv)));
+  b.AddKv(U32Kv("qwen35.attention.key_length",
+                static_cast<uint32_t>(d.head_dim)));
+  b.AddKv(U32Kv("qwen35.feed_forward_length", static_cast<uint32_t>(d.I)));
+  b.AddKv(F32Kv("qwen35.attention.layer_norm_rms_epsilon", 1e-6F));
+  b.AddKv(F32Kv("qwen35.rope.freq_base", 1000000.0F));
+  b.AddKv(U32Kv("qwen35.full_attention_interval", 1));
+  b.AddKv(U32Kv("qwen35.context_length", 4096));
+
+  AddF16T(b, "token_embd.weight", d.vocab, d.H, 0.5F);
+  AddF32T(b, "output_norm.weight", {d.H}, 1.5F);
+  if (!tied) AddF16T(b, "output.weight", d.vocab, d.H, 0.6F);
+  for (int64_t il = 0; il < d.n_layer; ++il) {
+    const std::string p = "blk." + std::to_string(il) + ".";
+    AddF32T(b, p + "attn_norm.weight", {d.H}, 1.25F);
+    AddF32T(b, p + "post_attention_norm.weight", {d.H}, 1.75F);
+    AddF16T(b, p + "attn_q.weight", d.n_head * d.head_dim, d.H, 0.11F);
+    AddF16T(b, p + "attn_k.weight", d.n_head_kv * d.head_dim, d.H, 0.13F);
+    AddF16T(b, p + "attn_v.weight", d.n_head_kv * d.head_dim, d.H, 0.17F);
+    AddF16T(b, p + "attn_output.weight", d.H, d.n_head * d.head_dim, 0.19F);
+    AddF32T(b, p + "attn_q_norm.weight", {d.head_dim}, 1.5F);
+    AddF32T(b, p + "attn_k_norm.weight", {d.head_dim}, 1.5F);
+    AddF16T(b, p + "ffn_gate.weight", d.I, d.H, 0.21F);
+    AddF16T(b, p + "ffn_up.weight", d.I, d.H, 0.23F);
+    AddF16T(b, p + "ffn_down.weight", d.H, d.I, 0.27F);
+  }
+  return b.Build();
+}
+
+// keep-f16 forced ON, copy residency (mmap off) — the A/B analogue of KeepQuantOn.
+GgufLoadPolicy KeepF16On() {
+  GgufLoadPolicy p;
+  p.keep_quant = true;   // GgufQuantComputeAvailable() would set this on CPU
+  p.expand_nk = true;
+  p.keep_f16 = true;
+  return p;
+}
+
+}  // namespace
+
+TEST_CASE("keep-f16 routing: F16 matmul/expert/embed keep, others expand") {
+  const uint32_t f16 = kF16;
+  // The keep-eligible roles + right rank keep f16 ONLY when keep_f16 is on.
+  CHECK(RouteGgufTensor(false, true, false, GgufTensorRole::kMatmulWeight, f16,
+                        {8, 64}) == GgufResidency::kKeepF16);
+  CHECK(RouteGgufTensor(false, true, false, GgufTensorRole::kStackedExpertWeight,
+                        f16, {2, 8, 64}) == GgufResidency::kKeepF16);
+  // The embedding table keeps f16 too (a gather widens f16 like bf16); this is
+  // what lets a tied token_embd/lm_head be ONE resident f16 vocab matrix.
+  CHECK(RouteGgufTensor(false, true, false, GgufTensorRole::kEmbeddingTable, f16,
+                        {32, 64}) == GgufResidency::kKeepF16);
+  // Value/layout-rewritten, conv and vector roles NEVER keep, even f16.
+  for (GgufTensorRole role :
+       {GgufTensorRole::kTransformedWeight, GgufTensorRole::kConvWeight,
+        GgufTensorRole::kVector}) {
+    CAPTURE(vllm::Name(role));
+    CHECK(RouteGgufTensor(false, true, false, role, f16, {8, 64}) ==
+          GgufResidency::kExpandBf16);
+  }
+  // Wrong rank never keeps.
+  CHECK(RouteGgufTensor(false, true, false, GgufTensorRole::kMatmulWeight, f16,
+                        {64}) == GgufResidency::kExpandBf16);
+  // keep_f16 OFF -> expand; VT_CPU_REF -> expand; a non-f16 type -> no keep-f16.
+  CHECK(RouteGgufTensor(false, false, false, GgufTensorRole::kMatmulWeight, f16,
+                        {8, 64}) == GgufResidency::kExpandBf16);
+  CHECK(RouteGgufTensor(true, true, true, GgufTensorRole::kMatmulWeight, f16,
+                        {8, 64}) == GgufResidency::kExpandBf16);
+  CHECK(RouteGgufTensor(false, true, false, GgufTensorRole::kMatmulWeight, kQ8_0,
+                        {8, 64}) == GgufResidency::kExpandBf16);
+  // keep-quant WINS over keep-f16 when both are on and the encoding is a block
+  // type (they are mutually exclusive by encoding, so this only asserts order).
+  CHECK(RouteGgufTensor(true, true, false, GgufTensorRole::kMatmulWeight, kQ8_0,
+                        {8, 64}) == GgufResidency::kKeepQuant);
+}
+
+TEST_CASE("OwnGgufF16 keeps the file's f16 bytes verbatim, [N,K] nk=true") {
+  const int64_t n = 5, k = 64;
+  const TempFile f([&] {
+    GgufModelBuilder b;
+    b.AddKv(StrKv("general.architecture", "test"));
+    b.AddTensor("w", {static_cast<uint64_t>(k), static_cast<uint64_t>(n)}, kF16,
+                F16Bytes(n * k, 0.3F));
+    return b.Build();
+  }());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::GgufTensorInfo& t = g.Get("w");
+  REQUIRE(t.nbytes == static_cast<size_t>(n) * k * 2);
+
+  const vllm::OwnedTensor res = vllm::OwnGgufF16(t, n, k);
+  CHECK(res.dtype == vt::DType::kF16);
+  CHECK(res.rank == 2);
+  CHECK(res.shape[0] == n);
+  CHECK(res.shape[1] == k);
+  CHECK(res.nk == true);
+  REQUIRE(res.bytes.size() == t.nbytes);
+  CHECK(std::memcmp(res.bytes.data(), t.data, t.nbytes) == 0);  // verbatim
+
+  // nk=false builds a [vocab,H] gather table over the SAME bytes.
+  const vllm::OwnedTensor emb = vllm::OwnGgufF16(t, n, k, 0, nullptr, false);
+  CHECK(emb.nk == false);
+  CHECK(std::memcmp(emb.bytes.data(), t.data, t.nbytes) == 0);
+
+  // Guards: not f16, ragged span, bad slice.
+  CHECK_THROWS(vllm::OwnGgufF16(t, n, k, /*row_offset=*/1));  // slice past span
+  const std::string q = OneTensorGguf(kQ8_0, n, k, RandomBlockBytes(
+      BlockBytesFor(kQ8_0, n * k), 7));
+  const TempFile qf(q);
+  const vllm::GgufFile qg = vllm::GgufFile::Open(qf.path());
+  CHECK_THROWS(vllm::OwnGgufF16(qg.Get("w"), n, k));  // not f16
+}
+
+TEST_CASE("loader keeps F16 weights f16, byte-identical, and expands norms") {
+  const DenseDims d;
+  const TempFile f(BuildDenseF16Gguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+
+  GgufLoadPolicy on = KeepF16On();
+  const vllm::Qwen3_5DenseWeights w = vllm::LoadQwen3_5DenseFromGguf(g, c, &on);
+
+  // The F16 GEMM weights STAY f16, in [N,K] nk=true, byte-identical to the file.
+  const vllm::GgufTensorInfo& oh = g.Get("output.weight");
+  CHECK(w.lm_head.dtype == vt::DType::kF16);
+  CHECK(w.lm_head.nk == true);
+  CHECK(std::memcmp(w.lm_head.bytes.data(), oh.data, oh.nbytes) == 0);
+  for (int64_t il = 0; il < d.n_layer; ++il) {
+    CAPTURE(il);
+    const auto& la = w.layers[static_cast<size_t>(il)];
+    for (const vllm::OwnedTensor* wt :
+         {&la.attn.q_proj, &la.attn.o_proj, &la.mlp.gate_proj, &la.mlp.down_proj}) {
+      CHECK(wt->dtype == vt::DType::kF16);
+      CHECK(wt->nk == true);
+    }
+    const std::string p = "blk." + std::to_string(il) + ".";
+    const vllm::GgufTensorInfo& gq = g.Get(p + "attn_q.weight");
+    CHECK(std::memcmp(la.attn.q_proj.bytes.data(), gq.data, gq.nbytes) == 0);
+    // Norms are F32 in the file and (w-1)-rewritten -> still bf16, never kept.
+    CHECK(la.input_layernorm.dtype == vt::DType::kBF16);
+  }
+  // The embedding table (F16) is kept f16 as a [vocab,H] gather, nk=false.
+  CHECK(w.embed_tokens.dtype == vt::DType::kF16);
+  CHECK(w.embed_tokens.nk == false);
+}
+
+TEST_CASE("VT_CPU_REF / keep_f16=off reproduce the historical bf16 expansion") {
+  const DenseDims d;
+  const TempFile f(BuildDenseF16Gguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+
+  // Oracle: everything expands to bf16, exactly as before L6.
+  GgufLoadPolicy oracle;  // default-constructed = all-expand
+  const vllm::Qwen3_5DenseWeights wo =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &oracle);
+  CHECK(wo.lm_head.dtype == vt::DType::kBF16);
+  CHECK(wo.embed_tokens.dtype == vt::DType::kBF16);
+  CHECK(wo.layers[0].attn.q_proj.dtype == vt::DType::kBF16);
+
+  // The kept-f16 weight carries the SAME information as the bf16 expansion, but
+  // MORE precisely: dequantizing f16->bf16 from the resident f16 equals the
+  // loader's bf16 expansion byte-for-byte (both round the file's f16 to bf16).
+  GgufLoadPolicy on = KeepF16On();
+  const vllm::Qwen3_5DenseWeights wk =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &on);
+  const vllm::GgufTensorInfo& gq = g.Get("blk.0.attn_q.weight");
+  const int64_t numel = gq.shape[0] * gq.shape[1];
+  const std::vector<uint16_t> bf_from_f16 =
+      vllm::DequantGgufRowToBf16(kF16, wk.layers[0].attn.q_proj.bytes.data(),
+                                 numel);
+  // wo.q_proj is the bf16 expansion in [N,K] (expand_nk off here -> [K,N]); to
+  // compare information not layout, expand the SAME file tensor to bf16 [N,K].
+  const std::vector<uint16_t> bf_from_file =
+      vllm::DequantGgufRowToBf16(kF16, gq.data, numel);
+  CHECK(bf_from_f16 == bf_from_file);
+}
+
+TEST_CASE("keep-f16 mmap residency BORROWS in place; copy arm OWNS") {
+  const DenseDims d;
+  const TempFile f(BuildDenseF16Gguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+
+  GgufLoadPolicy copy = KeepF16On();       // mmap off
+  GgufLoadPolicy mmap = KeepF16On();
+  mmap.mmap_residency = true;
+  const vllm::Qwen3_5DenseWeights wc = vllm::LoadQwen3_5DenseFromGguf(g, c, &copy);
+  const vllm::Qwen3_5DenseWeights wm = vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+
+  const vllm::GgufTensorInfo& oh = g.Get("output.weight");
+  CHECK(wc.lm_head.bytes.borrowed() == false);
+  CHECK(wm.lm_head.bytes.borrowed() == true);
+  CHECK(wm.lm_head.bytes == wc.lm_head.bytes);      // same bytes
+  CHECK(wm.lm_head.bytes.data() == oh.data);        // IN PLACE, the file's own
+  CHECK(wm.lm_head.dtype == vt::DType::kF16);
+}
+
+TEST_CASE("a borrowed F16 weight OUTLIVES the GgufFile and the file") {
+  const DenseDims d;
+  std::vector<uint8_t> expected;
+  std::unique_ptr<vllm::Qwen3_5DenseWeights> w;
+
+  {
+    const TempFile f(BuildDenseF16Gguf(d));
+    const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+    const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+    GgufLoadPolicy mmap = KeepF16On();
+    mmap.mmap_residency = true;
+    w = std::make_unique<vllm::Qwen3_5DenseWeights>(
+        vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap));
+    const vllm::GgufTensorInfo& t = g.Get("output.weight");
+    expected.assign(t.data, t.data + t.nbytes);
+  }
+
+  REQUIRE(w->lm_head.bytes.borrowed());
+  REQUIRE(w->lm_head.bytes.size() == expected.size());
+  CHECK(std::memcmp(w->lm_head.bytes.data(), expected.data(),
+                    expected.size()) == 0);
+  w.reset();  // last reference to the refcounted mapping
+}
+
+TEST_CASE("tied F16 head SHARES one f16 vocab matrix (copy AND mmap)") {
+  const DenseDims d;
+  const TempFile f(BuildDenseF16Gguf(d, /*tied=*/true));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+  REQUIRE_FALSE(FileHasTensor(g, "output.weight"));
+
+  for (bool use_mmap : {false, true}) {
+    CAPTURE(use_mmap);
+    GgufLoadPolicy shared = KeepF16On();
+    shared.share_tied_head = true;
+    shared.mmap_residency = use_mmap;
+    const vllm::Qwen3_5DenseWeights ws =
+        vllm::LoadQwen3_5DenseFromGguf(g, c, &shared);
+
+    // ONE f16 buffer serves both: the gather table [vocab,H] nk=false and the
+    // GEMM head [N=vocab,K=H] nk=true, over the same bytes.
+    CHECK(ws.embed_tokens.dtype == vt::DType::kF16);
+    CHECK(ws.lm_head.dtype == vt::DType::kF16);
+    CHECK(ws.embed_tokens.bytes.data() == ws.lm_head.bytes.data());
+    CHECK(ws.embed_tokens.bytes == ws.lm_head.bytes);
+    CHECK(ws.embed_tokens.nk == false);
+    CHECK(ws.lm_head.nk == true);
+    CHECK(ws.lm_head.shape[0] == d.vocab);
+    CHECK(ws.lm_head.shape[1] == d.H);
+    CHECK(ws.embed_tokens.bytes.borrowed());
+    CHECK(ws.lm_head.bytes.borrowed());
+
+    // The share is freed exactly once, either half first.
+    {
+      vllm::Qwen3_5DenseWeights w = vllm::LoadQwen3_5DenseFromGguf(g, c, &shared);
+      const vllm::OwnedBytes& head = w.lm_head.bytes;
+      const std::vector<uint8_t> want(head.begin(), head.end());
+      w.embed_tokens.bytes.Reset();
+      REQUIRE(head.size() == want.size());
+      CHECK(std::memcmp(head.data(), want.data(), want.size()) == 0);
+    }
+  }
 }

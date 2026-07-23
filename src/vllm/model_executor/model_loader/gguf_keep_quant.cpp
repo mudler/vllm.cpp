@@ -36,6 +36,27 @@ int64_t KeepQuantKDim(GgufTensorRole role, const std::vector<int64_t>& shape) {
   return -1;  // unreachable for a valid enumerator (see -Wswitch above)
 }
 
+// L6 keep-f16 eligibility by role. Same verbatim-bytes roles as keep-quant PLUS
+// the embedding table: an F16 gather table stays F16 (the gather widens f16 to
+// f32 exactly like it did bf16), which is what lets a tied token_embd/lm_head be
+// ONE resident f16 vocab matrix instead of a bf16 re-expansion. A value/layout
+// rewrite (kTransformedWeight), a conv filter or a 1-D vector never keeps native
+// bytes, exactly as for keep-quant. Returns the K (in-features) dim, or -1.
+int64_t KeepF16KDim(GgufTensorRole role, const std::vector<int64_t>& shape) {
+  switch (role) {
+    case GgufTensorRole::kMatmulWeight:
+    case GgufTensorRole::kEmbeddingTable:
+      return shape.size() == 2 ? shape[1] : -1;
+    case GgufTensorRole::kStackedExpertWeight:
+      return shape.size() == 3 ? shape[2] : -1;
+    case GgufTensorRole::kTransformedWeight:
+    case GgufTensorRole::kConvWeight:
+    case GgufTensorRole::kVector:
+      return -1;
+  }
+  return -1;  // unreachable for a valid enumerator (see -Wswitch above)
+}
+
 bool EnvOn(const char* name) {
   const char* v = std::getenv(name);
   if (v == nullptr) return false;
@@ -71,9 +92,13 @@ const char* Name(GgufResidency residency) {
   switch (residency) {
     case GgufResidency::kExpandBf16: return "expand_bf16";
     case GgufResidency::kKeepQuant: return "keep_quant";
+    case GgufResidency::kKeepF16: return "keep_f16";
   }
   return "?";
 }
+
+// ggml type id 1 is F16 (IEEE half); see gguf_dequant.cpp case 1.
+bool KeepF16DType(uint32_t ggml_type) { return ggml_type == 1; }
 
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   vt::DType dt = vt::DType::kF32;
@@ -85,23 +110,33 @@ bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   return true;
 }
 
-GgufResidency RouteGgufTensor(bool keep_quant, bool cpu_ref,
+GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool cpu_ref,
                               GgufTensorRole role, uint32_t ggml_type,
                               const std::vector<int64_t>& shape) {
   // The oracle switch wins over everything (spec gate 2).
-  if (cpu_ref || !keep_quant) return GgufResidency::kExpandBf16;
+  if (cpu_ref) return GgufResidency::kExpandBf16;
 
-  const int64_t k = KeepQuantKDim(role, shape);
-  if (k <= 0) return GgufResidency::kExpandBf16;
+  // 1. Keep-quant blocks (a block encoding in a verbatim GEMM/expert role).
+  if (keep_quant) {
+    const int64_t k = KeepQuantKDim(role, shape);
+    vt::DType dt = vt::DType::kF32;
+    // ggml_row_size's precondition: a row is a whole number of blocks. A weight
+    // whose K is ragged cannot be dotted block-wise, so it expands.
+    if (k > 0 && KeepQuantDType(ggml_type, &dt) &&
+        k % vt::BlockElems(dt) == 0) {
+      return GgufResidency::kKeepQuant;
+    }
+  }
 
-  vt::DType dt = vt::DType::kF32;
-  if (!KeepQuantDType(ggml_type, &dt)) return GgufResidency::kExpandBf16;
+  // 2. Keep-f16 (an F16 file weight in a verbatim role, incl. the gather table).
+  // Independent of keep_quant: F16 is not a block encoding, so a weight is never
+  // eligible for both. No block-alignment constraint — f16 is per-element.
+  if (keep_f16 && KeepF16DType(ggml_type) &&
+      KeepF16KDim(role, shape) > 0) {
+    return GgufResidency::kKeepF16;
+  }
 
-  // ggml_row_size's precondition: a row is a whole number of blocks. A weight
-  // whose K is ragged cannot be dotted block-wise, so it expands.
-  if (k % vt::BlockElems(dt) != 0) return GgufResidency::kExpandBf16;
-
-  return GgufResidency::kKeepQuant;
+  return GgufResidency::kExpandBf16;
 }
 
 GgufLoadPolicy GgufLoadPolicy::FromEnv() {
@@ -115,6 +150,22 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // switch turns it off with everything else so VT_CPU_REF=1 reproduces the
   // historical load byte for byte.
   p.expand_nk = p.keep_quant && !p.cpu_ref;
+  // L6 keep-f16. OPT-IN (default OFF), VT_GGUF_KEEP_F16=1 turns it on. The
+  // binding measurement (2026-07-23, docs/BENCHMARKS.md) REFUTED the hypothesis
+  // that keeping f16 resident closes the CPU RSS gap: L5's read-once page-release
+  // already dropped the f16 file pages, so the residual is a bf16 BUFFER of the
+  // SAME size as the f16 mass, and keep-f16 merely trades that anonymous buffer
+  // for equal-size file-backed f16 pages — RSS-NEUTRAL (3.884 -> 3.832 GiB,
+  // -52 MB). Worse, borrowing the f16 weights out of the mmap moves their
+  // first-touch page faults INTO the timed prefill (TTFT 577 -> ~1000 ms,
+  // dropping prefill from 1.25x AHEAD of llama.cpp to 0.72x BEHIND). The real
+  // CPU RSS gap (~1.08 GiB vs llama.cpp) is the engine's ANONYMOUS activation/KV
+  // workspace, not weight materialization — a separate lever. keep-f16 stays as
+  // a byte-faithful llama.cpp-mirroring residency (file-backed weight parity,
+  // native-f16 compute) available for multi-process weight sharing, but it does
+  // NOT ship default-ON because it would regress prefill below the competitor
+  // floor. It rides expand_nk so it is CPU-only and off under cpu_ref regardless.
+  p.keep_f16 = EnvOn("VT_GGUF_KEEP_F16") && p.expand_nk;
   // L5. Both ride the same availability condition as the residency they refine,
   // and both are forced off by the oracle switch, so VT_CPU_REF=1 keeps
   // reproducing the historical load byte for byte and allocation for allocation.
@@ -136,7 +187,8 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
 GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
                                     GgufTensorRole role) const {
   const GgufResidency r =
-      RouteGgufTensor(keep_quant, cpu_ref, role, tensor.ggml_type, tensor.shape);
+      RouteGgufTensor(keep_quant, keep_f16, cpu_ref, role, tensor.ggml_type,
+                      tensor.shape);
   if (audit) audit(tensor.name, role, r);
   return r;
 }

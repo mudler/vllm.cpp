@@ -56,13 +56,23 @@ enum class GgufTensorRole {
   kVector,
 };
 
-// The two possible fates of a tensor at load.
+// The possible fates of a tensor at load.
 enum class GgufResidency {
   // Today's behavior: DequantGgufRowToBf16/ToF32 at load, bf16 owned tensor.
   kExpandBf16,
   // L2: the file's ggml blocks are copied verbatim into an owned buffer and
   // the weight stays block-typed ([N, K], nk = true).
   kKeepQuant,
+  // L6: an F16 file weight stays F16, resident in the file's own [N, K] order
+  // (nk = true), consumed by the elementwise f16 GEMM directly instead of being
+  // dequantized (RE-rounded) to bf16 at load. Mirrors llama.cpp, which keeps
+  // f16 weights resident and computes on them with ggml_vec_dot_f16
+  // (src/llama-model-loader.cpp:1385 mmap `load_data_for`; ggml-cpu/vec.cpp:264
+  // f16 mul_mat). The residency change is byte-for-byte lossless (the SAME f16
+  // bytes, read not re-encoded); the COMPUTE dtype changes bf16 -> f16 input, so
+  // tokens may move — and toward the file's f16 truth, see the leaf spec's
+  // correctness section.
+  kKeepF16,
 };
 
 const char* Name(GgufTensorRole role);
@@ -80,12 +90,21 @@ using GgufRoutingAudit =
 // file weight type) and for every unported encoding.
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out);
 
+// True when `ggml_type` is F16 (ggml type id 1) — the one native-float encoding
+// L6 keeps resident. F32/BF16 weights are not kept native: F32 file tensors are
+// only ever norms/vectors (value-transformed), and no published Qwen GGUF stores
+// a bf16 matmul weight.
+bool KeepF16DType(uint32_t ggml_type);
+
 // The pure decision. `shape` is the GGUF reader's torch-order shape.
 // kKeepQuant requires ALL of: keep_quant enabled, cpu_ref off, a role whose
 // bytes are taken verbatim, the expected rank, a supported encoding with an
-// executable vec_dot kernel, and K a whole number of blocks. Anything else is
-// kExpandBf16 — the decision is total and never throws.
-GgufResidency RouteGgufTensor(bool keep_quant, bool cpu_ref,
+// executable vec_dot kernel, and K a whole number of blocks.
+// kKeepF16 requires ALL of: keep_f16 enabled, cpu_ref off, the tensor NOT
+// keep-quant eligible, a role whose bytes are taken verbatim (incl. the F16
+// embedding table, which is a plain gather), and an F16 encoding. Anything else
+// is kExpandBf16 — the decision is total and never throws.
+GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool cpu_ref,
                               GgufTensorRole role, uint32_t ggml_type,
                               const std::vector<int64_t>& shape);
 
@@ -121,6 +140,23 @@ struct GgufLoadPolicy {
   // on a device whose GEMM is not that shared kernel — cuBLASLt picks its algo
   // from the operand layout — orientation is NOT numerically free.
   bool expand_nk = false;
+  // L6 — keep-f16 residency (OPT-IN, VT_GGUF_KEEP_F16=1; default OFF). An F16
+  // matmul weight (and the F16 embedding table) STAYS F16 resident in the file's
+  // own [N, K] order (nk = true) rather than being dequantized to bf16 at load,
+  // and the elementwise GEMM consumes the f16 rows directly (LoadF32/
+  // WidenRowToF32 already widen f16; the SIMD tiers have an f16 vec_dot). This
+  // mirrors llama.cpp, which keeps f16 weights resident and computes on them
+  // (ggml_vec_dot_f16), so the compute is CLOSER to the file's f16 truth than the
+  // lossy bf16 re-expansion (empirically byte-identical greedy tokens on the 2B
+  // bench file — no movement). It is DEFAULT OFF because the binding measurement
+  // REFUTED the premise that it closes the CPU RSS gap: L5's page-release already
+  // recovered the f16 second materialization, so keep-f16 only swaps an anonymous
+  // bf16 buffer for equal-size file-backed f16 pages (RSS-neutral, -52 MB) while
+  // moving the f16 first-touch faults into the timed prefill (TTFT regresses
+  // below the llama.cpp floor). The remaining RSS gap is the engine's anonymous
+  // activation/KV workspace, not weights. It rides expand_nk (CPU-only, off under
+  // cpu_ref). See docs/BENCHMARKS.md and the leaf spec §L6.
+  bool keep_f16 = false;
   // VT_CPU_REF=1 — the parity ORACLE switch (spec gate 2). Forces the full
   // dequant-to-bf16 load path regardless of `keep_quant`, so the bit-stable
   // reference numerics stay reachable once keep-quant becomes the default.

@@ -83,6 +83,24 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                const GgufFile* mmap_src = nullptr,
                                bool repack = false);
 
+// L6 (keep-f16 residency). Take `n` rows of `k` F16 elements of `tensor`'s raw
+// bytes — starting at row `row_offset` (how a stacked [E, out, in] expert tensor
+// is split) — as an F16 tensor with orientation `nk` ([N=n, K=k] when true; a
+// [vocab, H] gather table when false). GGUF's on-disk [out, in] row-major order
+// IS the MatmulBT [N, K] orientation, so a matmul weight needs NO transpose; the
+// elementwise f16 GEMM consumes it directly (cpu_matmul_elem f16 vec_dot).
+//
+// RESIDENCY mirrors OwnGgufQuantBlocks: `mmap_src` null COPIES the bytes into an
+// owned buffer; non-null BORROWS them in place out of that file's read-only
+// mapping and refcounts it (llama.cpp `use_mmap`, src/llama-model-loader.cpp:1385).
+// Byte-for-byte lossless in both arms — the SAME f16 bytes, read not re-encoded.
+//
+// Throws when the tensor is not F16, on a bad slice, when the rows fall outside
+// the tensor's validated span, or when a borrowed span is not inside the mapping.
+OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
+                       int64_t row_offset = 0,
+                       const GgufFile* mmap_src = nullptr, bool nk = true);
+
 // Build the HfConfig from a GGUF file's metadata (arch prefix qwen35moe /
 // qwen3next / qwen35 [dense]). vocab_size is taken from token_embd's shape
 // when the kv is absent; layer_types is derived from the recurrent-layers kv

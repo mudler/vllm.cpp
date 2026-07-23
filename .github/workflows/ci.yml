@@ -15,6 +15,10 @@ jobs:
           python3 scripts/check-agent-record.py
           python3 tests/scripts/test_agent_record.py
           python3 tests/scripts/test_doc_checkpoint.py
+      - name: README stays a human-readable user-facing document
+        run: |
+          python3 scripts/check-readme-structure.py
+          python3 tests/scripts/test_check_readme_structure.py
   documentation-checkpoint:
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.

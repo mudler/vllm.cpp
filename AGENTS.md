@@ -13,21 +13,43 @@ commands. Before ending a session with work in flight, record them there in
 the same checkpoint change. (User-directed 2026-07-14: the separate
 `HANDSOFF.md` replace-in-place surface is retired; do not recreate it.)
 
-**Keep `README.md` (the user-facing status) CURRENT at EVERY feature/iteration
-checkpoint.** In the SAME change that advances a spike, implementation, test,
-gate, benchmark attempt, or lifecycle state, update the matching README
-section/table row with the exact current stage — including `ACTIVE`/`GATING`,
-failed or void runs, and explicit pending hardware work. Do not wait for a
-feature to land or a gate to pass. Keep its ⚠️ header, architecture /
-acceleration / quantization tables, and "Status & caveats" mutually consistent.
-The README must never lag reality and must not turn progress into support.
-It is a **current-state snapshot, not a chronological log**: keep one binding
-result, the current lifecycle state, active gaps and the next gate. At each
-checkpoint, collapse superseded attempt narratives and stale intermediate
-numbers into a concise disposition; detailed chronology belongs in the
-append-only `.agents/state.md` / `.agents/parity-ledger.md` record and feature
-specs. Do not preserve history in the README merely because an older paragraph
-already exists.
+**`README.md` is the HUMAN-READABLE, USER-FACING document, in the LocalAI house
+style. It is NOT a status-tracking log.** vllm.cpp is a LocalAI-team C++ port
+(same family as parakeet.cpp / depth-anything.cpp), and its README follows the
+`presenting-localai-cpp-projects` house format: the
+"Brought to you by the LocalAI team" header plus badges, honest measured numbers
+only, NO em-dashes (use commas, periods, parentheses, or hyphens), and the
+LocalAI CTA / author / citation / license footer. The README MUST document, for
+a newcomer who has never seen the project: **what it is**, its **Features**
+(honest current state per capability), **Supported models**, **Performance**
+(real measured numbers vs the vLLM oracle, or an explicit not-measured), the
+**Build** (the real cmake invocations and options from `CMakeLists.txt`), the
+**CLI / usage** (the real example-CLI and OpenAI-server arguments, grounded in
+`examples/` and `src/vllm/entrypoints/`), and **how to consume it** (as a
+library / C ABI, as the CLI, and as the OpenAI server, with a runnable example
+each). Every argument, flag, and endpoint documented MUST be grounded in actual
+source, never invented.
+
+**Keep `README.md` CURRENT at EVERY feature/iteration checkpoint, but as a
+current-state SNAPSHOT, not a chronological log.** In the SAME change that shifts
+a feature's lifecycle state, update its ONE binding current-state line in the
+matching README section or table (typically the **Features** or **Supported
+models** table, which is where a new feature's status line goes) with the exact
+current stage: correctness-complete / speed-pending / build-only /
+hardware-blocked / `ACTIVE` / `GATING`, plus active gaps and the next gate. Do
+not wait for a feature to land or a gate to pass, and do not turn progress into a
+support claim. The README must never lag reality. It keeps ONE binding result
+and the current lifecycle state per feature; **the detailed status, forensic
+chronology, and evidence live in the append-only `.agents/state.md`,
+`.agents/parity-ledger.md`, the area matrices, and `docs/BENCHMARKS.md`, NOT in
+README prose.** A README table cell must never grow into a wall of per-attempt
+prose; at each checkpoint collapse superseded narratives and stale intermediate
+numbers into a concise disposition and relocate the detail to the record (move
+it, never delete evidence). Do not preserve history in the README merely because
+an older paragraph already exists. `scripts/check-readme-structure.py` (CI-gated,
+with its mutation test `tests/scripts/test_check_readme_structure.py`) enforces
+that the required user-facing sections exist and that no table cell exceeds the
+prose-length threshold; do not weaken the checker to bypass the obligation.
 
 **Keep [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) CURRENT at the SAME
 checkpoint.** Every feature/iteration records its benchmark disposition there

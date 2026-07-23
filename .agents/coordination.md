@@ -110,6 +110,20 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 
 ## Active claims
 
+**Docs coordination note (2026-07-23, `CLAIM-DOCS-README-HOUSE-STYLE`, DONE).**
+A docs-and-policy-only change (no area-matrix work row, so it is recorded here as
+a note rather than in the claims table, which is reserved for rows in
+`SPIKE`/`ACTIVE`) curated `README.md` from a status-tracking log into the LocalAI
+house-style user-facing document, purged em-dashes from `docs/BENCHMARKS.md`,
+relocated the verbose README status prose to the append-only `.agents/state.md`,
+added the README-is-a-user-facing-document policy to `AGENTS.md`, and added the
+CI checker `scripts/check-readme-structure.py` (+ mutation test). It touched no
+`src/`/`include/` and moved no row state; see the parity-ledger row and the
+`.agents/state.md` entry of the same date. **Concurrent-work note:** the LMCache
+W2 agent is also appending to `README.md`; the new **Features** table is the
+single-line insertion point for a feature's current-state row, so a one-line
+status update folds into the new structure without adding a paragraph.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-MLA-PREFIX-CACHE-ASSERT` | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` (bugfix — restores its SACRED gate under asserts-enabled builds; the shared prefix-cache manager assertion it relaxes stays owned by `CLAIM-PREFIX-PROMPT-CACHING`, no row-state change to that row) | Claude Code (opus-4-8) | isolated worktree `/home/mudler/_git/vllm.cpp-mla-fix` (branch `fix/mla-prefix-cache-assert`, base `6abe09c`); dgx repro `/home/mudler/repro_deepseek` (unfixed) + `/home/mudler/repro_fixed` (fixed) | `fix/mla-prefix-cache-assert` | `src/vllm/v1/core/single_type_kv_cache_manager.cpp` (assert only) + `tests/vllm/v1/test_single_type_kv_cache_manager.cpp` (new MLA cases) | `DONE` (2026-07-23) | 2026-07-23 root-caused + fixed the DeepSeek-V2 assert abort |

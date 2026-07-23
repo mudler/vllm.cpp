@@ -1,970 +1,314 @@
 # vllm.cpp
 
-A 1:1 port of [vLLM](https://github.com/vllm-project/vllm) to pure C++ — no
-Python, PyTorch, or ggml at runtime. The project mirrors vLLM's V1 / Model
-Runner V2 architecture and exposes a library, C API, example CLI, and
-OpenAI-compatible server.
+**Brought to you by the [LocalAI](https://github.com/mudler/LocalAI) team**, the folks behind LocalAI, the open-source AI engine that runs any model (LLMs, vision, voice, image, video) on any hardware, no GPU required.
 
-> ⚠️ **Pre-release, under heavy development.** The text paths for
-> **Qwen3.6-35B-A3B** and **Qwen3.6-27B** pass token-exact greedy correctness
-> gates on NVIDIA GB10. **27B has reached effective performance PARITY-OR-BETTER
-> with vLLM v0.25.0.** Two independent fully-interleaved exact-grid reruns on the
-> full production default set (async + vendored Triton GDN decode cubin +
-> bit-identical fast RMSNorm + gated-RMSNorm + conv-update + FP4/SiLU) — `9ecd9d0`
-> (114/124) and `f0fb727` (111/124) — establish, by **two-grid per-axis totality**:
-> **110 axes pass in BOTH grids, 5 are noise-band coin-flips that flip between
-> grids (at-parity by totality) → 115/124 effective parity**, and **9 fail in
-> both**. These supersede `a875397` (52/124), `246a23c` (49/124) and `3f256ab`
-> (55/124), all retained immutable. Evidence
-> `dgx:~/work/vllm.cpp-online-gate/evidence/{9ecd9d0…,f0fb727…}`; ZERO void, 12/12
-> binding-eligible; correctness holds throughout (full default set 27B 235/235 +
-> 35B 315/315 token-exact).
->
-> **The path from 49→115 was a decode-kernel-efficiency close** via a family of
-> **bit-identical (0-ulp) fast decode kernels** — each reproduces its shipped
-> reference's exact float-op order (so the fast set yields identical logits and
-> can never cross the 27B tok6 razor near-tie) while vectorizing memory access:
-> `RmsNormRowFastKernel` (2.41×, `348d12d`, closed c2 entirely), `RmsNormGatedRowFastKernel`
-> (2.04× at c16, `9ecd9d0`, closed the c16 floor; templated `<Tin,Tout>` 2026-07-19 so the
-> 35B MoE **f32** gated norm also takes it — 1.55× isolated, was silently on the slow
-> kernel), `CausalConv1dUpdateFastKernel`
-> (1.92×, `f0fb727`), plus the flipped FP4-quant/SiLU fast kernels — all default
-> ON with `=0` rollback, on the async (`a0013a2`) + vendored GDN cubin (`a321d7c`)
-> defaults. Memory PASSES (windowed-load `cb2d310`, ours peak PSS 24.88 GB vs vLLM
-> 28.18 GB).
->
-> **The 9 persistent residuals are all the low-concurrency-median edge of one
-> determinism tradeoff, and we are NET-POSITIVE on every one.** Our synchronous
-> deterministic forward keeps co-admitted requests in lockstep, where vLLM's
-> async-runtime jitter de-phases them: this costs us slightly on low-concurrency
-> *median* decode/TTFT (c8 mean/median/p99 itl+tpot, c4 mean/median ttft, c16/c32
-> median_itl) but WINS the corresponding *tail* and the same metric at higher
-> concurrency — c8 p99_itl is 0.86 at c8 but **1.055 at c16 and 1.078 at c32**
-> (vLLM's jitter spawns 900 ms-band outliers we lack); c4 median_ttft is 0.95 but
-> c4 **p90/p99 TTFT are 1.009/1.013** and c8/c16/c32 mean TTFT are
-> **1.030/1.100/1.136**. No axis is meaningfully or closeably slower. The only way
-> to "win" those low-conc medians is to inject vLLM-like async-forward jitter,
-> which forfeits the tail + high-concurrency + throughput wins and has no
-> throughput basis (vLLM's own async is −0.7%) — net-negative. A literal per-run
-> 124/124 is gated by ~5 noise-band coin-flips + this favorable tradeoff, not by
-> any real deficit; see `.agents/specs/c8-p99-itl-tail-2026-07-18.md` and the
-> parity ledger. **35B performance: 19→70/124** (2026-07-19; + MoE shared-expert aux-stream decode overlap). c4-c32 ALL win vLLM (16/20 each, TPOT 1.05-1.18×); memory 4/4 beats vLLM; only c1/c2 residual (~0.96-0.98). Next engine levers: fp8 merged-projection glue-fusion + more overlap slices. Memory 4/4 beats vLLM; the c8/c16/c32 serving operating point WINS (16/20 each, TPOT 1.06-1.15×); c1/c2 residual (~0.91-0.94) is the multi-stream-overlap + glue-fusion engine work carried into roadmap_v1.81× at c1 amortizing to a win by c32, plus prefill TTFT).6-35B-A3B-NVFP4, MoE). The MoE routing/align + host-free levers closed the high-concurrency decode (c16/c32 now WIN throughput+TPOT); remaining: **MoE host double-store FIXED (2026-07-18)** — freeing the routed-expert
-> fp4 host mirror after the device Marlin resident is built (+`madvise`) drops
-> 35B STEADY serving PSS 20.17→**3.53 GiB** (beats vLLM's 13.3), token-neutral
-> 315/315+235/235; the whole-window `peak_pss` (~19.8 GiB load-phase
-> coexistence) load-time streaming interleave now LANDED CPU-side
-> (`ENG-MOE-LOADSTREAM`: defer routed experts, build+free per layer → bound peak
-> to one layer; DGX peak-PSS confirmation pending). Remaining gaps:
-> low-batch decode (c1 tput 0.743× / TPOT 0.734×, rising to c16/c32 TPOT 1.05× —
-> Marlin MoE GEMM inefficient at batch=1), TTFT 0.80–0.86× (prefill). High-batch
-> decode already at parity. 35B correctness holds (315/315). See
-> [Benchmarks](docs/BENCHMARKS.md).
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](LICENSE)
+[![LocalAI](https://img.shields.io/badge/LocalAI-Run_Locally-orange)](https://github.com/mudler/LocalAI)
 
-## Current status
+vllm.cpp is a from-scratch C++20 port of [vLLM](https://github.com/vllm-project/vllm) that runs large language models with no Python, PyTorch, or ggml at inference time. It mirrors vLLM's V1 / Model Runner V2 architecture one-to-one (scheduler, paged KV cache, sampler, engine step loop) on top of its own portable tensor runtime (`vt::`), and ships llama.cpp-style as a library, a stable C API, an example CLI, and an OpenAI-compatible server. It loads Hugging Face **safetensors** and **GGUF** checkpoints, and runs on CUDA, CPU, Metal, and Vulkan from one source tree.
 
-| Gate | State | Current evidence | Next gate |
-|---|---|---|---|
-| Qwen3.6-27B correctness | ✅ PASS | Real NVFP4 model, token-exact greedy oracle | Retained as the precondition for every performance run |
-| Qwen3.6-27B performance | 🟢 EFFECTIVE PARITY-OR-BETTER | **Two-grid totality: 115/124 effective** (regression-confirmed 2026-07-19: a fresh 27B grid at `fcfde41` after all 35B-era changes = 118/124, NO regression, throughput wins every concurrency) (110 pass-in-both + 5 noise-band coin-flips; grids `9ecd9d0` 114/124 + `f0fb727` 111/124, full bit-identical fast-decode default set; supersede `a875397`/`246a23c`/`3f256ab`, all retained). mem 4/4, c1 20/20, c2/c16/c32 ~19-20/20. The 49→115 close was the bit-identical (0-ulp) fast decode-kernel stack (RMSNorm 2.41×, gated-RMSNorm 2.04×, conv-update 1.92×, FP4/SiLU — all default ON) confirming the decode deficit was norm/quant/act kernel glue. The 9 persistent residuals are the low-concurrency-median edge of our deterministic-forward tradeoff — NET-POSITIVE on each (lose c8 mean/median/p99 + c4 median-ttft + c16/c32 median_itl, WIN the c16/c32 p99 tails 1.055/1.078, c4 p90/p99 ttft, c8/c16/c32 mean_ttft 1.03-1.14×). Full set 27B 235/235 + 35B 315/315 token-exact | No closeable real deficit remains; a literal 124/124 is gated by noise-band coin-flips + a favorable determinism tradeoff (async-forward jitter would forfeit the tail/high-conc/throughput wins, net-negative). 35B performance closure follows accepted 27B parity |
-| Qwen3.6-35B-A3B correctness | ✅ PASS | Real NVFP4 safetensors and supported GGUF text paths | Continue no-regression checks |
-| Qwen3.6-35B-A3B performance | 🟡 DECODE AT-PARITY-OR-BETTER; PREFILL-TTFT-BOUND — **70/124 at `786aa0e`** (2026-07-19) | **Fresh binding at HEAD `786aa0e` (ZERO void, 12/12 eligible): 70/124, and the entire remaining gap is PREFILL TTFT.** Decode is at-or-beyond vLLM everywhere: memory 4/4; at c4/c8/c16/c32 the ONLY failures are the 4 TTFT axes (mean/median/p90/p99 ttft 0.877–0.971), every decode axis (tpot/itl/e2el/throughput) PASSES; c1 (2/20) + c2 (0/20) are near-miss across the board (0.935–0.975) but TTFT-led. The GDN kernel-glue wins (post-conv + gated-RMSNorm, byte-exact, default-ON) held 70/124 without flipping TTFT → the gap exceeds kernel-glue; the concurrency-dependence (worse c2–c8/c32 than c1) points at batched-prefill SCHEDULING. Active lever: prefill-TTFT full-step attribution (host-side/scheduling vs kernel). The 19→70 journey (decode close) below. The 35B online-serving **c2+ crash that blocked the grid is FIXED** (2026-07-18): concurrency > 1 died with `cudaEventSynchronize: an illegal memory access` — cuda-gdb pinned it to `marlin_moe_wna16::Marlin`, whose fp32-reduce scratch `c_tmp` (`EnsureCtmp`) was a grow-on-free per-stream buffer baked into the captured pure-decode CUDA graph; a bigger later prefill/decode freed the block the graph still referenced → use-after-free on the next replay (single-stream c1 never grows it, so it never crashed). Fix = retire-on-grow across the four decode-graph-reached scratch allocators (`RetireGraphScratch`, `src/vt/cuda/graph_safe_scratch.h`). 35B c2-c16 sweep no longer dies (pre-fix 5/5 trials crash → post-fix 0), 315/315 token-exact preserved. **MoE host double-store FIXED (2026-07-18, `ENG-MOE-HOSTFREE`):** freeing the routed-expert fp4 host mirror (~16.9 GiB) after `BuildMoeMarlinResident` + `madvise(MADV_DONTNEED)` drops 35B STEADY serving PSS 20.17→**3.53 GiB** (beats vLLM 13.3), guarded to the Marlin path, token-neutral 315/315+235/235, memcheck clean; the whole-window `peak_pss` (~19.8 GiB, load-phase coexistence) is now bounded by the **load-time streaming interleave LANDED 2026-07-18 + DGX-PROVEN (`ENG-MOE-LOADSTREAM`):** the loader DEFERS the routed-expert host copies and `PrepareMarlinResident` materializes ONE layer's experts immediately before that layer's device Marlin build + host free, so at most one layer's ~256 experts coexist on the host. DGX A/B (new vs eager parent, one flock): 35B load-to-ready **peak RSS 21.43→4.19 GiB (−80%, below vLLM 13.3)**, token byte-identical (315/315 + 235/235), 27B unaffected, memcheck 0/315; device residents byte-identical; the orchestrator re-grids the binding memory axes to confirm the FAIL→PASS flip. **The largest c1 decode-TPOT lever landed 2026-07-18** (`CLAIM-MOE-DECODE-PARALLEL-1`): the two M=1 MoE decode kernels launched a single block and ran serially, leaving the GPU ~99% idle (grounded nsys: MoeAlign 29.3 µs vs vLLM 3.6 µs / 8.2×, MoeRouterTopK 20.2 µs vs vLLM 6.7 µs / 3.0× — together ~1.7 ms/tok ≈ 63% of the 2.7 ms c1 gap). Both are now parallelized (router top-k → per-thread argmax + tree reduction mirror of vLLM `moeTopK`/`topkGating`; moe_align → one-thread-per-expert `cub::BlockScan` prefix sum mirror of `moe_align_sum_kernels.cu`), **BYTE-EXACT to the serial reference** (router 72/72 + align 60/60 parity), same-box per-kernel A/B MoeAlign 29.5→3.0 µs (9.8×, now below vLLM) + MoeRouterTopK 20.2→12.3 µs (1.64×), plus block_size_m 16→8 at low M (L3) and 4 redundant Marlin workspace memsets removed (L4, memcheck-clean). Efficiency-only + **27B 235/235 + 35B 315/315 token-exact** ⇒ shipped ON by default | Run the v0.25.0 performance grid (now unblocked) after all 27B axes pass; the c1 TPOT recovery from this lever is re-measured in-situ by that grid |
-| Host-memory parity | ✅ PASS on the new binding grid | All four memory axes now PASS at `246a23c` (windowed-load `cb2d310` binding): ours peak PSS/RSS 24,879,201/24,881,800 KiB vs vLLM 28,184,400/28,563,020 KiB (1.1329×/1.1479×), GPU 40,996 vs 70,531 MiB, MemAvailable-drop 68,346,844 vs 80,660,556 KiB. The prior `3f256ab` peak (48.3 GB) was load-time double-residency, eliminated by the windowed release (−23.54 GB load-to-ready VmHWM) | Memory parity holds. Layer-bounded direct-device staging is now implemented only for the plain-BF16 Qwen3.5 dense diagnostic and remains `GATING`; broader quantized/MoE streaming is still open |
-| 35B FA2-prefill lever | ✅ LANDED / default-ON (2026-07-18, `CLAIM-35B-FA2-FLIP-1`) | The 35B FA2-prefill + fused qk-norm-rope-gate preamble is now DEFAULT-ON (`FuseAttnPreambleOn` returns true all arches; `VT_FUSE_ATTN_PREAMBLE=0`/`VT_FA2_PREFILL=0` roll back), so the 35B ratio-8 full-attn layers take the exact `flash_fwd_splitkv` kernel the 27B already uses. Grounded by the RESOLVED oracle ([spec](.agents/specs/qwen36-35b-fa2-prefill-oracle-2026-07-18.md)): vLLM production runs FA2 bf16-q + the fused preamble; vLLM 0.25.0 graphed greedy == the stored oracle **16/16**, so no re-baseline. Both sacred gates hold on the FULL current-main default set: 35B `test_qwen36_paged_engine` **315/315** + 27B `test_qwen27_paged_engine` **235/235**; memcheck 35B prefill **0 errors**. The spec's "round normed q/k→bf16 before RoPE" tighten was op-level bit-identical but flipped the 27B tok6 near-tie in combination (RMSNorm-saga) → NOT shipped; the preamble ships UNTIGHTENED, both arches token-exact. Realistic input-1024 TTFT A/B (conc8, same binary, FA2 default vs `VT_FA2_PREFILL=0`): Mean TTFT **824.7 vs 874.4 ms (−5.7%)**, prefill tput +5.5% (3 interleaved pairs, low variance). CPU gate: clean `-Werror` 0/0, full ctest **156/157** (`test_capi` is a known pre-existing nondeterministic dgx detokenizer flake, not a regression), tools 164/164 | 35B perf grid (orchestrator-owned) re-measures the in-situ TTFT gain from this lever |
-| 35B FA2-decode lever | ✅ LANDED / default-ON (2026-07-19, `CLAIM-35B-FA2-DECODE-1`) | The 35B ratio-8 (Hq/Hkv=16/2) hd-256 full-attn DECODE now takes the vendored `flash_fwd_splitkv` main+combine path the 27B ratio-6 already used, gated by new env `VT_FA2_DECODE_35B` (default ON, `=0` rollback). The old ratio-8 decode launched a **2-block grid** (`PagedAttentionDecodeGqaKernel`, grid=(num_reqs,num_kv_heads)) at low batch — near-zero GB10 occupancy; split-KV adds the `num_splits` axis so the grid fills the machine (nsys: clean 1:1 kernel swap, 300↔300 launches, GridZ up to 16). Both sacred gates hold on the FULL default set: 35B **315/315** + 27B **235/235**; operator **454,358** assertions (adds ratio-8 parity ladder); memcheck 35B decode **0 illegal-access errors**. In-situ 35B A/B (input-1024, same binary, `VT_FA2_DECODE_35B=1` vs `=0`, 4 interleaved pairs, first dropped): **c1 TPOT 14.96→16.72 ms (−10.5%), total tput +10.4%; c8 TPOT 33.02→34.12 ms (−3.2%), tput +2.8%; TTFT neutral** (decode-only lever). Targets the 35B c1 decode-TPOT 0.810× low-batch residual. CPU gate: clean `-Werror` 0/0, tools 164/164, checkers green; full DGX ctest 157/160 — the 3 misses are non-numerics (`test_async_llm` parallel-port flake passes isolated; `test_capi` documented nondeterministic detokenizer flake; `test_qwen36_gguf_engine` a two-35B-GGUF memory-edge OOM — `VT_FA2_DECODE_35B=0` passes 28/28, the added decode scratch tips a marginal box, production safetensors 35B is 315/315 ON — flagged for a scratch-pool follow-up) | 35B perf grid (orchestrator-owned) re-measures the in-situ c1–c4 TPOT gain |
+> **Pre-release, under heavy development.** The engine is correctness-complete and speed-competitive for a specific set of models on one GPU (NVIDIA GB10 / DGX Spark, sm_121a), plus a CPU path that matches or beats llama.cpp on GGUF. Read the honest per-feature state in [Features](#features) and [Supported models](#supported-models) below, and the full evidence in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Capabilities are labelled: *correctness-complete* (token-exact vs the vLLM oracle), *speed-pending* (correct, throughput work in progress), *build-only* (compiles for a target with no runtime proof here), and *hardware-blocked* (cannot run on the hardware available).
 
-The binding cache-off workload is input 1,024 → output 128, greedy, closed
-loop, with three interleaved repetitions. Arm equivalence is audited: batch
-cap, token budget, sampling, corpus, cache dtypes and kernel families all
-match, and the client commands are identical to one token — see the
-[equivalence audit](.agents/specs/benchmark-equivalence-audit-2026-07-15.md). Ratios are direction-normalized so
-**1.0 or higher passes**.
+The reference numbers below are measured against the pinned **vLLM 0.25.0** oracle on GB10, greedy, same workload, same tokens. Where a claim cannot be measured on the hardware here, it is stated as such rather than implied.
 
-| Concurrency | Axes passing | Total throughput: ours / vLLM | Ratio |
+## Features
+
+vllm.cpp implements an intentionally focused subset of vLLM, held to token-for-token correctness against the pinned oracle. One binding current-state line per capability follows; the detailed chronology and evidence live in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and the [`.agents/`](.agents/) record.
+
+| Capability | State | Notes |
+|---|---|---|
+| Qwen3.6-27B (NVFP4) text generation | Correctness-complete, at/above vLLM speed | Token-exact greedy on GB10; beats vLLM 0.25.0 total throughput at every concurrency (1.007-1.045x), effective parity 115/124 axes |
+| Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete, decode at-parity, prefill speed-pending | Token-exact greedy; decode at or beyond vLLM, remaining gap is prefill TTFT |
+| Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual |
+| Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM |
+| Llama-3.x dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 16/16 (Llama-3.2-1B); llama3 RoPE scaling |
+| Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
+| OPT (learned pos-emb, cross-family) | Correctness-complete, speed-pending | Strict token-exact 6/6 (OPT-125m); additivity canary across model families |
+| DeepSeek-V2 MLA | Correctness-complete, speed-pending | Token-exact 8/8 (DeepSeek-V2-Lite); 0.86-0.95x vLLM output rate, TTFT faster at c4/c8 |
+| Safetensors loading | Supported | Both gate models plus every registered dense/MoE family |
+| GGUF loading (F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) | Supported; compute-in-quant on CPU | Weights in six block encodings stay compressed from file to matmul on CPU (no BF16 expansion) |
+| CPU backend vs llama.cpp | At or ahead on every axis (GGUF) | Prefill 1.18x ahead, decode at parity, peak memory 1.01x, byte-identical greedy tokens |
+| Paged KV cache + prefix caching | Supported | Block-paged full attention, hybrid full-attention + GDN state groups, automatic prefix caching (APC) on by default for dense models |
+| KV offload to CPU / disk | Built, opt-in, off by default | CPU and disk tiers with identity-checked blocks; scheduler connector wired, worker-side GPU load pending |
+| Sampling | Supported | Greedy, temperature, top-k, top-p, min-p, penalties, allowed-token / bad-word masks |
+| Structured output | Supported (subset) | JSON schema, JSON object, regex, choice, GBNF grammar, Hermes-style tool-call subset |
+| OpenAI server | Supported (subset) | `/v1/completions`, `/v1/chat/completions`, streaming SSE, `/v1/models`, `/health`, `/version` |
+| Tokenizers | Supported | Byte-level BPE (Qwen/Llama-3/OPT/GPT-2/DeepSeek) and SentencePiece BPE (Mistral/Gemma), plus GGUF vocab; byte-exact vs the vLLM oracle |
+
+Not yet supported: multimodal / vision, LoRA, multi-GPU, speculative decoding (user-facing), and the full tool-calling template surface. See [Serving and API notes](#serving-and-api-notes).
+
+## Supported models
+
+Every model below passes a token-for-token correctness gate against the pinned vLLM 0.25.0 oracle on GB10. Where vLLM's own greedy is deterministic the bar is strict token-exact; where vLLM is self-inconsistent at bf16 near-ties, the bar is a near-tie-robust check (our token within half a nat of vLLM's own teacher-forced argmax on our prefix). "Speed" is a separate bar (match or beat vLLM on every axis), tracked in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+| Architecture | Example checkpoints | Safetensors | GGUF | Correctness | Speed |
+|---|---|:---:|:---:|---|---|
+| Qwen3.5/3.6 hybrid (GDN + MoE) | Qwen3.6-35B-A3B, Qwen3.6-27B | yes | 35B only | Token-exact | 27B at/above vLLM; 35B prefill-pending |
+| Qwen3 / Qwen2 dense | Qwen3-4B, Qwen3-0.6B, Qwen3-32B | yes | dense qwen35 | Token-exact (near-tie-robust) | Speed-pending |
+| Qwen3-MoE | Qwen3-Coder-30B-A3B | yes | - | Token-exact (near-tie-robust) | Speed-pending |
+| Llama-3.x dense | Llama-3.2-1B | yes | - | Token-exact (near-tie-robust) | Speed-pending |
+| Mistral dense | Mistral-7B-v0.3 | yes | - | Token-exact | Speed-pending |
+| OPT | OPT-125m | yes | - | Strict token-exact | Speed-pending |
+| DeepSeek-V2 (MLA) | DeepSeek-V2-Lite | yes | - | Token-exact | Speed-pending |
+
+Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively (RedHatAI/Qwen3-32B-NVFP4A16), correctness-complete and speed-pending.
+
+Larger DeepSeek / GLM / MiniMax variants are recorded as **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or **spiked-only**, per the [model matrix](.agents/model-matrix.md). GLM-4.7-Flash is the named next vehicle for the MLA track.
+
+## Performance
+
+Numbers are measured on NVIDIA GB10 (DGX Spark, sm_121a) against the pinned vLLM 0.25.0 oracle, greedy, closed loop, input 1024 tokens to output 128, three interleaved repetitions, ratios direction-normalized so 1.0 or higher passes. The full per-axis grids, memory tables, and exact reproduction recipes are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+**Qwen3.6-27B (NVFP4), total throughput vs vLLM 0.25.0:**
+
+| Concurrency | Ours (tok/s) | vLLM (tok/s) | Ratio |
 |---:|---:|---:|---:|
-| 1 | **20/20** | 86.05 / 82.32 tok/s | **1.0453×** |
-| 2 | **20/20** | 159.68 / 158.03 tok/s | **1.0105×** |
-| 4 | 18/20 | 292.34 / 290.31 tok/s | **1.0070×** |
-| 8 | 15/20 | 508.77 / 505.46 tok/s | **1.0066×** |
-| 16 | **19/20** | 801.76 / 789.16 tok/s | **1.0160×** |
-| 32 | 18/20 | 1095.01 / 1076.25 tok/s | **1.0174×** |
+| 1 | 86.05 | 82.32 | 1.045x |
+| 2 | 159.68 | 158.03 | 1.011x |
+| 4 | 292.34 | 290.31 | 1.007x |
+| 8 | 508.77 | 505.46 | 1.007x |
+| 16 | 801.76 | 789.16 | 1.016x |
+| 32 | 1095.01 | 1076.25 | 1.017x |
 
-We now beat vLLM on total throughput at every concurrency (1.007–1.045×). The
-two-grid effective parity is 115/124; the residuals are noise-band coin-flips or
-the favorable determinism tradeoff described above. The full per-axis table,
-memory table, and exact reproduction recipe are in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+We beat vLLM on total throughput at every concurrency; effective parity is 115/124 per-axis metrics (two-grid totality), with the residuals being noise-band coin-flips or a favorable determinism tradeoff described in the benchmark record. Peak host memory also passes (24.88 GiB vs vLLM 28.18 GiB). The 35B decode path is at or beyond vLLM everywhere; its remaining gap is prefill time-to-first-token, tracked as active work.
 
-### Current performance track
+**CPU vs llama.cpp (GGUF, same file, single binary):** prefill 223.8 tokens/s vs llama.cpp 177.3 (1.18x ahead), decode at parity (24.7 vs 25.4 tokens/s), peak memory 2.83 GiB vs 2.80 (1.01x), and the output tokens are byte-identical to llama.cpp's greedy decode.
 
-| Work item | Present disposition |
-|---|---|
-| Binding gate | 🟢 **EFFECTIVE PARITY (115/124 two-grid totality)** across grids `9ecd9d0`+`f0fb727`: 110 pass-in-both, 5 coin-flip-splits, 9 persistent residuals all = the low-conc-median edge of a net-positive determinism tradeoff (we win the corresponding tails + high-concurrency + throughput). No closeable real deficit; correctness 235/235+315/315 |
-| Selected GPU work | `KERNEL-GDN-PACKED-DECODE` is **`DONE`** — W1D3 **CLOSED on equivalence** (owner `e47b4d6`). The c16 HTTP-500 slot defect (the runner keyed the compact GDN state-slot pool on the mamba block-id, collapsing 2 long c16 sequences onto 1 recurrent-state slot; also latent silent cross-request corruption) was fixed test-first (request-identity keying) and proven at `c172336`. G3 closed over eight sealed components + the 8-pair A/B (−0.205% ± 0.30, <1σ) + the trace attribution (packed GPU-cheaper): no stable regression, no `complete-pass` marker, no speed credit. **qkvz** (`KERNEL-GEMM-BF16` W2) DGX gates closed green at `45f9e6d` (−48 BF16 GEMMs/window confirmed) and is in the `246a23c` binding binary. The authorized exact-grid rerun has now RUN (new binding, 49/124); the era A/B fully attributed the c16/c32 delta (corruption-subsidized bandwidth; pre-fix GDN kernel evidence now contamination-suspect); the fresh correct-state GDN kernel trace vs vLLM is now DONE (2026-07-16): the ~8 ms/step gap is ~4.65 ms busy + ~3.25 ms host/idle, busy = ~2.06 ms GDN recurrence tiling + ~2 ms unfused norm/quant glue (state-I/O fused in-kernel, not a separate op; GEMM/MoE/attn at parity); the naive register-resident port failed its DGX proof (−12%, oracle FAIL; default flipped OFF, opt-in retained); the recurrence-tiling lever is RESOLVED via the sanctioned vendored Triton cubin `gdn_decode_h48`, now **default ON** (`VT_GDN_PACKED_DECODE_TRITON`, MIRROR policy; `=0` rollback), 235/235 default + rollback + memcheck-clean; next: the W3 runner leaf and decode norm/quant kernel efficiency. **The FP4-quant decode-glue kernel-efficiency lever landed OPT-IN 2026-07-17** (`CLAIM-FP4-QUANT-FAST-1`): two NUMERICS-NEUTRAL bit-identical vectorized-load+store fast kernels (`VT_FP4_QUANT_FAST` `ScaledFp4QuantFastKernel`, `VT_SILU_FP4_FAST` `SiluAndMulFp4QuantFastKernel`) — each thread does one 16-byte `uint4` load + one 64-bit packed store (vs 16 + 8 scalar), memory-pattern change only, grounded 1:1 in vLLM `nvfp4_quant_kernels.cu:56-80,98`. Byte-exact new-vs-old PROVEN (60/60 adversarial asserts + full FP4 suite 24/24; engine both-flags-ON 27B 235/235 (16/16 token-exact) + 35B 315/315). Isolated nsys per-launch is **PARTIAL vs the ≥1.3× flip bar** — ScaledFp4Quant K=5120 1.12-1.18× / K=17408 1.44-1.62×, SiluAndMul 1.14× (c2) / 1.38× (c16-c32): clears the larger shapes, misses the dominant K=5120 / c2 (swizzled small-M is padding-thread-dominated; the residual to vLLM's ~1.7× is the numerics-changing hw fp4-cvt + bf16 reduction, out of scope). **2026-07-18 (`CLAIM-CONV-UPDATE-FAST-1`): both flags flipped DEFAULT ON** per the parity-enabler policy (byte-exact ⇒ never-slower + token-safe; under the strict ≥1.0 gate every fraction counts; `=0` rollback), re-verified byte-exact 25/25 (26,976) + full default set 27B 235/235 + 35B 315/315. **The GDN decode conv-update fast kernel also landed the same way** (`VT_CONV_UPDATE_FAST`, default ON, `CausalConv1dUpdateFastKernel` 0-ulp bit-identical, **isolated 1.92×** at the 27B c16 shape — a 2D grid removing the int64 div/mod + a register-cached state row; DGX byte-exact 330/330, full default set 235/235 + 315/315). The next binding grid runs the full bit-identical fast-decode stack by default; the orchestrator owns the combined in-situ A/B. **2026-07-18 (`CLAIM-GDN-PREFILL-CONV-1`): PREFILL GDN conv kernel-efficiency landed** — `CausalConv1dFwdRegKernel` (`VT_CONV_REG` DEFAULT ON, `=0` rollback), the register-resident sliding-window mirror of vLLM's FLA prefill `causal_conv1d` (weights preloaded to registers, each x loaded once, token-axis chunked for low-batch prefill occupancy); the per-V-head fused post-conv split (`VT_GDN_POSTCONV_SPLIT`) landed OPT-IN (measured near-neutral). Both BIT-IDENTICAL (0-ulp) to the shipped tiled/megablock kernels (byte-exact CUDA A/B 268 asserts + memcheck 0; 27B 235/235 + 35B 315/315). nsys 35B: conv −4.7% (c1) / −7.3% (c6) per-call — a real but modest bandwidth-bound win (the kernels are BW-bound; the residual vLLM conv gap is bf16 traffic, VT_GDN_IN_BF16, separate); TTFT within run-noise. Binding grid re-measures. **2026-07-19 (`CLAIM-GDN-POSTCONV-FAST-1`): fused post-conv FAST kernel landed DEFAULT ON.** A fresh production-path nsys (`--cuda-graph-trace=node`, Triton AOT ON) confirmed the GDN chunk **compute** (delta_h/chunk_o/kkt/recompute_w_u) runs the vendored FLA Triton cubins by default = **at FLA parity by construction**, so the #1 remaining NON-AOT GDN kernel on BOTH models is the fused post-conv prep. Since the split measured neutral/slower, `GdnPostConvFastKernel` (`VT_GDN_POSTCONV_FAST`, `=0` rollback) keeps the megablock grid but makes two BYTE-IDENTICAL changes (128 threads/block — the 128-wide L2-norm tree is the 256-wide tree minus a `+0` step; + 128-bit-staged V copy), grounded in FLA `_fused_post_conv_kernel`. Isolated nsys **27B −24.3% / 35B −24.8%** per-call; in-situ TTFT 27B c1 −1.14% / c2 −1.31%, 35B c1 −0.72% / c2 −0.99% (all reps positive); 27B 235/235 + 35B 315/315 both arms; clean `-Werror`. Per the parity-enabler policy (byte-exact + measured-faster ⇒ default ON) |
-| Remaining gap diagnosis | With memory now passing, the failing mass is the **c2–c32 decode-coupled family** (throughput inversely coupled to TPOT/ITL) — now **fully attributed**. The correct-state same-method c2/c8 full-step split ([spec](.agents/specs/c2-c8-attribution-2026-07-16.md), evidence `dgx:~/work/vllm.cpp-c2c8-attribution/beb8497`) resolves the [lost-lanes](.agents/specs/rescan-lost-lanes-2026-07-16.md) UNATTRIBUTED downgrade: the **c2 gap (+2.43 ms/step) is ENTIRELY GPU-busy** (busy Δ +3.16 = 130% of the gap; idle Δ −0.73 — ours idles LESS than vLLM) — a batch-independent norm/quant/act kernel-glue floor (+2.40: RMSNorm 129×/step +1.74, FP4-quant +0.30, SiLU +0.23, gated +0.14) plus the GDN recurrence (+0.93), GEMM/MoE/attention at parity; the **c8 gap (+7.29) is 38.6% GPU-busy** (glue +2.45, recurrence +1.53, GEMM bundle −1.28 ours-faster) **+ 61.4% wave-boundary stall time** — inside pure-decode waves both engines are ≥99% busy at parity (per-step host window bounded 0.12–0.19 ms/step), so the idle mass is the wave-boundary prefill-event mechanism ([tail spec](.agents/specs/tail-stall-analysis-2026-07-16.md)) now shown to move the c8 MEAN, not just the tails — and the CPU wave discriminator (`tests/vllm/v1/test_scheduler_wave.cpp`) proves the composition is byte-identical both sides, so the magnitude gap is the async depth-2 overlap (W3), not a scheduler divergence. The 07-14 "host-side" label is REFUTED at c2 / RESHAPED at c8; host plumbing (block-table cluster, sampler alloc) is bounded ≤~0.2 ms/step — hygiene, not a c2–c8 lever. Levers: c2–c4 → kernel glue (`KERNEL-EW-NORM-ACT` — RMSNorm Phase-1 confirmed 3.18-3.56×, `RmsNormRowFastKernel` real-cub numerics rework now token-exact 235/235+315/315 and ~3.2× isolated, but c16 in-situ A/B is a NULL so it was flipped ON after the c2 preflight win, then REVERTED same-day (2026-07-17) by the binding campaign's engine sanity gate: with the FULL default set (async + GDN cubin + RMSNorm-fast) the 27B production stream fails 233/235 at the documented token-7 near-tie — the combined output exactly matches the fixture's `want_emu` (pip-vLLM EAGER-mode) stream, i.e. the pair of individually token-exact kernels lands on the other side of a near-tie vLLM itself decides differently between graphed and eager modes. This is now RESOLVED (2026-07-17, `CLAIM-EW-NORM-ACT-3`): rather than a "Triton-faithful" match, `RmsNormRowFastKernel` was made BIT-IDENTICAL (0-ulp) to OUR shipped `RmsNormRowKernel` — the 235/235 through-stack reference — by reproducing its exact float op sequence (residual add `bf16(f32(x)+f32(res))`, variance in the exact kBlock=256 strided-partial + shared-tree ORDER via a 1024-thread vectorized Pass 1 that stages f32 squares to shared memory, `1.0f/sqrtf`), vectorizing only the element-independent normalize pass. So `fast+cubin ≡ shipped+cubin ≡ 198` BY CONSTRUCTION: the full production default set passes **27B 235/235 + 35B 315/315** (both rollback arms too), `test_cuda_ops` fast==shipped **0-ulp BIT-EXACT**, and the perf win SURVIVES (isolated 2.41×, in-situ 27B engine-forward RmsNorm 3.68×). Per the parity-enabler policy the **default is flipped ON** (`VT_RMSNORM_DECODE_FAST=0` rolls back); the next binding grid re-measures the production default. The sibling **gated-norm glue lever** (the `gated +0.14` c2 term / +0.40 ms/step at c16 vs vLLM's fused gated norm) landed the SAME bit-identical way (2026-07-17, `CLAIM-EW-NORM-GATED-1`): `RmsNormGatedRowFastKernel` behind `VT_RMSNORM_GATED_FAST` (default ON, `=0` rollback) is 0-ulp identical to the shipped gated kernel, **isolated 2.04× at c16** (1.31–1.38× at c1/c2), full default set 27B 235/235 + 35B 315/315) + recurrence tiling; c8+ → the W3 overlap family (`ENG-ASYNC-SCHED`; the 2026-07-17 discriminator resolved the TTFT/throughput question — the premium is vLLM's own async trade, W3-ON nets positive and **its default flip LANDED 2026-07-17**, `ENG-ASYNC-SCHED` DONE). The prior RMSNorm/generated-partitions residual stays **disproven** as a fusion gap; the c16/c32 regression stays attributed to corruption-subsidized state bandwidth (era A/B + probe3, `6dd24df`) |
-| MoE shared-expert aux-stream decode overlap (`ENG-MOE-SHARED-AUX`) | **LANDED default-ON 2026-07-19 (`CLAIM-MOE-SHARED-AUX-1`) — the first slice of the multi-stream intra-step OVERLAP named the largest remaining 35B c1/c2 lever.** Mirror of vLLM's decode overlap (`fused_moe/runner/shared_experts.py:99-104,125-142` + `maybe_execute_in_parallel`, `multi_stream_utils.py:20-58`): the MoE **shared-expert MLP** runs on a 2nd persistent CUDA stream concurrent with the **routed-expert** router/align/grouped-Marlin-GEMMs on the main stream inside `MoeBlockFusedMarlinCuda`, joined before the combine. **Byte-identical by construction** (independent shared/routed paths both complete before combine; overlap changes WHEN not WHAT) — proven: overlap `VT_MOE_SHARED_AUX_STREAM`∈{0,1} both 35B **315/315** + 27B **235/235**, captured-vs-eager 315/315, `compute-sanitizer memcheck` 0 errors. The scratch `DevicePool`'s single-stream reuse invariant is preserved by giving the aux stream its own `AuxPool` (each pool serves one stream; the fix for the cross-stream scratch race vLLM avoids via its `record_stream` allocator). **In-situ same-binary interleaved TPOT A/B** (35B, input-1024/output-128, greedy, drop cold rep1): c1 13.60 vs 14.40 ms **−5.6%**, c2 −2.7%, c4 −3.7%, c8 −3.4%, c16 −1.6%, c32 −1.5% — WINS at every concurrency, ZERO regression (GB10's 48 SMs leave spare occupancy across the low-conc band). Token-exact + faster c1-c4 + non-regressing c8+ ⇒ **default flipped ON** (`VT_MOE_SHARED_AUX_STREAM=0` rollback; `VT_MOE_SHARED_AUX_THRESHOLD` 128 gate). Remaining overlap slices (routed/attention/prefill multi-stream) + portable glue-fusion stay the roadmap_v1 35B priority. The next binding grid re-measures the c1/c2/c4 TPOT. |
-| FP8 merged-QKV projection (`KERNEL-GEMM-FP8` sub-lever) | **LANDED opt-in 2026-07-19 (`CLAIM-FP8-MERGED-QKV-1`) — token-exact, perf-NEUTRAL.** Extends the fp4-only merged-QKV fusion to the 35B FP8 W8A8 full-attn path: the 10 full-attn layers ran Q/K/V as 3 separate `MatmulFp8Cutlass` GEMMs; now ONE fp8 GEMM over the N-concatenated operand + split (30→10 GEMMs/step), targeting the M=1 decode launch overhead of the last 35B c1/c2 residual. **Key finding:** fp8 here is PER-TENSOR scaled (one scalar `weight_scale`/folded `alpha` per shard), so unlike the fp4 per-block merge a single-alpha concat is incorrect — realized as concat RAW fp8 bytes + GEMM `alpha=1` + a resident per-column alpha vector applied by the NEW `vt::MulColVecF32` op; byte-identical to the 3 separate GEMMs when cuBLASLt tiling matches (Q/K/V share one `input_scale` ⇒ identical activation quant). CPU gates GREEN (glue 10/10 incl. 2 new byte-exact MulColVecF32, fp8_cutlass 6/6, matmul 7/7, clean `-Werror`); **DGX GREEN** (clean CUDA `-Werror` 0 warn): 35B **315/315 token-exact both arms** + 27B **235/235 both arms** (inert), memcheck **0 errors**, merge proven to fire. **In-situ 35B TPOT A/B: NEUTRAL** — c1/c8 ~0%, c2/c4 −0.5%, all ≤0.9% within rep noise (the ~20-launch saving over 10 attn layers is below the decode-step noise floor; the step is dominated by 30 GDN layers + MoE). **Kept opt-in** (`VT_FP8_MERGED_QKV` default OFF) per "token-exact but not measurably faster". Follow-up: GDN qkvz/BA fp8 merge (30 layers — larger launch slice). |
-| Sigmoid-gate → o_proj fold (`KERNEL-GEMM-NVFP4-W4A4` sub-lever) | **LANDED opt-in 2026-07-19 (`CLAIM-SIGMOID-GATE-FOLD-1`) — byte-exact, perf-NEUTRAL.** Folds the standalone full-attention sigmoid output gate (`attn*sigmoid(gate)`) into the o_proj NVFP4 activation quant on the 27B true-W4A4 path — one fused `vt::SigmoidGateFp4Quant` kernel, no bf16 `gated` intermediate — mirroring vLLM's Inductor `triton_poi_fused_mul_scaled_fp4_quant_sigmoid` and reusing our `SiluMulFp4Quant` precedent. Only 27B (W4A4) o_proj quantizes its activation; 35B (W4A16-Marlin / fp8 o_proj) reads bf16 activations and keeps the standalone `SigmoidGateBf16` (fusion inert). **DGX GREEN** (`~/work/vllm.cpp-sigmoid-fold`, production flags CUTLASS sm120a + Marlin + FA2 sm_121a + Triton AOT, clean CUDA `-Werror` **0 warnings**): byte-exact op test `sigmoid_gate_fp4_quant` **14/14** (CPU f32/bf16 + CUDA, 3 shapes), 27B `test_qwen27_paged_engine` **235/235 both arms** (fused=default-ON and `VT_FUSE_SIGMOID_QUANT=0` fallback), 35B `test_qwen36_paged_engine` **315/315** (inert). **In-situ 27B TTFT A/B (input-1024, 3 reps/arm): NEUTRAL** — c1 med OFF 419.6 vs ON 419.0 ms (−0.15 %), c2 792.9 vs 792.7 ms (−0.03 %), all within ±0.5 % rep noise (the full-attn o_proj is a small slice of 27B prefill, dominated by GDN + MoE + QKV/gate/up GEMMs). **Kept opt-in** (`VT_FUSE_SIGMOID_QUANT=1`, default OFF) per "flip only on a measured win". |
-| 35B GDN out_proj gated-RMSNorm → fp8-quant fold (`KERNEL-EW-NORM-ACT` sub-lever, `CLAIM-GDN-OUT-FP8-FUSE-1`) | **LANDED default-ON 2026-07-19 — byte-exact, measured-faster (small).** Folds the 35B GDN out_proj's static W8A8 fp8 activation quant INTO the gated-RMSNorm output store: one new `vt::RmsNormGatedQuantFp8` kernel emits the fp8 activation directly (fed to `MatmulFp8CutlassPreQuantD`), removing the standalone `QuantFp8Static` pass **and** the bf16 gated-norm output it would write then re-read — the gated sibling of the existing `RmsNormQuantFp8Row` fusion (mirrors vLLM's Inductor fusion of the fla `layernorm_guard` RMSNormGated epilogue with the following RowParallelLinear's static-fp8 quant). **Byte-identical** to the split `RmsNormGated(bf16)+QuantFp8Static` (fp8 taken from the SAME bf16-rounded value; the fused kernel reproduces `RmsNormGatedRowFastKernel`'s exact 0-ulp variance reduction). Only the 35B GDN out_proj is fp8 (27B's is W4A4 fp4) → **35B-only, no 27B greedy-razor exposure.** **DGX GREEN** (`~/work/vllm.cpp-gdn-fp8-fuse`, prod flags, clean CUDA `-Werror` **0 warnings**): CPU byte-exact `rmsnorm_gated_quant_fp8` (silu+sigmoid, fused==split); 35B `test_qwen36_paged_engine` **315/315** on default-ON, `VT_GDN_OUT_FP8_FUSE=0` rollback, AND the pre-flip `=1` arm; 27B **235/235** (inert); `compute-sanitizer memcheck` **0 errors** fused-ON. **Isolated nsys** (35B prefill c1, 30 GDN layers): the gated-norm+out_proj-quant chain **6.43→4.58 ms (−28.7%)** — the fused fp8 1-byte store is even cheaper than the unfused gated norm's bf16 store alone — but only **~0.28%** of the ~655 ms total prefill GPU. **In-situ 35B TTFT A/B** (input-1024, output-8, 3 reps interleaved, same binary): **c1 median −1.4% (3/3 reps), c2 −1.3% (3/3), c8 −0.4% (2/3; async-off arm — a pre-existing `async_scheduler` assertion crashes c8+short-output, unrelated to the fold)**, prefill tput +1.0%, zero regression. Byte-exact + consistently faster ⇒ **default ON** (`VT_GDN_OUT_FP8_FUSE=0` rollback) per the parity-enabler policy (like `GdnPostConvFast`). **Honest read: a REAL but SMALL fold — it does NOT flip the 3–14% binding TTFT axes alone; each portable glue fold is ~1%, so closing the 35B prefill gap needs a STACK of them.** |
-| Eager Marlin repack (35B first-token) | **VERIFIED already-at-load-time — no work needed (2026-07-19).** The scoping premise (first-touch Marlin repack = 42 % of a COLD 35B prefill) was checked: the routed-expert / shared-expert / lm_head Marlin repack (`BuildMoeMarlinResident`) already runs eagerly at engine init via `Qwen3_5Model::PrepareMarlinResident`, called from the **`GPUModelRunner` constructor** (`runner.cpp:302/321`) — before any warmup or serving, mirroring vLLM's `process_weights_after_loading`. The forward-path first-touch build (`if (!mr.ready)`) is a dead fallback in production (`mr.ready` is already true from load). Empirically an un-warmed 35B c1 bench shows an elevated FIRST-request TTFT (median 178 / p99 575 ms over 6 reqs) — but that ~400 ms delta is general first-request warmup (FP4 autotune / plan-cache / CUDA-graph capture / page-in), NOT the multi-second expert repack (which is provably at construction, before request 1). The binding grid warms with a 1×1024-token request before timing, so even that general first-request cost is excluded; the repack is OUTSIDE the measured c1/c2 window ⇒ lever skipped. |
-| Async/overlap scheduling (`ENG-ASYNC-SCHED` W3) | **DONE — the async-scheduling default is FLIPPED ON (2026-07-17, mirror vLLM); DGX-re-confirmed TOKEN-NEUTRAL.** `VT_ASYNC_RUNNER` now defaults ON (pure `AsyncRunnerFlagIsOn` predicate), so the production engine resolves an `AsyncScheduler` + `max_concurrent_batches=2` (depth-2 `step_with_batch_queue` + async D2H) by default, mirroring `vllm/config/vllm.py:992-1044`; `VT_ASYNC_RUNNER=0` (runner-level) and `VT_ASYNC_SCHED=0` (scheduler-level) are the same-binary rollbacks. The DGX re-confirmation (`dgx:~/work/vllm.cpp-async-flip`, CUTLASS+FA2 hard-verified, one flock) proves the flip changes ZERO tokens — all three async arms bit-identical; on the shipping default **27B 235/235 + 35B 315/315** with the "Asynchronous scheduling is enabled (mcb=2)" log, both rollback arms 235/235+315/315 "disabled". **TTFT means will RISE into vLLM's async envelope BY DESIGN** (+26–31 %, the same depth-2 Little's-law trade vLLM's own async pays for the TPOT/ITL-tail win) — the next binding grid runs async by default and its TTFT readout must NOT be misread as a regression. The whole depth-2 overlap — `AsyncScheduler` placeholder accounting, `step_with_batch_queue`, runner async input-combine + copy-stream sampled-ID D2H, `AsyncOutputPool` persistent buffers, `LoadedEngine` enable-flip — was implemented behind `VT_ASYNC_RUNNER` and is now the default. **The W3 async TTFT-premium discriminator COMPLETED (2026-07-17, `CLAIM-W3-ASYNC-DISC`, [spec](.agents/specs/w3-async-ttft-discriminator-2026-07-16.md), evidence `dgx:~/work/vllm.cpp-w3-discriminator/6ea7856…`):** a one-flock vLLM v0.25.0 self-A/B (async ON vs `--no-async-scheduling`, arm log-confirmed) + ours W3-on/off at c8/c16/c32 proves the +705 ms TTFT premium is **vLLM's own async behavior** — vLLM async-ON vs its own sync costs **+26/+31/+28 % mean TTFT** at **−0.7 to −0.9 % throughput** and −2.6 to −4.3 ms TPOT, and upstream defaults it ON anyway; ours-W3on matches that pattern within noise (no engine-loop/output-timing divergence exists — the earlier "depth-2 needs a throughput lever" framing is retired as mis-calibrated, async has no throughput win upstream either). W3-on **flips both binding ITL-tail anomalies** (c8 p99_itl 0.552→0.897 in-band; c32 p90_itl 0.791→**1.048**, now beating vLLM) and improves every TPOT/ITL mean ratio +2.3–3.3 pp; vs the production bar (vLLM async-ON) ours-W3on mean TTFT is 0.995/1.042/1.103 (equal-or-better at c16/c32). Axis arithmetic: strict-PASS 14→15/54, +3 flips up vs −2 noise-scale c8-TTFT flips ⇒ **W3-ON nets positive as-is**. **The default flip LANDED 2026-07-17** (`ENG-ASYNC-SCHED` DONE, owner `6ea7856`); the DGX re-confirmation of the flip also caught a SEPARATE pre-existing RMSNorm-fast 27B token regression (see the elementwise-norm row below), rolled back to keep the production default token-exact. **ROBUSTNESS FIX (2026-07-20):** the SEPARATE pre-existing `async_scheduler` `num_output_placeholders >= 0` assertion crash on c8 + short-output (noted in the rows above) is FIXED — the runner was missing vLLM's `discard_request_mask`, so it emitted a sampled token for prefill-CHUNK requests, underflowing the async placeholder count under chunked-prefill + preemption. The fix mirrors vLLM (runner clears sampled tokens for still-prefilling requests; the async scheduler is unchanged); byte-identical on the non-chunked gates (27B 235/235 + 35B 315/315), and `vllm-bench` c8 + short-output + chunked-prefill + KV-pressure with async ON now completes cleanly (memcheck 0). |
-| Serving transport (TCP_NODELAY) | **DONE; measured NEUTRAL on the gate workload** (`SERVE-HTTP-TRANSPORT`). We mirror vLLM's uvicorn/asyncio default (`set_tcp_nodelay(true)`), pinned by a behavioral accepted-socket test (RED 0 → GREEN 1, 22/22). The non-binding localhost A/B sizing is neutral within noise at c1/c2 — µs loopback ACKs mean Nagle never held our ~100 ms-cadence token frames — so the mirror stays for real-network parity; the decode-gap attribution completed 2026-07-16 (c2 gap is GPU-busy kernel glue, not transport) |
-| Host-memory repair | **BINDING PASS for the established 27B windowed-release gate**: `LOAD-SAFETENSORS` progressive `madvise(MADV_DONTNEED)` remains in the `246a23c` binding binary (ours peak PSS 24.88 GB vs vLLM 28.18 GB), and the 35B routed-expert steady mirror/load interleave remains implemented. The additive plain-BF16 direct-device leaf (`LOAD-SAFETENSORS-DIRECT-DENSE`, [spike](.agents/specs/qwen35-plain-bf16-direct-load.md)) is **`GATING` after the corrected local Triton-AOT 4B run**. Root `/tmp/qwen35-transplant-4b-aot-557ab41d` completed all 18 guarded legs: direct ON/OFF/local-vLLM-0.24 total **6155.10/6064.06/6730.46 tok/s**, output **680.61/670.54/744.24**, peak PSS **2.405/8.571/7.569 GiB**, stable PSS **0.733/8.571/4.066 GiB**, and peak VRAM **12892/12884/12942.7 MiB**. ON=OFF output IDs **128/128 in every pair**; ON is **+1.50%** total and cuts peak/stable PSS **71.9%/91.4%**. Against the prior matching-AOT 4B result, current ON is **0.9316x** (**6155.10 vs 6607.04, −6.84%**); it is **0.9145x** local vLLM. The graph-node audit proves generated AOT GDN chunk kernels ran; the 27B-only packed-decode cubin is correctly ineligible for this 4B shape. **The 27B/35B/Coder regressions are now RUN and GREEN** on the PR rebased onto `a63c497` (2026-07-21, dgx, clean `-Werror` rebuild, FINAL binary): 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6**, plus the bf16/NVFP4 grouped-MoE and MoE-forward suites, with `compute-sanitizer memcheck` **0 errors** on the 27B engine path; `test_cuda_backend` shows GB10 reports `pageable=1 integrated=1`, so the discrete-Blackwell memory-classification fix is behavior-NEUTRAL here. A same-arch (`121a`) interleaved A/B of `origin/main` vs the rebased head on the 27B is neutral on every axis (output throughput **0.9995×**, median TPOT +0.03%, median TTFT −0.14%, all inside ±0.15%), so **the −6.84% is not a code regression against main**; the CMake arch suffix is independently confirmed a first-order lever (it gates fp4-MMA, CUTLASS NVFP4, Marlin MoE, FlashAttention-2 and the vendored Triton-AOT tree — FA2 alone measures +3.9% throughput / −36.4% TTFT on the 27B). Still open, and only reachable on the sm_120 box with the 4B checkpoint: the current-v0.25 4B correctness oracle, strict ON<=OFF VRAM (+8 MiB), and the same-source `120`-vs-`120a` A/B that would actually close the −6.84% attribution. No support extrapolation to 27B/35B from any 4B result |
-| Block-table host-cluster cleanup ([rescan](.agents/specs/rescan-lost-lanes-2026-07-16.md) §1,§5,§6) | Mechanical 1:1 CPU-side mirrors, **bit-identical** (per-step host waste removed; perf is measured by the pending c2/c8 probe + the authorized exact grid, NOT credited here): **(c) LANDED** — `block_table.compute_slot_mapping` no longer writes the dead tail-pad (fill bounded to `[0,num_tokens)`; the decode graph / consumer owns padding); **(d) LANDED** — the decode-graph capture-size set is now DERIVED from `max_num_seqs` (`decode_graph_sizes.h`, mirrors vLLM `_set_cudagraph_sizes`): `max_num_seqs=32` → `{1,2,4,8,16,24,32}` (adds the missing 24 bucket, drops the never-reachable 64; batches 17–24 stop over-padding to 32); CUDA-only, padding rows inert (token-exact); **(e) LANDED** — `InputBatch::make_sampling_metadata` now caches and rebuilds only on a batch change (add/remove/condense/swap), mirroring vLLM `refresh_metadata` (penalty-active path still rebuilds every step for output-token freshness — the greedy gate gets the full win bit-identically); `SchedulerOutput` `std::move`s the `num_scheduled_tokens` map + `finished_req_ids` set instead of copying (container plumbing, zero policy change). Items (a)-runner (full-width gather / positions / zero-copy views) and (b) (GDN col-0 gather) live in `runner.cpp` (owned by the async/GDN claims) — reported for those owners, not touched here. Landed `8a717b2`/`81afc36`/`0c4b41c` (merged `e027ad5`), clean `-Werror` rebuild; **DGX token-exactness gate PASSED** on the `e027ad5` build (27B default 235/235, `VT_GDN_PACKED_DECODE=0` rollback 235/235, 35B 315/315, one `flock` series) — CLOSED, claim released; `benchmark_binding=false`, no speed credit (payoff via the c2/c8 probe + next exact grid) |
+There is no front-page race clip yet; when one is produced it will follow the LocalAI house style (side-by-side, identical output, honest measured ratios). Until then the numbers above and in [docs/BENCHMARKS.md](docs/BENCHMARKS.md) are the reference.
 
-## What is implemented
+## Build
 
-The implemented subset is intentionally narrower than vLLM's full feature
-surface.
-
-| Area | Implemented scope |
-|---|---|
-| Engine | V1 scheduler, unified token budget, chunked prefill, FCFS preemption, persistent input batch, engine step loop, and batched generation |
-| KV cache | Block-paged full-attention KV, hybrid full-attention + GDN state groups, prefix-cache manager, allocation/recycling, and device-resident gate-model state |
-| Models | Qwen3.6-35B-A3B and Qwen3.6-27B text forwards with GDN, full attention, dense/MoE layers, and paged generation |
-| Loading | Safetensors for both gate models; dense `qwen35` GGUF files load too, via the model registry. **Block-resident (keep-quantized) GGUF loading is now the default on CPU** — a weight in one of the six supported block encodings is never expanded to BF16; everything else (16-bit and 32-bit tensors, unported encodings, GPU builds) still materializes to BF16. See the quantization table |
-| Tokenizer | Two HF `tokenizer.json` families, both byte-exact vs the vLLM oracle: **byte-level BPE** (Qwen/Llama-3/OPT/GPT-2/DeepSeek pre-tokenizer variants) and, new, **SentencePiece BPE** (`Metaspace` pre-tokenizer ▁ + `<0xNN>` byte-fallback vocab — Mistral/Gemma), plus GGUF vocab, added/special-token handling, `TemplateProcessing` BOS/EOS, and incremental detokenization |
-| Sampling | Greedy, temperature, top-k, top-p, min-p, repetition/frequency/presence penalties, allowed-token and bad-word masks, and internal logprob primitives |
-| Serving | Basic `/v1/completions` and `/v1/chat/completions`, non-streaming and incremental SSE, concurrent scheduling, cancellation, usage frames, models/health/version endpoints |
-| Structured output | Bounded JSON schema, JSON object, regex, choice, GBNF, and Hermes-style tool-call subset |
-| Library | Shared/static `libvllm`, stable 17-symbol C ABI, blocking and nonblocking request lifecycles, example CLI, and OpenAI server |
-
-Behavioral CPU tests run under CTest. CUDA correctness, sanitizer, trace, and
-performance evidence is recorded per feature rather than inferred from source.
-
-## Quick start
+vllm.cpp uses CMake (>= 3.24) and a C++20 compiler. The core has no ML dependencies; the OpenAI server uses a vendored header-only HTTP transport (cpp-httplib).
 
 ```sh
-# CPU build. Add -DVLLM_CPP_CUDA=ON on NVIDIA and
-# -DVLLM_CPP_SERVER=ON for the HTTP server.
-cmake -S . -B build -DVLLM_CPP_SERVER=ON
+# CPU build (the correctness / CI reference). The server is ON by default.
+cmake -S . -B build
 cmake --build build -j
 ctest --test-dir build
+```
 
-# GB10 fast-GDN build. Triton-AOT cubins are vendored; Python/Triton is only
-# needed to regenerate them, not to build or run them.
+```sh
+# NVIDIA GB10 build with the vendored fast GDN path.
+# Triton-AOT cubins are vendored: Python/Triton is only needed to regenerate
+# them (VLLM_CPP_TRITON_REGEN), never to build or run them.
 cmake -S . -B build-cuda \
   -DVLLM_CPP_CUDA=ON \
-  -DVLLM_CPP_TRITON=ON \
-  -DVLLM_CPP_SERVER=ON
+  -DVLLM_CPP_TRITON=ON
 cmake --build build-cuda -j
+```
 
-# Serve a supported Qwen text checkpoint.
-./build-cuda/examples/server \
+The example binaries land under `build/examples/`: `vllm-cli`, `server`, `vllm-bench`, and `tokenize`.
+
+### CMake options
+
+Read from [`CMakeLists.txt`](CMakeLists.txt). Defaults shown are the shipped defaults.
+
+| Option | Default | Purpose |
+|---|---|---|
+| `VLLM_CPP_CUDA` | `AUTO` | Build the CUDA backend: `ON`, `OFF`, or `AUTO` (on when a CUDA toolchain is found) |
+| `VLLM_CPP_CUDA_ARCHITECTURES` | `121a` | Target CUDA arch(s): `121a` (GB10), `120a` (consumer Blackwell), `120a;121a` (same-family fat binary), `90a` (Hopper, portable-only). The `a` suffix is required for the native fp4 MMA |
+| `VLLM_CPP_METAL` | `AUTO` | Build the Metal backend: `ON`, `OFF`, or `AUTO` (on for an Apple host with an ObjC++ compiler) |
+| `VLLM_CPP_VULKAN` | `AUTO` (= `OFF`) | Build the Vulkan backend. Opt-in with `-DVLLM_CPP_VULKAN=ON`; headers are vendored and SPIR-V is committed, so no graphics toolchain is needed |
+| `VLLM_CPP_MLX` | `OFF` | Build the optional MLX GEMM provider for Metal (needs `-DMLX_ROOT=<mlx install>`) |
+| `MLX_ROOT` | (empty) | Root of an MLX install (`include/` + `lib/`) for `VLLM_CPP_MLX` |
+| `VLLM_CPP_SERVER` | `ON` | Build the OpenAI HTTP server (needs `third_party/httplib/httplib.h`; disables itself with a warning if absent) |
+| `VLLM_CPP_TRITON` | `OFF` | Consume the vendored per-arch Triton-AOT GDN cubins (CUDA only; no Python needed) |
+| `VLLM_CPP_TRITON_REGEN` | `OFF` | Maintainer knob: regenerate the AOT cubins with Python + Triton |
+| `VLLM_CPP_CUTLASS_DIR` | `third_party/cutlass` | CUTLASS source root (>= 4.5.0) for the sm120a NVFP4 GEMM |
+| `VLLM_CPP_CUTLASS_FETCH` | `OFF` | FetchContent CUTLASS 4.5.0 if not found locally |
+| `VLLM_CPP_MARLIN` | `ON` | Build the vendored Marlin NVFP4 W4A16 MoE GEMM (sm_12xa) |
+| `VLLM_CPP_BUILD_TESTS` | `ON` | Compile and register ctest targets |
+| `VLLM_CPP_BUILD_EXAMPLES` | `ON` | Build the example CLI, server, and bench binaries |
+| `VLLM_CPP_BENCH_PROFILE_CONTROL` | `OFF` | Trace-only profiler replay control (never for production timing builds) |
+
+Only GB10 / sm_121a is a runtime-gated CUDA target today. `120a` and `90a` are build-supported (they compile and emit real machine code) but unproven here, and non-Apple / non-NVIDIA backends run a subset of operations. See [Acceleration](#acceleration) and the [backend matrix](.agents/backend-matrix.md).
+
+## Running inference (CLI)
+
+`vllm-cli` runs a one-shot completion through the C ABI. Source: [`examples/cli/main.cpp`](examples/cli/main.cpp).
+
+```sh
+build/examples/vllm-cli \
+  --model /path/to/Qwen3.6-27B \
+  --prompt "The capital of France is" \
+  --max-tokens 64
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--model <dir>` | (required) | Model directory (config.json + tokenizer.json + safetensors) |
+| `--prompt "<text>"` | (required) | Prompt text |
+| `--tokenizer-config <path>` | (none) | Override `tokenizer_config.json` |
+| `--max-tokens N` | `16` | Max tokens to generate |
+| `--temperature T` | `0.0` | Sampling temperature (`<= 0` means greedy) |
+| `--top-p P` | `1.0` | Nucleus cutoff |
+| `--top-k K` | `0` | Top-k (`0` means all) |
+| `--seed S` | (unset) | RNG seed (enables seeded sampling) |
+| `--stream` | off | Stream token deltas to stdout |
+| `-h`, `--help` | | Print usage and exit |
+
+A throughput/latency harness, `vllm-bench` ([`examples/bench/main.cpp`](examples/bench/main.cpp)), takes `--model`, `--dataset-path`, `--num-prompts`, `--input-len`, `--output-len`, `--concurrency`, `--max-num-batched-tokens`, and `--num-blocks`. A tokenizer smoke tool, `tokenize` ([`examples/tokenize/main.cpp`](examples/tokenize/main.cpp)), takes `<tokenizer.json | model.gguf> <corpus.txt>`.
+
+## OpenAI-compatible server
+
+`server` is a small HTTP server speaking the OpenAI API, so any OpenAI client works by pointing its `base_url` at it. Source: [`examples/server/main.cpp`](examples/server/main.cpp) and [`src/vllm/entrypoints/openai/`](src/vllm/entrypoints/openai/).
+
+```sh
+build/examples/server \
   --model /path/to/Qwen3.6-35B-A3B \
   --port 8000 \
   --max-num-seqs 32 \
   --max-num-batched-tokens 8192
-
-# One-shot completion through the C ABI.
-./build-cuda/examples/vllm-cli \
-  --model /path/to/model \
-  --prompt "The capital of France is"
 ```
 
-Link `libvllm` or load it dynamically and use `include/vllm.h`.
-`vllm_complete` / `vllm_complete_stream` provide blocking calls;
-`vllm_request_submit` and the request lifecycle functions provide nonblocking
-concurrent streams.
+```sh
+curl http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen3.6-35B-A3B", "prompt": "The capital of France is", "max_tokens": 64}'
+```
 
-## Supported model architectures
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+print(client.completions.create(model="Qwen3.6-35B-A3B",
+                                prompt="The capital of France is",
+                                max_tokens=64).choices[0].text)
+```
 
-| Architecture | Families | Safetensors | GGUF | Status |
-|---|---|:---:|:---:|---|
-| Qwen3.5/3.6 hybrid text | Qwen3.6-35B-A3B, Qwen3.6-27B | ✅ | 35B only | 🟡 Token-exact correctness passes on GB10; 27B performance is `GATING` at 49/124 axes (new binding `246a23c`); vision paths are not implemented |
-| Qwen3 / Qwen2 dense | Qwen3-32B, Qwen3-0.6B, … | 🚧 | — | 🚧 **First additive-model bring-up — correctness complete; SPEED at c1 effective-parity, c8 decode residual (2026-07-21)** ([spike](.agents/specs/first-additive-model-qwen3-dense.md)). **SPEED CORRECTION 2026-07-21 (same-session, matching-recipe binding, `Qwen3-4B` vs vLLM 0.25.0 production, in1024/out128 ignore-eos closed-loop):** the earlier "TTFT 2.27×/5.85×" and "c8 ITL 4.3×" were BAD-DENOMINATOR / num-prompts artifacts — a fresh same-session vLLM capture gives c1 TTFT ~152 ms & c8 ITL P99 ~130 ms, and **ours BEATS vLLM on TTFT at both concurrencies** (c1 0.90×, c8 0.38×) and ties c1 ITL (0.996×). **c1 = effective every-axis parity** (tput 0.98×, TPOT 1.01×, TTFT+ITL wins). **c8 residual = decode throughput/latency** (tput 0.93×, TPOT 1.10×, ITL P99 1.12×): the c8 decode step is 93% GPU-busy/compute-bound, dominated by small-M=8 `cutlass_80_wmma` projection GEMMs. The **qkv-merge** (single QKVParallelLinear GEMM + new `QkvSplit` op, mirroring vLLM) was implemented + measured NEUTRAL (doesn't cut decode FLOPs) → ships default-OFF (`VT_QWEN3_QKV_MERGE=1` opts in). **cutlass verification RESOLVED:** 27B `test_qwen27_paged_engine` on the flashinfer-cutlass build = 235/235 (the "flashinfer ⇒ 234/235" claim was a build artifact). Stays `ACTIVE` (c8 decode residual). See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) + [bench-evidence/qwen3-4b-binding-20260721.log](docs/bench-evidence/qwen3-4b-binding-20260721.log). Prior W0-W4 history: `Qwen3ForCausalLM` on `Qwen3-0.6B` (BF16). W0 = new registry TU (`qwen3_dense.cpp` + `qwen3.h`, one `REGISTER_VLLM_MODEL`, full-attention-only KV spec) resolves via the clean model-factory seam (zero shared-array edit). W1 = the **runner is now model-shape-agnostic**: a full-attention-only (empty `layer_types`, no GDN group) KV config allocates + steps without the hybrid GDN path — behaviour-preserving (27B 235/235 + 35B 315/315 token-exact UNCHANGED). W2 = the **weight loader** (`qwen3_weights.cpp`, new file): Qwen3-0.6B safetensors → `Qwen3DenseWeights` with merged qkv/gate_up (vLLM `packed_modules_mapping`), per-head q/k norm, and **tied `lm_head`** (aliases `embed_tokens`; the checkpoint's `lm_head.weight` is skipped, mirroring vLLM `skip_prefixes`). Shared BF16 loader helpers extracted to `dense_weight_loaders.h` (behaviour-preserving: 27B load byte-identical). W3 = the **dense forward** (`qwen3.cpp`, new file): embed → 28 layers (std add+RMSNorm, per-head q/k norm + RoPE, causal paged attention, SwiGLU MLP) → final norm → tied lm_head, composed from vt:: ops + 2 new byte-exact fusion recipes (non-gemma add-RMSNorm + non-gated qk-norm-rope), bf16 numerics mirroring vLLM. Two genuine latent bugs the first pure-dense bf16 model exposed were fixed: the classic Qwen2/Qwen3 tokenizer pre-tokenizer (`kQwen2Classic`) and a WMMA prefill kernel that mistokenized at head_dim≠256. **W4 CORRECTNESS COMPLETE 2026-07-20 — near-tie-robust gate PASSES on both 0.6B and a bigger 4B.** The earlier "vLLM greedy is non-deterministic" belief was a BATCHING artifact: PER-PROMPT (batch=1, the gate's single-request regime) vLLM 0.25.0 greedy is DETERMINISTIC (0.6B 0-multi over K=10, 4B 0-multi over K=5). Forward correctness is PROVEN by teacher-forcing vLLM on our exact prefix: at all-but-2 positions vLLM's own argmax given our prefix IS our token (gap 0.0000, bit-identical logprobs); the residual are bf16 near-ties (0.6B ≤0.125 nats, 4B ≤0.25) where vLLM's own one-shot prefill argmax disagrees with its incremental decode (vLLM contradicts itself — no forward bug). Gate: our token within 0.5 nats of vLLM's teacher-forced argmax (strict where equal). **Qwen3-0.6B 16/16** (strict 12/16 + near-tie 4/16). **Qwen3-4B (BF16, 36 layers, GQA 32/8, hidden 2560 — a DIFFERENT config, same forward code) 16/16** — the bigger-model complete-correctness proof (strict 10/16 + near-tie 6/16). Regression 27B 235/235 + 35B 315/315 UNCHANGED, CUDA -Werror clean, memcheck 0. Correctness-complete. **SPEED benchmark vs vLLM 0.25.0 production (2026-07-20, `Qwen3-4B`, in1024/out128, graphed denominator) — the dominant PREFILL lever is now IMPLEMENTED but Qwen3-4B is still below vLLM → stays ACTIVE (NOT DONE):** a **d128 FlashAttention-2 varlen prefill** (vLLM runs Qwen3 prefill on the same `flash_attn_varlen_func` family; generalized the vendored FA2 launcher to head_dim 128, `VT_FA2_PREFILL_QWEN3` default-ON) plus flipping the **FA2 varlen d128 decode default ON** (`VT_FA2_DECODE_QWEN3`, near-tie gate re-passes 16/16 on 0.6B + 4B) closes most of the gap: total throughput **0.90× (c1) / 0.62× (c8)** (up from 0.80×/0.48×), and c1 decode reaches parity (TPOT 1.04×, **ITL P99 0.98× — win**). The prefill kernel alone is +7%/+41% total tput and −55%/−48% TTFT (same-binary A/B). Still failing: **TTFT median 5.85×/10.2×** and total tput <1×, because the full prefill STEP (not the attention kernel, which now matches vLLM's FA2) is ~6× vLLM — non-attention prefill glue (GEMM/MLP fusion) + host-side per-kernel launch overhead (un-graphed prefill); plus c8 decode batch efficiency (TPOT 1.38×). Named residual levers: (1) portable prefill-step fusion + graphed prefill (dominant); (2) c8 split-KV decode occupancy. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md). **Strict-decode razor (2026-07-20, investigation):** an attempt to tighten the near-tie band to strict 16/16 by routing d128 decode through the vendored FA2 group-swap split-KV kernel measured WORSE (0.6B 12→11/16, 4B 10→9/16) and was reverted — vLLM runs FA2 *varlen* (fa_version 2 on sm_121), not the group-swap kvcache path; the real bit-match target is an FA2 varlen d128 decode. **That FA2 varlen d128 decode is now vendored + measured (2026-07-20, [spec](.agents/specs/qwen3-decode-strict-bitmatch.md)):** the exact vLLM varlen kernel BIT-MATCHES vLLM's decode attention output (teacher-forced logit gap 0.0000 nats away from the near-ties) but STRICT 16/16 is bf16-tie-bounded and NOT reached — it scores 0.6B 11/16 & 4B 9/16, one fewer than the CUDA-core fallback (12/16 & 10/16), because the residual ≤0.375-nat ties are ones vLLM itself resolves inconsistently between prefill argmax and incremental decode. Now shipped **default-ON** (`VT_FA2_DECODE_QWEN3`, d128-scoped so the d256 arms are untouched) as the production Qwen3-dense decode after the near-tie-robust gate re-passed 16/16 on 0.6B + 4B with FA2 prefill+decode ON (max teacher-forced gap 0.125 nats); strict-16/16 stays bf16-tie-bounded and the near-tie-robust gate remains the closure. **TTFT levers 2026-07-20 (base `812a57a`), measure-first:** the pooled `DevicePool` was extracted to a shared header (`device_pool.h`; dense forward + gate models both use it) — byte-identical, but a clean same-binary A/B DISPROVED the "~44% GPU-idle from cudaMalloc/cudaFree" premise (PERF-NEUTRAL; the async scheduler overlaps the alloc syncs). A **RoPE cos/sin cache** (route the bf16 preamble to `RopeFromCache` off the per-step cache instead of `RopeNeox`'s per-element fp64 pow/cos/sin, ~36.5% of prefill GPU-busy; bf16 cache == vLLM's `RotaryEmbedding`) IS the dominant dense-TTFT lever — same-binary A/B cuts `Qwen3-4B` median TTFT **c1 209→135 ms (−35%) / c8 316→144 ms (−54%)** (at/beyond vLLM median TTFT under this recipe). Shipped **DEFAULT-ON** (`VT_QWEN3_ROPE_CACHE=0` opts back to `RopeNeox`) after the opt-in blocker was GROUNDED AND DISPROVEN (2026-07-20): the alleged "1-ULP shift lands on an FA2-split-KV-combine run-to-run NONDETERMINISM → flaky gate" does NOT reproduce — the paged engine is byte-DETERMINISTIC run-to-run (RoPE-off gate 4/4 + RoPE-on dumps md5-identical 3/3 + gate 16/16 identical K=5), and for the short gate contexts `num_splits==1` so the split-KV combine kernel is never launched at all. The 1-ULP FMA shift is real but deterministic; it moves two genuine bf16 near-tie tokens, resolved by regenerating the near-tie goldens on the canonical `cutlass-4.5.0` build. Gate re-passes **16/16** on both sizes (0.6B max teacher-forced gap 0.0 nats, 4B 0.25 nats, 0 forward-divergent). Isolated from 27B/35B (`RopeCacheEnabled` lives only in the Qwen3-dense TU): 27B **235/235** + 35B **315/315** UNCHANGED. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md). 27B 235/235 + 35B 315/315 UNCHANGED, `-Werror` 0-warn, memcheck 0 |
-| MLA / DeepSeek family | DeepSeek-V2/V3/V3.2, Kimi-Linear, Kimi-K2.5 | BF16 (DeepSeek-V2-Lite) | — | 🟡 **CORRECT, FASTER, still NOT AT vLLM SPEED — and the rest of the family is now recorded as BLOCKED, not pending. The campaign plan is COMPLETE (W0-W10). DeepSeek-V2-Lite passes its correctness gate and has its binding speed number (2026-07-22). The row is `ACTIVE`, NOT `DONE`, because we are still behind vLLM on throughput at every concurrency** ([spike](.agents/specs/mla-deepseek-campaign.md), [numbers](docs/BENCHMARKS.md#binding-deepseek-v2-lite-mla-every-axis-grid--mla-campaign-w9)). **W0–W9 of the plan have landed.** Multi-head Latent Attention was a brand-new attention family for this project: instead of storing a key and a value per attention head, MLA stores ONE compressed 576-wide vector per token, which our cache allocator and cache-write kernels could not express at all. That required a new KV-cache description, backend selection for MLA, a cache-write kernel, a decode kernel, a prefill path with a bounded loop for reusing already-cached context, an attention layer with load-time weight folding so decode can read the compressed cache directly, and finally the DeepSeek-V2 model itself (configuration, weight loading, forward pass). Only `DeepseekV2ForCausalLM` is registered: the original `DeepseekForCausalLM` is not an MLA model at all, V3 does not fit this hardware and is stored in a format we do not load, and V3.2 needs a sparse-attention module we do not have — all three are refused by name rather than silently claimed. Two coverage limits are recorded rather than glossed: the query path DeepSeek-V3 and GLM-4.7-Flash use, and DeepSeek's distinctive expert-router behaviour, are both implemented and unit-tested at their real dimensions but unexercised end-to-end, because the one checkpoint that fits this box uses neither. **Hardware verdict: only DeepSeek-V2-Lite (~15.7B, ~29.3 GiB) fits GB10.** DeepSeek-V3/V3.2, Kimi-K2.5, MiniMax-M2 and MiniMax-M3 do not fit 119 GiB of unified memory (two also exceed free disk); Kimi-Linear-48B is marginal. For those we will check configuration, weight mapping on a slice and unit-level agreement at their dimensions, and record the rest as hardware-blocked rather than claiming a gate we cannot run | **Correctness: 8 of 8 prompts pass, and stayed identical after every speed change.** The bar is token-for-token agreement with vLLM 0.25.0 through the full paged engine. Five prompts match vLLM exactly; the other three differ only where vLLM cannot tell the candidates apart from itself — measured, not assumed: feeding vLLM our own text back shows that at 35 of the 36 differing positions vLLM's own most-likely next token is the one we produced, and the remaining case is within a quarter of a nat. Nothing we produced fell outside vLLM's top 20. The gate also proves the engine really drives this path: it checks the compact MLA cache was actually allocated, and runs the prompts concurrently with staggered arrival so the scheduler produces genuinely mixed batches in the exact order MLA silently depends on, plus a cache-reuse case. **Speed: two changes made decode 1.7× to 2.2× faster than before, but vLLM is still ahead.** Profiling the GPU rather than guessing found that the MLA decode kernel was taking 45% of all GPU time while using about 4% of the GPU — it was splitting the work into 2 pieces on a processor with dozens of cores, because the upstream rule that picks the split count only looks at sequence length and assumes many requests are in flight. Sizing the split to actually fill the GPU made that kernel **18× faster** and lifted end-to-end output rate by 70% at one request and 20% at eight. A second change records the decode step as a replayable GPU command list, worth a further ~2% (small here because this model's decode is limited by the GPU, not by the time we spend telling it what to do). Both are on by default and neither moves a single token. Against vLLM we are now at **0.86–0.95× its output rate** (was 0.50×), and our time-to-first-token is now **faster than vLLM at 4 and 8 concurrent requests**, but throughput is short everywhere, so this is an honest miss with a named cause: at one request per batch our dense projections fall back to a vector-matrix routine for a third of GPU time where vLLM uses tensor cores for much of the same work. That is the next thing to fix. One further honest note about the comparison itself: vLLM's own default expert-layer backend for this model **reboots this machine** — five times now, including twice on a freshly restarted box with every mitigation applied — so the comparison uses vLLM's best configuration that actually runs here, which is stated openly and does not flatter us, since we lose to it. Everything else in the tree is unchanged (the 27B, 35B, Qwen3-Coder, Qwen3-dense and OPT gates all re-run identical), the build is clean, and the GPU memory/race/sync tools report nothing. **Blocked-row disposition (W10):** DeepSeek-V3/V3.2 (671B, ~642 GiB), Kimi-K2.5 (~2000 GiB) and MiniMax-M2 (~428 GiB) cannot run end to end on 119 GiB and are recorded as hardware-blocked; V3.2 is blocked a second time by a dependency (its sparse attention has exactly one candidate backend on this GPU and that path dispatches to a dense-only kernel that drops the sparse selection); `DeepseekForCausalLM` is plain multi-head attention, not MLA, and is refused by name. Each blocked row records what can still be checked (configuration resolution, weight mapping on a slice, unit agreement at real dimensions) and what cannot. **Two permanent coverage gaps** — the grouped `noaux_tc` router and the low-rank query path — are unit-gated only, because the one checkpoint that fits uses neither; **GLM-4.7-Flash (31.2B, 58.2 GiB) fits and would close both**, and is the named next vehicle **Robustness fix (2026-07-23):** the SACRED gate now also passes under assertion-enabled builds. An original too-strict internal check let the compressed-cache prefix-reuse lookup pass only for ordinary attention, so any MLA model with prompt-caching on aborted whenever assertions were compiled in (it was silently skipped in the optimized release build every prior gate used). The check now permits the MLA cache exactly as upstream does; DeepSeek-V2 passes 8/8 with assertions live, full-attention models are byte-identical, and a new unit test proves a restored cached MLA prefix yields the identical tokens. |
-| MiniMax M2 / M3 | MiniMax-M2, MiniMax-M3-Sparse | — | — | 🔬 **SPIKED (M2) / INVENTORIED (M3), no implementation.** Determined to be **disjoint from MLA**, correcting an earlier source-scan assumption: M2 is plain dense GQA + MoE with partial RoPE and per-layer sliding window; M3 is GQA plus a learned sparse-attention indexer. Lightning attention is retired upstream. M2 needs the sliding-window track, not the MLA track, and its row is now `BLOCKED` (W10): HW-BLOCKED e2e at ~428 GiB bf16 against 119 GiB, with only configuration resolution and unit parity at its dimensions still gateable |
-| GLM family | GLM-4.7-Flash, GLM-4-9B-0414, GLM-4.5-Air, GLM-5, ChatGLM3 | — | — | 🔬 **SPIKED ONLY — no implementation (2026-07-21)** ([spike](.agents/specs/glm-dsa-latest-deepseek.md)). The family splits three ways. **`Glm4MoeLiteForCausalLM` (GLM-4.7-Flash, 31.2B, 58.2 GiB bf16) FITS GB10** and is upstream a zero-override subclass of DeepSeek-V2's MLA attention, so it lands as a pure addition once the MLA track exists — and it exercises two routing/projection paths the MLA spike could only unit-test. **`Glm4ForCausalLM` and `GlmForCausalLM` (both 9B / 17.5 GiB) also fit**, but need two primitives we have none of: a partial rotary factor (rope only a leading slice of each head) and sandwich norms (extra norms on each sublayer's output before the residual add). **`Glm4MoeForCausalLM` is HW-BLOCKED** — its smallest genuine checkpoint is 205.8 GiB bf16. **`GlmMoeDsaForCausalLM` (GLM-5) is blocked twice over:** 1404 GiB, and it needs sparse attention that does not run on this GPU (see the DeepSeek row). Nothing is implemented. **Updated 2026-07-22 (MLA campaign W10):** the GLM-5 row is now `BLOCKED` (hardware AND dependency), and GLM-4.7-Flash is recorded as the MLA track's named next vehicle — it is the only reachable checkpoint that closes both of that campaign's permanent coverage gaps. The other five GLM rows stay `SPIKE` |
-| DeepSeek V3.2 / V4 (latest) | DeepSeek-V3.2-Exp, DeepSeek-V4-Flash/Pro | — | — | 🔬 **SPIKED ONLY — no implementation (2026-07-21)** ([spike](.agents/specs/glm-dsa-latest-deepseek.md)). **V3.2 = V3 plus DSA** (DeepSeek Sparse Attention): a small extra "indexer" module with its own weights and its own 132-byte-per-token KV cache, whose only job is to pick which past tokens each query attends to. **DSA cannot run on GB10.** For a sparse model vLLM's backend filter removes the Triton MLA backend entirely, leaving one flashinfer sparse backend as the sole option — and that path is non-functional on the flashinfer available here (its sm12x kernel is dense-only and silently discards the top-k selection; vLLM's capability probe checks the wrong symbols, and upstream's only test stubs the probe out). This is a dependency gap to watch, not work we can do. **V4 is a new architecture, not an increment** — a 4-way-expanded residual stream normalized by a 20-iteration Sinkhorn solver every forward, a compressor with recurrent state paged through the KV manager, and hash-routed MoE layers with no learned gate. Its tokenizer, by contrast, is ordinary HF BPE with upstream golden fixtures, so that part is low-risk. Both are HW-BLOCKED end to end at 642 GiB and 148.7 GiB against 119 GiB of memory |
-| Mistral dense | Mistral-7B-v0.3, … | 🚧 | — | 🚧 **`MistralForCausalLM` — W0-W4 LANDED 2026-07-23; correctness COMPLETE (paged-engine token-exact 16/16 vs vLLM 0.25.0), SPEED PENDING** ([spike](.agents/specs/sweep-mistral.md)). The breadth sweep's **fifth model family** and the closest-to-Llama dense arch — vLLM's own `mistral.py` is literally "Mistral adaptation of the LLaMA architecture". Mistral IS the shared Qwen3/Llama dense forward with **no new primitive**: plain RoPE (`rope_theta=1000000`, no rope_scaling), no per-head qk-norm, an **untied lm_head**, and `sliding_window: null` (full attention) — all four already existed (from Llama/Qwen3/OPT), so the whole model is three new files with zero changes to the runner, scheduler, platforms, attention registry, config parser, any CUDA kernel, or any existing model. **Correctness COMPLETE:** the full paged-engine SACRED gate now RUNS and PASSES — unblocked by the new SentencePiece tokenizer (below). `test_mistral_paged_engine` drives the 16-prompt battery through the paged `LLMEngine` and matches the vLLM 0.25.0 per-prompt greedy oracle **16/16** (vLLM ALL-DETERMINISTIC over K=5 ⇒ STRICT bar): 15/16 strict token-exact + 1/16 near-tie-band (prompt[5]@tok10, vLLM's own teacher-forced argmax given our prefix equals our token, gap **0.0000 nats** ≪ 0.5), 0 forward-divergent. Prompt tokenization is byte-exact vs vLLM's own tokenizer (BOS=1). (Earlier W0-W3 also proved the forward tokenizer-free at 30/30.) The W2 loader was validated on the real 3-shard checkpoint (1541 assertions). Checkpoint `mistralai/Mistral-7B-v0.3` (SWA-disabled v0.3). **No throughput is measured or claimed** — SPEED is a separate increment, so the row stays `ACTIVE`, not `DONE`. Regressions unchanged each STANDALONE (27B 235/235, 35B 315/315, Qwen3-Coder, Qwen3-dense 16/16, OPT 6/6, Llama 16/16); clean CUDA rebuild `-Werror` 0 warnings; device-reference ratchet (DSR 32) unchanged |
-| OPT (cross-family canary) | OPT-125m, … | 🚧 | — | 🚧 **`OPTForCausalLM` — W0-W4 LANDED 2026-07-21; correctness COMPLETE (STRICT token-exact 6/6), SPEED PENDING** ([spike](.agents/specs/sweep-opt-125m.md)). The breadth sweep's **cross-family additivity canary**: the first model we support that is not a Qwen variant. OPT breaks every shared assumption at once — no RoPE (LEARNED absolute position embeddings, with the fairseq offset of 2), biased q/k/v/out/fc1/fc2 projections, LayerNorm-with-bias instead of RMSNorm, a plain ReLU fc1/fc2 MLP instead of SwiGLU, a `do_layer_norm_before` pre/post-LN switch, and tied embeddings by default. **Correctness: STRICT token-exact, 6/6 prompts / 96/96 tokens** vs the pinned vLLM 0.25.0 oracle. The strict bar is used because it was *measured* to be the right one: vLLM's own greedy is DETERMINISTIC on this model (K=5 runs, 0 multi-valued positions), so unlike the near-tie-gated Qwen rows there is no tolerance band here at all. **Additivity verdict:** the model-layer seams held completely — the whole model landed as 4 new files with zero changes to the runner, scheduler, platforms, attention registry, config parser, any CUDA kernel, or any existing model. What did have to change was one layer down, in two vocabularies that had quietly been Qwen-shaped: the `vt::` op table gained LayerNorm/ReLU/Add (append-only, through the existing op-table extension point), and the tokenizer gained the original GPT-2 byte-level split plus the ability to apply a post-processor's special tokens — the latter had been parsed but never applied, which silently cost every OPT prompt its leading `</s>` and was caught only because the oracle's own tokenization is committed alongside its continuations. **Caveats:** runs bf16 rather than the checkpoint's fp16 (vLLM's `--dtype bfloat16`, since our CUDA path has no fp16 compute); the HF snapshot ships a torch-pickle checkpoint with no `tokenizer.json`, so it is materialized to safetensors by a committed script; the post-LN (OPT-350m) branch is implemented but has no checkpoint to gate it. **No throughput has been measured and none is claimed** — head_dim 64 falls back to the generic paged-attention path (the FA2 fast kernels are d128/d256-only) and there is no decode CUDA graph yet, so the speed bar is a separate increment and the row stays `ACTIVE`, not `DONE`. Regressions all unchanged on the final dgx binary (27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 664 assertions); clean CUDA rebuild `-Werror` 0 warnings; memcheck reports 0 invalid reads/writes/global accesses on the OPT engine path (its 66 leak-check reports are the shared DevicePool's by-design retained scratch, fewer than the 125 the pre-existing Qwen3-dense reports on the same binary) |
-| Llama-3.x dense | Llama-3.2-1B, … | 🚧 | — | 🚧 **`LlamaForCausalLM` — W0-W4 LANDED 2026-07-23; correctness COMPLETE (near-tie-robust token-exact 16/16), SPEED PENDING** ([spike](.agents/specs/sweep-llama-3.2.md)). The breadth sweep's **cross-family DENSE additivity proof** and the roadmap's explicit "Llama-first" increment — the mainstream dense arch. Llama IS the Qwen3-dense forward with exactly two additive deltas: **no per-head q/k RMSNorm** (the shared dense attention block skips it when the norm weights are absent — byte-preserving for Qwen3) and **llama3 RoPE frequency scaling** (`rope_theta=500000` + `rope_scaling` type `llama3`, a piecewise low/high-wavelength rescale of the base inverse frequencies — the one genuinely new primitive, added as opt-in kernel fields that are a no-op for every other model; the formula was verified to 2e-7 relative error against vLLM). Everything else — merged QKV, GQA 32/8, SwiGLU, standard RMSNorm, tied lm_head, the full-attention paged forward — is reused verbatim. **Correctness:** vLLM 0.25.0 greedy was *measured* deterministic on this model (K=6 runs, 0 multi-valued positions), so the bar is STRICT token-exact — **16/16 prompts pass** (12 strict token-exact + 4 in the near-tie band, max teacher-forced gap 0.0000 nats, 0 forward-divergent); at every one of the 13 differing positions vLLM's own most-likely next token given our prefix IS the token we produced. **One correctness-fatal tokenizer bug was found and fixed by this gate:** Llama wraps its BOS-prepending post-processor inside a `Sequence` pipeline, which our parser did not descend into, so the `begin_of_text` (128000) token was silently never prepended and the model scored 1/16 with fluent output — caught only because a CUDA prefill-argmax diagnostic proved the forward itself correct (4/4 first-token argmax vs the oracle given vLLM's exact prompt tokens), isolating the fault to the tokenizer; the fix is byte-preserving for every existing model. **Additivity verdict:** 3 new model files reusing the shared dense forward, zero changes to the runner, scheduler, platforms, attention registry, config parser, or any existing model — the only shared touches are the guarded llama3 rope primitive, the qk-norm-optional attention block, and the one-layer-down tokenizer fix, all byte-preserving. Checkpoint: `unsloth/Llama-3.2-1B` (an ungated mirror of the gated `meta-llama/Llama-3.2-1B` — identical weights). **No throughput is measured or claimed** — head_dim 64 falls to the generic paged-attention path (the FA2 fast kernels are d128/d256-only), so speed is a separate increment (the head_dim-128 Llama-3.2-3B is the vehicle) and the row stays `ACTIVE`, not `DONE`. Regressions all unchanged (27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8); clean CUDA rebuild `-Werror` 0 warnings; memcheck 0 invalid accesses on the Llama engine path; device-reference ratchet (DSR 67) unchanged |
-| MoE decoders | Mixtral, Qwen3-MoE | 🚧 | — | 🚧 **Qwen3-Coder-30B-A3B (`Qwen3MoeForCausalLM`) — W0-W3 LANDED 2026-07-21** ([spike](.agents/specs/sweep-qwen3-coder-30b.md)); the first sweep model, a BF16 full-attention MoE that composes the done dense attention + 35B MoE experts (zero runner change). **W0** = new registry TU (`qwen3_moe_registry.cpp` + `qwen3_moe.h`, one `REGISTER_VLLM_MODEL`, full-attention-only KV spec, `is_dense_model=false`) resolves via the clean model-factory seam. **W1** = three behaviour-preserving refactors making the two done pieces reusable: (#1) the dense self-attention block extracted verbatim to `dense_attn_block.h`, (#2) the bf16 `MoeBlock` exposed cross-TU via `RunMoeBlock` (`qwen3_5_moe_block.h`), (#3) a no-shared-expert guard in `MoeBlock`. **W2** = BF16 loader `qwen3_moe_weights.cpp` (merged qkv/o + per-head q/k norm; NEW bf16 per-expert loader — router + 128 experts × gate/up/down in Matmul-B layout, no shared expert; UNTIED `lm_head` loaded separately, not aliased). **W3** = forward `qwen3_moe.cpp` (`Qwen3MoeModel::Forward/ForwardDevice` = the dense forward body with the per-layer MLP replaced by the MoE block — reused `AttnBlock` + `RunMoeBlock`, no GDN/shared, untied lm_head) wired into the factory. **W4** = the SACRED correctness gate (`test_qwen3coder_paged_engine.cpp`): paged-engine greedy vs the vLLM 0.25.0 oracle. vLLM's own greedy is DETERMINISTIC on Qwen3-Coder (K=5, 0 multi-valued cells), so the STRICT-where-well-posed near-tie-robust gate applies (same ratified methodology as the dense models) — **6/6 prompts PASS** (STRICT token-exact 4/6 + near-tie-band 2/6, max teacher-forced gap 0.125 nats, 0 forward-divergent; the 2 near-tie flips are vLLM's own argmax on our prefix). Gates: load gate all 18867 tensors mapped, forward doctest green (real-checkpoint prefill argmax = 12095 " Paris"); regression UNCHANGED (Qwen3-dense 16/16, 27B 235/235, 35B 315/315), CUDA `-Werror` 0-warn, memcheck 0. **W5 LANDED 2026-07-21** = the fast BF16 grouped-MoE GEMM (`vt::MoeGroupedGemmBf16`, **default ON**) replacing the per-expert host-gather loop with ~3 on-device grouped launches, reusing our NVFP4 grouped-MoE scheduling with the fp4 decode swapped for a direct bf16 read; plus a host-mirror release that stopped the model occupying ~114 GiB of GB10's 119 GiB unified pool. Correctness was RE-VERIFIED after the accumulation-order change and got **stricter** (6/6; STRICT token-exact 4/6 → 5/6; max teacher-forced gap 0.125 → 0.0000 nats). Same-binary A/B: TTFT **3.4×**, TPOT **1.59×**. **W6 LANDED 2026-07-21** = the MoE-GEMM tile/pipeline rework plus deterministic split-K, both **default ON**. The W5 tile's real defect was an uncoalesced `[K,N]` weight stage on a GEMM that is weight-bandwidth bound; the rewrite reads the weight tile k-major (`wmma::matrix_b` row-major) so the global read runs along contiguous N, adds 16-byte vectorized stages, a 3-deep `cp.async` multi-stage pipeline and a wider tile (shape ported from vLLM's Triton `fused_moe_kernel` + `get_default_config`; multistage structure from CUTLASS `mma_multistage.h`). Split-K lifts the block-starved small-batch decode GEMM using a fixed ascending-order partial reduction — explicitly not `atomicAdd`, which would break greedy reproducibility. **The MoE GEMM went 4.50 → 12.15 TFLOP/s (2.7×) and now runs ~1.2× vLLM's Triton `fused_moe` rate.** Correctness is UNCHANGED with zero token movement (the tile preserves the K-reduction order exactly, so it is bit-identical to W5): 6/6, strict 5/6, max gap 0.0000 nats. **SPEED: 12 of 16 binding-grid cells now at or above graphed vLLM — c4 passes every axis, c8 passes 3 of 4** (median TTFT 1.03/0.82/1.05/1.19×, TPOT 0.88/1.01/1.22/1.05×, ITL 0.88/1.03/1.22/1.09×, output throughput 0.77/0.90/1.09/0.99×). Every-axis-at-every-concurrency is **still not met**: the 4 residual cells are `nsys`-attributed to the missing bf16 decode CUDA graph (c1 decode is ~86% GPU-busy, so ~5 ms/step of host tax — not kernel speed) and to the non-MoE prefill glue at c2 (the MoE tile fell from 56% to 17% of GPU time). Note the W5 grid's c2/c4/c8 vLLM numbers were measured against a shared server that replayed prompts into vLLM's prefix cache; W6 re-measures with a fresh server per concurrency at a verified 0.0% hit rate (see [BENCHMARKS](docs/BENCHMARKS.md)). **W7 LANDED 2026-07-21** = the **bf16 decode CUDA graph** — the largest named lever from W6. Qwen3-Coder now gets the same capture-once/replay-per-step decode graph the 27B and 35B already had (that one was fp4-gated, so a bf16 model never got it), built as a third sibling of the same driver and ported from vLLM's `gpu_model_runner` capture/replay plus its pad-to-nearest-captured-size dispatch. Because Qwen3-Coder is pure full attention there is no GDN state to pad or gate, so every captured batch size is usable. Capturing this path for the first time exposed a genuine latent bug in shared attention glue: the RoPE row-index was uploaded from a stack-local buffer, which is fine eagerly but under capture bakes a dead stack address that every replay re-reads — it produced one wrong token and is now served from a process-persistent table. **Measured: decode went from ~86% to ~92% GPU-busy (host tax ~5 -> ~2.7 ms/step), median TPOT 36.22 -> 34.13 ms**, with **zero token movement** (a CUDA graph replays the same kernels in the same order, so bit-identity is the expectation and the measurement): 6/6, strict 5/6, max gap 0.0000 nats. **SPEED: 11 of 16 binding-grid cells at or above graphed vLLM, and c4 and c8 now pass every axis** (median TTFT 1.02/0.91/1.05/1.17x, TPOT 0.93/1.12/1.27/1.08x, ITL 0.93/1.10/1.28/1.14x, output throughput 0.84/0.96/1.11/1.03x). Every-axis-at-every-concurrency is **still not met**: the 5 residual cells sit at c1 (TPOT/ITL/output throughput) and c2 (TTFT/output throughput). The c1 residual is now attributed to engine-side per-step **host** bookkeeping — vLLM's entire 31.75 ms decode step costs about what our kernels alone cost (~31.5 ms), so c1 needs no kernel work — and the tempting CUDA-API explanation was profiled and **refuted** (stream-sync median 4.5 us). c2 is prefill-bound and untouched by a decode lever. **CORRECTNESS-DONE, SPEED ACTIVE.** Each sweep model is held to the Qwen3 bar (near-tie-robust token-exact + vLLM-speed on every axis) |
+Endpoints (registered in [`src/vllm/entrypoints/openai/api_server.cpp`](src/vllm/entrypoints/openai/api_server.cpp)):
 
-**Breadth sweep — ACTIVE (2026-07-21).** With the first additive model (Qwen3 dense) validated
-end-to-end, the active priority is adding more model architectures (recent-first), each held to the
-same bar: token-exact vs vLLM (near-tie-robust where vLLM's own greedy is self-inconsistent) AND
-vLLM-speed on every axis. Ranked queue + the CUDA-arch additivity audit:
-[`.agents/specs/breadth-sweep-plan.md`](.agents/specs/breadth-sweep-plan.md). Note: adding a new
-CUDA *arch* beyond the same-family sm_120 is HW-blocked (only GB10 sm_121 is testable here), so the
-actionable sweep is model breadth on GB10. **The Metal track now runs its SECOND model: Qwen3-dense
-(Qwen3-0.6B) generates on the Apple GPU and its forward is CONFIRMED CORRECT against the vLLM oracle**
-(2026-07-23, [state](.agents/state.md)). The honest bar here is subtle and worth stating plainly:
-Qwen3-0.6B is a *near-tie model* — at a handful of positions its top two tokens are separated by only
-thousandths of a nat, and which one wins depends on the exact numerical path, so a correct backend can
-legitimately pick either. (The same flip happens on NVIDIA: our production CUDA build says " France",
-a portable-kernel CUDA build and Apple both say " Italy" — and vLLM itself, asked to score the Apple
-prefix, agrees " Italy" is its own top choice there.) So the Apple gate is not strict token-for-token
-equality — that would be ill-posed on this model — but a *near-tie-robust* check backed by the oracle:
-every token Apple produces must sit within half a nat of vLLM's own most-likely token given Apple's
-own prefix, which we measured by having vLLM 0.25.0 score Apple's exact output. All sixty divergent
-positions pass, the worst just an eighth of a nat, and the gate is proven to bite (perturbing any token
-fails it). OPT-125m, the first Metal model, IS strict token-exact 6/6 (2026-07-22,
-[study §12](.agents/specs/metal-mlx-reuse-study.md)) because OPT has no such ties. The definitive
-strict-token-exact Apple proof wants a bigger *deterministic* dense model (Qwen3-4B) — not present on
-this Mac — and is deferred. Attention, the KV cache, rotary position encoding and greedy sampling now
-exist on Apple GPU (eighteen operations of seventy-five). **AND the first ours-vs-MLX benchmark exists** — on the SAME small Qwen3 model (1.7B),
-same box, same workload: **ours is a knowingly-unoptimised FLOOR, about 6–11× slower on decode and
-7–10× on time-to-first-token than MLX, at roughly twice the memory**, because our Metal path still
-uses one command buffer per operation and a naive matrix-multiply with none of MLX's tiled GPU
-kernels — the honest starting point, not our best, with the specific speed levers named. That
-number is **indicative, not binding**: the Mac could not be made quiet enough (a background service
-needs a password we do not have), and correctness and speed are separate bars of which only
-correctness is met.
-Most models still cannot run there (quantization, mixture-of-experts and rotary position
-encoding are all still missing), and the backend now says so explicitly rather than failing
-deep inside a GPU program. Matrix multiply arrived 2026-07-22 in two interchangeable forms — ours (the default)
-and an optional one delegating to Apple's MLX — as the first users of a new **provider
-mechanism** that lets several implementations of one operation coexist on one device and be
-switched between without a rebuild, replacing a single-slot table whose winner depended on
-program start-up order. The same work fixed a real defect that had silently disabled
-**every** self-registering component on macOS, including the CPU backend. **The Vulkan track
-has now started too, to the same shape and standard**: eight operations plus the fusion
-catalogue run on the GB10 GPU and are checked against both our CPU and our own CUDA results
-in the same program, its GPU programs ship pre-compiled so no graphics toolchain is needed to
-build, and it also runs on a software GPU with no graphics hardware at all. Again **no model
-runs on it and no speed is claimed**, and it is off unless explicitly requested. Intel XPU is
-spiked but hardware-blocked. From now on the Apple backend must also match or beat **MLX** on
-the same model — see Acceleration below. The audit's four
-CUDA-arch seam-gaps are now CLOSED as mechanism (see Acceleration below,
-[spike](.agents/specs/cuda-arch-additivity.md)) — expansion is additive, but validation of any
-non-sm_121 target remains hardware-blocked.
-
-**MLA / DeepSeek campaign — the plan is COMPLETE (W0-W10, 2026-07-22). DeepSeek-V2-Lite is CORRECT
-and is STILL BEHIND vLLM on throughput; every other family member is now recorded as blocked rather
-than pending.** The breadth sweep's Tier-3 "MLA = new attention, new campaign" item has its leaf spike
-([`.agents/specs/mla-deepseek-campaign.md`](.agents/specs/mla-deepseek-campaign.md)); the whole plan is
-in the tree, with a binding speed number
-([numbers](docs/BENCHMARKS.md#binding-deepseek-v2-lite-mla-every-axis-grid--mla-campaign-w9)).
-
-*What was hard.* Multi-head Latent Attention does not store a key and a value per attention head. It
-stores ONE compressed 576-number vector per token, with a single shared head and no separate value at
-all — something our cache allocator (which hardcoded a factor of two for key-plus-value) and our
-cache-write and attention kernels could not express in any form. Closing that meant a new way to
-describe a KV cache, MLA backend selection, a cache-write kernel, a decode kernel, a prefill path with
-a bounded loop for reusing already-cached context, an attention layer with load-time weight folding so
-decode reads the compressed cache directly instead of expanding it, DeepSeek's expert-router variant,
-and finally the DeepSeek-V2 model itself.
-
-*Correctness — the gate this project holds every model to.* Token-for-token agreement with vLLM
-0.25.0 over a fixed prompt set, driven through the full paged engine: **8 of 8 prompts pass**, and the
-result did not move by a single token across either speed change. Five match vLLM exactly. The other
-three differ only where vLLM cannot separate the candidates from itself, which was measured rather
-than assumed — feeding vLLM our own generated text back shows that at 35 of the 36 differing positions
-vLLM's own most-likely next token is the one we produced, and the one remaining case sits within a
-quarter of a nat; nothing we produced fell outside vLLM's top 20. The gate also proves the engine
-really drives this path: it checks that the compact MLA cache was actually allocated, and it runs the
-prompts concurrently with staggered arrival so the scheduler produces genuinely mixed batches in the
-exact order MLA silently depends on, plus a cache-reuse case.
-
-*Speed — a large win, and an honest shortfall.* Rather than guessing, we profiled what the GPU
-actually ran. The MLA decode kernel was consuming **45% of all GPU time while using about 4% of the
-GPU**: it split the work in two on a processor with dozens of independent cores, because the upstream
-rule that chooses the split count looks only at sequence length and quietly assumes many requests are
-in flight. Sizing the split to fill the machine — upstream's own stated occupancy target, simply
-applied — made that kernel **18x faster**. With a replayable decode command list (a further ~2%; small
-here because this decode is limited by the GPU, not by issuing work), end-to-end output rate rose
-**70% at one request and 20% at eight**. Both are on by default. Against vLLM we now reach
-**0.86-0.95x its output rate** (it was 0.50x) and our time-to-first-token is **faster than vLLM at 4
-and 8 concurrent requests**, but throughput is short at every concurrency, so this is a miss with a
-named cause: at small batch our dense projections fall back to a vector-matrix routine for roughly a
-third of GPU time where vLLM puts much of the same work on tensor cores. That is the next thing to
-fix, and it is a routing change rather than a new kernel. One thing worth stating plainly about the
-comparison: vLLM's own default expert-layer backend for this model **hard-reboots this machine** —
-five times now, including on a freshly restarted box with every mitigation applied — so the comparison
-uses vLLM's best configuration that actually runs here. That substitution does not flatter us: we lose
-to it.
-
-*Blocked, not pending — the honest disposition of the rest of the family.* Only
-`DeepseekV2ForCausalLM` is registered, and everything else is now recorded as what it actually is
-rather than as work in progress. DeepSeek-V3 and V3.2 (671B, ~642 GiB even in their native format),
-Kimi-K2.5 (~2000 GiB), MiniMax-M2 (~428 GiB) and GLM-5 (1404 GiB) **cannot run end to end on this
-119 GiB machine, now or after any amount of software work.** V3.2 and GLM-5 are blocked a second time
-over by a dependency: their sparse attention leaves exactly one candidate backend on this GPU, and
-that path is non-functional — it dispatches to a dense-only kernel that silently drops the sparse
-selection, and upstream's only test of it stubs the capability check out. `DeepseekForCausalLM` is not
-an MLA model at all (it is plain multi-head attention) and is refused by name rather than parked in an
-MLA row. For every blocked row we record what can still be checked — configuration resolution, weight
-mapping on a single-layer slice, unit-level agreement at the real dimensions — and what cannot.
-
-*Two permanent coverage gaps, and the checkpoint that would close them.* DeepSeek's distinctive
-grouped expert router and the low-rank query path that V3 and GLM use are both implemented and
-unit-tested at their real dimensions, but neither has any end-to-end coverage, because the one
-checkpoint that fits this box uses neither. That is not closable by porting harder — it needs a
-different model. **GLM-4.7-Flash (31.2B, 58.2 GiB) fits this hardware and would close both**, and
-upstream it is a zero-override subclass of DeepSeek-V2's attention, so it is recorded as the named
-next vehicle for this track.
-
-## Acceleration
-
-| Backend | Hardware | Status |
+| Method | Path | Purpose |
 |---|---|---|
-| CPU | x86-64 and arm64 reference | 🟢 Correctness/CI reference with a native threadpool; **on the GGUF benchmark file CPU is now at OR AHEAD of llama.cpp on EVERY axis — prefill 1.18× ahead, decode at parity, AND peak memory at parity (1.01×, down from 1.39×). The CPU gaps are fully closed.** **Compute-in-quant is LIVE and default-on**: a GGUF weight in six block encodings (Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K) stays compressed from file to matrix multiply (no 16-bit expansion) and the multiply runs directly on the blocks (`VT_GGUF_KEEP_QUANT=0` off, `VT_CPU_REF=1` restores the reference path). The ordinary 16-bit multiply is vectorized (16 accumulator chains, per-arch NEON / SSE2·F16C), the linear-attention recurrence and paged attention are threaded, the Q8_0 quant multiply takes an Arm **i8mm** tier and — the last prefill lever, 2026-07-23 — is **repacked once at load into the i8mm interleave** (ported from llama.cpp's repack-at-load): the compressed multiply runs **3.7–5.9× faster** at prefill shapes and whole-model **prefill goes 1.92× faster same-binary to 223.8 tokens/s vs llama.cpp's 177.3 — at/beyond parity** (was ~1.3–1.5× behind), **decode at parity** (24.7 vs 25.4 tokens/s). Every one of these is **bit-for-bit identical** to its predecessor (byte-permute + non-fused MAC, memcmp-gated), so the benchmark output tokens are byte-identical (same md5) with each lever on, off, or in reference mode, and the 35B GGUF acceptance gate reproduces llama.cpp token for token on both real files — no stored expected output moved. Peak memory is now **1.01×** llama.cpp (2.83 GiB vs 2.80 — parity, down from 1.39×): the loader reads compressed weights straight out of the memory-mapped file, shares the one tied vocabulary table between embedding and output head, drops finished file pages, and — 2026-07-23 — **keeps the file's 16-bit weights resident as f16 and computes on them natively** (`VT_GGUF_KEEP_F16=0` restores the old bf16 expansion), mirroring llama.cpp. Closing the last ~1 GiB took a precise profile: it is NOT the engine's activation/KV working memory (the pooled scratch measured 20 MiB and the whole KV cache 115 MiB, both already at or below llama.cpp), and it is NOT a bf16 expansion. It was a **double-count of the Q8_0 weights on Arm**: the i8mm repack copies each Q8_0 weight into a new buffer, and because the resident f16 weights hold the memory-mapped file open, the now-dead original Q8_0 pages stayed resident too. Releasing those dead source pages (the same read-once page-drop, ported from llama.cpp's `unmap_fragment`) removes the duplicate ~1 GiB, and prefaulting the resident weights at load (ported from llama.cpp's mmap prefetch) keeps the first prefill off the fault path — so keeping f16 resident is now the **default**, byte-identical greedy tokens (native-f16 compute rounds closer to the file's values), at parity memory and prefill ahead of llama.cpp. Two honest scope limits: plain 16-/32-bit tensors have no block form so they still expand and run the general (now-vectorized) kernel; and this is CPU-only — a GPU build still expands every GGUF weight. Specs: [q8_0 repack-at-load + i8mm tier](.agents/specs/gguf-compute-in-quant-gemm.md), [GDN orientation](.agents/specs/cpu-gdn-proj-orientation-2026-07-23.md), [two-kernel threading](.agents/specs/cpu-thread-gdn-paged-2026-07-23.md), [elementwise GEMM](.agents/specs/cpu-elementwise-gemm.md), [keep-quant loader](.agents/specs/gguf-keep-quant-loader.md), [floor re-measurement](.agents/specs/cpu-llamacpp-floor-remeasure-2026-07-22.md) |
-| CUDA | GB10 / DGX Spark, sm_121a | 🟡 Gate-model correctness passes; 27B v0.25.0 performance is `GATING` at **49/124** (new binding `246a23c`; memory + c1 + TTFT clean, decode c2–c32 open). Packed GDN decode is **CLOSED on equivalence** (`KERNEL-GDN-PACKED-DECODE` `DONE`): the c16 slot defect was fixed test-first (request-identity keying) and proven at `c172336`, and W1D3/G3 closed over eight seals + the 8-pair A/B (−0.205% ± 0.30, <1σ) + a trace showing packed is GPU-cheaper. qkvz DGX gates closed green at `45f9e6d` and ride this binding |
-| NVIDIA sm_120a | Consumer Blackwell — RTX 5070 / 5080 / 5090 class | 🟡 **BUILDS, and is declared a supported build target — but NOT runtime-gated here, because no such card exists on this hardware** (2026-07-22). `-DVLLM_CPP_CUDA_ARCHITECTURES=120a`, and the same-family fat binary `120a;121a`, both configure and compile warning-free, and the resulting archive genuinely contains sm_120a machine code (38 translation units carry it, the FP4 tensor-core kernel among them). All five architecture-gated capabilities (FP4 MMA, CUTLASS NVFP4, CUTLASS FP8, Marlin NVFP4, FlashAttention-2) resolve for it exactly as they do for GB10, and the runtime paths key on the Blackwell family rather than on GB10 specifically. **What is not proven: any of it actually executing.** A green build is not a support claim. One external contributor result exists on a real RTX 5070 Ti (the discrete-vs-unified memory classification), and the steps a card owner would follow to validate the rest are written down in the [arch-additivity spec](.agents/specs/cuda-arch-additivity.md). One caveat: the pre-compiled Triton kernels are per-architecture by nature, so a fat build must be configured with `-DVLLM_CPP_TRITON=OFF` (the portable CUDA kernels cover it), and a 5070-only build with them enabled needs them regenerated on the card |
-| NVIDIA sm_90a | Hopper — H100 / H200 class (a *different* family from Blackwell) | 🟡 **BUILDS single-arch, PORTABLE-KERNELS-ONLY — a build-supported target with NO fast paths and NO runtime here** (2026-07-23). `-DVLLM_CPP_CUDA_ARCHITECTURES=90a` configures with all five accelerated capabilities (FP4 MMA, CUTLASS NVFP4, CUTLASS FP8, Marlin NVFP4, FlashAttention-2) correctly **DISABLED** — we have no Hopper tensor-core kernel body, so only the portable C++/CUDA kernels compile — and the build links warning-free with real sm_90a machine code in 16 translation units. This is the first *cross-family* architecture to move off "inventoried", and it took one mechanical, GB10-byte-identical guard fix so the FP4 file compiles with its native path switched off. **What is NOT here: every Hopper fast path** (vLLM's 90a strength — FA3, Hopper CUTLASS, Machete, DeepGEMM — is a wgmma/TMA kernel campaign we have not ported), any sm_90 execution (no Hopper board), and the *fat* cross-family build `90a;121a`, which still does not compile because the sm_12x FP4 instructions are emitted for every architecture in the list (needs per-source gencode narrowing). A Hopper owner gets the portable path only; the steps to validate it are in the [arch-additivity spec §W9](.agents/specs/cuda-arch-additivity.md) |
-| Other NVIDIA SMs | sm70–sm89, sm100–sm110 families inventoried from vLLM | 🗓 Not yet built, traced, or gated here. The **expansion framework is additive** (2026-07-21, see below) — adding one is a table row + a tactic registration rather than a scattered multi-file edit, as the sm_120a (same-family) and sm_90a (cross-family, portable-only) rows above now demonstrate — but none can be executed on this hardware, a *fat* mixed-family build (say Hopper + Blackwell) still does not compile, and the per-architecture accelerated kernel bodies do not exist |
-| Intel XPU | Intel GPUs | 🔬 **SPIKED ONLY — and HW-BLOCKED** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). No Intel GPU exists on any machine here, and vLLM has no in-tree SYCL kernel source to copy (its XPU kernels ship as a separate package), so there is nothing to port loyally either. Only the backend-selection policy, compile coverage, and running SYCL kernels on a CPU device for unit checks remain possible. No end-to-end or speed gate is proposed, because none can be run |
-| ROCm / ANE | AMD GPUs / Apple Neural Engine | 🗓 Post-parity roadmap; not spiked |
-| Metal | Apple Silicon | 🟡 **TWO MODELS NOW RUN, BOTH EXACT — but two models is not general support** (OPT-125m 2026-07-22 token-exact 6/6, [study §12](.agents/specs/metal-mlx-reuse-study.md); Qwen3-dense 2026-07-23, [state](.agents/state.md)). What exists: OPT-125m AND Qwen3-dense (Qwen3-0.6B) generate end to end on the Apple GPU; OPT is the **same 96 tokens, exactly**, and Qwen3-0.6B PASSES its full 16-prompt correctness gate against the recorded reference-implementation answers our NVIDIA path is held to — the same answers, not a new baseline measured on the Mac (the four cross-device disagreements are all at positions the reference itself scores an exact bf16 tie). Eighteen of seventy-five operations now run there, including attention, the KV cache, rotary position encoding and greedy sampling. **The first ours-vs-MLX benchmark now exists** (Qwen3-1.7B, same box/workload): ours is a knowingly-unoptimised FLOOR — about 6–11× slower decode, 7–10× slower time-to-first-token, ~2× memory vs MLX's tiled kernels — indicative not binding (the Mac could not be quieted). Earlier detail: the pure copy, gather and selection paths agree with our CPU results **byte for byte**, and attention agrees to eleven orders of magnitude better than the required tolerance. The test also **proves the Apple GPU actually did the work** rather than assuming it — every operation is checked to have been dispatched there, with no silent hand-back to the CPU, and output buffers are poisoned beforehand so a program that never ran cannot pass by accident. What does NOT exist: quantization, mixture-of-experts, rotary position encoding and the rest of sampling, so most models still cannot run — which the backend now states up front, falling back to the CPU instead of failing deep inside a GPU program. **No speed number is measured or claimed** (see below). Two real portability defects surfaced only because a model finally ran on non-NVIDIA hardware — both were cases of code treating "not NVIDIA" as "has no GPU memory". Earlier: ten small operations plus the whole fusion catalogue agree with our CPU results to within the required tolerance — worst case eleven orders of magnitude better than the bar, with byte-for-byte agreement on the pure copy and number-format conversion paths.  **Matrix multiply now exists** (2026-07-22) in two interchangeable forms — our own, which is the default, and an optional one that delegates to Apple's MLX library — both agreeing with our CPU results far inside the required tolerance; they were added to give the new provider mechanism something real to choose between. One real defect was found and fixed along the way: on macOS the build silently discarded every self-registering component, so even the **CPU backend** failed to appear — that fix makes macOS a usable CPU target too. Cannot hold the 27B/35B gate models (16 GB), so no Apple result may ever be extrapolated to them. **MLX is now the named speed floor** for this backend: when a model does run here it must match or beat MLX on the same model and workload — and MLX's own numbers are now measured and on record as a target (about 28 tokens/second single-request, 213 at sixteen at once, on a small Qwen3 model), marked *not yet binding* because a background service on that Mac could not be stopped. A [source study of MLX](.agents/specs/metal-mlx-reuse-study.md) also settled how much of our code transfers: a first model needs only **six or seven new GPU programs**, everything else runs unchanged, and integrating MLX for the operations where it wins is possible after all — as an optional, switchable provider rather than a dependency. **New 2026-07-23:** because Apple Silicon shares one memory space, any operation Metal is missing a native kernel for now runs the portable CPU version automatically instead of stopping — so op count here is a *speed* budget, not a correctness gate; the 18 native kernels stay the fast path |
-| Vulkan | Portable GPU | 🟡 **SKELETON BUILT AND CHECKED — but no model runs on it yet, so this is NOT usable support** (2026-07-22, [spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)). What exists: the GPU is opened, memory is allocated on it, eight small operations plus the whole fusion catalogue run there, and their results are compared against **both** our CPU results **and our own CUDA results on the very same machine** — the strongest cross-check available anywhere in this project, and one the Apple backend cannot have. Agreement is far inside the required tolerance, with byte-for-byte agreement on the pure copy and number-format conversion paths. The GPU programs are compiled ahead of time and shipped with the source, so building needs no graphics toolchain at all. It also runs on a software GPU on the dev box, which means these checks can run with **no GPU hardware present**. What does NOT exist: matrix multiply, attention, the KV cache, quantization and sampling are all absent, so **no model can run**, and no speed number is measured or claimed. Turned off by default — it must be asked for explicitly, so that the NVIDIA gate builds are untouched. When a model does run here, llama.cpp's own Vulkan backend is the speed floor. **New 2026-07-23:** on a Vulkan device that shares memory with the host (this project's GB10, integrated GPUs) a missing operation now runs the portable CPU version instead of stopping; on a **discrete** Vulkan card it deliberately still stops, because a CPU program must not touch separate GPU memory |
+| POST | `/v1/completions` | Text completion (JSON or `text/event-stream`) |
+| POST | `/v1/chat/completions` | Chat completion (JSON or streaming SSE) |
+| GET | `/v1/models` | List the served model |
+| GET | `/health` | Process liveness (200) |
+| GET | `/version` | Engine version |
 
-Only GB10/sm_121a counts as CUDA hardware support today. Source-level fallback
-paths do not become support claims until their build, correctness, trace, and
-performance gates pass. Two architectures have moved past "inventoried" to
-**build-supported targets with evidence** — a weaker and different claim than
-hardware support: **sm_120a** (consumer Blackwell, same family as GB10, carries
-all fast paths) and **sm_90a** (Hopper, a different family — but PORTABLE-KERNELS
-ONLY, with every accelerated path disabled because no Hopper kernel body exists).
-Both stay build-supported until someone runs the gates on an actual card, and
-sm_90a additionally needs its Hopper fast-path kernels ported before it could be
-vLLM-competitive.
+Server flags:
 
-**Non-NVIDIA backends — Metal and Vulkan now both have checked skeletons; Intel XPU remains spiked only (2026-07-22,
-[spike](.agents/specs/backend-fanout-metal-vulkan-xpu.md)).** Both backends have
-moved from plan to code: they are built, they run, and their results are checked
-against our own CPU results — and, for Vulkan, against our own CUDA results on
-the same machine. Neither is **usable support**, and the section below is
-explicit about what is missing.
+| Flag | Default | Meaning |
+|---|---|---|
+| `--model <dir>` | (required) | Model directory (safetensors or `.gguf`) |
+| `--host H` | `0.0.0.0` | Bind host |
+| `--port P` | `8000` | Bind port |
+| `--served-model-name N` | model dir basename | Model id in `/v1/models` and responses |
+| `--tokenizer-config F` | `<dir>/tokenizer_config.json` | Chat template / tokenizer config |
+| `--block-size N` | `32` | KV block size |
+| `--num-blocks N` | `256` | KV blocks |
+| `--max-model-len N` | `0` (config default) | Max sequence length |
+| `--max-num-seqs N` | `8` | Max concurrent sequences (also sizes the HTTP worker pool) |
+| `--max-num-batched-tokens N` | `0` (per-arch default) | Per-step token budget |
+| `--enable-prefix-caching` / `--no-enable-prefix-caching` | model default | Override automatic prefix caching |
+| `--scheduling-policy fcfs\|priority` | `fcfs` | Scheduler policy |
+| `--enable-force-include-usage` | off | Force the usage block in responses |
+| `-h`, `--help` | | Print usage and exit |
 
-The encouraging finding is how little of this project is actually
-NVIDIA-specific. The engine — scheduling, memory management, batching, the
-server — contains no device code at all, and the compute layer was built so a
-backend registers its kernels into a table rather than being wired in by hand.
-Concretely, a new backend has to supply six memory/queue primitives and five
-platform descriptions; the existing CPU backend does that in 36 and 57 lines
-respectively. It then inherits argument validation, the whole fused-operation
-catalogue, and attention-backend selection for free. Slots for Metal, Vulkan and
-Intel were reserved in the core enumeration long ago, so none of this requires
-editing shared code. Building the Apple skeleton confirmed that in practice:
-turning it on adds files and changes no existing source file.
+For a production deployment, use [LocalAI](https://localai.io), which can embed engines like this behind a model gallery, multi-model serving, the full OpenAI API surface, auth, and metrics.
 
-**The discouraging finding, from an architecture audit completed 2026-07-22
-([audit](.agents/specs/accelerator-seam-audit.md)).** That encouraging picture is
-true of the *engine* and false of the *models*. vLLM keeps its device-specific
-choices in a shared library of model building blocks — the pieces every model is
-assembled from — so its model files barely mention any particular GPU vendor at
-all: across 287 of them, only 9 do, and the one matching our largest model
-mentions NVIDIA exactly **once** in 802 lines. We never built that shared library;
-we wrote those building blocks straight into the model files instead. The result
-is that our matching model file was 6,389 lines and mentioned NVIDIA dozens of
-times, and that single file held most of all the
-NVIDIA-specific code left in the supposedly shared part of the project. That count
-is now **32** places, down from the audit's 86 — and, decisively, **every one of
-the 32 that remains is a build-time switch** (a kernel that only compiles for one
-GPU family), not a runtime "is this NVIDIA" test: the shared model layer no longer
-contains a single runtime device-name check. See the automated count and the steps
-below.
-So a new accelerator today inherits the engine, the scheduler, the memory
-manager, the sampler and the fused-operation catalogue for free — and then meets
-a model file written for NVIDIA. Two further gaps were confirmed: we have no
-shared notion of "how is this compressed weight format multiplied on this
-device", so that decision is re-made inside every model; and unlike vLLM, an
-accelerator here that is missing an operation cannot fall back to a slow but
-correct version — it simply stops. That last one is why the Apple and Vulkan
-backends need a handful of GPU programs before they can produce a single token,
-rather than needing them only to be fast. The audit records a ranked eight-step
-plan to close all of this. **Nothing was built or changed by the audit itself.**
-Since then, steps one, three, four and five landed (the automated count, a set of
-per-accelerator capability questions the model now asks its platform, the
-reference fallback, and a first shared "how is this weight format multiplied"
-object), and the count of NVIDIA-specific places dropped from 86 to **55**. Step
-six — moving the remaining compressed-weight fast-path switches off an explicit
-"is this NVIDIA" test *by asking the operation table* — was assessed on 2026-07-23
-and found to have **no byte-identical move available** that way: those switches
-bottom out at routines that also exist on the CPU, so the operation-table question
-answers "yes" there and would flip the CPU result. Its fix was therefore re-scoped
-into step three, which lands it correctly: instead of asking the operation table,
-the model asks the *platform* a capability question ("does this device have the
-FP8/FP4 fast path?"), which answers exactly what the old "is this NVIDIA" test did
-today (yes on our GB10, no everywhere else) — byte-for-byte identical, yet a future
-accelerator answers for itself. Twelve of those switches moved this way, dropping
-the count from 67 to 55, with every model gate proven bit-identical
-(27B 235/235, 35B 315/315, plus Coder, the dense 32B, OPT, DeepSeek-V2 and Llama).
-Step **seven** — extracting the last shared-layer device coupling — then landed
-(2026-07-23) and took the count from 55 to **32**, its honest floor: it hoisted
-every remaining runtime "is this NVIDIA" test in the model layer onto a platform
-or backend capability question — the memory-model staging policy (why our unified
-GB10 still stages to device buffers), the flash-attention fast path, the
-secondary-stream overlap, the grouped-MoE kernel availability, the decode-graph
-and 4-bit-path gates — each answering exactly what the device-name test did today
-(yes on GB10, no everywhere else) yet decoupling for a future accelerator. What is
-left cannot be reduced without deleting a kernel: all 32 are compile-time gates for
-kernels that only build on one GPU family, and a build gate for a kernel that only
-exists on one architecture is legitimately irreducible. **The audit's aspirational
-"below 10" target is therefore not reachable — 32 build gates are the real floor —
-and this is the honest answer to "how additive can the shared layer get": every
-runtime device coupling is gone; only compile-time kernel availability remains.**
-Every model gate was proven bit-identical (27B 235/235, 35B 315/315, Qwen3-Coder
-6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8, Llama 16/16).
+## Consuming it as a library (C API and C++)
 
-**The first of those eight steps is now in place (2026-07-22): the leakage is
-counted automatically on every push, and the count can only go down.** It had
-already grown measurably in the days before the audit, with no mistake by anyone
-— three separate well-executed pieces of work each added a device check in
-passing. So the fix is a ratchet rather than a one-off cleanup: a small script
-counts the NVIDIA-specific references in the parts of the code that are supposed
-to work on any accelerator, compares that to a committed number, and fails the
-build if it has risen. Lowering it requires updating the committed number in the
-same change, so the figure cannot drift. Sites that legitimately *are* the NVIDIA
-implementation — the handful of lines that register it as an available device —
-are listed by name with a written reason each, so adding a new accelerator never
-trips the check. Deliberate exceptions are possible but are printed on every run
-rather than hidden. The check itself is covered by 24 tests that each plant a
-device reference and require it to be caught, because a check nobody checks is
-worse than none. Re-counting from scratch as part of this work put the real
-figure at **86**, not the audit's 94: four of the problems the audit reported did
-not exist, two mentions it counted were comments rather than code, and two were
-genuinely fixed in the meantime. Of the 86, only **3** turn out to be real
-per-device behaviour — the rest are questions the code could ask its own
-operation table instead, or build-time switches. **This step added a script, a
-test suite and a build check; it changed no engine, model or kernel code, so
-nothing about how the project runs has changed.**
+Link `libvllm` (static or shared) and include [`include/vllm.h`](include/vllm.h). It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 1`, 17 exported symbols) suitable for `dlopen` / FFI / LocalAI integration.
 
-**The fifth step is now in place (2026-07-23): the shared "how is this
-compressed weight multiplied on this device" seam the audit named as the single
-missing piece.** vLLM answers that question once, in a small policy object chosen
-when the model loads, so every model just says "apply this projection" and never
-asks which weight format or which GPU. We now have the same seam — a
-`LinearMethod` / `QuantizationConfig` layer that mirrors vLLM's, with the format
-chosen once from the checkpoint instead of guessed from a tensor name at every
-use — and the dense model's projections run through it. And where a model file
-used to ask "is this NVIDIA?" before taking a fast path, it now asks its own
-operation table "is this fast kernel available here?" — the same answer on
-NVIDIA today, and the right answer on any future accelerator that registers the
-kernel. That removed **19** of the device references (86 → **67**) with the
-output of every model **bit-for-bit unchanged**: all six correctness gates were
-re-run on the real hardware and produced identical tokens (27B 235/235, 35B
-315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8; the
-committed golden files were not touched). The device references that remain are
-the most delicate fast paths — the 27B's 4-bit-activation and the 8-bit fused
-kernels, whose availability question cannot yet be asked safely of the operation
-table — and are left for a later step that first adds the slow-but-correct
-fallback the audit calls for.
+```c
+#include "vllm.h"
 
-**That slow-but-correct fallback is now in place (2026-07-23): a backend that is
-missing an operation no longer stops — it runs the portable CPU version of that
-operation instead.** This is the step that turns "six programs before Apple can
-produce a single token" into "six programs to be *fast*". vLLM has always had
-this: every operation carries a plain, portable implementation that runs
-anywhere, so a brand-new accelerator with zero hand-written kernels is already
-*correct*, just slow. We now mirror it exactly, reusing our existing CPU
-implementations: when an operation has no native kernel on a GPU, the CPU version
-is registered as a lowest-priority fallback and used automatically. A real
-hand-written kernel, whenever one exists, always wins — so nothing about the
-NVIDIA path changes (all six correctness gates produced identical tokens, and the
-automated device count is unchanged because this lives in the compute runtime,
-not the shared model layer). The safety-critical part is *where* this is allowed:
-a CPU program can only touch a GPU's memory when the two genuinely share one
-memory space — true on Apple Silicon, on this project's NVIDIA GB10, and on
-integrated GPUs, but **not** on a discrete graphics card, where it would corrupt
-memory. So the fallback is switched on strictly by that shared-memory property,
-never by guessing from the device name, and a test proves a device that reports
-separate memory is refused and still stops rather than run a CPU program against
-GPU memory. When a fallback does run it is announced, not silent, so "this backend
-is running the slow path for operation X" is always visible. This is the fourth
-of the audit's eight steps; it also unblocks (but does not itself perform) the
-delicate 4-bit/8-bit conversions the previous step had to defer.
+vllm_model_params mp = vllm_model_params_default();
+mp.model_path = "/path/to/model";
 
-**The seventh step is now in place (2026-07-23), and it is the closest this
-extensibility work comes to a finish line: the shared model layer no longer
-branches on the device at runtime at all.** The audit's central complaint was that
-our biggest model file was written for NVIDIA. That is no longer true. Every one of
-the twenty-three remaining "is this NVIDIA" runtime tests across the model layer —
-in the 6,389-line file and in the DeepSeek, Qwen3-MoE, dense and worker files — was
-moved onto a capability the platform or the compute backend answers for itself. The
-subtle one was residency: our GB10 shares memory with the CPU, yet the NVIDIA path
-still stages weights into a separate device buffer, so the naive "is this shared
-memory" test would have flipped it the wrong way; the fix is a dedicated
-"does this device stage its weights" policy that answers yes on NVIDIA today (exactly
-as before) but lets a future shared-memory accelerator answer no and read its weights
-in place. The others: a flash-attention capability, a secondary-compute-stream
-capability, the grouped-expert-kernel availability question asked of the operation
-table, and the existing 4-bit / decode-graph platform questions reused. Every one is
-byte-for-byte what the device-name test returned on this hardware — proven by
-re-running all seven correctness gates on the real GPU to identical tokens (27B
-235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8,
-Llama 16/16) — yet each one decouples a future accelerator. The count of
-NVIDIA-specific places in the shared layer fell from 55 to **32**, and the
-remaining 32 are *all* build-time switches for kernels that compile on only one GPU
-family — an irreducible floor, not leakage. So the audit's "shared logic, swapped
-operations per accelerator" goal is met for the runtime model layer: a new
-accelerator that registers its operations now rides the whole model forward with no
-device-name edit anywhere. The remaining structural work — physically relocating
-those building blocks into a shared `layers/` library so the model file also
-*shrinks* toward vLLM's 802-line shape — is a follow-on refactor; the device
-coupling it was meant to remove is already gone.
+vllm_engine *engine = NULL;
+if (vllm_engine_load(&mp, &engine) != VLLM_OK) {
+    fprintf(stderr, "%s\n", vllm_last_error());
+    return 1;
+}
 
-**What was actually built for Apple.** The GPU is opened and memory allocated on
-it; GPU programs are compiled at run time from source embedded in the binary, so
-nothing extra has to be installed — which matters, because the Mac here has only
-Apple's command-line tools, not the full development suite that ships the offline
-shader compiler. Eight operations are implemented (addition including the
-bias form, ReLU, the gated activation, two number-format conversions, both
-normalisation kinds) plus a single entry point that gives the backend the entire
-fused-operation catalogue at once. Deliberately absent: matrix multiply,
-attention, the KV cache, quantization and sampling — **so no model runs on Apple
-yet**, work is submitted one command at a time rather than pipelined, and no
-speed figure is measured or claimed.
+vllm_sampling_params sp = vllm_sampling_params_default();
+sp.max_tokens = 64;               // sp.temperature = 0.0 means greedy
 
-**How it was checked.** Since vLLM cannot run on a Mac, the reference is our own
-CPU backend on the same machine, same binary, same inputs. Exact agreement is
-neither promised nor claimed for anything that sums across the GPU's parallel
-lanes, because our CPU results get their reproducibility from summing in a fixed
-order that no GPU preserves; the bar there is a relative-error measure, and the
-worst result came in about eleven orders of magnitude inside it. Where exactness
-*is* the right bar — plain copies, fills, and number-format conversion including
-the awkward cases (not-a-number, infinities, negative zero, and values sitting
-exactly on a rounding boundary) — the results match byte for byte. A new
-cross-device comparison harness was written for this and immediately paid for
-itself, catching two bugs in the new Apple code and one genuine difference
-between our CPU and NVIDIA number-format conversion.
+vllm_completion out;
+if (vllm_complete(engine, "The capital of France is", &sp, &out) == VLLM_OK) {
+    printf("%s\n", out.text);
+    vllm_completion_free(&out);
+}
+vllm_engine_free(engine);
+```
 
-Two things were fixed that had nothing to do with Apple GPUs. On macOS the build
-was quietly throwing away every self-registering component, so even the **CPU
-backend** did not appear at runtime; that is now fixed, and macOS is a usable
-CPU target. And the Apple compiler flagged seven warnings the Linux compiler
-never had — **all seven were fixed rather than silenced**, including a genuine
-latent bug on every platform: a base class was being deleted through a pointer
-without a virtual destructor, so the derived class's cleanup never ran.
+The ABI covers lifecycle (`vllm_engine_load` / `vllm_engine_free`), blocking and streaming completion (`vllm_complete`, `vllm_complete_stream`), non-blocking concurrent requests (`vllm_request_submit` / `_cancel` / `_wait` / `_done` / `_error` / `_free`), memory helpers, and diagnostics (`vllm_last_error`, `vllm_version`, `vllm_abi_version`).
 
-Vulkan now has a skeleton too, built to the same shape and to the same standard.
-Its one structural difference from Apple is worth stating: the GPU programs are
-compiled to their portable binary form **ahead of time and checked in with the
-source**, because none of our machines has a shader compiler installed and none
-of them lets us install one. That turned out better than the alternative — the
-build now needs no graphics toolchain whatsoever, on any machine, including
-continuous integration. The development box also has a software GPU, so the
-whole check can run with no graphics hardware at all, which we verified. Vulkan
-is off unless explicitly requested, so the NVIDIA gate builds are byte-for-byte
-unaffected. Intel is the honest disappointment — there is no Intel GPU here, and
-vLLM keeps its Intel kernels in a separate package, so there is neither hardware
-to test on nor source to copy from.
-
-**How correctness will be judged matters here**, because vLLM — our usual
-reference — does not run on Apple at all and has no Vulkan support anywhere. So
-no gate is proposed that we could not actually run: Vulkan will be checked
-against our own CUDA results on the same machine with the same weights, and
-Metal against our own CPU results on the Mac. Exact agreement is required where
-the operation is a plain data copy, but not for arithmetic that sums numbers in
-a different order on a GPU — there the existing numerical-accuracy threshold
-applies. Intel gets no end-to-end gate at all, because none is runnable. That
-standard is no longer hypothetical for either: it is what both skeletons above
-were measured against, and on the GB10 machine the Vulkan and CUDA results are
-produced by the same program in the same run.
-
-**Speed on Apple will be judged against MLX** (Apple's own array framework),
-decided 2026-07-22. Whenever a model does run on the Apple backend, it must match
-or beat MLX running the *same* model on the *same* machine, on every axis we
-measure elsewhere — throughput, latency and peak memory — with correctness as a
-precondition that is never traded away. That is the same standard vLLM sets for
-our NVIDIA path. Note this is purely a *comparison* choice: the Apple backend is
-being written directly against Apple's GPU programming language, not built on
-MLX. It also fixes which model comes first — it has to be one MLX can run too, or
-the comparison is meaningless.
-
-**MLX's own numbers are now on record, and we studied its source to see how much
-of our code can be reused (2026-07-22,
-[study](.agents/specs/metal-mlx-reuse-study.md)).** Two results are worth stating
-plainly. First, **the reuse is very high**: getting a first model onto the Apple
-GPU needs **nine to ten** of our seventy-five operations, of which the skeleton
-already has three — so **six or seven new GPU programs**, and everything else
-(the engine, the scheduler, the KV cache, all argument checking, the whole fusion
-catalogue, the model files themselves, and weight loading, which needs no GPU
-operation at all) runs unchanged. The small text-generation model OPT turns out
-to contain **no NVIDIA-specific code whatsoever**, which makes it the cheapest
-correct first target. The study also found a **real latent defect** on the shared
-path: on any non-NVIDIA GPU the code would hand a CPU memory address to a GPU
-program. It could not bite yet because no model runs there, and it is now
-**fixed** (2026-07-22) — the test was asking "is this not NVIDIA?" where it meant
-"is this the CPU?".
-
-Second, **integrating MLX turns out to be genuinely possible**, which contradicts
-our earlier assumption. We had assumed MLX's deferred, build-a-graph-then-run-it
-style would clash with our immediate, run-it-now design. Reading the source shows
-the graph sits *above* MLX's actual GPU code, and the GPU code underneath is
-plain, immediate function calls we can make directly, on memory we already own.
-
-**Both of those are now built, not just recommended (2026-07-22).** The missing
-mechanism was real and was a genuine defect: each operation had exactly one
-implementation slot per device, and a second one would silently overwrite the
-first — with *which* one survived depending on the order the program's start-up
-code happened to run, meaning the choice was not reproducible from one build to
-the next. There is now a proper **provider mechanism**: several implementations
-of one operation can coexist on one device, the winner is chosen by a fixed rule
-that cannot depend on start-up order, an implementation can refuse an individual
-call it does not handle and hand it back to ours, and the program can report
-which implementation actually ran (so a passing test cannot quietly hide a
-fall-back). It was generalised from the mechanism we already had for picking
-between NVIDIA chip generations, and it is deliberately one mechanism for all
-four cases — Apple delegating to MLX, NVIDIA to its vendor libraries, Vulkan to
-llama.cpp-style shaders, and the CPU to llama.cpp's hand-tuned routines. Adding
-it required **no change to any of the roughly seventy operation entry points**.
-
-On top of it, the Apple backend gained **its own matrix multiply** (which stays
-the default), and **MLX is wired in as an optional, switchable alternative** for
-that one operation, off unless explicitly asked for at build time. Both agree
-with our CPU results far inside the required tolerance, and the tests prove which
-of the two actually ran. Attention and the KV cache stay ours regardless: MLX has
-no equivalent of our paged cache at all. **No speed comparison is published**,
-because the Mac still cannot be quietened — a background service needs a
-password, and the desktop's animated video wallpaper keeps using the GPU; the
-exact commands the owner must run first are in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
-
-Finally, **MLX has been installed on the Mac and measured**: on a small Qwen3
-model it produces about 28 tokens/second for a single request, rising to about
-213 tokens/second at sixteen at once. Those are **MLX's numbers alone** — we have
-nothing to compare them with yet, and none of them is a claim about our speed.
-They are recorded as a target to design against, and marked *not yet binding*
-because a background service on that Mac could not be stopped without a password.
-The exact commands to reproduce them are in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
-
-**CUDA-arch expansion is now ADDITIVE — mechanism only, no new support
-(`BACKEND-CUDA-ARCH-ADDITIVITY`, LANDED + GATED 2026-07-21,
-[spike](.agents/specs/cuda-arch-additivity.md)).** The four seam-gaps the
-breadth-sweep audit named are closed: (1) the four hardcoded
-`MATCHES "12[01]a"` CMake guards became a **per-arch FEATURE TABLE**
-([`cmake/CudaArchFeatures.cmake`](cmake/CudaArchFeatures.cmake), a 1:1 port of
-vLLM's `cuda_archs_loose_intersection`, `cmake/utils.cmake:376-485`) that
-resolves each capability against the requested target list and REPORTS the
-result, so a multi-arch build can no longer silently drop fp4 / cutlass-nvfp4 /
-cutlass-fp8 / Marlin / FA2; (2) the device capability is probed once, cached,
-threaded into the kernel layer and **carried by the CUDA backend** (it previously
-existed only on the engine-side Platform seam); (3) host launchers now select a
-**runtime tactic** from a registration point, so a future architecture ADDS a
-tactic instead of editing the launcher; (4) the opt-in shared-memory ceiling in
-paged attention is the **queried** `cudaDevAttrMaxSharedMemoryPerBlockOptin`
-rather than a hardcoded GB10 assumption. **This is behavior-preserving by
-construction and confers no support:** exactly ONE tactic is registered (the
-existing `sm_12x` fp4 path), GB10 output is bit-identical, and no architecture
-moved off `INVENTORIED`. Building a genuinely heterogeneous fat binary still
-needs per-source gencode narrowing plus the per-arch kernel bodies — that
-remains a **hardware-blocked kernel campaign, not an additive drop-in**.
-
-**Extensibility — the Platform seam is extracted + DGX-confirmed (2026-07-18).** vLLM's
-`platforms/interface.py` capability seam is now mirrored 1:1 in C++
-(`include/vllm/platforms/interface.h` + `src/vllm/platforms/{platform,cpu,cuda}.cpp`):
-a `Platform` composes the `vt::Backend` and answers the memory-model /
-capability queries the engine and model code used to branch on inline
-(`is_cuda()`, `is_unified_memory()`, `has_device_capability()`,
-`supported_dtypes()`, `residency_policy()`, `supports_graph_capture()`), self-registered
-per `DeviceType`. The residency/host-weight-release + device-pool memory-model
-conditionals branch **per object** through `GetPlatform(<obj>.device.type)` —
-keyed on the specific tensor/queue being dispatched, so a new discrete/unified
-GPU's memory model becomes one additive `platforms/<gpu>.cpp` rather than
-scattered engine/model edits. (`CurrentPlatform()` — the process-global
-accelerator-first resolver — is reserved for genuine process-level "which
-accelerator is this process on" questions; using it for per-object dispatch
-would misroute a CPU queue/tensor on a GPU box, so the memory-model/residency
-sites key on the object's own device.) This is a behavior-preserving refactor
-(both gate models stay token-exact); kernel-shape dispatch branches are
-deliberately left for the later attention/kernel-registry items.
-
-**Extensibility — residency is now a consumed Platform capability (2026-07-19,
-CPU-gated).** The MoE host-weight-release, per-layer load-stream interleave, and
-device-scratch-pool cap decisions are now *read from*
-`GetPlatform(<obj>.device.type).residency_policy()` instead of being decided by
-an inline `device.type`/env gate. The RESIDENCY POLICY (free host weights after
-the device upload? pool cap?) comes from the platform; whether the Marlin
-resident is the committed compute path stays an orthogonal *kernel* gate
-(`MarlinMoeEnabled()`) — the two questions are kept separate. `CudaPlatform`
-advertises the values that reproduce today's GB10 behavior exactly
-(`release_host_weights_after_upload = true`, device pool on, uncapped), so the
-same host-free + load-stream runs and the 35B ~4 GiB load-to-ready peak is
-preserved; `VT_MOE_HOST_FREE`/`VT_MOE_LOADSTREAM` stay as rollback overrides.
-**Net effect: a new (e.g. discrete) GPU's residency behavior = set its
-`residency_policy()` field values, with zero model-code edits.** A
-behavior-preserving refactor (no numeric/kernel/memory change on GB10), unit-tested
-on the CPU tier and DGX-confirmed token-exact (27B 235/235 + 35B 315/315, 35B
-load-to-ready peak ≈ 4.0 GiB preserved, memcheck 0 errors).
-
-**Extensibility — model self-registration landed (2026-07-19, CPU-gated).**
-Adding a model architecture is now additive. The fixed model-registry array is
-replaced by a `REGISTER_VLLM_MODEL(...)` static-registration idiom
-(`include/vllm/model_executor/models/model_registry.h`) copying the proven
-op/backend/platform self-registration pattern: each architecture registers
-itself from its own translation unit into the shared, type-erased
-`ModelFactory`. The Qwen3.6 dense and MoE variants now live in their own registry
-TUs (`qwen3_5_dense.cpp`, `qwen3_5_moe.cpp`) over a shared `qwen3_5_common`
-helper, and `model_registry.cpp` is the generic family-agnostic registry. **Net
-effect: adding the next model = one new TU + one `REGISTER_VLLM_MODEL` line, with
-zero edits to a shared array or to `model_registry.cpp`** (previously: edit the
-fixed `kRegistrations` array *and* add glue inside the shared monolith). A
-behavior-preserving refactor — no numeric/kernel/dispatch change, DGX-confirmed
-token-exact (27B 235/235 + 35B 315/315, memcheck 0 errors). The deeper
-`qwen3_5.cpp` forward-machinery (DevicePool/matmul/GDN) factoring is a deferred
-follow-up.
-
-**Extensibility — attention-backend registry landed (2026-07-19, CPU-gated).**
-The third and final portability seam is realized: *which* attention backend a
-platform selects is now data, not an inline code edit. Attention backends
-self-register per device (`include/vllm/v1/attention/registry.h`,
-`RegisterAttentionBackend` — the same static-registration idiom as the op /
-platform / model registries), each `Platform` advertises a capability-ordered
-priority list (`get_attn_backend_priority()`, a 1:1 mirror of vLLM
-`cuda.py::_get_backend_priorities` — FLASH_ATTN → FLASHINFER → TRITON → FLEX on
-GB10, FLASHINFER-first on sm_100), and a selector (mirror of
-`get_attn_backend_cls`) returns the first *registered* backend in that order.
-**Net effect: adding a new backend's attention = one self-registering TU + one
-priority slot, with zero edits to the selector, model, or runner.** The concrete
-attention *kernel* remains selected at the device-agnostic vt:: op table, so this
-is a behavior-preserving refactor — the same FlashAttention-2 path is selected on
-both gate models (DGX-confirmed token-exact: 27B 235/235 + 35B 315/315, memcheck
-0 errors). This completes the three-seam extensibility foundation (Platform,
-attention-backend registry, model self-registration).
-
-**Extensibility — roadmap_v1 ORDER-1: the portable op-fusion framework
-(SPIKED 2026-07-19; W0 ADOPTED; W1 POD GENERALIZED; W2 HAND-FUSIONS MIGRATED; W3 MECHANICAL-SYNC PROVEN; W4 BACKEND-ADDITIVITY PROVEN 2026-07-20 — the W-series ORDER-1 proof milestone is DONE).** The fourth and unifying seam: fusions **declared once**
-(a backend-agnostic recipe catalog above `vt::`, transcribing vLLM's finite
-fusion-pass set) and **realized per-backend** through the `vt::` op table (a
-composite tier is the CPU oracle every backend inherits free; one interpreter
-kernel per backend lights up every recipe). It makes a new vLLM fusion PR a
-one-declaration port, a new GPU a one-file catalog realization, and a new model
-an additive pattern declaration — the same additive pattern as the seams above,
-so upstream fusion PRs port mechanically instead of being hand-wired at call
-sites. **W0 landed (2026-07-19):** the Phase-0 skeleton is now ADOPTED at one
-real production site — the 35B post-attention layernorm routes its plain
-add+residual+RMSNorm through `vt::FusedChain(kFusedAddRmsNorm)` (behind
-`VT_FUSED_CHAIN_ADOPT`, default-ON, `=0` rollback), behaviour-preserving and
-byte-identical to the prior hand-call, proving the declare-once/realize-per-backend
-seam end-to-end in a real model forward (35B 315/315 + 27B 235/235 token-exact on
-both arms, memcheck 0 errors). **W1 landed (2026-07-20):** the `FusedRecipe` POD is
-generalized — from `{kAdd,kMul,kRmsNorm}` + a fixed 4-role operand model to the full
-activation/norm/quant/rope opcode set + a small indexed operand table — so all five
-quant-fused W2 target chains (`kRmsNormQuantFp8`, `kRmsNormGatedQuantFp8`,
-`kSiluMulFp4Quant`, `kSigmoidGateFp4Quant`, `kAttnQkNormRopeGate`) are now expressible
-as `constexpr` recipes whose Tier-0 composite is byte-exact to the standalone-op
-sequence the model hand-calls today (proven CPU + CUDA; 35B 315/315 + 27B 235/235
-token-exact regression on the W0 site, memcheck 0). W1 is infrastructure only — no
-model call site changed. **W2 landed (2026-07-20):** the bespoke hand-fused ops are
-now MIGRATED to `vt::FusedChain(recipe)` at six production call sites
-(`kSiluMulFp4Quant` MoE down-proj, `kSigmoidGateFp4Quant` full-attn o-proj gate,
-`kRmsNormGatedQuantFp8` ×2 GDN out-proj, `kRmsNormQuantFp8` input-layernorm,
-`kAttnQkNormRopeGate` ×2 attn preamble) — the framework now OWNS the fusion dispatch.
-Each recipe carries a `fast_op` binding to its existing single-launch fused kernel, so
-`FusedChain(recipe)` dispatches to the SAME fast kernel the model called directly
-before migration: **byte-identical AND perf-neutral by construction** (no extra
-kernel, no per-forward getenv/alloc). The Tier-0 composite is the byte-exact oracle the
-fast kernel is validated against (`test_ops_fused_chain` proves fast == composite ==
-unfused sequence). Gates: clean CUDA `-Werror` 0-warn, byte-exact CUDA 420/420, and
-token-exact 27B 235/235 + 35B 315/315 on BOTH `VT_FUSED_CHAIN_ADOPT` arms (`=0`
-restores the exact prior hand-calls, same binary). **W3 landed (2026-07-20) — the
-mechanical-upstream-sync PROOF:** a NEW, previously-unported vLLM fusion pass
-(`SiluMulFp8StaticQuantPattern`, the static-per-tensor-FP8 activation variant of
-`ActivationQuantFusionPass`, `act_quant_fusion.py:81` → `_C.silu_and_mul_quant`) was
-ported as **ONE `constexpr FusedRecipe kSiluMulQuantFp8` declaration + its byte-exact
-test — touching exactly two files** (`include/vt/recipes.h` + `tests/vt/test_ops_fused_chain.cpp`),
-with **no kernel, no dispatch, no model-site edit, and no new primitive** (its composite
-realizes through the existing `vt::MoeSiluMul` + `vt::QuantFp8Static` ops). `git diff
---stat main` = those two files, nothing else — the PR-#4 additivity test made concrete:
-adding a whole new fusion pattern is one declaration. Gates: clean CUDA `-Werror` 0-warn,
-byte-exact CUDA 432/432, and — because the recipe is declared, not wired into any model —
-no token regression (27B 235/235 + 35B 315/315), memcheck 0. **W4 landed (2026-07-20) —
-the backend-additivity PROOF, closing the W-series:** the additivity claim ("a new backend
-registers `kFusedChain` once and inherits the ENTIRE catalog correct, zero per-recipe
-work") is now EXECUTABLE. A new test (`tests/vt/test_fused_chain_additivity.cpp`) treats the
-existing **CPU backend as the 'second backend'** relative to CUDA (no mock `DeviceType` —
-that would edit the core enum + every switch, ironically non-additive) and, in one generic
-loop over the whole catalog (all 7 recipes), asserts each runs **byte-exact on the CPU
-backend via the Tier-0 composite** — 4 end-to-end + 3 whose CUDA-only static-fp8 terminal
-is backend-negotiated (byte-exact prefix; the full composite is asserted to throw on CPU,
-documenting the tail). The additivity is real: the catalog (`recipes.h`) grew 1→6→7 recipes
-while the composite walker stayed **one per-opcode function** and each backend's `kFusedChain`
-registration stayed **one line** — `cpu_ops.cpp` never even includes `recipes.h`, and W3's
-whole new recipe appears in zero backend files, inherited for free. Gates: clean CPU
-`-Werror` 0-warn, `test_fused_chain_additivity` 17/17 + `test_ops_fused_chain` 228/228; the
-change is test-only (engine byte-identical) so 27B 235/235 + 35B 315/315 are structurally
-unchanged. Honest scope: this is an **extensibility +
-mechanical-upstream-sync + backend-additivity** cornerstone, not a perf lever — W0–W4 are
-perf-neutral by construction (the measured 35B prefill gap is compute-bound, ceiling
-~3.5%/step). Named future/HW-blocked work (does not gate the ORDER-1 milestone): the Tier-1
-single-pass perf interpreter for the quant chains (composite-only today). The **Metal and
-Vulkan realizations of the catalog are no longer future work** — both skeletons register a
-single-pass `kFusedChain` interpreter and inherit the whole catalog, and both realization
-tiers are checked against the CPU results (2026-07-22).
-Spike + work breakdown (W0–Wn):
-[`.agents/specs/portable-fusion-framework.md`](.agents/specs/portable-fusion-framework.md).
-Build hygiene alongside W1: a pre-existing CPU-only `-Werror=unused-function`
-(the `FuseSigmoidGateQuantEnabled` helper is used only under `#ifdef
-VT_CUTLASS_NVFP4`, so a CUDA-off build compiled it out) is fixed with
-`[[maybe_unused]]` — keeps the `build-test-cpu` CI job green; no behavior change.
-
-### Kernel coverage on the gate path
-
-| Kernel family | CPU | CUDA · GB10 | Status |
-|---|:---:|:---:|---|
-| Dense NVFP4 W4A4 GEMM | ✅ ref | ✅ | CUTLASS/FlashInfer-compatible tactics, frozen plan cache, packed QKV |
-| MoE NVFP4 W4A16 GEMM | ✅ ref | ✅ | Marlin/fp4-resident gate path |
-| BF16/FP8 projection GEMM | ✅ ref | ✅ | cuBLASLt TN / `nvjet_sm121` path; an opt-in per-device plan cache (descriptor + layouts + heuristic algo, keyed on the full shape/config; `VT_FP8_PLAN_CACHE=1`) mirrors vLLM's in-graph plan reuse — bit-exact but measured production-NEUTRAL on GB10 (prefill GPU-bound, decode graph-captured), so it ships default-OFF |
-| Prefill attention | ✅ ref | ✅ | Vendored FlashAttention-2 with portable fallback |
-| Paged decode attention | ✅ ref | ✅ | FA2 split-KV decode covers BOTH gate topologies: 27B ratio-6 (`VT_FA2_DECODE`) and **35B ratio-8 default-ON (2026-07-19, `VT_FA2_DECODE_35B`)**. The 35B decode previously ran a 2-block-grid GQA kernel at low batch (near-zero GB10 occupancy); split-KV fills the machine. Token-exact (35B 315/315 + 27B 235/235) + in-situ 35B win (c1 TPOT −10.5%, c8 −3.2%, TTFT neutral). The older 27B ratio-6 component strict-performance-failed its frozen c2/c16 grid (no credit); the 35B decode is a fresh in-situ win, orchestrator re-grids |
-| GDN / linear attention | ✅ ref | 🟡 | Prefill AOT is gated; the packed pure-decode kernel is **CLOSED on equivalence** (`KERNEL-GDN-PACKED-DECODE` `DONE`). The c16 slot defect (compact state-slot pool keyed on the mamba block-id collapsed two long c16 sequences onto one recurrent-state slot) was fixed test-first (request-identity keying) and proven at `c172336`; W1D3/G3 closed over eight seals + the 8-pair A/B (−0.205% ± 0.30, <1σ). Packed is the default (`VT_GDN_PACKED_DECODE=0` rollback); no speed credit |
-| RMSNorm, RoPE, SwiGLU, FP4/FP8 quant | ✅ ref | ✅ | Gate-path coverage; broader variant inventory remains open. CPU backend now registers both cast directions (`bf16→f32` `kCastF32` alongside the existing `f32→bf16` `kCastBf16`), closing a CPU op-registration asymmetry |
-| CUDA-graph decode | — | 🟡 | Gate-model path runs; complete cross-model evidence remains open |
+For C++ consumers, the higher-level surface lives under [`include/vllm/`](include/vllm/): `LoadedEngine::FromModelDir(...)` ([`entrypoints/model_loader.h`](include/vllm/entrypoints/model_loader.h)) hands back the synchronous `LLMEngine` ([`v1/engine/llm_engine.h`](include/vllm/v1/engine/llm_engine.h)) or the async `AsyncLLM` ([`v1/engine/async_llm.h`](include/vllm/v1/engine/async_llm.h)) the server itself uses, plus `SamplingParams` and `RequestOutput`. The underlying portable tensor runtime is `vt::` ([`include/vt/`](include/vt/): `tensor.h`, `dtype.h`, `ops.h`, `backend.h`, and friends), which carries no ggml or PyTorch dependency.
 
 ## Quantization
 
-| Format | Status |
+| Format | State |
 |---|---|
-| NVFP4 W4A4 / W4A16 | 🟡 Both gate-model paths run on GB10 and pass token-exact correctness. The new-binding 27B performance gate (`246a23c`) fails 75/124 axes (memory + c1 + TTFT now pass; decode c2–c32 open); FP4 tactics match, the non-quantized packed GDN decode leaf is closed on equivalence, and merged qkvz (`KERNEL-GEMM-BF16` W2, one BF16 in_proj_qkvz GEMM per GDN layer) is DGX-green and in the binding binary |
-| compressed-tensors NVFP4A16 (W4A16), dense | 🟡 **New scheme, correctness COMPLETE; speed not yet measured.** `RedHatAI/Qwen3-32B-NVFP4A16` (`Qwen3ForCausalLM`, 64 layers) loads and computes natively through the Marlin weight-only path — the same kernel vLLM itself forces for `use_a16` on sm_121 (observed: `Using MarlinNvFp4LinearKernel`), so this scheme needed **zero new kernel code**. The loader, scale conventions and merged-shard collapse mirror vLLM; a CPU synthetic check is bit-exact against the dequantized reference. The loader gate passes fully (all 1603 tensors mapped, 5144 assertions) and the engine path is memcheck-clean. The engine gate is **6 of 6 prompts**, of which 4 are token-exact (67/96 tokens) and 2 pass the same near-tie band the BF16 Qwen3 models use. That band is not an assumption: feeding vLLM our exact prefix and reading its own logits shows **every divergent position within 0.0625 nats of vLLM's own top choice, and 28 of 29 exactly equal to it** — one of the two flips is a perfect tie where vLLM's own two ways of computing it disagree with each other. The residual is the BF16 rounding behaviour the dense Qwen3 path already carries, not the quantization, which is separately exonerated by the bit-exact CPU check and by the divergences surviving a full swap of the quantized GEMM |
-| GGUF F32, F16, Q4_0, Q8_0, Q3_K/Q4_K/Q5_K/Q6_K | 🟡 Supported files load and pass same-file llama.cpp greedy checks. **Direct compute-in-quant is IMPLEMENTED and default-on for CPU (2026-07-22):** a weight in one of the six block encodings (Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K) stays in its native blocks from file to matrix multiply, and the multiply is a direct block kernel ported from llama.cpp and gated against an independent 64-bit reference. On the 35B acceptance files this reproduces llama.cpp's own greedy output token for token, and on the benchmark model the output tokens are byte-identical to the old expand-to-BF16 path. `VT_GGUF_KEEP_QUANT=0` disables it; `VT_CPU_REF=1` restores the full reference path. Measured effect on a mixed real file, same binary: decode 3.45x faster, prefill 4.16x faster, peak memory 1.16x smaller. **The loader was then taught to keep those compressed weights resident in the memory-mapped file instead of copying them, to share a tied vocabulary table between the embedding and the output head instead of expanding it twice, and to release the file pages of tensors it has finished expanding** (2026-07-23) — cutting peak memory from 6.40 to 3.88 GiB (2.29x to 1.39x llama.cpp) with the output tokens byte-identical and decode speed unchanged. **Two honest limits.** First, plain 16-bit and 32-bit tensors have no block form, so they are still expanded and still run the general kernel — on the benchmark file that is 60% of the weight bytes, which is why the speed-up was 3-4x and not the 9-17x projected. That general kernel has since been vectorized in its own right (bit-for-bit identically), which took the CPU decode rate to parity with llama.cpp; the two paths now run at comparable speed, so a mixed file no longer has a slow half. Second, this is CPU only: a GPU build still expands every GGUF weight. Per-architecture vector tiers for the block kernels, and GPU support for them, are later increments. Several formats remain open |
-| FP8 | 🟡 The 35B ModelOpt static per-tensor W8A8 projection slice is implemented; generic FP8 modes and FP8 KV remain open |
-| MXFP4 / MXFP8 | 🗓 Planned, including MLX-native modes |
+| NVFP4 W4A4 / W4A16 | Both gate-model paths run on GB10, token-exact. FP4 tactics match vLLM; Marlin NVFP4 W4A16 grouped-MoE is the 35B expert path |
+| compressed-tensors NVFP4A16 (W4A16), dense | Correctness-complete via the Marlin weight-only path (the same kernel vLLM forces for `use_a16` on sm_121); speed not yet measured |
+| GGUF F32 / F16 / Q4_0 / Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K | Supported. On CPU, the six block encodings compute directly on the compressed blocks (no BF16 expansion), byte-identical to the reference path (`VT_GGUF_KEEP_QUANT=0` disables it). GPU builds still expand GGUF weights |
+| FP8 (W8A8) | The 35B ModelOpt static per-tensor projection slice is implemented; generic FP8 modes and FP8 KV remain open |
+| MXFP4 / MXFP8 | Planned |
 
-Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
+## Acceleration
 
-## Serving and API caveats
+| Backend | Hardware | State |
+|---|---|---|
+| CPU | x86-64 and arm64 | Correctness / CI reference; at or ahead of llama.cpp on every GGUF axis (prefill 1.18x, decode parity, memory parity), with an Arm i8mm quant-GEMM tier |
+| CUDA | GB10 / DGX Spark, sm_121a | Gate-model correctness passes; 27B at/above vLLM throughput, 35B prefill-pending. The only runtime-gated CUDA target |
+| CUDA | Consumer Blackwell, sm_120a | Build-supported (compiles, emits real sm_120a code, all fast paths resolve) but not runtime-proven here (no such card) |
+| CUDA | Hopper, sm_90a | Build-supported, portable-kernels-only (accelerated paths disabled, no Hopper kernel bodies); not runtime-proven here |
+| Metal | Apple Silicon | Two models run end to end and pass correctness (OPT-125m, Qwen3-0.6B); 18 of 75 ops native, the rest fall back to CPU on unified memory. No general model support yet; MLX is the named speed floor |
+| Vulkan | Portable GPU | Skeleton: 8 ops plus the fusion catalogue run and cross-check against CPU and CUDA. No model runs yet; off unless `-DVLLM_CPP_VULKAN=ON` |
+| Intel XPU | Intel GPUs | Spiked, hardware-blocked |
+| ROCm / ANE | AMD GPUs / Apple Neural Engine | Post-parity roadmap |
 
-- The Qwen3.6 checkpoints' shipped tool template uses Qwen3-Coder XML and
-  forced reasoning blocks. The current Hermes-style parser does not yet fully
-  implement that format.
-- `/health` currently reports process liveness rather than a full engine-health
-  probe.
-- **Prompt / prefix caching (automatic prefix caching, APC) is implemented and
-  is ON by default for ordinary dense models**, mirroring vLLM's own per-model
-  default (hybrid/GDN and attention-free models default OFF, exactly as
-  upstream). Block chain-hashing, the block pool with refcounts and LRU
-  eviction, all three cache-hit coordinators and the hybrid cross-group
-  intersection are ported and unit-tested. A full parity audit against pinned
-  vLLM landed 2026-07-22
-  ([spike](.agents/specs/prefix-prompt-caching-parity.md)).
-  **Cache hit-rate statistics now exist and are on by default** (2026-07-22),
-  mirroring vLLM's own counters: queries and hits are counted in tokens over a
-  rolling window of the most recent 1000 requests, with previously-preempted
-  requests kept in separate counters so their guaranteed re-hit cannot inflate
-  the headline number. The first measurement confirms the cache genuinely
-  works: a repeated-prefix workload of 16 requests sharing a 128-token system
-  prompt reports a **0.75 hit rate (1920 of 2560 queried tokens served from
-  cache)**, against 0.0 with caching turned off. The honest remaining gaps are:
-  block-hash extra keys (multimodal / LoRA / `cache_salt`) are stubbed, so
-  `cache_salt` is unsupported and this must be completed before any multimodal
-  or LoRA support lands; KV-cache events are inert; only one of vLLM's four
-  hash algorithms is shipped; `reset_prefix_cache` exists in the engine but is
-  not reachable from the API; and there is still no `/metrics` endpoint, so the
-  hit rate is readable from the engine API rather than scraped. **No end-to-end
-  model gate has yet been run with caching ON**, so APC still has no measured
-  speed or correctness result on real hardware — treat it as functional and now
-  measurable, but ungated. The binding SGLang/vLLM shared-prefix competitor
-  gate remains pending; it is no longer blocked on missing counters.
-- Cascade attention (vLLM's shared-prefix batch attention) is **not
-  implemented, and after audit is not planned**: upstream disables it by
-  default, it exists only on the legacy V1 runner rather than the V2 runner we
-  mirror, and on Blackwell the attention backend that implements it is never
-  selected.
-- **Persisting the KV cache to disk: the storage layer is built, but it is not
-  yet wired into the engine, so there is no user-facing option to switch on.**
-  Audited against pinned vLLM on 2026-07-22
-  ([spike](.agents/specs/kv-persistence-lmcache.md)); the earlier note here that
-  vLLM also lacks disk persistence was **wrong** and is corrected: vLLM has
-  covered it since its `kv_offload` filesystem tier landed, storing one raw file
-  per KV block.
-  What now exists on our side: **block hashes are deterministic across
-  processes by default** (this was the blocker — they were previously seeded
-  randomly per process, so a cache written to disk would have found nothing on
-  restart; the fix is proven by a test that compares hashes produced by
-  separately launched processes); a **CPU offload tier** with LRU and ARC
-  replacement; and a **disk tier** that writes one raw file per block, publishes
-  it atomically, and deletes any file it cannot read so a corrupt entry becomes
-  a clean miss rather than a permanent error.
-  Two things here are deliberately **better than vLLM**. First, every block
-  file carries an identity header that is **read and checked on every open**,
-  covering the model, its full configuration digest, weight quantization, KV
-  dtype, rope configuration, sliding window, cache shape and the hash seed; if
-  any of them differs the cache is **refused outright** rather than silently
-  serving another model's data as plausible but wrong tokens. vLLM writes a
-  configuration file it never reads back, and its only check omits most of
-  those fields. Second, our disk tier honours a **size budget** and evicts, so
-  it cannot fill the disk; vLLM's grows without limit.
-  These tiers were independently built and gated on 2026-07-23 (clean CUDA
-  `-Werror` build, 0 warnings; the four new suites and all six model
-  regressions green on GB10; goldens unchanged), so the storage layer is
-  verified, not merely written.
-  **The tiers now have a consumer.** A tiering manager coordinates the CPU and
-  disk tiers — promoting a block up on a hit and demoting it down under memory
-  pressure — and a scheduler-side connector lets a **cross-request or
-  restarted-process prefix hit load from disk and skip recomputing that part of
-  the prompt.** In a repeated-prefix test through the real scheduler this saved
-  32 of 48 prompt tokens (two of three blocks loaded from disk), and the loaded
-  bytes are proven byte-identical to a cold run, so the continuation is
-  token-identical — a wrong load would be a silent wrong-output bug, so a
-  promotion re-checks the identity header and refuses a foreign block. This
-  offloading is **opt-in and off by default**, so it changes nothing for models
-  that do not use it (every regression is unaffected).
-  What is still missing: the connector is wired into the scheduler but a
-  user-facing CLI switch and the worker-side load into live GPU memory (which
-  generalizes the connector into a full plugin seam) are the next step, so
-  offloading is not yet a flag on the server. Note also that a disk cache
-  written by vllm.cpp will not interoperate with a stock vLLM unless that vLLM
-  is launched with `--prefix-caching-hash-algo sha256_cbor`, because our
-  block-hash algorithm deviates from upstream's default by design.
-- **LMCache is an external Python package, not a vLLM component — but connecting
-  to a *running* LMCache server from pure C++ is feasible, and does not need the
-  `lmcache` package in our process.** vLLM ships only the adapter glue; the cache
-  engine lives in the separate `lmcache` package. A wire-protocol analysis
-  ([spike](.agents/specs/lmcache-cpp-client-connector.md)) found that vLLM talks
-  to a running LMCache over two fully-specified, language-agnostic wires: an
-  `lm://` remote-store server (plain TCP, a fixed binary header, raw KV bytes)
-  and a multiprocess server (ZMQ + msgpack, with the KV data shared over
-  CUDA-IPC). A from-scratch C++ client that speaks the simpler `lm://` protocol
-  is the recommended first target; it keys on LMCache's own token hash, so it
-  sidesteps the block-hash-compatibility question entirely. This is still an
-  interop feature with a version-sync cost (LMCache is an unpinned, moving
-  target), not a mechanical port. **First code has landed (W1): the pure-CPU
-  `lm://` wire codec** — the fixed binary header messages, the cache-key string,
-  the blake3 rolling token hash (over a vendored copy of the official BLAKE3 C
-  library), and the `[2, layers, tokens, dim]` KV chunk layout — verified
-  byte-for-byte identical to the real Python LMCache codec on a captured-fixture
-  test, on both x86-64 and aarch64. It is a codec only: nothing connects to a
-  server yet (that is the next step, W2), it is **opt-in by absence** — no code
-  path reaches it — and there is **nothing to benchmark** (a codec moves no
-  tokens).
-- llama.cpp-style **imperative named session save/restore** — "save this
-  conversation's cache to a file, reload it later" — is supported by neither us
-  nor vLLM. It is the one caching capability llama.cpp genuinely has and vLLM
-  does not, and it is tracked as a beyond-parity feature rather than a parity
-  gap. If it is built, a restored cache will be refused rather than used when the
-  model, dtype, quantization or context configuration has changed.
-- Speculative decoding is not user-visible yet. MTP foundations exist, while
-  MTP integration, DFlash, DSpark, TLI, n-gram, and EAGLE3 remain roadmap work.
-- Multimodal/vision, LoRA, multi-GPU, local attention model consumers, and
-  scaled long-context RoPE consumers are not supported yet.
+## Serving and API notes
 
-The next execution order is fixed: with the packed-GDN decode leaf CLOSED on
-equivalence, merged **qkvz** DGX-green, and the authorized exact-grid rerun now
-RUN (new binding `246a23c`, 49/124), the open front is the c2–c32 decode gap —
-now fully attributed (c2/c8 split 2026-07-16): kernel glue + recurrence at c2–c4,
-wave-boundary admission grading (`ENG-ASYNC-SCHED` family) from c8 up →
-all-axis 27B parity → 35B parity → the SGLang shared-prefix gate →
-the rest of [roadmap v1](.agents/roadmap_v1.md), including DSpark and external KV
-cache / LMCache support.
+- **Automatic prefix caching (APC)** is implemented and on by default for dense models (hybrid / GDN and attention-free default off, mirroring vLLM). Hit-rate statistics are counted per vLLM's own counters. Some block-hash extra keys (multimodal / LoRA / `cache_salt`) are stubbed, and there is no `/metrics` endpoint yet.
+- **KV persistence to disk / CPU offload** is built (CPU and disk tiers, identity-checked blocks, a size-budgeted disk tier) and wired opt-in into the scheduler, but it is off by default and the worker-side GPU load plus a server flag are the next step.
+- **Tool calling** uses a Hermes-style / Qwen3 parser subset; the Qwen3-Coder XML forced-reasoning template is not fully implemented.
+- `/health` reports process liveness rather than a full engine-health probe.
+- **Speculative decoding** is not user-visible yet (MTP foundations exist).
+- **Multimodal / vision, LoRA, and multi-GPU** are not supported yet.
+
+## Verification and parity
+
+Every model is gated token-for-token against the pinned vLLM 0.25.0 oracle on the same workload, and every change that could affect correctness or performance is compared apples-to-apples against vLLM with both numbers and the ratio recorded. Behavioral CPU tests run under CTest; CUDA correctness, sanitizer, trace, and performance evidence is recorded per feature rather than inferred from source. The protocol is in [`.agents/gates.md`](.agents/gates.md) and [`.agents/benchmark-protocol.md`](.agents/benchmark-protocol.md).
+
+## Why vllm.cpp
+
+vLLM is an excellent serving framework, but running it drags in a heavy Python / PyTorch / CUDA stack. vllm.cpp is a from-scratch C++20 port focused on inference:
+
+- **No Python at inference.** A single `libvllm` behind a flat C ABI (`include/vllm.h`), easy to embed from C, C++, Go, or Rust, or to `dlopen` from LocalAI.
+- **One source tree, many backends.** CUDA, CPU, Metal, and Vulkan from the same code, loading safetensors and GGUF.
+- **Faithful to vLLM.** The V1 / Model Runner V2 architecture is mirrored one-to-one so upstream vLLM changes port mechanically, and correctness is held token-for-token against the pinned oracle.
+- **Honest numbers.** Every capability is labelled correctness-complete, speed-pending, build-only, or hardware-blocked, and the evidence is in the record.
 
 ## Project record
 
-The canonical project record lives under [`.agents/`](.agents/), indexed by
-[AGENTS.md](AGENTS.md):
+The canonical project record lives under [`.agents/`](.agents/), indexed by [AGENTS.md](AGENTS.md). This README is a human-readable current-state snapshot, not a chronological log: detailed status and evidence live in [`.agents/state.md`](.agents/state.md), the [parity ledger](.agents/parity-ledger.md), the [area matrices](.agents/model-matrix.md), and [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-- [roadmap v1](.agents/roadmap_v1.md)
-- [benchmark scoreboard](docs/BENCHMARKS.md)
-- [gates](.agents/gates.md) and [benchmark protocol](.agents/benchmark-protocol.md)
-- [engine](.agents/engine-matrix.md), [model](.agents/model-matrix.md),
-  [quantization](.agents/quantization-matrix.md),
-  [kernel](.agents/kernel-matrix.md), and
-  [backend](.agents/backend-matrix.md) matrices
-- [parity ledger](.agents/parity-ledger.md) and
-  [state log](.agents/state.md) for the current record era's detailed
-  chronology and evidence
-- [upstream sync protocol](.agents/upstream-sync.md) and
-  [v0.25.0 audit](.agents/sync/2026-07-12-702f481.md)
+## Citation
 
-The README, benchmark scoreboard, roadmap, matrices, and live specs are compact
-current-state surfaces, not chronological logs. Detailed state/ledger records
-are append-only within an open era, then frozen under `.agents/completed/` and
-replaced by a concise carry-forward when that era closes.
+If you use vllm.cpp, please cite this repository and the upstream vLLM project:
+
+```bibtex
+@software{vllm_cpp,
+  title  = {vllm.cpp: a C++ inference engine porting vLLM},
+  author = {Di Giacinto, Ettore},
+  url    = {https://github.com/mudler/vllm.cpp},
+  year   = {2026}
+}
+```
+
+vLLM is by the vLLM project ([vllm-project/vllm](https://github.com/vllm-project/vllm)). Model weights are governed by their own licenses, so check each model card.
+
+## Author
+
+Ettore Di Giacinto ([@mudler](https://github.com/mudler)).
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE)
-for third-party attributions.
+vllm.cpp is released under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE) for third-party attributions. The model weights keep their own licenses.
+
+---
+
+Built by the [LocalAI](https://github.com/mudler/LocalAI) team. If you want to run LLMs (and vision, voice, image, and video models) locally on any hardware with an OpenAI-compatible API, [give LocalAI a star](https://github.com/mudler/LocalAI).

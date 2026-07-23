@@ -20984,3 +20984,53 @@ docs/BENCHMARKS.md (docs/BENCHMARKS.md).
   model->connector->live-server e2e with **key-agreement** against a Python
   vLLM+LMCache peer, plus the DGX output-invariance + every-axis throughput arms.
   Not pushed.
+
+## 2026-07-23 — Structured output PRODUCTION-WIRED + C ABI v2 `structured_*` fields (`CLAIM-CAPI-STRUCTURED-V2`, engine-matrix row `TOOLS-STRUCTURED-CORE`, direct-to-main, user-directed)
+
+Motivation: LocalAI is adding a `vllm-cpp` backend whose tool-calling path
+constrains generation with a GBNF grammar per request (llama-cpp parity), so the
+C ABI must carry the structured-output constraints — and they must actually gate
+decoding in the production engine, which they did not: only
+`test_response_format_e2e.cpp` ever constructed a `StructuredOutputManager`;
+`LoadedEngine` built its Scheduler/EngineCore with the null default and
+`AsyncLLM` hardcoded `/*structured_output_manager=*/nullptr`, so a server
+`response_format` request flowed to the sampler UNCONSTRAINED
+(`Scheduler::get_grammar_bitmask` null-manager no-op).
+
+Change (TDD, red-first on the synthetic capi engine):
+- `LoadedEngine` now owns an engine-wide `StructuredOutputManager` member
+  (`max_num_seqs`, `MakeNativeBackendFactory(tokenizer_, config_.vocab_size)`;
+  tokenizer_ declared earlier so it outlives the manager) and threads it into
+  `MakeScheduler` (both Scheduler and AsyncScheduler arms), `engine_core_`, and
+  the lazily built `AsyncLLM` (`src/vllm/entrypoints/model_loader.{h,cpp}`).
+- `AsyncLLM` ctor gained a trailing `StructuredOutputManager*` (default null,
+  existing callers unchanged) forwarded to its `InprocClient`
+  (`{include,src}/vllm/v1/engine/async_llm.*`).
+- C ABI v2 (`include/vllm.h`, `src/capi/vllm_c.cpp`): additive
+  `vllm_sampling_params` fields `structured_json` / `structured_regex` /
+  `structured_choice`+`n_structured_choice` / `structured_grammar` /
+  `structured_json_object`, zeroed in `vllm_sampling_params_default`, lowered in
+  `ToSamplingParams` to `StructuredOutputsParams` (PostInit enforces the
+  upstream exactly-one rule, mapped to a status — no throw across the ABI).
+  `VLLM_ABI_VERSION` 1→2.
+- Tests (`tests/capi/test_capi.cpp`): choice-constrained greedy blocking
+  completion (baseline argmax proven ≠ constrained result), the same through
+  `vllm_complete_stream`, and the two-constraints rejection (engine stays
+  reusable). Red before the wiring (constraint silently ignored, rejection
+  absent), green after.
+
+Verification (isolated worktree on the clean base, not the shared checkout):
+`test_capi` 17/17 (127 asserts), `test_openai_api_server` 22/22 (293 asserts —
+UP from 274 at base: the server suite exercises constrained decoding once the
+manager is wired), `test_openai_conformance` 23/23, plus the full ctest
+battery. Pre-existing red OUT of this claim's scope: `test_model_loader_gguf`
+fails identically on the clean base commit (stale unsupported-architecture
+fixture expecting `LlamaForCausalLM` to be rejected).
+
+Perf: NOT APPLICABLE (see `docs/BENCHMARKS.md` correctness-only entry of this
+date) — the bitmask path runs only for constrained requests; unconstrained hot
+paths untouched.
+
+Next gates (unchanged, still open on `TOOLS-STRUCTURED-CORE`): upstream
+backend matrix (xgrammar etc.), full STRUCTURAL_TAG surface, streaming parser
+engine.

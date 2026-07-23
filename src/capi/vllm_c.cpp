@@ -140,6 +140,33 @@ vllm::SamplingParams ToSamplingParams(const vllm_sampling_params& c,
       if (c.stop[i] != nullptr) sp.stop.emplace_back(c.stop[i]);
     }
   }
+  // Structured output (ABI v2): lower the POD constraint fields into
+  // StructuredOutputsParams. PostInit() -> Verify() enforces the exactly-one
+  // rule, so setting more than one constraint is rejected here, not deep in the
+  // engine.
+  const bool has_choice =
+      c.structured_choice != nullptr && c.n_structured_choice > 0;
+  if (c.structured_json != nullptr || c.structured_regex != nullptr ||
+      has_choice || c.structured_grammar != nullptr ||
+      c.structured_json_object != 0) {
+    vllm::StructuredOutputsParams so;
+    if (c.structured_json != nullptr) so.json = std::string(c.structured_json);
+    if (c.structured_regex != nullptr)
+      so.regex = std::string(c.structured_regex);
+    if (has_choice) {
+      std::vector<std::string> choice;
+      choice.reserve(static_cast<size_t>(c.n_structured_choice));
+      for (int32_t i = 0; i < c.n_structured_choice; ++i) {
+        if (c.structured_choice[i] != nullptr)
+          choice.emplace_back(c.structured_choice[i]);
+      }
+      so.choice = std::move(choice);
+    }
+    if (c.structured_grammar != nullptr)
+      so.grammar = std::string(c.structured_grammar);
+    if (c.structured_json_object != 0) so.json_object = true;
+    sp.structured_outputs = std::move(so);
+  }
   sp.output_kind = output_kind;
   sp.PostInit();
   return sp;
@@ -223,6 +250,12 @@ VLLM_API vllm_sampling_params vllm_sampling_params_default(void) {
   p.ignore_eos = 0;
   p.stop = nullptr;
   p.n_stop = 0;
+  p.structured_json = nullptr;
+  p.structured_regex = nullptr;
+  p.structured_choice = nullptr;
+  p.n_structured_choice = 0;
+  p.structured_grammar = nullptr;
+  p.structured_json_object = 0;
   return p;
 }
 

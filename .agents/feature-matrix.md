@@ -134,7 +134,7 @@ and reference-engine performance.
 
 | Feature | Upstream | Status | Notes | Spec |
 |---|---|---|---|---|
-| Structured outputs: `json`(schema)/`json_object`/`regex`/`choice`/`grammar` + `response_format` | `v1/structured_output/` | `PARTIAL` T0 | seam + native backend work for a bounded JSON-schema subset; upstream backend matrix is unported | `planned: specs/structured-outputs.md` |
+| Structured outputs: `json`(schema)/`json_object`/`regex`/`choice`/`grammar` + `response_format` | `v1/structured_output/` | `PARTIAL` T0 | seam + native backend work for a bounded JSON-schema subset; PRODUCTION-WIRED 2026-07-23 (`CLAIM-CAPI-STRUCTURED-V2`): `LoadedEngine` owns the manager (native factory) threaded into Scheduler/EngineCore/AsyncLLM (`src/vllm/entrypoints/model_loader.cpp`), and the C ABI exposes the constraints (ABI v2 `structured_*`, `include/vllm.h` + `src/capi/vllm_c.cpp`; tests `tests/capi/test_capi.cpp` structured cases); upstream backend matrix is unported | `planned: specs/structured-outputs.md` |
 | xgrammar C++ core as 2nd backend | `structured_output/backend_xgrammar.py` | ☐ T1 | same proven seam; closes whitespace/key-order/exotic-schema parity | `planned: specs/xgrammar-backend.md` |
 | STRUCTURAL_TAG (full) | `structured_output/`, `tool_parsers/structural_tag_registry.py` | `PARTIAL` T1 | tool-choice subset works; full response-format/tag surface absent | `planned: specs/structural-tag.md` |
 | guidance / outlines backends | `structured_output/` | ☐ T2 | | `planned: specs/guidance-outlines-backends.md` |

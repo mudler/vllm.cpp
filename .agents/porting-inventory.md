@@ -281,7 +281,11 @@ nonblocking callback delivery over the shared AsyncLLM],
 `vllm_string_free`/`vllm_completion_free`, `vllm_last_error`, `vllm_version`;
 opaque handles, no-throw-across-ABI, thread-local error, unique per-call request
 ids — cgo/purego-friendly for LocalAI; W2 CPU/TSan/dlopen gates green, GB10
-G1/G3-G6 pending). The
+G1/G3-G6 pending). ABI v2 (2026-07-23, `CLAIM-CAPI-STRUCTURED-V2`): additive
+structured-output constraint fields on `vllm_sampling_params`
+(`structured_json`/`structured_regex`/`structured_choice`/`structured_grammar`/
+`structured_json_object`), lowered to `StructuredOutputsParams` under the
+upstream exactly-one rule; `VLLM_ABI_VERSION` bumped 1→2. The
 richer C++ API (`include/vllm/*.hpp` mirroring `LLM`/`AsyncLLM`) is later.
 Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI server),
 `examples/bench` (M2). DoD (LocalAI-style dlopen consumption) MET.

@@ -32,7 +32,7 @@ vllm.cpp implements an intentionally focused subset of vLLM, held to token-for-t
 | KV offload to CPU / disk | Built, opt-in, off by default | CPU and disk tiers with identity-checked blocks, selected by a KVTransferConfig connector (a disk-offload tier and the LMCache lm:// client) over one abstract KVConnector ABI; scheduler wired, worker-side GPU load pending |
 | LMCache client (`lm://` remote KV) | Built, opt-in, off by default; full model e2e pending | Pure-C++ `lm://` client wired as an `LMCacheConnector` (a `KVConnector`) selected by `KVTransferConfig`, no `lmcache` package in-process. A repeated prefix stored on the remote is looked up, shortcuts prefill through the real scheduler, and loads back byte-identical (proven vs a real `lmcache.v1.server`); a mismatched block is refused. Full model e2e with peer key-agreement is next |
 | Sampling | Supported | Greedy, temperature, top-k, top-p, min-p, penalties, allowed-token / bad-word masks |
-| Structured output | Supported (subset) | JSON schema, JSON object, regex, choice, GBNF grammar, Hermes-style tool-call subset |
+| Structured output | Supported (subset), engine-enforced | JSON schema, JSON object, regex, choice, GBNF grammar, Hermes-style tool-call subset. Constrained decoding runs in the production engine (native grammar backend, per-step logits bitmask) and is reachable from OpenAI `response_format` and the C ABI (ABI v2 `structured_*` fields) |
 | OpenAI server | Supported (subset) | `/v1/completions`, `/v1/chat/completions`, streaming SSE, `/v1/models`, `/health`, `/version` |
 | Tokenizers | Supported | Byte-level BPE (Qwen/Llama-3/OPT/GPT-2/DeepSeek) and SentencePiece BPE (Mistral/Gemma), plus GGUF vocab; byte-exact vs the vLLM oracle |
 
@@ -209,7 +209,7 @@ For a production deployment, use [LocalAI](https://localai.io), which can embed 
 
 ## Consuming it as a library (C API and C++)
 
-Link `libvllm` (static or shared) and include [`include/vllm.h`](include/vllm.h). It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 1`, 17 exported symbols) suitable for `dlopen` / FFI / LocalAI integration.
+Link `libvllm` (static or shared) and include [`include/vllm.h`](include/vllm.h). It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 2`, 17 exported symbols) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
 #include "vllm.h"
@@ -234,7 +234,7 @@ if (vllm_complete(engine, "The capital of France is", &sp, &out) == VLLM_OK) {
 vllm_engine_free(engine);
 ```
 
-The ABI covers lifecycle (`vllm_engine_load` / `vllm_engine_free`), blocking and streaming completion (`vllm_complete`, `vllm_complete_stream`), non-blocking concurrent requests (`vllm_request_submit` / `_cancel` / `_wait` / `_done` / `_error` / `_free`), memory helpers, and diagnostics (`vllm_last_error`, `vllm_version`, `vllm_abi_version`).
+The ABI covers lifecycle (`vllm_engine_load` / `vllm_engine_free`), blocking and streaming completion (`vllm_complete`, `vllm_complete_stream`), non-blocking concurrent requests (`vllm_request_submit` / `_cancel` / `_wait` / `_done` / `_error` / `_free`), memory helpers, and diagnostics (`vllm_last_error`, `vllm_version`, `vllm_abi_version`). Structured output (ABI v2): set at most one of `structured_json` (JSON-Schema string), `structured_regex`, `structured_choice`/`n_structured_choice`, `structured_grammar` (GBNF), or `structured_json_object` on `vllm_sampling_params` and generation is grammar-constrained per step on every completion entry point.
 
 For C++ consumers, the higher-level surface lives under [`include/vllm/`](include/vllm/): `LoadedEngine::FromModelDir(...)` ([`entrypoints/model_loader.h`](include/vllm/entrypoints/model_loader.h)) hands back the synchronous `LLMEngine` ([`v1/engine/llm_engine.h`](include/vllm/v1/engine/llm_engine.h)) or the async `AsyncLLM` ([`v1/engine/async_llm.h`](include/vllm/v1/engine/async_llm.h)) the server itself uses, plus `SamplingParams` and `RequestOutput`. The underlying portable tensor runtime is `vt::` ([`include/vt/`](include/vt/): `tensor.h`, `dtype.h`, `ops.h`, `backend.h`, and friends), which carries no ggml or PyTorch dependency.
 

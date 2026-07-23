@@ -29,6 +29,7 @@
 #include "vllm/v1/engine/output_processor.h"
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/structured_output/manager.h"
 #include "vllm/v1/worker/gpu/runner.h"
 #include "vt/backend.h"
 
@@ -173,7 +174,8 @@ class LoadedEngine {
   static std::unique_ptr<vllm::v1::Scheduler> MakeScheduler(
       bool async_enabled, vllm::SchedulerConfig scheduler_config,
       vllm::v1::KVCacheConfig kv_cache_config, int block_size,
-      bool enable_caching);
+      bool enable_caching,
+      vllm::v1::StructuredOutputManager* structured_output_manager);
   // Ensure NONE_HASH is initialized before the scheduler/hasher are built
   // (upstream global init). Idempotent; runs as the first member initializer.
   static bool EnsureNoneHash();
@@ -199,6 +201,12 @@ class LoadedEngine {
   // Resolved once, in dependency order after runner_ (see the accessors above).
   bool async_scheduling_enabled_;
   int max_concurrent_batches_;
+  // The engine's StructuredOutputManager (upstream EngineCore constructs one,
+  // core.py:134), wired with the NATIVE backend factory over tokenizer_ (which
+  // outlives it — declared earlier) so response_format / C-ABI structured
+  // constraints actually gate decoding. Declared before scheduler_ /
+  // engine_core_, which hold a pointer to it.
+  vllm::v1::StructuredOutputManager structured_output_manager_;
   // Polymorphic scheduler: a plain Scheduler by default, an AsyncScheduler when
   // async_scheduling_enabled_. Heap-held so the concrete class is chosen at
   // construction; engine_core_ / async_engine_ share this one instance by

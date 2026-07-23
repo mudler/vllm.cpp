@@ -43,8 +43,11 @@ extern "C" {
 /* ── ABI version ──────────────────────────────────────────────────────────────
  * Bumped on any incompatible change to the structs / signatures below. A
  * consumer can compare this against vllm_abi_version() to detect a mismatch
- * between the header it compiled against and the loaded library. */
-#define VLLM_ABI_VERSION 1
+ * between the header it compiled against and the loaded library.
+ * v2: structured-output constraint fields appended to vllm_sampling_params
+ * (structured_json / structured_regex / structured_choice / structured_grammar /
+ * structured_json_object). */
+#define VLLM_ABI_VERSION 2
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -121,6 +124,28 @@ typedef struct vllm_sampling_params {
   int32_t ignore_eos;        /* 0/1: keep generating past EOS. */
   const char* const* stop;   /* array of stop strings (may be NULL). */
   int32_t n_stop;            /* number of entries in `stop`. */
+  /* ── Structured output (ABI v2) ─────────────────────────────────────────────
+   * POD mirror of vllm::StructuredOutputsParams (the same constraints the
+   * OpenAI response_format layer lowers to). AT MOST ONE of the five
+   * constraints below may be set (non-NULL / non-zero); more than one is
+   * rejected with an error status (upstream's exactly-one rule). The strings
+   * are borrowed for the duration of the call; the library copies them.
+   * Enforcement is engine-side per-step constrained decoding (a grammar
+   * bitmask over the logits), on every completion entry point.
+   *   - structured_json: a JSON-Schema document, as a JSON string; the output
+   *     is constrained to instances of that schema.
+   *   - structured_regex: the output matches the regular expression.
+   *   - structured_choice / n_structured_choice: the output is exactly one of
+   *     the given strings.
+   *   - structured_grammar: a GBNF (llama.cpp-style) grammar.
+   *   - structured_json_object: != 0 => some valid JSON object (schema-free
+   *     "JSON mode"). */
+  const char* structured_json;          /* JSON-Schema string, or NULL. */
+  const char* structured_regex;         /* regular expression, or NULL. */
+  const char* const* structured_choice; /* array of choices (may be NULL). */
+  int32_t n_structured_choice;          /* entries in structured_choice. */
+  const char* structured_grammar;       /* GBNF grammar, or NULL. */
+  int32_t structured_json_object;       /* 0/1: schema-free JSON-object mode. */
 } vllm_sampling_params;
 
 /* ── Completion result ────────────────────────────────────────────────────────

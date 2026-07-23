@@ -55,10 +55,16 @@ class AsyncLLM {
   // step_with_batch_queue for depth-2 overlap. LoadedEngine resolves it once from
   // SchedulerConfig::ResolveAsyncScheduling(runner_supports_async()) and passes it
   // here; a caller that constructs AsyncLLM directly keeps the sync default.
+  //
+  // structured_output_manager: the engine's StructuredOutputManager, threaded
+  // through to the EngineCoreProc (grammar_init + the scheduler's bitmask).
+  // Null keeps structured output a no-op (backward-compat with tests that
+  // build a bare stack).
   AsyncLLM(InputProcessor& input_processor, Scheduler& scheduler,
            Executor& executor, OutputProcessor& output_processor,
            BlockHasher block_hasher = nullptr, int shutdown_timeout_s = 0,
-           int max_concurrent_batches = 1);
+           int max_concurrent_batches = 1,
+           StructuredOutputManager* structured_output_manager = nullptr);
   ~AsyncLLM();
 
   AsyncLLM(const AsyncLLM&) = delete;

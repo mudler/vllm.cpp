@@ -1937,6 +1937,27 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Structured output wired in the production engine + C ABI v2 `structured_*`
+  fields - `NOT APPLICABLE` (2026-07-23, `CLAIM-CAPI-STRUCTURED-V2`).**
+  `benchmark_binding=false`. **Correctness/enablement change, no performance
+  claim.** `LoadedEngine` now constructs the engine-wide
+  `StructuredOutputManager` (native grammar backend over the tokenizer) and
+  threads it into the Scheduler, `EngineCore`, and `AsyncLLM` - previously only
+  tests wired it, so `response_format` reached the sampler unconstrained. The C
+  ABI gains ABI v2 structured-output constraint fields on
+  `vllm_sampling_params` (`structured_json` / `structured_regex` /
+  `structured_choice` / `structured_grammar` / `structured_json_object`),
+  lowered to `StructuredOutputsParams` with the upstream exactly-one rule.
+  Constrained decoding is per-step bitmask work that runs ONLY for requests
+  carrying a constraint; the manager is otherwise a lazily-unused member, so
+  unconstrained hot paths are untouched (full ctest battery re-run on the
+  change; the one red test, `test_model_loader_gguf`, fails identically on the
+  clean base commit - a stale unsupported-architecture fixture - and is out of
+  this claim's scope). Evidence: `tests/capi/test_capi.cpp` structured cases
+  (blocking + streaming constraint, exactly-one rejection);
+  `test_openai_api_server` + `test_openai_conformance` green with the manager
+  wired. No binding number is created, re-based, or invalidated.
+
 - **sm_120a (consumer Blackwell) as a BUILD-supported CUDA target - `NOT
   APPLICABLE` (2026-07-22, `CLAIM-CUDA-SM120-BRINGUP`,
   [spec §W8](../.agents/specs/cuda-arch-additivity.md)).**

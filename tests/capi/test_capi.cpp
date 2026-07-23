@@ -660,6 +660,86 @@ TEST_CASE("capi: non-blocking callback errors propagate and leave the engine reu
   vllm_engine_free(eng);
 }
 
+// ─── structured output (ABI v2) ──────────────────────────────────────────────
+// A `choice` constraint over the synthetic vocab: the single greedy token must
+// be one of the allowed strings ("1" == id 8, "2" == id 9), which the
+// unconstrained argmax provably is not (asserted first). This proves the C ABI
+// fields reach the engine's per-step grammar bitmask, end to end through the
+// production LoadedEngine wiring — not just the SamplingParams translation.
+TEST_CASE("capi: structured_choice constrains greedy decoding") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+
+  // Unconstrained greedy baseline: argmax of "hello" is NOT "1" or "2".
+  vllm_sampling_params base = GreedyParams(1);
+  vllm_completion unconstrained;
+  REQUIRE(vllm_complete(eng, "hello", &base, &unconstrained) == VLLM_OK);
+  REQUIRE(unconstrained.text != nullptr);
+  const std::string baseline(unconstrained.text);
+  CAPTURE(baseline);
+  CHECK(baseline != "1");
+  CHECK(baseline != "2");
+  vllm_completion_free(&unconstrained);
+
+  const char* choices[] = {"1", "2"};
+  vllm_sampling_params sp = GreedyParams(1);
+  sp.structured_choice = choices;
+  sp.n_structured_choice = 2;
+  vllm_completion out;
+  REQUIRE(vllm_complete(eng, "hello", &sp, &out) == VLLM_OK);
+  REQUIRE(out.text != nullptr);
+  const std::string text(out.text);
+  CAPTURE(text);
+  CHECK((text == "1" || text == "2"));
+  vllm_completion_free(&out);
+  vllm_engine_free(eng);
+}
+
+// The same constraint through the streaming path: every delta is drawn from the
+// constrained token set, so the concatenation equals one of the choices for the
+// first token.
+TEST_CASE("capi: structured_choice constrains vllm_complete_stream") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+
+  const char* choices[] = {"1", "2"};
+  vllm_sampling_params sp = GreedyParams(1);
+  sp.structured_choice = choices;
+  sp.n_structured_choice = 2;
+
+  StreamAccumulator acc;
+  REQUIRE(vllm_complete_stream(eng, "hello", &sp, &AccumulateCb, &acc) ==
+          VLLM_OK);
+  CHECK(acc.saw_finished);
+  CAPTURE(acc.text);
+  CHECK((acc.text == "1" || acc.text == "2"));
+  vllm_engine_free(eng);
+}
+
+// Exactly-one rule: two constraints set at once must be rejected with a status
+// (no throw across the ABI) and a mentioning error, and the engine must stay
+// usable afterwards.
+TEST_CASE("capi: more than one structured constraint is rejected cleanly") {
+  vllm_engine* eng = MakeSyntheticEngine();
+  REQUIRE(eng != nullptr);
+
+  vllm_sampling_params sp = GreedyParams(1);
+  sp.structured_grammar = "root ::= \"1\"";
+  sp.structured_json_object = 1;
+  vllm_completion out;
+  CHECK(vllm_complete(eng, "hello", &sp, &out) != VLLM_OK);
+  CHECK(out.text == nullptr);
+  CHECK(std::string(vllm_last_error()).size() > 0);
+
+  // Engine reusable after the rejected request.
+  vllm_sampling_params ok = GreedyParams(1);
+  vllm_completion out2;
+  CHECK(vllm_complete(eng, "hello", &ok, &out2) == VLLM_OK);
+  CHECK(out2.text != nullptr);
+  vllm_completion_free(&out2);
+  vllm_engine_free(eng);
+}
+
 // ─── version / abi ───────────────────────────────────────────────────────────
 TEST_CASE("capi: version and abi-version are exposed") {
   CHECK(std::string(vllm_version()).size() > 0);

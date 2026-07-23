@@ -135,6 +135,17 @@ marks and rollup counts in lockstep with the detailed row states. It touched no
 already accurately stated. Wired into the ci.yml `agent-record` job; policy added
 to `AGENTS.md`; see the parity-ledger row of the same date.
 
+**Structured-output coordination note (2026-07-23, `CLAIM-CAPI-STRUCTURED-V2`,
+DONE, direct-to-main, user-directed).** Production-wired the engine-wide
+`StructuredOutputManager` (LoadedEngine -> Scheduler/EngineCore/AsyncLLM) and
+added the C ABI v2 `structured_*` constraint fields; engine-matrix row
+`TOOLS-STRUCTURED-CORE` stays `PARTIAL` (upstream backend matrix still
+unported) with its code/test anchors updated. Scope owned during the change:
+`src/vllm/entrypoints/model_loader.{h,cpp}`,
+`{include,src}/vllm/v1/engine/async_llm.*`, `include/vllm.h`,
+`src/capi/vllm_c.cpp`, `tests/capi/test_capi.cpp`. Details in the state-log
+entry of the same date.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-MLA-PREFIX-CACHE-ASSERT` | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` (bugfix — restores its SACRED gate under asserts-enabled builds; the shared prefix-cache manager assertion it relaxes stays owned by `CLAIM-PREFIX-PROMPT-CACHING`, no row-state change to that row) | Claude Code (opus-4-8) | isolated worktree `/home/mudler/_git/vllm.cpp-mla-fix` (branch `fix/mla-prefix-cache-assert`, base `6abe09c`); dgx repro `/home/mudler/repro_deepseek` (unfixed) + `/home/mudler/repro_fixed` (fixed) | `fix/mla-prefix-cache-assert` | `src/vllm/v1/core/single_type_kv_cache_manager.cpp` (assert only) + `tests/vllm/v1/test_single_type_kv_cache_manager.cpp` (new MLA cases) | `DONE` (2026-07-23) | 2026-07-23 root-caused + fixed the DeepSeek-V2 assert abort |

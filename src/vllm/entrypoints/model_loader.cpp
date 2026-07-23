@@ -18,6 +18,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
+#include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vt/dtype.h"
 #include "vt/tensor.h"
 #if defined(VLLM_CPP_CUDA) && defined(VT_CUTLASS_NVFP4)
@@ -205,16 +206,17 @@ bool LoadedEngine::ResolveAsyncEnabled(
 std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
     bool async_enabled, vllm::SchedulerConfig scheduler_config,
     vllm::v1::KVCacheConfig kv_cache_config, int block_size,
-    bool enable_caching) {
+    bool enable_caching,
+    vllm::v1::StructuredOutputManager* structured_output_manager) {
   if (async_enabled) {
     // get_scheduler_cls -> AsyncScheduler (scheduler.py:180-189).
     return std::make_unique<vllm::v1::AsyncScheduler>(
         std::move(scheduler_config), std::move(kv_cache_config), block_size,
-        enable_caching);
+        enable_caching, structured_output_manager);
   }
   return std::make_unique<vllm::v1::Scheduler>(
       std::move(scheduler_config), std::move(kv_cache_config), block_size,
-      enable_caching);
+      enable_caching, structured_output_manager);
 }
 
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
@@ -274,6 +276,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
                                                           : 8,
                                   max_num_batched_tokens_, params.policy)
                                   .MaxConcurrentBatches(async_scheduling_enabled_)),
+      // The engine-wide structured-output manager, native backend over the
+      // tokenizer (upstream EngineCore constructs one unconditionally,
+      // core.py:134). Wired into the scheduler + engine cores below so
+      // response_format / C-ABI structured constraints gate decoding.
+      structured_output_manager_(
+          params.max_num_seqs > 0 ? params.max_num_seqs : 8,
+          vllm::v1::MakeNativeBackendFactory(
+              tokenizer_, static_cast<int>(config_.vocab_size))),
       // AsyncScheduler when the flip resolved ON, else the synchronous Scheduler.
       scheduler_(MakeScheduler(
           async_scheduling_enabled_,
@@ -281,9 +291,10 @@ LoadedEngine::LoadedEngine(HfConfig config,
               max_model_len_, params.max_num_seqs > 0 ? params.max_num_seqs : 8,
               max_num_batched_tokens_, params.policy),
           kv_cfg_, params.block_size > 0 ? params.block_size : 32,
-          /*enable_caching=*/prefix_caching_enabled_)),
+          /*enable_caching=*/prefix_caching_enabled_,
+          &structured_output_manager_)),
       executor_(runner_),
-      engine_core_(*scheduler_, executor_),
+      engine_core_(*scheduler_, executor_, &structured_output_manager_),
       input_processor_(tokenizer_, config_),
       output_processor_(&tokenizer_),
       block_hasher_(prefix_caching_enabled_
@@ -361,7 +372,8 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
     // default keeps max_concurrent_batches_ == 1 (depth-1 step()).
     async_engine_ = std::make_unique<vllm::v1::AsyncLLM>(
         input_processor_, *scheduler_, executor_, output_processor_,
-        block_hasher_, /*shutdown_timeout_s=*/0, max_concurrent_batches_);
+        block_hasher_, /*shutdown_timeout_s=*/0, max_concurrent_batches_,
+        &structured_output_manager_);
   }
   return *async_engine_;
 }

@@ -19437,3 +19437,76 @@ cd build && ctest -j2
 ./tests/test_kv_offload_cpu
 ./tests/test_kv_offload_fs
 ```
+
+## 2026-07-23 — INDEPENDENT GATE VERIFICATION of the KV W1–W3 + prefix-cache-stats commit (`a2112b2`): the whole battery was RE-RUN, not trusted. GREEN. (`CLAIM-KV-PERSISTENCE-LMCACHE` W1–W3 + `CLAIM-PREFIX-PROMPT-CACHING` W1, worktree `agent-a39bc43d3e973d12a`, base `origin/main` `259f5c6`)
+
+The parent commit `a2112b2` was authored but its gates were **never actually
+run** — the ledger/state/BENCHMARKS numbers it recorded (27B 235/235 … no
+warnings …) were written speculatively. This entry records the results of
+INDEPENDENTLY building the branch and running the full battery. Every number
+below is from a real run on this SHA, not carried over. **No code fix was
+required — the build is clean and every gate passes; this is a pure
+verification checkpoint.**
+
+**Build — CLEAN.** Local CPU `-Werror` build (dev box, `VLLM_CPP_CUDA=OFF`):
+exit 0, **0 warnings / 0 errors**. dgx CUDA `-Werror` build (`git archive`
+transfer to `~/work/vllm.cpp-kvoffload-verify`, `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON
+-DCMAKE_CUDA_ARCHITECTURES=121a`, whole series under one `flock $HOME/gpu.lock`):
+build exit 0, **warning/error line count 0**. So the author's code compiled
+cleanly on BOTH toolchains on the first try; nothing was broken.
+
+**The commit's 4 new suites — PASS on CPU AND on the dgx CUDA build**, identical
+counts both places: `test_none_hash_determinism` 7/7 (56 assertions, 1
+skip-decorated child case), `test_prefix_cache_stats` 12/12 (36; MEASURED hit
+rate **0.75**), `test_kv_offload_cpu` 21/21 (91), `test_kv_offload_fs` 22/22 + 3
+SKIP (239; MEASURED cross-restart hit **6/6**). **The determinism test is
+GENUINELY cross-process** — it `readlink`s `/proc/self/exe`, `popen`-re-execs
+itself with a `--test-case` filter, and compares the chained hash lists printed
+by two SEPARATELY launched child processes (not an in-process loop); the
+`VLLM_PREFIX_CACHING_HASH_SEED=random` negative control confirms two processes
+DISAGREE, which is what makes the default-agreement meaningful.
+
+**SACRED regressions — ALL UNCHANGED, each STANDALONE** (production flags,
+one big model at a time, not `ctest -j`): 27B `test_qwen27_paged_engine`
+**235/235** (16/16 tokens), 35B `test_qwen36_paged_engine` **315/315** (single
++ batched-6), Qwen3-Coder `test_qwen3coder_paged_engine` **6/6** (138), Qwen3-dense
+`test_qwen3_paged_engine` **16/16** (664, 0.6B + 4B), OPT `test_opt_paged_engine`
+**6/6** (96/96 tokens, 63), DeepSeek-V2 `test_deepseek_v2_paged_engine`
+**8/8** (223/223). **No token moved** — the changed-default `NONE_HASH` (A) and
+the scheduler stats fold (B) are proven token-neutral, including on both NVFP4
+gate models and the two near-tie MoE/dense models.
+
+**DeepSeek-V2 hit the documented contention transient and was cleared per
+protocol.** In the batched series run it aborted at **95 assertions** (fatal
+`REQUIRE` anchor-drift, prompt[3] tok=9: engine 207 vs committed 245, a genuine
+0.25-nat near-tie under async scheduling), the EXACT "95/223 under contention"
+signature. A concurrent agent (the `~/work/l5c` tree) was in fact contending for
+the box. **Re-run STANDALONE under an exclusive `flock`, 3×: 223/223 every time,
+8/8 prompts, exit 0**, with the near-tie divergences byte-stable across all three
+runs (prompt[3] tok=9 → our=245 = the committed golden). Verdict: the documented
+transient, NOT a regression, NOT attributable to this commit (which touches no
+model/compute path).
+
+**memcheck** (`compute-sanitizer --tool memcheck --leak-check=full`) on
+`test_kv_offload_cpu` and `test_kv_offload_fs`: **0 bytes leaked, 0 errors**,
+suites 91/91 and 239/239 under the sanitizer. **HONEST COVERAGE CAVEAT:** these
+offload tests construct their transfer worker with `vt::Device{kCPU}`, so they
+drive `Backend::QueryEvent`'s true-returning CPU base, NOT the new
+`cuda_backend.cu` `cudaEventQuery` override. The only new device code in the
+commit therefore **compiles clean under CUDA `-Werror` but is not exercised by
+any test** — a real coverage gap. It is a 6-line `cudaEventQuery` wrapper
+(`cudaErrorNotReady`→false, clears the sticky status, else `Check`); low risk,
+but no test drives it and none is added here (verification scope, not new work).
+
+**Other checks:** full CPU ctest **161/161** (157 prior + 4 new; the lone
+`-j` miss was `test_openai_conformance`, which PASSES standalone — the documented
+HTTP-port flake). Record checkers green (`check-agent-record.py` OK,
+`check-doc-checkpoint.py` OK), `check-device-leakage.py` **DSR 86 == baseline 86**
+(holds). Goldens **md5-verified `2965ef5772b556d3f3f86fedf4221b2f` (475 files)
+identical before AND after** the whole dgx series (`git archive` transfer, never
+rsync).
+
+Repro (dgx, one flock): `bash ~/work/dgx_gate.sh` after the `git archive`
+transfer + configure; standalone DeepSeek re-run `~/work/dsv2_rerun.sh`.

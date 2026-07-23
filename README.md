@@ -745,6 +745,10 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
   configuration file it never reads back, and its only check omits most of
   those fields. Second, our disk tier honours a **size budget** and evicts, so
   it cannot fill the disk; vLLM's grows without limit.
+  These tiers were independently built and gated on 2026-07-23 (clean CUDA
+  `-Werror` build, 0 warnings; the four new suites and all six model
+  regressions green on GB10; goldens unchanged), so the storage layer is
+  verified, not merely written.
   What is still missing: nothing connects these tiers to the running engine
   yet, so there is no flag to enable them and no measured speed benefit. Note
   also that a disk cache written by vllm.cpp will not interoperate with a stock

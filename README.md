@@ -911,8 +911,15 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
   is the recommended first target; it keys on LMCache's own token hash, so it
   sidesteps the block-hash-compatibility question entirely. This is still an
   interop feature with a version-sync cost (LMCache is an unpinned, moving
-  target), not a mechanical port, and **no LMCache support is implemented or
-  benchmarked yet** — the analysis is scoping, not code.
+  target), not a mechanical port. **First code has landed (W1): the pure-CPU
+  `lm://` wire codec** — the fixed binary header messages, the cache-key string,
+  the blake3 rolling token hash (over a vendored copy of the official BLAKE3 C
+  library), and the `[2, layers, tokens, dim]` KV chunk layout — verified
+  byte-for-byte identical to the real Python LMCache codec on a captured-fixture
+  test, on both x86-64 and aarch64. It is a codec only: nothing connects to a
+  server yet (that is the next step, W2), it is **opt-in by absence** — no code
+  path reaches it — and there is **nothing to benchmark** (a codec moves no
+  tokens).
 - llama.cpp-style **imperative named session save/restore** — "save this
   conversation's cache to a file, reload it later" — is supported by neither us
   nor vLLM. It is the one caching capability llama.cpp genuinely has and vLLM

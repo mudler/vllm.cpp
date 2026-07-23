@@ -20468,3 +20468,61 @@ coordination claim, ledger, README, `docs/BENCHMARKS.md` (NOT APPLICABLE).
 `KVConnector` ABI, then MODE (1) `lm://` as the first LMCache client target;
 standing an `lmcache` server up on a test box (it is on no project box today) is
 the go/no-go gate's precondition.
+
+## 2026-07-23 — LMCache C++ CLIENT W1: the `lm://` wire codec (pure CPU, byte/bit-exact) — `CLAIM-LMCACHE-CPP-CLIENT`, base `96c5cbb`
+
+**What landed.** The first LMCache CODE — the MODE-1 (`lm://` remote-store) wire
+codec, pure CPU, in a dedicated `lmcache/` subdir so it never collides with the
+parent offload claim's files. Four modules mirroring four upstream files
+(LMCache `8570aad`):
+- `remote_protocol.{h,cpp}` ← `lmcache/v1/protocol.py:23-321` — the 186-byte
+  `ClientMetaMessage` / 36-byte `ServerMetaMessage` fixed-`struct` framing,
+  `ClientCommand`(PUT/GET/EXIST/LIST/HEALTH), `ServerReturnCode`(200/400),
+  `DTYPE_TO_INT`, `LOCATION_TO_INT`, shape pad/strip. Little-endian encoded
+  EXPLICITLY (upstream `struct` is native-endian; §9 deviation 13).
+- `cache_engine_key.{h,cpp}` ← `lmcache/utils.py:449-561` — `to_string` /
+  `from_string` for `model@world@worker@chunk_hash_hex@dtype[@tag%val]`.
+- `token_hasher.{h,cpp}` ← `lmcache/v1/multiprocess/token_hasher.py:37-49,179,192-230`
+  — the blake3 rolling prefix hash (none_hash + chunk rolling + fold-to-uint64),
+  computed with the VENDORED official BLAKE3 C impl.
+- `memory_format.{h,cpp}` ← `lmcache/v1/memory_management.py:79-133` — the
+  `KV_2LTD` `[2,L,T,D]` repack + inverse.
+
+**Vendoring decision.** blake3 is the external cache's OWN hash (not mirrorable
+from a vLLM dep), so the official BLAKE3-team C reference impl is vendored under
+`third_party/blake3/` (tag 1.5.5 / `81f772a`, dual CC0-1.0/Apache-2.0), built as
+a SEPARATE `blake3_vendored` static lib with the portable backend forced
+(`BLAKE3_NO_*`, `BLAKE3_USE_NEON=0`) — files unmodified (clean re-sync), off the
+`-Werror` path, byte-identical cross-arch. This is the project's FIRST compiled
+vendored dep; `third_party/README.md` + porting-inventory §9 (item 13) record it.
+`enable_language(C)` was added (project was CXX-only).
+
+**Correctness — the whole point: our wire bytes == the real Python codec's.**
+Fixtures captured from stdlib `struct` (LMCache's actual framing codec), the
+`blake3` PyPI package (the exact package `token_hasher.py` imports), and numpy
+(KV_2LTD) via `scripts/lmcache/gen_lmcache_fixtures.py` →
+`tests/fixtures/lmcache/lmcache_fixtures.json`. `test_lmcache_codec.cpp` asserts
+byte/bit-equality: **6/6 cases, 2074/2074 assertions.** blake3 (none_hash +
+single + chunk vectors) VERIFIED byte-identical on the dev box x86-64 AND the
+`dgx.casa` aarch64 box, both matching Python. Clean CPU `-Werror` 0 warnings.
+INERT by construction — grep confirms NO call site references the new symbols
+(the connector is W3), so every existing model/build path is untouched; the CUDA
+build is unaffected (blake3 is a plain-C static lib; the codec is host C++).
+
+**Effective `DTYPE_TO_INT` caveat.** `torch` is not installed on the build boxes,
+so the effective map (with the `torch.half is torch.float16` singleton collision
+resolving float16→2) is mirrored from source by reasoning and documented in
+`remote_protocol.h`; the hashes and framing themselves use the REAL Python codecs.
+
+**Records (same change).** Spec W1 row → DONE; coordination claim → `PARTIAL`
+(W1 landed, owns the new `lmcache/` files); engine-matrix `KV-EXTERNAL-CACHE`
+`SPIKE`→`ACTIVE` with code+test anchors; roadmap `ROAD-V1-D4` note; porting-
+inventory §9 item 13; ledger row; README; `docs/BENCHMARKS.md` (NOT APPLICABLE);
+`third_party/README.md`.
+
+**Next / open.** W2 — a blocking TCP `LMCacheRemoteClient` (`connect`/`sendall`/
+`recv_into`), the device→host repack path, and PUT/GET/EXIST against a REAL
+`lmcache.v1.server` (needs `lmcache` INSTALLED on a test box — on no project box
+today; a throwaway venv stood the fixtures up but a running server is the go/no-go
+precondition). Then W3 wires it as a `KVConnector` subclass over the parent
+claim's W5 abstract seam.

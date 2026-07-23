@@ -338,6 +338,12 @@ add_library(vllm STATIC
   src/vllm/v1/kv_offload/fs_tier.cpp
   src/vllm/v1/kv_offload/tiering_manager.cpp
   src/vllm/v1/kv_offload/kv_connector.cpp
+  # LMCache MODE-1 (lm://) wire codec — KV-EXTERNAL-CACHE W1 (pure CPU codec;
+  # no call site routes to it yet, the connector is W3).
+  src/vllm/v1/kv_offload/lmcache/memory_format.cpp
+  src/vllm/v1/kv_offload/lmcache/remote_protocol.cpp
+  src/vllm/v1/kv_offload/lmcache/cache_engine_key.cpp
+  src/vllm/v1/kv_offload/lmcache/token_hasher.cpp
   src/vllm/v1/core/sched/request_queue.cpp
   src/vllm/v1/core/sched/output.cpp
   src/vllm/v1/core/sched/scheduler.cpp
@@ -459,6 +465,27 @@ target_include_directories(vllm
 target_include_directories(vllm PRIVATE src)
 target_include_directories(vllm SYSTEM PUBLIC third_party)
 vllm_cpp_set_warnings(vllm)
+# --- Vendored BLAKE3 (LMCache MODE-1 lm:// token hash, KV-EXTERNAL-CACHE W1) --
+# The official BLAKE3 C implementation (third_party/blake3, upstream tag 1.5.5
+# / commit 81f772a; dual CC0-1.0 / Apache-2.0), the same algorithm the `blake3`
+# PyPI package LMCache imports binds. Built as a SEPARATE static lib with the
+# portable backend forced (every SIMD path disabled via BLAKE3_NO_*): the output
+# is byte-identical on x86-64 AND aarch64 (BLAKE3 is defined little-endian; the
+# portable load32 in blake3_impl.h assembles words byte-wise, endian-independent)
+# and this keeps the vendored C sources UNMODIFIED and off the -Werror path.
+# PIC so vllm_shared can link it. Provenance: third_party/README.md,
+# .agents/porting-inventory.md §9.
+enable_language(C)  # blake3 is plain C; the project is otherwise CXX-only
+add_library(blake3_vendored STATIC
+  third_party/blake3/blake3.c
+  third_party/blake3/blake3_dispatch.c
+  third_party/blake3/blake3_portable.c)
+target_compile_definitions(blake3_vendored PRIVATE
+  BLAKE3_NO_AVX512 BLAKE3_NO_AVX2 BLAKE3_NO_SSE41 BLAKE3_NO_SSE2
+  BLAKE3_USE_NEON=0)
+target_include_directories(blake3_vendored PUBLIC third_party/blake3)
+set_target_properties(blake3_vendored PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(vllm PUBLIC blake3_vendored)
 # --- Metal backend (BACKEND-METAL-MLX W0 skeleton) --------------------------
 # Purely ADDITIVE, exactly like the CUDA block below: a `target_sources` list, a
 # PUBLIC compile definition tests can gate on, and two framework links. No

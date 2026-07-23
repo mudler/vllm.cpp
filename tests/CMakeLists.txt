@@ -87,6 +87,12 @@ vllm_cpp_add_test(test_kv_offload_cpu vllm/v1/test_kv_offload_cpu.cpp)
 vllm_cpp_add_test(test_kv_offload_fs vllm/v1/test_kv_offload_fs.cpp)
 vllm_cpp_add_test(test_kv_offload_tiering vllm/v1/test_kv_offload_tiering.cpp)
 vllm_cpp_add_test(test_kv_offload_connector vllm/v1/test_kv_offload_connector.cpp)
+# LMCache MODE-1 (lm://) wire codec — KV-EXTERNAL-CACHE W1. Byte/bit-exact
+# against fixtures captured from the real Python codec (struct + the `blake3`
+# PyPI package + numpy); see tests/fixtures/lmcache/lmcache_fixtures.json.
+vllm_cpp_add_test(test_lmcache_codec vllm/v1/kv_offload/lmcache/test_lmcache_codec.cpp)
+target_compile_definitions(test_lmcache_codec PRIVATE
+  TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 vllm_cpp_add_test(test_scheduler_config vllm/test_scheduler_config.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)

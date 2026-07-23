@@ -739,6 +739,40 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     MEASURED c16 A/B (`VT_GDN_PACKED_DECODE_TRITON=1` vs default, interleaved 3
     pairs + w0 cold discard, one flock): triton [817.51, 821.06, 822.55] vs legacy [813.77, 815.62, 815.30] tok/s — paired mean **+5.48 tok/s (+0.67%)**, monotone (+3.74/+5.44/+7.25), 3/3 pairs positive; mean TPOT triton [161.04, 160.49, 160.35] vs legacy [162.09, 161.65, 161.93] = **-1.26 ms (-0.78%)** (median TPOT -1.13 ms); w0 cold-discard (triton 821.48/160.44) excluded. Kept default-OFF ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression). Kept **default OFF** — a new opt-in perf lever like the sibling GDN Triton kernels; the flip-to-default + binding exact-grid re-run is the follow-up, so no binding speed credit is claimed..
 
+13. **Vendored BLAKE3 + the LMCache MODE-1 (`lm://`) wire protocol port
+    (`KV-EXTERNAL-CACHE` W1):** an LMCache C++ CLIENT keys chunks on LMCache's
+    OWN blake3 rolling token hash (`lmcache/v1/multiprocess/token_hasher.py:37-49`
+    @ `8570aad`), the hash the `blake3` PyPI package LMCache imports computes.
+    blake3 is not mirrorable from a vLLM dep — it is the external cache's own
+    hash — so we VENDOR the official BLAKE3-team C reference implementation
+    (`third_party/blake3/`, upstream tag **1.5.5** / commit **81f772a**, dual
+    CC0-1.0 / Apache-2.0), built as a separate `blake3_vendored` static lib with
+    the PORTABLE backend forced (`BLAKE3_NO_AVX512/AVX2/SSE41/SSE2`,
+    `BLAKE3_USE_NEON=0`). Cleaner mirror than a from-scratch spec
+    re-implementation: the C files are UNMODIFIED (clean re-sync), kept off the
+    `-Werror` path, and byte-identical on x86-64 AND aarch64 (BLAKE3 is defined
+    little-endian; the portable `load32` assembles words byte-wise —
+    endian-independent, VERIFIED: `none_hash`/single/chunk vectors identical on
+    the dev box and on the `dgx.casa` aarch64 box, both matching the Python
+    `blake3` output). The wire FRAMING (`lmcache/v1/protocol.py:214-321`
+    `ClientMetaMessage`/`ServerMetaMessage` fixed `struct`; the `CacheEngineKey`
+    string codec `lmcache/utils.py:449-561`; the `MemoryFormat.KV_2LTD`
+    `[2,L,T,D]` layout `lmcache/v1/memory_management.py:79-133`) is a DIRECT port
+    into `src/vllm/v1/kv_offload/lmcache/{remote_protocol,cache_engine_key,
+    token_hasher,memory_format}.{h,cpp}`, gated BYTE/BIT-EXACT against fixtures
+    captured from the real Python codec
+    (`tests/vllm/v1/kv_offload/lmcache/test_lmcache_codec.cpp` vs
+    `tests/fixtures/lmcache/lmcache_fixtures.json`, generator
+    `scripts/lmcache/gen_lmcache_fixtures.py`). ENDIANNESS deviation: LMCache's
+    `struct.pack("iiiiiiiii150s", …)` is NATIVE-endian (no prefix); we encode
+    little-endian EXPLICITLY and require client/server to share byte order (true
+    for every realistic `lm://` deployment). Pure CPU codec — NO call site routes
+    to it (the connector is W3), so every model path is provably inert. `torch`
+    is not installed on the build boxes, so the effective `DTYPE_TO_INT` map (with
+    the `torch.half is torch.float16` singleton collision resolving float16→2) is
+    mirrored from source by reasoning and documented in `remote_protocol.h`; the
+    hashes and framing themselves use the REAL Python codecs.
+
 ## 10. E2E test suites (T0 deliverable)
 
 1. **Op parity**: golden dumps from upstream vLLM (Python, test-time only) →

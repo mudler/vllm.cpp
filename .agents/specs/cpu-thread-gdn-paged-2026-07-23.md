@@ -87,8 +87,21 @@ before(`4884d03`)/after + new ratio vs llama.cpp pp128 (173.28±1.75), op-level
 thread-scaling 1→20 for both kernels, a FRESH post-change profile + the new
 bottleneck.
 
-## Status
+## Result (binding, dgx aarch64, idle, 2026-07-23)
 
-`ACTIVE` — implemented + correctness-gated (byte-identity proven, full CPU ctest
-158/158, determinism battery extended). Binding dgx benchmark: see
-[docs/BENCHMARKS.md](../../docs/BENCHMARKS.md).
+- **Prefill same-binary 1.382×** (TTFT 1753→1269 ms; 73.0→100.9 t/s). vs
+  llama.cpp pp128 (refreshed same session, 177.54±2.16): **2.43× → 1.76× behind**.
+- **Decode at parity** — settled TPOT (output-len 96) 40.3→41.0 ms (1.04× vs
+  llama tg32 25.30, inside spread). The output-len-32 41.5→44.6 gap is an
+  early-decode warmup artifact of the faster TTFT, not a kernel change.
+- **Op-scaling 1→20:** kGdnPrefill 7.08× (peaks 7.8× at 8 threads — `Hv=16`
+  head cap), kPagedAttention 8.96×.
+- **Fresh post-change profile:** the two kernels 35 % → **8.6 %** of prefill
+  (kGdnPrefill 25→4.1 %, kPagedAttention 10→4.6 %). **New bottleneck = the GEMMs**
+  (kMatmulBTQuant 50 % + kMatmul 16 % + kMatmulBT 14 % = 80 %) ⇒ next CPU prefill
+  lever is the SIMD/repack GEMM tiers (G5/G6/G7), not another non-GEMM kernel.
+- Byte-identity held (md5 `d235db12f2cd304007530286a1755c95` at threads 1/4/20 +
+  `VT_CPU_REF=1`); CPU ctest 158/158; determinism battery extended.
+
+Full repro + tables: [docs/BENCHMARKS.md](../../docs/BENCHMARKS.md) § "thread
+kGdnPrefill + kPagedAttention". Status `ACCEPTED`.

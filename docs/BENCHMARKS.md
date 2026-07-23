@@ -2040,29 +2040,85 @@ The complete contract is in the
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
 
-## CPU vs llama.cpp — thread kGdnPrefill + kPagedAttention, `ACTIVE` / dgx binding in progress (2026-07-23)
+## CPU vs llama.cpp — thread kGdnPrefill + kPagedAttention, `ACCEPTED` / binding (2026-07-23)
 
 `BENCH-CPU-LLAMA` / `BACKEND-GATE-CPU-LLAMACPP` / `QUANT-GGUF-CPU-THREADPOOL`
 (`CLAIM-CPU-THREAD-GDN-PAGED-1`; [spec](../.agents/specs/cpu-thread-gdn-paged-2026-07-23.md)).
+Binding host **dgx.casa (GB10, aarch64, 20 cores), idle** (loadavg 0.25 inside
+one `flock $HOME/gpu.lock`, gated < 1.2, foreground; a first attempt at loadavg
+2.87 was ABORTED by the gate and is VOID). `git archive` transfer,
+`Qwen3.5-2B-UD-Q8_K_XL.gguf`, same-binary A/B, 4 reps, cold rep discarded.
 
-**The two serial non-GEMM kernels on the prefill hot path are now threaded.** A
-fresh op-dispatch profile of the current binary ranked prefill as kMatmulBTQuant
-37 % / **kGdnPrefill 25 %** / kMatmul 12 % / kMatmulBT 10 % / **kPagedAttention
-10 %** — the GEMMs already run at 211–417 GFLOP/s, and the 35 % that was
-single-threaded (GDN recurrence chunked over sequences = n=1 at c1; paged
-attention with no pool) was the gap. kGdnPrefill now chunks over the independent
-(sequence, value-head) axis, kPagedAttention over query-token rows; both stay
-**bit-identical** to single-thread (disjoint output/state partition, no reduction
-reassociation). Correctness proven: benchmark output-token md5
-`d235db12f2cd304007530286a1755c95` unchanged at threads 1/4/20 and under
-`VT_CPU_REF=1`; `test_cpu_threadpool` determinism battery (extended with a
-single-sequence `Hv=20` GdnPrefill case + a 37-token causal PagedAttention case)
-byte-identical at 1/3/20; full CPU ctest 158/158.
+**Prefill 1.38× faster same-binary (73.0 → 100.9 t/s); vs llama.cpp 2.43× → 1.76×
+behind. Decode stays at parity, output tokens byte-identical.** The two serial
+non-GEMM kernels on the prefill hot path are now threaded via the existing
+`ParallelForRows`: kGdnPrefill over the (sequence, value-head) axis, kPagedAttention
+over query-token rows. Both **bit-identical** to single-thread (disjoint
+output/state partition, no reduction reassociation): benchmark output-token md5
+`d235db12f2cd304007530286a1755c95` unchanged at threads 1/4/20 and `VT_CPU_REF=1`;
+`test_cpu_threadpool` determinism battery (extended: single-seq `Hv=20` GdnPrefill
++ 37-token causal PagedAttention) byte-identical at 1/3/20; full CPU ctest 158/158.
 
-**Binding numbers (dgx aarch64, idle, flock, foreground) — PENDING this run:**
-prefill before(`4884d03`)/after, new ratio vs llama.cpp pp128 173.28±1.75,
-op-level 1→20 thread-scaling for both kernels, fresh post-change profile + new
-bottleneck. Recipe = the floor-remeasurement recipe below.
+**llama.cpp floor refreshed same session** (`llama-bench -t20 -r5 -ngl0`): pp512
+**213.33±1.60**, pp128 **177.54±2.16**, tg128 25.51±0.30, tg32 25.30±0.89.
+
+**Prefill e2e A/B** (`--input-len 128 --output-len 32 --concurrency 1
+--seed 0 --temperature 0`, `VLLM_CPP_CPU_THREADS=20`, TTFT-derived = 128000/TTFT_ms,
+reps 2–4 after cold discard):
+
+| arm | TTFT median (ms) | prefill t/s | vs llama pp128 177.54 |
+|---|---|---|---|
+| BEFORE `4884d03` | 1753.46 | **73.0** | 2.43× behind |
+| AFTER `e53ae4c` | 1269.08 | **100.9** | **1.76× behind** |
+
+Same-binary **prefill speed-up 1.382×** (TTFT 1753→1269). Decode (settled,
+`--output-len 96`): BEFORE 40.3 ms / AFTER 41.0 ms TPOT → **at parity** (1000/41.0
+= 24.4 t/s = 1.04× vs llama tg32 25.30, inside run-to-run spread). The
+`--output-len 32` arm shows a larger early-decode warmup (41.5→44.6) that
+amortizes away by 96 tokens — a timing artifact of the faster TTFT, not a kernel
+change (GdnDecode/decode-paged code paths are unchanged: paged attention at c1
+decode has total_q=1 ⇒ inline, GDN decode uses the same recurrence).
+
+**Op-level thread-scaling 1→20** (standalone harness, model c1-prefill shapes:
+GDN n=1 T=128 Hv=16 Dk=Dv=128; Paged T=128 Hq=8 KVh=2 D=256; median of 60):
+
+| nth | kGdnPrefill ms | speed-up | kPagedAttention ms | speed-up |
+|---|---|---|---|---|
+| 1 | 21.36 | 1.00× | 51.64 | 1.00× |
+| 2 | 10.92 | 1.96× | 28.67 | 1.80× |
+| 4 | 5.47 | 3.91× | 15.55 | 3.32× |
+| 8 | 2.75 | 7.76× | 8.04 | 6.42× |
+| 20 | 3.02 | 7.08× | 5.77 | **8.96×** |
+
+kGdnPrefill saturates ~7.8× (peaks at 8 threads): it partitions over `Hv=16`
+value-heads on this model, so 20 threads leaves 4 idle plus kick overhead;
+kPagedAttention (128 query rows) keeps climbing to 8.96×. GDN's finer per-channel
+axis would lift the head-count cap but was not needed to move prefill.
+
+**Fresh post-change op-dispatch profile** (uncommitted `VT_OP_PROFILE` GetOp hook,
+100 % of wall time attributed, reverted before the binding runs;
+`--input-len 128 --output-len 4`, prefill-dominant ~90 %). Prefill is now
+**GEMM-bound again** — the two threaded kernels dropped from 35 % combined to
+**8.6 %**:
+
+| op | share (was) |
+|---|---|
+| kMatmulBTQuant | **50.2 %** (37 %) |
+| kMatmul | 16.1 % (12 %) |
+| kMatmulBT | 14.2 % (10 %) |
+| kAttnQkNormRopeGate | 2.0 % |
+| kRmsNorm | 1.9 % |
+| kCastBf16 | 1.7 % |
+| **kPagedAttention** | **4.6 %** (10 %) |
+| **kGdnPrefill** | **4.1 %** (25 %) |
+| everything else | < 1.3 % each |
+
+**New bottleneck named: the GEMMs (kMatmulBTQuant 50 % + kMatmul 16 % + kMatmulBT
+14 % = 80 % of prefill).** These already run at 211–417 GFLOP/s, so the next CPU
+prefill lever is the SIMD/repack GEMM tiers (`QUANT-GGUF-CIQ` G5 x86 AVX2/AVX512,
+G6 Arm NEON/i8mm mmla, G7 repack-at-load), exactly as the floor-remeasurement's
+deferred plan predicted — NOT another non-GEMM kernel. RSS (loader) is the other
+remaining single deficit.
 
 ## CPU vs llama.cpp — keep-quant loader RSS (L5), `ACCEPTED` / binding (2026-07-23)
 

@@ -19657,3 +19657,20 @@ runs are VOID per protocol.
   both kernels, and the fresh post-change profile: see
   `.agents/specs/cpu-thread-gdn-paged-2026-07-23.md` +
   `docs/BENCHMARKS.md`.
+
+- **2026-07-23 (result)** — **CPU two-kernel threading BINDING numbers taken
+  (`CLAIM-CPU-THREAD-GDN-PAGED-1`).** dgx aarch64, idle (loadavg 0.25 in one
+  flock; the gate correctly ABORTED a first attempt at loadavg 2.87 — a co-tenant
+  CPU burst — as VOID). Same-binary A/B (before `4884d03` / after `e53ae4c`),
+  `git archive` transfer, `Qwen3.5-2B-UD-Q8_K_XL.gguf`, 4 reps + cold discard.
+  **Prefill 1.382× (TTFT 1753→1269 ms, 73.0→100.9 t/s); vs llama.cpp pp128
+  (refreshed 177.54±2.16) 2.43× → 1.76× behind. Decode at parity** (settled TPOT
+  40.3→41.0 ms; the output-len-32 44.6 ms is a faster-TTFT warmup artifact, not a
+  kernel regression). **Op-scaling 1→20:** kGdnPrefill 7.08× (peaks 7.8× at 8
+  threads — `Hv=16` head cap), kPagedAttention 8.96×. **Fresh VT_OP_PROFILE
+  profile:** the two kernels 35 % → 8.6 % of prefill (GdnPrefill 25→4.1 %,
+  PagedAttention 10→4.6 %); **new bottleneck = the GEMMs** (kMatmulBTQuant 50 % +
+  kMatmul 16 % + kMatmulBT 14 % = 80 %) ⇒ the next CPU prefill lever is the
+  SIMD/repack GEMM tiers (G5 x86 AVX2/AVX512, G6 Arm NEON/i8mm, G7 repack), not
+  another non-GEMM kernel. Byte-identity held throughout (md5
+  `d235db12f2cd304007530286a1755c95`). Benchmark `ACCEPTED` in docs/BENCHMARKS.md.

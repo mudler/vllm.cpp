@@ -1,7 +1,7 @@
 # Leaf spec: GGUF keep-quantized loader — quantized weights resident, dequant as oracle
 
 **Row:** `QUANT-GGUF-KEEPQ-LOADER` (quantization-matrix.md, leaf of the
-`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **L1+L2+L3+L5 landed**; **L6 landed OPT-IN and its RSS premise REFUTED** (2026-07-23, `CLAIM-QUANT-GGUF-KEEPF16-L6-1`). Block residency, the total per-tensor routing policy, the `VT_CPU_REF` oracle switch, mmap residency and tied-head sharing all exist and are gated. **Keep-quant is DEFAULT ON wherever the running device can execute the quant GEMM** (CIQ G4). L5 brought peak RSS to 3.884 GiB (1.39× llama.cpp). **L6 (keep-f16) was implemented but MEASURED RSS-NEUTRAL and prefill-regressive, so it ships DEFAULT OFF (`VT_GGUF_KEEP_F16=1` opt-in)** — the binding A/B disproved the standing hypothesis (L4/L5) that the residual gap was the f16→bf16 expansion. It is NOT: L5's page-release already dropped the f16 file pages, so keeping f16 resident merely swaps an anonymous bf16 buffer for equal-size file-backed f16 pages (3.884 → 3.832 GiB, −52 MB). **The real ~1.08 GiB gap vs llama.cpp is the engine's ANONYMOUS activation/KV workspace, not weight materialization** (attribution below). See the L6 result ·
+`QUANT-GGUF-COMPUTE` block) · **status:** `ACTIVE` — **L1+L2+L3+L5+L7 landed**; **L6 keep-f16 landed and is now DEFAULT ON (L7)** (2026-07-23, `CLAIM-QUANT-GGUF-RSS-L7-1`). Block residency, the total per-tensor routing policy, the `VT_CPU_REF` oracle switch, mmap residency and tied-head sharing all exist and are gated. **Keep-quant is DEFAULT ON wherever the running device can execute the quant GEMM** (CIQ G4). **L7 CLOSES the CPU peak-RSS gap to 1.01× llama.cpp (2.832 vs 2.798 GiB, was 1.39×)** by (a) releasing the DEAD q8_0 repack-source mmap pages (port of llama.cpp `unmap_fragment`) — this was the double-count that made L6 look RSS-neutral — and (b) prefaulting the borrowed weights at load (port of llama.cpp's mmap prefetch), which removes L6's prefill regression, letting keep-f16 ship default-ON. **The L6 "workspace" attribution was WRONG:** the profile (below) measured the DevicePool at 20 MiB and the whole KV workspace at 115 MiB — both already ≤ llama.cpp; the residual was WEIGHT residency (the q8_0 repack double-count + the f16→bf16 expansion keep-f16 avoids), not activation/KV workspace. See the L6 and L7 results ·
 **upstream pin:** llama.cpp local fork `237ad9b96` (b9892) ·
 **parent evidence:** B4 decision row
 ([parity-ledger.md L290](../parity-ledger.md#L290)): load-time bf16 expansion
@@ -124,7 +124,8 @@ Pinned local fork `/home/mudler/_git/llama.cpp` @ `237ad9b96`.
 | L3 | routing + oracle switch | per-tensor policy table, `VT_CPU_REF` env, oracle-stability gate 2, routing units | L2 | **DONE** 2026-07-22 |
 | L4 | memory gate + closure | RSS measurement (gate 3), matrix `M`-cell notes, ledger row | L2, L3 | **MEASURED, NOT MET** 2026-07-22 (see below) |
 | L5 | mmap residency + tied-head sharing | stop COPYING block bytes out of the mapped file (llama.cpp supports both; L2 chose copy deliberately) and stop materialising the vocab matrix twice for a tied `lm_head` — the two changes L4's measurement identifies as ~1.9 GiB of the remaining 3.6 GiB gap | L4 | **DONE** 2026-07-23 (peak RSS 6.401 → 3.884 GiB, 2.29× → 1.39× llama.cpp; byte-identical) |
-| L6 | keep-f16 residency | keep F16 matmul weights + F16 embed/tied-head resident as F16 (mmap-borrow, [N,K] nk=true), consumed by the f16 elementwise GEMM, instead of the bf16 re-expansion | L5, KERNEL-GEMM-CPU-ELEM | **LANDED OPT-IN, PREMISE REFUTED** 2026-07-23 (RSS-neutral 3.884 → 3.832 GiB, −52 MB; prefill regresses below the llama.cpp floor; tokens byte-identical; default OFF, `VT_GGUF_KEEP_F16=1`). See L6 result. |
+| L6 | keep-f16 residency | keep F16 matmul weights + F16 embed/tied-head resident as F16 (mmap-borrow, [N,K] nk=true), consumed by the f16 elementwise GEMM, instead of the bf16 re-expansion | L5, KERNEL-GEMM-CPU-ELEM | **LANDED OPT-IN** 2026-07-23; premise looked refuted (RSS-neutral) but L7 found WHY and reversed it. See L6 result. |
+| L7 | repack-source release + prefault + keep-f16 default ON | (a) release the DEAD q8_0 repack-source mmap pages (`OwnGgufQuantBlocks`, port of llama.cpp `unmap_fragment`) — removes the 1.0 GiB double-count; (b) `PrefaultBorrowedSpan` load-time prefault (port of llama.cpp mmap prefetch) — removes L6's prefill regression; (c) flip keep-f16 default ON | L6 | **DONE** 2026-07-23 — CPU peak RSS **2.832 GiB = 1.01× llama.cpp** (was 1.39×), prefill 1.18× AHEAD, decode ~parity, tokens byte-identical. See L7 result. |
 
 ## Risks/decisions
 
@@ -521,4 +522,86 @@ where repack is off). The `expect` policy now mirrors FromEnv's full CPU default
 **Reproduction:** the L4/G4 recipe with a third A/B axis
 `VT_GGUF_KEEP_F16 ∈ {unset(=off), 1}`; the smaps attribution polls
 `/proc/PID/smaps_rollup` `Anonymous:`/`Rss:` at peak. Full command in
+`docs/BENCHMARKS.md`.
+
+## L7 result (2026-07-23) — the CPU RSS gap CLOSES to 1.01× llama.cpp; L6's "workspace" attribution was WRONG
+
+L7 profiled the ~1.08 GiB residual L6 blamed on "the engine's anonymous
+activation/KV workspace" and found that attribution is **incorrect**. The
+workspace is tiny; the residual is WEIGHT residency, and two small load-time
+changes close it to parity.
+
+**The profile (idle dgx aarch64, `Qwen3.5-2B-UD-Q8_K_XL.gguf`, smaps_rollup +
+per-pool instrumentation).** The suspected pools are NOT the gap:
+
+| pool | measured | vs llama.cpp |
+|---|---|---|
+| DevicePool (process-wide retain-don't-free scratch) | **19.98 MiB** peak driver-held | ≤ |
+| KV cache (6 full-attn layers × 256 blocks + GDN state, 1 slot) | **114.6 MiB** (fa 96 + ssm 18 + conv 0.6) | ≤ (llama sizes to context, but our 115 MiB is already small) |
+| per-step activation buffers | inside the 20 MiB pool | ≤ |
+
+So pool + KV + activations ≈ 135 MiB — already at/below llama.cpp. The residual
+is entirely WEIGHT residency, and it is **architecture-specific** (x86 keep-f16
+already measured 2.82 GiB / 194 MiB anon; the 1 GiB excess is aarch64-only):
+
+**Root cause — the q8_0 repack-source DOUBLE-COUNT.** On aarch64 the CIQ G7
+repack COPIES each q8_0 weight out of the mmap into an anonymous repacked buffer
+(`OwnGgufQuantBlocks`, the `repack` branch — a permuted layout cannot be an
+mmap borrow). Under keep-f16 the f16 weights BORROW the mapping, so the mapping
+stays alive (refcounted) — and the now-DEAD q8_0 source pages stay resident in
+it. The q8_0 mass (~1.0 GiB) is counted TWICE: once file-backed (the source),
+once anonymous (the repacked copy). This is exactly why L6 measured keep-f16 as
+"RSS-neutral": the win from keeping f16 file-backed was masked by the q8_0
+double-count. (Without keep-f16 nothing borrows the mapping, so it is dropped
+after load and the double-count never appears — which is why the L6 default arm
+did not show it.)
+
+**The lever (one, grounded in llama.cpp).** After repack-copying a q8_0 weight,
+`OwnGgufQuantBlocks` now `DropSpanResidency(src, bytes)` on the source span —
+the same read-once MADV_DONTNEED L5 already applies to EXPANDED tensors, a port
+of llama.cpp `unmap_fragment` (`src/llama-mmap.cpp:490`). Byte-identical (the
+repacked owned buffer is untouched; a later read re-faults the same bytes).
+
+**Enabling keep-f16 by default needed the prefill regression gone too.** L6's
+TTFT hit was borrowed-weight first-touch faults landing in the TIMED prefill. A
+load-time `PrefaultBorrowedSpan` (`madvise(MADV_WILLNEED)` + a one-byte-per-page
+touch, a port of llama.cpp's `use_mmap` prefetch, `src/llama-mmap.cpp:451`)
+faults the borrowed weights in at LOAD, off the timed path. With both fixes,
+keep-f16 flips DEFAULT ON (`VT_GGUF_KEEP_F16=0` opts out).
+
+**Binding A/B (idle dgx aarch64, 20 threads, one `flock`, same-binary base-vs-new
+default, `Qwen3.5-2B-UD-Q8_K_XL.gguf`):**
+
+| arm | peak RSS | TTFT (ms, 3-rep) | TPOT (ms) | file-backed | anon | tokens |
+|---|---|---|---|---|---|---|
+| base default (L5/L6, keep-f16 off) | 3.885 GiB | 570/571/574 | 40.4 | 0.959 | 2.923 | `809f2d0…` |
+| **L7 default (keep-f16 + release + prefault)** | **2.832 GiB** | 628/625/625 | 40.95 | 1.629 | 1.200 | `809f2d0…` |
+| ORACLE (`VT_CPU_REF=1`) | — | — | — | — | — | `809f2d0…` |
+| llama.cpp (pp128 173.2, tg32 25.09) | **2.798 GiB** | — | 39.9 | — | — | — |
+
+- **Peak RSS 3.885 → 2.832 GiB = 1.39× → 1.01× llama.cpp — the CPU RSS gap is
+  CLOSED.** The clean isolation (base-vs-L7 binary) shows L7 drops File 2.632 →
+  1.629 (−1.0 GiB, the released q8_0 source) at unchanged anon 1.200.
+- **Prefill 204 t/s = 1.18× AHEAD of pp128 173.2** (prefault removed L6's 0.72×
+  regression; ~9% under the keep-f16-off default's 224 t/s but comfortably above
+  the competitor floor).
+- **Decode 24.4 t/s ≈ parity** (llama 25.09; keep-f16 native-f16 compute costs
+  ~1.4% vs the bf16 default — within the known decode-scaling item, floor lever 7).
+- **Tokens BYTE-IDENTICAL**: md5 `809f2d0d6aac93a11faecd68df8a131f` across base,
+  L7-default and oracle — keep-f16/release/prefault change no byte.
+
+**Anon 1.200 GiB is IRREDUCIBLE:** repacked q8_0 (~1.06) + KV (0.115) + pool
+(0.02). The repacked q8_0 is what makes aarch64 prefill fast (G7); llama.cpp
+carries the same. There is no further loader RSS lever.
+
+**Correctness/units.** `test_gguf_keep_quant` **36/36** (x86 + dgx aarch64;
++1 L7 case: the prefault is byte-transparent on a borrowed f16 weight). The
+FromEnv default-flip and opt-out (`VT_GGUF_KEEP_F16=0`) are asserted; the
+"production default" case's `expect` policy mirrors the new keep-f16 default.
+On CUDA the whole path is inert (keep_f16 rides `expand_nk`, false when
+`GgufQuantComputeAvailable()` is false), so the CUDA regression set is unchanged.
+
+**Reproduction:** the L4/G4 recipe; the new default IS keep-f16+release+prefault
+(no env needed); `VT_GGUF_KEEP_F16=0` reproduces the 3.885 GiB base;
+`VT_GGUF_PREFAULT=0` isolates the prefill-fault effect. Full command in
 `docs/BENCHMARKS.md`.

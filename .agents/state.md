@@ -20341,3 +20341,63 @@ Regressions standalone (CUDA build, keep-f16 default-off = inert): 27B 235/235,
 anonymous activation/KV workspace (~1.08 GiB over llama.cpp). A future row should
 profile and shrink that workspace (KV pool sizing / activation reuse), which is
 where the remaining 1.39× actually lives — NOT the weight loader.
+
+## 2026-07-23 — `QUANT-GGUF-KEEPQ-LOADER` **L7**: the CPU RSS gap is CLOSED to 1.01× llama.cpp — CPU now at/ahead on EVERY axis (`CLAIM-QUANT-GGUF-RSS-L7-1`, base `f6be46e`, worktree `/home/mudler/_git/vllm.cpp-wsrss` branch `feat/cpu-workspace-rss`)
+
+**Task:** close the last CPU RSS gap — L6 attributed the ~1.08 GiB residual (peak
+RSS 3.884 GiB = 1.39× llama.cpp 2.798) to "the engine's anonymous activation/KV
+workspace"; profile it and shrink the top contributor.
+
+**The L6 attribution was WRONG — profiled it and proved so.** With per-pool
+instrumentation (DevicePool driver-held high-water + a KV-total log) on the idle
+dgx aarch64 CPU engine: the process-wide retain-don't-free **DevicePool held only
+19.98 MiB**, the **whole KV cache 114.6 MiB** (6 full-attn layers × 256 blocks ×
+64 KiB = 96 MiB + GDN state 18.6 MiB), per-step activations live inside the 20 MiB
+pool. All ≤ llama.cpp. The 1 GiB residual is WEIGHT residency, and it is
+architecture-specific: on x86 (no i8mm) keep-f16 already measured 2.82 GiB / 194 MiB
+anon; the 1 GiB excess is aarch64-only.
+
+**Root cause = a q8_0 repack-source DOUBLE-COUNT.** On Arm the G7 repack COPIES each
+q8_0 weight out of the mmap into an anonymous repacked buffer (a permuted layout
+cannot be an mmap borrow). Under keep-f16 the f16 weights BORROW the mapping, so it
+stays alive (refcounted) and the now-DEAD q8_0 source pages stay resident in it — the
+q8_0 mass counted twice (file-backed source + anonymous repack). This is exactly why
+L6 saw keep-f16 as "RSS-neutral": the file-backed f16 win was masked by the q8_0
+double-count. (Without keep-f16 nothing borrows the mapping → it is dropped after
+load → the double-count never appears, which is why L6's default arm didn't show it.)
+
+**Lever (one, grounded in llama.cpp).** `OwnGgufQuantBlocks` now `DropSpanResidency`es
+the repack source (read-once MADV_DONTNEED, port of llama.cpp `unmap_fragment`
+`llama-mmap.cpp:490`) — byte-identical, the repacked owned buffer is untouched. To
+enable keep-f16 by default the prefill regression also had to go: `PrefaultBorrowedSpan`
+(madvise WILLNEED + one-byte-per-page touch, port of llama.cpp mmap prefetch
+`llama-mmap.cpp:451`) faults borrowed weights in at LOAD, off the timed prefill. With
+both, **keep-f16 flips DEFAULT ON** (`VT_GGUF_KEEP_F16=0` opt-out; rides `expand_nk`,
+so inert on CUDA and under `VT_CPU_REF`).
+
+**Binding A/B (idle dgx aarch64, 20 threads, one flock, base-vs-L7 same-binary,
+`Qwen3.5-2B-UD-Q8_K_XL.gguf`, 3 reps; llama.cpp `237ad9b96` fresh: pp128 173.2, tg32
+25.09, RSS 2.798 GiB):**
+- peak RSS **3.885 → 2.832 GiB = 1.39× → 1.01× llama.cpp — CLOSED.** Clean isolation:
+  File 2.632 → 1.629 (−1.0 GiB released q8_0 source), anon 1.200 unchanged.
+- prefill **204 t/s = 1.18× AHEAD** of pp128 173.2 (prefault erased L6's 0.72× hit;
+  ~9% under the keep-f16-off default's 224 but above the competitor floor).
+- decode **24.4 t/s ≈ parity** (llama 25.09; native-f16 compute ~1.4% cost, within the
+  known decode-scaling item).
+- tokens **BYTE-IDENTICAL** md5 `809f2d0d6aac93a11faecd68df8a131f` across base, L7-default
+  and `VT_CPU_REF=1`.
+- anon 1.200 GiB IRREDUCIBLE (repacked q8_0 1.06 + KV 0.115 + pool 0.02) — llama.cpp
+  carries the same repacked q8_0.
+
+**CPU IS NOW AT OR AHEAD OF llama.cpp ON EVERY AXIS** — peak RSS 1.01× (parity), prefill
+1.18× ahead, decode at parity, byte-identical. The CPU gaps are fully closed.
+
+**Gates.** CPU + CUDA `-Werror` 0 warnings. `test_gguf_keep_quant` **36/36** (x86 +
+dgx aarch64; +1 L7 prefault-byte-transparency case; fixed a latent CUDA-build assertion
+that compared keep_f16 to `GgufQuantComputeAvailable()` instead of `expand_nk` under
+env-forced keep-quant). `test_qwen36_gguf_engine` STANDALONE **28/28** (16/16 both APEX
+files) on the CUDA build — loader change inert on the expand path. CUDA regressions each
+STANDALONE UNCHANGED: 27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT
+6/6, DeepSeek-V2 8/8, Llama 16/16. Goldens content-hash identical. Profiling
+instrumentation reverted before the binding binary (no shared-DevicePool/runner/CUDA
+change ships). Closing commit + full SHA reported to the caller.

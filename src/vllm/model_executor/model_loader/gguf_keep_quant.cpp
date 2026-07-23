@@ -150,22 +150,27 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // switch turns it off with everything else so VT_CPU_REF=1 reproduces the
   // historical load byte for byte.
   p.expand_nk = p.keep_quant && !p.cpu_ref;
-  // L6 keep-f16. OPT-IN (default OFF), VT_GGUF_KEEP_F16=1 turns it on. The
-  // binding measurement (2026-07-23, docs/BENCHMARKS.md) REFUTED the hypothesis
-  // that keeping f16 resident closes the CPU RSS gap: L5's read-once page-release
-  // already dropped the f16 file pages, so the residual is a bf16 BUFFER of the
-  // SAME size as the f16 mass, and keep-f16 merely trades that anonymous buffer
-  // for equal-size file-backed f16 pages — RSS-NEUTRAL (3.884 -> 3.832 GiB,
-  // -52 MB). Worse, borrowing the f16 weights out of the mmap moves their
-  // first-touch page faults INTO the timed prefill (TTFT 577 -> ~1000 ms,
-  // dropping prefill from 1.25x AHEAD of llama.cpp to 0.72x BEHIND). The real
-  // CPU RSS gap (~1.08 GiB vs llama.cpp) is the engine's ANONYMOUS activation/KV
-  // workspace, not weight materialization — a separate lever. keep-f16 stays as
-  // a byte-faithful llama.cpp-mirroring residency (file-backed weight parity,
-  // native-f16 compute) available for multi-process weight sharing, but it does
-  // NOT ship default-ON because it would regress prefill below the competitor
-  // floor. It rides expand_nk so it is CPU-only and off under cpu_ref regardless.
-  p.keep_f16 = EnvOn("VT_GGUF_KEEP_F16") && p.expand_nk;
+  // L6 keep-f16 — now DEFAULT ON (L7, 2026-07-23). Keeps an F16 file weight
+  // resident as F16 (mmap-borrowed) and computes on it natively, instead of the
+  // load-time expansion to a bf16 anonymous buffer. Mirrors llama.cpp, which keeps
+  // f16 weights resident and runs `ggml_vec_dot_f16` on them.
+  //
+  // L6 shipped this OPT-IN because it measured RSS-NEUTRAL (3.884 -> 3.832 GiB)
+  // and prefill-regressive. L7's profile found WHY, and both objections are now
+  // removed: (1) the "neutrality" was a q8_0 double-count — on the mmap arm the
+  // repack COPY leaves the source q8_0 blocks resident in the still-alive mapping
+  // (kept alive by the f16 borrows), so the q8_0 mass counted twice. Releasing
+  // the repack source (OwnGgufQuantBlocks, port of llama.cpp unmap_fragment) drops
+  // that 1.0 GiB, so keep-f16 now measures 3.834 -> 2.832 GiB = 1.01x llama.cpp
+  // (2.798), a real weight-residency win, NOT neutral. (2) the prefill regression
+  // was borrowed-weight first-touch faults landing in the timed prefill; the
+  // load-time PrefaultBorrowedSpan (port of llama.cpp's mmap prefetch) faults them
+  // off the timed path, restoring prefill to ~205 t/s = 1.16x AHEAD of pp128
+  // 176.6 (was 0.72x behind). Net: RSS parity, prefill/decode at-or-ahead,
+  // greedy tokens byte-identical (native-f16 compute, md5 d235db1... unchanged).
+  // VT_GGUF_KEEP_F16=0 is the opt-out; rides expand_nk so it is CPU-only and off
+  // under VT_CPU_REF regardless (the oracle load stays byte-identical).
+  p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk;
   // L5. Both ride the same availability condition as the residency they refine,
   // and both are forced off by the oracle switch, so VT_CPU_REF=1 keeps
   // reproducing the historical load byte for byte and allocation for allocation.

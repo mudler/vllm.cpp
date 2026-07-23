@@ -2228,6 +2228,59 @@ The complete contract is in the
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
 
+## CPU vs llama.cpp — RSS gap CLOSED to parity (L7: repack-source release + prefault + keep-f16 default-on), `ACCEPTED` / binding (2026-07-23)
+
+`BENCH-CPU-LLAMA` / `QUANT-GGUF-KEEPQ-LOADER` **L7** (`CLAIM-QUANT-GGUF-RSS-L7-1`;
+[keep-quant loader leaf](../.agents/specs/gguf-keep-quant-loader.md) § L7 result).
+**This is the current binding CPU result and it REVERSES the L6 refutation below:
+the CPU peak-RSS gap is CLOSED — CPU is now at or ahead of llama.cpp on EVERY axis.**
+
+**The profile disproved the L6 "engine workspace" attribution.** With per-pool
+instrumentation the DevicePool (process-wide retain-don't-free scratch) measured
+**19.98 MiB** and the whole KV cache (6 full-attn layers × 256 blocks + GDN state)
+**114.6 MiB** — both already ≤ llama.cpp. The residual was WEIGHT residency: on Arm
+the G7 repack COPIES each q8_0 weight into an anonymous buffer, and because keep-f16
+holds the mmap open, the DEAD source q8_0 pages stayed file-backed — a ~1 GiB
+double-count. Releasing them (`OwnGgufQuantBlocks` → `DropSpanResidency`, port of
+llama.cpp `unmap_fragment` `llama-mmap.cpp:490`) removes the duplicate; a load-time
+`PrefaultBorrowedSpan` (port of llama.cpp's mmap prefetch `llama-mmap.cpp:451`)
+removes L6's prefill regression; keep-f16 flips **default ON** (`VT_GGUF_KEEP_F16=0`
+opt-out).
+
+**Binding arm = `dgx.casa` (GB10, aarch64, 20 cores), idle** (loadavg-gated < 0.8),
+whole series one `flock $HOME/gpu.lock`, `git archive` transfer, base-vs-L7
+same-binary discipline, `Qwen3.5-2B-UD-Q8_K_XL.gguf`, 3 reps. llama.cpp `237ad9b96`
+fresh on the same host: **pp128 173.2±2.7, tg32 25.09±0.33, peak RSS 2,934,152 KB =
+2.798 GiB**.
+
+| arm | peak RSS | ratio vs llama | TTFT med (ms) | prefill t/s | TPOT (ms) | decode t/s | file-backed | anon | token md5 |
+|---|---|---|---|---|---|---|---|---|---|
+| base default (keep-f16 off) | 3.885 GiB | 1.389× | 570/571/574 | 224 | 40.4 | 24.7 | 0.959 | 2.923 | `809f2d0…` |
+| **L7 default (keep-f16 + release + prefault)** | **2.832 GiB** | **1.012× (PARITY)** | 628/625/625 | **204** | 40.95 | 24.4 | 1.629 | 1.200 | `809f2d0…` |
+| oracle (`VT_CPU_REF=1`) | — | — | — | — | — | — | — | — | `809f2d0…` |
+
+**Peak RSS 3.885 → 2.832 GiB = 1.39× → 1.01× llama.cpp — the CPU RSS gap is CLOSED.**
+The clean base-vs-L7 isolation shows the win is File 2.632 → 1.629 (−1.0 GiB, the
+released q8_0 source) at unchanged anon 1.200. **Prefill 204 t/s = 1.18× AHEAD** of
+pp128 173.2 (the prefault erased L6's 0.72× regression; ~9% under the keep-f16-off
+default's 224 but comfortably above the competitor floor). **Decode 24.4 t/s ≈
+parity** (llama 25.09; native-f16 compute costs ~1.4% vs the bf16 default, within the
+known decode-scaling item). **Output token md5 `809f2d0d6aac93a11faecd68df8a131f`
+byte-identical across base, L7-default and `VT_CPU_REF=1`.** Anon 1.200 GiB is
+IRREDUCIBLE (repacked q8_0 1.06 + KV 0.115 + pool 0.02); the repacked q8_0 is what
+makes Arm prefill fast (G7) and llama.cpp carries the same — there is no further
+loader RSS lever. **This is the last open CPU gap; with it closed, CPU is at or
+ahead of llama.cpp on peak RSS, prefill and decode simultaneously.**
+
+**Repro:** the L4/G4 recipe; the new default IS keep-f16+release+prefault (no env);
+`VT_GGUF_KEEP_F16=0` reproduces the 3.885 GiB base; `VT_GGUF_PREFAULT=0` isolates the
+prefill-fault effect; `VT_GGUF_RELEASE_PAGES=0` reverts the source-page release. The
+per-pool figures use a temporary `VT_POOL_STATS`/`VT_KV_ALLOC_LOG` instrumentation
+(reverted before the binding binary was built). Regressions (CUDA build, standalone,
+keep-f16 inert on CUDA — expand_nk false): 27B 235/235, 35B 315/315, Qwen3-Coder 6/6,
+Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8, Llama 16/16, `test_qwen36_gguf_engine`
+28/28 (16/16 both APEX files); `test_gguf_keep_quant` 36/36 (x86 + aarch64).
+
 ## CPU vs llama.cpp — G7 q8_0 repack-at-load (prefill crosses parity), `ACCEPTED` / binding (2026-07-23)
 
 `QUANT-GGUF-CIQ-GEMM` G7 / `BACKEND-GATE-CPU-LLAMACPP` (`CLAIM-QUANT-GGUF-CIQ-G7-1`;
@@ -2548,10 +2601,16 @@ a pre-existing environment condition, not an L5 regression.
 
 ## CPU vs llama.cpp — keep-f16 residency (L6): premise REFUTED, `ACCEPTED` / binding (2026-07-23)
 
+**SUPERSEDED by the L7 entry above (2026-07-23):** L6's "the residual is engine
+workspace" conclusion was itself wrong. L7 profiled the pools (DevicePool 20 MiB,
+KV 115 MiB — both ≤ llama.cpp) and found the residual was a q8_0 repack-source
+double-count; releasing it + prefaulting flips keep-f16 default-ON and closes the
+RSS gap to 1.01×. This entry is retained for the L6 measurement of record.
+
 `BENCH-CPU-LLAMA` / `QUANT-GGUF-KEEPQ-LOADER` **L6** (`CLAIM-QUANT-GGUF-KEEPF16-L6-1`).
 Full result: [keep-quant loader leaf](../.agents/specs/gguf-keep-quant-loader.md)
-§ L6 result. **This entry records a NEGATIVE / refutation, and it is why keep-f16
-ships DEFAULT OFF.**
+§ L6 result. **This entry records a NEGATIVE / refutation (why keep-f16 shipped
+DEFAULT OFF at L6, later reversed by L7).**
 
 **keep-f16 (keep the file's F16 weights resident as F16 and compute on them, like
 llama.cpp) is RSS-NEUTRAL (3.884 → 3.832 GiB, −52 MB) and regresses prefill. It

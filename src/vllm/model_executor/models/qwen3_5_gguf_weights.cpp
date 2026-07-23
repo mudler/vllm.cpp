@@ -5,11 +5,17 @@
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <variant>
 #include <vector>
+
+#if defined(__unix__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
@@ -17,6 +23,36 @@
 #include "vt/quant.h"
 
 namespace vllm {
+
+// Load-time PREFAULT of a mmap-borrowed weight span (VT_GGUF_PREFAULT, default
+// ON with mmap residency). A weight left BORROWED in the read-only mapping is not
+// resident until first touch; without a prefault those page faults land in the
+// TIMED prefill (the L6 keep-f16 TTFT regression). Faulting them in at load —
+// off the timed path — mirrors llama.cpp, which prefetches its mmap at load with
+// posix_madvise(POSIX_MADV_WILLNEED) (`src/llama-mmap.cpp:451`, the mmap prefetch
+// under `use_mmap`). We use MADV_WILLNEED as the async hint plus a synchronous
+// one-byte-per-page read so the pages are guaranteed resident before prefill,
+// not merely queued. Read-only, so it changes no bytes. No-op on the copy arm.
+inline void PrefaultBorrowedSpan(const uint8_t* src, size_t bytes) {
+#if defined(__unix__)
+  static const bool enabled = [] {
+    const char* v = std::getenv("VT_GGUF_PREFAULT");
+    return v == nullptr || !(v[0] == '0' || v[0] == '\0' ||
+                             std::strcmp(v, "false") == 0 ||
+                             std::strcmp(v, "off") == 0);
+  }();
+  if (!enabled || bytes == 0) return;
+  (void)::madvise(const_cast<uint8_t*>(src), bytes, MADV_WILLNEED);
+  const long ps_l = ::sysconf(_SC_PAGESIZE);
+  const size_t ps = static_cast<size_t>(ps_l > 0 ? ps_l : 4096);
+  volatile uint8_t sink = 0;
+  for (size_t off = 0; off < bytes; off += ps) sink ^= src[off];
+  (void)sink;
+#else
+  (void)src;
+  (void)bytes;
+#endif
+}
 
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset,
@@ -53,6 +89,16 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
     o.bytes.assign(src, src + bytes);
     vt::cpu::QuantRepackWeight(dt, o.bytes.data(), n, k);
     o.repacked = true;
+    // The repacked OWNED (anonymous) buffer is now the authority for this weight;
+    // the source mmap blocks were read once by the copy above and are dead. When
+    // the weight was borrowed from a mapping (mmap residency), those file pages
+    // otherwise stay RESIDENT next to the repacked copy — the q8_0 mass counted
+    // TWICE (once file-backed source, once anonymous repack). Drop the source's
+    // resident file pages (L5 read-once release, port of llama.cpp unmap_fragment
+    // `src/llama-mmap.cpp:490`; gated by VT_GGUF_RELEASE_PAGES). Byte-identical:
+    // a later read simply re-faults the same bytes. No-op on the copy arm
+    // (mmap_src == nullptr) and on non-repack CPUs (this branch never runs).
+    if (mmap_src != nullptr) mmap_src->DropSpanResidency(src, bytes);
     return o;
   }
 
@@ -73,6 +119,7 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
            "qwen3_5 gguf: keep-quant mmap span is not block-aligned for " +
                tensor.name);
   o.bytes = OwnedBytes::Borrow(src, bytes, mmap_src->Mapping());
+  PrefaultBorrowedSpan(src, bytes);  // fault at load, not in the timed prefill
   return o;
 }
 
@@ -114,6 +161,7 @@ OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
            "qwen3_5 gguf: keep-f16 mmap span is not 2-byte aligned for " +
                tensor.name);
   o.bytes = OwnedBytes::Borrow(src, bytes, mmap_src->Mapping());
+  PrefaultBorrowedSpan(src, bytes);  // fault at load, not in the timed prefill
   return o;
 }
 

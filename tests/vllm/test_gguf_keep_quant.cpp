@@ -363,15 +363,25 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
     const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
     CHECK(p.keep_quant == vllm::GgufQuantComputeAvailable());
     CHECK(p.expand_nk == vllm::GgufQuantComputeAvailable());
-    // L6: keep-f16 is OPT-IN (default OFF) — the binding measurement refuted the
-    // RSS-closing premise and it regresses prefill, so it never defaults on.
-    CHECK_FALSE(p.keep_f16);
+    // L7 (2026-07-23): keep-f16 is now DEFAULT ON wherever expand_nk holds — the
+    // repack-source release + load-time prefault removed L6's two objections
+    // (RSS-neutral, prefill regression), so it measures 1.01x llama.cpp RSS with
+    // prefill/decode at-or-ahead and byte-identical tokens.
+    CHECK(p.keep_f16 == vllm::GgufQuantComputeAvailable());
     CHECK_FALSE(p.cpu_ref);
   }
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   CHECK(GgufLoadPolicy::FromEnv().keep_quant);
   CHECK(GgufLoadPolicy::FromEnv().expand_nk);
-  CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_f16);  // opt-in, still off
+  // L7: keep-f16 defaults to expand_nk (true here, keep-quant is env-forced ON).
+  // NB compare to expand_nk, NOT GgufQuantComputeAvailable(): with keep-quant
+  // env-forced, expand_nk holds even on a CUDA build where the quant GEMM is
+  // unregistered (GgufQuantComputeAvailable() is false there).
+  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == GgufLoadPolicy::FromEnv().expand_nk);
+  // The opt-out must work after the default flip.
+  ::setenv("VT_GGUF_KEEP_F16", "0", 1);
+  CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_f16);
+  ::unsetenv("VT_GGUF_KEEP_F16");
   // The OPT-OUT the spec promised must survive the default flip.
   for (const char* off : {"0", "false", "off", ""}) {
     ::setenv("VT_GGUF_KEEP_QUANT", off, 1);
@@ -384,13 +394,11 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   // it is inert with keep-quant off (nothing to keep) or under VT_CPU_REF.
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   ::setenv("VT_GGUF_KEEP_F16", "1", 1);
-  CHECK(GgufLoadPolicy::FromEnv().keep_f16 ==
-        vllm::GgufQuantComputeAvailable());
+  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == GgufLoadPolicy::FromEnv().expand_nk);
   for (const char* on : {"1", "true", "on"}) {
     ::setenv("VT_GGUF_KEEP_F16", on, 1);
     CAPTURE(on);
-    CHECK(GgufLoadPolicy::FromEnv().keep_f16 ==
-          vllm::GgufQuantComputeAvailable());
+    CHECK(GgufLoadPolicy::FromEnv().keep_f16 == GgufLoadPolicy::FromEnv().expand_nk);
   }
   ::unsetenv("VT_GGUF_KEEP_F16");
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
@@ -884,7 +892,9 @@ TEST_CASE("production default is keep-quant wherever the quant GEMM exists") {
   GgufLoadPolicy expect;
   expect.keep_quant = vllm::GgufQuantComputeAvailable();
   expect.expand_nk = expect.keep_quant;
-  // keep_f16 is opt-in (default OFF), so FromEnv leaves it off here too.
+  // L7: keep_f16 defaults ON with the quant path, so `expect` must mirror it or
+  // the byte comparison diverges on any F16 verbatim weight in the fixture.
+  expect.keep_f16 = expect.expand_nk;
   expect.mmap_residency = expect.keep_quant;
   expect.share_tied_head = expect.keep_quant;
   expect.gdn_expand_nk = expect.keep_quant;
@@ -1050,14 +1060,15 @@ GgufLoadPolicy KeepQuantMmap() {
   return p;
 }
 
-// The production CPU shape: keep-quant + untransposed expansion + both L5
-// residency refinements, exactly as GgufLoadPolicy::FromEnv builds it there.
+// The L5 production CPU shape: keep-quant + untransposed expansion + both L5
+// residency refinements, with keep_f16 held OFF so these cases exercise the bf16
+// tied-head SHARE path specifically (VT_GGUF_KEEP_F16=0; the L7 default-on f16
+// share is covered by the KeepF16On() cases below).
 GgufLoadPolicy ProductionCpu() {
   GgufLoadPolicy p = KeepQuantOn();
   p.expand_nk = true;
   p.mmap_residency = true;
   p.share_tied_head = true;
-  // keep_f16 stays OFF: it is opt-in (default OFF), see FromEnv / L6.
   return p;
 }
 
@@ -1597,6 +1608,32 @@ TEST_CASE("keep-f16 mmap residency BORROWS in place; copy arm OWNS") {
   CHECK(wm.lm_head.bytes == wc.lm_head.bytes);      // same bytes
   CHECK(wm.lm_head.bytes.data() == oh.data);        // IN PLACE, the file's own
   CHECK(wm.lm_head.dtype == vt::DType::kF16);
+}
+
+TEST_CASE("L7 load-time prefault is byte-transparent on a borrowed F16 weight") {
+  // The prefault (VT_GGUF_PREFAULT) only READS the borrowed pages to fault them
+  // in at load, off the timed prefill path. It must change no byte and must leave
+  // the weight borrowed in place. A/B the two env settings on the SAME file.
+  const DenseDims d;
+  const TempFile f(BuildDenseF16Gguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+  const vllm::GgufTensorInfo& oh = g.Get("output.weight");
+
+  GgufLoadPolicy mmap = KeepF16On();
+  mmap.mmap_residency = true;
+
+  ::setenv("VT_GGUF_PREFAULT", "0", 1);
+  const vllm::Qwen3_5DenseWeights woff =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+  ::setenv("VT_GGUF_PREFAULT", "1", 1);
+  const vllm::Qwen3_5DenseWeights won =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+  ::unsetenv("VT_GGUF_PREFAULT");
+
+  CHECK(won.lm_head.bytes.borrowed());        // still an in-place borrow
+  CHECK(won.lm_head.bytes.data() == oh.data);
+  CHECK(won.lm_head.bytes == woff.lm_head.bytes);  // byte-identical to no-prefault
 }
 
 TEST_CASE("a borrowed F16 weight OUTLIVES the GgufFile and the file") {

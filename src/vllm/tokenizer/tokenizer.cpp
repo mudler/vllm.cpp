@@ -5,6 +5,7 @@
 #include "vllm/tokenizer/tokenizer.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <fstream>
 #include <stdexcept>
 #include <utility>
@@ -12,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/tokenizer/unicode_data.h"
 
 namespace vllm::tok {
 namespace {
@@ -168,6 +170,95 @@ void WalkPreTokenizer(const json& node, std::vector<std::string>& regexes,
     return;
   }
   Fail("unsupported pre_tokenizer component \"" + type + "\"");
+}
+
+// A SentencePiece tokenizer.json (Mistral, Gemma, ...) carries a `Metaspace`
+// pre_tokenizer instead of the byte-level Split/ByteLevel components: whitespace
+// is replaced with a replacement char (▁ = U+2581) and BPE runs over the
+// resulting string (NOT the byte-mapped alphabet), with byte-fallback for
+// characters absent from the vocab. Recognized here so FromHfJson can dispatch
+// to the SentencePiece family; anything else is left to DetectPattern (byte
+// level) or fails loudly there. Mirrors HF tokenizers `pre_tokenizers::Metaspace`
+// (tokenizers 0.22, pre_tokenizers/metaspace.rs). Returns false if the
+// pre_tokenizer is not a bare Metaspace node.
+bool DetectMetaspace(const json& doc, std::string& replacement,
+                     std::string& prepend_scheme, bool& split) {
+  const auto it = doc.find("pre_tokenizer");
+  if (it == doc.end() || it->is_null() || !it->is_object()) return false;
+  if (it->value("type", "") != "Metaspace") return false;
+  // HF Metaspace defaults: replacement "▁", prepend_scheme "always", split true.
+  replacement = it->value("replacement", std::string("\xE2\x96\x81"));
+  prepend_scheme = it->value("prepend_scheme", std::string("always"));
+  split = it->value("split", true);
+  return true;
+}
+
+// Parses an HF byte-fallback token "<0xNN>" (case-insensitive hex) to its byte
+// value, or -1 if `token` is not exactly a 6-char "<0xNN>" form. Mirrors HF
+// tokenizers `ByteFallback` decode (decoders/byte_fallback.rs).
+int ParseByteToken(const std::string& token) {
+  if (token.size() != 6 || token[0] != '<' || token[1] != '0' ||
+      token[2] != 'x' || token[5] != '>') {
+    return -1;
+  }
+  const auto hex = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  const int hi = hex(token[3]);
+  const int lo = hex(token[4]);
+  if (hi < 0 || lo < 0) return -1;
+  return (hi << 4) | lo;
+}
+
+// Strict UTF-8 validation matching Rust's std::str::from_utf8 (used by HF's
+// ByteFallback decoder): rejects overlong encodings, surrogates
+// (U+D800..U+DFFF) and codepoints above U+10FFFF.
+bool IsValidUtf8(const uint8_t* p, size_t n) {
+  size_t i = 0;
+  while (i < n) {
+    const uint8_t b0 = p[i];
+    if (b0 < 0x80) {
+      ++i;
+      continue;
+    }
+    size_t need;
+    uint8_t lo = 0x80, hi = 0xBF;  // first continuation byte's valid range
+    if (b0 >= 0xC2 && b0 <= 0xDF) {
+      need = 1;
+    } else if (b0 == 0xE0) {
+      need = 2;
+      lo = 0xA0;
+    } else if (b0 >= 0xE1 && b0 <= 0xEC) {
+      need = 2;
+    } else if (b0 == 0xED) {
+      need = 2;
+      hi = 0x9F;
+    } else if (b0 >= 0xEE && b0 <= 0xEF) {
+      need = 2;
+    } else if (b0 == 0xF0) {
+      need = 3;
+      lo = 0x90;
+    } else if (b0 >= 0xF1 && b0 <= 0xF3) {
+      need = 3;
+    } else if (b0 == 0xF4) {
+      need = 3;
+      hi = 0x8F;
+    } else {
+      return false;  // 0x80..0xC1, 0xF5..0xFF: never a valid lead
+    }
+    if (i + need >= n) return false;
+    for (size_t k = 1; k <= need; ++k) {
+      const uint8_t b = p[i + k];
+      const uint8_t klo = (k == 1) ? lo : uint8_t{0x80};
+      const uint8_t khi = (k == 1) ? hi : uint8_t{0xBF};
+      if (b < klo || b > khi) return false;
+    }
+    i += need + 1;
+  }
+  return true;
 }
 
 SplitPattern DetectPattern(const json& doc) {
@@ -355,7 +446,36 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
 
   Tokenizer tok;
   CheckNormalizer(doc);
-  tok.pattern_ = DetectPattern(doc);
+  // Dispatch on the pre_tokenizer FAMILY: a bare `Metaspace` node selects the
+  // SentencePiece family (Mistral/Gemma); everything else is byte-level BPE and
+  // goes through DetectPattern (which fails loudly on Metaspace, so the two
+  // families never overlap).
+  std::string ms_repl;
+  std::string ms_scheme;
+  bool ms_split = true;
+  std::string unk_token;  // model.unk_token, resolved to an id below
+  if (DetectMetaspace(doc, ms_repl, ms_scheme, ms_split)) {
+    tok.family_ = Family::kSentencePiece;
+    if (ms_repl.empty()) Fail("Metaspace has empty replacement");
+    tok.metaspace_replacement_ = ms_repl;
+    tok.metaspace_split_ = ms_split;
+    if (ms_scheme == "never") {
+      tok.prepend_scheme_ = PrependScheme::kNever;
+    } else if (ms_scheme == "first") {
+      tok.prepend_scheme_ = PrependScheme::kFirst;
+    } else if (ms_scheme == "always") {
+      tok.prepend_scheme_ = PrependScheme::kAlways;
+    } else {
+      Fail("unsupported Metaspace prepend_scheme \"" + ms_scheme + "\"");
+    }
+    // split=true would pre-split the metaspace string into per-▁ pretokens
+    // (MergedWithNext). No checkpoint in scope uses it (Mistral/Gemma set
+    // split=false); accept it only when we have a golden. Fail loudly rather
+    // than tokenize a split=true model subtly wrong.
+    if (ms_split) Fail("Metaspace split=true unsupported (no golden in scope)");
+  } else {
+    tok.pattern_ = DetectPattern(doc);
+  }
 
   const auto model_it = doc.find("model");
   if (model_it == doc.end() || !model_it->is_object()) Fail("missing model");
@@ -365,8 +485,7 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
     Fail("unsupported model type \"" + model_type +
          "\" (only byte-level BPE)");
   }
-  // These options change BPE segmentation semantics; the byte-level family
-  // never uses them.
+  // These options change BPE segmentation semantics; neither family uses them.
   for (const char* key : {"continuing_subword_prefix", "end_of_word_suffix"}) {
     const auto it = model.find(key);
     if (it != model.end() && !it->is_null() &&
@@ -375,6 +494,17 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
     }
   }
   tok.ignore_merges_ = model.value("ignore_merges", false);
+  // SentencePiece BPE model options (byte-fallback + unk fusion). byte_fallback
+  // decomposes an out-of-vocab character into its UTF-8 bytes as "<0xNN>"
+  // tokens; fuse_unk collapses consecutive unknowns into one unk id.
+  if (tok.family_ == Family::kSentencePiece) {
+    tok.byte_fallback_ = model.value("byte_fallback", false);
+    tok.fuse_unk_ = model.value("fuse_unk", false);
+    const auto unk_it = model.find("unk_token");
+    if (unk_it != model.end() && unk_it->is_string()) {
+      unk_token = unk_it->get<std::string>();
+    }
+  }
 
   // Vocab. Note: nlohmann keeps the LAST value for duplicate JSON keys; a
   // well-formed tokenizer.json has none.
@@ -440,6 +570,14 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
       }
       tok.added_tokens_.push_back(std::move(t));
     }
+  }
+
+  // Resolve the SentencePiece unk token to its id (used only when a character
+  // has no vocab token AND byte-fallback cannot cover it — for Mistral every
+  // byte 0x00..0xFF has a "<0xNN>" token so this path is never taken).
+  if (tok.family_ == Family::kSentencePiece && !unk_token.empty()) {
+    const auto it = tok.vocab_.find(unk_token);
+    if (it != tok.vocab_.end()) tok.unk_id_ = it->second;
   }
 
   ExtractBosEos(doc, tok.bos_id_, tok.eos_id_);
@@ -591,6 +729,95 @@ void Tokenizer::EncodePlain(std::string_view text,
   }
 }
 
+void Tokenizer::EncodePlainSp(std::string_view text, bool at_input_start,
+                             std::vector<int32_t>& out) const {
+  // 1) Metaspace normalization: replace every ASCII space (0x20) with the
+  //    replacement (▁), then prepend one replacement per prepend_scheme when
+  //    the result does not already start with it (HF Metaspace::pre_tokenize,
+  //    tokenizers 0.22 pre_tokenizers/metaspace.rs). Only 0x20 is replaced;
+  //    \t/\n are left for byte-fallback below (matches HF).
+  std::string s;
+  s.reserve(text.size() + metaspace_replacement_.size());
+  for (const char c : text) {
+    if (c == ' ') {
+      s += metaspace_replacement_;
+    } else {
+      s.push_back(c);
+    }
+  }
+  const bool prepend =
+      prepend_scheme_ == PrependScheme::kAlways ||
+      (prepend_scheme_ == PrependScheme::kFirst && at_input_start);
+  if (prepend && !s.empty() &&
+      s.compare(0, metaspace_replacement_.size(), metaspace_replacement_) != 0) {
+    s.insert(0, metaspace_replacement_);
+  }
+  if (s.empty()) return;
+
+  // 2) Build the initial BPE symbols. HF constructs the Word BEFORE merging:
+  //    each character maps to itself when present in the vocab, else (with
+  //    byte_fallback) decomposes into its UTF-8 bytes as "<0xNN>" tokens, else
+  //    becomes unk. Merges then run over these symbols.
+  static const std::string kUnk("\x01\x01unk\x01\x01");  // never a real symbol
+  std::vector<std::string> symbols;
+  size_t pos = 0;
+  while (pos < s.size()) {
+    const size_t begin = pos;
+    (void)DecodeUtf8(s, pos);
+    std::string ch = s.substr(begin, pos - begin);
+    if (vocab_.find(ch) != vocab_.end()) {
+      symbols.push_back(std::move(ch));
+      continue;
+    }
+    if (byte_fallback_) {
+      std::vector<std::string> bytes;
+      bool all = true;
+      for (const unsigned char b : ch) {
+        char buf[7];
+        std::snprintf(buf, sizeof(buf), "<0x%02X>", static_cast<unsigned>(b));
+        std::string bt(buf);
+        if (vocab_.find(bt) == vocab_.end()) {
+          all = false;
+          break;
+        }
+        bytes.push_back(std::move(bt));
+      }
+      if (all) {
+        for (auto& b : bytes) symbols.push_back(std::move(b));
+        continue;
+      }
+    }
+    if (unk_id_ < 0) {
+      Fail("SentencePiece: character \"" + ch +
+           "\" has no vocab token, byte-fallback unavailable, and no unk_token");
+    }
+    symbols.push_back(kUnk);
+  }
+
+  BpeMerge(symbols, merge_ranks_);
+
+  // 3) Map merged symbols to ids; fuse consecutive unk ids when fuse_unk.
+  int32_t prev = -1;
+  for (const std::string& sym : symbols) {
+    int32_t id;
+    if (sym == kUnk) {
+      id = unk_id_;
+    } else {
+      const auto it = vocab_.find(sym);
+      if (it != vocab_.end()) {
+        id = it->second;
+      } else if (unk_id_ >= 0) {
+        id = unk_id_;
+      } else {
+        Fail("SentencePiece: merged symbol \"" + sym + "\" not in vocab");
+      }
+    }
+    if (fuse_unk_ && id == unk_id_ && prev == unk_id_) continue;
+    out.push_back(id);
+    prev = id;
+  }
+}
+
 std::vector<int32_t> Tokenizer::Encode(std::string_view text) const {
   std::vector<int32_t> out;
   size_t pos = 0;
@@ -608,11 +835,24 @@ std::vector<int32_t> Tokenizer::Encode(std::string_view text) const {
         best = &t;
       }
     }
+    // Metaspace prepend_scheme="first" prepends ▁ ONLY to the segment that
+    // begins at byte 0 of the whole input (a segment following a special token
+    // is not "first"); at_input_start captures exactly that. Inert for the
+    // byte-level family.
+    const bool at_input_start = pos == 0;
     if (best == nullptr) {
-      EncodePlain(text.substr(pos), out);
+      if (family_ == Family::kSentencePiece) {
+        EncodePlainSp(text.substr(pos), at_input_start, out);
+      } else {
+        EncodePlain(text.substr(pos), out);
+      }
       break;
     }
-    EncodePlain(text.substr(pos, best_pos - pos), out);
+    if (family_ == Family::kSentencePiece) {
+      EncodePlainSp(text.substr(pos, best_pos - pos), at_input_start, out);
+    } else {
+      EncodePlain(text.substr(pos, best_pos - pos), out);
+    }
     out.push_back(best->id);
     pos = best_pos + best->text.size();
   }
@@ -635,7 +875,64 @@ std::vector<int32_t> Tokenizer::EncodeWithSpecialTokens(
   return out;
 }
 
+std::string Tokenizer::SpDecodeTokens(const std::vector<std::string>& tokens,
+                                     size_t begin, size_t end) const {
+  // HF tokenizers Sequence decoder for the SentencePiece family:
+  //   Replace(▁->" ") -> ByteFallback -> Fuse -> Strip(1 leading space).
+  // Replace only affects ▁ (never inside a "<0xNN>" byte token), so it is
+  // applied inline when a non-byte token is emitted. ByteFallback accumulates a
+  // run of consecutive "<0xNN>" tokens and, on the next non-byte token or at
+  // the end, decodes the run: valid UTF-8 -> the decoded text, else one U+FFFD
+  // per byte (decoders/byte_fallback.rs). Fuse is the implicit concatenation.
+  std::string out;
+  std::vector<uint8_t> byte_run;
+  const auto flush = [&]() {
+    if (byte_run.empty()) return;
+    if (IsValidUtf8(byte_run.data(), byte_run.size())) {
+      out.append(reinterpret_cast<const char*>(byte_run.data()),
+                 byte_run.size());
+    } else {
+      for (size_t k = 0; k < byte_run.size(); ++k) out += "\xEF\xBF\xBD";
+    }
+    byte_run.clear();
+  };
+  for (size_t t = begin; t < end; ++t) {
+    const std::string& tk = tokens[t];
+    const int byte = ParseByteToken(tk);
+    if (byte >= 0) {
+      byte_run.push_back(static_cast<uint8_t>(byte));
+      continue;
+    }
+    flush();
+    // Replace every ▁ with a space while appending.
+    size_t p = 0;
+    while (p < tk.size()) {
+      const size_t hit = tk.find(metaspace_replacement_, p);
+      if (hit == std::string::npos) {
+        out.append(tk, p, tk.size() - p);
+        break;
+      }
+      out.append(tk, p, hit - p);
+      out.push_back(' ');
+      p = hit + metaspace_replacement_.size();
+    }
+  }
+  flush();
+  // Strip(content=" ", start=1): remove at most one leading space.
+  if (!out.empty() && out.front() == ' ') out.erase(out.begin());
+  return out;
+}
+
 std::string Tokenizer::Decode(const std::vector<int32_t>& ids) const {
+  if (family_ == Family::kSentencePiece) {
+    // ids -> stored token strings (vocab: raw "▁Hello"/"<0xNN>"; added: literal
+    // content), then the SentencePiece decoder chain. Includes special tokens
+    // literally (full decode), matching the byte-level branch below.
+    std::vector<std::string> tokens;
+    tokens.reserve(ids.size());
+    for (const int32_t id : ids) tokens.push_back(TokenText(id));
+    return SpDecodeTokens(tokens, 0, tokens.size());
+  }
   std::string out;
   for (const int32_t id : ids) {
     const std::string& text = TokenText(id);

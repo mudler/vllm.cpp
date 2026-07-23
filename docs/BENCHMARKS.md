@@ -33,23 +33,36 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
-**Mistral (`MistralForCausalLM`, Mistral-7B-v0.3) — CORRECTNESS increment, no speed
-number (2026-07-23, `CLAIM-MODEL-MISTRAL`, [spike](../.agents/specs/sweep-mistral.md)).**
+**Mistral (`MistralForCausalLM`, Mistral-7B-v0.3) — CORRECTNESS COMPLETE, no speed
+number (2026-07-23, `CLAIM-MODEL-MISTRAL` + `CLAIM-LOAD-SENTENCEPIECE`,
+[spike](../.agents/specs/sweep-mistral.md), [tokenizer](../.agents/specs/sentencepiece.md)).**
 Disposition: **NO throughput measured or claimed — SPEED PENDING** (a separate
-increment), and the **full paged-engine SACRED gate is BLOCKED** on Mistral's
-SentencePiece/Metaspace tokenizer, which our ByteLevel-BPE-only tokenizer cannot load
-(the pre-inventoried `LOAD-SENTENCEPIECE` row (SentencePiece tokenizer family)). The MODEL forward was instead gated
-**tokenizer-free**: vLLM's exact prompt token ids fed through our CUDA prefill and
-greedy-decoded — **30/30 continuation tokens match the vLLM 0.25.0 oracle** (29 STRICT
-token-exact + 1 near-tie band [p3 last token: our 4608 ∈ vLLM's own {1782,4608}], 0
-forward-divergent; vLLM greedy MEASURED deterministic on 4/5 prompts, K=3). Mistral =
-the shared Qwen3/Llama dense forward with NO new primitive (plain rope θ1e6, no
-qk-norm, untied lm_head, null sliding_window all pre-existing), so the row is 3 new
-files with ZERO shared-code edit; the additive-only diff makes the existing gates
-unaffected. W2 loader validated on the real 3-shard checkpoint (1541 assertions).
-CUDA `-Werror` 0 warnings; DSR 32 unchanged. Row `ACTIVE`, not `DONE`. Repro: capture
-`~/venvs/vllm-oracle/bin/python -u mistral_capture2.py` (gpu_mem 0.40, ninja on PATH)
-then `flock $HOME/gpu.lock ./build-cuda/tests/test_mistral_forward` on dgx.
+increment). The **full paged-engine SACRED gate now RUNS + PASSES** — unblocked by the
+new SentencePiece (Metaspace + byte-fallback) tokenizer (`LOAD-SENTENCEPIECE`, encode/
+decode byte-exact vs vLLM 0.25.0). `test_mistral_paged_engine` drives the 16-prompt
+battery through the paged `LLMEngine` and matches the vLLM 0.25.0 per-prompt greedy
+oracle **16/16** (vLLM ALL-DETERMINISTIC over K=5 ⇒ STRICT bar): 15/16 strict
+token-exact + 1/16 near-tie band (prompt[5]@tok10 our 1535 vs vLLM greedy 1281, but
+vLLM's OWN teacher-forced argmax given our prefix == our token, gap **0.0000 nats**
+≪ 0.5), 0 forward-divergent. Prompt tokenization byte-exact vs vLLM's own tokenizer
+(BOS=1; `p{i}_prompt.i32` == our `EncodeWithSpecialTokens`). (Earlier W0-W3 also proved
+the forward tokenizer-free at 30/30.) Mistral = the shared Qwen3/Llama dense forward
+with NO new primitive (plain rope θ1e6, no qk-norm, untied lm_head, null sliding_window
+all pre-existing); 3 new model files, ZERO shared-code edit. W2 loader validated on the
+real 3-shard checkpoint (1541 assertions). CUDA `-Werror` 0 warnings; DSR 32 unchanged.
+Row `ACTIVE`, not `DONE` (SPEED pending). Repro on dgx: capture the oracle with
+`qwen3-oracle-capture.py --per-prompt --runs 5 --gpu-mem 0.40 --model mistralai/Mistral-7B-v0.3
+--out-dir tests/parity/goldens/mistral_greedy_7b`, bootstrap our ids with
+`VT_DUMP_IDS=1 ./build-cuda/tests/test_mistral_paged_engine` + `qwen3-neartie-gap.py`,
+then `flock $HOME/gpu.lock ./build-cuda/tests/test_mistral_paged_engine`.
+
+**SentencePiece tokenizer (`LOAD-SENTENCEPIECE`) — correctness gate, NOT a benchmark.**
+NOT APPLICABLE for throughput (tokenization is host-side and negligible vs the model
+forward). Correctness: `test_tokenizer_parity_mistral` **6/6, 421 assertions** byte-exact
+vs HF `tokenizers` 0.22.2 (= vLLM 0.25.0 backend) over a 45-entry Metaspace/byte-fallback/
+special-token corpus; SACRED cross-check vs vLLM's own `AutoTokenizer` 0/45 mismatch;
+byte-level suites byte-identical (test_bpe 852, test_detokenizer 221, test_tokenizer_parity
+1175, test_tokenizer_parity_deepseek 2461); ASan+UBSan clean on the tokenizer path.
 
 **Qwen3-dense SPEED binding vs vLLM 0.25.0 production — same-session, matching-recipe
 (2026-07-21, `Qwen3-4B` BF16).** SUPERSEDES the 2026-07-20 table below, whose vLLM

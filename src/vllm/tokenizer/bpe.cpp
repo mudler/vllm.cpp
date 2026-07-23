@@ -88,16 +88,7 @@ std::string MergeKey(std::string_view left, std::string_view right) {
   return key;
 }
 
-std::vector<std::string> BpeSplit(std::string_view mapped_pretoken,
-                                  const MergeRanks& ranks) {
-  // Start from single-codepoint symbols.
-  std::vector<std::string> symbols;
-  size_t pos = 0;
-  while (pos < mapped_pretoken.size()) {
-    const size_t begin = pos;
-    (void)DecodeUtf8(mapped_pretoken, pos);
-    symbols.emplace_back(mapped_pretoken.substr(begin, pos - begin));
-  }
+void BpeMerge(std::vector<std::string>& symbols, const MergeRanks& ranks) {
   // Repeatedly merge the lowest-ranked adjacent pair; leftmost wins ties
   // (strict < keeps the first best). O(n^2) scan; pretokens are tiny.
   while (symbols.size() >= 2) {
@@ -114,6 +105,19 @@ std::vector<std::string> BpeSplit(std::string_view mapped_pretoken,
     symbols[best_i] += symbols[best_i + 1];
     symbols.erase(symbols.begin() + static_cast<std::ptrdiff_t>(best_i) + 1);
   }
+}
+
+std::vector<std::string> BpeSplit(std::string_view mapped_pretoken,
+                                  const MergeRanks& ranks) {
+  // Start from single-codepoint symbols.
+  std::vector<std::string> symbols;
+  size_t pos = 0;
+  while (pos < mapped_pretoken.size()) {
+    const size_t begin = pos;
+    (void)DecodeUtf8(mapped_pretoken, pos);
+    symbols.emplace_back(mapped_pretoken.substr(begin, pos - begin));
+  }
+  BpeMerge(symbols, ranks);
   return symbols;
 }
 

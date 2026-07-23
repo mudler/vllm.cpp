@@ -353,11 +353,18 @@ IncrementalDetokenizeResult DetokenizeIncrementally(
 
   // The prefix text is necessary only to defeat cleanup algorithms in the
   // decode which decide to add a space or not depending on the surrounding
-  // ids.
+  // ids. The SentencePiece family (Metaspace + byte-fallback) routes through
+  // its own decoder chain; the byte-level family uses the ByteLevel reversal.
   const std::string prefix_text =
-      ConvertTokensToString(output_tokens, prefix_offset, read_offset);
+      tokenizer.IsSentencePiece()
+          ? tokenizer.SpDecodeTokens(output_tokens, prefix_offset, read_offset)
+          : ConvertTokensToString(output_tokens, prefix_offset, read_offset);
   std::string new_text =
-      ConvertTokensToString(output_tokens, prefix_offset, output_tokens.size());
+      tokenizer.IsSentencePiece()
+          ? tokenizer.SpDecodeTokens(output_tokens, prefix_offset,
+                                     output_tokens.size())
+          : ConvertTokensToString(output_tokens, prefix_offset,
+                                  output_tokens.size());
 
   // Upstream: `if len(new_text) <= len(prefix_text) or new_text.endswith("�")`
   // — a "�" at the end means it's a potential unfinished byte sequence from

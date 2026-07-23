@@ -36,6 +36,14 @@ using MergeRanks = std::unordered_map<std::string, int32_t>;
 
 std::string MergeKey(std::string_view left, std::string_view right);
 
+// The merge loop of BpeSplit, factored out so a pre-seeded symbol list can be
+// merged directly. Repeatedly merges the adjacent pair with the lowest rank
+// (leftmost on ties) until no adjacent pair is in `ranks`; mutates `symbols`
+// in place. The SentencePiece path uses this after building initial symbols
+// with byte-fallback substitution (HF BPE constructs the Word — including the
+// byte-fallback decomposition of unknown characters — BEFORE running merges).
+void BpeMerge(std::vector<std::string>& symbols, const MergeRanks& ranks);
+
 // Applies BPE to one pretoken already in the mapped alphabet: start from
 // single-codepoint symbols, repeatedly merge the adjacent pair with the
 // lowest rank (leftmost on ties) until no adjacent pair is in `ranks`.

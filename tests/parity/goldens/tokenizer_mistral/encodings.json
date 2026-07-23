@@ -1,0 +1,790 @@
+{
+ "label": "mistralai/Mistral-7B-v0.3 @ caa1feb0",
+ "tokenizers_version": "0.22.2",
+ "tokenizer_sha256": "e553af6fff7d7ad76e830608b218c5c0b0822998d5a1a96099a74cd3c1cb1a49",
+ "bos_id": 1,
+ "entries": [
+  {
+   "text": "",
+   "ids": [],
+   "ids_special": [
+    1
+   ],
+   "decode": ""
+  },
+  {
+   "text": " ",
+   "ids": [
+    29473
+   ],
+   "ids_special": [
+    1,
+    29473
+   ],
+   "decode": ""
+  },
+  {
+   "text": "  ",
+   "ids": [
+    1027
+   ],
+   "ids_special": [
+    1,
+    1027
+   ],
+   "decode": " "
+  },
+  {
+   "text": "   ",
+   "ids": [
+    3055
+   ],
+   "ids_special": [
+    1,
+    3055
+   ],
+   "decode": "  "
+  },
+  {
+   "text": "hello",
+   "ids": [
+    7080,
+    29477
+   ],
+   "ids_special": [
+    1,
+    7080,
+    29477
+   ],
+   "decode": "hello"
+  },
+  {
+   "text": " hello",
+   "ids": [
+    7080,
+    29477
+   ],
+   "ids_special": [
+    1,
+    7080,
+    29477
+   ],
+   "decode": "hello"
+  },
+  {
+   "text": "  hello",
+   "ids": [
+    29473,
+    7080,
+    29477
+   ],
+   "ids_special": [
+    1,
+    29473,
+    7080,
+    29477
+   ],
+   "decode": " hello"
+  },
+  {
+   "text": "Hello world",
+   "ids": [
+    23325,
+    2294
+   ],
+   "ids_special": [
+    1,
+    23325,
+    2294
+   ],
+   "decode": "Hello world"
+  },
+  {
+   "text": "Hello, world!",
+   "ids": [
+    23325,
+    29493,
+    2294,
+    29576
+   ],
+   "ids_special": [
+    1,
+    23325,
+    29493,
+    2294,
+    29576
+   ],
+   "decode": "Hello, world!"
+  },
+  {
+   "text": "multiple   spaces",
+   "ids": [
+    5934,
+    1027,
+    11367
+   ],
+   "ids_special": [
+    1,
+    5934,
+    1027,
+    11367
+   ],
+   "decode": "multiple   spaces"
+  },
+  {
+   "text": "end ",
+   "ids": [
+    1716,
+    29473
+   ],
+   "ids_special": [
+    1,
+    1716,
+    29473
+   ],
+   "decode": "end "
+  },
+  {
+   "text": "▁already",
+   "ids": [
+    2909
+   ],
+   "ids_special": [
+    1,
+    2909
+   ],
+   "decode": "already"
+  },
+  {
+   "text": "café",
+   "ids": [
+    29113
+   ],
+   "ids_special": [
+    1,
+    29113
+   ],
+   "decode": "café"
+  },
+  {
+   "text": "😀",
+   "ids": [
+    29473,
+    31343
+   ],
+   "ids_special": [
+    1,
+    29473,
+    31343
+   ],
+   "decode": "😀"
+  },
+  {
+   "text": "😀😀",
+   "ids": [
+    29473,
+    31343,
+    31343
+   ],
+   "ids_special": [
+    1,
+    29473,
+    31343,
+    31343
+   ],
+   "decode": "😀😀"
+  },
+  {
+   "text": "🇺🇸",
+   "ids": [
+    29473,
+    32405,
+    32586
+   ],
+   "ids_special": [
+    1,
+    29473,
+    32405,
+    32586
+   ],
+   "decode": "🇺🇸"
+  },
+  {
+   "text": "ℤ",
+   "ids": [
+    29473,
+    997,
+    903,
+    935
+   ],
+   "ids_special": [
+    1,
+    29473,
+    997,
+    903,
+    935
+   ],
+   "decode": "ℤ"
+  },
+  {
+   "text": "\tTab",
+   "ids": [
+    29473,
+    780,
+    8328
+   ],
+   "ids_special": [
+    1,
+    29473,
+    780,
+    8328
+   ],
+   "decode": "\tTab"
+  },
+  {
+   "text": "a\nb",
+   "ids": [
+    1032,
+    781,
+    29494
+   ],
+   "ids_special": [
+    1,
+    1032,
+    781,
+    29494
+   ],
+   "decode": "a\nb"
+  },
+  {
+   "text": "\u0000",
+   "ids": [
+    29473,
+    771
+   ],
+   "ids_special": [
+    1,
+    29473,
+    771
+   ],
+   "decode": "\u0000"
+  },
+  {
+   "text": "\u001f",
+   "ids": [
+    29473,
+    31985
+   ],
+   "ids_special": [
+    1,
+    29473,
+    31985
+   ],
+   "decode": "\u001f"
+  },
+  {
+   "text": "日本語",
+   "ids": [
+    29473,
+    29910,
+    29887,
+    31089
+   ],
+   "ids_special": [
+    1,
+    29473,
+    29910,
+    29887,
+    31089
+   ],
+   "decode": "日本語"
+  },
+  {
+   "text": "한국어test",
+   "ids": [
+    29473,
+    30050,
+    31547,
+    30201,
+    2381
+   ],
+   "ids_special": [
+    1,
+    29473,
+    30050,
+    31547,
+    30201,
+    2381
+   ],
+   "decode": "한국어test"
+  },
+  {
+   "text": "Hello[INST]world",
+   "ids": [
+    23325,
+    3,
+    10239
+   ],
+   "ids_special": [
+    1,
+    23325,
+    3,
+    10239
+   ],
+   "decode": "Hello[INST]world"
+  },
+  {
+   "text": "Hello [INST] world",
+   "ids": [
+    23325,
+    29473,
+    3,
+    2294
+   ],
+   "ids_special": [
+    1,
+    23325,
+    29473,
+    3,
+    2294
+   ],
+   "decode": "Hello [INST] world"
+  },
+  {
+   "text": "[INST]hi[/INST]",
+   "ids": [
+    3,
+    6133,
+    4
+   ],
+   "ids_special": [
+    1,
+    3,
+    6133,
+    4
+   ],
+   "decode": "[INST]hi[/INST]"
+  },
+  {
+   "text": "a</s>b",
+   "ids": [
+    1032,
+    2,
+    29494
+   ],
+   "ids_special": [
+    1,
+    1032,
+    2,
+    29494
+   ],
+   "decode": "a</s>b"
+  },
+  {
+   "text": "<s>hi",
+   "ids": [
+    1,
+    6133
+   ],
+   "ids_special": [
+    1,
+    1,
+    6133
+   ],
+   "decode": "<s>hi"
+  },
+  {
+   "text": "The quick brown fox.",
+   "ids": [
+    1183,
+    3704,
+    9828,
+    1053,
+    1910,
+    29491
+   ],
+   "ids_special": [
+    1,
+    1183,
+    3704,
+    9828,
+    1053,
+    1910,
+    29491
+   ],
+   "decode": "The quick brown fox."
+  },
+  {
+   "text": "The capital of France is",
+   "ids": [
+    1183,
+    6333,
+    1070,
+    5611,
+    1117
+   ],
+   "ids_special": [
+    1,
+    1183,
+    6333,
+    1070,
+    5611,
+    1117
+   ],
+   "decode": "The capital of France is"
+  },
+  {
+   "text": "Once upon a time,",
+   "ids": [
+    6481,
+    4482,
+    1032,
+    1495,
+    29493
+   ],
+   "ids_special": [
+    1,
+    6481,
+    4482,
+    1032,
+    1495,
+    29493
+   ],
+   "decode": "Once upon a time,"
+  },
+  {
+   "text": "In the beginning God created",
+   "ids": [
+    1328,
+    1040,
+    6166,
+    3267,
+    4627
+   ],
+   "ids_special": [
+    1,
+    1328,
+    1040,
+    6166,
+    3267,
+    4627
+   ],
+   "decode": "In the beginning God created"
+  },
+  {
+   "text": "The quick brown fox jumps over",
+   "ids": [
+    1183,
+    3704,
+    9828,
+    1053,
+    1910,
+    1229,
+    11343,
+    1522
+   ],
+   "ids_special": [
+    1,
+    1183,
+    3704,
+    9828,
+    1053,
+    1910,
+    1229,
+    11343,
+    1522
+   ],
+   "decode": "The quick brown fox jumps over"
+  },
+  {
+   "text": "def fibonacci(n):",
+   "ids": [
+    1569,
+    16950,
+    1034,
+    28895,
+    29500,
+    29479,
+    2097
+   ],
+   "ids_special": [
+    1,
+    1569,
+    16950,
+    1034,
+    28895,
+    29500,
+    29479,
+    2097
+   ],
+   "decode": "def fibonacci(n):"
+  },
+  {
+   "text": "Water boils at a temperature of",
+   "ids": [
+    9400,
+    2127,
+    5312,
+    1206,
+    1032,
+    8409,
+    1070
+   ],
+   "ids_special": [
+    1,
+    9400,
+    2127,
+    5312,
+    1206,
+    1032,
+    8409,
+    1070
+   ],
+   "decode": "Water boils at a temperature of"
+  },
+  {
+   "text": "The theory of relativity was developed by",
+   "ids": [
+    1183,
+    6510,
+    1070,
+    1784,
+    29051,
+    1171,
+    6970,
+    1254
+   ],
+   "ids_special": [
+    1,
+    1183,
+    6510,
+    1070,
+    1784,
+    29051,
+    1171,
+    6970,
+    1254
+   ],
+   "decode": "The theory of relativity was developed by"
+  },
+  {
+   "text": "To be or not to be, that is",
+   "ids": [
+    2559,
+    1115,
+    1210,
+    1227,
+    1066,
+    1115,
+    29493,
+    1137,
+    1117
+   ],
+   "ids_special": [
+    1,
+    2559,
+    1115,
+    1210,
+    1227,
+    1066,
+    1115,
+    29493,
+    1137,
+    1117
+   ],
+   "decode": "To be or not to be, that is"
+  },
+  {
+   "text": "The largest planet in our solar system is",
+   "ids": [
+    1183,
+    8407,
+    10641,
+    1065,
+    1581,
+    13792,
+    2355,
+    1117
+   ],
+   "ids_special": [
+    1,
+    1183,
+    8407,
+    10641,
+    1065,
+    1581,
+    13792,
+    2355,
+    1117
+   ],
+   "decode": "The largest planet in our solar system is"
+  },
+  {
+   "text": "Machine learning is a subfield of",
+   "ids": [
+    14021,
+    5936,
+    1117,
+    1032,
+    1851,
+    2990,
+    1070
+   ],
+   "ids_special": [
+    1,
+    14021,
+    5936,
+    1117,
+    1032,
+    1851,
+    2990,
+    1070
+   ],
+   "decode": "Machine learning is a subfield of"
+  },
+  {
+   "text": "The mitochondria is the powerhouse of",
+   "ids": [
+    1183,
+    3135,
+    4810,
+    1857,
+    4699,
+    1117,
+    1040,
+    2750,
+    6954,
+    1070
+   ],
+   "ids_special": [
+    1,
+    1183,
+    3135,
+    4810,
+    1857,
+    4699,
+    1117,
+    1040,
+    2750,
+    6954,
+    1070
+   ],
+   "decode": "The mitochondria is the powerhouse of"
+  },
+  {
+   "text": "Roses are red, violets are",
+   "ids": [
+    9318,
+    1042,
+    1228,
+    3528,
+    29493,
+    1131,
+    1459,
+    8603,
+    1228
+   ],
+   "ids_special": [
+    1,
+    9318,
+    1042,
+    1228,
+    3528,
+    29493,
+    1131,
+    1459,
+    8603,
+    1228
+   ],
+   "decode": "Roses are red, violets are"
+  },
+  {
+   "text": "The first president of the United States was",
+   "ids": [
+    1183,
+    1675,
+    5719,
+    1070,
+    1040,
+    3737,
+    4311,
+    1171
+   ],
+   "ids_special": [
+    1,
+    1183,
+    1675,
+    5719,
+    1070,
+    1040,
+    3737,
+    4311,
+    1171
+   ],
+   "decode": "The first president of the United States was"
+  },
+  {
+   "text": "E equals m c",
+   "ids": [
+    1181,
+    22356,
+    1058,
+    1045
+   ],
+   "ids_special": [
+    1,
+    1181,
+    22356,
+    1058,
+    1045
+   ],
+   "decode": "E equals m c"
+  },
+  {
+   "text": "A journey of a thousand miles begins with",
+   "ids": [
+    1098,
+    8891,
+    1070,
+    1032,
+    8796,
+    6820,
+    11426,
+    1163
+   ],
+   "ids_special": [
+    1,
+    1098,
+    8891,
+    1070,
+    1032,
+    8796,
+    6820,
+    11426,
+    1163
+   ],
+   "decode": "A journey of a thousand miles begins with"
+  },
+  {
+   "text": "The chemical symbol for gold is",
+   "ids": [
+    1183,
+    11613,
+    6370,
+    1122,
+    5782,
+    1117
+   ],
+   "ids_special": [
+    1,
+    1183,
+    11613,
+    6370,
+    1122,
+    5782,
+    1117
+   ],
+   "decode": "The chemical symbol for gold is"
+  }
+ ]
+}

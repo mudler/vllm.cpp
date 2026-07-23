@@ -427,6 +427,16 @@ vllm_cpp_add_test(test_tokenizer_parity_deepseek vllm/test_tokenizer_parity_deep
 target_compile_definitions(test_tokenizer_parity_deepseek PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 
+# LOAD-SENTENCEPIECE — the SentencePiece (Metaspace + byte-fallback) BPE
+# tokenizer parity gate. Mistral-7B-v0.3's tokenizer.json is the first of this
+# family (▁ metaspace + `<0xNN>` byte-fallback vocab + BOS-prepending
+# TemplateProcessing). MEASURED byte-exact against HF `tokenizers` (= vLLM
+# 0.25.0's backend) over a Metaspace/byte-fallback/special-token corpus. This
+# is what unblocks the Mistral paged-engine SACRED gate.
+vllm_cpp_add_test(test_tokenizer_parity_mistral vllm/test_tokenizer_parity_mistral.cpp)
+target_compile_definitions(test_tokenizer_parity_mistral PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+
 vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)
 target_compile_definitions(test_op_parity PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")

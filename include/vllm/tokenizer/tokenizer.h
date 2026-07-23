@@ -82,14 +82,35 @@ class Tokenizer {
   SplitPattern Pattern() const { return pattern_; }
   const std::vector<SpecialToken>& AddedTokens() const { return added_tokens_; }
 
+  // Tokenizer family. kByteLevel is the GPT-2 bytes_to_unicode BPE family
+  // (Qwen/OPT/DeepSeek/Llama); kSentencePiece is the Metaspace + byte-fallback
+  // BPE family (Mistral, Gemma, and SentencePiece-derived tokenizer.json).
+  enum class Family { kByteLevel, kSentencePiece };
+  Family GetFamily() const { return family_; }
+  bool IsSentencePiece() const { return family_ == Family::kSentencePiece; }
+
+  // Applies this SentencePiece tokenizer's DECODER chain to a window of already
+  // resolved token strings [begin, end): HF tokenizers' Sequence decoder
+  // Replace(▁->space) -> ByteFallback (runs of "<0xNN>" -> raw bytes, invalid
+  // UTF-8 run -> one U+FFFD per byte) -> Fuse -> Strip(1 leading space). Shared
+  // by Decode() and the incremental detokenizer so both mirror HF exactly.
+  // Precondition: IsSentencePiece().
+  std::string SpDecodeTokens(const std::vector<std::string>& tokens,
+                             size_t begin, size_t end) const;
+
  private:
   Tokenizer() = default;
 
   // Builds token_text_/is_added_ from vocab_ + added_tokens_ (shared by the
   // HF and GGUF loaders). Throws on id collisions or out-of-range ids.
   void FinalizeTables();
-  // Pretokenize + BPE for a text segment with no added tokens inside.
+  // Pretokenize + BPE for a byte-level text segment with no added tokens inside.
   void EncodePlain(std::string_view text, std::vector<int32_t>& out) const;
+  // Metaspace transform + byte-fallback BPE for a SentencePiece text segment
+  // with no added tokens inside. `at_input_start` is true iff this segment
+  // begins at byte 0 of the whole input (drives prepend_scheme="first").
+  void EncodePlainSp(std::string_view text, bool at_input_start,
+                     std::vector<int32_t>& out) const;
 
   std::unordered_map<std::string, int32_t> vocab_;  // mapped symbol -> id
   MergeRanks merge_ranks_;
@@ -97,6 +118,17 @@ class Tokenizer {
   std::vector<std::string> token_text_;  // id -> stored text ("" = unassigned)
   // id -> 0 plain vocab, 1 added, 2 added+special. Nonzero decodes literally.
   std::vector<uint8_t> is_added_;
+  Family family_ = Family::kByteLevel;
+  // --- SentencePiece (Metaspace + byte-fallback) parameters (family_ ==
+  // kSentencePiece). Mirror the HF tokenizer.json `pre_tokenizer` (Metaspace)
+  // and `model` (BPE byte_fallback/fuse_unk/unk_token). ---
+  enum class PrependScheme { kNever, kFirst, kAlways };
+  std::string metaspace_replacement_;  // e.g. "▁" (U+2581), UTF-8
+  PrependScheme prepend_scheme_ = PrependScheme::kFirst;
+  bool metaspace_split_ = false;  // Metaspace `split` flag
+  bool byte_fallback_ = false;    // model.byte_fallback
+  bool fuse_unk_ = false;         // model.fuse_unk (fuse consecutive unk ids)
+  int32_t unk_id_ = -1;           // model.unk_token resolved to an id, else -1
   SplitPattern pattern_ = SplitPattern::kQwen2;
   int32_t eos_id_ = -1;
   int32_t bos_id_ = -1;

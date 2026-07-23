@@ -899,12 +899,20 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
   written by vllm.cpp will not interoperate with a stock vLLM unless that vLLM
   is launched with `--prefix-caching-hash-algo sha256_cbor`, because our
   block-hash algorithm deviates from upstream's default by design.
-- **LMCache is an external Python package, not a vLLM component.** vLLM ships
-  only the adapter glue; the cache engine, wire protocol and transport all live
-  in the separate `lmcache` package. Interoperating from a pure-C++ engine is
-  therefore a research question rather than a port, and it is currently scoped as
-  a go/no-go study rather than planned work. No LMCache support is implemented or
-  benchmarked.
+- **LMCache is an external Python package, not a vLLM component — but connecting
+  to a *running* LMCache server from pure C++ is feasible, and does not need the
+  `lmcache` package in our process.** vLLM ships only the adapter glue; the cache
+  engine lives in the separate `lmcache` package. A wire-protocol analysis
+  ([spike](.agents/specs/lmcache-cpp-client-connector.md)) found that vLLM talks
+  to a running LMCache over two fully-specified, language-agnostic wires: an
+  `lm://` remote-store server (plain TCP, a fixed binary header, raw KV bytes)
+  and a multiprocess server (ZMQ + msgpack, with the KV data shared over
+  CUDA-IPC). A from-scratch C++ client that speaks the simpler `lm://` protocol
+  is the recommended first target; it keys on LMCache's own token hash, so it
+  sidesteps the block-hash-compatibility question entirely. This is still an
+  interop feature with a version-sync cost (LMCache is an unpinned, moving
+  target), not a mechanical port, and **no LMCache support is implemented or
+  benchmarked yet** — the analysis is scoping, not code.
 - llama.cpp-style **imperative named session save/restore** — "save this
   conversation's cache to a file, reload it later" — is supported by neither us
   nor vLLM. It is the one caching capability llama.cpp genuinely has and vLLM

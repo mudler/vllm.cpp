@@ -20401,3 +20401,70 @@ STANDALONE UNCHANGED: 27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 16/
 6/6, DeepSeek-V2 8/8, Llama 16/16. Goldens content-hash identical. Profiling
 instrumentation reverted before the binding binary (no shared-DevicePool/runner/CUDA
 change ships). Closing commit + full SHA reported to the caller.
+## 2026-07-23 — LMCache C++ CLIENT feasibility analysis (records-only; `CLAIM-LMCACHE-CPP-CLIENT`, base `f6be46e`)
+
+**Ask (user, 2026-07-23):** "we DO want to connect to LMCache, so we should NOT
+need a pypi package — IIRC it works with zmq. Analyze how vLLM connects to
+LMCache." This REOPENS the parent spike's
+([kv-persistence-lmcache.md](specs/kv-persistence-lmcache.md)) LMCache
+disposition, which deferred it as "external PyPI, no specified wire protocol to
+implement against, a from-scratch client is reverse-engineering a moving target"
+(its R2/W6) — a verdict reached WITHOUT reading the LMCache package (it was not
+installed and not cloned).
+
+**Method.** Cloned the public `LMCache/LMCache@8570aad` to
+`/home/mudler/_git/lmcache-src` (read-only; nothing installed, no build, no GPU)
+and read BOTH sides of the boundary: vLLM's vendored connector glue (pin
+`e24d1b24`) AND the LMCache package itself, citing `file:line` on each side.
+
+**Finding — the user is RIGHT; the "no wire protocol" verdict is REFUTED.** vLLM
+connects to a RUNNING LMCache over THREE modes, two of which are portable wires
+needing ZERO in-process `lmcache`:
+1. **`lm://` remote-store** (`lmcache.v1.server.LMCacheServer`): plain TCP + a
+   fixed `struct.pack("iiiiiiiii150s")` 186-byte header + raw KV bytes. No ZMQ,
+   no msgpack, no pickle, no CUDA-IPC (`lmcache/v1/protocol.py:214-321`,
+   `server/__main__.py:24-147`, `lm_connector.py:28-177`). **Cleanest C++
+   target; recommend FIRST.**
+2. **MP server** (`lmcache.v1.multiprocess`): ZMQ DEALER↔ROUTER +
+   `msgspec.msgpack` control + CUDA-IPC data + one pickle blob in the one-time
+   `REGISTER_KV_CACHE` (`mq.py:82-105,270-353`, `custom_types.py:120-234`,
+   `platform/cuda/ipc_wrapper.py:92-187`). This is the "zmq" mode the user
+   recalled. FEASIBLE with effort; co-located because the server touches our GPU
+   KV directly.
+3. **In-process `LMCacheConnectorV1`** (default): the engine runs inside the
+   process (`lmcache_connector.py:107-113`). Python-only, not a wire boundary —
+   correctly rejected, as before.
+
+**Key correction to the parent spike.** Its R1 gated LMCache on our
+`sha256_cbor` block hashes being incompatible with vLLM's. That does NOT bind:
+LMCache keys on its OWN blake3 rolling token hash (`token_hasher.py:54-79`), not
+vLLM block hashes — MODE (1) hashes client-side, MODE (2)/token-mode hashes
+server-side from raw token ids. Neither needs a vLLM-hash match.
+
+**Showstoppers, honestly.** pickle → only the MP one-time IPC-wrapper
+registration (a fixed emittable template; zero pickle in MODE (1) and zero in the
+MODE (2) hot path). CUDA-IPC → only the MODE (2) data plane; speakable from C++
+via `cudaIpcGetMemHandle`/`OpenMemHandle` (the `RawCudaIPCWrapper` recipe) but
+co-located and layout-coupled. torch serialization → none on either wire (dtypes
+are fixed ints / strings). The one real residual is that LMCache is an UNPINNED,
+fast-moving package, so this is an interop feature with a version-sync cost, not
+a mechanical core port.
+
+**Seam reuse.** An LMCache client is one more `KVConnector` subclass (exactly as
+`LMCacheConnectorV1`/`LMCacheMPConnector` are `KVConnectorBase_V1` subclasses
+upstream). It reuses the landed W4/W5 scheduler+worker seam unchanged and the
+matching `slot = block_id*block_size+offset`; the net-new surface is only the
+transport + serialization + key/repack (~4 files).
+
+**Deliverable.** New spec
+[lmcache-cpp-client-connector.md](specs/lmcache-cpp-client-connector.md) with the
+full structured contract and a W-plan (W0 this analysis DONE; W1 protocol codec +
+blake3; W2 TCP client + `MemoryFormat` repack + real-server round trip; W3 as a
+`KVConnector` over the W5 seam; W4 MP mode contingent). Records-only updates:
+engine-matrix `KV-EXTERNAL-CACHE` row (stays `SPIKE`), roadmap `ROAD-V1-D4` note,
+coordination claim, ledger, README, `docs/BENCHMARKS.md` (NOT APPLICABLE).
+
+**Next / open.** Implementation resumes at the parent claim's W5 abstract
+`KVConnector` ABI, then MODE (1) `lm://` as the first LMCache client target;
+standing an `lmcache` server up on a test box (it is on no project box today) is
+the go/no-go gate's precondition.

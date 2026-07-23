@@ -58,6 +58,12 @@ Backend& GetBackend(DeviceType type) {
   return *b;
 }
 
+Backend* TryGetBackend(DeviceType type) {
+  const size_t index = static_cast<size_t>(type);
+  if (index >= kNumDeviceTypes) return nullptr;
+  return Registry()[index].backend;
+}
+
 void RegisterBackend(DeviceType type, Backend* backend) {
   VT_CHECK(backend != nullptr, "cannot register a null backend");
   Registry()[DeviceIndex(type)].backend = backend;

@@ -175,4 +175,52 @@ void ResetOpProviderStats(OpId op, DeviceType device);
 void DisableOpProvider(const char* name, bool disabled);
 bool OpProviderDisabled(const char* name);
 
+// --- Portable reference tier (S5, .agents/specs/accelerator-seam-audit.md) ----
+//
+// vLLM's `CustomOp.forward_native` (custom_op.py:138) is a pure-torch body every
+// op carries, so a brand-new platform that implements ZERO kernels is still
+// CORRECT — just slow — because torch is the universal portable op layer. Our
+// GetOp() THROWS on an unregistered op, so a partial backend (Metal: 18/75 ops,
+// Vulkan: a skeleton) could not run a model at all. This is our equivalent of
+// `forward_native`: register the existing CPU kernel as a NEGATIVE-priority
+// provider on a UNIFIED-MEMORY device, so an op the device lacks a native kernel
+// for falls back to the CPU reference instead of throwing.
+//
+// SAFETY (the load-bearing invariant). A CPU kernel dereferences host pointers.
+// That is correct ONLY where host and device memory alias (Metal StorageMode-
+// Shared, GB10 / integrated Vulkan, CPU) — `Backend::UnifiedMemory()`. On a
+// DISCRETE GPU a CPU kernel reading a device pointer is memory corruption, so the
+// tier is gated on the unified-memory property, never on DeviceType blindly.
+//
+// DETERMINISM / no-change-on-native. The fallback registers at
+// kReferenceTierPriority (strictly below every native kernel's priority >= 0), so
+// a native kernel always wins when present — a backend that HAS the kernel is
+// byte-identical to before. And the tier installs LAZILY, only on a genuine
+// GetOp miss, so a backend that never misses (CUDA on the gate models) is
+// completely untouched: no provider added, no table change.
+inline constexpr const char* kReferenceProviderName = "vt-cpu-ref";
+inline constexpr int kReferenceTierPriority = -1000;  // strictly below any native
+
+// THE SAFETY GATE. True iff `device` may host the CPU reference tier: it is not
+// the CPU source device itself, a backend is registered for it, and that backend
+// reports UnifiedMemory() == true. Consulted at registration time; a device that
+// answers false NEVER gets a CPU fallback installed.
+bool ReferenceTierEligible(DeviceType device);
+
+// Eagerly install the reference tier for `target`: for every op that has a CPU
+// kernel and no native kernel on `target`, install the CPU fn as a
+// kReferenceProviderName provider. Returns the number installed; a no-op
+// returning 0 unless ReferenceTierEligible(target). Production need not call
+// this — the tier auto-installs on the first GetOp miss — but a backend may call
+// it to warm up, and tests use it to assert the gate.
+int RegisterReferenceTier(DeviceType target);
+
+// OBSERVABILITY (Risk 7 — a slow fallback must never be silent). The number of
+// distinct (op, device) resolutions that selected the reference tier since
+// process start. It MUST be 0 in any performance arm: a non-zero value means a
+// native kernel is missing and the portable CPU path ran. VT_OP_PROVIDER_STATS=1
+// additionally prints a one-time stderr line the first time each (op, device)
+// falls back.
+unsigned long long GetReferenceTierHits();
+
 }  // namespace vt

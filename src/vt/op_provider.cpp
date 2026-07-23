@@ -20,12 +20,14 @@
 #include "vt/op_provider.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 
+#include "vt/backend.h"
 #include "vt/ops.h"
 
 namespace vt {
@@ -50,12 +52,30 @@ struct Slot {
   // positive one — otherwise the seam would put a capability scan on the 35B
   // decode path. Cleared by registration and by SetDeviceProviderCaps().
   std::atomic<bool> resolved_none{false};
+  // Cached NATIVE-availability for OpRegistered: -1 unknown, 0 none, 1 present.
+  // OpRegistered means "is there a NATIVE kernel" (the fused-recipe ladder and
+  // the cross-device harness depend on that meaning), so it deliberately IGNORES
+  // any reference-tier fallback provider in this slot. Cleared exactly like the
+  // selection cache. This is separate from `selected` because `selected` CAN
+  // hold a reference-tier fn (a real GetOp answer) while native stays absent.
+  std::atomic<int8_t> native_registered{-1};
+  // One-time loud reference-tier warning per (op, device) — see Resolve.
+  std::atomic<bool> ref_announced{false};
   std::atomic<const char*> last_selected{nullptr};
   std::atomic<unsigned long long> selections{0};
   std::atomic<unsigned long long> declines{0};
   std::atomic<unsigned long long> fallbacks{0};
   std::atomic<bool> announced{false};
 };
+
+// OBSERVABILITY: total reference-tier selections across all (op, device). A
+// process that ran a model entirely on native kernels leaves this at 0; any
+// value > 0 is proof the portable CPU path fired and the run is not a
+// performance measurement. Ported in spirit from the ArchTacticStats counters.
+std::atomic<unsigned long long>& RefTierHits() {
+  static std::atomic<unsigned long long> hits{0};
+  return hits;
+}
 
 // Zero-initialized static storage: usable from any static-init order, no
 // dynamic allocation, no dependence on another TU's constructor. ~66 KiB of BSS.
@@ -172,6 +192,35 @@ const OpProvider* Choose(Slot& slot, const ProviderCaps& caps, const OpProvider*
   return best;
 }
 
+// The portable reference tier (S5). When (op, device) has no provider and the
+// device is a UNIFIED-MEMORY accelerator, install the CPU kernel as a
+// negative-priority fallback so GetOp returns a working (if slow) kernel instead
+// of throwing — our equivalent of vLLM CustomOp.forward_native. Returns true iff
+// a fallback was installed. The unified-memory gate lives in
+// ReferenceTierEligible; a discrete device NEVER reaches RegisterOpProvider here.
+bool MaybeInstallReferenceTier(OpId op, DeviceType device) {
+  if (!ReferenceTierEligible(device)) return false;
+  // Already installed for this (op, device)? Report no-install so an eager
+  // second pass (RegisterReferenceTier) is exactly idempotent — RegisterOpProvider
+  // rejects the duplicate name, so counting it would over-report.
+  Slot& target = At(op, device);
+  for (int i = 0; i < target.count; ++i) {
+    if (std::strcmp(target.providers[i].name, kReferenceProviderName) == 0) return false;
+  }
+  Slot& cpu = At(op, DeviceType::kCPU);
+  if (cpu.count == 0) return false;  // no CPU reference either — a genuine throw
+  const ProviderCaps cpu_caps = GetDeviceProviderCaps(DeviceType::kCPU);
+  const OpProvider* src = Choose(cpu, cpu_caps, nullptr);
+  if (src == nullptr) return false;
+  OpProvider ref;
+  ref.name = kReferenceProviderName;
+  ref.priority = kReferenceTierPriority;
+  ref.supports = nullptr;  // portable: runs wherever host==device memory
+  ref.fn = src->fn;        // the SAME host kernel the CPU device dispatches
+  RegisterOpProvider(op, device, ref);
+  return true;
+}
+
 void Announce(OpId op, DeviceType device, Slot& slot, const OpProvider* chosen,
               const ProviderCaps& caps) {
   if (!AnnounceEnabled()) return;
@@ -188,6 +237,13 @@ void Announce(OpId op, DeviceType device, Slot& slot, const OpProvider* chosen,
 void* Resolve(OpId op, DeviceType device, Slot& slot) {
   ProviderCaps caps = GetDeviceProviderCaps(device);
   const OpProvider* chosen = Choose(slot, caps, nullptr);
+  // MISS: on a unified-memory accelerator, install the CPU reference tier and
+  // re-select. The native kernel — if one existed — would already have been
+  // chosen above (priority >= 0 beats the tier's negative priority), so this
+  // path is reached ONLY when the device genuinely lacks a native kernel.
+  if (chosen == nullptr && MaybeInstallReferenceTier(op, device)) {
+    chosen = Choose(slot, caps, nullptr);
+  }
   Announce(op, device, slot, chosen, caps);
   if (chosen == nullptr) {
     slot.fallbacks.fetch_add(1, std::memory_order_relaxed);
@@ -196,6 +252,17 @@ void* Resolve(OpId op, DeviceType device, Slot& slot) {
                         std::to_string(static_cast<int>(op)) + " on device type " +
                         std::to_string(static_cast<int>(device)));
     return nullptr;
+  }
+  // Reference-tier accounting: count it, and warn LOUDLY exactly once per
+  // (op, device) so "this backend ran op X on the portable tier" is never silent.
+  if (std::strcmp(chosen->name, kReferenceProviderName) == 0) {
+    RefTierHits().fetch_add(1, std::memory_order_relaxed);
+    if (!slot.ref_announced.exchange(true, std::memory_order_relaxed)) {
+      std::fprintf(stderr,
+                   "[vt reference-tier] op=%d device=%d has NO native kernel; "
+                   "running the PORTABLE CPU fallback (correct but slow)\n",
+                   static_cast<int>(op), static_cast<int>(device));
+    }
   }
   slot.last_selected.store(chosen->name, std::memory_order_relaxed);
   slot.selected.store(chosen->fn, std::memory_order_relaxed);
@@ -207,6 +274,7 @@ void InvalidateAll() {
   for (size_t i = 0; i < kOpCount * kNumDeviceTypes; ++i) {
     t[i].selected.store(nullptr, std::memory_order_relaxed);
     t[i].resolved_none.store(false, std::memory_order_relaxed);
+    t[i].native_registered.store(-1, std::memory_order_relaxed);
   }
 }
 
@@ -253,6 +321,7 @@ void RegisterOpProvider(OpId op, DeviceType device, const OpProvider& provider) 
   slot.providers[slot.count++] = provider;
   slot.selected.store(nullptr, std::memory_order_relaxed);
   slot.resolved_none.store(false, std::memory_order_relaxed);
+  slot.native_registered.store(-1, std::memory_order_relaxed);
 }
 
 void RegisterOp(OpId op, DeviceType device, void* fn) {
@@ -299,18 +368,29 @@ void* GetOpFallback(OpId op, DeviceType device, const char* declining_provider) 
 }
 
 bool OpRegistered(OpId op, DeviceType device) {
+  // Meaning (unchanged, and load-bearing for the fused-recipe fast-realization
+  // ladder and the cross-device harness): is there a NATIVE kernel for
+  // (op, device)? The portable reference tier is a FALLBACK, not a native
+  // kernel, so it is deliberately EXCLUDED here — otherwise a unified accelerator
+  // would report every op as "registered" the moment its fallback installed, and
+  // the ladder would stop choosing its portable composite path. It cannot use the
+  // `selected` cache because `selected` can legitimately hold a reference-tier fn
+  // (a real GetOp answer); it keeps its own native-only memo instead.
   Slot& slot = At(op, device);
-  if (slot.selected.load(std::memory_order_relaxed) != nullptr) return true;
-  if (slot.resolved_none.load(std::memory_order_relaxed)) return false;
+  const int8_t cached = slot.native_registered.load(std::memory_order_relaxed);
+  if (cached >= 0) return cached == 1;
   const ProviderCaps caps = GetDeviceProviderCaps(device);
-  const OpProvider* chosen = Choose(slot, caps, nullptr);
-  if (chosen == nullptr) {
-    slot.resolved_none.store(true, std::memory_order_relaxed);
-    return false;
+  bool has_native = false;
+  for (int i = 0; i < slot.count; ++i) {
+    const OpProvider& p = slot.providers[i];
+    if (std::strcmp(p.name, kReferenceProviderName) == 0) continue;  // fallback, not native
+    if (Supported(p, caps)) {
+      has_native = true;
+      break;
+    }
   }
-  slot.last_selected.store(chosen->name, std::memory_order_relaxed);
-  slot.selected.store(chosen->fn, std::memory_order_relaxed);
-  return true;
+  slot.native_registered.store(has_native ? 1 : 0, std::memory_order_relaxed);
+  return has_native;
 }
 
 int OpProviderCount(OpId op, DeviceType device) { return At(op, device).count; }
@@ -389,6 +469,38 @@ bool OpProviderDisabled(const char* name) {
     if (std::strcmp(d.names[i], name) == 0) return true;
   }
   return false;
+}
+
+// --- Portable reference tier (S5) ------------------------------------------
+bool ReferenceTierEligible(DeviceType device) {
+  // The CPU is the SOURCE of the reference kernels, never a fallback target
+  // (falling back to itself is a no-op at best and self-reference at worst).
+  if (device == DeviceType::kCPU) return false;
+  // THE SAFETY GATE. A CPU kernel dereferences host pointers, which is correct
+  // ONLY where host and device memory alias. Gate on the unified-memory property
+  // of the ACTUAL registered backend, not on DeviceType: a discrete GPU (CUDA or
+  // Vulkan) answers false and never receives a CPU fallback. A device with no
+  // backend in this build is trivially ineligible.
+  Backend* b = TryGetBackend(device);
+  return b != nullptr && b->UnifiedMemory();
+}
+
+int RegisterReferenceTier(DeviceType target) {
+  if (!ReferenceTierEligible(target)) return 0;
+  int installed = 0;
+  for (size_t o = 0; o < kOpCount; ++o) {
+    const OpId op = static_cast<OpId>(o);
+    // Skip ops the target already serves natively — the tier is a fallback for
+    // MISSING kernels only, and installing under a native provider is wasted
+    // capacity (the native one wins by priority regardless).
+    if (OpRegistered(op, target)) continue;
+    if (MaybeInstallReferenceTier(op, target)) ++installed;
+  }
+  return installed;
+}
+
+unsigned long long GetReferenceTierHits() {
+  return RefTierHits().load(std::memory_order_relaxed);
 }
 
 }  // namespace vt

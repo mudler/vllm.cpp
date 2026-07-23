@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "vt/backend.h"
+#include "vt/op_provider.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"
 
@@ -491,5 +492,63 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
     setenv("VT_FUSED_TIER", saved.c_str(), 1);
   } else {
     unsetenv("VT_FUSED_TIER");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// S5 PORTABLE REFERENCE TIER (accelerator-seam-audit.md, work row S5). The proof
+// that op count is now a PERFORMANCE budget, not a CORRECTNESS gate: an op a
+// UNIFIED-MEMORY device lacks a native kernel for falls back to the CPU reference
+// and still returns the right answer, instead of throwing.
+//
+// Gated on Backend::UnifiedMemory() — THE safety invariant. On a discrete device
+// the DevBuf pointer is a real device pointer a CPU kernel must never dereference,
+// so the tier is neither installed nor exercised there (test_reference_tier.cpp
+// asserts the refusal directly against a fake discrete backend). On this box's
+// registered unified devices (Metal M4, GB10 CUDA/Vulkan) the pointer is
+// host-accessible, so the fallback runs. On a plain CPU build there is no non-CPU
+// device and the case is inert.
+TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
+  constexpr int64_t kRows = 7, kCols = 48;
+  constexpr size_t kN = kRows * kCols;
+  const std::vector<float> in = RandomVec(kN, 1313, -4.0f, 4.0f);
+
+  // CPU oracle through the same vt::Relu entry point (Relu is exact elementwise).
+  vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue cq = cpu.CreateQueue();
+  const Device cd{DeviceType::kCPU, 0};
+  std::vector<float> ci = in, ref(kN);
+  {
+    Tensor ti = T2(ci.data(), cd, kRows, kCols);
+    Tensor to = T2(ref.data(), cd, kRows, kCols);
+    vt::Relu(cq, to, ti);
+  }
+  cpu.DestroyQueue(cq);
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!vt::GetBackend(dt).UnifiedMemory()) continue;  // safety: unified only
+    // Only meaningful where the device LACKS a native kernel for the op; where it
+    // has one, the native path is already covered by the NMSE cases above.
+    if (vt::OpRegistered(vt::OpId::kRelu, dt)) continue;
+    CAPTURE(DeviceName(dt));
+
+    const unsigned long long hits_before = vt::GetReferenceTierHits();
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf din(dev, q, kN), dout(dev, q, kN);
+    din.Upload(in);
+    Tensor ti = T2(din.ptr(), d, kRows, kCols);
+    Tensor to = T2(dout.ptr(), d, kRows, kCols);
+    vt::Relu(q, to, ti);  // no native kernel -> portable CPU fallback
+
+    // Same host kernel, so bit-identical to the CPU oracle, not just close.
+    const std::vector<float> got = dout.Download();
+    CHECK(std::memcmp(ref.data(), got.data(), kN * sizeof(float)) == 0);
+    // The fallback fired and it was not silent.
+    CHECK(vt::GetReferenceTierHits() > hits_before);
+    CHECK(std::string(vt::OpProviderNameAt(vt::OpId::kRelu, dt, 0)) ==
+          vt::kReferenceProviderName);
+    dev.DestroyQueue(q);
   }
 }

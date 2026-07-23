@@ -136,6 +136,12 @@ Queue CreateQueue(Device device);
 void DestroyQueue(Queue& q);
 
 Backend& GetBackend(DeviceType type);
+// Non-throwing probe: the registered backend for `type`, or nullptr when none is
+// registered. `GetBackend` throws for the unregistered case, which forces every
+// "is this device present?" caller into a try/catch; this is the answer without
+// one. Used by the portable reference tier (op_provider.cpp) to read a device's
+// UnifiedMemory() property without assuming the device exists in this build.
+Backend* TryGetBackend(DeviceType type);
 // Threading contract: all registration must complete before main() runs
 // (backends register via static initializers). After that, GetBackend is
 // lock-free reads only; no synchronization is performed.

@@ -1,17 +1,25 @@
 # Accelerator seam audit — do MLX/Vulkan ride vLLM's CUDA-path logic? (`BACKEND-SEAM-AUDIT`)
 
-Status: **AUDIT + PLAN (2026-07-22) with work rows `S1` LANDED (2026-07-22) and
-`S4` LANDED-partial (2026-07-23).** `S1` — the DSR ratchet — is implemented and
-CI-gated; see **§8** for the as-built metric, the re-derived baseline (**86**,
-not 94) and the re-verified class composition. `S4` — the `LinearMethod` /
-`QuantizationConfig` seam — is built and the dense model routed through it, with
-the provably-byte-identical device gates converted to `vt::OpRegistered`; see
-**§9** for the as-built DSR (**86 → 67**), the per-site safety argument and the
-fragile sites deferred to `S6`. `S2`,`S3`,`S5`,`S6`,`S7`,`S8` remain plan only.
-Owners: `CLAIM-BACKEND-SEAM-AUDIT-1` (audit), `CLAIM-BACKEND-SEAM-S1-1` (`S1`),
-`CLAIM-BACKEND-SEAM-S4-1` (`S4`).
-Row: **`BACKEND-SEAM-AUDIT`** (`ACTIVE` — `S1`+`S4` landed, `S2`/`S3`/`S5`–`S8`
-owed). No other row moves.
+Status: **AUDIT + PLAN (2026-07-22) with work rows `S1` LANDED (2026-07-22),
+`S4` LANDED-partial (2026-07-23) and `S5` LANDED (2026-07-23).** `S1` — the DSR
+ratchet — is implemented and CI-gated; see **§8** for the as-built metric, the
+re-derived baseline (**86**, not 94) and the re-verified class composition. `S4`
+— the `LinearMethod` / `QuantizationConfig` seam — is built and the dense model
+routed through it, with the provably-byte-identical device gates converted to
+`vt::OpRegistered`; see **§9** for the as-built DSR (**86 → 67**), the per-site
+safety argument and the fragile sites deferred to `S6`. `S5` — the portable
+reference tier (`CustomOp.forward_native` mirror) — is built: a CPU kernel
+installs LAZILY as a negative-priority fallback on a UNIFIED-MEMORY device, so an
+op a backend lacks falls back to the portable CPU reference instead of throwing;
+see **§10** for the mechanism, the unified-memory safety proof, the verified
+finding that S5 does NOT byte-identically unblock the S4-deferred fp4/fp8 gates
+(those are `S6`, for which S5 is the required safety net), and the unchanged DSR
+(**67** — S5 is vt-runtime infrastructure, no shared-layer edit). `S2`,`S3`,`S6`,
+`S7`,`S8` remain plan only. Owners: `CLAIM-BACKEND-SEAM-AUDIT-1` (audit),
+`CLAIM-BACKEND-SEAM-S1-1` (`S1`), `CLAIM-BACKEND-SEAM-S4-1` (`S4`),
+`CLAIM-BACKEND-SEAM-S5-1` (`S5`).
+Row: **`BACKEND-SEAM-AUDIT`** (`ACTIVE` — `S1`+`S4`+`S5` landed,
+`S2`/`S3`/`S6`–`S8` owed). No other row moves.
 
 Audit base: `72f5db2`; `S1` base: `18094ee`. Pins: vLLM
 `/home/mudler/_git/vllm` @ `e24d1b24`; llama.cpp `237ad9b96`; MLX `v0.29.3`.
@@ -342,7 +350,7 @@ claim; none is claimed by this audit.
 | **1** | `S1` | **The DSR metric + CI ratchet — `DONE` 2026-07-22 (`CLAIM-BACKEND-SEAM-S1-1`).** [`scripts/check-device-leakage.py`](../../scripts/check-device-leakage.py) + [baseline](../../scripts/device-leakage-baseline.json) + CI job `device-leakage` + [24-case mutation suite](../../tests/scripts/test_device_leakage.py). Per-file/per-bucket allowlist with exact counts and reasons, `DSR-ALLOW` escape hatch, per-bucket AND total monotonic decrease | **86** (baseline, §8) | — | Cheapest row in the plan and it guards every row after it. **The counts already regrew 54→63 and 13→16 in days of well-executed work** — without this, every reduction below decays |
 | **2** | `S2` | **Reuse-study `W0b-1` residue** — **the include + hard-coded-queue half is ALREADY DONE on main** (§8.2): `model_loader.cpp` now calls `SelectQueue()`, and all four "unconditional" CUDA includes were in fact already `#ifdef`-guarded (an audit measurement error). Remaining: Metal `get_attn_backend_priority()` | 86 | `S1` | Class E and class F are both empty at `18094ee`; what is left is the Metal priority list, which the metric does not count |
 | **3** | `S3` | **Platform capability fields** mirroring `interface.py:914,933,977,1058,1133,1153` + `is_device_capability_family:466`; migrate the **3** remaining class-D sites off `is_cuda()`/`kCUDA` (`runner.cpp:702,1080`, `qwen3_5_dense_weights.cpp:115` — §8.3) | 83 | `S2` | Pure mirror of upstream, mechanical, and it is what makes ROCm a *config* rather than a port. Highest fidelity-per-line in the plan |
-| **4** | `S5` | **Portable reference tier** — register CPU kernels as negative-priority `OpProvider` entries on unified-memory devices, so an unregistered op FALLS BACK instead of throwing. Mirrors `CustomOp.forward_native` | 84 | `S3` | **Changes the economics of every future backend**: op count stops being a correctness gate. Uses only the mechanism we already shipped. Gate = OPT on Metal token-exact with today's 10 kernels |
+| **4** | `S5` | **Portable reference tier — `DONE` 2026-07-23 (`CLAIM-BACKEND-SEAM-S5-1`).** On a UNIFIED-MEMORY device the CPU kernel installs LAZILY (on the first `GetOp` miss) as a negative-priority (`-1000`) `vt-cpu-ref` `OpProvider`, so an op the backend lacks falls back to the portable CPU reference instead of throwing. Mirrors `custom_op.py:138 forward_native`. See §10 | **67** (unchanged — vt-runtime infra, no shared-layer edit) | `S3` | **Changes the economics of every future backend**: op count stops being a correctness gate. Uses only the mechanism we already shipped. Gate = OPT on Metal token-exact with today's 10 kernels (Mac demo); hardware-free proof = `vt::Relu` on a fake unified device with zero native kernels, bit-identical to the CPU oracle |
 | **5** | `S4` | **`QuantizationConfig` + `LinearMethod`/`QuantMethod` — `DONE` (partial) 2026-07-23 (`CLAIM-BACKEND-SEAM-S4-1`).** The seam is built (`include/vllm/model_executor/layers/{quantization/base_config.h,linear.h,quantization/compressed_tensors/schemes/nvfp4.h}`, mirroring `base_config.py:20-229` + `linear.py:141-230`); the dense model routes through it (`qwen3.cpp` MLP), scheme chosen ONCE by the factory (replaces `IsNvfp4()` probe); the provably-byte-identical class-A/B device gates became `vt::OpRegistered` (§9). See §9 for the as-built DSR and the deferred fragile sites | **67** (as-built §9; not ~55 — the delicate 27B-W4A4/fp8-recipe sites are held for `S6`) | `S3` | **The missing coarse seam** (§5). Biggest single leakage reduction available, and the only one that makes a new accelerator's quant work O(1) per scheme instead of O(models) |
 | **6** | `S6` | **Class A + B: fast-path gates become capability queries.** `env && device==kCUDA && shape` → `OpRegistered(op, device) && supports(shape)`; delete the 5 `VT_CHECK(device==kCUDA)` | ~37 | `S4`, `S5` | Removes the largest single class (**46 sites**, re-measured §8.3). Deferred to rank 6 only because it is hot-path-sensitive and needs `S5` as the safety net and `S4` for the quant half |
 | **7** | `S7` | **Extract the layer library** — `layers/{linear,layernorm,rotary,activation,fused_moe,gdn}` mirroring `model_executor/layers/`, shrinking `qwen3_5.cpp` toward `qwen3_next.py`'s shape | **< 10** | `S4`, `S6` | The structural end-state and the literal answer to "ride the same logical implementations". Largest and riskiest; must be split per family and scheduled against `qwen3_5.cpp` claim windows |
@@ -723,3 +731,126 @@ under `flock $HOME/gpu.lock`, one big-model test at a time:
 `test_linear_method` (scheme×device selection + bf16 apply) green on CPU + CUDA;
 quant suites (nvfp4-dequant, ct-nvfp4-emulation, gguf-dequant, gguf-keep-quant)
 green; full CPU ctest green. DSR checker + 24-case mutation suite green.
+
+## 10. `S5` LANDED — the portable reference tier as built (2026-07-23, `CLAIM-BACKEND-SEAM-S5-1`)
+
+Base `c05800d`. Removes the "correct with zero kernels" cliff (§4.2): a partial
+backend (Metal 18/75 ops, Vulkan a skeleton) now RUNS a model — every op it lacks
+a native kernel for falls back to the CPU reference — instead of throwing at the
+first missing op. **DSR is UNCHANGED at 67**: the entire change is in the `vt`
+runtime (`src/vt/`, excluded from the DSR scope by construction), not in the
+shared layer, so the ratchet and its 24-case mutation suite stay green with no
+baseline move.
+
+### 10.1 The mechanism (mirrors `custom_op.py:138 forward_native`, no new machinery)
+
+vLLM's `dispatch_forward` (`custom_op.py:174`) picks `forward_cuda/_hip/_xpu/…`
+if the platform provides one, and the pure-torch `forward_native` otherwise, so a
+brand-new platform with zero kernels is CORRECT. Our equivalent, using ONLY the
+`OpProvider` seam already shipped (priority + capability predicate +
+decline-and-fallback + stats):
+
+| Upstream | Ours (new) |
+|---|---|
+| `custom_op.py:138` `forward_native` — the universal portable body | the existing **CPU kernel**, reused verbatim as the portable body |
+| `custom_op.py:174` `dispatch_forward` picks native else `forward_native` | `op_provider.cpp` `Resolve`: on a `GetOp` MISS, install the CPU fn and re-select |
+| torch is the portable layer beneath every platform | the CPU op table is the portable layer beneath every UNIFIED-MEMORY device |
+
+The CPU kernel is installed as a provider `{name="vt-cpu-ref", priority=-1000,
+supports=nullptr, fn=<the CPU op fn>}` for `(op, device)`. Because `-1000` is
+strictly below every native kernel's `priority >= 0`, the deterministic
+`(priority DESC, name ASC)` order guarantees a native kernel ALWAYS wins when
+present — the fallback is reached only on a genuine miss. Install is **LAZY** (on
+the first `GetOp` miss, `op_provider.cpp` `Resolve`), which sidesteps the
+static-init ordering problem entirely (all CPU ops are registered by the time any
+op dispatches) and keeps the tables minimal (only the ops actually used get a
+fallback). An eager `RegisterReferenceTier(DeviceType)` is also exported for
+warm-up/tests; production relies on the lazy path and wires no init call.
+
+### 10.2 The unified-memory safety gate (the load-bearing part)
+
+A CPU kernel dereferences host pointers. `ReferenceTierEligible(device)` returns
+true **iff** `device != kCPU` (the source device) AND a backend is registered for
+it AND `Backend::UnifiedMemory() == true`. The gate is the unified-memory
+property of the ACTUAL registered backend, never DeviceType: a discrete GPU
+(discrete CUDA, discrete Vulkan) answers false and is NEVER given a CPU fallback —
+`GetOp` still throws there, exactly as before, because a CPU kernel against true
+device memory is corruption. This is the `Backend::UnifiedMemory()` restriction
+the audit's Risk 8 and the dependency table demanded, enforced at registration
+time. A new non-throwing probe `vt::TryGetBackend` (backend.h/.cpp) lets the vt
+runtime read that property without assuming the device exists in the build.
+
+**The safety proof is a test, not an argument.** `tests/vt/test_reference_tier.cpp`
+registers a fake DISCRETE backend on the otherwise-unused `kXPU` slot and asserts
+`ReferenceTierEligible(kXPU) == false`, `RegisterReferenceTier(kXPU) == 0`,
+`OpProviderCount(kRelu, kXPU) == 0`, and that `GetOp(kRelu, kXPU)` still THROWS —
+i.e. no CPU kernel can be dispatched against what the backend calls discrete
+memory. It then swaps in a fake UNIFIED backend (a host-malloc allocator standing
+in for Metal StorageModeShared / GB10 / integrated Vulkan) and runs `vt::Relu`
+with ZERO native kernels: the fallback fires and the output is **bit-identical**
+to the CPU oracle (same host kernel). This runs on EVERY build — no Metal or
+Vulkan hardware needed — so the safety invariant and the correctness-with-zero-
+kernels property are both executable facts on the dev box and dgx.
+
+### 10.3 No change on native backends; observability
+
+- **CUDA byte-identical.** The tier installs only on a MISS, and CUDA has a
+  native kernel for every op the gate models dispatch, so `Resolve` never reaches
+  the fallback path on CUDA — no provider added, no table changed. The SACRED
+  gates confirm it (§10.5). (GB10 CUDA IS unified, so it would be *eligible*, but
+  eligibility is moot without a miss.)
+- **`OpRegistered` still means "native kernel present".** It is consulted per
+  call by the fused-recipe fast-realization ladder; it now explicitly EXCLUDES
+  `vt-cpu-ref` providers (a fallback is not a native kernel), so the ladder's
+  behaviour is unchanged even on a unified accelerator after a fallback installs.
+  On CPU/CUDA — where no `vt-cpu-ref` provider ever exists — it is byte-identical.
+- **Loud, never silent (Risk 7).** `GetReferenceTierHits()` counts distinct
+  `(op, device)` fallbacks and MUST be 0 in any performance arm; the first
+  fallback per `(op, device)` also prints a one-time `[vt reference-tier] …
+  PORTABLE CPU fallback (correct but slow)` stderr line. A fallback that fires is
+  visible in the provider stats (`last_selected == "vt-cpu-ref"`), exactly as the
+  audit required.
+
+### 10.4 What S5 does NOT unblock — the S4-deferred fp4/fp8 gates stay deferred
+
+S5's two named unblock candidates were (a) the S4-deferred fp4/fp8 device-gate
+conversions and (b) a partial backend running a model. **(b) is landed** (§10.2's
+zero-native-kernel model-op proof; the Metal OPT run is its hardware form). **(a)
+was reassessed and stays deferred, verified not byte-identically convertible** —
+and importantly, the reference tier does NOT change that, because it changes
+nothing about what is registered on `kCPU`/`kCUDA`:
+
+- The deferred sites (§9.3) bottom out at ops that are registered for **both**
+  `kCUDA` and `kCPU` (`kMatmulNvfp4Fp4`, `kScaledFp4Quant`, `kSiluMulFp4Quant`,
+  `kRmsNormQuantFp8`), `kCPU`-**only** (`kSigmoidGateFp4Quant`), or **recipe-
+  realized and not directly registered** (`kRmsNormGatedQuantFp8`). For the first
+  two classes `vt::OpRegistered(op, device)` is TRUE on a CPU device, so replacing
+  `device == kCUDA` with it would FLIP the CPU path (not byte-identical); for the
+  recipe class `OpRegistered` is FALSE, so it would DISABLE the CUDA fast path.
+  None is a byte-identical swap, and the S4 discipline ("byte-identity is SACRED")
+  holds. DSR therefore stays **67**.
+- What S5 actually provides for those sites is the **safety net `S6` needs**: the
+  audit's class-A fix is `OpRegistered(op, device) && supports(shape)`, and moving
+  a fast-path gate onto that query is only safe once a device that lacks the fast
+  kernel can still produce correct output — which is precisely the reference tier.
+  So S5 UNBLOCKS `S6` (it is `S6`'s stated dependency), it does not itself convert
+  the sites. This is consistent with the plan: the fp4/fp8 conversions were always
+  `S6` work, ranked after `S5`.
+
+### 10.5 Gates (all green)
+
+Clean CUDA `-Werror` **0 warnings** (dgx, prod flags `-DVLLM_CPP_CUDA=ON
+-DCMAKE_CUDA_ARCHITECTURES=121a -DVLLM_CPP_TRITON=ON
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`) + clean CPU `-Werror`. Standalone
+under `flock $HOME/gpu.lock`, one big-model test at a time: **27B 235/235 · 35B
+315/315 · Qwen3-Coder 6/6 · Qwen3-dense 16/16 · OPT 6/6 · DeepSeek-V2 8/8** — all
+byte-identical (CUDA never installs the tier, so the tables are unchanged),
+goldens content-hash unchanged (no golden regenerated). New
+`tests/vt/test_reference_tier.cpp` (5 cases: discrete refusal, CPU-source
+ineligibility, unified fallback correctness+observability, native-wins, eager
+idempotence) green on CPU + CUDA; the cross-device harness gains a unified-only
+reference-tier case (`tests/vt/test_backend_cross_device.cpp`); `test_op_provider`
+(the seam regression net) unchanged and green; full CPU ctest green. DSR checker
+(**67 unchanged**) + 24-case mutation suite green. Mac Metal OPT demonstration:
+the reference tier lets Metal run the ops it lacks native kernels for via the CPU
+fallback (unified StorageModeShared), the hardware form of the §10.2 proof.

@@ -19980,3 +19980,52 @@ kMatmul 16 % + kMatmulBT 14 % = 80 %). G6 ports llama.cpp's Arm i8mm `nrc==2`
   `S5` (the negative-priority reference tier) which UNBLOCKS `S6` — converting the
   remaining fragile fp4-act/fp8-recipe gates once a slow-but-correct fallback
   exists. `S7` (extract the layer library from `qwen3_5.cpp`) is the end-state.
+
+## 2026-07-23 — accelerator-seam `S5`: portable reference tier (`CLAIM-BACKEND-SEAM-S5-1`, base `c05800d`, worktree `/home/mudler/vllm-s5-worktree` branch `s5-reference-tier`)
+
+- **WHAT.** Landed `S5` of [accelerator-seam-audit.md](specs/accelerator-seam-audit.md)
+  §10: the portable reference tier that removes the "correct with zero kernels"
+  cliff, mirroring vLLM `custom_op.py:138 forward_native`. On a UNIFIED-MEMORY
+  device the CPU kernel installs LAZILY (on the first `GetOp` miss, `op_provider.cpp`
+  `Resolve`) as a `{name="vt-cpu-ref", priority=-1000}` `OpProvider`, so an op the
+  backend lacks natively falls back to the portable CPU reference instead of
+  throwing. Metal (18/75) / Vulkan (skeleton) are now correct-by-default beyond
+  their native kernels; op count became a PERFORMANCE budget, not a correctness gate.
+- **MECHANISM (no new machinery — the shipped `OpProvider` seam).** Negative
+  priority (`-1000`) guarantees a native kernel (priority ≥ 0) ALWAYS wins by the
+  deterministic `(priority DESC, name ASC)` order, so a backend that HAS the kernel
+  is byte-identical. Install is LAZY-on-miss ⇒ no static-init ordering problem and
+  no table change on a backend that never misses. New public API (all in the `vt`
+  runtime, NO `src/vllm`/`include/vllm` edit): `ReferenceTierEligible`,
+  `RegisterReferenceTier`, `GetReferenceTierHits`, `kReferenceProviderName`/
+  `kReferenceTierPriority` (`op_provider.h`/`.cpp`) + the non-throwing
+  `vt::TryGetBackend` probe (`backend.h`/`.cpp`). `OpRegistered` now EXCLUDES the
+  reference tier (means "NATIVE kernel present" — the fused-recipe ladder's meaning).
+- **SAFETY (the load-bearing part).** `ReferenceTierEligible(device)` = `device != kCPU`
+  ∧ backend registered ∧ `Backend::UnifiedMemory()`. Gated on the unified-memory
+  PROPERTY, never DeviceType: a discrete GPU (discrete CUDA/Vulkan) answers false and
+  NEVER gets a CPU fallback — a host kernel on true device memory is corruption.
+  Proven by `test_reference_tier` against a fake discrete backend: refused,
+  `GetOp` still THROWS.
+- **DSR UNCHANGED at 67.** S5 is vt-runtime infrastructure; nothing under `src/vllm`/
+  `include/vllm` (the DSR scope) changed. Ratchet + 24-case mutation suite green.
+- **S4-DEFERRED fp4/fp8 GATES: verified NOT unblocked by S5.** Their ops are
+  dual-registered (`kCUDA`+`kCPU`), `kCPU`-only, or recipe-realized, so
+  `OpRegistered(op,device)` ≠ `(device==kCUDA)` on a CPU device — converting them is
+  not byte-identical, and the reference tier doesn't change what's registered on
+  `kCPU`/`kCUDA`. S5 provides the SAFETY NET `S6` needs (its stated dependency); the
+  conversion itself stays `S6`. DSR therefore stays 67 (S5 is pure infra — stated,
+  and allowed by the task).
+- **GATES (all green).** Clean CUDA `-Werror` 0 warn (dgx, prod flags) + clean CPU
+  `-Werror` 0 warn. Standalone under `flock $HOME/gpu.lock`, byte-identical:
+  27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2
+  8/8; goldens content-hash unchanged. New `tests/vt/test_reference_tier.cpp`
+  (5 cases / 22 assertions: discrete refusal, CPU-source ineligibility, unified
+  zero-native-kernel fallback correctness + observability, native-wins, eager
+  idempotence) green on CPU + CUDA; `test_backend_cross_device` gains a unified-only
+  reference-tier case; `test_op_provider` unchanged; full CPU ctest green. Checkers
+  bare RC=0 (`check-device-leakage` DSR 67, mutation suite 24/24, `check-agent-record`).
+- **NEXT / resume point.** `S3` (Platform capability fields), then `S6` (the fp4/fp8
+  fast-path gates → `OpRegistered(op,device) && supports(shape)`, now safe on the
+  reference tier). Mac OPT-on-Metal-via-the-tier is the hardware form of the S5
+  proof. `S7` (extract the layer library from `qwen3_5.cpp`) is the end-state.

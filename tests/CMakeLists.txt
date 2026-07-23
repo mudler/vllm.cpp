@@ -214,6 +214,11 @@ vllm_cpp_add_test(test_tensor vt/test_tensor.cpp)
 # — deterministic selection, capability predicates, decline-and-fall-back and the
 # selection stats. Device-independent (registers onto the unused kXPU slots).
 vllm_cpp_add_test(test_op_provider vt/test_op_provider.cpp)
+# S5 portable reference tier (accelerator-seam-audit.md): the unified-memory
+# safety gate, correctness-with-zero-native-kernels via the CPU fallback, and the
+# native-wins / observability contract. Hardware-free — a fake backend on the
+# unused kXPU slot stands in for a unified accelerator, so it runs on every build.
+vllm_cpp_add_test(test_reference_tier vt/test_reference_tier.cpp)
 vllm_cpp_add_test(test_arena vt/test_arena.cpp)
 vllm_cpp_add_test(test_ops_matmul vt/test_ops_matmul.cpp)
 # QUANT-GGUF-CIQ-GEMM G1: block dtypes, the quant traits table and its

@@ -69,6 +69,10 @@ def parse_args():
     ap.add_argument("--runs", type=int, default=int(os.environ.get("QWEN3_RUNS", "10")),
                     help="K greedy runs to build the observed distribution (K>=1)")
     ap.add_argument("--max-tokens", type=int, default=16)
+    ap.add_argument("--gpu-mem", type=float,
+                    default=float(os.environ.get("QWEN3_GPU_MEM", "0.9")),
+                    help="gpu_memory_utilization (GB10 unified memory reboots at "
+                         "high values — pass 0.40 on dgx)")
     ap.add_argument("--per-prompt", action="store_true",
                     help="decode each prompt in its OWN generate() call (batch size 1) "
                          "to match the paged-engine gate's single-request decode "
@@ -99,7 +103,8 @@ def main():
     T = args.max_tokens
     K = max(1, args.runs)
 
-    llm = LLM(model=args.model, dtype="bfloat16", enforce_eager=True)
+    llm = LLM(model=args.model, dtype="bfloat16", enforce_eager=True,
+              gpu_memory_utilization=args.gpu_mem)
     sp = SamplingParams(temperature=0.0, max_tokens=T)
 
     # runs[k][i] = list of token ids for prompt i on run k (padded to T with -1).

@@ -46,6 +46,8 @@ vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weight
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
 vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
 target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_llama_forward vllm/models/test_llama_forward.cpp)
+target_include_directories(test_llama_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_moe_load vllm/models/test_qwen3_moe_load.cpp)
 vllm_cpp_add_test(test_qwen3_moe_forward vllm/models/test_qwen3_moe_forward.cpp)
 target_include_directories(test_qwen3_moe_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -471,6 +473,18 @@ vllm_cpp_add_test(test_opt_paged_engine vllm/models/test_opt_paged_engine.cpp)
 target_compile_definitions(test_opt_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_opt_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# ADDITIVE-MODEL W2/W4 (Llama-3.2-1B, LlamaForCausalLM) — the CROSS-FAMILY dense
+# additivity bring-up: a host-only loader gate plus the SACRED near-tie-robust
+# greedy correctness gate vs the vLLM 0.25.0 oracle (llama3 rope-scaling, no
+# qk-norm, GQA 32/8, head_dim 64, tied lm_head). Checkpoint-gated, dgx-only.
+vllm_cpp_add_test(test_llama_load vllm/models/test_llama_load.cpp)
+target_include_directories(test_llama_load PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_llama_paged_engine parity/test_llama_paged_engine.cpp)
+target_compile_definitions(test_llama_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_llama_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # ADDITIVE-QUANT W2/W4 (Qwen3-32B-NVFP4A16, Qwen3ForCausalLM + compressed-tensors

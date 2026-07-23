@@ -546,9 +546,31 @@ void EmbeddingKernelCuda(Queue& q, Tensor& out, const Tensor& table, const Tenso
 // Angle math in double (pow/cos/sin) to match the CPU reference numerics.
 // Upstream csrc counterpart: csrc/pos_encoding_kernels.cu (rotary_embedding_kernel) — align post-MVP.
 
+// Llama-3 rope frequency rescale (vLLM Llama3RotaryEmbedding._compute_inv_freq,
+// rotary_embedding/llama3_rope.py:33-54). `freq` is the base inv_freq
+// (base^(-2i/rot)); when scaling_factor <= 0 this is a no-op (plain RoPE). The
+// piecewise low/high wavelength interpolation matches vLLM's torch.where ladder.
+__device__ __host__ inline double Llama3ScaleFreq(double freq, double scaling_factor,
+                                                  double low_ff, double high_ff,
+                                                  double orig_max) {
+  if (!(scaling_factor > 0.0)) return freq;
+  constexpr double kTwoPi = 6.283185307179586476925286766559;
+  const double low_freq_wavelen = orig_max / low_ff;
+  const double high_freq_wavelen = orig_max / high_ff;
+  const double wave_len = kTwoPi / freq;
+  double smooth = 0.0;
+  if (low_ff != high_ff)
+    smooth = (orig_max / wave_len - low_ff) / (high_ff - low_ff);
+  if (wave_len < high_freq_wavelen) return freq;                  // high-freq: keep
+  if (wave_len > low_freq_wavelen) return freq / scaling_factor;  // low-freq: scale
+  return (1.0 - smooth) * freq / scaling_factor + smooth * freq;  // mid: interpolate
+}
+
 template <typename T, typename Tid>
 __global__ void RopeNeoxKernel(T* qs, T* ks, const Tid* pos, int64_t hq, int64_t hk,
-                               int64_t d, int64_t half, int rot, double base, int64_t n) {
+                               int64_t d, int64_t half, int rot, double base,
+                               double l3_sf, double l3_lo, double l3_hi, double l3_omax,
+                               int64_t n) {
   const int64_t heads = hq + hk;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
@@ -566,7 +588,8 @@ __global__ void RopeNeoxKernel(T* qs, T* ks, const Tid* pos, int64_t hq, int64_t
       off = (tok * hk + (head - hq)) * d;
     }
     const int64_t p = static_cast<int64_t>(pos[tok]);
-    const double freq = pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
+    double freq = pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
+    freq = Llama3ScaleFreq(freq, l3_sf, l3_lo, l3_hi, l3_omax);
     const double angle = static_cast<double>(p) * freq;
     const float c = static_cast<float>(cos(angle));
     const float sn = static_cast<float>(sin(angle));
@@ -585,12 +608,18 @@ void LaunchRope(cudaStream_t s, Tensor& qs, Tensor& ks, const Tensor& pos,
   const int64_t n = t * (hq + hk) * half;
   if (n == 0) return;
   const double base = static_cast<double>(args.base);
+  const double l3_sf = static_cast<double>(args.llama3_scaling_factor);
+  const double l3_lo = static_cast<double>(args.llama3_low_freq_factor);
+  const double l3_hi = static_cast<double>(args.llama3_high_freq_factor);
+  const double l3_omax = static_cast<double>(args.llama3_orig_max_position);
   if (pos.dtype == DType::kI32) {
     RopeNeoxKernel<T, int32_t><<<GridFor(n), kBlock, 0, s>>>(
-        qs.Ptr<T>(), ks.Ptr<T>(), pos.Ptr<int32_t>(), hq, hk, d, half, args.rotary_dim, base, n);
+        qs.Ptr<T>(), ks.Ptr<T>(), pos.Ptr<int32_t>(), hq, hk, d, half, args.rotary_dim, base,
+        l3_sf, l3_lo, l3_hi, l3_omax, n);
   } else {
     RopeNeoxKernel<T, int64_t><<<GridFor(n), kBlock, 0, s>>>(
-        qs.Ptr<T>(), ks.Ptr<T>(), pos.Ptr<int64_t>(), hq, hk, d, half, args.rotary_dim, base, n);
+        qs.Ptr<T>(), ks.Ptr<T>(), pos.Ptr<int64_t>(), hq, hk, d, half, args.rotary_dim, base,
+        l3_sf, l3_lo, l3_hi, l3_omax, n);
   }
   Check(cudaGetLastError(), "rope_neox launch");
 }
@@ -733,7 +762,8 @@ void RopeFromCacheKernelCuda(Queue& q, Tensor& qs, Tensor* ks,
 
 template <typename Tid>
 __global__ void RopeCosSinCacheKernel(float* cos_sin, const Tid* pos, int64_t t, int rot,
-                                      int64_t half, double base) {
+                                      int64_t half, double base, double l3_sf, double l3_lo,
+                                      double l3_hi, double l3_omax) {
   const int64_t n = t * half;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
@@ -741,7 +771,8 @@ __global__ void RopeCosSinCacheKernel(float* cos_sin, const Tid* pos, int64_t t,
     const int64_t pair = idx % half;
     const int64_t tok = idx / half;
     const int64_t p = static_cast<int64_t>(pos[tok]);
-    const double freq = pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
+    double freq = pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
+    freq = Llama3ScaleFreq(freq, l3_sf, l3_lo, l3_hi, l3_omax);
     const double angle = static_cast<double>(p) * freq;
     cos_sin[tok * rot + pair] = static_cast<float>(cos(angle));
     cos_sin[tok * rot + half + pair] = static_cast<float>(sin(angle));
@@ -755,12 +786,18 @@ void RopeCosSinCacheKernelCuda(Queue& q, Tensor& cos_sin, const Tensor& pos, con
   if (n == 0) return;
   cudaStream_t s = AsStream(q);
   const double base = static_cast<double>(args.base);
+  const double l3_sf = static_cast<double>(args.llama3_scaling_factor);
+  const double l3_lo = static_cast<double>(args.llama3_low_freq_factor);
+  const double l3_hi = static_cast<double>(args.llama3_high_freq_factor);
+  const double l3_omax = static_cast<double>(args.llama3_orig_max_position);
   if (pos.dtype == DType::kI32) {
     RopeCosSinCacheKernel<int32_t><<<GridFor(n), kBlock, 0, s>>>(
-        cos_sin.Ptr<float>(), pos.Ptr<int32_t>(), t, args.rotary_dim, half, base);
+        cos_sin.Ptr<float>(), pos.Ptr<int32_t>(), t, args.rotary_dim, half, base,
+        l3_sf, l3_lo, l3_hi, l3_omax);
   } else {
     RopeCosSinCacheKernel<int64_t><<<GridFor(n), kBlock, 0, s>>>(
-        cos_sin.Ptr<float>(), pos.Ptr<int64_t>(), t, args.rotary_dim, half, base);
+        cos_sin.Ptr<float>(), pos.Ptr<int64_t>(), t, args.rotary_dim, half, base,
+        l3_sf, l3_lo, l3_hi, l3_omax);
   }
   Check(cudaGetLastError(), "rope_cos_sin_cache launch");
 }

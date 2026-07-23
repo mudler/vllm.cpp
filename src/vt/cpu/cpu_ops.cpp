@@ -633,12 +633,35 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
   });
 }
 
+// Llama-3 rope frequency rescale (vLLM Llama3RotaryEmbedding._compute_inv_freq,
+// rotary_embedding/llama3_rope.py:33-54); no-op when scaling_factor <= 0. Mirrors
+// the CUDA Llama3ScaleFreq element-for-element so the CPU reference and the CUDA
+// kernel agree.
+inline double Llama3ScaleFreq(double freq, const RopeArgs& a) {
+  const double sf = static_cast<double>(a.llama3_scaling_factor);
+  if (!(sf > 0.0)) return freq;
+  constexpr double kTwoPi = 6.283185307179586476925286766559;
+  const double lo = static_cast<double>(a.llama3_low_freq_factor);
+  const double hi = static_cast<double>(a.llama3_high_freq_factor);
+  const double omax = static_cast<double>(a.llama3_orig_max_position);
+  const double low_freq_wavelen = omax / lo;
+  const double high_freq_wavelen = omax / hi;
+  const double wave_len = kTwoPi / freq;
+  double smooth = 0.0;
+  if (lo != hi) smooth = (omax / wave_len - lo) / (hi - lo);
+  if (wave_len < high_freq_wavelen) return freq;
+  if (wave_len > low_freq_wavelen) return freq / sf;
+  return (1.0 - smooth) * freq / sf + smooth * freq;
+}
+
 // In-place rotation of one head starting at element head_off; f32 math,
 // stores round back to the tensor's dtype (f32 or bf16).
-void RopeRotateHead(const Tensor& t, int64_t head_off, int rot, double base, int64_t pos) {
+void RopeRotateHead(const Tensor& t, int64_t head_off, int rot, double base, int64_t pos,
+                    const RopeArgs& args) {
   const int half = rot / 2;
   for (int i = 0; i < half; ++i) {
     double freq = std::pow(base, -2.0 * i / rot);
+    freq = Llama3ScaleFreq(freq, args);
     double angle = static_cast<double>(pos) * freq;
     float c = static_cast<float>(std::cos(angle));
     float s = static_cast<float>(std::sin(angle));
@@ -655,10 +678,10 @@ void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const Rop
   for (int64_t i = r0; i < r1; ++i) {
     int64_t p = pos.dtype == DType::kI32 ? pos.Ptr<int32_t>()[i] : pos.Ptr<int64_t>()[i];
     for (int64_t hh = 0; hh < hq; ++hh) {
-      RopeRotateHead(qs, (i * hq + hh) * d, args.rotary_dim, static_cast<double>(args.base), p);
+      RopeRotateHead(qs, (i * hq + hh) * d, args.rotary_dim, static_cast<double>(args.base), p, args);
     }
     for (int64_t hh = 0; hh < hk; ++hh) {
-      RopeRotateHead(ks, (i * hk + hh) * d, args.rotary_dim, static_cast<double>(args.base), p);
+      RopeRotateHead(ks, (i * hk + hh) * d, args.rotary_dim, static_cast<double>(args.base), p, args);
     }
   }
   });
@@ -758,7 +781,8 @@ void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions, con
     const int64_t p =
         positions.dtype == DType::kI32 ? positions.Ptr<int32_t>()[i] : positions.Ptr<int64_t>()[i];
     for (int64_t pair = 0; pair < half; ++pair) {
-      const double freq = std::pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
+      double freq = std::pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
+      freq = Llama3ScaleFreq(freq, args);
       const double angle = static_cast<double>(p) * freq;
       StoreF32(cos_sin, i * rot + pair, static_cast<float>(std::cos(angle)));
       StoreF32(cos_sin, i * rot + half + pair, static_cast<float>(std::sin(angle)));

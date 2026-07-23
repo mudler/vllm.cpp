@@ -93,6 +93,31 @@ inline bool RopeCacheEnabled() {
   return on;
 }
 
+// Build the RopeArgs for a dense model from its config. base + rotary_dim always;
+// the llama3 frequency-rescale fields (factor/low/high/orig_max) are filled ONLY
+// when the checkpoint declares rope_type=="llama3" (e.g. Llama-3.2). For every
+// other model (rope_type=="default": Qwen, the gate models) the llama3 fields stay
+// zero, so RopeArgs is byte-identical to the previous `RopeArgs{base, rot}` form
+// and the RoPE kernels take their no-op branch — the Qwen3-dense forward is
+// UNCHANGED. Mirrors vLLM get_rope()'s llama3 dispatch
+// (rotary_embedding/__init__.py:155-171 -> Llama3RotaryEmbedding).
+inline vt::RopeArgs MakeRopeArgs(const HfConfig& cfg) {
+  vt::RopeArgs a;
+  a.base = static_cast<float>(cfg.rope_theta);
+  a.rotary_dim = static_cast<int>(cfg.rotary_dim);
+  if (cfg.rope_parameters.rope_type == "llama3") {
+    a.llama3_scaling_factor =
+        static_cast<float>(cfg.rope_parameters.factor.value_or(0.0));
+    a.llama3_low_freq_factor =
+        static_cast<float>(cfg.rope_parameters.low_freq_factor.value_or(0.0));
+    a.llama3_high_freq_factor =
+        static_cast<float>(cfg.rope_parameters.high_freq_factor.value_or(0.0));
+    a.llama3_orig_max_position = static_cast<float>(
+        cfg.rope_parameters.original_max_position_embeddings.value_or(0));
+  }
+  return a;
+}
+
 // Merged QKVParallelLinear: issue ONE [q|k|v] GEMM over the merged qkv weight
 // (mirror vLLM qwen3.py Qwen3Attention.qkv_proj, one F.linear then split via
 // QkvSplit), replacing the three per-shard MatmulBT GEMMs. It folds the two tiny
@@ -272,8 +297,7 @@ inline StepInputs BuildStepInputs(Dev d, const std::vector<int32_t>& positions,
     // is f32; RopeCosSinCacheKernel uses the SAME double-angle math as
     // RopeNeoxKernel, so an f32-precision RoPE off this cache is BIT-IDENTICAL to
     // RopeNeox (cuda_ops.cu:720).
-    vt::RopeCosSinCache(d.q, s.cos_sin.t(), s.positions.t(),
-                        vt::RopeArgs{static_cast<float>(cfg.rope_theta), rot});
+    vt::RopeCosSinCache(d.q, s.cos_sin.t(), s.positions.t(), MakeRopeArgs(cfg));
     // The bf16 model-dtype cache is only consumed by the opt-in RopeFromCache
     // path; skip the cast on the default (RopeNeox) path so default-OFF stays
     // perf-neutral vs baseline.
@@ -292,7 +316,7 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   const int64_t Hkv = cfg.num_key_value_heads;
   const int64_t Dh = cfg.head_dim;
   const int rot = static_cast<int>(cfg.rotary_dim);
-  const float base = static_cast<float>(cfg.rope_theta);
+  // RoPE base/scaling now come from MakeRopeArgs(cfg) (llama3-aware); no local base.
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const int64_t qdim = Hq * Dh, kdim = Hkv * Dh;
   VT_CHECK(w.qkv_bias.Empty(),
@@ -358,7 +382,14 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
   Tensor k2 = Reshape(k.t(), {T * Hkv, Dh});
   Tensor q3 = Reshape(q.t(), {T, Hq, Dh});
   Tensor k3 = Reshape(k.t(), {T, Hkv, Dh});
-  if (attn_f32 && FusedChainAdoptEnabled() && rot > 0) {
+  // qk-norm is OPTIONAL: Qwen3 applies per-head q/k RMSNorm before RoPE
+  // (w.q_norm/w.k_norm loaded); Llama (LlamaForCausalLM) has NO qk-norm, so its
+  // loader leaves both EMPTY and the norm step is SKIPPED — RoPE runs directly on
+  // the raw q/k. Byte-preserving for Qwen3 (norm present => same code path); the
+  // fused-chain qk-norm-rope recipe requires the norm weights, so a qk-norm-absent
+  // model always takes the standalone `else` branch below.
+  const bool has_qk_norm = !w.q_norm.Empty();
+  if (attn_f32 && FusedChainAdoptEnabled() && rot > 0 && has_qk_norm) {
     // f32 A/B ADOPT: the whole preamble through vt::FusedChain(kAttnQkNormRope) —
     // the Tier-0 composite = RmsNorm(q,false) + RmsNorm(k,false) + RopeFromCache,
     // byte-identical to the hand-call (test_ops_fused_chain.cpp). Qwen3's reuse of
@@ -377,7 +408,7 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
     b.n = 8;
     vt::FusedParams p;
     p.eps = eps;
-    p.rope = vt::RopeArgs{base, rot};
+    p.rope = MakeRopeArgs(cfg);
     vt::FusedChain(d.q, vt::kAttnQkNormRope, b, p);
   } else {
     // BF16 attention preamble: standalone per-head RMSNorm (weight dtype == q
@@ -400,20 +431,24 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
     // real positions — so cache[t] is read for token t at ANY position (the
     // position map is already applied when the cache is built), correct for
     // prefill AND decode.
-    Tensor wqn = attn_f32 ? ResidentWeightF32(d, w.q_norm, {Dh})
-                          : ResidentWeight(d, w.q_norm, {Dh});
-    Tensor wkn = attn_f32 ? ResidentWeightF32(d, w.k_norm, {Dh})
-                          : ResidentWeight(d, w.k_norm, {Dh});
-    vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
-    vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
+    // Per-head q/k RMSNorm — Qwen3 only (SKIPPED when the model has no qk-norm,
+    // e.g. Llama, which leaves w.q_norm/w.k_norm empty). RoPE runs either way.
+    if (has_qk_norm) {
+      Tensor wqn = attn_f32 ? ResidentWeightF32(d, w.q_norm, {Dh})
+                            : ResidentWeight(d, w.q_norm, {Dh});
+      Tensor wkn = attn_f32 ? ResidentWeightF32(d, w.k_norm, {Dh})
+                            : ResidentWeight(d, w.k_norm, {Dh});
+      vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
+      vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
+    }
     if (RopeCacheEnabled() && rot > 0) {
       Tensor k3v = k3;
       vt::RopeFromCache(d.q, q3, &k3v, si.rope_row_idx.t(), si.cos_sin_bf16.t(),
-                        vt::RopeArgs{base, rot});
+                        MakeRopeArgs(cfg));
     } else {
       // DEFAULT (byte-identical, deterministic): in-place bf16 NeoX RoPE with
       // per-element fp64 cos/sin, mirroring vLLM's rotary_emb bf16 rounding.
-      vt::RopeNeox(d.q, q3, k3, si.positions.t(), vt::RopeArgs{base, rot});
+      vt::RopeNeox(d.q, q3, k3, si.positions.t(), MakeRopeArgs(cfg));
     }
   }
 

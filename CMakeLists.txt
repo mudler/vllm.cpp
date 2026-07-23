@@ -309,6 +309,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/opt_registry.cpp
   src/vllm/model_executor/models/opt_weights.cpp
   src/vllm/model_executor/models/opt.cpp
+  src/vllm/model_executor/models/llama_registry.cpp
+  src/vllm/model_executor/models/llama_weights.cpp
   src/vllm/model_executor/models/model_registry.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp

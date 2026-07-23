@@ -254,6 +254,20 @@ struct RopeArgs {
   // temporal/height/width counts in the half-rotary frequency dimension.
   std::array<int32_t, 3> mrope_section = {0, 0, 0};
   bool mrope_interleaved = false;
+
+  // Llama-3 rope frequency rescaling (rope_type=="llama3", e.g. Llama-3.2). When
+  // llama3_scaling_factor <= 0 (the default) NO rescale is applied and the RoPE
+  // is byte-identical to plain RoPE — so every existing caller (Qwen, the gate
+  // models) that leaves these zero is UNCHANGED. When set, the base inv_freq
+  // (base^(-2i/rotary_dim)) is rescaled per frequency by a piecewise low/high
+  // wavelength interpolation, mirroring vLLM Llama3RotaryEmbedding._compute_inv_freq
+  // (vllm/model_executor/layers/rotary_embedding/llama3_rope.py:33-54). Consumed
+  // by RopeNeox + RopeCosSinCache (the cache feeds RopeFromCache, so no extra
+  // field is needed there).
+  float llama3_scaling_factor = 0.0f;    // rope_scaling "factor" (0 => disabled)
+  float llama3_low_freq_factor = 0.0f;   // rope_scaling "low_freq_factor"
+  float llama3_high_freq_factor = 0.0f;  // rope_scaling "high_freq_factor"
+  float llama3_orig_max_position = 0.0f;  // "original_max_position_embeddings"
 };
 
 // GDN op args (.agents/specs/gdn-semantics.md is the formula reference; sections

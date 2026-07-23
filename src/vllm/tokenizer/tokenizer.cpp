@@ -224,11 +224,31 @@ void CheckNormalizer(const json& doc) {
 void ExtractBosEos(const json& doc, int32_t& bos, int32_t& eos) {
   const auto pp = doc.find("post_processor");
   if (pp == doc.end() || !pp->is_object()) return;
-  if (pp->value("type", "") != "TemplateProcessing") return;
-  const auto single = pp->find("single");
-  const auto specials = pp->find("special_tokens");
-  if (single == pp->end() || !single->is_array() || single->empty() ||
-      specials == pp->end() || !specials->is_object()) {
+  // The TemplateProcessing node may be the post_processor itself (OPT) OR one
+  // member of a `Sequence` pipeline (Llama-3 wraps a ByteLevel + a
+  // TemplateProcessing in a Sequence; the ByteLevel carries no template tokens,
+  // the TemplateProcessing prepends BOS <|begin_of_text|> = 128000). Resolve the
+  // TemplateProcessing node in either shape.
+  const json* tp = nullptr;
+  const std::string pp_type = pp->value("type", "");
+  if (pp_type == "TemplateProcessing") {
+    tp = &*pp;
+  } else if (pp_type == "Sequence") {
+    const auto procs = pp->find("processors");
+    if (procs != pp->end() && procs->is_array()) {
+      for (const auto& p : *procs) {
+        if (p.is_object() && p.value("type", "") == "TemplateProcessing") {
+          tp = &p;
+          break;
+        }
+      }
+    }
+  }
+  if (tp == nullptr) return;
+  const auto single = tp->find("single");
+  const auto specials = tp->find("special_tokens");
+  if (single == tp->end() || !single->is_array() || single->empty() ||
+      specials == tp->end() || !specials->is_object()) {
     return;
   }
   const auto id_of = [&](const json& step) -> int32_t {

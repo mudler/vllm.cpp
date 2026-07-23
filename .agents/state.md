@@ -20029,3 +20029,34 @@ kMatmul 16 % + kMatmulBT 14 % = 80 %). G6 ports llama.cpp's Arm i8mm `nrc==2`
   fast-path gates → `OpRegistered(op,device) && supports(shape)`, now safe on the
   reference tier). Mac OPT-on-Metal-via-the-tier is the hardware form of the S5
   proof. `S7` (extract the layer library from `qwen3_5.cpp`) is the end-state.
+- **2026-07-23** — **Llama-3.2 (`LlamaForCausalLM`) cross-family DENSE bring-up
+  W0-W4 LANDED — CORRECTNESS COMPLETE** (`CLAIM-MODEL-LLAMA-3.2`, base `af0b21b`,
+  worktree `/home/mudler/_git/vllm.cpp-llama` branch `llama-3.2-bringup`, dgx build
+  `~/vllmcpp-accel`). The roadmap's explicit "Llama-first" increment and the first
+  mainstream non-Qwen/non-OPT dense arch, added as 3 new files
+  (`llama.h`/`llama_weights.cpp`/`llama_registry.cpp`) reusing the shared dense
+  forward VERBATIM (`LlamaModel == Qwen3DenseModel`). Llama = the Qwen3-dense
+  forward with exactly two ADDITIVE, byte-preserving deltas: (1) NO per-head q/k
+  RMSNorm — the shared `dense_attn_block.h::AttnBlock` skips it when q_norm/k_norm
+  are empty (`has_qk_norm`); (2) llama3 RoPE scaling (`rope_theta=500000` +
+  `rope_scaling` type `llama3`) — 4 default-0 `vt::RopeArgs` fields + a
+  `Llama3ScaleFreq` helper in the RopeNeox/RopeCosSinCache kernels (CUDA + CPU),
+  no-op elsewhere; formula verified 2e-7 rel vs vLLM. `HfConfig`/`RopeParameters`
+  already parse+validate the llama3 rope_scaling ⇒ ZERO hf_config edit. head_dim 64
+  runs the generic `LaunchPrefillFlash`/`LaunchDecode` CUDA-core path with ZERO
+  kernel edit. **SACRED gate 16/16** (STRICT token-exact 12/16 + near-tie band
+  4/16, max gap 0.0000 nats, 0 forward-divergent) vs a MEASURED-deterministic vLLM
+  0.25.0 oracle (K=6, 0 multi-valued cells ⇒ STRICT bar); at all 13 divergent
+  positions vLLM's own teacher-forced argmax given our prefix IS our token. **One
+  correctness-fatal tokenizer bug found+fixed:** Llama's `Sequence` post_processor
+  wrapping a `TemplateProcessing` was not descended into by `ExtractBosEos` ⇒ BOS
+  128000 never prepended (silently 1/16, fluent output); a CUDA prefill-argmax
+  diagnostic proved the forward correct 4/4 given vLLM's exact tokens, isolating the
+  fault to the tokenizer; the fix is byte-preserving for Qwen/OPT/DeepSeek (all
+  ByteLevel or top-level-TemplateProcessing). Regressions each STANDALONE UNCHANGED
+  (27B 235/235, 35B 315/315, Coder 6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2
+  8/8); clean CUDA `-Werror` 0-warn; memcheck 0; DSR 67 held. Checkpoint
+  `unsloth/Llama-3.2-1B` (ungated mirror of gated `meta-llama/Llama-3.2-1B`; 401 on
+  the gated weight download). Row `ACTIVE` (correctness DONE), SPEED explicitly
+  PENDING (head_dim 64 → generic paged path; Llama-3.2-3B head_dim-128 is the
+  FA2-toggle W-next). Not pushed — report FULL SHA to the caller.

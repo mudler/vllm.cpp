@@ -42,7 +42,7 @@ HfConfig Config(std::vector<std::string> architectures) {
 
 TEST_CASE("registry_imports: every registered architecture has a complete factory") {
   const auto registrations = ModelRegistry::Registrations();
-  REQUIRE(registrations.size() == 6);
+  REQUIRE(registrations.size() == 7);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -81,6 +81,10 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // MLA campaign W7: the DeepSeek-V2 MLA model, likewise one new TU + one
   // REGISTER_VLLM_MODEL line and ZERO edit to a shared array.
   CHECK(has_arch("DeepseekV2ForCausalLM"));
+  // The CROSS-FAMILY dense bring-up: Llama reuses the shared dense forward
+  // (qk-norm skipped + llama3 rope-scaling, both additive in the shared
+  // AttnBlock) and adds only its own loader/registry TU + one REGISTER line.
+  CHECK(has_arch("LlamaForCausalLM"));
 
   // Registration arrival order across TUs is unspecified under C++ static init,
   // so the registry imposes a stable canonical sort by architecture name. This
@@ -89,13 +93,14 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // "Qwen3" prefix), then the full-attention MoE "Qwen3MoeForCausalLM", then the
   // two hybrid Qwen3.5 wrappers; resolution is order-independent.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 6);
+  REQUIRE(supported.size() == 7);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
-  // MLA campaign W7 adds the first non-Qwen/non-OPT family; 'D' sorts first.
+  // 'D' sorts first; then 'L'lama (0x4C) < 'O'PT (0x4F) < 'Q'wen (0x51).
   CHECK(supported.front() == "DeepseekV2ForCausalLM");
-  CHECK(supported[1] == "OPTForCausalLM");  // 'O' (0x4F) < 'Q' (0x51)
-  CHECK(supported[2] == "Qwen3ForCausalLM");
-  CHECK(supported[3] == "Qwen3MoeForCausalLM");
+  CHECK(supported[1] == "LlamaForCausalLM");
+  CHECK(supported[2] == "OPTForCausalLM");
+  CHECK(supported[3] == "Qwen3ForCausalLM");
+  CHECK(supported[4] == "Qwen3MoeForCausalLM");
   CHECK(supported.back() == "Qwen3_5MoeForConditionalGeneration");
 
   // The dense/MoE scheduler policy split survives the per-variant TU move.
@@ -114,6 +119,7 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
     if (registration.architecture == "Qwen3ForCausalLM" ||
         registration.architecture == "Qwen3MoeForCausalLM" ||
         registration.architecture == "DeepseekV2ForCausalLM" ||
+        registration.architecture == "LlamaForCausalLM" ||
         registration.architecture == "OPTForCausalLM") {
       // Pure text-only full-attention arch (dense OR MoE): NOT hybrid (no GDN),
       // NOT multimodal (no vision tower).
@@ -177,6 +183,34 @@ TEST_CASE("resolve_model_cls: OPTForCausalLM resolves to the cross-family dense 
   // GQA, so num_key_value_heads == num_attention_heads (12 x 64 for opt-125m).
   HfConfig kv_config = config;
   kv_config.num_key_value_heads = 12;
+  kv_config.head_dim = 64;
+  const vllm::v1::KVCacheConfig kv =
+      reg.factory->make_kv_cache(kv_config, /*block_size=*/16, /*num_blocks=*/8);
+  REQUIRE(kv.kv_cache_groups.size() == 1);
+  CHECK(kv.kv_cache_groups[0].kv_cache_spec->kind() ==
+        vllm::v1::KVCacheSpecKind::kFullAttention);
+}
+
+TEST_CASE("resolve_model_cls: LlamaForCausalLM resolves to the cross-family dense factory") {
+  // The CROSS-FAMILY dense bring-up (registry.py). Llama shares the standard-dense
+  // shape with Qwen3 but differs (no qk-norm, llama3 rope-scaling); it lands as ONE
+  // new loader/registry TU + one REGISTER_VLLM_MODEL line, ZERO shared-array edit,
+  // reusing the shared dense forward.
+  const HfConfig config = Config({"LlamaForCausalLM"});
+  const ModelRegistration& reg = ModelRegistry::Resolve(config);
+  CHECK(reg.architecture == "LlamaForCausalLM");
+  REQUIRE(reg.factory != nullptr);
+  CHECK(reg.factory->parse_config != nullptr);
+  CHECK(reg.factory->load_weights != nullptr);
+  CHECK(reg.factory->prepare != nullptr);
+  CHECK(reg.factory->forward != nullptr);
+  CHECK(reg.factory->make_kv_cache != nullptr);
+  CHECK(reg.factory->is_dense_model);
+
+  // Pure-dense KV-cache spec: exactly one full-attention group (GQA 32/8,
+  // head_dim 64 for Llama-3.2-1B), NO MambaSpec/GDN group.
+  HfConfig kv_config = config;
+  kv_config.num_key_value_heads = 8;
   kv_config.head_dim = 64;
   const vllm::v1::KVCacheConfig kv =
       reg.factory->make_kv_cache(kv_config, /*block_size=*/16, /*num_blocks=*/8);
@@ -349,8 +383,9 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 6> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 7> kExampleConfigArchitectures{
       "DeepseekV2ForCausalLM",
+      "LlamaForCausalLM",
       "OPTForCausalLM",
       "Qwen3ForCausalLM",
       "Qwen3MoeForCausalLM",
@@ -418,12 +453,15 @@ TEST_CASE("raise_for_unsupported: out-of-tree branch exact message") {
 }
 
 TEST_CASE("raise_for_unsupported: subset default message and order match oracle") {
-  const HfConfig unknown = Config({"LlamaForCausalLM"});
+  // MistralForCausalLM is the still-unported dense arch (rank 6); LlamaForCausalLM
+  // is now SUPPORTED and appears in the sorted dict_keys below ('L' < 'O' < 'Q').
+  const HfConfig unknown = Config({"MistralForCausalLM"});
   CHECK_THROWS_WITH_AS(
       ModelRegistry::Resolve(unknown),
-      "Model architectures ['LlamaForCausalLM'] are not supported for now. "
+      "Model architectures ['MistralForCausalLM'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['DeepseekV2ForCausalLM', 'OPTForCausalLM', 'Qwen3ForCausalLM', "
+      "dict_keys(['DeepseekV2ForCausalLM', 'LlamaForCausalLM', 'OPTForCausalLM', "
+      "'Qwen3ForCausalLM', "
       "'Qwen3MoeForCausalLM', "
       "'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForConditionalGeneration'])",
@@ -434,7 +472,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(multiple),
       "Model architectures ['UnknownA', 'UnknownB'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['DeepseekV2ForCausalLM', 'OPTForCausalLM', 'Qwen3ForCausalLM', "
+      "dict_keys(['DeepseekV2ForCausalLM', 'LlamaForCausalLM', 'OPTForCausalLM', "
+      "'Qwen3ForCausalLM', "
       "'Qwen3MoeForCausalLM', "
       "'Qwen3_5ForConditionalGeneration', "
       "'Qwen3_5MoeForConditionalGeneration'])",

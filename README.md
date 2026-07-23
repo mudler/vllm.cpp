@@ -54,7 +54,7 @@ Every model below passes a token-for-token correctness gate against the pinned v
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively (RedHatAI/Qwen3-32B-NVFP4A16), correctness-complete and speed-pending.
 
-Larger DeepSeek / GLM / MiniMax variants are recorded as **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or **spiked-only**, per the [model matrix](.agents/model-matrix.md). GLM-4.7-Flash is the named next vehicle for the MLA track.
+Larger DeepSeek / GLM / MiniMax variants are recorded as **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or **spiked-only**, per the [model matrix](.agents/model-matrix.md). GLM-4.7-Flash is the named next vehicle for the MLA track. The matrix opens with an architecture-support checklist (a per-architecture status roll-up covering every engaged model) that a CI checker keeps in lockstep with the detailed rows.
 
 ## Performance
 

@@ -159,6 +159,17 @@ not name the row and cover the full spike contract, `SPIKE`/`ACTIVE` owners not
 present in the coordination claim table, and `DONE` rows without ledger/commit
 closure. Do not weaken the checker to make a transition pass; repair the record.
 
+`.agents/model-matrix.md` additionally opens with an **architecture-support
+checklist**: a rollup of how many architecture rows sit at each lifecycle state
+plus one support-marked line per *engaged* architecture (any row past
+`INVENTORIED`). This checklist MUST stay in sync with the detailed row lifecycle
+states, enforced by `scripts/check-model-checklist.py` (CI-gated, with its
+mutation test `tests/scripts/test_check_model_checklist.py`): a `✅`/`🚧`/`📋`/`🚫`
+mark can never claim more than the row's state backs, no engaged architecture may
+be omitted, and the rollup counts may not drift from the real per-state counts. A
+change that advances (or regresses) a model's state updates its checklist entry
+AND the rollup in the SAME commit; do not weaken the checker to bypass this.
+
 **Every commit MUST carry the trailer `FOLLOWING_AGENTS_PROTOCOL`** in its
 message. This asserts the contributor (human or AI-assisted) has read this
 AGENTS.md and follows the protocol. **CI rejects any commit lacking it**

@@ -13,6 +13,68 @@ It groups architecture aliases only when they resolve to the exact same
 upstream `(category, module, class)` target. Consequently each table row is
 a practical unit that one agent can spike without silently dropping aliases.
 
+## Architecture-support checklist
+
+At-a-glance view of which architectures we have actually engaged, and how far.
+**326 architecture rows are inventoried at the pin**; 23 are past `INVENTORIED`
+(engaged), the remaining 303 are known-but-not-started long tail. Every mark
+below is grounded in the row's lifecycle `State` cell plus its ledger evidence,
+and this section is CI-enforced against those rows by
+[`scripts/check-model-checklist.py`](../scripts/check-model-checklist.py): a mark
+can never claim more than the row backs, no engaged architecture can be omitted,
+and the rollup counts cannot drift. A change that advances (or regresses) a
+model's state updates its entry AND the rollup in the SAME commit.
+
+Legend: `✅` correctness-complete + gated (a passing SACRED token-exact gate on
+record; `DONE`/`ACTIVE`/`GATING`/`PARTIAL` rows) · `🚧` active / in progress
+(implemented or scoped, gate or speed still pending) · `📋` spiked (scoped in a
+spec, not implemented) · `🚫` blocked (hardware- or dependency-blocked, no
+runnable gate) · `⬜` inventoried (known, not started — shown only as the rollup
+count, never one line each). `⬜` never marks a single row; the ~300 inventoried
+rows are the rollup tail.
+
+Rollup by lifecycle state (must equal the detailed per-state row counts):
+
+| State | Rows |
+|---|---|
+| ACTIVE | 6 |
+| GATING | 3 |
+| PARTIAL | 2 |
+| READY | 1 |
+| SPIKE | 8 |
+| BLOCKED | 3 |
+| INVENTORIED | 303 |
+| DONE | 0 |
+| **Total** | **326** |
+
+Engaged architectures (the 23 non-`INVENTORIED` rows):
+
+| Support | Architecture | Family / example | Status | Row |
+|---|---|---|---|---|
+| ✅ | `Qwen3ForCausalLM` | Qwen3 dense (0.6B/1.7B/4B/32B) | near-tie-robust token-exact 16/16 on 0.6B+4B vs vLLM 0.25.0; NVFP4A16 (W4A16) dense quant also gated; c1 every-axis speed parity, c8 decode residual | `MODEL-TEXT-qwen3-qwen3-for-causal-lm` |
+| ✅ | `Qwen3MoeForCausalLM` | Qwen3-Coder-30B-A3B (MoE) | STRICT token-exact 6/6 vs vLLM 0.25.0; 11/16 speed-grid cells at/above graphed vLLM, c1/c2 residual | `MODEL-TEXT-qwen3-moe-qwen3-moe-for-causal-lm` |
+| ✅ | `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B (text path) | text-gen STRICT token-exact 235/235 vs vLLM 0.25.0; multimodal pending so the row is `PARTIAL` (text-only) | `MODEL-MM-qwen3-5-qwen3-5-for-conditional-generation` |
+| ✅ | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (text path) | text-gen STRICT token-exact 315/315 vs vLLM 0.25.0; multimodal pending so the row is `PARTIAL` (text-only) | `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation` |
+| ✅ | `OPTForCausalLM` | OPT-125m | STRICT token-exact 6/6 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-opt-optfor-causal-lm` |
+| ✅ | `DeepseekV2ForCausalLM` | DeepSeek-V2-Lite (MLA) | SACRED gate 8/8 token-exact vs vLLM 0.25.0; speed short (attributed, W9) | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` |
+| ✅ | `LlamaForCausalLM` | Llama-3.2-1B dense | STRICT token-exact 16/16 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-llama-llama-for-causal-lm` |
+| ✅ | `MistralForCausalLM` | Mistral-7B-v0.3 dense | full paged-engine SACRED gate 16/16 vs vLLM 0.25.0; speed pending | `MODEL-TEXT-mistral-mistral-for-causal-lm` |
+| 🚧 | `Qwen3_5MTP` | Qwen3.5 MTP draft (spec-decode) | spec complete; correctness gate in progress (`GATING`) | `MODEL-SPEC-qwen3-5-mtp-qwen3-5-mtp` |
+| 🚧 | `Qwen3_5MoeMTP` | Qwen3.5-MoE MTP draft (spec-decode) | spec complete; correctness gate in progress (`GATING`) | `MODEL-SPEC-qwen3-5-mtp-qwen3-5-moe-mtp` |
+| 🚧 | `DFlashDraftModel` | Qwen3 DFlash draft (spec-decode) | spec complete (`READY`); not yet implemented | `MODEL-SPEC-qwen3-dflash-dflash-qwen3-for-causal-lm` |
+| 🚧 | model factory / self-registration | cross-cutting registry (not an arch) | CPU build + test suite green; dgx gate + no-regression campaign deferred (`GATING`) | `MODEL-FACTORY-registry` |
+| 📋 | `ChatGLMForCausalLM` | ChatGLM | scoped in the GLM/DSA spike, not implemented | `MODEL-TEXT-chatglm-chat-glmfor-causal-lm` |
+| 📋 | `DeepseekForCausalLM` | DeepSeek (plain MHA, not MLA) | scoped; this is a plain-MHA row, distinct from the MLA campaign | `MODEL-TEXT-deepseek-v2-deepseek-for-causal-lm` |
+| 📋 | `DeepseekV4ForCausalLM` | DeepSeek-V4 | scoped in the GLM/DSA-latest spike, not implemented | `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` |
+| 📋 | `GlmForCausalLM` | GLM | scoped in the GLM/DSA spike, not implemented | `MODEL-TEXT-glm-glm-for-causal-lm` |
+| 📋 | `Glm4ForCausalLM` | GLM-4 | scoped in the GLM/DSA spike, not implemented | `MODEL-TEXT-glm4-glm4-for-causal-lm` |
+| 📋 | `Glm4MoeForCausalLM` | GLM-4 MoE | scoped in the GLM/DSA spike, not implemented | `MODEL-TEXT-glm4-moe-glm4-moe-for-causal-lm` |
+| 📋 | `Glm4MoeLiteForCausalLM` | GLM-4 MoE Lite | scoped in the GLM/DSA spike, not implemented | `MODEL-TEXT-glm4-moe-lite-glm4-moe-lite-for-causal-lm` |
+| 📋 | `KimiLinearForCausalLM` | Kimi-Linear | MLA half unlocked by the shared MLA campaign; the full model is not gated, row stays `SPIKE` | `MODEL-TEXT-kimi-linear-kimi-linear-for-causal-lm` |
+| 🚫 | `DeepseekV3ForCausalLM` / `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | HW-blocked (671B, ~642 GiB fp8 vs 119 GiB unified memory); V3.2 additionally DEP-blocked (DSA indexer) | `MODEL-TEXT-deepseek-v2-deepseek-v3-for-causal-lm` |
+| 🚫 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | HW-blocked (1404 GiB bf16) and DEP-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) | `MODEL-TEXT-deepseek-v2-glm-moe-dsa-for-causal-lm` |
+| 🚫 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | HW-blocked (~230B / ~428 GiB bf16, ~4x over unified memory) | `MODEL-TEXT-minimax-m2-mini-max-m2-for-causal-lm` |
+
 ## Row contract
 
 - `MODEL-*` IDs are deterministic: category prefix plus normalized upstream

@@ -2856,3 +2856,12 @@ flock $HOME/gpu.lock sh -c '
   done'
 # All nine token files MUST be md5 d235db12f2cd304007530286a1755c95.
 ```
+
+### Architecture-support checklist + its CI checker (2026-07-23, `CLAIM-DOCS-MODEL-CHECKLIST`) - NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE - docs/policy/CI only, no `src/`/`include/`
+touched, no kernel or engine behavior changed.** Added an at-a-glance
+architecture-support checklist to the top of `.agents/model-matrix.md` plus
+`scripts/check-model-checklist.py` (and its mutation test) that keeps the
+checklist marks and rollup counts in lockstep with the detailed row lifecycle
+states. All model gates are inert by construction; regression set unaffected.

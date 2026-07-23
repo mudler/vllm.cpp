@@ -124,6 +124,17 @@ W2 agent is also appending to `README.md`; the new **Features** table is the
 single-line insertion point for a feature's current-state row, so a one-line
 status update folds into the new structure without adding a paragraph.
 
+**Docs coordination note (2026-07-23, `CLAIM-DOCS-MODEL-CHECKLIST`, DONE).**
+Another docs-and-policy-only change (no area-matrix work row, so it is a note
+here, not a claims-table row): added an at-a-glance architecture-support
+checklist to the top of `.agents/model-matrix.md` (a rollup by lifecycle state
+plus one support-marked line per engaged architecture) and the CI checker
+`scripts/check-model-checklist.py` (+ mutation test) that keeps the checklist
+marks and rollup counts in lockstep with the detailed row states. It touched no
+`src/`/`include/` and moved NO row state; the audit confirmed all 23 engaged rows
+already accurately stated. Wired into the ci.yml `agent-record` job; policy added
+to `AGENTS.md`; see the parity-ledger row of the same date.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-MLA-PREFIX-CACHE-ASSERT` | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` (bugfix — restores its SACRED gate under asserts-enabled builds; the shared prefix-cache manager assertion it relaxes stays owned by `CLAIM-PREFIX-PROMPT-CACHING`, no row-state change to that row) | Claude Code (opus-4-8) | isolated worktree `/home/mudler/_git/vllm.cpp-mla-fix` (branch `fix/mla-prefix-cache-assert`, base `6abe09c`); dgx repro `/home/mudler/repro_deepseek` (unfixed) + `/home/mudler/repro_fixed` (fixed) | `fix/mla-prefix-cache-assert` | `src/vllm/v1/core/single_type_kv_cache_manager.cpp` (assert only) + `tests/vllm/v1/test_single_type_kv_cache_manager.cpp` (new MLA cases) | `DONE` (2026-07-23) | 2026-07-23 root-caused + fixed the DeepSeek-V2 assert abort |

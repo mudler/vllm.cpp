@@ -19,6 +19,10 @@ jobs:
         run: |
           python3 scripts/check-readme-structure.py
           python3 tests/scripts/test_check_readme_structure.py
+      - name: Architecture-support checklist matches the row states
+        run: |
+          python3 scripts/check-model-checklist.py
+          python3 tests/scripts/test_check_model_checklist.py
   documentation-checkpoint:
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.

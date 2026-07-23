@@ -205,7 +205,10 @@ An item moves `INVENTORIED -> SPIKE -> READY -> ACTIVE -> GATING -> DONE`.
 `READY` requires a real `.agents/specs/<slug>.md` with upstream/dependency
 anchors, exact tests to port, gates, dependencies and row-sized work. `DONE`
 requires merged code and exact code/test/evidence anchors. A planned path is
-plain text until the spike exists.
+plain text until the spike exists. The model matrix additionally opens with an
+architecture-support checklist (a per-architecture status roll-up over every
+engaged model), kept in lockstep with its detailed row states by the CI checker
+[../scripts/check-model-checklist.py](../scripts/check-model-checklist.py).
 
 ## Decision rules carried forward
 

@@ -1329,6 +1329,21 @@ to have run**: the test asserts `last_selected` names the provider AND that its
 `declines` counter is zero, so a silent fall-back to MSL cannot masquerade as an
 MLX pass.
 
+## DeepSeek-V2 MLA prefix-cache-hit assert fix — correctness, no new benchmark (2026-07-23)
+
+`CLAIM-MLA-PREFIX-CACHE-ASSERT` (base `6abe09c`). A correctness/robustness fix only — **no throughput
+number is produced or changed**. The DeepSeek-V2 SACRED gate `test_deepseek_v2_paged_engine` aborted at
+`single_type_kv_cache_manager.cpp:293` under asserts-enabled builds (a too-strict
+`FullAttentionManager::find_longest_cache_hit` precondition rejecting the MLA cache group); it was inert
+under the canonical `-DCMAKE_BUILD_TYPE=Release` gate build (NDEBUG). Relaxed to upstream's admissible set.
+Evidence (dgx, asserts-on, `-Werror` 0 warnings): `test_deepseek_v2_paged_engine` **8/8, 3/3 runs**
+(incl. Phase-3 prefix-cache reuse byte-identity); manager unit suite 28 cases / 77,643 asserts; prefix-cache
+units interface 21/21, coordinator 16/16, block_pool 14/14, kv_cache_manager 9/9. Full-attention models are
+byte-identical (the changed TU compiles to identical object code under NDEBUG). The binding W9 every-axis
+throughput grid below is UNCHANGED (the fix does not touch any compute/decode path). Repro: `git archive`
+`6abe09c` + fix → canonical dgx flags WITHOUT `-DCMAKE_BUILD_TYPE` (asserts live) →
+`ctest`/`test_deepseek_v2_paged_engine`.
+
 ## Binding DeepSeek-V2-Lite (MLA) every-axis grid — MLA campaign W9 (2026-07-22)
 
 **Verdict: NOT every-axis parity. The row stays `ACTIVE`.** Two optimizations

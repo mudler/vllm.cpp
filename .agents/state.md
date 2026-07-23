@@ -20586,3 +20586,68 @@ Touched ONLY `include/vllm/tokenizer/{bpe,tokenizer}.h`, `src/vllm/tokenizer/{bp
 **Transfer/serialize discipline.** `git archive HEAD | ssh dgx tar -x` (never rsync). The vLLM oracle capture initially FAILED with a memory-profiling assertion when run CONCURRENTLY with the CUDA build (GB10 unified memory: the build's RAM churn changed vLLM's "free GPU memory" mid-profile) — re-run alone after the build completed. All GPU work under `flock $HOME/gpu.lock`, big-model gates standalone.
 
 **Next.** Mistral SPEED close (head_dim 128 already rides the FA2 path; a decode CUDA graph is the lever). Gemma3 (also SentencePiece — now unblocked). If `split=true` SentencePiece checkpoints enter scope, implement + golden them (currently fail-loud).
+
+
+## 2026-07-23 — `KV-PREFIX-CACHE`: DeepSeek-V2 MLA prefix-cache-hit assert abort ROOT-CAUSED + FIXED (`CLAIM-MLA-PREFIX-CACHE-ASSERT`, base `6abe09c`, worktree `/home/mudler/_git/vllm.cpp-mla-fix` branch `fix/mla-prefix-cache-assert`)
+
+**Symptom.** `test_deepseek_v2_paged_engine` aborts (SIGABRT) at
+`src/vllm/v1/core/single_type_kv_cache_manager.cpp:293` —
+`assert(kv_cache_spec.kind() == KVCacheSpecKind::kFullAttention && "FullAttentionManager can only be used for full attention groups")`
+inside `FullAttentionManager::find_longest_cache_hit`. Reported by the SentencePiece agent
+(tokenizer diff proven not the cause).
+
+**Reproduction (Phase 1, dgx, canonical flags, NO `-DCMAKE_BUILD_TYPE` ⇒ asserts LIVE).**
+Clean `git archive` of `6abe09c` → build → `test_deepseek_v2_paged_engine` **aborts DETERMINISTICALLY,
+3/3 runs exit 134**, identical assertion at :293, fired during scheduling of the FIRST request
+(before any prompt forwards). NOT intermittent, NOT battery/hash-dependent: the assert sits at the top
+of `find_longest_cache_hit`, before any hit/miss logic.
+
+**Why an MLA group reaches `find_longest_cache_hit` NOW.** DeepSeek-V2 defaults automatic prefix caching
+ON — `ResolveEnablePrefixCaching` returns `!is_hybrid && !has_inner_state` (model_loader.cpp:159), and
+DeepSeek-V2 is neither. With APC on, a single MLA cache group → `UnitaryKVCacheCoordinator`, whose
+`find_longest_cache_hit` (kv_cache_coordinator.cpp:314-317) unconditionally calls the group manager's
+`find_longest_cache_hit`. The registry routes `MLAAttentionSpec` (kind `kMlaAttention`) to
+`FullAttentionManager` (kv_cache_spec_registry.cpp:75), exactly as upstream does. So the manager's
+strict `== kFullAttention` precondition aborts on the FIRST request. The deterministic-hash / battery
+content is irrelevant — a prefix HIT is not required, only the CALL.
+
+**Regression vs latent.** LATENT since the original `ec6f4be` (the assert has always been there). Masked
+in every prior gate because the canonical gate build is `-DCMAKE_BUILD_TYPE=Release`, and `assert()` is a
+no-op under NDEBUG — so L7/S3/G7/L6 all genuinely passed DeepSeek 8/8 (the assert was inert and the rest
+of `find_longest_cache_hit` is spec-kind-agnostic, running correctly for MLA). The SentencePiece agent
+simply built with asserts enabled and hit the pre-existing latent bug. NOT introduced by
+LMCache-W1/Mistral/SentencePiece (none touch the prefix-cache/MLA path).
+
+**Correct fix (grounded in vLLM).** The assert is TOO STRICT. Upstream
+`FullAttentionManager.find_longest_cache_hit` asserts
+`isinstance(kv_cache_spec, FullAttentionSpec | ChunkedLocalAttentionSpec)`
+(single_type_kv_cache_manager.py:578-582), and `MLAAttentionSpec(FullAttentionSpec)` (:363) is a
+SUBCLASS, so isinstance passes for MLA — with `register(MLAAttentionSpec, FullAttentionManager, …)`
+(:1538-1540). MLA prefix caching IS valid: blocks are opaque `page_size_bytes` rows hashed by token, so
+the cache-hit-by-block-hash walk is spec-kind-agnostic. Relaxed our precondition to the exact upstream
+admissible set: `kFullAttention || kMlaAttention || kChunkedLocalAttention`. No computed behaviour
+changes; for `kFullAttention` the assert is identical, so full-attention models are unaffected (and under
+NDEBUG the changed TU is object-code byte-identical).
+
+**Tests (TEST-FIRST).** Two new CPU cases in `test_single_type_kv_cache_manager.cpp`: (1) MLA-spec
+`find_longest_cache_hit` walks a two-block prefix without aborting; (2) end-to-end
+`cache_blocks → find_longest_cache_hit` restores the byte-identical prefix pages (same physical KV blocks
+→ a cached-prefix decode reproduces the cold tokens exactly — the untested MLA-restart-hit gap). RED on
+unfixed asserts-on (SIGABRT :293); GREEN after the fix.
+
+**Gates.** dgx canonical CUDA build asserts-ON `-Werror` **0 warnings**. Fixed
+`test_deepseek_v2_paged_engine` **8/8, 3/3 runs** (incl. Phase-3 prefix-cache reuse byte-identity).
+Unit regression (asserts-on, dgx + dev box): single_type manager 28 cases / 77,643 asserts,
+test_kv_cache_interface 21/21, test_kv_cache_coordinator 16/16, test_block_pool 14/14,
+test_kv_cache_manager 9/9. Full-attention models unchanged (Release build: the changed TU object is
+byte-identical base↔fix because `assert()` folds to `((void)0)` under NDEBUG). Goldens content unchanged.
+NOT pushed — reported FULL SHA to caller.
+
+**Secondary (non-load-bearing) note for the KV owner.** `SingleTypeKVCacheManager::allocate_new_blocks`
+/ `allocate_external_computed_blocks` gate `new_block_ids` recording on `kind() == kFullAttention`
+(single_type_kv_cache_manager.cpp:153,173), whereas upstream includes `MLAAttentionSpec` in the type set
+(single_type_kv_cache_manager.py:302-310). This is a latent divergence but INERT for correctness in our
+port: the top-level `KVCacheManager::take_new_block_ids()` (the only consumer) has NO callers — the
+scheduler builds the worker block-table from `req_to_new_blocks[...].get_block_ids()`
+(scheduler.cpp:353,405,666), which is why DeepSeek passed 8/8 despite it. Left unchanged (out of scope of
+this abort; documented so a future wiring of `take_new_block_ids` mirrors upstream).

@@ -48,6 +48,7 @@ using vllm::v1::KVCacheSpec;
 using vllm::v1::make_block_hash_with_group_id;
 using vllm::v1::MambaManager;
 using vllm::v1::MambaSpec;
+using vllm::v1::MLAAttentionSpec;
 using vllm::v1::Request;
 using vllm::v1::sha256_cbor;
 using vllm::v1::SlidingWindowManager;
@@ -69,6 +70,16 @@ std::shared_ptr<MambaSpec> MakeMambaSpec(int block_size = 2,
       block_size, std::vector<std::vector<int64_t>>{{2, 4}},
       std::vector<DType>{DType::kF32}, /*page_size_padded=*/std::nullopt, mode,
       num_speculative_blocks);
+}
+
+// MLA latent cache: block_size=2, ONE kv head, head_size=576
+// (kv_lora_rank 512 + qk_rope_head_dim 64). kind() == kMlaAttention, yet the
+// registry routes it to FullAttentionManager (kv_cache_spec_registry.cpp:75),
+// exactly as upstream registers MLAAttentionSpec -> FullAttentionManager
+// (single_type_kv_cache_manager.py:1538-1540).
+std::shared_ptr<MLAAttentionSpec> MakeMlaSpec(int block_size = 2,
+                                              int head_size = 576) {
+  return std::make_shared<MLAAttentionSpec>(block_size, head_size, DType::kF32);
 }
 
 std::shared_ptr<SlidingWindowSpec> MakeSlidingSpec(
@@ -243,6 +254,76 @@ TEST_CASE(
   CHECK(computed.size() == 3);
   for (int i = 0; i < 3; ++i) {
     CHECK(computed[static_cast<size_t>(i)]->block_id == allocated[static_cast<size_t>(i)]->block_id);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MLAAttentionSpec via FullAttentionManager — the MLA prefix-cache-hit path.
+//
+// Regression for the DeepSeek-V2 SACRED-gate abort: FullAttentionManager is the
+// registered manager for MLAAttentionSpec (kind() == kMlaAttention), exactly as
+// upstream registers MLAAttentionSpec -> FullAttentionManager
+// (single_type_kv_cache_manager.py:1538-1540) and its find_longest_cache_hit
+// admits `FullAttentionSpec | ChunkedLocalAttentionSpec` (:578-582) — MLA IS-A
+// FullAttentionSpec subclass, so the isinstance check passes for it upstream.
+// Our C++ kind()-equality precondition previously accepted ONLY kFullAttention,
+// so with automatic prefix caching ON (DeepSeek's default) the very first
+// cache-hit lookup aborted the assert. These cases prove (a) the lookup does not
+// abort for an MLA group and (b) the restored prefix is byte-identical to the
+// cold allocation — the same physical KV pages, i.e. a pure reuse of already
+// computed latent rows, which is what makes a cached-prefix decode reproduce the
+// uncached tokens exactly.
+// ---------------------------------------------------------------------------
+TEST_CASE(
+    "FullAttentionManager (MLA spec): find_longest_cache_hit walks the prefix "
+    "without aborting the kind assertion") {
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeMlaSpec();
+  REQUIRE(spec->kind() == vllm::v1::KVCacheSpecKind::kMlaAttention);
+  FullAttentionManager mgr(spec, pool, /*enable_caching=*/true,
+                           /*kv_cache_group_id=*/0, /*scheduler_block_size=*/2);
+
+  std::vector<BlockHash> bh = {"h0", "h1", "h2"};
+  MockCache(pool, "h0", &pool.blocks[10]);
+  MockCache(pool, "h1", &pool.blocks[11]);
+  // h2 not cached: the walk must stop after the two-block prefix, not abort.
+  auto computed = mgr.find_longest_cache_hit(
+      bh, /*max_length=*/6, {0}, pool, *spec, /*drop_eagle_block=*/false,
+      /*alignment_tokens=*/2)[0];
+  REQUIRE(computed.size() == 2);
+  CHECK(computed[0] == &pool.blocks[10]);
+  CHECK(computed[1] == &pool.blocks[11]);
+}
+
+TEST_CASE(
+    "FullAttentionManager (MLA spec): cache_blocks then find_longest_cache_hit "
+    "restores the byte-identical prefix (end-to-end MLA prefix reuse)") {
+  init_none_hash(sha256_cbor);
+  BlockPool pool(/*num_gpu_blocks=*/100, /*enable_caching=*/true,
+                 /*hash_block_size=*/2);
+  auto spec = MakeMlaSpec();
+  FullAttentionManager mgr(spec, pool, true, 0, 2);
+
+  // Request A fills three whole latent blocks and caches them.
+  Request reqA = MakeRequest("A", Iota(6), /*block_size=*/2);
+  REQUIRE(reqA.block_hashes.size() == 3);
+  auto allocated = mgr.allocate_new_blocks("A", 6, 6);
+  REQUIRE(allocated.size() == 3);
+  mgr.cache_blocks(reqA, /*num_tokens=*/6);
+
+  // Request B shares A's full 6-token prefix: the deterministic block hashes hit
+  // A's cached latent pages. The restored blocks must be the SAME physical pages
+  // A wrote — a cached-prefix decode then reads byte-identical latent rows and
+  // reproduces the cold-run tokens exactly.
+  Request reqB = MakeRequest("B", Iota(6), /*block_size=*/2);
+  REQUIRE(reqB.block_hashes == reqA.block_hashes);
+  auto computed = mgr.find_longest_cache_hit(reqB.block_hashes, 6, {0}, pool,
+                                             *spec, false, 2)[0];
+  REQUIRE(computed.size() == 3);
+  for (int i = 0; i < 3; ++i) {
+    CHECK(computed[static_cast<size_t>(i)]->block_id ==
+          allocated[static_cast<size_t>(i)]->block_id);
   }
 }
 

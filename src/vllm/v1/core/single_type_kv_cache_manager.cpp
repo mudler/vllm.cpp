@@ -290,8 +290,20 @@ FullAttentionManager::find_longest_cache_hit(
     const std::vector<int>& kv_cache_group_ids, BlockPool& block_pool,
     const KVCacheSpec& kv_cache_spec, bool drop_eagle_block,
     int alignment_tokens, int dcp_world_size, int pcp_world_size) {
-  assert(kv_cache_spec.kind() == KVCacheSpecKind::kFullAttention &&
-         "FullAttentionManager can only be used for full attention groups");
+  // Upstream precondition (single_type_kv_cache_manager.py:578-582):
+  //   assert isinstance(spec, FullAttentionSpec | ChunkedLocalAttentionSpec)
+  // MLAAttentionSpec IS-A FullAttentionSpec (kv_cache_interface.py:363), so that
+  // isinstance passes for MLA — and upstream registers MLAAttentionSpec ->
+  // FullAttentionManager (:1538-1540). Our kind() is a distinct enum value for
+  // the MLA subclass (page SIZE / tensor SHAPE differ), but the block-hash
+  // cache-hit walk below is spec-kind-agnostic, so MLA groups use it unchanged.
+  // Mirror the exact upstream admissible set; a strict `== kFullAttention` here
+  // wrongly aborted MLA prefix-cache lookups (DeepSeek-V2 with APC on).
+  assert((kv_cache_spec.kind() == KVCacheSpecKind::kFullAttention ||
+          kv_cache_spec.kind() == KVCacheSpecKind::kMlaAttention ||
+          kv_cache_spec.kind() == KVCacheSpecKind::kChunkedLocalAttention) &&
+         "FullAttentionManager can only be used for full attention and "
+         "chunked local attention groups");
   std::vector<std::vector<KVCacheBlock*>> computed_blocks(
       kv_cache_group_ids.size());
   int block_size = kv_cache_spec.block_size;

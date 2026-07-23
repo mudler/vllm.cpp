@@ -50,6 +50,26 @@ recorded in `### Work breakdown`.
 "MLA family = new attention, new campaign, needs its own leaf spike". This is
 that leaf spike.
 
+**Post-campaign fix — 2026-07-23 (`CLAIM-MLA-PREFIX-CACHE-ASSERT`, base `6abe09c`).** The DeepSeek-V2
+SACRED gate `test_deepseek_v2_paged_engine` aborted (SIGABRT) at
+`single_type_kv_cache_manager.cpp:293` under **asserts-enabled** builds (empty/Debug `CMAKE_BUILD_TYPE` —
+no NDEBUG). ROOT CAUSE: `FullAttentionManager::find_longest_cache_hit` asserted the group's spec
+`kind() == kFullAttention`, but the MLA group's spec is `MLAAttentionSpec` (`kind() == kMlaAttention`),
+which W1 correctly routes to the ORDINARY `FullAttentionManager` (registry, mirroring upstream). DeepSeek-V2
+defaults automatic prefix caching ON, so the single-group `UnitaryKVCacheCoordinator` calls the manager's
+`find_longest_cache_hit` on the FIRST request → the strict precondition aborts. DETERMINISTIC (fires before
+any prompt forwards); LATENT since the original `ec6f4be`; masked in every prior gate because the canonical
+build is `Release` (NDEBUG folds `assert()` out) — L7/S3/G7/L6 genuinely passed 8/8. NOT a regression from
+LMCache/Mistral/SentencePiece. FIX (grounded in vLLM `single_type_kv_cache_manager.py:578-582`: upstream
+asserts `isinstance(spec, FullAttentionSpec | ChunkedLocalAttentionSpec)` and `MLAAttentionSpec(FullAttentionSpec)`
+is a subclass): relax our precondition to `kFullAttention || kMlaAttention || kChunkedLocalAttention`. MLA
+prefix caching IS valid — blocks are opaque `page_size_bytes` rows hashed by token, so the cache-hit walk is
+spec-kind-agnostic and runs byte-for-byte as upstream. Two new CPU unit cases prove the MLA lookup does not
+abort AND the restored prefix restores the byte-identical KV pages (the previously untested MLA restart-hit).
+Restores DeepSeek-V2 8/8 (3/3, asserts-on, incl. Phase-3 prefix reuse byte-identity); full-attention models
+byte-identical (Release changed-TU object unchanged); `-Werror` 0 warnings. Does not change any W0-W10
+conclusion or state.
+
 ---
 
 ## 0. Headline findings (read this first)

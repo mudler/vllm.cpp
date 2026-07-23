@@ -73,6 +73,10 @@
 #include "vllm/v1/kv_cache_interface.h"
 #include "vllm/v1/request.h"
 
+namespace vllm::v1::kv_offload {
+class KVConnectorScheduler;  // vllm/v1/kv_offload/kv_connector.h (KV-OFFLOAD W4)
+}  // namespace vllm::v1::kv_offload
+
 namespace vllm::v1 {
 
 class StructuredOutputManager;  // vllm/v1/structured_output/manager.h
@@ -166,6 +170,18 @@ class Scheduler {
       const SchedulerOutput& scheduler_output,
       const ModelRunnerOutput& model_runner_output);
 
+  // KV-OFFLOAD W4: attach the scheduler-facing half of a KV connector. A null
+  // connector (the default) is ZERO behaviour change — offloading is opt-in and
+  // provably inert when off, so every existing model regression is unaffected.
+  // The scheduler does NOT own the connector; the caller keeps it alive for the
+  // scheduler's lifetime.
+  void set_kv_connector(kv_offload::KVConnectorScheduler* connector) {
+    kv_connector_ = connector;
+  }
+  kv_offload::KVConnectorScheduler* kv_connector() const {
+    return kv_connector_;
+  }
+
   // get_num_unfinished_requests: len(waiting) + len(running) (T0 subset).
   int get_num_unfinished_requests() const;
   // get_request_counts: (num_running, num_waiting).
@@ -230,6 +246,10 @@ class Scheduler {
   int current_step() const { return current_step_; }
 
  private:
+  // KV-OFFLOAD W4: the scheduler-facing KV connector (non-owning, opt-in, null by
+  // default). See set_kv_connector.
+  kv_offload::KVConnectorScheduler* kv_connector_ = nullptr;
+
   // Backing store for prefix_cache_metrics(); written only by schedule().
   CachingMetrics prefix_cache_metrics_;
 

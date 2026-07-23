@@ -334,6 +334,8 @@ add_library(vllm STATIC
   src/vllm/v1/kv_offload/kv_block_transfer.cpp
   src/vllm/v1/kv_offload/fs_io.cpp
   src/vllm/v1/kv_offload/fs_tier.cpp
+  src/vllm/v1/kv_offload/tiering_manager.cpp
+  src/vllm/v1/kv_offload/kv_connector.cpp
   src/vllm/v1/core/sched/request_queue.cpp
   src/vllm/v1/core/sched/output.cpp
   src/vllm/v1/core/sched/scheduler.cpp

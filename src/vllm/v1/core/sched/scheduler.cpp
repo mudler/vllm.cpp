@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "vllm/v1/core/sched/utils.h"           // check_stop
+#include "vllm/v1/kv_offload/kv_connector.h"    // KVConnectorScheduler (W4)
 #include "vllm/v1/structured_output/manager.h"  // StructuredOutputManager
 
 namespace vllm::v1 {
@@ -257,6 +258,10 @@ SchedulerOutput Scheduler::schedule() {
 
   // Next, schedule the WAITING requests (skipped entirely if any preemption
   // happened this step, matching upstream).
+  // KV-OFFLOAD W4: requests deferred by the connector's "not ready, re-ask"
+  // (nullopt) third state. Popped off waiting this step, re-queued to the front
+  // after the loop so they are re-asked next step (scheduler.py:744-750,1017).
+  std::vector<Request*> connector_skipped_waiting;
   if (preempted_reqs.empty()) {
     while (!waiting->empty() && token_budget > 0) {
       if (static_cast<int>(running.size()) >= max_num_running_reqs) {
@@ -282,6 +287,27 @@ SchedulerOutput Scheduler::schedule() {
         num_computed_tokens = request->num_computed_tokens;
       }
 
+      // KV-OFFLOAD W4: ask the connector how many EXTERNAL (tier-cached) tokens
+      // load beyond the local prefix, so a cross-request / restarted-process
+      // prefix HIT shortcuts prefill (scheduler.py:737-762). Null connector =
+      // zero change. The nullopt THIRD state ("a disk->CPU promotion is still in
+      // flight") pops the request and re-asks next step; treating it as 0 would
+      // spin or serve a partial prefix (§Risks R5).
+      int num_external_computed_tokens = 0;
+      if (kv_connector_ != nullptr && request->num_computed_tokens == 0) {
+        const auto match = kv_connector_->get_num_new_matched_tokens(
+            *request, num_new_local_computed_tokens);
+        if (!match.num_matched_tokens.has_value()) {
+          waiting->pop_request();
+          connector_skipped_waiting.push_back(request);
+          continue;
+        }
+        num_external_computed_tokens = *match.num_matched_tokens;
+        // The external tokens are treated as computed (their KV is loaded before
+        // compute by the worker), so prefill shrinks by exactly this many.
+        num_computed_tokens += num_external_computed_tokens;
+      }
+
       // Number of tokens to schedule (num_tokens covers resumed reqs' output).
       int num_new_tokens = request->NumTokens() - num_computed_tokens;
       if (0 < long_prefill_token_threshold_ &&
@@ -298,7 +324,7 @@ SchedulerOutput Scheduler::schedule() {
       std::optional<KVCacheBlocks> new_blocks = kv_cache_manager->allocate_slots(
           *request, num_new_tokens, num_new_local_computed_tokens,
           new_computed_blocks, /*num_lookahead_tokens=*/num_lookahead_tokens_,
-          /*num_external_computed_tokens=*/0, /*delay_cache_blocks=*/false,
+          num_external_computed_tokens, /*delay_cache_blocks=*/false,
           /*num_encoder_tokens=*/0,
           /*full_sequence_must_fit=*/scheduler_reserve_full_isl_,
           /*reserved_blocks=*/0, /*has_scheduled_reqs=*/!running.empty());
@@ -318,10 +344,25 @@ SchedulerOutput Scheduler::schedule() {
       }
 
       req_to_new_blocks[request_id] = kv_cache_manager->get_blocks(request_id);
+      // KV-OFFLOAD W4: register the load of the external prefix into the blocks
+      // just allocated (load-before-compute). ext==0 makes this a no-op
+      // (scheduler.py:932-937). The worker executes the load before those tokens
+      // are read as computed.
+      if (kv_connector_ != nullptr && num_external_computed_tokens > 0) {
+        kv_connector_->update_state_after_alloc(
+            *request, req_to_new_blocks[request_id].get_block_ids(),
+            num_external_computed_tokens);
+      }
       num_scheduled_tokens[request_id] = num_new_tokens;
       token_budget -= num_new_tokens;
       request->status = RequestStatus::kRunning;
       request->num_computed_tokens = num_computed_tokens;
+    }
+    // KV-OFFLOAD W4: re-queue the connector-deferred requests to the FRONT of
+    // waiting (reverse so FCFS order is preserved) to be re-asked next step.
+    for (auto it = connector_skipped_waiting.rbegin();
+         it != connector_skipped_waiting.rend(); ++it) {
+      waiting->prepend_request(*it);
     }
   }
 
@@ -403,6 +444,17 @@ SchedulerOutput Scheduler::schedule() {
   // history out of the window.
   if (auto stats = kv_cache_manager->make_prefix_cache_stats()) {
     prefix_cache_metrics_.observe(*stats);
+  }
+
+  // KV-OFFLOAD W4: build_connector_meta drains + RESETS the connector's per-step
+  // batch state (base.py:516-517); on_schedule_end flushes deferred disk->CPU
+  // promotions and polls transfers (tiering manager on_schedule_end). Null
+  // connector = no-op. In a live engine the worker consumes the returned load
+  // jobs; W4 wires the scheduler seam (default-off, provably inert), and the
+  // load execution is exercised end-to-end in the connector correctness harness.
+  if (kv_connector_ != nullptr) {
+    kv_connector_->build_connector_meta();
+    kv_connector_->on_schedule_end();
   }
   return scheduler_output;
 }

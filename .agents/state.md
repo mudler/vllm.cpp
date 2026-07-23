@@ -19839,3 +19839,106 @@ kMatmul 16 % + kMatmulBT 14 % = 80 %). G6 ports llama.cpp's Arm i8mm `nrc==2`
 - **Binding benchmark (idle-gated dgx aarch64, one flock):** op-level kMatmulBTQuant portable→i8mm — q8_0 ~1.2×, q6_K 3.8–4.5×, q4_K 7–8.4×; e2e prefill same-binary TTFT 1135.68→1047.70 ms (**1.084×**, 112.7→122.2 t/s), 1.56×→**1.44× behind** llama.cpp pp128 175.41. Decode unchanged (mmla off at M=1). The bench file is q8_0-dominant + 60 % f16 (pessimal for G6) so e2e is Amdahl-bounded — the 4–8× k-quant kernel win lands e2e on the APEX 35B files.
 - **Fresh bottleneck:** mmla drops the q8_0 kMatmulBTQuant share 50 %→~44 %; the elementwise f16/f32 GEMM (~30 %, UNCHANGED — the 60 % f16 mass incl. the tied lm_head/embed) is now co-dominant and the next CPU prefill lever on this file. On a k-quant file kMatmulBTQuant collapses and the elementwise GEMM + attention dominate. G5 (x86 AVX2/AVX512) and a NEON-dotprod nrc==1 tier for i8mm-absent aarch64 remain follow-ups; G7 repack parked.
 - **Gates:** CUDA production build 100 % `-Werror` 0 warnings (arm TU compiles clean in the CUDA build too); regression set UNCHANGED — 27B 235/235, 35B 315/315, Qwen3-Coder 6/6 (138), Qwen3-dense 16/16 (184), OPT 6/6, DeepSeek-V2 8/8; goldens untouched (git-verified, md5 `2965ef5772b556d3f3f86fedf4221b2f`). CPU units green (quant_dot 19/78,162, traits 5,615, dequant 215, keep_quant 5,857, threadpool 19,601, matmul_elem 654). NEXT: user review; G5 x86 tier; the elementwise-GEMM SIMD f16 lever (now co-dominant on mixed files).
+## 2026-07-23 — KV-persistence **W4**: the tiering manager + the connector/scheduler half — the FIRST demonstrable offload speedup (`CLAIM-KV-PERSISTENCE-LMCACHE`, `KV-OFFLOAD`, base `origin/main` `93b55c0`, worktree `w4-kv-tiering`)
+
+- **What landed.** The W1-W3 offload tiers now have a consumer.
+  - **Tiering manager** (`include/vllm/v1/kv_offload/tiering_manager.h` +
+    `src/vllm/v1/kv_offload/tiering_manager.cpp`): ONE manager over the W2 CPU
+    primary tier + the W3 disk secondary tier, mirroring
+    `vllm/v1/kv_offload/tiering/manager.py:123-706`. The ORDERING is the
+    correctness content, ported line-for-line: PROMOTION (a lookup that misses
+    CPU but hits disk reserves a primary slot at `ref_cnt=-1` so it reads
+    HIT_PENDING that same step and cannot be promoted twice, DEFERS a batched
+    load, and returns RETRY; the load flushes at `on_schedule_end` and the block
+    is HIT the next step — `manager.py:282-353`), CASCADE/demotion (a completed
+    CPU store `prepare_read`-pins the blocks and writes them to disk, unpinned
+    only when the write lands — `:497-556`), RESET (drains the secondary FIRST
+    and DELIBERATELY never resets it, so a persisted cache survives a
+    prefix-cache reset — `:642-681`). A promotion RE-VERIFIES the W3 identity
+    header and REFUSES a foreign/corrupt block (treats it as absent, unlinks it),
+    never trusting the lower tier blindly. The byte home is an injected
+    `PrimaryByteView` (mirrors upstream's `primary_kv_view` memoryview) so the
+    disk tier reads/writes CPU slots by id and never touches device memory.
+  - **Connector/scheduler half** (`include/vllm/v1/kv_offload/kv_connector.h` +
+    `src/vllm/v1/kv_offload/kv_connector.cpp`): `OffloadingConnector`, the
+    SEMANTICS of `KVConnectorBase_V1`'s scheduler hooks (base.py:453-561,
+    offloading/scheduler.py:648-792) — `get_num_new_matched_tokens` with the
+    load-bearing NULLOPT third state ("re-ask while a disk→CPU promotion runs"),
+    `Request::block_hashes` striding (`hbsf*j+hbsf-1`, hbsf==1 today), and
+    load-before-compute (`update_state_after_alloc` records the load; ext==0 is
+    the no-op second call). Wired OPT-IN + DEFAULT-OFF into `Scheduler`
+    (`set_kv_connector`; null pointer = zero behaviour change): the waiting loop
+    layers external matched tokens onto `get_computed_blocks`, defers on the
+    nullopt state (pop + re-queue to the front + continue), and end-of-schedule
+    builds the connector meta (state reset) + flushes promotions. An external
+    match is capped so at least one token is recomputed (`num_tokens-1` rule) to
+    keep block alignment.
+  - `BlockPool::evict_blocks` ported 1:1 (`block_pool.py:637-654`), replacing the
+    throw.
+- **Load-bearing vs Python-incidental.** Load-bearing (mirrored exactly): block
+  identity + hash agreement (offload keys ARE `Request::block_hashes`), the
+  nullopt/RETRY/HIT_PENDING tri-state, the ATOMIC evict + `ref_cnt==-1` sentinel
+  (from W2), promotion/cascade/reset ORDERING, load-before-compute, identity
+  refusal through a promotion. Python-incidental (replaced with C++ equivalents):
+  the dynamic `importlib` connector-module path → compile-time wiring; the
+  `SupportsHMA` isinstance dispatch (offloading ignores block_ids and tracks its
+  own) → one method; `msgspec`/`ctypes` structs → plain structs. The full
+  7-method abstract ABI + `KVTransferConfig` + registration is W5.
+- **Deviation, recorded.** W4 ships the SYNCHRONOUS-load shape (async flag always
+  false, mirroring LMCacheConnectorV1's `(n, False)`): the async part is the
+  disk→CPU promotion, handled by the RETRY/re-ask across a step boundary; the
+  CPU→GPU leg is synchronous. The cross-step `WAITING_FOR_REMOTE_KVS` GPU-load
+  buffer (scheduler.py:948-969) is W5. The tiering manager's secondary jobs are
+  submitted async (FS background pool) and finalized by a blocking `wait()` at
+  the next `process_finished_jobs` — the observable RETRY-then-HIT semantics are
+  preserved; only the poll is a blocking wait rather than a non-blocking query.
+- **Correctness proof (the silent-wrong-output guard).**
+  `tests/vllm/v1/test_kv_offload_tiering.cpp` 5/5: promotion RETRY→HIT
+  byte-identical; CPU-eviction→disk-survival→re-promotion (demotion) byte- and
+  token-identical; reset clears CPU but the disk tier survives; a FRESH manager
+  on the same directory promotes (restart); identity REFUSAL through a promotion
+  (a corrupt disk block is unlinked and treated as absent, refusals counter == 1).
+  `tests/vllm/v1/test_kv_offload_connector.cpp` 4/4: null-connector inertness;
+  an external match shortcuts prefill by exactly `ext`; the nullopt third state
+  defers then schedules next step; and the END-TO-END restart demonstration.
+- **Measured hit demonstration (the first offload speedup).** A restarted-prefix
+  workload through the REAL scheduler: a 48-token prompt (3 prefix blocks), all
+  persisted to disk then the CPU tier evicted. Offloading OFF schedules the full
+  48-token prefill; offloading ON, the connector reports a disk HIT and prefill
+  is shortcut by **32 of 48 tokens (2 of 3 blocks promoted from disk)** — hit
+  rate 2/3 blocks — with the promoted bytes proven byte-identical to the cold
+  store. This is where offload stops being storage and becomes a speedup.
+- **Gates — CLOSED on the stable dgx (independent verification 2026-07-23,
+  rebased onto current `main` `5c2a9a4`, head `e8a5d53`).** The authoring commit's
+  own dgx gates were destroyed by a co-tenant OOM reboot-loop; re-run clean on the
+  now-idle box (sole owner, one `flock $HOME/gpu.lock` held for the whole series,
+  each big-model gate STANDALONE — never `ctest -j` co-scheduled).
+  - **Build.** Clean CUDA `-Werror` build, **0 warnings** (`-DCMAKE_CUDA_ARCHITECTURES=121a`,
+    CUTLASS 4.5.0 + Triton AOT, 538/538, `-Werror` on 302 CXX + `-Werror=all-warnings`
+    on 38 CUDA TUs). Full CPU ctest green; `test_block_pool` 14/14 (the deferred-stub
+    `evict_blocks`-throws test is now the real 1:1 eviction).
+  - **New KV suites (7/7):** `test_kv_offload_tiering` 5/5, `test_kv_offload_connector`
+    4/4 (the e2e restart-hit emits `offload hit rate = 2/3 blocks; prefill tokens
+    saved = 32/48`, promotions==hits, refusals==0, promoted payload `got == payload`
+    byte-identical), `test_block_pool` 14/14, and W1–W3
+    (`test_none_hash_determinism`, `test_prefix_cache_stats`, `test_kv_offload_cpu`,
+    `test_kv_offload_fs`) all pass.
+  - **SACRED regressions — EACH STANDALONE, the "inert by construction" proof —
+    ALL UNCHANGED vs historical:** 27B **235/235** (NVFP4-emulation path on this
+    box's cutlass, byte-identical, not a regression), 35B **315/315**, Qwen3-Coder
+    **138/138** (6/6 prompts), Qwen3-dense **184/184** (16/16 prompts), OPT **63/63**
+    (6/6), DeepSeek-V2 **223/223** (8/8 — clean standalone idle; the earlier 95/223
+    was the co-tenancy transient). Every assertion count matches the historical
+    baseline exactly ⇒ the connector default-OFF is provably inert on every model.
+  - **memcheck.** `compute-sanitizer --tool memcheck --leak-check=full` on both
+    `test_kv_offload_tiering` and `test_kv_offload_connector`: **0 errors, 0 bytes
+    leaked**.
+  - **Goldens** content hash (477 files) identical BEFORE and AFTER the whole battery
+    (`1c1ea9c313e2440fcdc33d29c556f500`); W4 touches no golden.
+  - **Record checkers (bare, explicit RC):** `check-agent-record.py` RC=0,
+    `check-doc-checkpoint.py --base 5c2a9a4 --head e8a5d53` RC=0,
+    `check-device-leakage.py` RC=0 (DSR **86** == baseline 86, ratchet holds).
+- **NEXT / resume point.** W5 the connector seam as a first-class C++ ABI (7 pure
+  virtuals + registration + `KVTransferConfig`, generalizing this one connector
+  for `KV-CONNECTORS`; adds the worker-side GPU load + a CLI switch); then W6 the
+  LMCache go/no-go, W7 named per-sequence save/restore.

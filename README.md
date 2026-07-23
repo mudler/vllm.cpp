@@ -770,12 +770,24 @@ Legend: ✅ supported and tested · 🟡 partial / gating · 🗓 planned.
   `-Werror` build, 0 warnings; the four new suites and all six model
   regressions green on GB10; goldens unchanged), so the storage layer is
   verified, not merely written.
-  What is still missing: nothing connects these tiers to the running engine
-  yet, so there is no flag to enable them and no measured speed benefit. Note
-  also that a disk cache written by vllm.cpp will not interoperate with a stock
-  vLLM unless that vLLM is launched with `--prefix-caching-hash-algo
-  sha256_cbor`, because our block-hash algorithm deviates from upstream's
-  default by design.
+  **The tiers now have a consumer.** A tiering manager coordinates the CPU and
+  disk tiers — promoting a block up on a hit and demoting it down under memory
+  pressure — and a scheduler-side connector lets a **cross-request or
+  restarted-process prefix hit load from disk and skip recomputing that part of
+  the prompt.** In a repeated-prefix test through the real scheduler this saved
+  32 of 48 prompt tokens (two of three blocks loaded from disk), and the loaded
+  bytes are proven byte-identical to a cold run, so the continuation is
+  token-identical — a wrong load would be a silent wrong-output bug, so a
+  promotion re-checks the identity header and refuses a foreign block. This
+  offloading is **opt-in and off by default**, so it changes nothing for models
+  that do not use it (every regression is unaffected).
+  What is still missing: the connector is wired into the scheduler but a
+  user-facing CLI switch and the worker-side load into live GPU memory (which
+  generalizes the connector into a full plugin seam) are the next step, so
+  offloading is not yet a flag on the server. Note also that a disk cache
+  written by vllm.cpp will not interoperate with a stock vLLM unless that vLLM
+  is launched with `--prefix-caching-hash-algo sha256_cbor`, because our
+  block-hash algorithm deviates from upstream's default by design.
 - **LMCache is an external Python package, not a vLLM component.** vLLM ships
   only the adapter glue; the cache engine, wire protocol and transport all live
   in the separate `lmcache` package. Interoperating from a pure-C++ engine is

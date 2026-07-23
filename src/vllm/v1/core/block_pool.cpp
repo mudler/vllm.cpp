@@ -136,10 +136,22 @@ std::optional<BlockHashWithGroupId> BlockPool::cache_partial_block(
       "BlockPool::cache_partial_block: partial primitives not yet ported");
 }
 
-void BlockPool::evict_blocks(const std::set<int>& /*block_ids*/) {
-  // DEFERRED 1:1 stub (KV-connector-driven cache eviction). See header.
-  throw std::runtime_error(
-      "BlockPool::evict_blocks: connector-driven eviction not yet ported");
+void BlockPool::evict_blocks(const std::set<int>& block_ids) {
+  // KV-OFFLOAD W4 (jointly with KV-BLOCK-POOL). 1:1 with block_pool.py:637-654:
+  // evict the given blocks from the PREFIX CACHE hash table only. Blocks with
+  // ref_cnt > 0 stay in the pool (not freed) — this drops only their cache
+  // reachability, exactly as _maybe_evict_cached_block does. Used when a
+  // connector reports blocks whose external copy has become authoritative.
+  for (int block_id : block_ids) {
+    if (block_id < 0 || block_id >= static_cast<int>(blocks.size())) {
+      // A connector should only report scheduler-allocated ids; upstream asserts
+      // (block_pool.py:648-652). We THROW rather than corrupt on an out-of-range
+      // id, which is the safe side.
+      throw std::out_of_range(
+          "BlockPool::evict_blocks: block_id out of range (connector bug)");
+    }
+    _maybe_evict_cached_block(&blocks[block_id]);
+  }
 }
 
 std::vector<BlockHashWithGroupId> BlockPool::_remove_cached_block_hashes(

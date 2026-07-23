@@ -411,8 +411,34 @@ TEST_CASE("BlockPool: deferred align / partial primitives throw") {
   CHECK_THROWS_AS(
       pool.cache_full_blocks(req, blocks, 0, 1, /*block_size=*/8, 0),
       std::runtime_error);
-  // cache_partial_block / evict_blocks -> DEFERRED stubs.
+  // cache_partial_block -> DEFERRED stub (partial primitives, KV-PREFIX-CACHE).
   CHECK_THROWS_AS(pool.cache_partial_block(req, &owned[0], 4, 0, 8),
                   std::runtime_error);
-  CHECK_THROWS_AS(pool.evict_blocks({1, 2}), std::runtime_error);
+}
+
+// KV-OFFLOAD W4: evict_blocks (connector-driven eviction) — now IMPLEMENTED 1:1
+// with block_pool.py:637-654. Evicts the named blocks from the prefix-cache hash
+// table only; an out-of-range id (a connector bug) throws on the safe side.
+TEST_CASE("BlockPool: evict_blocks removes named blocks from the prefix cache") {
+  init_none_hash(sha256_cbor, "seed42");
+  const int block_size = 4;
+  BlockPool pool(/*num_gpu_blocks=*/10, /*enable_caching=*/true, block_size);
+  Request req = MakeRequest("0", Iota(14), block_size);  // 3 full blocks
+  REQUIRE(req.block_hashes.size() == 3);
+
+  // Real pool-owned blocks (evict_blocks indexes the pool's own blocks[]).
+  auto blocks = pool.get_new_blocks(3);
+  pool.cache_full_blocks(req, blocks, /*num_cached=*/0, /*num_full=*/3,
+                         block_size, /*group=*/0);
+  REQUIRE(pool.cached_block_hash_to_block.size() == 3);
+  REQUIRE(pool.get_cached_block(req.block_hashes[0], {0}).has_value());
+
+  // Evicting the first block drops only its cache reachability; the rest stay.
+  pool.evict_blocks({blocks[0]->block_id});
+  CHECK_FALSE(pool.get_cached_block(req.block_hashes[0], {0}).has_value());
+  CHECK(pool.get_cached_block(req.block_hashes[1], {0}).has_value());
+  CHECK(pool.cached_block_hash_to_block.size() == 2);
+
+  // An out-of-range block id is a connector bug -> throw (never corrupt).
+  CHECK_THROWS_AS(pool.evict_blocks({99999}), std::out_of_range);
 }

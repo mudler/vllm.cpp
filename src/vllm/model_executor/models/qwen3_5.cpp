@@ -1564,7 +1564,7 @@ bool DirectFp4ScaleEnabled() {
 
 bool DirectFp4ScaleEligible(Dev d) {
   return DirectFp4ScaleEnabled() && NvfpCutlassEnabled() &&
-         d.q.device.type == vt::DeviceType::kCUDA;
+         vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported();
 }
 
 // vLLM's CompressedTensorsW4A4Nvfp4 retains alpha as a non-trainable device
@@ -1918,7 +1918,7 @@ DBuf SigmoidGateOProjD(Dev d, const Tensor& attn2d, const Tensor& gate2d,
   const int64_t T = attn2d.shape[0], K = attn2d.shape[1];
 #ifdef VT_CUTLASS_NVFP4
   if (fp4 && w.o_proj_fp8.Empty() && FuseSigmoidGateQuantEnabled() &&
-      d.q.device.type == vt::DeviceType::kCUDA && !w.o_proj_fp4.Empty() &&
+      vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported() && !w.o_proj_fp4.Empty() &&
       w.o_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled()) {
     DBuf ap(d, DType::kI8, {T, K / 2});
     const bool direct_scale = DirectFp4ScaleEligible(d);
@@ -2008,7 +2008,7 @@ FullAttnQkvOutput ProjectFullAttnQkv(Dev d, const FullAttnLayerWeights& w,
   // divisors are equal, then retain one independently-scaled GEMM per shard.
   const bool fuse_qkv =
       out.fp4 && FuseQuantOnceEnabled() &&
-      d.q.device.type == vt::DeviceType::kCUDA &&
+      vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported() &&
       w.q_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled() &&
       w.q_proj_fp4.input_global_scale_inv ==
           w.k_proj_fp4.input_global_scale_inv &&
@@ -2340,7 +2340,7 @@ DBuf SharedGateUpFusedMarlinD(Dev d, const Tensor& x, const Nvfp4Weight& gw,
 
 DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
-  if (d.q.device.type == vt::DeviceType::kCUDA && w.IsTrueW4A4() && TrueW4A4Enabled())
+  if (vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported() && w.IsTrueW4A4() && TrueW4A4Enabled())
     return MatmulNvfp4Fp4D(d, x, w, DType::kF32);
 #ifdef VT_MARLIN_NVFP4
   // NVFP4 W4A16 dense (shared expert / lm_head): the load-time-repacked Marlin
@@ -2367,7 +2367,7 @@ DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
 // DequantNvfp4ToBLayout fallback (no CPU MatmulNvfp4 kernel).
 DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
-  if (d.q.device.type == vt::DeviceType::kCUDA && w.IsTrueW4A4() && TrueW4A4Enabled())
+  if (vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported() && w.IsTrueW4A4() && TrueW4A4Enabled())
     return MatmulNvfp4Fp4D(d, x, w, DType::kBF16);
 #ifdef VT_MARLIN_NVFP4
   if (vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) && !w.IsTrueW4A4() && MarlinMoeEnabled() &&
@@ -2936,7 +2936,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // bf16 value; the variance reduction order is unchanged). 27B's out_proj is fp4, so
   // it never takes this branch.
   if (!w.out_proj_fp8.Empty() && GdnOutFp8FuseEnabled() && GlueFuseEnabled() &&
-      d.q.device.type == vt::DeviceType::kCUDA) {
+      vllm::platforms::GetPlatform(d.q.device.type).supports_fp8()) {
     DBuf a_fp8(d, DType::kI8, {T, value_dim});
     Tensor a_fp8_v = z_strided ? Reshape(a_fp8.t(), {T, Hv, Dv})
                                : Reshape(a_fp8.t(), {T * Hv, Dv});
@@ -3438,7 +3438,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // bf16 value; the variance reduction order is unchanged). 27B's out_proj is fp4, so
   // it never takes this branch.
   if (!w.out_proj_fp8.Empty() && GdnOutFp8FuseEnabled() && GlueFuseEnabled() &&
-      d.q.device.type == vt::DeviceType::kCUDA) {
+      vllm::platforms::GetPlatform(d.q.device.type).supports_fp8()) {
     DBuf a_fp8(d, DType::kI8, {T, value_dim});
     Tensor a_fp8_v = z_strided ? Reshape(a_fp8.t(), {T, Hv, Dv})
                                : Reshape(a_fp8.t(), {T * Hv, Dv});
@@ -4692,7 +4692,7 @@ std::optional<DBuf> InputLayernormFp8(Dev d, const Qwen3_5MoeLayerWeights& layer
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   Tensor dw_in = ResidentWeight(d, layer.input_layernorm, {H});
   float fp8_scale = 0.0F;
-  const bool fuse = FuseRmsNormFp8QuantEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
+  const bool fuse = FuseRmsNormFp8QuantEnabled() && vllm::platforms::GetPlatform(d.q.device.type).supports_fp8() &&
                     Fp8SharedInputScale(layer.is_linear_attention, layer.gdn, layer.attn,
                                         &fp8_scale);
   if (fuse) {
@@ -4806,7 +4806,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // QUANTIZE-ONCE for gate/up: shared activation dh + shared input_global_scale ->
   // one ScaledFp4Quant feeding both fp4 GEMMs (removes 1 redundant [T,H] quant).
   const bool fuse_gu =
-      fp4 && FuseQuantOnceEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
+      fp4 && FuseQuantOnceEnabled() && vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported() &&
       w.gate_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled() &&
       w.gate_proj_fp4.input_global_scale_inv == w.up_proj_fp4.input_global_scale_inv;
   std::optional<DBuf> gu_ap, gu_as;
@@ -4859,7 +4859,7 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
   // FUSED silu-mul + fp4-quant → down GEMM (no bf16 intermediate). Only when the
   // down_proj would have quantized its activation anyway (true-W4A4, CUDA) — same
   // guard as MatmulNvfp4Bf16D's MatmulNvfp4Fp4D route. Bit-identical to the else.
-  if (fp4 && FuseSiluQuantEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
+  if (fp4 && FuseSiluQuantEnabled() && vllm::platforms::GetPlatform(d.q.device.type).cutlass_fp4_supported() &&
       w.down_proj_fp4.IsTrueW4A4() && TrueW4A4Enabled()) {
     DBuf ap(d, DType::kI8, {T, I / 2});
 #ifdef VT_CUTLASS_NVFP4
@@ -5993,7 +5993,8 @@ struct Qwen3_5DecodeGraph::Impl {
     const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
     const bool env_on = (env == nullptr) || std::string(env) != "0";
     Backend& b = vt::GetBackend(queue.device.type);
-    enabled = env_on && queue.device.type == vt::DeviceType::kCUDA &&
+    enabled = env_on &&
+              vllm::platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
   }
   ~Impl() {
@@ -6195,7 +6196,8 @@ struct Qwen3_5DenseDecodeGraph::Impl {
     const char* env = std::getenv("VLLM_CPP_CUDAGRAPH");
     const bool env_on = (env == nullptr) || std::string(env) != "0";
     Backend& b = vt::GetBackend(queue.device.type);
-    enabled = env_on && queue.device.type == vt::DeviceType::kCUDA &&
+    enabled = env_on &&
+              vllm::platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
   }
   ~Impl() {

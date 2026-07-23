@@ -21,6 +21,16 @@ bool Platform::has_device_capability(int major, int minor) const {
   return cap.minor >= minor;
 }
 
+// interface.py:441-476 is_device_capability_family — is the device capability any
+// <major>.x? Mirrors upstream exactly: `(to_int() // 10) == (capability // 10)`,
+// so sm_120 and sm_121 both map to the 12.x family. False when there is no
+// queryable capability (CPU / get_device_capability() -> None).
+bool Platform::is_device_capability_family(int capability) const {
+  const DeviceCapability cap = get_device_capability();
+  if (!cap.present()) return false;
+  return (cap.to_int() / 10) == (capability / 10);
+}
+
 namespace {
 std::array<Platform*, vt::kNumDeviceTypes>& Registry() {
   static std::array<Platform*, vt::kNumDeviceTypes> registry{};

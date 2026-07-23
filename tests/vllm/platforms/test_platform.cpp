@@ -40,6 +40,20 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   CHECK_FALSE(cpu.get_device_capability().present());
   CHECK_FALSE(cpu.has_device_capability(0, 0));
   CHECK_FALSE(cpu.has_device_capability(9, 0));
+  // ...so it belongs to no capability family either (get_device_capability None).
+  CHECK_FALSE(cpu.is_device_capability_family(120));
+  CHECK_FALSE(cpu.is_device_capability_family(0));
+
+  // Portable capability predicates (work row S3): the CPU leg answers the base
+  // false to every one — exactly what a `device.type == kCUDA` gate returned on a
+  // CPU device, which is what makes the S3 conversions byte-identical here. None
+  // of the fp8/fp4/opaque-attention/integrated/static-graph fast paths exist on
+  // CPU.
+  CHECK_FALSE(cpu.supports_fp8());
+  CHECK_FALSE(cpu.cutlass_fp4_supported());
+  CHECK_FALSE(cpu.opaque_attention_op());
+  CHECK_FALSE(cpu.is_integrated_gpu());
+  CHECK_FALSE(cpu.support_static_graph_mode());
 
   // supported_dtypes order (bf16 default fallback first).
   const std::vector<DType> expected{DType::kBF16, DType::kF16, DType::kF32};
@@ -130,6 +144,62 @@ TEST_CASE("has_device_capability tests platform capability >= required") {
   CHECK(sm121.has_device_capability(8, 9));
   CHECK_FALSE(sm121.has_device_capability(12, 2));
   CHECK_FALSE(sm121.has_device_capability(13, 0));
+}
+
+TEST_CASE("is_device_capability_family matches any <major>.x (interface.py:441-476)") {
+  // sm_120 and sm_121 share the 12.x family; a different major does not.
+  FakeCapabilityPlatform sm121(DeviceCapability{12, 1});
+  CHECK(sm121.is_device_capability_family(120));  // 121//10 == 120//10 == 12
+  CHECK(sm121.is_device_capability_family(121));
+  CHECK(sm121.is_device_capability_family(129));
+  CHECK_FALSE(sm121.is_device_capability_family(100));  // 10.x
+  CHECK_FALSE(sm121.is_device_capability_family(89));    // 8.x
+
+  // The base capability predicates default to false on any platform that does not
+  // override them (mirrors upstream's `Platform` base) — the FakeCapabilityPlatform
+  // does not, so it answers false even though its device_type() is kCUDA. Proves
+  // the defaults live on the base and the CUDA ANSWERS live in the CUDA leg.
+  CHECK_FALSE(sm121.supports_fp8());
+  CHECK_FALSE(sm121.cutlass_fp4_supported());
+  CHECK_FALSE(sm121.opaque_attention_op());
+  CHECK_FALSE(sm121.support_static_graph_mode());
+}
+
+// The CUDA leg's capability ANSWERS, exercised only where a real CUDA platform is
+// registered (the dgx CUDA build / a GPU box). This is the executable proof that
+// each S3-converted gate is byte-identical: the predicate returns `true` on this
+// CUDA device — exactly what the former `device.type == kCUDA` returned — so the
+// 27B fp4-activation razor and the fp8-fused paths select the same kernels.
+TEST_CASE("CUDA leg capability values (GPU build only)") {
+  if (!HasPlatform(DeviceType::kCUDA)) return;  // CPU-only tier: nothing to assert
+  Platform& cu = GetPlatform(DeviceType::kCUDA);
+  REQUIRE(cu.get_device_capability().present());
+  const int cc = cu.get_device_capability().to_int();  // 121 on GB10 (sm_121)
+
+  // supports_fp8 == has_device_capability(8,9); GB10 (>= 8.9) -> true. This is
+  // what the converted fp8-fused gates now read; it must equal the old
+  // `device==kCUDA` (true) on this device.
+  CHECK(cu.supports_fp8() == cu.has_device_capability(8, 9));
+  CHECK(cu.supports_fp8());  // true on GB10
+
+  // cutlass_fp4_supported: CC in [100,130). GB10 (121) -> true. This is what the
+  // converted true-W4A4 fp4-activation gates (the 27B razor) now read.
+  CHECK(cu.cutlass_fp4_supported() == (cc >= 100 && cc < 130));
+  CHECK(cu.cutlass_fp4_supported());  // true on GB10
+
+  // opaque_attention_op / support_static_graph_mode: unconditional true on CUDA
+  // (cuda.py:570 / :662). support_static_graph_mode backs the converted decode
+  // graph-capture gates.
+  CHECK(cu.opaque_attention_op());
+  CHECK(cu.support_static_graph_mode());
+
+  // is_integrated_gpu: GB10 (Grace-Blackwell UMA) reports integrated; it is also
+  // unified memory, so the two agree on this box.
+  CHECK(cu.is_integrated_gpu() == cu.is_unified_memory());
+
+  // Family membership: GB10 is 12.x.
+  CHECK(cu.is_device_capability_family(120));
+  CHECK_FALSE(cu.is_device_capability_family(80));
 }
 
 // --- BACKEND-PLATFORM item 2: residency-policy CONSUMPTION -------------------

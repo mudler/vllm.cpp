@@ -347,9 +347,9 @@ all: across 287 of them, only 9 do, and the one matching our largest model
 mentions NVIDIA exactly **once** in 802 lines. We never built that shared library;
 we wrote those building blocks straight into the model files instead. The result
 is that our matching model file is 6,389 lines and mentions NVIDIA dozens of
-times, and that single file holds about **three-quarters** of all the
-NVIDIA-specific code left in the supposedly shared part of the project (**67**
-places today, down from the audit's 86 — see the automated count and step five
+times, and that single file holds most of all the
+NVIDIA-specific code left in the supposedly shared part of the project (**55**
+places today, down from the audit's 86 — see the automated count and the steps
 below).
 So a new accelerator today inherits the engine, the scheduler, the memory
 manager, the sampler and the fused-operation catalogue for free — and then meets
@@ -361,17 +361,22 @@ correct version — it simply stops. That last one is why the Apple and Vulkan
 backends need a handful of GPU programs before they can produce a single token,
 rather than needing them only to be fast. The audit records a ranked eight-step
 plan to close all of this. **Nothing was built or changed by the audit itself.**
-Since then, steps one, four and five landed (the automated count, the reference
-fallback, and a first shared "how is this weight format multiplied" object), and
-the count of NVIDIA-specific places dropped from 86 to **67**. Step six — moving
-the remaining compressed-weight fast-path switches off an explicit "is this
-NVIDIA" test — was assessed on 2026-07-23 and found to have **no byte-identical
-move available**: those specific switches pick a genuinely different numerical
-path on a non-NVIDIA device, so flipping them would change results rather than
-preserve them, and the reference fallback does not help because the relevant
-non-NVIDIA routines already exist. It therefore changed nothing (the count stays
-67) and its work was folded into steps three and seven. This is recorded honestly
-as a no-op rather than forced into a result-changing refactor.
+Since then, steps one, three, four and five landed (the automated count, a set of
+per-accelerator capability questions the model now asks its platform, the
+reference fallback, and a first shared "how is this weight format multiplied"
+object), and the count of NVIDIA-specific places dropped from 86 to **55**. Step
+six — moving the remaining compressed-weight fast-path switches off an explicit
+"is this NVIDIA" test *by asking the operation table* — was assessed on 2026-07-23
+and found to have **no byte-identical move available** that way: those switches
+bottom out at routines that also exist on the CPU, so the operation-table question
+answers "yes" there and would flip the CPU result. Its fix was therefore re-scoped
+into step three, which lands it correctly: instead of asking the operation table,
+the model asks the *platform* a capability question ("does this device have the
+FP8/FP4 fast path?"), which answers exactly what the old "is this NVIDIA" test did
+today (yes on our GB10, no everywhere else) — byte-for-byte identical, yet a future
+accelerator answers for itself. Twelve of those switches moved this way, dropping
+the count from 67 to 55, with every model gate proven bit-identical
+(27B 235/235, 35B 315/315, plus Coder, the dense 32B, OPT, DeepSeek-V2 and Llama).
 
 **The first of those eight steps is now in place (2026-07-22): the leakage is
 counted automatically on every push, and the count can only go down.** It had

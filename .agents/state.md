@@ -20111,3 +20111,52 @@ kMatmul 16 % + kMatmulBT 14 % = 80 %). G6 ports llama.cpp's Arm i8mm `nrc==2`
   (DSR 67 == baseline 67, no bucket moved), 24-case mutation suite 24/24,
   `check-agent-record.py` RC=0, `check-doc-checkpoint.py` RC=0. Not pushed —
   report FULL SHA to the caller.
+
+## 2026-07-23 — accelerator-seam `S3`: Platform capability fields → the byte-identical fp4/fp8 unlock (`CLAIM-BACKEND-SEAM-S3-1`, base `6648a79`, worktree `/home/mudler/_git/vllm.cpp-s3-platform-caps` branch `s3-platform-caps`)
+
+- **Outcome: LANDED. DSR 67 → 55** (`kcuda` 25→13; `is_cuda` 10; `cuda_inc` 0;
+  `vt_ifdef` 32), baseline lowered in the same commit; ratchet + 24-case mutation
+  suite green. This executes the re-scoping S6 §11.5 handed off: the genuine
+  byte-identical unlock for the deferred fp4/fp8 gates is the audit's own class-D
+  fix — **Platform capability fields**, NOT `OpProvider`.
+- **Why a capability succeeds where S6's `OpRegistered` failed.** A capability
+  predicate answers exactly what `device==kCUDA` returned — `true` on GB10 (the
+  only registered CUDA platform), the base `false` on every other platform — so on
+  every real device and build the swap is bit-for-bit the old test. S6's
+  `OpRegistered` was TRUE on `kCPU` for the dual-registered ops (flipping the CPU
+  path); a capability is `false` off CUDA, so it does not.
+- **The surface added** (mirrors vLLM `file:line`): `include/vllm/platforms/interface.h`
+  base-`false` virtuals + defs in `src/vllm/platforms/{cuda.cpp,platform.cpp}` —
+  `supports_fp8()`=`has_device_capability(8,9)` (`cuda.py:562`),
+  `cutlass_fp4_supported()`=CC∈[100,130) (`nvfp4_utils.py:56` + csrc
+  `nvfp4_scaled_mm_entry.cu:71`), `opaque_attention_op()`=true (`cuda.py:570`),
+  `is_integrated_gpu()`=`cudaDevAttrIntegrated` probe (`cuda.py:675`),
+  `support_static_graph_mode()`=true (`cuda.py:662`),
+  `is_device_capability_family(int)`=`(to_int()//10)==(cap//10)`
+  (`interface.py:441-476`). cpu/metal/vulkan legs INHERIT the base false (the
+  honest non-CUDA answer) — unedited, compile unchanged.
+- **12 gates converted in `qwen3_5.cpp`.** 7 fp4-activation (true-W4A4) →
+  `cutlass_fp4_supported()` at 1567, 1921, 2011, 2343, 2370, 4809, 4862; 3
+  fp8-fused → `supports_fp8()` at 2939 (+ 3441, GDN out_proj `kRmsNormGatedQuantFp8`)
+  and 4695 (`kRmsNormQuantFp8`); 2 decode-graph → `support_static_graph_mode()` at
+  5996 (MoE) and 6198 (dense) — the line already tested the backend-level
+  `b.SupportsGraphCapture()`; this converts the platform-POLICY half.
+- **LEFT (S7 / non-fp4-fp8), documented in §12.3.** The 9 remaining `kCUDA` + 3
+  `is_cuda()` in `qwen3_5.cpp` are residency/staging (704, 725, 2500, 5298 —
+  GB10 is unified yet takes the CUDA staging branch, so no `is_unified`/`is_integrated`
+  mirror), merged-projection layout / same-op-both-branches (1272, 2656, 2752,
+  2780, 3151), FA2 dtype-selection (3647, 3653) and MoE aux-stream (4292);
+  `dense_nvfp4_gemm.h`'s 3 DSR are `#ifdef VT_*` build gates (class G). No clean
+  byte-identical capability mirror ⇒ DSR 55, not lower.
+- **Gates (all green).** dgx CUDA build (`~/s3-build-src/build-cuda`, prod flags
+  `-DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a -DVLLM_CPP_TRITON=ON
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`) + dev CPU build clean `-Werror` 0
+  warnings. Standalone under `flock $HOME/gpu.lock`, one big-model at a time,
+  byte-identical: **27B 235/235 · 35B 315/315 · Qwen3-Coder 6/6 · Qwen3-dense-32B
+  16/16 · OPT 6/6 · DeepSeek-V2 8/8 · Llama 16/16** — no golden regenerated. The
+  27B razor (tok6) is unflipped: the fp4-activation gates via `cutlass_fp4_supported()`
+  selected the exact production kernel. `test_platform` CUDA-leg case proves each
+  predicate == the former `device==kCUDA` on GB10; seam/quant nets green on
+  CPU+CUDA; `compute-sanitizer memcheck` 0 errors on `test_platform` +
+  `test_ops_nvfp4_fp4`. `check-device-leakage.py` RC=0 (DSR 55 == baseline 55),
+  24-case mutation suite 24/24. Not pushed — report FULL SHA to the caller.

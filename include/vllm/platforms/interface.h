@@ -134,6 +134,60 @@ class Platform {
   // (major, minor)? False when the platform has no queryable capability (CPU).
   bool has_device_capability(int major, int minor) const;
 
+  // interface.py:441-476 is_device_capability_family — is the device capability
+  // any <major>.x (CUDA-13 "family" architecture semantics, e.g. 10.x, 11.x,
+  // 12.x)? Argument is a full capability int (e.g. 120), mirroring upstream's
+  // `(current_capability.to_int() // 10) == (capability // 10)`. False when the
+  // platform has no queryable capability (CPU). Non-virtual: derived from
+  // get_device_capability(), so a new platform answers it for free. Upstream uses
+  // it for ROCm gfx-family / CUDA sm-family gating; carried for the ROCm port.
+  bool is_device_capability_family(int capability) const;
+
+  // --- Portable capability predicates (interface.py:914-984,1051-1072) --------
+  //
+  // The capability half of the Platform seam the audit found "accidentally
+  // absent" (accelerator-seam-audit.md §"Our baseline" 1, row S3 / §11.5): the
+  // fp8/fp4/attention/graph capability queries our shared layer branches on TODAY
+  // via a raw `device.type == kCUDA` test. Making them Platform POLICY (which is
+  // where vLLM owns them) is what lets a `device==kCUDA` fast-path gate become a
+  // capability predicate: byte-identical today (CUDA answers true, every other
+  // platform answers the base false — exactly what `device==kCUDA` returned), yet
+  // genuinely DECOUPLING (a future accelerator with the fast path answers true for
+  // itself, with no edit at the call site). This is the audit's class-D fix, and
+  // it is where the deferred fp4/fp8 gates (S4 §9.3) convert, since their bespoke
+  // ops are dual-registered CPU+CUDA and so cannot use `vt::OpRegistered` (S6 §11).
+  //
+  // Base defaults mirror upstream's `Platform` base (all False); the CudaPlatform
+  // leg overrides with the vLLM-mirrored answers, and its definition lives in the
+  // DSR-allowlisted CUDA platform file, so the removed call-site `kCUDA` is a real
+  // decoupling drop, not a moved comment. These are POLICY on Platform, never
+  // implementation-selection — that stays `vt::OpProvider` (audit Risks/dec. 6).
+
+  // interface.py:933 + cuda.py:562 supports_fp8 — does this platform support FP8
+  // types? CUDA: has_device_capability(8,9); every other platform: false.
+  virtual bool supports_fp8() const { return false; }
+
+  // nvfp4_utils.py:56 cutlass_fp4_supported (+ csrc nvfp4_scaled_mm_entry.cu:71)
+  // — is the CUTLASS/FlashInfer NVFP4 true-W4A4 fp4-activation fast path available
+  // here? CUDA: compute capability in [100,130); every other platform: false.
+  virtual bool cutlass_fp4_supported() const { return false; }
+
+  // interface.py:977 + cuda.py:570 opaque_attention_op — is attention registered
+  // as one giant opaque custom op on this platform? CUDA: true; else false.
+  virtual bool opaque_attention_op() const { return false; }
+
+  // interface.py:914 + cuda.py:675 is_integrated_gpu — is the GPU an integrated
+  // (UMA) device sharing system memory with the CPU? CUDA: probed once at
+  // registration (torch is_integrated analogue, cudaDevAttrIntegrated); else
+  // false. Surface parity for the ROCm/memory-reporting port; unwired today.
+  virtual bool is_integrated_gpu() const { return false; }
+
+  // interface.py:1058 + cuda.py:662 support_static_graph_mode — does this platform
+  // support static (CUDA-graph) capture mode? CUDA: true; else false. Distinct
+  // from supports_graph_capture() (the backend-level capability); this is the
+  // platform POLICY gate, mirroring upstream.
+  virtual bool support_static_graph_mode() const { return false; }
+
   // interface.py:181-187 supported_dtypes. The FIRST entry is the default
   // fallback for the platform ("auto" dtype resolution).
   virtual std::vector<DType> supported_dtypes() const = 0;

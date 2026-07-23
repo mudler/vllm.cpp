@@ -1,18 +1,24 @@
 # Accelerator seam audit — do MLX/Vulkan ride vLLM's CUDA-path logic? (`BACKEND-SEAM-AUDIT`)
 
 Status: **AUDIT + PLAN (2026-07-22) with work rows `S1` LANDED (2026-07-22),
-`S4` LANDED-partial (2026-07-23), `S5` LANDED (2026-07-23) and `S6` ASSESSED —
-NO-OP / BLOCKED (2026-07-23).** `S6` — converting the S4-deferred fp4/fp8 device
-gates behind S5's reference tier — was assessed and lands **no byte-identical
-conversion**: **DSR stays 67, no baseline moved, no `src/`/`include/`/test file
-touched.** Every remaining deferred fp4/fp8 gate bottoms out at a bespoke op that
-is **dual-registered on CPU+CUDA** (not CUDA-only), so `vt::OpRegistered(op,dev)`
-is TRUE on `kCPU` and the class-A swap FLIPS the CPU reference/emulation path
-(two different numerics per device) — the task's own "irreducible residual" rule.
-S5's reference tier does not change this (it rescues a GetOp MISS; these CPU
-kernels are present natively). The genuine byte-identical unlock is `S3` (Platform
-capability fields mirroring `supports_fp8`/`cutlass_fp4_supported`) and/or `S7`
-(layer extraction), both out of S6's LinearMethod/OpProvider scope. See **§11**.
+`S4` LANDED-partial (2026-07-23), `S5` LANDED (2026-07-23), `S6` ASSESSED —
+NO-OP / BLOCKED (2026-07-23), and `S3` LANDED (2026-07-23).** `S3` — the Platform
+capability fields — is the byte-identical unlock `S6` §11 re-scoped the deferred
+fp4/fp8 gates onto: it mirrors vLLM's `supports_fp8`/`cutlass_fp4_supported`/
+`opaque_attention_op`/`is_integrated_gpu`/`support_static_graph_mode`/
+`is_device_capability_family` on our `Platform`, then replaces 12 deferred
+`device==kCUDA`/graph gates in `qwen3_5.cpp` with the capability predicate. A
+capability answers exactly what `device==kCUDA` returned (CUDA true / everything
+else the base false) — so unlike S6's `OpRegistered` route (TRUE on `kCPU` for the
+dual-registered ops) it is byte-identical AND it drops the textual `kCUDA` at the
+call site. **DSR 67 → 55** (`kcuda` 25→13; `is_cuda` 10; `cuda_inc` 0; `vt_ifdef`
+32), baseline lowered in the same commit; see **§12**. `S6` was assessed and lands
+**no byte-identical conversion under its own LinearMethod/OpProvider scope**: every
+deferred fp4/fp8 gate bottoms out at a bespoke op that is **dual-registered on
+CPU+CUDA**, so `vt::OpRegistered(op,dev)` is TRUE on `kCPU` and the class-A swap
+FLIPS the CPU reference/emulation path — the "irreducible residual" rule. S6
+therefore re-scoped the fix to `S3` (Platform capability fields — now landed) +
+`S7` (layer extraction); see **§11**.
 `S1` — the DSR
 ratchet — is implemented and CI-gated; see **§8** for the as-built metric, the
 re-derived baseline (**86**, not 94) and the re-verified class composition. `S4`
@@ -25,13 +31,13 @@ installs LAZILY as a negative-priority fallback on a UNIFIED-MEMORY device, so a
 op a backend lacks falls back to the portable CPU reference instead of throwing;
 see **§10** for the mechanism, the unified-memory safety proof, the verified
 finding that S5 does NOT byte-identically unblock the S4-deferred fp4/fp8 gates
-(those are `S6`, for which S5 is the required safety net), and the unchanged DSR
-(**67** — S5 is vt-runtime infrastructure, no shared-layer edit). `S2`,`S3`,`S6`,
-`S7`,`S8` remain plan only. Owners: `CLAIM-BACKEND-SEAM-AUDIT-1` (audit),
-`CLAIM-BACKEND-SEAM-S1-1` (`S1`), `CLAIM-BACKEND-SEAM-S4-1` (`S4`),
-`CLAIM-BACKEND-SEAM-S5-1` (`S5`).
-Row: **`BACKEND-SEAM-AUDIT`** (`ACTIVE` — `S1`+`S4`+`S5` landed,
-`S2`/`S3`/`S6`–`S8` owed). No other row moves.
+(those re-scoped to `S3`), and the unchanged DSR (**67** — S5 is vt-runtime
+infrastructure, no shared-layer edit). `S2`,`S7`,`S8` remain plan only. Owners:
+`CLAIM-BACKEND-SEAM-AUDIT-1` (audit), `CLAIM-BACKEND-SEAM-S1-1` (`S1`),
+`CLAIM-BACKEND-SEAM-S4-1` (`S4`), `CLAIM-BACKEND-SEAM-S5-1` (`S5`),
+`CLAIM-BACKEND-SEAM-S3-1` (`S3`).
+Row: **`BACKEND-SEAM-AUDIT`** (`ACTIVE` — `S1`+`S3`+`S4`+`S5` landed,
+`S2`/`S7`/`S8` owed; `S6` assessed no-op). No other row moves.
 
 Audit base: `72f5db2`; `S1` base: `18094ee`. Pins: vLLM
 `/home/mudler/_git/vllm` @ `e24d1b24`; llama.cpp `237ad9b96`; MLX `v0.29.3`.
@@ -361,7 +367,7 @@ claim; none is claimed by this audit.
 |---:|---|---|---:|---|---|
 | **1** | `S1` | **The DSR metric + CI ratchet — `DONE` 2026-07-22 (`CLAIM-BACKEND-SEAM-S1-1`).** [`scripts/check-device-leakage.py`](../../scripts/check-device-leakage.py) + [baseline](../../scripts/device-leakage-baseline.json) + CI job `device-leakage` + [24-case mutation suite](../../tests/scripts/test_device_leakage.py). Per-file/per-bucket allowlist with exact counts and reasons, `DSR-ALLOW` escape hatch, per-bucket AND total monotonic decrease | **86** (baseline, §8) | — | Cheapest row in the plan and it guards every row after it. **The counts already regrew 54→63 and 13→16 in days of well-executed work** — without this, every reduction below decays |
 | **2** | `S2` | **Reuse-study `W0b-1` residue** — **the include + hard-coded-queue half is ALREADY DONE on main** (§8.2): `model_loader.cpp` now calls `SelectQueue()`, and all four "unconditional" CUDA includes were in fact already `#ifdef`-guarded (an audit measurement error). Remaining: Metal `get_attn_backend_priority()` | 86 | `S1` | Class E and class F are both empty at `18094ee`; what is left is the Metal priority list, which the metric does not count |
-| **3** | `S3` | **Platform capability fields** mirroring `interface.py:914,933,977,1058,1133,1153` + `is_device_capability_family:466`; migrate the **3** remaining class-D sites off `is_cuda()`/`kCUDA` (`runner.cpp:702,1080`, `qwen3_5_dense_weights.cpp:115` — §8.3) | 83 | `S2` | Pure mirror of upstream, mechanical, and it is what makes ROCm a *config* rather than a port. Highest fidelity-per-line in the plan |
+| **3** | `S3` | **Platform capability fields — `DONE` 2026-07-23 (`CLAIM-BACKEND-SEAM-S3-1`).** Mirrors `interface.py:914,933,977,1058` (`is_integrated_gpu`/`supports_fp8`/`opaque_attention_op`/`support_static_graph_mode`) + `nvfp4_utils.py:56 cutlass_fp4_supported` + `is_device_capability_family:441` on our `Platform` (base false; the CudaPlatform leg answers vLLM's values); converts **12** deferred `device==kCUDA`/graph gates in `qwen3_5.cpp` to the capability predicate — 7 fp4-activation → `cutlass_fp4_supported()`, 3 fp8-fused → `supports_fp8()`, 2 decode-graph → `support_static_graph_mode()`. See **§12** | **55** (as-built §12; the S6-deferred class-D residency/stream/FA2-dtype/merged-layout sites stay for `S7`) | `S2` | Pure mirror of upstream, mechanical, and the byte-identical unlock `S6` re-scoped the fp4/fp8 gates onto (a capability answers false off-CUDA exactly as `device==kCUDA` did, where `OpRegistered` answered TRUE on `kCPU`). Makes ROCm a *config* rather than a port |
 | **4** | `S5` | **Portable reference tier — `DONE` 2026-07-23 (`CLAIM-BACKEND-SEAM-S5-1`).** On a UNIFIED-MEMORY device the CPU kernel installs LAZILY (on the first `GetOp` miss) as a negative-priority (`-1000`) `vt-cpu-ref` `OpProvider`, so an op the backend lacks falls back to the portable CPU reference instead of throwing. Mirrors `custom_op.py:138 forward_native`. See §10 | **67** (unchanged — vt-runtime infra, no shared-layer edit) | `S3` | **Changes the economics of every future backend**: op count stops being a correctness gate. Uses only the mechanism we already shipped. Gate = OPT on Metal token-exact with today's 10 kernels (Mac demo); hardware-free proof = `vt::Relu` on a fake unified device with zero native kernels, bit-identical to the CPU oracle |
 | **5** | `S4` | **`QuantizationConfig` + `LinearMethod`/`QuantMethod` — `DONE` (partial) 2026-07-23 (`CLAIM-BACKEND-SEAM-S4-1`).** The seam is built (`include/vllm/model_executor/layers/{quantization/base_config.h,linear.h,quantization/compressed_tensors/schemes/nvfp4.h}`, mirroring `base_config.py:20-229` + `linear.py:141-230`); the dense model routes through it (`qwen3.cpp` MLP), scheme chosen ONCE by the factory (replaces `IsNvfp4()` probe); the provably-byte-identical class-A/B device gates became `vt::OpRegistered` (§9). See §9 for the as-built DSR and the deferred fragile sites | **67** (as-built §9; not ~55 — the delicate 27B-W4A4/fp8-recipe sites are held for `S6`) | `S3` | **The missing coarse seam** (§5). Biggest single leakage reduction available, and the only one that makes a new accelerator's quant work O(1) per scheme instead of O(models) |
 | **6** | `S6` | **ASSESSED 2026-07-23 — NO-OP / BLOCKED (`CLAIM-BACKEND-SEAM-S6-1`, §11).** The S4-deferred fp4/fp8 gates convert **zero** sites byte-identically via S6's scoped seams (LinearMethod/QuantMethod, OpProvider-mediated dispatch, S5 reference tier): every one bottoms out at a **dual-registered** (CPU+CUDA) bespoke op, so `OpRegistered(op,dev)` is TRUE on `kCPU` and the class-A swap flips the CPU reference/emulation path — two different numerics per device (the plan's `OpRegistered(op)&&supports(shape)` fix is byte-identical only for **CUDA-only** ops, which S4 already took). The plan's `~37`/`46-site` target counted the S4-CONVERTED class-A sites and assumed the swap byte-identical; post-S4 the residue is CUDA-only-op-free. Genuine byte-identical unlock = `S3` (capability fields) + `S7` (extraction) | **67** (unchanged — no byte-identical conversion exists in scope; baseline NOT moved) | `S4`, `S5` | Its OpRegistered mechanism is byte-identical only for CUDA-only ops (all taken by S4). The deferred fp4/fp8 ops are dual-registered ⇒ the conversion is bit-changing on CPU. Re-scoped to `S3`+`S7` |
@@ -969,3 +975,98 @@ that lowers no baseline; the seam is as-good-as-it-gets on the quant gates
 without S3's capability fields or S7's extraction.** The DSR checker (67
 unchanged) + 24-case mutation suite stay green; no build or GPU gate is owed
 because no `src/`/`include/`/test byte changed.
+
+## 12. `S3` LANDED — Platform capability fields, the byte-identical fp4/fp8 unlock (2026-07-23, `CLAIM-BACKEND-SEAM-S3-1`)
+
+Base `6648a79` (`origin/main`). Executes exactly the re-scoping §11.5 handed off:
+add the portable capability surface the audit found "accidentally absent" (row 1
+of §"Our baseline" 1), then move the S4/S6-deferred fp4/fp8 `device==kCUDA` gates
+onto it. **DSR 67 → 55** (`kcuda` 25→13; `is_cuda` 10; `cuda_inc` 0; `vt_ifdef`
+32), baseline lowered in the same commit; the ratchet + its 24-case mutation suite
+stay green. Every SACRED gate byte-identical.
+
+### 12.1 The capability surface (mirrors vLLM `file:line` both sides)
+
+Added to `include/vllm/platforms/interface.h` (base defaults) with the CudaPlatform
+answers in `src/vllm/platforms/cuda.cpp` and the family predicate in
+`src/vllm/platforms/platform.cpp`:
+
+| Upstream | Ours (new) | CUDA leg value | base / non-CUDA |
+|---|---|---|---|
+| `interface.py:933` + `cuda.py:562` `supports_fp8` | `Platform::supports_fp8()` | `has_device_capability(8,9)` → true on GB10 | `false` |
+| `nvfp4_utils.py:56` `cutlass_fp4_supported` + csrc `nvfp4_scaled_mm_entry.cu:71` | `Platform::cutlass_fp4_supported()` | CC in `[100,130)` → true on GB10 (121) | `false` |
+| `interface.py:977` + `cuda.py:570` `opaque_attention_op` | `Platform::opaque_attention_op()` | `true` | `false` |
+| `interface.py:914` + `cuda.py:675` `is_integrated_gpu` | `Platform::is_integrated_gpu()` | `cudaDevAttrIntegrated` probed at registration (GB10 = true) | `false` |
+| `interface.py:1058` + `cuda.py:662` `support_static_graph_mode` | `Platform::support_static_graph_mode()` | `true` | `false` |
+| `interface.py:441-476` `is_device_capability_family` | `Platform::is_device_capability_family(int)` | `(cap.to_int()//10)==(cap//10)` | `false` (no capability) |
+
+The base defaults mirror upstream's `Platform` base (all `False`); cpu/metal/vulkan
+INHERIT them (the honest non-CUDA answer — none has an fp8/fp4/graph fast path
+today), so no cpu/metal/vulkan leg was edited and they compile unchanged. The
+definitions live in the DSR-allowlisted CUDA platform file, so the removed
+call-site `kCUDA` is a real decoupling drop, not a moved token. These are POLICY on
+`Platform`, never implementation-selection (that stays `OpProvider`, Risks/dec. 6).
+
+### 12.2 The 12 converted gates, and why each is byte-identical
+
+A capability predicate answers **exactly** what `device==kCUDA` did — `true` on
+GB10 (the only registered CUDA platform), the base `false` on every other platform
+— so on every real device and every build the swap is bit-for-bit the old test.
+This is where S3 succeeds and S6's `OpRegistered` route failed: `OpRegistered` was
+TRUE on `kCPU` for the dual-registered ops (flipping the CPU path), whereas the
+capability is `false` off CUDA. Converted in `qwen3_5.cpp` (predicate in parens):
+
+- **7 fp4-activation** (true-W4A4 fp4 path; `cutlass_fp4_supported()`):
+  `DirectFp4ScaleEligible` (1567), `SigmoidGateOProjD` fuse (1921),
+  `fuse_qkv` (2011), `MatmulNvfp4F32D`/`MatmulNvfp4Bf16D` true-W4A4 (2343, 2370),
+  `fuse_gu` (4809), `FuseSiluQuant` down-proj (4862). On GB10 `cutlass_fp4_supported()`
+  is `true` (cap 121 ∈ [100,130)); the 27B razor takes the identical fp4 kernel.
+- **3 fp8-fused** (`supports_fp8()`): the two GDN out_proj `kRmsNormGatedQuantFp8`
+  fuse gates (2939, 3441) and the `kRmsNormQuantFp8` input-layernorm fuse (4695).
+  On GB10 `supports_fp8()` is `true` (cap 121 ≥ 8.9).
+- **2 decode-graph** (`support_static_graph_mode()`): the MoE (5996) and dense
+  (6198) `Qwen3_5DecodeGraph`/`Qwen3_5DenseDecodeGraph` capture gates. The line
+  already tests `b.SupportsGraphCapture()` (the backend capability); this converts
+  the platform-POLICY half. On GB10 `support_static_graph_mode()` is
+  unconditionally `true`.
+
+Proven executable: `test_platform`'s CUDA-leg case asserts, on GB10, that each
+predicate returns the value above (`supports_fp8`/`cutlass_fp4_supported`/
+`opaque_attention_op`/`support_static_graph_mode` all `true`, `is_integrated_gpu ==
+is_unified_memory`, `is_device_capability_family(120)` true / `(80)` false).
+
+### 12.3 What was deliberately LEFT (S7 / non-fp4-fp8), and why
+
+The remaining 9 `kCUDA` + 3 `is_cuda()` in `qwen3_5.cpp` are NOT fp4/fp8 capability
+questions and have no clean byte-identical capability mirror — converting them
+would either rename `is_cuda()` (a rubber stamp, audit Risk 3 / mutant M18) or flip
+behaviour:
+
+- **Residency / staging** (704, 725 `is_cuda()`; 2500 `!= kCUDA`; 5298 `is_cuda()`
+  precondition): "does this device need an explicit host→device buffer." GB10 is
+  UNIFIED yet still takes the CUDA staging branch, so neither `is_unified_memory()`
+  nor `is_integrated_gpu()` matches it — this is CUDA memory-model policy, `S7`.
+- **Merged-projection layout / same-op-both-branches** (1272, 2656, 2752, 2780,
+  3151): a layout choice with the SAME op on both arms; `S7` layer extraction.
+- **FA2 dtype-selection** (3647, 3653) and **MoE aux-stream overlap** (4292): class
+  D dtype/stream policy, not an fp4/fp8 capability.
+
+`dense_nvfp4_gemm.h`'s 3 remaining DSR are all `#ifdef VT_*` build gates (class G,
+"tracked, not scheduled"), so it was not touched. This is why the as-built DSR is
+**55**, not lower.
+
+### 12.4 Gates (all green)
+
+Clean CUDA `-Werror` **0 warnings** (dgx `~/s3-build-src/build-cuda`, prod flags
+`-DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a -DVLLM_CPP_TRITON=ON
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`) + clean CPU `-Werror`. Standalone
+under `flock $HOME/gpu.lock`, one big-model test at a time: **27B 235/235 · 35B
+315/315 · Qwen3-Coder 6/6 · Qwen3-dense-32B 16/16 · OPT 6/6 · DeepSeek-V2 8/8 ·
+Llama 16/16** — all byte-identical (each predicate returns exactly the former
+`device==kCUDA`), no golden regenerated (the change touches no golden). New
+`test_platform` CUDA-leg + `is_device_capability_family` cases green on CPU + CUDA;
+the seam/quant nets (`test_linear_method`, `test_op_provider`, `test_reference_tier`,
+`test_backend_cross_device`, nvfp4/fp8/ct/moe/gguf) green. `compute-sanitizer
+memcheck` **0 errors** on `test_platform` (the new registrar/capability device
+path) and `test_ops_nvfp4_fp4` (the fp4 kernels the converted gates select). DSR
+checker (**55**, baseline lowered same commit) + 24-case mutation suite green.

@@ -322,6 +322,31 @@ mirroring `supports_fp8`/`cutlass_fp4_supported`) + `S7` (layer extraction). Bar
 checkers on the dev box: `check-device-leakage.py` RC=0 (DSR 67 == baseline 67), 24-case
 mutation suite 24/24, `check-agent-record.py` + `check-doc-checkpoint.py` RC=0.
 
+### Accelerator-seam `S3` — Platform capability fields, the byte-identical fp4/fp8 unlock (2026-07-23, `CLAIM-BACKEND-SEAM-S3-1`) — byte-identical, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE — structural/decoupling refactor, no
+performance claim.** `S3` mirrors vLLM's `Platform` capability surface
+(`interface.py:914,933,977,1058` + `nvfp4_utils.py:56 cutlass_fp4_supported` +
+`is_device_capability_family:441`) as base-`false` virtuals with CudaPlatform
+answers, then replaces **12** deferred `device==kCUDA`/graph gates in `qwen3_5.cpp`
+with the capability predicate (7 fp4-activation → `cutlass_fp4_supported()`, 3
+fp8-fused → `supports_fp8()`, 2 decode-graph → `support_static_graph_mode()`). This
+is the byte-identical move `S6` §11 re-scoped the fp4/fp8 gates onto: a capability
+answers the base `false` off CUDA — exactly what `device==kCUDA` returned — where
+S6's `OpRegistered` answered TRUE on `kCPU` for the dual-registered ops. The
+selected kernels are unchanged (proven on GB10: `cutlass_fp4_supported()`/
+`supports_fp8()`/`support_static_graph_mode()` all `true`), so **no re-grid, no
+perf number is owed or claimed.** **DSR 67 → 55** (`kcuda` 25→13); baseline lowered
+in the same commit; ratchet + 24-case mutation suite green. Gates (dgx CUDA + dev
+CPU, clean `-Werror` **0 warnings**; standalone under `flock $HOME/gpu.lock`, one
+big-model at a time): **byte-identical 27B 235/235 · 35B 315/315 · Qwen3-Coder 6/6
+· Qwen3-dense-32B 16/16 · OPT 6/6 · DeepSeek-V2 8/8 · Llama 16/16**, no golden
+regenerated. `test_platform` CUDA-leg + family cases green; seam/quant nets green;
+`compute-sanitizer memcheck` **0 errors** on `test_platform` + `test_ops_nvfp4_fp4`.
+The residual class-D residency/stream/FA2-dtype/merged-layout sites and the
+`#ifdef VT_*` build gates in `dense_nvfp4_gemm.h` were LEFT (no clean byte-identical
+capability mirror — that is `S7`), which is why the as-built DSR is **55**, not lower.
+
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
 reruns on the full production default set (async + vendored Triton GDN decode cubin

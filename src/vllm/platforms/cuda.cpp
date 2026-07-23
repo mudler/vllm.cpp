@@ -17,7 +17,8 @@ namespace {
 
 class CudaPlatform final : public Platform {
  public:
-  CudaPlatform(int cc_major, int cc_minor) : cap_{cc_major, cc_minor} {}
+  CudaPlatform(int cc_major, int cc_minor, bool integrated)
+      : cap_{cc_major, cc_minor}, integrated_{integrated} {}
 
   DeviceType device_type() const override { return DeviceType::kCUDA; }
   Backend& backend() const override { return vt::GetBackend(DeviceType::kCUDA); }
@@ -25,6 +26,37 @@ class CudaPlatform final : public Platform {
   // cuda.py get_device_capability: torch.cuda.get_device_capability probed once
   // at registration (device 0 only for now, matching the backend registrar).
   DeviceCapability get_device_capability() const override { return cap_; }
+
+  // --- Portable capability predicates (work row S3) --------------------------
+  // Faithful ports of the CudaPlatform overrides in vllm/platforms/cuda.py @ pin
+  // e24d1b24. Each returns exactly what a raw `device.type == kCUDA` returned at
+  // the shared-layer gates S3 converts to it (true on this GB10/sm_121 CUDA leg,
+  // and the base false on every other platform) — so the conversion is
+  // byte-identical today, while a future accelerator answers for itself.
+
+  // cuda.py:562 supports_fp8 -> has_device_capability(89). GB10 (sm_121) is >= 8.9
+  // -> true; this is the fp8-fused-path gate the S4-deferred sites (§9.3) use.
+  bool supports_fp8() const override { return has_device_capability(8, 9); }
+
+  // nvfp4_utils.py:56 cutlass_fp4_supported -> is_cuda() && the csrc CC check
+  // (nvfp4_scaled_mm_entry.cu:71: CC in [100,130) with the SM100/SM120 NVFP4
+  // kernels compiled in). GB10 (cap 12.1 -> 121) qualifies -> true; the true-W4A4
+  // fp4-activation gate the 27B razor takes on this device.
+  bool cutlass_fp4_supported() const override {
+    const int cc = cap_.to_int();
+    return cc >= 100 && cc < 130;
+  }
+
+  // cuda.py:570 opaque_attention_op -> True.
+  bool opaque_attention_op() const override { return true; }
+
+  // cuda.py:675 is_integrated_gpu -> torch is_integrated; the C++ analogue is
+  // cudaDevAttrIntegrated, probed once at registration. GB10 (Grace-Blackwell UMA)
+  // reports integrated. Surface parity for the ROCm/memory-reporting port.
+  bool is_integrated_gpu() const override { return integrated_; }
+
+  // cuda.py:662 support_static_graph_mode -> True (CUDA graph capture mode).
+  bool support_static_graph_mode() const override { return true; }
 
   // interface.py:181-187 supported_dtypes order (bf16 default fallback).
   std::vector<DType> supported_dtypes() const override {
@@ -78,6 +110,7 @@ class CudaPlatform final : public Platform {
 
  private:
   DeviceCapability cap_;
+  bool integrated_ = false;
 };
 
 // Registers kCUDA during static init (registration must complete before main()
@@ -97,13 +130,20 @@ struct Registrar {
     if (cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0) != cudaSuccess) {
       return;
     }
+    // is_integrated_gpu (cuda.py:675 torch is_integrated) — probe once here, the
+    // same place the compute capability is probed. A query failure defaults to
+    // false (non-integrated), the conservative answer.
+    int integrated = 0;
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0) != cudaSuccess) {
+      integrated = 0;
+    }
     // GCC 13 false-positive: -Wdangling-pointer mis-flags a static local with a
     // vtable constructed from automatic ints, though CudaPlatform copies both
     // into cap_ by value (no pointer/reference to major/minor is retained). The
     // static outlives the registrar as RegisterPlatform requires.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdangling-pointer"
-    static CudaPlatform platform(major, minor);  // device 0 only for now
+    static CudaPlatform platform(major, minor, integrated != 0);  // device 0 only
 #pragma GCC diagnostic pop
     RegisterPlatform(DeviceType::kCUDA, &platform);
   }

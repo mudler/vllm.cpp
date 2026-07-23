@@ -188,17 +188,23 @@ TEST_CASE("Metal registers the W0 op set and NOT the unimplemented rest") {
                       vt::OpId::kGreedyArgmax}) {
     CHECK(vt::OpRegistered(op, DeviceType::kMETAL));
   }
+  // Work row M3b — the RoPE ops Qwen3-dense (`Qwen3ForCausalLM`) needs beyond OPT's
+  // set. The DEFAULT (VT_QWEN3_ROPE_CACHE) path builds the per-step cache
+  // (kRopeCosSinCache) and applies it (kRopeFromCache); kRopeNeox serves the
+  // cache-off opt-out.
+  for (vt::OpId op : {vt::OpId::kRopeCosSinCache, vt::OpId::kRopeFromCache,
+                      vt::OpId::kRopeNeox}) {
+    CHECK(vt::OpRegistered(op, DeviceType::kMETAL));
+  }
   // Still stubbed, and asserted so a later row cannot quietly claim more than it
-  // implements: the quant tier, the GDN/MoE families, RoPE (which is what
-  // Qwen3-dense needs on top of this set — work row M3b), and every sampler op
-  // except greedy argmax. A partial backend is a supported state: vt::GetOp
-  // throws on lookup.
-  for (vt::OpId op : {vt::OpId::kRopeFromCache, vt::OpId::kRopeCosSinCache,
-                      vt::OpId::kRandomSample, vt::OpId::kComputeProbs,
-                      vt::OpId::kMoeCombine}) {
+  // implements: the quant tier, the GDN/MoE families, and every sampler op except
+  // greedy argmax. A partial backend is a supported state: vt::GetOp throws on
+  // lookup.
+  for (vt::OpId op : {vt::OpId::kRandomSample, vt::OpId::kComputeProbs,
+                      vt::OpId::kMoeCombine, vt::OpId::kGdnStateGather}) {
     CHECK_FALSE(vt::OpRegistered(op, DeviceType::kMETAL));
   }
-  CHECK_THROWS_AS(vt::GetOp(vt::OpId::kRopeFromCache, DeviceType::kMETAL),
+  CHECK_THROWS_AS(vt::GetOp(vt::OpId::kMoeCombine, DeviceType::kMETAL),
                   std::runtime_error);
 }
 
@@ -856,5 +862,180 @@ TEST_CASE("Metal kPagedAttention matches the CPU oracle within NMSE <= 5e-4") {
           << " (bar 5e-4; the online-softmax form vs the materialized 3-pass "
              "reference, so bit-exactness is NOT claimed)");
   CHECK(nmse <= 5e-4);
+  metal.DestroyQueue(q);
+}
+
+// M3b — the two ops Qwen3-dense adds to OPT's Metal set. Both compute f32
+// transcendentals in-kernel (Metal has no double), so the bar is NMSE <= 5e-4 vs
+// the CPU oracle, NOT bit-exactness — the same posture as kPagedAttention.
+TEST_CASE("Metal kRopeNeox matches the CPU oracle within NMSE <= 5e-4") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+  const int64_t t = 7, hq = 4, hk = 2, dh = 16, rot = 16;
+  const float base = 1.0e6f;
+
+  std::mt19937 rng(23);
+  std::uniform_real_distribution<float> ud(-2.0f, 2.0f);
+  std::vector<float> qf(static_cast<size_t>(t * hq * dh)), kf(static_cast<size_t>(t * hk * dh));
+  for (auto& x : qf) x = Bf16RT(ud(rng));
+  for (auto& x : kf) x = Bf16RT(ud(rng));
+  const std::vector<uint16_t> qb = PackBf16(qf), kb = PackBf16(kf);
+  // A spread of positions incl. larger angles (worst case for f32 range reduction).
+  std::vector<int32_t> pos{0, 1, 2, 5, 9, 13, 20};
+  REQUIRE(static_cast<int64_t>(pos.size()) == t);
+
+  MBuf dq(metal, q, qb.size() * 2), dk(metal, q, kb.size() * 2), dpos(metal, q, pos.size() * 4);
+  dq.Upload(qb.data());
+  dk.Upload(kb.data());
+  dpos.Upload(pos.data());
+  metal.Synchronize(q);
+
+  Tensor tq = Tensor::Contiguous(dq.ptr(), vt::DType::kBF16, d, {t, hq, dh});
+  Tensor tk = Tensor::Contiguous(dk.ptr(), vt::DType::kBF16, d, {t, hk, dh});
+  Tensor tpos = Tensor::Contiguous(dpos.ptr(), vt::DType::kI32, d, {t});
+  vt::ResetOpProviderStats(vt::OpId::kRopeNeox, DeviceType::kMETAL);
+  vt::RopeNeox(q, tq, tk, tpos, vt::RopeArgs{base, static_cast<int>(rot)});
+  metal.Synchronize(q);
+  CHECK(DeclinesAfter(vt::OpId::kRopeNeox) == 0);
+
+  std::vector<uint16_t> gq(qb.size()), gk(kb.size());
+  dq.Download(gq.data());
+  dk.Download(gk.data());
+  metal.Synchronize(q);
+  std::vector<float> got;
+  got.reserve(gq.size() + gk.size());
+  for (uint16_t x : gq) got.push_back(vt::BF16ToF32(x));
+  for (uint16_t x : gk) got.push_back(vt::BF16ToF32(x));
+  for (float x : got) REQUIRE(std::isfinite(x));
+
+  std::vector<uint16_t> qcpu = qb, kcpu = kb;
+  std::vector<int32_t> pcpu = pos;
+  Queue cq{Device{DeviceType::kCPU, 0}, nullptr};
+  const Device cd{DeviceType::kCPU, 0};
+  Tensor cq_t = Tensor::Contiguous(qcpu.data(), vt::DType::kBF16, cd, {t, hq, dh});
+  Tensor ck_t = Tensor::Contiguous(kcpu.data(), vt::DType::kBF16, cd, {t, hk, dh});
+  Tensor cp_t = Tensor::Contiguous(pcpu.data(), vt::DType::kI32, cd, {t});
+  vt::RopeNeox(cq, cq_t, ck_t, cp_t, vt::RopeArgs{base, static_cast<int>(rot)});
+  std::vector<float> ref;
+  ref.reserve(qcpu.size() + kcpu.size());
+  for (uint16_t x : qcpu) ref.push_back(vt::BF16ToF32(x));
+  for (uint16_t x : kcpu) ref.push_back(vt::BF16ToF32(x));
+
+  const double nmse = Nmse(got, ref);
+  MESSAGE("Metal kRopeNeox NMSE vs the CPU oracle = " << nmse
+          << " (bar 5e-4; f32 pow/cos/sin vs the reference's fp64, so bit-exactness "
+             "is NOT claimed)");
+  CHECK(nmse <= 5e-4);
+  metal.DestroyQueue(q);
+}
+
+TEST_CASE("Metal kRopeCosSinCache matches the CPU oracle within NMSE <= 5e-4") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+  const int64_t t = 7, rot = 16;
+  const float base = 1.0e6f;
+  std::vector<int32_t> pos{0, 1, 2, 5, 9, 13, 20};
+  REQUIRE(static_cast<int64_t>(pos.size()) == t);
+
+  MBuf dcs(metal, q, static_cast<size_t>(t * rot) * 4), dpos(metal, q, pos.size() * 4);
+  dcs.PoisonNaN(4);
+  dpos.Upload(pos.data());
+  metal.Synchronize(q);
+
+  Tensor tcs = Tensor::Contiguous(dcs.ptr(), vt::DType::kF32, d, {t, rot});
+  Tensor tpos = Tensor::Contiguous(dpos.ptr(), vt::DType::kI32, d, {t});
+  vt::ResetOpProviderStats(vt::OpId::kRopeCosSinCache, DeviceType::kMETAL);
+  vt::RopeCosSinCache(q, tcs, tpos, vt::RopeArgs{base, static_cast<int>(rot)});
+  metal.Synchronize(q);
+  CHECK(DeclinesAfter(vt::OpId::kRopeCosSinCache) == 0);
+
+  std::vector<float> got(static_cast<size_t>(t * rot));
+  dcs.Download(got.data());
+  metal.Synchronize(q);
+  for (float x : got) REQUIRE(std::isfinite(x));
+
+  std::vector<int32_t> pcpu = pos;
+  std::vector<float> ref(static_cast<size_t>(t * rot), 0.0f);
+  Queue cq{Device{DeviceType::kCPU, 0}, nullptr};
+  const Device cd{DeviceType::kCPU, 0};
+  Tensor ccs = Tensor::Contiguous(ref.data(), vt::DType::kF32, cd, {t, rot});
+  Tensor cp_t = Tensor::Contiguous(pcpu.data(), vt::DType::kI32, cd, {t});
+  vt::RopeCosSinCache(cq, ccs, cp_t, vt::RopeArgs{base, static_cast<int>(rot)});
+
+  const double nmse = Nmse(got, ref);
+  MESSAGE("Metal kRopeCosSinCache NMSE vs the CPU oracle = " << nmse << " (bar 5e-4)");
+  CHECK(nmse <= 5e-4);
+  metal.DestroyQueue(q);
+}
+
+// M3b — kRopeFromCache is the op Qwen3-dense actually dispatches on the default
+// path (VT_QWEN3_ROPE_CACHE ON). It reads cos|sin from the cache (no in-kernel
+// transcendentals) and only rotates, so it is BIT-EXACT vs the CPU oracle.
+TEST_CASE("Metal kRopeFromCache is BIT-EXACT vs the CPU oracle") {
+  Backend& metal = vt::GetBackend(DeviceType::kMETAL);
+  Queue q = metal.CreateQueue();
+  const Device d{DeviceType::kMETAL, 0};
+  const int64_t t = 7, hq = 4, hk = 2, dh = 16, rot = 16, half = rot / 2;
+  const int64_t P = 40;  // cache rows (positions)
+  const float base = 1.0e6f;
+
+  std::mt19937 rng(29);
+  std::uniform_real_distribution<float> ud(-2.0f, 2.0f);
+  std::vector<float> qf(static_cast<size_t>(t * hq * dh)), kf(static_cast<size_t>(t * hk * dh));
+  for (auto& x : qf) x = Bf16RT(ud(rng));
+  for (auto& x : kf) x = Bf16RT(ud(rng));
+  // Build a bf16 cos|sin cache [P, rot] the same way RopeCosSinCache does (fp64
+  // angle math), so this test isolates the APPLY op from the cache-build op.
+  std::vector<float> cache_f(static_cast<size_t>(P * rot));
+  for (int64_t p = 0; p < P; ++p) {
+    for (int64_t i = 0; i < half; ++i) {
+      const double freq = std::pow(static_cast<double>(base), -2.0 * static_cast<double>(i) / rot);
+      const double angle = static_cast<double>(p) * freq;
+      cache_f[static_cast<size_t>(p * rot + i)] = Bf16RT(static_cast<float>(std::cos(angle)));
+      cache_f[static_cast<size_t>(p * rot + half + i)] = Bf16RT(static_cast<float>(std::sin(angle)));
+    }
+  }
+  const std::vector<uint16_t> qb = PackBf16(qf), kb = PackBf16(kf), cb = PackBf16(cache_f);
+  // Identity row index (Qwen3's si.rope_row_idx): token t reads cache row t.
+  std::vector<int32_t> pos{0, 1, 2, 3, 4, 5, 6};
+  REQUIRE(static_cast<int64_t>(pos.size()) == t);
+
+  MBuf dq(metal, q, qb.size() * 2), dk(metal, q, kb.size() * 2),
+      dpos(metal, q, pos.size() * 4), dcache(metal, q, cb.size() * 2);
+  dq.Upload(qb.data());
+  dk.Upload(kb.data());
+  dpos.Upload(pos.data());
+  dcache.Upload(cb.data());
+  metal.Synchronize(q);
+
+  Tensor tq = Tensor::Contiguous(dq.ptr(), vt::DType::kBF16, d, {t, hq, dh});
+  Tensor tk = Tensor::Contiguous(dk.ptr(), vt::DType::kBF16, d, {t, hk, dh});
+  Tensor tpos = Tensor::Contiguous(dpos.ptr(), vt::DType::kI32, d, {t});
+  Tensor tcache = Tensor::Contiguous(dcache.ptr(), vt::DType::kBF16, d, {P, rot});
+  vt::ResetOpProviderStats(vt::OpId::kRopeFromCache, DeviceType::kMETAL);
+  vt::RopeFromCache(q, tq, &tk, tpos, tcache, vt::RopeArgs{base, static_cast<int>(rot)});
+  metal.Synchronize(q);
+  CHECK(DeclinesAfter(vt::OpId::kRopeFromCache) == 0);
+
+  std::vector<uint16_t> gq(qb.size()), gk(kb.size());
+  dq.Download(gq.data());
+  dk.Download(gk.data());
+  metal.Synchronize(q);
+
+  std::vector<uint16_t> qcpu = qb, kcpu = kb, ccpu = cb;
+  std::vector<int32_t> pcpu = pos;
+  Queue cq{Device{DeviceType::kCPU, 0}, nullptr};
+  const Device cd{DeviceType::kCPU, 0};
+  Tensor cq_t = Tensor::Contiguous(qcpu.data(), vt::DType::kBF16, cd, {t, hq, dh});
+  Tensor ck_t = Tensor::Contiguous(kcpu.data(), vt::DType::kBF16, cd, {t, hk, dh});
+  Tensor cp_t = Tensor::Contiguous(pcpu.data(), vt::DType::kI32, cd, {t});
+  Tensor cc_t = Tensor::Contiguous(ccpu.data(), vt::DType::kBF16, cd, {P, rot});
+  vt::RopeFromCache(cq, cq_t, &ck_t, cp_t, cc_t, vt::RopeArgs{base, static_cast<int>(rot)});
+
+  // No in-kernel transcendental and no reduction, so the bits must be IDENTICAL.
+  CHECK(gq == qcpu);
+  CHECK(gk == kcpu);
   metal.DestroyQueue(q);
 }

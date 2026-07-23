@@ -55,19 +55,20 @@ class MetalPlatform final : public Platform {
   // row M3a). Metal is a PARTIAL backend — 15 of 75 ops — so the honest answer
   // is an explicit allow-list, not `true`.
   //
-  // OPT-125m (`OPTForCausalLM`) is the whole list today, and that is a MEASURED
-  // choice rather than an arbitrary one: the reuse study found all four OPT TUs
-  // contain zero CUDA references and that OPT needs the fewest new kernels of
-  // any model in the tree. Anything else pointed at Metal falls back to the CPU
-  // reference in model_loader.cpp::SelectQueue and runs correctly, just slowly —
-  // which is strictly better than dying inside a kernel bind.
-  //
-  // Qwen3-dense (`Qwen3ForCausalLM`) is the NEXT entry and is deliberately NOT
-  // here yet: it additionally needs kRopeCosSinCache + kRopeFromCache, which are
-  // unregistered (work row M3b). Adding an architecture to this list without its
-  // kernels would recreate exactly the silent-failure mode the seam removes.
+  // OPT-125m (`OPTForCausalLM`, M3a) was the first entry; Qwen3-dense
+  // (`Qwen3ForCausalLM`, M3b) is the second — the model MLX also runs, so the
+  // native-competitor benchmark arms are comparable. Each was added only once its
+  // ops were actually registered: Qwen3-dense needs kRopeCosSinCache +
+  // kRopeFromCache (the DEFAULT VT_QWEN3_ROPE_CACHE path: build the per-step cache,
+  // then apply it) plus kRopeNeox (the cache-off opt-out) on top of OPT's set, and
+  // all three are now registered in src/vt/metal/metal_ops.mm. Anything else
+  // pointed at Metal falls back to the CPU reference in
+  // model_loader.cpp::SelectQueue and runs correctly, just slowly — which is
+  // strictly better than dying inside a kernel bind. Adding an architecture here
+  // without its kernels would recreate exactly the silent-failure mode the seam
+  // removes.
   bool supports_model_architecture(std::string_view architecture) const override {
-    return architecture == "OPTForCausalLM";
+    return architecture == "OPTForCausalLM" || architecture == "Qwen3ForCausalLM";
   }
 
   // Attention-backend priority (W0b-1 item 4, closed by work row M3a). The W0

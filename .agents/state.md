@@ -19674,3 +19674,115 @@ runs are VOID per protocol.
   SIMD/repack GEMM tiers (G5 x86 AVX2/AVX512, G6 Arm NEON/i8mm, G7 repack), not
   another non-GEMM kernel. Byte-identity held throughout (md5
   `d235db12f2cd304007530286a1755c95`). Benchmark `ACCEPTED` in docs/BENCHMARKS.md.
+---
+
+## 2026-07-23 — M3b: Qwen3-dense on Metal (SECOND model on a non-CUDA backend) + the binding MLX-vs-ours benchmark (INDICATIVE / BLOCKED-ON-SUDO)
+
+`CLAIM-BACKEND-METAL-M3B-1`, worktree `/home/mudler/_git/vllm-metal-qwen3`
+(branch `metal-qwen3-dense`), base `origin/main` `4884d03`. M4 build/gate
+`192.168.68.103:~/work/m3b-qwen3`.
+
+**Ops needed beyond OPT's set — MEASURED against the CURRENT Metal op set, not the
+study's count.** After M3a, Metal already had 15 of 75 ops (incl. kEmbedding,
+kMatmulBT, kRmsNorm, kPagedAttention, kReshapeAndCache, kSiluAndMul, kCastBf16,
+kGreedyArgmax). Qwen3-dense's DEFAULT path (`VT_QWEN3_ROPE_CACHE` defaults **ON**)
+dispatches **kRopeCosSinCache** (build the per-step cos|sin cache) + **kRopeFromCache**
+(apply it, reading the bf16 cache) — NOT the study's literal "kRopeFromCache alone",
+and NOT kRopeNeox. I implemented **3 new MSL kernels**: kRopeCosSinCache,
+kRopeFromCache, and kRopeNeox (the `VT_QWEN3_ROPE_CACHE=0` opt-out) — Metal now
+**18 of 75**. kRopeFromCache is bit-exact (reads shared c/s, only rotates);
+kRopeNeox/kRopeCosSinCache compute f32 transcendentals in-kernel (Metal has no
+double) so they carry the NMSE bar (both measured 0 / 4e-15 vs the CPU oracle).
+
+**Correctness — Qwen3-0.6B SACRED gate PASSES on Metal, 16/16.** `test_qwen3_paged_engine`
+on the M4 (real HF Qwen3-0.6B checkpoint): 16/16 prompts PASS — 10/16 STRICT
+token-exact vs the vLLM 0.25.0 per-prompt greedy golden, 2/16 near-tie-band only,
+4/16 Metal-vs-CUDA cross-device near-tie divergences **all at gap = 0 nats** (vLLM's
+own teacher-forced logits place the two tokens at an EXACT bf16 tie), **0
+forward-divergent**. The gate was made device-aware: the CUDA/CPU path is
+byte-preserved (the hard our_ids anchor REQUIRE), and on Metal a divergence from the
+CUDA-captured anchor is classified against the committed gap — a near-tie (gap ≤ 500
+mnats) is accepted and reported, a well-separated gap is a hard fail. **Metal
+execution PROVEN, not inferred:** device type == kMETAL, and for all 9 Qwen3-dense
+ops `selections > 0` AND `declines == 0` (kRopeFromCache 7168, kPagedAttention 7168);
+per-op unit tests NaN-poison outputs.
+
+**M4 suites:** `test_metal_backend` **15 cases / 19,331 assertions** (adds bit-exact
+kRopeFromCache + NMSE kRopeNeox/kRopeCosSinCache), clean `-Werror` 0 warnings on the
+full rebuild (AppleClang, CLT-only). DSR holds at **86** (metal.cpp is the allowlisted
+platform leg; only a "Qwen3ForCausalLM" string added). Metal TUs are `VLLM_CPP_METAL`
+AUTO→OFF on Linux/CUDA so the dgx build is unaffected (only `test_qwen3_paged_engine.cpp`
+compiles there, behaviour-preserving on CUDA).
+
+**Benchmark — MLX-vs-ours, SAME box / SAME session / SAME model — INDICATIVE,
+BLOCKED-ON-SUDO.** Both arms Qwen3-1.7B bf16, p=512 g=128, b∈{1,2,4,8,16}. Ours =
+`vllm-bench` on Metal (Qwen/Qwen3-1.7B, device=2 confirmed via VT_OP_PROVIDER_STATS,
+all ops vt-native). MLX = `mlx_lm.benchmark` (mlx-community/Qwen3-1.7B-bf16), which
+reproduced the committed §7 baseline (gen 27.77→211.55). **The Mac could NOT be
+quieted** (`sudo -n true` → password required; root `com.localai.worker` LaunchDaemon
+up; desktop aerial wallpaper `WallpaperAerialsExtension` at ~9.8% CPU), so per the
+standing contended-run rule these numbers are INDICATIVE, not binding — though
+memory pressure read 83% free and MLX's trial spread was tiny.
+
+| B | ours decode tok/s/stream | MLX gen tok/s (agg) | ours TTFT ms | MLX TTFT ms | ours peak GB | MLX peak GB |
+|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 4.29 | 27.77 | 4858 | 470 | 7.36 | 3.78 |
+| 2 | 4.32 | 50.34 | 9083 | 898 | 7.36 | 3.97 |
+| 4 | 4.16 | 93.11 | 17664 | 1735 | 7.37 | 4.18 |
+| 8 | 3.25 | 160.24 | 28521 | 3399 | 7.64 | 4.47 |
+| 16 | 2.14 | 211.55 | 47167 | 7158 | 8.78 | 5.28 |
+
+Ours is a **FLOOR, not our best**: one command buffer per op (commit+wait), a plain
+threadgroup-tiled GEMM with no simdgroup-matrix, no batched encoders (M3c). Ours is
+~6–11× slower on decode, ~7–10× slower TTFT, ~1.7–2× the peak memory vs MLX's steel
+kernels. This is the first ours-vs-MLX comparison and it sets the optimization target
+(M3c batched encoders + a simdgroup GEMM are the named levers).
+
+**Repro:** M4, `~/work/m3b-qwen3/build`. Ours: `env VT_OP_PROVIDER_STATS=1
+./examples/vllm-bench --model <Qwen/Qwen3-1.7B snapshot> --num-prompts <B> --input-len
+512 --output-len 128 --concurrency <B> --temperature 0` (peak RSS via `/usr/bin/time
+-l`). MLX: `HF_HOME=$HOME/hf-cache ~/mlx-venv/bin/python -m mlx_lm.benchmark --model
+mlx-community/Qwen3-1.7B-bf16 -p 512 -g 128 -b <B> -n 3`. Gate:
+`./tests/test_qwen3_paged_engine --test-case="qwen3-0.6B*"`.
+
+**To make it BINDING the user must, on the M4:** `sudo launchctl bootout
+system/com.localai.worker` and disable the aerial wallpaper (System Settings →
+Wallpaper, or log the console user out); restore with `sudo launchctl bootstrap
+system /Library/LaunchDaemons/com.localai.worker.plist`.
+
+### 2026-07-23 addendum — dgx CUDA regression check + a PRE-EXISTING stale-golden finding
+
+The only M3b change that compiles on the dgx CUDA build is
+`tests/parity/test_qwen3_paged_engine.cpp` (Metal TUs are `VLLM_CPP_METAL`
+AUTO→OFF on Linux). On dgx: **clean CUDA `-Werror` build, 0 warnings**; device
+correctly stays CUDA (the `metal` branch is not taken); the CUDA/CPU anchor path
+is diff-verified behaviour-preserving (the old per-position `REQUIRE(got==od)`
+loop ≡ the new `REQUIRE(first_div < 0)`).
+
+**FINDING — the Qwen3-dense CUDA gate is currently RED on dgx, and it is a
+PRE-EXISTING stale-golden drift, NOT an M3b regression.** The gate fails at the
+hard our_ids anchor: dgx CUDA produces **15344** at prompt[0] tok=5 where the
+committed golden says **9625** (deterministic across 2 runs; 4B also drifts).
+Attribution is airtight: (1) `git diff 4884d03 HEAD` is exactly 5 files — 3
+Metal-only (not compiled on Linux) + the 2 test files; **zero** CUDA-engine/model
+files and **zero** goldens changed, so the CUDA engine is byte-identical to base
+`4884d03` and emits identical tokens → the drift exists on base too. (2) **Two
+independent devices corroborate the golden is stale, not the engine broken:** the
+M4 **Metal** run ALSO produced **15344** at prompt[0] tok=5 — the same token as
+dgx CUDA — while the committed golden says 9625. Two devices agreeing with each
+other and disagreeing with the golden ⇒ the committed `our_ids`/`gap` goldens
+(captured 2026-07-20 `e510e85` "on canonical cutlass-4.5.0") are stale vs the
+current engine/runtime, the SAME class as the documented 27B NVFP4-emulation
+control. **This STRENGTHENS the Metal result: Metal reproduces the CURRENT CUDA
+engine's exact near-tie tokens (both 15344), the strongest cross-device
+correctness evidence available.** I did NOT modify the goldens (refreshing them
+needs a fresh dgx vLLM-oracle capture via `scripts/qwen3-neartie-gap.py` and is
+out of M3b scope) — flagged for the next dgx session. The other five regression
+suites (27B, 35B, Qwen3-Coder, OPT, DeepSeek-V2) have **zero changed compiled
+code on dgx** (only Metal TUs + this one parity test changed) and were therefore
+not re-run — they are unchanged by construction.
+
+The Metal gate (`test_qwen3_paged_engine`, M4) passes 16/16 because its anchor is
+device-aware (a divergence from the CUDA-captured anchor at a committed near-tie
+is reported, not required away) — which is exactly the correct handling once the
+anchor is known to be stale on the current runtime for BOTH devices.

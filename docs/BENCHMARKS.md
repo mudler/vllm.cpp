@@ -967,14 +967,54 @@ The local Qwen3.5-4B checkpoint corpus is exactly
 `/tmp/qwen35-4b-sharegpt-1024.json`, SHA-256
 `9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`.
 
+## Ours-vs-MLX on Apple M4 — Qwen3-1.7B (2026-07-23, M3b) — INDICATIVE / `BLOCKED-ON-SUDO`
+
+**The first ours-vs-MLX comparison. NOT binding.** Qwen3-dense now runs on Metal
+(`BACKEND-METAL-MLX` work row M3b), so both arms exist for the SAME model. Both =
+**Qwen3-1.7B bf16**, SAME box, SAME session, p=512 g=128, b∈{1,2,4,8,16}. Ours =
+`examples/vllm-bench` on our Metal engine (`Qwen/Qwen3-1.7B` HF safetensors;
+device=2/Metal confirmed via `VT_OP_PROVIDER_STATS` — every op `vt-native`); MLX =
+`python -m mlx_lm.benchmark` (`mlx-community/Qwen3-1.7B-bf16`), re-run the same
+session (it reproduced the committed baseline below).
+
+| B | ours decode tok/s/stream | MLX gen tok/s (agg) | ours TTFT | MLX TTFT | ours peak | MLX peak |
+|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 4.29 | 27.77 | 4.86 s | 0.47 s | 7.36 GB | 3.78 GB |
+| 2 | 4.32 | 50.34 | 9.08 s | 0.90 s | 7.36 GB | 3.97 GB |
+| 4 | 4.16 | 93.11 | 17.66 s | 1.74 s | 7.37 GB | 4.18 GB |
+| 8 | 3.25 | 160.24 | 28.52 s | 3.40 s | 7.64 GB | 4.47 GB |
+| 16 | 2.14 | 211.55 | 47.17 s | 7.16 s | 8.78 GB | 5.28 GB |
+
+**Ours loses on every axis: ~6–11× slower decode, ~7–10× slower TTFT, ~2× peak
+memory.** This is a **knowingly-unoptimised FLOOR, not our best** — one command
+buffer per op (commit+wait), a plain threadgroup-tiled GEMM with no
+simdgroup-matrix, no batched encoders (work row `M3c`) — vs MLX's `steel` tiled
+kernels. It is the first ours-vs-MLX number and sets the optimisation target;
+the named levers are `M3c` (batched encoders) and a simdgroup-matrix GEMM.
+
+**Status: `BLOCKED-ON-SUDO` — INDICATIVE, NOT BINDING.** The Mac could not be
+quieted: `sudo -n true` → "a password is required"; the root `com.localai.worker`
+LaunchDaemon and the desktop aerial wallpaper (`WallpaperAerialsExtension`,
+~9.8% CPU) were both up. Per the standing contended-run rule this may not be cited
+as a bound comparison — though memory pressure read 83% free and MLX's trial
+spread stayed sub-1%. **To make it binding**, on the M4: `sudo launchctl bootout
+system/com.localai.worker`, disable the aerial wallpaper (System Settings →
+Wallpaper, or log the console user out), re-run both arms, then restore with
+`sudo launchctl bootstrap system /Library/LaunchDaemons/com.localai.worker.plist`.
+**Repro (M4, `~/work/m3b-qwen3/build`):** ours `env VT_OP_PROVIDER_STATS=1
+./examples/vllm-bench --model <Qwen/Qwen3-1.7B snapshot> --num-prompts <B>
+--input-len 512 --output-len 128 --concurrency <B> --temperature 0` (peak RSS via
+`/usr/bin/time -l`); MLX `HF_HOME=$HOME/hf-cache ~/mlx-venv/bin/python -m
+mlx_lm.benchmark --model mlx-community/Qwen3-1.7B-bf16 -p 512 -g 128 -b <B> -n 3`.
+
+---
+
 ## MLX competitor baseline on Apple M4 — UNOPPOSED FLOOR (2026-07-22)
 
-**READ THIS FIRST. This is NOT a parity result and NOT a binding floor.**
-There is **no "ours" column**: the Metal backend is a W0 skeleton, GEMM and
-attention are unregistered, and **no model runs on Metal**. Every number below is
-**MLX's own**, produced by **MLX's own harness**, recorded so that the Metal
-bring-up (`BACKEND-METAL-MLX` work row M3) has a target to design against.
-**No Metal speed result is claimed anywhere.**
+**READ THIS FIRST. This is NOT a parity result and NOT a binding floor.** (Now
+superseded as the live comparison by the ours-vs-MLX table above; retained as the
+original MLX-only baseline.) Every number below is **MLX's own**, produced by
+**MLX's own harness**.
 
 **Status: `BLOCKED-ON-SUDO` — INDICATIVE, NOT BINDING.** The `com.localai.worker`
 root LaunchDaemon on the M4 could not be stopped (`sudo -n true` -> "a password is

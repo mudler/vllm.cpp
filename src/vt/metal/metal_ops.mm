@@ -18,11 +18,18 @@
 //   MLX has no paged-KV attention primitive at all
 //   (.agents/specs/metal-mlx-reuse-study.md §5.3).
 //
+//   M3b (Qwen3-dense, `Qwen3ForCausalLM`): kRopeCosSinCache, kRopeFromCache and
+//   kRopeNeox — the RoPE ops beyond OPT's set. Qwen3's dense attention preamble
+//   defaults to the CACHE path (VT_QWEN3_ROPE_CACHE defaults ON): it builds the
+//   per-step cos|sin cache with kRopeCosSinCache and applies it with
+//   kRopeFromCache (both exercised by the SACRED gate). kRopeNeox serves the
+//   VT_QWEN3_ROPE_CACHE=0 opt-out (in-place fp-transcendental rotation). With
+//   these, qwen3.cpp runs END TO END on Apple GPU.
+//
 // WHAT IS STILL STUBBED: everything else — the whole quant tier, the GDN/MoE/MLA
-// families, RoPE, and every sampler op except greedy argmax. `vt::GetOp` throws
-// its normal "no kernel for op N on device type 2" for them (a partial backend is
-// a supported, tested state). Qwen3-dense needs kRopeCosSinCache + kRopeFromCache
-// on top of this set (work row M3b).
+// families, MRoPE (rank-2 rope-from-cache positions), and every sampler op except
+// greedy argmax. `vt::GetOp` throws its normal "no kernel for op N on device type
+// 2" for them (a partial backend is a supported, tested state).
 //
 // DISPATCH MODEL: one command buffer per op, committed and waited. See
 // metal_backend.mm § SCOPE for why, and what it costs.
@@ -81,9 +88,25 @@ struct PagedAttnParams {
   float scale;
 };
 struct ArgmaxParams { uint32_t n, v, tg; };
+struct RopeParams {
+  uint32_t t, hq, hk, d, rot, rhalf, q_dt, k_dt, pos_i64;
+  float base;
+};
+struct RopeCacheParams {
+  uint32_t t, rot, rhalf, out_dt, pos_i64;
+  float base;
+};
+struct RopeApplyParams {
+  uint64_t q_s0, q_s1, k_s0, k_s1;
+  uint32_t t, hq, hk, rot, rhalf, is_neox, q_dt, k_dt, cache_dt, pos_i64, has_k, pad;
+};
 struct FStepGpu { uint32_t op, out, in0, in1, gemma, pad; };
 struct FcParams { uint32_t t, h, nsteps, x_dt, w_dt, res_dt, out_dt, tg; float eps; };
 
+static_assert(sizeof(RopeParams) == 40, "RopeParams layout must match the MSL struct");
+static_assert(sizeof(RopeCacheParams) == 24, "RopeCacheParams layout must match the MSL struct");
+static_assert(sizeof(RopeApplyParams) == 80, "RopeApplyParams layout must match the MSL struct");
+static_assert(offsetof(RopeApplyParams, t) == 32, "RopeApplyParams: no interior padding");
 static_assert(sizeof(ElemParams) == 24, "ElemParams layout must match the MSL struct");
 static_assert(sizeof(FStepGpu) == 24, "FStepGpu layout must match the MSL struct");
 static_assert(sizeof(CacheParams) == 64, "CacheParams layout must match the MSL struct");
@@ -535,6 +558,76 @@ void GreedyArgmaxKernel(Queue&, Tensor& token_ids, const Tensor& logits) {
   e.DispatchRows(n, tg);
 }
 
+// cpu_ops.cpp:652-665 RopeNeoxKernel — the Qwen3-dense default rotation (M3b).
+// In-place NeoX RoPE over q [T,Hq,D] and k [T,Hk,D]; one GPU thread per
+// (token,head,pair). See metal_msl.h vt_rope_neox for the f32-transcendental
+// numerics note (NMSE bar, not bit-exact).
+void RopeNeoxKernel(Queue&, Tensor& qs, Tensor& ks, const Tensor& pos, const RopeArgs& args) {
+  const int64_t t = qs.shape[0], hq = qs.shape[1], hk = ks.shape[1], d = qs.shape[2];
+  const int rot = args.rotary_dim;
+  const int64_t half = rot / 2;
+  RopeParams p{static_cast<uint32_t>(t),   static_cast<uint32_t>(hq),
+               static_cast<uint32_t>(hk),  static_cast<uint32_t>(d),
+               static_cast<uint32_t>(rot), static_cast<uint32_t>(half),
+               DtypeCode(qs.dtype),        DtypeCode(ks.dtype),
+               pos.dtype == DType::kI64 ? 1u : 0u, args.base};
+  Encoder e("vt_rope_neox");
+  e.BindTensor(qs, 0, "rope_neox: q");
+  e.BindTensor(ks, 1, "rope_neox: k");
+  e.BindTensor(pos, 2, "rope_neox: positions");
+  e.BindBytes(&p, sizeof(p), 3);
+  e.DispatchFlat((t * hq + t * hk) * half);
+}
+
+// cpu_ops.cpp:751-768 RopeCosSinCacheKernel — fill cos_sin[T,rot] (M3b). One GPU
+// thread per (token,pair). Same numerics note as vt_rope_neox.
+void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions,
+                           const RopeArgs& args) {
+  const int64_t t = cos_sin.shape[0];
+  const int rot = args.rotary_dim;
+  const int64_t half = rot / 2;
+  RopeCacheParams p{static_cast<uint32_t>(t),   static_cast<uint32_t>(rot),
+                    static_cast<uint32_t>(half), DtypeCode(cos_sin.dtype),
+                    positions.dtype == DType::kI64 ? 1u : 0u, args.base};
+  Encoder e("vt_rope_cos_sin_cache");
+  e.BindTensor(cos_sin, 0, "rope_cos_sin_cache: cos_sin");
+  e.BindTensor(positions, 1, "rope_cos_sin_cache: positions");
+  e.BindBytes(&p, sizeof(p), 2);
+  e.DispatchFlat(t * half);
+}
+
+// cpu_ops.cpp:690-742 RopeFromCacheKernel — the Qwen3-dense DEFAULT rotation
+// (VT_QWEN3_ROPE_CACHE defaults ON). Applies cos|sin READ from the cache; no
+// in-kernel transcendentals, so it is bit-exact to the CPU oracle. See metal_msl.h
+// vt_rope_from_cache. MRoPE (rank-2 positions) is not yet ported to Metal.
+void RopeFromCacheKernel(Queue&, Tensor& qs, Tensor* ks, const Tensor& positions,
+                         const Tensor& cache, const RopeArgs& args) {
+  VT_CHECK(positions.rank == 1,
+           "metal rope_from_cache: MRoPE (rank-2 positions) is not supported on "
+           "Metal yet — Qwen3-dense uses rank-1 positions");
+  const int64_t t = qs.shape[0], hq = qs.shape[1];
+  const int64_t hk = ks != nullptr ? ks->shape[1] : 0;
+  const int rot = args.rotary_dim;
+  const int64_t half = rot / 2;
+  RopeApplyParams p{
+      static_cast<uint64_t>(qs.stride[0]), static_cast<uint64_t>(qs.stride[1]),
+      ks != nullptr ? static_cast<uint64_t>(ks->stride[0]) : 0,
+      ks != nullptr ? static_cast<uint64_t>(ks->stride[1]) : 0,
+      static_cast<uint32_t>(t),   static_cast<uint32_t>(hq),
+      static_cast<uint32_t>(hk),  static_cast<uint32_t>(rot),
+      static_cast<uint32_t>(half), args.is_neox_style ? 1u : 0u,
+      DtypeCode(qs.dtype),        ks != nullptr ? DtypeCode(ks->dtype) : DtypeCode(qs.dtype),
+      DtypeCode(cache.dtype),     positions.dtype == DType::kI64 ? 1u : 0u,
+      ks != nullptr ? 1u : 0u,    0u};
+  Encoder e("vt_rope_from_cache");
+  e.BindTensor(qs, 0, "rope_from_cache: q");
+  e.BindTensor(ks != nullptr ? *ks : qs, 1, "rope_from_cache: k");
+  e.BindTensor(positions, 2, "rope_from_cache: positions");
+  e.BindTensor(cache, 3, "rope_from_cache: cos_sin cache");
+  e.BindBytes(&p, sizeof(p), 4);
+  e.DispatchFlat((t * hq + t * hk) * half);
+}
+
 struct Registrar {
   Registrar() {
     // Same guard as the backend registrar: a Metal-enabled build on a device-less
@@ -573,6 +666,15 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<PagedAttentionFn>(&PagedAttentionKernel)));
     RegisterOp(OpId::kGreedyArgmax, DeviceType::kMETAL,
                reinterpret_cast<void*>(static_cast<GreedyArgmaxFn>(&GreedyArgmaxKernel)));
+    // --- M3b: the two ops Qwen3-dense needs beyond OPT's set. The DEFAULT
+    // (deterministic) dense attention path dispatches kRopeNeox (the rotation)
+    // plus kRopeCosSinCache (built once per step by the attention preamble).
+    RegisterOp(OpId::kRopeNeox, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));
+    RegisterOp(OpId::kRopeCosSinCache, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<RopeCosSinCacheFn>(&RopeCosSinCacheKernel)));
+    RegisterOp(OpId::kRopeFromCache, DeviceType::kMETAL,
+               reinterpret_cast<void*>(static_cast<RopeFromCacheFn>(&RopeFromCacheKernel)));
   }
 } registrar;
 

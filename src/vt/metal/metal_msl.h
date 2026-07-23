@@ -779,6 +779,166 @@ kernel void vt_greedy_argmax(device const float* logits [[buffer(0)]],
   }
   if (tid == 0u) { ids[row] = long(bi[0] == 0xFFFFFFFFu ? 0u : bi[0]); }
 }
+
+// ===========================================================================
+// RoPE (NeoX) — the Qwen3-dense default (deterministic) rotation, work row M3b.
+// ===========================================================================
+// cpu_ops.cpp:636-665 RopeRotateHead / RopeNeoxKernel. In-place rotation of the
+// leading `rot` dims of every (token, head) row of q [T,Hq,D] and k [T,Hk,D],
+// NeoX split (pair `i` with `i+half`). One thread per (row, pair), where a row is
+// one (token, head) in q (rows [0, T*Hq)) then one in k (rows [T*Hq, T*Hq+T*Hk)).
+// Non-reducing and per-element, so no thread aliases another's pair.
+//
+// NUMERICS. The CPU/CUDA reference computes freq/angle and cos/sin in DOUBLE and
+// casts to f32; Metal has no double, so this uses f32 `pow`/`precise::cos`/
+// `precise::sin`. The rotation arithmetic (x*c - y*s / x*s + y*c) is otherwise the
+// identical f32 form with a single bf16 rounding on store. Per the spike § Gates
+// the bar is therefore NMSE <= 5e-4 vs the CPU oracle, NOT bit-exactness — the
+// same posture as vt_paged_attention. For the short-prompt greedy gate the angles
+// stay small enough that the bf16-rounded result matches the reference at all but
+// bf16 near-ties (measured on the M4).
+struct VtRopeParams {
+  uint  t;        // tokens
+  uint  hq;       // query heads
+  uint  hk;       // key heads
+  uint  d;        // head_dim
+  uint  rot;      // rotary_dim (even, <= d)
+  uint  rhalf;    // rot / 2
+  uint  q_dt;
+  uint  k_dt;
+  uint  pos_i64;  // 1 => positions are i64, else i32
+  float base;
+};
+
+kernel void vt_rope_neox(device uchar* q             [[buffer(0)]],
+                         device uchar* k             [[buffer(1)]],
+                         device const uchar* positions [[buffer(2)]],
+                         constant VtRopeParams& p    [[buffer(3)]],
+                         uint gid [[thread_position_in_grid]]) {
+  const uint pair = gid % p.rhalf;
+  const uint row  = gid / p.rhalf;
+  const uint qrows = p.t * p.hq;
+  device uchar* buf;
+  uint dt;
+  uint token;
+  ulong head_off;
+  if (row < qrows) {
+    buf = q; dt = p.q_dt; token = row / p.hq; head_off = ulong(row) * p.d;
+  } else {
+    const uint r2 = row - qrows;
+    buf = k; dt = p.k_dt; token = r2 / p.hk; head_off = ulong(r2) * p.d;
+  }
+  const long pos = p.pos_i64
+      ? ((device const long*)positions)[token]
+      : (long)((device const int*)positions)[token];
+  const float freq  = pow(p.base, -2.0f * float(pair) / float(p.rot));
+  const float angle = float(pos) * freq;
+  const float c = precise::cos(angle);
+  const float s = precise::sin(angle);
+  const float x = vt_load(buf, dt, head_off + pair);
+  const float y = vt_load(buf, dt, head_off + pair + p.rhalf);
+  vt_store(buf, dt, head_off + pair,          x * c - y * s);
+  vt_store(buf, dt, head_off + pair + p.rhalf, x * s + y * c);
+}
+
+// cpu_ops.cpp:751-768 RopeCosSinCacheKernel. Fill cos_sin[T, rot]: cols [0,half)
+// = cos, [half,rot) = sin. One thread per (token, pair). Same f32-transcendental
+// deviation and NMSE bar as vt_rope_neox above. (Built once per step by the dense
+// attention preamble; consumed only by the opt-in RopeFromCache path, so on the
+// deterministic default path its output is unused — but the op must exist or the
+// engine's GetOp throws.)
+struct VtRopeCacheParams {
+  uint  t;
+  uint  rot;
+  uint  rhalf;
+  uint  out_dt;
+  uint  pos_i64;
+  float base;
+};
+
+kernel void vt_rope_cos_sin_cache(device uchar* cos_sin          [[buffer(0)]],
+                                  device const uchar* positions  [[buffer(1)]],
+                                  constant VtRopeCacheParams& p  [[buffer(2)]],
+                                  uint gid [[thread_position_in_grid]]) {
+  const uint pair  = gid % p.rhalf;
+  const uint token = gid / p.rhalf;
+  const long pos = p.pos_i64
+      ? ((device const long*)positions)[token]
+      : (long)((device const int*)positions)[token];
+  const float freq  = pow(p.base, -2.0f * float(pair) / float(p.rot));
+  const float angle = float(pos) * freq;
+  vt_store(cos_sin, p.out_dt, ulong(token) * p.rot + pair,           precise::cos(angle));
+  vt_store(cos_sin, p.out_dt, ulong(token) * p.rot + p.rhalf + pair, precise::sin(angle));
+}
+
+// ===========================================================================
+// RoPE from a precomputed cos|sin cache — the Qwen3-dense DEFAULT rotation
+// (VT_QWEN3_ROPE_CACHE defaults ON), work row M3b.
+// ===========================================================================
+// cpu_ops.cpp:690-742 RopeFromCacheKernel. Rotate the leading `rot` dims of every
+// (token, head) row of q [T,Hq,D] and k [T,Hk,D] using cos|sin READ from a
+// cos_sin[P, rot] cache (cols [0,half)=cos, [half,rot)=sin), indexed by
+// positions[token]. STRIDE-DRIVEN (q/k need only a unit-stride innermost dim).
+// One thread per (row, pair). No transcendentals in the kernel — the c/s are the
+// SAME cached values the CPU reference reads, and the rotation (x*c - y*s /
+// x*s + y*c) is the identical f32 arithmetic with a single bf16 rounding on store,
+// so this is bit-exact to the CPU oracle (a non-reducing per-element op). This is
+// the op the correctness gate actually exercises; kRopeNeox above serves the
+// VT_QWEN3_ROPE_CACHE=0 opt-out. Rank-1 positions only (MRoPE is guarded off in
+// the host wrapper — Qwen3-dense never uses it).
+struct VtRopeApplyParams {
+  ulong q_s0;    // q element stride over tokens
+  ulong q_s1;    // q element stride over heads
+  ulong k_s0;
+  ulong k_s1;
+  uint  t;
+  uint  hq;
+  uint  hk;
+  uint  rot;
+  uint  rhalf;
+  uint  is_neox;
+  uint  q_dt;
+  uint  k_dt;
+  uint  cache_dt;
+  uint  pos_i64;
+  uint  has_k;
+  uint  pad;
+};
+
+kernel void vt_rope_from_cache(device uchar* q               [[buffer(0)]],
+                               device uchar* k               [[buffer(1)]],
+                               device const uchar* positions [[buffer(2)]],
+                               device const uchar* cache     [[buffer(3)]],
+                               constant VtRopeApplyParams& p [[buffer(4)]],
+                               uint gid [[thread_position_in_grid]]) {
+  const uint pair = gid % p.rhalf;
+  const uint row  = gid / p.rhalf;
+  const uint qrows = p.t * p.hq;
+  device uchar* buf;
+  uint dt;
+  ulong s0, s1;
+  uint token, head;
+  if (row < qrows) {
+    buf = q; dt = p.q_dt; s0 = p.q_s0; s1 = p.q_s1; token = row / p.hq; head = row % p.hq;
+  } else {
+    if (p.has_k == 0u) return;
+    const uint r2 = row - qrows;
+    buf = k; dt = p.k_dt; s0 = p.k_s0; s1 = p.k_s1; token = r2 / p.hk; head = r2 % p.hk;
+  }
+  const long pos = p.pos_i64
+      ? ((device const long*)positions)[token]
+      : (long)((device const int*)positions)[token];
+  const ulong coff = ulong(pos) * p.rot;
+  const float c = vt_load(cache, p.cache_dt, coff + pair);
+  const float s = vt_load(cache, p.cache_dt, coff + p.rhalf + pair);
+  const uint first  = p.is_neox ? pair : pair * 2u;
+  const uint second = p.is_neox ? pair + p.rhalf : pair * 2u + 1u;
+  const ulong off = ulong(token) * s0 + ulong(head) * s1;
+  const float x = vt_load(buf, dt, off + first);
+  const float y = vt_load(buf, dt, off + second);
+  vt_store(buf, dt, off + first,  x * c - y * s);
+  vt_store(buf, dt, off + second, x * s + y * c);
+}
 )MSL";
 // clang-format on
 

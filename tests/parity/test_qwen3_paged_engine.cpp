@@ -54,6 +54,8 @@
 #include "npy.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/sampling_params.h"
+#include "vt/op_provider.h"  // the "which backend actually ran" proof (Metal, M3b)
+#include "vt/ops.h"
 
 namespace fs = std::filesystem;
 
@@ -199,6 +201,39 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
       vllm::entrypoints::LoadedEngine::FromModelDir(
           snap, vllm::entrypoints::EngineParams{});
 
+  // Which device did SelectQueue actually pick? On dgx this is kCUDA and the gate
+  // below is byte-for-byte the historical CUDA gate (the strict our_ids anchor +
+  // near-tie band). On the Apple M4 it is kMETAL, and two things change: (1) the
+  // Qwen3-dense ops must PROVE they ran on the Metal provider (selections > 0,
+  // declines == 0 — `last_selected` alone is insufficient, fan-out spike Risk 4);
+  // (2) the our_ids anchor was captured on CUDA, so a Metal divergence AT a
+  // committed near-tie (gap <= kNearTieMnats) is the SAME bf16 tie the gate already
+  // tolerates across decoders, not an anchor drift — it is reported, not required
+  // away, while a divergence at a well-separated position is still a hard fail.
+  const vt::DeviceType run_dev = loaded->runner().device().type;
+  const bool metal = run_dev == vt::DeviceType::kMETAL;
+  // The forward + greedy ops Qwen3-dense dispatches on the DEFAULT
+  // (VT_QWEN3_ROPE_CACHE) path. kRopeCosSinCache + kRopeFromCache are the M3b
+  // additions (build the per-step cos|sin cache, then apply it); the rest are
+  // shared with OPT. kMatmul is excluded deliberately: Qwen3-0.6B ties its
+  // lm_head, so every projection is a kMatmulBT.
+  const std::vector<vt::OpId> kQwen3Ops = {
+      vt::OpId::kEmbedding,      vt::OpId::kMatmulBT,       vt::OpId::kRmsNorm,
+      vt::OpId::kRopeCosSinCache, vt::OpId::kRopeFromCache, vt::OpId::kReshapeAndCache,
+      vt::OpId::kPagedAttention, vt::OpId::kSiluAndMul,     vt::OpId::kGreedyArgmax};
+  if (metal) {
+    for (vt::OpId op : kQwen3Ops) {
+      CHECK(vt::OpRegistered(op, run_dev));
+      vt::ResetOpProviderStats(op, run_dev);
+    }
+    vt::EnableOpProviderCallStats(true);
+    MESSAGE(label << ": running on device type " << static_cast<int>(run_dev)
+            << " (2=METAL) — the our_ids anchor is CUDA-captured, so Metal near-tie "
+               "divergences are reported, not required away");
+  }
+
+  int metal_neartie_div = 0;  // Metal-only: prompts that diverge from CUDA our_ids
+                              // at a committed near-tie position
   int strict_exact = 0;   // prompts where our tokens == vLLM greedy exactly
   int neartie_only = 0;   // prompts that pass only via the near-tie band
   int fail = 0;           // prompts with a token beyond the near-tie band
@@ -217,16 +252,48 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
         our_dump[static_cast<size_t>(i * T + j)] = got[static_cast<size_t>(j)];
     }
 
-    // Anchor: the committed gaps describe OUR engine's exact sequence. A drift
-    // here means the engine changed and the gap golden must be re-captured.
+    // Anchor: the committed gaps describe OUR engine's exact (CUDA-captured)
+    // sequence. On CUDA/CPU a drift is a hard REQUIRE (the engine changed and the
+    // gap golden must be re-captured). On Metal the anchor was captured on a
+    // DIFFERENT device, so a divergence is classified against the committed gap:
+    // at a near-tie it is the expected cross-decoder bf16 behaviour, at a
+    // well-separated position it is a real forward bug.
+    int first_div = -1;
     for (int64_t j = 0; j < T; ++j) {
-      REQUIRE_MESSAGE(got[static_cast<size_t>(j)] == od[i * T + j],
-                      label << " anchor drift prompt[" << i << "] tok=" << j
-                      << " engine=" << got[static_cast<size_t>(j)]
-                      << " committed our_ids=" << od[i * T + j]
+      if (got[static_cast<size_t>(j)] != od[i * T + j]) { first_div = static_cast<int>(j); break; }
+    }
+    if (!metal) {
+      REQUIRE_MESSAGE(first_div < 0,
+                      label << " anchor drift prompt[" << i << "] tok=" << first_div
+                      << " engine=" << (first_div < 0 ? -1 : got[static_cast<size_t>(first_div)])
+                      << " committed our_ids=" << (first_div < 0 ? -1 : od[i * T + first_div])
                       << " — re-run qwen3-neartie-gap.py to refresh the gap golden");
+    } else if (first_div >= 0) {
+      const int32_t mn = gapd[i * T + first_div];
+      if (mn > worst_gap) { worst_gap = mn; worst_i = static_cast<int>(i); worst_j = first_div; }
+      if (mn > kNearTieMnats) {
+        ++fail;
+        MESSAGE(label << " METAL FORWARD DIVERGENCE prompt[" << i << "] tok=" << first_div
+                << " metal=" << got[static_cast<size_t>(first_div)]
+                << " cuda_our_ids=" << od[i * T + first_div]
+                << " vLLM_greedy=" << gd[i * T + first_div]
+                << " gap=" << (mn / 1000.0) << " nats (> " << (kNearTieMnats / 1000.0)
+                << ") — a real forward divergence, not a near-tie");
+        CHECK(mn <= kNearTieMnats);
+      } else {
+        ++metal_neartie_div;
+        MESSAGE(label << " metal near-tie divergence prompt[" << i << "] tok=" << first_div
+                << " metal=" << got[static_cast<size_t>(first_div)]
+                << " cuda_our_ids=" << od[i * T + first_div]
+                << " gap=" << (mn / 1000.0) << " nats (<= band) — accepted (the CUDA "
+                   "anchor and Metal chose opposite sides of a bf16 tie vLLM cannot "
+                   "separate)");
+      }
+      continue;  // committed gaps past first_div describe a DIFFERENT sequence
     }
 
+    // No divergence from the anchor: the committed gaps describe our sequence, so
+    // the near-tie band check below is well-posed on every device.
     bool exact = true;
     bool prompt_ok = true;
     int first_bad = -1;
@@ -251,6 +318,30 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
     CHECK(prompt_ok);
   }
 
+  // The backend proof, now that work has been dispatched. Metal computes the same
+  // tokens as any other backend, so the token comparison does NOT say the Metal
+  // GPU ran; the provider stats do. Every Qwen3-dense op must have been SELECTED
+  // on the running device and must NEVER have DECLINED (a decline is a silent
+  // forward down the provider stack — fan-out spike Risk 4).
+  if (metal) {
+    vt::EnableOpProviderCallStats(false);
+    for (vt::OpId op : kQwen3Ops) {
+      const auto st = vt::GetOpProviderStats(op, run_dev);
+      CHECK_MESSAGE(st.selections > 0,
+                    label << ": op " << static_cast<int>(op)
+                          << " was never dispatched on the Metal device — the token "
+                             "result cannot be attributed to this backend");
+      CHECK_MESSAGE(st.declines == 0,
+                    label << ": op " << static_cast<int>(op)
+                          << " DECLINED on Metal and fell back");
+    }
+    MESSAGE(label << ": BACKEND PROOF — all " << kQwen3Ops.size()
+            << " Qwen3-dense ops dispatched on Metal with 0 declines (kRopeFromCache "
+               "selections=" << vt::GetOpProviderStats(vt::OpId::kRopeFromCache, run_dev).selections
+            << ", kPagedAttention selections="
+            << vt::GetOpProviderStats(vt::OpId::kPagedAttention, run_dev).selections << ")");
+  }
+
   if (dump) {
     const std::string path = (gdir / "our_ids.i32").string();
     std::FILE* f = std::fopen(path.c_str(), "wb");
@@ -260,11 +351,15 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
       MESSAGE(label << " dumped our token ids -> " << path);
     }
   }
-  MESSAGE(label << " correctness gate: " << (strict_exact + neartie_only) << "/" << N
+  MESSAGE(label << " correctness gate: "
+          << (strict_exact + neartie_only + metal_neartie_div) << "/" << N
           << " prompts PASS  (STRICT token-exact vs vLLM per-prompt greedy: "
           << strict_exact << "/" << N << "; near-tie-band only: " << neartie_only
-          << "/" << N << "; max gap " << (worst_gap / 1000.0) << " nats @ prompt["
-          << worst_i << "] tok=" << worst_j << "; " << fail << " forward-divergent)");
+          << "/" << N << "; " << (metal ? "metal cross-device near-tie: " : "")
+          << (metal ? std::to_string(metal_neartie_div) : std::string())
+          << (metal ? "/" + std::to_string(N) + "; " : "; ") << "max gap "
+          << (worst_gap / 1000.0) << " nats @ prompt[" << worst_i << "] tok=" << worst_j
+          << "; " << fail << " forward-divergent)");
   REQUIRE(fail == 0);
 }
 

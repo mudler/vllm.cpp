@@ -401,6 +401,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_quant_dequant.cpp
   src/vt/cpu/cpu_quant_act.cpp
   src/vt/cpu/cpu_quant_dot.cpp
+  src/vt/cpu/cpu_quant_dot_arm.cpp
   src/vt/cpu/cpu_quant_traits.cpp
   src/vt/cpu/cpu_quant_gemm.cpp
   src/vt/cpu/cpu_layernorm.cpp
@@ -410,6 +411,19 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_paged_attn.cpp
   src/vt/cpu/cpu_sample.cpp)
 add_library(vllm::vllm ALIAS vllm)
+
+# QUANT-GGUF-CIQ-GEMM G6: the Arm i8mm (mmla) quant-GEMM tier needs the ISA
+# extension enabled so <arm_neon.h> exposes `vmmlaq_s32` and defines
+# `__ARM_FEATURE_MATMUL_INT8`. The project sets no global -march, so build ONLY
+# this translation unit with armv8.2-a+i8mm (surgical, exactly like the x86
+# tier's per-function `target("f16c")`): every other TU stays on the default
+# baseline, and the kernels are additionally runtime-gated on HWCAP2_I8MM so the
+# binary still runs on non-i8mm aarch64 (portable tier serves those shapes).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set_source_files_properties(
+    src/vt/cpu/cpu_quant_dot_arm.cpp PROPERTIES
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+i8mm+dotprod>")
+endif()
 # Static-init registrars (e.g. the CPU backend, the platform table, the op
 # table, the attention backends) live in archive members no consumer references
 # directly; force-link the whole vllm archive so every consumer (tests, C API

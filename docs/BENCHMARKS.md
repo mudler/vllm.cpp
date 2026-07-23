@@ -2092,6 +2092,73 @@ The complete contract is in the
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
 
+## CPU vs llama.cpp — Arm i8mm (mmla) quant-GEMM tier (CIQ G6), `ACCEPTED` / binding (2026-07-23)
+
+`CLAIM-QUANT-GGUF-CIQ-G6-1`, base `93b55c0`, binding host idle-gated `dgx.casa`
+(GB10, aarch64, 20 cores), one `flock $HOME/gpu.lock`, `git archive` transfer.
+The i8mm `nrc==2` `vmmlaq_s32` `vec_dot` tier for q8_0/q4_0/q4_K/q6_K, 2x2-tiled
+into `kMatmulBTQuant` (`src/vt/cpu/cpu_quant_dot_arm.cpp`); q3_K/q5_K have no
+upstream mmla and stay portable. Runtime `HWCAP2_I8MM` probe; `VT_CPU_QUANT_MMLA=0`
+is the same-binary A/B defeat.
+
+**Op-level GFLOP/s (`kMatmulBTQuant`, `quant-gemm-bench`, best-of-N, portable→i8mm):**
+
+| shape (M×N×K) | q8_0 | q4_K | q6_K |
+|---|---|---|---|
+| prefill qkv 128×3072×2048 | 450–492→**518** (~1.2×) | 148→**1109** (**7.5×**) | 240→**930** (**3.9×**) |
+| prefill gate_up 128×12288×2048 | 492→**580** (1.18×) | 152→**1270** (**8.4×**) | 248→**1070** (**4.3×**) |
+| prefill down 128×2048×6144 | 454→**514** (1.13×) | 148→**1058** (**7.1×**) | 238→**905** (**3.8×**) |
+| decode qkv 1×3072×2048 | 412→412 (mmla off at M=1) | 139→143 | 227→227 |
+
+q8_0's portable kernel was already near-optimal (a simple int8 dot the compiler
+vectorizes); the K-quants gain most (mmla does the block unpack in-register vs
+the portable scalar `aux8` decode).
+
+**E2e prefill A/B — same binary, `Qwen3.5-2B-UD-Q8_K_XL`, 3 reps, medians:**
+
+| arm | TTFT (ms) | prefill t/s |
+|---|---|---|
+| mmla OFF (portable) | 1135.68 | 112.7 |
+| **mmla ON (default)** | **1047.70** | **122.2** |
+
+Same-binary **1.084× prefill**; vs llama.cpp pp128 (refreshed same session,
+175.41±1.62): **1.56× → 1.44× behind**. Decode TPOT ~44 ms unchanged (mmla off at
+M=1). This file is the PESSIMAL case for G6 — q8_0 (portable already fast) + 60 %
+`f16` (elementwise GEMM, not G6's domain) — so the e2e win is Amdahl-bounded; the
+4–8× K-quant kernel win lands end-to-end on the k-quant-heavy APEX 35B files.
+
+**Correctness:** q8_0/q4_0 mmla BIT-IDENTICAL to the portable/scalar tier
+(`vmlaq_f32` non-fused under `-ffp-contract=off`); q4_K/q6_K within NMSE ≤ 5e-4;
+mmla GEMM bit-identical across threads 1/2/4/20. `test_ops_quant_dot` 19 cases /
+78,162 assertions; `test_qwen36_gguf_engine` 2/2 · 16/16 on APEX-Compact and
+-Balanced vs the same-file llama.cpp oracle; bench-file token md5
+`d235db12f2cd304007530286a1755c95` byte-identical across mmla-OFF/ON/`VT_CPU_REF=1`.
+CUDA `-Werror` 0-warn; regression set UNCHANGED. **Fresh bottleneck:** mmla drops
+the q8_0 `kMatmulBTQuant` share from 50 % to ~44 % of prefill (the 8.4 % e2e is
+exactly `0.50·(1−1/1.2)`), so the elementwise f16/f32 GEMM (~30 %, unchanged — the
+60 % f16 mass incl. the tied lm_head/embed) is now co-dominant and the next CPU
+prefill lever on this file; on a k-quant file `kMatmulBTQuant` collapses (7–8× on
+q4_K) and the elementwise GEMM + attention dominate outright.
+
+**Reproduction:**
+
+```sh
+# dgx.casa, aarch64, idle, ONE flock; loadavg-gate inside the lock
+R=$HOME/work/bench-cpu-llama; M=$R/models/Qwen3.5-2B-UD-Q8_K_XL.gguf
+LB=$R/llamacpp/build/bin; W=$HOME/work/vllm.cpp-ciq-g6/build-cpu/examples
+cmake -S vllmcpp -B build-cpu -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
+cmake --build build-cpu -j 20 --target vllm-bench quant-gemm-bench
+flock $HOME/gpu.lock sh -c '
+  VT_CPU_QUANT_MMLA=0 VLLM_CPP_CPU_THREADS=20 '"$W"'/quant-gemm-bench   # portable
+  VLLM_CPP_CPU_THREADS=20 '"$W"'/quant-gemm-bench                        # i8mm
+  LD_LIBRARY_PATH='"$LB"' '"$LB"'/llama-bench -m '"$M"' -p 128 -n 32 -t 20 -r 5 -ngl 0
+  for arm in "VT_CPU_QUANT_MMLA=0" ""; do for rep in 1 2 3; do
+    env $arm VLLM_CPP_CPU_THREADS=20 '"$W"'/vllm-bench --model '"$M"' --num-prompts 1 \
+      --input-len 128 --output-len 32 --concurrency 1 --seed 0 --temperature 0 \
+      --output-token-ids /tmp/ids.$arm.$rep.json
+  done; done'  # all token-id files MUST md5 d235db12f2cd304007530286a1755c95
+```
+
 ## CPU vs llama.cpp — thread kGdnPrefill + kPagedAttention, `ACCEPTED` / binding (2026-07-23)
 
 `BENCH-CPU-LLAMA` / `BACKEND-GATE-CPU-LLAMACPP` / `QUANT-GGUF-CPU-THREADPOOL`

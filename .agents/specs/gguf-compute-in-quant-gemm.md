@@ -157,7 +157,7 @@ there (i8mm repack expected) before comparing.
 | G3 | tier-0 vec_dot kernels | the six generic `vec_dot` ports + GEMM wiring + test-quantize-fns/backend-ops ports + parity goldens | G1, G2 | **DONE** 2026-07-22 |
 | G4 | e2e enablement | route `MatmulBT` call sites on block dtype; engine gates (3) + `VT_CPU_REF` A/B; first B4-recipe measurement (tier-0 milestone) | G3, loader L2-L3, threadpool W2 | **DONE** 2026-07-22 |
 | G5 | x86 AVX2 tier | `arch/x86` vec_dot ports + feature probe; tier-1 milestone measurement | G3 | open — **BLOCKED on a fresh profile** (see G4 §Consequences item 0) and on a non-`VOID` x86 host |
-| G6 | Arm NEON/i8mm tier | `arch/arm` ports incl. `nrows==2` mmla; GB10 measurement | G3 | open — **BLOCKED on a fresh profile** (see G4 §Consequences item 0); a prefill candidate, but no longer ranked on the stale attribution |
+| G6 | Arm NEON/i8mm tier | `arch/arm` ports incl. `nrows==2` mmla; GB10 measurement | G3 | **DONE** 2026-07-23 — i8mm mmla `nrc==2` tier for q8_0/q4_0/q4_K/q6_K, 2x2-tiled into `kMatmulBTQuant` (see G6 result below) |
 | G7 | repack tier | repack-at-load + gemv/gemm + `quantize_mat_t`; selection parity vs `:4528`; closes gates 4-5 | G4 + loader L2 | open — parked; **BLOCKED on a fresh profile** (see G4 §Consequences item 0) |
 | G8 | ledger + matrix closure | full A/B series, ledger row, flip `C`/`E`/`P` cells per encoding row (Q8_0/Q4_K/Q5_K/Q6_K/Q3_K/Q4_0), roadmap update | G4-G7 | open |
 
@@ -559,3 +559,104 @@ flock $HOME/gpu.lock sh -c '
 **Gates at G1:** clean CPU `-Werror` build (0 warnings); full CPU ctest
 **151/151**; gguf ctest 4/4. **DGX CONFIRMATION RUN (`dgx.casa`, `~/work/vllm.cpp-ciq-g1`, production flags `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_CUTLASS_DIR=/home/mudler/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON`, one `flock $HOME/gpu.lock` for the whole series):** clean CUDA `-Werror` build to 100%, **0 warnings**. Regression set ALL UNCHANGED — 27B **235/235**, 35B **315/315**, Qwen3-Coder **6/6** (strict 5/6, max gap 0 nats), Qwen3-dense **16/16** (strict 11/16, max gap 0.25 nats), OPT **6/6** (36 assertions), DeepSeek-V2-Lite **8/8** (223 assertions). `test_qwen36_gguf_engine` run STANDALONE (it OOMs co-scheduled) on the real APEX files: **28/28 assertions, 2/2 cases, 16/16 tokens each on Compact and Balanced** — the k-quant dequant path is byte-stable across the decoder move. Gates 1-5 of this spec are
 untouched: they need G2/G3 (op correctness) and the loader leaf (e2e/perf/RSS).
+
+## G6 result (2026-07-23) — Arm i8mm (mmla) tier, landed + measured
+
+**What landed.** The `nrc==2` `vmmlaq_s32` block dot products for the FOUR
+encodings llama.cpp gives an mmla path — q8_0, q4_0, q4_K, q6_K — ported
+byte-for-byte from `arch/arm/quants.c` @ `237ad9b96` (q4_0 `:241`, q8_0 `:1094`,
+q4_K `:2495` `#elif MATMUL_INT8`, q6_K `:3101` `#elif MATMUL_INT8`) into
+[cpu_quant_dot_arm.cpp](../../src/vt/cpu/cpu_quant_dot_arm.cpp#L1). q3_K and q5_K
+have NO upstream mmla path (SVE + NEON only), so they legitimately stay on the
+portable nrc==1 tier — "port the mmla path where upstream has it", nothing
+invented. [`kMatmulBTQuant`](../../src/vt/cpu/cpu_quant_gemm.cpp#L85) grew a 2x2
+register-tiled path (`QuantChunkMmla`) that mirrors
+`ggml_compute_forward_mul_mat_one_chunk`'s `num_rows_per_vec_dot=2` tile
+(`ggml-cpu.c:1233-1239`): each `vec_dot(nrc=2)` computes two weight rows × two
+activation rows.
+
+**Feature probe (illegal-instruction-safe).** The TU is compiled with
+`-march=armv8.2-a+i8mm+dotprod` **for this one file only** (CMakeLists
+`set_source_files_properties`, surgical exactly like the x86 tier's per-function
+`target("f16c")`) so `<arm_neon.h>` exposes `vmmlaq_s32`; the whole body is
+`#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)`, else empty
+stubs so every other build links and the portable tier serves. At RUNTIME the
+mmla kernels are handed out only when `getauxval(AT_HWCAP2) & HWCAP2_I8MM`
+([QuantMmlaActive](../../src/vt/cpu/cpu_quant_dot_arm.cpp#L1)); a wrong-tier
+selection on a non-i8mm CPU can't happen. `VT_CPU_QUANT_MMLA=0|off|false` forces
+the tier off for a same-binary A/B (portable nrc==1 then serves every shape),
+and `VT_CPU_REF=1` still reproduces the historical dequant path.
+
+**Determinism by construction (unpin is thread-safe).** mmla engages only at
+`M%2==0 && N%2==0`; decode (M=1) and any odd dim keep the portable nrc==1 path —
+the exact "num_rows_per_vec_dot falls to 1" guard ggml uses (`ggml-cpu.c:1432`).
+The GEMM parallelizes over WEIGHT-ROW PAIRS, so the (weight-row, activation-row)
+pairing is GLOBAL and independent of how pairs chunk across threads → the result
+is bit-identical run-to-run AND across thread counts. Verified 1/2/4/20.
+
+**Bit-exact vs NMSE — determined, not assumed.** The int8 products accumulate
+into i32 EXACTLY, and q8_0/q4_0's only float step is a block-by-block
+`vmlaq_f32` MAC in the scalar kernel's order, non-fused under `-ffp-contract=off`
+— so **q8_0 and q4_0 mmla are BIT-IDENTICAL to the portable/scalar tier**
+(`CHECK(exact == total)` passes for all shapes). q4_K/q6_K add a `vpaddq`/`vmull`
+bias reduction that reassociates and are gated at the ratified **NMSE ≤ 5e-4**
+vs the portable per-element dot (measured well under). Both are asserted in
+[test_ops_quant_dot.cpp](../../tests/vt/test_ops_quant_dot.cpp#L1)'s new G6
+tier-cross-check (cases run only where the tier is live; skip coherently
+elsewhere). On dgx the suite is 19 cases / **78,162 assertions** green; on x86
+(portable) 19 / 78,058 with the mmla numeric cases skipping.
+
+**Correctness — NO token movement.** `test_qwen36_gguf_engine` STANDALONE with
+the mmla tier live: **2/2 cases, 16/16 greedy tokens** on APEX-Compact
+(`{F32,Q3_K,Q4_K,Q6_K}`) and APEX-Balanced (`{F32,Q8_0,Q5_K,Q6_K}`) vs the
+same-file llama.cpp oracle — q8_0/q4_K/q6_K all exercised at prefill through
+mmla, no token moved. On the bench file the output-token md5 is
+`d235db12f2cd304007530286a1755c95` — byte-identical across the mmla-OFF, mmla-ON
+and `VT_CPU_REF=1` arms.
+
+### Benchmark — binding, dgx.casa (GB10, aarch64, 20 cores), one flock
+
+Loadavg-gated inside the lock (start 1.30). `git archive` transfer.
+
+**Op-level GFLOP/s (kMatmulBTQuant, best-of-N, portable vs i8mm):**
+
+| shape (M×N×K) | q8_0 portable→i8mm | q4_K portable→i8mm | q6_K portable→i8mm |
+|---|---|---|---|
+| prefill qkv 128×3072×2048 | 450–492→**518** ~1.1–1.2× | 148→**1109** **7.5×** | 240→**930** **3.9×** |
+| prefill gate_up 128×12288×2048 | 492→**580** 1.18× | 152→**1270** **8.4×** | 248→**1070** **4.3×** |
+| prefill down 128×2048×6144 | 454→**514** 1.13× | 148→**1058** **7.1×** | 238→**905** **3.8×** |
+| decode qkv 1×3072×2048 | 412→412 (mmla off at M=1) | 139→143 | 227→227 |
+
+The k-quant win is large (mmla does the block unpack in-register vs the portable
+scalar `aux8` decode); q8_0's portable kernel was already near-optimal so its
+mmla uplift is modest.
+
+**E2e prefill A/B — same binary, `Qwen3.5-2B-UD-Q8_K_XL`, 3 reps, medians:**
+
+| arm | TTFT (ms) | prefill t/s |
+|---|---|---|
+| mmla OFF (portable) | 1135.68 | 112.7 |
+| **mmla ON (default)** | **1047.70** | **122.2** |
+
+Same-binary **1.084× prefill**; vs llama.cpp pp128 (refreshed same session,
+175.41±1.62): **1.56× → 1.44× behind**. Decode TPOT ~44 ms unchanged (mmla off
+at M=1). This file is the PESSIMAL case for G6 — it is q8_0 (whose portable was
+already fast) + 60 % `f16` (elementwise GEMM, not G6's domain) — so the e2e
+share is Amdahl-bounded; the op-level table shows the real kernel lever, and the
+k-quant-heavy APEX 35B production files are where the 3.8–8.4× lands end to end.
+
+**Fresh bottleneck.** The prior profile had kMatmulBTQuant 50 % + kMatmul 16 % +
+kMatmulBT 14 % = 80 % of prefill. mmla makes the q8_0 kMatmulBTQuant ~1.2×
+faster on this file (the 8.4 % e2e is exactly `0.50·(1−1/1.2)`), so its share
+drops to ~44 % and **the elementwise f16/f32 GEMM (kMatmul + kMatmulBT, ~30 %,
+UNCHANGED — the 60 % f16 mass incl. the tied lm_head/embed) is now co-dominant
+and the next CPU prefill lever on this file**; on a k-quant file kMatmulBTQuant
+collapses (7–8× on q4_K) and the elementwise GEMM + attention dominate outright.
+G5 (x86 AVX2/AVX512 quant tier) and the NEON-dotprod nrc==1 tier for i8mm-absent
+aarch64 remain open follow-ups; G7 repack stays parked.
+
+**Gates at G6:** clean CPU `-Werror` build 0 warnings; the new arm TU compiles
+clean on dgx aarch64; CPU units green (test_ops_quant_dot 19/78,162,
+test_ops_quant_traits 8/5,615, test_gguf_dequant, test_gguf_keep_quant,
+test_cpu_threadpool, test_ops_matmul_elem); e2e engine gate 2/2 · 16/16 vs
+llama.cpp. CUDA regression set UNCHANGED (see the parity ledger G6 row).

@@ -19824,3 +19824,18 @@ anchor is known to be stale on the current runtime for BOTH devices.
   the M4) — DEFERRED." `scripts/qwen3-neartie-gap.py` gained `--gpu-mem-util`
   (default 0.40, GB10-safe). Not pushed. NEXT: user review; Qwen3-4B on a Mac for
   the strict proof; Metal speed (`M3c`).
+
+## 2026-07-23 — QUANT-GGUF-CIQ-GEMM **G6**: Arm i8mm (mmla) quant-GEMM tier (`CLAIM-QUANT-GGUF-CIQ-G6-1`, base `93b55c0`, worktree `/home/mudler/_git/vllm.cpp-ciq-g6` branch `ciq-g6`, dgx build `~/work/vllm.cpp-ciq-g6`)
+
+**The profile-named next CPU prefill lever landed.** After threading the two
+serial non-GEMM kernels, prefill was again GEMM-bound (kMatmulBTQuant 50 % +
+kMatmul 16 % + kMatmulBT 14 % = 80 %). G6 ports llama.cpp's Arm i8mm `nrc==2`
+`vmmlaq_s32` `vec_dot` for the FOUR encodings upstream gives one — q8_0/q4_0/q4_K/q6_K
+(q3_K/q5_K have none → stay portable) — and 2x2-tiles it into `kMatmulBTQuant`.
+
+- **Code:** [cpu_quant_dot_arm.cpp](specs/../../src/vt/cpu/cpu_quant_dot_arm.cpp) (the 4 mmla kernels + `getauxval(AT_HWCAP2)&HWCAP2_I8MM` probe + `VT_CPU_QUANT_MMLA` defeat), [cpu_quant_gemm.cpp](../src/vt/cpu/cpu_quant_gemm.cpp) `QuantChunkMmla` (parallel over weight PAIRS → thread-count-deterministic; engages only at even M,N, else the portable nrc==1 path, exactly ggml's `num_rows_per_vec_dot=1` guard), [quant.h](../include/vt/quant.h) surface, `CMakeLists.txt` per-file `-march=armv8.2-a+i8mm+dotprod`.
+- **Bit-exact vs NMSE — DETERMINED:** the int8 products accumulate into i32 exactly, and q8_0/q4_0's only float step is the block-by-block `vmlaq_f32` MAC in the scalar order, non-fused under `-ffp-contract=off` → **q8_0/q4_0 mmla is BIT-IDENTICAL to the portable/scalar tier** (`CHECK(exact==total)` passes). q4_K/q6_K add a `vpaddq`/`vmull` bias reduction that reassociates → gated at the ratified **NMSE ≤ 5e-4**. Both in the new [test_ops_quant_dot G6 cross-check](../tests/vt/test_ops_quant_dot.cpp); mmla GEMM bit-identical across threads 1/2/4/20.
+- **NO token movement:** `test_qwen36_gguf_engine` STANDALONE 2/2 · 16/16 on APEX-Compact and -Balanced vs the same-file llama.cpp oracle (q8_0/q4_K/q6_K exercised at prefill through mmla); bench-file token md5 `d235db12f2cd304007530286a1755c95` byte-identical across mmla-OFF/ON/`VT_CPU_REF=1`.
+- **Binding benchmark (idle-gated dgx aarch64, one flock):** op-level kMatmulBTQuant portable→i8mm — q8_0 ~1.2×, q6_K 3.8–4.5×, q4_K 7–8.4×; e2e prefill same-binary TTFT 1135.68→1047.70 ms (**1.084×**, 112.7→122.2 t/s), 1.56×→**1.44× behind** llama.cpp pp128 175.41. Decode unchanged (mmla off at M=1). The bench file is q8_0-dominant + 60 % f16 (pessimal for G6) so e2e is Amdahl-bounded — the 4–8× k-quant kernel win lands e2e on the APEX 35B files.
+- **Fresh bottleneck:** mmla drops the q8_0 kMatmulBTQuant share 50 %→~44 %; the elementwise f16/f32 GEMM (~30 %, UNCHANGED — the 60 % f16 mass incl. the tied lm_head/embed) is now co-dominant and the next CPU prefill lever on this file. On a k-quant file kMatmulBTQuant collapses and the elementwise GEMM + attention dominate. G5 (x86 AVX2/AVX512) and a NEON-dotprod nrc==1 tier for i8mm-absent aarch64 remain follow-ups; G7 repack parked.
+- **Gates:** CUDA production build 100 % `-Werror` 0 warnings (arm TU compiles clean in the CUDA build too); regression set UNCHANGED — 27B 235/235, 35B 315/315, Qwen3-Coder 6/6 (138), Qwen3-dense 16/16 (184), OPT 6/6, DeepSeek-V2 8/8; goldens untouched (git-verified, md5 `2965ef5772b556d3f3f86fedf4221b2f`). CPU units green (quant_dot 19/78,162, traits 5,615, dequant 215, keep_quant 5,857, threadpool 19,601, matmul_elem 654). NEXT: user review; G5 x86 tier; the elementwise-GEMM SIMD f16 lever (now co-dominant on mixed files).

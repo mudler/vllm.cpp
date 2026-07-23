@@ -73,6 +73,22 @@ FromFloatFn BlockFromFloat(DType dtype);
 // cpu_quant_dot.cpp.
 VecDotFn BlockVecDot(DType dtype);
 
+// The Arm i8mm (mmla) `nrc == 2` `vec_dot` for a block WEIGHT dtype — QUANT-
+// GGUF-CIQ-GEMM work row G6 (cpu_quant_dot_arm.cpp). Non-null ONLY when the
+// process runs on i8mm-capable aarch64 (compile-time `__ARM_FEATURE_MATMUL_INT8`
+// AND runtime `HWCAP2_I8MM`) AND the dtype is one of the four encodings upstream
+// gives an mmla path (Q8_0, Q4_0, Q4_K, Q6_K). Returns nullptr everywhere else —
+// on any other CPU, when `VT_CPU_QUANT_MMLA=0`, and for q3_K/q5_K (no upstream
+// mmla) — so the caller falls back to the portable nrc==1 tier. A returned
+// kernel produces a 2x2 output tile: it MUST be called with nrc==2, two
+// consecutive weight rows (stride bx) and two consecutive activation rows
+// (stride by), writing s[0]=(w0,a0), s[1]=(w1,a0), s[bs]=(w0,a1), s[bs+1]=(w1,a1).
+VecDotFn QuantMmlaVecDot(DType dtype);
+
+// True when the Arm i8mm mmla tier is live in this process (i8mm probed present
+// and not defeated by VT_CPU_QUANT_MMLA). Always false off i8mm-capable aarch64.
+bool QuantMmlaActive();
+
 // Bytes one quantized ACTIVATION row occupies for a given weight dtype, i.e.
 // `ggml_row_size(vec_dot_type(weight_dtype), k)`. Throws when `k` is not a
 // whole number of activation blocks (256 for the K-quants, 32 otherwise) —

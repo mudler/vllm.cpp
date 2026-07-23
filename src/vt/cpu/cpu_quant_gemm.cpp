@@ -108,6 +108,39 @@ void QuantChunk(Tensor& out, const std::vector<uint8_t>& act,
   }
 }
 
+// mmla 2x2-tiled path — cpu_quant_dot_arm.cpp kernels + ggml-cpu.c:1233-1239
+// tile convention. Parallelized over WEIGHT-ROW PAIRS so each thread owns whole
+// pairs (0,1),(2,3),… : the (weight-row, activation-row) pairing is therefore
+// GLOBAL and independent of how the pairs are chunked across threads, which is
+// what keeps the result bit-identical run-to-run AND across thread counts (the
+// project determinism contract). One `vec_dot2(nrc=2)` writes a 2x2 tile:
+// s[0]=(w_j,a_i), s[1]=(w_{j+1},a_i), s[bs]=(w_j,a_{i+1}), s[bs+1]=(w_{j+1},a_{i+1}).
+// Requires m and n even; the caller guards that (else the whole GEMM takes the
+// nrc==1 QuantChunk, exactly as ggml drops to num_rows_per_vec_dot=1).
+void QuantChunkMmla(Tensor& out, const std::vector<uint8_t>& act,
+                    size_t act_row_bytes, const Tensor& b, VecDotFn vec_dot2,
+                    int64_t k, int64_t jp0, int64_t jp1) {
+  const int64_t m = out.shape[0];
+  const int64_t n = b.shape[0];
+  const size_t w_row_bytes = RowSizeBytes(b.dtype, k);
+  const uint8_t* w = b.Ptr<const uint8_t>();
+
+  for (int64_t jp = jp0; jp < jp1; ++jp) {
+    const int64_t j = 2 * jp;
+    const uint8_t* w_row = w + static_cast<size_t>(j) * w_row_bytes;
+    for (int64_t i = 0; i + 1 < m; i += 2) {
+      const uint8_t* a_row = act.data() + static_cast<size_t>(i) * act_row_bytes;
+      float tmp[4];
+      vec_dot2(static_cast<int>(k), tmp, /*bs=*/2, w_row, /*bx=*/w_row_bytes,
+               a_row, /*by=*/act_row_bytes, /*nrc=*/2);
+      StoreOutF32(out, i * n + j, tmp[0]);
+      StoreOutF32(out, i * n + j + 1, tmp[1]);
+      StoreOutF32(out, (i + 1) * n + j, tmp[2]);
+      StoreOutF32(out, (i + 1) * n + j + 1, tmp[3]);
+    }
+  }
+}
+
 void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a,
                          const Tensor& b) {
   (void)q;
@@ -135,6 +168,20 @@ void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a,
       }
       from_float(row.data(), act.data() + static_cast<size_t>(i) * act_row_bytes,
                  k);
+    }
+
+    // Arm i8mm mmla tier (G6): a 2x2 register-tiled GEMM at prefill shapes
+    // (M even, N even). Decode (M=1) and any odd dim take the portable nrc==1
+    // path below — the same "num_rows_per_vec_dot falls to 1" guard ggml uses
+    // (ggml-cpu.c:1432). Null off i8mm hardware / when VT_CPU_QUANT_MMLA=0 /
+    // for q3_K,q5_K (no upstream mmla).
+    const int64_t n = b.shape[0];
+    const VecDotFn mmla = QuantMmlaVecDot(b.dtype);
+    if (mmla != nullptr && m % 2 == 0 && n % 2 == 0) {
+      ParallelForRows(CurrentThreadpool(), n / 2, [&](int64_t jp0, int64_t jp1) {
+        QuantChunkMmla(out, act, act_row_bytes, b, mmla, k, jp0, jp1);
+      });
+      return;
     }
 
     ParallelForRows(CurrentThreadpool(), b.shape[0],

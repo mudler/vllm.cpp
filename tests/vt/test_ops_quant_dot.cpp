@@ -685,6 +685,116 @@ TEST_CASE("G3 MatmulBTQuant fails loudly on ragged K") {
   }
 }
 
+// ---------------------------------------------------------------------------
+// G6 — Arm i8mm (mmla) tier cross-check
+//
+// The mmla `nrc==2` kernels (cpu_quant_dot_arm.cpp) only exist on i8mm-capable
+// aarch64; on every other host QuantMmlaVecDot is null and these cases skip
+// after asserting that coherently. Where the tier IS live, the mmla GEMM output
+// is cross-checked against the PORTABLE scalar vec_dot (a genuinely different
+// tier): the ratified bar is NMSE <= 5e-4, and Q8_0/Q4_0 — whose only float step
+// is a block-by-block non-fused vmlaq_f32 MAC in the scalar kernel's order — are
+// additionally asserted BIT-identical to portable. Cross-thread bit-identity on
+// the mmla path is the determinism gate.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const WeightCase kMmlaCases[] = {
+    {vt::DType::kQ4_0, 32, 18, 0, -1, "q4_0"},
+    {vt::DType::kQ8_0, 32, 34, 0, -1, "q8_0"},
+    {vt::DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
+    {vt::DType::kQ6_K, 256, 210, 208, -1, "q6_K"},
+};
+
+// Q8_0/Q4_0's only float op is the block-by-block vmlaq_f32 MAC, in the same
+// order as the scalar kernel and non-fused under -ffp-contract=off, so it is
+// expected bit-identical to the portable tier. The K-quants add a vpaddq/vmull
+// bias reduction that reassociates and are gated at NMSE only.
+bool MmlaBitExactTier(vt::DType d) {
+  return d == vt::DType::kQ4_0 || d == vt::DType::kQ8_0;
+}
+
+}  // namespace
+
+TEST_CASE("G6 mmla tier availability is coherent") {
+  // Non-null iff the tier is live AND the dtype has an upstream mmla path.
+  for (vt::DType d : {vt::DType::kQ4_0, vt::DType::kQ8_0, vt::DType::kQ4_K,
+                      vt::DType::kQ6_K}) {
+    CAPTURE(vt::Name(d));
+    CHECK((vt::cpu::QuantMmlaVecDot(d) != nullptr) == vt::cpu::QuantMmlaActive());
+  }
+  // q3_K/q5_K have no upstream mmla path: always null, even when the tier is live.
+  CHECK(vt::cpu::QuantMmlaVecDot(vt::DType::kQ3_K) == nullptr);
+  CHECK(vt::cpu::QuantMmlaVecDot(vt::DType::kQ5_K) == nullptr);
+  if (!vt::cpu::QuantMmlaActive()) {
+    MESSAGE("i8mm mmla tier not live on this host; G6 numeric checks skipped");
+  }
+}
+
+TEST_CASE("G6 mmla GEMM agrees with portable per-element vec_dot") {
+  if (!vt::cpu::QuantMmlaActive()) return;  // portable-only host
+  // Even M and N so the GEMM engages the 2x2 mmla tile for EVERY output element.
+  for (const WeightCase& c : kMmlaCases) {
+    const int64_t k = 6 * c.block_elems;
+    for (int64_t m : {int64_t{2}, int64_t{4}, int64_t{8}, int64_t{128}}) {
+      for (int64_t n : {int64_t{2}, int64_t{16}, int64_t{48}}) {
+        CAPTURE(std::string(c.name));
+        CAPTURE(m);
+        CAPTURE(k);
+        CAPTURE(n);
+        const GemmFixture f = RunGemm(c, m, k, n, 0x6A11U);
+        const size_t w_row = static_cast<size_t>(vt::RowSizeBytes(c.dtype, k));
+
+        double num = 0;
+        double den = 0;
+        int64_t exact = 0;
+        int64_t total = 0;
+        for (int64_t i = 0; i < m; ++i) {
+          const std::vector<uint8_t> aq =
+              QuantizeActivation(c.dtype, f.a.data() + i * k, k);
+          for (int64_t j = 0; j < n; ++j) {
+            const float ref = RunVecDot(
+                c.dtype, f.wq.data() + static_cast<size_t>(j) * w_row, aq.data(), k);
+            const float got = f.out[static_cast<size_t>(i * n + j)];
+            num += static_cast<double>(got - ref) * static_cast<double>(got - ref);
+            den += static_cast<double>(ref) * static_cast<double>(ref);
+            if (got == ref) ++exact;
+            ++total;
+          }
+        }
+        const double nmse = den > 0 ? num / den : num;
+        CAPTURE(nmse);
+        CAPTURE(exact);
+        CAPTURE(total);
+        CHECK(nmse <= kMaxNmseErr);
+        if (MmlaBitExactTier(c.dtype)) CHECK(exact == total);
+      }
+    }
+  }
+}
+
+TEST_CASE("G6 mmla GEMM is bit-identical across thread counts") {
+  if (!vt::cpu::QuantMmlaActive()) return;
+  for (const WeightCase& c : kMmlaCases) {
+    CAPTURE(std::string(c.name));
+    const int64_t k = 4 * c.block_elems;
+    const int64_t m = 8;   // even -> mmla path
+    const int64_t n = 24;  // even -> mmla path
+    const GemmFixture base = RunGemm(c, m, k, n, 0x711EU);
+    for (int threads : {1, 2, 4, 20}) {
+      CAPTURE(threads);
+      vt::cpu::Threadpool tp(threads);
+      vt::cpu::Threadpool* prev = vt::cpu::Threadpool::SwapForTesting(&tp);
+      const GemmFixture again = RunGemm(c, m, k, n, 0x711EU);
+      vt::cpu::Threadpool::SwapForTesting(prev);
+      REQUIRE(again.out.size() == base.out.size());
+      CHECK(std::memcmp(again.out.data(), base.out.data(),
+                        base.out.size() * sizeof(float)) == 0);
+    }
+  }
+}
+
 TEST_CASE("G3 MatmulBTQuant matches per-row vec_dot exactly (no GEMM drift)") {
   // The GEMM must be nothing but "quantize src1 once, then one vec_dot per
   // output" (ggml-cpu.c:1313-1443). Comparing the op's output BIT-EXACTLY

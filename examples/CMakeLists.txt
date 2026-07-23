@@ -25,6 +25,13 @@ add_executable(vllm-cli cli/main.cpp)
 target_link_libraries(vllm-cli PRIVATE vllm::shared)
 vllm_cpp_set_warnings(vllm-cli)
 
+# quant-gemm-bench (QUANT-GGUF-CIQ-GEMM G6 evidence tool, NOT a gate): op-level
+# GFLOP/s for kMatmulBTQuant, portable vs Arm i8mm mmla tier.
+add_executable(quant-gemm-bench quant_gemm_bench/main.cpp)
+target_link_libraries(quant-gemm-bench PRIVATE vllm::vllm)
+target_include_directories(quant-gemm-bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_set_warnings(quant-gemm-bench)
+
 # The OpenAI HTTP server example is gated on the vendored cpp-httplib transport.
 if(VLLM_CPP_SERVER)
   add_executable(server server/main.cpp)

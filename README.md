@@ -29,7 +29,7 @@ vllm.cpp implements an intentionally focused subset of vLLM, held to token-for-t
 | GGUF loading (F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) | Supported; compute-in-quant on CPU | Weights in six block encodings stay compressed from file to matmul on CPU (no BF16 expansion) |
 | CPU backend vs llama.cpp | At or ahead on every axis (GGUF) | Prefill 1.18x ahead, decode at parity, peak memory 1.01x, byte-identical greedy tokens |
 | Paged KV cache + prefix caching | Supported | Block-paged full attention, hybrid full-attention + GDN state groups, automatic prefix caching (APC) on by default for dense models |
-| KV offload to CPU / disk | Built, opt-in, off by default | CPU and disk tiers with identity-checked blocks; scheduler connector wired, worker-side GPU load pending |
+| KV offload to CPU / disk | Built, opt-in, off by default | CPU and disk tiers with identity-checked blocks, selected by a KVTransferConfig connector (disk-offload now, LMCache next) over one abstract KVConnector ABI; scheduler wired, worker-side GPU load pending |
 | LMCache client (`lm://` remote KV) | Client built, engine wiring pending | Pure-C++ `lm://` TCP client; PUT/GET byte-identical against a real `lmcache.v1.server` and bidirectional with LMCache's own Python codec, no `lmcache` package in-process |
 | Sampling | Supported | Greedy, temperature, top-k, top-p, min-p, penalties, allowed-token / bad-word masks |
 | Structured output | Supported (subset) | JSON schema, JSON object, regex, choice, GBNF grammar, Hermes-style tool-call subset |
@@ -264,7 +264,7 @@ For C++ consumers, the higher-level surface lives under [`include/vllm/`](includ
 ## Serving and API notes
 
 - **Automatic prefix caching (APC)** is implemented and on by default for dense models (hybrid / GDN and attention-free default off, mirroring vLLM). Hit-rate statistics are counted per vLLM's own counters. Some block-hash extra keys (multimodal / LoRA / `cache_salt`) are stubbed, and there is no `/metrics` endpoint yet.
-- **KV persistence to disk / CPU offload** is built (CPU and disk tiers, identity-checked blocks, a size-budgeted disk tier) and wired opt-in into the scheduler, but it is off by default and the worker-side GPU load plus a server flag are the next step.
+- **KV persistence to disk / CPU offload** is built (CPU and disk tiers, identity-checked blocks, a size-budgeted disk tier) and wired opt-in into the scheduler through an abstract `KVConnector` ABI selected by a `KVTransferConfig` (the disk-offload connector now, the LMCache `lm://` client next, over the same seam), but it is off by default and the worker-side GPU load plus a server flag are the next step.
 - **Tool calling** uses a Hermes-style / Qwen3 parser subset; the Qwen3-Coder XML forced-reasoning template is not fully implemented.
 - `/health` reports process liveness rather than a full engine-health probe.
 - **Speculative decoding** is not user-visible yet (MTP foundations exist).

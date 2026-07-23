@@ -74,7 +74,7 @@
 #include "vllm/v1/request.h"
 
 namespace vllm::v1::kv_offload {
-class KVConnectorScheduler;  // vllm/v1/kv_offload/kv_connector.h (KV-OFFLOAD W4)
+class KVConnector;  // vllm/v1/kv_offload/kv_connector.h (KV-CONNECTORS W5 ABI)
 }  // namespace vllm::v1::kv_offload
 
 namespace vllm::v1 {
@@ -175,10 +175,10 @@ class Scheduler {
   // provably inert when off, so every existing model regression is unaffected.
   // The scheduler does NOT own the connector; the caller keeps it alive for the
   // scheduler's lifetime.
-  void set_kv_connector(kv_offload::KVConnectorScheduler* connector) {
+  void set_kv_connector(kv_offload::KVConnector* connector) {
     kv_connector_ = connector;
   }
-  kv_offload::KVConnectorScheduler* kv_connector() const {
+  kv_offload::KVConnector* kv_connector() const {
     return kv_connector_;
   }
 
@@ -248,7 +248,7 @@ class Scheduler {
  private:
   // KV-OFFLOAD W4: the scheduler-facing KV connector (non-owning, opt-in, null by
   // default). See set_kv_connector.
-  kv_offload::KVConnectorScheduler* kv_connector_ = nullptr;
+  kv_offload::KVConnector* kv_connector_ = nullptr;
 
   // Backing store for prefix_cache_metrics(); written only by schedule().
   CachingMetrics prefix_cache_metrics_;

@@ -281,6 +281,7 @@ add_library(vllm STATIC
   src/vllm/version.cpp
   src/vllm/sampling_params.cpp
   src/vllm/config/scheduler.cpp
+  src/vllm/config/kv_transfer.cpp
   src/vllm/outputs.cpp
   src/vllm/transformers_utils/hf_config.cpp
   src/vllm/model_executor/model_loader/safetensors_reader.cpp

@@ -18,9 +18,11 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "vllm/config/kv_transfer.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/v1/core/sched/scheduler.h"
 #include "vllm/v1/kv_cache_interface.h"
@@ -132,8 +134,10 @@ class TempDir {
 
 // A programmable connector for the scheduler-plumbing gate: it returns a queued
 // sequence of MatchResults and records every hook call.
-class MockConnector : public KVConnectorScheduler {
+class MockConnector : public KVConnector {
  public:
+  MockConnector() : KVConnector(KVConnectorRole::kScheduler) {}
+
   std::vector<MatchResult> answers;  // consumed front-to-back
   size_t answer_idx = 0;
   int alloc_calls = 0;
@@ -156,7 +160,11 @@ class MockConnector : public KVConnectorScheduler {
     build_meta_calls += 1;
     return {};
   }
-  void request_finished(const Request&) override { finished_calls += 1; }
+  RequestFinishedResult request_finished_all_groups(
+      const Request&, const std::vector<std::vector<int>>&) override {
+    finished_calls += 1;
+    return RequestFinishedResult{};
+  }
   void on_schedule_end() override { on_schedule_end_calls += 1; }
 };
 
@@ -325,4 +333,284 @@ TEST_CASE("Connector e2e: a restarted-prefix disk HIT shortcuts prefill") {
     CHECK(got == stored[j]);  // byte-identical across the restart
     mgr->complete_load({key}, wctx);
   }
+}
+
+// ===========================================================================
+// KV-CONNECTORS W5: the abstract KVConnector ABI + KVTransferConfig selection.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// KVTransferConfig validation + predicates (mirror test_config.py).
+// ---------------------------------------------------------------------------
+TEST_CASE("KVTransferConfig: default is inert; policy defaults to fail") {
+  vllm::KVTransferConfig cfg;
+  cfg.Validate();  // fills engine_id; no connector -> no throw
+  CHECK_FALSE(cfg.is_kv_transfer_instance());
+  CHECK_FALSE(cfg.is_kv_producer());
+  CHECK_FALSE(cfg.is_kv_consumer());
+  CHECK(cfg.kv_load_failure_policy == vllm::KVLoadFailurePolicy::kFail);
+  CHECK(cfg.engine_id.has_value());
+}
+
+TEST_CASE("KVTransferConfig: kv_connector without kv_role is refused") {
+  vllm::KVTransferConfig cfg;
+  cfg.kv_connector = "OffloadingConnector";
+  // kv_role omitted -> __post_init__ (:102-106) rejects.
+  CHECK_THROWS_AS(cfg.Validate(), std::invalid_argument);
+}
+
+TEST_CASE("KVTransferConfig: role predicates + string round-trips") {
+  vllm::KVTransferConfig both;
+  both.kv_connector = "OffloadingConnector";
+  both.kv_role = vllm::KVRole::kBoth;
+  both.Validate();
+  CHECK(both.is_kv_transfer_instance());
+  CHECK(both.is_kv_producer());
+  CHECK(both.is_kv_consumer());
+
+  vllm::KVTransferConfig prod;
+  prod.kv_connector = "OffloadingConnector";
+  prod.kv_role = vllm::KVRole::kProducer;
+  prod.Validate();
+  CHECK(prod.is_kv_producer());
+  CHECK_FALSE(prod.is_kv_consumer());
+
+  CHECK(vllm::parse_kv_role("kv_both") == vllm::KVRole::kBoth);
+  CHECK(vllm::parse_kv_role("kv_producer") == vllm::KVRole::kProducer);
+  CHECK_FALSE(vllm::parse_kv_role("bogus").has_value());
+  CHECK(std::string(vllm::kv_role_str(vllm::KVRole::kConsumer)) ==
+        "kv_consumer");
+  CHECK(vllm::parse_kv_load_failure_policy("recompute") ==
+        vllm::KVLoadFailurePolicy::kRecompute);
+  CHECK(std::string(vllm::kv_load_failure_policy_str(
+            vllm::KVLoadFailurePolicy::kFail)) == "fail");
+
+  vllm::KVTransferConfig e;
+  e.kv_connector_extra_config["root_dir"] = "/tmp/x";
+  CHECK(e.get_from_extra_config("root_dir", "def") == "/tmp/x");
+  CHECK(e.get_from_extra_config("missing", "def") == "def");
+}
+
+// ---------------------------------------------------------------------------
+// KVConnectorFactory: config-driven selection. An absent/empty config is a
+// no-op (nullptr); a named config builds the concrete connector; unknown names
+// and duplicate registration throw. (factory.py:33-36,91-92,96-125.)
+// ---------------------------------------------------------------------------
+TEST_CASE("KVConnectorFactory: absent config selects NO connector (default off)") {
+  // No config at all -> nullptr.
+  KVConnectorContext none;
+  CHECK(KVConnectorFactory::Create(none) == nullptr);
+
+  // A config with no connector name -> still nullptr (inert).
+  vllm::KVTransferConfig empty;
+  empty.Validate();
+  KVConnectorContext ctx;
+  ctx.config = &empty;
+  CHECK(KVConnectorFactory::Create(ctx) == nullptr);
+}
+
+TEST_CASE("KVConnectorFactory: the disk connector is registered + selectable") {
+  CHECK(KVConnectorFactory::IsRegistered("OffloadingConnector"));
+
+  // Duplicate registration is rejected (factory.py:33-36).
+  CHECK_THROWS(KVConnectorFactory::Register(
+      "OffloadingConnector",
+      &OffloadingConnector::CreateFromConfig));
+
+  // An unknown connector name throws (factory.py:91-92).
+  vllm::KVTransferConfig bad;
+  bad.kv_connector = "NoSuchConnector";
+  bad.kv_role = vllm::KVRole::kBoth;
+  bad.Validate();
+  KVConnectorContext bctx;
+  bctx.config = &bad;
+  CHECK_THROWS(KVConnectorFactory::Create(bctx));
+
+  // The disk connector builds from config, into an owning KVConnector that
+  // reports HMA support (§Risks R7).
+  TempDir dir("factory");
+  const CacheIdentity id = BaseIdentity();
+  vllm::KVTransferConfig cfg;
+  cfg.kv_connector = "OffloadingConnector";
+  cfg.kv_role = vllm::KVRole::kBoth;
+  cfg.kv_connector_extra_config["root_dir"] = dir.str();
+  cfg.kv_connector_extra_config["num_cpu_blocks"] = "8";
+  cfg.kv_connector_extra_config["offload_block_tokens"] =
+      std::to_string(kBlockSize);
+  cfg.Validate();
+  KVConnectorContext ctx;
+  ctx.config = &cfg;
+  ctx.page_size_bytes = kPage;
+  ctx.block_size = kBlockSize;
+  ctx.identity = &id;
+  std::unique_ptr<KVConnector> conn = KVConnectorFactory::Create(ctx);
+  REQUIRE(conn != nullptr);
+  CHECK(conn->role() == KVConnectorRole::kScheduler);
+  CHECK(conn->supports_hma());  // OffloadingConnector is SupportsHMA
+
+  // Missing root_dir is refused (a disk tier needs a home).
+  vllm::KVTransferConfig no_root;
+  no_root.kv_connector = "OffloadingConnector";
+  no_root.kv_role = vllm::KVRole::kBoth;
+  no_root.Validate();
+  KVConnectorContext nctx;
+  nctx.config = &no_root;
+  nctx.page_size_bytes = kPage;
+  nctx.identity = &id;
+  CHECK_THROWS(KVConnectorFactory::Create(nctx));
+}
+
+// ---------------------------------------------------------------------------
+// Interface-completeness oracle (mirror test_multi_connector_overrides_all_
+// base_methods): a connector may override EVERY method of the abstract base,
+// and the base supplies safe defaults for the worker-side no-op hooks.
+// ---------------------------------------------------------------------------
+namespace {
+class AllOverridesConnector : public KVConnector {
+ public:
+  AllOverridesConnector() : KVConnector(KVConnectorRole::kWorker) {}
+  mutable int calls = 0;
+  MatchResult get_num_new_matched_tokens(const Request&, int) override {
+    calls++;
+    return MatchResult{0, false};
+  }
+  void update_state_after_alloc(const Request&,
+                                const std::vector<std::vector<int>>&,
+                                int) override {
+    calls++;
+  }
+  std::vector<ConnectorLoadJob> build_connector_meta() override {
+    calls++;
+    return {};
+  }
+  bool supports_hma() const override { return true; }
+  RequestFinishedResult request_finished_all_groups(
+      const Request&, const std::vector<std::vector<int>>&) override {
+    calls++;
+    return RequestFinishedResult{true, std::nullopt};  // deferred free
+  }
+  void register_kv_caches() override { calls++; }
+  void start_load_kv() override { calls++; }
+  void wait_for_layer_load(const std::string&) override { calls++; }
+  void save_kv_layer(const std::string&) override { calls++; }
+  void wait_for_save() override { calls++; }
+  std::vector<std::string> get_finished() override {
+    calls++;
+    return {"r0"};
+  }
+  void on_schedule_end() override { calls++; }
+};
+}  // namespace
+
+TEST_CASE("KVConnector: the abstract base's full method set is overridable") {
+  AllOverridesConnector c;
+  auto req = MakeRequest("z", 16, /*seed=*/11);
+  CHECK(c.role() == KVConnectorRole::kWorker);
+  c.get_num_new_matched_tokens(*req, 0);
+  c.update_state_after_alloc(*req, {{0}}, 0);
+  c.build_connector_meta();
+  // The single-group request_finished folds into request_finished_all_groups.
+  RequestFinishedResult rf = c.request_finished(*req, {0});
+  CHECK(rf.delay_free);  // deferred block-free ownership (§Risks R6)
+  c.register_kv_caches();
+  c.start_load_kv();
+  c.wait_for_layer_load("layer.0");
+  c.save_kv_layer("layer.0");
+  c.wait_for_save();
+  CHECK(c.get_finished() == std::vector<std::string>{"r0"});
+  c.on_schedule_end();
+  CHECK(c.calls == 11);  // every method reached
+
+  // Base defaults for the worker-side no-op hooks are safe (a scheduler-only
+  // connector need not implement them). Exercise them via MockConnector, which
+  // does NOT override the worker hooks.
+  MockConnector m;
+  m.register_kv_caches();
+  m.start_load_kv();
+  m.wait_for_layer_load("x");
+  m.save_kv_layer("x");
+  m.wait_for_save();
+  CHECK(m.get_finished().empty());          // base default: nothing pending
+  CHECK_FALSE(m.supports_hma());            // base default: no HMA
+}
+
+// ---------------------------------------------------------------------------
+// BEHAVIOUR-IDENTICAL PROOF for the OWNING (factory) path: a connector BUILT BY
+// KVTransferConfig over a persisted disk directory shortcuts prefill by EXACTLY
+// the same amount as the borrowing-constructor restart-hit case above (32/48).
+// This proves the W5 seam refactor did not change the disk connector's behaviour.
+// ---------------------------------------------------------------------------
+TEST_CASE("KVConnector e2e: the config-selected disk connector shortcuts prefill "
+          "identically to the borrowing path") {
+  TempDir dir("factory_e2e");
+  const CacheIdentity id = BaseIdentity();
+
+  const int kPromptTokens = 48;
+  const int kPromptBlocks = kPromptTokens / kBlockSize;  // 3
+  auto req_probe = MakeRequest("warm", kPromptTokens, /*seed=*/7);
+  REQUIRE(static_cast<int>(req_probe->block_hashes.size()) == kPromptBlocks);
+
+  // "Process 1": write the prefix's blocks to the DISK tier, then clear CPU so
+  // the blocks live ONLY on disk (a genuine restart) — identical setup to the
+  // borrowing-path e2e above.
+  {
+    auto view = std::make_unique<HeapPrimaryByteView>(/*num_blocks=*/8, kPage);
+    auto primary = std::make_unique<CPUOffloadingManager>(8, "lru");
+    FileSystemTierOptions opts;
+    opts.root_dir = dir.str();
+    opts.identity = id;
+    auto secondary = std::make_unique<FileSystemTier>(opts);
+    auto mgr = std::make_unique<TieringOffloadingManager>(
+        std::move(primary), std::move(secondary), *view);
+    const ReqContext pctx{"populate"};
+    mgr->on_new_request(pctx);
+    for (int j = 0; j < kPromptBlocks; ++j) {
+      const OffloadKey key = make_offload_key(req_probe->block_hashes[j], 0);
+      const std::vector<uint8_t> payload = Payload(key);
+      auto out = mgr->prepare_store({key}, pctx);
+      REQUIRE(out.has_value());
+      auto* spec = dynamic_cast<CPULoadStoreSpec*>(out->store_spec.get());
+      REQUIRE(spec != nullptr);
+      std::memcpy(view->slot(spec->block_ids[0]), payload.data(), kPage);
+      mgr->complete_store({key}, pctx, true);
+      mgr->drain_jobs();
+    }
+    mgr->reset_cache();  // CPU cleared; disk SURVIVES
+  }
+
+  // "Process 2 (restart)": build the connector PURELY FROM CONFIG over the same
+  // root_dir. Its fresh CPU tier is empty; the disk tier is read from root_dir.
+  vllm::KVTransferConfig cfg;
+  cfg.kv_connector = "OffloadingConnector";
+  cfg.kv_role = vllm::KVRole::kBoth;
+  cfg.kv_connector_extra_config["root_dir"] = dir.str();
+  cfg.kv_connector_extra_config["num_cpu_blocks"] = "8";
+  cfg.kv_connector_extra_config["offload_block_tokens"] =
+      std::to_string(kBlockSize);
+  cfg.Validate();
+  KVConnectorContext ctx;
+  ctx.config = &cfg;
+  ctx.page_size_bytes = kPage;
+  ctx.block_size = kBlockSize;
+  ctx.identity = &id;
+  std::unique_ptr<KVConnector> conn = KVConnectorFactory::Create(ctx);
+  REQUIRE(conn != nullptr);
+
+  auto sched = CreateScheduler();
+  sched->set_kv_connector(conn.get());
+  sched->add_request(MakeRequest("warm", kPromptTokens, /*seed=*/7));
+
+  // Step 1: every prefix block is on disk -> promotions initiated, request
+  // DEFERRED (the nullopt third state). Step 2: the hits are reported.
+  auto out1 = sched->schedule();
+  CHECK(out1.num_scheduled_tokens.count("warm") == 0);
+  auto out2 = sched->schedule();
+  REQUIRE(out2.num_scheduled_tokens.count("warm") == 1);
+
+  const int treated_prefill = out2.num_scheduled_tokens.at("warm");
+  const int expected_hit_blocks = (kPromptTokens - 1) / kBlockSize;  // 2
+  const int prefill_saved = kPromptTokens - treated_prefill;
+  // EXACTLY the borrowing path's numbers: 32 tokens saved, 16 recomputed.
+  CHECK(prefill_saved == expected_hit_blocks * kBlockSize);  // 32
+  CHECK(treated_prefill == kBlockSize);                      // 16
 }

@@ -352,7 +352,10 @@ checked in SKIPPED with the tracked reason, never dropped.
 
 - **Rows.** Reuses `KV-EXTERNAL-CACHE` / `KV-CONNECTORS` W5 (the abstract
   `KVConnector` ABI + `KVTransferConfig` + registration) as the seam; that seam
-  must land first. Gate 6 inherits the caching spike's `KV-PREFIX-CACHE` W1
+  **LANDED 2026-07-23** (`KV-CONNECTORS` `SPIKE`→`ACTIVE`), so client-W3 is now
+  unblocked: subclass `KVConnector`, register with `REGISTER_KV_CONNECTOR`, and
+  select via `KVTransferConfig{kv_connector="LMCacheConnector"}` — no seam change
+  is owed. Gate 6 inherits the caching spike's `KV-PREFIX-CACHE` W1
   hit-rate counters (already landed) to prove hits. `KV-FP8`/`KV-NVFP4-TURBO`
   gate quantized-KV interop (deferred).
 - **New third-party deps, by mode.** MODE (1): **none** for transport (raw TCP)
@@ -378,7 +381,7 @@ Ordered highest-value / lowest-risk first. Nothing is started; every row is
 | W0 | **This analysis** — the two wire protocols mapped `file:line`, the feasibility verdict, showstoppers, and the recommendation of MODE (1) first | this document | CPU | **DONE (analysis)** |
 | W1 | **MODE (1) protocol codec + blake3** — `ClientMetaMessage`/`ServerMetaMessage` `struct` encode/decode, `CacheEngineKey.to_string`, the `TokenHasher`, plus the `KV_2LTD` `[2,L,T,D]` repack, all byte/bit-exact against captured Python fixtures | gate 1 | CPU | **DONE 2026-07-23** — `src/vllm/v1/kv_offload/lmcache/{remote_protocol,cache_engine_key,token_hasher,memory_format}.{h,cpp}` + vendored `third_party/blake3/` 1.5.5. Gate 1 GREEN: `test_lmcache_codec` 6/6 cases, 2074/2074 assertions == the real Python codec bytes (stdlib `struct` + `blake3` PyPI + numpy); blake3 byte-identical x86-64 + `dgx.casa` aarch64; INERT (no call site — connector is W3) |
 | W2 | **MODE (1) TCP client + `MemoryFormat` repack + interop round-trip** — a blocking TCP `LMCacheRemoteClient`, device→host repack into `KV_2LTD`, PUT/GET/EXIST against a REAL `lmcache.v1.server`; stand the server up | gates 2, 5 | CPU | **DONE 2026-07-23** — `remote_client.{h,cpp}` (blocking POSIX-socket PUT/GET/EXIST/HEALTH/LIST, partial-read/write loops, `PutKv2ltd`/`GetKv2ltd` repack, `LmcacheClientConfig` + `VT_LMCACHE_*` env). Gate 2+5 GREEN against a **REAL `lmcache.v1.server`** (`8570aad`): PUT→GET byte-identical, EXIST true/absent, absent-GET returns absent, KV_2LTD repack byte-identical; **BIDIRECTIONAL** interop proven with LMCache's OWN protocol codec on the Python side (Python real-codec PUT→C++ GET, and C++ PUT→Python real-codec GET, both byte-identical). Server ran headless from source (torch-CPU + small deps in a throwaway venv; torch imported before lmcache to dodge a torch circular import; the compiled `c_ops` native ext stubbed — unused by the lm:// CPU store). Always-on CI gate = a same-binary C++ mock-server round-trip (`test_lmcache_client`, no Python); live gate = `scripts/lmcache/run_live_roundtrip.sh`. INERT (no engine call site; the connector is W3) |
-| W3 | **MODE (1) as a `KVConnector` subclass** wired over the W5 seam (opt-in, default-off), + the key-agreement gate against a Python vLLM+LMCache peer | gate 3, then 4/6/7 | CPU, then DGX | open |
+| W3 | **MODE (1) as a `KVConnector` subclass** wired over the W5 seam (opt-in, default-off), + the key-agreement gate against a Python vLLM+LMCache peer | gate 3, then 4/6/7 | CPU, then DGX | open — **seam prerequisite MET 2026-07-23** (the abstract `KVConnector` ABI + `KVConnectorFactory` + `KVTransferConfig` landed under `KV-CONNECTORS`) |
 | W4 | **MODE (2) MP client** — libzmq DEALER + msgpack codec + `RawCudaIPCWrapper` CUDA-IPC export + the fixed pickle template; only if MODE (1) proves insufficient (e.g. a deployment that only runs the MP server) | gates 2–7 for MP | DGX | open — **contingent** |
 | — | Redis/S3/Mooncake/Infinistore/GDS backends, CB/blend, P2P | **NOT SCHEDULED** (§Risks D2) | — | dispositioned |
 

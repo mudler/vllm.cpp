@@ -20821,6 +20821,74 @@ live links is in git history at `9d2b8ba`.
 > decode already at parity. 35B correctness holds (315/315). See
 > Benchmarks (docs/BENCHMARKS.md).
 
+## 2026-07-23 — KV-persistence **W5**: the connector seam as a first-class C++ ABI (`CLAIM-KV-PERSISTENCE-LMCACHE`, `KV-CONNECTORS`/`KV-OFFLOAD`, base `origin/main` `88dcba7`, worktree `kv-w5-worktree` branch `kv-connectors-w5`)
+
+**What landed.** W5 generalizes W4's single connector into the abstract
+`KVConnector` ABI mirroring vLLM `KVConnectorBase_V1`
+(`vllm/distributed/kv_transfer/kv_connector/v1/base.py:171` @ `e24d1b24`), so both
+the landed disk-offload tier and the future LMCache `lm://` client plug in as
+connectors selected by config. Pure CPU, additive, default-off.
+
+- **Abstract `KVConnector` base** (`include/vllm/v1/kv_offload/kv_connector.h`):
+  the full scheduler + worker method set of `KVConnectorBase_V1`.
+  - LOAD-BEARING for correctness (scheduler side, pure virtual):
+    `get_num_new_matched_tokens` (`base.py:454`, the nullopt third state),
+    `update_state_after_alloc` (`base.py:489`), `build_connector_meta`
+    (`base.py:510`), `request_finished`/`request_finished_all_groups`
+    (`base.py:542`, deferred-free ownership + the `SupportsHMA` multi-group
+    finish, `base.py:85`).
+  - NO-OP hooks for our SYNCHRONOUS runner (defaulted in the base):
+    `register_kv_caches` (`base.py:251`), `start_load_kv` (`base.py:293`),
+    `wait_for_layer_load`/`save_kv_layer` (`base.py:311,325` — layerwise is NOT
+    SCHEDULED, §Risks R8), `wait_for_save` (`base.py:347`), `get_finished`
+    (`base.py:357` — synchronous connectors leave nothing pending across steps).
+    `KVConnectorRole` (`base.py:124`).
+- **`KVConnectorFactory` + `REGISTER_KV_CONNECTOR`**
+  (`src/vllm/v1/kv_offload/kv_connector.cpp`): a compile-time registry mirroring
+  `factory.py:27-125`, the C++ analogue of the Python `importlib`
+  `kv_connector_module_path` (recorded deviation; mirrors `REGISTER_VLLM_MODEL`).
+  Duplicate registration and unknown names throw; an absent/empty config selects
+  NO connector (nullptr) — the default-off inert path.
+- **`KVTransferConfig`** (`include/vllm/config/kv_transfer.h` +
+  `src/vllm/config/kv_transfer.cpp`): mirrors `vllm/config/kv_transfer.py:22-121`
+  — `kv_connector`, `kv_role` (required whenever `kv_connector` is set,
+  `:102-106`), `kv_connector_extra_config`, `kv_load_failure_policy` (default
+  `fail`, `:69`), the `is_kv_transfer_instance`/producer/consumer predicates and
+  string round-trips. Distributed-only knobs (NIXL/P-D) intentionally dropped.
+- **The W4 disk connector now IMPLEMENTS the abstract base** behaviour-identically:
+  `OffloadingConnector` derives from `KVConnector`, declares `supports_hma()`,
+  and adds a `CreateFromConfig` owning builder (registered as
+  `"OffloadingConnector"`) that builds+owns the CPU+disk tiering stack from
+  `kv_connector_extra_config`. Its scheduler-side method bodies are unchanged.
+- **Scheduler**: the `KVConnectorScheduler*` member/setter renamed to
+  `KVConnector*` (type only, no behaviour change; null == zero change).
+
+**Behaviour-identical proof.** The W4 restart-hit e2e reproduces byte-for-byte
+through the refactored ABI (32/48 prefill tokens saved, 2/3 blocks promoted from
+disk, promoted bytes byte-identical), and a NEW e2e proves the config-selected
+OWNING connector (built by `KVConnectorFactory` from a `KVTransferConfig` over a
+persisted disk directory) shortcuts prefill by the EXACT same 32/48.
+
+**What LMCache client-W3 must now fill in (no further seam change):** subclass
+`KVConnector`, implement the three scheduler methods (LMCache always returns
+`(n, false)`, `lmcache_connector.py:230-254`), register with
+`REGISTER_KV_CONNECTOR("LMCacheConnector", …)`, drive the landed W2
+`LMCacheRemoteClient` from the worker hooks, and select with
+`KVTransferConfig{kv_connector="LMCacheConnector"}`.
+
+**Gates (CPU, dev box).** `test_kv_offload_connector` 11/11 (80 assertions:
+config validation/predicates/round-trips, factory selection incl. dup/unknown
+throw + missing-root refusal, an interface-completeness oracle over EVERY base
+method + the worker-hook defaults, both restart-hit e2es); the rest of the CPU
+kv_offload suite unchanged green (`test_kv_offload_cpu` 21/21,
+`test_kv_offload_fs` 22/22+3skip, `test_kv_offload_tiering` 5/5,
+`test_none_hash_determinism` 7/7); `test_scheduler`/`test_kv_cache_manager`/
+`test_scheduler_config` green (rename regression check). Clean CPU `-Werror` 0
+warnings. **DGX gates (asserts-on for DeepSeek) + CUDA `-Werror` + SACRED
+regressions + memcheck** are the closing gate — see the closing commit / ledger.
+By construction the SACRED gates are byte-identical: with no connector configured
+(the default) the only scheduler change is a type rename.
+
 ### Relocated verbatim from README `9d2b8ba` - Current status + Current performance track tables
 
 ## Current status

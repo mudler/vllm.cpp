@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "vllm/v1/core/sched/utils.h"           // check_stop
-#include "vllm/v1/kv_offload/kv_connector.h"    // KVConnectorScheduler (W4)
+#include "vllm/v1/kv_offload/kv_connector.h"    // KVConnector abstract ABI (W5)
 #include "vllm/v1/structured_output/manager.h"  // StructuredOutputManager
 
 namespace vllm::v1 {

@@ -26,6 +26,14 @@ LMCacheConnector::LMCacheConnector(LmcacheConnectorConfig config,
   if (config_.chunk_tokens <= 0) {
     throw std::runtime_error("LMCacheConnector: chunk_tokens must be > 0");
   }
+  // W4: the peer-agreeing key derivation (vLLM sha256_cbor over chunk_tokens),
+  // byte-identical to a real Python vLLM+LMCache peer (chunked_token_database.h).
+  if (config_.key_mode == LmcacheConnectorConfig::KeyMode::kVllmSha256Cbor) {
+    peer_db_ = std::make_unique<ChunkedTokenDatabase>(
+        config_.chunk_tokens,
+        ChunkedTokenDatabase::NoneHashFromSeed(config_.none_hash_seed),
+        config_.save_unfull_chunk, PreCachingHash::kSha256Cbor);
+  }
 }
 
 LMCacheConnector::~LMCacheConnector() = default;
@@ -38,7 +46,17 @@ void LMCacheConnector::EnsureConnected() {
 
 std::vector<uint64_t> LMCacheConnector::ChunkFolds(
     const std::vector<int32_t>& token_ids) const {
-  // The rolling blake3 wants unsigned token ids (struct.pack ">I").
+  // W4 peer-agreeing path: the vLLM sha256_cbor ChunkedTokenDatabase produces
+  // the exact folded uint64 chunk hashes a real Python peer keys on.
+  if (peer_db_ != nullptr) {
+    std::vector<uint64_t> folds;
+    for (const ChunkedTokenDatabase::Entry& e : peer_db_->ProcessTokens(token_ids)) {
+      folds.push_back(e.chunk_hash);
+    }
+    return folds;
+  }
+  // W3 self-consistent path: the rolling blake3 wants unsigned token ids
+  // (struct.pack ">I").
   std::vector<uint32_t> toks(token_ids.size());
   for (std::size_t i = 0; i < token_ids.size(); ++i) {
     toks[i] = static_cast<uint32_t>(token_ids[i]);
@@ -205,19 +223,32 @@ std::unique_ptr<KVConnector> LMCacheConnector::CreateFromConfig(
   if (!host.empty()) client_cfg.host = host;
   const std::string port = cfg.get_from_extra_config("port", "");
   if (!port.empty()) client_cfg.port = static_cast<int>(std::stoll(port));
+  // hash_algo selects the KEY derivation. "vllm" (or the explicit
+  // "sha256_cbor") is the W4 PEER-AGREEING path: vLLM's own sha256_cbor over
+  // chunk_size 256, byte-identical to a real Python vLLM+LMCache peer. "blake3"
+  // is W3's self-consistent path. Default stays blake3 for back-compat.
   const std::string algo = cfg.get_from_extra_config("hash_algo", "");
+  LmcacheConnectorConfig conn_cfg;
   if (algo == "blake3") {
     client_cfg.hash_algo = LmcacheClientConfig::HashAlgo::kBlake3;
-  } else if (algo == "vllm") {
+    conn_cfg.key_mode = LmcacheConnectorConfig::KeyMode::kBlake3BlockAligned;
+  } else if (algo == "vllm" || algo == "sha256_cbor") {
     client_cfg.hash_algo = LmcacheClientConfig::HashAlgo::kVllm;
+    conn_cfg.key_mode = LmcacheConnectorConfig::KeyMode::kVllmSha256Cbor;
   } else if (!algo.empty()) {
     throw std::runtime_error(
-        "LMCacheConnector: hash_algo must be 'blake3' or 'vllm'");
+        "LMCacheConnector: hash_algo must be 'blake3', 'vllm', or 'sha256_cbor'");
   }
 
-  LmcacheConnectorConfig conn_cfg;
-  conn_cfg.chunk_tokens =
-      static_cast<int>(extra_int(cfg, "chunk_tokens", ctx.block_size));
+  // Peer mode chunks at LMCache's default 256 unless overridden; blake3 mode
+  // stays block-aligned (chunk_tokens == block_size).
+  const bool peer =
+      conn_cfg.key_mode == LmcacheConnectorConfig::KeyMode::kVllmSha256Cbor;
+  conn_cfg.chunk_tokens = static_cast<int>(
+      extra_int(cfg, "chunk_tokens", peer ? 256 : ctx.block_size));
+  conn_cfg.none_hash_seed = cfg.get_from_extra_config("none_hash_seed", "0");
+  conn_cfg.save_unfull_chunk =
+      cfg.get_from_extra_config("save_unfull_chunk", "false") == "true";
   conn_cfg.world_size = extra_int(cfg, "world_size", 1);
   conn_cfg.worker_id = extra_int(cfg, "worker_id", 0);
   conn_cfg.offload_prompt_only =

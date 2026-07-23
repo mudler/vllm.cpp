@@ -348,6 +348,9 @@ add_library(vllm STATIC
   src/vllm/v1/kv_offload/lmcache/remote_protocol.cpp
   src/vllm/v1/kv_offload/lmcache/cache_engine_key.cpp
   src/vllm/v1/kv_offload/lmcache/token_hasher.cpp
+  # W4 peer-agreeing key derivation (ChunkedTokenDatabase: vLLM sha256_cbor,
+  # chunk_size 256) — byte-identical CacheEngineKeys vs a real Python peer.
+  src/vllm/v1/kv_offload/lmcache/chunked_token_database.cpp
   src/vllm/v1/kv_offload/lmcache/remote_client.cpp
   # LMCache lm:// KVConnector subclass over the W5 seam — KV-EXTERNAL-CACHE W3.
   src/vllm/v1/kv_offload/lmcache/lmcache_connector.cpp

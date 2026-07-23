@@ -21034,3 +21034,77 @@ paths untouched.
 Next gates (unchanged, still open on `TOOLS-STRUCTURED-CORE`): upstream
 backend matrix (xgrammar etc.), full STRUCTURAL_TAG surface, streaming parser
 engine.
+
+## 2026-07-23 — LMCache C++ CLIENT **W4**: REAL peer key-agreement + peer->us interop load (`CLAIM-LMCACHE-CPP-CLIENT`, `KV-EXTERNAL-CACHE`, base `origin/main` `26e6609`, main tree)
+
+Closed the gap W3 named. W3's connector round-tripped its OWN writes but keyed on
+a rolling blake3 with `chunk_tokens==block_size` — self-consistent, NOT agreeing
+with a real Python vLLM+LMCache peer.
+
+**The determination (read the real `8570aad` lmcache source).** The `lm://`
+remote-store / in-process key path is `ChunkedTokenDatabase`
+(`lmcache/v1/token_database.py:298-449`), NOT the blake3 MP `TokenHasher`
+(`multiprocess/token_hasher.py`, a DIFFERENT subsystem — the ZMQ MP server). The
+key derivation:
+- `chunk_size` 256 (config default), tokens chunked independent of our block size;
+- hash_func = vLLM's OWN hash (`pre_caching_hash_algorithm`); the portable,
+  cross-implementation choice is `sha256_cbor` (`vllm/utils/hashing.py:43` —
+  `hashlib.sha256(cbor2.dumps(x, canonical=True))`);
+- prefix-hash CHAIN: `prefix := fold8(hash_func((prefix, tuple(chunk_tokens), ())))`,
+  where `fold8(b)=int.from_bytes(b[:8],"big")` (`_normalize_hash_to_int`
+  `token_database.py:34-56`), the 3-tuple's extra_keys is `()` for text-only;
+- `NONE_HASH = fold8(sha256_cbor(str(PYTHONHASHSEED)))` (`init_none_hash`
+  `kv_cache_utils.py:99-114`); the interop peer sets `PYTHONHASHSEED=0` ->
+  `NONE_HASH = 0x4e1195df020de59e`;
+- key string `model@world@worker@f"{chunk_hash:x}"@dtype` (`utils.py:449-457`).
+
+**Implemented** `src/vllm/v1/kv_offload/lmcache/chunked_token_database.{h,cpp}`
+mirroring it byte-exact, reusing the project's `CborValue`+`sha256_cbor` (already
+Python-cbor2/hashlib-exact for vLLM's own block hashes). Wired into
+`LMCacheConnector` as an additive `key_mode=kVllmSha256Cbor` (hash_algo
+"vllm"/"sha256_cbor", chunk 256) beside W3's kept-green blake3 path; the default
+stays blake3 so W3's connector gate is untouched.
+
+**Proven (both, headless, CPU dev box):**
+1. KEY AGREEMENT (crux) — `test_lmcache_key_agreement` 4 cases / 85 assertions:
+   our CacheEngineKey strings + chunk boundaries + folded hashes are
+   BYTE-IDENTICAL to the REAL lmcache `ChunkedTokenDatabase.process_tokens()`.
+   Fixtures (`tests/fixtures/lmcache/key_agreement_fixtures.json`) dumped by
+   `scripts/lmcache/gen_key_agreement_fixtures.py`, which drives the UNMODIFIED
+   real lmcache driver with vLLM's PINNED `sha256_cbor`/`init_none_hash` (a
+   throwaway venv + real `lmcache-src@8570aad`; the two vLLM leaf hash functions
+   supplied verbatim from the pin so lmcache's production key path runs exactly
+   as with a full vLLM). Sample:
+   `meta-llama/Llama-3.1-8B@1@0@33d6862800fff40c@bfloat16` (tokens 1000..1511).
+2. PEER->US INTEROP LOAD over the wire — `scripts/lmcache/{lm_key_interop.py,
+   run_key_interop.sh}`: a REAL lmcache `ChunkedTokenDatabase` derives a key from
+   tokens and PUTs a 512 B KV_2LTD chunk to a REAL `lmcache.v1.server` (8570aad,
+   headless per the W2 recipe — torch before lmcache, `c_ops` stubbed); our C++
+   INDEPENDENTLY re-derives the SAME key and GETs the peer-written bytes
+   byte-identical (`test_lmcache_key_agreement` LIVE case, `VT_LMCACHE_LIVE_SPEC`).
+
+**Gates.** CPU `-Werror` 0 warnings. ASan+UBSan clean on the connector path
+(key-agreement + connector + client + codec, 0 leaks/errors) incl. the live
+socket path. Regressions unchanged: W1 codec 6/6 (2074), W2 client 3/3 (45), W3
+connector 5/5 (50), W5 kv_offload_connector 11/11 (80). The change is PURELY
+ADDITIVE — new files + an additive connector key mode selected only when
+configured; scheduler/worker/seam diffs are empty.
+
+**DGX GB10 VERIFIED** at this exact commit (transferred via git-archive, built
+CUDA asserts-on = no NDEBUG with `-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0
+-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc -DVLLM_CPP_TRITON=ON
+-DCMAKE_CUDA_ARCHITECTURES=121a`): clean CUDA `-Werror` 0 warnings; the lmcache
+suite incl. key-agreement re-passes on aarch64 (codec 6/6, client 3/3, connector
+5/5, key-agreement 4/85 — the sha256_cbor/CBOR/fold primitives byte-identical
+cross-arch); and EVERY SACRED model gate byte-identical STANDALONE under `flock
+$HOME/gpu.lock`, worker container stopped, box idle: **27B 235/235, 35B 315/315,
+Qwen3-Coder 138/138, Qwen3-dense 184/184, OPT 63/63, DeepSeek-V2 223/223
+(asserts-on, exit 0), Llama 92/92, Mistral 92/92.** The interop-correctness
+milestone (key-agreement + peer->us load) is COMPLETE; `KV-EXTERNAL-CACHE` stays
+`ACTIVE` only for the connector-ON full-model output-invariance + throughput arm.
+
+**Remaining (honest).** Text-only scope: multimodal mm-hash extra_keys injection
+(`vllm_v1_adapter.py:344-352`) deferred (it would add non-empty extra_keys to the
+chunk hash). MODE (2) MP/ZMQ/CUDA-IPC deferred (contingent). The DGX full-model
+output-invariance + throughput arm (spec gates 4/6) is a follow-on benchmark
+concern, not an interop-correctness gap. Not pushed.

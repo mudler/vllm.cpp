@@ -29,15 +29,22 @@
 //     round-trip test drives them on synthetic KV, exactly as the disk tier's
 //     e2e drives the tiering manager on synthetic KV.
 //
-// DEVIATION vs upstream chunk keying (recorded). Upstream LMCache keys on a
-// rolling blake3 with chunk_size 256 AND injects multimodal hashes into the
-// token tensor (vllm_v1_adapter.py:344-352). Our connector keys on the SAME
-// rolling-blake3 family (token_hasher.h) with chunk_tokens == block_size so the
-// scheduler stays block-aligned, over the plain token ids. That makes OUR
-// store<->lookup<->load self-consistent (the connector-level round-trip gate).
-// AGREEING BIT-FOR-BIT with a Python vLLM+LMCache PEER additionally requires
-// chunk_size 256 and vLLM's own token hash + mm-hash injection — the
-// key-agreement gate (spec gate 3), which is the REMAINING full-model e2e step.
+// KEY MODES (config.key_mode).
+//   * kVllmSha256Cbor (W4, PEER-AGREEING): the connector keys on vLLM's own
+//     sha256_cbor ChunkedTokenDatabase at chunk_size 256 (chunked_token_database.h),
+//     which is BYTE-IDENTICAL to a real Python vLLM+LMCache peer for the same
+//     (model, tokens, dtype) — proven by test_lmcache_key_agreement vs the real
+//     lmcache ChunkedTokenDatabase. This is the mode a peer-interop deployment
+//     selects (hash_algo="vllm"/"sha256_cbor").
+//   * kBlake3BlockAligned (W3, self-consistent): the rolling blake3
+//     (token_hasher.h, the MP subsystem's family) with chunk_tokens == block_size
+//     so the scheduler stays block-aligned. OUR store<->lookup<->load round-trips,
+//     but the keys do NOT agree with a Python peer. Kept as the default for
+//     back-compat and the W3 connector-round-trip gate.
+// Multimodal mm-hash injection into the token tensor (vllm_v1_adapter.py:344-352)
+// is out of scope for this text-only increment; it would add non-empty extra_keys
+// to the chunk hash (token_database.py:282-284). The remaining full-model e2e is
+// the DGX output-invariance / throughput arm (spec gates 4/6).
 #ifndef VLLM_V1_KV_OFFLOAD_LMCACHE_LMCACHE_CONNECTOR_H_
 #define VLLM_V1_KV_OFFLOAD_LMCACHE_LMCACHE_CONNECTOR_H_
 
@@ -51,6 +58,7 @@
 
 #include "vllm/v1/kv_offload/kv_connector.h"
 #include "vllm/v1/kv_offload/lmcache/cache_engine_key.h"
+#include "vllm/v1/kv_offload/lmcache/chunked_token_database.h"
 #include "vllm/v1/kv_offload/lmcache/memory_format.h"
 #include "vllm/v1/kv_offload/lmcache/remote_client.h"
 #include "vllm/v1/kv_offload/lmcache/remote_protocol.h"
@@ -67,6 +75,22 @@ namespace vllm::v1::kv_offload::lmcache {
 // kv_connector_extra_config in CreateFromConfig; also constructed directly by
 // the connector-level round-trip test.
 struct LmcacheConnectorConfig {
+  // How chunk keys are derived. kBlake3BlockAligned is W3's self-consistent
+  // path (blake3 rolling, chunk_tokens == block_size): our own writes round-trip
+  // through our own reads, but the keys do NOT agree with a Python peer.
+  // kVllmSha256Cbor is the W4 PEER-AGREEING path (ChunkedTokenDatabase: vLLM's
+  // own sha256_cbor hash + chunk_size 256), byte-identical to a real vLLM+LMCache
+  // peer for the same (model, tokens, dtype) — see chunked_token_database.h.
+  enum class KeyMode { kBlake3BlockAligned, kVllmSha256Cbor };
+  KeyMode key_mode = KeyMode::kBlake3BlockAligned;
+
+  // Peer NONE_HASH seed (PYTHONHASHSEED) for kVllmSha256Cbor; "0" is the
+  // reproducible interop value (kv_cache_utils.py:113-114). Ignored for blake3.
+  std::string none_hash_seed = "0";
+  // save_unfull_chunk: keep the trailing partial chunk when keying
+  // (token_database.py:347-356). LMCache config default is False.
+  bool save_unfull_chunk = false;
+
   // CacheEngineKey identity fields (utils.py:449-457):
   // model_name@world_size@worker_id@chunk_hash_hex@dtype.
   std::string model_name = "vllm.cpp";
@@ -198,7 +222,11 @@ class LMCacheConnector final : public KVConnector {
  private:
   LmcacheConnectorConfig config_;
   std::unique_ptr<LmcacheRemoteClient> client_;
-  TokenHasher hasher_;
+  TokenHasher hasher_;  // W3 blake3 path (kBlake3BlockAligned)
+  // W4 peer-agreeing path (kVllmSha256Cbor). Non-null iff key_mode selects it;
+  // ChunkFolds/ChunkKey route through it so the connector's keys agree with a
+  // real Python vLLM+LMCache peer bit-for-bit.
+  std::unique_ptr<ChunkedTokenDatabase> peer_db_;
 
   // req_id -> the chunk key strings the last get_num_new_matched_tokens hit
   // (used by update_state_after_alloc; idempotent overwrite).

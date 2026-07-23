@@ -104,6 +104,13 @@ vllm_cpp_add_test(test_lmcache_client vllm/v1/kv_offload/lmcache/test_lmcache_cl
 # the REAL scheduler vs an in-process mock server (always), foreign-key refusal,
 # default-off inertness; the live gate vs a real server under VT_LMCACHE_LIVE_*.
 vllm_cpp_add_test(test_lmcache_connector vllm/v1/kv_offload/lmcache/test_lmcache_connector.cpp)
+# LMCache lm:// KEY AGREEMENT vs a REAL Python vLLM+LMCache peer —
+# KV-EXTERNAL-CACHE W4 crux gate. Byte-identical CacheEngineKey strings at
+# chunk_size 256 with vLLM's own sha256_cbor hash; fixtures dumped from the real
+# lmcache ChunkedTokenDatabase by scripts/lmcache/gen_key_agreement_fixtures.py.
+vllm_cpp_add_test(test_lmcache_key_agreement vllm/v1/kv_offload/lmcache/test_lmcache_key_agreement.cpp)
+target_compile_definitions(test_lmcache_key_agreement PRIVATE
+  TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 vllm_cpp_add_test(test_scheduler_config vllm/test_scheduler_config.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)

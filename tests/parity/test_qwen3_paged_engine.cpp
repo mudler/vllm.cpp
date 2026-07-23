@@ -271,24 +271,43 @@ void RunGate(const std::string& repo_dir, const std::string& golden_subdir,
     } else if (first_div >= 0) {
       const int32_t mn = gapd[i * T + first_div];
       if (mn > worst_gap) { worst_gap = mn; worst_i = static_cast<int>(i); worst_j = first_div; }
-      if (mn > kNearTieMnats) {
-        ++fail;
-        MESSAGE(label << " METAL FORWARD DIVERGENCE prompt[" << i << "] tok=" << first_div
-                << " metal=" << got[static_cast<size_t>(first_div)]
-                << " cuda_our_ids=" << od[i * T + first_div]
-                << " vLLM_greedy=" << gd[i * T + first_div]
-                << " gap=" << (mn / 1000.0) << " nats (> " << (kNearTieMnats / 1000.0)
-                << ") — a real forward divergence, not a near-tie");
-        CHECK(mn <= kNearTieMnats);
-      } else {
+      // HONEST device-awareness (repaired): the committed gap is vLLM's logit
+      // margin of OUR token BELOW vLLM's argmax, teacher-forced on OUR sequence.
+      // A gap of 0 means our token IS vLLM's argmax — it records NO runner-up
+      // margin, so it carries ZERO near-tie evidence. A divergence at a gap-0
+      // position is therefore a hard REQUIRE failure on EVERY device (CUDA and
+      // Metal alike): treating gap-0 as "within the near-tie band" would excuse an
+      // arbitrary forward error (the whole golden here is gap-0, so the old
+      // `mn <= band` relaxation excused EVERYTHING — a gate with no teeth). The
+      // device-awareness may ONLY relax a GENUINE near-tie: a strictly-positive
+      // committed gap within the band (0 < gap <= kNearTieMnats), where vLLM's own
+      // logits place our token below its argmax by a hair and two bf16 decoders may
+      // land either side. That is the sole cross-device latitude; gap-0 and
+      // above-band are both real divergences.
+      const bool genuine_neartie = (mn > 0 && mn <= kNearTieMnats);
+      if (genuine_neartie) {
         ++metal_neartie_div;
         MESSAGE(label << " metal near-tie divergence prompt[" << i << "] tok=" << first_div
                 << " metal=" << got[static_cast<size_t>(first_div)]
                 << " cuda_our_ids=" << od[i * T + first_div]
-                << " gap=" << (mn / 1000.0) << " nats (<= band) — accepted (the CUDA "
-                   "anchor and Metal chose opposite sides of a bf16 tie vLLM cannot "
-                   "separate)");
+                << " gap=" << (mn / 1000.0) << " nats (0 < gap <= band) — accepted (vLLM's "
+                   "own logits place our token a hair below its argmax; two bf16 "
+                   "decoders may land either side)");
+        continue;  // committed gaps past first_div describe a DIFFERENT sequence
       }
+      ++fail;
+      MESSAGE(label << " FORWARD DIVERGENCE prompt[" << i << "] tok=" << first_div
+              << " metal=" << got[static_cast<size_t>(first_div)]
+              << " cuda_our_ids=" << od[i * T + first_div]
+              << " vLLM_greedy=" << gd[i * T + first_div]
+              << " gap=" << (mn / 1000.0)
+              << (mn == 0 ? " nats (gap-0 = our token IS vLLM's argmax; a divergence "
+                            "here is a hard REQUIRE on EVERY device, NOT a near-tie)"
+                          : " nats (> band = a real forward divergence)"));
+      // Hard failure on gap-0 or above-band, identical bar on every device.
+      REQUIRE_MESSAGE(genuine_neartie,
+                      label << " gap-0/above-band divergence prompt[" << i << "] tok="
+                      << first_div << " is a forward error, not a tolerated near-tie");
       continue;  // committed gaps past first_div describe a DIFFERENT sequence
     }
 

@@ -19510,3 +19510,90 @@ rsync).
 
 Repro (dgx, one flock): `bash ~/work/dgx_gate.sh` after the `git archive`
 transfer + configure; standalone DeepSeek re-run `~/work/dsv2_rerun.sh`.
+## 2026-07-23 — `QUANT-GGUF-KEEPQ-LOADER` **L5** + the owed fresh CPU profile (`CLAIM-QUANT-GGUF-KEEPQ-L5-1`, base `18094ee`, worktree `agent-ad6ee629d3452e904`)
+
+Two deliverables the CPU-floor re-measurement owed.
+
+### Row 1 — the fresh op-dispatch profile (the plan's ranking basis was stale)
+
+The whole CPU plan was ranked on `kMatmul = 95.37%` of wall time, measured when
+that op ran at 24 GFLOP/s; it now runs at 351, and E4's M-blocking moved
+end-to-end prefill 0.0%. Re-profiled the CURRENT binary with the previous
+agent's technique — a temporary uncommitted hook in `vt::GetOp` (`src/vt/
+op_provider.cpp`) that attributes the wall time between one GetOp and the next
+on the same thread to the first op, accounting for 100% of wall time. Reverted
+before any binding run. Phase-split by differencing a 1-output-token run from a
+33-output-token run (both 128-token prefill), 2 reps each, idle dgx aarch64.
+
+**Prefill (per the 128-in/1-out run, ~1530 ms):**
+- kMatmulBTQuant 37.3% · **kGdnPrefill 25.3%** · kMatmul 12.2% · kMatmulBT 10.3%
+  · **kPagedAttention 9.9%** · everything else < 1.3% each.
+
+**Decode (differenced, per token, ~41.5 ms):**
+- kMatmulBT 29.0% · kMatmulBTQuant 26.1% · kMatmul 21.0% · kGdnDecode 8.0% ·
+  kPagedAttention 6.5% · rest < 3%.
+
+**Finding — prefill is NO LONGER GEMM-bound; it is split across the quant GEMM
+and TWO single-threaded non-GEMM kernels.** `GdnPrefillKernel` (`cpu_ops.cpp`,
+the GDN linear-attention recurrence) and `PagedAttentionKernel`
+(`cpu_paged_attn.cpp`) are 35% of prefill together and BOTH run serially:
+GdnPrefill chunks over sequences (`ForRows(n, …)` with n=1 at concurrency 1, so
+one thread), PagedAttention has a bare `for (r < num_reqs)` with NO threadpool at
+all. Decode is memory-bound matmul (BT+BTQuant+kMatmul = 76%) at llama.cpp
+parity — no decode kernel work is owed.
+
+**Re-rank of G5/G6/G7 and anything new, on this evidence:**
+- **G5 (x86 AVX2/AVX512)** and **G6 (Arm NEON/i8mm)** only speed
+  kMatmulBTQuant/kMatmulBT, which on aarch64 already run at 211-417 GFLOP/s.
+  They shave the 37%+10% GEMM share but do nothing for the 35% serial non-GEMM
+  mass. DOWN-RANKED below the new lever.
+- **G7 (repack)** — same: a prefill-GEMM lever when prefill is no longer
+  GEMM-bound. PARK confirmed.
+- **NEW #1 CPU LEVER: parallelize `kGdnPrefill` and `kPagedAttention`.** Each is
+  ~single-threaded and each already has a row/loop structure a `ParallelForRows`
+  wraps cleanly (GdnPrefill needs a chunk-over-tokens tiling since n=1 at c1;
+  PagedAttention needs a threadpool at all). This is the biggest prefill deficit
+  and it is NOT a kernel-speed problem, it is a threading one — a more valuable
+  finding than another GEMM win, exactly as the task anticipated.
+
+### Row 2 — L5: the RSS deficit (largest single CPU deficit)
+
+Landed mmap in-place residency + tied-head sharing + a read-once page release.
+New `OwnedBytes` gives `OwnedTensor` an owned-or-borrowed byte store (borrow
+carries a shared_ptr keep-alive; read API is the vector subset the tree uses, so
+~300 readers unchanged; structural mutation refused on a borrow). Refcounted
+`GgufMapping` lets a borrowed weight outlive the `GgufFile` AND the on-disk file.
+`LoadEmbedAndHead` shares one bf16 vocab matrix for a tied embed/lm_head.
+`GgufFile::DropSpanResidency` MADV_DONTNEEDs the interior file pages of expanded
+tensors (per-tensor port of llama.cpp `unmap_fragment`). All CPU-only (ride
+keep-quant), all off under `VT_CPU_REF`, each with a `VT_GGUF_*` opt-out.
+
+# binding arm (dgx, idle aarch64, ONE flock, same binary, 3 reps, medians)
+#   Qwen3.5-2B-UD-Q8_K_XL.gguf, VLLM_CPP_CPU_THREADS=20, in=128 out=32
+#   BEFORE  (VT_GGUF_MMAP=0 VT_GGUF_SHARE_TIED_HEAD=0): TTFT 1590 TPOT 41.77 RSS 6,712,464 KB
+#   AFTER   (production default):                       TTFT 1656 TPOT 41.79 RSS 4,072,720 KB
+#   ORACLE  (VT_CPU_REF=1):                             TTFT 2953 TPOT 92.26 RSS 7,788,300 KB
+# per-lever RSS: copy 6.401 -> +tied-share 5.455 -> +mmap 4.457 -> +page-release 3.884 GiB
+# llama.cpp fresh same host: pp128 180.14+-2.78, tg32 25.37+-0.81, RSS 2,934,060 KB = 2.798 GiB
+#   => peak RSS 6.401 -> 3.884 GiB (2.29x -> 1.388x), decode parity, prefill TTFT +4%
+#   => output token md5 d235db12f2cd304007530286a1755c95 identical BEFORE/AFTER/ORACLE
+
+**Lifetime safety tested explicitly** (borrow read correct after GgufFile+file
+destroyed; shared head freed once whichever half dies first; ReleaseHost on a
+borrow drops only the ref). CPU ctest 157/157, `-Werror` clean. CUDA production
+build (CUTLASS+FA2) `-Werror=all-warnings` clean; standalone-idle 35B 315/315,
+Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8, GGUF 28/28 PASS.
+
+# CONTROL — the 27B "failure" is environmental, not L5:
+#   27B produces the NVFP4 EMULATION-path tokens (got == want_emu) on this box's
+#   CUDA-13.0 / cutlass-4.5.0 runtime, BYTE-IDENTICALLY on base 18094ee and L5
+#   (same tokens {...13,271,248068,...}). Same methodology as the CIQ-G4
+#   CPU-goldens control: base built same box, identical divergence => not a
+#   regression. DeepSeek's first run was 95/223 (the documented co-tenancy OOM
+#   signature) and passes 8/8 standalone-idle. Goldens md5 2965ef... unchanged.
+
+**Contention caveat, recorded:** the FIRST binding attempt showed AFTER at 40x
+slower, high rep variance, loadavg 13.5 — a co-tenant agent's CPU build/test
+(the flock guards GPU only). Re-run on a genuinely idle box (loadavg gate inside
+the lock) all three arms are ~42 ms TPOT and the numbers reproduce. Contended CPU
+runs are VOID per protocol.

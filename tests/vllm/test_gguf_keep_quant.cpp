@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -470,7 +471,9 @@ void AddF32T(GgufModelBuilder& b, const std::string& name,
 // A tiny DENSE (`qwen35`) GGUF whose GEMM weights are Q8_0 and whose norms /
 // embedding stay F32 — the realistic mixed-type file the routing policy exists
 // for. All layers are full attention (interval 1), so no GDN tensors appear.
-std::string BuildDenseQ8Gguf(const DenseDims& d) {
+// `tied` omits `output.weight`, which is how a tied-embedding GGUF says "the
+// head IS token_embd" (llama.cpp TENSOR_DUPLICATED) — the L5 sharing case.
+std::string BuildDenseQ8Gguf(const DenseDims& d, bool tied = false) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "qwen35"));
   b.AddKv(U32Kv("qwen35.embedding_length", static_cast<uint32_t>(d.H)));
@@ -488,7 +491,7 @@ std::string BuildDenseQ8Gguf(const DenseDims& d) {
 
   AddF32T(b, "token_embd.weight", {d.vocab, d.H}, 0.5F);
   AddF32T(b, "output_norm.weight", {d.H}, 1.5F);
-  AddQ8_0(b, "output.weight", d.vocab, d.H, 11);
+  if (!tied) AddQ8_0(b, "output.weight", d.vocab, d.H, 11);
   for (int64_t il = 0; il < d.n_layer; ++il) {
     const std::string p = "blk." + std::to_string(il) + ".";
     AddF32T(b, p + "attn_norm.weight", {d.H}, 1.25F);
@@ -994,4 +997,332 @@ TEST_CASE("vt::MatmulBT routes a block-quantized weight to MatmulBTQuant") {
   bool nonzero = false;
   for (float v : got) nonzero = nonzero || v != 0.0F;
   CHECK(nonzero);
+}
+
+// ===========================================================================
+// L5 — mmap residency and tied-head sharing.
+//
+// Both replace a COPY with a VIEW, so both raise the same two questions: are
+// the bytes identical to the copy arm, and can the view outlive what it views?
+// The second is the real hazard the spec names, so it is gated by actually
+// destroying the producer rather than by reasoning about it.
+// ===========================================================================
+
+namespace {
+
+GgufLoadPolicy KeepQuantMmap() {
+  GgufLoadPolicy p = KeepQuantOn();
+  p.mmap_residency = true;
+  return p;
+}
+
+// The production CPU shape: keep-quant + untransposed expansion + both L5
+// residency refinements, exactly as GgufLoadPolicy::FromEnv builds it there.
+GgufLoadPolicy ProductionCpu() {
+  GgufLoadPolicy p = KeepQuantOn();
+  p.expand_nk = true;
+  p.mmap_residency = true;
+  p.share_tied_head = true;
+  return p;
+}
+
+bool FileHasTensor(const vllm::GgufFile& g, const std::string& name) {
+  for (const vllm::GgufTensorInfo& t : g.Tensors()) {
+    if (t.name == name) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+TEST_CASE("mmap residency is byte-identical to the copy arm, and borrows") {
+  const DenseDims d;
+  const TempFile f(BuildDenseQ8Gguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+
+  GgufLoadPolicy copy = KeepQuantOn();    // L2 arm: blocks copied out
+  GgufLoadPolicy mmap = KeepQuantMmap();  // L5 arm: blocks viewed in place
+  const vllm::Qwen3_5DenseWeights wc =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &copy);
+  const vllm::Qwen3_5DenseWeights wm =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap);
+
+  // The kept weights: same dtype/shape/orientation, same BYTES, different
+  // residency — and the mmap arm's bytes are literally the file's own.
+  const vllm::GgufTensorInfo& t = g.Get("output.weight");
+  CHECK(wc.lm_head.bytes.borrowed() == false);
+  CHECK(wm.lm_head.bytes.borrowed() == true);
+  CHECK(wm.lm_head.dtype == wc.lm_head.dtype);
+  CHECK(wm.lm_head.nk == wc.lm_head.nk);
+  CHECK(wm.lm_head.shape[0] == wc.lm_head.shape[0]);
+  CHECK(wm.lm_head.shape[1] == wc.lm_head.shape[1]);
+  CHECK(wm.lm_head.bytes == wc.lm_head.bytes);
+  CHECK(wm.lm_head.bytes.data() == t.data);  // IN PLACE, not a copy
+  CHECK(wm.lm_head.View().data == const_cast<uint8_t*>(t.data));
+
+  for (int64_t il = 0; il < d.n_layer; ++il) {
+    CAPTURE(il);
+    const auto& lc = wc.layers[static_cast<size_t>(il)];
+    const auto& lm = wm.layers[static_cast<size_t>(il)];
+    CHECK(lm.attn.q_proj.bytes.borrowed());
+    CHECK(lm.attn.q_proj.bytes == lc.attn.q_proj.bytes);
+    CHECK(lm.attn.o_proj.bytes == lc.attn.o_proj.bytes);
+    CHECK(lm.mlp.down_proj.bytes == lc.mlp.down_proj.bytes);
+    // An EXPANDED tensor owns its bytes in BOTH arms — mmap residency applies
+    // to kept blocks only and must not leak into the expansion path.
+    CHECK(lm.input_layernorm.bytes.borrowed() == false);
+    CHECK(lm.input_layernorm.bytes == lc.input_layernorm.bytes);
+  }
+}
+
+TEST_CASE("a borrowed weight OUTLIVES the GgufFile and the file itself") {
+  const DenseDims d;
+  std::vector<uint8_t> expected;
+  std::unique_ptr<vllm::Qwen3_5DenseWeights> w;
+  int64_t numel = 0;
+
+  {
+    // Both the reader and the on-disk file go away inside this scope. The
+    // weights must stay readable: the mapping is refcounted (GgufMapping), and
+    // a POSIX mapping survives unlink of its path.
+    const TempFile f(BuildDenseQ8Gguf(d));
+    const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+    const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+    GgufLoadPolicy mmap = KeepQuantMmap();
+    w = std::make_unique<vllm::Qwen3_5DenseWeights>(
+        vllm::LoadQwen3_5DenseFromGguf(g, c, &mmap));
+    const vllm::GgufTensorInfo& t = g.Get("output.weight");
+    expected.assign(t.data, t.data + t.nbytes);
+    numel = w->lm_head.shape[0] * w->lm_head.shape[1];
+  }
+
+  REQUIRE(w->lm_head.bytes.borrowed());
+  REQUIRE(w->lm_head.bytes.size() == expected.size());
+  // Reading through the view that would be dangling if it were not refcounted.
+  CHECK(std::memcmp(w->lm_head.bytes.data(), expected.data(),
+                    expected.size()) == 0);
+  // ...and decoding it still gives the right answer, i.e. these are the file's
+  // pages and not recycled memory that happens to compare equal.
+  const std::vector<uint16_t> re =
+      vllm::DequantGgufRowToBf16(kQ8_0, w->lm_head.bytes.data(), numel);
+  const std::vector<uint16_t> ref =
+      vllm::DequantGgufRowToBf16(kQ8_0, expected.data(), numel);
+  CHECK(re == ref);
+
+  w.reset();  // last reference: the mapping is unmapped exactly once, here
+}
+
+TEST_CASE("tied lm_head SHARES the embedding expansion instead of copying it") {
+  const DenseDims d;
+  const TempFile f(BuildDenseQ8Gguf(d, /*tied=*/true));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+  REQUIRE_FALSE(FileHasTensor(g, "output.weight"));
+
+  GgufLoadPolicy shared = ProductionCpu();
+  GgufLoadPolicy unshared = ProductionCpu();
+  unshared.share_tied_head = false;
+  const vllm::Qwen3_5DenseWeights ws =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &shared);
+  const vllm::Qwen3_5DenseWeights wu =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &unshared);
+
+  // THE GATE: sharing changes WHERE the bytes live, never WHAT they are.
+  CHECK(ws.embed_tokens.bytes == wu.embed_tokens.bytes);
+  CHECK(ws.lm_head.bytes == wu.lm_head.bytes);
+  CHECK(ws.lm_head.dtype == wu.lm_head.dtype);
+  CHECK(ws.lm_head.nk == wu.lm_head.nk);
+  CHECK(ws.lm_head.rank == wu.lm_head.rank);
+  CHECK(ws.lm_head.shape[0] == wu.lm_head.shape[0]);
+  CHECK(ws.lm_head.shape[1] == wu.lm_head.shape[1]);
+
+  // ONE buffer in the shared arm, TWO in the unshared one. This is the whole
+  // point of the row: a failure here means the second vocab matrix is still
+  // being paid for.
+  CHECK(ws.embed_tokens.bytes.data() == ws.lm_head.bytes.data());
+  CHECK(wu.embed_tokens.bytes.data() != wu.lm_head.bytes.data());
+  CHECK(ws.embed_tokens.bytes.borrowed());
+  CHECK(ws.lm_head.bytes.borrowed());
+
+  // The head is in the file's own [N = vocab, K = H] order, which is the ONLY
+  // orientation in which the two byte images can coincide...
+  CHECK(ws.lm_head.nk == true);
+  CHECK(ws.lm_head.shape[0] == d.vocab);
+  CHECK(ws.lm_head.shape[1] == d.H);
+  // ...and the gather table keeps its own metadata over the same bytes.
+  CHECK(ws.embed_tokens.nk == false);
+  CHECK(ws.embed_tokens.shape[0] == d.vocab);
+  CHECK(ws.embed_tokens.shape[1] == d.H);
+}
+
+TEST_CASE("a shared tied head is freed ONCE: either half may die first") {
+  const DenseDims d;
+  const TempFile f(BuildDenseQ8Gguf(d, /*tied=*/true));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+  GgufLoadPolicy shared = ProductionCpu();
+
+  // Drop the EMBEDDING first, then read the head.
+  {
+    vllm::Qwen3_5DenseWeights w = vllm::LoadQwen3_5DenseFromGguf(g, c, &shared);
+    const vllm::OwnedBytes& head = w.lm_head.bytes;
+    const std::vector<uint8_t> want(head.begin(), head.end());
+    w.embed_tokens.bytes.Reset();
+    REQUIRE(head.size() == want.size());
+    CHECK(std::memcmp(head.data(), want.data(), want.size()) == 0);
+  }
+  // Drop the HEAD first, then read the embedding.
+  {
+    vllm::Qwen3_5DenseWeights w = vllm::LoadQwen3_5DenseFromGguf(g, c, &shared);
+    const vllm::OwnedBytes& emb = w.embed_tokens.bytes;
+    const std::vector<uint8_t> want(emb.begin(), emb.end());
+    w.lm_head.bytes.Reset();
+    REQUIRE(emb.size() == want.size());
+    CHECK(std::memcmp(emb.data(), want.data(), want.size()) == 0);
+  }
+  // ReleaseHost() on a borrowed weight drops only the reference: it must not
+  // madvise pages it does not own, and the other half must stay readable.
+  {
+    vllm::Qwen3_5DenseWeights w = vllm::LoadQwen3_5DenseFromGguf(g, c, &shared);
+    const vllm::OwnedBytes& head = w.lm_head.bytes;
+    const std::vector<uint8_t> want(head.begin(), head.end());
+    w.embed_tokens.ReleaseHost();
+    CHECK(w.embed_tokens.bytes.empty());
+    REQUIRE(head.size() == want.size());
+    CHECK(std::memcmp(head.data(), want.data(), want.size()) == 0);
+  }
+}
+
+TEST_CASE("the oracle path shares NOTHING and borrows NOTHING") {
+  const DenseDims d;
+  const TempFile f(BuildDenseQ8Gguf(d, /*tied=*/true));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+
+  // VT_CPU_REF forces every L5 refinement off (see FromEnv), so the load is the
+  // historical two-buffer, transposed-head one, allocation for allocation.
+  GgufLoadPolicy oracle = ProductionCpu();
+  oracle.cpu_ref = true;
+  oracle.expand_nk = false;
+  oracle.mmap_residency = false;
+  oracle.share_tied_head = false;
+  const vllm::Qwen3_5DenseWeights wo =
+      vllm::LoadQwen3_5DenseFromGguf(g, c, &oracle);
+
+  CHECK(wo.embed_tokens.bytes.borrowed() == false);
+  CHECK(wo.lm_head.bytes.borrowed() == false);
+  CHECK(wo.embed_tokens.bytes.data() != wo.lm_head.bytes.data());
+  // Transposed to Matmul-B [K = H, N = vocab] — genuinely different bytes from
+  // the gather table, which is precisely why this arm cannot share.
+  CHECK(wo.lm_head.nk == false);
+  CHECK(wo.lm_head.shape[0] == d.H);
+  CHECK(wo.lm_head.shape[1] == d.vocab);
+  CHECK(wo.lm_head.bytes != wo.embed_tokens.bytes);
+}
+
+TEST_CASE("FromEnv derives both L5 switches, and VT_CPU_REF overrides them") {
+  ::unsetenv("VT_CPU_REF");
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_GGUF_SHARE_TIED_HEAD");
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
+  {
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
+    CHECK(p.keep_quant);
+    CHECK(p.expand_nk);
+    CHECK(p.mmap_residency);   // defaults ON with keep-quant
+    CHECK(p.share_tied_head);  // defaults ON with expand_nk
+  }
+  // Each is independently opt-out-able, so the copy and duplicate arms stay
+  // A/B-able against the production default.
+  for (const char* off : {"0", "false", "off", ""}) {
+    CAPTURE(off);
+    ::setenv("VT_GGUF_MMAP", off, 1);
+    ::setenv("VT_GGUF_SHARE_TIED_HEAD", off, 1);
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
+    CHECK(p.keep_quant);
+    CHECK_FALSE(p.mmap_residency);
+    CHECK_FALSE(p.share_tied_head);
+  }
+  // Turning keep-quant off takes both with it: there is nothing to borrow when
+  // every weight expands, and the head is transposed again.
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_GGUF_SHARE_TIED_HEAD");
+  ::setenv("VT_GGUF_KEEP_QUANT", "0", 1);
+  {
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
+    CHECK_FALSE(p.mmap_residency);
+    CHECK_FALSE(p.share_tied_head);
+  }
+  // The oracle switch wins over both, even when they are asked for explicitly.
+  ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
+  ::setenv("VT_GGUF_MMAP", "1", 1);
+  ::setenv("VT_GGUF_SHARE_TIED_HEAD", "1", 1);
+  ::setenv("VT_CPU_REF", "1", 1);
+  {
+    const GgufLoadPolicy p = GgufLoadPolicy::FromEnv();
+    CHECK(p.cpu_ref);
+    CHECK_FALSE(p.expand_nk);
+    CHECK_FALSE(p.mmap_residency);
+    CHECK_FALSE(p.share_tied_head);
+  }
+  ::unsetenv("VT_CPU_REF");
+  ::unsetenv("VT_GGUF_MMAP");
+  ::unsetenv("VT_GGUF_SHARE_TIED_HEAD");
+  ::unsetenv("VT_GGUF_KEEP_QUANT");
+}
+
+TEST_CASE("OwnedBytes refuses to MUTATE a borrowed buffer") {
+  auto holder = std::make_shared<const std::vector<uint8_t>>(
+      std::vector<uint8_t>{1, 2, 3, 4});
+  vllm::OwnedBytes b =
+      vllm::OwnedBytes::Borrow(holder->data(), holder->size(), holder);
+  REQUIRE(b.borrowed());
+  REQUIRE(b.size() == 4);
+  const vllm::OwnedBytes& rb = b;
+  CHECK(rb.data()[0] == 1);  // a const read is fine
+
+  // Every write path is a loud failure instead of a silent write through
+  // read-only memory. That is what makes the borrowed residency safe to
+  // introduce underneath ~300 existing `.bytes` call sites.
+  CHECK_THROWS_AS(b.resize(8), std::runtime_error);
+  CHECK_THROWS_AS(b.assign(size_t{2}, uint8_t{0}), std::runtime_error);
+  CHECK_THROWS_AS(b.Share(), std::runtime_error);
+  // Element access, const or not, is NOT rejected: constness does not
+  // distinguish a read from a write, and this tree reads weights through
+  // non-const handles everywhere. Only the STRUCTURAL mutations above — the
+  // ones that would move the buffer out from under the owner — are refused.
+  CHECK(b.data() == rb.data());
+
+  // A borrow with no keep-alive is unrepresentable.
+  CHECK_THROWS_AS(vllm::OwnedBytes::Borrow(holder->data(), 4, nullptr),
+                  std::runtime_error);
+
+  b.Reset();
+  CHECK_FALSE(b.borrowed());
+  CHECK(b.empty());
+  b.resize(2);  // and it is reusable as an owned buffer afterwards
+  CHECK(b.size() == 2);
+}
+
+TEST_CASE("OwnedBytes::Share hands the SAME bytes to a second viewer") {
+  vllm::OwnedBytes a(std::vector<uint8_t>{9, 8, 7, 6, 5});
+  const std::vector<uint8_t> want(a.begin(), a.end());
+  REQUIRE_FALSE(a.borrowed());
+
+  std::shared_ptr<const void> owner = a.Share();
+  REQUIRE(a.borrowed());
+  const vllm::OwnedBytes& ra = a;
+  vllm::OwnedBytes b = vllm::OwnedBytes::Borrow(ra.data(), ra.size(), owner);
+  const vllm::OwnedBytes& rb = b;
+
+  CHECK(ra.data() == rb.data());  // one buffer, two viewers
+  CHECK(a == b);
+  REQUIRE(ra.size() == want.size());
+  CHECK(std::memcmp(ra.data(), want.data(), want.size()) == 0);  // no copy
+
+  owner.reset();
+  a.Reset();  // the first viewer goes; the second still reads
+  REQUIRE(rb.size() == want.size());
+  CHECK(std::memcmp(rb.data(), want.data(), want.size()) == 0);
 }

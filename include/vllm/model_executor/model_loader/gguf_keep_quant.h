@@ -125,6 +125,26 @@ struct GgufLoadPolicy {
   // dequant-to-bf16 load path regardless of `keep_quant`, so the bit-stable
   // reference numerics stay reachable once keep-quant becomes the default.
   bool cpu_ref = false;
+  // L5 — mmap residency. A weight that KEEPS its blocks is consumed IN PLACE
+  // out of the GGUF's read-only mapping instead of being copied into an owned
+  // buffer, holding a refcount on the mapping (GgufMapping) for its lifetime.
+  // llama.cpp does exactly this when `use_mmap` is set
+  // (src/llama-model-loader.cpp:1385 `load_data_for`, which points the tensor at
+  // `mapping->addr + w.offs` rather than `read_raw`-ing into it @ 237ad9b96);
+  // L2 deliberately started with the copy, and this is the recorded follow-up.
+  // Byte-exactness is structural: the SAME file bytes in the SAME [N, K] order,
+  // read rather than memcpy'd first. Rides the keep_quant condition (there is
+  // nothing to borrow when everything expands) and is forced off by cpu_ref.
+  // VT_GGUF_MMAP=0 is the opt-out, kept so the copy arm stays A/B-able.
+  bool mmap_residency = false;
+  // L5 — tied-head sharing. When the file omits `output.weight`, the head IS
+  // `token_embd.weight` (llama.cpp calls this TENSOR_DUPLICATED), so the model
+  // materializes ONE vocab matrix and both the gather table and the lm_head GEMM
+  // weight view it. Only possible when the head expands in the file's own
+  // [N, K] order (expand_nk), because that is the case in which the head's bytes
+  // are elementwise IDENTICAL to the embedding table's; the transposing
+  // Matmul-B path builds genuinely different bytes and shares nothing.
+  bool share_tied_head = false;
   // Optional observer; null in production.
   GgufRoutingAudit audit;
 

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/owned_bytes.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
@@ -37,7 +38,11 @@ namespace vllm {
 // fresh vt::Tensor over the current buffer, so it stays valid across moves/
 // reallocations of the owning struct (no cached raw pointer to dangle).
 struct OwnedTensor {
-  std::vector<uint8_t> bytes;
+  // Heap bytes, OR a read-only borrowed view (GGUF mmap / a bf16 expansion
+  // shared with a second tensor) that carries its own keep-alive. See
+  // owned_bytes.h; the read API is the std::vector<uint8_t> subset this tree
+  // uses, so readers are unaffected by which residency a weight has.
+  OwnedBytes bytes;
   vt::DType dtype = vt::DType::kF32;
   int rank = 0;
   int64_t shape[vt::kMaxRank] = {0, 0, 0, 0};

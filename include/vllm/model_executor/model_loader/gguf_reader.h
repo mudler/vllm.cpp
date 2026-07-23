@@ -2,13 +2,33 @@
 // vLLM e24d1b24 has no GGUF load format.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <variant>
 #include <vector>
 
 namespace vllm {
+
+// The read-only mapping of ONE .gguf file, refcounted. `GgufFile` holds one
+// reference; a weight that is consumed IN PLACE out of the mapping (the
+// keep-quant loader's mmap residency, QUANT-GGUF-KEEPQ-LOADER L5) holds another,
+// so the mapping is unmapped only when BOTH the reader and every borrowing
+// tensor are gone. This is what makes a borrowed `GgufTensorInfo::data` pointer
+// safe to outlive the `GgufFile` value it came from — the entrypoint's
+// `GgufFile` local is destroyed as soon as the model is built.
+struct GgufMapping {
+  int fd = -1;
+  void* addr = nullptr;
+  size_t size = 0;
+
+  GgufMapping() = default;
+  GgufMapping(const GgufMapping&) = delete;
+  GgufMapping& operator=(const GgufMapping&) = delete;
+  ~GgufMapping();
+};
 
 // GGUF metadata value type ids (wire format).
 enum GgufValueType : uint32_t {
@@ -97,17 +117,52 @@ class GgufFile {
   // Throws std::runtime_error if `name` is not present.
   const GgufTensorInfo& Get(const std::string& name) const;
 
+  // A keep-alive reference on this file's mapping. Hand it to anything that
+  // retains a `GgufTensorInfo::data` pointer past this object's lifetime; see
+  // GgufMapping above. Never null on an open file.
+  const std::shared_ptr<const GgufMapping>& Mapping() const { return map_; }
+
+  // True when [data, data+nbytes) lies wholly inside this file's mapping — the
+  // precondition for borrowing those bytes in place.
+  bool OwnsSpan(const uint8_t* data, size_t nbytes) const;
+
+  // Drop the resident pages of a span that has been read for the LAST time —
+  // i.e. a tensor the loader EXPANDED, whose file bytes nothing will look at
+  // again. This is llama.cpp's `unmap_fragment` idea
+  // (src/llama-mmap.cpp:490, called from src/llama-model-loader.cpp:1676-1678,
+  // where the loader releases the parts of the mapping it did NOT keep in place)
+  // adapted to a MIXED file: llama.cpp can munmap two contiguous fragments
+  // because its in-place tensors are contiguous, whereas ours are interleaved
+  // with expanded f16/f32 ones, so the release is per-tensor and uses
+  // MADV_DONTNEED rather than munmap — which keeps the mapping's address space
+  // whole while dropping exactly the same physical pages. RECORDED DEVIATION.
+  //
+  // Purely a residency hint: the mapping is read-only and file-backed, so a
+  // later read of a dropped page simply re-faults it with the same bytes. Only
+  // whole INTERIOR pages are dropped, so a page shared with a neighbouring
+  // kept-in-place tensor is never touched. Enabled by ReleaseExpandedPages().
+  void DropSpanResidency(const uint8_t* data, size_t nbytes) const;
+
+  // Opt the file into DropSpanResidency (default off, i.e. today's behavior).
+  // Set by the loader for the duration of a load whose kept weights are
+  // consumed in place, so the read-once pages of the EXPANDED tensors do not
+  // accumulate into peak RSS alongside their expansions.
+  void ReleaseExpandedPages(bool on) const { release_expanded_ = on; }
+  bool releases_expanded_pages() const { return release_expanded_; }
+
  private:
   GgufFile() = default;
   void Release() noexcept;
 
   std::string path_;
-  int fd_ = -1;
-  void* map_ = nullptr;
-  size_t map_size_ = 0;
+  std::shared_ptr<const GgufMapping> map_;
   std::map<std::string, GgufValue> kvs_;
   std::vector<GgufTensorInfo> tensors_;
   std::map<std::string, size_t> index_;  // name -> position in tensors_
+  // A residency hint, not state: it changes which physical pages are resident,
+  // never what any read returns. Mutable so a const GgufFile (which is how every
+  // loader takes it) can carry the load's policy.
+  mutable bool release_expanded_ = false;
 };
 
 }  // namespace vllm

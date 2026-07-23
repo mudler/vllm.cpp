@@ -46,25 +46,32 @@
 
 namespace vllm {
 
-// L2 (keep-quant residency, .agents/specs/gguf-keep-quant-loader.md). Copy `n`
+// L2 (keep-quant residency, .agents/specs/gguf-keep-quant-loader.md). Take `n`
 // rows of `k` elements of `tensor`'s RAW ggml blocks — starting at row
 // `row_offset`, which is how a stacked [E, out, in] expert tensor is split —
-// into an owned block-typed tensor.
+// as a block-typed tensor.
 //
 // The result is [N = n, K = k] with `nk = true` and `dtype` the block dtype:
 // GGUF's on-disk [out, in] row-major order IS ggml's src0 layout and IS our
 // MatmulBT orientation, so keep-quant needs NO transpose. It could not do one
 // anyway — transposing a block encoding would require requantizing.
 //
-// Bytes are COPIED (uniform with every other weight path, no coupling to the
-// mmap's lifetime); llama.cpp supports both copy and mmap residency, so either
-// mirrors upstream. mmap zero-copy is a recorded follow-up.
+// RESIDENCY (L5). `mmap_src` null (the default) COPIES the bytes into an owned
+// buffer — L2's original behavior. Non-null BORROWS them in place out of that
+// file's read-only mapping and takes a refcount on it, which is llama.cpp's
+// `use_mmap` arm (src/llama-model-loader.cpp:1385 `load_data_for` points the
+// tensor at `mapping->addr + w.offs` instead of `read_raw`-ing into it, @
+// 237ad9b96). The two are byte-identical by construction: the same file bytes in
+// the same order, read rather than memcpy'd first. `mmap_src` must be the file
+// `tensor` came from; the span is re-validated against its mapping.
 //
 // Throws when the tensor's encoding is not keep-quant capable, when `k` is not
-// a whole number of blocks (ggml_row_size's precondition), or when the
-// requested rows fall outside the tensor's validated byte span.
+// a whole number of blocks (ggml_row_size's precondition), when the requested
+// rows fall outside the tensor's validated byte span, or when a borrowed span is
+// not inside `mmap_src`'s mapping.
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
-                               int64_t k, int64_t row_offset = 0);
+                               int64_t k, int64_t row_offset = 0,
+                               const GgufFile* mmap_src = nullptr);
 
 // Build the HfConfig from a GGUF file's metadata (arch prefix qwen35moe /
 // qwen3next / qwen35 [dense]). vocab_size is taken from token_embd's shape

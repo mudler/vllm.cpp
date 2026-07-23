@@ -2018,6 +2018,53 @@ The complete contract is in the
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
 
+## CPU vs llama.cpp — keep-quant loader RSS (L5), `ACCEPTED` / binding (2026-07-23)
+
+`BENCH-CPU-LLAMA` / `BACKEND-GATE-CPU-LLAMACPP` / `QUANT-GGUF-KEEPQ-LOADER`
+**L5** (`CLAIM-QUANT-GGUF-KEEPQ-L5-1`). Full result:
+[keep-quant loader leaf](../.agents/specs/gguf-keep-quant-loader.md) § L5 result.
+
+**Peak RSS 6.401 → 3.884 GiB — the 2.29× → 1.39× llama.cpp move. Decode stays at
+parity and output tokens stay byte-identical; prefill TTFT +4% (deferred paging).**
+
+The loader now (1) BORROWS kept q8_0 blocks in place out of the GGUF's read-only
+mmap instead of copying them into owned buffers (refcounted `GgufMapping`;
+mirrors llama.cpp `load_data_for` under `use_mmap`), (2) SHARES one bf16 vocab
+matrix between a tied `token_embd`/`lm_head` instead of materialising it twice
+(llama.cpp `TENSOR_DUPLICATED`), and (3) DROPS the read-once file pages of
+tensors it has finished expanding (`MADV_DONTNEED`, a per-tensor port of
+llama.cpp `unmap_fragment`). All three are CPU-only (they ride keep-quant) and
+all three are OFF under `VT_CPU_REF`.
+
+**Binding arm = `dgx.casa` (GB10, aarch64, 20 cores), idle**, whole series under
+one `flock $HOME/gpu.lock`, `git archive` transfer, goldens md5-verified
+(`2965ef5772b556d3f3f86fedf4221b2f`) before/after. Model
+`Qwen3.5-2B-UD-Q8_K_XL.gguf`. Same binary, 3 reps, medians. llama.cpp
+`237ad9b96` fresh on the same idle host: pp128 180.14±2.78, tg32 25.37±0.81,
+peak RSS 2,934,060 KB = 2.798 GiB.
+
+| arm | TTFT (ms) | TPOT (ms) | peak RSS (KB) |
+|---|---|---|---|
+| BEFORE — L4 copy (`VT_GGUF_MMAP=0 VT_GGUF_SHARE_TIED_HEAD=0`) | 1,590.4 | 41.77 | 6,712,464 |
+| **AFTER — L5 production default** | **1,656.1** | **41.79** | **4,072,720** |
+| oracle — `VT_CPU_REF=1` | 2,952.6 | 92.26 | 7,788,300 |
+
+Ratios AFTER: prefill 180.14 / (128/1.656) = 2.33× behind; decode 25.37 /
+(1000/41.79) = 1.06× behind (≈ parity); **peak RSS 3.884 / 2.798 = 1.388× worse**
+(was 2.29×). Per-lever RSS isolation on the same host: copy-only 6.401 GiB → +
+tied-share 5.455 → + mmap borrow 4.457 → + page-release **3.884**. Output token
+md5 `d235db12f2cd304007530286a1755c95` identical across BEFORE / AFTER / ORACLE
+— the same golden the two prior CPU checkpoints recorded, unchanged by mmap or
+head-sharing. **Contention caveat:** the first attempt showed the AFTER arm 40×
+slower with loadavg 13.5 (a co-tenant agent's CPU build; `flock` guards GPU
+only); re-run on a genuinely idle box (loadavg gate in the recipe) all arms are
+~42 ms and these numbers reproduce. CUDA regression set standalone (production
+CUTLASS+FA2 build): 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6,
+DeepSeek-V2 8/8, GGUF engine 28/28 all PASS; the 27B gate selects the NVFP4
+EMULATION path on this box's CUDA-13.0/cutlass-4.5.0 runtime (`got == want_emu`)
+BYTE-IDENTICALLY with and without L5 (base `18094ee` reproduces the same tokens),
+a pre-existing environment condition, not an L5 regression.
+
 ## CPU vs llama.cpp — elementwise GEMM vectorized, `ACCEPTED` / binding (2026-07-22)
 
 `BENCH-CPU-LLAMA` / `BACKEND-GATE-CPU-LLAMACPP` / `KERNEL-GEMM-CPU-ELEM`
@@ -2028,13 +2075,14 @@ the attribution that selected both levers:
 [floor re-measurement](../.agents/specs/cpu-llamacpp-floor-remeasure-2026-07-22.md).
 
 **Decode is now AT PARITY with llama.cpp (1.03×, inside its own run spread).
-Prefill is 2.34× behind and peak RSS 2.29× worse — those two remain open.**
+Prefill is 2.34× behind. Peak RSS was 2.29× worse at THIS checkpoint; the
+keep-quant loader L5 (section above, 2026-07-23) has since taken it to 1.39×.**
 
 | Axis | llama.cpp `237ad9b96` | ours, before | **ours, now** | **ratio now** | ratio before |
 |---|---|---|---|---|---|
 | Prefill (pp128 vs 128/TTFT) | 173.28 ± 1.75 t/s | 21.67 t/s | **73.97 t/s** | **2.34× behind** | 8.00× |
 | Decode (tg32 vs 1000/TPOT) | 24.52 ± 0.45 t/s (isolated 24.54 ± 0.79) | 7.649 t/s | **23.79 t/s** | **1.03× behind** (3.1 %; 1.032× vs isolated) | 3.21× |
-| Peak RSS | 2,934,136 KB = **2.798 GiB** | 6.401 GiB | **6.401 GiB** | **2.29× worse** | 2.29× |
+| Peak RSS | 2,934,136 KB = **2.798 GiB** | 6.401 GiB | **6.401 GiB** (→ 3.884 at L5, above) | **2.29× worse** (→ 1.39× at L5) | 2.29× |
 
 **Same-binary A/B gains: prefill 3.41×, decode 3.11×, peak RSS unchanged — with
 output tokens BYTE-IDENTICAL** across the BEFORE arm, the production default and

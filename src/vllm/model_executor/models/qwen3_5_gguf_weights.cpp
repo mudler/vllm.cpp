@@ -18,7 +18,8 @@
 namespace vllm {
 
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
-                               int64_t k, int64_t row_offset) {
+                               int64_t k, int64_t row_offset,
+                               const GgufFile* mmap_src) {
   vt::DType dt = vt::DType::kF32;
   VT_CHECK(KeepQuantDType(tensor.ggml_type, &dt),
            "qwen3_5 gguf: keep-quant on a non-keep-quant encoding for " +
@@ -40,13 +41,64 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
   o.shape[1] = k;  // K = in features
   // GGUF disk order [out, in] IS the MatmulBT [N, K] orientation: no transpose.
   o.nk = true;
-  o.bytes.assign(tensor.data + begin, tensor.data + begin + bytes);
+  const uint8_t* src = tensor.data + begin;
+  if (mmap_src == nullptr) {
+    o.bytes.assign(src, src + bytes);  // L2: copy into an owned buffer
+    return o;
+  }
+  // L5 mmap residency. Re-validate the span against the MAPPING (not just the
+  // tensor record) so a mismatched file can never hand out a view outside it,
+  // and require the block structs' natural alignment — every keep-quant block
+  // begins with a 2-byte scale field, and GGUF's own tensor-data alignment
+  // (`general.alignment`, >= 8 in practice) already guarantees it, so a failure
+  // here means a malformed file rather than a limitation of this path.
+  VT_CHECK(mmap_src->OwnsSpan(src, bytes),
+           "qwen3_5 gguf: keep-quant mmap span is outside the file mapping for " +
+               tensor.name);
+  VT_CHECK(reinterpret_cast<uintptr_t>(src) % alignof(uint16_t) == 0,
+           "qwen3_5 gguf: keep-quant mmap span is not block-aligned for " +
+               tensor.name);
+  o.bytes = OwnedBytes::Borrow(src, bytes, mmap_src->Mapping());
   return o;
 }
 
 namespace {
 
 // --- small helpers -------------------------------------------------------
+
+// Independent opt-out for the read-once page release (MADV_DONTNEED on the file
+// pages of EXPANDED tensors). Default ON with mmap residency. Kept separate so
+// the page-drop can be A/B'd against the mmap borrow alone.
+bool EnvReleaseExpandedPages() {
+  const char* v = std::getenv("VT_GGUF_RELEASE_PAGES");
+  if (v == nullptr) return true;
+  return !(std::strcmp(v, "") == 0 || std::strcmp(v, "0") == 0 ||
+           std::strcmp(v, "false") == 0 || std::strcmp(v, "off") == 0);
+}
+
+// Scopes the file's read-once-page release to ONE load, so a GgufFile that
+// outlives the loader (or is loaded from twice, as the tests do) never carries
+// a stale residency policy.
+class GgufPageReleaseScope {
+ public:
+  GgufPageReleaseScope(const GgufFile& g, bool on)
+      : g_(g), prev_(g.releases_expanded_pages()) {
+    g_.ReleaseExpandedPages(on);
+  }
+  ~GgufPageReleaseScope() { g_.ReleaseExpandedPages(prev_); }
+  GgufPageReleaseScope(const GgufPageReleaseScope&) = delete;
+  GgufPageReleaseScope& operator=(const GgufPageReleaseScope&) = delete;
+
+ private:
+  const GgufFile& g_;
+  bool prev_;
+};
+
+// L5: the file to borrow kept blocks from, or null to copy them (L2's arm,
+// which `VT_GGUF_MMAP=0` and `VT_CPU_REF=1` both select).
+const GgufFile* MmapSrc(const GgufFile& g, const GgufLoadPolicy& pol) {
+  return pol.mmap_residency ? &g : nullptr;
+}
 
 bool HasTensor(const GgufFile& g, const std::string& name) {
   for (const GgufTensorInfo& t : g.Tensors()) {
@@ -136,14 +188,24 @@ std::vector<uint16_t> DqBf16(const GgufFile& g, const std::string& name,
                              const GgufTensorInfo** info) {
   const GgufTensorInfo& t = g.Get(name);
   *info = &t;
-  return DequantGgufRowToBf16(t.ggml_type, t.data, ShapeNumel(t.shape));
+  std::vector<uint16_t> out =
+      DequantGgufRowToBf16(t.ggml_type, t.data, ShapeNumel(t.shape));
+  // The expansion is now the authority for this tensor; its file pages are
+  // read-once and must not sit in RSS next to it (L5, no-op unless the load
+  // enabled it). Re-reading the tensor later is still correct — the pages just
+  // fault back in.
+  g.DropSpanResidency(t.data, t.nbytes);
+  return out;
 }
 
 std::vector<float> DqF32(const GgufFile& g, const std::string& name,
                          const GgufTensorInfo** info) {
   const GgufTensorInfo& t = g.Get(name);
   *info = &t;
-  return DequantGgufRowToF32(t.ggml_type, t.data, ShapeNumel(t.shape));
+  std::vector<float> out =
+      DequantGgufRowToF32(t.ggml_type, t.data, ShapeNumel(t.shape));
+  g.DropSpanResidency(t.data, t.nbytes);
+  return out;
 }
 
 // bf16 tensor copied verbatim with `shape` (dequant, then own the bytes).
@@ -212,7 +274,7 @@ OwnedTensor OwnMatmulWeight(const GgufFile& g, const std::string& name,
   if (pol.Route(t, GgufTensorRole::kMatmulWeight) ==
       GgufResidency::kKeepQuant) {
     VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
-    return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1]);
+    return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1], 0, MmapSrc(g, pol));
   }
   if (pol.expand_nk) {
     VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
@@ -233,6 +295,55 @@ void RequireExpand(const GgufLoadPolicy& pol, const GgufFile& g,
   VT_CHECK(pol.Route(g.Get(name), role) == GgufResidency::kExpandBf16,
            std::string("qwen3_5 gguf: a ") + Name(role) +
                " tensor must not keep quant blocks: " + name);
+}
+
+// --- embedding + lm_head, with tied-head sharing (L5) ---------------------
+//
+// A tied-embedding GGUF omits `output.weight`: the head IS `token_embd.weight`,
+// and llama.cpp materializes no second copy — it aliases the head onto the
+// embedding (TENSOR_DUPLICATED). Until L5 we materialized it twice, which on the
+// 2B bench file is a whole extra 0.947 GiB bf16 vocab matrix (248320 x 2048).
+//
+// The two uses want the SAME bytes in the SAME order and differ only in
+// metadata: the gather table is [vocab, H] with nk = false, and the GEMM weight
+// is [N = vocab, K = H] with nk = true. `expand_nk` is exactly the condition
+// under which the head is materialized in the file's own [N, K] order, so it is
+// also exactly the condition under which the two byte images coincide and one
+// buffer can serve both. Without it (VT_CPU_REF, or any non-CPU device) the head
+// is TRANSPOSED to Matmul-B [K, N] — genuinely different bytes — and this falls
+// through to the historical two-buffer path, unchanged.
+//
+// Both tensors then BORROW one shared, refcounted expansion; neither owns it, so
+// there is no "which one frees it" question and no double free.
+void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
+                      OwnedTensor* embed, OwnedTensor* head) {
+  const std::string kEmbed = "token_embd.weight";
+  RequireExpand(pol, g, kEmbed, GgufTensorRole::kEmbeddingTable);
+  *embed = OwnBf16(g, kEmbed, g.Get(kEmbed).shape);
+
+  const bool tied = !HasTensor(g, "output.weight");
+  const std::string head_name = tied ? kEmbed : "output.weight";
+  const GgufTensorInfo& ht = g.Get(head_name);
+  // Ask the PURE decision function, not `pol.Route`, so probing the head here
+  // does not fire the audit hook a second time: the head is routed EXACTLY ONCE
+  // on both branches below, as it was before L5.
+  const bool head_expands =
+      RouteGgufTensor(pol.keep_quant, pol.cpu_ref, GgufTensorRole::kMatmulWeight,
+                      ht.ggml_type, ht.shape) == GgufResidency::kExpandBf16;
+
+  if (tied && pol.share_tied_head && head_expands && pol.expand_nk) {
+    (void)pol.Route(ht, GgufTensorRole::kMatmulWeight);  // the head's one audit event
+    std::shared_ptr<const void> owner = embed->bytes.Share();
+    OwnedTensor h;
+    h.dtype = embed->dtype;
+    h.rank = embed->rank;
+    for (int i = 0; i < embed->rank; ++i) h.shape[i] = embed->shape[i];
+    h.nk = true;  // [N = vocab, K = H], the file's own order
+    h.bytes = OwnedBytes::Borrow(embed->bytes.data(), embed->bytes.size(), owner);
+    *head = std::move(h);
+    return;
+  }
+  *head = OwnMatmulWeight(g, head_name, pol);
 }
 
 // --- config --------------------------------------------------------------
@@ -404,7 +515,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     const std::string nm = Blk(il, "attn_qkv.weight");
     if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
       const GgufTensorInfo& ti = g.Get(nm);
-      gdn.in_proj_qkv = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1]);
+      gdn.in_proj_qkv = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0, MmapSrc(g, pol));
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -421,7 +532,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     const std::string nm = Blk(il, "attn_gate.weight");
     if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
       const GgufTensorInfo& ti = g.Get(nm);
-      gdn.in_proj_z = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1]);
+      gdn.in_proj_z = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0, MmapSrc(g, pol));
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -439,7 +550,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
         Blk(il, pr == &gdn.in_proj_b ? "ssm_beta.weight" : "ssm_alpha.weight");
     if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
       const GgufTensorInfo& ti = g.Get(nm);
-      *pr = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1]);
+      *pr = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0, MmapSrc(g, pol));
       continue;
     }
     const GgufTensorInfo* t = nullptr;
@@ -472,7 +583,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     const std::string nm = Blk(il, "ssm_out.weight");
     if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
       const GgufTensorInfo& ti = g.Get(nm);
-      gdn.out_proj = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1]);
+      gdn.out_proj = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0, MmapSrc(g, pol));
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -549,7 +660,8 @@ std::vector<OwnedTensor> LoadExpertsT(const GgufFile& g, int64_t il,
     // blocks, so the split is a byte range and no block is ever cut.
     for (int64_t e = 0; e < num_experts; ++e) {
       experts.push_back(
-          OwnGgufQuantBlocks(ti, out_dim, in_dim, /*row_offset=*/e * out_dim));
+          OwnGgufQuantBlocks(ti, out_dim, in_dim, /*row_offset=*/e * out_dim,
+                             MmapSrc(g, pol)));
     }
     return experts;
   }
@@ -595,6 +707,12 @@ Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
   // historical all-bf16 expansion byte for byte.
   const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv();
   const GgufLoadPolicy& pol = policy != nullptr ? *policy : env_policy;
+  // Read-once file pages are dropped as the load goes, but only when the kept
+  // weights are the ones staying resident (mmap residency). With the copy arm or
+  // the oracle there is nothing in place to protect and the historical
+  // page-residency behavior is preserved exactly.
+  const GgufPageReleaseScope page_release(
+      gguf, pol.mmap_residency && EnvReleaseExpandedPages());
   VT_CHECK(config.num_hidden_layers > 0 &&
                static_cast<int64_t>(config.layer_types.size()) ==
                    config.num_hidden_layers,
@@ -604,23 +722,15 @@ Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
 
   Qwen3_5MoeWeights w;
   // embed_tokens [vocab, H] (NOT transposed): a GATHER table, never a GEMM.
-  RequireExpand(pol, gguf, "token_embd.weight",
-                GgufTensorRole::kEmbeddingTable);
-  w.embed_tokens =
-      OwnBf16(gguf, "token_embd.weight", gguf.Get("token_embd.weight").shape);
+  // lm_head [H, vocab] (+T). Tied-embedding GGUFs omit output.weight; then the
+  // head IS token_embd, as llama.cpp has it (TENSOR_DUPLICATED). token_embd is
+  // routed TWICE when tied — once as the gather table, once as this GEMM weight
+  // — which is the correct answer for both uses; L5 makes the two SHARE one
+  // expansion where their byte images coincide. See LoadEmbedAndHead.
+  LoadEmbedAndHead(gguf, pol, &w.embed_tokens, &w.lm_head);
   RequireExpand(pol, gguf, "output_norm.weight",
                 GgufTensorRole::kTransformedWeight);
   w.final_norm = OwnNormMinus1(gguf, "output_norm.weight");
-  // lm_head [H, vocab] (+T). Tied-embedding GGUFs omit output.weight; then the
-  // head is the transposed token_embd (same [vocab,H] source), as llama.cpp
-  // does (TENSOR_DUPLICATED from token_embd). When tied, token_embd is routed
-  // TWICE — once as the gather table, once as this GEMM weight — which is the
-  // correct answer for both uses.
-  w.lm_head = OwnMatmulWeight(gguf,
-                              HasTensor(gguf, "output.weight")
-                                  ? "output.weight"
-                                  : "token_embd.weight",
-                              pol);
 
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t il = 0; il < config.num_hidden_layers; ++il) {
@@ -655,6 +765,12 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
   // historical all-bf16 expansion byte for byte.
   const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv();
   const GgufLoadPolicy& pol = policy != nullptr ? *policy : env_policy;
+  // Read-once file pages are dropped as the load goes, but only when the kept
+  // weights are the ones staying resident (mmap residency). With the copy arm or
+  // the oracle there is nothing in place to protect and the historical
+  // page-residency behavior is preserved exactly.
+  const GgufPageReleaseScope page_release(
+      gguf, pol.mmap_residency && EnvReleaseExpandedPages());
   VT_CHECK(config.num_hidden_layers > 0 &&
                static_cast<int64_t>(config.layer_types.size()) ==
                    config.num_hidden_layers,
@@ -663,20 +779,13 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
            "qwen3_5 gguf: num_experts must be 0 for the dense model");
 
   Qwen3_5DenseWeights w;
-  RequireExpand(pol, gguf, "token_embd.weight",
-                GgufTensorRole::kEmbeddingTable);
-  w.embed_tokens =
-      OwnBf16(gguf, "token_embd.weight", gguf.Get("token_embd.weight").shape);
+  // Tied-embedding GGUFs (the 2B bench file) omit output.weight; the head is
+  // then token_embd itself, as llama.cpp has it (TENSOR_DUPLICATED), and L5
+  // lets the two SHARE one expansion. See LoadEmbedAndHead.
+  LoadEmbedAndHead(gguf, pol, &w.embed_tokens, &w.lm_head);
   RequireExpand(pol, gguf, "output_norm.weight",
                 GgufTensorRole::kTransformedWeight);
   w.final_norm = OwnNormMinus1(gguf, "output_norm.weight");
-  // Tied-embedding GGUFs (the 2B) omit output.weight; the head is then the
-  // transposed token_embd, as llama.cpp does (TENSOR_DUPLICATED).
-  w.lm_head = OwnMatmulWeight(gguf,
-                              HasTensor(gguf, "output.weight")
-                                  ? "output.weight"
-                                  : "token_embd.weight",
-                              pol);
 
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t il = 0; il < config.num_hidden_layers; ++il) {

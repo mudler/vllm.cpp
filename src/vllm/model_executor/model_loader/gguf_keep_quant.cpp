@@ -115,6 +115,11 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // switch turns it off with everything else so VT_CPU_REF=1 reproduces the
   // historical load byte for byte.
   p.expand_nk = p.keep_quant && !p.cpu_ref;
+  // L5. Both ride the same availability condition as the residency they refine,
+  // and both are forced off by the oracle switch, so VT_CPU_REF=1 keeps
+  // reproducing the historical load byte for byte and allocation for allocation.
+  p.mmap_residency = EnvOnOr("VT_GGUF_MMAP", p.keep_quant) && !p.cpu_ref;
+  p.share_tied_head = EnvOnOr("VT_GGUF_SHARE_TIED_HEAD", p.expand_nk) && p.expand_nk;
   return p;
 }
 

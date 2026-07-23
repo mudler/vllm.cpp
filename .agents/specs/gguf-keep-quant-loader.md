@@ -123,7 +123,7 @@ Pinned local fork `/home/mudler/_git/llama.cpp` @ `237ad9b96`.
 | L2 | quant residency | `GgufQuantWeight`/block-`OwnedTensor` storage + loader keep-quant path + losslessness units (gate 1) | CIQ G1 | **DONE** 2026-07-22 |
 | L3 | routing + oracle switch | per-tensor policy table, `VT_CPU_REF` env, oracle-stability gate 2, routing units | L2 | **DONE** 2026-07-22 |
 | L4 | memory gate + closure | RSS measurement (gate 3), matrix `M`-cell notes, ledger row | L2, L3 | **MEASURED, NOT MET** 2026-07-22 (see below) |
-| L5 | mmap residency + tied-head sharing | stop COPYING block bytes out of the mapped file (llama.cpp supports both; L2 chose copy deliberately) and stop materialising the vocab matrix twice for a tied `lm_head` — the two changes L4's measurement identifies as ~1.9 GiB of the remaining 3.6 GiB gap | L4 | open |
+| L5 | mmap residency + tied-head sharing | stop COPYING block bytes out of the mapped file (llama.cpp supports both; L2 chose copy deliberately) and stop materialising the vocab matrix twice for a tied `lm_head` — the two changes L4's measurement identifies as ~1.9 GiB of the remaining 3.6 GiB gap | L4 | **DONE** 2026-07-23 (peak RSS 6.401 → 3.884 GiB, 2.29× → 1.39× llama.cpp; byte-identical) |
 
 ## Risks/decisions
 
@@ -344,3 +344,88 @@ RSS to 256 KB (7,787,940 vs 7,788,196) and the pre-G4 latency to 0.15 %, and its
 output token stream is byte-identical to both the BEFORE and the AFTER arm (one
 md5, `d235db12f2cd304007530286a1755c95`) — gate 2 holds end to end with the
 default flipped.
+
+## L5 result (2026-07-23) — mmap residency + tied-head sharing, gate 3 MET-ish
+
+L5 removes the two largest terms L4's arithmetic named, plus a third the port of
+llama.cpp's `unmap_fragment` made cheap. All three are CPU-only (they ride
+`keep_quant`, which is off on CUDA) and all three are OFF under `VT_CPU_REF`, so
+the oracle path and every non-CPU device are byte-for-byte unchanged.
+
+**What landed.**
+- **`OwnedBytes`** ([owned_bytes.h](../../include/vllm/model_executor/models/owned_bytes.h))
+  replaces `OwnedTensor`'s bare `std::vector<uint8_t> bytes` with a container of
+  two residencies — an OWNED vector (default, every existing path) or a BORROWED
+  `(ptr,size)` view carrying a `shared_ptr` keep-alive. Its read API is the exact
+  `std::vector<uint8_t>` subset the tree uses, so all ~300 `.bytes` readers are
+  unchanged; the STRUCTURAL mutations that would move a buffer out from under its
+  owner (`resize`/`assign`/`Share`) hard-fail on a borrowed buffer.
+- **mmap residency** (`VT_GGUF_MMAP`, default on with keep-quant). A kept quant
+  weight is BORROWED in place out of the GGUF's read-only mapping instead of
+  copied into an owned buffer, holding a refcount on it (`GgufMapping`). Mirrors
+  llama.cpp `src/llama-model-loader.cpp:1385` (`load_data_for` under `use_mmap`).
+  The mapping is refcounted so a borrowed weight safely OUTLIVES the `GgufFile`
+  and even the on-disk file (the entrypoint drops its `GgufFile` as soon as the
+  model is built).
+- **tied-head sharing** (`VT_GGUF_SHARE_TIED_HEAD`, default on with `expand_nk`).
+  A tied-embedding GGUF (no `output.weight`) materialises ONE bf16 vocab matrix;
+  the gather table and the lm_head GEMM weight BORROW it with their own metadata
+  (`nk=false` [vocab,H] vs `nk=true` [N=vocab,K=H]). Only valid under `expand_nk`,
+  the one orientation in which the two byte images coincide (llama.cpp
+  `TENSOR_DUPLICATED`).
+- **read-once page release** (`VT_GGUF_RELEASE_PAGES`, default on with mmap).
+  `GgufFile::DropSpanResidency` MADV_DONTNEEDs the INTERIOR file pages of a tensor
+  the loader EXPANDED (read once into an owned bf16 buffer). Port of llama.cpp's
+  `unmap_fragment` (`src/llama-mmap.cpp:490`, called from
+  `llama-model-loader.cpp:1676-1678`) adapted to a MIXED file: our kept and
+  expanded tensors are interleaved, so it is per-tensor MADV_DONTNEED on interior
+  pages (recorded deviation from llama.cpp's two-fragment munmap), which keeps the
+  address space whole while dropping the same physical pages. Read-only file
+  pages, so a later read simply re-faults with the same bytes.
+
+**Gate 3 — MEASURED (binding, idle `dgx.casa` aarch64, one `flock`, 3 reps,
+`Qwen3.5-2B-UD-Q8_K_XL.gguf`, same-binary A/B).** Peak RSS
+**6,712,464 KB → 4,072,720 KB = 6.401 → 3.884 GiB**, a further 1.65× on top of
+L4. Against llama.cpp's 2.798 GiB the ratio is **2.29× → 1.388×**; the spec's
+≤1.15× bar is not fully met but the deficit is now 1.086 GiB, down from 3.6 GiB.
+Per-lever isolation on the same host:
+
+| arm | peak RSS | vs copy-only |
+|---|---|---|
+| copy blocks (L4, `VT_GGUF_MMAP=0 VT_GGUF_SHARE_TIED_HEAD=0`) | 6.401 GiB | — |
+| + tied-head share (`VT_GGUF_MMAP=0`) | 5.455 GiB | −0.946 GiB |
+| + mmap borrow (`VT_GGUF_RELEASE_PAGES=0`) | 4.457 GiB | −0.998 GiB |
+| + read-once page release (production default) | **3.884 GiB** | −0.573 GiB |
+
+The tied-head term (0.946) and the mmap term (0.998 ≈ the kept q8_0 that L4
+double-counted) match L4's arithmetic to within measurement; the page-release is
+the extra L5 found. The remaining ~1.09 GiB over llama.cpp is the **f16 → bf16
+expansion** (1.615 GiB of this file is f16, no block encoding covers it) minus
+what page-release recovered — NOT this leaf's target; it disappears if the
+elementwise GEMM learns to consume f16 rows directly (the CPU track's separate
+lever, see the fresh profile in cpu-llamacpp-floor-remeasure).
+
+**Throughput held; byte-identity held.** Same binary, 3 reps: decode TPOT
+**41.7 ms unchanged** (parity kept), prefill TTFT ~1590 → ~1656 ms (+4 %, the
+one-time mmap first-touch faults moving INTO the timed prefill window — total work
+is LESS, not more). Output token md5 is `d235db12f2cd304007530286a1755c95` across
+BEFORE, AFTER and ORACLE — the SAME golden L4 and the GEMM work held, unchanged by
+mmap or head-sharing. llama.cpp denominator, fresh on the same idle host: pp128
+180.14±2.78, tg32 25.37±0.81, RSS 2.798 GiB.
+
+**Lifetime safety — tested explicitly, both hazards.** A borrowed weight is read
+correctly AFTER its `GgufFile` and the on-disk file are destroyed (refcounted
+mapping survives unlink); a shared tied head is freed exactly once whether the
+embedding or the head half dies first, and `ReleaseHost()` on a borrowed weight
+drops only the reference (never madvise's pages it does not own). The new unit
+suite (`test_gguf_keep_quant`, 28 cases) adds mmap byte-identity, the
+outlives-the-file case, the one-buffer/two-buffer share assertion, the
+free-once/either-order case, the oracle-shares-nothing case, both L5 FromEnv
+switches, and the `OwnedBytes` mutate-refusal + `Share` cases.
+
+**Contention caveat, recorded.** The FIRST binding attempt showed the AFTER arm
+at 40× slower with high rep variance and loadavg spiking to 13.5 — a co-tenant
+agent's CPU build/test running concurrently (the `flock` serialises GPU work
+only). Re-run on a genuinely idle box (loadavg < 0.8, gated in the recipe), all
+three arms are ~42 ms TPOT and the numbers above reproduce. Contended CPU runs
+are VOID per protocol; the binding series waited for idle inside the lock.

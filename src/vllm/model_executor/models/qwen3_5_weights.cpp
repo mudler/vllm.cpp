@@ -35,6 +35,15 @@ void OwnedTensor::ReleaseHost() const {
   // narrow const_cast, consistent with the mutable lazy-device-residency design.
   auto& self = *const_cast<OwnedTensor*>(this);
   if (self.bytes.empty()) return;
+  // A BORROWED buffer owns no anonymous pages: the bytes live in the GGUF mmap
+  // (clean, file-backed, reclaimable by the kernel without our help) or in an
+  // expansion another tensor still references. madvise'ing them away would be
+  // wrong on both counts, so releasing one means only dropping the keep-alive.
+  if (self.bytes.borrowed()) {
+    self.bytes.Reset();
+    self.host_released = true;
+    return;
+  }
 #if defined(__unix__) || defined(__APPLE__)
   // RETURN THE PHYSICAL PAGES TO THE OS NOW. std::vector's free() alone does not:
   // glibc raises its dynamic mmap threshold as large blocks are freed, so the
@@ -59,8 +68,8 @@ void OwnedTensor::ReleaseHost() const {
     }
   }
 #endif
-  // swap-with-empty forces the vector to deallocate its capacity.
-  std::vector<uint8_t>().swap(self.bytes);
+  // Reset() forces the underlying vector to deallocate its capacity.
+  self.bytes.Reset();
   self.host_released = true;
 }
 

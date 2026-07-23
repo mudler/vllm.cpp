@@ -304,20 +304,25 @@ GgufFile GgufFile::Open(const std::string& path) {
   GgufFile f;  // fully constructed: dtor cleans up on any throw below
   f.path_ = path;
 
-  f.fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (f.fd_ < 0)
+  // The mapping is refcounted from the moment it exists, so every early Fail()
+  // below unmaps through the same one owner (GgufMapping's destructor).
+  auto mapping = std::make_shared<GgufMapping>();
+  f.map_ = mapping;
+
+  mapping->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (mapping->fd < 0)
     Fail(path, std::string("cannot open file: ") + std::strerror(errno));
   struct stat st{};
-  if (::fstat(f.fd_, &st) != 0)
+  if (::fstat(mapping->fd, &st) != 0)
     Fail(path, std::string("fstat failed: ") + std::strerror(errno));
   if (st.st_size <= 0) Fail(path, "empty file");
   const size_t file_size = static_cast<size_t>(st.st_size);
 
-  void* map = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, f.fd_, 0);
+  void* map = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, mapping->fd, 0);
   if (map == MAP_FAILED)
     Fail(path, std::string("mmap failed: ") + std::strerror(errno));
-  f.map_ = map;
-  f.map_size_ = file_size;
+  mapping->addr = map;
+  mapping->size = file_size;
 
   Cursor cur{static_cast<const uint8_t*>(map), file_size, 0, path};
 
@@ -472,48 +477,61 @@ const GgufTensorInfo& GgufFile::Get(const std::string& name) const {
   return tensors_[it->second];
 }
 
-void GgufFile::Release() noexcept {
-  if (map_ != nullptr) {
-    ::munmap(map_, map_size_);
-    map_ = nullptr;
-    map_size_ = 0;
-  }
-  if (fd_ >= 0) {
-    ::close(fd_);
-    fd_ = -1;
-  }
+GgufMapping::~GgufMapping() {
+  if (addr != nullptr) ::munmap(addr, size);
+  if (fd >= 0) ::close(fd);
 }
 
-GgufFile::~GgufFile() { Release(); }
+bool GgufFile::OwnsSpan(const uint8_t* data, size_t nbytes) const {
+  if (map_ == nullptr || map_->addr == nullptr) return false;
+  const auto* base = static_cast<const uint8_t*>(map_->addr);
+  return data >= base && nbytes <= map_->size &&
+         static_cast<size_t>(data - base) <= map_->size - nbytes;
+}
+
+void GgufFile::DropSpanResidency(const uint8_t* data, size_t nbytes) const {
+#if defined(__unix__)
+  if (!release_expanded_ || !OwnsSpan(data, nbytes)) return;
+  const long ps_l = ::sysconf(_SC_PAGESIZE);
+  const auto ps = static_cast<uintptr_t>(ps_l > 0 ? ps_l : 4096);
+  const auto begin = reinterpret_cast<uintptr_t>(data);
+  const uintptr_t end = begin + nbytes;
+  // INTERIOR whole pages only: a boundary page may also hold the first/last
+  // bytes of a neighbouring tensor that IS being kept in place.
+  const uintptr_t page_begin = (begin + ps - 1) & ~(ps - 1);
+  const uintptr_t page_end = end & ~(ps - 1);
+  if (page_end > page_begin) {
+    // Best-effort by contract: a failure costs resident pages, never
+    // correctness, so there is nothing to report or recover.
+    (void)::madvise(reinterpret_cast<void*>(page_begin),
+                    static_cast<size_t>(page_end - page_begin), MADV_DONTNEED);
+  }
+#else
+  (void)data;
+  (void)nbytes;
+#endif
+}
+
+// Drops THIS object's reference. The mapping itself survives while any borrowing
+// weight still holds one (GgufMapping's destructor does the munmap/close).
+void GgufFile::Release() noexcept { map_.reset(); }
+
+GgufFile::~GgufFile() = default;
 
 GgufFile::GgufFile(GgufFile&& other) noexcept
     : path_(std::move(other.path_)),
-      fd_(other.fd_),
-      map_(other.map_),
-      map_size_(other.map_size_),
+      map_(std::move(other.map_)),
       kvs_(std::move(other.kvs_)),
       tensors_(std::move(other.tensors_)),
-      index_(std::move(other.index_)) {
-  // Leave the moved-from object inert so its dtor is a no-op (no double
-  // munmap/close).
-  other.fd_ = -1;
-  other.map_ = nullptr;
-  other.map_size_ = 0;
-}
+      index_(std::move(other.index_)) {}
 
 GgufFile& GgufFile::operator=(GgufFile&& other) noexcept {
   if (this != &other) {
-    Release();
     path_ = std::move(other.path_);
-    fd_ = other.fd_;
-    map_ = other.map_;
-    map_size_ = other.map_size_;
+    map_ = std::move(other.map_);
     kvs_ = std::move(other.kvs_);
     tensors_ = std::move(other.tensors_);
     index_ = std::move(other.index_);
-    other.fd_ = -1;
-    other.map_ = nullptr;
-    other.map_size_ = 0;
   }
   return *this;
 }

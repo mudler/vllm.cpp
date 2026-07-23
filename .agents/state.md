@@ -20952,3 +20952,35 @@ docs/BENCHMARKS.md (docs/BENCHMARKS.md).
   the audit confirmed all 23 engaged rows already accurately stated (no row moved).
   8 `✅`, 4 `🚧`, 8 `📋`, 3 `🚫`; rollup 6 ACTIVE / 3 GATING / 2 PARTIAL / 1 READY /
   8 SPIKE / 3 BLOCKED / 303 INVENTORIED / 0 DONE = 326. See the same-date ledger row.
+- **2026-07-23 (LMCache C++ client W3 — `lm://` client wired as a `KVConnector`)** —
+  `CLAIM-LMCACHE-CPP-CLIENT`, base `26a0fc0`, worktree `/home/mudler/_git/vllm-lmcache-w3`
+  branch `lmcache-connector-w3`. The final step making LMCache usable end-to-end
+  through our engine: a new `LMCacheConnector : KVConnector`
+  (`src/vllm/v1/kv_offload/lmcache/lmcache_connector.{h,cpp}`) over the landed W5
+  abstract seam, `REGISTER_KV_CONNECTOR("LMCacheConnector", …)`, selected by
+  `KVTransferConfig{kv_connector="LMCacheConnector", kv_connector_extra_config=
+  {host,port,hash_algo,chunk_tokens,…}}`, default OFF. Scheduler side is real
+  (`get_num_new_matched_tokens` computes rolling-blake3 chunk hashes and
+  `Exist`-probes the remote store for the longest cached prefix, synchronous
+  `(n, false)`, mirroring `lmcache_connector.py:230-259`; `update_state_after_alloc`
+  records the load; `build_connector_meta` resets). Worker side drives the W2
+  client: `StoreChunk` (PUT KV_2LTD), `LoadChunk` (GET+unpack, foreign-block
+  refusal). **GATE ACHIEVED = the connector-level round-trip through the engine:**
+  store a repeated prefix, then a FRESH "restarted" connector over the SAME store
+  looks it up and shortcuts prefill through the REAL scheduler (32/48 prefill
+  tokens saved, 2/3 chunks hit), then loads it back byte-identical (token-identity);
+  foreign/mismatched-key REFUSAL; default-off inertness. `test_lmcache_connector`
+  5 cases / 50 assertions vs an in-process C++ mock lm:// server (always-on, no
+  Python); the store->load round-trip ALSO passes vs a REAL `lmcache.v1.server`
+  `8570aad` (16 assertions, `VT_LMCACHE_LIVE_*`, server stood up headless in a
+  throwaway venv per W2). Regressions CPU: W1 `test_lmcache_codec` 6/6 (2074), W2
+  `test_lmcache_client` 3/3 (45), W5 `test_kv_offload_connector` 11/11 (80) all
+  UNCHANGED. Clean CPU `-Werror` 0 warnings, asserts-on (no NDEBUG). All five
+  checkers RC=0 (DSR 32). Row `KV-EXTERNAL-CACHE` STAYS `ACTIVE` (NOT `DONE`).
+  RECORDED DEVIATION: chunk_tokens==block_size over plain token ids is
+  self-consistent for our store<->load, but bit-for-bit agreement with a Python
+  vLLM+LMCache PEER additionally needs chunk_size 256 + vLLM's own token hash +
+  mm-hash injection. NEXT (the named remaining step): the full
+  model->connector->live-server e2e with **key-agreement** against a Python
+  vLLM+LMCache peer, plus the DGX output-invariance + every-axis throughput arms.
+  Not pushed.

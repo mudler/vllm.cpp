@@ -342,13 +342,15 @@ add_library(vllm STATIC
   src/vllm/v1/kv_offload/tiering_manager.cpp
   src/vllm/v1/kv_offload/kv_connector.cpp
   # LMCache MODE-1 (lm://) wire codec + blocking TCP client — KV-EXTERNAL-CACHE
-  # W1 (codec) + W2 (client).  Pure CPU; no call site routes to it yet, the
-  # KVConnector subclass is W3.
+  # W1 (codec) + W2 (client).  Pure CPU; the W3 LMCacheConnector subclass
+  # (below) is the KVConnector that drives them over the W5 seam.
   src/vllm/v1/kv_offload/lmcache/memory_format.cpp
   src/vllm/v1/kv_offload/lmcache/remote_protocol.cpp
   src/vllm/v1/kv_offload/lmcache/cache_engine_key.cpp
   src/vllm/v1/kv_offload/lmcache/token_hasher.cpp
   src/vllm/v1/kv_offload/lmcache/remote_client.cpp
+  # LMCache lm:// KVConnector subclass over the W5 seam — KV-EXTERNAL-CACHE W3.
+  src/vllm/v1/kv_offload/lmcache/lmcache_connector.cpp
   src/vllm/v1/core/sched/request_queue.cpp
   src/vllm/v1/core/sched/output.cpp
   src/vllm/v1/core/sched/scheduler.cpp

@@ -99,6 +99,11 @@ target_compile_definitions(test_lmcache_codec PRIVATE
 # vs an in-process C++ mock server (always), and vs a REAL lmcache.v1.server
 # when VT_LMCACHE_LIVE_HOST/PORT are set (scripts/lmcache/run_live_roundtrip.sh).
 vllm_cpp_add_test(test_lmcache_client vllm/v1/kv_offload/lmcache/test_lmcache_client.cpp)
+# LMCache lm:// KVConnector subclass over the W5 seam — KV-EXTERNAL-CACHE W3.
+# Connector-level round-trip (store->lookup->shortcut->load-identical) through
+# the REAL scheduler vs an in-process mock server (always), foreign-key refusal,
+# default-off inertness; the live gate vs a real server under VT_LMCACHE_LIVE_*.
+vllm_cpp_add_test(test_lmcache_connector vllm/v1/kv_offload/lmcache/test_lmcache_connector.cpp)
 vllm_cpp_add_test(test_scheduler_config vllm/test_scheduler_config.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)

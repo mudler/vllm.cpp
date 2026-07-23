@@ -2568,4 +2568,58 @@ TEST_CASE("CUDA arch tactic registry is exercised by the fp4xfp4 launcher") {
   for (void* p : {dx, dbp, dbs, dap, das, dout}) b.Free(p);
   b.DestroyQueue(gq);
 }
+
+// ── BACKEND-CUDA-SM090 (arch additivity §W9): the SM-dispatch seam is CROSS-
+// FAMILY additive, not merely cross-arch within the sm_12x family ─────────────
+// sm_120a was near-free because it SHARES the sm_12x kernel bodies (same fp4
+// `mma.sync kind::mxf4nvf4` PTX). A genuinely different family (Hopper sm_90,
+// datacenter Blackwell sm_100, Ampere sm_80) has NO body here, so bringing one
+// up must be: register its tactic from its own TU, and the launcher selects it
+// by capability with ZERO launcher edits. This case proves the SELECTOR half of
+// that contract WITHOUT fabricating a kernel we cannot test: it feeds the
+// registry a synthetic Hopper capability and asserts the ONE registered tactic
+// (sm_12x) correctly DECLINES it, so a Hopper device falls through to the
+// portable path today and a real Hopper tactic would be additively selectable
+// tomorrow. Pure table logic — no GPU, no device dispatch — so it runs anywhere.
+TEST_CASE("CUDA arch tactic registry is cross-family additive (Hopper sm_90 declines to sm_12x)") {
+  using vt::cuda::ArchTactic;
+  using vt::cuda::DeviceCaps;
+  using vt::cuda::SelectArchTactic;
+  using vt::cuda::TacticFamily;
+
+  // A synthetic, VALID Hopper capability. No CUDA device is required: the
+  // registry's selection is a pure predicate over DeviceCaps.
+  DeviceCaps hopper;
+  hopper.valid = true;
+  hopper.sm_major = 9;  // Hopper H100/H200 — a different FAMILY from sm_12x
+  hopper.sm_minor = 0;
+  hopper.max_shared_memory_per_block_optin = 227 * 1024;  // H100 opt-in ceiling
+  hopper.multiprocessor_count = 132;
+
+  // The fp4 family must NOT select the sm_12x tactic for a Hopper device: its
+  // `mma.sync kind::mxf4nvf4` is consumer-Blackwell-only. A null return is the
+  // portable-fallback signal the launcher already handles.
+  const ArchTactic* fp4 = SelectArchTactic(TacticFamily::kNvfp4Fp4Mma, hopper);
+  CHECK(fp4 == nullptr);
+
+  // Same for a synthetic datacenter-Blackwell (sm_100) and an Ampere (sm_80):
+  // neither shares the sm_12x fp4 body, so both fall back.
+  for (int major : {10, 8}) {
+    DeviceCaps other = hopper;
+    other.sm_major = major;
+    CHECK(SelectArchTactic(TacticFamily::kNvfp4Fp4Mma, other) == nullptr);
+  }
+
+  // The additivity counter is still exactly the sm_12x population — registering
+  // a Hopper tactic would raise it by one and this selection would then return
+  // it, with no edit to LaunchFp4Fp4. That the registry ACCEPTS a major!=12 entry
+  // is the whole point of the seam.
+  const int registered =
+      vt::cuda::RegisteredArchTacticCount(TacticFamily::kNvfp4Fp4Mma);
+#ifdef VT_FP4_MMA_SM120A
+  CHECK(registered == 1);
+#else
+  CHECK(registered == 0);
+#endif
+}
 #endif  // VLLM_CPP_CUDA

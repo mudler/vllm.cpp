@@ -79,6 +79,23 @@ foreach(_f IN LISTS _ALL_FEATURES)
   expect_feature("80" "${_f}" "")
 endforeach()
 
+# --- Cross-family SINGLE-ARCH targets (Hopper sm_90a, datacenter Blackwell
+# sm_100a, Ampere sm_80) resolve EVERY fp4/cutlass/marlin/fa2 feature to EMPTY:
+# vllm.cpp has NO Hopper wgmma / sm_100 tcgen05 / Ampere kernel body, so the
+# FEATURE TABLE (which lists only archs with a BUILT+VALIDATED body — deviation
+# #2) names none of them. A single-arch `90a` build therefore compiles ONLY the
+# portable C++/CUDA kernels for sm_90a and is a build-supported, feature-degraded
+# target — NOT runtime-validated (no Hopper board here). Pinned here so a future
+# table edit cannot silently claim a Hopper fast path we do not have; widening a
+# cell without the matching tactic body is the exact silent-capability failure
+# this suite exists to catch. See backend-matrix.md BACKEND-CUDA-SM090 and
+# .agents/specs/cuda-arch-additivity.md §W9.
+foreach(_f IN LISTS _ALL_FEATURES)
+  expect_feature("90a" "${_f}" "")
+  expect_feature("100a" "${_f}" "")
+  expect_feature("90" "${_f}" "")
+endforeach()
+
 if(_failures GREATER 0)
   message(FATAL_ERROR "${_failures} CUDA feature-table expectation(s) failed")
 endif()

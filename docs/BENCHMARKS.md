@@ -1709,6 +1709,28 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   publish requires an actual RTX 50-series card; the validation steps for an
   owner are in the spec.
 
+- **sm_90a (Hopper) as a SINGLE-ARCH, PORTABLE-KERNELS-ONLY build-supported CUDA
+  target — `NOT APPLICABLE` (2026-07-23, `CLAIM-CUDA-SM090-BRINGUP`,
+  [spec §W9](../.agents/specs/cuda-arch-additivity.md)).**
+  `benchmark_binding=false`. **No sm_90 (Hopper H100/H200) hardware exists here,
+  so there is nothing to benchmark and no number is owed, pending, or claimed —
+  and even a Hopper owner would get only the PORTABLE-KERNEL path, since every
+  accelerated feature (FP4 MMA, CUTLASS NVFP4/FP8, Marlin, FlashAttention-2)
+  resolves DISABLED for `90a` (we have no Hopper wgmma/TMA kernel body).** The
+  change is build-enablement plus records: three native-fp4 helper functions in
+  `cuda_matmul_nvfp4.cu` are gated on `VT_FP4_MMA_SM120A` so the TU compiles when
+  the native path is off (which unblocks the single-arch `90a` build), plus
+  feature-table test assertions (`90a`→all-EMPTY) and a cross-family registry
+  test. The GB10 relevance is purely negative and was verified, not assumed: the
+  guard change alters what `cuda_matmul_nvfp4.cu` compiles, so a full production
+  `121a` build (CUTLASS+Marlin+FA2+Triton) was rebuilt `-Werror` 0-warn and the
+  regression battery re-run — UNCHANGED (see the ledger row) — and the guards are
+  no-ops on `121a` where `VT_FP4_MMA_SM120A` is defined. No existing binding
+  number is created, re-based or invalidated. A vLLM-competitive Hopper speed
+  number would first require the Hopper fast-path kernel bodies (a separate
+  campaign) AND an actual Hopper card; the validation steps for an owner are in
+  the spec.
+
 - **Qwen3-32B NVFP4A16 (compressed-tensors W4A16) — CORRECTNESS MET,
   SPEED PENDING (2026-07-21, `CLAIM-QUANT-NVFP4-CT-W4A16`,
   [spike](../.agents/specs/sweep-qwen3-32b-nvfp4a16.md)).**

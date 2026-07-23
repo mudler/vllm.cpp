@@ -1,8 +1,11 @@
 # CUDA-architecture additivity — implementation spike
 
-Status: **IMPLEMENTED — framework seams (W1-W6) plus the FIRST architecture brought
-up through them (W8: `sm_120a`, BUILD-supported, runtime HW-blocked)**.
-Owners: `CLAIM-CUDA-ARCH-ADDITIVITY` (the seams), `CLAIM-CUDA-SM120-BRINGUP` (W8).
+Status: **IMPLEMENTED — framework seams (W1-W6); the first SAME-FAMILY arch through
+them (W8: `sm_120a`, BUILD-supported, runtime HW-blocked); and the first CROSS-FAMILY
+arch (W9: `sm_90a` Hopper, single-arch PORTABLE-KERNELS-ONLY build-supported, runtime
+HW-blocked, no fast paths)**.
+Owners: `CLAIM-CUDA-ARCH-ADDITIVITY` (the seams), `CLAIM-CUDA-SM120-BRINGUP` (W8),
+`CLAIM-CUDA-SM090-BRINGUP` (W9).
 Rows: **`BACKEND-CUDA-ARCH-ADDITIVITY`** (new, the seam row), advancing
 `BACKEND-CUDA-SM120` / `BACKEND-CUDA-SM121` / `BACKEND-CUDA-COMP-FP4` /
 `BACKEND-CUDA-COMP-MARLIN` / `BACKEND-CUDA-COMP-SCALEDMM-C3X` / `BACKEND-CUDA-COMP-FA`.
@@ -210,8 +213,72 @@ predicate over an 8-entry table, off the gate models' default path entirely
 | W4 | GAP #3 — queried smem ceiling | `cuda_paged_attn.cu` | DONE |
 | W5 | positive-signal tests | `tests/vt/test_cuda_backend.cpp`, `tests/vt/test_ops_nvfp4_fp4.cpp` | DONE |
 | W6 | dgx gate battery + multi-arch configure evidence | — | see ledger |
-| W7 | **FUTURE, HW-BLOCKED** — per-source `-gencode` narrowing + the first cross-family tactic body | `cmake/CudaArchFeatures.cmake`, a new per-arch TU | NOT STARTED |
+| W7 | **NAMED NEXT ROW, HW-BLOCKED value** — per-source `-gencode` narrowing (vLLM `set_gencode_flags_for_srcs`, `utils.cmake:265-345`) so a CROSS-FAMILY FAT build (`"90a;121a"`) can compile the sm12x-only TUs for sm12x only. Requires target-level `CUDA_ARCHITECTURES OFF` + manual per-TU gencode across every CUDA target. Buys nothing runtime until a cross-family tactic body exists, and it re-codegens the arch we DO run (GB10) so it must be proven byte-identical. **W9 measured that the fat build is the ONLY thing that needs it** — a single-arch cross-family build does not. | `cmake/CudaArchFeatures.cmake`, every `target_sources` CUDA block | NOT STARTED |
 | W8 | **sm_120a bring-up — the first ADDITIVE architecture exercised end to end.** Same-family fat build proven to compile; Triton-AOT multi-arch diagnosis; configure-tier feature-table test + CI job | `cmake/TritonAOT.cmake`, `cmake/CudaArchFeaturesTest.cmake` (new), `CMakeLists.txt`, `.github/workflows/ci.yml` | DONE (BUILD-supported; runtime UNPROVEN — no sm_120 board here) |
+| W9 | **sm_90a (Hopper) bring-up — the first CROSS-FAMILY architecture, single-arch, PORTABLE-KERNELS-ONLY.** Guard the native fp4 helpers so the TU compiles when `VT_FP4_MMA_SM120A` is off; feature-table test pins `90a`→all-features-EMPTY; registry cross-family additivity test | `src/vt/cuda/cuda_matmul_nvfp4.cu`, `cmake/CudaArchFeaturesTest.cmake`, `tests/vt/test_ops_nvfp4_fp4.cpp` | DONE (single-arch BUILD-supported, portable-only, NO fast paths, runtime UNPROVEN — no Hopper board here; fat cross-family build still blocked, W7) |
+
+### W9 — sm_90a (Hopper), measured
+
+**What "copy sm_90a from vLLM" actually requires — determined, not assumed.** vLLM's
+sm_90a support is its widest non-Blackwell path (FA3 Hopper, CUTLASS scaled-mm C3x
+`ArchTag=Sm90`, Machete, DeepGEMM, CUTLASS MoE) — every one a **Hopper wgmma / TMA
+kernel body we do not have**. Our fast-path kernels are all sm_12x: the native fp4
+`mma.sync kind::mxf4nvf4` PTX, `ArchTag=Sm120` for CUTLASS FP8, the Marlin bf16-NVFP4
+slice built for sm_12x only, and the vendored FA-2 compiled for sm_12x only. So per
+FEATURE-TABLE deviation #2 (a cell lists only archs with a BUILT+VALIDATED body), all
+five fast-path cells correctly stay EMPTY for `90a`. **Copying vLLM's 90a fast paths is
+a Hopper kernel campaign, untestable here — NOT a config or table edit.** What IS
+mechanical and landed: the single-arch portable-kernel build.
+
+**Measured on dgx (nvcc 13.0, `~/work/sm90a`, base `4884d03`+W9):**
+- `-DVLLM_CPP_CUDA_ARCHITECTURES=90a` resolves fp4-mma / cutlass-nvfp4 / cutlass-fp8 /
+  marlin-nvfp4 / fa2 all **DISABLED** ("no requested arch in [90a] provides it") — the
+  honest portable-only state.
+- **The single-arch `90a` build was BLOCKED before W9** by three `-Werror` `#177-D
+  "declared but never referenced"` errors in `cuda_matmul_nvfp4.cu`: `FusedFp4VectorEnabled`
+  and `PointerAligned` (used only under `#if defined(VT_FP4_MMA_SM120A)`), and the
+  `__device__ GetNib` (used only by the `MatmulNvfp4Fp4Native` template, which is
+  instantiated only under `VT_FP4_MMA_SM120A`). This is a mechanical guard gap, NOT a
+  hardware limit — the sm12x native path is compiled-out on `90a`, so its private helpers
+  must be too. **W9 gates all three on `VT_FP4_MMA_SM120A`** (GetNib additionally keeps
+  its `__CUDA_ARCH_SPECIFIC__` guard). On GB10 (`121a`, the define is on) the code is
+  compiled EXACTLY as before — byte-identical.
+- **After W9 the single-arch `90a` build is CLEAN**: `BUILD_90A_EXIT=0`, `-Werror`
+  **0 warnings**, and `cuobjdump -lelf libvllm.a` shows **16 TUs carrying real `sm_90a`
+  cubins and nothing else** (the 22 fast-path TUs — cutlass/marlin/fa2/fp4-tactics — are
+  correctly ABSENT, vs 38 for a full `121a` build).
+- **The cross-family FAT build `"90a;121a"` still does NOT compile**, and W9 did not
+  change that: `VT_FP4_MMA_SM120A` is defined (121a provides fp4-mma) and the sources are
+  gencode'd for the WHOLE list, so `ptxas` rejects the sm12x fp4 PTX for `compute_90a` —
+  `Feature '.kind::mxf4nvf4' not supported on .target 'sm_90a'`, `Instruction 'cvt with
+  .e2m1x2' not supported`, `Feature '256 bit wide load/store' requires .target sm_100 or
+  higher`. This is the fundamental gencode blocker; per-source `-gencode` narrowing is the
+  named next row **W7**. (Note it is a DIFFERENT failure from the single-arch one W9 fixed.)
+
+**What is PROVEN for sm_90a:** configure-time feature resolution (all five fast paths
+DISABLED — portable-only), a clean `-Werror` single-arch compile, real `sm_90a` SASS in
+16 TUs, and the runtime SM-dispatch seam being cross-family-ready (the sole registered
+tactic declines a synthetic Hopper `DeviceCaps{sm_major=9}` → portable fallback, asserted
+in `test_ops_nvfp4_fp4.cpp` with no GPU).
+
+**What is NOT proven:** any sm_90 execution of anything. No Hopper board exists here. The
+portable CUDA kernels have never RUN on sm_90 hardware; a green single-arch link is not
+execution evidence and this row does not treat it as such. There are also no Hopper fast
+paths at all (fp4/cutlass/marlin/FA2 absent), so even a Hopper owner running this build
+gets the portable-kernel path only, not vLLM-competitive throughput.
+
+**What a Hopper (H100/H200) owner must do to validate it:**
+1. `cmake -S . -B build -DVLLM_CPP_CUDA_ARCHITECTURES=90a -DVLLM_CPP_TRITON=OFF`
+   (plus `-DVLLM_CPP_CUTLASS_DIR=<cutlass >=4.5.0>`), then build. Expect the five fast
+   paths DISABLED and 0 warnings.
+2. Run the unit tier — `test_cuda_backend`, `test_ops_paged_attn`, `test_ops_moe_grouped`
+   (the portable WMMA/grouped paths) — and report pass/fail; these have never executed on
+   sm_90 silicon.
+3. Run a gate model end to end against its golden and report token counts. Only this would
+   move `BACKEND-CUDA-SM090` past a build-supported claim.
+4. A Hopper-competitive path needs the fp4/CUTLASS/Marlin/FA tactic BODIES ported for
+   `sm_90a` (wgmma/TMA) and their FEATURE-TABLE cells widened — the kernel campaign, W7's
+   sibling, out of scope here.
 
 ### W8 — sm_120a, measured
 

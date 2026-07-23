@@ -97,6 +97,16 @@ bool Fp4VecEnabled() {
 // BF16 + direct-swizzled route. All other dtypes/layouts/alignment cases retain
 // the scalar producer below. Cache the environment decision: this launcher is
 // reached 64 times per dense forward and must never call getenv per kernel.
+//
+// These two helpers are consumed ONLY by the native fp4-MMA fused-producer path
+// (below, under `#if defined(VT_FP4_MMA_SM120A)`), so they are gated on the same
+// define. Without this, a cross-family single-arch build that compiles this TU
+// with the native path OFF (e.g. -DVLLM_CPP_CUDA_ARCHITECTURES=90a, where the
+// `fp4-mma` FEATURE-TABLE row resolves EMPTY) leaves them referenced nowhere and
+// -Werror rejects the TU (#177-D "declared but never referenced"). On sm_12x
+// (VT_FP4_MMA_SM120A defined) they are compiled exactly as before — byte
+// identical. See .agents/specs/cuda-arch-additivity.md §W9 (BACKEND-CUDA-SM090).
+#if defined(VT_FP4_MMA_SM120A)
 bool FusedFp4VectorEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_FP4_FUSED_VEC");
@@ -108,6 +118,7 @@ bool FusedFp4VectorEnabled() {
 bool PointerAligned(const void* pointer, uintptr_t alignment) {
   return (reinterpret_cast<uintptr_t>(pointer) & (alignment - 1)) == 0;
 }
+#endif  // VT_FP4_MMA_SM120A
 
 // Decode-specialized MoE grouped GEMM path toggle (M2.9; A/B, default ON). Set
 // VT_MOE_DECODE=0 to force the prefill-tuned BM=64 WMMA tile for small-M decode
@@ -2550,7 +2561,13 @@ __global__ void MatmulNvfp4Fp4Wmma(Tout* out, const uint8_t* a_packed, const uin
 //   D       d0(g,t*2) d1(g,t*2+1) d2(g+8,t*2) d3(g+8,t*2+1)
 //   A scale: row r held in lane (r%8)*4 + (r>=8?1:0), byte b = k-block b
 //   B scale: col n held in lane n*4,                  byte b = k-block b
-#if defined(__CUDA_ARCH_SPECIFIC__)
+// Consumed only by the MatmulNvfp4Fp4Native template below, which is instantiated
+// exclusively from the native fp4 tactic (under VT_FP4_MMA_SM120A). Gate on BOTH
+// so a cross-family single-arch build where __CUDA_ARCH_SPECIFIC__ is defined
+// (e.g. sm_90a) but the native path is OFF does not leave this device helper
+// referenced nowhere (-Werror #177-D). On sm_12x both are defined -> byte
+// identical. See .agents/specs/cuda-arch-additivity.md §W9 (BACKEND-CUDA-SM090).
+#if defined(__CUDA_ARCH_SPECIFIC__) && defined(VT_FP4_MMA_SM120A)
 __device__ __forceinline__ uint8_t GetNib(const uint8_t* p, int64_t row,
                                           int64_t col, int64_t k) {
   const uint8_t byte = p[row * (k / 2) + col / 2];

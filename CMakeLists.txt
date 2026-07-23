@@ -71,9 +71,17 @@ set(MLX_ROOT "" CACHE PATH "Root of an MLX install (include/ + lib/) for VLLM_CP
 #                 targets. NOTE: incompatible with -DVLLM_CPP_TRITON=ON, because a
 #                 vendored AOT cubin is single-arch (TritonAOT.cmake explains and
 #                 diagnoses this); the portable CUDA kernels cover the fat build.
-# A cross-FAMILY list (e.g. "90a;121a") resolves its features honestly but does
-# NOT compile — the sources are gencode'd for the whole list and no cross-family
-# tactic body exists. See .agents/specs/cuda-arch-additivity.md.
+#   90a           Hopper (H100/H200) — a DIFFERENT family. Single-arch only, and
+#                 PORTABLE-KERNELS-ONLY: all five accelerated features resolve
+#                 DISABLED (we have no Hopper wgmma/TMA kernel body, so no
+#                 FEATURE-TABLE cell names 9.0a), so only the portable C++/CUDA
+#                 kernels compile — build-supported, NOT vLLM-competitive, and
+#                 runtime-UNPROVEN (no Hopper board here). See backend-matrix.md
+#                 BACKEND-CUDA-SM090 and cuda-arch-additivity.md §W9.
+# A cross-FAMILY FAT list (e.g. "90a;121a") resolves its features honestly but
+# does NOT compile — the sources are gencode'd for the whole list, so the sm12x
+# fp4 PTX is rejected on compute_90a; per-source gencode narrowing (spec W7) is
+# what a fat cross-family binary needs. See .agents/specs/cuda-arch-additivity.md.
 set(VLLM_CPP_CUDA_ARCHITECTURES "121a" CACHE STRING "Target CUDA architectures (GB10=121a, consumer Blackwell=120a, same-family fat binary=120a;121a; the 'a' arch-specific target is REQUIRED for the native block-scaled fp4xfp4 MMA — mma.sync kind::mxf4nvf4 is rejected on base sm_120/sm_121)")
 option(VLLM_CPP_BENCH_PROFILE_CONTROL
   "Compile trace-only SIGUSR2/cudaProfiler replay control plus FIFO graceful shutdown (never for production timing builds)"

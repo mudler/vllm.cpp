@@ -19597,3 +19597,37 @@ slower, high rep variance, loadavg 13.5 — a co-tenant agent's CPU build/test
 (the flock guards GPU only). Re-run on a genuinely idle box (loadavg gate inside
 the lock) all three arms are ~42 ms TPOT and the numbers reproduce. Contended CPU
 runs are VOID per protocol.
+
+# ── 2026-07-23 · BACKEND-CUDA-SM090 W9 — sm_90a (Hopper) cross-family build support
+# CLAIM-CUDA-SM090-BRINGUP, base 4884d03, worktree sm90a-bringup, dgx ~/work/sm90a.
+# The first CROSS-FAMILY CUDA arch off INVENTORIED: sm_90a is BUILD-supported,
+# SINGLE-ARCH, PORTABLE-KERNELS-ONLY. What "copy sm_90a from vLLM" actually
+# requires, determined by measurement:
+#   * vLLM's 90a fast paths (FA3, CUTLASS C3x ArchTag=Sm90, Machete, DeepGEMM,
+#     CUTLASS MoE) are all Hopper wgmma/TMA KERNEL BODIES we do not have — a
+#     HW-untestable campaign, NOT a config/table edit. Our fast paths are all
+#     sm_12x, so per FEATURE-TABLE deviation #2 all five 9.0a cells stay EMPTY.
+#   * The ONE code change is mechanical: three native-fp4 helpers in
+#     cuda_matmul_nvfp4.cu (FusedFp4VectorEnabled+PointerAligned :100, GetNib
+#     :2553) gated on VT_FP4_MMA_SM120A so the TU compiles with the native path
+#     off. WITHOUT it the single-arch 90a build failed on three -Werror #177-D
+#     "declared but never referenced" (helpers used only by the sm_12x native
+#     path / the MatmulNvfp4Fp4Native template it instantiates). No-ops on 121a.
+# MEASURED (dgx nvcc 13.0):
+#   * 90a configure -> all five features DISABLED (portable-only, honest).
+#   * single-arch 90a build: BUILD_90A_EXIT=0, -Werror 0 warnings, cuobjdump
+#     shows 16 TUs of real sm_90a SASS and nothing else (22 fast-path TUs absent).
+#   * cmake -P CudaArchFeaturesTest.cmake: 50/50 (was 35; +15 for 90a/100a/90).
+#   * GB10 BYTE-IDENTICAL: production 121a build (CUTLASS+Marlin+FA2+Triton)
+#     -Werror 0/0, 38 sm_121a TUs; battery STANDALONE 27B 235/235, 35B 315/315,
+#     Coder 6/6 (138), dense 16/16 (664), OPT 6/6 (96/96), DeepSeek-V2 8/8 (223),
+#     test_ops_nvfp4_fp4 27006/27006 (+4 = new cross-family registry test).
+#     Goldens md5 2965ef5772b556d3f3f86fedf4221b2f (475 files) identical
+#     before AND after.
+#   * FAT "90a;121a" STILL does NOT compile — ptxas rejects sm12x fp4 PTX for
+#     compute_90a (kind::mxf4nvf4 / cvt.e2m1x2 / 256-bit load/store). The
+#     gencode blocker. Per-source gencode narrowing = spec W7 (named next row).
+# NOT proven: any sm_90 execution (no Hopper board), and NO Hopper fast paths at
+# all — even a Hopper owner gets only the portable path. A green single-arch link
+# is not execution evidence. benchmark_binding=false (no Hopper to benchmark).
+# NOT pushed. Full SHA reported to the caller.

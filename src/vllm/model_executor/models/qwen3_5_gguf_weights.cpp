@@ -14,12 +14,13 @@
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vt/dtype.h"
+#include "vt/quant.h"
 
 namespace vllm {
 
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset,
-                               const GgufFile* mmap_src) {
+                               const GgufFile* mmap_src, bool repack) {
   vt::DType dt = vt::DType::kF32;
   VT_CHECK(KeepQuantDType(tensor.ggml_type, &dt),
            "qwen3_5 gguf: keep-quant on a non-keep-quant encoding for " +
@@ -42,6 +43,19 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
   // GGUF disk order [out, in] IS the MatmulBT [N, K] orientation: no transpose.
   o.nk = true;
   const uint8_t* src = tensor.data + begin;
+
+  // CIQ G7: repack the slice into the i8mm interleave. It rewrites the buffer,
+  // so it always COPIES (an mmap borrow is read-only) and marks o.repacked; the
+  // total byte count is unchanged (block_q8_0x4 == 4 * block_q8_0). A slice that
+  // is not repack-eligible (wrong dtype/shape, or no i8mm) falls through to the
+  // normal copy/borrow below and stays a plain block weight.
+  if (repack && vt::cpu::QuantRepackEligible(dt, n, k)) {
+    o.bytes.assign(src, src + bytes);
+    vt::cpu::QuantRepackWeight(dt, o.bytes.data(), n, k);
+    o.repacked = true;
+    return o;
+  }
+
   if (mmap_src == nullptr) {
     o.bytes.assign(src, src + bytes);  // L2: copy into an owned buffer
     return o;
@@ -299,7 +313,8 @@ OwnedTensor OwnMatmulWeight(const GgufFile& g, const std::string& name,
   if (pol.Route(t, GgufTensorRole::kMatmulWeight) ==
       GgufResidency::kKeepQuant) {
     VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
-    return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1], 0, MmapSrc(g, pol));
+    return OwnGgufQuantBlocks(t, t.shape[0], t.shape[1], 0, MmapSrc(g, pol),
+                              pol.quant_repack);
   }
   if (pol.expand_nk) {
     VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
@@ -540,7 +555,8 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     const std::string nm = Blk(il, "attn_qkv.weight");
     if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
       const GgufTensorInfo& ti = g.Get(nm);
-      gdn.in_proj_qkv = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0, MmapSrc(g, pol));
+      gdn.in_proj_qkv = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0,
+                                           MmapSrc(g, pol), pol.quant_repack);
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -555,7 +571,8 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     const std::string nm = Blk(il, "attn_gate.weight");
     if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
       const GgufTensorInfo& ti = g.Get(nm);
-      gdn.in_proj_z = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0, MmapSrc(g, pol));
+      gdn.in_proj_z = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0,
+                                         MmapSrc(g, pol), pol.quant_repack);
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -571,7 +588,8 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
         Blk(il, pr == &gdn.in_proj_b ? "ssm_beta.weight" : "ssm_alpha.weight");
     if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
       const GgufTensorInfo& ti = g.Get(nm);
-      *pr = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0, MmapSrc(g, pol));
+      *pr = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0, MmapSrc(g, pol),
+                               pol.quant_repack);
       continue;
     }
     const GgufTensorInfo* t = nullptr;
@@ -602,7 +620,8 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     const std::string nm = Blk(il, "ssm_out.weight");
     if (pol.Route(g.Get(nm), proj_role) == GgufResidency::kKeepQuant) {
       const GgufTensorInfo& ti = g.Get(nm);
-      gdn.out_proj = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0, MmapSrc(g, pol));
+      gdn.out_proj = OwnGgufQuantBlocks(ti, ti.shape[0], ti.shape[1], 0,
+                                        MmapSrc(g, pol), pol.quant_repack);
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -678,7 +697,7 @@ std::vector<OwnedTensor> LoadExpertsT(const GgufFile& g, int64_t il,
     for (int64_t e = 0; e < num_experts; ++e) {
       experts.push_back(
           OwnGgufQuantBlocks(ti, out_dim, in_dim, /*row_offset=*/e * out_dim,
-                             MmapSrc(g, pol)));
+                             MmapSrc(g, pol), pol.quant_repack));
     }
     return experts;
   }

@@ -70,6 +70,13 @@ Tensor Tensor::View(std::initializer_list<int64_t> new_shape) const {
 Tensor Tensor::Slice(int dim, int64_t start, int64_t stop) const {
   VT_CHECK(dim >= 0 && dim < rank, "Slice() dim out of range");
   VT_CHECK(start >= 0 && start < stop && stop <= shape[dim], "Slice() bounds invalid");
+  // CIQ G7: a repacked q8_0 weight stores 4 rows interleaved per block group and
+  // K packed inside blocks, so no axis slices coherently — a slice would hand the
+  // GEMM a mislaid buffer. Fail loud rather than corrupt. Repacked weights are
+  // consumed WHOLE on the CPU quant path; the merged GDN/conv row-slices are
+  // safetensors-only bf16 weights (never repacked), and MatmulBT outputs carry
+  // repacked=false, so this never triggers on a valid path.
+  VT_CHECK(!repacked, "Slice() on a repacked weight is invalid (consume it whole)");
   Tensor s = *this;
   s.shape[dim] = stop - start;
   s.data = static_cast<char*>(data) +

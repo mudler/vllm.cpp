@@ -53,6 +53,13 @@ struct OwnedTensor {
   // via vt::MatmulBT, the cuBLASLt TN fast path (see ops.h MatmulBT).
   bool nk = false;
 
+  // CIQ G7: the block-quant bytes were REPACKED at load into the CPU i8mm
+  // interleave (q8_0 -> block_q8_0x4). Propagated to vt::Tensor::repacked by
+  // View(); the CPU quant GEMM keys on it. Only set on an i8mm process, only for
+  // repack-eligible q8_0 weights, and only on the copy residency (the transform
+  // mutates the buffer, so it cannot ride the read-only mmap borrow).
+  bool repacked = false;
+
   // A synchronized direct-device load may discard the host staging buffer while
   // retaining an authoritative d_dev/d_dev_f32 copy. Empty() is used as model
   // dispatch metadata, so host reclamation must not make a populated weight look

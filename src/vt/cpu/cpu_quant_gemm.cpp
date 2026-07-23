@@ -148,6 +148,15 @@ void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a,
   const int64_t m = a.shape[0];
   const int64_t k = a.shape[1];
 
+  // CIQ G7: a weight the loader REPACKED into the i8mm interleave takes the
+  // repack gemm/gemv (bit-identical to the paths below). The flag is only ever
+  // set on an i8mm-capable process (QuantRepackEligible), so QuantRepackMatmul's
+  // kernels are guaranteed live here.
+  if (b.repacked) {
+    QuantRepackMatmul(out, a, b);
+    return;
+  }
+
   if (HasQuantDotKernel(b.dtype)) {
     // `QuantActRowBytes` throws unless k is a whole number of ACTIVATION
     // blocks (256 for the K-quants, 32 otherwise); RowSizeBytes on the weight

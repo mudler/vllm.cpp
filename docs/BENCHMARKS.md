@@ -2228,6 +2228,70 @@ The complete contract is in the
 
 **Qwen3-Coder-30B W0-W4 landed / CORRECTNESS-DONE (2026-07-21):** W0-W3 (registry stub + extract/expose/guard + bf16 loader + forward) behavior-preserving (27B 235/235 + 35B 315/315 + Qwen3-dense 0.6B/4B 16/16 UNCHANGED). W4 SACRED gate `test_qwen3coder_paged_engine.cpp` **6/6 PASS** (vLLM deterministic K=5 → near-tie-robust strict-where-well-posed gate: 4/6 strict + 2/6 near-tie, max gap 0.125 nats, 0 divergent). W5 bf16-fast-MoE (SPEED) next.
 
+## CPU vs llama.cpp — G7 q8_0 repack-at-load (prefill crosses parity), `ACCEPTED` / binding (2026-07-23)
+
+`QUANT-GGUF-CIQ-GEMM` G7 / `BACKEND-GATE-CPU-LLAMACPP` (`CLAIM-QUANT-GGUF-CIQ-G7-1`;
+[spec](../.agents/specs/gguf-compute-in-quant-gemm.md) § G7 result). Base
+`99b7443`, binding idle-gated `dgx.casa` (GB10, aarch64, 20 cores), one
+`flock $HOME/gpu.lock`, `git archive` transfer, `Qwen3.5-2B-UD-Q8_K_XL.gguf`,
+same-binary A/B. llama.cpp `237ad9b96` refreshed same session (`-t20 -r5 -ngl0`):
+**pp128 177.32±2.50**, tg32 25.40±0.80.
+
+**The lever (profile-ranked #1):** the fresh op-dispatch profile put
+`kMatmulBTQuant` (the q8_0 quant GEMM) at **55 %** of prefill. G7 ports
+llama.cpp's repack-at-load `q8_0_4x8` tier (`ggml_repack_get_optimal_repack_type`
+→ `q8_0_4x8_q8_0`, `repack.cpp:4683 @ 237ad9b96`): the loader repacks each q8_0
+weight ONCE into the `block_q8_0x4` i8mm interleave, and `kMatmulBTQuant`
+dispatches a pre-shuffled gemm/gemv that reads contiguous aligned blocks with no
+in-register row shuffles.
+
+**BIT-IDENTICAL** (target met, not a near-tie): byte-permute weight + non-fused
+`vmlaq_f32` in tier-0 block order under `-ffp-contract=off`. Output-token md5
+`d235db12f2cd304007530286a1755c95` byte-identical across repack-ON (default),
+repack-OFF (`VT_CPU_QUANT_REPACK=0`) and `VT_CPU_REF=1`.
+[test_ops_quant_repack](../.agents/../tests/vt/test_ops_quant_repack.cpp) 305
+assertions on dgx: repacked gemm/gemv `memcmp`-equal to the plain path across
+decode/leftover/prefill, f32+bf16 out, strided activations, threads 1/2/4/20.
+`test_qwen36_gguf_engine` STANDALONE 2/2 · 16/16 on APEX Compact+Balanced with
+repack live.
+
+**Op-level q8_0 GFLOP/s (cache-warm, mmla → repacked):** prefill qkv 518.75 →
+**2400.92** (4.63×), gate_up 583.37 → **3455.86** (5.92×), down 514.13 →
+**1901.66** (3.70×), decode qkv (M=1) 408.75 → 418.54 (1.02×, memory-bound).
+
+**E2E prefill A/B** (`--input-len 128 --output-len 32`, 20 threads, 6 interleaved
+reps, cold discarded, median 2–6):
+
+| arm | TTFT median (ms) | prefill t/s | TPOT (ms) |
+|---|---|---|---|
+| BEFORE `VT_CPU_QUANT_REPACK=0` (mmla) | 1096.38 | 116.7 | ~40.5 |
+| **AFTER — repack default** | **571.88** | **223.8** | ~40.5 |
+
+**Same-binary prefill 1.92×.** Prefill 223.8 t/s vs llama.cpp pp128 177.32 =
+**1.26× — AT/BEYOND llama.cpp parity** (from 0.66× / 1.52× behind on the
+repack-OFF arm; the same-binary 1.92× on the recorded 1.32×-behind idle baseline
+likewise lands beyond llama). Decode TPOT ~40.5 ms unchanged (24.7 t/s ≈ llama
+tg32 25.4, at parity — repack neutral at M=1). Peak RSS 3.884 GiB unchanged.
+
+**A wiring bug this gate caught:** the op path was bit-identical from the start,
+but the first E2E run emitted ALL-ZERO tokens — `ResidentWeight`/`MakeTensor`
+(qwen3_5.cpp) dropped the `OwnedTensor.repacked` marker, so the kernel read
+repacked bytes as a plain q8_0 weight. Fixed at that single host→kernel
+weight-tensor chokepoint (covers every weight incl. experts); `Tensor::Slice`
+now throws on a repacked weight. Post-fix md5 is byte-identical (above).
+
+**Fresh post-change profile + what remains:** the q8_0 GEMM's ~4.6× drops its
+prefill share from 55 % (~603 ms) to ~21 % (~131 ms); the now-dominant prefill
+cost is the elementwise f16 GEMM (`kMatmulBT`, the tied lm_head/embed + f16 ffn,
+~48 %, UNCHANGED — not a block encoding). **But CPU prefill now matches/beats
+llama.cpp on this file**, so the CPU prefill-lever search is CLOSED: what remains
+vs llama.cpp is **peak RSS (1.39×, loader/f16-expansion bound, not compute)**.
+
+Gates: clean CPU + CUDA `-Werror` 0 warnings; CPU quant/gguf units green; CUDA
+regression set UNCHANGED, each STANDALONE (27B 235/235, 35B 315/315, Coder 6/6,
+Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8, Llama 16/16); goldens content-hash
+identical before/after; checkers green.
+
 ## CPU vs llama.cpp — GDN split-projection orientation (last slow-orientation GEMM), `ACCEPTED` / binding (2026-07-23)
 
 `BACKEND-GATE-CPU-LLAMACPP` / `QUANT-GGUF-KEEPQ-LOADER`

@@ -235,6 +235,13 @@ vllm_cpp_add_test(test_ops_quant_traits vt/test_ops_quant_traits.cpp)
 # header (SwapForTesting) used by the thread-count determinism case. CPU-only.
 vllm_cpp_add_test(test_ops_quant_dot vt/test_ops_quant_dot.cpp)
 target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# QUANT-GGUF-CIQ-GEMM G7: repack-at-load for the q8_0 quant GEMM. Proves the
+# i8mm interleave transform matches make_block_q8_0x4 and round-trips (portable),
+# and that the repacked gemm/gemv is BYTE-IDENTICAL to the plain quant GEMM
+# across decode/leftover/prefill shapes and thread counts (i8mm boxes; skips
+# coherently elsewhere). Reaches src/ for the block/repack/threadpool headers.
+vllm_cpp_add_test(test_ops_quant_repack vt/test_ops_quant_repack.cpp)
+target_include_directories(test_ops_quant_repack PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-ELEM-GEMM: the specialized + SIMD elementwise (bf16/f16/f32) GEMM. The
 # gate is BYTE-IDENTITY against an independent scalar reference across every
 # dtype combination, both weight orientations, ragged K/N, row-strided

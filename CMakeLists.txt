@@ -406,6 +406,8 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_quant_act.cpp
   src/vt/cpu/cpu_quant_dot.cpp
   src/vt/cpu/cpu_quant_dot_arm.cpp
+  src/vt/cpu/cpu_quant_repack.cpp
+  src/vt/cpu/cpu_quant_repack_arm.cpp
   src/vt/cpu/cpu_quant_traits.cpp
   src/vt/cpu/cpu_quant_gemm.cpp
   src/vt/cpu/cpu_layernorm.cpp
@@ -424,8 +426,13 @@ add_library(vllm::vllm ALIAS vllm)
 # baseline, and the kernels are additionally runtime-gated on HWCAP2_I8MM so the
 # binary still runs on non-i8mm aarch64 (portable tier serves those shapes).
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  # G6 mmla tier AND G7 repack tier (cpu_quant_repack_arm.cpp) both need i8mm.
+  # The global -ffp-contract=off (top of this file) still applies on top of this
+  # per-file -march, which is what keeps the repack gemm/gemv's non-fused
+  # `vmlaq_f32` bit-identical to the tier-0 path.
   set_source_files_properties(
-    src/vt/cpu/cpu_quant_dot_arm.cpp PROPERTIES
+    src/vt/cpu/cpu_quant_dot_arm.cpp
+    src/vt/cpu/cpu_quant_repack_arm.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+i8mm+dotprod>")
 endif()
 # Static-init registrars (e.g. the CPU backend, the platform table, the op

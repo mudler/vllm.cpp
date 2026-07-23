@@ -111,4 +111,50 @@ const QuantTypeTraits& QuantTraits(DType dtype);
 // which is what keeps it on the generic dequant-composite fallback.
 bool HasQuantDotKernel(DType dtype);
 
+// --- CIQ G7: repack-at-load for the q8_0 quant GEMM -----------------------
+//
+// llama.cpp repacks a quantized WEIGHT once at load into a SIMD/cache-friendly
+// interleave so the GEMM inner loop reads contiguous, pre-shuffled blocks with
+// no in-register row shuffles (repack.cpp @ 237ad9b96). On GB10 (aarch64 NEON +
+// i8mm) `ggml_repack_get_optimal_repack_type` selects `q8_0_4x8_q8_0`
+// (block_q8_0x4, nrows_interleaved=4, interleave_block=8) for a q8_0 weight
+// with ne[1] % 4 == 0 (repack.cpp:4683-4695). We mirror exactly that tier.
+//
+// The transform is a pure BYTE PERMUTATION (the quant values and fp16 deltas
+// are untouched) and the gemm/gemv fold the per-block scale in the SAME order
+// as the tier-0 / mmla path with a NON-FUSED multiply-add, so the repacked GEMM
+// is BIT-IDENTICAL to `kMatmulBTQuant`'s non-repacked output (proven by the
+// memcmp round-trip test). Only q8_0 is repacked in G7 (the profile's
+// kMatmulBTQuant is q8_0); the k-quants keep the mmla tier.
+
+// True when the i8mm repack tier is LIVE in this process: compiled for aarch64
+// with i8mm, `HWCAP2_I8MM` probed present, and not disabled by
+// `VT_CPU_QUANT_REPACK=0|off|false`. Always false off i8mm-capable aarch64, so
+// the loader never repacks and every consumer keeps the portable/mmla path.
+bool QuantRepackActive();
+
+// True when a weight of (dtype, N=out, K=in) is repack-eligible on THIS process:
+// QuantRepackActive() AND dtype == kQ8_0 AND N % 4 == 0 AND K % 32 == 0 (the
+// exact `ne[1] % 4 == 0`, `ne[0] % 8 == 0` guard of repack_q8_0_to_q8_0_4_bl;
+// K % 32 subsumes the K % 8 one). A weight that fails it stays plain and takes
+// the normal path — correct, just unrepacked.
+bool QuantRepackEligible(DType weight_dtype, int64_t n, int64_t k);
+
+// Repack a [N,K] q8_0 weight buffer IN PLACE into the block_q8_0x4 interleave.
+// `blocks` holds N*(K/32) plain BlockQ8_0 on entry and N/4 groups of (K/32)
+// BlockQ8_0x4 on return (same total bytes). Requires QuantRepackEligible.
+void QuantRepackWeight(DType weight_dtype, uint8_t* blocks, int64_t n,
+                       int64_t k);
+
 }  // namespace vt::cpu
+
+namespace vt {
+struct Tensor;
+namespace cpu {
+// The repacked-weight GEMM dispatched by `kMatmulBTQuant` when `b.repacked`.
+// out[M,N] = a[M,K] @ b[N,K]^T with `b` a q8_0 weight already repacked by
+// QuantRepackWeight. Bit-identical to the non-repacked quant path: the i8mm
+// gemm runs 4-row activation groups, the i8mm gemv the M=1 / leftover rows.
+void QuantRepackMatmul(vt::Tensor& out, const vt::Tensor& a, const vt::Tensor& b);
+}  // namespace cpu
+}  // namespace vt

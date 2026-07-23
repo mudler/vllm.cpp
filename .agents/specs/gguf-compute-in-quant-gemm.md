@@ -158,7 +158,7 @@ there (i8mm repack expected) before comparing.
 | G4 | e2e enablement | route `MatmulBT` call sites on block dtype; engine gates (3) + `VT_CPU_REF` A/B; first B4-recipe measurement (tier-0 milestone) | G3, loader L2-L3, threadpool W2 | **DONE** 2026-07-22 |
 | G5 | x86 AVX2 tier | `arch/x86` vec_dot ports + feature probe; tier-1 milestone measurement | G3 | open — **BLOCKED on a fresh profile** (see G4 §Consequences item 0) and on a non-`VOID` x86 host |
 | G6 | Arm NEON/i8mm tier | `arch/arm` ports incl. `nrows==2` mmla; GB10 measurement | G3 | **DONE** 2026-07-23 — i8mm mmla `nrc==2` tier for q8_0/q4_0/q4_K/q6_K, 2x2-tiled into `kMatmulBTQuant` (see G6 result below) |
-| G7 | repack tier | repack-at-load + gemv/gemm + `quantize_mat_t`; selection parity vs `:4528`; closes gates 4-5 | G4 + loader L2 | open — parked; **BLOCKED on a fresh profile** (see G4 §Consequences item 0) |
+| G7 | repack tier | repack-at-load + gemv/gemm + `quantize_mat_t`; selection parity vs `:4528`; closes gates 4-5 | G4 + loader L2 | **DONE** 2026-07-23 — q8_0 `q8_0_4x8` repack-at-load (block_q8_0x4 interleave), bit-identical i8mm gemm+gemv, byte-permute weight + non-fused MAC (see G7 result below) |
 | G8 | ledger + matrix closure | full A/B series, ledger row, flip `C`/`E`/`P` cells per encoding row (Q8_0/Q4_K/Q5_K/Q6_K/Q3_K/Q4_0), roadmap update | G4-G7 | open |
 
 G5/G6 are parallel; G7 may start once G4's layout is fixed.
@@ -660,3 +660,115 @@ clean on dgx aarch64; CPU units green (test_ops_quant_dot 19/78,162,
 test_ops_quant_traits 8/5,615, test_gguf_dequant, test_gguf_keep_quant,
 test_cpu_threadpool, test_ops_matmul_elem); e2e engine gate 2/2 · 16/16 vs
 llama.cpp. CUDA regression set UNCHANGED (see the parity ledger G6 row).
+
+## G7 result (2026-07-23) — q8_0 repack-at-load, landed + measured; CPU prefill crosses llama.cpp parity
+
+**What landed.** llama.cpp's repack-at-load for q8_0, the `q8_0_4x8_q8_0` tier
+`ggml_repack_get_optimal_repack_type` selects on NEON + i8mm
+(`repack.cpp:4683` @ `237ad9b96`). The keep-quant loader repacks each eligible
+q8_0 weight ONCE at load into the `block_q8_0x4` interleave (`nrows_interleaved=4`,
+`interleave_block=8`), and `kMatmulBTQuant` dispatches the pre-shuffled i8mm
+gemm/gemv, which read contiguous aligned blocks with NO in-register row shuffles
+(the mmla tier's per-block `vzip1q_s64` are gone).
+
+**Ported (file:line both sides).**
+- weight interleave `make_block_q8_0x4` (`repack.cpp:2725`) +
+  `repack_q8_0_to_q8_0_4_bl` (`repack.cpp:3480`) → byte-permute in
+  [cpu_quant_repack.cpp](../../src/vt/cpu/cpu_quant_repack.cpp#L1)
+  (`RepackQ8_0Rows4`/`QuantRepackWeight`), arch-independent.
+- prefill gemm `ggml_gemm_q8_0_4x8_q8_0` (NEON+i8mm, `arch/arm/repack.cpp:5091`)
+  and gemv `ggml_gemv_q8_0_4x8_q8_0` (NEON+dotprod, `arch/arm/repack.cpp:1779`) →
+  [cpu_quant_repack_arm.cpp](../../src/vt/cpu/cpu_quant_repack_arm.cpp#L1)
+  (`GemmTileQ8_0`/`GemvRowQ8_0`, parallelized over weight COL-groups).
+- activation side: rather than port `ggml_quantize_mat_q8_0_4x8`'s round-to-even,
+  the repack path quantizes each activation row with the SAME `from_float`
+  (`quantize_row_q8_0`, round-half-away-from-zero) as the tier-0/mmla path, then
+  interleaves the bytes (`InterleaveQ8_0Rows4`) — bit-preserving.
+- feature probe: `QuantRepackActive()` = compile-time aarch64 i8mm AND runtime
+  `HWCAP2_I8MM` AND not `VT_CPU_QUANT_REPACK=0`, mirroring the mmla tier's probe;
+  the loader repacks (`GgufLoadPolicy::quant_repack`) only under it, so the layout
+  and the kernel that consumes it can never disagree.
+
+**BIT-IDENTICAL (target met).** The transform is a byte permutation and the
+gemm/gemv fold the per-block scale in the SAME block order with a NON-FUSED
+`vmlaq_f32` (upstream uses fused `vfmaq_f32`; the swap, plus the global
+`-ffp-contract=off`, is the one recorded deviation) — so the integer `vmmlaq`/
+`vdotq` sums are exact and the float accumulation matches the tier-0/mmla path
+bit-for-bit. Proven by [test_ops_quant_repack](../../tests/vt/test_ops_quant_repack.cpp#L1)
+(dgx aarch64, 305 assertions): the repacked gemm/gemv is `memcmp`-identical to the
+non-repacked `kMatmulBTQuant` across decode (M=1) / leftover (M%4) / prefill
+(M%4==0), N∈{4..3072}, K up to 6144, f32 AND bf16 output, contiguous AND
+row-strided activations, and thread counts 1/2/4/20; the interleave also matches
+`make_block_q8_0x4` byte-for-byte and round-trips. On CI (x86, no i8mm) the
+transform round-trips and the gating is asserted total; the numeric cases skip
+coherently.
+
+**A wiring bug the E2E gate caught (recorded).** The op path was bit-identical
+from day one, but the first E2E run produced ALL-ZERO tokens: `ResidentWeight`
+(qwen3_5.cpp) builds the CPU forward's weight `vt::Tensor` via `MakeTensor`, which
+dropped the new `OwnedTensor.repacked` marker, so the kernel read repacked bytes
+as a plain q8_0 weight. Fixed by propagating `repacked` at that single
+host→kernel chokepoint (covers attn/ffn/GDN/router/experts — every weight tensor
+routes through it); `Tensor::Slice` now also throws on a repacked weight
+(defence — a repacked weight has no coherently sliceable axis; the merged
+GDN/conv row-slices are safetensors-only bf16, never repacked). After the fix the
+output-token md5 is `d235db12f2cd304007530286a1755c95` — byte-identical across
+repack-ON (default), repack-OFF (`VT_CPU_QUANT_REPACK=0`) and `VT_CPU_REF=1`.
+
+### Benchmark — binding, dgx.casa (GB10, aarch64, 20 cores), idle, one flock
+
+`git archive` transfer, `Qwen3.5-2B-UD-Q8_K_XL.gguf`, same-binary A/B, loadavg
+gated. llama.cpp `237ad9b96` refreshed same session (`-t20 -r5 -ngl0`): **pp128
+177.32±2.50**, tg32 25.40±0.80.
+
+**Op-level q8_0 GFLOP/s (cache-warm best-of-N, mmla tier → repacked):**
+
+| shape (M×N×K) | mmla | **repacked** | ratio |
+|---|---|---|---|
+| prefill qkv 128×3072×2048 | 518.75 | **2400.92** | **4.63×** |
+| prefill gate_up 128×12288×2048 | 583.37 | **3455.86** | **5.92×** |
+| prefill down 128×2048×6144 | 514.13 | **1901.66** | **3.70×** |
+| decode qkv 1×3072×2048 | 408.75 | 418.54 | 1.02× |
+
+The pre-interleaved contiguous loads + the 4×4 output tile (16 outputs / mmla vs
+the mmla tier's 2×2) remove the shuffle overhead and quadruple arithmetic
+intensity; decode (M=1, gemv) is memory-bound and neutral.
+
+**E2E prefill A/B** (`--input-len 128 --output-len 32`, `VLLM_CPP_CPU_THREADS=20`,
+6 interleaved reps to cancel drift, cold rep discarded, median 2–6):
+
+| arm | TTFT median (ms) | prefill t/s | TPOT (ms) |
+|---|---|---|---|
+| BEFORE `VT_CPU_QUANT_REPACK=0` (mmla) | 1096.38 | 116.7 | ~40.5 |
+| **AFTER — repack default** | **571.88** | **223.8** | ~40.5 |
+
+**Same-binary prefill 1.92×** — the binding, box-state-robust metric. Prefill t/s
+223.8 vs llama.cpp pp128 177.32 = **1.26× — AT/BEYOND llama.cpp parity**, up from
+0.66× (1.52× behind) on the repack-OFF arm this session (and from the recorded
+1.32×-behind idle baseline; the same-binary 1.92× on that baseline lands ~255 t/s,
+likewise beyond llama). Decode TPOT ~40.5 ms unchanged (24.7 t/s ≈ llama tg32
+25.4, at parity — repack is neutral at M=1). Peak RSS 3.884 GiB unchanged (the
+1.39× RSS gap is loader-bound f16 expansion, not G7's target).
+
+### Fresh post-change profile + what remains
+
+Prefill dropped 1096→572 ms; the q8_0 quant GEMM (`kMatmulBTQuant`, 55 % of
+prefill at ~510 GFLOP/s) went ~4.6× faster, so its share of the OLD time (603 ms)
+collapses to ~131 ms and its share of the NEW prefill is ~21 %. The now-dominant
+prefill cost is the **elementwise f16/bf16 GEMM** (`kMatmulBT`, the tied
+`lm_head`/`token_embd` + f16 ffn mass, ~48 % of the new prefill, UNCHANGED — not
+a block encoding, so repack does not touch it), then the q8_0 GEMM, then GDN +
+attention. **But the CPU prefill gap vs llama.cpp is CLOSED on this file** —
+prefill now matches/beats llama.cpp — so this closes the CPU prefill-lever search:
+what remains between us and llama.cpp is **peak RSS (1.39×, loader/f16-expansion
+bound, not compute)**, not prefill speed. A k-quant-heavy file would see the
+`kMatmulBTQuant` share (already mmla-fast on q4_K/q6_K) matter less again; adding
+the k-quant repack layouts is a clean follow-up but not required to reach parity.
+
+**Gates at G7:** clean CPU `-Werror` 0 warnings + clean CUDA `-Werror` 0 warnings;
+[test_ops_quant_repack](../../tests/vt/test_ops_quant_repack.cpp#L1) 5 cases /
+305 assertions on dgx aarch64 (110 on x86, numeric cases skip); CPU quant/gguf
+units green (test_ops_quant_dot, test_ops_quant_traits, test_gguf_keep_quant,
+test_gguf_dequant); `test_qwen36_gguf_engine` STANDALONE 2/2 · 16/16 on APEX
+Compact+Balanced with repack live; CUDA regression set UNCHANGED (see the ledger
+G7 row), goldens content-hash identical before/after.

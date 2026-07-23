@@ -701,9 +701,18 @@ std::vector<float> WeightF32(const OwnedTensor& w) {
 // the const_cast is safe. `shape` defaults to the owned shape.
 Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
-  if (!vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging())
-    return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
-                      shape);
+  if (!vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging()) {
+    Tensor t = MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype,
+                          d.q.device, shape);
+    // CIQ G7: carry the i8mm-repack marker from the OwnedTensor to the vt::Tensor
+    // the GEMM actually sees. This is the ONLY host->kernel weight-tensor
+    // construction on the CPU forward (MakeTensor drops it by default), so
+    // without this the kernel reads repacked bytes as a plain q8_0 weight ->
+    // garbage. Only ever true on the CPU keep-quant path (a staged device never
+    // repacks), so it is inert everywhere else.
+    t.repacked = w.repacked;
+    return t;
+  }
   if (!w.d_dev) {
     const size_t nb = w.bytes.size();
     void* p = d.b.Alloc(nb);

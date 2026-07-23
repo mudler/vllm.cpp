@@ -72,19 +72,39 @@ void Bench(vt::DType dt, int d_off, int dmin_off, const char* type_name) {
     bt.dtype = dt;
     vt::Tensor ot = vt::Tensor::Contiguous(out.data(), vt::DType::kF32, q.device, {s.m, s.n});
 
-    vt::MatmulBTQuant(q, ot, at, bt);  // warm
-    double best = 1e30;
-    const int reps = s.m == 1 ? 20 : 6;
-    for (int r = 0; r < reps; ++r) {
-      const auto t0 = std::chrono::steady_clock::now();
-      vt::MatmulBTQuant(q, ot, at, bt);
-      const auto t1 = std::chrono::steady_clock::now();
-      const double sec = std::chrono::duration<double>(t1 - t0).count();
-      if (sec < best) best = sec;
+    auto time_best = [&](vt::Tensor& b) {
+      vt::MatmulBTQuant(q, ot, at, b);  // warm
+      double best = 1e30;
+      const int reps = s.m == 1 ? 20 : 6;
+      for (int r = 0; r < reps; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        vt::MatmulBTQuant(q, ot, at, b);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double sec = std::chrono::duration<double>(t1 - t0).count();
+        if (sec < best) best = sec;
+      }
+      return 2.0 * static_cast<double>(s.m * s.n * s.k) / best / 1e9;
+    };
+
+    const double gflops = time_best(bt);
+    std::printf("%-9s %-16s M=%-4lld N=%-6lld K=%-5lld  %8.2f GFLOP/s\n", type_name,
+                s.name, (long long)s.m, (long long)s.n, (long long)s.k, gflops);
+
+    // CIQ G7: repacked-weight arm for q8_0 (i8mm interleave). Repack a copy of
+    // the weight, mark it, and time the repacked gemm/gemv against the same
+    // shapes — the tier-0/mmla vs repacked op-level A/B.
+    if (dt == vt::DType::kQ8_0 && vt::cpu::QuantRepackActive()) {
+      std::vector<uint8_t> wrp = wq;
+      vt::cpu::QuantRepackWeight(dt, wrp.data(), s.n, s.k);
+      vt::Tensor brp =
+          vt::Tensor::Contiguous(wrp.data(), vt::DType::kF32, q.device, {s.n, s.k});
+      brp.dtype = dt;
+      brp.repacked = true;
+      const double g2 = time_best(brp);
+      std::printf("%-9s %-16s M=%-4lld N=%-6lld K=%-5lld  %8.2f GFLOP/s\n",
+                  "q8_0-rp", s.name, (long long)s.m, (long long)s.n,
+                  (long long)s.k, g2);
     }
-    const double gflops = 2.0 * static_cast<double>(s.m * s.n * s.k) / best / 1e9;
-    std::printf("%-6s %-16s M=%-4lld N=%-6lld K=%-5lld  %8.2f GFLOP/s\n", type_name, s.name,
-                (long long)s.m, (long long)s.n, (long long)s.k, gflops);
   }
 }
 

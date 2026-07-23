@@ -65,13 +65,23 @@ namespace vllm {
 // the same order, read rather than memcpy'd first. `mmap_src` must be the file
 // `tensor` came from; the span is re-validated against its mapping.
 //
+// CIQ G7. When `repack` is set AND the slice is repack-eligible
+// (vt::cpu::QuantRepackEligible: i8mm live, q8_0, n % 4 == 0, k % 32 == 0), the
+// resident bytes are REPACKED once into the CPU i8mm interleave (block_q8_0x4)
+// and `repacked = true` is marked on the result. Repacking mutates the buffer,
+// so it forces the COPY residency (a read-only mmap borrow cannot be rewritten):
+// `mmap_src` is ignored for the tensors it touches. A non-eligible slice ignores
+// the flag and keeps its normal residency. The transform is a byte permutation,
+// so the GEMM stays bit-identical to the plain-block path.
+//
 // Throws when the tensor's encoding is not keep-quant capable, when `k` is not
 // a whole number of blocks (ggml_row_size's precondition), when the requested
 // rows fall outside the tensor's validated byte span, or when a borrowed span is
 // not inside `mmap_src`'s mapping.
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset = 0,
-                               const GgufFile* mmap_src = nullptr);
+                               const GgufFile* mmap_src = nullptr,
+                               bool repack = false);
 
 // Build the HfConfig from a GGUF file's metadata (arch prefix qwen35moe /
 // qwen3next / qwen35 [dense]). vocab_size is taken from token_embd's shape

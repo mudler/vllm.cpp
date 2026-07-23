@@ -159,6 +159,20 @@ struct GgufLoadPolicy {
   // historical transpose path), with VT_GGUF_GDN_NK=0 the narrow same-binary
   // A/B opt-out that reverts ONLY the GDN projections.
   bool gdn_expand_nk = false;
+  // CIQ G7 — repack-at-load for the q8_0 quant GEMM. When on, a KEEP-QUANT q8_0
+  // weight whose bytes are copied resident is REPACKED once into the CPU i8mm
+  // interleave (block_q8_0x4) so `kMatmulBTQuant` runs the pre-shuffled
+  // gemm/gemv with no in-register row shuffles — the profile's #1 CPU prefill
+  // lever (kMatmulBTQuant = 55 % of prefill). Repacking is a byte permutation
+  // and the gemm folds the scale in the same order with a non-fused MAC, so it
+  // is BIT-IDENTICAL to the non-repacked path. Rides keep_quant AND
+  // vt::cpu::QuantRepackActive() (i8mm present, not disabled by
+  // VT_CPU_QUANT_REPACK=0), and is forced off by cpu_ref. Because the transform
+  // mutates the buffer it selects the COPY residency for the tensors it touches
+  // (an mmap borrow is read-only); every other tensor keeps its chosen
+  // residency. VT_CPU_QUANT_REPACK=0 is the same-binary A/B opt-out (it also
+  // turns off the kernel probe, so the two can never disagree).
+  bool quant_repack = false;
   // Optional observer; null in production.
   GgufRoutingAudit audit;
 

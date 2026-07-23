@@ -20,6 +20,14 @@ struct Tensor {
   int64_t shape[kMaxRank] = {0, 0, 0, 0};
   int64_t stride[kMaxRank] = {0, 0, 0, 0};
 
+  // CIQ G7: this is a block-quant weight whose bytes were REPACKED at load into
+  // the CPU i8mm SIMD/cache-friendly interleave (q8_0 -> block_q8_0x4). Storage
+  // only — set by the GGUF keep-quant loader, consumed by `kMatmulBTQuant`,
+  // which then dispatches the repacked gemm/gemv. Ignored on every other op and
+  // device (a repacked weight only ever reaches the CPU quant GEMM). The total
+  // byte count and [N,K] shape are unchanged; only the block interleave differs.
+  bool repacked = false;
+
   static Tensor Contiguous(void* data, DType dtype, Device device,
                            std::initializer_list<int64_t> shape);
 

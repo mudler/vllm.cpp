@@ -124,6 +124,12 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // reproduces the historical transpose); VT_GGUF_GDN_NK=0 is the narrow
   // same-binary A/B that reverts only the GDN projections to [K, N].
   p.gdn_expand_nk = EnvOnOr("VT_GGUF_GDN_NK", p.expand_nk) && p.expand_nk;
+  // CIQ G7 repack-at-load. Rides keep_quant AND the i8mm probe (which itself
+  // honors VT_CPU_QUANT_REPACK=0), and is forced off by the oracle switch so
+  // VT_CPU_REF=1 reproduces the historical load. No separate default env read:
+  // QuantRepackActive() is the single source of the on/off decision, so the
+  // loader and the kernel can never disagree about whether repack is live.
+  p.quant_repack = p.keep_quant && !p.cpu_ref && vt::cpu::QuantRepackActive();
   return p;
 }
 

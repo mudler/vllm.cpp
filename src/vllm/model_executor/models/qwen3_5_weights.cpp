@@ -79,6 +79,7 @@ vt::Tensor OwnedTensor::View() const {
   vt::Tensor t;
   t.data = const_cast<uint8_t*>(bytes.data());
   t.dtype = dtype;
+  t.repacked = repacked;  // CIQ G7: carry the i8mm-repack marker to the kernel
   t.device = vt::Device{};  // default = CPU host
   t.rank = rank;
   int64_t stride = 1;

@@ -20257,3 +20257,38 @@ kMatmul 16 % + kMatmulBT 14 % = 80 %). G6 ports llama.cpp's Arm i8mm `nrc==2`
   `check-device-leakage.py` RC=0 (DSR 32 == baseline 32), 24-case mutation suite 24/24,
   record checkers RC=0. The physical `layers/`-library relocation is a follow-on refactor;
   the device coupling is already gone. Not pushed — report FULL SHA to the caller.
+## 2026-07-23 — CIQ G7: q8_0 repack-at-load (CPU prefill crosses llama.cpp parity)
+
+`CLAIM-QUANT-GGUF-CIQ-G7-1`, base `99b7443`, worktree `~/work/vllm.cpp-ciq-g7`.
+Ported llama.cpp's repack-at-load for q8_0 (the fresh profile's #1 CPU prefill
+lever: `kMatmulBTQuant` = 55 % of prefill). The keep-quant loader repacks each
+eligible q8_0 weight once into the `block_q8_0x4` i8mm interleave
+([cpu_quant_repack.cpp](specs/../../src/vt/cpu/cpu_quant_repack.cpp)) and
+`kMatmulBTQuant` dispatches a pre-shuffled i8mm gemm/gemv
+([cpu_quant_repack_arm.cpp](specs/../../src/vt/cpu/cpu_quant_repack_arm.cpp)).
+New TU + the `repacked` marker on `vt::Tensor`/`OwnedTensor` + policy field
+`GgufLoadPolicy::quant_repack`. `VT_CPU_QUANT_REPACK=0` A/B opt-out, `VT_CPU_REF=1`
+oracle.
+
+BIT-IDENTICAL by construction (byte-permute weight + non-fused `vmlaq_f32` in
+tier-0 block order, `-ffp-contract=off`); [test_ops_quant_repack](specs/../../tests/vt/test_ops_quant_repack.cpp)
+305 assertions on dgx (`memcmp` vs plain `kMatmulBTQuant` across
+decode/leftover/prefill, f32+bf16 out, strided activations, threads 1/2/4/20).
+
+**One wiring bug the E2E gate caught:** `ResidentWeight`/`MakeTensor` (qwen3_5.cpp)
+built the CPU forward's weight `vt::Tensor` WITHOUT propagating
+`OwnedTensor.repacked`, so the kernel read repacked bytes as plain q8_0 → all-zero
+tokens. Fixed at that single host→kernel chokepoint (covers attn/ffn/GDN/router/
+experts); `Tensor::Slice` now throws on a repacked weight (defence). After the fix
+the output-token md5 is byte-identical across repack-ON/OFF/`VT_CPU_REF=1`.
+
+Binding dgx aarch64 (idle, one flock, `git archive`): op-level q8_0 3.7–5.9×
+prefill; **E2E prefill 1.92× same-binary → 223.8 t/s vs llama.cpp pp128 177.3 =
+1.26× at/beyond parity** (was ~1.5× behind), decode at parity, RSS 3.884 GiB
+unchanged. Fresh profile: q8_0 GEMM 55 %→~21 %; the CPU prefill-lever search is
+CLOSED — the only remaining gap to llama.cpp is peak RSS (1.39×, loader-bound).
+CUDA regression set UNCHANGED, each STANDALONE (27B 235/235, 35B 315/315, Coder
+6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8, Llama 16/16); goldens
+content-hash identical; clean CPU+CUDA `-Werror` 0-warn; checkers RC=0. Records:
+spec G7 result, quantization-matrix CIQ-GEMM row, kernel-matrix, roadmap C4,
+ledger, README §CPU, BENCHMARKS. Not pushed — report FULL SHA to the caller.

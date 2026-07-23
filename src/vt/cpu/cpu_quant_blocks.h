@@ -46,6 +46,20 @@ struct BlockQ8_0 {
 };
 static_assert(sizeof(BlockQ8_0) == 34, "wrong q8_0 block size/padding");
 
+// llama.cpp repack.h:23-40 — block<8,4> == block_q8_0x4: FOUR q8_0 rows
+// interleaved for the i8mm repack GEMM (nrows_interleaved = 4, interleave_block
+// = 8). d[i] is row i's fp16 delta; qs is the 4 rows' 32 int8 quants laid out
+// in 8-byte chunks round-robin across rows: [r0[0:8] r1[0:8] r2[0:8] r3[0:8]
+// r0[8:16] ...]. Same total bytes as 4 plain BlockQ8_0 (4*34 == 136), so a
+// repacked weight buffer is byte-for-byte the same size as the plain one.
+struct BlockQ8_0x4 {
+  uint16_t d[4];
+  int8_t qs[kQK8_0 * 4];  // 128
+};
+static_assert(sizeof(BlockQ8_0x4) == 4 * 2 + 128, "wrong q8_0x4 block size/padding");
+inline constexpr int kQ8_0xNrowsInterleaved = 4;
+inline constexpr int kQ8_0xInterleaveBlock = 8;
+
 // ggml-common.h:305-310
 struct BlockQ3_K {
   uint8_t hmask[kQK_K / 8];      // quants - high bit

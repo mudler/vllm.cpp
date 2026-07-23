@@ -48,6 +48,8 @@ vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
 target_include_directories(test_qwen3_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_llama_forward vllm/models/test_llama_forward.cpp)
 target_include_directories(test_llama_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_mistral_forward vllm/models/test_mistral_forward.cpp)
+target_include_directories(test_mistral_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen3_moe_load vllm/models/test_qwen3_moe_load.cpp)
 vllm_cpp_add_test(test_qwen3_moe_forward vllm/models/test_qwen3_moe_forward.cpp)
 target_include_directories(test_qwen3_moe_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -498,6 +500,19 @@ vllm_cpp_add_test(test_llama_paged_engine parity/test_llama_paged_engine.cpp)
 target_compile_definitions(test_llama_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_llama_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# ADDITIVE-MODEL W2/W4 (Mistral-7B-v0.3, MistralForCausalLM) — the FIFTH-family
+# near-additive dense bring-up: a host-only loader gate plus the SACRED
+# near-tie-robust greedy correctness gate vs the vLLM 0.25.0 oracle (PLAIN rope
+# theta 1e6 / no scaling, no qk-norm, GQA 32/8, head_dim 128, UNTIED lm_head,
+# sliding_window null). Checkpoint-gated, dgx-only.
+vllm_cpp_add_test(test_mistral_load vllm/models/test_mistral_load.cpp)
+target_include_directories(test_mistral_load PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_mistral_paged_engine parity/test_mistral_paged_engine.cpp)
+target_compile_definitions(test_mistral_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_mistral_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # ADDITIVE-QUANT W2/W4 (Qwen3-32B-NVFP4A16, Qwen3ForCausalLM + compressed-tensors

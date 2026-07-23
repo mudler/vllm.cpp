@@ -20526,3 +20526,43 @@ inventory §9 item 13; ledger row; README; `docs/BENCHMARKS.md` (NOT APPLICABLE)
 today; a throwaway venv stood the fixtures up but a running server is the go/no-go
 precondition). Then W3 wires it as a `KVConnector` subclass over the parent
 claim's W5 abstract seam.
+## 2026-07-23 — Mistral (`MistralForCausalLM`) fifth-family dense bring-up (`CLAIM-MODEL-MISTRAL`)
+
+Base `96c5cbb`, worktree `/home/mudler/_git/vllm.cpp-sweep-mistral`, branch
+`sweep-mistral`, DGX build/gate `~/work/sweep-mistral`. Checkpoint
+`mistralai/Mistral-7B-v0.3` (SWA disabled `sliding_window: null`, UNTIED lm_head,
+rope_theta 1e6 with NO rope_scaling, GQA 32/8 head_dim 128, rms_eps 1e-5;
+`consolidated.safetensors` duplicate excluded).
+
+vLLM's own `mistral.py` is "Mistral adaptation of the LLaMA architecture"
+(`MistralForCausalLM(LlamaForCausalLM)`), so Mistral IS the shared Qwen3/Llama dense
+forward with **NO new primitive** — plain rope (no rope_scaling → `rope_type=="default"`,
+`MakeRopeArgs` no-op branch) + qk-norm-optional AttnBlock + untied lm_head + null
+sliding_window all pre-existed (Llama/Qwen3/OPT). W0 registry+config,
+W2 loader (real 3-shard weights, 1541 assertions: untied lm_head [4096,32768], qk-norm
+empty, no leftover), W3 forward (CPU doctest 510: qk-norm-absent + untied-lm_head-applied
++ ADOPT byte-exact). Registry test 7→8 archs (299 assertions, sorted D<L<M<O<Q).
+CUDA `-Werror` 0 warnings; DSR 32 == baseline (zero device refs).
+
+**MODEL forward gate (oracle-validated, tokenizer-free): 30/30 greedy tokens match
+vLLM 0.25.0** — 29/30 STRICT token-exact + 1/30 near-tie band (p3 "E equals m c" last
+token: our argmax 4608 ∈ vLLM's OWN {1782,4608}), 0 forward-divergent; vLLM greedy
+MEASURED deterministic on 4/5 prompts (K=3). Fed vLLM's EXACT prompt token ids through
+our CUDA prefill and greedy-decoded, isolating the FORWARD from the tokenizer.
+
+**Blocker found + recorded:** our tokenizer is ByteLevel-BPE-only; Mistral v0.3's
+tokenizer.json is SentencePiece BPE with a `Metaspace` pre_tokenizer (▁ replacement,
+prepend_scheme "first", split false) + byte-fallback vocab, so `Tokenizer::FromHfJson`
+throws "unsupported pre_tokenizer component Metaspace". This blocks the FULL
+paged-engine SACRED gate (which tokenizes prompts through the engine). Opened follow-up
+`LOAD-SENTENCEPIECE` (a separate tokenizer-family campaign); `test_mistral_load`'s
+tokenizer diagnostic and `test_mistral_paged_engine` degrade to a loud SKIP referencing it.
+
+ADDITIVITY: git diff = only new Mistral files + `CMakeLists.txt`/`tests/CMakeLists.txt`
+rows + the registry test; ZERO shared model/kernel/runner/tokenizer/config edit.
+REGRESSIONS confirmed UNCHANGED on dgx (registry 299, Qwen3-dense forward 1031, Llama
+paged-engine SACRED 16/16); the MoE/GDN gates (27B/35B/Qwen3-Coder/OPT/DeepSeek-V2) are
+unaffected BY CONSTRUCTION (no shared file touched — not re-run to spare contended GPU
+time; the additive-only diff is the evidence). Row `ACTIVE`, NOT `DONE`: SPEED and the
+full paged-engine token-exact gate are both explicitly PENDING. Next: the SentencePiece
+tokenizer campaign (unblocks the paged gate), then the speed close; then Gemma3 (rank 7).

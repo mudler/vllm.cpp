@@ -33,6 +33,24 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
+**Mistral (`MistralForCausalLM`, Mistral-7B-v0.3) — CORRECTNESS increment, no speed
+number (2026-07-23, `CLAIM-MODEL-MISTRAL`, [spike](../.agents/specs/sweep-mistral.md)).**
+Disposition: **NO throughput measured or claimed — SPEED PENDING** (a separate
+increment), and the **full paged-engine SACRED gate is BLOCKED** on Mistral's
+SentencePiece/Metaspace tokenizer, which our ByteLevel-BPE-only tokenizer cannot load
+(the pre-inventoried `LOAD-SENTENCEPIECE` row (SentencePiece tokenizer family)). The MODEL forward was instead gated
+**tokenizer-free**: vLLM's exact prompt token ids fed through our CUDA prefill and
+greedy-decoded — **30/30 continuation tokens match the vLLM 0.25.0 oracle** (29 STRICT
+token-exact + 1 near-tie band [p3 last token: our 4608 ∈ vLLM's own {1782,4608}], 0
+forward-divergent; vLLM greedy MEASURED deterministic on 4/5 prompts, K=3). Mistral =
+the shared Qwen3/Llama dense forward with NO new primitive (plain rope θ1e6, no
+qk-norm, untied lm_head, null sliding_window all pre-existing), so the row is 3 new
+files with ZERO shared-code edit; the additive-only diff makes the existing gates
+unaffected. W2 loader validated on the real 3-shard checkpoint (1541 assertions).
+CUDA `-Werror` 0 warnings; DSR 32 unchanged. Row `ACTIVE`, not `DONE`. Repro: capture
+`~/venvs/vllm-oracle/bin/python -u mistral_capture2.py` (gpu_mem 0.40, ninja on PATH)
+then `flock $HOME/gpu.lock ./build-cuda/tests/test_mistral_forward` on dgx.
+
 **Qwen3-dense SPEED binding vs vLLM 0.25.0 production — same-session, matching-recipe
 (2026-07-21, `Qwen3-4B` BF16).** SUPERSEDES the 2026-07-20 table below, whose vLLM
 c1 TTFT (61.6 ms ⇒ "2.27×") and c8 ITL P99 ("4.3×") were **denominator / num-prompts

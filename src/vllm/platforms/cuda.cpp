@@ -58,6 +58,20 @@ class CudaPlatform final : public Platform {
   // cuda.py:662 support_static_graph_mode -> True (CUDA graph capture mode).
   bool support_static_graph_mode() const override { return true; }
 
+  // S7 residency POLICY -> True: the CUDA path stages host tensors into distinct
+  // device-resident buffers (ResidentWeight, device-resident GDN state I/O, the
+  // merged/packed device-resident projections, direct-device-load), regardless of
+  // GB10 being physically unified. This is the memory-model residency the model's
+  // device-resident forward branches on; base false answers the host-resident
+  // direct-view reference path. Exactly what `device==kCUDA` returned.
+  bool needs_weight_staging() const override { return true; }
+
+  // S7 attention fast-path POLICY -> True: this device carries the vendored
+  // flash-attention-2 native-bf16 split-KV kernel the FA2 dispatch selects
+  // (cuda_paged_attn.cu). Base false answers the f32 graph-captured fallback.
+  // Exactly what `device==kCUDA` returned at the FA2 dispatch gate.
+  bool supports_fa2_attention() const override { return true; }
+
   // interface.py:181-187 supported_dtypes order (bf16 default fallback).
   std::vector<DType> supported_dtypes() const override {
     return {DType::kBF16, DType::kF16, DType::kF32};

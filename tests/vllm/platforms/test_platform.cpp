@@ -54,6 +54,18 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   CHECK_FALSE(cpu.opaque_attention_op());
   CHECK_FALSE(cpu.is_integrated_gpu());
   CHECK_FALSE(cpu.support_static_graph_mode());
+  // S7 residency / FA2 POLICY — base false on CPU: it reads host weights/state
+  // in place (no staging) and has no FA2 kernel, exactly what the converted
+  // `device==kCUDA` gates answered on a CPU device (byte-identical).
+  CHECK_FALSE(cpu.needs_weight_staging());
+  CHECK_FALSE(cpu.supports_fa2_attention());
+  // Proof that needs_weight_staging() is NOT is_unified_memory() in disguise: CPU
+  // is UNIFIED (host==device memory) yet does NOT stage. The two predicates
+  // DIVERGE here (unified true, staging false), so a staging gate keyed on
+  // is_unified_memory() would wrongly send CPU down the device-staging branch —
+  // the memory-property flip the dedicated policy avoids.
+  CHECK(cpu.is_unified_memory());
+  CHECK(cpu.needs_weight_staging() != cpu.is_unified_memory());
 
   // supported_dtypes order (bf16 default fallback first).
   const std::vector<DType> expected{DType::kBF16, DType::kF16, DType::kF32};
@@ -163,6 +175,9 @@ TEST_CASE("is_device_capability_family matches any <major>.x (interface.py:441-4
   CHECK_FALSE(sm121.cutlass_fp4_supported());
   CHECK_FALSE(sm121.opaque_attention_op());
   CHECK_FALSE(sm121.support_static_graph_mode());
+  // S7 additions default false on the base too (the CUDA ANSWER lives in the leg).
+  CHECK_FALSE(sm121.needs_weight_staging());
+  CHECK_FALSE(sm121.supports_fa2_attention());
 }
 
 // The CUDA leg's capability ANSWERS, exercised only where a real CUDA platform is
@@ -194,8 +209,24 @@ TEST_CASE("CUDA leg capability values (GPU build only)") {
   CHECK(cu.support_static_graph_mode());
 
   // is_integrated_gpu: GB10 (Grace-Blackwell UMA) reports integrated; it is also
-  // unified memory, so the two agree on this box.
+  // unified memory, so the two agree on this box. This backs the converted runner
+  // device-combine/scatter gates (async sampling into device-addressable host mem).
   CHECK(cu.is_integrated_gpu() == cu.is_unified_memory());
+  CHECK(cu.is_integrated_gpu());  // true on GB10
+
+  // S7 needs_weight_staging: unconditional true on CUDA — the CUDA path stages
+  // host tensors into device-resident buffers even though GB10 is physically
+  // unified. This is what the converted residency / merged-projection /
+  // packed-decode gates now read; it must equal the old `device==kCUDA` (true) on
+  // this device. On GB10 it AGREES with is_unified_memory() (both true — GB10 is
+  // unified AND stages), which is exactly why is_unified_memory() is the wrong
+  // predicate: the two DIVERGE on CPU (see the CPU-leg case — unified yet
+  // NON-staging), so a staging gate keyed on is_unified_memory() would flip CPU.
+  CHECK(cu.needs_weight_staging());
+
+  // S7 supports_fa2_attention: unconditional true on CUDA — the vendored FA2
+  // split-KV kernel exists here. Backs the converted FA2 dtype-selection gates.
+  CHECK(cu.supports_fa2_attention());
 
   // Family membership: GB10 is 12.x.
   CHECK(cu.is_device_capability_family(120));

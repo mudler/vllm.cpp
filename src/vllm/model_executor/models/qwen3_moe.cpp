@@ -381,7 +381,8 @@ struct Qwen3MoeDecodeGraph::Impl {
     const char* local = std::getenv("VT_QWEN3MOE_CUDAGRAPH");
     const bool local_on = (local == nullptr) || local[0] != '0';
     Backend& b = vt::GetBackend(queue.device.type);
-    enabled = env_on && local_on && queue.device.type == vt::DeviceType::kCUDA &&
+    enabled = env_on && local_on &&
+              platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
   }
   ~Impl() {

@@ -346,11 +346,14 @@ assembled from — so its model files barely mention any particular GPU vendor a
 all: across 287 of them, only 9 do, and the one matching our largest model
 mentions NVIDIA exactly **once** in 802 lines. We never built that shared library;
 we wrote those building blocks straight into the model files instead. The result
-is that our matching model file is 6,389 lines and mentions NVIDIA dozens of
-times, and that single file holds most of all the
-NVIDIA-specific code left in the supposedly shared part of the project (**55**
-places today, down from the audit's 86 — see the automated count and the steps
-below).
+is that our matching model file was 6,389 lines and mentioned NVIDIA dozens of
+times, and that single file held most of all the
+NVIDIA-specific code left in the supposedly shared part of the project. That count
+is now **32** places, down from the audit's 86 — and, decisively, **every one of
+the 32 that remains is a build-time switch** (a kernel that only compiles for one
+GPU family), not a runtime "is this NVIDIA" test: the shared model layer no longer
+contains a single runtime device-name check. See the automated count and the steps
+below.
 So a new accelerator today inherits the engine, the scheduler, the memory
 manager, the sampler and the fused-operation catalogue for free — and then meets
 a model file written for NVIDIA. Two further gaps were confirmed: we have no
@@ -377,6 +380,22 @@ today (yes on our GB10, no everywhere else) — byte-for-byte identical, yet a f
 accelerator answers for itself. Twelve of those switches moved this way, dropping
 the count from 67 to 55, with every model gate proven bit-identical
 (27B 235/235, 35B 315/315, plus Coder, the dense 32B, OPT, DeepSeek-V2 and Llama).
+Step **seven** — extracting the last shared-layer device coupling — then landed
+(2026-07-23) and took the count from 55 to **32**, its honest floor: it hoisted
+every remaining runtime "is this NVIDIA" test in the model layer onto a platform
+or backend capability question — the memory-model staging policy (why our unified
+GB10 still stages to device buffers), the flash-attention fast path, the
+secondary-stream overlap, the grouped-MoE kernel availability, the decode-graph
+and 4-bit-path gates — each answering exactly what the device-name test did today
+(yes on GB10, no everywhere else) yet decoupling for a future accelerator. What is
+left cannot be reduced without deleting a kernel: all 32 are compile-time gates for
+kernels that only build on one GPU family, and a build gate for a kernel that only
+exists on one architecture is legitimately irreducible. **The audit's aspirational
+"below 10" target is therefore not reachable — 32 build gates are the real floor —
+and this is the honest answer to "how additive can the shared layer get": every
+runtime device coupling is gone; only compile-time kernel availability remains.**
+Every model gate was proven bit-identical (27B 235/235, 35B 315/315, Qwen3-Coder
+6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8, Llama 16/16).
 
 **The first of those eight steps is now in place (2026-07-22): the leakage is
 counted automatically on every push, and the count can only go down.** It had
@@ -445,6 +464,35 @@ GPU memory. When a fallback does run it is announced, not silent, so "this backe
 is running the slow path for operation X" is always visible. This is the fourth
 of the audit's eight steps; it also unblocks (but does not itself perform) the
 delicate 4-bit/8-bit conversions the previous step had to defer.
+
+**The seventh step is now in place (2026-07-23), and it is the closest this
+extensibility work comes to a finish line: the shared model layer no longer
+branches on the device at runtime at all.** The audit's central complaint was that
+our biggest model file was written for NVIDIA. That is no longer true. Every one of
+the twenty-three remaining "is this NVIDIA" runtime tests across the model layer —
+in the 6,389-line file and in the DeepSeek, Qwen3-MoE, dense and worker files — was
+moved onto a capability the platform or the compute backend answers for itself. The
+subtle one was residency: our GB10 shares memory with the CPU, yet the NVIDIA path
+still stages weights into a separate device buffer, so the naive "is this shared
+memory" test would have flipped it the wrong way; the fix is a dedicated
+"does this device stage its weights" policy that answers yes on NVIDIA today (exactly
+as before) but lets a future shared-memory accelerator answer no and read its weights
+in place. The others: a flash-attention capability, a secondary-compute-stream
+capability, the grouped-expert-kernel availability question asked of the operation
+table, and the existing 4-bit / decode-graph platform questions reused. Every one is
+byte-for-byte what the device-name test returned on this hardware — proven by
+re-running all seven correctness gates on the real GPU to identical tokens (27B
+235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8,
+Llama 16/16) — yet each one decouples a future accelerator. The count of
+NVIDIA-specific places in the shared layer fell from 55 to **32**, and the
+remaining 32 are *all* build-time switches for kernels that compile on only one GPU
+family — an irreducible floor, not leakage. So the audit's "shared logic, swapped
+operations per accelerator" goal is met for the runtime model layer: a new
+accelerator that registers its operations now rides the whole model forward with no
+device-name edit anywhere. The remaining structural work — physically relocating
+those building blocks into a shared `layers/` library so the model file also
+*shrinks* toward vLLM's 802-line shape — is a follow-on refactor; the device
+coupling it was meant to remove is already gone.
 
 **What was actually built for Apple.** The GPU is opened and memory allocated on
 it; GPU programs are compiled at run time from source embedded in the binary, so

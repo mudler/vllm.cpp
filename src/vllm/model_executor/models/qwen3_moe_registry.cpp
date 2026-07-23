@@ -102,7 +102,7 @@ ForwardLogits ForwardQwen3MoeForCausalLM(LoadedModel& model,
   // from max_num_reqs_ regardless of whether the model has GDN layers), so a
   // pure full-attention model reads its capture-size cap from it unchanged.
   if (input.pure_decode &&
-      platforms::GetPlatform(input.queue.device.type).is_cuda()) {
+      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode()) {
     if (!qwen.decode_graph()) {
       qwen.decode_graph() = std::make_unique<Qwen3MoeDecodeGraph>(
           weights, input.config, input.queue, input.gdn_state_slots);

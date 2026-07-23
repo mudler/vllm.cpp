@@ -112,7 +112,8 @@ OwnedTensor LoadToF32(const TensorResolver& get, const std::string& name) {
 }
 
 bool DirectDeviceLoadEligible(vt::Queue* queue) {
-  if (queue == nullptr || queue->device.type != vt::DeviceType::kCUDA) {
+  if (queue == nullptr ||
+      !platforms::GetPlatform(queue->device.type).needs_weight_staging()) {
     return false;
   }
   const char* release = std::getenv("VT_RELEASE_HOST_WEIGHTS");

@@ -308,7 +308,14 @@ MoePtrs& MoePtrsFor(const DeepseekV2MoeWeights* key) {
 }
 
 bool GroupedMoeEligible(Dev d, const DeepseekV2MoeWeights& w) {
-  if (!vllm::platforms::GetPlatform(d.q.device.type).is_cuda()) return false;
+  // S7: this gates availability of the bf16 grouped-GEMM MoE kernel, which is
+  // registered ONLY for CUDA (cuda_matmul_nvfp4.cu:2799). `vt::OpRegistered` is
+  // therefore byte-identical to the old `is_cuda()` (true iff the op is realized
+  // for this device — kCUDA today, on every build) and drops the device token —
+  // exactly the S4 class-A conversion (audit §9.2), safe because the op is
+  // CUDA-only (not the dual-registered fp4/fp8 ops S6 had to leave).
+  if (!vt::OpRegistered(vt::OpId::kMoeGroupedGemmBf16, d.q.device.type))
+    return false;
   if (w.expert_gate.empty()) return false;
   // vt::MoeGroupedGemmBf16 reads the [K,N] Matmul-B orientation only.
   for (const OwnedTensor* t : {&w.expert_gate[0], &w.expert_up[0], &w.expert_down[0]})
@@ -882,7 +889,8 @@ struct DeepseekV2DecodeGraph::Impl {
     const char* local = std::getenv("VT_DEEPSEEK_CUDAGRAPH");
     const bool local_on = (local == nullptr) || local[0] != '0';
     Backend& b = vt::GetBackend(queue.device.type);
-    enabled = env_on && local_on && queue.device.type == vt::DeviceType::kCUDA &&
+    enabled = env_on && local_on &&
+              platforms::GetPlatform(queue.device.type).support_static_graph_mode() &&
               b.SupportsGraphCapture();
   }
   ~Impl() {

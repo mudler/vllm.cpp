@@ -20204,3 +20204,56 @@ kMatmul 16 % + kMatmulBT 14 % = 80 %). G6 ports llama.cpp's Arm i8mm `nrc==2`
   safetensors never reaches `LoadGdnGguf`). Regression set UNCHANGED, each
   STANDALONE — 27B 235/235, 35B 315/315, Coder 6/6, dense 16/16, OPT 6/6,
   DeepSeek-V2 8/8, Llama 16/16. Not pushed — report FULL SHA to the caller.
+
+
+## 2026-07-23 — accelerator-seam `S7`: extract the last shared-layer device coupling → DSR to its irreducible floor (`CLAIM-BACKEND-SEAM-S7-1`, base `2c7c199`, worktree `/home/mudler/s7-seam-worktree` branch `seam-s7`)
+
+- **What.** The audit's TERMINAL runtime-decoupling step. Hoisted **all 23**
+  remaining runtime `kCUDA`/`is_cuda()` leakage sites in the shared model layer
+  onto platform/backend capabilities so the model layer stops branching on the
+  device NAME at runtime. **DSR 55 → 32** (`kcuda` 13→0; `is_cuda` 10→0;
+  `cuda_inc` 0; `vt_ifdef` 32), baseline lowered same commit.
+- **New capability surface (mirrors the S3 pattern; defs in the allowlisted legs).**
+  `Platform::needs_weight_staging()` (interface.h base false + cuda.cpp true) — the
+  CUDA device-resident STAGING policy; converts qwen3_5.cpp residency 704/725/2500/5298,
+  merged/packed GDN 2656/2752/2780/3151, and qwen3_5_dense_weights.cpp:115 direct-load.
+  `Platform::supports_fa2_attention()` — FA2 dtype 3647/3653. `Backend::SupportsAuxStream()`
+  (backend.h + cuda_backend.cu, off the DSR scan) — MoE aux-stream 4292.
+- **Reused (no new surface).** `supports_fp8()` (qwen3_5.cpp:1272 merged-fp8-QKV),
+  `cutlass_fp4_supported()` (model_loader.cpp:307 fp4 warmup, qwen3_5_dense.cpp:98 +
+  qwen3_5_moe.cpp:77 fp4 decode-graph), `support_static_graph_mode()` (deepseek_v2.cpp:885,
+  qwen3_moe.cpp:384, deepseek_v2_registry.cpp:104, qwen3_moe_registry.cpp:105 decode-graph),
+  `is_integrated_gpu()` (runner.cpp:702/1080 async device combine/scatter),
+  `vt::OpRegistered(kMoeGroupedGemmBf16)` (deepseek_v2.cpp:311 GroupedMoeEligible — the op
+  is CUDA-only, `cuda_matmul_nvfp4.cu:2799`, so OpRegistered == `device==kCUDA`, the S4 rule).
+- **The residency predicate — why it equals the old behaviour and is NOT a memory flip.**
+  The CUDA path stages host weights/state into a distinct device-resident buffer even
+  though GB10 is physically UNIFIED (device pointers are a distinct bind address), so
+  `is_unified_memory()`/`is_integrated_gpu()` would answer true there and FLIP the path
+  onto the host-direct branch — the memory-property trap. `needs_weight_staging()` is a
+  DEDICATED policy (true on CUDA, base false), returns exactly what `device==kCUDA` did on
+  every registered platform, and DECOUPLES: a future discrete GPU answers true (it stages);
+  a direct-host accelerator answers false (reads host in place). The merged/packed GDN
+  paths ride it because they slice a device-resident staged packed-GEMM owner. The runner
+  combine/scatter (702/1080) correctly uses `is_integrated_gpu()` instead — that path writes
+  device-ADDRESSABLE host memory (integrated-GPU property), so a future discrete GPU answers
+  false and takes host bookkeeping, the right path there.
+- **32 is the honest floor; `<10` NOT reachable.** After S7 the shared model layer holds
+  ZERO runtime device tests. All 32 residual DSR are `#ifdef VT_*` compile-time gates for
+  kernels that only build on one GPU family (`VT_MARLIN_NVFP4`/`VT_CUTLASS_NVFP4`/
+  `VT_CUTLASS_FP8`/`VT_BENCH_PROFILE_CONTROL`) — a build gate for a kernel absent from the
+  binary cannot move to a runtime capability. This is the answer to "how additive can the
+  shared layer get": every RUNTIME device coupling is gone.
+- **Gates.** Clean CUDA `-Werror` 0 warnings (dgx, prod flags 121a + CUTLASS + Triton) +
+  clean CPU `-Werror` 0 warnings. Standalone under `flock $HOME/gpu.lock`, one big-model at
+  a time, byte-identical: **27B 235/235 · 35B 315/315 · Qwen3-Coder 6/6 · Qwen3-dense-32B
+  16/16 · OPT 6/6 · DeepSeek-V2 8/8 · Llama 16/16** (goldens content-hash unchanged, none
+  regenerated). New `test_platform` (needs_weight_staging / supports_fa2_attention + the
+  `!= is_unified_memory()` assertion) + Backend `SupportsAuxStream` (`test_backend`,
+  `test_cuda_backend`) green on CPU+CUDA; seam/quant/model nets green; full CPU ctest green
+  (two failures — `test_model_loader_gguf`, `test_openai_conformance` — reproduce
+  IDENTICALLY on pristine `2c7c199`: pre-existing tokenizer-fixture issue + `-j` port flake,
+  S7-independent). `compute-sanitizer memcheck` 0 errors on the touched device path.
+  `check-device-leakage.py` RC=0 (DSR 32 == baseline 32), 24-case mutation suite 24/24,
+  record checkers RC=0. The physical `layers/`-library relocation is a follow-on refactor;
+  the device coupling is already gone. Not pushed — report FULL SHA to the caller.

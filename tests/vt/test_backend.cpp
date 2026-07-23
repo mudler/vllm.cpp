@@ -15,6 +15,10 @@ TEST_CASE("CPU backend is registered and allocates usable memory") {
   Backend& cpu = vt::GetBackend(DeviceType::kCPU);
   CHECK(cpu.UnifiedMemory());
   CHECK_FALSE(cpu.SupportsGraphCapture());
+  // S7: a single-stream backend declines the MoE shared-expert aux-stream
+  // overlap — base false, exactly what the old `device==kCUDA` gate returned on
+  // CPU (the shared path runs serially, byte-identical, no overlap).
+  CHECK_FALSE(cpu.SupportsAuxStream());
 
   Queue q = cpu.CreateQueue();
   CHECK(q.device.type == DeviceType::kCPU);

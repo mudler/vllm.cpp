@@ -699,7 +699,14 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // to token_ids_cpu and last_sampled_tokens).
   if (async_input_combine_ && num_reqs > 0) {
 #ifdef VLLM_CPP_CUDA
-    if (vllm::platforms::GetPlatform(queue_.device.type).is_cuda()) {
+    // S7: the DEVICE combine splices input ids from device-ADDRESSABLE host
+    // arrays (pageable on GB10's UMA) — an INTEGRATED-GPU property, not just
+    // "is CUDA". is_integrated_gpu() is byte-identical on the only registered
+    // CUDA platform (GB10 reports integrated) yet correctly decouples: a future
+    // DISCRETE GPU answers false and takes the host combine, which is the right
+    // path there (its host arrays are NOT device-addressable). Definition lives
+    // in the allowlisted CUDA platform leg, so the device token drops.
+    if (vllm::platforms::GetPlatform(queue_.device.type).is_integrated_gpu()) {
       // DEVICE combine (W3 DGX leaf): splice each decode row's input id from the
       // device-resident-analog last_sampled_tokens on the MAIN queue, BEFORE the
       // forward (which embeds input_token_ids on the same queue → sees the patch)
@@ -1077,7 +1084,11 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   //
   skeleton.req_ids.reserve(static_cast<size_t>(num_reqs));
 #ifdef VLLM_CPP_CUDA
-  if (vllm::platforms::GetPlatform(dev.type).is_cuda()) {
+  // S7: the DEVICE scatter writes sampled ids into device-ADDRESSABLE host
+  // memory (pageable on GB10's UMA) — an INTEGRATED-GPU property. is_integrated_gpu()
+  // is byte-identical on GB10 (the only registered CUDA platform) yet decouples a
+  // future discrete GPU (false -> host bookkeeping, the correct path there).
+  if (vllm::platforms::GetPlatform(dev.type).is_integrated_gpu()) {
     // DEVICE scatter (W3 DGX leaf): write each row's sampled id into
     // last_sampled_tokens on the MAIN queue — main-stream-ordered with the next
     // step's device combine, so the sampled ids NEVER round-trip the host. This

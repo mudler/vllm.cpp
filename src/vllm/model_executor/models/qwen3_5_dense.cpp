@@ -95,7 +95,7 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
   auto& qwen = static_cast<Qwen3_5DenseLoadedModel&>(model);
   const Qwen3_5DenseWeights& weights = qwen.weights();
   const bool fp4_cuda =
-      platforms::GetPlatform(input.queue.device.type).is_cuda() &&
+      platforms::GetPlatform(input.queue.device.type).cutlass_fp4_supported() &&
       !weights.layers.empty() &&
       !weights.layers.front().mlp.gate_proj_fp4.Empty();
   constexpr int kMaxDecodeGraphBatch = 64;

@@ -179,6 +179,8 @@ class CudaBackend final : public Backend {
   //     position / slot / block-table, written by an async copy on the stream
   //     BEFORE Replay, or captured as part of the graph).
   bool SupportsGraphCapture() const override { return true; }
+  // S7: CUDA has a secondary stream for the MoE shared-expert overlap fork.
+  bool SupportsAuxStream() const override { return true; }
   void BeginCapture(Queue& q) override {
     Check(cudaStreamBeginCapture(AsStream(q), cudaStreamCaptureModeThreadLocal),
           "cudaStreamBeginCapture");

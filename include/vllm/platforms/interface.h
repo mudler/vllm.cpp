@@ -188,6 +188,48 @@ class Platform {
   // platform POLICY gate, mirroring upstream.
   virtual bool support_static_graph_mode() const { return false; }
 
+  // --- Residency / attention fast-path POLICY (accelerator-seam S7) -----------
+  //
+  // Two more capability predicates the shared layer branches on TODAY via a raw
+  // `device.type == kCUDA` test, hoisted to Platform POLICY (audit §12.3, work
+  // row S7). Same discipline as the S3 block above: byte-identical today (CUDA
+  // answers true, every other platform the base false — exactly what
+  // `device==kCUDA` returned), yet genuinely DECOUPLING (a future accelerator
+  // answers for itself, with no edit at the call site). Definitions live in the
+  // DSR-allowlisted CUDA platform leg, so the removed call-site `kCUDA` is a real
+  // decoupling drop. POLICY on Platform, never implementation-selection
+  // (audit Risks/dec. 6).
+
+  // Does this platform require host tensors to be STAGED into a distinct
+  // device-resident buffer before a kernel can read them? This is the CUDA
+  // programming-model residency policy, NOT a physical-memory probe:
+  // is_unified_memory()/is_integrated_gpu() are the WRONG predicate because GB10
+  // is physically unified yet the CUDA path STILL stages (device pointers are a
+  // distinct address the kernels bind), so a memory-property probe would FLIP the
+  // path (audit §12.3). CUDA: true; every other platform: base false — exactly
+  // what `device==kCUDA` answered. Governs the model's device-resident forward as
+  // a whole: resident-weight upload (ResidentWeight), device-resident state I/O
+  // (IndexedGdnStateIoEnabled), the merged/packed GDN projections (which slice a
+  // device-resident packed-GEMM owner) and the direct-device-load precondition —
+  // all the SAME "operands live in a staged device buffer" policy, versus the
+  // host-resident direct-view reference path. A future discrete GPU answers true
+  // (it stages); a future direct-host accelerator answers false (it reads host
+  // memory in place) — the decoupling a bare `kCUDA` cannot express.
+  virtual bool needs_weight_staging() const { return false; }
+
+  // Does this platform have the fused flash-attention-2 (native-bf16) attention
+  // fast path? The FA2 dispatch (qwen3_5.cpp GdnBlockPaged / full-attn preamble)
+  // emits bf16 q/k and a bf16 attention output — the combo the vendored CUDA
+  // split-KV FA2 kernel (cuda_paged_attn.cu:2494) consumes — versus the f32
+  // graph-captured fallback. Upstream expresses this as an attention-backend
+  // choice (FLASH_ATTN is a registered CUDA AttentionBackendEnum entry,
+  // registry.py:34-120); here the kernel lands one layer lower (the
+  // vt::PagedAttention op), so `vt::OpRegistered` cannot see the FA2 SUB-kernel
+  // (audit class D, §9.3) and the choice is a Platform predicate. CUDA: true;
+  // every other platform: base false — exactly what `device==kCUDA` answered. A
+  // future accelerator with a bf16 flash-attention kernel answers true.
+  virtual bool supports_fa2_attention() const { return false; }
+
   // interface.py:181-187 supported_dtypes. The FIRST entry is the default
   // fallback for the platform ("auto" dtype resolution).
   virtual std::vector<DType> supported_dtypes() const = 0;

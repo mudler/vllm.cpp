@@ -106,6 +106,9 @@ TEST_CASE("CUDA backend: graph capture/replay re-executes captured ops") {
   }
   Backend& cuda = vt::GetBackend(DeviceType::kCUDA);
   CHECK(cuda.SupportsGraphCapture());
+  // S7: CUDA has the secondary stream the MoE shared-expert overlap forks onto —
+  // true, exactly what the old `device==kCUDA` aux-stream gate returned.
+  CHECK(cuda.SupportsAuxStream());
   Queue q = cuda.CreateQueue();
   constexpr size_t kBytes = 64 * 1024;
 

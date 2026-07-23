@@ -96,6 +96,18 @@ class Backend {
   // the main queue, then QueueWaitEvent it on the copy queue).
   virtual void QueueWaitEvent(Queue& q, Event& e);
 
+  // Does this backend support a SECONDARY compute stream for overlap? The MoE
+  // shared-expert overlap (qwen3_5.cpp, ENG-MOE-SHARED-AUX) forks the shared MLP
+  // onto an aux stream (RecordEvent/QueueWaitEvent on a second Queue) so it runs
+  // concurrently with the routed grouped-GEMMs on the main stream — mirroring
+  // maybe_execute_in_parallel (multi_stream_utils.py:47-54). Base false: a
+  // single-stream backend runs the shared path serially (byte-identical output,
+  // no overlap). CUDA overrides true. This is the capability the model's
+  // `device==kCUDA && MoeSharedAuxStreamEnabled()` gate actually asked
+  // (accelerator-seam S7), CUDA true / base false. Lives on Backend (src/vt, off
+  // the DSR scan) so the model file stops naming a device at the aux-stream gate.
+  virtual bool SupportsAuxStream() const { return false; }
+
   // Optional graph/command capture (CUDA Graphs / Metal ICB / Vulkan CB).
   virtual bool SupportsGraphCapture() const { return false; }
   virtual void BeginCapture(Queue& q);

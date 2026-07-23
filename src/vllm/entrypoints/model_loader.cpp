@@ -304,7 +304,7 @@ LoadedEngine::LoadedEngine(HfConfig config,
 void LoadedEngine::WarmupKernels() {
 #if defined(VLLM_CPP_CUDA) && defined(VT_CUTLASS_NVFP4)
   if (!model_->uses_nvfp4_w4a4() ||
-      runner_.device().type != vt::DeviceType::kCUDA ||
+      !vllm::platforms::GetPlatform(runner_.device().type).cutlass_fp4_supported() ||
       !EnvironmentEnabled("VT_FP4_PRE_SERVE_WARMUP") ||
       !EnvironmentEnabled("VT_FP4_AUTOTUNE") ||
       !EnvironmentEnabled("VT_FP4_PLAN_CACHE")) {

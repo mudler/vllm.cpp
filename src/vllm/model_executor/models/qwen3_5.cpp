@@ -701,7 +701,7 @@ std::vector<float> WeightF32(const OwnedTensor& w) {
 // the const_cast is safe. `shape` defaults to the owned shape.
 Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
-  if (!vllm::platforms::GetPlatform(d.q.device.type).is_cuda())
+  if (!vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging())
     return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
                       shape);
   if (!w.d_dev) {
@@ -722,7 +722,7 @@ Tensor ResidentWeightF32(Dev d, const OwnedTensor& w,
                          const std::vector<int64_t>& shape) {
   if (!w.d_dev_f32) {
     std::vector<float> f = WeightF32(w);
-    if (!vllm::platforms::GetPlatform(d.q.device.type).is_cuda()) {
+    if (!vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging()) {
       auto* buf = new std::vector<float>(std::move(f));
       w.d_dev_f32 = std::shared_ptr<void>(buf->data(), [buf](void*) { delete buf; });
     } else {
@@ -1269,7 +1269,8 @@ bool MergedFp8QkvEligible(const FullAttnLayerWeights& w, Dev d,
   // merged GEMM quantizes the activation ONCE, so all three shards must read the
   // same activation scale (the real 35B q/k/v do; QKVParallelLinear is one input).
   return packed_consumers && MergedFp8QkvEnabled() &&
-         d.q.device.type == vt::DeviceType::kCUDA && !q.Empty() && !k.Empty() &&
+         vllm::platforms::GetPlatform(d.q.device.type).supports_fp8() &&
+         !q.Empty() && !k.Empty() &&
          !v.Empty() && q.k == k.k && q.k == v.k &&
          q.input_scale == k.input_scale && q.input_scale == v.input_scale;
 }
@@ -2497,7 +2498,7 @@ bool IndexedGdnStateIoEnabled(Device device) {
   const char* indexed = std::getenv("VT_GDN_INDEXED_STATE_IO");
   // CPU keeps the row-copy reference by default. An explicit =1 is a test hook
   // that drives the whole model integration through the CPU reference kernels.
-  if (device.type != vt::DeviceType::kCUDA)
+  if (!vllm::platforms::GetPlatform(device.type).needs_weight_staging())
     return indexed != nullptr && indexed[0] == '1';
   const char* cache = std::getenv("VT_DEVICE_KV_CACHE");
   if (cache != nullptr && cache[0] == '0') return false;
@@ -2653,7 +2654,8 @@ bool MergedGdnBaEnabled(Dev d) {
     const char* leaf = std::getenv("VT_GDN_MERGED_BA");
     return leaf == nullptr || leaf[0] != '0';
   }();
-  return enabled && d.q.device.type == vt::DeviceType::kCUDA;
+  return enabled &&
+         vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging();
 }
 
 DType MergedGdnBaOutputDType(bool packed_decode) {
@@ -2749,7 +2751,8 @@ bool MergedGdnQkvzEnabled(Dev d) {
     const char* leaf = std::getenv("VT_GDN_MERGED_QKVZ");
     return leaf == nullptr || leaf[0] != '0';
   }();
-  return enabled && d.q.device.type == vt::DeviceType::kCUDA;
+  return enabled &&
+         vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging();
 }
 
 struct GdnQkvzOutput {
@@ -2777,7 +2780,8 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
              "qwen3_5 merged GDN qkvz: invalid packed owner");
     Tensor packed_weight = ResidentWeight(d, w.in_proj_qkvz);
     if (detail::ShouldUseMergedGdnQkvz(detail::GdnMergedQkvzEligibility{
-            MergedGdnQkvzEnabled(d), d.q.device.type == vt::DeviceType::kCUDA,
+            MergedGdnQkvzEnabled(d),
+            vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging(),
             true, indt == outdt})) {
       out.packed_owner.emplace(MatmulBTRawD(d, h, packed_weight, indt));
       Tensor packed = out.packed_owner->t();
@@ -3148,7 +3152,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const bool packed_decode = detail::ShouldUsePackedGdnDecode(
       detail::GdnPackedDecodeEligibility{
           PackedGdnDecodeRuntimeEnabled(),
-          d.q.device.type == vt::DeviceType::kCUDA,
+          vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging(),
           cfg.num_experts == 0,
           !w.in_proj_ba.Empty(),
           MergedGdnBaEnabled(d),
@@ -3643,14 +3647,16 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // (Hq/Hkv=16/2, VT_FA2_DECODE_35B — CLAIM-35B-FA2-DECODE-1). All windows /
   // non-causal / non-256 / other-ratio shapes stay f32 on the graph-captured
   // fallback.
+  const bool fa2_platform =
+      vllm::platforms::GetPlatform(d.q.device.type).supports_fa2_attention();
   const bool fa2_prefill = Fa2PrefillOn() && FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin &&
-                           d.q.device.type == vt::DeviceType::kCUDA &&
+                           fa2_platform &&
                            kv.dtype == DType::kBF16 && Dh == 256 && T > meta.num_reqs;
   const bool fa2_decode_r6 = Hq == 24 && Hkv == 4 && Fa2DecodeOn();
   const bool fa2_decode_r8 = Hq == 16 && Hkv == 2 && Fa2Decode35BOn();
   const bool fa2_decode = (fa2_decode_r6 || fa2_decode_r8) && FuseAttnPreambleOn(fp4) &&
                           sdi.has_attn_cos_sin &&
-                          d.q.device.type == vt::DeviceType::kCUDA &&
+                          fa2_platform &&
                           kv.dtype == DType::kBF16 && kv.block_size % 16 == 0 &&
                           Dh == 256 && T == meta.num_reqs && meta.causal;
   const bool fa2_attention = fa2_prefill || fa2_decode;
@@ -4289,7 +4295,7 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
   // maybe_execute_in_parallel (multi_stream_utils.py:47-54): event0.record() on
   // main, aux waits event0, aux runs fn1, aux records event1.
   const bool aux_overlap = MoeSharedAuxStreamEnabled() &&
-                           d.q.device.type == vt::DeviceType::kCUDA &&
+                           d.b.SupportsAuxStream() &&
                            T <= static_cast<int64_t>(MoeSharedAuxThreshold());
   std::optional<SharedExpertParts> sp_aux;
   MoeAuxStream* ax = nullptr;
@@ -5295,8 +5301,8 @@ void Qwen3_5Model::PrepareMarlinResident(const Qwen3_5MoeWeights& weights,
 
 void Qwen3_5DenseModel::PrepareBf16Resident(
     const Qwen3_5DenseWeights& weights, vt::Queue& queue) {
-  VT_CHECK(platforms::GetPlatform(queue.device.type).is_cuda(),
-           "PrepareBf16Resident: CUDA queue required");
+  VT_CHECK(platforms::GetPlatform(queue.device.type).needs_weight_staging(),
+           "PrepareBf16Resident: a weight-staging (device-resident) queue required");
   Dev d{vt::GetBackend(queue.device.type), queue};
   const auto raw = [&d](const OwnedTensor& tensor) {
     if (!tensor.Empty()) (void)ResidentWeight(d, tensor);

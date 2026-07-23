@@ -9,10 +9,10 @@
     "  python3 scripts/check-device-leakage.py --write-baseline",
     "It is a leakage budget, never to be raised to make a failing check pass."
   ],
-  "total": 55,
+  "total": 32,
   "buckets": {
-    "kcuda": 13,
-    "is_cuda": 10,
+    "kcuda": 0,
+    "is_cuda": 0,
     "cuda_inc": 0,
     "vt_ifdef": 32
   }

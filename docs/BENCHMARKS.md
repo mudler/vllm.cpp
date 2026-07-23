@@ -347,6 +347,41 @@ The residual class-D residency/stream/FA2-dtype/merged-layout sites and the
 `#ifdef VT_*` build gates in `dense_nvfp4_gemm.h` were LEFT (no clean byte-identical
 capability mirror — that is `S7`), which is why the as-built DSR is **55**, not lower.
 
+### Accelerator-seam `S7` — extract the last shared-layer device coupling; DSR to its floor (2026-07-23, `CLAIM-BACKEND-SEAM-S7-1`) — byte-identical, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE — structural/decoupling refactor, no
+performance claim; each converted predicate resolves to exactly the former
+`device==kCUDA` value on GB10, so no re-grid is owed.** `S7` hoists **all 23**
+remaining runtime `kCUDA`/`is_cuda()` leakage sites in the shared model layer onto
+platform/backend capabilities: new `Platform::needs_weight_staging()` (the CUDA
+device-resident staging policy — residency 704/725/2500/5298, merged/packed GDN
+2656/2752/2780/3151, dense-weights direct-load; NOT `is_unified_memory()`, which
+would flip GB10) and `Platform::supports_fa2_attention()` (FA2 dtype 3647/3653), new
+`Backend::SupportsAuxStream()` (MoE aux-stream 4292), plus reuse of S3's
+`supports_fp8()` (merged-fp8-QKV 1272), `cutlass_fp4_supported()` (fp4 warmup +
+dense/moe fp4 decode-graph gates), `support_static_graph_mode()` (DeepSeek/Qwen3-MoE
+decode-graph gates), `is_integrated_gpu()` (runner device combine/scatter 702/1080),
+and `vt::OpRegistered(kMoeGroupedGemmBf16)` (a CUDA-only op, S4 pattern — DeepSeek
+GroupedMoeEligible). Each is byte-identical because GB10 is the only registered CUDA
+platform and every predicate returns `true` there / base `false` elsewhere — exactly
+what the device test answered. **DSR 55 → 32** (`kcuda` 13→0, `is_cuda` 10→0,
+`cuda_inc` 0, `vt_ifdef` 32); baseline lowered in the same commit; ratchet + 24-case
+mutation suite green. **32 is the honest floor:** every remaining site is a
+`#ifdef VT_*` compile-time gate for a kernel that only builds on one GPU family
+(legitimately irreducible); the shared model layer now holds **zero** runtime device
+tests. The audit's "<10" target is thus not reachable — build gates are the floor.
+Gates (dgx CUDA + dev CPU, clean `-Werror` **0 warnings**; standalone under
+`flock $HOME/gpu.lock`, one big-model at a time): **byte-identical 27B 235/235 · 35B
+315/315 · Qwen3-Coder 6/6 · Qwen3-dense-32B 16/16 · OPT 6/6 · DeepSeek-V2 8/8 ·
+Llama 16/16**, no golden regenerated (goldens content-hash unchanged before/after).
+New `test_platform` cases (needs_weight_staging / supports_fa2_attention, per leg) +
+Backend `SupportsAuxStream` cases (`test_backend`, `test_cuda_backend`) green;
+seam/quant nets green; `compute-sanitizer memcheck` **0 errors** on the touched
+device path. Bare-RC checkers: `check-device-leakage.py` RC=0 (DSR 32 == baseline
+32), 24-case mutation suite 24/24, `check-agent-record.py` + `check-doc-checkpoint.py`
+RC=0. This completes the accelerator-seam campaign's runtime-decoupling arc
+(86 → 67 → 55 → **32**, its irreducible build-gate floor).
+
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
 reruns on the full production default set (async + vendored Triton GDN decode cubin

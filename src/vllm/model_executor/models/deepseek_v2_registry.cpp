@@ -101,7 +101,7 @@ ForwardLogits ForwardDeepseekV2ForCausalLM(LoadedModel& model,
   // pure-MLA model reads its capture-size cap from it unchanged — the same seam
   // Qwen3-Coder uses.
   if (input.pure_decode &&
-      platforms::GetPlatform(input.queue.device.type).is_cuda()) {
+      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode()) {
     if (!ds.decode_graph()) {
       ds.decode_graph() = std::make_unique<DeepseekV2DecodeGraph>(
           weights, input.queue, input.gdn_state_slots);

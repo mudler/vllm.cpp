@@ -346,9 +346,10 @@ all: across 287 of them, only 9 do, and the one matching our largest model
 mentions NVIDIA exactly **once** in 802 lines. We never built that shared library;
 we wrote those building blocks straight into the model files instead. The result
 is that our matching model file is 6,389 lines and mentions NVIDIA dozens of
-times, and that single file holds **77%** of all the NVIDIA-specific code left in
-the supposedly shared part of the project (**86** places in total; see the
-automated count below).
+times, and that single file holds about **three-quarters** of all the
+NVIDIA-specific code left in the supposedly shared part of the project (**67**
+places today, down from the audit's 86 — see the automated count and step five
+below).
 So a new accelerator today inherits the engine, the scheduler, the memory
 manager, the sampler and the fused-operation catalogue for free — and then meets
 a model file written for NVIDIA. Two further gaps were confirmed: we have no
@@ -382,6 +383,27 @@ per-device behaviour — the rest are questions the code could ask its own
 operation table instead, or build-time switches. **This step added a script, a
 test suite and a build check; it changed no engine, model or kernel code, so
 nothing about how the project runs has changed.**
+
+**The fifth step is now in place (2026-07-23): the shared "how is this
+compressed weight multiplied on this device" seam the audit named as the single
+missing piece.** vLLM answers that question once, in a small policy object chosen
+when the model loads, so every model just says "apply this projection" and never
+asks which weight format or which GPU. We now have the same seam — a
+`LinearMethod` / `QuantizationConfig` layer that mirrors vLLM's, with the format
+chosen once from the checkpoint instead of guessed from a tensor name at every
+use — and the dense model's projections run through it. And where a model file
+used to ask "is this NVIDIA?" before taking a fast path, it now asks its own
+operation table "is this fast kernel available here?" — the same answer on
+NVIDIA today, and the right answer on any future accelerator that registers the
+kernel. That removed **19** of the device references (86 → **67**) with the
+output of every model **bit-for-bit unchanged**: all six correctness gates were
+re-run on the real hardware and produced identical tokens (27B 235/235, 35B
+315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6, DeepSeek-V2 8/8; the
+committed golden files were not touched). The device references that remain are
+the most delicate fast paths — the 27B's 4-bit-activation and the 8-bit fused
+kernels, whose availability question cannot yet be asked safely of the operation
+table — and are left for a later step that first adds the slow-but-correct
+fallback the audit calls for.
 
 **What was actually built for Apple.** The GPU is opened and memory allocated on
 it; GPU programs are compiled at run time from source embedded in the binary, so

@@ -249,6 +249,33 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level — both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
+### Accelerator-seam `S4` — LinearMethod / QuantizationConfig seam (2026-07-23, `CLAIM-BACKEND-SEAM-S4-1`) — byte-identical, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE — structural refactor, no performance claim.**
+`S4` of the accelerator-seam audit lands the `LinearMethod`/`QuantizationConfig` seam
+(`include/vllm/model_executor/layers/{linear.h,quantization/…}`, mirroring vLLM
+`linear.py:141-230` + `base_config.py:20-229`): scheme selection is centralized into a
+policy object chosen ONCE from the checkpoint (the dense model's projections route through
+`method.Apply()`), and 16 shared-layer `device == kCUDA` availability gates in
+`qwen3_5.cpp` + 2 in `dense_nvfp4_gemm.h` + 1 in `qwen3.cpp` became
+`vt::OpRegistered(op, device)` op-table queries. Those ops are registered ONLY for
+`kCUDA`, so on the production build the query is bit-for-bit the old `== kCUDA` test, and
+`OpRegistered` is a memoized relaxed-atomic load after first resolution (the audit's
+"resolve once, cache" pattern) so the decode hot path is unaffected. The engine is
+byte-identical by construction; **no re-grid, no perf number is owed or claimed.**
+**DSR 86 → 67** (`kcuda` 44→25); baseline lowered in the same commit; ratchet + 24-case
+mutation suite green. Gates (dgx `~/s4-build-src/build-cuda`, prod flags
+`-DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a -DVLLM_CPP_TRITON=ON`, clean CUDA
+`-Werror` **0 warnings**; standalone under `flock $HOME/gpu.lock`): **byte-identical
+27B 235/235 · 35B 315/315 · Qwen3-Coder 6/6 · Qwen3-dense 16/16 · OPT 6/6 (96/96 tokens) ·
+DeepSeek-V2 8/8**, goldens content-hash unchanged before/after; new
+`test_linear_method` (scheme×device selection + bf16 apply) + quant suites (nvfp4,
+ct-nvfp4-emulation, gguf-dequant, gguf-keep-quant) green; full CPU ctest green
+(`test_openai_conformance` a `-j4` contention flake, passes standalone). The delicate
+27B-W4A4 / fp8-recipe device gates (ops dual-registered on CPU or realized via a recipe)
+were deliberately LEFT for `S6`, which needs `S5`'s reference-tier fallback first —
+converting them would not have been byte-identical.
+
 **27B has reached effective performance
 PARITY-OR-BETTER with vLLM v0.25.0.** Two independent fully-interleaved exact-grid
 reruns on the full production default set (async + vendored Triton GDN decode cubin

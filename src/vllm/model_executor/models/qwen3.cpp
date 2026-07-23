@@ -40,6 +40,7 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/layers/quantization/compressed_tensors/schemes/nvfp4.h"  // LinearMethod seam
 #include "vllm/model_executor/models/dense_attn_block.h"  // shared AttnBlock + device glue
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // NVFP4 W4A16 dispatch
 #include "vllm/model_executor/models/device_pool.h"     // DevicePool/Pool/ActivePool (shared)
@@ -70,50 +71,23 @@ using v1::CommonAttentionMetadata;
 using namespace dense_attn;
 
 // Dense SwiGLU MLP (qwen3.py::Qwen3MLP=Qwen2MLP): merged gate_up_proj ->
-// SiluAndMul -> down_proj, all bf16. `dh2` is the post-norm hidden [T,H] bf16.
+// SiluAndMul -> down_proj. `dh2` is the post-norm hidden [T,H] bf16.
+//
+// Routed through the LinearMethod seam (S4): the gate_up+SiluAndMul and the
+// down projection each go through a method chosen ONCE by the checkpoint's
+// scheme (bf16 UnquantizedLinearMethod vs NVFP4 W4A16), so this forward no
+// longer carries the `IsNvfp4()` probe, the `device == kCUDA` gate or the
+// `#ifdef VT_MARLIN_NVFP4` fused-path dispatch — they live in the shared
+// quantization scheme headers. Byte-identical: the methods run the exact same
+// vt:: ops in the same order the inline path did.
 DBuf MlpBlock(Dev d, const Qwen3DenseMlpWeights& w, const HfConfig& cfg,
-              const Tensor& dh2, int64_t T) {
-  const int64_t H = cfg.hidden_size;
+              const Tensor& dh2, int64_t /*T*/) {
   const int64_t I = cfg.intermediate_size;
-  if (w.IsNvfp4()) {
-    // NVFP4 W4A16 MLP (compressed-tensors `nvfp4-pack-quantized`). The activation
-    // is bf16 throughout, which is exactly the a16 contract; the ONLY change vs
-    // the BF16 arm above is which GEMM the same [T,H]/[T,I] activations flow
-    // through — the SwiGLU, shapes and residual handling are untouched.
-    DBuf act = [&] {
-#ifdef VT_MARLIN_NVFP4
-      if (d.q.device.type == vt::DeviceType::kCUDA &&
-          dense_nvfp4::MarlinW4A16Enabled() &&
-          dense_nvfp4::GateUpFusedEligible(w.gate_proj_fp4, w.up_proj_fp4)) {
-        // vLLM's shape: ONE Marlin GEMM over the merged gate_up operand
-        // (size_n = 2I) + SiluAndMul on the halves.
-        return dense_nvfp4::GateUpFusedMarlinD(d, dh2, w.gate_proj_fp4,
-                                               w.up_proj_fp4);
-      }
-#endif
-      // SPLIT A/B fallback (and the CPU reference path): two separate GEMMs fed
-      // to the two-input MoeSiluMul — bit-identical to the fused arm's
-      // SiluAndMul over the merged halves (test_ops_moe_grouped probe).
-      DBuf gate = dense_nvfp4::MatmulNvfp4W4A16D(d, dh2, w.gate_proj_fp4,
-                                                 DType::kBF16);
-      DBuf up = dense_nvfp4::MatmulNvfp4W4A16D(d, dh2, w.up_proj_fp4,
-                                               DType::kBF16);
-      DBuf a(d, DType::kBF16, {T, I});
-      vt::MoeSiluMul(d.q, a.t(), gate.t(), up.t());
-      return a;
-    }();
-    return dense_nvfp4::MatmulNvfp4W4A16D(d, act.t(), w.down_proj_fp4,
-                                          DType::kBF16);
-  }
-  Tensor wgu = ResidentWeight(d, w.gate_up_proj);  // [2I, H] raw-NK
-  DBuf gate_up(d, DType::kBF16, {T, 2 * I});
-  vt::MatmulBT(d.q, gate_up.t(), dh2, wgu);
-  DBuf act(d, DType::kBF16, {T, I});
-  vt::SiluAndMul(d.q, act.t(), gate_up.t());  // silu(gate)*up
-  Tensor wdn = ResidentWeight(d, w.down_proj);  // [H, I] raw-NK
-  DBuf out(d, DType::kBF16, {T, H});
-  vt::MatmulBT(d.q, out.t(), act.t(), wdn);
-  return out;
+  auto gate_up = layers::MakeMlpGateUpMethod(w.gate_up_proj, w.gate_proj_fp4,
+                                             w.up_proj_fp4, I);
+  DBuf act = gate_up->Apply(d, dh2);
+  auto down = layers::MakeLinearMethod(w.down_proj, w.down_proj_fp4);
+  return down->Apply(d, act.t(), DType::kBF16);
 }
 
 // One dense decoder layer (qwen3.py::Qwen3DecoderLayer): input norm (std

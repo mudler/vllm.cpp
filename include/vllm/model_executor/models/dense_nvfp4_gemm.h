@@ -429,14 +429,21 @@ inline DBuf MatmulNvfp4W4A16D(Dev d, const Tensor& x, const Nvfp4Weight& w,
   VT_CHECK(!w.IsTrueW4A4(),
            "dense_nvfp4: true-W4A4 weight routed into the W4A16 dispatcher");
 #ifdef VT_MARLIN_NVFP4
-  // Marlin requires a bf16 activation (vLLM's a16 path is bf16/fp16 too).
-  if (d.q.device.type == vt::DeviceType::kCUDA && MarlinW4A16Enabled() &&
-      x.dtype == DType::kBF16)
+  // Marlin requires a bf16 activation (vLLM's a16 path is bf16/fp16 too). The
+  // device gate is an OP-AVAILABILITY question, not a "== kCUDA" question: ask
+  // the vt::OpProvider table whether the Marlin NVFP4 grouped-GEMM is realized
+  // for this device (registered only for kCUDA today, so this is byte-identical
+  // on the production build — accelerator-seam audit class A, work row S4).
+  if (vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) &&
+      MarlinW4A16Enabled() && x.dtype == DType::kBF16)
     return MatmulNvfp4MarlinD(d, x, w, out_dtype);
 #endif
   ++MutableW4A16Stats().fallback_gemms;
   DBuf dout(d, out_dtype, {M, N});
-  if (d.q.device.type == vt::DeviceType::kCUDA) {
+  // Same class-A conversion: the naive redundant-dequant NVFP4 GEMM exists only
+  // where the op table realizes it (kCUDA); elsewhere fall to the host dequant +
+  // bf16 Matmul reference. Byte-identical to the old `device == kCUDA` test.
+  if (vt::OpRegistered(vt::OpId::kMatmulNvfp4, d.q.device.type)) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), x, dw.packed, dw.scale, w.scale2);
   } else {

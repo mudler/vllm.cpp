@@ -1,13 +1,17 @@
 # Accelerator seam audit — do MLX/Vulkan ride vLLM's CUDA-path logic? (`BACKEND-SEAM-AUDIT`)
 
-Status: **AUDIT + PLAN (2026-07-22) with work row `S1` LANDED (2026-07-22).**
-`S1` — the DSR ratchet — is implemented and CI-gated; see **§8** for the as-built
-metric, the re-derived baseline (**86**, not 94) and the re-verified class
-composition. `S2`–`S8` remain plan only; no source file under `src/`/`include/`
-has been changed by this row and no build or GPU run is owed.
-Owners: `CLAIM-BACKEND-SEAM-AUDIT-1` (audit), `CLAIM-BACKEND-SEAM-S1-1` (`S1`).
-Row: **`BACKEND-SEAM-AUDIT`** (`ACTIVE` — `S1` landed, `S2`–`S8` owed). No other
-row moves.
+Status: **AUDIT + PLAN (2026-07-22) with work rows `S1` LANDED (2026-07-22) and
+`S4` LANDED-partial (2026-07-23).** `S1` — the DSR ratchet — is implemented and
+CI-gated; see **§8** for the as-built metric, the re-derived baseline (**86**,
+not 94) and the re-verified class composition. `S4` — the `LinearMethod` /
+`QuantizationConfig` seam — is built and the dense model routed through it, with
+the provably-byte-identical device gates converted to `vt::OpRegistered`; see
+**§9** for the as-built DSR (**86 → 67**), the per-site safety argument and the
+fragile sites deferred to `S6`. `S2`,`S3`,`S5`,`S6`,`S7`,`S8` remain plan only.
+Owners: `CLAIM-BACKEND-SEAM-AUDIT-1` (audit), `CLAIM-BACKEND-SEAM-S1-1` (`S1`),
+`CLAIM-BACKEND-SEAM-S4-1` (`S4`).
+Row: **`BACKEND-SEAM-AUDIT`** (`ACTIVE` — `S1`+`S4` landed, `S2`/`S3`/`S5`–`S8`
+owed). No other row moves.
 
 Audit base: `72f5db2`; `S1` base: `18094ee`. Pins: vLLM
 `/home/mudler/_git/vllm` @ `e24d1b24`; llama.cpp `237ad9b96`; MLX `v0.29.3`.
@@ -339,7 +343,7 @@ claim; none is claimed by this audit.
 | **2** | `S2` | **Reuse-study `W0b-1` residue** — **the include + hard-coded-queue half is ALREADY DONE on main** (§8.2): `model_loader.cpp` now calls `SelectQueue()`, and all four "unconditional" CUDA includes were in fact already `#ifdef`-guarded (an audit measurement error). Remaining: Metal `get_attn_backend_priority()` | 86 | `S1` | Class E and class F are both empty at `18094ee`; what is left is the Metal priority list, which the metric does not count |
 | **3** | `S3` | **Platform capability fields** mirroring `interface.py:914,933,977,1058,1133,1153` + `is_device_capability_family:466`; migrate the **3** remaining class-D sites off `is_cuda()`/`kCUDA` (`runner.cpp:702,1080`, `qwen3_5_dense_weights.cpp:115` — §8.3) | 83 | `S2` | Pure mirror of upstream, mechanical, and it is what makes ROCm a *config* rather than a port. Highest fidelity-per-line in the plan |
 | **4** | `S5` | **Portable reference tier** — register CPU kernels as negative-priority `OpProvider` entries on unified-memory devices, so an unregistered op FALLS BACK instead of throwing. Mirrors `CustomOp.forward_native` | 84 | `S3` | **Changes the economics of every future backend**: op count stops being a correctness gate. Uses only the mechanism we already shipped. Gate = OPT on Metal token-exact with today's 10 kernels |
-| **5** | `S4` | **`QuantizationConfig` + `LinearMethod`/`QuantMethod`** keyed `(scheme, DeviceType)`, mirroring `base_config.py:20-229` + `linear.py:141-230`. Absorbs the `QuantTypeTraits` split (`W0b-3`) and replaces `IsNvfp4()` tensor-name probes | ~55 | `S3` | **The missing coarse seam** (§5). Biggest single leakage reduction available, and the only one that makes a new accelerator's quant work O(1) per scheme instead of O(models) |
+| **5** | `S4` | **`QuantizationConfig` + `LinearMethod`/`QuantMethod` — `DONE` (partial) 2026-07-23 (`CLAIM-BACKEND-SEAM-S4-1`).** The seam is built (`include/vllm/model_executor/layers/{quantization/base_config.h,linear.h,quantization/compressed_tensors/schemes/nvfp4.h}`, mirroring `base_config.py:20-229` + `linear.py:141-230`); the dense model routes through it (`qwen3.cpp` MLP), scheme chosen ONCE by the factory (replaces `IsNvfp4()` probe); the provably-byte-identical class-A/B device gates became `vt::OpRegistered` (§9). See §9 for the as-built DSR and the deferred fragile sites | **67** (as-built §9; not ~55 — the delicate 27B-W4A4/fp8-recipe sites are held for `S6`) | `S3` | **The missing coarse seam** (§5). Biggest single leakage reduction available, and the only one that makes a new accelerator's quant work O(1) per scheme instead of O(models) |
 | **6** | `S6` | **Class A + B: fast-path gates become capability queries.** `env && device==kCUDA && shape` → `OpRegistered(op, device) && supports(shape)`; delete the 5 `VT_CHECK(device==kCUDA)` | ~37 | `S4`, `S5` | Removes the largest single class (**46 sites**, re-measured §8.3). Deferred to rank 6 only because it is hot-path-sensitive and needs `S5` as the safety net and `S4` for the quant half |
 | **7** | `S7` | **Extract the layer library** — `layers/{linear,layernorm,rotary,activation,fused_moe,gdn}` mirroring `model_executor/layers/`, shrinking `qwen3_5.cpp` toward `qwen3_next.py`'s shape | **< 10** | `S4`, `S6` | The structural end-state and the literal answer to "ride the same logical implementations". Largest and riskiest; must be split per family and scheduled against `qwen3_5.cpp` claim windows |
 | **8** | `S8` | **XPU platform, data only** (`xpu.py:121-167` selector policy, no kernels) | < 10 | `S3` | The cheap falsification test: if a THIRD upstream platform ports mechanically with no engine edit, the seam claim is proven rather than argued. Needs no hardware |
@@ -641,3 +645,81 @@ synthetic shared-layer tree and requiring the specific error:
 two real reductions since `72f5db2` both landed *outside* it. Everything else:
 `dense_nvfp4_gemm.h` 5, `deepseek_v2.cpp` 2, `qwen3.cpp` 2, `runner.cpp` 2, and
 seven files with 1 each.
+
+## 9. `S4` LANDED-partial — the LinearMethod seam as built (2026-07-23, `CLAIM-BACKEND-SEAM-S4-1`)
+
+Base `116bc39`. Ships the coarse seam §5 named as missing, routes the dense
+model through it, and converts the provably-byte-identical device gates to the
+op-availability query. **DSR 86 → 67** (`kcuda` 44→25; `is_cuda` 10; `cuda_inc`
+0; `vt_ifdef` 32), baseline lowered in the same commit; the ratchet and its
+24-case mutation suite stay green.
+
+### 9.1 The seam (mirrors vLLM `file:line` both sides)
+
+| Upstream | Ours (new) |
+|---|---|
+| `quantization/base_config.py:20-46` `QuantizeMethodBase` | `include/vllm/model_executor/layers/quantization/base_config.h` `QuantizeMethodBase` |
+| `linear.py:141-181` `LinearMethodBase` (`apply`) | `include/vllm/model_executor/layers/linear.h` `LinearMethodBase::Apply(Dev,x,out)` |
+| `linear.py:184-230` `UnquantizedLinearMethod` (`F.linear`) | `linear.h` `UnquantizedLinearMethod` (`ResidentWeight`+`vt::MatmulBT`) + `UnquantizedMlpGateUpMethod` (`MatmulBT`+`SiluAndMul`) |
+| `compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py:29-32` (`use_a16=True`) | `.../quantization/compressed_tensors/schemes/nvfp4.h` `Nvfp4W4A16LinearMethod` + `Nvfp4W4A16MlpGateUpMethod` (wrap `dense_nvfp4::MatmulNvfp4W4A16D` / `GateUpFusedMarlinD`) |
+| `base_config.py:180` `get_quant_method(layer, prefix)` | `nvfp4.h` `MakeLinearMethod` / `MakeMlpGateUpMethod` — scheme chosen ONCE from the checkpoint's populated weights, replacing the per-call `qwen3.h:60 IsNvfp4()` probe |
+
+`qwen3.cpp`'s dense `MlpBlock` now calls `method->Apply(...)` and carries no
+`IsNvfp4()` probe, no `device == kCUDA`, no `#ifdef VT_MARLIN_NVFP4`. The bf16
+merged-qkv path was deliberately NOT routed (its merge/3-shard A/B must stay
+byte-exact and has no counted DSR).
+
+### 9.2 The device-gate conversion, and why it is byte-identical
+
+`X.device.type == kCUDA` used as an **availability gate** became
+`vt::OpRegistered(<the op that branch calls>, X.device.type)`. `OpRegistered`
+returns true iff a kernel is realized for `(op, device)`; after first resolution
+it is a single relaxed-atomic load (`op_provider.cpp:301`), so no hot-path cost.
+The conversion is bit-for-bit the old test **only when the op is registered for
+`kCUDA` and for no other device** — then the query is true iff `device==kCUDA` on
+*every* device and *every* build. Converted (18 sites; op in parens):
+
+- `dense_nvfp4_gemm.h:433,439` (`kMoeGroupedGemmNvfp4Marlin`, `kMatmulNvfp4`)
+- `qwen3_5.cpp` ×14: `1022,1042,2354,2378` (`kMatmulNvfp4`); `2349,2373,3896`
+  (`kMoeGroupedGemmNvfp4Marlin`, inside `#ifdef VT_MARLIN_NVFP4`); `1712,1730`
+  (`kMatmulNvfp4Cutlass`, inside `#ifdef VT_CUTLASS_NVFP4`); `3493,3510,3613`
+  (`kAttnQkNormRopeGate`); `4571` (`kMoeGroupedGemmNvfp4`); `4584`
+  (`kMoeGroupedGemmBf16`)
+- `qwen3_5.cpp:1144,1166` — the two class-B `VT_CHECK(device==kCUDA)` fp8
+  preconditions became `VT_CHECK(vt::OpRegistered(kMatmulFp8CublasLt, device),…)`
+  (keeps the diagnostic, drops the token).
+
+### 9.3 What was DELIBERATELY NOT converted (deferred to `S6`, needs `S5`)
+
+Byte-identity is SACRED, so any gate whose op is **not `kCUDA`-only** was left
+alone — converting it would flip behaviour on a CPU device (or disable the fast
+path on CUDA):
+
+- 27B TRUE-W4A4 fp4-activation gates `2343,2370,2011,1921,4809,4862,1567`: bottom
+  out at `kMatmulNvfp4Fp4`/`kScaledFp4Quant`/`kSiluMulFp4Quant` (registered for
+  **both** `kCUDA` and `kCPU`) or `kSigmoidGateFp4Quant` (`kCPU`-only).
+- fp8 fused gates `2939,3441` (`kRmsNormGatedQuantFp8` — realized via a recipe,
+  NOT directly registered, so `OpRegistered` would be false and DISABLE the fast
+  path) and `4695` (`kRmsNormQuantFp8` — dual `kCUDA`+`kCPU`).
+- FA2 dtype gates `3647,3653` (dtype-selection into `kPagedAttention`;
+  `OpRegistered` cannot distinguish the FA2 sub-kernel — class D, not A).
+- class-D residency/stream/graph sites `704,725,2500,4292,5996,6198,5298` and the
+  borderline merged-projection layout gates `1272,2656,2752,2780,3151` (same op
+  both branches). These are `S3`/`S6`/`S7` work.
+
+This is why the as-built DSR is **67**, not the plan's optimistic `~55`: the
+remaining 25 `kcuda` are the fragile fused/quant fast paths that need `S5`'s
+reference-tier fallback as a safety net before they can move byte-identically.
+
+### 9.4 Gates (all green)
+
+Clean CUDA `-Werror` **0 warnings** (dgx `~/s4-build-src/build-cuda`, prod flags
+`-DVLLM_CPP_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121a -DVLLM_CPP_TRITON=ON
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0`) + clean CPU `-Werror`. Standalone
+under `flock $HOME/gpu.lock`, one big-model test at a time:
+**27B 235/235 · 35B 315/315 · Qwen3-Coder 6/6 · Qwen3-dense 16/16 · OPT 6/6
+(96/96 tokens) · DeepSeek-V2 8/8** — all byte-identical, goldens content-hash
+`0001b491…` unchanged before/after (no golden regenerated). New
+`test_linear_method` (scheme×device selection + bf16 apply) green on CPU + CUDA;
+quant suites (nvfp4-dequant, ct-nvfp4-emulation, gguf-dequant, gguf-keep-quant)
+green; full CPU ctest green. DSR checker + 24-case mutation suite green.

@@ -1019,7 +1019,7 @@ std::vector<float> MatmulNvfp4F32(Dev d, const std::vector<uint16_t>& x, int64_t
   const int64_t N = w.n;
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
   DBuf dout(d, DType::kF32, {M, N});
-  if (d.q.device.type == vt::DeviceType::kCUDA) {
+  if (vt::OpRegistered(vt::OpId::kMatmulNvfp4, d.q.device.type)) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), dx.t(), dw.packed, dw.scale, w.scale2);
   } else {
@@ -1039,7 +1039,7 @@ std::vector<uint16_t> MatmulNvfp4Bf16(Dev d, const std::vector<uint16_t>& x, int
   const int64_t N = w.n;
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
   DBuf dout(d, DType::kBF16, {M, N});
-  if (d.q.device.type == vt::DeviceType::kCUDA) {
+  if (vt::OpRegistered(vt::OpId::kMatmulNvfp4, d.q.device.type)) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), dx.t(), dw.packed, dw.scale, w.scale2);
   } else {
@@ -1141,7 +1141,7 @@ bool DenseCublasLtFp8Enabled() {
 // the CUDA+cutlass load, VT_DENSE_NATIVE).
 DBuf MatmulFp8CutlassD(Dev d, const Tensor& x, const Fp8Weight& w, DType out_dtype) {
   const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
-  VT_CHECK(d.q.device.type == vt::DeviceType::kCUDA,
+  VT_CHECK(vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, d.q.device.type),
            "MatmulFp8CutlassD: the fp8 W8A8 path is CUDA-only");
   DBuf a_fp8(d, DType::kI8, {M, K});
   vt::QuantFp8Static(d.q, a_fp8.t(), x, w.input_scale);
@@ -1163,7 +1163,7 @@ DBuf MatmulFp8CutlassD(Dev d, const Tensor& x, const Fp8Weight& w, DType out_dty
 // MatmulFp8CutlassD(x) when a_fp8 == QuantFp8Static(x, w.input_scale).
 DBuf MatmulFp8CutlassPreQuantD(Dev d, const Tensor& a_fp8, const Fp8Weight& w, DType out_dtype) {
   const int64_t M = a_fp8.shape[0], N = w.n;
-  VT_CHECK(d.q.device.type == vt::DeviceType::kCUDA,
+  VT_CHECK(vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, d.q.device.type),
            "MatmulFp8CutlassPreQuantD: the fp8 W8A8 path is CUDA-only");
   Tensor wdev = ResidentFp8(d, w);
   DBuf dout(d, out_dtype, {M, N});
@@ -1709,7 +1709,7 @@ bool MergedGateUpEligible(const DenseMlpWeights& w, Dev d) {
   const Nvfp4Weight& gate = w.gate_proj_fp4;
   const Nvfp4Weight& up = w.up_proj_fp4;
   return MergedGateUpEnabled() && NvfpCutlassEnabled() &&
-         Bf16GemmOutEnabled() && d.q.device.type == vt::DeviceType::kCUDA &&
+         Bf16GemmOutEnabled() && vt::OpRegistered(vt::OpId::kMatmulNvfp4Cutlass, d.q.device.type) &&
          !gate.Empty() && !up.Empty() && gate.IsTrueW4A4() &&
          up.IsTrueW4A4() && TrueW4A4Enabled() && gate.n == up.n &&
          gate.k == up.k && gate.weight_global_scale_inv > 0.0F &&
@@ -1727,7 +1727,7 @@ bool MergedQkvEligible(const FullAttnLayerWeights& w, Dev d,
   // reference rather than materializing split-copy kernels.
   return packed_consumers && MergedQkvEnabled() &&
          NvfpCutlassEnabled() && Bf16GemmOutEnabled() &&
-         d.q.device.type == vt::DeviceType::kCUDA && !q.Empty() && !k.Empty() &&
+         vt::OpRegistered(vt::OpId::kMatmulNvfp4Cutlass, d.q.device.type) && !q.Empty() && !k.Empty() &&
          !v.Empty() && q.IsTrueW4A4() && k.IsTrueW4A4() &&
          v.IsTrueW4A4() && TrueW4A4Enabled() && q.k == k.k && q.k == v.k &&
          q.weight_global_scale_inv > 0.0F &&
@@ -2346,12 +2346,12 @@ DBuf MatmulNvfp4F32D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
   // NVFP4 W4A16 dense (shared expert / lm_head): the load-time-repacked Marlin
   // GEMM replaces the naive redundant-dequant kernel when VT_NVFP4_MARLIN=1.
   // Marlin requires a bf16 activation (the 35B dense NVFP4 sinks all are).
-  if (d.q.device.type == vt::DeviceType::kCUDA && !w.IsTrueW4A4() && MarlinMoeEnabled() &&
+  if (vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) && !w.IsTrueW4A4() && MarlinMoeEnabled() &&
       x.dtype == DType::kBF16)
     return MatmulNvfp4MarlinD(d, x, w, DType::kF32);
 #endif
   DBuf dout(d, DType::kF32, {M, N});
-  if (d.q.device.type == vt::DeviceType::kCUDA) {
+  if (vt::OpRegistered(vt::OpId::kMatmulNvfp4, d.q.device.type)) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), x, dw.packed, dw.scale, w.scale2);
   } else {
@@ -2370,12 +2370,12 @@ DBuf MatmulNvfp4Bf16D(Dev d, const Tensor& x, const Nvfp4Weight& w) {
   if (d.q.device.type == vt::DeviceType::kCUDA && w.IsTrueW4A4() && TrueW4A4Enabled())
     return MatmulNvfp4Fp4D(d, x, w, DType::kBF16);
 #ifdef VT_MARLIN_NVFP4
-  if (d.q.device.type == vt::DeviceType::kCUDA && !w.IsTrueW4A4() && MarlinMoeEnabled() &&
+  if (vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) && !w.IsTrueW4A4() && MarlinMoeEnabled() &&
       x.dtype == DType::kBF16)
     return MatmulNvfp4MarlinD(d, x, w, DType::kBF16);
 #endif
   DBuf dout(d, DType::kBF16, {M, N});
-  if (d.q.device.type == vt::DeviceType::kCUDA) {
+  if (vt::OpRegistered(vt::OpId::kMatmulNvfp4, d.q.device.type)) {
     Nvfp4Dev dw = ResidentNvfp4(d, w);
     vt::MatmulNvfp4(d.q, dout.t(), x, dw.packed, dw.scale, w.scale2);
   } else {
@@ -3490,7 +3490,7 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   const bool fp4_attn = !w.q_proj_fp4.Empty();
   const bool packed_consumers =
       FuseAttnPreambleOn(fp4_attn) && rot > 0 &&
-      d.q.device.type == vt::DeviceType::kCUDA;
+      vt::OpRegistered(vt::OpId::kAttnQkNormRopeGate, d.q.device.type);
   FullAttnQkvOutput qkv =
       ProjectFullAttnQkv(d, w, h, T, h_fp8, packed_consumers);
   const bool fp4 = qkv.fp4;
@@ -3507,7 +3507,7 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
   DBuf dq3(d, DType::kF32, {T, Hq, Dh});
   DBuf dk3(d, DType::kF32, {T, Hkv, Dh});
   DBuf gatef(d, DType::kF32, {T, Hq, Dh});
-  if (FuseAttnPreambleOn(fp4) && rot > 0 && d.q.device.type == vt::DeviceType::kCUDA) {
+  if (FuseAttnPreambleOn(fp4) && rot > 0 && vt::OpRegistered(vt::OpId::kAttnQkNormRopeGate, d.q.device.type)) {
     DBuf dpos(d, DType::kI32, {T}, positions.data());
     DBuf cos_sin(d, DType::kF32, {T, rot});
     vt::RopeCosSinCache(d.q, cos_sin.t(), dpos.t(), vt::RopeArgs{base, rot});
@@ -3610,7 +3610,7 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   const bool fp4_attn = !w.q_proj_fp4.Empty();
   const bool packed_consumers =
       FuseAttnPreambleOn(fp4_attn) && sdi.has_attn_cos_sin &&
-      d.q.device.type == vt::DeviceType::kCUDA;
+      vt::OpRegistered(vt::OpId::kAttnQkNormRopeGate, d.q.device.type);
   FullAttnQkvOutput qkv_out =
       ProjectFullAttnQkv(d, w, h, T, h_fp8, packed_consumers);
   const bool fp4 = qkv_out.fp4;
@@ -3893,7 +3893,7 @@ SharedExpertParts SharedExpertUngated(Dev d, const MoeBlockWeights& w, const HfC
   // silu input values match the unfused path bit-for-bit given equal GEMM
   // outputs: unfused MatmulNvfp4F32D is the SAME Marlin bf16 GEMM upcast to f32
   // (value-preserving), and MoeSiluMul/SiluAndMul share the f32 silu math.
-  if (fp4 && d.q.device.type == vt::DeviceType::kCUDA && MarlinMoeEnabled() &&
+  if (fp4 && vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4Marlin, d.q.device.type) && MarlinMoeEnabled() &&
       h.dtype == DType::kBF16 &&
       SharedGateUpFusedEligible(w.shared_gate_proj_fp4, w.shared_up_proj_fp4)) {
     DBuf sact = SharedGateUpFusedMarlinD(d, h, w.shared_gate_proj_fp4, w.shared_up_proj_fp4);
@@ -4568,7 +4568,7 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   // The bf16 / CPU / GGUF reference below keeps the per-expert token-gather
   // path on host (not the capture target); the fused output is per-pair
   // bit-identical to it (same NVFP4 decode).
-  if (fp4 && d.q.device.type == vt::DeviceType::kCUDA) {
+  if (fp4 && vt::OpRegistered(vt::OpId::kMoeGroupedGemmNvfp4, d.q.device.type)) {
 #ifdef VT_MARLIN_NVFP4
     if (MarlinMoeEnabled()) return MoeBlockFusedMarlinCuda(d, w, cfg, dh, T);
 #endif
@@ -4581,7 +4581,7 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
   // LAYOUT-GUARDED (MoeBf16FastLayoutOk): only the [K,N] Matmul-B (`nk == false`)
   // orientation the grouped kernel can read; nk=true producers (35B MTP) fall
   // through to the reference loop.
-  if (!fp4 && d.q.device.type == vt::DeviceType::kCUDA && MoeBf16FastEnabled() &&
+  if (!fp4 && vt::OpRegistered(vt::OpId::kMoeGroupedGemmBf16, d.q.device.type) && MoeBf16FastEnabled() &&
       !w.expert_gate.empty() && MoeBf16FastLayoutOk(w, cfg))
     return MoeBlockBf16Cuda(d, w, cfg, dh, T);
 

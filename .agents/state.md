@@ -19942,3 +19942,41 @@ kMatmul 16 % + kMatmulBT 14 % = 80 %). G6 ports llama.cpp's Arm i8mm `nrc==2`
   virtuals + registration + `KVTransferConfig`, generalizing this one connector
   for `KV-CONNECTORS`; adds the worker-side GPU load + a CLI switch); then W6 the
   LMCache go/no-go, W7 named per-sequence save/restore.
+
+## 2026-07-23 — accelerator-seam `S4`: LinearMethod / QuantizationConfig seam (`CLAIM-BACKEND-SEAM-S4-1`, base `116bc39`, worktree `s4-linearmethod`)
+
+- **WHAT.** Landed (partial, byte-identical) `S4` of
+  [accelerator-seam-audit.md](specs/accelerator-seam-audit.md) §9: the coarse
+  per-(scheme, device) `LinearMethod` / `QuantizationConfig` seam vLLM keeps in
+  `model_executor/layers/quantization/` and every model reuses, ported vt::-native.
+  New: `include/vllm/model_executor/layers/quantization/base_config.h`
+  (`QuantizeMethodBase`), `.../layers/linear.h` (`LinearMethodBase`,
+  `UnquantizedLinearMethod`, `MlpGateUpMethodBase`, `UnquantizedMlpGateUpMethod`),
+  `.../layers/quantization/compressed_tensors/schemes/nvfp4.h`
+  (`Nvfp4W4A16LinearMethod`, `Nvfp4W4A16MlpGateUpMethod`, `MakeLinearMethod`,
+  `MakeMlpGateUpMethod`). Mirrors `linear.py:141-230` + `base_config.py:20-229`.
+- **ROUTING.** `qwen3.cpp` dense `MlpBlock` now calls `method->Apply()`; scheme
+  chosen ONCE by the factory from the checkpoint's populated weights (retires the
+  per-call `qwen3.h:60 IsNvfp4()` probe). The bf16 merged-qkv path was NOT routed
+  (its merge/3-shard A/B must stay byte-exact; it has no counted DSR).
+- **DSR DROP 86 → 67.** 18 shared-layer `device == kCUDA` availability gates →
+  `vt::OpRegistered(<op>, device)` (14 class-A + 2 class-B in `qwen3_5.cpp`, 2 in
+  `dense_nvfp4_gemm.h`, 1 in `qwen3.cpp`). Byte-identical because every converted
+  op is registered ONLY for `kCUDA`. `kcuda` 44→25; baseline lowered same commit;
+  ratchet + 24-case mutation suite green.
+- **DEFERRED (correctly, to `S6` behind `S5`).** The 27B-W4A4 fp4-activation gates
+  and the fp8 fused-recipe gates use ops dual-registered on CPU (kMatmulNvfp4Fp4,
+  kScaledFp4Quant, kSiluMulFp4Quant, kRmsNormQuantFp8), kCPU-only
+  (kSigmoidGateFp4Quant), or NOT directly registered (kRmsNormGatedQuantFp8) — for
+  these `OpRegistered` is NOT byte-identical to `== kCUDA`, so they were left. This
+  is why the as-built DSR is 67, not the plan's optimistic ~55.
+- **GATES (all green).** Clean CUDA `-Werror` 0 warn (dgx `~/s4-build-src/build-cuda`)
+  + clean CPU `-Werror`. Standalone under `flock $HOME/gpu.lock`, byte-identical:
+  27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense 16/16, OPT 6/6 (96/96),
+  DeepSeek-V2 8/8; goldens content-hash `0001b491…` unchanged before/after. New
+  `test_linear_method` green (CPU + CUDA); quant suites green; full CPU ctest green
+  (`test_openai_conformance` a `-j4` flake, passes standalone). Checkers bare RC=0.
+- **NEXT / resume point.** `S3` (Platform capability fields, mechanical) then
+  `S5` (the negative-priority reference tier) which UNBLOCKS `S6` — converting the
+  remaining fragile fp4-act/fp8-recipe gates once a slow-but-correct fallback
+  exists. `S7` (extract the layer library from `qwen3_5.cpp`) is the end-state.

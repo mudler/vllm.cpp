@@ -44,7 +44,8 @@
 // mechanical): PP-general batch queue depth > 2 (ENG-BATCH-QUEUE),
 // grammar_output / structured_output_manager (M3),
 // DP / EngineCoreProc / ZMQ, mm_receiver_cache (multimodal),
-// post_step / take_draft_token_ids (spec-decode), the utility handlers,
+// post_step / take_draft_token_ids: LANDED as an inert seam for SPEC-MTP I2
+// (check_for_draft_tokens_ false by default -> no-op). the utility handlers,
 // _process_aborts_queue / aborts_queue, log_stats / stats / iteration details,
 // _initialize_kv_caches (the runner allocates KV in Task 4), and the whole
 // __init__ config/plugin/GC-freeze setup (T0 wires refs directly).
@@ -92,11 +93,18 @@ class EngineCore {
   // the M1.8 tests building a bare EngineCore; when null, structured output is a
   // no-op. When provided, it must be the SAME manager the Scheduler was built
   // with (so get_grammar_bitmask/should_advance see the compiled grammars).
+  // check_for_draft_tokens (core.py:186-190): whether to pull the drafter's
+  // out-of-band proposal after each step and feed it to the scheduler. Set true
+  // ONLY when a speculator is configured AND async scheduling is off (in async
+  // mode the worker updates drafts itself). Default false = the no-speculator
+  // production path — post_step is a no-op, so step() is byte-identical.
   EngineCore(Scheduler& scheduler, Executor& executor,
-             StructuredOutputManager* structured_output_manager = nullptr)
+             StructuredOutputManager* structured_output_manager = nullptr,
+             bool check_for_draft_tokens = false)
       : scheduler_(scheduler),
         executor_(executor),
-        structured_output_manager_(structured_output_manager) {}
+        structured_output_manager_(structured_output_manager),
+        check_for_draft_tokens_(check_for_draft_tokens) {}
 
   // add_request: hand a new request to the scheduler (which takes ownership).
   // Mirrors EngineCore.add_request -> scheduler.add_request (validation +
@@ -128,6 +136,14 @@ class EngineCore {
   // requests whose bitmask must wait on the prior step's tokens.
   std::pair<std::map<int, EngineCoreOutputs>, bool> step_with_batch_queue();
 
+  // post_step (core.py:509-517): after a step, if a speculator is configured and
+  // async scheduling is off, take the runner's out-of-band draft tokens
+  // (executor.take_draft_token_ids) and install them on their requests for the
+  // next verify step (scheduler.update_draft_token_ids). No-op when
+  // check_for_draft_tokens_ is false (default) or the model did not execute, so
+  // the non-speculative path is byte-identical. Called at the tail of step().
+  void post_step(bool model_executed);
+
   // has_batch_queue_work (core.py:1247-1253 `bool(batch_queue)`): whether the
   // batch queue still holds an un-consumed batch. The busy loop must keep
   // stepping to drain it even after the scheduler has no more requests.
@@ -151,6 +167,10 @@ class EngineCore {
   // The engine's StructuredOutputManager (null when structured output is not
   // wired). Non-owning; must outlive the EngineCore. See the ctor note.
   StructuredOutputManager* structured_output_manager_ = nullptr;
+
+  // Whether to poll the drafter for spec tokens after each step (see the ctor
+  // note). False on the default (no-speculator) path -> post_step is inert.
+  bool check_for_draft_tokens_ = false;
 
   // Batch queue (core.py:196-202). batch_queue_size_ == max_concurrent_batches
   // (1 = synchronous step(); 2 = depth-2 overlap under async scheduling). The

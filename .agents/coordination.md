@@ -549,3 +549,25 @@ list of what the project supports.
   kernel-matrix (`KERNEL-SSM-MAMBA`), ledger, state, README, BENCHMARKS.
   `benchmark_binding=false`; the orchestrator runs the binding re-grid for the
   in-situ c1–c4 effect.
+
+- **2026-07-24 — `SPEC-MTP` I2 (scheduler-half) LANDED in worktree `mtp-i2-sched`
+  (branch `mtp-i2-scheduler`, base `61f3e85`; NOT pushed — the orchestrator owns
+  the merge, `origin/main` is at `ba4dd62`).** Host-side spec-decode
+  scheduler/engine plumbing plus the **FROZEN spec-metadata ABI** that I3
+  (rejection sampler) and I5 (verify/propose runner) code against — the
+  authoritative ABI table with upstream file:line per declaration is
+  [mtp-spec-decode.md §2.7](specs/mtp-spec-decode.md). Files touched:
+  `include/vllm/config/speculative.h` (NEW), `v1/request.h`,
+  `v1/core/sched/scheduler.{h,cpp}`, `v1/core/sched/async_scheduler.cpp`,
+  `v1/engine/{core.h,core.cpp,types.h}`, `v1/executor/executor.{h,cpp}`,
+  `v1/worker/gpu/{input_batch.h,input_batch.cpp,model_runner_base.h}`, plus
+  `tests/vllm/v1/test_scheduler.cpp` and
+  `tests/vllm/v1/worker/test_input_batch.cpp`. **DEFAULT-OFF / INERT** (no
+  `SpeculativeConfig` ⇒ `num_lookahead_tokens == 0` ⇒ byte-identical engine), so
+  it does not collide with any running model or kernel campaign and no model gate
+  moves. Row `SPEC-MTP` **STAYS `GATING`** — plumbing buys no gate. **NOTE for
+  whoever picks up I3/I5:** `SchedulerOutput::scheduled_spec_decode_tokens`
+  already existed as an unpopulated field; I2 is the first code to populate it,
+  so do not re-declare it. **PRE-EXISTING BREAKAGE observed, not owned by this
+  work:** `test_model_loader_gguf` and `test_model_registry` fail on base
+  `61f3e85` (verified with this branch's changes stashed) — an unclaimed fix.

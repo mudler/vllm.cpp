@@ -228,6 +228,43 @@ h = norm(h)                                          # -> lm_head (shared)
   (non-"align" mamba cache mode; **"all" prefix-caching mode is rejected** for
   Qwen3_5MTP, `qwen3_5_mtp.py:206-210` — mirror that check).
 
+### 2.7 FROZEN spec-metadata ABI (SPEC-MTP **I2 scheduler-half, LANDED**)
+
+I2 landed the host-side scheduler/engine plumbing and **FROZE** the metadata ABI
+the remaining increments build against. I3 (rejection sampler) and I5 (verify /
+propose runner) code against exactly these declarations — they are stable, and
+every one of them is **inert on the production default path** (no
+`SpeculativeConfig` ⇒ `num_lookahead_tokens == 0` ⇒ nothing below is ever
+populated, so the engine is byte-identical to the pre-spec engine).
+
+| # | Declaration | Where | Mirrors @ `e24d1b24` |
+|---|---|---|---|
+| 1 | `struct SpeculativeConfig { std::string method; std::optional<int> num_speculative_tokens; int n_predict; }` + `ResolveMtp(mtp_num_hidden_layers, user_k=nullopt)`, `ResolvedNumSpeculativeTokens()`, `use_eagle()`, `uses_draft_model()`, `use_dflash()`, `NumLookaheadTokens()` | `include/vllm/config/speculative.h` (NEW) | `vllm/config/speculative.py:480-489,865-875,1163-1195`; lookahead rule `sched/scheduler.py:275-292` |
+| 2 | `struct DraftTokenIds { std::vector<std::string> req_ids; std::vector<std::vector<int32_t>> draft_token_ids; }` | `include/vllm/v1/engine/types.h` | `vllm/v1/outputs.py:310-315` |
+| 3 | `std::vector<int32_t> Request::spec_token_ids` + `int Request::NumTokensWithSpec()` | `include/vllm/v1/request.h` | `vllm/v1/request.py:152,251-252` |
+| 4 | `SchedulerOutput::scheduled_spec_decode_tokens` (`map<string, vector<int32_t>>`) — field ALREADY existed; I2 is the first code to POPULATE it | `include/vllm/v1/core/sched/output.h:147` (unchanged) | `sched/scheduler.py:593-609` |
+| 5 | `Scheduler(..., std::optional<SpeculativeConfig> speculative_config = std::nullopt)` + `void Scheduler::update_draft_token_ids(const DraftTokenIds&)` | `include/vllm/v1/core/sched/scheduler.h` | `sched/scheduler.py:275-292,1937-1957` |
+| 6 | `virtual std::optional<DraftTokenIds> ModelRunnerBase::take_draft_token_ids()` (default `nullopt`) and the `Executor::take_draft_token_ids()` pass-through | `include/vllm/v1/worker/gpu/model_runner_base.h`, `include/vllm/v1/executor/executor.h` | `model_runner.py:1483-1489`; `executor/abstract.py` |
+| 7 | `EngineCore(..., bool check_for_draft_tokens = false)` + `void EngineCore::post_step(bool model_executed)` | `include/vllm/v1/engine/core.h` | `v1/engine/core.py:186-190,509-517` |
+| 8 | `InputBatch::num_accepted_tokens` (per-slot, seeded to 1) + `InputBatch::update_req_spec_token_ids(req_index, req_id, scheduled_spec_tokens)`; `spec_token_ids` per-slot list now populated | `include/vllm/v1/worker/gpu/input_batch.h` | `gpu_input_batch.py:240-243,286,484-509` |
+
+**Behavior landed** (all gated behind an actually-configured speculator):
+`num_tokens_with_spec` in the running-loop budget; a running request carrying
+drafts is scheduled for `1 + len(spec_token_ids)` tokens and recorded in
+`scheduled_spec_decode_tokens` (prefix-clamped when the budget fits only part
+of the drafts), then `spec_token_ids` is cleared; the `num_computed_tokens`
+rollback by `num_rejected` on `update_from_output`; and
+`update_draft_token_ids` installing fresh drafts (skipping unknown/finished
+requests, and clearing rather than installing for a request still in a prefill
+chunk).
+
+**STILL DEFERRED** (unchanged by I2, called out so I3/I5 do not assume them):
+the first-decode-step spec **padding** (placeholder `-1` drafts /
+`num_spec_tokens_to_schedule` / `num_invalid_spec_tokens`), the dynamic-SD
+lookup, the async draft-in-output path
+(`update_draft_token_ids_in_output`, `scheduler.py:1959`), and the
+structured-output grammar validation of proposed drafts.
+
 ## 3. GDN linear-state rollback — the mechanism (B5's hard problem, answered)
 
 Linear-attention state is not a paged KV you can truncate. Upstream solves
@@ -331,7 +368,11 @@ spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
   both checkpoints.
 - **M-mtp-1 — 27B k=1 greedy e2e (includes the GDN spec path — see §0).**
   Scheduler plumbing + prepare-prefill kernel + greedy rejection + GDN slot
-  mechanism (k+1=2 slots). Gate: token-for-token 16/16 vs
+  mechanism (k+1=2 slots). **I2 (scheduler-half) is LANDED — see §2.7 for the
+  frozen metadata ABI; the remaining I3/I5 work codes against it.** The row
+  stays `GATING`: I2 is host-side plumbing that is INERT by default and buys no
+  gate on its own; nothing is claimed until the e2e token gate below runs.
+  Gate: token-for-token 16/16 vs
   `vllm --speculative-config '{"method":"mtp","num_speculative_tokens":1}'`
   greedy, AND acceptance-rate telemetry within noise of vLLM's on the same
   prompts. Then A/B decode throughput + TPOT (expected from B5/community:

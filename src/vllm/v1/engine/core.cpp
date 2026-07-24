@@ -83,9 +83,26 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
     outputs_by_client.emplace(client_index, std::move(engine_core_outputs));
   }
 
+  // core.py:509-517 post_step: feed the drafter's out-of-band proposal back to
+  // the scheduler for the next step. Inert unless a speculator is configured.
+  const bool model_executed = scheduler_output.total_num_scheduled_tokens > 0;
+  post_step(model_executed);
+
   // core.py:508 return outputs, scheduler_output.total_num_scheduled_tokens > 0.
-  return {std::move(outputs_by_client),
-          scheduler_output.total_num_scheduled_tokens > 0};
+  return {std::move(outputs_by_client), model_executed};
+}
+
+void EngineCore::post_step(bool model_executed) {
+  // core.py:509-517. Under async scheduling the draft token ids are updated in
+  // the worker process instead (the synchronous step() is the only caller here,
+  // so `not async_scheduling` holds — the batch-queue path never calls this).
+  if (!check_for_draft_tokens_ || !model_executed) {
+    return;
+  }
+  std::optional<DraftTokenIds> draft_token_ids = executor_.take_draft_token_ids();
+  if (draft_token_ids.has_value()) {
+    scheduler_.update_draft_token_ids(*draft_token_ids);
+  }
 }
 
 std::pair<std::map<int, EngineCoreOutputs>, bool>

@@ -110,6 +110,19 @@ struct ModelRunnerOutput {
   std::vector<std::vector<int32_t>> sampled_token_ids;
 };
 
+// DraftTokenIds (vllm/v1/outputs.py:310-315): the drafter's proposal for the
+// NEXT verify step, produced OUT-OF-BAND by the runner (take_draft_token_ids)
+// and fed back to the scheduler by the engine core (core.py:511-517 ->
+// Scheduler::update_draft_token_ids). Parallel arrays: draft_token_ids[i] is the
+// list of draft ids for req_ids[i]. Frozen SPEC-MTP metadata ABI (I2) — I5's
+// runner populates it, I3's rejection sampler verifies against it.
+struct DraftTokenIds {
+  // [num_reqs].
+  std::vector<std::string> req_ids;
+  // num_reqs x num_draft_tokens (ragged; per-request draft count can differ).
+  std::vector<std::vector<int32_t>> draft_token_ids;
+};
+
 // EngineCoreOutput (vllm/v1/engine/__init__.py): the per-request core -> frontend
 // delta. msgspec.Struct upstream; a plain value carrier here.
 struct EngineCoreOutput {

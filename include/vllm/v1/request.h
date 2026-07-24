@@ -15,7 +15,7 @@
 //   - prompt_embeds / prompt_is_token_ids / _prompt_embeds_per_block_hashes,
 //     mm_features (multimodal), pooling_params,
 //     lora_request, cache_salt (prefix caching salt), events /
-//     kv_transfer_params, spec_token_ids,
+//     kv_transfer_params,
 //     client_index, streaming / resumable
 //     state, prefill_stats, last_sched_seq (defer_block_free fence),
 //     num_nans_in_logits.
@@ -150,6 +150,15 @@ struct Request {
 
   // Appended to during decode via AppendOutputToken.
   std::vector<int32_t> output_token_ids;
+  // Draft (speculative) token ids proposed for the NEXT verify step (upstream
+  // Request.spec_token_ids, request.py:152). Empty by default; set by
+  // Scheduler::update_draft_token_ids after the drafter proposes, CONSUMED and
+  // cleared in schedule() when the verify step is scheduled (mirror
+  // scheduler.py:593-609). Un-deferred for SPEC-MTP (I2 scheduler plumbing).
+  // With no speculator configured num_lookahead_tokens == 0 and this stays empty
+  // on every request, so num_tokens_with_spec == num_tokens (inert / byte-
+  // identical to the pre-spec scheduler).
+  std::vector<int32_t> spec_token_ids;
   int num_computed_tokens = 0;
   // How many times this request has been preempted (upstream
   // Request.num_preemptions). Incremented by Scheduler::preempt_request; read
@@ -207,6 +216,14 @@ struct Request {
 
   // num_tokens: len(_all_token_ids) == prompt + output (no prompt_embeds in T0).
   int NumTokens() const;
+  // num_tokens_with_spec (request.py:251-252): len(_all_token_ids) +
+  // len(spec_token_ids) — the token count the scheduler's running loop targets so
+  // the pending draft tokens are scheduled for verification alongside the sampled
+  // token. Equals NumTokens() when spec_token_ids is empty (no speculator), so
+  // the default scheduler path is unchanged. Un-deferred for SPEC-MTP (I2).
+  int NumTokensWithSpec() const {
+    return NumTokens() + static_cast<int>(spec_token_ids.size());
+  }
   // num_output_tokens: len(_output_token_ids).
   int NumOutputTokens() const;
   // max_tokens (request.py:106-110): the request's output-token cap. Upstream

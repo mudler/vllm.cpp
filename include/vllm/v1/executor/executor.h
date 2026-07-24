@@ -22,7 +22,8 @@
 //   - initialize_from_config / determine_available_memory / get_kv_cache_specs
 //     / supported_tasks / add_lora / sleep / wake_up / check_health / shutdown
 //     and the rest of the WorkerBase RPC surface,
-//   - take_draft_token_ids (spec-decode), KVOutputAggregator (P/D transfer).
+//   - KVOutputAggregator (P/D transfer). take_draft_token_ids is a pass-through
+//     seam as of SPEC-MTP I2 (nullopt on the default path).
 // grammar_output arg to sample_tokens is THREADED as of M3.4 Task 2 (forwarded
 // to the runner; Task 3 consumes it).
 #pragma once
@@ -70,6 +71,12 @@ class Executor {
   // runner_supports_async: pass-through to the runner's compat advertisement,
   // consumed by the engine wiring's SchedulerConfig::ResolveAsyncScheduling.
   bool runner_supports_async() const { return runner_.runner_supports_async(); }
+
+  // take_draft_token_ids: pass-through to the runner's out-of-band drafter output
+  // (abstract.py take_draft_token_ids -> collective_rpc). nullopt on the default
+  // path (no speculator). Consumed by EngineCore::post_step. Frozen SPEC-MTP
+  // seam (I2); the drafting runner (I5) supplies the real values.
+  std::optional<DraftTokenIds> take_draft_token_ids();
 
  private:
   ModelRunnerBase& runner_;

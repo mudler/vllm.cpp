@@ -3,7 +3,10 @@
 #include "vllm/v1/core/sched/async_scheduler.h"
 
 #include <cassert>
+#include <map>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace vllm::v1 {
 
@@ -13,9 +16,14 @@ void AsyncScheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
   // flush finished/preempted sets), then add this step's placeholders.
   Scheduler::update_after_schedule(scheduler_output);
 
-  // spec_decode_tokens is empty at T0 (no draft tokens), and
-  // num_spec_tokens_to_schedule == 0, so the _spec_token_placeholders reset and
-  // the per-request spec_token_ids assignment are inert and omitted.
+  // async_scheduler.py:20-21. The per-step scheduled draft tokens (empty on the
+  // default no-speculator path; the first-decode-step PADDING via
+  // _spec_token_placeholders / num_spec_tokens_to_schedule and the async
+  // worker-fill assignment `request.spec_token_ids = placeholders` are DEFERRED
+  // with the async-draft-in-output path — SPEC-MTP I2 lands only the placeholder
+  // COUNT so num_output_placeholders stays balanced under rejection rollback).
+  const std::map<std::string, std::vector<int32_t>>& spec_decode_tokens =
+      scheduler_output.scheduled_spec_decode_tokens;
   for (const auto& [req_id, num_scheduled] :
        scheduler_output.num_scheduled_tokens) {
     (void)num_scheduled;
@@ -33,8 +41,18 @@ void AsyncScheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
          request->num_output_placeholders > 0);
 
     // async_scheduler.py:38-41: reserve num_sampled_tokens_per_step placeholders
-    // for the token(s) this step samples (+ cur_num_spec_tokens == 0 at T0).
-    request->num_output_placeholders += num_sampled_tokens_per_step();
+    // for the token(s) this step samples, PLUS the scheduled draft tokens for
+    // this request so the returning verify step's rejection rollback
+    // (num_output_placeholders -= num_rejected) and the accepted-token drain
+    // balance to zero. cur_num_spec_tokens is 0 on the default path (the map is
+    // empty), so this is byte-identical there.
+    auto spec_it = spec_decode_tokens.find(req_id);
+    const int cur_num_spec_tokens =
+        spec_it == spec_decode_tokens.end()
+            ? 0
+            : static_cast<int>(spec_it->second.size());
+    request->num_output_placeholders +=
+        num_sampled_tokens_per_step() + cur_num_spec_tokens;
 
     // async_scheduler.py:46-49 (next_decode_eligible_step, PP microbatching):
     // pp_size == 1 at T0, so next_decode_eligible_step stays current_step + 1

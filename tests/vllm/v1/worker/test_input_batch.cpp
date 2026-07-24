@@ -12,6 +12,7 @@
 // seed (prefill_token_ids). See the header for the deferred slot state.
 #include <doctest/doctest.h>
 
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -381,4 +382,71 @@ TEST_CASE("make_sampling_metadata stays fresh when penalties are active") {
   CHECK(md.output_token_ids[0] == std::vector<int32_t>{4});
   // frequency/presence/repetition penalty slices are sized to the batch.
   CHECK(md.repetition_penalties.size() == 1);
+}
+
+// ===========================================================================
+// SPEC-MTP (I2) InputBatch spec-decode ABI: num_accepted_tokens (seeded to 1)
+// and update_req_spec_token_ids. These are the fields/updaters the rejection
+// sampler (I3) and verify/propose runner (I5) build on. Grounded in
+// gpu_input_batch.py:240-243,467,484-509,662,787 @ e24d1b24.
+// ===========================================================================
+
+TEST_CASE("add_request seeds num_accepted_tokens to 1 (default one token/step)") {
+  InputBatch batch = make_batch();
+  int s0 = batch.add_request(make_req("a", {1, 2}, {}, {0}));
+  int s1 = batch.add_request(make_req("b", {3}, {4}, {1}));
+  CHECK(batch.num_accepted_tokens[static_cast<size_t>(s0)] == 1);
+  CHECK(batch.num_accepted_tokens[static_cast<size_t>(s1)] == 1);
+}
+
+TEST_CASE("update_req_spec_token_ids splices drafts and records spec_token_ids") {
+  InputBatch batch = make_batch();
+  // prompt {10,11,12} + 1 sampled output {13} -> num_tokens_no_spec == 4.
+  int slot = batch.add_request(make_req("r0", {10, 11, 12}, {13}, {0}));
+  REQUIRE(batch.num_tokens_no_spec[static_cast<size_t>(slot)] == 4);
+
+  std::map<std::string, std::vector<int32_t>> scheduled = {{"r0", {77, 88}}};
+  batch.update_req_spec_token_ids(slot, "r0", scheduled);
+
+  // The drafts land after the non-spec prefix (columns 4,5) and are recorded.
+  CHECK(batch.spec_token_ids[static_cast<size_t>(slot)] ==
+        std::vector<int32_t>{77, 88});
+  CHECK(batch.token_id(slot, 4) == 77);
+  CHECK(batch.token_id(slot, 5) == 88);
+}
+
+TEST_CASE("update_req_spec_token_ids clears drafts when the request has none") {
+  InputBatch batch = make_batch();
+  int slot = batch.add_request(make_req("r0", {10, 11}, {12}, {0}));
+  // First install some drafts.
+  batch.update_req_spec_token_ids(slot, "r0", {{"r0", {5, 6}}});
+  REQUIRE(batch.spec_token_ids[static_cast<size_t>(slot)].size() == 2);
+  // A step with no scheduled drafts for r0 clears the stale list.
+  batch.update_req_spec_token_ids(slot, "r0", {});
+  CHECK(batch.spec_token_ids[static_cast<size_t>(slot)].empty());
+}
+
+TEST_CASE("num_accepted_tokens moves with the request under swap/condense") {
+  InputBatch batch = make_batch();
+  int s0 = batch.add_request(make_req("a", {1}, {}, {0}));
+  int s1 = batch.add_request(make_req("b", {2}, {}, {1}));
+  int s2 = batch.add_request(make_req("c", {3}, {}, {2}));
+  // Simulate a rejection-sampler write (I3 will do this after verification).
+  batch.num_accepted_tokens[static_cast<size_t>(s0)] = 2;
+  batch.num_accepted_tokens[static_cast<size_t>(s2)] = 3;
+  (void)s1;
+
+  // swap slot0<->slot2: c (was slot2, val 3) -> slot0; a (was slot0, val 2) -> slot2.
+  batch.swap_states(s0, s2);
+  CHECK(batch.num_accepted_tokens[static_cast<size_t>(s0)] == 3);  // c
+  CHECK(batch.num_accepted_tokens[static_cast<size_t>(s2)] == 2);  // a
+
+  // Remove b (slot1) and condense: the highest active row (a, slot2, val 2) moves
+  // down into the freed hole, carrying its accepted count; c stays at slot0.
+  batch.remove_request("b");
+  batch.condense();
+  const int idx_a = batch.req_id_to_index.at("a");
+  const int idx_c = batch.req_id_to_index.at("c");
+  CHECK(batch.num_accepted_tokens[static_cast<size_t>(idx_a)] == 2);
+  CHECK(batch.num_accepted_tokens[static_cast<size_t>(idx_c)] == 3);
 }

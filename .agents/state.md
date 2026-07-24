@@ -21764,3 +21764,51 @@ Evidence: test_protocol_tool_turns 3/3, the full
 user→assistant-tool_call→tool-result round trip rendering through the REAL
 Qwen3.5 fixture template (test_chat_template 21/21), test_openai_serving
 24/24, test_capi 24/24.
+
+## 2026-07-24 — `SPEC-MTP` I2 (scheduler-half): host plumbing + FROZEN spec-metadata ABI
+
+Worktree `mtp-i2-sched`, branch `mtp-i2-scheduler`, base `61f3e85`. NOT pushed;
+the orchestrator owns the merge (`origin/main` had advanced to `ba4dd62`).
+
+Landed the host-side V1 spec-decode scheduler/engine plumbing for `SPEC-MTP` and
+FROZE the metadata ABI that I3 (rejection sampler) and I5 (verify/propose
+runner) build against. The full ABI table with upstream file:line for every
+declaration is in the spec, §2.7 — that section is the briefing surface for
+I3/I5, not this entry. New file `include/vllm/config/speculative.h` (the T0
+scheduler subset of `SpeculativeConfig` + `ResolveMtp` + the lookahead
+predicates); `Request::spec_token_ids`/`NumTokensWithSpec`; the first population
+of the pre-existing `SchedulerOutput::scheduled_spec_decode_tokens`;
+`Scheduler::update_draft_token_ids` + an optional `SpeculativeConfig` ctor arg;
+the `take_draft_token_ids` runner/executor seam and `EngineCore::post_step`
+feedback loop; `InputBatch::num_accepted_tokens` + `update_req_spec_token_ids`.
+
+**Default-off and inert — this is the load-bearing property.** With no
+`SpeculativeConfig` (the production path) `num_lookahead_tokens == 0`, every
+`spec_token_ids` stays empty and `post_step` is a no-op, so the engine is
+byte-identical to the pre-spec engine. Proven by an explicit inertness test case
+plus five unchanged-green suites (`test_scheduler`, `test_async_scheduler`,
+`test_input_batch`, `test_engine_core`, `test_llm_engine`, 5/5).
+
+**RED was verified by experiment, not asserted from absence.** Stubbing the three
+behavior sites (spec-scheduling block, rejection rollback,
+`update_draft_token_ids` body) while KEEPING the ABI so it still compiles drops
+`test_scheduler` to 32/35 cases with 6 failing assertions; restoring gives 35/35
+/ 408 assertions. Note the inertness case passes under BOTH the stub and the
+implementation — that is what makes it a default-off guard rather than a
+behavior test.
+
+CPU evidence: clean full `-Werror` rebuild 0 errors / 0 warnings; full CPU ctest
+**231/233**. The 2 failures (`test_model_loader_gguf`, `test_model_registry`) are
+**PRE-EXISTING on base `61f3e85`** — RCA'd by re-running them with this branch's
+changes stashed, where they fail identically; they are NOT caused by this work
+and are left for a separate fix. `test_openai_conformance` failed once under a
+`-j2` co-run with `test_openai_api_server` and passes standalone (load-sensitive
+flake). No GPU work: default-off ⇒ every model gate is byte-identical to main,
+`benchmark_binding=false`, no speed credit.
+
+Row `SPEC-MTP` STAYS `GATING` — plumbing buys no gate; the e2e token gate is
+still owed by M-mtp-1. Still deferred and recorded in spec §2.7 so I3/I5 do not
+assume them: first-decode-step spec padding (`-1` placeholders /
+`num_spec_tokens_to_schedule` / `num_invalid_spec_tokens`), the dynamic-SD
+lookup, the async `update_draft_token_ids_in_output` path, and grammar
+validation of proposed drafts.

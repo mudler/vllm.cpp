@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "vllm/config/scheduler.h"
+#include "vllm/config/speculative.h"
 #include "vllm/sampling_params.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/core/sched/scheduler.h"
@@ -44,6 +45,8 @@
 using vllm::SamplingParams;
 using vllm::SchedulerConfig;
 using vllm::SchedulerPolicy;
+using vllm::SpeculativeConfig;
+using vllm::v1::DraftTokenIds;
 using vllm::v1::EngineCoreOutputs;
 using vllm::v1::FinishReason;
 using vllm::v1::FullAttentionSpec;
@@ -54,6 +57,7 @@ using vllm::v1::ModelRunnerOutput;
 using vllm::v1::Request;
 using vllm::v1::RequestStatus;
 using vllm::v1::Scheduler;
+using vllm::v1::SchedulerOutput;
 using vllm::v1::sha256_cbor;
 using vt::DType;
 
@@ -88,6 +92,40 @@ std::unique_ptr<Scheduler> CreateScheduler(int max_num_seqs = 16,
 
   return std::make_unique<Scheduler>(cfg, kv_cfg, block_size,
                                      /*enable_caching=*/true);
+}
+
+// create_scheduler(num_speculative_tokens=k): a scheduler configured with an MTP
+// speculator so num_lookahead_tokens == k and the spec-decode paths are engaged.
+// Mirrors the upstream test helper's num_speculative_tokens kwarg (the MTP head
+// depth n_predict is 1, so a user k of 1 is the natural default; larger k stay a
+// multiple of n_predict). This is the only difference from CreateScheduler — the
+// SpeculativeConfig turns the plumbing ON.
+std::unique_ptr<Scheduler> CreateSpecScheduler(
+    int num_speculative_tokens, int max_num_seqs = 16,
+    int max_num_batched_tokens = 8192, bool enable_chunked_prefill = true,
+    int num_blocks = 10000, int block_size = 16, int max_model_len = 8192) {
+  SchedulerConfig cfg;
+  cfg.max_num_seqs = max_num_seqs;
+  cfg.max_num_batched_tokens = max_num_batched_tokens;
+  cfg.enable_chunked_prefill = enable_chunked_prefill;
+  cfg.max_model_len = max_model_len;
+  cfg.watermark = 0.0;
+
+  KVCacheConfig kv_cfg;
+  kv_cfg.num_blocks = num_blocks;
+  kv_cfg.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"layer"},
+      std::make_shared<FullAttentionSpec>(block_size, /*num_kv_heads=*/1,
+                                          /*head_size=*/1, DType::kF32));
+
+  // n_predict = 1 (the MTP head depth); the user requests k drafts per step.
+  SpeculativeConfig spec =
+      SpeculativeConfig::ResolveMtp(/*mtp_num_hidden_layers=*/1,
+                                    num_speculative_tokens);
+  return std::make_unique<Scheduler>(cfg, kv_cfg, block_size,
+                                     /*enable_caching=*/true,
+                                     /*structured_output_manager=*/nullptr,
+                                     std::move(spec));
 }
 
 // Mirror of test utils.create_requests (T0 subset): prompts of `num_tokens`
@@ -1060,4 +1098,241 @@ TEST_CASE("Priority scheduling: preemption then resumption when out of KV") {
   CHECK(seed->size() == 32);
   CHECK((*seed)[31] == 100);
   (void)low;
+}
+
+// ===========================================================================
+// SPEC-MTP (I2) scheduler spec-decode plumbing. Ported from
+// tests/v1/core/test_scheduler.py @ e24d1b24:
+//   - test_schedule_spec_decoding_stats (:1042-1150) — the scheduling + rollback
+//     arithmetic (the SpecDecodingStats telemetry assertions are DROPPED: no
+//     SpecDecodingStats type at I2, per test-porting rule 3 realize-against-ours);
+//   - test_spec_decoding_stats_empty_output (:1152-1210) — empty-output regression
+//     (num_accepted floored at 0, no num_computed underflow);
+//   - test_no_spec_tokens_scheduled_for_prefill_chunks (:1212-1303).
+// The first-decode-step PADDING cases (test_spec_decode_padding_*) are SKIPPED —
+// that feature (num_spec_tokens_to_schedule / placeholder -1 drafts) is DEFERRED
+// past I2 (see scheduler.h / mtp-spec-decode.md §OMITTED). test-porting rule 6.
+// ===========================================================================
+
+namespace {
+// Feed a full ModelRunnerOutput back to the scheduler from an ordered list of
+// per-request sampled tokens over the scheduled requests (in num_scheduled_tokens
+// key order, matching how the runner indexes the batch).
+void FeedModelOutput(Scheduler& sched, const SchedulerOutput& out,
+                     const std::vector<std::vector<int32_t>>& sampled) {
+  std::vector<std::pair<std::string, std::vector<int32_t>>> per_req;
+  std::size_t i = 0;
+  for (const auto& [req_id, n] : out.num_scheduled_tokens) {
+    (void)n;
+    per_req.emplace_back(req_id, i < sampled.size() ? sampled[i]
+                                                    : std::vector<int32_t>{});
+    ++i;
+  }
+  sched.update_from_output(out, MakeRunnerOutput(per_req));
+}
+}  // namespace
+
+TEST_CASE(
+    "Scheduler.schedule: speculative decode schedules 1+k tokens and rolls back "
+    "num_computed on rejection") {
+  // Ported cases from test_schedule_spec_decoding_stats parametrization.
+  struct Case {
+    std::vector<std::vector<int32_t>> spec_tokens;   // per request
+    std::vector<std::vector<int32_t>> output_tokens;  // per request
+  };
+  const std::vector<Case> cases = {
+      {{{1, 2, 3}}, {{1, 2, 3, 4}}},          // perfect match
+      {{{1, 2, 3}}, {{1, 5}}},                // early mismatch
+      {{{1, 2}, {3}}, {{1, 2, 5}, {3, 4}}},   // multiple sequences
+      {{{1}}, {{1, 2}}},                      // single token sequence
+      {{{}}, {{5}}},                          // empty sequence
+      {{{1, 2, 3}, {4, 5, 6}}, {{1, 2, 7}, {4, 8}}},  // multiple mismatches
+  };
+
+  for (const auto& c : cases) {
+    int k = 1;
+    for (const auto& s : c.spec_tokens) {
+      k = std::max(k, static_cast<int>(s.size()));
+    }
+    auto scheduler = CreateSpecScheduler(/*num_speculative_tokens=*/k);
+    const int num_reqs = static_cast<int>(c.spec_tokens.size());
+    auto requests = CreateRequests(num_reqs, /*num_tokens=*/1);
+    std::vector<std::string> req_ids;
+    std::vector<Request*> raw;
+    for (auto& r : requests) {
+      req_ids.push_back(r->request_id);
+      raw.push_back(AddRequest(*scheduler, std::move(r)));
+    }
+
+    // Step 1: a plain decode (prefill of the 1-token prompt). No drafts yet.
+    auto out = scheduler->schedule();
+    CHECK(static_cast<int>(out.scheduled_new_reqs.size()) == num_reqs);
+    CHECK(out.total_num_scheduled_tokens == num_reqs);
+    for (const auto& id : req_ids) {
+      CHECK(out.num_scheduled_tokens.at(id) == 1);
+      CHECK(out.scheduled_spec_decode_tokens.count(id) == 0);
+    }
+
+    // Sample one token per request, then install the drafts for the next step.
+    std::vector<std::vector<int32_t>> sampled(num_reqs, std::vector<int32_t>{0});
+    FeedModelOutput(*scheduler, out, sampled);
+    DraftTokenIds drafts;
+    drafts.req_ids = req_ids;
+    drafts.draft_token_ids = c.spec_tokens;
+    scheduler->update_draft_token_ids(drafts);
+
+    for (int i = 0; i < num_reqs; ++i) {
+      Request* r = raw[i];
+      CHECK(r->num_computed_tokens == 1);        // the prompt token
+      CHECK(r->NumTokens() == 2);                // prompt + sampled
+      CHECK(r->NumTokensWithSpec() ==
+            2 + static_cast<int>(c.spec_tokens[i].size()));
+    }
+
+    // Step 2: schedule the drafts for verification (1 + k_i tokens per request).
+    out = scheduler->schedule();
+    CHECK(out.scheduled_new_reqs.empty());
+    int expected_total = num_reqs;
+    for (const auto& s : c.spec_tokens) {
+      expected_total += static_cast<int>(s.size());
+    }
+    CHECK(out.total_num_scheduled_tokens == expected_total);
+    std::vector<int> computed_before(num_reqs);
+    for (int i = 0; i < num_reqs; ++i) {
+      const std::string& id = req_ids[i];
+      const int k_i = static_cast<int>(c.spec_tokens[i].size());
+      CHECK(out.num_scheduled_tokens.at(id) == 1 + k_i);
+      if (k_i > 0) {
+        REQUIRE(out.scheduled_spec_decode_tokens.count(id) == 1);
+        CHECK(static_cast<int>(out.scheduled_spec_decode_tokens.at(id).size()) ==
+              k_i);
+        CHECK(out.scheduled_spec_decode_tokens.at(id) == c.spec_tokens[i]);
+      } else {
+        CHECK(out.scheduled_spec_decode_tokens.count(id) == 0);
+      }
+      // The drafts were consumed off the request.
+      CHECK(raw[i]->spec_token_ids.empty());
+      computed_before[i] = raw[i]->num_computed_tokens;
+      CHECK(computed_before[i] == 2 + k_i);  // 1 + (1 + k) scheduled this step
+    }
+
+    // Step 2 output: verify the rollback rewinds num_computed by num_rejected.
+    FeedModelOutput(*scheduler, out, c.output_tokens);
+    for (int i = 0; i < num_reqs; ++i) {
+      const int k_i = static_cast<int>(c.spec_tokens[i].size());
+      const int num_accepted = std::max(
+          static_cast<int>(c.output_tokens[i].size()) - 1, 0);
+      const int num_rejected = k_i - num_accepted;
+      if (k_i > 0) {
+        // num_computed was > 0, so the rollback applies.
+        CHECK(raw[i]->num_computed_tokens == computed_before[i] - num_rejected);
+      } else {
+        // No drafts scheduled -> no rollback; num_computed unchanged this step.
+        CHECK(raw[i]->num_computed_tokens == computed_before[i]);
+      }
+      CHECK(raw[i]->num_computed_tokens >= 0);
+    }
+  }
+}
+
+TEST_CASE(
+    "Scheduler.update_from_output: empty spec output does not underflow "
+    "num_computed (regression)") {
+  // Ported from test_spec_decoding_stats_empty_output.
+  auto scheduler = CreateSpecScheduler(/*num_speculative_tokens=*/3);
+  auto requests = CreateRequests(1, /*num_tokens=*/1);
+  const std::string req_id = requests[0]->request_id;
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+
+  auto out = scheduler->schedule();  // prefill
+  REQUIRE(out.scheduled_new_reqs.size() == 1);
+  FeedModelOutput(*scheduler, out, {{0}});
+
+  DraftTokenIds drafts;
+  drafts.req_ids = {req_id};
+  drafts.draft_token_ids = {{1, 2, 3}};
+  scheduler->update_draft_token_ids(drafts);
+
+  out = scheduler->schedule();  // schedule the 3 drafts for validation
+  REQUIRE(out.scheduled_spec_decode_tokens.count(req_id) == 1);
+  CHECK(out.scheduled_spec_decode_tokens.at(req_id).size() == 3);
+  const int computed_before = req->num_computed_tokens;
+
+  // Empty output (aborted/errored). Upstream's rollback guard is
+  // `scheduled_spec AND (generated OR num_sampled_per_step == 0)` — with an empty
+  // `generated` and num_sampled_per_step == 1 the block is SKIPPED entirely, so
+  // num_computed is left unchanged (no rollback). The regression this guards is
+  // that num_accepted = max(len([]) - 1, 0) = 0 (not -1) must never underflow /
+  // throw: we exercise the path and confirm no negative num_computed results.
+  FeedModelOutput(*scheduler, out, {{}});
+  CHECK(req->num_computed_tokens == computed_before);
+  CHECK(req->num_computed_tokens >= 0);
+}
+
+TEST_CASE(
+    "Scheduler: draft tokens are ignored for prefill chunks") {
+  // Ported from test_no_spec_tokens_scheduled_for_prefill_chunks. Budget 50,
+  // 80-token prompt -> chunked prefill; drafts provided mid-prefill must be
+  // dropped (no spec tokens scheduled with the remaining prefill).
+  auto scheduler = CreateSpecScheduler(/*num_speculative_tokens=*/3,
+                                       /*max_num_seqs=*/16,
+                                       /*max_num_batched_tokens=*/50);
+  auto requests = CreateRequests(1, /*num_tokens=*/80);
+  const std::string req_id = requests[0]->request_id;
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+
+  // First chunk: 50 of 80 tokens.
+  auto out = scheduler->schedule();
+  REQUIRE(out.scheduled_new_reqs.size() == 1);
+  CHECK(out.num_scheduled_tokens.at(req_id) == 50);
+  FeedModelOutput(*scheduler, out, {{}});  // still prefilling, no sampled token
+  CHECK(req->is_prefill_chunk);
+
+  // Drafts arrive mid-prefill -> ignored (cleared).
+  DraftTokenIds drafts;
+  drafts.req_ids = {req_id};
+  drafts.draft_token_ids = {{1, 2, 3}};
+  scheduler->update_draft_token_ids(drafts);
+  CHECK(req->spec_token_ids.empty());
+
+  // Second chunk: the remaining 30 prefill tokens ONLY (not 30 + 3 spec).
+  out = scheduler->schedule();
+  CHECK(out.num_scheduled_tokens.at(req_id) == 30);
+  CHECK(out.scheduled_spec_decode_tokens.count(req_id) == 0);
+  FeedModelOutput(*scheduler, out, {{42}});  // prefill complete, sampled token
+
+  // Now drafts are accepted (prefill complete).
+  scheduler->update_draft_token_ids(drafts);
+  REQUIRE(req->spec_token_ids.size() == 3);
+  CHECK(req->spec_token_ids == std::vector<int32_t>{1, 2, 3});
+
+  // Third schedule: decode + 3 spec tokens = 4.
+  out = scheduler->schedule();
+  CHECK(out.num_scheduled_tokens.at(req_id) == 4);
+  REQUIRE(out.scheduled_spec_decode_tokens.count(req_id) == 1);
+  CHECK(out.scheduled_spec_decode_tokens.at(req_id).size() == 3);
+}
+
+TEST_CASE(
+    "Scheduler: no speculator -> spec-decode paths inert (default-off)") {
+  // Default-off proof: a scheduler built WITHOUT a SpeculativeConfig never sees a
+  // draft (the runner never produces one), so spec_token_ids stays empty on every
+  // request, num_tokens_with_spec == num_tokens, and scheduled_spec_decode_tokens
+  // is empty on every step — byte-identical to the pre-SPEC-MTP scheduler. Drive
+  // a normal prefill+decode and confirm the spec map is empty and the decode
+  // schedules exactly one token.
+  auto scheduler = CreateScheduler();
+  auto requests = CreateRequests(1, /*num_tokens=*/4);
+  const std::string req_id = requests[0]->request_id;
+  Request* req = AddRequest(*scheduler, std::move(requests[0]));
+
+  auto out = scheduler->schedule();  // prefill 4 tokens
+  CHECK(out.scheduled_spec_decode_tokens.empty());
+  FeedModelOutput(*scheduler, out, {{0}});
+  CHECK(req->spec_token_ids.empty());
+  CHECK(req->NumTokensWithSpec() == req->NumTokens());
+
+  out = scheduler->schedule();  // decode: exactly 1 token, no spec
+  CHECK(out.num_scheduled_tokens.at(req_id) == 1);
+  CHECK(out.scheduled_spec_decode_tokens.empty());
 }

@@ -27,7 +27,9 @@
 //
 // DEFERRED (marked; slots in without reshaping the interface):
 //   - non_block / Future return (T0 = synchronous),
-//   - take_draft_token_ids (spec-decode), execute_dummy_batch, the KV-cache
+//   - take_draft_token_ids: a default-nullopt SEAM is declared for SPEC-MTP (I2);
+//     the drafting override lands with the verify/propose runner (I5).
+//   - execute_dummy_batch, the KV-cache
 //     init / profiling / LoRA / pooling RPC methods on WorkerBase.
 #pragma once
 
@@ -87,6 +89,17 @@ class ModelRunnerBase {
   // false — a plain runner keeps the synchronous scheduler. The batched runner
   // overrides it to reflect the VT_ASYNC_RUNNER opt-in.
   virtual bool runner_supports_async() const { return false; }
+
+  // take_draft_token_ids (model_runner.py take_draft_token_ids / executor
+  // abstract.py): hand the drafter's out-of-band proposal for the NEXT step back
+  // to the caller, consuming it (the runner clears its stash). Default nullopt —
+  // a runner with no speculator never drafts. The verify/propose runner (SPEC-MTP
+  // I5) overrides this to return the drafts its speculator produced; the engine
+  // core feeds them to Scheduler::update_draft_token_ids (core.py:511-517). This
+  // is the frozen SPEC-MTP seam (I2) — inert until I5 fills it.
+  virtual std::optional<DraftTokenIds> take_draft_token_ids() {
+    return std::nullopt;
+  }
 };
 
 }  // namespace vllm::v1

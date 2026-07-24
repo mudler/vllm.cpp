@@ -39,7 +39,8 @@ SchedulingPolicy ToQueuePolicy(SchedulerPolicy policy) {
 Scheduler::Scheduler(SchedulerConfig scheduler_config,
                      KVCacheConfig kv_cache_config, int block_size,
                      bool enable_caching,
-                     StructuredOutputManager* structured_output_manager)
+                     StructuredOutputManager* structured_output_manager,
+                     std::optional<SpeculativeConfig> speculative_config)
     : max_num_running_reqs(scheduler_config.max_num_seqs),
       max_num_scheduled_tokens(
           scheduler_config.ResolvedMaxNumScheduledTokens()),
@@ -52,6 +53,13 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
       enable_chunked_prefill_(scheduler_config.enable_chunked_prefill),
       scheduler_reserve_full_isl_(
           scheduler_config.scheduler_reserve_full_isl) {
+  // num_lookahead_tokens (scheduler.py:275-292): 0 when no speculator is
+  // configured (the default — every spec-decode path stays inert), else derived
+  // from the SpeculativeConfig (k for MTP). Threaded into allocate_slots below.
+  if (speculative_config.has_value()) {
+    num_lookahead_tokens_ = speculative_config->NumLookaheadTokens();
+  }
+
   // Scheduling policy -> the waiting (FCFS) queue.
   waiting = create_request_queue(ToQueuePolicy(scheduler_config.policy));
 
@@ -132,6 +140,10 @@ SchedulerOutput Scheduler::schedule() {
 
   std::map<std::string, KVCacheBlocks> req_to_new_blocks;
   std::map<std::string, int> num_scheduled_tokens;
+  // Speculative decode: req_id -> the draft token ids scheduled for verification
+  // this step (scheduler.py:593-609). Stays empty when no request carries drafts
+  // (num_lookahead_tokens == 0 -> byte-identical to the pre-SPEC-MTP path).
+  std::map<std::string, std::vector<int32_t>> scheduled_spec_decode_tokens;
   int token_budget = max_num_scheduled_tokens;
 
   kv_cache_manager->new_step_starts();
@@ -166,10 +178,14 @@ SchedulerOutput Scheduler::schedule() {
       continue;
     }
 
-    // num_tokens_with_spec == num_tokens at T0 (no spec tokens). Under async
+    // num_tokens_with_spec adds the request's pending draft tokens so they are
+    // scheduled for verification alongside the sampled token (scheduler.py:475).
+    // Equals num_tokens when spec_token_ids is empty (no speculator / drafts
+    // already consumed) -> byte-identical to the pre-SPEC-MTP path. Under async
     // scheduling num_output_placeholders reserves the in-flight sampled token(s)
     // (0 for the synchronous Scheduler, so this is unchanged there).
-    int num_new_tokens = request->NumTokens() + request->num_output_placeholders -
+    int num_new_tokens = request->NumTokensWithSpec() +
+                         request->num_output_placeholders -
                          request->num_computed_tokens;
     if (0 < long_prefill_token_threshold_ &&
         long_prefill_token_threshold_ < num_new_tokens) {
@@ -254,6 +270,30 @@ SchedulerOutput Scheduler::schedule() {
     num_scheduled_tokens[request_id] = num_new_tokens;
     token_budget -= num_new_tokens;
     req_index += 1;
+
+    // Speculative decode related (scheduler.py:593-609). If the request carries
+    // pending draft tokens, record how many of them were actually scheduled this
+    // step (num_new_tokens beyond the request's own sampled-token target is the
+    // draft-verification budget) and clear them off the request — the drafter
+    // will re-propose in update_draft_token_ids before the next step. Inert when
+    // spec_token_ids is empty (default path), so nothing is recorded and the map
+    // stays empty.
+    if (!request->spec_token_ids.empty()) {
+      const int num_scheduled_spec_tokens =
+          num_new_tokens + request->num_computed_tokens - request->NumTokens() -
+          request->num_output_placeholders;
+      if (num_scheduled_spec_tokens > 0) {
+        std::vector<int32_t> spec_ids = request->spec_token_ids;
+        // Chunked-prefill / budget clamping may fit only a prefix of the drafts.
+        if (static_cast<int>(spec_ids.size()) > num_scheduled_spec_tokens) {
+          spec_ids.resize(static_cast<std::size_t>(num_scheduled_spec_tokens));
+        }
+        scheduled_spec_decode_tokens[request_id] = std::move(spec_ids);
+      }
+      // New spec tokens will be set in update_draft_token_ids before the next
+      // step when applicable.
+      request->spec_token_ids.clear();
+    }
   }
 
   // Next, schedule the WAITING requests (skipped entirely if any preemption
@@ -425,7 +465,11 @@ SchedulerOutput Scheduler::schedule() {
   // moved-from state is unobservable.
   scheduler_output.num_scheduled_tokens = std::move(num_scheduled_tokens);
   scheduler_output.total_num_scheduled_tokens = total_num_scheduled_tokens;
-  // scheduled_spec_decode_tokens / scheduled_encoder_inputs stay empty (T0).
+  // scheduled_spec_decode_tokens (scheduler.py:593-609): populated above only for
+  // running requests carrying drafts; empty on the default (no-speculator) path.
+  // scheduled_encoder_inputs stays empty (encoder deferred).
+  scheduler_output.scheduled_spec_decode_tokens =
+      std::move(scheduled_spec_decode_tokens);
   scheduler_output.num_common_prefix_blocks = std::move(num_common_prefix_blocks);
   // finished_req_ids is EXISTING scheduler state (finished between the prior and
   // current step) — moved out here, then flushed in _update_after_schedule.
@@ -540,8 +584,41 @@ EngineCoreOutputs Scheduler::update_from_output(
             ? std::vector<int32_t>{}
             : sampled_token_ids[static_cast<std::size_t>(req_index)];
 
-    // DEFERRED: speculative-decode acceptance / num_computed rollback; encoder-
-    // input free.
+    // Speculative-decode acceptance / num_computed rollback (scheduler.py:1580-
+    // 1612). If this step verified draft tokens for the request, the runner
+    // returned 1 + num_accepted tokens (the sampled/bonus token plus every
+    // accepted draft); num_rejected of the scheduled drafts were computed but not
+    // kept, so num_computed_tokens (and, under async scheduling, the matching
+    // num_output_placeholders) is rewound by that many. Inert when the request
+    // had no scheduled drafts (the map lookup misses -> whole block skipped), so
+    // the default path is byte-identical.
+    auto spec_it = scheduler_output.scheduled_spec_decode_tokens.find(req_id);
+    if (spec_it != scheduler_output.scheduled_spec_decode_tokens.end() &&
+        (!new_token_ids.empty() || num_sampled_tokens_per_step_ == 0)) {
+      const int num_draft_tokens = static_cast<int>(spec_it->second.size());
+      // num_accepted = generated - num_sampled, floored at 0 so an empty
+      // (aborted / error) output does not underflow (regression: upstream
+      // test_spec_decoding_stats_empty_output).
+      const int num_accepted = std::max(
+          static_cast<int>(new_token_ids.size()) - num_sampled_tokens_per_step_,
+          0);
+      const int num_rejected = num_draft_tokens - num_accepted;
+      // num_computed_tokens counts tokens processed this step including the
+      // scheduled drafts; a rejection rewinds it so the next step recomputes from
+      // the last accepted position (the paged KV slots are simply overwritten;
+      // GDN linear-state rollback is the §4 kernel path, not here).
+      if (request->num_computed_tokens > 0) {
+        request->num_computed_tokens -= num_rejected;
+      }
+      // Under async scheduling num_output_placeholders also reserved the
+      // scheduled draft count, so it is rewound identically (0 -> inert on the
+      // synchronous path).
+      if (request->num_output_placeholders > 0) {
+        request->num_output_placeholders -= num_rejected;
+      }
+      // (make_spec_decoding_stats telemetry is deferred — no SpecDecodingStats.)
+    }
+    // DEFERRED: encoder-input free.
 
     bool stopped = false;
     const RequestStatus status_before_stop = request->status;
@@ -718,6 +795,39 @@ void Scheduler::update_after_schedule(SchedulerOutput& scheduler_output) {
   // copied-out scheduler_output is unaffected).
   finished_req_ids = {};
   reset_preempted_req_ids = {};
+}
+
+void Scheduler::update_draft_token_ids(const DraftTokenIds& draft_token_ids) {
+  // scheduler.py:1937-1957. Install the drafter's freshly-proposed spec tokens
+  // onto their requests for the NEXT verify step.
+  const std::size_t n =
+      std::min(draft_token_ids.req_ids.size(),
+               draft_token_ids.draft_token_ids.size());
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::string& req_id = draft_token_ids.req_ids[i];
+    auto it = requests.find(req_id);
+    if (it == requests.end() || it->second->IsFinished()) {
+      // The request may have been finished. Skip.
+      continue;
+    }
+    Request* request = it->second.get();
+
+    if (request->is_prefill_chunk) {
+      // Ignore draft tokens for prefill chunks (a request mid-prefill must not
+      // schedule drafts alongside its remaining prompt — scheduler.py:1948-1951).
+      if (!request->spec_token_ids.empty()) {
+        request->spec_token_ids.clear();
+      }
+      continue;
+    }
+
+    // Add the newly generated spec token ids to the request. A structured-output
+    // request first validates them against its grammar (should_advance); deferred
+    // here (no per-request grammar validate_tokens seam yet) — the manager gates
+    // it so a non-structured request is unaffected. When wired, this drops draft
+    // tokens that do not conform to the schema (upstream scheduler.py:1953-1956).
+    request->spec_token_ids = draft_token_ids.draft_token_ids[i];
+  }
 }
 
 int Scheduler::get_num_unfinished_requests() const {

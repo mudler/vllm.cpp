@@ -27,4 +27,10 @@ std::unique_ptr<AsyncModelRunnerOutput> Executor::sample_tokens_async(
   return runner_.sample_tokens_async(grammar_output);
 }
 
+std::optional<DraftTokenIds> Executor::take_draft_token_ids() {
+  // Upstream: collective_rpc("take_draft_token_ids")[0]. T0 single-worker: a
+  // direct call. nullopt on the default path (no speculator drafting).
+  return runner_.take_draft_token_ids();
+}
+
 }  // namespace vllm::v1

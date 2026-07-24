@@ -38,9 +38,18 @@
 // DEFERRED (marked; matches upstream structure so re-adding is mechanical):
 //   - Encoder inputs (_try_schedule_encoder_inputs), the encoder cache manager,
 //     encoder compute budget.
-//   - Speculative-decode tokens (spec_token_ids, num_lookahead_tokens,
-//     scheduled_spec_decode_tokens, spec pad, dynamic SD lookup) — T0 keeps
-//     num_lookahead_tokens = 0 and num_tokens_with_spec == num_tokens.
+//   - SPEC-MTP (I2, scheduler-half) LANDED the core spec-decode scheduler
+//     plumbing: num_lookahead_tokens (derived from an optional SpeculativeConfig,
+//     0 by default), num_tokens_with_spec in the running-loop budget, the
+//     per-step scheduled_spec_decode_tokens map (1 + len(spec_token_ids) tokens
+//     scheduled for a running request carrying drafts, scheduler.py:593-609),
+//     the num_computed_tokens rollback on rejection (scheduler.py:1580-1612), and
+//     update_draft_token_ids (scheduler.py:1937). All INERT when no
+//     SpeculativeConfig is supplied (num_lookahead_tokens == 0, every request's
+//     spec_token_ids stays empty), so the default path is byte-identical.
+//     STILL DEFERRED: the first-decode-step spec PADDING (placeholder -1 drafts /
+//     num_spec_tokens_to_schedule / num_invalid_spec_tokens), the dynamic-SD
+//     lookup, and the async draft-in-output path (update_draft_token_ids_in_output).
 //   - num_output_placeholders / async scheduling (the early-continue on
 //     max_tokens, next_decode_eligible_step) — treated as 0 / inert.
 //   - DP prefill balancing (throttle_prefills / defer_prefills /
@@ -66,6 +75,7 @@
 #include <vector>
 
 #include "vllm/config/scheduler.h"
+#include "vllm/config/speculative.h"
 #include "vllm/v1/core/kv_cache_manager.h"
 #include "vllm/v1/core/sched/output.h"
 #include "vllm/v1/core/sched/request_queue.h"
@@ -100,9 +110,18 @@ class Scheduler {
   // stay backward-compatible with the M1.4/M1.8 tests that build a bare
   // scheduler — when null, structured output is a no-op (get_grammar_bitmask
   // returns nullopt; no grammar advance).
+  //
+  // speculative_config (upstream vllm_config.speculative_config, read at
+  // scheduler.py:275-292): OPTIONAL. std::nullopt (the default) is the production
+  // no-speculator path — num_lookahead_tokens stays 0, so every spec-decode path
+  // is inert and the scheduler is byte-identical to the pre-SPEC-MTP engine. When
+  // present (e.g. SpeculativeConfig::ResolveMtp), num_lookahead_tokens is derived
+  // from it (SpeculativeConfig::NumLookaheadTokens) and threaded into
+  // allocate_slots so the verify slots are reserved ahead of time.
   Scheduler(SchedulerConfig scheduler_config, KVCacheConfig kv_cache_config,
             int block_size, bool enable_caching = false,
-            StructuredOutputManager* structured_output_manager = nullptr);
+            StructuredOutputManager* structured_output_manager = nullptr,
+            std::optional<SpeculativeConfig> speculative_config = std::nullopt);
 
   // VIRTUAL destructor — REQUIRED, not cosmetic. `AsyncScheduler` derives from
   // this class and production/test code owns the derived object through a
@@ -181,6 +200,18 @@ class Scheduler {
   kv_offload::KVConnector* kv_connector() const {
     return kv_connector_;
   }
+
+  // update_draft_token_ids (scheduler.py:1937-1957): install the drafter's
+  // freshly-proposed spec token ids onto their requests, to be scheduled for
+  // verification on the NEXT step. For each (req_id, draft ids) pair: skip
+  // unknown / finished requests; a request still in a prefill CHUNK ignores the
+  // drafts (clearing any stale spec_token_ids); otherwise request.spec_token_ids
+  // is set to the proposed ids (a structured-output request first validates them
+  // against its grammar — deferred here, no-op without a manager). Called by the
+  // engine core (core.py:511-517) with the runner's out-of-band
+  // take_draft_token_ids output. Inert unless a speculator is configured (the
+  // runner never produces drafts otherwise).
+  void update_draft_token_ids(const DraftTokenIds& draft_token_ids);
 
   // get_num_unfinished_requests: len(waiting) + len(running) (T0 subset).
   int get_num_unfinished_requests() const;
@@ -280,7 +311,10 @@ class Scheduler {
   int long_prefill_token_threshold_;
   bool enable_chunked_prefill_;
   bool scheduler_reserve_full_isl_;
-  // T0: 0 (no speculative decode / eagle).
+  // num_lookahead_tokens (scheduler.py:275-292): reserved verify slots per running
+  // request. 0 when no SpeculativeConfig is supplied (default), else derived from
+  // it in the ctor via SpeculativeConfig::NumLookaheadTokens (k for MTP). Threaded
+  // into allocate_slots (schedule() lines below).
   int num_lookahead_tokens_ = 0;
   // T0: 1 (not a diffusion model).
   int num_sampled_tokens_per_step_ = 1;

@@ -3263,3 +3263,15 @@ Disposition: **NO throughput measured or claimed for any of the three - SPEED PE
 - **OLMo-3 (`OLMo-3-1025-7B`) - DEP-BLOCKED (no oracle gate).** Implemented (dual rope: plain sliding theta 500000 + YaRN full-attn; per-layer sliding window; dtype-aware BF16 loader) and our engine loads + runs it, but the pinned vLLM 0.25.0 oracle CANNOT run the checkpoint: `olmo2.py:143` does `rope_parameters["rope_theta"]` -> `KeyError: 'rope_theta'` (the oracle's transformers predates OLMo-3's nested per-layer-type rope schema; an `hf_overrides` workaround surfaces `Unrecognized keys {'sliding_attention','full_attention'}` -> `TypeError: unhashable type: 'dict'`). No SACRED bar exists (spec D5); the W5 gate is pending an oracle/transformers that constructs OLMo-3's rope config. `test_olmo3_paged_engine` is present and skips (golden absent).
 
 **Regressions (this pass, byte-identical - the shared-TU fixes are diff-inert):** re-run STANDALONE from the clean `-Werror` build: **OLMo-2 16/16** (proves the guarded `olmo2.{cpp,weights}` dual-rope/dtype edits inert for OLMo-2), **Qwen3-dense 184/184**, **OPT 63/63**, **Llama-3.2-1B 92/92**, **Mistral 92/92** (these witness the `hf_config.cpp` longrope-fallback + `tokenizer.cpp` lstrip/rstrip edits inert). The big-model gates (27B 235/235, 35B 315/315, Qwen3-Coder 138/138, GLM-4-9B 16/16, GLM-4.7-Flash 8/8, Gemma-1/2/3 48/48, DeepSeek-V2 223/223) are byte-identical BY CONSTRUCTION (no kernel/runner/sampler TU touched) and were not re-run this pass (GB10 GPU time).
+**`SPEC-MTP` I2 scheduler-half - spec-decode host plumbing + FROZEN metadata ABI
+(2026-07-24, [spec](../.agents/specs/mtp-spec-decode.md)).**
+**Benchmark disposition: NOT APPLICABLE - no measurement, no speed credit
+claimed (`benchmark_binding=false`).** The change is host-side scheduler/engine
+plumbing that is DEFAULT-OFF and INERT: with no speculative config
+`num_lookahead_tokens` stays 0, every request's draft list stays empty, and the
+engine-core post-step hook is a no-op, so the production path is byte-identical
+to the pre-change engine and every model gate is inert by construction. No GPU
+work was run and no throughput or acceptance-rate number is claimed here - the
+honest speculative baseline is vLLM configured with the SAME speculative config,
+and that A/B is owed by the M-mtp-1 e2e gate, which keeps the `SPEC-MTP` row
+`GATING`.

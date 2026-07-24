@@ -21676,3 +21676,76 @@ increment with a non-passing gate on record. Closing it needs either a cascade-a
 first root divergence, which is the well-posed comparison once prefixes diverge) or the ratified bigger-dense-model
 STRICT check on `microsoft/phi-4` (14B, ~29 GiB — not downloaded this turn). Granite-3 (STRICT 16/16) and OLMo-3
 (DEP-blocked) landed separately and are NOT blocked on this.
+
+## 2026-07-24 — documentation-coverage AUDIT (`CLAIM-DOCS-COVERAGE`): shipped capability vs user-facing docs
+
+Read-only audit of what has actually shipped (code + 1115 commits of history) against what
+`README.md` and `docs/BENCHMARKS.md` tell a user. Base `origin/main` `f887c34`, isolated worktree,
+no code touched. Full gap table + fix plan: [specs/docs-coverage-audit.md](specs/docs-coverage-audit.md).
+
+**The trigger case generalized.** The request cited LMCache as an already-found instance of the
+failure mode (fully built W1-W5, status in the README, but no CLI flag anywhere and a BENCHMARKS row
+still calling it "NOT IMPLEMENTED"). It is not an isolated case. The same three shapes recur:
+
+1. **A feature lands, the Features table is updated, an OLDER prose paragraph in the SAME README is
+   not.** Gemma-2 and Gemma-1 landed at `a60b88b` with 48/48 SACRED gates and their Features rows;
+   the Supported-models prose two sections later still called them "spiked-only". The 39-dialect
+   tool-parser waves landed across `b846f2a`..`df8909b`; the Serving-notes bullet still said the
+   parser surface was a "Hermes-style / Qwen3 subset" and that the Qwen3-Coder XML template "is not
+   fully implemented" while `tool_parsers/qwen3_coder.cpp` ships and is registered.
+2. **A capability lands with a PROGRAMMATIC surface only, and nobody wires the CLI.** No
+   `--kv-transfer-config` exists anywhere in the tree; the bundled OpenAI server hardcodes the tool
+   parser to `"hermes"` and reasoning parsing to off at `examples/server/main.cpp:288-289`. So 39 tool
+   dialects, 7 reasoning parsers and the entire external-KV campaign are unreachable over HTTP.
+3. **Env vars become the de-facto config surface and are never written down.** 153 distinct
+   `VT_*`/`VLLM_*` names are read from `src/`+`include/`; **exactly one** (`VT_GGUF_KEEP_QUANT`)
+   appears in the README. Among the undocumented ones: `VT_LMCACHE_HOST`/`_PORT` (the only
+   non-programmatic way to point the LMCache client at a server), `VLLM_CPP_CPU_THREADS`,
+   `VLLM_PREFIX_CACHING_HASH_SEED` (whose `=random` value takes any persisted cache to a 0% hit
+   rate), and the default-ON rollbacks `VT_ASYNC_RUNNER` / `VT_ASYNC_SCHED` / `VT_GGUF_KEEP_F16`.
+
+**The one finding that is more than a doc bug (class D1, LOUD).** The README claimed the KV-offload
+connector seam has "scheduler and worker sides wired". That is true only for LMCache. For the CPU/disk
+`OffloadingConnector` there is NO worker half: `GPUModelRunner::ConnectorLoadExternalKv` and
+`ConnectorStorePromptKv` (`src/vllm/v1/worker/gpu/runner.cpp:1206`, `:1267`) both open with
+`dynamic_cast<LMCacheConnector*>` and return immediately otherwise; the `ConnectorLoadJob`s that
+`OffloadingConnector::build_connector_meta()` emits (`src/vllm/v1/kv_offload/kv_connector.cpp:285`)
+are consumed by nothing outside `kv_connector.*`/`lmcache`; the abstract worker hooks
+(`start_load_kv`/`save_kv_layer`/`wait_for_save`, `include/vllm/v1/kv_offload/kv_connector.h:179-190`)
+are no-op defaults it never overrides; and its byte home is a host `PrimaryByteView`, never a GPU page.
+The scheduler half nevertheless DOES shortcut prefill for matched blocks, and `BuildKvConnector`
+(`src/vllm/entrypoints/model_loader.cpp:109-140`) will build it for any device with no guard. So
+selecting `OffloadingConnector` on a GPU model would skip prefill for KV that is never written:
+a latent silent-wrong-output path. REPORTED, not fixed (this claim is read-only on code); the
+recommended five-line guard (refuse a non-LMCache connector on a non-CPU device) is a separate
+increment, ahead of implementing the worker half.
+
+**Class-D checks that came back clean, stated so the short D list is not mistaken for a shallow
+sweep:** every row of the README Supported-models / Quantization / Acceleration / CMake / endpoint /
+`vllm-cli`-flag tables and the C-ABI version+symbol count were each re-derived from source or the
+owning matrix. Nothing in them is fabricated or claims more than its row backs; the model, quant and
+backend tables match `.agents/model-matrix.md`, `.agents/quantization-matrix.md` and
+`.agents/backend-matrix.md` exactly. The only soft overstatement is the intro sentence listing Vulkan
+as a run target when it is a no-model skeleton (D2, one-line fix).
+
+**Repaired in this change (outright falsehoods only, per the claim's scope).** `docs/BENCHMARKS.md`
+open-gates `External KV / LMCache` row; README Gemma-1/2 "spiked-only" sentence; README tool-calling
+bullet; README OLMo-3 "follow-on" clause; README KV-offload worker-side claim (D1 scoping). The README
+was deliberately NOT restructured: the request scopes that to the Tier-3 follow-up.
+
+**Left for the owning agent:** `.agents/engine-matrix.md:171` `SERVE-C-ABI` still says "17 exported
+symbols"; the ABI has been 19 since `c44c1f8`/`eb9d129`. Not edited here because this claim moves no
+matrix row.
+
+**Fix plan (impact order).** Tier 1 falsehoods (done). Tier 2, four small independent wiring jobs:
+server `--tool-call-parser`/`--reasoning-parser` (~20 lines, highest impact per line: unlocks 39+7
+parsers over HTTP), server `--kv-transfer-config` mirroring vLLM's own CLI (~40 lines), the D1 device
+guard, and `vllm-cli` structured-output/sampling flags. Tier 3, one README pass (request-field table,
+the three missing Gemma rows in the Supported-models table, `VLLM_CPP_FLASH_ATTN`, the bench/server
+flag gaps). Tier 4, two new pages: `docs/ENVIRONMENT.md` (with a CI completeness check over every
+`getenv` name) and `docs/KV-OFFLOAD.md`.
+
+**Gates.** No build/GPU owed: the code diff is empty (`git show --stat` shows only `.agents/`,
+`README.md`, `docs/BENCHMARKS.md`), so every SACRED gate is unchanged by construction. All five record
+checkers GREEN by bare RC: `check-agent-record` 0, `check-doc-checkpoint` 0, `check-device-leakage` 0,
+`check-readme-structure` 0, `check-model-checklist` 0. Not pushed.

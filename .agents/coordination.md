@@ -135,6 +135,32 @@ marks and rollup counts in lockstep with the detailed row states. It touched no
 already accurately stated. Wired into the ci.yml `agent-record` job; policy added
 to `AGENTS.md`; see the parity-ledger row of the same date.
 
+**Docs coordination note (2026-07-24, `CLAIM-DOCS-COVERAGE`, DONE).** A
+documentation-coverage AUDIT, read-only on code, with no area-matrix work row
+(so it is a note here, not a claims-table row, following the
+`CLAIM-DOCS-MODEL-CHECKLIST` precedent above). Isolated worktree
+`scratchpad/wt-docs-audit` branch `docs-coverage-audit`, base `f887c34`; no
+build, no GPU. It swept 1115 commits plus every user-facing surface in the tree
+against `README.md`, `docs/BENCHMARKS.md` and the area matrices, and classified
+every gap A-E in [specs/docs-coverage-audit.md](specs/docs-coverage-audit.md).
+Owned scope: that new spec, this note, the ledger/state entries of the same
+date, the roadmap section-A `A6` row, and the OUTRIGHT-FALSEHOOD doc lines only
+(the `docs/BENCHMARKS.md` open-gates external-cache row plus four README lines:
+the Gemma 1/2 "spiked-only" sentence, the tool-calling bullet, the OLMo-3
+"follow-on" clause, and the KV-offload "worker sides wired" overstatement). It
+touched NO file under `src/`, `include/`, `tests/`, `examples/` or `cmake/`,
+moved NO matrix row state, and deliberately did NOT restructure the README
+(the Tier-3 follow-up increment owns that). Headline findings: two class-D
+overstatements, the louder being that the CPU/disk offloading connector has no
+worker half at all while its scheduler half still shortcuts prefill (a latent
+wrong-output path if it is selected on a GPU model, reported not fixed); five
+stale/contradictory doc lines, four fixed here and one left to the row's owner
+(the engine matrix still says the C ABI exports 17 symbols; it exports 19);
+four shipped-but-unreachable features (no `--kv-transfer-config` anywhere, the
+bundled server hardcoding the `hermes` tool parser with reasoning off, and so
+on); and 153 production environment variables of which exactly one appears in
+the README. Fix plan in impact order lives in the spec.
+
 **Structured-output coordination note (2026-07-23, `CLAIM-CAPI-STRUCTURED-V2`,
 DONE, direct-to-main, user-directed).** Production-wired the engine-wide
 `StructuredOutputManager` (LoadedEngine -> Scheduler/EngineCore/AsyncLLM) and

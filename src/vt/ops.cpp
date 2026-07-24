@@ -1112,6 +1112,17 @@ void MulScalar(Queue& q, Tensor& out, const Tensor& x, double scalar) {
   reinterpret_cast<MulScalarFn>(GetOp(OpId::kMulScalar, q.device.type))(q, out, x, scalar);
 }
 
+void SoftCap(Queue& q, Tensor& out, const Tensor& x, double cap) {
+  VT_CHECK(out.rank == x.rank, "soft_cap: out rank must match x");
+  for (int i = 0; i < x.rank; ++i)
+    VT_CHECK(out.shape[i] == x.shape[i], "soft_cap: out shape must match x");
+  VT_CHECK(cap > 0.0, "soft_cap: cap must be > 0");
+  VT_CHECK(IsFloat(x.dtype) && IsOutFloat(out.dtype), "soft_cap: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous(), "soft_cap: contiguous required");
+  VT_CHECK(x.device == out.device && x.device == q.device, "soft_cap: device mismatch");
+  reinterpret_cast<SoftCapFn>(GetOp(OpId::kSoftCap, q.device.type))(q, out, x, cap);
+}
+
 void LayerNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor* weight,
                const Tensor* bias, const LayerNormArgs& args) {
   VT_CHECK(x.rank >= 1 && out.rank == x.rank, "layer_norm: out rank must match x");

@@ -158,6 +158,22 @@ int WindowRight(const PagedAttentionArgs& args) {
   return args.window_size.has_value() ? args.window_size->right : -1;
 }
 
+// Attention logit soft-cap (vLLM Attention(logits_soft_cap=...), gemma2.py:202):
+// the scaled pre-softmax score S is replaced by cap * tanh(S / cap) before the
+// online softmax. softcap == 0.0 (every non-Gemma model) returns S unchanged,
+// so the plain scaled-dot score is byte-identical for existing models.
+__device__ __forceinline__ float ApplySoftcap(float s, float softcap) {
+  // Mirror vLLM/flash-attn's apply_softcap EXACTLY: it uses cutlass::fast_tanh,
+  // which lowers to the hardware `tanh.approx.f32` PTX on sm_121 (utils.h:463).
+  // Matching the oracle's approximation (not the more-accurate libdevice tanhf) is
+  // what keeps the capped scores bit-close to vLLM.
+  if (softcap <= 0.0f) return s;
+  float y;
+  const float x = s / softcap;
+  asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return softcap * y;
+}
+
 // ===========================================================================
 // DECODE path (M1.6, unchanged): one block per (query token, q-head). The block
 // scans query_start_loc to find token t's request r, derives the absolute
@@ -171,7 +187,7 @@ __global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_ca
                                      int64_t num_reqs, int64_t hq, int64_t num_kv_heads, int64_t d,
                                      int64_t block_size, int64_t bt_row, int64_t bt_col,
                                      int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
-                                     int64_t vc_pg, int64_t vc_hd, float scale, bool causal,
+                                     int64_t vc_pg, int64_t vc_hd, float scale, float softcap, bool causal,
                                      int window_left, int window_right) {
   const int64_t t = blockIdx.x;  // global query-token index
   const int64_t h = blockIdx.y;  // q-head
@@ -222,7 +238,7 @@ __global__ void PagedAttentionKernel(Tout* out, const TQ* query, const TKV* k_ca
       if (threadIdx.x < stride) red[threadIdx.x] += red[threadIdx.x + stride];
       __syncthreads();
     }
-    if (threadIdx.x == 0) s_score = red[0] * scale;
+    if (threadIdx.x == 0) s_score = ApplySoftcap(red[0] * scale, softcap);
     __syncthreads();
 
     const float s = s_score;
@@ -291,7 +307,7 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
                                               int64_t block_size, int64_t bt_row, int64_t bt_col,
                                               int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                               int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
-                                              float scale, bool causal, int window_left,
+                                              float scale, float softcap, bool causal, int window_left,
                                               int window_right) {
   const int64_t t = blockIdx.x;  // global query-token index (decode: one per req)
   const int64_t h = blockIdx.y;  // q-head
@@ -342,7 +358,7 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
     for (int o = 16; o > 0; o >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, o);
     dot = __shfl_sync(0xffffffffu, dot, 0);  // broadcast full-head score to lanes
 
-    const float s = dot * scale;
+    const float s = ApplySoftcap(dot * scale, softcap);
     const float m_new = fmaxf(m, s);
     const float corr = expf(m - m_new);  // 0 on the first key (m == -inf)
     const float pw = expf(s - m_new);
@@ -419,7 +435,7 @@ __global__ void PagedAttentionDecodeGqaKernel(Tout* out, const TQ* query, const 
                                               int64_t block_size, int64_t bt_row, int64_t bt_col,
                                               int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                               int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
-                                              float scale, bool causal, int window_left,
+                                              float scale, float softcap, bool causal, int window_left,
                                               int window_right) {
   const int64_t t = blockIdx.x;  // global query-token index (decode: one per req)
   const int64_t g = blockIdx.y;  // KV head (shared by QG q-heads)
@@ -480,7 +496,7 @@ __global__ void PagedAttentionDecodeGqaKernel(Tout* out, const TQ* query, const 
       for (int i = 0; i < kDecEpl; ++i) dot += q_reg[hh][i] * k_reg[i];
 #pragma unroll
       for (int o = 16; o > 0; o >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, o);
-      s_h[hh] = __shfl_sync(0xffffffffu, dot, 0) * scale;  // full-head score to lanes
+      s_h[hh] = ApplySoftcap(__shfl_sync(0xffffffffu, dot, 0) * scale, softcap);  // full-head score to lanes
     }
 
     float v_reg[kDecEpl];
@@ -554,7 +570,7 @@ __global__ void PagedFlashKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                  const int2* tiles, int num_tiles, int hq, int num_kv_heads, int d,
                                  int block_size, int64_t bt_row, int64_t bt_col, int64_t kc_blk,
                                  int64_t kc_pg, int64_t kc_hd, int64_t vc_blk, int64_t vc_pg,
-                                 int64_t vc_hd, float scale, bool causal, int window_left,
+                                 int64_t vc_hd, float scale, float softcap, bool causal, int window_left,
                                  int window_right, int bn) {
   const int tile_idx = blockIdx.x;
   const int h = blockIdx.y;  // q-head
@@ -647,7 +663,7 @@ __global__ void PagedFlashKernel(Tout* out, const TQ* query, const TKV* k_cache,
         for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
         dot = __shfl_sync(0xffffffffu, dot, 0);  // broadcast the row score
 
-        const float s = dot * scale;
+        const float s = ApplySoftcap(dot * scale, softcap);
         const float m_new = fmaxf(m, s);
         const float corr = __expf(m - m_new);  // 0 on the first key (m == -inf)
         const float pw = __expf(s - m_new);
@@ -707,7 +723,7 @@ __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_ca
                                      const int2* tiles, int num_tiles, int hq, int num_kv_heads,
                                      int d, int block_size, int64_t bt_row, int64_t bt_col,
                                      int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
-                                     int64_t vc_pg, int64_t vc_hd, float scale, bool causal,
+                                     int64_t vc_pg, int64_t vc_hd, float scale, float softcap, bool causal,
                                      int window_left, int window_right) {
   const int tile_idx = blockIdx.x;
   const int h = blockIdx.y;  // q-head
@@ -827,7 +843,7 @@ __global__ void PagedFlashWmmaKernel(Tout* out, const TQ* query, const TKV* k_ca
       for (int jj = 0; jj < tile_keys; ++jj) {
         const int j = j0 + jj;
         if ((!HasWindow || j >= jmin_i) && j <= jmax_i) {
-          const float s = Ssm[i * kWmmaBN + jj] * scale;
+          const float s = ApplySoftcap(Ssm[i * kWmmaBN + jj] * scale, softcap);
           Ssm[i * kWmmaBN + jj] = s;  // store scaled for the exp pass
           row_max = fmaxf(row_max, s);
         }
@@ -929,7 +945,7 @@ __global__ void PagedFlashWmmaGqaKernel(Tout* out, const TQ* query, const TKV* k
                                         const int2* tiles, int num_tiles, int hq, int num_kv_heads,
                                         int d, int block_size, int64_t bt_row, int64_t bt_col,
                                         int64_t kc_blk, int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
-                                        int64_t vc_pg, int64_t vc_hd, float scale, bool causal,
+                                        int64_t vc_pg, int64_t vc_hd, float scale, float softcap, bool causal,
                                         int window_left, int window_right) {
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;  // group over hq/QG groups of QG consecutive q-heads
@@ -1057,7 +1073,7 @@ __global__ void PagedFlashWmmaGqaKernel(Tout* out, const TQ* query, const TKV* k
         for (int jj = 0; jj < tile_keys; ++jj) {
           const int j = j0 + jj;
           if ((!HasWindow || j >= jmin_i) && j <= jmax_i) {
-            const float s = Ssm[i * kGqaBN + jj] * scale;
+            const float s = ApplySoftcap(Ssm[i * kGqaBN + jj] * scale, softcap);
             Ssm[i * kGqaBN + jj] = s;  // store scaled for the exp pass
             row_max = fmaxf(row_max, s);
           }
@@ -1164,7 +1180,7 @@ __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const 
                                               int block_size, int64_t bt_row, int64_t bt_col,
                                               int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                               int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
-                                              float scale, bool causal, int window_left,
+                                              float scale, float softcap, bool causal, int window_left,
                                               int window_right) {
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;
@@ -1290,7 +1306,7 @@ __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const 
         for (int jj = 0; jj < tile_keys; ++jj) {
           const int j = j0 + jj;
           if ((!HasWindow || j >= jmin_i) && j <= jmax_i) {
-            const float s = Ssm[i * kF2BN + jj] * scale;
+            const float s = ApplySoftcap(Ssm[i * kF2BN + jj] * scale, softcap);
             Ssm[i * kF2BN + jj] = s;
             row_max = fmaxf(row_max, s);
           }
@@ -1435,7 +1451,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
                                                  int block_size, int64_t bt_row, int64_t bt_col,
                                                  int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                                  int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
-                                                 float scale, bool causal, int window_left,
+                                                 float scale, float softcap, bool causal, int window_left,
                                                  int window_right) {
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;
@@ -1564,7 +1580,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
       bool valid = false;
       if (lane < tile_keys && (!HasWindow || (j0 + lane) >= jmin_i) &&
           (j0 + lane) <= jmax_i) {
-        sval = Sh[i * kF2BN + lane] * scale;
+        sval = ApplySoftcap(Sh[i * kF2BN + lane] * scale, softcap);
         valid = true;
       }
       float row_max = valid ? sval : -CUDART_INF_F;
@@ -1675,7 +1691,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, c
                                                    int block_size, int64_t bt_row, int64_t bt_col,
                                                    int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                                    int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
-                                                   float scale, bool causal, int window_left,
+                                                   float scale, float softcap, bool causal, int window_left,
                                                    int window_right) {
   constexpr int BM = MT * kWmmaM;  // query rows per block (MT WMMA M-tiles)
   const int tile_idx = blockIdx.x;
@@ -1809,7 +1825,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, c
       bool valid = false;
       if (lane < tile_keys && (!HasWindow || (j0 + lane) >= jmin_i) &&
           (j0 + lane) <= jmax_i) {
-        sval = Sh[i * kF2BN + lane] * scale;
+        sval = ApplySoftcap(Sh[i * kF2BN + lane] * scale, softcap);
         valid = true;
       }
       float row_max = valid ? sval : -CUDART_INF_F;
@@ -1958,7 +1974,7 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
           block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
           num_reqs, hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
           k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0],
-          v_cache.stride[1], v_cache.stride[2], args.scale, args.causal,
+          v_cache.stride[1], v_cache.stride[2], args.scale, args.logits_soft_cap, args.causal,
           WindowLeft(args), WindowRight(args));
       Check(cudaGetLastError(), "paged_attention decode-gqa launch");
       return;
@@ -1976,7 +1992,7 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
         block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
         num_reqs, hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
         k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0],
-        v_cache.stride[1], v_cache.stride[2], args.scale, args.causal,
+        v_cache.stride[1], v_cache.stride[2], args.scale, args.logits_soft_cap, args.causal,
         WindowLeft(args), WindowRight(args));
     Check(cudaGetLastError(), "paged_attention decode-opt launch");
     return;
@@ -1990,7 +2006,7 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
       block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(), num_reqs,
       hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
       k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1],
-      v_cache.stride[2], args.scale, args.causal, WindowLeft(args),
+      v_cache.stride[2], args.scale, args.logits_soft_cap, args.causal, WindowLeft(args),
       WindowRight(args));
   Check(cudaGetLastError(), "paged_attention decode launch");
 }
@@ -2113,7 +2129,7 @@ void LaunchPrefillFlash(cudaStream_t s, Tensor& out, const Tensor& query, const 
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal, WindowLeft(args), WindowRight(args), bn);
+      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args), bn);
   Check(cudaGetLastError(), "paged_attention prefill flash launch");
   Check(cudaFreeAsync(d_tiles, s), "paged flash tiles free");
 }
@@ -2148,7 +2164,7 @@ void LaunchPrefillWmma(cudaStream_t s, Tensor& out, const Tensor& query, const T
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal, WindowLeft(args), WindowRight(args));
+      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma tiles free");
 }
@@ -2187,7 +2203,7 @@ void LaunchPrefillWmmaGqa(cudaStream_t s, Tensor& out, const Tensor& query, cons
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal, WindowLeft(args), WindowRight(args));
+      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma-gqa launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-gqa tiles free");
 }
@@ -2230,7 +2246,7 @@ void LaunchPrefillWmmaGqaFlash2(cudaStream_t s, Tensor& out, const Tensor& query
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal, WindowLeft(args), WindowRight(args));
+      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma-flash2 launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-flash2 tiles free");
 }
@@ -2271,7 +2287,7 @@ void LaunchPrefillWmmaGqaFlash2Vec(cudaStream_t s, Tensor& out, const Tensor& qu
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal, WindowLeft(args), WindowRight(args));
+      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma-flash2vec launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-flash2vec tiles free");
 }
@@ -2313,7 +2329,7 @@ void LaunchPrefillWmmaGqaFlash2VecBM(cudaStream_t s, Tensor& out, const Tensor& 
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.causal, WindowLeft(args), WindowRight(args));
+      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma-flash2vec-bm launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-flash2vec-bm tiles free");
 }

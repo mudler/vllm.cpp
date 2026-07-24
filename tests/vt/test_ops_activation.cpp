@@ -135,6 +135,81 @@ TEST_CASE("mul_scalar: f32 exact") {
   CHECK(out[2] == 7.5f);
 }
 
+namespace {
+// Independent reference for the Gemma-2 logit soft-cap cap*tanh(x/cap), f32.
+float SoftCapRef(float x, float cap) { return cap * std::tanh(x / cap); }
+}  // namespace
+
+TEST_CASE("soft_cap golden (final_logit_softcapping semantics)") {
+  // Gemma-2 final_logit_softcapping = 30.0. Monotone squashing: |cap*tanh(x/cap)|
+  // < cap, preserving order (greedy argmax invariant).
+  const float cap = 30.0f;
+  std::vector<float> x = {0.0f, 15.0f, -45.0f, 300.0f};
+  std::vector<float> out(4, 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {4});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {4});
+  Queue q{Cpu(), nullptr};
+  vt::SoftCap(q, to, tx, cap);
+  for (int i = 0; i < 4; ++i) CHECK(out[i] == doctest::Approx(SoftCapRef(x[i], cap)));
+  CHECK(out[0] == 0.0f);            // tanh(0) = 0
+  CHECK(std::abs(out[3]) <= cap);  // saturates to cap (tanhf(10) rounds to 1.0 in f32)
+}
+
+TEST_CASE("soft_cap bit-exact vs reference at real Gemma-2 dims") {
+  // gemma-2-2b vocab_size = 256000; one row of logits soft-capped at cap=30. The
+  // CPU kernel IS the reference impl (both cap*std::tanh(x/cap), f32), so this
+  // asserts the kernel matches the independent formula EXACTLY at the real width.
+  const int64_t V = 256000;
+  const float cap = 30.0f;
+  std::vector<float> x(static_cast<size_t>(V));
+  for (size_t n = 0; n < x.size(); ++n)
+    x[n] = std::sin(0.0007f * static_cast<float>(n) + 0.2f) * 80.0f;  // spread past cap
+  std::vector<float> out(static_cast<size_t>(V), 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, V});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, V});
+  Queue q{Cpu(), nullptr};
+  vt::SoftCap(q, to, tx, cap);
+  for (int64_t i = 0; i < V; ++i)
+    CHECK(out[static_cast<size_t>(i)] == SoftCapRef(x[static_cast<size_t>(i)], cap));  // exact
+}
+
+TEST_CASE("soft_cap greedy argmax is invariant (monotone)") {
+  // The final soft-cap must not change the greedy token: argmax(cap*tanh(x/cap))
+  // == argmax(x). Proves why a greedy gate does not by itself detect it.
+  const float cap = 30.0f;
+  std::vector<float> x = {2.0f, -7.0f, 41.0f, 40.9f, 5.0f};
+  std::vector<float> out(5, 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {5});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {5});
+  Queue q{Cpu(), nullptr};
+  vt::SoftCap(q, to, tx, cap);
+  auto argmax = [](const std::vector<float>& v) {
+    int a = 0; for (int i = 1; i < static_cast<int>(v.size()); ++i) if (v[i] > v[a]) a = i; return a;
+  };
+  CHECK(argmax(out) == argmax(x));
+}
+
+TEST_CASE("soft_cap bf16 output within bf16 eps") {
+  const float cap = 30.0f;
+  std::vector<float> x = {15.0f, -45.0f};
+  std::vector<uint16_t> out(2, 0);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {2});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {2});
+  Queue q{Cpu(), nullptr};
+  vt::SoftCap(q, to, tx, cap);
+  CHECK(vt::BF16ToF32(out[0]) == doctest::Approx(SoftCapRef(15.0f, cap)).epsilon(0.01));
+  CHECK(vt::BF16ToF32(out[1]) == doctest::Approx(SoftCapRef(-45.0f, cap)).epsilon(0.01));
+}
+
+TEST_CASE("soft_cap rejects non-positive cap") {
+  std::vector<float> x(2, 1.0f);
+  std::vector<float> out(2, 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {2});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {2});
+  Queue q{Cpu(), nullptr};
+  CHECK_THROWS_AS(vt::SoftCap(q, to, tx, 0.0), std::runtime_error);
+}
+
 TEST_CASE("silu_and_mul rejects odd inner dim") {
   std::vector<float> x(3, 0.0f);
   std::vector<float> out(1, 0.0f);

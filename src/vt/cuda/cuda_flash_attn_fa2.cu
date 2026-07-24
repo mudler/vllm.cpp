@@ -383,9 +383,20 @@ void LaunchPrefillFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.d_rounded = RoundMultiple(static_cast<int>(d), 32);
   p.total_q = static_cast<int>(total_q);
 
-  p.scale_softmax = args.scale;
-  p.scale_softmax_log2 = args.scale * static_cast<float>(M_LOG2E);
-  p.softcap = 0.0f;
+  // Attention logit soft-cap fold (vLLM Attention(logits_soft_cap=...),
+  // gemma2.py:202). flash-attn convention: p.softcap = scale/cap, scale_softmax =
+  // cap, so the kernel computes cap * tanh(scale*S / cap). cap == 0 (every
+  // existing model; FA-2 is env-gated off by default) keeps the else path
+  // byte-identical to the original scaled-softmax assignments.
+  if (args.logits_soft_cap > 0.0f) {
+    p.softcap = args.scale / args.logits_soft_cap;
+    p.scale_softmax = args.logits_soft_cap;
+    p.scale_softmax_log2 = args.logits_soft_cap * static_cast<float>(M_LOG2E);
+  } else {
+    p.scale_softmax = args.scale;
+    p.scale_softmax_log2 = args.scale * static_cast<float>(M_LOG2E);
+    p.softcap = 0.0f;
+  }
 
   // Dropout disabled (inference): keep-prob 1.0.
   p.p_dropout = 1.0f;
@@ -611,6 +622,9 @@ void LaunchMlaPrefillFA2Bf16(cudaStream_t s, Tensor& out, float* lse_out,
   p.total_q = static_cast<int>(total_q);
   (void)total_k;
 
+  // MLA prefill: MlaPrefillAttentionArgs carries no logits_soft_cap (the MLA
+  // attention path never soft-caps — TritonMLAImpl rejects it, triton_mla.py:165),
+  // so this launcher keeps the plain scaled-softmax assignments unchanged.
   p.scale_softmax = args.scale;
   p.scale_softmax_log2 = args.scale * static_cast<float>(M_LOG2E);
   p.softcap = 0.0f;
@@ -801,9 +815,20 @@ void LaunchDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
   p.d_rounded = RoundMultiple(head_dim, 64);
   p.total_q = batch * query_groups;
 
-  p.scale_softmax = args.scale;
-  p.scale_softmax_log2 = args.scale * static_cast<float>(M_LOG2E);
-  p.softcap = 0.0F;
+  // Attention logit soft-cap fold (vLLM Attention(logits_soft_cap=...),
+  // gemma2.py:202). flash-attn convention: p.softcap = scale/cap, scale_softmax =
+  // cap, so the kernel computes cap * tanh(scale*S / cap). cap == 0 (every
+  // existing model; FA-2 is env-gated off by default) keeps the else path
+  // byte-identical to the original scaled-softmax assignments.
+  if (args.logits_soft_cap > 0.0f) {
+    p.softcap = args.scale / args.logits_soft_cap;
+    p.scale_softmax = args.logits_soft_cap;
+    p.scale_softmax_log2 = args.logits_soft_cap * static_cast<float>(M_LOG2E);
+  } else {
+    p.scale_softmax = args.scale;
+    p.scale_softmax_log2 = args.scale * static_cast<float>(M_LOG2E);
+    p.softcap = 0.0f;
+  }
   p.p_dropout = 1.0F;
   p.p_dropout_in_uint8_t = uint8_t(255);
   p.rp_dropout = 1.0F;
@@ -998,9 +1023,20 @@ void LaunchDecodeVarlenFA2Bf16(cudaStream_t s, Tensor& out, const Tensor& query,
   p.d_rounded = RoundMultiple(head_dim, 64);
   p.total_q = static_cast<int>(total_q);
 
-  p.scale_softmax = args.scale;
-  p.scale_softmax_log2 = args.scale * static_cast<float>(M_LOG2E);
-  p.softcap = 0.0F;
+  // Attention logit soft-cap fold (vLLM Attention(logits_soft_cap=...),
+  // gemma2.py:202). flash-attn convention: p.softcap = scale/cap, scale_softmax =
+  // cap, so the kernel computes cap * tanh(scale*S / cap). cap == 0 (every
+  // existing model; FA-2 is env-gated off by default) keeps the else path
+  // byte-identical to the original scaled-softmax assignments.
+  if (args.logits_soft_cap > 0.0f) {
+    p.softcap = args.scale / args.logits_soft_cap;
+    p.scale_softmax = args.logits_soft_cap;
+    p.scale_softmax_log2 = args.logits_soft_cap * static_cast<float>(M_LOG2E);
+  } else {
+    p.scale_softmax = args.scale;
+    p.scale_softmax_log2 = args.scale * static_cast<float>(M_LOG2E);
+    p.softcap = 0.0f;
+  }
   p.p_dropout = 1.0F;
   p.p_dropout_in_uint8_t = uint8_t(255);
   p.rp_dropout = 1.0F;

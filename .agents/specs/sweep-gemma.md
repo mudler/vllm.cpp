@@ -524,16 +524,39 @@ model); the dual per-layer rope-cache selector.
   required (ratified rule). Loader 340 tensors, registry 23/23, clean `-Werror` 0 warn.
 - **W3 — Final logit soft-cap.** Add `soft_cap` (tanh cap) to the logits path, plus the
   Gemma-2 attn soft-cap wiring through `Attention` -> FA-2. Default-inert for existing
-  models. *Gate: unit parity + regressions UNCHANGED.*
+  models. *Gate: unit parity + regressions UNCHANGED.* **LANDED 2026-07-24:** `vt::SoftCap`
+  (`kSoftCap`, appended before `kCount`; final cap, monotone/greedy-invariant, unit
+  bit-exact V=256000) + `PagedAttentionArgs.logits_soft_cap` (default 0.0) threaded into
+  the NATIVE paged-attn score kernels (`cuda_paged_attn.cu`, `ApplySoftcap=cap*fast_tanh`
+  via `tanh.approx.f32` mirroring flash-attn `cutlass::fast_tanh`), the CPU kernel, and the
+  FA-2 fold. Reality vs the spike: the DEFAULT attention path is the NATIVE `cuda_paged_attn`
+  kernels (FA-2 is env-gated OFF), so the soft-cap had to be threaded there (9 kernels), not
+  just the FA-2 launcher; the MLA fa2 launcher (`MlaPrefillAttentionArgs`) is left untouched
+  (MLA never soft-caps). cap==0 ⇒ byte-identical (regressions witness it).
 - **W4 — `Gemma2ForCausalLM`.** New `gemma2.{h,cpp}` = the Gemma-3 block minus QK-norm,
   plus attn+final soft-cap and qpas. *Gate: SACRED on gemma-2-2b-it; STRICT on
-  gemma-2-9b-it. Proves the soft-cap primitives.*
+  gemma-2-9b-it. Proves the soft-cap primitives.* **LANDED 2026-07-24:** `gemma2.{h,cpp}`/
+  `_weights`/`_registry` on `unsloth/gemma-2-2b-it` (ungated bf16 mirror; `google/*`
+  HF-gated). **near-tie-band SACRED 48/48** (vLLM K=5 ALL-DETERMINISTIC but 12/48 cells in its
+  OWN 0.5-nat band; 44 strict + 4 at gap 0.0000 nats in vLLM's own logits, 0 forward-divergent
+  — GLM-4 methodology). Soft-cap PROVEN applied (cap-on≠cap-off A/B + unit + CPU differs); the
+  4 near-ties are kernel-path-invariant (a base bf16 near-tie). No 9b run (1b/2b self-det
+  suffices per the ratified rule; disk). Loader 1427/288 tensors.
 - **W5 — `GemmaForCausalLM` (Gemma 1).** Simplest; reuses W1's GeGLU + embed-scale.
-  *Gate: SACRED on gemma-1.1-2b-it. Lowest priority, deferrable.*
+  *Gate: SACRED on gemma-1.1-2b-it. Lowest priority, deferrable.* **LANDED 2026-07-24:**
+  `gemma.{h,cpp}`/`_weights`/`_registry` on `unsloth/gemma-2b` (two fused norms/layer,
+  head_dim scale, no soft-cap/QK-norm/sliding; `hidden_act:gelu`+no `hidden_activation` ⇒
+  vLLM tanh-GeLU = our `kGeluAndMul`). **STRICT token-exact SACRED 48/48** (vLLM K=5
+  ALL-DETERMINISTIC → STRICT; BOS-verified). Loader 815/164 tensors.
 - **W6 — Gemma-4 characterization/honesty pass.** Record the 0.25.0 oracle-support
   verdict, config/registry resolution from the real MM `text_config`, and the
   PLE/YOCO/MoE/k_eq_v primitive inventory as a scoped follow-on campaign. Implement ONLY
   if W0 proved oracle support AND a text-backbone checkpoint fits. *Gate: gate 10.*
+  **LANDED 2026-07-24 (honesty pass):** `test_gemma4_honesty` 6/6 — we do NOT register
+  `Gemma4ForCausalLM` (resolving it fails loudly with the exact "not supported" oracle
+  message; the 3 ported siblings resolve). 0.25.0 registry LISTS `Gemma4ForCausalLM` but
+  every public checkpoint is multimodal-wrapped (≥12B); no bare text checkpoint. Recorded
+  HW/DEP-BLOCKED with the PLE/YOCO/Gemma-4-MoE/k_eq_v stack; NO multimodal implementation.
 - **W7 — Speed close.** Decode-graph sibling per landed Gemma + the binding every-axis
   grid vs vLLM. Nothing reaches `DONE` before this. *Gate: acceptance rule — match or
   beat vLLM on every axis.*

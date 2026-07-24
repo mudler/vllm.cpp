@@ -381,6 +381,17 @@ void MulScalarKernel(Queue&, Tensor& out, const Tensor& x, double scalar) {
   });
 }
 
+// out[i] = cap * tanh(x[i] / cap) (f32 compute, out-dtype store). The Gemma-2
+// final logit soft-cap (gemma2.py:344-345).
+// Mirrors torch: logits.div_(cap).tanh_().mul_(cap) — division, not reciprocal.
+void SoftCapKernel(Queue&, Tensor& out, const Tensor& x, double cap) {
+  const int64_t n = x.Numel();
+  const float c = static_cast<float>(cap);
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) StoreF32(out, i, c * std::tanh(LoadF32(x, i) / c));
+  });
+}
+
 void MoeSiluMulKernel(Queue&, Tensor& out, const Tensor& gate, const Tensor& up) {
   const int64_t n = out.Numel();
   // Elementwise: partition the flat output range.
@@ -1896,6 +1907,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GeluAndMulFn>(&GeluAndMulKernel)));
     RegisterOp(OpId::kMulScalar, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MulScalarFn>(&MulScalarKernel)));
+    RegisterOp(OpId::kSoftCap, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<SoftCapFn>(&SoftCapKernel)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernel)));
     RegisterOp(OpId::kScaledFp4Quant, DeviceType::kCPU,

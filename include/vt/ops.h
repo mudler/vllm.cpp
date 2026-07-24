@@ -199,6 +199,11 @@ enum class OpId : uint8_t {
   // `embed_tokens(ids) * sqrt(hidden_size)` (gemma3.py:328-341). Additive; no
   // Qwen/Llama/OPT/GLM model sets it.
   kMulScalar,
+  // Logit soft-cap: out[i] = cap * tanh(x[i] / cap) (f32 compute, out-dtype
+  // store). The Gemma-2 final logit soft-cap (gemma2.py:344-345,
+  // LogitsProcessor(soft_cap=final_logit_softcapping)) — a monotone squashing of
+  // the logits. NEW for the Gemma-2 family. Additive; default-unused otherwise.
+  kSoftCap,
   kCount
 };
 
@@ -353,6 +358,12 @@ struct PagedAttentionArgs {
   // p = seq_len - query_len + local_query_index. std::nullopt preserves the
   // existing full causal/non-causal behavior exactly.
   std::optional<AttentionWindow> window_size = std::nullopt;
+  // OPTIONAL attention logit soft-cap (vLLM Attention(logits_soft_cap=...),
+  // gemma2.py:202 attn_logit_softcapping). When > 0 each pre-softmax score S is
+  // replaced by cap * tanh(S / cap) before the online softmax. 0.0 (default)
+  // leaves the plain scaled-dot path byte-identical — every existing model uses
+  // the default, so this is diff-inert for them. Gemma-2/4 set it (50.0).
+  float logits_soft_cap = 0.0f;
   // OPTIONAL host-resident query_start_loc[num_reqs+1] (same values as the
   // device `query_start_loc` tensor). When set, the CUDA prefill flash/WMMA
   // launchers size the per-request query-tile grid from these host values and
@@ -547,6 +558,7 @@ using RmsNormFn =
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using GeluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MulScalarFn = void (*)(Queue&, Tensor&, const Tensor&, double);
+using SoftCapFn = void (*)(Queue&, Tensor&, const Tensor&, double);
 using LayerNormFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor*, const Tensor*,
                              const LayerNormArgs&);
 using ReluFn = void (*)(Queue&, Tensor&, const Tensor&);
@@ -1179,6 +1191,13 @@ void GeluAndMul(Queue& q, Tensor& out, const Tensor& x);
 // for a bf16-exact match of a torch bf16-scalar multiply). Powers the Gemma
 // embedding normalizer `embed_tokens(ids) * sqrt(hidden_size)` (gemma3.py:341).
 void MulScalar(Queue& q, Tensor& out, const Tensor& x, double scalar);
+
+// out[i] = cap * tanh(x[i] / cap), elementwise, computed in f32 and rounded to
+// out's dtype. The Gemma-2 final logit soft-cap
+// (LogitsProcessor(soft_cap=final_logit_softcapping), gemma2.py:344-345): a
+// monotone squashing that leaves greedy argmax invariant but is applied for
+// faithfulness. `cap` must be > 0. Shapes must match (same rank/extent).
+void SoftCap(Queue& q, Tensor& out, const Tensor& x, double cap);
 
 // out[..,D] = (x - mean(x)) * rsqrt(var(x) + eps) * weight + bias — torch
 // `nn.LayerNorm` over the LAST dim (ported from ATen `native_layer_norm` /

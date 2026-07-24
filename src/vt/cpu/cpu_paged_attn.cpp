@@ -60,6 +60,9 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   const int64_t num_kv_heads = k_cache.shape[2];
   const int64_t qpk = hq / num_kv_heads;  // q-heads per kv-head (GQA ratio)
   const float scale = args.scale;
+  // Attention logit soft-cap (vLLM Attention(logits_soft_cap=...), gemma2.py:202):
+  // score' = cap * tanh(score / cap). 0.0 (default) leaves the plain scaled dot.
+  const float softcap = args.logits_soft_cap;
   const int64_t window_left =
       args.window_size.has_value() ? args.window_size->left : -1;
   const int64_t window_right =
@@ -123,6 +126,7 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
           for (int64_t e = 0; e < d; ++e)
             dot += LoadF32(query, qoff + e) * LoadF32(k_cache, kbase + e);
           dot *= scale;
+          if (softcap > 0.0f) dot = softcap * std::tanh(dot / softcap);
           probs[static_cast<size_t>(j - jmin)] = dot;
           if (dot > m) m = dot;
         }

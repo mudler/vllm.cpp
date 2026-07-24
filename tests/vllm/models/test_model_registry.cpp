@@ -42,7 +42,7 @@ HfConfig Config(std::vector<std::string> architectures) {
 
 TEST_CASE("registry_imports: every registered architecture has a complete factory") {
   const auto registrations = ModelRegistry::Registrations();
-  REQUIRE(registrations.size() == 11);
+  REQUIRE(registrations.size() == 13);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -97,6 +97,11 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // adding the GeGLU + dual-rope-theta + Gemma-RMSNorm-sandwich + embed-scale
   // primitives as ONE forward/loader/registry TU + one REGISTER line.
   CHECK(has_arch("Gemma3ForCausalLM"));
+  // Sweep W4/W5: Gemma-2 (attn+final logit soft-cap, the inverse of Gemma-3's
+  // QK-norm) and Gemma-1 (the plain two-fused-norm original), each one
+  // forward/loader/registry TU + one REGISTER line, ZERO shared-array edit.
+  CHECK(has_arch("Gemma2ForCausalLM"));
+  CHECK(has_arch("GemmaForCausalLM"));
   // GLM-4.7-Flash (MLA + GLM MoE), likewise one TU + one REGISTER line.
   CHECK(has_arch("Glm4MoeLiteForCausalLM"));
 
@@ -107,20 +112,23 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // "Qwen3" prefix), then the full-attention MoE "Qwen3MoeForCausalLM", then the
   // two hybrid Qwen3.5 wrappers; resolution is order-independent.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 11);
+  REQUIRE(supported.size() == 13);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
-  // 'D' sorts first; then 'Ge'mma3 (0x65) < 'Gl'm4 (0x6C); "Glm4F" < "Glm4M"
-  // (0x46 < 0x4D) puts Glm4ForCausalLM before Glm4MoeLiteForCausalLM; then
-  // 'L'lama < 'M'istral < 'O'PT < 'Q'wen.
+  // 'D' sorts first; among the Gemmas "Gemma2" < "Gemma3" < "GemmaF" ('2' 0x32 <
+  // '3' 0x33 < 'F' 0x46), and all "Gemma*" < "Glm*" ('e' 0x65 < 'l' 0x6C); "Glm4F"
+  // < "Glm4M" puts Glm4ForCausalLM before Glm4MoeLiteForCausalLM; then 'L'lama <
+  // 'M'istral < 'O'PT < 'Q'wen.
   CHECK(supported.front() == "DeepseekV2ForCausalLM");
-  CHECK(supported[1] == "Gemma3ForCausalLM");
-  CHECK(supported[2] == "Glm4ForCausalLM");
-  CHECK(supported[3] == "Glm4MoeLiteForCausalLM");
-  CHECK(supported[4] == "LlamaForCausalLM");
-  CHECK(supported[5] == "MistralForCausalLM");
-  CHECK(supported[6] == "OPTForCausalLM");
-  CHECK(supported[7] == "Qwen3ForCausalLM");
-  CHECK(supported[8] == "Qwen3MoeForCausalLM");
+  CHECK(supported[1] == "Gemma2ForCausalLM");
+  CHECK(supported[2] == "Gemma3ForCausalLM");
+  CHECK(supported[3] == "GemmaForCausalLM");
+  CHECK(supported[4] == "Glm4ForCausalLM");
+  CHECK(supported[5] == "Glm4MoeLiteForCausalLM");
+  CHECK(supported[6] == "LlamaForCausalLM");
+  CHECK(supported[7] == "MistralForCausalLM");
+  CHECK(supported[8] == "OPTForCausalLM");
+  CHECK(supported[9] == "Qwen3ForCausalLM");
+  CHECK(supported[10] == "Qwen3MoeForCausalLM");
   CHECK(supported.back() == "Qwen3_5MoeForConditionalGeneration");
 
   // The dense/MoE scheduler policy split survives the per-variant TU move.
@@ -144,6 +152,8 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
         registration.architecture == "Glm4ForCausalLM" ||
         registration.architecture == "Glm4MoeLiteForCausalLM" ||
         registration.architecture == "Gemma3ForCausalLM" ||
+        registration.architecture == "Gemma2ForCausalLM" ||
+        registration.architecture == "GemmaForCausalLM" ||
         registration.architecture == "OPTForCausalLM") {
       // Pure text-only full-attention arch (dense OR MoE): NOT hybrid (no GDN),
       // NOT multimodal (no vision tower).
@@ -462,9 +472,11 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 11> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 13> kExampleConfigArchitectures{
       "DeepseekV2ForCausalLM",
+      "Gemma2ForCausalLM",
       "Gemma3ForCausalLM",
+      "GemmaForCausalLM",
       "Glm4ForCausalLM",
       "Glm4MoeLiteForCausalLM",
       "LlamaForCausalLM",
@@ -536,14 +548,16 @@ TEST_CASE("raise_for_unsupported: out-of-tree branch exact message") {
 }
 
 TEST_CASE("raise_for_unsupported: subset default message and order match oracle") {
-  // Gemma2ForCausalLM is the still-unported dense arch (sweep W4); Gemma3 is now
-  // SUPPORTED and appears in the sorted dict_keys below ('Ge' < 'Gl').
-  const HfConfig unknown = Config({"Gemma2ForCausalLM"});
+  // Gemma4ForCausalLM is the still-unported Gemma dense arch (sweep W6 honesty
+  // pass: MM-wrapped-only checkpoints + a PLE/YOCO/MoE campaign, gate-BLOCKED).
+  // Gemma-1/2/3 are now SUPPORTED and appear in the sorted dict_keys below.
+  const HfConfig unknown = Config({"Gemma4ForCausalLM"});
   CHECK_THROWS_WITH_AS(
       ModelRegistry::Resolve(unknown),
-      "Model architectures ['Gemma2ForCausalLM'] are not supported for now. "
+      "Model architectures ['Gemma4ForCausalLM'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['DeepseekV2ForCausalLM', 'Gemma3ForCausalLM', 'Glm4ForCausalLM', "
+      "dict_keys(['DeepseekV2ForCausalLM', 'Gemma2ForCausalLM', "
+      "'Gemma3ForCausalLM', 'GemmaForCausalLM', 'Glm4ForCausalLM', "
       "'Glm4MoeLiteForCausalLM', 'LlamaForCausalLM', "
       "'MistralForCausalLM', 'OPTForCausalLM', "
       "'Qwen3ForCausalLM', "
@@ -557,7 +571,8 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(multiple),
       "Model architectures ['UnknownA', 'UnknownB'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['DeepseekV2ForCausalLM', 'Gemma3ForCausalLM', 'Glm4ForCausalLM', "
+      "dict_keys(['DeepseekV2ForCausalLM', 'Gemma2ForCausalLM', "
+      "'Gemma3ForCausalLM', 'GemmaForCausalLM', 'Glm4ForCausalLM', "
       "'Glm4MoeLiteForCausalLM', 'LlamaForCausalLM', "
       "'MistralForCausalLM', 'OPTForCausalLM', "
       "'Qwen3ForCausalLM', "

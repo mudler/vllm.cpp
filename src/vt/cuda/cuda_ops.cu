@@ -542,6 +542,46 @@ void MulScalarKernelCuda(Queue& q, Tensor& out, const Tensor& x, double scalar) 
 }
 
 // ---------------------------------------------------------------------------
+// soft_cap: out[i] = cap * tanh(x[i] / cap) (f32 compute, out-dtype store). The
+// Gemma-2 final logit soft-cap (gemma2.py:344-345). Mirrors torch
+// logits.div_(cap).tanh_().mul_(cap).
+
+template <typename Tin, typename Tout>
+__global__ void SoftCapKernel(Tout* out, const Tin* x, int64_t n, float cap) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
+       idx += step)
+    Store(out, idx, cap * tanhf(static_cast<float>(Load(x, idx)) / cap));
+}
+
+template <typename Tin>
+void LaunchSoftCap(cudaStream_t s, Tensor& out, const Tensor& x, float cap) {
+  const int64_t n = x.Numel();
+  if (n == 0) return;
+  switch (out.dtype) {
+    case DType::kF32:
+      SoftCapKernel<Tin, float>
+          <<<GridFor(n), kBlock, 0, s>>>(out.Ptr<float>(), x.Ptr<Tin>(), n, cap);
+      break;
+    case DType::kBF16:
+      SoftCapKernel<Tin, __nv_bfloat16>
+          <<<GridFor(n), kBlock, 0, s>>>(out.Ptr<__nv_bfloat16>(), x.Ptr<Tin>(), n, cap);
+      break;
+    default: VT_CHECK(false, "cuda soft_cap: unsupported out dtype");
+  }
+  Check(cudaGetLastError(), "soft_cap launch");
+}
+
+void SoftCapKernelCuda(Queue& q, Tensor& out, const Tensor& x, double cap) {
+  const float c = static_cast<float>(cap);
+  switch (x.dtype) {
+    case DType::kF32: LaunchSoftCap<float>(AsStream(q), out, x, c); break;
+    case DType::kBF16: LaunchSoftCap<__nv_bfloat16>(AsStream(q), out, x, c); break;
+    default: VT_CHECK(false, "cuda soft_cap: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // embedding: grid-stride gather. Ids live on the device, so bounds are checked
 // in-kernel: bad ids are clamped for the gather (no OOB read) and the first bad
 // id is recorded in a device-side flag via atomicCAS. The host wrapper
@@ -1312,6 +1352,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GeluAndMulFn>(&GeluAndMulKernelCuda)));
     RegisterOp(OpId::kMulScalar, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MulScalarFn>(&MulScalarKernelCuda)));
+    RegisterOp(OpId::kSoftCap, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<SoftCapFn>(&SoftCapKernelCuda)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCUDA,

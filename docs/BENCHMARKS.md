@@ -3314,3 +3314,16 @@ byte-identical by construction. No throughput, TPOT or acceptance-rate number is
 claimed: the honest denominator is vLLM with the SAME speculative config, and
 that A/B is owed by the M-mtp-1 e2e gate, which keeps `SPEC-MTP` at `GATING` and
 `SPEC-REJECTION` short of `DONE`.
+
+Correctness evidence recorded instead (dgx.casa GB10 sm_121, CUDA 13.0, under
+`flock $HOME/gpu.lock`): clean CUDA `-Werror` build 0 warnings;
+`test_rejection_sampler` 10/10 (139 assertions); the CUDA==CPU rejection-kernel
+parity case bit-exact on accepted token ids AND `num_sampled` at the gate
+checkpoints' real vocab 248320; `compute-sanitizer --tool memcheck` ERROR
+SUMMARY 0 errors. SACRED re-witness (the shared sampler path is touched):
+OPT 63/63 and Llama-3.2-1B 92/92 PASS; Qwen3-dense and Mistral fail with
+`anchor drift` that a same-tree A/B against base `86fff01` reproduces with a
+BYTE-IDENTICAL signature (same prompt, token index, engine token id and anchor
+id), so the engine tokens are unchanged by this work and the drift is
+pre-existing golden staleness owned elsewhere. Full CPU ctest 232/238 with zero
+new failures.

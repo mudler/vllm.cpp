@@ -21990,11 +21990,47 @@ the rejection branch. No model or kernel FORWARD TU is touched (the only vt file
 edits add a NEW op and register it), so every SACRED model gate is byte-identical
 by construction.
 
-**Gates.** Clean CPU `-Werror` full rebuild, 0 warnings. Full CPU ctest run and
-the failure set diffed against base. CUDA `-Werror` build + `test_cuda_ops` +
-`compute-sanitizer` on dgx. No GPU benchmark and no speed claim
-(`benchmark_binding=false`): the honest denominator is vLLM with the SAME
-speculative config, owed by the M-mtp-1 e2e gate.
+**Gates — MEASURED.**
+
+- **CPU:** clean full `-Werror` rebuild, **0 errors / 0 warnings**. Full CPU
+  ctest **232/238** (`CTEST_RC=8`, 1485 s). SIX failures, **zero of them new**:
+  * `test_model_loader_gguf`, `test_model_registry` — PRE-EXISTING at base, I2
+    RCA'd them by stashing and rebuilding at base.
+  * `test_bpe` (1/852 assertions) — PRE-EXISTING, proven WITHOUT a rebuild from
+    the compiler's own dependency files: `bpe.cpp.o.d`, `tokenizer.cpp.o.d` and
+    `test_bpe.cpp.o.d` each match **0** of the ten files this commit changes, so
+    their object code is identical to base's by construction. Traced to commit
+    `4e9f1d2` (recent-dense batch3, already in base), which removed the
+    `lstrip`/`rstrip`/`single_word` loader throw that `tests/vllm/test_bpe.cpp:323`
+    still expects. Owned by `CLAIM-SWEEP-RECENT-DENSE`, not by I3.
+  * `test_engine_core_proc`, `test_openai_api_server`, `test_openai_conformance`
+    — LOAD-SENSITIVE FLAKES under `-j20`: re-run STANDALONE they are **10/10 (92
+    assertions)**, **22/22 (296)** and **23/23 (252)** GREEN. I2 recorded the same
+    `test_openai_conformance` flake.
+- **CUDA (dgx.casa, GB10 sm_121, CUDA 13.0):** clean `-Werror` build
+  `BUILD_RC=0`, **0 warnings** (`grep -ci warning build.log` == 0).
+  `test_rejection_sampler` **10/10 (139 assertions)**, `test_prepare_inputs`
+  **9/9 (61)**, and the CUDA==CPU parity case **1/1 (4)** — bit-exact accepted ids
+  AND `num_sampled` at vocab **248320** over `k_i ∈ {1,3,0,2}`.
+  `compute-sanitizer --tool memcheck` on the rejection kernel: **ERROR SUMMARY:
+  0 errors**.
+- **SACRED re-witness (shared sampler path touched → re-witnessed under
+  `flock $HOME/gpu.lock`, one at a time):** `test_opt_paged_engine` **63/63** and
+  `test_llama_paged_engine` **92/92** PASS. `test_qwen3_paged_engine` (0.6B + 4B)
+  and `test_mistral_paged_engine` fail with `anchor drift` — **PRE-EXISTING at
+  base, proven by a same-tree A/B**: swapping in base `86fff01`
+  `runner.{h,cpp}` + `prepare_inputs.{h,cpp}` (everything else identical) and
+  rebuilding reproduces the failure with a **BYTE-IDENTICAL signature** —
+  qwen3-0.6B `prompt[0] tok=5 engine=15344 anchor=96251`, qwen3-4B
+  `prompt[2] tok=11 engine=323 anchor=111`, mistral
+  `prompt[5] tok=10 engine=1281 anchor=1535`. Identical ENGINE token ids on both
+  arms is a STRONGER inertness proof than a pass: I3 changes no sampled token.
+  The drift is stale-anchor/golden staleness (the mistral message itself says
+  "re-run qwen3-neartie-gap.py to refresh the gap golden") introduced somewhere
+  in base, and it is NOT chased here.
+- No GPU benchmark and no speed claim (`benchmark_binding=false`): the honest
+  denominator is vLLM with the SAME speculative config, owed by the M-mtp-1 e2e
+  gate.
 
 **States.** `SPEC-REJECTION` `READY` → `ACTIVE` (its first `ours` cell) — NOT
 `DONE`, because the e2e greedy token gate is owed. `SPEC-MTP` STAYS `GATING`.

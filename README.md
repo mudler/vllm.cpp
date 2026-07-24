@@ -58,7 +58,7 @@ Every model below passes a token-for-token correctness gate against the pinned v
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively (RedHatAI/Qwen3-32B-NVFP4A16), correctness-complete and speed-pending.
 
-Larger DeepSeek / GLM / MiniMax variants are recorded as **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or **spiked-only**, per the [model matrix](.agents/model-matrix.md). The matrix opens with an architecture-support checklist (a per-architecture status roll-up covering every engaged model) that a CI checker keeps in lockstep with the detailed rows.
+The **Gemma family (Gemma 1/2/3/4)** is **spiked-only** ([spike](.agents/specs/sweep-gemma.md), 2026-07-24), designed but not yet implemented. The newest registered variant is Gemma 4, but its only public checkpoints are multimodal-wrapped and it needs a large new primitive stack (per-layer embeddings, YOCO KV-sharing, a Gemma-4 MoE), so the recommended first gate vehicle is Gemma 3 (`google/gemma-3-1b-it`). Most of Gemma reuses infrastructure already in the tree (gemma-RMSNorm, the GLM sandwich norms, the SentencePiece tokenizer, sliding-window attention, QK-norm, tied embeddings); the one genuinely-new compute kernel is GeGLU. Larger DeepSeek / GLM / MiniMax / Gemma-4 variants are recorded as **hardware-blocked** (they do not fit 119 GiB of unified memory on this box) or **spiked-only**, per the [model matrix](.agents/model-matrix.md). The matrix opens with an architecture-support checklist (a per-architecture status roll-up covering every engaged model) that a CI checker keeps in lockstep with the detailed rows.
 
 ## Performance
 

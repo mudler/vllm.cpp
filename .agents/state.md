@@ -21298,3 +21298,27 @@ task-scoped subagent in an isolated worktree.
 
 Open engine item CLOSED by this change: "minja namespace/macro/filters for
 full template fidelity" (was the caveat on the chat-ABI entries).
+
+## 2026-07-24 — Gemma family (Gemma 1/2/3/4) SPIKE — spec + records only (`CLAIM-SWEEP-GEMMA`)
+
+**SPIKE ONLY. No implementation, no kernels, no build, no GPU work, nothing downloaded.** Answers the user's explicit next model target after GLM ("and then we do gemma", said as "gemma 4"). Base `d85fd04` (GLM-4.7-Flash G1 landed), oracle pin `/home/mudler/_git/vllm` @ `e24d1b24`, dgx oracle vLLM 0.25.0. Isolated worktree `.claude/worktrees/agent-gemma-spike`, branch `spike-gemma-family`. Four model-matrix rows `INVENTORIED` -> `SPIKE`: `MODEL-TEXT-gemma{,2,3,4}-*-for-causal-lm`.
+
+**Newest registered Gemma = Gemma 4, and it is real.** `registry.py:110` `Gemma4ForCausalLM` (`gemma4.py`, 1715 lines). Public checkpoints exist (HF API, metadata only): `google/gemma-4-12B-it` 11.96B (`Gemma4UnifiedForConditionalGeneration`, ungated), `-31B-it` 32.68B and `-26B-A4B-it` 26.5B MoE (`Gemma4ForConditionalGeneration`), plus `unsloth/gemma-4-*-GGUF`. **But ALL public Gemma-4 checkpoints are multimodal-wrapped** — the bare `Gemma4ForCausalLM` text row has NO standalone checkpoint (extract via `_get_text_config`). Gemma 4 needs a large NEW primitive stack no other row uses: Per-Layer Embeddings (PLE), YOCO self/cross split, KV-sharing layers, a parallel Gemma-4 MoE (weight-less-RMSNorm + root_size + learned-scale + fp32 GateLinear router; softmax-over-all -> top-k -> renorm; `per_expert_scale` folded), k_eq_v layers, weight-less V-norm, double-wide MLP, per-layer scalar, `scaling=1.0`. So Gemma 4 **leads the characterization but is gate-BLOCKED as a first vehicle** (MM-only checkpoints + 0.25.0 oracle-support UNVERIFIED (likely absent — very new arch) + the primitive-stack campaign). Mirrors how the GLM spike handled `Glm4MoeForCausalLM`.
+
+**Recent-first gate vehicle that FITS + is oracle-certain = Gemma 3.** `Gemma3ForCausalLM` on `google/gemma-3-1b-it` (1.0B / ~2 GiB, pure text) — primary; `gemma-3-270m` (268M) CI-scale; `gemma-3-4b-it` text backbone (4.3B) strict check. Gate form BY MEASUREMENT (K=5 vLLM self-determinism first; 1B is small-dense near-tie regime, STRICT on the bigger 4B).
+
+**Reuse-vs-new (verified in `src/`/`include/` on `d85fd04`).** The two primitives the task flagged are BOTH already ours, plus more:
+- **gemma-RMSNorm `(1+w)` fp32** — `vt::RmsNorm {gemma=true}` (`include/vt/recipes.h:22-42,55-73`), used by GLM-4. REUSE.
+- **Sandwich norms** — standalone `vt::RmsNorm` on sublayer output before residual add, `src/vllm/model_executor/models/glm4.cpp:155-188` (landed `b568d20`). Gemma-2/3 pre/post-ff norms are the same pattern. REUSE — cross-family additivity proof GLM -> Gemma.
+- **SentencePiece tokenizer** — `src/vllm/tokenizer/tokenizer.cpp:175-189,449-475` (Metaspace -> `kSentencePiece`; comments name "Mistral/Gemma"); `ExtractBosEos` + `PrependScheme`. REUSE (W0 verifies BOS vs oracle per the OPT lesson).
+- **Sliding-window / interleaved local+global** — FA-2 `window_size_left/right` (`src/vt/cuda/cuda_flash_attn_fa2.cu:397-407`) + `SlidingWindowSpec`/`ChunkedLocalAttentionSpec` KV specs (`src/vllm/v1/kv_cache_interface.cpp:76-95`). REUSE at kernel+KV-spec level; NEW = per-layer routing + a second local-theta rope cache.
+- **QK-norm + rope preamble** — `kAttnQkNormRopeGate` (`include/vt/recipes.h:231-244`), gemma-RMSNorm(q/k)+NeoX rope. REUSE (Gemma-3/4 QK-norm).
+- **Tied embeddings** — existing `tie_word_embeddings` loader path (opt/qwen3_dense/glm4). REUSE.
+
+**Genuinely NEW (small set for the Gemma-3 vehicle):** (1) **GeGLU** (`gelu_pytorch_tanh`+mul) — we have ONLY SiLU (`include/vt/ops.h:91` `kSiluAndMul`; zero `gelu` hits). The one new compute kernel `kGeluAndMul`. (2) **Final logit soft-cap** — no `soft_cap`/`tanh` in `include/vllm/v1/sample/logits_processor/builtin.{h,cpp}`/`sampler.cpp`; add `cap*tanh(logits/cap)`. (3) **`query_pre_attn_scalar` scaling + `sqrt(hidden)` embed-scale** — two scalars. (4) **Dual per-layer rope theta + per-layer sliding routing** (Gemma-3 wiring). **Per-version delta:** Gemma-2 has an ATTENTION logit soft-cap; Gemma-3 REMOVED it and added QK-norm. The FA-2 kernel has soft-cap capability but our `Attention` ctor does not thread `logits_soft_cap` — that wiring is the Gemma-2 delta, not the Gemma-3 one.
+
+**W-order:** W0 ground HW (verify 0.25.0 constructs Gemma3, probe Gemma4, fetch gemma-3-1b, K=5 determinism + BOS verify) → W1 shared additive GeGLU+embed-scale+qpas → W2 Gemma-3 block + first SACRED gate → W3 final soft-cap (+Gemma2 attn soft-cap wiring) → W4 Gemma2 (proves soft-cap) → W5 Gemma1 → W6 Gemma4 honesty pass → W7 speed close. No hard MLA/router dependency; every Gemma-3/2/1 gate is a pure dense-path bring-up on landed infra.
+
+**Regression set (non-negotiable for the implementing Ws, all 10 SACRED gates):** 27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense (0.6B+4B 16/16), OPT 6/6, DeepSeek-V2-Lite 8/8, Llama 16/16, Mistral 16/16, GLM-4-9B 16/16, GLM-4.7-Flash 8/8. Every new op is additive + default-inert.
+
+**Files (records only):** NEW `.agents/specs/sweep-gemma.md`; EDIT `.agents/model-matrix.md` (4 rows INVENTORIED->SPIKE + rollup SPIKE 6->10/INVENTORIED 303->299 + 4 checklist rows), `.agents/coordination.md` (`CLAIM-SWEEP-GEMMA`), `.agents/roadmap_v1.md` (`ROAD-V1-C2`), `.agents/parity-ledger.md`, `README.md`, `docs/BENCHMARKS.md`. **Nothing claims READY/ACTIVE/DONE; speed N/A (spike).**

@@ -431,6 +431,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/granite4.cpp
   src/vllm/entrypoints/openai/tool_parsers/granite_20b_fc.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/abstract.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/detect.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/basic.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/deepseek_r1.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/mistral.cpp

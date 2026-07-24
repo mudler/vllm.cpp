@@ -34,6 +34,8 @@
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"  // get_tool_parser
 #include "vllm/entrypoints/openai/tool_parsers/detect.h"    // DetectToolParser
+#include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"  // get_reasoning_parser
+#include "vllm/entrypoints/openai/reasoning_parsers/detect.h"  // DetectReasoningParser
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/version.h"
@@ -63,6 +65,9 @@ struct vllm_engine {
   // first chat call fails with VLLM_ERR_INVALID_ARGUMENT (checked in
   // EnsureChatServing). Tests set it via vllm::capi::SetEngineToolParser.
   std::string tool_parser;
+  // ABI v5 reasoning-parser selection ("" = auto-detect from the template;
+  // "none" = force-disabled). Tests set it via SetEngineReasoningParser.
+  std::string reasoning_parser;
   // Lazily-built chat serving handler over the shared AsyncLLM (one per
   // handle; create_chat_completion is safe for concurrent callers, matching
   // the HTTP server's worker pool). Guarded by chat_mutex for the lazy build.
@@ -280,6 +285,26 @@ vllm::entrypoints::openai::OpenAIServingChat& EnsureChatServing(
                                   "\" (not a registered parser)");
     }
 
+    // Reasoning selection (ABI v5): explicit wins ("none" disables), else
+    // detect from the template; no detection => disabled (a reasoning parser
+    // actively splits text, so silence is the only safe default).
+    std::string reasoning_name;
+    if (!engine->reasoning_parser.empty()) {
+      if (engine->reasoning_parser != "none") {
+        reasoning_name = engine->reasoning_parser;
+      }
+    } else if (!raw_template.empty()) {
+      reasoning_name =
+          vllm::entrypoints::openai::DetectReasoningParser(raw_template);
+    }
+    if (!reasoning_name.empty() &&
+        vllm::entrypoints::openai::get_reasoning_parser(reasoning_name) ==
+            nullptr) {
+      throw std::invalid_argument("unknown reasoning parser \"" +
+                                  reasoning_name +
+                                  "\" (not a registered parser)");
+    }
+
     std::string served_name =
         engine->model_path.empty()
             ? std::string("model")
@@ -287,7 +312,8 @@ vllm::entrypoints::openai::OpenAIServingChat& EnsureChatServing(
     engine->chat_serving =
         std::make_unique<vllm::entrypoints::openai::OpenAIServingChat>(
             engine->loaded->async_engine(), std::move(served_name),
-            std::move(prompt_fn), std::move(parser_name));
+            std::move(prompt_fn), std::move(parser_name),
+            std::move(reasoning_name));
   }
   return *engine->chat_serving;
 }
@@ -384,6 +410,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.max_model_len = 0;
   p.max_num_seqs = 8;
   p.tool_parser = nullptr;  // AUTO-detect from the chat template (ABI v4).
+  p.reasoning_parser = nullptr;  // AUTO-detect / disabled (ABI v5).
   return p;
 }
 
@@ -438,6 +465,8 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
     handle->model_path = params->model_path;
     // ABI v4: copy the caller's tool-parser selection (NULL => empty => AUTO).
     if (params->tool_parser != nullptr) handle->tool_parser = params->tool_parser;
+    if (params->reasoning_parser != nullptr)
+      handle->reasoning_parser = params->reasoning_parser;
     *out = handle;
     ClearError();
     return VLLM_OK;
@@ -847,6 +876,10 @@ vllm_engine* MakeEngineHandle(
 
 void SetEngineToolParser(vllm_engine* handle, const std::string& name) noexcept {
   if (handle != nullptr) handle->tool_parser = name;
+}
+
+void SetEngineReasoningParser(vllm_engine* engine, std::string name) noexcept {
+  if (engine != nullptr) engine->reasoning_parser = std::move(name);
 }
 
 }  // namespace vllm::capi

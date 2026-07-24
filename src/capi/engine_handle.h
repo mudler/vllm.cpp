@@ -37,6 +37,10 @@ vllm_engine* MakeEngineHandle(
 // the parser). NULL handle is a no-op. Empty name restores AUTO detection.
 void SetEngineToolParser(vllm_engine* handle, const std::string& name) noexcept;
 
+// Test hook: select the ABI v5 reasoning parser on a handle (mirrors
+// SetEngineToolParser).
+void SetEngineReasoningParser(vllm_engine* engine, std::string name) noexcept;
+
 }  // namespace vllm::capi
 
 #endif  // VLLM_CAPI_ENGINE_HANDLE_H_

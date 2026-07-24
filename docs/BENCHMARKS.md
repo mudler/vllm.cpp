@@ -2033,6 +2033,23 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Reasoning-parser selection through the C ABI (ABI v5) - `NOT APPLICABLE`
+  (2026-07-24, `CLAIM-CAPI-REASONING-V5`).** `benchmark_binding=false`.
+  **API-surface change + one real bug fix, no decode-path change.**
+  `vllm_model_params.reasoning_parser` (NULL = auto-detect from the chat
+  template via `reasoning_parsers/detect.{h,cpp}`: "[THINK]" -> mistral,
+  "<think>" -> deepseek_r1, nothing -> DISABLED - unlike tool detection there
+  is no safe fallback parser; "none" force-disables; unknown names ->
+  `VLLM_ERR_INVALID_ARGUMENT` on the first chat call). Bug fix surfaced by the
+  new capi tests: the NON-STREAM serving path split the RAW detokenizer output
+  and attached the reasoning span WITHOUT `SanitizeUtf8` (content gets it),
+  so invalid UTF-8 in a reasoning turn failed response serialization; now
+  sanitized identically (think markers are ASCII, so no multi-byte sequence
+  can straddle the split). Evidence: `test_reasoning_parser_detect` 4 cases,
+  `test_capi` 24/24 (167 asserts, +2 cases), `test_openai_serving` green,
+  C11 header compile clean. No binding number is created, re-based, or
+  invalidated.
+
 - **Tool-parser wave B2 + the reasoning-parser seam - `NOT APPLICABLE`
   (2026-07-24, `CLAIM-TOOL-PARSERS-B2`).** `benchmark_binding=false`.
   **Serving-layer additions, no decode-path change.** Eleven more tool

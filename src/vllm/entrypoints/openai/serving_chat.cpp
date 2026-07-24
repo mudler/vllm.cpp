@@ -193,7 +193,11 @@ ShapedChatMessage ShapeChatMessage(
   }
   const auto attach_reasoning = [&]() {
     if (reasoning.has_value() && !reasoning->empty()) {
-      shaped.message.reasoning = reasoning;
+      // Same contract as every content assignment below: the non-stream path
+      // splits the RAW detokenizer output, so the reasoning span needs the
+      // same UTF-8 sanitization content gets (think markers are ASCII, so a
+      // multi-byte sequence can never straddle the split boundary).
+      shaped.message.reasoning = SanitizeUtf8(*reasoning);
     }
   };
 

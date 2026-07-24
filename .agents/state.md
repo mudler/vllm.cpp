@@ -21438,3 +21438,29 @@ Base `a20a11c`, worktree `gemma3-w0w2`, dgx build/gate `~/work/gemma3-w0w2` (git
 **W2 (Gemma-3 dense block + SACRED gate).** `gemma3.{h,cpp}` composes the Gemma vocabulary reusing the GLM-4 sandwich-norm layout (`glm4.cpp:158-188`) + `dense_attn_block.h` device glue + the shape-agnostic FA-only KV: GemmaRMSNorm `(1+w)` everywhere, per-head Gemma q/k norm before RoPE, **dual per-layer RoPE theta** (global vs `rope_local_base_freq`, routed by `sliding_window_pattern`), `query_pre_attn_scalar**-0.5` scale, per-layer sliding window (masked at the FA kernel; inert < window for the short gate), GeGLU MLP, `sqrt(hidden)` bf16 embed-scale, tied lm_head. `gemma3_weights.cpp` loader (four sandwich norms/layer; tied lm_head omitted by the ckpt) + `gemma3_registry.cpp` (one REGISTER + FA-only KV). **SACRED gate `test_gemma3_forward`: STRICT token-exact 48/48** greedy tokens vs vLLM 0.25.0 (tokenizer-free — feeds vLLM's exact BOS-prefixed ids into our CUDA prefill, re-prefilling the growing prefix; mirrors the Mistral `LOAD-SENTENCEPIECE` blocker path). Loader gate `test_gemma3_load` **1/1** (1687, all 340 tensors, 0 leftover). Registry `test_model_registry` **23/23** (Gemma3 resolves to the dense factory; ALSO repaired a pre-existing-stale registry test that never enumerated `Glm4MoeLiteForCausalLM` — the base was internally inconsistent at 9 vs the real 10 registrations, a merge-race artifact; now 11 with Gemma3).
 
 **Gates.** Clean full CUDA `-Werror` build **0 warnings**. compute-sanitizer memcheck (new kernels + gemma forward), regressions, and the five record checkers are the closing evidence (see the closing commit + ledger). Row `ACTIVE` (correctness complete, speed PENDING). W3-W7 (final soft-cap + Gemma2/1 + Gemma4 honesty + speed) NOT started.
+
+## 2026-07-24 — ABI v5: reasoning-parser selection + template auto-detection; non-stream reasoning UTF-8 sanitize fix (`CLAIM-CAPI-REASONING-V5`)
+
+Completes the selection story the wave-B2 seam left open. `vllm_model_params`
+gains `reasoning_parser` (ABI v4→v5, appended field): NULL/empty = AUTO
+(template markers: "[THINK]" → mistral, "<think>" → deepseek_r1 — ordered,
+mirroring the tool table; NO detection = DISABLED, because unlike tool
+parsing there is no safe fallback: a reasoning parser actively splits text);
+"none" = force-disabled; any other value must be registered or the first
+chat call fails VLLM_ERR_INVALID_ARGUMENT. minimax_m2/olmo3/step3 stay
+explicit-only (their tells are not template-stable vs deepseek_r1).
+
+Bug fix caught by the new capi coverage BEFORE shipping: ShapeChatMessage
+splits the RAW detokenizer output, and `attach_reasoning` stored the
+reasoning span WITHOUT SanitizeUtf8 while every content assignment sanitizes
+— an invalid-UTF-8 reasoning turn failed whole-response serialization
+(json.exception.type_error.316). Now sanitized identically; think markers
+are ASCII so no multi-byte sequence can straddle the split. The streaming
+path was already safe (deltas sanitized at ingestion).
+
+Evidence: test_reasoning_parser_detect 4/4 (incl. registered-parser
+invariant), test_capi 24/24 (167 asserts; unknown-name rejection +
+explicit/none cases), test_openai_serving, test_tool_parser_detect,
+test_chat_prompt green. Test hook SetEngineReasoningParser mirrors the v4
+tool hook. LocalAI mirror update (struct layout v5 + tool_parser/
+reasoning_parser model options) is the program's closing slice.

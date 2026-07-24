@@ -903,6 +903,42 @@ TEST_CASE("capi: an explicit registered tool_parser (hermes) serves normally") {
   vllm_engine_free(eng);
 }
 
+// ─── reasoning-parser selection (ABI v5) ─────────────────────────────────────
+TEST_CASE("capi: an unknown reasoning parser is rejected on the first chat call") {
+  vllm_engine* eng = MakeSyntheticChatEngine();
+  REQUIRE(eng != nullptr);
+  vllm::capi::SetEngineReasoningParser(eng, "no-such-reasoner");
+
+  const char* request =
+      "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+      "\"temperature\":0,\"max_tokens\":2}";
+  char* response = nullptr;
+  CHECK(vllm_chat(eng, request, &response) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(response == nullptr);
+  CHECK(std::string(vllm_last_error()).find("reasoning") != std::string::npos);
+  vllm_engine_free(eng);
+}
+
+TEST_CASE("capi: explicit deepseek_r1 and the 'none' opt-out both serve chat") {
+  for (const char* choice : {"deepseek_r1", "none"}) {
+    CAPTURE(choice);
+    vllm_engine* eng = MakeSyntheticChatEngine();
+    REQUIRE(eng != nullptr);
+    vllm::capi::SetEngineReasoningParser(eng, choice);
+    const char* request =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"temperature\":0,\"max_tokens\":2}";
+    char* response = nullptr;
+    const vllm_status st = vllm_chat(eng, request, &response);
+    const std::string last_err = vllm_last_error();
+    CAPTURE(last_err);
+    REQUIRE(st == VLLM_OK);
+    REQUIRE(response != nullptr);
+    vllm_string_free(response);
+    vllm_engine_free(eng);
+  }
+}
+
 // ─── version / abi ───────────────────────────────────────────────────────────
 TEST_CASE("capi: version and abi-version are exposed") {
   CHECK(std::string(vllm_version()).size() > 0);

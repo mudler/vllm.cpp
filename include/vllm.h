@@ -51,9 +51,10 @@ extern "C" {
  * templating, tool_choice lowering, and streaming tool-call parsing run
  * ENGINE-SIDE.
  * v4: tool_parser field appended to vllm_model_params — selects the tool-call
+ * v5: vllm_model_params.reasoning_parser (chain-of-thought split selection).
  * parser for the chat entry points, or AUTO-detects it from the chat template
  * when NULL/empty. */
-#define VLLM_ABI_VERSION 4
+#define VLLM_ABI_VERSION 5
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -117,6 +118,18 @@ typedef struct vllm_model_params {
    * "hermes", "qwen3"); an unknown name fails the first chat call with
    * VLLM_ERR_INVALID_ARGUMENT. Borrowed for the vllm_engine_load call only. */
   const char* tool_parser;
+  /* ── Reasoning parser (ABI v5) ──────────────────────────────────────────────
+   * Selects the parser that splits chain-of-thought from user-visible content
+   * for the chat entry points; reasoning streams as the `reasoning` field of
+   * the chat chunks and is stripped BEFORE tool-call parsing. NULL or "" =>
+   * AUTO: detected from the model's chat template at the first chat call
+   * ("[THINK]" selects "mistral", "<think>" selects "deepseek_r1"; nothing
+   * detected => reasoning parsing disabled). "none" => force-disabled. Any
+   * other value MUST name a registered reasoning parser (e.g. "deepseek_r1",
+   * "mistral", "minimax_m2", "step3", "olmo3"); an unknown name fails the
+   * first chat call with VLLM_ERR_INVALID_ARGUMENT. Borrowed for the
+   * vllm_engine_load call only. */
+  const char* reasoning_parser;
 } vllm_model_params;
 
 /* ── Sampling parameters ──────────────────────────────────────────────────────

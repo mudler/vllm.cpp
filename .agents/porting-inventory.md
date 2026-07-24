@@ -292,7 +292,10 @@ running the engine-side serving-chat pipeline (chat template incl. GGUF
 tool_choice, streaming Hermes tool parsing); 17→19 exported symbols. ABI v4 (2026-07-24, `CLAIM-CAPI-PARSER-SELECT`):
 `vllm_model_params.tool_parser` (NULL = auto-detect from the chat template via
 the ordered marker table in `tool_parsers/detect.{h,cpp}`, llama.cpp-inspired;
-one row per parser family). The
+one row per parser family). ABI v5 (2026-07-24, `CLAIM-CAPI-REASONING-V5`):
+`vllm_model_params.reasoning_parser` (auto-detect "[THINK]"/"<think>" via
+`reasoning_parsers/detect.{h,cpp}`, no-detection = disabled, "none" =
+force-off). The
 richer C++ API (`include/vllm/*.hpp` mirroring `LLM`/`AsyncLLM`) is later.
 Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI server),
 `examples/bench` (M2). DoD (LocalAI-style dlopen consumption) MET.

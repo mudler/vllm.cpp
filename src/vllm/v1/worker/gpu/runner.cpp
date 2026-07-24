@@ -24,6 +24,7 @@
 #include "vllm/v1/kv_offload/lmcache/lmcache_connector.h"  // KV-EXTERNAL-CACHE worker store/load
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
 #include "vllm/v1/worker/gpu/async_runner_flag.h"  // VT_ASYNC_RUNNER predicate
+#include "vllm/v1/spec_decode/rejection_sampler.h"  // SPEC-REJECTION I3 verify half
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
 #include "vt/dtype.h"  // VT_CHECK
 #include "vt/tensor.h"
@@ -881,16 +882,21 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
 vt::Tensor GPUModelRunner::assemble_sample_logits(
     const std::optional<GrammarOutput>& grammar_output,
     std::vector<float>& sampled_logits) {
-  const int num_reqs = exec_state_.num_reqs;
+  // The number of LOGIT ROWS the sampler runs on. Non-speculative (the
+  // production default) this is exactly num_reqs — prepare_inputs sets
+  // cu_num_logits = arange(num_reqs+1), so cu_num_logits.back() == num_reqs and
+  // every expression below is byte-identical to the pre-SPEC-REJECTION code.
+  // Under spec decode it is Σ(1 + k_i) (spec §2.4 / StepInputs::cu_num_logits).
+  const int num_logits = step_num_logits();
   const int64_t vocab = config_.vocab_size;
 
-  // Assemble the [num_reqs, vocab] logits the sampler runs on. Three cases:
+  // Assemble the [num_logits, vocab] logits the sampler runs on. Three cases:
   //
   //  (A) DEVICE path (default, gather ON): the forward already produced exactly
-  //      num_reqs rows in request order, ON DEVICE — hand the sampler the device
+  //      num_logits rows in request order, ON DEVICE — hand the sampler the device
   //      tensor directly (its argmax / temperature / top-k/top-p kernels run
   //      on-device; only the sampled token ids come back). No full-logits D2H.
-  //  (A') VT_GPU_SAMPLE=0 A/B: Download the device [num_reqs,vocab] logits to a
+  //  (A') VT_GPU_SAMPLE=0 A/B: Download the device [num_logits,vocab] logits to a
   //      host buffer and sample from it (the OLD download-then-sample path).
   //  (B) HOST path (VT_LOGITS_GATHER=0): full [num_actual_tokens,vocab] host
   //      logits — re-gather the per-request rows on host via logits_indices,
@@ -898,13 +904,13 @@ vt::Tensor GPUModelRunner::assemble_sample_logits(
   vt::Tensor logits;
   ForwardLogits& fl = exec_state_.logits;
   if (fl.on_device()) {
-    VT_CHECK(fl.rows == num_reqs,
-             "sample_tokens: device logits rows must equal num_reqs");
+    VT_CHECK(fl.rows == num_logits,
+             "sample_tokens: device logits rows must equal the expanded logits rows");
     if (GpuSampleEnabled()) {
       logits = fl.device_tensor;  // (A) sample straight off device
     } else {
       // (A') download then sample (A/B: reproduce the pre-change host path).
-      sampled_logits.resize(static_cast<size_t>(num_reqs) *
+      sampled_logits.resize(static_cast<size_t>(num_logits) *
                             static_cast<size_t>(vocab));
       vt::Backend& b = vt::GetBackend(queue_.device.type);
       b.Copy(queue_, sampled_logits.data(), fl.device_tensor.data,
@@ -912,17 +918,17 @@ vt::Tensor GPUModelRunner::assemble_sample_logits(
       b.Synchronize(queue_);
       logits = vt::Tensor::Contiguous(
           sampled_logits.data(), vt::DType::kF32, queue_.device,
-          {static_cast<int64_t>(num_reqs), vocab});
+          {static_cast<int64_t>(num_logits), vocab});
     }
-  } else if (fl.rows == num_reqs) {
+  } else if (fl.rows == num_logits) {
     logits = vt::Tensor::Contiguous(
         fl.host.data(), vt::DType::kF32, queue_.device,
-        {static_cast<int64_t>(num_reqs), vocab});
+        {static_cast<int64_t>(num_logits), vocab});
   } else {
-    // (B) VT_LOGITS_GATHER=0: re-gather num_reqs rows from full [T,vocab] host.
-    sampled_logits.resize(static_cast<size_t>(num_reqs) *
+    // (B) VT_LOGITS_GATHER=0: re-gather the logits rows from full [T,vocab] host.
+    sampled_logits.resize(static_cast<size_t>(num_logits) *
                           static_cast<size_t>(vocab));
-    for (int i = 0; i < num_reqs; ++i) {
+    for (int i = 0; i < num_logits; ++i) {
       const int row = exec_state_.step.logits_indices[static_cast<size_t>(i)];
       std::memcpy(
           sampled_logits.data() + static_cast<size_t>(i) * static_cast<size_t>(vocab),
@@ -932,18 +938,114 @@ vt::Tensor GPUModelRunner::assemble_sample_logits(
     }
     logits = vt::Tensor::Contiguous(
         sampled_logits.data(), vt::DType::kF32, queue_.device,
-        {static_cast<int64_t>(num_reqs), vocab});
+        {static_cast<int64_t>(num_logits), vocab});
   }
 
   // Apply the structured-output grammar bitmask (utils.py apply_grammar_bitmask)
-  // to the gathered [num_reqs, vocab] logits BEFORE sampling, when a structured
-  // request is scheduled this step (gpu_model_runner.py:4462-4466). Spec-decode
-  // is deferred at T0, so pass an empty spec-token map (per-req offset 0).
+  // to the gathered [num_logits, vocab] logits BEFORE sampling, when a structured
+  // request is scheduled this step (gpu_model_runner.py:4462-4466). The grammar
+  // bitmask over the EXPANDED spec rows (a bitmask row per draft position) is
+  // DEFERRED with SPEC-MTP (spec §Protocol-compliance "Grammar bitmask under
+  // spec decode: OUT of scope"), so the spec-token map stays empty (per-req
+  // offset 0) — correct while num_draft_tokens == 0, which is the only state
+  // the runner can reach today.
   if (grammar_output.has_value()) {
     apply_grammar_bitmask(*grammar_output, exec_state_.req_ids, {}, queue_,
                           logits);
   }
   return logits;
+}
+
+// step_num_logits: the number of expanded logit rows this step (spec §2.4).
+// cu_num_logits is arange(num_reqs+1) on the non-speculative path, so this is
+// exactly num_reqs there; the `.empty()` guard covers a StepInputs built by an
+// older direct-runner test that never went through prepare_inputs.
+int GPUModelRunner::step_num_logits() const {
+  const std::vector<int32_t>& cu = exec_state_.step.cu_num_logits;
+  return cu.empty() ? exec_state_.num_reqs : cu.back();
+}
+
+// The SPEC-DECODE VERIFY half (SPEC-REJECTION I3). Ported from
+// gpu/model_runner.py:1069-1077 (the rejection_sampler call) +
+// rejection_sampler.py:111 (draft_sampled = input_ids[logits_indices]) +
+// postprocess_sampled's num_accepted scatter (model_states/mamba_hybrid.py:
+// 290-310, `max(num_sampled, 1)`).
+//
+// UNREACHABLE ON THE PRODUCTION DEFAULT: the only caller gates on
+// exec_state_.step.num_draft_tokens > 0, which requires the scheduler to have
+// populated scheduled_spec_decode_tokens, which requires a configured
+// SpeculativeConfig. See the greedy accept rule in
+// include/vllm/v1/spec_decode/rejection_sampler.h.
+ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logits) {
+  const int num_reqs = exec_state_.num_reqs;
+  const StepInputs& step = exec_state_.step;
+  const int num_logits = step_num_logits();
+
+  // draft_sampled = input_ids[logits_indices] (rejection_sampler.py:111): the
+  // scheduled input token at each expanded row. Row cu[r]+i+1 is request r's
+  // i-th draft token (the +1 the accept walk reads).
+  std::vector<int32_t> draft_sampled(static_cast<size_t>(num_logits));
+  for (int j = 0; j < num_logits; ++j) {
+    draft_sampled[static_cast<size_t>(j)] =
+        step.input_token_ids[static_cast<size_t>(step.logits_indices[static_cast<size_t>(j)])];
+  }
+  // A row still consuming its prefill chunk samples and rejects nothing
+  // (_get_num_sampled_and_rejected_kernel; our discard mask is the same predicate).
+  std::vector<char> chunked_prefilling(static_cast<size_t>(num_reqs), 0);
+  for (int i = 0; i < num_reqs && i < static_cast<int>(exec_state_.discard.size()); ++i) {
+    chunked_prefilling[static_cast<size_t>(i)] =
+        exec_state_.discard[static_cast<size_t>(i)] != 0 ? 1 : 0;
+  }
+
+  int max_k = 0;
+  for (const int32_t k : step.num_draft_tokens_per_req) max_k = k > max_k ? k : max_k;
+  const RejectionSampler rejection_sampler(max_k);
+  const RejectionSamplerOutput rs =
+      rejection_sampler.forward(queue_, logits, draft_sampled, step.cu_num_logits,
+                                chunked_prefilling);
+
+  ModelRunnerOutput out;
+  out.req_ids.reserve(static_cast<size_t>(num_reqs));
+  out.sampled_token_ids.reserve(static_cast<size_t>(num_reqs));
+  for (int i = 0; i < num_reqs; ++i) {
+    const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
+    out.req_ids.push_back(req_id);
+    out.req_id_to_index[req_id] = i;
+
+    // num_accepted_tokens[i] = max(num_sampled, 1) — the GDN recurrent-state
+    // slot select reads it next step (spec §3 step 3 / §2.4).
+    const int32_t ns = rs.num_sampled[static_cast<size_t>(i)];
+    input_batch_.num_accepted_tokens[static_cast<size_t>(i)] = ns > 1 ? ns : 1;
+
+    if (chunked_prefilling[static_cast<size_t>(i)]) {
+      out.sampled_token_ids.push_back({});
+      continue;
+    }
+    const std::vector<int32_t>& toks = rs.sampled_token_ids[static_cast<size_t>(i)];
+    out.sampled_token_ids.push_back(toks);
+
+    // Write-back: append every emitted token (accepted drafts + the bonus /
+    // replacement) to slot i's token row, exactly as the non-spec path does for
+    // its single token.
+    for (const int32_t tok : toks) {
+      const int n = input_batch_.num_tokens_no_spec[static_cast<size_t>(i)];
+      const size_t idx = static_cast<size_t>(i) *
+                             static_cast<size_t>(input_batch_.max_model_len) +
+                         static_cast<size_t>(n);
+      if (idx < input_batch_.token_ids_cpu.size()) {
+        input_batch_.token_ids_cpu[idx] = tok;
+      }
+      input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] = n + 1;
+      auto& out_ids = input_batch_.req_output_token_ids[static_cast<size_t>(i)];
+      if (out_ids.has_value()) {
+        out_ids->push_back(tok);
+      }
+    }
+    if (!toks.empty()) {
+      input_batch_.last_sampled_tokens[static_cast<size_t>(i)] = toks.back();
+    }
+  }
+  return out;
 }
 
 ModelRunnerOutput GPUModelRunner::sample_tokens(
@@ -956,6 +1058,17 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
 
   std::vector<float> sampled_logits;  // host buffer; outlives the sampler when used
   vt::Tensor logits = assemble_sample_logits(grammar_output, sampled_logits);
+
+  // SPEC-DECODE VERIFY ROUTING (SPEC-REJECTION I3), mirroring
+  // gpu/model_runner.py:1065-1077 (`if input_batch.num_draft_tokens == 0 or
+  // self.rejection_sampler is None: sampler(...) else rejection_sampler(...)`).
+  // exec_state_.step.num_draft_tokens is > 0 ONLY when the scheduler populated
+  // scheduled_spec_decode_tokens, which needs an actually-configured
+  // SpeculativeConfig. On the production default it is 0 on every step, so this
+  // branch is never taken and the sampler path below is byte-identical.
+  if (exec_state_.step.num_draft_tokens > 0) {
+    return sample_tokens_with_rejection(logits);
+  }
 
   // SamplingMetadata in the SAME dense [0, num_reqs) order (M1.7; CLOSES the
   // make_sampling_metadata wiring dep). Then Sampler.forward.

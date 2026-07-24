@@ -635,3 +635,84 @@ TEST_CASE("CUDA rope_neox matches CPU (partial rotary, i32/i64 positions)") {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// greedy_rejection_sample (SPEC-REJECTION I3): CUDA == the CPU reference,
+// BIT-EXACT on the accepted token ids, at the GATE MODELS' real vocab (248320 —
+// both Qwen3.6 gate checkpoints, spec §1). Mirrors the greedy branch of
+// vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:564-585,628 @ e24d1b24.
+TEST_CASE("CUDA greedy_rejection_sample matches CPU bit-exactly at gate vocab (248320)") {
+  if (!HasCuda()) return;
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+
+  constexpr int64_t kVocab = 248320;  // the gate checkpoints' vocab_size
+  // Four requests with DIFFERENT k_i: 1, 3, 0 (no drafts), 2.
+  const std::vector<int32_t> ks = {1, 3, 0, 2};
+  const int64_t num_reqs = static_cast<int64_t>(ks.size());
+  std::vector<int32_t> cu_num_logits(static_cast<size_t>(num_reqs) + 1, 0);
+  for (size_t r = 0; r < ks.size(); ++r) {
+    cu_num_logits[r + 1] = cu_num_logits[r] + ks[r] + 1;
+  }
+  const int64_t num_logits = cu_num_logits.back();
+  const int64_t width = 4;  // >= max k + 1
+
+  std::vector<float> logits = RandomF32(static_cast<size_t>(num_logits * kVocab), 4242);
+  // Make each row's argmax a known, well-separated token id.
+  std::vector<int32_t> row_argmax(static_cast<size_t>(num_logits));
+  for (int64_t row = 0; row < num_logits; ++row) {
+    const int32_t tok = static_cast<int32_t>((row * 7919 + 13) % kVocab);
+    row_argmax[static_cast<size_t>(row)] = tok;
+    logits[static_cast<size_t>(row * kVocab + tok)] = 100.0f;
+  }
+  // draft_sampled: accept the first draft of each request, reject the second.
+  std::vector<int32_t> draft_sampled(static_cast<size_t>(num_logits), 0);
+  for (size_t r = 0; r < ks.size(); ++r) {
+    const int32_t start = cu_num_logits[r];
+    for (int32_t i = 0; i < ks[r]; ++i) {
+      const int32_t target = row_argmax[static_cast<size_t>(start + i)];
+      draft_sampled[static_cast<size_t>(start + i + 1)] =
+          (i == 0) ? target : static_cast<int32_t>((target + 1) % kVocab);
+    }
+  }
+
+  // CPU reference.
+  Queue cq{Cpu(), nullptr};
+  std::vector<int32_t> cpu_sampled(static_cast<size_t>(num_reqs * width), 0);
+  std::vector<int32_t> cpu_num_sampled(static_cast<size_t>(num_reqs), 0);
+  {
+    Tensor tl = MakeTensor(logits.data(), DType::kF32, Cpu(), {num_logits, kVocab});
+    Tensor td = MakeTensor(draft_sampled.data(), DType::kI32, Cpu(), {num_logits});
+    Tensor tc = MakeTensor(cu_num_logits.data(), DType::kI32, Cpu(), {num_reqs + 1});
+    Tensor ts = MakeTensor(cpu_sampled.data(), DType::kI32, Cpu(), {num_reqs, width});
+    Tensor tn = MakeTensor(cpu_num_sampled.data(), DType::kI32, Cpu(), {num_reqs});
+    vt::GreedyRejectionSample(cq, ts, tn, tl, td, tc);
+  }
+
+  // CUDA.
+  QueueGuard gq(gpu);
+  DeviceTensor dl(gpu, gq.q, DType::kF32, {num_logits, kVocab}, logits.data());
+  DeviceTensor dd(gpu, gq.q, DType::kI32, {num_logits}, draft_sampled.data());
+  DeviceTensor dc(gpu, gq.q, DType::kI32, {num_reqs + 1}, cu_num_logits.data());
+  DeviceTensor ds(gpu, gq.q, DType::kI32, {num_reqs, width});
+  DeviceTensor dn(gpu, gq.q, DType::kI32, {num_reqs});
+  vt::GreedyRejectionSample(gq.q, ds.tensor(), dn.tensor(), dl.tensor(), dd.tensor(),
+                            dc.tensor());
+  std::vector<int32_t> gpu_sampled(static_cast<size_t>(num_reqs * width));
+  std::vector<int32_t> gpu_num_sampled(static_cast<size_t>(num_reqs));
+  ds.Download(gq.q, gpu_sampled.data());
+  dn.Download(gq.q, gpu_num_sampled.data());
+
+  // BIT-EXACT on both outputs.
+  CHECK(gpu_num_sampled == cpu_num_sampled);
+  CHECK(gpu_sampled == cpu_sampled);
+
+  // And the accept rule itself: first draft accepted, second rejected.
+  //   k=1 -> all accepted -> num_sampled = 2 (draft + bonus)
+  //   k=3 -> 1 accepted   -> num_sampled = 2 (draft + replacement)
+  //   k=0 -> num_sampled = 1 (the plain greedy argmax — the non-spec reduction)
+  //   k=2 -> 1 accepted   -> num_sampled = 2
+  CHECK(cpu_num_sampled == std::vector<int32_t>{2, 2, 1, 2});
+  // The k=0 row emits exactly the target argmax of its single logit row.
+  CHECK(cpu_sampled[2 * static_cast<size_t>(width)] ==
+        row_argmax[static_cast<size_t>(cu_num_logits[2])]);
+}

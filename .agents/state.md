@@ -21905,3 +21905,105 @@ scheduler-side plumbing on branch `mtp-i2-scheduler`
 engine-core spec paths) — do not touch those from the model/parity layer.
 Reproduce the gate with:
 `ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/mtp_i1 && VLLM_MTP_REQUIRE_CHECKPOINTS=1 ./build-cuda/tests/test_op_parity -tc=\"qwen3.5 MTP standalone head parity*\" -s"'`
+
+---
+
+## 2026-07-24 — `SPEC-REJECTION` I3: the VERIFY half (greedy rejection sampler + input-batch logits expansion)
+
+Claim `CLAIM-SPEC-REJECTION-I3`, base `origin/main` `86fff01` (I2's scheduler
+half), worktree `wt-i3` / branch `spec-i3-rejection`. Codes against — and does
+NOT modify — the FROZEN spec-metadata ABI of
+[mtp-spec-decode.md §2.7](specs/mtp-spec-decode.md). The rule as implemented is
+recorded in the new **§2.8** of that spec.
+
+**THE GREEDY ACCEPT RULE (the whole correctness story for the I5 e2e gate).**
+Mirrors the `is_greedy` branch of `_rejection_kernel`
+(`vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:564-585` @
+`e24d1b24`), the accepted-length store at `:628`, the greedy short-circuit of
+`_resample_kernel` (`:846-849`) and `_insert_resampled_kernel` (`:828-841`). For
+request `r` over expanded rows `[cu[r], cu[r+1])` with `k_r = cu[r+1]-cu[r]-1`:
+accept draft `i` **iff** `draft_sampled[cu[r]+i+1] == argmax(logits[cu[r]+i])`
+(note the `+1`: draft `i` is the input id at the NEXT expanded row, `:534`);
+store the draft when accepted and the **target argmax** on the first mismatch,
+then STOP accepting (`accepted` is sticky-false and guards the loop body); when
+all `k_r` accept, store `argmax(logits[cu[r]+k_r])` — the bonus. Then
+`num_sampled = accepted + 1` and `num_rejected = (1+k_r) - num_sampled`.
+`num_sampled` feeds `InputBatch::num_accepted_tokens` as `max(ns,1)`
+(`model_states/mamba_hybrid.py:290-310`); `num_rejected` feeds I2's
+`num_computed_tokens -= num_rejected` rollback. A `-1` placeholder draft can
+never equal an argmax, so it is rejected with no out-of-bounds read. **`k_r == 0`
+emits exactly one token — the plain greedy argmax — which is the byte-identity
+anchor for the default path.**
+
+**Expansion design.** `StepInputs` gains `cu_num_logits` `[num_reqs+1]`,
+`num_draft_tokens_per_req` `[num_reqs]` and `num_draft_tokens`; `prepare_inputs`
+takes upstream's own two-branch shape (`gpu/model_runner.py:866-898`). No
+drafts (the production default): `cu_num_logits = arange(num_reqs+1)` and
+`logits_indices = query_start_loc[1:] - 1` — the pre-I3 array, byte for byte.
+Drafts: `num_logits[i] = k_i + 1`, `cu = [0] ++ cumsum`, and per request
+`logits_start = query_end - num_logits` then `num_logits` consecutive rows
+(the index formula of `_combine_sampled_and_draft_tokens_kernel`,
+`gpu/input_batch.py:317-327`). The LAST expanded row of every request is still
+its last scheduled token, so the bonus position coincides with the old single
+logits row — asserted in the tests.
+
+**Kernel.** ONE additive vt op `kGreedyRejectionSample` /
+`vt::GreedyRejectionSample(sampled, num_sampled, logits, draft_sampled,
+cu_num_logits)`. CPU reference in `src/vt/cpu/cpu_sample.cpp`; the CUDA impl in
+`src/vt/cuda/cuda_sample.cu` mirrors upstream's TWO-PHASE decomposition — a
+per-expanded-row block argmax (upstream's per-vocab-block local stats +
+`_compute_global_target_argmax`) then a one-thread-per-request sequential accept
+walk (upstream launches `_rejection_kernel` with `num_warps=1`). Both use the
+SAME lowest-index `ArgReduce` tie-break as `vt::GreedyArgmax`, so `k=0` is
+bit-identical to plain greedy. Recorded DEVIATION: upstream leaves `sampled`
+slots past `num_sampled` uninitialized (`new_empty`); we fill them with `-1`
+(`PLACEHOLDER_TOKEN_ID`, `vllm/v1/sample/rejection_sampler.py:30`).
+
+**RED WAS VERIFIED BY EXPERIMENT, not asserted from absence** (I2's standard). A
+deliberately WRONG stub kernel (`num_sampled = 0`, all-`-1` output) kept the ABI
+compiling: the ported suite ran **10/10 cases and 44/76 assertions FAILING**.
+Replacing the stub with the real accept rule turned it **10/10 cases, 139/139
+assertions GREEN**. Tests ported (test-porting protocol): `test_perfect_match`,
+`test_early_mismatch`, `test_multiple_sequences` (different `k_i` per request),
+`test_single_token_sequence`, `test_empty_sequence` (the `k=0` reduction),
+`test_multiple_mismatches`, `test_parametrized_cases`
+(`tests/v1/sample/test_rejection_sampler.py:133-288`), plus
+`test_greedy_rejection_sample` k∈{1,3} (swept over every draft-match pattern, so
+it pins WHERE the run stops, not just the invariant) and
+`test_placeholder_draft_token_rejected`
+(`tests/v1/spec_decode/test_rejection_sampler_utils.py:183,285`). The
+stochastic / synthetic / block-verification / i64-indexing cases are checked in
+SKIPPED with tracked reasons (rule 6). Expansion cases live in
+`tests/vllm/v1/worker/test_prepare_inputs.cpp` and assert BOTH the spec
+expansion and the no-draft byte identity.
+
+**CUDA == CPU, bit-exact at the gate vocab.** `tests/vt/test_cuda_ops.cpp` runs a
+4-request batch with `k_i ∈ {1,3,0,2}` over the gate checkpoints' real vocab
+**248320** and compares the accepted token ids AND `num_sampled` for exact
+equality (not tolerance) against the CPU reference.
+
+**DEFAULT-OFF INERT — the load-bearing property.** With no `SpeculativeConfig`
+the scheduler never populates `scheduled_spec_decode_tokens`, so
+`num_draft_tokens == 0` on every step, the expansion takes the `arange` branch,
+`logits_indices` is unchanged, and `GPUModelRunner::sample_tokens` never enters
+the rejection branch. No model or kernel FORWARD TU is touched (the only vt file
+edits add a NEW op and register it), so every SACRED model gate is byte-identical
+by construction.
+
+**Gates.** Clean CPU `-Werror` full rebuild, 0 warnings. Full CPU ctest run and
+the failure set diffed against base. CUDA `-Werror` build + `test_cuda_ops` +
+`compute-sanitizer` on dgx. No GPU benchmark and no speed claim
+(`benchmark_binding=false`): the honest denominator is vLLM with the SAME
+speculative config, owed by the M-mtp-1 e2e gate.
+
+**States.** `SPEC-REJECTION` `READY` → `ACTIVE` (its first `ours` cell) — NOT
+`DONE`, because the e2e greedy token gate is owed. `SPEC-MTP` STAYS `GATING`.
+
+**Resume point for I5.** The seam is
+`StepInputs::{cu_num_logits, num_draft_tokens_per_req, num_draft_tokens}` plus
+`GPUModelRunner::sample_tokens_with_rejection`. I5 owns the speculator
+(`propose()`, `prepare_prefill_inputs`), `take_draft_token_ids`, the draft-token
+splice into `input_ids` (still deferred in `combine_sampled_and_draft_tokens`,
+which needs the `draft_tokens` per-req buffer), and plumbing a real
+`SpeculativeConfig` into the runner so a `RejectionSampler` can be constructed
+once instead of per step.

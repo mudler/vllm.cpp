@@ -77,9 +77,37 @@ struct StepInputs {
   // (block_id*block_size + offset). slot_mapping[g] is group g's mapping,
   // truncated to [0, total). Upstream computes one per group.
   std::vector<std::vector<int64_t>> slot_mapping;
-  // Index (into the flattened token stream) of each sequence's last scheduled
-  // token: query_start_loc[1:] - 1. [num_reqs]
+  // Index (into the flattened token stream) of each row the sampler needs
+  // logits for. [total_num_logits]
+  //
+  // NON-SPECULATIVE (the production default, and every step until a speculator
+  // is configured): exactly one row per request — query_start_loc[1:] - 1, the
+  // last scheduled token per sequence. [num_reqs], byte-identical to the
+  // pre-SPEC-REJECTION array.
+  //
+  // SPECULATIVE (SPEC-REJECTION I3): when the scheduler scheduled drafts, a
+  // request with k_i drafts needs logits at 1 + k_i positions — the k_i draft
+  // positions plus the bonus position — so the target's argmax at each draft
+  // position can be compared against the draft (spec §2.4). The rows are the
+  // TAIL of the request's query: logits_start = query_end - (1 + k_i), then
+  // 1 + k_i consecutive rows. Mirrors
+  // gpu/input_batch.py::_combine_sampled_and_draft_tokens_kernel:317-327
+  // ("logits_start = query_end - num_logits").
   std::vector<int32_t> logits_indices;
+  // Per-request cumulative offsets into logits_indices: [0] ++ cumsum(1 + k_i).
+  // [num_reqs + 1]. On the non-speculative path this is exactly
+  // arange(num_reqs + 1) (upstream model_runner.py:872-875), so
+  // cu_num_logits[i] == i and cu_num_logits.back() == num_reqs.
+  // Mirrors gpu/model_runner.py:866-898.
+  std::vector<int32_t> cu_num_logits;
+  // Number of draft tokens scheduled per request. EMPTY when no drafts were
+  // scheduled (upstream num_draft_tokens_per_req is None then,
+  // model_runner.py:867,881-889). [num_reqs] otherwise.
+  std::vector<int32_t> num_draft_tokens_per_req;
+  // sum(num_draft_tokens_per_req); 0 on the default path. The runner routes
+  // through the rejection sampler IFF this is > 0
+  // (model_runner.py:1065 `if input_batch.num_draft_tokens == 0 ...`).
+  int num_draft_tokens = 0;
   // num_scheduled_tokens per request in batch order (the array upstream's
   // execute_model builds and passes to _prepare_inputs). [num_reqs]
   std::vector<int32_t> num_scheduled_tokens;

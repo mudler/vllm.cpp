@@ -204,6 +204,14 @@ enum class OpId : uint8_t {
   // LogitsProcessor(soft_cap=final_logit_softcapping)) — a monotone squashing of
   // the logits. NEW for the Gemma-2 family. Additive; default-unused otherwise.
   kSoftCap,
+  // Greedy speculative-decoding rejection sampling over the EXPANDED verify
+  // logits `[Σ(1+k_i), vocab]` — the accept-iff-draft-equals-target-argmax rule
+  // plus the bonus/replacement token. Mirrors the greedy branch of vLLM's
+  // `_rejection_kernel` (vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:
+  // 564-585,628) + the greedy short-circuit of `_resample_kernel` (:846-861) and
+  // `_insert_resampled_kernel` (:828-841). See vt::GreedyRejectionSample.
+  // Additive: nothing on the non-speculative path calls it.
+  kGreedyRejectionSample,
   kCount
 };
 
@@ -622,6 +630,9 @@ using ApplyTopKTopPFn = void (*)(Queue&, Tensor&, const Tensor*, const Tensor*);
 using ComputeProbsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using ComputeLogprobsFn = void (*)(Queue&, Tensor&, const Tensor&);
 using RandomSampleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+// --- Greedy spec-decode rejection sampling (SPEC-REJECTION I3).
+using GreedyRejectionSampleFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&, const Tensor&,
+                                         const Tensor&);
 // --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). See the section at the
 // bottom of this header for the full contracts.
 using ApplyPenaltiesFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
@@ -1870,6 +1881,48 @@ void ComputeLogprobs(Queue& q, Tensor& logprobs, const Tensor& logits);
 // M1.7 deferral. Greedy stays bit-exact; random is validated by algorithm +
 // determinism + distribution.
 void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor& seeds);
+
+// --- Greedy spec-decode rejection sampling (SPEC-REJECTION I3) --------------
+// Ported from vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py @ e24d1b24:
+// the `is_greedy` branch of `_rejection_kernel` (:564-585 accept + :628 store of
+// the accepted length), plus the greedy short-circuits of `_resample_kernel`
+// (:846-849) and `_insert_resampled_kernel` (:828-841 num_sampled += 1 and the
+// bonus-token argmax insert). The per-row `target_argmax` this needs is upstream's
+// `_compute_global_target_argmax` over `_compute_local_logits_stats_kernel`'s
+// per-vocab-block partials (:923-946).
+//
+// THE GREEDY ACCEPT RULE (the whole correctness story — see the header note in
+// include/vllm/v1/spec_decode/rejection_sampler.h):
+//   For request r the expanded logit rows are [cu[r], cu[r+1]); k_r = cu[r+1] -
+//   cu[r] - 1 draft positions plus one bonus position. Walking i = 0..k_r-1 while
+//   still accepting:
+//     * `target_argmax = argmax(logits[cu[r]+i])`
+//     * `draft = draft_sampled[cu[r]+i+1]`   (NOTE the +1: draft token i is the
+//       INPUT id at the NEXT expanded row, mirroring :534)
+//     * accept iff `draft == target_argmax`; store `draft` when accepted, else
+//       store `target_argmax` (the replacement) and STOP accepting.
+//   If all k_r accepted, store `argmax(logits[cu[r]+k_r])` (the bonus).
+//   num_sampled[r] = accepted_length + 1 (always ≥ 1: a rejection still emits the
+//   target argmax at the mismatch position).
+// A placeholder draft id of -1 can never equal an argmax (≥ 0), so it is rejected
+// with no out-of-bounds read — mirroring the upstream `-1` padding contract.
+//
+//   logits        [num_logits, vocab] f32   the EXPANDED verify logits
+//   draft_sampled [num_logits] i32          input ids gathered at logits_indices
+//   cu_num_logits [num_reqs + 1] i32        per-request expanded-row offsets
+//   sampled       [num_reqs, max_num_logits] i32  OUT; positions past
+//                 num_sampled[r] are filled with -1 (PLACEHOLDER_TOKEN_ID,
+//                 vllm/v1/sample/rejection_sampler.py:30). Upstream leaves them
+//                 uninitialized (`new_empty`); we fill so the buffer is
+//                 deterministic and the ported legacy-sampler assertions read
+//                 directly. Recorded deviation.
+//   num_sampled   [num_reqs] i32            OUT; accepted_length + 1
+//
+// Argmax tie-break is LOWEST INDEX (torch.argmax), identical to vt::GreedyArgmax,
+// so a k=0 request reduces EXACTLY to the non-speculative greedy sampler.
+void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled,
+                           const Tensor& logits, const Tensor& draft_sampled,
+                           const Tensor& cu_num_logits);
 
 // --- V1 penalty / mask / builtin-proc ops (M1.7 Task 3). Ported from
 // vllm/model_executor/layers/utils.py (apply_penalties), vllm/_custom_ops.py

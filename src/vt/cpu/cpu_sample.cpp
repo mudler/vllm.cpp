@@ -313,6 +313,70 @@ void ApplyTokenMaskKernel(Queue&, Tensor& logits, const Tensor& rows, const Tens
   for (int64_t k = 0; k < m; ++k) lp[static_cast<int64_t>(rp[k]) * v + cp[k]] = kNegInf;
 }
 
+// ─── Greedy spec-decode rejection sampling (SPEC-REJECTION I3) ──────────────
+// The CPU REFERENCE for vt::GreedyRejectionSample. Ported from the `is_greedy`
+// branch of `_rejection_kernel` (rejection_sampler_utils.py:564-585 accept/store,
+// :628 accepted-length store) plus the greedy short-circuits of
+// `_resample_kernel` (:846-849) and `_insert_resampled_kernel` (:828-841).
+// The row argmax uses the SAME strict `>` lowest-index tie-break as
+// GreedyArgmaxKernel above, so a k == 0 request reduces exactly to plain greedy.
+void GreedyRejectionSampleKernel(Queue&, Tensor& sampled, Tensor& num_sampled,
+                                 const Tensor& logits, const Tensor& draft_sampled,
+                                 const Tensor& cu_num_logits) {
+  const int64_t vocab = logits.shape[1];
+  const int64_t num_reqs = cu_num_logits.shape[0] - 1;
+  const int64_t width = sampled.shape[1];
+  const float* lp = logits.Ptr<float>();
+  const int32_t* dp = draft_sampled.Ptr<int32_t>();
+  const int32_t* cu = cu_num_logits.Ptr<int32_t>();
+  int32_t* sp = sampled.Ptr<int32_t>();
+  int32_t* ns = num_sampled.Ptr<int32_t>();
+
+  // argmax(logits[row]) with torch.argmax's lowest-index tie-break.
+  const auto row_argmax = [&](int64_t row) -> int32_t {
+    const float* r = lp + row * vocab;
+    int64_t best = 0;
+    float best_v = r[0];
+    for (int64_t j = 1; j < vocab; ++j) {
+      if (r[j] > best_v) {  // strict `>` => first occurrence of the max wins
+        best_v = r[j];
+        best = j;
+      }
+    }
+    return static_cast<int32_t>(best);
+  };
+
+  for (int64_t req = 0; req < num_reqs; ++req) {
+    const int64_t start = cu[req];
+    const int64_t end = cu[req + 1];
+    const int64_t num_draft_tokens = end - start - 1;
+    int32_t* row = sp + req * width;
+    for (int64_t j = 0; j < width; ++j) row[j] = -1;  // PLACEHOLDER_TOKEN_ID pad
+
+    bool accepted = true;
+    int64_t accepted_length = 0;
+    for (int64_t i = 0; i < num_draft_tokens; ++i) {
+      if (!accepted) break;  // upstream `elif accepted:` guard
+      const int32_t target_argmax = row_argmax(start + i);
+      // NOTE the +1: draft token i is the INPUT id at the NEXT expanded row
+      // (rejection_sampler_utils.py:534). A -1 placeholder can never equal an
+      // argmax (>= 0), so it is rejected with no out-of-bounds read.
+      const int32_t draft = dp[start + i + 1];
+      accepted = (target_argmax == draft);
+      row[i] = accepted ? draft : target_argmax;
+      accepted_length += accepted ? 1 : 0;
+    }
+    // Bonus token: every draft accepted -> resample (greedy: argmax) at the
+    // bonus row. On a rejection the target argmax is already stored, so
+    // _resample_kernel returns early (:846-849).
+    if (accepted_length == num_draft_tokens) {
+      row[accepted_length] = row_argmax(start + accepted_length);
+    }
+    // _insert_resampled_kernel:834 — num_sampled = accepted_length + 1.
+    ns[req] = static_cast<int32_t>(accepted_length) + 1;
+  }
+}
+
 // masked_fill_(mask, -inf) — mask TRUE means EXCLUDE (sampler.py:396-397).
 void ApplyAllowedTokenIdsKernel(Queue&, Tensor& logits, const Tensor& mask) {
   const int64_t n = logits.shape[0], v = logits.shape[1];
@@ -336,6 +400,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ComputeLogprobsFn>(&ComputeLogprobsKernel)));
     RegisterOp(OpId::kRandomSample, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<RandomSampleFn>(&RandomSampleKernel)));
+    RegisterOp(OpId::kGreedyRejectionSample, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<GreedyRejectionSampleFn>(&GreedyRejectionSampleKernel)));
     RegisterOp(OpId::kApplyPenalties, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<ApplyPenaltiesFn>(&ApplyPenaltiesKernel)));
     RegisterOp(OpId::kApplyMinP, DeviceType::kCPU,

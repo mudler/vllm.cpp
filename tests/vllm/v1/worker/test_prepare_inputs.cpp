@@ -247,3 +247,82 @@ TEST_CASE("prepare_inputs: single decode step (num_scheduled=1)") {
   REQUIRE(step.slot_mapping.size() == 1);
   CHECK(step.slot_mapping[0] == std::vector<int64_t>{35});
 }
+
+// ─── logits expansion under spec decode (SPEC-REJECTION I3) ─────────────────
+// Ported from gpu/model_runner.py:866-898 (the cu_num_logits build) + the
+// logits-index formula of _combine_sampled_and_draft_tokens_kernel:317-327.
+// The DEFAULT-OFF byte-identity property is asserted first: with no
+// scheduled_spec_decode_tokens the expansion reduces to the pre-I3 arrays.
+
+TEST_CASE("prepare_inputs: no drafts -> cu_num_logits == arange, logits_indices unchanged") {
+  InputBatch batch = make_batch();
+  add_direct(batch, "A", {100, 101, 102, 103}, {}, {3}, /*num_computed=*/0);
+  add_direct(batch, "B", {200, 201, 202, 203, 204}, {205}, {7}, /*num_computed=*/5);
+
+  SchedulerOutput so = make_output({{"A", 4}, {"B", 1}});
+  update_states(batch, so);
+  StepInputs step = prepare_inputs(batch, so);
+
+  // The scheduler populated NO drafts (the production default).
+  CHECK(so.scheduled_spec_decode_tokens.empty());
+  CHECK(step.num_draft_tokens == 0);
+  CHECK(step.num_draft_tokens_per_req.empty());
+  // cu_num_logits = arange(num_reqs + 1) (model_runner.py:872-875).
+  CHECK(step.cu_num_logits == std::vector<int32_t>{0, 1, 2});
+  // logits_indices == query_start_loc[1:] - 1 — the pre-I3 array, unchanged.
+  CHECK(step.logits_indices == std::vector<int32_t>{3, 4});
+  REQUIRE(step.logits_indices.size() == static_cast<size_t>(batch.num_reqs()));
+  for (int i = 0; i < batch.num_reqs(); ++i) {
+    CHECK(step.logits_indices[static_cast<size_t>(i)] ==
+          step.query_start_loc[static_cast<size_t>(i) + 1] - 1);
+  }
+}
+
+TEST_CASE("prepare_inputs: drafts expand logits to 1+k_i rows per request") {
+  InputBatch batch = make_batch();
+  // "A" carries 2 drafts => scheduled for 1 + 2 = 3 tokens.
+  add_direct(batch, "A", {100, 101, 102}, {103, 104, 105}, {3}, /*num_computed=*/3);
+  // "B" carries 1 draft => scheduled for 2 tokens.
+  add_direct(batch, "B", {200, 201}, {202, 203}, {7}, /*num_computed=*/2);
+
+  SchedulerOutput so = make_output({{"A", 3}, {"B", 2}});
+  so.scheduled_spec_decode_tokens["A"] = {104, 105};
+  so.scheduled_spec_decode_tokens["B"] = {203};
+  update_states(batch, so);
+  StepInputs step = prepare_inputs(batch, so);
+
+  CHECK(step.num_draft_tokens == 3);
+  CHECK(step.num_draft_tokens_per_req == std::vector<int32_t>{2, 1});
+  // num_logits = k_i + 1 => [3, 2]; cu = [0, 3, 5].
+  CHECK(step.cu_num_logits == std::vector<int32_t>{0, 3, 5});
+  // query_start_loc = [0, 3, 5]; per request logits_start = query_end -
+  // num_logits, then num_logits consecutive rows.
+  CHECK(step.query_start_loc == std::vector<int32_t>{0, 3, 5});
+  CHECK(step.logits_indices == std::vector<int32_t>{0, 1, 2, 3, 4});
+  // Every request's LAST expanded row is still its last scheduled token (the
+  // bonus position) — the non-spec logits_indices entry.
+  for (int i = 0; i < batch.num_reqs(); ++i) {
+    const int last = step.cu_num_logits[static_cast<size_t>(i) + 1] - 1;
+    CHECK(step.logits_indices[static_cast<size_t>(last)] ==
+          step.query_start_loc[static_cast<size_t>(i) + 1] - 1);
+  }
+}
+
+TEST_CASE("prepare_inputs: a request without drafts keeps 1 logit row in a mixed batch") {
+  InputBatch batch = make_batch();
+  add_direct(batch, "A", {100, 101}, {102, 103}, {3}, /*num_computed=*/2);
+  add_direct(batch, "B", {200, 201, 202}, {203}, {7}, /*num_computed=*/3);
+
+  // Only "A" carries a draft; "B" is a plain decode row in the same step.
+  SchedulerOutput so = make_output({{"A", 2}, {"B", 1}});
+  so.scheduled_spec_decode_tokens["A"] = {103};
+  update_states(batch, so);
+  StepInputs step = prepare_inputs(batch, so);
+
+  CHECK(step.num_draft_tokens == 1);
+  CHECK(step.num_draft_tokens_per_req == std::vector<int32_t>{1, 0});
+  CHECK(step.cu_num_logits == std::vector<int32_t>{0, 2, 3});
+  CHECK(step.query_start_loc == std::vector<int32_t>{0, 2, 3});
+  // A: rows 0,1 (draft position + bonus). B: row 2 (its single last token).
+  CHECK(step.logits_indices == std::vector<int32_t>{0, 1, 2});
+}

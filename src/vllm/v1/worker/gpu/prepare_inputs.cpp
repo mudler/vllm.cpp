@@ -7,6 +7,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <map>
 #include <string>
 #include <unordered_set>
 
@@ -165,11 +166,58 @@ StepInputs prepare_inputs(InputBatch& input_batch,
                                full.begin() + static_cast<std::ptrdiff_t>(total));
   }
 
-  // logits_indices = query_start_loc[1:] - 1 (last scheduled token per seq).
-  out.logits_indices.resize(static_cast<size_t>(num_reqs));
-  for (int i = 0; i < num_reqs; ++i) {
-    out.logits_indices[static_cast<size_t>(i)] =
-        out.query_start_loc[static_cast<size_t>(i) + 1] - 1;
+  // ─── logits expansion (SPEC-REJECTION I3) ─────────────────────────────────
+  // Mirrors gpu/model_runner.py:866-898 (the cu_num_logits build) + the
+  // logits-index formula of _combine_sampled_and_draft_tokens_kernel:317-327
+  // (`logits_start = query_end - num_logits`).
+  const std::map<std::string, std::vector<int32_t>>& draft_tokens =
+      scheduler_output.scheduled_spec_decode_tokens;
+  if (draft_tokens.empty()) {
+    // NO DRAFT TOKEN SCHEDULED (the common case, and the production default —
+    // the scheduler only populates the map behind a configured speculator).
+    // cu_num_logits = arange(num_reqs + 1); logits_indices = query_start_loc[1:]
+    // - 1 (last scheduled token per seq) — byte-identical to the pre-I3 array.
+    out.num_draft_tokens = 0;
+    out.cu_num_logits.resize(static_cast<size_t>(num_reqs) + 1);
+    for (int i = 0; i <= num_reqs; ++i) {
+      out.cu_num_logits[static_cast<size_t>(i)] = i;
+    }
+    out.logits_indices.resize(static_cast<size_t>(num_reqs));
+    for (int i = 0; i < num_reqs; ++i) {
+      out.logits_indices[static_cast<size_t>(i)] =
+          out.query_start_loc[static_cast<size_t>(i) + 1] - 1;
+    }
+  } else {
+    // num_logits[i] = num_draft_tokens_per_req[i] + num_bonus_tokens; the bonus
+    // count is 1 for every model we run (upstream
+    // model_state.num_new_sampled_tokens_per_step; > 1 only for multi-bonus
+    // heads, deferred).
+    constexpr int kNumBonusTokens = 1;
+    out.num_draft_tokens_per_req.resize(static_cast<size_t>(num_reqs));
+    out.cu_num_logits.resize(static_cast<size_t>(num_reqs) + 1);
+    out.cu_num_logits[0] = 0;
+    int total_num_logits = 0;
+    int total_num_draft_tokens = 0;
+    for (int i = 0; i < num_reqs; ++i) {
+      const std::string& req_id = *input_batch.req_ids[static_cast<size_t>(i)];
+      const auto it = draft_tokens.find(req_id);
+      const int k = it == draft_tokens.end() ? 0 : static_cast<int>(it->second.size());
+      out.num_draft_tokens_per_req[static_cast<size_t>(i)] = k;
+      total_num_draft_tokens += k;
+      total_num_logits += k + kNumBonusTokens;
+      out.cu_num_logits[static_cast<size_t>(i) + 1] = total_num_logits;
+    }
+    out.num_draft_tokens = total_num_draft_tokens;
+    out.logits_indices.reserve(static_cast<size_t>(total_num_logits));
+    for (int i = 0; i < num_reqs; ++i) {
+      const int num_logits = out.cu_num_logits[static_cast<size_t>(i) + 1] -
+                             out.cu_num_logits[static_cast<size_t>(i)];
+      const int32_t query_end = out.query_start_loc[static_cast<size_t>(i) + 1];
+      const int32_t logits_start = query_end - num_logits;
+      for (int j = 0; j < num_logits; ++j) {
+        out.logits_indices.push_back(logits_start + j);
+      }
+    }
   }
 
   return out;

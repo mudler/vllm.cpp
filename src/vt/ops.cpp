@@ -2325,6 +2325,34 @@ void RandomSample(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor
                                                                               seeds);
 }
 
+void GreedyRejectionSample(Queue& q, Tensor& sampled, Tensor& num_sampled, const Tensor& logits,
+                           const Tensor& draft_sampled, const Tensor& cu_num_logits) {
+  const int64_t num_logits = CheckSamplingLogits(q, logits, "greedy_rejection_sample");
+  VT_CHECK(cu_num_logits.rank == 1 && cu_num_logits.shape[0] >= 1 &&
+               cu_num_logits.dtype == DType::kI32 && cu_num_logits.IsContiguous() &&
+               cu_num_logits.device == q.device,
+           "greedy_rejection_sample: cu_num_logits must be i32 [num_reqs+1] contiguous on the "
+           "queue device");
+  const int64_t num_reqs = cu_num_logits.shape[0] - 1;
+  VT_CHECK(draft_sampled.rank == 1 && draft_sampled.shape[0] == num_logits &&
+               draft_sampled.dtype == DType::kI32 && draft_sampled.IsContiguous() &&
+               draft_sampled.device == q.device,
+           "greedy_rejection_sample: draft_sampled must be i32 [num_logits] contiguous on the "
+           "queue device");
+  VT_CHECK(sampled.rank == 2 && sampled.shape[0] == num_reqs && sampled.dtype == DType::kI32 &&
+               sampled.IsContiguous() && sampled.device == q.device,
+           "greedy_rejection_sample: sampled must be i32 [num_reqs, max_num_logits] contiguous on "
+           "the queue device");
+  VT_CHECK(num_sampled.rank == 1 && num_sampled.shape[0] == num_reqs &&
+               num_sampled.dtype == DType::kI32 && num_sampled.IsContiguous() &&
+               num_sampled.device == q.device,
+           "greedy_rejection_sample: num_sampled must be i32 [num_reqs] contiguous on the queue "
+           "device");
+  if (num_reqs == 0) return;
+  reinterpret_cast<GreedyRejectionSampleFn>(GetOp(OpId::kGreedyRejectionSample, q.device.type))(
+      q, sampled, num_sampled, logits, draft_sampled, cu_num_logits);
+}
+
 namespace {
 // [num_reqs, vocab] tensor of a required dtype, contiguous, on the queue device.
 void CheckSamplingMatrix(const Queue& q, const Tensor& t, int64_t n, int64_t v, DType dt,

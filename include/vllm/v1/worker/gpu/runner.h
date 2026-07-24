@@ -376,6 +376,16 @@ class GPUModelRunner final : public ModelRunnerBase {
   vt::Tensor assemble_sample_logits(
       const std::optional<GrammarOutput>& grammar_output,
       std::vector<float>& sampled_logits);
+  // The expanded logit-row count for the stashed step (StepInputs::cu_num_logits
+  // back, == exec_state_.num_reqs on the non-speculative default path).
+  int step_num_logits() const;
+  // The SPEC-DECODE VERIFY half (SPEC-REJECTION I3): route the expanded
+  // [Σ(1+k_i), vocab] logits through the greedy rejection sampler, write the
+  // accepted tokens back, and record num_accepted_tokens. Called by sample_tokens
+  // IFF exec_state_.step.num_draft_tokens > 0, which requires a configured
+  // SpeculativeConfig — unreachable on the production default path. Mirrors
+  // gpu/model_runner.py:1065-1077.
+  ModelRunnerOutput sample_tokens_with_rejection(vt::Tensor& logits);
   std::vector<std::unique_ptr<CacheBuffer>> full_attn_buf_;
   // GDN convolution and recurrent caches have independent dtypes. This mirrors
   // MambaStateDtypeCalculator::_mamba_state_dtype: mamba_cache_dtype="auto"

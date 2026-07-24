@@ -258,6 +258,85 @@ rollback by `num_rejected` on `update_from_output`; and
 requests, and clearing rather than installing for a request still in a prefill
 chunk).
 
+### 2.8 The GREEDY ACCEPT RULE, as implemented (SPEC-REJECTION **I3, LANDED**)
+
+I3 landed the VERIFY half against the §2.7 ABI: the input-batch logits expansion
+plus the greedy rejection sampler. It is likewise INERT on the production
+default (no `SpeculativeConfig` ⇒ the scheduler never populates
+`scheduled_spec_decode_tokens` ⇒ `num_draft_tokens == 0` on every step).
+
+**Logits expansion.** `prepare_inputs` (`src/vllm/v1/worker/gpu/prepare_inputs.cpp`)
+now emits `StepInputs::cu_num_logits` `[num_reqs+1]`,
+`num_draft_tokens_per_req` `[num_reqs]` and `num_draft_tokens`, and widens
+`logits_indices` from `[num_reqs]` to `[Σ(1+k_i)]`. Mirrors
+`gpu/model_runner.py:866-898` (the `if not draft_tokens:` / else split) and the
+index formula of `_combine_sampled_and_draft_tokens_kernel`
+(`gpu/input_batch.py:317-327`): per request `logits_start = query_end -
+(1 + k_i)`, then `1 + k_i` consecutive rows — the `k_i` draft positions followed
+by the bonus position. **With no drafts the else-branch is not taken:**
+`cu_num_logits = arange(num_reqs+1)` and `logits_indices =
+query_start_loc[1:] - 1`, the pre-I3 array, byte for byte.
+
+**The accept rule (the whole correctness story for the M-mtp-1 e2e gate).**
+Mirrors the `is_greedy` branch of `_rejection_kernel`
+(`rejection_sampler_utils.py:564-585`, accepted-length store at `:628`), the
+greedy short-circuit of `_resample_kernel` (`:846-849`) and
+`_insert_resampled_kernel` (`:828-841`). For request `r` over rows
+`[cu[r], cu[r+1])` with `k_r = cu[r+1] - cu[r] - 1`:
+
+```
+accepted = true; len = 0
+for i in [0, k_r):
+  if !accepted: break                              # upstream `elif accepted:`
+  target_argmax = argmax(logits[cu[r] + i])        # lowest-index tie-break
+  draft         = draft_sampled[cu[r] + i + 1]     # NOTE the +1, :534
+  accepted     &= (draft == target_argmax)
+  sampled[r][i] = accepted ? draft : target_argmax # replacement on mismatch
+  len          += accepted
+if len == k_r: sampled[r][k_r] = argmax(logits[cu[r] + k_r])   # BONUS
+num_sampled[r]  = len + 1
+num_rejected[r] = (1 + k_r) - num_sampled[r] = k_r - len
+```
+
+`draft_sampled` is `input_ids[logits_indices]` (`rejection_sampler.py:111`).
+`num_sampled` feeds `InputBatch::num_accepted_tokens` (as `max(num_sampled, 1)`,
+`model_states/mamba_hybrid.py:290-310`) and `num_rejected` feeds I2's
+`num_computed_tokens -= num_rejected` rollback. A `-1` placeholder draft is
+rejected by construction (an argmax is `>= 0`), with no out-of-bounds read.
+**`k_r == 0` therefore emits exactly one token — the plain greedy argmax — which
+is the byte-identity anchor for the default path.**
+
+**Code.** `include/vllm/v1/spec_decode/rejection_sampler.h` +
+`src/vllm/v1/spec_decode/rejection_sampler.cpp` (the host `RejectionSampler`,
+`RejectionSamplerOutput{sampled_token_ids, num_sampled, num_rejected}`, and the
+`get_num_sampled_and_rejected` chunked-prefill zeroing,
+`gpu/input_batch.py:408-453`); one additive vt op `kGreedyRejectionSample` /
+`vt::GreedyRejectionSample` with a CPU reference (`src/vt/cpu/cpu_sample.cpp`)
+and a CUDA mirror of upstream's two-phase decomposition
+(`src/vt/cuda/cuda_sample.cu`: `RejectionRowArgmaxKernel` per expanded row, then
+a one-thread-per-request `GreedyRejectAcceptKernel`); routing at
+`GPUModelRunner::sample_tokens` gated on `num_draft_tokens > 0`
+(`gpu/model_runner.py:1065-1077`).
+
+**Tests ported** (`tests/vllm/v1/spec_decode/test_rejection_sampler.cpp`):
+`test_perfect_match`, `test_early_mismatch`, `test_multiple_sequences`,
+`test_single_token_sequence`, `test_empty_sequence`, `test_multiple_mismatches`,
+`test_parametrized_cases` (`tests/v1/sample/test_rejection_sampler.py`),
+`test_greedy_rejection_sample` k∈{1,3} and
+`test_placeholder_draft_token_rejected`
+(`tests/v1/spec_decode/test_rejection_sampler_utils.py`), plus the expansion
+cases in `tests/vllm/v1/worker/test_prepare_inputs.cpp` and CUDA==CPU
+bit-exactness at the gate vocab 248320 in `tests/vt/test_cuda_ops.cpp`.
+
+**STILL DEFERRED after I3** (the obvious seams): the stochastic/Gumbel accept
+(`:589-627`) and residual resample (`:775-799`); block verification (`:535+`);
+synthetic acceptance rates; `apply_sampling_params` over the EXPANDED batch
+(`rejection_sampler.py:113-120`, needs `expanded_idx_mapping` /
+`expanded_local_pos` — greedy argmax is invariant under temperature/top-k/top-p,
+so this is a no-op for the greedy gate but REQUIRED before penalties /
+logit-bias / bad-words work under spec decode); expanded-batch logprobs
+(`rejection_sampler.py:67-99`); and the multi-row grammar bitmask.
+
 **STILL DEFERRED** (unchanged by I2, called out so I3/I5 do not assume them):
 the first-decode-step spec **padding** (placeholder `-1` drafts /
 `num_spec_tokens_to_schedule` / `num_invalid_spec_tokens`), the dynamic-SD

@@ -633,6 +633,100 @@ void ApplyAllowedTokenIdsCuda(Queue& q, Tensor& logits, const Tensor& mask) {
   Check(cudaGetLastError(), "apply_allowed_token_ids launch");
 }
 
+// --- Greedy spec-decode rejection sampling (SPEC-REJECTION I3) --------------
+// Mirrors the CPU reference (cpu_sample.cpp GreedyRejectionSampleKernel) element
+// for element, and upstream's TWO-PHASE decomposition: a per-expanded-row argmax
+// (upstream `_compute_local_logits_stats_kernel` per-vocab-block partials +
+// `_compute_global_target_argmax`, rejection_sampler_utils.py:923-946) followed by
+// a one-thread-per-request sequential accept walk (`_rejection_kernel`, launched
+// `num_warps=1` at :1032-1067). Bit-exact vs the CPU reference on the accepted
+// token ids: the argmax uses the SAME ArgReduce lowest-index tie-break as
+// GreedyArgmax, and the accept walk is pure integer equality.
+
+// Phase 1: target_argmax[row] = argmax(logits[row]) for every expanded row.
+__global__ void RejectionRowArgmaxKernel(int32_t* out, const float* logits, int64_t v) {
+  const int64_t row = blockIdx.x;
+  const float* r = logits + row * v;
+  __shared__ float sv[kBlock];
+  __shared__ int64_t si[kBlock];
+
+  float bv = kNegInf;
+  int64_t bi = kArgSentinel;
+  for (int64_t j = threadIdx.x; j < v; j += blockDim.x) ArgReduce(bv, bi, r[j], j);
+
+  sv[threadIdx.x] = bv;
+  si[threadIdx.x] = bi;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s)
+      ArgReduce(sv[threadIdx.x], si[threadIdx.x], sv[threadIdx.x + s], si[threadIdx.x + s]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    out[row] = static_cast<int32_t>((si[0] == kArgSentinel) ? 0 : si[0]);
+}
+
+// Phase 2: one thread per request walks its draft positions, accepting while the
+// draft equals the target argmax; stores the accepted stream + accepted_length+1.
+__global__ void GreedyRejectAcceptKernel(int32_t* sampled, int32_t* num_sampled,
+                                         const int32_t* target_argmax,
+                                         const int32_t* draft_sampled, const int32_t* cu_num_logits,
+                                         int64_t width) {
+  const int64_t req = blockIdx.x;
+  const int64_t start = cu_num_logits[req];
+  const int64_t end = cu_num_logits[req + 1];
+  const int64_t num_draft_tokens = end - start - 1;
+  int32_t* row = sampled + req * width;
+  for (int64_t j = 0; j < width; ++j) row[j] = -1;  // PLACEHOLDER_TOKEN_ID pad
+
+  bool accepted = true;
+  int64_t accepted_length = 0;
+  for (int64_t i = 0; i < num_draft_tokens; ++i) {
+    if (!accepted) break;  // upstream `elif accepted:` guard
+    const int32_t ta = target_argmax[start + i];
+    // +1: draft token i is the input id at the NEXT expanded row (:534). A -1
+    // placeholder can never equal an argmax (>= 0) => rejected, no OOB read.
+    const int32_t draft = draft_sampled[start + i + 1];
+    accepted = (ta == draft);
+    row[i] = accepted ? draft : ta;
+    accepted_length += accepted ? 1 : 0;
+  }
+  if (accepted_length == num_draft_tokens) {
+    // Bonus token (greedy resample == argmax of the bonus row).
+    row[accepted_length] = target_argmax[start + accepted_length];
+  }
+  num_sampled[req] = static_cast<int32_t>(accepted_length) + 1;
+}
+
+// Persistent grow-only scratch for the per-row argmax (a few KB), so a verify
+// step pays no cudaMalloc/cudaFree. Same pattern as the greedy-argmax partials.
+int32_t* g_reject_argmax = nullptr;
+size_t g_reject_argmax_cap = 0;
+
+void EnsureRejectArgmaxScratch(size_t elems) {
+  if (elems <= g_reject_argmax_cap) return;
+  if (g_reject_argmax) cudaFree(g_reject_argmax);
+  Check(cudaMalloc(&g_reject_argmax, elems * sizeof(int32_t)), "rejection argmax scratch");
+  g_reject_argmax_cap = elems;
+}
+
+void GreedyRejectionSampleCuda(Queue& q, Tensor& sampled, Tensor& num_sampled, const Tensor& logits,
+                               const Tensor& draft_sampled, const Tensor& cu_num_logits) {
+  const int64_t num_logits = logits.shape[0], v = logits.shape[1];
+  const int64_t num_reqs = cu_num_logits.shape[0] - 1;
+  if (num_reqs == 0 || num_logits == 0 || v == 0) return;
+  cudaStream_t s = AsStream(q);
+
+  EnsureRejectArgmaxScratch(static_cast<size_t>(num_logits));
+  RejectionRowArgmaxKernel<<<static_cast<unsigned>(num_logits), kBlock, 0, s>>>(
+      g_reject_argmax, logits.Ptr<float>(), v);
+  Check(cudaGetLastError(), "greedy_rejection_sample argmax launch");
+  GreedyRejectAcceptKernel<<<static_cast<unsigned>(num_reqs), 1, 0, s>>>(
+      sampled.Ptr<int32_t>(), num_sampled.Ptr<int32_t>(), g_reject_argmax,
+      draft_sampled.Ptr<int32_t>(), cu_num_logits.Ptr<int32_t>(), sampled.shape[1]);
+  Check(cudaGetLastError(), "greedy_rejection_sample accept launch");
+}
+
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kApplyTemperature, DeviceType::kCUDA,
@@ -647,6 +741,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<ComputeLogprobsFn>(&ComputeLogprobsCuda)));
     RegisterOp(OpId::kRandomSample, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<RandomSampleFn>(&RandomSampleCuda)));
+    RegisterOp(OpId::kGreedyRejectionSample, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<GreedyRejectionSampleFn>(&GreedyRejectionSampleCuda)));
     RegisterOp(OpId::kApplyPenalties, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<ApplyPenaltiesFn>(&ApplyPenaltiesCuda)));
     RegisterOp(OpId::kApplyMinP, DeviceType::kCUDA,

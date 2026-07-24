@@ -3300,3 +3300,17 @@ work was run and no throughput or acceptance-rate number is claimed here - the
 honest speculative baseline is vLLM configured with the SAME speculative config,
 and that A/B is owed by the M-mtp-1 e2e gate, which keeps the `SPEC-MTP` row
 `GATING`.
+
+**`SPEC-REJECTION` I3 verify half - greedy rejection sampler + input-batch logits
+expansion (2026-07-24, [spec](../.agents/specs/mtp-spec-decode.md)).**
+**Benchmark disposition: NOT APPLICABLE - no measurement, no speed credit
+claimed (`benchmark_binding=false`).** Like I2 this is DEFAULT-OFF and INERT:
+with no speculative config the scheduler never populates
+`scheduled_spec_decode_tokens`, so `StepInputs::num_draft_tokens` is 0 on every
+step, `cu_num_logits` is `arange(num_reqs+1)`, `logits_indices` is the pre-change
+`query_start_loc[1:] - 1` array, and the runner's rejection branch is never
+entered. No model or kernel forward TU was touched, so every model gate is
+byte-identical by construction. No throughput, TPOT or acceptance-rate number is
+claimed: the honest denominator is vLLM with the SAME speculative config, and
+that A/B is owed by the M-mtp-1 e2e gate, which keeps `SPEC-MTP` at `GATING` and
+`SPEC-REJECTION` short of `DONE`.

@@ -21264,3 +21264,37 @@ Invariant test pins every marker row to a registered parser. Evidence:
 `test_chat_prompt` 5/5, `test_chat_template` 17/17, C11 header compile clean.
 Authored by a task-scoped subagent in an isolated worktree; integrated,
 re-verified and recorded by the coordinating session.
+
+## 2026-07-24 — google/minja vendored as the chat-template engine (`CLAIM-CAPI-MINJA`, autoparser-parity program W4)
+
+The homegrown minja-SUBSET renderer (loud-error philosophy, ~1140 lines) is
+replaced by vendored google/minja `021c2293` (MIT, `third_party/minja/`,
+llama.cpp's renderer) behind the SAME `apply_chat_template` contract. The
+adapter drives minja's LOW-LEVEL Parser/Context API on purpose: the high-level
+`chat_template` wrapper runs speculative capability probes and message
+polyfills that are NOT transformers behavior and break byte-exactness.
+One local minja delta (diff-verified sole change): an `lstrip_blocks` guard so
+expression tags `{{ }}` do not strip leading spaces, matching Jinja2.
+
+Correction of record: five of the seventeen "byte-exact vs transformers"
+subset-era test expectations actually encoded SUBSET behavior and were
+verified WRONG against real jinja2 3.1.2 (system-role rendering, lstrip
+before expression tags, tojson separators, namespace()/macro renderability).
+They are corrected, not loosened; the tojson gap that remains (jinja2
+additionally sorts keys and HTML-escapes; minja does not) is documented in
+the test and does not affect real templates, which format tools themselves.
+
+The REAL Qwen3.5 chat template (7991 bytes, namespace()/macro/is-tests,
+extracted from the production GGUF into `tests/fixtures/`) now renders both
+plain and with tools (fixture-tested for the <tool_call> instruction). The
+capi probe-and-fallback (CLAIM-CAPI-CHAT-V3 addendum) stays as the safety net
+for genuinely broken templates, re-pointed test included.
+
+Evidence: `test_chat_template` 20/20 (was 17), `test_chat_prompt` 5/5,
+`test_capi` 22/22, `test_tool_parser_detect` 5/5, `test_openai_api_server`
+22/22, `test_openai_conformance` 23/23, `test_openai_tool_parsers` 12/12, all
+re-verified by the integrator after rebase onto ABI v4. Authored by a
+task-scoped subagent in an isolated worktree.
+
+Open engine item CLOSED by this change: "minja namespace/macro/filters for
+full template fidelity" (was the caveat on the chat-ABI entries).

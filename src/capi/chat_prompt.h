@@ -1,14 +1,16 @@
 // INTERNAL (not installed / not part of the public ABI). Chat-prompt
 // resolution for the ABI v3 chat entry points: pick the model's real chat
-// template when the minja-subset renderer can serve it, and otherwise degrade
+// template when the minja renderer can serve it, and otherwise degrade
 // — with a stderr witness, never silently — to a Hermes-aware fallback prompt
 // that still primes the model for the engine's structural-tag tool flow.
 //
-// Rationale: MakeChatTemplatePromptFn renders LAZILY, so an exotic template
-// (namespace()/macro — e.g. the full Qwen3.5 template) would otherwise fail
-// EVERY chat request with a ChatTemplateError. The bundled server already
-// falls back to a plain prompt when no template loads; this extends the same
-// policy to "loads but cannot render", probed ONCE at resolution.
+// Rationale: MakeChatTemplatePromptFn renders LAZILY, so a template that fails
+// to render (a genuine syntax/evaluation error) would otherwise fail EVERY chat
+// request with a ChatTemplateError. The bundled server already falls back to a
+// plain prompt when no template loads; this extends the same policy to "loads
+// but cannot render", probed ONCE at resolution. (The full Qwen3.5 template with
+// its namespace()/macro constructs now renders natively via minja, so it is used
+// directly rather than degraded; the fallback is for genuinely broken templates.)
 #ifndef VLLM_CAPI_CHAT_PROMPT_H_
 #define VLLM_CAPI_CHAT_PROMPT_H_
 

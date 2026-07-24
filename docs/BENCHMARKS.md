@@ -2000,6 +2000,24 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **google/minja vendored as the chat-template engine - `NOT APPLICABLE`
+  (2026-07-24, `CLAIM-CAPI-MINJA`).** `benchmark_binding=false`.
+  **Serving-layer renderer swap, no decode-path change.** The homegrown
+  minja-subset renderer (~1140 lines) is replaced by vendored google/minja
+  `021c229` (MIT, `third_party/minja/`, one documented lstrip_blocks guard as
+  the sole local delta) behind the SAME `apply_chat_template` contract, using
+  minja's low-level Parser/Context API (the high-level wrapper's capability
+  probes and message polyfills are deliberately bypassed - they diverge from
+  transformers). Full-surface templates now render (namespace()/macro/filters;
+  the REAL Qwen3.5 template from the GGUF renders incl. its tools branch,
+  fixture-tested). Five subset-era test expectations were found to encode
+  subset behavior, verified WRONG against real jinja2 3.1.2, and corrected
+  (system-role handling, lstrip before expression tags, tojson separators,
+  renderability of namespace/macro). Evidence: `test_chat_template` 20/20
+  (was 17), `test_chat_prompt` 5/5, `test_capi` 22/22,
+  `test_openai_api_server`/`test_openai_conformance` green. No binding number
+  is created, re-based, or invalidated.
+
 - **Tool-parser selection + template auto-detection through the C ABI (ABI v4) -
   `NOT APPLICABLE` (2026-07-24, `CLAIM-CAPI-PARSER-SELECT`).**
   `benchmark_binding=false`. **API-surface change, no performance claim.**

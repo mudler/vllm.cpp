@@ -16,6 +16,9 @@
 
 #include <doctest/doctest.h>
 
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -158,24 +161,43 @@ TEST_CASE("chat_template: whitespace trim control") {
   CHECK(apply_chat_template("A\n  {% set z = '1' %}\nB", {}, false) == "A\nB");
 }
 
-// ─── (e) an unsupported construct throws loudly ──────────────────────────────
-TEST_CASE("chat_template: unsupported constructs throw ChatTemplateError") {
-  // Filters are unsupported.
-  CHECK_THROWS_AS(apply_chat_template("{{ x | upper }}", {}, false),
-                  ChatTemplateError);
-  // Macros are unsupported.
-  CHECK_THROWS_AS(
-      apply_chat_template("{% macro f() %}{% endmacro %}", {}, false),
-      ChatTemplateError);
-  // namespace()/is-tests (the Qwen tool/thinking path) are unsupported.
-  CHECK_THROWS_AS(
-      apply_chat_template("{% set n = namespace(x=1) %}", {}, false),
-      ChatTemplateError);
+// ─── (e) a malformed template throws ChatTemplateError ───────────────────────
+// The engine is now the full google/minja renderer, so constructs the old
+// hand-written subset rejected (filters, macros, namespace(), is-tests, slicing)
+// render fine (see the "minja engine renders" case below). Only a genuinely
+// malformed template (a parse/eval error) still throws, and it is surfaced as a
+// ChatTemplateError so the capi probe-and-fallback safety net keeps working.
+TEST_CASE("chat_template: malformed templates throw ChatTemplateError") {
   // Unterminated tag.
   CHECK_THROWS_AS(apply_chat_template("{{ 'x'", {}, false), ChatTemplateError);
   // Unbalanced endfor.
   CHECK_THROWS_AS(apply_chat_template("{% endfor %}", {}, false),
                   ChatTemplateError);
+  // Unterminated block body.
+  CHECK_THROWS_AS(apply_chat_template("{% for m in messages %}", {}, false),
+                  ChatTemplateError);
+}
+
+// ─── the vendored minja engine renders constructs the old subset rejected ────
+// namespace()/macros/filters are exactly what the real Qwen3.5 template needs;
+// the previous subset renderer threw on them. Assert they now render.
+TEST_CASE("chat_template: minja engine renders namespace() and macros") {
+  // namespace() + a mutating loop (the Qwen tool/thinking idiom).
+  const char* ns =
+      "{%- set found = namespace(value=false) %}"
+      "{%- for m in messages %}{%- if m.role == 'user' %}"
+      "{%- set found.value = true %}{%- endif %}{%- endfor %}"
+      "{{- found.value }}";
+  CHECK(apply_chat_template(ns, SystemUser(), false) == "True");
+
+  // A macro definition + call.
+  const char* macro =
+      "{%- macro tag(role) -%}<|{{ role }}|>{%- endmacro -%}"
+      "{{- tag('assistant') }}";
+  CHECK(apply_chat_template(macro, {}, false) == "<|assistant|>");
+
+  // A filter the subset never supported.
+  CHECK(apply_chat_template("{{ 'hi' | upper }}", {}, false) == "HI");
 }
 
 // ─── M3.3 Task 3: tools rendered into the prompt via the tool branch ─────────
@@ -213,14 +235,16 @@ TEST_CASE("chat_template: tools render the function schemas into the prompt") {
       /*eos=*/"", WeatherTool());
 
   // The tool system prompt + the schema JSON (name/description/parameters) are
-  // present, and the user turn follows.
+  // present, and the user turn follows. minja's `tojson` uses Python/Jinja2
+  // json.dumps separators (`": "`, `", "`) rather than the deleted subset's
+  // compact nlohmann dump, so the key/value pairs carry a space after the colon.
   CHECK(out.find("# Tools") != std::string::npos);
   CHECK(out.find("<tools>") != std::string::npos);
-  CHECK(out.find("\"name\":\"get_weather\"") != std::string::npos);
-  CHECK(out.find("\"description\":\"Get the weather for a city.\"") !=
+  CHECK(out.find("\"name\": \"get_weather\"") != std::string::npos);
+  CHECK(out.find("\"description\": \"Get the weather for a city.\"") !=
         std::string::npos);
   CHECK(out.find("\"parameters\"") != std::string::npos);
-  CHECK(out.find("\"type\":\"function\"") != std::string::npos);
+  CHECK(out.find("\"type\": \"function\"") != std::string::npos);
   CHECK(out.find("<|im_start|>user\nweather?<|im_end|>") != std::string::npos);
 }
 
@@ -244,6 +268,56 @@ TEST_CASE("chat_template: tojson filter serializes the tool object") {
   CHECK(j.at("function").at("name") == "get_weather");
   CHECK(j.at("function").at("parameters").at("properties").at("city").at("type") ==
         "string");
+}
+
+// ─── The REAL Qwen3.5 chat template (namespace()/macros/is-tests/<tool_call>) ─
+// Extracted from the Qwen3.5-2B GGUF (tokenizer.chat_template) into
+// tests/fixtures/qwen35_chat_template.jinja. The old hand-written subset threw
+// on its namespace()/macro/is-test constructs; the vendored minja engine renders
+// it. This is the real-world driver for the whole vendoring effort.
+namespace {
+std::string ReadFixture(const std::string& name) {
+  std::ifstream f(std::string(VLLM_TEST_FIXTURES_DIR) + "/" + name,
+                  std::ios::binary);
+  if (!f) throw std::runtime_error("cannot open fixture: " + name);
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+}  // namespace
+
+TEST_CASE("chat_template: real Qwen3.5 template renders a plain conversation") {
+  const std::string tmpl = ReadFixture("qwen35_chat_template.jinja");
+  std::string out;
+  REQUIRE_NOTHROW(out = apply_chat_template(tmpl, SystemUser(),
+                                            /*add_generation_prompt=*/true,
+                                            /*bos=*/"", /*eos=*/"<|im_end|>"));
+  // The chatml turns are present and the assistant generation header is added.
+  CHECK(out.find("<|im_start|>system\nYou are a helpful assistant.<|im_end|>") !=
+        std::string::npos);
+  CHECK(out.find("<|im_start|>user\nHello, who are you?<|im_end|>") !=
+        std::string::npos);
+  CHECK(out.find("<|im_start|>assistant") != std::string::npos);
+  // With no tools, the tools system prompt must NOT appear.
+  CHECK(out.find("<tools>") == std::string::npos);
+}
+
+TEST_CASE("chat_template: real Qwen3.5 template renders the tools branch") {
+  const std::string tmpl = ReadFixture("qwen35_chat_template.jinja");
+  const std::vector<ChatMessage> msgs = {
+      ChatMessage{"user", std::string("what is the weather?")}};
+  std::string out;
+  REQUIRE_NOTHROW(out = apply_chat_template(
+                      tmpl, msgs, /*add_generation_prompt=*/true, /*bos=*/"",
+                      /*eos=*/"<|im_end|>", WeatherTool()));
+  // The tool system prompt, the <tool_call> instruction surface, and the tool
+  // name are all injected by the template's tool branch.
+  CHECK(out.find("# Tools") != std::string::npos);
+  CHECK(out.find("<tools>") != std::string::npos);
+  CHECK(out.find("<tool_call>") != std::string::npos);
+  CHECK(out.find("get_weather") != std::string::npos);
+  CHECK(out.find("<|im_start|>user\nwhat is the weather?<|im_end|>") !=
+        std::string::npos);
 }
 
 // ─── LoadChatTemplateFromGguf (ABI v3) ───────────────────────────────────────

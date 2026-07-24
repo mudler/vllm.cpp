@@ -479,6 +479,11 @@ target_include_directories(vllm
 # The C ABI impl reaches its internal test-hook header as "capi/engine_handle.h"
 # (an internal, non-installed header under src/); src is a PRIVATE search path.
 target_include_directories(vllm PRIVATE src)
+# third_party/ is a SYSTEM include so vendored headers stay off the -Werror path.
+# It carries the header-only deps reached as <dir/header>: <httplib/httplib.h>,
+# <nlohmann/json.hpp>, <doctest/doctest.h>, and the vendored google/minja Jinja
+# engine <minja/chat-template.hpp> / <minja/minja.hpp> that backs
+# src/vllm/entrypoints/chat_template.cpp.
 target_include_directories(vllm SYSTEM PUBLIC third_party)
 vllm_cpp_set_warnings(vllm)
 # --- Vendored BLAKE3 (LMCache MODE-1 lm:// token hash, KV-EXTERNAL-CACHE W1) --

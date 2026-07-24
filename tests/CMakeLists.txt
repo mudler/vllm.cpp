@@ -175,6 +175,11 @@ vllm_cpp_add_test(test_tool_parser_detect
 vllm_cpp_add_test(test_tool_choice_grammar
   vllm/entrypoints/openai/tool_parsers/test_tool_choice_grammar.cpp)
 vllm_cpp_add_test(test_chat_template vllm/entrypoints/test_chat_template.cpp)
+# The real Qwen3.5 chat template (extracted from the GGUF) lives under
+# tests/fixtures/; hand its absolute path to the test so it resolves regardless
+# of the working directory ctest runs it from.
+target_compile_definitions(test_chat_template PRIVATE
+  VLLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 # The HTTP api_server smoke test needs the vendored cpp-httplib (gated).
 if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_openai_api_server vllm/entrypoints/openai/test_api_server.cpp)

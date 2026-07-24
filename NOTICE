@@ -17,6 +17,9 @@ ports, and/or vendors code from third-party projects, including:
   - NVIDIA CUTLASS (BSD-3-Clause) — used for FP4/FP8 GEMM kernels.
   - xgrammar (Apache-2.0) — C++ grammar core, vendored for structured output.
   - cpp-httplib (MIT) and nlohmann/json (MIT) — header-only dependencies.
+  - google/minja (MIT) - header-only Jinja engine vendored under
+    third_party/minja/ (with its LICENSE), used as the chat-template renderer
+    in src/vllm/entrypoints/chat_template.cpp.
 
 Each such component remains under its own license; the notices and license
 texts of vendored third-party code are retained in their respective source

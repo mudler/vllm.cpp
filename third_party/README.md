@@ -5,6 +5,7 @@
 | doctest | v2.5.2 | github.com/doctest/doctest | MIT |
 | nlohmann/json | v3.12.0 | github.com/nlohmann/json | MIT |
 | cpp-httplib | v0.49.0 | github.com/yhirose/cpp-httplib | MIT |
+| minja (`minja/minja.hpp`, `minja/chat-template.hpp`, `minja/LICENSE`) | commit `021c229` (2026) | github.com/google/minja | MIT |
 | Vulkan-Headers (`vulkan_core.h`, `vk_platform.h`) | vulkan-sdk-1.4.328.1 (`VK_HEADER_VERSION` 328) | github.com/KhronosGroup/Vulkan-Headers | Apache-2.0 |
 | BLAKE3 (`c/`: `blake3.{h,c}`, `blake3_impl.h`, `blake3_dispatch.c`, `blake3_portable.c`) | 1.5.5 (commit `81f772a`) | github.com/BLAKE3-team/BLAKE3 | CC0-1.0 OR Apache-2.0 |
 

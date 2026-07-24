@@ -6,34 +6,30 @@
 //
 // DEVIATION (recorded, like the vt:: runtime): transformers renders the chat
 // template with the full CPython Jinja2 engine. We have no Python at runtime, so
-// this file is an ORIGINAL component — a small MINJA-SUBSET Jinja renderer
-// (there is no upstream C++ mirror to port). It supports ONLY the constructs the
-// gate-model (Qwen3.6 / Qwen-family, and best-effort Llama-family) chat
-// templates use for the T0 no-tools / no-thinking path:
-//   - `{{ expr }}` interpolation; variables `messages`, `add_generation_prompt`,
-//     `bos_token`, `eos_token`, the `for` loop var and `loop`, plus `{% set %}`
-//     bindings; member access `x.y`, subscript `x[i]` / `x['k']`.
-//   - `{% for v in expr %}` … `{% endfor %}` (with `loop.first/last/index0/
-//     index/length/revindex/revindex0`).
-//   - `{% if %}` / `{% elif %}` / `{% else %}` / `{% endif %}` with `==`, `!=`,
-//     `in`, `not in`, `and`, `or`, `not`, truthiness.
-//   - `{% set x = expr %}` bindings.
-//   - `+` / `~` string concatenation (and `+` integer add), `.strip()` /
-//     `.lstrip()` / `.rstrip()` (optional char arg).
-//   - Whitespace control: the `-` trim markers (`{%- -%}`, `{{- -}}`) PLUS
-//     transformers' `trim_blocks=True, lstrip_blocks=True` block-whitespace
-//     policy — reproduced exactly (chat_template_utils.py:474 @ transformers).
-// ANY other construct (filters `|`, macros, `include`, tuple-unpack `for`,
-// slicing `[::-1]`, `namespace()`, `is`-tests, unknown methods/functions) is a
-// LOUD ERROR (throws vllm::entrypoints::ChatTemplateError with the offending
-// construct + source position) — never a silently-wrong prompt.
+// the render engine is the vendored google/minja header-only Jinja renderer
+// (third_party/minja/, the same engine llama.cpp historically vendored). This
+// file is the ADAPTER over it: it parses the tokenizer's raw Jinja
+// `chat_template` and renders it with transformers' whitespace policy
+// (trim_blocks=True, lstrip_blocks=True, keep_trailing_newline=False, per
+// chat_template_utils.py @ transformers), exposing `messages`,
+// `add_generation_prompt`, `bos_token`, `eos_token`, `tools` (and strftime_now).
+// minja supports the full construct surface real templates use (filters,
+// macros, `namespace()`, is-tests, slicing, tuple-unpack loops), so the whole
+// upstream Qwen/Llama templates (tool-calling and <think> branches included)
+// render, not just a hand-picked subset.
 //
-// The full upstream Qwen3.6 template additionally drives tool-calling and
-// <think> reasoning via those unsupported constructs; those branches are DEFER-
-// RED to M3.3 (tool calling) / M3.4. For a no-tools/no-thinking conversation the
-// upstream template's output is byte-identical to the subset template rendered
-// here (verified against a transformers `apply_chat_template` dump — see
-// tests/vllm/entrypoints/test_chat_template.cpp).
+// It renders the template LITERALLY (like transformers), NOT via minja's
+// high-level `chat_template` wrapper: that wrapper adds a heuristic capability
+// probe + a "polyfill" pass (rewriting the message list) that is not
+// transformers behavior and diverges on byte-exact output. One local minja
+// modification restores exact transformers parity for lstrip_blocks before
+// expression tags (see third_party/minja/minja.hpp and third_party/README.md).
+//
+// A render/parse failure (syntax error, evaluation error) throws
+// vllm::entrypoints::ChatTemplateError, never a silently-wrong prompt; the capi
+// probe-and-fallback layer (src/capi/chat_prompt.*) relies on that. Byte-exact
+// outputs are verified against transformers/jinja2 in
+// tests/vllm/entrypoints/test_chat_template.cpp.
 #ifndef VLLM_ENTRYPOINTS_CHAT_TEMPLATE_H_
 #define VLLM_ENTRYPOINTS_CHAT_TEMPLATE_H_
 
@@ -55,7 +51,7 @@ class ChatTemplateError : public std::runtime_error {
       : std::runtime_error(msg) {}
 };
 
-// Render a minja-subset Jinja chat template to the prompt string.
+// Render a Jinja chat template (via the vendored minja engine) to the prompt.
 //   template_str          the tokenizer_config.json `chat_template` Jinja source
 //   messages              the {role, content} conversation
 //   add_generation_prompt appends the assistant generation header when the
@@ -65,8 +61,8 @@ class ChatTemplateError : public std::runtime_error {
 //                         as `tools` (a list of the OpenAI tool JSON objects) for
 //                         the `{% if tools %}...{{ tool | tojson }}...{% endif %}`
 //                         branch. Empty => the `tools` variable is an empty list
-//                         (falsy). Requires the `tojson` filter (M3.3 minja ext).
-// Throws ChatTemplateError on any unsupported construct or evaluation error.
+//                         (falsy). The `tojson` filter is a minja builtin.
+// Throws ChatTemplateError on any parse or evaluation error.
 std::string apply_chat_template(
     const std::string& template_str,
     const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,

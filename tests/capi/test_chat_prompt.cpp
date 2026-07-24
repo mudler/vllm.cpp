@@ -62,11 +62,13 @@ TEST_CASE("chat_prompt: a renderable template is used as-is") {
 }
 
 TEST_CASE("chat_prompt: an unrenderable template degrades to the hermes fallback") {
-  // namespace() is deliberately unsupported by the minja subset (the full
-  // Qwen3.5 template's shape), so the probe fails and every request goes to
-  // the fallback instead of throwing per request.
+  // The engine is now full minja, so namespace()/macros/filters render. A
+  // template only degrades when it is genuinely broken: this one has a syntax
+  // error (an unterminated {% for %} with no {% endfor %}), so the plain probe
+  // throws and every request goes to the fallback instead of throwing per
+  // request.
   const auto fn = ResolveTemplatePromptFn(
-      "{%- set c = namespace(value=0) %}{{ c.value }}", "", "", "test-origin");
+      "{% for m in messages %}{{ m.role }}", "", "", "test-origin");
   const std::string out = fn(Msgs(), true, WeatherTool());
   CHECK(out.find("<tools>") != std::string::npos);
   CHECK(out.find("user: weather in Rome?") != std::string::npos);

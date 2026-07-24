@@ -55,10 +55,10 @@ oai::ChatPromptFn ResolveTemplatePromptFn(const std::string& template_str,
   oai::ChatPromptFn template_fn =
       vllm::entrypoints::MakeChatTemplatePromptFn(template_str, bos, eos);
 
-  // Probe once: the minja-subset renderer rejects unsupported constructs
-  // LOUDLY at render time, and a chat surface that throws on every request is
-  // useless. A short two-turn conversation exercises the message loop; the
-  // dummy tool exercises the `{% if tools %}` branch.
+  // Probe once: minja throws LOUDLY on a genuinely broken template (syntax or
+  // evaluation error) at render time, and a chat surface that throws on every
+  // request is useless. A short two-turn conversation exercises the message
+  // loop; the dummy tool exercises the `{% if tools %}` branch.
   const std::vector<oai::ChatMessage> probe_messages = {
       oai::ChatMessage{"system", std::string("probe")},
       oai::ChatMessage{"user", std::string("probe")}};

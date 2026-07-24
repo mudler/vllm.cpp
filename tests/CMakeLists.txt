@@ -475,6 +475,13 @@ target_compile_definitions(test_qwen3_paged_engine PRIVATE
 target_include_directories(test_qwen3_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# GLM-4-9B-0414 (Glm4ForCausalLM) dense SACRED gate — first GLM-family model (G2).
+vllm_cpp_add_test(test_glm4_paged_engine parity/test_glm4_paged_engine.cpp)
+target_compile_definitions(test_glm4_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_glm4_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # GGUF 35B greedy acceptance gate (checkpoint-gated, dgx-only; skips when the
 # APEX k-quant GGUFs are absent). Loads the REAL .gguf single-file path
 # (metadata + embedded vocab + k-quant dequant) through the paged engine and

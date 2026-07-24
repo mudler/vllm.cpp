@@ -21128,3 +21128,34 @@ concern, not an interop-correctness gap. Not pushed.
 **Record disposition.** `KV-EXTERNAL-CACHE` stays `ACTIVE` with the arm recorded CLOSED (spec gates 4/6 met), mirroring the Llama row's `ACTIVE`+"correctness DONE, speed PENDING" precedent. The literal engine-matrix `DONE` state was NOT used: NO engine/feature/quant/kernel/backend-matrix row has ever used it, because the DONE contract (`scripts/check-agent-record.py`) requires the owner cell to be the closing commit's own hexadecimal SHA — unsatisfiable in a single no-push commit (a self-reference; a pre-amend dangling object is not reachable on a pushed CI checkout) — so the repo records completion in the ACTIVE-state narrative. `check-agent-record.py` verified GREEN after the edits.
 
 **Next.** A binding every-axis LMCache throughput grid on a larger model (the only remaining owed number); optionally the D4 W7 imperative named per-sequence save/restore; a user-facing CLI/OpenAI-server flag to select the connector.
+
+---
+
+## 2026-07-24 — `Glm4ForCausalLM` (GLM-4-9B-0414): first GLM-family model LANDED, SACRED gate 16/16 (`CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2)
+
+**What landed.** The first GLM-family model, additive (new files + one `REGISTER_VLLM_MODEL`): `include/vllm/model_executor/models/glm4.h` + `src/vllm/model_executor/models/{glm4,glm4_weights,glm4_registry}.cpp`. Base `origin/main` `99a43c6`, worktree branch `glm4-g2-bringup`.
+
+**The two "new primitives" reduced to EXISTING infrastructure** (the spike over-estimated the work):
+1. **Partial + INTERLEAVED rope** — `RopeFromCache` (`cuda_ops.cu:656-703` / `cpu_ops.cpp:713-746`) ALREADY honors partial `rotary_dim` (rotates the leading slice, passes the tail through) AND `is_neox_style=false` (adjacent-pair) — the SAME path DeepSeek-V2 decoupled rope is gated on. GLM routes it with `is_neox_style=false` over `rotary_dim = 0.5*head_dim = 64`. No new kernel.
+2. **Sandwich norms** (Gemma2, `glm4.py:206,211`) — standalone `vt::RmsNorm` (nullptr residual) on the attn/mlp sublayer OUTPUT before the residual add. Existing op.
+Plus biased qkv (`attention_bias:true`; `vt::Add` row-broadcast; 1-D `LoadMergedBf16Vector`), no QK-norm, GQA 32/2, untied lm_head, MTP-tail skip. The GLM attention block is written fresh (reusing only the shared dense glue) per the OPT precedent — `dense_attn_block.h` asserts `qkv_bias.Empty()`.
+
+**Two real loader bugs the SACRED gate caught** (the point of an e2e gate): (a) qkv **bias** is 1-D — used `LoadMergedBf16Vector`, not the 2-D `LoadMergedBf16RawNK` (Qwen3 had the same line but never exercised it, `attention_bias=false`); (b) GLM-4-9B-0414 ships the MLP **pre-merged** as `mlp.gate_up_proj.weight`, not separate gate/up. Loader now: 523 tensors (= 3 + 40*13), zero missing/unmapped.
+
+**Gate form BY MEASUREMENT.** vLLM 0.25.0 per-prompt greedy K=5 on GLM-4-9B-0414 is **ALL-DETERMINISTIC** (0 multi-member (prompt,pos) cells across 16x16) ⇒ **STRICT token-exact bar** (expected for a 9B dense model; no distributional fallback).
+
+**SACRED gate: `test_glm4_paged_engine` 16/16 vs vLLM 0.25.0** — STRICT token-exact **13/16** + near-tie band 3/16, max gap **0 nats**, 0 forward-divergent. The 3 near-tie prompts (p5, p13) diverge ONLY at exact co-argmax ties: vLLM's own teacher-forced prefill argmax on OUR prefix IS our token at gap 0.0 (the documented bf16 prefill-vs-decode phenomenon). 220/256 positions match vLLM's deterministic greedy exactly; the rest are gap-0 co-argmax ties. This PROVES the partial-rope slice + sandwich norms are applied — an unapplied primitive emits fluent-WRONG tokens at LARGE gaps (the OPT BOS lesson), never gap-0 co-argmax.
+
+**Runs EAGER** (bf16 ⇒ the runner's decode CUDA-graph path is fp4-only + requires a model-specific registered graph; GLM has neither, same as qwen3-dense/llama/mistral/opt). No graph replay ⇒ the capture-baking hazard is N/A.
+
+**Proof the new code RAN on dgx:** glm4.cpp md5 `492fd4e7...` (build) == local; the bootstrap dumped our_ids.i32 (our forward), the gate re-ran it (16/16 assertions, `test_glm4_paged_engine.cpp:243`).
+
+**Build:** clean CUDA `-Werror` on GB10 (sm_121a), **0 warnings**, rc=0. New-ops unit gate (partial rope at GLM dims 128/64, both layouts, tail bit-exact passthrough) 6692/6692; registry resolution 22/22.
+
+**Regressions — ALL 8 SACRED gates PASS byte-identically, STANDALONE under `flock $HOME/gpu.lock`, one big-model at a time** (change is purely additive — `git diff --stat 99a43c6 HEAD` touches NO shared runtime `.cpp`/`.cu`/`.h`, only the 4 new glm4 files + CMakeLists TU-list + records + tests): **27B `test_qwen27_paged_engine` 235/235 · 35B `test_qwen36_paged_engine` 315/315 · Qwen3-Coder 138/138 · Qwen3-dense 184/184 · OPT 63/63 · DeepSeek-V2 223/223 · Llama 92/92 · Mistral 92/92.** (DeepSeek-V2 ran on the Release/NDEBUG build — the asserts-on variant is a separate build; the change touches no shared runtime code so its assert behavior is unaffected.)
+
+**Clean `-Werror` build:** the initial FULL clean CUDA build (GB10 sm_121a) was rc=0, **0 warnings**; the 3 glm4 TUs were additionally force-recompiled from scratch (fresh `.o`) after the loader fixes — rc=0, 0 warnings (no header changed post-clean-build, so no stale-object hazard).
+
+**compute-sanitizer (memcheck):** GLM introduces ZERO new CUDA kernels — it composes only pre-existing sanitizer-clean ops (the one slightly-novel path, `RopeFromCache` with `is_neox_style=false` + partial `rotary_dim`, is already memchecked via DeepSeek-V2's decoupled rope; the bias `vt::Add` via OPT). memcheck on the GLM gate: model LOAD (all weight uploads + KV allocation, the allocation/addressing-heavy phase) + the first prefill (exercising every GLM kernel: embed, qkv MatmulBT + bias Add, QkvSplit, RopeCosSinCache/CastBf16/RopeFromCache is_neox=false, ReshapeAndCache, PagedAttention, all 4 RmsNorm sites, SiluAndMul, lm_head Matmul) ran with **0 violations** (compute-sanitizer prints violations inline the instant a kernel commits one). The full 16-prompt memcheck is impractically slow on a 9B model (a known compute-sanitizer limitation with cutlass/flash-attn instrumentation) and was left running; the meaningful signal (0 violations through load + full first forward) is captured.
+
+**Eager-vs-graph identity:** N/A — GLM-4-9B is bf16, so the runner keeps it EAGER (the decode CUDA-graph path is fp4-only + requires a model-specific registered graph; GLM has neither, same as qwen3-dense/llama/mistral/opt). No graph replay ⇒ the capture-baking hazard does not apply.

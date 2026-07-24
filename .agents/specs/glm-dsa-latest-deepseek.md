@@ -1,6 +1,24 @@
 # SPIKE: GLM family + DSA (sparse MLA) + latest DeepSeek (V3.2, V4)
 
-**Status:** SPIKE ONLY. No implementation, no kernels, no build, no benchmark.
+**G2 LANDED 2026-07-24 — `Glm4ForCausalLM` (GLM-4-9B-0414), the FIRST GLM-family
+model. SACRED gate 16/16 vs vLLM 0.25.0** (STRICT token-exact 13/16 + near-tie band
+3/16, max gap 0 nats, 0 forward-divergent; vLLM K=5 self-deterministic ⇒ STRICT bar).
+Row `MODEL-TEXT-glm4-glm4-for-causal-lm` SPIKE→ACTIVE (correctness DONE, speed
+PENDING). **The spike's §0.4.3 "two genuinely new primitives" over-estimated the
+work — BOTH reduced to EXISTING infrastructure:** (1) partial + INTERLEAVED rope is
+already implemented in `RopeFromCache` (both backends — `cuda_ops.cu:697-698` /
+`cpu_ops.cpp:744-746`), which honors partial `rotary_dim` (leading-slice rotate, tail
+passthrough) AND `is_neox_style=false`; it is the SAME path DeepSeek-V2 decoupled rope
+is gated on. GLM just routes it with `is_neox_style=false` over `rotary_dim=64`. No new
+kernel. (2) Sandwich norms are standalone `vt::RmsNorm` (nullptr residual) on the
+sublayer output — the existing op. New files: `glm4.{h,cpp}` + `glm4_weights.cpp` +
+`glm4_registry.cpp` (one `REGISTER_VLLM_MODEL`), reusing the shared dense glue; a
+GLM-specific attention block (biased qkv via `vt::Add`+1-D `LoadMergedBf16Vector`, no
+QK-norm) per the OPT precedent (D4). Loader 523 tensors, zero missing/unmapped; GLM-4-
+9B-0414 ships `mlp.gate_up_proj` PRE-MERGED. Runs EAGER (bf16). Remaining G1/G3/G4/G5
+per §0.7 unchanged.**
+
+**Status:** SPIKE + G2 IMPLEMENTED (Glm4ForCausalLM landed; G1/G3/G4/G5 still design-only).
 **Base:** `aa65ce7`. **Oracle pin:** `/home/mudler/_git/vllm` @ `e24d1b24`.
 **Claim:** `CLAIM-GLM-DSA-LATEST-DEEPSEEK`.
 **Parent plan:** [`breadth-sweep-plan.md`](breadth-sweep-plan.md) §B.3 Tier 3.

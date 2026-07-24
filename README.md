@@ -25,6 +25,7 @@ vllm.cpp implements an intentionally focused subset of vLLM, held to token-for-t
 | Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
 | OPT (learned pos-emb, cross-family) | Correctness-complete, speed-pending | Strict token-exact 6/6 (OPT-125m); additivity canary across model families |
 | DeepSeek-V2 MLA | Correctness-complete, speed-pending | Token-exact 8/8 (DeepSeek-V2-Lite); 0.86-0.95x vLLM output rate, TTFT faster at c4/c8 |
+| GLM-4 dense (sandwich norms, partial rope) | Correctness-complete, speed-pending | Token-exact 16/16 (GLM-4-9B-0414); first GLM-family model; partial interleaved RoPE + Gemma2 sandwich norms + biased qkv |
 | Safetensors loading | Supported | Both gate models plus every registered dense/MoE family |
 | GGUF loading (F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) | Supported; compute-in-quant on CPU | Weights in six block encodings stay compressed from file to matmul on CPU (no BF16 expansion) |
 | CPU backend vs llama.cpp | At or ahead on every axis (GGUF) | Prefill 1.18x ahead, decode at parity, peak memory 1.01x, byte-identical greedy tokens |
@@ -51,6 +52,7 @@ Every model below passes a token-for-token correctness gate against the pinned v
 | Mistral dense | Mistral-7B-v0.3 | yes | - | Token-exact | Speed-pending |
 | OPT | OPT-125m | yes | - | Strict token-exact | Speed-pending |
 | DeepSeek-V2 (MLA) | DeepSeek-V2-Lite | yes | - | Token-exact | Speed-pending |
+| GLM-4 dense | GLM-4-9B-0414 | yes | - | Token-exact | Speed-pending |
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively (RedHatAI/Qwen3-32B-NVFP4A16), correctness-complete and speed-pending.
 

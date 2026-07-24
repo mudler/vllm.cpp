@@ -38,6 +38,33 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
+**GLM-4 dense (`Glm4ForCausalLM`, GLM-4-9B-0414) - CORRECTNESS COMPLETE, no speed
+number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2,
+[spike](../.agents/specs/glm-dsa-latest-deepseek.md)).** The first GLM-family model.
+Disposition: **NO throughput measured or claimed - SPEED PENDING.** Gate form selected
+BY MEASUREMENT: vLLM 0.25.0 per-prompt greedy on GLM-4-9B-0414 is **ALL-DETERMINISTIC
+over K=5** (0 multi-member (prompt,pos) cells across 16x16) ⇒ **STRICT token-exact
+bar**. `test_glm4_paged_engine` drives the 16-prompt battery through the paged
+`LLMEngine` and matches the vLLM oracle **16/16**: STRICT token-exact **13/16** +
+near-tie band 3/16 (max gap **0 nats**, 0 forward-divergent). The 3 near-tie prompts
+(p5, p13) diverge ONLY at exact co-argmax ties where vLLM's own teacher-forced prefill
+argmax on OUR prefix IS our token (gap 0.0) - the documented bf16 prefill-vs-decode
+phenomenon, not a forward bug (an unapplied partial-rope slice or dropped sandwich norm
+would emit fluent-WRONG tokens at LARGE gaps; here 220/256 positions match vLLM's
+deterministic greedy exactly and the rest are gap-0 co-argmax ties). Runs EAGER (bf16,
+no decode graph). The two new primitives reduced to existing infra (partial+interleaved
+`RopeFromCache` with `is_neox_style=false`; standalone `vt::RmsNorm` sandwich norms) -
+see the model matrix row. New-ops unit gate (partial rope at GLM dims, both layouts,
+tail bit-exact) 6692/6692; registry resolution 22/22; loader 523 tensors zero
+missing/unmapped. Clean CUDA `-Werror` build, 0 warnings (glm4 TUs also force-recompiled from scratch
+post-fix). compute-sanitizer memcheck: GLM adds ZERO new CUDA kernels (composes
+pre-existing sanitizer-clean ops); model-load + first prefill (every GLM kernel)
+ran with 0 violations, full 16-prompt run impractically slow on a 9B model (left
+running). **Regressions — ALL 8 SACRED gates PASS byte-identically, standalone under
+`flock`, one big-model at a time: 27B 235/235 · 35B 315/315 · Qwen3-Coder 138/138 ·
+Qwen3-dense 184/184 · OPT 63/63 · DeepSeek-V2 223/223 · Llama 92/92 · Mistral 92/92**
+(purely additive: no shared runtime source touched).
+
 **Mistral (`MistralForCausalLM`, Mistral-7B-v0.3) - CORRECTNESS COMPLETE, no speed
 number (2026-07-23, `CLAIM-MODEL-MISTRAL` + `CLAIM-LOAD-SENTENCEPIECE`,
 [spike](../.agents/specs/sweep-mistral.md), [tokenizer](../.agents/specs/sentencepiece.md)).**

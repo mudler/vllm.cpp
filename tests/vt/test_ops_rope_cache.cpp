@@ -140,6 +140,86 @@ TEST_CASE("rope_from_cache applies GPT-J pairs and permits a missing key") {
   CHECK(query[5] == 100.0F);
 }
 
+// GLM-4-9B-0414 partial rotary: head_dim=128, partial_rotary_factor=0.5 ->
+// rotary_dim=64, in BOTH NeoX and interleaved (is_neox_style=false, GLM's actual
+// layout) forms. Asserts (a) the rotated leading 64 dims match the CPU reference
+// off the PRODUCTION RopeCosSinCache, and (b) the trailing [64,128) dims pass
+// through BIT-EXACTLY. This is the new-ops unit gate for the GLM partial-rotary
+// primitive (spike G2). GQA shape (Hq=4 q-heads, Hk=1 k-head — GLM ratio 32/2).
+TEST_CASE("rope_from_cache GLM partial rotary passes the tail through (both layouts)") {
+  constexpr int64_t kTokens = 3;
+  constexpr int64_t kHeadDim = 128;
+  constexpr int kRotaryDim = 64;  // 0.5 * 128
+  constexpr int64_t kHq = 4;
+  constexpr int64_t kHk = 1;
+  for (bool neox : {true, false}) {
+    CAPTURE(neox);
+    std::vector<int32_t> positions = {0, 5, 131};
+    std::vector<int64_t> ref_positions(positions.begin(), positions.end());
+
+    // Build the cos|sin cache via the production op (theta 1e4, rotary_dim 64).
+    vt::RopeArgs args{10000.0F, kRotaryDim};
+    args.is_neox_style = neox;
+    const int64_t cache_rows = 200;
+    std::vector<float> cache(static_cast<size_t>(cache_rows) * kRotaryDim, 0.0F);
+    {
+      std::vector<int64_t> cpos(static_cast<size_t>(cache_rows));
+      for (int64_t i = 0; i < cache_rows; ++i) cpos[static_cast<size_t>(i)] = i;
+      vt::Tensor tcp = vt::Tensor::Contiguous(cpos.data(), vt::DType::kI64, Cpu(),
+                                              {cache_rows});
+      vt::Tensor tcache = vt::Tensor::Contiguous(cache.data(), vt::DType::kF32,
+                                                 Cpu(), {cache_rows, kRotaryDim});
+      vt::Queue cq{Cpu(), nullptr};
+      vt::RopeCosSinCache(cq, tcache, tcp, args);
+    }
+
+    std::vector<float> query(static_cast<size_t>(kTokens * kHq * kHeadDim));
+    std::vector<float> key(static_cast<size_t>(kTokens * kHk * kHeadDim));
+    for (size_t i = 0; i < query.size(); ++i)
+      query[i] = 0.01F * static_cast<float>((i % 37) - 18);
+    for (size_t i = 0; i < key.size(); ++i)
+      key[i] = 0.01F * static_cast<float>((i % 29) - 14);
+    const std::vector<float> query0 = query;  // originals for the tail check
+    const std::vector<float> key0 = key;
+
+    std::vector<float> query_want = query;
+    std::vector<float> key_want = key;
+    Reference(query_want, kTokens, kHq, kHeadDim, ref_positions, false, cache,
+              cache_rows, args);
+    Reference(key_want, kTokens, kHk, kHeadDim, ref_positions, false, cache,
+              cache_rows, args);
+
+    vt::Tensor tq = vt::Tensor::Contiguous(query.data(), vt::DType::kF32, Cpu(),
+                                           {kTokens, kHq, kHeadDim});
+    vt::Tensor tk = vt::Tensor::Contiguous(key.data(), vt::DType::kF32, Cpu(),
+                                           {kTokens, kHk, kHeadDim});
+    vt::Tensor tp = vt::Tensor::Contiguous(positions.data(), vt::DType::kI32,
+                                           Cpu(), {kTokens});
+    vt::Tensor tc = vt::Tensor::Contiguous(cache.data(), vt::DType::kF32, Cpu(),
+                                           {cache_rows, kRotaryDim});
+    vt::Queue queue{Cpu(), nullptr};
+    vt::RopeFromCache(queue, tq, &tk, tp, tc, args);
+    CheckClose(query, query_want);
+    CheckClose(key, key_want);
+
+    // Tail [rotary_dim, head_dim) passes through BIT-EXACTLY (== not Approx).
+    for (int64_t t = 0; t < kTokens; ++t) {
+      for (int64_t h = 0; h < kHq; ++h) {
+        const int64_t row = (t * kHq + h) * kHeadDim;
+        for (int64_t dctx = kRotaryDim; dctx < kHeadDim; ++dctx) {
+          const size_t idx = static_cast<size_t>(row + dctx);
+          CHECK(query[idx] == query0[idx]);
+        }
+      }
+      const int64_t krow = t * kHk * kHeadDim;
+      for (int64_t dctx = kRotaryDim; dctx < kHeadDim; ++dctx) {
+        const size_t idx = static_cast<size_t>(krow + dctx);
+        CHECK(key[idx] == key0[idx]);
+      }
+    }
+  }
+}
+
 TEST_CASE("rope_from_cache MRoPE selects contiguous and interleaved T/H/W") {
   constexpr int64_t kRows = 4;
   constexpr int kRotaryDim = 8;

@@ -134,7 +134,16 @@ struct DeepseekV2Params {
 
 // Resolve DeepseekV2Params from a HfConfig. Throws with a precise message on any
 // field this port cannot serve. Pure/host — unit-testable without a checkpoint.
-DeepseekV2Params ParseDeepseekV2Params(const HfConfig& config);
+//
+// `allow_mtp_tail` tolerates `num_nextn_predict_layers > 0` (the MTP draft
+// layers, which ship as EXTRA `model.layers.{num_hidden_layers + i}.*` blocks the
+// loader never requests). DeepSeek-V2's own registration passes the default
+// FALSE — it refuses MTP checkpoints — so its behaviour is byte-identical. The
+// GLM-4.7-Flash (`Glm4MoeLite`) registration passes TRUE: that checkpoint ships
+// `num_nextn_predict_layers: 1`, and skipping the tail is exactly upstream's
+// `get_spec_layer_idx_from_weight_name` skip (glm4_moe_lite.py:358-360,633-643).
+DeepseekV2Params ParseDeepseekV2Params(const HfConfig& config,
+                                       bool allow_mtp_tail = false);
 
 // `DeepseekV2MLAAttention` weights (deepseek_v2.py:1003-1049), host-resident.
 // EXACTLY ONE query branch is populated (`q_lora_rank is not None` at :1003);
@@ -339,7 +348,8 @@ class DeepseekV2DecodeGraph {
 // `process_weights_after_loading` hook upstream; doing it at load time is the
 // same transform at the same point in the lifecycle) and the YaRN rope cache.
 DeepseekV2Weights LoadDeepseekV2ForCausalLMWeights(
-    const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config,
+    bool allow_mtp_tail = false);
 
 // Per-family config hook (the registry `parse_config`): resolves + validates
 // DeepseekV2Params and throws on anything unsupported.

@@ -284,6 +284,25 @@ MoeRouterTopKArgs V3Args() {
 }
 constexpr int64_t kV3Experts = 256;  // n_routed_experts
 
+// GLM-4.7-Flash's REAL router config (`Glm4MoeLite`, live config.json fetched
+// 2026-07-21 + glm4_moe.py:139-224). This is the config the SACRED gate actually
+// runs, so it is the e2e-relevant unit case: sigmoid `noaux_tc` scoring WITH an
+// `e_score_correction_bias`, `routed_scaling_factor: 1.8`, `norm_topk_prob: true`
+// (renormalize), and the DEGENERATE `n_group = topk_group = 1` (grouping is a
+// no-op — every expert is in the single surviving group — but the biased-select /
+// unbiased-weight asymmetry and the routed scaling are fully exercised).
+MoeRouterTopKArgs Glm47Args() {
+  MoeRouterTopKArgs a;
+  a.top_k = 4;                      // num_experts_per_tok
+  a.renormalize = true;             // norm_topk_prob
+  a.scoring_func = MoeScoringFunc::kSigmoid;
+  a.num_expert_group = 1;           // n_group
+  a.topk_group = 1;                 // topk_group
+  a.routed_scaling_factor = 1.8f;   // routed_scaling_factor
+  return a;
+}
+constexpr int64_t kGlm47Experts = 64;  // n_routed_experts
+
 }  // namespace
 
 // ===========================================================================
@@ -356,6 +375,68 @@ TEST_CASE("grouped_topk V3 dims: CUDA matches CPU exactly on ids") {
   // property is a 1-ULP bound, asserted below. (Selection is unaffected because
   // a 1-ULP score change cannot reorder experts that are not already tied — and
   // where they ARE exactly tied, the lowest-index rule decides identically.)
+  for (size_t i = 0; i < cpu.weights.size(); ++i) {
+    const float a = cpu.weights[i], b = gpu.weights[i];
+    if (a == b) continue;
+    const float ulp = std::nextafter(a, INFINITY) - a;
+    CHECK(std::fabs(a - b) <= 2.0f * std::fabs(ulp));
+  }
+}
+
+// ===========================================================================
+// GLM-4.7-Flash dims — the config the SACRED gate runs (noaux_tc, bias, renorm,
+// routed_scaling_factor 1.8, degenerate n_group=topk_group=1).
+// ===========================================================================
+TEST_CASE("grouped_topk at REAL GLM-4.7-Flash dims vs the upstream formula") {
+  const int64_t t = 24, e = kGlm47Experts;
+  const MoeRouterTopKArgs args = Glm47Args();
+  const auto logits = RandF32(static_cast<size_t>(t * e), 2468);
+  auto bias = RandF32(static_cast<size_t>(e), 1357, -0.35f, 0.35f);
+
+  const RouterOut ref = RefGroupedTopK(logits, t, e, args, &bias);
+  const RouterOut got = RunOpCpu(logits, t, e, args, &bias);
+
+  REQUIRE(got.ids.size() == ref.ids.size());
+  for (size_t i = 0; i < ref.ids.size(); ++i) {
+    CHECK(got.ids[i] == ref.ids[i]);  // selection must be EXACT
+    CHECK(got.weights[i] == doctest::Approx(ref.weights[i]).epsilon(1e-6));
+  }
+  // With n_group == 1 EVERY expert is in the single surviving group, so the
+  // group mask never eliminates a candidate — verified structurally.
+  for (int64_t row = 0; row < t; ++row) {
+    std::vector<int32_t> ids(got.ids.begin() + static_cast<long>(row * args.top_k),
+                             got.ids.begin() + static_cast<long>((row + 1) * args.top_k));
+    std::sort(ids.begin(), ids.end());
+    CHECK(std::adjacent_find(ids.begin(), ids.end()) == ids.end());
+    for (int32_t id : ids) CHECK((id >= 0 && id < e));
+  }
+  // The routed scaling is a strict multiply on the renormalized weights: the
+  // per-token weight sum must be 1.8 (renormalize -> sum 1, then * 1.8), a
+  // property independent of the reference selection.
+  for (int64_t row = 0; row < t; ++row) {
+    float s = 0.0f;
+    for (int j = 0; j < args.top_k; ++j) s += got.weights[static_cast<size_t>(row * args.top_k + j)];
+    CHECK(s == doctest::Approx(1.8f).epsilon(1e-5));
+  }
+}
+
+TEST_CASE("grouped_topk GLM-4.7-Flash dims: CUDA matches CPU exactly on ids") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping GLM grouped_topk parity");
+    return;
+  }
+  const int64_t t = 24, e = kGlm47Experts;
+  const MoeRouterTopKArgs args = Glm47Args();
+  const auto logits = RandF32(static_cast<size_t>(t * e), 2468);
+  auto bias = RandF32(static_cast<size_t>(e), 1357, -0.35f, 0.35f);
+
+  const RouterOut cpu = RunOpCpu(logits, t, e, args, &bias);
+  const RouterOut gpu = RunOpCuda(logits, t, e, args, &bias);
+  for (size_t i = 0; i < cpu.ids.size(); ++i) {
+    CHECK(gpu.ids[i] == cpu.ids[i]);  // selection bit-for-bit across devices
+    CHECK(gpu.weights[i] == doctest::Approx(cpu.weights[i]).epsilon(1e-5));
+  }
+  // 1-ULP transcendental bound, same rationale as the V3 case above.
   for (size_t i = 0; i < cpu.weights.size(); ++i) {
     const float a = cpu.weights[i], b = gpu.weights[i];
     if (a == b) continue;

@@ -70,6 +70,17 @@ target_compile_definitions(test_deepseek_v2_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 target_include_directories(test_deepseek_v2_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# GLM/DSA G1 (GLM-4.7-Flash, Glm4MoeLiteForCausalLM) — reuses the DeepSeek-V2 MLA
+# stack over the SAME DeepseekV2Weights; the FIRST e2e exercise of the q_lora
+# query branch AND the noaux_tc grouped router. Loader gate (host, MTP-tail skip)
+# + the SACRED paged-engine greedy gate (checkpoint-gated, dgx-only).
+vllm_cpp_add_test(test_glm4_moe_lite_load vllm/models/test_glm4_moe_lite_load.cpp)
+vllm_cpp_add_test(test_glm4_moe_lite_paged_engine vllm/models/test_glm4_moe_lite_paged_engine.cpp)
+target_compile_definitions(test_glm4_moe_lite_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_glm4_moe_lite_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_paged_forward vllm/models/test_qwen27_paged_forward.cpp)
 target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_unicode_data vllm/test_unicode_data.cpp)

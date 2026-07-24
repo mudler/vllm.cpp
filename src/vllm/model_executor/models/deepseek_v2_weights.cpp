@@ -206,7 +206,7 @@ DeepseekV2MoeWeights LoadMoeLayer(const TensorResolver& get,
 
 }  // namespace
 
-DeepseekV2Params ParseDeepseekV2Params(const HfConfig& config) {
+DeepseekV2Params ParseDeepseekV2Params(const HfConfig& config, bool allow_mtp_tail) {
   const nlohmann::json& doc = config.raw;
   DeepseekV2Params p;
   p.hidden_size = config.hidden_size;
@@ -296,7 +296,17 @@ DeepseekV2Params ParseDeepseekV2Params(const HfConfig& config) {
   p.norm_topk_prob = RawBool(doc, "norm_topk_prob", false);
   p.routed_scaling_factor =
       static_cast<float>(RawDouble(doc, "routed_scaling_factor", 1.0));
-  const std::string scoring = RawString(doc, "scoring_func", "softmax");
+  // `topk_method == "noaux_tc"` is the DeepSeek-V3 / GLM aux-loss-free router,
+  // which is INHERENTLY sigmoid-scored (grouped_topk_router.py:113-114 + the
+  // biased-select/unbiased-weight asymmetry only makes sense on sigmoid scores).
+  // DeepSeek-V3 sets `scoring_func: "sigmoid"` EXPLICITLY; GLM-4.7-Flash OMITS the
+  // key and its model class HARDCODES it (glm4_moe.py:204 `scoring_func="sigmoid"`).
+  // So the DEFAULT when the key is absent is sigmoid iff noaux_tc, softmax
+  // otherwise; an EXPLICIT scoring_func is always honored. DeepSeek-V2-Lite
+  // (topk_method "greedy", no scoring_func key) is UNCHANGED -> softmax.
+  const bool noaux_tc = RawString(doc, "topk_method", "greedy") == "noaux_tc";
+  const std::string scoring =
+      RawString(doc, "scoring_func", noaux_tc ? "sigmoid" : "softmax");
   if (scoring == "softmax") {
     p.scoring_func = vt::MoeScoringFunc::kSoftmax;
   } else if (scoring == "sigmoid") {
@@ -307,7 +317,7 @@ DeepseekV2Params ParseDeepseekV2Params(const HfConfig& config) {
         "' (grouped_topk_router.py:110-117 defines only softmax/sigmoid)");
   }
   // The learned gate bias exists ONLY for topk_method "noaux_tc" (:313-318).
-  p.has_e_score_correction_bias = RawString(doc, "topk_method", "greedy") == "noaux_tc";
+  p.has_e_score_correction_bias = noaux_tc;
 
   if (p.n_routed_experts > 0) {
     if (p.num_experts_per_tok <= 0 || p.num_experts_per_tok > p.n_routed_experts) {
@@ -334,9 +344,13 @@ DeepseekV2Params ParseDeepseekV2Params(const HfConfig& config) {
         "intermediate_size (the dense MLP width, deepseek_v2.py:1251-1258)");
   }
   // MTP draft layers ship as EXTRA `model.layers.{num_hidden_layers + i}.*`
-  // blocks (deepseek_v2.py:1917-1933 get_spec_layer_idx_from_weight_name). We
-  // load none of them, so refuse rather than silently ignore.
-  if (RawInt(doc, "num_nextn_predict_layers", 0) > 0) {
+  // blocks (deepseek_v2.py:1917-1933 get_spec_layer_idx_from_weight_name). The
+  // main-model loader requests only layers `[0, num_hidden_layers)`, so the tail
+  // is never pulled. DeepSeek-V2's registration passes allow_mtp_tail=false and
+  // REFUSES rather than silently ignore; GLM-4.7-Flash passes true (it ships
+  // `num_nextn_predict_layers: 1`, and skipping the tail IS upstream's
+  // get_spec_layer_idx_from_weight_name skip, glm4_moe_lite.py:358-360,633-643).
+  if (!allow_mtp_tail && RawInt(doc, "num_nextn_predict_layers", 0) > 0) {
     throw std::runtime_error(
         "DeepseekV2ForCausalLM: num_nextn_predict_layers > 0 (MTP draft layers) "
         "is not implemented");
@@ -357,7 +371,8 @@ DeepseekV2Params ParseDeepseekV2Params(const HfConfig& config) {
 }
 
 DeepseekV2Weights LoadDeepseekV2ForCausalLMWeights(
-    const std::vector<SafetensorsFile>& shards, const HfConfig& config) {
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config,
+    bool allow_mtp_tail) {
   std::unordered_map<std::string, const SafetensorsFile*> where;
   for (const SafetensorsFile& shard : shards)
     for (const std::string& name : shard.Names()) where[name] = &shard;
@@ -369,7 +384,7 @@ DeepseekV2Weights LoadDeepseekV2ForCausalLMWeights(
   };
 
   DeepseekV2Weights w;
-  w.params = ParseDeepseekV2Params(config);
+  w.params = ParseDeepseekV2Params(config, allow_mtp_tail);
   const DeepseekV2Params& p = w.params;
   VT_CHECK(p.num_hidden_layers > 0,
            "deepseek-v2: num_hidden_layers must be positive");

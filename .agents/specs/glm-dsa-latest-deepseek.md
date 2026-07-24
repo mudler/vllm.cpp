@@ -18,7 +18,26 @@ QK-norm) per the OPT precedent (D4). Loader 523 tensors, zero missing/unmapped; 
 9B-0414 ships `mlp.gate_up_proj` PRE-MERGED. Runs EAGER (bf16). Remaining G1/G3/G4/G5
 per §0.7 unchanged.**
 
-**Status:** SPIKE + G2 IMPLEMENTED (Glm4ForCausalLM landed; G1/G3/G4/G5 still design-only).
+**G1 LANDED 2026-07-24 — `Glm4MoeLiteForCausalLM` (GLM-4.7-Flash, 31.2B), the SECOND MLA
+model. SACRED gate 8/8 vs vLLM 0.25.0** (STRICT token-exact 1/8 + near-tie band 7/8,
+69/128 tokens strictly exact, max teacher-forced gap 0.0 nats, 0 forward-divergent; vLLM
+K=5 self-deterministic ⇒ STRICT bar). Row `MODEL-TEXT-glm4-moe-lite-glm4-moe-lite-for-causal-lm`
+SPIKE→ACTIVE (correctness COMPLETE, speed PENDING). **The scope was MUCH smaller than
+§0.4.1 estimated — the MLA campaign already built nearly everything:** the noaux_tc
+grouped router (sigmoid + `e_score_correction_bias` + group masking + `routed_scaling_factor`)
+had ALREADY landed in the campaign's W3, and GLM-4.7-Flash reuses the ENTIRE DeepSeek-V2 MLA
+stack over the SAME `DeepseekV2Weights` (W6 MLA block incl. q_lora branch, W7 loader + fused_qkv_a_proj
+merge, W9 decode graph). Genuinely-new work reduced to FOUR additive pieces: (1) a `head_dim=256`
+dispatch in `LaunchMlaPrefillFA2Bf16` (GLM qk 256/v 256; the 256 split-KV kernel was already
+compiled for the 27B/35B paged prefill, so the 192 path is byte-identical); (2) MTP-tolerant
+parse/loader (`allow_mtp_tail`, defaulted false → DeepSeek-V2 byte-identical); (3) the GLM registry
+TU `glm4_moe_lite_registry.cpp`; (4) a scoring-func fix (GLM's config OMITS `scoring_func` and its
+model class hardcodes sigmoid, so `noaux_tc`+absent-key now defaults to sigmoid; DeepSeek-V2-Lite
+greedy→softmax UNCHANGED — caught by the loader gate before the SACRED gate). **C2 CLOSED:** the
+q_lora query branch AND the whole noaux_tc router now have E2E coverage (were unit-gated-only on
+DeepSeek-V2-Lite). Residual per R4: `n_group=topk_group=1` on GLM-4.7-Flash, so multi-group masking
+stays unit-gated only. Regressions ALL byte-identical (incl. DeepSeek-V2 223/223 Release + asserts-on
+exit 0, the shared-TU canary). **Status:** SPIKE + G2 + G1 IMPLEMENTED (Glm4ForCausalLM + Glm4MoeLiteForCausalLM landed; G3/G4/G5 still design-only blocked-honesty passes).
 **Base:** `aa65ce7`. **Oracle pin:** `/home/mudler/_git/vllm` @ `e24d1b24`.
 **Claim:** `CLAIM-GLM-DSA-LATEST-DEEPSEEK`.
 **Parent plan:** [`breadth-sweep-plan.md`](breadth-sweep-plan.md) §B.3 Tier 3.

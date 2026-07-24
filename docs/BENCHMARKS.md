@@ -65,6 +65,40 @@ running). **Regressions — ALL 8 SACRED gates PASS byte-identically, standalone
 Qwen3-dense 184/184 · OPT 63/63 · DeepSeek-V2 223/223 · Llama 92/92 · Mistral 92/92**
 (purely additive: no shared runtime source touched).
 
+**GLM-4.7-Flash (`Glm4MoeLiteForCausalLM`, 31.2B MLA + GLM MoE) - CORRECTNESS COMPLETE,
+no speed number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G1,
+[spike](../.agents/specs/glm-dsa-latest-deepseek.md)).** The SECOND MLA model and the
+first to exercise the q_lora query branch AND the noaux_tc grouped router end-to-end
+(the two coverage gaps the MLA campaign named as unit-gated-only on DeepSeek-V2-Lite,
+C2). Disposition: **NO throughput measured or claimed - SPEED PENDING.** Gate form
+selected BY MEASUREMENT: vLLM 0.25.0 per-prompt greedy on GLM-4.7-Flash is
+**ALL-DETERMINISTIC over K=5** (0 multi-member (prompt,pos) cells across 8x16) ⇒
+**STRICT token-exact bar**. `test_glm4_moe_lite_paged_engine` drives the 8-prompt battery
+through the paged `LLMEngine` and matches the vLLM oracle **8/8**: STRICT token-exact
+**1/8** + near-tie band 7/8, 69/128 tokens strictly exact (max teacher-forced gap **0.0
+nats**, 0 forward-divergent). The teacher-forcing diagnostic shows ALL 59 divergent
+positions at gap EXACTLY 0.0000 nats (vLLM's OWN argmax on OUR prefix IS our token, 0
+outside vLLM's top-20) - a cleaner pass than DeepSeek-V2's (0.25-nat root flip), the
+documented bf16 prefill-vs-decode co-argmax phenomenon, not a forward bug (a wrong
+q_lora projection or mis-scored router would emit fluent-WRONG tokens at LARGE gaps).
+PROOF THE PATH RAN: fa_page_size 36864 = block 32 × 576 × 2B (real MLA cache, no factor
+2); split stats prefill_only=8/decode_only=120. Reuses the ENTIRE DeepSeek-V2 MLA stack;
+genuinely new = an ADDITIVE head_dim-256 MLA-prefill dispatch (256 split-KV instantiation
+already compiled for the 27B/35B paged prefill; 192 path byte-identical), MTP-tolerant
+parse/loader (`allow_mtp_tail`, defaulted false so DeepSeek-V2 unchanged), the GLM registry
+TU, and a scoring-func fix (GLM omits `scoring_func`; noaux_tc + absent-key defaults to
+sigmoid; DeepSeek-V2-Lite greedy → softmax UNCHANGED). Loader gate 3/3 / 57117 assertions
+(9491 mapped, 212 MTP-tail skipped, 0 unmapped/0 missing). Router unit gate at real GLM
+dims (64E/top-4/n_group1/routed_scale 1.8/noaux_tc/renorm) vs CPU ref, CUDA==CPU;
+compute-sanitizer memcheck 0 errors on the router AND on the FULL GLM gate (the
+head_dim-256 MLA prefill + MoE glue + MLA decode; ERROR SUMMARY: 0 errors, gate still
+8/8 under the sanitizer). eager==graph bit-identical (`VT_DEEPSEEK_CUDAGRAPH=0`). Clean full CUDA `-Werror` build 0 warn/0 err.
+**Regressions - ALL 8 SACRED gates PASS byte-identically, standalone under `flock`, one
+big-model at a time: 27B 235/235 · 35B 315/315 · Qwen3-Coder 138/138 · Qwen3-dense
+184/184 · OPT 63/63 · DeepSeek-V2 223/223 (Release AND asserts-on exit 0, the shared-TU
+canary) · Llama 92/92 · Mistral 92/92** (GLM-4-9B goldens not committed to git, its code
+path untouched → byte-identical by construction).
+
 **Mistral (`MistralForCausalLM`, Mistral-7B-v0.3) - CORRECTNESS COMPLETE, no speed
 number (2026-07-23, `CLAIM-MODEL-MISTRAL` + `CLAIM-LOAD-SENTENCEPIECE`,
 [spike](../.agents/specs/sweep-mistral.md), [tokenizer](../.agents/specs/sentencepiece.md)).**

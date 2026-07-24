@@ -115,3 +115,12 @@ TEST_CASE("detect: B2 ordering - exact jamba beats the hy_v3 prefix, step3p5 bea
   // A plain hermes template still falls through to hermes.
   CHECK(DetectToolParser("<tool_call>{\"name\"") == "hermes");
 }
+
+TEST_CASE("detect: wave B4 families resolve from their template markers") {
+  CHECK(DetectToolParser("..<|tool_call_start|>..") == "lfm2");
+  CHECK(DetectToolParser("..<start_function_call>..") == "functiongemma");
+  CHECK(DetectToolParser("..<|tools_prefix|>..") == "apertus");
+  CHECK(DetectToolParser("..<|function_call|>..") == "gigachat3");
+  // gigachat's piped literal must not shadow granite-20b-fc's plain one.
+  CHECK(DetectToolParser("..<function_call>..") == "granite-20b-fc");
+}

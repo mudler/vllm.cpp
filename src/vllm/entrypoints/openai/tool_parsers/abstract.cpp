@@ -191,6 +191,7 @@ std::unique_ptr<ToolParser> get_tool_parser(const std::string& name) {
   // "<|function_call|>{json}"; generation may end with "</s>".
   if (name == "gigachat3") {
     return std::make_unique<GigaChat3ToolParser>();
+  }
   // lfm2_tool_parser.py (name "lfm2") - pythonic `[func(arg=val), ...]` list
   // wrapped in <|tool_call_start|>...<|tool_call_end|> sentinels.
   if (name == "lfm2") {

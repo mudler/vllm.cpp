@@ -42,7 +42,10 @@ namespace {
 //     from jamba and needs the explicit option); "functools[" (phi4) and
 //     "<|action_start|><|plugin|>" (internlm) are distinctive literals.
 //   - EXPLICIT-ONLY families (no reliable template marker, select via the
-//     tool_parser option): granite4, pythonic, xlam, deepseek_v31.
+//     tool_parser option): granite4, pythonic, xlam, deepseek_v31,
+//     poolside_v1 (bare <tool_call> + inner tags colliding with hy_v3),
+//     hunyuan_a13b (block-identical to jamba), ernie45 (marker-identical to
+//     hermes), GigaChat 3.0's header form (3.1's <|function_call|> is rowed).
 constexpr ToolParserMarker kToolParserMarkers[] = {
     {"longcat", "<longcat_tool_call>"},
     {"deepseek_v3", "<｜tool▁calls▁begin｜>"},
@@ -58,6 +61,10 @@ constexpr ToolParserMarker kToolParserMarkers[] = {
     {"phi4_mini_json", "functools["},
     {"llama4_pythonic", "<|python_start|>"},
     {"llama3_json", "<|python_tag|>"},
+    {"lfm2", "<|tool_call_start|>"},
+    {"functiongemma", "<start_function_call>"},
+    {"apertus", "<|tools_prefix|>"},
+    {"gigachat3", "<|function_call|>"},
     {"jamba", "<tool_calls>"},
     {"hy_v3", "<tool_calls"},
     {"step3p5", "<function="},

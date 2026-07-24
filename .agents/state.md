@@ -21464,3 +21464,35 @@ explicit/none cases), test_openai_serving, test_tool_parser_detect,
 test_chat_prompt green. Test hook SetEngineReasoningParser mirrors the v4
 tool hook. LocalAI mirror update (struct layout v5 + tool_parser/
 reasoning_parser model options) is the program's closing slice.
+
+## 2026-07-24 — Tool-parser wave B4: the last seven pure-text families (`CLAIM-TOOL-PARSERS-B4`, autoparser-parity program W3 close-out for the mechanical scope)
+
+Two task-scoped subagents in isolated worktrees; integrator merged (one
+keep-both brace artifact repaired, compile-caught), added detection rows, and
+re-verified. Registered dialects: 30 — this CLOSES the pure-text portion of
+the pinned upstream registry.
+
+Added: hunyuan_a13b (upstream's nested-args streaming xfail preserved as
+skipped-with-reason), apertus (all 19 upstream cases incl. MTP-burst /
+skip-and-catch-up streaming), ernie45 (MAJOR text rework: upstream gates
+streaming content cleanup on vocab token-ids; reworked to text-literal
+analogues, documented as best-effort, extraction path verbatim), gigachat3
+(both header forms; 3.0's role_sep header is not one-literal detectable),
+lfm2 (vocab rework + pythonic_core reuse), poolside_v1 (vocab rework;
+EXPLICIT-ONLY: bare <tool_call> wrapper + inner tags collide with default
+hy_v3), functiongemma (regex scans + argument typing).
+
+Detection: +4 rows (lfm2 <|tool_call_start|>, functiongemma
+<start_function_call>, apertus <|tools_prefix|>, gigachat3 <|function_call|>
+which the piped literal keeps distinct from granite-20b-fc's plain
+<function_call>, test-pinned). Explicit-only set now: granite4, pythonic,
+xlam, deepseek_v31, default-suffix hy_v3, poolside_v1, hunyuan_a13b
+(block-identical to jamba), ernie45 (marker-identical to hermes).
+
+Evidence: ~110 new doctest cases across seven suites green; affected battery
+green (test_openai_conformance parallel flake, green serially). NOT ported
+(out of mechanical scope, decision pending with the user): ENGINE-backed
+(qwen3_coder/xml, gemma4, glm45/47, kimi_k2, minimax_m2, seed_oss - token-id
+scanner state machines) and Rust/Harmony-backed (minimax_m3, cohere_command,
+gpt-oss). In flight: per-family structural-tag registry (forced tool_choice
+in native syntax). Next: LocalAI closeout (ABI v5 mirror + options + pin).

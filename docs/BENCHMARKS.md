@@ -2033,6 +2033,23 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Tool-parser wave B4: the last seven mechanically-portable families -
+  `NOT APPLICABLE` (2026-07-24, `CLAIM-TOOL-PARSERS-B4`).**
+  `benchmark_binding=false`. **Serving-layer parsing additions, no decode-path
+  change.** hunyuan_a13b, apertus (all 19 upstream cases), ernie45 (vocab
+  content-gating reworked to text, documented as a best-effort analogue),
+  gigachat3 (both header forms), lfm2 + poolside_v1 (vocab->text reworks;
+  lfm2 reuses pythonic_core), functiongemma - 30 registered dialects total,
+  which closes the PURE-TEXT portion of the pinned vLLM registry. Detection
+  rows added for lfm2/functiongemma/apertus/gigachat3; hunyuan_a13b
+  (block-identical to jamba), ernie45 (marker-identical to hermes) and
+  poolside_v1 join the documented explicit-only set. ~110 new doctest cases
+  across seven suites, all green; battery green (one conformance run was the
+  known parallel-ctest flake, green serially). Remaining upstream families
+  are ENGINE-backed token-id state machines or Rust/Harmony-backed - out of
+  mechanical-port scope, tracked in the state log. No binding number is
+  created, re-based, or invalidated.
+
 - **Reasoning-parser selection through the C ABI (ABI v5) - `NOT APPLICABLE`
   (2026-07-24, `CLAIM-CAPI-REASONING-V5`).** `benchmark_binding=false`.
   **API-surface change + one real bug fix, no decode-path change.**

@@ -199,6 +199,8 @@ vllm_cpp_add_test(test_tool_parsers_llama4_pythonic
   vllm/entrypoints/openai/tool_parsers/test_llama4_pythonic.cpp)
 vllm_cpp_add_test(test_tool_choice_grammar
   vllm/entrypoints/openai/tool_parsers/test_tool_choice_grammar.cpp)
+vllm_cpp_add_test(test_structural_tags
+  vllm/entrypoints/openai/tool_parsers/test_structural_tags.cpp)
 vllm_cpp_add_test(test_tool_parser_mistral
   vllm/entrypoints/openai/tool_parsers/test_mistral.cpp)
 vllm_cpp_add_test(test_reasoning_base_thinking

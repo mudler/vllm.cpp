@@ -21496,3 +21496,30 @@ green (test_openai_conformance parallel flake, green serially). NOT ported
 scanner state machines) and Rust/Harmony-backed (minimax_m3, cohere_command,
 gpt-oss). In flight: per-family structural-tag registry (forced tool_choice
 in native syntax). Next: LocalAI closeout (ABI v5 mirror + options + pin).
+
+## 2026-07-24 — Per-family structural-tag registry: native-syntax forced tool_choice (`CLAIM-STRUCTURAL-TAGS`, autoparser-parity program)
+
+Closes the constraint-side gap the parser waves left: ApplyToolChoiceStructuredOutput
+previously built HERMES tags for every request, so tool_choice required/named
+FORCED Hermes syntax on models trained on other dialects. New
+`ToolChoiceStructuralTagSpecFor(tool_parser_name, request)` keys the tag
+builder off the ACTIVE parser: eight families compile their native surface
+(hermes/qwen3/longcat wrappers, llama3/4_json bare-JSON with the {"name": "
+trigger, mistral [TOOL_CALLS] name-first, deepseek v3 + v31 marker chains);
+every family a flat structural tag cannot express returns nullopt in ALL
+modes — required/named now leave the model unconstrained in its own trained
+syntax (its parser still extracts) instead of wrong-forcing Hermes.
+Serving keeps source-compat thin wrappers; create_chat_completion passes the
+active tool_parser_name_.
+
+Recorded deviations: auto stays unconditionally lazy (upstream gates on
+strict tools); DeepSeek multi-call required re-emits the outer wrapper per
+call (the flat tag JSON cannot factor shared outer wrappers); deepseek_v32/v4
+deliberately nullopt (DSML per-parameter XML is not a JSON args object — the
+upstream xgrammar builtin has no native-tag equivalent here).
+
+Evidence: test_structural_tags 12/173 (compiled-grammar ACCEPT+terminate per
+mapped family, Hermes-syntax REJECT per non-Hermes family, nullopt asserted
+per unmapped family and mode); test_tool_choice_grammar 4/411 unchanged;
+test_capi 24/167, test_openai_serving 24/333 green — re-verified by the
+integrator after rebase. Authored by a task-scoped subagent.

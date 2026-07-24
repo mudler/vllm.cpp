@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/serving_utils.h"
+#include "vllm/entrypoints/openai/tool_parsers/structural_tags.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -26,45 +27,6 @@ bool IsNamedToolChoice(const ChatCompletionRequest& request) {
          request.tool_choice->mode == "function";
 }
 
-// _get_function_parameters (tool_parsers/structural_tag_registry.py:207-210):
-// the "arguments" content schema is the tool's `parameters`, or `true` (any
-// JSON) when it declares none. JSON-schema `true` lowers to `value` in
-// JsonSchemaToGbnf / StructuralTagToGbnf.
-nlohmann::json ToolArgumentsSchema(const FunctionDefinition& fn) {
-  if (fn.parameters.has_value()) return *fn.parameters;
-  return true;
-}
-
-// The Hermes structural-tag `tags` array from the request's tools — mirror
-// _hermes_tool_tags (tool_parsers/structural_tag_registry.py:213-234). Each tool
-// yields TWO tags (the two surface variants, :219-221): the tool name is baked
-// into the `begin` literal (:226 begin + name + '", "arguments": '), the content
-// is the `parameters` schema (:227-229), the `end` closes the wrapper. The
-// native backend compiles each tag as `begin-literal + content + end-literal`
-// (StructuralTagToGbnf), so the JSON `{`/`"`/`\n` bytes live inside the literals.
-nlohmann::json HermesToolTags(
-    const std::vector<ChatCompletionToolsParam>& tools) {
-  // The two (begin, end) surface variants (:219-221). arguments_field_prefix
-  // (:214) `", "arguments": ` closes the name string + opens the arguments.
-  static constexpr const char* kArgumentsFieldPrefix = "\", \"arguments\": ";
-  static const std::pair<const char*, const char*> kFormats[] = {
-      {"<tool_call>\n{\"name\": \"", "}\n</tool_call>"},
-      {"<tool_call>{\"name\": \"", "}</tool_call>"},
-  };
-  nlohmann::json tags = nlohmann::json::array();
-  // vLLM iterates tools OUTER, formats INNER (:232-233).
-  for (const ChatCompletionToolsParam& tool : tools) {
-    for (const auto& [begin, end] : kFormats) {
-      nlohmann::json tag = nlohmann::json::object();
-      tag["begin"] =
-          std::string(begin) + tool.function.name + kArgumentsFieldPrefix;
-      tag["content_schema"] = ToolArgumentsSchema(tool.function);
-      tag["end"] = end;
-      tags.push_back(std::move(tag));
-    }
-  }
-  return tags;
-}
 }  // namespace
 
 std::string DefaultChatPromptFallback(
@@ -99,73 +61,18 @@ bool ToolsEnabled(const ChatCompletionRequest& request) {
 
 std::optional<nlohmann::json> ToolChoiceStructuralTagSpec(
     const ChatCompletionRequest& request) {
-  // No tools, or tool_choice="none": no structural tag (model unconstrained).
-  if (!ToolsEnabled(request)) return std::nullopt;
-  if (!request.tools.has_value() || request.tools->empty()) return std::nullopt;
-
-  const std::vector<ChatCompletionToolsParam>& tools = *request.tools;
-  // tool_choice unset defaults to "auto" when tools are present (protocol default;
-  // get_hermes_structural_tag receives the simplified choice — auto here).
-  const std::string mode =
-      request.tool_choice.has_value() ? request.tool_choice->mode : "auto";
-
-  nlohmann::json spec = nlohmann::json::object();
-
-  // get_hermes_structural_tag "forced" branch (structural_tag_registry.py:255-261):
-  // the named ("function") choice — exactly one tag, forced from token 0.
-  if (mode == "function") {
-    const std::string name =
-        request.tool_choice->function_name.value_or("");
-    std::vector<ChatCompletionToolsParam> chosen;
-    for (const ChatCompletionToolsParam& tool : tools) {
-      if (tool.function.name == name) chosen.push_back(tool);
-    }
-    // A named choice matching no tool: no constraint (upstream 400s upstream of
-    // here at validation, protocol.py:886-895).
-    if (chosen.empty()) return std::nullopt;
-    spec["lazy"] = false;
-    spec["stop_after_first"] = true;  // TagsWithSeparatorFormat(:260)
-    spec["tags"] = HermesToolTags(chosen);
-    return spec;
-  }
-
-  // "required" else-branch (structural_tag_registry.py:262-267): any listed
-  // tool, at_least_one, forced from token 0 (no stop_after_first — one-or-more).
-  if (mode == "required") {
-    spec["lazy"] = false;
-    spec["stop_after_first"] = false;
-    spec["tags"] = HermesToolTags(tools);
-    return spec;
-  }
-
-  // "auto" (and the tools-present unset default) — the LAZY payoff
-  // (structural_tag_registry.py:248-254): TriggeredTagsFormat, INERT until the
-  // `<tool_call>` trigger. Plain text is free; a tool call is constrained only
-  // after the model chooses to start one. NOT forced.
-  spec["lazy"] = true;
-  spec["triggers"] = nlohmann::json::array({"<tool_call>"});
-  spec["stop_after_first"] = false;
-  spec["tags"] = HermesToolTags(tools);
-  return spec;
+  // Thin wrapper preserved for source compatibility (existing callers/tests).
+  // The Hermes builder now lives in the per-family registry (structural_tags.h);
+  // this delegates to the "hermes" family exactly.
+  return ToolChoiceStructuralTagSpecFor("hermes", request);
 }
 
 void ApplyToolChoiceStructuredOutput(const ChatCompletionRequest& request,
                                      SamplingParams& sampling_params) {
-  const std::optional<nlohmann::json> spec =
-      ToolChoiceStructuralTagSpec(request);
-  if (!spec.has_value()) return;
-  // The structural tag IS the structured-output constraint (it replaces any
-  // response_format constraint — a tool-constrained request carries none in
-  // practice). Route it through `structural_tag` (the kStructuralTag native
-  // compile path): the native backend builds the `<tool_call>...</tool_call>`
-  // wrapper + a LAZY (auto) or FORCED (required/named) grammar the Hermes/Qwen
-  // parser extracts — subsuming the old WrapSchemaAsToolCallGbnf forced-json
-  // path. structured_outputs then holds exactly `structural_tag` (one
-  // constraint); json/grammar stay unset.
-  StructuredOutputsParams so;
-  so.structural_tag = spec->dump();
-  sampling_params.structured_outputs = std::move(so);
-  sampling_params.structured_outputs->Verify();  // exactly-one-constraint check.
+  // Thin wrapper preserved for source compatibility — delegates to the Hermes
+  // family. create_chat_completion calls the per-family overload with the active
+  // tool_parser_name so the constraint matches the model's native syntax.
+  ApplyToolChoiceStructuredOutput("hermes", request, sampling_params);
 }
 
 ShapedChatMessage ShapeChatMessage(
@@ -560,12 +467,15 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   SamplingParams sampling_params = request.to_sampling_params();
 
   // tool_choice -> a structural-tag constraint (structured_outputs.structural_tag)
-  // before add_request: auto -> a LAZY tag (free text until the `<tool_call>`
-  // trigger, then the tool-call JSON is constrained — NOT forced); required/named
-  // -> a FORCED tag (a valid, parser-extractable `<tool_call>...</tool_call>` from
-  // token 0). none / no tools: no-op. Mirrors upstream's xgrammar StructuralTag
-  // (chat_completion/serving.py -> tool_parsers/structural_tag_registry.py).
-  ApplyToolChoiceStructuredOutput(request, sampling_params);
+  // before add_request, built for the ACTIVE tool parser family
+  // (tool_parser_name_) so required/named force the model's OWN native tool
+  // syntax (not always Hermes). auto -> a LAZY tag (free text until the family's
+  // begin marker, then the call is constrained — NOT forced); required/named ->
+  // a FORCED tag (a valid, parser-extractable native call from token 0); an
+  // unmapped family or none / no tools: no-op. Mirrors upstream's per-model
+  // xgrammar StructuralTag (chat_completion/serving.py ->
+  // tool_parsers/structural_tag_registry.py::get_model_structural_tag).
+  ApplyToolChoiceStructuredOutput(tool_parser_name_, request, sampling_params);
 
   // Single prompt → sub_request_id == request_id (chat_completion/serving.py:293).
   const std::string engine_request_id = request_id;

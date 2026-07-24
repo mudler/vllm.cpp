@@ -116,41 +116,23 @@ std::optional<DeltaMessage> ShapeChatDelta(const std::string& previous_text,
                                            ReasoningParser* reasoning_parser = nullptr);
 
 // Ported from: vllm/tool_parsers/structural_tag_registry.py @ e24d1b24
-// (get_hermes_structural_tag:237-269 + _hermes_tool_tags:213-234). Build the
-// Hermes STRUCTURAL-TAG spec from a request's tools + tool_choice — the DECODE
-// constraint that steers a tool call. Returns nullopt for "none" / no tools.
+// (get_hermes_structural_tag:237-269 + _hermes_tool_tags:213-234).
 //
-// The spec is our native structural-tag JSON (backend_native.cpp kStructuralTag;
-// the SEAM is 1:1 with vLLM's xgrammar StructuralTag, the content backend-private):
-//   {"lazy": bool, "triggers": [str], "stop_after_first": bool,
-//    "tags": [{"begin": str, "content_schema": <schema|true>, "end": str}]}
-// Each tool contributes TWO tags (vLLM's two Hermes surface variants,
-// structural_tag_registry.py:219-221): the tool name is baked into `begin`
-// (`<tool_call>\n{"name": "<fn>", "arguments": ` and the compact
-// `<tool_call>{"name": "<fn>", "arguments": `), `content_schema` is the tool's
-// `parameters` (or `true` = any JSON when absent, _get_function_parameters:207),
-// and `end` closes the wrapper (`}\n</tool_call>` / `}</tool_call>`).
-//
-// tool_choice -> spec (get_hermes_structural_tag:248-267):
-//   auto (or unset default) -> LAZY: {lazy:true, triggers:["<tool_call>"],
-//       tags:[all tools]} — plain text is FREE until the `<tool_call>` trigger,
-//       then the tool-call JSON is constrained (TriggeredTagsFormat, :249-254).
-//       NOT forced: the model may just reply.
-//   required -> FORCED >=1: {lazy:false, stop_after_first:false, tags:[all
-//       tools]} (TagsWithSeparatorFormat at_least_one, :262-267).
-//   named ("function") -> FORCED exactly one: {lazy:false,
-//       stop_after_first:true, tags:[that one tool]} (+stop_after_first, :255-261).
+// THIN WRAPPERS over the per-family STRUCTURAL-TAG registry
+// (tool_parsers/structural_tags.h): both delegate to the "hermes" family and are
+// kept only for source compatibility with existing callers/tests. New code
+// should call ToolChoiceStructuralTagSpecFor(tool_parser_name, request) /
+// ApplyToolChoiceStructuredOutput(tool_parser_name, request, sampling_params) so
+// the DECODE constraint matches the ACTIVE model family's native tool syntax
+// instead of always Hermes. See structural_tags.h for the native spec shape, the
+// per-family coverage table and the tool_choice (auto/required/named) semantics.
 std::optional<nlohmann::json> ToolChoiceStructuralTagSpec(
     const ChatCompletionRequest& request);
 
-// Apply ToolChoiceStructuralTagSpec onto `sampling_params`: sets
-// structured_outputs.structural_tag = dump(spec) (the ONE structured-output
-// constraint; json/grammar stay unset) and re-runs Verify(). No-op for
-// auto/none with no tools. For auto this is a LAZY tag (the model may reply in
-// plain text OR emit a `<tool_call>` — NOT forced); required/named force a call.
-// This SUBSUMES the old WrapSchemaAsToolCallGbnf forced-json path — the native
-// structural-tag compile handles the `<tool_call>` wrapper for ALL cases. Called
-// in create_chat_completion before add_request.
+// Thin wrapper: applies the "hermes" family structural tag onto
+// `sampling_params` (structured_outputs.structural_tag). create_chat_completion
+// itself calls the per-family overload (structural_tags.h) with the active
+// tool_parser_name. Kept for source compatibility.
 void ApplyToolChoiceStructuredOutput(const ChatCompletionRequest& request,
                                      SamplingParams& sampling_params);
 

@@ -2033,6 +2033,24 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Per-family structural-tag registry (native-syntax forced tool_choice) -
+  `NOT APPLICABLE` (2026-07-24, `CLAIM-STRUCTURAL-TAGS`).**
+  `benchmark_binding=false`. **Constraint-selection change, no new kernels.**
+  `ToolChoiceStructuralTagSpecFor(tool_parser_name, request)` replaces the
+  unconditional Hermes tag builder: eight families compile their NATIVE
+  surface (hermes/qwen3/longcat, llama3/4_json, mistral v11, deepseek
+  v3/v31), proven by compiled-grammar accept/terminate tests plus
+  Hermes-rejection tests per non-Hermes family; families a flat structural
+  tag cannot express (DSML per-parameter XML, pythonic brackets, xlam
+  multi-envelope, the JSON-list dialects without upstream specs) return
+  nullopt for EVERY mode - required/named now leave the model unconstrained
+  in its trained syntax instead of wrong-forcing Hermes. Deviations
+  documented at the builders (auto stays lazy unconditionally; DeepSeek
+  multi-call required re-emits the outer wrapper per call). Evidence:
+  `test_structural_tags` 12 cases / 173 asserts; `test_tool_choice_grammar`
+  4/411 unchanged; capi + serving green. No binding number is created,
+  re-based, or invalidated.
+
 - **Tool-parser wave B4: the last seven mechanically-portable families -
   `NOT APPLICABLE` (2026-07-24, `CLAIM-TOOL-PARSERS-B4`).**
   `benchmark_binding=false`. **Serving-layer parsing additions, no decode-path

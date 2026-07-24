@@ -413,6 +413,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/serving_chat.cpp
   src/vllm/entrypoints/openai/serving_models.cpp
   src/vllm/entrypoints/openai/tool_parsers/abstract.cpp
+  src/vllm/entrypoints/openai/tool_parsers/structural_tags.cpp
   src/vllm/entrypoints/openai/tool_parsers/detect.cpp
   src/vllm/entrypoints/openai/tool_parsers/utils.cpp
   src/vllm/entrypoints/openai/tool_parsers/hermes.cpp

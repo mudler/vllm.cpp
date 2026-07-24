@@ -220,6 +220,15 @@ tests, documented three new explicit-only families. Scope:
 `{include,src}/vllm/entrypoints/openai/tool_parsers/*`, detect table, tests,
 CMake. Details in the state-log entry of the same date.
 
+**Structural-tag registry coordination note (2026-07-24,
+`CLAIM-STRUCTURAL-TAGS`, DONE, direct-to-main, user-directed,
+subagent-authored + integrator-verified).** Per-family native-syntax
+tool_choice constraints; wrong-forcing of Hermes syntax on unmapped families
+REMOVED. Scope: `{include,src}/vllm/entrypoints/openai/tool_parsers/
+structural_tags.*`, serving_chat.* (hermes builder moved, thin wrappers
+kept), `tests/.../test_structural_tags.cpp`, CMake. Details in the state-log
+entry of the same date.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-MLA-PREFIX-CACHE-ASSERT` | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` (bugfix — restores its SACRED gate under asserts-enabled builds; the shared prefix-cache manager assertion it relaxes stays owned by `CLAIM-PREFIX-PROMPT-CACHING`, no row-state change to that row) | Claude Code (opus-4-8) | isolated worktree `/home/mudler/_git/vllm.cpp-mla-fix` (branch `fix/mla-prefix-cache-assert`, base `6abe09c`); dgx repro `/home/mudler/repro_deepseek` (unfixed) + `/home/mudler/repro_fixed` (fixed) | `fix/mla-prefix-cache-assert` | `src/vllm/v1/core/single_type_kv_cache_manager.cpp` (assert only) + `tests/vllm/v1/test_single_type_kv_cache_manager.cpp` (new MLA cases) | `DONE` (2026-07-23) | 2026-07-23 root-caused + fixed the DeepSeek-V2 assert abort |

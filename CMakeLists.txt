@@ -330,6 +330,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/olmo2_registry.cpp
   src/vllm/model_executor/models/olmo2_weights.cpp
   src/vllm/model_executor/models/olmo2.cpp
+  src/vllm/model_executor/models/phi3_registry.cpp
+  src/vllm/model_executor/models/phi3_weights.cpp
+  src/vllm/model_executor/models/phi3.cpp
   src/vllm/model_executor/models/granite_registry.cpp
   src/vllm/model_executor/models/granite_weights.cpp
   src/vllm/model_executor/models/granite.cpp

@@ -21649,3 +21649,30 @@ Base `origin/main` `e1173fa`; worktree `sweep-recent-dense-batch3`; dgx `~/vllmc
 **OLMo-3 (`Olmo3ForCausalLM`) — IMPLEMENTED, oracle-BLOCKED.** Guarded additive edits to `olmo2.{h,cpp,weights}` (diff-inert for OLMo-2, proven by the re-run OLMo-2 gate 16/16 UNCHANGED) + `test_olmo3_paged_engine.cpp`: per-layer routing off `config.layer_types` — sliding_attention layers use plain NeoX rope (theta 500000) + finite window (masked at the FA kernel, inert for short contexts); full_attention layers use a precomputed YaRN cos/sin cache (get_rope yarn: factor 8, original 8192, mscale=yarn_get_mscale(8)=1.2079=config attention_factor) indexed by real positions; dtype-aware loader (OLMo-3 BF16 on-disk vs OLMo-2 F32). Our engine LOADS + RUNS it. **BUT the pinned vLLM 0.25.0 oracle CANNOT run `allenai/OLMo-3-1025-7B`**: `olmo2.py:143` does `rope_parameters["rope_theta"]` → `KeyError: 'rope_theta'` (the oracle's transformers predates OLMo-3's nested per-layer-type rope schema and does not fold the top-level rope_theta into standardized rope_parameters); an `hf_overrides` workaround surfaces the deeper `Unrecognized keys {'sliding_attention','full_attention'}` → `TypeError: unhashable type: 'dict'`. So there is NO pinned-oracle SACRED bar (DEP-blocked, spec D5). W5 SACRED gate pending an oracle transformers that constructs OLMo-3's rope config (or a pin advance).
 
 **Gates/build.** Clean full CUDA `-Werror` rebuild **0 warnings** (772 targets). compute-sanitizer memcheck **0 errors** on BOTH the Granite AND Phi-3 forwards (full gate under sanitizer); OLMo-3 reuses the same memchecked shared kernels + RopeFromCache (covered by construction). **Regressions ALL re-run byte-identical STANDALONE from the clean build (the shared-TU edits — hf_config longrope-fallback, tokenizer lstrip/rstrip, olmo2 dual-rope — proven diff-inert): OLMo-2 16/16 · Qwen3-dense 184/184 · OPT 63/63 · Llama 92/92 · Mistral 92/92.** The big-model gates (27B 235/235, 35B 315/315, Qwen3-Coder 138/138, GLM-4-9B 16/16, GLM-4.7-Flash 8/8, Gemma-1/2/3 48/48, DeepSeek-V2 223/223) are byte-identical BY CONSTRUCTION (no kernel/runner/sampler TU touched; the three shared TUs are config-parse/tokenizer/olmo2-only, empirically witnessed inert by the dense re-runs). Runs EAGER (bf16 dense) — eager-vs-graph N/A. Not pushed. SPEED PENDING for all three.
+
+## 2026-07-24 — Phi-3/Phi-4 held increment: LongRoPE RCA (rope cache EXONERATED, cascade not a forward bug)
+
+Follow-up to the batch3 landing (Granite-3 + OLMo-3 committed separately). The Phi-4-mini gate's 2 over-band
+positions were investigated per systematic-debugging; the proposed "build the LongRoPE cache in fp32" fix is
+DISPROVEN as the cause, with measurements:
+
+1. **vLLM's LongRoPE cache is bf16, not fp32.** `Phi3LongRoPEScaledRotaryEmbedding.__init__` computes cos/sin in
+   fp32 (`_compute_cos_sin_cache`: `t=arange(dtype=torch.float)`, `freqs.cos()*mscale`) and then **casts**:
+   `short_cache = short_cache.to(dtype)` / `long_cache = long_cache.to(dtype)` with dtype = the model dtype (bf16).
+   So an fp32 cache on our side would DIVERGE from the oracle, not converge.
+2. **Our cache is BIT-IDENTICAL to vLLM's.** Replicating our C++ formula (`phi3_long_rope_scaled_rope.cpp`
+   `ComputeInvFreq` + `build_cos_sin_cache`) in fp32 numpy and comparing against vLLM's constructed
+   `long_short_cos_sin_cache[orig:orig+max_pos]` in bf16: **bit-identical over all gate positions**; our mscale
+   1.1902381 == vLLM's 1.1902380714238083. The rope cache is EXONERATED.
+3. **The over-band positions are CASCADE, not a forward error.** On prompt 12 our tokens are identical to vLLM
+   through tok3. The FIRST divergence is **tok4 at gap EXACTLY 0.0000 nats** — vLLM's own teacher-forced argmax on
+   that prefix IS our token, i.e. vLLM's incremental decode contradicts its own argmax at an exact bf16 tie (the
+   documented vLLM prefill-vs-decode self-inconsistency). tok6/tok8 (1.0 nats) occur only AFTER the prefix already
+   diverged there, so they compare two legitimately different continuations.
+4. **Across all 16 prompts EVERY root (first) divergence is <=0.5 nats**; 7 prompts are fully token-exact.
+
+**Disposition (honest):** no forward bug identified, and NO clean pass claimed. Phi-3 is held as a separate
+increment with a non-passing gate on record. Closing it needs either a cascade-aware gate (compare only up to the
+first root divergence, which is the well-posed comparison once prefixes diverge) or the ratified bigger-dense-model
+STRICT check on `microsoft/phi-4` (14B, ~29 GiB — not downloaded this turn). Granite-3 (STRICT 16/16) and OLMo-3
+(DEP-blocked) landed separately and are NOT blocked on this.

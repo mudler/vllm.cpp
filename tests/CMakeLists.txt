@@ -609,6 +609,12 @@ target_compile_definitions(test_granite_paged_engine PRIVATE
 target_include_directories(test_granite_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+vllm_cpp_add_test(test_phi3_paged_engine parity/test_phi3_paged_engine.cpp)
+target_compile_definitions(test_phi3_paged_engine PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+target_include_directories(test_phi3_paged_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_olmo3_paged_engine parity/test_olmo3_paged_engine.cpp)
 target_compile_definitions(test_olmo3_paged_engine PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")

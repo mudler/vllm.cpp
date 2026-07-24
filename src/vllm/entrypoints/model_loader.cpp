@@ -100,6 +100,45 @@ bool EnvironmentEnabled(const char* name) {
 }
 #endif
 
+// KV-EXTERNAL-CACHE (LMCache): build the external KV connector selected by
+// EngineParams::kv_transfer_config, injecting the runner's resolved
+// full-attention KV geometry into its extra_config so the connector's KV_2LTD
+// chunk layout matches the physical KV page exactly. Returns nullptr when no
+// connector is configured (the default-off inert path). Mirrors vLLM building
+// the connector from --kv-transfer-config after the KV caches exist.
+std::unique_ptr<vllm::v1::kv_offload::KVConnector> BuildKvConnector(
+    const EngineParams& params, const vllm::v1::GPUModelRunner& runner) {
+  using namespace vllm::v1::kv_offload;
+  if (!params.kv_transfer_config.has_value()) return nullptr;
+  vllm::KVTransferConfig cfg = *params.kv_transfer_config;
+  if (!cfg.kv_connector.has_value() || cfg.kv_connector->empty()) return nullptr;
+  // kv_role is required whenever kv_connector is set; default to kBoth so a
+  // caller that only names the connector still yields a valid config.
+  if (!cfg.kv_role.has_value()) cfg.kv_role = vllm::KVRole::kBoth;
+
+  const std::vector<vllm::PagedKvCache>& kv = runner.attn_kv();
+  if (kv.empty()) {
+    throw std::runtime_error(
+        "LMCache connector requires a full-attention KV group, but this model "
+        "has none");
+  }
+  const int num_layers = static_cast<int>(kv.size());
+  const int hidden_dim =
+      static_cast<int>(kv[0].num_kv_heads * kv[0].head_size);
+  const int fa_block = static_cast<int>(kv[0].block_size);
+  // Inject the geometry (extra_config overrides win in CreateFromConfig). The
+  // connector keys block-aligned (chunk_tokens == the full-attention block).
+  cfg.kv_connector_extra_config["num_layers"] = std::to_string(num_layers);
+  cfg.kv_connector_extra_config["hidden_dim"] = std::to_string(hidden_dim);
+  cfg.kv_connector_extra_config["chunk_tokens"] = std::to_string(fa_block);
+
+  KVConnectorContext ctx;
+  ctx.config = &cfg;
+  ctx.role = KVConnectorRole::kScheduler;
+  ctx.block_size = fa_block;
+  return KVConnectorFactory::Create(ctx);
+}
+
 }  // namespace
 
 // Resolve the per-step token budget (max_num_batched_tokens) for chunked
@@ -304,6 +343,20 @@ LoadedEngine::LoadedEngine(HfConfig config,
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
+  // KV-EXTERNAL-CACHE (LMCache): build + wire the external KV connector when the
+  // caller selected one via EngineParams::kv_transfer_config. Default (unset)
+  // leaves kv_connector_ null and BOTH the scheduler and the runner unchanged —
+  // byte-identical to the production engine. Built here (ctor body), after
+  // runner_ and scheduler_ are fully constructed, so the runner's KV geometry is
+  // available for the connector's chunk layout.
+  kv_connector_ = BuildKvConnector(params, runner_);
+  if (kv_connector_ != nullptr) {
+    scheduler_->set_kv_connector(kv_connector_.get());
+    runner_.set_kv_connector(kv_connector_.get());
+    std::cerr << "vllm.cpp: KV external cache connector '"
+              << *params.kv_transfer_config->kv_connector
+              << "' wired ON (scheduler + worker)\n";
+  }
   // Mirror vLLM's "Asynchronous scheduling is enabled/disabled" resolution log
   // (vllm/config/vllm.py:990-1038) so the DGX A/B can audit which arm is live.
   std::cerr << "vllm.cpp: Asynchronous scheduling is "

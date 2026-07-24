@@ -79,6 +79,10 @@
 #include "vt/device.h"
 #include "vt/tensor.h"
 
+namespace vllm::v1::kv_offload {
+class KVConnector;  // KV-EXTERNAL-CACHE: worker-side store/load seam (fwd-decl).
+}  // namespace vllm::v1::kv_offload
+
 namespace vllm::v1 {
 
 // Decode-first reorder (utils.py::reorder_batch_to_split_decodes_and_prefills @
@@ -238,6 +242,18 @@ class GPUModelRunner final : public ModelRunnerBase {
   }
   vt::Device device() const { return queue_.device; }
 
+  // KV-EXTERNAL-CACHE (LMCache) worker-side seam. A non-owning pointer to the
+  // SAME connector instance the scheduler holds (single-process engine); null =
+  // no connector = ZERO behaviour change (the load/store paths are skipped, the
+  // KV cache is byte-identical to production). Set by LoadedEngine right after
+  // both runner_ and scheduler_ are built. Only the concrete LMCacheConnector
+  // carries a worker-side store/load (dynamic_cast in runner.cpp); a base
+  // connector with no worker transport is a no-op here.
+  void set_kv_connector(kv_offload::KVConnector* connector) {
+    kv_connector_ = connector;
+  }
+  kv_offload::KVConnector* kv_connector() const { return kv_connector_; }
+
  private:
   // Owns one persistent cache allocation. CUDA defaults to vt::Alloc-backed
   // device storage; CPU and VT_DEVICE_KV_CACHE=0 retain the host-vector
@@ -375,6 +391,22 @@ class GPUModelRunner final : public ModelRunnerBase {
   std::vector<std::unique_ptr<CacheBuffer>> conv_buf_;
   std::vector<PagedKvCache> attn_kv_;
   std::vector<GdnStateCache> gdn_state_;
+
+  // ── KV-EXTERNAL-CACHE (LMCache) worker-side store/load ──────────────────────
+  // Non-owning; null (default) = inert. See set_kv_connector.
+  kv_offload::KVConnector* kv_connector_ = nullptr;
+  // Per-request count of prompt blocks already STORED to the external cache, so
+  // a multi-step (chunked) prefill stores each full block exactly once and a
+  // decode step re-stores nothing. Only touched when kv_connector_ != nullptr.
+  std::unordered_map<std::string, int> connector_stored_blocks_;
+  // Drain + apply the connector's recorded external-prefix loads into the KV
+  // cache blocks BEFORE the forward reads them (load-before-compute). No-op
+  // unless kv_connector_ is a worker-capable connector with pending loads.
+  void ConnectorLoadExternalKv();
+  // After the forward has written this step's KV, STORE every newly-complete
+  // prompt block of each running request to the external cache (offload-prompt-
+  // only). No-op unless kv_connector_ is a worker-capable connector.
+  void ConnectorStorePromptKv(const SchedulerOutput& scheduler_output);
 
   // Stashed forward result between execute_model and sample_tokens (upstream
   // ExecuteModelState — hidden_states + input_batch handoff, here the full

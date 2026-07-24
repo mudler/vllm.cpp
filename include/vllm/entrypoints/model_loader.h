@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 
+#include "vllm/config/kv_transfer.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
@@ -29,6 +30,7 @@
 #include "vllm/v1/engine/output_processor.h"
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/kv_offload/kv_connector.h"
 #include "vllm/v1/structured_output/manager.h"
 #include "vllm/v1/worker/gpu/runner.h"
 #include "vt/backend.h"
@@ -63,6 +65,15 @@ struct EngineParams {
   // --scheduling-policy flag). Default fcfs. Set kPriority to schedule by
   // (priority, arrival_time); requests then carry a `priority` field.
   vllm::SchedulerPolicy policy = vllm::SchedulerPolicy::kFCFS;
+
+  // KV-EXTERNAL-CACHE (LMCache): opt-in external KV-cache connector selection.
+  // Empty/absent (default) == NO connector == byte-identical production engine
+  // (mirrors vLLM's --kv-transfer-config being unset). When set with a
+  // kv_connector name, LoadedEngine builds the connector via KVConnectorFactory,
+  // injects the runner's resolved full-attention KV geometry into its
+  // extra_config, and wires it to BOTH the scheduler (prefix lookup / prefill
+  // shortcut) and the runner (worker-side KV store/load).
+  std::optional<vllm::KVTransferConfig> kv_transfer_config = std::nullopt;
 };
 
 // Owns the full V1 engine stack (config + weights + tokenizer + Scheduler +
@@ -131,6 +142,13 @@ class LoadedEngine {
   bool prefix_caching_enabled() const { return prefix_caching_enabled_; }
   const vllm::v1::GPUModelRunner& runner() const { return runner_; }
 
+  // KV-EXTERNAL-CACHE (LMCache): the wired external KV connector, or null when
+  // none was configured. Exposed so the output-invariance gate can read the
+  // prefill-tokens-saved / chunks-stored counters. Non-owning.
+  vllm::v1::kv_offload::KVConnector* kv_connector() const {
+    return kv_connector_.get();
+  }
+
   // The async-scheduling enable-flip, resolved ONCE at construction (W3
   // ENG-ASYNC-SCHED). `async_scheduling_enabled()` is
   // AsyncSchedulingEnabled(SchedulerConfig::ResolveAsyncScheduling(
@@ -189,6 +207,11 @@ class LoadedEngine {
   // Concrete weights and model-specific runtime state behind the central
   // registry contract. Declared before runner_ so its borrow remains live.
   std::unique_ptr<LoadedModel> model_;
+  // KV-EXTERNAL-CACHE (LMCache): the owned external KV connector (null unless
+  // EngineParams::kv_transfer_config selects one). Declared BEFORE runner_ /
+  // scheduler_ so it outlives the non-owning pointers they hold to it. Built in
+  // the ctor body once runner_ geometry is known; see model_loader.cpp.
+  std::unique_ptr<vllm::v1::kv_offload::KVConnector> kv_connector_;
   tok::Tokenizer tokenizer_;
   int max_model_len_;
   int max_num_batched_tokens_;

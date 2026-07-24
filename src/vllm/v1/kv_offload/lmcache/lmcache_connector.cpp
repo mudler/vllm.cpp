@@ -114,6 +114,7 @@ MatchResult LMCacheConnector::get_num_new_matched_tokens(
 
   hit_keys_[request.request_id] = hit;
   const int num_hit_tokens = static_cast<int>(hit.size()) * chunk;
+  external_tokens_matched_ += num_hit_tokens;
   // LMCache is synchronous: the async flag is always false.
   return MatchResult{num_hit_tokens, false};
 }
@@ -185,6 +186,7 @@ void LMCacheConnector::StoreChunk(const std::string& key,
   EnsureConnected();
   client_->PutKv2ltd(key, config_.ChunkLayout(), k_planes, v_planes,
                      config_.dtype);
+  ++chunks_stored_;
 }
 
 bool LMCacheConnector::LoadChunk(const std::string& key,

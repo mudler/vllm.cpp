@@ -516,6 +516,13 @@ target_compile_definitions(test_opt_paged_engine PRIVATE
 target_include_directories(test_opt_paged_engine PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
+# KV-EXTERNAL-CACHE (LMCache): the connector-ON full-model OUTPUT-INVARIANCE +
+# throughput gate. Real OPT-125m generation loop vs a live lmcache.v1.server;
+# checkpoint- and server-gated (loud SKIP otherwise). Driven by
+# scripts/lmcache/run_output_invariance.sh.
+vllm_cpp_add_test(test_lmcache_output_invariance
+  vllm/models/test_lmcache_output_invariance.cpp)
+
 # ADDITIVE-MODEL W2/W4 (Llama-3.2-1B, LlamaForCausalLM) — the CROSS-FAMILY dense
 # additivity bring-up: a host-only loader gate plus the SACRED near-tie-robust
 # greedy correctness gate vs the vLLM 0.25.0 oracle (llama3 rope-scaling, no

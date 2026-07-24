@@ -21,6 +21,7 @@
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/platforms/interface.h"  // GetPlatform(device.type) per-tensor memory-model seam
 #include "vllm/v1/kv_cache_dtype.h"  // ResolveKvCacheDType (VT_KV_CACHE_F32 A/B)
+#include "vllm/v1/kv_offload/lmcache/lmcache_connector.h"  // KV-EXTERNAL-CACHE worker store/load
 #include "vllm/v1/sample/ops/bad_words.h"  // apply_allowed_token_ids (-inf mask)
 #include "vllm/v1/worker/gpu/async_runner_flag.h"  // VT_ASYNC_RUNNER predicate
 #include "vt/backend.h"  // vt::Backend / GetBackend (VT_GPU_SAMPLE=0 download)
@@ -822,7 +823,24 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
       .pure_decode = pure_decode,
       .gather_logits = gather,
   };
+  // KV-EXTERNAL-CACHE (LMCache): apply any external-prefix loads recorded by the
+  // scheduler's connector for THIS step into the freshly-allocated KV blocks
+  // BEFORE the forward reads them (load-before-compute, base.py:293). Inert when
+  // no worker-capable connector is set — the KV cache is byte-identical to
+  // production and no sync is issued.
+  if (kv_connector_ != nullptr) {
+    ConnectorLoadExternalKv();
+  }
+
   ForwardLogits logits = ModelRegistry::Forward(*model_, forward_input);
+
+  // KV-EXTERNAL-CACHE (LMCache): after the forward has written this step's KV,
+  // STORE every newly-complete prompt block to the external cache (the worker
+  // half of LMCacheConnectorV1's synchronous save). Inert (no sync, no I/O)
+  // unless a worker-capable connector is set.
+  if (kv_connector_ != nullptr) {
+    ConnectorStorePromptKv(scheduler_output);
+  }
 
   // Stash for sample_tokens (upstream ExecuteModelState).
   exec_state_.num_actual_tokens = scheduler_output.total_num_scheduled_tokens;
@@ -1158,6 +1176,172 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   return std::make_unique<AsyncGPUModelRunnerOutput>(
       std::move(skeleton), dev, pool, slot, num_reqs, queue_, copy_q,
       std::move(invalid_req_indices));
+}
+
+// ─── KV-EXTERNAL-CACHE (LMCache) worker-side store/load ──────────────────────
+//
+// The full-attention page is [2, block_size, num_kv_heads, head_size] per block
+// (backend.h:241), so within a block the K plane is the first half and the V
+// plane the second — each exactly [block_size, hidden_dim] contiguous bytes,
+// which is byte-for-byte the LMCache KV_2LTD per-layer plane the connector's
+// PutKv2ltd/GetKv2ltd expect. We store/load each half at its own page offset, so
+// an our-store -> our-load cycle restores the block bit-for-bit (the whole point
+// of the output-invariance gate). Device<->host movement goes through the
+// backend Copy (a UMA memcpy on GB10), synchronized before the bytes are read.
+
+namespace {
+// The full-attention page geometry a store/load needs. num_layers == the number
+// of full-attention KV buffers, hidden_dim == num_kv_heads*head_size, plane_bytes
+// == one K (or V) plane, page_bytes == the whole [K|V] block.
+struct FaGeom {
+  int num_layers = 0;
+  int block_size = 0;
+  int hidden_dim = 0;
+  std::size_t elem_size = 0;
+  std::size_t plane_bytes = 0;
+  std::size_t page_bytes = 0;
+};
+}  // namespace
+
+void GPUModelRunner::ConnectorLoadExternalKv() {
+  using kv_offload::lmcache::LMCacheConnector;
+  auto* lm = dynamic_cast<LMCacheConnector*>(kv_connector_);
+  if (lm == nullptr) return;  // a base/non-worker connector: nothing to load
+  std::vector<kv_offload::lmcache::LmcacheLoadJob> loads =
+      lm->TakeConnectorLoads();
+  if (loads.empty()) return;
+  VT_CHECK(!attn_kv_.empty(),
+           "LMCache load: model has no full-attention KV group");
+
+  FaGeom g;
+  g.num_layers = static_cast<int>(full_attn_buf_.size());
+  g.block_size = static_cast<int>(attn_kv_[0].block_size);
+  g.hidden_dim = static_cast<int>(attn_kv_[0].num_kv_heads * attn_kv_[0].head_size);
+  g.elem_size = vt::SizeOf(attn_kv_[0].dtype);
+  g.plane_bytes = static_cast<std::size_t>(g.block_size) *
+                  static_cast<std::size_t>(g.hidden_dim) * g.elem_size;
+  g.page_bytes = 2 * g.plane_bytes;
+  VT_CHECK(g.page_bytes == static_cast<std::size_t>(fa_page_size_bytes_),
+           "LMCache load: full-attention page is padded/asymmetric — refusing "
+           "to move KV under an unexpected layout");
+  const auto& c = lm->config();
+  VT_CHECK(c.num_layers == g.num_layers && c.hidden_dim == g.hidden_dim &&
+               c.chunk_tokens == g.block_size && c.elem_size == g.elem_size,
+           "LMCache load: connector geometry disagrees with the runner's KV "
+           "cache — refusing to load (identity safety)");
+
+  vt::Backend& backend = vt::GetBackend(queue_.device.type);
+  std::vector<std::string> kp, vp;
+  for (const auto& job : loads) {
+    VT_CHECK(job.keys.size() == job.gpu_block_ids.size(),
+             "LMCache load: key/block-id count mismatch");
+    for (std::size_t j = 0; j < job.keys.size(); ++j) {
+      kp.clear();
+      vp.clear();
+      // A chunk the scheduler recorded as a HIT that is now absent is a real
+      // bug (torn store, evicted mid-decode), never silently recomputed here.
+      const bool got = lm->LoadChunk(job.keys[j], &kp, &vp);
+      VT_CHECK(got,
+               "LMCache load: a chunk recorded as an external-prefix hit is "
+               "absent on the server");
+      VT_CHECK(static_cast<int>(kp.size()) == g.num_layers &&
+                   static_cast<int>(vp.size()) == g.num_layers,
+               "LMCache load: plane count != num_layers");
+      const int block_id = job.gpu_block_ids[j];
+      for (int l = 0; l < g.num_layers; ++l) {
+        VT_CHECK(kp[static_cast<std::size_t>(l)].size() == g.plane_bytes &&
+                     vp[static_cast<std::size_t>(l)].size() == g.plane_bytes,
+                 "LMCache load: plane byte count != expected");
+        auto* base = static_cast<uint8_t*>(full_attn_buf_[static_cast<std::size_t>(l)]->data()) +
+                     static_cast<std::size_t>(block_id) * g.page_bytes;
+        backend.Copy(queue_, base, kp[static_cast<std::size_t>(l)].data(),
+                     g.plane_bytes);
+        backend.Copy(queue_, base + g.plane_bytes,
+                     vp[static_cast<std::size_t>(l)].data(), g.plane_bytes);
+      }
+    }
+  }
+  backend.Synchronize(queue_);
+}
+
+void GPUModelRunner::ConnectorStorePromptKv(
+    const SchedulerOutput& scheduler_output) {
+  using kv_offload::lmcache::LMCacheConnector;
+  auto* lm = dynamic_cast<LMCacheConnector*>(kv_connector_);
+  if (lm == nullptr) return;
+  if (full_attn_group_id_ < 0 || attn_kv_.empty()) return;
+  const int num_reqs = input_batch_.num_reqs();
+  if (num_reqs == 0) return;
+
+  FaGeom g;
+  g.num_layers = static_cast<int>(full_attn_buf_.size());
+  g.block_size = static_cast<int>(attn_kv_[0].block_size);
+  g.hidden_dim = static_cast<int>(attn_kv_[0].num_kv_heads * attn_kv_[0].head_size);
+  g.elem_size = vt::SizeOf(attn_kv_[0].dtype);
+  g.plane_bytes = static_cast<std::size_t>(g.block_size) *
+                  static_cast<std::size_t>(g.hidden_dim) * g.elem_size;
+  g.page_bytes = 2 * g.plane_bytes;
+  VT_CHECK(g.page_bytes == static_cast<std::size_t>(fa_page_size_bytes_),
+           "LMCache store: full-attention page is padded/asymmetric");
+  const auto& cfg = lm->config();
+  VT_CHECK(cfg.num_layers == g.num_layers && cfg.hidden_dim == g.hidden_dim &&
+               cfg.chunk_tokens == g.block_size && cfg.elem_size == g.elem_size,
+           "LMCache store: connector geometry disagrees with the runner's KV "
+           "cache");
+
+  int fa_cols = 0;
+  const std::vector<int32_t> fa_bt =
+      gather_block_table(full_attn_group_id_, num_reqs, &fa_cols);
+
+  vt::Backend& backend = vt::GetBackend(queue_.device.type);
+  // The forward's ReshapeAndCache writes may still be in flight on the queue;
+  // the device reads below must see the committed KV.
+  backend.Synchronize(queue_);
+
+  std::vector<std::string> kp(static_cast<std::size_t>(g.num_layers));
+  std::vector<std::string> vp(static_cast<std::size_t>(g.num_layers));
+  for (int i = 0; i < num_reqs; ++i) {
+    const std::string& req_id = *input_batch_.req_ids[static_cast<std::size_t>(i)];
+    const int num_prompt =
+        input_batch_.num_prompt_tokens[static_cast<std::size_t>(i)];
+    const int computed_before =
+        input_batch_.num_computed_tokens_cpu[static_cast<std::size_t>(i)];
+    const int num_scheduled = scheduler_output.num_scheduled_tokens.at(req_id);
+    // Post-step computed count, clamped to the prompt (offload_prompt_only).
+    const int prompt_done = std::min(computed_before + num_scheduled, num_prompt);
+    const int complete_blocks = prompt_done / g.block_size;
+    int already = connector_stored_blocks_[req_id];  // 0 if unseen
+    if (complete_blocks <= already) continue;
+
+    const int need = complete_blocks * g.block_size;
+    std::vector<int32_t> toks;
+    toks.reserve(static_cast<std::size_t>(need));
+    for (int col = 0; col < need; ++col) {
+      toks.push_back(input_batch_.token_id(i, col));
+    }
+    const std::vector<uint64_t> folds = lm->ChunkFolds(toks);
+    for (int b = already; b < complete_blocks &&
+                          b < static_cast<int>(folds.size());
+         ++b) {
+      const int block_id = fa_bt[static_cast<std::size_t>(i) *
+                                     static_cast<std::size_t>(fa_cols) +
+                                 static_cast<std::size_t>(b)];
+      for (int l = 0; l < g.num_layers; ++l) {
+        kp[static_cast<std::size_t>(l)].resize(g.plane_bytes);
+        vp[static_cast<std::size_t>(l)].resize(g.plane_bytes);
+        const auto* base =
+            static_cast<const uint8_t*>(full_attn_buf_[static_cast<std::size_t>(l)]->data()) +
+            static_cast<std::size_t>(block_id) * g.page_bytes;
+        backend.Copy(queue_, kp[static_cast<std::size_t>(l)].data(), base,
+                     g.plane_bytes);
+        backend.Copy(queue_, vp[static_cast<std::size_t>(l)].data(),
+                     base + g.plane_bytes, g.plane_bytes);
+      }
+      backend.Synchronize(queue_);  // planes host-valid before the wire PUT
+      lm->StoreChunk(lm->ChunkKey(folds[static_cast<std::size_t>(b)]), kp, vp);
+    }
+    connector_stored_blocks_[req_id] = complete_blocks;
+  }
 }
 
 }  // namespace vllm::v1

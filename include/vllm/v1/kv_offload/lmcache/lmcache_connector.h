@@ -219,6 +219,13 @@ class LMCacheConnector final : public KVConnector {
   // Drain the typed per-step loads recorded by update_state_after_alloc.
   std::vector<LmcacheLoadJob> TakeConnectorLoads();
 
+  // Cumulative count of EXTERNAL prefix tokens matched (prefill shortcut) across
+  // all get_num_new_matched_tokens calls — the "prefill tokens saved" the
+  // output-invariance / throughput gate reports. Observability only.
+  int64_t external_tokens_matched() const { return external_tokens_matched_; }
+  // Cumulative count of chunks STORED to the remote server. Observability only.
+  int64_t chunks_stored() const { return chunks_stored_; }
+
  private:
   LmcacheConnectorConfig config_;
   std::unique_ptr<LmcacheRemoteClient> client_;
@@ -233,6 +240,10 @@ class LMCacheConnector final : public KVConnector {
   std::unordered_map<std::string, std::vector<std::string>> hit_keys_;
   // This step's accumulated typed loads, drained by TakeConnectorLoads.
   std::vector<LmcacheLoadJob> batch_loads_;
+
+  // Observability counters (see accessors above).
+  int64_t external_tokens_matched_ = 0;
+  int64_t chunks_stored_ = 0;
 };
 
 }  // namespace vllm::v1::kv_offload::lmcache

@@ -7,6 +7,7 @@
 #define VLLM_CAPI_ENGINE_HANDLE_H_
 
 #include <memory>
+#include <string>
 
 #include "vllm.h"
 #include "vllm/entrypoints/model_loader.h"
@@ -29,6 +30,12 @@ vllm_engine* MakeEngineHandle(
 vllm_engine* MakeEngineHandle(
     std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded,
     vllm::entrypoints::openai::ChatPromptFn prompt_fn) noexcept;
+
+// Test hook for the ABI v4 tool-parser selection: set the handle's tool-parser
+// name as vllm_engine_load would from vllm_model_params.tool_parser. Must be
+// called BEFORE the first chat call (the chat serving is built lazily and caches
+// the parser). NULL handle is a no-op. Empty name restores AUTO detection.
+void SetEngineToolParser(vllm_engine* handle, const std::string& name) noexcept;
 
 }  // namespace vllm::capi
 

@@ -21244,3 +21244,23 @@ evaluation-only tools failure); `test_capi` 20/20 and `test_chat_template`
 **Build + regressions (all on the FINAL code):** clean full CUDA `-Werror` rebuild 0 warn / 0 err. EVERY SACRED gate byte-identical, STANDALONE under `flock $HOME/gpu.lock`, one big-model at a time: **27B 235/235 · 35B 315/315 · Qwen3-Coder 138/138 · Qwen3-dense 184/184 · OPT 63/63 · DeepSeek-V2 223/223 (Release AND asserts-on = no-NDEBUG build, exit 0 — the shared-TU canary, since this change touches deepseek_v2_weights.cpp/deepseek_v2.h/cuda_flash_attn_fa2.cu) · Llama 92/92 · Mistral 92/92.** GLM-4-9B goldens are NOT committed to git (were local to G2's capture); glm4.cpp is untouched by this change → byte-identical by construction, not re-run. compute-sanitizer memcheck on the FULL GLM gate (the head_dim-256 MLA prefill + MoE glue + MLA decode): **ERROR SUMMARY: 0 errors** (the gate still passed 8/8 under the sanitizer; the run is slow — 58GB model + serialized instrumentation — but completed). Corroborated: the 256 kernel is the same instantiation memchecked for the 27B/35B paged prefill, via the contiguous-varlen mode memchecked for DeepSeek's 192 MLA prefill.
 
 **Files:** NEW `src/vllm/model_executor/models/glm4_moe_lite_registry.cpp`, `tests/vllm/models/test_glm4_moe_lite_{load,paged_engine}.cpp`, `scripts/glm4-moe-lite-{oracle-capture,neartie-gap}.py`, `tests/parity/goldens/glm4_moe_lite_greedy/*`. EDIT `src/vt/cuda/cuda_flash_attn_fa2.cu` (256 dispatch), `include/vllm/model_executor/models/deepseek_v2.h` + `src/vllm/model_executor/models/deepseek_v2_weights.cpp` (allow_mtp_tail + scoring default), `CMakeLists.txt` + `tests/CMakeLists.txt` (TU registration), `tests/vt/test_ops_moe_router_grouped.cpp` (GLM case). **Speed PENDING** — no number; `DONE` requires vLLM every-axis parity.
+
+## 2026-07-24 — ABI v4: tool-parser selection + chat-template auto-detection (`CLAIM-CAPI-PARSER-SELECT`, autoparser-parity program W1+W2)
+
+First slice of the autoparser-parity program (mechanical port of vLLM's full
+tool/reasoning parser registry is in flight in parallel worktrees). The capi
+chat path no longer hardcodes "hermes": `vllm_model_params.tool_parser` (ABI
+v3→v4, appended field, NULL = auto) names the dialect explicitly, else
+`DetectToolParser` scans the RESOLVED chat template against an ordered
+marker table (`tool_parsers/detect.{h,cpp}` — the llama.cpp common/chat.cpp
+detection idea, credited; each future parser family adds one row; ordering =
+more-specific-first, documented and test-pinned via a synthetic two-row
+table), else hermes. Unknown explicit names throw at serving construction →
+`VLLM_ERR_INVALID_ARGUMENT` on the first chat call (no crash, engine
+reusable). `ResolveChatPromptFn` exposes the raw template out-param so
+detection sees the dialect even when rendering degrades to the fallback.
+Invariant test pins every marker row to a registered parser. Evidence:
+`test_tool_parser_detect` 5/5, `test_capi` 22/22 (two new cases), 
+`test_chat_prompt` 5/5, `test_chat_template` 17/17, C11 header compile clean.
+Authored by a task-scoped subagent in an isolated worktree; integrated,
+re-verified and recorded by the coordinating session.

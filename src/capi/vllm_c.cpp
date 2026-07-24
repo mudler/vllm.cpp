@@ -18,6 +18,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,6 +32,8 @@
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
+#include "vllm/entrypoints/openai/tool_parsers/abstract.h"  // get_tool_parser
+#include "vllm/entrypoints/openai/tool_parsers/detect.h"    // DetectToolParser
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/version.h"
@@ -54,6 +57,12 @@ struct vllm_engine {
   // Test-hook override for the chat-prompt seam (MakeEngineHandle overload):
   // when set, chat_serving is built with it instead of the resolved template.
   vllm::entrypoints::openai::ChatPromptFn test_prompt_fn;
+  // The caller-selected tool-call parser (ABI v4 vllm_model_params.tool_parser),
+  // copied at vllm_engine_load. Empty => AUTO-detect from the chat template at
+  // the first chat call; a non-empty value must name a registered parser or the
+  // first chat call fails with VLLM_ERR_INVALID_ARGUMENT (checked in
+  // EnsureChatServing). Tests set it via vllm::capi::SetEngineToolParser.
+  std::string tool_parser;
   // Lazily-built chat serving handler over the shared AsyncLLM (one per
   // handle; create_chat_completion is safe for concurrent callers, matching
   // the HTTP server's worker pool). Guarded by chat_mutex for the lazy build.
@@ -196,9 +205,17 @@ vllm::SamplingParams ToSamplingParams(const vllm_sampling_params& c,
 // chat_template for a model directory, the `tokenizer.chat_template` GGUF
 // metadata for a .gguf file, else the role-join fallback (mirrors the bundled
 // server's resolution in examples/server/main.cpp).
+//
+// When `out_raw_template` is non-null it receives the RAW resolved template
+// string (the tool-parser auto-detector sniffs it), or stays untouched when no
+// template resolved at all. The raw string is captured regardless of whether the
+// minja subset can render it: detection is a plain substring match, so an exotic
+// template that degrades to the fallback for RENDERING still names its tool-call
+// dialect for DETECTION.
 vllm::entrypoints::openai::ChatPromptFn ResolveChatPromptFn(
     const std::string& model_path,
-    const vllm::entrypoints::LoadedEngine& loaded) {
+    const vllm::entrypoints::LoadedEngine& loaded,
+    std::string* out_raw_template = nullptr) {
   namespace fs = std::filesystem;
   try {
     std::string tmpl;
@@ -209,6 +226,7 @@ vllm::entrypoints::openai::ChatPromptFn ResolveChatPromptFn(
       tmpl = vllm::entrypoints::LoadChatTemplateFromConfig(
           (fs::path(model_path) / "tokenizer_config.json").string());
     }
+    if (out_raw_template != nullptr) *out_raw_template = tmpl;
     const vllm::tok::Tokenizer& tok = loaded.tokenizer();
     const std::string bos =
         tok.BosId() >= 0 ? tok.Decode({tok.BosId()}) : std::string();
@@ -219,23 +237,49 @@ vllm::entrypoints::openai::ChatPromptFn ResolveChatPromptFn(
     return vllm::capi::ResolveTemplatePromptFn(tmpl, bos, eos, model_path);
   } catch (const std::exception&) {
     // No template shipped with the model at all: the hermes-aware fallback
-    // still primes the structural-tag tool flow.
+    // still primes the structural-tag tool flow, and detection sees no template.
     return vllm::capi::HermesToolsFallbackPrompt;
   }
 }
 
-// Lazily build the handle's chat serving handler over the shared AsyncLLM
-// (same wiring as the bundled server: real chat template when the model ships
-// one, hermes tool parser). One handler per handle; create_chat_completion is
-// safe for concurrent callers.
+// Lazily build the handle's chat serving handler over the shared AsyncLLM (same
+// wiring as the bundled server: real chat template when the model ships one).
+// One handler per handle; create_chat_completion is safe for concurrent callers.
+//
+// The tool-call parser (ABI v4) is selected here: an EXPLICIT handle->tool_parser
+// wins; otherwise it is AUTO-detected from the resolved chat template
+// (DetectToolParser); when no template resolved at all it defaults to "hermes".
+// An explicitly-named parser that is not registered throws std::invalid_argument
+// (the callers map it to VLLM_ERR_INVALID_ARGUMENT) — detection never returns an
+// unregistered name, so only a bad caller-supplied name can trip this.
 vllm::entrypoints::openai::OpenAIServingChat& EnsureChatServing(
     vllm_engine* engine) {
   std::lock_guard<std::mutex> lock(engine->chat_mutex);
   if (engine->chat_serving == nullptr) {
+    std::string raw_template;
     vllm::entrypoints::openai::ChatPromptFn prompt_fn =
         engine->test_prompt_fn
             ? engine->test_prompt_fn
-            : ResolveChatPromptFn(engine->model_path, *engine->loaded);
+            : ResolveChatPromptFn(engine->model_path, *engine->loaded,
+                                  &raw_template);
+
+    std::string parser_name;
+    if (!engine->tool_parser.empty()) {
+      parser_name = engine->tool_parser;  // explicit selection wins.
+    } else if (!raw_template.empty()) {
+      parser_name = vllm::entrypoints::openai::DetectToolParser(raw_template);
+    } else {
+      parser_name = "hermes";  // no template to detect from.
+    }
+    // Reject an unknown explicit name here, at the first chat call, rather than
+    // silently disabling tool parsing (get_tool_parser returns nullptr for an
+    // unregistered name, which MakeToolParser would treat as "no parser").
+    if (!parser_name.empty() &&
+        vllm::entrypoints::openai::get_tool_parser(parser_name) == nullptr) {
+      throw std::invalid_argument("unknown tool parser \"" + parser_name +
+                                  "\" (not a registered parser)");
+    }
+
     std::string served_name =
         engine->model_path.empty()
             ? std::string("model")
@@ -243,7 +287,7 @@ vllm::entrypoints::openai::OpenAIServingChat& EnsureChatServing(
     engine->chat_serving =
         std::make_unique<vllm::entrypoints::openai::OpenAIServingChat>(
             engine->loaded->async_engine(), std::move(served_name),
-            std::move(prompt_fn), /*tool_parser_name=*/"hermes");
+            std::move(prompt_fn), std::move(parser_name));
   }
   return *engine->chat_serving;
 }
@@ -339,6 +383,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.num_blocks = 256;
   p.max_model_len = 0;
   p.max_num_seqs = 8;
+  p.tool_parser = nullptr;  // AUTO-detect from the chat template (ABI v4).
   return p;
 }
 
@@ -391,6 +436,8 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
     auto* handle = new vllm_engine;
     handle->loaded = std::move(loaded);
     handle->model_path = params->model_path;
+    // ABI v4: copy the caller's tool-parser selection (NULL => empty => AUTO).
+    if (params->tool_parser != nullptr) handle->tool_parser = params->tool_parser;
     *out = handle;
     ClearError();
     return VLLM_OK;
@@ -796,6 +843,10 @@ vllm_engine* MakeEngineHandle(
   vllm_engine* handle = MakeEngineHandle(std::move(loaded));
   if (handle != nullptr) handle->test_prompt_fn = std::move(prompt_fn);
   return handle;
+}
+
+void SetEngineToolParser(vllm_engine* handle, const std::string& name) noexcept {
+  if (handle != nullptr) handle->tool_parser = name;
 }
 
 }  // namespace vllm::capi

@@ -2000,6 +2000,18 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Tool-parser selection + template auto-detection through the C ABI (ABI v4) -
+  `NOT APPLICABLE` (2026-07-24, `CLAIM-CAPI-PARSER-SELECT`).**
+  `benchmark_binding=false`. **API-surface change, no performance claim.**
+  `vllm_model_params` gains `tool_parser` (NULL = auto); the capi chat path
+  selects the parser as explicit-name -> marker-table detection over the
+  resolved chat template (`tool_parsers/detect.{h,cpp}`, seeded with hermes,
+  one row per future family) -> hermes fallback; unknown explicit names map to
+  `VLLM_ERR_INVALID_ARGUMENT` on the first chat call. No decode-path changes.
+  Evidence: `test_tool_parser_detect` 5 cases, `test_capi` 22 (up from 20),
+  `test_chat_prompt` 5, `test_chat_template` 17, pure-C header compile clean.
+  No binding number is created, re-based, or invalidated.
+
 - **Chat entry points through the C ABI (ABI v3: `vllm_chat` /
   `vllm_chat_stream`) - `NOT APPLICABLE` (2026-07-24,
   `CLAIM-CAPI-CHAT-V3`).** `benchmark_binding=false`. **API-surface change, no

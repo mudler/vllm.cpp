@@ -170,6 +170,8 @@ vllm_cpp_add_test(test_openai_serving vllm/entrypoints/openai/test_serving.cpp)
 vllm_cpp_add_test(test_openai_utf8 vllm/entrypoints/openai/test_utf8.cpp)
 vllm_cpp_add_test(test_openai_tool_parsers
   vllm/entrypoints/openai/tool_parsers/test_tool_parsers.cpp)
+vllm_cpp_add_test(test_tool_parser_detect
+  vllm/entrypoints/openai/tool_parsers/test_detect.cpp)
 vllm_cpp_add_test(test_tool_choice_grammar
   vllm/entrypoints/openai/tool_parsers/test_tool_choice_grammar.cpp)
 vllm_cpp_add_test(test_chat_template vllm/entrypoints/test_chat_template.cpp)

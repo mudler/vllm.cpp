@@ -289,7 +289,10 @@ upstream exactly-one rule; `VLLM_ABI_VERSION` bumped 1→2. ABI v3 (2026-07-24, 
 `vllm_chat_stream` — OpenAI chat request JSON in, response / chunk JSON out,
 running the engine-side serving-chat pipeline (chat template incl. GGUF
 `tokenizer.chat_template` via `LoadChatTemplateFromGguf`, structural-tag
-tool_choice, streaming Hermes tool parsing); 17→19 exported symbols. The
+tool_choice, streaming Hermes tool parsing); 17→19 exported symbols. ABI v4 (2026-07-24, `CLAIM-CAPI-PARSER-SELECT`):
+`vllm_model_params.tool_parser` (NULL = auto-detect from the chat template via
+the ordered marker table in `tool_parsers/detect.{h,cpp}`, llama.cpp-inspired;
+one row per parser family). The
 richer C++ API (`include/vllm/*.hpp` mirroring `LLM`/`AsyncLLM`) is later.
 Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI server),
 `examples/bench` (M2). DoD (LocalAI-style dlopen consumption) MET.

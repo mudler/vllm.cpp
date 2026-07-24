@@ -867,6 +867,42 @@ TEST_CASE("capi: vllm_chat rejects malformed request JSON cleanly") {
   vllm_engine_free(eng);
 }
 
+// ─── tool-parser selection (ABI v4) ──────────────────────────────────────────
+// An UNKNOWN explicit tool-parser name must fail the FIRST chat call with
+// VLLM_ERR_INVALID_ARGUMENT (not crash, not silently disable parsing) and set
+// vllm_last_error; an explicit "hermes" (a registered parser) serves normally.
+TEST_CASE("capi: an unknown tool_parser fails the first chat call cleanly") {
+  vllm_engine* eng = MakeSyntheticChatEngine();
+  REQUIRE(eng != nullptr);
+  vllm::capi::SetEngineToolParser(eng, "no-such-parser");
+
+  const char* request =
+      "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+      "\"temperature\":0,\"max_tokens\":4}";
+  char* response = nullptr;
+  CHECK(vllm_chat(eng, request, &response) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(response == nullptr);
+  CHECK(std::string(vllm_last_error()).find("no-such-parser") !=
+        std::string::npos);
+  vllm_engine_free(eng);
+}
+
+TEST_CASE("capi: an explicit registered tool_parser (hermes) serves normally") {
+  vllm_engine* eng = MakeSyntheticChatEngine();
+  REQUIRE(eng != nullptr);
+  vllm::capi::SetEngineToolParser(eng, "hermes");
+
+  const char* request =
+      "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+      "\"temperature\":0,\"max_tokens\":4}";
+  char* response = nullptr;
+  REQUIRE(vllm_chat(eng, request, &response) == VLLM_OK);
+  REQUIRE(response != nullptr);
+  CHECK(json::parse(response).at("object") == "chat.completion");
+  vllm_string_free(response);
+  vllm_engine_free(eng);
+}
+
 // ─── version / abi ───────────────────────────────────────────────────────────
 TEST_CASE("capi: version and abi-version are exposed") {
   CHECK(std::string(vllm_version()).size() > 0);

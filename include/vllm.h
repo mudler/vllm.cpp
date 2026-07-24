@@ -49,8 +49,11 @@ extern "C" {
  * structured_json_object).
  * v3: OpenAI-style chat entry points (vllm_chat / vllm_chat_stream) — chat
  * templating, tool_choice lowering, and streaming tool-call parsing run
- * ENGINE-SIDE. */
-#define VLLM_ABI_VERSION 3
+ * ENGINE-SIDE.
+ * v4: tool_parser field appended to vllm_model_params — selects the tool-call
+ * parser for the chat entry points, or AUTO-detects it from the chat template
+ * when NULL/empty. */
+#define VLLM_ABI_VERSION 4
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -104,6 +107,16 @@ typedef struct vllm_model_params {
   int32_t max_model_len;
   /* Max concurrent sequences the scheduler admits. <= 0 => 8. */
   int32_t max_num_seqs;
+  /* ── Tool-call parser (ABI v4) ──────────────────────────────────────────────
+   * Selects the parser that turns the model's raw tool-call output into
+   * structured tool_calls for the chat entry points (vllm_chat /
+   * vllm_chat_stream). NULL or "" => AUTO: the parser is detected from the
+   * model's chat template at the first chat call (a template that wraps calls
+   * in <tool_call> selects "hermes"; the fallback when nothing is detected is
+   * also "hermes"). A non-empty value MUST name a registered parser (e.g.
+   * "hermes", "qwen3"); an unknown name fails the first chat call with
+   * VLLM_ERR_INVALID_ARGUMENT. Borrowed for the vllm_engine_load call only. */
+  const char* tool_parser;
 } vllm_model_params;
 
 /* ── Sampling parameters ──────────────────────────────────────────────────────

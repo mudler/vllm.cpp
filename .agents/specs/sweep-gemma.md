@@ -495,17 +495,33 @@ model); the dual per-layer rope-cache selector.
   selects the gate form; **verify BOS placement vs the oracle** (the OPT lesson); and
   **probe whether 0.25.0 can construct `Gemma4*`** (decides the Gemma-4 row's fate). No
   code. *Gate: oracle reference outputs produced; determinism + BOS + Gemma-4-oracle
-  verdicts recorded.*
+  verdicts recorded.* **LANDED 2026-07-24:** 0.25.0 constructs `Gemma3ForCausalLM` and
+  runs it; `gemma-3-1b-it` config matches §0.5-0.6 (head_dim 256, `final_logit_softcapping:
+  null` → the final soft-cap is NOT needed for the Gemma-3 gate); K=5 per-prompt greedy
+  **ALL-DETERMINISTIC → STRICT bar** (1b self-deterministic, so per the ratified rule NO
+  4b-MM-backbone check is required); **BOS verified** (all prompts prepend `bos_token_id=2`).
+  (Gemma-4 oracle probe deferred to W6.)
 - **W1 — Shared additive primitives.** `kGeluAndMul` (tanh-approx GeLU + mul) in
   `vt::ops` (CUDA + CPU), the `sqrt(hidden)` embed-scale, and the
   `query_pre_attn_scalar` attention scalar. Additive; no existing model sets them ->
   all 10 regressions byte-identical. *Gate: unit parity at real dims + regressions
-  UNCHANGED.*
+  UNCHANGED.* **LANDED 2026-07-24:** `kGeluAndMul` + `kMulScalar` (bf16 embed-scale)
+  CUDA+CPU appended before `OpId::kCount` (no op renumbered); qpas is a scalar threaded
+  into the block (no op). Unit gate `test_ops_activation` **12/12** (GeGLU bit-exact vs
+  in-test reference at I=6912 + MulScalar bf16).
 - **W2 — Gemma-3 dense block + G1 gate.** New `gemma3.{h,cpp}`: sandwich norms (reuse
   glm4), QK-norm (reuse `kAttnQkNormRopeGate`), dual per-layer rope theta + interleaved
   sliding-window routing (reuse FA-2 window + KV specs), tied embeddings, W1 scalars.
   Reuses only the `dense_attn_block.h` glue + GQA paged path, per D4. *Gate: SACRED gate
-  on gemma-3-1b-it (form per W0) + bigger strict on gemma-3-4b text backbone.*
+  on gemma-3-1b-it (form per W0) + bigger strict on gemma-3-4b text backbone.* **LANDED
+  2026-07-24:** `gemma3.{h,cpp}`/`gemma3_weights.cpp`/`gemma3_registry.cpp`. Note the q/k
+  norm uses standalone `vt::RmsNorm{gemma=true}` (not the fused `kAttnQkNormRopeGate`
+  recipe) + `RopeNeox` per-layer theta — the byte-identical deterministic default path.
+  **SACRED gate STRICT token-exact 48/48** greedy vs vLLM 0.25.0 (tokenizer-free: feeds
+  vLLM's exact BOS-prefixed ids into the CUDA prefill, mirroring the Mistral
+  `LOAD-SENTENCEPIECE` blocker — our loader does not validate Gemma's byte_fallback BPE
+  tokenizer.json). 1b self-deterministic ⇒ the 4b text-backbone strict check is NOT
+  required (ratified rule). Loader 340 tensors, registry 23/23, clean `-Werror` 0 warn.
 - **W3 — Final logit soft-cap.** Add `soft_cap` (tanh cap) to the logits path, plus the
   Gemma-2 attn soft-cap wiring through `Attention` -> FA-2. Default-inert for existing
   models. *Gate: unit parity + regressions UNCHANGED.*

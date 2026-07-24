@@ -355,6 +355,32 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   });
 }
 
+// Gemma GeGLU: out = gelu_tanh(gate) * up. gelu_tanh(g) = 0.5*g*(1 + tanh(
+// sqrt(2/pi)*(g + 0.044715*g^3))) — the exact gelu_pytorch_tanh, computed in f32.
+void GeluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
+  const int64_t t = x.shape[0], d = x.shape[1] / 2;
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      float g = LoadF32(x, i * 2 * d + j);
+      float up = LoadF32(x, i * 2 * d + d + j);
+      float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+      float gelu = 0.5f * g * (1.0f + std::tanh(inner));
+      StoreF32(out, i * d + j, gelu * up);
+    }
+  }
+  });
+}
+
+// out[i] = x[i] * scalar (f32 compute, out-dtype store).
+void MulScalarKernel(Queue&, Tensor& out, const Tensor& x, double scalar) {
+  const int64_t n = x.Numel();
+  const float s = static_cast<float>(scalar);
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) StoreF32(out, i, LoadF32(x, i) * s);
+  });
+}
+
 void MoeSiluMulKernel(Queue&, Tensor& out, const Tensor& gate, const Tensor& up) {
   const int64_t n = out.Numel();
   // Elementwise: partition the flat output range.
@@ -1866,6 +1892,10 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormQuantFp8Fn>(&RmsNormQuantFp8Kernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
+    RegisterOp(OpId::kGeluAndMul, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<GeluAndMulFn>(&GeluAndMulKernel)));
+    RegisterOp(OpId::kMulScalar, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MulScalarFn>(&MulScalarKernel)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernel)));
     RegisterOp(OpId::kScaledFp4Quant, DeviceType::kCPU,

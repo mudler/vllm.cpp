@@ -189,6 +189,16 @@ enum class OpId : uint8_t {
   // (csrc/libtorch_stable/concat_mla_q.cuh) and `_concat_k_nope_k_pe`
   // (mla_attention.py:2063-2092). See vt::ConcatMlaNopeRope.
   kConcatMlaNopeRope,
+  // Gemma GeGLU activation: gelu_pytorch_tanh(gate) * up — the tanh-approx GELU
+  // on the gate half elementwise-multiplied by the up half. The GeGLU analog of
+  // kSiluAndMul, mirroring vLLM GeluAndMul(approximate="tanh") (activation.py).
+  // NEW for the Gemma family (Gemma 1/2/3/4 MLP).
+  kGeluAndMul,
+  // Elementwise multiply by a runtime scalar: out[i] = x[i] * scalar (f32
+  // compute, out-dtype store). The Gemma embedding normalizer
+  // `embed_tokens(ids) * sqrt(hidden_size)` (gemma3.py:328-341). Additive; no
+  // Qwen/Llama/OPT/GLM model sets it.
+  kMulScalar,
   kCount
 };
 
@@ -535,6 +545,8 @@ using SharedExpertGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
+using GeluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
+using MulScalarFn = void (*)(Queue&, Tensor&, const Tensor&, double);
 using LayerNormFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor*, const Tensor*,
                              const LayerNormArgs&);
 using ReluFn = void (*)(Queue&, Tensor&, const Tensor&);
@@ -1154,6 +1166,19 @@ void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& q_out, Tensor& k_ou
 // out[T,D] = silu(x[:, :D]) * x[:, D:], x is [T, 2D]; out f32 or bf16.
 // Note: computes in f32 (upstream forward_native computes in x's dtype); bf16 parity tests need bf16-eps tolerance.
 void SiluAndMul(Queue& q, Tensor& out, const Tensor& x);
+
+// out[T,D] = gelu_tanh(x[:, :D]) * x[:, D:], x is [T, 2D]; out f32 or bf16.
+// gelu_tanh(a) = 0.5*a*(1 + tanh(sqrt(2/pi)*(a + 0.044715*a^3))) — the exact
+// `gelu_pytorch_tanh` / F.gelu(approximate="tanh"), computed in f32 then stored.
+// Mirrors vLLM GeluAndMul(approximate="tanh") (activation.py NewGELU math). The
+// GeGLU analog of vt::SiluAndMul; the one genuinely-new Gemma compute kernel.
+void GeluAndMul(Queue& q, Tensor& out, const Tensor& x);
+
+// out[i] = x[i] * scalar, elementwise, computed in f32 and rounded to out's
+// dtype (f32/bf16). `scalar` is a runtime double (pass the bf16-rounded value
+// for a bf16-exact match of a torch bf16-scalar multiply). Powers the Gemma
+// embedding normalizer `embed_tokens(ids) * sqrt(hidden_size)` (gemma3.py:341).
+void MulScalar(Queue& q, Tensor& out, const Tensor& x, double scalar);
 
 // out[..,D] = (x - mean(x)) * rsqrt(var(x) + eps) * weight + bias — torch
 // `nn.LayerNorm` over the LAST dim (ported from ATen `native_layer_norm` /

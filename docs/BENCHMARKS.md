@@ -38,6 +38,38 @@ Its regression bar HOLDS on the canonical build: the two gate models stay token-
 (27B `test_qwen27_paged_engine` **235/235** + 35B `test_qwen36_paged_engine` **315/315**),
 unchanged by construction (the RoPE flip lives only in the Qwen3-dense TU).
 
+**Gemma-3 (`Gemma3ForCausalLM`, gemma-3-1b-it) - CORRECTNESS COMPLETE, no speed
+number (2026-07-24, `CLAIM-SWEEP-GEMMA` W0-W2, [spike](../.agents/specs/sweep-gemma.md)).**
+The FIRST Gemma-family model. Disposition: **SPEED PENDING - no throughput measured
+or claimed.** Gate form BY MEASUREMENT: vLLM 0.25.0 per-prompt (batch=1) greedy on
+gemma-3-1b-it is **ALL-DETERMINISTIC over K=5** (0 multi-member (prompt,pos) cells
+across 6x8) => **STRICT token-exact bar**; BOS verified vs the oracle (all prompts
+prepend `bos_token_id=2`). The SACRED gate is TOKENIZER-FREE (gemma's byte_fallback
+BPE tokenizer.json is not validated by our loader - the same `LOAD-SENTENCEPIECE`
+blocker Mistral hit): `test_gemma3_forward` feeds vLLM's EXACT BOS-prefixed prompt
+ids into our CUDA prefill and greedy-decodes by re-prefilling the growing prefix,
+matching the vLLM oracle **48/48 greedy tokens STRICT token-exact** (6 prompts x 8
+steps, 0 near-tie, 0 forward-divergent). This isolates + proves the FORWARD (GeGLU
+`gelu_pytorch_tanh`, dual per-layer RoPE theta, Gemma-RMSNorm sandwich norms,
+sqrt(hidden) embed-scale, query_pre_attn_scalar scaling) - an unapplied primitive
+would emit fluent-WRONG tokens (the OPT failure mode). New-ops unit gate
+`test_ops_activation` **12/12** (20762 assertions; GeGLU bit-exact vs an in-test
+reference at real dims I=6912, MulScalar bf16). Loader `test_gemma3_load` **1/1**
+(1687; all 340 tensors mapped/shaped, tied lm_head, 0 leftover). Registry
+`test_model_registry` **23/23**. Clean full CUDA `-Werror` build **0 warnings**.
+compute-sanitizer memcheck on the gemma forward + `kGeluAndMul`/`kMulScalar`: **0
+errors** (full `test_gemma3_forward` under memcheck; the 48-step forward re-passes 564
+assertions). No decode CUDA-graph (bf16 dense, like qwen3-dense/glm4) => eager-vs-graph N/A.
+**Regressions - the change is additive by construction (new OpIds appended before
+`kCount`, no existing op renumbered; no existing model/kernel/runner/sampler TU
+touched):** EMPIRICAL WITNESS from the clean build - the four fast dense SACRED
+gates that share the op-registry/rmsnorm/silu/rope path re-pass byte-identical:
+**Qwen3-dense 184/184** (0.6B 16/16 + 4B 16/16), **OPT 63/63** (6/6, 96/96 tokens),
+**Llama-3.2-1B 92/92** (16/16), **Mistral forward 30/30**. The big-model gates (27B
+235/235, 35B 315/315, Qwen3-Coder 138/138, DeepSeek-V2-Lite asserts-on 8/8, GLM-4-9B
+16/16, GLM-4.7-Flash 8/8) are byte-identical BY CONSTRUCTION (no shared runtime TU
+touched) and were not re-run this pass (GB10 GPU time).
+
 **GLM-4 dense (`Glm4ForCausalLM`, GLM-4-9B-0414) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2,
 [spike](../.agents/specs/glm-dsa-latest-deepseek.md)).** The first GLM-family model.

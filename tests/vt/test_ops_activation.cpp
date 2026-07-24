@@ -1,6 +1,7 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -41,6 +42,97 @@ TEST_CASE("silu_and_mul bf16 output: same golden within bf16 eps") {
   vt::SiluAndMul(q, to, tx);
   CHECK(vt::BF16ToF32(out[0]) == doctest::Approx(2.193176f).epsilon(0.01));
   CHECK(vt::BF16ToF32(out[1]) == doctest::Approx(7.046377f).epsilon(0.01));
+}
+
+namespace {
+// Independent reference for gelu_pytorch_tanh (the exact math vLLM's
+// GeluAndMul(approximate="tanh") applies), computed in f32.
+float GeluTanhRef(float g) {
+  const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+  return 0.5f * g * (1.0f + std::tanh(inner));
+}
+}  // namespace
+
+TEST_CASE("gelu_and_mul golden (gelu_pytorch_tanh)") {
+  // x=[1,2,3,4], D=2: gate=[1,2], up=[3,4].
+  // gelu_tanh(1)=0.841192, gelu_tanh(2)=1.954598 -> out=[2.523575, 7.818392]
+  std::vector<float> x = {1.0f, 2.0f, 3.0f, 4.0f};
+  std::vector<float> out(2, 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, 4});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, 2});
+  Queue q{Cpu(), nullptr};
+  vt::GeluAndMul(q, to, tx);
+  CHECK(out[0] == doctest::Approx(GeluTanhRef(1.0f) * 3.0f));
+  CHECK(out[1] == doctest::Approx(GeluTanhRef(2.0f) * 4.0f));
+}
+
+TEST_CASE("gelu_and_mul bit-exact vs reference at real Gemma dims") {
+  // Gemma-3-1b intermediate_size = 6912; T rows of [2*I] -> [I]. The CPU kernel
+  // IS the reference impl, so this asserts the kernel matches the independent
+  // formula EXACTLY (f32), bit-for-bit, at the real forward width.
+  const int64_t T = 3, I = 6912;
+  std::vector<float> x(static_cast<size_t>(T * 2 * I));
+  for (size_t n = 0; n < x.size(); ++n)
+    x[n] = std::sin(0.013f * static_cast<float>(n) + 0.5f) * 4.0f;  // spread of magnitudes
+  std::vector<float> out(static_cast<size_t>(T * I), 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {T, 2 * I});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {T, I});
+  Queue q{Cpu(), nullptr};
+  vt::GeluAndMul(q, to, tx);
+  for (int64_t i = 0; i < T; ++i)
+    for (int64_t j = 0; j < I; ++j) {
+      const float g = x[static_cast<size_t>(i * 2 * I + j)];
+      const float up = x[static_cast<size_t>(i * 2 * I + I + j)];
+      CHECK(out[static_cast<size_t>(i * I + j)] == GeluTanhRef(g) * up);  // exact
+    }
+}
+
+TEST_CASE("gelu_and_mul bf16 output within bf16 eps") {
+  std::vector<float> x = {1.0f, 2.0f, 3.0f, 4.0f};
+  std::vector<uint16_t> out(2, 0);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, 4});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {1, 2});
+  Queue q{Cpu(), nullptr};
+  vt::GeluAndMul(q, to, tx);
+  CHECK(vt::BF16ToF32(out[0]) == doctest::Approx(GeluTanhRef(1.0f) * 3.0f).epsilon(0.01));
+  CHECK(vt::BF16ToF32(out[1]) == doctest::Approx(GeluTanhRef(2.0f) * 4.0f).epsilon(0.01));
+}
+
+TEST_CASE("gelu_and_mul rejects odd inner dim") {
+  std::vector<float> x(3, 0.0f);
+  std::vector<float> out(1, 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, 3});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, 1});
+  Queue q{Cpu(), nullptr};
+  CHECK_THROWS_AS(vt::GeluAndMul(q, to, tx), std::runtime_error);
+}
+
+TEST_CASE("mul_scalar: bf16 embedding-normalizer semantics") {
+  // sqrt(1152) rounded to bf16 then multiplied (f32) and rounded to bf16 — the
+  // Gemma embed scale. Assert against the same f32 arithmetic.
+  const double norm = static_cast<double>(vt::BF16ToF32(vt::F32ToBF16(
+      std::sqrt(1152.0f))));  // bf16-rounded sqrt(hidden)
+  std::vector<float> x = {1.0f, -2.5f, 0.25f, 7.0f};
+  std::vector<uint16_t> out(4, 0);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {2, 2});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {2, 2});
+  Queue q{Cpu(), nullptr};
+  vt::MulScalar(q, to, tx, norm);
+  for (int i = 0; i < 4; ++i)
+    CHECK(vt::BF16ToF32(out[i]) ==
+          doctest::Approx(vt::BF16ToF32(vt::F32ToBF16(x[i] * static_cast<float>(norm)))));
+}
+
+TEST_CASE("mul_scalar: f32 exact") {
+  std::vector<float> x = {1.0f, 2.0f, 3.0f};
+  std::vector<float> out(3, 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {3});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {3});
+  Queue q{Cpu(), nullptr};
+  vt::MulScalar(q, to, tx, 2.5);
+  CHECK(out[0] == 2.5f);
+  CHECK(out[1] == 5.0f);
+  CHECK(out[2] == 7.5f);
 }
 
 TEST_CASE("silu_and_mul rejects odd inner dim") {

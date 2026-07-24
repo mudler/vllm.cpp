@@ -1091,6 +1091,27 @@ void SiluAndMul(Queue& q, Tensor& out, const Tensor& x) {
   reinterpret_cast<SiluAndMulFn>(GetOp(OpId::kSiluAndMul, q.device.type))(q, out, x);
 }
 
+void GeluAndMul(Queue& q, Tensor& out, const Tensor& x) {
+  VT_CHECK(x.rank == 2 && out.rank == 2, "gelu_and_mul: rank-2 required");
+  VT_CHECK(x.shape[1] % 2 == 0, "gelu_and_mul: inner dim must be even");
+  VT_CHECK(out.shape[0] == x.shape[0] && out.shape[1] == x.shape[1] / 2,
+           "gelu_and_mul: output shape mismatch");
+  VT_CHECK(IsFloat(x.dtype) && IsOutFloat(out.dtype), "gelu_and_mul: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous(), "gelu_and_mul: contiguous required");
+  VT_CHECK(x.device == out.device && x.device == q.device, "gelu_and_mul: device mismatch");
+  reinterpret_cast<GeluAndMulFn>(GetOp(OpId::kGeluAndMul, q.device.type))(q, out, x);
+}
+
+void MulScalar(Queue& q, Tensor& out, const Tensor& x, double scalar) {
+  VT_CHECK(out.rank == x.rank, "mul_scalar: out rank must match x");
+  for (int i = 0; i < x.rank; ++i)
+    VT_CHECK(out.shape[i] == x.shape[i], "mul_scalar: out shape must match x");
+  VT_CHECK(IsFloat(x.dtype) && IsOutFloat(out.dtype), "mul_scalar: float in, f32/bf16 out");
+  VT_CHECK(x.IsContiguous() && out.IsContiguous(), "mul_scalar: contiguous required");
+  VT_CHECK(x.device == out.device && x.device == q.device, "mul_scalar: device mismatch");
+  reinterpret_cast<MulScalarFn>(GetOp(OpId::kMulScalar, q.device.type))(q, out, x, scalar);
+}
+
 void LayerNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor* weight,
                const Tensor* bias, const LayerNormArgs& args) {
   VT_CHECK(x.rank >= 1 && out.rank == x.rank, "layer_norm: out rank must match x");

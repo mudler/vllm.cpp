@@ -455,6 +455,93 @@ void SiluAndMulKernelCuda(Queue& q, Tensor& out, const Tensor& x) {
 }
 
 // ---------------------------------------------------------------------------
+// gelu_and_mul (Gemma GeGLU): out = gelu_tanh(gate) * up. gelu_tanh is the
+// exact `gelu_pytorch_tanh` / F.gelu(approximate="tanh") — computed in f32 then
+// stored, mirroring vLLM GeluAndMul(approximate="tanh").
+
+template <typename Tin, typename Tout>
+__global__ void GeluAndMulKernel(Tout* out, const Tin* x, int64_t n, int64_t d) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
+       idx += step) {
+    const int64_t i = idx / d;
+    const int64_t j = idx - i * d;
+    const float g = Load(x, i * 2 * d + j);
+    const float up = Load(x, i * 2 * d + d + j);
+    // 0.5*g*(1 + tanh( sqrt(2/pi) * (g + 0.044715*g^3) )); sqrt(2/pi)=0.7978845608...
+    const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+    const float gelu = 0.5f * g * (1.0f + tanhf(inner));
+    Store(out, idx, gelu * up);
+  }
+}
+
+template <typename Tin>
+void LaunchGeluAndMul(cudaStream_t s, Tensor& out, const Tensor& x) {
+  const int64_t t = x.shape[0], d = x.shape[1] / 2;
+  const int64_t n = t * d;
+  if (n == 0) return;
+  switch (out.dtype) {
+    case DType::kF32:
+      GeluAndMulKernel<Tin, float>
+          <<<GridFor(n), kBlock, 0, s>>>(out.Ptr<float>(), x.Ptr<Tin>(), n, d);
+      break;
+    case DType::kBF16:
+      GeluAndMulKernel<Tin, __nv_bfloat16>
+          <<<GridFor(n), kBlock, 0, s>>>(out.Ptr<__nv_bfloat16>(), x.Ptr<Tin>(), n, d);
+      break;
+    default: VT_CHECK(false, "cuda gelu_and_mul: unsupported out dtype");
+  }
+  Check(cudaGetLastError(), "gelu_and_mul launch");
+}
+
+void GeluAndMulKernelCuda(Queue& q, Tensor& out, const Tensor& x) {
+  switch (x.dtype) {
+    case DType::kF32: LaunchGeluAndMul<float>(AsStream(q), out, x); break;
+    case DType::kBF16: LaunchGeluAndMul<__nv_bfloat16>(AsStream(q), out, x); break;
+    default: VT_CHECK(false, "cuda gelu_and_mul: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// mul_scalar: out[i] = x[i] * scalar (f32 compute, out-dtype store). The Gemma
+// embedding normalizer `embed * sqrt(hidden_size)`.
+
+template <typename Tin, typename Tout>
+__global__ void MulScalarKernel(Tout* out, const Tin* x, int64_t n, float scalar) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
+       idx += step)
+    Store(out, idx, Load(x, idx) * scalar);
+}
+
+template <typename Tin>
+void LaunchMulScalar(cudaStream_t s, Tensor& out, const Tensor& x, float scalar) {
+  const int64_t n = x.Numel();
+  if (n == 0) return;
+  switch (out.dtype) {
+    case DType::kF32:
+      MulScalarKernel<Tin, float>
+          <<<GridFor(n), kBlock, 0, s>>>(out.Ptr<float>(), x.Ptr<Tin>(), n, scalar);
+      break;
+    case DType::kBF16:
+      MulScalarKernel<Tin, __nv_bfloat16>
+          <<<GridFor(n), kBlock, 0, s>>>(out.Ptr<__nv_bfloat16>(), x.Ptr<Tin>(), n, scalar);
+      break;
+    default: VT_CHECK(false, "cuda mul_scalar: unsupported out dtype");
+  }
+  Check(cudaGetLastError(), "mul_scalar launch");
+}
+
+void MulScalarKernelCuda(Queue& q, Tensor& out, const Tensor& x, double scalar) {
+  const float s = static_cast<float>(scalar);
+  switch (x.dtype) {
+    case DType::kF32: LaunchMulScalar<float>(AsStream(q), out, x, s); break;
+    case DType::kBF16: LaunchMulScalar<__nv_bfloat16>(AsStream(q), out, x, s); break;
+    default: VT_CHECK(false, "cuda mul_scalar: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // embedding: grid-stride gather. Ids live on the device, so bounds are checked
 // in-kernel: bad ids are clamped for the gather (no OOB read) and the first bad
 // id is recorded in a device-side flag via atomicCAS. The host wrapper
@@ -1221,6 +1308,10 @@ struct Registrar {
                    static_cast<RmsNormQuantFp8Fn>(&RmsNormQuantFp8KernelCuda)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernelCuda)));
+    RegisterOp(OpId::kGeluAndMul, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<GeluAndMulFn>(&GeluAndMulKernelCuda)));
+    RegisterOp(OpId::kMulScalar, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MulScalarFn>(&MulScalarKernelCuda)));
     RegisterOp(OpId::kEmbedding, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelCuda)));
     RegisterOp(OpId::kRopeNeox, DeviceType::kCUDA,

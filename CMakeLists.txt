@@ -451,6 +451,9 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/ernie45.cpp
   src/vllm/entrypoints/openai/tool_parsers/gigachat3.cpp
   src/vllm/entrypoints/openai/tool_parsers/olmo3.cpp
+  src/vllm/entrypoints/openai/tool_parsers/lfm2.cpp
+  src/vllm/entrypoints/openai/tool_parsers/poolside_v1.cpp
+  src/vllm/entrypoints/openai/tool_parsers/functiongemma.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp

@@ -110,6 +110,25 @@ time owns the GB10. Results without the lock for their entire run are discarded.
 
 ## Active claims
 
+**MTP coordination note (2026-07-24, `CLAIM-MTP-I1-HEAD-ORACLE`, DONE).**
+Increment I1 of the MTP campaign closed **M-mtp-0**: it captured the draft-head
+oracle golden on both gate checkpoints and turned the previously SKIP'd parity
+case green. It is recorded here as a note rather than in the claims table
+because that table is reserved for rows in `SPIKE`/`ACTIVE` and `SPEC-MTP`
+legitimately **stays `GATING`** (no e2e spec-decode loop exists yet). Scope was
+additive/test-only — `src/` and `include/` untouched; owned files were
+`tools/parity/dump_qwen3_5_mtp.py`, the MTP runner + focused case in
+`tests/parity/test_op_parity.cpp`, and the new goldens
+`tests/parity/goldens/qwen3_5_mtp_head_{27b,35b}/`. Worktree
+`/home/mudler/_git/wt-mtp-i1` (branch `mtp-i1-head-oracle`, base `origin/main`
+`f887c34`), dgx tree `~/mtp_i1` transferred by `git archive`, every GPU stage
+under `flock $HOME/gpu.lock` on a verified-idle GPU. **Concurrent-work note:** a
+sibling agent owns the scheduler-side spec plumbing on `mtp-i2-scheduler`
+(`src/vllm/v1/core/sched/*`, `include/vllm/v1/request.h`,
+`include/vllm/v1/worker/gpu/input_batch.*`, `include/vllm/config/speculative.h`,
+the engine-core spec paths); none of those were touched here. Evidence: the
+parity-ledger row and the `.agents/state.md` entry of the same date.
+
 **Docs coordination note (2026-07-23, `CLAIM-DOCS-README-HOUSE-STYLE`, DONE).**
 A docs-and-policy-only change (no area-matrix work row, so it is recorded here as
 a note rather than in the claims table, which is reserved for rows in
@@ -450,7 +469,7 @@ items a-runner/b stay with the async/GDN `runner.cpp` owners.
 | 6 | `BACKEND-GATE-CUDA-SGLANG` | `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT`, then `SERVE-ASYNC-LLM` | run the binding c1-c16 campaign only after both dependencies close | `BLOCKED` |
 | 7 | `BACKEND-GATE-CUDA-SGLANG-PREFIX` | accepted shared-prefix extension; PX1 can proceed, while binding execution depends on exact SGLang v0.5.15 equivalence, a dedicated `KV-MAMBA-ALIGN` spike/implementation and `SERVE-ASYNC-LLM` | after the priority 27B cache-off parity grid/trace, implement the deterministic 64k/256k corpus and counters, write then execute the Mamba-align retention leaf, prove cache hits/no eviction, and bind every axis to the faster equivalent vLLM/SGLang result before 35B | `READY` |
 | 8 | C2/C4 models + quantizations | accepted comprehensive inventories | `MODEL-FACTORY-registry` and `QUANT-GGUF-CPU-THREADPOOL` are implemented and `GATING`: the registry awaits its exact two-model GPU greedy/performance/memory handoff after `CLAIM-SERVE-GATE-1`; the threadpool has 1/3/20 determinism + TSAN evidence but still needs the exclusive-idle-host B4 ≥10x/RSS series. Both claims are released. Keep-quant loader + CIQ GEMM follow that CPU checkpoint, then Llama dense | `GATING` |
-| 9 | C3/C5/C7/C8 engine/API work | C3/C5/C6 specs accepted; C7/C8 leaf specs missing | C3 M-mtp-0 remains `GATING` on its GPU recipe. All C5 W1-W8 implementation leaves are now `GATING`; restored feature-positive model rows, CUDA/runtime/oracle/trace and every-axis campaigns remain. An idle GPU still gates runtime closure; then spike C7/C8 | `GATING` |
+| 9 | C3/C5/C7/C8 engine/API work | C3/C5/C6 specs accepted; C7/C8 leaf specs missing | C3 **M-mtp-0 is CLOSED (2026-07-24, `CLAIM-MTP-I1-HEAD-ORACLE`)** — the standalone MTP draft head is oracle-parity-proven on both gate checkpoints; `SPEC-MTP` stays `GATING` on M-mtp-1..4 (scheduler plumbing, greedy rejection, GDN spec slots, k>1, CUDA graphs). All C5 W1-W8 implementation leaves are now `GATING`; restored feature-positive model rows, CUDA/runtime/oracle/trace and every-axis campaigns remain. An idle GPU still gates runtime closure; then spike C7/C8 | `GATING` |
 | 10 | D1 backend expansion | accepted backend/CUDA inventory + vt seam | spike architecture spine, then NVIDIA fan-out, ROCm, MLX, Vulkan, XPU | `SPIKE` |
 | 11 | `ENG-EXPERT-STREAM` (D4 first leaf) | corrected spike accepted after live Marlin/loader verification | claim W0 nsys + fresh c1 baseline; then W1 CPU cache policy and W2 bank-only loader/reader/pread as independent performance checkpoints before W3 dispatch | `READY` |
 

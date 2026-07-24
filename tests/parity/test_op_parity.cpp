@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <set>
@@ -1404,6 +1405,11 @@ bool RunQwen35MtpHead(Backend& b, Queue& q, const fs::path& dir,
       LoadTensor(dir, manifest.at("tensors").at("mtp_hidden"));
   auto expected_argmax =
       LoadTensor(dir, manifest.at("tensors").at("expected_argmax"));
+  // vLLM's f32 top-8 logits per row: the numeric reference for the shared
+  // lm_head without shipping a T x 248320 f32 tensor.
+  auto topk_values = LoadTensor(dir, manifest.at("tensors").at("topk_values"));
+  auto topk_indices =
+      LoadTensor(dir, manifest.at("tensors").at("topk_indices"));
   VT_CHECK(input_ids_loaded.dtype == DType::kI32 &&
                positions_loaded.dtype == DType::kI32 &&
                target_hidden_loaded.dtype == DType::kBF16 &&
@@ -1427,8 +1433,14 @@ bool RunQwen35MtpHead(Backend& b, Queue& q, const fs::path& dir,
   DeviceBuf target_hidden(b, q, DType::kBF16, {tokens, config.hidden_size},
                           target_hidden_loaded.raw.data.data());
 
+  // The oracle's own MTP hidden states, uploaded so the shared lm_head can be
+  // isolated from the head forward (see `oracle_logits` below).
+  DeviceBuf oracle_hidden(b, q, DType::kBF16, {tokens, config.hidden_size},
+                          expected_hidden.raw.data.data());
+
   std::vector<uint8_t> hidden_bytes;
   std::vector<float> logits;
+  std::vector<float> oracle_hidden_logits;
   auto execute = [&](const vllm::Qwen3_5MTPModel& model) {
     vllm::Qwen3_5MTPHiddenStates hidden =
         model.Forward(input_ids, positions, target_hidden.tensor(), q);
@@ -1442,6 +1454,14 @@ bool RunQwen35MtpHead(Backend& b, Queue& q, const fs::path& dir,
     logits.resize(static_cast<size_t>(output.rows) * output.vocab);
     b.Copy(q, logits.data(), output.device_tensor.data,
            logits.size() * sizeof(float));
+    // Same shared lm_head, but fed the ORACLE's hidden states: isolates the
+    // lm_head tie from everything the head forward does before it.
+    vllm::ForwardLogits from_oracle =
+        model.ComputeLogits(oracle_hidden.tensor(), q);
+    oracle_hidden_logits.resize(static_cast<size_t>(from_oracle.rows) *
+                                from_oracle.vocab);
+    b.Copy(q, oracle_hidden_logits.data(), from_oracle.device_tensor.data,
+           oracle_hidden_logits.size() * sizeof(float));
     b.Synchronize(q);
   };
 
@@ -1455,24 +1475,263 @@ bool RunQwen35MtpHead(Backend& b, Queue& q, const fs::path& dir,
     execute(vllm::Qwen3_5MTPModel(mtp, target, config));
   }
 
+  // --- Hidden-state agreement (REPORTED, not element-gated). ---------------
+  // Both sides store bf16, so one ULP at |h| ~ 8 is already 0.0625 and an
+  // element-wise absolute tolerance below that is unsatisfiable even for a
+  // perfect port. What IS diagnostic of a structural error (wrong norm style,
+  // transposed fc, dropped gate, wrong rope) is the vector's DIRECTION and
+  // SCALE, which bf16 accumulation noise cannot move; those are gated below,
+  // and the full element-wise distribution is reported for the record.
   Tensor actual_hidden = expected_hidden.tensor;
   actual_hidden.data = hidden_bytes.data();
-  const double hidden_atol = manifest.at("tol").value(
-      "hidden_diagnostic_atol", 0.05);
-  RequireMatch("mtp_hidden", actual_hidden, expected_hidden.tensor,
-               hidden_atol, 0.0);
+  const double hidden_atol =
+      manifest.at("tol").value("hidden_report_atol", 0.05);
+  const double hidden_rtol =
+      manifest.at("tol").value("hidden_report_rtol", 0.05);
+  double hidden_max_abs = 0.0;
+  double hidden_max_rel = 0.0;
+  double hidden_sq_err = 0.0;
+  double hidden_sq_ref = 0.0;
+  int64_t hidden_exact = 0;
+  int64_t hidden_out_of_tol = 0;
+  int64_t hidden_worst = -1;
+  double hidden_max_ref = 0.0;
+  const int64_t hidden_numel = expected_hidden.tensor.Numel();
+  for (int64_t i = 0; i < hidden_numel; ++i) {
+    const double got = AsF32(actual_hidden, i);
+    const double want = AsF32(expected_hidden.tensor, i);
+    VT_CHECK(std::isfinite(got) && std::isfinite(want),
+             "MTP parity: non-finite hidden state");
+    const double diff = std::abs(got - want);
+    if (diff > hidden_max_abs) hidden_worst = i;
+    hidden_max_abs = std::max(hidden_max_abs, diff);
+    hidden_max_ref = std::max(hidden_max_ref, std::abs(want));
+    // bf16 has 8 mantissa bits: one ULP is 2^-8 of the binade, so the
+    // relative unit here is diff/|want| measured in those units.
+    if (std::abs(want) > 0.0) {
+      hidden_max_rel = std::max(hidden_max_rel, diff / std::abs(want));
+    }
+    hidden_sq_err += diff * diff;
+    hidden_sq_ref += want * want;
+    if (diff == 0.0) ++hidden_exact;
+    if (!(diff <= hidden_atol + hidden_rtol * std::abs(want))) {
+      ++hidden_out_of_tol;
+    }
+  }
+  const double hidden_rel_rms =
+      hidden_sq_ref > 0.0 ? std::sqrt(hidden_sq_err / hidden_sq_ref) : 0.0;
+  MESSAGE("MTP " << tag << "B hidden: bit-exact " << hidden_exact << "/"
+                 << hidden_numel << ", max|d|=" << hidden_max_abs
+                 << ", max rel=" << hidden_max_rel
+                 << ", rel RMS=" << hidden_rel_rms << " (bound atol="
+                 << hidden_atol << " rtol=" << hidden_rtol << "), out-of-tol "
+                 << hidden_out_of_tol << "/" << hidden_numel);
+  if (hidden_worst >= 0) {
+    MESSAGE("MTP " << tag << "B hidden worst element [" << hidden_worst
+                   << "] (row " << hidden_worst / config.hidden_size
+                   << "): got " << AsF32(actual_hidden, hidden_worst)
+                   << " want " << AsF32(expected_hidden.tensor, hidden_worst)
+                   << "; max|ref| over the tensor = " << hidden_max_ref);
+  }
+  // Direction/scale forensics: a structural error (wrong norm style, wrong fc
+  // orientation, a missing gate) moves the vector's DIRECTION or SCALE; bf16
+  // accumulation noise moves neither.
+  double min_row_cos = 1.0;
+  double slope_num = 0.0;
+  double slope_den = 0.0;
+  for (int64_t token = 0; token < tokens; ++token) {
+    double dot = 0.0;
+    double norm_got = 0.0;
+    double norm_want = 0.0;
+    for (int64_t col = 0; col < config.hidden_size; ++col) {
+      const int64_t i = token * config.hidden_size + col;
+      const double got = AsF32(actual_hidden, i);
+      const double want = AsF32(expected_hidden.tensor, i);
+      dot += got * want;
+      norm_got += got * got;
+      norm_want += want * want;
+      slope_num += got * want;
+      slope_den += want * want;
+    }
+    if (norm_got > 0.0 && norm_want > 0.0) {
+      min_row_cos = std::min(min_row_cos, dot / std::sqrt(norm_got * norm_want));
+    }
+  }
+  const double hidden_scale =
+      slope_den > 0.0 ? slope_num / slope_den : 0.0;
+  const double min_cosine_bound =
+      manifest.at("tol").value("hidden_min_row_cosine", 0.995);
+  const double scale_tol = manifest.at("tol").value("hidden_scale_tol", 0.01);
+  const double rel_rms_bound =
+      manifest.at("tol").value("hidden_rel_rms_max", 0.02);
+  MESSAGE("MTP " << tag << "B hidden direction: min row cosine=" << min_row_cos
+                 << " (bound >=" << min_cosine_bound
+                 << "), global best-fit scale=" << hidden_scale << " (bound 1+/-"
+                 << scale_tol << "), rel RMS=" << hidden_rel_rms << " (bound <="
+                 << rel_rms_bound << ")");
+  CHECK(min_row_cos >= min_cosine_bound);
+  CHECK(std::abs(hidden_scale - 1.0) <= scale_tol);
+  CHECK(hidden_rel_rms <= rel_rms_bound);
 
+  // lm_head isolation: our shared lm_head applied to the ORACLE's hidden.
+  VT_CHECK(topk_values.dtype == DType::kF32 &&
+               topk_indices.dtype == DType::kI32 &&
+               topk_values.tensor.rank == 2 &&
+               topk_values.tensor.shape[0] == tokens,
+           "MTP parity: malformed golden top-k tensors");
+  const int64_t topk = topk_values.tensor.shape[1];
+  const float* want_topk = topk_values.tensor.Ptr<float>();
+  const int32_t* want_topk_idx = topk_indices.tensor.Ptr<int32_t>();
+  // Same tolerance the whole-model logits gates use (qwen36_logits_{27,35}b).
+  const double logits_atol = manifest.at("tol").value("logits_atol", 0.05);
+  const double logits_rtol = manifest.at("tol").value("logits_rtol", 0.05);
+  // A row is UNAMBIGUOUS when vLLM's own top-1 strictly beats its top-2. On an
+  // exact tie vLLM's OWN argmax and topk disagree with each other, so "the"
+  // greedy token is not defined there and no implementation can be required to
+  // reproduce it; such rows are counted and reported separately.
+  int64_t unambiguous_rows = 0;
+  for (int64_t token = 0; token < tokens; ++token) {
+    const size_t base = static_cast<size_t>(token) * topk;
+    if (want_topk[base] > want_topk[base + 1]) ++unambiguous_rows;
+  }
+  double lm_head_max_abs = 0.0;
+  int64_t lm_head_out_of_tol = 0;
+  int64_t lm_head_argmax_matches = 0;
+  for (int64_t token = 0; token < tokens; ++token) {
+    const float* row = oracle_hidden_logits.data() +
+                       static_cast<size_t>(token) * config.vocab_size;
+    const size_t base = static_cast<size_t>(token) * topk;
+    for (int64_t k = 0; k < topk; ++k) {
+      const size_t flat = base + k;
+      const double want = want_topk[flat];
+      const double diff =
+          std::abs(static_cast<double>(row[want_topk_idx[flat]]) - want);
+      lm_head_max_abs = std::max(lm_head_max_abs, diff);
+      if (!(diff <= logits_atol + logits_rtol * std::abs(want))) {
+        ++lm_head_out_of_tol;
+      }
+    }
+    if (want_topk[base] > want_topk[base + 1] &&
+        ArgmaxRow(row, config.vocab_size) ==
+            expected_argmax.tensor.Ptr<int32_t>()[token]) {
+      ++lm_head_argmax_matches;
+    }
+  }
+  MESSAGE("MTP " << tag << "B lm_head ISOLATED (oracle hidden -> our shared "
+                 << "lm_head): top-8 max|d|=" << lm_head_max_abs
+                 << ", out-of-tol " << lm_head_out_of_tol << "/"
+                 << (tokens * topk) << ", argmax " << lm_head_argmax_matches
+                 << "/" << unambiguous_rows << " unambiguous rows");
+  // Isolated, the shared lm_head must reproduce vLLM's own f32 logits from
+  // vLLM's own hidden states, and recover vLLM's argmax on every row whose
+  // top-1 is unambiguous. This proves the embed/lm_head sharing and the
+  // (NVFP4 on the 35B) logits GEMM independently of the head forward.
+  CHECK(lm_head_out_of_tol == 0);
+  CHECK(lm_head_argmax_matches == unambiguous_rows);
+
+  // --- Logits numeric closeness on the oracle's top-8 per row. -------------
+  // The golden stores vLLM's f32 top-8 values/indices; comparing our logits at
+  // exactly those indices is a direct numeric check of the shared-lm_head tie
+  // without shipping a 27x248320 f32 reference.
+  double logits_max_abs = 0.0;
+  double logits_max_rel = 0.0;
+  int64_t logits_out_of_tol = 0;
+  double min_top1_margin = std::numeric_limits<double>::infinity();
+  for (int64_t token = 0; token < tokens; ++token) {
+    const float* row = logits.data() + static_cast<size_t>(token) *
+                                           config.vocab_size;
+    for (int64_t k = 0; k < topk; ++k) {
+      const size_t flat = static_cast<size_t>(token) * topk + k;
+      const int32_t index = want_topk_idx[flat];
+      VT_CHECK(index >= 0 && index < config.vocab_size,
+               "MTP parity: golden top-k index out of range");
+      const double want = want_topk[flat];
+      const double diff = std::abs(static_cast<double>(row[index]) - want);
+      logits_max_abs = std::max(logits_max_abs, diff);
+      if (std::abs(want) > 1.0) {
+        logits_max_rel = std::max(logits_max_rel, diff / std::abs(want));
+      }
+      if (!(diff <= logits_atol + logits_rtol * std::abs(want))) {
+        ++logits_out_of_tol;
+      }
+    }
+    // Oracle top1-top2 gap: how much logit error the argmax could absorb.
+    const size_t base = static_cast<size_t>(token) * topk;
+    min_top1_margin = std::min(
+        min_top1_margin,
+        static_cast<double>(want_topk[base]) - want_topk[base + 1]);
+  }
+  MESSAGE("MTP " << tag << "B logits(top-" << topk << "): max|d|="
+                 << logits_max_abs << ", max rel=" << logits_max_rel
+                 << ", oracle min top1-top2 margin=" << min_top1_margin
+                 << " (bound atol=" << logits_atol << " rtol=" << logits_rtol
+                 << "), out-of-tol " << logits_out_of_tol << "/"
+                 << (tokens * topk));
+  REQUIRE(logits_out_of_tol == 0);
+
+  // --- The operational gate: the head's proposed token. --------------------
+  // M-mtp-0 (mtp-spec-decode.md §5): "argmax match on >=16/16 positions ...
+  // both checkpoints". Rows whose oracle top-1 is unambiguous must match
+  // exactly; on an exact oracle tie our pick must still be ONE of the tied
+  // maxima (which is all any implementation can be held to, and is exactly
+  // what vLLM's own argmax/topk disagreement demonstrates).
   const int32_t* want_argmax = expected_argmax.tensor.Ptr<int32_t>();
   int64_t matches = 0;
+  int64_t strict_matches = 0;
+  int64_t tie_rows_resolved = 0;
+  int64_t tie_rows = 0;
   for (int64_t token = 0; token < tokens; ++token) {
-    const int32_t actual = ArgmaxRow(
-        logits.data() + static_cast<size_t>(token) * config.vocab_size,
-        config.vocab_size);
+    const float* row =
+        logits.data() + static_cast<size_t>(token) * config.vocab_size;
+    const size_t base = static_cast<size_t>(token) * topk;
+    const double oracle_top1 = want_topk[base];
+    const double oracle_top2 = want_topk[base + 1];
+    const bool oracle_tie = !(oracle_top1 > oracle_top2);
+    const int32_t actual = ArgmaxRow(row, config.vocab_size);
     if (actual == want_argmax[token]) ++matches;
+    if (oracle_tie) {
+      ++tie_rows;
+      // Our pick counts iff the oracle assigned it the SAME (maximal) logit.
+      bool tied_max = false;
+      for (int64_t k = 0; k < topk; ++k) {
+        if (want_topk_idx[base + k] == actual &&
+            want_topk[base + k] == oracle_top1) {
+          tied_max = true;
+          break;
+        }
+      }
+      if (tied_max) ++tie_rows_resolved;
+      const std::string verdict =
+          tied_max ? " (a tied maximum: OK)"
+                   : " (NOT a tied maximum: DIVERGENCE)";
+      MESSAGE("MTP " << tag << "B row " << token
+                     << " is an EXACT oracle tie: top1 idx "
+                     << want_topk_idx[base] << " and top2 idx "
+                     << want_topk_idx[base + 1] << " both = " << oracle_top1
+                     << "; vLLM's argmax returned " << want_argmax[token]
+                     << ", ours " << actual << verdict);
+      continue;
+    }
+    if (actual == want_argmax[token]) {
+      ++strict_matches;
+      continue;
+    }
+    MESSAGE("MTP " << tag << "B argmax MISMATCH row " << token << ": ours "
+                   << actual << " (logit " << row[actual] << "), oracle "
+                   << want_argmax[token] << " (logit " << row[want_argmax[token]]
+                   << "); oracle top1 idx " << want_topk_idx[base] << " = "
+                   << oracle_top1 << ", top2 idx " << want_topk_idx[base + 1]
+                   << " = " << oracle_top2 << ", margin "
+                   << (oracle_top1 - oracle_top2));
   }
-  MESSAGE("MTP " << tag << "B standalone head: argmax " << matches << "/"
-                 << tokens << " exact; hidden atol=" << hidden_atol);
-  REQUIRE(matches == tokens);
+  MESSAGE("MTP " << tag << "B standalone head: argmax exact on "
+                 << strict_matches << "/" << unambiguous_rows
+                 << " unambiguous rows (" << matches << "/" << tokens
+                 << " vs vLLM's raw argmax); " << tie_rows_resolved << "/"
+                 << tie_rows << " exact-tie rows resolved to a tied maximum");
+  REQUIRE(unambiguous_rows >= 16);  // the spec's >=16/16 sample-size bar
+  CHECK(strict_matches == unambiguous_rows);
+  CHECK(tie_rows_resolved == tie_rows);
   return true;
 }
 

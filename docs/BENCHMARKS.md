@@ -446,6 +446,31 @@ today) and per-recipe fast kernels. The Metal (2026-07-22) and Vulkan (2026-07-2
 realizations are DONE at skeleton level - both register one `kFusedChain` interpreter and
 inherit the whole catalog, both tiers checked against the CPU oracle.
 
+### MTP draft-head oracle parity, M-mtp-0 (2026-07-24, `CLAIM-MTP-I1-HEAD-ORACLE`) - correctness only, NOT APPLICABLE
+
+**Benchmark disposition: NOT APPLICABLE - correctness increment, no performance
+claim, `benchmark_binding=false`.** M-mtp-0 captures the Qwen3.5/3.6 MTP
+draft-head oracle golden on BOTH gate checkpoints and turns the previously
+SKIP'd parity case green. It is an **op-level** parity check against a dumped
+vLLM oracle (`speculative_config={"method":"mtp","num_speculative_tokens":1}`,
+`enforce_eager=True`, vLLM 0.25.0 whose `qwen3_5_mtp.py` is byte-identical to
+the pin `e24d1b24`), **not** a token-generation SACRED gate and **not** a
+speculative-decoding speed result: no spec-decode loop exists yet, so there is
+nothing to benchmark. Gate GREEN, 20/20 assertions, both checkpoints
+(`VLLM_MTP_REQUIRE_CHECKPOINTS=1`): argmax exact on 26/26 unambiguous rows each
+(the one remaining row per checkpoint is an exact oracle top1==top2 tie where
+vLLM's own `argmax` and `topk` disagree, and our pick is a tied maximum);
+logits 0/216 out of tolerance at atol 0.05 + rtol 0.05 (the same bound
+`qwen36_logits_{27,35}b` use); shared lm_head isolated bit-exact on the 35B;
+compute-sanitizer memcheck 0 errors. The change is additive/test-only (`src/`
+and `include/` untouched), so the binding 27B 235/235 and 35B 315/315 SACRED
+gates and every published throughput number are unaffected by construction and
+were not re-run. **Next benchmark owed:** M-mtp-1 / M-mtp-2 (27B then 35B k=1
+greedy e2e), whose honest denominator is vLLM **with the same speculative
+config** at both the latency and throughput operating points
+(mtp-spec-decode.md §5). Reproduce the correctness gate with
+`ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/mtp_i1 && VLLM_MTP_REQUIRE_CHECKPOINTS=1 ./build-cuda/tests/test_op_parity -tc=\"qwen3.5 MTP standalone head parity*\" -s"'`.
+
 ### Accelerator-seam `S4` - LinearMethod / QuantizationConfig seam (2026-07-23, `CLAIM-BACKEND-SEAM-S4-1`) - byte-identical, NOT APPLICABLE
 
 **Benchmark disposition: NOT APPLICABLE - structural refactor, no performance claim.**

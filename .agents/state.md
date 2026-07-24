@@ -21812,3 +21812,96 @@ assume them: first-decode-step spec padding (`-1` placeholders /
 `num_spec_tokens_to_schedule` / `num_invalid_spec_tokens`), the dynamic-SD
 lookup, the async `update_draft_token_ids_in_output` path, and grammar
 validation of proposed drafts.
+## 2026-07-24 — M-mtp-0 CLOSED: MTP draft-head oracle parity GREEN on both gate checkpoints (`SPEC-MTP`)
+
+**Claim `CLAIM-MTP-I1-HEAD-ORACLE`.** Base `origin/main` `f887c34`, worktree
+`/home/mudler/_git/wt-mtp-i1` (branch `mtp-i1-head-oracle`), dgx tree `~/mtp_i1`
+(transferred by `git archive`, never rsync). Increment I1 of the MTP campaign:
+capture the M-mtp-0 oracle golden and turn the SKIP'd parity case green, BEFORE
+any spec-decode loop is built on top of the head.
+
+**Scope is additive/test-only.** `git diff --name-only` contains no `src/` or
+`include/` path: only `tests/parity/test_op_parity.cpp`,
+`tools/parity/dump_qwen3_5_mtp.py`, and two new golden directories. The 27B
+235/235 and 35B 315/315 SACRED gates and the fast dense gates are therefore
+byte-identical by construction and were NOT re-run — stated, not implied.
+
+**Oracle capture.** The pre-existing harness `tools/parity/dump_qwen3_5_mtp.py`
+had never produced a golden and, run as-is, failed with "no >=16-row real
+Qwen3_5MTP forward was captured". RCA: both gate checkpoints declare
+`*ForConditionalGeneration`, so vLLM 0.25.0's speculator takes its multimodal
+branch and calls the draft model with `input_ids=None` plus a prebuilt
+`inputs_embeds` (`v1/spec_decode/llm_base_proposer.py:962-991`), and the
+harness's capture predicate required a tensor `input_ids`. Fix: also patch
+`Qwen3_5MTP.embed_input_ids`, which the proposer calls with the real ids one
+line earlier (`:971`), recover the ids there, and refuse to write a golden
+unless the recovered ids cover the whole forward (so cudagraph padding rows can
+never poison it; `enforce_eager=True` makes that hold). Two other operational
+notes: the flashinfer JIT needs `~/venvs/vllm-oracle/bin` on `PATH` (`ninja`)
+under a non-interactive ssh shell, and `gpu_memory_utilization` was kept at
+**0.35** per the unified-memory OOM hazard.
+
+**Provenance.** Oracle = the installed vLLM **0.25.0** executable whose
+`qwen3_5_mtp.py` is byte-identical to the pin `e24d1b24` (md5
+`fbc42adca54090f7be1d685e1ee624cf` on the wheel, the pinned tree, and
+`dgx:~/work/vllm-pin`, whose `PIN` file reads
+`e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`), so the harness's AST drift guard is
+exact rather than approximate. Config
+`{"method":"mtp","num_speculative_tokens":1}`, `enforce_eager=True`,
+`max_model_len=256`, `max_num_seqs=1`, one 27-token natural-language prompt.
+Snapshots: `unsloth/Qwen3.6-27B-NVFP4` `890bdef7a42feba6d83b6e17a03315c694112f2a`
+and `nvidia/Qwen3.6-35B-A3B-NVFP4` `491c2f1ea524c639598bf8fa787a93fed5a6fbce`.
+
+**RESULT — GREEN on both, 20/20 assertions.** This is an OP-LEVEL parity check
+against a dumped oracle, not a token-generation SACRED gate. Per checkpoint,
+27 rows: argmax exact on **26/26 unambiguous rows**; logits within
+atol 0.05 + rtol 0.05 (the whole-model bound) **0/216 out-of-tol**, max |d|
+0.159 (27B) / 0.125 (35B); shared lm_head isolated **bit-exact on the 35B**
+(0.062 on the 27B); hidden-state min row cosine 0.99949 / 0.99863, best-fit
+scale 0.99969 / 0.99996, relative RMS 0.95 % / 1.20 %; compute-sanitizer
+memcheck **0 errors**.
+
+**The one divergent row per checkpoint is an EXACT oracle tie, not a
+divergence.** 27B row 0: vLLM's f32 logits have `2279` and `279` both at
+**14.375 bit-for-bit**; 35B row 7: `31890` and `13311` both at **20.25**. On
+those rows vLLM's own `argmax` and its own `topk` disagree with each other
+(`argmax` returns the higher index's rival, `topk` ranks the other first), so
+"the" greedy token is undefined there; our pick is a tied maximum. Every other
+row has an oracle top1-top2 margin >= 0.125, and we match all of them. The gate
+encodes exactly this: exact match on unambiguous rows, tied-maximum membership
+on tie rows, plus the spec's >=16 sample-size bar (26 >= 16).
+
+**Why the hidden state is gated on direction/scale, not element-wise.** Both
+sides store bf16, so one ULP at |h| ~ 8 is already 0.0625 and the harness's
+original `hidden_diagnostic_atol: 0.05` (rtol 0) was unsatisfiable even for a
+perfect port — it is the check that first went red. Rather than widen a number
+until it passed, the check was replaced with the invariants a structural error
+(wrong norm style, transposed `fc`, dropped gate, wrong rope) actually moves:
+per-row cosine, global best-fit scale, and relative RMS, all reported with
+their measured values. The element-wise distribution is still printed for the
+record (370/138240 on the 27B and 798/55296 on the 35B exceed atol 0.05 +
+rtol 0.05, concentrated in high-magnitude channels). The lm_head-isolated check
+is what makes this conclusive: fed vLLM's OWN hidden states, our shared lm_head
+reproduces vLLM's f32 top-8 bit-exactly on the 35B and recovers vLLM's argmax on
+every unambiguous row, so the residual logit error is attributable to bf16
+accumulation inside the head forward and not to the tie or the GEMM.
+
+**bf16-unquant carve-out verified.** Read straight from the safetensors
+headers: exactly **15** `mtp.*` tensors on the 27B and **19** on the 35B, **all
+BF16**, matching spec §1. Correction to the spec's premise: at these snapshots
+the quant configs DO exempt them (27B `compressed-tensors` `re:^mtp\..*`; 35B
+`MIXED_PRECISION` `mtp*`, `mtp.layers.0*`), so the upstream `mtp.fc` gotcha is
+not live here. Our loader is unconditional regardless: every `mtp.*` tensor goes
+through `LoadBf16Direct`/`LoadBf16RawNK`
+(`src/vllm/model_executor/models/qwen3_5_mtp.cpp:35,48`), which hard-fails on
+any non-BF16 dtype, so a quantized path cannot be taken silently.
+
+**Next (resume here).** `SPEC-MTP` stays `GATING`. M-mtp-1 (27B k=1 greedy e2e,
+including the GDN spec-slot mechanism), then M-mtp-2 (35B), M-mtp-3 (k>1 +
+stochastic rejection), M-mtp-4 (CUDA graphs). A sibling agent owns the
+scheduler-side plumbing on branch `mtp-i2-scheduler`
+(`src/vllm/v1/core/sched/*`, `include/vllm/v1/request.h`,
+`include/vllm/v1/worker/gpu/input_batch.*`, `include/vllm/config/speculative.h`,
+engine-core spec paths) — do not touch those from the model/parity layer.
+Reproduce the gate with:
+`ssh dgx.casa 'flock $HOME/gpu.lock bash -lc "cd ~/mtp_i1 && VLLM_MTP_REQUIRE_CHECKPOINTS=1 ./build-cuda/tests/test_op_parity -tc=\"qwen3.5 MTP standalone head parity*\" -s"'`

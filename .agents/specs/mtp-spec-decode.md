@@ -361,11 +361,66 @@ concurrency (bs-decay, B5: 4.0×→1.9× c1→c32 on a 9B) — gate at BOTH the
 latency operating point (low concurrency, where vLLM's own defaults enable
 spec) and the throughput gate concurrency, mirroring vLLM's behavior at each.
 
-- **M-mtp-0 — weights + head parity (no engine changes).** Load `mtp.*` on
-  both models; run the MTP head standalone on captured target hidden states;
-  token-exact vs a vLLM-oracle script driving `Qwen3_5MTP` on the same inputs.
-  Gate: argmax match on ≥16/16 positions across a natural-language prompt set,
-  both checkpoints.
+- **M-mtp-0 — weights + head parity (no engine changes). CLOSED 2026-07-24.**
+  Load `mtp.*` on both models; run the MTP head standalone on captured target
+  hidden states; compare against a vLLM-oracle capture of `Qwen3_5MTP` on the
+  same inputs. Gate: argmax match on ≥16/16 positions across a natural-language
+  prompt set, both checkpoints.
+  **RESULT — op-level parity against a dumped oracle, NOT a token-generation
+  SACRED gate.** Oracle: the installed vLLM 0.25.0 executable whose
+  `qwen3_5_mtp.py` is byte-identical to the pin `e24d1b24` (md5
+  `fbc42adca54090f7be1d685e1ee624cf` on the wheel, the pinned tree and
+  `dgx:~/work/vllm-pin`), driven with
+  `speculative_config={"method":"mtp","num_speculative_tokens":1}`,
+  `enforce_eager=True`, one 27-token natural-language prompt; the harness
+  intercepts the first real `Qwen3_5MTP.forward` and stores its exact draft
+  inputs and outputs. Goldens
+  `tests/parity/goldens/qwen3_5_mtp_head_{27b,35b}/`, consumed by the focused
+  case `tests/parity/test_op_parity.cpp:1914` (runner `:1373`), 20/20
+  assertions with `VLLM_MTP_REQUIRE_CHECKPOINTS=1`. Both checkpoints, 27 rows:
+  - **argmax exact on 26/26 rows whose oracle top-1 is unambiguous.** The one
+    remaining row per checkpoint (27B row 0, 35B row 7) is an **EXACT oracle
+    top1==top2 tie** — 14.375 == 14.375 and 20.25 == 20.25 bit-for-bit in
+    vLLM's own f32 logits, where vLLM's *own* `argmax` and `topk` disagree with
+    each other. Our pick equals the oracle's `topk` top-1, i.e. a tied maximum,
+    so that row carries no correctness information. Every other row has an
+    oracle margin ≥ 0.125.
+  - **logits within the whole-model bound** (atol 0.05 + rtol 0.05, the exact
+    tolerance `qwen36_logits_{27,35}b` use): **0/216 out of tolerance on both**;
+    max |Δ| 0.159 (27B, rel 1.5 %) and 0.125 (35B, rel 0.78 %) over vLLM's
+    top-8 per row.
+  - **shared lm_head isolated** (vLLM's own hidden states → our shared
+    `lm_head`): **bit-exact on the 35B** (max |Δ| = 0, argmax 26/26) and
+    max |Δ| 0.062 on the 27B (bf16 GEMM ordering; argmax 26/26). This proves
+    the `load_eagle_model` embed/lm_head sharing and the NVFP4 logits GEMM
+    independently of the head forward.
+  - **hidden states** are bf16 on both sides, so an element-wise absolute bound
+    below one ULP (0.0625 at |h| ≈ 8) is unsatisfiable even for a perfect port;
+    the gate is therefore on direction and scale, which a structural error
+    (wrong norm style, transposed `fc`, dropped gate, wrong rope) would move:
+    min per-row cosine **0.99949** (27B) / **0.99863** (35B), global best-fit
+    scale **0.99969** / **0.99996**, relative RMS **0.95 %** / **1.20 %**.
+    Reported for the record, not gated: 370/138240 (27B) and 798/55296 (35B)
+    elements exceed atol 0.05 + rtol 0.05, concentrated in the high-magnitude
+    channels.
+  - compute-sanitizer memcheck over both heads: **0 errors** (gate still 20/20
+    under the sanitizer). `test_mtp_speculator` 7/7 cases / 141 assertions.
+  - **bf16-unquant carve-out verified from the checkpoints**: 27B has exactly
+    15 `mtp.*` tensors and the 35B exactly 19, **all BF16** in the safetensors
+    headers. Correction to §1's premise: at these snapshots the quant configs
+    DO exempt them (27B `compressed-tensors` exclude `re:^mtp\..*`; 35B
+    `MIXED_PRECISION` exclude `mtp*`, `mtp.layers.0*`), so the upstream
+    `mtp.fc` gotcha is not live here — and our loader is unconditional anyway:
+    every `mtp.*` tensor goes through `LoadBf16Direct`/`LoadBf16RawNK`
+    (`src/vllm/model_executor/models/qwen3_5_mtp.cpp:35,48`), which hard-fails
+    on any non-BF16 dtype, so a quantized path cannot be taken silently.
+  - **Harness note (upstream drift found and handled):** both gate checkpoints
+    declare `*ForConditionalGeneration`, so vLLM 0.25.0's speculator takes its
+    multimodal branch and calls the draft with `input_ids=None` plus a prebuilt
+    `inputs_embeds` (`v1/spec_decode/llm_base_proposer.py:962-991`). The dump
+    tool therefore also patches `Qwen3_5MTP.embed_input_ids` (called with the
+    real ids one line earlier, `:971`) and recovers the token ids from there,
+    refusing to write a golden unless the recovered ids cover the whole forward.
 - **M-mtp-1 — 27B k=1 greedy e2e (includes the GDN spec path — see §0).**
   Scheduler plumbing + prepare-prefill kernel + greedy rejection + GDN slot
   mechanism (k+1=2 slots). **I2 (scheduler-half) is LANDED — see §2.7 for the

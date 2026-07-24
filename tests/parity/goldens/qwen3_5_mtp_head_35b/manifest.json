@@ -1,0 +1,107 @@
+{
+ "op": "qwen3_5_mtp_head",
+ "args": {
+  "model": "/home/mudler/.cache/huggingface/hub/models--nvidia--Qwen3.6-35B-A3B-NVFP4/snapshots/491c2f1ea524c639598bf8fa787a93fed5a6fbce",
+  "tag": "35b",
+  "prompt": "Modern computing evolved from mechanical calculators through vacuum tubes, transistors, integrated circuits, and massively parallel processors used for scientific simulations.",
+  "tokens": 27,
+  "hidden_size": 2048,
+  "vocab_size": 248320,
+  "mtp_num_hidden_layers": 1,
+  "positions_layout": "[3, 27] equal rows -> row 0",
+  "input_ids_source": "embed_input_ids(self.input_ids[:num_tokens])",
+  "speculative_config": {
+   "method": "mtp",
+   "num_speculative_tokens": 1
+  },
+  "installed_source": "/home/mudler/venvs/vllm-oracle/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_5_mtp.py",
+  "pinned_forward_ast_verified": true,
+  "installed_loader_drift_allowed": [
+   "load_fused_expert_weights",
+   "load_weights"
+  ],
+  "generated_ids": [
+   733,
+   12503
+  ]
+ },
+ "tensors": {
+  "input_ids": {
+   "file": "input_ids.npy",
+   "dtype": "i32",
+   "shape": [
+    27
+   ]
+  },
+  "positions": {
+   "file": "positions.npy",
+   "dtype": "i32",
+   "shape": [
+    27
+   ]
+  },
+  "target_hidden": {
+   "file": "target_hidden.npy",
+   "dtype": "bf16",
+   "shape": [
+    27,
+    2048
+   ]
+  },
+  "mtp_hidden": {
+   "file": "mtp_hidden.npy",
+   "dtype": "bf16",
+   "shape": [
+    27,
+    2048
+   ]
+  },
+  "expected_argmax": {
+   "file": "expected_argmax.npy",
+   "dtype": "i32",
+   "shape": [
+    27
+   ]
+  },
+  "topk_values": {
+   "file": "topk_values.npy",
+   "dtype": "f32",
+   "shape": [
+    27,
+    8
+   ]
+  },
+  "topk_indices": {
+   "file": "topk_indices.npy",
+   "dtype": "i32",
+   "shape": [
+    27,
+    8
+   ]
+  }
+ },
+ "inputs": [
+  "input_ids",
+  "positions",
+  "target_hidden"
+ ],
+ "outputs": [
+  "mtp_hidden",
+  "expected_argmax"
+ ],
+ "tol": {
+  "argmax": "exact on rows with a nonzero oracle top1-top2 margin; exact-tie rows must select a tied maximum",
+  "logits_atol": 0.05,
+  "logits_rtol": 0.05,
+  "hidden_min_row_cosine": 0.995,
+  "hidden_scale_tol": 0.01,
+  "hidden_rel_rms_max": 0.02,
+  "hidden_report_atol": 0.05,
+  "hidden_report_rtol": 0.05
+ },
+ "oracle": {
+  "vllm_version": "0.25.0",
+  "upstream_pin": "e24d1b24",
+  "torch": "2.11.0"
+ }
+}

@@ -8,14 +8,19 @@ namespace {
 // ORDER MATTERS: first match wins, more specific first. "[THINK]" is the
 // Mistral special-token literal and cannot appear in a <think>-family
 // template; "<think>" is the broad Qwen/DeepSeek-family convention and sits
-// last. Families whose markers are not template-stable (minimax_m2's
+// last. The "<think>" row selects think_auto (NOT deepseek_r1): generic
+// <think> templates include hybrid-thinking families that may answer WITHOUT
+// a think block, and R1 semantics would swallow such answers whole as
+// reasoning; think_auto degrades to plain content when no marker appears and
+// is R1-identical otherwise. R1-style models keep explicit selection.
+// Families whose markers are not template-stable (minimax_m2's
 // end-token-only </think>, olmo3's plain-vocab <think>) stay EXPLICIT-ONLY:
 // a template-level probe cannot distinguish them from deepseek_r1, and
 // deepseek_r1's split behavior is the correct default for a plain
 // <think>...</think> stream.
 constexpr ReasoningParserMarker kReasoningParserMarkers[] = {
     {"mistral", "[THINK]"},
-    {"deepseek_r1", "<think>"},
+    {"think_auto", "<think>"},
 };
 
 constexpr std::size_t kReasoningParserMarkerCount =

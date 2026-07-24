@@ -15,7 +15,7 @@ using vllm::entrypoints::openai::ReasoningParserMarkerTable;
 
 TEST_CASE("reasoning detect: [THINK] selects mistral, <think> selects deepseek_r1") {
   CHECK(DetectReasoningParser("..[THINK]..") == "mistral");
-  CHECK(DetectReasoningParser("..<think>..") == "deepseek_r1");
+  CHECK(DetectReasoningParser("..<think>..") == "think_auto");
 }
 
 TEST_CASE("reasoning detect: [THINK] wins over <think> when both appear") {

@@ -2033,6 +2033,21 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **think_auto reasoning parser (auto-detection default for <think>
+  templates) - `NOT APPLICABLE` (2026-07-24, `CLAIM-THINK-AUTO`).**
+  `benchmark_binding=false`. **Serving-layer semantics fix, no decode-path
+  change.** Live-fire against Qwen3.5-2B exposed that deepseek_r1 semantics
+  (everything before </think> is reasoning) swallow a hybrid-thinking model's
+  MARKERLESS answer whole (content=null). New ORIGINAL think_auto parser
+  (llama.cpp-autoparser-credited rule): no marker => pure content; markers
+  present => R1-identical split (incl. the pre-filled end-only case);
+  streaming decides mode once from the output head with an ambiguity
+  hold-back and primes the base parser on its lone-marker-delta cadence. The
+  "<think>" detection row now selects think_auto; deepseek_r1 stays
+  explicitly selectable for true pre-fill templates. Evidence:
+  test_reasoning_think_auto 6 cases / 18 asserts, reasoning-detect + capi +
+  serving green. No binding number is created, re-based, or invalidated.
+
 - **Per-family structural-tag registry (native-syntax forced tool_choice) -
   `NOT APPLICABLE` (2026-07-24, `CLAIM-STRUCTURAL-TAGS`).**
   `benchmark_binding=false`. **Constraint-selection change, no new kernels.**

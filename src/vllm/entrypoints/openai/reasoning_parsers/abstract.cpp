@@ -7,6 +7,7 @@
 #include <string>
 
 #include "vllm/entrypoints/openai/reasoning_parsers/deepseek_r1.h"
+#include "vllm/entrypoints/openai/reasoning_parsers/think_auto.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/minimax_m2.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/mistral.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/olmo3.h"
@@ -15,6 +16,9 @@
 namespace vllm::entrypoints::openai {
 
 std::unique_ptr<ReasoningParser> get_reasoning_parser(const std::string& name) {
+  if (name == "think_auto") {
+    return std::make_unique<ThinkAutoReasoningParser>();
+  }
   if (name == "deepseek_r1") {
     return std::make_unique<DeepSeekR1ReasoningParser>();
   }

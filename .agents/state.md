@@ -21523,3 +21523,29 @@ mapped family, Hermes-syntax REJECT per non-Hermes family, nullopt asserted
 per unmapped family and mode); test_tool_choice_grammar 4/411 unchanged;
 test_capi 24/167, test_openai_serving 24/333 green — re-verified by the
 integrator after rebase. Authored by a task-scoped subagent.
+
+## 2026-07-24 — think_auto: the auto-detection reasoning default for generic <think> templates (`CLAIM-THINK-AUTO`)
+
+Live-fire against the real Qwen3.5-2B GGUF caught a semantics mismatch the
+unit suites could not: the "<think>" detection row selected deepseek_r1,
+whose (upstream-faithful) rule "text before </think> is reasoning even
+without <think>" is correct ONLY for templates that PRE-FILL the opening
+marker. Qwen3.5 is hybrid-thinking: the model answered WITHOUT any think
+block and R1 semantics classified the ENTIRE answer as reasoning
+(content=null) — the LocalAI e2e failed on an empty Message.
+
+New ORIGINAL packaging-layer parser `think_auto` (llama.cpp's autoparser
+rule, credited): no marker anywhere => pure content; <think>...</think> =>
+R1-identical split; end-only => R1-identical prefix-reasoning. Streaming
+decides the mode ONCE from the output head (think blocks open the turn),
+withholds while the head is an ambiguous prefix of "<think>", then either
+flushes as content or primes the base parser ON ITS OWN CONTRACT (upstream
+basic_parsers cadence: markers arrive as lone deltas — two-step priming:
+lone-marker call then the withheld remainder). Registered as "think_auto";
+the "<think>" detect row retargeted; deepseek_r1 remains explicitly
+selectable for true pre-fill templates.
+
+Evidence: test_reasoning_think_auto 6/18 (markerless-content, full-split,
+end-only, chunked content streaming, atomic-marker think streaming,
+ambiguous-head hold-back + flush), test_reasoning_parser_detect updated,
+test_capi 24/167 and test_openai_serving 24/333 green.

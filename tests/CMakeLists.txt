@@ -177,6 +177,8 @@ vllm_cpp_add_test(test_tool_parser_detect
   vllm/entrypoints/openai/tool_parsers/test_detect.cpp)
 vllm_cpp_add_test(test_reasoning_parser_detect
   vllm/entrypoints/openai/reasoning_parsers/test_detect.cpp)
+vllm_cpp_add_test(test_reasoning_think_auto
+  vllm/entrypoints/openai/reasoning_parsers/test_think_auto.cpp)
 vllm_cpp_add_test(test_deepseek
   vllm/entrypoints/openai/tool_parsers/test_deepseek.cpp)
 vllm_cpp_add_test(test_deepseek_v32

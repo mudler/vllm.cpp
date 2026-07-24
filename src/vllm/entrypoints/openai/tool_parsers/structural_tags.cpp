@@ -12,6 +12,7 @@
 #include "vllm/entrypoints/openai/serving_chat.h"  // ToolsEnabled
 #include "vllm/entrypoints/openai/tool_parsers/deepseek_v3.h"
 #include "vllm/entrypoints/openai/tool_parsers/hermes.h"
+#include "vllm/entrypoints/openai/tool_parsers/kimi_k2.h"
 #include "vllm/entrypoints/openai/tool_parsers/longcat.h"
 #include "vllm/entrypoints/openai/tool_parsers/mistral.h"
 
@@ -164,6 +165,42 @@ nlohmann::json MistralTags(const std::vector<ChatCompletionToolsParam>& tools) {
   return tags;
 }
 
+// Kimi K2 surface (kimi_k2.h / vllm/parser/kimi_k2.py). A call is the SECTION
+// wrapper + one INNER call: `<|tool_calls_section_begin|><|tool_call_begin|>
+// functions.NAME:0 <|tool_call_argument_begin|>{args}<|tool_call_end|>
+// <|tool_calls_section_end|>`. The args ARE a JSON object, so a JSON
+// content_schema expresses the surface (unlike the DSML families). The native id
+// header is baked as `functions.NAME:0` (the index the parser reads back), and a
+// single space separates it from the argument-begin marker (the parser strips
+// the header, so the exact spacing is not load-bearing for extraction).
+//
+// DEVIATION (multi-call `required`, index): like DeepSeek, the flat native tag
+// cannot factor the shared SECTION wrapper out of the inner repetition, so each
+// tag bakes the SECTION begin/end in - a `required` run of >1 call re-emits the
+// section wrapper per call rather than one section around many; and the index is
+// baked `:0` for every tool (a parallel call's real `:1`/`:2` would not match the
+// forced literal). A single call (auto / named / the common `required` case) is
+// byte-faithful; the primary goal - forcing the Kimi markers instead of Hermes -
+// holds for every case. Documented (mirrors DeepSeekV3Tags).
+nlohmann::json KimiK2Tags(const std::vector<ChatCompletionToolsParam>& tools) {
+  const std::string section_begin =
+      KimiK2ToolParser::kToolCallsSectionBeginToken;
+  const std::string section_end = KimiK2ToolParser::kToolCallsSectionEndToken;
+  const std::string call_begin = KimiK2ToolParser::kToolCallBeginToken;
+  const std::string call_end = KimiK2ToolParser::kToolCallEndToken;
+  const std::string arg_begin = KimiK2ToolParser::kToolCallArgumentBeginToken;
+  nlohmann::json tags = nlohmann::json::array();
+  for (const ChatCompletionToolsParam& tool : tools) {
+    nlohmann::json tag = nlohmann::json::object();
+    tag["begin"] = section_begin + call_begin + "functions." +
+                   tool.function.name + ":0 " + arg_begin;
+    tag["content_schema"] = ToolArgumentsSchema(tool.function);
+    tag["end"] = call_end + section_end;
+    tags.push_back(std::move(tag));
+  }
+  return tags;
+}
+
 // ── The registry: parser name -> (auto trigger marker, tag builder) ──────────
 
 struct FamilySpec {
@@ -194,6 +231,17 @@ const std::unordered_map<std::string, FamilySpec>& Registry() {
     // Mistral v11 name-first - trigger on `[TOOL_CALLS]`.
     r.emplace("mistral",
               FamilySpec{MistralToolParser::kBotToken, MistralTags});
+    // DELIBERATELY UNMAPPED (nullopt for every mode), documented in
+    // structural_tags.h COVERAGE: qwen3_coder / qwen3_xml / mimo speak the
+    // Qwen3-Coder per-parameter XML surface (<function=..><parameter=..>..),
+    // which - like the DSML deepseek_v32/v4 families - is not a flat JSON-args
+    // begin/content/end tag. Upstream constrains it with the xgrammar
+    // `qwen_3_coder` builtin, not a flat structural-tag builder, so there is no
+    // family builder to add here.
+    // Kimi K2 - trigger on the section-begin marker.
+    r.emplace("kimi_k2",
+              FamilySpec{KimiK2ToolParser::kToolCallsSectionBeginToken,
+                         KimiK2Tags});
     return r;
   }();
   return registry;

@@ -12,6 +12,8 @@
 #include "vllm/entrypoints/openai/tool_parsers/deepseek_v32.h"
 #include "vllm/entrypoints/openai/tool_parsers/deepseek_v4.h"
 #include "vllm/entrypoints/openai/tool_parsers/functiongemma.h"
+#include "vllm/entrypoints/openai/tool_parsers/glm47.h"
+#include "vllm/entrypoints/openai/tool_parsers/gemma4.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite4.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite_20b_fc.h"
@@ -22,10 +24,12 @@
 #include "vllm/entrypoints/openai/tool_parsers/hunyuan_a13b.h"
 #include "vllm/entrypoints/openai/tool_parsers/internlm.h"
 #include "vllm/entrypoints/openai/tool_parsers/jamba.h"
+#include "vllm/entrypoints/openai/tool_parsers/kimi_k2.h"
 #include "vllm/entrypoints/openai/tool_parsers/hy_v3.h"
 #include "vllm/entrypoints/openai/tool_parsers/lfm2.h"
 #include "vllm/entrypoints/openai/tool_parsers/longcat.h"
 #include "vllm/entrypoints/openai/tool_parsers/minicpm5.h"
+#include "vllm/entrypoints/openai/tool_parsers/minimax_m2.h"
 #include "vllm/entrypoints/openai/tool_parsers/mistral.h"
 #include "vllm/entrypoints/openai/tool_parsers/phi4_mini.h"
 #include "vllm/entrypoints/openai/tool_parsers/poolside_v1.h"
@@ -35,6 +39,8 @@
 #include "vllm/entrypoints/openai/tool_parsers/olmo3.h"
 #include "vllm/entrypoints/openai/tool_parsers/pythonic.h"
 #include "vllm/entrypoints/openai/tool_parsers/qwen3.h"
+#include "vllm/entrypoints/openai/tool_parsers/qwen3_coder.h"
+#include "vllm/entrypoints/openai/tool_parsers/seed_oss.h"
 #include "vllm/entrypoints/openai/tool_parsers/step3.h"
 #include "vllm/entrypoints/openai/tool_parsers/step3p5.h"
 
@@ -160,6 +166,14 @@ std::unique_ptr<ToolParser> get_tool_parser(const std::string& name) {
   if (name == "step3p5") {
     return std::make_unique<Step3p5ToolParser>();
   }
+  // Qwen3-Coder XML surface (qwen3_engine_tool_parser.py registers "qwen3_coder",
+  // "qwen3_xml" and "mimo" onto the same Qwen3EngineToolParser); reimplemented
+  // from the qwen3.py wire format as a text parser (qwen3_coder.h). NOTE: the
+  // existing "qwen3" name above is the Hermes-JSON Qwen variant, a DIFFERENT
+  // dialect - these three names are the XML `<function=…><parameter=…>` surface.
+  if (name == "qwen3_coder" || name == "qwen3_xml" || name == "mimo") {
+    return std::make_unique<Qwen3CoderToolParser>();
+  }
   // olmo3_tool_parser.py: the pythonic-inside-<function_calls> wrapper format.
   if (name == "olmo3") {
     return std::make_unique<Olmo3ToolParser>();
@@ -206,6 +220,37 @@ std::unique_ptr<ToolParser> get_tool_parser(const std::string& name) {
   // <start_function_call>call:NAME{KEY:<escape>VALUE<escape>}<end_function_call>.
   if (name == "functiongemma") {
     return std::make_unique<FunctionGemmaToolParser>();
+  }
+  // kimi_k2.py (name "kimi_k2") - <|tool_calls_section_begin|><|tool_call_begin|>
+  // functions.NAME:IDX <|tool_call_argument_begin|>{args}<|tool_call_end|>
+  // <|tool_calls_section_end|>; the native functions.NAME:IDX header IS the
+  // ToolCall id (reimplemented from the wire format - see kimi_k2.h).
+  if (name == "kimi_k2") {
+    return std::make_unique<KimiK2ToolParser>();
+  }
+  // glm47_moe_tool_parser.py registers Glm47MoeModelToolParser under BOTH "glm45"
+  // and "glm47" (test_glm4_moe_tool_parser asserts both resolve to it). The GLM
+  // XML <tool_call>NAME<arg_key>..<arg_value>..</tool_call> wire surface,
+  // reimplemented from the token-id ParserEngine (see glm47.h).
+  if (name == "glm45" || name == "glm47") {
+    return std::make_unique<Glm47ToolParser>();
+  }
+  // minimax_m2_tool_parser.py (name "minimax_m2") - the <minimax:tool_call> XML
+  // wrapper with <invoke name=..> blocks + <parameter name=..> args (minimax_m2.h).
+  if (name == "minimax_m2") {
+    return std::make_unique<MinimaxM2ToolParser>();
+  }
+  // gemma4.py + gemma4_engine_tool_parser.py (name "gemma4") - Google Gemma4
+  // <|tool_call>call:NAME{KEY:<|"|>VALUE<|"|>,..}<tool_call|> (the native
+  // key:value dialect, reimplemented from the wire format; see gemma4.h).
+  if (name == "gemma4") {
+    return std::make_unique<Gemma4ToolParser>();
+  }
+  // seed_oss.py + seed_oss_engine_tool_parser.py (name "seed_oss") - ByteDance
+  // Seed-OSS: the Qwen3 XML body (<function=..><parameter=..>) wrapped in
+  // <seed:tool_call> (reimplemented from the wire format; see seed_oss.h).
+  if (name == "seed_oss") {
+    return std::make_unique<SeedOssToolParser>();
   }
   return nullptr;
 }

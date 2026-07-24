@@ -21549,3 +21549,39 @@ Evidence: test_reasoning_think_auto 6/18 (markerless-content, full-split,
 end-only, chunked content streaming, atomic-marker think streaming,
 ambiguous-head hold-back + flush), test_reasoning_parser_detect updated,
 test_capi 24/167 and test_openai_serving 24/333 green.
+
+## 2026-07-24 — ENG wave: the six engine-backed families text-reimplemented (`CLAIM-TOOL-PARSERS-ENG`, autoparser-parity program close-out)
+
+Upstream backs qwen3_coder/qwen3_xml/mimo, kimi_k2, glm45/glm47, minimax_m2,
+gemma4 and seed_oss with the token-id ParserEngine (vllm/parser/) — not
+mechanically portable. Four task-scoped subagents REIMPLEMENTED each wire
+format on the text seam (headers say REIMPLEMENTED-FROM-WIRE-FORMAT, grammar
+modules cited), held to the upstream test suites as the fidelity bar:
+qwen3_coder 28 cases/166 asserts (typed anyOf coercion, malformed-XML PR
+regressions), kimi_k2 37/249 (tokenizer-interval streaming reproduced as
+byte-splits at the same intervals — strictly harsher; NATIVE
+functions.NAME:INDEX ids preserved per the upstream asserts), glm 20/60 +
+minimax_m2 22/56 (the engine's coerce_to_schema_type layer rehomed into
+shared utils; hy_v3/poolside unregressed), gemma4 58/117 (all 54 upstream:
+the <|tool_call>call:NAME{...} compact dialect with <|"|> string delimiters),
+seed_oss 19/52 (incl. the #46314 malformed-header regression; Qwen3-XML body
+under seed:-prefixed wrappers).
+
+Structural tags: kimi_k2 = FULL native builder (JSON-args surface;
+grammar-verified accept/terminate + Hermes-reject; multi-call rewrap
+deviation documented like DeepSeek's). qwen3_coder/glm/minimax_m2/gemma4/
+seed_oss = documented nullopt (xgrammar builtins or non-JSON-args surfaces —
+the DSML precedent). Registered dialects: 39; upstream registry coverage is
+now COMPLETE except the three Rust/Harmony-backed families (minimax_m3,
+cohere_command, gpt-oss), descoped by decision.
+
+Detection: +4 rows (kimi_k2 ASCII-pipe section marker — distinct from
+step3's fullwidth bytes; minimax:tool_call; gemma4 <|tool_call>call: —
+prefix-overlaps lfm2 without containment; seed_oss wrapper ORDERED ABOVE
+step3p5's inner <function= row, test-pinned). Explicit-only additions:
+qwen3_coder/qwen3_xml/mimo (byte-identical surface to step3p5) and
+glm45/glm47 (identical to poolside_v1/hy_v3 tags). Integrator repaired two
+keep-both brace artifacts (compile-caught, the recurring merge failure mode).
+
+Evidence: ~135 new doctest cases across six suites green; full affected
+battery green (test_openai_conformance parallel flake, green serially).

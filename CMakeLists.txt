@@ -446,6 +446,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/jamba.cpp
   src/vllm/entrypoints/openai/tool_parsers/step3.cpp
   src/vllm/entrypoints/openai/tool_parsers/step3p5.cpp
+  src/vllm/entrypoints/openai/tool_parsers/qwen3_coder.cpp
   src/vllm/entrypoints/openai/tool_parsers/minicpm5.cpp
   src/vllm/entrypoints/openai/tool_parsers/hy_v3.cpp
   src/vllm/entrypoints/openai/tool_parsers/hunyuan_a13b.cpp
@@ -456,6 +457,11 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/lfm2.cpp
   src/vllm/entrypoints/openai/tool_parsers/poolside_v1.cpp
   src/vllm/entrypoints/openai/tool_parsers/functiongemma.cpp
+  src/vllm/entrypoints/openai/tool_parsers/kimi_k2.cpp
+  src/vllm/entrypoints/openai/tool_parsers/glm47.cpp
+  src/vllm/entrypoints/openai/tool_parsers/minimax_m2.cpp
+  src/vllm/entrypoints/openai/tool_parsers/gemma4.cpp
+  src/vllm/entrypoints/openai/tool_parsers/seed_oss.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp

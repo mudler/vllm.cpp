@@ -28,6 +28,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -90,5 +91,42 @@ std::optional<DeltaMessage> granite_stream_emit(
     bool& current_tool_name_sent, std::vector<std::string>& streamed_args_for_tool,
     const std::vector<nlohmann::ordered_json>& tool_call_arr,
     const std::vector<bool>& is_complete);
+
+// ── Schema-aware type coercion (the parser-ENGINE seam) ─────────────────────
+// Ported from vllm/tool_parsers/utils.py:498/571/184 (extract_types_from_schema,
+// coerce_to_schema_type, find_tool_properties) + the ParserEngine schema
+// correction (parser_engine.py:_coerce_dict/_fix_arg_types). These back the
+// GLM-4.5/4.7 and MiniMax-M2 wire reimplementations, whose upstream parsers are
+// the token-id ParserEngine: each raw string argument value is coerced against
+// its JSON-Schema type BY THE ENGINE (not by the family's arg_converter, which
+// only emits raw strings). This is a DIFFERENT coercion from hy_v3/poolside's
+// json.loads->literal->raw `_deserialize`; keep them distinct.
+
+// utils.py:498. All JSON-Schema type strings a schema can produce: the `type`
+// field (string or list), `enum` value inference, and recursive anyOf/oneOf/
+// allOf. Returns {"string"} when nothing type-bearing is present.
+std::set<std::string> extract_types_from_schema(const nlohmann::json& schema);
+
+// utils.py:571. Best-effort coercion of a raw string `value` to one of the given
+// schema `types` (aliases normalized), trying priority null > integer > number >
+// boolean > object > array > string and returning the first success; the raw
+// string otherwise. Non-finite numeric results (inf/nan) are rejected back to the
+// string so the emitted JSON stays valid.
+nlohmann::ordered_json coerce_to_schema_type(const std::string& value,
+                                             const std::set<std::string>& types);
+
+// utils.py:184. The named function tool's `parameters.properties` object, or an
+// empty object when the tool/params/properties are absent.
+nlohmann::json find_tool_properties(
+    const std::optional<std::vector<ChatCompletionToolsParam>>& tools,
+    const std::string& tool_name);
+
+// parser_engine.py:_coerce_dict (one entry). Coerce a single raw string arg value
+// against `properties[key]`, mirroring `_fix_arg_types`: coerce ONLY when the
+// property is present AND is a schema object; otherwise the value stays the raw
+// string (untyped keys, or no schema at all, are left as-is).
+nlohmann::ordered_json coerce_arg_value(const std::string& raw_value,
+                                        const nlohmann::json& properties,
+                                        const std::string& key);
 
 }  // namespace vllm::entrypoints::openai

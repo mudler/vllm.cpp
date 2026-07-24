@@ -45,7 +45,14 @@ namespace {
 //     tool_parser option): granite4, pythonic, xlam, deepseek_v31,
 //     poolside_v1 (bare <tool_call> + inner tags colliding with hy_v3),
 //     hunyuan_a13b (block-identical to jamba), ernie45 (marker-identical to
-//     hermes), GigaChat 3.0's header form (3.1's <|function_call|> is rowed).
+//     hermes), GigaChat 3.0's header form (3.1's <|function_call|> is rowed),
+//     qwen3_coder/qwen3_xml/mimo (surface byte-identical to step3p5's), and
+//     glm45/glm47 (surface identical to poolside_v1/hy_v3's arg tags).
+//   - ENG-wave ordering: seed_oss's wrapper row must precede step3p5's
+//     "<function=" (seed output contains that inner marker); gemma4's
+//     "<|tool_call>call:" shares a prefix with lfm2's "<|tool_call_start|>"
+//     but neither contains the other; kimi's ASCII pipes are distinct from
+//     step3's fullwidth ones.
 constexpr ToolParserMarker kToolParserMarkers[] = {
     {"longcat", "<longcat_tool_call>"},
     {"deepseek_v3", "<｜tool▁calls▁begin｜>"},
@@ -65,6 +72,10 @@ constexpr ToolParserMarker kToolParserMarkers[] = {
     {"functiongemma", "<start_function_call>"},
     {"apertus", "<|tools_prefix|>"},
     {"gigachat3", "<|function_call|>"},
+    {"kimi_k2", "<|tool_calls_section_begin|>"},
+    {"minimax_m2", "<minimax:tool_call>"},
+    {"gemma4", "<|tool_call>call:"},
+    {"seed_oss", "<seed:tool_call>"},
     {"jamba", "<tool_calls>"},
     {"hy_v3", "<tool_calls"},
     {"step3p5", "<function="},

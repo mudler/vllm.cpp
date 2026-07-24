@@ -2033,6 +2033,28 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **ENG wave: the six engine-backed vLLM families text-reimplemented -
+  `NOT APPLICABLE` (2026-07-24, `CLAIM-TOOL-PARSERS-ENG`).**
+  `benchmark_binding=false`. **Serving-layer parsing additions, no decode-path
+  change.** Upstream backs qwen3_coder/qwen3_xml/mimo, kimi_k2, glm45/glm47,
+  minimax_m2, gemma4 and seed_oss with a token-id ParserEngine; these are
+  REIMPLEMENTED from their wire formats on the text seam (documented as such,
+  grammar modules cited) and held to the upstream test suites: qwen3_coder
+  28 cases (incl. the malformed-XML PR regressions + typed anyOf coercion),
+  kimi_k2 37 (tokenizer-interval streaming reproduced as harsher byte
+  splits; native functions.NAME:INDEX ids preserved), glm 20 + minimax_m2 22
+  (the engine's schema-coercion layer rehomed into shared utils; hy_v3/
+  poolside unregressed), gemma4 58 (all 54 upstream), seed_oss 19 (incl. the
+  #46314 regression). Structural tags: kimi_k2 gains a full native builder
+  (grammar-verified, Hermes-rejecting); the rest are documented nullopt
+  (xgrammar-builtin or non-JSON-args surfaces, the DSML precedent).
+  Detection: +4 rows (kimi, minimax_m2, gemma4, seed_oss - the seed wrapper
+  ordered above step3p5's inner marker, test-pinned); qwen3_coder and glm
+  are explicit-only (surfaces byte-identical to step3p5/poolside). 39
+  registered dialects total. Full affected battery green (the conformance
+  parallel flake green serially). No binding number is created, re-based, or
+  invalidated.
+
 - **think_auto reasoning parser (auto-detection default for <think>
   templates) - `NOT APPLICABLE` (2026-07-24, `CLAIM-THINK-AUTO`).**
   `benchmark_binding=false`. **Serving-layer semantics fix, no decode-path

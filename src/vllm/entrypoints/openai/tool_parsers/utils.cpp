@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -425,6 +428,228 @@ std::optional<DeltaMessage> granite_stream_emit(
   // granite_tool_parser.py:248 - self.prev_tool_call_arr = tool_call_arr.
   prev_tool_call_arr = tool_call_arr;
   return delta;
+}
+
+// ── Schema-aware type coercion (utils.h) ────────────────────────────────────
+
+namespace {
+
+// Trim leading/trailing ASCII whitespace (Python str.strip()).
+std::string Strip(const std::string& s) {
+  std::size_t b = 0;
+  std::size_t e = s.size();
+  while (b < e && IsJsonSpace(s[b])) ++b;
+  while (e > b && IsJsonSpace(s[e - 1])) --e;
+  return s.substr(b, e - b);
+}
+
+// utils.py:544-568 (_TYPE_ALIASES) + coerce_to_schema_type's key normalization
+// (t.strip().lower()). Maps alias type strings onto the seven JSON-Schema types.
+std::string NormalizeTypeKey(const std::string& raw) {
+  std::string t = Strip(raw);
+  for (char& c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  static const std::vector<std::pair<std::string, std::string>> kAliases = {
+      {"str", "string"},     {"text", "string"},    {"varchar", "string"},
+      {"char", "string"},    {"enum", "string"},    {"int", "integer"},
+      {"int32", "integer"},  {"int64", "integer"},  {"uint", "integer"},
+      {"uint32", "integer"}, {"uint64", "integer"}, {"long", "integer"},
+      {"short", "integer"},  {"unsigned", "integer"}, {"float", "number"},
+      {"float32", "number"}, {"float64", "number"}, {"double", "number"},
+      {"bool", "boolean"},   {"dict", "object"},    {"arr", "array"},
+      {"list", "array"},     {"sequence", "array"},
+  };
+  for (const auto& kv : kAliases) {
+    if (t == kv.first) return kv.second;
+  }
+  return t;
+}
+
+// Whether a parsed JSON value is free of non-finite floats (inf/nan), recursing
+// into arrays/objects. json.dumps of Infinity/NaN is invalid JSON, so upstream
+// (utils.py _is_json_finite) rejects such values back to the raw string.
+bool IsJsonFinite(const nlohmann::ordered_json& v) {
+  if (v.is_number_float()) {
+    const double d = v.get<double>();
+    return std::isfinite(d);
+  }
+  if (v.is_array() || v.is_object()) {
+    for (auto it = v.begin(); it != v.end(); ++it) {
+      if (!IsJsonFinite(it.value())) return false;
+    }
+  }
+  return true;
+}
+
+// int(value) / float(value) accept surrounding ASCII whitespace but no interior
+// junk. Strict decimal parse of the stripped string (optional sign).
+std::optional<long long> StrictInt(const std::string& value) {
+  const std::string t = Strip(value);
+  if (t.empty()) return std::nullopt;
+  std::size_t idx = 0;
+  try {
+    const long long v = std::stoll(t, &idx);
+    if (idx != t.size()) return std::nullopt;
+    return v;
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+std::optional<double> StrictFloat(const std::string& value) {
+  const std::string t = Strip(value);
+  if (t.empty()) return std::nullopt;
+  std::size_t idx = 0;
+  try {
+    const double v = std::stod(t, &idx);
+    if (idx != t.size()) return std::nullopt;
+    return v;
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+}  // namespace
+
+std::set<std::string> extract_types_from_schema(const nlohmann::json& schema) {
+  if (!schema.is_object()) return {"string"};
+  std::set<std::string> types;
+
+  if (schema.contains("type")) {
+    const nlohmann::json& tv = schema.at("type");
+    if (tv.is_string()) {
+      types.insert(tv.get<std::string>());
+    } else if (tv.is_array()) {
+      for (const nlohmann::json& t : tv) {
+        if (t.is_string()) types.insert(t.get<std::string>());
+      }
+    }
+  }
+
+  if (schema.contains("enum") && schema.at("enum").is_array() &&
+      !schema.at("enum").empty()) {
+    for (const nlohmann::json& value : schema.at("enum")) {
+      if (value.is_null()) {
+        types.insert("null");
+      } else if (value.is_boolean()) {
+        types.insert("boolean");
+      } else if (value.is_number_integer() || value.is_number_unsigned()) {
+        types.insert("integer");
+      } else if (value.is_number_float()) {
+        types.insert("number");
+      } else if (value.is_string()) {
+        types.insert("string");
+      } else if (value.is_array()) {
+        types.insert("array");
+      } else if (value.is_object()) {
+        types.insert("object");
+      }
+    }
+  }
+
+  for (const char* choice_field : {"anyOf", "oneOf", "allOf"}) {
+    if (schema.contains(choice_field) && schema.at(choice_field).is_array()) {
+      for (const nlohmann::json& choice : schema.at(choice_field)) {
+        const std::set<std::string> sub = extract_types_from_schema(choice);
+        types.insert(sub.begin(), sub.end());
+      }
+    }
+  }
+
+  if (types.empty()) return {"string"};
+  return types;
+}
+
+nlohmann::ordered_json coerce_to_schema_type(const std::string& value,
+                                             const std::set<std::string>& types) {
+  std::set<std::string> normalized;
+  for (const std::string& t : types) normalized.insert(NormalizeTypeKey(t));
+
+  // Priority: null > integer > number > boolean > object > array > string.
+  static const char* kPriority[] = {"null",    "integer", "number", "boolean",
+                                    "object",  "array",   "string"};
+  for (const char* candidate : kPriority) {
+    if (normalized.find(candidate) == normalized.end()) continue;
+    const std::string cand(candidate);
+    if (cand == "null") {
+      std::string lower = value;
+      for (char& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (lower == "null") return nlohmann::ordered_json(nullptr);
+      continue;
+    }
+    if (cand == "string") {
+      return nlohmann::ordered_json(value);
+    }
+    if (cand == "integer") {
+      const std::optional<long long> i = StrictInt(value);
+      if (i.has_value()) return nlohmann::ordered_json(static_cast<std::int64_t>(*i));
+      continue;
+    }
+    if (cand == "number") {
+      const std::optional<double> d = StrictFloat(value);
+      if (!d.has_value() || !std::isfinite(*d)) continue;
+      // val if val != int(val) else int(val).
+      if (*d == static_cast<double>(static_cast<long long>(*d))) {
+        return nlohmann::ordered_json(static_cast<std::int64_t>(*d));
+      }
+      return nlohmann::ordered_json(*d);
+    }
+    if (cand == "boolean") {
+      std::string lower = Strip(value);
+      for (char& c : lower)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (lower == "true" || lower == "1") return nlohmann::ordered_json(true);
+      if (lower == "false" || lower == "0") return nlohmann::ordered_json(false);
+      continue;
+    }
+    if (cand == "object" || cand == "array") {
+      try {
+        nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(value);
+        if (IsJsonFinite(parsed)) return parsed;
+      } catch (const std::exception&) {
+        // fall through to next candidate.
+      }
+      continue;
+    }
+  }
+
+  // Fallback: json.loads(value), rejecting non-finite results back to the string.
+  try {
+    nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(value);
+    if (!IsJsonFinite(parsed)) return nlohmann::ordered_json(value);
+    return parsed;
+  } catch (const std::exception&) {
+    return nlohmann::ordered_json(value);
+  }
+}
+
+nlohmann::json find_tool_properties(
+    const std::optional<std::vector<ChatCompletionToolsParam>>& tools,
+    const std::string& tool_name) {
+  if (!tools.has_value()) return nlohmann::json::object();
+  for (const ChatCompletionToolsParam& tool : *tools) {
+    if (tool.function.name != tool_name) continue;
+    if (!tool.function.parameters.has_value()) return nlohmann::json::object();
+    const nlohmann::json& params = *tool.function.parameters;
+    if (!params.is_object() || !params.contains("properties")) {
+      return nlohmann::json::object();
+    }
+    const nlohmann::json& props = params.at("properties");
+    if (!props.is_object()) return nlohmann::json::object();
+    return props;
+  }
+  return nlohmann::json::object();
+}
+
+nlohmann::ordered_json coerce_arg_value(const std::string& raw_value,
+                                        const nlohmann::json& properties,
+                                        const std::string& key) {
+  if (properties.is_object() && properties.contains(key) &&
+      properties.at(key).is_object()) {
+    return coerce_to_schema_type(raw_value,
+                                 extract_types_from_schema(properties.at(key)));
+  }
+  return nlohmann::ordered_json(raw_value);
 }
 
 }  // namespace vllm::entrypoints::openai

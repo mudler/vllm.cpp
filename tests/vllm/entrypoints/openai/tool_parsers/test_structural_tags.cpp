@@ -279,6 +279,14 @@ TEST_CASE("structural tags: mistral family ([TOOL_CALLS]name{args}, v11)") {
              /*non_hermes=*/true});
 }
 
+TEST_CASE("structural tags: kimi_k2 family (section+call markers, JSON args)") {
+  RunFamily({"kimi_k2", "<|tool_calls_section_begin|>",
+             "<|tool_calls_section_begin|><|tool_call_begin|>functions."
+             "get_weather:0 <|tool_call_argument_begin|>{\"city\":\"Paris\"}"
+             "<|tool_call_end|><|tool_calls_section_end|>",
+             /*non_hermes=*/true});
+}
+
 // ── NULLOPT families: no expressible tag surface -> NO constraint (documented) ─
 TEST_CASE("structural tags: DSML + non-taggable families are nullopt") {
   // Every mode (auto/required/named) must yield nullopt for a family with no
@@ -288,6 +296,15 @@ TEST_CASE("structural tags: DSML + non-taggable families are nullopt") {
       "xlam",         "granite",       "granite4",     "granite-20b-fc",
       "phi4_mini_json", "internlm",    "jamba",        "step3",
       "step3p5",      "minicpm5",      "hy_v3",        "olmo3",
+      "qwen3_coder",  "qwen3_xml",     "mimo",
+      // GLM (glm_4_7 xgrammar builtin) + MiniMax-M2 (minimax_xml content): both
+      // are per-argument XML surfaces a flat JSON content_schema cannot express.
+      "glm45",        "glm47",         "minimax_m2",
+      // gemma4's native key:value dialect (KEY:<|"|>VALUE<|"|>) and seed_oss's
+      // <parameter=..> XML body are NOT JSON args objects a content_schema can
+      // express; both parsers set structural_tag_model=None upstream. Same
+      // deepseek_v32/step3p5 precedent -> nullopt for every mode.
+      "gemma4",       "seed_oss",
       "",             "not_a_parser",
   };
   for (const std::string& fam : nullopt_families) {

@@ -124,3 +124,14 @@ TEST_CASE("detect: wave B4 families resolve from their template markers") {
   // gigachat's piped literal must not shadow granite-20b-fc's plain one.
   CHECK(DetectToolParser("..<function_call>..") == "granite-20b-fc");
 }
+
+TEST_CASE("detect: ENG-wave families resolve from their template markers") {
+  CHECK(DetectToolParser("..<|tool_calls_section_begin|>..") == "kimi_k2");
+  CHECK(DetectToolParser("..<minimax:tool_call>..") == "minimax_m2");
+  CHECK(DetectToolParser("..<|tool_call>call:get..") == "gemma4");
+  CHECK(DetectToolParser("..<seed:tool_call>..<function=f>..") == "seed_oss");
+  // seed_oss's wrapper must beat step3p5's inner "<function=" row.
+  CHECK(DetectToolParser("<seed:tool_call><function=f>") != "step3p5");
+  // gemma4 and lfm2 share a "<|tool_call" prefix but stay distinct.
+  CHECK(DetectToolParser("..<|tool_call_start|>..") == "lfm2");
+}

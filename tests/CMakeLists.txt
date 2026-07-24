@@ -187,6 +187,8 @@ vllm_cpp_add_test(test_deepseek_v4
   vllm/entrypoints/openai/tool_parsers/test_deepseek_v4.cpp)
 vllm_cpp_add_test(test_longcat
   vllm/entrypoints/openai/tool_parsers/test_longcat.cpp)
+vllm_cpp_add_test(test_kimi_k2
+  vllm/entrypoints/openai/tool_parsers/test_kimi_k2.cpp)
 vllm_cpp_add_test(test_granite_tool_parser
   vllm/entrypoints/openai/tool_parsers/test_granite_tool_parser.cpp)
 vllm_cpp_add_test(test_granite4_tool_parser
@@ -229,6 +231,8 @@ vllm_cpp_add_test(test_tool_parser_step3
   vllm/entrypoints/openai/tool_parsers/test_step3.cpp)
 vllm_cpp_add_test(test_tool_parser_step3p5
   vllm/entrypoints/openai/tool_parsers/test_step3p5.cpp)
+vllm_cpp_add_test(test_tool_parser_qwen3_coder
+  vllm/entrypoints/openai/tool_parsers/test_qwen3_coder.cpp)
 vllm_cpp_add_test(test_tool_parser_minicpm5
   vllm/entrypoints/openai/tool_parsers/test_minicpm5.cpp)
 vllm_cpp_add_test(test_tool_parser_hy_v3
@@ -249,6 +253,14 @@ vllm_cpp_add_test(test_tool_parser_poolside_v1
   vllm/entrypoints/openai/tool_parsers/test_poolside_v1.cpp)
 vllm_cpp_add_test(test_tool_parser_functiongemma
   vllm/entrypoints/openai/tool_parsers/test_functiongemma.cpp)
+vllm_cpp_add_test(test_glm47
+  vllm/entrypoints/openai/tool_parsers/test_glm47.cpp)
+vllm_cpp_add_test(test_minimax_m2_tool
+  vllm/entrypoints/openai/tool_parsers/test_minimax_m2_tool.cpp)
+vllm_cpp_add_test(test_tool_parser_gemma4
+  vllm/entrypoints/openai/tool_parsers/test_gemma4.cpp)
+vllm_cpp_add_test(test_tool_parser_seed_oss
+  vllm/entrypoints/openai/tool_parsers/test_seed_oss.cpp)
 vllm_cpp_add_test(test_chat_template vllm/entrypoints/test_chat_template.cpp)
 # The real Qwen3.5 chat template (extracted from the GGUF) lives under
 # tests/fixtures/; hand its absolute path to the test so it resolves regardless

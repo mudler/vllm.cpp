@@ -43,11 +43,34 @@
 //   deepseek_v3          -> full  (deepseek_r1 markers + ```json fence)
 //   deepseek_v31         -> full  (deepseek markers, args after the separator)
 //   mistral              -> full  (`[TOOL_CALLS]<name>{args}`, v11 name-first)
+//   kimi_k2              -> full  (section+call markers, args a JSON object;
+//       `functions.NAME:0` id + section wrapper baked - single-call faithful,
+//       multi-call `required` re-wraps per call, same as DeepSeek's deviation)
 // Families that return NULLOPT for every mode (documented at their site):
 //   deepseek_v32, deepseek_v4 -> the DSML per-parameter XML surface
 //       (<｜DSML｜parameter name=..>..) is NOT a JSON args object, so a JSON
 //       content_schema cannot express it. Upstream uses a full xgrammar builtin
 //       grammar we do not port; a flat native structural tag cannot represent it.
+//   qwen3_coder, qwen3_xml, mimo -> the Qwen3-Coder XML surface
+//       (<function=NAME><parameter=KEY>VALUE</parameter>..) has the same defeat
+//       as DSML: each parameter is its OWN <parameter=..> element, so the
+//       per-call content is NOT a single JSON args object a content_schema can
+//       express. Upstream drives it through the xgrammar `qwen_3_coder` BUILTIN
+//       (structural_tag_registry.py XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS), NOT
+//       a _VLLM_STRUCTURAL_TAG_REGISTRY flat-tag builder, so there is no flat
+//       begin/content/end shape to mirror - nullopt for every mode, exactly the
+//       deepseek_v32 precedent.
+//   glm45, glm47 -> the GLM per-argument XML surface (<arg_key>K</arg_key>
+//       <arg_value>V</arg_value>) is the same per-arg-XML shape as DSML, NOT a JSON
+//       args object. Upstream's structural_tag_model is the `glm_4_7` XGRAMMAR
+//       BUILTIN grammar (not a vLLM-owned tag builder we could mirror); a flat
+//       native structural tag cannot represent per-arg XML. Same precedent as
+//       deepseek_v32.
+//   minimax_m2 -> upstream DOES register a `minimax` tag builder, but its
+//       per-parameter content uses xgrammar's `minimax_xml` style (it renders the
+//       JSON schema AS <parameter name=..>..</parameter> XML, not a JSON args
+//       object). The flat native tag's JSON content_schema cannot express that
+//       per-argument XML, so nullopt - same per-arg-XML precedent as GLM/DSML.
 //   pythonic, llama4_pythonic -> Python bracket call grammar (`[fn(a=1)]`), not
 //       a taggable begin/end surface.
 //   xlam                 -> multi-envelope (fenced / [TOOL_CALLS] / bare-list),

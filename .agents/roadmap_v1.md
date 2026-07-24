@@ -89,7 +89,15 @@ sweep: Metal/MLX (M4), Intel XPU, Vulkan, CPU-opt (benchmark vs llama.cpp, steal
 OPT-125m, Llama-3.2-1B, Mistral-7B, Gemma-1/2/3, GLM-4-9B, GLM-4.7-Flash, DeepSeek-V2-Lite (MLA),
 and now **OLMo-2 (`Olmo2ForCausalLM`/`Olmo3ForCausalLM`, SACRED 16/16, ZERO new kernels)** all
 landed with passing SACRED gates; OLMo-2's `Olmo3ForCausalLM` alias + Olmo-3 sliding-window e2e
-(W5) and every landed model's speed close remain.
+(W5) and every landed model's speed close remain. **NEXT-TIER BATCH TRIAGE (2026-07-24,
+`sweep-recent-dense-batch.md`, `CLAIM-SWEEP-RECENT-DENSE`):** 8 recent dense/small-MoE families
+advanced `INVENTORIED` -> `SPIKE` with a ranked one-agent-each queue — **4 ZERO-NEW-KERNEL
+near-additive** (Phi-3/Phi-4 `Phi3ForCausalLM` a Llama subclass, Granite-3 4-scalar-multipliers,
+StableLM LayerNorm+partial-rope, MiniCPM scalars) + 4 small-new-op (InternLM2 wqkv-split,
+Command-R logit_scale+parallel-residual, Phi-1/2 NewGELU-unary, MiniCPM3 MLA-rewire). **TOP 3 to
+implement next: OLMo-3 (nearly-free W5 on the landed olmo2 row), Phi-3/Phi-4, Granite-3.** Falcon /
+Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as MoE/SSM campaigns; the
+pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no 0.25.0 oracle.
 
 ## Top-level portfolio
 

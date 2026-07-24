@@ -126,6 +126,18 @@ witness above); no kernel/runner/forward edit. SPEED stays PENDING until the eve
 grid vs vLLM at W6 - a row reaches DONE only at token-exact AND vLLM throughput on every
 axis.
 
+**Recent-dense TEXT batch (`Phi3`/`Granite`/`StableLm`/`MiniCPM`/`InternLM2`/`Cohere`/`Phi`/`MiniCPM3`) - SPIKE ONLY, DESIGN, no gate run (2026-07-24, `CLAIM-SWEEP-RECENT-DENSE` [spike](../.agents/specs/sweep-recent-dense-batch.md)).**
+Disposition: **NO throughput measured, NO correctness gate run, nothing built or downloaded
+(only HF API metadata read) - SPEED PENDING for all 8 rows.** A batch triage advancing 8
+recent dense/small-MoE families `INVENTORIED` -> `SPIKE` with a ranked one-agent-each queue:
+**4 ZERO-NEW-KERNEL near-additive** (Phi-3/Phi-4 a `LlamaForCausalLM` subclass, Granite-3 =
+Llama + 4 scalar multipliers, StableLM = LayerNorm dense + partial rope, MiniCPM = Llama +
+scale-depth/embedding scalars) + **4 small-new-op** (InternLM2 wqkv-split loader, Command-R
+logit_scale + parallel-residual, Phi-1/2 one new NewGELU unary, MiniCPM3 MLA re-wire). **TOP 3
+to implement next: OLMo-3 (nearly-free W5 on the landed OLMo-2 code), Phi-3/Phi-4, Granite-3.**
+Each binds a future per-family SACRED token-exact gate vs vLLM 0.25.0 (form BY MEASUREMENT) +
+the every-axis speed close before any row reaches DONE. No number is claimed here.
+
 **GLM-4 dense (`Glm4ForCausalLM`, GLM-4-9B-0414) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2,
 [spike](../.agents/specs/glm-dsa-latest-deepseek.md)).** The first GLM-family model.

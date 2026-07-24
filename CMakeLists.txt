@@ -446,6 +446,10 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/step3p5.cpp
   src/vllm/entrypoints/openai/tool_parsers/minicpm5.cpp
   src/vllm/entrypoints/openai/tool_parsers/hy_v3.cpp
+  src/vllm/entrypoints/openai/tool_parsers/hunyuan_a13b.cpp
+  src/vllm/entrypoints/openai/tool_parsers/apertus.cpp
+  src/vllm/entrypoints/openai/tool_parsers/ernie45.cpp
+  src/vllm/entrypoints/openai/tool_parsers/gigachat3.cpp
   src/vllm/entrypoints/openai/tool_parsers/olmo3.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp

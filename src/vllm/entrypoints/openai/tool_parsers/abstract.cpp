@@ -14,7 +14,11 @@
 #include "vllm/entrypoints/openai/tool_parsers/granite.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite4.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite_20b_fc.h"
+#include "vllm/entrypoints/openai/tool_parsers/apertus.h"
+#include "vllm/entrypoints/openai/tool_parsers/ernie45.h"
+#include "vllm/entrypoints/openai/tool_parsers/gigachat3.h"
 #include "vllm/entrypoints/openai/tool_parsers/hermes.h"
+#include "vllm/entrypoints/openai/tool_parsers/hunyuan_a13b.h"
 #include "vllm/entrypoints/openai/tool_parsers/internlm.h"
 #include "vllm/entrypoints/openai/tool_parsers/jamba.h"
 #include "vllm/entrypoints/openai/tool_parsers/hy_v3.h"
@@ -165,6 +169,25 @@ std::unique_ptr<ToolParser> get_tool_parser(const std::string& name) {
   // <tool_sep..><arg_key..><arg_value..> XML dialect (default empty suffix).
   if (name == "hy_v3") {
     return std::make_unique<HYV3ToolParser>();
+  }
+  // hunyuan_a13b_tool_parser.py: <tool_calls>[{"name":..,"arguments":..}]
+  // </tool_calls> (a JSON array; <think>-guarded; bot_string + consume_space).
+  if (name == "hunyuan_a13b") {
+    return std::make_unique<HunyuanA13BToolParser>();
+  }
+  // apertus_tool_parser.py: <|tools_prefix|>[{name:{args}}]<|tools_suffix|>.
+  if (name == "apertus") {
+    return std::make_unique<ApertusToolParser>();
+  }
+  // ernie45_tool_parser.py: <tool_call>{json}</tool_call> (thinking/response
+  // interplay; upstream vocab-aware, reworked to text - see ernie45.h).
+  if (name == "ernie45") {
+    return std::make_unique<Ernie45ToolParser>();
+  }
+  // gigachat3_tool_parser.py: "function call<|role_sep|>\n{json}" or
+  // "<|function_call|>{json}"; generation may end with "</s>".
+  if (name == "gigachat3") {
+    return std::make_unique<GigaChat3ToolParser>();
   }
   return nullptr;
 }

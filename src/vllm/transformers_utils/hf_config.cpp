@@ -192,6 +192,16 @@ RopeParameters ParseRopeParameters(const nlohmann::json& text,
   params.factor = GetOptionalDouble(*raw, "factor");
   params.original_max_position_embeddings =
       GetOptionalInt(*raw, "original_max_position_embeddings");
+  // Phi-3/Phi-4 longrope (and some other checkpoints) place
+  // original_max_position_embeddings at the TOP LEVEL of config.json rather than
+  // inside the rope dict; transformers' standardize_rope_params folds it into the
+  // rope parameters before vLLM's get_rope sees it. Mirror that: when the rope dict
+  // omits it, fall back to the top-level field. Inert for every checkpoint whose
+  // rope dict already carries the field (yarn/llama3 configs) and for default-rope
+  // models (the field is unused unless rope_type consumes it).
+  if (!params.original_max_position_embeddings.has_value())
+    params.original_max_position_embeddings =
+        GetOptionalInt(text, "original_max_position_embeddings");
   params.low_freq_factor = GetOptionalDouble(*raw, "low_freq_factor");
   params.high_freq_factor = GetOptionalDouble(*raw, "high_freq_factor");
   params.short_factor = GetDoubleArray(*raw, "short_factor");

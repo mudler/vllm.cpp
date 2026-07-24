@@ -3236,3 +3236,14 @@ architecture-support checklist to the top of `.agents/model-matrix.md` plus
 `scripts/check-model-checklist.py` (and its mutation test) that keeps the
 checklist marks and rollup counts in lockstep with the detailed row lifecycle
 states. All model gates are inert by construction; regression set unaffected.
+
+---
+
+**Recent-dense batch3 ((`GraniteForCausalLM`, `Olmo3ForCausalLM`)) - CORRECTNESS / GATING / DEP-BLOCKED, no speed measured**
+
+Disposition: **NO throughput measured or claimed for any of the three - SPEED PENDING.** Correctness only this pass, gate form BY MEASUREMENT vs the pinned vLLM 0.25.0 oracle (`~/venvs/vllm-oracle`, dgx, per-prompt K=5 self-determinism first).
+
+- **Granite-3 (`granite-3.3-2b-instruct`) - CORRECTNESS COMPLETE.** vLLM K=5 ALL-DETERMINISTIC (0 multi-member cells) -> STRICT bar. `test_granite_paged_engine`: **16/16 prompts PASS (STRICT token-exact 15/16 + near-tie-band 1/16, max gap 0.062 nats @ p13tok0, 0 forward-divergent, 92 assertions).** Proves the four scalar multipliers (embedding 12.0 / residual 0.22 / attention 0.015625=1/64 / logits 8.0) + the custom attention scale are wired correctly. compute-sanitizer memcheck 0 errors on BOTH the Granite AND Phi-3 forwards (full gate under sanitizer, ERROR SUMMARY: 0). Runs EAGER (bf16). Row `ACTIVE`.
+- **OLMo-3 (`OLMo-3-1025-7B`) - DEP-BLOCKED (no oracle gate).** Implemented (dual rope: plain sliding theta 500000 + YaRN full-attn; per-layer sliding window; dtype-aware BF16 loader) and our engine loads + runs it, but the pinned vLLM 0.25.0 oracle CANNOT run the checkpoint: `olmo2.py:143` does `rope_parameters["rope_theta"]` -> `KeyError: 'rope_theta'` (the oracle's transformers predates OLMo-3's nested per-layer-type rope schema; an `hf_overrides` workaround surfaces `Unrecognized keys {'sliding_attention','full_attention'}` -> `TypeError: unhashable type: 'dict'`). No SACRED bar exists (spec D5); the W5 gate is pending an oracle/transformers that constructs OLMo-3's rope config. `test_olmo3_paged_engine` is present and skips (golden absent).
+
+**Regressions (this pass, byte-identical - the shared-TU fixes are diff-inert):** re-run STANDALONE from the clean `-Werror` build: **OLMo-2 16/16** (proves the guarded `olmo2.{cpp,weights}` dual-rope/dtype edits inert for OLMo-2), **Qwen3-dense 184/184**, **OPT 63/63**, **Llama-3.2-1B 92/92**, **Mistral 92/92** (these witness the `hf_config.cpp` longrope-fallback + `tokenizer.cpp` lstrip/rstrip edits inert). The big-model gates (27B 235/235, 35B 315/315, Qwen3-Coder 138/138, GLM-4-9B 16/16, GLM-4.7-Flash 8/8, Gemma-1/2/3 48/48, DeepSeek-V2 223/223) are byte-identical BY CONSTRUCTION (no kernel/runner/sampler TU touched) and were not re-run this pass (GB10 GPU time).

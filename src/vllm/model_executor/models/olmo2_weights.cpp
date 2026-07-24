@@ -37,19 +37,24 @@
 
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/layers/rotary_embedding/base.h"  // get_rope (OLMo-3 YaRN)
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
-#include "vllm/model_executor/models/dense_weight_loaders.h"  // MakeOwned
+#include "vllm/model_executor/models/dense_weight_loaders.h"  // MakeOwned + bf16 helpers
 #include "vt/dtype.h"
 
 namespace vllm {
 namespace {
 
+using dense_loaders::LoadBf16Direct;
+using dense_loaders::LoadBf16Transposed;
+using dense_loaders::LoadMergedBf16RawNK;
 using dense_loaders::MakeOwned;
 
 bool RawBool(const nlohmann::json& doc, const char* key, bool fallback) {
@@ -141,7 +146,21 @@ OwnedTensor LoadMergedF32ToBf16RawNK(const TensorResolver& get,
   return merged;
 }
 
-Olmo2LayerWeights LoadOlmo2Layer(const TensorResolver& get, int64_t layer) {
+// Dtype-aware dispatch: OLMo-2-0425-1B ships FLOAT32 on disk (downcast to bf16),
+// OLMo-3-1025-7B ships BF16 (loaded direct via the shared bf16 helpers). The F32
+// path is byte-identical to the original OLMo-2 loader.
+OwnedTensor LoadDirect(const TensorResolver& get, const std::string& name,
+                       bool is_bf16) {
+  return is_bf16 ? LoadBf16Direct(get, name) : LoadF32ToBf16Direct(get, name);
+}
+OwnedTensor LoadMergedRawNK(const TensorResolver& get,
+                            const std::vector<std::string>& names, bool is_bf16) {
+  return is_bf16 ? LoadMergedBf16RawNK(get, names)
+                 : LoadMergedF32ToBf16RawNK(get, names);
+}
+
+Olmo2LayerWeights LoadOlmo2Layer(const TensorResolver& get, int64_t layer,
+                                 bool is_bf16) {
   const std::string base = "model.layers." + std::to_string(layer) + ".";
   const std::string sa = base + "self_attn.";
   const std::string mlp = base + "mlp.";
@@ -149,26 +168,51 @@ Olmo2LayerWeights LoadOlmo2Layer(const TensorResolver& get, int64_t layer) {
   Olmo2LayerWeights w;
   // TWO standalone post-norms (olmo2.py:253-259). NO input/pre norm.
   w.post_attention_layernorm =
-      LoadF32ToBf16Direct(get, base + "post_attention_layernorm.weight");
+      LoadDirect(get, base + "post_attention_layernorm.weight", is_bf16);
   w.post_feedforward_layernorm =
-      LoadF32ToBf16Direct(get, base + "post_feedforward_layernorm.weight");
+      LoadDirect(get, base + "post_feedforward_layernorm.weight", is_bf16);
 
   // QKVParallelLinear (bias=False): one merged owner in exact [q,k,v] output-row
   // order (packed_modules_mapping), kept raw-NK for MatmulBT.
-  w.attn.qkv_proj = LoadMergedF32ToBf16RawNK(
-      get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "v_proj.weight"});
+  w.attn.qkv_proj = LoadMergedRawNK(
+      get, {sa + "q_proj.weight", sa + "k_proj.weight", sa + "v_proj.weight"},
+      is_bf16);
   // FULL-WIDTH q/k RMSNorm weights (olmo2.py:113-117): q_norm[hidden_size],
   // k_norm[kv_size] — over the WHOLE projection, NOT per-head head_dim.
-  w.attn.q_norm = LoadF32ToBf16Direct(get, sa + "q_norm.weight");
-  w.attn.k_norm = LoadF32ToBf16Direct(get, sa + "k_norm.weight");
+  w.attn.q_norm = LoadDirect(get, sa + "q_norm.weight", is_bf16);
+  w.attn.k_norm = LoadDirect(get, sa + "k_norm.weight", is_bf16);
   // RowParallelLinear o_proj — single raw-NK owner, NO bias.
-  w.attn.o_proj = LoadMergedF32ToBf16RawNK(get, {sa + "o_proj.weight"});
+  w.attn.o_proj = LoadMergedRawNK(get, {sa + "o_proj.weight"}, is_bf16);
 
   // OLMo-2 ships gate_proj/up_proj as SEPARATE tensors -> merge to gate_up (raw-NK).
-  w.mlp.gate_up_proj = LoadMergedF32ToBf16RawNK(
-      get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"});
-  w.mlp.down_proj = LoadMergedF32ToBf16RawNK(get, {mlp + "down_proj.weight"});
+  w.mlp.gate_up_proj = LoadMergedRawNK(
+      get, {mlp + "gate_proj.weight", mlp + "up_proj.weight"}, is_bf16);
+  w.mlp.down_proj = LoadMergedRawNK(get, {mlp + "down_proj.weight"}, is_bf16);
   return w;
+}
+
+// Build the OLMo-3 YaRN cos/sin cache (bf16 [P, rotary_dim], [cos|sin] halves,
+// indexed by REAL position) via the pinned get_rope yarn dispatch. Rows =
+// original_max_position_embeddings * factor (== config.max_position_embeddings).
+// EMPTY for OLMo-2 (rope_type default, no scaling).
+OwnedTensor BuildOlmo3YarnCache(const HfConfig& config) {
+  if (config.rope_parameters.rope_type != "yarn") return OwnedTensor{};
+  const int64_t head_dim = config.head_dim;
+  const int64_t rotary_dim = config.rotary_dim;
+  const int64_t max_pos = config.max_position_embeddings;
+  VT_CHECK(rotary_dim > 0, "olmo3: rotary_dim must be positive");
+  std::shared_ptr<RotaryEmbeddingBase> rope =
+      get_rope(head_dim, max_pos, /*is_neox_style=*/true, config.rope_parameters,
+               vt::DType::kBF16);
+  const vt::Tensor cache = rope->cos_sin_cache();  // bf16 [rows, rotary_dim]
+  VT_CHECK(cache.rank == 2 && cache.shape[1] == rotary_dim,
+           "olmo3: yarn cache shape mismatch");
+  const int64_t rows = cache.shape[0];
+  OwnedTensor out = MakeOwned(vt::DType::kBF16, {rows, rotary_dim});
+  std::memcpy(out.bytes.data(), cache.data,
+              static_cast<size_t>(rows) * static_cast<size_t>(rotary_dim) *
+                  sizeof(uint16_t));
+  return out;
 }
 
 }  // namespace
@@ -191,17 +235,26 @@ Olmo2Weights LoadOlmo2ForCausalLMWeights(const std::vector<SafetensorsFile>& sha
   Olmo2Weights w;
   w.tie_word_embeddings = RawBool(config.raw, "tie_word_embeddings", false);
 
-  w.embed_tokens = LoadF32ToBf16Direct(get, "model.embed_tokens.weight");
-  w.final_norm = LoadF32ToBf16Direct(get, "model.norm.weight");
-  // OLMo-2-1B is UNTIED: load the standalone lm_head (Matmul-B [H, vocab]). The
-  // tied path (skip lm_head, alias embed_tokens via MatmulBT) is retained for a
-  // tied OLMo-2 checkpoint but is not exercised by OLMo-2-0425-1B.
+  // Detect on-disk dtype from embed_tokens: OLMo-2-1B is F32 (downcast to bf16),
+  // OLMo-3-7B is BF16 (loaded direct). The F32 path is byte-identical to before.
+  const bool is_bf16 = get("model.embed_tokens.weight").dtype == "BF16";
+
+  w.embed_tokens = LoadDirect(get, "model.embed_tokens.weight", is_bf16);
+  w.final_norm = LoadDirect(get, "model.norm.weight", is_bf16);
+  // OLMo-2-1B and OLMo-3-7B are both UNTIED: load the standalone lm_head (Matmul-B
+  // [H, vocab]). The tied path (skip lm_head, alias embed_tokens) is retained for a
+  // tied checkpoint but is not exercised here.
   if (!w.tie_word_embeddings)
-    w.lm_head = LoadF32ToBf16Transposed(get, "lm_head.weight");
+    w.lm_head = is_bf16 ? LoadBf16Transposed(get, "lm_head.weight")
+                        : LoadF32ToBf16Transposed(get, "lm_head.weight");
 
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l)
-    w.layers.push_back(LoadOlmo2Layer(get, l));
+    w.layers.push_back(LoadOlmo2Layer(get, l, is_bf16));
+
+  // OLMo-3 (Olmo3ForCausalLM): precompute the YaRN cache for the full-attention
+  // layers. EMPTY for OLMo-2 (rope_type default) -> forward stays byte-identical.
+  w.rope_cos_sin_yarn = BuildOlmo3YarnCache(config);
   return w;
 }
 

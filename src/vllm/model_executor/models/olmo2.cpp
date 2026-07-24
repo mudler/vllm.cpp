@@ -23,6 +23,8 @@
 
 #include <cmath>
 #include <memory>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -76,7 +78,8 @@ DBuf Olmo2MlpBlock(Dev d, const Olmo2MlpWeights& w, const HfConfig& cfg,
 DBuf Olmo2AttnBlock(Dev d, const Olmo2AttnWeights& w, const HfConfig& cfg,
                     const Tensor& h, const StepInputs& si,
                     const CommonAttentionMetadata& meta, const PagedKvCache& kv,
-                    int64_t T) {
+                    int64_t T, bool use_yarn, const Tensor* yarn_cache,
+                    std::optional<int64_t> sliding_window) {
   const int64_t H = cfg.hidden_size;
   const int64_t Hq = cfg.num_attention_heads;
   const int64_t Hkv = cfg.num_key_value_heads;
@@ -117,7 +120,18 @@ DBuf Olmo2AttnBlock(Dev d, const Olmo2AttnWeights& w, const HfConfig& cfg,
   // (vLLM-faithful), else in-place RopeNeox (per-element fp64 cos/sin).
   Tensor q3 = Reshape(q.t(), {T, Hq, Dh});
   Tensor k3 = Reshape(k.t(), {T, Hkv, Dh});
-  if (RopeCacheEnabled() && rot > 0) {
+  if (use_yarn && rot > 0) {
+    // OLMo-3 FULL-attention layer: YaRN-scaled rope from the precomputed cache
+    // (olmo2.py:139-149 — scaling on full-attn layers only), indexed by the REAL
+    // positions. base is unused (the cache is precomputed with the YaRN inv_freq).
+    vt::RopeArgs ra;
+    ra.rotary_dim = rot;
+    ra.is_neox_style = true;
+    Tensor k3v = k3;
+    vt::RopeFromCache(d.q, q3, &k3v, si.positions.t(), *yarn_cache, ra);
+  } else if (RopeCacheEnabled() && rot > 0) {
+    // OLMo-2, and OLMo-3 SLIDING layers: plain NeoX rope (base rope_theta) off the
+    // per-step bf16 cos/sin cache (identity row index). Byte-identical to before.
     Tensor k3v = k3;
     vt::RopeFromCache(d.q, q3, &k3v, si.rope_row_idx.t(), si.cos_sin_bf16.t(),
                       MakeRopeArgs(cfg));
@@ -147,6 +161,11 @@ DBuf Olmo2AttnBlock(Dev d, const Olmo2AttnWeights& w, const HfConfig& cfg,
   vt::PagedAttentionArgs pa{scale, meta.causal};
   pa.query_start_loc_host = meta.query_start_loc.data();
   pa.max_seq_len = meta.max_seq_len;
+  // OLMo-3 SLIDING-attention layer: mask to the last `sliding_window` keys (FA
+  // window convention (W-1, 0)). Inert for contexts < sliding_window (the gate
+  // battery is short), so the SACRED gate is unaffected; correct for long contexts.
+  if (sliding_window.has_value() && *sliding_window > 0)
+    pa.window_size = vt::AttentionWindow{static_cast<int32_t>(*sliding_window - 1), 0};
   vt::PagedAttention(d.q, attn.t(), q3, k_cache, v_cache, si.block_table.t(),
                      si.seq_lens.t(), si.query_start_loc.t(), pa);
 
@@ -172,12 +191,15 @@ DBuf Olmo2AttnBlock(Dev d, const Olmo2AttnWeights& w, const HfConfig& cfg,
 // separate fused residual buffer — the plain add keeps the residual in `hidden`).
 void RunLayer(Dev d, const Olmo2LayerWeights& layer, const HfConfig& cfg,
               DBuf& hidden, const StepInputs& si,
-              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T) {
+              const CommonAttentionMetadata& meta, const PagedKvCache& kv, int64_t T,
+              bool use_yarn, const Tensor* yarn_cache,
+              std::optional<int64_t> sliding_window) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
 
   // Attention sub-block on the RAW residual (NO input norm).
-  DBuf attn = Olmo2AttnBlock(d, layer.attn, cfg, hidden.t(), si, meta, kv, T);
+  DBuf attn = Olmo2AttnBlock(d, layer.attn, cfg, hidden.t(), si, meta, kv, T,
+                             use_yarn, yarn_cache, sliding_window);
   // post_attention_layernorm (STANDALONE): attn_n = norm(attn).
   Tensor w_pa = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf attn_n(d, DType::kBF16, {T, H});
@@ -236,9 +258,33 @@ DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   if (rot > 0 && RopeCacheEnabled())
     vt::CastBf16(d.q, si.cos_sin_bf16.t(), si.cos_sin.t());
 
-  for (int64_t l = 0; l < config.num_hidden_layers; ++l)
+  // OLMo-3 (`Olmo3ForCausalLM`): per-layer interleaved sliding window + YaRN rope on
+  // FULL-attention layers ONLY (olmo2.py:121-149). Routed by config.layer_types.
+  // OLMo-2 has EMPTY layer_types -> has_layer_types is false -> every layer takes the
+  // plain-rope / no-window path (byte-identical to before). The YaRN cache is
+  // resident-uploaded once and reused; EMPTY for OLMo-2.
+  const bool has_layer_types = !config.layer_types.empty();
+  const bool has_yarn = !weights.rope_cos_sin_yarn.Empty();
+  Tensor yarn_cache;
+  if (has_yarn) yarn_cache = ResidentWeight(d, weights.rope_cos_sin_yarn);
+  const std::optional<int64_t> window_len =
+      config.sliding_window.has_value() ? config.sliding_window : std::nullopt;
+
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    bool use_yarn = false;
+    std::optional<int64_t> sliding_window;
+    if (has_layer_types) {
+      const std::string& lt = config.layer_types[static_cast<size_t>(l)];
+      if (lt == "sliding_attention") {
+        sliding_window = window_len;  // plain rope, finite window
+      } else {
+        use_yarn = has_yarn;  // full_attention: YaRN rope, no window
+      }
+    }
     RunLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, si,
-             attn_meta, attn_kv[static_cast<size_t>(l)], T);
+             attn_meta, attn_kv[static_cast<size_t>(l)], T, use_yarn,
+             use_yarn ? &yarn_cache : nullptr, sliding_window);
+  }
 
   // Final standalone RMSNorm over the residual stream (olmo2.py:342), then lm_head.
   Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});

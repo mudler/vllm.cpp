@@ -1,5 +1,43 @@
 # SPIKE: recent-dense TEXT batch (Phi / Command-R / Granite / StableLM / InternLM2 / MiniCPM / Phi-3-4)
 
+## TOP-3 IMPLEMENTATION UPDATE (2026-07-24, batch3 — `sweep-recent-dense-batch3`, base `origin/main` `e1173fa`, dgx `~/vllmcpp-b3`)
+
+The three §0.6 recommendations were implemented, one clean `-Werror` build, one
+regression pass. **All three ZERO-NEW-KERNEL as scoped** (Granite reuses the shared
+dense glue + `vt::MulScalar`/`vt::Add`; Phi-3 reuses the pinned `Phi3LongRoPE` CPU
+rope class + `RopeFromCache`; OLMo-3 reuses the yarn CPU rope class + the Gemma-3
+sliding-window arg). Results:
+
+- **rank 3 Granite-3 (`GraniteForCausalLM`, `granite-3.3-2b-instruct`) — SACRED 16/16, row `ACTIVE`.**
+  vLLM K=5 ALL-DETERMINISTIC → STRICT; 15/16 token-exact + 1 near-tie 0.062 nats, 0
+  forward-divergent. The 4 default-1 scalars + the attention scale (0.015625=1/64,
+  NOT 1/sqrt(64)) proven. memcheck 0 errors. New files only.
+- **rank 2 Phi-3/Phi-4 (`Phi3ForCausalLM`, `Phi-4-mini-instruct`) — 15/16, row `GATING`.**
+  Pre-fused qkv/gate_up loader + LongRoPE (partial rotary 96/128, long_factor+mscale)
+  fed by real positions. 7/16 token-exact + 8 near-tie + 1 forward-divergent (p12tok6
+  1.0 nats > 0.5 band) — coherent output, structurally correct; the 1 residual is a
+  LongRoPE bf16-cache precision follow-on. Forced two guarded, diff-inert shared-TU
+  fixes (regression-witnessed): `hf_config.cpp` longrope `original_max_position_embeddings`
+  top-level fallback (Phi-4 stores it top-level, D4 anchor) + `tokenizer.cpp` accept
+  lstrip/rstrip added-token options (Phi-4 `<\|assistant\|>`).
+- **rank 1 OLMo-3 (`Olmo3ForCausalLM`, `OLMo-3-1025-7B`) — IMPLEMENTED, oracle-BLOCKED (D5).**
+  Rides the landed olmo2 row via guarded additive edits (diff-inert; OLMo-2 gate 16/16
+  UNCHANGED): per-layer dual rope (plain sliding theta 500000 vs YaRN full-attn, routed
+  by `config.layer_types`) + finite sliding window (inert for short gate contexts) +
+  dtype-aware BF16 loader. **The pinned vLLM 0.25.0 oracle CANNOT run the checkpoint**
+  (`olmo2.py:143` `rope_parameters["rope_theta"]` → `KeyError`; per-layer-type rope
+  schema newer than the oracle's transformers), so there is NO SACRED bar (exactly the
+  D5 "no oracle → honestly blocked" case). Our engine loads + runs it; W5 gate pending
+  a pin/oracle advance. The §0.5/§0.6 D5 caveat (oracle-support must be probed) is thus
+  confirmed for OLMo-3, not just MiniCPM/pin-removed names.
+
+Regressions byte-identical (OLMo-2 16/16 · Qwen3-dense 184/184 · OPT 63/63 · Llama
+92/92 · Mistral 92/92 re-run; big gates by construction). SPEED PENDING for all three.
+Remaining rows (StableLM, MiniCPM, InternLM2, Command-R, Phi-1/2, MiniCPM3) stay
+`SPIKE`, one agent each per the queue below.
+
+---
+
 **SPIKE ONLY — no implementation, no kernels, no build, no benchmark, nothing
 downloaded (only HF API metadata read).** A BATCH-SCOPING triage of the next tier
 of recent dense (and small-MoE) text families, so the sweep has a RANKED, GROUNDED
@@ -103,7 +141,7 @@ this table (the OPT lesson): W0 verifies weight FILES on dgx before a row is pic
 
 | Family | Smallest genuine checkpoint | Params | bf16 on disk | Gated? | Tokenizer + BOS note | Oracle-support risk (0.25.0) |
 |---|---|---|---|---|---|---|
-| **Phi-3 / Phi-4** | `microsoft/Phi-4-mini-instruct` | 3.836B | ~7.7 GiB | ungated | Phi-4 = ByteLevel BPE (o200k-ish); Phi-3-mini = SentencePiece (Llama, 32064); BOS varies (Phi-3 `<s>`; Phi-4 `<|endoftext|>`) — W0 verify. Both REUSE. | LOW — `Phi3ForCausalLM` well-established; bigger STRICT `microsoft/phi-4` 14.66B (~29.3 GiB) also `Phi3ForCausalLM` |
+| **Phi-3 / Phi-4** | `microsoft/Phi-4-mini-instruct` | 3.836B | ~7.7 GiB | ungated | Phi-4 = ByteLevel BPE (o200k-ish); Phi-3-mini = SentencePiece (Llama, 32064); BOS varies (Phi-3 `<s>`; Phi-4 `<\|endoftext\|>`) — W0 verify. Both REUSE. | LOW — `Phi3ForCausalLM` well-established; bigger STRICT `microsoft/phi-4` 14.66B (~29.3 GiB) also `Phi3ForCausalLM` |
 | **Granite-3** | `ibm-granite/granite-3.3-2b-instruct` | 2.53B | ~5.1 GiB | ungated | ByteLevel BPE (StarCoder/GPT-2 family, 49k); BOS W0-verify. REUSE. | LOW — Granite well-established |
 | **StableLM** | `stabilityai/stablelm-2-1_6b` | 1.64B | ~3.3 GiB | ungated | Arcade100k GPT-NeoX ByteLevel BPE. REUSE. | LOW; `stablelm-3b-4e1t` 2.8B a bigger strict |
 | **MiniCPM** | `openbmb/MiniCPM-2B-sft-bf16` | ~2.7B | ~5.4 GiB | ungated | Llama SentencePiece. REUSE. NOTE: `.bin` (no safetensors), needs `trust_remote_code`. | MEDIUM — needs `trust_remote_code=True`; W0 confirms the 0.25.0 oracle constructs it |

@@ -88,6 +88,13 @@ struct Olmo2Weights {
   OwnedTensor final_norm;    // bf16 [H]
   OwnedTensor lm_head;       // bf16 [H, vocab] Matmul-B; EMPTY when tied
   std::vector<Olmo2LayerWeights> layers;
+  // OLMo-3 ONLY (`Olmo3ForCausalLM`): the precomputed YaRN cos/sin cache
+  // (bf16 [P, rotary_dim], [cos|sin] halves, indexed by REAL position) consumed by
+  // the FULL-attention layers. Rope scaling is applied on full-attention layers
+  // ONLY (olmo2.py:139-149); sliding-window layers use the plain-rope path (base
+  // rope_theta). EMPTY for OLMo-2 (no rope_scaling) — so the OLMo-2 forward is
+  // byte-identical (this field is never read when config.layer_types is empty).
+  OwnedTensor rope_cos_sin_yarn;
 };
 
 // Load `Olmo2ForCausalLM` (OLMo-2-0425-1B) safetensors into Olmo2Weights. Name map

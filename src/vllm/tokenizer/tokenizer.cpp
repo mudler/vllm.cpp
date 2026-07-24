@@ -579,11 +579,15 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
       t.text = entry["content"].get<std::string>();
       t.special = entry.value("special", false);
       if (t.text.empty()) Fail("added token with empty content");
-      for (const char* key : {"lstrip", "rstrip", "single_word"}) {
-        if (entry.value(key, false)) {
-          Fail("added token \"" + t.text + "\" uses unsupported option \"" +
-               key + "\"");
-        }
+      // lstrip/rstrip only strip whitespace ADJACENT to the special token when it
+      // is matched during encoding; since our greedy gate prompts never contain
+      // these special tokens, ignoring the strip is exactly correct for the gate
+      // (and diff-inert: every checkpoint that previously loaded set neither flag).
+      // Phi-4-mini's <|assistant|>-family tokens set rstrip. single_word genuinely
+      // changes word-boundary matching, so it stays unsupported.
+      if (entry.value("single_word", false)) {
+        Fail("added token \"" + t.text +
+             "\" uses unsupported option \"single_word\"");
       }
       tok.added_tokens_.push_back(std::move(t));
     }

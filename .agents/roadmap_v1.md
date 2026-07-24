@@ -94,10 +94,17 @@ landed with passing SACRED gates; OLMo-2's `Olmo3ForCausalLM` alias + Olmo-3 sli
 advanced `INVENTORIED` -> `SPIKE` with a ranked one-agent-each queue — **4 ZERO-NEW-KERNEL
 near-additive** (Phi-3/Phi-4 `Phi3ForCausalLM` a Llama subclass, Granite-3 4-scalar-multipliers,
 StableLM LayerNorm+partial-rope, MiniCPM scalars) + 4 small-new-op (InternLM2 wqkv-split,
-Command-R logit_scale+parallel-residual, Phi-1/2 NewGELU-unary, MiniCPM3 MLA-rewire). **TOP 3 to
-implement next: OLMo-3 (nearly-free W5 on the landed olmo2 row), Phi-3/Phi-4, Granite-3.** Falcon /
-Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as MoE/SSM campaigns; the
-pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no 0.25.0 oracle.
+Command-R logit_scale+parallel-residual, Phi-1/2 NewGELU-unary, MiniCPM3 MLA-rewire). **TOP 3
+IMPLEMENTED (2026-07-24, batch3, `sweep-recent-dense-batch3`):** **Granite-3 (`GraniteForCausalLM`)
+`ACTIVE` — SACRED 16/16** vs vLLM 0.25.0 (K=5 deterministic → STRICT; 4 default-1 scalars +
+attention scale proven, ZERO new kernel); Phi-3/Phi-4 is HELD in a separate increment (gate not a clean pass); 1 residual over the 0.5-nat band = bf16 rope-cache precision
+follow-on); **OLMo-3 (`Olmo3ForCausalLM`) IMPLEMENTED but oracle-BLOCKED** — the pinned vLLM 0.25.0
+cannot run `allenai/OLMo-3-1025-7B` (`KeyError: 'rope_theta'`, per-layer-type rope schema newer than
+the oracle's transformers), so no SACRED bar (our engine loads+runs it; W5 gate pending a pin/oracle
+advance). Remaining rows (StableLM, MiniCPM, InternLM2, Command-R, Phi-1/2, MiniCPM3) stay `SPIKE`,
+one agent each. Falcon / Falcon-H1(SSM) / GraniteMoe* / Cohere2Moe / PhiMoE stay `INVENTORIED` as
+MoE/SSM campaigns; the pin-removed names (Phi3Small/Phi4Flash/Phi4Multimodal/InternLM2VE) have no
+0.25.0 oracle.
 
 ## Top-level portfolio
 

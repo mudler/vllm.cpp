@@ -6,6 +6,8 @@
 // transformers/utils/chat_template_utils.py:474).
 #include "vllm/entrypoints/chat_template.h"
 
+#include "vllm/model_executor/model_loader/gguf_reader.h"
+
 #include <cctype>
 #include <cstddef>
 #include <fstream>
@@ -1220,6 +1222,30 @@ std::string LoadChatTemplateFromConfig(
   }
   throw ChatTemplateError("unrecognized 'chat_template' shape in " +
                           tokenizer_config_path);
+}
+
+std::string LoadChatTemplateFromGguf(const std::string& gguf_path) {
+  try {
+    const vllm::GgufFile gguf = vllm::GgufFile::Open(gguf_path);
+    const vllm::GgufValue* kv = gguf.FindKv("tokenizer.chat_template");
+    if (kv == nullptr) {
+      throw ChatTemplateError("gguf has no 'tokenizer.chat_template': " +
+                              gguf_path);
+    }
+    const std::string* tmpl = std::get_if<std::string>(&kv->v);
+    if (tmpl == nullptr || tmpl->empty()) {
+      throw ChatTemplateError(
+          "gguf 'tokenizer.chat_template' is not a non-empty string: " +
+          gguf_path);
+    }
+    return *tmpl;
+  } catch (const ChatTemplateError&) {
+    throw;
+  } catch (const std::exception& e) {
+    // GgufFile::Open throws std::runtime_error on any malformation.
+    throw ChatTemplateError(std::string("cannot read gguf chat template: ") +
+                            e.what());
+  }
 }
 
 }  // namespace vllm::entrypoints

@@ -1966,6 +1966,21 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Chat entry points through the C ABI (ABI v3: `vllm_chat` /
+  `vllm_chat_stream`) - `NOT APPLICABLE` (2026-07-24,
+  `CLAIM-CAPI-CHAT-V3`).** `benchmark_binding=false`. **API-surface change, no
+  performance claim.** The existing serving-chat pipeline (chat-template
+  render, tool_choice -> structural-tag lowering, streaming Hermes tool
+  parsing) is exposed over the C ABI: request in as one OpenAI chat JSON,
+  chunks out as `chat.completion.chunk` JSON via the existing token callback.
+  New `LoadChatTemplateFromGguf` reads the GGUF `tokenizer.chat_template`
+  metadata so .gguf models get their real template (a GGUF has no
+  tokenizer_config.json). No engine/scheduler/kernel path changes; the serving
+  layer itself is unchanged and already gated. Evidence: `tests/capi`
+  chat cases (blocking/stream parity, role-first cadence, malformed-request
+  rejection) + `tests/vllm/entrypoints/test_chat_template.cpp` GGUF loader
+  cases. No binding number is created, re-based, or invalidated.
+
 - **Structured output wired in the production engine + C ABI v2 `structured_*`
   fields - `NOT APPLICABLE` (2026-07-23, `CLAIM-CAPI-STRUCTURED-V2`).**
   `benchmark_binding=false`. **Correctness/enablement change, no performance

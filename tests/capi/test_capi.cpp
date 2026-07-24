@@ -242,6 +242,26 @@ vllm_engine* MakeSyntheticEngine() {
   return vllm::capi::MakeEngineHandle(std::move(loaded));
 }
 
+// Chat-capable synthetic engine: same stack, but the chat serving is built with
+// an IN-VOCAB prompt seam (the tiny fixture vocab cannot spell a real chat
+// template), mirroring the api-server harness's InVocabChatPrompt.
+vllm_engine* MakeSyntheticChatEngine() {
+  const HfConfig c = MakeConfig();
+  auto loaded = std::make_unique<LoadedEngine>(c, MakeWeights(c), BuildFixture(),
+                                               SyntheticParams());
+  return vllm::capi::MakeEngineHandle(
+      std::move(loaded),
+      [](const std::vector<vllm::entrypoints::openai::ChatMessage>& messages,
+         bool /*add_generation_prompt*/,
+         const std::vector<
+             vllm::entrypoints::openai::ChatCompletionToolsParam>& /*tools*/) {
+        std::string p;
+        for (const auto& m : messages)
+          if (m.content.has_value()) p += *m.content;
+        return p;
+      });
+}
+
 vllm_sampling_params GreedyParams(int32_t max_tokens) {
   vllm_sampling_params sp = vllm_sampling_params_default();
   sp.temperature = 0.0f;  // greedy (argmax) -> deterministic.
@@ -737,6 +757,113 @@ TEST_CASE("capi: more than one structured constraint is rejected cleanly") {
   CHECK(vllm_complete(eng, "hello", &ok, &out2) == VLLM_OK);
   CHECK(out2.text != nullptr);
   vllm_completion_free(&out2);
+  vllm_engine_free(eng);
+}
+
+// ─── chat entry points (ABI v3) ──────────────────────────────────────────────
+// vllm_chat: one OpenAI chat request in, one ChatCompletionResponse JSON out.
+// The engine-side serving stack (template seam -> sampling -> engine ->
+// response shaping) runs behind the C ABI; greedy keeps it deterministic.
+TEST_CASE("capi: vllm_chat returns a chat.completion response JSON") {
+  vllm_engine* eng = MakeSyntheticChatEngine();
+  REQUIRE(eng != nullptr);
+
+  const char* request =
+      "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+      "\"temperature\":0,\"max_tokens\":6}";
+  char* response = nullptr;
+  REQUIRE(vllm_chat(eng, request, &response) == VLLM_OK);
+  REQUIRE(response != nullptr);
+  const json body = json::parse(response);
+  CAPTURE(std::string(response));
+  CHECK(body.at("object") == "chat.completion");
+  CHECK(body.at("choices").size() == 1);
+  CHECK(body.at("choices").at(0).at("message").at("role") == "assistant");
+  CHECK(!body.at("choices").at(0).at("message").at("content")
+             .get<std::string>()
+             .empty());
+  CHECK(body.at("usage").at("completion_tokens").get<int>() == 6);
+  vllm_string_free(response);
+  vllm_engine_free(eng);
+}
+
+// vllm_chat_stream: role-first chunk cadence, content deltas that concatenate
+// to the blocking result, then the terminal finished callback.
+TEST_CASE("capi: vllm_chat_stream chunks concatenate to the blocking result") {
+  vllm_engine* eng = MakeSyntheticChatEngine();
+  REQUIRE(eng != nullptr);
+
+  const char* request =
+      "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+      "\"temperature\":0,\"max_tokens\":6}";
+
+  char* blocking = nullptr;
+  REQUIRE(vllm_chat(eng, request, &blocking) == VLLM_OK);
+  const std::string expected = json::parse(blocking)
+                                   .at("choices").at(0)
+                                   .at("message").at("content")
+                                   .get<std::string>();
+  vllm_string_free(blocking);
+
+  struct ChatAccumulator {
+    std::string content;
+    bool saw_role = false;
+    bool saw_finished = false;
+    int chunks = 0;
+    bool every_chunk_parsed = true;
+  } acc;
+  auto cb = [](const char* delta_text, bool finished, void* user_data) -> bool {
+    auto* a = static_cast<ChatAccumulator*>(user_data);
+    if (finished) {
+      a->saw_finished = true;
+      return true;
+    }
+    a->chunks++;
+    json chunk;
+    try {
+      chunk = json::parse(delta_text);
+    } catch (...) {
+      a->every_chunk_parsed = false;
+      return true;
+    }
+    if (chunk.value("object", "") != "chat.completion.chunk") {
+      a->every_chunk_parsed = false;
+      return true;
+    }
+    const json& delta = chunk.at("choices").at(0).at("delta");
+    if (delta.contains("role")) a->saw_role = true;
+    if (delta.contains("content") && delta.at("content").is_string())
+      a->content += delta.at("content").get<std::string>();
+    return true;
+  };
+  REQUIRE(vllm_chat_stream(eng, request, cb, &acc) == VLLM_OK);
+  CHECK(acc.saw_finished);
+  CHECK(acc.saw_role);
+  CHECK(acc.every_chunk_parsed);
+  CHECK(acc.chunks > 1);
+  CAPTURE(acc.content);
+  CAPTURE(expected);
+  CHECK(acc.content == expected);
+  vllm_engine_free(eng);
+}
+
+// Malformed request JSON is rejected with INVALID_ARGUMENT (no throw across
+// the ABI) and the engine stays usable.
+TEST_CASE("capi: vllm_chat rejects malformed request JSON cleanly") {
+  vllm_engine* eng = MakeSyntheticChatEngine();
+  REQUIRE(eng != nullptr);
+
+  char* response = nullptr;
+  CHECK(vllm_chat(eng, "{not json", &response) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(response == nullptr);
+  CHECK(std::string(vllm_last_error()).size() > 0);
+
+  const char* request =
+      "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+      "\"temperature\":0,\"max_tokens\":2}";
+  CHECK(vllm_chat(eng, request, &response) == VLLM_OK);
+  CHECK(response != nullptr);
+  vllm_string_free(response);
   vllm_engine_free(eng);
 }
 

@@ -10,6 +10,7 @@
 
 #include "vllm.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/entrypoints/openai/serving_chat.h"  // ChatPromptFn
 
 namespace vllm::capi {
 
@@ -20,6 +21,14 @@ namespace vllm::capi {
 // wrap it here, then drive vllm_complete().
 vllm_engine* MakeEngineHandle(
     std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded) noexcept;
+
+// Test-hook overload for the ABI v3 chat entry points: the handle's chat
+// serving is built with `prompt_fn` instead of the disk-resolved chat template,
+// so a synthetic-vocab engine can keep its prompt in-vocab (mirrors the
+// api-server test harness's InVocabChatPrompt seam).
+vllm_engine* MakeEngineHandle(
+    std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded,
+    vllm::entrypoints::openai::ChatPromptFn prompt_fn) noexcept;
 
 }  // namespace vllm::capi
 

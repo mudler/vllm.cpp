@@ -211,7 +211,7 @@ For a production deployment, use [LocalAI](https://localai.io), which can embed 
 
 ## Consuming it as a library (C API and C++)
 
-Link `libvllm` (static or shared) and include [`include/vllm.h`](include/vllm.h). It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 2`, 17 exported symbols) suitable for `dlopen` / FFI / LocalAI integration.
+Link `libvllm` (static or shared) and include [`include/vllm.h`](include/vllm.h). It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 3`, 19 exported symbols) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
 #include "vllm.h"
@@ -236,7 +236,7 @@ if (vllm_complete(engine, "The capital of France is", &sp, &out) == VLLM_OK) {
 vllm_engine_free(engine);
 ```
 
-The ABI covers lifecycle (`vllm_engine_load` / `vllm_engine_free`), blocking and streaming completion (`vllm_complete`, `vllm_complete_stream`), non-blocking concurrent requests (`vllm_request_submit` / `_cancel` / `_wait` / `_done` / `_error` / `_free`), memory helpers, and diagnostics (`vllm_last_error`, `vllm_version`, `vllm_abi_version`). Structured output (ABI v2): set at most one of `structured_json` (JSON-Schema string), `structured_regex`, `structured_choice`/`n_structured_choice`, `structured_grammar` (GBNF), or `structured_json_object` on `vllm_sampling_params` and generation is grammar-constrained per step on every completion entry point.
+The ABI covers lifecycle (`vllm_engine_load` / `vllm_engine_free`), blocking and streaming completion (`vllm_complete`, `vllm_complete_stream`), non-blocking concurrent requests (`vllm_request_submit` / `_cancel` / `_wait` / `_done` / `_error` / `_free`), memory helpers, and diagnostics (`vllm_last_error`, `vllm_version`, `vllm_abi_version`). Structured output (ABI v2): set at most one of `structured_json` (JSON-Schema string), `structured_regex`, `structured_choice`/`n_structured_choice`, `structured_grammar` (GBNF), or `structured_json_object` on `vllm_sampling_params` and generation is grammar-constrained per step on every completion entry point. Chat (ABI v3): `vllm_chat` / `vllm_chat_stream` take one OpenAI chat-completions request JSON (messages, tools, tool_choice, sampling) and run the SAME engine-side pipeline as the bundled server: the model's chat template (tokenizer_config.json, or the GGUF `tokenizer.chat_template` metadata) renders the prompt, tool_choice lowers to the structural-tag decode constraint (auto is LAZY: the engine decides when a tool call engages), and tool-call output is parsed engine-side into structured `tool_calls` deltas; the stream callback receives one `chat.completion.chunk` JSON per delta.
 
 For C++ consumers, the higher-level surface lives under [`include/vllm/`](include/vllm/): `LoadedEngine::FromModelDir(...)` ([`entrypoints/model_loader.h`](include/vllm/entrypoints/model_loader.h)) hands back the synchronous `LLMEngine` ([`v1/engine/llm_engine.h`](include/vllm/v1/engine/llm_engine.h)) or the async `AsyncLLM` ([`v1/engine/async_llm.h`](include/vllm/v1/engine/async_llm.h)) the server itself uses, plus `SamplingParams` and `RequestOutput`. The underlying portable tensor runtime is `vt::` ([`include/vt/`](include/vt/): `tensor.h`, `dtype.h`, `ops.h`, `backend.h`, and friends), which carries no ggml or PyTorch dependency.
 

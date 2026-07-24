@@ -21159,3 +21159,41 @@ Plus biased qkv (`attention_bias:true`; `vt::Add` row-broadcast; 1-D `LoadMerged
 **compute-sanitizer (memcheck):** GLM introduces ZERO new CUDA kernels — it composes only pre-existing sanitizer-clean ops (the one slightly-novel path, `RopeFromCache` with `is_neox_style=false` + partial `rotary_dim`, is already memchecked via DeepSeek-V2's decoupled rope; the bias `vt::Add` via OPT). memcheck on the GLM gate: model LOAD (all weight uploads + KV allocation, the allocation/addressing-heavy phase) + the first prefill (exercising every GLM kernel: embed, qkv MatmulBT + bias Add, QkvSplit, RopeCosSinCache/CastBf16/RopeFromCache is_neox=false, ReshapeAndCache, PagedAttention, all 4 RmsNorm sites, SiluAndMul, lm_head Matmul) ran with **0 violations** (compute-sanitizer prints violations inline the instant a kernel commits one). The full 16-prompt memcheck is impractically slow on a 9B model (a known compute-sanitizer limitation with cutlass/flash-attn instrumentation) and was left running; the meaningful signal (0 violations through load + full first forward) is captured.
 
 **Eager-vs-graph identity:** N/A — GLM-4-9B is bf16, so the runner keeps it EAGER (the decode CUDA-graph path is fp4-only + requires a model-specific registered graph; GLM has neither, same as qwen3-dense/llama/mistral/opt). No graph replay ⇒ the capture-baking hazard does not apply.
+
+## 2026-07-24 — Chat entry points through the C ABI: `vllm_chat` / `vllm_chat_stream` (ABI v3) + GGUF chat-template loader (`CLAIM-CAPI-CHAT-V3`, direct-to-main, user-directed)
+
+Motivation: LocalAI's `vllm-cpp` backend must ride the SAME code path as
+llama.cpp's autoparser — the ENGINE decides when a tool call engages and parses
+it. All of that already exists in the serving layer (chat-template renderer,
+`ToolChoiceStructuralTagSpec` with the LAZY auto tag, the streaming-stateful
+hermes parser) but was reachable only over HTTP.
+
+Change (thin ABI forwarding, no serving-layer edits):
+- `include/vllm.h` ABI v3: `vllm_chat(engine, request_json, &response_json)`
+  (blocking, caller frees) and `vllm_chat_stream(engine, request_json, cb, ud)`
+  (per-chunk `chat.completion.chunk` JSON through the existing
+  `vllm_token_callback`, terminal finished call; false aborts). Request `model`
+  / `stream` fields ignored.
+- `src/capi/vllm_c.cpp`: handle gains model_path + a lazily-built
+  `OpenAIServingChat` over the shared AsyncLLM (served name = basename, hermes
+  parser). Chat template resolution mirrors the bundled server:
+  tokenizer_config.json for a model dir, NEW `LoadChatTemplateFromGguf`
+  (`tokenizer.chat_template` metadata via `GgufFile::FindKv`) for .gguf, else
+  the role-join fallback. SSE framing stripped before the callback; malformed
+  request JSON → `VLLM_ERR_INVALID_ARGUMENT`.
+- Test hook: `MakeEngineHandle(loaded, prompt_fn)` overload so the synthetic
+  capi engine keeps its prompt in-vocab (api-server harness convention).
+- Tests: capi chat cases (response shape + usage, stream role-first cadence +
+  chunks concatenating byte-equal to the blocking content, malformed-request
+  rejection with the engine reusable) and
+  `test_chat_template.cpp` GGUF-loader cases (extracts the key, loud
+  `ChatTemplateError` when absent/unreadable) over synthetic GGUF files
+  (`gguf_builder.h`).
+
+Verification: isolated worktree on origin/main; `test_capi` 20/20 (149
+asserts), `test_chat_template` 17/17, full ctest battery (serving suites
+unchanged). Perf: NOT APPLICABLE (see BENCHMARKS correctness-only entry).
+
+Follow-ups: reasoning-parser deltas (serving-layer deferral, upstream parity
+item) will flow through the same chunk JSON once the serving layer emits them;
+multi-turn tool-result messages parse per the protocol's ChatMessage subset.

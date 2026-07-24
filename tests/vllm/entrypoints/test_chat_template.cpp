@@ -12,6 +12,8 @@
 // configured exactly as transformers does (trim_blocks=True, lstrip_blocks=True).
 #include "vllm/entrypoints/chat_template.h"
 
+#include "../gguf_builder.h"
+
 #include <doctest/doctest.h>
 
 #include <string>
@@ -242,4 +244,32 @@ TEST_CASE("chat_template: tojson filter serializes the tool object") {
   CHECK(j.at("function").at("name") == "get_weather");
   CHECK(j.at("function").at("parameters").at("properties").at("city").at("type") ==
         "string");
+}
+
+// ─── LoadChatTemplateFromGguf (ABI v3) ───────────────────────────────────────
+// GGUF models carry their chat template as `tokenizer.chat_template` metadata
+// (no tokenizer_config.json exists). Build minimal synthetic GGUFs and assert
+// the loader extracts the template / errors loudly.
+TEST_CASE("chat_template: LoadChatTemplateFromGguf extracts tokenizer.chat_template") {
+  gguf_test::GgufModelBuilder b;
+  b.AddKv(gguf_test::StrKv("general.architecture", "qwen35"));
+  b.AddKv(gguf_test::StrKv("tokenizer.chat_template",
+                           "{{ messages[0].content }}"));
+  gguf_test::TempFile f(b.Build());
+  CHECK(vllm::entrypoints::LoadChatTemplateFromGguf(f.path()) ==
+        "{{ messages[0].content }}");
+}
+
+TEST_CASE("chat_template: LoadChatTemplateFromGguf errors without the key") {
+  gguf_test::GgufModelBuilder b;
+  b.AddKv(gguf_test::StrKv("general.architecture", "qwen35"));
+  gguf_test::TempFile f(b.Build());
+  CHECK_THROWS_AS(vllm::entrypoints::LoadChatTemplateFromGguf(f.path()),
+                  vllm::entrypoints::ChatTemplateError);
+}
+
+TEST_CASE("chat_template: LoadChatTemplateFromGguf errors on an unreadable file") {
+  CHECK_THROWS_AS(
+      vllm::entrypoints::LoadChatTemplateFromGguf("/nonexistent/x.gguf"),
+      vllm::entrypoints::ChatTemplateError);
 }

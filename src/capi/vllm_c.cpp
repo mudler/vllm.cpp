@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -21,8 +22,13 @@
 #include <thread>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "capi/engine_handle.h"
+#include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
@@ -39,6 +45,19 @@ struct vllm_engine {
   // (now-freed) Request → heap-use-after-free. Unique ids + the RequestGuard
   // below make the engine safely reusable after ANY mid-request error.
   std::atomic<uint64_t> next_request_id{0};
+
+  // ── Chat entry points (ABI v3) ────────────────────────────────────────────
+  // The model path vllm_engine_load received; empty for a test-hook handle.
+  // Used to resolve the chat template + the served model name.
+  std::string model_path;
+  // Test-hook override for the chat-prompt seam (MakeEngineHandle overload):
+  // when set, chat_serving is built with it instead of the resolved template.
+  vllm::entrypoints::openai::ChatPromptFn test_prompt_fn;
+  // Lazily-built chat serving handler over the shared AsyncLLM (one per
+  // handle; create_chat_completion is safe for concurrent callers, matching
+  // the HTTP server's worker pool). Guarded by chat_mutex for the lazy build.
+  std::mutex chat_mutex;
+  std::unique_ptr<vllm::entrypoints::openai::OpenAIServingChat> chat_serving;
 };
 
 // One non-blocking callback-delivery request. The AsyncLLM output handler owns
@@ -172,6 +191,91 @@ vllm::SamplingParams ToSamplingParams(const vllm_sampling_params& c,
   return sp;
 }
 
+// Resolve the chat-prompt seam for a loaded model: tokenizer_config.json's
+// chat_template for a model directory, the `tokenizer.chat_template` GGUF
+// metadata for a .gguf file, else the role-join fallback (mirrors the bundled
+// server's resolution in examples/server/main.cpp).
+vllm::entrypoints::openai::ChatPromptFn ResolveChatPromptFn(
+    const std::string& model_path,
+    const vllm::entrypoints::LoadedEngine& loaded) {
+  namespace fs = std::filesystem;
+  try {
+    std::string tmpl;
+    if (fs::is_regular_file(model_path) &&
+        fs::path(model_path).extension() == ".gguf") {
+      tmpl = vllm::entrypoints::LoadChatTemplateFromGguf(model_path);
+    } else {
+      tmpl = vllm::entrypoints::LoadChatTemplateFromConfig(
+          (fs::path(model_path) / "tokenizer_config.json").string());
+    }
+    const vllm::tok::Tokenizer& tok = loaded.tokenizer();
+    const std::string bos =
+        tok.BosId() >= 0 ? tok.Decode({tok.BosId()}) : std::string();
+    const std::string eos =
+        tok.EosId() >= 0 ? tok.Decode({tok.EosId()}) : std::string();
+    return vllm::entrypoints::MakeChatTemplatePromptFn(tmpl, bos, eos);
+  } catch (const std::exception&) {
+    return vllm::entrypoints::openai::DefaultChatPromptFallback;
+  }
+}
+
+// Lazily build the handle's chat serving handler over the shared AsyncLLM
+// (same wiring as the bundled server: real chat template when the model ships
+// one, hermes tool parser). One handler per handle; create_chat_completion is
+// safe for concurrent callers.
+vllm::entrypoints::openai::OpenAIServingChat& EnsureChatServing(
+    vllm_engine* engine) {
+  std::lock_guard<std::mutex> lock(engine->chat_mutex);
+  if (engine->chat_serving == nullptr) {
+    vllm::entrypoints::openai::ChatPromptFn prompt_fn =
+        engine->test_prompt_fn
+            ? engine->test_prompt_fn
+            : ResolveChatPromptFn(engine->model_path, *engine->loaded);
+    std::string served_name =
+        engine->model_path.empty()
+            ? std::string("model")
+            : std::filesystem::path(engine->model_path).filename().string();
+    engine->chat_serving =
+        std::make_unique<vllm::entrypoints::openai::OpenAIServingChat>(
+            engine->loaded->async_engine(), std::move(served_name),
+            std::move(prompt_fn), /*tool_parser_name=*/"hermes");
+  }
+  return *engine->chat_serving;
+}
+
+// Strip the SSE framing off one serving-layer chunk ("data: {json}\n\n" →
+// "{json}"; "data: [DONE]\n\n" → "[DONE]").
+std::string StripSseFraming(const std::string& chunk) {
+  std::string payload = chunk;
+  constexpr const char kPrefix[] = "data: ";
+  if (payload.rfind(kPrefix, 0) == 0) payload.erase(0, sizeof(kPrefix) - 1);
+  while (!payload.empty() &&
+         (payload.back() == '\n' || payload.back() == '\r')) {
+    payload.pop_back();
+  }
+  return payload;
+}
+
+// Parse an OpenAI chat request JSON for the ABI entry points. Throws
+// std::invalid_argument on malformed JSON / shape (mapped to
+// VLLM_ERR_INVALID_ARGUMENT by the callers).
+vllm::entrypoints::openai::ChatCompletionRequest ParseChatRequest(
+    const char* request_json) {
+  nlohmann::json j;
+  try {
+    j = nlohmann::json::parse(request_json);
+  } catch (const std::exception& e) {
+    throw std::invalid_argument(std::string("malformed request JSON: ") +
+                                e.what());
+  }
+  try {
+    return j.get<vllm::entrypoints::openai::ChatCompletionRequest>();
+  } catch (const std::exception& e) {
+    throw std::invalid_argument(std::string("invalid chat request: ") +
+                                e.what());
+  }
+}
+
 void JoinRequest(vllm_request* request) {
   std::lock_guard<std::mutex> lock(request->join_mutex);
   if (request->delivery_thread.joinable()) request->delivery_thread.join();
@@ -279,7 +383,9 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
 
     auto loaded =
         vllm::entrypoints::LoadedEngine::FromModelDir(params->model_path, ep);
-    auto* handle = new vllm_engine{std::move(loaded)};
+    auto* handle = new vllm_engine;
+    handle->loaded = std::move(loaded);
+    handle->model_path = params->model_path;
     *out = handle;
     ClearError();
     return VLLM_OK;
@@ -545,6 +651,107 @@ VLLM_API void vllm_request_free(vllm_request* request) {
   }
 }
 
+VLLM_API vllm_status vllm_chat(vllm_engine* engine, const char* request_json,
+                               char** out_response_json) {
+  if (out_response_json == nullptr) {
+    SetError("vllm_chat: out_response_json is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  *out_response_json = nullptr;
+  if (engine == nullptr || request_json == nullptr) {
+    SetError("vllm_chat: engine or request_json is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    vllm::entrypoints::openai::ChatCompletionRequest request =
+        ParseChatRequest(request_json);
+    request.stream = false;
+    vllm::entrypoints::openai::ChatCompletionResult result =
+        EnsureChatServing(engine).create_chat_completion(request);
+    if (!result.response.has_value()) {
+      SetError("vllm_chat: serving produced no response");
+      return VLLM_ERR_RUNTIME;
+    }
+    const nlohmann::json j = *result.response;
+    char* text = DupString(j.dump());
+    if (text == nullptr) {
+      SetError("vllm_chat: out-of-memory copying response");
+      return VLLM_ERR_RUNTIME;
+    }
+    *out_response_json = text;
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::invalid_argument& e) {
+    SetError(std::string("vllm_chat: ") + e.what());
+    return VLLM_ERR_INVALID_ARGUMENT;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_chat: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_chat: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API vllm_status vllm_chat_stream(vllm_engine* engine,
+                                      const char* request_json,
+                                      vllm_token_callback cb,
+                                      void* user_data) {
+  if (engine == nullptr || request_json == nullptr || cb == nullptr) {
+    SetError("vllm_chat_stream: engine, request_json or cb is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    vllm::entrypoints::openai::ChatCompletionRequest request =
+        ParseChatRequest(request_json);
+    request.stream = true;
+    vllm::entrypoints::openai::ChatCompletionResult result =
+        EnsureChatServing(engine).create_chat_completion(request);
+
+    bool stopped_by_callback = false;
+    auto deliver = [&](const std::string& framed) -> bool {
+      const std::string payload = StripSseFraming(framed);
+      if (payload.empty() || payload == "[DONE]") return true;
+      // Callback contract mirrors vllm_complete_stream: borrowed, per-chunk.
+      return cb(payload.c_str(), false, user_data);
+    };
+
+    if (result.sse_stream != nullptr) {
+      // Live AsyncLLM path: pull framed chunks as the engine produces them.
+      std::string chunk;
+      while (result.sse_stream->next(chunk)) {
+        if (!deliver(chunk)) {
+          stopped_by_callback = true;
+          result.sse_stream->abort();
+          break;
+        }
+      }
+    } else {
+      for (const std::string& chunk : result.sse_chunks) {
+        if (!deliver(chunk)) {
+          stopped_by_callback = true;
+          break;
+        }
+      }
+    }
+    if (!stopped_by_callback) {
+      // Terminal call, matching the vllm_token_callback contract.
+      (void)cb("", true, user_data);
+    }
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::invalid_argument& e) {
+    SetError(std::string("vllm_chat_stream: ") + e.what());
+    return VLLM_ERR_INVALID_ARGUMENT;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_chat_stream: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_chat_stream: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
 VLLM_API void vllm_string_free(char* s) { std::free(s); }
 
 VLLM_API void vllm_completion_free(vllm_completion* out) {
@@ -573,7 +780,17 @@ namespace vllm::capi {
 vllm_engine* MakeEngineHandle(
     std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded) noexcept {
   if (loaded == nullptr) return nullptr;
-  return new (std::nothrow) vllm_engine{std::move(loaded)};
+  auto* handle = new (std::nothrow) vllm_engine;
+  if (handle != nullptr) handle->loaded = std::move(loaded);
+  return handle;
+}
+
+vllm_engine* MakeEngineHandle(
+    std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded,
+    vllm::entrypoints::openai::ChatPromptFn prompt_fn) noexcept {
+  vllm_engine* handle = MakeEngineHandle(std::move(loaded));
+  if (handle != nullptr) handle->test_prompt_fn = std::move(prompt_fn);
+  return handle;
 }
 
 }  // namespace vllm::capi

@@ -87,6 +87,12 @@ openai::ChatPromptFn MakeChatTemplatePromptFn(std::string template_str,
 // cannot be read or carries no chat_template.
 std::string LoadChatTemplateFromConfig(const std::string& tokenizer_config_path);
 
+// Load the chat template out of a .gguf file's `tokenizer.chat_template`
+// metadata (the llama.cpp-ecosystem convention for shipping the template
+// inside the model file, since a GGUF has no tokenizer_config.json). Throws
+// ChatTemplateError if the file cannot be read or carries no such key.
+std::string LoadChatTemplateFromGguf(const std::string& gguf_path);
+
 }  // namespace vllm::entrypoints
 
 #endif  // VLLM_ENTRYPOINTS_CHAT_TEMPLATE_H_

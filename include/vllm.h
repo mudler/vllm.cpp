@@ -46,8 +46,11 @@ extern "C" {
  * between the header it compiled against and the loaded library.
  * v2: structured-output constraint fields appended to vllm_sampling_params
  * (structured_json / structured_regex / structured_choice / structured_grammar /
- * structured_json_object). */
-#define VLLM_ABI_VERSION 2
+ * structured_json_object).
+ * v3: OpenAI-style chat entry points (vllm_chat / vllm_chat_stream) — chat
+ * templating, tool_choice lowering, and streaming tool-call parsing run
+ * ENGINE-SIDE. */
+#define VLLM_ABI_VERSION 3
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -255,6 +258,45 @@ VLLM_API const char* vllm_request_error(const vllm_request* request);
  * a no-op. The parent engine must still be alive. Must not be called from the
  * request's own callback; use cancel there and free from another thread. */
 VLLM_API void vllm_request_free(vllm_request* request);
+
+/* ── Chat completions (ABI v3) ────────────────────────────────────────────────
+ * OpenAI-style chat entry points over the SAME engine handle. The heavy
+ * lifting runs ENGINE-SIDE, exactly like the bundled OpenAI server:
+ *   - request_json is one OpenAI /v1/chat/completions request object
+ *     (messages, tools, tool_choice, temperature, top_p, max_tokens, stop,
+ *     ...). The `model` and `stream` fields are ignored (the handle's model
+ *     serves; streaming is selected by the entry point).
+ *   - The chat template is applied by the engine's renderer. It is resolved
+ *     at vllm_engine_load: <model_dir>/tokenizer_config.json `chat_template`,
+ *     or the GGUF `tokenizer.chat_template` metadata for a .gguf model; when
+ *     neither exists, a plain "<role>: <content>" join is used.
+ *   - tools + tool_choice lower to the engine's structural-tag DECODE
+ *     constraint: `auto` is LAZY (the ENGINE decides when a tool engages —
+ *     text is unconstrained until the model emits the tool trigger, then the
+ *     call is grammar-constrained); `required`/named force a call; `none`
+ *     disables. Tool-call output is parsed engine-side (streaming-stateful
+ *     Hermes-style parser) into structured tool_calls deltas.
+ *
+ * vllm_chat: BLOCKING non-streaming completion. On VLLM_OK, *out_response_json
+ * is a heap NUL-terminated ChatCompletionResponse JSON object (choices with
+ * message.content / message.tool_calls, finish_reason "stop"/"length"/
+ * "tool_calls", usage) that the CALLER frees via vllm_string_free. On error,
+ * *out_response_json is NULL and vllm_last_error() is set (a malformed
+ * request_json maps to VLLM_ERR_INVALID_ARGUMENT). */
+VLLM_API vllm_status vllm_chat(vllm_engine* engine, const char* request_json,
+                               char** out_response_json);
+
+/* vllm_chat_stream: BLOCKING streaming completion. `cb` receives ONE OpenAI
+ * chat.completion.chunk JSON object per invocation in delta_text (no SSE
+ * framing): first the role chunk, then content and/or tool_calls delta chunks
+ * as the engine-side parser emits them, then the finish chunk; after the last
+ * chunk the callback is invoked once more with finished == true and an empty
+ * delta. Returning false from the callback aborts the in-flight request
+ * (VLLM_OK is still returned). The borrow/threading contract of
+ * vllm_token_callback applies unchanged. */
+VLLM_API vllm_status vllm_chat_stream(vllm_engine* engine,
+                                      const char* request_json,
+                                      vllm_token_callback cb, void* user_data);
 
 /* ── Memory helpers ───────────────────────────────────────────────────────────
  * Free a heap string returned by the library. NULL is a no-op. */

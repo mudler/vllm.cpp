@@ -285,7 +285,11 @@ G1/G3-G6 pending). ABI v2 (2026-07-23, `CLAIM-CAPI-STRUCTURED-V2`): additive
 structured-output constraint fields on `vllm_sampling_params`
 (`structured_json`/`structured_regex`/`structured_choice`/`structured_grammar`/
 `structured_json_object`), lowered to `StructuredOutputsParams` under the
-upstream exactly-one rule; `VLLM_ABI_VERSION` bumped 1→2. The
+upstream exactly-one rule; `VLLM_ABI_VERSION` bumped 1→2. ABI v3 (2026-07-24, `CLAIM-CAPI-CHAT-V3`): `vllm_chat` /
+`vllm_chat_stream` — OpenAI chat request JSON in, response / chunk JSON out,
+running the engine-side serving-chat pipeline (chat template incl. GGUF
+`tokenizer.chat_template` via `LoadChatTemplateFromGguf`, structural-tag
+tool_choice, streaming Hermes tool parsing); 17→19 exported symbols. The
 richer C++ API (`include/vllm/*.hpp` mirroring `LLM`/`AsyncLLM`) is later.
 Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI server),
 `examples/bench` (M2). DoD (LocalAI-style dlopen consumption) MET.

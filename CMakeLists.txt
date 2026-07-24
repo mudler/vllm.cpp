@@ -327,6 +327,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/gemma_registry.cpp
   src/vllm/model_executor/models/gemma_weights.cpp
   src/vllm/model_executor/models/gemma.cpp
+  src/vllm/model_executor/models/olmo2_registry.cpp
+  src/vllm/model_executor/models/olmo2_weights.cpp
+  src/vllm/model_executor/models/olmo2.cpp
   src/vllm/model_executor/models/model_registry.cpp
   src/vllm/tokenizer/unicode_data.cpp
   src/vllm/tokenizer/pretokenizer.cpp

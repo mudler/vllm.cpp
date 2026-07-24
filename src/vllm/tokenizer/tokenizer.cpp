@@ -144,9 +144,26 @@ void WalkPreTokenizer(const json& node, std::vector<std::string>& regexes,
     return;
   }
   if (type == "Split") {
-    if (node.value("behavior", "") != "Isolated" ||
-        node.value("invert", false)) {
-      Fail("Split pre-tokenizer must be behavior=Isolated, invert=false");
+    // Two equivalent encodings of "keep each regex match as its own pre-token"
+    // over a FULLY-COVERING pattern (the GPT-4/cl100k regex every byte-level BPE
+    // family here uses):
+    //   - behavior=Isolated, invert=false  — Qwen/Llama-3/GLM/DeepSeek express it
+    //     this way (the pattern is the delimiter, Isolated keeps it as a piece);
+    //   - behavior=Removed,  invert=true   — OLMo-2 (GPT-NeoX/tiktoken-derived)
+    //     expresses it this way (invert makes the pattern's matches the pieces,
+    //     Removed drops the — inverted, i.e. non-matched — gaps).
+    // For a full-cover pattern the two produce the IDENTICAL piece sequence, so
+    // the inverted form is accepted and pushes the SAME regex (mapped to kLlama3
+    // by DetectPattern via the shared `\p{N}{1,3}` marker). Verified by round-trip
+    // vs the HF tokenizer on the OLMo-2 prompt battery. Additive: no existing
+    // checkpoint uses the inverted form, so their tokenization is unchanged.
+    const std::string behavior = node.value("behavior", "");
+    const bool invert = node.value("invert", false);
+    const bool isolated = behavior == "Isolated" && !invert;
+    const bool removed_inverted = behavior == "Removed" && invert;
+    if (!isolated && !removed_inverted) {
+      Fail("Split pre-tokenizer must be behavior=Isolated,invert=false or "
+           "behavior=Removed,invert=true");
     }
     const auto pat = node.find("pattern");
     if (pat == node.end() || !pat->is_object() || !pat->contains("Regex") ||

@@ -14,9 +14,54 @@ dense forward almost verbatim") + §B.3 Tier-2 rank 8. **Gold-standard spike sha
 mirrored:** [`sweep-gemma.md`](sweep-gemma.md),
 [`glm-dsa-latest-deepseek.md`](glm-dsa-latest-deepseek.md).
 
-Row advanced `INVENTORIED` -> `SPIKE`:
+Row advanced `INVENTORIED` -> `SPIKE` -> `ACTIVE` (W0-W4 LANDED 2026-07-24):
 `MODEL-TEXT-olmo2-olmo2-for-causal-lm` (`Olmo2ForCausalLM`, `Olmo3ForCausalLM` — one
 vLLM class, one row).
+
+## W0-W4 RESULT (LANDED 2026-07-24, base `origin/main` f312fd5)
+
+**SACRED gate PASSES 16/16** on `allenai/OLMo-2-0425-1B` vs vLLM 0.25.0 greedy —
+**STRICT** form (vLLM K=5 per-prompt ALL-DETERMINISTIC, 0 multi-member cells):
+STRICT token-exact 13/16 + near-tie-band 3/16 (max teacher-forced gap **0.094
+nats**, far below the 0.5-nat bar), **0 forward-divergent**. The two new wiring
+facts (pure post-norm placement + full-width qk-norm) are proven correct — a
+misplaced norm or wrong qk-norm width would emit fluent-WRONG tokens > 0.5 nats
+out (none did; all 16 first-tokens exact).
+
+**W0 grounded facts (dgx):** real config = hidden 2048, 16 layers, 16 attn heads
+(MHA: num_kv_heads=16), head_dim 128, intermediate 8192, rope_theta **500000**,
+rope_scaling null (full NeoX rope, rotary_dim==head_dim), rms_norm_eps 1e-6,
+vocab 100352, **`tie_word_embeddings: FALSE`** (UNTIED lm_head — the 1B is NOT
+tied, differs from the spike's "ties conditionally" guess). q_norm[2048]/k_norm[2048]
+(FULL-WIDTH confirmed). **On-disk dtype is F32** (all 179 tensors) — vLLM serves
+bf16, so the loader downcasts f32→bf16 (round-to-nearest-even via `vt::F32ToBF16`)
+to reproduce vLLM's bf16 weights. **BOS: OLMo-2 prepends NO BOS** (oracle prompt
+ids == plain tokenizer, no `<|endoftext|>`=100257 prefix; `add_bos_token` unset) —
+verified vs the oracle; our engine must not add one (the gate confirms parity).
+**Olmo-3 oracle finding: the 0.25.0 oracle CONSTRUCTS `Olmo3Config`** AND both
+`Olmo2ForCausalLM`+`Olmo3ForCausalLM` are registered in vLLM 0.25.0 — so the
+Olmo-3 sliding-window e2e (W5) is UNBLOCKED (no oracle gap), reserved as a
+follow-on (out of the W0-W4 scope here).
+
+**Tokenizer (the one shared-TU touch):** OLMo-2's `tokenizer.json` uses a Split
+pre-tokenizer with `behavior=Removed, invert=true` — the tiktoken/GPT-NeoX way of
+expressing the SAME full-cover cl100k/GPT-4 regex that Qwen/Llama-3/GLM express as
+`behavior=Isolated, invert=false`. For a full-cover pattern the two produce the
+IDENTICAL piece sequence. `tokenizer.cpp::WalkPreTokenizer` gained a GUARDED
+additive branch accepting the inverted form (mapping to the existing `kLlama3`
+pattern via the shared `\p{N}{1,3}` marker); no other checkpoint uses the inverted
+form, so their tokenization is byte-identical. This makes OLMo-2 a REAL
+tokenizer-inclusive gate (round-trips OLMo-2's tokenizer.json).
+
+**Impl (new files only + 1 guarded tokenizer branch):**
+`include/vllm/model_executor/models/olmo2.h`,
+`src/vllm/model_executor/models/{olmo2,olmo2_weights,olmo2_registry}.cpp`,
+`tests/parity/test_olmo2_paged_engine.cpp`, goldens
+`tests/parity/goldens/olmo2_greedy_1b/`, +CMake build-glue. Loader: 179 tensors,
+zero unmapped/zero missing, full-width q_norm/k_norm + untied lm_head + merged
+qkv/gate_up. Reuses `glm4-oracle-capture.py`/`glm4-neartie-gap.py` (model-agnostic).
+Runs EAGER (bf16 dense, no decode graph). SPEED: PENDING (W6). W5 (Olmo-3 sliding
+window) + W6 (speed) remain out of this landing.
 
 Explicitly LEFT `INVENTORIED` (out of scope, each with a reason in §Scope):
 `MODEL-TEXT-olmo-olmo-for-causal-lm` (OLMo-1 — a DIFFERENT norm: non-parametric

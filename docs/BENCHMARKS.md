@@ -104,19 +104,27 @@ unchanged) - EMPIRICAL WITNESS from the clean build: **Gemma-3 48/48, Qwen3-dens
 the identical `logits_soft_cap==0` path and are byte-identical by construction; not
 re-run this pass (GB10 GPU time / unified-memory OOM safety).
 
-**OLMo-2 family (`Olmo2ForCausalLM` / `Olmo3ForCausalLM`) - NOT APPLICABLE (spike
-only), 2026-07-24, `CLAIM-SWEEP-OLMO2` ([spike](../.agents/specs/sweep-olmo2.md)).**
-Disposition: **NO number - design only, no code, no build, no benchmark, nothing
-downloaded.** No throughput or correctness is claimed or possible without
-implementation. The spike's binding findings: OLMo-2 is the cleanest dense bring-up
-yet (ZERO new compute kernels); its reordered post-norm placement (`norm_after`) is a
-subset of the landed GLM-4/Gemma sandwich norms (reusing the standalone output-norm op,
-dropping the pre-norms) and its full-width QK-norm reuses the existing `vt::RmsNorm` op
-at a new shape (not the per-head fused recipe). Gate vehicle `allenai/OLMo-2-0425-1B`
-(~2.77 GiB, fits GB10); the gate form is selected BY MEASUREMENT (vLLM K=5
-self-determinism) at W0. When implemented, the regression bar is all 13 current SACRED
-gates unchanged (new-files-only), and SPEED stays PENDING until the every-axis grid vs
-vLLM at W6 - a row reaches DONE only at token-exact AND vLLM throughput on every axis.
+**OLMo-2 (`Olmo2ForCausalLM` / `Olmo3ForCausalLM`) - CORRECTNESS COMPLETE, no speed
+number (2026-07-24, `CLAIM-SWEEP-OLMO2` [spike](../.agents/specs/sweep-olmo2.md)).**
+The first OLMo-family model. Disposition: **NO throughput measured or claimed - SPEED
+PENDING.** Gate form selected BY MEASUREMENT: vLLM 0.25.0 per-prompt greedy on
+`allenai/OLMo-2-0425-1B` is **ALL-DETERMINISTIC over K=5** (0 multi-member (prompt,pos)
+cells across 16x16) ⇒ **STRICT token-exact bar**. **SACRED gate PASSES 16/16**
+(`test_olmo2_paged_engine`, 92 assertions, dgx): STRICT token-exact 13/16 + near-tie-band
+3/16 (max teacher-forced gap **0.094 nats**, far under the 0.5-nat bar), **0
+forward-divergent**. The two new wiring facts are proven applied — a misplaced norm or
+wrong qk-norm width would emit fluent-WRONG tokens > 0.5 nats out (all 16 first-tokens
+exact). ZERO new compute kernels: pure post-norm (`norm_after`) = standalone `vt::RmsNorm`
+on each sublayer OUTPUT + plain `vt::Add`, NO pre-norm; full-width QK-norm = two standalone
+`vt::RmsNorm` over `[T,q_size]`/`[T,kv_size]` before NeoX rope. Checkpoint is F32 on-disk →
+loader downcasts f32→bf16 to match vLLM-bf16; UNTIED lm_head; NO-BOS ByteLevel tokenizer
+(a real tokenizer-inclusive gate). Olmo3Config CONSTRUCTS in the 0.25.0 oracle (W5
+sliding-window e2e unblocked). **Regression (ONE guarded shared-TU touch — `tokenizer.cpp`
+accepts the OLMo-2 Split `Removed/invert=true` encoding, inert for every non-OLMo
+checkpoint):** the fast dense SACRED gates re-run byte-identical (see the clean-build
+witness above); no kernel/runner/forward edit. SPEED stays PENDING until the every-axis
+grid vs vLLM at W6 - a row reaches DONE only at token-exact AND vLLM throughput on every
+axis.
 
 **GLM-4 dense (`Glm4ForCausalLM`, GLM-4-9B-0414) - CORRECTNESS COMPLETE, no speed
 number (2026-07-24, `CLAIM-GLM-DSA-LATEST-DEEPSEEK` task G2,

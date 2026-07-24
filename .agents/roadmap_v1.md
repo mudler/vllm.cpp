@@ -85,6 +85,11 @@ Qwen3-32B dense/NVFP4A16 (dense forward done + W4A16 loader), OPT-125m cross-fam
 (near-tie-robust where vLLM is self-inconsistent) AND vLLM-speed on every axis. This drives
 `ROAD-V1-C2` (model half, actionable) + `ROAD-V1-D1` (device half, HW-blocked). AFTER the first
 sweep: Metal/MLX (M4), Intel XPU, Vulkan, CPU-opt (benchmark vs llama.cpp, steal faster ideas).
+**Sweep progress (correctness-complete, speed pending):** Qwen3-Coder-30B, Qwen3-32B-NVFP4A16,
+OPT-125m, Llama-3.2-1B, Mistral-7B, Gemma-1/2/3, GLM-4-9B, GLM-4.7-Flash, DeepSeek-V2-Lite (MLA),
+and now **OLMo-2 (`Olmo2ForCausalLM`/`Olmo3ForCausalLM`, SACRED 16/16, ZERO new kernels)** all
+landed with passing SACRED gates; OLMo-2's `Olmo3ForCausalLM` alias + Olmo-3 sliding-window e2e
+(W5) and every landed model's speed close remain.
 
 ## Top-level portfolio
 

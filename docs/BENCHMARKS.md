@@ -2001,6 +2001,25 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Tool-parser wave B2 + the reasoning-parser seam - `NOT APPLICABLE`
+  (2026-07-24, `CLAIM-TOOL-PARSERS-B2`).** `benchmark_binding=false`.
+  **Serving-layer additions, no decode-path change.** Eleven more tool
+  dialects ported 1:1 from the pin (deepseek_v32/v4 DSML, xlam,
+  phi4_mini_json, internlm, jamba (vocab->text rework), step3, step3p5 (the
+  1519-line XML streaming state machine, all 19 upstream cases + split
+  edges), minicpm5, hy_v3, olmo3 (reusing the extracted pythonic_core)) -
+  23 registered dialects total - plus the GREENFIELD reasoning-parser seam:
+  BaseThinkingReasoningParser with the ported 25-case upstream contract,
+  six parsers (deepseek_r1, mistral, minimax_m2, minimax_m2_append_think,
+  step3, olmo3), `reasoning` on ChatMessage/DeltaMessage, and serving-chat
+  routing reasoning BEFORE tool extraction in stream + non-stream paths.
+  Detection table now 18 rows with cross-family ordering pinned by tests
+  (jamba exact before hy_v3 prefix; step3p5 inner marker before hermes).
+  ~200 new doctest cases across 13 new suites, all green; serving suites
+  unchanged-green (one conformance run was the known parallel-ctest load
+  flake, green serially). No binding number is created, re-based, or
+  invalidated.
+
 - **Tool-parser wave B1: seven vLLM parser families ported + detection table
   populated - `NOT APPLICABLE` (2026-07-24, `CLAIM-TOOL-PARSERS-B1`).**
   `benchmark_binding=false`. **Serving-layer parsing additions, no decode-path

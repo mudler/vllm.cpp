@@ -190,6 +190,18 @@ deepseek_v31, longcat, utils; refactor: hermes virtual accessors; detect
 table), `tests/vllm/entrypoints/openai/tool_parsers/*`, CMake wiring. Details
 in the state-log entry of the same date.
 
+**Tool-parser wave B2 + reasoning seam coordination note (2026-07-24,
+`CLAIM-TOOL-PARSERS-B2`, DONE, direct-to-main, user-directed, five subagent
+worktrees + integrator).** Eleven more tool dialects (23 total) + the
+greenfield reasoning-parser seam (six parsers, serving-chat
+reasoning-before-tools routing, `reasoning` chunk field). Integrator fixed
+two keep-both merge brace artifacts and the example server's ServingChat
+call site (ctor gained reasoning_parser_name), extended the detection table
+to 18 ordering-pinned rows. Scope: `{include,src}/vllm/entrypoints/openai/
+{tool_parsers,reasoning_parsers}/*`, serving_chat.*, protocol.*,
+examples/server/main.cpp, tests, CMake. Details in the state-log entry of
+the same date.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-MLA-PREFIX-CACHE-ASSERT` | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` (bugfix — restores its SACRED gate under asserts-enabled builds; the shared prefix-cache manager assertion it relaxes stays owned by `CLAIM-PREFIX-PROMPT-CACHING`, no row-state change to that row) | Claude Code (opus-4-8) | isolated worktree `/home/mudler/_git/vllm.cpp-mla-fix` (branch `fix/mla-prefix-cache-assert`, base `6abe09c`); dgx repro `/home/mudler/repro_deepseek` (unfixed) + `/home/mudler/repro_fixed` (fixed) | `fix/mla-prefix-cache-assert` | `src/vllm/v1/core/single_type_kv_cache_manager.cpp` (assert only) + `tests/vllm/v1/test_single_type_kv_cache_manager.cpp` (new MLA cases) | `DONE` (2026-07-23) | 2026-07-23 root-caused + fixed the DeepSeek-V2 assert abort |

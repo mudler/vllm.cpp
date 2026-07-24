@@ -91,3 +91,27 @@ TEST_CASE("detect: specific markers beat the generic hermes tail row") {
   CHECK(DetectToolParser("<longcat_tool_call> and <tool_call>") == "longcat");
   CHECK(DetectToolParser("[TOOL_CALLS] then <tool_call>") == "mistral");
 }
+
+TEST_CASE("detect: wave B2 families resolve from their template markers") {
+  CHECK(DetectToolParser("..<｜DSML｜function_calls>..") == "deepseek_v32");
+  CHECK(DetectToolParser("..<｜DSML｜tool_calls>..") == "deepseek_v4");
+  CHECK(DetectToolParser("..<｜tool_calls_begin｜>..") == "step3");
+  CHECK(DetectToolParser("..<function name=\"x\">..") == "minicpm5");
+  CHECK(DetectToolParser("..<function_calls>[f(x=1)]..") == "olmo3");
+  CHECK(DetectToolParser("..<|action_start|><|plugin|>..") == "internlm");
+  CHECK(DetectToolParser("..functools[..") == "phi4_mini_json");
+  CHECK(DetectToolParser("..<tool_calls>[..") == "jamba");
+  CHECK(DetectToolParser("..<tool_callsSFX>..") == "hy_v3");
+  CHECK(DetectToolParser("..<tool_call><function=f>..") == "step3p5");
+}
+
+TEST_CASE("detect: B2 ordering - exact jamba beats the hy_v3 prefix, step3p5 beats hermes") {
+  // jamba's exact "<tool_calls>" row precedes hy_v3's prefix probe.
+  CHECK(DetectToolParser("<tool_calls>") == "jamba");
+  // A suffixed hy_v3 tag misses jamba's exact literal and lands on the prefix.
+  CHECK(DetectToolParser("<tool_calls_v1>") == "hy_v3");
+  // step3p5's inner "<function=" wins over the generic hermes wrapper.
+  CHECK(DetectToolParser("<tool_call><function=get>") == "step3p5");
+  // A plain hermes template still falls through to hermes.
+  CHECK(DetectToolParser("<tool_call>{\"name\"") == "hermes");
+}

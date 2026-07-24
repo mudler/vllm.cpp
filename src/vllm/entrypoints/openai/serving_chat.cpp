@@ -171,16 +171,38 @@ void ApplyToolChoiceStructuredOutput(const ChatCompletionRequest& request,
 ShapedChatMessage ShapeChatMessage(
     const std::string& role, const std::string& model_output,
     std::optional<std::string> output_finish_reason,
-    const ChatCompletionRequest& request, ToolParser* parser) {
+    const ChatCompletionRequest& request, ToolParser* parser,
+    ReasoningParser* reasoning_parser) {
   ShapedChatMessage shaped;
   shaped.message.role = role;
+
+  // chat_completion/serving.py:858-866. Reasoning runs FIRST: strip the
+  // chain-of-thought, then tool detection operates ONLY on the user-visible
+  // content. `content_span` is what the tool parser (and a plain message) see;
+  // `has_content_span` distinguishes an absent post-reasoning span (pure
+  // reasoning, content=None) from an empty one.
+  std::string content_span = model_output;
+  bool has_content_span = true;
+  std::optional<std::string> reasoning;
+  if (reasoning_parser != nullptr) {
+    const ExtractedReasoning er =
+        reasoning_parser->extract_reasoning(model_output, request);
+    reasoning = er.reasoning;
+    has_content_span = er.content.has_value();
+    content_span = er.content.value_or(std::string());
+  }
+  const auto attach_reasoning = [&]() {
+    if (reasoning.has_value() && !reasoning->empty()) {
+      shaped.message.reasoning = reasoning;
+    }
+  };
 
   // chat_completion/serving.py:899-923 (the "auto" path). When tools are active
   // and a parser exists, extract; on tools_called, the finish_reason becomes
   // "tool_calls" (:936).
   if (parser != nullptr && ToolsEnabled(request)) {
     const ExtractedToolCallInformation info =
-        parser->extract_tool_calls(model_output, request);
+        parser->extract_tool_calls(content_span, request);
     if (info.tools_called && !info.tool_calls.empty()) {
       if (info.content.has_value()) {
         shaped.message.content = SanitizeUtf8(*info.content);
@@ -189,21 +211,28 @@ ShapedChatMessage ShapeChatMessage(
       }
       shaped.message.tool_calls = info.tool_calls;
       shaped.finish_reason = "tool_calls";
+      attach_reasoning();
       return shaped;
     }
     // tools_called=false → fall through to a plain-content message with the
-    // parser's content (the whole output).
-    shaped.message.content =
-        SanitizeUtf8(info.content.value_or(model_output));
+    // parser's content (the post-reasoning span).
+    shaped.message.content = SanitizeUtf8(info.content.value_or(content_span));
     shaped.finish_reason = std::move(output_finish_reason);
     if (!shaped.finish_reason.has_value()) shaped.finish_reason = "stop";
+    attach_reasoning();
     return shaped;
   }
 
-  // No tools: plain content message (:881).
-  shaped.message.content = SanitizeUtf8(model_output);
+  // No tools: plain content message (:881). With a reasoning parser, an absent
+  // post-reasoning span means content=null (pure reasoning turn).
+  if (reasoning_parser != nullptr && !has_content_span) {
+    shaped.message.content = std::nullopt;
+  } else {
+    shaped.message.content = SanitizeUtf8(content_span);
+  }
   shaped.finish_reason = std::move(output_finish_reason);
   if (!shaped.finish_reason.has_value()) shaped.finish_reason = "stop";
+  attach_reasoning();
   return shaped;
 }
 
@@ -211,9 +240,52 @@ std::optional<DeltaMessage> ShapeChatDelta(const std::string& previous_text,
                                            const std::string& current_text,
                                            const std::string& delta_text,
                                            const ChatCompletionRequest& request,
-                                           ToolParser* parser) {
-  // chat_completion/serving.py:589-613 — with a parser, run the streaming parse;
-  // otherwise emit a plain content delta.
+                                           ToolParser* parser,
+                                           ReasoningParser* reasoning_parser) {
+  // chat_completion/serving.py:587-613. Reasoning runs BEFORE tools. The
+  // reasoning parser splits this delta into a reasoning span (rides on
+  // DeltaMessage.reasoning) and a post-reasoning CONTENT span; only that content
+  // span is routed to the tool parser, so the tool parse never sees the thoughts.
+  if (reasoning_parser != nullptr) {
+    std::optional<DeltaMessage> rd = reasoning_parser->extract_reasoning_streaming(
+        previous_text, current_text, delta_text, request);
+    if (!rd.has_value()) return std::nullopt;  // lone marker swallowed
+
+    const bool tools = (parser != nullptr && ToolsEnabled(request));
+    if (!tools) return rd;  // reasoning and/or content deltas straight through
+
+    const std::string content_delta = rd->content.value_or(std::string());
+    const std::optional<std::string> reasoning_piece = rd->reasoning;
+    if (content_delta.empty()) {
+      if (reasoning_piece.has_value()) {
+        DeltaMessage m;
+        m.reasoning = reasoning_piece;
+        return m;
+      }
+      return std::nullopt;
+    }
+
+    // Content-space offsets for the (stateful) tool parser, derived from the
+    // reasoning split of the accumulated prefix: the content the user has seen
+    // so far, without any reasoning.
+    const std::string content_prev =
+        reasoning_parser->extract_reasoning(previous_text, request)
+            .content.value_or(std::string());
+    const std::string content_curr = content_prev + content_delta;
+    std::optional<DeltaMessage> td = parser->extract_tool_calls_streaming(
+        content_prev, content_curr, content_delta, request);
+
+    DeltaMessage out = td.value_or(DeltaMessage{});
+    if (reasoning_piece.has_value()) out.reasoning = reasoning_piece;
+    if (!td.has_value() && !reasoning_piece.has_value() &&
+        !out.content.has_value()) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // No reasoning parser: with a tool parser, run the streaming parse; otherwise
+  // emit a plain content delta.
   if (parser != nullptr && ToolsEnabled(request)) {
     return parser->extract_tool_calls_streaming(previous_text, current_text,
                                                 delta_text, request);
@@ -234,8 +306,9 @@ class ChatSseStream final : public SseStream {
   ChatSseStream(v1::AsyncLLM& engine, v1::AsyncRequest async_request,
                 std::string response_id, int64_t created, std::string model,
                 ChatCompletionRequest request,
-                std::unique_ptr<ToolParser> parser, bool named_tool_choice,
-                StreamUsageSelection usage)
+                std::unique_ptr<ToolParser> parser,
+                std::unique_ptr<ReasoningParser> reasoning_parser,
+                bool named_tool_choice, StreamUsageSelection usage)
       : engine_(engine),
         async_request_(std::move(async_request)),
         response_id_(std::move(response_id)),
@@ -243,6 +316,7 @@ class ChatSseStream final : public SseStream {
         model_(std::move(model)),
         request_(std::move(request)),
         parser_(std::move(parser)),
+        reasoning_parser_(std::move(reasoning_parser)),
         named_tool_choice_(named_tool_choice),
         usage_(usage) {}
 
@@ -333,7 +407,8 @@ class ChatSseStream final : public SseStream {
       previous_num_tokens_ += static_cast<int>(output.token_ids.size());
       const std::string current_text = previous_text_ + delta_text;
       std::optional<DeltaMessage> delta = ShapeChatDelta(
-          previous_text_, current_text, delta_text, request_, parser_.get());
+          previous_text_, current_text, delta_text, request_, parser_.get(),
+          reasoning_parser_.get());
       previous_text_ = current_text;
 
       if (delta.has_value() && delta->tool_calls.has_value() &&
@@ -393,6 +468,7 @@ class ChatSseStream final : public SseStream {
   std::string model_;
   ChatCompletionRequest request_;
   std::unique_ptr<ToolParser> parser_;
+  std::unique_ptr<ReasoningParser> reasoning_parser_;
   bool named_tool_choice_ = false;
   StreamUsageSelection usage_;
   std::optional<RequestOutput> buffered_response_;
@@ -416,26 +492,35 @@ std::unique_ptr<ToolParser> OpenAIServingChat::MakeToolParser(
   return get_tool_parser(tool_parser_name_);
 }
 
+std::unique_ptr<ReasoningParser> OpenAIServingChat::MakeReasoningParser() const {
+  if (reasoning_parser_name_.empty()) return nullptr;
+  return get_reasoning_parser(reasoning_parser_name_);
+}
+
 OpenAIServingChat::OpenAIServingChat(v1::LLMEngine& engine,
                                      std::string served_model_name,
                                      ChatPromptFn prompt_fn,
                                      std::string tool_parser_name,
+                                     std::string reasoning_parser_name,
                                      bool enable_force_include_usage)
     : sync_engine_(&engine),
       served_model_name_(std::move(served_model_name)),
       prompt_fn_(std::move(prompt_fn)),
       tool_parser_name_(std::move(tool_parser_name)),
+      reasoning_parser_name_(std::move(reasoning_parser_name)),
       enable_force_include_usage_(enable_force_include_usage) {}
 
 OpenAIServingChat::OpenAIServingChat(v1::AsyncLLM& engine,
                                      std::string served_model_name,
                                      ChatPromptFn prompt_fn,
                                      std::string tool_parser_name,
+                                     std::string reasoning_parser_name,
                                      bool enable_force_include_usage)
     : async_engine_(&engine),
       served_model_name_(std::move(served_model_name)),
       prompt_fn_(std::move(prompt_fn)),
       tool_parser_name_(std::move(tool_parser_name)),
+      reasoning_parser_name_(std::move(reasoning_parser_name)),
       enable_force_include_usage_(enable_force_include_usage) {}
 
 ChatCompletionResult OpenAIServingChat::create_chat_completion(
@@ -463,6 +548,9 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
   // One tool parser per request (the streaming parse is stateful); null when the
   // request has no tools (or the parser is disabled).
   std::unique_ptr<ToolParser> parser = MakeToolParser(request);
+  // One reasoning parser per request (streaming may be stateful, olmo3); null
+  // when disabled (empty reasoning_parser_name_). Independent of tools.
+  std::unique_ptr<ReasoningParser> reasoning_parser = MakeReasoningParser();
   const bool named_tool_choice = IsNamedToolChoice(request);
 
   SamplingParams sampling_params = request.to_sampling_params();
@@ -488,7 +576,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
       try {
         result.sse_stream = std::make_shared<ChatSseStream>(
             *async_engine_, async_request, request_id, created_time, model_name,
-            request, std::move(parser), named_tool_choice, usage);
+            request, std::move(parser), std::move(reasoning_parser),
+            named_tool_choice, usage);
       } catch (...) {
         async_engine_->abort(async_request.request_id);
         throw;
@@ -550,7 +639,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
 
           const std::string current_text = previous_text + delta_text;
           std::optional<DeltaMessage> delta_message = ShapeChatDelta(
-              previous_text, current_text, delta_text, request, parser.get());
+              previous_text, current_text, delta_text, request, parser.get(),
+              reasoning_parser.get());
           previous_text = current_text;
 
           // :598-599 — a tool-call delta flips the finish_reason to tool_calls.
@@ -631,7 +721,8 @@ ChatCompletionResult OpenAIServingChat::create_chat_completion(
     // and set finish_reason="tool_calls"; else a plain-content assistant message
     // (finish_reason = output.finish_reason or "stop", :956-960).
     ShapedChatMessage shaped = ShapeChatMessage(
-        kAssistantRole, output.text, output.finish_reason, request, parser.get());
+        kAssistantRole, output.text, output.finish_reason, request, parser.get(),
+        reasoning_parser.get());
     choice.message = std::move(shaped.message);
     choice.finish_reason = std::move(shaped.finish_reason);
     response.choices.push_back(std::move(choice));

@@ -286,7 +286,8 @@ int main(int argc, char** argv) {
                 << "); falling back to the simple role-join prompt\n";
     }
     oai::OpenAIServingChat chat(engine, served_model_name, chat_prompt_fn,
-                                "hermes", args.enable_force_include_usage);
+                                "hermes", /*reasoning_parser_name=*/"",
+                                args.enable_force_include_usage);
 
     // Diagnostic opt-out exists only for same-binary attribution. Production
     // defaults to the capacity-derived fixed pool.

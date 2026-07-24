@@ -335,7 +335,7 @@ struct ServerHarness {
         models("test-model"),
         completion(async_engine, "test-model", enable_force_include_usage),
         chat(async_engine, "test-model", InVocabChatPrompt, "hermes",
-             enable_force_include_usage),
+             /*reasoning_parser_name=*/std::string(), enable_force_include_usage),
         server(completion, chat, models, "9.9.9", max_concurrent_streams) {}
 
   static SchedulerConfig MakeSchedulerConfig() {

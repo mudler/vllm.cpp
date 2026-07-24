@@ -33,6 +33,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/entrypoints/openai/protocol.h"
+#include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"
 #include "vllm/entrypoints/openai/serving_completion.h"  // SseStream
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"
 #include "vllm/sampling_params.h"
@@ -78,6 +79,14 @@ bool ToolsEnabled(const ChatCompletionRequest& request);
 // finish_reason. When `parser` is non-null AND ToolsEnabled(request), run
 // extract_tool_calls: on tools_called, attach tool_calls (+ the leading content)
 // and set finish_reason="tool_calls"; otherwise a plain-content message.
+//
+// REASONING (chat_completion/serving.py:858-866): when `reasoning_parser` is
+// non-null it runs FIRST: extract_reasoning splits `model_output` into a
+// reasoning span (attached to message.reasoning) and the remaining CONTENT, and
+// only that content is then handed to the tool parser. Order: reasoning strips
+// the chain-of-thought, then tool extraction runs over what the user actually
+// sees, exactly as upstream `parser.parse()` returns (reasoning, content,
+// tool_calls) with reasoning removed before tool detection.
 struct ShapedChatMessage {
   ChatMessage message;
   std::optional<std::string> finish_reason;
@@ -86,17 +95,25 @@ ShapedChatMessage ShapeChatMessage(const std::string& role,
                                    const std::string& model_output,
                                    std::optional<std::string> output_finish_reason,
                                    const ChatCompletionRequest& request,
-                                   ToolParser* parser);
+                                   ToolParser* parser,
+                                   ReasoningParser* reasoning_parser = nullptr);
 
 // Per-delta stream tool shaping (chat_completion/serving.py:589-613). When
 // `parser` is non-null AND ToolsEnabled(request), drive the STATEFUL streaming
 // parser (extract_tool_calls_streaming) → a DeltaMessage or nullopt (withhold).
 // Otherwise a plain-content DeltaMessage carrying `delta_text`.
+//
+// REASONING: when `reasoning_parser` is non-null it runs FIRST on the raw delta
+// (extract_reasoning_streaming). The reasoning span rides on the returned
+// DeltaMessage.reasoning; the post-reasoning CONTENT span (once </think> passes)
+// is what feeds the tool parser, with content-space previous/current offsets
+// derived from the reasoning split so the tool parse never sees the thoughts.
 std::optional<DeltaMessage> ShapeChatDelta(const std::string& previous_text,
                                            const std::string& current_text,
                                            const std::string& delta_text,
                                            const ChatCompletionRequest& request,
-                                           ToolParser* parser);
+                                           ToolParser* parser,
+                                           ReasoningParser* reasoning_parser = nullptr);
 
 // Ported from: vllm/tool_parsers/structural_tag_registry.py @ e24d1b24
 // (get_hermes_structural_tag:237-269 + _hermes_tool_tags:213-234). Build the
@@ -143,13 +160,18 @@ class OpenAIServingChat {
   // `tool_parser_name` selects the tool-call parser (get_tool_parser) used when
   // a request carries tools; default "hermes" (the gate model's format — Qwen3.6
   // shares it, see qwen3.h). Empty disables tool parsing.
+  // `reasoning_parser_name` selects the reasoning parser (get_reasoning_parser),
+  // mirroring the tool_parser_name pattern; default "" DISABLES reasoning
+  // extraction (the C ABI / capi wires the model-specific selection separately).
   OpenAIServingChat(v1::LLMEngine& engine, std::string served_model_name,
                     ChatPromptFn prompt_fn = DefaultChatPromptFallback,
                     std::string tool_parser_name = "hermes",
+                    std::string reasoning_parser_name = "",
                     bool enable_force_include_usage = false);
   OpenAIServingChat(v1::AsyncLLM& engine, std::string served_model_name,
                     ChatPromptFn prompt_fn = DefaultChatPromptFallback,
                     std::string tool_parser_name = "hermes",
+                    std::string reasoning_parser_name = "",
                     bool enable_force_include_usage = false);
 
   // create_chat_completion (chat_completion/serving.py:229).
@@ -166,11 +188,18 @@ class OpenAIServingChat {
   std::unique_ptr<ToolParser> MakeToolParser(
       const ChatCompletionRequest& request) const;
 
+  // Build the per-request reasoning parser (get_reasoning_parser) when a parser
+  // name is configured; else nullptr. ONE instance per request (the streaming
+  // parse may be stateful, olmo3). Unlike tools, reasoning does not gate on
+  // ToolsEnabled: a request without tools can still carry a chain-of-thought.
+  std::unique_ptr<ReasoningParser> MakeReasoningParser() const;
+
   v1::LLMEngine* sync_engine_ = nullptr;
   v1::AsyncLLM* async_engine_ = nullptr;
   std::string served_model_name_;
   ChatPromptFn prompt_fn_;
   std::string tool_parser_name_;
+  std::string reasoning_parser_name_;
   bool enable_force_include_usage_ = false;
   // request_id is "chatcmpl-<counter>" (upstream f"chatcmpl-{random_uuid()}").
   std::atomic<int64_t> request_counter_{0};

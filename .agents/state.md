@@ -21377,3 +21377,52 @@ parser-ENGINE-backed families (qwen3_coder, gemma4, glm4x, kimi_k2,
 minimax_m2, seed_oss — token-id state machines, NOT mechanically portable),
 Rust/Harmony-backed (minimax_m3, cohere_command, gpt-oss), the reasoning
 parser seam (greenfield), and per-family structural-tag specs beyond hermes.
+
+## 2026-07-24 — Tool-parser wave B2 (eleven dialects) + the reasoning-parser seam (`CLAIM-TOOL-PARSERS-B2`, autoparser-parity program W3+W5)
+
+Five task-scoped subagents in isolated worktrees; integrator merged, repaired
+two keep-both brace artifacts in the get_tool_parser chain (compile-caught),
+fixed examples/server/main.cpp for the widened OpenAIServingChat ctor,
+extended the detection table, and re-verified.
+
+Tool parsers added (23 registered dialects total): deepseek_v32 + deepseek_v4
+(DSML; 49/49 + 7/8 upstream cases; a REAL byte-level UTF-8 hold-back bug in
+the streaming escaper was surfaced by all-split-points CJK chunking and
+fixed), xlam (explicit-only: its four envelopes collide with everyone),
+phi4_mini_json, internlm, jamba (full vocab->text rework, behavior-identical
+by construction), step3 (ported BUG-FOR-BUG with upstream's xfailed quirks
+documented), step3p5 (the 1519-line XML streaming state machine: all 19
+upstream cases, typed parameter coercion mirrored, expat replaced by an
+in-file event emitter), minicpm5, hy_v3 (suffix-parametrized tags; only the
+"<tool_calls" prefix is template-stable), olmo3 (reuses the extracted
+pythonic_core; pythonic suite unregressed). utils gained
+find_common_suffix/extract_intermediate_diff.
+
+Reasoning seam (GREENFIELD): text-only ABC + registry
+(reasoning_parsers/abstract.*), BaseThinkingReasoningParser with the ported
+25-case upstream contract suite, parsers deepseek_r1 (<think>), mistral
+([THINK]), minimax_m2 + minimax_m2_append_think (end-token-only), step3,
+olmo3 (stateful overlap buffering). protocol gains `reasoning` on
+ChatMessage/DeltaMessage (serialized when present; the pin renamed
+reasoning_content->reasoning). serving_chat: reasoning_parser_name ctor
+param, per-request instance, reasoning split BEFORE tool extraction in both
+stream and non-stream paths (tool parsing operates on user-visible content
+only, mirroring the upstream parse order); end-to-end reasoning-delta cases
+added to the serving tests. The capi/ABI selection of a reasoning parser is
+the NEXT slice (ABI v5, with <think>/[THINK] template heuristics).
+
+Detection table: 18 rows, ordering pinned by tests (DSML rows adjacent to
+deepseek_v3; step3's ASCII-underscore marker distinct from deepseek's U+2581;
+jamba's exact "<tool_calls>" before hy_v3's prefix probe; step3p5's inner
+"<function=" above the hermes tail). Explicit-only set documented: granite4,
+pythonic, xlam, deepseek_v31, default-suffix hy_v3.
+
+Evidence: ~200 new doctest cases across 13 new suites green; full affected
+battery green (one test_openai_conformance failure under ctest -j12 was the
+known parallel-load httplib flake, green on serial rerun). Program remainder:
+pure-text wave B4 (hunyuan_a13b, apertus, gigachat3, functiongemma, lfm2,
+poolside_v1, ernie45, gigachat/cohere-text subset), ENG-backed families
+(qwen3_coder, gemma4, glm4x, kimi_k2, minimax_m2, seed_oss) pending a
+text-reimplementation vs engine-port decision, Rust/Harmony (minimax_m3,
+cohere_command, gpt-oss) descoped pending decision, ABI v5 reasoning
+selection, LocalAI closeout.

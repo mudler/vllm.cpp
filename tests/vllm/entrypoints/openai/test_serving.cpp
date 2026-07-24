@@ -9,6 +9,7 @@
 // serving.py @ e24d1b24.
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
+#include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"
 #include "vllm/entrypoints/openai/tool_parsers/hermes.h"
 
@@ -74,6 +75,8 @@ using vllm::entrypoints::openai::ToolChoice;
 using vllm::entrypoints::openai::ToolChoiceStructuralTagSpec;
 using vllm::entrypoints::openai::ToolParser;
 using vllm::entrypoints::openai::ToolsEnabled;
+using vllm::entrypoints::openai::ReasoningParser;
+using vllm::entrypoints::openai::get_reasoning_parser;
 using vllm::tok::Tokenizer;
 using vllm::v1::EngineCore;
 using vllm::v1::Executor;
@@ -1038,6 +1041,106 @@ TEST_CASE("serving_chat: streaming tool call emits name-first then arg deltas") 
   // The finish-reason rule the serving loop applies on the terminal chunk.
   const std::string finish = (tools_streamed) ? "tool_calls" : "stop";
   CHECK(finish == "tool_calls");
+}
+
+// ─── REASONING: a reasoning parser splits the chain-of-thought off the message
+//     BEFORE tool parsing. These prove the reasoning slot flows through the
+//     ShapeChatMessage / ShapeChatDelta serving seam (the harness the engine
+//     drives), independent of the model fixture. ───────────────────────────────
+
+// (r1) NON-STREAM, no tools: <think>...</think> → message.reasoning + content.
+TEST_CASE("serving_chat: non-stream reasoning splits reasoning + content") {
+  ChatCompletionRequest req;
+  req.messages = {ChatMessage{"user", std::string("hi")}};
+  std::unique_ptr<ReasoningParser> rparser = get_reasoning_parser("deepseek_r1");
+  REQUIRE(rparser != nullptr);
+
+  const std::string model_output =
+      "<think>the user greeted me</think>Hello there!";
+  ShapedChatMessage shaped =
+      ShapeChatMessage("assistant", model_output, std::string("stop"), req,
+                       /*parser=*/nullptr, rparser.get());
+
+  REQUIRE(shaped.message.reasoning.has_value());
+  CHECK(*shaped.message.reasoning == "the user greeted me");
+  REQUIRE(shaped.message.content.has_value());
+  CHECK(*shaped.message.content == "Hello there!");
+
+  // The serialized response carries a "reasoning" key alongside content.
+  ChatCompletionResponseChoice choice;
+  choice.message = shaped.message;
+  choice.finish_reason = shaped.finish_reason;
+  json j = choice;
+  CHECK(j.at("message").at("reasoning") == "the user greeted me");
+  CHECK(j.at("message").at("content") == "Hello there!");
+}
+
+// (r2) STREAM, no tools: fake in-vocab think-token stream → reasoning deltas
+//     first, then content deltas; each carries the right JSON slot.
+TEST_CASE("serving_chat: streaming reasoning emits reasoning then content deltas") {
+  ChatCompletionRequest req;
+  req.messages = {ChatMessage{"user", std::string("hi")}};
+  req.stream = true;
+  std::unique_ptr<ReasoningParser> rparser = get_reasoning_parser("deepseek_r1");
+
+  // The engine streams the think block fragmented; the </think> arrives as its
+  // own delta (a detokenizer surfaces the atomic marker on its own).
+  const std::vector<std::string> deltas = {
+      "<think>", "reasoning ", "here", "</think>", "final ", "answer"};
+
+  std::string previous;
+  std::string reasoning_acc;
+  std::string content_acc;
+  int reasoning_chunks = 0;
+  int content_chunks = 0;
+  for (const std::string& delta : deltas) {
+    const std::string current = previous + delta;
+    std::optional<DeltaMessage> dm = ShapeChatDelta(
+        previous, current, delta, req, /*parser=*/nullptr, rparser.get());
+    previous = current;
+    if (!dm.has_value()) continue;
+    ChatCompletionResponseStreamChoice choice;
+    choice.delta = *dm;
+    json jc = choice;
+    if (jc.at("delta").contains("reasoning")) {
+      ++reasoning_chunks;
+      reasoning_acc += jc.at("delta").at("reasoning").get<std::string>();
+    }
+    if (jc.at("delta").contains("content")) {
+      ++content_chunks;
+      content_acc += jc.at("delta").at("content").get<std::string>();
+    }
+  }
+  CHECK(reasoning_acc == "reasoning here");
+  CHECK(content_acc == "final answer");
+  CHECK(reasoning_chunks >= 1);
+  CHECK(content_chunks >= 1);
+}
+
+// (r3) NON-STREAM, reasoning BEFORE tools: the tool parser only sees the
+//     post-reasoning content, so the tool call is still extracted and the
+//     thoughts ride on message.reasoning.
+TEST_CASE("serving_chat: reasoning is stripped before tool parsing") {
+  const ChatCompletionRequest req = ToolRequest();
+  std::unique_ptr<ToolParser> parser = get_tool_parser("hermes");
+  std::unique_ptr<ReasoningParser> rparser = get_reasoning_parser("deepseek_r1");
+
+  const std::string model_output =
+      "<think>I should call the weather tool</think>"
+      "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": "
+      "\"Paris\"}}\n</tool_call>";
+  ShapedChatMessage shaped = ShapeChatMessage(
+      "assistant", model_output, std::string("stop"), req, parser.get(),
+      rparser.get());
+
+  REQUIRE(shaped.message.reasoning.has_value());
+  CHECK(*shaped.message.reasoning == "I should call the weather tool");
+  REQUIRE(shaped.message.tool_calls.has_value());
+  REQUIRE(shaped.message.tool_calls->size() == 1);
+  CHECK((*shaped.message.tool_calls)[0].function.name == "get_weather");
+  CHECK((*shaped.message.tool_calls)[0].function.arguments == "{\"city\":\"Paris\"}");
+  REQUIRE(shaped.finish_reason.has_value());
+  CHECK(*shaped.finish_reason == "tool_calls");
 }
 
 // ─── (e) STREAM backward compat: tools present, content-only output over the

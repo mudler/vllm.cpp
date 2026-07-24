@@ -282,6 +282,10 @@ struct ChatMessage {
   // does not trip -Werror=missing-field-initializers now that tool_calls exists.
   std::optional<std::string> content{};
   std::optional<std::vector<ToolCall>> tool_calls{};
+  // reasoning (chat_completion/protocol.py:67). The chain-of-thought span split
+  // off by the reasoning parser. Serialized only when present + non-empty, and
+  // kept LAST so the positional aggregate inits above stay valid.
+  std::optional<std::string> reasoning{};
 };
 
 // Ported from: vllm/entrypoints/openai/engine/protocol.py:350 (DeltaMessage).
@@ -290,6 +294,9 @@ struct ChatMessage {
 struct DeltaMessage {
   std::optional<std::string> role;
   std::optional<std::string> content;
+  // reasoning (engine/protocol.py:353). The streamed chain-of-thought span;
+  // emitted on its own delta before the content deltas. Serialized when present.
+  std::optional<std::string> reasoning;
   std::optional<std::vector<DeltaToolCall>> tool_calls;
 };
 

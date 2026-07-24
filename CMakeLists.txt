@@ -416,14 +416,33 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/mistral.cpp
   src/vllm/entrypoints/openai/tool_parsers/llama.cpp
   src/vllm/entrypoints/openai/tool_parsers/llama4_pythonic.cpp
+  src/vllm/entrypoints/openai/tool_parsers/pythonic_core.cpp
   src/vllm/entrypoints/openai/tool_parsers/pythonic.cpp
   src/vllm/entrypoints/openai/tool_parsers/qwen3.cpp
   src/vllm/entrypoints/openai/tool_parsers/deepseek_v3.cpp
   src/vllm/entrypoints/openai/tool_parsers/deepseek_v31.cpp
+  src/vllm/entrypoints/openai/tool_parsers/deepseek_v32.cpp
+  src/vllm/entrypoints/openai/tool_parsers/deepseek_v4.cpp
   src/vllm/entrypoints/openai/tool_parsers/longcat.cpp
   src/vllm/entrypoints/openai/tool_parsers/granite.cpp
   src/vllm/entrypoints/openai/tool_parsers/granite4.cpp
   src/vllm/entrypoints/openai/tool_parsers/granite_20b_fc.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/abstract.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/basic.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/deepseek_r1.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/mistral.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/minimax_m2.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/step3.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/olmo3.cpp
+  src/vllm/entrypoints/openai/tool_parsers/xlam.cpp
+  src/vllm/entrypoints/openai/tool_parsers/phi4_mini.cpp
+  src/vllm/entrypoints/openai/tool_parsers/internlm.cpp
+  src/vllm/entrypoints/openai/tool_parsers/jamba.cpp
+  src/vllm/entrypoints/openai/tool_parsers/step3.cpp
+  src/vllm/entrypoints/openai/tool_parsers/step3p5.cpp
+  src/vllm/entrypoints/openai/tool_parsers/minicpm5.cpp
+  src/vllm/entrypoints/openai/tool_parsers/hy_v3.cpp
+  src/vllm/entrypoints/openai/tool_parsers/olmo3.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp

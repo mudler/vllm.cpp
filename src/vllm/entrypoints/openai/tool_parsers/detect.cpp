@@ -29,14 +29,38 @@ namespace {
 //     deliberately absent from this table.
 //   - "<|python_tag|>" (llama3/4 json) is the least discriminating marker that
 //     is still template-sniffable, so it sits just above the hermes fallback.
+//   - Wave B2 additions and their collision analyses (from the port reports):
+//     the two DSML markers diverge right after "<｜DSML｜" and neither contains
+//     the other or "<tool_call>"; step3's marker uses ASCII underscores where
+//     deepseek_v3's uses U+2581, so they are distinct byte strings; step3p5
+//     wraps in the same <tool_call> as hermes but its inner "<function=" is
+//     template-stable and collides with nothing (minicpm5 has "<function name="
+//     and granite-20b-fc "<function_call>", both full distinct literals);
+//     jamba's exact "<tool_calls>" must precede hy_v3's PREFIX probe
+//     "<tool_calls" (hy_v3 tags are suffix-parametrized, so only the prefix is
+//     template-stable; a default-suffix hy_v3 template is indistinguishable
+//     from jamba and needs the explicit option); "functools[" (phi4) and
+//     "<|action_start|><|plugin|>" (internlm) are distinctive literals.
+//   - EXPLICIT-ONLY families (no reliable template marker, select via the
+//     tool_parser option): granite4, pythonic, xlam, deepseek_v31.
 constexpr ToolParserMarker kToolParserMarkers[] = {
     {"longcat", "<longcat_tool_call>"},
     {"deepseek_v3", "<｜tool▁calls▁begin｜>"},
+    {"deepseek_v32", "<｜DSML｜function_calls>"},
+    {"deepseek_v4", "<｜DSML｜tool_calls>"},
+    {"step3", "<｜tool_calls_begin｜>"},
     {"mistral", "[TOOL_CALLS]"},
+    {"minicpm5", "<function name=\""},
+    {"olmo3", "<function_calls>"},
     {"granite-20b-fc", "<function_call>"},
     {"granite", "<|tool_call|>"},
+    {"internlm", "<|action_start|><|plugin|>"},
+    {"phi4_mini_json", "functools["},
     {"llama4_pythonic", "<|python_start|>"},
     {"llama3_json", "<|python_tag|>"},
+    {"jamba", "<tool_calls>"},
+    {"hy_v3", "<tool_calls"},
+    {"step3p5", "<function="},
     {"hermes", "<tool_call>"},
 };
 

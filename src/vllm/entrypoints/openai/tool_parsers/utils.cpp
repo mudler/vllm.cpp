@@ -262,6 +262,50 @@ std::string find_common_prefix(const std::string& a, const std::string& b) {
   return a.substr(0, i);
 }
 
+std::string find_common_suffix(const std::string& a, const std::string& b) {
+  // utils.py:78 - grow the shared suffix while both chars match AND the char is
+  // NOT alphanumeric (so it never eats a partially-streamed word/number).
+  std::string suffix;
+  const std::size_t n = std::min(a.size(), b.size());
+  for (std::size_t i = 1; i <= n; ++i) {
+    const char ca = a[a.size() - i];
+    const char cb = b[b.size() - i];
+    const bool alnum = std::isalnum(static_cast<unsigned char>(ca)) != 0;
+    if (ca == cb && !alnum) {
+      suffix.insert(suffix.begin(), ca);
+    } else {
+      break;
+    }
+  }
+  return suffix;
+}
+
+std::string extract_intermediate_diff(const std::string& curr,
+                                      const std::string& old_in) {
+  // utils.py:96. The Python uses reversed-string .replace(...,1) to strip the
+  // LAST occurrence of the suffix, and .replace(prefix,"",1) to strip the FIRST
+  // occurrence of the prefix.
+  const std::string suffix = find_common_suffix(curr, old_in);
+
+  std::string old_stripped = old_in;
+  if (!suffix.empty()) {
+    const std::size_t p = old_stripped.rfind(suffix);
+    if (p != std::string::npos) old_stripped.erase(p, suffix.size());
+  }
+  const std::string prefix = find_common_prefix(curr, old_stripped);
+
+  std::string diff = curr;
+  if (!suffix.empty()) {
+    const std::size_t p = diff.rfind(suffix);
+    if (p != std::string::npos) diff.erase(p, suffix.size());
+  }
+  if (!prefix.empty()) {
+    const std::size_t p = diff.find(prefix);
+    if (p != std::string::npos) diff.erase(p, prefix.size());
+  }
+  return diff;
+}
+
 bool is_complete_json(const std::string& s) { return nlohmann::json::accept(s); }
 
 std::pair<nlohmann::ordered_json, std::size_t> partial_json_loads(

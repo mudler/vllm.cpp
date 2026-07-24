@@ -45,6 +45,18 @@ std::size_t consume_space(std::size_t i, const std::string& s);
 // utils.py:52 (find_common_prefix). The shared leading prefix of a and b.
 std::string find_common_prefix(const std::string& a, const std::string& b);
 
+// utils.py:78 (find_common_suffix). The shared trailing suffix of a and b, but
+// only across NON-alphanumeric characters (it stops at the first alnum). Used by
+// extract_intermediate_diff to avoid prematurely emitting close-quotes/brackets.
+std::string find_common_suffix(const std::string& a, const std::string& b);
+
+// utils.py:96 (extract_intermediate_diff). Given `curr` and `old` (known to share
+// a common prefix and/or suffix), return the middle tokens that should be
+// streamed. Argument order matters: `curr` is the newer partial JSON, `old` the
+// previous one. Used by the internlm/jamba streaming argument-diff.
+std::string extract_intermediate_diff(const std::string& curr,
+                                      const std::string& old);
+
 // utils.py:135 (is_complete_json). Whether `s` is a complete, valid JSON doc.
 bool is_complete_json(const std::string& s);
 

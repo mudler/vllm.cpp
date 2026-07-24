@@ -470,6 +470,10 @@ void to_json(nlohmann::json& j, const DeltaToolCall& t) {
 // non-empty (upstream _serialize pops an empty list).
 void to_json(nlohmann::json& j, const ChatMessage& m) {
   j = nlohmann::json{{"role", m.role}, {"content", OrNull(m.content)}};
+  // reasoning (chat_completion/protocol.py:67): present + non-empty only.
+  if (m.reasoning.has_value() && !m.reasoning->empty()) {
+    j["reasoning"] = *m.reasoning;
+  }
   if (m.tool_calls.has_value() && !m.tool_calls->empty()) {
     j["tool_calls"] = *m.tool_calls;
   }
@@ -480,6 +484,8 @@ void to_json(nlohmann::json& j, const DeltaMessage& m) {
   j = nlohmann::json::object();
   if (m.role.has_value()) j["role"] = *m.role;
   if (m.content.has_value()) j["content"] = *m.content;
+  // reasoning (engine/protocol.py:353): mirror content; emitted when present.
+  if (m.reasoning.has_value()) j["reasoning"] = *m.reasoning;
   if (m.tool_calls.has_value() && !m.tool_calls->empty()) {
     j["tool_calls"] = *m.tool_calls;
   }

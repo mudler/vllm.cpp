@@ -9,16 +9,27 @@
 
 #include "vllm/entrypoints/openai/tool_parsers/deepseek_v3.h"
 #include "vllm/entrypoints/openai/tool_parsers/deepseek_v31.h"
+#include "vllm/entrypoints/openai/tool_parsers/deepseek_v32.h"
+#include "vllm/entrypoints/openai/tool_parsers/deepseek_v4.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite4.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite_20b_fc.h"
 #include "vllm/entrypoints/openai/tool_parsers/hermes.h"
+#include "vllm/entrypoints/openai/tool_parsers/internlm.h"
+#include "vllm/entrypoints/openai/tool_parsers/jamba.h"
+#include "vllm/entrypoints/openai/tool_parsers/hy_v3.h"
 #include "vllm/entrypoints/openai/tool_parsers/longcat.h"
+#include "vllm/entrypoints/openai/tool_parsers/minicpm5.h"
 #include "vllm/entrypoints/openai/tool_parsers/mistral.h"
+#include "vllm/entrypoints/openai/tool_parsers/phi4_mini.h"
+#include "vllm/entrypoints/openai/tool_parsers/xlam.h"
 #include "vllm/entrypoints/openai/tool_parsers/llama.h"
 #include "vllm/entrypoints/openai/tool_parsers/llama4_pythonic.h"
+#include "vllm/entrypoints/openai/tool_parsers/olmo3.h"
 #include "vllm/entrypoints/openai/tool_parsers/pythonic.h"
 #include "vllm/entrypoints/openai/tool_parsers/qwen3.h"
+#include "vllm/entrypoints/openai/tool_parsers/step3.h"
+#include "vllm/entrypoints/openai/tool_parsers/step3p5.h"
 
 namespace vllm::entrypoints::openai {
 
@@ -79,6 +90,14 @@ std::unique_ptr<ToolParser> get_tool_parser(const std::string& name) {
   if (name == "deepseek_v31") {
     return std::make_unique<DeepSeekV31ToolParser>();
   }
+  // deepseek_v32 (DSML <｜DSML｜function_calls>…) + deepseek_v4 (the same DSML
+  // grammar wrapped in <｜DSML｜tool_calls>). deepseek_v4 subclasses v32.
+  if (name == "deepseek_v32") {
+    return std::make_unique<DeepSeekV32ToolParser>();
+  }
+  if (name == "deepseek_v4") {
+    return std::make_unique<DeepSeekV4ToolParser>();
+  }
   if (name == "longcat") {
     return std::make_unique<LongcatToolParser>();
   }
@@ -108,6 +127,44 @@ std::unique_ptr<ToolParser> get_tool_parser(const std::string& name) {
   }
   if (name == "llama4_pythonic") {
     return std::make_unique<Llama4PythonicToolParser>();
+  }
+  // xlam_tool_parser.py (name "xlam") - fenced / [TOOL_CALLS] / <tool_call> /
+  // bare-list envelopes around a JSON tool-call array.
+  if (name == "xlam") {
+    return std::make_unique<xLAMToolParser>();
+  }
+  // phi4mini_tool_parser.py (name "phi4_mini_json") - `functools[...]`.
+  if (name == "phi4_mini_json") {
+    return std::make_unique<Phi4MiniJsonToolParser>();
+  }
+  // internlm2_tool_parser.py (name "internlm") - <|action_start|><|plugin|>{}<|action_end|>.
+  if (name == "internlm") {
+    return std::make_unique<Internlm2ToolParser>();
+  }
+  // jamba_tool_parser.py (name "jamba") - <tool_calls>[...]</tool_calls>.
+  if (name == "jamba") {
+    return std::make_unique<JambaToolParser>();
+  }
+  // StepFun step3 (opaque fullwidth-｜ markers) + step3.5 (XML-parametrized
+  // <tool_call><function=…><parameter=…> streaming state machine).
+  if (name == "step3") {
+    return std::make_unique<Step3ToolParser>();
+  }
+  if (name == "step3p5") {
+    return std::make_unique<Step3p5ToolParser>();
+  }
+  // olmo3_tool_parser.py: the pythonic-inside-<function_calls> wrapper format.
+  if (name == "olmo3") {
+    return std::make_unique<Olmo3ToolParser>();
+  }
+  // minicpm5xml_tool_parser.py: the <function name="x"><param ...> XML dialect.
+  if (name == "minicpm5") {
+    return std::make_unique<MiniCPM5ToolParser>();
+  }
+  // hy_v3_tool_parser.py: the suffix-parametrized <tool_calls..><tool_call..>
+  // <tool_sep..><arg_key..><arg_value..> XML dialect (default empty suffix).
+  if (name == "hy_v3") {
+    return std::make_unique<HYV3ToolParser>();
   }
   return nullptr;
 }

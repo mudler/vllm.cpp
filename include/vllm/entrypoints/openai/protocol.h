@@ -284,8 +284,14 @@ struct ChatMessage {
   std::optional<std::vector<ToolCall>> tool_calls{};
   // reasoning (chat_completion/protocol.py:67). The chain-of-thought span split
   // off by the reasoning parser. Serialized only when present + non-empty, and
-  // kept LAST so the positional aggregate inits above stay valid.
+  // kept after the positional aggregate-init fields above.
   std::optional<std::string> reasoning{};
+  // Multi-turn tool-conversation identity (chat_completion/protocol.py: the
+  // role="tool" reply carries the id of the assistant call it answers, and
+  // optionally the function name). Without these a second turn after tool
+  // execution is malformed for templates that render tool_call_id/name.
+  std::optional<std::string> tool_call_id{};
+  std::optional<std::string> name{};
 };
 
 // Ported from: vllm/entrypoints/openai/engine/protocol.py:350 (DeltaMessage).

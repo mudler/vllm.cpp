@@ -347,3 +347,34 @@ TEST_CASE("chat_template: LoadChatTemplateFromGguf errors on an unreadable file"
       vllm::entrypoints::LoadChatTemplateFromGguf("/nonexistent/x.gguf"),
       vllm::entrypoints::ChatTemplateError);
 }
+
+// Review-driven round trip: user -> assistant tool_call -> tool result ->
+// next generation prompt, rendered through the REAL Qwen3.5 template. The
+// tool turn's identity fields must reach the template context (protocol
+// from_json + the minja adapter), or the second turn is malformed.
+TEST_CASE("chat_template: multi-turn tool conversation renders through the Qwen3.5 fixture") {
+  const std::string tmpl = ReadFixture("qwen35_chat_template.jinja");
+
+  ChatMessage user{"user", std::string("What is the weather in Rome?")};
+  ChatMessage assistant;
+  assistant.role = "assistant";
+  vllm::entrypoints::openai::ToolCall call;
+  call.id = "call_1";
+  call.function.name = "get_weather";
+  call.function.arguments = "{\"city\": \"Rome\"}";
+  assistant.tool_calls = std::vector<vllm::entrypoints::openai::ToolCall>{call};
+  ChatMessage tool;
+  tool.role = "tool";
+  tool.tool_call_id = "call_1";
+  tool.name = "get_weather";
+  tool.content = "{\"temp\": 21}";
+
+  const std::string out = vllm::entrypoints::apply_chat_template(
+      tmpl, {user, assistant, tool}, /*add_generation_prompt=*/true, "", "",
+      WeatherTool());
+  // The rendered prompt must carry the tool call AND the tool result, and end
+  // with the assistant generation header.
+  CHECK(out.find("get_weather") != std::string::npos);
+  CHECK(out.find("{\"temp\": 21}") != std::string::npos);
+  CHECK(out.rfind("<|im_start|>assistant") != std::string::npos);
+}

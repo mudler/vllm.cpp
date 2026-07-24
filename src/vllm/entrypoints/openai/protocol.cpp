@@ -239,6 +239,33 @@ void from_json(const nlohmann::json& j, ChatMessage& m) {
   if (auto it = j.find("content"); it != j.end() && it->is_string()) {
     m.content = it->get<std::string>();
   }
+  // Multi-turn tool conversations: the assistant-history tool_calls and the
+  // role="tool" reply's tool_call_id/name must survive parsing, or the chat
+  // template cannot associate a tool result with the call that produced it.
+  if (auto it = j.find("tool_calls"); it != j.end() && it->is_array()) {
+    std::vector<ToolCall> calls;
+    for (const nlohmann::json& c : *it) {
+      ToolCall tc;
+      GetOr(c, "id", tc.id);
+      GetOr(c, "type", tc.type);
+      if (auto fn = c.find("function"); fn != c.end() && fn->is_object()) {
+        GetOr(*fn, "name", tc.function.name);
+        GetOr(*fn, "arguments", tc.function.arguments);
+      }
+      calls.push_back(std::move(tc));
+    }
+    if (!calls.empty()) m.tool_calls = std::move(calls);
+  }
+  if (auto it = j.find("tool_call_id"); it != j.end() && it->is_string()) {
+    m.tool_call_id = it->get<std::string>();
+  }
+  if (auto it = j.find("name"); it != j.end() && it->is_string()) {
+    m.name = it->get<std::string>();
+  }
+  // Prior-turn reasoning round-trips so templates that re-render it can.
+  if (auto it = j.find("reasoning"); it != j.end() && it->is_string()) {
+    m.reasoning = it->get<std::string>();
+  }
 }
 
 // Ported from: vllm/entrypoints/openai/chat_completion/protocol.py:165
@@ -474,6 +501,10 @@ void to_json(nlohmann::json& j, const ChatMessage& m) {
   if (m.reasoning.has_value() && !m.reasoning->empty()) {
     j["reasoning"] = *m.reasoning;
   }
+  // Round-trip symmetry for tool-turn identity (input-side fields; response
+  // messages never carry them, so present-only serialization is a no-op there).
+  if (m.tool_call_id.has_value()) j["tool_call_id"] = *m.tool_call_id;
+  if (m.name.has_value()) j["name"] = *m.name;
   if (m.tool_calls.has_value() && !m.tool_calls->empty()) {
     j["tool_calls"] = *m.tool_calls;
   }

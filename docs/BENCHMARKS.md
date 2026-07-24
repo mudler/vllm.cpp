@@ -2101,6 +2101,21 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Multi-turn tool-conversation fields through the chat protocol -
+  `NOT APPLICABLE` (2026-07-24, `CLAIM-TOOL-TURN-FIELDS`).**
+  `benchmark_binding=false`. **Protocol/serving fix, no decode-path change.**
+  Review-driven (LocalAI PR #11100): ChatMessage::from_json parsed only
+  role+content, silently dropping assistant-history `tool_calls`, the
+  role="tool" reply's `tool_call_id`/`name`, and prior-turn `reasoning` - so
+  a second turn after tool execution was malformed for templates that render
+  tool identity. ChatMessage gains tool_call_id/name; from_json parses all
+  four; to_json round-trips them; the minja adapter exposes them to the
+  template context (present-only, matching transformers' dict shape).
+  Evidence: test_protocol_tool_turns 3 cases; a user->assistant-tool_call->
+  tool-result round trip renders through the REAL Qwen3.5 fixture template
+  (test_chat_template); serving + capi suites unchanged-green. No binding
+  number is created, re-based, or invalidated.
+
 - **gcc-14 -Werror=maybe-uninitialized false positive in InputBatch::condense
   - `NOT APPLICABLE` (2026-07-24, `CLAIM-GCC14-CONDENSE`).**
   `benchmark_binding=false`. **Build-portability fix, no behavior change.**

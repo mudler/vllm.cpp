@@ -45,6 +45,13 @@ nlohmann::ordered_json BuildMessages(
     } else {
       o["content"] = nullptr;
     }
+    // Multi-turn tool identity + prior reasoning: exposed only when present so
+    // `{% if message.tool_call_id %}`-style template gates stay falsy on plain
+    // turns (an always-present null would still be falsy in Jinja, but absent
+    // matches transformers' dict shape exactly).
+    if (m.tool_call_id.has_value()) o["tool_call_id"] = *m.tool_call_id;
+    if (m.name.has_value()) o["name"] = *m.name;
+    if (m.reasoning.has_value()) o["reasoning"] = *m.reasoning;
     if (m.tool_calls.has_value()) {
       nlohmann::ordered_json calls = nlohmann::ordered_json::array();
       for (const openai::ToolCall& tc : *m.tool_calls) {

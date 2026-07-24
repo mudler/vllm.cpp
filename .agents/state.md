@@ -21749,3 +21749,18 @@ flag gaps). Tier 4, two new pages: `docs/ENVIRONMENT.md` (with a CI completeness
 `README.md`, `docs/BENCHMARKS.md`), so every SACRED gate is unchanged by construction. All five record
 checkers GREEN by bare RC: `check-agent-record` 0, `check-doc-checkpoint` 0, `check-device-leakage` 0,
 `check-readme-structure` 0, `check-model-checklist` 0. Not pushed.
+
+## 2026-07-24 — Multi-turn tool-conversation fields through the chat protocol (`CLAIM-TOOL-TURN-FIELDS`)
+
+Review-driven (LocalAI PR #11100 maint-bot review): ChatMessage::from_json
+parsed only role + bare-string content, silently dropping assistant-history
+`tool_calls`, the role="tool" reply's `tool_call_id`/`name`, and prior-turn
+`reasoning` — a second turn after tool execution was malformed for templates
+that render tool identity. ChatMessage gains tool_call_id/name (kept after
+the positional aggregate-init fields); from_json parses all four; to_json
+round-trips them present-only; the minja adapter exposes them to the
+template context (absent when unset, matching transformers' dict shape).
+Evidence: test_protocol_tool_turns 3/3, the full
+user→assistant-tool_call→tool-result round trip rendering through the REAL
+Qwen3.5 fixture template (test_chat_template 21/21), test_openai_serving
+24/24, test_capi 24/24.

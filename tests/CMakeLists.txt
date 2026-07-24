@@ -172,8 +172,26 @@ vllm_cpp_add_test(test_openai_tool_parsers
   vllm/entrypoints/openai/tool_parsers/test_tool_parsers.cpp)
 vllm_cpp_add_test(test_tool_parser_detect
   vllm/entrypoints/openai/tool_parsers/test_detect.cpp)
+vllm_cpp_add_test(test_deepseek
+  vllm/entrypoints/openai/tool_parsers/test_deepseek.cpp)
+vllm_cpp_add_test(test_longcat
+  vllm/entrypoints/openai/tool_parsers/test_longcat.cpp)
+vllm_cpp_add_test(test_granite_tool_parser
+  vllm/entrypoints/openai/tool_parsers/test_granite_tool_parser.cpp)
+vllm_cpp_add_test(test_granite4_tool_parser
+  vllm/entrypoints/openai/tool_parsers/test_granite4_tool_parser.cpp)
+vllm_cpp_add_test(test_granite_20b_fc_tool_parser
+  vllm/entrypoints/openai/tool_parsers/test_granite_20b_fc_tool_parser.cpp)
+vllm_cpp_add_test(test_tool_parsers_llama
+  vllm/entrypoints/openai/tool_parsers/test_llama.cpp)
+vllm_cpp_add_test(test_tool_parsers_pythonic
+  vllm/entrypoints/openai/tool_parsers/test_pythonic.cpp)
+vllm_cpp_add_test(test_tool_parsers_llama4_pythonic
+  vllm/entrypoints/openai/tool_parsers/test_llama4_pythonic.cpp)
 vllm_cpp_add_test(test_tool_choice_grammar
   vllm/entrypoints/openai/tool_parsers/test_tool_choice_grammar.cpp)
+vllm_cpp_add_test(test_tool_parser_mistral
+  vllm/entrypoints/openai/tool_parsers/test_mistral.cpp)
 vllm_cpp_add_test(test_chat_template vllm/entrypoints/test_chat_template.cpp)
 # The real Qwen3.5 chat template (extracted from the GGUF) lives under
 # tests/fixtures/; hand its absolute path to the test so it resolves regardless

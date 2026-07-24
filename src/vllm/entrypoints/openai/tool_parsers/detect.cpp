@@ -16,11 +16,27 @@ namespace {
 // otherwise the generic row would shadow the specific model. A new parser port
 // adds exactly one row here (and, if its marker is generic, places it last).
 //
-// Today the only registered family is Hermes/Qwen, whose templates wrap each
-// call in a <tool_call> block. That same surface is what the structural-tag
-// constraint (get_hermes_structural_tag) triggers on, so this row keeps
-// detection and constraint in agreement.
+// Marker sources: each row was recommended by the family's port (see the
+// parser file headers), with these collision notes:
+//   - longcat's wrapper never contains a bare "<tool_call>" substring, so the
+//     hermes row cannot shadow it, but the specific marker still goes first.
+//   - The DeepSeek begin marker is shared by v3 and v31 templates; detection
+//     resolves to deepseek_v3, and a v31 model selects "deepseek_v31"
+//     explicitly via the tool_parser option.
+//   - granite4 is marker-identical to hermes (<tool_call> blocks) and
+//     pythonic's only tell (a bare leading "[") is far too generic for
+//     template sniffing: both are EXPLICIT-ONLY families (tool_parser option),
+//     deliberately absent from this table.
+//   - "<|python_tag|>" (llama3/4 json) is the least discriminating marker that
+//     is still template-sniffable, so it sits just above the hermes fallback.
 constexpr ToolParserMarker kToolParserMarkers[] = {
+    {"longcat", "<longcat_tool_call>"},
+    {"deepseek_v3", "<｜tool▁calls▁begin｜>"},
+    {"mistral", "[TOOL_CALLS]"},
+    {"granite-20b-fc", "<function_call>"},
+    {"granite", "<|tool_call|>"},
+    {"llama4_pythonic", "<|python_start|>"},
+    {"llama3_json", "<|python_tag|>"},
     {"hermes", "<tool_call>"},
 };
 
@@ -37,9 +53,9 @@ std::string DetectToolParser(const std::string& chat_template,
       return table[i].parser;
     }
   }
-  // No marker matched: fall back to the sole registered family. Its parser is a
-  // no-op on output that carries no <tool_call> block, so this is safe even when
-  // the model does not actually emit tool calls.
+  // No marker matched: fall back to hermes, the most widely trained dialect.
+  // Its parser is a no-op on output that carries no <tool_call> block, so this
+  // is safe even when the model does not actually emit tool calls.
   return "hermes";
 }
 

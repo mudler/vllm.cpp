@@ -179,6 +179,17 @@ minja delta; 5 subset-era expectations corrected vs real jinja2. Scope:
 `tests/vllm/entrypoints/test_chat_template.cpp`,
 `tests/capi/test_chat_prompt.cpp`, NOTICE, `third_party/README.md`.
 
+**Tool-parser wave B1 coordination note (2026-07-24,
+`CLAIM-TOOL-PARSERS-B1`, DONE, direct-to-main, user-directed,
+four subagent worktrees + integrator).** Seven vLLM tool-parser families
+ported to the text-only C++ seam (12 registered dialects total) with upstream
+tests case-for-case; detection marker table populated. Scope:
+`{include,src}/vllm/entrypoints/openai/tool_parsers/*` (new: mistral, llama,
+pythonic, llama4_pythonic, granite, granite4, granite_20b_fc, deepseek_v3,
+deepseek_v31, longcat, utils; refactor: hermes virtual accessors; detect
+table), `tests/vllm/entrypoints/openai/tool_parsers/*`, CMake wiring. Details
+in the state-log entry of the same date.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-MLA-PREFIX-CACHE-ASSERT` | `MODEL-TEXT-deepseek-v2-deepseek-v2-for-causal-lm` (bugfix — restores its SACRED gate under asserts-enabled builds; the shared prefix-cache manager assertion it relaxes stays owned by `CLAIM-PREFIX-PROMPT-CACHING`, no row-state change to that row) | Claude Code (opus-4-8) | isolated worktree `/home/mudler/_git/vllm.cpp-mla-fix` (branch `fix/mla-prefix-cache-assert`, base `6abe09c`); dgx repro `/home/mudler/repro_deepseek` (unfixed) + `/home/mudler/repro_fixed` (fixed) | `fix/mla-prefix-cache-assert` | `src/vllm/v1/core/single_type_kv_cache_manager.cpp` (assert only) + `tests/vllm/v1/test_single_type_kv_cache_manager.cpp` (new MLA cases) | `DONE` (2026-07-23) | 2026-07-23 root-caused + fixed the DeepSeek-V2 assert abort |

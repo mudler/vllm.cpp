@@ -15,19 +15,6 @@ namespace vllm::entrypoints::openai {
 
 namespace {
 
-// hermes_tool_parser.py:38-40:
-//   tool_call_regex = re.compile(
-//       r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", re.DOTALL)
-// There are two possible captures: the JSON between the open/close tags
-// (group 1), or between an open tag and end-of-string (group 2, the
-// unterminated tail). `.` under re.DOTALL matches newlines — ECMAScript `.`
-// does not, so we use `[\s\S]` to emulate DOTALL.
-const std::regex& tool_call_regex() {
-  static const std::regex re(
-      R"(<tool_call>([\s\S]*?)</tool_call>|<tool_call>([\s\S]*))");
-  return re;
-}
-
 // ─── Streaming helpers (tool_parsers/utils.py + hermes_tool_parser.py) ────────
 
 // Python str.strip() / str.rstrip() over ASCII whitespace.
@@ -92,9 +79,8 @@ std::optional<std::string> ExtractToolArgs(const std::string& tc_json,
 // hermes_tool_parser.py:141 (_extract_tool_call_jsons): (json_text, is_complete)
 // for each <tool_call> region in `text`.
 std::vector<std::pair<std::string, bool>> ExtractToolCallJsons(
-    const std::string& text) {
-  const std::string start_tok = HermesToolParser::kToolCallStartToken;
-  const std::string end_tok = HermesToolParser::kToolCallEndToken;
+    const std::string& text, const std::string& start_tok,
+    const std::string& end_tok) {
   std::vector<std::pair<std::string, bool>> results;
   std::size_t pos = 0;
   for (;;) {
@@ -121,10 +107,29 @@ std::vector<std::pair<std::string, bool>> ExtractToolCallJsons(
 
 }  // namespace
 
+// hermes_tool_parser.py:36-40 — the wrapper tokens + the two-capture regex,
+// exposed as virtuals (see hermes.h). There are two possible captures: the JSON
+// between the open/close tags (group 1), or between an open tag and
+// end-of-string (group 2, the unterminated tail). `.` under re.DOTALL matches
+// newlines — ECMAScript `.` does not, so we use `[\s\S]` to emulate DOTALL.
+const std::string& HermesToolParser::tool_call_start() const {
+  static const std::string tok = kToolCallStartToken;
+  return tok;
+}
+const std::string& HermesToolParser::tool_call_end() const {
+  static const std::string tok = kToolCallEndToken;
+  return tok;
+}
+const std::regex& HermesToolParser::tool_call_pattern() const {
+  static const std::regex re(
+      R"(<tool_call>([\s\S]*?)</tool_call>|<tool_call>([\s\S]*))");
+  return re;
+}
+
 ExtractedToolCallInformation HermesToolParser::extract_tool_calls(
     const std::string& model_output, const ChatCompletionRequest& /*request*/) {
   // hermes_tool_parser.py:75-79 — sanity check; avoid unnecessary processing.
-  if (model_output.find(kToolCallStartToken) == std::string::npos) {
+  if (model_output.find(tool_call_start()) == std::string::npos) {
     return ExtractedToolCallInformation{false, {}, model_output};
   }
 
@@ -133,8 +138,8 @@ ExtractedToolCallInformation HermesToolParser::extract_tool_calls(
     // json.loads(match[0] if match[0] else match[1]) for each block and build a
     // ToolCall with the arguments re-serialized back to a JSON *string*.
     std::vector<ToolCall> tool_calls;
-    for (auto it = std::sregex_iterator(model_output.begin(),
-                                        model_output.end(), tool_call_regex());
+    for (auto it = std::sregex_iterator(
+             model_output.begin(), model_output.end(), tool_call_pattern());
          it != std::sregex_iterator(); ++it) {
       const std::smatch& match = *it;
       // Prefer group 1 (between tags); fall back to group 2 (unterminated tail).
@@ -161,7 +166,7 @@ ExtractedToolCallInformation HermesToolParser::extract_tool_calls(
     // hermes_tool_parser.py:109-114 — content is the text before the first
     // <tool_call>; None when empty.
     const std::string content =
-        model_output.substr(0, model_output.find(kToolCallStartToken));
+        model_output.substr(0, model_output.find(tool_call_start()));
     ExtractedToolCallInformation info;
     info.tools_called = true;
     info.tool_calls = std::move(tool_calls);
@@ -190,10 +195,10 @@ std::optional<DeltaMessage> HermesToolParser::extract_tool_calls_streaming(
     std::optional<std::string> content;
     {
       std::size_t sendable_idx;
-      const std::size_t start = current_text.find(kToolCallStartToken);
+      const std::size_t start = current_text.find(tool_call_start());
       if (start == std::string::npos) {
         const std::size_t overlap =
-            PartialTagOverlap(current_text, kToolCallStartToken);
+            PartialTagOverlap(current_text, tool_call_start());
         sendable_idx = current_text.size() - overlap;
       } else {
         sendable_idx = start;
@@ -206,7 +211,7 @@ std::optional<DeltaMessage> HermesToolParser::extract_tool_calls_streaming(
     }
 
     const std::vector<std::pair<std::string, bool>> tool_call_jsons =
-        ExtractToolCallJsons(current_text);
+        ExtractToolCallJsons(current_text, tool_call_start(), tool_call_end());
     std::vector<DeltaToolCall> tool_call_deltas;
 
     for (std::size_t i = 0; i < tool_call_jsons.size(); ++i) {

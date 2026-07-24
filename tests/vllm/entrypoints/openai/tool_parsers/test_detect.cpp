@@ -73,3 +73,21 @@ TEST_CASE("detect: the built-in marker table holds its invariants") {
 TEST_CASE("detect: null count pointer is tolerated") {
   CHECK(ToolParserMarkerTable(nullptr) != nullptr);
 }
+
+TEST_CASE("detect: every ported family resolves from its template marker") {
+  CHECK(DetectToolParser("...<longcat_tool_call>...") == "longcat");
+  CHECK(DetectToolParser("...<｜tool▁calls▁begin｜>...") == "deepseek_v3");
+  CHECK(DetectToolParser("...[TOOL_CALLS]...") == "mistral");
+  CHECK(DetectToolParser("...<function_call>...") == "granite-20b-fc");
+  CHECK(DetectToolParser("...<|tool_call|>...") == "granite");
+  CHECK(DetectToolParser("...<|python_start|>...") == "llama4_pythonic");
+  CHECK(DetectToolParser("...<|python_tag|>...") == "llama3_json");
+  CHECK(DetectToolParser("...<tool_call>...") == "hermes");
+}
+
+TEST_CASE("detect: specific markers beat the generic hermes tail row") {
+  // A template that carries BOTH a family marker and a plain <tool_call>
+  // must resolve to the specific family (first-match-wins ordering).
+  CHECK(DetectToolParser("<longcat_tool_call> and <tool_call>") == "longcat");
+  CHECK(DetectToolParser("[TOOL_CALLS] then <tool_call>") == "mistral");
+}

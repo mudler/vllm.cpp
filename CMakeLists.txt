@@ -411,8 +411,19 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/serving_models.cpp
   src/vllm/entrypoints/openai/tool_parsers/abstract.cpp
   src/vllm/entrypoints/openai/tool_parsers/detect.cpp
+  src/vllm/entrypoints/openai/tool_parsers/utils.cpp
   src/vllm/entrypoints/openai/tool_parsers/hermes.cpp
+  src/vllm/entrypoints/openai/tool_parsers/mistral.cpp
+  src/vllm/entrypoints/openai/tool_parsers/llama.cpp
+  src/vllm/entrypoints/openai/tool_parsers/llama4_pythonic.cpp
+  src/vllm/entrypoints/openai/tool_parsers/pythonic.cpp
   src/vllm/entrypoints/openai/tool_parsers/qwen3.cpp
+  src/vllm/entrypoints/openai/tool_parsers/deepseek_v3.cpp
+  src/vllm/entrypoints/openai/tool_parsers/deepseek_v31.cpp
+  src/vllm/entrypoints/openai/tool_parsers/longcat.cpp
+  src/vllm/entrypoints/openai/tool_parsers/granite.cpp
+  src/vllm/entrypoints/openai/tool_parsers/granite4.cpp
+  src/vllm/entrypoints/openai/tool_parsers/granite_20b_fc.cpp
   src/vt/dtype.cpp
   src/vt/backend.cpp
   src/vt/tensor.cpp

@@ -2001,6 +2001,17 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **Tool-parser wave B1: seven vLLM parser families ported + detection table
+  populated - `NOT APPLICABLE` (2026-07-24, `CLAIM-TOOL-PARSERS-B1`).**
+  `benchmark_binding=false`. **Serving-layer parsing additions, no decode-path
+  change.** mistral (both wire forms), llama3_json/llama4_json, pythonic,
+  llama4_pythonic, granite/granite4/granite-20b-fc, deepseek_v3/deepseek_v31,
+  longcat - each a 1:1 text-seam port of the pinned upstream parser with its
+  upstream tests ported case-for-case (174 new doctest cases across ten new
+  suites, all green) plus the detection marker table (specificity-ordered;
+  granite4 and pythonic are explicit-only by design). No binding number is
+  created, re-based, or invalidated.
+
 - **google/minja vendored as the chat-template engine - `NOT APPLICABLE`
   (2026-07-24, `CLAIM-CAPI-MINJA`).** `benchmark_binding=false`.
   **Serving-layer renderer swap, no decode-path change.** The homegrown

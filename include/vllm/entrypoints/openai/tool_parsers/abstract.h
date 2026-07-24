@@ -86,7 +86,9 @@ class ToolParser {
 // Ported from: vllm/tool_parsers/abstract_tool_parser.py:235
 // (ToolParserManager.get_tool_parser). Returns a fresh parser for `name`, or
 // nullptr when the name is not one of the T0-registered formats (upstream
-// raises KeyError). Registered names: "hermes", "qwen3".
+// raises KeyError). Registered names: "hermes", "qwen3", "mistral".
+// raises KeyError). Registered names: "hermes", "qwen3", "granite", "granite4",
+// "granite-20b-fc".
 std::unique_ptr<ToolParser> get_tool_parser(const std::string& name);
 
 // Ported from: vllm/entrypoints/chat_utils.py:1964 (make_tool_call_id). Returns

@@ -21322,3 +21322,58 @@ full template fidelity" (was the caveat on the chat-ABI entries).
 **Regression set (non-negotiable for the implementing Ws, all 10 SACRED gates):** 27B 235/235, 35B 315/315, Qwen3-Coder 6/6, Qwen3-dense (0.6B+4B 16/16), OPT 6/6, DeepSeek-V2-Lite 8/8, Llama 16/16, Mistral 16/16, GLM-4-9B 16/16, GLM-4.7-Flash 8/8. Every new op is additive + default-inert.
 
 **Files (records only):** NEW `.agents/specs/sweep-gemma.md`; EDIT `.agents/model-matrix.md` (4 rows INVENTORIED->SPIKE + rollup SPIKE 6->10/INVENTORIED 303->299 + 4 checklist rows), `.agents/coordination.md` (`CLAIM-SWEEP-GEMMA`), `.agents/roadmap_v1.md` (`ROAD-V1-C2`), `.agents/parity-ledger.md`, `README.md`, `docs/BENCHMARKS.md`. **Nothing claims READY/ACTIVE/DONE; speed N/A (spike).**
+
+## 2026-07-24 — Tool-parser wave B1: seven vLLM parser families ported (mistral, llama3/4_json, pythonic, llama4_pythonic, granite x3, deepseek_v3/v31, longcat) + populated detection table (`CLAIM-TOOL-PARSERS-B1`, autoparser-parity program W3)
+
+Four task-scoped subagents each ported a family batch 1:1 from the pinned
+upstream (`/home/mudler/_git/vllm` @ e24d1b24) in isolated worktrees; the
+coordinating session merged, repaired one merge artifact (three closing braces
+dropped from the get_tool_parser chain by a keep-both resolution — caught by
+compile), populated the detection marker table, and re-verified everything.
+
+Registered names now: hermes, qwen3, mistral, llama3_json, llama4_json,
+pythonic, llama4_pythonic, granite, granite4, granite-20b-fc, deepseek_v3,
+deepseek_v31, longcat. All streaming-capable (stateful
+extract_tool_calls_streaming), all with upstream tests ported case-for-case
+plus added edges. Detection rows (specificity-ordered): longcat, deepseek_v3
+(shared marker with v31 — v31 is explicit-only), mistral [TOOL_CALLS],
+granite-20b-fc <function_call>, granite <|tool_call|>, llama4_pythonic
+<|python_start|>, llama3_json <|python_tag|>, hermes <tool_call> tail.
+granite4 (marker-identical to hermes) and pythonic (bare "[") are
+EXPLICIT-ONLY by design.
+
+Noteworthy port decisions (each recorded in its file header):
+- Text-only seam holds: every upstream token-id/vocab dependency reworked to
+  byte-string matching (DeepSeek fullwidth ｜/▁ markers matched as opaque
+  bytes; streaming split mid-marker held back and re-diffed — UTF-8-safe by
+  construction, fixture-tested).
+- hermes.{h,cpp} refactored to virtual tag accessors so longcat/qwen3-style
+  wrapper subclasses stay one-liners (mirrors upstream subclassing).
+- Shared `tool_parsers/utils.{h,cpp}` ported from upstream utils.py
+  (consume_space, find_common_prefix, is_complete_json, tolerant
+  partial_json_loads); nlohmann::ordered_json adopted where argument diffs
+  must preserve insertion order (default sorted keys corrupted streaming
+  reconstruction — caught by tests).
+- pythonic grammar: upstream Python-ast parse rehomed as a strict
+  recursive-descent parser (rejects what ast rejects, incl. leading '-').
+- mistral: both wire forms (v11 name-first + pre-v11 bracketed array; form is
+  a construction flag mirroring upstream's tokenizer-version key).
+- longcat detection ordering VERIFIED against the real LongCat-Flash template
+  rather than assumed.
+
+Evidence (integrator re-run, all green): test_tool_parser_detect (incl. new
+per-family marker + ordering cases), test_tool_parser_mistral 42,
+test_deepseek 22, test_longcat 10, test_granite_tool_parser 16,
+test_granite4_tool_parser 9, test_granite_20b_fc_tool_parser 14,
+test_tool_parsers_llama 21, test_tool_parsers_pythonic 18,
+test_tool_parsers_llama4_pythonic 22, plus test_openai_tool_parsers,
+test_tool_choice_grammar, test_capi, test_chat_prompt, test_chat_template
+unchanged-green.
+
+Still open in the program: pure-text waves B2-B4 (deepseek_v32/v4, xlam,
+phi4_mini, internlm, jamba, step3/3.5, minicpm5, hy_v3, olmo3, hunyuan,
+apertus, gigachat3, functiongemma, lfm2, poolside, ernie45), the
+parser-ENGINE-backed families (qwen3_coder, gemma4, glm4x, kimi_k2,
+minimax_m2, seed_oss — token-id state machines, NOT mechanically portable),
+Rust/Harmony-backed (minimax_m3, cohere_command, gpt-oss), the reasoning
+parser seam (greenfield), and per-family structural-tag specs beyond hermes.

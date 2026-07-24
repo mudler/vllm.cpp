@@ -1975,10 +1975,16 @@ scripts/dgx-online-serving.sh --execute --model 27 \
   chunks out as `chat.completion.chunk` JSON via the existing token callback.
   New `LoadChatTemplateFromGguf` reads the GGUF `tokenizer.chat_template`
   metadata so .gguf models get their real template (a GGUF has no
-  tokenizer_config.json). No engine/scheduler/kernel path changes; the serving
-  layer itself is unchanged and already gated. Evidence: `tests/capi`
+  tokenizer_config.json), and `src/capi/chat_prompt.*` probe-renders the
+  template once at resolution: an unrenderable template (minja-subset limits,
+  e.g. the full Qwen3.5 `namespace()`/`macro` template) degrades with a stderr
+  witness to a Hermes-aware plain prompt (tools schemas + `<tool_call>`
+  instruction) so structural-tag tool engagement still works; a tools-only
+  render failure goes hybrid. No engine/scheduler/kernel path changes; the
+  serving layer itself is unchanged and already gated. Evidence: `tests/capi`
   chat cases (blocking/stream parity, role-first cadence, malformed-request
-  rejection) + `tests/vllm/entrypoints/test_chat_template.cpp` GGUF loader
+  rejection), `tests/capi/test_chat_prompt.cpp` (fallback + probe degradation
+  + hybrid), `tests/vllm/entrypoints/test_chat_template.cpp` GGUF loader
   cases. No binding number is created, re-based, or invalidated.
 
 - **Structured output wired in the production engine + C ABI v2 `structured_*`

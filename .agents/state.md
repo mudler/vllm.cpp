@@ -21197,3 +21197,26 @@ unchanged). Perf: NOT APPLICABLE (see BENCHMARKS correctness-only entry).
 Follow-ups: reasoning-parser deltas (serving-layer deferral, upstream parity
 item) will flow through the same chunk JSON once the serving layer emits them;
 multi-turn tool-result messages parse per the protocol's ChatMessage subset.
+
+## 2026-07-24 — Chat-ABI follow-up: probe-rendered template resolution + Hermes-aware fallback prompt (`CLAIM-CAPI-CHAT-V3` addendum)
+
+Live-fire against the real Qwen3.5-2B GGUF exposed the gap: its
+`tokenizer.chat_template` uses `namespace()`/`macro`, which the minja subset
+rejects LOUDLY — but `MakeChatTemplatePromptFn` renders LAZILY, so every
+`vllm_chat` call failed with `ChatTemplateError` at request time. New
+`src/capi/chat_prompt.{h,cpp}` (internal, not exported): resolution
+PROBE-renders the template once (with and without a dummy tool) and picks (a)
+the real template when both render, (b) a hybrid (template for tool-less
+requests, fallback for tool requests) when only the tools branch fails at
+evaluation, or (c) the fallback outright — each degradation with one stderr
+witness, mirroring the bundled server's load-failure fallback policy. The
+fallback is HERMES-AWARE: it renders the `<tools>` schema block and the
+`<tool_call>` emission instruction ahead of the role-join conversation, i.e.
+the exact tag surface `ToolChoiceStructuralTagSpec` constrains on, so lazy
+(auto) tool engagement works even without the model's own template. A model
+with NO template at all now also gets this fallback (was: plain role join).
+Tests: `tests/capi/test_chat_prompt.cpp` 5 cases (tools block + ordering,
+plain join, template-as-is, full degradation on `namespace()`, hybrid on an
+evaluation-only tools failure); `test_capi` 20/20 and `test_chat_template`
+17/17 unchanged. Template-fidelity for the full Qwen3.5 template (minja
+`namespace`/`macro`/filters) stays an open engine item on the §7 row.

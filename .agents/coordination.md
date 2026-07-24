@@ -151,7 +151,8 @@ direct-to-main, user-directed).** ABI v3: `vllm_chat` / `vllm_chat_stream`
 expose the serving-chat pipeline (template render, structural-tag tool_choice,
 streaming Hermes tool parsing) through the C ABI for the LocalAI `vllm-cpp`
 backend's autoparser-parity tool calling; `LoadChatTemplateFromGguf` added.
-Scope owned during the change: `include/vllm.h`, `src/capi/*`,
+Scope owned during the change: `include/vllm.h`, `src/capi/*` (incl. the
+follow-up `chat_prompt.*` probe/fallback resolution + `tests/capi/test_chat_prompt.cpp`),
 `{include,src}/vllm/entrypoints/chat_template.*`, `tests/capi/test_capi.cpp`,
 `tests/vllm/entrypoints/test_chat_template.cpp`. Serving layer untouched;
 engine-matrix `TOOLS-STRUCTURED-CORE` unchanged. Details in the state-log entry

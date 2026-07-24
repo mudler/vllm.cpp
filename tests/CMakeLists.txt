@@ -181,6 +181,8 @@ target_include_directories(test_bench PRIVATE ${CMAKE_SOURCE_DIR}/examples/bench
 # engine via the internal MakeEngineHandle hook (reached under src/).
 vllm_cpp_add_test(test_capi capi/test_capi.cpp)
 target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_chat_prompt capi/test_chat_prompt.cpp)
+target_include_directories(test_chat_prompt PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Pure-C compile check: include/vllm.h must compile as C11 with no C++ leaks.
 enable_language(C)

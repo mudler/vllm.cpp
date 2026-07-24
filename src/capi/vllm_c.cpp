@@ -24,6 +24,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "capi/chat_prompt.h"
 #include "capi/engine_handle.h"
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
@@ -213,9 +214,13 @@ vllm::entrypoints::openai::ChatPromptFn ResolveChatPromptFn(
         tok.BosId() >= 0 ? tok.Decode({tok.BosId()}) : std::string();
     const std::string eos =
         tok.EosId() >= 0 ? tok.Decode({tok.EosId()}) : std::string();
-    return vllm::entrypoints::MakeChatTemplatePromptFn(tmpl, bos, eos);
+    // Probe-renders the template and degrades (with a stderr witness) to the
+    // hermes-aware fallback when the minja subset cannot serve it.
+    return vllm::capi::ResolveTemplatePromptFn(tmpl, bos, eos, model_path);
   } catch (const std::exception&) {
-    return vllm::entrypoints::openai::DefaultChatPromptFallback;
+    // No template shipped with the model at all: the hermes-aware fallback
+    // still primes the structural-tag tool flow.
+    return vllm::capi::HermesToolsFallbackPrompt;
   }
 }
 

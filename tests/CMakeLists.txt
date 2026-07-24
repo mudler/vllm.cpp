@@ -224,6 +224,14 @@ vllm_cpp_add_test(test_tool_parser_minicpm5
   vllm/entrypoints/openai/tool_parsers/test_minicpm5.cpp)
 vllm_cpp_add_test(test_tool_parser_hy_v3
   vllm/entrypoints/openai/tool_parsers/test_hy_v3.cpp)
+vllm_cpp_add_test(test_tool_parser_hunyuan_a13b
+  vllm/entrypoints/openai/tool_parsers/test_hunyuan_a13b_tool_parser.cpp)
+vllm_cpp_add_test(test_tool_parser_apertus
+  vllm/entrypoints/openai/tool_parsers/test_apertus_tool_parser.cpp)
+vllm_cpp_add_test(test_tool_parser_ernie45
+  vllm/entrypoints/openai/tool_parsers/test_ernie45_tool_parser.cpp)
+vllm_cpp_add_test(test_tool_parser_gigachat3
+  vllm/entrypoints/openai/tool_parsers/test_gigachat3_tool_parser.cpp)
 vllm_cpp_add_test(test_tool_parser_olmo3
   vllm/entrypoints/openai/tool_parsers/test_olmo3.cpp)
 vllm_cpp_add_test(test_chat_template vllm/entrypoints/test_chat_template.cpp)

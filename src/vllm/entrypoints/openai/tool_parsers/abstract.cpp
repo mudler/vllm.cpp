@@ -11,6 +11,7 @@
 #include "vllm/entrypoints/openai/tool_parsers/deepseek_v31.h"
 #include "vllm/entrypoints/openai/tool_parsers/deepseek_v32.h"
 #include "vllm/entrypoints/openai/tool_parsers/deepseek_v4.h"
+#include "vllm/entrypoints/openai/tool_parsers/functiongemma.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite4.h"
 #include "vllm/entrypoints/openai/tool_parsers/granite_20b_fc.h"
@@ -18,10 +19,12 @@
 #include "vllm/entrypoints/openai/tool_parsers/internlm.h"
 #include "vllm/entrypoints/openai/tool_parsers/jamba.h"
 #include "vllm/entrypoints/openai/tool_parsers/hy_v3.h"
+#include "vllm/entrypoints/openai/tool_parsers/lfm2.h"
 #include "vllm/entrypoints/openai/tool_parsers/longcat.h"
 #include "vllm/entrypoints/openai/tool_parsers/minicpm5.h"
 #include "vllm/entrypoints/openai/tool_parsers/mistral.h"
 #include "vllm/entrypoints/openai/tool_parsers/phi4_mini.h"
+#include "vllm/entrypoints/openai/tool_parsers/poolside_v1.h"
 #include "vllm/entrypoints/openai/tool_parsers/xlam.h"
 #include "vllm/entrypoints/openai/tool_parsers/llama.h"
 #include "vllm/entrypoints/openai/tool_parsers/llama4_pythonic.h"
@@ -165,6 +168,21 @@ std::unique_ptr<ToolParser> get_tool_parser(const std::string& name) {
   // <tool_sep..><arg_key..><arg_value..> XML dialect (default empty suffix).
   if (name == "hy_v3") {
     return std::make_unique<HYV3ToolParser>();
+  }
+  // lfm2_tool_parser.py (name "lfm2") - pythonic `[func(arg=val), ...]` list
+  // wrapped in <|tool_call_start|>...<|tool_call_end|> sentinels.
+  if (name == "lfm2") {
+    return std::make_unique<Lfm2ToolParser>();
+  }
+  // poolside_v1_tool_parser.py (name "poolside_v1") - GLM-4-derived bare
+  // <tool_call> with a NAME + <arg_key>/<arg_value> XML body.
+  if (name == "poolside_v1") {
+    return std::make_unique<PoolsideV1ToolParser>();
+  }
+  // functiongemma_tool_parser.py (name "functiongemma") - Google FunctionGemma
+  // <start_function_call>call:NAME{KEY:<escape>VALUE<escape>}<end_function_call>.
+  if (name == "functiongemma") {
+    return std::make_unique<FunctionGemmaToolParser>();
   }
   return nullptr;
 }

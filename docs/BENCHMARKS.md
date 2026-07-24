@@ -2101,6 +2101,20 @@ scripts/dgx-online-serving.sh --execute --model 27 \
 
 ## Correctness-only changes (benchmark disposition NOT APPLICABLE)
 
+- **gcc-14 -Werror=maybe-uninitialized false positive in InputBatch::condense
+  - `NOT APPLICABLE` (2026-07-24, `CLAIM-GCC14-CONDENSE`).**
+  `benchmark_binding=false`. **Build-portability fix, no behavior change.**
+  LocalAI's CI (ubuntu:24.04, gcc 14.2) fails the whole backend build: routing
+  the per-slot output-token move through a local
+  `std::optional<std::vector<int32_t>>` trips a maybe-uninitialized false
+  positive when resize() inlines into condense(). The move now goes slot to
+  slot directly (indices always distinct), removing the flagged object.
+  Verified BOTH ways under the exact CI compiler (dockerized g++-14.2, -O3,
+  -Werror=maybe-uninitialized): old code reproduces the two diagnostics,
+  fixed code compiles clean; `test_llm_engine` and `test_capi` green
+  (condense behavior unchanged). No binding number is created, re-based, or
+  invalidated.
+
 - **ENG wave: the six engine-backed vLLM families text-reimplemented -
   `NOT APPLICABLE` (2026-07-24, `CLAIM-TOOL-PARSERS-ENG`).**
   `benchmark_binding=false`. **Serving-layer parsing additions, no decode-path

@@ -92,7 +92,7 @@ There is no front-page race clip yet; when one is produced it will follow the Lo
 
 ## Build
 
-vllm.cpp uses CMake (>= 3.24) and a C++20 compiler. The core has no ML dependencies; the OpenAI server uses a vendored header-only HTTP transport (cpp-httplib).
+vllm.cpp uses CMake (>= 3.24) and a C++20 compiler (gcc 13/14 and clang are exercised; the tree builds -Werror-clean on gcc 14.2). The core has no ML dependencies; the OpenAI server uses a vendored header-only HTTP transport (cpp-httplib).
 
 ```sh
 # CPU build (the correctness / CI reference). The server is ON by default.

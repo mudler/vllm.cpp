@@ -444,12 +444,16 @@ void InputBatch::condense() {
     removed_tracker_.pop_removed();
     const std::optional<std::string> req_id =
         req_ids[static_cast<size_t>(last_req_index)];
-    std::optional<std::vector<int32_t>> output_token_ids =
-        req_output_token_ids[static_cast<size_t>(last_req_index)];
     req_ids[static_cast<size_t>(empty_index)] = req_id;
     req_ids[static_cast<size_t>(last_req_index)] = std::nullopt;
+    // Move slot-to-slot directly (empty_index < last_req_index, always
+    // distinct). Routing the move through a local
+    // std::optional<std::vector<int32_t>> trips gcc-14's
+    // -Werror=maybe-uninitialized when the later resize() inlines into
+    // condense() (a false positive through the optional's raw storage); the
+    // direct move keeps the semantics and removes the flagged object.
     req_output_token_ids[static_cast<size_t>(empty_index)] =
-        std::move(output_token_ids);
+        std::move(req_output_token_ids[static_cast<size_t>(last_req_index)]);
     req_output_token_ids[static_cast<size_t>(last_req_index)] = std::nullopt;
     req_id_to_index[*req_id] = empty_index;
 

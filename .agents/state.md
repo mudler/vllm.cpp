@@ -21626,3 +21626,15 @@ Base `origin/main` `eb9d129`. Worktree `sweep-gemma-w3w6`, dgx build/gate `~/wor
 **Left INVENTORIED (campaigns, each a distinct leaf spike):** Falcon (`FalconForCausalLM`, older + alibi), Falcon-H1 (`FalconH1ForCausalLM`, Mamba2 SSM), GraniteMoe/Shared/Hybrid, Cohere2Moe, PhiMoE.
 
 **Records (this commit):** the spec; model-matrix (rollup SPIKE 6->14, INVENTORIED 298->290, 8 `📋` checklist entries + 8 rows to `SPIKE`); `CLAIM-SWEEP-RECENT-DENSE` in coordination; roadmap sweep-progress; this state entry; parity-ledger SPIKE row; README + BENCHMARKS spike notes. All five record checkers green by bare RC. NO implementation, NO push.
+
+## 2026-07-24 — gcc-14 maybe-uninitialized false positive in InputBatch::condense (`CLAIM-GCC14-CONDENSE`)
+
+LocalAI's backend CI (ubuntu:24.04, gcc 14.2) failed every vllm-cpp build:
+the local `std::optional<std::vector<int32_t>> output_token_ids` staging the
+per-slot move in condense() trips -Werror=maybe-uninitialized when the later
+resize() inlines into condense() (false positive through the optional's raw
+storage; gcc 13.3 does not fire). Fix: move slot-to-slot directly (indices
+always distinct in the condense loop), removing the flagged object; the
+moved-from slot is then set to nullopt exactly as before. Verified BOTH ways
+under the exact CI compiler (dockerized g++-14.2 -O3): unfixed reproduces the
+two diagnostics, fixed compiles clean; test_llm_engine + test_capi green.

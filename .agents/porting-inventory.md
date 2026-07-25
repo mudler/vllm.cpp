@@ -720,10 +720,12 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     the FIRST landed under a MEASURED-not-inferred codegen proof.
     `triton_kernels/fused_recurrent_packed_decode.py` (FLA body VERBATIM; AOT
     adaptations: scale pinned to Dk^-0.5 in-kernel — same fp32-scalar mis-pack as
-    chunk_o; constexpr dims/strides pinned per-shape to the 27B call site; one dead
+    chunk_o; constexpr dims/strides pinned per-shape to the supported dense call
+    sites; one dead
     grid-carrier `NBH`=B*HV; state-index ABI adapter `state_idx < 0` for our
-    slot-0-valid cache ABI vs FLA's `<= 0`). One specialization gdn_decode_h48
-    (27B: H=16, HV=48, K=V=128, BK=128, BV=32; 35B does NOT select packed decode);
+    slot-0-valid cache ABI vs FLA's `<= 0`). Exact specializations
+    `gdn_decode_h48` (27B) and `gdn_decode_h32` (dense 4B), both H=16, K=V=128,
+    BK=128, BV=32; 35B does NOT select packed decode;
     dispatch `TryTritonPackedDecode` in `cuda_gdn.cu` behind runtime toggle
     `VT_GDN_PACKED_DECODE_TRITON` (**default ON since the 2026-07-16 flip** —
     MIRROR policy: it is vLLM's exact token-identical FLA kernel; `=0` rolls back
@@ -750,8 +752,20 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     (legacy path bit-exact preserved); **27B model gate 235/235 token-exact with the
     Triton decode path ON** (bit-identical to vLLM through the full model);
     compute-sanitizer 0 errors / 0 leaks; default-off gate 235/235.
-    MEASURED c16 A/B (`VT_GDN_PACKED_DECODE_TRITON=1` vs default, interleaved 3
-    pairs + w0 cold discard, one flock): triton [817.51, 821.06, 822.55] vs legacy [813.77, 815.62, 815.30] tok/s — paired mean **+5.48 tok/s (+0.67%)**, monotone (+3.74/+5.44/+7.25), 3/3 pairs positive; mean TPOT triton [161.04, 160.49, 160.35] vs legacy [162.09, 161.65, 161.93] = **-1.26 ms (-0.78%)** (median TPOT -1.13 ms); w0 cold-discard (triton 821.48/160.44) excluded. Kept default-OFF ACCEPTANCE MET (oracle PASS + consistent c16 TPOT improvement + no throughput regression). Kept **default OFF** — a new opt-in perf lever like the sibling GDN Triton kernels; the flip-to-default + binding exact-grid re-run is the follow-up, so no binding speed credit is claimed..
+    The 27B acceptance campaign established token exactness and a positive
+    c16 A/B, and the later default flip made the vendored selector current
+    production behavior (`=0` rollback). Detailed chronology remains in the
+    append-only ledger/state record.
+
+    **Dense H32 extension checkpoint (2026-07-25).** The current selector
+    defaults the vendored path ON and `=0` is the rollback. The new Hv=32
+    specialization is gated by the exact raw-packed/FP32-state ABI and remains
+    ineligible for 35B. Local sm_120: flag 10/10, GDN 66/66 (4,242), real 4B
+    graph/direct/eager 3/3 (1,672). Same-binary H32 AOT vs hand rollback is
+    **+4.5906% total/output throughput**. Final graph-node trace proves the AOT
+    specialization executes. The parent direct-loader checkpoint remains
+    speed-pending at 0.9864x vLLM total/output throughput; see
+    [2026-07-25 evidence](../docs/bench-evidence/qwen35-4b-main-repair-20260725.md).
 
 13. **Vendored BLAKE3 + the LMCache MODE-1 (`lm://`) wire protocol port
     (`KV-EXTERNAL-CACHE` W1):** an LMCache C++ CLIENT keys chunks on LMCache's

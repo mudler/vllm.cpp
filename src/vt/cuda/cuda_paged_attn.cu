@@ -2512,6 +2512,14 @@ bool Fa2Decode35BEnabled() {
   return e == nullptr || e[0] != '0';
 }
 
+// Qwen3.5-4B ratio-4 Hq/Hkv=16/4 hd-256 decode arm of the same generic
+// group-swap split-KV launcher. Independent rollback keeps the 27B/35B controls
+// unchanged and makes the 4B performance gate a same-binary A/B.
+bool Fa2Decode4BEnabled() {
+  const char* e = std::getenv("VT_FA2_DECODE_4B");
+  return e == nullptr || e[0] != '0';
+}
+
 // Qwen3-dense (head_dim 128) VARLEN decode: the exact non-swap
 // flash_attn_varlen_func reduction order vLLM runs for decode (bit-matches vLLM's
 // decode attention OUTPUT, teacher-forced gap 0.0000). Distinct from the d256
@@ -2587,18 +2595,21 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
   // attention and FA2-compatible page/block-table layout. q/out are selected
   // BF16 by the matching model-side gate, so no cast kernel appears. Two
   // independently-toggled topologies share the exact vendored split-KV path:
+  //   * 4B ratio-4 Hq/Hkv=16/4, gated by VT_FA2_DECODE_4B;
   //   * 27B ratio-6 Hq/Hkv=24/4 (W3-G), gated by VT_FA2_DECODE;
   //   * 35B ratio-8 Hq/Hkv=16/2 (CLAIM-35B-FA2-DECODE-1), gated by
   //     VT_FA2_DECODE_35B — the old ratio-8 path launched only 2 blocks/step.
   // The LaunchDecodeFA2Bf16 body is generic in groups/heads; only these gates
   // and the model-side dtype selection need the ratio widened.
+  const bool fa2_decode_r4 =
+      hq == 16 && num_kv_heads == 4 && qpk == 4 && Fa2Decode4BEnabled();
   const bool fa2_decode_r6 = hq == 24 && num_kv_heads == 4 && qpk == 6 && Fa2DecodeEnabled();
   const bool fa2_decode_r8 = hq == 16 && num_kv_heads == 2 && qpk == 8 && Fa2Decode35BEnabled();
   const bool fa2_decode = !is_prefill && num_tokens == num_reqs && d == 256 &&
                           block_size % 16 == 0 && args.causal &&
                           !args.window_size.has_value() &&
                           block_table.stride[1] == 1 &&
-                          (fa2_decode_r6 || fa2_decode_r8) &&
+                          (fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8) &&
                           std::is_same<TQ, __nv_bfloat16>::value &&
                           std::is_same<TKV, __nv_bfloat16>::value &&
                           out.dtype == DType::kBF16;

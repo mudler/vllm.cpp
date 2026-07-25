@@ -683,8 +683,9 @@ void LaunchMlaPrefillFA2Bf16(cudaStream_t s, Tensor& out, float* lse_out,
 }
 
 // Launch the pinned FA2 pure-decode optimization: bf16 paged KV, D256, one
-// query per request, global causal decoder attention, for either Hq/Hkv=24/4
-// (G=6, 27B) or Hq/Hkv=16/2 (G=8, 35B). flash_api.cpp first normalizes
+// query per request, global causal decoder attention, for Hq/Hkv=16/4
+// (G=4, 4B), Hq/Hkv=24/4 (G=6, 27B), or Hq/Hkv=16/2 (G=8, 35B).
+// flash_api.cpp first normalizes
 // max_seqlen_q==1 to non-causal, then swaps query groups into the sequence
 // dimension and applies split-KV. Independent strides let us expose that
 // logical swap without copies:
@@ -698,19 +699,22 @@ void LaunchDecodeFA2Bf16(cudaStream_t stream, Tensor& out, const Tensor& query,
                          int64_t block_size) {
   if (query.shape[0] == 0) return;
   const int64_t groups = hq / num_kv_heads;
-  // Two supported topologies, both hd-256 BF16 paged global-causal pure decode:
+  // Three supported topologies, all hd-256 BF16 paged global-causal pure decode:
+  //   * 4B ratio-4 Hq/Hkv=16/4;
   //   * 27B ratio-6 Hq/Hkv=24/4 (W3-G);
   //   * 35B ratio-8 Hq/Hkv=16/2 (CLAIM-35B-FA2-DECODE-1).
   // The split-KV group-swap below is generic in groups/heads, so the body is
   // shared; only this admission and the caller gates encode the ratio.
+  const bool ratio4 = hq == 16 && num_kv_heads == 4 && groups == 4;
   const bool ratio6 = hq == 24 && num_kv_heads == 4 && groups == 6;
   const bool ratio8 = hq == 16 && num_kv_heads == 2 && groups == 8;
   if (query.dtype != DType::kBF16 || k_cache.dtype != DType::kBF16 ||
       v_cache.dtype != DType::kBF16 || out.dtype != DType::kBF16 ||
-      query.shape[0] != num_reqs || !(ratio6 || ratio8) || d != 256 ||
+      query.shape[0] != num_reqs || !(ratio4 || ratio6 || ratio8) || d != 256 ||
       block_size % 16 != 0 || !args.causal || args.window_size.has_value()) {
     throw std::runtime_error(
-        "cuda flash-attn-2 decode: dispatch called outside ratio-6/ratio-8 BF16/D256 eligibility");
+        "cuda flash-attn-2 decode: dispatch called outside ratio-4/ratio-6/ratio-8 "
+        "BF16/D256 eligibility");
   }
 
   const int batch = static_cast<int>(num_reqs);

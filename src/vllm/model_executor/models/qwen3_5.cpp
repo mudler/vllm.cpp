@@ -1571,6 +1571,18 @@ bool Fa2Decode35BOn() {
 #endif
 }
 
+// Qwen3.5-4B ratio-4 (Hq/Hkv=16/4), hd-256 arm of the same FA2 split-KV
+// launcher. Kept independently controllable so the established 27B/35B
+// dispatch and their rollback flags remain unchanged.
+bool Fa2Decode4BOn() {
+#ifdef VLLM_CPP_FLASH_ATTN
+  const char* e = std::getenv("VT_FA2_DECODE_4B");
+  return e == nullptr || e[0] != '0';
+#else
+  return false;
+#endif
+}
+
 // QUANTIZE-ONCE: q/k/v (and gate/up) share their input activation AND their on-disk
 // input_global_scale (verified: 27B layer-3 q/k/v all 28.75; gate/up 812/476), so we
 // can ScaledFp4Quant the shared activation ONCE and feed each projection's fp4xfp4
@@ -4064,7 +4076,8 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   // ratio at head_dim 256, so BOTH the 27B (ratio-6) and the 35B (ratio-8) take
   // FA2 prefill (2026-07-18 flip, default-ON via FuseAttnPreambleOn). Pure
   // decode FA2 now covers BOTH gate topologies through the same vendored
-  // split-KV kernel: 27B ratio-6 (Hq/Hkv=24/4, VT_FA2_DECODE) and 35B ratio-8
+  // split-KV kernel: 4B ratio-4 (Hq/Hkv=16/4, VT_FA2_DECODE_4B),
+  // 27B ratio-6 (Hq/Hkv=24/4, VT_FA2_DECODE), and 35B ratio-8
   // (Hq/Hkv=16/2, VT_FA2_DECODE_35B — CLAIM-35B-FA2-DECODE-1). All windows /
   // non-causal / non-256 / other-ratio shapes stay f32 on the graph-captured
   // fallback.
@@ -4073,9 +4086,12 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
   const bool fa2_prefill = Fa2PrefillOn() && FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin &&
                            fa2_platform &&
                            kv.dtype == DType::kBF16 && Dh == 256 && T > meta.num_reqs;
+  const bool fa2_decode_r4 = Hq == 16 && Hkv == 4 && Fa2Decode4BOn();
   const bool fa2_decode_r6 = Hq == 24 && Hkv == 4 && Fa2DecodeOn();
   const bool fa2_decode_r8 = Hq == 16 && Hkv == 2 && Fa2Decode35BOn();
-  const bool fa2_decode = (fa2_decode_r6 || fa2_decode_r8) && FuseAttnPreambleOn(fp4) &&
+  const bool fa2_decode =
+      (fa2_decode_r4 || fa2_decode_r6 || fa2_decode_r8) &&
+      FuseAttnPreambleOn(fp4) &&
                           sdi.has_attn_cos_sin &&
                           fa2_platform &&
                           kv.dtype == DType::kBF16 && kv.block_size % 16 == 0 &&
@@ -7296,7 +7312,7 @@ struct Qwen3_5DenseDecodeGraph::Impl {
   }
   ~Impl() {
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
-      std::fprintf(stderr, "[DenseDecodeGraph] dense-27B decode graph: %lld total "
+      std::fprintf(stderr, "[DenseDecodeGraph] Qwen3.5 dense decode graph: %lld total "
                            "replays across %zu captured size(s)\n",
                    static_cast<long long>(replays), slots.size());
     Backend& b = vt::GetBackend(queue.device.type);
@@ -7464,7 +7480,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     s.captured = true;
     impl_->any_captured = true;
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
-      std::fprintf(stderr, "[DenseDecodeGraph] captured dense-27B decode graph "
+      std::fprintf(stderr, "[DenseDecodeGraph] captured Qwen3.5 dense decode graph "
                            "for padded size S=%lld (real B=%lld)\n",
                    static_cast<long long>(S), static_cast<long long>(B));
     b.ReplayGraph(impl_->queue, s.graph);

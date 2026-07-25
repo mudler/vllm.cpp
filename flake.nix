@@ -80,18 +80,15 @@
             # /sbin/ldconfig, which is not present on this host.
             TRITON_LIBCUDA_PATH = "/run/opengl-driver/lib";
 
-            LD_LIBRARY_PATH = "${cudaLibPath}:/run/opengl-driver/lib";
-            LIBRARY_PATH = "${cudaLibPath}:/run/opengl-driver/lib";
+            # The live NVIDIA driver must precede toolkit stubs. This is also
+            # the lookup order Triton and PyTorch use for their CUDA probe.
+            LD_LIBRARY_PATH = "/run/opengl-driver/lib:${cudaLibPath}";
+            LIBRARY_PATH = "/run/opengl-driver/lib:${cudaLibPath}";
             CPATH = "${cudaIncludePath}";
             C_INCLUDE_PATH = "${cudaIncludePath}";
             CPLUS_INCLUDE_PATH = "${cudaIncludePath}";
 
             shellHook = ''
-              export LD_LIBRARY_PATH="${cudaLibPath}:/run/opengl-driver/lib\''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-              export LIBRARY_PATH="${cudaLibPath}:/run/opengl-driver/lib\''${LIBRARY_PATH:+:$LIBRARY_PATH}"
-              export CPATH="${cudaIncludePath}\''${CPATH:+:$CPATH}"
-              export C_INCLUDE_PATH="${cudaIncludePath}\''${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
-              export CPLUS_INCLUDE_PATH="${cudaIncludePath}\''${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
               export CMAKE_CUDA_COMPILER="${cuda.cuda_nvcc}/bin/nvcc"
               export CMAKE_CUDA_HOST_COMPILER="${pkgs.gcc14}/bin/g++"
               export TRITON_LIBCUDA_PATH="/run/opengl-driver/lib"

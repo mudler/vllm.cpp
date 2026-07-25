@@ -25,11 +25,8 @@ namespace vllm {
 namespace {
 
 bool DenseDecodeGraphEnabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("VLLM_CPP_DENSE_DECODE_GRAPH");
-    return value == nullptr || value[0] != '0';
-  }();
-  return enabled;
+  const char* value = std::getenv("VLLM_CPP_DENSE_DECODE_GRAPH");
+  return value == nullptr || value[0] != '0';
 }
 
 class Qwen3_5DenseLoadedModel final : public LoadedModel {
@@ -124,13 +121,14 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
         input.hidden_tap, input.logits_indices);
   }
 
-  const bool fp4_cuda =
-      platforms::GetPlatform(input.queue.device.type).cutlass_fp4_supported() &&
-      !weights.layers.empty() &&
-      !weights.layers.front().mlp.gate_proj_fp4.Empty();
+  // vLLM's CUDA-graph selection is independent of weight quantization. The
+  // driver below already captures the shared dense forward, so restricting it
+  // to the 27B FP4 checkpoint left ordinary BF16 Qwen3.5 decode eager.
+  const bool graph_cuda =
+      platforms::GetPlatform(input.queue.device.type).support_static_graph_mode();
   constexpr int kMaxDecodeGraphBatch = 64;
 
-  if (DenseDecodeGraphEnabled() && input.pure_decode && fp4_cuda &&
+  if (DenseDecodeGraphEnabled() && input.pure_decode && graph_cuda &&
       input.num_reqs <= kMaxDecodeGraphBatch) {
     if (!qwen.decode_graph()) {
       qwen.decode_graph() = std::make_unique<Qwen3_5DenseDecodeGraph>(

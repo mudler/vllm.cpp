@@ -1,6 +1,18 @@
 # Environment & assets
 
-- **Dev box (no GPU)**: CPU reference backend + engine logic + CI development.
+- **Local development/GPU box (re-verified 2026-07-25):** NVIDIA GeForce RTX
+  5070 Ti, 16 GiB, compute capability 12.0 (`sm_120`), driver 595.71.05. The
+  cached `Qwen/Qwen3.5-4B` snapshot is the only model large enough for the
+  local direct-load performance diagnostic; it cannot run the 27B/35B gates.
+  The CUDA Nix shell must put `/run/opengl-driver/lib` before toolkit stubs.
+  `flake.nix` now does so directly and no longer emits a malformed literal
+  `LD_LIBRARY_PATH` expansion. A clean `nix develop .#cuda` reports
+  `torch.cuda.is_available() == True` and Triton
+  `GPUTarget(backend='cuda', arch=120, warp_size=32)` without a manual
+  override. Build the current diagnostic with CMake CUDA arch `120a`, Triton
+  vendored target `sm_120`, CUTLASS and FlashAttention-2 enabled.
+- **CPU development path:** CPU reference backend + engine logic + CI
+  development.
 - **GPU box**: `ssh dgx.casa` — DGX Spark, GB10 (Blackwell, **sm_121**),
   ~119 GB unified memory, 20 cores, CUDA toolkit 13.0.88 (nvcc); compute
   capability 12.1 → sm_121. Unified memory: both gate models fit

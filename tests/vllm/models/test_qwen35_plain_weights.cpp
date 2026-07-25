@@ -159,7 +159,7 @@ TEST_CASE("dense host release keeps a device-resident weight dispatch-visible") 
   CHECK(weights.embed_tokens.d_dev != nullptr);
 }
 
-TEST_CASE("Qwen3.5-4B direct-device load matches retained-host execution") {
+TEST_CASE("Qwen3.5-4B direct-device and decode-graph execution match fallbacks") {
   const std::string snapshot = FindSnapshot();
   if (snapshot.empty()) {
     MESSAGE("SKIP: Qwen/Qwen3.5-4B is absent; set HF_HOME or "
@@ -170,27 +170,38 @@ TEST_CASE("Qwen3.5-4B direct-device load matches retained-host execution") {
   MESSAGE("SKIP: direct-device gate requires a CUDA build");
   return;
 #else
-  const auto generate = [&snapshot](const char* direct) {
+  const auto generate = [&snapshot](const char* direct, const char* graph) {
     REQUIRE(setenv("VT_DIRECT_DEVICE_LOAD", direct, 1) == 0);
+    REQUIRE(setenv("VLLM_CPP_DENSE_DECODE_GRAPH", graph, 1) == 0);
     vllm::SamplingParams sampling;
     sampling.temperature = 0.0;
-    sampling.max_tokens = 4;
+    // The first pure-decode shape warms, the second captures, and later tokens
+    // replay the graph. Eight tokens ensure this is an execution test, not only
+    // a graph-construction smoke test.
+    sampling.max_tokens = 8;
     sampling.PostInit();
     auto loaded = vllm::entrypoints::LoadedEngine::FromModelDir(
         snapshot, vllm::entrypoints::EngineParams{});
     return loaded->engine().generate("The capital of France is", sampling,
-                                     std::string("direct-") + direct);
+                                     std::string("direct-") + direct +
+                                         "-graph-" + graph);
   };
 
-  const vllm::RequestOutput retained = generate("0");
-  const vllm::RequestOutput direct = generate("1");
+  const vllm::RequestOutput retained = generate("0", "1");
+  const vllm::RequestOutput direct = generate("1", "1");
+  const vllm::RequestOutput eager = generate("1", "0");
   unsetenv("VT_DIRECT_DEVICE_LOAD");
+  unsetenv("VLLM_CPP_DENSE_DECODE_GRAPH");
 
   REQUIRE(retained.finished);
   REQUIRE(direct.finished);
+  REQUIRE(eager.finished);
   REQUIRE(retained.outputs.size() == 1);
   REQUIRE(direct.outputs.size() == 1);
+  REQUIRE(eager.outputs.size() == 1);
   CHECK(direct.prompt_token_ids == retained.prompt_token_ids);
   CHECK(direct.outputs[0].token_ids == retained.outputs[0].token_ids);
+  CHECK(direct.prompt_token_ids == eager.prompt_token_ids);
+  CHECK(direct.outputs[0].token_ids == eager.outputs[0].token_ids);
 #endif
 }

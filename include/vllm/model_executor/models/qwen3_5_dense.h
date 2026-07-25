@@ -281,8 +281,9 @@ std::vector<float> Qwen3_5ReplayDenseLayer(
     const std::vector<float>& hidden_in, const std::vector<int32_t>& positions,
     int64_t seqlen, vt::Queue& queue);
 
-// 27B DENSE decode CUDA-graph driver — the dense sibling of Qwen3_5DecodeGraph
-// (qwen3_5.h). Captures the PURE-DECODE dense forward once per PADDED batch size
+// Qwen3.5 DENSE decode CUDA-graph driver — the dense sibling of
+// Qwen3_5DecodeGraph (qwen3_5.h). It serves both the 27B NVFP4 and ordinary
+// BF16 dense checkpoints. Captures the PURE-DECODE dense forward once per PADDED batch size
 // (kDecodeGraphSizes {1,2,4,8,16,32,64}, capped at max_num_reqs) and replays it
 // per token, removing the per-step host tax (the ~62k cudaMalloc/step + kernel
 // launch overhead) that the eager dense decode paid every step. The embedding is

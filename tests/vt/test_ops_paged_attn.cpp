@@ -1469,9 +1469,9 @@ Fa2DecodeRunStats RunFa2DecodeCase(Fa2DecodeCase& c, const char* toggle,
   DeviceTensor qsl(gpu, guard.q, DType::kI32, {c.batch + 1}, c.qsl.data());
   DeviceTensor out(gpu, guard.q, DType::kBF16, {c.batch, c.hq, c.d});
 
-  // Both decode arms share this harness: VT_FA2_DECODE gates the 27B ratio-6
-  // topology, VT_FA2_DECODE_35B the 35B ratio-8 topology. Drive both from the
-  // same toggle so a case's expect_fa2 is honored regardless of its ratio.
+  // All d256 decode arms share this harness. Drive their independent flags from
+  // one test toggle so each topology has the same fallback contract.
+  EnvGuard decode4_toggle("VT_FA2_DECODE_4B", toggle);
   EnvGuard decode_toggle("VT_FA2_DECODE", toggle);
   EnvGuard decode35_toggle("VT_FA2_DECODE_35B", toggle);
   vt::cuda::testing::ResetFa2DecodeDebugCounters();
@@ -1618,6 +1618,21 @@ TEST_CASE("paged_attention CUDA FA-2 ratio-6 pure decode matches composed refere
   }
 }
 
+TEST_CASE("paged_attention CUDA FA-2 ratio-4 Qwen3.5-4B decode matches composed reference") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping FA-2 ratio-4 decode parity (dgx-pending)");
+    return;
+  }
+  for (const int batch : {1, 2, 4, 8, 16}) {
+    CAPTURE(batch);
+    std::vector<int32_t> lengths(static_cast<size_t>(batch));
+    for (int i = 0; i < batch; ++i) lengths[static_cast<size_t>(i)] = 1024 + i * 7;
+    Fa2DecodeCase c(/*Hq=*/16, /*Hkv=*/4, std::move(lengths),
+                    6450U + static_cast<uint32_t>(batch));
+    RunFa2DecodeCase(c, "1", /*expect_fa2=*/true);
+  }
+}
+
 TEST_CASE("paged_attention CUDA FA-2 ratio-8 pure decode matches composed reference") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend; skipping FA-2 ratio-8 decode parity (dgx-pending)");
@@ -1652,8 +1667,14 @@ TEST_CASE("paged_attention CUDA FA-2 decode toggle and invalid eligibility use f
   RunFa2DecodeCase(ratio8, "1", /*expect_fa2=*/false,
                    AttentionWindow{127, 0});
 
-  // An unsupported GQA ratio (Hq/Hkv=8/2, ratio 4) stays on the fallback even
-  // with both decode toggles enabled.
+  // The Qwen3.5-4B ratio-4 topology has its own rollback and finite-window
+  // fallback.
+  Fa2DecodeCase ratio4_4b(/*Hq=*/16, /*Hkv=*/4, {1024, 1057}, 6315);
+  RunFa2DecodeCase(ratio4_4b, "0", /*expect_fa2=*/false);
+  RunFa2DecodeCase(ratio4_4b, "1", /*expect_fa2=*/false,
+                   AttentionWindow{127, 0});
+
+  // A different ratio-4 geometry is still outside the bounded admission.
   Fa2DecodeCase ratio4(/*Hq=*/8, /*Hkv=*/2, {1024, 1057}, 6320);
   RunFa2DecodeCase(ratio4, "1", /*expect_fa2=*/false);
 }

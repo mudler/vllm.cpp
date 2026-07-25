@@ -7,9 +7,8 @@
 # (cmake/TritonAOT.cmake, gated VLLM_CPP_TRITON=OFF by default) and embedded in
 # libvllm; the RUNTIME is Triton/Python-free (cubin via the CUDA driver API). The
 # portable hand-C++ CUDA kernel (GdnPackedDecodeKernel in src/vt/cuda/cuda_gdn.cu)
-# + the CPU reference are PRESERVED as the fallback and remain the DEFAULT even
-# when VLLM_CPP_TRITON=ON (the Triton decode path is opt-in behind
-# VT_GDN_PACKED_DECODE_TRITON).
+# + the CPU reference are PRESERVED as the fallback. The Triton path is the
+# default when VLLM_CPP_TRITON=ON; VT_GDN_PACKED_DECODE_TRITON=0 rolls it back.
 #
 # WHY AOT (MEASURED, 2026-07-16, root dgx:~/work/vllm.cpp-gdn-recurrence/phase1):
 # the identical register-resident [BV=32, BK=128] fp32 state tile compiles to
@@ -38,8 +37,8 @@
 #     (2) the constexpr strides/dims (stride_*, H, HV, K, V, BK, BV,
 #         SOFTPLUS_THRESHOLD, USE_QK_L2NORM_IN_KERNEL) are PINNED per-shape via the
 #         triton.tools.compile SIGNATURE (see cmake/TritonAOTKernels.cmake) to the
-#         27B gate-model packed-decode call site; the launcher guards every stride
-#         and dim before firing and otherwise falls back to the hand kernel.
+#         supported dense packed-decode call sites; the launcher guards every
+#         stride and dim before firing and otherwise falls back to the hand kernel.
 #     (3) one trailing runtime scalar `NBH` (= B*HV, the number of
 #         (sequence, value-head) pairs) is appended: the FLA launch grid is
 #         (cdiv(V,BV), B*HV) but B (the sequence count) is NOT a kernel argument,
@@ -56,17 +55,17 @@
 #         reference, NOT a recurrence deviation; it does not affect the boundary
 #         oracle (indices there are >= 1).
 #
-# Pinned config for the vllm.cpp 27B GDN packed pure-decode call site
+# Pinned configs for the vllm.cpp dense GDN packed pure-decode call sites
 # (qwen3_5.cpp GdnPackedDecode; mirror fused_recurrent.py packed decode):
-#   H=16 (Hk), HV=48 (Hv), K=128 (Dk), V=128 (Dv), BK=128, BV=32,
+#   H=16 (Hk), HV in {48,32} (Hv), K=128 (Dk), V=128 (Dv), BK=128, BV=32,
 #   SOFTPLUS_THRESHOLD=20.0, USE_QK_L2NORM_IN_KERNEL=1.
 # Buffer layout is a 1:1 drop-in (verified stride-for-stride against the FLA
 # pointer arithmetic and our hand GdnPackedDecodeKernel):
-#   mixed_qkv=[B, 2*H*K + HV*V]=[B,10240] bf16 row-contiguous (stride 10240),
+#   mixed_qkv=[B, 2*H*K + HV*V] bf16 row-contiguous (stride 10240/8192),
 #   a=[B,HV] bf16 / b=[B,HV] bf16 (the merged BA view: b at col 0, a at col HV,
-#     each row stride 2*HV=96), A_log=[HV] f32 / dt_bias=[HV] f32 (loader upcasts),
+#     each row stride 2*HV=96/64), A_log=[HV] f32 / dt_bias=[HV] f32 (loader upcasts),
 #   o=[B,HV,V] bf16 (stride HV*V then V), h0=ht=state=[slots,HV,V,K] f32
-#     (stride HV*V*K=786432), ssm_state_indices=[B] i32.
+#     (stride HV*V*K=786432/524288), ssm_state_indices=[B] i32.
 import triton
 import triton.language as tl
 

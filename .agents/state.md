@@ -24079,3 +24079,105 @@ checkers green by bare RC. `benchmark_binding=false`, SPEED still PENDING (row s
   model byte-identical by construction. `benchmark_binding=false`, SPEED PENDING (row
   `ACTIVE`, not `DONE`). Remaining recent-dense rows (MiniCPM, MiniCPM3) stay `SPIKE`.
   Not pushed; FULL SHA reported.
+
+## 2026-07-25 — main conflict resolution + local 4B H32/graph/FA2 repair and matched rerun
+
+Started with a stale in-progress rebase of `local-blackwell-environment` onto
+current `main` (`72f9fb13`) and conflicts in `.agents/state.md`,
+`.agents/environment.md`, `flake.nix` and
+`src/vt/cuda/cuda_matmul_nvfp4.cu`. Current main already contained the
+direct-load/Triton-AOT baseline and 33 stale commits remained. Aborted the
+rebase, switched to `main`, and transplanted only the relevant H32 repair from
+`176d4926` without importing stale canonical-record narratives. Local
+`upstream/main` equals `72f9fb13`; `git fetch upstream main` could not
+authenticate to GitHub (`Permission denied (publickey)`), so remote freshness
+could not be advanced beyond the existing tracking ref.
+
+**Environment repair.** `flake.nix` put toolkit link stubs before the live
+driver and emitted a malformed literal `LD_LIBRARY_PATH` expansion. The shell
+now places `/run/opengl-driver/lib` first and drops the broken export. A clean
+`nix develop .#cuda` reports `torch.cuda.is_available() == True` and Triton
+`GPUTarget(backend='cuda', arch=120, warp_size=32)` on the RTX 5070 Ti
+(sm_120, 16 GiB, driver 595.71.05), without a manual override.
+
+**Implemented repairs.**
+
+1. Added the exact raw-packed/BF16-activation/FP32-state Hv=32 Triton-AOT
+   recurrence, including generated/vendored sm_120/sm_121a artifacts and
+   dense-only dispatch. H48/35B behavior is unchanged.
+2. Reused the established decode-graph driver for plain-BF16 dense Qwen3.5;
+   graph eligibility is now platform/static-shape based rather than FP4-only.
+   The real 4B test executes graph ON, direct ON/OFF and eager rollback.
+3. Extended the already-generic head-dim-256 FA2 split-KV launcher to the exact
+   Qwen3.5-4B Hq/Hkv=16/4 topology behind `VT_FA2_DECODE_4B` (default ON,
+   `=0` rollback), with composed-reference, finite-window and unsupported-shape
+   tests.
+
+**Correctness and focused gates.** `test_gdn_packed_decode_triton` 1/1,
+10/10; `test_ops_gdn` 66/66, 4,242/4,242;
+`test_ops_paged_attn` 25/25, 454,474/454,474; cached real-checkpoint
+`test_qwen35_plain_weights --no-skip` 3/3, 1,672/1,672, including six graph
+replays at S=1. Triton AOT manifest drift check passes. The local Nix closure
+does not provide `compute-sanitizer`; no sanitizer result is invented.
+
+**Component attribution under one `flock /tmp/gpu`.**
+
+- H32 AOT vs rollback root `/tmp/qwen35-h32-main-ab-locked-20260725`:
+  5,645.537 vs 5,397.747 total tok/s, **+4.5906%**.
+- Graph vs eager root `/tmp/qwen35-4b-main-graph-ab-20260725`: 5,668.707 vs
+  5,646.837 total tok/s, **+0.3873%**, 128/128 request and 16,384/16,384 token
+  identity in every pair.
+- Ratio-4 FA2 vs generic fallback root
+  `/tmp/qwen35-4b-main-fa2-r4-ab-20260725`: 5,757.830 vs 5,667.133 total
+  tok/s, **+1.6004%**.
+
+**Final matched comparison.** Root `/tmp/qwen35-main-final-fa2-20260725`,
+aggregate SHA-256
+`dfba09cb5a01d873a36492b7a05b382e234c10759abd5831a497f96eaf5475f9`,
+same exact 128-request / 131,784-input / 16,384-output / c32 corpus, vLLM
+0.25.0, three repetitions. Direct ON: total 5,769.993, output 638.030 tok/s,
+4.9867 req/s, TTFT 834.910 ms, TPOT/ITL 43.720 ms, peak/stable PSS
+2.406/0.759 GiB, peak VRAM 12,850.7 MiB. Direct OFF: total 5,660.703, output
+625.943 tok/s, 4.8900 req/s, TTFT 943.427 ms, TPOT/ITL 43.837 ms,
+peak/stable PSS 8.592/8.589 GiB, peak VRAM 12,843.3 MiB. ON=OFF output IDs
+128/128 in every pair; direct loading is +1.93% total, -72.0% peak PSS and
+-91.2% stable PSS, with +7.3 MiB VRAM (within the +8 MiB gate).
+
+The same-lock vLLM middle repetition was a 2.1% slow outlier, so raw mean
+5,796.55 tok/s is retained but not used as the binding denominator. Clean
+immediate confirmation root `/tmp/qwen35-vllm-confirm2-20260725` is stable at
+5,840.304/5,862.944/5,846.159, mean **5,849.802 total**, 646.855 output,
+5.0536 req/s, TTFT 1,047.130 ms, TPOT/ITL 38.550 ms. Direct ON is therefore
+**0.986357x** total/output and 0.986765x req/s. It passes TTFT and memory but
+fails total/output/request throughput and TPOT/ITL; row remains `GATING`.
+The first out-of-shell confirmation `/tmp/qwen35-vllm-confirm-20260725` is
+`VOID` because CUDA/Triton was unavailable.
+
+**Required execution trace.** Final node-mode local root
+`/tmp/qwen35-main-final-fa2-profile-20260725`, SHA-256
+`c619a4b698196e44ceb70bd2cc5fcf0ebd2711950b03386d720ee97bcadf6fb4`,
+contains 453 graph launches, 5,148 graph-node API events, 200,972 graph-child
+kernels and 1,680 distinct graph node IDs. Ratio-4 FA2 executes 3,568 times at
+0.643 s total / 180.28 us average, versus matched vLLM 178.40 us. Local
+graph-child time is 9.000 s vs vLLM 9.199 s while wall TPOT remains slower.
+The remaining gap is host/engine scheduling or graph-launch cadence outside
+child kernels. Next: profile those inter-launch intervals on both arms, repair
+the concrete difference, then rerun the exact matched series. Full evidence:
+[docs/bench-evidence/qwen35-4b-main-repair-20260725.md](../docs/bench-evidence/qwen35-4b-main-repair-20260725.md).
+
+**Post-checkpoint CUDA-API attribution, same saved traces.** The vague
+"host/engine" residual is now concrete. Of the project's 1,090
+`cudaStreamSynchronize` calls, 497 follow a 256-byte sampled-ID D2H and consume
+**20.975 s total / 42.20 ms average**; the variable-size sampled-ID tail adds
+~0.24 s. They come from `GPUModelRunner::sample_tokens_async`'s discrete-GPU
+branch, which immediately waits on the main stream to update host
+`InputBatch::last_sampled_tokens`. The 531 16-byte embedding-error-flag
+synchronizations cost only **12.6 ms total / 23.7 us average** and are not the
+lever. The matched vLLM trace uses `cudaEventSynchronize` for sampled output
+after launching the next batch, preserving depth-2 overlap. Correct next work:
+add a device-resident sampled-token map indexed independently of condensed
+dense rows (or explicitly mirror every removal/move), then run device combine
+on discrete CUDA and consume output through the existing event path. Do NOT
+delete the synchronize while retaining host row state: that races and can feed
+the wrong request after `InputBatch::condense`. No unsafe shortcut is included
+in this checkpoint.

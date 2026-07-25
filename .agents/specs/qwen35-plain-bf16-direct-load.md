@@ -22,6 +22,11 @@ In scope:
   torch-Linear orientation and use the existing `MatmulBT` path;
 - represent tied `lm_head` as the embedding owner rather than copying it;
 - reuse main's merged GDN projection and fused-attention policies unchanged;
+- mirror vLLM's quantization-independent CUDA-graph selection for pure decode by
+  reusing the existing Qwen3.5 dense graph driver for plain BF16;
+- admit the exact 4B `Hq/Hkv=16/4`, head-dim 256 topology to the existing
+  generic FA2 group-swap split-KV decode launcher, behind
+  `VT_FA2_DECODE_4B=0` rollback;
 - preselect one engine queue, pass it through `ModelSource`, stage each completed
   plain-BF16 layer, synchronize, release only host bytes with an authoritative
   device resident, then give that same queue to the runner;
@@ -53,6 +58,7 @@ into a 27B/35B support claim.
 | pinned vLLM `vllm/model_executor/models/qwen3_5.py:276-303` | Stack QKV, gate/up, GDN BA, and GDN QKVZ physical parameters in the declared shard order. |
 | pinned vLLM `vllm/model_executor/models/qwen3_5.py:483-492` | Tied output embeddings share the embedding parameter rather than copying bytes. |
 | pinned vLLM `tests/models/test_initialization.py` | Model initialization and tied-parameter lifetime remain valid after loading. |
+| installed vLLM 0.25 `vllm/config/compilation.py:590-619,1316-1460`; `vllm/compilation/cuda_graph.py:145-164` | CUDA graph mode is selected by runtime batch/model capability, not weight quantization. Full decode capture caches a graph per batch descriptor and replays it on later calls. |
 
 The required `/home/mudler/_git/vllm` checkout is absent on this host. The
 available `/home/rich/python/vllm` checkout confirms the same target-device and
@@ -86,6 +92,8 @@ requires matching nsys traces under the project parity protocol.
 |---|---|---|
 | plain BF16/F32 recognition and raw-NK load | `qwen3_5_dense_weights.cpp`, `qwen3_5_dense.h` | Compose with `dense_weight_loaders.h` and main's merged QKVZ/BA owners; do not restore split owners. |
 | plain projection execution | `qwen3_5.cpp` | Add raw-NK/plain branches without changing NVFP4/FP8/GGUF behavior or `FuseAttnPreambleOn`. |
+| plain BF16 decode graph | `qwen3_5_dense.cpp`, `qwen3_5.cpp` | Remove the registry's FP4-only eligibility restriction. Reuse the existing dense graph driver, capture sizes, persistent metadata, eager fallback and `VLLM_CPP_DENSE_DECODE_GRAPH=0` rollback unchanged. |
+| 4B full-attention decode | `qwen3_5.cpp`, `cuda_paged_attn.cu`, `cuda_flash_attn_fa2.cu` | Mirror the observed vLLM FA2 split-KV dispatch for Hq/Hkv=16/4, D256. Extend only the generic launcher's bounded admission and keep a topology-specific rollback. |
 | tied logits | dense weight metadata plus dense forward | Select `embed_tokens` as the logits operand; never copy it. |
 | logical host release | `OwnedTensor`, dense traversal | Preserve logical presence after synchronized release; reject host `View()` once released. |
 | load queue propagation | `ModelSource`, `qwen3_5_dense.cpp`, `LoadedEngine` | Add a non-owning queue pointer while retaining `safetensors_owned`; transfer the same queue to the runner. |
@@ -100,6 +108,8 @@ requires matching nsys traces under the project parity protocol.
 | target-device construction/lifetime | `tests/vllm/models/test_model_registry.cpp` covers queue propagation; the real 4B CUDA case compares retained-host and direct-device full-engine execution in one binary. |
 | released-host safety | Unit-test logical presence, byte count, invalid host access, and resident-only forward behavior. |
 | full model | `tests/vllm/models/test_qwen35_plain_weights.cpp:162-196` skips without CUDA/the cached 4B model; when available it compares prompt/output token IDs for both direct-load arms. Current-vLLM oracle comparison remains a separate W4 gate. |
+| graph selection and replay | The same real-checkpoint test runs enough tokens to reach cold, capture and replay states, then compares graph ON against the eager rollback. Matched `nsys --cuda-graph-trace=node` evidence must contain project graph-node rows before speed credit. |
+| 4B FA2 decode | `test_ops_paged_attn` ports the existing ratio-6/ratio-8 composed-reference sweep to ratio 4 over batch 1/2/4/8/16, plus explicit toggle-off, finite-window and unsupported-geometry fallback cases. The real 4B gate and same-binary token A/B precede speed credit. |
 | exact benchmark corpus and output capture | `tests/examples/test_bench.cpp` covers first-turn ShareGPT loading, exact request count, fixed output length and submission-order JSON token-ID serialization; the same header-only path is compiled into `vllm-bench`. |
 
 No upstream test is dropped. GPU/model tests that cannot run in CI remain
@@ -127,39 +137,39 @@ checked in with an explicit model/backend skip.
    `scripts/check-doc-checkpoint.py`, README, BENCHMARKS, matrices, roadmap,
    ledger and state agree at every checkpoint.
 
-Current checkpoint: `GATING` after the corrected Triton-AOT local 4B
-comparison. Clean CPU gates remain green. CUDA 12.9/GCC 14 uses CMake CUDA arch
-`120a` (required by current Blackwell sources), generated Triton target
-`sm_120`, FlashInfer CUTLASS, `VLLM_CPP_TRITON=ON` and regeneration ON. The real
-cached `Qwen/Qwen3.5-4B` CUDA gate passes 3/3 cases and 1664/1664 assertions;
-the seven Triton-specific GDN cases execute 378/378 assertions; direct ON/OFF
-outputs are identical.
+Current checkpoint: `GATING / speed-pending` after transplanting the relevant
+H32 AOT repair onto current `main` and completing the plain-BF16 graph and
+ratio-4 FA2 work. CUDA arch `120a`, generated Triton target `sm_120`,
+FlashInfer CUTLASS, `VLLM_CPP_TRITON=ON` and regeneration ON are verified in
+the build. The real cached `Qwen/Qwen3.5-4B` graph/direct/eager gate passes
+**3/3 cases and 1,672/1,672 assertions**; direct ON/OFF outputs are identical.
 
-Immutable root `/tmp/qwen35-transplant-4b-aot-557ab41d` completed all 18
-cache/idle/thermal-guarded legs at 128 requests, 131,784 actual input tokens,
-128 output tokens/request and concurrency 32. Direct ON/OFF/local-vLLM-0.24
-means are **6155.10/6064.06/6730.46 total tok/s**,
-**680.61/670.54/744.24 output tok/s**, **5.317/5.240/5.814 req/s**,
-**722.56/815.05/903.20 ms mean TTFT**, **41.44/41.43/33.56 ms mean
-TPOT/ITL**, and **5985.90/6076.37/5164.87 ms mean E2EL**. Peak PSS is
-**2.405/8.571/7.569 GiB**, stable PSS **0.733/8.571/4.066 GiB**, and peak VRAM
-**12892/12884/12942.7 MiB**. ON is **+1.50%** total over same-binary OFF and
-cuts peak/stable PSS **71.9%/91.4%**; ON=OFF output IDs match 128/128 in all
-three pairs. The +8 MiB ON-vs-OFF VRAM delta keeps the strict VRAM gate open.
+Immutable root `/tmp/qwen35-main-final-fa2-20260725` completed all 18 guarded
+legs at 128 requests, 131,784 actual input tokens, 128 output tokens/request
+and concurrency 32. A clean immediate vLLM confirmation supplies the stable
+denominator. Direct ON/OFF/vLLM-0.25 means are **5769.99/5660.70/5849.80 total
+tok/s**, **638.03/625.94/646.85 output tok/s**, **4.9867/4.8900/5.0536
+req/s**, **834.91/943.43/1047.13 ms mean TTFT**, and
+**43.72/43.84/38.55 ms mean TPOT/ITL**. Peak PSS is
+**2.406/8.592/7.662 GiB**, stable PSS **0.759/8.589/4.029 GiB**, and peak VRAM
+**12850.7/12843.3/12942.7 MiB**. ON is **+1.93%** total over same-binary OFF
+and cuts peak/stable PSS **72.0%/91.2%**; ON=OFF output IDs match 128/128 in
+all three pairs. The +7.3 MiB ON-vs-OFF VRAM delta is within the +8 MiB gate.
 
-Current AOT ON is **0.9316x** the previous AOT ON (**6155.10 vs 6607.04,
--6.84%**) and **0.9145x** local vLLM; current vLLM is 1.002x the previous
-reference, so the residual is project-side. Matching nsys captures show the
-generated AOT GDN chunk kernels executing. The packed-decode AOT cubin is
-27B-only by contract and is ineligible for the 4B geometry, whose trace
-correctly contains `GdnPackedDecodeKernel`. vLLM graph launches include
-304,746 graph-node kernel rows; the project 4B path makes no graph launch, so
-there are no omitted project child kernels. Aggregate SHA-256 is
-`6ff009822cda2dc146301ebbd0f4adbf76d3e341c6f0eff2542dbb38c25798ed`;
-project/vLLM trace SHA-256 values are `f2e73f4b...681` and `cbe2afbc...9a9`.
-The local vLLM arm remains a performance reference only: it is v0.24, not the
-current v0.25 correctness oracle. Current-v0.25 correctness, sanitizer,
-current-vs-previous AOT attribution and external 27B/35B regressions remain.
+The repaired components are individually positive: H32 AOT **+4.5906%**,
+plain-BF16 graph **+0.3873%**, and ratio-4 FA2 **+1.6004%** total throughput
+against their same-binary rollbacks. The final `--cuda-graph-trace=node`
+capture contains 453 graph launches and 200,972 graph-child kernel events.
+Local FA2 is **180.28 us/call** versus vLLM **178.40 us/call**, and local
+graph-child GPU time is below the matched vLLM trace, but binding TPOT remains
+43.72 vs 38.55 ms. CUDA API attribution identifies the open lever: 497
+sampled-ID D2H operations are followed by immediate main-stream synchronization
+on discrete CUDA, costing 20.975 s / 42.20 ms each in the profile, whereas vLLM
+defers that wait with events. The required repair is a device-resident
+sampled-token map that remains correct across request compaction. Full evidence
+and hashes:
+[2026-07-25 4B repair](../../docs/bench-evidence/qwen35-4b-main-repair-20260725.md).
+Sanitizer availability and external 27B/35B regressions remain follow-ups.
 
 Corrected AOT reproduction entry point:
 
@@ -189,7 +199,7 @@ REQUIRE_TRITON_AOT=1 \
   CPP_BENCH=$PWD/build-nix-cuda-transplant-triton/examples/vllm-bench \
   CMAKE_CACHE=$PWD/build-nix-cuda-transplant-triton/CMakeCache.txt \
   flock /tmp/gpu tools/bench/run_qwen35_4b_compare.sh \
-  /tmp/qwen35-transplant-4b-aot-<commit>
+  /tmp/qwen35-main-final-fa2-<commit>
 ```
 
 ## Dependencies
@@ -214,11 +224,16 @@ REQUIRE_TRITON_AOT=1 \
    current preamble/GDN dispatch; regression tests.
 4. `W3` residency: **COMPLETE / LOCAL-CUDA-GATED** — logical host-release state, dense prepare/release traversal,
    queue propagation/reuse, exclusions and retained-host/direct-device token equivalence; sanitizer remains W4.
-5. `W4` gates: **GATING / LOCAL AOT 4B COMPLETE** — 18/18 guarded legs and
-   matching traces bind the current 4B diagnostic. Current is 0.9316x the
-   previous AOT result and 0.9145x local vLLM; direct loading remains exact and
-   memory-positive. Current-v0.25 correctness, regression attribution,
-   sanitizer, strict ON<=OFF VRAM and external 27B/35B remain follow-ups.
+5. `W4` gates: **GATING / LOCAL 4B COMPLETE** — 18/18 guarded legs and matching
+   traces bind the current diagnostic. Direct loading is exact and
+   memory-positive. Stable vLLM-0.25 comparison is 0.9864x total/output
+   throughput and slower on TPOT/ITL, so speed remains open.
+6. `W5` plain-BF16 decode graph: **COMPLETE** — exact graph/eager/direct test,
+   128/128 benchmark identity and attribution-complete node trace; +0.3873%.
+7. `W6` 4B FA2 decode: **COMPLETE** — exact ratio-4 gate, composed-reference
+   ladder and node trace; +1.6004%. Remaining work is the discrete-CUDA
+   sampled-token device map and event-overlapped output consumption outside
+   graph-child kernels.
 
 ## Risks and decisions
 

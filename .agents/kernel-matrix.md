@@ -39,6 +39,26 @@ migrates incrementally to the common raw pointer/shape/stride/scalar/layout/
 workspace/stream adapter and completes its own correctness, trace, every-axis
 performance, and memory checkpoint before the next migration stacks.
 
+Current `KERNEL-GDN-PACKED-DECODE` extension checkpoint (2026-07-25): the
+historical Hv=32-launcher-rejection text embedded in that completed 27B row is
+superseded for **dense 4B only**. `CLAIM-LOCAL-BF16-H32-AOT` adds the current
+raw-packed/FP32-state `gdn_decode_h32` specialization; 35B remains inert through
+the dense-only model selector. Full GDN is **66/66 (4,242/4,242)**, the flag
+test is **10/10**, the real graph/direct/eager 4B gate is **3/3
+(1,672/1,672)**, and sm_120 plus sm_121a manifest drift checks pass.
+Same-binary AOT versus rollback is **+4.5906%** total/output throughput, and
+the final graph-node trace proves the specialization executes. The extension
+is complete; its parent 4B loader row remains speed-pending.
+
+Current `KERNEL-ATTN-FA2` ratio-4 checkpoint (2026-07-25): the existing generic
+head-dim-256 split-KV launcher now admits the Qwen3.5-4B exact Hq/Hkv=16/4
+topology behind `VT_FA2_DECODE_4B` (default ON, `=0` rollback). The composed
+reference suite is **25/25 (454,474/454,474)**. Same-binary FA2 versus generic
+paged fallback is **+1.6004%** total/output throughput. Node-mode execution is
+trace-proven at **180.28 us/call**, within 1.1% of the matched vLLM FA2 kernel
+at 178.40 us/call. Evidence:
+[2026-07-25 4B repair](../docs/bench-evidence/qwen35-4b-main-repair-20260725.md).
+
 | ID | Item | Upstream | Our code | Tests/evidence | Spike/spec | State | Owner |
 |---|---|---|---|---|---|---|---|
 | `KERNEL-ACCEL-PROVIDER-SELECT` | **WHICH implementation of an op runs, when more than one exists on a device** — the selection layer above every kernel family in this matrix. Distinct from `KERNEL-CUDA-DISPATCH-AOT`, which is about which ARCH a CUDA kernel is compiled/selected for; this is about which PROVIDER (ours, a vendor library, MLX, llama.cpp) serves the op at all | no single upstream file: this is the shape vLLM's runtime chain uses everywhere — flashinfer tactic registries, cuBLASLt/CUTLASS per-call heuristics, and torch's backend selection — rather than compile-time pinning | `vt::OpProvider` [op_provider.h](../include/vt/op_provider.h) + [op_provider.cpp](../src/vt/op_provider.cpp); the flat `[OpId][DeviceType]` `void*` table it replaces is gone from [ops.cpp](../src/vt/ops.cpp) with the ~70 op wrappers untouched. Providers registered today: `vt-native` (every backend kernel in the tree, priority 0, unconditional — behaviour preserved exactly), `mlx` (priority 100, Metal `kMatmul`/`kMatmulBT`, build-gated `VLLM_CPP_MLX`, [metal_mlx_provider.mm](../src/vt/metal/metal_mlx_provider.mm)), and — NEW 2026-07-23 (`CLAIM-BACKEND-SEAM-S5-1`, work row `S5`) — **`vt-cpu-ref` (priority −1000, the portable reference tier)**: the CPU kernel installed LAZILY as a negative-priority fallback on a UNIFIED-MEMORY device's first `GetOp` miss, mirroring `custom_op.py:138 forward_native`, so a partial backend runs an op it lacks natively instead of throwing. Native always wins (priority); gated on `Backend::UnifiedMemory()` (a discrete GPU never gets it — a CPU kernel on true device memory is corruption); observable via `GetReferenceTierHits()` + a one-time loud stderr line | [test_op_provider.cpp](../tests/vt/test_op_provider.cpp) 11 cases / 47 assertions — deterministic selection under REVERSED registration order, name tie-break, duplicate rejection, capability predicate, caps re-resolution, decline-and-fall-back, stats, runtime disable; [test_metal_backend.cpp](../tests/vt/test_metal_backend.cpp) 9 cases / 108 assertions on the M4 with MLX ON, including MLX-vs-MSL-vs-CPU NMSE per op at real shapes and an end-to-end DECLINE; **[test_reference_tier.cpp](../tests/vt/test_reference_tier.cpp) (S5): discrete-device refusal + unified-device zero-native-kernel fallback correctness + native-wins + observability, hardware-free via a fake backend on `kXPU`.** Linux CPU 156/156; dgx regression set ALL UNCHANGED | [Metal/MLX reuse study §6](specs/metal-mlx-reuse-study.md); [accelerator-seam-audit §10](specs/accelerator-seam-audit.md); [drop-in kernel ABI](specs/dropin-kernel-abi.md) (the complementary ARGUMENT half) | `ACTIVE` — mechanism landed and gated with THREE provider kinds (`vt-native`, `mlx`, `vt-cpu-ref`); the CUDA/CPU/Vulkan vendor provider rows it was designed for are not yet populated (so the row is deliberately left open) | `CLAIM-BACKEND-ACCEL-PROVIDER-1` |

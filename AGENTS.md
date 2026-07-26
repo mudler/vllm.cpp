@@ -1,15 +1,39 @@
 # AGENTS.md — vllm.cpp canonical index
 
-This file is the **index** to the project's canonical record. Every session:
-read this first, follow the links that matter for your task, and keep the
-record updated (append to the state log) — commit it with your changes.
-Push directly to `main`.
+This file is the **index** to the project's canonical record. Every session,
+read this first and follow the links that matter for the task. Commits are
+allowed for completed in-scope changes and must follow the commit protocol
+below.
+
+**Developer preferences.** After this file, read
+[`.agents/developer-preferences.md`](.agents/developer-preferences.md) when it
+exists. It is intentionally untracked and records the current developer's Git
+integration choices, usable hosts, local paths, GPU contention policy,
+download/service permissions, and collaboration preferences. Start from the
+tracked
+[developer-preferences example](.agents/developer-preferences.example.md).
+Preferences control operations, not project truth: they cannot weaken the
+correctness, testing, evidence, attribution, lifecycle, or documentation rules
+in this file. Do not infer preferences from a developer name, filesystem path,
+Git author, or machine identity.
+
+If the preference file is absent or silent, use the safe defaults: local edits,
+tests, and commits are allowed; do not push, merge, force-update refs, use
+external hosts, install/download large assets, manage services, or start
+parallel agents. Ask before those actions. In the protocol, `${VLLM_SOURCE}`,
+`${VLLM_ORACLE}`, `${DEPENDENCY_SOURCE}`, and `${GPU_LOCK}` mean the values
+selected by that file. Exact Ettore infrastructure paths retained in the
+environment registry or historical evidence are not commands for other
+developers.
 
 **Session handoff.** Cold-resume context for unfinished work lives in the
 newest [`.agents/state.md`](.agents/state.md) entries plus the live claim row
 in [`.agents/coordination.md`](.agents/coordination.md): active claim, exact
 source/evidence roots, prohibitions, and the first resume/verification
-commands. Before ending a session with work in flight, record them there in
+commands. Append to the state log for a feature/lifecycle checkpoint, a
+material implementation decision, or unfinished work that needs a handoff.
+Routine review, Git housekeeping, and protocol discussion do not require a
+state entry. Before ending a session with work in flight, record the handoff in
 the same checkpoint change. (User-directed 2026-07-14: the separate
 `HANDSOFF.md` replace-in-place surface is retired; do not recreate it.)
 
@@ -141,14 +165,14 @@ present in the tree is not allowed to claim `DONE` in a matrix until the row
 links exact code and test/evidence anchors, its ledger evidence, and the closing
 commit; record gaps honestly as `ANCHOR-BACKFILL` or `PARTIAL`.
 
-Parallel work is coordinated through `.agents/coordination.md`. A sub-agent
-claims stable row IDs there before editing, uses an isolated worktree/branch,
-and owns only the listed files/rows. GPU execution is serialized with
-`flock /tmp/gpu` per `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`
-WHEN multiple agents may run GPU work concurrently — there is no external
-contention on dgx, so a sole GPU owner (verified idle via `nvidia-smi`) may run
-lock-free; benchmark series always need an uncontended GPU regardless;
-an A/B or profile series holds one lock for the whole series. When every row in
+Parallel work is coordinated through `.agents/coordination.md`. When the
+developer preferences enable parallel agents, each sub-agent claims stable row
+IDs there before editing, uses an isolated worktree/branch, and owns only the
+listed files/rows. A single-agent task does not need a worktree or claim unless
+it is explicitly participating in coordinated roadmap work. GPU execution uses
+the `${GPU_LOCK}` policy from the developer preferences whenever concurrent
+work may contend. The universal rule is an uncontended benchmark: an A/B or
+profile series holds one exclusion mechanism across the whole series. When every row in
 an execution block is `DONE`, move the block plan/report to
 `.agents/completed/` in the closing change. Permanent support matrices retain
 the completed row and its code/test anchors so current capability remains
@@ -188,7 +212,7 @@ Assisted-by: Claude Code:claude-opus-4-8 [ClaudeCode]
 **TL;DR:** 1:1 port of vLLM to pure C++ (no Python/PyTorch; ggml as example,
 not dependency), structured so every future upstream vLLM PR can be ported
 mechanically. MVP gate: Qwen3.6-35B-A3B + 27B (NVFP4) at vLLM throughput
-parity on `dgx.casa` (GB10), loading from safetensors **and GGUF**, shipped
+parity on the project GB10/sm_121 release target, loading from safetensors **and GGUF**, shipped
 llama.cpp-style as a library + example CLI/OpenAI server, with tool calling,
 grammars, streaming/non-streaming, and e2e test suites.
 
@@ -208,9 +232,9 @@ is an ORCHESTRATION layer — the kernels that actually run (and that make it fa
 live in its DEPENDENCIES: **flashinfer** (CuTe-DSL / cutlass fp4·fp8 GEMMs, fused
 norm+quant, MoE, sm_121 "blackwell_sm12x" kernels), **cutlass**, **cuBLASLt**
 (nvjet), **DeepGEMM**, and **torch/Inductor** (the fused Triton it codegens). Read
-the actual pinned vLLM code (`/home/mudler/_git/vllm` @ pin `e24d1b24`) AND, as
-needed, the installed dep source (`~/venvs/vllm-oracle/lib/python3.12/site-packages/`
-— e.g. `flashinfer/cute_dsl/*.py`, `flashinfer/gemm/`), cite `file:line` on every
+the actual pinned vLLM code (`${VLLM_SOURCE}` @ pin `e24d1b24`) AND, as
+needed, the installed dependency source (`${DEPENDENCY_SOURCE}`, for example
+`flashinfer/cute_dsl/*.py` and `flashinfer/gemm/`), cite `file:line` on every
 side, and mirror what you find. **NEVER declare a lever "build-specific",
 "unverifiable", or "out of reach" without first inspecting the dep chain and, for
 compiled/JIT/Inductor code, DUMPING the generated kernel** — `TORCH_LOGS=output_code`
@@ -262,7 +286,7 @@ turns the suite into the regression net. Full protocol:
 
 Every change that could affect correctness OR performance MUST be compared
 apples-to-apples against vLLM and both numbers + the ratio recorded in the
-ledger: **correctness** vs the pinned pip-vLLM oracle (`~/venvs/vllm-oracle`),
+ledger: **correctness** vs the pinned pip-vLLM oracle (`${VLLM_ORACLE}`),
 **performance** vs `vllm bench throughput` on the *identical* workload. Never
 re-base the bench config without re-running vLLM on it. This is non-negotiable
 and applies to subagents. Full rule: [.agents/gates.md](.agents/gates.md)
@@ -302,16 +326,18 @@ compared against vLLM — dense bf16→fp8 +6%, prefill-attn vectorized staging
 0.79×→0.985× *after* the floor was supposedly "hit".)
 
 **The loop: SCAN → RE-ADAPT → FIND LEVERS — especially when a lever search
-stalls.** Run a **dynamic Workflow** that fans out **many** sub-agents to
+stalls.** When developer preferences and the current task authorize parallel
+agents, run a **dynamic Workflow** that fans out **many** sub-agents to
 deep-compare vLLM's throughput HOT PATH against ours **from a VARIETY of angles**
 — by subsystem (forward dtype/casts, GDN/MoE/attention kernels, norm/rope fusion,
 cudagraph/compile, quant dispatch, scheduler/batching, KV-cache, per-step host
 overhead) AND by lens on the same area (kernel wall-time, memory traffic, launch
 count, dtype/precision, tile/config, algorithm/fusion, occupancy), plus
 adversarial "refute we-match-vLLM" + completeness ("what haven't we looked at?")
-critics. Overlapping coverage is good — it finds blind spots. Each agent reads
-BOTH the
-pinned vLLM (`/home/mudler/_git/vllm` @ the parity pin) AND our source, cites
+critics. Overlapping coverage is good — it finds blind spots. Without parallel
+authorization, run the same lenses serially; the evidence standard is
+unchanged. Each participating agent reads BOTH the pinned vLLM
+(`${VLLM_SOURCE}` @ the parity pin) AND our source, cites
 `file:line` on both sides, and reports what vLLM does DIFFERENTLY that makes it
 faster. Then verify each diff adversarially (real? on the gate hot path?), rank
 by gain÷effort, drive the top lever, re-measure vs vLLM, repeat. Full protocol:
@@ -337,6 +363,12 @@ submitting AI-assisted code, read
 
 ## Index
 
+- [`.agents/developer-preferences.md`](.agents/developer-preferences.md) — the
+  ignored, developer-owned execution profile for this workspace (copy the
+  tracked example below; absence uses the safe defaults above).
+- [.agents/developer-preferences.example.md](.agents/developer-preferences.example.md)
+  — tracked template for Git integration, paths, hosts, compute, and
+  collaboration preferences.
 - [.agents/mission.md](.agents/mission.md) — what this project is and is not.
 - [.agents/gates.md](.agents/gates.md) — the 5 MVP gates (success definition).
 - [.agents/parity-lever-protocol.md](.agents/parity-lever-protocol.md) — the
@@ -353,9 +385,10 @@ submitting AI-assisted code, read
   the PARITY PIN (the vLLM commit we are parity-comparable against) and the
   repeatable sync cycle (enumerate → classify → report → port → re-verify →
   advance pin) that keeps porting upstream PRs a routine task.
-- [.agents/environment.md](.agents/environment.md) — dev box, `dgx.casa`
-  (GB10/sm_121) specs, benchmark models, gate-model architecture, prior-art
-  patch series, environment TODOs.
+- [.agents/environment.md](.agents/environment.md) — factual environment
+  profile registry, benchmark models, gate-model architecture, prior-art patch
+  series, and environment TODOs; availability is selected by developer
+  preferences.
 - [.agents/vllm-v1-v2.md](.agents/vllm-v1-v2.md) — V1 engine vs "Model Runner
   V2" terminology; we port MRV2.
 - [.agents/backends.md](.agents/backends.md) — backend portability strategy

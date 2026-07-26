@@ -1,5 +1,9 @@
 # Parity-lever protocol — scan → re-adapt → find levers (never accept a "ceiling")
 
+Source, oracle, dependency and profiler paths come from the untracked
+`developer-preferences.md`. The examples recorded for Ettore's infrastructure
+are not implied capabilities or authority in another workspace.
+
 **Core axiom:** vllm.cpp is a 1:1 port — SAME architecture, SAME model, SAME GPU
 as vLLM. Therefore, **if vLLM achieves a throughput/quality number, we can too.**
 Any apparent "ceiling", "diffuse per-op inefficiency", or "hand-kernel exhausted"
@@ -23,12 +27,14 @@ target, denominator, and A/B in vLLM (the oracle).
    - scheduler / batching / chunked-prefill / prefix-cache effectiveness
    - per-step engine/host overhead (input prep, sampling, async scheduling)
 
-   Each agent reads BOTH the pinned vLLM (`/home/mudler/_git/vllm` @ the parity
+   Each agent reads BOTH the pinned vLLM (`${VLLM_SOURCE}` @ the parity
    pin) AND our source, and reports, with `file:line` cited on BOTH sides, **what
    vLLM does differently that makes it faster** and the concrete fix in our code.
 
-   **Use MANY sub-agents and attack from a VARIETY of angles — do not rely on
-   one agent or one lens.** Fan out broadly and diversely, e.g.:
+   **When the developer preferences and current task permit parallel agents,
+   use MANY sub-agents and attack from a VARIETY of angles.** Otherwise run the
+   same lenses serially; do not drop coverage merely because the execution is
+   single-agent. Fan out broadly and diversely when authorized, e.g.:
    - **By subsystem** (the list above) — one agent per hot-path area.
    - **By lens on the same area** — separate agents examining the same op through
      different perspectives: kernel wall-time, memory traffic / bandwidth,
@@ -87,7 +93,7 @@ its dependencies; a lever "absent from vLLM's `csrc/`" often lives one layer dow
 Before calling anything "build-specific / unverifiable / out of reach", inspect the
 chain and, for compiled/JIT code, DUMP the generated kernel:
 
-- **flashinfer** (`~/venvs/vllm-oracle/lib/python3.12/site-packages/flashinfer/`):
+- **flashinfer** (`${DEPENDENCY_SOURCE}/flashinfer/`):
   the real fp4/fp8 GEMMs + fused kernels, many as **readable CuTe-DSL Python** — e.g.
   `cute_dsl/add_rmsnorm_fp4quant.py` (fused Add+RMSNorm+FP4-quant), `cute_dsl/
   rmsnorm_fp4quant.py`, `gemm/` (the fp4 GEMM + its tactic selection),
@@ -128,7 +134,7 @@ cuBLASLt/cutlass heuristics, flashinfer autotune, torch.compile codegen, capabil
 backend selection, and runtime-linked deps (TRT-LLM) the source never names.
 
 THE METHOD — do this BEFORE and DURING any parity/throughput work:
-1. **nsys BOTH** the vLLM oracle (`~/venvs/vllm-oracle`, graphed = production) AND our
+1. **nsys BOTH** the vLLM oracle (`${VLLM_ORACLE}`, graphed = production) AND our
    engine on the IDENTICAL workload. For our graphed engine the command is
    `nsys profile -t cuda --cuda-graph-trace=node -o OUT --stats=false <cmd>`
    then `nsys stats --force-export=true --report cuda_gpu_kern_sum OUT.nsys-rep`.
@@ -170,7 +176,7 @@ runs that we haven't matched 1:1.**
 profiler):**
 1. OURS: `nsys profile -t cuda ... ; nsys stats --report cuda_gpu_kern_sum` (works for us).
 2. vLLM: nsys fails (EngineCore init). Use the LLM-API torch profiler instead — a Python
-   script (run under `~/venvs/vllm-oracle/bin/python`) with these NON-obvious requirements:
+   script (run with the `${VLLM_ORACLE}` Python) with these NON-obvious requirements:
    - Wrap the body in `if __name__ == '__main__':` — vLLM uses `spawn` (CUDA pre-init) which
      re-imports the module; an unguarded top-level `LLM(...)` double-inits and crashes.
    - `LLM(model=..., profiler_config=ProfilerConfig(profiler="torch", torch_profiler_dir="/tmp/vprof3"))`

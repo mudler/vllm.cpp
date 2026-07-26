@@ -55,6 +55,7 @@ portable/reference path. In normal operation leave them unset.
 | `VT_CONV_REG` | on (CUDA GDN) | The non-register-tiled short causal convolution |
 | `VT_FA2_PREFILL` | on (CUDA) | The portable prefill attention instead of the vendored FA2 |
 | `VT_FA2_DECODE` | on (CUDA) | The portable decode attention instead of the vendored FA2 |
+| `VT_FA2_DECODE_4B` | on (CUDA, Qwen3.5-4B) | The portable paged decode attention instead of the ratio-4 vendored FA2 path; the 27B and 35B selectors are unchanged |
 | `VT_CPU_REF` | off | Set on to force the portable reference path (dequantize-everything oracle), the standard "is this a kernel bug?" bisect switch |
 
 ## Diagnostic

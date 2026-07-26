@@ -18,3 +18,7 @@ __pycache__/
 a.out
 *.out
 .claude/worktrees/
+
+# Per-developer agent execution preferences. Copy the tracked example and keep
+# machine paths, Git integration choices, and infrastructure policy local.
+.agents/developer-preferences.md

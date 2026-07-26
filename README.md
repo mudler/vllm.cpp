@@ -20,7 +20,7 @@ vllm.cpp implements an intentionally focused subset of vLLM, held to token-for-t
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete, at/above vLLM speed | Token-exact greedy on GB10; beats vLLM 0.25.0 total throughput at every concurrency (1.007-1.045x), effective parity 115/124 axes |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete, decode at-parity, prefill speed-pending | Token-exact greedy; decode at or beyond vLLM, remaining gap is prefill TTFT |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual |
-| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Direct ON and OFF are token-identical; direct loading cuts peak/stable host PSS by 72.0%/91.2%. Repaired H32 AOT, decode graphs and ratio-4 FA2 reach 0.9864x vLLM 0.25.0 total/output throughput; TPOT/ITL remains 43.72 vs 38.55 ms because discrete-CUDA sampled-token bookkeeping still synchronizes the main stream |
+| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Direct ON and OFF are token-identical; direct loading cuts peak/stable host PSS by 72.0%/91.2%. The pre-transplant H32 AOT, decode-graph and ratio-4 FA2 result reached 0.9864x vLLM 0.25.0; the current-main development branch is pending revalidation |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM |
 | Llama-3.x dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 16/16 (Llama-3.2-1B); llama3 RoPE scaling |
 | Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
@@ -101,15 +101,17 @@ Numbers are measured on NVIDIA GB10 (DGX Spark, sm_121a) against the pinned vLLM
 
 We beat vLLM on total throughput at every concurrency; effective parity is 115/124 per-axis metrics (two-grid totality), with the residuals being noise-band coin-flips or a favorable determinism tradeoff described in the benchmark record. Peak host memory also passes (24.88 GiB vs vLLM 28.18 GiB). The 35B decode path is at or beyond vLLM everywhere; its remaining gap is prefill time-to-first-token, tracked as active work.
 
-**Local Qwen3.5-4B plain BF16 direct loader, speed-pending:** on an RTX 5070 Ti,
-the repaired Triton-AOT, CUDA-graph and FA2 path reaches 5769.99 total tok/s
-versus vLLM 0.25.0 at 5849.80 tok/s (0.9864x) on the identical 128-request
-workload. Direct loading reduces peak PSS from 8.59 to 2.41 GiB and stable PSS
-from 8.59 to 0.76 GiB. It is not speed-complete because mean TPOT/ITL is
-43.72 ms versus vLLM's 38.55 ms. Profiling attributes the residual to the
-discrete-CUDA sampled-token D2H path synchronizing the main stream instead of
-retaining vLLM's event-overlapped device mapping. This local 4B diagnostic does
-not establish 27B/35B support. Exact evidence and reproduction:
+**Local Qwen3.5-4B plain BF16 direct loader, speed-pending:** the measured
+pre-transplant repair on an RTX 5070 Ti reached 5769.99 total tok/s versus vLLM
+0.25.0 at 5849.80 tok/s (0.9864x) on the identical 128-request workload. Direct
+loading reduced peak PSS from 8.59 to 2.41 GiB and stable PSS from 8.59 to 0.76
+GiB. Mean TPOT/ITL was 43.72 ms versus vLLM's 38.55 ms. Profiling attributes
+the residual to the discrete-CUDA sampled-token D2H path synchronizing the main
+stream instead of retaining vLLM's event-overlapped device mapping. The repair
+has since been transplanted onto current `main`; that development branch is
+pending the same-series revalidation, so these numbers do not yet bind to it.
+This local 4B diagnostic does not establish 27B/35B support. Exact evidence and
+reproduction:
 [Qwen3.5-4B main repair](docs/bench-evidence/qwen35-4b-main-repair-20260725.md).
 
 **CPU vs llama.cpp (GGUF, same file, single binary):** prefill 223.8 tokens/s vs llama.cpp 177.3 (1.18x ahead), decode at parity (24.7 vs 25.4 tokens/s), peak memory 2.83 GiB vs 2.80 (1.01x), and the output tokens are byte-identical to llama.cpp's greedy decode.

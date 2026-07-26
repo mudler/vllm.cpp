@@ -105,7 +105,8 @@ suffix are aliases for the corresponding `_M` preset.
 
 ## 2. vLLM-native and compatibility formats
 
-Registry source: `/home/mudler/_git/vllm/vllm/model_executor/layers/quantization/__init__.py:12-46`.
+Registry source:
+`${VLLM_SOURCE}/vllm/model_executor/layers/quantization/__init__.py:12-46`.
 `DONE` below is deliberately limited to a named gate-model slice.
 
 | ID | Upstream method / scheme | W/A/KV | Backend scope | R | M | C | E | P | State | Our code + tests/evidence | Spike/spec | Owner |

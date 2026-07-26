@@ -23,6 +23,10 @@
    binding floor. Cache-neutral/cache-off and shared-prefix cache-on are
    separate workloads with identical explicit policies and cache-hit proofs;
    a default-policy mismatch never counts.
+   `dgx.casa` is the current project release target, not a generally available
+   agent host. Only a developer preference profile that explicitly enables it
+   may execute there; other environments retain the gate as `PENDING` and run
+   only honest local diagnostics.
 2. **GGUF reading**: the same models load and serve from GGUF files (including
    NVFP4 GGUF extension types from the APEX/killgate tooling), not just
    safetensors.
@@ -47,7 +51,7 @@ that could affect either MUST be compared against vLLM, apples-to-apples, and
 BOTH numbers recorded in the [parity ledger](parity-ledger.md):
 
 - **Correctness:** op dumps + model logits/greedy vs the pinned pip-vLLM oracle
-  (`~/venvs/vllm-oracle` on dgx.casa, forward-math-identical to the pin). A new
+  (`${VLLM_ORACLE}`, forward-math-identical to the pin). A new
   op/model change is not "done" until it matches the vLLM oracle (or the
   deviation is recorded as accepted with the reason).
 - **Performance (gate #1):** every perf/kernel change is measured with our

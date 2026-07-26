@@ -1,7 +1,8 @@
 # Model parity matrix
 
 **Status:** canonical exhaustive model-family table for parallel claims.
-**Pinned oracle:** `/home/mudler/_git/vllm` at `e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`.
+**Pinned oracle source:** `${VLLM_SOURCE}` at
+`e24d1b24fe96a56ba8b0d653efa076d03eb95d6c`.
 **Audited sync target:** v0.25.0 `702f4814fe54`; the three explicitly marked
 target-pending rows below are inventoried now but do not advance the parity pin.
 **Inventory spike:** [specs/model-family-inventory.md](specs/model-family-inventory.md).

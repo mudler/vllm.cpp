@@ -1,5 +1,9 @@
 # Benchmarking protocol — match or beat every applicable floor on every axis
 
+Commands in this document use the source, oracle, host, cache and exclusion
+mechanism selected by the untracked `developer-preferences.md`. Infrastructure
+paths are parameters; the comparability and evidence requirements are not.
+
 **Acceptance rule (non-negotiable):** vLLM remains the compatibility and CUDA
 performance floor wherever it supports the same workload. Each backend also has
 a native performance floor and a leader comparison below. vllm.cpp must be
@@ -94,7 +98,7 @@ reproduction command. A CPU-only/non-performance feature records
 checkpoint.
 
 1. **Re-measure the vLLM denominator** on the IDENTICAL workload (`vllm bench
-   throughput` / `bench serve`, `~/venvs/vllm-oracle`) — same model, in/out len,
+   throughput` / `bench serve`, `${VLLM_ORACLE}`) — same model, in/out len,
    concurrency, sampling. Its number drifts; a stale baseline is disqualifying.
 2. **Same-binary A/B** for our change (toggle ON vs OFF) to isolate its effect,
    then compare the ON arm vs the fresh vLLM number on every axis.
@@ -130,22 +134,26 @@ rumor; a reproducible run is evidence.
   reproduce is void, not a win.
 - **Same-binary A/B** (toggle ON vs OFF) so the delta is attributable to the
   change, not to build/config drift.
-- **Guard against contamination with the shared mutex** — wrap the complete
-  server/reference/A/B/profile series in one `flock /tmp/gpu -c '...'`, per
-  `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. A number is void
-  unless the lock was held for its entire run. Inspect `fuser -v /tmp/gpu` on a
-  timeout; never kill a PID you did not start. CPU-only comparisons use an
-  equivalent host lock or an otherwise idle, pinned-core machine.
+- **Guard against contamination with the selected exclusion mechanism** — wrap
+  the complete server/reference/A/B/profile series in one `${GPU_LOCK}` scope
+  from `developer-preferences.md`. A number is void unless exclusivity was
+  proven for its entire run. Inspect the selected lock holder on a timeout;
+  never kill a PID you did not start. CPU-only comparisons use an equivalent
+  host lock or an otherwise idle, pinned-core machine. Ettore's profile maps
+  this to `flock /tmp/gpu`; other developers do not inherit that path.
 - **Prefer a scripted, re-runnable harness** over ad-hoc one-offs so any result
   can be regenerated on demand; keep the gate config stable (never silently
   re-base it without re-running vLLM on the new config).
 - **Thermal/power + memory-return disclosure for multi-arm series** (adopted
-  from spark-bench `matrix_driver.sh`; GB10 is a compact unified-memory box):
-  fail closed if the pinned absolute `nvidia-smi` probe exits nonzero; snapshot
-  `nvidia-smi -q -d PERFORMANCE,TEMPERATURE,POWER` before/after each
-  measured leg, require thermal/power-brake event reasons inactive and require
-  the SW/HW thermal plus HW power-braking counters not to increase; record the
-  parsed values and raw snapshots with the results. Between engine legs, verify available memory
+  from spark-bench `matrix_driver.sh`; the Ettore GB10 release target is a
+  compact unified-memory box):
+  on an NVIDIA profile, fail closed if the preference-selected absolute
+  `nvidia-smi` probe exits nonzero; snapshot
+  `nvidia-smi -q -d PERFORMANCE,TEMPERATURE,POWER` before/after each measured
+  leg, require thermal/power-brake event reasons inactive and require the SW/HW
+  thermal plus HW power-braking counters not to increase. Other backends use
+  the equivalent probe selected by their profile. Record parsed values and raw
+  snapshots with the results. Between engine legs, verify available memory
   returns to the recorded baseline (leak check) and drop page caches before the
   next leg. The allowed memory-return tolerance is fixed by the committed
   harness, never read from mutable evidence. A leg run on a throttling or memory-leaking box voids the

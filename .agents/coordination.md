@@ -70,43 +70,51 @@ implementation supported.
 ## Claim protocol
 
 1. Pick the highest-priority `READY` row whose dependencies are `DONE`.
-2. Add one active-claim row below before editing. List every file or narrow
-   directory owned; overlapping ownership requires an explicit lead claim.
-3. Create an isolated worktree and branch named for the stable row ID. Never
-   share a build directory between claims.
+2. For coordinated parallel work, add one active-claim row below before
+   editing. List every file or narrow directory owned; overlapping ownership
+   requires an explicit lead claim. A single-agent ad hoc task does not create
+   a claim unless it is taking ownership of a roadmap row.
+3. For every parallel claim, create an isolated worktree and branch named for
+   the stable row ID. Never share a build directory between claims. Single-agent
+   branch/worktree behavior follows `developer-preferences.md`.
 4. Update the claim after spike, implementation, and gating handoffs. A stalled
    agent releases its claim; it does not keep an invisible reservation.
 5. Return commit SHA, exact commands/results, remaining gaps, and every status
    file that must change. The integrating agent checks the row contract.
-6. Merge/push only after the matrix, roadmap, porting inventory, ledger, state,
+6. Integrate only after the matrix, roadmap, porting inventory, ledger, state,
    `README.md`, and `docs/BENCHMARKS.md` all agree. README and BENCHMARKS are
    mandatory at every feature/iteration checkpoint, including pending, failed,
-   and void stages rather than only externally visible closure.
+   and void stages rather than only externally visible closure. Merge/push/PR
+   behavior follows `developer-preferences.md`; this control plane grants no
+   remote authority.
 
 ## GPU scheduling
 
-All agents use the shared protocol at
-`/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`.
+The universal invariant is exclusive, demonstrably uncontended benchmark and
+profile execution. `developer-preferences.md` selects the local lock command,
+device-idleness probe, shared-host rules, and any service-quiescence procedure.
+Do not use an infrastructure-specific lock or manage a service merely because a
+historical entry names it.
 
-**When the lock applies (user-directed 2026-07-10):** there is no external GPU
-contention on dgx (the LocalAI worker stays stopped during work) — the flock is
-purely the INTER-AGENT mutex. It is REQUIRED whenever more than one agent or
-queued job may execute GPU work in the same window (any moment coordination.md
-lists 2+ GPU-capable claims, or a queue exists). A sole GPU owner may run
-lock-free after verifying the GPU is idle (`nvidia-smi` shows no compute
-process); benchmark/A-B validity still requires an uncontended GPU either way —
-that invariant is about measurement, not locking.
+On Ettore's DGX profile, `${GPU_LOCK}` is `flock /tmp/gpu` and the detailed
+shared-host procedure lives at
+`/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. That flock is an
+inter-agent mutex because the LocalAI worker is normally stopped. Other
+developers use their selected policy. A sole GPU owner may run correctness work
+lock-free after verifying the GPU is idle when preferences permit it;
+benchmark/A-B validity still requires an uncontended GPU either way.
 
 | Work | Lock rule |
 |---|---|
 | Compile, sync files, inspect source, `ps`/`nvidia-smi` | No GPU lock needed |
-| CUDA tests, model load, server, benchmark, nsys/ncu | `flock /tmp/gpu -c '<whole job>'` |
-| A/B or competitor series | One `flock` around every arm and trace; interleaved runs are void |
-| Long background run | `setsid flock /tmp/gpu -c '<job>'`; lock parent lives with job |
-| Timeout | `flock -w <seconds>`; inspect holder, never kill an unowned PID |
+| CUDA tests, model load, server, benchmark, nsys/ncu | `${GPU_LOCK} <whole job>` when the selected policy requires it |
+| A/B or competitor series | One selected exclusion mechanism around every arm and trace; interleaved runs are void |
+| Long background run | Use the preference-selected durable lock/job mechanism |
+| Timeout | Inspect the selected lock holder; never kill an unowned PID |
 
-Each claim records its remote directory and planned lock window. One server at a
-time owns the GB10. Results without the lock for their entire run are discarded.
+Each parallel claim records its execution directory and planned exclusion
+window. One server at a time owns the selected benchmark device. Results
+without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 

@@ -237,11 +237,13 @@ evidence.
 
 1. Follow the ordered portfolio in roadmap_v1.md and select an unblocked
    `INVENTORIED` row or row block.
-2. Claim its stable ID in coordination.md and write the real
-   `specs/<slug>.md` spike. A plain `planned: specs/...` cell is deliberately
-   not a link and does not make the row `READY`.
-3. Merge the spike, change the row to `READY`, then delegate implementation in
-   an isolated worktree. GPU jobs use one `flock /tmp/gpu` across the whole run.
+2. For coordinated roadmap work, claim its stable ID in coordination.md. Write
+   the real `specs/<slug>.md` spike in all cases. A plain `planned: specs/...`
+   cell is deliberately not a link and does not make the row `READY`.
+3. Make the spike reviewable, change the row to `READY`, then implement. Use an
+   isolated worktree for parallel claims and the `${GPU_LOCK}` policy for GPU
+   work when selected by `developer-preferences.md`; a benchmark is always
+   uncontended.
 4. `DONE` requires exact local code, ported-test/evidence and real-spec anchors,
    plus the roadmap, README, inventory, ledger and state updates in the same
    change. Legacy emoji rows are migrated by the anchor-backfill workstream.

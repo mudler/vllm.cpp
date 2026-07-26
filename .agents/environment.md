@@ -1,6 +1,13 @@
 # Environment & assets
 
-- **Local development/GPU box (re-verified 2026-07-25):** NVIDIA GeForce RTX
+This file is a factual registry of known development and gate environments. It
+does not authorize connecting to a host, managing its services, using its
+credentials, or assuming its paths exist. The untracked
+`developer-preferences.md` selects which entries are available in the current
+workspace and supplies local path/lock overrides. If no profile is selected,
+use only the current local host and mark unavailable hardware gates `PENDING`.
+
+- **Rich local development/GPU profile (re-verified 2026-07-25):** NVIDIA GeForce RTX
   5070 Ti, 16 GiB, compute capability 12.0 (`sm_120`), driver 595.71.05. The
   cached `Qwen/Qwen3.5-4B` snapshot is the only model large enough for the
   local direct-load performance diagnostic; it cannot run the 27B/35B gates.
@@ -13,7 +20,7 @@
   vendored target `sm_120`, CUTLASS and FlashAttention-2 enabled.
 - **CPU development path:** CPU reference backend + engine logic + CI
   development.
-- **GPU box**: `ssh dgx.casa` — DGX Spark, GB10 (Blackwell, **sm_121**),
+- **Ettore DGX release-gate profile**: `ssh dgx.casa` — DGX Spark, GB10 (Blackwell, **sm_121**),
   ~119 GB unified memory, 20 cores, CUDA toolkit 13.0.88 (nvcc); compute
   capability 12.1 → sm_121. Unified memory: both gate models fit
   in bf16; the machine is memory-bandwidth-bound (~273 GB/s class) — decode
@@ -61,7 +68,7 @@
     gate checkpoints, APEX GGUF evidence and sources were preserved; the volume
     had 359 GB free afterward. Maintain at least 200 GB headroom before adding
     competitor images.
-- **Apple/Metal box**: `ssh 192.168.68.103` — Mac mini, Apple M4 (10 CPU
+- **Ettore Apple/Metal profile**: `ssh 192.168.68.103` — Mac mini, Apple M4 (10 CPU
   cores), 16 GB unified memory, arm64, macOS 26.5.2. Use it for the MLX-backed
   `vt::` backend, Metal op parity, and small-model bring-up. It cannot hold the
   27B/35B gate models; gate-scale Apple performance needs a larger-memory Mac.
@@ -163,7 +170,7 @@
   | Device probe | `mx.metal.device_info()` -> `applegpu_g16g`, `max_recommended_working_set_size` 12,713,115,648 (11.84 GiB), `max_buffer_length` 9,534,832,640 |
   | Removal | `rm -rf ~/mlx-venv ~/hf-cache` — neither is on any PATH our builds consult |
 
-## Benchmark models on dgx.casa
+## Benchmark models on Ettore's dgx.casa profile
 
 - `~/.cache/huggingface/hub/models--nvidia--Qwen3.6-35B-A3B-NVFP4`
   (snapshot complete, ~22G, 3 safetensors shards — re-downloaded 2026-07-03
@@ -179,7 +186,7 @@ partial RoPE 64 dims (MRoPE sections [11,11,10,0]), rope base 1e7; MoE 256
 experts top-8 + 1 shared (expert FFN 512); GDN: conv kernel 4, 16 groups,
 inner 4096, state 128; context 262144.
 
-## Prior art on dgx.casa (mudler's llama.cpp patch series — mine for GB10 kernels)
+## Prior art on Ettore's dgx.casa profile (mudler's llama.cpp patch series — mine for GB10 kernels)
 
 - `~/killgate_series/` — NVFP4 W4A4 FP4 MMA prefill, qwen35moe NVFP4
   quant/dedup, MoE decode regraph

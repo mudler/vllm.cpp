@@ -5,26 +5,35 @@ and continue. Follow this protocol every session.
 
 ## Session protocol
 
-1. **Orient**: read `AGENTS.md` (index), the top-level
+1. **Orient**: read `AGENTS.md` (index), the untracked
+   `developer-preferences.md` when present, the top-level
    [roadmap_v1.md](roadmap_v1.md) row, its owning area matrix row,
    [coordination.md](coordination.md), and only the current carry-forward plus
    newest/relevant entries in [state.md](state.md). Search by stable row ID and
    inspect the tail; do not load the append-only state or parity ledger from
    beginning to end merely because it exists.
-2. **Claim one stable row ID**: add the sub-agent/worktree/branch and owned files
-   to the coordination table before editing. One focused row or explicitly
-   listed row block per PR; split oversized rows in the area matrix first.
+2. **Claim one stable row ID for coordinated roadmap work**: when parallel
+   work is enabled or the task joins an existing claim block, add the
+   sub-agent/worktree/branch and owned files to the coordination table before
+   editing. One focused row or explicitly listed row block per PR; split
+   oversized rows in the area matrix first. A single-agent ad hoc task does not
+   create a claim merely to satisfy ceremony.
 3. **Spike first**: create `.agents/specs/<slug>.md` and move the row through
    `INVENTORIED -> SPIKE -> READY`. The spike must cover upstream + dependency
    dispatch, tests to port, gates, hardware, dependencies, and row-sized work.
-   Implementation must not start from an uncommitted or missing spike.
+   Implementation must not start from a missing spike. The spike must be in the
+   reviewable change before implementation and committed before integration.
 4. **Read upstream first**: before implementing any subsystem, read the
    upstream Python at the paths listed in
    [porting-inventory.md](porting-inventory.md) — port, don't reinvent
    ([discipline.md](discipline.md)).
 5. **Tests -> code**: port the upstream tests listed in the spike and use the
    parity harness before filling implementation anchors.
-6. **Close the loop** (Definition of Done for every change):
+6. **Close the loop** (Definition of Done for every feature/iteration
+   checkpoint). Governance, review and Git-housekeeping work runs its relevant
+   checks without claiming a feature-state change; touching a path classified
+   as a checkpoint by `check-doc-checkpoint.py` still retains that checker's
+   same-change public-document contract:
    - `python3 scripts/check-agent-record.py` and
      `python3 tests/scripts/test_agent_record.py` pass (canonical tables, stable
      IDs, semantic row fields, lifecycle/spec/claim/DONE integrity, pinned
@@ -48,7 +57,9 @@ and continue. Follow this protocol every session.
      (anti-stale-golden gate). Skipping this reddens CI until the runner lands
      (burned us twice: M0.8 MoE, M0.9 qwen36). The runner task removes the
      entry; the milestone close-out asserts the set is empty of its ops. Always
-     verify CI green (`gh run list`) after any commit that touches goldens.
+     verify CI green after any commit that touches goldens when the developer
+     preferences authorize a push and CI access; otherwise return the exact CI
+     handoff.
    - ported files carry upstream path + commit headers;
    - [porting-inventory.md](porting-inventory.md) status markers flipped;
    - [parity-ledger.md](parity-ledger.md) row appended (what it does vs vLLM,
@@ -73,7 +84,10 @@ and continue. Follow this protocol every session.
      roadmap/campaign boundary atomically freeze the raw files in `completed/`,
      seed concise live carry-forward files, and repair all live links;
    - [state.md](state.md) entry appended (what landed, what's next);
-   - commit + push to `main` (user-authorized, for now).
+   - commit the completed in-scope change with the required trailers;
+   - integrate, push, open a PR, or leave the commit local exactly as selected
+     by `developer-preferences.md`. The project protocol itself grants no push,
+     merge, force-update, or remote-host authority.
 
 ## Tabular lifecycle
 
@@ -101,12 +115,15 @@ and false closure commits are rejected.
 
 ## Practicalities
 
-- Long CUDA builds/benchmarks run on `dgx.casa` over SSH; each claim gets its
-  own `~/work/<claim>/` directory. Gate GPU execution on `flock /tmp/gpu` whenever 2+ agents may run GPU work in the window (sole owner verified idle via `nvidia-smi` may skip; benchmarks still need an uncontended GPU)
-  and hold one lock across a whole A/B/profile sequence, following
-  `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. Compilation,
-  read-only `nvidia-smi`, and file transfer do not need the lock. Specs/models:
-  [environment.md](environment.md).
+- Run builds and benchmarks only on hosts selected by
+  `developer-preferences.md`. Coordinated claims use distinct build/evidence
+  directories and the selected `${GPU_LOCK}` policy whenever work may contend.
+  A sole owner may run correctness work lock-free after verifying idleness if
+  the preference file permits it; every benchmark/A-B/profile sequence remains
+  uncontended and holds one exclusion mechanism across all arms. Compilation,
+  read-only device inspection and file transfer do not require a GPU lock.
+  Ettore-host examples and model locations are factual entries in
+  [environment.md](environment.md), not defaults for other developers.
 - Benchmarks are honest: same box, same model files, request-rate sweeps,
   report TTFT/ITL/throughput; no cherry-picking. Numbers go in the ledger.
 - Upstream sync procedure: [upstream-sync.md](upstream-sync.md). When syncing,

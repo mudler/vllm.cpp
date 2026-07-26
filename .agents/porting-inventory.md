@@ -1,6 +1,6 @@
 # vLLM → vllm.cpp Porting Inventory (living parity record)
 
-**Upstream reference:** `/home/mudler/_git/vllm` @ sync point in
+**Upstream reference:** `${VLLM_SOURCE}` @ sync point in
 [upstream-sync.md](upstream-sync.md).
 **Rule:** every item lists its upstream path. We port features/capabilities 1:1 —
 same algorithms, same semantics, same names — so that future upstream PRs can be

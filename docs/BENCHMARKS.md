@@ -1923,10 +1923,13 @@ The local Qwen3.5-4B checkpoint corpus is exactly
 
 ### Local Qwen3.5-4B direct-load checkpoint, 2026-07-25
 
-**GATING / speed-pending.** The repaired current-`main` path includes the
-exact H32 Triton-AOT recurrence, plain-BF16 decode graph capture/replay and
-ratio-4 FA2 split-KV decode. On the corpus above at concurrency 32, 128 output
-tokens/request and three repetitions, direct ON/OFF/vLLM-0.25 means are:
+**GATING / speed-pending; current-main transplant revalidation PENDING.** The
+measurements below bind the original repair commit `8964bde7` based on
+`72f9fb13`, not its current-main transplant `c317237a` based on `c39d78a6`.
+That path includes the exact H32 Triton-AOT recurrence, plain-BF16 decode graph
+capture/replay and ratio-4 FA2 split-KV decode. On the corpus above at
+concurrency 32, 128 output tokens/request and three repetitions, direct
+ON/OFF/vLLM-0.25 means were:
 
 | Axis | Direct ON | Direct OFF | vLLM 0.25 stable confirmation | Disposition |
 |---|---:|---:|---:|---|
@@ -1949,6 +1952,10 @@ finds the residual: 497 sampled-ID D2H synchronizations consume 20.975 s
 immediately; vLLM defers the equivalent wait through events. Root, hashes,
 exact commands and the stable-denominator rationale:
 [Qwen3.5-4B main repair evidence](bench-evidence/qwen35-4b-main-repair-20260725.md).
+Revalidate `c317237a` with the exact `flock /tmp/gpu
+tools/bench/run_qwen35_4b_compare.sh /tmp/qwen35-main-final-fa2-<commit>` recipe
+in that evidence document before publishing these values as binding for the
+development branch.
 This 4B diagnostic does not establish 27B/35B support.
 
 ## Ours-vs-MLX on Apple M4 - Qwen3-1.7B (2026-07-23, M3b) - INDICATIVE / `BLOCKED-ON-SUDO`

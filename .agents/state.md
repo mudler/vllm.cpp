@@ -24181,3 +24181,53 @@ on discrete CUDA and consume output through the existing event path. Do NOT
 delete the synchronize while retaining host row state: that races and can feed
 the wrong request after `InputBatch::condense`. No unsafe shortcut is included
 in this checkpoint.
+
+## 2026-07-26 — direct-to-main policy corrected
+
+The repository instruction now permits a direct push to `main` only when the
+developer is Ettore. All other developers and agents must work on a branch and
+leave merging and pushing to `main` to an authorized maintainer. The local
+Qwen3.5-4B repair commit `8964bde7` was preserved by creating and switching to
+`qwen35-4b-aot-fa2-repair`; no remote ref changed. Live upstream `main` was
+checked at `c39d78a6`: `8964bde7` is neither its ancestor nor patch-equivalent
+(`git cherry` reports `+`), so the repair remains branch-only work.
+
+## 2026-07-26 — Qwen3.5-4B repair moved to current-main development branch
+
+Fetched live upstream `main` at `c39d78a6` over HTTPS and confirmed the repair
+was neither merged nor patch-equivalent. Created
+`qwen35-4b-aot-fa2-repair-c39d78a6` directly from that tip and transplanted the
+repair as `c317237a`, resolving the two append-only record conflicts by retaining
+both upstream history and the repair entries. Transplanted the Ettore-only
+direct-to-main policy in this checkpoint. The pre-sync
+`qwen35-4b-aot-fa2-repair` branch remains intact as a safety copy. Because the
+performance series predates this current-main transplant, its numbers remain
+the original repair evidence and are `PENDING` revalidation on `c317237a`.
+
+Current-main transplant validation is green: the sm_120 CUDA/Triton-AOT build
+completed all 602 reported Ninja steps; cached Qwen3.5-4B direct/graph/eager
+coverage passed 3/3 with 1,672/1,672 assertions; the packed-decode Triton, full
+GDN, concurrent-first-load and paged-attention CTests passed 4/4 under one
+`flock /tmp/gpu`; the Triton AOT drift contract passed; and the seven canonical
+checker mutation suites passed 79/79. This validates the transplant's build and
+correctness, not the still-pending current-base throughput number.
+
+Publishing the development branch is credential-blocked. SSH push to `origin`
+failed with `Permission denied (publickey)`. HTTPS authenticated, but GitHub
+rejected the new ref because the fork is behind upstream and the branch's
+current-main ancestry includes `.github/workflows/ci.yml`; the OAuth token lacks
+`workflow` scope. No remote ref was created. Resume with an SSH key or HTTPS
+token carrying workflow scope:
+`git push -u origin qwen35-4b-aot-fa2-repair-c39d78a6`.
+
+## 2026-07-26 — identity-based execution policy superseded before publication
+
+The preceding Ettore-only direct-to-main rule was too narrow: infrastructure
+access and Git authority are developer/workspace preferences, not identity
+properties that the repository can infer. It is superseded by the ignored
+`.agents/developer-preferences.md`, linked from `AGENTS.md` and seeded from a
+tracked example. Commits remain allowed. Push, merge, ref-rewrite, external-host,
+path, lock, download/service, and parallel-agent choices now come from that
+local profile; safe non-remote defaults apply when it is absent. Project-wide
+correctness, evidence, testing, lifecycle, documentation, and attribution rules
+remain invariant. No remote ref changed.

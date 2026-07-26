@@ -1,5 +1,9 @@
 # Upstream sync protocol
 
+The reference checkout, fetch remote and eligible gate host come from the
+untracked `developer-preferences.md`. The parity pin and classification rules
+are repository-wide; machine paths are not.
+
 **Active cycle (2026-07-12):** current parity pin `e24d1b24`; audited target
 v0.25.0 `702f4814fe54`; report
 [`sync/2026-07-12-702f481.md`](sync/2026-07-12-702f481.md). The exact 145-commit
@@ -11,7 +15,8 @@ validated and active with a preserved v0.24.0 rollback; immutable `9cc7191`
 established the first new 27B denominator, while immutable `3f256ab` supersedes
 it and remains failed/open at **55/124 axes pass, 69 fail**.
 
-- **Reference checkout:** `/home/mudler/_git/vllm`, branch `main`
+- **Reference checkout:** `${VLLM_SOURCE}`, branch selected by the developer
+  preferences (normally `main`)
   (https://github.com/vllm-project/vllm).
 - **STARTING PIN (MVP phase):** `e24d1b24` (2026-07-02) — the vLLM commit we
   port *from*. During the MVP build-out this is **not a parity claim**: we are
@@ -62,9 +67,11 @@ it and remains failed/open at **55/124 axes pass, 69 fail**.
    translate it into the mirrored C++ file(s), bump those file headers to
    TARGET, add/adjust tests, append a [parity-ledger.md](parity-ledger.md)
    row per ported PR (upstream ref goes in the "Upstream equivalent" column).
-6. **Re-verify.** Regenerate golden dumps at TARGET on dgx.casa (parity
-   harness), run op/behavioral/model suites; if benchmarks are baselined, the
-   vLLM baseline must be re-measured at TARGET before comparing.
+6. **Re-verify.** Regenerate golden dumps at TARGET on an eligible host selected
+   by the developer preferences, then run op/behavioral/model suites. If the
+   required release-gate hardware is unavailable, retain the gate as `PENDING`
+   with an exact handoff. If benchmarks are baselined, the vLLM baseline must
+   be re-measured at TARGET before comparing.
 7. **Advance the pin.** Fast-forward the reference checkout to TARGET, update
    the PARITY PIN line above, append a [state.md](state.md) entry linking the
    sync report. A cycle that stalls mid-way keeps the old pin and records

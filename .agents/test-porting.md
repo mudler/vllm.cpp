@@ -1,7 +1,7 @@
 # Test-porting protocol — port vLLM's TESTS with its code (user-directed 2026-07-10)
 
 **Principle: upstream tests are the executable spec.** vLLM's `tests/` tree
-(`/home/mudler/_git/vllm/tests/` @ pin `e24d1b24`) encodes what every feature
+(`${VLLM_SOURCE}/tests/` @ pin `e24d1b24`) encodes what every feature
 is REQUIRED to do — edge cases included — better than any prose. Porting code
 without its tests loses the ground truth and leaves regressions undetectable.
 So test porting is part of the mirror obligation, not an optional extra.
@@ -42,8 +42,10 @@ So test porting is part of the mirror obligation, not an optional extra.
    dependency is checked in SKIPPED with a one-line tracked reason (and shows
    up as debt), never silently dropped or watered down.
 7. **Regression floor**: all ported tests run in CI (CPU tiers) or the
-   `SERVE-E2E-NIGHTLY` DGX suite (GPU/model tiers). If vLLM asserts a behavior, our
-   port is not DONE until an equivalent assertion runs green in our suite —
+   `SERVE-E2E-NIGHTLY` release-target suite (GPU/model tiers). A developer
+   without access to eligible hardware leaves the gate `PENDING` with an exact
+   handoff; local diagnostics do not replace it. If vLLM asserts a behavior,
+   our port is not DONE until an equivalent assertion runs green in our suite —
    the test-side twin of the mirror policy's "match on every axis".
 
 ## Why (recorded reasoning)

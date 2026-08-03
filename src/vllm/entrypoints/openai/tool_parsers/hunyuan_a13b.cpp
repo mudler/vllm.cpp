@@ -200,7 +200,12 @@ std::optional<DeltaMessage> HunyuanA13BToolParser::handle_test_compatibility(
       d.function.name = function_name;
       DeltaMessage msg;
       msg.tool_calls = std::vector<DeltaToolCall>{std::move(d)};
-      hy_current_tools_sent = {true};
+      // assign() rather than `= {true}`: the initializer_list assignment routes
+      // through vector<bool>::_M_insert_range -> _M_copy_aligned, where GCC 15
+      // mis-analyses the bit-packing word copy and reports a false
+      // -Warray-bounds ("forming offset 8 is out of the bounds [0, 8]") against
+      // a correct one-element assignment. Same semantics, no suppression.
+      hy_current_tools_sent.assign(1, true);
       hy_current_tool_id = 0;
       hy_current_tool_index = 0;
       if (hy_sent_tools.empty()) {

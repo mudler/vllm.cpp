@@ -1,5 +1,64 @@
 # Benchmarks
 
+## Qwen3.5-4B re-validated across the 217-commit rebase + GCC 15 build repair (2026-08-03, `CLAIM-CPU-GCC15-WERROR-LOCAL`) - MEASURED, 0.9980x total throughput, output BIT-IDENTICAL
+
+Measured, not assumed. `main` advanced `f3ecbe70d` to `265e3bf98` (217 upstream
+commits) and the GCC 15 `-Werror` build repair landed on top as `4e43aa5e`, so
+the 4B lever was re-run against the pinned oracle on the identical workload.
+
+| Axis | ours | vLLM @ pin | ratio | 2026-07-29 | Disposition |
+|---|---:|---:|---:|---:|---|
+| Total throughput (tok/s) | 6611.397 | 6624.585 | 0.9980x | 0.9972x | FAIL |
+| Output throughput (tok/s) | 731.070 | 732.528 | 0.9980x | 0.9972x | FAIL |
+| Requests/s | 5.710 | 5.723 | 0.9978x | 0.9971x | FAIL |
+| Mean TTFT (ms) | 728.243 | 948.961 | 0.7674x | 0.7701x | PASS |
+| Mean TPOT (ms) | 38.160 | 33.942 | 1.1243x | 1.1247x | FAIL |
+| Peak PSS (GiB) | 2.147 | 7.621 | 0.2816x | | PASS |
+| Peak VRAM (MiB) | 12850.7 | 12832.0 | 1.0015x | | FAIL |
+
+**Nothing moved.** Every axis reproduces the 2026-07-29 series inside
+run-to-run noise, and our generated tokens are BIT-IDENTICAL to it: 128/128 per
+repetition within the run, and 128/128 against that series for every arm. The
+217-commit advance plus the build repair changed no output on this workload.
+Agreement with vLLM stays at 89/128, unchanged, so the residual is the known
+near-tie sampling difference and not new drift.
+
+The published ratio moved 0.0008x, and the honest attribution is the
+DENOMINATOR: ours moved +0.017% (ratio-to-historical 1.00017x) while the oracle
+came in 0.06% slower than its own previous series. Both are inside noise. Read
+this as a null result, not an improvement.
+
+Still an OPEN GAP under the match-or-beat-every-axis rule: throughput 0.2%
+below, TPOT 12.4% above, peak VRAM 18.7 MiB above. TPOT remains owned by
+`ENG-ASYNC-SCHED` and needs the async engine loop, which `vllm-bench` does not
+drive. Peak host memory is the decisive win (2.147 against 7.621 GiB; stable
+PSS 0.760 against 4.442 GiB).
+
+Oracle: `.venv-vllm-pin`, vLLM `0.23.1rc1.dev1511+g555967922` built from source
+at the parity pin, NOT the 0.24.0 release that would understate us. Clean CUDA
+rebuild 899/899. Three interleaved repetitions per arm under one
+`flock /tmp/gpu`, and all 18 legs recorded 0% GPU utilization before starting,
+so the series is uncontended and binding. No 4B result implies support or speed
+for the 27B/35B gates, which stay hardware-unavailable here and `PENDING`.
+
+The build repair itself: the CPU build failed on this host's GCC 15.2.0 under
+`-Wall -Wextra -Werror` in exactly two translation units out of 731, both
+correct code mis-analysed after inlining, enumerated with a keep-going build
+before anything was changed. `hunyuan_a13b.cpp` drew `-Warray-bounds` from the
+`std::vector<bool>` bit-packing word copy behind a one-element assignment and is
+repaired in project code as `assign(1, true)`, with no suppression.
+`chat_template.cpp` drew `-Wfree-nonheap-object` from inside the vendored minja
+parser and demotes that single diagnostic on that single unit, for GNU only.
+Pre-existing rather than rebase damage: the identical failure reproduces at
+`bfd51fb84`. CI never saw it, because `ubuntu-latest` ships an older GCC. CPU
+suite now 329/331; the two failures are host-environment issues this repair
+merely made reachable (`PYTHONHASHSEED=0` exported by the nix dev shell, and a
+hardcoded `/usr/bin/true` absent on NixOS), recorded as open host-portability
+gaps.
+
+Evidence and reproduction:
+[Qwen3.5-4B GCC 15 fix re-validation](bench-evidence/qwen35-4b-gcc15fix-20260803.md).
+
 ## Laguna-S-2.1-NVFP4 decode — router top-k KERNEL-EFFICIENCY (`VT_LAGUNA_TOPK_SHFL`), BYTE-EXACT, SigmoidTopK 1.67×, −0.57% decode-step GPU (2026-08-03, `CLAIM-LAGUNA-TOPK-SHFL`)
 
 With the residual-norm byte-exact floor reached (`CLAIM-LAGUNA-FAST-NORM` below), a fresh `nsys cuda_gpu_kern_sum --cuda-graph-trace=node` 2-length diff (20-vs-70) ranked the remaining small kernels; excluding the at-parity projection GEMVs (`gemvx`, ~69% of decode step — the IDENTICAL cuBLAS kernels vLLM uses) and the Marlin MoE (we win) / attention-compute kernels, the router `SigmoidTopKKernel` was the single largest still-optimizable small kernel (415 µs/step, 1.6%). Same box/model/ids/env as below (`~/laguna-xs-nvfp4`, ids `2,785,9626,377,15360,395`, `VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1 VT_LAGUNA_DECODE_GRAPH=1`), origin/main `e61b4de3`.

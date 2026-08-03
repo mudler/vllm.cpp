@@ -779,6 +779,21 @@ target_include_directories(vllm PRIVATE src)
 # src/vllm/entrypoints/chat_template.cpp.
 target_include_directories(vllm SYSTEM PUBLIC third_party)
 vllm_cpp_set_warnings(vllm)
+# SYSTEM covers the FRONT-END diagnostics from those vendored headers, but not
+# the ones the OPTIMIZER raises after inlining: those are attributed to the TU
+# being compiled, not to the header, so -isystem cannot reach them. GCC 15
+# inlines minja::Parser::parseValueExpression (third_party/minja/minja.hpp),
+# loses track of the allocation base of a std::vector<std::string> it is
+# destroying, and reports -Wfree-nonheap-object against correct vendored code.
+# Demote just that diagnostic, just here: the warning stays visible, -Werror
+# stays in force for every other diagnostic and every other TU, and the
+# vendored source stays unmodified. Ordered after vllm_cpp_set_warnings so the
+# target-level -Werror cannot promote it again (the lesson of the MLX header
+# exception below). cmake/CompilerWarnings.cmake documents the same GCC
+# false-positive class for the sanitizer lanes.
+set_source_files_properties(src/vllm/entrypoints/chat_template.cpp PROPERTIES
+  COMPILE_OPTIONS
+    "$<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-error=free-nonheap-object>")
 # --- Vendored BLAKE3 (LMCache MODE-1 lm:// token hash, KV-EXTERNAL-CACHE W1) --
 # The official BLAKE3 C implementation (third_party/blake3, upstream tag 1.5.5
 # / commit 81f772a; dual CC0-1.0 / Apache-2.0), the same algorithm the `blake3`

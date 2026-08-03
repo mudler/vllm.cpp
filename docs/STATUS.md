@@ -1190,6 +1190,11 @@ pip-installed 0.24.0 release: that release is 1.25% faster than the pin, so
 the old denominator was understating us. TPOT (+12.4%) is the one real gap.
 Re-validated 2026-07-29 after rebasing onto 139 upstream commits: 0.9972x /
 TPOT 1.1247x, every axis inside noise and token-identical to the prior series.
+Re-validated again 2026-08-03 across a further 217 upstream commits plus the
+GCC 15 build repair: 0.9980x / TPOT 1.1243x, still inside noise and still
+bit-identical (128/128 per arm against the 2026-07-29 series). The 0.0008x
+ratio move is the denominator, the oracle came in 0.06% slower while we moved
++0.017%, so read it as a null result rather than an improvement.
 
 One open lead is on record from the same profiling pass: cuBLASLt resolves
 Ampere-class GEMM kernels on this Blackwell device. It is unmeasured and may be
@@ -1209,7 +1214,23 @@ CI runs both as separate jobs. Verified end to end: the ASan+UBSan lane builds
 and passes `test_input_batch`, `test_combine_tokens` and `test_arena` with leak
 detection on. The lanes keep the warnings but drop `-Werror`, because sanitizer
 instrumentation makes GCC's range and initialization analyses fire inside
-libstdc++ on correct code; the plain build is the one that enforces `-Werror`. The lane refuses to configure with the CUDA
+libstdc++ on correct code; the plain build is the one that enforces `-Werror`.
+
+That same analysis class reaches the PLAIN build on a new enough compiler, so
+two cases are now handled at their source rather than by relaxing the policy.
+GCC 15.2.0 (the nix dev shell on the RTX 5070 Ti host) rejected exactly two
+translation units, both correct code mis-analysed after inlining.
+`hunyuan_a13b.cpp` drew `-Warray-bounds` from the bit-packing word copy behind
+a one-element `std::vector<bool>` assignment; that is project code and is now
+written as `assign(1, true)`, which takes a different libstdc++ path and needs
+no suppression at all. `chat_template.cpp` drew `-Wfree-nonheap-object` from
+inside the vendored minja parser, so it demotes that ONE diagnostic to a
+warning, on GNU compilers only. `third_party/` being a SYSTEM include does not
+cover that case: the optimizer raises it after inlining and attributes it to
+the translation unit rather than to the header, so `-isystem` cannot reach it.
+`-Werror` remains in force for every other diagnostic and every other unit. CI
+sees neither, because `ubuntu-latest` ships an older GCC, so the
+newer-toolchain build is a LOCAL gate with no CI coverage. The lane refuses to configure with the CUDA
 backend on, because a host sanitizer runtime does not instrument nvcc device
 translation units and reports false positives against the CUDA driver; the CUDA
 tier's equivalent is `compute-sanitizer`, and `VT_POOL_BYPASS=1` makes the device

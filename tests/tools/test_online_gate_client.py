@@ -1462,7 +1462,8 @@ class OnlineClientContractTests(unittest.TestCase):
                 "-c",
                 definitions
                 + '"${benchmark_clean_env[@]}" "${h1d_plan_env[@]}" '
-                "python3 -c 'import tools.bench.online_gate'",
+                + shlex.quote(sys.executable)
+                + " -c 'import tools.bench.online_gate'",
             ],
             env=polluted,
             check=True,

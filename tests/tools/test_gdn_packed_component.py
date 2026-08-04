@@ -1078,8 +1078,11 @@ def _write_complete_evidence(root: pathlib.Path, *, packed_better: bool = True) 
 class GdnPackedComponentTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        true_binary = shutil.which("true")
+        if true_binary is None:
+            raise unittest.SkipTest("the platform has no 'true' executable")
         cls.cuda_compiler_patch = mock.patch.object(
-            gdn_component, "DGX_CUDA_COMPILER", pathlib.Path("/usr/bin/true")
+            gdn_component, "DGX_CUDA_COMPILER", pathlib.Path(true_binary)
         )
         cls.cuda_compiler_patch.start()
 

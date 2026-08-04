@@ -1210,11 +1210,20 @@ a cooldown rather than before it.
 
 Alongside the default build, `-DVLLM_CPP_SANITIZE=address,undefined` and
 `-DVLLM_CPP_SANITIZE=thread` build the CPU tier under the dynamic detectors, and
-CI runs both as separate jobs. Verified end to end: the ASan+UBSan lane builds
-and passes `test_input_batch`, `test_combine_tokens` and `test_arena` with leak
-detection on. The lanes keep the warnings but drop `-Werror`, because sanitizer
-instrumentation makes GCC's range and initialization analyses fire inside
-libstdc++ on correct code; the plain build is the one that enforces `-Werror`.
+CI runs both as separate jobs. Current binding local result on GCC 15.2.0 is
+**331/331 PASS in both lanes**, with ASan leak detection enabled. PR #28's
+hosted ASan+UBSan failure was a build-filesystem exhaustion, not a sanitizer
+finding: every test had force-linked another complete instrumented static
+engine, leaving 99 MiB before `ld` failed. Sanitizer tests now load one internal
+shared instrumented image, and `-g1` retains file/line attribution without full
+type/local-variable DWARF. The ASan+UBSan tree fell from 93 GiB to 5.6 GiB
+(about 94%); the TSan tree is 1.9 GiB. CI also sets the existing
+`VT_POOL_BYPASS=1` detector mode so deliberate scratch-cache retention is not
+reported as a leak. The full survey found and fixed one real leak, minja macros
+strongly captured the same context that owned their callable. The lanes keep
+the warnings but drop `-Werror`, because sanitizer instrumentation makes GCC's
+range and initialization analyses fire inside libstdc++ on correct code; the
+plain build is the one that enforces `-Werror`.
 
 That same analysis class reaches the PLAIN build on a new enough compiler, so
 two cases are now handled at their source rather than by relaxing the policy.

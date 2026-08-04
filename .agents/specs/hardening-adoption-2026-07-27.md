@@ -56,9 +56,10 @@ separate jobs. Design points, all from the guide:
   project code, and the plain build — the one that DOES enforce `-Werror` — stays
   clean. Letting a false positive in a system header stop the runtime detectors
   would defeat the point.
-- Landed `continue-on-error: true` because the lanes have never run: their FIRST
-  run is a survey, and a pre-existing finding must not block unrelated work. The
-  closing step of this row is triaging that first run and REMOVING the flag.
+- `continue-on-error: true` remains until the repaired PR validates the two
+  lanes on the hosted runner. The first complete local survey is now triaged:
+  both full suites pass, and removing the flag after remote confirmation is the
+  closing step of this row.
 
 **The lane paid for itself before it was even committed.** Its first real build
 failed on `-Werror=unused-function`: `AsyncDeviceMirrorEnvDefault()`, added by the
@@ -71,11 +72,16 @@ compiles the other `cfg` branches.
 
 **Verified end to end**, not merely configured: `address,undefined` and `thread`
 both configure; the two guards fire (a lane value outside the allowlist, and a
-lane with the CUDA backend on, are both `FATAL_ERROR`); the ASan+UBSan lane
-builds `test_input_batch`, `test_combine_tokens` and `test_arena` clean and all
-three PASS under `ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1`
-(25/25 + 183 asserts, 7/7 + 14, 4/4 + 18), which includes the new W4 op-log
-cases. The plain CPU build was re-verified clean and green in the same pass.
+lane with the CUDA backend on, are both `FATAL_ERROR`). On GCC 15.2.0 the full
+ASan+UBSan suite passes 331/331 under
+`ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1`,
+`UBSAN_OPTIONS=print_stacktrace=1`, and `VT_POOL_BYPASS=1`; the full TSan suite
+also passes 331/331 with the bypass. The detector-specific shared test image
+reduces the ASan+UBSan build from 93 GiB to 5.6 GiB, while keeping file/line
+traces with `-g1`; TSan is 1.9 GiB. The survey also removed the minja macro
+context ownership cycle that leak detection exposed. The plain GCC 15 `-Werror`
+build and the affected `test_serve_low_tools`, `test_none_hash_determinism`, and
+`test_chat_template` cases pass 3/3.
 
 ### 2. Allocator-blind-spot bypass (§4)
 
@@ -121,8 +127,8 @@ reproduce here, which is worth recording so a later reader does not re-audit:
 
 ## Follow-up rows
 
-1. Triage the first `sanitize-cpu` run and remove `continue-on-error` (closes
-   this row).
+1. Confirm both repaired `sanitize-cpu` jobs on the hosted PR runner, then
+   remove `continue-on-error` (closes this row).
 2. Validate the three residual `atoi` sites.
 3. A concurrency matrix per §7 (independent concurrent engines, callback
    re-entry, forced worker failure).

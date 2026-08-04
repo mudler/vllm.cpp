@@ -6644,9 +6644,12 @@ configuration - it reinstates the per-op `cudaMalloc`/`cudaFree` device-sync
 storm the pool exists to remove. Rationale and the item-by-item transfer
 decision: [.agents/specs/hardening-adoption-2026-07-27.md](../.agents/specs/hardening-adoption-2026-07-27.md).
 The lanes are verified end to end (both configure, both guards fire, ASan+UBSan
-builds and passes three CPU suites with leak detection on), and their first real
-build already caught a `-Werror=unused-function` break in the W4 commit that
-would also have failed the existing `build-test-cpu` job.
+and TSan each pass the full 331-test CPU suite). ASan+UBSan ran with
+`detect_leaks=1`, `strict_string_checks=1`, and `VT_POOL_BYPASS=1`; TSan ran the
+same suite with the pool bypass. The repaired ASan+UBSan build occupies 5.6 GiB
+instead of the pre-repair 93 GiB, and the TSan build occupies 1.9 GiB. This is a
+build/test-layout result only: no model, kernel, runtime default, GPU path, or
+timing path changed, so performance remains **NOT APPLICABLE**.
 
 ## `M3c-1` CUDA-path neutrality on GB10 (2026-07-27) - NO MEASURABLE REGRESSION
 

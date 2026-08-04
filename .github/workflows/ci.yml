@@ -240,4 +240,8 @@ jobs:
         env:
           UBSAN_OPTIONS: print_stacktrace=1
           ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          # The production DevicePool deliberately retains scratch blocks. Its
+          # detector lane uses exact allocations and real frees so ASan can
+          # distinguish that cache from a leak and can see use-after-free.
+          VT_POOL_BYPASS: "1"
         run: ctest --test-dir build-sanitize --output-on-failure

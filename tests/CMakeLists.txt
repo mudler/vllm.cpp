@@ -17,7 +17,11 @@ set_tests_properties(test_serve_low_tools PROPERTIES
 
 function(vllm_cpp_add_test name)
   add_executable(${name} ${ARGN})
-  target_link_libraries(${name} PRIVATE vllm::vllm vllm_test_main)
+  if(TARGET vllm::sanitize_test_shared)
+    target_link_libraries(${name} PRIVATE vllm::sanitize_test_shared vllm_test_main)
+  else()
+    target_link_libraries(${name} PRIVATE vllm::vllm vllm_test_main)
+  endif()
   vllm_cpp_set_warnings(${name})
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
@@ -207,6 +211,11 @@ vllm_cpp_add_test(test_single_type_kv_cache_manager vllm/v1/test_single_type_kv_
 vllm_cpp_add_test(test_kv_cache_coordinator vllm/v1/test_kv_cache_coordinator.cpp)
 vllm_cpp_add_test(test_kv_cache_manager vllm/v1/test_kv_cache_manager.cpp)
 vllm_cpp_add_test(test_none_hash_determinism vllm/v1/test_none_hash_determinism.cpp)
+# This suite explicitly exercises configured and unconfigured hash seeding in
+# child processes. Insulate its unconfigured control arm from a developer shell
+# that happens to export Python's seed (the Nix dev shell exports 0).
+set_tests_properties(test_none_hash_determinism PROPERTIES
+  ENVIRONMENT_MODIFICATION "PYTHONHASHSEED=unset:")
 vllm_cpp_add_test(test_prefix_cache_stats vllm/v1/test_prefix_cache_stats.cpp)
 vllm_cpp_add_test(test_prometheus_metrics vllm/v1/test_prometheus_metrics.cpp)
 vllm_cpp_add_test(test_kv_offload_cpu vllm/v1/test_kv_offload_cpu.cpp)

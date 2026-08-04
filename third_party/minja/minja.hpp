@@ -1063,7 +1063,15 @@ public:
     void do_render(std::ostringstream &, const std::shared_ptr<Context> & macro_context) const override {
         if (!name) throw std::runtime_error("MacroNode.name is null");
         if (!body) throw std::runtime_error("MacroNode.body is null");
-        auto callable = Value::callable([this, macro_context](const std::shared_ptr<Context> & call_context, ArgumentsValue & args) {
+        // The callable is stored in macro_context itself. Capturing that context
+        // strongly creates a permanent cycle (Context -> Value -> callable ->
+        // Context) after rendering any template with a macro. Callers keep the
+        // context alive through call_context's parent chain, so a weak capture
+        // preserves the lifetime needed during invocation without leaking it.
+        std::weak_ptr<Context> weak_macro_context = macro_context;
+        auto callable = Value::callable([this, weak_macro_context](const std::shared_ptr<Context> & call_context, ArgumentsValue & args) {
+            auto macro_context = weak_macro_context.lock();
+            if (!macro_context) throw std::runtime_error("Macro context has expired");
             auto execution_context = Context::make(Value::object(), macro_context);
 
             if (call_context->contains("caller")) {

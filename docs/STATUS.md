@@ -54,7 +54,7 @@ token-for-token correctness against the pinned oracle.
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete, at/above vLLM speed | Token-exact greedy on GB10; beats vLLM 0.25.0 total throughput at every concurrency (1.007-1.045x), effective parity 115/124 axes |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; 3-rep grid 0.93-1.03x. Async batch-1 greedy token-0 degeneration FIXED (ROW-SERVE-ASYNC-LLM): `VT_ASYNC_DEVICE_MIRROR` now default ON | Token-exact SYNC + ASYNC (gate `test_qwen36_async_serving` RED→GREEN); c4 1.025x, c16 0.932x (2303.9 mirror-neutral); c16 fix still needs drain-removal + double-buffer |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual. **D1 (2026-07-31, `CLAIM-D1-BF16-MERGED-QKV`): the bf16 merged-QKV path (`Qwen3QkvMergeEnabled`/`VT_QWEN3_QKV_MERGE`) is now default-ON** — one `vt::MatmulBT` over the merged `[qdim+2kdim,H]` owner + a contiguous `vt::QkvSplit` (OLMo-2 exemplar), replacing three per-shard GEMMs. Bit-exact GEMM math (A/B unit `test_ops_qkv_merge` byte-identical, RED-first); the wider-N cuBLASLt K-reduction flips the 0.6B genuine bf16 near-tie so the SACRED 0.6B golden was regenerated (all tokens within the near-tie band, max 0.125 nats), while Qwen3-4B is byte-neutral (0 diffs, stays STRICT). Re-gated 0.6B 16/16 + 4B 16/16; consistency/launch-count fold (measured NEUTRAL on 4B decode), no new throughput owed |
-| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Direct ON and OFF are token-identical, and token-identical to the previous series; direct loading cuts peak/stable host PSS by 73.4%/91.1% and mean TTFT by 12.7%. Against an oracle built at the actual parity pin: 0.9970x total throughput, TTFT passes (0.773x), TPOT 12.4% high; re-validated unchanged (0.9972x / 1.1247x) after rebasing onto 139 upstream commits. The failing axis is the discrete-GPU async-overlap gap, scoped as ENG-ASYNC-SCHED W4 |
+| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete, speed-pending | Revalidated after merging current upstream: local throughput is unchanged at 0.99997x its prior run; against the freshly measured pinned oracle it is 0.9971x. TTFT 0.7719x and host PSS 0.3127x pass; TPOT/ITL 1.1244x and VRAM 1.0014x remain open. Direct ON/OFF outputs remain 128/128 identical |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM. **D1 (2026-07-31): inherits the default-ON bf16 merged-QKV via the shared dense `AttnBlock` — byte-neutral (0 token diffs, golden UNCHANGED); re-gated 6/6** |
 | Llama-3.x dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 16/16 (Llama-3.2-1B); llama3 RoPE scaling |
 | Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
@@ -1247,11 +1247,11 @@ protocol is ACCEPTED; W0-W5 LANDED, enforcement opt-in
 kernel, no numbers changed.
 
 Qwen3.5-4B direct-load remains speed-pending against the oracle built at the
-actual parity pin. The 2026-08-03 revalidation across another 217 upstream
-commits plus the GCC 15 repair measured 0.9980x total throughput and 1.1243x
-TPOT, with output bit-identical to the prior series (128/128 per arm). The
-0.0008x ratio movement was denominator noise. The older 0.9819x result used the
-1.25%-faster pip 0.24.0 release and is not the binding comparison.
+actual parity pin. The 2026-08-05 post-upstream revalidation measured 0.9971x
+total throughput and 1.1244x TPOT. Our throughput is 0.99997x the prior run;
+the ratio moved because the current oracle denominator is 1.00089x its prior
+run. Direct ON/OFF outputs remain 128/128 identical, so this is a benchmark
+null result rather than a local regression.
 
 One open lead is on record from the same profiling pass: cuBLASLt resolves
 Ampere-class GEMM kernels on this Blackwell device. It is unmeasured and may be
@@ -1296,36 +1296,28 @@ regression.
 
 ## Performance detail
 
-**Local Qwen3.5-4B plain BF16 direct loader, speed-pending:** revalidated on
-current `main` (`7f620e74`) on an RTX 5070 Ti at 6600.66 total tok/s versus vLLM
-0.24.0 at 6722.24 tok/s (0.9819x) on the identical 128-request workload. Direct
-loading reduces peak PSS from 8.59 to 2.28 GiB, stable PSS from 8.59 to 0.76
-GiB, and mean TTFT from 835.0 to 729.2 ms. Mean TPOT/ITL is 38.22 ms versus
-vLLM's 33.53 ms. Every token matches the previous series exactly (128/128 per
-repetition, both arms), so the 109-commit upstream advance moved no output here.
+**Local Qwen3.5-4B plain BF16 direct loader, speed-pending:** on the current
+`upstream/main` tree at `59674cf1d`, the uncontended three-repetition comparison
+on an RTX 5070 Ti measured 6611.207 total tok/s versus the pinned vLLM oracle at
+6630.481 tok/s (0.9971x). Mean TTFT is 730.403 versus 946.214 ms
+(PASS), peak/stable host PSS is 2.531/0.739 versus 8.093/4.422 GiB (PASS), while
+mean TPOT/ITL is 38.143 versus 33.924 ms and peak VRAM is 12850 versus 12832 MiB
+(OPEN). Local throughput is 0.99997x its previous run, a null result.
 
 The failing TPOT axis has a corrected diagnosis as of the W4 work below: the
 per-step synchronization it was blamed on is the synchronous engine loop
 waiting for its own sampling, about one per step, not a removable defect in
-the async sampler. Closing it means running the async engine loop, which is
-what the (opt-in) device-resident sampled-token mirror now makes legal on a
-discrete GPU; the measurement that would bind it is a serving A/B and is
-pending a harness this host can run.
+the async sampler. The device-resident sampled-token mirror is now default ON;
+this synchronous harness does not claim the remaining serving comparison.
 
-Two things to know about the numbers. First, the earlier 5769.99 tok/s figure is
-VOID, not superseded by an improvement: that whole series ran against a GPU held
-at 11-13% utilization by a graphics consumer the harness's idle check could not
-see, and both arms gained ~14% once measured on a genuinely idle box. The check
-now fails on non-idle utilization. Second, the residual is a specific missing
-mechanism rather than a diffuse gap: this GPU is discrete, so the async-scheduling
-device combine/scatter falls back to a host path that must synchronize the main
-stream for the sampled ids, and the depth-2 scheduler therefore has nothing to
-overlap. Upstream keeps that state GPU-resident unconditionally. Scoped as
-ENG-ASYNC-SCHED W4.
+The earlier 5769.99 tok/s series remains VOID because a graphics consumer held
+the GPU at 11-13% utilization. Both arms gained about 14% once measured on an
+idle box; the harness now rejects that contention. The current 0.9971x result
+passed the same idle gate on all 18 legs.
 
 This local 4B diagnostic does not establish 27B/35B support. Exact evidence and
 reproduction:
-[Qwen3.5-4B post-pull revalidation](bench-evidence/qwen35-4b-postpull-20260727.md).
+[Qwen3.5-4B post-upstream revalidation](bench-evidence/qwen35-4b-upstream-20260805.md).
 
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).

@@ -11814,3 +11814,35 @@ NO regression (rollback `=0` arm median 2290.0). c32 default 2942.7.
 Evidence `dgx:~/work/mirror-ab/{asyncgate2-{RED,GREEN}.log,
 asyncgate-SACRED-default.log,mab-defmeasure.log,mab-asyncmemcheck.log,
 evidence/raw/35/ours/c16-r{1,2,3}-{defaulton,rollback0}.json}`.
+
+## Qwen3.5-4B revalidation after merging current upstream (2026-08-05)
+
+Merged `upstream/main` at `59674cf1d` into the branch as `312af21a9`, rebuilt
+the exact CUDA/Triton-AOT tree, and reran the binding 128-request, 128-output,
+c32 comparison against vLLM at pin `555967922`. Three memory and three
+performance repetitions per direct-ON/vLLM/direct-OFF arm ran interleaved under
+one `flock /tmp/gpu`; every one of the 18 legs observed 0% GPU utilization.
+
+| Axis | ours | vLLM at pin | ratio | Disposition |
+|---|---:|---:|---:|---|
+| Total throughput (tok/s) | 6611.207 | 6630.481 | 0.9971x | FAIL |
+| Output throughput (tok/s) | 731.050 | 733.180 | 0.9971x | FAIL |
+| Requests/s | 5.710 | 5.728 | 0.9969x | FAIL |
+| Mean TTFT (ms) | 730.403 | 946.214 | 0.7719x | PASS |
+| Mean TPOT/ITL (ms) | 38.143 | 33.924 | 1.1244x | FAIL |
+| Peak/stable PSS (GiB) | 2.531 / 0.739 | 8.093 / 4.422 | 0.3127x / 0.1671x | PASS |
+| Peak VRAM (MiB) | 12850 | 12832 | 1.0014x | FAIL |
+
+This is a NULL local result: ours is 0.999971x its 2026-08-03 throughput, while
+the current vLLM denominator is 1.000890x its prior run. Direct ON remains
+128/128 identical to direct OFF and to its historical arm in every repetition.
+The vLLM third repetition followed a near-tie branch (95/128 versus its first
+rep/historical run); ours versus vLLM was 89/89/98, not a local output drift.
+
+Fresh full-workload node-level nsys captures
+(`/tmp/qwen35-upstream-312af21a9-{ours,vllm}.nsys-rep`) contain graph child
+kernels and preserve the known CUTLASS/WMMA/GDN structural families. Their
+percentages are warmup/JIT/capture-contaminated and are not used as binding
+steady-state weights. Raw root `/tmp/qwen35-upstream-312af21a9`; aggregate
+`/tmp/qwen35-upstream-312af21a9/aggregate.json`. Full commands and evidence:
+[Qwen3.5-4B post-upstream revalidation](../docs/bench-evidence/qwen35-4b-upstream-20260805.md).

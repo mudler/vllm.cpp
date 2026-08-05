@@ -9,7 +9,8 @@ benchmark record. Budget: 100 lines.
 
 ## Live claims
 
-Working head: `origin/main`.
+Working head: `bench/qwen35-upstream-rebenchmark-20260805`, one benchmark
+checkpoint on `upstream/main` at `59674cf1d`.
 
 | Claim / track | State | Next command or step |
 |---|---|---|
@@ -18,10 +19,10 @@ Working head: `origin/main`.
 | f32-out GEMV audit | Only laguna + deepseek_v4 bf16 tower affected; gate models & on-framework dense unaffected (bf16-out, e2e-verified) | Re-verify deepseek_v4 bf16 tower same-tool |
 | Invocation-parity prevention | CI guard (`check-gemv-invocation-consistency.py`) + AGENTS.md checklist landing | Review + merge; CUDA build-verify `kGemvHeuristicAlgos` on dgx |
 | MiniMax-H3 lane | Portable path complete; e2e prompt-conditioned video on real weights (Thor). Speed = NVFP4 FP4 device path, sm_121-gated | PR #26 rebase + supports-audit synthesis (workflow ran; integrate) |
-| Protocol substrate repair | BENCHMARKS.md converted to scoreboard (landed); STATUS.md budget + record-era roll still open | Items below |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **W7 device COMPUTE landed, CPU-gated** (`CLAIM-KIMI-LINEAR-W7`, `ACTIVE`): DBuf-resident `ForwardDeviceCompute` (2 host islands: KDA recurrence, NoPE-MLA softmax); `test_kimi_linear_forward` **12/12·614**; opt-in `VT_KIMI_DEVICE_COMPUTE=1` | GPU-verify: CUDA build, token-exact vs oracle, e2e §8 |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` (drain MOVE) c16 NEUTRAL 0.999x — now **DEFAULT ON for CORRECTNESS** (below). Real c16 fix still needs drain-removal + double-buffer | — |
-| Async-serving decode bug **FIXED** (`ROW-SERVE-ASYNC-LLM`) | Async batch-1 greedy = nondet token-0 garbage: unsynced combine device-write vs decode-graph host read (SACRED is SYNC → missed it). FIX: `VT_ASYNC_DEVICE_MIRROR` **default ON** (embed reads combine on-queue, vLLM-parity). Gate `test_qwen36_async_serving` RED(=0)→GREEN(default); SACRED/UAF clean; c16 2303.9 neutral | Push PR #31 |
+| Async-serving bug **FIXED** (`ROW-SERVE-ASYNC-LLM`) | Device-write/graph-host-read race caused batch-1 token-0 garbage. Mirror default ON; async gate RED(=0)→GREEN(default), SACRED/UAF clean, c16 neutral | Push PR #31 |
+| Qwen3.5-4B revalidation | **Speed-pending:** local 0.999971x prior; pinned-oracle ratio 0.9971x. TTFT/PSS pass; TPOT/ITL/VRAM open; 18/18 legs idle | Publish branch checkpoint; evidence in `docs/bench-evidence/` |
 
 In-flight branches (gated default-OFF, not pushed): `laguna-fp4proj-prod`
 (fp4 opt-in), laguna bf16/legacy/pipeline-gemv, `ds4-hc-expand-fuse`.
@@ -40,8 +41,9 @@ MEASUREMENT arbitrates; distrust aggregate bytes/time and CROSS-TOOL comparisons
 
 ## Next actions
 
-1. **★ Async-serving token-exact gate** — the missing gate that let the batch-1
-   greedy degeneration ship; then root-cause it + decide the mirror default.
+1. **Qwen3.5-4B serving follow-up:** the synchronous 0.9971x harness remains
+   speed-pending; bind the default-ON async-serving path against the same oracle
+   before attributing the remaining TPOT gap.
 2. **Merge the invocation-parity prevention** (CI guard + AGENTS.md checklist);
    CUDA build-verify the byte-exact `kGemvHeuristicAlgos` refactor on dgx.
 3. **Same-tool re-verify deepseek_v4's bf16 resident tower** (the one other

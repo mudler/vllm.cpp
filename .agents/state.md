@@ -35978,3 +35978,18 @@ NO regression. Evidence `dgx:~/work/mirror-ab/{asyncgate2-{RED,GREEN}.log,
 asyncgate-SACRED-default.log,mab-defmeasure.log,mab-asyncmemcheck.log,
 evidence/raw/35/ours/c16-r{1,2,3}-{defaulton,rollback0}.json}`. Commit on
 `row/SERVE-ASYNC-LLM`.
+
+## Qwen3.5-4B upstream revalidation is a local null; binding ratio 0.9971x
+<!-- state: 2026-08-06T14:00 -->
+
+Measurement date 2026-08-05. Branch `fix/minja-gcc15-werror-20260803` merged
+the four new `upstream/main` commits through `59674cf1d` as `312af21a9`, then
+rebuilt and completed an uncontended 18-leg Qwen3.5-4B comparison against the
+pinned vLLM oracle. Ours is 6611.207 tok/s, 0.999971x its previous run; vLLM is
+6630.481 tok/s, 1.000890x its previous run. The strict binding ratio is 0.9971x
+and remains speed-pending. TTFT 0.7719x and host PSS 0.3127x pass; TPOT/ITL
+1.1244x and VRAM 1.0014x remain open. Direct ON/OFF output is 128/128 identical
+in all reps and unchanged from history. Fresh node-level nsys traces contain
+graph child kernels on both arms. Evidence:
+`docs/bench-evidence/qwen35-4b-upstream-20260805.md`; raw root
+`/tmp/qwen35-upstream-312af21a9`.

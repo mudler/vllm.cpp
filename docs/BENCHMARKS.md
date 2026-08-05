@@ -38,7 +38,7 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | Qwen3.6-27B | NVFP4 | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality |
 | Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x (c4 wins), c16 0.93x. Both c16 levers A/B'd NEG: drain event -1.9%, mirror 0.999x. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
-| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | 2/7 | 0.998x throughput; TTFT/PSS win. TPOT 1.124x and VRAM open ([evidence](bench-evidence/qwen35-4b-gcc15fix-20260803.md)) |
+| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | 3/9 | 0.9971x throughput after the upstream update; TTFT and host PSS win. TPOT/ITL 1.1244x and VRAM remain open ([evidence](bench-evidence/qwen35-4b-upstream-20260805.md)) |
 
 ### Qwen3.6-27B by concurrency
 

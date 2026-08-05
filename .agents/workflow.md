@@ -5,7 +5,19 @@ and continue. Follow this protocol every session.
 
 ## Session protocol
 
-1. **Orient**: read `AGENTS.md` (index), the untracked
+0. **Declare your role** before anything else, if this session has not already:
+   `scripts/agent-role.py show` (exit 3 = undeclared), then
+   `claim operator` or `claim helper --row <ROW-ID>`. Helpers then create their
+   worktree, `row/<ROW-ID>` branch and DRAFT PR immediately — the draft PR is
+   the claim. `scripts/ready-for-helper.py` lists what a helper may pick. Full
+   protocol: [specs/operator-helper-protocol.md](specs/operator-helper-protocol.md).
+1. **Orient**: read [NOW.md](NOW.md) FIRST — it is the one-Read resume surface
+   (live claims, current gate, next actions) and is rewritten in place every
+   checkpoint. The state tail is trustworthy only below the
+   `<!-- state-order:enforced-below -->` marker, where every entry carries a
+   sortable anchor and `scripts/check-state-order.py` proves the order; above it
+   the record is frozen history that a union merge already interleaved. Then
+   read `AGENTS.md` (index), the untracked
    `developer-preferences.md` when present, the top-level
    [roadmap_v1.md](roadmap_v1.md) row, its owning area matrix row,
    [coordination.md](coordination.md), and only the current carry-forward plus
@@ -30,7 +42,9 @@ and continue. Follow this protocol every session.
 5. **Tests -> code**: port the upstream tests listed in the spike and use the
    parity harness before filling implementation anchors.
 6. **Close the loop** (Definition of Done for every feature/iteration
-   checkpoint). Governance, review and Git-housekeeping work runs its relevant
+   checkpoint). `scripts/agent-preflight.sh --staged` runs every record gate and
+   its mutation suite in one command and prints [NOW.md](NOW.md); run it at
+   session start and again before committing. Governance, review and Git-housekeeping work runs its relevant
    checks without claiming a feature-state change; touching a path classified
    as a checkpoint by `check-doc-checkpoint.py` still retains that checker's
    same-change public-document contract:
@@ -40,8 +54,8 @@ and continue. Follow this protocol every session.
      inventory size, and mutation proof that malformed rows fail);
    - `python3 scripts/check-doc-checkpoint.py --staged` and
      `python3 tests/scripts/test_doc_checkpoint.py` pass: every feature or
-     iteration checkpoint updates both `README.md` and `docs/BENCHMARKS.md` in
-     the same change, even when the honest result is pending, failed, or void;
+     iteration checkpoint updates the obligated public surfaces below in the
+     same change, even when the honest result is pending, failed, or void;
    - tests green (op-parity / behavioral / e2e as applicable);
    - every feature/milestone that can plausibly affect speed, latency,
      scheduling, memory traffic, loading, or peak memory completes its own
@@ -67,10 +81,20 @@ and continue. Follow this protocol every session.
    - owning area-matrix row has exact implementation + test/evidence anchors;
    - [roadmap_v1.md](roadmap_v1.md) portfolio row and
      [coordination.md](coordination.md) claim updated;
-   - **`README.md` current-stage status and support tables** (architectures /
-     acceleration / quantization) updated at every feature/iteration
-     checkpoint — not only at feature closure; a family/backend becomes ✅ only
-     when parity-tested per [discipline.md](discipline.md);
+   - **`docs/STATUS.md` per-capability status** updated at every
+     feature/iteration checkpoint — not only at feature closure: the ONE binding
+     current-state line for the capability this change moves, with its exact
+     lifecycle stage, active gaps, and next gate. **NOT `README.md`** — the
+     README is a user-facing landing page and changes only when a user-visible
+     HEADLINE shifts (new architecture family, new backend or quantization
+     format, changed headline numbers, changed pre-release caveat). A
+     family/backend becomes ✅ only when parity-tested per
+     [discipline.md](discipline.md);
+   - **`docs/FEATURES.md` row** updated in the same change whenever a
+     feature/model/backend/quantization surface moves;
+   - **[NOW.md](NOW.md) refreshed** in the same change as the `state.md` append
+     below (live claims, current gate, next actions, stamp) —
+     `scripts/check-now-current.py` gates both its budget and its freshness;
    - **`docs/BENCHMARKS.md` benchmark disposition** updated at that same
      checkpoint with accepted comparable numbers or an explicit
      `PENDING`/`NOT APPLICABLE`/`FAILED`/`VOID` result and next reproduction
@@ -83,11 +107,33 @@ and continue. Follow this protocol every session.
      `completed/` document. Never rewrite entries inside an open era; at a
      roadmap/campaign boundary atomically freeze the raw files in `completed/`,
      seed concise live carry-forward files, and repair all live links;
-   - [state.md](state.md) entry appended (what landed, what's next);
+   - [state.md](state.md) entry appended (what landed, what's next), below the
+     `<!-- state-order:enforced-below -->` marker and carrying a
+     `<!-- state: YYYY-MM-DD -->` anchor on the line after its heading, so the
+     tail stays genuinely newest-last. After a union merge of two worktrees'
+     appends, repair the order with
+     `python3 scripts/sort-state-tail.py --apply`;
    - commit the completed in-scope change with the required trailers;
    - integrate, push, open a PR, or leave the commit local exactly as selected
      by `developer-preferences.md`. The project protocol itself grants no push,
      merge, force-update, or remote-host authority.
+
+## Obligated public surfaces
+
+These are the surfaces `scripts/check-doc-checkpoint.py` enforces, declared here
+so the manual can never drift from the gate. `scripts/check-protocol-consistency.py`
+asserts this block equals the checker's constants and matches AGENTS.md verbatim;
+changing one without the other is a red build. `README.md` is deliberately absent
+— pointing the per-checkpoint obligation at the README is what drifted it from a
+landing page into a status log.
+
+<!-- doc-obligation-contract:begin -->
+| Public surface | Owed by |
+|---|---|
+| `docs/STATUS.md` | every feature/iteration checkpoint |
+| `docs/BENCHMARKS.md` | every feature/iteration checkpoint |
+| `docs/FEATURES.md` | any change to a feature/model/backend/quantization surface |
+<!-- doc-obligation-contract:end -->
 
 ## Tabular lifecycle
 

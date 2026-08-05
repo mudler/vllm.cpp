@@ -23,6 +23,13 @@ struct GgufMapping {
   int fd = -1;
   void* addr = nullptr;
   size_t size = 0;
+  // Extra shard mappings kept alive by THIS (primary) mapping, for a multi-file
+  // split GGUF (llama.cpp `gguf-split`, "...-00001-of-00003.gguf"). A merged
+  // GgufFile exposes ONE mapping (this one) via Mapping(); a borrowed span in
+  // any shard therefore pins every shard, exactly as a single-file borrow pins
+  // the whole file. Empty for a normal single-file open. Destroyed after this
+  // mapping's own munmap (member-destruction order), releasing each shard.
+  std::vector<std::shared_ptr<const GgufMapping>> siblings;
 
   GgufMapping() = default;
   GgufMapping(const GgufMapping&) = delete;
@@ -102,6 +109,12 @@ const GgmlTypeTraits& GgmlTraits(uint32_t type);
 // out-of-bounds span.
 class GgufFile {
  public:
+  // Opens a .gguf file. If `path` names one shard of a llama.cpp split GGUF
+  // ("...-00001-of-00003.gguf"), ALL shards are opened and their tensor tables
+  // merged into one logical file (KV metadata comes from shard 00001, which
+  // carries the full header); the returned file's Tensors()/Get() see every
+  // tensor and Mapping() keeps every shard alive. A non-split path is opened
+  // as-is. Set VT_GGUF_NO_SPLIT=1 to force single-file behavior.
   static GgufFile Open(const std::string& path);
 
   GgufFile(GgufFile&& other) noexcept;
@@ -153,6 +166,9 @@ class GgufFile {
  private:
   GgufFile() = default;
   void Release() noexcept;
+  // Parse exactly ONE physical .gguf file (no split awareness). Open() uses it
+  // for every shard.
+  static GgufFile OpenOne(const std::string& path);
 
   std::string path_;
   std::shared_ptr<const GgufMapping> map_;

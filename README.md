@@ -13,13 +13,25 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache_2.0-blue"></a>
-  <a href="docs/BENCHMARKS.md"><img alt="vs vLLM" src="https://img.shields.io/badge/Qwen3.6--27B_vs_vLLM-token--exact_%2B_faster_at_every_concurrency-3ec8e0"></a>
+  <a href="docs/BENCHMARKS.md"><img alt="vs vLLM" src="https://img.shields.io/badge/Qwen3.6--27B_vs_vLLM-token--exact_%2B_same_throughput-3ec8e0"></a>
   <a href="docs/STATUS.md"><img alt="Architectures" src="https://img.shields.io/badge/architectures-25%2B_gated-7ee787"></a>
-  <a href="#performance-faster-than-vllm"><img alt="Binary size" src="https://img.shields.io/badge/one_binary-66_MiB,_no_Python-6e7681"></a>
+  <a href="#performance"><img alt="Binary size" src="https://img.shields.io/badge/one_binary-66_MiB,_no_Python-6e7681"></a>
   <a href="https://github.com/mudler/LocalAI"><img alt="LocalAI" src="https://img.shields.io/badge/LocalAI-Run_Locally-orange"></a>
 </p>
 
 **Brought to you by the [LocalAI](https://github.com/mudler/LocalAI) team**, the folks behind LocalAI, the open-source AI engine that runs any model (LLMs, vision, voice, image, video) on any hardware, no GPU required.
+
+> **Independent and unofficial.** vllm.cpp is a community port. It is not affiliated with, endorsed
+> by, or sponsored by the vLLM project, the PyTorch Foundation, or the Linux Foundation. "vLLM" is
+> used here only to name the upstream project this port mirrors and is measured against. See
+> [Trademarks](#trademarks).
+
+> ⚠️ **Under heavy development.** This project moves fast right now: internals, CLI flags, and
+> server behavior can change between commits, so expect breakage if you track `main`.
+> The one thing we keep disciplined is the **C ABI** in [`include/vllm.h`](include/vllm.h):
+> it is versioned (`VLLM_ABI_VERSION`, checkable at runtime with `vllm_abi_version()`), grows by
+> appending fields whose zero value keeps existing behavior byte-identical, and only bumps on an
+> incompatible change. If you embed us, embed through that header.
 
 vllm.cpp is a from-scratch C++20 inference engine chasing three things at once: be the
 **smallest** thing you can deploy, be the **fastest** on the hardware you already own, and still
@@ -37,21 +49,22 @@ What keeps that honest is the oracle. Every architecture is gated **token-for-to
 itself** on the same workload, so "grounded in vLLM" is a test result rather than a design claim, and
 speed is only ever quoted against a reference measured in its own production config.
 
-![vllm.cpp vs vLLM on Qwen3.6-27B: ahead at every concurrency](benchmarks/media/concurrency_race.gif)
+![vllm.cpp vs vLLM on Qwen3.6-27B: identical output at every concurrency](benchmarks/media/concurrency_race.gif)
 
-> The same model, the same prompts, side by side: **token-for-token identical output, and vllm.cpp
-> finishes first** ([full clip](benchmarks/media/concurrency_race.mp4)).
+> The same model, the same prompts, side by side: **token-for-token identical output**, finishing a
+> hair ahead. That margin is inside our noise band at five of the six concurrencies
+> ([full clip](benchmarks/media/concurrency_race.mp4)).
 
 Where that stands today:
 
 - **Small.** **66 MiB** of binary against a **9.1 GiB** vLLM install, both measured on the same GB10:
   about **140x less to deploy**, serving the same model in **24.88 GiB of peak host memory against
   vLLM's 28.18**. No interpreter in the process, and 0 bytes of bundled CUDA userspace.
-- **Fast.** On Qwen3.6-27B we beat vLLM at **all six concurrencies we measured**, against its graphed
-  production config: **4.5% at c1**, and 0.7% to 1.7% across the rest, which is close enough to our
-  noise band to call a tie. Also **1.18x llama.cpp's prefill** on the same GGUF file, and **ahead of
-  MLX-LM on prefill** on Apple Silicon. Most other architectures are correct but speed-pending, and
-  each one says so.
+- **Fast.** On Qwen3.6-27B we **match vLLM's throughput** against its graphed production config.
+  We are ahead at all six concurrencies we measured, but only **c1 (4.5%)** is outside our noise
+  band; the other five, 0.7% to 1.7%, are ties. Also **1.18x llama.cpp's prefill** on the same
+  GGUF file, and **ahead of MLX-LM on prefill** on Apple Silicon. Most other architectures are
+  correct but speed-pending, and each one says so.
 - **Everything.** 25+ architectures, tool calling (36 parser families), structured output including
   GBNF, three speculative decoders, image and video and audio input, external KV offload, Prometheus
   metrics, and the SGLang knobs, all in a library you can `dlopen`.
@@ -59,7 +72,7 @@ Where that stands today:
   where vLLM's own greedy decode is non-deterministic at bf16 near-ties, the gate says so instead of
   quietly loosening.
 
-## Performance: faster than vLLM
+## Performance
 
 Qwen3.6-27B (NVFP4) on NVIDIA GB10, greedy, closed loop, against the vLLM oracle in its
 **production graphed config** (not `--enforce-eager`). Output is token-for-token identical at every
@@ -73,8 +86,8 @@ point on this curve:
 
 We are ahead at all six, but the margins in the middle are thin. Our run-to-run noise band is 0.5%,
 and c2 through c32 land between 0.7% and 1.7%, so treat those as ties. Only c1, at 4.5%, is clearly
-outside the noise. A tie is still a good result for a 66 MiB binary against a mature CUDA stack, and
-the tokens come out identical either way.
+outside the noise. The tokens come out identical either way, and the install is 66 MiB against
+9.1 GiB.
 
 Peak host memory is a clean win at **24.88 GiB against vLLM's 28.18 GiB**, with no Python stack behind
 it:
@@ -195,8 +208,9 @@ you get on top, most of it borrowed from whichever engine does it best:
 - **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 9 reasoning
   parsers, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`. Chat templates
   render through the vendored google/minja engine, the same renderer llama.cpp ships.
-- **Multimodal.** Image, video, and audio to text, correctness-complete on a single-sequence path
-  (not yet wired into the OpenAI server).
+- **Multimodal.** Image, video, and audio to text, correctness-complete. Image chat requests are
+  wired through the OpenAI server (content parts on `/v1/chat/completions`) into the engine's
+  registered forward; video and audio still run on the single-sequence path.
 - **Quantization.** NVFP4 W4A4/W4A16, compressed-tensors NVFP4A16, GGUF
   F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K, and an FP8 W8A8 slice.
 - **External KV.** KV offload to CPU/disk and an `lm://` LMCache client, plus KV-cache events for
@@ -234,7 +248,7 @@ Qwen3-VL and Qwen3.6-27B vision (image + video) and Voxtral (audio).
 | Mistral dense | Mistral-7B-v0.3 | - | Token-exact | Speed-pending |
 | OPT | OPT-125m | - | Strict token-exact | Speed-pending |
 | DeepSeek-V2 (MLA) | DeepSeek-V2-Lite | - | Token-exact | Speed-pending |
-| DeepSeek-V4-Flash (MLA + MHC + DSA) | DeepSeek-V4-Flash-GGUF (80.7 GB, single GB10) | keep-quant | Coherent (near-tie-robust) | Device-resident decode ~7.96 tok/s (~48% of ds4) |
+| DeepSeek-V4-Flash (MLA + MHC + DSA) | DeepSeek-V4-Flash-GGUF (80.7 GB, single GB10) | keep-quant | Coherent (near-tie-robust) | Device-resident decode ~15.87 tok/s (~96% of ds4) |
 | GLM-4 dense | GLM-4-9B-0414 | - | Token-exact | Speed-pending |
 | GLM-4.7-Flash (MLA MoE) | GLM-4.7-Flash | - | Token-exact (near-tie-robust) | Speed-pending |
 | Gemma-3 / Gemma-2 / Gemma-1 dense | gemma-3-1b-it, gemma-2-2b-it, gemma-2b | - | Token-exact (48/48 each) | Speed-pending |
@@ -378,6 +392,7 @@ the number stays in the README and the label says *speed-pending*.
 | [docs/USAGE.md](docs/USAGE.md) | CLI, OpenAI server (endpoints + flags), C ABI, C++ API |
 | [docs/BUILD.md](docs/BUILD.md) | Build recipes per backend, every CMake option, hardware and quantization state |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | The measured evidence: per-axis grids, memory, reproduction recipes |
+| [docs/FEATURES.md](docs/FEATURES.md) | Feature-by-feature comparison against vLLM, SGLang and llama.cpp |
 | [docs/STATUS.md](docs/STATUS.md) | Per-capability lifecycle ledger, active gaps, next gate |
 | [docs/SGLANG-COMPAT.md](docs/SGLANG-COMPAT.md) | The SGLang-inspired knobs, and when to turn them on |
 | [docs/SPECULATIVE-DECODING.md](docs/SPECULATIVE-DECODING.md) | MTP, DFlash, ngram |
@@ -436,6 +451,21 @@ weights are governed by their own licenses, so check each model card.
 ## Author
 
 Ettore Di Giacinto ([@mudler](https://github.com/mudler)).
+
+## Trademarks
+
+vllm.cpp is an independent community project. It is **not affiliated with, endorsed by, or sponsored
+by** the vLLM project, the [PyTorch Foundation](https://pytorch.org/projects/vllm/), or the Linux
+Foundation.
+
+"vLLM" is a mark of its respective owners. It is used throughout this repository in its descriptive
+sense only: to identify the upstream project that vllm.cpp ports, mirrors, and is gated against.
+Nothing here should be read as a claim of ownership of that mark, or as a suggestion that the vLLM
+project has reviewed, approved, or endorsed this software. The Apache License, Version 2.0 under
+which vLLM is distributed grants no trademark rights (section 6), and none are claimed.
+
+Other names and marks (llama.cpp, SGLang, MLX, CUTLASS, and the rest) belong to their respective
+owners and are likewise used descriptively.
 
 ## License
 

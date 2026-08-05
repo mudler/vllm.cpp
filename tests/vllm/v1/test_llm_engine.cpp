@@ -41,6 +41,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/config/scheduler.h"
+#include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/sampling_params.h"
@@ -999,4 +1000,52 @@ TEST_CASE("llm_engine: per-request queue/prefill/inference timing populates") {
   CHECK(inference_sum <= e2e_sum);
   CHECK(prefill_sum <= inference_sum);
   CHECK(queue_sum > 0.0);
+}
+
+// ─── ENG-ASYNC-SCHED depth-2 serving-path e2e (heap-corruption regression) ────
+// Full production-server stack (LoadedEngine -> AsyncLLM -> InprocClient ->
+// EngineCoreProc::run_busy_loop -> step_with_batch_queue, mcb=2) over the MoE
+// arch, driven with ignore_eos PAST the natural EOS — the exact serving shape
+// that aborted the 35B (`malloc(): unaligned tcache chunk`) with a heap
+// corruption in prepare_inputs. The synthetic model here settles into token 17,
+// which we make the eos: ignore_eos=false stops at ~7 tokens, ignore_eos=true
+// keeps generating past it. On the CPU eager backend there is no real GPU
+// overlap so this cannot reproduce the crash by itself (the true guard is
+// test_runner's async-drain invariant); it locks the full async serving loop
+// against LOGIC regressions on this path and documents the trigger. See the
+// runner's async_forward_in_flight_ lifetime guard for the actual fix.
+TEST_CASE("llm_engine: async depth-2 serving generates past ignore_eos (no corruption)") {
+  HfConfig c = MakeConfig();
+  c.raw["eos_token_id"] = 17;  // the model settles into token 17 (step ~7+)
+  vllm::entrypoints::EngineParams params;
+
+  // ignore_eos=false: the request stops at the natural EOS well before the cap
+  // (the fix does not change output — decode is byte-identical, just correctly
+  // sequenced against the overlapped GPU work).
+  {
+    vllm::entrypoints::LoadedEngine eng(c, MakeWeights(c), Fixture(), params);
+    CHECK(eng.async_scheduling_enabled());       // depth-2 step_with_batch_queue
+    CHECK(eng.max_concurrent_batches() == 2);
+    SamplingParams sp = Greedy(24);
+    sp.ignore_eos = false;
+    RequestOutput r = eng.async_engine().generate(std::string("hello"), sp, "s");
+    REQUIRE(r.finished);
+    REQUIRE(r.outputs.size() == 1);
+    CHECK(static_cast<int>(r.outputs[0].token_ids.size()) < 24);  // stopped at eos
+  }
+
+  // ignore_eos=true PAST the ~4-8-token trigger: the exact serving shape that
+  // aborted the 35B. The full AsyncLLM -> step_with_batch_queue depth-2 loop must
+  // run to the cap and return a clean terminal output (CPU cannot reproduce the
+  // GPU-overlap crash; this guards the loop's LOGIC — the runner drain invariant
+  // is gated in test_runner).
+  {
+    vllm::entrypoints::LoadedEngine eng(c, MakeWeights(c), Fixture(), params);
+    SamplingParams sp = Greedy(16);
+    sp.ignore_eos = true;
+    RequestOutput r = eng.async_engine().generate(std::string("hello"), sp, "req");
+    REQUIRE(r.finished);
+    REQUIRE(r.outputs.size() == 1);
+    CHECK(static_cast<int>(r.outputs[0].token_ids.size()) == 16);  // ran to cap
+  }
 }

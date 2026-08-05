@@ -589,7 +589,10 @@ def main() -> int:
             )
             print(
                 f"  - {name} ({r.reg_file}: {r.f32_resid_decls} f32 residual-stream "
-                f"decl(s){casts}, no bf16-resident stream)",
+                f"decl(s){casts}, no bf16-resident stream) -> its M=1 decode projections "
+                "buy the slow cuBLAS gemvx<bf16,FLOAT> template (f32 output) where vLLM "
+                "runs gemvx<bf16,bf16>; the op-contract side is policed by "
+                "scripts/check-gemv-invocation-consistency.py",
                 file=sys.stderr,
             )
         print(

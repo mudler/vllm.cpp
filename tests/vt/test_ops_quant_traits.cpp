@@ -135,31 +135,37 @@ TEST_CASE("vt block geometry agrees with the GGUF reader's GgmlTraits") {
   }
 }
 
-// Q2_K (id 10) and IQ2_XXS (id 16) are the DeepSeek-V4-Flash ~2-bit GGUF
-// vehicles. They register geometry + a `to_float` decode but NO vec_dot kernel,
-// so `HasQuantDotKernel` is false and the loader routes them to expand-to-bf16
-// (dequant-only), never keep-quant GEMM. This is a DISTINCT contract from the
-// executable weight types in kBlockCases, so it gets its own case.
-TEST_CASE("Q2_K/IQ2_XXS/IQ3_XXS keep-quant block dtypes (geometry + vec_dot)") {
-  // DeepSeek-V4 W8 (CLAIM-DEEPSEEK-V4-W8): these ~2-3-bit codebook encodings —
-  // the single-Spark UD-IQ2_XXS (IQ2_XXS gate/up + IQ3_XXS down) / UD-Q2_K_XL
-  // routed experts — gained a keep-quant `vec_dot` against Q8_K, so they are now
-  // HasQuantDotKernel-TRUE (the memory enabler) rather than dequant-only.
+// The ~2-3-bit / fp4 codebook encodings the DeepSeek-V4-Flash GGUF checkpoints
+// use for routed experts. They register geometry + a `to_float` decode AND a
+// keep-quant `vec_dot`, so `HasQuantDotKernel` is TRUE and the loader keeps the
+// blocks COMPRESSED (never expand-to-bf16). This is a DISTINCT contract from the
+// executable weight types in kBlockCases, so it gets its own case. Note MXFP4
+// dots against Q8_0 (32-element blocks), the rest against Q8_K.
+TEST_CASE("IQ/MXFP4 keep-quant block dtypes (geometry + vec_dot)") {
+  // DeepSeek-V4 W8 (CLAIM-DEEPSEEK-V4-W8): these codebook encodings — the
+  // single-Spark UD-IQ2_XXS (IQ2_XXS gate/up + IQ3_XXS down) / UD-Q2_K_XL and
+  // the UD-IQ2_M (IQ2_S gate/up + MXFP4 down) routed experts — carry a keep-quant
+  // `vec_dot`, so they are HasQuantDotKernel-TRUE (the memory enabler).
   struct KeepQuantCase {
     vt::DType dtype;
     uint32_t ggml_type;
     int64_t block_elems;
     int64_t block_bytes;
+    vt::DType vec_dot_type;
     const char* name;
   };
   // Sizes written out from ggml-common.h @ 237ad9b96:
-  //   q2_K    :288-299  16 sc + 64 qs + f16 d + f16 dmin = 16+64+2+2 = 84
-  //   iq2_xxs :371-374  f16 d + 32 u16 qs                = 2 + 64    = 66
-  //   iq3_xxs :385-400  f16 d + 96 u8 qs                 = 2 + 96    = 98
+  //   q2_K    :288-299  16 sc + 64 qs + f16 d + f16 dmin        = 16+64+2+2 = 84
+  //   iq2_xxs :371-374  f16 d + 32 u16 qs                       = 2 + 64    = 66
+  //   iq3_xxs :385-400  f16 d + 96 u8 qs                        = 2 + 96    = 98
+  //   iq2_s   :386-392  f16 d + 64 qs + 8 qh + 8 scales         = 2+64+8+8  = 82
+  //   mxfp4   :204-209  u8 e + 16 qs                            = 1 + 16    = 17
   const KeepQuantCase cases[] = {
-      {vt::DType::kQ2_K, 10, 256, 84, "q2_K"},
-      {vt::DType::kIQ2_XXS, 16, 256, 66, "iq2_xxs"},
-      {vt::DType::kIQ3_XXS, 18, 256, 98, "iq3_xxs"},
+      {vt::DType::kQ2_K, 10, 256, 84, vt::DType::kQ8_K, "q2_K"},
+      {vt::DType::kIQ2_XXS, 16, 256, 66, vt::DType::kQ8_K, "iq2_xxs"},
+      {vt::DType::kIQ3_XXS, 18, 256, 98, vt::DType::kQ8_K, "iq3_xxs"},
+      {vt::DType::kIQ2_S, 22, 256, 82, vt::DType::kQ8_K, "iq2_s"},
+      {vt::DType::kMXFP4, 39, 32, 17, vt::DType::kQ8_0, "mxfp4"},
   };
   for (const KeepQuantCase& c : cases) {
     CAPTURE(c.name);
@@ -182,12 +188,14 @@ TEST_CASE("Q2_K/IQ2_XXS/IQ3_XXS keep-quant block dtypes (geometry + vec_dot)") {
     CHECK(back == c.dtype);
 
     // Decodes (to_float present) AND keep-quant capable: a vec_dot row against
-    // Q8_K exists, so the loader keeps the blocks compressed (W8).
+    // its activation encoding exists, so the loader keeps the blocks compressed.
     CHECK(vt::cpu::BlockToFloat(c.dtype) != nullptr);
     CHECK(vt::cpu::HasQuantDotKernel(c.dtype));
     const vt::cpu::QuantTypeTraits& t = vt::cpu::QuantTraits(c.dtype);
     CHECK(t.vec_dot != nullptr);
-    CHECK(t.vec_dot_type == vt::DType::kQ8_K);
+    CHECK(t.vec_dot_type == c.vec_dot_type);
+    // The activation encoding it dots against must itself be encodable.
+    CHECK(vt::cpu::BlockFromFloat(c.vec_dot_type) != nullptr);
     // No `from_float`: nothing quantizes an activation INTO these weight types.
     CHECK(vt::cpu::BlockFromFloat(c.dtype) == nullptr);
   }

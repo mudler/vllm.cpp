@@ -97,12 +97,16 @@ struct WeightCase {
 const WeightCase kCases[] = {
     {DType::kIQ2_XXS, 256, 66, 0, -1, "iq2_xxs"},   // DeepSeek-V4 gate/up
     {DType::kIQ3_XXS, 256, 98, 0, -1, "iq3_xxs"},   // DeepSeek-V4 down
+    {DType::kIQ2_S, 256, 82, 0, -1, "iq2_s"},       // DeepSeek-V4 UD-IQ2_M gate/up
     {DType::kQ2_K, 256, 84, 80, 82, "q2_K"},        // DeepSeek-V4 UD-Q2_K_XL
     {DType::kQ3_K, 256, 110, 108, -1, "q3_K"},
     {DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
     {DType::kQ5_K, 256, 176, 0, 2, "q5_K"},
     {DType::kQ6_K, 256, 210, 208, -1, "q6_K"},
     {DType::kQ8_0, 32, 34, 0, -1, "q8_0"},          // DeepSeek-V4 AProj/SExp/Out (Q8_0-act path)
+    // NOTE (box-deferred): MXFP4 (39, UD-IQ2_M ffn_down) is NOT here — it dots a
+    // 32-elem Q8_0 activation and has no native CUDA GEMM yet (CPU-fallback). The
+    // CPU dot IS gated in tests/vt/test_ops_quant_dot.cpp.
 };
 
 void GenerateData(float offset, size_t n, float* dst) {

@@ -83,6 +83,19 @@ const QuantTypeTraits* FindQuantTraits(DType dtype) {
       static const QuantTypeTraits t = MakeTraits(DType::kIQ3_XXS, DType::kQ8_K);
       return &t;
     }
+    // ggml-cpu.c:352-357 — IQ2_S -> Q8_K activations. The UD-IQ2_M ffn_gate/up
+    // routed-expert slabs; keep-quant against Q8_K (no from_float into it).
+    case DType::kIQ2_S: {
+      static const QuantTypeTraits t = MakeTraits(DType::kIQ2_S, DType::kQ8_K);
+      return &t;
+    }
+    // ggml-cpu.c:277-282 — MXFP4 -> Q8_0 activations (NOT Q8_K: MXFP4's 32-elem
+    // blocks pair with the legacy 32-elem Q8_0 encoding). The UD-IQ2_M ffn_down
+    // routed-expert slabs; keep-quant, no from_float into it.
+    case DType::kMXFP4: {
+      static const QuantTypeTraits t = MakeTraits(DType::kMXFP4, DType::kQ8_0);
+      return &t;
+    }
     default:
       return nullptr;
   }

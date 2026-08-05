@@ -111,11 +111,17 @@ std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
     case 12:   // Q4_K
     case 13:   // Q5_K
     case 14:   // Q6_K
+    case 22:   // IQ2_S  (~2.5-bit codebook; UD-IQ2_M ffn_gate/up experts)
+    case 39:   // MXFP4  (OCP micro-scaling fp4; UD-IQ2_M ffn_down experts)
     case 16: {  // IQ2_XXS (~2-bit codebook; UD-IQ2_XXS DeepSeek-V4 vehicle)
       // The block decoders moved to vt (src/vt/cpu/cpu_quant_dequant.cpp) so
       // the loader oracle and the compute-in-quant GEMM's generic fallback
       // share ONE implementation. The code is byte-identical to what lived
       // here, so numerics are unchanged; this test suite gates that.
+      // NOTE: MXFP4 (39) decodes here through the vt kMXFP4 block dtype — the
+      // GGML micro-scaling form (kvalues_mxfp4 == 2*e2m1, scale 2^(byte-128)) —
+      // NOT through the compressed-tensors E8M0ToF32 path used for NVFP4 (40)
+      // below; the two containers use different scale conventions.
       vt::DType dtype = vt::DType::kF32;
       VT_CHECK(vt::BlockDTypeFromGgmlTypeId(ggml_type, &dtype),
                "gguf dequant: no vt block dtype for this ggml type");

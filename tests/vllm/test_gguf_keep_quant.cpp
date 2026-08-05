@@ -61,7 +61,7 @@ namespace {
 // ggml type ids (ggml/include/ggml.h:390-432).
 constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ8_0 = 8, kQ3_K = 11,
                    kQ4_K = 12, kQ5_K = 13, kQ6_K = 14, kQ8_K = 15,
-                   kIQ2_S = 22, kIQ4_XS = 23, kBF16 = 30;
+                   kIQ2_S = 22, kIQ4_XS = 23, kBF16 = 30, kMXFP4 = 39;
 
 // Every executable weight encoding, with a K that is a whole number of blocks.
 struct Encoding {
@@ -254,16 +254,24 @@ TEST_CASE("keep-quant residency refuses ragged K and out-of-span slices") {
 // L3 — the routing policy table.
 // ===========================================================================
 
-TEST_CASE("KeepQuantDType covers exactly the six executable encodings") {
+TEST_CASE("KeepQuantDType covers the executable encodings") {
   vt::DType dt = vt::DType::kF32;
   for (const Encoding& e : kEncodings) {
     CAPTURE(e.name);
     CHECK(KeepQuantDType(e.ggml_type, &dt));
     CHECK(vt::cpu::HasQuantDotKernel(dt));
   }
-  // Unquantized file types, the activation-only encoding, and every unported
-  // encoding are NOT keep-quant capable.
-  for (uint32_t id : {kF32, kF16, kBF16, kQ8_K, kIQ2_S, kIQ4_XS}) {
+  // IQ2_S (22, Q8_K-activation) and MXFP4 (39, Q8_0-activation) are the UD-IQ2_M
+  // routed-expert encodings; both gained a keep-quant vec_dot, so the loader must
+  // keep them COMPRESSED (never expand-to-bf16 -> OOM).
+  for (uint32_t id : {kIQ2_S, kMXFP4}) {
+    CAPTURE(id);
+    CHECK(KeepQuantDType(id, &dt));
+    CHECK(vt::cpu::HasQuantDotKernel(dt));
+  }
+  // Unquantized file types, the activation-only encoding, and every still-unported
+  // encoding (IQ4_XS) are NOT keep-quant capable.
+  for (uint32_t id : {kF32, kF16, kBF16, kQ8_K, kIQ4_XS}) {
     CAPTURE(id);
     CHECK_FALSE(KeepQuantDType(id, &dt));
   }
@@ -277,8 +285,9 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
       GgufTensorRole::kTransformedWeight, GgufTensorRole::kEmbeddingTable,
       GgufTensorRole::kConvWeight,        GgufTensorRole::kVector,
   };
-  const uint32_t all_types[] = {kF32,  kF16,  kBF16,   kQ4_0,   kQ8_0,  kQ3_K,
-                                kQ4_K, kQ5_K, kQ6_K,   kQ8_K,   kIQ2_S, kIQ4_XS};
+  const uint32_t all_types[] = {kF32,  kF16,  kBF16, kQ4_0,  kQ8_0,   kQ3_K,
+                                kQ4_K, kQ5_K, kQ6_K, kQ8_K,  kIQ2_S,  kIQ4_XS,
+                                kMXFP4};
 
   int kept = 0;
   int expanded = 0;
@@ -294,10 +303,13 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         CAPTURE(shape.size());
 
         // --- the independent expectation ---
+        // IQ2_S (256-elem, Q8_K-act) and MXFP4 (32-elem, Q8_0-act) are keep-quant
+        // capable as of the UD-IQ2_M vehicle, so they route like the others.
         const bool block_capable =
             type == kQ4_0 || type == kQ8_0 || type == kQ3_K || type == kQ4_K ||
-            type == kQ5_K || type == kQ6_K;
-        const int64_t blk = (type == kQ4_0 || type == kQ8_0) ? 32 : 256;
+            type == kQ5_K || type == kQ6_K || type == kIQ2_S || type == kMXFP4;
+        const int64_t blk =
+            (type == kQ4_0 || type == kQ8_0 || type == kMXFP4) ? 32 : 256;
         bool expect_keep = false;
         if (block_capable) {
           if (role == GgufTensorRole::kMatmulWeight && shape.size() == 2) {
@@ -329,8 +341,8 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   }
   // Both outcomes are actually exercised (a table that never keeps anything
   // would pass every assertion above vacuously).
-  CHECK(kept == 12);          // 6 encodings x 2 keep-capable roles, right rank
-  CHECK(expanded == 12 * 36 - 12);
+  CHECK(kept == 16);          // 8 block-capable encodings x 2 keep-capable roles
+  CHECK(expanded == 13 * 36 - 16);  // 13 types x (6 roles x 6 shapes) - kept
 }
 
 TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {

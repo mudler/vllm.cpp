@@ -8,9 +8,12 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
+#include <variant>
 
 namespace vllm {
 
@@ -315,7 +318,7 @@ const GgmlTypeTraits& GgmlTraits(uint32_t type) {
   return *t;
 }
 
-GgufFile GgufFile::Open(const std::string& path) {
+GgufFile GgufFile::OpenOne(const std::string& path) {
   GgufFile f;  // fully constructed: dtor cleans up on any throw below
   f.path_ = path;
 
@@ -481,6 +484,90 @@ GgufFile GgufFile::Open(const std::string& path) {
   return f;
 }
 
+namespace {
+
+// llama.cpp split-GGUF naming: a shard path ends with "-NNNNN-of-MMMMM.gguf"
+// (5-digit, 1-based). On a match, fills `total` (MMMMM) and returns a builder
+// that yields the path of the i-th shard (0-based): the "-NNNNN-" run is
+// rewritten to i+1, everything else preserved. Returns false for a plain name.
+struct SplitNaming {
+  std::string prefix;  // up to and including the leading '-' before NNNNN
+  std::string suffix;  // "-of-MMMMM.gguf"
+  int total = 0;
+  std::string Shard(int i0) const {
+    char num[16];  // wide enough for any int (silences -Wformat-truncation)
+    std::snprintf(num, sizeof(num), "%05d", i0 + 1);
+    return prefix + num + suffix;
+  }
+};
+
+bool DetectSplit(const std::string& path, SplitNaming* out) {
+  static const std::string kExt = ".gguf";
+  if (path.size() < kExt.size() || path.compare(path.size() - kExt.size(),
+                                                kExt.size(), kExt) != 0)
+    return false;
+  // Locate the LAST "-of-" and require 5 digits on each side: "-NNNNN-of-MMMMM".
+  const std::string mark = "-of-";
+  const size_t body = path.size() - kExt.size();  // index just past MMMMM
+  const size_t of = path.rfind(mark, body);
+  if (of == std::string::npos) return false;
+  const size_t m_begin = of + mark.size();
+  if (body != m_begin + 5) return false;  // MMMMM must be exactly 5 digits
+  const size_t n_begin = of >= 5 ? of - 5 : std::string::npos;
+  if (n_begin == std::string::npos || of < 5) return false;
+  if (n_begin == 0 || path[n_begin - 1] != '-') return false;  // "-NNNNN-of-"
+  auto all_digits = [&](size_t b, size_t n) {
+    for (size_t i = 0; i < n; ++i)
+      if (path[b + i] < '0' || path[b + i] > '9') return false;
+    return true;
+  };
+  if (!all_digits(n_begin, 5) || !all_digits(m_begin, 5)) return false;
+  const int total = std::atoi(path.substr(m_begin, 5).c_str());
+  if (total <= 1) return false;  // single shard: nothing to merge
+  out->total = total;
+  out->prefix = path.substr(0, n_begin);              // "...-"
+  out->suffix = path.substr(of);                       // "-of-MMMMM.gguf"
+  return true;
+}
+
+}  // namespace
+
+GgufFile GgufFile::Open(const std::string& path) {
+  SplitNaming sn;
+  if (std::getenv("VT_GGUF_NO_SPLIT") != nullptr || !DetectSplit(path, &sn))
+    return OpenOne(path);
+
+  // Shard 00001 carries the full KV header + its own tensors; open it as the
+  // primary. Every additional shard contributes only its tensor table (its KVs
+  // are just split.no/count and would collide), and its mapping is kept alive
+  // under the primary so borrowed spans in any shard stay valid.
+  GgufFile f = OpenOne(sn.Shard(0));
+  // A merged file is addressed by its shard-00001 name in error messages.
+  f.path_ = path;
+  auto* primary = const_cast<GgufMapping*>(f.map_.get());  // just made non-const
+  for (int i = 1; i < sn.total; ++i) {
+    GgufFile s = OpenOne(sn.Shard(i));
+    primary->siblings.push_back(s.map_);  // pin the shard mapping to the primary
+    for (GgufTensorInfo& t : s.tensors_) {
+      // Each tensor's `data` already points into shard i's mapping (now pinned).
+      if (!f.index_.emplace(t.name, f.tensors_.size()).second)
+        Fail(path, "tensor \"" + t.name + "\" appears in more than one shard");
+      f.tensors_.push_back(std::move(t));
+    }
+  }
+  // Soft cross-check against the file's own split.count, when present.
+  if (const GgufValue* c = f.FindKv("split.count")) {
+    const auto* u = std::get_if<uint16_t>(&c->v);
+    const auto* w = std::get_if<uint32_t>(&c->v);
+    const int64_t declared = u != nullptr ? *u : (w != nullptr ? *w : sn.total);
+    if (declared != sn.total)
+      Fail(path, "split.count " + std::to_string(declared) +
+                     " disagrees with the filename's -of-" +
+                     std::to_string(sn.total));
+  }
+  return f;
+}
+
 const GgufValue* GgufFile::FindKv(const std::string& key) const {
   auto it = kvs_.find(key);
   return it == kvs_.end() ? nullptr : &it->second;
@@ -498,10 +585,18 @@ GgufMapping::~GgufMapping() {
 }
 
 bool GgufFile::OwnsSpan(const uint8_t* data, size_t nbytes) const {
-  if (map_ == nullptr || map_->addr == nullptr) return false;
-  const auto* base = static_cast<const uint8_t*>(map_->addr);
-  return data >= base && nbytes <= map_->size &&
-         static_cast<size_t>(data - base) <= map_->size - nbytes;
+  const auto in = [&](const GgufMapping* m) {
+    if (m == nullptr || m->addr == nullptr) return false;
+    const auto* base = static_cast<const uint8_t*>(m->addr);
+    return data >= base && nbytes <= m->size &&
+           static_cast<size_t>(data - base) <= m->size - nbytes;
+  };
+  if (in(map_.get())) return true;
+  // A merged split GGUF: the span may live in any sibling shard's mapping.
+  if (map_ != nullptr)
+    for (const auto& s : map_->siblings)
+      if (in(s.get())) return true;
+  return false;
 }
 
 void GgufFile::DropSpanResidency(const uint8_t* data, size_t nbytes) const {

@@ -1,0 +1,120 @@
+{
+ "available": true,
+ "pins": {
+  "vllm": "555967922",
+  "sglang": "f63458b5b",
+  "llamacpp": "237ad9b96"
+ },
+ "arch_floor": {
+  "supported": [
+   "7.5",
+   "8.0",
+   "8.6",
+   "8.7",
+   "8.9",
+   "9.0",
+   "10.0",
+   "10.1",
+   "10.3",
+   "12.0",
+   "12.1"
+  ],
+  "anchor": "CMakeLists.txt:129",
+  "our_rows_below_floor": [
+   "BACKEND-CUDA-SM060",
+   "BACKEND-CUDA-SM061",
+   "BACKEND-CUDA-SM070"
+  ],
+  "supported_with_no_row": []
+ },
+ "components": {
+  "machete": {
+   "files": 12,
+   "anchor": "csrc/libtorch_stable/quantization/machete:1"
+  },
+  "allspark": {
+   "files": 6,
+   "anchor": "csrc/libtorch_stable/quantization/gptq_allspark:1"
+  },
+  "scaled_mm_c2x": {
+   "files": 6,
+   "anchor": "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c2x_sm89_fp8_dispatch.cuh:1"
+  },
+  "cutlass_moe": {
+   "files": 3,
+   "anchor": "vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py:1"
+  },
+  "w4a8": {
+   "files": 13,
+   "anchor": "csrc/libtorch_stable/quantization/cutlass_w4a8:1"
+  },
+  "flashmla": {
+   "files": 5,
+   "anchor": "vllm/v1/attention/ops/flashmla.py:1"
+  },
+  "deepgemm": {
+   "files": 0,
+   "anchor": ""
+  },
+  "mla": {
+   "files": 39,
+   "anchor": "csrc/libtorch_stable/attention/mla:1"
+  }
+ },
+ "devices": {
+  "vllm_platforms": [
+   "cpu",
+   "cuda",
+   "rocm",
+   "tpu",
+   "xpu",
+   "zen_cpu"
+  ],
+  "vllm_uncovered": [],
+  "llamacpp_backends": [
+   "blas",
+   "cann",
+   "cpu",
+   "cuda",
+   "hexagon",
+   "hip",
+   "metal",
+   "musa",
+   "opencl",
+   "openvino",
+   "rpc",
+   "sycl",
+   "virtgpu",
+   "vulkan",
+   "webgpu",
+   "zdnn",
+   "zendnn"
+  ],
+  "llamacpp_uncovered": [
+   "blas",
+   "cann",
+   "hexagon",
+   "musa",
+   "opencl",
+   "openvino",
+   "rpc",
+   "virtgpu",
+   "webgpu",
+   "zdnn",
+   "zendnn"
+  ],
+  "sglang_platforms": [
+   "cpu",
+   "cuda",
+   "device_mixin",
+   "interface",
+   "rocm"
+  ]
+ },
+ "registry": {
+  "upstream_total": 362,
+  "named_by_us": 362,
+  "missing_count": 0,
+  "missing": []
+ }
+}

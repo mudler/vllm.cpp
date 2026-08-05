@@ -266,6 +266,10 @@ class GPUModelRunner final : public ModelRunnerBase {
     async_input_combine_ = enabled;
   }
   bool async_input_combine() const { return async_input_combine_; }
+  // ENG-ASYNC-SCHED depth-2 lifetime guard, exposed for the regression test.
+  // TRUE between a sample_tokens_async that left main-queue work outstanding and
+  // the next execute_model that drains it (see async_forward_in_flight_).
+  bool async_forward_in_flight() const { return async_forward_in_flight_; }
   bool kv_cache_backend_resident() const {
     return kv_cache_backend_resident_;
   }
@@ -408,6 +412,18 @@ class GPUModelRunner final : public ModelRunnerBase {
   // Async-scheduling device-input opt-in (see set_async_input_combine). Default
   // from VT_ASYNC_RUNNER at construction; OFF keeps the sync host path.
   bool async_input_combine_ = false;
+  // ENG-ASYNC-SCHED depth-2 LIFETIME GUARD. sample_tokens_async DEFERS the main
+  // queue's completion to the consuming step's get_output() (one step_with_batch_
+  // queue call later), so when it returns the previous step's forward / sample /
+  // scatter kernels are STILL IN FLIGHT and still reading exec_state_ (device
+  // logits, the StepInputs host arrays) and writing input_batch_.last_sampled_
+  // tokens. The next execute_model() would otherwise reset exec_state_ and mutate
+  // input_batch_ (update_states condense/swap) WHILE those kernels run — a
+  // use-after-free / host-heap corruption that only real GPU overlap exposes
+  // (serialized runs — the CPU eager backend, compute-sanitizer — never see it).
+  // Set true whenever sample_tokens_async leaves main-queue work outstanding;
+  // execute_model() drains it before touching any shared state.
+  bool async_forward_in_flight_ = false;
   // Dedicated COPY queue for the async sampled-id D2H (async_output_copy_stream,
   // gpu_model_runner.py:711-716,1137-1141). Created lazily on the first async
   // sample so the sync path allocates no extra stream; destroyed in the dtor.

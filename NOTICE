@@ -24,3 +24,20 @@ ports, and/or vendors code from third-party projects, including:
 Each such component remains under its own license; the notices and license
 texts of vendored third-party code are retained in their respective source
 files and directories.
+
+TRADEMARKS
+
+vllm.cpp is an independent community project. It is NOT affiliated with,
+endorsed by, or sponsored by the vLLM project, the PyTorch Foundation, or the
+Linux Foundation.
+
+"vLLM" is a mark of its respective owners and is used in this repository in its
+descriptive sense only, to identify the upstream project that vllm.cpp ports,
+mirrors, and is gated against. No claim of ownership of that mark is made, and
+nothing here implies that the vLLM project has reviewed, approved, or endorsed
+this software. Section 6 of the Apache License, Version 2.0 grants no trademark
+rights, and none are claimed.
+
+Other names and marks referenced here (llama.cpp, SGLang, MLX, CUTLASS,
+FlashInfer, Marlin, TRT-LLM, and others) belong to their respective owners and
+are likewise used descriptively.

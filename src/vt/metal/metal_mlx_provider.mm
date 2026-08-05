@@ -50,21 +50,21 @@
 #include <cstring>
 #include <vector>
 
-// MLX 0.29.x uses constant-folded variable length arrays in public headers.
-// Keep the target-wide -Werror policy, but ignore that external-header-only
-// AppleClang diagnostic after command-line warning options have been applied.
-#if defined(__clang__)
-#pragma clang diagnostic ignored "-Wgnu-folding-constant"
-#endif
-
 // MLX public headers. Deliberately NOT mlx/backend/metal/*: those pull in
 // metal-cpp and, as noted above, their entry points are not exported anyway.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-folding-constant"
+#endif
 #include "mlx/allocator.h"
 #include "mlx/array.h"
 #include "mlx/dtype.h"
 #include "mlx/ops.h"
 #include "mlx/stream.h"
 #include "mlx/transforms.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 #include "metal_buffers.h"
 #include "metal_context.h"

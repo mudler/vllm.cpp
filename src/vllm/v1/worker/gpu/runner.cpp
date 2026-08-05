@@ -822,6 +822,24 @@ void GPUModelRunner::remap_gdn_state_slots(
 
 std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     const SchedulerOutput& scheduler_output) {
+  // ENG-ASYNC-SCHED depth-2 LIFETIME GUARD. Under async scheduling the previous
+  // step went through sample_tokens_async, which DEFERS the main queue's D2H to
+  // the consuming step's get_output() (one step_with_batch_queue call later). So
+  // on entry here the previous step's forward / sample / scatter kernels may
+  // still be IN FLIGHT, and they still reference the state we are about to
+  // mutate: exec_state_ (the device logits + the StepInputs host arrays the
+  // forward/sampler read) and input_batch_.last_sampled_tokens (the scatter
+  // writes it; update_states' condense/swap read+move it). Freeing/mutating that
+  // state now — while those kernels run on GB10's unified memory — is a
+  // use-after-free that corrupts the host heap. It only manifests with REAL GPU
+  // overlap: the CPU eager backend and compute-sanitizer both serialize the
+  // queue and never see it, which is exactly why the CPU gates stayed green while
+  // the served 35B aborted. Drain the outstanding work before touching anything.
+  if (async_forward_in_flight_) {
+    vt::GetBackend(queue_.device.type).Synchronize(queue_);
+    async_forward_in_flight_ = false;
+  }
+
   // update_states: admit new reqs (incl. prefill_token_ids) + apply cached diffs
   // + remove finished/unscheduled + condense (M1.5).
   update_states(input_batch_, scheduler_output);
@@ -2163,6 +2181,15 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
       invalid_req_indices.push_back(i);
     }
   }
+
+  // ENG-ASYNC-SCHED depth-2 LIFETIME GUARD: this path issued the sampled-id D2H
+  // on the COPY queue and left the forward / sample / scatter on the MAIN queue
+  // UNSYNCED (that overlap is the whole point). Those kernels still reference
+  // exec_state_ and write input_batch_.last_sampled_tokens, so the NEXT
+  // execute_model() must drain the main queue before it resets exec_state_ or
+  // mutates input_batch_. Flag it. (The host-fallback branch above already
+  // Synchronized, so its flag is a no-op next step — harmless.)
+  async_forward_in_flight_ = true;
 
   // Issue the non-blocking sampled-id D2H on the COPY queue + record the event.
   // The async output BORROWS the pool slot (device buffer already holds the

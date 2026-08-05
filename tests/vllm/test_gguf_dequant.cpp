@@ -300,6 +300,111 @@ TEST_CASE("DequantGgufRowToF32 IQ2_XXS codebook block (grid + signs + scale)") {
   CHECK(bf[32] == vt::F32ToBF16(-3.0F));
 }
 
+// --- IQ2_S (22): block = { f16 d; u8 qs[64]; u8 qh[8]; u8 scales[8]; }
+// (82 bytes). Codebook decode over 8 sub-blocks of 32. Each 32-lane sub-block
+// has 4 lanes; lane l reads a 10-bit grid index = qs[l] | ((qh[ib32]<<(8-2l))
+// & 0x300), looks up iq2s_grid (1024 x u64 = 8 grid bytes), and applies the
+// DIRECT sign byte signs[l] (= qs+32) per kmask_iq2xs — NO ksigns lookup.
+// scales[ib32] packs two 4-bit ls: low nibble -> db[0] (l=0,1), high -> db[1]
+// (l=2,3); db = d*(0.5 + ls)*0.25.
+//
+// Hand-verified against ggml-common.h iq2s_grid @ 237ad9b96:
+//   grid[0]   = 0x0808080808080808 -> all 8 bytes = 8.
+//   grid[1]   = 0x080808080808082b -> byte0 = 0x2b (43), bytes1..7 = 8.
+//   grid[2]   = 0x0808080808081919 -> bytes0,1 = 0x19 (25), bytes2..7 = 8.
+//   grid[256] = 0x0819081919191919 -> bytes = {25,25,25,25,25,8,25,8}.
+// kmask_iq2xs[j] = 1<<j; sign byte 129 = 0b10000001 flips lanes j=0 and j=7.
+TEST_CASE("DequantGgufRowToF32 IQ2_S codebook block (grid + qh + signs + scale)") {
+  std::vector<uint8_t> b(82, 0);
+  const uint16_t d = vt::F32ToF16(1.0F);
+  b[0] = static_cast<uint8_t>(d & 0xFF);
+  b[1] = static_cast<uint8_t>(d >> 8);
+  // qs field @2: grid-low bytes qs[0..31] then sign bytes qs[32..63].
+  b[2] = 1;      // ib32=0 lane0 grid idx low = 1  -> grid[1]
+  b[4] = 2;      // ib32=0 lane2 grid idx low = 2  -> grid[2]
+  b[6] = 1;      // ib32=1 lane0 grid idx low = 1  -> grid[1]
+  b[38] = 0x81;  // ib32=1 lane0 sign byte = 129 (flips j=0, j=7)
+  // qh field @66: 2 high index bits per lane.
+  b[68] = 0x01;  // qh[2] bit0 -> ib32=2 lane0 idx high = 0x100 -> grid[256]
+  // scales field @74. scales[0]: low nib 0 -> db[0]=0.125, high nib 1 -> db[1]=0.375.
+  b[74] = 0x10;  // scales[0]; scales[1..7] stay 0 -> db[0]=db[1]=0.125.
+
+  const std::vector<float> out = DequantGgufRowToF32(22, b.data(), 256);
+  REQUIRE(out.size() == 256);
+  // ib32=0 l0 (grid[1], db[0]=0.125): y[0]=0.125*43=5.375, y[1..7]=1.0.
+  CHECK(out[0] == doctest::Approx(5.375F));
+  CHECK(out[1] == doctest::Approx(1.0F));
+  CHECK(out[7] == doctest::Approx(1.0F));
+  // ib32=0 l1 (grid[0]): y[8..15]=1.0.
+  CHECK(out[8] == doctest::Approx(1.0F));
+  // ib32=0 l2 (grid[2], db[1]=0.375): y[16]=y[17]=0.375*25=9.375, y[18..23]=3.0.
+  CHECK(out[16] == doctest::Approx(9.375F));
+  CHECK(out[17] == doctest::Approx(9.375F));
+  CHECK(out[18] == doctest::Approx(3.0F));
+  // ib32=0 l3 (grid[0], db[1]): y[24..31]=0.375*8=3.0.
+  CHECK(out[24] == doctest::Approx(3.0F));
+  // ib32=1 l0 (grid[1], db[0]=0.125, sign 129 flips j=0 and j=7):
+  //   y[32]=-5.375, y[33..38]=1.0, y[39]=-1.0.
+  CHECK(out[32] == doctest::Approx(-5.375F));
+  CHECK(out[33] == doctest::Approx(1.0F));
+  CHECK(out[39] == doctest::Approx(-1.0F));
+  // ib32=1 l1..3 (grid[0], no signs): all 1.0.
+  CHECK(out[40] == doctest::Approx(1.0F));
+  CHECK(out[63] == doctest::Approx(1.0F));
+  // ib32=2 l0 (qh high bit -> grid[256], db[0]=0.125): y[64]=0.125*25=3.125,
+  //   y[69]=0.125*8=1.0 (grid[256] byte5 = 8, distinguishes idx 256 from idx 0).
+  CHECK(out[64] == doctest::Approx(3.125F));
+  CHECK(out[69] == doctest::Approx(1.0F));
+  // ib32=2 l1..3 (qh bits for other lanes are 0 -> grid[0]): 1.0.
+  CHECK(out[72] == doctest::Approx(1.0F));
+  // ib32=3..7 (all-zero -> grid[0], db=0.125): all 1.0.
+  CHECK(out[96] == doctest::Approx(1.0F));
+  CHECK(out[255] == doctest::Approx(1.0F));
+
+  // bf16 variant round-trips through the same f32 decode.
+  const std::vector<uint16_t> bf = DequantGgufRowToBf16(22, b.data(), 256);
+  REQUIRE(bf.size() == 256);
+  CHECK(bf[0] == vt::F32ToBF16(5.375F));
+  CHECK(bf[32] == vt::F32ToBF16(-5.375F));
+}
+
+// --- MXFP4 (39): block = { u8 e; u8 qs[16]; } (17 bytes). OCP micro-scaling
+// fp4: d = E8M0ToF32Half(e) = 2^(e-128); each of the 32 e2m1 nibbles is looked
+// up in kvalues_mxfp4 = {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12}. Split-half
+// packing: element j in the low nibble of qs[j], j+16 in the high nibble.
+//
+// Hand cases: e=0x80 -> 2^0 = 1.0 ; e=0x81 -> 2^1 = 2.0.
+TEST_CASE("DequantGgufRowToF32 MXFP4 micro-scaling block (e8m0 + kvalues)") {
+  std::vector<uint8_t> b(34, 0);  // two 17-byte blocks
+  // Block A: e = 0x80 (scale 1.0).
+  b[0] = 0x80;
+  b[1] = 0x17;  // qs[0]: low nib 7 -> kvalues[7]=12 (y[0]); high nib 1 -> 1 (y[16])
+  b[2] = 0x9F;  // qs[1]: low nib 15 -> kvalues[15]=-12 (y[1]); high nib 9 -> -1 (y[17])
+  // Block B (offset 17): e = 0x81 (scale 2.0).
+  b[17] = 0x81;
+  b[18] = 0x06;  // qs[0]: low nib 6 -> kvalues[6]=8 (y[32]); high nib 0 -> 0 (y[48])
+
+  const std::vector<float> out = DequantGgufRowToF32(39, b.data(), 64);
+  REQUIRE(out.size() == 64);
+  // Block A, scale 1.0.
+  CHECK(out[0] == doctest::Approx(12.0F));
+  CHECK(out[16] == doctest::Approx(1.0F));
+  CHECK(out[1] == doctest::Approx(-12.0F));
+  CHECK(out[17] == doctest::Approx(-1.0F));
+  for (int j = 2; j < 16; ++j) {
+    CHECK(out[j] == doctest::Approx(0.0F));
+    CHECK(out[j + 16] == doctest::Approx(0.0F));
+  }
+  // Block B, scale 2.0: y[32] = 8*2 = 16, y[48] = 0.
+  CHECK(out[32] == doctest::Approx(16.0F));
+  CHECK(out[48] == doctest::Approx(0.0F));
+
+  const std::vector<uint16_t> bf = DequantGgufRowToBf16(39, b.data(), 64);
+  REQUIRE(bf.size() == 64);
+  CHECK(bf[0] == vt::F32ToBF16(12.0F));
+  CHECK(bf[32] == vt::F32ToBF16(16.0F));
+}
+
 // --- Multi-block row: two Q8_0 blocks (64 elems) with distinct scales. ---
 TEST_CASE("DequantGgufRowToF32 Q8_0 multi-block row") {
   std::vector<uint8_t> b;
@@ -337,10 +442,9 @@ TEST_CASE("DequantGgufRowToF32 rejects non-block-multiple numel") {
 }
 
 TEST_CASE("DequantGgufRowToF32 rejects unsupported i-quant type") {
-  std::vector<uint8_t> b(82, 0);
-  // IQ2_S (22): tabulated in the reader (256 elems) but not dequant-able yet.
-  CHECK_THROWS_AS(DequantGgufRowToF32(22, b.data(), 256), std::runtime_error);
-  // IQ4_XS (23) likewise.
+  // IQ2_S (22) and MXFP4 (39) are now decodable (UD-IQ2_M vehicle); their golden
+  // cases are above. IQ4_XS (23) remains tabulated in the reader but has no
+  // decoder yet, so it must still fail loudly rather than silently mis-decode.
   std::vector<uint8_t> b2(136, 0);
   CHECK_THROWS_AS(DequantGgufRowToF32(23, b2.data(), 256), std::runtime_error);
 }

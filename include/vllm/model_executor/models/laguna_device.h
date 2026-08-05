@@ -144,6 +144,14 @@ struct LagunaDeviceKernels {
   // reproduces the bits vt::CastF32 wrote. x2 (shared expert) stays f32.
   void (*fused_add2_rmsnorm_bf16x1)(vt::Queue&, float* out, float* residual, const void* x1,
                                     const float* x2, const float* w, int64_t h, float eps);
+  // LEVER A (VT_LAGUNA_KV_BF16): eager-path KV append with a HOST row offset. Sibling of
+  // append_kv_row (which reads the slot from a DEVICE int for the captured graph); the eager
+  // LagunaForwardResidentDecode loop is async with per-layer-varying sliding-window row counts,
+  // so the slot MUST be baked into each launch (a shared device int would race). Casts the f32
+  // new row to bf16 when the cache stores bf16 (env-gated), else a plain f32 store. cache_k/
+  // cache_v are the (possibly bf16) per-layer buffers passed via the float* param (address pun).
+  void (*append_kv_row_cast)(vt::Queue&, float* cache_k, float* cache_v, const float* knew,
+                             const float* vnew, int64_t kvdim, int64_t off_rows);
 };
 
 // Resolver (throws on a CPU-only build where nothing registered for kLaguna,kCUDA).

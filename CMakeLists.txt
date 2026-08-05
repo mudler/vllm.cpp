@@ -467,6 +467,11 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/kimi_k3_weights.cpp
   src/vllm/model_executor/models/kimi_k3.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
+  src/vllm/model_executor/models/kimi_linear_registry.cpp
+  src/vllm/model_executor/models/kimi_linear_weights.cpp
+  src/vllm/model_executor/models/kimi_linear_forward.cpp
+  src/vllm/model_executor/models/kimi_linear.cpp
+  src/vllm/model_executor/models/kimi_linear_device.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
   src/vllm/model_executor/models/glm4_weights.cpp
   src/vllm/model_executor/models/glm4.cpp
@@ -849,11 +854,13 @@ if(VLLM_CPP_METAL)
       message(FATAL_ERROR "VLLM_CPP_MLX=ON but no libmlx + include/mlx/array.h under "
         "MLX_ROOT=${MLX_ROOT}")
     endif()
+    include(cmake/MLXDependency.cmake)
+    vllm_cpp_import_mlx("${MLX_ROOT}" "${MLX_LIBRARY}")
     target_compile_definitions(vllm PUBLIC VLLM_CPP_MLX)
     target_sources(vllm PRIVATE src/vt/metal/metal_mlx_provider.mm)
-    # SYSTEM so MLX's own headers cannot break our -Werror build.
-    target_include_directories(vllm SYSTEM PRIVATE "${MLX_ROOT}/include")
-    target_link_libraries(vllm PUBLIC ${MLX_LIBRARY})
+    # MLX is a third-party dependency target: its public headers are SYSTEM,
+    # while vllm's own sources remain subject to the target-wide -Werror policy.
+    target_link_libraries(vllm PUBLIC vllm_cpp::mlx)
     message(STATUS "MLX GEMM provider enabled: ${MLX_LIBRARY}")
   endif()
 endif()

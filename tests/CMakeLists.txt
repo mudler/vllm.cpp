@@ -163,6 +163,22 @@ vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 # K3 is beyond the pinned oracle (.agents/specs/kimi-k3.md).
 vllm_cpp_add_test(test_kimi_k3_scaffold vllm/models/test_kimi_k3_scaffold.cpp)
 
+# Kimi-Linear-48B-A3B (KimiLinearForCausalLM) W1 scaffolding gate: registry-resolve
+# + config parse (20 KDA + 7 NoPE-MLA schedule, MLA/MoE/KDA dims, reject cases) +
+# checkpoint name-map faithfulness (block_sparse_moe, verified vs the HF index) +
+# loader round-trip on a synthetic 2-layer checkpoint (throws BY NAME on a missing
+# or mis-shaped tensor). CPU-only; the forward REFUSES-by-name (W3-W6).
+# .agents/specs/kimi-linear.md.
+vllm_cpp_add_test(test_kimi_linear_scaffold vllm/models/test_kimi_linear_scaffold.cpp)
+
+# Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
+# (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
+# reference; sigmoid noaux_tc router + block vs a hand-computed case) and the whole
+# 2-layer forward (loader materializes host weights, finite/coherent, greedy-decodes
+# N tokens with the context advancing). The DEVICE forward stays refuse-by-name
+# (born-on-runner W6/W7). .agents/specs/kimi-linear.md §5.
+vllm_cpp_add_test(test_kimi_linear_forward vllm/models/test_kimi_linear_forward.cpp)
+
 # KDA (Kimi Delta Attention) net-new gated-linear-attention primitives — host
 # reference + unit gate (KERNEL-KDA-DELTA). Shared unblocker for Kimi-Linear-48B
 # and Kimi-K3 (W4). Hand-derived literal cases + double-precision references over

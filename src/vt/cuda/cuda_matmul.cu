@@ -43,6 +43,15 @@ namespace {
 
 constexpr size_t kWorkspaceBytes = 32ull << 20;  // 32 MB, per the M0.6 plan
 
+// requestedAlgoCount for EVERY cuBLASLt heuristic query below: 1 == take the single
+// best heuristic, no algo search. Named (not a bare literal at each call site) so any
+// future algo-policy change is one conscious, greppable edit — the invocation-parity
+// bug class this guards is that the caller's choices (output dtype, entry point, algo
+// policy) SELECT the resolved kernel template (a bf16 M=1 GEMV with an f32-out layout
+// buys the slower gemvx<bf16,FLOAT> template than vLLM's gemvx<bf16,bf16>). Enforced by
+// scripts/check-gemv-invocation-consistency.py.
+constexpr int kGemvHeuristicAlgos = 1;
+
 void CheckCuda(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
     throw std::runtime_error(std::string("vt cuda: matmul: ") + what + ": " +
@@ -255,7 +264,7 @@ void MatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   cublasLtMatmulHeuristicResult_t heur{};
   int returned = 0;
   CheckLt(cublasLtMatmulAlgoGetHeuristic(ctx.handle, desc.v, la.v, lb.v, lc.v, lc.v, pref.v,
-                                         /*requestedAlgoCount=*/1, &heur, &returned),
+                                         /*requestedAlgoCount=*/kGemvHeuristicAlgos, &heur, &returned),
           "cublasLtMatmulAlgoGetHeuristic");
   if (returned == 0) {
     throw std::runtime_error("vt cuda: matmul: no cublasLt heuristic for [" +
@@ -335,7 +344,7 @@ void MatmulBTKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   cublasLtMatmulHeuristicResult_t heur{};
   int returned = 0;
   CheckLt(cublasLtMatmulAlgoGetHeuristic(ctx.handle, desc.v, la.v, lb.v, lc.v, lc.v, pref.v,
-                                         /*requestedAlgoCount=*/1, &heur, &returned),
+                                         /*requestedAlgoCount=*/kGemvHeuristicAlgos, &heur, &returned),
           "bt cublasLtMatmulAlgoGetHeuristic");
   if (returned == 0) {
     throw std::runtime_error("vt cuda: matmul_bt: no cublasLt heuristic for [" +
@@ -421,7 +430,7 @@ void BatchedMatmulKernelCuda(Queue& q, Tensor& out, const Tensor& a, const Tenso
   cublasLtMatmulHeuristicResult_t heur{};
   int returned = 0;
   CheckLt(cublasLtMatmulAlgoGetHeuristic(ctx.handle, desc.v, la.v, lb.v, lc.v, lc.v, pref.v,
-                                         /*requestedAlgoCount=*/1, &heur, &returned),
+                                         /*requestedAlgoCount=*/kGemvHeuristicAlgos, &heur, &returned),
           "batched cublasLtMatmulAlgoGetHeuristic");
   if (returned == 0) {
     throw std::runtime_error("vt cuda: batched_matmul: no cublasLt heuristic for g=" +
@@ -527,7 +536,7 @@ bool BuildFp8Plan(const LtContext& ctx, const Fp8PlanKey& key, Fp8Plan* out) {
 
   int returned = 0;
   const cublasStatus_t hst = cublasLtMatmulAlgoGetHeuristic(
-      ctx.handle, p.desc, p.la, p.lb, p.lc, p.lc, pref.v, /*requestedAlgoCount=*/1, &p.heur,
+      ctx.handle, p.desc, p.la, p.lb, p.lc, p.lc, pref.v, /*requestedAlgoCount=*/kGemvHeuristicAlgos, &p.heur,
       &returned);
   if (hst != CUBLAS_STATUS_SUCCESS || returned == 0) {
     if (p.lc != nullptr) cublasLtMatrixLayoutDestroy(p.lc);

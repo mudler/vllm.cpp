@@ -16,6 +16,22 @@ ROOT = Path(__file__).resolve().parents[1]
 # is a judgement call this checker deliberately does not force.
 PUBLIC_CHECKPOINTS = ("docs/STATUS.md", "docs/BENCHMARKS.md")
 
+# The public feature surface is docs/FEATURES.md: the user-facing comparison of
+# what we support against vLLM, SGLang and llama.cpp. It is NOT owed by every
+# checkpoint (most commits move no feature row), so it has its own narrower
+# trigger set: the area matrices that define feature/model/backend/quant state,
+# and the model implementations themselves. AGENTS.md already requires those
+# matrices to move in the same change as the code, so this only mirrors that
+# obligation onto the public surface.
+FEATURE_CHECKPOINT = "docs/FEATURES.md"
+FEATURE_TRIGGER_PREFIXES = ("src/vllm/model_executor/models/",)
+FEATURE_TRIGGER_FILES = {
+    ".agents/backend-matrix.md",
+    ".agents/feature-matrix.md",
+    ".agents/model-matrix.md",
+    ".agents/quantization-matrix.md",
+}
+
 CHECKPOINT_PREFIXES = (
     ".agents/completed/",
     ".agents/specs/",
@@ -49,22 +65,42 @@ def is_checkpoint_path(path: str) -> bool:
     return path in CHECKPOINT_FILES or path.startswith(CHECKPOINT_PREFIXES)
 
 
-def checkpoint_errors(paths: set[str]) -> list[str]:
-    """Return missing-public-document errors for one atomic change."""
-    triggers = sorted(path for path in paths if is_checkpoint_path(path))
-    if not triggers:
-        return []
-    missing = [path for path in PUBLIC_CHECKPOINTS if path not in paths]
-    if not missing:
-        return []
+def is_feature_path(path: str) -> bool:
+    """Return whether a changed path can move a row in the public feature matrix."""
+    return path in FEATURE_TRIGGER_FILES or path.startswith(FEATURE_TRIGGER_PREFIXES)
+
+
+def _preview(triggers: list[str]) -> str:
     preview = ", ".join(triggers[:5])
     if len(triggers) > 5:
         preview += f", ... (+{len(triggers) - 5})"
-    return [
-        "feature/iteration checkpoint changed "
-        f"({preview}) but did not update {path} in the same change"
-        for path in missing
-    ]
+    return preview
+
+
+def checkpoint_errors(paths: set[str]) -> list[str]:
+    """Return missing-public-document errors for one atomic change."""
+    errors: list[str] = []
+
+    triggers = sorted(path for path in paths if is_checkpoint_path(path))
+    if triggers:
+        errors += [
+            "feature/iteration checkpoint changed "
+            f"({_preview(triggers)}) but did not update {path} in the same change"
+            for path in PUBLIC_CHECKPOINTS
+            if path not in paths
+        ]
+
+    feature_triggers = sorted(path for path in paths if is_feature_path(path))
+    if feature_triggers and FEATURE_CHECKPOINT not in paths:
+        errors.append(
+            "feature/model/backend/quantization surface changed "
+            f"({_preview(feature_triggers)}) but did not update "
+            f"{FEATURE_CHECKPOINT} in the same change; update the row this "
+            "moves (support mark, gate, or the Not-supported-yet table) so the "
+            "public feature matrix cannot drift from the area matrices"
+        )
+
+    return errors
 
 
 def git(*args: str) -> str:
@@ -135,12 +171,17 @@ def main() -> int:
             print(f"ERROR: {failure}", file=sys.stderr)
         print(
             "Update docs/STATUS.md and docs/BENCHMARKS.md with the current "
-            "stage/result, including explicit pending or void outcomes.",
+            "stage/result, including explicit pending or void outcomes, and "
+            "docs/FEATURES.md when the feature/model/backend/quantization "
+            "surface moves.",
             file=sys.stderr,
         )
         return 1
 
-    print("OK: feature checkpoints update docs/STATUS.md and docs/BENCHMARKS.md.")
+    print(
+        "OK: feature checkpoints update docs/STATUS.md and docs/BENCHMARKS.md, "
+        "and feature-surface changes update docs/FEATURES.md."
+    )
     return 0
 
 

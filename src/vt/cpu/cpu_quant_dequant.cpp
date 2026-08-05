@@ -334,6 +334,60 @@ void DequantIQ3_XXS(const uint8_t* data, int64_t nb, float* y) {
   }
 }
 
+// block_iq2_s = { f16 d; u8 qs[64]; u8 qh[8]; u8 scales[8]; } (82 bytes)
+// dequantize_row_iq2_s:2471. Codebook decode: 8 sub-blocks of 32. Each of the 4
+// lanes reads a grid-index low byte (qs[l]) OR'd with 2 high bits from qh[ib32]
+// (10-bit index into the 1024-entry kIq2sGrid), then applies the DIRECT sign
+// byte signs[l] (signs = qs + QK_K/8; NO ksigns lookup, unlike IQ2_XXS).
+// scales[ib32] packs two 4-bit ls: low nibble -> db[0] (l=0,1), high nibble ->
+// db[1] (l=2,3); db = d*(0.5 + ls)*0.25.
+void DequantIQ2_S(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 256;
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 82;
+    const float d = ReadF16(blk);
+    const uint8_t* qs = blk + 2;         // grid-index low bytes
+    const uint8_t* qh = blk + 66;        // 2 high index bits per lane
+    const uint8_t* scales = blk + 74;    // per-ib32 packed ls
+    const uint8_t* signs = qs + qk / 8;  // qs + 32 (direct sign bytes)
+    float db[2];
+    for (int ib32 = 0; ib32 < qk / 32; ++ib32) {
+      db[0] = d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+      db[1] = d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+      for (int l = 0; l < 4; ++l) {
+        const float dl = db[l / 2];
+        const uint8_t* grid = reinterpret_cast<const uint8_t*>(
+            kIq2sGrid + (qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)));
+        for (int j = 0; j < 8; ++j)
+          y[j] = dl * grid[j] * ((signs[l] & kKmaskIq2xs[j]) ? -1.f : 1.f);
+        y += 8;
+      }
+      qs += 4;
+      signs += 4;
+    }
+  }
+}
+
+// block_mxfp4 = { u8 e; u8 qs[16]; } (17 bytes) dequantize_row_mxfp4:511.
+// OCP micro-scaling fp4: d = E8M0ToF32Half(e) is one power-of-two block scale;
+// each of the 32 elements is an e2m1 nibble looked up in kValuesMxfp4. The
+// nibbles use the split-half packing (element j in the low nibble of qs[j],
+// j+16 in the high nibble), matching q4_0 and the ggml reference.
+void DequantMXFP4(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 32;
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 17;
+    const float d = E8M0ToF32Half(blk[0]);
+    const uint8_t* qs = blk + 1;
+    for (int j = 0; j < qk / 2; ++j) {
+      const int8_t x0 = kValuesMxfp4[qs[j] & 0x0F];
+      const int8_t x1 = kValuesMxfp4[qs[j] >> 4];
+      y[i * qk + j + 0] = x0 * d;
+      y[i * qk + j + qk / 2] = x1 * d;
+    }
+  }
+}
+
 // Adapt a whole-row `(data, nb, y)` decoder to upstream's
 // `ggml_to_float_t(x, y, k)` shape.
 template <void (*Kernel)(const uint8_t*, int64_t, float*), int64_t kBlockElems>
@@ -357,6 +411,8 @@ ToFloatFn BlockToFloat(DType dtype) {
     case DType::kQ8_K: return &ToFloatAdapter<&DequantQ8_K, 256>;
     case DType::kIQ2_XXS: return &ToFloatAdapter<&DequantIQ2_XXS, 256>;
     case DType::kIQ3_XXS: return &ToFloatAdapter<&DequantIQ3_XXS, 256>;
+    case DType::kIQ2_S: return &ToFloatAdapter<&DequantIQ2_S, 256>;
+    case DType::kMXFP4: return &ToFloatAdapter<&DequantMXFP4, 32>;
     default: return nullptr;
   }
 }

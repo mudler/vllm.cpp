@@ -82,6 +82,22 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
       static constexpr BlockGeometry g{256, 98, 18, "iq3_xxs"};
       return &g;
     }
+    case DType::kIQ2_S: {
+      // block_iq2_s (ggml-common.h:386-392): f16 d + u8 qs[QK_K/4]
+      // + u8 qh[QK_K/32] + u8 scales[QK_K/32] = 2 + 64 + 8 + 8 = 82.
+      // ggml type id 22. Codebook (iq2s_grid, 1024 entries) decode; qs holds
+      // both the 8-bit grid-index low bytes (first 32) and the direct sign
+      // bytes (last 32), qh supplies the 2 high index bits per lane.
+      static constexpr BlockGeometry g{256, 82, 22, "iq2_s"};
+      return &g;
+    }
+    case DType::kMXFP4: {
+      // block_mxfp4 (ggml-common.h:204-209): u8 e (E8M0 shared exponent)
+      // + u8 qs[QK_MXFP4/2] = 1 + 16 = 17, QK_MXFP4 = 32. ggml type id 39.
+      // OCP micro-scaling fp4: e2m1 nibbles times one power-of-two block scale.
+      static constexpr BlockGeometry g{32, 17, 39, "mxfp4"};
+      return &g;
+    }
     case DType::kF32:
     case DType::kF16:
     case DType::kBF16:
@@ -92,6 +108,7 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
   }
   return nullptr;
 }
+
 
 const BlockGeometry& RequireBlockGeometry(DType dtype) {
   const BlockGeometry* g = FindBlockGeometry(dtype);
@@ -114,7 +131,7 @@ bool BlockDTypeFromGgmlTypeId(uint32_t ggml_type, DType* out) {
   static constexpr DType kBlockDTypes[] = {
       DType::kQ4_0, DType::kQ8_0,    DType::kQ2_K,     DType::kQ3_K, DType::kQ4_K,
       DType::kQ5_K, DType::kQ6_K,    DType::kQ8_K,     DType::kIQ2_XXS,
-      DType::kIQ3_XXS};
+      DType::kIQ3_XXS, DType::kIQ2_S, DType::kMXFP4};
   for (DType d : kBlockDTypes) {
     if (FindBlockGeometry(d)->ggml_type == ggml_type) {
       if (out != nullptr) *out = d;
@@ -157,6 +174,8 @@ size_t SizeOf(DType dtype) {
     case DType::kQ8_K:
     case DType::kIQ2_XXS:
     case DType::kIQ3_XXS:
+    case DType::kIQ2_S:
+    case DType::kMXFP4:
       VT_CHECK(false, std::string("SizeOf: block-quantized dtype ") +
                           Name(dtype) + " has no per-element size");
       return 0;
@@ -183,6 +202,8 @@ const char* Name(DType dtype) {
     case DType::kQ8_K: return "q8_K";
     case DType::kIQ2_XXS: return "iq2_xxs";
     case DType::kIQ3_XXS: return "iq3_xxs";
+    case DType::kIQ2_S: return "iq2_s";
+    case DType::kMXFP4: return "mxfp4";
   }
   return "?";
 }

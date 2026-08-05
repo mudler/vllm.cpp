@@ -49,6 +49,13 @@ namespace vt {
 // their blocks COMPRESSED and dots them directly — the memory enabler that lets
 // a 158 B DeepSeek-V4 stay ~91 GiB instead of OOM-expanding to bf16. See
 // `.agents/specs/gguf-iquant-dsv4.md` and `.agents/specs/deepseek-v4-flash.md`.
+//
+// kIQ2_S (2.5625 bpw, Q8_K-activation) and kMXFP4 (OCP micro-scaling fp4, 32-elem
+// blocks, Q8_0-activation) are the extra per-tensor "dynamic" encodings the
+// `unsloth/DeepSeek-V4-Flash-GGUF UD-IQ2_M` checkpoint mixes into a handful of
+// routed-expert slabs (IQ2_S ffn_gate/up + MXFP4 ffn_down). Both carry a
+// keep-quant `vec_dot` (IQ2_S vs Q8_K, MXFP4 vs Q8_0) so they load COMPRESSED
+// on the same memory-safe path — expanding them to bf16 would OOM the box.
 enum class DType : uint8_t {
   kF32,
   kF16,
@@ -67,6 +74,8 @@ enum class DType : uint8_t {
   kQ8_K,
   kIQ2_XXS,
   kIQ3_XXS,
+  kIQ2_S,
+  kMXFP4,
 };
 
 // Bytes per ELEMENT. Throws for block-quantized dtypes (they have no

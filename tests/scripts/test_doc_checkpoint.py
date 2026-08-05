@@ -60,5 +60,56 @@ class DocumentationCheckpointTests(unittest.TestCase):
         )
 
 
+class FeatureSurfaceCheckpointTests(unittest.TestCase):
+    """docs/FEATURES.md is the public mirror of the area matrices."""
+
+    def test_feature_matrix_change_requires_the_public_feature_page(self) -> None:
+        errors = doc_checkpoint.checkpoint_errors(
+            {".agents/feature-matrix.md", "docs/STATUS.md", "docs/BENCHMARKS.md"}
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("docs/FEATURES.md", errors[0])
+
+    def test_every_area_matrix_triggers_the_feature_page(self) -> None:
+        for path in (
+            ".agents/feature-matrix.md",
+            ".agents/model-matrix.md",
+            ".agents/backend-matrix.md",
+            ".agents/quantization-matrix.md",
+            "src/vllm/model_executor/models/qwen3.cpp",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(doc_checkpoint.is_feature_path(path))
+
+    def test_updating_the_feature_page_satisfies_the_obligation(self) -> None:
+        self.assertEqual(
+            doc_checkpoint.checkpoint_errors(
+                {
+                    ".agents/model-matrix.md",
+                    "docs/STATUS.md",
+                    "docs/BENCHMARKS.md",
+                    "docs/FEATURES.md",
+                }
+            ),
+            [],
+        )
+
+    def test_non_feature_code_does_not_owe_the_feature_page(self) -> None:
+        # A scheduler or kernel change is a checkpoint, but it moves no public
+        # feature row, so it must not be forced to touch FEATURES.md.
+        errors = doc_checkpoint.checkpoint_errors(
+            {"src/vt/cuda/matmul.cu", "docs/STATUS.md", "docs/BENCHMARKS.md"}
+        )
+        self.assertEqual(errors, [])
+
+    def test_feature_page_alone_is_not_a_general_checkpoint_surface(self) -> None:
+        # Editing FEATURES.md must not satisfy the STATUS/BENCHMARKS obligation.
+        errors = doc_checkpoint.checkpoint_errors(
+            {".agents/model-matrix.md", "docs/FEATURES.md"}
+        )
+        self.assertTrue(any("docs/STATUS.md" in e for e in errors), errors)
+        self.assertTrue(any("docs/BENCHMARKS.md" in e for e in errors), errors)
+
+
 if __name__ == "__main__":
     unittest.main()

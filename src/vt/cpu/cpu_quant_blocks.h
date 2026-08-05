@@ -31,6 +31,8 @@ inline constexpr int kKScaleSize = 12;
 // ggml-common.h:184, :241
 inline constexpr int kQK4_0 = 32;
 inline constexpr int kQK8_0 = 32;
+// ggml-common.h:204
+inline constexpr int kQK_MXFP4 = 32;
 
 // ggml-common.h:213-218
 struct BlockQ4_0 {
@@ -139,5 +141,28 @@ struct BlockIQ3_XXS {
   uint8_t qs[3 * kQK_K / 8];    // 96 — QK_K/4 grid indices + QK_K/8 scale+signs
 };
 static_assert(sizeof(BlockIQ3_XXS) == 98, "wrong iq3_xxs block size/padding");
+
+// ggml-common.h:386-392 block_iq2_s. 2.5625 bpw codebook quant: `qs` holds the
+// 8-bit grid-index low bytes (first QK_K/8 = 32) followed by the per-lane sign
+// bytes (last QK_K/8 = 32, applied DIRECTLY — no ksigns lookup, unlike IQ2_XXS);
+// `qh` supplies 2 high index bits per lane (10-bit index into the 1024-entry
+// iq2s_grid); `scales` packs two 4-bit sub-scales per 32-element sub-block.
+struct BlockIQ2_S {
+  uint16_t d;                   // super-block scale (ggml_half)
+  uint8_t qs[kQK_K / 4];        // 64 — 32 grid-index low bytes + 32 sign bytes
+  uint8_t qh[kQK_K / 32];       // 8 — 2 high index bits per lane
+  uint8_t scales[kQK_K / 32];   // 8 — 4-bit ls (low) + 4-bit ls (high) per ib32
+};
+static_assert(sizeof(BlockIQ2_S) == 82, "wrong iq2_s block size/padding");
+
+// ggml-common.h:204-209 block_mxfp4. OCP micro-scaling fp4: `e` is one E8M0
+// (power-of-two) shared exponent for the whole 32-element block, `qs` packs the
+// 32 e2m1 4-bit elements two-per-byte (element j in the low nibble of qs[j],
+// element j+16 in the high nibble — the same split-half packing q4_0 uses).
+struct BlockMXFP4 {
+  uint8_t e;                     // E8M0 shared exponent
+  uint8_t qs[kQK_MXFP4 / 2];     // 16 — packed e2m1 nibbles
+};
+static_assert(sizeof(BlockMXFP4) == 17, "wrong mxfp4 block size/padding");
 
 }  // namespace vt::cpu

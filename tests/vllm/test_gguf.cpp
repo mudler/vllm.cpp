@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -326,6 +327,93 @@ TEST_CASE("gguf: zero-tensor file with kvs only is fine") {
   vllm::GgufFile g = vllm::GgufFile::Open(tf.path());
   CHECK(g.Tensors().empty());
   CHECK(std::get<int32_t>(g.FindKv("k")->v) == -10);
+}
+
+namespace {
+// One shard of a synthetic split GGUF: split.no/count KVs + a single F32[4]
+// tensor whose first element is `v0`. Shard 00001 also carries the "real"
+// metadata (general.architecture), the others do not (mirrors llama.cpp
+// gguf-split, whose non-first shards hold only split.* KVs).
+std::string SplitShard(const std::string& tname, float v0, uint32_t split_no,
+                       uint32_t split_count, bool full_kv) {
+  gguf_test::GgufModelBuilder b;
+  if (full_kv) b.AddKv(gguf_test::StrKv("general.architecture", "deepseek4"));
+  b.AddKv(gguf_test::U32Kv("split.no", split_no));
+  b.AddKv(gguf_test::U32Kv("split.count", split_count));
+  std::string data(16, '\0');
+  for (int i = 0; i < 4; ++i) {
+    const float f = v0 + static_cast<float>(i);
+    std::memcpy(&data[i * 4], &f, 4);
+  }
+  b.AddTensor(tname, {4}, /*F32=*/0, data);
+  return b.Build();
+}
+// Writes two shard files under a unique split-named base and removes them on
+// destruction. `Open(shard1())` must transparently merge both.
+struct SplitFiles {
+  std::string base, s1, s2;
+  explicit SplitFiles(const std::string& tag) {
+    static int n = 0;
+    base = (std::filesystem::temp_directory_path() /
+            ("vllm_gguf_split_" + std::to_string(::getpid()) + "_" + tag + "_" +
+             std::to_string(n++)))
+               .string();
+    s1 = base + "-00001-of-00002.gguf";
+    s2 = base + "-00002-of-00002.gguf";
+  }
+  void Write(const std::string& a, const std::string& b) const {
+    std::ofstream(s1, std::ios::binary)
+        .write(a.data(), static_cast<std::streamsize>(a.size()));
+    std::ofstream(s2, std::ios::binary)
+        .write(b.data(), static_cast<std::streamsize>(b.size()));
+  }
+  ~SplitFiles() {
+    std::remove(s1.c_str());
+    std::remove(s2.c_str());
+  }
+};
+}  // namespace
+
+TEST_CASE("gguf: split shards are merged into one logical file") {
+  SplitFiles f("merge");
+  f.Write(SplitShard("t_shard0", 10.0f, 0, 2, /*full_kv=*/true),
+          SplitShard("t_shard1", 20.0f, 1, 2, /*full_kv=*/false));
+
+  vllm::GgufFile g = vllm::GgufFile::Open(f.s1);
+  // Both shards' tensors are visible through the merged file.
+  REQUIRE(g.Tensors().size() == 2);
+  // KV metadata comes from shard 00001.
+  const vllm::GgufValue* arch = g.FindKv("general.architecture");
+  REQUIRE(arch != nullptr);
+  CHECK(std::get<std::string>(arch->v) == "deepseek4");
+  // The shard-2 tensor's bytes stay readable — its mapping is kept alive by the
+  // primary shard's mapping (the keep-quant borrow contract), and OwnsSpan sees
+  // spans in either shard.
+  const vllm::GgufTensorInfo& t1 = g.Get("t_shard1");
+  float v0 = 0;
+  std::memcpy(&v0, t1.data, 4);
+  CHECK(v0 == 20.0f);
+  CHECK(g.OwnsSpan(t1.data, t1.nbytes));
+  const vllm::GgufTensorInfo& t0 = g.Get("t_shard0");
+  CHECK(g.OwnsSpan(t0.data, t0.nbytes));
+}
+
+TEST_CASE("gguf: VT_GGUF_NO_SPLIT opens a single shard as-is") {
+  SplitFiles f("nosplit");
+  f.Write(SplitShard("t_shard0", 1.0f, 0, 2, true),
+          SplitShard("t_shard1", 2.0f, 1, 2, false));
+  ::setenv("VT_GGUF_NO_SPLIT", "1", 1);
+  vllm::GgufFile g = vllm::GgufFile::Open(f.s1);
+  ::unsetenv("VT_GGUF_NO_SPLIT");
+  CHECK(g.Tensors().size() == 1);  // only shard 00001's tensor
+}
+
+TEST_CASE("gguf: split.count disagreeing with the -of- filename throws") {
+  SplitFiles f("mismatch");
+  // Filename says -of-00002, but the header KV claims 3 shards.
+  f.Write(SplitShard("t_shard0", 1.0f, 0, /*count=*/3, true),
+          SplitShard("t_shard1", 2.0f, 1, /*count=*/3, false));
+  CHECK_THROWS_AS(vllm::GgufFile::Open(f.s1), std::runtime_error);
 }
 
 TEST_CASE("ggml traits: standard table values") {

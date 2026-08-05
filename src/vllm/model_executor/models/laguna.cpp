@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,88 @@
 
 namespace vllm {
 namespace {
+
+// LEVER A: host f32→bf16 round-to-nearest-even (matches CUDA __float2bfloat16 used by the
+// on-device KV append, so the one-time prefill-KV migration rounds identically to the decode
+// appends). NaN is preserved as a quiet bf16 NaN; KV values never hit it in practice.
+inline uint16_t LagunaF32ToBf16Rne(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof(x));
+  if ((x & 0x7fffffffu) > 0x7f800000u) return static_cast<uint16_t>((x >> 16) | 0x0040u);
+  const uint32_t bias = ((x >> 16) & 1u) + 0x7fffu;  // round-to-nearest-even
+  return static_cast<uint16_t>((x + bias) >> 16);
+}
+
+// LEVER A (VT_LAGUNA_KV_BF16, default OFF — opt-in): store the resident/graph decode KV at
+// bf16 (see laguna.h k_dev16). Reads the SAME env var as the .cu-side LagunaKvBf16On() (a
+// process-global toggle; both read it independently, mirroring the other Laguna*Enabled gates).
+// Default OFF because a prior short-context attempt was a WASH + near-tie break; the win is
+// context-linear (see the .cu comment). MUST agree with the .cu reader — same var, same logic.
+inline bool LagunaKvBf16Enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_KV_BF16");
+    return (e != nullptr && e[0] == '1');  // default OFF; =1 opts in
+  }();
+  return on;
+}
+
+// Per-layer decode KV headroom (rows reserved above the prompt for generated tokens). Default
+// 1024 (unchanged behavior). VT_LAGUNA_KV_HEADROOM raises it so the two-length long-context
+// slope measurement (~2048 generated tokens) fits the fixed-capacity resident/graph KV without
+// tripping the capacity VT_CHECK — measurement infrastructure, not a lever.
+inline int64_t LagunaKvHeadroom() {
+  static const int64_t rows = [] {
+    const char* e = std::getenv("VT_LAGUNA_KV_HEADROOM");
+    if (e == nullptr) return static_cast<int64_t>(1024);
+    const long v = std::strtol(e, nullptr, 10);
+    return (v > 0) ? static_cast<int64_t>(v) : static_cast<int64_t>(1024);
+  }();
+  return rows;
+}
+
+// ── VT_LAGUNA_RESIDENT_BF16W (default ON; =0 opts back to the retag A/B arm):
+// stage the bf16/f32 decode projection
+// weights TRUE device-resident (a cudaMalloc'd copy, uploaded ONCE and reused every
+// step) instead of the unified-memory RETAG of the host bytes (w.View() +
+// .device=dev). On GB10 the GPU reads system-allocated (ATS/unified) memory slower
+// than cudaMalloc'd device memory — worst on the long-K low-parallelism o_proj GEMV
+// — so the retagged host weight caps per-call GEMV bandwidth below vLLM's (whose
+// weights are true device allocations). SAME bytes, SAME MatmulBT kernel, SAME
+// invocation ⇒ byte-exact by construction. Mirrors the canonical
+// dense_attn_block.h ResidentWeight d_dev seam and reuses OwnedTensor's existing
+// mutable d_dev cache. CAPTURE-SAFE: the first touch of each weight happens in the
+// eager cold warm-run (LagunaGraph gstate 0, before any BeginCapture — the same
+// place the Marlin residents build lazily), so the captured replay reads a stable
+// device pointer and does ZERO fresh cudaMalloc.
+inline bool LagunaResidentBf16WEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_RESIDENT_BF16W");
+    return (e == nullptr || e[0] != '0');  // default ON (parity enabler); =0 opts out
+  }();
+  return on;
+}
+
+// Device operand for a bf16/f32 projection weight consumed by a decode GEMV.
+// Lever ON: lazily upload w.bytes → w.d_dev (cudaMalloc + one H2D copy) and return
+// a view over the DEVICE copy. Lever OFF: the legacy unified-memory retag (host
+// bytes, device-tagged). The operand is byte-identical either way — only the
+// backing allocation (true-device vs system) differs. Starts from w.View() so the
+// shape/stride/nk/repack metadata is exactly the retag path's; only .data changes.
+inline vt::Tensor LagunaResidentBf16W(vt::Queue& q, const OwnedTensor& w, vt::Device dev) {
+  vt::Tensor t = w.View();
+  t.device = dev;
+  if (!LagunaResidentBf16WEnabled()) return t;  // legacy unified-memory retag (byte-identical)
+  if (!w.d_dev) {
+    vt::Backend& b = vt::GetBackend(dev);
+    const size_t nb = w.bytes.size();
+    void* p = b.Alloc(nb);
+    b.Copy(q, p, w.bytes.data(), nb);
+    vt::Backend* bk = &b;
+    w.d_dev = std::shared_ptr<void>(p, [bk](void* pp) { bk->Free(pp); });
+  }
+  t.data = w.d_dev.get();
+  return t;
+}
 
 // Decode an OwnedTensor (host bytes) to a flat f32 vector. Reference path handles
 // the two host dtypes a synthetic/dequantized tower carries: f32 and bf16.
@@ -1705,6 +1788,32 @@ inline bool LagunaTailFusedEnabled() {
   return on;
 }
 
+// ── VT_LAGUNA_SHARED_AUX: run the per-MoE-layer SHARED expert on a SECOND CUDA
+// stream, forked from the post-attn-norm hidden `hn` BEFORE the router GEMV, so
+// the (fp4-Marlin) shared expert overlaps the router GEMV + sigmoid_topk + routed
+// grouped-GEMM issued on the main stream. This mirrors vLLM's
+// MULTI_STREAM_OVERLAPPED (fused_moe/runner/shared_experts.py:125-129 fork from
+// the post-attn hidden, moe_runner.py:560-596,809 join before MoeCombine) — the
+// SAME machinery the 35B ships ON by default (ENG-MOE-SHARED-AUX,
+// qwen3_5.cpp:4408-4467). The routed grouped GEMM is low-occupancy on the GB10
+// (ncu: ~14% mem-SoL, 23% occ, 1 wave), so its spare SMs run the shared MLP
+// concurrently. DEFAULT ON: the in-situ GB10 A/B won it (byte-exact + real 2.34 ms/step
+// concurrency, net GPU-active +2.9%, 38.15->39.27 tok/s, ~92% of vLLM — parity-enablers-
+// ship-as-defaults). BYTE-EXACT: the two streams read the same `hn` and write
+// disjoint buffers (routed->doutb on main, shared->so on aux) joined before the
+// combine, so the result is bit-identical to the serial order; `=0` is the
+// same-binary rollback. Only meaningful in the fp4-shared arm (VT_LAGUNA_SHARED_FP4,
+// default ON), where the router GEMV is already SPLIT from the shared expert — the
+// EARLY fork the prior fused-GEMV attempt could not achieve. inline so a CPU build
+// (VT_MARLIN_NVFP4 off, graph excluded) does not -Wunused.
+inline bool LagunaSharedAuxEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_SHARED_AUX");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+
 bool LagunaCanRunResidentDecode(const LagunaParams& p, vt::Queue& q, const LagunaWeights& w,
                                 int64_t T) {
 #ifndef VT_MARLIN_NVFP4
@@ -1740,20 +1849,36 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
   // ONCE. Thereafter each token's K/V is appended ON-STREAM at dev_rows[l] (no host
   // std::vector insert, so no per-layer DrainQueue). Full-deck (no eviction) — the
   // decode_attn window mask handles sliding layers, and dev_first_pos stays frozen.
+  // LEVER A: allocate the KV at bf16 (half the DRAM) or f32 (byte-exact fallback), never both.
+  const bool kv_bf16 = LagunaKvBf16Enabled();
   if (!cache.resident_ready) {
-    cache.max_cap = pos + 1024;  // decode headroom (VT_CHECK guards; one-time zero-init)
-    cache.k_dev.assign(static_cast<size_t>(nlayers), {});
-    cache.v_dev.assign(static_cast<size_t>(nlayers), {});
+    cache.max_cap = pos + LagunaKvHeadroom();  // decode headroom (VT_CHECK guards; one-time zero-init)
     cache.dev_first_pos.assign(static_cast<size_t>(nlayers), 0);
     cache.dev_rows.assign(static_cast<size_t>(nlayers), 0);
+    if (kv_bf16) {
+      cache.k_dev16.assign(static_cast<size_t>(nlayers), {});
+      cache.v_dev16.assign(static_cast<size_t>(nlayers), {});
+    } else {
+      cache.k_dev.assign(static_cast<size_t>(nlayers), {});
+      cache.v_dev.assign(static_cast<size_t>(nlayers), {});
+    }
     for (int64_t l = 0; l < nlayers; ++l) {
       const size_t cap = static_cast<size_t>(cache.max_cap * kvdim);
-      cache.k_dev[static_cast<size_t>(l)].assign(cap, 0.0F);
-      cache.v_dev[static_cast<size_t>(l)].assign(cap, 0.0F);
       const std::vector<float>& kc = cache.k[static_cast<size_t>(l)];
       const std::vector<float>& vc = cache.v[static_cast<size_t>(l)];
-      std::copy(kc.begin(), kc.end(), cache.k_dev[static_cast<size_t>(l)].begin());
-      std::copy(vc.begin(), vc.end(), cache.v_dev[static_cast<size_t>(l)].begin());
+      if (kv_bf16) {  // one-time prefill migration with RNE cast (matches the on-device append)
+        cache.k_dev16[static_cast<size_t>(l)].assign(cap, 0);
+        cache.v_dev16[static_cast<size_t>(l)].assign(cap, 0);
+        std::vector<uint16_t>& kd = cache.k_dev16[static_cast<size_t>(l)];
+        std::vector<uint16_t>& vd = cache.v_dev16[static_cast<size_t>(l)];
+        for (size_t i = 0; i < kc.size(); ++i) kd[i] = LagunaF32ToBf16Rne(kc[i]);
+        for (size_t i = 0; i < vc.size(); ++i) vd[i] = LagunaF32ToBf16Rne(vc[i]);
+      } else {
+        cache.k_dev[static_cast<size_t>(l)].assign(cap, 0.0F);
+        cache.v_dev[static_cast<size_t>(l)].assign(cap, 0.0F);
+        std::copy(kc.begin(), kc.end(), cache.k_dev[static_cast<size_t>(l)].begin());
+        std::copy(vc.begin(), vc.end(), cache.v_dev[static_cast<size_t>(l)].begin());
+      }
       cache.dev_first_pos[static_cast<size_t>(l)] = cache.first_pos[static_cast<size_t>(l)];
       cache.dev_rows[static_cast<size_t>(l)] = static_cast<int64_t>(kc.size()) / kvdim;
     }
@@ -1816,8 +1941,7 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
     vt::Tensor ab = vt::Tensor::Contiguous(abf.data(), DType::kBF16, dev, {1, K});
     vt::CastBf16(q, ab, xf);
     vt::Tensor ot = vt::Tensor::Contiguous(out, DType::kF32, dev, {1, N});
-    vt::Tensor wt = w.View();
-    wt.device = dev;
+    vt::Tensor wt = LagunaResidentBf16W(q, w, dev);  // VT_LAGUNA_RESIDENT_BF16W: device copy vs retag
     vt::MatmulBT(q, ot, ab, wt);
   };
 
@@ -1872,11 +1996,19 @@ std::vector<float> LagunaForwardResidentDecode(const LagunaWeights& weights, vt:
     // insert/eviction. Full-deck: dev_first_pos frozen, decode_attn's window mask evicts.
     const int64_t dr = cache.dev_rows[static_cast<size_t>(l)];
     VT_CHECK(dr < cache.max_cap, "laguna resident decode: KV capacity exceeded (raise max_cap)");
-    float* kdev = cache.k_dev[static_cast<size_t>(l)].data();
-    float* vdev = cache.v_dev[static_cast<size_t>(l)].data();
-    const size_t rowbytes = static_cast<size_t>(kvdim) * sizeof(float);
-    vt::GetBackend(dev).Copy(q, kdev + dr * kvdim, knp, rowbytes);
-    vt::GetBackend(dev).Copy(q, vdev + dr * kvdim, vnp, rowbytes);
+    // LEVER A: the cache is bf16 (k_dev16) or f32 (k_dev); pass its base to the kernels via
+    // float* (address pun for bf16 — the launchers read the env and the kernels reinterpret).
+    float* kdev = kv_bf16 ? reinterpret_cast<float*>(cache.k_dev16[static_cast<size_t>(l)].data())
+                          : cache.k_dev[static_cast<size_t>(l)].data();
+    float* vdev = kv_bf16 ? reinterpret_cast<float*>(cache.v_dev16[static_cast<size_t>(l)].data())
+                          : cache.v_dev[static_cast<size_t>(l)].data();
+    if (kv_bf16) {  // append CASTS f32→bf16 on device at host row offset dr (no shared device int)
+      LAG->append_kv_row_cast(q, kdev, vdev, knp, vnp, kvdim, dr);
+    } else {  // f32: raw f32→f32 Copy at the byte offset (byte-exact, unchanged path)
+      const size_t rowbytes = static_cast<size_t>(kvdim) * sizeof(float);
+      vt::GetBackend(dev).Copy(q, kdev + dr * kvdim, knp, rowbytes);
+      vt::GetBackend(dev).Copy(q, vdev + dr * kvdim, vnp, rowbytes);
+    }
     const int64_t rows = dr + 1;
     const int64_t fp = cache.dev_first_pos[static_cast<size_t>(l)];
     // LEVER 1: the fused GEMV already produced g (glp -> qkvg_buf); only the split
@@ -2022,6 +2154,11 @@ struct LagunaGraph {
   // each layer needs its OWN persistent buffer (a shared one would be overwritten
   // by the next layer before Step() drains it).
   std::vector<std::vector<float>> cache_k, cache_v, qkvg;
+  // LEVER A (VT_LAGUNA_KV_BF16): bf16 alternative to cache_k/cache_v (half the KV DRAM,
+  // matching vLLM). Only one of the pair is allocated per run (env-gated); the f32 path is
+  // byte-identical when off. bf16 bits (uint16_t) passed to the kernels via the float* param.
+  std::vector<std::vector<uint16_t>> cache_k16, cache_v16;
+  bool kv_bf16 = false;  // resolved in the ctor from LagunaKvBf16Enabled()
   // persistent per-layer f32 norms/bias — pre-converted ONCE (kills per-token ReadF32
   // + the stack-baked-pointer hazard).
   std::vector<std::vector<float>> input_norm_f, q_norm_f, k_norm_f, post_norm_f, moe_bias_f;
@@ -2057,6 +2194,17 @@ struct LagunaGraph {
   // ride LagunaSharedExpertMarlinInto (no bf16 shared weights read). Set in the ctor
   // init-list (depends on the ctor's weights arg).
   const bool shared_fp4;
+  // VT_LAGUNA_SHARED_AUX: the aux stream + fork/join events for the shared-expert
+  // overlap (ENG-MOE-SHARED-AUX mirror). Created in the ctor — BEFORE any capture —
+  // so the stream/events exist when the gstate-1 region is captured; the gstate-0
+  // eager warm-run issues the aux shared expert once (building its fp4 Marlin
+  // residents + warming AuxPool) so the captured replay does zero cudaMalloc. Only
+  // armed when VT_LAGUNA_SHARED_AUX=1 AND the fp4-shared arm is active AND the
+  // backend has a second stream (SupportsAuxStream). Serial (no fork) otherwise.
+  bool shared_aux = false;
+  vt::Queue aux_q{};      // the shared-expert stream (plain default-priority, like vLLM)
+  vt::Event aux_fork{};   // recorded on main; aux waits it (hn ready — the fork point)
+  vt::Event aux_done{};   // recorded on aux after the shared MLP; main waits it (join)
   std::vector<int64_t> argmax_id;
   int32_t last_sampled = -1;
   void* graph = nullptr;
@@ -2095,22 +2243,38 @@ struct LagunaGraph {
                "< sliding window 512); the per-layer ring-buffer graph is Brick A2b");
     }
     kv_rows = rows0;
-    max_cap = rows0 + 1024;  // decode headroom
+    max_cap = rows0 + LagunaKvHeadroom();  // decode headroom (VT_LAGUNA_KV_HEADROOM for ~2k slope)
     // persistent per-layer KV seeded from the host prefill KV; per-layer fused
     // q|k|v|g new-row scratch (LEVER 1). Each qkvg[l] is sized to the layer's own
     // N_total = qdim_l + 2*kvdim + Hq_l; its k/v sub-ranges are the new-row scratch
     // Step() drains between replays.
-    cache_k.assign(static_cast<size_t>(nlayers), {});
-    cache_v.assign(static_cast<size_t>(nlayers), {});
+    // LEVER A: bf16 or f32 KV, never both (env-gated; f32 byte-identical when off).
+    kv_bf16 = LagunaKvBf16Enabled();
     qkvg.assign(static_cast<size_t>(nlayers), {});
+    if (kv_bf16) {
+      cache_k16.assign(static_cast<size_t>(nlayers), {});
+      cache_v16.assign(static_cast<size_t>(nlayers), {});
+    } else {
+      cache_k.assign(static_cast<size_t>(nlayers), {});
+      cache_v.assign(static_cast<size_t>(nlayers), {});
+    }
     for (int64_t l = 0; l < nlayers; ++l) {
       const size_t cap = static_cast<size_t>(max_cap * kvdim);
-      cache_k[static_cast<size_t>(l)].assign(cap, 0.0F);
-      cache_v[static_cast<size_t>(l)].assign(cap, 0.0F);
       const std::vector<float>& kc = cache.k[static_cast<size_t>(l)];
       const std::vector<float>& vc = cache.v[static_cast<size_t>(l)];
-      std::copy(kc.begin(), kc.end(), cache_k[static_cast<size_t>(l)].begin());
-      std::copy(vc.begin(), vc.end(), cache_v[static_cast<size_t>(l)].begin());
+      if (kv_bf16) {  // one-time prefill migration with RNE cast (matches append_kv_row)
+        cache_k16[static_cast<size_t>(l)].assign(cap, 0);
+        cache_v16[static_cast<size_t>(l)].assign(cap, 0);
+        std::vector<uint16_t>& kd = cache_k16[static_cast<size_t>(l)];
+        std::vector<uint16_t>& vd = cache_v16[static_cast<size_t>(l)];
+        for (size_t i = 0; i < kc.size(); ++i) kd[i] = LagunaF32ToBf16Rne(kc[i]);
+        for (size_t i = 0; i < vc.size(); ++i) vd[i] = LagunaF32ToBf16Rne(vc[i]);
+      } else {
+        cache_k[static_cast<size_t>(l)].assign(cap, 0.0F);
+        cache_v[static_cast<size_t>(l)].assign(cap, 0.0F);
+        std::copy(kc.begin(), kc.end(), cache_k[static_cast<size_t>(l)].begin());
+        std::copy(vc.begin(), vc.end(), cache_v[static_cast<size_t>(l)].begin());
+      }
       const LayerC& c = lc[static_cast<size_t>(l)];
       // The graph always fuses (NVFP4-arm-only path); the loader must have built
       // the stacked projections. Fail LOUDLY here rather than mis-slice at replay.
@@ -2171,9 +2335,30 @@ struct LagunaGraph {
     doutb_bf16.assign(static_cast<size_t>(H), 0);  // VT_LAGUNA_TAIL_FUSED reuse buffer
     eids32.assign(static_cast<size_t>(topk), 0);
     argmax_id.assign(1, 0);  // VT_LAGUNA_ONDEV_SAMPLE token buffer (device-accessible)
+    // VT_LAGUNA_SHARED_AUX: create the aux stream + fork/join events NOW (ctor runs
+    // before any BeginCapture). Only in the fp4-shared arm — the bf16 arm fuses the
+    // shared gate/up INTO the router GEMV (router_shared_gu), so there is no split
+    // shared expert to hand to a second stream. SupportsAuxStream is false on non-CUDA
+    // backends (the graph itself is CUDA-only, but keep the guard honest).
+    if (LagunaSharedAuxEnabled() && shared_fp4) {
+      vt::Backend& b = vt::GetBackend(dev);
+      if (b.SupportsAuxStream()) {
+        aux_q = b.CreateQueue();
+        aux_fork = b.CreateEvent();
+        aux_done = b.CreateEvent();
+        shared_aux = true;
+      }
+    }
   }
   ~LagunaGraph() {
-    if (graph != nullptr && qp != nullptr) vt::GetBackend(qp->device).DestroyGraph(graph);
+    if (qp == nullptr) return;
+    vt::Backend& b = vt::GetBackend(qp->device);
+    if (graph != nullptr) b.DestroyGraph(graph);
+    if (shared_aux) {
+      b.DestroyEvent(aux_fork);
+      b.DestroyEvent(aux_done);
+      b.DestroyQueue(aux_q);
+    }
   }
   LagunaGraph(const LagunaGraph&) = delete;
   LagunaGraph& operator=(const LagunaGraph&) = delete;
@@ -2188,8 +2373,7 @@ struct LagunaGraph {
     vt::Tensor ab = vt::Tensor::Contiguous(abf.data(), vt::DType::kBF16, dev, {1, K});
     vt::CastBf16(q, ab, xf);
     vt::Tensor ot = vt::Tensor::Contiguous(out, vt::DType::kF32, dev, {1, N});
-    vt::Tensor wv = wt.View();
-    wv.device = dev;
+    vt::Tensor wv = LagunaResidentBf16W(q, wt, dev);  // VT_LAGUNA_RESIDENT_BF16W
     vt::MatmulBT(q, ot, ab, wv);
   }
 
@@ -2209,8 +2393,7 @@ struct LagunaGraph {
     vt::Queue& q = *qp;
     vt::Tensor ab = vt::Tensor::Contiguous(hn_bf16.data(), vt::DType::kBF16, dev, {1, K});
     vt::Tensor ot = vt::Tensor::Contiguous(out, vt::DType::kF32, dev, {1, N});
-    vt::Tensor wv = wt.View();
-    wv.device = dev;
+    vt::Tensor wv = LagunaResidentBf16W(q, wt, dev);  // VT_LAGUNA_RESIDENT_BF16W
     vt::MatmulBT(q, ot, ab, wv);
   }
 
@@ -2309,8 +2492,13 @@ struct LagunaGraph {
       }
       // GRAPH decode attention: cache_k[l][0..len) + kn/vn as the new row, with
       // len/pos read from the DEVICE buffers. first_pos=0 (uniform, P<512).
-      LAG->decode_attn_gqa_g(q, attn.data(), qvp, cache_k[static_cast<size_t>(l)].data(),
-                             cache_v[static_cast<size_t>(l)].data(), kn, vn, c.Hq, Hkv, Dh, c.group,
+      // LEVER A: the cache base is bf16 (cache_k16) or f32 (cache_k), passed via float* (bf16
+      // is an address pun — the launcher reads the env and the kernels reinterpret to bf16).
+      float* ckl = kv_bf16 ? reinterpret_cast<float*>(cache_k16[static_cast<size_t>(l)].data())
+                           : cache_k[static_cast<size_t>(l)].data();
+      float* cvl = kv_bf16 ? reinterpret_cast<float*>(cache_v16[static_cast<size_t>(l)].data())
+                           : cache_v[static_cast<size_t>(l)].data();
+      LAG->decode_attn_gqa_g(q, attn.data(), qvp, ckl, cvl, kn, vn, c.Hq, Hkv, Dh, c.group,
                              /*first_pos=*/0, c.window, scale, len_buf.data(), pos_buf.data(),
                              glue_fused ? glp : nullptr);  // L1: fold softplus out-gate
       // LEVER A: append this token's post-RoPE K (kn) and raw V (vn) into the growing
@@ -2318,8 +2506,7 @@ struct LagunaGraph {
       // replay host Copy launches into the captured graph. Runs after decode_attn_gqa_g
       // consumed kn/vn (slot len is outside its [0,len) cache read ⇒ no intra-replay RAW;
       // the write is seen by the NEXT replay's attention via same-stream ordering).
-      LAG->append_kv_row(q, cache_k[static_cast<size_t>(l)].data(),
-                         cache_v[static_cast<size_t>(l)].data(), kn, vn, kvdim, len_buf.data());
+      LAG->append_kv_row(q, ckl, cvl, kn, vn, kvdim, len_buf.data());
       // g was produced by the fused GEMV (glp -> qkvg[l]); untouched until here.
       if (!glue_fused)  // L1 off => separate softplus out-gate pass
         LAG->softplus_head_gate(q, attn.data(), glp, c.Hq, Dh);
@@ -2351,6 +2538,26 @@ struct LagunaGraph {
         // VT_LAGUNA_MOE_ONECAST: cast hn→bf16 ONCE here and feed the persistent buffer to the
         // router GEMM + routed Marlin + shared Marlin (each else-cast the SAME hn otherwise).
         const void* hnb = moe_onecast ? static_cast<const void*>(hn_bf16.data()) : nullptr;
+        // ── VT_LAGUNA_SHARED_AUX FORK ─────────────────────────────────────────────
+        // Issue the FULL fp4 shared expert on the aux stream NOW — forked from `hn`
+        // (the post-attn-norm hidden) BEFORE the main-stream router GEMV — so it runs
+        // concurrently with router+sigmoid_topk+routed grouped GEMM. This is the EARLY
+        // fork vLLM does (shared_experts.py:125-129: record on main, aux waits, aux runs
+        // the shared MLP). The aux path reads `hn` (f32) and does its OWN hn->bf16 cast
+        // (hnb=nullptr) rather than the main-stream hn_bf16 — deterministic truncation of
+        // the same hn ⇒ byte-identical `so`, and it removes the only main->aux data
+        // dependency, so the aux path waits ONLY the fork point (hn ready). Its scratch is
+        // drawn from AuxPool (disjoint from the main routed Pool blocks) so the two
+        // concurrent streams never alias a live block.
+        const bool do_aux = shared_aux;  // shared_aux already implies shared_fp4
+        if (do_aux) {
+          vt::Backend& b = vt::GetBackend(dev);
+          b.RecordEvent(aux_fork, q);          // event0.record() on the main stream (hn ready)
+          b.QueueWaitEvent(aux_q, aux_fork);   // aux waits event0 before reading hn
+          ActivePoolScope guard(&AuxPool());   // shared scratch from AuxPool (see device_pool.h)
+          LagunaSharedExpertMarlinInto(aux_q, lw.moe, hn.data(), H, so.data());  // fp4 shared on aux
+          b.RecordEvent(aux_done, aux_q);      // event1.record() on the aux stream (join target)
+        }
         if (moe_onecast) CastHnBf16(hn.data());
         if (shared_fp4) {
           if (moe_onecast) GemmBf16Pre(rsg.data(), lw.moe.router, E, H);  // router only
@@ -2373,11 +2580,19 @@ struct LagunaGraph {
         LagunaMoeResidentMarlinInto(q, lw.moe, hn.data(), moe_I, H, E, eids32.data(), topw.data(),
                                     topk, doutb.data(), hnb, routed_bf16);
         if (shared_fp4) {
-          LagunaSharedExpertMarlinInto(q, lw.moe, hn.data(), H, so.data(), hnb);  // fp4 shared
+          // When do_aux, the shared expert was already issued on the aux stream above;
+          // otherwise run it serially on the main stream here (fp4 shared).
+          if (!do_aux)
+            LagunaSharedExpertMarlinInto(q, lw.moe, hn.data(), H, so.data(), hnb);
         } else {
           SiluMul(dact.data(), sgp, sup, moe_I);
           GemmBf16(so.data(), lw.moe.shared_down, dact.data(), H, moe_I);
         }
+        // ── VT_LAGUNA_SHARED_AUX JOIN ─────────────────────────────────────────────
+        // Make the main stream wait for the aux shared MLP (event1.wait) so the combine
+        // below reads a fully-computed `so`. Both the routed path (main) and the shared
+        // path (aux) are now complete → the combine result is byte-identical to serial.
+        if (do_aux) vt::GetBackend(dev).QueueWaitEvent(q, aux_done);
         // LEVER A: hidden += routed + shared; hn = rms_norm(hidden)*next_norm in ONE node
         // (byte-exact vs AddInto(doutb) + FusedAddNorm(so)). Only in the glue-fused regime
         // (the split path is what it replaces); =0 restores the two-node split.
@@ -2409,10 +2624,12 @@ struct LagunaGraph {
     if (!glue_fused)  // L4: fused path already produced hn=norm(hidden,final_norm) in the
                       // last layer's Pair-2 tail (next_norm==final_norm_f when l+1==nlayers)
       LAG->rms_norm_seq(q, hn.data(), hidden.data(), final_norm_f.data(), 1, H, eps, true);
-    if (w->lm_head.dtype == vt::DType::kBF16)
-      LAG->lm_head_gemv(q, logits.data(),
-                        reinterpret_cast<const void*>(w->lm_head.bytes.data()), hn.data(), Vsz, H);
-    else
+    if (w->lm_head.dtype == vt::DType::kBF16) {
+      // VT_LAGUNA_RESIDENT_BF16W: stream the ~616 MB lm_head from a true device copy
+      // (uploaded once in the gstate-0 warm-run) instead of the unified host bytes.
+      vt::Tensor lmw = LagunaResidentBf16W(q, w->lm_head, dev);
+      LAG->lm_head_gemv(q, logits.data(), lmw.data, hn.data(), Vsz, H);
+    } else
       GemmBf16(logits.data(), w->lm_head, hn.data(), Vsz, H);
     // VT_LAGUNA_ONDEV_SAMPLE: greedy argmax the logits ON-DEVICE into argmax_id (the next
     // step's input token). vt::GreedyArgmax uses a two-pass reduction with a LOWEST-index

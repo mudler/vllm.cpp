@@ -34580,3 +34580,1266 @@ No model, kernel, runtime default, CUDA path, correctness lifecycle, or
 benchmark headline changed. Performance is NOT APPLICABLE. Next external gate:
 push the checkpoint through the Ordino action-request path and confirm both
 hosted sanitizer jobs before removing their first-survey `continue-on-error`.
+
+## 2026-08-03 - MLX system-header dependency boundary
+
+LocalAI Darwin consumer run `30783379823` showed that translation-unit warning
+flags and pragmas did not durably isolate AppleClang diagnostics emitted by MLX
+0.29.3 headers from vllm.cpp's target-wide `-Werror`. The MLX library and its
+public includes are now owned by a dedicated imported CMake target, with the
+include directory explicitly present in both the normal and SYSTEM interface.
+The provider links that dependency target and carries no diagnostic pragma.
+
+A RED-first focused regression configures a synthetic MLX dependency whose
+header emits Clang's GNU-folding warning: the dependency warning must compile,
+while the identical warning in project source must remain fatal. This is build
+portability only. Local structural checks pass; Darwin consumer CI remains the
+binding AppleClang verification.
+
+<!-- state-order:enforced-below -->
+
+## Protocol substrate repair: NOW.md resume digest, enforced state ordering, doc-obligation contract
+<!-- state: 2026-08-04T17:00 -->
+
+An audit of AGENTS.md and `.agents/` found the RULES sound and well enforced (8
+CI checkers, each with a mutation test) but the SUBSTRATE decayed: the two
+primitives autonomy rests on -- cold-resume and "what do I do next" -- had both
+stopped working. Three repairs land here; the rest are queued in NOW.md.
+
+1. **Cold-resume was unsound.** `state.md` declares "append; newest last" and
+   AGENTS.md sends every cold session to the tail, but union-merged appends from
+   parallel worktrees had interleaved it: the last 40 dated entries ran
+   `07-29 x19, 07-30 x11, 07-27 x4, 07-28, 07-29, 07-31 x2, 08-01 x2`. Reading
+   the tail returned a jumble that both included stale entries and omitted
+   recent ones. Fixed by a sortable `<!-- state: YYYY-MM-DD -->` anchor per
+   entry below a one-time enforcement marker (the 34.5k lines of prior history
+   stay frozen and exempt), gated by `scripts/check-state-order.py`, with
+   `scripts/sort-state-tail.py --apply` as the mechanical merge repair.
+
+2. **No cheap entry point.** The files a cold session was told to read are the
+   largest in the repo: `state.md` 2.5 MB, `parity-ledger.md` 2.0 MB,
+   `coordination.md` 769 KB, `roadmap_v1.md` 281 KB (portfolio table at line
+   463, under 462 lines of 2026-07-18 narrative). Added `.agents/NOW.md`: a
+   100-line, rewritten-in-place digest of live claims, current gate and next
+   actions, gated by `scripts/check-now-current.py` for both budget and
+   freshness -- any change appending to `state.md` must refresh it in the same
+   change, since that append is what moves what is live.
+
+3. **The operating manual contradicted the checker.** `workflow.md` step 6 still
+   required a README update at every checkpoint and described
+   `check-doc-checkpoint.py` as enforcing "README.md and docs/BENCHMARKS.md",
+   while the checker had moved to `PUBLIC_CHECKPOINTS = (docs/STATUS.md,
+   docs/BENCHMARKS.md)` and AGENTS.md restricted README to headline shifts. An
+   agent following the manual did precisely what the migration removed. Fixed,
+   and the class is now gated: both normative documents carry an identical
+   machine-readable doc-obligation contract block, asserted equal to the checker
+   constants by `scripts/check-protocol-consistency.py`.
+
+Also surfaced, and NOT yet fixed: the era-rollover directive in AGENTS.md is
+currently UNEXECUTABLE for `parity-ledger.md`. `check-agent-record.py` requires
+every `DONE` row to carry an exact LINE anchor into that file
+(`EVIDENCE_ANCHOR_FILES`, 43 live references), so freezing it under
+`completed/` silently invalidates the evidence graph. Re-anchoring `DONE`
+evidence by ledger ROW ID instead of line number is the prerequisite, and it is
+recorded as the blocker in NOW.md rather than worked around.
+
+No source, kernel, model, gate, benchmark or lifecycle state changed.
+
+## Claim/lifecycle triage against the code: 28 rows out of ACTIVE, 31 claims retired
+<!-- state: 2026-08-04T18:30 -->
+
+Developer ground truth: only the **DeepSeek and Laguna speed-parity** tracks are
+in flight; the rest of the state was to be derived from the code.
+
+**Correction first.** The "187 `ACTIVE` + 79 `SPIKE`" figure published earlier
+today was a naive grep counting prose mentions. Parsed from the tables the real
+figure is **106 `ACTIVE` + 46 `SPIKE` of 653 rows**. STATUS and NOW are corrected.
+
+**What moved.** A row moved only if it ALREADY carried both an exact code anchor
+and an exact test/evidence anchor, and only to `ANCHOR-BACKFILL` ("legacy code
+exists but the evidence contract is incomplete; cannot count as `DONE`"), which
+never over-claims -- promotion to `DONE` requires a gated change, the correct
+direction of travel. 42 rows qualified; 14 were held back because they shared a
+claim line with rows that did not qualify, and stripping one ID out of a prose
+cell (`` `A`, `B`, `C` `` -> `` , , `C` ``) destroys the cell's meaning. So a
+claim retires whole or not at all: **28 rows moved, 31 claims retired** verbatim
+into `.agents/completed/claims-era1-2026-08-04.md`, coordination.md lost 31
+whole lines and gained zero, and no claim was lost (189 -> 158 live + 31
+archived).
+
+**Also repaired:** the engine lifecycle summary was recomputed from real
+per-area states. Its per-area `SPIKE` counts had drifted from the rows because
+`check_engine_summary` gates only the `Total` line -- another instance of the
+pattern that unenforced surfaces drift.
+
+**What did NOT move, and why.** 124 rows remain `SPIKE`/`ACTIVE`. They lack a
+code or test anchor, and every honest destination (`ANCHOR-BACKFILL`, `PARTIAL`,
+`GATING`, `DONE`) is in `EVIDENCED_STATES` and requires those anchors.
+Fabricating them to clear the board would be the exact dishonesty the record
+exists to prevent, so they are left alone and reported as the backfill queue.
+
+**Root cause, now named.** The lifecycle has **no zero-cost parking state**. A
+landed but unowned row has nowhere cheap to go: `INVENTORIED` would lie about
+the code, and every evidenced state costs anchor work. So rows rot in `ACTIVE`,
+which is why 106 of them accumulated. Two ways out, for the developer to pick:
+do the anchor backfill row by row, or add an explicit unowned/dormant state with
+no anchor requirement. Recorded in NOW.md, not decided here.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Record-surface compaction: roadmap preamble archived, STATUS ratcheted, AGENTS.md tiered
+<!-- state: 2026-08-04T20:00 -->
+
+The three remaining shape items from the 2026-08-04 audit.
+
+**Roadmap.** 484 lines of run-by-run chronology sat ABOVE the portfolio table,
+which AGENTS.md's compaction directive explicitly forbids, so the roadmap could
+not answer "what next" without first reading a 2026-07-18 story. Moved verbatim
+to `completed/roadmap-v1-preamble-2026-07-18..2026-08-03.md` (links rebased one
+level); `roadmap_v1.md` is 803 -> 345 lines with the table at line 27. The
+replacement is a current-position block that also NAMES the known staleness: the
+order-0 row is still framed against vLLM v0.25.0 while the pin is 0.26.
+
+**STATUS ratchet, not budget.** `docs/STATUS.md` was the only public surface
+with no size gate, in precisely the shape BENCHMARKS.md was in before its
+conversion: 291,094 chars, 91 paragraphs over the 700-char prose budget, 47
+cells over 220 chars, longest cell 16,181 chars. A hard budget would either fail
+on landing or push detail somewhere worse, and this page is itself where
+BENCHMARKS forensics were told to go. So `check-public-doc-tables.py` gained a
+RATCHET pinned to today's measurements across chars/sections/long-paragraphs/
+oversized-cells: the page may only SHRINK. Same mechanism as the device-leakage
+DSR ratchet. The real compaction is still owed; lowering the ratchet is the gate
+closing. Six mutation tests cover both directions.
+
+**AGENTS.md tiered.** 697 lines of co-equal MUST directives is more than a
+session reliably holds, and with everything at equal weight rules get dropped
+arbitrarily rather than by priority. Now 286 lines: a T0 non-negotiables list of
+13 one-line rules, the doc-obligation contract (which the consistency gate
+requires in place), the commit protocol, TL;DR and index. Every directive body
+moved VERBATIM to the new live `.agents/directives.md` (508 lines), which is the
+binding text; nothing was reworded. A line-level diff proves all 600 substantive
+lines of the original survive in AGENTS.md + directives.md.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## CI: the two DIFF-scoped gates could be cancelled, leaving commit ranges unvalidated
+<!-- state: 2026-08-04T21:00 -->
+
+`documentation-checkpoint` and `commit-protocol-tag` are DIFF-scoped: each
+validates `github.event.before..github.sha` and NOTHING re-covers that range
+later, because the next push's `before` is this push's `sha`. Their own comments
+say so explicitly and state that they "deliberately carry NO concurrency group".
+
+They both carried one anyway: `ci-doc-${{ github.ref }}` and
+`ci-commit-${{ github.ref }}`, each with `cancel-in-progress: true`. Comment and
+code contradicted each other inside the same job block.
+
+Not theoretical. Observed twice in one day: pushing `0435746d` cancelled
+`cdec2d10`'s run, and pushing `39f29b0d` cancelled most of `0435746d`'s. Commit
+ranges that the two per-commit gates existed to cover went unvalidated, which is
+exactly the failure the comments warned about. `cdec2d10` in particular was the
+commit that HAD missed its `docs/BENCHMARKS.md` obligation, so the gate that
+would have caught it was cancelled before it could.
+
+Fix: both `concurrency:` blocks removed, so the diff-scoped gates always run to
+completion for their own range. They are a checkout plus a Python script, so
+always running them costs approximately nothing against a silently skipped gate.
+The tree-scoped jobs (agent-record, build/test, sanitizers, device-leakage,
+cuda-arch-features) keep their groups, which is correct: only the newest push to
+a ref is meaningful for a whole-tree assertion.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Anchor backfill, batch 1: 12 engine rows made precise, 10 more rows out of ACTIVE
+<!-- state: 2026-08-04T22:00 -->
+
+**A scripted derivation was tried FIRST and REJECTED.** The idea was to grep the
+tree for each row's backticked identifiers and cite where they land. It produced
+confident nonsense: three unrelated multimodal rows all resolved to the SAME
+line (`mla_attention.h:204`, token `Attention`), and rows resolved onto comments
+MENTIONING an upstream Python name (`_process_video_input`) rather than onto our
+implementation. Adding specificity filters (document frequency, shared-token
+rejection, duplicate-anchor rejection) improved it but did not fix the class:
+the identifiers these rows name are often upstream Python symbols or bare
+filenames, so grep finds prose about them, not the code. Technically true,
+semantically junk, and AGENTS.md requires an EXACT implementation anchor. The
+approach was abandoned rather than shipped.
+
+**What was actually done.** 25 rows already had a proven code anchor and named
+their test FILE in prose but without a line number. That is missing PRECISION,
+not missing evidence: the row already asserts the file. For 12 of them the file
+resolves and contains a real `TEST_CASE`, so the reference now carries the line.
+The line is chosen to match a test name the row itself QUOTES (word-overlap
+scored, first-case fallback only when nothing matches) - citing a file's first
+test when the row names a different one would be precise and wrong.
+`SERVE-RESPONSE-METRICS` now points at "records QUEUED/SCHEDULED/PREEMPTED
+engine-core events", `ENG-RUNNER-MODELSHAPE` at "full-attention-only KV config
+allocates without the GDN path". All 12 verified through the checker's own
+resolver. The other 13 were left alone: their cells name no resolvable test file
+(several are `-`, several are build-verified-only backend rows).
+
+**Knock-on.** With anchors present, 10 rows became movable and left `ACTIVE` for
+`ANCHOR-BACKFILL`, retiring 19 more claims (152 -> 133 claim lines). Remaining
+`SPIKE`/`ACTIVE`: 124 -> 114, concentrated in backend (36), model (31) and
+kernel (16) rows, which are the ones needing genuine per-row investigation
+rather than a precision fix.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Anchor backfill, batch 2: 19 model rows anchored on their registration + registry assertion
+<!-- state: 2026-08-04T23:00 -->
+
+Model rows carry a signal the generic identifier search lacked. Each names an
+ARCHITECTURE CLASS, and that exact string appears as a literal in one
+`REGISTER_VLLM_MODEL(tag, "Arch", factory, info)` call. That line IS the
+architecture's implementation entry point, so citing it is MEANINGFUL, not
+merely true - the distinction the abandoned batch-1 grep failed on.
+
+Two defects were found and fixed during the dry run, both the same failure mode
+as before:
+- the first pass anchored seven different rows on the SAME shared `TEST_CASE`
+  line. Fixed by citing the LITERAL occurrence instead, which is the per-arch
+  assertion `CHECK(has_arch("Glm4ForCausalLM"))` and unique by construction;
+- a "dedicated test file" filename bonus sent `GemmaForCausalLM` to a **gemma4**
+  test, and the multi-arch llama row cited **InternLM3**'s registration. Fixed
+  by dropping the fuzzy filename heuristic and sorting each row's architectures
+  so the one the ROW IS NAMED FOR wins.
+
+Anchors were spot-verified by reading the cited lines: `llama_registry.cpp:148`
+is `REGISTER_VLLM_MODEL(llama_dense, "LlamaForCausalLM", ...)` and
+`test_model_registry.cpp:89` is `CHECK(has_arch("LlamaForCausalLM"))`.
+
+19 rows anchored. 6 left alone because their architecture is NOT registered
+(ChatGLM, Glm, Glm4Moe, KimiLinear, Gemma4Unified, Voxtral) - there is no
+implementation to cite, and pointing at something adjacent would be the exact
+dishonesty this backfill exists to avoid. Those rows need a state decision, not
+an anchor.
+
+**A REAL ERROR CAUGHT BY A GATE, not by me.** The first apply moved the 15 model
+rows to `ANCHOR-BACKFILL` like every other row. `check-model-checklist.py`
+rejected it: `ANCHOR-BACKFILL` is NOT an allowed state under a `✅` support mark
+(allowed: `ACTIVE`/`DONE`/`GATING`/`PARTIAL`). Moving them would have silently
+DOWNGRADED THE PUBLIC SUPPORT CLAIM for 15 shipped, gated models - the opposite
+of the honesty this triage is for. Corrected to `PARTIAL`, which is exactly what
+these rows are: correctness-gated, speed-pending, missing modes explicit. The
+lifecycle rollup was recomputed from the real states. Lesson: a blanket
+"not in flight" demotion is NOT state-neutral; the target state has to be chosen
+per row against what the row publicly claims.
+
+**Knock-on:** 16 more rows left `ACTIVE` (15 model -> `PARTIAL`, 1 engine ->
+`ANCHOR-BACKFILL`), 10 more claims retired (133 -> 123 claim lines). Remaining
+`SPIKE`/`ACTIVE`: 114 -> 98, now backend 36, engine 26, kernel 16, model 16,
+quant 4.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Operator / helper-agent protocol ACCEPTED (design only, not yet enforced)
+<!-- state: 2026-08-04T23:45 -->
+
+User-directed. Two roles for concurrent sessions, written up as
+`.agents/specs/operator-helper-protocol.md`. `AGENTS.md` deliberately untouched
+until reviewed.
+
+**Motivated by two measured failures the same day, both structural:**
+(1) two sessions pushed to `main` minutes apart, both writing STATUS/BENCHMARKS/
+NOW, neither claiming anything in coordination.md, and a three-way merge
+SILENTLY produced a variant of the other session's binding performance numbers -
+no conflict, no marker, caught only by hashing the lines against origin/main;
+(2) the audit found 106 rows claiming "in flight" with nobody flying them,
+because claiming was free and un-expiring while releasing cost anchor work.
+
+**Decided by the user:** operator MAY drive features but only via sub-agents;
+role DERIVED from the environment where possible and ASKED only as fallback;
+claims become PR-DERIVED.
+
+**Key design choices, and why:**
+- the draft PR is opened at the START and IS the claim - a PR that appears only
+  at the end leaves a window with no visible reservation, which is exactly the
+  race above; and a claim that IS the work cannot outlive it, which is the
+  structural fix for the 106 stale rows;
+- branch `row/<ROW-ID>` makes the claim machine-derivable, so coordination.md
+  becomes a GENERATED report rather than a hand-maintained table;
+- "operator does features only via sub-agents" is enforced by PATH, not by
+  detecting authorship: feature code may reach `main` only through a merged
+  `row/*` PR (W1). The operator stays free to read diffs, run gates, resolve
+  conflicts and benchmark, because an operator who cannot touch anything cannot
+  review and becomes a rubber stamp;
+- a HARD rule that keyed records (STATUS/BENCHMARKS/FEATURES/NOW/matrices/
+  coordination) are NEVER three-way merged: take main's version wholesale,
+  re-apply your edit, verify the other side byte-identical. The failure mode is
+  silent, so discipline alone will not catch it;
+- READY-FOR-HELPER gate, because a helper picking an arbitrary row hits rows
+  whose state is a lie - 98 currently fail it, so the anchor backfill is the
+  practical prerequisite to helpers being useful at all.
+
+Constraints recorded: GPU is operator-serialized (contended benchmark = void);
+concurrent helpers are bounded by DISK, since each build dir is ~21 GB and
+ENOSPC has previously produced bogus test failures here.
+
+W1-W5 guards (role discipline, generated claims, ready-queue, PR template,
+AGENTS.md fold) are the implied work. Nothing is enforced yet. No source,
+kernel, model, gate, benchmark or capability mark changed.
+
+## Operator/helper protocol rev 2: role acquisition corrected — DECLARE, MATERIALIZE, then derive
+<!-- state: 2026-08-05T00:15 -->
+
+User-caught error in rev 1. The first draft made ENVIRONMENT-DERIVATION the
+primary way a session learns its role (primary checkout + lock = operator;
+worktree on `row/*` = helper). That is CIRCULAR for the common case the user
+named: an operator and several helper sessions all started from the SAME
+environment - same machine, same checkout, same branch. Nothing distinguishes
+them, and a helper only becomes environmentally recognisable AFTER it has taken
+a worktree and a branch, which is the very thing the role was supposed to decide.
+
+Acquisition and persistence are different problems:
+
+1. **Acquire = ASK.** Unavoidable: the information does not exist in the
+   environment yet. Cheap, once per session. This restores the user's original
+   instinct, which rev 1 wrongly argued down. My objection to asking (it does not
+   survive context compaction) was real but aimed at the WRONG problem - that is
+   about persistence, not acquisition.
+2. **Materialize = make the answer a fact.** Operator atomically takes
+   `.agents/operator.lock` (create-exclusive, so a second self-declared operator
+   FAILS instead of racing); helper immediately creates worktree + `row/<ROW-ID>`
+   branch + draft PR. After this the session is externally distinguishable.
+3. **Persist = re-derive, never re-ask.** Session-scoped role marker outside the
+   repo; a compacted session reads the marker and lock rather than guessing.
+4. **Enforce = ride the mandatory preflight.** `agent-preflight.sh` resolves and
+   PRINTS the role every run and FAILS when a session has not declared one. That
+   is what keeps the role from being a prose convention: the check sits inside a
+   tool both roles must already run at session start and before every commit.
+
+The lock doubles as mutual exclusion, not just a label: if held, this session
+CANNOT be operator whatever it was told, and should offer the helper role
+instead. Multiple helpers from one environment are collision-free because each
+worktree is named for its row and the row is already exclusive via its PR.
+
+Added W0 (role machinery) ahead of W1-W5. Still design-only; nothing enforced.
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## W0 + W1 LANDED: agent role machinery and role discipline
+<!-- state: 2026-08-05T01:00 -->
+
+**W0 — `scripts/agent-role.py`.** Declare, materialize, re-derive. Two identities
+were MEASURED rather than assumed before building on them: `PPID` is stable
+across tool calls within a session (3110653 twice) and differs between concurrent
+sessions, so it is the session id fallback under `VLLM_CPP_AGENT_SESSION`; and
+`git rev-parse --git-dir` is per-worktree (`.git/worktrees/<name>`), so a
+materialized helper is distinguishable with no bookkeeping.
+
+Design points that matter:
+- the operator lock lives in the git COMMON dir, not the work tree - shared by
+  every worktree (the right scope for "one operator per repo") and impossible to
+  commit by accident. This deviates from rev 2's `.agents/operator.lock`; spec
+  updated;
+- the lock is `O_CREAT|O_EXCL`, so a SECOND self-declared operator FAILS and is
+  told to take the helper role, rather than both racing on main;
+- a marker written by a different session sharing the same checkout does NOT
+  resolve - the exact case that made pure environment-derivation circular;
+- an operator marker whose lock has vanished resolves as UNDECLARED, not as
+  operator (a mutation test caught this crashing instead; the early-return dict
+  was missing its `session` key);
+- stale locks are breakable after a 2 h TTL but the break is always LOGGED.
+
+**W1 — `scripts/check-role-discipline.py`.** Enforces the PATH, not authorship:
+feature code (`src/`, `include/`, `tests/`, `examples/`, `cmake/`,
+`CMakeLists.txt`) reaches main only through a merged `row/*` PR or a squash-merge
+carrying `(#N)`. Integration paths (`scripts/`, `.agents/`, `docs/`, `.github/`)
+are exempt BY DESIGN so the operator can fix a gate or repair the record without
+a round trip - an operator who cannot touch anything cannot review.
+
+**REPORT-ONLY, deliberately.** `ROLE_DISCIPLINE_SINCE` is `None`. The project
+pushes to main directly by explicit user policy, so switching this on
+retroactively would redden legitimate history. Set it to the cutover commit when
+the protocol is adopted. Same reasoning for preflight: it PRINTS the role every
+run and fails only under `--require-role`, so an undeclared session is visible
+before it is fatal.
+
+16 mutation tests cover both, including second-operator refusal, cross-session
+non-inheritance, stale-lock breaking, and each acceptance path for W1. Wired into
+CI (tree-scoped `agent-record` + the diff-scoped range job). No source, kernel,
+model, gate, benchmark or capability mark changed.
+
+## W2-W5 LANDED: generated claim view, helper queue, PR reviewability, protocol folded in
+<!-- state: 2026-08-05T02:00 -->
+
+**W2 - `scripts/claim-view.py`.** The claim table is now GENERATED from open PR
+state into a delimited block: an open `row/<ROW-ID>` PR IS the reservation,
+released by merging or closing. Split into `--apply` (queries `gh`) and
+`--check` (pure offline: block present, well-formed, row IDs real, inside a
+14-day TTL) so CI never needs the network. Ran against live PR state: 0 rows
+reserved, because the two open PRs are not `row/*` branches - correctly not
+counted. The legacy hand-maintained table stays ABOVE the block until cutover,
+because `check-agent-record.py` still requires every SPIKE/ACTIVE row's owner to
+appear there; deleting it now would strand 98 rows.
+
+**W3 - `scripts/ready-for-helper.py`.** Computes the pickable queue from the 5
+conditions. `--check` deliberately never asserts the queue is NON-empty - an
+empty queue is a true and useful answer - only that every row it WOULD offer
+satisfies every condition. Real result today: **4 pickable rows**, and the
+reasons the rest are not: 399 lack a runnable gate/evidence anchor, 371 lack a
+substantive spec, 31 do not name their hardware need. That is the measured size
+of the prerequisite work before helpers are useful.
+
+**W4 - PR template + `scripts/check-pr-size.py`.** The template forces the row
+ID, the evidence (what RAN and what it proves), an explicit speed-claim
+declaration, and an "honest gaps" section whose emptiness is itself a claim. The
+size cap (900 non-exempt lines) is ENFORCED on `row/*` PRs and only REPORTED on
+others, so pre-existing work is not retroactively punished for a rule it was not
+written under. Record and protocol paths are exempt: shrinking evidence to fit a
+line cap would be exactly the wrong incentive.
+
+**W5 - folded in.** `AGENTS.md` T0 gains two non-negotiables: know your role
+(declare -> materialize -> re-derive, with the draft PR as the claim), and NEVER
+three-way merge a keyed record. `.agents/workflow.md` gains step 0 (declare the
+role before anything else). The doc-obligation contract still matches, so
+`check-protocol-consistency.py` stays green.
+
+All wired into `agent-preflight.sh` and CI, plus a new PR-only `pr-size` job. 14
+more mutation tests (30 across W0-W5), covering stale-TTL rejection, unknown-row
+rejection, non-`row/*` branches being ignored, reserved rows leaving the queue,
+and the exempt/counted path split.
+
+**Still opt-in by design:** `ROLE_DISCIPLINE_SINCE` is None and preflight only
+fails on `--require-role`. Turning both on is the cutover decision, and it is the
+user's. No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Anchor backfill batch 3: test anchors generalized; CODE anchors abandoned as unautomatable
+<!-- state: 2026-08-05T03:00 -->
+
+Generalized the batch-1 precision pass to the form most rows actually use: a
+markdown link whose target is a `../src/` path carrying no `#L` fragment, as
+well as bare paths. 11 more rows gained a real test anchor (a verified `TEST_CASE`, matched
+to a test name the row itself quotes), across model/quant/kernel/backend.
+
+**CODE anchors abandoned, deliberately, after two attempts.** Automating them
+kept producing plausible-but-weak citations:
+- first pass: the file's first definition, which was usually the `namespace`
+  opener - in the right file, saying nothing;
+- second pass: prefer a definition naming a symbol the row names. Better
+  (`MultiModalHasher::HashImageRGB`, `VideoSmartResize`) but still wrong often
+  enough - a `void GeluTanh(...)` DECLARATION cited for a VISION-TOWER row, and
+  a `vt::RopeFromCache(...)` CALL SITE cited as an implementation.
+
+A weak anchor that PASSES the checker is worse than an absent one, because the
+row then LOOKS proven and nobody revisits it. So this batch writes test anchors
+only; code anchors are left for a per-row human pass. That is the third time
+today an automated shortcut was rejected on quality rather than shipped, and the
+pattern is consistent: test anchors automate well because `TEST_CASE` names are
+self-describing, code anchors do not because a row's subject rarely maps to one
+definition.
+
+**Knock-on:** 23 non-live rows are now fully anchored; 4 more left `ACTIVE` and
+18 further claims retired (123 -> 105 claim lines). Remaining `SPIKE`/`ACTIVE`:
+98 -> 94 (backend 36, engine 25, model 16, kernel 13, quant 4). Most fully
+anchored rows still cannot move because they share a claim line with rows that
+cannot - the whole-claim-or-nothing rule, which protects the prose cells.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Anchor backfill batch 4: manual pass, 11 hand-verified code anchors + a structural finding
+<!-- state: 2026-08-05T04:00 -->
+
+The manual pass over the remaining rows. 11 code anchors written, each chosen by
+READING the candidate and confirming it is a DEFINITION of the row's subject -
+`MultiModalHasher::HashImageRGB`, `Qwen3VLGetRopeIndex`, `class
+WhisperAudioProcessor`, `WhisperAudioEncoderForward`, `BeamSearchStep`,
+`SelectBestOf`, `StreamingParserEngine::feed`, `class RejectionSampler`,
+`DraftModelProposeGreedy`, the `DispatchPooler` ctor and
+`PoolingRunner::GetSupportedTasks`. Every cited line was verified in range before
+writing. Non-live rows fully anchored: 23 -> 30.
+
+**Rows deliberately left unanchored:** `ENG-MM-VISION-TOWER`, `KV-EVENTS`,
+`TOOLS-XGRAMMAR`, `SPEC-NGRAM` - their expected symbols do not exist under those
+names, so any citation would be a guess. They need someone who knows what those
+rows actually refer to.
+
+**STRUCTURAL FINDING - state changes are NOT safe here, anchors are.** The pass
+started by moving 6 verified-no-implementation rows (MACHETE, ALLSPARK,
+SCALEDMM-C2X, DISTRIBUTED-PP/EP/SP - all 0 files in src/include/cmake) out of
+SPIKE. Two things went wrong and both were caught by gates:
+1. `READY` was rejected: their spec exists but does NOT cover the spike contract,
+   so READY would have been a false claim. `INVENTORIED` is the honest state;
+2. `INVENTORIED` was then rejected too, because those rows share claim lines
+   (`CLAIM-CUDA-DATACENTER-SCOPE`, `CLAIM-CUDA-AMPERE-SCOPE`,
+   `CLAIM-SCALE-OUT-SPIKE`, `CLAIM-PARALLELISM-MODES-SPIKE`) with rows that are
+   still SPIKE/ACTIVE, and a claim retires whole or not at all.
+
+The claim graph is densely interlinked: a single claim like
+`CLAIM-CUDA-ARCH-EXPANSION` spans 8 arch rows, and `CLAIM-DEEPSEEK-V4-*` chains
+bind live DeepSeek rows to kernel rows. So the remaining rows cannot be moved
+row-by-row at all - they must be retired CLAIM-FAMILY at a time, which is a
+project-state decision (is this whole family still live?) rather than a records
+task. The 6 state changes were REVERTED; only the additive anchors were kept.
+
+That is the real blocker on finishing the backfill, and it is now named: not
+missing anchors, but claim families that must be closed as units.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Upstream-derived inventory, pass 1: the record answers that the record could not give
+<!-- state: 2026-08-05T05:00 -->
+
+User-directed: stop asking which stale claim families are dead, DERIVE it from
+the reference code. All three references are present locally and VERIFIED at the
+exact pins the record claims - vLLM `555967922` (our parity pin), SGLang
+`f63458b5be` (release/v0.5.15), llama.cpp `237ad9b96`. ds4 is not on this box
+(it lives on dgx), so its comparison is deferred rather than guessed.
+
+**Finding 1 - three arch rows are BELOW vLLM's floor.** vLLM's CMakeLists sets
+`CUDA_SUPPORTED_ARCHS` with a FLOOR of 7.5. Our `BACKEND-CUDA-SM060`, `SM061`
+and `SM070` rows track arches vLLM does not support at all. Under the standing
+MIRROR-vLLM directive they are out of scope - the first claim family closeable
+without asking anyone, and now a code-derived fact rather than a judgement.
+
+**Finding 2 - the COMP-* rows are REAL unported work, not dead.** Every one
+exists in vLLM's csrc at our pin (machete 12 files/13 refs, w4a8 13/9, mla
+39/14, allspark 6/5, scaled_mm_c2x 6/5, cutlass_moe 3/6). This CORRECTS
+yesterday's read: they have no implementation HERE precisely because they are
+unported UPSTREAM work. They stay open. Only `COMP-DEEPGEMM` needs re-scoping -
+0 files, 0 refs, it is not vLLM code but an external dependency. `COMP-FLASHMLA`
+exists as a separate package rather than csrc.
+
+**Finding 3 - all five parallelism modes are real upstream** (pipeline 11 files,
+expert 3, sequence 9, tensor 16, data 20). No `BACKEND-DISTRIBUTED-*` row is
+obsolete.
+
+**Finding 4, the most valuable - 62 upstream architectures have NO ROW AT ALL.**
+vLLM's registry defines 362 architectures; our model matrix names 300. The gap
+is invisible to the existing record because the record only tracks rows we
+created. Missing set is dominated by embedding/retrieval/encoder models
+(`BertForMaskedLM`, `BertForSequenceClassification`, `ColPaliForRetrieval`,
+`ColQwen3`, ...). The backfill was making 79 existing rows honest while 62
+architectures had no row to be honest about.
+
+Written up as `.agents/specs/upstream-derived-inventory-2026-08-05.md` with a
+W1-W4 plan whose FIRST item is making this enumeration reproducible
+(`scripts/upstream-inventory.py`), so matrix-vs-upstream drift becomes a
+checkable condition instead of an occasional audit.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## W1 LANDED: upstream inventory made reproducible — and it CORRECTS my own 62 figure
+<!-- state: 2026-08-05T06:00 -->
+
+`scripts/upstream-inventory.py` turns yesterday's hand audit into a repeatable
+derivation with `file:line` citations, snapshotted to
+`.agents/upstream-inventory.json` and drift-checked in CI.
+
+**It immediately corrected a number I had published.** The hand count said 62
+uninventoried upstream architectures; the real figure is **43** (362 upstream,
+319 named by us). The 62 came from an arch-name regex that missed
+`ForMaskedLM`/`ForRetrieval`/`ForSequenceClassification` suffixes, so
+legitimately-inventoried rows looked absent. This is exactly why W1 was
+sequenced FIRST instead of acting on the raw numbers: a one-off grep produces
+confident wrong counts, and the fix is tooling, not more care.
+
+Confirmed unchanged by the tooling: vLLM's arch floor is 7.5 (CMakeLists.txt:129)
+so `SM060`/`SM061`/`SM070` are out of scope; all COMP-* components are real
+unported work except `deepgemm` (0 files - external dep).
+
+Design points:
+- `--check` SKIPS cleanly when reference checkouts are absent rather than
+  pretending to have verified something. CI has no vLLM checkout, so a silent
+  pass there would be a lie;
+- drift is defined as the uninventoried COUNT changing or vLLM's supported-arch
+  list changing, either of which means upstream moved and the delta needs
+  inventorying;
+- 10 mutation tests cover the parsing, which is where the errors live: an
+  off-by-one in the arch floor would declare a SUPPORTED arch out of scope, and a
+  sloppy registry regex would invent or hide architectures. One test caught my
+  own wrong line-number expectation (the code was right).
+
+Remaining: W2 (close the 3 sub-floor rows, re-scope DEEPGEMM), W3 (inventory the
+43), W4 (repeat against SGLang and llama.cpp). No source, kernel, model, gate,
+benchmark or capability mark changed.
+
+## W2+W4 and a DEVICE inventory: vLLM platforms complete, 11 llama.cpp backends unrowed
+<!-- state: 2026-08-05T07:00 -->
+
+User follow-up: inventory the GPU DEVICES too. Extended the enumeration one
+level up from architectures to devices, and landed W2/W4 with it.
+
+**Devices.** vLLM exposes 6 platforms (cpu, cuda, rocm, tpu, xpu, zen_cpu) and we
+have a row for EVERY one - platform coverage is COMPLETE, which matters mainly
+because it had never been verified. llama.cpp ships 17 ggml backends and **11
+have no row at all**: cann, musa, opencl, openvino, rpc, webgpu, zdnn, zendnn,
+hexagon, blas, virtgpu. SGLang exposes only cpu and cuda. So the device gap is
+llama.cpp-shaped, not vLLM-shaped - consistent with vLLM being the mirror source
+and llama.cpp the breadth reference.
+
+**W2 - verdicts recorded ON the rows, additively.** SM060/SM061/SM070 annotated
+OUT-OF-SCOPE with the citation (below vLLM's 7.5 floor, CMakeLists.txt:129);
+COMP-DEEPGEMM annotated RE-SCOPED (0 files at the pin, an external dependency).
+Their STATE is deliberately unchanged: yesterday established that state moves
+require claim-FAMILY closure, and `CLAIM-CUDA-BREADTH-SCOPE` also holds SM075,
+which vLLM DOES support. Annotating is safe and true; moving the state would
+break the record to make a point.
+
+**W4** - SGLang and llama.cpp now enumerated alongside vLLM, which is what
+surfaced the device gap.
+
+The `--check` contract widens to include the uninventoried device sets, so a new
+ggml backend or vLLM platform appearing upstream fails the gate rather than going
+unnoticed.
+
+**NOT DONE: W3** (inventorying the 43 missing architectures as rows). It is a
+bulk matrix edit plus a pinned-count bump and deserves its own change.
+
+**Separately, and NOT mine: `origin/main` is RED on `check-env-doc`.**
+`VT_V4_RESIDENT_W` is read in `src/` but is neither documented in
+`docs/ENVIRONMENT.md` nor allowlisted. Verified red on a clean `origin/main`
+checkout before this change. Left alone deliberately - whether it is a
+user-facing knob or a kernel-internal switch is the authoring session's call.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Arch parity made BIDIRECTIONAL; llama.cpp device breadth folded into scope (ROAD-V1-D6)
+<!-- state: 2026-08-05T08:00 -->
+
+Two user directives, both grounded in the upstream enumeration.
+
+**"We want to support the same arches."** The gate was one-directional: it only
+flagged rows of ours BELOW vLLM's floor. It now ALSO flags vLLM-supported arches
+we carry no row for, and drift on either side fails `--check`. Current result:
+`vLLM arches with NO row of ours: none` - we already track vLLM's full set
+(7.5 through 12.1), and the only divergence remains SM060/061/070 below the
+floor, already annotated OUT-OF-SCOPE. So "same arch set" is now a CHECKED
+invariant rather than an assumption.
+
+**llama.cpp device breadth folded into scope.** The 11 ggml backends vLLM has no
+platform for are now `BACKEND-GGML-*` rows: cann, musa, opencl, openvino, rpc,
+webgpu, zdnn, zendnn, hexagon, blas, virtgpu. Each cites its llama.cpp source
+directory and file count at `237ad9b96`, and each is `INVENTORIED` with
+"☐ spike required before any implementation" - the standing spike-first
+directive, per the user's instruction. Pinned BACKEND row count 68 -> 79.
+
+New roadmap block **`ROAD-V1-D6`** carries them, stating explicitly that vLLM
+remains the MIRROR source and llama.cpp is the BREADTH reference, so folding in
+its devices does not make it a behavior oracle.
+
+Inventorying is not committing: these rows claim nothing, no mark moved on
+`docs/FEATURES.md`, and an inventoried backend is not a supported one. Whether
+any of them is worth building is a roadmap decision the rows now make visible.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Kimi-Linear-48B-A3B W0 dedicated spike — SPIKE→READY, the one e2e-gateable Kimi text model
+
+<!-- state: 2026-08-05T09:00 -->
+
+Wrote the full W0 spike contract for `KimiLinearForCausalLM` (Kimi-Linear-48B-A3B-Instruct),
+`specs/kimi-linear.md`, `CLAIM-KIMI-LINEAR-W0`. CPU-only, records-only: NO build, NO GPU, NO
+download. Base `origin/main` HEAD `10dd23ee`; pinned oracle `555967922` (0.26.0.dev0). The row
+`MODEL-TEXT-kimi-linear-kimi-linear-for-causal-lm` STAYS `SPIKE` (it is actively claimed by
+`CLAIM-MLA-DEEPSEEK` + `CLAIM-KDA-KERNEL` and now this claim, and the record protocol
+[`check-agent-record.py`] forbids a claimed row from being `READY`); the dedicated full W0 spike
+is complete and W1 implementation can start.
+
+Grounded in the pinned vLLM source (`models/kimi_linear.py`, `layers/mamba/gdn/
+kimi_gdn_linear_attn.py`, `third_party/flash_linear_attention/ops/kda.py`, `layers/mla.py`,
+`layers/fused_moe`, `configs/kimi_linear.py`) and the AUTHORITATIVE `config.json` (HF fetch
+2026-08-05, supersedes the 2026-07-25 sweep). Real 48B-A3B dims: H=2304, 27 layers = **20 KDA +
+7 full-attn MLA** (`full_attn_layers=[4,8,12,16,20,24,27]`, 1-indexed; selector
+`is_kda_layer(i):=(i+1) in kda_layers`); MLA `kv_lora=512`/`q_lora=null`/`qk_nope=128`/
+`qk_rope=64`/`v=128` with **`mla_use_nope=true`** (`rotary_emb=None` → positionless MLA, no RoPE
+anywhere); MoE 256 experts/top-8/1-shared sigmoid `noaux_tc`, `routed_scaling_factor=2.446`,
+`first_k_dense_replace=1` (layer-0 dense KimiMLP), `num_expert_group=1`/`topk_group=1` (trivial
+grouping); KDA `head_dim=128`/`num_heads=32`/`short_conv=4`; **`num_nextn_predict_layers=0` ⇒ NO
+MTP head in this checkpoint** (arch supports it; loader skips spec layers). CORRECTS the sweep's
+"full-attn layers are MHA head_dim 72" — they are MLA.
+
+HW-fit: **FITS one GB10** — 48.9B bf16 ≈ 91.5 GiB, 0.77× the 119 GiB unified pool, and the pinned
+oracle constructs+serves it ⇒ this is the ONE Kimi text model with a REAL e2e SACRED token gate
+(STRICT expected at 48.9B; near-tie fallback ratified), UNLIKE the 2.8T Kimi-K3 (DERIVE-AND-SHIP,
+~12× over — `specs/kimi-k3.md`). Precondition: ~10 GiB dgx disk reclaim before the download;
+low `gpu_memory_utilization` (unified pool reserves HOST RAM). The W0 GPU golden-capture recipe
+is ready to run (spec §8), a SEPARATE later step.
+
+Reuse-vs-new, with our `file:line`: HEAVY reuse — DeepSeek MLA (campaign W1-W6,
+`mla_attention.{h,cpp}`, `cuda_mla_*.cu`), the sigmoid/`noaux_tc` grouped MoE
+(`deepseek_v2.cpp RunMoeBlock`, `MoeRouterTopKArgs`, `e_score_correction_bias`, `cuda_moe*.cu`),
+the GDN family (KDA's parent: `cuda_gdn.cu`, `gdn_attn.cpp`, `GDNAttentionMetadata`, AOT cubins),
+the Qwen3.6-35B GDN-hybrid-MoE skeleton (`qwen3_5_moe.cpp`, DONE 315/315), and the KDA host refs
+already landed (task #173, `CLAIM-KDA-KERNEL`, `kimi_kda.{h,cpp}`, `test_kimi_kda` 14/14·36 — the
+oracle for the KDA device kernel). KEY kernel-scoping finding: the KDA DECODE path reuses GDN's
+fused-recurrent kernel verbatim (`fused_recurrent_kda` = GDN recurrent fed a precomputed
+per-channel gate); only the PREFILL path needs KDA-new `chunk_kda_scaled_dot_kkt` +
+`recompute_w_u` + `chunk_gla_fwd_o_gk` + the gate cumsum. NET-NEW = the KDA device kernel
+(host-ref-oracled), the NoPE-MLA branch (`rotary_emb=None`), the hybrid layer-schedule + het-KV
+wiring (GDN state + MLA latent per layer), and the loader name-map (reuse
+`EnumerateKimiK3TextBackboneTensors`). The three MUST-route seams are PLANNED (fusion catalog /
+merged-GEMM / born-on-runner decode), not hand-rolled.
+
+W0-W7 breakdown + correctness gates + tests-to-port + the GPU golden recipe are in the spec.
+Records: matrix row stays SPIKE (checklist `📋` unchanged, rollup unchanged; the dedicated spec is
+now the Spike link + a W0-complete note); `CLAIM-KIMI-LINEAR-W0` claim block + table row; roadmap
+ROAD-V1-C2 breadth note;
+`docs/STATUS.md`/`docs/BENCHMARKS.md`/`docs/FEATURES.md` one-liners; `NOW.md` live-claim row +
+stamp. Record checkers green (`check-model-checklist`, `check-agent-record`, `check-doc-checkpoint`,
+`check-now-current`). Co-owns the row with `CLAIM-MLA-DEEPSEEK` (MLA half) + `CLAIM-KDA-KERNEL`
+(KDA host refs). NEXT: W1 registry + `ParseKimiLinearParams` (CPU). No source/kernel/gate changed.
+
+## W3 LANDED: 31 never-inventoried architectures rowed; the "43" was itself overstated
+<!-- state: 2026-08-05T09:00 -->
+
+Every vLLM registry architecture now carries a row: **362 upstream, 362 named**.
+
+**The count was wrong twice, and the tooling caught it both times.** The hand
+audit said 62; W1's tooling said 43; applying it revealed **12 of those 43
+already had rows** under names the detector could not see - `GritLM`,
+`MiniCPMO`, `ExaoneMoeMTP` and nine others carry no `ForCausalLM`-style suffix,
+so a suffix-anchored regex reported them as absent. The duplicate-ID check in
+`check-agent-record.py` refused the rows outright, which is how it surfaced.
+**31 architectures were genuinely new.** The detector now counts any backticked
+CamelCase token in the matrix rather than suffix-matching, so this class of
+undercount cannot recur.
+
+The sequence is worth keeping: grep said 62, tooling said 43, applying said 31.
+Each step was more grounded than the last, and only the last one touched the
+record.
+
+**What landed:** 31 rows, each citing its `registry.py:LINE` and module path,
+classified from the registry dict it lives in - 17 multimodal, 10 speculative
+draft heads, 10 embedding/retrieval/classification, 4 text-generation, 2
+backend-generic. All `INVENTORIED` with "☐ required" spikes. Pinned MODEL count
+327 -> 358; the lifecycle rollup was recomputed from the real states
+(`INVENTORIED` 284 -> 315).
+
+Inventorying is not committing: these rows claim nothing, no capability mark
+moved, and whether any is worth building is now a visible roadmap decision
+rather than an invisible gap.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## 35B fresh 3-rep binding grid: low-batch CLOSED, c16 regression found (goal phase 2)
+<!-- state: 2026-08-05T10:10 -->
+
+Box recovered (user power-cycle). Prior crash root-caused from journal: NOT our
+engine — the grid's ours→vLLM transition started the vLLM load ~1 s after our
+server exited, while the kernel was still reclaiming ~67 GiB of unified
+allocations; the per-leg gate checked `gpu_idle` only. Patched
+`dgx:~/work/q35-regrid/run_grid2.sh` with a per-leg `avail_gb >= 90` wait
+(mirrors the queue gate; graceful abort, no benchmark-parameter change); the
+fresh run crossed that transition six times cleanly.
+
+Fresh binding grid (2026-08-05 @`1ea26427`, 3 fresh-server reps, SACRED gate=0
+pre-bench, medians): tput ratios c1 0.977 / c2 0.964 / c4 **1.025** / c8 0.964 /
+c16 0.932 / c32 0.971; TTFT 0.980/0.947/0.976/0.939/0.933/0.929; TPOT
+0.975/0.966/**1.036**/0.976/0.928/0.988. The old failing mass (c1/c2 low-batch,
+was 0.817/0.849) is CLOSED by the landed lever stack. NEW failing mass: TTFT
+0.93-0.98 everywhere + a c16 ABSOLUTE regression (ours 2489.1→2327.4 tok/s
+while vLLM held ~2490), flipping c16 from 1.010x to 0.932x. Top suspect: the
+async-UAF fix's unconditional `async_forward_in_flight_` drain at
+`execute_model` top serializes the depth-2 overlap that paid most at c16.
+Next: (1) A/B an event-scoped/conditional drain at c16 (byte-exactness and the
+UAF fix's safety are non-negotiable), (2) TTFT attribution at c2/c8/c32.
+Evidence: `dgx:~/work/q35-regrid/evidence/raw/35/`; full table appended to the
+benchmark record. Public surfaces updated same-change (BENCHMARKS table + rows,
+STATUS row 35B, NOW).
+
+## DeepSeek-V4 Phase-2 routed-expert residency MEASURED NEGATIVE, held default-OFF
+<!-- state: 2026-08-05T12:00 -->
+
+Implemented the Phase-1 agent's recorded Phase-2 spike: stage the ~70 GiB
+routed-expert keep-quant slabs (`moe_gate/up/down_exps`, IQ2_XXS/Q2_K) TRUE
+device-resident with MOVE semantics, extending the shipped Phase-1 dense-tower
+win (`VT_V4_RESIDENT_W`, 18.69 vs ds4 16.33). New env `VT_V4_RESIDENT_EXPERTS`
+(default-OFF). **Disposition: HELD default-OFF as a characterized negative** — it
+is byte-exact and memory-safe but ~3.4% SLOWER in steady decode.
+
+**Implementation** (`src/vllm/model_executor/models/deepseek_v4.cpp`, all in the
+resident-decode namespace next to the Phase-1 `V4ResidentW`): `V4ResidentExpertBase`
+lazily `cudaMalloc`+H2D-copies a slab into the OwnedTensor's `d_dev` on first
+touch, then **synchronizes** (Backend::Copy is `cudaMemcpyAsync`, so the DMA must
+complete before the source pages are dropped) and calls `V4DropBorrowedResidency`
+= interior-whole-page `madvise(MADV_DONTNEED)` on the borrowed GGUF mmap range
+(the exact page math of `GgufFile::DropSpanResidency`, replicated because the
+consumer holds only the type-erased borrow, not the GgufFile). Consumers
+`GemmGroupedInto` + `MoeGateUpSwiGLUInto` route through `V4ResidentExpertW`
+(View over `d_dev` when ON, else the legacy ATS retag). Capture-safe: staging
+happens on the gstate-0 eager warm run, BEFORE `BeginCapture`, mirroring Phase-1;
+gstate-1 capture and gstate-2 replay reuse `d_dev` with zero cuda calls.
+Load-time staging (the spike's literal wording) is infeasible — the model_loader
+is device-free by design (no queue) — so first-touch-in-the-warm-run is the
+architecturally-correct realization of the same copy+immediate-reclaim contract.
+
+**Measurement** (dgx.casa GB10, worker parked, flock, drop_caches before each
+load, single-load per rep, `deepseek-v4-gen --gpu --kv-cache` on the real 80.7 GB
+IQ2XXS UD checkpoint, max-tokens 256, median-of-3; steady is warm-cancelled =
+`(steps-3)/(decode_total - t0 - t1 - t2)`, dropping the eager-warm/graph-capture/
+settle steps whose one-time cost otherwise dominates the naive average): OFF
+(Phase-1) steady **19.43 tok/s** (19.414/19.429/19.429) vs ON **18.76**
+(18.708/18.764/18.876) = **0.966x, −3.4%**, bands non-overlapping. Generated ids
+**byte-identical** (md5 `f0b88b70…` on ALL 6 runs, OFF==ON). PEAK RESIDENT flat
+(86.68 OFF vs 86.63 ON) and the move is real — per-step host RSS drops 86.3→13.9
+GiB once the warm run stages+reclaims. Memory SAFE (min avail 29-30 GiB, 0
+sentinel kills). Arm B's graph-capture step is a large one-time cost (6-8.6 s vs
+0.47 s).
+
+**Why negative (grounded in the last-mile roofline, `CLAIM-DEEPSEEK-V4-DEVICE-DECODE`
+Brick 0):** the dense Q8_0 tower Phase-1 sped up is bandwidth-bound (63% of the
+240 GB/s peak), so faster device memory helped; the grouped-MoE
+`QuantDotGemmGrouped<IQ2_XXS>`/`<Q2_K>` kernels are dequant/latency-bound (~19-24%
+of peak), so residency (a bandwidth lever) cannot help and slightly hurts. A
+second downside: pinning the 70 GiB as `cudaMalloc` instead of evictable mmap
+file cache cuts the unified-pool reclaimable headroom from ~103 to ~30 GiB avail.
+
+Kept in the tree default-OFF for reproducibility. Also **resolved the RED
+`check-env-doc` on main** the W2/W4 entry above flagged: allowlisted BOTH
+`VT_V4_RESIDENT_W` (the pre-existing omission) and the new `VT_V4_RESIDENT_EXPERTS`
+in `scripts/env-doc-allowlist.txt` (kernel-internal A/B switches). Docs
+STATUS/BENCHMARKS/FEATURES + NOW.md updated to the held-OFF negative; STATUS kept
+under its 288,036 ratchet.
+
+## 35B serving heap corruption FIXED — async depth-2 GPU-overlap use-after-free
+<!-- state: 2026-08-05T13:00 -->
+
+Root-caused and fixed the reproducible heap corruption (`malloc(): unaligned
+tcache chunk detected` / `malloc_consolidate(): unaligned fastbin chunk`) that
+aborted `examples/server` on the Qwen3.6-35B-A3B-NVFP4 binding-bench workload and
+BLOCKED the 35B binding-grid re-run. gdb: the abort fires on the first small
+`operator new` inside `vllm::v1::prepare_inputs` on the engine busy-loop thread
+(`EngineCoreProc::run_busy_loop -> step_with_batch_queue -> execute_model`), i.e.
+a detector, not the corrupting write.
+
+**Trigger (bench, re-confirmed on dgx repro5):** async scheduling default-ON
+(mcb=2) + `ignore_eos=true` + generation past ~4-8 decode tokens. `Hello there
+friend` max_tokens=4 → http 200; max_tokens=8 → http 000 (server thread dead);
+`ignore_eos=false` fine (it stops at the natural eos before the trigger). The
+model naturally samples eos within a few tokens; ignore_eos forces it PAST, which
+is what runs the pipeline long enough to detonate.
+
+**Localization (the decisive evidence chain):**
+- CPU repros are CLEAN under ASAN even with faithful eos-continuation — a dense
+  `LoadedEngine` async depth-2 run AND a MoE `LoadedEngine` async depth-2 run
+  (synthetic Qwen3.5 dense + Qwen3.5-MoE, eos set to an emitted token,
+  ignore_eos true vs false, multi-block paging). So the backend-neutral host code
+  (scheduler placeholders, `prepare_inputs`, `combine_sampled_and_draft_tokens`,
+  `InputBatch` condense/swap, block table, detok) is correct.
+- `compute-sanitizer --tool memcheck` on the real 35B: the crash DID NOT
+  reproduce and reported ZERO device errors → NOT a CUDA-kernel OOB write.
+- Env toggles on the real 35B: `VT_ASYNC_SCHED=0` (sync Scheduler, depth-1, but
+  the runner combine still ON) = CLEAN; `VT_ASYNC_RUNNER=0` = CLEAN; DEFAULT
+  (mcb=2) = CRASH at mt=8. memcheck keeps the AsyncScheduler accounting but
+  SERIALIZES the GPU → clean; so the cause is the real depth-2 GPU OVERLAP, not
+  the scheduler accounting.
+
+**Root cause.** `sample_tokens_async` (the depth-2 serving sampler) issues the
+sampled-id D2H on the COPY queue and DEFERS its wait to the consuming step's
+`get_output()`, which lands one `step_with_batch_queue` call LATER. So on entry
+to the next `execute_model` the previous step's forward / sample / scatter are
+still IN FLIGHT on the MAIN queue and still reference `exec_state_` (device
+logits + the `StepInputs` host arrays) and write
+`input_batch_.last_sampled_tokens`. That `execute_model` immediately reset
+`exec_state_` and ran `update_states` (condense/swap read+move
+`last_sampled_tokens`) — mutating/freeing state a live kernel still used on GB10
+unified memory. A use-after-free that corrupts the HOST heap. It only manifests
+under REAL GPU overlap, which is exactly why the CPU eager backend and
+compute-sanitizer (both serialize the queue) never saw it while the served model
+aborted. (Matches the recorded "compute-sanitizer clean while wrong / capture
+lifetime" trap.)
+
+**Fix** (`src/vllm/v1/worker/gpu/runner.cpp` + `runner.h`): a depth-2 lifetime
+guard. `sample_tokens_async` sets `async_forward_in_flight_` when it leaves
+main-queue work outstanding; `execute_model` drains it
+(`GetBackend(...).Synchronize(queue_)`) at the very TOP, before it touches
+`exec_state_` or `input_batch_`. Cost is minimal — the forward already overlapped
+the call's own host work (`get_output`/`update_from_output`/schedule); the D2H
+copy-queue overlap that the async design buys is preserved (the drain is the main
+queue only). Byte-identical output.
+
+**Verification.** dgx incremental server rebuild at this SHA: the repro5 bracket
+(`ignore_eos=T`, mt 4/8/16/32/64/128) all http 200 + ALIVE (was 000 from mt=8),
+`Once upon a time` 128+ignore_eos 200/ALIVE, non-ignore_eos correctness output
+intact; SACRED `test_qwen36_paged_engine` 1/1 (74.96 s). New CPU regression
+`test_runner` "async sample_tokens_async work is drained before the next
+execute_model" (RED→GREEN verified: disabling the drain fails 10 assertions) +
+e2e `test_llm_engine` async-depth-2-past-ignore_eos. CPU ASAN suites green:
+test_runner 17/17, test_loaded_engine_dense 6/6, test_llm_engine (serial),
+engine_core_proc / async_llm / openai_conformance (serial). Docs
+STATUS/BENCHMARKS + NOW.md updated; STATUS kept under its 287,962 ratchet
+(trimmed a dated audit meta-clause to offset the fix note).
+
+## Kimi-Linear-48B-A3B W1 — registry + config + loader scaffolding LANDED (row stays SPIKE)
+<!-- state: 2026-08-05T14:00 -->
+
+**`CLAIM-KIMI-LINEAR-W1`, DONE — foreground, NOT pushed.** Base `origin/main` HEAD
+`053116df`; pinned oracle `555967922`. Implemented the W1 brick of the Kimi-Linear
+spike (`specs/kimi-linear.md`): the additive `kimi_linear*.cpp` TU family that makes
+`KimiLinearForCausalLM` RESOLVE + parse config + load (name-map coverage), with a
+REFUSE-by-name forward so the W3-W6 assembly can start next.
+
+- **Registry** (`kimi_linear_registry.cpp`): one `REGISTER_VLLM_MODEL(kimi_linear,
+  "KimiLinearForCausalLM")` (ZERO shared-array edit), info text-gen + `is_hybrid`
+  (20 KDA linear-attn layers) + `supports_multimodal=false` (its K3 wrapper is the
+  MM one). `MakeKimiLinearKVCache` declares the HETEROGENEOUS per-layer KV: an MLA
+  latent-576 group (7 full-attn layers) + a KDA/GDN `MambaSpec` group (20 KDA layers:
+  conv `12288×3` bf16, recurrent `32×128×128` f32 per `kda_state_shape`/`kda_state
+  _dtype`, mamba_utils.py:274-294,130-137).
+- **Config** (`ParseKimiLinearParams`): the authoritative 48B schedule — 27 layers
+  (20 KDA + 7 NoPE-MLA via `full_attn_layers=[4,8,12,16,20,24,27]`/`is_kda_layer`),
+  MLA `kv_lora=512`/`qk_nope=128`/`qk_rope=64`/`v=128` q_lora-null, 256e/top-8/
+  1-shared sigmoid `noaux_tc` `routed_scaling=2.446`, `first_k_dense_replace=1`.
+  Mirrors `kimi_linear.py:214-215` — hard-asserts `mla_use_nope` and `q_lora==null`;
+  rejects a positional MLA / q-LoRA branch / missing `linear_attn_config` /
+  non-sigmoid router.
+- **Loader** (`EnumerateKimiLinearTensors` + `LoadKimiLinearForCausalLMWeights`):
+  the standalone checkpoint name-map, VERIFIED vs the real
+  `moonshotai/Kimi-Linear-48B-A3B-Instruct` safetensors index (HF range fetch of the
+  index only, NO weight download) — the concrete correction over the DERIVED K3 map
+  is the MoE block name `block_sparse_moe.*` (not `mlp.*`; `kimi_linear.py:334`
+  registers `block_sparse_moe` first, `self.mlp` is a deduplicated alias). The loader
+  THROWS BY NAME on the first missing OR mis-shaped tensor (never a silent zero).
+- **Forward** (`kimi_linear.cpp`): REFUSE-by-name (`VT_CHECK(false)`) — the KDA
+  device kernel (W3), NoPE-MLA route (W4), sigmoid-noaux MoE (W5), het-KV
+  born-on-runner forward (W6) are the residual.
+
+Gates (clean CPU `-DVLLM_CPP_CUDA=OFF` Release): `test_kimi_linear_scaffold` 9/9·83
+(registry-resolve + config schedule/split + name-map + synthetic 2-layer loader
+round-trip + RED missing/mis-shape + reject cases + het-KV spec),
+`test_model_registry` 24/24·700 (arch sorted-set 29→30 + error message + hybrid
+model-property branch), `test_kimi_k3_scaffold` 6/6 UNCHANGED. `check-fusion-
+consistency` + `check-runner-routing-consistency` green (the refuse-by-name forward
+is a skipped stub — NO allowlist). Record checkers rc=0.
+
+Row STAYS `SPIKE`/`📋` (forward refuses; rollup unchanged), exactly the kimi_k3
+scaffolding precedent. NEXT: the W3-W6 forward assembly, then the W7 e2e SACRED gate
+on GB10 (spec §8 golden-capture recipe, ready for the next free GPU slot).
+
+## Kimi-Linear-48B-A3B W2-W6 — the CPU REFERENCE forward LANDED (row stays SPIKE)
+<!-- state: 2026-08-05T18:00 -->
+
+**`CLAIM-KIMI-LINEAR-W2`, DONE — foreground, NOT pushed.** Base `origin/main` HEAD
+`0988db48`; pinned oracle `555967922`. Replaced the refuse-by-name host
+`KimiLinearModel::Forward` with a REAL, per-op-gated CPU REFERENCE forward that
+composes the whole 27-layer KDA/NoPE-MLA + 256-expert-MoE decoder from the landed
+host primitives — so the ONLY remaining correctness step is the e2e SACRED token
+golden on GB10 (spike §4/§8). Mirrors the DeepSeek-V4 cadence: deepseek_v4.cpp's
+`DeepseekV4ForwardHost` is likewise the host f32 reference the device kernels are
+gated against.
+
+What the reference composes (grounded 1:1 @ the pin):
+- **KDA layer** (`KimiKdaLayerForward`, `kimi_gdn_linear_attn.py:233-268` + the
+  gated-delta recurrence `fused_recurrent.py:122-149`): q/k/v proj → 3 silu short
+  convs (`vllm::kimi_kda::KdaShortConv`) → per-head q/k L2-norm (`L2NormRows`) → the
+  gated-delta recurrence (state S[d_v,d_k]: decay by `exp(g_k)` per k-channel where
+  the KDA gate `g = -exp(A_log)·softplus(f_b(f_a(x))+dt_bias)` via `KdaLowRankDecay`
+  +`KdaDecayGate`, delta rule with per-head `beta=sigmoid(b_proj(x))`, output S@(q·
+  head_dim⁻⁰·⁵)) → sigmoid-gated `FusedRMSNormGated(·,g2)` → o_proj.
+- **NoPE-MLA layer** (`KimiNoPEMlaLayerForward`, `kimi_linear.py:180-285`): the
+  UNABSORBED materialized-MHA reference (the identity the device absorbed path
+  equals, mla_attention.h) — q_proj, kv_a → `kv_a_layernorm`(latent) → kv_b → per-
+  head causal softmax over the KV cache with `scaling=qk_head_dim**-0.5` and NO RoPE
+  (`rotary_emb=None`, `mla_use_nope` asserted) → o_proj.
+- **MoE block** (`KimiMoeRoute`/`KimiMoeBlockForward`, `kimi_linear.py:104-177` +
+  grouped_topk_router.py:106-161): sigmoid `noaux_tc` router — the trivial
+  `num_expert_group=1`/`topk_group=1` group — select top-8 on `scores +
+  e_score_correction_bias`, weight from the UNBIASED scores, renormalize, then
+  `× routed_scaling=2.446`; plus the always-added shared expert; experts `w1`/`w2`/
+  `w3` = gate/down/up SwiGLU.
+- **Dense layer-0 SwiGLU** (`KimiMLP`) + the pre-norm residual stream
+  (`kimi_linear.py:353-378`: each branch adds to the residual, the norm sees the
+  accumulated residual).
+
+The loader now MATERIALIZES the host float weights (bf16/f32→f32) in
+`LoadKimiLinearForCausalLMWeights` (`KimiLinearWeights::host`), so a loaded model
+runs the reference forward end-to-end. The DEVICE forward `ForwardDevice` (the
+DEFAULT `gather_logits` runner path) STAYS refuse-by-name — the born-on-runner
+device forward (KDA device kernel W3, absorbed-MLA decode W4, grouped-MoE slabs W5,
+het-KV runner wiring W6) + the W0/W7 e2e SACRED golden + speed are the residual.
+
+Gates (clean CPU `-DVLLM_CPP_CUDA=OFF` build): `test_kimi_linear_forward` **6/6·246**
+— (a) KDA layer == a hand-composition of the `kimi_kda` refs + an INDEPENDENT
+recurrence (wiring proof); (b) NoPE-MLA layer == an INDEPENDENT materialized-MHA
+reference; (c) sigmoid `noaux_tc` router == a HAND-COMPUTED top-k case (bias-select/
+unbiased-weight, renormalize, scaling) + the whole block == shared+Σ weight·expert;
+(d) the loader materializes host weights end-to-end + the whole 2-layer synthetic
+forward is finite/coherent-shaped + greedy-decodes 5 tokens with the (recomputed)
+recurrent+latent context advancing. `test_kimi_linear_scaffold` 9/9·83 +
+`test_kimi_kda` 14/14 UNCHANGED. `check-fusion-consistency` +
+`check-runner-routing-consistency` green (the DEVICE forward is a refuse-skipped stub
+— NO allowlist; the host reference uses no `vt::` fusable device ops so the fusion
+floor never trips). Record checkers rc=0.
+
+New code: `src/vllm/model_executor/models/kimi_linear_forward.cpp`,
+`tests/vllm/models/test_kimi_linear_forward.cpp`, additive host-weight structs +
+per-op declarations in `include/vllm/model_executor/models/kimi_linear.h`, the
+host-materialization pass in `kimi_linear_weights.cpp`, two CMake lines. Row STAYS
+`SPIKE`/`📋` (the DEVICE forward refuses; the W0/W7 e2e SACRED token golden on GB10
+— spec §8 golden-capture recipe — plus speed are the residual).
+
+## Kimi-Linear-48B-A3B W6 — the born-on-the-runner DEVICE forward SEAM LANDED (row SPIKE→ACTIVE)
+<!-- state: 2026-08-05T20:00 -->
+
+**`CLAIM-KIMI-LINEAR-W6` (foreground, isolated worktree
+`.claude/worktrees/agent-a01ce06793789391e`, base `origin/main` `1ea26427`, CPU-only,
+NOT pushed).** Wired the born-on-the-runner DEVICE forward
+`KimiLinearModel::ForwardDevice` — the DEFAULT `gather_logits` production/runner path
+that had been a `VT_CHECK(false)` refuse stub. It now composes the `[rows,vocab]`
+logits via the landed CPU reference (`KimiLinearModel::Forward` → HostForwardSeq, the
+whole 27-layer KDA/NoPE-MLA + 256-expert-MoE hybrid, honoring `logits_indices`
+gather) and hands them back **DEVICE-RESIDENT** — a pooled `DBuf` wrapped verbatim
+like `deepseek_v2.cpp:633 WrapDeviceLogits`, so `ForwardLogits.on_device()==true` on
+CPU **and** CUDA and the runner's on-GPU sampler consumes them with NO host logit
+download on the default path (the third MUST-route seam).
+
+**Why the compose stays on the CPU reference (correctness-first; the DGX box is
+down).** The device-COMPUTE lane — a `DBuf`-resident bf16 forward that routes each
+layer through the reused device blocks — can only be GATED against the pinned vLLM
+oracle on GB10 (the GDN Triton-AOT decode cubins, the paged het-KV caches, bf16
+numerics), so authoring it now would present as "done" without evidence. This brick
+lands the runner SEAM + the full reuse-wiring PLAN (documented as comments in
+`kimi_linear.cpp` + spec §9) so only the GPU verify + the W0/W7 e2e golden remain.
+This mirrors the DeepSeek-V4 device-forward cadence (compose off the host tower,
+return device-resident logits, the DBuf-resident paged decode is a named residual).
+The Explore audit confirmed every reused op (`vt::MatmulBT`, `FusedChain`,
+`GdnDecode`/`GdnPrefill`, `mla::ForwardMlaAttentionBlock`, `MoeRouterTopK`,
+`MoeCombine`, `L2Norm`, `RmsNormGated`, `CausalConv1dFwd`) is CPU+CUDA-registered —
+only the bf16 grouped-MoE GEMM is CUDA-only (CPU lane = per-expert `Matmul`+
+`MoeSiluMul`), and the KDA decay gate `-exp(A_log)*softplus(...)` has no device
+exp/softplus op → a documented host-fallback (`vllm::kimi_kda`, upload). So the W7
+device compute IS feasible + CPU-runnable; it is deferred purely because it needs the
+GPU-vs-oracle gate to be trustworthy.
+
+**Gates.** `test_kimi_linear_forward` **7/7·300** — new case (e) asserts
+`ForwardDevice` returns `on_device()` logits byte-exact to the host reference, greedy
+tokens identical, and the `logits_indices` gather returns exactly one device row in
+request order. `check-runner-routing-consistency` reclassifies Kimi-Linear
+device-resident (25 routed models; refuse-skipped stubs 2→1) with **NO allowlist**
+entry (the wrapper hand-rolls no residual stream), and `check-fusion-consistency`
+stays green. `test_kimi_linear_scaffold` 9/9·83 + `test_kimi_kda` 14/14 +
+`test_model_registry` 24/24 UNCHANGED; clean CPU `-DVLLM_CPP_CUDA=OFF` Release build;
+`check-model-checklist` + `check-agent-record` rc=0.
+
+**Records.** Row `SPIKE`→`ACTIVE` (device SEAM wired; device compute + e2e golden
+pending — matching the deepseek_v4 "device-forward wired, e2e-pending" precedent),
+checklist mark `📋`→`🚧`, rollup `SPIKE 7→6`/`ACTIVE 9→10` (Total 327 unchanged). The
+ACTIVE advance required a machine-readable structured-contract appendix in
+`specs/kimi-linear.md` (§9 + the Scope/Upstream chain/Our baseline/Port map/Tests to
+port/Gates/Dependencies/Work breakdown/Risks blocks the deepseek-v4-flash.md
+convention uses) so `check-agent-record`'s READY-state spec structure passes.
+
+**Records-hygiene repair (inherited, not my landing):** the base tree had a
+merge artifact — the `35B serving heap corruption` state heading was glued onto the
+end of the W2-W6 entry's last line (so its `T13:00` anchor was unattached) and out of
+order. Split the newline and ran `scripts/sort-state-tail.py --apply` (reordered 3
+entries); `check-state-order` now green.
+
+New code: `src/vllm/model_executor/models/kimi_linear.cpp` (`ForwardDevice` +
+`WrapKimiLinearDeviceLogits` + the W7 device-compute reuse-wiring plan), the
+`ForwardDevice` doc in `include/vllm/model_executor/models/kimi_linear.h`, case (e)
+in `tests/vllm/models/test_kimi_linear_forward.cpp`. NO new CUDA kernel, NO CMake
+change.
+
+**GPU-verify recipe (box-return):** build `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0` on dgx (sm_121a); run
+`test_kimi_linear_forward` on a CUDA queue (proves `ForwardDevice` returns
+device-resident logits fed to the on-GPU sampler); then author + gate the W7 DBuf
+device compute vs the pinned oracle, and capture the §8 e2e SACRED greedy golden.
+
+**RESIDUAL (GPU-verify-pending W7):** the DBuf-resident device COMPUTE (KDA via the
+GDN device family + the KDA-gate host-fallback, NoPE-MLA via
+`mla::ForwardMlaAttentionBlock`, the DeepSeek-V2 sigmoid-`noaux_tc` grouped-MoE, over
+the paged het-KV caches) + the W0/W7 e2e SACRED token golden on GB10 (spec §8) +
+speed. Row stays `ACTIVE` until those land.
+
+## Kimi-Linear-48B-A3B W7 — the DBuf-RESIDENT device COMPUTE forward LANDED, CPU-gated (row stays ACTIVE)
+<!-- state: 2026-08-05T22:00 -->
+
+`CLAIM-KIMI-LINEAR-W7`, foreground, NOT pushed. Base `origin/main` +
+W1/W2-W6 (`0988db48` + `bcaa1299`/`4e471f17`). Pinned oracle `555967922`. CPU-only
+(box down). The W7 residual named by W6 — the real **DBuf-resident device COMPUTE
+path** — is now IMPLEMENTED and CPU-gated against the W2 host reference.
+
+**What landed.** New additive TU `src/vllm/model_executor/models/kimi_linear_device
+.cpp` composes the whole 27-layer KDA/NoPE-MLA + 256-expert-MoE hybrid over POOLED
+f32 `DBuf`s through the SHARED `vt::` device ops, mirroring the `deepseek_v2.cpp`
+device-forward structure (embed → per-layer `vt::FusedChain(kFusedAddRmsNormStd)`
+residual add+RMSNorm → KDA/NoPE-MLA self-attn → FusedChain → dense/MoE MLP → final
+FusedChain → lm_head; returns DEVICE-RESIDENT `[rows,vocab]` f32 logits via the same
+pooled-`DBuf` `WrapDeviceLogits` carrier). ON DEVICE (genuine `vt::` dispatch):
+`vt::Embedding`, every projection via `vt::MatmulBT` (host weights are torch
+`[out,in]`=`[N,K]`), the 3 KDA short convs `vt::CausalConv1dFwd` (silu, fresh zero
+conv-state, mirroring `qwen3_5.cpp:3032-3040`), q/k `vt::L2Norm`, the KDA output
+`vt::RmsNormGated` (sigmoid), the MoE router `vt::MoeRouterTopK` (sigmoid `noaux_tc`,
+group 1/1, `e_score_correction_bias`, `routed_scaling=2.446`), the per-expert /
+dense / shared SwiGLU via `vt::MoeSiluMul`, the weighted `vt::MoeCombine`, and the
+`lm_head` `vt::MatmulBT`. TWO documented HOST-FALLBACK islands = the W7-speed
+residuals: (1) the KDA per-k-channel gated-delta RECURRENCE + its decay gate
+`g=-exp(A_log)*softplus(f_b(f_a(x))+dt_bias)` + `beta=sigmoid(b_proj)` — `vt::Gdn
+Decode`/`GdnPrefill` carry only a per-HEAD scalar decay `g[T,Hv]` (ops.h), so they
+CANNOT express KDA's per-channel `g[T,H,D]`; computed on host from the
+device-resident q/k/v/g1/beta via the landed `kimi_kda` refs + the reference
+recurrence, then uploaded; (2) the NoPE-MLA attention CORE (causal softmax) — the
+device path is `mla::ForwardMlaAttentionBlock` over the runner's paged het-KV +
+load-time W_UK/W_UV absorption (born-on-runner residual), so this seam keeps every
+MLA projection + `kv_a_layernorm` + `kv_b` ON DEVICE and computes only the softmax
+core on host (identical materialized-MHA math, NoPE so no RoPE).
+
+**Why CPU-gating is a REAL wiring gate.** The CPU backend executes the SAME `vt::`
+dispatch (a pooled `DBuf` is a device buffer on CPU; `ResidentWeight`/`WF32` aliases
+the host weight bytes on CPU — the W6 case-(e) pattern). Activations are f32 `DBuf`s
+(the reference holds f32), so the match is tight (only f32-accumulation-order slack
+vs the reference's double). Weights alias the host f32 arrays via `MakeTensor`
+(exactly `ResidentWeight`'s CPU branch); the CUDA staging over materialized
+`OwnedTensor`s (grouped-MoE slabs, absorbed W_UK/W_UV) stays the born-on-runner
+residual (Kimi's device weights are not materialized as `OwnedTensor`s yet).
+
+**Runner routing.** `KimiLinearModel::ForwardDeviceCompute` is a new static method;
+`ForwardDevice` routes to it under `VT_KIMI_DEVICE_COMPUTE=1` (default OFF), so the
+CPU-verified W6 host-ref-compose stays the production runner path until the device
+compute is GPU-verified against the SACRED oracle, while the flag lets the device
+path BE the runner path for that verification. Mirrors the project gated-default-OFF
+in-flight convention. Env documented in `docs/ENVIRONMENT.md` (Rollback/bisect table).
+
+**Gate.** `tests/vllm/models/test_kimi_linear_forward.cpp` **12/12·614** (was
+7/7·300): +5 W7 cases — (f) KDA layer device==W2 ref (rtol 3e-3/atol 3e-4, the
+recurrence mildly amplifies f32 slack), (g) NoPE-MLA layer (rtol 1e-4), (h) MoE
+block + dense MLP (rtol 2e-4/1e-4 — the device router selects the SAME experts,
+lowest-index tie rule matches `KimiMoeRoute`), (i) the WHOLE 2-layer
+`ForwardDeviceCompute` == W2 reference logits (rtol 5e-3/atol 1e-3) AND
+greedy-token-identical AND device-resident (`on_device()`, `logits_indices` gather →
+1 row), (j) `ForwardDevice` reaches the device compute (opt-in routing present).
+`test_kimi_linear_scaffold` 9/9·83 + `test_kimi_kda` 14/14 UNCHANGED; clean CPU
+`-DVLLM_CPP_CUDA=OFF` build, `kimi_linear_device.cpp` compiles `-Wall -Wextra
+-Werror` clean; `check-fusion-consistency` (glue via `vt::FusedChain`; `MoeSiluMul`
+avoids the merged-GEMM trigger) + `check-runner-routing-consistency` +
+`check-env-doc` + `check-agent-record` rc=0.
+
+**HONEST LABELING — NOT a DONE claim.** GPU numerics stay a NAMED pending (box
+down): bf16 activations for vLLM parity, the GDN Triton-AOT decode cubins, the paged
+het-KV, the grouped-MoE slabs, and the e2e SACRED greedy golden vs the pinned oracle
+(spec §8) are unverified. Row STAYS `ACTIVE`.
+
+New code: `src/vllm/model_executor/models/kimi_linear_device.cpp` (the device
+compute + 4 per-op device wrappers + `ForwardDeviceCompute` + `KimiDeviceComputeEnabled`);
+`kimi_linear.cpp` (route under the flag); `kimi_linear.h` (decls); `CMakeLists.txt`
+(add the TU); `test_kimi_linear_forward.cpp` (cases f-j); `docs/ENVIRONMENT.md`
+(`VT_KIMI_DEVICE_COMPUTE`); spec `specs/kimi-linear.md` §9.
+
+**Box-return checklist (GPU verify):** (1) build `-DVLLM_CPP_CUDA=ON
+-DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0` on dgx (sm_121a); (2) run
+`test_kimi_linear_forward` on a CUDA queue — the device compute must stay
+token-identical to the W2 reference within a bf16 envelope; (3) with
+`VT_KIMI_DEVICE_COMPUTE=1`, run the runner path + capture the §8 e2e SACRED greedy
+golden vs the pinned oracle (STRICT expected for a 48.9B MoE; near-tie fallback
+ratified); (4) once token-exact, speed: `nsys` BOTH sides, vLLM graphed denominator,
+match/beat every axis — the KDA per-channel-decay device recurrence op + a device
+exp/softplus KDA-gate op + the mla::ForwardMlaAttentionBlock paged wiring +
+grouped-MoE slabs replace the two host-fallback islands.
+
+## State-tail re-sorted; the freshness gate's over-trigger corrected
+<!-- state: 2026-08-05T23:30 -->
+
+**The env-doc issue is NOT mine and is already closed.** `788ad913`
+("chore(env-doc): allowlist VT_V4_RESIDENT_W") landed while this session was
+working, and `check-env-doc` now passes on main: 225 production env vars all
+documented or classified. The classification is right - `VT_V4_RESIDENT_W` is a
+default-OFF DeepSeek-V4 residency switch whose mechanism was transferred from
+Laguna's `VT_LAGUNA_RESIDENT_BF16W`, so kernel-internal matches its sibling.
+
+**What WAS broken:** concurrent appends from two sessions left the state tail
+non-chronological (a 08-05T09:00 entry after a 08-05T22:00 one).
+`check-state-order.py` caught it; `sort-state-tail.py --apply` repaired it - 7
+entries reordered, 675 headings before and after, byte count identical. That is
+the 2026-08-04 gate working end to end on exactly the failure it was built for.
+
+**And a defect in my own checker, fixed rather than worked around.** The repair
+tripped `check-now-current`, which demanded a NOW.md refresh because
+`.agents/state.md` had changed. But a re-sort ADDS NO ENTRY and moves nothing
+live - the rule is "a state APPEND moves what is live", not "any byte changed".
+I nearly satisfied it by trimming another session's digest to make room for a
+cosmetic edit, which would have been gaming the gate. Instead
+`freshness_errors()` now takes whether the commit's state-entry HEADING SET
+actually changed, computed against the parent, and a pure reorder is exempt. A
+real append still requires the refresh, and three mutation tests pin all three
+cases.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+## Role discipline ENABLED: enforcing from cutover 44e8225c
+<!-- state: 2026-08-06T00:30 -->
+
+User-directed. `ROLE_DISCIPLINE_SINCE = "44e8225c…"`, so from that commit onward
+feature code reaches `main` only through a merged `row/*` PR (or a squash-merge
+carrying `(#N)`). Everything BEFORE the cutover stays exempt: it was created
+under the previous direct-push policy, and reddening honest history to make a
+point would be the opposite of the honesty this protocol is for.
+
+Verified before and after flipping it:
+- pre-cutover feature commits REPORT and pass - a `--base HEAD~8` run showed 5
+  recent Kimi-Linear/runner commits reported, exit 0;
+- the checker still passes on the tree as it stands;
+- a synthetic post-cutover direct feature push FAILS (mutation test), and the
+  cutover SHA is asserted to be a real commit, so a typo cannot silently disable
+  enforcement by naming a nonexistent ref.
+
+The mutation test that previously pinned enforcement OFF
+(`test_report_only_until_the_cutover_is_named`) was REPLACED, not deleted - it
+now asserts the opposite invariants: enforcement live, cutover resolvable,
+pre-cutover history exempt, post-cutover feature push rejected.
+
+**What this changes in practice for both roles:** `src/`, `include/`, `tests/`,
+`examples/`, `cmake/` and `CMakeLists.txt` can no longer be pushed straight to
+main. `scripts/`, `.agents/`, `docs/` and `.github/` still can, deliberately, so
+the operator can fix a gate or repair the record without a round trip.
+
+NOT enabled: `agent-preflight.sh --require-role` remains opt-in. Making an
+undeclared role fatal would block every session that has not yet declared one,
+including CI, and that is a separate switch with a separate blast radius.
+
+No source, kernel, model, gate, benchmark or capability mark changed.
+
+
+## 35B c16 drain-sync lever A/B: blocking-event drain NEGATIVE (−1.9%), full drain KEPT; real fix = GPU-resident sampled tokens
+<!-- state: 2026-08-06T01:00 -->
+
+Chased the 35B grid's c16 regression (2489→2327, prior entry) — suspect = the
+async-UAF fix's (`1ea26427`) full-stream drain at `execute_model` top. Built and
+A/B'd the one SAFE, byte-exact, vLLM-mirroring scoped variant; it LOST. Honest
+negative recorded; **drain kept as-is, code reverted to baseline `7aa8a17e`.**
+
+**Mechanism (mirror vLLM).** Replace the spinning `cudaStreamSynchronize` drain
+with a BLOCKING (sleep) completion event recorded after the sample/scatter in
+`sample_tokens_async`, host-waited at the next `execute_model` top — same wait
+BOUNDARY (byte-identical, equally UAF-safe), only spin→sleep. Mirrors vLLM's
+`prepare_inputs_event = torch.cuda.Event(blocking=True)` (gpu_model_runner.py
+738-743 / synchronize_input_prep 3857-3870). Added `bool blocking` to
+`vt::Backend::CreateEvent` (CUDA `cudaEventBlockingSync`).
+
+**Result (dgx.casa GB10, dual-lock, worker parked, single load/arm, 3 reps c16,
+never reload/rep; both binaries recompiled 81 TUs from ONE box src toggling only
+the 5-file diff, md5 A `852ee96c`!=B `6112a885`):** total tok/s medians drain
+**2308.0** (2307.1/2308.0/2336.9) vs event **2263.2** (2263.2/2259.3/2263.9) =
+**0.981x, −1.9%**, bands NON-OVERLAPPING, worse on tput+TPOT(47.6→49.0)+TTFT;
+96/96 completed 0 failed both arms. Safety/byte-exactness held: SACRED
+`test_qwen36_paged_engine` exit=0 (Arm-B build), served ignore_eos UAF bracket
+(mt 4-128) all 200+ALIVE on Arm B. CPU gates green (test_runner 17/17 incl.
+drain-invariant, llm_engine 11/11, dense 6/6, engine_core_proc 10/10,
+async_llm 8/8).
+
+**Root cause CONFIRMED (was suspect).** c16 cost is NOT driver-lock spin — a
+blocking event at the same boundary is SLOWER (per-step sleep/wake ~+1.5 ms TPOT;
+single-rank GB10 has no TP lock contention for the blocking event to relieve).
+It is the depth-2 **serialization** the drain guards: on the integrated host-array
+combine path, `update_states`' host `condense` reorders `last_sampled_tokens` —
+the array the previous step's device scatter WRITES and the next step's combine
+READS — a true read-after-write on the scatter (the last main-queue op). So any
+safe drain waits ~the whole GPU tail before `update_states`, and `prepare_inputs`
+is gated behind it. The pre-fix c16 "win" was the RACE itself (matches the prior
+"corruption-subsidized state bandwidth" c16/c32 finding). No scoped/event/
+conditional drain recovers this on the current architecture.
+
+**Real lever (open, larger, separately-gated).** Keep sampled tokens GPU-resident
++ GPU reorder — vLLM's `prev_sampled_token_ids` device tensor + `_prepare_input_
+ids` gather (gpu_model_runner.py 1786-1881), so `_update_states` never touches a
+device-written buffer. Our W4 device-mirror (`AsyncDeviceInputs`,
+`replay_last_sampled_ops`, `VT_ASYNC_DEVICE_MIRROR=1`) already does this for
+DISCRETE CUDA (OFF on integrated GB10, serving A/B never run). Enabling it on the
+integrated path (drop the `is_integrated_gpu()` host-array branch) removes the
+`condense`↔scatter dep, and additionally needs hazard-A (double-buffer
+`exec_state_` vs in-flight forward) + hazard-C (block-table device buffer). This
+is the device-resident-sampled-tokens architecture, not a small drain tweak.
+Evidence `dgx:~/work/q35-regrid/evidence/raw/35/ours/c16-r{1,2,3}-{abdrain,abevent}.json`;
+full A/B in benchmark-record. No source/kernel/model/gate mark changed (code at baseline).

@@ -39,6 +39,8 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kQ8_K:
     case DType::kIQ2_XXS:
     case DType::kIQ3_XXS:
+    case DType::kIQ2_S:
+    case DType::kMXFP4:
       break;
   }
   VT_CHECK(false, "unsupported storage dtype for scalar-type conversion");

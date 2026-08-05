@@ -902,6 +902,78 @@ TEST_CASE("runner: async device-input reads last_sampled over a stale host token
   CHECK(tok1 != kCorrupt);
 }
 
+// ─── ENG-ASYNC-SCHED depth-2 LIFETIME GUARD (serving heap-corruption regression) ─
+// Root cause of the 35B serving abort (`malloc(): unaligned tcache chunk`) under
+// async scheduling + ignore_eos past ~4-8 decode tokens: sample_tokens_async
+// leaves the forward / sample / scatter on the MAIN queue UNSYNCED (the depth-2
+// overlap defers the sampled-id D2H to the consuming step's get_output(), one
+// step_with_batch_queue call later). Those kernels still reference exec_state_
+// (device logits + StepInputs host arrays) and write input_batch_.last_sampled_
+// tokens. The NEXT execute_model() reset exec_state_ and mutated input_batch_
+// (update_states condense/swap) WHILE they ran -> use-after-free on GB10 unified
+// memory. It only reproduces under REAL GPU overlap: the CPU eager backend and
+// compute-sanitizer both serialize the queue, so the CPU gates stayed green while
+// the served model aborted. This test locks the INVARIANT the fix enforces:
+// sample_tokens_async marks async work outstanding, and the next execute_model
+// drains it before touching any shared state. RED before the fix (execute_model
+// never drained -> the flag would stay set / the field did not exist); GREEN after.
+TEST_CASE("runner: async sample_tokens_async work is drained before the next execute_model") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  GPUModelRunner runner(c, w, MakeKvConfig(c, DType::kBF16, DType::kF32), Q(), 8,
+                        kMaxModelLen, 64);
+  runner.set_async_input_combine(true);
+
+  const std::vector<int32_t> prompt = {5, 9, 2, 31, 17};
+  const int P = static_cast<int>(prompt.size());
+
+  // Fresh runner: no async work is outstanding yet.
+  CHECK_FALSE(runner.async_forward_in_flight());
+
+  // Prefill via the ASYNC sample path (the serving path — step_with_batch_queue).
+  SchedulerOutput s1 =
+      NewStep({MakeNewReq("A", prompt, {}, 0, {0, 1}, 0, Greedy())}, {{"A", P}});
+  CHECK_FALSE(runner.execute_model(s1).has_value());
+  std::unique_ptr<vllm::v1::AsyncModelRunnerOutput> a1 =
+      runner.sample_tokens_async(std::nullopt);
+  // The async sample left main-queue work referencing exec_state_ / input_batch_.
+  CHECK(runner.async_forward_in_flight());
+  ModelRunnerOutput m1 = a1->get_output();
+  REQUIRE(m1.sampled_token_ids[0].size() == 1);
+  int32_t last = m1.sampled_token_ids[0][0];
+
+  // Continue past the trigger (ignore_eos regime): every async decode step must
+  // (a) find the guard already set from the prior step, then (b) DRAIN it at the
+  // top of execute_model before it resets exec_state_ / condenses input_batch_.
+  int computed = P, outputs = 1;
+  for (int k = 0; k < 10; ++k) {
+    SchedulerOutput sd = DecodeStep("A", computed, outputs);
+    CHECK(runner.async_forward_in_flight());          // set by the previous step
+    CHECK_FALSE(runner.execute_model(sd).has_value());
+    CHECK_FALSE(runner.async_forward_in_flight());     // DRAINED before mutation
+    // The decode input id is the previous step's sampled token (state intact).
+    CHECK(runner.last_step().input_token_ids == std::vector<int32_t>{last});
+    std::unique_ptr<vllm::v1::AsyncModelRunnerOutput> ad =
+        runner.sample_tokens_async(std::nullopt);
+    CHECK(runner.async_forward_in_flight());
+    ModelRunnerOutput md = ad->get_output();
+    REQUIRE(md.sampled_token_ids[0].size() == 1);
+    last = md.sampled_token_ids[0][0];
+    computed += 1;
+    outputs += 1;
+  }
+
+  // The SYNC sample path leaves nothing outstanding (it synchronizes to read the
+  // ids on host), so it must NOT arm the guard — the sync engine is unaffected.
+  GPUModelRunner sync_runner(c, w, MakeKvConfig(c, DType::kBF16, DType::kF32),
+                             Q(), 8, kMaxModelLen, 64);
+  SchedulerOutput s2 =
+      NewStep({MakeNewReq("A", prompt, {}, 0, {0, 1}, 0, Greedy())}, {{"A", P}});
+  CHECK_FALSE(sync_runner.execute_model(s2).has_value());
+  (void)sync_runner.sample_tokens(std::nullopt);
+  CHECK_FALSE(sync_runner.async_forward_in_flight());
+}
+
 // ─── 4. Two-request greedy batch step (per-request logits rows) ───────────────
 TEST_CASE("runner: 2-request greedy batch samples each from its own logits row") {
   const HfConfig c = MakeConfig();

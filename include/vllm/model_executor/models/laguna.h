@@ -389,7 +389,13 @@ struct LagunaKvCache {
   // ON-STREAM at index dev_rows (no host insert, no per-layer DrainQueue). No
   // eviction — the decode_attn window mask handles sliding layers (full-deck),
   // so dev_first_pos stays the prefill value (graph-ready: a per-layer constant).
-  std::vector<std::vector<float>> k_dev, v_dev;  // [layer] max_cap*kvdim
+  std::vector<std::vector<float>> k_dev, v_dev;  // [layer] max_cap*kvdim (f32 path)
+  // LEVER A (VT_LAGUNA_KV_BF16): the bf16 alternative to k_dev/v_dev — HALF the KV DRAM
+  // (2 B/elem), moved every layer every step, matching vLLM's bf16 KV. Only ONE of the two
+  // (f32 k_dev OR bf16 k_dev16) is allocated per run (env-gated), so the proven f32 path is
+  // byte-identical when bf16 is off. Stored as raw bf16 bits (uint16_t); passed to the CUDA
+  // kernels via the float* param as an address pun (the kernels reinterpret to bf16).
+  std::vector<std::vector<uint16_t>> k_dev16, v_dev16;  // [layer] max_cap*kvdim (bf16 path)
   std::vector<int64_t> dev_first_pos;            // [layer] frozen at migration
   std::vector<int64_t> dev_rows;                 // [layer] cached-row count (grows 1/token)
   int64_t max_cap = 0;
@@ -414,6 +420,8 @@ struct LagunaKvCache {
     kv_heads = hkv;
     k_dev.clear();
     v_dev.clear();
+    k_dev16.clear();
+    v_dev16.clear();
     dev_first_pos.clear();
     dev_rows.clear();
     max_cap = 0;

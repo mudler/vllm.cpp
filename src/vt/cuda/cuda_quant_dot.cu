@@ -27,12 +27,15 @@
 // reduction vs the CPU's sequential add), so the gate is: INTEGER core bit-exact,
 // final scale within the same NMSE band `test_ops_quant_dot` uses (5e-4).
 //
-// COVERAGE. The seven Q8_K-family encodings (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
-// IQ2_XXS, IQ3_XXS — all dot against a Q8_K activation) run natively on the GPU;
-// DeepSeek-V4's experts are IQ2_XXS / IQ3_XXS / Q2_K. The two legacy Q8_0-
-// activation encodings (Q4_0, Q8_0) fall back to the CPU keep-quant kernel over
-// the SAME unified-memory tensors (correct, just not GPU-accelerated) — nothing
-// in the DeepSeek-V4 vehicle uses them.
+// COVERAGE. The eight Q8_K-family encodings (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
+// IQ2_XXS, IQ3_XXS, IQ2_S — all dot against a Q8_K activation) run natively on
+// the GPU; DeepSeek-V4's experts are IQ2_XXS / IQ3_XXS / Q2_K (UD-IQ2_XXS) and
+// IQ2_S (UD-IQ2_M gate/up). The Q8_0-activation encodings (Q4_0, Q8_0, and MXFP4
+// — the UD-IQ2_M ffn_down) fall back to the CPU keep-quant kernel over the SAME
+// unified-memory tensors (correct, just not GPU-accelerated): they dot against a
+// 32-element Q8_0 activation, not the 256-element Q8_K super-block this templated
+// GEMM quantizes to, so a native GPU path for them needs a separate
+// Q8_0-activation GEMM variant (DotMXFP4 has the ready device math). BOX-DEFERRED.
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -53,8 +56,10 @@
 namespace vt::cuda {
 namespace {
 
+using vt::cpu::BlockIQ2_S;
 using vt::cpu::BlockIQ2_XXS;
 using vt::cpu::BlockIQ3_XXS;
+using vt::cpu::BlockMXFP4;
 using vt::cpu::BlockQ2_K;
 using vt::cpu::BlockQ3_K;
 using vt::cpu::BlockQ4_K;
@@ -62,8 +67,9 @@ using vt::cpu::BlockQ5_K;
 using vt::cpu::BlockQ6_K;
 using vt::cpu::BlockQ8_0;
 using vt::cpu::BlockQ8_K;
-using vt::cpu::kQK8_0;  // 32
-using vt::cpu::kQK_K;   // 256
+using vt::cpu::kQK8_0;     // 32
+using vt::cpu::kQK_K;      // 256
+using vt::cpu::kQK_MXFP4;  // 32
 
 void CheckCuda(cudaError_t err, const char* what) {
   if (err != cudaSuccess) {
@@ -130,6 +136,14 @@ __device__ inline uint16_t DF32ToF16(float f) {
   uint32_t rem = mant & 0x1FFF;
   if (rem > 0x1000 || (rem == 0x1000 && (half & 1))) ++half;
   return static_cast<uint16_t>(sign | half);
+}
+
+// cpu_quant_iq_tables.h E8M0ToF32Half (ggml-impl.h:477) — bit-exact port. Decodes
+// an MXFP4 E8M0 block scale to 2^(byte-128); pairs with d_kvalues_mxfp4 (= 2*e2m1).
+__device__ inline float DE8M0ToF32Half(uint8_t x) {
+  const uint32_t bits =
+      x < 2 ? (0x00200000u << x) : (static_cast<uint32_t>(x - 1) << 23);
+  return __int_as_float(static_cast<int>(bits));
 }
 
 // cpu_quant_act.cpp NearestInt (ggml-quants.c:563) — magic-constant round-to-even.
@@ -348,6 +362,69 @@ __device__ inline float DotIQ3XXS(const BlockIQ3_XXS* xb, const BlockQ8_K* yb) {
     bsum += sumi * static_cast<int32_t>(ls);
   }
   return d * bsum;  // final *0.25 applied after the warp reduction
+}
+
+// cpu_quant_dot.cpp VecDotIQ2_SQ8_K (quants.c:947) — one super-block. Scalar
+// port (mirrors DotIQ3XXS's structure) — a __dp4a last-mile pass can follow the
+// IQ2_XXS treatment later. 10-bit grid index = qs[l] | qh high 2 bits into
+// d_iq2s_grid; the DIRECT sign byte signs[l] (= qs + QK_K/8, NO ksigns lookup)
+// flips lanes; per-32 ls = 1 + 2*ls_nibble fold in; final *0.125 after the warp
+// reduction. BIT-IDENTICAL integer core to the CPU reference.
+__device__ inline float DotIQ2S(const BlockIQ2_S* xb, const BlockQ8_K* yb) {
+  const float d = DF16ToF32(xb->d) * yb->d;
+  const int8_t* q8 = yb->qs;
+  const uint8_t* qs = xb->qs;
+  const uint8_t* qh = xb->qh;
+  const uint8_t* signs = qs + kQK_K / 8;
+  int32_t bsum = 0;
+  for (int ib32 = 0; ib32 < kQK_K / 32; ++ib32) {
+    const int ls1 = 1 + 2 * (xb->scales[ib32] & 0xf);
+    const int ls2 = 1 + 2 * (xb->scales[ib32] >> 4);
+    int sumi1 = 0;
+    int sumi2 = 0;
+    for (int l = 0; l < 2; ++l) {
+      const uint8_t* grid = reinterpret_cast<const uint8_t*>(
+          &d_iq2s_grid[qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)]);
+      for (int j = 0; j < 8; ++j)
+        sumi1 += q8[j] * grid[j] * ((signs[l] & d_kmask_iq2xs[j]) ? -1 : 1);
+      q8 += 8;
+    }
+    for (int l = 2; l < 4; ++l) {
+      const uint8_t* grid = reinterpret_cast<const uint8_t*>(
+          &d_iq2s_grid[qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)]);
+      for (int j = 0; j < 8; ++j)
+        sumi2 += q8[j] * grid[j] * ((signs[l] & d_kmask_iq2xs[j]) ? -1 : 1);
+      q8 += 8;
+    }
+    bsum += ls1 * sumi1 + ls2 * sumi2;
+    qs += 4;
+    signs += 4;
+  }
+  return d * bsum;  // final *0.125 applied after the warp reduction
+}
+
+// cpu_quant_dot.cpp VecDotMXFP4Q8_0 (quants.c:247) — one MXFP4 (32-elem) block
+// dotted against ONE Q8_0 activation block. BOX-DEFERRED / NOT YET WIRED into a
+// GEMM: the templated GEMM below is Q8_K-activation-only (its DotSuperblock takes
+// a BlockQ8_K and the K super-block is 256 elements), whereas MXFP4 dots against
+// a 32-element Q8_0 activation. Reaching the GPU therefore needs a separate
+// Q8_0-activation grouped-MoE GEMM variant (the Q8_0 prologue + a 32-elem block
+// walk); until that lands, MXFP4 correctly CPU-fallbacks like Q4_0/Q8_0
+// (IsCudaKeepQuantSupported returns false for it). The math here is ready for
+// that variant and is BIT-IDENTICAL to the CPU reference's integer core.
+// [[maybe_unused]]: intentionally not yet referenced (awaits the Q8_0-activation
+// GEMM variant above) — keeps the ready device math without tripping nvcc #177-D
+// under -Werror.
+[[maybe_unused]] __device__ inline float DotMXFP4(const BlockMXFP4* xb,
+                                                  const BlockQ8_0* yb) {
+  const float d = DF16ToF32(yb->d) * DE8M0ToF32Half(xb->e);
+  int sumi1 = 0;
+  int sumi2 = 0;
+  for (int j = 0; j < kQK_MXFP4 / 2; ++j) {
+    sumi1 += yb->qs[j + 0] * d_kvalues_mxfp4[xb->qs[j] & 0xf];
+    sumi2 += yb->qs[j + kQK_MXFP4 / 2] * d_kvalues_mxfp4[xb->qs[j] >> 4];
+  }
+  return d * (sumi1 + sumi2);
 }
 
 // cpu_quant_dot.cpp VecDotQ2_KQ8_K (quants.c:514) — one super-block.
@@ -569,6 +646,10 @@ enum class WType : int {
   kQ4_K = 4,
   kQ5_K = 5,
   kQ6_K = 6,
+  kIQ2_S = 7,  // UD-IQ2_M ffn_gate/up (Q8_K activation, fits this GEMM)
+  // NOTE: MXFP4 is intentionally ABSENT — it dots against a 32-element Q8_0
+  // activation, not Q8_K, so it cannot slot into this Q8_K super-block GEMM
+  // (see DotMXFP4). It CPU-fallbacks until a Q8_0-activation GEMM variant lands.
 };
 
 template <WType W>
@@ -601,10 +682,16 @@ template <>
 __device__ inline float DotSuperblock<WType::kQ6_K>(const void* w, const BlockQ8_K* a) {
   return DotQ6K(static_cast<const BlockQ6_K*>(w), a);
 }
+template <>
+__device__ inline float DotSuperblock<WType::kIQ2_S>(const void* w, const BlockQ8_K* a) {
+  return DotIQ2S(static_cast<const BlockIQ2_S*>(w), a);
+}
 
 template <WType W>
 __device__ constexpr float FinalFactor() {
-  return W == WType::kIQ2_XXS ? 0.125f : (W == WType::kIQ3_XXS ? 0.25f : 1.0f);
+  return (W == WType::kIQ2_XXS || W == WType::kIQ2_S)
+             ? 0.125f
+             : (W == WType::kIQ3_XXS ? 0.25f : 1.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -1438,7 +1525,10 @@ bool IsCudaKeepQuantSupported(DType dt, WType* out) {
     case DType::kQ4_K: *out = WType::kQ4_K; return true;
     case DType::kQ5_K: *out = WType::kQ5_K; return true;
     case DType::kQ6_K: *out = WType::kQ6_K; return true;
-    default: return false;  // Q4_0 / Q8_0 (Q8_0-activation) -> CPU fallback
+    case DType::kIQ2_S: *out = WType::kIQ2_S; return true;
+    // MXFP4 (Q8_0-activation, 32-elem blocks) is NOT handled by this Q8_K GEMM;
+    // it falls through to CPU like Q4_0 / Q8_0 until a Q8_0-activation GEMM lands.
+    default: return false;  // Q4_0 / Q8_0 / MXFP4 (Q8_0-activation) -> CPU fallback
   }
 }
 
@@ -1705,6 +1795,7 @@ void MatmulBTQuantKernelCuda(Queue& q, Tensor& out, const Tensor& a,
     case WType::kQ4_K: LaunchGemm<WType::kQ4_K>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     case WType::kQ5_K: LaunchGemm<WType::kQ5_K>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     case WType::kQ6_K: LaunchGemm<WType::kQ6_K>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kIQ2_S: LaunchGemm<WType::kIQ2_S>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
   }
   CheckCuda(cudaGetLastError(), "matmul_bt_quant launch");
 }
@@ -1787,6 +1878,7 @@ void MatmulBTQuantGroupedKernelCuda(Queue& q, Tensor& out, const Tensor& act,
     case WType::kQ4_K: LaunchGroupedGemm<WType::kQ4_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
     case WType::kQ5_K: LaunchGroupedGemm<WType::kQ5_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
     case WType::kQ6_K: LaunchGroupedGemm<WType::kQ6_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kIQ2_S: LaunchGroupedGemm<WType::kIQ2_S>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
   }
   CheckCuda(cudaGetLastError(), "matmul_bt_quant_grouped launch");
 }
@@ -1955,6 +2047,7 @@ void MoeGateUpSwiGLUGroupedCuda(Queue& q, Tensor& out, const Tensor& act, const 
     case WType::kQ4_K: LaunchGroupedFusedSwiGLU<WType::kQ4_K>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
     case WType::kQ5_K: LaunchGroupedFusedSwiGLU<WType::kQ5_K>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
     case WType::kQ6_K: LaunchGroupedFusedSwiGLU<WType::kQ6_K>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kIQ2_S: LaunchGroupedFusedSwiGLU<WType::kIQ2_S>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
   }
   CheckCuda(cudaGetLastError(), "moe_gate_up_swiglu launch");
 }

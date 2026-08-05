@@ -87,6 +87,40 @@ inline bool LagunaTopkShflOn() {
   return on;
 }
 
+// ── LEVER B: VT_LAGUNA_SWA_WINDOW (default ON): window-bounded SWA reads. ¾ of Laguna's
+// layers are sliding-window-512, yet the decode-attn kernels staged the FULL grown KV deck
+// into shared then discarded out-of-window rows with a `continue` AFTER the DRAM/smem load.
+// vLLM bounds the READ (laguna.py:412 per_layer_sliding_window). This starts each kernel's
+// tile loop at the tile-aligned floor of the first in-window row, so a sliding layer streams
+// ~window (≤512) rows instead of the whole deck — ~0 at short context, growing LINEARLY once
+// the deck exceeds the window. BYTE-EXACT (only fully-masked tiles are skipped; every
+// surviving key, its split, and the online-softmax order are identical). '0' rolls back to
+// the full-deck read (same-binary A/B proves byte-exactness: identical id stream).
+inline bool LagunaSwaWindowBoundOn() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_SWA_WINDOW");
+    return !(e != nullptr && e[0] == '0');  // default ON; =0 opts out
+  }();
+  return on;
+}
+
+// ── LEVER A: VT_LAGUNA_KV_BF16 (default OFF — opt-in): store the resident/graph decode KV at
+// bf16 (2 B/elem) instead of f32. vLLM stores bf16 KV (cache.py:76 auto→model bf16; FA2
+// supports bf16 KV) — the f32 store moved 2× the KV DRAM every layer every step. K/V are cast
+// to bf16 on append and widened bf16→f32 in-register in the smem-load of the decode-attn
+// kernels. NOT byte-exact (bf16-rounded KV) → DISTRIBUTIONAL near-tie vs vLLM. DEFAULT OFF:
+// a prior short-context (~130 tok) attempt (STATUS CLAIM-LAGUNA-KV-ATTN-BF16, 2026-08-02) was
+// a WASH and flipped the near-tie prefix at decode step 2 — the KV-read DRAM is a small share
+// at short context. The win is expected to grow LINEARLY with context; keep OFF until a
+// two-length (256 & 2048) slope on GB10 proves it at ~2k, then flip the default. '1' opts in.
+inline bool LagunaKvBf16On() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_LAGUNA_KV_BF16");
+    return (e != nullptr && e[0] == '1');  // default OFF; =1 opts in
+  }();
+  return on;
+}
+
 // Warp-shuffle argmax by (val desc, idx asc) — no __syncthreads. Full-warp mask; used by the
 // byte-exact SigmoidTopKShflKernel round reduce (lane-uniform trip count).
 __device__ __forceinline__ void LagArgmaxWarpShfl(float& val, int& idx) {
@@ -415,12 +449,40 @@ __global__ void FusedQkNormRopeGKernel(float* qbuf, float* kbuf, const float* q_
 // across replays but the POINTERS are fixed ⇒ capture-safe. Called AFTER the graph decode
 // attention consumed knew/vnew, so appending row *len_dev creates no intra-replay hazard.
 __global__ void AppendKvRowKernel(float* cache_k, float* cache_v, const float* knew,
-                                  const float* vnew, int64_t kvdim, const int* len_dev) {
+                                  const float* vnew, int64_t kvdim, const int* len_dev,
+                                  bool kv_bf16) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= kvdim) return;
   const int64_t off = static_cast<int64_t>(*len_dev) * kvdim;
-  cache_k[off + i] = knew[i];
-  cache_v[off + i] = vnew[i];
+  // LEVER A: the new token's K/V arrive f32 (knew/vnew); the cache stores bf16 when kv_bf16
+  // (round-to-nearest-even, matching the smem-load widen) — cache_k/cache_v are then bf16
+  // byte buffers passed through the float* param (address pun; see DecodeAttnGqaGKernel).
+  if (kv_bf16) {
+    reinterpret_cast<__nv_bfloat16*>(cache_k)[off + i] = __float2bfloat16(knew[i]);
+    reinterpret_cast<__nv_bfloat16*>(cache_v)[off + i] = __float2bfloat16(vnew[i]);
+  } else {
+    cache_k[off + i] = knew[i];
+    cache_v[off + i] = vnew[i];
+  }
+}
+
+// LEVER A eager-path sibling of AppendKvRowKernel: the append slot comes from a HOST offset
+// `off_rows` baked into the launch (the eager LagunaForwardResidentDecode loop is async, so
+// a single shared device len int would race across layers with differing sliding-window row
+// counts). Same f32→bf16 cast (or f32 store) as AppendKvRowKernel.
+__global__ void AppendKvRowCastKernel(float* cache_k, float* cache_v, const float* knew,
+                                      const float* vnew, int64_t kvdim, int64_t off_rows,
+                                      bool kv_bf16) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= kvdim) return;
+  const int64_t off = off_rows * kvdim;
+  if (kv_bf16) {
+    reinterpret_cast<__nv_bfloat16*>(cache_k)[off + i] = __float2bfloat16(knew[i]);
+    reinterpret_cast<__nv_bfloat16*>(cache_v)[off + i] = __float2bfloat16(vnew[i]);
+  } else {
+    cache_k[off + i] = knew[i];
+    cache_v[off + i] = vnew[i];
+  }
 }
 
 // ── Brick B: one-pass GQA-broadcast flash decode attention ──────────────────
@@ -443,7 +505,8 @@ constexpr int kLagTile = 32;             // keys staged per shared tile
 __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, const float* v,
                                     int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group,
                                     int64_t kv_rows, int64_t q_pos, int64_t first_pos,
-                                    int64_t window, float scale, const float* gate) {
+                                    int64_t window, float scale, const float* gate, bool bound,
+                                    bool kv_bf16) {
   const int64_t g = static_cast<int64_t>(blockIdx.x);  // KV head this block owns
   if (g >= Hkv) return;
   const int warp = static_cast<int>(threadIdx.x) >> 5;   // == q-head within the group
@@ -466,7 +529,19 @@ __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, co
   __shared__ float ksh[kLagTile * kLagDh];  // 16 KiB
   __shared__ float vsh[kLagTile * kLagDh];  // 16 KiB
 
-  for (int64_t base = 0; base < kv_rows; base += kLagTile) {
+  // LEVER B: window-bounded READ. For sliding-window layers (window>0), row gj (global
+  // pos first_pos+gj) is kept iff q_pos-(first_pos+gj)<window <=> gj > q_pos-window-first_pos.
+  // Skip STAGING whole tiles that lie entirely below that first-kept index — every row in
+  // them is already discarded by the `continue` below, so dropping the DRAM/smem load is
+  // BYTE-EXACT (the surviving keys, their order, and the online-softmax accumulation are
+  // identical). Start at the tile-aligned floor so the partial first tile still masks
+  // correctly. Streams ~window rows instead of the full grown deck on the sliding layers.
+  int64_t base_start = 0;
+  if (bound && window > 0) {
+    const int64_t gj_min = q_pos - window - first_pos + 1;
+    if (gj_min > 0) base_start = (gj_min / kLagTile) * kLagTile;
+  }
+  for (int64_t base = base_start; base < kv_rows; base += kLagTile) {
     const int64_t cnt = (kv_rows - base < kLagTile) ? (kv_rows - base) : kLagTile;
     const int64_t nload = cnt * Dh;  // elems per K (or V) block
     // Cooperative stage: [0,nload) → K rows, [nload,2*nload) → V rows (each read ONCE).
@@ -474,8 +549,13 @@ __global__ void DecodeAttnGqaKernel(float* o, const float* q, const float* k, co
       const bool isv = idx >= nload;
       const int64_t e = isv ? (idx - nload) : idx;
       const int64_t row = e / Dh, col = e % Dh;
+      // LEVER A: widen the bf16 cache → f32 in-register (kv_bf16); else read f32 directly.
+      // src is the cache K/V passed through the float* param (address pun) — reinterpret to
+      // bf16 for the load when the cache stores bf16.
+      const int64_t sidx = ((base + row) * Hkv + g) * Dh + col;
       const float* src = isv ? v : k;
-      (isv ? vsh : ksh)[row * Dh + col] = src[((base + row) * Hkv + g) * Dh + col];
+      (isv ? vsh : ksh)[row * Dh + col] =
+          kv_bf16 ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(src)[sidx]) : src[sidx];
     }
     __syncthreads();
     if (active) {
@@ -535,7 +615,7 @@ __global__ void DecodeAttnGqaGKernel(float* o, const float* q, const float* k, c
                                      const float* knew, const float* vnew, int64_t Hq, int64_t Hkv,
                                      int64_t Dh, int64_t group, int64_t first_pos, int64_t window,
                                      float scale, const int* len_dev, const int* pos_dev,
-                                     const float* gate) {
+                                     const float* gate, bool bound, bool kv_bf16) {
   const int64_t g = static_cast<int64_t>(blockIdx.x);  // KV head this block owns
   if (g >= Hkv) return;
   const int warp = static_cast<int>(threadIdx.x) >> 5;   // == q-head within the group
@@ -560,7 +640,15 @@ __global__ void DecodeAttnGqaGKernel(float* o, const float* q, const float* k, c
   __shared__ float ksh[kLagTile * kLagDh];  // 16 KiB
   __shared__ float vsh[kLagTile * kLagDh];  // 16 KiB
 
-  for (int64_t base = 0; base < total; base += kLagTile) {
+  // LEVER B: window-bounded READ (byte-exact; see DecodeAttnGqaKernel). first_pos==0 here
+  // (graph ctor asserts it, laguna.cpp:2092), so gj_min == q_pos-window+1; the new row
+  // (gj==len==q_pos) is always in-window. Skip staging tiles fully below the window.
+  int64_t base_start = 0;
+  if (bound && window > 0) {
+    const int64_t gj_min = q_pos - window - first_pos + 1;
+    if (gj_min > 0) base_start = (gj_min / kLagTile) * kLagTile;
+  }
+  for (int64_t base = base_start; base < total; base += kLagTile) {
     const int64_t cnt = (total - base < kLagTile) ? (total - base) : kLagTile;
     const int64_t nload = cnt * Dh;
     // Cooperative stage: rows [0,len) from the k/v cache, row == len from knew/vnew.
@@ -571,8 +659,11 @@ __global__ void DecodeAttnGqaGKernel(float* o, const float* q, const float* k, c
       const int64_t gj = base + row;  // global key index in [0,total)
       float val;
       if (gj < len) {
+        // LEVER A: cache stores bf16 when kv_bf16 → widen to f32; the new row (else) is f32.
+        const int64_t sidx = (gj * Hkv + g) * Dh + col;
         const float* src = isv ? v : k;
-        val = src[(gj * Hkv + g) * Dh + col];
+        val = kv_bf16 ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(src)[sidx])
+                      : src[sidx];
       } else {  // gj == len: the new (not-yet-appended) row, layout [Hkv,Dh]
         const float* src = isv ? vnew : knew;
         val = src[g * Dh + col];
@@ -639,7 +730,8 @@ __global__ void DecodeAttnGqaGKernel(float* o, const float* q, const float* k, c
 __global__ void DecodeAttnGqaSplitKernel(float* mp, float* lp, float* op, const float* q,
                                          const float* k, const float* v, int64_t Hq, int64_t Hkv,
                                          int64_t Dh, int64_t group, int64_t kv_rows, int64_t q_pos,
-                                         int64_t first_pos, int64_t window, float scale, int SPLIT) {
+                                         int64_t first_pos, int64_t window, float scale, int SPLIT,
+                                         bool bound, bool kv_bf16) {
   const int64_t g = static_cast<int64_t>(blockIdx.x);  // KV head this block owns
   if (g >= Hkv) return;
   const int sp = static_cast<int>(blockIdx.y);         // split index within head g
@@ -665,15 +757,31 @@ __global__ void DecodeAttnGqaSplitKernel(float* mp, float* lp, float* op, const 
   __shared__ float ksh[kLagTile * kLagDh];
   __shared__ float vsh[kLagTile * kLagDh];
 
-  for (int64_t base = row_begin; base < row_end; base += kLagTile) {
+  // LEVER B: window-bounded READ (byte-exact; see DecodeAttnGqaKernel). Advance from this
+  // split's row_begin over WHOLE tiles that lie entirely below the window. The split's row
+  // PARTITION (rps/row_begin/row_end) is UNCHANGED — only fully-masked front tiles are
+  // skipped — so every surviving key stays in the SAME split with the SAME accumulation
+  // order and the combine merges identically ⇒ byte-exact vs the un-bounded split.
+  int64_t base_start = row_begin;
+  if (bound && window > 0) {
+    const int64_t gj_min = q_pos - window - first_pos + 1;
+    if (gj_min > row_begin)
+      base_start = row_begin + ((gj_min - row_begin) / kLagTile) * kLagTile;
+  }
+  for (int64_t base = base_start; base < row_end; base += kLagTile) {
     const int64_t cnt = (row_end - base < kLagTile) ? (row_end - base) : kLagTile;
     const int64_t nload = cnt * Dh;
     for (int64_t idx = threadIdx.x; idx < 2 * nload; idx += nth) {
       const bool isv = idx >= nload;
       const int64_t e = isv ? (idx - nload) : idx;
       const int64_t row = e / Dh, col = e % Dh;
+      // LEVER A: widen the bf16 cache → f32 in-register (kv_bf16); else read f32 directly.
+      // src is the cache K/V passed through the float* param (address pun) — reinterpret to
+      // bf16 for the load when the cache stores bf16.
+      const int64_t sidx = ((base + row) * Hkv + g) * Dh + col;
       const float* src = isv ? v : k;
-      (isv ? vsh : ksh)[row * Dh + col] = src[((base + row) * Hkv + g) * Dh + col];
+      (isv ? vsh : ksh)[row * Dh + col] =
+          kv_bf16 ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(src)[sidx]) : src[sidx];
     }
     __syncthreads();
     if (active) {
@@ -721,7 +829,7 @@ __global__ void DecodeAttnGqaSplitGKernel(float* mp, float* lp, float* op, const
                                           const float* vnew, int64_t Hq, int64_t Hkv, int64_t Dh,
                                           int64_t group, int64_t first_pos, int64_t window,
                                           float scale, const int* len_dev, const int* pos_dev,
-                                          int SPLIT) {
+                                          int SPLIT, bool bound, bool kv_bf16) {
   const int64_t g = static_cast<int64_t>(blockIdx.x);
   if (g >= Hkv) return;
   const int sp = static_cast<int>(blockIdx.y);
@@ -750,7 +858,15 @@ __global__ void DecodeAttnGqaSplitGKernel(float* mp, float* lp, float* op, const
   __shared__ float ksh[kLagTile * kLagDh];
   __shared__ float vsh[kLagTile * kLagDh];
 
-  for (int64_t base = row_begin; base < row_end; base += kLagTile) {
+  // LEVER B: window-bounded READ (byte-exact; see DecodeAttnGqaSplitKernel). Same split-
+  // preserving advance; first_pos==0 here (graph ctor asserts it, laguna.cpp:2092).
+  int64_t base_start = row_begin;
+  if (bound && window > 0) {
+    const int64_t gj_min = q_pos - window - first_pos + 1;
+    if (gj_min > row_begin)
+      base_start = row_begin + ((gj_min - row_begin) / kLagTile) * kLagTile;
+  }
+  for (int64_t base = base_start; base < row_end; base += kLagTile) {
     const int64_t cnt = (row_end - base < kLagTile) ? (row_end - base) : kLagTile;
     const int64_t nload = cnt * Dh;
     for (int64_t idx = threadIdx.x; idx < 2 * nload; idx += nth) {
@@ -760,8 +876,11 @@ __global__ void DecodeAttnGqaSplitGKernel(float* mp, float* lp, float* op, const
       const int64_t gj = base + row;  // global key index in [0,total)
       float val;
       if (gj < len) {
+        // LEVER A: cache stores bf16 when kv_bf16 → widen to f32; the new row (else) is f32.
+        const int64_t sidx = (gj * Hkv + g) * Dh + col;
         const float* src = isv ? v : k;
-        val = src[(gj * Hkv + g) * Dh + col];
+        val = kv_bf16 ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(src)[sidx])
+                      : src[sidx];
       } else {  // gj == len: the new (not-yet-appended) row, layout [Hkv,Dh]
         const float* src = isv ? vnew : knew;
         val = src[g * Dh + col];
@@ -1160,8 +1279,17 @@ void FusedQkNormRopeGLaunch(Queue& q, float* qbuf, float* kbuf, const float* q_n
 }
 void AppendKvRowLaunch(Queue& q, float* cache_k, float* cache_v, const float* knew,
                        const float* vnew, int64_t kvdim, const int* len_dev) {
+  // LEVER A: cast f32→bf16 on append when the cache stores bf16 (cache_k/cache_v are then
+  // bf16 byte buffers passed via the float* param). Read once (baked at graph capture).
   AppendKvRowKernel<<<Blocks(kvdim), kTPB, 0, AsStream(q)>>>(cache_k, cache_v, knew, vnew, kvdim,
-                                                             len_dev);
+                                                             len_dev, LagunaKvBf16On());
+}
+// LEVER A eager-path append with a HOST row offset (see AppendKvRowCastKernel). Same env-gated
+// f32→bf16 cast; used by LagunaForwardResidentDecode instead of a raw f32→f32 Copy.
+void AppendKvRowCastLaunch(Queue& q, float* cache_k, float* cache_v, const float* knew,
+                           const float* vnew, int64_t kvdim, int64_t off_rows) {
+  AppendKvRowCastKernel<<<Blocks(kvdim), kTPB, 0, AsStream(q)>>>(cache_k, cache_v, knew, vnew,
+                                                                 kvdim, off_rows, LagunaKvBf16On());
 }
 void DecodeAttnGqaLaunch(Queue& q, float* o, const float* qd, const float* k, const float* v,
                          int64_t Hq, int64_t Hkv, int64_t Dh, int64_t group, int64_t kv_rows,
@@ -1173,10 +1301,13 @@ void DecodeAttnGqaLaunch(Queue& q, float* o, const float* qd, const float* k, co
   // L1: `gate` (or nullptr) folds the softplus out-gate into the normalized store below.
   const unsigned blk = static_cast<unsigned>(group * 32);
   cudaStream_t st = AsStream(q);
+  const bool bound = LagunaSwaWindowBoundOn();  // LEVER B: window-bounded SWA read
+  const bool kv_bf16 = LagunaKvBf16On();        // LEVER A: bf16 cache (k/v are bf16 buffers)
   const int SPLIT = ChooseSplitEager(kv_rows, Hkv);
   if (SPLIT <= 1) {  // byte-exact single-block fallback (tiny kv_rows)
     DecodeAttnGqaKernel<<<static_cast<unsigned>(Hkv), blk, 0, st>>>(
-        o, qd, k, v, Hq, Hkv, Dh, group, kv_rows, q_pos, first_pos, window, scale, gate);
+        o, qd, k, v, Hq, Hkv, Dh, group, kv_rows, q_pos, first_pos, window, scale, gate, bound,
+        kv_bf16);
     return;
   }
   const size_t need = static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT) *
@@ -1187,7 +1318,8 @@ void DecodeAttnGqaLaunch(Queue& q, float* o, const float* qd, const float* k, co
   float* lp = mp + static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT);
   const dim3 grid(static_cast<unsigned>(Hkv), static_cast<unsigned>(SPLIT));
   DecodeAttnGqaSplitKernel<<<grid, blk, 0, st>>>(mp, lp, op, qd, k, v, Hq, Hkv, Dh, group, kv_rows,
-                                                 q_pos, first_pos, window, scale, SPLIT);
+                                                 q_pos, first_pos, window, scale, SPLIT, bound,
+                                                 kv_bf16);
   const size_t csh = static_cast<size_t>(3 * SPLIT) * sizeof(float);
   DecodeAttnCombineKernel<<<static_cast<unsigned>(Hq), static_cast<unsigned>(kLagDh), csh, st>>>(
       o, mp, lp, op, Hq, Dh, SPLIT, gate);
@@ -1203,11 +1335,13 @@ void DecodeAttnGqaGLaunch(Queue& q, float* o, const float* qd, const float* k, c
   // the combine's baked scratch pointer stays valid across replays. STATIC shared (ksh/vsh).
   const unsigned blk = static_cast<unsigned>(group * 32);
   cudaStream_t st = AsStream(q);
+  const bool bound = LagunaSwaWindowBoundOn();  // LEVER B: window-bounded SWA read (baked at capture)
+  const bool kv_bf16 = LagunaKvBf16On();        // LEVER A: bf16 cache (baked at capture)
   constexpr int SPLIT = kLagSplitGraph;
   if (SPLIT <= 1) {  // byte-exact single-block fallback (keeps the original kernel live)
     DecodeAttnGqaGKernel<<<static_cast<unsigned>(Hkv), blk, 0, st>>>(
         o, qd, k, v, knew, vnew, Hq, Hkv, Dh, group, first_pos, window, scale, len_dev, pos_dev,
-        gate);
+        gate, bound, kv_bf16);
     return;
   }
   const size_t need = static_cast<size_t>(Hq) * static_cast<size_t>(SPLIT) *
@@ -1219,7 +1353,7 @@ void DecodeAttnGqaGLaunch(Queue& q, float* o, const float* qd, const float* k, c
   const dim3 grid(static_cast<unsigned>(Hkv), static_cast<unsigned>(SPLIT));
   DecodeAttnGqaSplitGKernel<<<grid, blk, 0, st>>>(mp, lp, op, qd, k, v, knew, vnew, Hq, Hkv, Dh,
                                                   group, first_pos, window, scale, len_dev, pos_dev,
-                                                  SPLIT);
+                                                  SPLIT, bound, kv_bf16);
   const size_t csh = static_cast<size_t>(3 * SPLIT) * sizeof(float);
   DecodeAttnCombineKernel<<<static_cast<unsigned>(Hq), static_cast<unsigned>(kLagDh), csh, st>>>(
       o, mp, lp, op, Hq, Dh, SPLIT, gate);
@@ -1266,7 +1400,7 @@ const LagunaDeviceKernels kLaguna = {&RmsNormSeqLaunch,    &RopeFromCacheLaunch,
                                      &LmHeadGemvLaunch,    &AppendKvRowLaunch,
                                      &RopeFromCacheGLaunch, &EmbedGatherLaunch,
                                      &AddAdd2RmsNormStdLaunch, &FusedQkNormRopeGLaunch,
-                                     &AddAdd2RmsNormStdBf16Launch};
+                                     &AddAdd2RmsNormStdBf16Launch, &AppendKvRowCastLaunch};
 
 struct Registrar {
   Registrar() {

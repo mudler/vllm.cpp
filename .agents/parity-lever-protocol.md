@@ -155,6 +155,87 @@ THE METHOD — do this BEFORE and DURING any parity/throughput work:
 Code-only comparison is necessary but NOT sufficient. If you have not PROFILED vLLM on the
 workload, you do not yet know where the gap is — you are guessing.
 
+## The STRUCTURAL lens — same kernel, different throughput (scan → then VERIFY per-shape)
+
+The trace can show BOTH engines running the IDENTICAL kernel yet ours *appearing* slower at
+the same clock. A real bandwidth/compute wall caps BOTH engines EQUALLY, so an apparent
+same-kernel throughput split is a RED FLAG worth investigating and forbids declaring a
+"ceiling" — but it is a HYPOTHESIS to confirm, NOT a proven structural deficit. If the gap
+is real it usually lives in how the engine DRIVES execution AROUND the kernel; audit the
+context, not the kernel:
+
+- **Stream count + graph structure** — how many CUDA streams does decode run on; one full
+  cudagraph on one stream, or a per-layer stream explosion?
+- **Overlap / scheduling policy** — is DRAM-heavy work co-scheduled with a bandwidth-bound
+  kernel on a saturated bus (a possible net loss), or is overlap gated to compute-slack work
+  when the primary leaves idle SMs? (vLLM gates overlap OFF above token thresholds bs=1 never
+  trips.)
+- **Allocator-pool placement** — per-stream pools can strand scratch and shift KV/weight
+  physical placement.
+- **Per-step sync vs async** — a per-step device sync that idles the GPU vs async
+  step-N/step-(N+1) overlap.
+- **Kernel DECOMPOSITION** — does the reference split the SAME logical op into a DIFFERENT
+  set of kernels (e.g. offloading part of a quantized GEMV to tensor-core GEMMs)? Same op ≠
+  same kernels.
+
+**MANDATORY lane #1 — read THE REFERENCE'S OWN rationale (vLLM AND non-vLLM).** Box-
+independent, so run it ALONGSIDE the trace, not after. Scan the reference's own performance
+REASONING — vLLM for most models, EQUALLY any non-vLLM reference the model is gated against
+(ds4/DwarfStar, SGLang, llama.cpp): source CODE COMMENTS + kernel structure, ENV-VAR/design
+docs (`vllm/envs.py`, `docs/design/`), and (where they exist) issues/PRs. It often documents
+the exact structural pitfall and its magnitude.
+
+**MANDATORY lane #2 — the scan is a HYPOTHESIS GENERATOR; per-shape MEASUREMENT is the
+arbiter.** This is the hard rule the two 2026-08-04 cases teach. Confirm both the ANOMALY and
+the proposed FIX with PER-SHAPE / PER-KERNEL timing before implementing, and DISTRUST any
+aggregate/derived throughput number (bytes÷time) until the byte total is verified and
+cross-checked per-kernel:
+
+- **POSITIVE (ds4 / DeepSeek):** reading ds4's OWN kernel source (`ds4_cuda.cu`) revealed it
+  OFFLOADS a chunk of projections to f16 tensor-core GEMMs (`matmul_f16_pair` /
+  `cutlass_80_wmma`) — a real DECOMPOSITION difference, MEASUREMENT-CONFIRMED (ds4 does ~1.8×
+  less GPU work) → a beat-path our per-launch-parity int8-GEMV scans had all missed.
+- **CAUTIONARY (vLLM / Laguna):** a "20% in-engine bandwidth deficit" (~131 vs 167 GB/s) that
+  triggered a whole structural hunt was a MEASUREMENT ARTIFACT — an aggregate bytes÷time
+  whose byte total was UNDERCOUNTED (it missed the 64-head sliding layers' bigger 10240-qkv /
+  K=8192 o_proj); the clean PER-SHAPE table showed our projections at per-call PARITY with
+  vLLM (~172 GB/s ≈ the isolated microbench). And vLLM's own "avoid an explosion of streams
+  for every layer" comment generated a plausible fix (collapse our 41 streams) that per-shape
+  measurement then REFUTED: the projections were 0.41% concurrent (nothing to de-contend) and
+  the more-serial variant measured ~2% SLOWER. The scan surfaced the idea; measurement killed
+  it — do NOT implement a scan-hypothesis against your own trace.
+
+RED FLAGS: declaring "DRAM/hardware wall", "weight-stream floor", "diffuse inefficiency", or
+"irreducible" (a) from an AGGREGATE metric you have not confirmed per-shape, or (b) without
+scanning the reference's rationale — that is a structural miss you have not found yet.
+EQUALLY a red flag: implementing a scan-derived structural fix WITHOUT per-shape confirmation
+that its premise holds in your measured trace (the Laguna 41-stream fix would have shipped a
+~2%-slower regression).
+
+RED FLAGS that you skipped this lane: concluding "DRAM/hardware wall", "Q8_0/weight-stream
+floor", "diffuse in-engine inefficiency", or "irreducible" while your OWN trace shows the
+reference achieving a higher number (or doing LESS work) on the same op — that is a
+structural miss you have not found yet, never a ceiling.
+
+**MANDATORY lane #3 — INVOCATION parity (same kernel NAME ≠ same resolved kernel).** The
+trace can name the IDENTICAL kernel on both engines yet run a DIFFERENT resolved TEMPLATE —
+the cost that hid on Laguna for weeks: our bf16 M=1 decode GEMVs ran cuBLAS
+`gemvx<bf16,FLOAT>` (f32 output, 204 us o_proj) where vLLM runs `gemvx<bf16,bf16>` (bf16
+output, 139 us) — the OUTPUT dtype SELECTS the gemvx template, and `requestedAlgoCount=1`
+skips the algo search. Before claiming any GEMM/GEMV at-parity, verify vLLM's ACTUAL call on
+FOUR axes: (1) **output/C dtype** — it SELECTS the template, so an API-name match can still
+be a slower `<bf16,FLOAT>` template; (2) **compute + scale type**; (3) **entry point + algo
+policy** — `cublasGemmEx` default-algo vs `cublasLtMatmul` requestedAlgoCount/heuristic; (4)
+**the resolved template dtypes** read off the SAME tool's trace. HARD RULE: a CROSS-TOOL
+comparison (our nsys vs vLLM's torch-profiler) can NEVER establish invocation parity — it
+cannot compare in-graph stall% or template dtypes across two different profilers; a SAME-tool
+trace where entry point AND resolved template BOTH match is required. This is CI-gated on both
+sides so the regression cannot reland silently: the op-contract side (the C/D layout stays
+dtype-faithful to the caller via `out_type`, requestedAlgoCount is the named
+`kGemvHeuristicAlgos`) by `scripts/check-gemv-invocation-consistency.py` over
+`src/vt/cuda/cuda_matmul.cu`, and the CALLER side (an f32-resident decode stream that buys the
+slow template model-wide) by `check-runner-routing-consistency.py` invariant (c).
+
 ### MANDATORY during autonomous porting: profile vLLM's ACTUAL kernels, port 1:1 what it runs
 
 **"At-parity" inferred from SOURCE is NOT parity — you must MEASURE it.** (Proven

@@ -14,6 +14,15 @@ on:
 # The expensive TREE-scoped jobs carry their own job-level group instead, which
 # does collapse superseded main pushes. Net effect: a superseded push to main
 # keeps only its 2 per-commit gates and drops the other 6 jobs.
+#
+# 2026-08-04: those two jobs DID carry `ci-doc-`/`ci-commit-` groups keyed on
+# `github.ref` with `cancel-in-progress: true`, directly contradicting their own
+# comments and this one. It was not theoretical: two consecutive pushes to main
+# had their documentation-checkpoint and commit-protocol-tag cancelled by the
+# next push, so commits cdec2d10 and 0435746d's ranges went unvalidated by the
+# gates written to cover them. The groups are removed; these two jobs must never
+# regain one. They are a checkout plus a Python script, so the cost of always
+# running them is negligible against a silently skipped gate.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}-${{ github.repository }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -39,6 +48,10 @@ jobs:
         run: |
           python3 scripts/check-readme-structure.py
           python3 tests/scripts/test_check_readme_structure.py
+      - name: Benchmarks and features stay human-readable keyed tables
+        run: |
+          python3 scripts/check-public-doc-tables.py
+          python3 tests/scripts/test_check_public_doc_tables.py
       - name: Architecture-support checklist matches the row states
         run: |
           python3 scripts/check-model-checklist.py
@@ -55,10 +68,34 @@ jobs:
         run: |
           python3 scripts/check-runner-routing-consistency.py
           python3 tests/scripts/test_check_runner_routing_consistency.py
+      - name: cuBLASLt GEMM invocation stays dtype-faithful (template parity)
+        run: |
+          python3 scripts/check-gemv-invocation-consistency.py
+          python3 tests/scripts/test_check_gemv_invocation_consistency.py
+      - name: Protocol prose matches the checkers that enforce it
+        run: |
+          python3 scripts/check-protocol-consistency.py
+          python3 tests/scripts/test_check_protocol_consistency.py
+      - name: The state-log tail is anchored and chronological
+        run: |
+          python3 scripts/check-state-order.py
+          python3 tests/scripts/test_check_state_order.py
+      - name: NOW.md stays a short one-Read resume surface
+        run: |
+          python3 scripts/check-now-current.py
+          python3 tests/scripts/test_check_now_current.py
+      - name: Agent role machinery and role discipline
+        run: |
+          python3 scripts/check-role-discipline.py
+          python3 tests/scripts/test_agent_role.py
+      - name: Claim view, helper queue and PR reviewability
+        run: |
+          python3 scripts/claim-view.py --check
+          python3 scripts/ready-for-helper.py --check
+          python3 scripts/upstream-inventory.py --check
+          python3 tests/scripts/test_claim_view.py
+          python3 tests/scripts/test_upstream_inventory.py
   documentation-checkpoint:
-    concurrency:
-      group: ci-doc-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
     # Gate: every code/test/benchmark/spike/lifecycle iteration refreshes both
     # user-facing status surfaces in that same commit, including void attempts.
     #
@@ -70,7 +107,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Every feature checkpoint updates README and BENCHMARKS
+      - name: Every feature checkpoint updates STATUS, BENCHMARKS and NOW
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
@@ -87,10 +124,9 @@ jobs:
             head="$PUSH_HEAD"
           fi
           python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
+          python3 scripts/check-now-current.py --base "$base" --head "$head"
+          python3 scripts/check-role-discipline.py --base "$base" --head "$head"
   commit-protocol-tag:
-    concurrency:
-      group: ci-commit-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.
     #
@@ -137,6 +173,21 @@ jobs:
             exit 1
           fi
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
+  pr-size:
+    # PR-only: helper PRs stay cheap to review, which is what stops the serial
+    # operator from becoming the bottleneck. Non-row branches are reported only.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Helper PRs stay reviewable
+        run: |
+          python3 scripts/check-pr-size.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --branch "${{ github.event.pull_request.head.ref }}"
   cuda-arch-features:
     # Configure-tier assertions on the CUDA per-arch FEATURE TABLE. Needs neither
     # a CUDA toolkit nor a GPU: it drives cmake/CudaArchFeatures.cmake directly,

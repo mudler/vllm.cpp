@@ -583,6 +583,93 @@ void VecDotIQ3_XXSQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
   *s = 0.25f * sumf;
 }
 
+// quants.c:947 — ggml_vec_dot_iq2_s_q8_K_generic. Codebook dot: 8 sub-blocks of
+// 32. Each lane's 10-bit grid index (`qs[l] | qh high 2 bits`) picks a kIq2sGrid
+// entry; the DIRECT sign byte `signs[l]` (= qs + QK_K/8, NO ksigns lookup) flips
+// lanes; the per-32 scales fold in as `ls = 1 + 2*ls_nibble` (l=0,1 share the low
+// nibble, l=2,3 the high). The final 0.125 folds the grid's fixed 8x magnitude
+// (as in IQ2_XXS). Grid/sign tables in cpu_quant_iq_tables.h.
+void VecDotIQ2_SQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
+                     const void* vy, size_t by, int nrc) {
+  VT_CHECK(n % kQK_K == 0, "vec_dot_iq2_s_q8_K: n must be a multiple of 256");
+  VT_CHECK(nrc == 1, "vec_dot_iq2_s_q8_K: generic tier supports nrc == 1 only");
+  (void)nrc;
+  (void)bx;
+  (void)by;
+  (void)bs;
+
+  const BlockIQ2_S* x = static_cast<const BlockIQ2_S*>(vx);
+  const BlockQ8_K* y = static_cast<const BlockQ8_K*>(vy);
+  const int nb = n / kQK_K;
+
+  float sumf = 0.f;
+  for (int i = 0; i < nb; ++i) {
+    const float d = F16ToF32(x[i].d) * y[i].d;
+    const int8_t* q8 = y[i].qs;
+    const uint8_t* qs = x[i].qs;
+    const uint8_t* qh = x[i].qh;
+    const uint8_t* signs = qs + kQK_K / 8;
+    int bsum = 0;
+    for (int ib32 = 0; ib32 < kQK_K / 32; ++ib32) {
+      const int ls1 = 1 + 2 * (x[i].scales[ib32] & 0xf);
+      const int ls2 = 1 + 2 * (x[i].scales[ib32] >> 4);
+      int sumi1 = 0;
+      int sumi2 = 0;
+      for (int l = 0; l < 2; ++l) {
+        const uint8_t* grid = reinterpret_cast<const uint8_t*>(
+            kIq2sGrid + (qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)));
+        for (int j = 0; j < 8; ++j)
+          sumi1 += q8[j] * grid[j] * ((signs[l] & kKmaskIq2xs[j]) ? -1 : 1);
+        q8 += 8;
+      }
+      for (int l = 2; l < 4; ++l) {
+        const uint8_t* grid = reinterpret_cast<const uint8_t*>(
+            kIq2sGrid + (qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)));
+        for (int j = 0; j < 8; ++j)
+          sumi2 += q8[j] * grid[j] * ((signs[l] & kKmaskIq2xs[j]) ? -1 : 1);
+        q8 += 8;
+      }
+      bsum += ls1 * sumi1 + ls2 * sumi2;
+      qs += 4;
+      signs += 4;
+    }
+    sumf += d * bsum;
+  }
+  *s = 0.125f * sumf;
+}
+
+// quants.c:247 — ggml_vec_dot_mxfp4_q8_0_generic. UNLIKE the K-quants above,
+// MXFP4 dots against a Q8_0 activation (QK_MXFP4 == QK8_0 == 32), not Q8_K.
+// Integer core: kValuesMxfp4 (int8) x the q8_0 quants (int8), scaled per 32-block
+// by F16(q8_0.d) * E8M0ToF32Half(mxfp4.e). Split-half nibble packing (like q4_0).
+void VecDotMXFP4Q8_0(int n, float* s, size_t bs, const void* vx, size_t bx,
+                     const void* vy, size_t by, int nrc) {
+  const int qk = kQK_MXFP4;
+  VT_CHECK(n % qk == 0, "vec_dot_mxfp4_q8_0: n must be a multiple of 32");
+  VT_CHECK(nrc == 1, "vec_dot_mxfp4_q8_0: generic tier supports nrc == 1 only");
+  (void)nrc;
+  (void)bx;
+  (void)by;
+  (void)bs;
+
+  const BlockMXFP4* x = static_cast<const BlockMXFP4*>(vx);
+  const BlockQ8_0* y = static_cast<const BlockQ8_0*>(vy);
+  const int nb = n / qk;
+
+  float sumf = 0;
+  for (int ib = 0; ib < nb; ++ib) {
+    const float d = F16ToF32(y[ib].d) * E8M0ToF32Half(x[ib].e);
+    int sumi1 = 0;
+    int sumi2 = 0;
+    for (int j = 0; j < qk / 2; ++j) {
+      sumi1 += y[ib].qs[j + 0] * kValuesMxfp4[x[ib].qs[j] & 0xf];
+      sumi2 += y[ib].qs[j + qk / 2] * kValuesMxfp4[x[ib].qs[j] >> 4];
+    }
+    sumf += d * (sumi1 + sumi2);
+  }
+  *s = sumf;
+}
+
 }  // namespace
 
 VecDotFn BlockVecDot(DType dtype) {
@@ -596,6 +683,8 @@ VecDotFn BlockVecDot(DType dtype) {
     case DType::kQ6_K: return &VecDotQ6_KQ8_K;        // quants.c:800
     case DType::kIQ2_XXS: return &VecDotIQ2_XXSQ8_K;  // quants.c:855
     case DType::kIQ3_XXS: return &VecDotIQ3_XXSQ8_K;  // quants.c:999
+    case DType::kIQ2_S: return &VecDotIQ2_SQ8_K;      // quants.c:947
+    case DType::kMXFP4: return &VecDotMXFP4Q8_0;      // quants.c:247
     default:
       // kQ8_K is the ACTIVATION encoding — upstream gives it no vec_dot row
       // (it is only ever the `y` side of the K-quant kernels above), so a

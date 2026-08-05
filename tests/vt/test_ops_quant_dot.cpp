@@ -86,6 +86,7 @@ struct WeightCase {
   int64_t block_bytes;
   int d_off;      // ggml_half super-block scale, -1 when absent
   int dmin_off;   // ggml_half super-block min scale, -1 when absent
+  int e8m0_off;   // u8 E8M0 (power-of-two) block scale, -1 when absent (MXFP4)
   const char* name;
 };
 
@@ -102,19 +103,25 @@ struct WeightCase {
 // q2_K :288-299   scales@0 qs@16 d@80 dmin@82                    (84B)
 // iq2_xxs :371-374 d@0 qs@2 (u16[32])                            (66B)
 // iq3_xxs :385-400 d@0 qs@2 (u8[96]: 64 grid idx + 32 sc/sig)    (98B)
+// iq2_s   :386-392 d@0 qs@2 (64: 32 grid idx + 32 signs) qh@66 sc@74 (82B)
+// mxfp4   :204-209 e8m0@0 qs@1 (16: 32 e2m1 nibbles)             (17B)
 const WeightCase kWeightCases[] = {
-    {vt::DType::kQ4_0, 32, 18, 0, -1, "q4_0"},
-    {vt::DType::kQ8_0, 32, 34, 0, -1, "q8_0"},
-    {vt::DType::kQ2_K, 256, 84, 80, 82, "q2_K"},
-    {vt::DType::kQ3_K, 256, 110, 108, -1, "q3_K"},
-    {vt::DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
-    {vt::DType::kQ5_K, 256, 176, 0, 2, "q5_K"},
-    {vt::DType::kQ6_K, 256, 210, 208, -1, "q6_K"},
-    // DeepSeek-V4 W8 keep-quant enablers — the ~2-3-bit codebook encodings the
-    // single-Spark UD-IQ2_XXS routed experts use (IQ2_XXS gate/up, IQ3_XXS down;
-    // Q2_K is the UD-Q2_K_XL sibling vehicle).
-    {vt::DType::kIQ2_XXS, 256, 66, 0, -1, "iq2_xxs"},
-    {vt::DType::kIQ3_XXS, 256, 98, 0, -1, "iq3_xxs"},
+    {vt::DType::kQ4_0, 32, 18, 0, -1, -1, "q4_0"},
+    {vt::DType::kQ8_0, 32, 34, 0, -1, -1, "q8_0"},
+    {vt::DType::kQ2_K, 256, 84, 80, 82, -1, "q2_K"},
+    {vt::DType::kQ3_K, 256, 110, 108, -1, -1, "q3_K"},
+    {vt::DType::kQ4_K, 256, 144, 0, 2, -1, "q4_K"},
+    {vt::DType::kQ5_K, 256, 176, 0, 2, -1, "q5_K"},
+    {vt::DType::kQ6_K, 256, 210, 208, -1, -1, "q6_K"},
+    // DeepSeek-V4 W8 keep-quant enablers — the codebook / fp4 encodings the
+    // single-Spark routed experts use: UD-IQ2_XXS (IQ2_XXS gate/up, IQ3_XXS
+    // down; Q2_K is the UD-Q2_K_XL sibling) and UD-IQ2_M (IQ2_S gate/up dotting
+    // Q8_K, MXFP4 down dotting Q8_0 — the one 32-element / Q8_0-activation type
+    // here besides q4_0/q8_0, so it also exercises that path for a codebook).
+    {vt::DType::kIQ2_XXS, 256, 66, 0, -1, -1, "iq2_xxs"},
+    {vt::DType::kIQ3_XXS, 256, 98, 0, -1, -1, "iq3_xxs"},
+    {vt::DType::kIQ2_S, 256, 82, 0, -1, -1, "iq2_s"},
+    {vt::DType::kMXFP4, 32, 17, -1, -1, 0, "mxfp4"},
 };
 
 // Random raw blocks: every quant/scale payload byte is arbitrary (all legal),
@@ -138,6 +145,13 @@ std::vector<uint8_t> RandomBlocks(const WeightCase& c, int64_t nblocks,
     const float jitter = 1.0F + 0.05F * static_cast<float>(i % 7);
     if (c.d_off >= 0) put_f16(c.d_off, 0.0125F * jitter);
     if (c.dmin_off >= 0) put_f16(c.dmin_off, 0.0075F * jitter);
+    // MXFP4's block scale is a single E8M0 byte (exponent, value 2^(byte-128)),
+    // NOT an f16. Random bytes would decode to wildly out-of-range 2^127 scales
+    // (inf dots), so pin a small, per-block-varying exponent instead.
+    if (c.e8m0_off >= 0) {
+      bytes[static_cast<size_t>(i * c.block_bytes + c.e8m0_off)] =
+          static_cast<uint8_t>(0x7E + (i % 5));  // 2^-2 .. 2^2
+    }
   }
   return bytes;
 }
@@ -213,7 +227,8 @@ TEST_CASE("G2/G3 populate from_float and vec_dot (ggml-cpu.c:211-406)") {
   CHECK(vt::cpu::BlockFromFloat(vt::DType::kQ8_K) != nullptr);
   for (vt::DType d : {vt::DType::kQ4_0, vt::DType::kQ2_K, vt::DType::kQ3_K,
                       vt::DType::kQ4_K, vt::DType::kQ5_K, vt::DType::kQ6_K,
-                      vt::DType::kIQ2_XXS, vt::DType::kIQ3_XXS}) {
+                      vt::DType::kIQ2_XXS, vt::DType::kIQ3_XXS,
+                      vt::DType::kIQ2_S, vt::DType::kMXFP4}) {
     CHECK(vt::cpu::BlockFromFloat(d) == nullptr);
   }
 
@@ -711,10 +726,10 @@ TEST_CASE("G3 MatmulBTQuant fails loudly on ragged K") {
 namespace {
 
 const WeightCase kMmlaCases[] = {
-    {vt::DType::kQ4_0, 32, 18, 0, -1, "q4_0"},
-    {vt::DType::kQ8_0, 32, 34, 0, -1, "q8_0"},
-    {vt::DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
-    {vt::DType::kQ6_K, 256, 210, 208, -1, "q6_K"},
+    {vt::DType::kQ4_0, 32, 18, 0, -1, -1, "q4_0"},
+    {vt::DType::kQ8_0, 32, 34, 0, -1, -1, "q8_0"},
+    {vt::DType::kQ4_K, 256, 144, 0, 2, -1, "q4_K"},
+    {vt::DType::kQ6_K, 256, 210, 208, -1, -1, "q6_K"},
 };
 
 // Q8_0/Q4_0's only float op is the block-by-block vmlaq_f32 MAC, in the same

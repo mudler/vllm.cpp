@@ -141,7 +141,7 @@ gate; this row only closes the proven Q8 assembly/compiler gap.
 | W3 | **GREEN** scheduled AAPCS64 kernel | ABI/disassembly checks and direct tests green |
 | W4 | **GREEN with T4 residual** interleaved Pi PMU A/B | 3.66-5.08% win on M1/T1 and M128; M1/T4 −2.43% |
 | W5 | **GREEN** recursive Qwen A/B and checkpoint | exact output; TTFT improves; E2E tie; docs current |
-| W6 | Whole-system/thread/competitor exhaustion | M1/T4 partition, BF16 GEMM, memory/concurrency and llama.cpp floor |
+| W6 | **Competitor measured, speed OPEN**; whole-system/thread exhaustion | vllm.cpp 0.461x prefill / 0.653x decode+E2E vs llama.cpp, 24.2% less RSS; profile BF16 GEMM and M1/T4 partition, then concurrency |
 
 ## R4-R5 binding result
 
@@ -166,9 +166,16 @@ only on Cortex-A76+DotProd; every other CPU retains the portable path. The
 immutable commands, hashes, disassembly and raw-file index are in
 [the R5 evidence](../../docs/bench-evidence/rpi5-a76-q8-dot-20260806.md).
 
-W6 remains open for the M=1/T4 scheduler interaction, BF16-GEMM optimization,
-peak memory, concurrency and the same-file llama.cpp floor. Those gaps keep
-this row `GATING`; they do not undo the demonstrated assembly/compiler win.
+W6's same-file llama.cpp measurement is now complete and the speed floor is
+NOT MET. On the exact 17-input/64-output shape, vllm.cpp is 0.461x llama.cpp
+prefill and 0.653x decode/E2E, while peak RSS is better at 2.841 vs 3.747 GiB.
+A same-text 64-token greedy check is byte-identical. This turns the former
+unknown competitor gate into a measured 2.17x prefill / 1.53x decode target;
+BF16 GEMM profiling, the M=1/T4 scheduler interaction and concurrency remain
+open. The [competitor evidence](../../docs/bench-evidence/rpi5-a76-llamacpp-20260806.md)
+records the reconstructed llama.cpp b9892 pin, commands and raw hashes. These
+whole-model gaps keep the row `GATING`; they do not undo the demonstrated
+assembly/compiler win.
 
 ## Risks and decisions
 

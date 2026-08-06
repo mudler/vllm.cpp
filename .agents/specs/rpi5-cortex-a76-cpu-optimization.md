@@ -223,7 +223,7 @@ matching llama.cpp quant/repack cases for any borrowed layout or kernel:
 | R3 | **GREEN** Qwen trace + recursive scope profiling | R1-R2 | reached-loop inventory and binding baseline below |
 | R4 | **GREEN** A76 C++/NEON/SDOT provider | R3 ranked evidence | exact operation/model output; 2.4x scalar kernel speedup |
 | R5 | **GREEN with named T4 residual** A76 assembly candidate | R4 plateau + proven compiler gap | 3.66-5.08% binding kernel win; recursive model non-regressing |
-| R6 | Whole-system/thread/serving exhaustion | accepted R4/R5 stack | all lever dispositions, <1% residual model, llama.cpp floor |
+| R6 | **llama.cpp measured, speed OPEN**; whole-system/thread/serving exhaustion | accepted R4/R5 stack | close measured 2.17x prefill / 1.53x decode gap, M1/T4 and concurrency; retain RSS win |
 
 R1-R3 are the first implementation checkpoint. R4/R5 split into separate
 kernel-row PRs if the changed code exceeds the one-row helper size cap; this PR
@@ -268,15 +268,35 @@ The recursive model gate is non-regressing: assembly versus compiler SDOT has
 1.55% lower median TTFT, neutral TPOT and 0.13% lower E2E. Against the
 portable arm it lowers E2E 2.67%. `auto` selects the assembly only on
 Cortex-A76+DotProd. M=1/T4 remains a measured negative at −2.43%, so R6 owns
-that thread-partition interaction plus BF16 GEMM, peak memory, concurrency and
-the same-file Pi llama.cpp floor. Full provenance and raw hashes are in the
+that thread-partition interaction plus BF16 GEMM and concurrency. Full
+provenance and raw hashes are in the
 [R5 evidence](../../docs/bench-evidence/rpi5-a76-q8-dot-20260806.md).
+
+## R6 same-file llama.cpp checkpoint
+
+The Pi competitor floor is no longer unknown. Against a locally QEMU-built
+official llama.cpp b9892 (`ee445f93d`), on the same Q8_K_XL bytes, four cores
+and 17-input/64-output shape, vllm.cpp measures 12.81 tok/s prefill, 2.55 tok/s
+decode and 2.46 tok/s output-equivalent E2E. llama.cpp measures 27.77, 3.91 and
+3.77 tok/s: vllm.cpp ratios 0.461x / 0.653x / 0.653x. llama.cpp is therefore
+2.17x faster in prefill and 1.53x faster in decode/E2E, well outside each
+arm's sub-1% spread. vllm.cpp wins peak RSS at 2.841 vs 3.747 GiB, 24.2% less.
+Both engines produce byte-identical normalized text for a same-prompt 64-token
+greedy check.
+
+R6 remains open on speed and concurrency, not memory or correctness. The prior
+profile already puts BF16 `Bt16Neon` at 57.76% of the model run, so the next
+recursive step is a fresh clean profile of both engines followed by the BF16
+GEMM compiler/output audit; the M1/T4 Q8 partition remains a secondary leaf.
+The exact b9892 reconstruction caveat, commands, samples and raw hashes are in
+the [Pi competitor evidence](../../docs/bench-evidence/rpi5-a76-llamacpp-20260806.md).
 
 ## Risks and decisions
 
 - `BACKEND-CPU` already passes a 20-core Arm i8mm Qwen3.5-2B single-stream
   llama.cpp floor. That evidence does not transfer to a four-core A76 without
-  i8mm; Pi numbers begin `PENDING` and never replace the existing scoreboard.
+  i8mm; the Pi now has its own measured open speed gate and never replaces the
+  existing 20-core scoreboard.
 - The Q8_K_XL file contains substantial f16 weights, so quant GEMM alone cannot
   be assumed dominant. A fresh trace ranks work before each lever.
 - Reordered floating reductions may move near ties. Exact integer paths and the

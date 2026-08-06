@@ -8,7 +8,7 @@
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
 | **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
-| **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: assembly component gate **1.04-1.05x vs compiler SDOT**; same-file llama.cpp floor pending | byte-identical on both Arm lanes |
+| **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: vllm.cpp is **0.461x prefill / 0.653x decode+E2E**, but uses **24.2% less RSS** | byte-identical on both Arm lanes |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 
@@ -175,8 +175,18 @@ lowers TTFT 33.40% and E2E 2.67%. Cortex-A76+DotProd therefore selects the
 assembly arm by default; every other CPU retains portable dispatch. Exact
 commands, binary/raw-file hashes, all four kernel arms and the disassembly are
 in the [immutable evidence index](bench-evidence/rpi5-a76-q8-dot-20260806.md).
-Peak memory, concurrent serving and the same-file Pi llama.cpp comparison stay
-`PENDING`; no Pi competitor-parity claim is made.
+The same-file Pi competitor floor is now measured and **NOT MET on speed**.
+The nominal 16-token vllm.cpp prompt measures 17 tokens, so the accepted
+llama.cpp denominator is pp17/tg64/pp17+tg64. vllm.cpp reaches **12.81 tok/s
+prefill, 2.55 tok/s decode and 2.46 tok/s output-equivalent E2E**, against
+llama.cpp's **27.77 / 3.91 / 3.77 tok/s**: ratios **0.461x / 0.653x /
+0.653x**. Median E2E is 26,018.39 vs 16,998.49 ms, so llama.cpp is 1.53x
+faster overall. vllm.cpp wins peak RSS, **2.841 vs 3.747 GiB (24.2% less)**.
+Three clean repetitions are stable, every leg is unthrottled, and a same-text
+64-token greedy CLI check is byte-identical after trailing-newline
+normalization. The [binding evidence](bench-evidence/rpi5-a76-llamacpp-20260806.md)
+records commands, pin reconstruction, raw hashes, and the discarded intrusive
+sampler run. Pi concurrency remains `PENDING`.
 
 Same GGUF file both arms, `dgx.casa` GB10 aarch64 (20 cores), idle, 3 reps,
 llama.cpp `237ad9b96` built fresh on the same host.

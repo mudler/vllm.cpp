@@ -39438,3 +39438,31 @@ disassembly excerpts are indexed at
 M=1/T4 scheduler interaction, the still-dominant BF16 GEMM, peak memory,
 concurrency and the same-file Pi llama.cpp floor. No Pi competitor-parity
 claim is made.
+
+## 2026-08-06 — RPi5 same-file llama.cpp floor measured
+
+The four-core Cortex-A76 lane now has its independent same-file competitor
+result. Official llama.cpp tag b9892 (`ee445f93d`) was built locally for
+AArch64 under QEMU with GCC 13.3, DotProd+FP16, OpenMP and no accelerator
+backend, then copied to the execution-only Pi. The historical project object
+`237ad9b96` is unavailable from both recorded remotes; b9892's Q8/Arm/repack
+and Qwen3.5 line anchors match the project record exactly, and the binding
+evidence records this reconstruction plus the actual binary SHA.
+
+The vllm.cpp nominal input length 16 tokenized to 17 tokens. Three clean
+vllm.cpp reps and llama.cpp pp17/tg64/pp17+tg64 (three timed samples after
+warmups) were all unthrottled. Medians/means: vllm.cpp prefill 12.81 tok/s,
+decode 2.55 tok/s, output-equivalent E2E 2.46 tok/s, E2E 26,018.39 ms;
+llama.cpp 27.77 / 3.91 / 3.77 tok/s, E2E 16,998.49 ms. Ratios are 0.461x
+prefill and 0.653x decode/E2E, so the Pi speed floor is NOT MET. vllm.cpp wins
+peak RSS, 2.841 vs 3.747 GiB (24.2% less). A separate same-text 64-token greedy
+CLI check is byte-identical after trailing-newline normalization, SHA-256
+`a5a630d7e9774c2300f5dda67a085d43ab1cf9125480c37208ae1c24a2eb25e0`.
+
+An initial `/proc` sampler that forked two `awk` processes every 50 ms is
+explicitly VOID because it inflated load and slowed both arms. Accepted
+throughput ran with no sampler; RSS ran separately with a once-per-second
+shell-builtin `VmHWM` reader. Full commands, samples, pins and raw hashes are
+in `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md`. R6 now owns a measured
+2.17x prefill / 1.53x decode speed gap, with fresh cross-engine profiling and
+the already-dominant BF16 GEMM first; M1/T4 and concurrency remain open.

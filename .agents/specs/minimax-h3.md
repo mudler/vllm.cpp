@@ -1000,3 +1000,73 @@ pageable-source usage, and every copy is followed by a synchronize, but unexerci
 device), and any bf16-vs-quantized RENDER or SPEED comparison. The quality A/B is now
 runnable; it has not been run.
 
+
+## 8.15 The bf16 TEXT ENCODER — 14 shards, 63 GB, streamed; and `--encoder-only` (2026-08-06, `row/H3-ENC-BF16-COND-DIFF`)
+
+**Why.** §8.6 made the full-precision *DiT* loadable, but every H3 render — including
+the ones whose output looks competent-but-generic — conditioned on a **Q4_K_M** text
+encoder (`enc_q4km.gguf`, 14.6 GB, Qwen3-VL-32B). Nobody had ever measured the
+encoder's contribution. That matters because weak conditioning and a
+quantization-damaged conditioning tensor look identical from the outside: the wuxia
+prompt asked for shot/reverse-shot coverage of a martial-arts sect exchanging
+intelligence and got a good generic portrait, and this family is known to be
+quantization-sensitive (ComfyUI PR 15298: H3's partial split-half RoPE produces
+channel-wise magnitude outliers that corrupt even INT8).
+
+The blocker was mechanical: `--encoder` only accepted a GGUF
+(`LoadMiniMaxH3EncoderFromGguf`), while the unquantized tower ships as **14
+safetensors shards + `model.safetensors.index.json`, 63 GB**.
+
+**What landed.**
+
+- `MiniMaxH3EncoderConfigFromShards(ckpt, max_layers)` derives the geometry from the
+  index's SHAPES alone — no payload — using the SAME recovery rules as the GGUF
+  loader (head_dim from `q_norm`, heads from `q_proj` rows), so the two arms cannot
+  disagree about what model they are running. The knobs shapes cannot carry
+  (`rope_theta`, `mrope_section`, `rms_norm_eps`, `selected_layer`) keep the SAME
+  defaults the GGUF arm leaves in place; otherwise an A/B would be comparing two
+  RoPEs, not two quantizations.
+- `StreamMiniMaxH3EncoderShardsToDevice` (`minimax_h3_encoder_sharded.cpp`) fills the
+  same `MiniMaxH3EncoderDeviceWeights::views` map the GGUF arm fills, over bf16
+  instead of ggml blocks. The projections stay **BF16 on the device** and are
+  uploaded DIRECTLY out of the read-only mmap with no host buffer at all; the two row
+  FUSIONS (`[q|k|v]`, `[gate|up]`) are done ON THE DEVICE by uploading each member
+  into its offset of one allocation, so the transform does not cost a host copy
+  either. Only the norms are widened on the host, and those are `[5120]`.
+- `MiniMaxH3EncoderTextForwardDevice` is UNCHANGED in structure and now WIDENS a bf16
+  weight to f32 immediately before its GEMM, into a scratch buffer keyed by element
+  count and reused across all 50 layers. This is a RESIDENCY trick, not a numerics
+  one: `vt::MatmulBT` requires both operands in one dtype and these activations are
+  f32, while staging the 50 layers H3 runs as f32 would be **97.5 GiB** against a
+  **48.8 GiB** bf16 residency on a 122 GiB UNIFIED pool. bf16 -> f32 is EXACT, so the
+  GEMM sees bit-identical inputs to an f32-staged tower — gated below.
+- `MiniMaxH3EncoderEmbedTokensFromShards` gathers a prompt's embedding rows straight
+  out of the mmap (the table is `[151936, 5120]`), the safetensors twin of the GGUF
+  arm's per-row dequantize.
+- `minimax-h3-gen --encoder <dir>` is accepted wherever the GGUF was, and
+  **`--encoder-only`** runs the tower alone — no DiT, no VAEs, no output path — and
+  writes `--save-embeds`. That is what makes the measurement affordable: the DiT was
+  loaded FIRST in the normal path, so asking for conditioning alone used to cost its
+  residency too (~96 GiB peak instead of ~49 GiB on a pool that OOM-reboots the box).
+  Both encoder paths now go through ONE helper, so the conditioning a render consumes
+  and the conditioning the A/B measures are produced by the same code.
+
+**Gates (CPU, `test_minimax_h3` 70/70, 49706 assertions, up from 68/68).**
+1. *Resolve, fuse and stream*: a synthetic 4-shard encoder at the REAL name spellings
+   (`model.language_model.layers.N.*`, `model.visual.*`, `lm_head.weight`). Geometry
+   from shapes matches; every fused view's bytes are `memcmp`-exact against
+   `q ++ k ++ v` and `gate ++ up` for EVERY layer; `o_proj`/`down_proj` pass through
+   byte-exact; the separate q/k/v and gate/up names are GONE; `norm.weight`,
+   `lm_head.weight` and the vision tower are NOT bound; truncation works; the
+   embedding gather is exact and throws out of range.
+2. *The loader RAN, and it is not the GGUF path*: `MiniMaxH3EncoderShardStreamStats`
+   (mirroring `MiniMaxH3ShardStreamStats`) is asserted on — shards opened, layers
+   streamed, 8 views/layer, 2 fused groups/layer, 7 direct (no-host-copy) uploads and
+   4 conversions per layer, and `host_peak_bytes` equal to ONE norm (so peak cannot
+   scale with the model). The views are `kBF16`, a dtype the GGUF loader can never
+   produce, which is what makes this a proof rather than a coincidence.
+3. *Widening is exact*: the SAME synthetic checkpoint written twice — once BF16, once
+   F32 holding the bf16-rounded values — streams to `kBF16` and `kF32` views
+   respectively (asserted), and the two full encoder forwards are **BIT-IDENTICAL**
+   (`memcmp == 0`), not merely close. Without this, "we measured what quantizing the
+   encoder costs" would be confounded by what the widening itself did.

@@ -27,10 +27,22 @@
 //                  [--keep-quant] [--steps N] [--frames N] [--height N] [--width N]
 //                  [--workdir DIR] [--ffmpeg PATH] [--dry-run]
 //
+//   minimax-h3-gen --encoder-only
+//                  --encoder <encoder.gguf|shard-dir/>
+//                  # a DIRECTORY of the original bf16 encoder release's shards
+//                  # plus model.safetensors.index.json is accepted wherever the
+//                  # Q4_K_M GGUF is.
+//                  --prompt <text> --tokenizer <tokenizer.json>
+//                  --save-embeds <f32.bin> [--encoder-max-layers N]
+//
 // PROMPT EMBEDDINGS are taken as a file rather than computed here, deliberately:
 // the encoder tower needs a tokenizer + a 32B forward, which is its own driver.
 // This keeps the assembly question ("do the checkpoints compose into a video?")
-// separable from the encoding question.
+// separable from the encoding question. `--encoder-only` is the other side of
+// that seam: run the tower alone, write the conditioning, exit — no DiT, no VAEs.
+// On a 122 GiB UNIFIED pool that is what makes encoding the same prompt with two
+// different encoders affordable, which is how "what does quantizing the encoder
+// cost?" gets a number instead of an opinion.
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -193,13 +205,126 @@ std::string Need(int argc, char** argv, int i, const std::string& flag) {
   return argv[i];
 }
 
+// Encode `prompt` with the H3 text encoder; returns the [seq, hidden] f32
+// conditioning the DiT consumes.
+//
+// `encoder_path` is EITHER a ComfyUI-format GGUF (the shipped Q4_K_M tower) or a
+// DIRECTORY holding the ORIGINAL bf16 release's safetensors shards plus
+// model.safetensors.index.json. Everything after the weight bytes is shared: same
+// tokenizer, same text-only M-RoPE positions, same
+// MiniMaxH3EncoderTextForwardDevice, same f32 activations. That is exactly what
+// makes "how much does quantizing the encoder change the conditioning?" a
+// measurable question rather than an opinion — run both, diff the output.
+//
+// TEXT-ONLY, on purpose. This backs `--encoder-only`, which exists to produce a
+// conditioning tensor for that A/B and nothing else. The normal run path keeps its
+// own inline encoder block because that one also carries the VISION path
+// (`--cond-image`: merged features masked_scatter'd into inputs_embeds plus the 3
+// DeepStack taps), which this helper deliberately does not duplicate.
+std::vector<float> EncodeH3Prompt(const std::string& encoder_path, const std::string& prompt,
+                                  const std::string& tokenizer_path, int64_t encoder_max_layers,
+                                  const std::string& device_name, int64_t* out_seq,
+                                  int64_t* out_hidden) {
+  const bool sharded = vllm::MiniMaxH3ShardedCheckpoint::IsShardedDir(encoder_path);
+  std::cerr << "loading encoder " << encoder_path
+            << (sharded ? " (bf16 shards)" : " (keep-quant GGUF)") << "\n";
+
+  // The queue is created BEFORE the weights are read: on a unified-memory box the
+  // CUDA context must exist first, or the driver's reservation lands on top of a
+  // pool the weights already filled.
+  vt::Device enc_dev{};
+  if (device_name == "cuda") {
+    enc_dev = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue().device;
+  }
+  vt::Queue eq{enc_dev, nullptr};
+  vt::Backend& eb = vt::GetBackend(enc_dev.type);
+  if (enc_dev.type != vt::DeviceType::kCPU) eq = eb.CreateQueue();
+
+  vllm::MiniMaxH3EncoderConfig ec;
+  std::vector<int32_t> ids;
+  std::vector<float> embeds;
+  vllm::MiniMaxH3EncoderDeviceWeights staged;
+  const auto t0 = std::chrono::steady_clock::now();
+
+  if (sharded) {
+    const vllm::MiniMaxH3ShardedCheckpoint ckpt =
+        vllm::MiniMaxH3ShardedCheckpoint::Open(encoder_path);
+    std::cerr << "  shards=" << ckpt.ShardCount() << " tensors=" << ckpt.Names().size() << "\n";
+    ec = vllm::MiniMaxH3EncoderConfigFromShards(ckpt, encoder_max_layers);
+    if (tokenizer_path.empty()) {
+      throw std::runtime_error("--tokenizer is required with a safetensors-shard --encoder");
+    }
+    const vllm::tok::Tokenizer tokenizer = vllm::tok::Tokenizer::FromHfJson(tokenizer_path);
+    ids = tokenizer.Encode(prompt);
+    VT_CHECK(!ids.empty(), "minimax-h3-gen: the prompt tokenized to nothing");
+    // Gathered straight out of the mmap'd shard: the table is [151936, hidden] and
+    // the prompt touches a few dozen rows, so nothing is materialized.
+    embeds = vllm::MiniMaxH3EncoderEmbedTokensFromShards(ckpt, ids);
+    staged = vllm::StreamMiniMaxH3EncoderShardsToDevice(eq, ckpt, encoder_max_layers, &ec);
+    const vllm::MiniMaxH3EncoderShardStreamStats st = vllm::GetMiniMaxH3EncoderShardStreamStats();
+    std::cerr << "  streamed bf16 encoder -> device: layers=" << st.layers_streamed
+              << " tensors=" << st.tensors_streamed << " direct=" << st.direct_uploads
+              << " converted=" << st.converted_uploads << " fused=" << st.fused_groups
+              << " uploaded=" << (st.bytes_uploaded / (1024.0 * 1024.0 * 1024.0))
+              << " GiB host_peak=" << (st.host_peak_bytes / (1024.0 * 1024.0)) << " MiB\n";
+  } else {
+    const vllm::GgufFile ef = vllm::GgufFile::Open(encoder_path);
+    const vllm::MiniMaxH3EncoderQuantWeights enc =
+        vllm::LoadMiniMaxH3EncoderFromGguf(ef, encoder_max_layers);
+    ec = enc.config;
+    size_t quant_bytes = 0;
+    for (const auto& kv : enc.quant_storage) quant_bytes += kv.second.size();
+    std::cerr << "  encoder resident (keep-quant) = "
+              << (quant_bytes / (1024.0 * 1024.0 * 1024.0)) << " GiB\n";
+    // The ComfyUI-style encoder GGUF is WEIGHTS ONLY — it carries no
+    // `tokenizer.ggml.*` metadata, unlike a llama.cpp export — so the vocab comes
+    // from the checkpoint's own tokenizer.json.
+    const vllm::tok::Tokenizer tokenizer = tokenizer_path.empty()
+                                               ? vllm::tok::Tokenizer::FromGguf(ef)
+                                               : vllm::tok::Tokenizer::FromHfJson(tokenizer_path);
+    ids = tokenizer.Encode(prompt);
+    VT_CHECK(!ids.empty(), "minimax-h3-gen: the prompt tokenized to nothing");
+    embeds = vllm::MiniMaxH3EncoderEmbedTokens(enc, ids);
+    staged = vllm::StageMiniMaxH3EncoderWeights(eq, enc);
+  }
+
+  std::cerr << "  encoder layers=" << ec.num_hidden_layers << " hidden=" << ec.hidden_size
+            << " heads=" << ec.num_attention_heads << " kv_heads=" << ec.num_key_value_heads
+            << " head_dim=" << ec.head_dim << " ffn=" << ec.intermediate_size << "\n";
+  std::cerr << "  prompt tokens = " << ids.size() << " (load "
+            << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+            << " s)\n";
+
+  // Text-only: all three M-RoPE axes are the token index.
+  const int64_t seq = static_cast<int64_t>(ids.size());
+  std::vector<int64_t> pos(static_cast<size_t>(3 * seq));
+  for (int64_t a = 0; a < 3; ++a) {
+    for (int64_t s = 0; s < seq; ++s) pos[static_cast<size_t>(a * seq + s)] = s;
+  }
+  std::cerr << "  encoding prompt...\n";
+  std::vector<float> conditioning =
+      vllm::MiniMaxH3EncoderTextForwardDevice(eq, ec, staged, embeds, pos.data(), seq);
+  std::cerr << "  conditioning = [" << seq << ", " << ec.hidden_size << "]\n";
+  if (out_seq != nullptr) *out_seq = seq;
+  if (out_hidden != nullptr) *out_hidden = ec.hidden_size;
+  return conditioning;
+}
+
+void WriteEmbeds(const std::string& path, const std::vector<float>& values) {
+  std::ofstream out(path, std::ios::binary);
+  if (!out) throw std::runtime_error("cannot write " + path);
+  out.write(reinterpret_cast<const char*>(values.data()),
+            static_cast<std::streamsize>(values.size() * sizeof(float)));
+  std::cerr << "  saved conditioning -> " << path << "\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string dit_path, video_vae_path, video_cfg_path, audio_vae_path, audio_cfg_path;
   std::string embeds_path, out_path, workdir = "/tmp/minimax_h3_gen", ffmpeg = "ffmpeg";
   bool keep_quant = false, dry_run = false, dequant_bf16 = false, denoise_only = false;
-  bool dump_params = false, fp4_resident = false;
+  bool dump_params = false, fp4_resident = false, encoder_only = false;
   std::string device_name = "cpu";
   std::string encoder_path, prompt, tokenizer_path, save_embeds_path;
   std::string first_frame_path, last_frame_path;
@@ -237,6 +362,7 @@ int main(int argc, char** argv) {
       else if (f == "--dry-run") dry_run = true;
       else if (f == "--denoise-only") denoise_only = true;
       else if (f == "--dump-params") dump_params = true;
+      else if (f == "--encoder-only") encoder_only = true;
       else if (f == "--decode-latent") decode_latent_path = Need(argc, argv, ++i, f);
       else if (f == "--roundtrip") roundtrip_path = Need(argc, argv, ++i, f);
       else if (f == "--prompt-image") prompt_image_path = Need(argc, argv, ++i, f);
@@ -270,12 +396,17 @@ int main(int argc, char** argv) {
     // --prompt-image runs the vision tower ONLY (from --encoder); it needs no DiT/VAE/out.
     const bool vision_probe = !prompt_image_path.empty();
     const bool diag_vae_only = !decode_latent_path.empty() || !roundtrip_path.empty();
-    const bool need_vaes = !denoise_only && !dump_params && !diag_vae_only;
-    const bool need_cond = !dump_params && !diag_vae_only;
+    const bool need_vaes = !denoise_only && !dump_params && !encoder_only && !diag_vae_only;
+    const bool need_cond = !dump_params && !encoder_only && !diag_vae_only;
     // --decode-latent / --roundtrip / --prompt-image need NO DiT and NO conditioning
     // (their own blocks validate their inputs); the shared check below would otherwise
     // reject --dit.
-    if (!diag_vae_only && !vision_probe &&
+    // --encoder-only needs NO DiT either, and that is the point: the DiT is loaded
+    // FIRST in the normal path, so asking for conditioning alone used to cost the
+    // DiT's residency on top of the tower's. On a 122 GiB UNIFIED pool that is the
+    // difference between ~49 GiB and ~96 GiB peak — i.e. between a run and an OOM
+    // reboot — and it is faster besides.
+    if (!diag_vae_only && !vision_probe && !encoder_only &&
         (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
          (need_vaes && out_path.empty()) ||
          (need_cond && embeds_path.empty() && (encoder_path.empty() || prompt.empty())))) {
@@ -286,8 +417,27 @@ int main(int argc, char** argv) {
                    "[--dry-run] [--denoise-only] [--dump-params] "
                    "[--first-frame f.ppm] [--last-frame f.ppm] [--noise-aug A] "
                    "[--ref-image f.ppm ...] [--ref-video DIR] [--ref-audio f.wav] "
-                   "[--partition fl2va|ref2va]\n";
+                   "[--partition fl2va|ref2va]\n"
+                   "   or: minimax-h3-gen --encoder-only --encoder <f.gguf|shard-dir> "
+                   "--prompt <text> --tokenizer <tokenizer.json> --save-embeds <f32.bin> "
+                   "[--encoder-max-layers N] [--device cpu|cuda]\n";
       return 2;
+    }
+
+    // --encoder-only: run the text tower, write its conditioning, exit. No DiT, no
+    // VAEs, no output path. This is what makes the encoder A/B affordable — and it
+    // is the tool for "produce conditioning once, reuse it across renders".
+    if (encoder_only) {
+      if (encoder_path.empty() || prompt.empty() || save_embeds_path.empty()) {
+        throw std::runtime_error(
+            "--encoder-only needs --encoder, --prompt and --save-embeds");
+      }
+      int64_t seq = 0, hidden = 0;
+      const std::vector<float> conditioning = EncodeH3Prompt(
+          encoder_path, prompt, tokenizer_path, encoder_max_layers, device_name, &seq, &hidden);
+      WriteEmbeds(save_embeds_path, conditioning);
+      std::cout << "tokens=" << seq << "\nhidden=" << hidden << "\n";
+      return 0;
     }
 
     // --dump-params reads the MANIFEST ONLY -- names and shapes, no payload -- and
@@ -616,9 +766,9 @@ int main(int argc, char** argv) {
     std::cerr << "  layers=" << dit.params.num_layers << " hidden=" << dit.params.hidden_size
               << " heads=" << dit.params.num_attention_heads << "\n";
 
-    // --- 1b. optional encoder probe. Loading the 32B tower keep-quant is the
-    // precondition for real text conditioning; this reports the geometry it
-    // recovered so the loader can be validated against the REAL file. ---
+    // --- 1b. optional encoder run. Same helper --encoder-only uses, so the
+    // conditioning a render consumes and the conditioning the A/B measures come
+    // out of ONE code path. ---
     std::vector<float> encoded_prompt;
     if (!encoder_path.empty()) {
       std::cerr << "loading encoder " << encoder_path << " (keep-quant)\n";

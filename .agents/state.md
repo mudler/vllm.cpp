@@ -41176,3 +41176,71 @@ number is claimed - the quality A/B is now runnable, and has not been run.
 
 Next: the operator runs the real 13-shard bf16 DiT on GB10 and answers the quantization
 quality question.
+Next: the operator runs the real 13-shard bf16 DiT and answers the quantization
+quality question; nothing here claims it.
+
+## 2026-08-07T13:30 - H3: the bf16 TEXT ENCODER (14 shards, 63 GB) LOADS + `--encoder-only`, so the Q4_K_M conditioning question is measurable (row/H3-ENC-BF16-COND-DIFF)
+
+<!-- state: 2026-08-07T13:30 -->
+
+`row/H3-ENC-BF16-COND-DIFF` (helper, branched from `origin/main` `ad231615`, with
+§8.6's `MiniMaxH3ShardedCheckpoint` **cherry-picked** from `row/H3-BF16-SHARDED-DIT`
+`1a46ff17` rather than mirrored - the shard index resolver is exactly the piece this
+row needs and duplicating 222 lines of it would drift).
+
+**Why.** §8.6 made the full-precision *DiT* loadable, but every H3 render so far -
+including the ones that look competent-but-generic - conditioned on a **Q4_K_M**
+encoder (`enc_q4km.gguf`, 14.6 GB, Qwen3-VL-32B), and the encoder's contribution had
+NEVER been measured. Weak conditioning and quantization-damaged conditioning look
+identical from outside a render: the wuxia prompt asked for shot/reverse-shot
+coverage of a sect exchanging intelligence and produced a good generic portrait.
+This family is quantization-sensitive (ComfyUI PR 15298: the partial split-half RoPE
+produces channel-wise magnitude outliers that corrupt even INT8). The blocker was
+mechanical - `--encoder` took only a GGUF, the unquantized tower ships as 14
+safetensors shards.
+
+**What landed** (full detail: [specs/minimax-h3.md](specs/minimax-h3.md) §8.7).
+`MiniMaxH3EncoderConfigFromShards` (geometry from the index's SHAPES alone, SAME
+recovery rules and SAME non-shape defaults as the GGUF loader, so an A/B cannot be
+comparing two RoPEs), `StreamMiniMaxH3EncoderShardsToDevice` (fills the same
+`MiniMaxH3EncoderDeviceWeights::views` map over bf16; projections uploaded DIRECTLY
+out of the mmap, the `[q|k|v]` and `[gate|up]` fusions done ON DEVICE into offsets of
+one allocation, so even the transform costs no host copy),
+`MiniMaxH3EncoderEmbedTokensFromShards` (per-row gather out of the `[151936, 5120]`
+table), and `--encoder <dir>` + **`--encoder-only`** in `minimax-h3-gen`.
+
+**The memory decision, stated plainly.** The 50 layers H3 actually runs are
+**48.8 GiB in bf16 and 97.5 GiB in f32**, on a 122 GiB UNIFIED pool that has
+OOM-rebooted this box. So the weights stay bf16 and
+`MiniMaxH3EncoderTextForwardDevice` WIDENS each one to f32 immediately before its
+GEMM into a scratch reused across layers (~2 GiB peak): `vt::MatmulBT` requires one
+dtype for both operands and these activations are f32. bf16 -> f32 is EXACT, so this
+is residency, not numerics - and it is GATED as such. `--encoder-only` matters for
+the same reason: the DiT was loaded FIRST in the normal path, so conditioning alone
+used to cost ~96 GiB peak instead of ~49 GiB.
+
+**Gates (CPU, `test_minimax_h3` 70/70 cases / 49706 assertions, up from 68/68).**
+(1) resolve+fuse+stream over a synthetic 4-shard encoder at the REAL name spellings -
+every fused view `memcmp`-exact against `q ++ k ++ v` and `gate ++ up` for every
+layer, unfused projections byte-exact, separate names GONE, `norm.weight`/`lm_head`/
+vision tower NOT bound, truncation, exact embedding gather + out-of-range throws.
+(2) ★ the loader RAN and is NOT the GGUF path - `MiniMaxH3EncoderShardStreamStats`
+asserted on shards/layers/views/fused-groups/direct-vs-converted uploads, with
+`host_peak_bytes` equal to ONE norm so peak cannot scale with the model, and the
+views are `kBF16`, a dtype the GGUF loader can never produce. (3) ★ widening is
+EXACT - the same checkpoint written BF16 and F32 (bf16-rounded values) streams to
+`kBF16` and `kF32` views respectively and the two full forwards are BIT-IDENTICAL
+(`memcmp == 0`), so the measurement below cannot be confounded by the widening.
+
+**Record repair done in passing.** `docs/STATUS.md` was 41 chars OVER its
+`check-public-doc-tables` ratchet on `origin/main` (284114 vs 284073) - a pre-existing
+red. The H3 row's superseded narrative was collapsed to the binding result, which
+brings the page back inside the ratchet.
+
+**Pre-existing red, NOT this row's:** `check-fusion-consistency` /
+`test_check_fusion_consistency` (`minimax_h3_video_vae_device` gemm-merge drift),
+verified RED on a clean `origin/main` tree before this work.
+
+Next: the measurement itself - encode the wuxia prompt with both encoders on the
+Thor GPU and diff the `[tokens, 5120]` conditioning (max|diff|, RMS, relative RMS,
+per-token cosine). Numbers land in the same row.

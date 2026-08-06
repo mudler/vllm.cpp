@@ -7395,3 +7395,301 @@ TEST_CASE("minimax_h3: the embedding gather decodes ONLY the rows it needs, exac
   CHECK_THROWS(vllm::MiniMaxH3EncoderEmbedTokens(w, {VOCAB}));
   CHECK_THROWS(vllm::MiniMaxH3EncoderEmbedTokens(w, {-1}));
 }
+
+// ---------------------------------------------------------------------------
+// The ORIGINAL bf16 H3-Encoder: 14 safetensors shards, 63 GB
+// ---------------------------------------------------------------------------
+// Every H3 render so far conditioned on the Q4_K_M encoder, and nobody had ever
+// measured what that quantization does to the conditioning tensor. Asking needs
+// the SAME prompt encoded by the unquantized tower — which ships as 14 shards,
+// while `--encoder` only ever accepted a GGUF. These gates cover the loader that
+// closes that gap: the name map, the two row fusions, the bf16 residency, and —
+// the one that has bitten this codebase before — that the new path actually RAN
+// rather than silently falling back to the GGUF one.
+
+namespace {
+
+// The reduced geometry the encoder-shard gates run at, at the REAL layout:
+// q/k/v and gate/up SEPARATE on disk, GQA (heads > kv_heads), head_dim dividing
+// both projection row counts.
+struct EncShardGeometry {
+  int64_t layers = 3;
+  int64_t hidden = 32;
+  int64_t heads = 4;
+  int64_t kv_heads = 2;
+  int64_t head_dim = 8;
+  int64_t ffn = 48;
+  int64_t vocab = 24;
+};
+
+// Round through bf16, so an "F32" copy of a checkpoint holds values the BF16 copy
+// can represent EXACTLY. That is what lets the widen-vs-native comparison below
+// demand BIT-IDENTICAL outputs rather than a tolerance.
+std::vector<float> Bf16RoundTrip(const std::vector<float>& v) {
+  std::vector<float> out(v.size());
+  for (size_t i = 0; i < v.size(); ++i) {
+    uint32_t bits;
+    std::memcpy(&bits, &v[i], sizeof(bits));
+    const uint32_t rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
+    const uint32_t back = rounded & 0xFFFF0000u;
+    std::memcpy(&out[i], &back, sizeof(back));
+  }
+  return out;
+}
+
+// The REAL encoder release's tensor names, at reduced dims. Deliberately includes
+// the three things the loader must NOT bind (`model.language_model.norm.weight`,
+// `lm_head.weight`, the whole `model.visual.` tower) — a loader that grabs them
+// would still "work", and would apply a final RMSNorm H3 does not.
+std::vector<H3StEntry> BuildEncoderShardEntries(const EncShardGeometry& g, bool bf16) {
+  std::vector<H3StEntry> entries;
+  auto add = [&](const std::string& name, const std::vector<int64_t>& shape) {
+    int64_t n = 1;
+    for (int64_t d : shape) n *= d;
+    const std::vector<float> values = Bf16RoundTrip(MakeParam("encsh." + name, n, 0.2));
+    entries.push_back({name, bf16 ? "BF16" : "F32", shape,
+                       bf16 ? PackBf16(values) : PackF32(values)});
+  };
+  const std::string lm = "model.language_model.";
+  add(lm + "embed_tokens.weight", {g.vocab, g.hidden});
+  for (int64_t l = 0; l < g.layers; ++l) {
+    const std::string p = lm + "layers." + std::to_string(l) + ".";
+    add(p + "input_layernorm.weight", {g.hidden});
+    add(p + "post_attention_layernorm.weight", {g.hidden});
+    add(p + "self_attn.q_norm.weight", {g.head_dim});
+    add(p + "self_attn.k_norm.weight", {g.head_dim});
+    add(p + "self_attn.q_proj.weight", {g.heads * g.head_dim, g.hidden});
+    add(p + "self_attn.k_proj.weight", {g.kv_heads * g.head_dim, g.hidden});
+    add(p + "self_attn.v_proj.weight", {g.kv_heads * g.head_dim, g.hidden});
+    add(p + "self_attn.o_proj.weight", {g.hidden, g.heads * g.head_dim});
+    add(p + "mlp.gate_proj.weight", {g.ffn, g.hidden});
+    add(p + "mlp.up_proj.weight", {g.ffn, g.hidden});
+    add(p + "mlp.down_proj.weight", {g.hidden, g.ffn});
+  }
+  // MUST NOT be bound: H3 reads the UNNORMALIZED truncated output, never a head.
+  add(lm + "norm.weight", {g.hidden});
+  add("lm_head.weight", {g.vocab, g.hidden});
+  // The vision tower shares the release and is not part of a text-only encode.
+  add("model.visual.blocks.0.attn.qkv.weight", {3 * g.hidden, g.hidden});
+  add("model.visual.merger.norm.weight", {g.hidden});
+  return entries;
+}
+
+const H3StEntry& FindEntry(const std::vector<H3StEntry>& entries, const std::string& name) {
+  for (const H3StEntry& e : entries) {
+    if (e.name == name) return e;
+  }
+  REQUIRE_MESSAGE(false, "synthetic encoder checkpoint has no tensor named " << name);
+  return entries.front();
+}
+
+}  // namespace
+
+TEST_CASE("minimax_h3: the bf16 encoder shards resolve, FUSE and STREAM to the device") {
+  const EncShardGeometry g;
+  const std::vector<H3StEntry> entries = BuildEncoderShardEntries(g, /*bf16=*/true);
+  const std::string dir = "/tmp/minimax_h3_enc_shards";
+  const size_t kShards = 4;
+  const std::map<std::string, std::string> promised =
+      WriteMiniMaxH3ShardedDit(entries, dir, kShards);
+  const vllm::MiniMaxH3ShardedCheckpoint ckpt = vllm::MiniMaxH3ShardedCheckpoint::Open(dir);
+  CHECK(ckpt.ShardCount() == kShards);
+  CHECK(ckpt.Names().size() == entries.size());
+
+  // GEOMETRY FROM SHAPES ALONE — no payload read. The recovery rules are the GGUF
+  // loader's (head_dim from q_norm, heads from q_proj rows), so the two arms
+  // cannot disagree about what model they are running.
+  const vllm::MiniMaxH3EncoderConfig cfg = vllm::MiniMaxH3EncoderConfigFromShards(ckpt);
+  CHECK(cfg.num_hidden_layers == g.layers);
+  CHECK(cfg.hidden_size == g.hidden);
+  CHECK(cfg.num_attention_heads == g.heads);
+  CHECK(cfg.num_key_value_heads == g.kv_heads);
+  CHECK(cfg.head_dim == g.head_dim);
+  CHECK(cfg.intermediate_size == g.ffn);
+  // The knobs the shapes cannot carry keep their defaults, and they are the SAME
+  // defaults the GGUF arm leaves in place — otherwise an A/B would be comparing
+  // two different RoPEs, not two quantizations.
+  CHECK(cfg.selected_layer == vllm::kMiniMaxH3EncoderSelectedLayer);
+  CHECK(cfg.rope_theta == doctest::Approx(5000000.0));
+  CHECK(cfg.mrope_section == std::vector<int64_t>{24, 20, 20});
+
+  vllm::ResetMiniMaxH3EncoderShardStreamStats();
+  vt::Queue q{Cpu(), nullptr};
+  vllm::MiniMaxH3EncoderConfig streamed_cfg;
+  const vllm::MiniMaxH3EncoderDeviceWeights w =
+      vllm::StreamMiniMaxH3EncoderShardsToDevice(q, ckpt, /*max_layers=*/0, &streamed_cfg);
+  CHECK(streamed_cfg.num_hidden_layers == g.layers);
+  CHECK(streamed_cfg.intermediate_size == g.ffn);
+
+  // ★ THE LOADER RAN. A green suite over a path that silently fell back to the
+  // GGUF loader is a failure mode this codebase has hit; the counters make the
+  // bf16 path OBSERVABLE and this asserts on them rather than on a comment.
+  const vllm::MiniMaxH3EncoderShardStreamStats st =
+      vllm::GetMiniMaxH3EncoderShardStreamStats();
+  CHECK(st.shards_opened == kShards);
+  CHECK(st.layers_streamed == static_cast<uint64_t>(g.layers));
+  CHECK(st.tensors_streamed == static_cast<uint64_t>(8 * g.layers));
+  CHECK(st.fused_groups == static_cast<uint64_t>(2 * g.layers));  // qkv + gate_up per layer
+  // Every PROJECTION took the no-host-copy path (mmap -> device); only the four
+  // norms per layer needed a conversion, and those are [hidden]/[head_dim].
+  CHECK(st.direct_uploads == static_cast<uint64_t>(7 * g.layers));
+  CHECK(st.converted_uploads == static_cast<uint64_t>(4 * g.layers));
+  CHECK(st.bytes_uploaded > 0);
+  // Peak host memory is bounded by the largest CONVERSION, i.e. one norm — it
+  // cannot scale with the model. On the real 63 GB release that is the difference
+  // between a run and the OOM-kill a previous H3 loader took at anon-rss 125 GB.
+  CHECK(st.host_peak_bytes == static_cast<uint64_t>(g.hidden) * sizeof(float));
+  CHECK(st.host_peak_bytes * 16 < st.bytes_uploaded);
+
+  // ★ These views are BF16 — a dtype the GGUF loader can never produce (it binds
+  // block-quant projections and f32 norms). So this is not the GGUF path wearing
+  // a different name.
+  const vt::Tensor& qkv = w.Get("layers.0.self_attn.qkv_proj.weight");
+  CHECK(qkv.dtype == vt::DType::kBF16);
+  CHECK(w.Get("layers.0.mlp.gate_up_proj.weight").dtype == vt::DType::kBF16);
+  CHECK(w.Get("layers.0.self_attn.o_proj.weight").dtype == vt::DType::kBF16);
+  CHECK(w.Get("layers.0.mlp.down_proj.weight").dtype == vt::DType::kBF16);
+  // Norms stay f32: vt::RmsNorm takes an f32 weight.
+  CHECK(w.Get("layers.0.input_layernorm.weight").dtype == vt::DType::kF32);
+  CHECK(w.Get("layers.0.self_attn.q_norm.weight").dtype == vt::DType::kF32);
+
+  // SHAPES: the fusions are row concatenations, and the forward slices them.
+  CHECK(qkv.shape[0] == (g.heads + 2 * g.kv_heads) * g.head_dim);
+  CHECK(qkv.shape[1] == g.hidden);
+  const vt::Tensor& gu = w.Get("layers.0.mlp.gate_up_proj.weight");
+  CHECK(gu.shape[0] == 2 * g.ffn);
+  CHECK(gu.shape[1] == g.hidden);
+  CHECK(w.Get("layers.0.self_attn.q_norm.weight").shape[0] == g.head_dim);
+
+  // ★ AND THE ORDER IS RIGHT, byte for byte. [q|k|v] and [gate|up] are what the
+  // forward assumes; any other order still runs and silently feeds keys into the
+  // query path.
+  for (int64_t l = 0; l < g.layers; ++l) {
+    const std::string src = "model.language_model.layers." + std::to_string(l) + ".";
+    const std::string dst = "layers." + std::to_string(l) + ".";
+    const std::string want_qkv = FindEntry(entries, src + "self_attn.q_proj.weight").bytes +
+                                 FindEntry(entries, src + "self_attn.k_proj.weight").bytes +
+                                 FindEntry(entries, src + "self_attn.v_proj.weight").bytes;
+    const vt::Tensor& got_qkv = w.Get(dst + "self_attn.qkv_proj.weight");
+    REQUIRE(static_cast<size_t>(got_qkv.Numel()) * 2 == want_qkv.size());
+    CHECK(std::memcmp(got_qkv.data, want_qkv.data(), want_qkv.size()) == 0);
+
+    const std::string want_gu = FindEntry(entries, src + "mlp.gate_proj.weight").bytes +
+                                FindEntry(entries, src + "mlp.up_proj.weight").bytes;
+    const vt::Tensor& got_gu = w.Get(dst + "mlp.gate_up_proj.weight");
+    REQUIRE(static_cast<size_t>(got_gu.Numel()) * 2 == want_gu.size());
+    CHECK(std::memcmp(got_gu.data, want_gu.data(), want_gu.size()) == 0);
+
+    // The unfused projections pass through untouched.
+    const std::string want_o = FindEntry(entries, src + "self_attn.o_proj.weight").bytes;
+    const vt::Tensor& got_o = w.Get(dst + "self_attn.o_proj.weight");
+    CHECK(std::memcmp(got_o.data, want_o.data(), want_o.size()) == 0);
+  }
+
+  // The SEPARATE names must be gone — leaving them would let a forward read an
+  // unfused tensor and take the mixed-encoding branch by accident.
+  CHECK_FALSE(w.Has("layers.0.self_attn.q_proj.weight"));
+  CHECK_FALSE(w.Has("layers.0.mlp.gate_proj.weight"));
+  // H3 deltas: no final norm, no lm_head, no vision tower on a text-only encode.
+  CHECK_FALSE(w.Has("norm.weight"));
+  CHECK_FALSE(w.Has("lm_head.weight"));
+  CHECK_FALSE(w.Has("blocks.0.attn.qkv.weight"));
+
+  // TRUNCATION — H3 runs min(num_hidden_layers, 50) and the release ships 64, so
+  // the loader must be able to stop early. That is not cosmetic: it is 14 layers
+  // of a 48.8 GiB residency.
+  CHECK(w.Has("layers." + std::to_string(g.layers - 1) + ".self_attn.qkv_proj.weight"));
+  vllm::ResetMiniMaxH3EncoderShardStreamStats();
+  const vllm::MiniMaxH3EncoderDeviceWeights trunc =
+      vllm::StreamMiniMaxH3EncoderShardsToDevice(q, ckpt, /*max_layers=*/1, nullptr);
+  CHECK(trunc.Has("layers.0.self_attn.qkv_proj.weight"));
+  CHECK_FALSE(trunc.Has("layers.1.self_attn.qkv_proj.weight"));
+  CHECK(vllm::GetMiniMaxH3EncoderShardStreamStats().layers_streamed == 1);
+  CHECK(vllm::MiniMaxH3EncoderConfigFromShards(ckpt, /*max_layers=*/1).num_hidden_layers == 1);
+
+  // The EMBEDDING gather reads rows out of the mmap without materializing the
+  // table, and must be exact — an off-by-one row is a different prompt.
+  const std::vector<int32_t> ids = {5, 0, static_cast<int32_t>(g.vocab - 1), 5};
+  const std::vector<float> got_rows = vllm::MiniMaxH3EncoderEmbedTokensFromShards(ckpt, ids);
+  REQUIRE(got_rows.size() == ids.size() * static_cast<size_t>(g.hidden));
+  const std::vector<float> table =
+      Bf16RoundTrip(MakeParam("encsh.model.language_model.embed_tokens.weight",
+                              g.vocab * g.hidden, 0.2));
+  for (size_t i = 0; i < ids.size(); ++i) {
+    for (int64_t c = 0; c < g.hidden; ++c) {
+      CHECK(got_rows[i * static_cast<size_t>(g.hidden) + c] ==
+            table[static_cast<size_t>(ids[i]) * static_cast<size_t>(g.hidden) + c]);
+    }
+  }
+  CHECK_THROWS(vllm::MiniMaxH3EncoderEmbedTokensFromShards(ckpt, {static_cast<int32_t>(g.vocab)}));
+  CHECK_THROWS(vllm::MiniMaxH3EncoderEmbedTokensFromShards(ckpt, {-1}));
+
+  RemoveShardedDit(dir, kShards);
+}
+
+TEST_CASE("minimax_h3: the bf16 encoder runs the SAME forward as an f32-staged tower") {
+  // THE CLAIM UNDER TEST. The unquantized arm keeps its projections BF16 on the
+  // device (48.8 GiB for the 50 layers H3 runs; 97.5 GiB as f32, against a 122 GiB
+  // UNIFIED pool) and widens each one to f32 immediately before its GEMM. That is
+  // a RESIDENCY trick, and this asserts it is nothing more: bf16 -> f32 is exact,
+  // so a widened tower and an f32-staged tower holding the same values must agree
+  // BIT FOR BIT — not to a tolerance.
+  //
+  // Without this, "we measured what quantizing the encoder costs" would be
+  // confounded by whatever the widening itself did.
+  const EncShardGeometry g;
+  const int64_t SEQ = 6;
+
+  const std::string bf16_dir = "/tmp/minimax_h3_enc_shards_bf16";
+  const std::string f32_dir = "/tmp/minimax_h3_enc_shards_f32";
+  const size_t kShards = 3;
+  const std::vector<H3StEntry> bf16_entries = BuildEncoderShardEntries(g, /*bf16=*/true);
+  const std::vector<H3StEntry> f32_entries = BuildEncoderShardEntries(g, /*bf16=*/false);
+  WriteMiniMaxH3ShardedDit(bf16_entries, bf16_dir, kShards);
+  WriteMiniMaxH3ShardedDit(f32_entries, f32_dir, kShards);
+
+  const vllm::MiniMaxH3ShardedCheckpoint bf16_ckpt =
+      vllm::MiniMaxH3ShardedCheckpoint::Open(bf16_dir);
+  const vllm::MiniMaxH3ShardedCheckpoint f32_ckpt =
+      vllm::MiniMaxH3ShardedCheckpoint::Open(f32_dir);
+
+  vt::Queue q{Cpu(), nullptr};
+  const vllm::MiniMaxH3EncoderDeviceWeights bf16_w =
+      vllm::StreamMiniMaxH3EncoderShardsToDevice(q, bf16_ckpt);
+  const vllm::MiniMaxH3EncoderDeviceWeights f32_w =
+      vllm::StreamMiniMaxH3EncoderShardsToDevice(q, f32_ckpt);
+  // The two really are staged differently — otherwise this compares a path to
+  // itself, which is the trap the counters exist to catch.
+  CHECK(bf16_w.Get("layers.0.self_attn.qkv_proj.weight").dtype == vt::DType::kBF16);
+  CHECK(f32_w.Get("layers.0.self_attn.qkv_proj.weight").dtype == vt::DType::kF32);
+
+  vllm::MiniMaxH3EncoderConfig cfg = vllm::MiniMaxH3EncoderConfigFromShards(bf16_ckpt);
+  cfg.selected_layer = g.layers;
+  cfg.mrope_section = {2, 1, 1};
+  cfg.rope_theta = 10000.0;
+
+  const std::vector<float> embeds = MakeParam("encsh.embeds", SEQ * g.hidden, 1.0);
+  std::vector<int64_t> pos(static_cast<size_t>(3 * SEQ));
+  for (int64_t a = 0; a < 3; ++a) {
+    for (int64_t s = 0; s < SEQ; ++s) pos[static_cast<size_t>(a * SEQ + s)] = s;
+  }
+
+  const std::vector<float> from_bf16 =
+      vllm::MiniMaxH3EncoderTextForwardDevice(q, cfg, bf16_w, embeds, pos.data(), SEQ);
+  const std::vector<float> from_f32 =
+      vllm::MiniMaxH3EncoderTextForwardDevice(q, cfg, f32_w, embeds, pos.data(), SEQ);
+
+  REQUIRE(from_bf16.size() == static_cast<size_t>(SEQ * g.hidden));
+  REQUIRE(from_f32.size() == from_bf16.size());
+  CHECK(std::memcmp(from_bf16.data(), from_f32.data(), from_bf16.size() * sizeof(float)) == 0);
+  // ...and it produced a tower's output, not zeros.
+  double mag = 0.0;
+  for (float v : from_bf16) {
+    REQUIRE(std::isfinite(v));
+    mag = std::max(mag, std::abs(static_cast<double>(v)));
+  }
+  CHECK(mag > 1e-3);
+
+  RemoveShardedDit(bf16_dir, kShards);
+  RemoveShardedDit(f32_dir, kShards);
+}

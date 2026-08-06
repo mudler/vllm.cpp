@@ -21,6 +21,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -136,6 +137,35 @@ std::vector<float> MiniMaxH3EncoderTextForwardDevice(
   vt::RmsNormArgs norm_args;
   norm_args.eps = static_cast<float>(config.rms_norm_eps);
 
+  // GEMM WEIGHT ACCESS. A block-quant weight (the GGUF arm) goes to MatmulBT
+  // untouched — it dispatches kMatmulBTQuant, which takes the f32 activation as
+  // it is. A BF16 weight (the unquantized safetensors arm) cannot: MatmulBT
+  // requires BOTH operands in the same dtype and these activations are f32.
+  //
+  // So a bf16 weight is WIDENED here, immediately before its GEMM, into a scratch
+  // buffer keyed by element count and reused across all 50 layers. bf16 -> f32 is
+  // EXACT, so the GEMM sees bit-identical inputs to what an f32-staged tower would
+  // have given it — the widening is a residency trick, not a numerics one. It has
+  // to be: the 50 layers H3 runs are 48.8 GiB in bf16 and 97.5 GiB in f32, and the
+  // pool is 122 GiB shared with the host. Peak cost is ONE layer's projections
+  // (~2 GiB), not the model.
+  std::map<int64_t, DBuf> widen_scratch;
+  auto weight = [&](const std::string& name) -> Tensor {
+    const Tensor& w = weights.Get(name);
+    if (w.dtype != DType::kBF16) return w;
+    const int64_t numel = w.Numel();
+    auto it = widen_scratch.find(numel);
+    if (it == widen_scratch.end()) {
+      it = widen_scratch.emplace(numel, DBuf(d, DType::kF32, {numel})).first;
+    }
+    // Same allocation every layer, and the casts and GEMMs are enqueued on ONE
+    // stream, so layer L's GEMM has consumed it before layer L+1's cast writes it.
+    Tensor flat_src = dense_attn::Reshape(w, {numel});
+    vt::CastF32(d.q, it->second.t(), flat_src);
+    return dense_attn::Reshape(it->second.t(),
+                               std::vector<int64_t>(w.shape, w.shape + w.rank));
+  };
+
   const int64_t num_layers =
       MiniMaxH3EncoderNumLayers(config.num_hidden_layers, config.selected_layer);
   for (int64_t layer = 0; layer < num_layers; ++layer) {
@@ -148,15 +178,15 @@ std::vector<float> MiniMaxH3EncoderTextForwardDevice(
     if (weights.Has(p + "self_attn.qkv_proj.weight")) {
       // Uniform-encoding checkpoint: one GEMM then split.
       DBuf qkv(d, DType::kF32, {seq, q_width + 2 * kv_width});
-      vt::MatmulBT(d.q, qkv.t(), normed.t(), weights.Get(p + "self_attn.qkv_proj.weight"));
+      vt::MatmulBT(d.q, qkv.t(), normed.t(), weight(p + "self_attn.qkv_proj.weight"));
       vt::QkvSplit(d.q, q.t(), k.t(), v.t(), qkv.t());
     } else {
       // MIXED-encoding checkpoint (the shipped Q4_K_M keeps v_proj at Q6_K), so the
       // group was never fused: three GEMMs, each in its own encoding. Costs launches,
       // not precision.
-      vt::MatmulBT(d.q, q.t(), normed.t(), weights.Get(p + "self_attn.q_proj.weight"));
-      vt::MatmulBT(d.q, k.t(), normed.t(), weights.Get(p + "self_attn.k_proj.weight"));
-      vt::MatmulBT(d.q, v.t(), normed.t(), weights.Get(p + "self_attn.v_proj.weight"));
+      vt::MatmulBT(d.q, q.t(), normed.t(), weight(p + "self_attn.q_proj.weight"));
+      vt::MatmulBT(d.q, k.t(), normed.t(), weight(p + "self_attn.k_proj.weight"));
+      vt::MatmulBT(d.q, v.t(), normed.t(), weight(p + "self_attn.v_proj.weight"));
     }
 
     // Per-head q/k RMSNorm over head_dim, THEN RoPE — that order is upstream's.
@@ -185,7 +215,7 @@ std::vector<float> MiniMaxH3EncoderTextForwardDevice(
     vt::DFlashBlockAttention(d.q, attn.t(), q3, k3, tv, args);
 
     Tensor flat = dense_attn::Reshape(attn.t(), {seq, q_width});
-    vt::MatmulBT(d.q, attn_out.t(), flat, weights.Get(p + "self_attn.o_proj.weight"));
+    vt::MatmulBT(d.q, attn_out.t(), flat, weight(p + "self_attn.o_proj.weight"));
     vt::Add(d.q, h.t(), h.t(), attn_out.t());
 
     vt::RmsNorm(d.q, normed.t(), h.t(), weights.Get(p + "post_attention_layernorm.weight"),
@@ -194,13 +224,13 @@ std::vector<float> MiniMaxH3EncoderTextForwardDevice(
     DBuf act(d, DType::kF32, {seq, ffn});
     if (weights.Has(p + "mlp.gate_up_proj.weight")) {
       DBuf gate_up(d, DType::kF32, {seq, 2 * ffn});
-      vt::MatmulBT(d.q, gate_up.t(), normed.t(), weights.Get(p + "mlp.gate_up_proj.weight"));
+      vt::MatmulBT(d.q, gate_up.t(), normed.t(), weight(p + "mlp.gate_up_proj.weight"));
       vt::SiluAndMul(d.q, act.t(), gate_up.t());
     } else {
       DBuf gate(d, DType::kF32, {seq, ffn});
       DBuf up(d, DType::kF32, {seq, ffn});
-      vt::MatmulBT(d.q, gate.t(), normed.t(), weights.Get(p + "mlp.gate_proj.weight"));
-      vt::MatmulBT(d.q, up.t(), normed.t(), weights.Get(p + "mlp.up_proj.weight"));
+      vt::MatmulBT(d.q, gate.t(), normed.t(), weight(p + "mlp.gate_proj.weight"));
+      vt::MatmulBT(d.q, up.t(), normed.t(), weight(p + "mlp.up_proj.weight"));
       // SiluAndMul wants [gate | up] contiguous, so stage the pair once.
       DBuf gate_up(d, DType::kF32, {seq, 2 * ffn});
       for (int64_t r = 0; r < seq; ++r) {
@@ -213,7 +243,7 @@ std::vector<float> MiniMaxH3EncoderTextForwardDevice(
       }
       vt::SiluAndMul(d.q, act.t(), gate_up.t());
     }
-    vt::MatmulBT(d.q, attn_out.t(), act.t(), weights.Get(p + "mlp.down_proj.weight"));
+    vt::MatmulBT(d.q, attn_out.t(), act.t(), weight(p + "mlp.down_proj.weight"));
     vt::Add(d.q, h.t(), h.t(), attn_out.t());
 
     // DeepStack: ADD the visual features into the visual-token rows, for the FIRST

@@ -580,6 +580,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_device.cpp
   src/vllm/model_executor/models/minimax_h3_vae_loader.cpp
   src/vllm/model_executor/models/minimax_h3_encoder_gguf.cpp
+  src/vllm/model_executor/models/minimax_h3_encoder_sharded.cpp
   src/vllm/model_executor/models/minimax_h3_encoder_device.cpp
   src/vllm/model_executor/models/minimax_h3_vision_gguf.cpp
   src/vllm/entrypoints/openai/video_api.cpp

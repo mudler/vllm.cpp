@@ -8,7 +8,7 @@
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
 | **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
-| **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | prefill **1.18x ahead**, decode tie, memory parity | byte-identical |
+| **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: **PENDING** | byte-identical on binding arm; Pi pending |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 
@@ -153,6 +153,13 @@ Qwen3.6-27B NVFP4, GB10, whole serving window.
 host mirror is freed once the device Marlin resident is built.
 
 ## llama.cpp, CPU
+
+Raspberry Pi 5 Cortex-A76 is a separate `PENDING` arm. It has four cores,
+DotProd and no i8mm, so the binding 20-core Arm result below does not transfer.
+Reproduction starts with the exact Q8_K_XL SHA-256 recorded in the
+[RPi5 spike](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md), portable
+16-token correctness, then three interleaved vllm.cpp/llama.cpp repetitions at
+1/2/4 threads. No Pi throughput or memory number is accepted yet.
 
 Same GGUF file both arms, `dgx.casa` GB10 aarch64 (20 cores), idle, 3 reps,
 llama.cpp `237ad9b96` built fresh on the same host.

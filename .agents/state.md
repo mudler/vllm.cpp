@@ -39275,3 +39275,33 @@ DISK-BLOCKED: NVFP4 working set (DiT + Qwen3-VL-32B NVFP4 encoder + 2 VAEs) is
 render. Comparability: vLLM-Omni CANNOT serve a quantized H3 on one GPU
 (BF16-only in practice; source-audited `a4ea67a2`) -> HW/loader-forced-indirect,
 DeepSeek-GGUF precedent. Draft PR is the claim.
+
+
+## 2026-08-06T15:05 - BACKEND-CPU Raspberry Pi 5 Cortex-A76 campaign spiked
+<!-- state: 2026-08-06T15:05 -->
+
+Draft PR #65 (`row/BACKEND-CPU`) records the target before implementation:
+Qwen3.5-2B UD-Q8_K_XL, SHA-256
+`a53988df91157d78acaf3c95e22db179d13f6236061bdb86576494dc99b1bc3b`, on
+the four-core Raspberry Pi 5 Cortex-A76. Read-only hardware inspection proved
+ASIMD/FP16/RDM/DotProd and no i8mm, 64 KiB L1D/L1I + 512 KiB L2 per core,
+shared 2 MiB L3, and a real `armv8_cortex_a76` Linux PMU exposing cycles,
+instructions, frontend/backend stalls, branch, TLB and L1/L2/L3/LL-cache
+events. The existing Arm MMLA/repack fast path is therefore inert on this
+target; an SDOT route is a candidate, not yet a result.
+
+The committed leaf spec `.agents/specs/rpi5-cortex-a76-cpu-optimization.md`
+pins the sequence: generalized PMU-backed kernel harness; x86 vLLM/current-CPU
+goldens; portable Pi 16-token bring-up; trace-derived reached-loop inventory;
+C++/NEON/SDOT experiments; assembly only after a measured compiler gap; and
+recursive kernel→op→block→model/serving A/B after every accepted lever. A
+causal PMU improvement may remain in the experimental stack before wall clock
+moves, but no optimized provider becomes default without enclosing-scope
+evidence and no area closes until every lever family has a disposition with
+less than 1% predicted end-to-end residual. Same-file llama.cpp at project pin
+`237ad9b96` is the Pi speed/memory floor; vLLM will not run on the Pi.
+
+No Pi model run, correctness result, throughput number or assembly kernel is
+claimed at this checkpoint. `docs/BENCHMARKS.md` records `PENDING`; the prior
+20-core Arm/i8mm binding result remains intact and explicitly does not transfer.
+Next: R1 harness, then exact-hash model transfer and portable bring-up.

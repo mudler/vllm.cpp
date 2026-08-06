@@ -130,9 +130,14 @@ MATRICES = {
     # the DGX GB10: 2/2 cases · 92401 assertions vs the CPU oracle + f64 dequant,
     # memcheck 0, RED-first proven. `ACTIVE`, `CLAIM-CUDA-KEEPQUANT-GEMM`, spec
     # specs/deepseek-v4-flash.md §W8.)
+    # 46 since 2026-08-06: +`KERNEL-CPU-A76-Q8-DOT`, a separately gateable
+    # Cortex-A76 Q8_0 x Q8_0 DotProd/assembly family. The physical-Pi trace
+    # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
+    # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
+    # the broad CPU-backend row.
     # Inventory size, bumped for a genuinely new family — never to make a failing
     # state transition pass.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 45),
+    "KERNEL": (AGENTS / "kernel-matrix.md", 46),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

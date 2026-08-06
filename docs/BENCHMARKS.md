@@ -169,6 +169,10 @@ dot. These numbers bind the portable denominator only. SDOT/assembly A/B,
 three interleaved full-model repetitions, peak memory and same-file llama.cpp
 comparison remain `PENDING`.
 
+The selected follow-on is `KERNEL-CPU-A76-Q8-DOT`. Its binding performance
+gate compares portable, exact-order compiler SDOT and scheduled AAPCS64 in one
+QEMU-built binary on the physical Pi. No assembly speedup is claimed at spike.
+
 Same GGUF file both arms, `dgx.casa` GB10 aarch64 (20 cores), idle, 3 reps,
 llama.cpp `237ad9b96` built fresh on the same host.
 

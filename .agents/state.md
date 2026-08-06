@@ -39364,3 +39364,19 @@ R4/R5 will compare an exact-order C++ SDOT intrinsic against a scheduled
 AAPCS64 implementation in one QEMU-built binary, using the portable checksums,
 PMU fixture and full-model run as recursive gates. No speedup or llama.cpp
 parity is claimed at this checkpoint.
+
+## 2026-08-06T17:50 - KERNEL-CPU-A76-Q8-DOT spiked
+<!-- state: 2026-08-06T17:50 -->
+
+R3's zero-loss physical-Pi trace selects the portable Q8_0 x Q8_0 dot as the
+first assembly candidate: it consumes 20.10% of Qwen3.5-2B user cycles on a
+Cortex-A76 with DotProd but no i8mm. New row `KERNEL-CPU-A76-Q8-DOT` and spike
+`.agents/specs/cpu-a76-q8-dot.md` bind the comparison to three same-binary arms:
+portable scalar, exact-order compiler SDOT, and scheduled AAPCS64 assembly.
+
+The assembly arm is not accepted merely for using SDOT or beating scalar. It
+must beat the C++ intrinsic in physical-Pi cycles and wall time with identical
+operation checksums and model tokens, a proven ABI/disassembly contract, and no
+enclosing Qwen regression. QEMU remains build/smoke-only and source will not be
+compiled on the Pi. No optimized implementation or speed claim exists at this
+spike checkpoint.

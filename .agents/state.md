@@ -41184,11 +41184,11 @@ quality question; nothing here claims it.
 <!-- state: 2026-08-07T13:30 -->
 
 `row/H3-ENC-BF16-COND-DIFF` (helper, branched from `origin/main` `ad231615`, with
-§8.6's `MiniMaxH3ShardedCheckpoint` **cherry-picked** from `row/H3-BF16-SHARDED-DIT`
+§8.13's `MiniMaxH3ShardedCheckpoint` (landed separately as `row/H3-BF16-SHARDED-DIT` + `row/H3-BF16-SHARDED-STREAM`)
 `1a46ff17` rather than mirrored - the shard index resolver is exactly the piece this
 row needs and duplicating 222 lines of it would drift).
 
-**Why.** §8.6 made the full-precision *DiT* loadable, but every H3 render so far -
+**Why.** §8.13/§8.14 made the full-precision *DiT* loadable, but every H3 render so far -
 including the ones that look competent-but-generic - conditioned on a **Q4_K_M**
 encoder (`enc_q4km.gguf`, 14.6 GB, Qwen3-VL-32B), and the encoder's contribution had
 NEVER been measured. Weak conditioning and quantization-damaged conditioning look
@@ -41199,7 +41199,7 @@ produces channel-wise magnitude outliers that corrupt even INT8). The blocker wa
 mechanical - `--encoder` took only a GGUF, the unquantized tower ships as 14
 safetensors shards.
 
-**What landed** (full detail: [specs/minimax-h3.md](specs/minimax-h3.md) §8.7).
+**What landed** (full detail: [specs/minimax-h3.md](specs/minimax-h3.md) §8.15).
 `MiniMaxH3EncoderConfigFromShards` (geometry from the index's SHAPES alone, SAME
 recovery rules and SAME non-shape defaults as the GGUF loader, so an A/B cannot be
 comparing two RoPEs), `StreamMiniMaxH3EncoderShardsToDevice` (fills the same
@@ -41219,7 +41219,7 @@ is residency, not numerics - and it is GATED as such. `--encoder-only` matters f
 the same reason: the DiT was loaded FIRST in the normal path, so conditioning alone
 used to cost ~96 GiB peak instead of ~49 GiB.
 
-**Gates (CPU, `test_minimax_h3` 70/70 cases / 49706 assertions, up from 68/68).**
+**Gates (CPU, re-run POST-REBASE: `test_minimax_h3` 75/75 cases / 55609 assertions).**
 (1) resolve+fuse+stream over a synthetic 4-shard encoder at the REAL name spellings -
 every fused view `memcmp`-exact against `q ++ k ++ v` and `gate ++ up` for every
 layer, unfused projections byte-exact, separate names GONE, `norm.weight`/`lm_head`/
@@ -41232,15 +41232,86 @@ EXACT - the same checkpoint written BF16 and F32 (bf16-rounded values) streams t
 `kBF16` and `kF32` views respectively and the two full forwards are BIT-IDENTICAL
 (`memcmp == 0`), so the measurement below cannot be confounded by the widening.
 
-**Record repair done in passing.** `docs/STATUS.md` was 41 chars OVER its
-`check-public-doc-tables` ratchet on `origin/main` (284114 vs 284073) - a pre-existing
-red. The H3 row's superseded narrative was collapsed to the binding result, which
-brings the page back inside the ratchet.
-
-**Pre-existing red, NOT this row's:** `check-fusion-consistency` /
-`test_check_fusion_consistency` (`minimax_h3_video_vae_device` gemm-merge drift),
-verified RED on a clean `origin/main` tree before this work.
+**Rebase note.** This row was written off `ad231615` and REBASED onto the landed
+`row/H3-BF16-SHARDED-STREAM` before landing; the gate numbers here are the POST-REBASE
+re-run. Two claims from the pre-rebase write-up no longer apply and are withdrawn: the
+`docs/STATUS.md` ratchet red (284114 vs 284073) was repaired on main in the meantime,
+and the earlier 70/70 count is superseded by the 75/75 recorded above. `origin/main` had ALSO grown
+a vision-conditioning path in the encoder block (`--cond-image`, DeepStack taps) that
+this row's text-only `EncodeH3Prompt` refactor would have silently dropped; the refactor
+is now scoped to `--encoder-only` and main's inline block is kept for the run path, so
+both capabilities survive.
 
 Next: the measurement itself - encode the wuxia prompt with both encoders on the
 Thor GPU and diff the `[tokens, 5120]` conditioning (max|diff|, RMS, relative RMS,
 per-token cosine). Numbers land in the same row.
+
+## 2026-08-07T13:40 - H3 THE NUMBER: Q4_K_M encoder moves the conditioning as much as a ONE-WORD prompt edit, but DIFFUSELY (row/H3-ENC-BF16-COND-DIFF, Thor)
+
+<!-- state: 2026-08-07T13:40 -->
+
+The measurement the loader existed for. Full tables:
+[benchmark-record.md](benchmark-record.md) and
+[specs/minimax-h3.md](specs/minimax-h3.md) §8.15. Build `d1085374` (built and measured as `d1085374`, amended for the row-branch trailer; IDENTICAL tree `dd9283cf`, so the measurement binary IS this commit), Thor sm_110,
+CUDA 13.0.1 container, GPU idle (the LocalAI render had finished; it was never
+touched).
+
+**Controlled the way it has to be.** Same prompt (`wuxia.txt`, 233 tokens), same
+tokenizer, same 50-layer truncation, same `MiniMaxH3EncoderTextForwardDevice`, same
+f32 activations - only the weight bytes differ. Both arms self-report IDENTICAL
+geometry (50 / 5120 / 64 / 8 / 128 / 25600), which is what proves they are the same
+model rather than two checkpoints that merely share a name.
+
+**A CALIBRATION arm, because a cosine means nothing without a yardstick.** The bf16
+encoder also encoded a ONE-WORD edit of the same prompt (`at night` -> `at dawn`,
+also 233 tokens).
+
+| | rel RMS | rel RMS excl. sink | cos mean | cos median | cos min | angle median | angle max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **Q4_K_M vs bf16** | **0.03403** | **0.06849** | **0.99745** | 0.99810 | 0.90916 | 3.535° | 24.61° |
+| bf16 one-word edit | 0.01897 | 0.06666 | 0.99769 | 0.99963 | 0.84736 | 1.565° | 32.07° |
+
+max|diff| 154.0 / RMS 0.5045 (quant) vs 31.1 / 0.2812 (edit).
+
+**The read.** (1) NOT a scale change - the Q4 conditioning is uniformly ~1% smaller
+(norm ratio 0.99010) but the best global rescale removes almost none of it
+(0.03403 -> 0.03280), so it is DIRECTIONAL. (2) Its total energy is ON PAR with a
+one-word prompt edit (6.85% vs 6.67% excluding the sink token). (3) The SHAPE is
+opposite: the edit is SPARSE (172/233 tokens above cosine 0.999, median rotation
+0.16°, concentrated on ~6 tokens), quantization is DIFFUSE (232/233 below 0.999,
+median 3.5°, every token). (4) `max|diff|` 154 is the ATTENTION SINK, not
+corruption: token 0 has norm 15,522 vs a 366 mean (42x) and carries 68% of the total
+squared error while its DIRECTION is intact (cosine 0.99962) - ComfyUI PR 15298's
+channel-wise magnitude outliers, concretely.
+
+**Verdict.** Q4_K_M does real, measurable, directional damage, comparable in
+magnitude to editing the prompt, but diffusely - a uniform few-degree rotation of
+every token, which is the signature that blunts fine-grained compositional
+instruction toward a prompt's average semantics. That matches the
+"competent but generic" symptom, so the bf16 encoder is worth a render A/B.
+
+**Explicitly NOT established: that the RENDER changes.** Nothing here measures the
+DiT's sensitivity to a 3.5°-median rotation. The owed follow-up is a
+byte-identical-everything-else render A/B - same DiT, seed and steps, with
+`--prompt-embeds cond_q4km.bin` vs `cond_bf16.bin` (both saved on the box), which is
+exactly what the save/replay seam makes controllable.
+
+**REPRODUCED.** Both arms were re-run from scratch (fresh process, fresh
+checkpoint load) and each produced a BYTE-IDENTICAL file - `cond_q4km.bin` md5
+`a331232096ef1da2628f885950b2fc55`, `cond_bf16.bin` md5
+`9c096b63b9bd07f604daebb2fc090f46` on both runs. Every number above is
+deterministic, not a sample; there is no noise band to argue about.
+
+**Cost, recorded for the next run.** Q4_K_M 40 s / 18.0 GiB peak; bf16 40 s (35 s
+streaming) / 45.41 GiB uploaded / host conversion peak 0.0195 MiB (ONE norm - the
+projections never touch a host buffer) / 51.95 GiB total peak of the 122 GiB unified
+pool. Real-checkpoint streamer counters: `layers=50 tensors=400 direct=350
+converted=200 fused=100`.
+
+Also fixed this session: the streamer uploaded norms from a conversion buffer scoped
+INSIDE its branch, i.e. freed before the Synchronize that guarantees the async
+`cudaMemcpyAsync` landed. Norms are ~20 KB so CUDA would usually stage them and get
+away with it, which is exactly why it could not ship (`d1085374`).
+
+Next: the render A/B, and the same treatment for the bf16 DiT (§8.13's loader is
+already in this branch).

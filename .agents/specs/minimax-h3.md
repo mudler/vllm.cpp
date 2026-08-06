@@ -1003,7 +1003,7 @@ runnable; it has not been run.
 
 ## 8.15 The bf16 TEXT ENCODER — 14 shards, 63 GB, streamed; and `--encoder-only` (2026-08-06, `row/H3-ENC-BF16-COND-DIFF`)
 
-**Why.** §8.6 made the full-precision *DiT* loadable, but every H3 render — including
+**Why.** §8.13/§8.14 made the full-precision *DiT* loadable, but every H3 render — including
 the ones whose output looks competent-but-generic — conditioned on a **Q4_K_M** text
 encoder (`enc_q4km.gguf`, 14.6 GB, Qwen3-VL-32B). Nobody had ever measured the
 encoder's contribution. That matters because weak conditioning and a
@@ -1051,7 +1051,7 @@ safetensors shards + `model.safetensors.index.json`, 63 GB**.
   Both encoder paths now go through ONE helper, so the conditioning a render consumes
   and the conditioning the A/B measures are produced by the same code.
 
-**Gates (CPU, `test_minimax_h3` 70/70, 49706 assertions, up from 68/68).**
+**Gates (CPU, re-run after the rebase onto `row/H3-BF16-SHARDED-STREAM`: `test_minimax_h3` 75/75, 55609 assertions).**
 1. *Resolve, fuse and stream*: a synthetic 4-shard encoder at the REAL name spellings
    (`model.language_model.layers.N.*`, `model.visual.*`, `lm_head.weight`). Geometry
    from shapes matches; every fused view's bytes are `memcmp`-exact against
@@ -1070,3 +1070,62 @@ safetensors shards + `model.safetensors.index.json`, 63 GB**.
    respectively (asserted), and the two full encoder forwards are **BIT-IDENTICAL**
    (`memcmp == 0`), not merely close. Without this, "we measured what quantizing the
    encoder costs" would be confounded by what the widening itself did.
+
+### 8.8 THE NUMBER — what Q4_K_M does to the conditioning (2026-08-06, `row/H3-ENC-BF16-COND-DIFF`, Thor sm_110, build `d1085374` (built and measured as `d1085374`, amended for the row-branch trailer; IDENTICAL tree `dd9283cf`, so the measurement binary IS this commit))
+
+**Method.** Same prompt (`wuxia.txt`, **233 tokens**), same tokenizer, same 50-layer
+truncation, same `MiniMaxH3EncoderTextForwardDevice`, same f32 activations — only
+the weight bytes differ. Both arms self-report identical geometry
+(`layers=50 hidden=5120 heads=64 kv_heads=8 head_dim=128 ffn=25600`), which is what
+establishes they are the same model. Conditioning is `[233, 5120]` f32 via
+`--encoder-only --save-embeds`. A CALIBRATION arm encodes a ONE-WORD edit of the
+same prompt with the bf16 encoder (`bamboo forest at night` -> `at dawn`, also 233
+tokens), because a cosine has no meaning without a yardstick.
+
+| | max\|diff\| | RMS | rel RMS | rel RMS excl. sink | cos min | cos mean | cos median | angle mean | angle max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Q4_K_M vs bf16** | 154.0 | 0.5045 | **0.03403** | **0.06849** | 0.90916 | **0.99745** | 0.99810 | 3.793° | 24.61° |
+| bf16, one-word edit | 31.1 | 0.2812 | 0.01897 | 0.06666 | 0.84736 | 0.99769 | 0.99963 | 2.228° | 32.07° |
+
+1. **Not a scale change.** Q4 conditioning is uniformly ~1% smaller (norm ratio mean
+   0.99010) but the best single global rescale removes almost none of the difference
+   (0.03403 -> 0.03280). It is DIRECTIONAL, the kind that matters.
+2. **Its energy is on par with a one-word prompt edit** (6.85% vs 6.67% excluding the
+   sink token). Quantizing the encoder moves the conditioning about as much as
+   rewriting a word of the prompt.
+3. **The SHAPE is opposite.** The edit is SPARSE — 172/233 tokens stay above cosine
+   0.999 (median rotation 0.16°), the change concentrating on ~6 tokens, max 32°.
+   Quantization is DIFFUSE — 232/233 tokens fall below 0.999, EVERY token rotates a
+   few degrees (median 3.5°), one token by 24.6°. A smear everywhere, not a different
+   prompt.
+4. **`max|diff|` 154 is the attention SINK, not corruption.** Token 0 has norm 15,522
+   against a 366 mean (42x) and carries 68% of the total squared error, yet its
+   direction is nearly untouched (cosine 0.99962) — the channel-wise magnitude-outlier
+   behaviour ComfyUI PR 15298 attributes to the partial split-half RoPE, showing up
+   concretely. This is why the sink-excluded column is the honest aggregate.
+
+**Verdict.** Q4_K_M does real, measurable, directional damage — comparable in
+magnitude to editing the prompt — but DIFFUSELY. A uniform few-degree rotation of
+every token is the signature that blunts fine-grained compositional instruction
+(coverage, blocking, staging) toward a prompt's average semantics, which is exactly
+the "competent but generic" symptom. The bf16 encoder is worth a render A/B.
+
+**What this does NOT establish.** It does not prove the RENDER changes; nothing here
+measures the DiT's sensitivity to a 3.5°-median rotation. The owed follow-up is a
+byte-identical-everything-else render A/B (same DiT, seed, steps;
+`--prompt-embeds cond_q4km.bin` vs `cond_bf16.bin`), which is exactly what
+`--save-embeds`/`--prompt-embeds` make controllable.
+
+**REPRODUCED.** Both arms were re-run from scratch (fresh process, fresh
+load of the checkpoint) and each produced a BYTE-IDENTICAL conditioning file:
+`cond_q4km.bin` md5 `a331232096ef1da2628f885950b2fc55` and `cond_bf16.bin` md5
+`9c096b63b9bd07f604daebb2fc090f46` on both runs. So every number above is
+deterministic, not a sample — there is no noise band to argue about, and a
+future change to either path shows up as an md5 change.
+
+**Cost.** Q4_K_M arm 40 s wall, peak **18.0 GiB**. bf16 arm 40 s wall (35 s
+streaming), **45.41 GiB** uploaded, host conversion peak **0.0195 MiB** (one norm —
+the projections never touch a host buffer), total peak **51.95 GiB** of the 122 GiB
+UNIFIED pool. Streamer counters on the real checkpoint:
+`layers=50 tensors=400 direct=350 converted=200 fused=100`, i.e. the shard path ran
+and every projection took the no-host-copy upload.

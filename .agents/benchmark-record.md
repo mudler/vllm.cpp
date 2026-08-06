@@ -14687,3 +14687,81 @@ DELIVERED: 5 harness bodies authored (verbatim FLA ports, AOT-adapted) STAGED in
 NOT YET (Phase-2, coupled — the harness signatures depend on the op's confirmed buffer dtypes so regen is premature until the op exists): move harness to `triton_kernels/`, add the §17.3 declarations, regen sm_121a cubins (`scripts/regen-triton-aot.sh`), wire `vt::KdaChunkPrefill`, run the RED-first unit + FLA golden + 48.9B STRICT gate + tok/s/TTFT ladder. Row STAYS ACTIVE. No default flips (nothing measured).
 
 **USER 2026-08-07 (mid-flight): the Kimi-Linear success bar is MEET vLLM SPEED — the §14/§16/#107 "HW-forced-indirect" framing is SUPERSEDED.** vLLM demonstrably RUNS Kimi-Linear-48B on ONE GB10: the §12 STRICT golden capture used it at `gpu_memory_utilization=0.82`, single-seq, eager. So the Phase-2 speed ladder MUST include a vLLM arm at that EXACT recipe (single-seq, eager, util 0.82, the §12 launch config) measuring steady decode tok/s + prefill TTFT on the SAME prompts as our arm — SEQUENTIAL after our runs, `local-ai-worker` PARKED, `drop_caches` before wall-clock, and PRE-WARM FlashInfer's autotune in a throwaway start at TINY util FIRST (cold autotune at util 0.82 with 91.5 GiB weights = the tightest vLLM config ever run on this box = a recorded OOM-reboot trigger; memory monitor mandatory, ONE attempt, if it OOMs record honestly and do NOT retry higher). The tok/s ladder then reads ours-vs-vLLM matched-config: the lane's distance-to-bar becomes a MEASURED number. Recorded in spec §17.5; below vLLM on any axis is an open gap, not done.
+## MiniMax-H3 — what quantizing the TEXT ENCODER to Q4_K_M does to the conditioning (2026-08-06, `row/H3-ENC-BF16-COND-DIFF`, Thor sm_110)
+
+**The question.** Every H3 render so far conditioned on a Q4_K_M Qwen3-VL-32B text
+encoder (`enc_q4km.gguf`, 14.6 GB), and the encoder's contribution had never been
+measured. It mattered because weak conditioning and quantization-damaged
+conditioning are indistinguishable from outside a render: the wuxia prompt asked
+for measured shot/reverse-shot coverage of a martial-arts sect exchanging
+intelligence and produced a good but generic portrait.
+
+**Method.** The SAME prompt (`wuxia.txt`, 233 tokens), the SAME tokenizer, the SAME
+50-layer truncation, the SAME `MiniMaxH3EncoderTextForwardDevice`, the SAME f32
+activations — only the weight bytes differ (Q4_K_M ggml blocks vs the original
+bf16 14-shard release). Both arms self-report identical geometry
+(`layers=50 hidden=5120 heads=64 kv_heads=8 head_dim=128 ffn=25600`), which is what
+establishes they are the same model. Conditioning is `[233, 5120]` f32, written by
+`minimax-h3-gen --encoder-only --save-embeds`. Build `d3861693d51a`, CUDA 13.0.1
+container, Thor sm_110, GPU idle (the LocalAI render had finished).
+
+**A CALIBRATION arm, because a cosine is meaningless without a scale.** The bf16
+encoder also encoded a one-word edit of the same prompt (`bamboo forest at night`
+-> `at dawn`, also 233 tokens). That is a real semantic change to the scene, and it
+is the yardstick the quantization number is read against.
+
+| | max\|diff\| | RMS | rel RMS | rel RMS excl. sink tok | cos min | cos mean | cos median | angle mean | angle max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Q4_K_M vs bf16** (quantization) | 154.0 | 0.5045 | **0.03403** | **0.06849** | 0.90916 | **0.99745** | 0.99810 | 3.793° | 24.61° |
+| bf16 `night`->`dawn` (one-word edit) | 31.1 | 0.2812 | 0.01897 | 0.06666 | 0.84736 | 0.99769 | 0.99963 | 2.228° | 32.07° |
+
+**Reading it.**
+
+1. **It is NOT a scale change.** The Q4 conditioning is uniformly ~1% smaller
+   (per-token norm ratio mean 0.99010), but the best single global rescale removes
+   almost none of the difference (0.03403 -> 0.03280). The change is DIRECTIONAL,
+   which is the kind that matters for conditioning.
+2. **Its total energy is on par with a one-word prompt edit.** Excluding token 0,
+   the perturbations are 6.85% (quantization) vs 6.67% (the edit) of the
+   conditioning norm. Quantizing the encoder moves the conditioning about as much
+   as rewriting a word of the prompt.
+3. **But the SHAPE is opposite, and this is the interesting part.** The word edit
+   is SPARSE: 172 of 233 tokens stay above cosine 0.999 (median rotation 0.16°) and
+   the change concentrates on ~6 tokens, the biggest at 32°. Quantization is
+   DIFFUSE: 232 of 233 tokens fall below cosine 0.999, EVERY token rotates by a few
+   degrees (median 3.5°), and one token (69) rotates 24.6°. That is a smear applied
+   everywhere, not a different prompt.
+4. **`max|diff|` = 154 is the attention sink, not corruption.** Token 0 has norm
+   15,522 against a 366 mean (42x) and carries 68% of the total squared error, yet
+   its DIRECTION is nearly untouched (cosine 0.99962). This is the channel-wise
+   magnitude-outlier behaviour ComfyUI PR 15298 attributes to H3's partial
+   split-half RoPE, showing up concretely: the outlier dominates every norm-weighted
+   aggregate, which is why the sink-excluded column is the honest one.
+
+**Verdict.** Q4_K_M is doing real, measurable damage to the conditioning — not a
+rounding artifact, and comparable in magnitude to editing the prompt — but it
+damages it DIFFUSELY. A uniform few-degree rotation of every token is the signature
+that blunts fine-grained compositional instruction (coverage, blocking, staging)
+toward a prompt's average semantics, which is exactly the "competent but generic"
+symptom. So the bf16 encoder is worth a render A/B.
+
+**What this does NOT establish.** It does not prove the render changes. The DiT
+consumes conditioning through a token refiner and cross-attention, and nothing here
+measures that path's sensitivity to a 3.5°-median rotation. The owed next
+measurement is a byte-identical-everything-else render A/B: same DiT, same seed,
+same steps, `--prompt-embeds cond_q4km.bin` vs `cond_bf16.bin` (which is exactly
+what `--save-embeds` / `--prompt-embeds` make controllable).
+
+**REPRODUCED.** Both arms were re-run from scratch (fresh process, fresh
+load of the checkpoint) and each produced a BYTE-IDENTICAL conditioning file:
+`cond_q4km.bin` md5 `a331232096ef1da2628f885950b2fc55` and `cond_bf16.bin` md5
+`9c096b63b9bd07f604daebb2fc090f46` on both runs. So every number above is
+deterministic, not a sample — there is no noise band to argue about, and a
+future change to either path shows up as an md5 change.
+
+**Cost, for the next person.** Q4_K_M arm: 40 s wall, host+device peak **18.0 GiB**.
+bf16 arm: 40 s wall (35 s of it streaming), **45.41 GiB uploaded** to the device,
+host conversion peak **0.0195 MiB** (one norm — the projections never touch a host
+buffer), total host+device peak **51.95 GiB** on the 122 GiB UNIFIED pool. The
+streamer's counters confirm the path ran: `layers=50 tensors=400 direct=350
+converted=200 fused=100`.

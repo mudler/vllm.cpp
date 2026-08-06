@@ -1,0 +1,10 @@
+ARG UBUNTU=24.04
+FROM ubuntu:${UBUNTU} AS build
+ARG JOBS=4
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,id=vllm-cpp-arm64-build,target=/build cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_SERVER=OFF && cmake --build /build -j${JOBS} --target vllm-bench vllm-cpu-kernel-bench && /build/examples/vllm-cpu-kernel-bench --m 1 --n 32 --k 32 --threads 1 --warmup 0 --iterations 1 --counters off --no-pin --format json && mkdir -p /out && cp /build/examples/vllm-bench /build/examples/vllm-cpu-kernel-bench /out/
+FROM scratch AS export
+COPY --from=build /out/vllm-bench /
+COPY --from=build /out/vllm-cpu-kernel-bench /

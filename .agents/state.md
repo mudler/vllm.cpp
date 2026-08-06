@@ -39333,3 +39333,34 @@ invalid-input and structured-counter cases. Direct x86 executions passed at
 groups returned real counts. Those x86 timings are tool validation only and
 are not binding performance evidence. Pi PMU execution, Qwen correctness and
 llama.cpp comparison remain `PENDING`; next is R1-on-Pi, then R2 bring-up.
+
+## 2026-08-06T17:45 - BACKEND-CPU R2-R3 portable Pi baseline green
+<!-- state: 2026-08-06T17:45 -->
+
+The CPU-only ARM64 build now runs entirely through local Docker buildx/QEMU;
+the Pi remains execution-only. Ubuntu 24.04/GCC 13.3 built and linked
+`vllm-bench` plus `vllm-cpu-kernel-bench`, and QEMU executed the quantized
+matmul smoke. Exported binaries and the pinned 2.83 GB Q8_K_XL model were
+SHA-256-gated before deployment into `~/vllm-cpp-assembly`.
+
+R2 correctness is GREEN. The Pi generated the exact x86 current-engine golden
+over 16/16 tokens; the token file SHA-256 is
+`684f55a32355c0ccb6ce9c987273981f077b9591a46db07aea68561eb6432966`.
+Portable Q8 operation checksums were exact at one and four threads: decode
+M=1/N=3072/K=2048 `0xd6aec014c0050fda`, prefill M=128
+`0xa89baff1f3a4e360`.
+
+R3's idle, unthrottled 2.4 GHz baseline measured the M=1 fixture at 1,554,115
+ns median / 8.10 GFLOP/s on one core and 742,585 ns / 16.94 GFLOP/s on four;
+the M=128 fixture measured 197,061,735 ns and 49,890,756 ns (3.95x). The
+16-token model arm measured 2.14 output tok/s, TTFT 1,961.99 ms and TPOT/ITL
+366.91 ms. A separate 64-token `perf record -e cycles:u -c 1000000` captured
+241K samples with zero loss: `Bt16Neon` 57.76%, portable
+`VecDotQ8_0Q8_0` 20.10%, thread-ready 6.45%, `F16ToF32` 4.87%.
+
+The real model therefore reaches a material scalar Q8 dot hot spot. Existing
+Arm acceleration requires i8mm, which the A76 lacks; DotProd is available.
+R4/R5 will compare an exact-order C++ SDOT intrinsic against a scheduled
+AAPCS64 implementation in one QEMU-built binary, using the portable checksums,
+PMU fixture and full-model run as recursive gates. No speedup or llama.cpp
+parity is claimed at this checkpoint.

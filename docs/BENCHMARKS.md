@@ -154,15 +154,20 @@ host mirror is freed once the device Marlin resident is built.
 
 ## llama.cpp, CPU
 
-Raspberry Pi 5 Cortex-A76 is a separate `PENDING` arm. It has four cores,
+Raspberry Pi 5 Cortex-A76 is a separate `GATING` arm. It has four cores,
 DotProd and no i8mm, so the binding 20-core Arm result below does not transfer.
-Reproduction starts with the exact Q8_K_XL SHA-256 recorded in the
-[RPi5 spike](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md), portable
-16-token correctness, then three interleaved vllm.cpp/llama.cpp repetitions at
-1/2/4 threads. The R1 vt-op harness is CPU-gated and emits PMU-accounted JSON;
-the first Pi probe is
-`vllm-cpu-kernel-bench --dtype q8_0 --m 1 --n 3072 --k 2048 --threads 1 --cache stream --counters a76 --format json`.
-No Pi throughput or memory number is accepted yet.
+The R2-R3 portable baseline uses the exact Q8_K_XL SHA-256 in the
+[RPi5 spike](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md) and a local
+buildx/QEMU ARM64 build; QEMU timing is non-binding. The exported artifact ran
+unthrottled at 2.4 GHz on the Pi and matched the x86 golden 16/16 tokens. Q8_0
+M=1/N=3072/K=2048 measured 1,554,115 ns at one thread and 742,585 ns at four;
+M=128 measured 197,061,735 ns and 49,890,756 ns respectively. Exact fixture
+checksums held in every arm. The 16-token model arm measured TTFT 1,961.99 ms,
+TPOT/ITL 366.91 ms and output throughput 2.14 tok/s. A zero-loss 64-token
+`cycles:u` trace attributes 57.76% to BF16 GEMM and 20.10% to the portable Q8
+dot. These numbers bind the portable denominator only. SDOT/assembly A/B,
+three interleaved full-model repetitions, peak memory and same-file llama.cpp
+comparison remain `PENDING`.
 
 Same GGUF file both arms, `dgx.casa` GB10 aarch64 (20 cores), idle, 3 reps,
 llama.cpp `237ad9b96` built fresh on the same host.

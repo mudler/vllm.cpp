@@ -51,8 +51,6 @@ target_link_libraries(quant-gemm-bench PRIVATE vllm::vllm)
 target_include_directories(quant-gemm-bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_set_warnings(quant-gemm-bench)
 
-# General PMU-backed CPU operation harness (BACKEND-CPU R1). quant-gemm-bench
-# stays available so the earlier binding evidence remains reproducible.
 add_executable(vllm-cpu-kernel-bench cpu_kernel_bench/main.cpp)
 target_link_libraries(vllm-cpu-kernel-bench PRIVATE vllm::vllm)
 target_include_directories(vllm-cpu-kernel-bench PRIVATE ${CMAKE_SOURCE_DIR}/src)

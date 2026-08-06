@@ -40,6 +40,28 @@ the Pi is the performance and memory floor.
   `perf` and LLVM are not initially installed; direct `perf_event_open` is the
   binding harness path, with `perf`/`llvm-mca` optional cross-checks.
 
+## Build and execution split
+
+The Pi is an execution target, not a build host. `docker/Dockerfile.arm64`
+mirrors the repository-family buildx pattern: Ubuntu 24.04 runs as
+`linux/arm64` under QEMU, configures a Release CPU-only build, compiles
+`vllm-bench` plus `vllm-cpu-kernel-bench`, executes a small quantized-matmul
+smoke, and exports only those two binaries:
+
+```sh
+docker buildx build --builder pf-arm --platform linux/arm64 \
+  -f docker/Dockerfile.arm64 --target export \
+  --output type=local,dest=/tmp/vllm-arm64 .
+```
+
+This keeps source compilation, build packages and build trees off the Pi. The
+exported glibc 2.39 binaries are deployed into a disposable user-owned Pi
+directory and execute against the Pi's newer glibc. QEMU proves AArch64 build,
+link and instruction execution, but its time and virtual PMU are never accepted
+as Cortex-A76 performance evidence. All binding cycles, stalls, cache events,
+wall time, frequency, temperature and throttling metadata come from execution
+of the exported artifact on the physical Pi.
+
 ## Upstream and dependency chain
 
 vLLM is the semantic oracle, not the Pi implementation source:
@@ -83,7 +105,7 @@ The current production path is already shared and model-independent:
 | Paged attention | `src/vt/cpu/cpu_paged_attn.cpp` | correctness and 1/2/4-core scaling owed |
 | Qwen3.5 forward | `src/vllm/model_executor/models/qwen3_5*.cpp` | reuse unchanged; no Pi-private forward |
 | Provider selection | `include/vt/op_provider.h`, `src/vt/op_provider.cpp` | register A76 variants here with same-binary fallback |
-| CPU microbench | `examples/cpu_kernel_bench/main.cpp` | R1 vt-op/PMU substrate CPU-gated; Pi execution pending |
+| CPU microbench | `examples/cpu_kernel_bench/main.cpp` | R1 vt-op/PMU substrate CPU-gated; QEMU build and physical-Pi execution green |
 | Legacy quant evidence | `examples/quant_gemm_bench/main.cpp` | retained unchanged for prior results |
 
 Every operation observed in the Qwen trace is entered into the experiment
@@ -175,8 +197,8 @@ matching llama.cpp quant/repack cases for any borrowed layout or kernel:
 1. x86-64 captures fixed prompt IDs, seeds, sampling parameters, 16 greedy
    tokens, selected logits and operation fixtures from the pinned vLLM oracle
    and the current CPU implementation.
-2. Pi portable build loads the exact-hash GGUF and matches 16/16 tokens before
-   any optimized provider is enabled.
+2. The QEMU-built portable artifact loads the exact-hash GGUF on the Pi and
+   matches 16/16 tokens before any optimized provider is enabled.
 3. Every provider matches its portable operation contract and the Pi full
    model repeats the cross-architecture golden.
 4. Microbench A/B uses randomized interleaved trials. A retained metric-level
@@ -197,8 +219,8 @@ matching llama.cpp quant/repack cases for any borrowed layout or kernel:
 |---|---|---|---|
 | R0 | Spike, Pi inventory and fixed model recipe | observed hardware facts | this spec + current record surfaces |
 | R1 | **CPU-GATED** general CPU kernel/PMU harness | existing quant bench | warning-clean build; JSON/CLI/timer/counter contract; 1/4-thread runs |
-| R2 | Portable Pi bring-up and x86 goldens | R0 | exact hash, load, 16/16 tokens, operation fixtures |
-| R3 | Qwen trace + recursive scope profiling | R1-R2 | complete reached-loop inventory and binding baseline |
+| R2 | **GREEN** QEMU-built portable Pi bring-up and x86 goldens | R0 | exact hash, load, 16/16 tokens, operation fixtures |
+| R3 | **GREEN** Qwen trace + recursive scope profiling | R1-R2 | reached-loop inventory and binding baseline below |
 | R4 | A76 C++/NEON/SDOT providers | R3 ranked evidence | op correctness + causal metric win + no enclosing regression |
 | R5 | A76 assembly candidates | R4 plateau + proven compiler gap | ABI/disassembly/correctness + recursive A/B |
 | R6 | Whole-system/thread/serving exhaustion | accepted R4/R5 stack | all lever dispositions, <1% residual model, llama.cpp floor |
@@ -206,6 +228,31 @@ matching llama.cpp quant/repack cases for any borrowed layout or kernel:
 R1-R3 are the first implementation checkpoint. R4/R5 split into separate
 kernel-row PRs if the changed code exceeds the one-row helper size cap; this PR
 does not silently absorb unrelated kernel families.
+
+## R2-R3 binding result
+
+The Ubuntu 24.04 buildx/QEMU build completed with GCC 13.3 and its quantized
+matmul smoke passed. The two exported AArch64 binaries were hash-gated before
+deployment. On the physical Pi, the pinned model matched the x86 current-engine
+golden 16/16 tokens (golden file SHA-256 `684f55a32355c0ccb6ce9c987273981f077b9591a46db07aea68561eb6432966`).
+The four portable fixture arms also retained their exact checksums: decode
+M=1 `0xd6aec014c0050fda` and prefill M=128 `0xa89baff1f3a4e360`, at one and
+four threads.
+
+The idle, unthrottled 2.4 GHz Pi baseline measured Q8_0 M=1/N=3072/K=2048 at
+1,554,115 ns median (8.10 GFLOP/s) on one core and 742,585 ns (16.94 GFLOP/s)
+on four. The M=128 arm measured 197,061,735 ns on one core and 49,890,756 ns
+on four (3.95x scaling). The 16-token model arm measured TTFT 1,961.99 ms,
+TPOT/ITL 366.91 ms and output throughput 2.14 tok/s. These are portable
+baselines, not optimized results or llama.cpp parity claims.
+
+A zero-loss, low-overhead `cycles:u` profile of a 64-token model run ranks the
+reached loops: BF16 `Bt16Neon` 57.76%, portable `VecDotQ8_0Q8_0` 20.10%,
+thread-ready 6.45% and `F16ToF32` 4.87%. The Q8 dot is selected for R4/R5:
+the Pi has DotProd but the only existing Arm quant fast path requires i8mm, so
+the real model currently executes the scalar portable dot. The next checkpoint
+must compare portable, compiler-generated exact-order SDOT and AAPCS64 assembly
+in one binary before any default dispatch changes.
 
 ## Risks and decisions
 
@@ -220,6 +267,7 @@ does not silently absorb unrelated kernel families.
 - PMU counter availability is verified, but permissions and event scheduling
   can still reject an event. The harness reports unsupported events and never
   fabricates zero counts.
-- Temporary governor/tool installation and model transfer were approved by the
-  user. Every system setting is recorded and restored; no public service is
-  started and vLLM is not installed on the Pi.
+- Artifact/model deployment into a disposable user-owned directory is approved.
+  Source is never compiled on the Pi. Every temporary system setting is
+  recorded and restored; no public service is started and vLLM is not installed
+  on the Pi.

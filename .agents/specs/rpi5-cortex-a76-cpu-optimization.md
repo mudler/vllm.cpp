@@ -83,7 +83,8 @@ The current production path is already shared and model-independent:
 | Paged attention | `src/vt/cpu/cpu_paged_attn.cpp` | correctness and 1/2/4-core scaling owed |
 | Qwen3.5 forward | `src/vllm/model_executor/models/qwen3_5*.cpp` | reuse unchanged; no Pi-private forward |
 | Provider selection | `include/vt/op_provider.h`, `src/vt/op_provider.cpp` | register A76 variants here with same-binary fallback |
-| Existing microbench | `examples/quant_gemm_bench/main.cpp` | generalize, retain legacy cases |
+| CPU microbench | `examples/cpu_kernel_bench/main.cpp` | R1 vt-op/PMU substrate CPU-gated; Pi execution pending |
+| Legacy quant evidence | `examples/quant_gemm_bench/main.cpp` | retained unchanged for prior results |
 
 Every operation observed in the Qwen trace is entered into the experiment
 manifest before tuning. Expected families are quant and elementwise GEMM/GEMV,
@@ -195,7 +196,7 @@ matching llama.cpp quant/repack cases for any borrowed layout or kernel:
 | W | Item | Entry gate | Exit gate |
 |---|---|---|---|
 | R0 | Spike, Pi inventory and fixed model recipe | observed hardware facts | this spec + current record surfaces |
-| R1 | General CPU kernel/PMU harness | existing quant bench | units, JSON schema, timer/counter self-tests |
+| R1 | **CPU-GATED** general CPU kernel/PMU harness | existing quant bench | warning-clean build; JSON/CLI/timer/counter contract; 1/4-thread runs |
 | R2 | Portable Pi bring-up and x86 goldens | R0 | exact hash, load, 16/16 tokens, operation fixtures |
 | R3 | Qwen trace + recursive scope profiling | R1-R2 | complete reached-loop inventory and binding baseline |
 | R4 | A76 C++/NEON/SDOT providers | R3 ranked evidence | op correctness + causal metric win + no enclosing regression |

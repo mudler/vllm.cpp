@@ -39305,3 +39305,31 @@ No Pi model run, correctness result, throughput number or assembly kernel is
 claimed at this checkpoint. `docs/BENCHMARKS.md` records `PENDING`; the prior
 20-core Arm/i8mm binding result remains intact and explicitly does not transfer.
 Next: R1 harness, then exact-hash model transfer and portable bring-up.
+
+
+## 2026-08-06T16:39 - BACKEND-CPU R1 PMU harness CPU-gated
+<!-- state: 2026-08-06T16:39 -->
+
+`examples/cpu_kernel_bench/main.cpp` adds the review-capped
+`vllm-cpu-kernel-bench` vt-op substrate without changing a production kernel.
+The initial fixture covers `MatmulBTQuant` Q8_0/Q4_K/Q6_K with M/N/K/thread,
+provider, warmup/iteration, hot/L2/L3/stream pressure and text/JSON controls.
+Inputs are deterministic and every timing/counter pass must preserve the same
+FNV checksum. Hot cases calibrate calls per sample until clock-read overhead is
+below 0.1%; cold profiles expose an invalid timing instead of hiding overhead.
+
+Linux counters use `perf_event_open` directly. Generic passes and four
+Cortex-A76 raw groups repeat cycles/instructions alongside stalls, branch,
+L1/L2/LL-cache and TLB events; counts are scaled by enabled/running time and
+each pass reports `ok`, `partial`, `multiplexed`, `unscheduled` or
+`unsupported`. The JSON also records IPC, logical bytes/bandwidth, compiler
+features, CPU/affinity/migration, frequency, governor, temperature and
+Raspberry Pi `get_throttled` output when `vcgencmd` exists.
+
+GCC 15.2 CPU build passed `-Wall -Wextra -Werror`; clang-format is clean;
+CTest `test_cpu_kernel_bench_cli` passed its deterministic JSON-schema,
+invalid-input and structured-counter cases. Direct x86 executions passed at
+1 and 4 threads, including a model-shaped Q8_0 decode fixture, and generic PMU
+groups returned real counts. Those x86 timings are tool validation only and
+are not binding performance evidence. Pi PMU execution, Qwen correctness and
+llama.cpp comparison remain `PENDING`; next is R1-on-Pi, then R2 bring-up.

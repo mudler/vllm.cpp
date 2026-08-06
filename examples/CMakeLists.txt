@@ -51,6 +51,20 @@ target_link_libraries(quant-gemm-bench PRIVATE vllm::vllm)
 target_include_directories(quant-gemm-bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_set_warnings(quant-gemm-bench)
 
+# General PMU-backed CPU operation harness (BACKEND-CPU R1). quant-gemm-bench
+# stays available so the earlier binding evidence remains reproducible.
+add_executable(vllm-cpu-kernel-bench cpu_kernel_bench/main.cpp)
+target_link_libraries(vllm-cpu-kernel-bench PRIVATE vllm::vllm)
+target_include_directories(vllm-cpu-kernel-bench PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_set_warnings(vllm-cpu-kernel-bench)
+if(VLLM_CPP_BUILD_TESTS)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME test_cpu_kernel_bench_cli
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/scripts/test_cpu_kernel_bench.py
+      $<TARGET_FILE:vllm-cpu-kernel-bench>)
+endif()
+
 # The OpenAI HTTP server example is gated on the vendored cpp-httplib transport.
 if(VLLM_CPP_SERVER)
   add_executable(server server/main.cpp)

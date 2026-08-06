@@ -159,7 +159,10 @@ DotProd and no i8mm, so the binding 20-core Arm result below does not transfer.
 Reproduction starts with the exact Q8_K_XL SHA-256 recorded in the
 [RPi5 spike](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md), portable
 16-token correctness, then three interleaved vllm.cpp/llama.cpp repetitions at
-1/2/4 threads. No Pi throughput or memory number is accepted yet.
+1/2/4 threads. The R1 vt-op harness is CPU-gated and emits PMU-accounted JSON;
+the first Pi probe is
+`vllm-cpu-kernel-bench --dtype q8_0 --m 1 --n 3072 --k 2048 --threads 1 --cache stream --counters a76 --format json`.
+No Pi throughput or memory number is accepted yet.
 
 Same GGUF file both arms, `dgx.casa` GB10 aarch64 (20 cores), idle, 3 reps,
 llama.cpp `237ad9b96` built fresh on the same host.

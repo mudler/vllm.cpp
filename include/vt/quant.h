@@ -73,6 +73,17 @@ FromFloatFn BlockFromFloat(DType dtype);
 // cpu_quant_dot.cpp.
 VecDotFn BlockVecDot(DType dtype);
 
+// Q8_0 x Q8_0 DotProd variants for KERNEL-CPU-A76-Q8-DOT. The explicit
+// getters are test/benchmark seams; SelectQuantQ8VecDot applies
+// VT_CPU_Q8_DOT=auto|portable|sdot|a76-asm while retaining `portable` as the
+// universal fallback. The assembly getter is ISA-safe on any DotProd core;
+// QuantQ8A76AsmActive additionally reports whether the running CPU is A76.
+VecDotFn QuantQ8SdotVecDot();
+VecDotFn QuantQ8A76AsmVecDot();
+VecDotFn SelectQuantQ8VecDot(VecDotFn portable);
+bool QuantQ8SdotActive();
+bool QuantQ8A76AsmActive();
+
 // The Arm i8mm (mmla) `nrc == 2` `vec_dot` for a block WEIGHT dtype — QUANT-
 // GGUF-CIQ-GEMM work row G6 (cpu_quant_dot_arm.cpp). Non-null ONLY when the
 // process runs on i8mm-capable aarch64 (compile-time `__ARM_FEATURE_MATMUL_INT8`

@@ -221,8 +221,8 @@ matching llama.cpp quant/repack cases for any borrowed layout or kernel:
 | R1 | **CPU-GATED** general CPU kernel/PMU harness | existing quant bench | warning-clean build; JSON/CLI/timer/counter contract; 1/4-thread runs |
 | R2 | **GREEN** QEMU-built portable Pi bring-up and x86 goldens | R0 | exact hash, load, 16/16 tokens, operation fixtures |
 | R3 | **GREEN** Qwen trace + recursive scope profiling | R1-R2 | reached-loop inventory and binding baseline below |
-| R4 | A76 C++/NEON/SDOT providers | R3 ranked evidence | op correctness + causal metric win + no enclosing regression |
-| R5 | A76 assembly candidates | R4 plateau + proven compiler gap | ABI/disassembly/correctness + recursive A/B |
+| R4 | **GREEN** A76 C++/NEON/SDOT provider | R3 ranked evidence | exact operation/model output; 2.4x scalar kernel speedup |
+| R5 | **GREEN with named T4 residual** A76 assembly candidate | R4 plateau + proven compiler gap | 3.66-5.08% binding kernel win; recursive model non-regressing |
 | R6 | Whole-system/thread/serving exhaustion | accepted R4/R5 stack | all lever dispositions, <1% residual model, llama.cpp floor |
 
 R1-R3 are the first implementation checkpoint. R4/R5 split into separate
@@ -250,9 +250,27 @@ A zero-loss, low-overhead `cycles:u` profile of a 64-token model run ranks the
 reached loops: BF16 `Bt16Neon` 57.76%, portable `VecDotQ8_0Q8_0` 20.10%,
 thread-ready 6.45% and `F16ToF32` 4.87%. The Q8 dot is selected for R4/R5:
 the Pi has DotProd but the only existing Arm quant fast path requires i8mm, so
-the real model currently executes the scalar portable dot. The next checkpoint
-must compare portable, compiler-generated exact-order SDOT and AAPCS64 assembly
-in one binary before any default dispatch changes.
+the R4-R5 checkpoint therefore compared portable, compiler-generated
+exact-order SDOT and AAPCS64 assembly in one binary before changing dispatch.
+
+## R4-R5 binding result
+
+The A76 Q8 row is now `GATING`, with its requested assembly/compiler gap
+proven. The locally QEMU-built binary passed 20/20 focused cases and 150,258
+assertions. On the physical Pi, all operation checksums and all 64 Qwen tokens
+match their portable/x86 goldens. The scheduled two-block AAPCS64 leaf beats
+GCC's ACLE SDOT loop 3.66% on M=1/T1, 5.08% on M=128/T1 and 3.69% on
+M=128/T4, while retiring about 10% fewer instructions. GCC emits a 48-byte
+frame and two dependent SDOTs per block; the valid assembly hot path is a
+stack-free leaf with two independent block chains.
+
+The recursive model gate is non-regressing: assembly versus compiler SDOT has
+1.55% lower median TTFT, neutral TPOT and 0.13% lower E2E. Against the
+portable arm it lowers E2E 2.67%. `auto` selects the assembly only on
+Cortex-A76+DotProd. M=1/T4 remains a measured negative at −2.43%, so R6 owns
+that thread-partition interaction plus BF16 GEMM, peak memory, concurrency and
+the same-file Pi llama.cpp floor. Full provenance and raw hashes are in the
+[R5 evidence](../../docs/bench-evidence/rpi5-a76-q8-dot-20260806.md).
 
 ## Risks and decisions
 

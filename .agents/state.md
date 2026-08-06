@@ -39380,3 +39380,61 @@ operation checksums and model tokens, a proven ABI/disassembly contract, and no
 enclosing Qwen regression. QEMU remains build/smoke-only and source will not be
 compiled on the Pi. No optimized implementation or speed claim exists at this
 spike checkpoint.
+
+## 2026-08-06T19:45 - KERNEL-CPU-A76-Q8-DOT R4-R5 assembly win
+<!-- state: 2026-08-06T19:45 -->
+
+`CLAIM-KERNEL-CPU-A76-Q8-DOT` closes W1-W5 and moves the kernel row from
+`SPIKE` to `GATING`. ARM64 was never compiled on the Pi: local buildx/QEMU
+with Ubuntu 24.04/GCC 13.3 built the assembly TU, ran `test_ops_quant_dot`
+20/20 (150,258 assertions) and executed an explicit assembly smoke before
+export. Final binary SHA-256 values are `vllm-bench`
+`9eb57cf3760eaade9dcef03dda1648556577c44199369ad38bf42083efbc70a9`
+and `vllm-cpu-kernel-bench`
+`a94dad30411651901e4f6ed8aaf14efb735e09f0412bb8f8788873fdfd7a6818`.
+
+The implementation keeps the portable Q8_0 dot as the universal fallback,
+adds a GCC/ACLE exact-order SDOT control, and adds an AAPCS64 two-block leaf.
+Linux HWCAP gates DotProd; MIDR implementer `0x41`, part `0xd0b` gates the
+automatic assembly selection. Only `cpu_quant_dot_sdot.cpp` receives
+`-march=armv8.2-a+dotprod+fp16`. Explicit benchmark overrides remain available
+through `VT_CPU_Q8_DOT=portable|sdot|a76-asm`; `auto` selects assembly only on
+Cortex-A76+DotProd and otherwise stays portable.
+
+Final disassembly proves the compiler gap. GCC's 216-byte `VecDotQ8Sdot` has a
+48-byte stack frame and a one-block loop whose two adjacent SDOTs feed one
+dependent accumulator. The 276-byte assembly valid path is a leaf with no
+stack traffic, overlaps two independent `v4`/`v20` block chains, post-indexes
+the 68-byte Q8 pair, uses only caller-saved registers and retains original
+per-block f32 accumulation order. Invalid K/`nrc` tail-branches to the C++
+contract checker.
+
+Physical-Pi evidence is one same-binary interleaved series per shape, seven
+outer repetitions per arm, ondemand up to 2.4 GHz and `throttled=0x0`.
+Assembly versus compiler SDOT medians: M=1/T1 614,414.75 vs 637,738.5 ns
+(**+3.66%**), cycles 1,469,048 vs 1,517,121 and instructions 3,664,537.5 vs
+4,076,185.5; M=128/T1 75,537,409 vs 79,579,829 ns (**+5.08%**); M=128/T4
+19,887,768 vs 20,649,426 ns (**+3.69%**). Retired instructions fall
+9.74-10.24%. The named negative is M=1/T4, 480,210 vs 468,798.25 ns
+(**-2.43%**) and 4.32% more cycles despite 8.77% fewer instructions,
+selecting the threadpool partition as W6
+rather than hiding it.
+
+All portable/compiler/assembly fixture arms are checksum-identical. The three
+64-token Qwen repetitions for each arm are also byte-identical to the x86
+golden SHA-256
+`0ec98eabb23e4148d540fcf79a2fe61678fb90fe462cdf28134af7a42fe6a826`.
+Median assembly versus compiler SDOT: TTFT 1,307.27 vs 1,327.91 ms
+(**1.55% lower**), TPOT 367.67 vs 367.85 ms (0.05% lower, neutral), E2E
+24,470.20 vs 24,502.52 ms (**0.13% lower**). Against portable, assembly
+lowers TTFT 33.40%, E2E 2.67% and raises output throughput 2.75%. A final
+`auto` 16-token run selected assembly, matched the original x86 golden and
+reported TTFT 1,305.62 ms / TPOT 362.63 ms / E2E 6,745.08 ms without
+throttling.
+
+Binding commands, all raw-file SHA-256 values, the four shape tables and
+disassembly excerpts are indexed at
+`docs/bench-evidence/rpi5-a76-q8-dot-20260806.md`. W6 remains open for the
+M=1/T4 scheduler interaction, the still-dominant BF16 GEMM, peak memory,
+concurrency and the same-file Pi llama.cpp floor. No Pi competitor-parity
+claim is made.

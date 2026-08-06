@@ -204,6 +204,13 @@ float RunVecDot(vt::DType wtype, const uint8_t* wq, const uint8_t* aq,
   return s;
 }
 
+float RunVecDotFn(vt::cpu::VecDotFn fn, const uint8_t* wq,
+                  const uint8_t* aq, int64_t k) {
+  float s = 0.0F;
+  fn(static_cast<int>(k), &s, 0, wq, 0, aq, 0, 1);
+  return s;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -583,6 +590,73 @@ TEST_CASE("G3 dot_product_error within upstream bound (test-quantize-fns:86)") {
   CHECK(err < kMaxDotProductError);
 }
 
+TEST_CASE("KERNEL-CPU-A76-Q8-DOT explicit SDOT and assembly match portable") {
+  const vt::cpu::VecDotFn sdot = vt::cpu::QuantQ8SdotVecDot();
+  const vt::cpu::VecDotFn assembly = vt::cpu::QuantQ8A76AsmVecDot();
+  CHECK((sdot == nullptr) == (assembly == nullptr));
+  if (sdot == nullptr) {
+    CHECK_FALSE(vt::cpu::QuantQ8SdotActive());
+    CHECK_FALSE(vt::cpu::QuantQ8A76AsmActive());
+    return;
+  }
+  CHECK(vt::cpu::QuantQ8SdotActive());
+
+  const vt::cpu::VecDotFn portable =
+      vt::cpu::QuantTraits(vt::DType::kQ8_0).vec_dot;
+  for (int blocks : {1, 2, 3, 5, 64}) {
+    CAPTURE(blocks);
+    const int64_t k = 32 * blocks;
+    std::vector<uint8_t> wq =
+        RandomBlocks(kWeightCases[1], blocks, 0xA760U + blocks);
+    std::vector<float> act(static_cast<size_t>(k));
+    GenerateData(0.75F, act.size(), act.data());
+    std::vector<uint8_t> aq =
+        QuantizeActivation(vt::DType::kQ8_0, act.data(), k);
+
+    // Offset both buffers by one byte: Q8 blocks are 34 bytes and therefore
+    // alternate natural alignment in real rows. All three tiers must accept
+    // an unaligned block base without reading beyond the final block.
+    std::vector<uint8_t> wu(wq.size() + 2, 0xA5);
+    std::vector<uint8_t> au(aq.size() + 2, 0x5A);
+    std::memcpy(wu.data() + 1, wq.data(), wq.size());
+    std::memcpy(au.data() + 1, aq.data(), aq.size());
+    const float ref = RunVecDotFn(portable, wu.data() + 1, au.data() + 1, k);
+    CHECK(RunVecDotFn(sdot, wu.data() + 1, au.data() + 1, k) == ref);
+    CHECK(RunVecDotFn(assembly, wu.data() + 1, au.data() + 1, k) == ref);
+  }
+
+  auto check_edge_blocks = [&](uint16_t wd, uint16_t ad, bool zero_payload) {
+    constexpr int blocks = 2;
+    constexpr int block_bytes = 34;
+    std::vector<uint8_t> wq(blocks * block_bytes);
+    std::vector<uint8_t> aq(blocks * block_bytes);
+    for (int ib = 0; ib < blocks; ++ib) {
+      uint8_t* wb = wq.data() + ib * block_bytes;
+      uint8_t* ab = aq.data() + ib * block_bytes;
+      std::memcpy(wb, &wd, sizeof(wd));
+      std::memcpy(ab, &ad, sizeof(ad));
+      for (int j = 0; j < 32; ++j) {
+        wb[2 + j] = zero_payload
+                        ? 0
+                        : static_cast<uint8_t>((j & 1) != 0 ? 127 : -128);
+        ab[2 + j] = zero_payload
+                        ? 0
+                        : static_cast<uint8_t>((j & 2) != 0 ? -128 : 127);
+      }
+    }
+    const float ref = RunVecDotFn(portable, wq.data(), aq.data(), 64);
+    CHECK(RunVecDotFn(sdot, wq.data(), aq.data(), 64) == ref);
+    CHECK(RunVecDotFn(assembly, wq.data(), aq.data(), 64) == ref);
+  };
+  check_edge_blocks(vt::F32ToF16(1.0F), vt::F32ToF16(1.0F), true);
+  check_edge_blocks(/*maximum finite f16=*/0x7BFFU,
+                    /*minimum normal negative f16=*/0x8400U, false);
+
+  std::vector<uint8_t> one(34, 0);
+  float out = 0.0F;
+  CHECK_THROWS(sdot(33, &out, 0, one.data(), 0, one.data(), 0, 1));
+  CHECK_THROWS(assembly(32, &out, 0, one.data(), 0, one.data(), 0, 2));
+}
 // ---------------------------------------------------------------------------
 // G3 — the GEMM wiring (kMatmulBTQuant), ported MUL_MAT cases
 // ---------------------------------------------------------------------------

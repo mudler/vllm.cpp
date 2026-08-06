@@ -675,7 +675,8 @@ void VecDotMXFP4Q8_0(int n, float* s, size_t bs, const void* vx, size_t bx,
 VecDotFn BlockVecDot(DType dtype) {
   switch (dtype) {
     case DType::kQ4_0: return &VecDotQ4_0Q8_0;        // quants.c:174
-    case DType::kQ8_0: return &VecDotQ8_0Q8_0;        // quants.c:400
+    case DType::kQ8_0:
+      return SelectQuantQ8VecDot(&VecDotQ8_0Q8_0);  // quants.c:400 + A76 tier
     case DType::kQ2_K: return &VecDotQ2_KQ8_K;        // quants.c:514
     case DType::kQ3_K: return &VecDotQ3_KQ8_K;        // quants.c:566
     case DType::kQ4_K: return &VecDotQ4_KQ8_K;        // quants.c:645

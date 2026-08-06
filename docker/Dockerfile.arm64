@@ -1,10 +1,23 @@
 ARG UBUNTU=24.04
 FROM ubuntu:${UBUNTU} AS build
 ARG JOBS=4
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake ca-certificates python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY . .
-RUN --mount=type=cache,id=vllm-cpp-arm64-build,target=/build cmake -S . -B /build -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_SERVER=OFF && cmake --build /build -j${JOBS} --target vllm-bench vllm-cpu-kernel-bench && /build/examples/vllm-cpu-kernel-bench --m 1 --n 32 --k 32 --threads 1 --warmup 0 --iterations 1 --counters off --no-pin --format json && mkdir -p /out && cp /build/examples/vllm-bench /build/examples/vllm-cpu-kernel-bench /out/
+RUN --mount=type=bind,source=.,target=/src,readonly \
+    --mount=type=cache,id=vllm-cpp-arm64-build,target=/build \
+    cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_SERVER=OFF \
+    && cmake -E rm -f \
+       /build/CMakeFiles/vllm.dir/src/vt/cpu/cpu_quant_dot.cpp.o \
+       /build/CMakeFiles/vllm.dir/src/vt/cpu/cpu_quant_dot_sdot.cpp.o \
+       /build/CMakeFiles/vllm.dir/src/vt/cpu/cpu_quant_dot_a76.S.o \
+       /build/examples/CMakeFiles/vllm-cpu-kernel-bench.dir/cpu_kernel_bench/main.cpp.o \
+       /build/tests/CMakeFiles/test_ops_quant_dot.dir/vt/test_ops_quant_dot.cpp.o \
+    && cmake --build /build -j${JOBS} --target vllm-bench vllm-cpu-kernel-bench test_ops_quant_dot \
+    && /build/tests/test_ops_quant_dot \
+    && /build/examples/vllm-cpu-kernel-bench --dtype q8_0 --m 1 --n 32 --k 64 --threads 1 --variant a76-asm --warmup 0 --iterations 1 --counters off --no-pin --format json \
+    && mkdir -p /out \
+    && cp /build/examples/vllm-bench /build/examples/vllm-cpu-kernel-bench /out/
 FROM scratch AS export
 COPY --from=build /out/vllm-bench /
 COPY --from=build /out/vllm-cpu-kernel-bench /

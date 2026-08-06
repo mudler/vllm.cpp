@@ -85,7 +85,8 @@ T ParseInteger(std::string_view value, std::string_view flag) {
 void Usage(std::ostream& out) {
   out << "vllm-cpu-kernel-bench, PMU-backed CPU operation harness\n\n"
       << "  --op matmul-bt-quant  --dtype q8_0|q4_k|q6_k\n"
-      << "  --m N --n N --k N --threads N --variant auto|portable|repacked|mmla\n"
+      << "  --m N --n N --k N --threads N\n"
+      << "  --variant auto|portable|sdot|a76-asm|repacked|mmla\n"
       << "  --warmup N --iterations N --cache hot|l2|l3|stream\n"
       << "  --counters auto|off|generic|a76|all --format text|json\n"
       << "  --seed N --no-pin\n\n"
@@ -150,7 +151,8 @@ Options ParseArgs(int argc, char** argv) {
   if (o.m <= 0 || o.n <= 0 || o.k <= 0) Fail("M, N and K must be positive");
   if (o.threads <= 0 || o.threads > 512) Fail("--threads must be in [1,512]");
   if (o.warmup < 0 || o.iterations <= 0) Fail("warmup must be >=0 and iterations >0");
-  const std::array<std::string_view, 4> variants = {"auto", "portable", "repacked", "mmla"};
+  const std::array<std::string_view, 6> variants = {"auto",    "portable", "sdot",
+                                                    "a76-asm", "repacked", "mmla"};
   const std::array<std::string_view, 4> caches = {"hot", "l2", "l3", "stream"};
   const std::array<std::string_view, 5> counters = {"auto", "off", "generic", "a76", "all"};
   if (std::find(variants.begin(), variants.end(), o.variant) == variants.end())
@@ -552,6 +554,11 @@ class QuantMatmulFixture {
       repacked_ = true;
     }
     if (o.variant == "mmla" && !vt::cpu::QuantMmlaActive()) Fail("mmla is unavailable");
+    if ((o.variant == "sdot" || o.variant == "a76-asm") && dtype_ != vt::DType::kQ8_0)
+      Fail("sdot and a76-asm require q8_0");
+    if (o.variant == "sdot" && !vt::cpu::QuantQ8SdotActive()) Fail("sdot is unavailable");
+    if (o.variant == "a76-asm" && vt::cpu::QuantQ8A76AsmVecDot() == nullptr)
+      Fail("a76-asm is unavailable");
     at_ = vt::Tensor::Contiguous(activations_.data(), vt::DType::kF32, q_.device, {o.m, o.k});
     bt_ = vt::Tensor::Contiguous(weights_.data(), vt::DType::kF32, q_.device, {o.n, o.k});
     bt_.dtype = dtype_;
@@ -851,9 +858,14 @@ int main(int argc, char** argv) {
   try {
     Options options = ParseArgs(argc, argv);
     SetEnv("VLLM_CPP_CPU_THREADS", std::to_string(options.threads));
-    if (options.variant == "portable") {
+    if (options.variant == "portable" || options.variant == "sdot" ||
+        options.variant == "a76-asm") {
       SetEnv("VT_CPU_QUANT_MMLA", "0");
       SetEnv("VT_CPU_QUANT_REPACK", "0");
+    }
+    if (options.variant == "portable" || options.variant == "sdot" ||
+        options.variant == "a76-asm") {
+      SetEnv("VT_CPU_Q8_DOT", options.variant);
     }
     if (options.pin) PinToFirstCpus(options.threads);
     QuantMatmulFixture fixture(options);

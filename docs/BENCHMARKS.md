@@ -8,7 +8,7 @@
 | **vLLM** | Qwen3.6-35B-A3B NVFP4, GB10 | 0.93x to 1.03x: ahead at c4, worst c16 0.93x | identical |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
 | **vLLM** | Laguna-XS-2.1 NVFP4, GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
-| **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: **PENDING** | byte-identical on binding arm; Pi pending |
+| **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: assembly component gate **1.04-1.05x vs compiler SDOT**; same-file llama.cpp floor pending | byte-identical on both Arm lanes |
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 
@@ -156,22 +156,27 @@ host mirror is freed once the device Marlin resident is built.
 
 Raspberry Pi 5 Cortex-A76 is a separate `GATING` arm. It has four cores,
 DotProd and no i8mm, so the binding 20-core Arm result below does not transfer.
-The R2-R3 portable baseline uses the exact Q8_K_XL SHA-256 in the
-[RPi5 spike](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md) and a local
-buildx/QEMU ARM64 build; QEMU timing is non-binding. The exported artifact ran
-unthrottled at 2.4 GHz on the Pi and matched the x86 golden 16/16 tokens. Q8_0
-M=1/N=3072/K=2048 measured 1,554,115 ns at one thread and 742,585 ns at four;
-M=128 measured 197,061,735 ns and 49,890,756 ns respectively. Exact fixture
-checksums held in every arm. The 16-token model arm measured TTFT 1,961.99 ms,
-TPOT/ITL 366.91 ms and output throughput 2.14 tok/s. A zero-loss 64-token
-`cycles:u` trace attributes 57.76% to BF16 GEMM and 20.10% to the portable Q8
-dot. These numbers bind the portable denominator only. SDOT/assembly A/B,
-three interleaved full-model repetitions, peak memory and same-file llama.cpp
-comparison remain `PENDING`.
+ARM64 artifacts are built and tested locally with buildx/QEMU, then copied to
+the Pi for execution only. The exact Q8_K_XL model and all output/checksum
+hashes are fixed in the [campaign spec](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md).
 
-The selected follow-on is `KERNEL-CPU-A76-Q8-DOT`. Its binding performance
-gate compares portable, exact-order compiler SDOT and scheduled AAPCS64 in one
-QEMU-built binary on the physical Pi. No assembly speedup is claimed at spike.
+`KERNEL-CPU-A76-Q8-DOT` now closes the compiler-scheduling hypothesis. In one
+GCC 13.3 binary on an unthrottled Pi, the scheduled AAPCS64 leaf beats
+the exact-order compiler SDOT loop by **3.66%** on M=1/T1, **5.08%** on
+M=128/T1 and **3.69%** on M=128/T4, with 9.74-10.24% fewer retired
+instructions. M=1/T4 is the named residual, **2.43% slower**, despite fewer
+instructions, so its thread partition remains open.
+
+The recursive 64-token Qwen gate is byte-identical across x86, portable,
+compiler SDOT and assembly. Median assembly versus compiler SDOT is **1.55%
+lower TTFT** (1,307.27 vs 1,327.91 ms), neutral TPOT (367.67 vs 367.85 ms),
+and **0.13% lower E2E** (24,470.20 vs 24,502.52 ms). Against portable it
+lowers TTFT 33.40% and E2E 2.67%. Cortex-A76+DotProd therefore selects the
+assembly arm by default; every other CPU retains portable dispatch. Exact
+commands, binary/raw-file hashes, all four kernel arms and the disassembly are
+in the [immutable evidence index](bench-evidence/rpi5-a76-q8-dot-20260806.md).
+Peak memory, concurrent serving and the same-file Pi llama.cpp comparison stay
+`PENDING`; no Pi competitor-parity claim is made.
 
 Same GGUF file both arms, `dgx.casa` GB10 aarch64 (20 cores), idle, 3 reps,
 llama.cpp `237ad9b96` built fresh on the same host.

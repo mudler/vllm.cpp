@@ -748,6 +748,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_quant_dequant.cpp
   src/vt/cpu/cpu_quant_act.cpp
   src/vt/cpu/cpu_quant_dot.cpp
+  src/vt/cpu/cpu_quant_dot_sdot.cpp
   src/vt/cpu/cpu_quant_dot_arm.cpp
   src/vt/cpu/cpu_quant_repack.cpp
   src/vt/cpu/cpu_quant_repack_arm.cpp
@@ -769,6 +770,17 @@ add_library(vllm::vllm ALIAS vllm)
 # baseline, and the kernels are additionally runtime-gated on HWCAP2_I8MM so the
 # binary still runs on non-i8mm aarch64 (portable tier serves those shapes).
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  # KERNEL-CPU-A76-Q8-DOT is Linux-only because its dispatch uses HWCAP/MIDR
+  # and the hand-written file carries ELF assembler directives. Other arm64
+  # platforms compile the generic stub and retain their existing portable tier.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    enable_language(ASM)
+    target_sources(vllm PRIVATE src/vt/cpu/cpu_quant_dot_a76.S)
+    set_source_files_properties(
+      src/vt/cpu/cpu_quant_dot_sdot.cpp PROPERTIES
+      COMPILE_DEFINITIONS VT_CPU_A76_Q8_DOT=1
+      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:-march=armv8.2-a+dotprod+fp16>")
+  endif()
   # G6 mmla tier AND G7 repack tier (cpu_quant_repack_arm.cpp) both need i8mm.
   # The global -ffp-contract=off (top of this file) still applies on top of this
   # per-file -march, which is what keeps the repack gemm/gemv's non-fused

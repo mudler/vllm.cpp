@@ -1,4 +1,4 @@
-# KERNEL-CPU-A76-Q8-DOT spike
+# KERNEL-CPU-A76-Q8-DOT
 
 Date: 2026-08-06
 
@@ -7,11 +7,11 @@ Row: `KERNEL-CPU-A76-Q8-DOT`
 Claim: `CLAIM-KERNEL-CPU-A76-Q8-DOT`, stacked branch
 `row/KERNEL-CPU-A76-Q8-DOT`
 
-State: `SPIKE`
+State: `GATING`
 
 ## Scope
 
-Optimize the Q8_0 weight by Q8_0 activation dot used by
+Optimizes the Q8_0 weight by Q8_0 activation dot used by
 `vt::MatmulBTQuant` on Raspberry Pi 5's Cortex-A76. The row owns a portable
 fallback, a compiler-generated Arm DotProd/SDOT implementation, a scheduled
 AAPCS64 implementation, runtime dispatch, same-binary selection, focused tests,
@@ -59,11 +59,11 @@ proven, but the assembly schedule is selected only for Cortex-A76.
 | Source | Local destination | Decision |
 |---|---|---|
 | llama portable `quants.c:400` | existing `cpu_quant_dot.cpp` | permanent fallback and exact oracle |
-| llama Arm DotProd structure | new `cpu_quant_dot_sdot.cpp` | ACLE `vdotq_s32`, exact per-block float order |
-| measured A76 schedule | new `cpu_quant_dot_a76.S` | original implementation, AAPCS64, no stack spill in core loop |
+| llama Arm DotProd structure | `cpu_quant_dot_sdot.cpp` | ACLE `vdotq_s32`, exact per-block float order |
+| measured A76 schedule | `cpu_quant_dot_a76.S` | original implementation, AAPCS64 leaf hot path, no stack traffic |
 | Linux HWCAP/MIDR selection | new C++ TU plus `include/vt/quant.h` | ASIMDDP gate; A76-only assembly; env A/B control |
 | quant GEMM dispatch | `cpu_quant_dot.cpp` | selected function replaces only Q8_0 row |
-| benchmark variants | `examples/cpu_kernel_bench/main.cpp` | `portable`, `sdot`, `a76-asm`, `auto` |
+| benchmark variants | `examples/cpu_kernel_bench/main.cpp` | `portable`, `sdot`, `a76-asm`, `auto`; exact same-binary A/B |
 
 The optimized implementations return exactly the portable function signature.
 They perform both 16-byte SDOTs per Q8 block, horizontally add the four i32
@@ -136,26 +136,54 @@ gate; this row only closes the proven Q8 assembly/compiler gap.
 | W | Work | Exit |
 |---|---|---|
 | W0 | spike, row and claim | record checkers green, committed before code |
-| W1 | selection seam + explicit benchmark variants | x86 fallback and QEMU smoke green |
-| W2 | exact-order C++ SDOT | disassembly contains SDOT; fixture/model exact |
-| W3 | scheduled AAPCS64 kernel | ABI/disassembly checks and direct tests green |
-| W4 | interleaved Pi PMU A/B | assembly beats C++ in cycles and wall time |
-| W5 | recursive Qwen A/B and checkpoint | no output/enclosing regression; docs current |
+| W1 | **GREEN** selection seam + explicit benchmark variants | x86 fallback and QEMU smoke green |
+| W2 | **GREEN** exact-order C++ SDOT | disassembly contains SDOT; fixture/model exact |
+| W3 | **GREEN** scheduled AAPCS64 kernel | ABI/disassembly checks and direct tests green |
+| W4 | **GREEN with T4 residual** interleaved Pi PMU A/B | 3.66-5.08% win on M1/T1 and M128; M1/T4 −2.43% |
+| W5 | **GREEN** recursive Qwen A/B and checkpoint | exact output; TTFT improves; E2E tie; docs current |
+| W6 | Whole-system/thread/competitor exhaustion | M1/T4 partition, BF16 GEMM, memory/concurrency and llama.cpp floor |
+
+## R4-R5 binding result
+
+The locally QEMU-built GCC 13.3 binary passed 20/20 focused cases and 150,258
+assertions, including explicit SDOT/assembly execution with random, unaligned,
+zero, signed-extreme, scale-edge, ragged and invalid-`nrc` inputs. The physical
+Pi retained exact fixture checksums for portable, compiler and assembly arms.
+
+Against compiler SDOT, assembly improves wall time by 3.66% for M=1/T1,
+5.08% for M=128/T1 and 3.69% for M=128/T4. Cycles fall 3.17-4.61% and retired
+instructions fall 9.74-10.24%. The compiler loop has a 48-byte frame and two
+dependent SDOTs per block; the assembly leaf overlaps two independent block
+chains without changing floating accumulation order. M=1/T4 is an honest
+negative, 2.43% slower despite 8.77% fewer instructions, and remains a W6
+thread-partition gate.
+
+All three 64-token Pi arms are byte-identical to the x86 golden. Median
+assembly versus compiler SDOT is 1.55% lower TTFT, neutral TPOT (0.05% lower)
+and tied/slightly lower E2E (0.13%). Against the prior portable production
+arm it lowers TTFT 33.40% and E2E 2.67%. `auto` therefore selects assembly
+only on Cortex-A76+DotProd; every other CPU retains the portable path. The
+immutable commands, hashes, disassembly and raw-file index are in
+[the R5 evidence](../../docs/bench-evidence/rpi5-a76-q8-dot-20260806.md).
+
+W6 remains open for the M=1/T4 scheduler interaction, BF16-GEMM optimization,
+peak memory, concurrency and the same-file llama.cpp floor. Those gaps keep
+this row `GATING`; they do not undo the demonstrated assembly/compiler win.
 
 ## Risks and decisions
 
-- The compiler may already schedule the intrinsic loop optimally. In that case
-  this assembly candidate is negative and the row remains open or selects a
-  different proven compiler gap; an assembly file is not success by itself.
+- GCC did not schedule the intrinsic loop optimally: it emitted a framed,
+  one-block loop with two dependent SDOTs. The independent two-block assembly
+  schedule closes that measured gap on three of four binding shapes.
 - Q8 blocks are 34 bytes, so scale and payload streams are not naturally
   16-byte aligned. Loads must remain unaligned-safe, and speculative reads may
   not cross the allocated final block.
 - Hardware FP16 conversion must match `F16ToF32`, including signed zero,
   infinities and NaNs. If payload handling differs, retain software conversion
   for specials or dispatch those inputs to portable code.
-- Unrolling may expose memory-level parallelism but increases register and I-
-  cache pressure. PMU plus recursive model A/B, not instruction count alone,
-  decides the retained schedule.
-- The R3 model is BF16-GEMM dominated. A clear dot-kernel win may be diluted;
-  it is still accepted as the requested demonstrated assembly win only when no
-  enclosing regression exists, and remains opt-in until model wall time moves.
+- Two-block unrolling improved M=1/T1 and both M=128 arms, but M=1/T4 regressed
+  because the enclosing threadpool dominates that small shard. The model A/B,
+  not instruction count alone, justifies the retained A76-only default.
+- The R3 model remains BF16-GEMM dominated. The assembly win mainly moves
+  prefill/TTFT; decode TPOT is neutral, which selects BF16 GEMM and the
+  M=1/T4 partition as the next recursive optimization targets.

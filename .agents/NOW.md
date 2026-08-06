@@ -22,7 +22,7 @@ checkpoint on `upstream/main` at `59674cf1d`.
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **Full-model GB10 e2e RUNS** (bf16-resident §13): CPU+CUDA 13/13·656, no OOM. **Token gate NEAR-TIE 106/128** (6/8 token-exact) | device GDN/MLA islands + bf16 stream; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: tput 0.93-1.03x, c16 0.93x. INTAKE + Option A both **RESOLVED NEGATIVE** (H2D-out-of-capture tput WASH) | Real lever left: prefill glue (task #61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |
-| RPi5 A76 CPU | **R3 BASELINE GREEN:** QEMU-built artifact, 16/16 x86-token exact, PMU trace | Portable Q8 dot is 20.1% of user cycles; prove C++ SDOT/compiler gap, then A76 assembly A/B |
+| RPi5 A76 CPU | **R5 ASSEMBLY GREEN:** output-exact AAPCS64 beats compiler SDOT 3.66-5.08%; Qwen TTFT/E2E improve | W6: M1/T4 −2.43%, BF16 GEMM, memory/concurrency and llama.cpp floor |
 | MXFP4 parity | **TERMINAL:** c1 1.020x pass; c2-c8 0.962-0.969 GPU-intrinsic; final cap/glue levers exhausted | Record; branch unmerged |
 | ROW-SERVE-ASYNC-DENSE-MIRROR | **LANDED+dgx-VERIFIED** (`f9c969ae`): #31 async mirror on classic dense Qwen3; gate RED→GREEN, SACRED 184/184 | Residual: sibling scope one-liner |
 

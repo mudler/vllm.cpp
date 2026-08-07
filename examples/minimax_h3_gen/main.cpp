@@ -563,16 +563,32 @@ int main(int argc, char** argv) {
       // The ORIGINAL bf16 release: a DIRECTORY of shards plus
       // model.safetensors.index.json. Every other --dit form is a single file and
       // keeps working unchanged; this is the only one that can open the
-      // full-precision DiT at all, which is what makes the quantization-quality
-      // question askable.
+      // full-precision DiT, which is what makes the quantization-quality question
+      // answerable at all.
       const vllm::MiniMaxH3ShardedCheckpoint ckpt =
           vllm::MiniMaxH3ShardedCheckpoint::Open(dit_path);
       std::cerr << "  " << ckpt.ShardCount() << " shard(s), " << ckpt.Names().size()
                 << " tensors (index " << ckpt.IndexPath() << ")\n";
-      // Host f32 reference path. ~132 GB on the real release, so it is usable
-      // only on a reduced checkpoint; opening the real release on a device needs
-      // a streaming loader, which this row does not yet ship.
-      dit = vllm::LoadMiniMaxH3DitFromShards(ckpt);
+      if (device_name == "cuda") {
+        // STREAM. 66.3 GB cannot be materialized on the host and then staged: the
+        // pool is UNIFIED, so that holds the model twice against 122 GiB. One
+        // tensor at a time, and a bf16 shard tensor is uploaded straight out of
+        // the mmap with no host buffer at all.
+        vt::Queue sq = vt::GetBackend(vt::DeviceType::kCUDA).CreateQueue();
+        const auto t0 = std::chrono::steady_clock::now();
+        streamed = vllm::StreamMiniMaxH3ShardedToDeviceBf16(sq, ckpt, &dit.params);
+        have_streamed = true;
+        const vllm::MiniMaxH3ShardStreamStats st = vllm::GetMiniMaxH3ShardStreamStats();
+        std::cerr << "  streamed sharded bf16 DiT -> device in "
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                  << " s (" << st.tensors_streamed << " tensors, " << st.direct_uploads
+                  << " direct, " << st.converted_uploads << " converted, peak host buffer "
+                  << (st.host_peak_bytes / (1024.0 * 1024.0)) << " MiB)\n";
+      } else {
+        // Host f32 reference path. ~132 GB on the real release — usable only on a
+        // reduced checkpoint; a real run wants --device cuda.
+        dit = vllm::LoadMiniMaxH3DitFromShards(ckpt);
+      }
     } else {
       const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(dit_path);
       if (device_name == "cuda") {

@@ -17,7 +17,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Laguna NVFP4 / DeepSeek-V4 decode | **Both CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run when convenient |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **fl2va COHERENT; ref2va grid DIAGNOSED (#95): NO loader bug; bf16 13-shard DiT INDEXES** | residual = community-NVFP4 quant fidelity §8.12; no bf16 render yet |
+| MiniMax-H3 lane | **fl2va COHERENT; ref2va grid DIAGNOSED (#95): NO loader bug; bf16 13-shard DiT STREAMS** | residual = community-NVFP4 quant fidelity §8.12; no bf16 render yet |
 | Kimi-Linear-48B (KDA/NoPE-MLA/MoE) | device-KDA **122/128, 4.24 tok/s** best (§15); MLA device NEG (§16). chunk_kda prefill AOT **SPIKED**: 5 kernels authored+pinned+recipe (§17). Bar = MEET vLLM speed | Phase-2: regen harness, wire `vt::KdaChunkPrefill`, gate STRICT + vLLM 0.82 ladder |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |

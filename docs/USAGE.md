@@ -301,3 +301,71 @@ auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, ep);
 
 The underlying portable tensor runtime is `vt::` ([`include/vt/`](../include/vt/)),
 which carries no ggml or PyTorch dependency.
+
+## Multimodal input (image, video, audio to text)
+
+Multimodal input is served over the **OpenAI API**, not the CLI. `vllm-cli` is text-only:
+`--model --prompt --max-tokens --temperature --top-k --top-p --seed --stream
+--speculative-config --tokenizer-config`.
+
+Start the server with a multimodal model, then send content parts on
+`/v1/chat/completions`:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+
+client.chat.completions.create(model="Qwen3.6-27B", messages=[{"role": "user", "content": [
+    {"type": "text",      "text": "Describe this image."},
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,<...>"}},
+]}])
+```
+
+Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
+
+| part type | modality |
+|---|---|
+| `image_url` | image |
+| `video_url` | video |
+| `input_audio` / `audio_url` | audio |
+
+## MiniMax-H3: video + audio generation
+
+
+Renders an MP4 with a stereo track. Weights: a GGUF DiT (use **Q4_K_M**), the Qwen3-VL-32B
+encoder, and both VAEs.
+
+```sh
+build/examples/minimax-h3-gen \
+  --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --dequant-bf16 \
+  --encoder qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf --tokenizer tokenizer.json \
+  --prompt "A golden retriever runs across a sunlit beach, waves crashing behind it" \
+  --video-vae video_vae.safetensors --video-vae-config video_vae_config.json \
+  --audio-vae audio_vae.safetensors --audio-vae-config audio_vae_config.json \
+  --frames 124 --height 480 --width 864 --steps 50 \
+  --device cuda --out out.mp4 --workdir /tmp/h3
+```
+
+Conditioning modes, all optional and mutually exclusive where noted:
+
+```sh
+--first-frame start.ppm --last-frame end.ppm   # pin the first and/or last frame (fl2va)
+--ref-image subject.ppm                        # reference image, repeatable (ref2va)
+--ref-video prev_workdir/                      # reference clip, reads frame_%06d.ppm
+--ref-audio voice.wav                          # reference audio
+--noise-aug 0.9                                # how hard a keyframe is pinned (1.0 = exact)
+```
+
+Reference frames are binary PPM, which is what this tool also **writes**, so one run's `--workdir`
+feeds straight back in as `--ref-video` and clips chain. Convert anything else with
+`ffmpeg -i in.png -pix_fmt rgb24 out.ppm`.
+
+Useful for measurement: `--denoise-only` times the DiT loop without loading the VAEs,
+`--dump-params` prints the geometry a checkpoint implies (manifest only, no weights),
+`--save-embeds` writes the text conditioning so a second run can replay it with
+`--prompt-embeds` and compare checkpoints on identical conditioning.
+
+Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `examples/server` and
+`POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
+routes stay unregistered.
+

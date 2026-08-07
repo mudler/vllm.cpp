@@ -161,7 +161,7 @@ model architecture is wired.
 | Image | ✅ correctness-gated | ✅ | ✅ | ◐ |
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
-| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT on GB10 (fl2va via keyframe+encoder path); vision→cond scatter gated; ref2va assembly FIXED+gated but grids, RE-ATTRIBUTED to the NVFP4 checkpoint/loader, NOT assembly (§8.10) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT on GB10 at FULL requested duration (fl2va via keyframe+encoder); vision→cond scatter gated; ref2va assembly FIXED+gated but grids, RE-ATTRIBUTED to the NVFP4 checkpoint/loader, NOT assembly (§8.10) | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
 | Multimodal over the OpenAI server | ☐ | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Serving them

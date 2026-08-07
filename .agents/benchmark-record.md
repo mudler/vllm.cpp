@@ -14400,3 +14400,48 @@ so both misattributed a checkpoint/loader defect. True residual = the NVFP4 DiT 
 Synthetic-NVFP4 gates proved the dequant MATH byte-exact but never loaded THIS file vs a coherent oracle.
 Next: a REF2VA GGUF (bf16, known-good loader) as checkpoint oracle — dgx-disk-blocked (23 GiB free).
 Artifacts `~/h3fp4/out_{vs_ref2va,bf16_ref2va,t2va_nvfp4,vs_fl2va}.mp4`.
+
+## MiniMax-H3 — the Thor render-speed leg, the audio-duration bug, and the Q3_K_M quantization floor (2026-08-06)
+
+Moved out of `docs/BENCHMARKS.md` on landing: the scoreboard is a keyed table, so
+the measured results live there as three rows and the forensics live here.
+
+**Thor render speed (sm_110, no FlashAttention-2).** One Jetson Thor, 864x480 /
+124 frames / 50 steps, Q4_K_M DiT:
+
+| stage | measured |
+|---|---|
+| DiT forward | **34.6 s/step** (was 574.5 s before the attention work: **16.6x**) |
+| attention share of a step | 96% before, and the whole of that 16.6x |
+| full 50-step render | **~28 min** (was ~8 h) |
+
+The 16.6x is three landed changes and two MEASURED NEGATIVES: warp-per-query,
+then a chunked warp reduce-scatter (1.76x), then bf16 tensor cores via
+`mma.sync` (9.82x). Shared-memory K/V tiling (**23% SLOWER**) and register
+Q-blocking (**-0.8%**) were both measured and REVERTED. Both chased memory
+traffic, which is not the bound: one head's K+V is 3.9 MB against 32 MB of L2.
+Do not re-run either without a new reason.
+
+**Quantization floor: use Q4_K_M, not Q3_K_M.** H3's split-half RoPE produces
+channel-wise magnitude outliers that 3 bits cannot hold. A controlled A/B (same
+prompt, same seed, same code, only the DiT encoding changed) turned a murky
+lattice-covered silhouette into a photoreal close-up.
+
+**The audio-duration bug: a 124-frame render silently muxed as 61 frames.**
+`audio_t` is the PER-CHANNEL latent length (the planner sets it from 40 Hz *
+duration) and the packed layout carries `audio_t * audio_channel` ROWS, one per
+(channel, step). The denormalize step divided by the channel count, so the
+decoded audio ran half the video's duration; because the muxer passes
+`-shortest`, that silently truncated the VIDEO to half its frames too.
+
+Worth recording is WHY the suite was blind to it. Every existing gate asserts
+shape SELF-CONSISTENCY, and a uniformly halved pipeline is perfectly
+self-consistent: the shapes agreed with each other, they were just half as long
+as the request asked for. `ffprobe` on the artifact exposed it. The gate added
+is the invariant that is NOT self-consistency: latent steps / 40 Hz must equal
+the video duration, to within one latent step.
+
+(The sibling reference-leak bug found in the same render session, where
+conditioning rows reached unpatchify, was independently fixed on `main` by
+`row/H3-RENDER-CLOSE` taking the TRAILING target rows; this row's alternative
+`update_mask` mechanism was dropped rather than landed twice.)

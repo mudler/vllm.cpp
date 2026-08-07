@@ -775,6 +775,78 @@ dump the ref2va target-row VAE-input latent adjacency-cosine (like #77 did for t
 0.95) to confirm the target rows are white, and A/B the reference-row condition-noise vs a clean
 anchor.
 
+## 9. W-OAI — the `/v1/videos` OpenAI (Sora) WIRE SHAPE, 2026-08-06
+
+Row `SERVE-VIDEOS-OAI` (engine matrix, Serving surface), claim
+`CLAIM-SERVE-VIDEOS-OAI`, branch `row/SERVE-VIDEOS-OAI`.
+
+Developer-directed: an unmodified OpenAI client must work against `/v1/videos`.
+ADDITIVE — the vLLM-Omni-derived fields keep working, and every body that parsed
+before means exactly what it meant before.
+
+SPLIT, deliberately: this row is the REQUEST/RESPONSE SHAPE only (`model`,
+`size`, `seconds`, and the MP4 download route). It touches no generation code and
+loads no VAE. The REFERENCE CONDITIONING half (`input_reference` -> fl2va, plus
+the two `metadata` reference modalities -> ref2va) is §10, row
+`SERVE-VIDEOS-REFS`, because it is a separate capability that pulls in the VAE
+encoder halves and the runner. Each half is independently reviewable and gated.
+
+### 9.0 Spike contract (`SERVE-VIDEOS-OAI`)
+
+| Section | Content |
+|---|---|
+| Scope | IN: the OpenAI (Sora) REQUEST SPELLINGS `model`, `size`, `seconds` on `/v1/videos`, their precedence against the native fields, the `model`-mismatch warning on the job, and `GET /v1/videos/{id}/content`. OUT: reference conditioning of any modality (§10); OpenAI's status vocabulary / id shape / `progress` / multipart upload; any change to generation, the DiT, the VAEs or the muxer. |
+| Upstream chain | OpenAI's published video API (`POST /v1/videos`, `GET /v1/videos/{video_id}/content`, `size` "WxH", `seconds` string enum) is the request CONTRACT; vLLM-Omni's `/v1/videos` async+sync job pair is the endpoint shape we already mirror. |
+| Our baseline | `ParseVideoRequest` took only the native spellings (`duration`, `height`/`width`, `num_frames`, `num_inference_steps`, `flow_shift`, `audio_flow_shift`, `seed`, plus `extra_params`); an OpenAI client's body parsed to DEFAULT geometry and duration. `VideoJobStore` had no `model`/`warning`. The routes stopped at status: the produced .mp4 was reachable only through the filesystem. |
+| Port map | Request contract -> `include/vllm/entrypoints/openai/video_api.h` (`VideoRequest::model` + `ParseVideoSize`) and `src/vllm/entrypoints/openai/video_api.cpp` (`ParseVideoRequest`, `ReadDuration`, `ParseWholeNumber`). Job record -> `VideoJobStore::Create(model, warning)` + `VideoJobStatusJson`. Download route -> `ApiServer::handle_video_content` + `video_model_warning` + their registration in `src/vllm/entrypoints/openai/api_server.cpp`. |
+| Tests to port | No upstream test module exists for this surface (OpenAI publishes an API, not tests; vLLM-Omni's video endpoint has no ported test). The contract is gated in-tree instead, extending the existing files: `tests/vllm/entrypoints/openai/test_video_api.cpp` (parsing, precedence, the job record) and `tests/vllm/entrypoints/openai/test_api_server.cpp` (routes, content behaviour, additivity over a real socket). Every assertion uses values that DIFFER from the field default. |
+| Gates | CPU, foreground: `test_video_api` 11/11 (125 assertions), `test_openai_api_server` 40/40 (509), `server` builds clean. Content route: 404 unknown / 409 unfinished (no bytes leaked) / 500 failed / 500 vanished / 200 byte-exact `video/mp4`. Additivity: with no `VideoRunner`, `POST /v1/videos` is 404 over a real socket with no `ErrorResponse` envelope; with one, it is 200 and the unknown-id 404 IS ours. Commands: `cmake --build build --target test_video_api test_openai_api_server server -j12`. Real-weights e2e rides §8's GB10/disk window. |
+| Dependencies | Row IDs: the MiniMax-H3 model rows and `row/H3-FP4-SPEED` (UNTOUCHED - no generation code changed); `SERVE-VIDEOS-REFS` (§10) stacks on this row. No new download, no GPU, no toolchain change for the CPU gate. |
+| Work breakdown | (1) alias parsing + precedence + `ParseVideoSize`; (2) `model` recording + the job `warning`; (3) `handle_video_content` + its route; (4) both test files; (5) docs + record. |
+| Risks/decisions | NATIVE-wins precedence: the only direction that leaves every previously-parsing body meaning what it meant. `model` mismatch WARNS rather than 404s: a Sora client cannot know the local model name, so a rejection would defeat the compatibility; silence would hide it. A 409 (never bytes) on an unfinished job: a partially muxed file would reach the client as a valid-looking, truncated MP4. No vLLM-defined behaviour is reopened. |
+
+### 9.1 The aliases and their precedence
+
+| OpenAI | Lands on | Notes |
+|---|---|---|
+| `model` | `VideoRequest::model` | Recorded + echoed; an unserved name is a job `warning`, never a rejection (a Sora client cannot know the local model's name) |
+| `size` | `width`, `height` | `"<w>x<h>"`, whole positive pixels, one `x`/`X` |
+| `seconds` | `duration_seconds` | Number OR numeric string — OpenAI types it as a string enum ("4"/"8"/"12") |
+
+PRECEDENCE: the NATIVE field WINS (`width`/`height` over `size`, `duration` over
+`seconds`). Both spellings are VALIDATED whichever wins, so a malformed `size` is
+a 400 even when explicit `width`/`height` override it. Precedence is PER-AXIS: an
+explicit `width` alone still lets `size` supply the height it did not specify.
+
+### 9.2 `GET /v1/videos/{id}/content`
+
+Returns the finished MP4 as `video/mp4`. Without it a caller could start and poll
+a job but never fetch the result over HTTP. Unknown id -> 404; queued/running ->
+409 naming the status (never a truncated file); failed -> 500 carrying the
+failure; a vanished output -> 500, not a 200 with zero bytes.
+
+### 9.3 Status
+
+- **CPU-LANDED + gated.** `test_video_api` 11/11 (125 assertions),
+  `test_openai_api_server` 40/40 (509), `server` builds clean. Additivity is
+  gated over a REAL socket: without a `VideoRunner` all four routes are absent
+  (a 404 with no `ErrorResponse` envelope), with one they serve.
+- **Residuals, named.** OpenAI's status vocabulary is not mirrored (ours stays
+  queued/running/succeeded/failed, ids `vid_N`, no `object`/`progress`/
+  `created_at`); reference conditioning is §10 (`SERVE-VIDEOS-REFS`), not this row.
+- **Real-weights leg** rides the same GB10/disk window as §8.
+
+## 10. W-REFS — reference conditioning over `/v1/videos`, 2026-08-06
+
+Row `SERVE-VIDEOS-REFS` (engine matrix, Serving surface), claim
+`CLAIM-SERVE-VIDEOS-REFS`, branch `row/SERVE-VIDEOS-REFS`, stacked on §9.
+
+§9 made an OpenAI client's request PARSE. This row makes its REFERENCES do
+something: an image the video starts from, a clip it continues, a voice it
+carries. Before it, no reference modality was reachable over HTTP at all.
+
+### 10.0 Spike contract (`SERVE-VIDEOS-REFS`)
+
 | Section | Content |
 |---|---|
 | Scope | IN: OpenAI's `input_reference` mapped to fl2va first-frame conditioning; the two reference modalities OpenAI has no slot for carried in `metadata` (`input_reference_video`, `input_reference_audio`) mapped to ref2va blocks; the fl2va/ref2va combination rule enforced at the request boundary; the `examples/server` runner wiring (PPM decode, frame-directory clip, WAV, lazily-loaded VAE encoder halves). OUT: the ref2va IMAGE modality (reachable via the native `task` + the CLI, deliberately not bound to `input_reference`); any change to generation, the DiT, the VAEs or the muxer; OpenAI's multipart upload. |
@@ -786,7 +858,55 @@ anchor.
 | Dependencies | Row `SERVE-VIDEOS-OAI` (§9), stacked. Code: `MiniMaxH3Encode{KeyframeCondRows,ReferenceVideo,ReferenceAudio}`, `MiniMaxH3ReadWav`, `DecodeDataUri`. Runtime: `--video-vae` for an image or video reference, `--audio-vae` for an audio reference (both encoder halves, loaded lazily and once). No new download, no GPU. |
 | Work breakdown | (1) `input_reference` parsing (path or `data:` URL) -> fl2va, with the geometry refusal; (2) the `metadata` map + the video/audio reference keys; (3) the combination rule in the parser; (4) the `examples/server` runner branches; (5) both test files; (6) docs + record. |
 | Risks/decisions | `input_reference` -> fl2va, NOT ref2va: OpenAI documents it as the frame the video starts from; ref2va would silently change what the API promises. The two extra modalities go in `metadata` rather than new top-level fields, so a strict client's schema validation still passes. Combination legality is enforced in the PARSER, not left to the pipeline, so a supplied reference is never silently dropped. |
-| OpenAI | Lands on | Notes |
-| `model` | `VideoRequest::model` | Recorded + echoed; an unserved name is a job `warning`, never a rejection (a Sora client cannot know the local model's name) |
-| `size` | `width`, `height` | `"<w>x<h>"`, whole positive pixels, one `x`/`X` |
-| `seconds` | `duration_seconds` | Number OR numeric string — OpenAI types it as a string enum ("4"/"8"/"12") |
+
+### 10.1 `input_reference` is fl2va, not ref2va
+
+OpenAI documents it as the image the video STARTS FROM, which is what
+`MiniMaxH3EncodeKeyframeCondRows` expresses (frame 0 of the output pinned to the
+image, `imgvid_noise_aug = 1.0`). `MiniMaxH3EncodeReferenceImages` prepends whole
+reference images as their own blocks — guidance that never becomes a frame — so
+mapping it there would have changed what the API promises. With a reference image
+and no explicit `task`, the task IS `fl2va`, and the image's aspect drives the
+default resolution through `MiniMaxH3ResolveShape`.
+
+Two limits, both refused up front rather than deep in the denoise: the image must
+be a binary PPM (P6), because no PNG/JPEG codec is vendored (the same NAMED
+residual the chat multimodal path carries), and it must already be at the
+resolved output geometry, because no image resampler is vendored. The refusal
+names both geometries.
+
+### 10.2 The two reference modalities OpenAI has no slot for
+
+H3 has three (image, silent video, audio); the Sora schema carries one. The other
+two enter through `metadata`, the standard OpenAI free-form string map that
+strict clients tolerate, rather than invented top-level fields that would fail a
+client's schema validation. The whole map is kept verbatim.
+
+- `metadata.input_reference_video` — a DIRECTORY of `frame_%06d.ppm`, the exact
+  layout `minimax-h3-gen` and the server WRITE, so clips chain. No demuxer is
+  vendored, hence a frame directory rather than a container; a `data:` URL cannot
+  name a directory and is refused by name.
+  `MiniMaxH3EncodeReferenceVideo` emits `ref_audio_t == 0`: the clip is SILENT.
+- `metadata.input_reference_audio` — a 16-bit PCM WAV path or `data:` URL, read
+  by the existing `MiniMaxH3ReadWav` and encoded by
+  `MiniMaxH3EncodeReferenceAudio`. Supplied with a video reference it ATTACHES to
+  that block (one `kVideoAudio` block carrying both, the layout
+  `packed_sequence.py` builds); alone it is its own block.
+
+LEGALITY is the pipeline's own rule (`minimax_h3_pipeline.cpp:251`: fl2va
+keyframes and ref2va blocks are exclusive), enforced in the PARSER so it is a 400
+naming the pair rather than a failed job — and never a silently dropped
+reference, which is the failure that looks like it worked. Legal: none / image /
+video / audio / video+audio. Illegal: `input_reference` with either metadata
+reference.
+
+### 10.3 Status
+
+- **CPU-LANDED + gated.** `test_video_api` 14/14 (167 assertions),
+  `test_openai_api_server` 41/41 (525), `server` builds clean. Each modality is
+  gated as ARRIVING at the runner, and an illegal pair is a 400 that generates
+  nothing (`calls == 0`).
+- **Residuals, named.** Reference images are binary PPM at the output resolution;
+  a video reference is a frame DIRECTORY; OpenAI's real `input_reference` upload
+  is multipart, ours is the JSON spelling.
+- **Real-weights leg** rides the same GB10/disk window as §8.

@@ -40623,3 +40623,75 @@ a coherent oracle. NEXT: a REF2VA GGUF (bf16, known-good loader) as checkpoint o
 disk (23 GiB free, 100% full; large dirs belong to other campaigns, not prunable). Fix + gates LAND
 regardless; box left clean (renders exited, gpu.lock released, worker stays parked, ckpts kept). Records:
 spec §8.10 + §8.2 row, STATUS/BENCHMARKS/FEATURES H3 rows, benchmark-record, NOW.
+
+## 2026-08-07T05:35 - MiniMax-H3: half of every video was being discarded (audio duration), plus the user-facing docs the lane never had
+
+<!-- state: 2026-08-07T05:35 -->
+
+Branch `fix/h3-audio-duration-and-readme` (PR #68). Found by RENDERING, not by
+the suite.
+
+**THE BUG.** A 124-frame render silently muxed as **61 frames**. `audio_t` is the
+PER-CHANNEL latent length (the planner sets it from 40 Hz * duration) and the
+packed layout carries `audio_t * audio_channel` ROWS, one per (channel, step).
+The denormalize step divided by the channel count, so the decoded audio ran half
+the video's duration; because the muxer passes `-shortest`, that silently
+truncated the VIDEO to half its frames too. The fix is one line
+(`audio_steps = request.audio_t`), and it now agrees with the same function's own
+`target_audio_rows = request.audio_t * request.audio_channel` two lines up.
+
+**WHY THE SUITE WAS BLIND, which is the part worth keeping.** Every existing gate
+asserts shape SELF-CONSISTENCY, and a uniformly halved pipeline is perfectly
+self-consistent: the shapes agreed with each other, they were just half as long
+as the request asked for. `ffprobe` on the artifact exposed it. The gate added is
+the invariant that is NOT self-consistency: latent steps / 40 Hz must equal the
+video duration, to within one latent step, and the halved value is asserted to be
+off by more than a second.
+
+**A SECOND BUG FROM THE SAME SESSION, DROPPED RATHER THAN LANDED TWICE.**
+Conditioning PREPENDS rows to `img_pos`, so the denoise loop returns condition
+rows followed by the targets, and unpatchify was handed the whole set. This
+branch fixed it by carrying the layout's own `update_mask` out of the loop.
+`main` fixed the SAME bug independently in `row/H3-RENDER-CLOSE` by taking the
+TRAILING `target_video_rows`, with a `VT_CHECK` on the row accounting. On rebase
+the `update_mask` mechanism and its test were DROPPED: landing a second solution
+to a fixed bug is churn, and the positional form already ships gated. Recorded
+here so the alternative is not silently lost.
+
+**DOCS.** The video+audio generation path had no user-facing documentation at
+all, and the multimodal INPUT interface was documented WRONG: `vllm-cli
+--image/--video/--audio` does not exist, the CLI is text-only. Multimodal input
+is served over the OpenAI API as `image_url`, `video_url` and
+`input_audio`/`audio_url` content parts on `/v1/chat/completions`
+(`src/vllm/entrypoints/openai/chat_mm.cpp`), which was documented NOWHERE, so
+`docs/USAGE.md` now states it rather than the wrong claim merely being removed.
+README gains a News section led by video+audio generation, paid for INSIDE the
+30,000-char landing-page budget rather than by raising it.
+
+**Public docs.** The 19-line narrative this branch originally appended to
+`docs/BENCHMARKS.md` was a non-canonical H2 section and pushed the page over its
+prose budget: converted into three keyed ROWS (Thor render speed, render
+duration, quantization floor) with the forensics moved verbatim into
+`.agents/benchmark-record.md`, which is what that page's own checker instructs.
+
+**STATUS, paid for in place.** The page sits within 20 chars of its 283470
+ratchet, so the note was made to FIT rather than granted headroom: the H3 row's
+"(t2va-no-refs grids too)" forensic aside was dropped (the detail is spec §8.10,
+where #93 recorded it) and the duration result stated as "audio full-duration".
+Net -4 chars; the ratchet is untouched because it did not need to move.
+
+**THIRD-PARTY RECORD DAMAGE REPAIRED (out of row, carried here because it is the
+same file and it left `check-agent-record` RED on main).** `#93`'s squash-merge
+removed 130 lines from `specs/minimax-h3.md`: its branch predated `#71`/`#92`, so
+landing it DELETED `## 9` and `## 10` (the `/v1/videos` rows) and left two
+orphaned table fragments with no heading and no separator, which the record
+checker reports as `table has 4 pipes; expected 3` plus `no linked spec names
+exact stable token SERVE-VIDEOS-REFS` (the engine-matrix row pointed at a section
+that no longer existed). Repaired by restoring `## 9` and `## 10` VERBATIM from
+`548b0000` and cutting the orphans; `#93`'s own content is preserved byte-for-byte.
+This is the hazard AGENTS.md names: a keyed/structured record file merged from a
+stale base silently loses another row's section.
+
+**GATE (CPU, foreground).** `test_minimax_h3` full suite, plus the new duration
+case. No numbers changed by the doc work; the Thor speed figures are prior
+measurements now recorded in the scoreboard rather than new ones.

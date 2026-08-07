@@ -33,6 +33,14 @@
 > appending fields whose zero value keeps existing behavior byte-identical, and only bumps on an
 > incompatible change. If you embed us, embed through that header.
 
+## News
+
+- **2026-08** **MiniMax-H3 video + audio generation lands.** A 33 B joint video+audio diffusion
+  transformer, prompt to MP4 with a stereo track, on one Jetson Thor. Attention got **16.6x**
+  faster on the way (bf16 tensor cores): a 50-step 864x480 render went ~8 h to ~28 min.
+- **2026-08** Audio input (Whisper, Voxtral) and image+video input (Qwen3-VL, Qwen3.6-27B)
+  correctness-complete, single-sequence path.
+
 vllm.cpp is a from-scratch C++20 inference engine chasing three things at once: be the
 **smallest** thing you can deploy, be the **fastest** on the hardware you already own, and still
 carry **every feature people actually want**. No Python and no PyTorch at inference time.
@@ -270,6 +278,15 @@ and Voxtral (audio).
 | Qwen3-VL (image + video) | Qwen3-VL-4B-Instruct | - | Strict token-exact 32/32 (image) | Speed-pending |
 | Qwen3.6-27B vision (image + video) | Qwen3.6-27B | - | Strict token-exact 32/32 | Speed-pending |
 | Voxtral (audio) | Voxtral-Mini-3B-2507 | - | Near-tie-robust (decoder 48/48 exact) | Speed-pending |
+| **MiniMax-H3 (video + audio GENERATION)** | MiniMaxAI/MiniMax-H3 | Q4_K_M / NVFP4 | Renders 864x480 / 124f with audio | **34.6 s/step, one Jetson Thor** |
+
+**Video + audio GENERATION is supported**, not just video *input*. MiniMax-H3 renders end to
+end: prompt -> Qwen3-VL-32B encoder -> DiT denoise -> ViT3D video VAE + DAC/BigVGAN audio VAE
+-> MP4 with a stereo track. The project's first DIFFUSION architecture (no KV cache, no
+sampler, no logits); upstream is `vllm-project/vllm-omni`, beyond the parity pin. Five
+conditioning modes, each gated on the conditioning CHANGING the output rather than merely
+being accepted, and `POST /v1/videos`. Use **Q4_K_M**: 3 bits cannot hold the channel-wise
+outliers H3's split-half RoPE produces. Detail: [docs/STATUS.md](docs/STATUS.md).
 
 Compressed-tensors NVFP4A16 (W4A16) dense weights also load and compute natively
 (RedHatAI/Qwen3-32B-NVFP4A16). Long-context RoPE (YaRN, Llama-3, LongRoPE, dynamic-NTK) and
@@ -286,7 +303,7 @@ hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
 | Backend | Hardware | State |
 |---|---|---|
 | **CUDA** | GB10 / DGX Spark (sm_121a) | Runtime-gated. 27B at/above vLLM throughput, 35B prefill-pending |
-| **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 through sm_121a) | Build-supported, compiles to real machine code, fast GDN path build-verified per-arch. Not runtime-proven here (no such boards) |
+| **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 through sm_121a) | Build-supported, fast GDN path build-verified per-arch. Not runtime-proven here (no such boards) |
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis, Arm i8mm quant-GEMM tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
 | **Vulkan** | Portable GPU | Skeleton: 8 ops plus the fusion catalogue cross-check against CPU and CUDA. No model runs yet |
@@ -324,6 +341,22 @@ build/examples/vllm-cli --model /path/to/Qwen3.6-27B --prompt "The capital of Fr
 
 `vllm-bench` (throughput/latency harness) and `tokenize` (tokenizer smoke tool) ship alongside it.
 All flags, including `--speculative-config`: [docs/USAGE.md](docs/USAGE.md).
+
+### Multimodal INPUT and video GENERATION
+
+Multimodal INPUT goes through `/v1/chat/completions` content parts (`image_url`,
+`video_url`, `input_audio`). Video GENERATION:
+
+```sh
+build/examples/minimax-h3-gen --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --dequant-bf16 \
+  --encoder qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf --tokenizer tokenizer.json \
+  --video-vae video_vae.safetensors --audio-vae audio_vae.safetensors \
+  --prompt "A golden retriever runs across a sunlit beach" \
+  --frames 124 --height 480 --width 864 --steps 50 --device cuda --out out.mp4
+```
+
+Conditioning flags, the PPM convention that chains clips, and serving:
+[docs/USAGE.md](docs/USAGE.md).
 
 ## OpenAI-compatible server
 

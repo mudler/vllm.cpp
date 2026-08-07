@@ -17,7 +17,7 @@ Working head: `row/backend-rocm-w0` (#41). Prior: benchmark checkpoint
 | Laguna NVFP4 / DeepSeek-V4 decode | **Both CLOSED, byte-exact, default-ON**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run when convenient |
 | f32-out GEMV audit | Only laguna + ds4 bf16 tower affected; gate models unaffected | Re-verify ds4 tower same-tool |
 | Invocation-parity prevention | CI guard + checklist landing | Merge; build-verify `kGemvHeuristicAlgos` on dgx |
-| MiniMax-H3 lane | **fl2va COHERENT; ref2va assembly bug FIXED+gated** (`H3-REF2VA-ASSEMBLY`) | grid RE-ATTRIBUTED to the ref2va NVFP4 checkpoint/loader, NOT assembly/fp4 (§8.10) |
+| MiniMax-H3 lane | **fl2va COHERENT; ref2va assembly bug FIXED+gated** (`H3-REF2VA-ASSEMBLY`) | +audio-duration fix (#68); grid RE-ATTRIBUTED to the ref2va NVFP4 ckpt/loader (§8.10) |
 | Kimi-Linear-48B (KDA+NoPE-MLA+MoE) | **e2e RUNS** (bf16-resident §13): 13/13·656. Token gate **NEAR-TIE 106/128** | device GDN/MLA islands; 1.59 tok/s; default OFF |
 | 35B fresh grid | **BOUND** @`1ea26427`: 0.93-1.03x, c16 0.93x. INTAKE + Option A both NEGATIVE | Lever left: prefill glue (#61) |
 | Qwen3.5-4B revalidation | 0.9971x @`59674cf1` (#35); TTFT/PSS pass, TPOT/ITL open | `docs/bench-evidence/` |

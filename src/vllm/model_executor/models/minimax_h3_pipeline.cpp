@@ -436,7 +436,12 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
   const int64_t video_per_channel = request.latent_t * request.latent_h * request.latent_w;
   denormalize(video_latent, dit_params.latents_dim, video_per_channel, request.video_latents_mean,
               request.video_latents_std);
-  const int64_t audio_steps = request.audio_t / request.audio_channel;
+  // `audio_t` is the PER-CHANNEL latent length (the planner sets it from
+  // 40 Hz * duration), and the packed layout carries `audio_t * audio_channel`
+  // ROWS -- one per (channel, step). Dividing by the channel count here halved
+  // the decoded audio, and because the muxer passes `-shortest` that silently
+  // truncated the VIDEO to half its frames too: a 124-frame render muxed 61.
+  const int64_t audio_steps = request.audio_t;
   denormalize(audio_latent, dit_params.audio_latents_dim, audio_steps * request.audio_channel,
               request.audio_latents_mean, request.audio_latents_std);
 

@@ -2805,6 +2805,38 @@ TEST_CASE("minimax_h3: the encoder text tower matches upstream, with all three H
 // ImageNet-normalized values to a writer that expects [-1, 1]: it casts colour (the
 // per-channel means differ) and compresses the dynamic range ~4.4x (std ~0.22),
 // which is what "dark and washed out" looks like.
+// The decoded AUDIO must last as long as the decoded VIDEO. Nothing checked this,
+// and it was wrong: `audio_t` is the PER-CHANNEL latent length (planner: 40 Hz *
+// duration) but the pipeline divided it by the channel count, halving the audio.
+// Because the muxer passes `-shortest`, that silently truncated the VIDEO too --
+// a 124-frame render produced a 61-frame MP4. Every structural check passed
+// throughout: shapes were self-consistent, just half as long as intended.
+//
+// Found by RENDERING, not by the suite, which is the part worth recording: the
+// existing gates all assert shape SELF-CONSISTENCY, and a uniformly halved
+// pipeline is self-consistent. The invariant below is the one that is not.
+TEST_CASE("minimax_h3: decoded audio spans the same duration as the video") {
+  // Planner geometry: audio latents run at 40 Hz over num_frames / fps seconds.
+  const int64_t num_frames = 124;
+  const double seconds = static_cast<double>(num_frames) / vllm::kMiniMaxH3Fps;
+  const int64_t audio_t = vllm::MiniMaxH3AudioLatentT(seconds);
+  INFO("num_frames=" << num_frames << " seconds=" << seconds << " audio_t=" << audio_t);
+
+  // 40 Hz * 5.1667 s = 207 latent steps PER CHANNEL, not 103.
+  CHECK(audio_t == 207);
+
+  // The invariant the bug broke: latent steps / 40 Hz must equal the video
+  // duration, to within one latent step.
+  const double audio_seconds = static_cast<double>(audio_t) / 40.0;
+  INFO("audio " << audio_seconds << " s vs video " << seconds << " s");
+  CHECK(std::abs(audio_seconds - seconds) <= 1.0 / 40.0);
+
+  // And the halving specifically: dividing by the 2 channels would give ~half the
+  // duration, which is what shipped.
+  const double halved = static_cast<double>(audio_t / vllm::kMiniMaxH3AudioChannels) / 40.0;
+  CHECK(std::abs(halved - seconds) > 1.0);  // the wrong value is off by ~2.5 s
+}
+
 TEST_CASE("minimax_h3: ImageNet pixel de/normalization matches upstream's wrapper") {
   const int64_t n = 5;
   // Round trip: normalize then de-normalize must return the original, for values
@@ -3474,6 +3506,34 @@ TEST_CASE("minimax_h3: the WHOLE t2va path composes end to end") {
   CHECK(out.audio_channels == request.audio_channel);
   CHECK(out.sample_rate == vllm::kMiniMaxH3AudioSampleRate);
   CHECK(out.audio_samples_per_channel > 0);
+
+  // DURATION, not merely self-consistency. `audio_t` is the PER-CHANNEL latent
+  // length; the pipeline used to divide it by the channel count, so the decoded
+  // audio ran half the video's length and `-shortest` truncated the MP4 to match
+  // (a 124-frame render muxed as 61). Every shape check still passed, because a
+  // uniformly halved pipeline is self-consistent. The decoder is linear in latent
+  // steps, so decoding `audio_t` steps INDEPENDENTLY and requiring the pipeline to
+  // have produced exactly that many samples is the check that is not
+  // self-consistency: with the bug this is off by the channel count.
+  {
+    const std::vector<float> probe(
+        static_cast<size_t>(p.audio_latents_dim * request.audio_t), 0.0f);
+    int64_t expected_samples = 0;
+    vllm::MiniMaxH3AudioVaeDecode(audio_config, audio_weights, probe, request.audio_t,
+                                  &expected_samples);
+    INFO("audio_t=" << request.audio_t << " channels=" << request.audio_channel
+                    << " expected=" << expected_samples
+                    << " got=" << out.audio_samples_per_channel);
+    CHECK(out.audio_samples_per_channel == expected_samples);
+    // And the halved value is genuinely different, so the check has teeth.
+    int64_t halved_samples = 0;
+    const std::vector<float> halved_probe(
+        static_cast<size_t>(p.audio_latents_dim * (request.audio_t / request.audio_channel)),
+        0.0f);
+    vllm::MiniMaxH3AudioVaeDecode(audio_config, audio_weights, halved_probe,
+                                  request.audio_t / request.audio_channel, &halved_samples);
+    CHECK(halved_samples != expected_samples);
+  }
   CHECK(static_cast<int64_t>(out.waveform.size()) ==
         out.audio_channels * out.audio_samples_per_channel);
   for (float v : out.waveform) {

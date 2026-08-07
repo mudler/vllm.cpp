@@ -946,3 +946,57 @@ the 900-line review cap.
 loader ships in this row - see §8.14), no measured peak RSS, and no bf16-vs-quantized
 RENDER or SPEED comparison. The bf16-vs-quant quality question is UNBLOCKED, not
 answered.
+
+## 8.14 The ORIGINAL bf16 release — the DEVICE STREAMER (2026-08-07, `row/H3-BF16-SHARDED-STREAM`, CPU-only)
+
+Stacked on §8.13, which landed the multi-shard checkpoint and its host-f32 reference
+loader. Split as its own row so each PR stays inside the 900-line review cap; the seam
+is checkpoint-vs-device.
+
+**Why it must stream.** The reference loader materializes the whole DiT as host f32,
+~132 GB on the real release. The box has 122 GiB of UNIFIED memory — host and device
+draw on ONE pool — so "load to host, then stage" holds the model TWICE against that
+budget, and the non-streaming NVFP4 loader was already OOM-KILLED at anon-rss 125 GB on
+HALF this size. Without a streaming path the 66.3 GB release is not loadable at all.
+
+**What landed.**
+- `StreamMiniMaxH3ShardedToDeviceBf16(queue, ckpt, out_params)` (`minimax_h3_device.cpp`,
+  next to its GGUF and NVFP4 twins so it shares `BindStreamedDitViews`). Manifest first
+  (names+shapes, no payload) so the geometry is known and a wrong name map is caught
+  before anything is allocated; then ONE tensor at a time.
+- PEAK HOST MEMORY, precisely. Two of the three cases cost NOTHING: BF16-on-disk ->
+  bf16 device slot (essentially the whole 66.3 GB) and F32 -> f32 island are both
+  uploaded DIRECTLY out of the read-only mmap, with no host buffer at any point. Only a
+  dtype MISMATCH (a BF16 island widened to f32, an F32 body rounded to bf16, an F16
+  shard) costs one tensor's conversion buffer, freed before the next iteration.
+  `host_peak_bytes` reports the largest such buffer, so the gate asserts the bound
+  rather than trusting the comment.
+- Each source range goes to `MaybeReleaseSourcePages` the moment its copy returns, so
+  the page cache does not accumulate against the same pool the weights live in.
+  `rope.inv_freq` stays HOST-resident (`BuildRopeCosSin` runs before any kernel, so a
+  device pointer there segfaults on the first forward).
+- `MiniMaxH3ShardStreamStats`, mirroring `Nvfp4W4A16Stats`, makes the path OBSERVABLE.
+  This codebase has shipped a never-executing guarded kernel under a green suite before;
+  counters are how that is prevented.
+- `examples/minimax_h3_gen`: `--dit <dir> --device cuda` streams and prints the stats
+  line; `--device cpu` keeps §8.13's host reference loader.
+
+**Gates (CPU, `test_minimax_h3` 73/73, 55203 assertions).**
+1. *Streamed == non-streamed*: over a 3-shard synthetic set whose dtypes exercise all
+   four (on-disk x device) combinations, every one of the 46 weight views is BIT-EXACT
+   (`memcmp == 0`) against `StageMiniMaxH3DitWeights(kBF16)` over the same checkpoint,
+   dtypes included (12 fp32 islands, the rest bf16), and both device forwards return
+   IDENTICAL logits (video and audio max|diff| both exactly 0.0). `rope.inv_freq` is
+   asserted HOST-resident.
+2. *The loader RAN*: the counters are asserted, not merely printed. Observed
+   `shards=3 tensors=46 direct=37 converted=9 bytes=444504 host_peak=8192` — BOTH upload
+   paths taken, every bound view pointing at an allocation this loader owns, and
+   `host_peak_bytes` (one tensor's buffer) under 1/4 of the bytes uploaded, i.e. the peak
+   cannot scale with the model.
+
+**Not claimed here (needs the real weights / a GPU):** the 66.3 GB load itself and its
+measured peak RSS, CUDA `cudaMemcpy` straight from a file-backed mmap (valid
+pageable-source usage, and every copy is followed by a synchronize, but unexercised on
+device), and any bf16-vs-quantized RENDER or SPEED comparison. The quality A/B is now
+runnable; it has not been run.
+

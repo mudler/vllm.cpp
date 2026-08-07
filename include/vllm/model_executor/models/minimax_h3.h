@@ -1499,11 +1499,57 @@ std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3ShardedTensors(
 
 // The REFERENCE (non-streaming) multi-shard loader: materialize every tensor as
 // host f32 and bind the forward's views, exactly as LoadMiniMaxH3DitFromNvfp4
-// does for the single-file NVFP4 arm. It is the CPU path for small checkpoints
-// and the comparison baseline a device streamer is gated against; on the REAL
-// 66.3 GB release it would need ~132 GB of host f32 and must NOT be used — that
-// release needs a streaming device loader, which this row does not yet ship.
+// does for the single-file NVFP4 arm. It is the comparison baseline the streamer
+// is gated against and the CPU path for small checkpoints; on the REAL 66.3 GB
+// release it would need ~132 GB of host f32 and must not be used — that is what
+// StreamMiniMaxH3ShardedToDeviceBf16 exists for.
 MiniMaxH3GgufDit LoadMiniMaxH3DitFromShards(const MiniMaxH3ShardedCheckpoint& ckpt);
+
+// ★ Stream the ORIGINAL bf16 DiT from its shards STRAIGHT ONTO THE DEVICE, one
+// tensor at a time — the multi-shard twin of StreamMiniMaxH3Nvfp4ToDeviceBf16.
+//
+// It MUST stream. 66.3 GB cannot be materialized on the host and then staged: the
+// box has 122 GiB of UNIFIED memory (host and device share ONE pool), and the
+// non-streaming NVFP4 loader was already OOM-KILLED at anon-rss 125 GB doing
+// exactly that. Peak host anonymous memory here is ONE tensor's conversion buffer
+// (freed before the next), and for the real release it is very nearly ZERO: a
+// BF16-on-disk tensor bound for a bf16 device slot is uploaded DIRECTLY out of
+// the read-only mmap with no host buffer at all, and each source range is
+// released (MaybeReleaseSourcePages) the moment its copy returns, so the page
+// cache does not accumulate against the same pool the weights live in either.
+//
+// The fp32 ISLANDS (see MiniMaxH3IsFp32IslandTensor) stay f32; everything else is
+// staged bf16. `rope.inv_freq` stays HOST-resident on the returned struct.
+MiniMaxH3DitDeviceWeights StreamMiniMaxH3ShardedToDeviceBf16(
+    vt::Queue& queue, const MiniMaxH3ShardedCheckpoint& ckpt,
+    MiniMaxH3DitParams* out_params = nullptr);
+
+// --- "this loader actually RAN" counters -----------------------------------
+// A green suite over a path that silently fell back to another loader is a
+// failure mode this codebase has hit before (a kernel guarded to `num_reqs == 1`
+// shipped never-executing while the suite stayed green), so the streamer is made
+// OBSERVABLE and the gate asserts on it. Mirrors dense_nvfp4_gemm.h's
+// Nvfp4W4A16Stats.
+struct MiniMaxH3ShardStreamStats {
+  uint64_t shards_opened = 0;       // shards the checkpoint resolved to
+  uint64_t tensors_streamed = 0;    // tensors uploaded to the device
+  uint64_t direct_uploads = 0;      // uploaded straight from the mmap, NO host copy
+  uint64_t converted_uploads = 0;   // needed one host dtype conversion first
+  uint64_t host_resident = 0;       // kept on the HOST on purpose (rope.inv_freq)
+  uint64_t bytes_uploaded = 0;      // total device bytes staged
+  uint64_t host_peak_bytes = 0;     // largest host conversion buffer alive at once
+};
+
+inline MiniMaxH3ShardStreamStats& MutableMiniMaxH3ShardStreamStats() {
+  static MiniMaxH3ShardStreamStats s;
+  return s;
+}
+inline MiniMaxH3ShardStreamStats GetMiniMaxH3ShardStreamStats() {
+  return MutableMiniMaxH3ShardStreamStats();
+}
+inline void ResetMiniMaxH3ShardStreamStats() {
+  MutableMiniMaxH3ShardStreamStats() = MiniMaxH3ShardStreamStats{};
+}
 
 MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
                                                    const MiniMaxH3DitParams& params,

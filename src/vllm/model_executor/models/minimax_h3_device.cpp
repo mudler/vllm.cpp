@@ -30,6 +30,7 @@
 // own accumulation orders. f32 is what upstream torch RMSNorm does, so the device
 // path is arguably the closer mirror. It is gated against the SAME upstream
 // goldens at the SAME tolerance as the CPU forward.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -1431,6 +1432,141 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
   }
 
   BindStreamedDitViewsFp4(views, fp4, params, &staged.weights);
+  return staged;
+}
+
+// ★ The ORIGINAL bf16 release (13 shards, 66.3 GB), streamed STRAIGHT ONTO THE
+// DEVICE — the multi-shard twin of StreamMiniMaxH3Nvfp4ToDeviceBf16, and the
+// first loader that can open the full-precision DiT at all.
+//
+// WHY IT MUST STREAM. The box has 122 GiB of UNIFIED memory: host and device
+// share ONE pool, so "load to host, then stage to device" holds the model TWICE
+// against the same budget. The non-streaming NVFP4 loader was already OOM-KILLED
+// at anon-rss 125 GB doing exactly that, and this checkpoint is twice its size.
+// So: convert ONE tensor, upload it, let the host buffer die before the next.
+//
+// PEAK HOST MEMORY, precisely. Two of the three cases cost NOTHING:
+//   * BF16 on disk -> bf16 device slot: uploaded DIRECTLY out of the read-only
+//     mmap. No host buffer exists at any point. This is the case for essentially
+//     the entire 66.3 GB (every norm, every projection).
+//   * F32 on disk -> f32 island: same, a direct mmap upload.
+//   * anything else (a BF16 island widened to f32, an F32 tensor rounded to
+//     bf16, an F16 shard): ONE tensor's conversion buffer, freed at the end of
+//     its iteration. `host_peak_bytes` reports the largest such buffer, so the
+//     gate asserts on the bound rather than trusting this comment.
+// Each source range is handed to MaybeReleaseSourcePages the moment its copy
+// returns (the same windowed release every other loader uses, default ON), so
+// the page cache does not accumulate against the pool the weights live in.
+MiniMaxH3DitDeviceWeights StreamMiniMaxH3ShardedToDeviceBf16(
+    vt::Queue& queue, const MiniMaxH3ShardedCheckpoint& ckpt,
+    MiniMaxH3DitParams* out_params) {
+  vt::Backend& backend = vt::GetBackend(queue.device.type);
+  const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
+
+  // Manifest first: names + shapes only, no payload, so the geometry is known
+  // (and a wrong name map is caught) before a single byte is allocated.
+  const std::vector<MiniMaxH3TensorSpec> manifest = EnumerateMiniMaxH3ShardedTensors(ckpt);
+  const MiniMaxH3DitParams params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+  if (out_params != nullptr) *out_params = params;
+
+  MiniMaxH3ShardStreamStats& stats = MutableMiniMaxH3ShardStreamStats();
+  stats = MiniMaxH3ShardStreamStats{};
+  stats.shards_opened = static_cast<uint64_t>(ckpt.ShardCount());
+
+  MiniMaxH3DitDeviceWeights staged;
+  std::map<std::string, Tensor> views;
+  size_t done = 0;
+  for (const MiniMaxH3TensorSpec& spec : manifest) {
+    const StTensor& t = ckpt.Get(spec.name);
+
+    // rope.inv_freq is consumed on the HOST (BuildRopeCosSin runs before any
+    // kernel); binding a device pointer here segfaults on the first forward.
+    if (spec.name == "rope.inv_freq") {
+      staged.rope_inv_freq_host = MiniMaxH3ReadSafetensorF32(t);
+      staged.weights.rope_inv_freq = vt::Tensor::Contiguous(
+          staged.rope_inv_freq_host.data(), DType::kF32, vt::Device{},
+          {static_cast<int64_t>(staged.rope_inv_freq_host.size())});
+      MaybeReleaseSourcePages(t.data, t.nbytes);
+      ++stats.host_resident;
+      continue;
+    }
+
+    int64_t numel = 1;
+    for (int64_t d : spec.shape) numel *= d;
+    VT_CHECK(numel > 0, "minimax_h3 sharded stream: tensor '" + spec.name +
+                            "' has an empty logical shape");
+
+    const bool island = MiniMaxH3IsFp32IslandTensor(spec.name);
+    const DType want = island ? DType::kF32 : DType::kBF16;
+    const bool already = (island && t.dtype == "F32") || (!island && t.dtype == "BF16");
+
+    std::vector<float> f32;
+    std::vector<uint16_t> bf16;
+    const void* src = nullptr;
+    size_t bytes = 0;
+    if (already) {
+      // The whole point: the on-disk bytes ARE the device bytes, so there is no
+      // host copy to peak on.
+      VT_CHECK(t.nbytes == static_cast<size_t>(numel) * (island ? 4u : 2u),
+               "minimax_h3 sharded stream: tensor '" + spec.name +
+                   "' byte span does not match its shape");
+      src = t.data;
+      bytes = t.nbytes;
+      ++stats.direct_uploads;
+    } else {
+      // Whatever the shard stored it as (BF16 island, F32 body, F16 either way),
+      // land on the dtype the forward needs — one tensor at a time.
+      f32 = MiniMaxH3ReadSafetensorF32(t);
+      VT_CHECK(static_cast<int64_t>(f32.size()) == numel,
+               "minimax_h3 sharded stream: tensor '" + spec.name +
+                   "' read produced the wrong element count");
+      if (island) {
+        src = f32.data();
+        bytes = f32.size() * sizeof(float);
+      } else {
+        bf16.resize(f32.size());
+        for (size_t i = 0; i < f32.size(); ++i) {
+          uint32_t bits;
+          std::memcpy(&bits, &f32[i], sizeof(bits));
+          // round-to-nearest-even, the same rounding vt uses on a bf16 store
+          const uint32_t rounded = bits + 0x7FFFu + ((bits >> 16) & 1u);
+          bf16[i] = static_cast<uint16_t>(rounded >> 16);
+        }
+        // The f32 staging buffer dies HERE, not at the end of the iteration: it
+        // is the larger of the two, and holding both is the only way this branch
+        // could double its own peak.
+        const size_t f32_bytes = f32.size() * sizeof(float);
+        f32.clear();
+        f32.shrink_to_fit();
+        stats.host_peak_bytes = std::max<uint64_t>(
+            stats.host_peak_bytes, static_cast<uint64_t>(f32_bytes + bf16.size() * 2));
+        src = bf16.data();
+        bytes = bf16.size() * sizeof(uint16_t);
+      }
+      stats.host_peak_bytes = std::max<uint64_t>(stats.host_peak_bytes, bytes);
+      ++stats.converted_uploads;
+    }
+
+    void* pdev = backend.Alloc(bytes);
+    std::shared_ptr<void> owner(pdev, [&backend](void* q) { backend.Free(q); });
+    backend.Copy(queue, pdev, src, bytes);
+    backend.Synchronize(queue);  // the host buffer dies at the end of this iteration
+    views[spec.name] = dense_attn::MakeTensor(pdev, want, queue.device, spec.shape);
+    staged.storage.push_back(std::move(owner));
+    // Copied-then-dead: drop the shard pages this tensor occupied. On a unified
+    // box the page cache competes with the model for the same pool.
+    MaybeReleaseSourcePages(t.data, t.nbytes);
+
+    ++stats.tensors_streamed;
+    stats.bytes_uploaded += bytes;
+    if (trace && (++done % 50 == 0 || done == manifest.size())) {
+      std::fprintf(stderr, "[h3] shard-streamed %zu/%zu tensors (last: %s)\n", done,
+                   manifest.size(), spec.name.c_str());
+      std::fflush(stderr);
+    }
+  }
+
+  BindStreamedDitViews(views, params, &staged.weights);
   return staged;
 }
 

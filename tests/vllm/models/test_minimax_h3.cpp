@@ -4180,6 +4180,56 @@ std::set<std::string> ShardedGateF32Names() {
           "rope.inv_freq", "blocks.0.norm1.weight"};
 }
 
+// Every weight view in binder order, so a comparison covers the WHOLE contract
+// rather than a spot check.
+std::vector<std::pair<std::string, const vt::Tensor*>> AllDitViews(
+    const vllm::MiniMaxH3DitWeights& w) {
+  std::vector<std::pair<std::string, const vt::Tensor*>> out;
+  auto add = [&out](const std::string& name, const vt::Tensor& t) {
+    out.emplace_back(name, &t);
+  };
+  add("video_patch_proj.weight", w.video_patch_proj_w);
+  add("video_patch_proj.bias", w.video_patch_proj_b);
+  add("audio_patch_proj.weight", w.audio_patch_proj_w);
+  add("audio_patch_proj.bias", w.audio_patch_proj_b);
+  add("condition_proj.weight", w.condition_proj_w);
+  add("condition_proj.bias", w.condition_proj_b);
+  add("time_embedder.proj_in.weight", w.time_proj_in_w);
+  add("time_embedder.proj_in.bias", w.time_proj_in_b);
+  add("time_embedder.proj_out.weight", w.time_proj_out_w);
+  add("time_embedder.proj_out.bias", w.time_proj_out_b);
+  auto add_block = [&](const std::string& prefix, const vllm::MiniMaxH3DitBlockWeights& b,
+                       bool adaln) {
+    add(prefix + ".norm1.weight", b.norm1);
+    add(prefix + ".norm2.weight", b.norm2);
+    add(prefix + ".attn.qkv_proj.weight", b.qkv_proj);
+    add(prefix + ".attn.q_norm.weight", b.q_norm);
+    add(prefix + ".attn.k_norm.weight", b.k_norm);
+    add(prefix + ".attn.out_proj.weight", b.out_proj);
+    add(prefix + ".mlp.fc1.weight", b.fc1);
+    add(prefix + ".mlp.fc2.weight", b.fc2);
+    if (adaln) {
+      add(prefix + ".adaln_proj.linear.weight", b.adaln_w);
+      add(prefix + ".adaln_proj.linear.bias", b.adaln_b);
+    }
+  };
+  for (size_t i = 0; i < w.refiner.size(); ++i) {
+    add_block("token_refiner.blocks." + std::to_string(i), w.refiner[i], false);
+  }
+  add("token_refiner.final_norm.weight", w.refiner_final_norm);
+  for (size_t i = 0; i < w.blocks.size(); ++i) {
+    add_block("blocks." + std::to_string(i), w.blocks[i], true);
+  }
+  add("final_layer.norm.weight", w.final_norm);
+  add("final_layer.adaln_proj.linear.weight", w.final_adaln_w);
+  add("final_layer.adaln_proj.linear.bias", w.final_adaln_b);
+  add("final_layer.video_out.weight", w.video_out_w);
+  add("final_layer.video_out.bias", w.video_out_b);
+  add("final_layer.audio_out.weight", w.audio_out_w);
+  add("final_layer.audio_out.bias", w.audio_out_b);
+  return out;
+}
+
 }  // namespace
 
 TEST_CASE("minimax_h3: the multi-shard index resolves every tensor to its own shard") {
@@ -4293,11 +4343,176 @@ TEST_CASE("minimax_h3: the multi-shard index resolves every tensor to its own sh
   CHECK_THROWS(vllm::MiniMaxH3ShardedCheckpoint::Open("/tmp"));
 }
 
+TEST_CASE("minimax_h3: the sharded bf16 DiT STREAMS to the device, matching the reference") {
+  const MiniMaxH3DitParams want = ShardedGateParams();
+  const std::vector<H3StEntry> entries =
+      BuildMiniMaxH3DitEntries(want, /*quantize=*/false, /*plain_bf16=*/true,
+                               ShardedGateF32Names());
+  const std::string dir = "/tmp/minimax_h3_sharded_stream";
+  const size_t kShards = 3;
+  WriteMiniMaxH3ShardedDit(entries, dir, kShards);
+  const vllm::MiniMaxH3ShardedCheckpoint ckpt = vllm::MiniMaxH3ShardedCheckpoint::Open(dir);
+
+  // The NON-STREAMED reference: materialize to host f32, then stage with the
+  // existing (load-everything-then-upload) stager. This is the arm the streamer
+  // must reproduce, and it is the arm that CANNOT be used on the real 66.3 GB
+  // release — it holds the model twice against a 122 GiB UNIFIED pool.
+  vt::Queue q = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+  const vllm::MiniMaxH3GgufDit reference = vllm::LoadMiniMaxH3DitFromShards(ckpt);
+  const vllm::MiniMaxH3DitDeviceWeights ref_staged =
+      vllm::StageMiniMaxH3DitWeights(q, reference.params, reference.weights, vt::DType::kBF16);
+
+  vllm::ResetMiniMaxH3ShardStreamStats();
+  MiniMaxH3DitParams streamed_params;
+  const vllm::MiniMaxH3DitDeviceWeights streamed =
+      vllm::StreamMiniMaxH3ShardedToDeviceBf16(q, ckpt, &streamed_params);
+  const vllm::MiniMaxH3ShardStreamStats stats = vllm::GetMiniMaxH3ShardStreamStats();
+
+  CHECK(streamed_params.num_layers == reference.params.num_layers);
+  CHECK(streamed_params.hidden_size == reference.params.hidden_size);
+  CHECK(streamed_params.text_dim == reference.params.text_dim);
+
+  // ★ THE LOADER RAN, and it produced DEVICE tensors. A green suite over a path
+  // that silently fell back to another loader is a failure mode this codebase has
+  // already shipped once, so the positive signal is asserted, not assumed.
+  INFO("shard-stream stats: shards=" << stats.shards_opened << " tensors="
+       << stats.tensors_streamed << " direct=" << stats.direct_uploads << " converted="
+       << stats.converted_uploads << " bytes=" << stats.bytes_uploaded << " host_peak="
+       << stats.host_peak_bytes);
+  CHECK(stats.shards_opened == kShards);
+  CHECK(stats.tensors_streamed == entries.size() - 1);  // rope.inv_freq stays host
+  CHECK(stats.host_resident == 1);
+  CHECK(stats.direct_uploads + stats.converted_uploads == stats.tensors_streamed);
+  CHECK(stats.direct_uploads > 0);     // the zero-host-copy path really is taken
+  CHECK(stats.converted_uploads > 0);  // and so is the converting one
+  CHECK(stats.bytes_uploaded > 0);
+
+  // ★ PEAK HOST MEMORY CANNOT BALLOON. Only ONE tensor's conversion buffer is ever
+  // alive, so the peak is bounded by the largest single tensor — NOT by the model.
+  // On the real release that bound is ~1 GB against 66.3 GB of weights, and the
+  // BF16->bf16 bulk costs nothing at all.
+  uint64_t largest = 0;
+  for (const H3StEntry& e : entries) {
+    largest = std::max<uint64_t>(largest, static_cast<uint64_t>(e.bytes.size()) * 2);
+  }
+  CHECK(stats.host_peak_bytes <= largest);
+  CHECK(stats.host_peak_bytes < stats.bytes_uploaded / 4);
+
+  // Every streamed view points at an allocation this loader OWNS (a device buffer),
+  // never into the mmap or into a host reference.
+  std::set<const void*> owned;
+  for (const std::shared_ptr<void>& s : streamed.storage) owned.insert(s.get());
+  CHECK(owned.size() == stats.tensors_streamed);
+
+  // ★ STREAMED == NON-STREAMED, tensor for tensor. Both round f32->bf16 with the
+  // same round-to-nearest-even rule and keep the same fp32 islands, so this is
+  // BIT-EXACT, not a tolerance.
+  const auto ref_views = AllDitViews(ref_staged.weights);
+  const auto got_views = AllDitViews(streamed.weights);
+  REQUIRE(ref_views.size() == got_views.size());
+  size_t compared = 0, island_count = 0;
+  for (size_t i = 0; i < ref_views.size(); ++i) {
+    const std::string& name = ref_views[i].first;
+    const vt::Tensor& a = *ref_views[i].second;
+    const vt::Tensor& b = *got_views[i].second;
+    INFO("weight " << name);
+    REQUIRE(got_views[i].first == name);
+    REQUIRE(b.data != nullptr);
+    CHECK(owned.count(b.data) == 1);  // it came from THIS loader's device staging
+    REQUIRE(a.rank == b.rank);
+    for (int r = 0; r < a.rank; ++r) CHECK(a.shape[r] == b.shape[r]);
+    // The dtype policy: fp32 ISLANDS stay f32, everything else is bf16.
+    const bool island = vllm::MiniMaxH3IsFp32IslandTensor(name);
+    CHECK(b.dtype == (island ? vt::DType::kF32 : vt::DType::kBF16));
+    CHECK(a.dtype == b.dtype);
+    island_count += island ? 1 : 0;
+    const size_t bytes = static_cast<size_t>(a.Numel()) * vt::SizeOf(a.dtype);
+    CHECK(std::memcmp(a.data, b.data, bytes) == 0);
+    ++compared;
+  }
+  CHECK(compared == ref_views.size());
+  CHECK(island_count == 12);  // both patch projections, the time embedder, both heads
+
+  // ★ rope.inv_freq stays on the HOST. The forward builds the cos/sin cache from it
+  // BEFORE any kernel runs, so a device pointer here segfaults rather than
+  // misbehaving.
+  CHECK(!streamed.rope_inv_freq_host.empty());
+  CHECK(streamed.weights.rope_inv_freq.data == streamed.rope_inv_freq_host.data());
+  CHECK(streamed.weights.rope_inv_freq.dtype == vt::DType::kF32);
+  CHECK(owned.count(streamed.weights.rope_inv_freq.data) == 0);
+  REQUIRE(static_cast<int64_t>(streamed.rope_inv_freq_host.size()) == want.rope_inv_freq_len);
+  for (int64_t i = 0; i < want.rope_inv_freq_len; ++i) {
+    CHECK(streamed.rope_inv_freq_host[static_cast<size_t>(i)] ==
+          ref_staged.weights.rope_inv_freq.Ptr<float>()[i]);
+  }
+
+  // And it must RUN: the streamed weights drive a real device forward, and the
+  // non-streamed reference produces the SAME velocity prediction.
+  const MiniMaxH3PackedSequence packed =
+      BuildMiniMaxH3PackedSequence(4, 2, 4, 4, 2, 2, /*include_keyframe_cond=*/false, {}, 0);
+  const int64_t seq = packed.seq_len;
+  const int64_t num_img = static_cast<int64_t>(packed.img_pos.size());
+  const int64_t num_audio = static_cast<int64_t>(packed.audio_pos.size());
+  const int64_t num_text = static_cast<int64_t>(packed.text_pos.size());
+  const int64_t video_width = want.video_row_width();
+  const std::vector<float> x(static_cast<size_t>(seq * video_width), 0.25f);
+  const std::vector<float> audio_x(static_cast<size_t>(seq * want.audio_latents_dim), 0.1f);
+  const std::vector<float> prompt(static_cast<size_t>(num_text * want.text_dim), 0.2f);
+  const std::vector<float> unique_ts = {0.4f};
+  const std::vector<int64_t> inverse(static_cast<size_t>(seq), 0);
+  const std::vector<int32_t> refiner_cu = {0, static_cast<int32_t>(num_text),
+                                           static_cast<int32_t>(num_text)};
+  MiniMaxH3DitInputs in;
+  in.seq_len = seq;
+  in.x = x.data();
+  in.audio_x = audio_x.data();
+  in.img_position_ids = packed.img_position_ids.data();
+  in.unique_timesteps = unique_ts.data();
+  in.num_unique_timesteps = 1;
+  in.inverse_indices = inverse.data();
+  in.token_tags = packed.token_tags.data();
+  in.prompt_embeds = prompt.data();
+  in.img_pos = packed.img_pos.data();
+  in.num_img_pos = num_img;
+  in.audio_pos = packed.audio_pos.data();
+  in.num_audio_pos = num_audio;
+  in.text_pos = packed.text_pos.data();
+  in.num_text_pos = num_text;
+  in.infer_out_pos = packed.img_pos.data();
+  in.num_infer_out_pos = num_img;
+  in.update_mask = packed.update_mask.data();
+  in.cu_seqlens = packed.cu_seqlens.data();
+  in.num_cu_seqlens = static_cast<int64_t>(packed.cu_seqlens.size());
+  in.refiner_cu_seqlens = refiner_cu.data();
+  in.num_refiner_cu_seqlens = static_cast<int64_t>(refiner_cu.size());
+
+  const MiniMaxH3DitOutputs got =
+      MiniMaxH3DitForwardDevice(q, streamed_params, streamed.weights, in, vt::DType::kBF16);
+  const MiniMaxH3DitOutputs ref =
+      MiniMaxH3DitForwardDevice(q, reference.params, ref_staged.weights, in, vt::DType::kBF16);
+  REQUIRE(got.video_logits.size() == static_cast<size_t>(num_img * video_width));
+  REQUIRE(got.video_logits.size() == ref.video_logits.size());
+  REQUIRE(got.audio_logits.size() == ref.audio_logits.size());
+  for (float v : got.video_logits) REQUIRE(std::isfinite(v));
+  for (float v : got.audio_logits) REQUIRE(std::isfinite(v));
+  const double video_delta =
+      MaxAbsDiff(got.video_logits, ref.video_logits.data(), got.video_logits.size());
+  const double audio_delta =
+      MaxAbsDiff(got.audio_logits, ref.audio_logits.data(), got.audio_logits.size());
+  INFO("streamed-vs-reference forward: video max|diff| = " << video_delta
+                                                           << ", audio max|diff| = " << audio_delta);
+  // Bit-identical weights through the same graph: the outputs match EXACTLY.
+  CHECK(video_delta == 0.0);
+  CHECK(audio_delta == 0.0);
+
+  RemoveShardedDit(dir, kShards);
+}
+
 TEST_CASE("minimax_h3: a 13-shard 66 GB bf16 release derives the SHIPPED geometry") {
   // The real release's SHAPE at its real size, with the payload as a sparse hole:
   // the headers are byte-for-byte what the 66.3 GB checkpoint declares, so the
-  // manifest path — the one `--dump-params <dir>` uses, and the one any device
-  // loader must derive its geometry from before allocating — is gated on the REAL
+  // manifest path — the one `--dump-params <dir>` uses, and the one the streamer
+  // derives its geometry from before allocating anything — is gated on the REAL
   // names and shapes without downloading or storing a weight byte.
   MiniMaxH3DitParams shipped;  // the defaults ARE the shipped H3 geometry
   const std::vector<vllm::MiniMaxH3TensorSpec> specs =

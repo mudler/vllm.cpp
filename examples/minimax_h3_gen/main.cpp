@@ -12,7 +12,10 @@
 // artifacts and argv and spawns nothing.
 //
 // Usage:
-//   minimax-h3-gen --dit <dit.gguf|dit.safetensors>
+//   minimax-h3-gen --dit <dit.gguf|dit.safetensors|shard-dir/>
+//                  # a DIRECTORY holding the original bf16 release's shards plus
+//                  # model.safetensors.index.json is accepted wherever a single
+//                  # DiT file is; every existing --dit form is unchanged.
 //                  --video-vae <video_vae.safetensors> --video-vae-config <config.json>
 //                  --audio-vae <audio_vae.safetensors> --audio-vae-config <config.json>
 //                  --prompt-embeds <f32.bin>   (rows of text_dim, little-endian f32)
@@ -276,7 +279,7 @@ int main(int argc, char** argv) {
         (dit_path.empty() || (need_vaes && (video_vae_path.empty() || audio_vae_path.empty())) ||
          (need_vaes && out_path.empty()) ||
          (need_cond && embeds_path.empty() && (encoder_path.empty() || prompt.empty())))) {
-      std::cerr << "usage: minimax-h3-gen --dit <f> --video-vae <f> --audio-vae <f> "
+      std::cerr << "usage: minimax-h3-gen --dit <f|shard-dir> --video-vae <f> --audio-vae <f> "
                    "--prompt-embeds <f32.bin> --out <out.mp4> [--video-vae-config <j>] "
                    "[--audio-vae-config <j>] [--keep-quant] [--steps N] [--frames N] "
                    "[--height N] [--width N] [--device cpu|cuda] [--workdir DIR] [--ffmpeg PATH] "
@@ -297,6 +300,16 @@ int main(int argc, char** argv) {
       if (EndsWith(dit_path, ".gguf")) {
         const vllm::GgufFile gf = vllm::GgufFile::Open(dit_path);
         pr = vllm::ParseMiniMaxH3DitParamsFromGgufManifest(vllm::EnumerateMiniMaxH3GgufTensors(gf));
+      } else if (vllm::MiniMaxH3ShardedCheckpoint::IsShardedDir(dit_path)) {
+        // A DIRECTORY of shards + index: the original bf16 release. Manifest only,
+        // so this answers "do the 13 shards agree on the geometry the GGUF arm
+        // derives?" on a 66.3 GB checkpoint without reading a single weight byte.
+        const vllm::MiniMaxH3ShardedCheckpoint ckpt =
+            vllm::MiniMaxH3ShardedCheckpoint::Open(dit_path);
+        std::cerr << "  " << ckpt.ShardCount() << " shard(s), " << ckpt.Names().size()
+                  << " tensors, index " << ckpt.IndexPath() << "\n";
+        pr = vllm::ParseMiniMaxH3DitParamsFromGgufManifest(
+            vllm::EnumerateMiniMaxH3ShardedTensors(ckpt));
       } else {
         const vllm::SafetensorsFile sf = vllm::SafetensorsFile::Open(dit_path);
         std::vector<vllm::MiniMaxH3TensorSpec> manifest;
@@ -546,6 +559,20 @@ int main(int argc, char** argv) {
         dit = dequant_bf16 ? vllm::LoadMiniMaxH3DitFromGgufBf16(f)
                            : vllm::LoadMiniMaxH3DitFromGguf(f, keep_quant);
       }
+    } else if (vllm::MiniMaxH3ShardedCheckpoint::IsShardedDir(dit_path)) {
+      // The ORIGINAL bf16 release: a DIRECTORY of shards plus
+      // model.safetensors.index.json. Every other --dit form is a single file and
+      // keeps working unchanged; this is the only one that can open the
+      // full-precision DiT at all, which is what makes the quantization-quality
+      // question askable.
+      const vllm::MiniMaxH3ShardedCheckpoint ckpt =
+          vllm::MiniMaxH3ShardedCheckpoint::Open(dit_path);
+      std::cerr << "  " << ckpt.ShardCount() << " shard(s), " << ckpt.Names().size()
+                << " tensors (index " << ckpt.IndexPath() << ")\n";
+      // Host f32 reference path. ~132 GB on the real release, so it is usable
+      // only on a reduced checkpoint; opening the real release on a device needs
+      // a streaming loader, which this row does not yet ship.
+      dit = vllm::LoadMiniMaxH3DitFromShards(ckpt);
     } else {
       const vllm::SafetensorsFile f = vllm::SafetensorsFile::Open(dit_path);
       if (device_name == "cuda") {

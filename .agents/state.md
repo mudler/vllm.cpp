@@ -40896,3 +40896,72 @@ Records: spec §14, STATUS/BENCHMARKS/FEATURES Kimi rows, benchmark-record, NOW.
   fails to create. `sudo` on the host is the working path. No container was
   holding the GPU (all exited), so nothing was stopped and nothing needed
   restoring.
+
+## 2026-08-07T09:55 - H3: the ORIGINAL bf16 release (13 shards, 66.3 GB) is INDEXABLE - multi-shard DiT checkpoint + host reference loader (row/H3-BF16-SHARDED-DIT, CPU-only)
+<!-- state: 2026-08-07T09:55 -->
+
+`row/H3-BF16-SHARDED-DIT` (helper; CPU-only, no GPU job, no download - the box's GPU
+was busy with an attention A/B). Written 2026-08-06 off `075b9f21`, REBASED onto
+`f34e0d17` and re-gated on 2026-08-07 before landing; the gate numbers below are the
+post-rebase ones, re-run here, not the pre-rebase report.
+
+**Why.** Every H3 render so far used a QUANTIZED DiT, and H3 is unusually
+quantization-sensitive: Q3_K_M -> Q4_K_M alone turned a murky lattice-covered
+silhouette into a photoreal close-up (ComfyUI PR 15298 attributes it to the partial
+split-half RoPE creating channel-wise magnitude outliers that corrupt even INT8). The
+obvious next question - what does FULL PRECISION look like? - could not be asked,
+because every DiT loader took a SINGLE file while the bf16 release ships 13
+safetensors shards totalling 66.3 GB.
+
+**What landed (this row is the CHECKPOINT half; the device streamer is the stacked
+follow-up `row/H3-BF16-SHARDED-STREAM`, split out to stay inside the PR-size cap).**
+- `MiniMaxH3ShardedCheckpoint::Open(dir)` in the new
+  `src/vllm/model_executor/models/minimax_h3_sharded.cpp`: resolves every tensor
+  through the checkpoint's own `model.safetensors.index.json` weight map (the
+  diffusers `diffusion_pytorch_model.*` spelling is accepted too), one index over all
+  shards, mirroring the in-tree template `LoadMiniMaxH3EncoderWeights(const
+  std::vector<SafetensorsFile>&, ...)`. A tensor the index NAMES but whose shard does
+  not contain it throws BY NAME - skipping it would read as zeros and render.
+- `EnumerateMiniMaxH3ShardedTensors` builds the same names+shapes manifest the GGUF
+  and NVFP4 arms build, so `ParseMiniMaxH3DitParamsFromGgufManifest` derives the
+  geometry from SHAPES ALONE on a sharded checkpoint too.
+- `LoadMiniMaxH3DitFromShards` (host-f32 REFERENCE loader - the comparison baseline
+  and the CPU path for reduced checkpoints; it needs ~132 GB on the real release and
+  must not be used there), and `MiniMaxH3IsFp32IslandTensor` single-sourcing the
+  fp32-ISLAND split that the three existing streamers each hand-rolled.
+- `--dit <dir>` in `examples/minimax_h3_gen` wherever a single DiT file was accepted,
+  for both `--dump-params` and the run path; every existing `--dit` form unchanged.
+
+**Gates (CPU, re-run post-rebase: `test_minimax_h3` 72/72 cases / 54497 assertions,
+clean Release build of `libvllm.a`, `test_minimax_h3`, `minimax-h3-gen`).**
+(1) index+name mapping over a synthetic 4-shard set - every tensor resolves to the
+shard the index named AND to the bytes written there; a tensor named in the index but
+missing from its shard throws with its NAME in the message; the derived geometry
+equals the SINGLE-FILE path over the same tensors, field for field. (2) real geometry
+without the weights - a 13-shard release whose headers declare the REAL 535 tensors at
+their REAL shapes with the payload as a SPARSE hole (61.73 GiB = 66.3 GB declared,
+144 KB on disk) parses to the SHIPPED geometry (num_layers 50, hidden 5376, heads 56,
+head_dim 128, ffn 14336, latents 24, audio_latents 32, patch 1x2x2, text_dim 5120),
+and `minimax-h3-gen --dit <dir> --dump-params` prints all 20 fields on it.
+
+**A real defect this row's CI found, fixed here.** `MiniMaxH3ReadSafetensorF32`
+(`minimax_h3_vae_loader.cpp:88`) read 16-bit payloads as
+`reinterpret_cast<const uint16_t*>(tensor.data)[i]`. safetensors puts the payload
+straight after a JSON header of ARBITRARY length, so a tensor's first byte is only
+2-byte aligned if the writer happened to pad, and the format does not require it - the
+cast is UB on any file with an odd header. It had never fired because every checkpoint
+reaching that function so far was padded; `LoadMiniMaxH3DitFromShards` made an unpadded
+one reachable and the ASan+UBSan lane caught it immediately (`load of misaligned address
+... requires 2 byte alignment`). Now a byte-wise `memcpy` load, which has no alignment
+precondition. RED-first proven locally: reverting the fix on the same sanitizer build
+reproduces CI's message at the same line and exits 1; with it, `test_minimax_h3` is
+73/73 / 55203 under `-fsanitize=address,undefined` with ZERO findings. The synthetic
+shard writer is deliberately left UNPADDED so this stays covered.
+
+**Honest residuals.** NOT claimed here: any device load of the real 66.3 GB release
+(this row ships no streaming device loader - see the stacked follow-up), its measured
+peak RSS, and any bf16-vs-quantized RENDER or SPEED number. The bf16-vs-quant quality
+question is UNBLOCKED, not answered.
+
+Next: `row/H3-BF16-SHARDED-STREAM` (device streamer), then the operator runs the real
+13-shard bf16 DiT.

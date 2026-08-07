@@ -133,7 +133,7 @@ they sit outside the gated list above.
 |---|---|---|---|
 | Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder TTFT ~17x, pending |
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
-| MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 69/69; t2va+fl2va COHERENT; ref2va NVFP4 grid DIAGNOSED (§8.12): NO loader bug (weights/islands/RoPE all quant-noise-close to the coherent GGUF); residual = community-NVFP4 quant fidelity, not a loader fix | FP4/Marlin landed; ref2va NVFP4 render blocked on checkpoint quant (needs official modelopt NVFP4), speed pending |
+| MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 72/72; t2va+fl2va COHERENT; ref2va NVFP4 grid = the community checkpoint's own quant fidelity, NO loader bug (§8.12); loads GGUF + NVFP4, INDEXES the bf16 13-shard release | FP4/Marlin landed; ref2va NVFP4 render blocked on checkpoint quant (needs official modelopt NVFP4), speed pending; no bf16 render yet |
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
@@ -161,7 +161,7 @@ model architecture is wired.
 | Image | ✅ correctness-gated | ✅ | ✅ | ◐ |
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
-| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT on GB10; ref2va NVFP4 grid DIAGNOSED (§8.12): NO loader bug (weights/islands/RoPE all quant-noise-close to the coherent GGUF); residual = community-NVFP4 quant fidelity | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ t2va+fl2va COHERENT on GB10; ref2va NVFP4 grid = the community checkpoint's own quant fidelity, NO loader bug (§8.12); DiT loads GGUF or NVFP4, and indexes the bf16 13-shard release | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
 | Multimodal over the OpenAI server | ☐ | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Serving them

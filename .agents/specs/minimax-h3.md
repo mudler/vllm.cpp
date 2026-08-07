@@ -884,7 +884,65 @@ carries. Before it, no reference modality was reachable over HTTP at all.
 | Dependencies | Row `SERVE-VIDEOS-OAI` (§9), stacked. Code: `MiniMaxH3Encode{KeyframeCondRows,ReferenceVideo,ReferenceAudio}`, `MiniMaxH3ReadWav`, `DecodeDataUri`. Runtime: `--video-vae` for an image or video reference, `--audio-vae` for an audio reference (both encoder halves, loaded lazily and once). No new download, no GPU. |
 | Work breakdown | (1) `input_reference` parsing (path or `data:` URL) -> fl2va, with the geometry refusal; (2) the `metadata` map + the video/audio reference keys; (3) the combination rule in the parser; (4) the `examples/server` runner branches; (5) both test files; (6) docs + record. |
 | Risks/decisions | `input_reference` -> fl2va, NOT ref2va: OpenAI documents it as the frame the video starts from; ref2va would silently change what the API promises. The two extra modalities go in `metadata` rather than new top-level fields, so a strict client's schema validation still passes. Combination legality is enforced in the PARSER, not left to the pipeline, so a supplied reference is never silently dropped. |
+
 | OpenAI | Lands on | Notes |
+|---|---|---|
 | `model` | `VideoRequest::model` | Recorded + echoed; an unserved name is a job `warning`, never a rejection (a Sora client cannot know the local model's name) |
 | `size` | `width`, `height` | `"<w>x<h>"`, whole positive pixels, one `x`/`X` |
 | `seconds` | `duration_seconds` | Number OR numeric string — OpenAI types it as a string enum ("4"/"8"/"12") |
+
+## 8.13 The ORIGINAL bf16 release — the multi-shard CHECKPOINT (2026-08-07, `row/H3-BF16-SHARDED-DIT`, CPU-only)
+
+**Why.** Every H3 render so far used a QUANTIZED DiT, and H3 is unusually
+quantization-sensitive: Q3_K_M -> Q4_K_M alone turned a murky lattice-covered
+silhouette into a photoreal close-up (ComfyUI PR 15298 attributes it to the partial
+split-half RoPE producing channel-wise magnitude outliers that corrupt even INT8).
+"What does FULL PRECISION look like?" was unanswerable because every DiT loader took
+a SINGLE file (`LoadMiniMaxH3DitFromGguf`/`...Bf16`/`StreamMiniMaxH3DitToDeviceBf16`
+one GGUF; `LoadMiniMaxH3DitFromNvfp4`/`StreamMiniMaxH3Nvfp4To*` one safetensors),
+while the bf16 release ships **13 safetensors shards totalling 66.3 GB**.
+
+This section is the CHECKPOINT half. The device streamer that makes the real 66.3 GB
+release loadable on a GPU is §8.14, split out as a stacked row so each PR stays inside
+the 900-line review cap.
+
+**What landed.**
+- `MiniMaxH3ShardedCheckpoint::Open(dir)` (`minimax_h3_sharded.cpp`) resolves shards
+  through the checkpoint's own `model.safetensors.index.json` weight map (the
+  `diffusion_pytorch_model.*` spelling is accepted too). Nothing is discovered by
+  scanning. Shape mirrors the in-tree multi-shard template
+  `LoadMiniMaxH3EncoderWeights(const std::vector<SafetensorsFile>&, ...)`: one index
+  over every shard. A tensor the index NAMES but whose shard does not contain it
+  throws BY NAME (skipping it would read as zeros and render).
+- `EnumerateMiniMaxH3ShardedTensors` produces the same names+shapes manifest the GGUF
+  and NVFP4 arms build, so `ParseMiniMaxH3DitParamsFromGgufManifest` derives the
+  geometry from SHAPES ALONE here too, and a sharded checkpoint and a single-file one
+  holding the same tensors produce IDENTICAL params.
+- `LoadMiniMaxH3DitFromShards` is the host-f32 REFERENCE loader (the comparison
+  baseline and the CPU path for reduced checkpoints; ~132 GB on the real release, so
+  not for real runs).
+- The fp32 ISLAND split is single-sourced as `MiniMaxH3IsFp32IslandTensor` and the
+  three pre-existing streamers now call it. It is load-bearing: `vt::MatmulBT` rejects
+  an (f32 activation, bf16 weight) pair, so a tensor on the wrong side fails at the
+  first island GEMM.
+- `examples/minimax_h3_gen`: `--dit <dir>` accepts a shard directory everywhere a DiT
+  file was accepted, for both `--dump-params` and the run path. Every existing `--dit`
+  form is unchanged.
+
+**Gates (CPU, re-run after the rebase onto `f34e0d17`: `test_minimax_h3` 72/72 cases,
+54497 assertions).**
+1. *Index + name mapping, no weights*: a synthetic 4-shard set; every tensor resolves
+   to the shard the index named AND to the bytes written there; a tensor named in the
+   index but missing from its shard THROWS with the tensor name in the message; the
+   derived geometry equals the SINGLE-FILE path over the same tensors, field for field.
+2. *Real geometry without the weights*: a 13-shard release whose headers declare the
+   REAL 535 tensors at their REAL shapes with the payload as a SPARSE hole (61.73 GiB
+   = 66.3 GB declared, 144 KB on disk) parses to the SHIPPED geometry: num_layers 50,
+   hidden 5376, heads 56, head_dim 128, ffn 14336, latents 24, audio_latents 32, patch
+   1x2x2, text_dim 5120 - the same numbers the working GGUF arm derives from shapes
+   alone. `minimax-h3-gen --dit <dir> --dump-params` prints all 20 fields on it.
+
+**Not claimed here.** No device load of the real 66.3 GB release (no streaming device
+loader ships in this row - see §8.14), no measured peak RSS, and no bf16-vs-quantized
+RENDER or SPEED comparison. The bf16-vs-quant quality question is UNBLOCKED, not
+answered.

@@ -1424,6 +1424,87 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
                                                           const SafetensorsFile& file,
                                                           MiniMaxH3DitParams* out_params = nullptr);
 
+// ---------------------------------------------------------------------------
+// The ORIGINAL bf16 release: 13 safetensors shards, 66.3 GB
+// (minimax_h3_sharded.cpp + the streamer in minimax_h3_device.cpp)
+// ---------------------------------------------------------------------------
+//
+// Every H3 render so far used a QUANTIZED DiT, and H3 is unusually
+// quantization-sensitive (Q3_K_M -> Q4_K_M alone turned a murky lattice into a
+// photoreal frame; ComfyUI PR 15298 traces it to the partial split-half RoPE
+// producing channel-wise magnitude outliers that corrupt even INT8). Answering
+// "what does FULL PRECISION look like?" needs the original release, and every
+// DiT loader before this one took a SINGLE file.
+
+// The upstream `MINIMAX_H3_FP32_PARAM_NAMES` / `_BUFFER_NAMES` split
+// (minimax_h3_transformer.py:85-101): both patch projections, both time-embedder
+// projections, both output heads and `rope.inv_freq` stay FP32 even in a bf16
+// stream. This is LOAD-BEARING, not a precision nicety — their activations are
+// f32 and `vt::MatmulBT` REJECTS a mixed (f32 activation, bf16 weight) pair, so a
+// tensor on the wrong side of this line fails loudly at the first island GEMM.
+// Single-sourced here because all four staging paths must agree on it.
+bool MiniMaxH3IsFp32IslandTensor(const std::string& name);
+
+// A MULTI-SHARD safetensors checkpoint, resolved through its
+// `model.safetensors.index.json` weight map. The index is USED, never guessed
+// around: a tensor the index names but whose shard does not contain it throws BY
+// NAME instead of being silently skipped (a skipped weight reads as zeros later,
+// which is a plausible-looking render rather than an error).
+//
+// Shape mirrors `LoadMiniMaxH3EncoderWeights(const std::vector<SafetensorsFile>&,
+// ...)` — one index over every shard, so a tensor is found wherever it lives.
+// Every shard is mmap'd read-only; nothing is materialized at Open() time, which
+// is why this is safe on a checkpoint far larger than RAM.
+class MiniMaxH3ShardedCheckpoint {
+ public:
+  // `dir` holds the shards and their index. `model.safetensors.index.json` is the
+  // name the H3 release ships; `diffusion_pytorch_model.safetensors.index.json`
+  // (the diffusers spelling) is accepted as well. Throws naming `dir` when
+  // neither exists.
+  static MiniMaxH3ShardedCheckpoint Open(const std::string& dir);
+  // Whether `path` is a directory holding one of those indexes — the test a
+  // caller with a single `--dit` flag uses to tell a directory from a file.
+  static bool IsShardedDir(const std::string& path);
+
+  MiniMaxH3ShardedCheckpoint();
+  ~MiniMaxH3ShardedCheckpoint();
+  MiniMaxH3ShardedCheckpoint(MiniMaxH3ShardedCheckpoint&&) noexcept;
+  MiniMaxH3ShardedCheckpoint& operator=(MiniMaxH3ShardedCheckpoint&&) noexcept;
+  MiniMaxH3ShardedCheckpoint(const MiniMaxH3ShardedCheckpoint&) = delete;
+  MiniMaxH3ShardedCheckpoint& operator=(const MiniMaxH3ShardedCheckpoint&) = delete;
+
+  // Every tensor the index names, in index order.
+  const std::vector<std::string>& Names() const;
+  bool Has(const std::string& name) const;
+  // Throws BY NAME when the index does not name `name`.
+  const StTensor& Get(const std::string& name) const;
+  // The shard FILENAME `name` was resolved to — the gateable answer to "did this
+  // tensor come out of the right shard?".
+  const std::string& ShardOf(const std::string& name) const;
+  const std::vector<std::string>& ShardFiles() const;
+  const std::string& IndexPath() const;
+  size_t ShardCount() const;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+// Names + shapes (+ the fp32-island flag) over every shard, the same manifest the
+// GGUF and NVFP4 arms build — so `ParseMiniMaxH3DitParamsFromGgufManifest` derives
+// the geometry from SHAPES ALONE here too, and a sharded checkpoint and a
+// single-file one that hold the same tensors produce IDENTICAL params.
+std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3ShardedTensors(
+    const MiniMaxH3ShardedCheckpoint& ckpt);
+
+// The REFERENCE (non-streaming) multi-shard loader: materialize every tensor as
+// host f32 and bind the forward's views, exactly as LoadMiniMaxH3DitFromNvfp4
+// does for the single-file NVFP4 arm. It is the CPU path for small checkpoints
+// and the comparison baseline a device streamer is gated against; on the REAL
+// 66.3 GB release it would need ~132 GB of host f32 and must NOT be used — that
+// release needs a streaming device loader, which this row does not yet ship.
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromShards(const MiniMaxH3ShardedCheckpoint& ckpt);
+
 MiniMaxH3DitDeviceWeights StageMiniMaxH3DitWeights(vt::Queue& queue,
                                                    const MiniMaxH3DitParams& params,
                                                    const MiniMaxH3DitWeights& host,

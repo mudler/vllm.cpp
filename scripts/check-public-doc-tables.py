@@ -331,7 +331,13 @@ STATUS_RATCHET = {
     # exactly on it: a ratchet pinned to the byte turns every concurrently
     # merged row's one-line status edit into a spurious failure. Still strictly
     # DOWN from 284062, the only direction this number may move.
-    "chars": 283470,
+    #
+    # 283455 since 2026-08-07 (measured 283433): the MiniMax-H3 row had to carry
+    # a new claim (the ORIGINAL bf16 13-shard DiT release is now indexable), and
+    # it was paid for inside the same cell rather than out of the page - the
+    # ref2va activation-diff narrative collapsed to its binding result, with the
+    # full guilty-class audit kept in .agents/specs/minimax-h3.md 8.12. Net -6.
+    "chars": 283455,
     "h2_sections": 11,
     "long_paragraphs": 89,
     "oversized_cells": 47,

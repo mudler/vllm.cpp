@@ -567,6 +567,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_planner.cpp
   src/vllm/model_executor/models/minimax_h3_gguf.cpp
   src/vllm/model_executor/models/minimax_h3_nvfp4.cpp
+  src/vllm/model_executor/models/minimax_h3_sharded.cpp
   src/vllm/model_executor/models/minimax_h3_audio_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae_device.cpp

@@ -1097,12 +1097,9 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
   // projections, both time-embedder projections and both output heads stay f32 even
   // in a bf16 stream. Their ACTIVATIONS are f32 too, and vt::MatmulBT rejects a
   // mixed (f32 act, bf16 weight) pair — so getting this split wrong is not a
-  // precision nuance, it fails loudly at the first island GEMM.
-  auto is_fp32_island = [](const std::string& n) {
-    return n.rfind("video_patch_proj.", 0) == 0 || n.rfind("audio_patch_proj.", 0) == 0 ||
-           n.rfind("time_embedder.", 0) == 0 || n.rfind("final_layer.video_out.", 0) == 0 ||
-           n.rfind("final_layer.audio_out.", 0) == 0 || n == "rope.inv_freq";
-  };
+  // precision nuance, it fails loudly at the first island GEMM. Single-sourced in
+  // MiniMaxH3IsFp32IslandTensor so every staging path agrees on it.
+  auto is_fp32_island = [](const std::string& n) { return MiniMaxH3IsFp32IslandTensor(n); };
   int64_t done = 0;
   for (const MiniMaxH3TensorSpec& spec : manifest) {
     const GgufTensorInfo& info = file.Get(spec.name);
@@ -1187,11 +1184,7 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
   // Same fp32 ISLANDS as the GGUF stream: vt::MatmulBT rejects a mixed
   // (f32 activation, bf16 weight) pair, so this split is load-bearing, not a
   // precision nicety.
-  auto is_fp32_island = [](const std::string& n) {
-    return n.rfind("video_patch_proj.", 0) == 0 || n.rfind("audio_patch_proj.", 0) == 0 ||
-           n.rfind("time_embedder.", 0) == 0 || n.rfind("final_layer.video_out.", 0) == 0 ||
-           n.rfind("final_layer.audio_out.", 0) == 0 || n == "rope.inv_freq";
-  };
+  auto is_fp32_island = [](const std::string& n) { return MiniMaxH3IsFp32IslandTensor(n); };
 
   // Pass 1: LOGICAL shapes only (no payload), so geometry is known before any
   // allocation. A packed [out, in/2] U8 weight is logically [out, in].
@@ -1327,11 +1320,7 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
     return (n.size() > 12 && n.compare(n.size() - 12, 12, "weight_scale") == 0) ||
            (n.size() > 14 && n.compare(n.size() - 14, 14, "weight_scale_2") == 0);
   };
-  auto is_fp32_island = [](const std::string& n) {
-    return n.rfind("video_patch_proj.", 0) == 0 || n.rfind("audio_patch_proj.", 0) == 0 ||
-           n.rfind("time_embedder.", 0) == 0 || n.rfind("final_layer.video_out.", 0) == 0 ||
-           n.rfind("final_layer.audio_out.", 0) == 0 || n == "rope.inv_freq";
-  };
+  auto is_fp32_island = [](const std::string& n) { return MiniMaxH3IsFp32IslandTensor(n); };
 
   // Pass 1: logical shapes (U8 packed [out, in/2] is logically [out, in]).
   std::vector<MiniMaxH3TensorSpec> manifest;

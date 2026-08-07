@@ -81,16 +81,24 @@ std::vector<float> MiniMaxH3ReadSafetensorF32(const StTensor& tensor) {
     VT_CHECK(tensor.nbytes == static_cast<size_t>(numel) * 4,
              "minimax_h3: F32 tensor span does not match its shape");
     std::memcpy(out.data(), tensor.data, tensor.nbytes);
-  } else if (tensor.dtype == "BF16") {
+  } else if (tensor.dtype == "BF16" || tensor.dtype == "F16") {
     VT_CHECK(tensor.nbytes == static_cast<size_t>(numel) * 2,
-             "minimax_h3: BF16 tensor span does not match its shape");
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(tensor.data);
-    for (int64_t i = 0; i < numel; ++i) out[static_cast<size_t>(i)] = Bf16ToF32(src[i]);
-  } else if (tensor.dtype == "F16") {
-    VT_CHECK(tensor.nbytes == static_cast<size_t>(numel) * 2,
-             "minimax_h3: F16 tensor span does not match its shape");
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(tensor.data);
-    for (int64_t i = 0; i < numel; ++i) out[static_cast<size_t>(i)] = F16ToF32(src[i]);
+             "minimax_h3: 16-bit tensor span does not match its shape");
+    // Byte-wise load, NOT `reinterpret_cast<const uint16_t*>(tensor.data)[i]`.
+    // safetensors puts the payload immediately after a JSON header of ARBITRARY
+    // length, so a tensor's first byte is only 2-byte aligned if the writer
+    // happened to pad; the format does not require it. The cast was UB on such a
+    // file and UBSan caught it ("load of misaligned address ... requires 2 byte
+    // alignment") the first time a checkpoint with an odd header reached this
+    // path. memcpy has no alignment precondition and compiles to the same load
+    // where the address does happen to be aligned.
+    const auto* bytes = static_cast<const unsigned char*>(tensor.data);
+    const bool bf16 = (tensor.dtype == "BF16");
+    for (int64_t i = 0; i < numel; ++i) {
+      uint16_t bits;
+      std::memcpy(&bits, bytes + static_cast<size_t>(i) * 2, sizeof(bits));
+      out[static_cast<size_t>(i)] = bf16 ? Bf16ToF32(bits) : F16ToF32(bits);
+    }
   } else {
     VT_CHECK(false, "minimax_h3: unsupported tensor dtype (expected F32/BF16/F16)");
   }

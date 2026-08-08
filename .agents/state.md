@@ -43120,6 +43120,21 @@ F79-4 remain open on the landed tree; the review's merge-and-fix map is the
 binding description. Pi concurrency, BF16 GEMM/speed closure (W6) stay open
 as the lane's own next steps.
 
+## 2026-08-08 — Release manifest W5 claimed after #129 merged
+<!-- state: 2026-08-08T21:00 -->
+
+PR #129 merged the accepted `ENG-RELEASE-BINARIES` spike at `b38f78a7`.
+The issue/PR search found no duplicate open release implementation claim, and
+the current tree still has no versioned manifest schema, generator, validator,
+or manifest fixtures. `CLAIM-ENG-RELEASE-BINARIES-W5` now owns only that W5
+slice in `/home/mudler/_git/vllm.cpp-release-binaries` on
+`row/ENG-RELEASE-BINARIES`; a new draft PR opened from this checkpoint is the
+claim. Implementation has not started. The row stays `SPIKE`, and every archive,
+runtime, correctness, performance, CUDA-fat, CPU-tier, install, and publication
+claim remains pending. Next: add deterministic RED-first fixtures that prove
+the four evidence states and reject missing or inconsistent host/backend,
+CPU-tier, CUDA-SM, dependency, channel, and static-boundary metadata.
+
 ## 2026-08-08 — ROCm approach-(b): unified memory true by construction on integrated APUs
 <!-- state: 2026-08-08T21:30 -->
 
@@ -43242,6 +43257,27 @@ memberships (incl. `MistralModel`) unregistered. (3) `/pooling`, `/score`,
 (5) `vllm_embed` batches sequentially through the synchronous engine
 (recorded deviation; AsyncLLM stays generation-only).
 
+## 2026-08-08 — Release manifest W5 implemented; release row is ACTIVE
+<!-- state: 2026-08-08T22:00 -->
+
+Draft PR #141 implements only `ENG-RELEASE-BINARIES` W5: versioned schema
+`vllm.cpp.release-manifest.v1`, a deterministic stdlib-only build-time
+generator/validator, and canonical synthetic CPU/CUDA fixtures. The 13-test
+suite mutates schema identity, required and unknown fields, all four evidence
+states, every current x86 CPU tier, all ten primary CUDA SMs and six available
+AOT mappings, backend flags, preview/stable publication evidence, dependencies,
+static boundaries, host ABI and duplicate/non-deterministic inputs. CI and
+preflight register it fail-closed; the accepted release-contract suite remains
+green at 30/30.
+
+This is contract tooling, not release evidence. Fixture `passed` states are
+synthetic and cannot satisfy an artifact gate. W1-W4 and W6-W13 remain pending;
+there is no server install/package target, archive, staged-archive result,
+runtime/correctness/performance result, SBOM/provenance for published bytes, or
+publication workflow. The required x86 CUDA-13 ten-SM fat-build hardware and
+toolchain are unavailable in this worktree. The row advances from `SPIKE` to
+`ACTIVE`, never `DONE` or `GATING`.
+
 ## 2026-08-08 — PR #140 ROCm gfx1201 + Gemma-4-26B-A4B MoE landed with contributor authorship preserved + operator hardening
 <!-- state: 2026-08-08T22:30 -->
 
@@ -43313,6 +43349,33 @@ Row moved INVENTORIED→READY (roadmap_v1 + feature-matrix §2). M1-M4 are the i
 rows this unblocks; M1/M2/M4-CPU are CPU-completable, M3 (profile run) is
 dgx-gated. Records-only spike (no code).
 
+## 2026-08-08 — Release manifest W5 fresh-review contract repair
+<!-- state: 2026-08-08T23:00 -->
+
+Fresh mutation review of draft PR #141 found seven independently surviving
+production removals: schema type, enum and const enforcement; stable
+runtime/correctness evidence; required CPU bits; CUDA portable-fallback
+mapping; and CUDA AOT evidence-state rules. It also proved the unmodified
+validator accepted `schema_version: true`, and that CPU manifests could invent
+kernel families or add CPU bits and OS probes.
+
+The repair makes schema equality JSON-type-strict (so booleans never equal
+integer constants), declares `schema_version` as integer const 1, and binds the
+current x86_64 and aarch64 CPU tiers to exact kernel-family, CPU-bit and OS-probe
+inventories grounded in the compiled selectors. Linux aarch64 uses
+`getauxval(AT_HWCAP2) & HWCAP2_I8MM`; Darwin uses
+`sysctl:hw.optional.arm.FEAT_I8MM`. No independent VNNI, AMX, BF16 or DotProd
+tier is advertised because no separately gated current kernel tier exists.
+The focused suite is 17/17, and isolated mutation runs kill all seven original
+production-removal classes. Four readable JSON goldens moved byte-for-byte
+under `tests/scripts/fixtures/` so CI's documented fixture exemption applies;
+the checker and fixtures were not compacted or weakened.
+
+This remains W5 contract tooling with synthetic fixtures. W1-W4 and W6-W13,
+all archives and staged smoke, real runtime/correctness/performance evidence,
+and publication remain pending. `ENG-RELEASE-BINARIES` stays `ACTIVE`; no
+artifact, backend, runtime, performance or release-channel claim advances.
+
 ## 2026-08-08 — ROAD-V1-MEM M1+M2 LANDED: absolute --kv-cache-memory knob + group-aware bytes-per-block (CPU brick)
 <!-- state: 2026-08-08T23:30 -->
 
@@ -43332,6 +43395,31 @@ MLA no-factor-2 / hybrid-excludes-mamba / het-KV per-layer / divisor),
 `test_capi` 49/49 incl. v16 round-trip, `test_model_loader_gguf` 3/3, CPU build
 clean -Werror. M3 (the `gpu_memory_utilization` device profile run) stays
 dgx-gated; until it lands the util branch falls back to 256. Row `M1+M2 DONE`.
+
+## 2026-08-08 — Release manifest W5 scoped re-review test repair
+<!-- state: 2026-08-08T23:30 -->
+
+Scoped re-review found that two Python/JSON identity guards and the required
+CUDA NVIDIA-driver declaration were enforced in production but not each pinned
+by an independent test. Two named tests close those holes. One directly asserts
+that JSON `true` is neither the integer schema type nor equal to integer constant
+`1`; the other removes `nvidia-driver` from an otherwise valid CUDA manifest and
+requires the exact missing-driver diagnostic. The existing integration rejection
+of `schema_version: true` and arbitrary-driver rejection remain intact.
+
+All three source-removal mutations are independently red: removing the bool
+exclusion fails only the direct integer-type assertion, removing JSON type
+identity fails only the direct constant assertion, and removing the named
+`require_external` call leaves the missing-driver manifest error-free and fails
+the exact diagnostic assertion. Restored production is 19/19; the cumulative
+fresh-review removal battery is 10/10, with the accepted release contract still
+30/30.
+
+This is tests-and-records hardening over unchanged W5 tooling. Fixtures remain
+byte-identical and synthetic. W1-W4 and W6-W13, all archives and staged smoke,
+real runtime/correctness/performance evidence, and publication remain pending.
+`ENG-RELEASE-BINARIES` stays `ACTIVE`; no artifact or release-channel claim
+advances.
 
 ## 2026-08-08 — TP-W1 LANDED: rank-layout group table (parallel_layout.h) + LoadedModel TP handle
 <!-- state: 2026-08-08T23:45 -->
@@ -43355,6 +43443,26 @@ inertness and thread_local isolation. No regression: existing `test_tp_forward`
 additive/byte-neutral). Header-only, no CMake wiring beyond the test. Next: TP-W2
 (row/input-dim shard + rank-0 bias + per-rank Hq/Hkv + QKV kv-replication + vocab
 embed/lm_head + logits all-gather).
+
+## 2026-08-08 — clean-CI live-row audit and embedding lifecycle repair
+<!-- state: 2026-08-08T23:45 -->
+
+PR #141 exposed a host-dependent record gate: `audit-live-rows.py` counted
+local `refs/heads/row/*` as repo-wide claim evidence, so this workstation's
+stale local `row/MODEL-EMBED-llama-llama-for-causal-lm` ref made preflight
+green while a clean GitHub checkout correctly reported that ACTIVE row
+ABANDONED. A RED-first unit test now proves local-only refs are ignored; only
+fetched remote `row/*` refs can materialize shared in-flight evidence.
+
+With the false local evidence removed, the record's real lifecycle error was
+visible. The ROW 6 implementation is already on main at `57ed063e`, but only
+`LlamaModel` of eight memberships is registered and the real-checkpoint
+`vllm.LLM(task="embed")` cosine gate has not run. Per the lifecycle contract,
+the model row is therefore `PARTIAL`, not `ACTIVE`; its checklist counts,
+closed-PR wording, coordination scope, NOW snapshot and all three obligated
+public surfaces now say so. No implementation, runtime result or release W5
+artifact claim changes. The focused audit suite is 42/42 and the clean audit
+reports 0 abandoned ACTIVE rows.
 
 ## 2026-08-08 — FIX: device-leakage regression on main (async readback becomes a Backend capability) — unblocks 3 contributor PRs
 <!-- state: 2026-08-09T00:05 -->

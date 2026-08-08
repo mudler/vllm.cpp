@@ -1,0 +1,377 @@
+{
+  "artifact": {
+    "channel": "preview",
+    "id": "linux-x86_64-glibc-cuda-fat",
+    "kind": "primary",
+    "static_boundary": "static-core",
+    "version": "0.1.0-test"
+  },
+  "backend": {
+    "flags": {
+      "MLX_ROOT": "",
+      "VLLM_CPP_BUILD_EXAMPLES": true,
+      "VLLM_CPP_BUILD_TESTS": true,
+      "VLLM_CPP_CUDA": true,
+      "VLLM_CPP_CUDA_ARCHITECTURES": [
+        "80",
+        "86",
+        "87",
+        "89",
+        "90a",
+        "100a",
+        "103a",
+        "110",
+        "120a",
+        "121a"
+      ],
+      "VLLM_CPP_HIP": false,
+      "VLLM_CPP_HIP_ARCHITECTURES": [],
+      "VLLM_CPP_METAL": false,
+      "VLLM_CPP_MLX": false,
+      "VLLM_CPP_SERVER": true,
+      "VLLM_CPP_TRITON": true,
+      "VLLM_CPP_VULKAN": false
+    },
+    "gpu_driver_boundary": "external-host-never-bundled",
+    "name": "cuda"
+  },
+  "build": {
+    "compiler": "GNU C++ 13.2.0",
+    "resolved_cmake_options": {
+      "MLX_ROOT": "",
+      "VLLM_CPP_BUILD_EXAMPLES": true,
+      "VLLM_CPP_BUILD_TESTS": true,
+      "VLLM_CPP_CUDA": true,
+      "VLLM_CPP_CUDA_ARCHITECTURES": [
+        "80",
+        "86",
+        "87",
+        "89",
+        "90a",
+        "100a",
+        "103a",
+        "110",
+        "120a",
+        "121a"
+      ],
+      "VLLM_CPP_HIP": false,
+      "VLLM_CPP_HIP_ARCHITECTURES": [],
+      "VLLM_CPP_METAL": false,
+      "VLLM_CPP_MLX": false,
+      "VLLM_CPP_SERVER": true,
+      "VLLM_CPP_TRITON": true,
+      "VLLM_CPP_VULKAN": false
+    },
+    "source_clean": true,
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "test_commands": [
+      "cmake --build build --target vllm",
+      "ctest --test-dir build"
+    ],
+    "toolchain": "cmake-3.30+ninja-1.12"
+  },
+  "cuda": {
+    "compiled_sms": [
+      "80",
+      "86",
+      "87",
+      "89",
+      "90a",
+      "100a",
+      "103a",
+      "110",
+      "120a",
+      "121a"
+    ],
+    "sm_evidence": [
+      {
+        "aot_available": true,
+        "aot_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "portable_fallback": false,
+        "runtime_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "sm": "80"
+      },
+      {
+        "aot_available": true,
+        "aot_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "portable_fallback": false,
+        "runtime_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "sm": "86"
+      },
+      {
+        "aot_available": false,
+        "aot_evidence": {
+          "command": "",
+          "reason": "synthetic cross-build has no matching runtime host",
+          "result": "",
+          "state": "not-applicable",
+          "url": ""
+        },
+        "portable_fallback": true,
+        "runtime_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "sm": "87"
+      },
+      {
+        "aot_available": true,
+        "aot_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "portable_fallback": false,
+        "runtime_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "sm": "89"
+      },
+      {
+        "aot_available": true,
+        "aot_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "portable_fallback": false,
+        "runtime_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "sm": "90a"
+      },
+      {
+        "aot_available": true,
+        "aot_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "portable_fallback": false,
+        "runtime_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "sm": "100a"
+      },
+      {
+        "aot_available": false,
+        "aot_evidence": {
+          "command": "",
+          "reason": "synthetic cross-build has no matching runtime host",
+          "result": "",
+          "state": "not-applicable",
+          "url": ""
+        },
+        "portable_fallback": true,
+        "runtime_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "sm": "103a"
+      },
+      {
+        "aot_available": false,
+        "aot_evidence": {
+          "command": "",
+          "reason": "synthetic cross-build has no matching runtime host",
+          "result": "",
+          "state": "not-applicable",
+          "url": ""
+        },
+        "portable_fallback": true,
+        "runtime_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "sm": "110"
+      },
+      {
+        "aot_available": false,
+        "aot_evidence": {
+          "command": "",
+          "reason": "synthetic cross-build has no matching runtime host",
+          "result": "",
+          "state": "not-applicable",
+          "url": ""
+        },
+        "portable_fallback": true,
+        "runtime_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "sm": "120a"
+      },
+      {
+        "aot_available": true,
+        "aot_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "portable_fallback": false,
+        "runtime_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "sm": "121a"
+      }
+    ]
+  },
+  "dependencies": [
+    {
+      "bundled": false,
+      "kind": "driver",
+      "linkage": "external",
+      "name": "nvidia-driver",
+      "role": "external-runtime",
+      "version": ">=580"
+    },
+    {
+      "bundled": false,
+      "kind": "library",
+      "linkage": "dynamic",
+      "name": "glibc",
+      "role": "runtime",
+      "version": "2.31"
+    }
+  ],
+  "evidence": {
+    "archive_smoke": {
+      "command": "cmake --build build --target vllm",
+      "reason": "",
+      "result": "exit 0",
+      "state": "passed",
+      "url": "https://example.invalid/evidence/passed"
+    },
+    "build": {
+      "command": "cmake --build build --target vllm",
+      "reason": "",
+      "result": "exit 0",
+      "state": "passed",
+      "url": "https://example.invalid/evidence/passed"
+    },
+    "correctness": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    },
+    "dependency_audit": {
+      "command": "cmake --build build --target vllm",
+      "reason": "",
+      "result": "exit 0",
+      "state": "passed",
+      "url": "https://example.invalid/evidence/passed"
+    },
+    "performance": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    },
+    "runtime": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    }
+  },
+  "host": {
+    "abi": "glibc",
+    "abi_version": "2.31",
+    "arch": "x86_64",
+    "os": "linux"
+  },
+  "supply_chain": {
+    "archive_checksum": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    },
+    "licenses": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    },
+    "provenance": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    },
+    "sbom": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    }
+  }
+}

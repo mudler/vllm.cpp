@@ -127,75 +127,78 @@ GUARD_MAP_KEYS = {
 RECORD_ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
-    ".agents/NOW.md": "| Release | SPIKE; 30/30 | #129 |",
+    ".agents/NOW.md": (
+        "| Release | **ACTIVE; W5 19/19+10/10; contract 30/30** |"
+    ),
     ".agents/coordination.md": (
-        "| `CLAIM-ENG-RELEASE-BINARIES-SPIKE` | "
-        "`ENG-RELEASE-BINARIES` |"
+        "| `CLAIM-ENG-RELEASE-BINARIES-W5` | "
+        "`ENG-RELEASE-BINARIES` (`ACTIVE`; W5 only) |"
     ),
     ".agents/state.md": (
-        "## 2026-08-07 — Release matrix revised: fat CUDA and adaptive CPU "
-        "are the primary downloads"
+        "## 2026-08-08 — Release manifest W5 implemented; release row is ACTIVE"
     ),
-    "docs/STATUS.md": (
-        "#129: SPIKE∅"
-    ),
+    "docs/STATUS.md": "#141 W5 19/19 ACTIVE ART∅",
     "docs/BENCHMARKS.md": (
-        "| **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`:"
+        "| **Binary release matrix (ACTIVE; W5 implemented)** | "
+        "`ENG-RELEASE-BINARIES`:"
     ),
 }
 
 LIFECYCLE_RECORD_MUTATIONS = (
     (
         ".agents/engine-matrix.md",
-        "`SPIKE` | `CLAIM-ENG-RELEASE-BINARIES-SPIKE` |",
-        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-SPIKE` |",
+        "`ACTIVE` | `CLAIM-ENG-RELEASE-BINARIES-W5` |",
+        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-W5` |",
         "engine-matrix release lifecycle",
     ),
     (
         ".agents/engine-matrix.md",
-        "gaps remain; no install/archive/publish implementation",
-        "gaps closed; install/archive/publish implementation complete",
+        "install/archive/publish implementation and all real release evidence "
+        "remain pending",
+        "install/archive/publish implementation and all real release evidence "
+        "are complete",
         "engine-matrix release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "`SPIKE` | Fresh review of PR #129",
-        "`DONE` | Fresh review of PR #129",
+        "`ACTIVE` | W5 versioned manifest schema/generator",
+        "`DONE` | W5 versioned manifest schema/generator",
         "roadmap release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "bundle work; no archive exists",
-        "bundle work complete; archive exists",
+        "no archive exists",
+        "archive exists",
         "roadmap release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "| `ACTIVE` | 2026-08-07 — user-reviewed revision complete: primary fat "
-        "CUDA + adaptive CPU per host ABI, optional per-SM diagnostics; row stays "
-        "`SPIKE`; awaiting fresh review |",
-        "| `DONE` | 2026-08-07 — user-reviewed revision complete: primary fat "
-        "CUDA + adaptive CPU per host ABI, optional per-SM diagnostics; row stays "
-        "`SPIKE`; awaiting fresh review |",
+        "| `ACTIVE` | 2026-08-08 — W5 19/19; fresh-review production removals "
+        "10/10 killed; accepted release suite 30/30; no archive or real "
+        "runtime/correctness/performance evidence |",
+        "| `DONE` | 2026-08-08 — W5 19/19; fresh-review production removals "
+        "10/10 killed; accepted release suite 30/30; "
+        "archive and runtime/correctness/performance evidence complete |",
         "coordination release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "no CMake, workflow, source, test, or artifact implementation",
-        "CMake, workflow, source, test, and artifact implementation complete",
+        "Excludes W1-W4, W6-W13, archives, install/package/publish workflows and "
+        "runtime artifacts",
+        "Includes W1-W13, archives, install/package/publish workflows and "
+        "runtime artifacts",
         "coordination release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "row stays `SPIKE`; awaiting fresh review",
-        "row is `DONE`; release shipped",
+        "no archive or real runtime/correctness/performance evidence",
+        "release archive and runtime/correctness/performance evidence shipped",
         "coordination release lifecycle",
     ),
     (
         ".agents/state.md",
-        "`ENG-RELEASE-BINARIES` remains `SPIKE`, and no archive or implementation "
-        "is\nclaimed.",
-        "`ENG-RELEASE-BINARIES` is `DONE`, with archive and implementation.",
+        "`ACTIVE`, never `DONE` or `GATING`.",
+        "`DONE`, with every release gate complete.",
         "state release lifecycle",
     ),
 )
@@ -235,17 +238,16 @@ HUMAN_WORK_IDS = (
 PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
-        "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states; 30 tests GREEN. No archive, "
-        "staged smoke, runtime, correctness, or performance evidence",
+        "**PENDING:** W1-W4/W6-W13 and all archive/staged-smoke/runtime/"
+        "correctness/performance gates",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
         "docs/BENCHMARKS.md release row",
     ),
     (
         "docs/STATUS.md",
-        "Supported (subset); #129: SPIKE∅",
-        "Supported; #129: SHIPPED",
+        "Subset; #141 W5 19/19 ACTIVE ART∅",
+        "Supported; #141: RELEASE DONE/ARTIFACTS✓",
         "docs/STATUS.md release row",
     ),
 )
@@ -283,7 +285,9 @@ PRIMARY_ARTIFACT_PROSE_MUTATIONS = (
 )
 
 EXACT_MACHINE_FIELDS = {
-    "lifecycle": "SPIKE",
+    "lifecycle": "ACTIVE",
+    "manifest_schema": "vllm.cpp.release-manifest.v1",
+    "work_W5_status": "implemented",
     "work_W12_policy": "optional-non-blocking",
     "archive_claims": "pending",
     "runtime_claims": "pending",
@@ -297,7 +301,8 @@ EXACT_MACHINE_FIELDS = {
     "required_anchor_paths": (
         ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
         ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
-        "docs/BENCHMARKS.md"
+        "docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,"
+        "scripts/release_manifest.py,tests/scripts/test_release_manifest.py"
     ),
 }
 
@@ -812,8 +817,8 @@ class AcceptedDesignMutations(unittest.TestCase):
                 mutate(
                     root,
                     self.SPEC,
-                    "lifecycle=SPIKE",
-                    f"lifecycle=SPIKE\n{field}={value}",
+                    "lifecycle=ACTIVE",
+                    f"lifecycle=ACTIVE\n{field}={value}",
                 )
                 bypass_unknown_field_enforcement(root)
                 result = run_checker(root)

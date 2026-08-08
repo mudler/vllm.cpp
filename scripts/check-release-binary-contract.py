@@ -55,91 +55,94 @@ WORK_DEPS = {
 ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
-    ".agents/NOW.md": "| Release | SPIKE; 30/30 | #129 |",
+    ".agents/NOW.md": (
+        "| Release | **ACTIVE; W5 19/19+10/10; contract 30/30** |"
+    ),
     ".agents/coordination.md": (
-        "| `CLAIM-ENG-RELEASE-BINARIES-SPIKE` | "
-        "`ENG-RELEASE-BINARIES` |"
+        "| `CLAIM-ENG-RELEASE-BINARIES-W5` | "
+        "`ENG-RELEASE-BINARIES` (`ACTIVE`; W5 only) |"
     ),
     ".agents/state.md": (
-        "## 2026-08-07 — Release matrix revised: fat CUDA and adaptive CPU "
-        "are the primary downloads"
+        "## 2026-08-08 — Release manifest W5 implemented; release row is ACTIVE"
     ),
-    "docs/STATUS.md": (
-        "#129: SPIKE∅"
-    ),
+    "docs/STATUS.md": "#141 W5 19/19 ACTIVE ART∅",
     "docs/BENCHMARKS.md": (
-        "| **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`:"
+        "| **Binary release matrix (ACTIVE; W5 implemented)** | "
+        "`ENG-RELEASE-BINARIES`:"
     ),
 }
 
 LIFECYCLE_RECORD_MUTATIONS = (
     (
         ".agents/engine-matrix.md",
-        "`SPIKE` | `CLAIM-ENG-RELEASE-BINARIES-SPIKE` |",
-        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-SPIKE` |",
+        "`ACTIVE` | `CLAIM-ENG-RELEASE-BINARIES-W5` |",
+        "`DONE` | `CLAIM-ENG-RELEASE-BINARIES-W5` |",
         "engine-matrix release lifecycle",
     ),
     (
         ".agents/engine-matrix.md",
-        "gaps remain; no install/archive/publish implementation",
-        "gaps closed; install/archive/publish implementation complete",
+        "install/archive/publish implementation and all real release evidence "
+        "remain pending",
+        "install/archive/publish implementation and all real release evidence "
+        "are complete",
         "engine-matrix release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "`SPIKE` | Fresh review of PR #129",
-        "`DONE` | Fresh review of PR #129",
+        "`ACTIVE` | W5 versioned manifest schema/generator",
+        "`DONE` | W5 versioned manifest schema/generator",
         "roadmap release lifecycle",
     ),
     (
         ".agents/roadmap_v1.md",
-        "bundle work; no archive exists",
-        "bundle work complete; archive exists",
+        "no archive exists",
+        "archive exists",
         "roadmap release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "| `ACTIVE` | 2026-08-07 — user-reviewed revision complete: primary fat "
-        "CUDA + adaptive CPU per host ABI, optional per-SM diagnostics; row stays "
-        "`SPIKE`; awaiting fresh review |",
-        "| `DONE` | 2026-08-07 — user-reviewed revision complete: primary fat "
-        "CUDA + adaptive CPU per host ABI, optional per-SM diagnostics; row stays "
-        "`SPIKE`; awaiting fresh review |",
+        "| `ACTIVE` | 2026-08-08 — W5 19/19; fresh-review production removals "
+        "10/10 killed; accepted release suite 30/30; no archive or real "
+        "runtime/correctness/performance evidence |",
+        "| `DONE` | 2026-08-08 — W5 19/19; fresh-review production removals "
+        "10/10 killed; accepted release suite 30/30; "
+        "archive and runtime/correctness/performance evidence complete |",
         "coordination release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "no CMake, workflow, source, test, or artifact implementation",
-        "CMake, workflow, source, test, and artifact implementation complete",
+        "Excludes W1-W4, W6-W13, archives, install/package/publish workflows and "
+        "runtime artifacts",
+        "Includes W1-W13, archives, install/package/publish workflows and "
+        "runtime artifacts",
         "coordination release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "row stays `SPIKE`; awaiting fresh review",
-        "row is `DONE`; release shipped",
+        "no archive or real runtime/correctness/performance evidence",
+        "release archive and runtime/correctness/performance evidence shipped",
         "coordination release lifecycle",
     ),
     (
         ".agents/state.md",
-        "`ENG-RELEASE-BINARIES` remains `SPIKE`, and no archive or implementation "
-        "is\nclaimed.",
-        "`ENG-RELEASE-BINARIES` is `DONE`, with archive and implementation.",
+        "`ACTIVE`, never `DONE` or `GATING`.",
+        "`DONE`, with every release gate complete.",
         "state release lifecycle",
     ),
 )
 
 BENCHMARKS_RELEASE_ROW = (
-    "| **Binary release matrix (spiked)** | `ENG-RELEASE-BINARIES`: primary "
-    "host-ABI fat-CUDA + adaptive-CPU static-core bundles; optional per-SM "
-    "diagnostics; experimental literal-static musl CPU | **PENDING:** pins 10-SM "
-    "fat CUDA, adaptive no-AVX2 CPU, W1-W13/W10-W12 policy, public pending states; "
-    "30 tests GREEN. No archive, staged smoke, runtime, correctness, or performance "
-    "evidence "
-    "| n/a |"
+    "| **Binary release matrix (ACTIVE; W5 implemented)** | "
+    "`ENG-RELEASE-BINARIES`: versioned deterministic manifest for primary "
+    "host-ABI fat-CUDA + adaptive-CPU static-core bundles, optional per-SM "
+    "diagnostics and experimental literal-static musl CPU | **W5 GREEN:** "
+    "19/19 + ten review mutations killed; contract 30/30. Synthetic fixtures "
+    "only. **PENDING:** W1-W4/W6-W13 and all archive/staged-smoke/runtime/"
+    "correctness/performance gates | n/a |"
 )
 
 STATUS_RELEASE_FRAGMENTS = (
-    "Supported (subset); #129: SPIKE∅",
+    "Subset; #141 W5 19/19 ACTIVE ART∅",
 )
 
 BACKEND_POLICY_PROSE = {
@@ -293,17 +296,16 @@ WORK_CONTENT = {
 PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
-        "**PENDING:** pins 10-SM fat CUDA, adaptive no-AVX2 CPU, "
-        "W1-W13/W10-W12 policy, public pending states; 30 tests GREEN. No archive, "
-        "staged smoke, runtime, correctness, or performance evidence",
+        "**PENDING:** W1-W4/W6-W13 and all archive/staged-smoke/runtime/"
+        "correctness/performance gates",
         "**SHIPPED:** archive, runtime, correctness, and performance evidence "
         "complete",
         "docs/BENCHMARKS.md release row",
     ),
     (
         "docs/STATUS.md",
-        "Supported (subset); #129: SPIKE∅",
-        "Supported; #129: SHIPPED",
+        "Subset; #141 W5 19/19 ACTIVE ART∅",
+        "Supported; #141: RELEASE DONE/ARTIFACTS✓",
         "docs/STATUS.md release row",
     ),
 )
@@ -421,7 +423,9 @@ EXPECTED_GUARD_MAP_KEYS = {
 TEST_LITERAL_INVENTORIES = {
     "PRIMARY_CUDA_SMS": PRIMARY_CUDA_SMS,
     "EXACT_MACHINE_FIELDS": {
-        "lifecycle": "SPIKE",
+        "lifecycle": "ACTIVE",
+        "manifest_schema": "vllm.cpp.release-manifest.v1",
+        "work_W5_status": "implemented",
         "work_W12_policy": "optional-non-blocking",
         "archive_claims": "pending",
         "runtime_claims": "pending",
@@ -435,7 +439,8 @@ TEST_LITERAL_INVENTORIES = {
         "required_anchor_paths": (
             ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
             ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
-            "docs/BENCHMARKS.md"
+            "docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,"
+            "scripts/release_manifest.py,tests/scripts/test_release_manifest.py"
         ),
     },
     "EXPECTED_DEPS": {work: ",".join(deps) for work, deps in WORK_DEPS.items()},
@@ -578,7 +583,7 @@ TEST_INVENTORY_BODY_DIGESTS = {
     "GUARD_MAP_KEYS": "701e4821bee926c2e074dbf2b97ff4a93bebb610cc6bed76e06063cab8974758",
     "INVENTORY_CONSUMER_METHODS": "916894a32d88026a883cc1f316d949eb116ee1fced36d635b585d7bf3372b01d",
     "CONSUMER_FLOW_MUTATIONS": "6f69f9e361d38c325fbc455c31ec7211578131368624312e024448afdfc01e83",
-    "UNKNOWN_MACHINE_FIELD_MUTATIONS": "8d10128593c67c64cde8cbe7e58faa9a9ade0d4bde391d24474fd04d6392ed6b",
+    "UNKNOWN_MACHINE_FIELD_MUTATIONS": "b69a6bd26c8417e04994815042ba1520968b906d6bfee4b3413ffc0dafafc5f2",
     "HUMAN_WORK_DEPS": "54a501b903eb3c97023084393666f9f63d289ab9a78e22f389c32bfc1711573b",
     "BACKEND_POLICY_PROSE_MUTATIONS": "c5fea18a668932c4768cb9feb4746fd444b3df7e7ec15df1a588141898d28f2d",
     "PREFLIGHT_WIRING_MUTATIONS": "d442c6d188efd624bffc9e94a7750d6a527c7b693affde5cbc33304f9e95272e",
@@ -586,7 +591,9 @@ TEST_INVENTORY_BODY_DIGESTS = {
 }
 
 EXACT_MACHINE_FIELDS = {
-    "lifecycle": "SPIKE",
+    "lifecycle": "ACTIVE",
+    "manifest_schema": "vllm.cpp.release-manifest.v1",
+    "work_W5_status": "implemented",
     "work_W12_policy": "optional-non-blocking",
     "archive_claims": "pending",
     "runtime_claims": "pending",
@@ -600,7 +607,8 @@ EXACT_MACHINE_FIELDS = {
     "required_anchor_paths": (
         ".agents/engine-matrix.md,.agents/roadmap_v1.md,.agents/NOW.md,"
         ".agents/coordination.md,.agents/state.md,docs/STATUS.md,"
-        "docs/BENCHMARKS.md"
+        "docs/BENCHMARKS.md,docs/FEATURES.md,release/manifest-v1.schema.json,"
+        "scripts/release_manifest.py,tests/scripts/test_release_manifest.py"
     ),
 }
 
@@ -621,12 +629,10 @@ WORK_ROW = re.compile(
 )
 
 STATE_RELEASE_HEADING = (
-    "## 2026-08-07 — Release matrix revised: fat CUDA and adaptive CPU are the "
-    "primary downloads"
+    "## 2026-08-08 — Release manifest W5 implemented; release row is ACTIVE"
 )
 STATE_RELEASE_LIFECYCLE = (
-    "`ENG-RELEASE-BINARIES` remains `SPIKE`, and no archive or implementation "
-    "is claimed."
+    "The row advances from `SPIKE` to `ACTIVE`, never `DONE` or `GATING`."
 )
 
 
@@ -947,13 +953,18 @@ def wiring_errors(preflight_text: str, ci_text: str) -> list[str]:
         errors.append("release checker is missing from preflight CHECKERS")
     if suites is None or "test_check_release_binary_contract" not in suites:
         errors.append("release mutation suite is missing from preflight SUITES")
+    if suites is None or "test_release_manifest" not in suites:
+        errors.append("W5 manifest suite is missing from preflight SUITES")
     returncode, invocations = _trace_preflight_commands(preflight_text)
     checker_argv = ("scripts/check-release-binary-contract.py",)
     suite_argv = ("tests/scripts/test_check_release_binary_contract.py",)
+    manifest_suite_argv = ("tests/scripts/test_release_manifest.py",)
     if invocations.count(checker_argv) != 1:
         errors.append("preflight does not execute release CHECKERS through its checker loop")
     if invocations.count(suite_argv) != 1:
         errors.append("preflight does not execute release SUITES through its suite loop")
+    if invocations.count(manifest_suite_argv) != 1:
+        errors.append("preflight does not execute the W5 manifest suite exactly once")
     if returncode != 0:
         errors.append(f"instrumented preflight execution failed with rc={returncode}")
     active = _active_ci_commands(ci_text)
@@ -964,6 +975,8 @@ def wiring_errors(preflight_text: str, ci_text: str) -> list[str]:
         "tests/scripts/test_check_release_binary_contract.py",
     ) not in active:
         errors.append("release mutation suite is missing from the explicit CI step")
+    if ("python3", "tests/scripts/test_release_manifest.py") not in active:
+        errors.append("W5 manifest suite is missing from an unconditional CI step")
     if not _ci_has_active_release_step(ci_text):
         errors.append(
             "CI release step must contain checker and suite as direct active commands"
@@ -1015,12 +1028,14 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
         errors,
     )
     if engine is not None and (
-        engine[7] != "`SPIKE`"
-        or "gaps remain; no install/archive/publish implementation" not in engine[4]
+        engine[7] != "`ACTIVE`"
+        or "W5 schema" not in engine[4]
+        or "install/archive/publish implementation and all real release evidence "
+        "remain pending" not in engine[4]
     ):
         errors.append(
-            "engine-matrix release lifecycle must stay SPIKE and state that the "
-            "gaps remain with no install/archive/publish implementation"
+            "engine-matrix release lifecycle must be ACTIVE with W5 implemented "
+            "and install/archive/publish plus real evidence pending"
         )
 
     roadmap = _table_record(
@@ -1032,30 +1047,35 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
         errors,
     )
     if roadmap is not None and (
-        roadmap[5] != "`SPIKE`" or "no archive exists" not in roadmap[6]
+        roadmap[5] != "`ACTIVE`"
+        or "W5 versioned manifest" not in roadmap[6]
+        or "W1-W4 and W6-W13 remain pending" not in roadmap[6]
+        or "no archive exists" not in roadmap[6]
     ):
         errors.append(
-            "roadmap release lifecycle must stay SPIKE and state that no archive "
-            "exists"
+            "roadmap release lifecycle must be ACTIVE with W5 implemented while "
+            "W1-W4/W6-W13 and archives remain pending"
         )
 
     coordination = _table_record(
         root,
         ".agents/coordination.md",
-        "| `CLAIM-ENG-RELEASE-BINARIES-SPIKE` |",
+        "| `CLAIM-ENG-RELEASE-BINARIES-W5` |",
         8,
         "coordination release lifecycle",
         errors,
     )
     if coordination is not None and (
         coordination[6] != "`ACTIVE`"
-        or "no CMake, workflow, source, test, or artifact implementation"
+        or "W5 implemented"
         not in coordination[5]
-        or "row stays `SPIKE`; awaiting fresh review" not in coordination[7]
+        or "Excludes W1-W4, W6-W13" not in coordination[5]
+        or "no archive or real runtime/correctness/performance evidence"
+        not in coordination[7]
     ):
         errors.append(
-            "coordination release lifecycle must keep the claim ACTIVE while the "
-            "row stays SPIKE, awaiting review, with no implementation"
+            "coordination release lifecycle must keep W5 ACTIVE and implemented "
+            "while later work and real artifact evidence remain pending"
         )
 
     state_path = root / ".agents/state.md"
@@ -1076,8 +1096,8 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
             section = state_text[start:] if end < 0 else state_text[start:end]
             if STATE_RELEASE_LIFECYCLE not in _normalize_prose(section):
                 errors.append(
-                    "state release lifecycle must say ENG-RELEASE-BINARIES remains "
-                    "SPIKE with no archive or implementation claimed"
+                    "state release lifecycle must say W5 advances the row only to "
+                    "ACTIVE, never DONE or GATING"
                 )
     return errors
 
@@ -1283,10 +1303,13 @@ def contract_errors(root: Path) -> list[str]:
         if fields.get(key) != expected:
             errors.append(_field_error(key, fields.get(key), expected))
 
-    if "Status: accepted spike for `ENG-RELEASE-BINARIES`." not in text:
+    if (
+        "Status: accepted contract with W5 manifest tooling implemented for\n"
+        "`ENG-RELEASE-BINARIES`." not in text
+    ):
         errors.append(
-            "release spec identity/status line must name accepted spike "
-            "ENG-RELEASE-BINARIES"
+            "release spec identity/status line must name the accepted W5 "
+            "ENG-RELEASE-BINARIES contract"
         )
 
     header = "| Work | Deps | Deliverable | Exit gate |"
@@ -1363,7 +1386,7 @@ def contract_errors(root: Path) -> list[str]:
     )
     if not all(fragment in status_row for fragment in STATUS_RELEASE_FRAGMENTS):
         errors.append(
-            "docs/STATUS.md release row must stay SPIKED with no artifacts and no "
+            "docs/STATUS.md release row must stay ACTIVE/W5 with no artifacts or "
             "runtime claim"
         )
     preflight = root / PREFLIGHT_PATH

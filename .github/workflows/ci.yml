@@ -48,6 +48,9 @@ jobs:
         run: |
           python3 scripts/check-release-binary-contract.py
           python3 tests/scripts/test_check_release_binary_contract.py
+      - name: Binary release manifests are deterministic and fail closed
+        run: |
+          python3 tests/scripts/test_release_manifest.py
       - name: README stays a human-readable user-facing document
         run: |
           python3 scripts/check-readme-structure.py

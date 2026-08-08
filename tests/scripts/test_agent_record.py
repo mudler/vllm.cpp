@@ -6,9 +6,11 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -217,6 +219,35 @@ class AgentRecordMutationTests(unittest.TestCase):
             validate_mutation(self.rows, malformed),
             r"MODEL-FACTORY-registry table lacks semantic owner column",
         )
+
+    def test_engine_summary_rejects_stale_area_rollup(self) -> None:
+        source = agent_record.ENGINE_MATRIX.read_text(encoding="utf-8")
+        current = next(
+            line
+            for line in source.splitlines()
+            if line.startswith("| Serving, API, CLI, library |")
+        )
+        cells = [cell.strip() for cell in current.strip().strip("|").split("|")]
+        self.assertGreater(int(cells[6]), 0)
+        cells[5] = str(int(cells[5]) + 1)
+        cells[6] = str(int(cells[6]) - 1)
+        stale = "| " + " | ".join(cells) + " |"
+
+        with tempfile.TemporaryDirectory(dir=ROOT) as temp_dir:
+            matrix = Path(temp_dir) / "engine-matrix.md"
+            with mock.patch.object(agent_record, "ENGINE_MATRIX", matrix):
+                matrix.write_text(source, encoding="utf-8")
+                baseline_errors: list[str] = []
+                baseline_rows = agent_record.parse_claim_rows(matrix, baseline_errors)
+                agent_record.check_engine_summary(baseline_rows, baseline_errors)
+                self.assertEqual(baseline_errors, [])
+
+                matrix.write_text(source.replace(current, stale), encoding="utf-8")
+                errors: list[str] = []
+                rows = agent_record.parse_claim_rows(matrix, errors)
+                agent_record.check_engine_summary(rows, errors)
+
+        require(errors, r"Serving, API, CLI, library summary ready=\d+; actual \d+")
 
 
 if __name__ == "__main__":

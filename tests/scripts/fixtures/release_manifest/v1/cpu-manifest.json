@@ -1,0 +1,238 @@
+{
+  "artifact": {
+    "channel": "preview",
+    "id": "linux-x86_64-glibc-cpu",
+    "kind": "primary",
+    "static_boundary": "static-core",
+    "version": "0.1.0-test"
+  },
+  "backend": {
+    "flags": {
+      "MLX_ROOT": "",
+      "VLLM_CPP_BUILD_EXAMPLES": true,
+      "VLLM_CPP_BUILD_TESTS": true,
+      "VLLM_CPP_CUDA": false,
+      "VLLM_CPP_CUDA_ARCHITECTURES": [],
+      "VLLM_CPP_HIP": false,
+      "VLLM_CPP_HIP_ARCHITECTURES": [],
+      "VLLM_CPP_METAL": false,
+      "VLLM_CPP_MLX": false,
+      "VLLM_CPP_SERVER": true,
+      "VLLM_CPP_TRITON": false,
+      "VLLM_CPP_VULKAN": false
+    },
+    "gpu_driver_boundary": "not-applicable",
+    "name": "cpu",
+    "resolved_features": []
+  },
+  "build": {
+    "compiler": "GNU C++ 13.2.0",
+    "resolved_cmake_options": {
+      "MLX_ROOT": "",
+      "VLLM_CPP_BUILD_EXAMPLES": true,
+      "VLLM_CPP_BUILD_TESTS": true,
+      "VLLM_CPP_CUDA": false,
+      "VLLM_CPP_CUDA_ARCHITECTURES": [],
+      "VLLM_CPP_HIP": false,
+      "VLLM_CPP_HIP_ARCHITECTURES": [],
+      "VLLM_CPP_METAL": false,
+      "VLLM_CPP_MLX": false,
+      "VLLM_CPP_SERVER": true,
+      "VLLM_CPP_TRITON": false,
+      "VLLM_CPP_VULKAN": false
+    },
+    "source_clean": true,
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "test_commands": [
+      "cmake --build build --target vllm",
+      "ctest --test-dir build"
+    ],
+    "toolchain": "cmake-3.30+ninja-1.12"
+  },
+  "cpu": {
+    "baseline": "portable-sse2",
+    "compiled_tiers": [
+      {
+        "execution_evidence": {
+          "command": "cmake --build build --target vllm",
+          "reason": "",
+          "result": "exit 0",
+          "state": "passed",
+          "url": "https://example.invalid/evidence/passed"
+        },
+        "kernel_families": [
+          "matmul-elem-f32-bf16"
+        ],
+        "name": "portable-sse2",
+        "required_cpu_bits": [
+          "sse2"
+        ],
+        "required_os_state": []
+      },
+      {
+        "execution_evidence": {
+          "command": "lddtree bin/vllm-server",
+          "reason": "synthetic dependency audit failure",
+          "result": "exit 1: undeclared libsynthetic.so",
+          "state": "failed",
+          "url": "https://example.invalid/evidence/failed"
+        },
+        "kernel_families": [
+          "matmul-elem-f16"
+        ],
+        "name": "sse2-f16c",
+        "required_cpu_bits": [
+          "avx",
+          "f16c",
+          "osxsave",
+          "sse2"
+        ],
+        "required_os_state": [
+          "xcr0:xmm",
+          "xcr0:ymm"
+        ]
+      },
+      {
+        "execution_evidence": {
+          "command": "",
+          "reason": "synthetic fixture has not run this gate",
+          "result": "",
+          "state": "absent",
+          "url": ""
+        },
+        "kernel_families": [
+          "matmul-elem-f32-bf16-f16"
+        ],
+        "name": "avx2-f16c",
+        "required_cpu_bits": [
+          "avx",
+          "avx2",
+          "f16c",
+          "osxsave"
+        ],
+        "required_os_state": [
+          "xcr0:xmm",
+          "xcr0:ymm"
+        ]
+      },
+      {
+        "execution_evidence": {
+          "command": "",
+          "reason": "synthetic cross-build has no matching runtime host",
+          "result": "",
+          "state": "not-applicable",
+          "url": ""
+        },
+        "kernel_families": [
+          "matmul-elem-f32-bf16"
+        ],
+        "name": "avx512f",
+        "required_cpu_bits": [
+          "avx",
+          "avx512f",
+          "osxsave"
+        ],
+        "required_os_state": [
+          "xcr0:xmm",
+          "xcr0:ymm",
+          "xcr0:opmask",
+          "xcr0:zmm_hi256",
+          "xcr0:hi16_zmm"
+        ]
+      }
+    ],
+    "selected_tier": "portable-sse2"
+  },
+  "dependencies": [
+    {
+      "bundled": false,
+      "kind": "library",
+      "linkage": "dynamic",
+      "name": "glibc",
+      "role": "runtime",
+      "version": "2.31"
+    }
+  ],
+  "evidence": {
+    "archive_smoke": {
+      "command": "cmake --build build --target vllm",
+      "reason": "",
+      "result": "exit 0",
+      "state": "passed",
+      "url": "https://example.invalid/evidence/passed"
+    },
+    "build": {
+      "command": "cmake --build build --target vllm",
+      "reason": "",
+      "result": "exit 0",
+      "state": "passed",
+      "url": "https://example.invalid/evidence/passed"
+    },
+    "correctness": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    },
+    "dependency_audit": {
+      "command": "cmake --build build --target vllm",
+      "reason": "",
+      "result": "exit 0",
+      "state": "passed",
+      "url": "https://example.invalid/evidence/passed"
+    },
+    "performance": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    },
+    "runtime": {
+      "command": "",
+      "reason": "synthetic cross-build has no matching runtime host",
+      "result": "",
+      "state": "not-applicable",
+      "url": ""
+    }
+  },
+  "host": {
+    "abi": "glibc",
+    "abi_version": "2.31",
+    "arch": "x86_64",
+    "os": "linux"
+  },
+  "schema": "vllm.cpp.release-manifest.v1",
+  "schema_version": 1,
+  "supply_chain": {
+    "archive_checksum": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    },
+    "licenses": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    },
+    "provenance": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    },
+    "sbom": {
+      "command": "",
+      "reason": "synthetic fixture has not run this gate",
+      "result": "",
+      "state": "absent",
+      "url": ""
+    }
+  }
+}

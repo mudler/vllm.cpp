@@ -317,6 +317,19 @@ ENGINE_PREFIXES = (
 # Bumped for a real new row, never to make a failing state transition pass.
 ENGINE_ROWS = 144
 
+ENGINE_SUMMARY_SECTIONS = (
+    ("Engine and scheduling", "Engine core and scheduling"),
+    ("KV cache and memory", "KV cache and memory"),
+    ("Parallelism", "Parallelism and scale-out"),
+    ("Sampling and generation", "Sampling and generation controls"),
+    ("Structured output and tools", "Structured outputs and tool calling"),
+    ("Speculative decoding", "Speculative decoding"),
+    ("Serving, API, CLI, library", "Serving surface, CLI, and library"),
+    ("LoRA and adapters", "LoRA and adapters"),
+    ("Long context and attention", "Long context and attention breadth"),
+    ("Loading, tokenizer, config", "Loading, tokenizer, and config"),
+)
+
 MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
 REQUIRED = [
     ROOT / "AGENTS.md",
@@ -591,33 +604,66 @@ def check_engine_summary(rows: list[ClaimRow], errors: list[str]) -> None:
     lines = ENGINE_MATRIX.read_text(encoding="utf-8").splitlines()
     header: list[str] | None = None
     total: list[str] | None = None
-    for line in lines:
+    summaries: dict[str, list[str]] = {}
+    section_lines: dict[str, int] = {}
+    for line_no, line in enumerate(lines, 1):
+        if line.startswith("## "):
+            section_lines[line.removeprefix("## ").strip()] = line_no
         if line.startswith("| Area | Rows |"):
             header = [normalize_header(cell) for cell in split_cells(line)]
-        elif header is not None and line.startswith("| **Total** |"):
-            total = [cell.replace("*", "").strip() for cell in split_cells(line)]
-            break
+        elif header is not None and total is None and line.startswith("|"):
+            cells = [cell.replace("*", "").strip() for cell in split_cells(line)]
+            if is_separator(cells):
+                continue
+            if cells[0] == "Total":
+                total = cells
+            else:
+                summaries[cells[0]] = cells
     if header is None or total is None or len(header) != len(total):
         errors.append(f"{ENGINE_MATRIX.relative_to(ROOT)}: missing or malformed lifecycle summary")
         return
 
     actual_rows = [row for row in rows if row.path == ENGINE_MATRIX]
-    expected = {"rows": len(actual_rows)}
-    expected.update(
-        {normalize_header(state): sum(row.state == state for row in actual_rows) for state in STATES}
-    )
-    for index, name in enumerate(header[1:], 1):
-        if name not in expected:
+
+    def check_counts(label: str, recorded_cells: list[str], scoped_rows: list[ClaimRow]) -> None:
+        if len(recorded_cells) != len(header):
+            errors.append(f"{ENGINE_MATRIX.relative_to(ROOT)}: malformed {label} lifecycle summary")
+            return
+        expected = {"rows": len(scoped_rows)}
+        expected.update(
+            {normalize_header(state): sum(row.state == state for row in scoped_rows) for state in STATES}
+        )
+        for index, name in enumerate(header[1:], 1):
+            if name not in expected:
+                continue
+            try:
+                recorded = int(recorded_cells[index])
+            except ValueError:
+                errors.append(
+                    f"{ENGINE_MATRIX.relative_to(ROOT)}: non-numeric {label} summary for {name}"
+                )
+                continue
+            if recorded != expected[name]:
+                errors.append(
+                    f"{ENGINE_MATRIX.relative_to(ROOT)}: {label} summary {name}={recorded}; "
+                    f"actual {expected[name]}"
+                )
+
+    check_counts("total", total, actual_rows)
+    for area, section in ENGINE_SUMMARY_SECTIONS:
+        recorded_cells = summaries.get(area)
+        section_line = section_lines.get(section)
+        if recorded_cells is None or section_line is None:
+            errors.append(f"{ENGINE_MATRIX.relative_to(ROOT)}: missing {area} lifecycle summary")
             continue
-        try:
-            recorded = int(total[index])
-        except ValueError:
-            errors.append(f"{ENGINE_MATRIX.relative_to(ROOT)}: non-numeric total for {name}")
-            continue
-        if recorded != expected[name]:
-            errors.append(
-                f"{ENGINE_MATRIX.relative_to(ROOT)}: summary {name}={recorded}; actual {expected[name]}"
-            )
+        next_section_line = min(
+            (line_no for line_no in section_lines.values() if line_no > section_line),
+            default=len(lines) + 1,
+        )
+        scoped_rows = [
+            row for row in actual_rows if section_line < row.line_no < next_section_line
+        ]
+        check_counts(area, recorded_cells, scoped_rows)
 
 
 def is_placeholder(value: str) -> bool:

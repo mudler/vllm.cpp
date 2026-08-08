@@ -26,6 +26,7 @@ are our reading of their documented behavior, not measurements.
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
 | Architectures | 30 registered, 25+ gated | 130+ | 100+ | 100+ |
+| Downloadable server binaries | ◐ W5 mutation-gated manifest contract implemented; no archives published | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
 
 ## Serving and scheduling
 

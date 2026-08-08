@@ -307,3 +307,4 @@ backends in scope as inventoried rows. Neither changed a capability, so **no
 mark on this page moved**. An inventoried backend is not a supported one, and the same
 holds for the 31 architectures inventoried on 2026-08-05. A row's lifecycle state and its support mark
 are independent: see [STATUS.md](STATUS.md). Parakeet ASR (encoder + CTC/RNN-T/TDT) runs natively on CPU, 4 checkpoints token-exact vs HF.
+| Live-row audit demotion (abandoned ACTIVE->SPIKE) | done | Matrices only; unblocks agent-record |

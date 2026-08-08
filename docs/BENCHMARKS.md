@@ -383,3 +383,4 @@ built on it rather than keeping the flattering one.
 
 Build flags, environment variables, and the full gate list are in
 [BUILD.md](BUILD.md) and [ENVIRONMENT.md](ENVIRONMENT.md).
+No throughput change. Matrix lifecycle bookkeeping only (2026-08-08).

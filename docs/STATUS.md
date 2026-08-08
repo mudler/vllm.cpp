@@ -1564,18 +1564,18 @@ runtime-verified yet.
 ## Serving and API notes
 
 - **Surface coverage (ONE SURFACE, `ARCH-ONE-SURFACE`,
-  `.agents/specs/surface-coverage-2026-08-07.md`).** 21/30 text archs
-  on-framework; the recurring defect (a capability in a per-model CLI) is in seven
-  lanes. Guard `scripts/check-surface-coverage.py` (two axes, preflight + CI):
-  every `examples/*` unit is a client of `include/vllm.h` or tracked to a fold
-  row; every `FEATURES.md` C-ABI capability names an entry point or is tracked.
-  ROW 8 ABI-v14 device selection is behavior-complete; #139 repairs #136's
-  shared-layer DSR 39->32 through registry/name resolution (`kcuda=0`) with the
-  baseline unchanged. CPU: selector 2/2·11; semantic execution guard 52/52
-  (CTest config/enabled, CI/preflight, manifest integrity). CUDA A/B remains.
+ `.agents/specs/surface-coverage-2026-08-07.md`).** 21/30 text archs
+ on-framework; the recurring defect (a capability in a per-model CLI) is in seven
+ lanes. Guard `scripts/check-surface-coverage.py` (two axes, preflight + CI):
+ every `examples/*` unit is a client of `include/vllm.h` or tracked to a fold
+ row; every `FEATURES.md` C-ABI capability names an entry point or is tracked.
+ ROW 8 ABI-v14 device selection is behavior-complete; #139 repairs #136's
+ shared-layer DSR 39->32 through registry/name resolution (`kcuda=0`) with the
+ baseline unchanged. CPU: selector 2/2·11; semantic execution guard 52/52
+ (CTest config/enabled, CI/preflight, manifest integrity). CUDA A/B remains.
 - **Automatic prefix caching (APC)** is on by default for dense models (hybrid /
-  GDN and attention-free default off, mirroring vLLM), and it now has an
-  end-to-end cache-ON gate on `Qwen/Qwen3-4B` (a shared common prefix reused
+ GDN and attention-free default off, mirroring vLLM), and it now has an
+ end-to-end cache-ON gate on `Qwen/Qwen3-4B` (a shared common prefix reused
   across requests). A cache hit never changes the output: cache-ON and cache-OFF
   produce token-identical greedy decodes (differing only where the bf16 model
   itself is a genuine near-tie, exactly as vLLM's own greedy does), and both
@@ -2211,7 +2211,5 @@ boundary; runtime behavior and Laguna's lifecycle state are unchanged.
 The next run also guarded Voxtral's GCC-only `-Wstringop-overflow` suppression
 out of Clang, where it was fatal. Its Go `go-m1cpu` diagnostics were nonfatal
 and outside this repo.
-
-**Agent onboarding:** [session](../.agents/specs/session-onboarding.md) +
-[entry](../.agents/specs/developer-agent-protocol-entrypoint.md) implemented;
-documentation-only.
+OpenAI server (2026-08-08): generate waits on own request_id; VT_CHAT_ENABLE_THINKING; jinja sidecar.
+Live-row audit (2026-08-08): abandoned ACTIVE rows demoted to SPIKE (no Git evidence).

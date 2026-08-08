@@ -1193,3 +1193,58 @@ and `--decode-latent` went with the pre-fold binary (documented at
 `minimax_h3_gen/main.cpp:31-36`), so replaying a dumped latent through the VAE now needs a
 throwaway harness against `MiniMaxH3VideoVaeDecodeTemporalDevice`; a `--decode-latent` on
 the ABI would have turned this row's 3 h re-render into a 2 min decode.
+
+## 8.17 The AUDIO arm CALIBRATED — VAE cleared by round-trip, the DiT latent is OUT OF DISTRIBUTION (2026-08-08, `row/H3-AUDIO-ENCODE-REF`, Thor sm_110)
+
+§8.16's dump (PR #175) gave the audio arm its first measurement: adjacent-time cosine
+**0.5897** against a 0.0855 random-pair baseline, i.e. NOT white. That ruled out the
+video arm's failure mode but could not say whether 0.59 was HEALTHY — the audio arm had
+no equivalent of the video arm's 0.789 real-encode anchor. This row built it.
+
+**The reference.** `MiniMaxH3AudioVaeEncodeToLatent` on real 32 kHz speech (jfk, 11.0 s ->
+440 frames, confirming the 40 Hz geometry) gives the raw-VAE-space latent a healthy signal
+actually looks like. Same space as the pipeline's post-denormalize dump, so the two compare
+directly.
+
+| Latent | adj-time cosine | random-pair | per-channel \|mean\| | per-channel std |
+|---|---|---|---|---|
+| REFERENCE real speech (jfk) | 0.6431 | 0.4285 | 0.4388 | 0.7736 |
+| ENCODE(our generated audio) | 0.4784 | 0.1194 | 0.3028 | 0.9694 |
+| OUR DiT latent (ch0) | 0.5897 | 0.0855 | 0.2406 | 1.0774 |
+| audio_vae config `latents_mean/std` | — | — | 0.1940 | **1.8983** |
+
+**The video VAE was cleared by a round-trip (§8.6); the AUDIO VAE is now cleared the same
+way.** Decoding the jfk REFERENCE latent — one the encoder itself produced — back through
+`MiniMaxH3AudioVaeDecode` returns 440 frames -> 352000 samples (exactly 11.00 s @32 kHz)
+that ASR transcribes WORD-IDENTICALLY to the original ("and so my fellow americans ask not
+what your country can do for you ask what you can do for your country", both). The decoder
+is SOUND; the reported metallic voice is not a decode defect.
+
+**What is wrong is the DiT's audio latent, and it is OUT OF DISTRIBUTION.** A functioning
+VAE satisfies `encode(decode(z)) ~ z`. Decoding our DiT audio latent and RE-ENCODING the
+audio it produced gives cosine **+0.016** (ch0) / **+0.031** (ch1), per-frame mean +0.022 /
++0.036 — no relationship. The decoder maps our latent somewhere, but nowhere the encoder
+would ever have come from. Contrast the reference, which round-trips perfectly.
+
+**The shape of the divergence.** Our latent's per-channel MEAN matches the config
+(0.2406 vs 0.1940) while its per-channel STD is ~**57%** of what full denormalization
+implies (1.0774 vs 1.8983). Since `denormalize` is `value * std + mean`, a correct mean
+with a short std means the DiT's NORMALIZED audio output carries std ~0.57 rather than 1.0
+— an UNDER-DISPERSED latent. Note the video arm, on the same sampler and the same joint
+sequence, is coherent at 0.8924 (§8.16), so whatever this is, it is specific to the audio
+stream rather than the denoise as a whole.
+
+**Ruled out along the way, by measurement, not argument:** the audio latent is not white
+(0.5897 vs 0.0855); there is no latent-rate seam (40 Hz modulation reads 1.83x local
+baseline against a 53 Hz control at 2.14x — no line); and the BigVGAN anti-aliasing IS
+ported (SnakeBeta + kaiser-sinc `UpSample1d`/`LowPassFilter1d`, from `dac_alias_free_*`),
+so aliasing is not the source either.
+
+**Residuals.** (1) WHY the audio stream is under-dispersed is unproven — the two candidates
+are the audio sigma schedule (upstream DERIVES the audio sigma from the video sigma in
+closed form, `model.py:36-39 time_shift_sigma(sigma, 12.0, 3.0)`, where we build
+`sigmas_audio` independently at shift 3.0; these coincide only if both walk the same base
+grid) and an audio-side scale in the DiT head. A dump of the DiT's NORMALIZED audio rows
+before denormalize would separate them in one render. (2) The 512x512 canvas is the right
+bed for this: the artifact is resolution-INDEPENDENT and the loop is 15.4 s/step against
+176 s at the REF canvas.

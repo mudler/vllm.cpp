@@ -486,10 +486,38 @@ class RoleDiscipline(unittest.TestCase):
             sys.argv = saved
 
     def test_landed_detached_commit_remains_strict_without_pending_evidence(self) -> None:
+        # The subject here is main()'s DECISION: a violation on a commit that
+        # has landed, with no --pending-pr-head evidence, is strict (1), not a
+        # REPORT (0). Feed it a fixed violation instead of relying on the real
+        # HEAD to be one. It did rely on that, and the coupling was live: under
+        # a pull_request event CI checks out the SYNTHETIC merge, whose
+        # merged_messages are the PR's own commit bodies, so any PR whose
+        # message cites an issue or PR number matched PR_REFERENCE, HEAD stopped
+        # being a violation, main() returned 0, and this test failed for a
+        # reason that had nothing to do with what it asserts.
         saved = sys.argv
         sys.argv = [saved[0], "--commit", "HEAD"]
         try:
-            with mock.patch.object(discipline, "has_reached_main", return_value=True):
+            with mock.patch.object(discipline, "has_reached_main", return_value=True), \
+                 mock.patch.object(discipline, "enforced", return_value=True), \
+                 mock.patch.object(discipline, "inspect", return_value=["x: landed without a row PR"]):
+                self.assertEqual(discipline.main(), 1)
+        finally:
+            sys.argv = saved
+
+    def test_a_pr_number_in_the_body_does_not_decide_this_gate(self) -> None:
+        """Regression: the case that made the test above fail in CI.
+
+        A commit message that merely MENTIONS `#123` must not change main()'s
+        landed-vs-pending decision. This pins the decision to the inputs it is
+        about, so a message quoting PR numbers cannot flip the outcome again.
+        """
+        saved = sys.argv
+        sys.argv = [saved[0], "--commit", "HEAD"]
+        try:
+            with mock.patch.object(discipline, "has_reached_main", return_value=True), \
+                 mock.patch.object(discipline, "enforced", return_value=True), \
+                 mock.patch.object(discipline, "inspect", return_value=["x: see (#157) and #174"]):
                 self.assertEqual(discipline.main(), 1)
         finally:
             sys.argv = saved

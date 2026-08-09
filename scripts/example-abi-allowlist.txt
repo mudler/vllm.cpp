@@ -24,7 +24,6 @@
 # --- Capability drivers whose FAST PATH is reachable ONLY here, not through the ABI ---
 examples/deepseek_v4_gen | fold=ARCH-ONE-SURFACE | DeepSeek-V4-Flash keep-quant GGUF greedy decode (DeepseekV4ForwardGguf(Cached) + DeepseekV4KvCache) is CLI-only; the registered DeepseekV4ForCausalLM forward is a W3-W8 stub (deepseek_v4_registry.cpp:22). Grow ABI keep-quant GGUF load+decode, rewrite as ABI client, delete the bespoke forward
 examples/laguna_gen | fold=ARCH-ONE-SURFACE | Laguna-S-2.1 keep-quant GGUF (multi-shard) + NVFP4 W4A4 device-resident decode (LagunaForwardGguf(Cached), Marlin residents, fp4-shared) is CLI-only; registered LagunaForCausalLM forward VT_CHECK(false)s on non-bf16 (laguna.cpp:156). Grow ABI, rewrite as client, delete bespoke forward
-examples/server | fold=ARCH-ONE-SURFACE | The reference OpenAI server constructs the engine, metrics, video_runner and mm seam directly from internal C++ headers (LoadedEngine/AsyncLLM, minimax_h3.h, chat_mm). It should stand on the public surface (C ABI, or a curated public C++ API the ABI wraps). Grow the surface, rewrite the server against it
 
 # --- Dev / diagnostic tools: NO permanent exemption (developer-directed 2026-08-07) ---
 # Every one is a transition-tracker like the drivers above; the allowlist only shrinks.

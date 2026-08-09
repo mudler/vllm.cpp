@@ -1811,6 +1811,10 @@ endif()
 if(VLLM_CPP_SERVER)
   find_package(Threads REQUIRED)
   target_sources(vllm PRIVATE src/vllm/entrypoints/openai/api_server.cpp)
+  # ARCH-ONE-SURFACE: the server ENTRY POINT (flag parsing + engine/serving
+  # construction) lives in the library so examples/server can be a thin client of
+  # the C ABI's vllm_server_main (v17). It shares api_server.cpp's httplib gate.
+  target_sources(vllm PRIVATE src/vllm/entrypoints/openai/server_main.cpp)
   target_compile_definitions(vllm PUBLIC VLLM_CPP_SERVER)
   target_link_libraries(vllm PUBLIC Threads::Threads)
   # third_party/httplib/httplib.h is reached as <httplib/httplib.h> (third_party

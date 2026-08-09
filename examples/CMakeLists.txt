@@ -67,7 +67,11 @@ endif()
 # The OpenAI HTTP server example is gated on the vendored cpp-httplib transport.
 if(VLLM_CPP_SERVER)
   add_executable(server server/main.cpp)
-  target_link_libraries(server PRIVATE vllm::vllm)
+  # ARCH-ONE-SURFACE: server/main.cpp is a THIN CLIENT of the public C ABI
+  # (vllm_server_main, v17) -- it includes vllm.h and nothing else, so it links the
+  # PACKAGED shared library exactly as an out-of-tree consumer would, not the
+  # internal C++ target.
+  target_link_libraries(server PRIVATE vllm::shared)
   vllm_cpp_set_warnings(server)
   if(VLLM_CPP_BUILD_TESTS)
     add_test(NAME test_server_help COMMAND $<TARGET_FILE:server> --help)

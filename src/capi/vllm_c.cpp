@@ -44,6 +44,7 @@
 #include "vllm/model_executor/models/minimax_h3.h"    // mux argv (v12)
 #include "vllm/multimodal/parakeet_transcription.h"     // vllm_transcribe (v11)
 #include "vllm/multimodal/minimax_h3_video.h"          // vllm_video_* (v12)
+#include "vllm/entrypoints/openai/server_main.h"   // vllm_server_main (v17)
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
 #include "vllm/transformers_utils/hf_config.h"  // PeekHfArchitectures (v11)
@@ -1613,6 +1614,22 @@ VLLM_API const char* vllm_version(void) {
   // Static storage: computed once, borrowed by the caller (never freed).
   static const std::string kVersion = vllm::Version();
   return kVersion.c_str();
+}
+
+VLLM_API int32_t vllm_server_main(int32_t argc, char** argv) {
+  // The server owns its own error reporting on stderr (it is a PROCESS entry
+  // point, not a request call), so this does not set vllm_last_error. What it
+  // must guarantee is that nothing throws across the C boundary.
+  try {
+    return static_cast<int32_t>(
+        vllm::entrypoints::openai::VllmServerMain(static_cast<int>(argc), argv));
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "vllm_server_main: %s\n", e.what());
+    return 1;
+  } catch (...) {
+    std::fprintf(stderr, "vllm_server_main: unknown error\n");
+    return 1;
+  }
 }
 
 VLLM_API int32_t vllm_abi_version(void) { return VLLM_ABI_VERSION; }

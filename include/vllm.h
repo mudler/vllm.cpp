@@ -129,8 +129,20 @@ extern "C" {
  * other's tasks LOUDLY: vllm_complete/vllm_chat on a pooling engine name
  * vllm_embed, and vllm_embed on a text engine names vllm_complete — the
  * SupportsTranscription-refusal precedent (v11) applied to the pooling task.
- * Purely additive — no struct changed; zero values preserve behaviour. */
-#define VLLM_ABI_VERSION 16
+ * Purely additive — no struct changed; zero values preserve behaviour.
+ *
+ * v17 — vllm_server_main: RUN THE OPENAI SERVER from the public surface.
+ * examples/server was the deepest ONE SURFACE breach (36 internal headers: the
+ * engine, the serving layers, metrics, the video and ASR seams), which is why it
+ * carried an example-abi-allowlist entry. That construction moved INTO the
+ * library (vllm/entrypoints/openai/server_main.h) and the example is now a thin
+ * client of this call. argv rather than a params struct is deliberate: the
+ * server takes ~57 flags and gains more with every serving feature, and a
+ * mirrored C struct would put that churn in the ABI where every field is
+ * permanent. The flag surface mirrors vLLM's cli_args.py, which is the real
+ * contract. Embedders wanting programmatic control keep the granular entry
+ * points. Purely additive. */
+#define VLLM_ABI_VERSION 17
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -791,6 +803,23 @@ VLLM_API const char* vllm_last_error(void);
 /* The library version string ("MAJOR.MINOR.PATCH[+cuda]"), static storage; do
  * not free. */
 VLLM_API const char* vllm_version(void);
+
+/* ── OpenAI-compatible server ─────────────────────────────────────────────────
+ * Parse `argv` and RUN the OpenAI-compatible HTTP server until it exits,
+ * returning the process exit code (0 on clean shutdown). `--help` prints usage
+ * and returns 0; a bad argument or a startup failure prints the reason and
+ * returns non-zero. Never throws across this boundary.
+ *
+ * This is what `vllm-server` is: examples/server is a thin client of this call.
+ * It serves /v1/chat/completions, /v1/completions, /v1/models, /v1/embeddings,
+ * and — when the matching flags are supplied — /v1/videos (MiniMax-H3) and
+ * transcription, all through the SAME library seams the granular entry points
+ * below drive, so HTTP and FFI cannot drift.
+ *
+ * BLOCKS for the lifetime of the server. `argv` must hold `argc` NUL-terminated
+ * strings and stay valid for the duration; the library does not take ownership.
+ * The conventional argv[0] program name is expected at index 0. */
+VLLM_API int32_t vllm_server_main(int32_t argc, char** argv);
 
 /* The ABI version the library was built with (compare against VLLM_ABI_VERSION). */
 VLLM_API int32_t vllm_abi_version(void);

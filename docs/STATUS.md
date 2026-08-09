@@ -1116,16 +1116,14 @@ inner-state-free; `test_model_registry` 24/24. Test-golden sync (2026-07-29):
 `test_model_loader_gguf`'s hardcoded supported-architectures string was likewise
 stale (predated the breadth-sweep + frontier registrations); synced to include
 DeepseekV4/Gemma4/KimiK3/Qwen3VL, `test_model_loader_gguf` 3/3 (was RED on main).
-Env-doc hygiene (2026-07-29): two production env vars recent lanes added were
-undocumented (left `check-env-doc` RED) — `VLLM_PLUGINS` (user-facing plugin
-allowlist) documented in `docs/ENVIRONMENT.md`, `VLLM_GEMMA4_MM_DEBUG` (a
-diagnostic print switch) classified on `scripts/env-doc-allowlist.txt`;
+Env-doc hygiene (2026-07-29): `VLLM_PLUGINS` documented in
+`docs/ENVIRONMENT.md`, `VLLM_GEMMA4_MM_DEBUG` classified kernel-internal;
 `check-env-doc` rc=0. And the `check-device-leakage` DSR ratchet (RED from the
 W7-device lane): the 8 `kCUDA` op-lookups in `deepseek_v4_device.cpp` (the
-DeepSeek-V4 CUDA device-forward resolver TU) are allowlisted with a reason +
-a recorded FOLLOW-UP to thread the runner `DeviceType` through them (deferred,
-needs a GB10 re-gate — DGX offline); `check-device-leakage` rc=0. All six record
-checkers now green on main.
+V4 device-forward resolver TU) are allowlisted with a reason + a FOLLOW-UP to thread the runner `DeviceType` through them (deferred,
+needs a GB10 re-gate — DGX offline). #189 then moved the server TU into the
+shared layer with 5 `VT_BENCH_PROFILE_CONTROL` guards (32→37), DSR-ALLOW'd per
+site; baseline held at 32. Record checkers green on main.
 The matrix opens with an
 architecture-support checklist (a per-architecture status roll-up covering every
 engaged model) that a CI checker keeps in lockstep with the detailed rows.

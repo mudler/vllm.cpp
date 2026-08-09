@@ -46,6 +46,7 @@
 #include <atomic>
 #include <sys/wait.h>
 #include <unistd.h>
+// DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
 #ifdef VT_BENCH_PROFILE_CONTROL
 #include <cerrno>
 #include <chrono>
@@ -89,6 +90,7 @@
 #include "vllm/v1/kv_offload/kv_connector.h"
 #include "vllm/v1/worker/gpu/runner.h"
 #include "vt/backend.h"
+// DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
 #ifdef VT_BENCH_PROFILE_CONTROL
 #include "vt/cuda/cuda_profiler_control.h"
 #endif
@@ -690,6 +692,7 @@ int VllmServerMain(int argc, char** argv) {
     const vllm::tok::Tokenizer& tokenizer = loaded->tokenizer();
 
     if (args.cuda_profile_graph_replays > 0) {
+// DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
 #ifdef VT_BENCH_PROFILE_CONTROL
       vt::cuda::ConfigureCudaGraphReplayProfiler(
           static_cast<uint32_t>(args.cuda_profile_graph_replays),
@@ -938,6 +941,7 @@ int VllmServerMain(int argc, char** argv) {
     }
     std::cerr << ")\n";
 
+// DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
 #ifdef VT_BENCH_PROFILE_CONTROL
     std::atomic<bool> benchmark_shutdown_waiter_ready{false};
     std::atomic<bool> benchmark_shutdown_received{false};
@@ -1020,6 +1024,7 @@ int VllmServerMain(int argc, char** argv) {
 
     const bool listen_ok = server.listen(args.host, args.port);
 
+// DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
 #ifdef VT_BENCH_PROFILE_CONTROL
     if (benchmark_shutdown_thread.joinable()) {
       benchmark_shutdown_cancelled.store(true, std::memory_order_release);

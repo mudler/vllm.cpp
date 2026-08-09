@@ -184,6 +184,11 @@ CHECKER_EVIDENCE_OVERRIDES = {
     "scripts/check-role-discipline.py": "tests/scripts/test_check_pr_size.py",
     "scripts/check-doc-checkpoint.py": "tests/scripts/test_doc_checkpoint.py",
     "scripts/check-protocol-consistency.py": "tests/scripts/test_check_protocol_consistency.py",
+    # Its suite predates the test_check_<name> convention and CI runs it under
+    # the older name, so the derived path pointed at a file that does not
+    # exist and NO change to this checker could ever satisfy its own evidence
+    # rule. Mapped to the file CI actually runs.
+    "scripts/check-device-leakage.py": "tests/scripts/test_device_leakage.py",
 }
 
 # New entrypoints cannot appear in their own historical policy enforcement

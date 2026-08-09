@@ -20,6 +20,31 @@ sys.modules[SPEC.name] = checker
 SPEC.loader.exec_module(checker)
 
 
+class CheckerEvidenceMapping(unittest.TestCase):
+    # A checker whose evidence path does not exist can never satisfy the
+    # governance_checker rule: every change to it fails with "requires semantic
+    # mutation evidence in <file that is not there>". That is how
+    # check-device-leakage.py became unmodifiable -- its suite predates the
+    # test_check_<name> convention, so the derived path missed by one word.
+    KNOWN_UNTESTED = {
+        # No suite at all, and not wired into ci.yml either. Named here so the
+        # gap is visible in a test rather than invisible in a naming rule.
+        "scripts/check-dsv4-gguf-namemap.py",
+    }
+
+    def test_every_checker_maps_to_an_evidence_file_that_exists(self) -> None:
+        root = Path(checker.__file__).resolve().parents[1]
+        missing = []
+        for path in sorted(root.glob("scripts/check-*.py")):
+            rel = f"scripts/{path.name}"
+            if rel in self.KNOWN_UNTESTED:
+                continue
+            evidence = checker.recognized_evidence(rel)
+            if not (root / evidence).is_file():
+                missing.append(f"{rel} -> {evidence}")
+        self.assertEqual(missing, [])
+
+
 class PathClassification(unittest.TestCase):
     def test_each_mutable_surface_has_an_explicit_class(self) -> None:
         expected = {

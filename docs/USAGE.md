@@ -159,6 +159,8 @@ to one built without video support. See
 | `--enable-metrics` / `--disable-metrics` | on | Serve the metrics endpoint |
 | `--enable-thinking` / `--no-enable-thinking` | off | Set the `enable_thinking` chat-template variable for templates that gate a reasoning block on it (Gemma-4 and friends). Our spelling of vLLM's `--default-chat-template-kwargs enable_thinking` |
 | `--verbose`, `-v` | off | Verbose server logging |
+| `--cuda-profile-graph-replays N` | `0` (off) | Trace-only diagnostic: arm the CUDA-graph-replay profiler and stop after N replays, printing a pid to signal with `SIGUSR2`. Requires a build with `VT_BENCH_PROFILE_CONTROL` |
+| `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |
 | `-h`, `--help` | | Print usage and exit |
 
 For a production deployment, use [LocalAI](https://localai.io), which can embed

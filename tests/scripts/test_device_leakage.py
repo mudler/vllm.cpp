@@ -382,6 +382,30 @@ class RealTreeTests(unittest.TestCase):
             rc = dl.main([])
         self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
 
+    def test_server_main_dsr_allows_cover_only_the_profiler_guard(self) -> None:
+        # #189 moved the server body into the shared layer, bringing 5
+        # `#ifdef VT_BENCH_PROFILE_CONTROL` sites with it and pushing vt_ifdef
+        # 32 -> 37. They are exempted per-site with DSR-ALLOW rather than by a
+        # per-file budget, because a budget can be spent on something else: swap
+        # one guard for a real device fork and the count still reads 5. This pins
+        # that every exempted guard in that TU is the profiler one.
+        path = ROOT / "src/vllm/entrypoints/openai/server_main.cpp"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        guarded = [
+            index
+            for index, line in enumerate(lines)
+            if line.lstrip().startswith("#ifdef VT_")
+            or line.lstrip().startswith("#if defined(VT_")
+        ]
+        self.assertTrue(guarded)
+        for index in guarded:
+            self.assertIn("VT_BENCH_PROFILE_CONTROL", lines[index])
+            self.assertTrue(
+                dl.RE_DSR_ALLOW.search(lines[index])
+                or (index and dl.RE_DSR_ALLOW.search(lines[index - 1])),
+                f"line {index + 1} has no DSR-ALLOW on it or directly above it",
+            )
+
     def test_every_allowlisted_path_exists(self) -> None:
         # A stale allowlist entry is a silent exemption for a file that may later
         # be recreated with different contents.

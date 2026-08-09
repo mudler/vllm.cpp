@@ -429,6 +429,18 @@ class StatusRatchet(unittest.TestCase):
             doc_tables.status_errors(doc_tables.STATUS.read_text(encoding="utf-8")), []
         )
 
+    def test_the_char_ratchet_is_not_slack(self) -> None:
+        """Headroom is not a growth budget.
+
+        The cheap way out of a red char ratchet is to RAISE the number instead
+        of shrinking the page, and the gate then measures nothing. Bounding the
+        slack means clearing it still costs a real collapse.
+        """
+        live = len(doc_tables.STATUS.read_text(encoding="utf-8"))
+        slack = doc_tables.STATUS_RATCHET["chars"] - live
+        self.assertGreaterEqual(slack, 0, "the live page is already over its ratchet")
+        self.assertLessEqual(slack, 2000, "ratchet headroom is cover for bloat")
+
     def test_the_live_page_keeps_the_character_ratchet_tight(self) -> None:
         text = doc_tables.STATUS.read_text(encoding="utf-8")
         slack = doc_tables.STATUS_RATCHET["chars"] - len(text)

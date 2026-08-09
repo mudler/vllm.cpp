@@ -1,6 +1,6 @@
 # Benchmarks
 
-## At a glance: W5 manifest and record rollups guarded; artifacts pending
+## At a glance: W5 manifest guarded; release artifacts pending
 
 | Reference | Workload | Headline | Tokens |
 |---|---|---|---|

@@ -415,7 +415,12 @@ STATUS_RATCHET = {
     # the ratchet is tightened to the measured value in the same change so the
     # headroom cannot be silently re-spent. oversized_cells 47 -> 44 and
     # long_paragraphs 89 -> 82 fall out of the same move.
-    "chars": 244486,
+    #
+    # 244126 since 2026-08-09 (measured 244101): the release-binary manifest
+    # milestone updated the OpenAI server status cell. Its endpoint-by-endpoint
+    # prose already lives in docs/USAGE.md, so the cell now keeps only the
+    # capability groups and binding limitations. Net -366 from rebased main.
+    "chars": 244126,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

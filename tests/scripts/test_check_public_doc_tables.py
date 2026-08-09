@@ -432,6 +432,12 @@ class StatusRatchet(unittest.TestCase):
             doc_tables.status_errors(doc_tables.STATUS.read_text(encoding="utf-8")), []
         )
 
+    def test_the_live_page_keeps_the_character_ratchet_tight(self) -> None:
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        slack = doc_tables.STATUS_RATCHET["chars"] - len(text)
+        self.assertGreaterEqual(slack, 0)
+        self.assertLessEqual(slack, 25)
+
     def test_the_ratchet_carries_no_hidden_headroom(self) -> None:
         # A ratchet parked well above the page it guards is not a ratchet: it
         # silently licenses regrowth up to the old number. The rule is "lower it

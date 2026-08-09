@@ -16758,6 +16758,19 @@ MEASURE 243-248 GB/s -- above 230.3 -- so 230.3 is a ceiling for THAT SHAPE
 ceiling sits ~7% below the same kernel's on layer weights is UNEXPLAINED, and is
 the same lone buffer the 20x bimodal collapse attaches to.
 
+## Rolled out of the status page on 2026-08-09
+
+Moved verbatim from `docs/STATUS.md`; the keyed capability row remains the
+public status surface.
+
+## 2026-08-08 — Gemma4 ROCm fused helpers via portable vt:: seam (#154)
+
+Model files (`gemma4.cpp`, `gemma4_moe.cpp`) no longer call `vt::rocm::*` directly.
+Fused paths go through `include/vt/fused_ops.h` (`vt::RmsNormPlusAdd`,
+`DualRmsNormPlusRes`, `GeluMulSeparate`, `MatmulBTAlphaBeta`, `MatmulBTFp8Channel`,
+`ExpertGeGLUBf16TopKM1`). ROCm fast path under `VLLM_CPP_HIP`; non-HIP stubs for
+peer/pin/resident upload. `check-device-leakage` holds baseline.
+
 ## Laguna-S-2.1 MoE STATUS cell, relocated verbatim (2026-08-09)
 
 MOVED, NOT EDITED. `docs/STATUS.md` carried this as a single 33,211-char table

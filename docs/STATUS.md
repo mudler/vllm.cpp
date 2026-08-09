@@ -1319,7 +1319,7 @@ LocalAI house style (side-by-side, identical output, honest measured ratios).
 
 ## Backend detail
 
-Gemma4 ROCm fused helpers route through the portable `include/vt/fused_ops.h` seam rather than calling `vt::rocm::*` from model files; ROCm fast path under `VLLM_CPP_HIP`, non-HIP stubs for peer/pin/resident upload, `check-device-leakage` at baseline (#154).
+Gemma4 ROCm fused helpers use portable `include/vt/fused_ops.h`: ROCm fast paths under `VLLM_CPP_HIP`; non-HIP stubs cover peer/pin/resident upload; kernel-only `VT_GEMMA4_*` switches are classified and device leakage stays at baseline (#154).
 
 **Platform SELECTION is the one non-additive site, and is now gated.** A
 platform missing from `CurrentPlatform()`'s hardcoded walk registers and answers

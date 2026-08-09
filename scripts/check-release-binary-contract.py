@@ -55,21 +55,11 @@ WORK_DEPS = {
 ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
-    ".agents/NOW.md": (
-        "| Release | **ACTIVE; W5 19/19+10/10; contract 30/30** |"
-    ),
-    ".agents/coordination.md": (
-        "| `CLAIM-ENG-RELEASE-BINARIES-W5` | "
-        "`ENG-RELEASE-BINARIES` (`ACTIVE`; W5 only) |"
-    ),
-    ".agents/state.md": (
-        "## 2026-08-08 — Release manifest W5 implemented; release row is ACTIVE"
-    ),
+    ".agents/NOW.md": "| Release | **ACTIVE; W5 19/19+10/10; contract 30/30** |",
+    ".agents/coordination.md": "| `CLAIM-ENG-RELEASE-BINARIES-W5` | `ENG-RELEASE-BINARIES` (`ACTIVE`; W5 only) |",
+    ".agents/state.md": "## 2026-08-08 — Release manifest W5 implemented; release row is ACTIVE",
     "docs/STATUS.md": "#141 W5 19/19 ACTIVE ART∅",
-    "docs/BENCHMARKS.md": (
-        "| **Binary release matrix (ACTIVE; W5 implemented)** | "
-        "`ENG-RELEASE-BINARIES`:"
-    ),
+    "docs/BENCHMARKS.md": "| **Binary release matrix (ACTIVE; W5 implemented)** | `ENG-RELEASE-BINARIES`:",
 }
 
 LIFECYCLE_RECORD_MUTATIONS = (
@@ -81,10 +71,8 @@ LIFECYCLE_RECORD_MUTATIONS = (
     ),
     (
         ".agents/engine-matrix.md",
-        "install/archive/publish implementation and all real release evidence "
-        "remain pending",
-        "install/archive/publish implementation and all real release evidence "
-        "are complete",
+        "install/archive/publish implementation and all real release evidence remain pending",
+        "install/archive/publish implementation and all real release evidence are complete",
         "engine-matrix release lifecycle",
     ),
     (
@@ -101,20 +89,14 @@ LIFECYCLE_RECORD_MUTATIONS = (
     ),
     (
         ".agents/coordination.md",
-        "| `ACTIVE` | 2026-08-08 — W5 19/19; fresh-review production removals "
-        "10/10 killed; accepted release suite 30/30; no archive or real "
-        "runtime/correctness/performance evidence |",
-        "| `DONE` | 2026-08-08 — W5 19/19; fresh-review production removals "
-        "10/10 killed; accepted release suite 30/30; "
-        "archive and runtime/correctness/performance evidence complete |",
+        "| `ACTIVE` | 2026-08-08 — W5 19/19; fresh-review production removals 10/10 killed; accepted release suite 30/30; no archive or real runtime/correctness/performance evidence |",
+        "| `DONE` | 2026-08-08 — W5 19/19; fresh-review production removals 10/10 killed; accepted release suite 30/30; archive and runtime/correctness/performance evidence complete |",
         "coordination release lifecycle",
     ),
     (
         ".agents/coordination.md",
-        "Excludes W1-W4, W6-W13, archives, install/package/publish workflows and "
-        "runtime artifacts",
-        "Includes W1-W13, archives, install/package/publish workflows and "
-        "runtime artifacts",
+        "Excludes W1-W4, W6-W13, archives, install/package/publish workflows and runtime artifacts",
+        "Includes W1-W13, archives, install/package/publish workflows and runtime artifacts",
         "coordination release lifecycle",
     ),
     (
@@ -132,13 +114,8 @@ LIFECYCLE_RECORD_MUTATIONS = (
 )
 
 BENCHMARKS_RELEASE_ROW = (
-    "| **Binary release matrix (ACTIVE; W5 implemented)** | "
-    "`ENG-RELEASE-BINARIES`: versioned deterministic manifest for primary "
-    "host-ABI fat-CUDA + adaptive-CPU static-core bundles, optional per-SM "
-    "diagnostics and experimental literal-static musl CPU | **W5 GREEN:** "
-    "19/19 + ten review mutations killed; contract 30/30. Synthetic fixtures "
-    "only. **PENDING:** W1-W4/W6-W13 and all archive/staged-smoke/runtime/"
-    "correctness/performance gates | n/a |"
+    "| **Binary release matrix (ACTIVE; W5 implemented)** | `ENG-RELEASE-BINARIES`: versioned deterministic manifest for primary host-ABI fat-CUDA + adaptive-CPU static-core bundles, optional per-SM diagnostics and experimental literal-static musl CPU | **W5 GREEN:** "
+    "19/19 + ten review mutations killed; contract 30/30; PR-size classes/budget GREEN. Synthetic fixtures only. **PENDING:** W1-W4/W6-W13 and all archive/staged-smoke/runtime/correctness/performance gates | n/a |"
 )
 
 STATUS_RELEASE_FRAGMENTS = (
@@ -296,10 +273,8 @@ WORK_CONTENT = {
 PUBLIC_PENDING_MUTATIONS = (
     (
         "docs/BENCHMARKS.md",
-        "**PENDING:** W1-W4/W6-W13 and all archive/staged-smoke/runtime/"
-        "correctness/performance gates",
-        "**SHIPPED:** archive, runtime, correctness, and performance evidence "
-        "complete",
+        "**PENDING:** W1-W4/W6-W13 and all archive/staged-smoke/runtime/correctness/performance gates",
+        "**SHIPPED:** archive, runtime, correctness, and performance evidence complete",
         "docs/BENCHMARKS.md release row",
     ),
     (
@@ -1027,15 +1002,9 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
         "engine-matrix release lifecycle",
         errors,
     )
-    if engine is not None and (
-        engine[7] != "`ACTIVE`"
-        or "W5 schema" not in engine[4]
-        or "install/archive/publish implementation and all real release evidence "
-        "remain pending" not in engine[4]
-    ):
+    if engine is not None and (engine[7] != "`ACTIVE`" or "W5 schema" not in engine[4] or "install/archive/publish implementation and all real release evidence remain pending" not in engine[4]):
         errors.append(
-            "engine-matrix release lifecycle must be ACTIVE with W5 implemented "
-            "and install/archive/publish plus real evidence pending"
+            "engine-matrix release lifecycle must be ACTIVE with W5 implemented and install/archive/publish plus real evidence pending"
         )
 
     roadmap = _table_record(
@@ -1046,15 +1015,9 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
         "roadmap release lifecycle",
         errors,
     )
-    if roadmap is not None and (
-        roadmap[5] != "`ACTIVE`"
-        or "W5 versioned manifest" not in roadmap[6]
-        or "W1-W4 and W6-W13 remain pending" not in roadmap[6]
-        or "no archive exists" not in roadmap[6]
-    ):
+    if roadmap is not None and (roadmap[5] != "`ACTIVE`" or "W5 versioned manifest" not in roadmap[6] or "W1-W4 and W6-W13 remain pending" not in roadmap[6] or "no archive exists" not in roadmap[6]):
         errors.append(
-            "roadmap release lifecycle must be ACTIVE with W5 implemented while "
-            "W1-W4/W6-W13 and archives remain pending"
+            "roadmap release lifecycle must be ACTIVE with W5 implemented while W1-W4/W6-W13 and archives remain pending"
         )
 
     coordination = _table_record(
@@ -1065,17 +1028,9 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
         "coordination release lifecycle",
         errors,
     )
-    if coordination is not None and (
-        coordination[6] != "`ACTIVE`"
-        or "W5 implemented"
-        not in coordination[5]
-        or "Excludes W1-W4, W6-W13" not in coordination[5]
-        or "no archive or real runtime/correctness/performance evidence"
-        not in coordination[7]
-    ):
+    if coordination is not None and (coordination[6] != "`ACTIVE`" or "W5 implemented" not in coordination[5] or "Excludes W1-W4, W6-W13" not in coordination[5] or "no archive or real runtime/correctness/performance evidence" not in coordination[7]):
         errors.append(
-            "coordination release lifecycle must keep W5 ACTIVE and implemented "
-            "while later work and real artifact evidence remain pending"
+            "coordination release lifecycle must keep W5 ACTIVE and implemented while later work and real artifact evidence remain pending"
         )
 
     state_path = root / ".agents/state.md"
@@ -1095,10 +1050,7 @@ def _release_lifecycle_errors(root: Path) -> list[str]:
             end = state_text.find("\n## ", start)
             section = state_text[start:] if end < 0 else state_text[start:end]
             if STATE_RELEASE_LIFECYCLE not in _normalize_prose(section):
-                errors.append(
-                    "state release lifecycle must say W5 advances the row only to "
-                    "ACTIVE, never DONE or GATING"
-                )
+                errors.append("state release lifecycle must say W5 advances the row only to ACTIVE, never DONE or GATING")
     return errors
 
 
@@ -1303,13 +1255,9 @@ def contract_errors(root: Path) -> list[str]:
         if fields.get(key) != expected:
             errors.append(_field_error(key, fields.get(key), expected))
 
-    if (
-        "Status: accepted contract with W5 manifest tooling implemented for\n"
-        "`ENG-RELEASE-BINARIES`." not in text
-    ):
+    if "Status: accepted contract with W5 manifest tooling implemented for\n`ENG-RELEASE-BINARIES`." not in text:
         errors.append(
-            "release spec identity/status line must name the accepted W5 "
-            "ENG-RELEASE-BINARIES contract"
+            "release spec identity/status line must name the accepted W5 ENG-RELEASE-BINARIES contract"
         )
 
     header = "| Work | Deps | Deliverable | Exit gate |"

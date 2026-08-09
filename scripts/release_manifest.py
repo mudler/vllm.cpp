@@ -27,16 +27,8 @@ PRIMARY_CUDA_SMS = (
     "80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a"
 )
 AOT_AVAILABILITY = {
-    "80": True,
-    "86": True,
-    "87": False,
-    "89": True,
-    "90a": True,
-    "100a": True,
-    "103a": False,
-    "110": False,
-    "120a": False,
-    "121a": True,
+    "80": True, "86": True, "87": False, "89": True, "90a": True,
+    "100a": True, "103a": False, "110": False, "120a": False, "121a": True,
 }
 PUBLISHED_EVIDENCE = ("build", "archive_smoke", "dependency_audit")
 STABLE_EVIDENCE = ("runtime", "correctness")

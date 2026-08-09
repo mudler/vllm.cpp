@@ -33,6 +33,7 @@ class PathClassification(unittest.TestCase):
             ".github/workflows/ci.yml": "ci",
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
+            "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
         }
         for path, path_class in expected.items():
             with self.subTest(path=path):
@@ -96,6 +97,10 @@ class PathClassification(unittest.TestCase):
         self.assertNotEqual(
             checker.recognized_evidence("scripts/check-policy.py"),
             "tests/scripts/test_policy_contract_extra.py",
+        )
+        self.assertEqual(
+            checker.recognized_evidence("scripts/check-agent-record.py"),
+            "tests/scripts/test_agent_record.py",
         )
 
 

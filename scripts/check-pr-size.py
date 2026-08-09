@@ -174,8 +174,12 @@ SYNC_RECORD = re.compile(r"\.agents/sync/[A-Za-z0-9_.-]+\.md\Z")
 HOOK = re.compile(r"\.githooks/(?:README\.md|[A-Za-z0-9_.-]+)\Z")
 BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/[A-Za-z0-9_.-]+\.(?:json|png|gif|mp4|log)\Z")
 ASSET = re.compile(r"assets/[A-Za-z0-9_.-]+\.(?:png|svg)\Z")
+RELEASE_MANIFEST_FIXTURE = re.compile(
+    r"tests/scripts/fixtures/release_manifest/v[0-9]+/[a-z0-9-]+\.json\Z"
+)
 
 CHECKER_EVIDENCE_OVERRIDES = {
+    "scripts/check-agent-record.py": "tests/scripts/test_agent_record.py",
     "scripts/check-policy.py": "tests/scripts/test_policy_contract.py",
     "scripts/check-role-discipline.py": "tests/scripts/test_check_pr_size.py",
     "scripts/check-doc-checkpoint.py": "tests/scripts/test_doc_checkpoint.py",
@@ -292,7 +296,7 @@ def classify_path(path: str) -> str:
         return "ci"
     if HOOK.fullmatch(path):
         return "ci"
-    if ASSET.fullmatch(path):
+    if ASSET.fullmatch(path) or RELEASE_MANIFEST_FIXTURE.fullmatch(path):
         return "asset"
     if path.startswith("third_party/"):
         return "vendored_dependency"

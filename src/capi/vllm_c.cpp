@@ -1627,6 +1627,7 @@ VLLM_API const char* vllm_version(void) {
 }
 
 VLLM_API int32_t vllm_server_main(int32_t argc, char** argv) {
+#ifdef VLLM_CPP_SERVER
   // The server owns its own error reporting on stderr (it is a PROCESS entry
   // point, not a request call), so this does not set vllm_last_error. What it
   // must guarantee is that nothing throws across the C boundary.
@@ -1640,6 +1641,24 @@ VLLM_API int32_t vllm_server_main(int32_t argc, char** argv) {
     std::fprintf(stderr, "vllm_server_main: unknown error\n");
     return 1;
   }
+#else
+  // The server translation unit is compiled ONLY under VLLM_CPP_SERVER (it pulls
+  // in the vendored httplib transport). The SYMBOL still has to exist in every
+  // build: it is part of ABI v17, and a consumer that dlopen's the library and
+  // resolves entry points must find it rather than fail to load. So this arm
+  // reports the missing capability instead of the symbol going missing.
+  //
+  // Getting this wrong broke a real downstream build: LocalAI links libvllm with
+  // the server OFF, and the unconditional call left
+  // vllm::entrypoints::openai::VllmServerMain undefined at dylib link time.
+  (void)argc;
+  (void)argv;
+  SetError(
+      "vllm_server_main: this library was built without VLLM_CPP_SERVER; "
+      "rebuild with -DVLLM_CPP_SERVER=ON to serve HTTP");
+  std::fprintf(stderr, "%s\n", vllm_last_error());
+  return 1;
+#endif
 }
 
 VLLM_API int32_t vllm_abi_version(void) { return VLLM_ABI_VERSION; }

@@ -359,9 +359,6 @@ class RollRecordTests(unittest.TestCase):
         self.assertTrue(all("not a heading" not in t for t, _ in sections))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # docs/STATUS.md is guarded by a RATCHET, not a budget: it may only shrink. The
 # mutations therefore prove both directions -- growth fails, shrinkage passes --
@@ -473,3 +470,5 @@ class StatusRatchet(unittest.TestCase):
                     f"measured {measured[key]}; lower it in the change that shrank "
                     "the page",
                 )
+if __name__ == "__main__":
+    unittest.main()

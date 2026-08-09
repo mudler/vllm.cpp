@@ -155,6 +155,7 @@ on CUDA/CPU builds beyond the documented behavior.
 | `VT_GEMMA4_RESIDENT_EXPERTS` | unset | `=1` preloads the Gemma-4 MoE experts resident on the GPU(s) after the first use instead of streaming them per step (discrete-ROCm optimization). No-op (with a stderr note) on a binary built without `-DVLLM_CPP_HIP` |
 | `VT_GEMMA4_RESIDENT_GPUS` | `2` | Number of GPUs across which resident Gemma-4 experts are spread; clamped to the ROCm device count. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
 | `VT_GEMMA4_RESIDENT_MAX_LAYERS` | (all) | Caps how many MoE layers get resident-preloaded, to fit a smaller VRAM budget. Read only when `VT_GEMMA4_RESIDENT_EXPERTS=1` |
+| `VLLM_CPP_HTTP_FIXED_POOL` | `1` (fixed) | `=0` reverts the HTTP worker pool to the legacy dynamic mode. Production uses the capacity-derived fixed pool; the opt-out exists for same-binary A/B attribution |
 | `VT_ROCM_ATTN_CPU_REF` | unset | `=1` routes ROCm paged attention through the CPU reference kernel instead of the HIP kernel — a correctness A/B for the ROCm attention bring-up |
 | `VT_DEBUG_SAMPLED` | unset | `=1` prints the per-step sampled token id(s) to stderr (sampling-loop debug). Read-only; does not change output. Read once per token, so it does not stall the hot loop |
 

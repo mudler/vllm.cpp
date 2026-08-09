@@ -33,6 +33,7 @@ class PathClassification(unittest.TestCase):
             ".github/workflows/ci.yml": "ci",
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
             "release/manifest-v1.schema.json": "configuration",
+            "scripts/env-doc-allowlist.txt": "configuration",
             "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
         }
         for path, path_class in expected.items():

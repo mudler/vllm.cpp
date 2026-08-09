@@ -293,6 +293,8 @@ def classify_path(path: str) -> str:
         return "asset"
     if path.startswith("third_party/"):
         return "vendored_dependency"
+    if path == "release/manifest-v1.schema.json":
+        return "configuration"
     if path in {
         "CMakeLists.txt", ".env.example", ".gitignore", ".dockerignore",
         ".clang-format", ".gitattributes", "flake.lock", "flake.nix",

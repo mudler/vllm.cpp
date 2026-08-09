@@ -31,6 +31,7 @@ class PathClassification(unittest.TestCase):
             "docs/STATUS.md": "public_document",
             ".github/workflows/ci.yml": "ci",
             "src/vt/vulkan/vulkan_spirv.cpp": "generated",
+            "release/manifest-v1.schema.json": "configuration",
         }
         for path, path_class in expected.items():
             with self.subTest(path=path):
@@ -338,6 +339,7 @@ class BudgetEnforcement(unittest.TestCase):
             ".github/workflows/ci.yml",
             "scripts/agent-role.py",
             ".env.example",
+            "release/manifest-v1.schema.json",
         )
         for path in governed:
             with self.subTest(path=path):

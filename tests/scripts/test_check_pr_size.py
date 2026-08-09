@@ -24,6 +24,7 @@ class PathClassification(unittest.TestCase):
     def test_each_mutable_surface_has_an_explicit_class(self) -> None:
         expected = {
             "src/vt/x.cpp": "product",
+            "scripts/check-release-binary-contract.py": "product",
             "scripts/check-policy.py": "governance_checker",
             "tests/scripts/test_policy_contract.py": "governance_test",
             ".agents/policy.csv": "policy",

@@ -148,6 +148,7 @@ GOVERNANCE_SUPPORT_FILES = frozenset(
         "scripts/agent-preflight.sh",
     }
 )
+PRODUCT_CHECKER_FILES = frozenset({"scripts/check-release-binary-contract.py"})
 PUBLIC_DOCUMENT_FILES = frozenset(
     {
         "README.md",
@@ -281,6 +282,8 @@ def classify_path(path: str) -> str:
         return "design"
     if path in PUBLIC_DOCUMENT_FILES or DOC.fullmatch(path):
         return "public_document"
+    if path in PRODUCT_CHECKER_FILES:
+        return "product"
     if CHECKER.fullmatch(path):
         return "governance_checker"
     if CHECKER_TEST.fullmatch(path):

@@ -463,6 +463,22 @@ void RunRequestDelivery(vllm_request* request) noexcept {
 
 }  // namespace
 
+namespace {
+
+// C++ LINKAGE, deliberately hoisted ABOVE the `extern "C"` block below.
+//
+// This helper returns std::string. Defined INSIDE `extern "C"` it inherits C
+// linkage while returning a C++ type: GCC only warns, but Apple Clang's
+// -Wreturn-type-c-linkage is an ERROR under the -Werror this project builds
+// with, so the whole C ABI failed to compile there. Found downstream by the
+// LocalAI vllm-cpp backend, which had to vendor a patch against a pinned SHA to
+// build its metal-darwin-arm64 lane; this is that patch, upstream.
+//
+// Keep helpers that return or take C++ types on THIS side of the boundary.
+std::string OrEmpty(const char* s) { return s == nullptr ? std::string() : std::string(s); }
+
+}  // namespace
+
 extern "C" {
 
 VLLM_API vllm_model_params vllm_model_params_default(void) {
@@ -1396,12 +1412,6 @@ VLLM_API vllm_video_params vllm_video_params_default(void) {
   std::memset(&p, 0, sizeof(p));
   return p;
 }
-
-namespace {
-
-std::string OrEmpty(const char* s) { return s == nullptr ? std::string() : std::string(s); }
-
-}  // namespace
 
 // The opaque video handle: owns the loaded checkpoint set + staged weights.
 struct vllm_video_engine {

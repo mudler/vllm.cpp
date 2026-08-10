@@ -174,7 +174,11 @@ MATRICES = {
     # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
     # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
     # the broad CPU-backend row.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 51),
+    # 52 since 2026-08-10 (issue #284): +`KERNEL-GEMM-CPU-ELEM-A76`, the
+    # Raspberry Pi 5 Cortex-A76 BF16 specialization of the elementwise GEMM.
+    # The C++/NEON row is separately gateable from the broad portable family;
+    # assembly is explicitly blocked until its C++ path beats llama.cpp E2E.
+    "KERNEL": (AGENTS / "kernel-matrix.md", 52),
     # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
     # itself, which is a cross-backend platform concern rather than a platform).
     # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does

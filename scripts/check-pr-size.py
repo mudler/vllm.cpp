@@ -159,6 +159,13 @@ CHECKER_TEST = re.compile(r"tests/scripts/test_[a-z0-9]+(?:_[a-z0-9]+)*\.py\Z")
 CI = re.compile(r"\.github/(?:workflows/[A-Za-z0-9_.-]+\.ya?ml|dependabot\.yml|pull_request_template\.md)\Z")
 DESIGN = re.compile(r"docs/superpowers/specs/[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9-]+\.md\Z")
 DOC = re.compile(r"docs/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:md|png|svg|json)\Z")
+# The published documentation site. Its layouts, CSS, config and assets are
+# prose and presentation for a PUBLIC surface, reviewed the way the documents
+# themselves are -- not product code, and not CI (the workflow that publishes it
+# keeps its own `ci` class). One class for the whole directory on purpose:
+# splitting layouts from config would let a large redesign hide half its diff in
+# the cheaper bucket, which is the blanket-exemption failure AGENTS.md names.
+SITE = re.compile(r"website/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
 SPEC = re.compile(r"\.agents/specs/[A-Za-z0-9_.-]+\.md\Z")
 SPEC_EVIDENCE = re.compile(r"\.agents/specs/[A-Za-z0-9_.-]+\.(?:patch|json|log)\Z")
 COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
@@ -351,7 +358,7 @@ def classify_path(path: str) -> str:
         return "governance_support"
     if DESIGN.fullmatch(path):
         return "design"
-    if path in PUBLIC_DOCUMENT_FILES or DOC.fullmatch(path):
+    if path in PUBLIC_DOCUMENT_FILES or DOC.fullmatch(path) or SITE.fullmatch(path):
         return "public_document"
     if path in PRODUCT_CHECKER_FILES:
         return "product"

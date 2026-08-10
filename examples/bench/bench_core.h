@@ -40,6 +40,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <random>
@@ -67,6 +68,29 @@
 
 namespace vllm::bench {
 
+enum class OutputWaitMode {
+  kPoll,
+  kBlockingC1,
+};
+
+inline const char* OutputWaitModeName(OutputWaitMode mode) {
+  switch (mode) {
+    case OutputWaitMode::kPoll:
+      return "poll";
+    case OutputWaitMode::kBlockingC1:
+      return "blocking-c1";
+  }
+  throw std::invalid_argument("unknown benchmark output wait mode");
+}
+
+inline OutputWaitMode ParseOutputWaitMode(std::string_view name) {
+  if (name == "poll") return OutputWaitMode::kPoll;
+  if (name == "blocking-c1") return OutputWaitMode::kBlockingC1;
+  throw std::invalid_argument("unknown benchmark output wait '" +
+                              std::string(name) +
+                              "' (expected poll or blocking-c1)");
+}
+
 // ── Config (mirrors the `vllm bench throughput` / `serve` knobs we support) ────
 struct BenchConfig {
   // Empty => SYNTHETIC tiny CPU engine (smoke). Otherwise a model dir / .gguf.
@@ -76,6 +100,10 @@ struct BenchConfig {
   std::string dataset_path;
   // Optional JSON output path containing generated IDs in submission order.
   std::string output_token_ids_path;
+  // Optional structured result artifact. This is separate from
+  // output_token_ids_path so the established array-only token fixture stays
+  // byte-compatible.
+  std::string output_json_path;
   // Optional speculative-decoding config JSON, e.g.
   // '{"method":"mtp","num_speculative_tokens":1}'. Empty => spec decode OFF
   // (production non-spec path, byte-identical to pre-existing runs). Parsed via
@@ -86,6 +114,10 @@ struct BenchConfig {
   int input_len = 16;      // L: target prompt tokens per request.
   int output_len = 16;     // O: max_tokens per request (greedy => exactly O).
   int concurrency = 4;     // C: max in-flight requests admitted to the engine.
+  // `poll` preserves the production benchmark's scan+yield loop. The
+  // concurrency-1-only `blocking-c1` control performs the same nowait probe,
+  // then blocks on the sole collector so Pi measurements can isolate polling.
+  OutputWaitMode output_wait = OutputWaitMode::kPoll;
   uint64_t seed = 0;       // prompt-generation RNG seed.
   double temperature = 0;  // <= 0 => greedy (deterministic).
   bool quiet = false;      // suppress per-progress logging to stderr.
@@ -129,6 +161,10 @@ struct BenchResult {
   // result so a benchmark artifact cannot silently mix frontend modes.
   bool pretokenized_admission = false;
   int max_concurrent_batches = 1;
+  OutputWaitMode output_wait = OutputWaitMode::kPoll;
+  // Number of calls made to AsyncLLM::get_output after a failed nowait probe.
+  // This proves a blocking-c1 artifact actually exercised its control path.
+  int64_t blocking_wait_calls = 0;
   int completed = 0;
   double duration_s = 0.0;
   int64_t total_input = 0;
@@ -532,6 +568,11 @@ inline SamplingParams MakeSampling(const BenchConfig& cfg, int req_index) {
 inline BenchResult RunBench(const BenchConfig& cfg) {
   using Clock = std::chrono::steady_clock;
 
+  if (cfg.output_wait == OutputWaitMode::kBlockingC1 && cfg.concurrency != 1) {
+    throw std::invalid_argument(
+        "benchmark output wait 'blocking-c1' requires --concurrency 1");
+  }
+
   std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded;
   std::vector<std::string> prompts;
   prompts.reserve(static_cast<size_t>(cfg.num_prompts));
@@ -616,6 +657,7 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   int next = 0;       // next prompt index to submit.
   int in_flight = 0;  // requests currently admitted + unfinished.
   int done = 0;
+  int64_t blocking_wait_calls = 0;
 
   auto admit = [&]() {
     const int available = cfg.concurrency - in_flight;
@@ -670,6 +712,36 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
     in_flight += wave_size;
   };
 
+  auto consume_output = [&](auto it, RequestOutput out) {
+    RequestRecord& rec = records[out.request_id];
+    if (rec.prompt_tokens == 0 && !out.prompt_token_ids.empty()) {
+      rec.prompt_tokens = static_cast<int>(out.prompt_token_ids.size());
+      rec.prompt_token_ids = out.prompt_token_ids;
+    }
+    if (!out.outputs.empty() && !out.outputs[0].token_ids.empty()) {
+      const double t = now_s();
+      const int n_new = static_cast<int>(out.outputs[0].token_ids.size());
+      if (rec.first_token_s < 0.0) {
+        rec.first_token_s = t;  // TTFT reference.
+      } else {
+        rec.itls.push_back(t - rec.last_token_s);  // one ITL per chunk.
+      }
+      rec.last_token_s = t;
+      rec.output_tokens += n_new;
+      rec.output_token_ids.insert(rec.output_token_ids.end(),
+                                  out.outputs[0].token_ids.begin(),
+                                  out.outputs[0].token_ids.end());
+    }
+    if (out.finished && !rec.finished) {
+      rec.finished = true;
+      rec.completion_s = now_s();
+      --in_flight;
+      ++done;
+      return active.erase(it);
+    }
+    return std::next(it);
+  };
+
   admit();
   while (done < cfg.num_prompts) {
     bool observed_output = false;
@@ -680,43 +752,28 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
         continue;
       }
       observed_output = true;
-      RequestOutput& out = *ready;
-      RequestRecord& rec = records[out.request_id];
-      if (rec.prompt_tokens == 0 && !out.prompt_token_ids.empty()) {
-        rec.prompt_tokens = static_cast<int>(out.prompt_token_ids.size());
-        rec.prompt_token_ids = out.prompt_token_ids;
-      }
-      if (!out.outputs.empty() && !out.outputs[0].token_ids.empty()) {
-        const double t = now_s();
-        const int n_new = static_cast<int>(out.outputs[0].token_ids.size());
-        if (rec.first_token_s < 0.0) {
-          rec.first_token_s = t;  // TTFT reference.
-        } else {
-          rec.itls.push_back(t - rec.last_token_s);  // one ITL per chunk.
+      it = consume_output(it, std::move(*ready));
+    }
+    if (!observed_output) {
+      if (cfg.output_wait == OutputWaitMode::kBlockingC1) {
+        // Validation above guarantees the sole active collector is also the
+        // sole admitted request. The scan already performed the required
+        // nowait probe, matching AsyncLLM::generate before this blocking wait.
+        if (active.size() != 1) {
+          throw std::logic_error(
+              "blocking-c1 benchmark must have exactly one active request");
         }
-        rec.last_token_s = t;
-        rec.output_tokens += n_new;
-        rec.output_token_ids.insert(rec.output_token_ids.end(),
-                                    out.outputs[0].token_ids.begin(),
-                                    out.outputs[0].token_ids.end());
-      }
-      if (out.finished && !rec.finished) {
-        rec.finished = true;
-        rec.completion_s = now_s();
-        --in_flight;
-        ++done;
-        it = active.erase(it);
+        auto it = active.begin();
+        ++blocking_wait_calls;
+        it = consume_output(it, engine.get_output(it->second));
+        (void)it;
       } else {
-        ++it;
+        // Exact historical policy: yield rather than block on an arbitrary
+        // request, which could delay a ready peer at concurrency greater than 1.
+        std::this_thread::yield();
       }
     }
     admit();  // keep C in flight as requests finish.
-    if (!observed_output) {
-      // The output-handler thread will publish the next per-request DELTA.
-      // Yield rather than block on an arbitrary request: blocking on one
-      // collector can delay ready outputs for other requests and distort ITL.
-      std::this_thread::yield();
-    }
   }
 
   const double dur_s = now_s();
@@ -748,6 +805,8 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   res.async_scheduling_enabled = loaded->async_scheduling_enabled();
   res.pretokenized_admission = pretokenized_admission;
   res.max_concurrent_batches = loaded->max_concurrent_batches();
+  res.output_wait = cfg.output_wait;
+  res.blocking_wait_calls = blocking_wait_calls;
   res.prompt_token_ids.resize(static_cast<size_t>(cfg.num_prompts));
   res.output_token_ids.resize(static_cast<size_t>(cfg.num_prompts));
   res.completed = done;
@@ -807,6 +866,32 @@ inline void WriteOutputTokenIds(const std::string& path,
   out << nlohmann::json(result.output_token_ids).dump() << '\n';
 }
 
+inline nlohmann::json ResultJson(const BenchConfig& cfg,
+                                 const BenchResult& result) {
+  return {{"output_wait", OutputWaitModeName(result.output_wait)},
+          {"blocking_wait_calls", result.blocking_wait_calls},
+          {"concurrency", cfg.concurrency},
+          {"completed", result.completed},
+          {"duration_s", result.duration_s},
+          {"total_input", result.total_input},
+          {"total_output", result.total_output},
+          {"request_throughput", result.request_throughput},
+          {"output_throughput", result.output_throughput},
+          {"prefill_throughput", result.prefill_throughput},
+          {"mean_per_stream_decode", result.mean_per_stream_decode},
+          {"mean_ttft_ms", result.mean_ttft_ms},
+          {"mean_tpot_ms", result.mean_tpot_ms},
+          {"mean_e2el_ms", result.mean_e2el_ms},
+          {"output_token_ids", result.output_token_ids}};
+}
+
+inline void WriteResultJson(const std::string& path, const BenchConfig& cfg,
+                            const BenchResult& result) {
+  std::ofstream out(path);
+  if (!out) throw std::runtime_error("cannot write benchmark JSON: " + path);
+  out << ResultJson(cfg, result).dump() << '\n';
+}
+
 // Print the summary table, mirroring serve.py's "Serving Benchmark Result"
 // block + our prefill/decode split. Fixed-width columns like serve.py
 // ("{:<40} {:<10.2f}").
@@ -827,6 +912,10 @@ inline void PrintReport(const BenchConfig& cfg, const BenchResult& r,
   std::fprintf(out, "\n============= vllm.cpp Benchmark Result =============\n");
   std::fprintf(out, "%-42s %-12s\n", "Engine frontend:",
                r.async_frontend ? "AsyncLLM" : "LLMEngine");
+  std::fprintf(out, "%-42s %-12s\n", "Output wait:",
+               OutputWaitModeName(r.output_wait));
+  line_i("Blocking wait calls:",
+         static_cast<long long>(r.blocking_wait_calls));
   line_i("Async scheduling enabled:", r.async_scheduling_enabled ? 1 : 0);
   line_i("Pretokenized prompt admission:", r.pretokenized_admission ? 1 : 0);
   line_i("Maximum concurrent batches:", r.max_concurrent_batches);

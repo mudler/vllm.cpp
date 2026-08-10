@@ -22,6 +22,7 @@ using vllm::bench::BenchConfig;
 using vllm::bench::BenchResult;
 using vllm::bench::DispatchBenchPromptAdmission;
 using vllm::bench::DispatchBenchPromptWaveAdmission;
+using vllm::bench::OutputWaitMode;
 using vllm::bench::PretokenizeBenchPromptsThenStartClock;
 using vllm::bench::RunBench;
 
@@ -294,6 +295,48 @@ TEST_CASE("bench: pretokenized vectors match timed-string InputProcessor") {
     CHECK(prepared[i] == timed_string.prompt_token_ids);
   }
   CHECK(clock_value == 17);
+}
+
+TEST_CASE("bench: blocking-c1 selector rejects concurrent requests by name") {
+  BenchConfig cfg;
+  cfg.num_prompts = 2;
+  cfg.input_len = 8;
+  cfg.output_len = 4;
+  cfg.concurrency = 2;
+  cfg.output_wait = OutputWaitMode::kBlockingC1;
+
+  CHECK_THROWS_WITH_AS(
+      RunBench(cfg),
+      "benchmark output wait 'blocking-c1' requires --concurrency 1",
+      std::invalid_argument);
+}
+
+TEST_CASE("bench: blocking-c1 exercises blocking control with exact tokens") {
+  BenchConfig cfg;
+  cfg.num_prompts = 3;
+  cfg.input_len = 8;
+  cfg.output_len = 4;
+  cfg.concurrency = 1;
+  cfg.seed = 91;
+
+  const BenchResult poll = RunBench(cfg);
+  cfg.output_wait = OutputWaitMode::kBlockingC1;
+  const BenchResult blocking = RunBench(cfg);
+
+  CHECK(poll.output_wait == OutputWaitMode::kPoll);
+  CHECK(poll.blocking_wait_calls == 0);
+  CHECK(blocking.output_wait == OutputWaitMode::kBlockingC1);
+  CHECK(blocking.blocking_wait_calls > 0);
+  CHECK(blocking.completed == poll.completed);
+  CHECK(blocking.total_input == poll.total_input);
+  CHECK(blocking.total_output == poll.total_output);
+  CHECK(blocking.output_token_ids == poll.output_token_ids);
+
+  const nlohmann::json artifact = vllm::bench::ResultJson(cfg, blocking);
+  CHECK(artifact.at("output_wait") == "blocking-c1");
+  CHECK(artifact.at("blocking_wait_calls").get<int64_t>() > 0);
+  CHECK(artifact.at("output_token_ids") ==
+        nlohmann::json(blocking.output_token_ids));
 }
 
 TEST_CASE("bench: synthetic engine completes all requests with sane metrics") {

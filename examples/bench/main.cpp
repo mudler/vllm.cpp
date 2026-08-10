@@ -12,7 +12,8 @@
 //   vllm-bench [--model <dir|.gguf>] [--dataset-path <sharegpt.json>]
 //              [--num-prompts N] [--input-len L]
 //              [--output-len O] [--concurrency C] [--seed S]
-//              [--temperature T] [--output-token-ids <json>]
+//              [--temperature T] [--output-wait poll|blocking-c1]
+//              [--output-token-ids <json>] [--output-json <json>]
 //
 // With NO --model it builds a SYNTHETIC tiny CPU engine so the harness runs on
 // the dev box (toy weights => meaningless numbers; the point is the harness).
@@ -46,6 +47,8 @@ void Usage(const char* argv0, std::FILE* out) {
       "          [--output-len O] [--concurrency C] [--seed S]\n"
       "          [--temperature T] [--max-num-batched-tokens B]\n"
       "          [--output-token-ids <json>]\n"
+      "          [--output-json <json>]\n"
+      "          [--output-wait poll|blocking-c1]\n"
       "          [--speculative-config <json>]\n"
       "\n"
       "Throughput/latency benchmark over the vllm.cpp V1 AsyncLLM, mirroring\n"
@@ -86,6 +89,17 @@ bool ParseArgs(int argc, char** argv, BenchConfig& cfg, int& exit_code) {
       cfg.temperature = std::atof(NextArg(argc, argv, i));
     } else if (flag == "--output-token-ids") {
       cfg.output_token_ids_path = NextArg(argc, argv, i);
+    } else if (flag == "--output-json") {
+      cfg.output_json_path = NextArg(argc, argv, i);
+    } else if (flag == "--output-wait") {
+      try {
+        cfg.output_wait =
+            vllm::bench::ParseOutputWaitMode(NextArg(argc, argv, i));
+      } catch (const std::invalid_argument& e) {
+        std::fprintf(stderr, "vllm-bench: %s\n", e.what());
+        exit_code = 2;
+        return false;
+      }
     } else if (flag == "--max-num-batched-tokens") {
       cfg.max_num_batched_tokens = std::atoi(NextArg(argc, argv, i));
     } else if (flag == "--num-blocks") {
@@ -111,6 +125,14 @@ bool ParseArgs(int argc, char** argv, BenchConfig& cfg, int& exit_code) {
     exit_code = 2;
     return false;
   }
+  if (cfg.output_wait == vllm::bench::OutputWaitMode::kBlockingC1 &&
+      cfg.concurrency != 1) {
+    std::fprintf(stderr,
+                 "vllm-bench: benchmark output wait 'blocking-c1' requires "
+                 "--concurrency 1\n");
+    exit_code = 2;
+    return false;
+  }
   return true;
 }
 
@@ -125,18 +147,23 @@ int main(int argc, char** argv) {
 
   std::fprintf(stderr,
                "vllm-bench: %s engine | num_prompts=%d input_len=%d "
-               "output_len=%d concurrency=%d seed=%llu temp=%.2f dataset=%s\n",
+               "output_len=%d concurrency=%d seed=%llu temp=%.2f dataset=%s "
+               "output_wait=%s\n",
                cfg.model_path.empty() ? "SYNTHETIC (no --model)"
                                        : cfg.model_path.c_str(),
                cfg.num_prompts, cfg.input_len, cfg.output_len, cfg.concurrency,
                static_cast<unsigned long long>(cfg.seed), cfg.temperature,
-               cfg.dataset_path.empty() ? "generated" : cfg.dataset_path.c_str());
+               cfg.dataset_path.empty() ? "generated" : cfg.dataset_path.c_str(),
+               vllm::bench::OutputWaitModeName(cfg.output_wait));
 
   try {
     const vllm::bench::BenchResult res = vllm::bench::RunBench(cfg);
     vllm::bench::PrintReport(cfg, res, stdout);
     if (!cfg.output_token_ids_path.empty()) {
       vllm::bench::WriteOutputTokenIds(cfg.output_token_ids_path, res);
+    }
+    if (!cfg.output_json_path.empty()) {
+      vllm::bench::WriteResultJson(cfg.output_json_path, cfg, res);
     }
     if (res.completed != cfg.num_prompts) {
       std::fprintf(stderr,

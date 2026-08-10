@@ -119,13 +119,17 @@ body {
   background: var(--paper-2);
 }
 .sidebar .brand { display: block; margin-bottom: 1.35rem; }
-.sidebar .brand img { display: block; width: 100%; max-width: 11.5rem; height: auto; }
-/* One logo file per scheme; the wrong one is simply not rendered. */
-.logo-light { display: block; }
-.logo-dark  { display: none; }
+.sidebar .brand img { width: 100%; max-width: 11.5rem; height: auto; }
+/* One logo file per scheme; the wrong one is simply not rendered.
+   These selectors MUST match the specificity of `.sidebar .brand img` above.
+   Written as bare `.logo-dark` they lose to it (0,1,0 against 0,2,1), its
+   `display: block` wins, and BOTH logos render stacked — which is exactly what
+   happened. The `display` declaration is deliberately not in the shared rule. */
+.sidebar .brand img.logo-light { display: block; }
+.sidebar .brand img.logo-dark  { display: none; }
 @media (prefers-color-scheme: dark) {
-  .logo-light { display: none; }
-  .logo-dark  { display: block; }
+  .sidebar .brand img.logo-light { display: none; }
+  .sidebar .brand img.logo-dark  { display: block; }
 }
 
 .rail-label {

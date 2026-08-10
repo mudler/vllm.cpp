@@ -1,9 +1,12 @@
 {{ define "main" }}
-<article class="doc">
-  <p class="doc-kicker">vllm.cpp</p>
-  <h1>Documentation</h1>
-  <div class="lede">{{ .Content }}</div>
+<article class="doc home">
+  <p class="doc-kicker">Brought to you by the LocalAI team</p>
+  <h1>vllm.cpp</h1>
+  <p class="tagline">Same tokens as vLLM. One binary, no Python.</p>
 
+  {{ .Content }}
+
+  <h2 id="documentation">Documentation</h2>
   <ul class="cards">
     {{ range $i, $e := site.Data.nav.docs }}
       {{ $slug := lower (strings.TrimSuffix ".md" $e.file) }}

@@ -362,7 +362,17 @@ main {
 .doc img { max-width: 100%; height: auto; }
 
 /* ----------------------------------------------------------------- home --- */
-.lede {
+/* The home page opens on the project, not on the documentation. The tagline and
+   the first paragraph carry it; everything after is ordinary prose. */
+.tagline {
+  max-width: var(--measure);
+  margin: -.2rem 0 1.6rem;
+  font-family: var(--font-mono);
+  font-size: .92rem;
+  letter-spacing: -.01em;
+  color: var(--ink-faint);
+}
+.home .tagline + p {
   max-width: var(--measure);
   font-size: var(--step-1);
   line-height: 1.5;

@@ -2,7 +2,7 @@
 
 **Status:** built. Five tasks, all landed. The row stays `READY` — not because
 the work is unstarted, but because the lifecycle move itself is blocked; see
-delta 9 and [Remaining](#remaining).
+delta 11 and [Remaining](#remaining).
 
 **Goal:** Publish the 11 `docs/*.md` as a browsable site at
 `https://mudler.github.io/vllm.cpp/` without creating a second copy of the prose.
@@ -56,79 +56,36 @@ table and the tables are the content.
 
 ## Deltas from the plan as written
 
-Everything below was discovered by building and running the thing, not by
-reading. Recorded because each one is a trap for the next person.
+Every one of these was found by building and running the thing, not by reading
+it. Each is a trap for the next person.
 
-**1. A one-shot `hugo` build is not proof the site works.** `hugo --minify` was
-green while `hugo server` crashed. The server renders page kinds the one-shot
-build had no layout for — `/tags`, `/categories`, `/docs` — and those are
-generated pages with **no source file**, so `.File.ContentBaseName` in the title
-partial nil-dereferenced and took the whole build down. The partial now guards
-`.File`; `hugo.toml` disables `taxonomy`, `term`, `rss` and `sitemap`, none of
-which this site has any content for.
+| # | What happened | Resolution |
+|---|---|---|
+| 1 | **A one-shot `hugo` build is not proof the site works.** `hugo --minify` was green while `hugo server` crashed: the server renders page kinds with no source file (`/tags`, `/categories`, `/docs`), where `.File.ContentBaseName` nil-dereferenced | title partial guards `.File`; unused kinds disabled in `hugo.toml` |
+| 2 | **`/docs/` rendered blank.** Hugo generates the section page whether or not anything links to it. This also surfaced delta 1 — before it existed those kinds had no layout and were never rendered | added `layouts/_default/list.html` |
+| 3 | **Code blocks had no syntax highlighting at all.** `noClasses = false` emits class names and no colours; nothing shipped the classes, and the build said nothing | `assets/css/chroma.css`, generated for both schemes |
+| 4 | **The "broken tables" were not a parsing bug.** Goldmark parses every table correctly — separator counts match rendered `<table>` counts in every document (BENCHMARKS 16, FEATURES 15, USAGE 11, ENVIRONMENT 5, STATUS 1). A 46rem prose measure plus `display:block` did the damage | the broadsheet inversion, tabular figures, sticky header, per-table scroll box |
+| 5 | **Webfonts could not ship.** `check-pr-size.py` refuses binary changes outright, and a waiver is for one-time migrations with an expiry, not a permanent asset | stacks only: a serif for display, the mono for labels and table headers; zero third-party requests |
+| 6 | **Logos were duplicated into `website/static/`** — the very copy this design forbids, applied to artwork | mounted from `assets/` with `includeFiles` |
+| 7 | **Both logos rendered, stacked.** `.sidebar .brand img` (0,2,1) outranked a bare `.logo-dark { display: none }` (0,1,0) | matched specificity; `display` kept out of the shared sizing rule |
+| 8 | TOC threshold 4 -> 5 sections: at 4, `RELEASES.md` (68 lines) got furniture | `single.html` |
+| 9 | Home page opened by explaining its own build mechanism | rewritten around MANIFESTO.md's argument, condensed and linked rather than copied |
 
-**2. `/docs/` rendered blank.** Hugo generates the section page whether or not
-anything links to it, so trimming the address bar landed on an empty document.
-Added `layouts/_default/list.html`. This is also what surfaced delta 1 — before
-it existed, those kinds had no layout and were never rendered.
+**10. The README pointer could not land.** `README.md` was already 29,990 of the
+30,000-character budget `check-readme-structure.py` enforces; a 95-character link
+block takes it to 30,085. Freeing space means cutting landing-page prose, which
+is the maintainer's editorial call. **Still owed.**
 
-**3. Code blocks had no syntax highlighting at all.** `hugo.toml` sets
-`noClasses = false`, which emits class names and no inline colours. Nothing
-shipped those classes, so every code block rendered as flat text and the build
-said nothing. `assets/css/chroma.css` is generated from
-`hugo gen chromastyles` for both schemes; `website/README.md` records the
-command.
-
-**4. The stylesheet had to become a Hugo template.** Font `@font-face` URLs were
-hardcoded to `/vllm.cpp/fonts/...`, which the plan's own global constraint
-forbids. CSS inlined into `<style>` resolves relative URLs against the *page*,
-not the stylesheet, so relative paths cannot work either. `site.css` is now run
-through `resources.ExecuteAsTemplate` and uses `relURL`.
-
-**5. The first stylesheet made the tables look broken, and the tables were
-fine.** Worth stating precisely, because the instinct is to blame the parser:
-Goldmark parses every table correctly — separator counts match rendered
-`<table>` counts exactly in every document (BENCHMARKS 16, FEATURES 15, USAGE
-11, ENVIRONMENT 5, STATUS 1). The damage was a 46rem prose measure plus
-`display:block` applied to documents whose cells hold whole paragraphs. Hence
-the broadsheet inversion above, plus tabular figures, a sticky header row, and a
-scroll box that belongs to the table rather than the page.
-
-**6. The TOC threshold moved from 4 sections to 5.** At 4, `RELEASES.md` — 68
-lines — got a table of contents, which is furniture. STATUS has 11 sections and
-needs one.
-
-**7. The README pointer could not land.** `README.md` was already 29,990 of the
-30,000-character budget `check-readme-structure.py` enforces; a 95-character
-link block takes it to 30,085 and the gate refuses it. Freeing space means
-cutting existing landing-page prose, which is an editorial decision for the
-maintainer rather than something to do quietly. **Still owed** — see below.
-
-**8. Fonts and palette came from the project, not from taste.** The logo
-(`assets/logo.svg`) supplies the real brand colours — `#0f7f96` teal, `#3abbd2`
-cyan, `#131a20` ink — which replaced the README badge colours guessed at in the
-spec. Sora 700 and Geist Mono are self-hosted from the LocalAI site assets (both
-SIL OFL, attributed in `website/README.md`) so the site makes no third-party
-requests and works under a strict CSP.
-
-**9. The row could not be moved to `GATING`, and the reason is worth recording.**
-`check-doc-checkpoint.py` requires any lifecycle move to update `docs/STATUS.md`,
-`docs/BENCHMARKS.md` and `.agents/NOW.md` in the same change — correctly, since a
-state change is a claim about the project. But all three are at their
-shrink-only ratchets right now: at this branch's base, `docs/STATUS.md` measures
-**exactly** its 243,588-character ratchet (zero headroom, "this page may only
-shrink") and `.agents/NOW.md` is 5,986 of its 6,000. A one-line note in either
-one fails the gate. `check-public-doc-tables.py` also caps a BENCHMARKS cell at
-220 characters.
-
-So the move requires collapsing unrelated superseded narrative to buy space —
-which the checker explicitly prescribes ("collapse the superseded narrative …
-then lower the ratchet in the same change"), but which means editing other
-people's prose from inside a docs-site change. That is a separate, deliberate
-edit, not something to fold in here, so the row stays `READY` with its code and
-evidence anchors filled in, and the move is listed below. **This is not specific
-to this row:** any lifecycle move in the repository is blocked the same way
-until STATUS has room.
+**11. The row could not move to `GATING`.** `check-doc-checkpoint.py` requires a
+lifecycle move to update `docs/STATUS.md`, `docs/BENCHMARKS.md` and
+`.agents/NOW.md` in the same change — correctly, a state change is a claim. But
+all three sit at their shrink-only ratchets: at this branch's base `STATUS.md`
+measures **exactly** its 243,588-character ratchet (zero headroom) and `NOW.md`
+is 5,986 of 6,000, so a one-line note in either fails the gate. The move
+therefore requires collapsing unrelated superseded narrative first — which the
+checker prescribes, but which means editing other people's prose from inside a
+docs-site change. Left as a separate deliberate edit. **This is not specific to
+this row:** any lifecycle move is blocked the same way until STATUS has room.
 
 ## Verification
 
@@ -167,7 +124,7 @@ destination rather than erroring, and a Hugo bump past 0.153 would ignore
   GitHub Actions. A repository setting, not a file; the workflow is inert
   without it. This is the spec's stop condition and the reason the row is
   `GATING` rather than `DONE`.
-- [ ] **Free room on the public surfaces, then move the row** (delta 9).
+- [ ] **Free room on the public surfaces, then move the row** (delta 11).
   `docs/STATUS.md` needs space before `READY -> GATING -> DONE` can be recorded
   at all; the engine-matrix summary counts move in the same edit, and the spec
   gains its `## Outcome` section when the page resolves.

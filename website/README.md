@@ -31,6 +31,9 @@ hugo --minify -s website               # one-shot build into website/public/
 python3 scripts/check-site.py
 ```
 
+Check `hugo server`, not just `hugo`: the server renders page kinds the one-shot
+build may skip, and a template that crashes on them passes a green build.
+
 The Hugo version is pinned in the workflow. `hugo.toml` uses `excludeFiles`,
 which Hugo deprecates from 0.153 in favour of `files`; **bumping past that
 version without migrating the key would publish `docs/bench-evidence/` and
@@ -38,16 +41,10 @@ version without migrating the key would publish `docs/bench-evidence/` and
 
 ## Layout
 
-```
-hugo.toml                              mounts, pins, params
-data/nav.yaml                          sidebar order and labels
-content/_index.md                      home page prose
-layouts/partials/title.html            title from the first H1
-layouts/partials/sidebar.html          logo, filter, nav
-layouts/_default/_markup/              link + heading render hooks
-assets/css/site.css                    the design
-assets/css/chroma.css                  GENERATED, see below
-```
+`hugo.toml` holds the mounts and pins. `data/nav.yaml` is the sidebar.
+`content/_index.md` is the home page. `layouts/partials/title.html` derives
+titles, `layouts/_default/_markup/` holds the link and heading render hooks, and
+`assets/css/` holds the design plus the generated highlighting.
 
 ### Regenerating the syntax highlighting
 

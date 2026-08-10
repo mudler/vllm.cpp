@@ -345,13 +345,21 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file) {
     int64_t numel = 1;
     for (int64_t d : spec.shape) numel *= d;
     VT_CHECK(numel > 0, "minimax_h3 gguf bf16: tensor has an empty logical shape");
-    // The two buffers the forward consumes on the HOST as f32 — rope.inv_freq
-    // (it builds the cos/sin cache) and, for a pruned checkpoint, adaln_t_table
-    // (it is interpolated at the per-row timestep) — must NOT be rounded into
-    // bf16 bits here: both are read through Ptr<float>(), which is an unchecked
-    // cast, so a bf16 buffer is silently reinterpreted as garbage floats. See
-    // https://github.com/mudler/vllm.cpp/issues/244.
-    if (spec.name == "rope.inv_freq" || spec.name == "adaln_t_table") {
+    // The fp32 ISLANDS stay f32 here, consulted from the SINGLE source rather
+    // than re-listed. Two distinct hazards live behind this one predicate:
+    //
+    //   * `rope.inv_freq` and `adaln_t_table` are read on the HOST through
+    //     `Ptr<float>()`, an unchecked cast — a bf16 buffer is reinterpreted as
+    //     garbage floats, not converted (#244).
+    //   * the patch projections, the time embedder and the output heads are
+    //     upstream's fp32 island (minimax_h3_transformer.py:85-101). Those are
+    //     correctly TYPED when bound, so they are not garbage, but rounding them
+    //     here silently makes this path lower precision than every other loader.
+    //
+    // Re-listing names is what let those two drift apart: this loader named two
+    // of the seven and no gate noticed, because the rule was documented as
+    // binding on "all four staging paths" and this host loader is a fifth.
+    if (MiniMaxH3IsFp32IslandTensor(spec.name)) {
       out.storage[spec.name] = DequantGgufRowToF32(info.ggml_type, info.data, numel);
       out.shapes[spec.name] = spec.shape;
       continue;

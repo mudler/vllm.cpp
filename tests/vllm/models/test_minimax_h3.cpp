@@ -3897,6 +3897,36 @@ TEST_CASE("minimax_h3: a ComfyUI-format GGUF loads into a runnable DiT") {
   CHECK(loaded.weights.blocks[0].qkv_proj.shape[0] == 3 * inner);
   CHECK(loaded.weights.blocks[0].qkv_proj.shape[1] == want.hidden_size);
 
+  // ★ THE fp32-ISLAND RULE BINDS THE bf16 HOST LOADER TOO (#244). The rule is
+  // single-sourced in MiniMaxH3IsFp32IslandTensor and its contract says every
+  // staging path must agree; this HOST loader was a fifth path that re-listed
+  // two of the seven names by hand, so five islands silently became bf16 and no
+  // gate noticed. Two hazards ride on the same predicate: rope.inv_freq and
+  // adaln_t_table are read through an unchecked Ptr<float>() (bf16 bits
+  // reinterpreted as garbage floats), while the patch projections, the time
+  // embedder and the output heads are correctly TYPED but must not be silently
+  // down-converted on one path only.
+  {
+    const vllm::MiniMaxH3GgufDit bf16_loaded = vllm::LoadMiniMaxH3DitFromGgufBf16(gguf);
+    // Assert on the loader's OWN storage split rather than the bound views: this
+    // is the decision under test, and it is the map a tensor lands in that
+    // decides whether the forward later reads f32 bits or bf16 bits.
+    size_t islands = 0, streamed = 0;
+    for (const auto& kv : bf16_loaded.shapes) {
+      const std::string& iname = kv.first;
+      const bool is_island = vllm::MiniMaxH3IsFp32IslandTensor(iname);
+      INFO("tensor " << iname << (is_island ? " (fp32 island)" : " (bf16 stream)"));
+      CHECK(bf16_loaded.storage.count(iname) == (is_island ? 1u : 0u));
+      CHECK(bf16_loaded.bf16_storage.count(iname) == (is_island ? 0u : 1u));
+      if (is_island) ++islands; else ++streamed;
+    }
+    // The fixture carries both patch projections, the time embedder, both output
+    // heads and rope.inv_freq, so the island set is non-trivial -- a predicate
+    // that matched nothing would pass the loop above vacuously.
+    CHECK(islands >= 6);
+    CHECK(streamed > islands);
+  }
+
   // And the whole thing must actually RUN: a real forward off GGUF-loaded weights.
   const MiniMaxH3PackedSequence packed = BuildMiniMaxH3PackedSequence(
       4, 2, 4, 4, 2, 2, /*include_keyframe_cond=*/false, {}, 0);

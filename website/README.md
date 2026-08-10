@@ -10,14 +10,9 @@ Design: [`.agents/specs/gh-pages-docs-site.md`](../.agents/specs/gh-pages-docs-s
 markdown in the repository are the same bytes, so they cannot drift.
 
 **Never add a copy of a document under `content/`, and never add front matter to
-a file in `docs/`.** Everything front matter would normally carry is derived
-instead:
-
-| Normally front matter | Here |
-|---|---|
-| `title:` | the file's first `# H1` (`layouts/partials/title.html`) |
-| `weight:` | order in `data/nav.yaml` |
-| link fixups | `layouts/_default/_markup/render-link.html` |
+a file in `docs/`.** Titles come from each file's first `# H1`, sidebar order
+from `data/nav.yaml`, and internal links from the render hook in
+`layouts/_default/_markup/`.
 
 `scripts/check-site.py` gates the first two: every published doc must open with
 an `# H1`, and `data/nav.yaml` must be in bijection with the mounted set.
@@ -58,7 +53,7 @@ hugo gen chromastyles --style=github-dark  # dark, wrapped in a prefers-color-sc
 
 ## No webfonts, no third-party requests
 
-The site loads nothing from another host — no CDN, no font service, no
+The site loads nothing from another host. No CDN, no font service, no
 analytics. Typography is font stacks only: a serif does the display work and the
 monospace carries labels, kickers and table headers.
 
@@ -67,8 +62,8 @@ binary changes outright ("binary change has no reviewable line budget"), and a
 waiver is for one-time migrations with an expiry, not for a permanent asset.
 
 The logos and favicon are **mounted** from the repository's `assets/`, not
-copied here — same rule as `docs/`: a logo refreshed upstream must not leave a
-stale twin on the site. `hugo.toml`'s `includeFiles` keeps the rest of that
+copied here, the same rule as `docs/`: a logo refreshed upstream must not
+leave a stale twin on the site. `hugo.toml`'s `includeFiles` keeps the rest of that
 directory (about 1 MB of unrelated artwork) off the published site.
 
 ## A custom domain, later

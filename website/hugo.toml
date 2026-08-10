@@ -45,7 +45,7 @@ target = "static"
 includeFiles = ["logo.svg", "logo-light.svg", "logo-mark.svg", "favicon.png"]
 
 [params]
-  description = 'vllm.cpp — a from-scratch C++20 inference engine, gated token-for-token against vLLM.'
+  description = 'vllm.cpp is a from-scratch C++20 inference engine, gated against vLLM on exact token ids. No Python, no PyTorch, one binary.'
   repo = 'https://github.com/mudler/vllm.cpp'
   # Where `../`-escaping links in docs/ are sent. See layouts/_default/_markup/render-link.html.
   blobBase = 'https://github.com/mudler/vllm.cpp/blob/main/'

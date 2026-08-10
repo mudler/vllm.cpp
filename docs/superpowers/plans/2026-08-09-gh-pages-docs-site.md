@@ -10,12 +10,10 @@ delta 11 and [Remaining](#remaining).
 Spec: [`.agents/specs/gh-pages-docs-site.md`](../../../.agents/specs/gh-pages-docs-site.md).
 Row `ENG-DOCS-SITE`. Issue [#224](https://github.com/mudler/vllm.cpp/issues/224).
 
-> **Why this document is short.** It was originally a 1289-line build plan whose
-> bulk was the full text of every template, stylesheet and checker. Those files
-> now exist in the tree. Keeping a second copy of them here would be precisely
-> the drift the spec exists to prevent — *anything that must be kept in sync is
-> the defect* — so the code blocks are gone and this is now a record of what was
-> built, what changed on contact with reality, and what is left.
+> **Why this document is short.** It was a 1289-line build plan whose bulk was
+> the full text of every template, stylesheet and checker. Those files now exist
+> in the tree, and a second copy here would be the drift the spec exists to
+> prevent. The code blocks are gone; what remains is a record.
 
 ## Architecture as built
 
@@ -131,11 +129,9 @@ destination rather than erroring, and a Hugo bump past 0.153 would ignore
 
 ## Notes for whoever touches this next
 
-- **Never edit a file under `docs/` to make the site render better.** The whole
-  design rests on the mount being read-only. If a document genuinely cannot
-  render, that is a `NEEDS_DECISION`, not a quick fix.
-- **`relURL` everywhere.** The site is published under `/vllm.cpp/`, not a
-  domain root; a hardcoded `/docs/status/` works locally and 404s in production.
-- **Check `hugo server`, not just `hugo`.** See delta 1.
-- **Adding a document to `docs/` means adding it to `data/nav.yaml`.**
-  `check-site.py` fails the build otherwise, which is the point.
+Never edit a file under `docs/` to make the site render better: the design rests
+on the mount being read-only, and a document that cannot render is a
+`NEEDS_DECISION`. Use `relURL` for every internal link, because the site is
+published under `/vllm.cpp/` and a hardcoded path works locally then 404s in
+production. Check `hugo server`, not just `hugo` (delta 1). Adding a document to
+`docs/` means adding it to `data/nav.yaml`, or `check-site.py` fails the build.

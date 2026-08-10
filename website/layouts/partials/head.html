@@ -1,0 +1,20 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{{ $title := partial "title.html" . }}
+<title>{{ $title }} · {{ site.Title }}</title>
+<meta name="description" content="{{ site.Params.description }}">
+<link rel="icon" href="{{ "favicon.png" | relURL }}">
+<link rel="canonical" href="{{ .Permalink }}">
+<meta property="og:title" content="{{ $title }}">
+<meta property="og:description" content="{{ site.Params.description }}">
+<meta property="og:type" content="article">
+<meta property="og:url" content="{{ .Permalink }}">
+
+{{- /* Inlined: the whole sheet is a few KB and this is one fewer round trip on
+       a page that is otherwise a single document. No webfonts and no CDN, so
+       there is nothing to preload and no third-party request to make.
+       chroma.css is generated -- see website/README.md. */}}
+{{ $site := resources.Get "css/site.css" }}
+{{ $chroma := resources.Get "css/chroma.css" }}
+{{ $css := slice $site $chroma | resources.Concat "css/bundle.css" | minify }}
+<style>{{ $css.Content | safeCSS }}</style>

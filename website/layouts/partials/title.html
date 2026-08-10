@@ -1,0 +1,23 @@
+{{- /*
+  The mounted docs carry no front matter, so `.Title` is EMPTY for every one of
+  them. Hugo has no "use the first heading" mode, so take it from the content.
+  All 11 docs open with an `# H1` and scripts/check-site.py keeps it that way;
+  the ContentBaseName fallback is a belt-and-braces path that should never fire.
+*/ -}}
+{{- if .IsHome -}}
+  Documentation
+{{- else -}}
+  {{- $matches := findRE `(?m)^#\s+.+$` .RawContent 1 -}}
+  {{- if $matches -}}
+    {{- strings.TrimSpace (strings.TrimPrefix "#" (index $matches 0)) -}}
+  {{- else if .File -}}
+    {{- /* `.File` is NIL for generated pages -- section lists, taxonomies --
+           which have no source file at all. Reaching for .ContentBaseName on
+           one is a nil dereference that takes the whole build down, and a
+           single-page `hugo` run does not necessarily render them, so it can
+           hide behind a green build and surface under `hugo server`. */ -}}
+    {{- .File.ContentBaseName -}}
+  {{- else -}}
+    {{- .Title | default site.Title -}}
+  {{- end -}}
+{{- end -}}

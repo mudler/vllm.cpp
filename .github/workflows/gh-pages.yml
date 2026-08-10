@@ -1,0 +1,98 @@
+name: docs site
+
+# Build on every PR that touches the site or the documents it publishes, so a
+# site that does not compile fails review instead of main. Deploy only from
+# main.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'website/**'
+      - 'assets/**'
+      - 'scripts/check-site.py'
+      - '.github/workflows/gh-pages.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'website/**'
+      - 'assets/**'
+      - 'scripts/check-site.py'
+      - '.github/workflows/gh-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deploy in progress: a half-published Pages artifact is worse
+# than a slightly stale one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # Pinned deliberately. website/hugo.toml uses `excludeFiles`, which Hugo
+  # deprecates from 0.153 in favour of `files`; bumping past that without
+  # migrating the key would publish docs/bench-evidence and docs/superpowers.
+  HUGO_VERSION: "0.146.3"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: ${{ env.HUGO_VERSION }}
+          extended: true
+
+      - name: The site's content invariants hold
+        run: python3 scripts/check-site.py
+
+      - name: Configure Pages
+        id: pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      # On a PR there is no Pages base URL to ask for, and none is needed: the
+      # job only has to prove the site compiles.
+      - name: Build
+        working-directory: website
+        run: |
+          hugo --minify \
+            --baseURL "${{ steps.pages.outputs.base_url || 'https://example.invalid/vllm.cpp' }}/"
+
+      - name: The excluded trees stayed excluded
+        run: |
+          test ! -e website/public/docs/bench-evidence
+          test ! -e website/public/docs/superpowers
+
+      # The link rewriting is the difference between a usable site and 139 dead
+      # links, and it is a template that fails silently -- a bad hook emits the
+      # raw `.md` destination rather than erroring. Assert the output instead.
+      - name: No published link points at a .md file
+        run: |
+          if grep -roh 'href="[^"]*\.md[^"]*"' website/public --include=index.html | sort -u | grep .; then
+            echo "::error::links above were not rewritten by render-link.html"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/public
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

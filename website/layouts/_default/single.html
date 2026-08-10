@@ -1,0 +1,21 @@
+{{ define "main" }}
+<article class="doc">
+  {{- /* The kicker names the source file. These documents are edited in the
+         repository, not here, and a reader who wants to change one needs to
+         know which file to open. */ -}}
+  <p class="doc-kicker">docs/{{ .File.LogicalName }}</p>
+
+  {{- /* Only long documents earn a table of contents. STATUS.md has 11 sections
+         and needs one; RELEASES.md has 4 across 68 lines, where a TOC is
+         furniture. Five is the line that separates them. */ -}}
+  {{ $headings := findRE `(?m)^##\s+.+$` .RawContent }}
+  {{ if ge (len $headings) 5 }}
+  <nav class="toc" aria-label="On this page">
+    <p class="rail-label">On this page</p>
+    {{ .TableOfContents }}
+  </nav>
+  {{ end }}
+
+  {{ .Content }}
+</article>
+{{ end }}

@@ -166,6 +166,12 @@ DOC = re.compile(r"docs/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:md|png|svg|json
 # splitting layouts from config would let a large redesign hide half its diff in
 # the cheaper bucket, which is the blanket-exemption failure AGENTS.md names.
 SITE = re.compile(r"website/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
+# `website/static/` is the site's artwork and fonts -- logos, a favicon, woff2.
+# Not prose, and the binaries among them have no reviewable line budget at all,
+# so they take the `asset` class the same way any other shipped artwork does.
+# Kept as a separate pattern rather than an extension list: what makes these
+# assets is WHERE they live, and static/ is Hugo's name for exactly that.
+SITE_ASSET = re.compile(r"website/static/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\Z")
 SPEC = re.compile(r"\.agents/specs/[A-Za-z0-9_.-]+\.md\Z")
 SPEC_EVIDENCE = re.compile(r"\.agents/specs/[A-Za-z0-9_.-]+\.(?:patch|json|log)\Z")
 COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
@@ -265,6 +271,11 @@ CREATION_MUTATIONS = {
     "scripts/check-pr-size.py": DISABLED_CREATION_CHECKER,
     "scripts/check-prompt-contract.py": DISABLED_CREATION_CHECKER,
     "scripts/check-triton-aot-multiarch.py": DISABLED_CREATION_CHECKER,
+    # A new checker has no BASE version to mutate, so it registers the disabled
+    # form its own tests must reject. The empty stub exits 0 and prints nothing,
+    # which fails every case in tests/scripts/test_check_site.py -- including
+    # the clean-tree case, which asserts the "nav in bijection" line.
+    "scripts/check-site.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120
@@ -358,6 +369,8 @@ def classify_path(path: str) -> str:
         return "governance_support"
     if DESIGN.fullmatch(path):
         return "design"
+    if SITE_ASSET.fullmatch(path):
+        return "asset"
     if path in PUBLIC_DOCUMENT_FILES or DOC.fullmatch(path) or SITE.fullmatch(path):
         return "public_document"
     if path in PRODUCT_CHECKER_FILES:

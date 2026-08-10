@@ -1,0 +1,55 @@
+<nav class="sidebar" aria-label="Documentation">
+  <a class="brand" href="{{ "" | relURL }}" aria-label="vllm.cpp documentation home">
+    {{- /* Two files rather than one recoloured by CSS: the mark is a real
+           artwork with per-block fills, and filter/invert would muddy them. */ -}}
+    <img class="logo-light" src="{{ "logo-light.svg" | relURL }}" alt="vllm.cpp" width="210" height="64">
+    <img class="logo-dark"  src="{{ "logo.svg" | relURL }}"       alt="vllm.cpp" width="210" height="64">
+  </a>
+
+  <input id="site-search" type="search" placeholder="Filter…" aria-label="Filter pages">
+
+  <p class="rail-label">Documentation</p>
+  <ul id="site-nav">
+    {{ range site.Data.nav.docs }}
+      {{ $slug := lower (strings.TrimSuffix ".md" .file) }}
+      {{ $url := printf "docs/%s/" $slug | relURL }}
+      <li><a href="{{ $url }}"{{ if eq $.RelPermalink $url }} class="active" aria-current="page"{{ end }}>{{ .label }}</a></li>
+    {{ end }}
+  </ul>
+
+  <div class="rail-foot">
+    <a href="{{ site.Params.repo }}">github.com/mudler/vllm.cpp</a><br>
+    Built from <code>docs/</code> at HEAD.
+  </div>
+
+  <script>
+  // 11 pages. A filter over the sidebar titles plus each page's headings from
+  // index.json is the whole feature; a search library would be more machinery
+  // than corpus.
+  (function () {
+    var box = document.getElementById('site-search');
+    if (!box) return;
+    var items = Array.prototype.slice.call(
+      document.querySelectorAll('#site-nav li'));
+    var index = null;
+    fetch("{{ "index.json" | relURL }}")
+      .then(function (r) { return r.json(); })
+      .then(function (d) { index = d; })
+      .catch(function () { index = []; });
+    box.addEventListener('input', function () {
+      var q = box.value.trim().toLowerCase();
+      items.forEach(function (li) {
+        var a = li.querySelector('a');
+        var hit = !q || a.textContent.toLowerCase().indexOf(q) !== -1;
+        if (!hit && index) {
+          hit = index.some(function (p) {
+            return p.url === a.getAttribute('href') &&
+              p.headings.toLowerCase().indexOf(q) !== -1;
+          });
+        }
+        li.hidden = !hit;
+      });
+    });
+  })();
+  </script>
+</nav>

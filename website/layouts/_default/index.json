@@ -1,0 +1,12 @@
+{{- $pages := slice -}}
+{{- range where site.RegularPages "Section" "docs" -}}
+  {{- $headings := slice -}}
+  {{- range findRE `(?m)^#{1,3}\s+.+$` .RawContent -}}
+    {{- $headings = $headings | append (strings.TrimSpace (strings.TrimLeft . "# ")) -}}
+  {{- end -}}
+  {{- $pages = $pages | append (dict
+      "title" (partial "title.html" .)
+      "url" .RelPermalink
+      "headings" (delimit $headings " ")) -}}
+{{- end -}}
+{{- $pages | jsonify -}}

@@ -1,0 +1,28 @@
+# The sidebar. This is the ONLY place doc order and display labels are
+# declared: the mounted files carry no front matter, so there is no `weight:`
+# or `title:` to read. scripts/check-site.py asserts this list and the mounted
+# set are in bijection, so a new doc cannot go missing from the sidebar and a
+# deleted one cannot linger here.
+docs:
+  - file: USAGE.md
+    label: Usage
+  - file: BUILD.md
+    label: Building
+  - file: FEATURES.md
+    label: Features
+  - file: BENCHMARKS.md
+    label: Benchmarks
+  - file: STATUS.md
+    label: Status
+  - file: ENVIRONMENT.md
+    label: Environment variables
+  - file: RELEASES.md
+    label: Binary releases
+  - file: SPECULATIVE-DECODING.md
+    label: Speculative decoding
+  - file: KV-OFFLOAD.md
+    label: KV offload
+  - file: SGLANG-COMPAT.md
+    label: SGLang compatibility
+  - file: ROCM.md
+    label: ROCm backend

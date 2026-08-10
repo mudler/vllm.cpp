@@ -1,0 +1,10 @@
+{{- /*
+  Deep-linkable headings. Reference documents get quoted section by section in
+  issues and PRs, and "see the Limitations part of the speculative decoding
+  page" is worse than a link that lands on it. The anchor is invisible until the
+  heading is hovered, so it costs nothing visually.
+*/ -}}
+<h{{ .Level }} id="{{ .Anchor }}">
+  {{- .Text | safeHTML -}}
+  {{- if or (eq .Level 2) (eq .Level 3) }}<a class="anchor" href="#{{ .Anchor }}" aria-label="Link to this section">#</a>{{ end -}}
+</h{{ .Level }}>

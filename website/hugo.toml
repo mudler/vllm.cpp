@@ -1,0 +1,65 @@
+# The documentation site. It owns NO content: `docs/` is mounted read-only
+# below, so the markdown on this site and the markdown in the repository are
+# the same bytes. Adding a copy under content/ would create a second surface
+# free to drift from the protocol-governed originals -- see
+# .agents/specs/gh-pages-docs-site.md.
+#
+# baseURL is overridden by CI with the value actions/configure-pages reports,
+# so this literal only affects local builds.
+baseURL = 'https://mudler.github.io/vllm.cpp/'
+languageCode = 'en-GB'
+defaultContentLanguage = 'en'
+title = 'vllm.cpp'
+enableEmoji = true
+
+# Nothing on this site is tagged or categorised, and the mounted docs carry no
+# front matter to tag them with. Left enabled, Hugo still generates empty /tags
+# and /categories pages that a reader can reach and that every layout has to
+# defend against.
+disableKinds = ['taxonomy', 'term', 'rss', 'sitemap']
+
+# Hugo 0.146.3. `excludeFiles` is the correct key at this version; it is
+# deprecated from 0.153 in favour of `files`. A Hugo bump past that MUST
+# migrate this or the excluded trees below start publishing.
+[[module.mounts]]
+source = "content"
+target = "content"
+
+[[module.mounts]]
+source = "../docs"
+target = "content/docs"
+excludeFiles = ["bench-evidence/**", "superpowers/**"]
+
+[[module.mounts]]
+source = "assets"
+target = "assets"
+
+# The logos and favicon are MOUNTED from the repository's own assets/, not
+# copied here. Copying them would create the second surface this whole design
+# exists to avoid -- the same argument as docs/, applied to artwork: a logo
+# refreshed in assets/ must not leave a stale twin on the site. includeFiles
+# keeps the ~1 MB of unrelated artwork in that directory off the published site.
+[[module.mounts]]
+source = "../assets"
+target = "static"
+includeFiles = ["logo.svg", "logo-light.svg", "logo-mark.svg", "favicon.png"]
+
+[params]
+  description = 'vllm.cpp — a from-scratch C++20 inference engine, gated token-for-token against vLLM.'
+  repo = 'https://github.com/mudler/vllm.cpp'
+  # Where `../`-escaping links in docs/ are sent. See layouts/_default/_markup/render-link.html.
+  blobBase = 'https://github.com/mudler/vllm.cpp/blob/main/'
+
+[markup]
+  [markup.tableOfContents]
+    startLevel = 2
+    endLevel = 3
+  [markup.goldmark.renderer]
+    unsafe = true
+  [markup.highlight]
+    noClasses = false
+    lineNos = false
+
+[outputs]
+  home = ['html', 'json']
+  page = ['html']

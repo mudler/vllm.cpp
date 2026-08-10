@@ -1,0 +1,22 @@
+{{ define "main" }}
+{{- /*
+  /docs/ itself. Hugo generates a section page whether or not anything links to
+  it, and without this template it renders empty -- a URL a reader reaches by
+  trimming the address bar and finds blank. Ordered by nav.yaml, not filename.
+*/ -}}
+<article class="doc">
+  <p class="doc-kicker">vllm.cpp</p>
+  <h1>Documentation</h1>
+  <ul class="cards">
+    {{ range $i, $e := site.Data.nav.docs }}
+      {{ $slug := lower (strings.TrimSuffix ".md" $e.file) }}
+      <li>
+        <a href="{{ printf "docs/%s/" $slug | relURL }}">
+          <span class="num">{{ printf "%02d" (add $i 1) }}</span>
+          <span>{{ $e.label }}<span class="desc">docs/{{ $e.file }}</span></span>
+        </a>
+      </li>
+    {{ end }}
+  </ul>
+</article>
+{{ end }}

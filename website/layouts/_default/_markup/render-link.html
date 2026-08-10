@@ -1,0 +1,34 @@
+{{- /*
+  Two rules, because docs/*.md links point at two different worlds.
+
+  1. A sibling doc (`BENCHMARKS.md`, `./USAGE.md`) is on this site -> rewrite to
+     the pretty URL Hugo generated for it, /vllm.cpp/docs/benchmarks/.
+  2. Anything escaping docs/ (`../.agents/**`, `../AGENTS.md`, `../include/**`)
+     is NOT published -- the protocol tree is deliberately absent -- so send it
+     to the same file on GitHub instead of 404ing. There were 139 such links at
+     the time of writing and the count moves with every commit, which is why
+     this is a mechanical rule rather than a list.
+
+  Anchors are preserved in both cases. Absolute URLs and bare `#anchor` links
+  pass through untouched.
+*/ -}}
+{{- $dst := .Destination -}}
+{{- $out := $dst -}}
+{{- $parsed := urls.Parse $dst -}}
+{{- if and (not $parsed.Scheme) (not (strings.HasPrefix $dst "#")) -}}
+  {{- $frag := "" -}}
+  {{- $path := $dst -}}
+  {{- if strings.Contains $dst "#" -}}
+    {{- $parts := split $dst "#" -}}
+    {{- $path = index $parts 0 -}}
+    {{- $frag = printf "#%s" (index $parts 1) -}}
+  {{- end -}}
+  {{- if strings.HasPrefix $path "../" -}}
+    {{- $out = printf "%s%s%s" site.Params.blobBase (strings.TrimPrefix "../" $path) $frag -}}
+  {{- else if strings.HasSuffix $path ".md" -}}
+    {{- $base := path.Base $path -}}
+    {{- $slug := lower (strings.TrimSuffix ".md" $base) -}}
+    {{- $out = printf "%s%s" (printf "docs/%s/" $slug | relURL) $frag -}}
+  {{- end -}}
+{{- end -}}
+<a href="{{ $out }}"{{ with .Title }} title="{{ . }}"{{ end }}{{ if strings.HasPrefix $out "http" }} rel="noopener"{{ end }}>{{ .Text | safeHTML }}</a>

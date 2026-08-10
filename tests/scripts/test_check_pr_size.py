@@ -381,6 +381,10 @@ class BudgetEnforcement(unittest.TestCase):
             "scripts/check-pr-size.py",
             "scripts/check-prompt-contract.py",
             "scripts/check-triton-aot-multiarch.py",
+            # 2026-08-10: the docs-site content guard (#224). A checker created
+            # in the same PR has no BASE version to mutate, so it registers the
+            # disabled form its own tests must reject.
+            "scripts/check-site.py",
         }
         self.assertEqual(set(checker.CREATION_MUTATIONS), expected)
         for path, mutation in checker.CREATION_MUTATIONS.items():

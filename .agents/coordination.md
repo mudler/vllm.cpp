@@ -1649,6 +1649,22 @@ and the config/CLI plumbing to select a mode from outside the library are both s
 Records a spec-after-code ordering deviation in the spec preamble rather than hiding it behind
 commit order.
 
+**Benchmark thread-budget control (#293 C1, 2026-08-10).** Codex
+(gpt-5.6-sol), fresh helper implementer, isolated worktree
+`/tmp/vllm-a76-c1-upstream`, branch
+`helper/SERVE-CLI-BENCH-293-C1-UPSTREAM`, base `9ec8cae23`; corrected W0/C0
+evidence `0a07c53db`. NOT in the claims table below: that table keys whole
+`SPIKE`/`ACTIVE` rows, while the broad `SERVE-CLI-BENCH` row must stay
+`PARTIAL`; the committed [#293 spec](specs/cpu-bench-thread-budget.md) tracks
+this leaf as `ACTIVE`, and the helper role marker provides the worktree lock.
+Scope: same-binary `poll` vs concurrency-1-only `blocking-c1`, RED mutation,
+native/QEMU gates, and interleaved Pi T4/T3 correctness/profile measurement.
+Owns `examples/bench/bench_core.h`, `examples/bench/main.cpp`,
+`tests/examples/test_bench.cpp`, and scoped #293/spec/evidence projections. C2
+AsyncLLM/output-event files are excluded even if C1 is decisively positive.
+Also excludes kernels, model/loader, CUDA/Vulkan, C ABI, assembly, Pi builds,
+service changes and remote Git operations.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-KERNEL-GEMM-CPU-ELEM-A76` | `KERNEL-GEMM-CPU-ELEM-A76` (`ACTIVE`) | Codex (gpt-5.6-sol), fresh helper implementer | isolated local worktree `/tmp/vllm-a76-bf16-impl`; build/test under buildx/QEMU only; execute/PMU on user-authorized disposable `rich@rpi5fan.lan` | `helper/KERNEL-GEMM-CPU-ELEM-A76-W0-W2`, base spec commit `999e1221e` plus this claim commit | Issue #284 W0-W2 only: refresh both-engine baseline/profile; add the BF16 elementwise benchmark/selection mutation proof; audit disassembly and retain only byte-exact C++/NEON changes with recursive measurements. Owns the new spec/row and scoped edits to `examples/cpu_kernel_bench/main.cpp`, its CLI test/CMake only if needed, `src/vt/cpu/cpu_matmul_elem*`, `src/vt/cpu/cpu_ops.cpp` only if profiling proves partitioning, focused tests, and indexed Pi evidence/record projections. Excludes assembly, model/loader/CUDA/Vulkan/C ABI changes, building on the Pi, service changes and PR/push. | `DONE` | 2026-08-10 — W0 complete and reranked before code: current AsyncLLM T4/T3 proves a runnable-thread/core-budget interaction but does not isolate polling; the old binary is historical only. W1-W4 await the #293 discriminator and fresh profile; no kernel/fixture change retained; row stays `ACTIVE`. |

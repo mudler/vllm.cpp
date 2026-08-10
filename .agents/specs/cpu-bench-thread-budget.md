@@ -1,7 +1,7 @@
 # CPU benchmark frontend wait + thread budget
 
 **Row:** `SERVE-CLI-BENCH` · **issue:**
-[#293](https://github.com/mudler/vllm.cpp/issues/293) · **leaf state:** `READY` ·
+[#293](https://github.com/mudler/vllm.cpp/issues/293) · **leaf state:** `ACTIVE` ·
 **trigger:** Raspberry Pi 5 W0 refresh for `KERNEL-GEMM-CPU-ELEM-A76` at
 `3520b7f7f` · **target:** current-source causal control first, C++ only.
 
@@ -145,8 +145,8 @@ upstream event semantics and extend the local original-harness tests:
 
 | W | Deliverable | State |
 |---|---|---|
-| C0 | Correct #284 evidence wording and register #293 | ready |
-| C1 | Same-current-source `poll` vs `blocking-c1` control + RED mutation | pending |
+| C0 | Correct #284 evidence wording and register #293 | complete (`0a07c53db`) |
+| C1 | Same-current-source `poll` vs `blocking-c1` control + RED mutation | active |
 | C2 | If C1 positive, general event/epoch wait + deterministic multi-request tests | blocked by C1 |
 | C3 | QEMU gate and interleaved Pi T4/T3 causal profile | blocked by C1 |
 | C4 | Retain event wait or reject it; test reserved-core budget only if C1 is negative/insufficient | blocked by C3 |

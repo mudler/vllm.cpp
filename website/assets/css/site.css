@@ -213,6 +213,11 @@ main {
   line-height: 1.15;
   color: var(--ink);
   text-wrap: balance;
+  /* A block box does not shrink beside a float, only its inline content does,
+     so the h1/h2 border-bottom drew straight through the floated TOC. A BFC may
+     not overlap a float, and `flow-root` makes one. `hr` needs it too; tables
+     and `pre` get a BFC free from `overflow-x: auto`. */
+  display: flow-root;
 }
 .doc h1 {
   font-size: var(--step-3);
@@ -252,7 +257,8 @@ main {
 .doc a:hover { color: var(--teal-lift); }
 
 .doc strong { font-weight: 700; color: var(--ink); }
-.doc hr { margin: 2.5rem 0; border: 0; border-top: 1px solid var(--rule); }
+/* flow-root: stops at the floated TOC, as above. */
+.doc hr { display: flow-root; margin: 2.5rem 0; border: 0; border-top: 1px solid var(--rule); }
 
 /* Headings carry an anchor once hovered — progressive disclosure, no clutter. */
 .doc h2, .doc h3 { position: relative; }

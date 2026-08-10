@@ -163,7 +163,9 @@ Two more example binaries ship alongside it:
   `--max-num-batched-tokens`, and `--num-blocks`. It pretokenizes before timing
   and atomically publishes each concurrency wave. Set
   `VT_BENCH_PRETOKENIZE=0` for the timed-string rollback; the report names the
-  resolved mode.
+  resolved mode. Its `--output-wait` mode
+  defaults to `poll`; the explicit `blocking-c1` diagnostic is valid only with
+  `--concurrency 1` and is not a general multi-request policy.
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
   GGUF `tokenizer.ggml.pre` names accepted: `qwen35`, `qwen2`, `llama-bpe`,

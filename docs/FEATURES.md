@@ -43,6 +43,7 @@ are our reading of their documented behavior, not measurements.
 | CUDA graph decode capture | ◐ per-family | ✅ | ✅ | ✅ |
 | Partial-prefill concurrency | ☐ | ✅ | ✅ | ☐ |
 | Cascade attention | ☐ | ✅ | ◐ | ☐ |
+| Benchmark output-wait selection | ◐ `poll` default; blocking diagnostic at c1 | n/a | n/a | n/a |
 
 ## KV cache and memory
 

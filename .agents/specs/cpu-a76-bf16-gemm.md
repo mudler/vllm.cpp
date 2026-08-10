@@ -250,9 +250,11 @@ official b9892 denominator reproduced at 27.96 prefill and 3.907 decode tok/s.
 Full commands, samples, artifact hashes and raw evidence hashes are in the
 [W0 reranking evidence](../../docs/bench-evidence/rpi5-a76-bf16-w0-20260810.md).
 
-Disposition: the row remains `ACTIVE`, but W1-W4 are blocked until the
-[`SERVE-CLI-BENCH` control in issue #293](https://github.com/mudler/vllm.cpp/issues/293)
-and its [committed spec](cpu-bench-thread-budget.md) resolve or reject the
-frontend-polling hypothesis, followed by a new four-core profile that ranks the
-reached elementwise kernel. The BF16 fixture, C++ schedule candidates and
-assembly gate were not attempted. Assembly remains forbidden.
+Disposition: the row remains `ACTIVE`. The
+[`SERVE-CLI-BENCH` C1 control in issue #293](https://github.com/mudler/vllm.cpp/issues/293)
+is now positive at the implementer checkpoint: T4 blocking restores 2.193x
+decode while T3 is neutral ([C1 evidence](../../docs/bench-evidence/rpi5-a76-output-wait-c1-20260810.md)).
+W1-W4 remain blocked on fresh C1 review, C2's general multi-request event wait,
+and the subsequent four-core profile that ranks the reached elementwise
+kernel. The BF16 fixture, C++ schedule candidates and assembly gate were not
+attempted. Assembly remains forbidden.

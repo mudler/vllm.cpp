@@ -1665,6 +1665,17 @@ AsyncLLM/output-event files are excluded even if C1 is decisively positive.
 Also excludes kernels, model/loader, CUDA/Vulkan, C ABI, assembly, Pi builds,
 service changes and remote Git operations.
 
+Implementer checkpoint `bdbfffcbf`: native 6/6 (47 assertions), scoped CTest
+5/5, dispatch mutation killed by the three intended assertions, AArch64 QEMU
+quant 23/23 (150,350 assertions), QEMU bench 6/6 (47 assertions), and A76
+assembly smoke green. The hash-verified same-binary Pi C1 is positive: T4
+blocking/poll is 2.193x decode and 0.458x E2E latency; T3 is neutral; all 12
+token files match. The pathological T4 poll spread is above 3%, so no binding
+floor moves. Raw evidence and exact hashes are indexed in
+[`rpi5-a76-output-wait-c1-20260810.md`](../docs/bench-evidence/rpi5-a76-output-wait-c1-20260810.md).
+This implementation is complete and awaits fresh mutation review. C2 was not
+started.
+
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|
 | `CLAIM-KERNEL-GEMM-CPU-ELEM-A76` | `KERNEL-GEMM-CPU-ELEM-A76` (`ACTIVE`) | Codex (gpt-5.6-sol), fresh helper implementer | isolated local worktree `/tmp/vllm-a76-bf16-impl`; build/test under buildx/QEMU only; execute/PMU on user-authorized disposable `rich@rpi5fan.lan` | `helper/KERNEL-GEMM-CPU-ELEM-A76-W0-W2`, base spec commit `999e1221e` plus this claim commit | Issue #284 W0-W2 only: refresh both-engine baseline/profile; add the BF16 elementwise benchmark/selection mutation proof; audit disassembly and retain only byte-exact C++/NEON changes with recursive measurements. Owns the new spec/row and scoped edits to `examples/cpu_kernel_bench/main.cpp`, its CLI test/CMake only if needed, `src/vt/cpu/cpu_matmul_elem*`, `src/vt/cpu/cpu_ops.cpp` only if profiling proves partitioning, focused tests, and indexed Pi evidence/record projections. Excludes assembly, model/loader/CUDA/Vulkan/C ABI changes, building on the Pi, service changes and PR/push. | `DONE` | 2026-08-10 — W0 complete and reranked before code: current AsyncLLM T4/T3 proves a runnable-thread/core-budget interaction but does not isolate polling; the old binary is historical only. W1-W4 await the #293 discriminator and fresh profile; no kernel/fixture change retained; row stays `ACTIVE`. |

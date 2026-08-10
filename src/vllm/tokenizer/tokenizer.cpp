@@ -26,6 +26,12 @@ constexpr const char* kQwen36Regex =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 constexpr const char* kClassicQwen2Regex =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// Mistral Tekken (mistralai/Mistral-Nemo-Instruct-2407 and the other Tekken
+// checkpoints). Byte-equal to tiktoken's o200k_base pat_str except that the
+// optional (?i:'s|'t|...) group is absent from both letter alternatives and
+// numbers are \p{N} rather than \p{N}{1,3}.
+constexpr const char* kTekkenRegex =
+    R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 
 [[noreturn]] void Fail(const std::string& msg) {
   throw std::runtime_error("tokenizer: " + msg);
@@ -350,6 +356,7 @@ SplitPattern DetectPattern(const json& doc) {
   }
   if (re == kQwen36Regex) return SplitPattern::kQwen2;
   if (re == kClassicQwen2Regex) return SplitPattern::kQwen2Classic;
+  if (re == kTekkenRegex) return SplitPattern::kTekken;
   if (re.find(R"(\p{N}{1,3})") != std::string::npos) {
     return SplitPattern::kLlama3;
   }

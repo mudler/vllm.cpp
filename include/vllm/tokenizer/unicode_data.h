@@ -2,7 +2,7 @@
 // Generator:  tools/gen_unicode_data.py
 // Regenerate: python3 tools/gen_unicode_data.py
 // Unicode data version (Python unicodedata.unidata_version): 15.0.0
-// Category ranges: 1563; whitespace ranges: 10.
+// Category ranges: 1563; whitespace ranges: 10; letter-case ranges: 1861.
 // Semantics mirror HF tokenizers byte-level BPE: categories are the major
 // Unicode general-category classes (unassigned -> kOther); IsWhitespace is
 // python str.isspace().
@@ -28,6 +28,20 @@ enum class UCat : uint8_t {
 };
 
 UCat Category(uint32_t cp);
+
+// CASE class of a letter. Needed only by SplitPattern::kTekken, whose letter
+// alternatives are [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and
+// [\p{Ll}\p{Lm}\p{Lo}\p{M}]; UCat collapses all of L* into kLetter and
+// cannot express that. Deliberately a separate narrow table, so UCat and every
+// existing consumer of it are unchanged. kNotLetter for anything outside L*.
+enum class LetterCase : uint8_t {
+  kNotLetter = 0,
+  kUpper = 1,     // Lu, Lt -- the UPPER class only
+  kLower = 2,     // Ll     -- the LOWER class only
+  kCaseless = 3,  // Lm, Lo -- present in BOTH classes
+};
+
+LetterCase LetterCaseOf(uint32_t cp);
 
 // python str.isspace() semantics (per HF byte-level pretokenization):
 // includes 0x1C-0x1F, NEL (0x85) and NBSP (0xA0); excludes ZWSP (0x200B),

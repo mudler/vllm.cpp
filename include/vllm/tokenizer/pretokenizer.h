@@ -27,6 +27,19 @@ enum class SplitPattern {
             // case-SENSITIVE contractions, a plain ` ?` space prefix instead of
             // the `[^\r\n\p{L}\p{N}]?` prefix, UNBOUNDED `\p{N}+` digit runs,
             // no `[\r\n]*` punct tail and no `\s*[\r\n]+` rule at all.
+  kTekken,  // Mistral Tekken family (Mistral-Nemo, and the Tekken-v3/v7
+            // checkpoints that share its tokenizer.json shape). The ONLY
+            // pattern here whose letter rule is CASE-AWARE: two alternatives,
+            // [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+ then
+            // the same pair with the quantifiers swapped, so an uppercase run
+            // ends a piece when a lowercase run follows ("HelloWorld" ->
+            // "Hello" + "World"). It is tiktoken's o200k_base pat_str with
+            // exactly two edits: NO (?i:'s|'t|...) contraction group, and
+            // single-codepoint \p{N} instead of \p{N}{1,3}. Marks sit INSIDE
+            // both letter classes (like kQwen2) while the punct negation is
+            // [^\s\p{L}\p{N}] with no \p{M} (like kLlama3) -- a combination no
+            // other pattern has. Its punct run also ends [\r\n/]*, absorbing a
+            // '/' that follows a newline.
   kDeepSeek,  // DeepSeek family (DeepSeek-V2/V2-Lite/V3). STRUCTURALLY UNLIKE
               // every pattern above: not ONE alternation regex but a HF
               // `Sequence` PIPELINE of seven pre-tokenizers, each further

@@ -129,6 +129,31 @@ Two more example binaries ship alongside it:
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
 
+### Which HF tokenizers load
+
+A checkpoint's `tokenizer.json` is accepted when its `pre_tokenizer` is one this
+build recognises. Recognition is by exact regex or pipeline shape, not by model
+name, so a checkpoint from any vendor loads if it carries one of these:
+
+| family | shape | examples |
+|---|---|---|
+| Qwen3.6 | one `Split` regex, single-codepoint `\p{N}`, `\p{M}` folded into letter runs | Qwen3.6-27B |
+| Qwen2/Qwen3 classic | as above without `\p{M}` awareness | Qwen3-0.6B, Qwen3-Coder |
+| Llama-3 | `\p{N}{1,3}` digit groups, no `\p{M}` awareness | Llama-3 family |
+| Tekken (Mistral) | case-aware letter runs, single-codepoint `\p{N}`, `/` in the punct tail | Mistral-Nemo-Instruct-2407 |
+| GPT-2 byte-level | `ByteLevel(use_regex=true)` with no explicit `Split` | OPT, GPT-2 |
+| DeepSeek | a seven-stage `Sequence` pipeline, not one alternation | DeepSeek-V2/V3 |
+| SentencePiece | `Metaspace` + byte-fallback vocab | Mistral-7B-v0.3 |
+
+An unrecognised one fails loudly at load with `tokenizer: unrecognized
+pre-tokenizer split regex: <regex>`, rather than tokenizing incorrectly. If you
+hit that, the printed regex is what a new pattern would have to match.
+
+Note that Mistral ships **two** unrelated tokenizer families: Mistral-7B-v0.3 is
+SentencePiece, while Mistral-Nemo is Tekken, a byte-level BPE whose regex is
+tiktoken's `o200k_base` with the contraction group removed and `\p{N}{1,3}`
+reduced to `\p{N}`. Support for one says nothing about the other.
+
 ### How much memory a Vulkan load needs
 
 On a unified-memory device (a DGX Spark) the Vulkan heap and system RAM are the

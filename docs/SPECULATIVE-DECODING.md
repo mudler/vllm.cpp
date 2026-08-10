@@ -1,7 +1,6 @@
-# Speculative decoding (MTP)
+# Speculative decoding
 
-vllm.cpp ships MTP (Multi-Token Prediction) speculative decoding: a small draft
-head proposes the next token, the full model verifies it in the same step, and an
+A draft proposes tokens, the full model verifies them in the same step, and an
 accepted proposal skips a full model step. It is **opt-in and off by default**;
 with no speculative config the engine is byte-identical to the non-speculative
 one.
@@ -9,18 +8,66 @@ one.
 Selection mirrors vLLM's own CLI: `--speculative-config '<json>'`, taking the
 same JSON object vLLM takes, so a config written for vLLM works here.
 
-## What it does and where it works
+## Methods
 
-- **Method:** MTP only, at `num_speculative_tokens` = 1 (k=1).
+The engine accepts five `method` strings. Anything else is refused at load with
+the list of accepted ones (`src/vllm/config/speculative.cpp`).
+
+| `method` | Draft | k | State |
+|---|---|---|---|
+| `mtp` | the target's own `mtp.*` head | 1 | Gated, and the default recommendation. Token-exact against vLLM at concurrency 1, ~1.04x its speculative-on decode |
+| `dflash` | a separate z-lab block-diffusion checkpoint | block size, e.g. 16 | Gated. 2.9x over speculative-off at concurrency 1, at or above vLLM's own DFlash-on |
+| `dspark` | a separate DSpark checkpoint | block size, at least the draft's own | Runs end to end, **not gated**. Token-identical to speculative-off on the 35B, but currently about 2% slower than plain decode; no speed win is claimed |
+| `ngram` | none, drafts come from the prompt's own suffix | required, no default | Accepted and wired; no published measurement |
+| `draft_model` | a separate full model | from the draft | **Config only.** The JSON parses, but the engine has no branch for it and refuses the load |
+
+MTP and DFlash are the two with binding numbers behind them; the per-method
+detail below and in [BENCHMARKS.md](BENCHMARKS.md) says which is which.
+
+## MTP
+
 - **Models:** the Qwen3.5 / 3.6 gate checkpoints that ship an `mtp.*` draft head
   in their safetensors (Qwen3.6-27B and Qwen3.6-35B-A3B). Both are GDN hybrids,
   and the speculative path is wired through the linear-attention (GDN) recurrence
   and short causal convolution as well as the attention layers.
+- **k = 1 only.** `num_speculative_tokens` greater than 1 is not accepted for
+  this method. Depth (k>1, dynamic, adaptive) is unbuilt and tracked in
+  [#81](https://github.com/mudler/vllm.cpp/issues/81).
 - **Correctness:** at concurrency 1 the speculative-on greedy output is
   token-for-token identical to both the speculative-off output and vLLM's own MTP
   speculative greedy output on the same prompt.
 - **Speed:** measured about 1.04x faster than vLLM's own speculative-on decode at
   concurrency 1 (see [Measured result](#measured-result)).
+
+## DFlash (block diffusion)
+
+DFlash drafts a whole block in one non-autoregressive pass from a separate
+z-lab draft checkpoint over the same target. `num_speculative_tokens` is
+required and is the draft's block size, e.g. 16.
+
+```bash
+server --model /models/Qwen3.6-27B \
+  --speculative-config '{"method":"dflash","model":"<draft-path>","num_speculative_tokens":16}'
+```
+
+Gated on the 27B: end-to-end output matches the vLLM DFlash-on golden under the
+ratified near-tie rule, and at concurrency 1 it is 2.9x our own speculative-off
+throughput and at or above vLLM's own DFlash-on decode. Speculative-off stays
+byte-identical.
+
+## n-gram
+
+The draft-free proposer: candidates come from matching the sequence's own
+suffix, so there is no draft checkpoint to load. `num_speculative_tokens` is
+required and the prompt-lookup window defaults to 5/5.
+
+```bash
+server --model /models/Qwen3.6-27B \
+  --speculative-config '{"method":"ngram","num_speculative_tokens":4}'
+```
+
+It is wired end to end and reuses the same verify machinery as MTP. No
+throughput number is published for it.
 
 ## DSpark (semi-autoregressive block drafting) — in progress
 
@@ -89,9 +136,11 @@ vllm_engine_load(&mp, &engine);   /* NULL/"" speculative_config => no speculatio
 ```
 
 The JSON is parsed into the same `vllm::SpeculativeConfig` the C++ API takes
-programmatically (`EngineParams::speculative_config`). `method` must be `mtp` and
-`num_speculative_tokens` must be 1; a malformed document, an unsupported method,
-or a checkpoint with no `mtp.*` head fails the load loudly at startup rather than
+programmatically (`EngineParams::speculative_config`). The examples above use
+`mtp`, where `num_speculative_tokens` must be 1; see [Methods](#methods) for the
+other spellings and what each one requires. A malformed document, an unsupported
+method, a missing `num_speculative_tokens` where the method needs one, or a
+checkpoint with no `mtp.*` head fails the load loudly at startup rather than
 running silently without speculation.
 
 ## Measured result
@@ -126,13 +175,23 @@ and 8 on the 27B (about 1.5x our own speculative-off throughput).
 
 ## Limitations
 
-- **k=1 only.** `num_speculative_tokens` greater than 1 is not accepted.
-- **MTP only.** Other draft methods (n-gram, EAGLE, a separate draft model, the
-  DFlash draft) are not wired; MTP is the one that ships.
-- **Qwen3.5/3.6 with an `mtp.*` head only.** The target may be a safetensors
+Each of these names the method it applies to.
+
+- **MTP is k=1 only.** `num_speculative_tokens` greater than 1 is not accepted
+  for `mtp`. The block drafters take their k from the draft's block size
+  instead, and `ngram` requires one. Depth for MTP (k>1, dynamic, adaptive) is
+  unbuilt, [#81](https://github.com/mudler/vllm.cpp/issues/81).
+- **EAGLE, EAGLE3, Medusa and the rest are not wired.** Of vLLM's thirteen
+  `SpeculativeMethod` strings the engine accepts five, and `draft_model` among
+  those is config-only. The remainder are inventoried, not implemented.
+- **DSpark is not gated.** It runs end to end and is token-identical to
+  speculative-off on the 35B, but it is about 2% slower than plain decode at
+  concurrency 1, and the comparison against vLLM's own DSpark, the
+  acceptance-rate band and the other target families are all still owed.
+- **MTP needs Qwen3.5/3.6 with an `mtp.*` head.** The target may be a safetensors
   directory or a `.gguf` converted WITH the head (llama.cpp's layer-indexed
   `nextn` block); a GGUF exported `--no-mtp` is refused and says so.
-- **On an NVFP4 safetensors target the concurrency-1 identity below is not
+- **On an NVFP4 safetensors target the concurrency-1 identity above is not
   currently reliable.** Measured on the 35B A3B NVFP4 safetensors: its logits
   land on a coarse grid that yields EXACT ties between distinct tokens, and at
   such a tie speculative-on and speculative-off, and even two speculative-off

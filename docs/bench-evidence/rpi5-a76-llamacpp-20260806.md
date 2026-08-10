@@ -48,8 +48,11 @@ Thus the competitor gap is performance-only for the checked stream.
 
 - Pi: Raspberry Pi 5, four Cortex-A76 r4p1 cores, DotProd present, i8mm
   absent, 8 GiB RAM, Debian kernel `6.18.34+rpt-rpi-2712`.
-- Model: `Qwen3.5-2B-UD-Q8_K_XL.gguf`, 2,823,978,240 bytes, SHA-256
+- Model: `Qwen3.5-2B-UD-Q8_K_XL.gguf`, 2,834,940,160 filesystem bytes,
+  SHA-256
   `a53988df91157d78acaf3c95e22db179d13f6236061bdb86576494dc99b1bc3b`.
+  llama.cpp reports 2,823,978,240 logical tensor bytes; the original record
+  accidentally labelled that logical value as the file size.
 - vllm.cpp: branch head `9044c2a7d`; assembly-default `vllm-bench` SHA-256
   `9eb57cf3760eaade9dcef03dda1648556577c44199369ad38bf42083efbc70a9`.
 - llama.cpp: official tag `b9892`, commit

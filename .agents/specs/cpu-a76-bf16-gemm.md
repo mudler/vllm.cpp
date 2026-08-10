@@ -195,11 +195,11 @@ same binary. A microbenchmark-only win never justifies selecting assembly.
 
 | W | Deliverable | State |
 |---|---|---|
-| W0 | Refresh both-engine binding baseline/profile; validate artifact hashes and idle-state evidence | pending |
-| W1 | Add elementwise BF16 microbench/PMU fixtures and selection mutation proof | pending |
-| W2 | Audit current compiler output and evaluate C++/ACLE schedule/tile/prefetch candidates | pending |
-| W3 | Recursively gate retained C++ default through full model vs llama.cpp | pending |
-| W4 | Assembly eligibility decision from the explicit gate; implement only if eligible | blocked by W3 |
+| W0 | Refresh both-engine binding baseline/profile; validate artifact hashes and idle-state evidence | **complete; reranked the work** |
+| W1 | Add elementwise BF16 microbench/PMU fixtures and selection mutation proof | **blocked by W0 reranking** |
+| W2 | Audit current compiler output and evaluate C++/ACLE schedule/tile/prefetch candidates | **blocked by W0 reranking** |
+| W3 | Recursively gate retained C++ default through full model vs llama.cpp | **blocked by W0 reranking** |
+| W4 | Assembly eligibility decision from the explicit gate; implement only if eligible | **blocked by W0 and W3** |
 
 ## Risks and stop conditions
 
@@ -223,3 +223,36 @@ Spec accepted after the inventory checker correctly rejected the new 52nd
 kernel row while pinned to 51. The count ratchet moved only after the issue,
 row and structured spec existed. Implementation and binding measurement remain
 pending.
+
+### W0 fresh-profile result, 2026-08-10
+
+W0 triggered this spec's stop condition before any benchmark-fixture or kernel
+edit. The exact current `0e4a1c13d` AArch64 artifact passes its QEMU build gate
+and emits the established 64-token SHA, but the production `AsyncLLM` benchmark
+frontend now competes with a four-thread CPU pool for the Pi's four cores. The
+matched profile ranks summed user cycles as `Threadpool::Barrier` 42.21%,
+`Bt16Neon<ElemKind::kF16>` 33.09% and Q8 A76 assembly 12.05%. Thus both binding
+premises changed: synchronization/resource ownership ranks before the kernel,
+and the reached 16-bit specialization is F16 rather than BF16.
+
+The old synchronous `9044c2a7d` artifact still runs in 26,028.76 ms, but it is
+historical context rather than a causal frontend control because 141 relevant
+files differ. Current AsyncLLM with four compute threads takes a 48,698.67 ms
+median; the same current binary with three compute threads recovers to
+26,957.58 ms and 2.53 decode tok/s. It does not restore prefill, because that
+arm has only three compute workers. This proves a runnable-thread/core-budget
+interaction, not which frontend or engine thread causes it, and is not evidence
+for shipping a three-thread default.
+
+The fresh current-main TTFT spread is 15.3%, so its 0.209x prefill / 0.350x
+decode diagnostic is not promoted over the accepted 2026-08-06 floor. The
+official b9892 denominator reproduced at 27.96 prefill and 3.907 decode tok/s.
+Full commands, samples, artifact hashes and raw evidence hashes are in the
+[W0 reranking evidence](../../docs/bench-evidence/rpi5-a76-bf16-w0-20260810.md).
+
+Disposition: the row remains `ACTIVE`, but W1-W4 are blocked until the
+[`SERVE-CLI-BENCH` control in issue #293](https://github.com/mudler/vllm.cpp/issues/293)
+and its [committed spec](cpu-bench-thread-budget.md) resolve or reject the
+frontend-polling hypothesis, followed by a new four-core profile that ranks the
+reached elementwise kernel. The BF16 fixture, C++ schedule candidates and
+assembly gate were not attempted. Assembly remains forbidden.

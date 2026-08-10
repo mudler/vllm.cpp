@@ -1,7 +1,7 @@
 # Cortex-A76 BF16 elementwise GEMM: close the Raspberry Pi 5 llama.cpp gap
 
 **Row:** `KERNEL-GEMM-CPU-ELEM-A76` · **issue:**
-[#284](https://github.com/mudler/vllm.cpp/issues/284) · **state:** `READY` ·
+[#284](https://github.com/mudler/vllm.cpp/issues/284) · **state:** `ACTIVE` ·
 **parent:** `KERNEL-GEMM-CPU-ELEM` · **target:** Raspberry Pi 5 Cortex-A76
 r4p1, four cores, AArch64 NEON + DotProd, no i8mm · **comparison source:**
 official llama.cpp b9892 at `ee445f93d8a0a5033a46d1960e901ef5caec9a41`.

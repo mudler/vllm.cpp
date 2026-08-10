@@ -4,6 +4,7 @@
 // — this asserts the HARNESS: all N requests finish, throughput > 0, TTFT > 0,
 // and the token accounting is coherent. The real parity numbers come from a GB10
 // run with --model (dgx-pending), which this same code path drives.
+#define VLLM_BENCH_TEST_OUTPUT_WAIT_TRACE
 #include "bench_core.h"
 
 #include <doctest/doctest.h>
@@ -23,6 +24,7 @@ using vllm::bench::BenchResult;
 using vllm::bench::DispatchBenchPromptAdmission;
 using vllm::bench::DispatchBenchPromptWaveAdmission;
 using vllm::bench::OutputWaitMode;
+using vllm::bench::OutputWaitTestEvent;
 using vllm::bench::PretokenizeBenchPromptsThenStartClock;
 using vllm::bench::RunBench;
 
@@ -297,6 +299,37 @@ TEST_CASE("bench: pretokenized vectors match timed-string InputProcessor") {
   CHECK(clock_value == 17);
 }
 
+TEST_CASE("bench: text report identifies the exercised output wait") {
+  BenchConfig cfg;
+  cfg.concurrency = 1;
+  BenchResult result;
+  result.async_frontend = true;
+  result.output_wait = OutputWaitMode::kBlockingC1;
+  result.blocking_wait_calls = 37;
+
+  std::FILE* output = std::tmpfile();
+  REQUIRE(output != nullptr);
+  vllm::bench::PrintReport(cfg, result, output);
+  REQUIRE(std::fflush(output) == 0);
+  REQUIRE(std::fseek(output, 0, SEEK_END) == 0);
+  const long size = std::ftell(output);
+  REQUIRE(size >= 0);
+  REQUIRE(std::fseek(output, 0, SEEK_SET) == 0);
+  std::string text(static_cast<size_t>(size), '\0');
+  CHECK(std::fread(text.data(), 1, text.size(), output) == text.size());
+  std::fclose(output);
+
+  auto report_line = [&](std::string_view label) {
+    const size_t begin = text.find(label);
+    REQUIRE(begin != std::string::npos);
+    const size_t end = text.find('\n', begin);
+    REQUIRE(end != std::string::npos);
+    return text.substr(begin, end - begin);
+  };
+  CHECK(report_line("Output wait:").find("blocking-c1") != std::string::npos);
+  CHECK(report_line("Blocking wait calls:").find("37") != std::string::npos);
+}
+
 TEST_CASE("bench: blocking-c1 selector rejects concurrent requests by name") {
   BenchConfig cfg;
   cfg.num_prompts = 2;
@@ -312,6 +345,19 @@ TEST_CASE("bench: blocking-c1 selector rejects concurrent requests by name") {
 }
 
 TEST_CASE("bench: blocking-c1 exercises blocking control with exact tokens") {
+  const std::filesystem::path bench_core =
+      std::filesystem::path(__FILE__).parent_path().parent_path().parent_path() /
+      "examples/bench/bench_core.h";
+  std::ifstream bench_core_stream(bench_core);
+  REQUIRE(bench_core_stream.good());
+  const std::string bench_core_source{
+      std::istreambuf_iterator<char>(bench_core_stream),
+      std::istreambuf_iterator<char>()};
+  REQUIRE(bench_core_source.find(
+              "VLLM_BENCH_TRACE_NOWAIT(\n"
+              "          engine.get_output_nowait(it->second))") !=
+          std::string::npos);
+
   BenchConfig cfg;
   cfg.num_prompts = 3;
   cfg.input_len = 8;
@@ -321,6 +367,8 @@ TEST_CASE("bench: blocking-c1 exercises blocking control with exact tokens") {
 
   const BenchResult poll = RunBench(cfg);
   cfg.output_wait = OutputWaitMode::kBlockingC1;
+  std::vector<OutputWaitTestEvent> output_wait_trace;
+  cfg.output_wait_test_trace = &output_wait_trace;
   const BenchResult blocking = RunBench(cfg);
 
   CHECK(poll.output_wait == OutputWaitMode::kPoll);
@@ -337,6 +385,19 @@ TEST_CASE("bench: blocking-c1 exercises blocking control with exact tokens") {
   CHECK(artifact.at("blocking_wait_calls").get<int64_t>() > 0);
   CHECK(artifact.at("output_token_ids") ==
         nlohmann::json(blocking.output_token_ids));
+
+  REQUIRE(!output_wait_trace.empty());
+  bool observed_blocking_wait = false;
+  bool every_blocking_wait_has_preceding_empty_nowait = true;
+  for (size_t i = 0; i < output_wait_trace.size(); ++i) {
+    if (output_wait_trace[i] != OutputWaitTestEvent::kBlockingWait) continue;
+    observed_blocking_wait = true;
+    if (i == 0 || output_wait_trace[i - 1] != OutputWaitTestEvent::kNowaitEmpty) {
+      every_blocking_wait_has_preceding_empty_nowait = false;
+    }
+  }
+  CHECK(observed_blocking_wait);
+  CHECK(every_blocking_wait_has_preceding_empty_nowait);
 }
 
 TEST_CASE("bench: synthetic engine completes all requests with sane metrics") {

@@ -73,6 +73,17 @@ enum class OutputWaitMode {
   kBlockingC1,
 };
 
+#ifdef VLLM_BENCH_TEST_OUTPUT_WAIT_TRACE
+// Test-only observation seam. Production benchmark translation units do not
+// define VLLM_BENCH_TEST_OUTPUT_WAIT_TRACE, so tracing adds no state or work to
+// the measured loop.
+enum class OutputWaitTestEvent {
+  kNowaitReady,
+  kNowaitEmpty,
+  kBlockingWait,
+};
+#endif
+
 inline const char* OutputWaitModeName(OutputWaitMode mode) {
   switch (mode) {
     case OutputWaitMode::kPoll:
@@ -118,6 +129,9 @@ struct BenchConfig {
   // concurrency-1-only `blocking-c1` control performs the same nowait probe,
   // then blocks on the sole collector so Pi measurements can isolate polling.
   OutputWaitMode output_wait = OutputWaitMode::kPoll;
+#ifdef VLLM_BENCH_TEST_OUTPUT_WAIT_TRACE
+  std::vector<OutputWaitTestEvent>* output_wait_test_trace = nullptr;
+#endif
   uint64_t seed = 0;       // prompt-generation RNG seed.
   double temperature = 0;  // <= 0 => greedy (deterministic).
   bool quiet = false;      // suppress per-progress logging to stderr.
@@ -742,11 +756,27 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
     return std::next(it);
   };
 
+#ifdef VLLM_BENCH_TEST_OUTPUT_WAIT_TRACE
+#define VLLM_BENCH_TRACE_NOWAIT(expression)                                \
+  ([&]() {                                                                \
+    std::optional<RequestOutput> traced_ready = (expression);             \
+    if (cfg.output_wait_test_trace != nullptr) {                           \
+      cfg.output_wait_test_trace->push_back(                               \
+          traced_ready.has_value() ? OutputWaitTestEvent::kNowaitReady    \
+                                   : OutputWaitTestEvent::kNowaitEmpty);   \
+    }                                                                     \
+    return traced_ready;                                                   \
+  }())
+#else
+#define VLLM_BENCH_TRACE_NOWAIT(expression) (expression)
+#endif
+
   admit();
   while (done < cfg.num_prompts) {
     bool observed_output = false;
     for (auto it = active.begin(); it != active.end();) {
-      std::optional<RequestOutput> ready = engine.get_output_nowait(it->second);
+      std::optional<RequestOutput> ready = VLLM_BENCH_TRACE_NOWAIT(
+          engine.get_output_nowait(it->second));
       if (!ready.has_value()) {
         ++it;
         continue;
@@ -764,6 +794,12 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
               "blocking-c1 benchmark must have exactly one active request");
         }
         auto it = active.begin();
+#ifdef VLLM_BENCH_TEST_OUTPUT_WAIT_TRACE
+        if (cfg.output_wait_test_trace != nullptr) {
+          cfg.output_wait_test_trace->push_back(
+              OutputWaitTestEvent::kBlockingWait);
+        }
+#endif
         ++blocking_wait_calls;
         it = consume_output(it, engine.get_output(it->second));
         (void)it;
@@ -775,6 +811,7 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
     }
     admit();  // keep C in flight as requests finish.
   }
+#undef VLLM_BENCH_TRACE_NOWAIT
 
   const double dur_s = now_s();
 

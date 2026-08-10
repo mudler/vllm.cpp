@@ -345,19 +345,6 @@ TEST_CASE("bench: blocking-c1 selector rejects concurrent requests by name") {
 }
 
 TEST_CASE("bench: blocking-c1 exercises blocking control with exact tokens") {
-  const std::filesystem::path bench_core =
-      std::filesystem::path(__FILE__).parent_path().parent_path().parent_path() /
-      "examples/bench/bench_core.h";
-  std::ifstream bench_core_stream(bench_core);
-  REQUIRE(bench_core_stream.good());
-  const std::string bench_core_source{
-      std::istreambuf_iterator<char>(bench_core_stream),
-      std::istreambuf_iterator<char>()};
-  REQUIRE(bench_core_source.find(
-              "VLLM_BENCH_TRACE_NOWAIT(\n"
-              "          engine.get_output_nowait(it->second))") !=
-          std::string::npos);
-
   BenchConfig cfg;
   cfg.num_prompts = 3;
   cfg.input_len = 8;
@@ -398,6 +385,21 @@ TEST_CASE("bench: blocking-c1 exercises blocking control with exact tokens") {
   }
   CHECK(observed_blocking_wait);
   CHECK(every_blocking_wait_has_preceding_empty_nowait);
+}
+
+TEST_CASE("bench: runtime executes the production nowait call") {
+  BenchConfig cfg;
+  cfg.num_prompts = 1;
+  cfg.input_len = 8;
+  cfg.output_len = 4;
+  cfg.concurrency = 1;
+  cfg.output_wait = OutputWaitMode::kBlockingC1;
+  cfg.output_wait_test_probe.seed_first_collector = true;
+  cfg.output_wait_test_probe.stop_after_first_nowait = true;
+
+  CHECK_THROWS_WITH_AS(
+      RunBench(cfg), "nowait runtime probe observed seeded output",
+      std::logic_error);
 }
 
 TEST_CASE("bench: synthetic engine completes all requests with sane metrics") {

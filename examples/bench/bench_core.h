@@ -82,6 +82,14 @@ enum class OutputWaitTestEvent {
   kNowaitEmpty,
   kBlockingWait,
 };
+
+// Runtime probe controls used only by test_bench. The seeded collector value is
+// input to the real AsyncLLM method; the observer below runs only after that
+// method has returned, so neither control can replace the production call.
+struct OutputWaitTestProbe {
+  bool seed_first_collector = false;
+  bool stop_after_first_nowait = false;
+};
 #endif
 
 inline const char* OutputWaitModeName(OutputWaitMode mode) {
@@ -131,6 +139,7 @@ struct BenchConfig {
   OutputWaitMode output_wait = OutputWaitMode::kPoll;
 #ifdef VLLM_BENCH_TEST_OUTPUT_WAIT_TRACE
   std::vector<OutputWaitTestEvent>* output_wait_test_trace = nullptr;
+  OutputWaitTestProbe output_wait_test_probe;
 #endif
   uint64_t seed = 0;       // prompt-generation RNG seed.
   double temperature = 0;  // <= 0 => greedy (deterministic).
@@ -756,27 +765,37 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
     return std::next(it);
   };
 
-#ifdef VLLM_BENCH_TEST_OUTPUT_WAIT_TRACE
-#define VLLM_BENCH_TRACE_NOWAIT(expression)                                \
-  ([&]() {                                                                \
-    std::optional<RequestOutput> traced_ready = (expression);             \
-    if (cfg.output_wait_test_trace != nullptr) {                           \
-      cfg.output_wait_test_trace->push_back(                               \
-          traced_ready.has_value() ? OutputWaitTestEvent::kNowaitReady    \
-                                   : OutputWaitTestEvent::kNowaitEmpty);   \
-    }                                                                     \
-    return traced_ready;                                                   \
-  }())
-#else
-#define VLLM_BENCH_TRACE_NOWAIT(expression) (expression)
-#endif
-
   admit();
+#ifdef VLLM_BENCH_TEST_OUTPUT_WAIT_TRACE
+  if (cfg.output_wait_test_probe.seed_first_collector) {
+    if (active.size() != 1 || active.begin()->second.collector == nullptr) {
+      throw std::logic_error(
+          "nowait runtime probe requires exactly one active collector");
+    }
+    RequestOutput seeded;
+    seeded.request_id = active.begin()->first;
+    active.begin()->second.collector->put(std::move(seeded));
+  }
+#endif
   while (done < cfg.num_prompts) {
     bool observed_output = false;
     for (auto it = active.begin(); it != active.end();) {
-      std::optional<RequestOutput> ready = VLLM_BENCH_TRACE_NOWAIT(
-          engine.get_output_nowait(it->second));
+      // Keep this evaluation unconditional: test instrumentation observes the
+      // already-evaluated value below and cannot replace the production call.
+      std::optional<RequestOutput> ready =
+          engine.get_output_nowait(it->second);
+#ifdef VLLM_BENCH_TEST_OUTPUT_WAIT_TRACE
+      if (cfg.output_wait_test_trace != nullptr) {
+        cfg.output_wait_test_trace->push_back(
+            ready.has_value() ? OutputWaitTestEvent::kNowaitReady
+                              : OutputWaitTestEvent::kNowaitEmpty);
+      }
+      if (cfg.output_wait_test_probe.stop_after_first_nowait) {
+        throw std::logic_error(
+            ready.has_value() ? "nowait runtime probe observed seeded output"
+                              : "nowait runtime probe missed seeded output");
+      }
+#endif
       if (!ready.has_value()) {
         ++it;
         continue;
@@ -811,7 +830,6 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
     }
     admit();  // keep C in flight as requests finish.
   }
-#undef VLLM_BENCH_TRACE_NOWAIT
 
   const double dur_s = now_s();
 

@@ -56,6 +56,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#206](https://github.com/mudler/vllm.cpp/issues/206) | `KERNEL-SSM-MAMBA` | RTX 5070 Ti: close Qwen3.5-4B TTFT, TPOT and VRAM gaps vs vLLM — owns the sm_120 post-conv token tile and the K=4 causal-conv arm (PR #155) | feature |
 | [#305](https://github.com/mudler/vllm.cpp/issues/305) | `KERNEL-SSM-MAMBA` | GDN causal-conv: the `conv_state` initial-state read races the final-state write across blocks (`VT_CONV_REG` + exact chunks, both default ON) | bug |
 | [#287](https://github.com/mudler/vllm.cpp/issues/287) | `KV-MOONCAKE-STORE` | `MooncakeStoreConnector`: the KV store half is linkable native C++ and gateable over TCP on one box | feature |
+| [#293](https://github.com/mudler/vllm.cpp/issues/293) | `SERVE-CLI-BENCH` | Stop benchmark AsyncLLM polling from stealing a CPU worker core | perf |
 | [#268](https://github.com/mudler/vllm.cpp/issues/268) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer (Meta, 30B agentic multimodal): text tower, perception encoder, DFlash drafter | feature |
 | [#329](https://github.com/mudler/vllm.cpp/issues/329) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer GGUF k-quants: text arm lands; mmproj blocked by a converter axis drop | feature |
 | [#333](https://github.com/mudler/vllm.cpp/issues/333) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer speed: no number on any axis; benchmark vs llama.cpp, HF, and ourselves | perf |

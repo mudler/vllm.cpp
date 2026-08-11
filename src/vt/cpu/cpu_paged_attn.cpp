@@ -16,8 +16,10 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
+#include "cpu_matmul_elem.h"
 #include "cpu_threadpool.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -25,20 +27,74 @@
 namespace vt::cpu {
 namespace {
 
-// f32 load shared with cpu_ops (redeclared locally to keep this TU standalone).
-float LoadF32(const Tensor& t, int64_t elem_offset) {
-  switch (t.dtype) {
-    case DType::kF32: return t.Ptr<float>()[elem_offset];
-    case DType::kF16: return F16ToF32(t.Ptr<uint16_t>()[elem_offset]);
-    case DType::kBF16: return BF16ToF32(t.Ptr<uint16_t>()[elem_offset]);
-    default: VT_CHECK(false, "paged_attention LoadF32: unsupported dtype"); return 0.0f;
+// PERF-CPU-ATTN-DTYPE. The inner loops below used to call a per-ELEMENT
+// `LoadF32(tensor, offset)` dtype switch — a branch on a value that is constant
+// for the whole tensor, taken once per element, inside the K/V reduction. That
+// is the same defect the elementwise GEMM already removed (see the
+// MatmulOneChunk header, cpu_ops.cpp:98-107), so this mirrors that shape rather
+// than inventing a new one:
+//   1. the QUERY row is widened to f32 ONCE per token with the shared
+//      `WidenRowToF32` (cpu_matmul_elem.h:110), documented bit-identical to a
+//      per-element LoadF32, and reused by every q-head and every key; and
+//   2. the K/V cache dtype is resolved ONCE per kernel invocation into a TYPED
+//      element accessor, exactly as the GEMM resolves the weight dtype once per
+//      chunk into a typed micro-kernel.
+// Nothing about the arithmetic moves: the same f32 products accumulate over the
+// same indices in the same strictly sequential order, so this is bit-identical
+// by construction (asserted against a captured pre-change reference in
+// tests/vt/test_ops_paged_attn_dtype.cpp).
+
+// The element encodings a paged K/V cache may carry, resolved once per call.
+// kFp8 is the KV-FP8 W1 path: 1-byte fp8 pages dequantized by k_scale/v_scale.
+enum class KvKind { kF32, kF16, kBF16, kFp8 };
+
+// One K/V element, with the dtype decision already made at COMPILE time. The
+// f32/f16/bf16 arms are literally the old switch arms (same `Ptr<T>()[off]`,
+// same F16ToF32/BF16ToF32) and the fp8 arm is the old `LoadKvFp8E4M3` branch,
+// so every arm returns the identical float the per-element form returned.
+template <KvKind kKind>
+inline float KvElem(const void* base, int64_t off, float scale) {
+  if constexpr (kKind == KvKind::kF32) {
+    (void)scale;
+    return static_cast<const float*>(base)[off];
+  } else if constexpr (kKind == KvKind::kF16) {
+    (void)scale;
+    return F16ToF32(static_cast<const uint16_t*>(base)[off]);
+  } else if constexpr (kKind == KvKind::kBF16) {
+    (void)scale;
+    return BF16ToF32(static_cast<const uint16_t*>(base)[off]);
+  } else {
+    return vt::LoadKvFp8E4M3(static_cast<const uint8_t*>(base)[off], scale);
   }
 }
 
-void StoreF32(const Tensor& t, int64_t elem_offset, float v) {
+// KvKind of a non-fp8 cache. Same supported set — and same failure message — as
+// the per-element switch it replaces; only the moment the branch is taken moves.
+KvKind KvKindOf(DType dt) {
+  switch (dt) {
+    case DType::kF32: return KvKind::kF32;
+    case DType::kF16: return KvKind::kF16;
+    case DType::kBF16: return KvKind::kBF16;
+    default: VT_CHECK(false, "paged_attention LoadF32: unsupported dtype"); return KvKind::kF32;
+  }
+}
+
+// The output counterpart of `WidenRowToF32`: narrow `n` f32 accumulators into
+// `t`'s storage dtype with ONE branch for the row instead of one per element.
+// Same supported set, same rounding (`F32ToBF16`), same message as the
+// per-element StoreF32 it replaces.
+void StoreRowF32(const Tensor& t, int64_t elem_offset, int64_t n, const float* src) {
   switch (t.dtype) {
-    case DType::kF32: t.Ptr<float>()[elem_offset] = v; break;
-    case DType::kBF16: t.Ptr<uint16_t>()[elem_offset] = F32ToBF16(v); break;
+    case DType::kF32: {
+      float* dst = t.Ptr<float>() + elem_offset;
+      for (int64_t i = 0; i < n; ++i) dst[i] = src[i];
+      break;
+    }
+    case DType::kBF16: {
+      uint16_t* dst = t.Ptr<uint16_t>() + elem_offset;
+      for (int64_t i = 0; i < n; ++i) dst[i] = F32ToBF16(src[i]);
+      break;
+    }
     default: VT_CHECK(false, "paged_attention StoreF32: unsupported dtype");
   }
 }
@@ -81,16 +137,23 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
   // k_scale|v_scale before the f32 softmax (scaled_vec_conversion<float,uint8_t>,
   // quant_utils.cuh:302-308). kAuto keeps the float path byte-identical.
   const bool kv_fp8 = args.kv_cache_dtype != vt::Fp8KVCacheDataType::kAuto;
-  const uint8_t* k_fp8 = kv_fp8 ? k_cache.Ptr<uint8_t>() : nullptr;
-  const uint8_t* v_fp8 = kv_fp8 ? v_cache.Ptr<uint8_t>() : nullptr;
   const float k_scale = args.k_scale;
   const float v_scale = args.v_scale;
-  auto LoadK = [&](int64_t off) -> float {
-    return kv_fp8 ? vt::LoadKvFp8E4M3(k_fp8[off], k_scale) : LoadF32(k_cache, off);
-  };
-  auto LoadV = [&](int64_t off) -> float {
-    return kv_fp8 ? vt::LoadKvFp8E4M3(v_fp8[off], v_scale) : LoadF32(v_cache, off);
-  };
+  // Resolved ONCE per invocation, replacing both the per-element `kv_fp8 ? ...`
+  // branch and the per-element dtype switch underneath it. ONE kind covers both
+  // caches because `vt::PagedAttention` already requires it: k_cache and v_cache
+  // must share one float dtype (ops.cpp:3043-3045), and the fp8 path requires
+  // both to be kI8 (ops.cpp:3050-3051).
+  const void* k_base = k_cache.data;
+  const void* v_base = v_cache.data;
+  const KvKind kv_kind = kv_fp8 ? KvKind::kFp8 : KvKindOf(k_cache.dtype);
+  // Query rows are widened with the shared `WidenRowToF32`; its byte cursor and
+  // element size are the flat element indexing the per-element load did. An f32
+  // query is already its own widened form — `WidenRowToF32` would `memcpy` it
+  // onto itself — so that case reads the tensor in place and copies nothing.
+  const uint8_t* q_bytes = static_cast<const uint8_t*>(query.data);
+  const size_t q_esize = SizeOf(query.dtype);
+  const float* q_f32 = query.dtype == DType::kF32 ? query.Ptr<float>() : nullptr;
 
   // Flatten the (request, local-token) nest into the global query-token index so
   // the work is one embarrassingly-parallel axis: at c1 prefill num_reqs==1, so
@@ -116,58 +179,90 @@ void PagedAttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor
     }
   }
 
-  ParallelForRows(CurrentThreadpool(), total_q, [&](int64_t t0, int64_t t1) {
-    std::vector<float> probs;
-    std::vector<float> acc(static_cast<size_t>(d));
-    for (int64_t t = t0; t < t1; ++t) {
-      const int64_t r = tok_req[static_cast<size_t>(t)];
-      const int64_t p = tok_pos[static_cast<size_t>(t)];  // absolute position
-      const int64_t seqlen = tok_slen[static_cast<size_t>(t)];
-      const int64_t jmin = window_left >= 0 ? std::max<int64_t>(0, p - window_left) : 0;
-      int64_t jmax = args.causal ? p : seqlen - 1;
-      if (window_right >= 0) jmax = std::min(jmax, p + window_right);
-      jmax = std::min(jmax, seqlen - 1);
-      if (jmax < jmin) continue;
-      probs.assign(static_cast<size_t>(jmax - jmin + 1), 0.0f);
-      for (int64_t h = 0; h < hq; ++h) {
-        const int64_t g = h / qpk;
-        const int64_t qoff = (t * hq + h) * d;
-        // Pass 1: scores + running max.
-        float m = -std::numeric_limits<float>::infinity();
-        for (int64_t j = jmin; j <= jmax; ++j) {
-          const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
-          const int64_t off = j % block_size;
-          const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
-          float dot = 0.0f;
-          for (int64_t e = 0; e < d; ++e)
-            dot += LoadF32(query, qoff + e) * LoadK(kbase + e);
-          dot *= scale;
-          if (softcap > 0.0f) dot = softcap * std::tanh(dot / softcap);
-          probs[static_cast<size_t>(j - jmin)] = dot;
-          if (dot > m) m = dot;
+  // The token loop, with the K and V element encodings bound at compile time.
+  // Body text is unchanged from the per-element form apart from the two loads.
+  auto run = [&](auto kv_tag) {
+    constexpr KvKind kKV = decltype(kv_tag)::value;
+    ParallelForRows(CurrentThreadpool(), total_q, [&](int64_t t0, int64_t t1) {
+      std::vector<float> probs;
+      std::vector<float> acc(static_cast<size_t>(d));
+      // The token's whole query row (hq*d contiguous elements), widened once and
+      // reused by every q-head and every key of that token. Unused (and unsized)
+      // when the query is already f32.
+      std::vector<float> qrow;
+      if (q_f32 == nullptr) qrow.resize(static_cast<size_t>(hq * d));
+      for (int64_t t = t0; t < t1; ++t) {
+        const int64_t r = tok_req[static_cast<size_t>(t)];
+        const int64_t p = tok_pos[static_cast<size_t>(t)];  // absolute position
+        const int64_t seqlen = tok_slen[static_cast<size_t>(t)];
+        const int64_t jmin = window_left >= 0 ? std::max<int64_t>(0, p - window_left) : 0;
+        int64_t jmax = args.causal ? p : seqlen - 1;
+        if (window_right >= 0) jmax = std::min(jmax, p + window_right);
+        jmax = std::min(jmax, seqlen - 1);
+        if (jmax < jmin) continue;
+        probs.assign(static_cast<size_t>(jmax - jmin + 1), 0.0f);
+        const float* qtok;
+        if (q_f32 != nullptr) {
+          qtok = q_f32 + t * hq * d;
+        } else {
+          WidenRowToF32(query.dtype, q_bytes + static_cast<size_t>(t * hq * d) * q_esize, hq * d,
+                        qrow.data());
+          qtok = qrow.data();
         }
-        // Pass 2: exp + denominator.
-        float denom = 0.0f;
-        for (int64_t j = jmin; j <= jmax; ++j) {
-          const float e = std::exp(probs[static_cast<size_t>(j - jmin)] - m);
-          probs[static_cast<size_t>(j - jmin)] = e;
-          denom += e;
+        for (int64_t h = 0; h < hq; ++h) {
+          const int64_t g = h / qpk;
+          const int64_t qoff = (t * hq + h) * d;
+          const float* q = qtok + h * d;  // == &query[(t*hq+h)*d], as f32
+          // Pass 1: scores + running max.
+          float m = -std::numeric_limits<float>::infinity();
+          for (int64_t j = jmin; j <= jmax; ++j) {
+            const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
+            const int64_t off = j % block_size;
+            const int64_t kbase = blk * kc_blk + off * kc_pg + g * kc_hd;
+            float dot = 0.0f;
+            for (int64_t e = 0; e < d; ++e)
+              dot += q[e] * KvElem<kKV>(k_base, kbase + e, k_scale);
+            dot *= scale;
+            if (softcap > 0.0f) dot = softcap * std::tanh(dot / softcap);
+            probs[static_cast<size_t>(j - jmin)] = dot;
+            if (dot > m) m = dot;
+          }
+          // Pass 2: exp + denominator.
+          float denom = 0.0f;
+          for (int64_t j = jmin; j <= jmax; ++j) {
+            const float e = std::exp(probs[static_cast<size_t>(j - jmin)] - m);
+            probs[static_cast<size_t>(j - jmin)] = e;
+            denom += e;
+          }
+          const float inv = 1.0f / denom;  // every valid decoder/encoder window has >= 1 key
+          // Pass 3: weighted sum of V (f32 accumulation), stored at out's dtype.
+          for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;
+          for (int64_t j = jmin; j <= jmax; ++j) {
+            const float pw = probs[static_cast<size_t>(j - jmin)] * inv;
+            const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
+            const int64_t off = j % block_size;
+            const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
+            for (int64_t e = 0; e < d; ++e)
+              acc[static_cast<size_t>(e)] += pw * KvElem<kKV>(v_base, vbase + e, v_scale);
+          }
+          StoreRowF32(out, qoff, d, acc.data());
         }
-        const float inv = 1.0f / denom;  // every valid decoder/encoder window has >= 1 key
-        // Pass 3: weighted sum of V (f32 accumulation), stored at out's dtype.
-        for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;
-        for (int64_t j = jmin; j <= jmax; ++j) {
-          const float pw = probs[static_cast<size_t>(j - jmin)] * inv;
-          const int64_t blk = btab[r * bt_row + (j / block_size) * bt_col];
-          const int64_t off = j % block_size;
-          const int64_t vbase = blk * vc_blk + off * vc_pg + g * vc_hd;
-          for (int64_t e = 0; e < d; ++e)
-            acc[static_cast<size_t>(e)] += pw * LoadV(vbase + e);
-        }
-        for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
       }
-    }
-  });
+    });
+  };
+
+  // ONE 4-way switch for the whole call, instead of a branch per element.
+#define VT_KV_KIND_CASE(kind)                                \
+  case KvKind::kind:                                         \
+    run(std::integral_constant<KvKind, KvKind::kind>{});     \
+    break
+  switch (kv_kind) {
+    VT_KV_KIND_CASE(kF32);
+    VT_KV_KIND_CASE(kF16);
+    VT_KV_KIND_CASE(kBF16);
+    VT_KV_KIND_CASE(kFp8);
+  }
+#undef VT_KV_KIND_CASE
 }
 
 struct Registrar {

@@ -557,6 +557,44 @@ token in the Marlin MoE kernel at T=9, 6e), not by the missing graph. The lever
 worth building is the MoE verify path - expert batching for the 1+k shape, and
 finding why that path loses its graph - not a generic 1+k capture.
 
+## 6g. CORRECTION: there is no graph asymmetry (2026-08-11)
+
+Sections 6e and 6f both asserted that the speculative verify "runs fully eager"
+on the 35B (zero `cudaGraphLaunch`) while the dense path captured. **That does
+not reproduce and the claim is withdrawn.** Re-measured on the current binary
+with the dense lane's recipe (`--max-num-seqs 2`, same tool, same two lengths):
+
+| arm | `cudaGraphLaunch` |
+|---|---:|
+| 35B spec-off 32 / 64 | 30 / 62 |
+| **35B DSpark 32 / 64** | **15 / 28** |
+| 27B spec-off 32 / 64 | 30 / 62 |
+| **27B DSpark 32 / 64** | **11 / 24** |
+
+`VT_DFLASH_GRAPH_STATS=1` confirms it independently: `[DFLASH-GRAPH] captured
+#1 Tq=8 C=5` (35B) and `Tq=15` (27B). BOTH families capture. Issue #389, filed
+on the non-reproducing zero, is CLOSED as not a defect.
+
+**What the gate actually says**, which reading it would have shown before either
+section was written: both target gates require `input.pure_decode`
+(`num_actual_tokens == num_reqs`; qwen3_5_dense.cpp:159, qwen3_5_moe.cpp:128).
+A verify carries 1+k tokens per request, so **the verify is eager on BOTH
+families** — including the dense one that reached 1.77x. The graph launches under
+DSpark are the DRAFT step (D13 Part C, gated `P == 1`), one per propose, which is
+exactly why the count tracked speculative steps.
+
+**Net effect on the attribution: it survives and gets cleaner.** With no graph
+difference between the families, the 35B's 1.15x against the dense 1.77x rests
+entirely on MoE expert activation (1.7x more GPU time per generated token at
+T=9, 6e). And the standing lever is better evidenced than when 6e proposed it:
+the 1+k verify is eager EVERYWHERE, so capturing that shape is unexploited
+headroom on both families rather than a repair to one.
+
+**Method note worth keeping:** 6e drew an architectural conclusion from a single
+profile without a same-binary control. The dense lane was the control that caught
+it, and the counter settled it in one run. A launch-count difference between two
+models is a claim about a gate — read the gate.
+
 **Still owed for a binding W6:** (1) the cross-engine speed A/B against vLLM's
 PRODUCTION GRAPHED config through the project's harness, not the eager arm run
 here; (2) token-exactness against that oracle on the SACRED corpus rather than

@@ -38,7 +38,9 @@ Cold start: `MEASURED`. Load (#150): 27B bf16 loads **1.54x warm / 1.61x cold**,
 Releases: W1-W11/W13 are implemented in #196; local CPU, Vulkan, archive,
 metadata and mutation gates are green, while the hosted eight-tuple dry run and
 tagged publication stay pending, so no binary is published. Container
-images (#170): the cpu lane passes its gate; nothing is published.
+images (#170): the cpu (amd64) and cuda (arm64) lanes pass their gates, the
+latter RUNTIME-VERIFIED on GB10 `sm_121a` with `--gpus all`; Tegra (Thor, Orin)
+is untested and nothing is published.
 See [RELEASES](RELEASES.md).
 
 Protocol (2026-08-09): `776c56f1` has 157 imports = 3,231,342 exact bytes;
@@ -435,7 +437,14 @@ on 4 gfx archs (#41); the ratified (b) APU unified-memory fix is in
 Gemma-4 MoE (#140, contributor) M0/M1 on 2× R9700, CPU-link-verified our side;
 [guide](ROCM.md)), and the full tool-calling template surface. **Muse Glimmer's
 GGUF arm generates coherently** (#347, #359), is NOT token-exact, and has
-only a llama.cpp bar (#333). **Scale-out / distributed execution is scoped, with two legs landed
+only a llama.cpp bar (#333). Its CPU decode was **synchronisation-bound, not
+kernel-bound**: the threadpool's never-yielding spin-wait cost a full scheduler
+timeslice per dispatch whenever the pool was wider than the cores available to
+it, which the default `hardware_concurrency()` width reaches on its own. A
+bounded spin then `sched_yield` (#391 Lever 1, 2026-08-11) takes in512 decode
+**3.41x** and in128 prefill to **1.023x of llama.cpp**, and collapses the
+run-to-run decode spread from 73.3% to 15.2%. Prefill at 512 input tokens is
+**unmoved** and remains the open half of the gap (#391 Lever 2). **Scale-out / distributed execution is scoped, with two legs landed
 CPU-gated** (2026-07-28): one `vt::` collective / process-group abstraction
 with backend transports (NCCL / RDMA / MLX-ring) mirrors vLLM's
 `device_communicators` across multi-GPU TP+PP, 2×DGX-Spark over ConnectX-7

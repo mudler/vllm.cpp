@@ -12,6 +12,12 @@
 #include <immintrin.h>
 #endif
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sched.h>
+#endif
+
 // Match ggml's GGML_TSAN_ENABLED fence workaround. GCC and Clang both warn
 // that a standalone atomic_thread_fence is not modeled by ThreadSanitizer;
 // the upstream TSAN build uses a no-op seq-cst RMW on the same synchronization
@@ -41,6 +47,63 @@ inline void CpuRelax() {
   ;
 #endif
 }
+
+// Hand the core back to the scheduler. Purely a scheduling hint: it reads and
+// writes no synchronization state and orders no memory, so inserting it into a
+// spin-wait changes only WHEN a waiter is on a CPU, never what any thread
+// computes or observes (see kDefaultSpinRounds).
+inline void YieldThread() {
+#if defined(_WIN32)
+  SwitchToThread();
+#else
+  sched_yield();
+#endif
+}
+
+// Spin budget before a waiter yields its core. NOT ported: ggml's two
+// spin-waits (ggml_barrier :587-589 and ggml_graph_compute_poll_for_work
+// :3137-3139) relax without ever yielding, because upstream kicks the pool once
+// per GRAPH — a spinner there is idle only across a node boundary. Our recorded
+// per-OP adaptation (cpu_threadpool.h) kicks per operation, so a spinner is
+// also idle across the caller's serial between-op work, and the number of
+// waits per token is multiplied by the op count.
+//
+// A never-yielding spin-wait has a hard scheduler cliff at
+// (runnable threads) > (available cores): the barrier's last arrival may be
+// off-CPU while every other worker burns its core spinning, so the wait costs a
+// full scheduler timeslice instead of a cache-line transfer. MEASURED on this
+// tree with an empty op, 8 CPUs (taskset), 5000 dispatches: 8 pool threads =
+// 1.84 us mean; 9 pool threads = 6004 us mean, p50 6000 us — exactly one CFS
+// timeslice, a 3265x cliff for one extra thread. The default pool width is
+// hardware_concurrency(), so any other runnable thread in the process — the
+// async-scheduling thread, the API/CLI thread — puts a stock decode over that
+// cliff.
+//
+// Yielding after a bounded spin removes the cliff (5516 us -> 5.93 us at
+// 9 threads on 8 CPUs) and is free when the pool fits (1.63 -> 1.68 us at 8 on
+// 8, inside the run-to-run spread). The budget is in relax rounds, so it is
+// arch-dependent: x86 `pause` is tens of cycles, aarch64 `yield` is a hint that
+// often retires in one. VT_CPU_SPIN_ROUNDS overrides it for a same-binary A/B;
+// 0 disables yielding entirely and restores the upstream never-yield wait.
+#if defined(__aarch64__)
+inline constexpr long kDefaultSpinRounds = 4096;
+#else
+inline constexpr long kDefaultSpinRounds = 256;
+#endif
+
+long SpinRoundsFromEnv() {
+  if (const char* e = std::getenv("VT_CPU_SPIN_ROUNDS")) {
+    const long n = std::atol(e);
+    if (n >= 0) {
+      return n;
+    }
+  }
+  return kDefaultSpinRounds;
+}
+
+// Read once at static-init time: this is a tuning constant, and both readers
+// are inner spin loops that must not pay a magic-static guard per iteration.
+const long g_spin_rounds = SpinRoundsFromEnv();
 
 // Thread count selection (spec § env contract): VLLM_CPP_CPU_THREADS, default
 // std::thread::hardware_concurrency(); clamped to [1, kMaxThreads]
@@ -126,9 +189,18 @@ void Threadpool::Barrier() {
     return;
   }
 
-  // wait for other threads
+  // wait for other threads. Deviation from ggml-cpu.c:587-589: after a bounded
+  // spin, hand the core back so the arrival we are waiting for can be
+  // scheduled. The loop condition, the atomics, their memory orders and the
+  // exit fence below are all untouched, so the set of observable states this
+  // wait can exit in is unchanged — only how long it holds a CPU moves.
+  long spins = 0;
   while (n_barrier_passed_.load(std::memory_order_relaxed) == n_passed) {
     CpuRelax();
+    if (g_spin_rounds > 0 && ++spins >= g_spin_rounds) {
+      spins = 0;
+      YieldThread();
+    }
   }
 
   // exit barrier (full seq-cst fence). TSAN does not model a standalone
@@ -197,8 +269,16 @@ void Threadpool::ThreadSync() {
 // rounds before falling back to the cond-var sleep.
 bool Threadpool::PollForWork(ComputeState& state) {
   const uint64_t n_rounds = 1024UL * 128 * poll_;
+  // Same deviation as Barrier(): a poller that never yields holds a core
+  // through the caller's whole serial between-op window, which upstream does
+  // not have (one kickoff per graph vs our per-op kickoff).
+  long spins = 0;
   for (uint64_t i = 0; !ThreadReady(state) && i < n_rounds; ++i) {
     CpuRelax();
+    if (g_spin_rounds > 0 && ++spins >= g_spin_rounds) {
+      spins = 0;
+      YieldThread();
+    }
   }
   return state.pending;
 }

@@ -452,6 +452,40 @@ exactly as open as it was. The boot gate needs a model, so hosted CI runs config
 and layout only and reports the absence of runtime evidence rather than
 implying it -- W6 is where that closes.
 
+### W6 GB10 result: the arm64 cuda lane runs on real silicon
+
+Measured 2026-08-11 on `promaxgb10-4ad8` (GB10, `sm_121a`, aarch64, CUDA 13.3,
+Docker 29.2.1 with the nvidia runtime), building `docker/Dockerfile --target
+cuda` natively:
+
+| axis | result |
+|---|---|
+| build | 673/673 objects; ten-SM gencode audit PASS; Triton AOT "six exact trees and namespaces OK" |
+| image | **1.71 GB** (`linux/arm64`, cuda lane) |
+| driver | `/usr/lib/aarch64-linux-gnu/libcuda.so.1 -> libcuda.so.580.159.03`, injected by the host runtime; the image ships none |
+| runtime | `/health` 200, `/version` 200, the image's own declared healthcheck passing inside the container, clean SIGTERM -- **with `--gpus all`**, on `opt-125m-bf16-st` |
+
+This is the first runtime evidence for any lane on accelerator hardware, and it
+is evidence for exactly one tuple: `linux/arm64` + cuda + `sm_121a`. It says
+nothing about amd64, and nothing about Tegra.
+
+Getting here cost four defects, none of which existed in theory and all of which
+the build found: the CUDA 12.9 base that could not compile `sm_110`, the
+BuildKit cache mount that outlived its toolchain (both #366), the Marlin gencode
+table drift that failed the audit on 14 correctly-compiled TUs (#394), and a
+validator that could only ever produce build evidence because its boot smoke
+never passed `--gpus`.
+
+**SBSA is now confirmed, and it sharpens the Tegra question rather than
+answering it.** The runtime libraries were copied from
+`/usr/local/cuda/targets/sbsa-linux/lib` -- so the published arm64 image is an
+SBSA image. GB10 runs it. Thor (`sm_110`) and Orin (`sm_87`) are Tegra/L4T with
+a different CUDA runtime, remain unprobed, and are not covered by this result.
+
+Lock discipline, since the box is shared: the build ran outside `gpu.lock`
+because it needs no GPU, and only the container run took the lock, blocking --
+it queued 16:58:38 -> 17:50:43 behind other users rather than jumping them.
+
 ### Pull-request scope, and why it is not a hole
 
 A release run builds every lane on both architectures. A pull request builds a

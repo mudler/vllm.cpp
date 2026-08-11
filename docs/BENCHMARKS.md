@@ -8,7 +8,7 @@
 | **Structured state record (active)** | v1 scalar + relational + Git-history contracts | No benchmark. At `776c56f1`: 157 imports = 3,231,342 exact bytes; append preserved all 156 wrappers/rows. 95 tests: validator/core 44 (checker 20 + core 24), NOW 18, migration 22, cutover 11. New raw-row mutation guard. | n/a |
 | **Binary release matrix (ACTIVE; required W1-W11/W13 implemented in #196)** | Eight primary CPU/CUDA/Vulkan/Metal/MLX host tuples | Adaptive x86 tiers, Vulkan 35/35 + cross-device 11/11, and metadata/mutation gates green. **PENDING:** hosted full matrix, matching hardware, tagged publish | n/a |
 | **Binary release delivery topology** | #196: read-only build/verify, OIDC attest, protected publish; generated indexes and explicit handoff-authenticated assets | Fixes the zero-binary release path by attaching all eight archive/checksum/provenance triplets plus indexes. Hosted proof pending; W12 diagnostics optional | n/a |
-| **Container images (ACTIVE)** | `ENG-RELEASE-CONTAINERS`: GHCR lanes `-cuda`/`-vulkan`/`-cpu` ([spec](../.agents/specs/container-images.md)) | cpu linux/amd64 image **783 MB**; SIGTERM shutdown **0.25 s, exit 0** (was 30 s then SIGKILL 137, #312). `PENDING`: cuda/vulkan sizes, arm64, GB10 in-container `/health` | n/a |
+| **Container images (ACTIVE; arm64 cuda RUNTIME-VERIFIED 2026-08-11)** | `ENG-RELEASE-CONTAINERS` ([spec](../.agents/specs/container-images.md)) | cpu amd64 **783 MB**; cuda arm64 **1.71 GB**, `/health`+`/version`+healthcheck+clean SIGTERM **on `--gpus all`** on GB10 `sm_121a`; SIGTERM **0.25 s exit 0** (was 30 s SIGKILL, #312) | n/a |
 | **Developer/row protocol** | Contribution entry point; `ENG-NOW-DERIVED` #374 @`dbd0d51c` | Entry-point gates retained. #374 W1-W5 DONE; benchmark/runtime/parity `VOID`; row specs now carry `## Now` | n/a |
 | **LoRA runtime W2** (`LORA-RUNTIME`, #278) | **No number owed:** correctness-only; a grid PENDS the W7 model gate |
 | **ARCH audit: ABI is text-only** | 4 capabilities (H3 video, Laguna, Kimi-Linear, DeepSeek-V4) reachable only from `examples/`, none registry-backed. No gate asks whether a CONSUMER can reach a capability. Documentation only |
@@ -25,7 +25,7 @@
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 | **vLLM** | Kimi-Linear-48B-A3B, GB10 | no binding number: the published checkpoint is tiktoken-only, so it cannot drive the warm-server harness | golden 122/128, near-tie profile |
-| **Muse Glimmer 30B (#268)** | no vLLM denominator (pin lacks `muse_glimmer`); SECONDARY llama.cpp, same GGUF, idle GB10 | **vLLM axis is an OPEN GAP.** vs llama.cpp ([#333](../.agents/specs/muse-glimmer.md) §14): prefill **tie 0.997x**, decode **0.232x**, RSS 1.92x | coherent, NOT token-exact |
+| **Muse Glimmer 30B (#268)** | no vLLM denominator (pin lacks `muse_glimmer`); SECONDARY llama.cpp, same GGUF, idle GB10 | **vLLM axis is an OPEN GAP.** vs llama.cpp after the [#391](../.agents/specs/cpu-decode-barrier-and-attn-dispatch.md) fix: in128 prefill **1.023x** (was 0.878x); in512 decode **0.194x** (3.41x), prefill 0.175x flat | coherent, NOT token-exact |
 
 Reading the ratios: throughput is ours/reference, latency is reference/ours, so
 **1.0 or higher is a win** everywhere on this page. Which architecture each number
@@ -339,7 +339,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | Dense **1.77x** warm c1 (17.45 vs 9.87 tok/s, 12.2% acceptance, graphs captured). MoE only **1.15x**: its verify runs eager and its expert GEMM costs 1.7x more GPU per token at T=9 | `ACTIVE` |
+| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | Dense **1.77x** warm c1 (17.45 vs 9.87 tok/s) at 12.2% acceptance; MoE **1.15x** at 20.8%. The gap is MoE expert cost (1.7x GPU/token at T=9), not graphs: both families capture the draft and run the verify eager | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure

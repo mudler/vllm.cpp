@@ -359,6 +359,15 @@ HfConfig TinyConfigNormalizedTokEmbeddings() {
   return c;
 }
 
+// The norm OFF arm needs the flag set EXPLICITLY false. Omitting it means TRUE
+// (#405) -- the released config omits it, and upstream defaults it on -- so a
+// config that merely stays silent is the ON case, not the OFF one.
+HfConfig TinyConfigNoNormalizedTokEmbeddings() {
+  HfConfig c = TinyConfig();
+  c.raw["text_config"]["normalize_tok_embeddings"] = false;
+  return c;
+}
+
 // The synthetic checkpoint, written in the REAL on-disk names (canonical
 // `model.language_model.*` text + `model.vision_tower.*` vision with SEPARATE q/k/v
 // and biases) so the loader's normalization and merge both run for real.
@@ -777,13 +786,19 @@ TEST_CASE("MuseGlimmer: perception_emb_norm runs IFF normalize_tok_embeddings") 
   std::vector<vllm::SafetensorsFile> shards;
   shards.push_back(vllm::SafetensorsFile::Open(file.path()));
   const MuseGlimmerWeights w_off =
-      vllm::LoadMuseGlimmerForConditionalGenerationWeights(shards, TinyConfig());
+      vllm::LoadMuseGlimmerForConditionalGenerationWeights(
+          shards, TinyConfigNoNormalizedTokEmbeddings());
   const MuseGlimmerWeights w_on =
       vllm::LoadMuseGlimmerForConditionalGenerationWeights(
           shards, TinyConfigNormalizedTokEmbeddings());
-  // The released 30B's case is OFF; only an explicit flag arms the norm.
+  // The released 30B's case is ON: the key is ABSENT and absent means TRUE
+  // (#405). This test previously asserted the opposite and so encoded the bug
+  // as an expectation -- worse than not covering it, because it made the wrong
+  // default look deliberate. The OFF arm now sets the flag explicitly, and the
+  // silent-config case is pinned in test_muse_glimmer_scaffold.
   REQUIRE_FALSE(w_off.params.text.normalize_tok_embeddings);
   REQUIRE(w_on.params.text.normalize_tok_embeddings);
+  REQUIRE(ParseMuseGlimmerParams(TinyConfig()).text.normalize_tok_embeddings);
   vt::Queue q = Qcpu();
 
   const std::vector<float> off = vllm::MuseGlimmerEncodePixelGroups(TinyImages(), w_off, q);

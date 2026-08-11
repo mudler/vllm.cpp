@@ -240,14 +240,23 @@ def wait_for_health(url: str, timeout: float) -> tuple[bool, str]:
     return False, last
 
 
-def check_boot(image: str, model: Path, port: int, timeout: float) -> list[str]:
+def check_boot(
+    image: str, model: Path, port: int, timeout: float, gpus: str | None = None
+) -> list[str]:
     errors: list[str] = []
     name = f"vllm-cpp-smoke-{port}"
+
+    # --gpus is what turns a build result into RUNTIME evidence for an
+    # accelerator lane: without it the cuda image runs its CPU paths and proves
+    # nothing about the GPU it was built for. The driver still comes from the
+    # host through the container runtime; the image never carries one.
+    gpu_args = ["--gpus", gpus] if gpus else []
 
     run(["docker", "rm", "--force", name])
     code, output = run(
         [
             "docker", "run", "--detach", "--name", name,
+            *gpu_args,
             "--publish", f"127.0.0.1:{port}:8000",
             "--volume", f"{model}:/models/smoke:ro",
             image,
@@ -307,6 +316,11 @@ def main() -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--expect-revision")
     parser.add_argument("--model", type=Path, help="model directory for the boot smoke")
+    parser.add_argument(
+        "--gpus",
+        help="pass through to `docker run --gpus` (e.g. all) so the boot smoke is "
+        "real runtime evidence for an accelerator lane",
+    )
     parser.add_argument("--port", type=int, default=18000)
     parser.add_argument("--boot-timeout", type=float, default=180.0)
     args = parser.parse_args()
@@ -321,7 +335,7 @@ def main() -> int:
             errors.append(f"--model {args.model} is not a directory")
         else:
             boot_errors = check_boot(
-                args.image, args.model.resolve(), args.port, args.boot_timeout
+                args.image, args.model.resolve(), args.port, args.boot_timeout, args.gpus
             )
             errors += boot_errors
             runtime_verified = not boot_errors
@@ -335,7 +349,11 @@ def main() -> int:
     print(f"container image OK: {args.image} lane={args.lane} version={args.version}")
     print(f"  config, layout: verified")
     if runtime_verified:
-        print("  boot: /health 200, /version 200, declared healthcheck passed, clean SIGTERM")
+        where = f"on --gpus {args.gpus}" if args.gpus else "on CPU paths only (no --gpus)"
+        print(
+            f"  boot: /health 200, /version 200, declared healthcheck passed, clean "
+            f"SIGTERM, {where}"
+        )
     else:
         print("  boot: NOT RUN (no --model): this image has NO runtime evidence")
     return 0

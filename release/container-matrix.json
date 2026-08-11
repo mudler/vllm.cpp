@@ -70,7 +70,7 @@
         {
           "platform": "linux/arm64",
           "runner": "ubuntu-24.04-arm",
-          "runtime_evidence": false
+          "runtime_evidence": true
         }
       ],
       "channel": "preview",

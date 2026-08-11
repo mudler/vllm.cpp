@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/check-cuda-fat-gencode.py"
+
+
+def _load_checker():
+    spec = importlib.util.spec_from_file_location("check_cuda_fat_gencode", CHECKER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+checker = _load_checker()
 ALL = ("80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a")
 
 
@@ -32,7 +44,9 @@ def valid_commands() -> list[dict[str, str]]:
         command("src/vt/cuda/cuda_matmul_nvfp4_sm100.cu", ("100a",)),
         command("src/vt/cuda/cuda_scaled_mm_c3x_sm90.cu", ("90a",)),
         command("src/vt/cuda/cuda_scaled_mm_c3x_sm100.cu", ("100a",)),
-        command("src/vt/cuda/cuda_moe_marlin.cu", ("120a", "121a")),
+        # Marlin's set is the feature table's, not a literal here: restating it
+        # is exactly what drifted in #394.
+        command("src/vt/cuda/cuda_moe_marlin.cu", checker.expected_sms("src/vt/cuda/cuda_moe_marlin.cu")),
         command(
             "src/vt/cuda/cuda_flash_attn_fa2.cu",
             ("80", "86", "87", "89", "120a", "121a"),
@@ -107,3 +121,44 @@ class FatGencodeContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MarlinTracksTheFeatureTable(unittest.TestCase):
+    """#394: the checker restated a fact cmake already owns, and they drifted.
+
+    `cmake/CudaArchFeatures.cmake` declares the marlin-nvfp4 arch set. sm_110
+    was added there for Thor (#325) and the checker's hardcoded SM12X was not
+    updated, so every ten-SM fat build failed its own audit on 14 Marlin TUs
+    while the build itself was correct.
+
+    RED-first: with `return SM12X` these assertions fail for 110.
+    """
+
+    def feature_table_marlin_archs(self) -> set[str]:
+        text = (ROOT / "cmake/CudaArchFeatures.cmake").read_text(encoding="utf-8")
+        row = re.search(r'"marlin-nvfp4\|([^|]+)\|', text)
+        self.assertIsNotNone(row, "the marlin-nvfp4 feature row must exist")
+        return {
+            arch.strip().replace(".", "", 1) + ""
+            for arch in row.group(1).split(",")
+        }
+
+    def test_marlin_expectation_equals_the_feature_table(self):
+        table = self.feature_table_marlin_archs()
+        for source in (
+            "src/vt/cuda/cuda_moe_marlin.cu",
+            "src/vt/cuda/cuda_marlin_dense.cu",
+            "src/vt/cuda/cuda_marlin_repack.cu",
+            "src/vt/cuda/marlin/libtorch_stable/quantization/marlin/marlin_mm_dense.cu",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(
+                    set(checker.expected_sms(source)),
+                    table,
+                    "the checker and cmake/CudaArchFeatures.cmake must agree; "
+                    "restating the arch set is what caused #394",
+                )
+
+    def test_sm110_is_expected_for_marlin(self):
+        """The specific regression, named: Thor's SM must not be audited away."""
+        self.assertIn("110", checker.expected_sms("src/vt/cuda/cuda_moe_marlin.cu"))

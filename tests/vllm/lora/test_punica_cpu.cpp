@@ -46,16 +46,22 @@ std::vector<float> Rand(int64_t n, uint32_t seed, float scale = 0.2f) {
   return v;
 }
 
-// Reference: out[t,r] = scaling * sum_i x[t,i]*a[s][r,i], s = idx[t] (skip <0).
+// Reference: out[t,r] = scaling * sum_i x[t,i]*a[s][r,i], s = idx[t].
+// Skips the same slots the kernel skips (punica_cpu.cpp BgmvShrink/AddShrink:
+// `slot < 0 || slot >= num_slots`). Both halves matter: a caller that exercises
+// the out-of-range guard passes `idx[t] == num_slots`, and reading `a` at that
+// slot runs off the end of the stacked adapter. `num_slots` is not a parameter,
+// so derive it from the only place it is knowable here -- `a`'s own extent.
 std::vector<double> RefShrink(const std::vector<float>& x, int64_t T,
                               int64_t in_dim, const std::vector<float>& a,
                               int64_t rank, const std::vector<int32_t>& idx,
                               double scaling) {
   std::vector<double> out(static_cast<size_t>(T * rank), 0.0);
   const int64_t a_stride = rank * in_dim;
+  const int64_t num_slots = static_cast<int64_t>(a.size()) / a_stride;
   for (int64_t t = 0; t < T; ++t) {
     const int32_t s = idx[static_cast<size_t>(t)];
-    if (s < 0) continue;
+    if (s < 0 || s >= num_slots) continue;
     for (int64_t r = 0; r < rank; ++r) {
       double acc = 0.0;
       for (int64_t i = 0; i < in_dim; ++i) {

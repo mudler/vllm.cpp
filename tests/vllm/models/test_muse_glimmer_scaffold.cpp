@@ -248,6 +248,19 @@ TEST_CASE("MuseGlimmer: qk-norm and the output gate default ON when ABSENT") {
   const MuseGlimmerParams disabled = ParseMuseGlimmerParams(off);
   CHECK_FALSE(disabled.text.use_qk_norm);
   CHECK_FALSE(disabled.text.use_attn_output_gate);
+
+  // THE SAME TRAP, third field (#405). `normalize_tok_embeddings` is ABSENT
+  // from the released config too, and upstream defaults it TRUE
+  // (configs/muse_glimmer.py:66; SGLang srt/configs/muse_glimmer.py:100 agrees
+  // independently). We defaulted it false, which made `perception_emb_norm` a
+  // silent no-op on the vision path.
+  //
+  // The wiring gate drives that norm by setting the flag EXPLICITLY, so it
+  // exercised the mechanism and never the DEFAULT — and the default is the only
+  // case a released checkpoint actually hits.
+  CHECK(absent.text.normalize_tok_embeddings);
+  off.raw["text_config"]["normalize_tok_embeddings"] = false;
+  CHECK_FALSE(ParseMuseGlimmerParams(off).text.normalize_tok_embeddings);
 }
 
 TEST_CASE("MuseGlimmer: the iRoPE mask counts BACKWARD from the last layer") {

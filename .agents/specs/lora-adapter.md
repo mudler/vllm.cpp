@@ -8,6 +8,16 @@ engine matrix. Claims: `CLAIM-LORA-RUNTIME` (W0+W1) and
 
 Tracking issue for W2: [#278](https://github.com/mudler/vllm.cpp/issues/278).
 
+Bug found after W2 landed: [#395](https://github.com/mudler/vllm.cpp/issues/395)
+— `test_punica_cpu`'s own `RefShrink` reference read past `a_stacked` for the
+out-of-range slot the case feeds on purpose, so W2 turned the
+`sanitize-cpu (address,undefined)` lane red on `main`. The kernel was correct;
+only the reference was missing the `s >= num_slots` half of the guard the case
+exists to verify. Fixed in the test, with a mutation showing the case still
+fails when the kernel's own guard is dropped. Related coverage gap found in the
+same review and tracked separately:
+[#400](https://github.com/mudler/vllm.cpp/issues/400).
+
 Pinned oracle `${VLLM_SOURCE}` = `/home/mudler/_git/vllm` @ `555967922`
 (vLLM 0.26.0.dev0). Every `file:line` below is read from that pin. This is the
 #1 HIGH-priority gap from

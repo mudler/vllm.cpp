@@ -330,6 +330,11 @@ than "it works", so it is worth stating precisely.
   forward has **never run**.
 - Those are argmax positions from a single prefill, not generated tokens.
   **Multi-step decode is untested**, and so is the sliding window across steps.
+- The perception encoder normalizes merged multimodal embeddings again as of
+  #405. Its config key is absent from the released checkpoint and defaults on,
+  which we had read as off — so image and video prompts before that fix skipped
+  a normalization step. Still no reference decode for the vision path either
+  way, so this corrects the code without changing what has been verified.
 - Even at reduced depth this is agreement with independent transcriptions of the
   same upstream source, not agreement with the model's own runtime: the pinned
   oracle cannot load `muse_glimmer` at all.

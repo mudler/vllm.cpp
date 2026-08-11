@@ -277,7 +277,11 @@ MuseGlimmerParams ParseMuseGlimmerParams(const HfConfig& config) {
   t.post_norm_eps = static_cast<float>(
       RawDouble(text, "post_norm_eps", static_cast<double>(t.rms_norm_eps)));
   t.hidden_activation = RawString(text, "hidden_activation", "silu");
-  t.normalize_tok_embeddings = RawBool(text, "normalize_tok_embeddings", false);
+  // ABSENT means TRUE, the same tri-state as use_qk_norm / use_attn_output_gate
+  // above (configs/muse_glimmer.py:66). The released config omits the key, so the
+  // default is the only value that ships; defaulting it false made
+  // `perception_emb_norm` a silent no-op on the vision path (#405).
+  t.normalize_tok_embeddings = RawBoolDefaultTrue(text, "normalize_tok_embeddings");
   t.output_multiplier = RawDouble(text, "output_multiplier", 1.0);
   t.final_logit_softcapping = RawDouble(text, "final_logit_softcapping", 0.0);
 

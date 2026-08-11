@@ -9,7 +9,9 @@
 // VLLM_CPP_CPU_THREADS 1/3/20; 3 = non-divisor thread count for boundary bugs).
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -465,4 +467,77 @@ TEST_CASE("determinism: byte-identical outputs at n_threads 1 / 3 / 20") {
     CHECK_MESSAGE(ref[i] == got3[i], "buffer " << i << " differs at n_threads=3");
     CHECK_MESSAGE(ref[i] == got20[i], "buffer " << i << " differs at n_threads=20");
   }
+}
+
+// PERF-CPU-BARRIER (issue #391, spec cpu-decode-barrier-and-attn-dispatch.md
+// §2). No upstream analogue: it pins the ONE recorded deviation from ggml's
+// two spin-waits (the bounded spin then YieldThread in Threadpool::Barrier and
+// ::PollForWork).
+//
+// The defect this catches: a spin-wait that never yields turns every dispatch
+// into a full scheduler timeslice as soon as the pool is wider than the cores
+// available to it, because the arrival everyone is waiting for is off-CPU while
+// every other worker burns a core spinning. Measured on the pristine wait,
+// 8 CPUs, empty op: 8 threads 1.84 us, 9 threads 6004 us — a 3265x cliff for
+// one extra thread. With the yield the same pair is 1.68 us / 5.93 us.
+//
+// The assertion is a RATIO between two pools measured back to back in the same
+// process, so it needs no absolute timing budget, and external load inflates
+// BOTH sides, which shrinks the ratio. The 100x threshold sits ~30x below the
+// defect and ~28x above the fixed behaviour.
+//
+// Know the one-sided failure mode before trusting a green: a box that is
+// ALREADY saturated drives both arms to the same timeslice-bound cost and the
+// ratio collapses toward 1, so this test can pass on the defective code there.
+// Verified both ways on 20 cores: on the pristine wait at 1-min load 116 it
+// reported 1.28-3.00 and PASSED, while on a quiet box the same pristine code
+// reports 1835/2079/3836 and fails every time (21 threads costing 2999-5996 us
+// against the fixed 18-20 us). It can
+// therefore be trusted to fail loudly on a quiet machine and never to fail
+// spuriously on a busy one, which is the safe direction for CI. Re-derive the
+// defect on an idle box, not under a parallel gate run.
+TEST_CASE("oversubscribed dispatch does not cost a scheduler timeslice") {
+  const int cores = static_cast<int>(std::thread::hardware_concurrency());
+  if (cores < 4) {
+    MESSAGE("skipped: needs >= 4 cores to oversubscribe meaningfully");
+    return;
+  }
+  // Half the cores always fits; one MORE than the cores never does. The
+  // over arm is deliberately cores+1, not a multiple: that is the regime a
+  // stock run lands in (pool = hardware_concurrency, plus our own async-
+  // scheduling and API threads). A pool that is 2x the cores cannot be made
+  // cheap by any wait policy — every dispatch must wait for 2x as many threads
+  // as there are cores to be scheduled at least once — so testing that regime
+  // would assert something this lever cannot deliver.
+  const int fits = cores / 2;
+  const int over = cores + 1;
+
+  auto median_dispatch_us = [](int n_threads, int reps) {
+    Threadpool tp(n_threads);
+    for (int i = 0; i < 64; ++i) {
+      tp.Run([](int, int) {});  // warm the workers out of the cond-var park
+    }
+    std::vector<double> us;
+    us.reserve(static_cast<size_t>(reps));
+    for (int i = 0; i < reps; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      tp.Run([](int, int) {});
+      us.push_back(std::chrono::duration<double, std::micro>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count());
+    }
+    std::sort(us.begin(), us.end());
+    return us[us.size() / 2];
+  };
+
+  const double fits_us = median_dispatch_us(fits, 2000);
+  const double over_us = median_dispatch_us(over, 2000);
+  const double ratio = over_us / fits_us;
+  MESSAGE("empty-op dispatch: " << fits << " threads " << fits_us << " us, "
+                                << over << " threads " << over_us
+                                << " us, ratio " << ratio);
+  CHECK_MESSAGE(ratio < 100.0,
+                "oversubscribed dispatch is " << ratio
+                    << "x the fitted cost: the waiter is spinning through a "
+                       "scheduler timeslice instead of yielding its core");
 }

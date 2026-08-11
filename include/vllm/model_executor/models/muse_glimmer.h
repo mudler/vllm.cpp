@@ -104,7 +104,9 @@ struct MuseGlimmerTextParams {
   bool use_qk_norm = true;
   bool use_attn_output_gate = true;
 
-  bool normalize_tok_embeddings = false;
+  // Defaults TRUE when absent, like the two flags above (#405): the released
+  // config omits it, and upstream gates `perception_emb_norm` on it.
+  bool normalize_tok_embeddings = true;
   double output_multiplier = 1.0;
   double final_logit_softcapping = 0.0;  // 0 == none
   std::string hidden_activation = "silu";

@@ -13,6 +13,28 @@ from pathlib import Path
 
 ALL_SMS = ("80", "86", "87", "89", "90a", "100a", "103a", "110", "120a", "121a")
 SM12X = ("120a", "121a")
+
+
+def _feature_table_archs(feature: str) -> tuple[str, ...]:
+    """Read one feature's arch set out of cmake/CudaArchFeatures.cmake.
+
+    #394: this checker used to restate the Marlin arch set as SM12X. When
+    sm_110 was added to marlin-nvfp4 for Thor (#325) only cmake learned it, so
+    every ten-SM fat build failed this audit on 14 correctly-compiled TUs.
+    CMake owns the fact; deriving it here is what stops the two drifting again.
+
+    The rows look like:
+        "marlin-nvfp4|11.0,12.0a,12.1a|vendored Marlin NVFP4 ..."
+    and the arch spellings differ between the two files (11.0 vs 110).
+    """
+    table = PROJECT_ROOT / "cmake/CudaArchFeatures.cmake"
+    row = re.search(rf'"{re.escape(feature)}\|([^|]+)\|', table.read_text(encoding="utf-8"))
+    if row is None:
+        raise SystemExit(f"{table}: no feature row for {feature!r}")
+    archs = tuple(arch.strip().replace(".", "", 1) for arch in row.group(1).split(","))
+    if not archs:
+        raise SystemExit(f"{table}: feature {feature!r} declares no architectures")
+    return archs
 FA2_SMS = ("80", "86", "87", "89", "120a", "121a")
 
 REQUIRED_SOURCES = (
@@ -54,17 +76,23 @@ def expected_sms(source: str) -> tuple[str, ...]:
         return ("100a",)
     if "flash_attn/" in source or name == "cuda_flash_attn_fa2.cu":
         return FA2_SMS
+    # Marlin is DERIVED from the feature table (#394); the nvfp4/fp8 CUTLASS
+    # sources below are genuinely sm12x-only and stay literal. Collapsing the
+    # two into one branch would silently widen those to Marlin's arch set.
     if (
-        name == "cuda_nvfp4_sm12x.cu"
-        or name == "cuda_matmul_nvfp4_cutlass.cu"
-        or name.startswith("cuda_nvfp4_tactics_")
-        or name == "cuda_matmul_fp8_cutlass.cu"
-        or name in {
+        name in {
             "cuda_moe_marlin.cu",
             "cuda_marlin_repack.cu",
             "cuda_marlin_dense.cu",
         }
         or "/marlin/" in source
+    ):
+        return _feature_table_archs("marlin-nvfp4")
+    if (
+        name == "cuda_nvfp4_sm12x.cu"
+        or name == "cuda_matmul_nvfp4_cutlass.cu"
+        or name.startswith("cuda_nvfp4_tactics_")
+        or name == "cuda_matmul_fp8_cutlass.cu"
     ):
         return SM12X
     return ALL_SMS

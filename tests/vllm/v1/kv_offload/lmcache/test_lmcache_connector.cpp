@@ -73,31 +73,35 @@ constexpr int kBlockSize = 16;
 class MockLmcacheServer {
  public:
   MockLmcacheServer() {
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    REQUIRE(listen_fd_ >= 0);
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd >= 0);
     int one = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     // Unqualified on purpose: function in glibc, function-like MACRO in the
     // Darwin SDK, and `::htonl` does not compile against a macro.
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
-    REQUIRE(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
-                   sizeof(addr)) == 0);
+    REQUIRE(::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
     socklen_t len = sizeof(addr);
-    REQUIRE(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
-                          &len) == 0);
+    REQUIRE(::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0);
     port_ = ntohs(addr.sin_port);
-    REQUIRE(::listen(listen_fd_, 8) == 0);
+    REQUIRE(::listen(fd, 8) == 0);
+    // Publish only once the socket is ready; from the next line on the
+    // descriptor is shared with the accept thread.
+    listen_fd_.store(fd);
     thread_ = std::thread([this] { Run(); });
   }
   ~MockLmcacheServer() {
     stop_.store(true);
-    if (listen_fd_ >= 0) {
-      ::shutdown(listen_fd_, SHUT_RDWR);
-      ::close(listen_fd_);
-      listen_fd_ = -1;
+    // Unblock accept() by closing the listen socket. This runs BEFORE the join,
+    // so it is concurrent with Run(): the handoff has to be atomic, and a plain
+    // int here is the data race TSan reports.
+    const int fd = listen_fd_.exchange(-1);
+    if (fd >= 0) {
+      ::shutdown(fd, SHUT_RDWR);
+      ::close(fd);
     }
     if (thread_.joinable()) thread_.join();
   }
@@ -199,12 +203,20 @@ class MockLmcacheServer {
   }
   void Run() {
     while (!stop_.load()) {
-      const int fd = ::accept(listen_fd_, nullptr, nullptr);
+      const int lfd = listen_fd_.load();
+      if (lfd < 0) break;  // destructor already took it
+      // ACCEPTED residual: the destructor can close `lfd` between this load and
+      // the accept below. That is not a data race and cannot reach a reused
+      // descriptor here -- only two threads exist, the destructor opens nothing
+      // and joins before returning -- so the worst case is EBADF, which is the
+      // intended exit. Closing after the join instead is NOT the fix: on Darwin
+      // `shutdown()` alone does not wake `accept()`.
+      const int fd = ::accept(lfd, nullptr, nullptr);
       if (fd < 0) break;
       HandleClient(fd);
     }
   }
-  int listen_fd_ = -1;
+  std::atomic<int> listen_fd_{-1};
   int port_ = 0;
   std::atomic<bool> stop_{false};
   std::thread thread_;

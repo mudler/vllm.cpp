@@ -90,6 +90,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#243](https://github.com/mudler/vllm.cpp/issues/243) | — | `vllm-feature-gap-analysis.md` is a stale 2026-07-28 snapshot: 9 of 16 HIGH/MED gaps have since landed | bug |
 | [#250](https://github.com/mudler/vllm.cpp/issues/250) | — | `a5b52047` reached main without a task branch, and `check-role-discipline` cannot be waived | bug |
 | [#285](https://github.com/mudler/vllm.cpp/issues/285) | — | The operator lock refuses a second coordinator; it should only RECORD who is working where (spec `specs/operator-record.md`) | bug |
+| [#274](https://github.com/mudler/vllm.cpp/issues/274) | — | `main` is not verified by its own CI: the per-job `github.ref` concurrency groups cancel every long job on the next push, so the suite never completes (spec `specs/main-verifiability.md`) | bug |
 | [#296](https://github.com/mudler/vllm.cpp/issues/296) | — | Two limitations recorded when #285 landed: a stale TTL comment, and a publish-NAME pin `os.rename` escapes (spec `specs/operator-record.md`, "Follow-up") | bug |
 
 ## Top-level portfolio

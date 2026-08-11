@@ -28,6 +28,37 @@ type before believing a surprising green.
 Tests that starve under `ctest -j` are re-run serially before being called a
 regression.
 
+## Is `main` green? — the baseline lane
+
+Before spending a build cycle proving a red check is not yours, ask:
+
+```sh
+scripts/main-baseline.py            # last fully green SHA, and what is failing now
+scripts/main-baseline.py --json
+```
+
+It reads the `schedule`/`workflow_dispatch` runs of `.github/workflows/ci.yml` —
+the only lane whose long jobs are not cancelled by the next push — and derives
+the verdict at read time. Nothing is stored, so there is no file to conflict on
+and no file that can be stale relative to the runs.
+
+Three things to know before you trust or dismiss a red check.
+
+- **A `push` run on `main` proves almost nothing.** Its expensive jobs share a
+  ref-keyed concurrency group, so the next push cancels them. Of 40 consecutive
+  runs measured for [#274](https://github.com/mudler/vllm.cpp/issues/274), 26
+  were `cancelled` and exactly one completed.
+- **A run's own conclusion is not the verdict.** `sanitize-cpu` is
+  `continue-on-error`, so a run reports `success` with the sanitizers red — run
+  `31448896841` at `5812b8b6` is exactly that. The tool reads per-job
+  conclusions and so should you.
+- **Staleness is visible, not silent.** Every line carries the run's date. If the
+  newest baseline is old, say so; never read an absent run as a pass, and never
+  read `REMOTE_UNVERIFIED` as one either.
+
+To pin a baseline on a SHA you care about right now, rather than waiting for the
+4-hourly cron: `gh workflow run ci.yml --ref main`.
+
 ## Reviewing
 
 Review happens only after the implementation's own gates pass, and only on an

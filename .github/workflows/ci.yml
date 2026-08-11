@@ -3,6 +3,31 @@ on:
   push:
     branches: [main]
   pull_request:
+  # THE BASELINE LANE (issue #274, spec .agents/specs/main-verifiability.md).
+  #
+  # The push lane below cannot answer "is main green?", by construction. Every
+  # expensive job carries a job-level group keyed on `github.ref`, which is the
+  # constant `refs/heads/main` for every push, so consecutive pushes cancel each
+  # other's long jobs. Measured over 40 consecutive main runs at 0eb049f7: 26
+  # cancelled, 12 failure, 1 success. The cancel instant equals the next push's
+  # start instant (run 31485402200 died 11:46:33, run 31488132224 started
+  # 11:46:32; 31482845117 died 11:05:12, 31485054749 started 11:05:11). At 55
+  # pushes/day and a 99-minute suite, that is structural, not bad luck.
+  #
+  # This lane runs the SAME jobs on a cadence, in its own concurrency groups so
+  # a push cannot cancel it, and publishes a verdict via `baseline-summary`.
+  # Every 4h: at 55 pushes/day a red baseline then names ~9 commits (three
+  # bisect steps), and successive runs still cannot overlap a 99-minute suite.
+  # Making every MERGE non-cancellable was rejected: ~55 overlapping runs/day,
+  # ~190 h/day of job time on a pool where run 31485402200 already sat queued 37
+  # minutes without starting a single job -- and at that rate the newest
+  # complete baseline would be several commits stale anyway.
+  schedule:
+    - cron: '17 */4 * * *'
+  # The hybrid half: pin a baseline on a SHA you care about right after merging
+  # it, without paying for a full run on all 55 of the day's pushes.
+  #   gh workflow run ci.yml --ref main
+  workflow_dispatch:
 
 # Workflow-level: dedupe PR pushes only. The group is keyed on the SHA for a
 # push, so two pushes to main never share a group and never cancel each other.
@@ -23,8 +48,15 @@ on:
 # gates written to cover them. The groups are removed; these two jobs must never
 # regain one. They are a checkout plus a Python script, so the cost of always
 # running them is negligible against a silently skipped gate.
+#
+# 2026-08-11 (#274): `github.event_name` joins the key. `cancel-in-progress` is
+# already false for every non-PR event, so this cancels nothing new -- it stops
+# a `workflow_dispatch` baseline fired on a SHA that was just pushed from
+# sharing group `ci-<sha>-<repo>` with that push's run and QUEUEING behind it.
+# For `push` and `pull_request` the added token is a constant, so their
+# partition into groups is exactly what it was.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.sha }}-${{ github.repository }}
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}-${{ github.repository }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -32,8 +64,8 @@ jobs:
     # Tree-scoped: validates the record as it stands at HEAD, so only the newest
     # push to a ref is meaningful. Cancellable.
     concurrency:
-      group: ci-agent-record-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
+      group: ci-agent-record-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -216,6 +248,13 @@ jobs:
     # DIFF-scoped: deliberately carries NO concurrency group. Its verdict covers
     # this push's own `before..sha` range and nothing re-covers that range later,
     # so cancelling it would silently exempt those commits from the gate.
+    #
+    # Not on the baseline lane (#274): `schedule` and `workflow_dispatch`
+    # payloads have no `github.event.before`, so the range below would be empty
+    # and the gate vacuous. The push that landed each commit already ran this,
+    # which is exactly why it carries no group. The baseline's subject is the
+    # TREE at a SHA, and `scripts/main-baseline.py` names the jobs it covered.
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -252,6 +291,10 @@ jobs:
     # DIFF-scoped: deliberately carries NO concurrency group, same reasoning as
     # documentation-checkpoint above. It walks `before..sha` per push, so a
     # cancelled run means those commits are never checked for the trailer.
+    #
+    # Not on the baseline lane (#274), same reasoning: no `before` on a
+    # `schedule` or `workflow_dispatch` payload, so the walk has no range.
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -320,8 +363,8 @@ jobs:
     #
     # Tree-scoped (drives cmake at HEAD): cancellable.
     concurrency:
-      group: ci-cuda-arch-features-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
+      group: ci-cuda-arch-features-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -346,8 +389,8 @@ jobs:
     permissions:
       contents: read
     concurrency:
-      group: ci-cuda-fat-build-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
+      group: ci-cuda-fat-build-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     container: nvidia/cuda:13.3.0-devel-ubuntu24.04
@@ -418,8 +461,8 @@ jobs:
     #
     # Tree-scoped (checks HEAD's artifact): cancellable.
     concurrency:
-      group: ci-vulkan-spirv-freshness-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
+      group: ci-vulkan-spirv-freshness-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -452,8 +495,8 @@ jobs:
     #
     # Tree-scoped: cancellable.
     concurrency:
-      group: ci-build-test-vulkan-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
+      group: ci-build-test-vulkan-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -494,8 +537,8 @@ jobs:
     # Tree-scoped: the ratchet compares HEAD against the committed baseline, so
     # only the newest push matters. Cancellable.
     concurrency:
-      group: ci-device-leakage-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
+      group: ci-device-leakage-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -506,8 +549,8 @@ jobs:
   build-test-cpu:
     # Tree-scoped and the most expensive lane in the workflow. Cancellable.
     concurrency:
-      group: ci-build-test-cpu-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
+      group: ci-build-test-cpu-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -557,8 +600,8 @@ jobs:
     # every available rich tier; qemu's Cortex-A53 model supplies the required
     # feature-poor execution and illegal-tier refusal gate.
     concurrency:
-      group: ci-build-test-cpu-arm64-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
+      group: ci-build-test-cpu-arm64-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -641,8 +684,8 @@ jobs:
     # the two mutually-exclusive sanitizer legs of the SAME run would land in one
     # group and cancel each other, leaving only whichever started second.
     concurrency:
-      group: ci-sanitize-cpu-${{ matrix.lane }}-${{ github.ref }}-${{ github.repository }}
-      cancel-in-progress: true
+      group: ci-sanitize-cpu-${{ matrix.lane }}-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
+      cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -665,3 +708,47 @@ jobs:
           # distinguish that cache from a leak and can see use-after-free.
           VT_POOL_BYPASS: "1"
         run: ctest --test-dir build-sanitize --output-on-failure
+  baseline-summary:
+    # THE PUBLISHED VERDICT (issue #274, spec .agents/specs/main-verifiability.md).
+    #
+    # Baseline lane ONLY. It can never run on a `pull_request` or a `push`, so it
+    # blocks no contributor and changes nothing about what a PR must pass.
+    #
+    # It fails when any covered job is red, `sanitize-cpu` INCLUDED. That job is
+    # `continue-on-error: true` for the push/PR lanes and stays that way -- its
+    # removal is the closing step of the hardening row, not this one. What this
+    # job refuses is a BASELINE that reports green while a job it covered is red,
+    # which would rebuild the very defect #274 was filed about.
+    #
+    # It reads per-job conclusions from the Actions API for its own run, NOT from
+    # `needs.<job>.result`: `continue-on-error` makes that context report
+    # `success` for a failed job, which is the trap the whole row is about. Run
+    # 31448896841 is the live proof -- run conclusion `success`, both sanitizer
+    # lanes `failure`.
+    #
+    # On the day this lands the first run is EXPECTED RED, on the six sanitizer
+    # failures of #274 finding #1 / #301. That is the correct first verdict. A
+    # baseline that hid them would certify nothing.
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    needs:
+      - agent-record
+      - cuda-arch-features
+      - cuda-fat-build
+      - vulkan-spirv-freshness
+      - build-test-vulkan
+      - device-leakage
+      - build-test-cpu
+      - build-test-cpu-arm64
+      - sanitize-cpu
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the per-job baseline verdict for this SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/main-baseline.py \
+            --run-id "${{ github.run_id }}" --emit-summary

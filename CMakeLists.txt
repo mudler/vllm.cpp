@@ -638,17 +638,21 @@ if(VLLM_CPP_CUDA)
   # Marlin NVFP4 W4A16 grouped-MoE GEMM drop-in (the 35B expert kernel). Vendored
   # torch-free slice of vLLM's moe/marlin_moe_wna16 under src/vt/cuda/marlin/
   # (marlin-dropin-feasibility.md). NO external dependency — the kernel is
-  # standalone CUDA + inline PTX. Enabled on sm_12xa (compiles to native sm_121
-  # SASS). The two vendored TUs + the vt launcher are isolated with their own
-  # compile options (see below); gated by VT_MARLIN_NVFP4.
-  option(VLLM_CPP_MARLIN "Build the vendored Marlin NVFP4 W4A16 MoE GEMM (sm_12xa)" ON)
+  # standalone CUDA + inline PTX. Enabled on whichever architectures the
+  # `marlin-nvfp4` FEATURE-TABLE cell resolves to — sm_12xa (native sm_121 SASS)
+  # and, since the Thor bring-up, sm_110. The arch set is DATA, so these strings
+  # report the resolved cell instead of hardcoding one architecture; the previous
+  # "sm_12xa"-only wording went stale the moment the cell gained a second arch.
+  # The two vendored TUs + the vt launcher are isolated with their own compile
+  # options (see below); gated by VT_MARLIN_NVFP4.
+  option(VLLM_CPP_MARLIN "Build the vendored Marlin NVFP4 W4A16 MoE GEMM (marlin-nvfp4 archs)" ON)
   if(VLLM_CPP_MARLIN AND VT_MARLIN_NVFP4_ARCHS
      AND EXISTS "${CMAKE_SOURCE_DIR}/src/vt/cuda/marlin/core/scalar_type.hpp")
     set(VLLM_CPP_MARLIN ON)
-    message(STATUS "Marlin NVFP4 W4A16 MoE GEMM enabled (vendored, sm_12xa)")
+    message(STATUS "Marlin NVFP4 W4A16 MoE GEMM enabled (vendored) for [${VT_MARLIN_NVFP4_ARCHS}]")
   else()
     set(VLLM_CPP_MARLIN OFF)
-    message(STATUS "Marlin NVFP4 MoE GEMM disabled (needs sm_12xa + vendored slice)")
+    message(STATUS "Marlin NVFP4 MoE GEMM disabled (needs a marlin-nvfp4 arch + vendored slice)")
   endif()
 endif()
 

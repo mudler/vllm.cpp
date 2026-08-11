@@ -253,8 +253,14 @@ def audit() -> list[dict]:
 # configure/build/focused-test/full-ctest invocation the gate was run with,
 # including the serial re-run for the known parallel-ctest flake. Growth, so the
 # set is re-pinned in the same change.
+# 2026-08-11: +ENG-RECORD-CONFLICT-SURFACES. The row reaches READY on its
+# committed spec (issue #364), whose Gates section names the exact preflight,
+# `tests/scripts/` and `agent-integration.py` invocations the record gate runs
+# with, and records that no CUDA/GPU/SACRED gate is implicated because no product
+# source is touched. Growth, so the set is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
+    "ENG-RECORD-CONFLICT-SURFACES",
     "SAMPLE-PROMPT-LOGPROBS",
     "ATTN-ROPE-FAMILY",
     "BACKEND-CUDA-ARCH-ADDITIVITY",

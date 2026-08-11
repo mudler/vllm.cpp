@@ -337,8 +337,15 @@ ENGINE_PREFIXES = (
 # P2P `MooncakeConnector` with the store connector; the P2P half keeps that
 # verdict. User-directed, issue #287; `SPIKE` on its committed spec. No client,
 # no connector, no build flag and no gate result is claimed by the bump.
+# 148 since 2026-08-11: +`ENG-RECORD-CONFLICT-SURFACES` (retire the shared record
+# surfaces that make concurrent PRs conflict by construction — the `STATUS_RATCHET`
+# global, the `NOW.md` byte budget, and the insert-at-one-anchor claims table).
+# MEASURED at `origin/main` `d928e2c3`: 16 of 29 open PRs conflict and 13 of those
+# 16 conflict in bookkeeping only. User-directed, issue #364; `READY` on its
+# committed spec. No checker semantic, no doc content and no gate result is
+# changed by the bump — this row is the record of the work, not the work.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 147
+ENGINE_ROWS = 148
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

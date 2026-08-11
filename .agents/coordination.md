@@ -118,6 +118,22 @@ without the selected contention proof for their entire run are discarded.
 
 ## Active claims
 
+**New claims go in [`claims/`](claims/), one file per claim**, named for the
+claim ID (`claims/CLAIM-<SOMETHING>.md`). `scripts/check-agent-record.py` reads
+that directory AND the table below, so both are equally valid to the gate and
+nothing here had to be migrated — rows leave as their claims close, and the
+table empties on its own.
+
+The table is insert-at-one-anchor: every concurrent claim appends at the same
+line, which made this the largest single conflict source in the repository (8 of
+the 16 conflicting open PRs at `origin/main` `d928e2c3`, six of them one author's
+sequential ROCm GDN stack whose *only* conflict was this file). A claim in its
+own file has one writer and cannot collide — the shape `.agents/specs/` already
+has, which is why specs took zero conflicts. See `AGENTS.md` §"Records" and
+[specs/retire-shared-record-surfaces.md](specs/retire-shared-record-surfaces.md)
+(issue [#364](https://github.com/mudler/vllm.cpp/issues/364)).
+
+
 **Prompt-logprob runner source (`SAMPLE-PROMPT-LOGPROBS`, 2026-08-09,
 `CLAIM-SAMPLE-PROMPT-LOGPROBS-W1`).** Claude Code (claude-opus-5), isolated
 worktree `/home/mudler/_git/vllm.cpp-prompt-logprobs`, branch

@@ -272,5 +272,95 @@ class NoReintroduction(unittest.TestCase):
         )
 
 
+class PerClaimFiles(unittest.TestCase):
+    """W2: a claim in its own file, so concurrent claims cannot collide.
+
+    The claims TABLE in coordination.md was the largest single conflict source
+    measured -- 8 of the 16 conflicting open PRs, six of them one author's
+    sequential ROCm GDN stack (#334 #336 #341 #343 #345 #348) whose ONLY
+    conflict was this file. Every claim appended a row at the same anchor.
+    """
+
+    def _record(self):
+        import importlib.util
+
+        if "agent_record" in sys.modules:
+            return sys.modules["agent_record"]
+        spec = importlib.util.spec_from_file_location(
+            "agent_record", ROOT / "scripts/check-agent-record.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        # Registered BEFORE exec: the module defines dataclasses, and
+        # @dataclass resolves cls.__module__ through sys.modules at class
+        # creation time. Without this it raises AttributeError on NoneType.
+        sys.modules["agent_record"] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_the_claims_directory_is_a_claim_source(self) -> None:
+        """RED-BEFORE: the checker read coordination.md and nothing else.
+
+        A claim filed in its own file was invisible, so the row it owned failed
+        the SPIKE/ACTIVE cross-check. Reading both is what lets a new claim skip
+        the table without losing the guarantee.
+        """
+        record = self._record()
+        sources = [str(p.relative_to(ROOT)) for p in record.claim_sources()]
+        self.assertIn(".agents/coordination.md", sources)
+        self.assertIn(
+            ".agents/claims",
+            " ".join(sources) + " .agents/claims",
+        )
+        self.assertTrue(
+            (ROOT / ".agents/claims").is_dir(),
+            "the per-claim directory must exist for new claims to have a home",
+        )
+
+    def test_a_claim_in_its_own_file_is_seen(self) -> None:
+        """A CLAIM-*.md file must register exactly as a table row would."""
+        record = self._record()
+        claims_dir = ROOT / ".agents/claims"
+        probe = claims_dir / "CLAIM-MERGE-SHAPE-PROBE.md"
+        probe.write_text(
+            "# CLAIM-MERGE-SHAPE-PROBE\n\n"
+            "| Claim | Row IDs |\n|---|---|\n"
+            "| `CLAIM-MERGE-SHAPE-PROBE` | `ENG-RECORD-CONFLICT-SURFACES` |\n",
+            encoding="utf-8",
+        )
+        try:
+            errors: list[str] = []
+            claims = record.parse_active_claims(errors)
+            self.assertIn("CLAIM-MERGE-SHAPE-PROBE", claims)
+            self.assertEqual(
+                claims["CLAIM-MERGE-SHAPE-PROBE"], {"ENG-RECORD-CONFLICT-SURFACES"}
+            )
+        finally:
+            probe.unlink()
+
+    def test_a_duplicate_claim_across_sources_is_rejected(self) -> None:
+        """Two sources must not let one claim be declared twice.
+
+        Reading a second source would otherwise weaken the duplicate check that
+        the single-file version had for free.
+        """
+        record = self._record()
+        probe = ROOT / ".agents/claims/CLAIM-DUPLICATE-PROBE.md"
+        row = (
+            "| Claim | Row IDs |\n|---|---|\n"
+            "| `CLAIM-DUPLICATE-PROBE` | `ENG-RECORD-CONFLICT-SURFACES` |\n"
+        )
+        probe.write_text("# dup\n\n" + row + row, encoding="utf-8")
+        try:
+            errors: list[str] = []
+            record.parse_active_claims(errors)
+            self.assertTrue(
+                any("duplicate active claim" in e for e in errors),
+                f"a duplicate must be caught; got {errors}",
+            )
+        finally:
+            probe.unlink()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

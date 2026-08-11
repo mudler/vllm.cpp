@@ -897,21 +897,47 @@ def check_spec(row: ClaimRow, errors: list[str]) -> None:
         )
 
 
+def claim_sources() -> list[Path]:
+    """Every file that may carry an active claim row.
+
+    One file per claim in .agents/claims/ (ENG-RECORD-CONFLICT-SURFACES, #364),
+    plus the legacy table in coordination.md. Both are read, so a claim is
+    equally valid in either and no existing row had to be migrated -- the table
+    empties as its claims close.
+
+    The per-claim file exists because the table is insert-at-one-anchor: every
+    concurrent claim appended at the same line, which made coordination.md the
+    largest single conflict source in the repository (8 of the 16 conflicting
+    open PRs at origin/main d928e2c3, six of them one author's sequential ROCm
+    stack whose only conflict was this). A file with one writer cannot collide.
+    """
+    sources = [AGENTS / "coordination.md"]
+    claims_dir = AGENTS / "claims"
+    if claims_dir.is_dir():
+        sources.extend(sorted(claims_dir.glob("CLAIM-*.md")))
+    return sources
+
+
 def parse_active_claims(errors: list[str]) -> dict[str, set[str]]:
-    path = AGENTS / "coordination.md"
     claims: dict[str, set[str]] = {}
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.startswith("| `CLAIM-"):
-            continue
-        cells = split_cells(line)
-        claim_match = CLAIM_RE.search(cells[0])
-        if claim_match is None:
-            continue
-        claim = claim_match.group(0)
-        if claim in claims:
-            errors.append(f"{path.relative_to(ROOT)}:{line_no}: duplicate active claim {claim}")
-            continue
-        claims[claim] = set(ID_RE.findall(cells[1])) if len(cells) > 1 else set()
+    origin: dict[str, str] = {}
+    for path in claim_sources():
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.startswith("| `CLAIM-"):
+                continue
+            cells = split_cells(line)
+            claim_match = CLAIM_RE.search(cells[0])
+            if claim_match is None:
+                continue
+            claim = claim_match.group(0)
+            if claim in claims:
+                errors.append(
+                    f"{path.relative_to(ROOT)}:{line_no}: duplicate active claim "
+                    f"{claim} (already declared in {origin[claim]})"
+                )
+                continue
+            origin[claim] = str(path.relative_to(ROOT))
+            claims[claim] = set(ID_RE.findall(cells[1])) if len(cells) > 1 else set()
     return claims
 
 
@@ -949,7 +975,7 @@ def check_row_contracts(
                 claim = claim_match.group(0)
                 if row.item_id not in active_claims.get(claim, set()):
                     errors.append(
-                        f"{location}: owner {claim} does not claim active row {row.item_id} in coordination.md"
+                        f"{location}: owner {claim} does not claim active row {row.item_id} in any claim source"
                     )
 
         if row.state == "DONE":
@@ -967,14 +993,14 @@ def check_row_contracts(
 
     for claim, item_ids in active_claims.items():
         if not item_ids:
-            errors.append(f".agents/coordination.md: active claim {claim} has no stable row IDs")
+            errors.append(f"active claim {claim} has no stable row IDs")
         for item_id in item_ids:
             row = by_id.get(item_id)
             if row is None:
-                errors.append(f".agents/coordination.md: {claim} references unknown row {item_id}")
+                errors.append(f"active claim {claim} references unknown row {item_id}")
             elif row.state not in {"SPIKE", "ACTIVE"}:
                 errors.append(
-                    f".agents/coordination.md: {claim} references {item_id} in state {row.state}, not SPIKE/ACTIVE"
+                    f"active claim {claim} references {item_id} in state {row.state}, not SPIKE/ACTIVE"
                 )
 
 

@@ -157,11 +157,36 @@ benefit, which is exactly the case this spec's stop condition names.
 Retain `MAX_CELL_CHARS` and `MAX_PARAGRAPH_CHARS`: local to the cell or
 paragraph being edited, so they couple no two PRs.
 
-**W2 — remove the active-claims table from `coordination.md`.** Claims are
-derived from open PRs and `row/<ID>` branch names, which are authoritative and
-cannot drift from the tree. Keep the canonical hierarchy and the row contract:
-those are policy prose, edited rarely, and implicated in no conflict here.
-`scripts/agent-role.py` keeps the coordinator record it already owns.
+**W2 — one file per claim in `.agents/claims/`.** *(Redesigned during
+implementation. The original text said "derive claims from open PRs and branch
+names"; that is wrong and is recorded here rather than quietly changed.)*
+
+Two things came out of reading the consumers. First, deriving from GitHub would
+put a **network call inside an offline gate** — `check-agent-record.py` runs in
+preflight with no network, and a checker that cannot answer without `gh` fails
+closed on every disconnected run. Second, the table is not redundant with the PR
+list: `check_row_contracts` uses it for a **bidirectional cross-check** — every
+`SPIKE`/`ACTIVE` matrix row must be claimed by a live claim, and every claim must
+name rows in those states. A PR list cannot supply that, so deriving would have
+silently dropped a real guarantee. That is exactly the case this spec's stop
+condition names.
+
+The shape that satisfies the invariant without either cost is the one that
+already works here: **one file per claim**, globbed. `.agents/claims/CLAIM-*.md`
+holds one claim each, `parse_active_claims` reads that directory *and* the legacy
+table, and the cross-check is unchanged because the parsed data is unchanged.
+
+It is **additive on purpose**: no existing row is migrated. Rewriting 115 rows
+spread across several interleaved tables, struck-through released entries, and
+prose blocks — some of them below a later `##` heading — is how a record gets
+silently lost, and it would be a large unreviewable diff. New claims go in their
+own file; the table shrinks as claims close. The conflict source is closed for
+all future claims from the day this lands, which is what the measurement is
+about.
+
+Keep the canonical hierarchy and the row contract: policy prose, edited rarely,
+implicated in no conflict. `scripts/agent-role.py` keeps the coordinator record
+it already owns.
 
 **W3 — drop `NOW.md`'s hard character budget.** `MAX_LINES` and
 `MAX_ENTRY_CHARS` stay and carry the obligation: a line cap bounds the page the

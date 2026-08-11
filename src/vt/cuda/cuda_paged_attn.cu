@@ -299,7 +299,41 @@ __device__ inline void LoadRow8(const float* p, int64_t base, int lane, float r[
   }
 }
 
-template <typename TQ, typename TKV, typename Tout, bool HasWindow>
+// EPL-generic row loaders, so the decode-opt kernel can serve a head_dim other
+// than 256. EPL == 8 forwards to LoadRow8, so the d256 path stays BYTE-FOR-BYTE
+// what it was (same transactions, same order, same accumulation). EPL == 4 adds
+// head_dim 128 -- the width Qwen3-dense / Llama / Mistral actually use -- as one
+// 64-bit transaction per lane for bf16 and one 128-bit for f32. 32 lanes * 4
+// elems == 128, so a warp still covers exactly one head-dim row.
+template <int EPL, typename T>
+__device__ inline void LoadRowN(const T* p, int64_t base, int lane, float* r);
+
+template <>
+__device__ inline void LoadRowN<8, __nv_bfloat16>(const __nv_bfloat16* p, int64_t base, int lane,
+                                                  float* r) {
+  LoadRow8(p, base, lane, r);
+}
+template <>
+__device__ inline void LoadRowN<8, float>(const float* p, int64_t base, int lane, float* r) {
+  LoadRow8(p, base, lane, r);
+}
+template <>
+__device__ inline void LoadRowN<4, __nv_bfloat16>(const __nv_bfloat16* p, int64_t base, int lane,
+                                                  float* r) {
+  const uint2 w = reinterpret_cast<const uint2*>(p + base)[lane];
+  const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&w);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) r[i] = __bfloat162float(h[i]);
+}
+template <>
+__device__ inline void LoadRowN<4, float>(const float* p, int64_t base, int lane, float* r) {
+  const uint4 a = reinterpret_cast<const uint4*>(p + base)[lane];
+  const float* fa = reinterpret_cast<const float*>(&a);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) r[i] = fa[i];
+}
+
+template <typename TQ, typename TKV, typename Tout, bool HasWindow, int EPL = kDecEpl>
 __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const TKV* k_cache,
                                               const TKV* v_cache, const int32_t* block_table,
                                               const int32_t* seq_lens,
@@ -338,23 +372,23 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
   const int64_t g = h / (hq / num_kv_heads);
   const int64_t qoff = (t * hq + h) * d;
 
-  float q_reg[kDecEpl];
-  LoadRow8(query, qoff, lane, q_reg);  // this lane's query slice, loaded once
+  float q_reg[EPL];
+  LoadRowN<EPL>(query, qoff, lane, q_reg);  // this lane's query slice, loaded once
 
   float m = -CUDART_INF_F, l = 0.0f;
-  float o_reg[kDecEpl];
+  float o_reg[EPL];
 #pragma unroll
-  for (int i = 0; i < kDecEpl; ++i) o_reg[i] = 0.0f;
+  for (int i = 0; i < EPL; ++i) o_reg[i] = 0.0f;
 
   // Warp-strided scan over keys: warp-shuffle q.k, register online softmax.
   for (int64_t j = jmin + warp; j <= jmax; j += kDecWarps) {
     const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
     const int64_t off = j % block_size;
-    float k_reg[kDecEpl];
-    LoadRow8(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
+    float k_reg[EPL];
+    LoadRowN<EPL>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
     float dot = 0.0f;
 #pragma unroll
-    for (int i = 0; i < kDecEpl; ++i) dot += q_reg[i] * k_reg[i];
+    for (int i = 0; i < EPL; ++i) dot += q_reg[i] * k_reg[i];
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, o);
     dot = __shfl_sync(0xffffffffu, dot, 0);  // broadcast full-head score to lanes
@@ -363,10 +397,10 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
     const float m_new = fmaxf(m, s);
     const float corr = expf(m - m_new);  // 0 on the first key (m == -inf)
     const float pw = expf(s - m_new);
-    float v_reg[kDecEpl];
-    LoadRow8(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_reg);
+    float v_reg[EPL];
+    LoadRowN<EPL>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_reg);
 #pragma unroll
-    for (int i = 0; i < kDecEpl; ++i) o_reg[i] = o_reg[i] * corr + pw * v_reg[i];
+    for (int i = 0; i < EPL; ++i) o_reg[i] = o_reg[i] * corr + pw * v_reg[i];
     l = l * corr + pw;
     m = m_new;
   }
@@ -377,7 +411,7 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
   float* m_sh = o_sh + kDecWarps * d;  // [kDecWarps]
   float* l_sh = m_sh + kDecWarps;      // [kDecWarps]
 #pragma unroll
-  for (int i = 0; i < kDecEpl; ++i) o_sh[warp * d + lane * kDecEpl + i] = o_reg[i];
+  for (int i = 0; i < EPL; ++i) o_sh[warp * d + lane * EPL + i] = o_reg[i];
   if (lane == 0) {
     m_sh[warp] = m;
     l_sh[warp] = l;
@@ -389,19 +423,19 @@ __global__ void PagedAttentionDecodeOptKernel(Tout* out, const TQ* query, const 
 #pragma unroll
     for (int w = 0; w < kDecWarps; ++w) gm = fmaxf(gm, m_sh[w]);
     float gl = 0.0f;
-    float acc[kDecEpl];
+    float acc[EPL];
 #pragma unroll
-    for (int i = 0; i < kDecEpl; ++i) acc[i] = 0.0f;
+    for (int i = 0; i < EPL; ++i) acc[i] = 0.0f;
 #pragma unroll
     for (int w = 0; w < kDecWarps; ++w) {
       const float sc = expf(m_sh[w] - gm);  // empty warp: exp(-inf) == 0
       gl += l_sh[w] * sc;
 #pragma unroll
-      for (int i = 0; i < kDecEpl; ++i) acc[i] += sc * o_sh[w * d + lane * kDecEpl + i];
+      for (int i = 0; i < EPL; ++i) acc[i] += sc * o_sh[w * d + lane * EPL + i];
     }
     const float inv = 1.0f / gl;
 #pragma unroll
-    for (int i = 0; i < kDecEpl; ++i) Store(out, qoff + lane * kDecEpl + i, acc[i] * inv);
+    for (int i = 0; i < EPL; ++i) Store(out, qoff + lane * EPL + i, acc[i] * inv);
   }
 }
 
@@ -1966,6 +2000,27 @@ bool DecodeGqaEnabled() {
   return enabled;
 }
 
+// head_dim-128 arm of the warp-split-KV decode kernel (the EPL=4 instantiation).
+// Without it, `d == 128` -- the width Qwen3-dense / Llama / Mistral use -- misses
+// the decode-opt kernel entirely on the `d == 32 * kDecEpl` (256) gate and falls
+// to the generic block kernel.
+//
+// DEFAULT OFF, opt in with VT_ATTN_DECODE_D128=1. It is correctness-complete but
+// NOT byte-exact against the block kernel it replaces: the two reduce the KV
+// sequence in a different ORDER (warp-strided online softmax vs the block
+// kernel's per-tile loop), so a greedy anchor can move at an exact bf16 tie.
+// Shipping it OFF keeps every existing golden byte-identical, mirroring how the
+// FA2 decode GQA group-swap landed (gated OFF, correctness-complete) before it
+// was flipped ON against the full gate. The flip is a separate change and owes
+// the near-tie razor + distributional gate + regen under the ratified-tie rule.
+bool DecodeD128Enabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("VT_ATTN_DECODE_D128");
+    return e != nullptr && e[0] == '1';
+  }();
+  return enabled;
+}
+
 // --- Launchers -------------------------------------------------------------
 
 template <typename TQ, typename TKV, typename Tout>
@@ -1975,6 +2030,27 @@ void LaunchDecode(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor
                   int64_t hq, int64_t d, int64_t num_reqs, int64_t num_kv_heads,
                   int64_t block_size) {
   const dim3 grid(static_cast<unsigned>(num_tokens), static_cast<unsigned>(hq));
+  // head_dim 128 (EPL=4), opt-in. No GQA carve-out: PagedAttentionDecodeGqaKernel
+  // sits inside the `d == 32 * kDecEpl` (256) branch below, so at head_dim 128 it
+  // can never run, and excluding qpk == kDecGqaQG here would strand exactly those
+  // models (e.g. Qwen3-32B, hq/num_kv_heads == 8) on the generic block kernel this
+  // arm exists to replace.
+  if (DecodeOptEnabled() && DecodeD128Enabled() && d == 32 * 4) {
+    const int block = kDecWarps * 32;
+    const size_t shmem = (static_cast<size_t>(kDecWarps) * d + 2 * kDecWarps) * sizeof(float);
+    auto* k4 = args.window_size.has_value()
+                   ? PagedAttentionDecodeOptKernel<TQ, TKV, Tout, true, 4>
+                   : PagedAttentionDecodeOptKernel<TQ, TKV, Tout, false, 4>;
+    k4<<<grid, block, shmem, s>>>(
+        out.Ptr<Tout>(), query.Ptr<TQ>(), k_cache.Ptr<TKV>(), v_cache.Ptr<TKV>(),
+        block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), query_start_loc.Ptr<int32_t>(),
+        num_reqs, hq, num_kv_heads, d, block_size, block_table.stride[0], block_table.stride[1],
+        k_cache.stride[0], k_cache.stride[1], k_cache.stride[2], v_cache.stride[0],
+        v_cache.stride[1], v_cache.stride[2], args.scale, args.logits_soft_cap, args.causal,
+        WindowLeft(args), WindowRight(args));
+    Check(cudaGetLastError(), "paged_attention decode-opt-d128 launch");
+    return;
+  }
   if (DecodeOptEnabled() && d == 32 * kDecEpl) {
     // GQA-fused decode (grid.y = num_kv_heads): stage each KV head's K/V ONCE and
     // attend all QG q-heads of that head, killing the opt kernel's 8x redundant

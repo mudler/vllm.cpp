@@ -146,10 +146,10 @@ upstream event semantics and extend the local original-harness tests:
 | W | Deliverable | State |
 |---|---|---|
 | C0 | Correct #284 evidence wording and register #293 | complete (`0a07c53db`) |
-| C1 | Same-current-source `poll` vs `blocking-c1` control + RED mutation | implemented at `bdbfffcbf`; fresh review pending |
+| C1 | Same-current-source `poll` vs `blocking-c1` control + RED mutation | reviewed and current-main operator-gated at `960647bf5` |
 | C2 | If C1 positive, general event/epoch wait + deterministic multi-request tests | unblocked by positive C1; excluded from this implementation |
-| C3 | QEMU gate and interleaved Pi T4/T3 causal profile | complete ([evidence](../../docs/bench-evidence/rpi5-a76-output-wait-c1-20260810.md)) |
-| C4 | Retain event wait or reject it; test reserved-core budget only if C1 is negative/insufficient | blocked by C2 + fresh review |
+| C3 | QEMU gate and interleaved Pi T4/T3 causal profile | current-main confirmed ([operator evidence](../../docs/bench-evidence/rpi5-a76-output-wait-c1-main-20260811.md); [original evidence](../../docs/bench-evidence/rpi5-a76-output-wait-c1-20260810.md)) |
+| C4 | Retain event wait or reject it; test reserved-core budget only if C1 is negative/insufficient | blocked by C2 |
 | C5 | Full model versus llama.cpp; return to the measured F16/kernel ranking | blocked by C4 |
 
 ## Risks/decisions
@@ -170,20 +170,24 @@ upstream event semantics and extend the local original-harness tests:
 
 ## Outcome
 
-C1 implementer result: **positive, fresh review pending**. On the exact
-current-source AArch64 binary, three interleaved idle/unthrottled processes per
-arm show T4 `blocking-c1` / `poll` medians of 2.193x decode, 2.004x prefill and
-0.458x E2E latency, while the T3 control is neutral at 1.003x decode, 1.001x
-prefill and 0.997x E2E latency. All 12 token files exactly match the accepted
-SHA-256; RSS is neutral. T4 blocking retires 76.5% fewer instructions and uses
-54.2% less task-clock. This isolates scan-and-yield frontend contention as the
-cause of the four-core collapse.
+C1 result: **positive, reviewed and operator-gated on current main**. The
+rebased `960647bf5` AArch64 binary reproduces the discriminator over three
+interleaved idle/unthrottled processes per arm: T4 `blocking-c1` / `poll`
+medians are 2.149x decode, 1.973x prefill and 0.465x E2E latency, while the T3
+control is neutral at 1.003x decode, 0.999x prefill and 0.998x E2E latency.
+All 12 token files exactly match the accepted SHA-256; RSS is neutral. T4
+blocking retires 63.0% fewer instructions and uses 53.4% less task-clock. This
+confirms scan-and-yield frontend contention as the cause of the four-core
+collapse after the upstream rebase.
 
 No replacement performance floor is accepted here: the pathological T4 poll
-arm still has 5.9-10.7% spread and fails the sub-3% binding gate, although the
-effect is positive in every pair and the blocking/T3 arms are stable below
-0.52%. `blocking-c1` remains an explicit concurrency-one control and `poll`
-remains the default. C2's lost-wakeup-safe general event wait requires a fresh
-implementer after review; it was deliberately not started. Full hashes, native
+arm has 13.33-15.96% spread and fails the sub-3% binding gate, although the
+effect is positive in every pair and the blocking/T3 arms are stable. The
+older source/binary evidence remains preserved rather than being overwritten.
+`blocking-c1` remains an explicit concurrency-one control and `poll` remains
+the default. C2's lost-wakeup-safe general event wait requires a fresh
+implementer; it was deliberately not started. Full latest-main hashes, native
 and QEMU counts, host state, raw evidence and medians are in the
-[C1 evidence](../../docs/bench-evidence/rpi5-a76-output-wait-c1-20260810.md).
+[operator checkpoint](../../docs/bench-evidence/rpi5-a76-output-wait-c1-main-20260811.md);
+the [original C1 evidence](../../docs/bench-evidence/rpi5-a76-output-wait-c1-20260810.md)
+retains its historical provenance.

@@ -252,9 +252,12 @@ Full commands, samples, artifact hashes and raw evidence hashes are in the
 
 Disposition: the row remains `ACTIVE`. The
 [`SERVE-CLI-BENCH` C1 control in issue #293](https://github.com/mudler/vllm.cpp/issues/293)
-is now positive at the implementer checkpoint: T4 blocking restores 2.193x
-decode while T3 is neutral ([C1 evidence](../../docs/bench-evidence/rpi5-a76-output-wait-c1-20260810.md)).
-W1-W4 remain blocked on fresh C1 review, C2's general multi-request event wait,
-and the subsequent four-core profile that ranks the reached elementwise
-kernel. The BF16 fixture, C++ schedule candidates and assembly gate were not
-attempted. Assembly remains forbidden.
+is positive, reviewed and operator-gated on current main: T4 blocking is
+2.149x decode and 0.465x E2E latency while T3 is neutral
+([current-main evidence](../../docs/bench-evidence/rpi5-a76-output-wait-c1-main-20260811.md);
+[original evidence](../../docs/bench-evidence/rpi5-a76-output-wait-c1-20260810.md)).
+The accepted llama.cpp floor stays unchanged because T4 polling remains above
+the binding spread limit. W1-W4 remain blocked on C2's general multi-request
+event wait and the subsequent four-core profile that ranks the reached
+elementwise kernel. The BF16 fixture, C++ schedule candidates and assembly
+gate were not attempted. Assembly remains forbidden.

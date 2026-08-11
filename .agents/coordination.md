@@ -1673,8 +1673,14 @@ blocking/poll is 2.193x decode and 0.458x E2E latency; T3 is neutral; all 12
 token files match. The pathological T4 poll spread is above 3%, so no binding
 floor moves. Raw evidence and exact hashes are indexed in
 [`rpi5-a76-output-wait-c1-20260810.md`](../docs/bench-evidence/rpi5-a76-output-wait-c1-20260810.md).
-This implementation is complete and awaits fresh mutation review. C2 was not
-started.
+After fresh review and rebase onto `upstream/main` `4ba051406`, immutable head
+`960647bf5` passed the operator's native and QEMU gates and a second
+hash-verified Pi series. T4 blocking/poll is 2.149x decode and 0.465x E2E
+latency; T3 remains neutral; exact tokens hold. T4 poll spread is 13.33-15.96%,
+so no binding floor moves. The
+[current-main evidence](../docs/bench-evidence/rpi5-a76-output-wait-c1-main-20260811.md)
+preserves that binary separately from the original run. C1 is complete; C2 was
+not started.
 
 | Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
 |---|---|---|---|---|---|---|---|

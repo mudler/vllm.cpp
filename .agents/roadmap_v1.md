@@ -78,6 +78,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#83](https://github.com/mudler/vllm.cpp/issues/83) | — | Auto-size memory to the workload; pre-flight error instead of OOM | feature |
 | [#81](https://github.com/mudler/vllm.cpp/issues/81) | `SPEC-MTP` | Speculative decoding: MTP k>1, dynamic and adaptive depth | feature |
 | [#41](https://github.com/mudler/vllm.cpp/issues/41) | `BACKEND-ROCM` | ROCm (AMD GPU) backend | feature |
+| [#364](https://github.com/mudler/vllm.cpp/issues/364) | `ENG-RECORD-CONFLICT-SURFACES` | Shared record surfaces are a lock: 16/29 open PRs conflict, 13 of them in bookkeeping only | bug |
 
 ## Top-level portfolio
 

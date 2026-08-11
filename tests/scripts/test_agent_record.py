@@ -271,6 +271,26 @@ class AgentRecordMutationTests(unittest.TestCase):
             agent_record.check_matrices(errors)
         require(errors, r"\d+ MODEL rows; expected \d+")
 
+    def test_kernel_row_ratchet_matches_the_current_inventory(self) -> None:
+        """The #284 A76 family is a real 52nd kernel row, not a relaxed pin."""
+        path, expected = agent_record.MATRICES["KERNEL"]
+        self.assertEqual(expected, 52)
+
+        errors: list[str] = []
+        rows = agent_record.parse_claim_rows(path, errors)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(rows), expected)
+
+        for mutated_expected in (expected - 1, expected + 1):
+            with self.subTest(expected=mutated_expected):
+                mutated_errors: list[str] = []
+                with mock.patch.dict(
+                    agent_record.MATRICES,
+                    {"KERNEL": (path, mutated_expected)},
+                ):
+                    agent_record.check_matrices(mutated_errors)
+                require(mutated_errors, r"\d+ KERNEL rows; expected \d+")
+
     def test_engine_summary_rejects_stale_area_rollup(self) -> None:
         source = agent_record.ENGINE_MATRIX.read_text(encoding="utf-8")
         current = next(

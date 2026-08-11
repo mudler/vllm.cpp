@@ -512,6 +512,17 @@ TEST_CASE("bench: pretokenized default preserves prompt and output token IDs") {
   cfg.seed = 31;
   cfg.temperature = 0.0;
 
+  const vllm::tok::Tokenizer tokenizer =
+      vllm::bench::detail::BuildSyntheticTokenizer();
+  std::vector<std::vector<int32_t>> expected_prompt_token_ids;
+  expected_prompt_token_ids.reserve(static_cast<size_t>(cfg.num_prompts));
+  for (int i = 0; i < cfg.num_prompts; ++i) {
+    const std::string prompt = vllm::bench::detail::BuildPrompt(
+        tokenizer, cfg.input_len, cfg.seed + static_cast<uint64_t>(i));
+    expected_prompt_token_ids.push_back(
+        tokenizer.EncodeWithSpecialTokens(prompt));
+  }
+
   BenchResult pretokenized;
   {
     ScopedEnv env("VT_BENCH_PRETOKENIZE", std::nullopt);
@@ -530,6 +541,14 @@ TEST_CASE("bench: pretokenized default preserves prompt and output token IDs") {
           static_cast<size_t>(cfg.num_prompts));
   REQUIRE(timed_string.prompt_token_ids.size() ==
           static_cast<size_t>(cfg.num_prompts));
+  REQUIRE(expected_prompt_token_ids.size() ==
+          static_cast<size_t>(cfg.num_prompts));
+  for (size_t i = 0; i < expected_prompt_token_ids.size(); ++i) {
+    CAPTURE(i);
+    REQUIRE_FALSE(expected_prompt_token_ids[i].empty());
+    CHECK(pretokenized.prompt_token_ids[i] == expected_prompt_token_ids[i]);
+    CHECK(timed_string.prompt_token_ids[i] == expected_prompt_token_ids[i]);
+  }
   CHECK(pretokenized.prompt_token_ids == timed_string.prompt_token_ids);
   CHECK(pretokenized.output_token_ids == timed_string.output_token_ids);
   CHECK(pretokenized.total_input == timed_string.total_input);

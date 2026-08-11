@@ -499,6 +499,14 @@ class StatusRatchet(unittest.TestCase):
             doc_tables.status_errors(doc_tables.STATUS.read_text(encoding="utf-8")), []
         )
 
+    def test_the_a76_c1_status_records_the_cause_and_next_step(self) -> None:
+        text = doc_tables.STATUS.read_text(encoding="utf-8")
+        self.assertIn(
+            "#293 C1: T4 polling caused collapse; T3 neutral. C2 event next.",
+            text,
+        )
+        self.assertNotIn("#293 tests polling", text)
+
     def test_a_retired_claim_cannot_come_back_for_free(self) -> None:
         """A claim the page RETIRED must cost something to reinstate.
 

@@ -6,6 +6,17 @@
 build, no GPU.**
 
 Portfolio row: `ROAD-V1-D4` (external KV-cache provider interoperability).
+
+Bug found after the client and connector landed:
+[#396](https://github.com/mudler/vllm.cpp/issues/396) — the `MockLmcacheServer`
+that both test TUs carry closed and reassigned a **non-atomic** `listen_fd_` in
+its destructor *before* joining the accept thread that reads it, so
+`sanitize-cpu (thread)` reported a data race on whichever TU happened to
+interleave. `stop_` had been made atomic; `listen_fd_` was missed. Measured hit
+rate on `test_lmcache_client` before the fix: 7/25 runs; after: 0/50. Fixed at
+both sites by publishing the descriptor after the socket is ready and handing it
+over with `exchange(-1)`.
+
 This spec **reopens** the LMCache disposition that
 [kv-persistence-lmcache.md](kv-persistence-lmcache.md) deferred as
 "external PyPI, go/no-go, no specified wire protocol to implement against"

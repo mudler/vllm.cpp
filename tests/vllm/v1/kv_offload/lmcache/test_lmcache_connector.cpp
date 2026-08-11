@@ -205,6 +205,12 @@ class MockLmcacheServer {
     while (!stop_.load()) {
       const int lfd = listen_fd_.load();
       if (lfd < 0) break;  // destructor already took it
+      // ACCEPTED residual: the destructor can close `lfd` between this load and
+      // the accept below. That is not a data race and cannot reach a reused
+      // descriptor here -- only two threads exist, the destructor opens nothing
+      // and joins before returning -- so the worst case is EBADF, which is the
+      // intended exit. Closing after the join instead is NOT the fix: on Darwin
+      // `shutdown()` alone does not wake `accept()`.
       const int fd = ::accept(lfd, nullptr, nullptr);
       if (fd < 0) break;
       HandleClient(fd);

@@ -258,8 +258,14 @@ def audit() -> list[dict]:
 # `tests/scripts/` and `agent-integration.py` invocations the record gate runs
 # with, and records that no CUDA/GPU/SACRED gate is implicated because no product
 # source is touched. Growth, so the set is re-pinned in the same change.
+# 2026-08-11: +ENG-NOW-DERIVED. The row reaches ACTIVE on its committed spec
+# (issue #374), whose Gates section names the exact preflight, tests/scripts
+# and agent-integration invocations it runs with, and records that no
+# CUDA/GPU/SACRED gate is implicated because no product source is touched.
+# Growth, so the set is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
+    "ENG-NOW-DERIVED",
     "ENG-RECORD-CONFLICT-SURFACES",
     "SAMPLE-PROMPT-LOGPROBS",
     "ATTN-ROPE-FAMILY",

@@ -127,7 +127,10 @@ GUARD_MAP_KEYS = {
 RECORD_ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
-    ".agents/NOW.md": "| Release | **ACTIVE; required W1-W11/W13 implemented in #196** |",
+    # RELOCATED by ENG-NOW-DERIVED (#374): the release row's live position moved
+    # out of the shared digest and into the row's own spec, so this restatement
+    # follows it. Independently written, as the contract requires.
+    ".agents/specs/release-binary-matrix.md": "**ACTIVE; required W1-W11/W13 implemented in #196.**",
     ".agents/coordination.md": (
         "**Server binary release W1-W13 (`ENG-RELEASE-BINARIES`, 2026-08-09,"
     ),

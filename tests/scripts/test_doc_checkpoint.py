@@ -35,11 +35,16 @@ SPEC.loader.exec_module(checker)
 
 ROW_TABLE = """# Kernel matrix
 
-| ID | Item | State | Owner |
-|---|---|---|---|
-| `KERNEL-ALPHA` | alpha | `{alpha}` | ops |
-| `KERNEL-BETA` | beta | `{beta}` | ops |
+| ID | Item | Spike/spec | State | Owner |
+|---|---|---|---|---|
+| `KERNEL-ALPHA` | alpha | [alpha](specs/alpha.md) | `{alpha}` | ops |
+| `KERNEL-BETA` | beta | [beta](specs/beta.md) | `{beta}` | ops |
 """
+
+# A row spec carrying the relocated live position (ENG-NOW-DERIVED, #374).
+SPEC_WITH_NOW = "# Alpha\n\n## Scope\n\nthings\n\n## Now\n\nRun the focused gate.\n"
+SPEC_WITHOUT_NOW = "# Alpha\n\n## Scope\n\nthings\n"
+SPEC_EMPTY_NOW = "# Alpha\n\n## Scope\n\nthings\n\n## Now\n\n## Gates\n\nx\n"
 
 
 class RowStateParsing(unittest.TestCase):
@@ -101,9 +106,22 @@ class LifecycleTrigger(unittest.TestCase):
 
 
 class ObligationsFire(unittest.TestCase):
-    def errors(self, paths, before_text="", after_text=""):
+    def errors(self, paths, before_text="", after_text="", specs=None):
+        """Stub blob() PER PATH so a row table and its spec can differ.
+
+        specs maps a spec path to its AFTER content; anything unnamed falls back
+        to a spec that carries a `## Now`, so a test that is not about the spec
+        obligation does not have to declare one.
+        """
+        specs = specs or {}
         original = checker.blob
-        checker.blob = lambda rev, path: before_text if rev == "BEFORE" else after_text
+
+        def fake(rev, path):
+            if path.startswith(".agents/specs/"):
+                return specs.get(path, SPEC_WITH_NOW)
+            return before_text if rev == "BEFORE" else after_text
+
+        checker.blob = fake
         try:
             return checker.errors_for(set(paths), "BEFORE", "AFTER")
         finally:
@@ -114,30 +132,121 @@ class ObligationsFire(unittest.TestCase):
         ROW_TABLE.format(alpha="DONE", beta="DONE"),
     )
 
-    def test_lifecycle_move_demands_status_benchmarks_and_now(self):
+    def test_lifecycle_move_demands_status_and_benchmarks(self):
         errors = self.errors([".agents/kernel-matrix.md"], *self.MOVED)
         self.assertTrue(errors)
-        for surface in ("docs/STATUS.md", "docs/BENCHMARKS.md", ".agents/NOW.md"):
-            self.assertIn(surface, errors[0])
+        joined = " ".join(errors)
+        for surface in ("docs/STATUS.md", "docs/BENCHMARKS.md"):
+            self.assertIn(surface, joined)
+
+    def test_a_lifecycle_move_no_longer_demands_the_shared_digest(self):
+        """RED-BEFORE: .agents/NOW.md was in the lifecycle triple (#374).
+
+        That one requirement is why every row-advancing PR wrote one shared
+        file, and why NOW.md conflicted in 5 of the 16 conflicting open PRs
+        measured at d928e2c3. A complete checkpoint must now pass WITHOUT it.
+        """
+        paths = [
+            ".agents/kernel-matrix.md",
+            ".agents/specs/alpha.md",
+            "docs/STATUS.md",
+            "docs/BENCHMARKS.md",
+        ]
+        self.assertEqual(self.errors(paths, *self.MOVED), [])
 
     def test_each_required_surface_is_individually_load_bearing(self):
-        required = ["docs/STATUS.md", "docs/BENCHMARKS.md", ".agents/NOW.md"]
+        required = ["docs/STATUS.md", "docs/BENCHMARKS.md"]
         for omitted in required:
             with self.subTest(omitted=omitted):
-                paths = [".agents/kernel-matrix.md"] + [
+                paths = [".agents/kernel-matrix.md", ".agents/specs/alpha.md"] + [
                     s for s in required if s != omitted
                 ]
                 errors = self.errors(paths, *self.MOVED)
                 self.assertTrue(errors, f"omitting {omitted} was not caught")
-                self.assertIn(omitted, errors[0])
+                self.assertIn(omitted, " ".join(errors))
 
     def test_a_complete_checkpoint_passes(self):
         paths = [
             ".agents/kernel-matrix.md",
+            ".agents/specs/alpha.md",
             "docs/STATUS.md",
             "docs/BENCHMARKS.md",
-            ".agents/NOW.md",
         ]
+        self.assertEqual(self.errors(paths, *self.MOVED), [])
+
+    def test_the_moved_rows_spec_is_required(self):
+        """The relocated obligation, and the reason NOW could leave the triple.
+
+        The live position still has to be recorded on a lifecycle move; it is
+        recorded in the ROW's spec instead of the shared digest. Omit the spec
+        and this must fail, or the requirement was dropped rather than moved.
+        """
+        paths = [".agents/kernel-matrix.md", "docs/STATUS.md", "docs/BENCHMARKS.md"]
+        errors = self.errors(paths, *self.MOVED)
+        self.assertTrue(errors)
+        self.assertIn(".agents/specs/alpha.md", " ".join(errors))
+
+    def test_a_spec_without_a_now_section_fails(self):
+        paths = [
+            ".agents/kernel-matrix.md",
+            ".agents/specs/alpha.md",
+            "docs/STATUS.md",
+            "docs/BENCHMARKS.md",
+        ]
+        errors = self.errors(
+            paths, *self.MOVED, specs={".agents/specs/alpha.md": SPEC_WITHOUT_NOW}
+        )
+        self.assertTrue(errors)
+        self.assertIn("`## Now`", " ".join(errors))
+
+    def test_an_empty_now_section_fails(self):
+        """A heading with nothing under it is not a recorded position."""
+        paths = [
+            ".agents/kernel-matrix.md",
+            ".agents/specs/alpha.md",
+            "docs/STATUS.md",
+            "docs/BENCHMARKS.md",
+        ]
+        errors = self.errors(
+            paths, *self.MOVED, specs={".agents/specs/alpha.md": SPEC_EMPTY_NOW}
+        )
+        self.assertTrue(errors)
+        self.assertIn("empty", " ".join(errors))
+
+    def test_a_row_linking_no_spec_is_reported_not_skipped(self):
+        """Fail closed: an unresolvable row must be named, never waved through."""
+        no_spec = ROW_TABLE.replace(" [alpha](specs/alpha.md) |", " - |")
+        before = no_spec.format(alpha="READY", beta="DONE")
+        after = no_spec.format(alpha="DONE", beta="DONE")
+        errors = self.errors(
+            [".agents/kernel-matrix.md", "docs/STATUS.md", "docs/BENCHMARKS.md"],
+            before,
+            after,
+        )
+        self.assertTrue(any("links no spec" in e for e in errors), errors)
+
+    def test_restoring_now_to_the_triple_breaks_the_new_contract(self):
+        """MUTATION: proves the removal is what makes the NOW-free case pass."""
+        paths = [
+            ".agents/kernel-matrix.md",
+            ".agents/specs/alpha.md",
+            "docs/STATUS.md",
+            "docs/BENCHMARKS.md",
+        ]
+        self.assertEqual(self.errors(paths, *self.MOVED), [])
+        original = dict(checker.REQUIRED)
+        checker.REQUIRED["lifecycle"] = (
+            checker.STATUS,
+            checker.BENCHMARKS,
+            checker.NOW,
+        )
+        try:
+            errors = self.errors(paths, *self.MOVED)
+            self.assertTrue(errors, "the mutation must reinstate the shared write")
+            self.assertIn(".agents/NOW.md", " ".join(errors))
+        finally:
+            checker.REQUIRED.clear()
+            checker.REQUIRED.update(original)
         self.assertEqual(self.errors(paths, *self.MOVED), [])
 
 

@@ -36,7 +36,7 @@ USAGE = "docs/USAGE.md"
 README = "README.md"
 NOW = ".agents/NOW.md"
 
-PUBLIC_SURFACES = frozenset({STATUS, BENCHMARKS, FEATURES, USAGE, README, NOW})
+PUBLIC_SURFACES = frozenset({STATUS, BENCHMARKS, FEATURES, USAGE, README})
 
 # Rows live in these keyed tables. A lifecycle move in any of them is a claim
 # about the project, which is exactly what the public surfaces project.
@@ -144,6 +144,87 @@ def row_states(text: str) -> dict[str, str]:
     return states
 
 
+SPEC_LINK = re.compile(r"\.agents/specs/([A-Za-z0-9_.-]+\.md)|\(specs/([A-Za-z0-9_.-]+\.md)\)")
+NOW_SECTION = re.compile(r"^##\s+Now\s*$", re.MULTILINE)
+
+
+def moved_rows(paths: set[str], before: str, after: str) -> dict[str, str]:
+    """Map row ID -> the table it moved in, for every lifecycle move."""
+    moved: dict[str, str] = {}
+    for path in sorted(paths & set(ROW_TABLES)):
+        old = row_states(blob(before, path))
+        new = row_states(blob(after, path))
+        for row, state in sorted(new.items()):
+            previous = old.get(row)
+            if previous is None:
+                if state in {"ACTIVE", "GATING", "DONE"}:
+                    moved[row] = path
+            elif previous != state:
+                moved[row] = path
+    return moved
+
+
+def spec_for_row(text: str, row: str) -> str | None:
+    """Return the spec path a matrix row links, or None when it links none."""
+    for line in text.splitlines():
+        identifier = ROW_ID.match(line)
+        if not identifier or identifier.group(1) != row:
+            continue
+        match = SPEC_LINK.search(line)
+        if match is None:
+            return None
+        slug = match.group(1) or match.group(2)
+        return f".agents/specs/{slug}"
+    return None
+
+
+def spec_now_errors(paths: set[str], before: str, after: str) -> list[str]:
+    """The relocated freshness obligation (ENG-NOW-DERIVED, #374).
+
+    A row that moves lifecycle state must say, in ITS OWN spec, what the next
+    step now is. That is what .agents/NOW.md's per-row line used to carry, and
+    moving it here is the whole point: a spec has ONE writer, so the requirement
+    stops serialising every concurrent PR through one shared digest.
+
+    Reported, never inferred: a row whose matrix line links no spec is an error
+    naming the row, not a silent pass.
+    """
+    errors: list[str] = []
+    for row, table in sorted(moved_rows(paths, before, after).items()):
+        spec = spec_for_row(blob(after, table), row)
+        if spec is None:
+            errors.append(
+                f"{table}: {row} moved lifecycle state but its row links no spec, "
+                "so there is nowhere to record what happens next; add the "
+                "`Spike/spec` link"
+            )
+            continue
+        if spec not in paths:
+            errors.append(
+                f"{spec} is not in this change: {row} moved lifecycle state, so "
+                "its spec owes an updated `## Now` line. This replaced the old "
+                ".agents/NOW.md requirement -- the live position is recorded per "
+                "ROW now, in a file only this row's author writes"
+            )
+            continue
+        body = blob(after, spec)
+        section = NOW_SECTION.search(body)
+        if section is None:
+            errors.append(
+                f"{spec} has no `## Now` section; {row} moved lifecycle state and "
+                "the spec is where its live position is recorded"
+            )
+            continue
+        rest = body[section.end():]
+        following = rest.split("\n##", 1)[0].strip()
+        if not following:
+            errors.append(
+                f"{spec}: `## Now` is empty; {row} moved lifecycle state, so say "
+                "what the next command or step actually is"
+            )
+    return errors
+
+
 def lifecycle_moves(paths: set[str], before: str, after: str) -> list[str]:
     """Return 'ROW: OLD -> NEW' for every row that changed lifecycle state."""
     moves: list[str] = []
@@ -216,8 +297,19 @@ def classify(paths: set[str], before: str, after: str) -> tuple[set[str], list[s
     return classes, reasons
 
 
+# NOW LEFT THIS TRIPLE 2026-08-11 (ENG-NOW-DERIVED, #374). Requiring it here is
+# what made .agents/NOW.md a surface EVERY row-advancing PR writes: the gate
+# marched them into one shared file, and it conflicted in 5 of the 16 conflicting
+# open PRs measured at d928e2c3. That is a lock under the AGENTS.md invariant
+# "no surface that every PR must write", which #364 added while this line stood.
+#
+# The obligation is RELOCATED, not dropped. "The live position must be current"
+# is now paid in the moved row's OWN spec, as a `## Now` line -- see
+# spec_now_errors below. A spec has one writer, so the same requirement no longer
+# serialises everyone. .agents/NOW.md keeps only what is authored at operator
+# cadence and is otherwise rendered by scripts/now.py.
 REQUIRED = {
-    "lifecycle": (STATUS, BENCHMARKS, NOW),
+    "lifecycle": (STATUS, BENCHMARKS),
     "feature_surface": (FEATURES,),
     "user_usage": (USAGE,),
     "landing_page": (README,),
@@ -227,6 +319,8 @@ REQUIRED = {
 def errors_for(paths: set[str], before: str, after: str) -> list[str]:
     classes, reasons = classify(paths, before, after)
 
+    errors = spec_now_errors(paths, before, after)
+
     required: set[str] = set()
     for change_class in classes:
         # landing_page PERMITS a README change; it does not demand one.
@@ -234,7 +328,6 @@ def errors_for(paths: set[str], before: str, after: str) -> list[str]:
             continue
         required.update(REQUIRED[change_class])
 
-    errors = []
     missing = sorted(required - paths)
     if missing:
         detail = "; ".join(reasons) if reasons else ", ".join(sorted(classes))

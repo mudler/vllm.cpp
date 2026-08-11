@@ -19,7 +19,9 @@ the reference for behavior and the bar for speed.
    as a coordinator; it is never refused because someone else is coordinating.
    Add `--headless` only when the developer explicitly says the run is
    unattended. Never infer it.
-3. Read `.agents/NOW.md`. It is the live snapshot and fits on one screen.
+3. Run `scripts/now.py` for the live position, and read `.agents/NOW.md`
+   for the operator's current gate and next actions. The first is derived;
+   the second is authored and fits on one screen.
 4. Read only the claimed row, its spec, its evidence, and the task guide for
    what you are about to do.
 5. Run `scripts/agent-preflight.sh` before you edit anything.
@@ -212,25 +214,21 @@ Union-append only genuinely append-only logs. Never accept an automatic
 three-way merge of a keyed record.
 
 **No surface that every PR must write.** If N concurrent PRs all edit file F,
-then F is a lock and the conflicts are that lock being held. A record surface is
-admissible only in one of three shapes: **one file per row**, globbed for
-reading; **genuinely append-only**, so it union-merges; or **derived at read
-time** from git and GitHub, so nobody writes it at all. Anything else gets
-rewritten into one of the three.
+then F is a lock. A record surface is admissible in one of three shapes only:
+**one file per row**, globbed for reading; **genuinely append-only**, so it
+union-merges; or **derived at read time**, so nobody writes it. Rewrite anything
+else into one of the three.
 
-A fixed budget on a shared file is the sharpest form of the defect, because it
-turns every addition into a read-modify-write — you must evict someone else's
-content to fit your own — and concurrent read-modify-write on one global loses
-updates. There the conflict is the *lucky* outcome: a clean three-way merge
-applies both evictions and both additions, silently dropping live content and
-blowing the budget the gate existed to defend. Cap the *entry*, never the file.
-Likewise, never store a measurement of one file inside another; a number that
-moves on every edit couples every PR to lines it does not own.
+Two corollaries. **Cap the entry, never the file** — a budget on a shared file
+turns every addition into evicting someone else's content, and merging two such
+edits cleanly is worse than conflicting, because it applies both evictions.
+**Never store a measurement of one file inside another** — a number that moves on
+every edit couples every PR to lines it does not own.
 
-Measured 2026-08-11 at `d928e2c3` (issue #364): 16 of 29 open PRs conflicted, 13
-of those in bookkeeping only, while `.agents/specs/` — one file per row — took
-zero. That is the third instance of one failure, after the `policy.csv` registry
-(`0f3e44ee`) and the per-class line budgets (2026-08-10).
+A gate is what usually creates the lock: if a checker *requires* every change to
+touch a shared file, that is the defect, not the discipline of the people
+touching it. Relocate the obligation to a per-row surface rather than deleting
+it.
 
 Compact by *moving* superseded detail into `.agents/completed/` with links and
 provenance intact. Never delete evidence to save context.

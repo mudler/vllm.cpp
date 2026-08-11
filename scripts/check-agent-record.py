@@ -344,8 +344,15 @@ ENGINE_PREFIXES = (
 # 16 conflict in bookkeeping only. User-directed, issue #364; `READY` on its
 # committed spec. No checker semantic, no doc content and no gate result is
 # changed by the bump — this row is the record of the work, not the work.
+# 149 since 2026-08-11: +`ENG-NOW-DERIVED` (the live position is DERIVED and the
+# freshness obligation moves to the row's own spec, so `.agents/NOW.md` stops
+# being a surface every row-advancing PR must write). Follow-up to #364, which
+# removed the file's byte budget but not the doc-checkpoint requirement that
+# marched every PR into it. User-directed, issue #374; `ACTIVE` on its committed
+# spec. No checker semantic beyond the row's own scope and no product source is
+# changed by the bump.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 148
+ENGINE_ROWS = 149
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

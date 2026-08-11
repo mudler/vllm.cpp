@@ -8,35 +8,15 @@ characters.
 
 ## Live claims
 
-Work: 7 external PRs landed (6 merged + #227 repaired).
+Rendered on demand: **`scripts/now.py`**. It assembles every `SPIKE`/`ACTIVE`
+row, its claim and PR, and the row's own next step from the matrices,
+`.agents/claims/`, and each row spec's `## Now`.
 
-| Claim / track | State | Next command or step |
-|---|---|---|
-| `SPEC-DSPARK` | **WORKS on 35B**: ON==OFF 48/48 | Draft step ~6x a target step |
-| State record (#166) | **157 imports = 3,231,342 bytes** at `776c56f1` | Force-update #166; rerun readiness |
-| Laguna NVFP4 / DS-V4 decode | **CLOSED, byte-exact**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
-| 27B NVFP4 @`0893e160` | **c1 0.838, c2-c8 0.95-0.97** (#213 levers ACTIVE); c1 unmoved | c1 decode window; 35B canonical |
-| f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%) | Fold into the 35B lever |
-| Muse Glimmer (#333) | #347+#359 FIXED: GGUF COHERENT | Token-exact vs llama.cpp |
-| MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
-| Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
-| 35B mid-band | **canonical 0.918-0.972x** c1-c32 (@`348c265d`, first c16/c32) | Decode-only window, ONE tool |
-| Qwen3.5-4B sm_120 | tput **1.0283x** `PENDING`; TTFT/TPOT/E2E 1.085/1.017/1.029x | Profile wave |
-| RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
-| SERVE-ASYNC-MIRROR | **#323 FIXED** (mitigation): graph declines while the mirror is live; 7/7 async gates | Graph read ids at REPLAY |
-| CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** | Parakeet encoder; attn dtype hoist |
-| `SERVE-METRICS` async (#277) | **`/metrics` was DEAD on the shipped server**: AsyncLLM folded nothing. Now live, ctest 366/366 | Config-gated families |
-| `ENG-LOAD-DIRECT-UPLOAD` (#150) | **default ON:** weights VIEW the mmap; 27B load **1.54x warm / 1.61x cold** | merged qkv/gate_up + lm_head |
-| Vulkan 27B | decode **MET 4.36 vs 4.35**. **LOADMEM: load held the model TWICE, 100.759 -> 53.413 GiB** | Load-phase host build is the new peak |
-| `BACKEND-ROCM` | #140 + gfx1200 M0-M4 (#269) + GDN slice and MoE ops (#334-#348): Qwen3.5-0.8B e2e all-native | strict CPU parity; GDN drift |
-| TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
-| Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
-| Containers `#170` | **cpu+vulkan CI green**; #312 fixed | W6: cuda/arm64; unpushed |
-| `SAMPLE-PROMPT-LOGPROBS` (#223) | **LANDED** 21/21 | W2 `echo`; CUDA PENDING |
-| `logprobs_mode` (#238) | **3 stubs -> all 4 work** | `logprob_token_ids` half |
-| Surface coverage (`ARCH-ONE-SURFACE`) | ROW 8 + #139; **embeddings live (#137): ABI v15, endpoint, fold 4/4-231** | Real-checkpoint oracle cosine |
-
-In-flight, default-OFF, not pushed: see the row's spec.
+They are NOT listed here any more (ENG-NOW-DERIVED, #374). A per-row table in
+this file made it a surface every row-advancing PR had to write, which is a lock
+under `AGENTS.md` §Records; it conflicted in 5 of the 16 conflicting open PRs
+measured at `d928e2c3`. What remains below is authored at operator cadence, so
+no per-row change needs to touch this file at all.
 
 ## Current gate
 

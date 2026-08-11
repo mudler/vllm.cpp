@@ -55,7 +55,12 @@ WORK_DEPS = {
 ANCHORS = {
     ".agents/engine-matrix.md": "| `ENG-RELEASE-BINARIES` |",
     ".agents/roadmap_v1.md": "| REL | `ROAD-V1-RELEASE` |",
-    ".agents/NOW.md": "| Release | **ACTIVE; required W1-W11/W13 implemented in #196** |",
+    # RELOCATED 2026-08-11 (ENG-NOW-DERIVED, #374). This anchor used to pin a
+    # per-ROW line inside .agents/NOW.md, which is one of the requirements that
+    # made that file a surface every PR had to keep current. The row's live
+    # position now lives in the row's OWN spec under `## Now` -- one writer, and
+    # the same place check-doc-checkpoint.py requires it.
+    ".agents/specs/release-binary-matrix.md": "**ACTIVE; required W1-W11/W13 implemented in #196.**",
     ".agents/coordination.md": "**Server binary release W1-W13 (`ENG-RELEASE-BINARIES`, 2026-08-09,",
     ".agents/completed/state-events/2026-08/STATE-20260809T160000-001.md": "# W6 installed server package green",
     "docs/STATUS.md": "#196 binary pipeline implemented; no published binaries",

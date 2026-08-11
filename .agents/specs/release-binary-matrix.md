@@ -603,3 +603,10 @@ archive, CPU, Vulkan, workflow, and mutation gates are green. The hosted
 eight-tuple dry run, matching-hardware evidence, and tagged publication remain
 pending, so no published archive or release-channel advancement is claimed.
 W12 remains the optional non-primary diagnostic lane.
+
+## Now
+
+**ACTIVE; required W1-W11/W13 implemented in #196.** Next: finish the hosted
+ten-SM proof, rebase and push, and run the full eight-tuple dry run. Hosted
+ten-SM completion, matching-hardware gates and tagged publication remain pending;
+no binaries are published.

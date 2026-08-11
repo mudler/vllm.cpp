@@ -48,6 +48,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#224](https://github.com/mudler/vllm.cpp/issues/224) | `ENG-DOCS-SITE` | Publish `docs/` as a GitHub Pages site without owning a second copy | feature |
 | [#150](https://github.com/mudler/vllm.cpp/issues/150) | `ENG-LOAD-DIRECT-UPLOAD` | Model load / cold start time: measure properly, then cut | perf |
 | [#301](https://github.com/mudler/vllm.cpp/issues/301) | `ENG-LOAD-DIRECT-UPLOAD` | `main` is RED on ASan/UBSan: five misaligned BF16 reads from borrowed mmap weights | bug |
+| [#374](https://github.com/mudler/vllm.cpp/issues/374) | `ENG-NOW-DERIVED` | NOW.md is still a surface every PR must write: the doc-checkpoint gate marches them into it | bug |
 | [#364](https://github.com/mudler/vllm.cpp/issues/364) | `ENG-RECORD-CONFLICT-SURFACES` | Shared record surfaces are a lock: 16/29 open PRs conflict, 13 of them in bookkeeping only | bug |
 | [#117](https://github.com/mudler/vllm.cpp/issues/117) | `ENG-RELEASE-BINARIES` | Binary release | feature |
 | [#170](https://github.com/mudler/vllm.cpp/issues/170) | `ENG-RELEASE-BINARIES` | Publish container images to GHCR (cuda, vulkan, cpu) | feature |

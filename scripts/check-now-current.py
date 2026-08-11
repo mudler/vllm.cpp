@@ -54,6 +54,8 @@ REQUIRED_HEADINGS = (
     "next actions",
 )
 
+ROW_TABLE_LINE = re.compile(r"^\|\s*`[A-Z0-9][A-Za-z0-9_.-]*`\s*\|")
+
 STAMP = re.compile(r"^<!--\s*now-updated:\s*(\d{4}-\d{2}-\d{2})\s*-->$", re.MULTILINE)
 
 
@@ -82,6 +84,25 @@ def structure_errors(text: str) -> list[str]:
             f"is {len(lines)} lines, over the {MAX_LINES}-line budget; move "
             "detail to the row's spec and keep only the live position here"
         )
+    # REGROWTH GUARD (ENG-NOW-DERIVED, #374). The per-row claims table left this
+    # file because requiring it made NOW.md a surface every row-advancing PR had
+    # to write -- a lock under AGENTS.md §Records, and 5 of the 16 conflicting
+    # open PRs at d928e2c3. Removing it once is not enough: the decay path is
+    # someone re-adding "just one row", and then the file is a status log again
+    # and every PR is back in it. So the SHAPE is enforced, not just the state.
+    #
+    # A row here is a line whose first cell is a backticked stable ID. Ordinary
+    # tables (the gate, the invariants) have prose first cells and still pass.
+    for lineno, line in enumerate(lines, 1):
+        if ROW_TABLE_LINE.match(line.strip()):
+            errors.append(
+                f"line {lineno}: a per-row table row is back in NOW.md "
+                f"({line.strip()[:48]!r}...). The live position is DERIVED -- run "
+                "scripts/now.py -- and a row's next step belongs in that row's "
+                "own spec under `## Now`, which has one writer. Putting rows here "
+                "again makes this file a surface every PR must write"
+            )
+
     for line in lines:
         stripped = line.strip()
         if stripped.startswith(("-", "|")) and len(stripped) > MAX_ENTRY_CHARS:

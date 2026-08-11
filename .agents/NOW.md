@@ -15,7 +15,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | `SPEC-DSPARK` | **WORKS on 35B**: ON==OFF 48/48 | Draft step ~6x a target step |
 | State record (#166) | **157 imports = 3,231,342 bytes** at `776c56f1` | Force-update #166; rerun readiness |
 | Laguna NVFP4 / DS-V4 decode | **CLOSED, byte-exact**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
-| 27B NVFP4 @`0893e160` | **c1 0.838, c2-c8 0.95-0.97** (#213 levers ACTIVE); c1 unmoved | c1 decode window; 35B canonical |
+| 27B NVFP4 @`0893e160` | **flat 0.937-0.956 c1-c32** (6-point, `gate_pass:false`); 0.838 c1 did not reproduce (#349) | why the grids disagree: build diff |
 | f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%) | Fold into the 35B lever |
 | Invocation-parity | **CLOSED**: re-verified @`812de8ca` | — |
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |

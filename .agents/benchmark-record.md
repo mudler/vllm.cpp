@@ -18140,3 +18140,78 @@ the Laguna-XS-2.1-NVFP4 decode sections. Nothing was edited or dropped.
 | Laguna-S-2.1 NVFP4 | **CLOSED 2026-08-04, parity+**: `VT_LAGUNA_RESIDENT_BF16W` default-ON (bf16 weights unified/ATS → cudaMalloc device-resident) → 44.6 vs 43.1 tok/s, byte-exact (o_proj 194→131, lm_head 2410→1620 us/call) | none, closed |
 | DFlash speculative decode | **CLOSED 2026-07-27 (D14)**: warp-scoped draft attention (242.9 → 77.9 ms), c1 our-on 29.32 vs vLLM-on 29.24 tok/s, non-overlapping 3-rep bands, 1.003x | none, closed |
 | cuBLAS invocation-parity guard | **CLOSED**: CI guard landed (CPU) and the `kGemvHeuristicAlgos` refactor re-verified on CUDA @`812de8ca` (forced recompile, clean `-Werror`, 315/315 + 235/235) | none |
+
+## 27B NVFP4 canonical SIX-POINT regrid, and the two grids that disagree (2026-08-11, main `348c265d`, GB10)
+
+Issue: [#349](https://github.com/mudler/vllm.cpp/issues/349).
+
+Ran the canonical driver for model key `27n` at the SAME SHA and the SAME build
+(`build-gate2`) as the recorded c1-c8 cells, so all six points form one coherent
+grid rather than a mixture of two trees. Corpus regenerated with this
+checkpoint's own tokenizer (the 35B corpus is keyed to the 35B tokenizer and is
+not reusable). Model gate passed token-exact 16/16 vs vLLM before any timing.
+
+| | c1 | c2 | c4 | c8 | c16 | c32 |
+|---|---:|---:|---:|---:|---:|---:|
+| ours tok/s (n=3) | 10.756 | 19.232 | 32.365 | 50.520 | 69.040 | 84.064 |
+| vLLM tok/s (n=3) | 11.250 | 20.153 | 34.281 | 53.666 | 73.114 | 89.706 |
+| ratio | 0.9561x | 0.9543x | 0.9441x | 0.9414x | 0.9443x | 0.9371x |
+| ours spread | 1.005 | 1.006 | 1.006 | 1.001 | 1.004 | 1.006 |
+| vLLM spread | 1.006 | 1.006 | 1.005 | 1.005 | 1.003 | 1.004 |
+
+Driver verdict `{"gate_pass": false}`. Best c1 0.9561x, worst c32 0.9371x, no
+cell at or above parity.
+
+### The published grid does not reproduce
+
+| arm, c1 | 2026-08-10 | 2026-08-11 | delta |
+|---|---:|---:|---:|
+| vLLM | 11.3646 | 11.250 | 1.0% |
+| ours | 9.366 | 10.756 | **+14.8%** |
+| ratio | 0.8384x | 0.9561x | +0.118 |
+
+Same SHA, same driver, same box. The denominator reproduces to 1%; our own arm
+moved ~15%. A third value exists for our c1 (8.1176, the no-lever floor of
+[#319](https://github.com/mudler/vllm.cpp/issues/319)), giving our arm an
+8.12-10.76 span (32%) while vLLM stays inside 1%.
+
+The SHAPE changes too. The published table has c1 as the WORST cell and c8 the
+best; the regrid is nearly FLAT (0.937-0.956) with c1 the BEST. There is no c1
+cliff.
+
+### Refuted: a per-load residency lottery
+
+Both grids are internally tight (08-10 recorded spreads 1.0013-1.0068; the
+regrid 1.001-1.006) yet disagree by 15%, which looks like a state fixed per
+server lifetime. Tested directly: ONE identical binary, 6 cold loads, page cache
+dropped before each, nothing else varied.
+
+```
+11.7933  11.7642  11.7573  11.7541  11.7392  11.7484   (batch-1 tok/s)
+min 11.739  max 11.793  spread 1.0046x  -> SINGLE MODE
+```
+
+Reload-to-reload variance is 0.46%, ~30x smaller than the cross-grid delta. Not
+a lottery, and not per-load nondeterminism at this magnitude. (Absolute values
+here are not comparable to the grid: this harness uses a 5-token prompt and is
+far more decode-dominated. It tests VARIANCE of one fixed method, and must not
+be quoted as a ratio.)
+
+Leading remaining candidate is a BUILD difference. The regrid used
+RelWithDebInfo, `VLLM_CPP_TRITON=ON`, oracle ninja, flashinfer-bundled CUTLASS,
+`BENCH_PROFILE_CONTROL=OFF`, FA2 marker verified in the configure log. The 08-10
+grid records its recipe only as "same recipe as the pre-lever binding grid".
+This project has a recorded incident of a hand-built bench tree silently
+omitting `-DVLLM_CPP_TRITON=ON`, and another of a degraded CUTLASS build
+drifting near-tie gates. Settle it by locating that grid's configure log and
+diffing the flags, not by re-measuring.
+
+### What this retracts
+
+"THE OPEN PROBLEM: c1 did not move" is withdrawn as a statement about the
+levers. Both levers demonstrably executed; the two runs most likely differ for
+the reason above. Any per-lever attribution taken at c1 before 2026-08-11 is
+noise-dominated, including the four-decimal pre-lever attribution (lm_head
+8.6414 + fp8 tower 7.6068 of 17.3292), which
+[#339](https://github.com/mudler/vllm.cpp/issues/339) independently found
+mis-assigned its terms.

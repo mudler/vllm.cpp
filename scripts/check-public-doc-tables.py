@@ -535,11 +535,14 @@ STATUS_RATCHET = {
     # canonical c1-c32 grid instead of the superseded ad-hoc narrative.
     # Strictly DOWN from 243378.
     #
-    # 243287 since 2026-08-11 (measured 243287): main re-pinned to 243309 for the
+    # 243285 since 2026-08-11 (measured 243285): the 27B row collapsed to the binding
+    # canonical 6-point result; the superseded 0.838 c1 and the two-grid
+    # disagreement moved to .agents/benchmark-record.md (#349). Prior note:
+    # 243287 since 2026-08-11: main re-pinned to 243309 for the
     # 35B canonical grid while #223 and #238 were landing. RE-MEASURED against the
     # page carrying all three -- 243309 less #223's 10 and #238's 12 -- not carried
     # from any one of them. Strictly DOWN.
-    "chars": 243287,
+    "chars": 243285,
     "h2_sections": 11,
     "long_paragraphs": 82,
     "oversized_cells": 44,

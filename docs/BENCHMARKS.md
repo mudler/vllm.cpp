@@ -81,17 +81,17 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 
 ### Qwen3.6-27B NVFP4 `nvidia` @`0893e160` by concurrency (ModelOpt)
 
-| Concurrency | 1 | 2 | 4 | 8 |
-|---|---:|---:|---:|---:|
-| **vllm.cpp** tok/s (canonical 2026-08-10) | 9.4201 | 17.2474 | 29.5132 | 46.7061 |
-| vLLM 0.25.0 tok/s (canonical) | 11.3646 | 20.3858 | 34.6041 | 54.0616 |
-| **Ratio POST-LEVER (BINDING, main @`348c265d`)** | **0.8384x** | **0.9637x** | **0.9545x** | **0.9670x** |
-| ours tok/s post-lever | 9.366 | 19.529 | 32.870 | 51.753 |
-| Ratio pre-lever (same recipe, superseded) | 0.8289x | 0.8461x | 0.8529x | 0.8639x |
-| Levers landed | packed NVFP4 `lm_head` + merged GDN fp8 qkvz. Both ACTIVE by kernel signature: `cutlass_80_tensorop` ABSENT, split `nvjet_64x128x128` replaced by merged `192x48x128` | | |
-| OPEN: c1 did not move | c2-c8 gained ~10 points, c1 only +0.010 though both levers execute there. The pre-lever attribution sized them AT c1, so it mis-assigned c1 | | |
-| TPOT / TTFT ratio (canonical) | 1.2245 / 1.0077 | 1.1902 / 1.1111 | 1.2313 / 0.9722 | 1.2250 / 0.9992 |
-| Prior ad-hoc ratio (superseded, consistent) | 0.847x | 0.861x | 0.853x | 0.843x |
+| Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|---:|
+| **vllm.cpp** tok/s (canonical 2026-08-11) | 10.756 | 19.232 | 32.365 | 50.520 | 69.040 | 84.064 |
+| vLLM 0.25.0 tok/s (canonical 2026-08-11) | 11.250 | 20.153 | 34.281 | 53.666 | 73.114 | 89.706 |
+| **Ratio BINDING (main @`348c265d`, n=3 both arms)** | **0.9561x** | **0.9543x** | **0.9441x** | **0.9414x** | **0.9443x** | **0.9371x** |
+| leg spread, ours / vLLM | 1.005 / 1.006 | 1.006 / 1.006 | 1.006 / 1.005 | 1.001 / 1.005 | 1.004 / 1.003 | 1.006 / 1.004 |
+| Ratio 2026-08-10, same SHA (SUPERSEDED, see [#349](https://github.com/mudler/vllm.cpp/issues/349)) | 0.8384x | 0.9637x | 0.9545x | 0.9670x | not run | not run |
+| Driver verdict | `{"gate_pass": false}`. First six-point grid here; the earlier table stopped at c8 though the driver sweeps c1-c32, so it was incomplete | | | | | |
+| Levers landed | packed NVFP4 `lm_head` + merged GDN fp8 qkvz, both ACTIVE by kernel signature | | | | | |
+| OPEN: the grids disagree | vLLM reproduces to 1.0%; OURS moved +14.8% at c1. Residency lottery REFUTED (6 loads span 1.0046x). Build difference leads. [#349](https://github.com/mudler/vllm.cpp/issues/349) | | | | | |
+| RETRACTED: "c1 did not move" | c1 attribution was noise-dominated; any per-lever c1 number before 2026-08-11 is suspect | | | | | |
 | Before the FP8 tower fix | 8.76 | 17.07 | 33.01 | 62.13 |
 | Noise band, measured BEFORE any delta | ±0.03% c1 back-to-back; 0.29-1.85% leg-to-leg with reload, drifting down on BOTH arms so it cancels in the ratio | | |
 | c16, c32 | NOT MEASURED. Both canonical attempts void: denominator contended mid-timing once, host OOM-reboot once | | |

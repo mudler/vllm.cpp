@@ -1,5 +1,5 @@
 // vllm.cpp ORIGINAL; see muse_glimmer_gguf_weights.h for the port record, the
-// three convert-time transforms this file inverts (each verified byte-for-byte
+// four convert-time transforms this file inverts (each verified element-wise
 // against the released bf16 safetensors), and the residency rationale.
 //
 // GGUF tensor names + metadata keys mirror llama.cpp's `muse-glimmer` arch
@@ -192,6 +192,52 @@ OwnedTensor LoadMatmul(const GgufFile& g, const GgufLoadPolicy& pol,
   return ExpandBf16(g, name, {n, k}, /*nk=*/true);
 }
 
+// ── the converter's Q/K RoPE row permutation (transform 4) ───────────────────
+
+// llama.cpp's converter stores `attn_q` / `attn_k` in ggml's INTERLEAVED-RoPE row
+// order, not HF's. `LlamaModel.permute` (llama.cpp `conversion/llama.py:163-169`,
+// which the `muse-glimmer` converter in ggml-org/llama.cpp#26841 inherits) does,
+// per head:
+//
+//     w.reshape(n_head, 2, head_dim/2, K).swapaxes(1, 2).reshape(n_head*head_dim, K)
+//
+// so GGUF row `h*Dh + b*2 + a` holds HF row `h*Dh + a*(Dh/2) + b`. That is the
+// weight-side half of ggml's `rope_norm`, which rotates ADJACENT channel pairs
+// (2i, 2i+1); HF — and our `vt::RopeNeox` — rotates HALF-OFFSET pairs
+// (i, i + Dh/2). `attn_k` is permuted with `n_head_kv`, `attn_q` with `n_head`.
+//
+// Our forward consumes HF order, so the loader must UN-permute. The inverse of
+// the map above sends destination (HF) row `i` within a head to source (GGUF) row
+// `(i % (Dh/2)) * 2 + i / (Dh/2)`.
+//
+// VERIFIED against the released bf16 checkpoint on 2026-08-11, layers 0, 3, 25
+// and 51, for both `attn_q` (32 heads) and `attn_k` (2 kv heads): read verbatim
+// the GGUF disagrees with `meta-models/Muse-Glimmer-30B` at mean relative error
+// ~1.40 (i.e. unrelated numbers), and read through this map it agrees at ~0.077 —
+// exactly the Q4_K quantization noise every other tensor in the file shows.
+// `attn_v`, `attn_output` and both MLP shards are NOT permuted upstream and match
+// verbatim, which is why only q and k carry a head count here.
+//
+// This is invisible without RoPE: a permutation applied to BOTH q and k leaves
+// q·k unchanged, so the 13 NoPE layers are correct either way. On the 39 RoPE
+// layers it rotates the wrong channel pairs, which is why the model loaded,
+// ran, and emitted degenerate text instead of failing (issue #359).
+int64_t QkUnpermuteSrcRow(int64_t dst_row, int64_t head_dim) {
+  const int64_t half = head_dim / 2;
+  const int64_t h = dst_row / head_dim;
+  const int64_t i = dst_row % head_dim;
+  return h * head_dim + (i % half) * 2 + i / half;
+}
+
+// One shard of a merged operand. `rope_heads > 0` marks a shard that carries the
+// converter's Q/K row permutation and must be un-permuted on the way in; 0 means
+// the shard is taken verbatim.
+struct MergedShard {
+  std::string name;
+  int64_t n = 0;
+  int64_t rope_heads = 0;
+};
+
 // A MERGED [sum(n_i), K] operand built from several file tensors that share K.
 //
 // The forward wants ONE tensor for qkv (rows q|k|v) and one for gate_up (rows
@@ -207,16 +253,21 @@ OwnedTensor LoadMatmul(const GgufFile& g, const GgufLoadPolicy& pol,
 // `attn_v` is Q6_K while `attn_q`/`attn_k` are Q4_K, so the qkv trio expands and
 // the homogeneous ffn_gate|ffn_up pair stays quantized.
 OwnedTensor LoadMerged(const GgufFile& g, const GgufLoadPolicy& pol,
-                       const std::vector<std::pair<std::string, int64_t>>& shards,
-                       int64_t k) {
+                       const std::vector<MergedShard>& shards, int64_t k) {
   VT_CHECK(!shards.empty(), "muse_glimmer gguf: empty merged operand");
   int64_t total_n = 0;
   bool keep = true;
   uint32_t type0 = 0;
   for (size_t i = 0; i < shards.size(); ++i) {
-    const GgufTensorInfo& t = g.Get(shards[i].first);
-    RequireShape(t, {shards[i].second, k});
-    total_n += shards[i].second;
+    const GgufTensorInfo& t = g.Get(shards[i].name);
+    RequireShape(t, {shards[i].n, k});
+    VT_CHECK(shards[i].rope_heads == 0 ||
+                 (shards[i].n % shards[i].rope_heads == 0 &&
+                  (shards[i].n / shards[i].rope_heads) % 2 == 0),
+             "muse_glimmer gguf: " + shards[i].name +
+                 " cannot carry the converter's Q/K RoPE row permutation: its row "
+                 "count is not an even head_dim times the head count");
+    total_n += shards[i].n;
     if (i == 0) type0 = t.ggml_type;
     keep = keep && t.ggml_type == type0 &&
            pol.Route(t, GgufTensorRole::kMatmulWeight) == GgufResidency::kKeepQuant;
@@ -235,12 +286,25 @@ OwnedTensor LoadMerged(const GgufFile& g, const GgufLoadPolicy& pol,
     o.nk = true;
     std::vector<uint8_t> buf;
     buf.reserve(static_cast<size_t>(total_n) * row_bytes);
-    for (const auto& [name, n] : shards) {
-      const GgufTensorInfo& t = g.Get(name);
-      const size_t bytes = static_cast<size_t>(n) * row_bytes;
+    for (const MergedShard& s : shards) {
+      const GgufTensorInfo& t = g.Get(s.name);
+      const size_t bytes = static_cast<size_t>(s.n) * row_bytes;
       VT_CHECK(bytes <= t.nbytes,
-               "muse_glimmer gguf: merged slice exceeds the tensor span for " + name);
-      buf.insert(buf.end(), t.data, t.data + bytes);
+               "muse_glimmer gguf: merged slice exceeds the tensor span for " + s.name);
+      if (s.rope_heads > 0) {
+        // Transform 4, on the KEPT-QUANT path. A k-quant row is a whole number of
+        // superblocks, so reordering WHOLE rows never touches a block boundary and
+        // nothing is requantized — the same property that makes the concat itself
+        // a byte operation.
+        const int64_t head_dim = s.n / s.rope_heads;
+        for (int64_t r = 0; r < s.n; ++r) {
+          const uint8_t* src =
+              t.data + static_cast<size_t>(QkUnpermuteSrcRow(r, head_dim)) * row_bytes;
+          buf.insert(buf.end(), src, src + row_bytes);
+        }
+      } else {
+        buf.insert(buf.end(), t.data, t.data + bytes);
+      }
       // The merged buffer is now the authority for these bytes; the file pages
       // they came from are read-once (llama.cpp `unmap_fragment`, L5).
       if (pol.mmap_residency) g.DropSpanResidency(t.data, bytes);
@@ -258,14 +322,24 @@ OwnedTensor LoadMerged(const GgufFile& g, const GgufLoadPolicy& pol,
   OwnedTensor o = MakeBf16({total_n, k}, /*nk=*/true);
   auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
   int64_t row = 0;
-  for (const auto& [name, n] : shards) {
-    const GgufTensorInfo& t = g.Get(name);
+  for (const MergedShard& s : shards) {
+    const GgufTensorInfo& t = g.Get(s.name);
     const std::vector<uint16_t> dq =
-        DequantGgufRowToBf16(t.ggml_type, t.data, n * k);
-    VT_CHECK(static_cast<int64_t>(dq.size()) == n * k,
-             "muse_glimmer gguf: dequant length mismatch for " + name);
-    std::memcpy(dst + row * k, dq.data(), dq.size() * sizeof(uint16_t));
-    row += n;
+        DequantGgufRowToBf16(t.ggml_type, t.data, s.n * k);
+    VT_CHECK(static_cast<int64_t>(dq.size()) == s.n * k,
+             "muse_glimmer gguf: dequant length mismatch for " + s.name);
+    if (s.rope_heads > 0) {
+      // Transform 4, on the DEQUANTIZED path — the one the released 17 GB file
+      // actually takes, because its qkv trio is heterogeneous (Q6_K v vs Q4_K q/k).
+      const int64_t head_dim = s.n / s.rope_heads;
+      for (int64_t r = 0; r < s.n; ++r)
+        std::memcpy(dst + (row + r) * k,
+                    dq.data() + QkUnpermuteSrcRow(r, head_dim) * k,
+                    static_cast<size_t>(k) * sizeof(uint16_t));
+    } else {
+      std::memcpy(dst + row * k, dq.data(), dq.size() * sizeof(uint16_t));
+    }
+    row += s.n;
   }
   return o;
 }
@@ -555,18 +629,25 @@ MuseGlimmerWeights LoadMuseGlimmerFromGguf(const GgufFile& gguf,
     lw.post_feedforward_layernorm =
         LoadNormBf16(gguf, Blk(l, "post_ffw_norm.weight"), H, true);
 
-    lw.attn.qkv_proj = LoadMerged(gguf, pol,
-                                  {{Blk(l, "attn_q.weight"), qdim},
-                                   {Blk(l, "attn_k.weight"), kdim},
-                                   {Blk(l, "attn_v.weight"), kdim}},
-                                  H);
+    // Transform 4: `attn_q` and `attn_k` are stored in ggml's interleaved-RoPE row
+    // order and are UN-permuted here (with `n_head` and `n_head_kv` respectively,
+    // mirroring llama.cpp's `permute(w, n_head, n_head_kv)`); `attn_v` is stored
+    // verbatim and takes no head count.
+    lw.attn.qkv_proj =
+        LoadMerged(gguf, pol,
+                   {{Blk(l, "attn_q.weight"), qdim, t.num_attention_heads},
+                    {Blk(l, "attn_k.weight"), kdim, t.num_key_value_heads},
+                    {Blk(l, "attn_v.weight"), kdim, 0}},
+                   H);
     lw.attn.o_proj = LoadMatmul(gguf, pol, Blk(l, "attn_output.weight"), H, qdim);
     if (t.use_attn_output_gate)
       lw.attn.output_gate_proj =
           LoadMatmul(gguf, pol, Blk(l, "attn_gate.weight"), qdim, H);
 
-    lw.mlp.gate_up_proj = LoadMerged(
-        gguf, pol, {{Blk(l, "ffn_gate.weight"), I}, {Blk(l, "ffn_up.weight"), I}}, H);
+    lw.mlp.gate_up_proj =
+        LoadMerged(gguf, pol,
+                   {{Blk(l, "ffn_gate.weight"), I, 0}, {Blk(l, "ffn_up.weight"), I, 0}},
+                   H);
     lw.mlp.down_proj = LoadMatmul(gguf, pol, Blk(l, "ffn_down.weight"), H, I);
     w.layers.push_back(std::move(lw));
   }

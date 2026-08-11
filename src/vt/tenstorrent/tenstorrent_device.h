@@ -50,4 +50,20 @@ void MarkHostWritten(void* host);
 // device-resident results without every op writing host eagerly.
 void EnsureHostBytes(void* host);
 
+// ---- ttnn mesh-trace capture (Backend graph-capture mapping) --------------
+// Maps vt::Backend::{BeginCapture,EndCapture,Replay} onto
+// ttnn::operations::trace::{begin,end,execute}_trace_capture. Implemented in
+// tenstorrent_ops.cpp so the backend TU stays free of ttnn headers.
+//
+// Contract (same class as CUDA graphs): every op between Begin and End must
+// stay async on the mesh CQ with fixed device buffers; host Ensure/Download
+// and fresh program compiles during capture are illegal and will throw.
+// Warm the program cache with an identical shape before BeginCapture.
+void TraceBeginCapture();
+void TraceEndCapture();           // stores the default single-slot replay id
+void TraceReplay();               // replay the single-slot id
+void* TraceEndCaptureGraph();     // returns an opaque MeshTraceId* (caller owns)
+void TraceReplayGraph(void* graph);
+void TraceDestroyGraph(void* graph);
+
 }  // namespace vt::tenstorrent

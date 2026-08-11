@@ -25,6 +25,7 @@
 #define VLLM_V1_ENGINE_ASYNC_LLM_H_
 
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -164,6 +165,9 @@ class AsyncLLM {
   RequestOutput get_output(const AsyncRequest& request);
   std::optional<RequestOutput> get_output_nowait(
       const AsyncRequest& request);
+  // Timed wait — nullopt on timeout (for SSE keepalives).
+  std::optional<RequestOutput> get_output_for(
+      const AsyncRequest& request, std::chrono::milliseconds timeout);
 
   // Blocking convenience for non-streaming callers: drain this request's
   // collector until its terminal RequestOutput. Other requests keep running.

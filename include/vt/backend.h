@@ -178,6 +178,13 @@ class Backend {
   // device, exactly as SupportsAsyncSampledTokenReadback did for the runner.
   virtual bool SupportsCompressedConvState() const { return false; }
 
+  // The GDN recurrent (SSM) state twin of the conv clause above: f16/bf16
+  // [N,Hv,Dv,Dk] state addressed in place by the GdnPrefill/GdnDecode kernels,
+  // read/written in f32 registers (vLLM's mamba_cache_dtype default is bf16).
+  // CheckGdnCommon used to spell this as `device == kCUDA`; asking the backend
+  // keeps the shared op layer device-agnostic.
+  virtual bool SupportsCompressedGdnState() const { return false; }
+
   // Optional graph/command capture (CUDA Graphs / Metal ICB / Vulkan CB).
   virtual bool SupportsGraphCapture() const { return false; }
   virtual void BeginCapture(Queue& q);

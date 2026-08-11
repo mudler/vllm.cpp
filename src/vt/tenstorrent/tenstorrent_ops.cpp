@@ -53,6 +53,8 @@
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
 #include <ttnn/operations/transformer/sdpa_config.hpp>
+#include <ttnn/operations/trace.hpp>
+#include <ttnn/common/queue_id.hpp>
 // chunked_scaled_dot_product_attention lives in sdpa.hpp, but the installed
 // TT-NN tree ships that header with a missing device/ include. Forward-declare
 // the overload we call; the symbol is linked via TTNN::TTNN.
@@ -2345,6 +2347,86 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// ---- ttnn mesh-trace capture (Backend graph-capture mapping) ----------------
+// Process-local single-slot capture + multi-graph handles (opaque MeshTraceId*).
+// Mirrors the CUDA backend's single-exec_ vs EndCaptureGraph split.
+
+namespace {
+struct TraceState {
+  bool capturing = false;
+  bool has_replay = false;
+  ttnn::MeshTraceId capturing_id{0};
+  ttnn::MeshTraceId replay_id{0};
+};
+TraceState& TraceSlot() {
+  static TraceState s;
+  return s;
+}
+constexpr auto kTraceCq = ttnn::QueueId(0);
+}  // namespace
+
+void TraceBeginCapture() {
+  TraceState& s = TraceSlot();
+  VT_CHECK(!s.capturing, "tenstorrent: nested TraceBeginCapture");
+  MeshDevice& device = SharedMeshDevice();
+  s.capturing_id = ttnn::operations::trace::begin_trace_capture(&device, kTraceCq);
+  s.capturing = true;
+}
+
+void TraceEndCapture() {
+  TraceState& s = TraceSlot();
+  VT_CHECK(s.capturing, "tenstorrent: TraceEndCapture without Begin");
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::operations::trace::end_trace_capture(&device, s.capturing_id, kTraceCq);
+  // Drop previous single-slot replay if any.
+  if (s.has_replay) {
+    try {
+      ttnn::operations::trace::release_trace(&device, s.replay_id);
+    } catch (...) {
+    }
+  }
+  s.replay_id = s.capturing_id;
+  s.has_replay = true;
+  s.capturing = false;
+}
+
+void TraceReplay() {
+  TraceState& s = TraceSlot();
+  VT_CHECK(!s.capturing, "tenstorrent: TraceReplay during capture");
+  VT_CHECK(s.has_replay, "tenstorrent: TraceReplay with no captured trace");
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::operations::trace::execute_trace(&device, s.replay_id, kTraceCq, /*blocking=*/true);
+}
+
+void* TraceEndCaptureGraph() {
+  TraceState& s = TraceSlot();
+  VT_CHECK(s.capturing, "tenstorrent: TraceEndCaptureGraph without Begin");
+  MeshDevice& device = SharedMeshDevice();
+  ttnn::operations::trace::end_trace_capture(&device, s.capturing_id, kTraceCq);
+  s.capturing = false;
+  // Opaque handle: heap-allocated MeshTraceId for the multi-graph API.
+  return new ttnn::MeshTraceId(s.capturing_id);
+}
+
+void TraceReplayGraph(void* graph) {
+  VT_CHECK(graph != nullptr, "tenstorrent: TraceReplayGraph null");
+  VT_CHECK(!TraceSlot().capturing, "tenstorrent: TraceReplayGraph during capture");
+  MeshDevice& device = SharedMeshDevice();
+  const auto id = *static_cast<ttnn::MeshTraceId*>(graph);
+  ttnn::operations::trace::execute_trace(&device, id, kTraceCq, /*blocking=*/true);
+}
+
+void TraceDestroyGraph(void* graph) {
+  if (graph == nullptr) return;
+  auto* id = static_cast<ttnn::MeshTraceId*>(graph);
+  try {
+    MeshDevice& device = SharedMeshDevice();
+    ttnn::operations::trace::release_trace(&device, *id);
+  } catch (...) {
+  }
+  delete id;
+}
 
 // ---- Called from TenstorrentBackend::Alloc/Free/Copy (no ttnn in that TU). ----
 void RegisterHostBuffer(void* host, size_t bytes) {

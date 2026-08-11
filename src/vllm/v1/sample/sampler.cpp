@@ -96,7 +96,12 @@ void ApplyTopKTopPFromMeta(vt::Queue& q, vt::Tensor& logits,
 LogprobsTensors GatherLogprobs(const std::vector<float>& raw_logprobs, int64_t n,
                                int64_t vocab, int num_logprobs,
                                const std::vector<int64_t>& sampled) {
-  const int k = num_logprobs;
+  // #249 defense-in-depth: validation (InputProcessor::ValidateParams) rejects
+  // k > vocab before we get here, mirroring upstream's _validate_logprobs. Clamp
+  // anyway — partial_sort(idx.begin(), idx.begin() + k, ...) below indexes a
+  // vocab-sized array, so an unvalidated caller walking past the end is a crash,
+  // and no internal path should be able to reach that from a request field.
+  const int k = static_cast<int>(std::min<int64_t>(num_logprobs, vocab));
   const int width = k + 1;
   LogprobsTensors lt;
   lt.num_positions = static_cast<int>(n);

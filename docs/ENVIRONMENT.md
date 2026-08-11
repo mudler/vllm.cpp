@@ -25,6 +25,7 @@ These change how the engine runs and have no CLI flag (or complement one).
 | `VT_LMCACHE_PORT` | `65432` | Default LMCache server port. The `kv_connector_extra_config.port` key overrides it |
 | `VT_LMCACHE_HASH_ALGO` | `blake3` | Default LMCache key-derivation algorithm. Set `vllm` (alias `sha256_cbor`) for byte-for-byte interop with a real vLLM + LMCache peer. The `kv_connector_extra_config.hash_algo` key overrides it |
 | `VT_SERVER_MAX_PROMPT_CHARS` | `200000` characters | Rejects chat-completion prompts larger than this many characters. Set `0` to disable the prompt-size guard |
+| `VT_SERVER_SSE_PING_S` | 15 | Seconds between SSE comment keepalives (`:\n\n`) on silent streams; `<=0` disables. |
 | `VT_SERVER_MAX_NEW_TOKENS` | `4096` | Clamps the requested generation length to this many new tokens. Set `0` to disable the cap |
 | `VT_BENCH_PRETOKENIZE` | `1` (on) | Makes `vllm-bench` encode every prompt before its benchmark clock and admit token IDs, matching the pinned vLLM comparison frontend. Exact `0` restores timed string admission for same-binary A/B; unset, `1`, and invalid spellings keep the safe default-on behavior |
 | `VT_VULKAN_DEVICE` | first suitable device | Forces the Vulkan physical device index. Required on a multi-GPU host to pin the intended device |

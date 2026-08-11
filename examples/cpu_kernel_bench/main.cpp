@@ -430,6 +430,11 @@ class PerfGroup {
 };
 #endif
 
+// The Cortex-A76 PMU lookup reads /sys/bus/event_source, so it is called only
+// from the __linux__ half of MakeCounterGroups below. It carries the same guard
+// as its caller: without it the pair is dead code everywhere else, and
+// -Werror,-Wunused-function makes that a hard build failure (macOS/clang).
+#if defined(__linux__)
 std::optional<uint64_t> ParsePerfEvent(std::string_view descriptor) {
   const size_t at = descriptor.find("event=");
   if (at == std::string_view::npos) return std::nullopt;
@@ -453,6 +458,7 @@ std::optional<EventSpec> A76Event(const std::string& name) {
   if (!config) return std::nullopt;
   return EventSpec{name, ParseInteger<uint32_t>(type_text, "pmu-type"), *config};
 }
+#endif
 
 std::vector<PerfGroup> MakeCounterGroups(const std::string& selection) {
   std::vector<PerfGroup> groups;

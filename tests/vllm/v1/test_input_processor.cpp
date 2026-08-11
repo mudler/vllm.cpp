@@ -501,3 +501,40 @@ TEST_CASE("InputProcessor honours an explicit max_model_len override") {
           params),
       vllm::v1::InputValidationError);
 }
+
+// ─── #249: an out-of-range logprobs request must be REJECTED, not crash ──────
+// GatherLogprobs partial_sorts k entries out of a vocab-sized index array, so an
+// unbounded k walked off the end and killed the server process — reachable from
+// a single unauthenticated POST with {"logprobs": 999999}. Upstream
+// _validate_logprobs (sampling_params.py:755-770) REJECTS rather than clamps,
+// and this mirrors that.
+TEST_CASE("process_inputs rejects logprobs above the vocabulary cap (#249)") {
+  const Tokenizer& tok = GoldenTokenizer();
+  HfConfig cfg = MakeConfig(4096, json(nullptr));
+  InputProcessor proc(tok, cfg);
+  const int vocab = static_cast<int>(tok.VocabSize());
+
+  SUBCASE("sample logprobs far above vocab throws instead of crashing") {
+    SamplingParams params;
+    params.logprobs = 999999;
+    CHECK_THROWS_AS(proc.process_inputs("r", "hi", params), std::runtime_error);
+  }
+
+  SUBCASE("prompt logprobs above vocab throws too") {
+    SamplingParams params;
+    params.prompt_logprobs = vocab + 1;
+    CHECK_THROWS_AS(proc.process_inputs("r", "hi", params), std::runtime_error);
+  }
+
+  SUBCASE("exactly vocab is ACCEPTED — the cap is inclusive, as upstream's is") {
+    SamplingParams params;
+    params.logprobs = vocab;
+    CHECK_NOTHROW(proc.process_inputs("r", "hi", params));
+  }
+
+  SUBCASE("an ordinary small request is unaffected") {
+    SamplingParams params;
+    params.logprobs = 5;
+    CHECK_NOTHROW(proc.process_inputs("r", "hi", params));
+  }
+}

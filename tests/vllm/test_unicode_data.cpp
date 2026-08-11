@@ -11,7 +11,9 @@ using vllm::tok::Category;
 using vllm::tok::DecodeUtf8;
 using vllm::tok::EncodeUtf8;
 using vllm::tok::IsWhitespace;
+using vllm::tok::LetterCaseOf;
 using vllm::tok::UCat;
+using vllm::tok::LetterCase;
 
 TEST_CASE("Category spot checks") {
   CHECK(Category(U'a') == UCat::kLetter);
@@ -167,4 +169,43 @@ TEST_CASE("Range table sanity: sorted, non-overlapping, non-empty") {
   CHECK(Category(U'@') == UCat::kPunct);  // Po, immediately before 'A'
   CHECK(Category(U'Z') == UCat::kLetter);
   CHECK(Category(U'[') == UCat::kPunct);  // Ps, immediately after 'Z'
+}
+
+// LetterCaseOf is the minor letter class the Tekken (#168) and GPT-4o (#347)
+// split regexes need -- they name the SAME two classes. Spot checks are Unicode
+// general categories, verifiable against
+// `python3 -c "import unicodedata; print(unicodedata.category(chr(0x...)))"`.
+TEST_CASE("LetterCaseOf splits L* three ways") {
+  CHECK(LetterCaseOf(U'a') == LetterCase::kLower);        // Ll
+  CHECK(LetterCaseOf(U'z') == LetterCase::kLower);        // Ll
+  CHECK(LetterCaseOf(0x00E9) == LetterCase::kLower);      // é  Ll
+  CHECK(LetterCaseOf(U'A') == LetterCase::kUpper);        // Lu
+  CHECK(LetterCaseOf(0x00C9) == LetterCase::kUpper);      // É  Lu
+  CHECK(LetterCaseOf(0x01C5) == LetterCase::kUpper);      // ǅ  Lt (title case)
+  CHECK(LetterCaseOf(0x01C4) == LetterCase::kUpper);      // Ǆ  Lu
+  CHECK(LetterCaseOf(0x01C6) == LetterCase::kLower);      // ǆ  Ll
+  CHECK(LetterCaseOf(0x02B0) == LetterCase::kCaseless);   // ʰ  Lm
+  CHECK(LetterCaseOf(0x99C5) == LetterCase::kCaseless);   // 駅 Lo
+  CHECK(LetterCaseOf(0x05D0) == LetterCase::kCaseless);   // א  Lo
+  // Non-letters, including the marks that the GPT-4o classes add SEPARATELY.
+  CHECK(LetterCaseOf(U'5') == LetterCase::kNotLetter);
+  CHECK(LetterCaseOf(U' ') == LetterCase::kNotLetter);
+  CHECK(LetterCaseOf(0x0301) == LetterCase::kNotLetter);  // combining acute, Mn
+  CHECK(LetterCaseOf(0x110000) == LetterCase::kNotLetter);
+}
+
+TEST_CASE("LetterCaseOf and Category agree on what a letter is") {
+  // The two tables are generated from the same unicodedata pass; if one is
+  // regenerated without the other they drift, and a Tekken or GPT-4o letter run
+  // silently changes shape. Sweep the BMP plus a slice of the SMP.
+  for (uint32_t cp = 0; cp < 0x11000; ++cp) {
+    const bool by_cat = Category(cp) == UCat::kLetter;
+    const bool by_case = LetterCaseOf(cp) != LetterCase::kNotLetter;
+    if (by_cat != by_case) FAIL("Category/LetterCaseOf disagree at cp ", cp);
+  }
+  for (uint32_t cp = 0x1D400; cp < 0x1D800; ++cp) {
+    const bool by_cat = Category(cp) == UCat::kLetter;
+    const bool by_case = LetterCaseOf(cp) != LetterCase::kNotLetter;
+    if (by_cat != by_case) FAIL("Category/LetterCaseOf disagree at cp ", cp);
+  }
 }

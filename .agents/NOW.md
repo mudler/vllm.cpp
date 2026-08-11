@@ -17,7 +17,7 @@ Work: 7 external PRs landed (6 merged + #227 repaired).
 | Laguna NVFP4 / DS-V4 decode | **CLOSED, byte-exact**: 1.03x vLLM, 1.144x ds4 | Laguna vLLM K-run |
 | 27B NVFP4 @`0893e160` | **c1 0.838, c2-c8 0.95-0.97** (#213 levers ACTIVE); c1 unmoved | c1 decode window; 35B canonical |
 | f32-out GEMV audit | **CLAIM WRONG**: 35B runs 41 `CastF32`/step (3.1%) | Fold into the 35B lever |
-| Muse Glimmer (#333) | **no speed number**: GGUF tokenizer blocks it (#347) | Fix #347 |
+| Muse Glimmer (#333) | #347+#359 FIXED: GGUF COHERENT | Token-exact vs llama.cpp |
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
 | 35B mid-band | **canonical 0.918-0.972x** c1-c32 (@`348c265d`, first c16/c32) | Decode-only window, ONE tool |
@@ -28,7 +28,7 @@ Work: 7 external PRs landed (6 merged + #227 repaired).
 | `SERVE-METRICS` async (#277) | **`/metrics` was DEAD on the shipped server**: AsyncLLM folded nothing. Now live, ctest 366/366 | Config-gated families |
 | `ENG-LOAD-DIRECT-UPLOAD` (#150) | **default ON:** weights VIEW the mmap; 27B load **1.54x warm / 1.61x cold** | merged qkv/gate_up + lm_head |
 | Vulkan 27B | decode **MET 4.36 vs 4.35**. **LOADMEM: load held the model TWICE, 100.759 -> 53.413 GiB** | Load-phase host build is the new peak |
-| `BACKEND-ROCM` | **(b) fix in; #140 gfx1201 hipBLAS + Gemma-4 MoE landed; W0 green** | compile + M2 ([spec](specs/rocm-unified-memory-b.md)) |
+| `BACKEND-ROCM` | #140 + gfx1200 M0-M4 (#269) + GDN slice and MoE ops (#334-#348): Qwen3.5-0.8B e2e all-native | strict CPU parity; GDN drift |
 | TP spike #287 (PR #143) | **TP-W1 LANDED**: rank-group table + TP handle (6/6); DSR leak FIXED (unblocks #127/#154/#155) | TP-W2 (linears + loader) |
 | Release | **ACTIVE; required W1-W11/W13 implemented in #196** | Finish hosted ten-SM proof; rebase/push; run full eight-tuple dry run |
 | Containers `#170` | **cpu+vulkan CI green**; #312 fixed | W6: cuda/arm64; unpushed |

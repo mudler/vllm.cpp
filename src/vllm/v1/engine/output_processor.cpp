@@ -4,6 +4,7 @@
 #include "vllm/v1/engine/output_processor.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
@@ -52,6 +53,24 @@ RequestOutput RequestOutputCollector::get() {
     std::rethrow_exception(error);
   }
   RequestOutput output = std::move(*output_);
+  output_.reset();
+  return output;
+}
+
+std::optional<RequestOutput> RequestOutputCollector::get_for(
+    std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  const bool ready = ready_.wait_for(lock, timeout, [&] {
+    return output_.has_value() || error_ != nullptr;
+  });
+  if (!ready) return std::nullopt;
+  if (error_ != nullptr) {
+    std::exception_ptr error = std::move(error_);
+    error_ = nullptr;
+    lock.unlock();
+    std::rethrow_exception(error);
+  }
+  std::optional<RequestOutput> output(std::move(*output_));
   output_.reset();
   return output;
 }

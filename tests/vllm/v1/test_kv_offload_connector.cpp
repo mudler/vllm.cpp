@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include "vllm/config/kv_transfer.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/v1/core/sched/scheduler.h"

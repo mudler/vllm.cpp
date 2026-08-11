@@ -28,8 +28,8 @@ enum class SplitPattern {
             // the `[^\r\n\p{L}\p{N}]?` prefix, UNBOUNDED `\p{N}+` digit runs,
             // no `[\r\n]*` punct tail and no `\s*[\r\n]+` rule at all.
   kTekken,  // Mistral Tekken family (Mistral-Nemo, and the Tekken-v3/v7
-            // checkpoints that share its tokenizer.json shape). The ONLY
-            // pattern here whose letter rule is CASE-AWARE: two alternatives,
+            // checkpoints that share its tokenizer.json shape). Case-aware:
+            // two alternatives,
             // [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+ then
             // the same pair with the quantifiers swapped, so an uppercase run
             // ends a piece when a lowercase run follows ("HelloWorld" ->
@@ -40,6 +40,17 @@ enum class SplitPattern {
             // [^\s\p{L}\p{N}] with no \p{M} (like kLlama3) -- a combination no
             // other pattern has. Its punct run also ends [\r\n/]*, absorbing a
             // '/' that follows a newline.
+  kGpt4o,   // GPT-4o / o200k family (llama.cpp's LLAMA_VOCAB_PRE_TYPE_GPT4O:
+            // pre names "gpt-4o", "llama4", "kanana2", "talkie"). NOT a
+            // variant of kLlama3 despite sharing its \p{N}{1,3} digit
+            // grouping: the single letter-run alternative is replaced by the
+            // SAME two case-aware alternatives kTekken uses, the contraction
+            // is a SUFFIX of the word rather than its own leading alternative,
+            // and the punctuation run absorbs a trailing `/` as well as \r/\n.
+            // The difference from kTekken is exactly the two edits named in
+            // its comment above, run in reverse: kGpt4o KEEPS the o200k
+            // contraction group and KEEPS \p{N}{1,3}. See
+            // src/vllm/tokenizer/pretokenizer.cpp for the verbatim pattern.
   kDeepSeek,  // DeepSeek family (DeepSeek-V2/V2-Lite/V3). STRUCTURALLY UNLIKE
               // every pattern above: not ONE alternation regex but a HF
               // `Sequence` PIPELINE of seven pre-tokenizers, each further

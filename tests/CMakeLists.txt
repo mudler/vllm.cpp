@@ -617,6 +617,7 @@ target_compile_definitions(test_chat_mm PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 vllm_cpp_add_test(test_openai_protocol vllm/entrypoints/openai/test_protocol.cpp)
 vllm_cpp_add_test(test_openai_serving vllm/entrypoints/openai/test_serving.cpp)
+vllm_cpp_add_test(test_sse_keepalive vllm/entrypoints/openai/test_sse_keepalive.cpp)
 vllm_cpp_add_test(test_openai_run_batch
   vllm/entrypoints/openai/test_run_batch.cpp)
 vllm_cpp_add_test(test_openai_serving_chat_stream
@@ -1143,6 +1144,16 @@ target_compile_definitions(test_tokenizer_parity_deepseek PRIVATE
 # is what unblocks the Mistral paged-engine SACRED gate.
 vllm_cpp_add_test(test_tokenizer_parity_mistral vllm/test_tokenizer_parity_mistral.cpp)
 target_compile_definitions(test_tokenizer_parity_mistral PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
+
+# TOK-LLAMA4-PRE (issue #347) — the GPT-4o / o200k tokenizer parity gate. This
+# family is what a GGUF tags `tokenizer.ggml.pre = "llama4"` (Muse Glimmer 30B).
+# It shares kLlama3's `\p{N}{1,3}` digit grouping but splits CamelCase and keeps
+# the contraction as a word suffix, so an alias would mistokenize silently —
+# only comparing IDS against HF `tokenizers` catches that, which is what this
+# gate does.
+vllm_cpp_add_test(test_tokenizer_parity_gpt4o vllm/test_tokenizer_parity_gpt4o.cpp)
+target_compile_definitions(test_tokenizer_parity_gpt4o PRIVATE
   PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 
 vllm_cpp_add_test(test_op_parity parity/test_op_parity.cpp)

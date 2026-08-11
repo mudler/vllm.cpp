@@ -17,7 +17,7 @@
 // the secondary C++ reference the Muse spec §0 already declares. llama.cpp is
 // NEVER the correctness oracle and never a speed denominator.
 //
-// ─── THE THREE CONVERT-TIME TRANSFORMS THIS INVERTS ──────────────────────────
+// ─── THE FOUR CONVERT-TIME TRANSFORMS THIS INVERTS ───────────────────────────
 // Each was VERIFIED byte-for-byte against `meta-models/Muse-Glimmer-30B`
 // (bf16 safetensors, 1436 tensors) on 2026-08-11, not inferred from the names:
 //
@@ -50,6 +50,29 @@
 //     the same split the safetensors config encodes twice (`layer_rope_theta[i]
 //     == 0` and `layer_types[i] == "full_attention"`), verified to agree on the
 //     released checkpoint (NoPE at 3, 7, ... 51 for L = 52).
+//
+//  4. `attn_q` / `attn_k` ARE STORED IN ggml's INTERLEAVED-RoPE ROW ORDER.
+//     llama.cpp's converter applies `LlamaModel.permute`
+//     (`conversion/llama.py:163-169`), i.e. per head
+//     `w.reshape(heads, 2, Dh/2, K).swapaxes(1, 2)`, to the query and key
+//     projections — with `n_head` for q and `n_head_kv` for k. That is the
+//     weight-side half of ggml's `rope_norm`, which rotates ADJACENT channel
+//     pairs (2i, 2i+1), whereas HF — and our `vt::RopeNeox` — rotates
+//     HALF-OFFSET pairs (i, i + Dh/2). The loader therefore UN-permutes both
+//     shards on the way into the merged `qkv_proj`; `attn_v`, `attn_output` and
+//     the MLP shards are stored verbatim and are taken verbatim.
+//
+//     VERIFIED against the released bf16 checkpoint on 2026-08-11 at layers 0, 3,
+//     25 and 51: read verbatim, GGUF `attn_q`/`attn_k` disagree with
+//     `meta-models/Muse-Glimmer-30B` at mean relative error ~1.40 (unrelated
+//     numbers); read through the inverse map they agree at ~0.077 — exactly the
+//     Q4_K quantization noise every other tensor in the file shows.
+//
+//     This one hides from every structural check — right names, right shapes,
+//     right counts, right dtypes — and from attention itself on the NoPE layers,
+//     because a permutation applied to BOTH q and k leaves q·k unchanged. It only
+//     bites where RoPE runs. Issue #359: the released 17 GB k-quant loaded, ran a
+//     forward, and emitted degenerate text rather than failing.
 //
 // ─── WHAT IS NOT ESTABLISHED ─────────────────────────────────────────────────
 // No e2e, no token-exact and NO SPEED claim of any kind. The pinned oracle

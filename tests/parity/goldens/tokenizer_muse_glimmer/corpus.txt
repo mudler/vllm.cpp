@@ -1,0 +1,85 @@
+# Tokenizer parity corpus for the GPT-4o / o200k pre-tokenizer ("llama4" GGUF
+# pre name), issue #347. One entry per line.
+# Format rules (implemented identically by tools/parity/dump_tokenizer.py,
+# tools/parity/verify_tokenizer_gguf.py and examples/tokenize/main.cpp):
+#   - Lines starting with '#' are comments and are skipped.
+#   - An empty line is an entry: the empty string.
+#   - Escapes: \n = LF, \r = CR, \t = TAB, \\ = backslash. Any other
+#     backslash sequence is an error (fail loud on typos).
+# Beyond the usual axes (ASCII prose, code, CJK, emoji, RTL, space and newline
+# runs, digit runs, special tokens mid-text, empty string) this corpus targets
+# what makes GPT-4o NOT kLlama3 and NOT kQwen2: CamelCase boundaries, the
+# contraction as a word SUFFIX, `/` in the punctuation-run tail, the minor
+# letter categories (Ll vs Lu/Lt vs Lm/Lo) and combining marks.
+#
+# --- ASCII prose ---
+The quick brown fox jumps over the lazy dog.
+Hello, world! This is a plain ASCII sentence with punctuation: commas, semicolons; and (parentheses).
+A
+Supercalifragilisticexpialidocious antidisestablishmentarianism
+# --- contractions (a SUFFIX of the word in this family, not its own token) ---
+don't we'll I'm they've he'd she's it'll
+DON'T WE'LL I'M THEY'VE HE'D SHE'S IT'LL
+Don't mix It's o'clock rock'n'roll can'tt 'standalone' 'S 'T 'RE
+I said "don't" and he said 'won't', y'all.
+It's a test, isn't it? We'd better not, y'all'd've.
+I don't think we'll be able to; it's o'clock and they've gone.
+# --- CamelCase / case boundaries (the two minor-category alternatives) ---
+MixedCase CamelCase snake_case SCREAMING_SNAKE kebab-case dotted.name
+XMLHttpRequest HTMLParser IOError getHTTPResponseCode NSURLSession
+aB Ba aBc AbC ABc abC MiXeD
+# --- numbers and long digit runs (grouped in threes) ---
+0 7 42 100 1000 12345 1234567890 000123 3.14159 -273.15 1e10 0x1F 1,234,567.89
+The year 2024 had 365 days and 8760 hours; pi is 3.14159265358979.
+# --- code with punctuation and paths (`/` joins the punct run's tail) ---
+def f(x): return [i**2 for i in range(x) if i % 2 == 0]
+path/to/file.txt ../relative/../path //double// /leading trailing/
+https://example.com/a/b?c=d&e=f#frag
+git diff --stat HEAD~1..HEAD -- src/vllm/tokenizer/*.cpp
+# a `/` right after a newline stays in the punctuation run's tail here
+a!\n/b
+x!\r\n/y
+end.\n/usr/bin/env python3
+hi!\n//comment\n/*block*/
+{"key": "value", "n": [1, 2, 3], "nested": {"a": null, "b": true}}
+#include <vector>\n\nint main() {\n\treturn 0;\n}\n
+# --- whitespace: leading, trailing, runs, tabs, newlines ---
+  leading spaces
+trailing spaces   
+a  b   c    d
+\tleading tab\tand\tinner tabs\t
+line one\nline two\r\nline three\n\n\nend
+ \n \n  x\n
+mixed \t \n \t space and newline run
+# --- CJK, Hangul, kana ---
+你好世界，这是一个测试。
+日本語のテキストです。カタカナとひらがなと漢字。
+한국어 텍스트입니다.
+中文ABC混排English你好World123
+# --- emoji, symbols ---
+🎉 party 👍 thumbs 🇮🇹 flag 👨‍👩‍👧‍👦 family
+math: ∑ ∫ √ ≈ ≠ ≤ π α β γ → ⇒ ∀ ∃
+currency: $100 €50 £25 ¥1000 ₹500
+# --- accented / decomposed / minor letter categories ---
+café résumé naïve façade Zürich Ångström
+éÉ Éé ÉÉé éée ÀÉÎÕÜ àéîõü
+é X́e ́abc word́ ́word decomposed (NFD) vs é precomposed (NFC)
+नमस्ते हिन्दी สวัสดี ไทย marks on base letters
+क्या हाल है? मैं ठीक हूँ। नमस्ते दोस्तों।
+ผมสบายดีครับ ขอบคุณมากครับ สวัสดีตอนเช้า
+ǅǄǆ ǇǈǉǊǋǌ titlecase digraphs
+ʰello ʲump modifier letters Aʰ Bʲ
+ЁЖЗ ёжз Привет мир МОСКВА москва
+ΑΒΓΔΕ αβγδε Ελληνικά
+# --- RTL ---
+مرحبا بالعالم هذا اختبار
+مرحباً كيف حالك؟ أنا بخير، شكراً لك.
+שלום עולם זהו מבחן
+# --- special / added tokens mid-text ---
+<|begin_of_text|>hello<|end_of_text|>
+prefix <|start|> role <|message|> content <|eot|> suffix
+<|image_start|><|image|><|patch|><|image_end|> and <|vid_start|><|video|><|vid_frame_separator|><|vid_end|>
+<|eom|> <|finetune_right_pad|> <|reserved_special_token_2047|>
+not a real token: <|not_a_token|> <| |> <|>
+# --- empty string ---
+

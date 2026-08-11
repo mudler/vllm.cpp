@@ -15,9 +15,11 @@
 //     CommitDevice) so the matmul/norm/silu chain can skip host
 //     download+reupload between ops. UnifiedMemory() remains false — the real
 //     hardware property.
-//   * `SupportsGraphCapture()` stays FALSE. tt_metal trace capture
-//     (begin_trace_capture/end_trace_capture/replay_trace) is the eventual
-//     mapping the spec already names; not implemented here.
+//   * `SupportsGraphCapture()` is TRUE: maps onto ttnn mesh-trace capture
+//     (begin_trace_capture / end_trace_capture / execute_trace) via free
+//     functions in tenstorrent_ops.cpp. Capture still requires fixed device
+//     buffers and a warmed program cache — same class of contract as CUDA
+//     graphs (see BeginCapture notes on the CUDA backend).
 //   * `UnifiedMemory()` is `false`: this is the real hardware property (a
 //     discrete card over PCIe), independent of this W0's host-staging
 //     implementation detail above. It also means op_provider.h's portable CPU
@@ -63,6 +65,15 @@ class TenstorrentBackend final : public Backend {
   // optional device shadow (ops TU) is the residency model; the CPU reference
   // tier stays gated off.
   bool UnifiedMemory() const override { return false; }
+
+  // ttnn mesh-trace capture — see Trace* in tenstorrent_device.h / ops.cpp.
+  bool SupportsGraphCapture() const override { return true; }
+  void BeginCapture(Queue&) override { TraceBeginCapture(); }
+  void EndCapture(Queue&) override { TraceEndCapture(); }
+  void Replay(Queue&) override { TraceReplay(); }
+  void* EndCaptureGraph(Queue&) override { return TraceEndCaptureGraph(); }
+  void ReplayGraph(Queue&, void* graph) override { TraceReplayGraph(graph); }
+  void DestroyGraph(void* graph) override { TraceDestroyGraph(graph); }
 };
 
 struct Registrar {

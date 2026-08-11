@@ -127,8 +127,30 @@ foreach(_f IN LISTS _NON_FA2_FEATURES)
   expect_feature("89" "${_f}" "")
   expect_feature("100a" "${_f}" "")    # (already asserted above; kept for locality)
   expect_feature("103a" "${_f}" "")
-  expect_feature("110" "${_f}" "")
+  # sm_110 is the ONE exception in this fan-out: `marlin-nvfp4` was built and
+  # validated on Thor silicon (see MARLIN NVFP4 SM110 below), so it is asserted
+  # separately and excluded here. Every OTHER fast path stays EMPTY for 110.
+  if(NOT _f STREQUAL "marlin-nvfp4")
+    expect_feature("110" "${_f}" "")
+  endif()
 endforeach()
+
+# --- MARLIN NVFP4 ON SM_110 (BACKEND-CUDA-SM110, issue #325). The vendored
+# Marlin slice needed no source change for Thor: every __CUDA_ARCH__ guard under
+# src/vt/cuda/marlin/ selects, for 1100, the same side an already-supported arch
+# selects. The cell gained `11.0` only after the kernel built (403/403), ran on
+# real sm_110 silicon and matched the incumbent vt::MatmulNvfp4 numerically.
+# Pinned here so the enablement cannot be silently reverted, and so the sm_12x
+# production resolution is proven byte-unchanged by the widened cell.
+expect_feature("110" "marlin-nvfp4" "110")
+expect_feature("121a" "marlin-nvfp4" "121a")
+expect_feature("120a" "marlin-nvfp4" "120a")
+expect_feature("120a;121a" "marlin-nvfp4" "120a;121a")
+# The widened cell must not leak onto the OTHER major-11 or cross-family
+# targets: `11.0` is a single exact arch, not a family claim.
+expect_feature("103a" "marlin-nvfp4" "")
+expect_feature("100a" "marlin-nvfp4" "")
+expect_feature("80" "marlin-nvfp4" "")
 
 # --- FA2 AMPERE ENABLEMENT (WA-1, BACKEND-CUDA-SM080/086/087/089 + COMP-FA).
 # The vendored FlashAttention-2 kernel bodies are `#if __CUDA_ARCH__ >= 800`

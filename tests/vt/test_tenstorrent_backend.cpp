@@ -1361,3 +1361,65 @@ TEST_CASE("kTENSTORRENT kPagedAttention pure-prefill matches host within BF16 en
   MESSAGE("pure-prefill max_abs vs host oracle: ", max_abs);
   CHECK(max_abs < 0.5f);
 }
+
+// ttnn mesh-trace capture: warm a matmul, capture it, replay, check BF16 envelope.
+// Program cache must be warm before BeginCapture (ttnn trace contract).
+TEST_CASE("kTENSTORRENT SupportsGraphCapture and matmul capture/replay") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  REQUIRE(backend.SupportsGraphCapture());
+
+  constexpr int64_t M = 32, K = 64, N = 32;
+  std::vector<float> ha(static_cast<size_t>(M * K), 0.1f);
+  std::vector<float> hb(static_cast<size_t>(K * N), 0.2f);
+  std::vector<float> hc(static_cast<size_t>(M * N), 0.0f);
+  for (size_t i = 0; i < ha.size(); ++i) ha[i] = static_cast<float>((i % 7) - 3) * 0.05f;
+  for (size_t i = 0; i < hb.size(); ++i) hb[i] = static_cast<float>((i % 5) - 2) * 0.04f;
+
+  void* ma = backend.Alloc(ha.size() * sizeof(float));
+  void* mb = backend.Alloc(hb.size() * sizeof(float));
+  void* mc = backend.Alloc(hc.size() * sizeof(float));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, ha.data(), ha.size() * sizeof(float));
+  backend.Copy(q, mb, hb.data(), hb.size() * sizeof(float));
+
+  Tensor ta = Tensor::Contiguous(ma, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {K, N});
+  Tensor tc = Tensor::Contiguous(mc, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+
+  auto mm = reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmul, DeviceType::kTENSTORRENT));
+  // Warm program cache (required before capture).
+  mm(q, tc, ta, tb);
+  backend.Copy(q, hc.data(), mc, hc.size() * sizeof(float));
+
+  // Capture the same matmul on the already-resident shadows.
+  backend.BeginCapture(q);
+  mm(q, tc, ta, tb);
+  backend.EndCapture(q);
+
+  // Replay several times — should not throw.
+  for (int i = 0; i < 3; ++i) backend.Replay(q);
+
+  std::vector<float> after(hc.size(), 0.0f);
+  backend.Copy(q, after.data(), mc, after.size() * sizeof(float));
+  float max_abs = 0.0f;
+  for (size_t i = 0; i < after.size(); ++i)
+    max_abs = std::max(max_abs, std::fabs(after[i] - hc[i]));
+  MESSAGE("trace replay max_abs vs warm: ", max_abs);
+  CHECK(max_abs < 1e-3f);
+
+  // Multi-graph handle API: capture again into an owned handle.
+  backend.BeginCapture(q);
+  mm(q, tc, ta, tb);
+  void* graph = backend.EndCaptureGraph(q);
+  REQUIRE(graph != nullptr);
+  backend.ReplayGraph(q, graph);
+  backend.DestroyGraph(graph);
+
+  backend.Free(ma);
+  backend.Free(mb);
+  backend.Free(mc);
+}

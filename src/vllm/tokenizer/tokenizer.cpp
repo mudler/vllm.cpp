@@ -32,6 +32,13 @@ constexpr const char* kClassicQwen2Regex =
 // numbers are \p{N} rather than \p{N}{1,3}.
 constexpr const char* kTekkenRegex =
     R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// GPT-4o / o200k (the "llama4" GGUF pre name). o200k_base pat_str VERBATIM --
+// i.e. kTekkenRegex with the two edits above put back: the contraction group
+// is present as a SUFFIX of both letter alternatives, and numbers are
+// \p{N}{1,3}. That last one is why this MUST be matched exactly and BEFORE the
+// `\p{N}{1,3}` heuristic below -- see the comment at that heuristic.
+constexpr const char* kGpt4oRegex =
+    R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 
 [[noreturn]] void Fail(const std::string& msg) {
   throw std::runtime_error("tokenizer: " + msg);
@@ -357,6 +364,16 @@ SplitPattern DetectPattern(const json& doc) {
   if (re == kQwen36Regex) return SplitPattern::kQwen2;
   if (re == kClassicQwen2Regex) return SplitPattern::kQwen2Classic;
   if (re == kTekkenRegex) return SplitPattern::kTekken;
+  // BOTH exact matches BEFORE the `\p{N}{1,3}` heuristic. kGpt4oRegex groups
+  // digits in threes as well, so the heuristic below claims it and hands back
+  // kLlama3 -- a split that tokenizes plausibly and WRONGLY (it never breaks
+  // CamelCase and it detaches every contraction). Muse Glimmer's HF
+  // tokenizer.json is exactly that shape, so this line is what stops the
+  // safetensors path from silently mistokenizing it. Issue #347.
+  // kTekkenRegex uses single-codepoint `\p{N}` and so was never at risk from
+  // the heuristic, but it is matched exactly for the same reason: recognition
+  // here is by whole pattern, never by a substring that a sibling shares.
+  if (re == kGpt4oRegex) return SplitPattern::kGpt4o;
   if (re.find(R"(\p{N}{1,3})") != std::string::npos) {
     return SplitPattern::kLlama3;
   }
@@ -738,6 +755,23 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
     tok.pattern_ = SplitPattern::kQwen2Classic;
   } else if (pre == "llama-bpe") {
     tok.pattern_ = SplitPattern::kLlama3;
+  } else if (pre == "gpt-4o" || pre == "llama4" || pre == "kanana2" ||
+             pre == "talkie") {
+    // The GPT-4o / o200k family. These are exactly the four pre names
+    // llama.cpp maps to LLAMA_VOCAB_PRE_TYPE_GPT4O (llama.cpp
+    // src/llama-vocab.cpp:2294-2299 @ 153d324bcf), and that pre-type carries
+    // its own regex, ported verbatim as SplitPattern::kGpt4o (see
+    // src/vllm/tokenizer/pretokenizer.cpp for the pattern and its provenance).
+    // It is NOT kLlama3 with different digit grouping: the word alternatives
+    // split CamelCase and swallow the contraction as a SUFFIX, so aliasing it
+    // would mistokenize ordinary English silently — the same reason "qwen2"
+    // above is refused rather than folded into "qwen35".
+    //
+    // llama.cpp also sets clean_spaces = false for this pre-type. That flag
+    // drives llama.cpp's own detokenizer space fixups, which our byte-level
+    // Decode() never performs, so "off" is already our behaviour and there is
+    // nothing to carry over.
+    tok.pattern_ = SplitPattern::kGpt4o;
   } else if (pre == "joyai-llm" || pre == "deepseek-llm" || pre == "deepseek-v3" ||
              pre == "laguna") {
     // Laguna-S-2.1 GGUFs tag pre="laguna"; the vocab is gpt2 byte-level BPE and
@@ -759,6 +793,11 @@ Tokenizer Tokenizer::FromGguf(const GgufFile& f) {
   // option, so it stays false. (HF Llama-3 sets ignore_merges=true; a
   // llama-bpe GGUF therefore matches llama.cpp, not HF, on the rare
   // pretokens where that flag matters. Irrelevant for the qwen2 family.)
+  // Muse Glimmer's HF tokenizer.json ("llama4" pre) also sets the flag.
+  // MEASURED rather than assumed on that checkpoint: encoding 29704 distinct
+  // vocab-derived strings plus a 320-string mixed corpus with ignore_merges on
+  // and off yields byte-identical ids in every case, so leaving it false here
+  // costs that vocab nothing.
 
   // Vocab: tokens[i] is the string for id i, already in the byte-mapped
   // alphabet (same convention as HF tokenizer.json). token_type says which

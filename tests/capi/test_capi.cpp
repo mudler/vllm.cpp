@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include <nlohmann/json.hpp>
 
 #include "capi/engine_handle.h"

@@ -1,10 +1,7 @@
 # sm_120 Qwen3.5 causal-conv residual — structured spike
 
 **Rows:** `KERNEL-SSM-MAMBA`, feeding `ROAD-V1-C2-LOCAL-BF16`.
-<<<<<<< HEAD
 **Issue:** [#206](https://github.com/mudler/vllm.cpp/issues/206) (landed by PR [#155](https://github.com/mudler/vllm.cpp/pull/155)).
-=======
->>>>>>> pr-266
 **Hardware/workload:** RTX 5070 Ti (`sm_120`), Qwen3.5-4B plain BF16,
 128 ShareGPT requests, 128 output tokens, concurrency 32,
 `max_num_batched_tokens=2048`, 1,280 KV blocks, greedy. **Lifecycle:**
@@ -141,7 +138,6 @@ and padded rows. A first serial-stripe arm 2 failed that matrix because stripe
 1 could overwrite the shared state before stripe 2 read its initial history;
 the accepted kernel preloads both stripes before processing either.
 
-<<<<<<< HEAD
 That preload NARROWS the window; it does not close it, and this spec should
 not be read as claiming otherwise. The underlying hazard is older and wider
 than arm 2: in the exact-chunk mapping only chunk 0 reads the initial
@@ -156,8 +152,6 @@ instruction ~0, not on any ordering guarantee. Tracked as its own bug rather
 than fixed silently here, since it is present on main independently of this
 row: [#305](https://github.com/mudler/vllm.cpp/issues/305).
 
-=======
->>>>>>> pr-266
 The first production profile series was VOID: the test targets had rebuilt the
 CUDA library but `vllm-bench` had not been relinked, and all three traces proved
 they still launched `CausalConv1dFwdRegKernel` at grid 64/registers 43. After

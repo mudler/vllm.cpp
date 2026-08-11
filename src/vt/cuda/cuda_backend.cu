@@ -116,6 +116,10 @@ class CudaBackend final : public Backend {
   // the branch it took before.
   bool SupportsCompressedConvState() const override { return true; }
 
+  // CheckGdnCommon's compressed-state clause used to name kCUDA directly; the
+  // capability query keeps CUDA on exactly the branch it took before.
+  bool SupportsCompressedGdnState() const override { return true; }
+
   // --- Async-output primitives (ENG-ASYNC-SCHED W3, async_utils.py:12-70) ------
   // Page-locked host memory the copy engine DMAs into without a staging bounce
   // (a pageable destination would force cudaMemcpyAsync to block), plus real

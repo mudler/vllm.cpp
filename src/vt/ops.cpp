@@ -1642,12 +1642,17 @@ void CheckGdnCommon(const Queue& q, const Tensor& out, const Tensor& q_in, const
   VT_CHECK(g.dtype == DType::kF32 && beta.dtype == DType::kF32,
            std::string(name) + ": g/beta must be f32 (upstream keeps them f32)");
   if (allow_compressed_state) {
+    // Asking the backend (Backend::SupportsCompressedGdnState) rather than
+    // naming a device — the same device-agnostic pattern CheckConvCommon
+    // already uses for the conv state. CUDA answers for its existing kernels;
+    // ROCm answers for the portable scan's f16/bf16 state arms.
+    const Backend* gdn_backend = TryGetBackend(q.device.type);
     VT_CHECK(state.dtype == DType::kF32 ||
-                 ((state.dtype == DType::kF16 ||
-                   state.dtype == DType::kBF16) &&
-                  q.device.type == DeviceType::kCUDA),
+                 ((state.dtype == DType::kF16 || state.dtype == DType::kBF16) &&
+                  gdn_backend != nullptr && gdn_backend->SupportsCompressedGdnState()),
              std::string(name) +
-                 ": state must be f32, or fp16/bf16 on CUDA (in/out, in place; "
+                 ": state must be f32, or fp16/bf16 on a backend whose GDN kernels "
+                 "support a compressed state in place (in/out, in place; "
                  "read/written in f32 registers)");
   } else {
     VT_CHECK(state.dtype == DType::kF32,

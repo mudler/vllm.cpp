@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/kv_offload/base.h"
 #include "vllm/v1/kv_offload/cache_identity.h"

@@ -303,6 +303,14 @@ std::optional<RequestOutput> AsyncLLM::get_output_nowait(
   return request.collector->get_nowait();
 }
 
+std::optional<RequestOutput> AsyncLLM::get_output_for(
+    const AsyncRequest& request, std::chrono::milliseconds timeout) {
+  if (request.collector == nullptr) {
+    throw std::invalid_argument("AsyncLLM request has no collector");
+  }
+  return request.collector->get_for(timeout);
+}
+
 RequestOutput AsyncLLM::generate(const std::string& prompt,
                                  SamplingParams params,
                                  const std::string& request_id, int priority) {

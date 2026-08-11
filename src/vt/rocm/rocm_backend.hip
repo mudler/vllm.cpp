@@ -238,6 +238,14 @@ class RocmBackend final : public Backend {
   //      host access is guaranteed by construction. This is the route
   //      XNACK-less RDNA3 APUs take, where ground 1 reads false (issue #41 F6).
   // Probed, never inferred from the gfx name.
+  // The GDN conv-update and scan kernels registered for this backend carry
+  // bf16/f16 state arms (f32 register math, boundary conversion), so both
+  // compressed-state capabilities answer true. Validated on gfx1100 against
+  // the f32 oracle before advertisement (the M2 e2e run exercises the bf16
+  // mamba_cache_dtype path end to end).
+  bool SupportsCompressedConvState() const override { return true; }
+  bool SupportsCompressedGdnState() const override { return true; }
+
   bool UnifiedMemory() const override { return unified_memory_; }
 
  private:

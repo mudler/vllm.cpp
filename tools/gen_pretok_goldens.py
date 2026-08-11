@@ -6,10 +6,10 @@ huggingface/tokenizers (Rust onig engine) and emits the resulting pieces as a
 C++ table. The C++ scanner in pretokenizer.cpp must reproduce these pieces
 byte-for-byte.
 
-Usage (needs the `tokenizers` package; the vllm-oracle venv on dgx has it):
-  scp tools/gen_pretok_goldens.py dgx.casa:/tmp/ && \
-  ssh dgx.casa '~/venvs/vllm-oracle/bin/python /tmp/gen_pretok_goldens.py' \
-    > tests/vllm/pretokenizer_goldens.inc
+Usage (needs the `tokenizers` package; the vllm-oracle venv on dgx has it, and
+any host with `pip install tokenizers` will do — the regexes are literals here,
+no checkpoint is read):
+  python3 tools/gen_pretok_goldens.py > tests/vllm/pretokenizer_goldens.inc
 """
 
 import random
@@ -50,6 +50,20 @@ TEKKEN = (
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
     r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
     r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+# GPT-4o / o200k family (llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O; GGUF pre names
+# "gpt-4o", "llama4", "kanana2", "talkie"). VERBATIM from
+# /mnt/nas_share/checkpoints/muse-glimmer-30b/tokenizer.json
+# (pre_tokenizer.pretokenizers[0].pattern.Regex, read 2026-08-11) — byte-equal
+# to the string llama.cpp records as "original regex from tokenizer.json" at
+# src/llama-vocab.cpp:432 @ 153d324bcf.
+GPT4O = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
 
 DETERMINISTIC = [
@@ -121,6 +135,30 @@ DETERMINISTIC = [
     "!!\n/b",
     "a.\n//y",
     "x!\n/",
+    # GPT-4o-specific structure (each of these separates it from kLlama3):
+    "abcDEF HTMLParser camelCaseWord",   # lower->upper splits, upper run does not
+    "don't DON'T It's o'clock",          # contraction is a word SUFFIX here
+    "path/to/file.txt a//b !/x",         # `/` in the punct-run tail
+    "a!\n/b  x!\r\n/y  end.\n/usr/bin",   # `/` AFTER a newline: tail-only case
+    "\u00e9\u00c9 \u00c9\u00e9 \u00c9\u00c9\u00e9 caf\u00e9",  # Ll/Lu boundaries
+    "e\u0301X X\u0301e \u0301abc",         # combining marks are in BOTH classes
+    "\u02b0ello A\u02b0B",                # Lm sits in both classes
+    "\u01c5\u01c4\u01c6 \u01c4x",             # Lt (title case) is in A only
+    "'s 'S x's X'S ' 's",                # apostrophe with no preceding word
+    "\u4f60\u597dABC\u4f60\u597d",             # Lo neighbours a Lu run
+    # \p{M} INSIDE the UPPER letter class (issue #369). Both kTekken and
+    # kGpt4o put marks in BOTH letter classes, but nothing above could tell:
+    # with a LOWERCASE base
+    # ("e\u0301X", "word\u0301") the mark is absorbed by the lower class and the
+    # upper class's \p{M} branch never decides anything. It takes an UPPERCASE
+    # base, a combining mark, and then MORE upper/caseless letters -- the mark
+    # has to keep the upper run alive across itself. Found by mutation: dropping
+    # \p{M} from the upper class left every other row in this file byte-identical
+    # and every gate green, while changing the split on 1957 of 36104 fuzz
+    # inputs. These rows are what makes that mutant die.
+    "A\u0301Aa A\u0301A\u0301 A\u0301\u0308B",
+    "\u00c9CHO A\u0301\u0359\u01c5x",
+    "HTM\u0139Parser",
 ]
 
 ASCII_POOL = (
@@ -163,6 +201,7 @@ def main() -> None:
     qwen = Split(Regex(QWEN), behavior="isolated", invert=False)
     llama = Split(Regex(LLAMA3), behavior="isolated", invert=False)
     tekken = Split(Regex(TEKKEN), behavior="isolated", invert=False)
+    gpt4o = Split(Regex(GPT4O), behavior="isolated", invert=False)
     cases = DETERMINISTIC + random_strings(seed=42, count=60)
 
     w = sys.stdout.write
@@ -179,6 +218,7 @@ def main() -> None:
         q = pieces(qwen, s)
         l = pieces(llama, s)
         t = pieces(tekken, s)
+        g = pieces(gpt4o, s)
         # rstrip: a trailing backslash in a // comment splices lines (GCC even
         # splices across "backslash then whitespace then newline").
         w("  {  // %s\n" % ascii(s)[1:-1][:90].rstrip("\\ "))
@@ -186,6 +226,7 @@ def main() -> None:
         w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in q))
         w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in l))
         w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in t))
+        w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in g))
         w("  },\n")
     w("};\n")
     w("// clang-format on\n")

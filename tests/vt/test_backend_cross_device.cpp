@@ -1064,6 +1064,921 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
 // registered unified devices (Metal M4, GB10 CUDA/Vulkan) the pointer is
 // host-accessible, so the fallback runs. On a plain CPU build there is no non-CPU
 // device and the case is inert.
+// i32 device buffer (state_idx / query_start_loc / has_initial_state /
+// conv_state_indices). Same staging discipline as DevBuf.
+class DevBufI32 {
+ public:
+  DevBufI32(vt::Backend& b, Queue& q, size_t n) : b_(b), q_(q), n_(n) {
+    ptr_ = b_.Alloc(n * sizeof(int32_t));
+  }
+  ~DevBufI32() { b_.Free(ptr_); }
+  DevBufI32(const DevBufI32&) = delete;
+  DevBufI32& operator=(const DevBufI32&) = delete;
+  void Upload(const std::vector<int32_t>& src) {
+    REQUIRE(src.size() == n_);
+    b_.Copy(q_, ptr_, src.data(), n_ * sizeof(int32_t));
+  }
+  void* ptr() const { return ptr_; }
+
+ private:
+  vt::Backend& b_;
+  Queue& q_;
+  size_t n_;
+  void* ptr_ = nullptr;
+};
+
+// Byte-addressed device buffer for i8 masks (has_initial_state) and u16 bf16
+// cache contents (sized in ELEMENTS of the templated width).
+class DevBufBytes {
+ public:
+  DevBufBytes(vt::Backend& b, Queue& q, size_t nbytes) : b_(b), q_(q), n_(nbytes) {
+    ptr_ = b_.Alloc(nbytes);
+  }
+  ~DevBufBytes() { b_.Free(ptr_); }
+  DevBufBytes(const DevBufBytes&) = delete;
+  DevBufBytes& operator=(const DevBufBytes&) = delete;
+  void Upload(const void* src) { b_.Copy(q_, ptr_, src, n_); }
+  void Download(void* dst) {
+    b_.Synchronize(q_);
+    b_.Copy(q_, dst, ptr_, n_);
+    b_.Synchronize(q_);
+  }
+  void* ptr() const { return ptr_; }
+
+ private:
+  vt::Backend& b_;
+  Queue& q_;
+  size_t n_;
+  void* ptr_ = nullptr;
+};
+
+// f32 -> bf16 bits through the CPU backend's own cast op, so the test never
+// reimplements the codec it is comparing against.
+std::vector<uint16_t> Bf16Bits(const std::vector<float>& src) {
+  vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+  Queue cq = cpu.CreateQueue();
+  const Device cd{DeviceType::kCPU, 0};
+  std::vector<float> in = src;
+  std::vector<uint16_t> out(src.size(), 0);
+  Tensor tin = T1(in.data(), cd, static_cast<int64_t>(in.size()));
+  Tensor tout = Tensor::Contiguous(out.data(), DType::kBF16, cd,
+                                   {static_cast<int64_t>(out.size())});
+  vt::CastBf16(cq, tout, tin);
+  cpu.DestroyQueue(cq);
+  return out;
+}
+
+// Rank-3 padded-row view [T, H, D] over a [T, row_stride] f32 buffer — the
+// merged-qkvz slice shape the GDN/attention glue ops consume in the model.
+Tensor T3PaddedF32(void* p, Device d, int64_t t, int64_t h, int64_t w,
+                   int64_t row_stride) {
+  Tensor t3 = Tensor::Contiguous(p, DType::kF32, d, {t, h, w});
+  t3.stride[0] = row_stride;
+  return t3;
+}
+
+
+// --- GDN cases (BACKEND-ROCM-GDN-KERNELS) -------------------------------------
+
+TEST_CASE("GDN state gather/scatter are BIT-EXACT against the CPU oracle") {
+  // Indexed data movement between an f32 working set and a persistent cache:
+  // no arithmetic anywhere, so the bar is byte equality — including the bf16
+  // cache arm, where both sides apply the same RNE round at the boundary.
+  // Covers the uniform layout (cache_inner == work_inner), the spec-widened
+  // layout (leading work_inner cols per channel at the physical stride), the
+  // has_initial_state mask in i8/i32/absent forms, and scatter's untouched-row
+  // preservation.
+  const int64_t S = 8, R = 4, mid = 4, w_in = 6, c_in = 8;  // c_in>w_in: widened
+  for (bool widened : {false, true}) {
+    const int64_t cache_inner = widened ? c_in : w_in;
+    CAPTURE(widened);
+    const size_t cache_n = static_cast<size_t>(S * mid * cache_inner);
+    const size_t work_n = static_cast<size_t>(R * mid * w_in);
+    const std::vector<float> cache_f = RandomVec(cache_n, 910);
+    const std::vector<uint16_t> cache_bf = Bf16Bits(cache_f);
+    const std::vector<int32_t> idx = {1, 0, 7, 6};  // unique slots
+    const std::vector<int32_t> has32 = {1, 0, 1, 0};
+    const std::vector<int8_t> has8 = {1, 0, 1, 0};
+
+    for (int arm = 0; arm < 2; ++arm) {  // 0 = f32 cache, 1 = bf16 cache
+      CAPTURE(arm);
+      for (int has = 0; has < 3; ++has) {  // 0 = absent, 1 = i8, 2 = i32
+        CAPTURE(has);
+        // ---- CPU oracle: gather, then scatter the gathered rows back.
+        std::vector<float> ref_work(work_n, -1.0f);
+        std::vector<float> ref_cache_f = cache_f;
+        std::vector<uint16_t> ref_cache_bf = cache_bf;
+        std::vector<int32_t> ci = idx, ch32 = has32;
+        std::vector<int8_t> ch8 = has8;
+        {
+          vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+          Queue cq = cpu.CreateQueue();
+          const Device cd{DeviceType::kCPU, 0};
+          Tensor tidx = TI32(ci.data(), cd, R);
+          Tensor th8 = Tensor::Contiguous(ch8.data(), DType::kI8, cd, {R});
+          Tensor th32 = TI32(ch32.data(), cd, R);
+          Tensor tw = Tensor::Contiguous(ref_work.data(), DType::kF32, cd, {R, mid, w_in});
+          const Tensor* ph = has == 1 ? static_cast<const Tensor*>(&th8)
+                             : has == 2 ? static_cast<const Tensor*>(&th32)
+                                        : nullptr;
+          if (arm == 0) {
+            Tensor tc = Tensor::Contiguous(ref_cache_f.data(), DType::kF32, cd,
+                                           {S, mid, cache_inner});
+            vt::GdnStateGather(cq, tw, tc, tidx, ph);
+            vt::GdnStateScatter(cq, tc, tw, tidx);
+          } else {
+            Tensor tc = Tensor::Contiguous(ref_cache_bf.data(), DType::kBF16, cd,
+                                           {S, mid, cache_inner});
+            vt::GdnStateGather(cq, tw, tc, tidx, ph);
+            vt::GdnStateScatter(cq, tc, tw, tidx);
+          }
+          cpu.DestroyQueue(cq);
+        }
+
+        for (DeviceType dt : RegisteredDevices()) {
+          if (!OpAvailable(vt::OpId::kGdnStateGather, dt) ||
+              !OpAvailable(vt::OpId::kGdnStateScatter, dt))
+            continue;
+          CAPTURE(DeviceName(dt));
+          vt::Backend& dev = vt::GetBackend(dt);
+          Queue q = dev.CreateQueue();
+          const Device d{dt, 0};
+          DevBuf dwork(dev, q, work_n);
+          DevBufI32 didx(dev, q, R), dhas32(dev, q, R);
+          DevBufBytes dhas8(dev, q, R);
+          didx.Upload(idx);
+          dhas32.Upload(has32);
+          dhas8.Upload(has8.data());
+          Tensor tidx = TI32(didx.ptr(), d, R);
+          Tensor th8 = Tensor::Contiguous(dhas8.ptr(), DType::kI8, d, {R});
+          Tensor th32 = TI32(dhas32.ptr(), d, R);
+          Tensor tw = Tensor::Contiguous(dwork.ptr(), DType::kF32, d, {R, mid, w_in});
+          const Tensor* ph = has == 1 ? &th8 : has == 2 ? &th32 : nullptr;
+
+          const size_t cache_bytes = cache_n * (arm == 0 ? 4 : 2);
+          DevBufBytes dcache(dev, q, cache_bytes);
+          dcache.Upload(arm == 0 ? static_cast<const void*>(cache_f.data())
+                                 : static_cast<const void*>(cache_bf.data()));
+          Tensor tc = Tensor::Contiguous(dcache.ptr(),
+                                         arm == 0 ? DType::kF32 : DType::kBF16, d,
+                                         {S, mid, cache_inner});
+          vt::GdnStateGather(q, tw, tc, tidx, ph);
+          CHECK(dwork.Download() == ref_work);  // gather: bit-exact
+          vt::GdnStateScatter(q, tc, tw, tidx);
+          if (arm == 0) {
+            std::vector<float> got(cache_n);
+            dcache.Download(got.data());
+            CHECK(got == ref_cache_f);  // scatter round-trip: bit-exact
+          } else {
+            std::vector<uint16_t> got(cache_n);
+            dcache.Download(got.data());
+            CHECK(got == ref_cache_bf);
+          }
+          dev.DestroyQueue(q);
+        }
+      }
+    }
+  }
+}
+
+
+TEST_CASE("causal conv1d fwd/update match the CPU oracle") {
+  // §2/§3 of gdn-semantics.md. Outputs are arithmetic (silu epilogue) -> NMSE;
+  // the conv_state write-back/roll moves RAW x values -> bit-exact.
+  const int64_t C = 24, K = 4, W = K - 1;
+  const std::vector<int32_t> qsl = {0, 5, 6, 15};  // 3 seqs: lens 5, 1, 9
+  const std::vector<int32_t> has = {1, 0, 1};
+  const int64_t T = 15, N = 3;
+  const size_t xn = static_cast<size_t>(T * C), wn = static_cast<size_t>(C * K);
+  const std::vector<float> x = RandomVec(xn, 811);
+  const std::vector<float> w = RandomVec(wn, 812, -0.5f, 0.5f);
+  const std::vector<float> bias = RandomVec(static_cast<size_t>(C), 813, -0.2f, 0.2f);
+  const std::vector<float> st0 = RandomVec(static_cast<size_t>(N * C * W), 814, -0.5f, 0.5f);
+
+  // CPU oracle (fwd).
+  std::vector<float> ref_out(xn, 0.0f), ref_state = st0;
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cx = x, cw = w, cb = bias;
+    std::vector<int32_t> cqsl = qsl, chas = has;
+    Tensor tx = T2(cx.data(), cd, T, C);
+    Tensor tw = T2(cw.data(), cd, C, K);
+    Tensor tb = T1(cb.data(), cd, C);
+    Tensor tst = Tensor::Contiguous(ref_state.data(), DType::kF32, cd, {N, C, W});
+    Tensor tqsl = TI32(cqsl.data(), cd, N + 1);
+    Tensor this_ = TI32(chas.data(), cd, N);
+    Tensor tout = T2(ref_out.data(), cd, T, C);
+    vt::CausalConv1dFwd(cq, tout, tx, tw, &tb, tst, tqsl, this_, vt::CausalConv1dArgs{});
+    cpu.DestroyQueue(cq);
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kCausalConv1dFwd, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dx(dev, q, xn), dw(dev, q, wn), db(dev, q, static_cast<size_t>(C)),
+        dout(dev, q, xn), dst(dev, q, static_cast<size_t>(N * C * W));
+    DevBufI32 dqsl(dev, q, N + 1), dhas(dev, q, N);
+    dx.Upload(x);
+    dw.Upload(w);
+    db.Upload(bias);
+    dst.Upload(st0);
+    dqsl.Upload(qsl);
+    dhas.Upload(has);
+    Tensor tx = T2(dx.ptr(), d, T, C);
+    Tensor tw = T2(dw.ptr(), d, C, K);
+    Tensor tb = T1(db.ptr(), d, C);
+    Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {N, C, W});
+    Tensor tqsl = TI32(dqsl.ptr(), d, N + 1);
+    Tensor this_ = TI32(dhas.ptr(), d, N);
+    Tensor tout = T2(dout.ptr(), d, T, C);
+    vt::CausalConv1dFwd(q, tout, tx, tw, &tb, tst, tqsl, this_, vt::CausalConv1dArgs{});
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+    CHECK(dst.Download() == ref_state);  // raw-x write-back: bit-exact
+
+    // Exact-chunks descriptor form (VT_CONV_EXACT_CHUNKS — the shape Qwen3.5
+    // prefill actually passes on the live path): one program per (sequence,
+    // 8-token chunk). lens 5,1,9 -> programs (s0,c0), (s1,c0), (s2,c0),
+    // (s2,c1). Must equal the same CPU oracle (the CPU keeps the scalar
+    // mapping; the descriptors only re-slice the work).
+    const std::vector<int32_t> batch_ptr = {0, 1, 2, 2};
+    const std::vector<int32_t> chunk_off = {0, 0, 0, 1};
+    DevBufI32 dbp(dev, q, batch_ptr.size()), dtco(dev, q, chunk_off.size());
+    dbp.Upload(batch_ptr);
+    dtco.Upload(chunk_off);
+    dst.Upload(st0);  // reset state for the descriptor run
+    Tensor tbp = TI32(dbp.ptr(), d, static_cast<int64_t>(batch_ptr.size()));
+    Tensor ttco = TI32(dtco.ptr(), d, static_cast<int64_t>(chunk_off.size()));
+    vt::CausalConv1dArgs exact_args;
+    exact_args.batch_ptr = &tbp;
+    exact_args.token_chunk_offset_ptr = &ttco;
+    vt::CausalConv1dFwd(q, tout, tx, tw, &tb, tst, tqsl, this_, exact_args);
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+    CHECK(dst.Download() == ref_state);  // descriptor write-back: bit-exact
+    dev.DestroyQueue(q);
+  }
+
+  // Update: B=4 tokens. Compact arm: conv_state [B,C,W] (one row per token,
+  // per the ops.cpp contract). Indexed arm: the full [SLOTS,C,W] cache with one
+  // NULL slot (-1 -> out row untouched).
+  const int64_t B = 4, SLOTS = 6;
+  const size_t un = static_cast<size_t>(B * C);
+  const std::vector<int32_t> cidx = {3, -1, 0, 5};
+  const std::vector<float> ux = RandomVec(un, 821);
+  const std::vector<float> ust0 = RandomVec(static_cast<size_t>(SLOTS * C * W), 822, -0.5f, 0.5f);
+  for (bool indexed : {false, true}) {
+    CAPTURE(indexed);
+    const int64_t st_rows = indexed ? SLOTS : B;
+    const std::vector<float> ust_arm(ust0.begin(), ust0.begin() + st_rows * C * W);
+    // CPU oracle.
+    std::vector<float> ref_uout(un, -2.0f), ref_ust = ust_arm;
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> cx = ux, cw = w, cb = bias;
+      std::vector<int32_t> cci = cidx;
+      Tensor tx = T2(cx.data(), cd, B, C);
+      Tensor tw = T2(cw.data(), cd, C, K);
+      Tensor tb = T1(cb.data(), cd, C);
+      Tensor tst = Tensor::Contiguous(ref_ust.data(), DType::kF32, cd, {st_rows, C, W});
+      Tensor tci = TI32(cci.data(), cd, B);
+      Tensor tout = T2(ref_uout.data(), cd, B, C);
+      vt::CausalConv1dUpdate(cq, tout, tx, tw, &tb, tst, vt::CausalConv1dArgs{},
+                             indexed ? &tci : nullptr);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kCausalConv1dUpdate, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dx(dev, q, un), dw(dev, q, wn), db(dev, q, static_cast<size_t>(C)),
+          dout(dev, q, un), dst(dev, q, static_cast<size_t>(st_rows * C * W));
+      DevBufI32 dci(dev, q, B);
+      dx.Upload(ux);
+      dw.Upload(w);
+      db.Upload(bias);
+      dst.Upload(ust_arm);
+      dci.Upload(cidx);
+      // Untouched-row sentinel must match the oracle's initial -2 fill.
+      dout.Upload(std::vector<float>(un, -2.0f));
+      Tensor tx = T2(dx.ptr(), d, B, C);
+      Tensor tw = T2(dw.ptr(), d, C, K);
+      Tensor tb = T1(db.ptr(), d, C);
+      Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {st_rows, C, W});
+      Tensor tci = TI32(dci.ptr(), d, B);
+      Tensor tout = T2(dout.ptr(), d, B, C);
+      vt::CausalConv1dUpdate(q, tout, tx, tw, &tb, tst, vt::CausalConv1dArgs{},
+                             indexed ? &tci : nullptr);
+      CHECK(Nmse(ref_uout, dout.Download()) <= kNmseTol);
+      CHECK(dst.Download() == ref_ust);  // roll: bit-exact
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+
+TEST_CASE("GdnPostConv matches the CPU oracle within NMSE <= 5e-4") {
+  // The fused post-conv glue (the VT_GLUE_FUSE path the model calls by
+  // default): conv-split + q/k l2norm + g/beta in one launch, with padded a/b
+  // row strides. All arithmetic: NMSE.
+  const int64_t T = 4, HK = 2, DK = 16, HV = 4, DV = 24;
+  const int64_t key_dim = HK * DK, value_dim = HV * DV;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t a_outer = HV + 3, b_outer = HV + 5;
+  const std::vector<float> conv = RandomVec(static_cast<size_t>(T * conv_dim), 871, -0.5f, 0.5f);
+  const std::vector<float> araw = RandomVec(static_cast<size_t>(T * a_outer), 872, -0.4f, 0.4f);
+  const std::vector<float> braw = RandomVec(static_cast<size_t>(T * b_outer), 873, -0.4f, 0.4f);
+  const std::vector<float> a_log = RandomVec(static_cast<size_t>(HV), 874, -2.0f, -0.5f);
+  const std::vector<float> dt_bias = RandomVec(static_cast<size_t>(HV), 875, -0.1f, 0.1f);
+  vt::L2NormArgs l2a;
+  l2a.eps = 1e-6f;
+
+  std::vector<float> ref_q(static_cast<size_t>(T * key_dim)),
+      ref_k(static_cast<size_t>(T * key_dim)), ref_v(static_cast<size_t>(T * value_dim)),
+      ref_g(static_cast<size_t>(T * HV)), ref_b(static_cast<size_t>(T * HV));
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cc = conv, ca = araw, cb = braw, cal = a_log, cdt = dt_bias;
+    // araw/braw reach the op as padded [T, HV] rank-2 views (row stride honored).
+    auto Make = [](void* p, Device dd, std::initializer_list<int64_t> s) {
+      return Tensor::Contiguous(p, DType::kF32, dd, s);
+    };
+    Tensor tq = Make(ref_q.data(), cd, {T, HK, DK});
+    Tensor tk = Make(ref_k.data(), cd, {T, HK, DK});
+    Tensor tv = Make(ref_v.data(), cd, {T, HV, DV});
+    Tensor tg = Make(ref_g.data(), cd, {T, HV});
+    Tensor tb = Make(ref_b.data(), cd, {T, HV});
+    Tensor tc = Make(cc.data(), cd, {T, conv_dim});
+    Tensor ta = Make(ca.data(), cd, {T, a_outer});  // logical HV cols, padded row
+    ta.shape[1] = HV;  // view narrows the row; stride[0] stays a_outer
+    Tensor tb2 = Make(cb.data(), cd, {T, b_outer});
+    tb2.shape[1] = HV;
+    Tensor tal = Make(cal.data(), cd, {HV});
+    Tensor tdt = Make(cdt.data(), cd, {HV});
+    vt::GdnPostConv(cq, tq, tk, tv, tg, tb, tc, ta, tb2, tal, tdt, l2a);
+    cpu.DestroyQueue(cq);
+  }
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kGdnPostConv, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dq(dev, q, ref_q.size()), dk(dev, q, ref_k.size()), dv(dev, q, ref_v.size()),
+        dg(dev, q, ref_g.size()), db(dev, q, ref_b.size()), dc(dev, q, conv.size()),
+        da(dev, q, araw.size()), db2(dev, q, braw.size()), dal(dev, q, HV),
+        ddt(dev, q, HV);
+    dq.Upload(std::vector<float>(ref_q.size(), 0.0f));
+    dc.Upload(conv);
+    da.Upload(araw);
+    db2.Upload(braw);
+    dal.Upload(a_log);
+    ddt.Upload(dt_bias);
+    auto Make = [&](void* p, std::initializer_list<int64_t> s) {
+      return Tensor::Contiguous(p, DType::kF32, d, s);
+    };
+    Tensor tq = Make(dq.ptr(), {T, HK, DK});
+    Tensor tk = Make(dk.ptr(), {T, HK, DK});
+    Tensor tv = Make(dv.ptr(), {T, HV, DV});
+    Tensor tg = Make(dg.ptr(), {T, HV});
+    Tensor tb = Make(db.ptr(), {T, HV});
+    Tensor tc = Make(dc.ptr(), {T, conv_dim});
+    Tensor ta = Make(da.ptr(), {T, a_outer});
+    ta.shape[1] = HV;
+    ta.stride[0] = a_outer;
+    Tensor tb2 = Make(db2.ptr(), {T, b_outer});
+    tb2.shape[1] = HV;
+    tb2.stride[0] = b_outer;
+    Tensor tal = Make(dal.ptr(), {HV});
+    Tensor tdt = Make(ddt.ptr(), {HV});
+    vt::GdnPostConv(q, tq, tk, tv, tg, tb, tc, ta, tb2, tal, tdt, l2a);
+    CHECK(Nmse(ref_q, dq.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_k, dk.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_v, dv.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_g, dg.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_b, db.Download()) <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+}
+
+TEST_CASE("GDN prefill/decode recurrence matches the CPU oracle within NMSE <= 5e-4") {
+  // §7/§8. All f32. NMSE on out AND on the in-place state (the recurrence is
+  // arithmetic end to end). Decode covers the compact arm, the indexed arm,
+  // and the NULL-slot zero-out.
+  const int64_t HK = 2, HV = 4, DK = 16, DV = 24;  // HV = ratio*HK
+  const float scale = 0.25f;
+  vt::GdnArgs ga;
+  ga.scale = scale;
+
+  // ---- prefill: two sequences, lens 4 and 1, fresh zero state.
+  const std::vector<int32_t> qsl = {0, 4, 5};
+  const int64_t N = 2, T = 5;
+  const size_t qkn = static_cast<size_t>(T * HK * DK), vn = static_cast<size_t>(T * HV * DV);
+  const size_t gbn = static_cast<size_t>(T * HV), stn = static_cast<size_t>(N * HV * DV * DK);
+  const std::vector<float> qin = RandomVec(qkn, 851, -0.5f, 0.5f);
+  const std::vector<float> kin = RandomVec(qkn, 852, -0.5f, 0.5f);
+  const std::vector<float> vin = RandomVec(vn, 853, -0.5f, 0.5f);
+  const std::vector<float> gin = RandomVec(gbn, 854, -0.3f, -0.01f);  // log-decay < 0
+  const std::vector<float> bin = RandomVec(gbn, 855, 0.0f, 0.5f);
+
+  std::vector<float> ref_out(vn, 0.0f), ref_st(stn, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> hq = qin, hk_ = kin, hv_ = vin, hg = gin, hb = bin;
+    std::vector<int32_t> cqsl = qsl;
+    Tensor tq = Tensor::Contiguous(hq.data(), DType::kF32, cd, {T, HK, DK});
+    Tensor tk = Tensor::Contiguous(hk_.data(), DType::kF32, cd, {T, HK, DK});
+    Tensor tv = Tensor::Contiguous(hv_.data(), DType::kF32, cd, {T, HV, DV});
+    Tensor tg = T2(hg.data(), cd, T, HV);
+    Tensor tb = T2(hb.data(), cd, T, HV);
+    Tensor tst = Tensor::Contiguous(ref_st.data(), DType::kF32, cd, {N, HV, DV, DK});
+    Tensor tqsl = TI32(cqsl.data(), cd, N + 1);
+    Tensor tout = Tensor::Contiguous(ref_out.data(), DType::kF32, cd, {T, HV, DV});
+    vt::GdnPrefill(cq, tout, tq, tk, tv, tg, tb, tst, tqsl, ga);
+    cpu.DestroyQueue(cq);
+  }
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kGdnPrefill, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dq(dev, q, qkn), dk(dev, q, qkn), dv(dev, q, vn), dg(dev, q, gbn),
+        db(dev, q, gbn), dout(dev, q, vn), dst(dev, q, stn);
+    DevBufI32 dqsl(dev, q, N + 1);
+    dq.Upload(qin);
+    dk.Upload(kin);
+    dv.Upload(vin);
+    dg.Upload(gin);
+    db.Upload(bin);
+    dst.Upload(std::vector<float>(stn, 0.0f));
+    dqsl.Upload(qsl);
+    Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {T, HK, DK});
+    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {T, HK, DK});
+    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {T, HV, DV});
+    Tensor tg = T2(dg.ptr(), d, T, HV);
+    Tensor tb = T2(db.ptr(), d, T, HV);
+    Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {N, HV, DV, DK});
+    Tensor tqsl = TI32(dqsl.ptr(), d, N + 1);
+    Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, HV, DV});
+    vt::GdnPrefill(q, tout, tq, tk, tv, tg, tb, tst, tqsl, ga);
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_st, dst.Download()) <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+
+  // ---- decode: B=3 tokens over a 4-slot cache; slot -1 => zero out row,
+  // state untouched. Compact arm (no indices) alongside.
+  const int64_t B = 3, SLOTS = 4;
+  const size_t dqkn = static_cast<size_t>(B * HK * DK), dvn = static_cast<size_t>(B * HV * DV);
+  const size_t dgbn = static_cast<size_t>(B * HV);
+  const std::vector<int32_t> sidx = {2, -1, 0};
+  const std::vector<float> dq_in = RandomVec(dqkn, 861, -0.5f, 0.5f);
+  const std::vector<float> dk_in = RandomVec(dqkn, 862, -0.5f, 0.5f);
+  const std::vector<float> dv_in = RandomVec(dvn, 863, -0.5f, 0.5f);
+  const std::vector<float> dg_in = RandomVec(dgbn, 864, -0.3f, -0.01f);
+  const std::vector<float> db_in = RandomVec(dgbn, 865, 0.0f, 0.5f);
+  const size_t dstn = static_cast<size_t>(SLOTS * HV * DV * DK);
+  const std::vector<float> dst0 = RandomVec(dstn, 866, -0.4f, 0.4f);
+  for (bool indexed : {false, true}) {
+    CAPTURE(indexed);
+    const int64_t st_rows = indexed ? SLOTS : B;
+    const std::vector<float> dst_arm(dst0.begin(), dst0.begin() + st_rows * HV * DV * DK);
+    std::vector<float> ref_dout(dvn, -7.0f), ref_dst = dst_arm;
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> hq = dq_in, hk_ = dk_in, hv_ = dv_in, hg = dg_in, hb = db_in;
+      std::vector<int32_t> csi = sidx;
+      Tensor tq = Tensor::Contiguous(hq.data(), DType::kF32, cd, {B, HK, DK});
+      Tensor tk = Tensor::Contiguous(hk_.data(), DType::kF32, cd, {B, HK, DK});
+      Tensor tv = Tensor::Contiguous(hv_.data(), DType::kF32, cd, {B, HV, DV});
+      Tensor tg = T2(hg.data(), cd, B, HV);
+      Tensor tb = T2(hb.data(), cd, B, HV);
+      Tensor tst = Tensor::Contiguous(ref_dst.data(), DType::kF32, cd, {st_rows, HV, DV, DK});
+      Tensor tsi = TI32(csi.data(), cd, B);
+      Tensor tout = Tensor::Contiguous(ref_dout.data(), DType::kF32, cd, {B, HV, DV});
+      vt::GdnDecode(cq, tout, tq, tk, tv, tg, tb, tst, ga, indexed ? &tsi : nullptr);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kGdnDecode, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dq(dev, q, dqkn), dk(dev, q, dqkn), dv(dev, q, dvn), dg(dev, q, dgbn),
+          db(dev, q, dgbn), dout(dev, q, dvn), dst(dev, q, static_cast<size_t>(st_rows * HV * DV * DK));
+      DevBufI32 dsi(dev, q, B);
+      dq.Upload(dq_in);
+      dk.Upload(dk_in);
+      dv.Upload(dv_in);
+      dg.Upload(dg_in);
+      db.Upload(db_in);
+      dst.Upload(dst_arm);
+      dsi.Upload(sidx);
+      dout.Upload(std::vector<float>(dvn, -7.0f));  // untouched-row sentinel
+      Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {B, HK, DK});
+      Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {B, HK, DK});
+      Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {B, HV, DV});
+      Tensor tg = T2(dg.ptr(), d, B, HV);
+      Tensor tb = T2(db.ptr(), d, B, HV);
+      Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {st_rows, HV, DV, DK});
+      Tensor tsi = TI32(dsi.ptr(), d, B);
+      Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {B, HV, DV});
+      vt::GdnDecode(q, tout, tq, tk, tv, tg, tb, tst, ga, indexed ? &tsi : nullptr);
+      CHECK(Nmse(ref_dout, dout.Download()) <= kNmseTol);
+      CHECK(Nmse(ref_dst, dst.Download()) <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+
+TEST_CASE("RmsNormGated and SigmoidGate match the CPU oracle") {
+  // §5. RmsNormGated: NMSE (rms reduction + gate activation), both gate
+  // activations, and BOTH gate layouts — contiguous rank-2 and the padded-row
+  // rank-3 [T,Hv,D] merged-qkvz view. SigmoidGateBf16 is a single multiply
+  // with an RNE store both sides apply: bit-exact.
+  const int64_t T = 5, HV = 3, D = 32;
+  const int64_t rows = T * HV;
+  const int64_t gate_outer = HV * D + 8;  // padded token stride (rank-3 arm)
+  const size_t xn = static_cast<size_t>(rows * D);
+  const std::vector<float> x = RandomVec(xn, 831);
+  const std::vector<float> gate = RandomVec(static_cast<size_t>(T * gate_outer), 832);
+  const std::vector<float> w = RandomVec(static_cast<size_t>(D), 833, 0.2f, 1.0f);
+
+  for (bool sig : {false, true}) {
+    for (bool rank3 : {false, true}) {
+      CAPTURE(sig);
+      CAPTURE(rank3);
+      vt::RmsNormGatedArgs args;
+      args.sigmoid_gate = sig;
+      // rank3 arm: x/gate/out are [T,Hv,D] (gate padded-row); rank2 arm: all
+      // [rows,D] contiguous (gate buffer's leading rows*D elements).
+      std::vector<float> ref(xn, 0.0f);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> cx = x, cg = gate, cw = w;
+        Tensor tx = rank3 ? Tensor::Contiguous(cx.data(), DType::kF32, cd, {T, HV, D})
+                          : T2(cx.data(), cd, rows, D);
+        Tensor tg = rank3 ? T3PaddedF32(cg.data(), cd, T, HV, D, gate_outer)
+                          : T2(cg.data(), cd, rows, D);
+        Tensor tw = T1(cw.data(), cd, D);
+        Tensor tout = rank3 ? Tensor::Contiguous(ref.data(), DType::kF32, cd, {T, HV, D})
+                            : T2(ref.data(), cd, rows, D);
+        vt::RmsNormGated(cq, tout, tx, tg, tw, args);
+        cpu.DestroyQueue(cq);
+      }
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kRmsNormGated, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBuf dx(dev, q, xn), dg(dev, q, gate.size()), dw(dev, q, D), dout(dev, q, xn);
+        dx.Upload(x);
+        dg.Upload(gate);
+        dw.Upload(w);
+        Tensor tx = rank3 ? Tensor::Contiguous(dx.ptr(), DType::kF32, d, {T, HV, D})
+                          : T2(dx.ptr(), d, rows, D);
+        Tensor tg = rank3 ? T3PaddedF32(dg.ptr(), d, T, HV, D, gate_outer)
+                          : T2(dg.ptr(), d, rows, D);
+        Tensor tw = T1(dw.ptr(), d, D);
+        Tensor tout = rank3 ? Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, HV, D})
+                            : T2(dout.ptr(), d, rows, D);
+        vt::RmsNormGated(q, tout, tx, tg, tw, args);
+        CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+
+  // SigmoidGateBf16: out bf16, gate f32, attn bf16 OR f32 (the FA-2 prefill
+  // combo) — single multiply with the same RNE store on both sides: bit-exact.
+  const size_t sn = 256;
+  const std::vector<float> attn_f = RandomVec(sn, 841);
+  const std::vector<float> gate_f = RandomVec(sn, 842);
+  const std::vector<uint16_t> attn_bf = Bf16Bits(attn_f);
+  for (bool attn_is_bf16 : {true, false}) {
+    CAPTURE(attn_is_bf16);
+    std::vector<uint16_t> ref_sg(sn, 0);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<uint16_t> ca = attn_bf;
+      std::vector<float> caf = attn_f, cg = gate_f;
+      Tensor ta = attn_is_bf16
+                      ? Tensor::Contiguous(ca.data(), DType::kBF16, cd, {static_cast<int64_t>(sn)})
+                      : Tensor::Contiguous(caf.data(), DType::kF32, cd, {static_cast<int64_t>(sn)});
+      Tensor tg = T1(cg.data(), cd, static_cast<int64_t>(sn));
+      Tensor tout = Tensor::Contiguous(ref_sg.data(), DType::kBF16, cd, {static_cast<int64_t>(sn)});
+      vt::SigmoidGateBf16(cq, tout, ta, tg);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kSigmoidGateBf16, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBufBytes da(dev, q, sn * (attn_is_bf16 ? 2 : 4));
+      DevBuf dg(dev, q, sn);
+      DevBufBytes dout(dev, q, sn * 2);
+      if (attn_is_bf16) {
+        da.Upload(attn_bf.data());
+      } else {
+        da.Upload(attn_f.data());
+      }
+      dg.Upload(gate_f);
+      Tensor ta = Tensor::Contiguous(da.ptr(), attn_is_bf16 ? DType::kBF16 : DType::kF32, d,
+                                     {static_cast<int64_t>(sn)});
+      Tensor tg = T1(dg.ptr(), d, static_cast<int64_t>(sn));
+      Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {static_cast<int64_t>(sn)});
+      vt::SigmoidGateBf16(q, tout, ta, tg);
+      std::vector<uint16_t> got(sn);
+      dout.Download(got.data());
+      CHECK(got == ref_sg);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+
+TEST_CASE("AttnQkNormRopeGate matches the CPU oracle within NMSE <= 5e-4") {
+  // Fused full-attention preamble: split q|gate + (gemma) qk-RMSNorm(Dh) +
+  // partial NeoX RoPE-from-cache + gate passthrough. Padded qgate/kf token
+  // strides; plain + gemma norm variants. All arithmetic: NMSE except the
+  // gate passthrough (pure movement).
+  const int64_t T = 4;
+  // Real Qwen3.5-0.8B attention dims first: Dh=256, rot=64 (partial_rotary
+  // 0.25), Hq=8, Hkv=2 — the config the model actually runs; the synthetic
+  // 32/16 arm below does not exercise the 192-dim pass-through tail.
+  {
+    const int64_t HQr = 8, HKVr = 2, DHr = 256, ROTr = 64;
+    const int64_t qgo = HQr * 2 * DHr + 7, kfo = HKVr * DHr + 5;
+    const std::vector<float> qg = RandomVec(static_cast<size_t>(T * qgo), 981, -0.5f, 0.5f);
+    const std::vector<float> kfv = RandomVec(static_cast<size_t>(T * kfo), 982, -0.5f, 0.5f);
+    const std::vector<float> qnr = RandomVec(static_cast<size_t>(DHr), 983, 0.2f, 1.0f);
+    const std::vector<float> knr = RandomVec(static_cast<size_t>(DHr), 984, 0.2f, 1.0f);
+    const std::vector<float> csr = RandomVec(static_cast<size_t>(T * ROTr), 985, -1.0f, 1.0f);
+    for (bool gemma : {false, true}) {
+      CAPTURE(gemma);
+      vt::RmsNormArgs na2; na2.eps = 1e-6f; na2.gemma = gemma;
+      vt::RopeArgs ra2; ra2.rotary_dim = static_cast<int>(ROTr);
+      std::vector<float> rq(static_cast<size_t>(T * HQr * DHr));
+      std::vector<float> rk(static_cast<size_t>(T * HKVr * DHr));
+      std::vector<float> rg(static_cast<size_t>(T * HQr * DHr));
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> a = qg, b = kfv, e = qnr, f = knr, g = csr;
+        Tensor tqg = Tensor::Contiguous(a.data(), DType::kF32, cd, {T, HQr * 2 * DHr});
+        tqg.stride[0] = qgo;
+        Tensor tkf = Tensor::Contiguous(b.data(), DType::kF32, cd, {T, HKVr * DHr});
+        tkf.stride[0] = kfo;
+        Tensor tqn = T1(e.data(), cd, DHr);
+        Tensor tkn = T1(f.data(), cd, DHr);
+        Tensor tcs = T2(g.data(), cd, T, ROTr);
+        Tensor tqo = Tensor::Contiguous(rq.data(), DType::kF32, cd, {T, HQr, DHr});
+        Tensor tko = Tensor::Contiguous(rk.data(), DType::kF32, cd, {T, HKVr, DHr});
+        Tensor tgo = Tensor::Contiguous(rg.data(), DType::kF32, cd, {T, HQr, DHr});
+        vt::AttnQkNormRopeGate(cq, tqo, tko, tgo, tqg, tkf, tqn, tkn, tcs, na2, ra2);
+        cpu.DestroyQueue(cq);
+      }
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kAttnQkNormRopeGate, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBuf dqg(dev, q, qg.size()), dkf(dev, q, kfv.size()), dqn(dev, q, DHr),
+            dkn(dev, q, DHr), dcs(dev, q, csr.size()), dqo(dev, q, rq.size()),
+            dko(dev, q, rk.size()), dgo(dev, q, rg.size());
+        dqg.Upload(qg); dkf.Upload(kfv); dqn.Upload(qnr); dkn.Upload(knr); dcs.Upload(csr);
+        Tensor tqg = Tensor::Contiguous(dqg.ptr(), DType::kF32, d, {T, HQr * 2 * DHr});
+        tqg.stride[0] = qgo;
+        Tensor tkf = Tensor::Contiguous(dkf.ptr(), DType::kF32, d, {T, HKVr * DHr});
+        tkf.stride[0] = kfo;
+        Tensor tqn = T1(dqn.ptr(), d, DHr);
+        Tensor tkn = T1(dkn.ptr(), d, DHr);
+        Tensor tcs = T2(dcs.ptr(), d, T, ROTr);
+        Tensor tqo = Tensor::Contiguous(dqo.ptr(), DType::kF32, d, {T, HQr, DHr});
+        Tensor tko = Tensor::Contiguous(dko.ptr(), DType::kF32, d, {T, HKVr, DHr});
+        Tensor tgo = Tensor::Contiguous(dgo.ptr(), DType::kF32, d, {T, HQr, DHr});
+        vt::AttnQkNormRopeGate(q, tqo, tko, tgo, tqg, tkf, tqn, tkn, tcs, na2, ra2);
+        CHECK(Nmse(rq, dqo.Download()) <= kNmseTol);
+        CHECK(Nmse(rk, dko.Download()) <= kNmseTol);
+        CHECK(Nmse(rg, dgo.Download()) <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+
+  const int64_t HQ = 3, HKV = 2, DH = 32, ROT = 16;
+  const int64_t qg_outer = HQ * 2 * DH + 7, kf_outer = HKV * DH + 5;
+  const std::vector<float> qgate = RandomVec(static_cast<size_t>(T * qg_outer), 881, -0.5f, 0.5f);
+  const std::vector<float> kf = RandomVec(static_cast<size_t>(T * kf_outer), 882, -0.5f, 0.5f);
+  const std::vector<float> qn = RandomVec(static_cast<size_t>(DH), 883, 0.2f, 1.0f);
+  const std::vector<float> kn = RandomVec(static_cast<size_t>(DH), 884, 0.2f, 1.0f);
+  const std::vector<float> cs = RandomVec(static_cast<size_t>(T * ROT), 885, -1.0f, 1.0f);
+  for (bool gemma : {false, true}) {
+    CAPTURE(gemma);
+    vt::RmsNormArgs na;
+    na.eps = 1e-6f;
+    na.gemma = gemma;
+    vt::RopeArgs ra;
+    ra.rotary_dim = ROT;
+    std::vector<float> ref_qo(static_cast<size_t>(T * HQ * DH)),
+        ref_ko(static_cast<size_t>(T * HKV * DH)), ref_go(static_cast<size_t>(T * HQ * DH));
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> cqg = qgate, ckf = kf, cqn = qn, ckn = kn, ccs = cs;
+      Tensor tqg = Tensor::Contiguous(cqg.data(), DType::kF32, cd, {T, HQ * 2 * DH});
+      tqg.stride[0] = qg_outer;  // padded token rows (merged-projection view)
+      Tensor tkf = Tensor::Contiguous(ckf.data(), DType::kF32, cd, {T, HKV * DH});
+      tkf.stride[0] = kf_outer;
+      Tensor tqn = T1(cqn.data(), cd, DH);
+      Tensor tkn = T1(ckn.data(), cd, DH);
+      Tensor tcs = T2(ccs.data(), cd, T, ROT);
+      Tensor tqo = Tensor::Contiguous(ref_qo.data(), DType::kF32, cd, {T, HQ, DH});
+      Tensor tko = Tensor::Contiguous(ref_ko.data(), DType::kF32, cd, {T, HKV, DH});
+      Tensor tgo = Tensor::Contiguous(ref_go.data(), DType::kF32, cd, {T, HQ, DH});
+      vt::AttnQkNormRopeGate(cq, tqo, tko, tgo, tqg, tkf, tqn, tkn, tcs, na, ra);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kAttnQkNormRopeGate, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dqg(dev, q, qgate.size()), dkf(dev, q, kf.size()), dqn(dev, q, DH),
+          dkn(dev, q, DH), dcs(dev, q, cs.size()), dqo(dev, q, ref_qo.size()),
+          dko(dev, q, ref_ko.size()), dgo(dev, q, ref_go.size());
+      dqg.Upload(qgate);
+      dkf.Upload(kf);
+      dqn.Upload(qn);
+      dkn.Upload(kn);
+      dcs.Upload(cs);
+      Tensor tqg = Tensor::Contiguous(dqg.ptr(), DType::kF32, d, {T, HQ * 2 * DH});
+      tqg.stride[0] = qg_outer;
+      Tensor tkf = Tensor::Contiguous(dkf.ptr(), DType::kF32, d, {T, HKV * DH});
+      tkf.stride[0] = kf_outer;
+      Tensor tqn = T1(dqn.ptr(), d, DH);
+      Tensor tkn = T1(dkn.ptr(), d, DH);
+      Tensor tcs = T2(dcs.ptr(), d, T, ROT);
+      Tensor tqo = Tensor::Contiguous(dqo.ptr(), DType::kF32, d, {T, HQ, DH});
+      Tensor tko = Tensor::Contiguous(dko.ptr(), DType::kF32, d, {T, HKV, DH});
+      Tensor tgo = Tensor::Contiguous(dgo.ptr(), DType::kF32, d, {T, HQ, DH});
+      vt::AttnQkNormRopeGate(q, tqo, tko, tgo, tqg, tkf, tqn, tkn, tcs, na, ra);
+      CHECK(Nmse(ref_qo, dqo.Download()) <= kNmseTol);
+      CHECK(Nmse(ref_ko, dko.Download()) <= kNmseTol);
+      CHECK(Nmse(ref_go, dgo.Download()) <= kNmseTol);  // gate passthrough: exact movement
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("MoeSiluMul matches the CPU oracle within NMSE <= 5e-4") {
+  // Elementwise silu(gate)*up (the MoE-path activation). f32 and bf16 arms.
+  const size_t n = 1024;
+  const std::vector<float> gate = RandomVec(n, 901);
+  const std::vector<float> up = RandomVec(n, 902);
+  const std::vector<uint16_t> gate_bf = Bf16Bits(gate);
+  const std::vector<uint16_t> up_bf = Bf16Bits(up);
+  for (bool bf16 : {false, true}) {
+    CAPTURE(bf16);
+    std::vector<float> ref_f(n, 0.0f);
+    std::vector<uint16_t> ref_b(n, 0);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> cg = gate, cu = up;
+      std::vector<uint16_t> cgb = gate_bf, cub = up_bf;
+      if (bf16) {
+        Tensor tg = Tensor::Contiguous(cgb.data(), DType::kBF16, cd, {static_cast<int64_t>(n)});
+        Tensor tu = Tensor::Contiguous(cub.data(), DType::kBF16, cd, {static_cast<int64_t>(n)});
+        Tensor tout = Tensor::Contiguous(ref_b.data(), DType::kBF16, cd, {static_cast<int64_t>(n)});
+        vt::MoeSiluMul(cq, tout, tg, tu);
+      } else {
+        Tensor tg = T1(cg.data(), cd, static_cast<int64_t>(n));
+        Tensor tu = T1(cu.data(), cd, static_cast<int64_t>(n));
+        Tensor tout = T1(ref_f.data(), cd, static_cast<int64_t>(n));
+        vt::MoeSiluMul(cq, tout, tg, tu);
+      }
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kMoeSiluMul, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dg(dev, q, n), du(dev, q, n), dout(dev, q, n);
+      DevBufBytes dgb(dev, q, n * 2), dub(dev, q, n * 2), doutb(dev, q, n * 2);
+      if (bf16) {
+        dgb.Upload(gate_bf.data());
+        dub.Upload(up_bf.data());
+        Tensor tg = Tensor::Contiguous(dgb.ptr(), DType::kBF16, d, {static_cast<int64_t>(n)});
+        Tensor tu = Tensor::Contiguous(dub.ptr(), DType::kBF16, d, {static_cast<int64_t>(n)});
+        Tensor tout = Tensor::Contiguous(doutb.ptr(), DType::kBF16, d, {static_cast<int64_t>(n)});
+        vt::MoeSiluMul(q, tout, tg, tu);
+        std::vector<uint16_t> got(n);
+        doutb.Download(got.data());
+        CHECK(got == ref_b);  // single multiply + RNE store both sides: exact
+      } else {
+        dg.Upload(gate);
+        du.Upload(up);
+        Tensor tg = T1(dg.ptr(), d, static_cast<int64_t>(n));
+        Tensor tu = T1(du.ptr(), d, static_cast<int64_t>(n));
+        Tensor tout = T1(dout.ptr(), d, static_cast<int64_t>(n));
+        vt::MoeSiluMul(q, tout, tg, tu);
+        CHECK(Nmse(ref_f, dout.Download()) <= kNmseTol);
+      }
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("MoeRouterTopK matches the CPU oracle (f32 and bf16 logits)") {
+  // Ungrouped softmax top-k. Weights are arithmetic (softmax + renorm): NMSE.
+  // The selected INDICES are discrete outputs: exact match required (the
+  // tie-break is lowest-index on both sides). The bf16-logits arm upcasts at
+  // the boundary; the softmax stays f32 on both sides.
+  const int64_t T = 6, E = 48, K = 5;
+  const size_t ln = static_cast<size_t>(T * E);
+  const std::vector<float> logits = RandomVec(ln, 891);
+  const std::vector<uint16_t> logits_bf = Bf16Bits(logits);
+  for (bool bf16 : {false, true}) {
+    for (bool renorm : {false, true}) {
+      CAPTURE(bf16);
+      CAPTURE(renorm);
+      vt::MoeRouterTopKArgs args;
+      args.top_k = static_cast<int>(K);
+      args.renormalize = renorm;
+      std::vector<float> ref_w(static_cast<size_t>(T * K), 0.0f);
+      std::vector<int32_t> ref_i(static_cast<size_t>(T * K), -1);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> cl = logits;
+        std::vector<uint16_t> clb = logits_bf;
+        Tensor tl = bf16 ? Tensor::Contiguous(clb.data(), DType::kBF16, cd, {T, E})
+                         : Tensor::Contiguous(cl.data(), DType::kF32, cd, {T, E});
+        Tensor tw = Tensor::Contiguous(ref_w.data(), DType::kF32, cd, {T, K});
+        Tensor ti = Tensor::Contiguous(ref_i.data(), DType::kI32, cd, {T, K});
+        vt::MoeRouterTopK(cq, tw, ti, tl, args, nullptr);
+        cpu.DestroyQueue(cq);
+      }
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kMoeRouterTopK, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBuf dl(dev, q, ln), dw(dev, q, static_cast<size_t>(T * K));
+        DevBufBytes dlb(dev, q, ln * 2);
+        DevBufI32 di(dev, q, static_cast<size_t>(T * K));
+        if (bf16) dlb.Upload(logits_bf.data());
+        else dl.Upload(logits);
+        Tensor tl = bf16 ? Tensor::Contiguous(dlb.ptr(), DType::kBF16, d, {T, E})
+                         : Tensor::Contiguous(dl.ptr(), DType::kF32, d, {T, E});
+        Tensor tw = Tensor::Contiguous(dw.ptr(), DType::kF32, d, {T, K});
+        Tensor ti = Tensor::Contiguous(di.ptr(), DType::kI32, d, {T, K});
+        vt::MoeRouterTopK(q, tw, ti, tl, args, nullptr);
+        CHECK(Nmse(ref_w, dw.Download()) <= kNmseTol);
+        std::vector<int32_t> got_i(static_cast<size_t>(T * K));
+        dev.Synchronize(q);
+        dev.Copy(q, got_i.data(), di.ptr(), got_i.size() * sizeof(int32_t));
+        dev.Synchronize(q);
+        CHECK(got_i == ref_i);  // selected experts: exact
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
 TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
   constexpr int64_t kRows = 7, kCols = 48;
   constexpr size_t kN = kRows * kCols;

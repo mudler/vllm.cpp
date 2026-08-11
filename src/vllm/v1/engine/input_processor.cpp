@@ -133,6 +133,27 @@ void InputProcessor::ValidateParams(SamplingParams& params) const {
   // __post_init__ to this constructing unit (M1.1), so PostInit() both
   // normalizes the params AND runs Verify() — closing that carry.
   params.PostInit();
+
+  // #249 — _validate_logprobs (sampling_params.py:755-770). Upstream REJECTS a
+  // request whose logprobs exceed the cap; it does not clamp. Without this a
+  // single `{"logprobs": 999999}` reached GatherLogprobs, which partial_sorts k
+  // entries out of a vocab-sized index array and walked off the end — one
+  // unauthenticated request killed the server process.
+  //
+  // Our ModelConfig carries no separate max_logprobs, so the cap is the vocab
+  // size, which is upstream's own meaning for max_logprobs == -1.
+  const int64_t vocab = static_cast<int64_t>(tokenizer_.VocabSize());
+  const auto over_cap = [vocab](int n) { return vocab > 0 && n > vocab; };
+  if (params.logprobs.has_value() && over_cap(*params.logprobs)) {
+    throw std::runtime_error(
+        "Requested sample logprobs of " + std::to_string(*params.logprobs) +
+        ", which is greater than max allowed: " + std::to_string(vocab) + ".");
+  }
+  if (params.prompt_logprobs.has_value() && over_cap(*params.prompt_logprobs)) {
+    throw std::runtime_error(
+        "Requested prompt logprobs of " + std::to_string(*params.prompt_logprobs) +
+        ", which is greater than max allowed: " + std::to_string(vocab) + ".");
+  }
 }
 
 void InputProcessor::UpdateFromGenerationConfig(SamplingParams& params) const {

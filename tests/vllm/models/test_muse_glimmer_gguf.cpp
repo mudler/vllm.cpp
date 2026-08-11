@@ -182,6 +182,99 @@ std::vector<float> OwnedBf16ToF32(const vllm::OwnedTensor& t) {
   return out;
 }
 
+// The converter's Q/K RoPE row permutation (transform 4), reproduced INDEPENDENTLY
+// of the loader from llama.cpp's own `LlamaModel.permute`
+// (`conversion/llama.py:163-169`) so a failure names the transform rather than
+// restating the implementation:
+//     gguf = w.reshape(heads, 2, head_dim/2, K).swapaxes(1, 2).reshape(w.shape)
+// Returns, for a DESTINATION (HF-order) row, the SOURCE row in the GGUF.
+int64_t QkSrcRow(int64_t dst_row, int64_t heads, int64_t rows) {
+  const int64_t head_dim = rows / heads;
+  const int64_t half = head_dim / 2;
+  const int64_t h = dst_row / head_dim;
+  const int64_t i = dst_row % head_dim;
+  return h * head_dim + (i % half) * 2 + i / half;
+}
+
+// ── a SECOND synthetic file, geometry chosen so the qkv trio can stay QUANTIZED ─
+// The released 17 GB k-quant's qkv trio is heterogeneous (Q6_K `attn_v` against
+// Q4_K `attn_q`/`attn_k`), so it always takes `LoadMerged`'s DEQUANTIZED branch.
+// A homogeneous trio takes the KEPT-QUANT block-concat branch instead, and the
+// Q/K un-permute has to happen there too — on whole rows, which is byte-safe
+// because a quantized row is a whole number of blocks. This file exists to reach
+// that branch: hidden 64 = two Q8_0 blocks per row, one layer, everything else F32.
+struct SyntheticMuseQ8 {
+  static constexpr int64_t kLayers = 1;
+  static constexpr int64_t kHidden = 64;
+  static constexpr int64_t kHeads = 2;
+  static constexpr int64_t kKvHeads = 1;
+  static constexpr int64_t kHeadDim = 32;
+  static constexpr int64_t kVocab = 4;
+  static constexpr int64_t kInter = 64;
+  static constexpr uint32_t kF32 = 0;
+  static constexpr uint32_t kQ8_0 = 8;
+
+  // block_q8_0 = { fp16 d; int8 qs[32] }. `d` is fixed at 1.0 so a dequantized
+  // element is EXACTLY the stored int8 and a permuted row is unmistakable.
+  static int8_t Q(int64_t row, int64_t col) {
+    return static_cast<int8_t>((row * 13 + col * 5) % 101 - 50);
+  }
+  static std::string Q8Data(int64_t rows, int64_t cols) {
+    std::string s;
+    for (int64_t r = 0; r < rows; ++r)
+      for (int64_t b = 0; b < cols / 32; ++b) {
+        s += std::string("\x00\x3c", 2);  // fp16 1.0, little-endian
+        for (int64_t i = 0; i < 32; ++i)
+          s.push_back(static_cast<char>(Q(r, b * 32 + i)));
+      }
+    return s;
+  }
+
+  static std::string Build() {
+    GgufModelBuilder b;
+    const std::string a = "muse-glimmer.";
+    b.AddKv(StrKv("general.architecture", "muse-glimmer"));
+    b.AddKv(U32Kv(a + "block_count", static_cast<uint32_t>(kLayers)));
+    b.AddKv(U32Kv(a + "context_length", 4096));
+    b.AddKv(U32Kv(a + "embedding_length", static_cast<uint32_t>(kHidden)));
+    b.AddKv(U32Kv(a + "feed_forward_length", static_cast<uint32_t>(kInter)));
+    b.AddKv(U32Kv(a + "attention.head_count", static_cast<uint32_t>(kHeads)));
+    b.AddKv(U32Kv(a + "attention.head_count_kv", static_cast<uint32_t>(kKvHeads)));
+    b.AddKv(U32Kv(a + "attention.key_length", static_cast<uint32_t>(kHeadDim)));
+    b.AddKv(U32Kv(a + "attention.value_length", static_cast<uint32_t>(kHeadDim)));
+    b.AddKv(F32Kv(a + "rope.freq_base", 500000.0f));
+    b.AddKv(F32Kv(a + "attention.layer_norm_rms_epsilon", 1e-5f));
+    b.AddKv(U32Kv(a + "attention.sliding_window", 2048));
+    b.AddKv(gguf_test::BoolArrayKv(a + "attention.sliding_window_pattern", {true}));
+
+    SyntheticMuse::AddF32(b, "token_embd.weight", {kHidden, kVocab}, 1);
+    const std::string p = "blk.0.";
+    SyntheticMuse::AddF32(b, p + "attn_norm.weight", {kHidden}, 10);
+    SyntheticMuse::AddF32(b, p + "post_attention_norm.weight", {kHidden}, 20);
+    SyntheticMuse::AddF32(b, p + "ffn_norm.weight", {kHidden}, 30);
+    SyntheticMuse::AddF32(b, p + "post_ffw_norm.weight", {kHidden}, 40);
+    b.AddTensor(p + "attn_q_norm.weight", {kHeadDim}, kF32,
+                SyntheticMuse::ConstData(kHeadDim, SyntheticMuse::kQueryPreScale));
+    b.AddTensor(p + "attn_k_norm.weight", {kHeadDim}, kF32,
+                SyntheticMuse::ConstData(kHeadDim, 1.0f));
+    // The homogeneous Q8_0 trio — the whole point of this file.
+    b.AddTensor(p + "attn_q.weight", {kHidden, kHeads * kHeadDim}, kQ8_0,
+                Q8Data(kHeads * kHeadDim, kHidden));
+    b.AddTensor(p + "attn_k.weight", {kHidden, kKvHeads * kHeadDim}, kQ8_0,
+                Q8Data(kKvHeads * kHeadDim, kHidden));
+    b.AddTensor(p + "attn_v.weight", {kHidden, kKvHeads * kHeadDim}, kQ8_0,
+                Q8Data(kKvHeads * kHeadDim, kHidden));
+    SyntheticMuse::AddF32(b, p + "attn_output.weight", {kHeads * kHeadDim, kHidden}, 80);
+    SyntheticMuse::AddF32(b, p + "attn_gate.weight", {kHidden, kHeads * kHeadDim}, 90);
+    SyntheticMuse::AddF32(b, p + "ffn_gate.weight", {kHidden, kInter}, 100);
+    SyntheticMuse::AddF32(b, p + "ffn_up.weight", {kHidden, kInter}, 110);
+    SyntheticMuse::AddF32(b, p + "ffn_down.weight", {kInter, kHidden}, 120);
+    SyntheticMuse::AddF32(b, "output_norm.weight", {kHidden}, 200);
+    SyntheticMuse::AddF32(b, "output.weight", {kHidden, kVocab}, 201);
+    return b.Build();
+  }
+};
+
 // The released 30B geometry, so the manifest cases enumerate what the real file
 // must contain without needing the file.
 vllm::MuseGlimmerParams Released30BParams() {
@@ -413,6 +506,112 @@ TEST_CASE("muse glimmer gguf: shapes and the qkv/gate_up merges") {
     CHECK(qkv[static_cast<size_t>((qdim + kdim) * H + i)] ==
           doctest::Approx(SyntheticMuse::Fill(70, i)).epsilon(0.01));
   }
+}
+
+// ── transform 4: the converter's Q/K RoPE row permutation ────────────────────
+// llama.cpp stores `attn_q` / `attn_k` in ggml's INTERLEAVED-RoPE row order
+// (`LlamaModel.permute`, conversion/llama.py:163-169, which the `muse-glimmer`
+// converter of ggml-org/llama.cpp#26841 inherits). Our forward runs
+// `vt::RopeNeox`, which is HF's half-offset pairing, so the loader must invert it.
+//
+// This is the defect behind issue #359: the permutation is INVISIBLE to every
+// structural check (right names, right shapes, right counts) and invisible to
+// attention itself on the 13 NoPE layers (a permutation applied to BOTH q and k
+// leaves q·k unchanged), so the 17 GB k-quant loaded, ran, and emitted degenerate
+// text — " is is is is ..." — instead of failing.
+TEST_CASE("muse glimmer gguf: the converter's Q/K RoPE row permutation is inverted") {
+  const TempFile f(SyntheticMuse::Build());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig cfg = vllm::MuseGlimmerHfConfigFromGguf(g);
+  const vllm::MuseGlimmerWeights w = vllm::LoadMuseGlimmerFromGguf(g, cfg);
+
+  const int64_t H = SyntheticMuse::kHidden;
+  const int64_t qdim = SyntheticMuse::kHeads * SyntheticMuse::kHeadDim;
+  const int64_t kdim = SyntheticMuse::kKvHeads * SyntheticMuse::kHeadDim;
+  const std::vector<float> qkv = OwnedBf16ToF32(w.layers[0].attn.qkv_proj);
+
+  // The synthetic filler is a multiple of 1/8, so every value is EXACT in bf16
+  // and these are equalities, not tolerances.
+  // q: permuted with `n_head` (muse `attention.head_count`).
+  for (int64_t r = 0; r < qdim; ++r) {
+    const int64_t src = QkSrcRow(r, SyntheticMuse::kHeads, qdim);
+    for (int64_t c = 0; c < H; ++c)
+      CHECK(qkv[static_cast<size_t>(r * H + c)] == SyntheticMuse::Fill(50, src * H + c));
+  }
+  // k: permuted with `n_head_kv`, NOT `n_head` — llama.cpp substitutes the KV
+  // head count for the key side, so a k shard un-permuted with 2 q-heads instead
+  // of 1 kv-head lands on different rows.
+  for (int64_t r = 0; r < kdim; ++r) {
+    const int64_t src = QkSrcRow(r, SyntheticMuse::kKvHeads, kdim);
+    for (int64_t c = 0; c < H; ++c)
+      CHECK(qkv[static_cast<size_t>((qdim + r) * H + c)] ==
+            SyntheticMuse::Fill(60, src * H + c));
+  }
+  // v is NOT permuted upstream and must stay VERBATIM. Un-permuting it too would
+  // be just as wrong as not un-permuting q/k, and just as quiet.
+  for (int64_t r = 0; r < kdim; ++r)
+    for (int64_t c = 0; c < H; ++c)
+      CHECK(qkv[static_cast<size_t>((qdim + kdim + r) * H + c)] ==
+            SyntheticMuse::Fill(70, r * H + c));
+
+  // The map must not be the identity, or the three loops above would pass on a
+  // loader that ignores the transform entirely.
+  CHECK(QkSrcRow(1, SyntheticMuse::kHeads, qdim) != 1);
+  CHECK(qkv[static_cast<size_t>(1 * H)] != SyntheticMuse::Fill(50, 1 * H));
+
+  // The MLP shards share `LoadMerged` and carry no permutation at all.
+  const std::vector<float> gu = OwnedBf16ToF32(w.layers[0].mlp.gate_up_proj);
+  for (int64_t c = 0; c < H; ++c) {
+    CHECK(gu[static_cast<size_t>(1 * H + c)] == SyntheticMuse::Fill(100, 1 * H + c));
+    CHECK(gu[static_cast<size_t>((SyntheticMuse::kInter + 1) * H + c)] ==
+          SyntheticMuse::Fill(110, 1 * H + c));
+  }
+}
+
+TEST_CASE("muse glimmer gguf: the Q/K un-permute also runs on the KEPT-QUANT concat") {
+  // A homogeneous quantized qkv trio is merged as a BYTE CONCAT, and the row
+  // reorder has to happen there too. Rows are whole blocks, so this is a pure
+  // byte-level row permutation and nothing is requantized.
+  const TempFile f(SyntheticMuseQ8::Build());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig cfg = vllm::MuseGlimmerHfConfigFromGguf(g);
+  vllm::GgufLoadPolicy pol;
+  pol.keep_quant = true;
+  // Pin the two byte-rewriting levers OFF so this case reads the concat itself.
+  pol.quant_repack = false;
+  pol.mmap_residency = false;
+  const vllm::MuseGlimmerWeights w = vllm::LoadMuseGlimmerFromGguf(g, cfg, &pol);
+
+  const int64_t H = SyntheticMuseQ8::kHidden;
+  const int64_t qdim = SyntheticMuseQ8::kHeads * SyntheticMuseQ8::kHeadDim;
+  const int64_t kdim = SyntheticMuseQ8::kKvHeads * SyntheticMuseQ8::kHeadDim;
+  const vllm::OwnedTensor& qkv = w.layers[0].attn.qkv_proj;
+  REQUIRE(qkv.shape[0] == qdim + 2 * kdim);
+  REQUIRE(qkv.shape[1] == H);
+  // block_q8_0 is { fp16 d; int8 qs[32] } = 34 bytes per 32 columns. Restated
+  // here rather than read from the loader so the test is not circular.
+  const size_t row_bytes = 34 * static_cast<size_t>(H / 32);
+  REQUIRE(qkv.bytes.size() == static_cast<size_t>(qdim + 2 * kdim) * row_bytes);
+
+  const auto* q_src = g.Get("blk.0.attn_q.weight").data;
+  const auto* k_src = g.Get("blk.0.attn_k.weight").data;
+  const auto* v_src = g.Get("blk.0.attn_v.weight").data;
+  const uint8_t* dst = qkv.bytes.data();
+  for (int64_t r = 0; r < qdim; ++r) {
+    const size_t src = static_cast<size_t>(QkSrcRow(r, SyntheticMuseQ8::kHeads, qdim));
+    CHECK(std::memcmp(dst + static_cast<size_t>(r) * row_bytes,
+                      q_src + src * row_bytes, row_bytes) == 0);
+  }
+  for (int64_t r = 0; r < kdim; ++r) {
+    const size_t src = static_cast<size_t>(QkSrcRow(r, SyntheticMuseQ8::kKvHeads, kdim));
+    CHECK(std::memcmp(dst + static_cast<size_t>(qdim + r) * row_bytes,
+                      k_src + src * row_bytes, row_bytes) == 0);
+  }
+  for (int64_t r = 0; r < kdim; ++r)
+    CHECK(std::memcmp(dst + static_cast<size_t>(qdim + kdim + r) * row_bytes,
+                      v_src + static_cast<size_t>(r) * row_bytes, row_bytes) == 0);
+  // Not the identity: row 1 of the merged q block is NOT row 1 of the file.
+  CHECK(std::memcmp(dst + row_bytes, q_src + row_bytes, row_bytes) != 0);
 }
 
 TEST_CASE("muse glimmer gguf: synthetic accounting is exact in both directions") {

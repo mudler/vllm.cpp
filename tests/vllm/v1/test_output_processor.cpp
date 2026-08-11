@@ -7,6 +7,8 @@
 //       and reqs_to_abort carries the req (EngineCore did not signal STOP);
 //   (c) finish-reason mapping (LENGTH/STOP) -> RequestOutput strings;
 //   (d) a normal EngineCore-signaled EOS finish -> finished, no reqs_to_abort.
+#include <chrono>
+#include <thread>
 #include <doctest/doctest.h>
 
 #include <cstdint>
@@ -435,4 +437,26 @@ TEST_CASE("per-request stream_interval below the engine interval is clamped up")
       MakeStep("r0", {9}, std::optional<FinishReason>(FinishReason::kLength)));
   REQUIRE(s3.request_outputs.size() == 1);
   CHECK(s3.request_outputs[0].outputs[0].text == "12");
+}
+
+TEST_CASE("RequestOutputCollector.get_for times out and delivers") {
+  using namespace std::chrono_literals;
+  vllm::v1::RequestOutputCollector c(RequestOutputKind::kDelta, "t0");
+  // Timeout with nothing queued.
+  auto miss = c.get_for(20ms);
+  CHECK_FALSE(miss.has_value());
+
+  // Producer after a short delay.
+  std::thread th([&] {
+    std::this_thread::sleep_for(30ms);
+    RequestOutput out;
+    out.request_id = "t0";
+    out.finished = true;
+    c.put(std::move(out));
+  });
+  auto hit = c.get_for(500ms);
+  th.join();
+  REQUIRE(hit.has_value());
+  CHECK(hit->request_id == "t0");
+  CHECK(hit->finished);
 }

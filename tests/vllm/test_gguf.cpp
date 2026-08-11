@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 #include "gguf_builder.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 

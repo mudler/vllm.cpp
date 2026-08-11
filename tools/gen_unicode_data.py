@@ -2,14 +2,30 @@
 """Generate src/vllm/tokenizer/unicode_data.cpp + include/vllm/tokenizer/unicode_data.h.
 
 Emits merged (start, end, cat) codepoint ranges for Unicode general-category
-lookup plus a whitespace table with python str.isspace() semantics, both
-binary-searched at runtime. Category mapping (major class of
+lookup, a letter-CASE table, and a whitespace table with python str.isspace()
+semantics, all binary-searched at runtime. Category mapping (major class of
 unicodedata.category):
 
     L* -> kLetter, N* -> kNumber, Z* -> kSeparator, M* -> kMark,
     P* -> kPunct,  S* -> kSymbol, C* -> kControl,
     except Cn (unassigned) which is omitted from the table so lookup misses
     fall through to kOther.
+
+The letter-case table splits L* three ways (Lu+Lt | Ll | Lm+Lo). It exists
+because two pretokenizer patterns we implement -- SplitPattern::kTekken and
+SplitPattern::kGpt4o -- name the MINOR letter categories rather than \\p{L},
+and both use the SAME pair of classes:
+    [\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]  and  [\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]
+Lu and Lt always occur together in those regexes, as do Lm and Lo, so three
+classes are enough and the table stays small.
+
+ONE table, not two. Tekken (#168) and GPT-4o (#347) landed concurrently and
+each proposed its own three-way cut of L*, named LetterCase{kUpper, kLower,
+kCaseless} and ULetterSub{kLuLt, kLl, kLmLo}. Those are the SAME partition:
+the relabelling kUpper<->kLuLt, kLower<->kLl, kCaseless<->kLmLo is a bijection
+over all 0x110000 codepoints, checked exhaustively when the two were merged.
+Emitting both would be 1861 duplicated ranges that can only ever drift apart,
+so LetterCase is kept (it landed first) and the GPT-4o scanner reads it too.
 
 Whitespace is enumerated directly with str.isspace() over every codepoint
 (covers 0x85/0xA0 and friends exactly as Python does) rather than hand-listed.
@@ -64,9 +80,11 @@ def build_category_ranges() -> list[tuple[int, int, int]]:
     return ranges
 
 
-# Letter CASE class, needed only by the Tekken pre-tokenizer, whose two letter
-# alternatives are [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and [\p{Ll}\p{Lm}\p{Lo}\p{M}]
-# (see SplitPattern::kTekken). The major-class table above collapses every L*
+# Letter CASE class, needed by the Tekken and GPT-4o pre-tokenizers, whose two
+# letter alternatives are BOTH [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and
+# [\p{Ll}\p{Lm}\p{Lo}\p{M}] (see SplitPattern::kTekken / ::kGpt4o -- the two
+# regexes differ in their quantifiers, digit grouping and contraction handling,
+# but not in these two classes). The major-class table above collapses every L*
 # into kLetter, which cannot express that split. This is deliberately a SECOND,
 # narrow table rather than a re-cut of the category table: every existing
 # consumer of UCat keeps the exact bytes it has today.
@@ -142,11 +160,14 @@ enum class UCat : uint8_t {
 
 UCat Category(uint32_t cp);
 
-// CASE class of a letter. Needed only by SplitPattern::kTekken, whose letter
-// alternatives are [\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}] and
+// CASE class of a letter. Needed by SplitPattern::kTekken and ::kGpt4o, whose
+// letter alternatives are BOTH [\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}] and
 // [\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]; UCat collapses all of L* into kLetter and
 // cannot express that. Deliberately a separate narrow table, so UCat and every
 // existing consumer of it are unchanged. kNotLetter for anything outside L*.
+// Category(cp) == UCat::kLetter is exactly LetterCaseOf(cp) != kNotLetter;
+// this table splits that same set three ways. Marks are NOT in it -- \\p{M} is
+// not a letter subcategory, and both regexes above get it from Category().
 enum class LetterCase : uint8_t {
   kNotLetter = 0,
   kUpper = 1,     // Lu, Lt -- the UPPER class only

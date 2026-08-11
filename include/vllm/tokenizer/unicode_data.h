@@ -29,11 +29,14 @@ enum class UCat : uint8_t {
 
 UCat Category(uint32_t cp);
 
-// CASE class of a letter. Needed only by SplitPattern::kTekken, whose letter
-// alternatives are [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and
+// CASE class of a letter. Needed by SplitPattern::kTekken and ::kGpt4o, whose
+// letter alternatives are BOTH [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and
 // [\p{Ll}\p{Lm}\p{Lo}\p{M}]; UCat collapses all of L* into kLetter and
 // cannot express that. Deliberately a separate narrow table, so UCat and every
 // existing consumer of it are unchanged. kNotLetter for anything outside L*.
+// Category(cp) == UCat::kLetter is exactly LetterCaseOf(cp) != kNotLetter;
+// this table splits that same set three ways. Marks are NOT in it -- \p{M} is
+// not a letter subcategory, and both regexes above get it from Category().
 enum class LetterCase : uint8_t {
   kNotLetter = 0,
   kUpper = 1,     // Lu, Lt -- the UPPER class only

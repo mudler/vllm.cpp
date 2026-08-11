@@ -53,6 +53,9 @@ std::vector<std::string> Gpt2Pieces(std::string_view t) {
 std::vector<std::string> TekkenPieces(std::string_view t) {
   return Pieces(t, SplitPattern::kTekken);
 }
+std::vector<std::string> Gpt4oPieces(std::string_view t) {
+  return Pieces(t, SplitPattern::kGpt4o);
+}
 
 using V = std::vector<std::string>;
 
@@ -61,6 +64,7 @@ struct PretokGolden {
   std::vector<std::string_view> qwen;
   std::vector<std::string_view> llama;
   std::vector<std::string_view> tekken;
+  std::vector<std::string_view> gpt4o;
 };
 
 // sizeof-based so embedded NUL bytes survive.
@@ -232,6 +236,9 @@ TEST_CASE("goldens: scanner matches the HF tokenizers oracle") {
     for (size_t i = 0; i < l.size(); ++i) CHECK(l[i] == g.llama[i]);
     REQUIRE(t.size() == g.tekken.size());
     for (size_t i = 0; i < t.size(); ++i) CHECK(t[i] == g.tekken[i]);
+    const auto o = Gpt4oPieces(g.input);
+    REQUIRE(o.size() == g.gpt4o.size());
+    for (size_t i = 0; i < o.size(); ++i) CHECK(o[i] == g.gpt4o[i]);
   }
 }
 
@@ -275,7 +282,8 @@ TEST_CASE("reconstruction property over random strings (ASCII + UTF-8 + "
                                            sizeof(kSnippets[0]))];
       s.append(sn.data(), sn.size());
     }
-    for (SplitPattern p : {SplitPattern::kQwen2, SplitPattern::kLlama3}) {
+    for (SplitPattern p : {SplitPattern::kQwen2, SplitPattern::kLlama3,
+                          SplitPattern::kGpt4o}) {
       // Pieces() REQUIREs contiguity/cover; also re-join to be explicit.
       const auto pieces = Pieces(s, p);
       std::string joined;
@@ -360,4 +368,106 @@ TEST_CASE("kGpt2: empty and single-char inputs tile exactly") {
   CHECK(Gpt2Pieces("'") == V{"'"});
   CHECK(Gpt2Pieces("a") == V{"a"});
   CHECK(Gpt2Pieces("7") == V{"7"});
+}
+
+// ---------------------------------------------------------------------------
+// kGpt4o — the GPT-4o / o200k split (llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT4O; GGUF
+// pre names "gpt-4o", "llama4", "kanana2", "talkie"), added by the Muse Glimmer
+// k-quant GGUF bring-up (issue #347). The regex is transcribed verbatim from
+// /mnt/nas_share/checkpoints/muse-glimmer-30b/tokenizer.json into
+// tools/gen_pretok_goldens.py (GPT4O), and EVERY expectation below — including
+// the contrasting kLlama3/kQwen2 lines that make aliasing detectable — was
+// produced by running that regex through the HF tokenizers oracle, never by
+// hand. Regenerate with `python3 tools/gen_pretok_goldens.py`.
+
+TEST_CASE("kGpt4o: CamelCase splits at every lower->upper boundary (kLlama3 never does)") {
+  CHECK(Gpt4oPieces("Hello world") == V{"Hello", " world"});
+  CHECK(Gpt4oPieces("abcDEF") == V{"abc", "DEF"});
+  CHECK(LlamaPieces("abcDEF") == V{"abcDEF"});  // differs
+  CHECK(Gpt4oPieces("HTMLParser") == V{"HTMLParser"});
+  CHECK(Gpt4oPieces("camelCaseWord") == V{"camel", "Case", "Word"});
+  CHECK(LlamaPieces("camelCaseWord") == V{"camelCaseWord"});  // differs
+  CHECK(Gpt4oPieces("XMLHttpRequest") == V{"XMLHttp", "Request"});
+  CHECK(LlamaPieces("XMLHttpRequest") == V{"XMLHttpRequest"});  // differs
+  CHECK(Gpt4oPieces("MiXeD") == V{"Mi", "Xe", "D"});
+  CHECK(LlamaPieces("MiXeD") == V{"MiXeD"});  // differs
+}
+
+TEST_CASE("kGpt4o: the contraction is a word SUFFIX, not its own leading alternative") {
+  CHECK(Gpt4oPieces("don't") == V{"don't"});
+  CHECK(LlamaPieces("don't") == V{"don", "'t"});  // differs
+  CHECK(Gpt4oPieces("DON'T") == V{"DON'T"});
+  CHECK(LlamaPieces("DON'T") == V{"DON", "'T"});  // differs
+  CHECK(Gpt4oPieces("It's") == V{"It's"});
+  CHECK(LlamaPieces("It's") == V{"It", "'s"});  // differs
+  CHECK(Gpt4oPieces("x's") == V{"x's"});
+  CHECK(LlamaPieces("x's") == V{"x", "'s"});  // differs
+  CHECK(Gpt4oPieces("can'tt") == V{"can't", "t"});
+  CHECK(LlamaPieces("can'tt") == V{"can", "'t", "t"});  // differs
+  CHECK(Gpt4oPieces("o'clock") == V{"o", "'clock"});
+  CHECK(Gpt4oPieces("'s") == V{"'s"});
+  CHECK(Gpt4oPieces(" 's") == V{" '", "s"});
+  CHECK(Gpt4oPieces("'") == V{"'"});
+}
+
+TEST_CASE("kGpt4o: digits group in threes and the punct run absorbs a trailing `/`") {
+  CHECK(Gpt4oPieces("x123") == V{"x", "123"});
+  CHECK(QwenPieces("x123") == V{"x", "1", "2", "3"});  // differs
+  CHECK(Gpt4oPieces("1234567") == V{"123", "456", "7"});
+  CHECK(QwenPieces("1234567") == V{"1", "2", "3", "4", "5", "6", "7"});  // differs
+  CHECK(Gpt4oPieces("The year 2024 had 365 days.") == V{"The", " year", " ", "202", "4", " had", " ", "365", " days", "."});
+  CHECK(QwenPieces("The year 2024 had 365 days.") == V{"The", " year", " ", "2", "0", "2", "4", " had", " ", "3", "6", "5", " days", "."});  // differs
+  CHECK(Gpt4oPieces("path/to/file.txt") == V{"path", "/to", "/file", ".txt"});
+  CHECK(Gpt4oPieces("a//b") == V{"a", "//", "b"});
+  CHECK(Gpt4oPieces("!/x") == V{"!/", "x"});
+  CHECK(Gpt4oPieces("hi!!\012\012ok") == V{"hi", "!!\012\012", "ok"});
+}
+
+TEST_CASE("kGpt4o: minor letter categories -- Ll vs Lu/Lt, and Lm/Lo in BOTH classes") {
+  CHECK(Gpt4oPieces("\303\251\303\211") == V{"\303\251", "\303\211"});
+  CHECK(LlamaPieces("\303\251\303\211") == V{"\303\251\303\211"});  // differs
+  CHECK(Gpt4oPieces("\303\211\303\251") == V{"\303\211\303\251"});
+  CHECK(Gpt4oPieces("caf\303\251") == V{"caf\303\251"});
+  CHECK(Gpt4oPieces("\307\205\307\204\307\206") == V{"\307\205\307\204\307\206"});
+  CHECK(Gpt4oPieces("\312\260ello") == V{"\312\260ello"});
+  CHECK(Gpt4oPieces("A\312\260B") == V{"A\312\260", "B"});
+  CHECK(LlamaPieces("A\312\260B") == V{"A\312\260B"});  // differs
+  CHECK(Gpt4oPieces("\344\275\240\345\245\275ABC") == V{"\344\275\240\345\245\275", "ABC"});
+  CHECK(LlamaPieces("\344\275\240\345\245\275ABC") == V{"\344\275\240\345\245\275ABC"});  // differs
+  CHECK(Gpt4oPieces(" \344\275\240\345\245\275") == V{" \344\275\240\345\245\275"});
+}
+
+TEST_CASE("kGpt4o: combining marks belong to both letter classes (kLlama3 puts them in the punct run)") {
+  CHECK(Gpt4oPieces("e\314\201X") == V{"e\314\201", "X"});
+  CHECK(LlamaPieces("e\314\201X") == V{"e", "\314\201X"});  // differs
+  CHECK(Gpt4oPieces("X\314\201e") == V{"X\314\201e"});
+  CHECK(LlamaPieces("X\314\201e") == V{"X", "\314\201e"});  // differs
+  CHECK(Gpt4oPieces("\314\201abc") == V{"\314\201abc"});
+  CHECK(Gpt4oPieces("word\314\201 \314\201word") == V{"word\314\201", " \314\201word"});
+  CHECK(LlamaPieces("word\314\201 \314\201word") == V{"word", "\314\201", " \314\201", "word"});  // differs
+}
+
+TEST_CASE("kGpt4o: whitespace rules are unchanged from the Qwen/Llama-3 family") {
+  CHECK(Gpt4oPieces("a  b   c") == V{"a", " ", " b", "  ", " c"});
+  CHECK(Gpt4oPieces("\011foo \011 bar  ") == V{"\011foo", " \011", " bar", "  "});
+  CHECK(Gpt4oPieces("  \012 \012  x\012") == V{"  \012 \012", " ", " x", "\012"});
+  CHECK(Gpt4oPieces("trailing   ") == V{"trailing", "   "});
+  CHECK(Gpt4oPieces(" ") == V{" "});
+  CHECK(Gpt4oPieces("\012") == V{"\012"});
+  CHECK(Gpt4oPieces("a") == V{"a"});
+  CHECK(Gpt4oPieces("7") == V{"7"});
+}
+
+
+TEST_CASE("kGpt4o: `/` in the punct-run tail -- only visible AFTER a newline") {
+  // `[^\s\p{L}\p{N}]+` already eats a bare `/`, so the `[\r\n/]*` tail can
+  // only be observed when a `/` follows the \r/\n that the run absorbed.
+  CHECK(Gpt4oPieces("a!\012/b") == V{"a", "!\012/", "b"});
+  CHECK(LlamaPieces("a!\012/b") == V{"a", "!\012", "/b"});  // differs
+  CHECK(Gpt4oPieces("x!\015\012/y") == V{"x", "!\015\012/", "y"});
+  CHECK(LlamaPieces("x!\015\012/y") == V{"x", "!\015\012", "/y"});  // differs
+  CHECK(Gpt4oPieces("end.\012/usr/bin") == V{"end", ".\012/", "usr", "/bin"});
+  CHECK(LlamaPieces("end.\012/usr/bin") == V{"end", ".\012", "/usr", "/bin"});  // differs
+  CHECK(Gpt4oPieces("hi!\012//comment") == V{"hi", "!\012//", "comment"});
+  CHECK(LlamaPieces("hi!\012//comment") == V{"hi", "!\012", "//", "comment"});  // differs
 }

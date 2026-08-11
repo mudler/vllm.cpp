@@ -49,6 +49,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -84,6 +85,9 @@ class RequestOutputCollector {
   // Stored producer errors are rethrown on the consumer thread.
   RequestOutput get();
   std::optional<RequestOutput> get_nowait();
+  // Timed wait on the single-slot collector. nullopt on timeout (no error);
+  // rethrows producer errors. Wakes immediately when put()/put_error().
+  std::optional<RequestOutput> get_for(std::chrono::milliseconds timeout);
 
   bool has_output() const;
   const std::string& request_id() const { return request_id_; }

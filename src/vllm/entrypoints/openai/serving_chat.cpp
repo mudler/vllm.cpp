@@ -341,6 +341,22 @@ class ChatSseStream final : public SseStream {
 
   ~ChatSseStream() override { abort(); }
 
+  // Timed wait on this request's collector. On timeout with pings enabled,
+  // writes a pure SSE comment frame to `ping_chunk` and returns false so next()
+  // can deliver it alone (never concatenated with a data frame). On data,
+  // moves into `out` and returns true.
+  bool WaitOutput(RequestOutput& out, std::string& ping_chunk) {
+    const int ping_s = SsePingIntervalSec();
+    if (ping_s <= 0) {
+      out = engine_.get_output(async_request_);
+      return true;
+    }
+    auto ready = engine_.get_output_for(
+        async_request_, std::chrono::milliseconds(ping_s * 1000));
+    // Shared framing with completion: ping is a standalone comment frame.
+    return AssignSseWaitResult(std::move(ready), out, ping_chunk);
+  }
+
   bool next(std::string& chunk) override {
     if (complete_) return false;
     if (role_pending_) {
@@ -349,7 +365,11 @@ class ChatSseStream final : public SseStream {
       // count; the default path retains its immediately available role frame.
       if (usage_.include_continuous_usage) {
         for (;;) {
-          RequestOutput response = engine_.get_output(async_request_);
+          RequestOutput response;
+          if (!WaitOutput(response, chunk)) {
+            // WaitOutput filled chunk with a pure SSE ping — return it first.
+            return true;
+          }
           prompt_tokens_ =
               static_cast<int>(response.prompt_token_ids.size());
           if (!response.outputs.empty() || response.finished) {
@@ -401,7 +421,9 @@ class ChatSseStream final : public SseStream {
         response = std::move(*buffered_response_);
         buffered_response_.reset();
       } else {
-        response = engine_.get_output(async_request_);
+        if (!WaitOutput(response, chunk)) {
+          return true;  // pure ping frame
+        }
       }
       prompt_tokens_ = static_cast<int>(response.prompt_token_ids.size());
       if (response.outputs.empty()) {
@@ -529,6 +551,14 @@ class ChatSseStream final : public SseStream {
 std::unique_ptr<ToolParser> OpenAIServingChat::MakeToolParser(
     const ChatCompletionRequest& request) const {
   if (tool_parser_name_.empty() || !ToolsEnabled(request)) return nullptr;
+  // Lab/Hermes: free-form Gemma4 often emits bare `call:NAME{ARGS}` (or
+  // detokenized <|tool_call>… text) without the engine's special-token IDs.
+  // Prefer the text-seam gemma4 tool parser so both shapes extract to tool_calls.
+  // Engine-backed gemma4 remains available for other entrypoints via
+  // get_parser_engine("gemma4").
+  if (tool_parser_name_ == "gemma4") {
+    return get_tool_parser("gemma4");
+  }
   // An engine-backed name is served by MakeParserEngine, not the legacy seam.
   if (vllm::parser::get_parser_engine(tool_parser_name_) != nullptr) {
     return nullptr;
@@ -539,6 +569,9 @@ std::unique_ptr<ToolParser> OpenAIServingChat::MakeToolParser(
 std::unique_ptr<vllm::parser::engine::ParserEngine>
 OpenAIServingChat::MakeParserEngine(const ChatCompletionRequest& request) const {
   if (tool_parser_name_.empty() || !ToolsEnabled(request)) return nullptr;
+  if (tool_parser_name_ == "gemma4") {
+    return nullptr;  // OpenAI chat uses text-seam MakeToolParser above.
+  }
   // parser_manager get_parser_engine returns nullptr for a name that is not an
   // engine-backed format, so the legacy MakeToolParser seam handles those. This
   // is the name-selected dispatch swap: engine-backed (qwen3/seed_oss/kimi_k2)

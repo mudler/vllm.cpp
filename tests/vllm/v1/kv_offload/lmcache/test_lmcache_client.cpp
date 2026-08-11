@@ -52,14 +52,17 @@ class MockLmcacheServer {
     ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+    // htonl/ntohs are called UNQUALIFIED on purpose: they are functions in
+    // glibc but function-like MACROS in the Darwin SDK (<sys/_endian.h>), and
+    // `::htonl` does not compile against a macro.
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;  // let the kernel pick a free port
     REQUIRE(::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
                    sizeof(addr)) == 0);
     socklen_t len = sizeof(addr);
     REQUIRE(::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
                           &len) == 0);
-    port_ = ::ntohs(addr.sin_port);
+    port_ = ntohs(addr.sin_port);
     REQUIRE(::listen(listen_fd_, 4) == 0);
     thread_ = std::thread([this] { Run(); });
   }

@@ -477,6 +477,39 @@ std::string FixArgTypes(const std::string& args_json, const std::string& func_na
   return args_json;
 }
 
+
+// Strip trailing partial prefixes of tool markers so stream chunks never leak
+// half a `<|tool_call>` or bare `call:` into content (maint-bot split-tag case).
+void StripTrailingToolMarkerPrefixes(std::string& content_out) {
+  for (std::size_t k = kStart.size() - 1; k >= 1; --k) {
+    if (EndsWith(content_out, kStart.substr(0, k))) {
+      content_out.erase(content_out.size() - k);
+      break;
+    }
+    if (k == 1) break;
+  }
+  // A partial `call:` is only buffered where a BARE call could actually begin:
+  // the same boundary rule ScanBareCalls applies (not inside an identifier or a
+  // path). Without it every content ending in "c" -- topic, music, specific --
+  // is treated as a possible split marker and held back, and this seam has NO
+  // end-of-stream flush, so a response ending on that letter would lose it.
+  for (std::size_t k = kCall.size() - 1; k >= 1; --k) {
+    if (EndsWith(content_out, kCall.substr(0, k))) {
+      const std::size_t at = content_out.size() - k;
+      if (at > 0) {
+        const char prev = content_out[at - 1];
+        if (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_' ||
+            prev == '/') {
+          break;  // part of a word, not the start of a bare call
+        }
+      }
+      content_out.erase(at);
+      break;
+    }
+    if (k == 1) break;
+  }
+}
+
 // ── Wire-format block scan ────────────────────────────────────────────────────
 // One <|tool_call>call:NAME{ARGS}<tool_call|> block recovered from the text.
 struct GemmaCall {
@@ -529,17 +562,89 @@ void ScanBlocks(const std::string& text, std::string& content_out,
     calls_out.push_back(std::move(call));
   }
 
-  // Buffer a trailing partial <|tool_call> start-tag prefix out of content so a
-  // split start tag never leaks (mirrors the engine never emitting a partial
-  // special token as text).
-  for (std::size_t k = kStart.size() - 1; k >= 1; --k) {
-    if (EndsWith(content_out, kStart.substr(0, k))) {
-      content_out.erase(content_out.size() - k);
+  // Buffer trailing partial tool-marker prefixes out of content.
+  StripTrailingToolMarkerPrefixes(content_out);
+}
+
+
+// Bare `call:NAME{ARGS}` fallback — some decodes drop <|tool_call>/<tool_call|>
+// specials (text-only seam / free-form with structural tags off) but still emit
+// the call: body Hermes needs. Brace depth ignores content inside <|"|> strings.
+void ScanBareCalls(const std::string& text, std::string& content_out,
+                   std::vector<GemmaCall>& calls_out) {
+  content_out.clear();
+  calls_out.clear();
+  std::size_t pos = 0;
+  const std::size_t n = text.size();
+  while (pos < n) {
+    const std::size_t s = text.find(kCall, pos);
+    if (s == std::string::npos) {
+      content_out += text.substr(pos);
       break;
     }
-    if (k == 1) break;
+    // Avoid matching inside identifiers ("callback:", paths, etc.).
+    if (s > 0) {
+      const char prev = text[s - 1];
+      if (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_' ||
+          prev == '/') {
+        content_out += text.substr(pos, s + kCall.size() - pos);
+        pos = s + kCall.size();
+        continue;
+      }
+    }
+    content_out += text.substr(pos, s - pos);
+    const std::size_t name_start = s + kCall.size();
+    const std::size_t brace = text.find('{', name_start);
+    if (brace == std::string::npos) {
+      // Incomplete bare call (no '{' yet) — buffer; do not leak as content.
+      break;
+    }
+    GemmaCall call;
+    call.name = Strip(text.substr(name_start, brace - name_start));
+    call.has_name = !call.name.empty();
+    std::size_t i = brace + 1;
+    int depth = 1;
+    bool in_str = false;
+    while (i < n && depth > 0) {
+      if (!in_str && DelimAt(text, i)) {
+        in_str = true;
+        i += kDelimLen;
+        continue;
+      }
+      if (in_str) {
+        if (DelimAt(text, i)) {
+          in_str = false;
+          i += kDelimLen;
+          continue;
+        }
+        ++i;
+        continue;
+      }
+      if (text[i] == '{') {
+        ++depth;
+      } else if (text[i] == '}') {
+        --depth;
+        if (depth == 0) {
+          call.args_text = text.substr(brace + 1, i - (brace + 1));
+          call.complete = true;
+          ++i;
+          break;
+        }
+      }
+      ++i;
+    }
+    if (!call.complete) {
+      call.args_text = text.substr(brace + 1);
+      call.complete = false;
+      pos = n;
+    } else {
+      pos = i;
+    }
+    if (call.has_name) calls_out.push_back(std::move(call));
   }
+  StripTrailingToolMarkerPrefixes(content_out);
 }
+
 
 }  // namespace
 
@@ -555,14 +660,18 @@ nlohmann::ordered_json Gemma4ToolParser::ParseArray(const std::string& arr_str,
 
 ExtractedToolCallInformation Gemma4ToolParser::extract_tool_calls(
     const std::string& model_output, const ChatCompletionRequest& request) {
-  // No start marker -> plain content (unmodified).
-  if (model_output.find(kStart) == std::string::npos) {
-    return ExtractedToolCallInformation{false, {}, model_output};
-  }
   try {
     std::string content;
     std::vector<GemmaCall> calls;
-    ScanBlocks(model_output, content, calls);
+    const bool has_wrapped = model_output.find(kStart) != std::string::npos;
+    if (has_wrapped) {
+      ScanBlocks(model_output, content, calls);
+    } else if (model_output.find(kCall) != std::string::npos) {
+      // Lab/Hermes free-form path: bare call:NAME{ARGS} without specials.
+      ScanBareCalls(model_output, content, calls);
+    } else {
+      return ExtractedToolCallInformation{false, {}, model_output};
+    }
 
     std::vector<ToolCall> tool_calls;
     for (const GemmaCall& c : calls) {
@@ -580,9 +689,14 @@ ExtractedToolCallInformation Gemma4ToolParser::extract_tool_calls(
       return ExtractedToolCallInformation{false, {}, model_output};
     }
 
-    // Content = text before the first <|tool_call>, stripped; None when empty.
+    // Content = text before the first tool marker, stripped; None when empty.
     std::optional<std::string> content_opt;
-    const std::size_t first = model_output.find(kStart);
+    std::size_t first = std::string::npos;
+    if (has_wrapped) {
+      first = model_output.find(kStart);
+    } else {
+      first = model_output.find(kCall);
+    }
     if (first != std::string::npos && first > 0) {
       const std::string c = Strip(model_output.substr(0, first));
       if (!c.empty()) content_opt = c;
@@ -604,7 +718,17 @@ std::optional<DeltaMessage> Gemma4ToolParser::extract_tool_calls_streaming(
   try {
     std::string content;
     std::vector<GemmaCall> calls;
-    ScanBlocks(current_text, content, calls);
+    // Unified content path: never emit a trailing partial `<|tool_call>` or
+    // bare `call:` prefix (split-across-chunks). Full markers dispatch to the
+    // wrapped / bare scanners; otherwise treat text as content with buffering.
+    if (current_text.find(kStart) != std::string::npos) {
+      ScanBlocks(current_text, content, calls);
+    } else if (current_text.find(kCall) != std::string::npos) {
+      ScanBareCalls(current_text, content, calls);
+    } else {
+      content = current_text;
+      StripTrailingToolMarkerPrefixes(content);
+    }
 
     DeltaMessage msg;
     std::vector<DeltaToolCall> deltas;

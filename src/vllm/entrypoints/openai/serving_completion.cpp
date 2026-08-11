@@ -36,6 +36,18 @@ class CompletionSseStream final : public SseStream {
 
   ~CompletionSseStream() override { abort(); }
 
+  bool WaitOutput(RequestOutput& out, std::string& ping_chunk) {
+    const int ping_s = SsePingIntervalSec();
+    if (ping_s <= 0) {
+      out = engine_.get_output(request_);
+      return true;
+    }
+    auto ready = engine_.get_output_for(
+        request_, std::chrono::milliseconds(ping_s * 1000));
+    // Shared framing with chat: ping is a standalone comment frame.
+    return AssignSseWaitResult(std::move(ready), out, ping_chunk);
+  }
+
   bool next(std::string& chunk) override {
     if (complete_) return false;
     if (usage_pending_) {
@@ -59,7 +71,10 @@ class CompletionSseStream final : public SseStream {
     }
 
     for (;;) {
-      RequestOutput response = engine_.get_output(request_);
+      RequestOutput response;
+      if (!WaitOutput(response, chunk)) {
+        return true;  // pure SSE ping
+      }
       prompt_tokens_ = static_cast<int>(response.prompt_token_ids.size());
       if (response.outputs.empty()) {
         if (response.finished) {

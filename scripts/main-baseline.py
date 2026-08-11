@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -48,6 +49,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 WORKFLOW_FILE = "ci.yml"
+WORKFLOW_PATH = ROOT / ".github/workflows" / WORKFLOW_FILE
 BRANCH = "main"
 # The lane's own verdict job. It is still `in_progress` while it queries, so
 # counting it would make every baseline permanently non-green.
@@ -59,6 +61,71 @@ BASELINE_EVENTS = ("schedule", "workflow_dispatch")
 # not green". Reported separately and never counted either way.
 NOT_RUN_CONCLUSIONS = frozenset({"skipped"})
 GREEN = "success"
+
+# THE JOBS A BASELINE MUST COVER, and why a set is needed at all.
+#
+# Without one the verdict was purely subtractive: whatever the API happened to
+# return got graded, and nothing noticed what it did NOT return. Called with
+# eight of the nine covered jobs simply absent, it printed GREEN with `jobs
+# covered: 1`. So a job renamed, deleted or accidentally `if:`-guarded off the
+# lane by an unrelated PR would silently narrow the baseline while it kept
+# publishing green -- the same shape as the `continue-on-error` trap above, just
+# reached by omission instead of by a masked conclusion.
+#
+# Pinned here and cross-checked against `baseline-summary`'s `needs:` list in
+# ci.yml by `tests/scripts/test_main_baseline.py`, so renaming a job reds the
+# suite in the PR that renames it rather than quietly shrinking the baseline.
+EXPECTED_JOBS = (
+    "agent-record",
+    "build-test-cpu",
+    "build-test-cpu-arm64",
+    "build-test-vulkan",
+    "cuda-arch-features",
+    "cuda-fat-build",
+    "device-leakage",
+    "sanitize-cpu",
+    "vulkan-spirv-freshness",
+)
+
+
+def expected_jobs_from_workflow(path: Path = WORKFLOW_PATH) -> tuple[str, ...]:
+    """`baseline-summary`'s `needs:` list, read from the workflow text.
+
+    The workflow is the authority on which jobs the lane runs; `EXPECTED_JOBS`
+    is the pin that a test compares against this, so the two cannot drift.
+    """
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    block = re.search(
+        rf"(?ms)^  {re.escape(SUMMARY_JOB)}:$\n(.*?)(?=^  [A-Za-z0-9_-]+:$|\Z)", text
+    )
+    if block is None:
+        return ()
+    # No DOTALL here, deliberately: with it, `      - .+\n` swallows the whole
+    # rest of the job and the "expected jobs" set becomes shell fragments.
+    needs = re.search(r"(?m)^    needs:$\n((?:      - .+\n)+)", block.group(1))
+    if needs is None:
+        return ()
+    return tuple(
+        sorted(
+            line.strip()[1:].strip()
+            for line in needs.group(1).splitlines()
+            if line.strip()
+        )
+    )
+
+
+def job_matches(expected: str, name: str) -> bool:
+    """Does an API job name belong to expected job id `expected`?
+
+    A matrix job reports as `sanitize-cpu (address,undefined)`, one entry per
+    lane; a plain job reports as its own id.
+    """
+
+    return name == expected or name.startswith(f"{expected} (")
 
 
 @dataclass
@@ -72,6 +139,8 @@ class Verdict:
     failing: list[str] = field(default_factory=list)
     covered: list[str] = field(default_factory=list)
     not_run: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
     url: str = ""
 
     def as_dict(self) -> dict:
@@ -83,20 +152,28 @@ class Verdict:
             "failing": self.failing,
             "covered": self.covered,
             "not_run": self.not_run,
+            "pending": self.pending,
+            "missing": self.missing,
             "url": self.url,
         }
 
 
-def verdict(run: dict, jobs: list[dict]) -> Verdict:
+def verdict(run: dict, jobs: list[dict], expected: tuple[str, ...] | None = None) -> Verdict:
     """Per-job verdict for one run. NEVER reads `run["conclusion"]`.
 
     `continue-on-error: true` on `sanitize-cpu` means the run conclusion can be
     `success` while that job is `failure`; run 31448896841 is exactly that. Fails
-    closed: no covered job is "unknown", which is not green.
+    closed three ways: a job that ran and was not green is `failing`, a job that
+    has not finished is `pending`, and an EXPECTED job the payload never
+    mentioned (or only mentions as skipped) is `missing`. None of the three is
+    green, and the third is the one absence could otherwise wear green's face.
     """
+    if expected is None:
+        expected = EXPECTED_JOBS
     covered: list[str] = []
     failing: list[str] = []
     not_run: list[str] = []
+    pending: list[str] = []
     for entry in jobs:
         name = entry.get("name", "")
         if name == SUMMARY_JOB:
@@ -105,17 +182,36 @@ def verdict(run: dict, jobs: list[dict]) -> Verdict:
         if conclusion in NOT_RUN_CONCLUSIONS:
             not_run.append(name)
             continue
+        if conclusion is None:
+            # Queued or still running. Fail-closed like everything else here,
+            # but it is not a FAILURE and must not be reported as one.
+            pending.append(name)
+            continue
         covered.append(name)
         if conclusion != GREEN:
             failing.append(name)
+    # A skipped job is present in the payload and did NOT run, so it cannot
+    # discharge an expectation: `skipped` reads as absent here, deliberately.
+    ran = [
+        entry.get("name", "")
+        for entry in jobs
+        if entry.get("conclusion") not in NOT_RUN_CONCLUSIONS
+    ]
+    missing = [
+        name
+        for name in expected
+        if not any(job_matches(name, actual) for actual in ran)
+    ]
     return Verdict(
         sha=run.get("head_sha", ""),
         created_at=run.get("created_at", ""),
         run_id=run.get("id", 0),
-        green=bool(covered) and not failing,
+        green=bool(covered) and not failing and not pending and not missing,
         failing=failing,
         covered=covered,
         not_run=not_run,
+        pending=pending,
+        missing=missing,
         url=run.get("html_url", ""),
     )
 
@@ -244,6 +340,10 @@ def render(verdicts: list[Verdict], degraded: str | None) -> str:
         lines.append(f"{item.created_at}  {item.sha[:12]}  {state:5s}  run {item.run_id}")
         if item.failing:
             lines.append(f"    failed:    {', '.join(item.failing)}")
+        if item.pending:
+            lines.append(f"    pending:   {', '.join(item.pending)}")
+        if item.missing:
+            lines.append(f"    missing:   {', '.join(item.missing)}")
         if item.not_run:
             lines.append(f"    not run:   {', '.join(item.not_run)}")
     lines.append("")
@@ -253,7 +353,12 @@ def render(verdicts: list[Verdict], degraded: str | None) -> str:
         lines.append(f"NEWEST BASELINE: GREEN at {newest.sha}")
     else:
         lines.append(f"NEWEST BASELINE: RED at {newest.sha}")
-        lines.append(f"  failing: {', '.join(newest.failing)}")
+        if newest.failing:
+            lines.append(f"  failing: {', '.join(newest.failing)}")
+        if newest.pending:
+            lines.append(f"  pending: {', '.join(newest.pending)}")
+        if newest.missing:
+            lines.append(f"  missing (expected, never ran): {', '.join(newest.missing)}")
 
     green = last_green(verdicts)
     if green is None:
@@ -293,7 +398,7 @@ def emit_summary(item: Verdict, stream) -> int:
     stream.write(f"# main baseline: {state}\n\n")
     stream.write(f"- commit: `{item.sha}`\n")
     stream.write(f"- run: {item.run_id}\n")
-    stream.write(f"- jobs covered: {len(item.covered)}\n")
+    stream.write(f"- jobs covered: {len(item.covered)} of {len(EXPECTED_JOBS)} expected\n")
     if item.not_run:
         stream.write(f"- not run (skipped on this lane): {', '.join(item.not_run)}\n")
     stream.write("\n")
@@ -305,8 +410,21 @@ def emit_summary(item: Verdict, stream) -> int:
             "\nThe verdict is per-job. `sanitize-cpu` is `continue-on-error`, so "
             "the run's own conclusion may still read `success`.\n"
         )
-    else:
-        stream.write("Every covered job is green.\n")
+    if item.pending:
+        stream.write("\n## Still running\n\n")
+        for name in item.pending:
+            stream.write(f"- `{name}`\n")
+    if item.missing:
+        stream.write("\n## Expected but never ran\n\n")
+        for name in item.missing:
+            stream.write(f"- `{name}`\n")
+        stream.write(
+            "\nA baseline that does not cover every expected job certifies less "
+            "than it claims, so this is RED. Renaming or removing a job re-pins "
+            "`EXPECTED_JOBS` in the same change.\n"
+        )
+    if item.green:
+        stream.write("Every expected job ran and is green.\n")
     stream.write(
         "\nRead the history with `scripts/main-baseline.py` (issue #274, spec "
         "`.agents/specs/main-verifiability.md`).\n"
@@ -357,7 +475,12 @@ def main(argv: list[str] | None = None) -> int:
         print_json(verdicts, degraded)
     else:
         print(render(verdicts, degraded))
-    return 1 if degraded else 0
+    # Absence exits NON-ZERO, for the same reason REMOTE_UNVERIFIED does. "No
+    # completed baseline run found on main" is the strongest possible statement
+    # that main is unverified, and exiting 0 let `main-baseline.py && echo ok`
+    # read it as a pass -- the exact confusion between absence and success this
+    # module was written to prevent.
+    return 1 if (degraded or not verdicts) else 0
 
 
 if __name__ == "__main__":

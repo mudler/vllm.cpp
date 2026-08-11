@@ -276,13 +276,45 @@ reason goes in `## Outcome`.
    absence explicitly when there is none.
 4. **`cancelled` and `skipped` are not green.** A cancelled job must never be
    folded into a pass.
-5. **Workflow shape**, asserted against `.github/workflows/ci.yml` text:
-   every job-level concurrency group carries the event discriminator; the
-   baseline lane is non-cancellable; `baseline-summary` is gated to
-   schedule/dispatch; `schedule` and `workflow_dispatch` triggers exist; and
-   `push`/`pull_request` grouping is unchanged.
+5. **Workflow shape**, asserted against `.github/workflows/ci.yml`: every
+   job-level concurrency group carries the event discriminator;
+   `baseline-summary` is gated to schedule/dispatch; and `schedule` /
+   `workflow_dispatch` triggers exist.
 6. **Offline degradation** returns `REMOTE_UNVERIFIED` rather than an empty
-   green.
+   green, and so does absence — "no completed baseline run found" exits
+   NON-ZERO, because `main-baseline.py && echo ok` must not print `ok` when
+   nothing has ever run.
+7. **Expected-job coverage.** A payload missing eight of the nine covered jobs
+   is RED and names them, rather than printing GREEN with `jobs covered: 1`.
+   `EXPECTED_JOBS` is cross-checked against `baseline-summary`'s `needs:` list,
+   so renaming a job reds this suite in the PR that renames it.
+8. **In-progress is `pending`, not `failed`.** Both are non-green; only one is
+   a true statement about the job.
+
+**Tests 5, 9-12 EVALUATE the workflow; they do not grep it.** The first version
+of this suite checked substrings and four planted defects walked through it, so
+each is now an assertion about a *resolved value*:
+
+9.  **Cancellation policy**, resolved to a boolean per event by a small
+    GitHub-expression evaluator: `push`/`pull_request` → `true`,
+    `schedule`/`workflow_dispatch` → `false`, on all nine job groups and on the
+    workflow-level key. Inverting the polarity to
+    `== 'schedule' || == 'workflow_dispatch'` preserves every substring and
+    reverses the meaning of all nine.
+10. **Group keys pinned as an equality** against the base revision's key
+    (`git show 0eb049f7:.github/workflows/ci.yml`) with the constant `-<event>`
+    inserted — which is the entire content of the "`push`/`pull_request`
+    grouping is unchanged" claim, and the only form of it that catches an added
+    `${{ github.sha }}`. Plus a by-name blocklist of run-varying tokens.
+11. **The verdict job cannot swallow its own failure**: no `|| true`, `; true`
+    or `set +e` in the `--emit-summary` step body, and no `continue-on-error` on
+    the job. Either one rebuilds the `sanitize-cpu` defect this row exists to
+    expose, one level up.
+12. **`agent-record`'s two `github.event.before` consumers are EXECUTED** under
+    a `python3` shim on all four events — see *Gates*.
+13. **This suite is registered** in `scripts/agent-preflight.sh`'s `SUITES` and
+    in the `agent-record` job, and that job is unconditional. Guarding a claim
+    with a test nothing runs is not guarding it.
 
 ## Gates
 
@@ -300,16 +332,44 @@ change cannot be proven by the PR's own CI run: the PR run is a `pull_request`
 event on a PR ref, so it exercises neither the `schedule` trigger (GitHub only
 fires `schedule` on the default branch, and only for the version of the workflow
 committed there) nor the main-branch grouping. Everything green before merge is
-static: the YAML parses, the suites pass, the workflow text says what it should.
+static: the YAML parses and the suites pass.
+
+**"The workflow text says what it should" was itself unearned, and this row
+proved it.** That sentence stood here through the first implementation, and the
+first fresh review falsified it: `agent-record` is in `baseline-summary`'s
+`needs:`, carried the same diff-scoped `github.event.before` logic that was
+correctly guarded out of `documentation-checkpoint` and `commit-protocol-tag`,
+and carried no event guard of its own. On a `schedule` payload `PUSH_BASE`
+renders empty and, under `set -eu`, `check-commit-trailers.py --range ..<sha>`
+exits 2 — so the lane could never have published anything but RED, and every
+static gate above was green while that was true. Reading a workflow is not
+running it. The repair guards the two range-scoped calls in place (the rest of
+that job is tree-scoped and the baseline needs it) and
+`tests/scripts/test_main_baseline.py::AgentRecordDiffRangeTests` **executes**
+both step bodies under a `python3` shim, on all four events, asserting both
+directions: no range-scoped call where there is no range, and the range-scoped
+calls still happen on `push` and `pull_request`.
+
 The claims that only a post-merge observation can settle:
 
 * a scheduled run actually fires on the chosen cron;
 * it survives concurrent pushes to `main` instead of being cancelled;
 * `baseline-summary` obtains the Actions API result for its own run with the
   default `GITHUB_TOKEN` and `actions: read`;
-* `scripts/main-baseline.py` finds and parses real baseline runs.
+* `scripts/main-baseline.py` finds and parses real baseline runs;
+* **every job in `baseline-summary`'s `needs:` can reach a green conclusion on a
+  `schedule` payload.** `agent-record` demonstrably could not, and it was the
+  only one anybody had reason to doubt only because it is the one carrying
+  diff-scoped logic — but no static gate here distinguishes "runs green on the
+  push lane" from "runs green on the baseline lane", so the first scheduled run
+  is where each of the nine is observed for the first time. Any job that comes
+  back RED for a *lane* reason rather than a *tree* reason is this same defect
+  in a different job, and is repaired the same way;
+* the verdict's `missing` bucket stays empty against a real payload — i.e. the
+  job names the Actions API reports still match `EXPECTED_JOBS` (matrix lanes
+  arrive as `sanitize-cpu (thread)`, which is why the match is by id prefix).
 
-`## Outcome` is not written until those four are observed. The first scheduled
+`## Outcome` is not written until those six are observed. The first scheduled
 run is expected **RED** on the six sanitizer failures — that is the correct
 first verdict, not a regression introduced here.
 
@@ -319,6 +379,11 @@ first verdict, not a regression introduced here.
 * [#301](https://github.com/mudler/vllm.cpp/issues/301) / #274 finding #1 — the
   six sanitizer failures. Independent, in flight in parallel, deliberately
   untouched. They are what the first baseline will report.
+* [#408](https://github.com/mudler/vllm.cpp/issues/408) — filed while repairing
+  this row's review findings: 12 of 54 `tests/scripts` suites are executed by
+  nothing, this row's own suite having been one of them. The instance is fixed
+  here; the class needs a checker-semantics change with its own spec and
+  mutation evidence, which is why it is filed rather than folded in.
 * **No matrix row owns CI infrastructure.** Every `ENG-*` row in
   `.agents/engine-matrix.md` is an engine capability; no row, in any matrix,
   covers `.github/workflows/`. The issue table admits `—` in its Row column
@@ -355,6 +420,9 @@ first verdict, not a regression introduced here.
 | 6 | The scheduled trigger goes dormant — GitHub disables cron on repos with 60 days of no activity | Not a live risk at 20 pushes/day, and `scripts/main-baseline.py` shows the newest baseline's **date**, so a stopped lane reads as stale rather than as green. |
 | 7 | Cron drift under load; `schedule` is best-effort | Staleness is visible for the same reason as #6. |
 | 8 | A baseline pins a SHA nobody can reproduce | It pins the SHA the run checked out, and the run's own logs are the evidence. |
+| 9 | A covered job cannot be green on the baseline lane at all, so the verdict is permanently RED for a reason that is not about the tree | Found in review, in `agent-record`; see *Gates*. Guarded, and `AgentRecordDiffRangeTests` executes the step bodies rather than reading them. The residual is the other eight jobs, which are observed for the first time by the first scheduled run — named in the owed-observation list. |
+| 10 | **Recorded, not fixed.** `scripts/check-role-discipline.py` accepts `--base ""` and silently degrades: `commits_in_range` (`scripts/check-role-discipline.py:328-333`) cannot resolve the empty base, falls back to `[head]`, and prints `OK: every change on main arrived on a task branch` — a PASS covering ONE commit while looking like it covered a range | On the baseline lane the call is now skipped loudly instead, so this row does not rely on the degradation either way; the two lanes that do have a range (`push`, `pull_request`) are unaffected. The underlying checker behaviour is untouched here: it is a checker-semantics change, which under AGENTS.md needs its own spec and red-before evidence, and it is out of scope for a CI-lane row. Anyone giving that checker an empty base elsewhere gets a vacuous pass. |
+| 11 | A suite that guards this row runs on no machine | Exactly what happened: `tests/scripts/test_main_baseline.py` shipped in neither `scripts/agent-preflight.sh`'s `SUITES` nor the `agent-record` job, so all of its tests ran nowhere. Registered in both, and `SuiteRegistrationTests` now asserts both registrations. The CLASS — 12 of 54 `tests/scripts` suites are executed by nothing, and `check-test-registration.py`'s fixed `REQUIRED_TESTS` cannot see it — is [#408](https://github.com/mudler/vllm.cpp/issues/408). |
 
 **Decisions.** (i) Baseline in `ci.yml`, not a second workflow — one definition
 of the suite, no drift. (ii) Sanitizers binding **on the baseline lane only**.

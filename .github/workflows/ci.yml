@@ -152,7 +152,29 @@ jobs:
         run: |
           python3 scripts/check-gemv-invocation-consistency.py
           python3 tests/scripts/test_check_gemv_invocation_consistency.py
+      - name: The main baseline lane and its reader stay honest
+        # Registered in TWO places, deliberately: here and in the `SUITES` array
+        # of `scripts/agent-preflight.sh`. It shipped in neither, so the 24 tests
+        # that guard the baseline lane ran on no machine -- the same class of
+        # defect as an unregistered CTest target, one layer up. #408 tracks
+        # whether a checker should catch the class; this closes the instance.
+        run: |
+          python3 tests/scripts/test_main_baseline.py
       - name: Protocol prose matches the checkers that enforce it
+        # PART tree-scoped, PART diff-scoped, and the two must be told apart on
+        # the baseline lane (#274). `documentation-checkpoint` and
+        # `commit-protocol-tag` opt OUT of `schedule`/`workflow_dispatch`
+        # wholesale because they are diff-scoped end to end; this job cannot,
+        # because most of it is tree-scoped and the baseline needs it. So the
+        # RANGE-SCOPED call is guarded here instead of the whole job.
+        #
+        # Without that guard this step DID kill the lane: a `schedule` payload
+        # has no `github.event.before`, `PUSH_BASE` renders empty, and under
+        # `set -eu` the walk aborts with
+        #   `--range: range must be exactly BASE..HEAD` (exit 2)
+        # so `agent-record` could never be green and `baseline-summary`, which
+        # `needs:` it, could never publish GREEN. Reproduced by replaying this
+        # body with EVENT_NAME=schedule, PUSH_BASE="".
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
@@ -173,7 +195,12 @@ jobs:
             base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
-          python3 scripts/check-commit-trailers.py --range "$base..$head"
+          if [ -z "$base" ]; then
+            echo "no diff range on the $EVENT_NAME lane: the trailer walk is"
+            echo "diff-scoped and every commit's own push already ran it."
+          else
+            python3 scripts/check-commit-trailers.py --range "$base..$head"
+          fi
       - name: NOW.md stays a short one-Read resume surface
         run: |
           python3 scripts/check-now-current.py
@@ -191,6 +218,16 @@ jobs:
           python3 scripts/check-gate-commands.py --check
           python3 tests/scripts/test_check_gate_commands.py
       - name: Agent role machinery and role discipline
+        # Same split as the step above: the two suites are tree-scoped and run
+        # on every lane; `check-role-discipline.py --base/--head` is DIFF-scoped
+        # and is skipped where there is no range.
+        #
+        # It would not have aborted on its own -- passing `--base ""` makes
+        # `commits_in_range` fall back to the head commit alone
+        # (scripts/check-role-discipline.py:328-333), so the baseline lane would
+        # have reported a PASS covering one commit while looking like it covered
+        # a range. Skipping loudly beats passing vacuously. Recorded as risk 10
+        # in .agents/specs/main-verifiability.md.
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
@@ -208,8 +245,13 @@ jobs:
             base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
-          python3 scripts/check-role-discipline.py \
-            --base "$base" --head "$head" "${pending_args[@]}"
+          if [ -z "$base" ]; then
+            echo "no diff range on the $EVENT_NAME lane: role discipline is"
+            echo "diff-scoped and every commit's own push already ran it."
+          else
+            python3 scripts/check-role-discipline.py \
+              --base "$base" --head "$head" "${pending_args[@]}"
+          fi
           python3 tests/scripts/test_agent_role.py
           python3 tests/scripts/test_agent_onboard.py
       - name: Claim view, helper queue and PR reviewability

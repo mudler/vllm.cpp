@@ -111,6 +111,7 @@ SUITES=(
   test_check_test_registration
   test_audit_live_rows
   test_check_gate_commands
+  test_main_baseline
 )
 
 failed=()

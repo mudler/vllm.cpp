@@ -265,25 +265,22 @@ class RatchetTests(unittest.TestCase):
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
-    def test_now_derived_is_credited_for_real_commands(self):
-        # ENG-NOW-DERIVED (#374) joins the runnable population on arrival, so it
-        # earns the credit the same way: its spec's Gates section must name
-        # commands that can actually fail. Its gate is the record gate -- no
-        # CUDA, GPU or SACRED gate is implicated because no product source is
-        # touched, and the spec says so rather than leaving the absence unread.
+    def test_now_derived_left_the_gated_population_cleanly(self):
+        # The row was credited runnable on arrival at ACTIVE and left the gated
+        # population the same day on reaching PARTIAL -- its work landed in
+        # dbd0d51c and the residual `## Now` backfill has no scheduled command,
+        # because a row acquires the line when it MOVES. Assert the departure is
+        # complete on BOTH sides: gone from the audit AND gone from the baseline.
+        # A row present in one and not the other is exactly what the exact pin
+        # exists to catch.
         verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
-        self.assertEqual(verdicts.get("ENG-NOW-DERIVED"), "runnable")
-        spec = (ROOT / ".agents/specs/now-derived.md").read_text(encoding="utf-8")
-        for command in ("scripts/agent-preflight.sh", "agent-integration.py"):
-            with self.subTest(command=command):
-                self.assertIn(command, spec)
+        self.assertIsNone(verdicts.get("ENG-NOW-DERIVED"))
+        self.assertNotIn("ENG-NOW-DERIVED", gates.RUNNABLE_BASELINE)
 
-    def test_the_now_derived_re_pin_is_load_bearing(self):
-        # MUTATION: drop the entry and the exact pin must break, so the baseline
-        # is not decorative.
-        reduced = set(gates.RUNNABLE_BASELINE) - {"ENG-NOW-DERIVED"}
+    def test_re_adding_the_departed_row_breaks_the_pin(self):
+        # MUTATION: the baseline must still be load-bearing after the shrink.
         runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
-        self.assertNotEqual(runnable, reduced)
+        self.assertNotEqual(runnable, set(gates.RUNNABLE_BASELINE) | {"ENG-NOW-DERIVED"})
         self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
 
     def test_record_conflict_surfaces_is_credited_for_real_commands(self):

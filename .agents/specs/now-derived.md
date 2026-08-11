@@ -196,10 +196,66 @@ reliable target and the mapping must be fixed first.
 
 ## Now
 
-W2 next: drop `NOW` from the lifecycle triple and require the moved row's spec to
-carry this section.
+DONE at `dbd0d51c`: no implementation step remains; use `scripts/now.py` for the
+derived live position.
 
 ## Outcome
 
-Pending. To be written at `DONE` with the measured changed-path set of a
-lifecycle PR, what was rejected, and why each retained cap sits where it does.
+Landed `dbd0d51c` (PR #376). The performance/parity result is honestly `VOID`:
+this is local protocol/checker machinery with no vLLM analogue, and it changes
+no product source, model output, latency, throughput, or memory behavior.
+
+**What was measured.** `.agents/NOW.md` left the lifecycle triple and
+`PUBLIC_SURFACES`. The binding lifecycle-path test passes with exactly the moved
+matrix, that row's own spec, `docs/STATUS.md`, and `docs/BENCHMARKS.md`;
+`.agents/NOW.md` is absent. The paired suite ran 26 cases: omitting the spec,
+omitting either public projection, removing `## Now`, or leaving it empty fails,
+and the mutation that restores `NOW` to the lifecycle triple makes the NOW-free
+case fail again. `scripts/now.py` rendered 105 live rows in ~50 ms with no
+network; its 11-case suite preserves the roster while reporting
+`REMOTE_UNVERIFIED`. The 15-case digest suite rejects table regrowth, and its
+mutation proves `ROW_TABLE_LINE` is load-bearing.
+
+The stronger draft shorthand "touches no shared surface" is rejected as
+inaccurate: `STATUS` and `BENCHMARKS` intentionally remain lifecycle
+projections. The measured result is narrower and sufficient: no lifecycle PR
+writes the shared *live-position digest*.
+
+**What the implementation found that the plan had not.** Two consumers of the
+per-row table were not in the issue's inventory: `check-release-binary-contract.py`
+pinned a literal Release row inside NOW.md, and two of #364's own tests asserted
+that adding a ROW to NOW.md is free. Both were relocated rather than deleted. This
+is the second time scoping this class of change from analysis alone missed a
+consumer — the first was #364's `pr-size` finding — which is an argument for
+grepping every reader of a surface before removing it, not for a bigger spec.
+
+**What was rejected.** Deleting `.agents/NOW.md` outright: the current gate and
+the cross-row next actions are authored judgement no generator produces. Merely
+enlarging its budget keeps the write lock and postpones the same eviction;
+dropping freshness loses the obligation instead of relocating it. A digest that
+needs a network to print would be worse than the file it replaced. Deriving
+claims solely from `gh pr list` was rejected for the same offline reason in #364
+and stays rejected here.
+
+**The cost, recorded because it was not flagged before landing.** Removing a
+shared surface imposes a ONE-TIME conflict on every in-flight branch that touched
+it. Measured after the merge: 5 of the 8 still-conflicting open PRs conflict on
+`.agents/NOW.md` and 4 on `check-public-doc-tables.py`, and #360 was `MERGEABLE`
+before this work and `CONFLICTING` after. The resolution is mechanical — take
+main's version, move the row's next step into its own spec's `## Now` — but the
+cost is real and should have been stated in the spec before the change landed.
+
+**Why the backfill is progressive.** Requiring `## Now` in every existing spec at
+once would be a bulk edit across ~100 files, which is exactly the unreviewable
+shared-surface rewrite this row exists to avoid. The requirement therefore binds
+on movement, and `now.py` shows a dash until a row moves. This is the selected
+compatibility policy, not unfinished work in this row.
+
+**Why the retained defaults remain.** Offline-first rendering preserves cold
+start and degrades explicitly to `REMOTE_UNVERIFIED`. The freshness stamp and
+the three authored headings say when the snapshot was known true and retain the
+non-derivable operator context. The 100-line cap keeps that context readable in
+one pass; the 400-character per-entry cap bounds narrative growth locally. The
+old 6,000-byte cap stays removed because variable-size edits forced unrelated
+evictions. The per-row-table regrowth guard stays enabled so the eliminated
+shared writer cannot silently return.

@@ -258,14 +258,15 @@ def audit() -> list[dict]:
 # `tests/scripts/` and `agent-integration.py` invocations the record gate runs
 # with, and records that no CUDA/GPU/SACRED gate is implicated because no product
 # source is touched. Growth, so the set is re-pinned in the same change.
-# 2026-08-11: +ENG-NOW-DERIVED. The row reaches ACTIVE on its committed spec
-# (issue #374), whose Gates section names the exact preflight, tests/scripts
-# and agent-integration invocations it runs with, and records that no
-# CUDA/GPU/SACRED gate is implicated because no product source is touched.
-# Growth, so the set is re-pinned in the same change.
+# 2026-08-11: +ENG-NOW-DERIVED on arrival at ACTIVE, then REMOVED the same day
+# when the row reached PARTIAL and left the gated population entirely (its
+# verdict is now None, not a downgraded one). The row's work landed in dbd0d51c;
+# what remains is the progressive `## Now` backfill, which has no gate command
+# because it has no scheduled work -- a row acquires the line when it moves. A
+# shrink for a real record edit, named here as the message demands, never to make
+# a failing gate pass.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
-    "ENG-NOW-DERIVED",
     "ENG-RECORD-CONFLICT-SURFACES",
     "SAMPLE-PROMPT-LOGPROBS",
     "ATTN-ROPE-FAMILY",

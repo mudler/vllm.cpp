@@ -328,9 +328,12 @@ set(VT_CUDA_FEATURE_TABLE
   "scaledmm-c3x-sm100|10.0a|CUTLASS C3x FP8 scaled-mm tcgen05 GEMM, sm100 build-verify (VT_SCALEDMM_C3X_SM100)"
   # Vendored Marlin NVFP4 W4A16 grouped-MoE GEMM (src/vt/cuda/marlin/).
   # upstream: vLLM MARLIN_ARCHS "8.0+PTX;12.0a;12.1a" (CMakeLists.txt:558) — the
-  # sm80+PTX leg is NOT claimed here: our vendored slice is the bf16 NVFP4
-  # instantiation only and has never been built or run outside sm_12x.
-  "marlin-nvfp4|12.0a,12.1a|vendored Marlin NVFP4 W4A16 MoE GEMM (VT_MARLIN_NVFP4)"
+  # sm80+PTX leg is still NOT claimed: our vendored slice is the bf16 NVFP4
+  # instantiation only, and sm_8x has never been built or run.
+  # sm_110 (Jetson Thor) IS claimed: built and validated on-device — every
+  # __CUDA_ARCH__ guard under src/vt/cuda/marlin/ selects, for 1100, the same
+  # side an already-supported arch selects. See issue #325.
+  "marlin-nvfp4|11.0,12.0a,12.1a|vendored Marlin NVFP4 W4A16 MoE GEMM (VT_MARLIN_NVFP4)"
   # Vendored FlashAttention-2 prefill/decode split-KV kernels.
   # upstream: vLLM builds FA2 for the WHOLE requested CUDA_ARCHS list, incl
   # 8.0;8.6;8.7;8.9 (vllm/cmake/external_projects/vllm_flash_attn.cmake:6-8 @ pin

@@ -4,6 +4,11 @@ How to port a model, kernel, or feature. The rules are in
 [`AGENTS.md`](../AGENTS.md); this is the method. Nothing here is binding on its
 own.
 
+Porting a **model** specifically? Work through
+[`porting-a-model.md`](porting-a-model.md) as well — this file is the method,
+that one is the coverage checklist (weight formats including GGUF k-quants,
+multimodal, speculative decoding, the serving surface, records).
+
 ## Before you write anything
 
 Verify the recorded gap against the *current* pinned upstream and the current

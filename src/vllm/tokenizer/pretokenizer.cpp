@@ -41,7 +41,10 @@
 
 #include "vllm/tokenizer/pretokenizer.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <string_view>
+#include <vector>
 
 #include "vllm/tokenizer/unicode_data.h"
 
@@ -125,6 +128,87 @@ size_t MatchLetterRun(std::string_view t, size_t pos, bool marks_in_run) {
   return p;
 }
 
+// Tekken rules 1-2, the CASE-AWARE letter alternatives:
+//   [^\r\n\p{L}\p{N}]? [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]* [\p{Ll}\p{Lm}\p{Lo}\p{M}]+
+//   [^\r\n\p{L}\p{N}]? [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+ [\p{Ll}\p{Lm}\p{Lo}\p{M}]*
+// The two classes OVERLAP on {Lm, Lo, M}, so this needs real backtracking and
+// cannot be folded into MatchLetterRun's single-predicate scan.
+bool InTekkenUpperClass(uint32_t cp) {
+  if (Category(cp) == UCat::kMark) return true;  // \p{M} is in BOTH classes
+  const LetterCase lc = LetterCaseOf(cp);
+  return lc == LetterCase::kUpper || lc == LetterCase::kCaseless;
+}
+
+bool InTekkenLowerClass(uint32_t cp) {
+  if (Category(cp) == UCat::kMark) return true;  // \p{M} is in BOTH classes
+  const LetterCase lc = LetterCaseOf(cp);
+  return lc == LetterCase::kLower || lc == LetterCase::kCaseless;
+}
+
+// Scans a maximal run of `pred` from `from`, recording every codepoint
+// boundary so the caller can give characters back (regex backtracking).
+void ScanRun(std::string_view t, size_t from, bool (*pred)(uint32_t),
+             std::vector<size_t>& stops) {
+  stops.clear();
+  stops.push_back(from);
+  size_t p = from;
+  while (p < t.size()) {
+    const Cp c = DecodeAt(t, p);
+    if (!pred(c.cp)) break;
+    p = c.end;
+    stops.push_back(p);
+  }
+}
+
+// `upper_first_required`: alternative 2 needs [U]+ then [L]*; alternative 1
+// needs [U]* then [L]+. Returns the match end, or 0 for no match.
+size_t MatchTekkenAlt(std::string_view t, size_t from, bool upper_first_required,
+                      std::vector<size_t>& scratch) {
+  ScanRun(t, from, InTekkenUpperClass, scratch);
+  // [U]* / [U]+ are greedy, so walk the give-back positions longest-first;
+  // the FIRST that lets the second half match is what the regex engine picks.
+  for (size_t i = scratch.size(); i-- > 0;) {
+    const size_t split = scratch[i];
+    const size_t upper_len = i;  // codepoints consumed by the upper run
+    if (upper_first_required && upper_len == 0) break;  // [U]+ needs >= 1
+    size_t p = split;
+    size_t lower_len = 0;
+    while (p < t.size()) {
+      const Cp c = DecodeAt(t, p);
+      if (!InTekkenLowerClass(c.cp)) break;
+      p = c.end;
+      ++lower_len;
+    }
+    if (!upper_first_required && lower_len == 0) continue;  // [L]+ needs >= 1
+    if (p > from) return p;
+  }
+  return 0;
+}
+
+size_t MatchTekkenLetterRun(std::string_view t, size_t pos,
+                            std::vector<size_t>& scratch) {
+  // Alternation is ORDERED and `X?` is greedy, so the engine tries, in order:
+  // alt1-with-prefix, alt1-without, alt2-with-prefix, alt2-without.
+  for (int alt = 0; alt < 2; ++alt) {
+    const bool upper_first_required = alt == 1;
+    for (int use_prefix = 1; use_prefix >= 0; --use_prefix) {
+      size_t start = pos;
+      if (use_prefix != 0) {
+        const Cp c0 = DecodeAt(t, pos);
+        const UCat cat = Category(c0.cp);
+        if (c0.cp == U'\r' || c0.cp == U'\n' || cat == UCat::kLetter ||
+            cat == UCat::kNumber || c0.end >= t.size()) {
+          continue;  // this codepoint cannot serve as the optional prefix
+        }
+        start = c0.end;
+      }
+      const size_t end = MatchTekkenAlt(t, start, upper_first_required, scratch);
+      if (end != 0) return end;
+    }
+  }
+  return 0;
+}
+
 // Rule 3: \p{N} (Qwen, max_digits=1) | \p{N}{1,3} (Llama-3, max_digits=3;
 // greedy, so long digit runs split into groups of three from the left).
 size_t MatchNumbers(std::string_view t, size_t pos, int max_digits) {
@@ -141,10 +225,13 @@ size_t MatchNumbers(std::string_view t, size_t pos, int max_digits) {
 
 // Rule 4: ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` (Qwen3.6; marks_excluded=true)
 //         ` ?[^\s\p{L}\p{N}]+[\r\n]*`      (Llama-3; marks_excluded=false)
+//         ` ?[^\s\p{L}\p{N}]+[\r\n/]*`     (Tekken;  slash_in_tail=true)
 // Optional single literal ASCII space, then >=1 codepoints that are not
 // regex-space/letters/numbers (nor marks, for Qwen), then any trailing \r/\n
-// bytes. If only the space matched, the rule fails as a whole.
-size_t MatchPunctRun(std::string_view t, size_t pos, bool marks_excluded) {
+// bytes -- and '/' too for Tekken. If only the space matched, the rule fails
+// as a whole.
+size_t MatchPunctRun(std::string_view t, size_t pos, bool marks_excluded,
+                     bool slash_in_tail) {
   size_t p = pos;
   if (t[p] == ' ') ++p;
   const size_t run_begin = p;
@@ -159,7 +246,10 @@ size_t MatchPunctRun(std::string_view t, size_t pos, bool marks_excluded) {
     p = c.end;
   }
   if (p == run_begin) return 0;
-  while (p < t.size() && IsNewlineByte(t[p])) ++p;
+  while (p < t.size() &&
+         (IsNewlineByte(t[p]) || (slash_in_tail && t[p] == '/'))) {
+    ++p;
+  }
   return p;
 }
 
@@ -516,15 +606,28 @@ std::vector<std::pair<size_t, size_t>> Pretokenize(std::string_view text,
   // UNIQUE to the Qwen3.6 regex. Classic Qwen2/Qwen3 and Llama-3 both treat
   // marks like ordinary punct-run codepoints. Number grouping is single-digit
   // for BOTH Qwen variants; only Llama-3 groups \p{N}{1,3}.
-  const bool marks_aware = pattern == SplitPattern::kQwen2;
+  // kTekken needs these two APART: marks live inside its letter classes (like
+  // kQwen2) while its punct negation is [^\s\p{L}\p{N}] with no \p{M} (like
+  // kLlama3). No other pattern mixes them, which is why one flag sufficed
+  // until now.
+  const bool tekken = pattern == SplitPattern::kTekken;
+  const bool marks_in_run = pattern == SplitPattern::kQwen2 || tekken;
+  const bool marks_excluded = pattern == SplitPattern::kQwen2;
   const int max_digits = pattern == SplitPattern::kLlama3 ? 3 : 1;
   std::vector<std::pair<size_t, size_t>> spans;
+  std::vector<size_t> scratch;  // reused give-back stops for the Tekken scan
   size_t pos = 0;
   while (pos < text.size()) {
-    size_t end = MatchContraction(text, pos);
-    if (end == 0) end = MatchLetterRun(text, pos, /*marks_in_run=*/marks_aware);
+    // Tekken has NO (?i:'s|'t|...) alternative at all.
+    size_t end = tekken ? 0 : MatchContraction(text, pos);
+    if (end == 0) {
+      end = tekken ? MatchTekkenLetterRun(text, pos, scratch)
+                   : MatchLetterRun(text, pos, marks_in_run);
+    }
     if (end == 0) end = MatchNumbers(text, pos, max_digits);
-    if (end == 0) end = MatchPunctRun(text, pos, /*marks_excluded=*/marks_aware);
+    if (end == 0) {
+      end = MatchPunctRun(text, pos, marks_excluded, /*slash_in_tail=*/tekken);
+    }
     if (end == 0) end = MatchWsNewlines(text, pos);
     if (end == 0) end = MatchWsNotBeforeNonSpace(text, pos);
     if (end == 0) end = MatchWs(text, pos);

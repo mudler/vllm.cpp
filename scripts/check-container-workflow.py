@@ -57,7 +57,9 @@ def validate(text: str) -> list[str]:
     for fragment in (
         "  push:\n    tags: ['v*']",
         "  pull_request:",
-        "  workflow_dispatch: {}",
+        # A manual entry point must exist; whether it takes inputs is not this
+        # gate's business, so match the key rather than the empty-mapping form.
+        "  workflow_dispatch:",
         "permissions:\n  contents: read",
     ):
         if fragment not in text:

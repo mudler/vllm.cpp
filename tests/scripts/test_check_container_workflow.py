@@ -154,6 +154,14 @@ class PullRequestSafetyTests(unittest.TestCase):
         text = SHIPPED.replace("  pull_request:\n", "")
         assert_flags(self, text, "pull_request")
 
+    def test_dropping_the_manual_entry_point_is_rejected(self):
+        """The matcher was widened from `workflow_dispatch: {}` to the key alone
+        so the dispatch could take a full_matrix input. What it still has to
+        enforce is that a manual entry point EXISTS -- a dry run is how a lane
+        outside the pull-request matrix gets proved."""
+        text = SHIPPED.replace("  workflow_dispatch:\n", "")
+        assert_flags(self, text, "workflow_dispatch")
+
     def test_continue_on_error_is_rejected(self):
         text = SHIPPED.replace(
             "  verify:\n    needs: plan\n", "  verify:\n    continue-on-error: true\n    needs: plan\n"

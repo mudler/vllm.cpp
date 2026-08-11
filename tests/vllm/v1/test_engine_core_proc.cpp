@@ -30,12 +30,16 @@
 //     deferred (core.py:196-223 selection; ENG-ASYNC-SCHED W3).
 #include <doctest/doctest.h>
 
+#include <atomic>
+#include <chrono>
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "vllm/config/scheduler.h"
@@ -65,12 +69,14 @@ using vllm::v1::EngineShutdownState;
 using vllm::v1::Executor;
 using vllm::v1::FinishReason;
 using vllm::v1::FullAttentionSpec;
+using vllm::v1::BlockingQueue;
 using vllm::v1::get_request_block_hasher;
 using vllm::v1::init_none_hash;
 using vllm::v1::InprocClient;
 using vllm::v1::KVCacheConfig;
 using vllm::v1::ModelRunnerBase;
 using vllm::v1::ModelRunnerOutput;
+using vllm::v1::PublishEngineCoreInputWaveAtomically;
 using vllm::v1::Request;
 using vllm::v1::Scheduler;
 using vllm::v1::SchedulerOutput;
@@ -78,6 +84,60 @@ using vllm::v1::sha256_cbor;
 using vt::DType;
 
 namespace {
+
+struct MoveGate {
+  std::atomic<bool> armed{false};
+  std::atomic<bool> entered{false};
+  std::atomic<bool> release{false};
+  std::atomic<bool> throw_on_move{false};
+};
+
+struct GatedMoveItem {
+  GatedMoveItem() = default;
+  GatedMoveItem(int value, std::shared_ptr<MoveGate> gate)
+      : value(value), gate(std::move(gate)) {}
+  GatedMoveItem(const GatedMoveItem&) = delete;
+  GatedMoveItem& operator=(const GatedMoveItem&) = delete;
+
+  GatedMoveItem(GatedMoveItem&& other)
+      : value(other.value), gate(std::move(other.gate)) {
+    if (gate != nullptr && value == 2 && gate->armed.load()) {
+      gate->entered.store(true);
+      while (!gate->release.load()) std::this_thread::yield();
+      if (gate->throw_on_move.load()) {
+        throw std::runtime_error("injected batch element move failure");
+      }
+    }
+  }
+
+  GatedMoveItem& operator=(GatedMoveItem&& other) noexcept {
+    value = other.value;
+    gate = std::move(other.gate);
+    return *this;
+  }
+
+  int value = 0;
+  std::shared_ptr<MoveGate> gate;
+};
+
+struct CountingConditionVariable {
+  void notify_one() { ++notifications; }
+
+  template <typename Lock, typename Predicate>
+  void wait(Lock&, Predicate&&) {}
+
+  static inline int notifications = 0;
+};
+
+struct PutManyOnlyQueue {
+  int publish_calls = 0;
+  std::vector<int> published;
+
+  void put_many_nowait(std::vector<int> items) {
+    ++publish_calls;
+    published = std::move(items);
+  }
+};
 
 // The canned token the stub "samples" for every scheduled request (same seam
 // as test_engine_core.cpp; upstream drives a real tiny model).
@@ -180,6 +240,82 @@ void LoopUntilDone(InprocClient& client, const std::set<std::string>& want,
 }
 
 }  // namespace
+
+TEST_CASE("engine core wave route owns one atomic put-many publish") {
+  PutManyOnlyQueue queue;
+  PublishEngineCoreInputWaveAtomically(queue, std::vector<int>{4, 5, 6});
+
+  CHECK(queue.publish_calls == 1);
+  CHECK(queue.published == std::vector<int>{4, 5, 6});
+}
+
+TEST_CASE("BlockingQueue batch publish is all-at-once and ordered") {
+  BlockingQueue<GatedMoveItem> queue;
+  const auto gate = std::make_shared<MoveGate>();
+  std::vector<GatedMoveItem> batch;
+  batch.emplace_back(1, gate);
+  batch.emplace_back(2, gate);
+  batch.emplace_back(3, gate);
+  gate->armed.store(true);
+
+  auto producer = std::async(std::launch::async, [&] {
+    queue.put_many_nowait(std::move(batch));
+  });
+  for (int i = 0; i < 100 && !gate->entered.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE(gate->entered.load());
+
+  // The first element has already been appended, but a consumer must not be
+  // able to acquire the queue mutex until the complete wave is present.
+  auto consumer = std::async(std::launch::async, [&] {
+    GatedMoveItem item;
+    const bool found = queue.try_get(item);
+    return std::make_pair(found, item.value);
+  });
+  CHECK(consumer.wait_for(std::chrono::milliseconds(20)) ==
+        std::future_status::timeout);
+
+  gate->release.store(true);
+  producer.get();
+  const auto first = consumer.get();
+  CHECK(first == std::make_pair(true, 1));
+
+  GatedMoveItem item;
+  REQUIRE(queue.try_get(item));
+  CHECK(item.value == 2);
+  REQUIRE(queue.try_get(item));
+  CHECK(item.value == 3);
+  CHECK_FALSE(queue.try_get(item));
+}
+
+TEST_CASE("BlockingQueue batch publish rolls back an appended suffix on failure") {
+  BlockingQueue<GatedMoveItem> queue;
+  const auto gate = std::make_shared<MoveGate>();
+  queue.put_nowait(GatedMoveItem(9, gate));
+
+  std::vector<GatedMoveItem> batch;
+  batch.emplace_back(1, gate);
+  batch.emplace_back(2, gate);
+  batch.emplace_back(3, gate);
+  gate->armed.store(true);
+  gate->release.store(true);
+  gate->throw_on_move.store(true);
+  CHECK_THROWS_AS(queue.put_many_nowait(std::move(batch)), std::runtime_error);
+
+  gate->armed.store(false);
+  GatedMoveItem item;
+  REQUIRE(queue.try_get(item));
+  CHECK(item.value == 9);
+  CHECK_FALSE(queue.try_get(item));
+}
+
+TEST_CASE("BlockingQueue successful batch emits one notification") {
+  CountingConditionVariable::notifications = 0;
+  BlockingQueue<int, CountingConditionVariable> queue;
+  queue.put_many_nowait(std::vector<int>{1, 2, 3});
+  CHECK(CountingConditionVariable::notifications == 1);
+}
 
 // ---------------------------------------------------------------------------
 // Normal request cycle (test_engine_core_client.py:548-562): add N requests,

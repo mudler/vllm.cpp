@@ -60,6 +60,8 @@
 #ifndef VT_CUDA_GDN_PREFILL_CONV_H_
 #define VT_CUDA_GDN_PREFILL_CONV_H_
 
+#include <cstdint>
+
 namespace vt::cuda {
 
 // Pure predicate for the VT_CONV_REG contract: DEFAULT ON. The register-window
@@ -77,6 +79,80 @@ inline bool ConvRegFlagIsOn(const char* env_value) {
 // family at 720.047 -> 234.607 ms (3.07x), with byte-identical output tokens.
 inline bool ConvExactChunksFlagIsOn(const char* env_value) {
   return env_value == nullptr || env_value[0] != '0';
+}
+
+// Three-arm same-binary experiment for the remaining prefill causal-conv gap.
+// Arm 0 is the sealed runtime-width kernel. Arms 1 and 2 are valid only for the
+// production width K=4: respectively one and two channels per 128-thread lane.
+// Unset and every spelling except the exact strings "1" and "2" preserve arm 0.
+enum class ConvChannelTileArm : uint8_t {
+  kRuntimeWidth = 0,
+  kWidthFour = 1,
+  kWidthFourTwoChannels = 2,
+};
+
+inline constexpr ConvChannelTileArm ConvChannelTileArmFromEnv(const char* env_value) {
+  if (env_value != nullptr && env_value[0] == '1' && env_value[1] == '\0') {
+    return ConvChannelTileArm::kWidthFour;
+  }
+  if (env_value != nullptr && env_value[0] == '2' && env_value[1] == '\0') {
+    return ConvChannelTileArm::kWidthFourTwoChannels;
+  }
+  return ConvChannelTileArm::kRuntimeWidth;
+}
+
+inline constexpr ConvChannelTileArm ResolveConvChannelTileArm(ConvChannelTileArm requested,
+                                                              int64_t channels,
+                                                              int64_t kernel_width) {
+  if (requested != ConvChannelTileArm::kRuntimeWidth &&
+      (channels <= 0 || kernel_width != 4)) {
+    return ConvChannelTileArm::kRuntimeWidth;
+  }
+  return requested;
+}
+
+struct ConvChannelTileLaunchContract {
+  ConvChannelTileArm arm;
+  int64_t feature_blocks;
+  int64_t threads_per_block;
+};
+
+inline constexpr int64_t kConvChannelTileThreads = 128;
+
+inline constexpr ConvChannelTileLaunchContract ConvChannelTileLaunchContractFor(
+    const char* env_value, int64_t channels, int64_t kernel_width) {
+  const ConvChannelTileArm arm = ResolveConvChannelTileArm(
+      ConvChannelTileArmFromEnv(env_value), channels, kernel_width);
+  const int64_t channels_per_block =
+      arm == ConvChannelTileArm::kWidthFourTwoChannels ? 256 : 128;
+  return ConvChannelTileLaunchContract{
+      arm,
+      channels > 0 ? (channels + channels_per_block - 1) / channels_per_block : 0,
+      kConvChannelTileThreads,
+  };
+}
+
+// One shared dispatch seam for both the CUDA launcher and portable tests. Keeping
+// the arm selection here means the tests exercise the exact branch logic used in
+// production without adding a launch counter or other debug state to the hot path.
+// The callbacks inline away at each call site and receive the already-resolved
+// geometry, including runtime-width fallback for unsupported shapes.
+template <typename RuntimeWidthLaunch, typename WidthFourLaunch,
+          typename WidthFourTwoChannelsLaunch>
+inline decltype(auto) DispatchConvChannelTileLaunch(
+    const char* env_value, int64_t channels, int64_t kernel_width,
+    RuntimeWidthLaunch&& runtime_width_launch,
+    WidthFourLaunch&& width_four_launch,
+    WidthFourTwoChannelsLaunch&& width_four_two_channels_launch) {
+  const ConvChannelTileLaunchContract contract =
+      ConvChannelTileLaunchContractFor(env_value, channels, kernel_width);
+  if (contract.arm == ConvChannelTileArm::kWidthFour) {
+    return width_four_launch(contract);
+  }
+  if (contract.arm == ConvChannelTileArm::kWidthFourTwoChannels) {
+    return width_four_two_channels_launch(contract);
+  }
+  return runtime_width_launch(contract);
 }
 
 // Pure predicate for the VT_GDN_POSTCONV_SPLIT contract: DEFAULT OFF (OPT-IN). The
@@ -117,6 +193,31 @@ inline bool GdnPostConvSplitFlagIsOn(const char* env_value) {
 //       environment value is present AND its first char is '0' (rollback).
 inline bool GdnPostConvFastFlagIsOn(const char* env_value) {
   return env_value == nullptr || env_value[0] != '0';
+}
+
+// Experimental spelling of vLLM's fused post-conv work partition: 16 tokens per
+// block, one Q/K or V head per grid.y program, four warps. It remains opt-in until
+// same-binary correctness and performance gates close; unset and '0' keep the
+// byte-identical fast megablock default above.
+inline bool GdnPostConvTokenTileFlagIsOn(const char* env_value) {
+  return env_value != nullptr && env_value[0] != '0';
+}
+
+// Shared production eligibility contract for the token-tile kernel. The
+// explicit split experiment retains priority, and the token-tile indexing owns
+// exactly four 32-element feature groups per lane, so both Q/K and V head
+// widths must independently be 128. Unsupported shapes keep the existing
+// megablock/split dispatch.
+inline bool GdnPostConvTokenTileEligible(bool split, const char* env_value,
+                                         int64_t dk, int64_t dv) {
+  return !split && GdnPostConvTokenTileFlagIsOn(env_value) && dk == 128 &&
+         dv == 128;
+}
+
+inline constexpr int64_t kGdnPostConvTokenTileTokens = 16;
+
+inline constexpr int64_t GdnPostConvTokenTileGridX(int64_t tokens) {
+  return (tokens + kGdnPostConvTokenTileTokens - 1) / kGdnPostConvTokenTileTokens;
 }
 
 }  // namespace vt::cuda

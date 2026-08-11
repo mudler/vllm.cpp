@@ -6,6 +6,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
@@ -898,6 +899,119 @@ std::vector<KVCacheBlock*> FreeKVCacheBlockQueue::get_all_free_blocks() const {
     curr_block = curr_block->next_free_block;
   }
   return ret;
+}
+
+namespace {
+
+// vllm/utils/mem_utils.py:30-31 format_gib: `f"{round(b / GiB_bytes, 2)}"`.
+// Fixed 2 decimals rather than Python's float repr (which drops a trailing
+// zero); the value is identical, only "1.50" vs "1.5" differs.
+std::string FormatGiB(int64_t bytes) {
+  const double gib = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+  std::array<char, 64> buf{};
+  std::snprintf(buf.data(), buf.size(), "%.2f", gib);
+  return std::string(buf.data());
+}
+
+// The vllm.cpp-specific half of the remediation advice. Upstream points at
+// `gpu_memory_utilization`, which our loader does not implement yet
+// (model_loader.cpp ResolveNumBlocks step 3, TODO ROAD-V1-MEM M3), so name the
+// knobs that do size the pool here. Additive: upstream's sentence is kept
+// verbatim ahead of it.
+constexpr const char* kLocalRemediation =
+    " In vllm.cpp the KV pool is sized by `--num-blocks` / `--kv-cache-memory`"
+    " (gpu_memory_utilization profiling is not ported yet), so raise one of"
+    " those or lower `--max-model-len`.";
+
+constexpr const char* kConservingMemoryDoc =
+    " See https://docs.vllm.ai/en/latest/configuration/conserving_memory/"
+    " for more details.";
+
+}  // namespace
+
+int64_t kv_memory_needed_bytes(int64_t max_model_len, int block_size,
+                               int64_t bytes_per_block) {
+  if (max_model_len <= 0 || block_size <= 0 || bytes_per_block <= 0) {
+    return 0;
+  }
+  // Whole blocks only: ceil(max_model_len / block_size).
+  const int64_t blocks =
+      (max_model_len + block_size - 1) / static_cast<int64_t>(block_size);
+  return blocks * bytes_per_block;
+}
+
+int64_t estimate_max_model_len(int64_t available_memory,
+                               int64_t bytes_per_block, int block_size) {
+  // Upstream binary-searches `max_memory_usage_bytes(len) <= available_memory`.
+  // That predicate is `ceil(len / block_size) * bytes_per_block <= available`,
+  // whose largest solution is `(available / bytes_per_block) * block_size` —
+  // written closed-form because our per-block geometry does not vary with the
+  // block count (see KVBytesPerBlock).
+  if (available_memory <= 0 || bytes_per_block <= 0 || block_size <= 0) {
+    return 0;
+  }
+  const int64_t blocks = available_memory / bytes_per_block;
+  return blocks * static_cast<int64_t>(block_size);
+}
+
+void check_enough_kv_cache_memory(int64_t available_memory,
+                                  int64_t needed_memory, int64_t max_model_len,
+                                  int64_t estimated_max_model_len) {
+  // kv_cache_utils.py:757-765.
+  if (available_memory <= 0) {
+    throw std::invalid_argument(
+        std::string(
+            "No available memory for the cache blocks. Try increasing "
+            "`gpu_memory_utilization` when initializing the engine (this flag "
+            "also controls CPU memory reservation on the CPU backend, despite "
+            "its name).") +
+        kLocalRemediation + kConservingMemoryDoc);
+  }
+
+  // kv_cache_utils.py:769-788.
+  if (needed_memory > available_memory) {
+    std::string estimated_msg;
+    if (estimated_max_model_len > 0) {
+      estimated_msg = "Based on the available memory, the estimated maximum "
+                      "model length is " +
+                      std::to_string(estimated_max_model_len) + ". ";
+    }
+    throw std::invalid_argument(
+        "To serve at least one request with the model's max seq len (" +
+        std::to_string(max_model_len) + "), (" + FormatGiB(needed_memory) +
+        " GiB KV cache is needed, which is larger than the available KV cache "
+        "memory (" +
+        FormatGiB(available_memory) + " GiB). " + estimated_msg +
+        "Try increasing `gpu_memory_utilization` (which also controls CPU "
+        "memory on the CPU backend) or decreasing `max_model_len` when "
+        "initializing the engine." +
+        kLocalRemediation + kConservingMemoryDoc);
+  }
+}
+
+int64_t auto_fit_max_model_len(int64_t derived_max_model_len,
+                               int64_t available_memory,
+                               int64_t bytes_per_block, int block_size) {
+  // kv_cache_utils.py:1986-1992: an attention-free model has no KV to fit, so
+  // the derived length stands.
+  if (bytes_per_block <= 0) {
+    return derived_max_model_len;
+  }
+  const int64_t auto_fit_max =
+      estimate_max_model_len(available_memory, bytes_per_block, block_size);
+  // kv_cache_utils.py:2005-2010.
+  if (auto_fit_max <= 0) {
+    throw std::invalid_argument(
+        "Cannot auto-fit max_model_len: not enough GPU memory available to "
+        "serve even a single token. Try increasing `gpu_memory_utilization`." +
+        std::string(kLocalRemediation));
+  }
+  // kv_cache_utils.py:2012-2027: keep the full context when it fits, else
+  // reduce to what does.
+  if (auto_fit_max >= derived_max_model_len) {
+    return derived_max_model_len;
+  }
+  return auto_fit_max;
 }
 
 }  // namespace vllm::v1

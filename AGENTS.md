@@ -192,6 +192,13 @@ exact tracked exception. Never hand-roll a parallel path.
 New hardware, architectures, and models are **additive** files that mirror
 vLLM's structure.
 
+A model port covers the **quantized arms, not just bf16**. GGUF k-quants in
+particular are a standing requirement, not a per-model choice: they are what most
+users can actually run, and they are what a quant-matched llama.cpp comparison
+needs. An arm that is not implemented is refused with a message naming the
+missing piece and recorded as owed — never left to be discovered later.
+[`.agents/porting-a-model.md`](.agents/porting-a-model.md) is the checklist.
+
 ## Records
 
 Every inventory item has a stable ID and records upstream source, local anchor,
@@ -320,6 +327,7 @@ Read the one for the job in front of you.
 
 | Doing this | Read |
 |---|---|
+| Porting a MODEL (the coverage checklist) | [`.agents/porting-a-model.md`](.agents/porting-a-model.md) |
 | Porting a model, kernel, or feature from vLLM | [`.agents/porting.md`](.agents/porting.md) |
 | Running gates, proving correctness, reviewing | [`.agents/verification.md`](.agents/verification.md) |
 | Measuring performance | [`.agents/benchmarking.md`](.agents/benchmarking.md) |

@@ -272,6 +272,15 @@ class Scheduler {
   // deferred with their config-gated metric families (see loggers.h).
   SchedulerStats make_stats() const;
 
+  // Emit the chunked-prefill progress lines for the step just executed
+  // (VT_SERVER_PREFILL_PROGRESS / VT_SERVER_VERBOSE). Called by EngineCore
+  // AFTER execute_model, because schedule() advances num_computed_tokens before
+  // the GPU has run and timing it there reports the rate of an empty step. A
+  // pure diagnostic: no engine state is read or written beyond the request map,
+  // and the whole body is a no-op when the knob is off. NOT upstream — vLLM logs
+  // this from its Python front end.
+  void LogPrefillAfterExecute(const SchedulerOutput& scheduler_output);
+
  protected:
   // _update_after_schedule (scheduler.py:1166-1213): advance num_computed_tokens
   // for every scheduled request, refresh is_prefill_chunk (num_computed <

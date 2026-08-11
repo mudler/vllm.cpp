@@ -59,6 +59,10 @@ std::pair<std::map<int, EngineCoreOutputs>, bool> EngineCore::step() {
   // execute_model returns None ("forward done"), so we always call sample_tokens.
   std::optional<ModelRunnerOutput> model_output =
       executor_.execute_model(scheduler_output);
+  // Chunked-prefill progress, AFTER the forward so its elapsed_s is real wall
+  // time rather than the cost of scheduling. No-op unless
+  // VT_SERVER_PREFILL_PROGRESS / VT_SERVER_VERBOSE is on.
+  scheduler_.LogPrefillAfterExecute(scheduler_output);
   // core.py:492 grammar_output = self.scheduler.get_grammar_bitmask(...). Nullopt
   // when no structured request is scheduled (or no manager is wired); threaded to
   // sample_tokens (Task 3 consumes it).
@@ -144,6 +148,8 @@ EngineCore::step_with_batch_queue() {
     // done). A failed eager forward throws here, through the engine-fatal guard.
     std::optional<ModelRunnerOutput> exec_out =
         executor_.execute_model(scheduler_output);
+    // Same diagnostic as the synchronous path above.
+    scheduler_.LogPrefillAfterExecute(scheduler_output);
     // core.py:552-553 model_executed = total_num_scheduled_tokens > 0
     // (is_ec_consumer is always true for us — no EC transfer).
     model_executed = scheduler_output.total_num_scheduled_tokens > 0;

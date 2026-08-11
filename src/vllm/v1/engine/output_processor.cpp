@@ -575,6 +575,28 @@ std::vector<std::string> OutputProcessor::abort_requests(
   return request_ids_to_abort;
 }
 
+void OutputProcessor::rollback_requests(
+    const std::vector<std::string>& request_ids) noexcept {
+  for (const std::string& request_id : request_ids) {
+    auto request_it = request_states_.find(request_id);
+    if (request_it == request_states_.end()) continue;
+
+    const RequestState& state = *request_it->second;
+    auto external_it = external_req_ids_.find(state.external_req_id);
+    if (external_it != external_req_ids_.end()) {
+      std::vector<std::string>& internal_ids = external_it->second;
+      internal_ids.erase(
+          std::remove(internal_ids.begin(), internal_ids.end(), request_id),
+          internal_ids.end());
+      if (internal_ids.empty()) external_req_ids_.erase(external_it);
+    }
+    if (state.parent_req != nullptr) {
+      parent_requests_.erase(state.parent_req->request_id());
+    }
+    request_states_.erase(request_it);
+  }
+}
+
 std::vector<std::string> OutputProcessor::abort_all_requests(
     bool produce_final_output) {
   std::vector<std::string> request_ids;

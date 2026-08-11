@@ -18244,3 +18244,622 @@ located. They establish **nothing** about how fast vllm.cpp runs Muse Glimmer,
 nothing about how it compares to any engine, and nothing about vLLM — which
 remains the only bar that counts and remains unavailable. **No ceiling is
 claimed or implied anywhere in this entry.**
+## 2026-08-08 — sm_120 fused GDN post-conv 16-token tile: 1.859x kernel, byte-exact
+
+**Disposition:** IMPLEMENTED as opt-in `VT_GDN_POSTCONV_TOKEN_TILE=1`.
+Locally positive and token-safe; default and release-model gates remain open.
+
+**Selection and falsification.** On exact-chunks `c3bb0f39a`, the accepted
+Qwen3.5-4B/c32/1,280-block graph-node trace measured fast megablock
+228.150171 ms and the existing per-V-head split 448.364941 ms across 1,728
+calls. Both token files were identical. The split is 1.965x slower and the
+enclosing run 0.97% slower, so V-only launch decomposition is rejected.
+Pinned vLLM's same-tool `_fused_post_conv_kernel` is 108.034870 ms across 1,923
+calls. Source comparison instead selected vLLM/FLA's 16-token, per-head,
+four-warp schedule and Q/K register reuse.
+
+**Implementation and numerical mutant.** `GdnPostConvTokenTileKernel` maps one
+block to `(16 tokens, one Q/K or V head)` and one warp to four tokens. Each Q/K
+lane retains features `lane+{0,32,64,96}` across normalization. The first
+implementation summed those four squares sequentially before a warp reduction:
+kernel time improved 227.731960→122.472980 ms and enclosing throughput
+6731.69→6773.85 tok/s, but the tile token SHA
+`1d496ff0f989978155d8e900c7a5500a43db26816dead8e035310d0bf9cb9756`
+did not match fast `83fcdc45...453545`; REJECTED. Reproducing the current
+128-lane tree exactly—`(i+i+64)`, then `(i+i+32)`, then shuffle offsets
+16/8/4/2/1—restored byte identity without restoring the reload/barrier costs.
+
+**Final same-binary profile.** One `/tmp/gpu` lock, 22/25 GiB user-systemd
+scope, `--cuda-graph-trace=node`, identical production workload and binary:
+
+| Axis | fast megablock | token tile | change |
+|---|---:|---:|---:|
+| post-conv GPU total, 1,728 calls | 227.887066 ms | **122.587027 ms** | **1.858982x faster** |
+| mean post-conv call | 131.879 us | **70.942 us** | **46.21% lower** |
+| total throughput | 6734.82 tok/s | **6770.62 tok/s** | **+0.532%** |
+| output throughput | 744.72 tok/s | **748.68 tok/s** | **+0.532%** |
+| TTFT | 1024.14 ms | **1015.43 ms** | **-0.850%** |
+| TPOT / ITL | 35.01 ms | **34.85 ms** | **-0.457%** |
+| E2E | 5469.87 ms | **5440.81 ms** | **-0.531%** |
+
+The vLLM kernel residual is now **1.134699x**, down from 2.112x. Final token
+files are identical, full SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Portable flag/grid tests pass 6/6·50; CUDA GDN passes 67/67·4384 including
+partial/exact tiles, packed BA non-zero views/wider row strides, byte-exact five
+outputs, finiteness and norms; cached Qwen3.5-4B passes 3/3·1672.
+
+**Evidence.** Final fast/tile traces
+`/tmp/qwen35-postconv-tile-exact-{fast,tile}.nsys-rep`, SHA-256
+`c75e2cb...bcadc` / `a0eb1808...f418`; token files beside them. Rejected
+arithmetic traces `/tmp/qwen35-postconv-tile-wip-{fast,tile}.nsys-rep`, SHA-256
+`c2d8872e...b774` / `1c42d489...d66b`. Selection traces and exact recipes are
+in [the spike/result](specs/sm120-qwen35-postconv-token-tile-2026-08-08.md).
+One local profile is not extrapolated to the unavailable Qwen3.6-27B/35B gates;
+the flag therefore remains opt-in.
+
+## 2026-08-08 — sm_120 causal-conv residual: K=4 specialization wins; 256-channel tile falsified
+
+**Disposition:** arm 1 is IMPLEMENTED, byte-exact and locally positive behind
+`VT_CONV_CHANNEL_TILE=1`; arm 2 (`=2`) is retained as an explicit falsified
+experiment. Unset/`0` remains the default pending repeated and release-model
+gates.
+
+**Divide-and-conquer selection.** Fresh current-main/post-conv tracing measured
+causal conv 234.255 ms versus pinned-vLLM 145.532 ms, while post-conv's
+remaining excess was only 14.476 ms. Grouping causal-conv launches by grid
+showed the 279/280-program waves consumed 136.189 ms (58.1%). Local used 64
+feature blocks and runtime width at 43 registers/thread; vLLM used `BLOCK_N=256`,
+32 feature blocks and compile-time width at 32 registers/thread. The spike split
+those differences into arm 1 (compile-time K=4, unchanged 64 blocks) and arm 2
+(K=4 plus two channels/thread, 32 blocks).
+
+**Correctness/review finding.** A serial-stripe arm 2 corrupted the second
+stripe when an exact final-chunk block wrote state before stripe 2 loaded initial
+history; the CUDA matrix caught it and the accepted kernel preloads both stripes.
+Fresh mutation review then found byte comparisons could stay green when a whole
+specialized dispatch branch was deleted. A fresh fix routes production through
+the same portable callback dispatcher the tests mutate. Scoped re-review killed
+arm-1 deletion, arm-2 deletion, relaxed arm-2 parsing and removed non-K4 fallback.
+Final gates: portable 9/9·88, CUDA GDN 67/67·4631, paged-forward 4/4·8.
+
+**VOID series.** `/tmp/qwen35-conv-arm{0,1,2}-565a26fcc.*` is invalid for
+selection: the test executables had rebuilt but `vllm-bench` had not relinked.
+All three traces proved the old runtime kernel/grid/registers ran. This was
+caught structurally before timing interpretation.
+
+**Accepted rebuilt same-binary profile.** One GPU lock, 22/25 GiB user-systemd
+scope, exact c32 workload and `--cuda-graph-trace=node`:
+
+| Axis | arm 0 runtime | arm 1 K4x1 | arm 2 K4x2 |
+|---|---:|---:|---:|
+| kernel / grid / registers | runtime / 64 / 43 | K4<1> / 64 / 52 | K4<2> / 32 / 58 |
+| causal-conv total, 1,728 calls | 234.604587 ms | **219.506425 ms** | 228.400830 ms |
+| 279-program mean | 149.546 us | **140.133 us** | 145.586 us |
+| 280-program mean | 149.480 us | **139.982 us** | 145.468 us |
+| total throughput | 6759.39 tok/s | **6767.62 tok/s** | 6757.19 tok/s |
+| output throughput | 747.43 tok/s | **748.34 tok/s** | 747.19 tok/s |
+| TTFT | 1016.69 ms | **1013.82 ms** | 1017.61 ms |
+| TPOT / ITL | 34.91 ms | **34.88 ms** | 34.91 ms |
+| E2E | 5449.87 ms | **5443.16 ms** | 5451.66 ms |
+
+Arm 1 improves conv **6.4356%**, with every enclosing axis positive but small.
+It leaves a **1.5083x** same-tool vLLM conv residual. Register count rises rather
+than falls, falsifying the occupancy rationale; compile-time removal of runtime
+width work is the supported cause. Arm 2 improves only 2.6443% versus baseline,
+is **4.0520% slower than arm 1**, and is neutral/slightly negative end to end:
+halving blocks does not repay duplicated channel-local register state on sm_120.
+
+All accepted token files SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Report SHA-256 arm0/arm1/arm2:
+`39d383dd878fc340a3cfaaee79a4addcb4eccb181439e9b4725f724f4569a6eb`,
+`c8799ac0b4cdf997d383fe8a690b223be882dce3b1ee1a6fff35a62d75f7cf85`,
+`3d38793571539864b23688fd9a85966debbf1e7c48fe8a1a2509438a45ee0452`.
+Full recipe and decision:
+[structured spike/result](specs/sm120-qwen35-conv-channel-tile-2026-08-08.md).
+
+## 2026-08-09 — sm_120 block-256 causal conv and four-warp GDN decode refuted
+
+**Block-256 causal conv (`VT_CONV_CHANNEL_TILE=3`) — REJECTED and removed.**
+At production head `84c7e23b0`, one rebuilt binary, one GPU lease/lock and the
+standard c32 Qwen3.5-4B scope gave byte-identical arm-1/arm-3 token files
+(SHA-256 `83fcdc45...453545`). The intended launch change executed: K4 arm 1
+used grid-x 64 / block 128 / 52 registers, while arm 3 used grid-x 32 / block
+256 / 52 registers. Nevertheless the selected 279+280 programs regressed
+127.645906→142.936163 ms over 912 calls (**+11.9802%**) and all causal conv
+regressed 219.400955→245.421363 ms over 1,728 calls (**+11.8598%**). The
+enclosing single profile also lost: total/output throughput
+6772.76/748.91→6756.52/747.12 tok/s, TTFT 1014.42→1016.46 ms, TPOT/ITL
+34.84→34.93 ms and E2E 5439.06→5452.21 ms. Halving block count does not repay
+the residency cost of twice as many threads at this register footprint. Per the
+spike stop condition, the dormant arm-3 selector, instantiation and tests were
+removed; accepted arm 1 and the falsified arm-2 control are unchanged. Traces:
+`/tmp/qwen35-conv-block256-arm{1,3}-84c7e23b0.nsys-rep`, SHA-256
+`39d333c5...344b9` / `62ee50dd...3f4e9`.
+
+**Four-warp fused GDN decode (`VT_GDN_DECODE_NW=4`) — correctness REJECTED,
+no timing claim.** The immediately following existing-selector discriminator
+changed the production token SHA from default NW8
+`83fcdc45...453545` to `93003ca1...8eebe`: 24/128 requests and 678/16,384
+aligned token positions differed, with equal lengths. Correctness failed before
+timing acceptance, so NW8 stays unchanged and no selector code changed. The NW4
+diagnostic-only profile was total/output 6730.55/744.25 tok/s, TTFT 1017.55 ms,
+TPOT/ITL 35.08 ms and E2E 5473.25 ms. Trace
+`/tmp/qwen35-gdn-decode-nw4-84c7e23b0.nsys-rep`, SHA-256
+`8680008e0261e9aa70bb9e001e2b31165e7999341ae3f963bc0b667caff7fb9a`.
+Reducing decode warps is therefore closed for exact greedy inference unless a
+separate numerical-order-preserving implementation is spiked.
+
+## 2026-08-09 — sm_120 fused GDN decode BV16 accepted opt-in
+
+**Disposition:** ACCEPTED OPT-IN at product commit `92256e6a9`. The exact
+`VT_GDN_DECODE_BV=16` selector changes only the independent value tile; unset
+keeps BV32. Default and Qwen3.6-27B/35B release gates remain open.
+
+**Correctness and geometry.** Operator gates pass: portable selector/geometry
+3/3 · 49, CUDA GDN 68/68 · 4,699, and Qwen3.5 paged-forward 4/4 · 8. Every
+profile and memory-run token file has SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+The profiler confirms the intended grid-x 4 / block 256 / 52-register BV32
+launch becomes grid-x 8 / block 128 / 52-register BV16, preserving NW8 and its
+arithmetic order.
+
+**Counterbalanced same-binary graph-node series.** Order was
+BV32a→BV16a→BV16b→BV32b on the identical 128-request Qwen3.5-4B BF16 c32
+workload:
+
+| Arm | all GDN decode, 1,704 calls | grid-y 800, 816 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| BV32a | 295.608238 ms | 149.887342 ms | 6763.51 / 747.89 | 1014.64 ms | 34.90 ms | 5446.55 ms |
+| BV16a | 265.417816 ms | 133.690094 ms | 6766.91 / 748.27 | 1013.00 ms | 34.89 ms | 5443.79 ms |
+| BV16b | 264.152452 ms | 133.030633 ms | 6779.94 / 749.71 | 1011.37 ms | 34.82 ms | 5433.25 ms |
+| BV32b | 295.123586 ms | 149.627524 ms | 6763.94 / 747.94 | 1015.48 ms | 34.89 ms | 5446.15 ms |
+
+Counterbalanced means are **295.365912→264.785134 ms (-10.3535%)** across all
+1,704 decode calls and **149.757433→133.360364 ms (-10.9491%)** for the
+dominant grid-y 800 shape. That shape falls from 183.526 to 163.432 us/call.
+Pinned vLLM remains faster at 128.061 us/call, a local BV16 residual of about
+**1.276x**; unequal all-call composition prevents claiming an all-call oracle
+ratio.
+
+**Enclosing and memory reproduction.** A third pair sampled peak memory.
+Across all three pairs, BV32→BV16 means are total throughput
+6783.437→6791.063 tok/s (**+0.1124%**), output throughput
+750.093→750.940 tok/s (**+0.1129%**), TTFT 1013.237→1011.490 ms
+(**-0.1724%**), TPOT/ITL 34.7867→34.7500 ms (**-0.1054%**), and E2E
+5430.777→5424.630 ms (**-0.1132%**). The memory pair itself is
+6822.86/754.45 tok/s, 1009.59 ms TTFT, 34.57 ms TPOT/ITL and 5399.63 ms E2E
+for BV32 versus 6826.34/754.84, 1010.10, 34.54 and 5396.85 for BV16. Peak GPU
+memory is 13058→13054 MiB and peak PSS 2,273,490→2,170,880 KiB.
+
+**Evidence.** Traces, exported SQLite databases and tokens are
+`/tmp/qwen35-gdn-bv{32a,16a,16b,32b}-92256e6a9.*`; trace SHA-256 values are
+`198d1bf843443f69fd1491131a13e7aa95cc136c56e96441aa43c48f267958f5`,
+`2f5e47f54faafa70ed8494c3afaa2160e31d311d90e7412cbf9777f2e93e3d18`,
+`3b0303a97e2335d5ca2f88eacf5c2e5f063d7d899cb44db3dd7d6a170938d117`,
+and `3d7b4a214b14976c95e9e4c944540e91163c7f10e820bb63bf7d0cb9fc9d8b11`.
+Memory JSONL/log/token evidence is
+`/tmp/qwen35-gdn-bv{32,16}-mem-92256e6a9.*`. The accepted result is local
+evidence only; it is not extrapolated to unavailable release models and does
+not change the default.
+
+## 2026-08-09 — sm_120 fused GDN decode BV8/BV24 rejected
+
+**Disposition:** REJECTED AND REMOVED at measured implementation `e102a14de`
+and cleanup `634ccba70`; BV16 remains the sole exact opt-in and BV32 remains
+default. Default and Qwen3.6-27B/35B release gates remain open.
+
+Operator runtime gates pass: portable selector/geometry **3/3 · 100**, CUDA GDN
+**69/69 · 4,850** including the public production-graph geometry case, and
+Qwen3.5 paged-forward **4/4 · 8**. The prescribed same-binary order was
+BV32a→BV16a→BV8a→BV24a→BV24b→BV8b→BV16b→BV32b. Every token file has SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+
+| Arm mean | all fused decode, 1,704 calls | grid-y 800, 816 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| BV32 | 302.7940655 ms | 153.7994265 ms | 6730.700 / 744.265 | 1022.205 ms | 35.050 ms | 5473.235 ms |
+| BV16 | 271.5899630 ms | 136.9721265 ms | 6740.010 / 745.290 | 1021.150 ms | 34.995 ms | 5465.690 ms |
+| BV8 | 278.4436445 ms | 141.1102230 ms | 6739.720 / 745.255 | 1021.195 ms | 35.000 ms | 5465.840 ms |
+| BV24 | 279.7297115 ms | 141.5291235 ms | 6732.840 / 744.500 | 1022.340 ms | 35.035 ms | 5471.455 ms |
+
+Against BV16, BV8 regresses all fused decode **2.5235%** and the dominant shape
+**3.0211%**; BV24 regresses **2.9971%** and **3.3270%** respectively. Both
+samples of each candidate have the same losing direction. They fail the ≥1%
+dominant-shape win and all-fused non-regression bars, so the enclosing means
+are recorded but confer no selection credit. BV16 repeats its win over BV32 in
+this series: **-10.3054%** across all fused calls and **-10.9411%** at grid-y
+800.
+
+Profiler launch contracts are exact at Dv=Dk=128 and 52 registers/thread:
+BV8 grid-x 16 / block 64 / 5,152 shared bytes; BV16 8 / 128 / 9,280; BV24 6 /
+192 / 13,408; BV32 4 / 256 / 17,536. Cleanup removes the losing selectors,
+arms, instantiations and expectations; `VT_GDN_DECODE_BV=8` and `=24` fall back
+to BV32, while exact `=16` remains opt-in.
+
+The current BV16 dominant mean is **167.858 us/call** versus pinned vLLM
+**128.061 us/call**, about **1.311x** slower. The prior accepted series' 1.276x
+ratio remains valid for that run; the difference is run variance, not evidence
+of a new oracle or a closed residual.
+
+Evidence is
+`/tmp/qwen35-gdn-bvsweep-{32a,16a,8a,24a,24b,8b,16b,32b}-e102a14de.{nsys-rep,sqlite,log,tokens.json}`.
+The per-leg values and eight trace SHA-256 values are preserved in the
+[structured result](specs/sm120-qwen35-gdn-decode-bv-sweep-2026-08-09.md).
+
+## 2026-08-09 — sm_120 fused GDN decode RPT2 rejected and removed
+
+**Disposition:** REJECTED AND REMOVED. Measured product `6ac8bf390` passed
+portable **4/4 · 125**, CUDA GDN **69/69 · 5,046**, and Qwen3.5 paged-forward
+**4/4 · 8**. All four production token files have SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Cleanup `f6a0c879141a1887f9fcf8c85a9eb3a8cf8a6275` removes the losing selector, specialization and
+tests; BV16 remains the sole opt-in and BV32 remains default.
+
+The intended geometry executed at Dv=Dk=128: BV16 grid-x 8 / block 128 /
+9,280 shared bytes / 50 registers, versus RPT2 grid-x 4 / block 128 / 17,536
+shared bytes / 56 registers. Across the counterbalanced
+`BV16a -> RPT2a -> RPT2b -> BV16b` series, the 1,704-call all-fused mean
+regressed **271.577988 -> 372.4151745 ms (+37.1301%)** and the 816-call y800
+mean regressed **136.9415415 -> 190.121047 ms (+38.8337%)**.
+
+| Arm mean | all fused decode, 1,704 calls | grid-y 800, 816 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| BV16 | 271.577988 ms | 136.9415415 ms | 6732.58 / 744.47 | 1026.28 ms | 35.00 ms | 5471.38 ms |
+| RPT2 | 372.4151745 ms | 190.121047 ms | 6709.16 / 741.88 | 1027.645 ms | 35.145 ms | 5490.87 ms |
+
+RPT2 fails both micro bars and every enclosing mean despite exact correctness.
+BV16's current dominant call is **167.82 us/call** versus pinned vLLM
+**128.061 us/call**, about **1.310x** slower. Default/release and the
+hardware-unavailable 27B/35B gates remain open. Evidence is
+`/tmp/qwen35-gdn-rpt2-{bv16a,rpt2a,rpt2b,bv16b}-6ac8bf390.*`; full disposition
+is in the [structured result](specs/sm120-qwen35-gdn-decode-rpt2-2026-08-09.md).
+
+## 2026-08-09 — sm_120 BV16/NW8 GDN decode shared swizzle accepted opt-in
+
+**Disposition:** ACCEPTED OPT-IN at spike `bdfaf823e` and product `824370396`.
+Operator gates pass: portable **6/6 · 633**, CUDA GDN **69/69 · 4,742**, and
+Qwen3.5 paged-forward **4/4 · 8**; parser/mapping negative mutations fail 5/132.
+All six token files have SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Both arms launch gx8/bx128/reg56; shared bytes change 9,280 -> 9,728.
+
+| Arm mean | all fused decode, 1,704 calls | grid-y 800, 816 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| BV16 | 289.8737275 ms | 146.959362 ms | 6724.18 / 743.54 | 1027.34 ms | 35.045 ms | 5478.205 ms |
+| SWZ | 268.254130 ms | 135.9178535 ms | 6739.86 / 745.275 | 1023.005 ms | 34.98 ms | 5465.725 ms |
+
+The prescribed `BV16a -> SWZa -> SWZb -> BV16b` series improves all fused
+decode **7.4555%** and y800 **7.5123%**, with both samples winning and every
+enclosing throughput/latency mean positive. The memory pair is likewise
+positive on user-visible/device axes: total 6784.64 -> 6793.05 tok/s, output
+750.23 -> 751.16 tok/s, TTFT 1020.77 -> 1018.67 ms, TPOT 34.72 -> 34.68 ms,
+E2E 5430.24 -> 5423.44 ms, and GPU 13,060 -> 13,054 MiB.
+
+Peak host PSS rises **1,909,259 -> 2,038,631 KiB (+6.78%)**, while the supplied
+available-memory drop is **1,641,476 -> 1,529,724 KiB**. The isolated PSS move
+is recorded as a noisy transient host-load caveat; the candidate stays explicit
+opt-in and receives no default/release credit. Accepted swizzle y800 is
+**166.566 us/call** versus pinned vLLM **128.061 us/call** (**1.301x** slower).
+
+Evidence is
+`/tmp/qwen35-gdn-swizzle-{bv16a,swza,swzb,bv16b}-8243703.{nsys-rep,sqlite,log,tokens.json}`
+and `/tmp/qwen35-gdn-swizzle-{bv16,swz}-mem-8243703.{jsonl,log,tokens.json}`.
+Trace SHA-256 prefixes: BV16a `59bb6081`, SWZa `082cd6d4`, SWZb `b44792c8`,
+BV16b `633fad31`. Default/release and 27B/35B gates remain open.
+
+## 2026-08-09 — sm_120 GDN decode register-state measured provisional opt-in
+
+**Disposition:** `MEASURED/PROVISIONAL` at product commit `7476818c1`. The
+strict `VT_GDN_DECODE_REGSTATE=1` specialization retains each lane's 16 F32
+state values across the two recurrence loops while preserving the accepted
+BV16/NW8/shared-swizzle mapping. It remains explicit opt-in: exact static SASS
+size and NCU attribution are pending external tool/download authority, so this
+is not fully `ACCEPTED` and changes no default, release, or 27B/35B claim.
+
+**Correctness, review and resources.** The full canonical preflight is green;
+fresh static and targeted mutation re-review is `PASS`. Operator gates pass:
+portable selector/mapping **10/10 · 1,962**, CUDA GDN **70/70 · 4,830**, and
+cached Qwen3.5 paged-forward **4/4 · 8**, all observed diffs zero. Every token
+file has SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+The intended graph executes at gx8/gy800/bx128, 9,728 dynamic shared bytes, 56
+registers and zero local bytes. Same-tool ptxas evidence at
+`/tmp/cuda_gdn-regstate-candidate-7476818c1.log` reports the exact
+`bf16,bf16,float,NW8,SWIZZLED=true,REGSTATE=true` specialization at 56
+registers, one barrier, zero stack and zero spills; the accepted SWZ baseline
+also uses 56 registers. The missing exact-specialization static SASS-size
+<=5% and shared-instruction count are not inferred from these resource facts.
+The retained nvcc 12.9 build `/tmp/cuda-gdn-keep.gXumAL/` supplies additional
+non-substitute structure: exact cubin ELF symbol size is 27,008 bytes SWZ versus
+26,496 REGSTATE (**-1.896%**), while exact PTX counts are 922/894 total
+instructions, 69/53 shared loads and 47/31 shared stores, with unchanged 19/7
+global loads/stores and two barriers. The exact -16/-16 PTX shared operations
+support the mechanism and the cubin byte-size direction, but neither is the
+required SASS instruction/shared-op count; cuobjdump remains pending. PTX/cubin
+SHA-256 values are `dc500503...e2e6` / `5169611e...d913`.
+
+**Counterbalanced same-binary graph-node series.** The prescribed order was
+`SWZa -> REGa -> REGb -> SWZb` on the standard 128-request Qwen3.5-4B BF16 c32
+workload. Both REGSTATE raw legs beat both bracketing SWZ legs on grid-y 800 and
+all fused decode.
+
+| Arm mean | all fused decode, 1,704 calls | grid-y 800, 816 calls | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| SWZ | 268.1141915 ms | 135.7758125 ms | 6726.240 / 743.770 | 1026.800 ms | 35.000 ms | 5471.960 ms |
+| REGSTATE | 264.7265645 ms | 134.2911050 ms | 6739.125 / 745.195 | 1021.745 ms | 35.000 ms | 5466.420 ms |
+
+REGSTATE improves all fused decode **1.263502%** and the dominant y800 shape
+**1.093499%**, with total/output throughput **+0.191563%/+0.191591%**, TTFT
+**-0.492306%**, unchanged TPOT/ITL, and E2E **-0.101243%**. This is a local
+same-binary discriminator, not a new pinned-vLLM ratio.
+
+**Memory and evidence.** The separate non-profiled memory pair reports peak GPU
+allocation 13,058 -> 13,060 MiB and peak PSS 2,436,964 -> 1,989,479 KiB. The
+candidate's host PSS is lower, so no repeat is owed; timing from the memory pair
+is non-binding. Four-leg roots are
+`/tmp/qwen35-gdn-regstate-{swza,rega,regb,swzb}-7476818c1.*`; memory roots are
+`/tmp/qwen35-gdn-regstate-{swz,reg}-mem-7476818c1.*`. `cuobjdump`/NCU downloads
+were separately requested but are not authorized and the Ordino service is
+unavailable. Preserve this candidate as provisional opt-in until those exact
+diagnostics can run.
+
+## 2026-08-09 — sm_120 GDN decode REGK structurally rejected and removed
+
+**Disposition:** `REJECTED/REMOVED` before product commit or GPU work. The
+red-first missing-contract compile was captured, then the candidate selector,
+specialization and tests existed only as uncommitted experiment changes and
+were fully restored. Clean disposition head
+`28d3a9334d50a80e16f0f3d2ccc0e0cc1b9a4593` has no REGK code or test residue.
+The restored portable gate passed **13/13 · 2,005**.
+
+The contract negatives were live: a parser-prefix mutation killed **0/1** with
+two failures, regular-path eligibility died at `-Werror`, and both compile-time
+assertions killed the shared-column mapping mutation. The required recurrence
+discriminator failed structurally. Same-tool nvcc 12.9 exact
+`bf16,bf16,float,NW8,SWIZZLED=true,REGSTATE=true,REGK=true` PTX is byte-identical
+for the baseline, first-loop-to-`bk`, and second-loop-to-`bk` variants: exact
+symbol **848 instructions**, **53 `ld.shared`**, full PTX SHA-256
+`1fec62b7f48dc5fa2a33bfe414ce6a10aa01979c41489375a8d67b07c88a97a0`; both
+loop comparisons are identical. Current REGSTATE without REGK already has
+**53 `ld.shared`**, proving the compiler performs the intended K reuse and the
+spec's mandatory shared-load reduction cannot be met.
+
+No GPU, timing, performance or memory run was made and no such claim follows.
+REGSTATE's provisional exact result is preserved; exact SASS and NCU remain
+pending. The next candidate must be a new spike for direct register-to-global
+REGSTATE writeback, removing the final `rr` shared write, synchronization and
+shared reread while treating global-store coalescing as a falsifiable tradeoff.
+Do not pursue q+k caching: q is single-use and K caching is a compiler no-op.
+
+## 2026-08-09 — sm_120 GDN decode direct store rejected and removed
+
+**Disposition:** `REJECTED/REMOVED`. Product experiment `9485a5514` was
+reverted in the records/cleanup change; all seven product, test, env and
+pending-doc paths equal parent `a9d778957`. Every token SHA-256 is exact and
+the candidate graph is gx8/gy800/bx128/smem9728. REGSTATE/DIRECT STORE report
+56/55 registers and zero local storage.
+
+| Arm mean | all fused decode | grid-y 800 | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| REGSTATE | 264.656741 ms | 134.3005475 ms | 6725.73 / 743.715 | 1029.48 ms | 35.02 ms | 5477.21 ms |
+| DIRECT STORE | 388.7906645 ms | 196.3294475 ms | 6694.67 / 740.28 | 1031.48 ms | 35.21 ms | 5502.83 ms |
+
+DIRECT STORE regresses y800 **46.1866%** (164.584 -> 240.600 us/call) and all
+fused decode **46.904%**; both raw DST legs lose. Total/output throughput fall
+**0.4618%/0.4619%**; TTFT, TPOT/ITL and E2E worsen
+**0.1943%/0.5425%/0.4678%**. Evidence roots are
+`/tmp/qwen35-gdn-direct-store-{rega,dsta,dstb,regb}-9485a5514.*`.
+
+Static PTX moved in the intended direction—848 -> 694 instructions, shared
+loads 53 -> 48, shared stores 31 -> 15, barriers 2 -> 1—but global stores rose
+7 -> 18 and the timing proves lost coalescing dominates. No memory pair is
+needed after the hard timing rejection. No acceptance, default, release,
+pinned-vLLM, 27B or 35B claim changes.
+
+## 2026-08-09 — sm_120 Qwen3.5-4B combined prefill arms accepted locally; cross-engine frontend ratios void
+
+**Issue:** [#206](https://github.com/mudler/vllm.cpp/issues/206).
+The immutable measured binary was commit `84be99763bfcd8de94c7e6e2dd871e7a793348ea`
+(SHA-256 `581ea963303b37a92f838c96e5f8f828f79b0c29081c0d4d1c240606ed3fd041`).
+The fresh mutation review found that the post-conv token-tile fallback for the
+independent Q/K and V head widths was not owned by a focused test. Commit
+`23bc978f0e2c43265d858fc154d484be6e995f42` extracted the production
+eligibility predicate and added split/env/Dk/Dv fallback coverage; the fresh
+scoped mutation re-review then passed. This was a test-contract finding, not a
+token or measured-product change.
+
+The reviewed same-binary series used the standard cached Qwen3.5-4B BF16
+workload: ShareGPT SHA-256
+`9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`,
+128 requests, 128 output tokens, c32, greedy, 2,048 batched-token cap and 1,280
+KV blocks. BASE set `VT_CONV_CHANNEL_TILE=0` and
+`VT_GDN_POSTCONV_TOKEN_TILE=0`; COMBINED set both to `1`. The order was
+`BASE-r1 -> COMBINED-r1 -> COMBINED-r2 -> BASE-r2 -> BASE-r3 -> COMBINED-r3`.
+The GPU was idle before the series (RTX 5070 Ti, driver 595.71.05, P8, 0%
+utilization, no compute application); the whole series held `/tmp/gpu`.
+
+| Arm / leg | total tok/s | output tok/s | mean TTFT | mean TPOT / ITL | mean E2E |
+|---|---:|---:|---:|---:|---:|
+| BASE-r1 | 6762.97 | 747.83 | 1031.42 ms | 34.77 ms | 5447.71 ms |
+| BASE-r2 | 6775.87 | 749.26 | 1019.15 ms | 34.79 ms | 5437.30 ms |
+| BASE-r3 | 6780.66 | 749.79 | 1018.40 ms | 34.76 ms | 5433.45 ms |
+| **BASE mean** | **6773.1667** | **748.9600** | **1022.9900 ms** | **34.7733 ms** | **5439.4867 ms** |
+| COMBINED-r1 | 6820.31 | 754.17 | 1010.46 ms | 34.58 ms | 5401.67 ms |
+| COMBINED-r2 | 6823.24 | 754.49 | 1009.11 ms | 34.57 ms | 5399.32 ms |
+| COMBINED-r3 | 6821.75 | 754.33 | 1008.28 ms | 34.59 ms | 5400.59 ms |
+| **COMBINED mean** | **6821.7667** | **754.3300** | **1009.2833 ms** | **34.5800 ms** | **5400.5267 ms** |
+| **COMBINED change** | **+0.7175%** | **+0.7170%** | **-1.340%** | **-0.556%** | **-0.716%** |
+
+Every one of the six token files has SHA-256
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`.
+Both candidate legs beat every base leg on every enclosing timing axis, so the
+combined K=4 causal-conv plus 16-token post-conv arm is **ACCEPTED as a local,
+default-OFF opt-in**. Raw evidence is
+`/tmp/qwen35-ab-combined-84be99763/`; the six raw log hashes in arm order are
+`a776a34e...dd02`, `15858c44...5c6`, `09b42ddd...e7f`,
+`413713fb...c201`, `c1a664df...3f19`, and `6b0b1780...f214`.
+
+### TTFT attribution and the frontend mismatch
+
+A local COMBINED diagnostic produced **6816.79 tok/s**, **1010.16 ms TTFT**
+and **34.60 ms TPOT**. Across all 128 request rows, mean
+intake/queue/prefill was **196.252 / 344.389 / 469.181 ms**, summing to
+**1009.822 ms**. The pinned vLLM `555967922` diagnostic produced
+**6633.514 tok/s**, client/core TTFT **942.785 / 942.261 ms**, and TPOT
+**33.91494 ms**; its mean queue/prefill components were
+**338.960 / 449.291 ms**. vLLM's request arrival is a wall-clock timestamp
+while its event timestamps are monotonic, so the raw recorded intake delta is
+invalid. The only comparable intake inference is
+`core_ttft - queue - prefill` = **154.011 ms**. The resulting TTFT-gap
+decomposition is **42.241 ms intake + 5.429 ms queue + 19.890 ms prefill =
+67.560 ms**.
+
+Request-id waves further localize the mismatch:
+
+| IDs | local mean TTFT | pinned vLLM mean TTFT |
+|---|---:|---:|
+| 0-31 | 2104.505 ms | 1752.132 ms |
+| 32-63 | 656.106 ms | 657.784 ms |
+| 64-95 | 643.766 ms | 670.053 ms |
+| 96-127 | 634.913 ms | 689.077 ms |
+
+The source proves the frontends are not timing the same work. Local starts
+`t0` before admission and submits prompt **strings** through `AsyncLLM`, so
+tokenization is inside its measured interval
+(`examples/bench/bench_core.h:508-529`). The oracle tokenizes every prompt
+before `run_closed_loop` starts its timer and submits `TokensPrompt` IDs
+(`tools/bench/vllm_closed_loop_metrics.py:59-82,137-167`). Therefore every
+prior cross-engine **total-throughput and TTFT ratio on this harness is VOID**;
+both axes are `PENDING` a pretokenized local rerun. The local same-binary
+COMBINED A/B above remains accepted because both arms timed the same frontend.
+TPOT remains comparable and open because it begins after the first token.
+
+Diagnostic evidence hashes: local log/token
+`f7359b58...f41b` / `83fcdc45...3545`; vLLM log/metrics/splits/tokens
+`9980b7b4...7148` / `61739a24...12a` / `a46753d9...3c4` /
+`eebbb644...a38`. Roots are `/tmp/qwen35-combined-ttft-split-84be99763.*`
+and `/tmp/qwen35-vllm-ttft-split-pin.*`. The next gate pre-tokenizes every
+local prompt before `t0`, submits the existing token-ID overload, then repeats
+counterbalanced same-binary rollback and fresh local/vLLM comparisons.
+
+## 2026-08-09 — pretokenized frontend real A/B failed token identity; timings void
+
+**Issue:** [#206](https://github.com/mudler/vllm.cpp/issues/206).
+The first real-GPU pair used clean implementation/review head
+`a33993a7cd8fdcf33b2b91112ef7a172b8f63fe1`, binary SHA-256
+`50f509cbde5865a6b0fe3b2bce0a05b68bf716337d41a90cb88d66480f1f8d02`
+and the accepted K4 causal-conv plus post-conv-token-tile flags in both arms.
+STRING-r1 set `VT_BENCH_PRETOKENIZE=0`; TOKENS-r1 set
+`VT_BENCH_PRETOKENIZE=1`. The ShareGPT corpus SHA-256 remained
+`9ea13603767c62c267e3f381fbccf42d0c9ca0c393655c37533eadca7aefca0c`.
+
+The hard correctness gate failed and stopped the series after that pair. Both
+arms reported 131,784 input tokens and produced 128 requests x 128 output
+tokens, but only **98/128 requests** and **15,507/16,384 positions** matched.
+The differing request IDs were
+`[1,7,10,23,30,41,46,50,51,60,61,68,70,74,77,80,82,83,85,86,88,92,95,110,113,116,122,124,126,127]`.
+STRING-r1 output SHA-256 was
+`83fcdc45f79ddb06a634c7d7d95eba3384543b3cd781a45a8db1fc4e2a453545`;
+TOKENS-r1 was
+`be20ffbceb61f0264ca21d972bfc5fc51e855e64f2b945de71669cae666aa702`.
+Raw evidence is `/tmp/qwen35-ab-pretoken-a33993a7/`; the two log SHA-256
+values are `02c4381844c0a62aa2cf20023750ada2042d54f11f65189d7cf581060a6fe197`
+and `3b0efb96c8b5ede5565bb12081d0d9010ccf10957a6fcb33ad7203ad766bc8d0`.
+
+| Invalid one-pair observation | total tok/s | output tok/s | mean TTFT | mean TPOT / ITL | mean E2E |
+|---|---:|---:|---:|---:|---:|
+| STRING-r1 | 6803.47 | 752.31 | 1012.01 ms | 34.65 ms | 5412.13 ms |
+| TOKENS-r1 | 6839.78 | 756.32 | 1012.97 ms | 34.45 ms | 5388.73 ms |
+
+These values are **VOID**: changed output means changed work, so none receives
+performance credit and the missing second/third repetitions are not a reason to
+continue an invalid series.
+
+The mechanism is the admission boundary. Local `AsyncLLM` publishes and
+notifies one request at a time, and its background `EngineCoreProc` blocks on
+the first item then drains only items immediately available. String admission
+tokenizes between publishes; pretokenized admission publishes fast enough to
+change which requests are present for the first scheduling step. The pinned
+wrapper synchronously adds every request in the initial concurrency before its
+first `engine.step`, then publishes each refill group between steps. The next
+discriminator is therefore an additive **atomic wave admission** API: prepare
+all inputs and collectors first, register them under the shutdown lock, append
+every core ADD under one queue lock, and notify once. The benchmark will record
+arrivals for a whole refill wave and publish it once, so string rollback still
+times tokenization while both arms execute identical batches. The full
+RED-first, rollback and mutation gates are binding in the
+[campaign spec](specs/sm120-qwen35-pareto-2026-08-09.md).
+
+## 2026-08-09 — Qwen3.5 corrected frontend comparison and retained local decode stack
+
+Atomic all-at-once request-wave admission repaired the pretokenized benchmark's
+batching confound at reviewed head `da449a88f0a06710839a0a6568f18426cb44fc19`.
+All repeated local and pinned-vLLM legs generated the same 128 x 128-token
+workload; the local token SHA-256 is
+`be20ffbceb61f0264ca21d972bfc5fc51e855e64f2b945de71669cae666aa702`.
+The corrected, non-profiled three-repetition comparison is:
+
+| Engine | total tok/s | output tok/s | mean TTFT | mean TPOT / ITL | mean E2E | peak VRAM |
+|---|---:|---:|---:|---:|---:|---:|
+| vllm.cpp direct-load | 6831.7100 | 755.4300 | 1016.5133 ms | 34.4767 ms | 5395.1333 ms | 12,950.7 MiB |
+| pinned vLLM `555967922` | 6643.4025 | 734.6087 | 936.5893 ms | 33.9171 ms | 5244.0659 ms | 12,832.0 MiB |
+| ratio / gap | **1.028345x** | **1.028345x** | **1.085335x slower** | **1.016497x slower** | **1.028807x slower** | **+118.7 MiB** |
+
+Host peak/stable PSS is 2.338/0.770 GiB locally versus 7.868/4.496 GiB for
+vLLM, so host memory remains a large win. Raw comparison root is
+`/tmp/qwen35-compare-da449a88f/`; same-tool traces are
+`/tmp/qwen35-profile-da449a88f-{ours,vllm}.{nsys-rep,sqlite}`. Throughput is
+now a valid win; TTFT, TPOT/ITL, E2E and VRAM remain open.
+
+Two later exact, counterbalanced local stacks were retained as default-OFF
+opt-ins. `VT_GDN_DECODE_BV=16`, `VT_GDN_DECODE_SWIZZLE=1` and
+`VT_GDN_DECODE_REGSTATE=1` moved the direct-load local mean from
+6838.4400/756.1767 tok/s, 1014.0233 ms TTFT, 34.4533 ms TPOT and 5389.7900 ms
+E2E to **6852.1200/757.6900**, **1011.8500**, **34.3867** and **5378.9500**
+(+0.200% throughput, -0.214% TTFT, -0.193% TPOT, -0.201% E2E). Adding
+`VT_GDN_SLACK_MEMSET=1` produced **6856.8633/758.2133**, **1010.4800 ms**,
+**34.3700 ms** and **5375.1900 ms** against its adjacent decode-stack mean
+6852.5700/757.7367, 1011.5233, 34.3900 and 5378.6167. These local gains have
+not been consolidated into a new pinned-vLLM ratio; do not project them as a
+cross-engine pass. Roots are `/tmp/qwen35-ab-decode-stack-da449a88f/` and
+`/tmp/qwen35-ab-slack-memset-da449a88f/`.
+
+## 2026-08-09 — geometric argmax scratch rejected and removed
+
+Reviewed head `06db3bbb3454f85e20f75b96eeb299afba7036ae` passed 9 portable
+cases / 105 assertions plus CUDA sampling. All six legs were token-exact.
+
+| Arm mean, 3 reps | total / output tok/s | TTFT | TPOT / ITL | E2E |
+|---|---:|---:|---:|---:|
+| Incumbent | 6862.2667 / 758.8100 | 1009.7167 ms | 34.3400 ms | 5371.0000 ms |
+| Geometric scratch | 6863.8867 / 758.9867 | 965.0133 ms | 34.6833 ms | 5369.7067 ms |
+
+The apparent -4.427% TTFT coincides with a **+0.9998% TPOT regression**, so
+the candidate fails the Pareto gate. Same-tool traces identify wait migration,
+not saved compute: `cudaFree` falls 506 calls / 2960.361 ms to 476 / 27.705 ms
+(exactly 30 argmax frees), while the same 567 `cudaStreamSynchronize` calls rise
+18,027.497 -> 20,878.260 ms. Raw A/B is
+`/tmp/qwen35-ab-argmax-geometric-06db3bbb/`; candidate profiler hashes are
+`1021b045...239e7` and `808a7516...b7be4`. Product and tests are removed; the
+falsified allocation hypothesis remains documented.
+
+## 2026-08-09 — BF16 GDN vector writeback rejected and removed
+
+Implementation `29de225c8` plus repair `3ca49e926` passed fresh mutation
+review (16 cases / 2,568 assertions), operator CUDA rebuild and focused
+`test_gdn_decode_fused` + `test_ops_gdn`. All four profiled legs were exact.
+
+| Arm | all fused decode | y800 decode | total / output tok/s | TTFT | TPOT | E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| REG-a | 251.210058 ms | 139.127859 ms | 6760.82 / 747.59 | 1027.95 | 34.81 | 5449.30 |
+| VEC-a | 250.472657 ms | 138.702659 ms | 6802.32 / 752.18 | 1015.76 | 34.66 | 5417.91 |
+| VEC-b | 251.214368 ms | 139.138796 ms | 6804.21 / 752.39 | 1015.60 | 34.65 | 5416.35 |
+| REG-b | 251.404693 ms | 139.111428 ms | 6807.51 / 752.76 | 1013.82 | 34.65 | 5413.73 |
+
+Counterbalanced means improve y800 only **0.1430%** and all fused decode only
+**0.1846%**; VEC-b loses to both controls on y800. It therefore misses the
+required 1% and raw-leg gates. `nsys` records unchanged gx8/gy800/bx128,
+56 registers/thread, 9,728 dynamic shared bytes and zero local bytes. Evidence
+is `/tmp/qwen35-gdn-vecstore-{rega,veca,vecb,regb}-3ca49e926.*`. Product and
+tests are removed; REGSTATE remains the local opt-in.

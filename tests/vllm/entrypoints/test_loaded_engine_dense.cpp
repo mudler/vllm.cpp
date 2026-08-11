@@ -31,6 +31,7 @@
 #include "vllm/config/scheduler.h"
 #include "vllm/platforms/interface.h"
 #include "vllm/v1/core/sched/async_scheduler.h"
+#include "vllm/v1/engine/input_processor.h"  // InputValidationError
 
 #include <nlohmann/json.hpp>
 
@@ -539,4 +540,109 @@ TEST_CASE("loaded_engine: FromModelDir resolves an explicit absent device BEFORE
   CHECK_THROWS_WITH_AS(
       LoadedEngine::FromModelDir("/nonexistent/vllm-cpp/model/dir", params),
       doctest::Contains("not a directory"), std::runtime_error);
+}
+
+// ─── KV sizing at startup (issue #83 M4; external PR #227) ───────────────────
+// vllm/v1/core/kv_cache_utils.py:2160-2174 @ 555967922 runs both halves at
+// engine init. Without them a prompt the pool can never hold is admitted, never
+// allocates, and the engine spins at model_executed=0 with an idle GPU.
+
+TEST_CASE(
+    "loaded_engine: refuses a pinned --max-model-len the KV pool cannot hold") {
+  // _check_enough_kv_cache_memory (kv_cache_utils.py:751-788): the caller asked
+  // for 4096 tokens of context out of a 1 x 32-token pool.
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.num_blocks = 1;  // 1 x 32 = 32 tokens of KV
+  params.max_model_len = 4096;
+
+  CHECK_THROWS_WITH_AS(
+      LoadedEngine(c, MakeDenseWeights(c), FreshFixture(), params),
+      doctest::Contains("larger than the available KV cache memory"),
+      std::invalid_argument);
+
+  // The message carries upstream's remediation and ours, so the user is left
+  // with an action rather than a number.
+  try {
+    LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+    FAIL("expected the KV sizing check to refuse this configuration");
+  } catch (const std::invalid_argument& e) {
+    const std::string msg = e.what();
+    CHECK(msg.find("max seq len (4096)") != std::string::npos);
+    CHECK(msg.find("estimated maximum model length is 32") != std::string::npos);
+    CHECK(msg.find("--num-blocks") != std::string::npos);
+  }
+}
+
+TEST_CASE(
+    "ResolveMaxModelLen: a model with no paged KV is never refused by the "
+    "sizing check") {
+  // kv_cache_utils.py:872-878 guards the check with `if kv_cache_spec:`. A
+  // model whose KV state does not scale with the block count (attention-free,
+  // or pure Mamba/GDN — KVBytesPerBlock is 0 for both) has nothing to run out
+  // of, so a pinned length must pass however small the pool is, and an unpinned
+  // one must not be fitted down to nothing.
+  const HfConfig c = MakeDenseConfig();
+  vllm::v1::KVCacheConfig no_paged_kv{};
+  no_paged_kv.num_blocks = 1;  // no groups -> KVBytesPerBlock == 0
+
+  EngineParams pinned;
+  pinned.max_model_len = 4096;
+  CHECK(LoadedEngine::ResolveMaxModelLen(pinned, c, no_paged_kv,
+                                         /*block_size=*/32) == 4096);
+
+  EngineParams unpinned;
+  CHECK(LoadedEngine::ResolveMaxModelLen(unpinned, c, no_paged_kv,
+                                         /*block_size=*/32) == kMaxModelLen);
+}
+
+TEST_CASE(
+    "loaded_engine: a pinned --max-model-len the pool CAN hold is served "
+    "unchanged") {
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;
+  params.num_blocks = 1;                // 32 tokens of KV
+  params.max_model_len = kMaxModelLen;  // exactly one pool
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  CHECK(eng.max_model_len() == kMaxModelLen);
+}
+
+TEST_CASE(
+    "loaded_engine: an unpinned max_model_len auto-fits down to the KV pool") {
+  // _auto_fit_max_model_len (kv_cache_utils.py:1967-2027): the checkpoint claims
+  // 4096 tokens of context and the pool holds 32, so 32 is what gets served —
+  // and the admission check then rejects anything longer instead of the
+  // scheduler wedging on it.
+  HfConfig c = MakeDenseConfig();
+  c.max_position_embeddings = 4096;
+  EngineParams params;
+  params.num_blocks = 1;  // 32 tokens
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  CHECK(eng.max_model_len() == kMaxModelLen);
+}
+
+TEST_CASE(
+    "loaded_engine: an unpinned max_model_len the pool holds is NOT reduced") {
+  // The default path must be untouched: 256 x 32 = 8192 tokens of KV against a
+  // 32-token checkpoint context leaves the context alone.
+  const HfConfig c = MakeDenseConfig();
+  EngineParams params;  // defaults: num_blocks 256, block_size 32
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  CHECK(eng.max_model_len() == kMaxModelLen);
+}
+
+TEST_CASE("loaded_engine: an over-long prompt is REFUSED, not left waiting") {
+  // The end-to-end point of both guards. Before them this prompt was admitted,
+  // could never allocate, and the engine produced no tokens forever.
+  HfConfig c = MakeDenseConfig();
+  c.max_position_embeddings = 4096;
+  EngineParams params;
+  params.num_blocks = 1;  // 32 tokens of KV -> max_model_len auto-fits to 32
+  LoadedEngine eng(c, MakeDenseWeights(c), FreshFixture(), params);
+  REQUIRE(eng.max_model_len() == kMaxModelLen);
+
+  const std::vector<int32_t> long_prompt(kMaxModelLen + 8, 3);
+  CHECK_THROWS_AS(eng.engine().generate(long_prompt, Greedy(1), "toolong"),
+                  vllm::v1::InputValidationError);
+  CHECK_FALSE(eng.engine().has_unfinished_requests());
 }

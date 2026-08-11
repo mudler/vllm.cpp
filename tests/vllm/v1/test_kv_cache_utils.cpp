@@ -928,3 +928,114 @@ TEST_CASE("unify_hybrid_kv_cache_specs rejects an unconvertible mixed policy") {
       "specs to one unified type.",
       std::invalid_argument);
 }
+
+// ---------------------------------------------------------------------------
+// Startup KV sizing: kv_memory_needed_bytes / estimate_max_model_len /
+// check_enough_kv_cache_memory / auto_fit_max_model_len.
+// Ported from vllm/v1/core/kv_cache_utils.py @ 555967922 (:751-788, :791-798,
+// :800-851, :1967-2027). Issue #83 M4; the guard external PR #227 needed.
+// ---------------------------------------------------------------------------
+TEST_CASE("kv_memory_needed_bytes rounds up to whole blocks") {
+  // max_memory_usage_bytes (:791-798): blocks are allocated whole.
+  CHECK(vllm::v1::kv_memory_needed_bytes(/*max_model_len=*/32, /*block_size=*/32,
+                                         /*bytes_per_block=*/100) == 100);
+  CHECK(vllm::v1::kv_memory_needed_bytes(33, 32, 100) == 200);
+  CHECK(vllm::v1::kv_memory_needed_bytes(64, 32, 100) == 200);
+  CHECK(vllm::v1::kv_memory_needed_bytes(1, 32, 100) == 100);
+  // Degenerate inputs need no KV rather than dividing by zero.
+  CHECK(vllm::v1::kv_memory_needed_bytes(0, 32, 100) == 0);
+  CHECK(vllm::v1::kv_memory_needed_bytes(64, 32, 0) == 0);
+}
+
+TEST_CASE("estimate_max_model_len is the longest sequence the pool holds") {
+  // estimate_max_model_len (:800-851). Upstream binary-searches the same
+  // predicate; ours is the closed form, so the two must agree at the boundary:
+  // the answer is a whole number of blocks and never overshoots.
+  CHECK(vllm::v1::estimate_max_model_len(/*available_memory=*/1000,
+                                         /*bytes_per_block=*/100,
+                                         /*block_size=*/32) == 320);
+  // A partial block buys nothing.
+  CHECK(vllm::v1::estimate_max_model_len(1099, 100, 32) == 320);
+  CHECK(vllm::v1::estimate_max_model_len(1100, 100, 32) == 352);
+  // Not even one block: 0, which suppresses the "estimated maximum" clause.
+  CHECK(vllm::v1::estimate_max_model_len(99, 100, 32) == 0);
+  CHECK(vllm::v1::estimate_max_model_len(0, 100, 32) == 0);
+
+  // Agreement with the predicate it stands in for, across the grid.
+  for (int64_t available = 0; available <= 1000; available += 37) {
+    const int64_t est = vllm::v1::estimate_max_model_len(available, 100, 32);
+    CHECK(vllm::v1::kv_memory_needed_bytes(est, 32, 100) <= available);
+    // One token more must NOT fit (unless nothing fit at all).
+    if (est > 0) {
+      CHECK(vllm::v1::kv_memory_needed_bytes(est + 1, 32, 100) > available);
+    }
+  }
+}
+
+TEST_CASE("check_enough_kv_cache_memory admits a pool that holds the context") {
+  CHECK_NOTHROW(vllm::v1::check_enough_kv_cache_memory(
+      /*available_memory=*/1000, /*needed_memory=*/1000,
+      /*max_model_len=*/320, /*estimated_max_model_len=*/320));
+  CHECK_NOTHROW(vllm::v1::check_enough_kv_cache_memory(1000, 100, 32, 320));
+  // An attention-free model needs no KV at all, so nothing is short.
+  CHECK_NOTHROW(vllm::v1::check_enough_kv_cache_memory(1, 0, 32, 32));
+}
+
+TEST_CASE("check_enough_kv_cache_memory refuses a pool that cannot") {
+  // :769-788. The message names both sizes, the estimate, and the remedies.
+  CHECK_THROWS_AS(
+      vllm::v1::check_enough_kv_cache_memory(/*available_memory=*/1000,
+                                             /*needed_memory=*/8000,
+                                             /*max_model_len=*/2560,
+                                             /*estimated_max_model_len=*/320),
+      std::invalid_argument);
+  try {
+    vllm::v1::check_enough_kv_cache_memory(1000, 8000, 2560, 320);
+    FAIL("expected the KV sizing check to refuse this configuration");
+  } catch (const std::invalid_argument& e) {
+    const std::string msg = e.what();
+    CHECK(msg.find("To serve at least one request with the model's max seq "
+                   "len (2560)") != std::string::npos);
+    CHECK(msg.find("larger than the available KV cache memory") !=
+          std::string::npos);
+    CHECK(msg.find("estimated maximum model length is 320") !=
+          std::string::npos);
+    CHECK(msg.find("decreasing `max_model_len`") != std::string::npos);
+    CHECK(msg.find("--num-blocks") != std::string::npos);
+  }
+
+  // estimated <= 0 suppresses the estimate clause, exactly as upstream's
+  // `if estimated_max_len > 0` does (:775-780).
+  try {
+    vllm::v1::check_enough_kv_cache_memory(50, 8000, 2560, 0);
+    FAIL("expected a refusal");
+  } catch (const std::invalid_argument& e) {
+    CHECK(std::string(e.what()).find("Based on the available memory") ==
+          std::string::npos);
+  }
+}
+
+TEST_CASE("check_enough_kv_cache_memory refuses an empty pool by name") {
+  // :757-765, the `available_memory <= 0` arm — a different message.
+  CHECK_THROWS_WITH_AS(
+      vllm::v1::check_enough_kv_cache_memory(0, 100, 32, 0),
+      doctest::Contains("No available memory for the cache blocks"),
+      std::invalid_argument);
+}
+
+TEST_CASE("auto_fit_max_model_len reduces the context to what the pool holds") {
+  // :1967-2027. 1000 bytes / 100 per block = 10 blocks x 32 = 320 tokens.
+  CHECK(vllm::v1::auto_fit_max_model_len(/*derived_max_model_len=*/4096,
+                                         /*available_memory=*/1000,
+                                         /*bytes_per_block=*/100,
+                                         /*block_size=*/32) == 320);
+  // The full context fits: keep it (:2012-2017), never round it UP to the pool.
+  CHECK(vllm::v1::auto_fit_max_model_len(128, 1000, 100, 32) == 128);
+  CHECK(vllm::v1::auto_fit_max_model_len(320, 1000, 100, 32) == 320);
+  // Attention-free (no KV bytes at all): nothing to fit against (:1986-1992).
+  CHECK(vllm::v1::auto_fit_max_model_len(4096, 0, 0, 32) == 4096);
+  // Not even one token fits (:2005-2010).
+  CHECK_THROWS_WITH_AS(vllm::v1::auto_fit_max_model_len(4096, 99, 100, 32),
+                       doctest::Contains("Cannot auto-fit max_model_len"),
+                       std::invalid_argument);
+}

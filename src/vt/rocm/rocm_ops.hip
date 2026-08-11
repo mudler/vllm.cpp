@@ -38,6 +38,20 @@ void GeluTanhKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void GeluErfKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void MoeRouterTopKKernelRocm(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
                              const MoeRouterTopKArgs& args, const Tensor* bias);
+void ApplyAllowedTokenIdsKernelRocm(Queue& q, Tensor& logits, const Tensor& mask);
+void ApplyTokenMaskKernelRocm(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& cols);
+void ApplyTemperatureKernelRocm(Queue& q, Tensor& logits, const Tensor& temp, bool all_random);
+void ApplyTopKTopPKernelRocm(Queue& q, Tensor& logits, const Tensor* k, const Tensor* p);
+void ComputeProbsKernelRocm(Queue& q, Tensor& probs, const Tensor& logits);
+void ComputeLogprobsKernelRocm(Queue& q, Tensor& logprobs, const Tensor& logits);
+void RandomSampleKernelRocm(Queue& q, Tensor& token_ids, const Tensor& probs, const Tensor& seeds);
+void ApplyPenaltiesKernelRocm(Queue& q, Tensor& logits, const Tensor& prompt_mask,
+                              const Tensor& output_bin_counts, const Tensor& output_mask,
+                              const Tensor& frequency_penalties, const Tensor& presence_penalties,
+                              const Tensor& repetition_penalties);
+void ApplyMinPKernelRocm(Queue& q, Tensor& logits, const Tensor& min_p);
+void ApplyLogitBiasKernelRocm(Queue& q, Tensor& logits, const Tensor& rows, const Tensor& cols,
+                              const Tensor& biases);
 
 namespace {
 
@@ -95,6 +109,34 @@ struct Registrar {
     RegisterOp(OpId::kMoeRouterTopK, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernelRocm)));
+    // Full V1 sampler surface for Hermes (temp/top-p/allowed ids/penalties/...).
+    RegisterOp(OpId::kApplyTemperature, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ApplyTemperatureFn>(&ApplyTemperatureKernelRocm)));
+    RegisterOp(OpId::kApplyTopKTopP, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ApplyTopKTopPFn>(&ApplyTopKTopPKernelRocm)));
+    RegisterOp(OpId::kComputeProbs, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<ComputeProbsFn>(&ComputeProbsKernelRocm)));
+    RegisterOp(OpId::kComputeLogprobs, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ComputeLogprobsFn>(&ComputeLogprobsKernelRocm)));
+    RegisterOp(OpId::kRandomSample, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<RandomSampleFn>(&RandomSampleKernelRocm)));
+    RegisterOp(OpId::kApplyPenalties, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ApplyPenaltiesFn>(&ApplyPenaltiesKernelRocm)));
+    RegisterOp(OpId::kApplyMinP, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<ApplyMinPFn>(&ApplyMinPKernelRocm)));
+    RegisterOp(OpId::kApplyLogitBias, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ApplyLogitBiasFn>(&ApplyLogitBiasKernelRocm)));
+    RegisterOp(OpId::kApplyAllowedTokenIds, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ApplyAllowedTokenIdsFn>(&ApplyAllowedTokenIdsKernelRocm)));
+    RegisterOp(OpId::kApplyTokenMask, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ApplyTokenMaskFn>(&ApplyTokenMaskKernelRocm)));
   }
 } registrar;
 

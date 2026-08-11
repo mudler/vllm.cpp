@@ -36,6 +36,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -44,7 +45,9 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -108,6 +111,7 @@ struct RequestRecord {
   double last_token_s = 0.0;    // running: previous token arrival (for ITL).
   int prompt_tokens = 0;
   int output_tokens = 0;
+  std::vector<int32_t> prompt_token_ids;
   std::vector<int32_t> output_token_ids;
   std::vector<double> itls;  // inter-token latencies (s), one per chunk>1st.
   bool finished = false;
@@ -120,6 +124,10 @@ struct BenchResult {
   // queue depth is one), matching vLLM's frontend across the ON/OFF control.
   bool async_frontend = false;
   bool async_scheduling_enabled = false;
+  // True when prompt tokenization was completed before the benchmark clock and
+  // timed admission used AsyncLLM's TokensPrompt overload. Auditable in every
+  // result so a benchmark artifact cannot silently mix frontend modes.
+  bool pretokenized_admission = false;
   int max_concurrent_batches = 1;
   int completed = 0;
   double duration_s = 0.0;
@@ -127,6 +135,7 @@ struct BenchResult {
   int64_t total_output = 0;
   // Per-request generated IDs in submission order. This makes the benchmark
   // workload usable as a token-for-token correctness gate before timing it.
+  std::vector<std::vector<int32_t>> prompt_token_ids;
   std::vector<std::vector<int32_t>> output_token_ids;
   double request_throughput = 0.0;       // req/s
   double output_throughput = 0.0;        // tok/s  (decode)
@@ -172,6 +181,70 @@ inline double Mean(const std::vector<double>& v) {
   double s = 0.0;
   for (double x : v) s += x;
   return s / static_cast<double>(v.size());
+}
+
+// Benchmark frontend parity selector. The pinned vLLM comparison tokenizes all
+// prompts before starting its closed-loop clock and submits TokensPrompt IDs.
+// Keep that production-parity path as the safe default: only exact `0` selects
+// the timed string-admission rollback; invalid spellings stay default-ON.
+inline bool ResolveBenchPretokenizedAdmission(const char* env_value) {
+  return env_value == nullptr || std::string_view(env_value) != "0";
+}
+
+// Pure production dispatch seam: exactly one callback is invoked. Keeping the
+// selector separate from the benchmark loop lets the CPU contract test detect
+// parser inversion and accidental double admission without hot-path counters.
+template <typename PretokenizedCallback, typename TimedStringCallback>
+inline decltype(auto) DispatchBenchPromptAdmission(
+    const char* env_value, PretokenizedCallback&& pretokenized_callback,
+    TimedStringCallback&& timed_string_callback) {
+  if (ResolveBenchPretokenizedAdmission(env_value)) {
+    return std::forward<PretokenizedCallback>(pretokenized_callback)();
+  }
+  return std::forward<TimedStringCallback>(timed_string_callback)();
+}
+
+// One benchmark refill is one observable engine wave. Record every selected
+// request's arrival before invoking exactly one engine batch publish; in rollback
+// mode, string tokenization therefore remains timed but begins only after the
+// complete wave has the same arrival boundary as the pretokenized path.
+template <typename Engine, typename ArrivalCallback,
+          typename PretokenizedWaveFactory, typename TimedStringWaveFactory>
+inline decltype(auto) DispatchBenchPromptWaveAdmission(
+    Engine& engine, const char* env_value, std::size_t wave_size,
+    ArrivalCallback&& arrival_callback,
+    PretokenizedWaveFactory&& pretokenized_wave_factory,
+    TimedStringWaveFactory&& timed_string_wave_factory) {
+  for (std::size_t offset = 0; offset < wave_size; ++offset) {
+    std::forward<ArrivalCallback>(arrival_callback)(offset);
+  }
+  if (ResolveBenchPretokenizedAdmission(env_value)) {
+    return engine.add_request_wave(
+        std::forward<PretokenizedWaveFactory>(pretokenized_wave_factory)());
+  }
+  return engine.add_request_wave(
+      std::forward<TimedStringWaveFactory>(timed_string_wave_factory)());
+}
+
+// Own the ordering boundary between workload preparation and measurement.
+// The clock callback is invoked exactly once and only after every default-path
+// prompt has been encoded with the same special-token policy as InputProcessor.
+// Supplying the clock keeps this pure host contract deterministic in tests.
+template <typename TokenizerLike, typename StartClockCallback>
+inline auto PretokenizeBenchPromptsThenStartClock(
+    bool pretokenized_admission, const TokenizerLike& tokenizer,
+    const std::vector<std::string>& prompts,
+    StartClockCallback&& start_clock_callback) {
+  std::vector<std::vector<int32_t>> pretokenized_prompts;
+  if (pretokenized_admission) {
+    pretokenized_prompts.reserve(prompts.size());
+    for (const std::string& prompt : prompts) {
+      pretokenized_prompts.push_back(
+          tokenizer.EncodeWithSpecialTokens(prompt));
+    }
+  }
+  auto start = std::forward<StartClockCallback>(start_clock_callback)();
+  return std::make_pair(std::move(pretokenized_prompts), std::move(start));
 }
 
 // ────────────────────────────── Synthetic model ───────────────────────────────
@@ -337,6 +410,20 @@ inline tok::Tokenizer BuildSyntheticTokenizer() {
              {"add_prefix_space", false},
              {"trim_offsets", false},
              {"use_regex", false}}})}};
+  // Keep a real TemplateProcessing distinction in the benchmark fixture. The
+  // production string path applies this post-processor through InputProcessor;
+  // the pretokenized path must therefore use EncodeWithSpecialTokens too.
+  doc["post_processor"] = nlohmann::json::parse(R"json({
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<tool>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}}
+    ],
+    "pair": [],
+    "special_tokens": {
+      "<tool>": {"id": "<tool>", "ids": [20], "tokens": ["<tool>"]}
+    }
+  })json");
   nlohmann::json vocab = {
       {"h", 0},   {"e", 1},   {"l", 2},    {"o", 3},     {"w", 4},
       {"r", 5},   {"d", 6},   {"Ġ", 7}, {"1", 8},   {"2", 9},
@@ -363,11 +450,12 @@ inline tok::Tokenizer BuildSyntheticTokenizer() {
   return t;
 }
 
-// Build a prompt string that tokenizes to ~target tokens under `tok`. We can't
-// hand the engine raw token ids (add_request takes text), so vLLM's exact
-// random-token input is approximated with a repeated-word filler; the harness
-// reports the MEASURED tokenized counts (from RequestOutput.prompt_token_ids),
-// so throughput stays honest regardless of the small over/undershoot.
+// Build a prompt string that tokenizes to ~target tokens under `tok`. The
+// generated-workload mode intentionally remains human-readable rather than
+// sampling arbitrary IDs; default admission pre-encodes this string before the
+// clock and the rollback tokenizes the same string inside add_request. The
+// harness reports the measured tokenized counts, so throughput stays honest
+// regardless of the small over/undershoot.
 inline std::string BuildPrompt(const tok::Tokenizer& t, int target,
                                uint64_t seed) {
   // NOTE: for the SYNTHETIC engine, only bytes in the tiny fixture's alphabet
@@ -507,9 +595,20 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
 
   vllm::v1::AsyncLLM& engine = loaded->async_engine();
 
+  // Match the pinned vLLM comparison frontend: tokenize the complete workload
+  // before t0, preserving submission order and the string path's special-token
+  // processing, then move those IDs through AsyncLLM's TokensPrompt overload.
+  // Exact `VT_BENCH_PRETOKENIZE=0` retains the previous timed string overload
+  // and does not allocate this precomputed workload.
+  const char* const pretokenize_env = std::getenv("VT_BENCH_PRETOKENIZE");
+  const bool pretokenized_admission =
+      ResolveBenchPretokenizedAdmission(pretokenize_env);
+  auto [pretokenized_prompts, t0] = PretokenizeBenchPromptsThenStartClock(
+      pretokenized_admission, loaded->tokenizer(), prompts,
+      []() { return Clock::now(); });
+
   std::map<std::string, RequestRecord> records;
   std::map<std::string, vllm::v1::AsyncRequest> active;
-  const Clock::time_point t0 = Clock::now();
   auto now_s = [&]() {
     return std::chrono::duration<double>(Clock::now() - t0).count();
   };
@@ -519,17 +618,56 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   int done = 0;
 
   auto admit = [&]() {
-    while (next < cfg.num_prompts && in_flight < cfg.concurrency) {
-      const std::string rid = std::to_string(next);
-      RequestRecord rec;
-      rec.arrival_s = now_s();
-      records[rid] = rec;
-      active.emplace(
-          rid, engine.add_request(rid, prompts[static_cast<size_t>(next)],
-                                  MakeSampling(cfg, next)));
-      ++next;
-      ++in_flight;
+    const int available = cfg.concurrency - in_flight;
+    const int wave_size = std::min(cfg.num_prompts - next, available);
+    if (wave_size <= 0) return;
+    const int wave_begin = next;
+
+    std::vector<vllm::v1::AsyncRequest> admitted =
+        DispatchBenchPromptWaveAdmission(
+            engine, pretokenize_env, static_cast<std::size_t>(wave_size),
+            [&](std::size_t offset) {
+              const int request_index =
+                  wave_begin + static_cast<int>(offset);
+              RequestRecord record;
+              record.arrival_s = now_s();
+              records[std::to_string(request_index)] = std::move(record);
+            },
+            [&]() {
+              std::vector<vllm::v1::AsyncTokensRequestInput> wave;
+              wave.reserve(static_cast<std::size_t>(wave_size));
+              for (int offset = 0; offset < wave_size; ++offset) {
+                const int request_index = wave_begin + offset;
+                const std::size_t prompt_index =
+                    static_cast<std::size_t>(request_index);
+                wave.push_back(vllm::v1::AsyncTokensRequestInput{
+                    std::to_string(request_index),
+                    std::move(pretokenized_prompts[prompt_index]),
+                    MakeSampling(cfg, request_index), 0});
+              }
+              return wave;
+            },
+            [&]() {
+              std::vector<vllm::v1::AsyncStringRequestInput> wave;
+              wave.reserve(static_cast<std::size_t>(wave_size));
+              for (int offset = 0; offset < wave_size; ++offset) {
+                const int request_index = wave_begin + offset;
+                const std::size_t prompt_index =
+                    static_cast<std::size_t>(request_index);
+                wave.push_back(vllm::v1::AsyncStringRequestInput{
+                    std::to_string(request_index), prompts[prompt_index],
+                    MakeSampling(cfg, request_index), 0});
+              }
+              return wave;
+            });
+    if (admitted.size() != static_cast<std::size_t>(wave_size)) {
+      throw std::runtime_error("AsyncLLM admitted an incomplete bench wave");
     }
+    for (vllm::v1::AsyncRequest& request : admitted) {
+      active.emplace(request.request_id, std::move(request));
+    }
+    next += wave_size;
+    in_flight += wave_size;
   };
 
   admit();
@@ -546,6 +684,7 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
       RequestRecord& rec = records[out.request_id];
       if (rec.prompt_tokens == 0 && !out.prompt_token_ids.empty()) {
         rec.prompt_tokens = static_cast<int>(out.prompt_token_ids.size());
+        rec.prompt_token_ids = out.prompt_token_ids;
       }
       if (!out.outputs.empty() && !out.outputs[0].token_ids.empty()) {
         const double t = now_s();
@@ -607,7 +746,9 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
   BenchResult res;
   res.async_frontend = true;
   res.async_scheduling_enabled = loaded->async_scheduling_enabled();
+  res.pretokenized_admission = pretokenized_admission;
   res.max_concurrent_batches = loaded->max_concurrent_batches();
+  res.prompt_token_ids.resize(static_cast<size_t>(cfg.num_prompts));
   res.output_token_ids.resize(static_cast<size_t>(cfg.num_prompts));
   res.completed = done;
   res.duration_s = dur_s;
@@ -646,6 +787,7 @@ inline BenchResult RunBench(const BenchConfig& cfg) {
     if (request_index >= res.output_token_ids.size()) {
       throw std::runtime_error("benchmark request id is out of range");
     }
+    res.prompt_token_ids[request_index] = kv.second.prompt_token_ids;
     res.output_token_ids[request_index] = kv.second.output_token_ids;
   }
   // Speculative-decoding acceptance telemetry (real-checkpoint spec-ON only;
@@ -686,6 +828,7 @@ inline void PrintReport(const BenchConfig& cfg, const BenchResult& r,
   std::fprintf(out, "%-42s %-12s\n", "Engine frontend:",
                r.async_frontend ? "AsyncLLM" : "LLMEngine");
   line_i("Async scheduling enabled:", r.async_scheduling_enabled ? 1 : 0);
+  line_i("Pretokenized prompt admission:", r.pretokenized_admission ? 1 : 0);
   line_i("Maximum concurrent batches:", r.max_concurrent_batches);
   line_i("Successful requests:", r.completed);
   line_i("Maximum request concurrency:", cfg.concurrency);

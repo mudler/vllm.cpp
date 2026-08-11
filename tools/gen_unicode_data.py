@@ -64,6 +64,36 @@ def build_category_ranges() -> list[tuple[int, int, int]]:
     return ranges
 
 
+# Letter CASE class, needed only by the Tekken pre-tokenizer, whose two letter
+# alternatives are [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+# (see SplitPattern::kTekken). The major-class table above collapses every L*
+# into kLetter, which cannot express that split. This is deliberately a SECOND,
+# narrow table rather than a re-cut of the category table: every existing
+# consumer of UCat keeps the exact bytes it has today.
+#   1 = kUpper    (Lu, Lt) -- upper class only
+#   2 = kLower    (Ll)     -- lower class only
+#   3 = kCaseless (Lm, Lo) -- BOTH classes
+# Non-letters are omitted, so a lookup miss means "not a cased letter".
+LCASE_NAMES = ["kNotLetter", "kUpper", "kLower", "kCaseless"]
+LETTER_SUBCAT_TO_LCASE = {"Lu": 1, "Lt": 1, "Ll": 2, "Lm": 3, "Lo": 3}
+
+
+def letter_case_index(cp: int) -> int:
+    return LETTER_SUBCAT_TO_LCASE.get(unicodedata.category(chr(cp)), 0)
+
+
+def build_letter_case_ranges() -> list[tuple[int, int, int]]:
+    ranges: list[tuple[int, int, int]] = []
+    run_start, run_cls = None, 0
+    for cp in range(MAX_CP + 1):  # +1 sentinel iteration flushes the last run
+        cls = letter_case_index(cp) if cp < MAX_CP else -1
+        if cls != run_cls:
+            if run_cls != 0 and run_start is not None:
+                ranges.append((run_start, cp - 1, run_cls))
+            run_start, run_cls = cp, cls
+    return ranges
+
+
 def build_whitespace_ranges() -> list[tuple[int, int]]:
     cps = [cp for cp in range(MAX_CP) if chr(cp).isspace()]
     ranges: list[tuple[int, int]] = []
@@ -75,13 +105,13 @@ def build_whitespace_ranges() -> list[tuple[int, int]]:
     return ranges
 
 
-def banner(what: str, n_cat: int, n_ws: int) -> str:
+def banner(what: str, n_cat: int, n_ws: int, n_lc: int) -> str:
     return f"""\
 // GENERATED FILE — do not edit by hand.  ({what})
 // Generator:  tools/gen_unicode_data.py
 // Regenerate: python3 tools/gen_unicode_data.py
 // Unicode data version (Python unicodedata.unidata_version): {unicodedata.unidata_version}
-// Category ranges: {n_cat}; whitespace ranges: {n_ws}.
+// Category ranges: {n_cat}; whitespace ranges: {n_ws}; letter-case ranges: {n_lc}.
 // Semantics mirror HF tokenizers byte-level BPE: categories are the major
 // Unicode general-category classes (unassigned -> kOther); IsWhitespace is
 // python str.isspace().
@@ -111,6 +141,20 @@ enum class UCat : uint8_t {
 };
 
 UCat Category(uint32_t cp);
+
+// CASE class of a letter. Needed only by SplitPattern::kTekken, whose letter
+// alternatives are [\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}] and
+// [\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]; UCat collapses all of L* into kLetter and
+// cannot express that. Deliberately a separate narrow table, so UCat and every
+// existing consumer of it are unchanged. kNotLetter for anything outside L*.
+enum class LetterCase : uint8_t {
+  kNotLetter = 0,
+  kUpper = 1,     // Lu, Lt -- the UPPER class only
+  kLower = 2,     // Ll     -- the LOWER class only
+  kCaseless = 3,  // Lm, Lo -- present in BOTH classes
+};
+
+LetterCase LetterCaseOf(uint32_t cp);
 
 // python str.isspace() semantics (per HF byte-level pretokenization):
 // includes 0x1C-0x1F, NEL (0x85) and NBSP (0xA0); excludes ZWSP (0x200B),
@@ -150,6 +194,12 @@ struct WsRange {
   uint32_t start;
   uint32_t end;  // inclusive
 };
+
+struct LCaseRange {
+  uint32_t start;
+  uint32_t end;  // inclusive
+  uint8_t cls;   // static_cast<uint8_t>(LetterCase)
+};
 """
 
 SOURCE_EPILOGUE = """\
@@ -165,6 +215,18 @@ UCat Category(uint32_t cp) {
   --it;
   if (cp <= it->end) return static_cast<UCat>(it->cat);
   return UCat::kOther;
+}
+
+LetterCase LetterCaseOf(uint32_t cp) {
+  const LCaseRange* first = std::begin(kLetterCaseRanges);
+  const LCaseRange* last = std::end(kLetterCaseRanges);
+  const LCaseRange* it = std::upper_bound(
+      first, last, cp,
+      [](uint32_t v, const LCaseRange& r) { return v < r.start; });
+  if (it == first) return LetterCase::kNotLetter;
+  --it;
+  if (cp <= it->end) return static_cast<LetterCase>(it->cls);
+  return LetterCase::kNotLetter;
 }
 
 bool IsWhitespace(uint32_t cp) {
@@ -258,16 +320,26 @@ def format_rows(rows: list[str], per_line: int) -> str:
 def main() -> int:
     cat_ranges = build_category_ranges()
     ws_ranges = build_whitespace_ranges()
+    lc_ranges = build_letter_case_ranges()
 
-    header = banner("declarations", len(cat_ranges), len(ws_ranges)) + HEADER_BODY
+    header = (
+        banner("declarations", len(cat_ranges), len(ws_ranges), len(lc_ranges))
+        + HEADER_BODY
+    )
 
     cat_rows = [f"{{0x{s:X}, 0x{e:X}, {c}}}," for s, e, c in cat_ranges]
     ws_rows = [f"{{0x{s:X}, 0x{e:X}}}," for s, e in ws_ranges]
+    lc_rows = [f"{{0x{s:X}, 0x{e:X}, {c}}}," for s, e, c in lc_ranges]
     legend = "  // cat legend: " + " ".join(
         f"{i}={n}" for i, n in enumerate(CAT_NAMES) if i != 0
     )
+    lc_legend = "  // letter-case legend: " + " ".join(
+        f"{i}={n}" for i, n in enumerate(LCASE_NAMES) if i != 0
+    )
     source = (
-        banner("tables + utf8 helpers", len(cat_ranges), len(ws_ranges))
+        banner(
+            "tables + utf8 helpers", len(cat_ranges), len(ws_ranges), len(lc_ranges)
+        )
         + SOURCE_PROLOGUE
         + "\n"
         + legend
@@ -277,6 +349,11 @@ def main() -> int:
         + "\n};\n\n"
         + f"constexpr WsRange kWhitespaceRanges[{len(ws_ranges)}] = {{\n"
         + format_rows(ws_rows, 6)
+        + "\n};\n\n"
+        + lc_legend
+        + "\n"
+        + f"constexpr LCaseRange kLetterCaseRanges[{len(lc_ranges)}] = {{\n"
+        + format_rows(lc_rows, 4)
         + "\n};\n\n"
         + SOURCE_EPILOGUE
     )
@@ -289,7 +366,8 @@ def main() -> int:
         f"wrote {HEADER_PATH.relative_to(REPO_ROOT)} and "
         f"{SOURCE_PATH.relative_to(REPO_ROOT)}: "
         f"{len(cat_ranges)} category ranges, {len(ws_ranges)} whitespace "
-        f"ranges, unidata {unicodedata.unidata_version}"
+        f"ranges, {len(lc_ranges)} letter-case ranges, "
+        f"unidata {unicodedata.unidata_version}"
     )
     return 0
 

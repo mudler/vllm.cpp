@@ -45,6 +45,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "vllm/v1/engine/core_proc.h"  // EngineCoreProc + queue/message types
@@ -63,6 +64,16 @@ class EngineDeadError : public std::runtime_error {
             "root cause." +
             (detail.empty() ? std::string() : " [" + detail + "]")) {}
 };
+
+// The client-to-core wave route owns the queue's atomic batch primitive. Keep
+// this seam injectable so focused tests can use a queue that deliberately has
+// no per-item API: replacing the batch publish with an item loop then fails to
+// compile instead of silently weakening wave visibility.
+template <typename Queue, typename Item>
+inline void PublishEngineCoreInputWaveAtomically(Queue& queue,
+                                                  std::vector<Item> items) {
+  queue.put_many_nowait(std::move(items));
+}
 
 // The in-process EngineCore client over the busy-loop queue split.
 // Collaborator lifetimes as EngineCore: scheduler/executor (and the optional
@@ -94,6 +105,11 @@ class InprocClient {
   // add_request (core_client.py:886-889): enqueue an ADD. The DP
   // engines_running flip (:887-888) is deferred.
   void add_request_async(std::unique_ptr<Request> request);
+
+  // Add one ordered frontend wave atomically. The input queue holds its mutex
+  // across the full append and wakes the engine thread once, so its first drain
+  // cannot observe only a prefix of this call. Empty waves are no-ops.
+  void add_requests_async(std::vector<std::unique_ptr<Request>> requests);
 
   // abort_requests (core_client.py:891-893): enqueue an ABORT; no-op for an
   // empty list or a dead engine.

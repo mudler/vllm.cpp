@@ -8,7 +8,7 @@ characters.
 
 ## Live claims
 
-Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
+Work: 7 external PRs landed (6 merged + #227 repaired).
 
 | Claim / track | State | Next command or step |
 |---|---|---|
@@ -21,7 +21,7 @@ Work: exact-chunks on main `1ce0d662b`; sm_120 measured at `3d2581551`.
 | MiniMax-H3 | **PRUNED ckpts RUN (#241): Q8_0 renders, seam 0.9941** | same-binary A/B |
 | Kimi-Linear-48B | 122/128 held; e2e NOT ESTABLISHED | tiktoken-only ckpt: no warm server |
 | 35B mid-band | **canonical 0.918-0.972x** c1-c32 (@`348c265d`, first c16/c32) | Decode-only window, ONE tool |
-| Qwen3.5-4B sm_120 | Exact chunks ON: 3.072x kernel / +2.272% run; tput 1.021x PASS; latency/VRAM OPEN | Spike 1.609x conv gap |
+| Qwen3.5-4B sm_120 | tput **1.0283x** `PENDING`; TTFT/TPOT/E2E 1.085/1.017/1.029x | Profile wave |
 | RPi5 A76 CPU | **R5 asm GREEN; llama NOT MET**: 0.461x pf, 0.653x dec | W6: BF16 GEMM |
 | SERVE-ASYNC-MIRROR | **#323 FIXED** (mitigation): graph declines while the mirror is live; 7/7 async gates | Graph read ids at REPLAY |
 | CPU levers (`QUANT-GGUF-CIQ-GEMM`) | Profile DONE: decode **47% threadpool sync**, prefill **~39% paged attn** | Parakeet encoder; attn dtype hoist |
@@ -57,10 +57,11 @@ latency/memory on every axis, both gate models, reproduced 2–3x idle. See
    of roof. Dense-marlin +0.5%; Triton-AOT GDN a WASH.
 2. **Spike the Parakeet encoder row** (vLLM: `nano_nemotron_vl.py`; the
    transducer half is NOT in vLLM: separate call).
-3. **Qwen3.5-4B sm_120:** GREEN + reprofiled. Spike the residual 1.609x conv
-   gap; latency/VRAM and gate models stay open.
-4. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).
-5. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
+3. **Qwen3.5-4B #206:** +2.83% `PENDING`; latency/VRAM open.
+4. **Invocation-parity prevention:** CI guard + checklist; build-verify
+   `kGemvHeuristicAlgos` on dgx.
+5. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).
+6. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
    `AGENTS.md` tiering DONE. REMAINING: anchor backfill (6 model rows need a
    DECISION); record-era rollover BLOCKED on `DONE` rows bound to
    `parity-ledger.md` LINE anchors (re-anchor by ROW ID).

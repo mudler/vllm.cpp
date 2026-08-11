@@ -31,6 +31,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "vllm/multimodal/inputs.h"  // multimodal::MultiModalInputs (mm request)
@@ -53,6 +54,38 @@ struct AsyncRequest {
   std::string request_id;
   std::shared_ptr<RequestOutputCollector> collector;
 };
+
+// Ordered-wave admission inputs. Separate types make it impossible for one
+// item to carry both prompt forms. The batch API preserves these objects'
+// order in both core publication and returned collectors.
+struct AsyncStringRequestInput {
+  std::string request_id;
+  std::string prompt;
+  SamplingParams params;
+  int priority = 0;
+};
+
+struct AsyncTokensRequestInput {
+  std::string request_id;
+  std::vector<int32_t> prompt_token_ids;
+  SamplingParams params;
+  int priority = 0;
+};
+
+// The second admission check lives on the lock-owned publish route, rather
+// than only at the start of input preparation. This injectable seam lets a
+// deterministic test model shutdown winning after the outer fast check and
+// prove that no registration or core publish callback can run afterward.
+template <typename Lockable, typename AlivePredicate, typename PublishCallback>
+inline decltype(auto) PublishAsyncRequestWaveIfAlive(
+    Lockable& admission_mutex, AlivePredicate&& alive_predicate,
+    PublishCallback&& publish_callback) {
+  std::lock_guard<Lockable> lock(admission_mutex);
+  if (!std::forward<AlivePredicate>(alive_predicate)()) {
+    throw EngineDeadError("request wave submitted to a stopped AsyncLLM");
+  }
+  return std::forward<PublishCallback>(publish_callback)();
+}
 
 class AsyncLLM {
  public:
@@ -104,6 +137,16 @@ class AsyncLLM {
   AsyncRequest add_request(const std::string& request_id,
                            std::vector<int32_t> prompt_token_ids,
                            SamplingParams params, int priority = 0);
+
+  // Prepare and atomically publish one complete string or TokensPrompt wave.
+  // Every input/core Request and collector is built before any frontend state
+  // is registered. On duplicate, preparation/enqueue failure, or shutdown,
+  // this call publishes no core prefix and removes only state created by this
+  // call, without producing synthetic terminal outputs.
+  std::vector<AsyncRequest> add_request_wave(
+      std::vector<AsyncStringRequestInput> requests);
+  std::vector<AsyncRequest> add_request_wave(
+      std::vector<AsyncTokensRequestInput> requests);
 
   // add_request for a MULTIMODAL prompt (ROAD-V1-MM MM-SERVE-ENGINE). Strictly
   // ADDITIVE overload mirroring LLMEngine::add_request(MultiModalInputs): builds
@@ -175,6 +218,15 @@ class AsyncLLM {
   void shutdown();
 
  private:
+  struct PreparedRequest {
+    EngineCoreRequest request;
+    std::optional<std::string> prompt;
+    std::shared_ptr<RequestOutputCollector> collector;
+    std::unique_ptr<Request> core_request;
+  };
+
+  std::vector<AsyncRequest> PublishPreparedWave(
+      std::vector<PreparedRequest> prepared);
   void RunOutputHandler();
 
   InputProcessor& input_processor_;

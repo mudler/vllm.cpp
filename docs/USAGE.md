@@ -24,6 +24,11 @@ directory (issue #85).
 
 ### One ROCm-specific behaviour
 
+ROCm builds register the full V1 sampler surface (temperature, top-k/top-p, min-p,
+penalties, allowed-token masks, logprobs, random sample) so EngineCore does not
+fatal with `no kernel for op` after prefill on AMD. Non-positive chat
+`max_tokens` is treated as unset on all backends (Hermes `max_tokens=-1`).
+
 Worth knowing before you read a hang as a bug in the tests: a build that sets no
 `CMAKE_BUILD_TYPE` floors **HIP device code** at `-O1` and prints a configure
 line saying so. At `-O0` the ROCm runtime starts a hostcall listener the kernels
@@ -125,9 +130,37 @@ Two more example binaries ship alongside it:
 - `vllm-bench` ([`examples/bench/main.cpp`](../examples/bench/main.cpp)), a
   throughput/latency harness taking `--model`, `--dataset-path`,
   `--num-prompts`, `--input-len`, `--output-len`, `--concurrency`,
-  `--max-num-batched-tokens`, and `--num-blocks`.
+  `--max-num-batched-tokens`, and `--num-blocks`. It pretokenizes before timing
+  and atomically publishes each concurrency wave. Set
+  `VT_BENCH_PRETOKENIZE=0` for the timed-string rollback; the report names the
+  resolved mode.
 - `tokenize` ([`examples/tokenize/main.cpp`](../examples/tokenize/main.cpp)), a
   tokenizer smoke tool taking `<tokenizer.json | model.gguf> <corpus.txt>`.
+
+### Which HF tokenizers load
+
+A checkpoint's `tokenizer.json` is accepted when its `pre_tokenizer` is one this
+build recognises. Recognition is by exact regex or pipeline shape, not by model
+name, so a checkpoint from any vendor loads if it carries one of these:
+
+| family | shape | examples |
+|---|---|---|
+| Qwen3.6 | one `Split` regex, single-codepoint `\p{N}`, `\p{M}` folded into letter runs | Qwen3.6-27B |
+| Qwen2/Qwen3 classic | as above without `\p{M}` awareness | Qwen3-0.6B, Qwen3-Coder |
+| Llama-3 | `\p{N}{1,3}` digit groups, no `\p{M}` awareness | Llama-3 family |
+| Tekken (Mistral) | case-aware letter runs, single-codepoint `\p{N}`, `/` in the punct tail | Mistral-Nemo-Instruct-2407 |
+| GPT-2 byte-level | `ByteLevel(use_regex=true)` with no explicit `Split` | OPT, GPT-2 |
+| DeepSeek | a seven-stage `Sequence` pipeline, not one alternation | DeepSeek-V2/V3 |
+| SentencePiece | `Metaspace` + byte-fallback vocab | Mistral-7B-v0.3 |
+
+An unrecognised one fails loudly at load with `tokenizer: unrecognized
+pre-tokenizer split regex: <regex>`, rather than tokenizing incorrectly. If you
+hit that, the printed regex is what a new pattern would have to match.
+
+Note that Mistral ships **two** unrelated tokenizer families: Mistral-7B-v0.3 is
+SentencePiece, while Mistral-Nemo is Tekken, a byte-level BPE whose regex is
+tiktoken's `o200k_base` with the contraction group removed and `\p{N}{1,3}`
+reduced to `\p{N}`. Support for one says nothing about the other.
 
 ### How much memory a Vulkan load needs
 
@@ -650,6 +683,27 @@ a stop token early.
 | `--cuda-profile-graph-replays N` | `0` (off) | Trace-only diagnostic: arm the CUDA-graph-replay profiler and stop after N replays, printing a pid to signal with `SIGUSR2`. Requires a build with `VT_BENCH_PROFILE_CONTROL` |
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |
 | `-h`, `--help` | | Print usage and exit |
+
+#### Context length vs the KV pool
+
+The KV pool holds `--num-blocks × --block-size` tokens — `256 × 32 = 8192` by
+default. A request longer than that can never be scheduled, so the engine
+refuses it early rather than leaving it in the waiting queue forever. Two checks
+do that, mirroring vLLM:
+
+- **At startup.** If `--max-model-len` is given and the pool cannot hold one
+  sequence that long, the server exits with the sizes and the flags that close
+  the gap (vLLM's `_check_enough_kv_cache_memory`). If it is **not** given, the
+  serving length is auto-fitted down to what the pool holds and logged
+  (vLLM's `_auto_fit_max_model_len`) — so raising `--num-blocks` is what buys a
+  longer context.
+- **At admission.** A prompt at or past the resolved `max_model_len` is
+  rejected with **HTTP 400** (`BadRequestError`) naming both lengths, exactly as
+  vLLM's `_validate_prompt_len` does. It is never a finish reason and never a
+  500.
+
+Set `VT_ENGINE_STEP_LOG=1` to print a per-step engine heartbeat if you need to
+confirm that a quiet engine is idle rather than stalled.
 
 For a production deployment, use [LocalAI](https://localai.io), which can embed
 engines like this behind a model gallery, multi-model serving, the full OpenAI

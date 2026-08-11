@@ -767,4 +767,43 @@ void GeluErfKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
   Check(hipGetLastError(), "gelu_erf");
 }
 
+// --- sampling logit masks (Hermes allowed_token_ids / bad_words) ------------
+// mask TRUE => exclude (set -inf). Mirrors CPU/CUDA ApplyAllowedTokenIds.
+__global__ void ApplyAllowedTokenIdsK(float* logits, const int8_t* mask, int64_t total) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
+       idx += step)
+    if (mask[idx]) logits[idx] = -INFINITY;
+}
+
+void ApplyAllowedTokenIdsKernelRocm(Queue& q, Tensor& logits, const Tensor& mask) {
+  const int64_t n = logits.shape[0], v = logits.shape[1];
+  if (n == 0 || v == 0) return;
+  VT_CHECK(logits.dtype == DType::kF32, "rocm apply_allowed_token_ids: logits f32");
+  VT_CHECK(mask.dtype == DType::kI8, "rocm apply_allowed_token_ids: mask i8");
+  const int64_t total = n * v;
+  ApplyAllowedTokenIdsK<<<GridFor(total), kBlock, 0, AsStream(q)>>>(
+      logits.Ptr<float>(), mask.Ptr<int8_t>(), total);
+  Check(hipGetLastError(), "apply_allowed_token_ids");
+}
+
+// Sparse -inf scatter at (rows[k], cols[k]) — bad_words path.
+__global__ void ApplyTokenMaskK(float* logits, const int32_t* rows, const int32_t* cols,
+                                int64_t v, int64_t m) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t k = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; k < m;
+       k += step)
+    logits[static_cast<int64_t>(rows[k]) * v + cols[k]] = -INFINITY;
+}
+
+void ApplyTokenMaskKernelRocm(Queue& q, Tensor& logits, const Tensor& rows,
+                              const Tensor& cols) {
+  const int64_t v = logits.shape[1], m = rows.shape[0];
+  if (m == 0) return;
+  VT_CHECK(logits.dtype == DType::kF32, "rocm apply_token_mask: logits f32");
+  ApplyTokenMaskK<<<GridFor(m), kBlock, 0, AsStream(q)>>>(
+      logits.Ptr<float>(), rows.Ptr<int32_t>(), cols.Ptr<int32_t>(), v, m);
+  Check(hipGetLastError(), "apply_token_mask");
+}
+
 }  // namespace vt::rocm

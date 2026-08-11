@@ -49,6 +49,7 @@
 #include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
 #include <ttnn/operations/data_movement/slice/slice.hpp>
 #include <ttnn/operations/data_movement/concat/concat.hpp>
+#include <ttnn/operations/data_movement/permute/permute.hpp>
 #include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
 #include <ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
 #include <ttnn/operations/transformer/sdpa_config.hpp>
@@ -715,9 +716,12 @@ ttnn::Tensor EnsurePagedKvTtnn(const Tensor& cache_nhd, MeshDevice& device, uint
 
 // Publish a device result as the current value of `out` WITHOUT downloading
 // to host (the residency win). Host is marked stale until EnsureHost.
-void CommitDevice2D(Tensor& out, ttnn::Tensor dev) {
-  VT_CHECK(out.rank == 2 && out.IsContiguous(),
-           "tenstorrent: CommitDevice2D expects contiguous rank-2 out");
+// Device tensor is stored as logical [rows, cols] TILE (may differ from out's
+// rank-3 view as long as numel matches) so a later Reshape+EnsureDevice2D hits.
+void CommitDeviceLogical2D(Tensor& out, ttnn::Tensor dev, uint32_t rows, uint32_t cols) {
+  VT_CHECK(out.IsContiguous(), "tenstorrent: CommitDeviceLogical2D expects contiguous out");
+  VT_CHECK(out.Numel() == static_cast<int64_t>(rows) * static_cast<int64_t>(cols),
+           "tenstorrent: CommitDeviceLogical2D numel mismatch");
   std::lock_guard<std::mutex> g(SlotMutex());
   BufferSlot* s = FindSlot(out.data);
   if (s == nullptr) {
@@ -726,10 +730,17 @@ void CommitDevice2D(Tensor& out, ttnn::Tensor dev) {
     return;
   }
   s->device = std::move(dev);
-  s->dev_rows = static_cast<uint32_t>(out.shape[0]);
-  s->dev_cols = static_cast<uint32_t>(out.shape[1]);
+  s->dev_rows = rows;
+  s->dev_cols = cols;
   s->device_current = true;
   s->host_current = false;
+}
+
+void CommitDevice2D(Tensor& out, ttnn::Tensor dev) {
+  VT_CHECK(out.rank == 2 && out.IsContiguous(),
+           "tenstorrent: CommitDevice2D expects contiguous rank-2 out");
+  CommitDeviceLogical2D(out, std::move(dev), static_cast<uint32_t>(out.shape[0]),
+                        static_cast<uint32_t>(out.shape[1]));
 }
 
 // Host wrote `out` in place — drop any device shadow.
@@ -740,23 +751,6 @@ void CommitHost(Tensor& out) {
   s->host_current = true;
   s->device_current = false;
   s->device = std::nullopt;
-}
-
-// Legacy name used by a few call sites that still force a host materialization.
-void Download(ttnn::Tensor& dev, Tensor& out) {
-  DownloadToHost(dev, out);
-  CommitHost(out);
-  // Also keep device copy so a subsequent EnsureDevice can reuse it without
-  // re-upload if host was not modified.
-  std::lock_guard<std::mutex> g(SlotMutex());
-  BufferSlot* s = FindSlot(out.data);
-  if (s != nullptr) {
-    s->device = dev;
-    s->dev_rows = out.rank >= 1 ? static_cast<uint32_t>(out.shape[0]) : 0;
-    s->dev_cols = out.rank >= 2 ? static_cast<uint32_t>(out.shape[1]) : 0;
-    s->device_current = (out.rank == 2);
-    s->host_current = true;
-  }
 }
 
 // Device compute: keep result on device (CommitDevice2D). Host round-trip only
@@ -863,17 +857,63 @@ void ReluKernel(Queue&, Tensor& out, const Tensor& x) {
   CommitDevice2D(out, std::move(dev_y));
 }
 
+// ---- Persistent embedding-table shadows (ROW_MAJOR BF16 on device) --------
+// The vocab table is multi-hundred MB for Qwen3; re-uploading every forward
+// was a pure tax. Keyed by host table base; invalidated by MarkHostWritten /
+// UnregisterHostBuffer.
+struct EmbedTableShadow {
+  std::optional<ttnn::Tensor> device;
+  uint32_t vocab = 0, h = 0;
+};
+std::mutex& EmbedTableMutex() {
+  static std::mutex m;
+  return m;
+}
+std::map<uintptr_t, EmbedTableShadow>& EmbedTableShadows() {
+  static std::map<uintptr_t, EmbedTableShadow> m;
+  return m;
+}
+void DropEmbedTableShadow(void* host) {
+  if (host == nullptr) return;
+  std::lock_guard<std::mutex> g(EmbedTableMutex());
+  EmbedTableShadows().erase(reinterpret_cast<uintptr_t>(host));
+}
+
+ttnn::Tensor EnsureEmbedTableDevice(const Tensor& table, MeshDevice& device) {
+  VT_CHECK(table.rank == 2 && table.IsContiguous(), "EnsureEmbedTable: rank-2 contiguous");
+  const uint32_t vocab = static_cast<uint32_t>(table.shape[0]);
+  const uint32_t h = static_cast<uint32_t>(table.shape[1]);
+  {
+    std::lock_guard<std::mutex> g(EmbedTableMutex());
+    auto it = EmbedTableShadows().find(reinterpret_cast<uintptr_t>(table.data));
+    if (it != EmbedTableShadows().end() && it->second.device.has_value() &&
+        it->second.vocab == vocab && it->second.h == h) {
+      return *it->second.device;
+    }
+  }
+  EnsureHost(table);
+  std::vector<float> host_table = ToHostF32(table);
+  ttnn::Tensor dev_table = ttnn::Tensor::from_vector<float>(
+      host_table,
+      SpecOf(tt::tt_metal::Shape({vocab, h}), ttnn::DataType::BFLOAT16, ttnn::Layout::ROW_MAJOR),
+      &device);
+  std::lock_guard<std::mutex> g(EmbedTableMutex());
+  EmbedTableShadow& s = EmbedTableShadows()[reinterpret_cast<uintptr_t>(table.data)];
+  s.device = dev_table;
+  s.vocab = vocab;
+  s.h = h;
+  return dev_table;
+}
+
 // kEmbedding: row gather `out[i,:] = table[ids[i],:]` (cpu_ops.cpp
 // EmbeddingKernel contract). Two layout departures from the TILE/BFLOAT16
 // linear ops, forced by ttnn::embedding's validate path:
 //   1. ids upload as ROW_MAJOR UINT32 (ttnn rejects i32/i64; vt still accepts
 //      kI32/kI64 at the seam and converts host-side, matching Metal/Vulkan).
-//   2. table upload as ROW_MAJOR BFLOAT16 (ttnn requires ROW_MAJOR weights;
-//      TILE is converted inside ttnn::embedding, but starting RM is cheaper
-//      and matches the unit tests in tt-metal).
+//   2. table is ROW_MAJOR BFLOAT16 (cached on device after first use).
 // Parameter order at the ttnn call is (ids, table) — reversed from
-// vt::EmbeddingFn's (table, ids). Output is requested ROW_MAJOR so
-// to_vector is dense without tile padding for arbitrary (t, h).
+// vt::EmbeddingFn's (table, ids). Output is TILE so the next matmul can keep
+// the activation device-resident without a host round-trip.
 void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids) {
   VT_CHECK(table.rank == 2 && ids.rank == 1 && out.rank == 2,
            "tenstorrent kEmbedding: table rank-2, ids rank-1, out rank-2");
@@ -889,7 +929,6 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
   VT_CHECK(out.shape[0] == t && out.shape[1] == h, "tenstorrent kEmbedding: out shape mismatch");
 
   EnsureHost(ids);
-  EnsureHost(table);
   std::vector<uint32_t> host_ids(t);
   if (ids.dtype == DType::kI32) {
     const int32_t* p = ids.Ptr<int32_t>();
@@ -910,33 +949,51 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
   ttnn::Tensor dev_ids = ttnn::Tensor::from_vector<uint32_t>(
       host_ids, SpecOf(tt::tt_metal::Shape({t}), ttnn::DataType::UINT32, ttnn::Layout::ROW_MAJOR),
       &device);
-  std::vector<float> host_table = ToHostF32(table);
-  ttnn::Tensor dev_table = ttnn::Tensor::from_vector<float>(
-      host_table,
-      SpecOf(tt::tt_metal::Shape({vocab, h}), ttnn::DataType::BFLOAT16, ttnn::Layout::ROW_MAJOR),
-      &device);
-  // (ids, table) — reversed from vt::EmbeddingFn. Explicit ROW_MAJOR output
-  // keeps download dense for non-tile-aligned (t, h).
+  ttnn::Tensor dev_table = EnsureEmbedTableDevice(table, device);
+  // TILE output → CommitDevice2D so the first residual/RMS/matmul reuses it.
   ttnn::Tensor dev_out = ttnn::embedding(dev_ids, dev_table, /*pad_token=*/std::nullopt,
-                                         /*layout=*/ttnn::Layout::ROW_MAJOR);
-  // Embedding is ROW_MAJOR; materialize host then re-upload as TILE so the next
-  // matmul hits the device cache. Once-per-forward cost; activations after
-  // this stay device-resident via CommitDevice2D on matmul/norm.
-  Download(dev_out, out);
+                                         /*layout=*/ttnn::Layout::TILE);
+  // embedding may return [t, h] or a higher-rank view; normalize to [t, h].
+  if (dev_out.logical_shape().rank() != 2 ||
+      dev_out.logical_shape()[0] != t || dev_out.logical_shape()[1] != h) {
+    dev_out = ttnn::reshape(dev_out, ttnn::Shape({t, h}));
+  }
+  CommitDevice2D(out, std::move(dev_out));
 }
 
-// Upload a rank-1 F32 affine vector as TILE BFLOAT16 with logical shape
-// [1, d]. ttnn::layer_norm's TILE-gamma path requires padded height ==
-// tile_height (32); from_vector with TILE layout pads a [1,d] tensor to
-// that. ROW_MAJOR gamma only works cleanly when d == tile_width in the
-// ttnn unit tests, so TILE is the general path.
-ttnn::Tensor UploadAffine1D(const Tensor& t, uint32_t d, MeshDevice& device) {
+// Upload a rank-1 affine vector as TILE BFLOAT16 [1, d], caching on the weight's
+// host buffer slot so RmsNorm/LayerNorm do not re-upload every layer call.
+// ttnn's TILE-gamma path requires padded height == tile_height (32); from_vector
+// with TILE pads a [1,d] tensor to that.
+ttnn::Tensor EnsureAffine1D(const Tensor& t, uint32_t d, MeshDevice& device) {
+  VT_CHECK(t.rank == 1 && t.IsContiguous() && t.shape[0] == static_cast<int64_t>(d),
+           "tenstorrent EnsureAffine1D: rank-1 [d] contiguous");
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(t.data);
+    if (s != nullptr && s->device_current && s->device.has_value() && s->dev_rows == 1 &&
+        s->dev_cols == d) {
+      return *s->device;
+    }
+  }
+  EnsureHost(t);
   std::vector<float> host(d);
   for (uint32_t i = 0; i < d; ++i) host[i] = LoadElemF32(t, i);
-  return ttnn::Tensor::from_vector<float>(
+  ttnn::Tensor dev = ttnn::Tensor::from_vector<float>(
       host, SpecOf(tt::tt_metal::Shape({1, d}), ttnn::DataType::BFLOAT16, ttnn::Layout::TILE),
       &device);
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(t.data);
+  if (s != nullptr) {
+    s->device = dev;
+    s->dev_rows = 1;
+    s->dev_cols = d;
+    s->device_current = true;
+    s->host_current = true;
+  }
+  return dev;
 }
+
 
 // kLayerNorm: per-row mean/var over the last dim (cpu_layernorm.cpp
 // LayerNormKernel / ATen native_layer_norm). Biased (1/N) variance; optional
@@ -964,13 +1021,11 @@ void LayerNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor* weight,
   }
 
   MeshDevice& device = SharedMeshDevice();
-  if (weight != nullptr) EnsureHost(*weight);
-  if (bias != nullptr) EnsureHost(*bias);
   ttnn::Tensor dev_x = EnsureDevice2D(x, device);
   std::optional<ttnn::Tensor> dev_w;
   std::optional<ttnn::Tensor> dev_b;
-  if (weight != nullptr) dev_w = UploadAffine1D(*weight, d, device);
-  if (bias != nullptr) dev_b = UploadAffine1D(*bias, d, device);
+  if (weight != nullptr) dev_w = EnsureAffine1D(*weight, d, device);
+  if (bias != nullptr) dev_b = EnsureAffine1D(*bias, d, device);
   ttnn::Tensor dev_y = ttnn::layer_norm(dev_x, args.eps, dev_w, dev_b);
   CommitDevice2D(out, std::move(dev_y));
 }
@@ -1007,10 +1062,13 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
              "tenstorrent kRmsNorm: residual must be contiguous float");
   }
 
-  // Residual stream: x + residual -> residual (with dtype re-read), then norm
-  // that value. Host-staged so bf16 round-trip matches cpu_ops RmsNormKernel.
-  // Gemma (w+1) also stays on the host path with the same math as CPU.
-  if (residual != nullptr || args.gemma) {
+  // Host path for gemma (w+1) and for tiny residual merges: short decode
+  // (rows=1) pays more for device add+rms launches than a host loop, and was
+  // a measurable e2e regression vs host residual.
+  constexpr uint32_t kDeviceResidualMinRows = 32;
+  const bool host_residual =
+      args.gemma || (residual != nullptr && rows < kDeviceResidualMinRows);
+  if (host_residual) {
     EnsureHost(x);
     EnsureHost(weight);
     if (residual != nullptr) EnsureHost(*residual);
@@ -1042,11 +1100,18 @@ void RmsNormKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& weight,
     return;
   }
 
+  // Device path: plain rms, or residual stream (x+residual → residual, then
+  // rms) when rows are large enough that launches amortize.
   MeshDevice& device = SharedMeshDevice();
-  EnsureHost(weight);
   ttnn::Tensor dev_x = EnsureDevice2D(x, device);
-  ttnn::Tensor dev_w = UploadAffine1D(weight, d, device);
-  ttnn::Tensor dev_y = ttnn::rms_norm(dev_x, args.eps, dev_w);
+  ttnn::Tensor dev_w = EnsureAffine1D(weight, d, device);
+  ttnn::Tensor to_norm = dev_x;
+  if (residual != nullptr) {
+    ttnn::Tensor dev_r = EnsureDevice2D(*residual, device);
+    to_norm = ttnn::add(dev_x, dev_r);
+    CommitDevice2D(*residual, to_norm);
+  }
+  ttnn::Tensor dev_y = ttnn::rms_norm(to_norm, args.eps, dev_w);
   CommitDevice2D(out, std::move(dev_y));
 }
 
@@ -1269,8 +1334,9 @@ void RopeApplyHost(Tensor& qs, Tensor* ks, const float* cos_t, const float* sin_
   if (ks != nullptr) CommitHost(*ks);
 }
 
-// Prefer device apply only when T*H is large enough that kernel launches amortize.
-// Short Qwen3 decode (T=1,H=16) is host-faster; long prefill benefits from device.
+// Prefer device apply only when T*H amortizes the slice/mul/concat launches.
+// Short Qwen3 decode (T=1,H=16) is host-faster even when Q is already on device
+// (measured regression when always-device-for-resident was forced).
 inline bool PreferDeviceRope(int64_t tokens, int64_t heads) {
   return tokens * heads >= 64;
 }
@@ -1572,9 +1638,7 @@ bool TryPagedAttentionDeviceDecode(Tensor& out, const Tensor& query, const Tenso
   if ((d % 32) != 0 || (block_size % 32) != 0) return false;
   if (block_table.rank != 2 || seq_lens.rank != 1 || query_start_loc.rank != 1) return false;
 
-  EnsureHost(query);
-  EnsureHost(k_cache);
-  EnsureHost(v_cache);
+  // Query may stay device-resident after rope — do not force EnsureHost(query).
   EnsureHost(block_table);
   EnsureHost(seq_lens);
   EnsureHost(query_start_loc);
@@ -1612,24 +1676,48 @@ bool TryPagedAttentionDeviceDecode(Tensor& out, const Tensor& query, const Tenso
     ttnn::Tensor dev_k = EnsurePagedKvTtnn(k_cache, device, used_nb);
     ttnn::Tensor dev_v = EnsurePagedKvTtnn(v_cache, device, used_nb);
 
-    // Q: [1, B, H, D] TILE BF16 DRAM from host [B, H, D] (decode order = req order).
-    std::vector<float> q_host(static_cast<size_t>(num_reqs * hq * d));
-    for (int64_t r = 0; r < num_reqs; ++r) {
-      const int64_t t = qsl[r];
-      for (int64_t h = 0; h < hq; ++h) {
-        for (int64_t e = 0; e < d; ++e) {
-          q_host[static_cast<size_t>((r * hq + h) * d + e)] =
-              LoadElemF32(query, (t * hq + h) * d + e);
-        }
-      }
-    }
     const uint32_t Bu = static_cast<uint32_t>(num_reqs);
     const uint32_t hu = static_cast<uint32_t>(hq);
     const uint32_t du = static_cast<uint32_t>(d);
-    ttnn::Tensor dev_q = ttnn::Tensor::from_vector<float>(
-        q_host, SpecOf(tt::tt_metal::Shape({1u, Bu, hu, du}), ttnn::DataType::BFLOAT16,
-                       ttnn::Layout::TILE),
-        &device);
+
+    // Q: [1, B, H, D]. Prefer reshape of a resident [B*H, D] / [B, H*D] shadow
+    // (post device rope) so we never download then re-upload.
+    bool identity_q = true;
+    for (int64_t r = 0; r < num_reqs; ++r) {
+      if (qsl[r] != r) {
+        identity_q = false;
+        break;
+      }
+    }
+    ttnn::Tensor dev_q;
+    bool q_from_device = false;
+    if (identity_q) {
+      try {
+        Tensor q_flat = query.View({total_q * hq, d});
+        ttnn::Tensor dev_q2d = EnsureDevice2D(q_flat, device);
+        dev_q = ttnn::reshape(dev_q2d, ttnn::Shape({1u, Bu, hu, du}));
+        q_from_device = true;
+      } catch (const std::exception&) {
+        q_from_device = false;
+      }
+    }
+    if (!q_from_device) {
+      EnsureHost(query);
+      std::vector<float> q_host(static_cast<size_t>(num_reqs * hq * d));
+      for (int64_t r = 0; r < num_reqs; ++r) {
+        const int64_t t = qsl[r];
+        for (int64_t h = 0; h < hq; ++h) {
+          for (int64_t e = 0; e < d; ++e) {
+            q_host[static_cast<size_t>((r * hq + h) * d + e)] =
+                LoadElemF32(query, (t * hq + h) * d + e);
+          }
+        }
+      }
+      dev_q = ttnn::Tensor::from_vector<float>(
+          q_host, SpecOf(tt::tt_metal::Shape({1u, Bu, hu, du}), ttnn::DataType::BFLOAT16,
+                         ttnn::Layout::TILE),
+          &device);
+    }
     ttnn::Tensor dev_pt = ttnn::Tensor::from_vector<int32_t>(
         pt, SpecOf(tt::tt_metal::Shape({Bu, static_cast<uint32_t>(max_blocks)}),
                    ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR),
@@ -1665,8 +1753,29 @@ bool TryPagedAttentionDeviceDecode(Tensor& out, const Tensor& query, const Tenso
         /*paged_cache_geometry=*/std::nullopt,
         /*cache_position_modulo=*/std::nullopt);
 
+    // Prefer keeping activations on device for o_proj: flatten to [B, H*D].
+    // Pure-decode with identity token order (qsl[r]==r) matches out's storage
+    // layout [T,H,D] == [B,H,D] so Reshape→MatmulBT hits EnsureDevice2D.
+    bool identity_order = true;
+    for (int64_t r = 0; r < num_reqs; ++r) {
+      if (qsl[r] != r) {
+        identity_order = false;
+        break;
+      }
+    }
+    if (identity_order && total_q == num_reqs) {
+      try {
+        ttnn::Tensor flat =
+            ttnn::reshape(dev_out, ttnn::Shape({Bu, static_cast<uint32_t>(hq * d)}));
+        CommitDeviceLogical2D(out, std::move(flat), Bu, static_cast<uint32_t>(hq * d));
+        return true;
+      } catch (const std::exception&) {
+        // Fall through to host materialization.
+      }
+    }
+
     // Output ~ [1, B, H, D] → host [B, H, D] in request order, then scatter to
-    // global query token indices (identity when pure decode).
+    // global query token indices.
     std::vector<float> result = dev_out.to_vector<float>();
     VT_CHECK(static_cast<int64_t>(result.size()) >= num_reqs * hq * d,
              "tenstorrent device PA: unexpected output size");
@@ -1674,7 +1783,6 @@ bool TryPagedAttentionDeviceDecode(Tensor& out, const Tensor& query, const Tenso
       const int64_t t = qsl[r];
       for (int64_t h = 0; h < hq; ++h) {
         for (int64_t e = 0; e < d; ++e) {
-          // Prefer logical [1,B,H,D] packing; if padded, to_vector is dense logical.
           const float v = result[static_cast<size_t>((r * hq + h) * d + e)];
           StoreElemF32(out, (t * hq + h) * d + e, v);
         }
@@ -1772,6 +1880,16 @@ bool TryPagedAttentionDevicePrefill(Tensor& out, const Tensor& query, const Tens
     const uint32_t hu = static_cast<uint32_t>(hq);
     const uint32_t du = static_cast<uint32_t>(d);
 
+    // Single-request contiguous prefill (qsl[0]==0, q_len==total_q): keep
+    // result on device as [T, H*D] for o_proj. Multi-chunk uses permute+concat
+    // so we never host-materialize the full sequence.
+    const bool device_prefill_out =
+        num_reqs == 1 && qsl[0] == 0 &&
+        static_cast<int64_t>(qsl[1] - qsl[0]) == total_q && total_q > 0;
+
+    std::vector<ttnn::Tensor> out_pieces;  // each [n_real, H*D]
+    out_pieces.reserve(static_cast<size_t>((total_q + kChunk - 1) / kChunk));
+
     for (int64_t r = 0; r < num_reqs; ++r) {
       const int64_t q_begin = static_cast<int64_t>(qsl[r]);
       const int64_t q_len = static_cast<int64_t>(qsl[r + 1] - qsl[r]);
@@ -1818,6 +1936,22 @@ bool TryPagedAttentionDevicePrefill(Tensor& out, const Tensor& query, const Tens
             /*memory_config=*/std::nullopt, /*program_config=*/prog,
             /*compute_kernel_config=*/std::nullopt, /*paged_cache_geometry=*/std::nullopt);
 
+        if (device_prefill_out) {
+          // [1, H, S, D] → [1, S, H, D] → slice real tokens → [n_real, H*D].
+          ttnn::Tensor perm =
+              ttnn::permute(dev_out, ttsl::SmallVector<int64_t>{0, 2, 1, 3});
+          if (n_real < kChunk) {
+            const uint32_t nr = static_cast<uint32_t>(n_real);
+            perm = ttnn::slice(perm, ttsl::SmallVector<uint32_t>{0, 0, 0, 0},
+                               ttsl::SmallVector<uint32_t>{1u, nr, hu, du},
+                               ttsl::SmallVector<uint32_t>{1, 1, 1, 1});
+          }
+          const uint32_t nr = static_cast<uint32_t>(n_real);
+          out_pieces.push_back(
+              ttnn::reshape(perm, ttnn::Shape({nr, static_cast<uint32_t>(hq * d)})));
+          continue;
+        }
+
         std::vector<float> result = dev_out.to_vector<float>();
         // Expected dense logical [1, H, kChunk, D].
         VT_CHECK(static_cast<int64_t>(result.size()) >= hq * kChunk * d,
@@ -1832,6 +1966,15 @@ bool TryPagedAttentionDevicePrefill(Tensor& out, const Tensor& query, const Tens
           }
         }
       }
+    }
+
+    if (device_prefill_out && !out_pieces.empty()) {
+      ttnn::Tensor flat = out_pieces.size() == 1
+                              ? std::move(out_pieces[0])
+                              : ttnn::concat(out_pieces, /*dim=*/0);
+      CommitDeviceLogical2D(out, std::move(flat), static_cast<uint32_t>(total_q),
+                            static_cast<uint32_t>(hq * d));
+      return true;
     }
     CommitHost(out);
     return true;
@@ -2222,16 +2365,22 @@ void UnregisterHostBuffer(void* host) {
     Slots().erase(reinterpret_cast<uintptr_t>(host));
   }
   DropPagedKvShadow(host);
+  DropEmbedTableShadow(host);
 }
 
 void MarkHostWritten(void* host) {
   if (host == nullptr) return;
-  std::lock_guard<std::mutex> g(SlotMutex());
-  BufferSlot* s = FindSlot(host);
-  if (s == nullptr) return;
-  s->host_current = true;
-  s->device_current = false;
-  s->device = std::nullopt;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    BufferSlot* s = FindSlot(host);
+    if (s != nullptr) {
+      s->host_current = true;
+      s->device_current = false;
+      s->device = std::nullopt;
+    }
+  }
+  // Weight tables may be rewritten in place during load — drop embed cache.
+  DropEmbedTableShadow(host);
 }
 
 void EnsureHostBytes(void* host) {

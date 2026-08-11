@@ -144,6 +144,35 @@ class PathClassification(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     checker.classify_path(path)
 
+    def test_the_model_porting_checklist_is_procedure_and_agents_is_not_blanket(
+        self,
+    ) -> None:
+        """The new per-model checklist classifies, and `.agents/` stays explicit.
+
+        `.agents/porting-a-model.md` (#318) is a task guide like its siblings, so
+        it belongs to the procedure class. It is listed by exact path rather than
+        by widening a glob over `.agents/`, because AGENTS.md forbids hiding
+        mutable files behind a blanket directory exemption.
+
+        Both halves matter. Without the first the gate fails closed on the guide
+        -- which is how this was found. Without the second, adding the entry as a
+        directory pattern would silently classify every future `.agents/` file,
+        including ones nobody reviewed, so the check asserts an unknown sibling
+        still fails to classify.
+        """
+        self.assertEqual(
+            checker.classify_path(".agents/porting-a-model.md"), "procedure"
+        )
+        # Its siblings are unchanged.
+        self.assertEqual(checker.classify_path(".agents/porting.md"), "procedure")
+
+        # `.agents/` is NOT a blanket exemption. An unlisted path there does not
+        # quietly inherit a class -- the classifier refuses it outright, which is
+        # what makes the gate fail closed on every new file rather than only on
+        # the ones someone remembered to think about.
+        with self.assertRaises(ValueError):
+            checker.classify_path(".agents/not-a-real-guide-xyz.md")
+
     def test_every_tracked_and_current_change_path_is_classified(self) -> None:
         paths = set(
             subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True).splitlines()

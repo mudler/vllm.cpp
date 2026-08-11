@@ -7,6 +7,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -127,6 +128,123 @@ AsyncRequest AsyncLLM::add_request(const std::string& request_id,
   }
 
   return AsyncRequest{request.request_id, std::move(collector)};
+}
+
+std::vector<AsyncRequest> AsyncLLM::add_request_wave(
+    std::vector<AsyncStringRequestInput> requests) {
+  if (requests.empty()) return {};
+  if (shutdown_started_.load() || errored_.load() ||
+      engine_core_.engine_dead()) {
+    throw EngineDeadError("request wave submitted to a stopped AsyncLLM");
+  }
+
+  std::set<std::string> request_ids;
+  for (const AsyncStringRequestInput& input : requests) {
+    if (!request_ids.insert(input.request_id).second) {
+      throw std::invalid_argument("duplicate request id in wave: " +
+                                  input.request_id);
+    }
+  }
+
+  std::vector<PreparedRequest> prepared;
+  prepared.reserve(requests.size());
+  for (AsyncStringRequestInput& input : requests) {
+    EngineCoreRequest request = input_processor_.process_inputs(
+        input.request_id, input.prompt, std::move(input.params),
+        /*arrival_time=*/std::nullopt, input.priority);
+    auto collector = std::make_shared<RequestOutputCollector>(
+        request.sampling_params.output_kind, request.request_id);
+    auto core_request = std::make_unique<Request>(
+        Request::FromEngineCoreRequest(request, block_hasher_));
+    prepared.push_back(PreparedRequest{
+        std::move(request), std::move(input.prompt), std::move(collector),
+        std::move(core_request)});
+  }
+  return PublishPreparedWave(std::move(prepared));
+}
+
+std::vector<AsyncRequest> AsyncLLM::add_request_wave(
+    std::vector<AsyncTokensRequestInput> requests) {
+  if (requests.empty()) return {};
+  if (shutdown_started_.load() || errored_.load() ||
+      engine_core_.engine_dead()) {
+    throw EngineDeadError("request wave submitted to a stopped AsyncLLM");
+  }
+
+  std::set<std::string> request_ids;
+  for (const AsyncTokensRequestInput& input : requests) {
+    if (!request_ids.insert(input.request_id).second) {
+      throw std::invalid_argument("duplicate request id in wave: " +
+                                  input.request_id);
+    }
+  }
+
+  std::vector<PreparedRequest> prepared;
+  prepared.reserve(requests.size());
+  for (AsyncTokensRequestInput& input : requests) {
+    EngineCoreRequest request = input_processor_.process_inputs_tokens(
+        input.request_id, std::move(input.prompt_token_ids),
+        std::move(input.params), /*arrival_time=*/std::nullopt, input.priority);
+    auto collector = std::make_shared<RequestOutputCollector>(
+        request.sampling_params.output_kind, request.request_id);
+    auto core_request = std::make_unique<Request>(
+        Request::FromEngineCoreRequest(request, block_hasher_));
+    prepared.push_back(PreparedRequest{
+        std::move(request), std::nullopt, std::move(collector),
+        std::move(core_request)});
+  }
+  return PublishPreparedWave(std::move(prepared));
+}
+
+std::vector<AsyncRequest> AsyncLLM::PublishPreparedWave(
+    std::vector<PreparedRequest> prepared) {
+  std::vector<AsyncRequest> result;
+  std::vector<std::string> rollback_ids;
+  std::vector<std::unique_ptr<Request>> core_requests;
+  result.reserve(prepared.size());
+  rollback_ids.reserve(prepared.size());
+  core_requests.reserve(prepared.size());
+  for (PreparedRequest& item : prepared) {
+    result.push_back(AsyncRequest{item.request.request_id, item.collector});
+    rollback_ids.push_back(item.request.request_id);
+    core_requests.push_back(std::move(item.core_request));
+  }
+
+  return PublishAsyncRequestWaveIfAlive(
+      output_processor_mutex_,
+      [&]() {
+        return !shutdown_started_.load() && !errored_.load() &&
+               !engine_core_.engine_dead();
+      },
+      [&]() -> std::vector<AsyncRequest> {
+        // Reject every collision before creating the first new frontend state.
+        // This keeps a colliding pre-existing request outside the rollback set.
+        for (const PreparedRequest& item : prepared) {
+          if (output_processor_.has_request(item.request.request_id)) {
+            throw std::invalid_argument("duplicate live request id: " +
+                                        item.request.request_id);
+          }
+        }
+
+        std::size_t rollback_count = 0;
+        try {
+          for (std::size_t i = 0; i < prepared.size(); ++i) {
+            // Include the current id in rollback before registration:
+            // add_request may have inserted one of its maps before a later
+            // allocation fails.
+            rollback_count = i + 1;
+            PreparedRequest& item = prepared[i];
+            output_processor_.add_request(item.request, item.prompt,
+                                          /*request_index=*/0, item.collector);
+          }
+          engine_core_.add_requests_async(std::move(core_requests));
+        } catch (...) {
+          rollback_ids.resize(rollback_count);
+          output_processor_.rollback_requests(rollback_ids);
+          throw;
+        }
+        return std::move(result);
+      });
 }
 
 AsyncRequest AsyncLLM::add_request(const std::string& request_id,

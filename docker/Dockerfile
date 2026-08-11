@@ -16,7 +16,12 @@
 # Bases are pinned by digest. `docker buildx imagetools inspect <ref>` refreshes
 # them; release/container-matrix.json records the same digests and is gated.
 ARG UBUNTU_BASE=ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
-ARG CUDA_BUILDER_BASE=nvidia/cuda:12.9.1-devel-ubuntu24.04@sha256:020bc241a628776338f4d4053fed4c38f6f7f3d7eb5919fecb8de313bb8ba47c
+# CUDA 13.3, not 12.x: the ten-SM list includes sm_110 (Thor), and 12.9's
+# nvcc rejects it outright -- `nvcc fatal: Unsupported gpu architecture
+# 'compute_110'`. This must track the toolkit release.yml's CUDA job runs in
+# (`container: nvidia/cuda:13.3.0-devel-ubuntu24.04`), because both build the
+# same ten-SM fat binary from the same script.
+ARG CUDA_BUILDER_BASE=nvidia/cuda:13.3.0-devel-ubuntu24.04@sha256:ef2203909e80b8b976cfc672f7e2ae2b00bc0e25c404ee86d89e10a3802f1c52
 
 # ---------------------------------------------------------------------------
 # Builder toolchains
@@ -106,6 +111,7 @@ RUN --mount=type=cache,target=/src/build-container-cpu,id=vllm-cpp-container-cpu
     VERSION="${VERSION:-$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)}" \
     SOURCE_SHA="$SOURCE_SHA" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     EVIDENCE_URL="$EVIDENCE_URL" JOBS="$JOBS" \
+    docker/reset-stale-build-cache.sh build-container-cpu; \
     scripts/build-cpu-release.sh \
       "$artifact" "$arch" stable build-container-cpu \
       "$(getconf GNU_LIBC_VERSION | awk '{print $2}')" "$poor" "$rich"; \
@@ -126,6 +132,7 @@ RUN --mount=type=cache,target=/src/build-container-vulkan,id=vllm-cpp-container-
     VERSION="${VERSION:-$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)}" \
     SOURCE_SHA="$SOURCE_SHA" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     EVIDENCE_URL="$EVIDENCE_URL" JOBS="$JOBS" \
+    docker/reset-stale-build-cache.sh build-container-vulkan; \
     scripts/build-linux-accelerator-release.sh "$artifact" vulkan build-container-vulkan; \
     mkdir -p /out; cp -a build-container-vulkan/release/stage/. /out/
 
@@ -144,6 +151,7 @@ RUN --mount=type=cache,target=/src/build-container-cuda,id=vllm-cpp-container-cu
     VERSION="${VERSION:-$(sed -n 's/^project(vllm_cpp VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)}" \
     SOURCE_SHA="$SOURCE_SHA" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     EVIDENCE_URL="$EVIDENCE_URL" JOBS="$JOBS" \
+    docker/reset-stale-build-cache.sh build-container-cuda; \
     scripts/build-linux-accelerator-release.sh "$artifact" cuda build-container-cuda; \
     mkdir -p /out; cp -a build-container-cuda/release/stage/. /out/
 # The CUDA runtime libraries the server links (CMakeLists.txt:1417) are
@@ -243,4 +251,4 @@ LABEL org.opencontainers.image.title="vllm.cpp" \
       io.vllm-cpp.lane="cuda" \
       io.vllm-cpp.channel="preview" \
       io.vllm-cpp.cuda-sms="80,86,87,89,90a,100a,103a,110,120a,121a" \
-      io.vllm-cpp.min-driver="host NVIDIA driver providing libcuda.so.1 for CUDA 12.9"
+      io.vllm-cpp.min-driver="host NVIDIA driver providing libcuda.so.1 for CUDA 13.3"

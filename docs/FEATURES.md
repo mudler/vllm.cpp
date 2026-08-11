@@ -219,7 +219,7 @@ HTTP are not started.
 | CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
-| ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; builds on ROCm 6.x with the CLR hostcall fix, #201/#132; APU unified-memory fix landed, unverified) | ✅ | ✅ | ✅ |
+| ROCm | ◐ (W0 community-verified on 4 gfx archs, #41; APU unified-memory fix landed, unverified; gfx1200 M0-M4 MET on one model, #269) | ✅ | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
 | Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m STRICT 6/6 e2e; Qwen3-0.6B gate wired with device goldens, full 16x16 rerun pending ([spec](../.agents/specs/tenstorrent-backend.md), `BACKEND-TENSTORRENT`) | ✅ | ☐ | ☐ |
 
@@ -303,11 +303,11 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
 | Multimodal over HTTP | Image request path wired; forward + codec pending | `ROAD-V1-MM` W1-W3 landed (`server_main.cpp:826`). Open: no mm-forward consuming `Request.mm_features`; no image codec vendored (raw RGB only); video/audio/multi-image not started |
 | Reranking / classify models | Engine side only | Embeddings are LIVE (`LlamaModel`, `vllm_embed`, `/v1/embeddings`); the classify/score heads are landed ops with no registered arch |
-| ROCm | W0 verified by community, model e2e pending | Backend + platform + 1 op, ctest-green on gfx1151/1103/1100/1201 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU UnifiedMemory fix in (managed allocs, unverified); M2 unblocks with it. [ROCM.md](ROCM.md) |
+| ROCm | W0 verified by community; model e2e MET on gfx1200 (one model), still pending elsewhere | Backend + platform + 1 op, ctest-green on 4 archs ([#41](https://github.com/mudler/vllm.cpp/issues/41)); gfx1200 MET M0-M4, one model ([#269](https://github.com/mudler/vllm.cpp/issues/269)). [ROCM.md](ROCM.md) |
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |
 | Custom logits processors on CUDA | Open, not root-caused | Segfaults in a CUDA build, 232/232 green on CPU |
 | Memory budgeting (`ROAD-V1-MEM`, #83) | M1+M2 landed (absolute bytes) | `--kv-cache-memory` sizes the KV pool from an absolute byte budget (ABI v16, group-aware divisor); `--num-blocks` overrides; `--gpu-memory-utilization` needs the M3 profile run (dgx-gated). See `specs/kv-sizing.md` |
-| Gemma4 MoE ROCm fused helpers (`vt::fused_ops`) | Partial | Portable ROCm seam. Public: `VT_GEMMA4_EXPERT_VRAM_MB` (positive-MiB LRU cap; unset/0 unlimited) + `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` (200000/4096; 0 disables). Nine tuning vars internal; defaults unchanged |
+| Gemma4 MoE ROCm fused helpers + V1 sampler | Partial | `vt::fused_ops` seam; ROCm registers full V1 sample ops (temp/top-p/masks/penalties). Public: `VT_GEMMA4_EXPERT_VRAM_MB`, `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` |
 
 ## How to read this page
 

@@ -78,7 +78,7 @@ token-for-token correctness against the pinned oracle.
 | Qwen3.6-27B (NVFP4) text generation | Correctness-complete; speed is CHECKPOINT-dependent | Token-exact GB10 on both. `unsloth` @`890bdef7` beats vLLM every c (1.007-1.045x), 115/124; `nvidia` @`0893e160` **c1 0.838, c2-c8 0.95-0.97** (#213); c1 unmoved |
 | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | Correctness-complete; **canonical 0.918-0.972x c1-c32** @`348c265d` (first c16/c32) | Token-exact SYNC+ASYNC; `VT_ASYNC_DEVICE_MIRROR` ON fixes async batch-1 token-0 degeneration |
 | Qwen3 / Qwen2 dense (BF16) | Correctness-complete, speed-pending. Async-serving P0 FIXED (#323: the decode graph replayed stale HOST ids, now declines while the mirror is live; async 7/7 incl. Llama/Mistral/InternLM2) | Near-tie-robust token-exact vs vLLM (Qwen3-0.6B, Qwen3-4B); c1 effective parity, c8 decode residual. **Async device-mirror (`ROW-SERVE-ASYNC-DENSE-MIRROR`, `f9c969ae`): the #31 fix ported to the classic dense family, dgx-VERIFIED.** The shared dense `EmbedInto` (qwen3.cpp) raced the async combine's device input-ids write against a stale host upload → token-0 degeneration on the depth-2 AsyncLLM serving path (quant-independent). `EmbedInto` now consumes the device override published by `ForwardQwen3ForCausalLM`'s `DeviceTokenIdsScope` (27B-dense template); gate `test_qwen3_dense_async_serving` RED on `VT_ASYNC_DEVICE_MIRROR=0`, GREEN default, byte-identical mirror-off. dgx GB10: async gate RED→GREEN 0.6B+4B, SACRED 0.6B+4B 184/184 unchanged (byte-neutral sync path), memcheck 0 errors; Yi30/Qwen3-8B-MXFP4 default-config e2e coherent + 3/4 token-exact (p2 = oracle-ratified near-tie, gap 0.0000), closing the QUANT-CT-MXFP4 async-default residual. RESIDUAL: sibling InternLM2/Mistral/Llama scope one-liner; W4 bench RAN; FA2 GQA-swap default-ON, c2-c8 <1.0x. `FLASH-PTXAS` #82: codegen at PARITY (no ptxas lever); gap=engine context. **D1 (2026-07-31, `CLAIM-D1-BF16-MERGED-QKV`): the bf16 merged-QKV path (`Qwen3QkvMergeEnabled`/`VT_QWEN3_QKV_MERGE`) is now default-ON** — one `vt::MatmulBT` over the merged `[qdim+2kdim,H]` owner + a contiguous `vt::QkvSplit` (OLMo-2 exemplar), replacing three per-shard GEMMs. Bit-exact GEMM math (A/B unit `test_ops_qkv_merge` byte-identical, RED-first); the wider-N cuBLASLt K-reduction flips the 0.6B genuine bf16 near-tie so the SACRED 0.6B golden was regenerated (all tokens within the near-tie band, max 0.125 nats), while Qwen3-4B is byte-neutral (0 diffs, stays STRICT). Re-gated 0.6B 16/16 + 4B 16/16; consistency/launch-count fold (measured NEUTRAL on 4B decode), no new throughput owed |
-| Qwen3.5-4B plain BF16 direct loading on discrete CUDA | Correctness-complete; throughput passes, latency/VRAM open | Exact GDN chunks default ON and byte-identical to rollback. Local A/B: total/output +2.152%, TTFT -2.945%, TPOT/ITL -1.920%; sealed-vLLM comparison 1.021x throughput, 1.086x TTFT, 1.025x TPOT, +233 MiB VRAM ([evidence](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
+| Qwen3.5-4B BF16 direct-load on discrete CUDA | Correct; throughput/host PSS ahead, acceptance `PENDING`; latency/VRAM open | Atomic pretoken exact. Ratios: tput 1.0283x; TTFT/TPOT/E2E 1.0853/1.0165/1.0288x slower; VRAM +118.7 MiB. GDN local stack retained ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
 | Qwen3-Coder-30B-A3B MoE (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 6/6; 11 of 16 binding grid cells at or above vLLM. **D1 (2026-07-31): inherits the default-ON bf16 merged-QKV via the shared dense `AttnBlock` — byte-neutral (0 token diffs, golden UNCHANGED); re-gated 6/6** |
 | Llama-3.x dense (BF16) | Correctness-complete, speed-pending | Near-tie-robust token-exact 16/16 (Llama-3.2-1B); llama3 RoPE scaling |
 | Mistral dense (BF16) | Correctness-complete, speed-pending | Paged-engine token-exact 16/16 (Mistral-7B-v0.3) |
@@ -1292,22 +1292,22 @@ regression.
 
 ## Performance detail
 
-**Local Qwen3.5-4B plain BF16 direct loader, throughput passed; latency and
-VRAM pending:** the benchmark now uses production `AsyncLLM`. Exact
-`(sequence, 8-token chunk)` causal-conv metadata is built once per step, shared
-across GDN layers and default ON. `VT_CONV_EXACT_CHUNKS=0` is a byte-identical
-same-binary rollback. Rebased-main graph-node `nsys` confirms the mechanism:
-causal-conv falls from **718.704 to 233.955 ms (3.072x)**, leaving **1.609x**
-to vLLM. The profiled whole run improves **2.272%** with identical token files.
+**Local Qwen3.5-4B plain BF16 direct loader; throughput ahead, acceptance
+`PENDING`, latency and VRAM open:** production `AsyncLLM` uses default-ON exact
+`(sequence, 8-token chunk)` causal-conv dispatch. Graph-node `nsys` measures
+**718.704→233.955 ms (3.072x)**, leaving 1.609x to vLLM.
 
-Against the sealed same-workload vLLM baseline throughput is
-**1.021246x PASS**; TTFT, TPOT/ITL and peak VRAM are **OPEN**. The A/B
-percentages, the exact OPEN ratios and the VOID 18-leg oracle attempts stay
-verbatim in `.agents/benchmark-record.md` and the evidence file below.
+ONE cross-engine result stands, the corrected three-repetition run: throughput
+**6831.71 vs 6643.40 tok/s (1.0283x)**, host PSS lower; TTFT **1.0853x**, TPOT
+**1.0165x**, E2E **1.0288x** slower, VRAM **+118.7 MiB** OPEN. The earlier
+**1.021246x** is SUPERSEDED, not a rival: it predates the atomic wave
+admission that removed the frontend confound. Disposition `PENDING`, matching
+[the spec](../.agents/specs/sm120-qwen35-pareto-2026-08-09.md) — mutation
+re-review, operator gate and real-GPU token identity are owed; the GDN
+selectors stay default OFF. The 18-leg oracle runs were VOID.
 
-This local 4B diagnostic does not establish 27B/35B support. Exact evidence and
-reproduction:
-[Qwen3.5-4B exact-chunk outcome](bench-evidence/qwen35-4b-sm120-main-20260807.md).
+This local 4B diagnostic does not establish 27B/35B support:
+[exact-chunk outcome](bench-evidence/qwen35-4b-sm120-main-20260807.md).
 
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).

@@ -851,6 +851,50 @@ TEST_CASE("api_server: malformed JSON → 400 error shape") {
   CHECK(j.at("error").at("code") == 400);
 }
 
+// A prompt the engine can never serve is the CLIENT's mistake, so it is a 400,
+// not the 500 the generic handler would report and not a silent finish reason.
+// Upstream raises ValueError from _validate_prompt_len
+// (input_processor.py:387-432) and maps it to BadRequestError / HTTP 400 in
+// create_error_response (serve/utils/error_response.py:62-65). External PR #227.
+TEST_CASE("api_server: prompt past max_model_len → 400 BadRequestError") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  // kMaxModelLen is 32 tokens; "hello world" is 2, so 20 repeats overruns it.
+  std::string long_prompt;
+  for (int i = 0; i < 20; ++i) long_prompt += "hello world";
+  REQUIRE(static_cast<int>(
+              Fixture().EncodeWithSpecialTokens(long_prompt).size()) >
+          kMaxModelLen);
+
+  json body;
+  body["prompt"] = long_prompt;
+  body["max_tokens"] = 3;
+  body["temperature"] = 0.0;
+
+  ApiServer::DispatchResult r = h.server.handle_completions(body.dump());
+  CHECK(r.status == 400);
+  json j = json::parse(r.body);
+  CHECK(j.at("error").at("type") == "BadRequestError");
+  CHECK(j.at("error").at("code") == 400);
+  CHECK(j.at("error").at("message").get<std::string>().find(
+            "maximum model length of 32") != std::string::npos);
+  // Refused at admission: nothing was handed to the engine to wedge on.
+  CHECK_FALSE(h.async_engine.has_unfinished_requests());
+
+  // Same mapping on the chat route.
+  json chat_body;
+  chat_body["messages"] =
+      json::array({{{"role", "user"}, {"content", long_prompt}}});
+  chat_body["max_tokens"] = 3;
+  chat_body["temperature"] = 0.0;
+  ApiServer::DispatchResult cr =
+      h.server.handle_chat_completions(chat_body.dump());
+  CHECK(cr.status == 400);
+  CHECK(json::parse(cr.body).at("error").at("type") == "BadRequestError");
+}
+
 TEST_CASE("api_server: unknown model → 404 error shape") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);

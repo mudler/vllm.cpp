@@ -229,6 +229,25 @@ class LoadedEngine {
   // the default policy without a disk load.
   static int ResolveMaxNumBatchedTokens(const EngineParams& params,
                                         int max_model_len, bool is_dense_arch);
+  // The serving `max_model_len`, resolved AGAINST the KV pool that will hold it.
+  // Mirrors vllm/v1/core/kv_cache_utils.py:2160-2174 @ 555967922, which runs
+  // both halves at engine init:
+  //   - `params.max_model_len <= 0` (the caller did not pin a length) ->
+  //     auto_fit_max_model_len (kv_cache_utils.py:1967-2027): serve the
+  //     checkpoint's context, reduced to what the pool holds.
+  //   - `params.max_model_len > 0` (pinned) -> check_enough_kv_cache_memory
+  //     (kv_cache_utils.py:751-788): THROW std::invalid_argument when the pool
+  //     cannot hold one sequence that long, naming the sizes and the flags.
+  // Either way the post-condition is the one the scheduler and the admission
+  // check both rely on: a request of max_model_len tokens fits in KV. Without
+  // it an over-long prompt is admitted, never allocates, and the engine spins
+  // at model_executed=0 with an idle GPU (issue #83 M4; external PR #227).
+  // Exposed, like ResolveMaxNumBatchedTokens above, for testing the policy
+  // without a disk load.
+  static int ResolveMaxModelLen(const EngineParams& params,
+                                const HfConfig& config,
+                                const vllm::v1::KVCacheConfig& kv_cfg,
+                                int block_size);
   static bool ResolveEnablePrefixCaching(const EngineParams& params,
                                          const ModelInfo& model_info);
   // ARCH-ONE-SURFACE ROW 8: the EXPLICIT arms of the device-selection policy
@@ -396,6 +415,13 @@ class LoadedEngine {
   // the ctor body once runner_ geometry is known; see model_loader.cpp.
   std::unique_ptr<vllm::v1::kv_offload::KVConnector> kv_connector_;
   tok::Tokenizer tokenizer_;
+  // kv_cfg_ is declared BEFORE max_model_len_: the serving length is resolved
+  // AGAINST the KV pool (ResolveMaxModelLen auto-fits it down to what the pool
+  // holds, or refuses an explicit --max-model-len the pool cannot serve), and
+  // every consumer below — max_num_batched_tokens_, runner_, scheduler_,
+  // input_processor_ — takes the already-resolved value. MakeKVCacheResolved
+  // depends only on model_/config_/resolved_spec_config_, all declared above.
+  vllm::v1::KVCacheConfig kv_cfg_;
   int max_model_len_;
   int max_num_batched_tokens_;
   bool prefix_caching_enabled_;
@@ -403,7 +429,6 @@ class LoadedEngine {
   // EngineParams::enable_jump_forward + the VT_ENABLE_JUMP_FORWARD env override.
   // Depends only on params + env (no member deps), so its init order is free.
   bool jump_forward_enabled_;
-  vllm::v1::KVCacheConfig kv_cfg_;
   // runner_ is declared BEFORE the scheduler (W3): the async-scheduling flip is
   // resolved from runner_.runner_supports_async(), so the runner must be fully
   // constructed before async_scheduling_enabled_ / scheduler_ are initialized.

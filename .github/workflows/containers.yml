@@ -22,7 +22,15 @@ on:
   push:
     tags: ['v*']
   pull_request:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: >-
+          Build every lane on both architectures, including the ten-SM fat cuda
+          lane that pull requests skip for cost. Use this to prove a lane that
+          is not in the pull-request matrix.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -67,7 +75,8 @@ jobs:
           # fat CUDA image does not fit a hosted runner budget per push. Nothing
           # is published without the full set: publish rebuilds and revalidates
           # each lane immediately before pushing it.
-          if [ "${{ steps.plan.outputs.is_release }}" = "true" ]; then
+          if [ "${{ steps.plan.outputs.is_release }}" = "true" ] \
+             || [ "${{ inputs.full_matrix }}" = "true" ]; then
             echo "verify=$(python3 scripts/container_tags.py --build-matrix --release)" >> "$GITHUB_OUTPUT"
           else
             echo "verify=$(python3 scripts/container_tags.py --build-matrix)" >> "$GITHUB_OUTPUT"

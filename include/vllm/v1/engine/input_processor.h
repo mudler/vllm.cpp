@@ -36,16 +36,26 @@
 //     (sampling_params.py:659-698), ROAD-V1-C7 (previously a no-op stub while
 //     bad_words was deferred on SamplingParams).
 //
+//   - _validate_model_inputs -> _validate_prompt_len (input_processor.py:387-432
+//     @ 555967922) is LANDED for the decoder arm: an empty prompt, and one at or
+//     past max_model_len, are refused with InputValidationError, which the
+//     OpenAI server answers with HTTP 400. It is what stops an unservable prompt
+//     from reaching the scheduler and sitting in `waiting` forever with an idle
+//     GPU. The ENCODER arm (mm_encoder_cache_size) and the out-of-vocab check
+//     remain deferred with the encoder/decoder split.
+//
 // DEFERRED (marked; matches upstream so re-adding is mechanical): dict/EngineInput
 // prompts, prompt_embeds, encoder/decoder split, multimodal (mm_features),
 // pooling (PoolingParams), LoRA, data_parallel_rank validation, request-id
-// randomization (assign_request_id), _validate_model_inputs (prompt-length /
-// out-of-vocab checks), current_platform.validate_request, trace_headers,
+// randomization (assign_request_id), the _validate_model_inputs out-of-vocab
+// check and its encoder arm, current_platform.validate_request, trace_headers,
 // priority, resumable.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -59,13 +69,38 @@ class Tokenizer;  // vllm/tokenizer/tokenizer.h
 
 namespace vllm::v1 {
 
+// A request the engine REFUSES because the caller asked for something it can
+// never serve — today: a prompt longer than the resolved max_model_len
+// (_validate_prompt_len, input_processor.py:387-432 @ 555967922).
+//
+// Upstream raises a bare ValueError here and the OpenAI server maps ValueError
+// to `BadRequestError` / HTTP 400 in create_error_response
+// (vllm/entrypoints/serve/utils/error_response.py:62-65). C++ has no equivalent
+// of "the user-input exception class", so the mapping needs a NAMED type: the
+// api_server handlers catch this ahead of their generic `std::exception` ->
+// HTTP 500 arm, which is what makes the status code 400 rather than 500.
+class InputValidationError : public std::invalid_argument {
+ public:
+  explicit InputValidationError(const std::string& msg)
+      : std::invalid_argument(msg) {}
+};
+
 class InputProcessor {
  public:
   // __init__ (T0 deps): the tokenizer + HfConfig the processor reads. The
   // TOKENIZER must outlive the InputProcessor; the HfConfig need not — it is
   // fully consumed here (max_model_len + eos ids are derived up front and the
   // config is not retained).
-  InputProcessor(const tok::Tokenizer& tokenizer, const HfConfig& config);
+  //
+  // `max_model_len_override` (> 0) supplies the ALREADY-RESOLVED serving length
+  // in place of the checkpoint's own context window. Upstream reads
+  // model_config.max_model_len, which is exactly that resolved value; our
+  // HfConfig only carries the raw max_position_embeddings, so LoadedEngine
+  // threads its resolved max_model_len_ (the `--max-model-len` override, or the
+  // KV-pool auto-fit) through here. 0 keeps the historical
+  // derive-from-config behaviour, so every existing construction is unchanged.
+  InputProcessor(const tok::Tokenizer& tokenizer, const HfConfig& config,
+                 int64_t max_model_len_override = 0);
 
   // process_inputs (text path): validate + tokenize + build the request.
   // `params` is taken BY VALUE (upstream clones it); PostInit()/eos-wiring
@@ -115,6 +150,10 @@ class InputProcessor {
   // _validate_params: runs SamplingParams::PostInit() (normalize + Verify) —
   // this closes the M1.1 deferred-__post_init__ carry.
   void ValidateParams(SamplingParams& params) const;
+  // _validate_prompt_len (input_processor.py:387-432), decoder arm: refuse an
+  // empty prompt and one at or past max_model_len. Throws InputValidationError,
+  // which the OpenAI server answers with HTTP 400.
+  void ValidatePromptLen(std::size_t prompt_len) const;
   // update_from_generation_config (T0 subset: eos_token_id + secondary stop ids).
   void UpdateFromGenerationConfig(SamplingParams& params) const;
   // update_from_tokenizer (T0 no-op: bad_words is deferred).

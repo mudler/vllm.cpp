@@ -35,6 +35,7 @@
 #include "vt/cuda/conv_update_fast.h"
 #include "vt/cuda/cuda_device_caps.h"
 #include "vt/cuda/cuda_gdn_internal.h"
+#include "vt/cuda/gdn_decode_fused.h"
 #include "vt/cuda/gdn_packed_decode_triton.h"
 #include "vt/cuda/gdn_prefill_conv.h"
 #include "vt/cuda/gdn_packed_reg_tile.h"
@@ -842,6 +843,114 @@ __global__ void CausalConv1dFwdRegKernel(Tout* out, const Tin* x, const Tin* w,
   }
 }
 
+// Width-four experiment used by Qwen3.5. Unlike the sealed runtime-width kernel
+// above, K and the number of channels owned by each lane are compile-time
+// constants. ChannelsPerThread=1 isolates width specialization at the same
+// 128-channel tile; ChannelsPerThread=2 covers two coalesced 128-channel stripes
+// and therefore matches upstream's 256-channel feature tile.
+template <int ChannelsPerThread, typename Tin, typename Tout, typename THas>
+__global__ void CausalConv1dFwdRegK4Kernel(
+    Tout* out, const Tin* x, const Tin* w, const Tin* bias, float* conv_state,
+    const int32_t* qsl, const THas* his, int64_t c_dim, int64_t x_row_stride,
+    bool silu, int chunked, const int32_t* batch_ptr,
+    const int32_t* token_chunk_offset_ptr, int exact) {
+  static_assert(ChannelsPerThread == 1 || ChannelsPerThread == 2);
+  constexpr int64_t k = 4;
+  constexpr int64_t width = k - 1;
+  constexpr int64_t channels_per_block = kConvRegN * ChannelsPerThread;
+
+  const int64_t program = blockIdx.y;
+  const int64_t s = exact ? batch_ptr[program] : program;
+  const int64_t begin = qsl[s];
+  const int64_t t_len = qsl[s + 1] - begin;
+  const int64_t chunk_m = exact ? kConvExactM : kConvRegM;
+  const int64_t token_offset = exact
+                                   ? static_cast<int64_t>(token_chunk_offset_ptr[program]) *
+                                         kConvExactM
+                                   : (chunked ? static_cast<int64_t>(blockIdx.z) * kConvRegM
+                                              : 0);
+  if (token_offset > 0 && token_offset >= t_len) return;
+  const int64_t token_end =
+      ((chunked || exact) && token_offset + chunk_m < t_len) ? token_offset + chunk_m : t_len;
+  const bool init = his[s] != 0;
+
+  int64_t channels[ChannelsPerThread];
+  bool active[ChannelsPerThread];
+  float* state_rows[ChannelsPerThread];
+  float biases[ChannelsPerThread];
+  float weights[ChannelsPerThread][k];
+  float windows[ChannelsPerThread][k];
+
+  // Load both stripes' initial history before processing either stripe. This
+  // matches the intended duplicated-register experiment without extending the
+  // baseline state-read/write exposure across an entire first-stripe token loop.
+#pragma unroll
+  for (int lane_channel = 0; lane_channel < ChannelsPerThread; ++lane_channel) {
+    const int64_t c = static_cast<int64_t>(blockIdx.x) * channels_per_block +
+                      threadIdx.x + static_cast<int64_t>(lane_channel) * kConvRegN;
+    channels[lane_channel] = c;
+    active[lane_channel] = c < c_dim;
+    if (!active[lane_channel]) continue;
+    float* srow = conv_state + (s * c_dim + c) * width;
+    state_rows[lane_channel] = srow;
+    biases[lane_channel] = bias != nullptr ? Load(bias, c) : 0.0f;
+#pragma unroll
+    for (int j = 0; j < k; ++j) weights[lane_channel][j] = Load(w, c * k + j);
+#pragma unroll
+    for (int j = 0; j < width; ++j) {
+      const int64_t ti = token_offset - width + j;
+      float v = 0.0f;
+      if (ti >= 0) {
+        v = Load(x, (begin + ti) * x_row_stride + c);
+      } else if (init) {
+        v = srow[width + ti];
+      }
+      windows[lane_channel][j] = v;
+    }
+    windows[lane_channel][width] =
+        token_offset < t_len ? Load(x, (begin + token_offset) * x_row_stride + c) : 0.0f;
+  }
+
+  for (int64_t t = token_offset; t < token_end; ++t) {
+#pragma unroll
+    for (int lane_channel = 0; lane_channel < ChannelsPerThread; ++lane_channel) {
+      if (!active[lane_channel]) continue;
+      const int64_t c = channels[lane_channel];
+      float acc = biases[lane_channel];
+#pragma unroll
+      for (int j = 0; j < k; ++j)
+        acc += weights[lane_channel][j] * windows[lane_channel][j];
+      Store(out, (begin + t) * c_dim + c, silu ? Silu(acc) : acc);
+#pragma unroll
+      for (int j = 0; j < width; ++j)
+        windows[lane_channel][j] = windows[lane_channel][j + 1];
+      const int64_t nt = t + 1;
+      windows[lane_channel][width] =
+          nt < t_len ? Load(x, (begin + nt) * x_row_stride + c) : 0.0f;
+    }
+  }
+
+  if (token_end == t_len) {
+#pragma unroll
+    for (int lane_channel = 0; lane_channel < ChannelsPerThread; ++lane_channel) {
+      if (!active[lane_channel]) continue;
+      const int64_t c = channels[lane_channel];
+      float* srow = state_rows[lane_channel];
+#pragma unroll
+      for (int j = 0; j < width; ++j) {
+        const int64_t tj = t_len - width + j;
+        float v = 0.0f;
+        if (tj >= 0) {
+          v = Load(x, (begin + tj) * x_row_stride + c);
+        } else if (init) {
+          v = srow[width + tj];
+        }
+        srow[j] = v;
+      }
+    }
+  }
+}
+
 // Toggle: DEFAULT ON (VT_CONV_REG=0 restores the tiled/scalar path). Read per call
 // (prefill dispatch is coarse — one launch/step — so the getenv is negligible and
 // in-process CUDA tests can flip the selection). Predicate factored to
@@ -854,6 +963,56 @@ bool ConvExactChunksEnabled() {
   return ConvExactChunksFlagIsOn(std::getenv("VT_CONV_EXACT_CHUNKS"));
 }
 
+template <int ChannelsPerThread, typename Tin, typename Tout>
+void LaunchConvFwdRegK4(cudaStream_t s, Tensor& out, const Tensor& x,
+                        const Tensor& w, const Tensor* bias, Tensor& conv_state,
+                        const Tensor& qsl, const Tensor& his,
+                        const CausalConv1dArgs& args, int64_t chan_tiles) {
+  static_assert(ChannelsPerThread == 1 || ChannelsPerThread == 2);
+  const int64_t n = conv_state.shape[0], c = x.shape[1];
+  const int64_t total_tokens = x.shape[0];
+  const int64_t x_rs = x.stride[0];
+  int64_t grid_z = 1;
+  int chunked = 0;
+  const bool exact = ConvExactChunksEnabled() && args.batch_ptr != nullptr;
+  int64_t grid_y = n;
+  if (exact) {
+    grid_y = args.batch_ptr->shape[0];
+    VT_CHECK(grid_y <= kMaxGridY,
+             "cuda causal_conv1d_fwd(reg-k4): too many exact chunk programs");
+  } else if (n <= kConvRegChunkMaxSeqs) {
+    const int64_t z = (total_tokens + kConvRegM - 1) / kConvRegM;
+    if (z >= 1 && z <= kMaxGridY) {
+      grid_z = z;
+      chunked = 1;
+    }
+  }
+  const dim3 grid(static_cast<unsigned>(chan_tiles), static_cast<unsigned>(grid_y),
+                  static_cast<unsigned>(grid_z));
+  const dim3 block(kConvRegN);
+  const int32_t* batch_ptr = exact ? args.batch_ptr->Ptr<int32_t>() : nullptr;
+  const int32_t* token_chunk_offset_ptr =
+      exact ? args.token_chunk_offset_ptr->Ptr<int32_t>() : nullptr;
+  if (his.dtype == DType::kI8) {
+    CausalConv1dFwdRegK4Kernel<ChannelsPerThread, Tin, Tout, int8_t>
+        <<<grid, block, 0, s>>>(
+            out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+            bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+            qsl.Ptr<int32_t>(), his.Ptr<int8_t>(), c, x_rs,
+            args.silu_activation, chunked, batch_ptr, token_chunk_offset_ptr,
+            exact ? 1 : 0);
+  } else {
+    CausalConv1dFwdRegK4Kernel<ChannelsPerThread, Tin, Tout, int32_t>
+        <<<grid, block, 0, s>>>(
+            out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(),
+            bias != nullptr ? bias->Ptr<Tin>() : nullptr, conv_state.Ptr<float>(),
+            qsl.Ptr<int32_t>(), his.Ptr<int32_t>(), c, x_rs,
+            args.silu_activation, chunked, batch_ptr, token_chunk_offset_ptr,
+            exact ? 1 : 0);
+  }
+  Check(cudaGetLastError(), "causal_conv1d_fwd(reg-k4) launch");
+}
+
 // Register-window launcher (VT_CONV_REG=1). The default exact descriptor maps
 // grid.y to a flattened list of (sequence, 8-token chunk) programs, mirroring
 // upstream and launching neither rectangular padding nor sequence-serial work.
@@ -861,14 +1020,15 @@ bool ConvExactChunksEnabled() {
 // chunks): it chunks grid.z only for <=4 sequences, and serially streams each
 // whole sequence for larger batches.
 template <typename Tin, typename Tout>
-void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
-                      const Tensor* bias, Tensor& conv_state, const Tensor& qsl,
-                      const Tensor& his, const CausalConv1dArgs& args) {
+void LaunchConvFwdRegRuntime(cudaStream_t s, Tensor& out, const Tensor& x,
+                             const Tensor& w, const Tensor* bias,
+                             Tensor& conv_state, const Tensor& qsl,
+                             const Tensor& his, const CausalConv1dArgs& args,
+                             int64_t chan_tiles) {
   const int64_t n = conv_state.shape[0], c = x.shape[1], k = w.shape[1];
   const int64_t total_tokens = x.shape[0];
   const int64_t x_rs = x.stride[0];  // padded-row (merged qkvz) x view honored
   VT_CHECK(k - 1 <= kConvRegMaxW, "cuda causal_conv1d_fwd(reg): conv width exceeds kConvRegMaxW");
-  const int64_t chan_tiles = (c + kConvRegN - 1) / kConvRegN;
   int64_t gridZ = 1;
   int chunked = 0;
   const bool exact = ConvExactChunksEnabled() && args.batch_ptr != nullptr;
@@ -904,6 +1064,28 @@ void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x, const Tensor
         batch_ptr, token_chunk_offset_ptr, exact ? 1 : 0);
   }
   Check(cudaGetLastError(), "causal_conv1d_fwd(reg) launch");
+}
+
+template <typename Tin, typename Tout>
+void LaunchConvFwdReg(cudaStream_t s, Tensor& out, const Tensor& x,
+                      const Tensor& w, const Tensor* bias, Tensor& conv_state,
+                      const Tensor& qsl, const Tensor& his,
+                      const CausalConv1dArgs& args) {
+  const int64_t c = x.shape[1], k = w.shape[1];
+  DispatchConvChannelTileLaunch(
+      std::getenv("VT_CONV_CHANNEL_TILE"), c, k,
+      [&](const ConvChannelTileLaunchContract& contract) {
+        LaunchConvFwdRegRuntime<Tin, Tout>(s, out, x, w, bias, conv_state, qsl,
+                                           his, args, contract.feature_blocks);
+      },
+      [&](const ConvChannelTileLaunchContract& contract) {
+        LaunchConvFwdRegK4<1, Tin, Tout>(s, out, x, w, bias, conv_state, qsl,
+                                        his, args, contract.feature_blocks);
+      },
+      [&](const ConvChannelTileLaunchContract& contract) {
+        LaunchConvFwdRegK4<2, Tin, Tout>(s, out, x, w, bias, conv_state, qsl,
+                                        his, args, contract.feature_blocks);
+      });
 }
 
 // Dispatch on the toggles. reg (VT_CONV_REG, default ON) wins; else tiled
@@ -1384,7 +1566,101 @@ __global__ void GdnPostConvFastKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, flo
   }
 }
 
-// Split post-conv (VT_GDN_POSTCONV_SPLIT, default ON) — grid (T, Hk+Hv), mirroring
+// Experimental 1:1 CUDA spelling of vLLM/FLA's post-conv launch schedule:
+// grid=(ceil(T,16), Hk+Hv), BLOCK_T=16, four warps. Each warp owns four tokens
+// in the tile. For Q/K, each lane keeps four feature values in registers across
+// the float32 norm reduction and normalized store, eliminating the fast kernel's
+// second conv read and all shared-memory barriers. For V, the same mapping gives
+// four coalesced 32-element copy waves per token and lane zero computes gating.
+// Arithmetic and strides otherwise retain the local GdnPostConv contract.
+template <typename Tqkv, typename Tconv, typename Tgate>
+__global__ void GdnPostConvTokenTileKernel(
+    Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float* g_out, float* beta_out,
+    const Tconv* conv, const Tgate* araw, const Tgate* braw, const float* a_log,
+    const float* dt_bias, int64_t t, int64_t hk, int64_t dk, int64_t hv, int64_t dv,
+    int64_t a_row_stride, int64_t b_row_stride, float eps) {
+  constexpr int kWarps = 4;
+  constexpr int kFeaturesPerLane = 4;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int64_t tile_start = static_cast<int64_t>(blockIdx.x) * kGdnPostConvTokenTileTokens;
+  const int64_t head = blockIdx.y;
+  const int64_t key_dim = hk * dk;
+  const int64_t value_dim = hv * dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+
+  if (head < hk) {
+#pragma unroll
+    for (int tile_token = warp; tile_token < kGdnPostConvTokenTileTokens;
+         tile_token += kWarps) {
+      const int64_t tok = tile_start + tile_token;
+      if (tok >= t) continue;
+      const int64_t row = tok * conv_dim;
+      const Tconv* qin = conv + row + head * dk;
+      const Tconv* kin = conv + row + key_dim + head * dk;
+      Tqkv* qo = q_out + (tok * hk + head) * dk;
+      Tqkv* ko = k_out + (tok * hk + head) * dk;
+
+      float qv[kFeaturesPerLane];
+      float kv[kFeaturesPerLane];
+#pragma unroll
+      for (int item = 0; item < kFeaturesPerLane; ++item) {
+        const int feature = lane + item * 32;
+        qv[item] = Load(qin, feature);
+        kv[item] = Load(kin, feature);
+      }
+      // Reproduce the fast kernel's 128-lane shared reduction exactly. Its first
+      // two levels are (i+i+64), then (i+i+32); those four terms are resident in
+      // this lane. The remaining 32-lane tree is the same 16,8,4,2,1 order.
+      float qsum = (qv[0] * qv[0] + qv[2] * qv[2]) +
+                   (qv[1] * qv[1] + qv[3] * qv[3]);
+      float ksum = (kv[0] * kv[0] + kv[2] * kv[2]) +
+                   (kv[1] * kv[1] + kv[3] * kv[3]);
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        qsum += __shfl_down_sync(0xffffffffu, qsum, offset);
+        ksum += __shfl_down_sync(0xffffffffu, ksum, offset);
+      }
+      qsum = __shfl_sync(0xffffffffu, qsum, 0);
+      ksum = __shfl_sync(0xffffffffu, ksum, 0);
+      const float qinv = 1.0f / sqrtf(qsum + eps);
+      const float kinv = 1.0f / sqrtf(ksum + eps);
+#pragma unroll
+      for (int item = 0; item < kFeaturesPerLane; ++item) {
+        const int feature = lane + item * 32;
+        Store(qo, feature, qv[item] * qinv);
+        Store(ko, feature, kv[item] * kinv);
+      }
+    }
+  } else {
+    const int64_t value_head = head - hk;
+#pragma unroll
+    for (int tile_token = warp; tile_token < kGdnPostConvTokenTileTokens;
+         tile_token += kWarps) {
+      const int64_t tok = tile_start + tile_token;
+      if (tok >= t) continue;
+      const int64_t row = tok * conv_dim;
+      const Tconv* vin = conv + row + 2 * key_dim + value_head * dv;
+      Tqkv* vo = v_out + tok * value_dim + value_head * dv;
+#pragma unroll
+      for (int item = 0; item < kFeaturesPerLane; ++item) {
+        const int feature = lane + item * 32;
+        Store(vo, feature, Load(vin, feature));
+      }
+      if (lane == 0) {
+        const int64_t idx = tok * hv + value_head;
+        const float av = Load(araw, tok * a_row_stride + value_head);
+        const float bv = Load(braw, tok * b_row_stride + value_head);
+        const float x = av + dt_bias[value_head];
+        const float sp = x > 20.0f ? x : log1pf(expf(x));
+        g_out[idx] = -expf(a_log[value_head]) * sp;
+        beta_out[idx] = 1.0f / (1.0f + expf(-bv));
+      }
+    }
+  }
+}
+
+// Split post-conv (VT_GDN_POSTCONV_SPLIT, opt-in) — grid (T, Hk+Hv), mirroring
 // vLLM's grid (ceil(L,BLOCK_T), H+HV) in _fused_post_conv_kernel:57-149 where each V
 // head is its own program. The shipped GdnPostConvKernel packs the ENTIRE
 // value_dim = Hv*Dv copy + all Hv gating scalars into ONE grid.y block per token
@@ -1457,7 +1733,7 @@ __global__ void GdnPostConvSplitKernel(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, fl
   }
 }
 
-// Toggle: DEFAULT ON (VT_GDN_POSTCONV_SPLIT=0 restores the single-megablock kernel).
+// Toggle: DEFAULT OFF; a present non-'0'-leading value selects the split kernel.
 // Read per call (post-conv dispatch is coarse — one launch/step).
 bool GdnPostConvSplitEnabled() {
   return GdnPostConvSplitFlagIsOn(std::getenv("VT_GDN_POSTCONV_SPLIT"));
@@ -1480,12 +1756,20 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
   // VT_GDN_POSTCONV_SPLIT (opt-in): grid (T, Hk+Hv) — each V head its own block
   // (mirrors vLLM). =0 (default) uses the single-megablock grid (T, Hk+1).
   const bool split = GdnPostConvSplitEnabled();
+  // VT_GDN_POSTCONV_TOKEN_TILE (opt-in): the full upstream 16-token,
+  // per-head/four-warp schedule. The explicit split control keeps priority when
+  // both experimental flags are set. Only the production 128-wide heads route.
+  const bool token_tile = GdnPostConvTokenTileEligible(
+      split, std::getenv("VT_GDN_POSTCONV_TOKEN_TILE"), dk, dv);
   // VT_GDN_POSTCONV_FAST: byte-identical megablock at 128 threads + 128-bit V copy.
   // Only for the Dk==Dv==128 gate dims (16B alignment + value_dim%8==0); mutually
   // exclusive with the split (both target the same megablock). See predicate.
-  const bool fast = !split && GdnPostConvFastFlagIsOn(std::getenv("VT_GDN_POSTCONV_FAST")) &&
-                    dk == 128 && dv == 128;
-  dim3 grid(static_cast<unsigned>(t), static_cast<unsigned>(split ? hk + hv : hk + 1));
+  const bool fast = !split && !token_tile &&
+                    GdnPostConvFastFlagIsOn(std::getenv("VT_GDN_POSTCONV_FAST")) && dk == 128 &&
+                    dv == 128;
+  const unsigned grid_x = static_cast<unsigned>(token_tile ? GdnPostConvTokenTileGridX(t) : t);
+  const unsigned grid_y = static_cast<unsigned>((split || token_tile) ? hk + hv : hk + 1);
+  dim3 grid(grid_x, grid_y);
   cudaStream_t s = AsStream(q);
   // Dispatch over (q/k/v out dtype) x (conv-in dtype). conv is bf16 under the
   // input-side bf16 GDN path (VT_GDN_IN_BF16); the conv read upcasts to f32.
@@ -1493,7 +1777,13 @@ void GdnPostConvKernelCuda(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
     using Tqkv = decltype(qkv_tag);
     using Tconv = decltype(conv_tag);
     using Tgate = decltype(gate_tag);
-    if (fast) {
+    if (token_tile) {
+      GdnPostConvTokenTileKernel<Tqkv, Tconv, Tgate><<<grid, 128, 0, s>>>(
+          q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
+          beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(), braw.Ptr<Tgate>(),
+          a_log.Ptr<float>(), dt_bias.Ptr<float>(), t, hk, dk, hv, dv, araw.stride[0],
+          braw.stride[0], args.eps);
+    } else if (fast) {
       GdnPostConvFastKernel<Tqkv, Tconv, Tgate><<<grid, 128, 0, s>>>(
           q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
           beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(), braw.Ptr<Tgate>(),
@@ -2487,11 +2777,14 @@ void GdnPackedDecodeKernelCuda(Queue& q, Tensor& out,
 // NW consecutive lanes [floor(lane/NW)*NW, +NW), aligned inside one warp (NW is
 // a power of two dividing 32 and the launcher only uses NW>1 when BV==32, so a
 // block is always a whole number of warps) — the xor butterfly stays in-warp.
-template <typename Tin, typename Tout, typename TState, int NW>
+template <typename Tin, typename Tout, typename TState, int NW, bool SWIZZLED,
+          bool REGSTATE>
 __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, const Tin* v,
                                      const float* g, const float* beta, TState* state,
                                      const int32_t* state_idx, int64_t hk_n, int64_t dk,
                                      int64_t hv_n, int64_t dv, int64_t bv, float scale) {
+  static_assert(!REGSTATE || (SWIZZLED && NW == 8),
+                "register state requires the production swizzled NW8 layout");
   const int64_t i_v = blockIdx.x;         // value-dim tile
   const int64_t i_nh = blockIdx.y;        // fused (sequence, v-head)
   const int64_t i_n = i_nh / hv_n;        // sequence == decode token index
@@ -2516,7 +2809,7 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
     row = si;
   }
 
-  const int64_t sdk = dk + 1;  // padded shared row stride (kills the 32-way conflict)
+  const int64_t sdk = SWIZZLED ? dk + NW : dk + 1;
   extern __shared__ float smem[];
   float* bq = smem;       // [dk]  q' = q*scale
   float* bk = bq + dk;    // [dk]  k
@@ -2527,17 +2820,29 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
   // q'(=q*scale) and k for this (token, head) — broadcast to every lane.
   const int64_t qkbase = (i_n * hk_n + hk) * dk;
   for (int64_t i = tid; i < dk; i += blockDim.x) {
-    bq[i] = Load(q, qkbase + i) * scale;
-    bk[i] = Load(k, qkbase + i);
+    const int64_t si = SWIZZLED ? (i % 16) * 8 + i / 16 : i;
+    bq[si] = Load(q, qkbase + i) * scale;
+    bk[si] = Load(k, qkbase + i);
   }
   // Coalesced load of the [BV,Dk] state slice into padded shared. The persistent
   // cache TState is bf16 (mirrors vLLM's default mamba_cache_dtype=auto→model
   // dtype; fla fused_recurrent reads bf16→f32 registers→writes bf16) or f32
   // (unit test). Load() upcasts to f32; the recurrence below runs in f32.
   TState* s_head = state + (row * hv_n + hv) * dv * dk + vbase * dk;  // [<=bv, dk]
-  for (int64_t e = tid; e < bv * dk; e += blockDim.x)
-    sbh[(e / dk) * sdk + e % dk] = e < tile ? Load(s_head, e) : 0.0f;
+  for (int64_t e = tid; e < bv * dk; e += blockDim.x) {
+    const int64_t c = e % dk;
+    const int64_t sc = SWIZZLED ? (c % 16) * 8 + c / 16 : c;
+    sbh[(e / dk) * sdk + sc] = e < tile ? Load(s_head, e) : 0.0f;
+  }
   __syncthreads();
+
+  float* r = sbh + static_cast<int64_t>(vi) * sdk;
+  float rr[16];
+  if constexpr (REGSTATE) {
+    for (int64_t j = 0; j < 16; ++j) {
+      rr[j] = r[GdnDecodeRegisterSharedColumn(wk, j)];
+    }
+  }
 
   // This thread's Dk column slice [c0, c1) of value-row vi (partition of [0,dk)).
   const int64_t ck = (dk + NW - 1) / NW;
@@ -2548,11 +2853,24 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
   // slice); only the global v-load and o-store are guarded by vrow < dv.
   const float decay = expf(g[i_n * hv_n + hv]);
   const float beta_t = beta[i_n * hv_n + hv];
-  float* r = sbh + static_cast<int64_t>(vi) * sdk;
   float pdot = 0.0f;  // partial (S * exp(g)) @ k over this slice, fused w/ decay
-  for (int64_t c = c0; c < c1; ++c) {
-    r[c] *= decay;
-    pdot += r[c] * bk[c];
+  if constexpr (REGSTATE) {
+    for (int64_t j = 0; j < 16; ++j) {
+      const int64_t sc = GdnDecodeRegisterSharedColumn(wk, j);
+      rr[j] *= decay;
+      pdot += rr[j] * bk[sc];
+    }
+  } else if constexpr (SWIZZLED) {
+    for (int64_t j = 0; j < 16; ++j) {
+      const int64_t sc = j * 8 + wk;
+      r[sc] *= decay;
+      pdot += r[sc] * bk[sc];
+    }
+  } else {
+    for (int64_t c = c0; c < c1; ++c) {
+      r[c] *= decay;
+      pdot += r[c] * bk[c];
+    }
   }
   float dot = pdot;  // reduce the partials across the NW lanes of the row-group
 #pragma unroll
@@ -2560,64 +2878,116 @@ __global__ void GdnDecodeFusedKernel(Tout* out, const Tin* q, const Tin* k, cons
   const float vv = vrow < dv ? Load(v, (i_n * hv_n + hv) * dv + vrow) : 0.0f;
   const float vp = (vv - dot) * beta_t;
   float po = 0.0f;  // partial (S + outer(v',k)) @ q' over this slice, fused w/ update
-  for (int64_t c = c0; c < c1; ++c) {
-    r[c] += vp * bk[c];
-    po += r[c] * bq[c];
+  if constexpr (REGSTATE) {
+    for (int64_t j = 0; j < 16; ++j) {
+      const int64_t sc = GdnDecodeRegisterSharedColumn(wk, j);
+      rr[j] += vp * bk[sc];
+      po += rr[j] * bq[sc];
+    }
+  } else if constexpr (SWIZZLED) {
+    for (int64_t j = 0; j < 16; ++j) {
+      const int64_t sc = j * 8 + wk;
+      r[sc] += vp * bk[sc];
+      po += r[sc] * bq[sc];
+    }
+  } else {
+    for (int64_t c = c0; c < c1; ++c) {
+      r[c] += vp * bk[c];
+      po += r[c] * bq[c];
+    }
   }
   float o = po;
 #pragma unroll
   for (int off = 1; off < NW; off <<= 1) o += __shfl_xor_sync(0xffffffffu, o, off);
   if (vrow < dv && wk == 0) Store(out, (i_n * hv_n + hv) * dv + vrow, o);
+  if constexpr (REGSTATE) {
+    for (int64_t j = 0; j < 16; ++j) {
+      r[GdnDecodeRegisterSharedColumn(wk, j)] = rr[j];
+    }
+  }
   __syncthreads();
 
   // Coalesced write-back of the updated slice from f32 registers to the
   // configured fp16/bf16/fp32 temporal cache.
-  for (int64_t e = tid; e < tile; e += blockDim.x)
-    Store(s_head, e, sbh[(e / dk) * sdk + e % dk]);
+  for (int64_t e = tid; e < tile; e += blockDim.x) {
+    const int64_t c = e % dk;
+    const int64_t sc = SWIZZLED ? (c % 16) * 8 + c / 16 : c;
+    Store(s_head, e, sbh[(e / dk) * sdk + sc]);
+  }
 }
 
 template <typename Tin, typename Tout, typename TState, int NW>
 void LaunchGdnDecodeFusedNW(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                             const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                            const int32_t* state_idx, int64_t n, const GdnArgs& args) {
+                            const int32_t* state_idx, int64_t n, const GdnArgs& args,
+                            const GdnDecodeLaunchContract& contract) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
-  const int64_t bv = dv < 32 ? dv : 32;   // fla BV cap of 32; any dv via tail guard
-  const int64_t nv = (dv + bv - 1) / bv;  // value-dim tiles (fla NV)
-  const dim3 grid(static_cast<unsigned>(nv), static_cast<unsigned>(n * hv_n));
-  const size_t shmem =
-      (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) * sizeof(float);
-  GdnDecodeFusedKernel<Tin, Tout, TState, NW><<<grid, static_cast<unsigned>(bv * NW), shmem, s>>>(
-      out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
-      beta.Ptr<float>(), state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv, args.scale);
+  const int64_t bv = contract.value_tile;
+  const dim3 grid(static_cast<unsigned>(contract.value_tiles),
+                  static_cast<unsigned>(n * hv_n));
+  if constexpr (NW == 8) {
+    if (contract.swizzled) {
+      DispatchGdnDecodeStateStorage(
+          contract,
+          [&](const GdnDecodeLaunchContract&) {
+            GdnDecodeFusedKernel<Tin, Tout, TState, NW, true, false>
+                <<<grid, static_cast<unsigned>(contract.block_threads),
+                   contract.shared_bytes, s>>>(
+                    out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(),
+                    v.Ptr<Tin>(), g.Ptr<float>(), beta.Ptr<float>(),
+                    state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv,
+                    args.scale);
+          },
+          [&](const GdnDecodeLaunchContract&) {
+            GdnDecodeFusedKernel<Tin, Tout, TState, NW, true, true>
+                <<<grid, static_cast<unsigned>(contract.block_threads),
+                   contract.shared_bytes, s>>>(
+                    out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(),
+                    v.Ptr<Tin>(), g.Ptr<float>(), beta.Ptr<float>(),
+                    state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv,
+                    args.scale);
+          });
+    } else {
+      GdnDecodeFusedKernel<Tin, Tout, TState, NW, false, false>
+          <<<grid, static_cast<unsigned>(contract.block_threads), contract.shared_bytes, s>>>(
+          out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
+          beta.Ptr<float>(), state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv,
+          args.scale);
+    }
+  } else {
+    GdnDecodeFusedKernel<Tin, Tout, TState, NW, false, false>
+        <<<grid, static_cast<unsigned>(contract.block_threads), contract.shared_bytes, s>>>(
+        out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(), g.Ptr<float>(),
+        beta.Ptr<float>(), state.Ptr<TState>(), state_idx, hk_n, dk, hv_n, dv, bv, args.scale);
+  }
   Check(cudaGetLastError(), "gdn decode(fused) launch");
 }
 
-// nw: warps-per-block for the Dk-split (occupancy lever). >1 only when BV==32
-// (dv>=32, the real gate dim) so a block is always a whole number of warps and
-// the row-group shuffles stay in-warp; smaller dv (test corners) forces nw=1.
+// lanes_per_row: cooperative lanes for each value row's Dk split. The launch
+// contract keeps each row's NW consecutive lanes together for every value tile;
+// smaller dv test corners preserve the shipped NW=1 rule.
 template <typename Tin, typename Tout, typename TState>
 void LaunchGdnDecodeFused(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                           const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                          const int32_t* state_idx, int64_t n, const GdnArgs& args, int nw) {
-  const int64_t dv = v.shape[2];
-  const int nw_eff = dv >= 32 ? nw : 1;
-  switch (nw_eff) {
+                          const int32_t* state_idx, int64_t n, const GdnArgs& args,
+                          const GdnDecodeLaunchContract& contract) {
+  switch (contract.lanes_per_row) {
     case 2:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 2>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args);
+                                                   n, args, contract);
       break;
     case 4:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 4>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args);
+                                                   n, args, contract);
       break;
     case 8:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 8>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args);
+                                                   n, args, contract);
       break;
     default:
       LaunchGdnDecodeFusedNW<Tin, Tout, TState, 1>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args);
+                                                   n, args, contract);
       break;
   }
 }
@@ -2627,16 +2997,17 @@ void LaunchGdnDecodeFused(cudaStream_t s, Tensor& out, const Tensor& q_in, const
 template <typename Tin, typename Tout>
 void LaunchGdnDecodeFusedS(cudaStream_t s, Tensor& out, const Tensor& q_in, const Tensor& k,
                            const Tensor& v, const Tensor& g, const Tensor& beta, Tensor& state,
-                           const int32_t* state_idx, int64_t n, const GdnArgs& args, int nw) {
+                           const int32_t* state_idx, int64_t n, const GdnArgs& args,
+                           const GdnDecodeLaunchContract& contract) {
   if (state.dtype == DType::kBF16)
     LaunchGdnDecodeFused<Tin, Tout, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx,
-                                                   n, args, nw);
+                                                   n, args, contract);
   else if (state.dtype == DType::kF16)
     LaunchGdnDecodeFused<Tin, Tout, __half>(s, out, q_in, k, v, g, beta,
-                                           state, state_idx, n, args, nw);
+                                           state, state_idx, n, args, contract);
   else
     LaunchGdnDecodeFused<Tin, Tout, float>(s, out, q_in, k, v, g, beta, state, state_idx, n, args,
-                                           nw);
+                                           contract);
 }
 
 // Decode dispatch. state_idx == nullptr: compact [n,Hv,Dv,Dk] state (row==i_n).
@@ -2653,14 +3024,6 @@ void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor&
   const int64_t n = q_in.shape[0], hv_n = state.shape[1], dv = state.shape[2], dk = state.shape[3];
   if (n == 0 || hv_n == 0 || dv == 0) return;
   VT_CHECK(n * hv_n <= kMaxGridY, "cuda gdn_decode: too many (seq×head) blocks (grid.y limit)");
-  const int64_t bv = dv < 32 ? dv : 32;
-  const size_t shmem =
-      (2 * static_cast<size_t>(dk) + static_cast<size_t>(bv) * (dk + 1)) * sizeof(float);
-  if (shmem > 48 * 1024) {  // corner-dim fallback (no decode test hits this; real dims are 128)
-    GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, state_idx,
-                args, "gdn_decode");
-    return;
-  }
   // Warps-per-block for the Dk-split occupancy lever (default 8 — measured best
   // on GB10 sm_121: raises GdnDecodeFused theoretical occupancy 10.4%→66.7% and
   // cuts per-call time ~2.2× at conc-64; A/B via env, read once per call —
@@ -2672,21 +3035,33 @@ void GdnDecodeFusedCuda(Queue& q, Tensor& out, const Tensor& q_in, const Tensor&
     if (v_nw == 1 || v_nw == 2 || v_nw == 4 || v_nw == 8) nw = v_nw;
   }
   cudaStream_t s = AsStream(q);
-  if (q_in.dtype == DType::kF32) {
-    if (out.dtype == DType::kF32)
-      LaunchGdnDecodeFusedS<float, float>(s, out, q_in, k, v, g, beta, state, state_idx, n, args,
-                                          nw);
-    else
-      LaunchGdnDecodeFusedS<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx, n,
-                                                  args, nw);
-  } else {
-    if (out.dtype == DType::kF32)
-      LaunchGdnDecodeFusedS<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, state_idx, n,
-                                                  args, nw);
-    else
-      LaunchGdnDecodeFusedS<__nv_bfloat16, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state,
-                                                          state_idx, n, args, nw);
-  }
+  auto launch = [&](const GdnDecodeLaunchContract& contract) {
+    if (contract.shared_bytes > 48 * 1024) {
+      // Corner-dim fallback (no decode test hits this; real dims are 128).
+      GdnScanCuda(q, out, q_in, k, v, g, beta, state, nullptr, state_idx,
+                  args, "gdn_decode");
+      return;
+    }
+    if (q_in.dtype == DType::kF32) {
+      if (out.dtype == DType::kF32)
+        LaunchGdnDecodeFusedS<float, float>(s, out, q_in, k, v, g, beta, state, state_idx, n,
+                                            args, contract);
+      else
+        LaunchGdnDecodeFusedS<float, __nv_bfloat16>(s, out, q_in, k, v, g, beta, state, state_idx,
+                                                    n, args, contract);
+    } else {
+      if (out.dtype == DType::kF32)
+        LaunchGdnDecodeFusedS<__nv_bfloat16, float>(s, out, q_in, k, v, g, beta, state, state_idx,
+                                                    n, args, contract);
+      else
+        LaunchGdnDecodeFusedS<__nv_bfloat16, __nv_bfloat16>(
+            s, out, q_in, k, v, g, beta, state, state_idx, n, args, contract);
+    }
+  };
+  DispatchGdnDecodeValueTile(std::getenv("VT_GDN_DECODE_BV"),
+                             std::getenv("VT_GDN_DECODE_SWIZZLE"),
+                             std::getenv("VT_GDN_DECODE_REGSTATE"), dv, dk,
+                             nw, launch, launch);
 }
 
 // Shared wrapper body: qsl_ptr == nullptr → decode (n = batch = state rows;

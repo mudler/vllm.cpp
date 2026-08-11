@@ -50,6 +50,9 @@ std::vector<std::string> ClassicPieces(std::string_view t) {
 std::vector<std::string> Gpt2Pieces(std::string_view t) {
   return Pieces(t, SplitPattern::kGpt2);
 }
+std::vector<std::string> TekkenPieces(std::string_view t) {
+  return Pieces(t, SplitPattern::kTekken);
+}
 
 using V = std::vector<std::string>;
 
@@ -57,6 +60,7 @@ struct PretokGolden {
   std::string_view input;
   std::vector<std::string_view> qwen;
   std::vector<std::string_view> llama;
+  std::vector<std::string_view> tekken;
 };
 
 // sizeof-based so embedded NUL bytes survive.
@@ -147,15 +151,87 @@ TEST_CASE("combining marks: Qwen letter run includes \\p{M}, Llama-3 not") {
   CHECK(LlamaPieces(s) == V{"word", "\xCC\x81", " \xCC\x81", "word"});
 }
 
+TEST_CASE("kTekken: the case-aware letter split, which no other pattern has") {
+  // Tekken's letter rule is TWO alternatives over distinct classes --
+  // [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+ tried first,
+  // then the same pair with the quantifiers swapped -- so an uppercase run
+  // ENDS a piece when a lowercase run follows it. Qwen/Llama-3 have a single
+  // [\p{L}]+ run and keep each of these whole.
+  CHECK(TekkenPieces("HelloWorld") == V{"Hello", "World"});
+  CHECK(QwenPieces("HelloWorld") == V{"HelloWorld"});
+  CHECK(TekkenPieces("fooBarBaz") == V{"foo", "Bar", "Baz"});
+  CHECK(TekkenPieces("McDonald") == V{"Mc", "Donald"});
+  CHECK(TekkenPieces("iOS") == V{"i", "OS"});
+  // Alternative 1 is greedy over the UPPER class, so a leading all-caps run
+  // followed by lowercase stays ONE piece; alternation is ordered, not
+  // longest-match, and alt 0 already covers this.
+  CHECK(TekkenPieces("ABCdef") == V{"ABCdef"});
+  // All-caps has no lowercase tail, so alt 0 fails and alt 1 takes it whole.
+  CHECK(TekkenPieces("ABC") == V{"ABC"});
+}
+
+TEST_CASE("kTekken: Lt and dotted-Lu count as UPPER, U+017F is Ll") {
+  // U+01C5 (DZ with caron, titlecase Lt) heads the upper class, so "abc"
+  // continues the same piece via alt 0.
+  CHECK(TekkenPieces("\xC7\x85" "abc") == V{"\xC7\x85" "abc"});
+  // U+0130 (I with dot above, Lu) likewise.
+  CHECK(TekkenPieces("\xC4\xB0" "stanbul") == V{"\xC4\xB0" "stanbul"});
+  // U+017F (long s) LOOKS uppercase but is Ll, so it cannot start alt 1's
+  // upper run -- "aſb" is one lowercase run.
+  CHECK(TekkenPieces("a\xC5\xBF" "b") == V{"a\xC5\xBF" "b"});
+}
+
+TEST_CASE("kTekken: marks are in the letter run but NOT excluded from punct") {
+  // Tekken carries \p{M} inside BOTH letter classes (like kQwen2) while its
+  // punct negation is [^\s\p{L}\p{N}] with no \p{M} (like kLlama3). That
+  // combination exists in no other pattern here, which is why the two mark
+  // behaviours cannot share one flag.
+  const std::string s = "word\xCC\x81 \xCC\x81word";
+  CHECK(TekkenPieces(s) == V{"word\xCC\x81", " \xCC\x81word"});
+  // Mark folds into the lowercase run, then the uppercase run splits off.
+  CHECK(TekkenPieces("\xC3\xA9\xCC\x81X") == V{"\xC3\xA9\xCC\x81", "X"});
+  CHECK(QwenPieces("\xC3\xA9\xCC\x81X") == V{"\xC3\xA9\xCC\x81X"});
+}
+
+TEST_CASE("kTekken: '/' joins the punct run's trailing class") {
+  // Tekken's punct rule ends [\r\n/]* where Qwen/Llama-3 end [\r\n]*. It is
+  // only observable when '/' follows a NEWLINE that follows a punct run -- in
+  // "a/b" the '/' is absorbed by the run itself and every pattern agrees.
+  CHECK(TekkenPieces("!!\n/b") == V{"!!\n/", "b"});
+  CHECK(QwenPieces("!!\n/b") == V{"!!\n", "/b"});
+  CHECK(TekkenPieces("a.\n//y") == V{"a", ".\n//", "y"});
+  CHECK(TekkenPieces("x!\n/") == V{"x", "!\n/"});
+  // Unaffected: '/' adjacent to letters behaves like any other punct.
+  CHECK(TekkenPieces("path/to/file") == V{"path", "/to", "/file"});
+}
+
+TEST_CASE("kTekken: no contraction rule, and single-codepoint digits") {
+  // Tekken has NO (?i:'s|'t|...) alternative. "'m" still splits off, but as
+  // alt 0's optional punct prefix plus a lowercase run -- not as a
+  // contraction -- and the observable pieces coincide here.
+  CHECK(TekkenPieces("I'm  fine\n\n") == V{"I", "'m", " ", " fine", "\n\n"});
+  // Where the missing rule SHOWS: "can'tt". Qwen's contraction alternative
+  // matches exactly "'t" and leaves a stranded "t"; Tekken has no such rule,
+  // so the apostrophe is alt 0's punct prefix and the whole "'tt" is one
+  // piece. This is the cleanest observable consequence of dropping the group.
+  CHECK(TekkenPieces("can'tt") == V{"can", "'tt"});
+  CHECK(QwenPieces("can'tt") == V{"can", "'t", "t"});
+  CHECK(TekkenPieces("x123") == V{"x", "1", "2", "3"});  // \p{N}, not {1,3}
+  CHECK(TekkenPieces("A1b2") == V{"A", "1", "b", "2"});
+}
+
 TEST_CASE("goldens: scanner matches the HF tokenizers oracle") {
   for (const PretokGolden& g : kPretokGoldens) {
     CAPTURE(g.input);
     const auto q = QwenPieces(g.input);
     const auto l = LlamaPieces(g.input);
+    const auto t = TekkenPieces(g.input);
     REQUIRE(q.size() == g.qwen.size());
     for (size_t i = 0; i < q.size(); ++i) CHECK(q[i] == g.qwen[i]);
     REQUIRE(l.size() == g.llama.size());
     for (size_t i = 0; i < l.size(); ++i) CHECK(l[i] == g.llama[i]);
+    REQUIRE(t.size() == g.tekken.size());
+    for (size_t i = 0; i < t.size(); ++i) CHECK(t[i] == g.tekken[i]);
   }
 }
 

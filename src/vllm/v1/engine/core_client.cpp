@@ -74,6 +74,23 @@ void InprocClient::add_request_async(std::unique_ptr<Request> request) {
   proc_.input_queue.put_nowait(std::move(item));
 }
 
+void InprocClient::add_requests_async(
+    std::vector<std::unique_ptr<Request>> requests) {
+  if (requests.empty()) return;
+
+  std::vector<EngineCoreInputItem> items;
+  items.reserve(requests.size());
+  static const bool kLoopTrace = std::getenv("VT_LOOP_TRACE") != nullptr;
+  for (std::unique_ptr<Request>& request : requests) {
+    EngineCoreInputItem item;
+    item.type = EngineCoreRequestType::kAdd;
+    item.request = std::move(request);
+    if (kLoopTrace) item.enqueue_ts = MonotonicSeconds();
+    items.push_back(std::move(item));
+  }
+  PublishEngineCoreInputWaveAtomically(proc_.input_queue, std::move(items));
+}
+
 void InprocClient::abort_requests_async(
     const std::vector<std::string>& request_ids) {
   // core_client.py:891-893: "if request_ids and not resources.engine_dead".

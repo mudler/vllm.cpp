@@ -42,13 +42,13 @@ The binding comparison. vLLM runs its **production graphed config**, never
 | Qwen3.6-27B | NVFP4 (`nvidia` @`0893e160`, ModelOpt `modelopt_mixed`) | 0.25.0 | 0/4 | **BEHIND, uniformly 0.85x** on decode throughput (was 0.72x before the FP8 tower fix); greedy continuation IDENTICAL to vLLM. A different model from the `unsloth` row (NVFP4 MLP + FP8 W8A8 GDN/attn tower) |
 | Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x (c4 wins), c16 0.93x. Both c16 levers A/B'd NEG: drain event -1.9%, mirror 0.999x. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
 | DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
-| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | throughput + host PSS | Exact chunks ON: total **1.021x PASS**; TTFT **1.086x**, TPOT **1.025x**, VRAM **1.018x OPEN**; local A/B **+2.152%** ([evidence](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
+| Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | **1.0283x tput, `PENDING`** | OPEN: TTFT/TPOT/E2E 1.085/1.017/1.029x, VRAM +118.7 MiB ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
 
-### GDN prefill causal-convolution by GPU
+### GDN prefill kernels by GPU
 
 | GPU | Workload and basis | vllm.cpp | vLLM | Ratio | Status |
 |---|---|---:|---:|---:|---|
-| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16, c32, steady-interval total | 233.955 ms | 145.421 ms | **1.609x slower** | Rebased-main exact chunks ON; rollback 718.704 ms, so local is **3.072x faster** ([evidence](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
+| RTX 5070 Ti (`sm_120`) | Qwen3.5-4B BF16 c32: conv / post-conv | 234.605→**219.506**; 122.587 ms | 145.421; 108.035 ms | 1.509x; 1.135x | Opt-in, byte-exact: K4 **6.436%**, tile **1.859x** ([conv](../.agents/specs/sm120-qwen35-conv-channel-tile-2026-08-08.md), [tile](../.agents/specs/sm120-qwen35-postconv-token-tile-2026-08-08.md)) |
 | GB10 (`sm_121a`) | Qwen3.6-27B NVFP4, historical normalized prefill | 0.43 us/token/layer | 0.18 us/token/layer | **2.39x slower** | Directional only: unequal token clusters, older pin ([ledger](../.agents/parity-ledger.md)) |
 | GB10 (`sm_121a`) | Qwen3.6-35B NVFP4, later local kernel A/B | 321.148 us c1; 960.313 us c6 | - | `PENDING` | Register vs tiled improved 4.7%/7.3%; no paired vLLM denominator ([record](../.agents/specs/gdn-prefill-conv-reg-2026-07-18.md)) |
 | Jetson Thor (`sm_110`), AGX Orin (`sm_87`) | No matched GDN workload | - | - | `PENDING` | Runtime correctness only; no causal-conv speed trace |

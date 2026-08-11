@@ -765,3 +765,175 @@ TEST_CASE("CUDA random_sample agrees with CPU on the vast majority of rows") {
   // Allow a small number of ULP-driven argmax flips; require strong agreement.
   CHECK(agree >= static_cast<size_t>(0.98 * static_cast<double>(N)));
 }
+
+// ===========================================================================
+// CPU-vs-ROCm parity (same contracts as the CUDA block above). Skips when no
+// ROCm backend is linked/registered (CPU CI). Lab proof: dual R9700 gfx1201.
+namespace {
+
+bool HasRocm() {
+  try {
+    vt::GetBackend(DeviceType::kROCM);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+Device RocmDev() { return Device{DeviceType::kROCM, 0}; }
+
+class RocmDeviceTensor {
+ public:
+  RocmDeviceTensor(Backend& b, Queue& q, DType dt, const std::vector<int64_t>& shape,
+                   const void* host = nullptr)
+      : b_(b) {
+    int64_t numel = 1;
+    for (auto s : shape) numel *= s;
+    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
+    p_ = b_.Alloc(bytes_ == 0 ? 1 : bytes_);
+    if (host != nullptr) b_.Copy(q, p_, host, bytes_);
+    t_ = MakeT(p_, dt, RocmDev(), shape);
+  }
+  ~RocmDeviceTensor() { b_.Free(p_); }
+  RocmDeviceTensor(const RocmDeviceTensor&) = delete;
+  RocmDeviceTensor& operator=(const RocmDeviceTensor&) = delete;
+  Tensor& tensor() { return t_; }
+  void Download(Queue& q, void* dst) {
+    b_.Copy(q, dst, p_, bytes_);
+    b_.Synchronize(q);
+  }
+
+ private:
+  Backend& b_;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+  Tensor t_;
+};
+
+}  // namespace
+
+TEST_CASE("ROCm greedy_argmax / temperature / top-k-p / allowed_ids / logprobs match CPU") {
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; skipping");
+    return;
+  }
+  const int64_t N = 4, V = 256;
+  const auto logits = RandomLogits(static_cast<size_t>(N * V), 7777);
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  QueueGuard gq(gpu);
+  Queue cq = Q();
+
+  // greedy_argmax bit-exact
+  {
+    std::vector<float> lc = logits;
+    std::vector<int64_t> id_cpu(static_cast<size_t>(N), -1);
+    Tensor tl = MakeT(lc.data(), DType::kF32, Cpu(), {N, V});
+    Tensor ti = MakeT(id_cpu.data(), DType::kI64, Cpu(), {N});
+    vt::GreedyArgmax(cq, ti, tl);
+    RocmDeviceTensor dl(gpu, gq.q, DType::kF32, {N, V}, logits.data());
+    RocmDeviceTensor did(gpu, gq.q, DType::kI64, {N});
+    vt::GreedyArgmax(gq.q, did.tensor(), dl.tensor());
+    std::vector<int64_t> id_gpu(static_cast<size_t>(N));
+    did.Download(gq.q, id_gpu.data());
+    for (size_t i = 0; i < id_cpu.size(); ++i) CHECK(id_gpu[i] == id_cpu[i]);
+  }
+
+  // apply_temperature
+  {
+    std::vector<float> lc = logits, lg = logits;
+    std::vector<float> temp(static_cast<size_t>(N), 0.7f);
+    Tensor tl = MakeT(lc.data(), DType::kF32, Cpu(), {N, V});
+    Tensor tt = MakeT(temp.data(), DType::kF32, Cpu(), {N});
+    vt::ApplyTemperature(cq, tl, tt, /*all_random=*/true);
+    RocmDeviceTensor dl(gpu, gq.q, DType::kF32, {N, V}, lg.data());
+    RocmDeviceTensor dt(gpu, gq.q, DType::kF32, {N}, temp.data());
+    vt::ApplyTemperature(gq.q, dl.tensor(), dt.tensor(), /*all_random=*/true);
+    std::vector<float> out(lg.size());
+    dl.Download(gq.q, out.data());
+    for (size_t i = 0; i < lc.size(); ++i)
+      CHECK(out[i] == doctest::Approx(lc[i]).epsilon(1e-5));
+  }
+
+  // top-k only
+  {
+    std::vector<float> lc = logits, lg = logits;
+    std::vector<int32_t> k(static_cast<size_t>(N), 16);
+    Tensor tl = MakeT(lc.data(), DType::kF32, Cpu(), {N, V});
+    Tensor tk = MakeT(k.data(), DType::kI32, Cpu(), {N});
+    vt::ApplyTopKTopP(cq, tl, &tk, /*p=*/nullptr);
+    RocmDeviceTensor dl(gpu, gq.q, DType::kF32, {N, V}, lg.data());
+    RocmDeviceTensor dk(gpu, gq.q, DType::kI32, {N}, k.data());
+    vt::ApplyTopKTopP(gq.q, dl.tensor(), &dk.tensor(), /*p=*/nullptr);
+    std::vector<float> out(lc.size());
+    dl.Download(gq.q, out.data());
+    for (size_t i = 0; i < lc.size(); ++i) {
+      if (std::isinf(lc[i])) CHECK(std::isinf(out[i]));
+      else CHECK(out[i] == doctest::Approx(lc[i]).epsilon(1e-5));
+    }
+  }
+
+  // allowed_token_ids mask (Hermes title-gen path).
+  // Contract: mask[i]!=0 → logit becomes -inf (blocked). 0 keeps the value.
+  {
+    std::vector<float> lc = logits, lg = logits;
+    std::vector<int8_t> mask(static_cast<size_t>(N * V), 0);
+    // Block all but first 8 ids per row
+    for (int64_t n = 0; n < N; ++n)
+      for (int64_t v = 8; v < V; ++v) mask[static_cast<size_t>(n * V + v)] = 1;
+    Tensor tl = MakeT(lc.data(), DType::kF32, Cpu(), {N, V});
+    Tensor tm = MakeT(mask.data(), DType::kI8, Cpu(), {N, V});
+    vt::ApplyAllowedTokenIds(cq, tl, tm);
+    RocmDeviceTensor dl(gpu, gq.q, DType::kF32, {N, V}, lg.data());
+    RocmDeviceTensor dm(gpu, gq.q, DType::kI8, {N, V}, mask.data());
+    vt::ApplyAllowedTokenIds(gq.q, dl.tensor(), dm.tensor());
+    std::vector<float> out(lc.size());
+    dl.Download(gq.q, out.data());
+    for (size_t i = 0; i < lc.size(); ++i) {
+      if (std::isinf(lc[i])) CHECK(std::isinf(out[i]));
+      else CHECK(out[i] == doctest::Approx(lc[i]).epsilon(1e-5));
+    }
+  }
+
+  // compute_logprobs
+  {
+    std::vector<float> lp_cpu(static_cast<size_t>(N * V));
+    std::vector<float> lc = logits;
+    Tensor tl = MakeT(lc.data(), DType::kF32, Cpu(), {N, V});
+    Tensor to = MakeT(lp_cpu.data(), DType::kF32, Cpu(), {N, V});
+    vt::ComputeLogprobs(cq, to, tl);
+    RocmDeviceTensor dl(gpu, gq.q, DType::kF32, {N, V}, logits.data());
+    RocmDeviceTensor dout(gpu, gq.q, DType::kF32, {N, V});
+    vt::ComputeLogprobs(gq.q, dout.tensor(), dl.tensor());
+    std::vector<float> lp_gpu(lp_cpu.size());
+    dout.Download(gq.q, lp_gpu.data());
+    for (size_t i = 0; i < lp_cpu.size(); ++i)
+      CHECK(lp_gpu[i] == doctest::Approx(lp_cpu[i]).epsilon(1e-4));
+  }
+}
+
+TEST_CASE("ROCm apply_min_p / penalties surface matches CPU mask pattern") {
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; skipping");
+    return;
+  }
+  // min_p: keep values that are high enough vs row max
+  std::vector<float> logits = {0.0f, 1.0f, 2.0f, 3.0f,
+                               5.0f, 4.0f, 0.0f, -1.0f};
+  std::vector<float> min_p = {0.5f, 0.1f};
+  std::vector<float> lc = logits, lg = logits;
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  QueueGuard gq(gpu);
+  Queue cq = Q();
+  Tensor tl = MakeT(lc.data(), DType::kF32, Cpu(), {2, 4});
+  Tensor tp = MakeT(min_p.data(), DType::kF32, Cpu(), {2});
+  vt::ApplyMinP(cq, tl, tp);
+  RocmDeviceTensor dl(gpu, gq.q, DType::kF32, {2, 4}, lg.data());
+  RocmDeviceTensor dp(gpu, gq.q, DType::kF32, {2}, min_p.data());
+  vt::ApplyMinP(gq.q, dl.tensor(), dp.tensor());
+  std::vector<float> out(8);
+  dl.Download(gq.q, out.data());
+  for (size_t i = 0; i < 8; ++i) {
+    if (std::isinf(lc[i])) CHECK(std::isinf(out[i]));
+    else CHECK(out[i] == doctest::Approx(lc[i]).epsilon(1e-5));
+  }
+}

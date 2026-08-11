@@ -33,6 +33,25 @@ LLAMA3 = (
     r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
 
+# Tekken (Mistral). Verbatim from mistralai/Mistral-Nemo-Instruct-2407
+# tokenizer.json (pre_tokenizer.pretokenizers[0].pretokenizers[0].pattern.Regex,
+# behavior=Isolated, invert=false); the ByteLevel sibling carries
+# use_regex=false, so this Split is the whole word-splitting rule.
+#
+# Structurally this is tiktoken's o200k_base pat_str with exactly two edits:
+# the optional `(?i:'s|'t|'re|'ve|'m|'ll|'d)?` group is absent from both letter
+# alternatives, and numbers are single-codepoint `\p{N}` rather than
+# `\p{N}{1,3}`. Everything from the punct run onward is byte-identical to
+# o200k_base. Note the two CASE-AWARE letter alternatives, which no other
+# pattern in this file has: an uppercase/caseless run followed by a lowercase
+# run, then the same pair with the quantifiers swapped. Alternation is ORDERED,
+# so the first is tried first at every position.
+TEKKEN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
 DETERMINISTIC = [
     "",
     "Hello world",
@@ -82,6 +101,26 @@ DETERMINISTIC = [
     "1234 x 123456789",
     "  12",
     "tab\tnum\t9",
+    # Tekken's case-aware letter split: an uppercase run ends a piece when a
+    # lowercase run follows. Qwen/Llama-3 keep each of these as ONE letter run,
+    # so these rows discriminate the new pattern from both existing ones.
+    "HelloWorld fooBarBaz",
+    "McDonald iOS ABCdef",
+    "ABC A1b2",
+    # Lt (titlecase, U+01C5) and Lu-with-dot (U+0130) must both count as the
+    # UPPER class; ſ is Ll despite looking uppercase-ish.
+    "ǅabc İstanbul aſb",
+    # Marks are in Tekken's letter classes but NOT excluded from its punct run
+    # (unlike Qwen, which excludes them from both) -- the combination that
+    # forces marks_in_run and marks_excluded apart.
+    "é́X word́ ́word",
+    # '/' is in Tekken's punct-run TRAILING class ([\r\n/]*, vs [\r\n]* for
+    # Qwen/Llama-3). Only observable when '/' follows a newline that follows a
+    # punct run -- a bare "a/b" absorbs '/' into the run itself and cannot see
+    # the difference.
+    "!!\n/b",
+    "a.\n//y",
+    "x!\n/",
 ]
 
 ASCII_POOL = (
@@ -123,6 +162,7 @@ def pieces(pt: Split, s: str) -> list[str]:
 def main() -> None:
     qwen = Split(Regex(QWEN), behavior="isolated", invert=False)
     llama = Split(Regex(LLAMA3), behavior="isolated", invert=False)
+    tekken = Split(Regex(TEKKEN), behavior="isolated", invert=False)
     cases = DETERMINISTIC + random_strings(seed=42, count=60)
 
     w = sys.stdout.write
@@ -138,12 +178,14 @@ def main() -> None:
     for s in cases:
         q = pieces(qwen, s)
         l = pieces(llama, s)
+        t = pieces(tekken, s)
         # rstrip: a trailing backslash in a // comment splices lines (GCC even
         # splices across "backslash then whitespace then newline").
         w("  {  // %s\n" % ascii(s)[1:-1][:90].rstrip("\\ "))
         w("    SV(%s),\n" % cxx_bytes(s))
         w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in q))
         w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in l))
+        w("    {%s},\n" % ", ".join("SV(%s)" % cxx_bytes(p) for p in t))
         w("  },\n")
     w("};\n")
     w("// clang-format on\n")

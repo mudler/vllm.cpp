@@ -183,8 +183,39 @@ void EngineCoreProc::process_input_queue() {
 
 bool EngineCoreProc::process_engine_step() {
   // core.py:1300-1318. "Called only when there are unfinished local requests."
+  // VT_ENGINE_STEP_LOG (external PR #227): a per-step heartbeat. A stalled
+  // engine and a busy one look identical from outside — both just produce no
+  // client tokens — and this is what separates them: `model_executed=0` with a
+  // non-zero unfinished count, step after step, is the engine spinning on work
+  // it can never schedule. Diagnostic only; it changes no generation.
+  static const bool kStepHeartbeat = [] {
+    const char* e = std::getenv("VT_ENGINE_STEP_LOG");
+    if (e != nullptr && e[0] == '1') return true;
+    const char* v = std::getenv("VT_SERVER_VERBOSE");
+    return v != nullptr && v[0] == '1';
+  }();
+  const double heartbeat_t0 = kStepHeartbeat ? MonotonicSeconds() : 0.0;
+  if (kStepHeartbeat) {
+    std::fprintf(stderr,
+                 "INFO core-step begin unfinished=%d finished_pending=%d\n",
+                 scheduler_.get_num_unfinished_requests(),
+                 scheduler_.has_finished_requests() ? 1 : 0);
+    std::fflush(stderr);
+  }
   // core.py:1303: step the engine core.
   auto [outputs, model_executed] = (this->*step_fn_)();
+  if (kStepHeartbeat) {
+    int n_out = 0;
+    for (const auto& [client_index, engine_core_outputs] : outputs) {
+      (void)client_index;
+      n_out += static_cast<int>(engine_core_outputs.outputs.size());
+    }
+    std::fprintf(stderr,
+                 "INFO core-step end model_executed=%d n_out=%d elapsed_s=%.3f\n",
+                 model_executed ? 1 : 0, n_out,
+                 MonotonicSeconds() - heartbeat_t0);
+    std::fflush(stderr);
+  }
   // core.py:1305-1306: put EngineCoreOutputs into the output queue.
   for (auto& [client_index, engine_core_outputs] : outputs) {
     EngineCoreOutputItem out;

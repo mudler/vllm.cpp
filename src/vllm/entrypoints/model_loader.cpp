@@ -31,6 +31,7 @@
 #include "vllm/model_executor/models/qwen3_dflash.h"  // SPEC-DFLASH D5 draft load
 #include "vllm/transformers_utils/hf_config.h"  // SPEC-DFLASH D5 draft config
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — SelectQueue
+#include "vllm/v1/core/kv_cache_utils.h"  // check_enough_kv_cache_memory (M4)
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vllm/v1/structured_output/jump_forward.h"     // JumpForwardEnabled (SW3)
 #include "vt/dtype.h"
@@ -894,6 +895,56 @@ vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheResolved(
   return MakeKVCacheMaybeSpec(model, config, block_size, resolved, spec);
 }
 
+int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
+                                     const HfConfig& config,
+                                     const vllm::v1::KVCacheConfig& kv_cfg,
+                                     int block_size) {
+  // kv_cache_utils.py:2160-2174 @ 555967922. See model_loader.h for the two
+  // arms and why this post-condition matters.
+  const int64_t bytes_per_block = vllm::v1::KVBytesPerBlock(kv_cfg);
+  const int64_t available =
+      static_cast<int64_t>(kv_cfg.num_blocks) * bytes_per_block;
+
+  if (params.max_model_len > 0) {
+    // The caller pinned a length. Refuse if the pool cannot serve it — UNLESS
+    // there is no paged KV to size at all. kv_cache_utils.py:872-878 guards the
+    // whole check with `if kv_cache_spec:` for exactly this: an attention-free
+    // model (and, here, a pure Mamba/GDN one, whose state is sized per sequence
+    // slot rather than per block, so KVBytesPerBlock is 0) has nothing to run
+    // out of, and checking it would refuse a configuration that works.
+    if (bytes_per_block > 0) {
+      const int64_t needed = vllm::v1::kv_memory_needed_bytes(
+          params.max_model_len, block_size, bytes_per_block);
+      vllm::v1::check_enough_kv_cache_memory(
+          available, needed, params.max_model_len,
+          vllm::v1::estimate_max_model_len(available, bytes_per_block,
+                                           block_size));
+    }
+    return params.max_model_len;
+  }
+
+  // Unpinned: serve the checkpoint's own context, auto-fitted down to the pool.
+  const int64_t derived = config.max_position_embeddings;
+  if (derived <= 0) {
+    // No context length in the config at all. There is nothing to fit against,
+    // and it is not this function's job to invent one.
+    return static_cast<int>(derived);
+  }
+  const int64_t fitted = vllm::v1::auto_fit_max_model_len(
+      derived, available, bytes_per_block, block_size);
+  if (fitted < derived) {
+    // kv_cache_utils.py:2021-2027 logs the reduction. Silence here would make a
+    // shortened context look like a model-config surprise later.
+    std::cerr << "INFO auto-fit max_model_len: reduced from " << derived
+              << " to " << fitted << " to fit the KV cache ("
+              << kv_cfg.num_blocks << " blocks x " << block_size
+              << " tokens). Raise --num-blocks / --kv-cache-memory for a longer"
+                 " context.\n";
+    std::cerr.flush();
+  }
+  return static_cast<int>(fitted);
+}
+
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
                            tok::Tokenizer tokenizer, const EngineParams& params)
     : LoadedEngine(std::move(config),
@@ -921,9 +972,18 @@ LoadedEngine::LoadedEngine(HfConfig config,
       dflash_draft_(std::move(dflash_draft)),
       model_(std::move(model)),
       tokenizer_(std::move(tokenizer)),
-      max_model_len_(params.max_model_len > 0
-                         ? params.max_model_len
-                         : static_cast<int>(config_.max_position_embeddings)),
+      // ROAD-V1-MEM M1: resolve the block count from the sizing knobs
+      // (num_blocks override > kv_cache_memory_bytes > util fallback) against the
+      // model's own per-block byte geometry. FIRST, because max_model_len_ is
+      // resolved against this pool.
+      kv_cfg_(MakeKVCacheResolved(
+          *model_, config_, params.block_size > 0 ? params.block_size : 32,
+          params, resolved_spec_config_)),
+      // The serving length, checked (pinned) or auto-fitted (unpinned) against
+      // kv_cfg_. See ResolveMaxModelLen.
+      max_model_len_(ResolveMaxModelLen(
+          params, config_, kv_cfg_,
+          params.block_size > 0 ? params.block_size : 32)),
       max_num_batched_tokens_(ResolveMaxNumBatchedTokens(
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
@@ -933,12 +993,6 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // the byte-identical decode path (jump-forward is inert until enabled).
       jump_forward_enabled_(
           vllm::v1::JumpForwardEnabled(params.enable_jump_forward)),
-      // ROAD-V1-MEM M1: resolve the block count from the sizing knobs
-      // (num_blocks override > kv_cache_memory_bytes > util fallback) against the
-      // model's own per-block byte geometry.
-      kv_cfg_(MakeKVCacheResolved(
-          *model_, config_, params.block_size > 0 ? params.block_size : 32,
-          params, resolved_spec_config_)),
       // runner_ FIRST (W3): the async-scheduling flip reads
       // runner_.runner_supports_async(). SPEC-MTP I5d: when speculation is on,
       // pass the resolved config + the MTP draft (built from the retained mtp.*
@@ -1008,7 +1062,11 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // so the next verify step schedules them. Default false (no-op post_step).
       engine_core_(*scheduler_, executor_, &structured_output_manager_,
                    /*check_for_draft_tokens=*/resolved_spec_config_.has_value()),
-      input_processor_(tokenizer_, config_),
+      // The admission-time prompt-length check validates against the RESOLVED
+      // serving length, which is what upstream's model_config.max_model_len is
+      // (input_processor.py:399-401). Passing config_ alone would check against
+      // the raw checkpoint context and let through prompts the pool cannot hold.
+      input_processor_(tokenizer_, config_, max_model_len_),
       output_processor_(&tokenizer_),
       block_hasher_(prefix_caching_enabled_
                         ? vllm::v1::get_request_block_hasher(

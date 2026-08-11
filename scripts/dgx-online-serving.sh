@@ -714,7 +714,11 @@ run_paired_traces() {
       --num-blocks "${num_blocks}"
       --max-num-seqs "${max_num_seqs}"
       --max-num-batched-tokens "${max_num_batched_tokens}"
-      --max-model-len 262144
+      # No --max-model-len: the KV pool here is num_blocks x 32 tokens
+      # (4736 x 32 = 151552), so a pinned 262144 asked for four times the
+      # context the pool could ever hold and is now refused at startup by the
+      # KV sizing check. Leaving it unset auto-fits the serving length to the
+      # pool, which is the length this server could actually serve either way.
       --no-enable-prefix-caching
       --cuda-profile-graph-replays 4
     )

@@ -105,6 +105,10 @@ PROCEDURE_FILES = frozenset(
         ".agents/workflow.md",
         ".agents/verification.md",
         ".agents/porting.md",
+        # The per-model coverage checklist that porting.md points at (#318). Same
+        # procedure class as its sibling guides; listed explicitly rather than
+        # letting .agents/ become a blanket exemption.
+        ".agents/porting-a-model.md",
         ".agents/benchmarking.md",
         ".agents/bugfixing.md",
         ".agents/prompts/implementer.md",

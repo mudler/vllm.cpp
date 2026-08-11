@@ -957,6 +957,11 @@ target_include_directories(test_gdn_packed_reg_tile PRIVATE ${CMAKE_SOURCE_DIR}/
 # src/vt/cuda/cuda_gdn.cu (TryTritonPackedDecode -> gdn_decode_h{48,32}).
 vllm_cpp_add_test(test_gdn_packed_decode_triton vt/test_gdn_packed_decode_triton.cpp)
 target_include_directories(test_gdn_packed_decode_triton PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# CPU-tier contract for the opt-in fused-GDN decode BV16 value tile. Reaches
+# the CUDA-free selector/geometry header under src/; the executing kernel lives
+# in cuda_gdn.cu and is covered by same-process byte-exact CUDA comparisons.
+vllm_cpp_add_test(test_gdn_decode_fused vt/test_gdn_decode_fused.cpp)
+target_include_directories(test_gdn_decode_fused PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # CPU-tier contract for the two NUMERICS-NEUTRAL FP4-quant vectorized-load
 # fast-path flags (VT_FP4_QUANT_FAST + VT_SILU_FP4_FAST, both default OFF /
 # '1'-opt-in). Reaches the internal header under src/ (not public API); the

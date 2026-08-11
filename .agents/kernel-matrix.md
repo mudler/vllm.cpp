@@ -172,6 +172,43 @@ and the profiled enclosing workload improves **2.272%**; pinned vLLM remains
 Lifecycle stays `INVENTORIED` because generic Mamba coverage and the 27B/35B
 release gates are unchanged. [Spec and evidence](specs/sm120-qwen35-conv-chunking-2026-08-07.md).
 
+**2026-08-08 `KERNEL-SSM-MAMBA` checkpoint.** The opt-in
+`VT_GDN_POSTCONV_TOKEN_TILE` path ports vLLM/FLA's 16-token, per-head,
+four-warp post-conv schedule for 128-wide Q/K/V heads. It preserves the current
+128-lane reduction tree exactly while retaining Q/K values in registers.
+Qwen3.5-4B sm_120 graph-node time is **227.887→122.587 ms (1.859x)** with
+byte-identical production tokens and every enclosing axis positive; the
+same-tool vLLM residual is **1.135x**. Portable 6/6, CUDA GDN 67/67·4384 and
+cached 4B 3/3·1672 pass. It remains opt-in pending repeated and 27B/35B gates;
+generic Mamba lifecycle stays `INVENTORIED`.
+[Spike and result](specs/sm120-qwen35-postconv-token-tile-2026-08-08.md).
+
+**2026-08-08 `KERNEL-SSM-MAMBA` causal-conv residual checkpoint.** The
+opt-in width-four, one-channel arm removes runtime-width work at the unchanged
+64-block feature grid and is byte-exact. Qwen3.5-4B sm_120 graph-node time is
+**234.605→219.506 ms (-6.44%)**; dominant waves improve about 149.5→140.1 us
+and every observed enclosing axis is slightly positive. CUPTI registers rise
+43→52, so the win is not occupancy. The separately measured 256-channel arm
+halves the grid but rises to 58 registers and is 4.05% slower than the K4
+one-channel arm; that hypothesis is falsified. Portable 9/9·88, CUDA GDN
+67/67·4631 and paged-forward 4/4·8 pass. Arm 1 remains opt-in; generic Mamba
+lifecycle stays `INVENTORIED`.
+[Spike and result](specs/sm120-qwen35-conv-channel-tile-2026-08-08.md).
+**2026-08-09 `KERNEL-SSM-MAMBA` sm_120 campaign anchor.**
+[#206](https://github.com/mudler/vllm.cpp/issues/206) tracks the RTX 5070 Ti
+Qwen3.5-4B Pareto campaign. Reviewed atomic pretoken admission removed the
+frontend/batching confound; the corrected exact three-repetition comparison is
+**6831.71 vs 6643.40 tok/s (1.0283x)**, while TTFT, TPOT/ITL and E2E remain
+**1.0853x / 1.0165x / 1.0288x slower** and VRAM is **+118.7 MiB**. The exact
+default-OFF GDN decode BV16+swizzle+REGSTATE stack improves local throughput,
+TTFT, TPOT and E2E, and slack-only memset adds a smaller further local win.
+Two deeper candidates are closed: geometric argmax scratch merely moved wait
+from `cudaFree` to stream synchronization and regressed TPOT ~1%; BF16 vector
+writeback improved y800 only 0.143% with one losing raw leg. Both products/tests
+were removed while their specs and same-tool traces remain. Lifecycle stays
+`INVENTORIED`; generic Mamba and 27B/35B coverage are unchanged.
+[Campaign spec](specs/sm120-qwen35-pareto-2026-08-09.md).
+
 ## Count invariants
 
 - This table has exactly 35 practical kernel-family rows.

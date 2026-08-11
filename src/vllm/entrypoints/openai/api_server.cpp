@@ -25,6 +25,7 @@
 #include "vllm/entrypoints/openai/request_logger.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/v1/engine/async_llm.h"
+#include "vllm/v1/engine/input_processor.h"  // InputValidationError -> HTTP 400
 #include "vllm/v1/metrics/loggers.h"
 
 namespace vllm::entrypoints::openai {
@@ -181,6 +182,13 @@ ApiServer::DispatchResult ApiServer::handle_completions(
                                              std::defer_lock);
     if (!completion_->uses_async_engine()) legacy_lock.lock();
     result = completion_->create_completion(request);
+  } catch (const vllm::v1::InputValidationError& e) {
+    // The request itself is unservable (today: a prompt at or past
+    // max_model_len). Upstream raises ValueError from _validate_prompt_len and
+    // create_error_response maps ValueError to BadRequestError / 400
+    // (serve/utils/error_response.py:62-65). Caught AHEAD of the generic arm
+    // below, which would otherwise report a client mistake as a server fault.
+    return MakeError(400, "BadRequestError", e.what());
   } catch (const std::exception& e) {
     // DISCRIMINATOR: attribute a 500 to its endpoint + model + raw cause so a
     // benchmark driver that only sees the generic HTTP body can still recover
@@ -241,6 +249,10 @@ ApiServer::DispatchResult ApiServer::handle_chat_completions(
                                              std::defer_lock);
     if (!chat_->uses_async_engine()) legacy_lock.lock();
     result = chat_->create_chat_completion(request);
+  } catch (const vllm::v1::InputValidationError& e) {
+    // Same mapping as /v1/completions above (error_response.py:62-65).
+    LogRequestError("", "/v1/chat/completions", e.what());
+    return MakeError(400, "BadRequestError", e.what());
   } catch (const std::exception& e) {
     std::cerr << "api-server: 500 endpoint=/v1/chat/completions model="
               << request.model.value_or("") << " what=" << e.what() << "\n";

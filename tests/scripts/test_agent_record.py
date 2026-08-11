@@ -387,5 +387,96 @@ class IssueIntakeTable(unittest.TestCase):
         agent_record.check_issue_table(errors)
         self.assertEqual(errors, [])
 
+
+
+class PerClaimFileSource(unittest.TestCase):
+    """A claim may live in its own file under .agents/claims/ (#364).
+
+    The claims TABLE in coordination.md is insert-at-one-anchor, so every
+    concurrent claim appended a row at the same line. It conflicted in 8 of the
+    16 conflicting open PRs measured at origin/main d928e2c3 -- six of them one
+    author's sequential ROCm GDN stack whose ONLY conflict was this file. A
+    claim in its own file has one writer and cannot collide.
+
+    parse_active_claims reads BOTH sources, so no existing row had to be
+    migrated and the SPIKE/ACTIVE cross-check is unchanged.
+    """
+
+    def test_both_sources_are_read(self) -> None:
+        sources = [str(p.relative_to(ROOT)) for p in agent_record.claim_sources()]
+        self.assertIn(".agents/coordination.md", sources)
+        self.assertTrue(
+            (ROOT / ".agents/claims").is_dir(),
+            "the per-claim directory must exist for new claims to have a home",
+        )
+
+    def test_a_claim_file_registers_exactly_like_a_table_row(self) -> None:
+        probe = ROOT / ".agents/claims/CLAIM-AGENT-RECORD-PROBE.md"
+        probe.write_text(
+            "# CLAIM-AGENT-RECORD-PROBE\n\n"
+            "| Claim | Row IDs |\n|---|---|\n"
+            "| `CLAIM-AGENT-RECORD-PROBE` | `ENG-RECORD-CONFLICT-SURFACES` |\n",
+            encoding="utf-8",
+        )
+        try:
+            errors: list[str] = []
+            claims = agent_record.parse_active_claims(errors)
+            self.assertIn("CLAIM-AGENT-RECORD-PROBE", claims)
+            self.assertEqual(
+                claims["CLAIM-AGENT-RECORD-PROBE"], {"ENG-RECORD-CONFLICT-SURFACES"}
+            )
+        finally:
+            probe.unlink()
+
+    def test_dropping_the_directory_from_the_sources_is_caught(self) -> None:
+        """MUTATION: read coordination.md alone and the claim disappears.
+
+        This is the semantic being added. Without it a claim filed in its own
+        file is invisible to the gate, and the row it owns fails the
+        SPIKE/ACTIVE cross-check while looking correctly claimed to a human.
+        """
+        probe = ROOT / ".agents/claims/CLAIM-AGENT-RECORD-PROBE.md"
+        probe.write_text(
+            "# CLAIM-AGENT-RECORD-PROBE\n\n"
+            "| Claim | Row IDs |\n|---|---|\n"
+            "| `CLAIM-AGENT-RECORD-PROBE` | `ENG-RECORD-CONFLICT-SURFACES` |\n",
+            encoding="utf-8",
+        )
+        try:
+            with mock.patch.object(
+                agent_record,
+                "claim_sources",
+                lambda: [ROOT / ".agents/coordination.md"],
+            ):
+                errors: list[str] = []
+                self.assertNotIn(
+                    "CLAIM-AGENT-RECORD-PROBE",
+                    agent_record.parse_active_claims(errors),
+                    "the mutation must hide the claim, or this test proves nothing",
+                )
+            errors = []
+            self.assertIn("CLAIM-AGENT-RECORD-PROBE", agent_record.parse_active_claims(errors))
+        finally:
+            probe.unlink()
+
+    def test_a_claim_declared_twice_across_sources_is_rejected(self) -> None:
+        """Reading a second source must not weaken the duplicate check."""
+        probe = ROOT / ".agents/claims/CLAIM-AGENT-RECORD-DUP.md"
+        row = (
+            "| Claim | Row IDs |\n|---|---|\n"
+            "| `CLAIM-AGENT-RECORD-DUP` | `ENG-RECORD-CONFLICT-SURFACES` |\n"
+        )
+        probe.write_text("# dup\n\n" + row + row, encoding="utf-8")
+        try:
+            errors: list[str] = []
+            agent_record.parse_active_claims(errors)
+            self.assertTrue(
+                any("duplicate active claim" in e for e in errors),
+                f"a duplicate must be caught; got {errors}",
+            )
+        finally:
+            probe.unlink()
+
+
 if __name__ == "__main__":
     unittest.main()

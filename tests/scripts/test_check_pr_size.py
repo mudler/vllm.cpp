@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import re
 import tempfile
 import subprocess
 import sys
@@ -654,6 +655,47 @@ class BudgetEnforcement(unittest.TestCase):
                 self.assertEqual(
                     role.merged_pr_content([git("rev-parse", "HEAD")]), frozenset()
                 )
+
+
+
+
+class PerClaimPathClass(unittest.TestCase):
+    """`.agents/claims/CLAIM-*.md` is a classified path (#364).
+
+    One file per active claim, added because the claims TABLE in
+    coordination.md is insert-at-one-anchor and was the largest single conflict
+    source measured -- 8 of 16 conflicting open PRs. classify_path FAILS CLOSED
+    on an unknown path, so without this the directory cannot be added at all.
+    """
+
+    def test_a_claim_file_is_classified(self) -> None:
+        self.assertEqual(
+            checker.classify_path(".agents/claims/CLAIM-EXAMPLE.md"),
+            checker.classify_path(".agents/specs/example.md"),
+            "a per-claim file is the same class as the per-row spec it mirrors",
+        )
+
+    def test_the_directory_readme_is_classified(self) -> None:
+        checker.classify_path(".agents/claims/README.md")
+
+    def test_dropping_the_pattern_fails_closed(self) -> None:
+        """MUTATION: without the CLAIM pattern the path is unclassified.
+
+        Proves the added clause is load-bearing rather than shadowed by some
+        broader rule that already accepted the path.
+        """
+        with mock.patch.object(checker, "CLAIM", re.compile(r"(?!)")):
+            with self.assertRaises(ValueError):
+                checker.classify_path(".agents/claims/CLAIM-EXAMPLE.md")
+
+    def test_a_non_claim_file_in_the_directory_is_still_rejected(self) -> None:
+        """The pattern must not become a blanket exemption for the directory.
+
+        AGENTS.md forbids hiding mutable files behind a directory exemption, so
+        a non-markdown path here must still fail closed.
+        """
+        with self.assertRaises(ValueError):
+            checker.classify_path(".agents/claims/CLAIM-EXAMPLE.sh")
 
 
 if __name__ == "__main__":

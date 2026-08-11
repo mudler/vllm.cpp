@@ -141,13 +141,21 @@ per row (globbed for reading), genuinely append-only (union-mergeable), or
 derived at read time from git and GitHub. Anything else is rewritten into one of
 those three shapes.
 
-**W1 — delete `STATUS_RATCHET`.** Remove the constant, its accumulated
-justification comments, and the comparison loop at `check-public-doc-tables.py:595`.
-Retain `MAX_CELL_CHARS` and `MAX_PARAGRAPH_CHARS`: those are local to the cell or
-paragraph being edited, so they couple no two PRs. The anti-decay obligation the
-ratchet claimed is already carried by the per-cell and per-paragraph caps plus
-`check-doc-checkpoint.py`, which is what actually requires the page to move on a
-lifecycle change.
+**W1 — delete the `chars` key of `STATUS_RATCHET`.** *(Narrowed during
+implementation; the original text said delete the whole constant.)* Reading the
+checker showed the four keys are not alike. `chars` is a LENGTH, so it moves on
+every edit — that is what made it the conflict driver and a merge hotspot in 4
+of the 16 conflicting PRs. The other three (`h2_sections`, `long_paragraphs`,
+`oversized_cells`) count QUALITY DEFECTS — sections, paragraphs over
+`MAX_PARAGRAPH_CHARS`, cells over `MAX_CELL_CHARS` — so an ordinary lifecycle
+line moves none of them and two concurrent PRs do not collide on them. They are
+kept, and they carry the whole anti-decay obligation: BENCHMARKS.md's
+11,127-line decay would have tripped `long_paragraphs` and `oversized_cells`
+alone. Deleting them too would have dropped a real obligation for no conflict
+benefit, which is exactly the case this spec's stop condition names.
+
+Retain `MAX_CELL_CHARS` and `MAX_PARAGRAPH_CHARS`: local to the cell or
+paragraph being edited, so they couple no two PRs.
 
 **W2 — remove the active-claims table from `coordination.md`.** Claims are
 derived from open PRs and `row/<ID>` branch names, which are authoritative and
@@ -155,10 +163,20 @@ cannot drift from the tree. Keep the canonical hierarchy and the row contract:
 those are policy prose, edited rarely, and implicated in no conflict here.
 `scripts/agent-role.py` keeps the coordinator record it already owns.
 
-**W3 — drop `NOW.md`'s hard character budget.** The 100-line cap stays as a soft
-shape check; the byte budget goes. `NOW.md` remains a snapshot rather than a log,
-which the "snapshot, not log" structural rules and the freshness stamp already
-enforce without requiring an eviction per write.
+**W3 — drop `NOW.md`'s hard character budget.** `MAX_LINES` and
+`MAX_ENTRY_CHARS` stay and carry the obligation: a line cap bounds the page the
+same way a byte cap does, but a row costs ONE line rather than a variable number
+of bytes, and `MAX_ENTRY_CHARS` bounds each entry locally.
+
+*Correction found by the W4 regression test, recorded because the original text
+overclaimed:* removing the budget does **not**, on its own, make two concurrent
+row additions merge. Two appends land on the same anchor and conflict either way
+— that is W4's job. What the budget added on top was a forced DELETION of
+unrelated content, and that is the part with teeth. It made every PR edit lines
+it did not own, and it made a *successful* merge unsafe: git resolving two such
+branches without complaint applies both evictions, so both victims vanish and no
+gate notices. The budget was defended by losing the content it defended. W3
+removes the eviction; W4 removes the collision; neither alone is sufficient.
 
 **W4 — order the roadmap's keyed tables by ID.** Sorting the issue and portfolio
 tables by a stable key turns "append at the same anchor" into "insert at a key",

@@ -204,6 +204,27 @@ wholesale and reapplying your scoped edit; verify unrelated keys byte-for-byte.
 Union-append only genuinely append-only logs. Never accept an automatic
 three-way merge of a keyed record.
 
+**No surface that every PR must write.** If N concurrent PRs all edit file F,
+then F is a lock and the conflicts are that lock being held. A record surface is
+admissible only in one of three shapes: **one file per row**, globbed for
+reading; **genuinely append-only**, so it union-merges; or **derived at read
+time** from git and GitHub, so nobody writes it at all. Anything else gets
+rewritten into one of the three.
+
+A fixed budget on a shared file is the sharpest form of the defect, because it
+turns every addition into a read-modify-write — you must evict someone else's
+content to fit your own — and concurrent read-modify-write on one global loses
+updates. There the conflict is the *lucky* outcome: a clean three-way merge
+applies both evictions and both additions, silently dropping live content and
+blowing the budget the gate existed to defend. Cap the *entry*, never the file.
+Likewise, never store a measurement of one file inside another; a number that
+moves on every edit couples every PR to lines it does not own.
+
+Measured 2026-08-11 at `d928e2c3` (issue #364): 16 of 29 open PRs conflicted, 13
+of those in bookkeeping only, while `.agents/specs/` — one file per row — took
+zero. That is the third instance of one failure, after the `policy.csv` registry
+(`0f3e44ee`) and the per-class line budgets (2026-08-10).
+
 Compact by *moving* superseded detail into `.agents/completed/` with links and
 provenance intact. Never delete evidence to save context.
 

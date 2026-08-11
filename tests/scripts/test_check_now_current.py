@@ -80,10 +80,41 @@ class StructureContract(unittest.TestCase):
             any("line budget" in e for e in checker.structure_errors(text))
         )
 
-    def test_character_budget_is_enforced(self):
-        text = VALID + "- " + ("x" * checker.MAX_CHARS) + "\n"
-        errors = checker.structure_errors(text)
-        self.assertTrue(any("character budget" in e for e in errors), errors)
+    def test_a_row_costs_only_itself(self):
+        """The defect ENG-RECORD-CONFLICT-SURFACES (#364) removed.
+
+        RED-BEFORE: the tracked digest measured EXACTLY the old 6000-char cap,
+        so adding one row put it over and the PR had to EVICT another row --
+        someone else's -- to land. That read-modify-write on a shared global is
+        what made NOW.md conflict in 5 of 16 conflicting open PRs, and it made a
+        CLEAN merge unsafe: both evictions and both additions would apply.
+
+        A row must now cost one line and nothing else.
+        """
+        live = (ROOT / ".agents/NOW.md").read_text(encoding="utf-8")
+        self.assertEqual(checker.structure_errors(live), [])
+        row = "| `NEW-ROW` | state | next step |\n"
+        self.assertEqual(checker.structure_errors(live + row), [])
+
+    def test_two_concurrent_rows_do_not_couple(self):
+        """Two PRs adding a row each must both pass, and so must their union."""
+        live = (ROOT / ".agents/NOW.md").read_text(encoding="utf-8")
+        a = "| `ROW-A` | state | next |\n"
+        b = "| `ROW-B` | state | next |\n"
+        self.assertEqual(checker.structure_errors(live + a), [])
+        self.assertEqual(checker.structure_errors(live + b), [])
+        self.assertEqual(checker.structure_errors(live + a + b), [])
+
+    def test_the_line_budget_still_bounds_the_page(self):
+        """Removing the byte cap must not have left the page unbounded.
+
+        MAX_LINES is what carries the obligation now, so mutate the LIVE digest
+        past it and require the failure -- otherwise the removal quietly took
+        the whole size gate with it.
+        """
+        live = (ROOT / ".agents/NOW.md").read_text(encoding="utf-8")
+        grown = live + "\n".join(f"- entry {i}" for i in range(checker.MAX_LINES))
+        self.assertTrue(any("line budget" in e for e in checker.structure_errors(grown)))
 
     def test_one_oversized_entry_is_rejected(self):
         text = VALID + "- " + ("x" * (checker.MAX_ENTRY_CHARS + 1)) + "\n"
@@ -95,7 +126,7 @@ class StructureContract(unittest.TestCase):
     def test_budgets_are_small_enough_to_be_read_in_full(self):
         """A budget nobody could read in one pass is not a budget."""
         self.assertLessEqual(checker.MAX_LINES, 120)
-        self.assertLessEqual(checker.MAX_CHARS, 8000)
+        # The byte cap is gone (#364); the line cap is what bounds the read.
 
 
 class RepositoryDigest(unittest.TestCase):

@@ -400,32 +400,6 @@ class StatusRatchet(unittest.TestCase):
                     f"dropping '{label}' was not rejected",
                 )
 
-    def test_the_ratchet_is_exactly_one_byte_wide(self) -> None:
-        """A page one byte over fails and one byte under passes.
-
-        The number moved for ENG-RELEASE-CONTAINERS, which owed the page a
-        lifecycle line and paid for it inside the release paragraph. What must
-        keep holding is not the value but the shape: byte-tight, shrink-only.
-        A ratchet that tolerated one spare byte would tolerate a hundred.
-        """
-        limit = doc_tables.STATUS_RATCHET["chars"]
-        under = STATUS_VALID + "x" * (limit - len(STATUS_VALID) - 1)
-        self.assertEqual(len(under), limit - 1)
-        self.assertEqual(
-            [e for e in doc_tables.status_errors(under) if "chars is" in e], []
-        )
-        over = STATUS_VALID + "x" * (limit - len(STATUS_VALID) + 1)
-        self.assertEqual(len(over), limit + 1)
-        self.assertTrue(any("chars is" in e for e in doc_tables.status_errors(over)))
-
-    def test_growth_past_the_char_ratchet_is_rejected(self) -> None:
-        text = STATUS_VALID + "\n" + "x" * doc_tables.STATUS_RATCHET["chars"]
-        errors = doc_tables.status_errors(text)
-        self.assertTrue(any("chars is" in error for error in errors), errors)
-        self.assertTrue(
-            any("structured state evidence" in error for error in errors), errors
-        )
-
     def test_growth_past_the_section_ratchet_is_rejected(self) -> None:
         extra = "\n".join(
             f"## Extra {i}\n\nprose\n" for i in range(doc_tables.STATUS_RATCHET["h2_sections"] + 1)
@@ -447,69 +421,83 @@ class StatusRatchet(unittest.TestCase):
         errors = doc_tables.status_errors(STATUS_VALID + "\n\n| a | b |\n|---|---|\n" + rows)
         self.assertTrue(any("oversized cells is" in e for e in errors))
 
+    def test_a_lifecycle_line_costs_no_unrelated_deletion(self) -> None:
+        """The defect ENG-RECORD-CONFLICT-SURFACES (#364) removed.
+
+        This is the RED-BEFORE case. With the `chars` key in place it failed:
+        a page that gained one ordinary lifecycle line was over its byte
+        ratchet, so the PR had to find the bytes by deleting prose from some
+        UNRELATED row and re-pin the constant in the checker. That is what
+        coupled every concurrent PR to lines it did not own and made both
+        docs/STATUS.md and this checker merge hotspots.
+
+        A lifecycle line is the most ordinary edit this page takes. It must
+        cost nothing but itself.
+        """
+        line = "| New capability | Works |\n"
+        grown = STATUS_VALID + "\n" + line
+        self.assertEqual(doc_tables.status_errors(grown), [])
+
+        # And on the LIVE page, which is the case that actually failed.
+        live = doc_tables.STATUS.read_text(encoding="utf-8")
+        self.assertEqual(doc_tables.status_errors(live + line), [])
+
+    def test_two_concurrent_lifecycle_lines_do_not_couple(self) -> None:
+        """Two PRs adding a row each must both pass, independently.
+
+        The byte ratchet made this impossible by construction: whichever landed
+        second was over the number the first had re-pinned, so it had to be
+        rebased and re-paid even though the two edits touch nothing in common.
+        Asserting BOTH arms and their union is what proves the coupling is gone
+        rather than merely relaxed for one of them.
+        """
+        live = doc_tables.STATUS.read_text(encoding="utf-8")
+        a = "| Capability A | Works |\n"
+        b = "| Capability B | Works |\n"
+        self.assertEqual(doc_tables.status_errors(live + a), [])
+        self.assertEqual(doc_tables.status_errors(live + b), [])
+        self.assertEqual(doc_tables.status_errors(live + a + b), [])
+
+    def test_the_retained_keys_still_bind_on_the_live_page(self) -> None:
+        """Removing `chars` must not have quietly disarmed the other three.
+
+        Each retained key counts a QUALITY defect rather than a length, so this
+        mutates the LIVE page past each one in turn and requires a failure. If a
+        later edit lands the page on a cap, this goes red instead of the cap
+        silently ceasing to bind.
+        """
+        live = doc_tables.STATUS.read_text(encoding="utf-8")
+        self.assertEqual(doc_tables.status_errors(live), [])
+
+        over_sections = live + "\n" + "\n".join(
+            f"## Extra {i}\n\nprose\n"
+            for i in range(doc_tables.STATUS_RATCHET["h2_sections"] + 1)
+        )
+        self.assertTrue(
+            any("h2 sections is" in e for e in doc_tables.status_errors(over_sections))
+        )
+
+        para = "y" * (doc_tables.MAX_PARAGRAPH_CHARS + 1)
+        over_paras = live + "\n\n" + "\n\n".join(
+            [para] * (doc_tables.STATUS_RATCHET["long_paragraphs"] + 1)
+        )
+        self.assertTrue(
+            any("long paragraphs is" in e for e in doc_tables.status_errors(over_paras))
+        )
+
+        cell = "z" * (doc_tables.MAX_CELL_CHARS + 1)
+        over_cells = live + "\n\n| a | b |\n|---|---|\n" + "\n".join(
+            f"| {cell} | {cell} |"
+            for _ in range(doc_tables.STATUS_RATCHET["oversized_cells"] + 1)
+        )
+        self.assertTrue(
+            any("oversized cells is" in e for e in doc_tables.status_errors(over_cells))
+        )
+
     def test_the_live_page_is_inside_its_ratchet(self) -> None:
         self.assertEqual(
             doc_tables.status_errors(doc_tables.STATUS.read_text(encoding="utf-8")), []
         )
-
-    def test_the_char_ratchet_is_not_slack(self) -> None:
-        """Headroom is not a growth budget.
-
-        The cheap way out of a red char ratchet is to RAISE the number instead
-        of shrinking the page, and the gate then measures nothing. Bounding the
-        slack means clearing it still costs a real collapse.
-        """
-        live = len(doc_tables.STATUS.read_text(encoding="utf-8"))
-        slack = doc_tables.STATUS_RATCHET["chars"] - live
-        self.assertGreaterEqual(slack, 0, "the live page is already over its ratchet")
-        self.assertLessEqual(slack, 2000, "ratchet headroom is cover for bloat")
-
-    def test_a_repin_can_only_tighten_the_char_ratchet(self) -> None:
-        """A re-pin must move the ratchet DOWN, and must still bind afterwards.
-
-        The Muse Glimmer speed entry (#333) took this page 243287 -> 243283 by
-        collapsing a duplicated Qwen3.5-4B paragraph to pay for its own line.
-        That is the only legitimate shape of a re-pin: the page shrank, so the
-        number shrank with it.
-
-        The failure this guards is the opposite move -- raising the constant to
-        make room -- which turns a shrink-only ratchet into a growth budget and
-        silently stops measuring anything. Proven by mutation in both
-        directions: a ratchet below the live page must be an error, and one
-        inflated above it must be caught as slack.
-        """
-        live = len(doc_tables.STATUS.read_text(encoding="utf-8"))
-        pinned = doc_tables.STATUS_RATCHET["chars"]
-
-        # The pin binds: it is at or above the page, but not by much.
-        self.assertGreaterEqual(pinned, live)
-        self.assertLessEqual(pinned - live, 2000)
-
-        # DOWN past the page: must be rejected.
-        with mock.patch.dict(doc_tables.STATUS_RATCHET, {"chars": live - 1}):
-            errors = doc_tables.status_errors(
-                doc_tables.STATUS.read_text(encoding="utf-8")
-            )
-            self.assertTrue(
-                any("char" in error for error in errors),
-                "a ratchet below the live page has to be an error",
-            )
-
-        # UP well past the page: the slack bound is what catches an inflated
-        # re-pin, so assert it would fire rather than trusting the constant.
-        self.assertGreater(
-            (live + 5000) - live, 2000, "an inflated re-pin must exceed the slack bound"
-        )
-
-    def test_the_live_page_keeps_the_character_ratchet_tight(self) -> None:
-        text = doc_tables.STATUS.read_text(encoding="utf-8")
-        slack = doc_tables.STATUS_RATCHET["chars"] - len(text)
-        self.assertGreaterEqual(slack, 0)
-        self.assertLessEqual(slack, 25)
-
-    def test_the_rebased_character_ratchet_is_byte_tight(self) -> None:
-        text = doc_tables.STATUS.read_text(encoding="utf-8")
-        self.assertEqual(doc_tables.STATUS_RATCHET["chars"], len(text))
 
     def test_a_retired_claim_cannot_come_back_for_free(self) -> None:
         """A claim the page RETIRED must cost something to reinstate.
@@ -517,7 +505,8 @@ class StatusRatchet(unittest.TestCase):
         The ratchet is what makes a deletion permanent. #277 paid for its STATUS
         edit by deleting two claims that had become false -- that `/metrics` has
         no live async backing, once in the OpenAI-server row and once in the
-        metrics paragraph -- and lowered the char ratchet by the same 30 bytes.
+        metrics paragraph. The char ratchet it also lowered is gone (#364);
+        the deletion obligation asserted here is not.
 
         Two things are asserted, and neither is the byte-tightness above.
         First, the retired wording is genuinely GONE: a page that still says
@@ -558,12 +547,14 @@ class StatusRatchet(unittest.TestCase):
             "the mutation must actually re-add the retired claims; if the "
             "anchors stopped matching, this test is asserting nothing",
         )
-        errors = doc_tables.status_errors(restored)
-        self.assertTrue(
-            any("chars is" in error for error in errors),
-            "reinstating the retired claims must break the char ratchet, "
-            f"otherwise the deletion bought free headroom; got {errors}",
-        )
+        # The char ratchet used to be the second half of this test: reinstating
+        # the claims had to break it. That half is gone with the ratchet
+        # (ENG-RECORD-CONFLICT-SURFACES, #364) and is deliberately NOT replaced
+        # by a weaker assertion, because it was never what made the claim false
+        # -- no size gate can tell a true sentence from a lying one. What
+        # survives is the obligation that actually mattered and that the ratchet
+        # never carried: the retired wording is gone from the live page.
+        self.assertEqual(doc_tables.status_errors(restored), [])
 
     def test_the_status_ratchet_only_ever_moves_down(self) -> None:
         """A ratchet that can be RAISED is a budget with extra steps.
@@ -572,11 +563,11 @@ class StatusRatchet(unittest.TestCase):
         the page measured ... and may only go DOWN" -- and nothing enforced it.
         Every other ratchet test here measures the LIVE page, so raising a cap
         and growing the page by the same amount in one change is green in all of
-        them: measured 2026-08-10, `"chars": 243584 -> 243684` plus 100 chars
-        appended to docs/STATUS.md left this module at 52/52 OK. That is exactly
-        the cheap way out the ratchet exists to block, and every STATUS edit
-        touches this number, so it is the number most likely to drift upward
-        unnoticed.
+        them: raising a cap and growing the page by the same amount in one
+        change was green in all of them. That is the cheap way out the ratchet
+        exists to block. The `chars` key it was written for is gone (#364) --
+        it was the one every STATUS edit touched, which is what made it a merge
+        hotspot -- and the guard still binds the three that remain.
 
         STATUS_RATCHET_CEILING is the ratchet as it stands. Lowering a cap keeps
         passing; raising one fails here and can only be unblocked by editing the
@@ -585,7 +576,6 @@ class StatusRatchet(unittest.TestCase):
         243584 over 48 commits), so the ceiling never needs to rise.
         """
         ceiling = {
-            "chars": 243578,
             "h2_sections": 11,
             "long_paragraphs": 82,
             "oversized_cells": 44,
@@ -606,87 +596,3 @@ class StatusRatchet(unittest.TestCase):
                     "narrative instead, and lower this ceiling in the same "
                     "change that lowers the ratchet -- never the reverse",
                 )
-
-    def test_the_repin_was_paid_for_by_a_real_collapse(self) -> None:
-        # Lowering the cap is the honest half of "STATUS may only shrink"; the
-        # dishonest half is lowering it after growing the page and calling the
-        # difference rounding. The 2026-08-09 prompt-logprobs re-pin added a
-        # Sampling clause and paid for it by collapsing three restatements in the
-        # same row.
-        #
-        # So assert the payment, not the arithmetic: put the collapsed text back
-        # and the page must break the cap it is pinned to. If a later edit
-        # quietly restores that prose, this goes red rather than the slack being
-        # silently re-spent.
-        text = doc_tables.STATUS.read_text(encoding="utf-8")
-        restored = text.replace(
-            "); the C-ABI beam",
-            "), so beam search runs on the real server (the C-ABI beam",
-            1,
-        ).replace(
-            "beams are stepped sequentially).",
-            "beams are stepped sequentially, byte-identical to the sync driver).",
-            1,
-        )
-        self.assertNotEqual(restored, text, "the collapsed prose is not where it was")
-        self.assertGreater(len(restored), doc_tables.STATUS_RATCHET["chars"])
-
-    def test_the_logprobs_mode_repin_was_paid_for(self) -> None:
-        # Same contract as the other re-pin guards: the cap may only come down,
-        # and the reduction must be a real collapse rather than a growth budget.
-        # The 2026-08-10 logprobs_mode line was paid for by dropping the best_of
-        # cell's upstream rationale. Restore it and the page must break its cap,
-        # so a later edit cannot quietly put the prose back and re-spend the
-        # slack.
-        #
-        # This guard and test_the_repin_was_paid_for_by_a_real_collapse above
-        # cover DIFFERENT collapses in the SAME row (#238's best_of rationale,
-        # #223's beam-search restatements). They are complementary, not
-        # alternatives: dropping either one would leave its collapse unguarded.
-        text = doc_tables.STATUS.read_text(encoding="utf-8")
-        restored = text.replace(
-            "`best_of==n` is the default no-op).",
-            "`best_of==n` is the default no-op) \u2014 vLLM 0.26 itself has dropped "
-            "`best_of` from its live path, so this follows the classic OpenAI contract.",
-            1,
-        )
-        self.assertNotEqual(restored, text, "the collapsed rationale is not where it was")
-        self.assertGreater(len(restored), doc_tables.STATUS_RATCHET["chars"])
-
-    def test_the_ratchet_carries_no_hidden_headroom(self) -> None:
-        # A ratchet parked well above the page it guards is not a ratchet: it
-        # silently licenses regrowth up to the old number. The rule is "lower it
-        # in the same change", so the cap must track the page rather than trail
-        # it. This caught the real case -- collapsing one 33,211-char row left
-        # 32,728 chars of slack that would otherwise have been free to re-spend.
-        text = doc_tables.STATUS.read_text(encoding="utf-8")
-        headers = [line for line in text.split("\n") if line.startswith("## ")]
-        measured = {
-            "chars": len(text),
-            "h2_sections": len(headers),
-            "long_paragraphs": sum(
-                1
-                for _, para in doc_tables._prose_paragraphs(text)
-                if len(para) > doc_tables.MAX_PARAGRAPH_CHARS
-            ),
-            "oversized_cells": sum(
-                1
-                for _, cells in doc_tables._table_rows(text)
-                for cell in cells
-                if len(cell) > doc_tables.MAX_CELL_CHARS
-            ),
-        }
-        for key, cap in doc_tables.STATUS_RATCHET.items():
-            with self.subTest(metric=key):
-                self.assertLessEqual(measured[key], cap)
-                # 1% of slack absorbs an in-flight edit; more than that is a cap
-                # that stopped describing the page.
-                self.assertLessEqual(
-                    cap - measured[key],
-                    max(1, cap // 100),
-                    f"{key} ratchet {cap} sits {cap - measured[key]} above the "
-                    f"measured {measured[key]}; lower it in the change that shrank "
-                    "the page",
-                )
-if __name__ == "__main__":
-    unittest.main()

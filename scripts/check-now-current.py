@@ -27,8 +27,25 @@ NOW_PATH = ".agents/NOW.md"
 # Budgets. NOW.md exists to be read in full, every session, by every agent. The
 # moment it stops fitting in one screenful of attention it has become the thing
 # it was meant to replace.
+#
+# MAX_CHARS WAS REMOVED 2026-08-11 (ENG-RECORD-CONFLICT-SURFACES, #364). It was
+# 6000, and the tracked file measured EXACTLY 6000: tuned to the byte, with no
+# headroom at all. That made adding a row require EVICTING one, so every PR
+# performed a read-modify-write of a single shared global, and NOW.md conflicted
+# in 5 of the 16 conflicting open PRs measured at origin/main d928e2c3.
+#
+# The conflict was the LUCKY outcome. Concurrent read-modify-write loses
+# updates: a clean three-way merge of two such PRs applies BOTH evictions and
+# BOTH additions, silently dropping two live rows and blowing the very budget
+# this constant existed to defend. A gate whose SUCCESS mode is unsafe is worse
+# than no gate.
+#
+# MAX_LINES and MAX_ENTRY_CHARS are KEPT and carry the obligation between them.
+# A line cap bounds the page just as a byte cap does, but a row costs ONE line
+# rather than a variable number of bytes, so an ordinary edit no longer forces
+# an unrelated deletion; and MAX_ENTRY_CHARS bounds each entry LOCALLY, which is
+# what actually stops a digest decaying into the status log it replaced.
 MAX_LINES = 100
-MAX_CHARS = 6000
 MAX_ENTRY_CHARS = 400
 
 REQUIRED_HEADINGS = (
@@ -65,12 +82,6 @@ def structure_errors(text: str) -> list[str]:
             f"is {len(lines)} lines, over the {MAX_LINES}-line budget; move "
             "detail to the row's spec and keep only the live position here"
         )
-    if len(text) > MAX_CHARS:
-        errors.append(
-            f"is {len(text)} characters, over the {MAX_CHARS}-character budget; "
-            "this is a digest, not a status log"
-        )
-
     for line in lines:
         stripped = line.strip()
         if stripped.startswith(("-", "|")) and len(stripped) > MAX_ENTRY_CHARS:

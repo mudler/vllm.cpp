@@ -139,6 +139,21 @@ them, and each arm asserted its own kernel identity before building — matching
 tokens, because the fixed kernel's comment cites both by name and a token grep
 reports the fixed tree as the old one.
 
+**Post-merge re-run.** `origin/main` advanced 17 commits (including the Mamba2 SSD
+work) between the RED/GREEN pair and landing, so the device suite was rebuilt and
+re-run from the *merged* tree rather than trusting the pre-merge green:
+
+```
+[doctest] test cases:    23 |    23 passed | 0 failed | 0 skipped
+[doctest] assertions: 83913 | 83913 passed | 0 failed |
+[doctest] Status: SUCCESS!
+```
+
+with the mandatory fast path hard-verified in that run's own configure log —
+`CUTLASS found at /home/mudler/cutlass-4.5.0; enabling sm120a NVFP4 cutlass GEMM`
+and `FlashAttention-2 prefill/decode: ENABLED for arch(es) [121a]` — and
+`--list-test-cases` confirming all 3 new cases in the built binary.
+
 Process note: the first attempt at both arms was lost to `client_loop: send
 disconnect: Broken pipe` while queued on the GPU lock. The harness reported the
 ssh as exit 0 while no DONE marker existed — the wrapper exited, the script never

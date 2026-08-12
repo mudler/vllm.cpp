@@ -2073,6 +2073,86 @@ TEST_CASE("MoeRouterTopK matches the CPU oracle (f32 and bf16 logits)") {
   }
 }
 
+TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, shuffled blocks)") {
+  // The "paged attention" case above hand-builds a contiguous KV cache; the
+  // real model path writes it with ReshapeAndCache and reads it back. This
+  // case is that composition, at real model dims (Dh=256, Hq=8, Hkv=2,
+  // block_size 16), a shuffled block table, and a non-sequential slot mapping
+  // — the layout a stride/scatter bug would live in and the contiguous case
+  // cannot see.
+  constexpr int64_t T = 20, Hq = 8, Hkv = 2, Dh = 256, BS = 16;
+  constexpr int64_t kBlocks = 4;                 // 4 blocks x 16 slots = 64 >= 20
+  constexpr int64_t qstride = Hq * Dh + 64;      // padded row (fused-view shape)
+  const size_t qn = static_cast<size_t>(T) * qstride;
+  const size_t kvn = static_cast<size_t>(T) * Hkv * Dh;
+  const size_t cachen = static_cast<size_t>(kBlocks) * BS * Hkv * Dh;
+  const std::vector<float> q = RandomVec(qn, 711);
+  const std::vector<float> k = RandomVec(kvn, 712);
+  const std::vector<float> v = RandomVec(kvn, 713);
+  // Non-sequential slot mapping (reverse-ish) to exercise the scatter.
+  std::vector<int64_t> slots(T);
+  for (int64_t i = 0; i < T; ++i) slots[i] = (i * 7 + 3) % (kBlocks * BS);
+  std::vector<int32_t> block_table = {3, 1, 2, 0};  // shuffled physical blocks
+  std::vector<int32_t> seq_lens = {T};
+  std::vector<int32_t> qsl = {0, T};
+  vt::PagedAttentionArgs pa;
+  pa.scale = 1.0f / std::sqrt(static_cast<float>(Dh));
+  pa.causal = true;
+
+  std::vector<float> ref_out(static_cast<size_t>(T) * Hq * Dh, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> q_host = q, ck = k, cv = v;
+    std::vector<float> ckc(cachen, 0.0f), cvc(cachen, 0.0f);
+    std::vector<int64_t> cslots = slots;
+    std::vector<int32_t> cbt = block_table, csl = seq_lens, cqsl = qsl;
+    Tensor tq = Tensor::Contiguous(q_host.data(), DType::kF32, cd, {T, Hq, Dh});  // contiguous (op contract)
+    Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {T, Hkv, Dh});
+    Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {T, Hkv, Dh});
+    Tensor tkc = Tensor::Contiguous(ckc.data(), DType::kF32, cd, {kBlocks, BS, Hkv, Dh});
+    Tensor tvc = Tensor::Contiguous(cvc.data(), DType::kF32, cd, {kBlocks, BS, Hkv, Dh});
+    Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {T});
+    vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
+    Tensor tbt = Tensor::Contiguous(cbt.data(), DType::kI32, cd, {1, kBlocks});
+    Tensor tsl = Tensor::Contiguous(csl.data(), DType::kI32, cd, {1});
+    Tensor tqsl = Tensor::Contiguous(cqsl.data(), DType::kI32, cd, {2});
+    Tensor to = Tensor::Contiguous(ref_out.data(), DType::kF32, cd, {T, Hq, Dh});
+    vt::PagedAttention(cq, to, tq, tkc, tvc, tbt, tsl, tqsl, pa);
+    cpu.DestroyQueue(cq);
+  }
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kPagedAttention, dt) || !OpAvailable(vt::OpId::kReshapeAndCache, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q_ = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dq(dev, q_, qn), dk(dev, q_, kvn), dv(dev, q_, kvn),
+        dkc(dev, q_, cachen), dvc(dev, q_, cachen), dout(dev, q_, static_cast<size_t>(T) * Hq * Dh);
+    DevBufBytes dsm(dev, q_, T * 8), dbt(dev, q_, kBlocks * 4), dsl_(dev, q_, 4), dqsl(dev, q_, 8);
+    dq.Upload(q); dk.Upload(k); dv.Upload(v);
+    dkc.Upload(std::vector<float>(cachen, 0.0f)); dvc.Upload(std::vector<float>(cachen, 0.0f));
+    dsm.Upload(slots.data()); dbt.Upload(block_table.data());
+    dsl_.Upload(seq_lens.data()); dqsl.Upload(qsl.data());
+    Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {T, Hq, Dh});  // contiguous (op contract)
+    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {T, Hkv, Dh});
+    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {T, Hkv, Dh});
+    Tensor tkc = Tensor::Contiguous(dkc.ptr(), DType::kF32, d, {kBlocks, BS, Hkv, Dh});
+    Tensor tvc = Tensor::Contiguous(dvc.ptr(), DType::kF32, d, {kBlocks, BS, Hkv, Dh});
+    Tensor tsm = Tensor::Contiguous(dsm.ptr(), DType::kI64, d, {T});
+    vt::ReshapeAndCache(q_, tk, tv, tkc, tvc, tsm);
+    Tensor tbt = Tensor::Contiguous(dbt.ptr(), DType::kI32, d, {1, kBlocks});
+    Tensor tsl = Tensor::Contiguous(dsl_.ptr(), DType::kI32, d, {1});
+    Tensor tqsl = Tensor::Contiguous(dqsl.ptr(), DType::kI32, d, {2});
+    Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, Hq, Dh});
+    vt::PagedAttention(q_, to, tq, tkc, tvc, tbt, tsl, tqsl, pa);
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+    dev.DestroyQueue(q_);
+  }
+}
+
+
 TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
   constexpr int64_t kRows = 7, kCols = 48;
   constexpr size_t kN = kRows * kCols;

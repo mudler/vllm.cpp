@@ -2073,6 +2073,96 @@ TEST_CASE("MoeRouterTopK matches the CPU oracle (f32 and bf16 logits)") {
   }
 }
 
+// Scalar bf16 RNE round-trip helpers for host-side oracles (the MoE combine
+// gate reference rounds the shared term through bf16 exactly like the kernel).
+static uint16_t F32ToBf16Rne(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  return static_cast<uint16_t>((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
+static float Bf16ToF32(uint16_t b) {
+  uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+TEST_CASE("MoE combine/gate ops match the CPU oracle") {
+  // SharedExpertGate (sigmoid*mul), MoeCombine (weighted expert sum +/-
+  // shared), MoeCombineGate (combine + folded shared gate). f32 and bf16 arms.
+  constexpr int64_t T = 5, H = 64, K = 3;
+  const size_t en = static_cast<size_t>(T) * K * H, on = static_cast<size_t>(T) * H;
+  const std::vector<float> eo = RandomVec(en, 911);
+  const std::vector<float> w = RandomVec(static_cast<size_t>(T) * K, 912, 0.0f, 1.0f);
+  const std::vector<float> sd = RandomVec(on, 913);
+  const std::vector<float> gl = RandomVec(static_cast<size_t>(T), 914);
+
+  for (DeviceType dt : RegisteredDevices()) {
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    // CPU oracle for all three, f32.
+    std::vector<uint16_t> ref_sg_b(on, 0);
+  std::vector<float> ref_c(on), ref_cg(on);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> csd = sd, cgl = gl, ceo = eo, cw = w;
+      Tensor tout = Tensor::Contiguous(ref_sg_b.data(), DType::kBF16, cd, {T, H});
+      Tensor tsd = T2(csd.data(), cd, T, H);
+      Tensor tgl = T1(cgl.data(), cd, T);
+      if (OpAvailable(vt::OpId::kSharedExpertGate, DeviceType::kCPU))
+        vt::SharedExpertGate(cq, tout, tsd, tgl);
+      Tensor teo = Tensor::Contiguous(ceo.data(), DType::kF32, cd, {T, K, H});
+      Tensor tw = T2(cw.data(), cd, T, K);
+      Tensor to2 = T2(ref_c.data(), cd, T, H);
+      if (OpAvailable(vt::OpId::kMoeCombine, DeviceType::kCPU))
+        vt::MoeCombine(cq, to2, teo, tw, &tsd);
+      cpu.DestroyQueue(cq);
+      // MoeCombineGate has no CPU op registration; the oracle is the composite
+      // computed on host: MoeCombine (no shared) + bf16-round(sigmoid(gl)*sd).
+      for (int64_t r = 0; r < T; ++r) {
+        const float g = 1.0f / (1.0f + std::exp(-gl[static_cast<size_t>(r)]));
+        for (int64_t c2 = 0; c2 < H; ++c2) {
+          float acc = 0.0f;
+          for (int64_t j = 0; j < K; ++j)
+            acc += w[static_cast<size_t>(r * K + j)] * eo[static_cast<size_t>((r * K + j) * H + c2)];
+          const float sv = g * sd[static_cast<size_t>(r * H + c2)];
+          const uint16_t svb = F32ToBf16Rne(sv);
+          acc += Bf16ToF32(svb);
+          ref_cg[static_cast<size_t>(r * H + c2)] = acc;
+        }
+      }
+    }
+    // device
+    DevBuf deo(dev, q, en), dw(dev, q, T * K), dsd(dev, q, on), dgl(dev, q, T), dout(dev, q, on);
+    DevBufBytes doutb(dev, q, on * 2);
+    deo.Upload(eo); dw.Upload(w); dsd.Upload(sd); dgl.Upload(gl);
+    Tensor teo = Tensor::Contiguous(deo.ptr(), DType::kF32, d, {T, K, H});
+    Tensor tw = T2(dw.ptr(), d, T, K);
+    Tensor tsd = T2(dsd.ptr(), d, T, H);
+    Tensor tgl = T1(dgl.ptr(), d, T);
+    Tensor tout = T2(dout.ptr(), d, T, H);
+    if (OpAvailable(vt::OpId::kSharedExpertGate, dt)) {
+      Tensor toutb = Tensor::Contiguous(doutb.ptr(), DType::kBF16, d, {T, H});
+      vt::SharedExpertGate(q, toutb, tsd, tgl);
+      std::vector<uint16_t> gotb(on);
+      doutb.Download(gotb.data());
+      CHECK(gotb == ref_sg_b);  // both sides store bf16: bit-exact
+    }
+    if (OpAvailable(vt::OpId::kMoeCombine, dt)) {
+      vt::MoeCombine(q, tout, teo, tw, &tsd);
+      CHECK(Nmse(ref_c, dout.Download()) <= kNmseTol);
+    }
+    if (OpAvailable(vt::OpId::kMoeCombineGate, dt)) {
+      vt::MoeCombineGate(q, tout, teo, tw, tsd, tgl);
+      CHECK(Nmse(ref_cg, dout.Download()) <= kNmseTol);
+    }
+    dev.DestroyQueue(q);
+  }
+}
+
 TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
   constexpr int64_t kRows = 7, kCols = 48;
   constexpr size_t kN = kRows * kCols;

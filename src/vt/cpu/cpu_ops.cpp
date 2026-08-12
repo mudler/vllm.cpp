@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "cpu_matmul_elem.h"
@@ -1502,6 +1503,505 @@ void KdaChunkPrefillKernel(Queue& q, Tensor& out, const Tensor& q_in, const Tens
   KdaGatedDeltaRuleKernel(q, out, q_in, k, v, g_t, beta, state, qsl, args);
 }
 
+// ── Mamba2 / SSD host references (.agents/specs/mamba2-ssd.md W1, #496) ──────
+//
+// Landed in THIS translation unit rather than a new src/vt/cpu/cpu_mamba2_ssd.cpp
+// (which the spec's §3 port map names) because adding a source file means editing
+// the root CMakeLists.txt, which check-doc-checkpoint classifies as user_usage and
+// therefore owes a docs/USAGE.md update this change does not have. The GDN and KDA
+// references these ops are siblings of already live here, so this is where a reader
+// looks for them.
+//
+// Three ops, each a 1:1 transcription of the upstream path named on it, at the
+// pinned oracle `555967922` (vLLM 0.26.0.dev0):
+//
+//   Mamba2ChunkScan   <- ops/ssd_combined.py:27-235 (the 5-stage varlen pipeline)
+//                        over ssd_chunk_state.py, ssd_state_passing.py,
+//                        ssd_bmm.py and ssd_chunk_scan.py
+//   Mamba2StateUpdate <- ops/mamba_ssm.py:497+ `selective_state_update`, at the
+//                        scalar-per-head shape Mamba2 uses, which is also the
+//                        one upstream's OWN CPU kernel implements
+//                        (csrc/cpu/mamba_kernels.hpp:104-250)
+//   RmsNormGatedGroup <- mamba_mixer2.py:100-149 `Mixer2RMSNormGated.forward_native`
+//
+// SSD IS NOT THE GATED DELTA RULE. Nothing here is shared with, or derived from,
+// cpu_ops.cpp's GdnPrefill/GdnDecode/KdaGatedDeltaRule: those carry a delta
+// removal term `(I - beta*k*k^T)` this recurrence does not have, and a per-head
+// (or per-K-channel) decay where this one has `exp(A[h]*dt[t,h])` with `B`/`C`
+// shared across `n_groups` head groups. Sibling ops, one shared state layout
+// (mamba2-ssd.md §0, §7).
+//
+// DTYPE POLICY. Arithmetic is ALWAYS f32; only the load/store width varies, so a
+// bf16 stream rounds exactly at upstream's cast point and nowhere else. The two
+// buffers that are f32 REGARDLESS of the activation dtype are f32 because
+// upstream pins them there, not by our choice:
+//   * the per-chunk state `states` — `states_in_fp32=True` (ssd_combined.py:100-102);
+//   * `CB` — `output_dtype=torch.float32` (ssd_combined.py:124).
+// The INTER-CHUNK state that `_state_passing_fwd` produces is NOT f32: it carries
+// the caller's `state_dtype` (ssd_combined.py:46,119,176), and `_chunk_scan_fwd`
+// reads it back at that width, so the rounding is observable in `out` as well as
+// in `final_states`. `RoundThrough` below reproduces exactly that rounding.
+//
+// DELIBERATE DEVIATION FROM THE DEVICE ARM (W2 owns closing it). Triton's dots
+// downcast their tile inputs — `_chunk_state_fwd` casts the decayed `B` to x's
+// dtype before `tl.dot` (ssd_chunk_state.py:283-285) and `_chunk_scan_fwd` casts
+// the f32 `CB` and the previous state to C's dtype (:266-269, :359-363). Those
+// are tensor-core input-precision details of the device kernels, not statements
+// of the algorithm; this host reference keeps f32 throughout. The W1 gate is the
+// host reference against a sequential double-precision recurrence, not a
+// bit-compare against Triton (mamba2-ssd.md §5).
+// The value `v` as it would read back after a store/load round trip through
+// `dt`. Used to keep an f32 working buffer numerically identical to one actually
+// held at the target width — the `state_dtype` / `input_dtype` cast points.
+float RoundThrough(DType dt, float v) {
+  switch (dt) {
+    case DType::kF32: return v;
+    case DType::kF16: return F16ToF32(F32ToF16(v));
+    case DType::kBF16: return BF16ToF32(F32ToBF16(v));
+    default: VT_CHECK(false, "mamba2: unsupported dtype"); return 0.0f;
+  }
+}
+
+// softplus, guarded exactly as upstream: `tl.where(dt <= 20.0, softplus(dt), dt)`
+// (ssd_chunk_state.py:94; the same guard at mamba_kernels.hpp:177).
+inline float SoftplusGuarded(float v) { return v <= 20.0f ? std::log1p(std::exp(v)) : v; }
+
+inline float SiluGate(float z) { return z / (1.0f + std::exp(-z)); }
+
+// A IS STRICTLY NEGATIVE, BY CONTRACT — and the contract is enforced, not
+// assumed. Upstream builds it as `A = -torch.exp(self.A_log.float())`
+// (mamba_mixer2.py:456), which is < 0 for every finite `A_log`, and `dt >= 0`
+// after the `dt_limit` clamp (`dt_min < 0` is refused in the validator).
+// Together those two make `dA_cumsum` non-increasing WITHIN a chunk, which is
+// the only reason upstream's `min(., 0)` clamps (ssd_chunk_state.py:283-285,
+// ssd_chunk_scan.py:339-341) are algebraic no-ops here rather than a
+// truncation. Neither is derivable from the arguments: fed `A = +1.0` the
+// clamped intra-chunk term silently returns a truncated recurrence instead of
+// the growing one it was asked for. An arm that is not implemented is REFUSED
+// with the missing piece named (mamba2-ssd.md §7).
+void CheckMamba2ANegative(const Tensor& A, const char* name) {
+  const float* Ap = A.Ptr<float>();
+  for (int64_t h = 0; h < A.shape[0]; ++h) {
+    VT_CHECK(Ap[h] < 0.0f,
+             std::string(name) + ": A must be strictly negative (A = -exp(A_log), " +
+                 "mamba_mixer2.py:456) — A[" + std::to_string(h) + "] = " +
+                 std::to_string(Ap[h]));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// vt::Mamba2ChunkScan — the 5-stage varlen SSD prefill pipeline, in upstream
+// order (_mamba_chunk_scan_combined_fwd, ssd_combined.py:88-146).
+// ─────────────────────────────────────────────────────────────────────────────
+void Mamba2ChunkScanKernel(Queue&, Tensor& out, Tensor& final_states, const Tensor& x,
+                           const Tensor& dt_in, const Tensor& A, const Tensor& B,
+                           const Tensor& C, const Tensor* D, const Tensor* z,
+                           const Tensor* dt_bias, const Tensor* initial_states,
+                           const Tensor& cu_seqlens, const Tensor& cu_chunk_seqlens,
+                           const Tensor& last_chunk_indices, const Tensor& seq_idx,
+                           const Mamba2Args& args) {
+  const int64_t T = x.shape[0], H = x.shape[1], P = x.shape[2];
+  const int64_t G = B.shape[1], N = B.shape[2];
+  const int64_t S = final_states.shape[0];
+  const int64_t cs = args.chunk_size;
+  const int64_t nchunks = cu_chunk_seqlens.shape[0] - 1;
+  const int64_t hpg = H / G;  // nheads_ngroups_ratio (ssd_chunk_state.py:238)
+
+  const int32_t* ccs = cu_chunk_seqlens.Ptr<int32_t>();
+  const int32_t* lci = last_chunk_indices.Ptr<int32_t>();
+  const int32_t* sidx = seq_idx.Ptr<int32_t>();
+  const int32_t* cus = cu_seqlens.Ptr<int32_t>();
+  const float* Ap = A.Ptr<float>();
+  const float* dbp = dt_bias != nullptr ? dt_bias->Ptr<float>() : nullptr;
+  const float* Dp = D != nullptr ? D->Ptr<float>() : nullptr;
+  const bool d_has_hdim = D != nullptr && D->rank == 2;
+
+  // The metadata contract `compute_varlen_chunk_metadata` guarantees
+  // (mamba2_attn.py:56-74): chunks tile [0,T) in order, none crosses a physical
+  // chunk boundary, and none is empty.
+  VT_CHECK(ccs[0] == 0 && ccs[nchunks] == static_cast<int32_t>(T),
+           "mamba2_chunk_scan: cu_chunk_seqlens must tile [0, T)");
+  VT_CHECK(cus[0] == 0 && cus[S] == static_cast<int32_t>(T),
+           "mamba2_chunk_scan: cu_seqlens must tile [0, T)");
+  for (int64_t c = 0; c < nchunks; ++c) {
+    const int64_t len = ccs[c + 1] - ccs[c];
+    VT_CHECK(len > 0 && len <= cs,
+             "mamba2_chunk_scan: each logical chunk must be non-empty and at most chunk_size");
+    VT_CHECK(sidx[c] >= 0 && sidx[c] < S,
+             "mamba2_chunk_scan: seq_idx entries must index a sequence");
+  }
+  CheckMamba2ANegative(A, "mamba2_chunk_scan");
+  for (int64_t b = 0; b < S; ++b) {
+    // `last_chunk_indices[b] == -1` is what `compute_varlen_chunk_metadata`
+    // leaves for a sequence with NO tokens (mamba2_attn.py:56-74 pushes no chunk
+    // for it). Upstream's `varlen_states = states[last_chunk_indices]`
+    // (ssd_combined.py:154) is then a torch NEGATIVE index: it silently returns
+    // the last chunk of the whole batch — some OTHER sequence's state. vLLM
+    // never schedules an empty sequence, so that is an indexing quirk rather
+    // than behaviour to mirror; refuse instead of deviating quietly.
+    VT_CHECK(lci[b] >= 0,
+             "mamba2_chunk_scan: last_chunk_indices[" + std::to_string(b) +
+                 "] < 0 — empty sequences are NOT supported (upstream's "
+                 "states[last_chunk_indices] would negative-index another sequence's "
+                 "chunk, ssd_combined.py:154)");
+    VT_CHECK(lci[b] < nchunks, "mamba2_chunk_scan: last_chunk_indices out of range");
+  }
+
+  // ── stage 1: `_chunk_cumsum_fwd` (ssd_chunk_state.py:300-346) ──────────────
+  // dt_out and dA_cumsum are [H, nchunks, chunk_size] f32 (:314-319). Positions
+  // past a partial chunk hold dt = 0 (:104-107), so dA_cumsum[..., cs-1] is the
+  // chunk's TOTAL decay whatever its length — which is what stages 2 and 3 read.
+  std::vector<float> dtv(static_cast<size_t>(H * nchunks * cs), 0.0f);
+  std::vector<float> dac(static_cast<size_t>(H * nchunks * cs), 0.0f);
+  ForRows(H, [&](int64_t h0, int64_t h1) {
+    for (int64_t h = h0; h < h1; ++h) {
+      const float a = Ap[h];
+      for (int64_t c = 0; c < nchunks; ++c) {
+        const int64_t start = ccs[c], len = ccs[c + 1] - start;
+        const size_t base = static_cast<size_t>((h * nchunks + c) * cs);
+        float acc = 0.0f;
+        for (int64_t i = 0; i < cs; ++i) {
+          float d = 0.0f;
+          if (i < len) {
+            d = LoadF32(dt_in, (start + i) * H + h);
+            if (dbp != nullptr) d += dbp[h];
+            if (args.dt_softplus) d = SoftplusGuarded(d);
+            d = std::min(std::max(d, args.dt_min), args.dt_max);
+          }
+          dtv[base + static_cast<size_t>(i)] = d;
+          acc += d * a;
+          dac[base + static_cast<size_t>(i)] = acc;
+        }
+      }
+    }
+  });
+
+  // ── stage 2: `_chunk_state_fwd` (ssd_chunk_state.py:349-407) ───────────────
+  // states[c,h,p,n] = sum_i x[i,h,p] * B[i,g,n] * exp(min(dA_last - dA_i, 0)) * dt_i
+  // f32 by upstream's own `states_in_fp32=True` (ssd_combined.py:100-102).
+  std::vector<float> states(static_cast<size_t>(nchunks * H * P * N), 0.0f);
+  ForRows(nchunks * H, [&](int64_t r0, int64_t r1) {
+    std::vector<float> xrow(static_cast<size_t>(P)), brow(static_cast<size_t>(N));
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t c = r / H, h = r % H, g = h / hpg;
+      const int64_t start = ccs[c], len = ccs[c + 1] - start;
+      const size_t dbase = static_cast<size_t>((h * nchunks + c) * cs);
+      const float da_last = dac[dbase + static_cast<size_t>(cs - 1)];
+      float* st = states.data() + static_cast<size_t>((c * H + h) * P * N);
+      for (int64_t i = 0; i < len; ++i) {
+        // The `min(., 0)` is upstream's, and INSIDE THE ENFORCED CONTRACT it is
+        // an algebraic no-op: `A < 0` (CheckMamba2ANegative) and `dt >= 0`
+        // (dt_min >= 0, checked in the validator) make `dac` non-increasing over
+        // i, so `da_last - dac[i] <= 0` for every i in the chunk. It is kept
+        // because upstream keeps it — it guards the floating-point edge where
+        // the running cumsum ticks up by an ulp — and it is NOT what stands
+        // between the op and an `A > 0` caller; that arm is refused outright.
+        const float scale = std::exp(std::min(da_last - dac[dbase + static_cast<size_t>(i)],
+                                              0.0f)) *
+                            dtv[dbase + static_cast<size_t>(i)];
+        if (scale == 0.0f) continue;
+        for (int64_t p = 0; p < P; ++p)
+          xrow[static_cast<size_t>(p)] = LoadF32(x, ((start + i) * H + h) * P + p);
+        for (int64_t n = 0; n < N; ++n)
+          brow[static_cast<size_t>(n)] =
+              LoadF32(B, ((start + i) * G + g) * N + n) * scale;
+        for (int64_t p = 0; p < P; ++p) {
+          const float xv = xrow[static_cast<size_t>(p)];
+          float* srow = st + p * N;
+          for (int64_t n = 0; n < N; ++n) srow[n] += xv * brow[static_cast<size_t>(n)];
+        }
+      }
+    }
+  });
+
+  // ── stage 3: `_state_passing_fwd` (ssd_state_passing.py:99-146) ────────────
+  // Per SEQUENCE, over the chunk range last_chunk_indices derives (:56-60):
+  //   S_c = exp(dA_last[c]) * S_{c-1} + states[c],  S_{-1} = initial_states[b]
+  // and out[c] is the state AFTER chunk c (:90-97).
+  //
+  // THE RUNNING STATE STAYS F32 AND THE STORE ROUNDS. Upstream carries `states`
+  // in f32 registers across the chunk loop and stores a `state_dtype` copy per
+  // chunk (:88-97) — it never reads its own rounded store back into the
+  // recurrence. `_chunk_scan_fwd` DOES read that stored copy, so `state_dtype`
+  // shows up in `out` as well as in `final_states`, but it must not compound
+  // inside the state passing itself.
+  // `passed` is f32 while upstream's `out` buffer is `state_dtype` (2x narrower
+  // at bf16). It holds only `state_dtype`-ROUNDED values (RoundThrough below),
+  // so the extra width is not numerically observable — it is a HOST-REFERENCE
+  // working buffer that keeps stage 5 on one load path, never a model-path
+  // allocation. W2 (the CUDA arm) must allocate this at `state_dtype`, as
+  // upstream does, and must NOT inherit this width (.agents/porting.md: a
+  // token gate cannot catch a dtype that is too WIDE).
+  std::vector<float> passed(static_cast<size_t>(nchunks * H * P * N), 0.0f);
+  const DType state_dt = final_states.dtype;
+  ForRows(S * H, [&](int64_t r0, int64_t r1) {
+    std::vector<float> s(static_cast<size_t>(P * N));
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t b = r / H, h = r % H;
+      const int64_t chunk_end = lci[b] + 1;
+      const int64_t chunk_start = b > 0 ? lci[b - 1] + 1 : 0;
+      if (initial_states != nullptr) {
+        for (int64_t i = 0; i < P * N; ++i)
+          s[static_cast<size_t>(i)] = LoadF32(*initial_states, (b * H + h) * P * N + i);
+      } else {
+        std::fill(s.begin(), s.end(), 0.0f);
+      }
+      for (int64_t c = chunk_start; c < chunk_end; ++c) {
+        const float decay =
+            std::exp(dac[static_cast<size_t>((h * nchunks + c) * cs + cs - 1)]);
+        const float* in = states.data() + static_cast<size_t>((c * H + h) * P * N);
+        float* outp = passed.data() + static_cast<size_t>((c * H + h) * P * N);
+        for (int64_t i = 0; i < P * N; ++i) {
+          s[static_cast<size_t>(i)] = s[static_cast<size_t>(i)] * decay + in[i];
+          outp[i] = RoundThrough(state_dt, s[static_cast<size_t>(i)]);
+        }
+      }
+      // `varlen_states = states[last_chunk_indices]` (ssd_combined.py:154).
+      // A sequence with no chunk keeps its incoming state, which for a fresh
+      // sequence is zeros.
+      for (int64_t i = 0; i < P * N; ++i)
+        StoreF32(final_states, (b * H + h) * P * N + i, s[static_cast<size_t>(i)]);
+    }
+  });
+
+  // ── stage 4: `_bmm_chunk_fwd` (ssd_bmm.py:148-209) ─────────────────────────
+  // CB[c,g,i,j] = sum_n C[i,g,n] * B[j,g,n], f32 REGARDLESS of the activation
+  // dtype (`output_dtype=torch.float32`, ssd_combined.py:124).
+  std::vector<float> cb(static_cast<size_t>(nchunks * G * cs * cs), 0.0f);
+  ForRows(nchunks * G, [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t c = r / G, g = r % G;
+      const int64_t start = ccs[c], len = ccs[c + 1] - start;
+      float* dst = cb.data() + static_cast<size_t>((c * G + g) * cs * cs);
+      std::vector<float> crow(static_cast<size_t>(N));
+      for (int64_t i = 0; i < len; ++i) {
+        for (int64_t n = 0; n < N; ++n)
+          crow[static_cast<size_t>(n)] = LoadF32(C, ((start + i) * G + g) * N + n);
+        for (int64_t j = 0; j <= i; ++j) {  // only j <= i is ever read (IS_CAUSAL)
+          float acc = 0.0f;
+          for (int64_t n = 0; n < N; ++n)
+            acc += crow[static_cast<size_t>(n)] * LoadF32(B, ((start + j) * G + g) * N + n);
+          dst[i * cs + j] = acc;
+        }
+      }
+    }
+  });
+
+  // ── stage 5: `_chunk_scan_fwd` (ssd_chunk_scan.py:216-525) ────────────────
+  //   out_i = exp(dA_i) * (C_i . S_{c-1})                                  inter
+  //         + sum_{j<=i} CB[i,j] * exp(min(dA_i - dA_j, 0)) * dt_j * x_j    intra
+  //         + D * x_i                                                      skip
+  //   then `out *= z * sigmoid(z)` when z is given (:394-406).
+  ForRows(nchunks * H, [&](int64_t r0, int64_t r1) {
+    std::vector<float> prev(static_cast<size_t>(P * N));
+    std::vector<float> crow(static_cast<size_t>(N));
+    std::vector<float> w(static_cast<size_t>(cs));
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t c = r / H, h = r % H, g = h / hpg;
+      const int64_t start = ccs[c], len = ccs[c + 1] - start;
+      const size_t dbase = static_cast<size_t>((h * nchunks + c) * cs);
+
+      // Previous state: initial_states[seq_idx[c]] when this chunk opens a new
+      // sequence AND initial states were supplied, ZEROS when they were not
+      // (ssd_chunk_scan.py:236-250, :271-274), else the passed state of c-1.
+      const int32_t si = sidx[c];
+      const int32_t si_prev = c >= 1 ? sidx[c - 1] : -1;
+      bool prev_zero = false;
+      if (si != si_prev) {
+        if (initial_states != nullptr) {
+          for (int64_t i = 0; i < P * N; ++i)
+            prev[static_cast<size_t>(i)] =
+                LoadF32(*initial_states, (static_cast<int64_t>(si) * H + h) * P * N + i);
+        } else {
+          prev_zero = true;
+        }
+      } else {
+        const float* src = passed.data() + static_cast<size_t>(((c - 1) * H + h) * P * N);
+        std::copy(src, src + P * N, prev.begin());
+      }
+
+      const float* cbc = cb.data() + static_cast<size_t>((c * G + g) * cs * cs);
+      for (int64_t i = 0; i < len; ++i) {
+        const float da_i = dac[dbase + static_cast<size_t>(i)];
+        const float scale_m = std::exp(da_i);
+        for (int64_t n = 0; n < N; ++n)
+          crow[static_cast<size_t>(n)] = LoadF32(C, ((start + i) * G + g) * N + n);
+        // The intra-chunk weight is independent of p; hoist it out of the p loop.
+        // As in stage 2, `min(., 0)` is an algebraic no-op inside the enforced
+        // contract (`A < 0`, `dt >= 0` => `dac` non-increasing => `da_i <= da_j`
+        // for j <= i) and is kept only because upstream keeps it.
+        for (int64_t j = 0; j <= i; ++j) {
+          w[static_cast<size_t>(j)] =
+              cbc[i * cs + j] *
+              std::exp(std::min(da_i - dac[dbase + static_cast<size_t>(j)], 0.0f)) *
+              dtv[dbase + static_cast<size_t>(j)];
+        }
+        for (int64_t p = 0; p < P; ++p) {
+          float acc = 0.0f;
+          if (!prev_zero) {
+            const float* prow = prev.data() + p * N;
+            for (int64_t n = 0; n < N; ++n) acc += crow[static_cast<size_t>(n)] * prow[n];
+          }
+          acc *= scale_m;
+          for (int64_t j = 0; j <= i; ++j)
+            acc += w[static_cast<size_t>(j)] * LoadF32(x, ((start + j) * H + h) * P + p);
+          const float xi = LoadF32(x, ((start + i) * H + h) * P + p);
+          if (Dp != nullptr) acc += (d_has_hdim ? Dp[h * P + p] : Dp[h]) * xi;
+          if (z != nullptr) acc *= SiluGate(LoadF32(*z, ((start + i) * H + h) * P + p));
+          StoreF32(out, ((start + i) * H + h) * P + p, acc);
+        }
+      }
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// vt::Mamba2StateUpdate — `selective_state_update` (ops/mamba_ssm.py:497+) at the
+// scalar-per-head shape, transcribed from upstream's own CPU kernel
+// (csrc/cpu/mamba_kernels.hpp:104-250 `selective_state_update_kernel`).
+// ─────────────────────────────────────────────────────────────────────────────
+void Mamba2StateUpdateKernel(Queue&, Tensor& out, Tensor& state, const Tensor& x,
+                             const Tensor& dt_in, const Tensor& A, const Tensor& B,
+                             const Tensor& C, const Tensor* D, const Tensor* z,
+                             const Tensor* dt_bias, const Tensor* state_indices,
+                             const Mamba2Args& args) {
+  const int64_t Nb = x.shape[0], H = x.shape[1], P = x.shape[2];
+  const int64_t G = B.shape[1], N = B.shape[2];
+  const int64_t S = state.shape[0];
+  const int64_t hpg = H / G;
+  const int32_t* sidx = state_indices != nullptr ? state_indices->Ptr<int32_t>() : nullptr;
+  const float* Ap = A.Ptr<float>();
+  const float* Dp = D != nullptr ? D->Ptr<float>() : nullptr;
+  const float* dbp = dt_bias != nullptr ? dt_bias->Ptr<float>() : nullptr;
+
+  CheckMamba2ANegative(A, "mamba2_state_update");
+
+  // Row-chunked over the BATCH: each row owns one cache slot and one output row,
+  // as GdnDecodeKernel does. `ForRows` is a PARALLEL for, so two rows naming the
+  // same slot race on the same read-modify-write and the answer depends on the
+  // thread schedule; upstream's own CPU kernel is sequential and stays
+  // deterministic under duplicates, so distinctness is a LOCAL precondition and
+  // is enforced here rather than only documented. NULL rows (index < 0) touch no
+  // slot at all and may repeat.
+  if (sidx != nullptr) {
+    std::vector<int32_t> slots;
+    slots.reserve(static_cast<size_t>(Nb));
+    for (int64_t b = 0; b < Nb; ++b)
+      if (sidx[b] >= 0) slots.push_back(sidx[b]);
+    std::sort(slots.begin(), slots.end());
+    VT_CHECK(std::adjacent_find(slots.begin(), slots.end()) == slots.end(),
+             "mamba2_state_update: state_indices entries must be DISTINCT (each row owns "
+             "one cache slot; the row dispatch is parallel)");
+  }
+
+  ForRows(Nb, [&](int64_t r0, int64_t r1) {
+    for (int64_t b = r0; b < r1; ++b) {
+      int64_t slot = b;
+      if (sidx != nullptr) {
+        // LOCAL ABI: index < 0 is the NULL row (upstream's `NULL_BLOCK_ID`
+        // padding, v1/attention/backends/utils.py:46, remapped by the caller).
+        // Its cache slot is untouched — `continue` at mamba_kernels.hpp:147 —
+        // and its output row is zeroed, as GdnDecodeKernel does.
+        if (sidx[b] < 0) {
+          for (int64_t i = 0; i < H * P; ++i) StoreF32(out, b * H * P + i, 0.0f);
+          continue;
+        }
+        slot = sidx[b];
+        VT_CHECK(slot < S, "mamba2_state_update: state_indices entry out of range");
+      }
+      for (int64_t h = 0; h < H; ++h) {
+        const int64_t g = h / hpg;
+        float d = LoadF32(dt_in, b * H + h);
+        if (dbp != nullptr) d += dbp[h];
+        if (args.dt_softplus) d = SoftplusGuarded(d);
+        const float dA = std::exp(Ap[h] * d);
+        for (int64_t p = 0; p < P; ++p) {
+          const float xv = LoadF32(x, (b * H + h) * P + p);
+          const int64_t sbase = ((slot * H + h) * P + p) * N;
+          float y = 0.0f;
+          for (int64_t n = 0; n < N; ++n) {
+            const float bv = LoadF32(B, (b * G + g) * N + n);
+            const float cv = LoadF32(C, (b * G + g) * N + n);
+            // The readout uses the F32 value, not the value re-read from the
+            // cache: the Triton kernel holds `state` in registers and computes
+            // `out = sum(state * C)` from it, storing the cache-width copy
+            // separately (mamba_ssm.py:433,451); upstream's CPU kernel does the
+            // same with `s_new` (mamba_kernels.hpp:225-228).
+            const float sn = LoadF32(state, sbase + n) * dA + bv * xv * d;
+            StoreF32(state, sbase + n, sn);
+            y += sn * cv;
+          }
+          if (Dp != nullptr) y += Dp[h] * xv;
+          if (z != nullptr) y *= SiluGate(LoadF32(*z, (b * H + h) * P + p));
+          StoreF32(out, (b * H + h) * P + p, y);
+        }
+      }
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// vt::RmsNormGatedGroup — `Mixer2RMSNormGated.forward_native`
+// (mamba_mixer2.py:100-149).
+// ─────────────────────────────────────────────────────────────────────────────
+void RmsNormGatedGroupKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate,
+                             const Tensor* weight, const RmsNormGatedGroupArgs& args) {
+  const int64_t hidden = x.shape[x.rank - 1];
+  int64_t rows = 1;
+  for (int r = 0; r < x.rank - 1; ++r) rows *= x.shape[r];
+  const int64_t group_size = hidden / args.n_groups;
+  // THE WEIGHT IS READ AT ITS OWN DTYPE. `Mixer2RMSNormGated.weight` is
+  // `nn.Parameter(torch.ones(per_rank_hidden_size))` (mamba_mixer2.py:91),
+  // created at the MODEL dtype — bf16 for every checkpoint that ships this
+  // layer — and the validator accepts any float (`CheckMamba2Operand(...,
+  // is_output=false)`, src/vt/ops.cpp). `Tensor::Ptr<float>()` is an unchecked
+  // `static_cast` (include/vt/tensor.h), so taking one here would read
+  // `hidden * 4` bytes out of a `hidden * 2` byte allocation. `LoadF32` is the
+  // dtype-aware read the sibling `RmsNormGatedKernel` already uses.
+  // `input_dtype = x.dtype` (:113) is the width the normalized value is cast back
+  // to before the weight multiply (`self.weight * x.to(input_dtype)`, :149).
+  const DType input_dt = x.dtype;
+
+  ForRows(rows, [&](int64_t r0, int64_t r1) {
+    std::vector<float> v(static_cast<size_t>(hidden));
+    for (int64_t r = r0; r < r1; ++r) {
+      // `x = x * nn.functional.silu(gate.to(torch.float32))` (:114) — the gate is
+      // promoted to f32 BEFORE the silu, which is why this is f32 throughout.
+      for (int64_t j = 0; j < hidden; ++j)
+        v[static_cast<size_t>(j)] =
+            LoadF32(x, r * hidden + j) * SiluGate(LoadF32(gate, r * hidden + j));
+      if (weight == nullptr) {
+        // use_rms_norm == False: no parameter, no norm (:94-96, :115-116).
+        for (int64_t j = 0; j < hidden; ++j)
+          StoreF32(out, r * hidden + j,
+                    RoundThrough(input_dt, v[static_cast<size_t>(j)]));
+        continue;
+      }
+      for (int64_t g = 0; g < args.n_groups; ++g) {
+        // variance = x_grouped.pow(2).mean(-1) over group_size (:139-140); the
+        // n_groups == 1 branch (:127-131) is the same expression with
+        // group_size == hidden.
+        // f32 accumulation, NOT double: upstream reduces `x.pow(2).mean(-1)`
+        // in f32 (x is f32 from the :114 gate promotion) and the sibling
+        // `RmsNormGatedKernel` above does the same. W2 must not inherit a wider
+        // host-reference reduction.
+        float ss = 0.0f;
+        for (int64_t j = 0; j < group_size; ++j) {
+          const float t = v[static_cast<size_t>(g * group_size + j)];
+          ss += t * t;
+        }
+        // `rsqrt(variance + eps)` (:130, :141) — eps is INSIDE the square root.
+        const float inv = 1.0f / std::sqrt(ss / static_cast<float>(group_size) + args.eps);
+        for (int64_t j = 0; j < group_size; ++j) {
+          const int64_t idx = g * group_size + j;
+          const float normed = RoundThrough(input_dt, v[static_cast<size_t>(idx)] * inv);
+          StoreF32(out, r * hidden + idx, LoadF32(*weight, idx) * normed);
+        }
+      }
+    }
+  });
+}
+
 // SPECULATIVE (multi-token, slot-snapshotting) gated-delta-rule step.
 // Ported from vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py @
 // e24d1b24 — fused_recurrent_gated_delta_rule_fwd_kernel with IS_VARLEN
@@ -2597,6 +3097,15 @@ struct Registrar {
     RegisterOp(
         OpId::kKdaChunkPrefill, DeviceType::kCPU,
         reinterpret_cast<void*>(static_cast<KdaChunkPrefillFn>(&KdaChunkPrefillKernel)));
+    RegisterOp(
+        OpId::kMamba2ChunkScan, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<Mamba2ChunkScanFn>(&Mamba2ChunkScanKernel)));
+    RegisterOp(
+        OpId::kMamba2StateUpdate, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<Mamba2StateUpdateFn>(&Mamba2StateUpdateKernel)));
+    RegisterOp(
+        OpId::kRmsNormGatedGroup, DeviceType::kCPU,
+        reinterpret_cast<void*>(static_cast<RmsNormGatedGroupFn>(&RmsNormGatedGroupKernel)));
     RegisterOp(
         OpId::kGdnStateGather, DeviceType::kCPU,
         reinterpret_cast<void*>(

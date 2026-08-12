@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <type_traits>
 
@@ -371,6 +372,18 @@ enum class OpId : uint8_t {
   // participates in plan/algo selection. Appended before kCount so no existing
   // op's id shifts.
   kMatmulFp8CublasLtAlphaVec,
+  // --- Mamba2 / SSD selective-scan core (.agents/specs/mamba2-ssd.md W1,
+  // #496). The three numerical objects the GDN arm of KERNEL-SSM-MAMBA never
+  // built. SSD is NOT the gated delta rule: there is no `(I - beta*k*k^T)`
+  // removal term, the decay is a diagonal `exp(A*dt)` driven by `A_log`/`dt`,
+  // and `B`/`C` are shared across `n_groups` head groups. See
+  // vt::Mamba2ChunkScan / vt::Mamba2StateUpdate / vt::RmsNormGatedGroup below
+  // for the exact contracts and their upstream anchors. Additive: nothing
+  // outside the Mamba2 path dispatches them. Appended before kCount so no
+  // existing op's id shifts.
+  kMamba2ChunkScan,
+  kMamba2StateUpdate,
+  kRmsNormGatedGroup,
   kCount
 };
 
@@ -477,6 +490,41 @@ struct RmsNormGatedArgs {
   // output_gate_type (gdn-semantics.md §5). norm_before_gate=True and
   // group_size=None (the only configuration Qwen GDN uses) are baked in.
   bool sigmoid_gate = false;
+};
+
+// Silu-gated GROUP RMS norm args (Mixer2RMSNormGated, mamba_mixer2.py:69-149).
+// SIBLING of RmsNormGatedArgs, not a mode of it: the GDN/KDA gated norm reduces
+// over the WHOLE row with an optional sigmoid gate, this one always uses SILU and
+// reduces over `group_size = hidden / n_groups` slices (:136-141).
+struct RmsNormGatedGroupArgs {
+  float eps = 1e-6f;  // Mixer2RMSNormGated default (mamba_mixer2.py:76)
+  // full_n_groups. group_size = hidden / n_groups must divide the last dim
+  // (mamba_mixer2.py:80). n_groups == 1 degenerates to a whole-row RMS norm,
+  // which is exactly upstream's `self.n_groups == 1` branch (:120-131).
+  int64_t n_groups = 1;
+  // W1 lands tp_world_size == 1 only. Any other value is REFUSED with a message
+  // naming `extra_groups_for_head_shards` (mamba_utils.py:187) rather than
+  // silently computing a wrong split (mamba2-ssd.md §7).
+  int64_t tp_world_size = 1;
+};
+
+// Mamba2 SSD args, shared by the chunked prefill scan and the decode state
+// update (ssd_combined.py:27-235, mamba_ssm.py:497+).
+struct Mamba2Args {
+  // Physical chunk length. MUST be an integer power of two — upstream asserts it
+  // (`is_int_pow_2`, ssd_combined.py:48). Ignored by Mamba2StateUpdate.
+  int64_t chunk_size = 0;
+  // Whether dt goes through softplus before the decay (`dt_softplus`). Upstream
+  // guards it as `dt <= 20 ? softplus(dt) : dt` (ssd_chunk_state.py:94,
+  // mamba_kernels.hpp:177). mamba_mixer2.py:1097 passes True.
+  bool dt_softplus = false;
+  // dt_limit, applied AFTER softplus (`tl.clamp(dt, dt_min, dt_max)`,
+  // ssd_chunk_state.py:96). Upstream default is (0.0, +inf).
+  // Ignored by Mamba2StateUpdate: selective_state_update has no dt_limit.
+  float dt_min = 0.0f;
+  float dt_max = std::numeric_limits<float>::infinity();
+  // W1 lands tp_world_size == 1 only; see RmsNormGatedGroupArgs::tp_world_size.
+  int64_t tp_world_size = 1;
 };
 
 struct GdnArgs {
@@ -950,6 +998,31 @@ using KdaGatedDeltaRuleFn = void (*)(Queue&, Tensor&, const Tensor&, const Tenso
 using KdaChunkPrefillFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                    const Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                    Tensor&, const Tensor&, const GdnArgs&);
+// Mamba2 SSD varlen chunked prefill scan (vt::Mamba2ChunkScan). NOT a shape of
+// GdnPrefillFn: the SSD recurrence has no delta-removal term and carries the
+// per-chunk decay/state-passing metadata upstream builds in mamba2_attn.py.
+using Mamba2ChunkScanFn = void (*)(Queue&, Tensor& /*out*/, Tensor& /*final_states*/,
+                                   const Tensor& /*x*/, const Tensor& /*dt*/,
+                                   const Tensor& /*A*/, const Tensor& /*B*/,
+                                   const Tensor& /*C*/, const Tensor* /*D*/,
+                                   const Tensor* /*z*/, const Tensor* /*dt_bias*/,
+                                   const Tensor* /*initial_states*/,
+                                   const Tensor& /*cu_seqlens*/,
+                                   const Tensor& /*cu_chunk_seqlens*/,
+                                   const Tensor& /*last_chunk_indices*/,
+                                   const Tensor& /*seq_idx*/, const Mamba2Args&);
+// Mamba2 single-token selective state update (vt::Mamba2StateUpdate).
+using Mamba2StateUpdateFn = void (*)(Queue&, Tensor& /*out*/, Tensor& /*state*/,
+                                     const Tensor& /*x*/, const Tensor& /*dt*/,
+                                     const Tensor& /*A*/, const Tensor& /*B*/,
+                                     const Tensor& /*C*/, const Tensor* /*D*/,
+                                     const Tensor* /*z*/, const Tensor* /*dt_bias*/,
+                                     const Tensor* /*state_indices*/, const Mamba2Args&);
+// Silu-gated group RMS norm (vt::RmsNormGatedGroup). `weight` is nullable:
+// upstream skips the parameter entirely when use_rms_norm is False.
+using RmsNormGatedGroupFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                     const Tensor& /*gate*/, const Tensor* /*weight*/,
+                                     const RmsNormGatedGroupArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -2008,6 +2081,112 @@ void KdaChunkPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                      const Tensor& v, const Tensor& g_raw, const Tensor& beta,
                      const Tensor& a_log, const Tensor& dt_bias, Tensor& state,
                      const Tensor& query_start_loc, const GdnArgs& args);
+
+// ─── Mamba2 / SSD (.agents/specs/mamba2-ssd.md, issue #496) ──────────────────
+//
+// SSD IS NOT THE GATED DELTA RULE. GdnPrefill/KdaGatedDeltaRule above carry a
+// delta REMOVAL term `(I - beta*k*k^T)` and a decay that is a per-head (GDN) or
+// per-K-channel (KDA) scalar. Mamba2's SSD is a diagonally-decayed gated linear
+// recurrence with NO removal term, whose decay `exp(A[h]*dt[t,h])` is driven by
+// `A_log`/`dt`, with a `D` skip and `B`/`C` SHARED across `n_groups` head groups
+// (head h reads group `h / (nheads/ngroups)`). These are sibling ops, never a
+// parameterisation of the GDN kernels (mamba2-ssd.md §0, §7).
+
+// MAMBA2 CHUNKED SSD PREFILL — the varlen entry
+// `mamba_chunk_scan_combined_varlen` (ssd_combined.py:157-235) over the 5-stage
+// pipeline `_mamba_chunk_scan_combined_fwd` (:27-156), in upstream order:
+//   1. `_chunk_cumsum_fwd`  (ssd_chunk_state.py:300-346) — dt bias/softplus/clamp
+//      then per-chunk `dA_cumsum[h,c,i] = sum_{j<=i} dt[h,c,j]*A[h]`. Positions
+//      past a partial chunk's length hold dt = 0, so `dA_cumsum[h,c,cs-1]` is the
+//      chunk's TOTAL decay whatever its length (:96-110).
+//   2. `_chunk_state_fwd`   (ssd_chunk_state.py:349-407) — the chunk-local state
+//      `sum_i x*B * exp(min(dA_last - dA_i, 0)) * dt`, accumulated in f32
+//      (`states_in_fp32=True`, ssd_combined.py:100-102).
+//   3. `_state_passing_fwd` (ssd_state_passing.py:99-146) — the inter-chunk
+//      recurrence `S_c = exp(dA_last[c]) * S_{c-1} + states[c]`, run per SEQUENCE
+//      over the chunk range `last_chunk_indices` derives, seeded from
+//      `initial_states`. Note out[c] is the state AFTER chunk c (:90-97).
+//   4. `_bmm_chunk_fwd`     (ssd_bmm.py:148-209) — `CB[c,g,i,j] = C_i . B_j`,
+//      accumulated and RETURNED in f32 regardless of activation dtype
+//      (`output_dtype=torch.float32`, ssd_combined.py:124).
+//   5. `_chunk_scan_fwd`    (ssd_chunk_scan.py:216-525) — per token i of chunk c:
+//        out = exp(dA_i) * (C_i . S_{c-1})                       // inter-chunk
+//            + sum_{j<=i} CB[i,j] * exp(min(dA_i - dA_j,0)) * dt_j * x_j // intra
+//            + D * x_i                                           // skip
+//        and `out *= z*sigmoid(z)` when z is given. `S_{c-1}` is
+//        `initial_states[seq_idx[c]]` when `seq_idx[c] != seq_idx[c-1]` and
+//        initial states were supplied, ZEROS when they were not (:236-250,
+//        :271-289) — that is what makes a sequence boundary inside a physical
+//        chunk correct.
+//
+// Shapes (varlen, implicit batch 1 — ssd_combined.py:158-215):
+//   x            [T,H,P] float          dt      [T,H] float
+//   A            [H] f32 (negative)     B,C     [T,G,N] float, H % G == 0
+//   D            optional [H] or [H,P] f32       z  optional [T,H,P] float
+//   dt_bias      optional [H] f32
+//   initial_states optional [S,H,P,N] f32/bf16 (:79, :194)
+//   cu_seqlens   [S+1] i32              seq_idx [nchunks] i32 — PER CHUNK, not
+//                                       per token (:60-61, :189)
+//   cu_chunk_seqlens [nchunks+1] i32    last_chunk_indices [S] i32
+//   out          [T,H,P] f32/bf16 (pre-allocated, written in place)
+//   final_states [S,H,P,N] f32/bf16 — `varlen_states`, the state after each
+//                sequence's LAST chunk (:154). Its dtype is the SEPARATE
+//                `state_dtype` knob (:46,119,176), NOT the activation dtype.
+// `args.chunk_size` must be a power of two (:48). All arithmetic is f32; the
+// device tile-precision downcasts inside the Triton dots are a W2 concern.
+void Mamba2ChunkScan(Queue& q, Tensor& out, Tensor& final_states, const Tensor& x,
+                     const Tensor& dt, const Tensor& A, const Tensor& B, const Tensor& C,
+                     const Tensor* D, const Tensor* z, const Tensor* dt_bias,
+                     const Tensor* initial_states, const Tensor& cu_seqlens,
+                     const Tensor& cu_chunk_seqlens, const Tensor& last_chunk_indices,
+                     const Tensor& seq_idx, const Mamba2Args& args);
+
+// MAMBA2 SINGLE-TOKEN SELECTIVE STATE UPDATE — the decode path,
+// `selective_state_update` (mamba_ssm.py:497+) as mamba_mixer2.py:1087 calls it.
+// Per row b and head h (group g = h / (H/G)), with dt SCALAR PER HEAD — the
+// `tie_hdim` shape Mamba2 always uses, and the only one upstream's own CPU
+// kernel implements (csrc/cpu/mamba_kernels.hpp:104-250, and the
+// `current_platform.is_cpu()` skips in tests/kernels/mamba/test_mamba_ssm.py):
+//   dt = softplus(dt[b,h] + dt_bias[h])            // guarded dt<=20, :177
+//   s  = s * exp(A[h]*dt) + B[b,g,:] * x[b,h,p] * dt
+//   out[b,h,p] = sum_n s[n]*C[b,g,n] + D[h]*x[b,h,p]   (then *= silu(z))
+//
+//   state   [S,H,P,N] f32/bf16 — the FULL cache when state_indices is given
+//           (mamba2_state_dtype's ssm_dtype is its own knob, mamba_utils.py:73-81),
+//           else compact [Nb,H,P,N] with row b == b. Updated IN PLACE.
+//   x [Nb,H,P] float, dt [Nb,H] float, A [H] f32, B/C [Nb,G,N] float,
+//   D optional [H] f32, z optional [Nb,H,P] float, dt_bias optional [H] f32,
+//   out [Nb,H,P] f32/bf16.
+//   state_indices optional [Nb] i32 (upstream `state_batch_indices`). LOCAL ABI:
+//           index < 0 is the NULL row — its cache slot is left untouched and its
+//           output row is zeroed, exactly as GdnDecode/CausalConv1dSpecUpdate
+//           already model it (ops.h GdnDecode, cpu_ops.cpp GdnDecodeKernel).
+//           Upstream's sentinel is `NULL_BLOCK_ID = 0`
+//           (v1/attention/backends/utils.py:46) and it leaves the padded output
+//           rows UNDEFINED (`continue`, mamba_kernels.hpp:147); the caller maps
+//           its padding onto the local negative sentinel, and zeroing is strictly
+//           more defined than what upstream promises.
+void Mamba2StateUpdate(Queue& q, Tensor& out, Tensor& state, const Tensor& x,
+                       const Tensor& dt, const Tensor& A, const Tensor& B, const Tensor& C,
+                       const Tensor* D, const Tensor* z, const Tensor* dt_bias,
+                       const Tensor* state_indices, const Mamba2Args& args);
+
+// SILU-GATED GROUP RMS NORM — `Mixer2RMSNormGated.forward_native`
+// (mamba_mixer2.py:100-149). A SIBLING of RmsNormGated, not a mode of it: that
+// one is the GDN/KDA gate (sigmoid or silu) over the WHOLE row; this one always
+// SILU-gates and reduces the variance over `group_size = hidden / n_groups`
+// slices. Both the activation and the reduction extent differ (mamba2-ssd.md §0).
+//   v      = x * silu(f32(gate))                                     (:114)
+//   out    = weight * dtype(x)( v * rsqrt(mean(v^2 over its group) + eps) )
+//            (:136-141 grouped, :127-131 the n_groups == 1 whole-row branch,
+//             :149 the `self.weight * x.to(input_dtype)` cast point)
+// x/gate/out are rank 2 [rows,Hd] or rank 3 [T,H,D]; the LAST dim is the hidden
+// dim and every leading dim is a row (`*prefix_dims, hidden_dim`, :136).
+// `weight` is [Hd] float, or NULLPTR for `use_rms_norm=False`, where upstream
+// registers no parameter at all and returns just the gated value (:94-96,
+// :115-116). args.n_groups must divide the last dim.
+void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
+                       const Tensor* weight, const RmsNormGatedGroupArgs& args);
 
 // Single-token gated-delta-rule step, one token per sequence
 // (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and

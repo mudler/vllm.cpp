@@ -7,9 +7,16 @@ the native Marlin W4A16 MXFP4 keep-quant path). The NVFP4 gate models ("27"/"35"
 use a committed npy near-tie paged-engine ctest; the MXFP4 8B has no such golden,
 so its gate reproduces the #44 e2e battery instead: greedy (temperature 0, seed 0)
 completion of four fixed prompts via ``vllm-cli``, compared to the oracle golden
-``docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json`` (captured from the
-pinned 0.25.0 oracle with ``VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`` →
-Marlin W4A16).
+``docs/bench-evidence/mxfp4-qwen/golden_marlin_w4a16.json`` (captured with
+``VLLM_DISABLED_KERNELS=FlashInferMxFp4LinearKernel`` → Marlin W4A16).
+
+That golden was captured from the **then-pinned** 0.25.0 / ``702f481`` oracle. It
+is provenance, not the current pin: the pin advanced to ``555967922`` (vLLM
+0.26.0.dev0) on 2026-07-26 and ``.agents/upstream-sync.md`` is the record (this
+docstring said "the pinned 0.25.0 oracle" in the present tense until #520). The
+golden stands on its capture provenance; RE-capturing it runs against the current
+pin, and ``~/venvs/vllm-oracle`` is host state that still resolves to the 0.25.0
+rollback (#375), so check what it points at before capturing anything.
 
 The battery encodes exactly the #44 verdict: the three DETERMINISTIC prompts
 (capitals, arithmetic, fibonacci) must be TOKEN-EXACT vs the golden text, and the

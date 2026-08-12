@@ -1158,6 +1158,15 @@ vllm_cpp_add_test(test_ops_kda_recurrence vt/test_ops_kda_recurrence.cpp)
 target_include_directories(test_ops_kda_recurrence PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_kda_chunk_prefill vt/test_ops_kda_chunk_prefill.cpp)
 target_include_directories(test_ops_kda_chunk_prefill PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# Mamba2 / SSD host references (.agents/specs/mamba2-ssd.md W1, #496). Three
+# sibling ops of the GDN/KDA lane above, gated against a sequential
+# double-precision reference and across chunk sizes.
+vllm_cpp_add_test(test_ops_mamba2_ssd vt/test_ops_mamba2_ssd.cpp)
+target_include_directories(test_ops_mamba2_ssd PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_mamba2_state_update vt/test_ops_mamba2_state_update.cpp)
+target_include_directories(test_ops_mamba2_state_update PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_mamba2_gated_norm vt/test_ops_mamba2_gated_norm.cpp)
+target_include_directories(test_ops_mamba2_gated_norm PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)

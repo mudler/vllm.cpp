@@ -39,6 +39,7 @@ from tools.bench.online_gate import (
     TRACE_CLEAN_FIXED_ENV,
     TRACE_REQUIRED_ENV,
     TRACE_SYSTEM_PATH,
+    VLLM_DISTRIBUTION_VERSION,
     VLLM_ORACLE_VERSION,
     _fingerprint_tree,
     _parse_fp4_plan_log,
@@ -52,6 +53,7 @@ from tools.bench.serve_low_common import (
     HarnessError,
     SGLANG_COMMIT,
     VLLM_COMMIT,
+    assert_oracle_commit,
     canonical_json,
     coefficient_of_variation,
     percentile,
@@ -1586,10 +1588,14 @@ def _validate_execution(evidence: pathlib.Path, vllm_cpp_sha: str) -> dict[str, 
         oracle.get("bench_dependencies") != execution["bench_dependencies"]
         or oracle.get("client_contract_source_commit") != VLLM_COMMIT
         or oracle.get("cutlass_source_tree") != cutlass_record
-        or oracle.get("oracle_version") != VLLM_ORACLE_VERSION
+        # `oracle_version` is the DISTRIBUTION metadata string, which differs
+        # from the runtime one on the pin (#520); they were both compared to the
+        # runtime constant while the two happened to be equal at 0.25.0.
+        or oracle.get("oracle_version") != VLLM_DISTRIBUTION_VERSION
         or oracle.get("runtime_version") != VLLM_ORACLE_VERSION
     ):
         raise HarnessError("component execution oracle manifest differs")
+    assert_oracle_commit(oracle.get("runtime_version"))
     oracle_artifacts = oracle.get("artifacts")
     if not isinstance(oracle_artifacts, Mapping) or set(oracle_artifacts) != set(
         _ORACLE_ARTIFACT_NAMES

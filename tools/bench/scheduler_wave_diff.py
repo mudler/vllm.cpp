@@ -18,11 +18,16 @@
 #                binding shape; shows the emergent regime (both arms self-stagger
 #                to ~2048-token admission steps -- the attractor evidence).
 #
-# Requires the pinned vLLM oracle (~/venvs/vllm-oracle == vllm 0.25.0 == 702f481;
-# the sched loop is drift-free vs e24d1b24 for this scenario -- async_scheduler.py
-# and request_queue.py are byte-identical and scheduler.py differs only in
-# spec-decode / structured-output / KV-connector paths, all inert here). Run on a
-# host with the oracle venv, e.g.:
+# Requires the vLLM oracle. THE PIN IS `555967922` (vLLM 0.26.0.dev0), recorded in
+# .agents/upstream-sync.md; until #520 this comment still named 0.25.0 / 702f481,
+# which was the pin when the committed golden was captured and stopped being the
+# pin on 2026-07-26. The golden stands -- the sched loop is drift-free for this
+# scenario (async_scheduler.py and request_queue.py byte-identical; scheduler.py
+# differs only in spec-decode / structured-output / KV-connector paths, all inert
+# here) -- but a RE-capture runs against the current pin, not against 702f481.
+# `~/venvs/vllm-oracle` is HOST STATE and is NOT a statement of the pin: it still
+# resolves to the 0.25.0 rollback (#375), so check what it points at before
+# quoting anything produced through it. Run on a host with the oracle venv, e.g.:
 #   ~/venvs/vllm-oracle/bin/python tools/bench/scheduler_wave_diff.py \
 #       script --out tests/fixtures/scheduler_wave/wave_script_oracle.json
 #

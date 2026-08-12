@@ -32,6 +32,11 @@ claim_root="${HOME}/work/vllm.cpp-online-gate"
 evidence=""
 build_dir=""
 configure_log=""
+# The oracle venv is HOST state, not repo state, so this stays a symlink and
+# `--client` still overrides it. What changed (#520) is that the symlink can no
+# longer decide the run silently: `record-oracle` below asserts the resolved
+# oracle's COMMIT against the parity pin, so pointing this at the preserved
+# v0.25.0 rollback now ABORTS the gate instead of quietly relabelling it (#375).
 client="${HOME}/venvs/vllm-oracle/bin/vllm"
 vllm_cpp_sha=""
 port=8001

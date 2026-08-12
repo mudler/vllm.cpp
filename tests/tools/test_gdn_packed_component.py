@@ -39,6 +39,7 @@ from tools.bench.online_gate import (
     TRACE_CLEAN_FIXED_ENV,
     TRACE_REQUIRED_ENV,
     TRACE_SYSTEM_PATH,
+    VLLM_DISTRIBUTION_VERSION,
     VLLM_ORACLE_VERSION,
     build_client_command,
 )
@@ -626,7 +627,7 @@ def _write_complete_evidence(root: pathlib.Path, *, packed_better: bool = True) 
                 "client_contract_source_commit": VLLM_COMMIT,
                 "cutlass_source_tree": cutlass_record,
                 "generated_utc": "2026-07-14T00:00:00+00:00",
-                "oracle_version": VLLM_ORACLE_VERSION,
+                "oracle_version": VLLM_DISTRIBUTION_VERSION,
                 "runtime_version": VLLM_ORACLE_VERSION,
             }
         ),

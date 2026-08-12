@@ -8,11 +8,16 @@ one a checkpoint at a time (BENCHMARKS.md reached 11,405 lines and 171 sections
 before the 2026-08-04 conversion), which is exactly what makes them unreadable
 to users.
 
-This checker fails if either page loses a required user-facing section, grows
-past its budget, accumulates sections or prose instead of rows, or stops
-pointing at the record it relocates detail into. When BENCHMARKS.md fails
-because sections accumulated, `scripts/roll-benchmark-record.py` moves them into
-.agents/benchmark-record.md.
+This checker fails if either page loses a required user-facing section, appends
+a section or a per-attempt dated heading instead of updating a row, lets one
+entry grow into a wall of prose, or stops pointing at the record it relocates
+detail into. When BENCHMARKS.md fails because sections accumulated,
+`scripts/roll-benchmark-record.py` moves them into .agents/benchmark-record.md.
+
+Nothing here budgets the WHOLE FILE. Adding a measurement row must never
+require deleting a row someone else owns: see the MAX_ROW_CHARS comment for the
+measurement behind that, and AGENTS.md, Records, "cap the entry, never the
+file".
 
 The validation logic is the pure functions `benchmarks_errors(text)` and
 `features_errors(text)` so they are unit-testable and mutation-testable (see
@@ -22,6 +27,7 @@ check-readme-structure.py and check-doc-checkpoint.py.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -37,6 +43,52 @@ MAX_CELL_CHARS = 220
 # Likewise shared: a single paragraph past this is narrative, not a caption.
 MAX_PARAGRAPH_CHARS = 700
 
+# THE PER-PAGE `max_chars` BUDGET WAS REMOVED 2026-08-12
+# (ENG-RECORD-CONFLICT-SURFACES, #460). It was 45,000 for the scoreboard and
+# 30,000 for the feature matrix, and both pages sat against it: BENCHMARKS.md
+# measured 44,795 of 45,000 and FEATURES.md 29,740 of 30,000. A budget on a
+# SHARED file makes every addition an eviction of somebody else's row, which is
+# the corollary AGENTS.md Records states outright ("cap the entry, never the
+# file"), and 87308dea already removed the two sibling budgets on this argument
+# under #364: MAX_CHARS in check-now-current.py and the `chars` key of
+# STATUS_RATCHET below. This was the third, left standing in that pass.
+#
+# The measured consequences, over the last 25 commits touching BENCHMARKS.md:
+# free space ranged from 421 characters down to MINUS SEVEN; row count fell 165
+# to 162 while the project gained measurements; two commits (93613baa, 887e04ff)
+# exist for no purpose but to pay rent; and 04b2b9fa is a CLEAN automatic merge
+# that landed the page at 45,007 chars, over the cap, because two PRs each paid
+# by evicting a different row and the three-way merge applied both additions and
+# neither eviction. A gate whose success mode is unsafe is worse than no gate.
+#
+# MAX_ROW_CHARS and DATED_HEADING_RE carry the obligation between them, and both
+# are ENTRY-scoped, so an author bounds their own row and never anyone else's.
+
+# One table row is one ENTRY, and this is its budget. Set from the shipped
+# pages: the longest live row is 520 chars on BENCHMARKS.md and 580 on
+# FEATURES.md. It is a real constraint and a tighter one than the cell cap it
+# joins, which alone permits a five-column row of 1,100 characters.
+MAX_ROW_CHARS = 600
+
+# REGROWTH GUARD. What actually bloated BENCHMARKS.md to 11,405 lines was
+# PER-ATTEMPT sections, appended one checkpoint at a time, and the page's own
+# archive records their shape: 287 of the 310 sections already rolled into
+# .agents/benchmark-record.md name a DATE in the heading. Zero of the 36 live
+# headings across the two public pages do (18 each; reproduce with _headings).
+# So a dated heading is the append-log entry, and it fails at the FIRST one.
+#
+# WHAT THIS GUARD IS AND IS NOT TIGHTER THAN. It is strictly tighter than the
+# canonical-section allowlist it joins, which runs over _h2_headers and so
+# matches "## " only: an appended DATED "### " subsection was rejected by
+# nothing but the retired character budget, and is now rejected here at every
+# depth. It is NOT tighter than the retired byte cap in general, and an earlier
+# revision of this comment claimed that it was. An UNDATED appended subsection
+# passes this guard by construction, because the guard fires on a date. What
+# bounds that case is the paragraph budget, once _prose_paragraphs counts the
+# bulleted forensics such a section carries: see the fold recorded there, and
+# the two mutations that measured the gap before it existed.
+DATED_HEADING_RE = re.compile(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b")
+
 # The scoreboard must point at the record, and the record must exist, otherwise
 # "move it to the archive" silently loses the evidence.
 RECORD_LINK = ".agents/benchmark-record.md"
@@ -49,6 +101,23 @@ class PageRules:
     headroom for genuinely new subjects but not for accumulated entries. That
     is the whole mechanism: growth that is new ROWS passes, growth that is new
     SECTIONS or new PROSE fails.
+
+    NONE of these limits is a budget on the whole file: see the MAX_ROW_CHARS
+    comment above for why the per-page `max_chars` key was removed on
+    2026-08-12. A limit here either counts a QUALITY defect (sections,
+    paragraphs) or bounds ONE entry, so adding a ROW never requires deleting a
+    row someone else owns.
+
+    THAT SENTENCE IS TRUE OF ROWS, AND ONLY OF ROWS. `max_h2_sections` and
+    `max_prose_paragraphs` are still whole-page COUNTS, and both live pages sit
+    on the paragraph one: docs/BENCHMARKS.md measures 35 of 35 and
+    docs/FEATURES.md 21 of 21. So adding a PARAGRAPH does still cost somebody's
+    paragraph. That is deliberate rather than overlooked. Rows are the growth
+    mode of a keyed table and prose is the decay mode this checker exists to
+    stop, which is the same argument #364 used to keep `long_paragraphs` in
+    STATUS_RATCHET while deleting `chars`. It is a real cost, not a free one,
+    and it is recorded here so the next author meets it in the docstring instead
+    of in CI.
     """
 
     def __init__(
@@ -59,7 +128,6 @@ class PageRules:
         required_sections: tuple[tuple[str, tuple[str, ...]], ...],
         max_h2_sections: int,
         max_prose_paragraphs: int,
-        max_chars: int,
         min_table_rows: int,
         required_links: tuple[str, ...],
         canonical_sections: tuple[str, ...] | None = None,
@@ -69,7 +137,6 @@ class PageRules:
         self.required_sections = required_sections
         self.max_h2_sections = max_h2_sections
         self.max_prose_paragraphs = max_prose_paragraphs
-        self.max_chars = max_chars
         self.min_table_rows = min_table_rows
         self.required_links = required_links
         # When set, EVERY H2 must match one of these substrings. This is the
@@ -101,7 +168,6 @@ BENCHMARKS_RULES = PageRules(
     ),
     max_h2_sections=16,
     max_prose_paragraphs=35,
-    max_chars=45000,
     min_table_rows=40,
     required_links=(RECORD_LINK,),
     # The scoreboard's sections ARE its schema: a reference engine, a resource
@@ -135,8 +201,12 @@ FEATURES_RULES = PageRules(
         ("How to read this page", ("how to read", "legend", "reading")),
     ),
     max_h2_sections=20,
-    max_prose_paragraphs=20,
-    max_chars=30000,
+    # 21, not 20, since 2026-08-12: _prose_paragraphs now folds list items in,
+    # and this page carries one (the C-ABI capability note). Re-baselined to
+    # what the page measures under the new definition, exactly as the old number
+    # was pinned to what it measured under the old one. Nothing was widened: the
+    # population counted grew, the headroom did not.
+    max_prose_paragraphs=21,
     min_table_rows=60,
     required_links=("STATUS.md", "BENCHMARKS.md"),
 )
@@ -150,11 +220,37 @@ def _is_separator_row(cells: list[str]) -> bool:
     return all(set(cell) <= set("-: ") for cell in cells)
 
 
-def _prose_paragraphs(text: str) -> list[tuple[int, str]]:
-    """Yield (start_line, paragraph) for prose only.
+LIST_ITEM_RE = re.compile(r"^(?:[-*+](?:\s|$)|\d+[.)]\s)")
 
-    Fenced code blocks, tables, headings, and list items are excluded: the rule
-    targets the narrative paragraph, not legitimate tables or code samples.
+
+def _prose_paragraphs(text: str) -> list[tuple[int, str]]:
+    """Yield (start_line, paragraph) for narrative prose.
+
+    Fenced code blocks, tables and headings are excluded: the rule targets the
+    narrative paragraph, not legitimate tables or code samples.
+
+    LIST ITEMS AND BLOCKQUOTE LINES ARE PROSE HERE, folded into the paragraph
+    that runs through them, and that is a 2026-08-12 repair, not the original
+    behaviour (#460, review finding F1). Excluding them meant a bulleted or
+    quoted wall was counted by NOTHING: not this budget, not MAX_PARAGRAPH_CHARS,
+    not MAX_CELL_CHARS, not MAX_ROW_CHARS, and not the dated-heading guard, which
+    only sees a DATE. Two mutations proved it on the real checker: 3,000 appended
+    bullet lines took docs/BENCHMARKS.md to 113,833 characters and 500 appended
+    UNDATED "### Attempt N" sections with bulleted forensics took it to 117,222,
+    and both reported no errors. Folding makes a contiguous run one paragraph, so
+    the wall trips MAX_PARAGRAPH_CHARS, and a run per section trips the paragraph
+    COUNT. Neither live page gains a paragraph from the fold except
+    docs/FEATURES.md, which gains its one list item; see max_prose_paragraphs.
+
+    KNOWN RESIDUE, deliberately left and filed, not silently kept: a line
+    beginning with EMPHASIS rather than a list marker ("**Protocol.** ...") is
+    still excluded, because it starts with "*". That is the accident this
+    exclusion always was, and closing it turns four paragraphs already shipped on
+    docs/BENCHMARKS.md red at 717, 719, 748 and 1,084 characters against
+    MAX_PARAGRAPH_CHARS = 700. Fixing it therefore owes an edit to a page #481
+    holds open, so it takes its own spec and its own red-before rather than
+    riding along here: issue #507, spec W8. A prose wall led by "**bold**" is
+    UNBOUNDED until then.
     """
     paragraphs: list[tuple[int, str]] = []
     current: list[str] = []
@@ -175,12 +271,14 @@ def _prose_paragraphs(text: str) -> list[tuple[int, str]]:
             continue
         if in_fence:
             continue
+        # "-", "+" and ">" are gone from this list entirely, which IS the fold:
+        # a list item or a quoted line now joins the paragraph running through
+        # it. Only "|", "#" and an emphasis-lead "*" still break a paragraph,
+        # and the last of those is the residue documented above, not a rule.
         is_prose = bool(stripped) and not (
             stripped.startswith("|")
             or stripped.startswith("#")
-            or stripped.startswith("-")
-            or stripped.startswith("*")
-            or stripped.startswith(">")
+            or (stripped.startswith("*") and not LIST_ITEM_RE.match(stripped))
         )
         if is_prose:
             if not current:
@@ -192,9 +290,13 @@ def _prose_paragraphs(text: str) -> list[tuple[int, str]]:
     return paragraphs
 
 
-def _table_rows(text: str) -> list[tuple[int, list[str]]]:
-    """Yield (line_number, cells) for every non-separator table row."""
-    rows: list[tuple[int, list[str]]] = []
+def _table_rows(text: str) -> list[tuple[int, list[str], str]]:
+    """Yield (line_number, cells, raw_row) for every non-separator table row.
+
+    The raw row travels with the cells because MAX_ROW_CHARS bounds the ENTRY,
+    which is the whole row, not any one of its cells.
+    """
+    rows: list[tuple[int, list[str], str]] = []
     in_fence = False
     for lineno, raw in enumerate(text.splitlines(), start=1):
         stripped = raw.strip()
@@ -206,8 +308,30 @@ def _table_rows(text: str) -> list[tuple[int, list[str]]]:
         if stripped.startswith("|") and stripped.endswith("|"):
             cells = [c.strip() for c in stripped.strip("|").split("|")]
             if not _is_separator_row(cells):
-                rows.append((lineno, cells))
+                rows.append((lineno, cells, stripped))
     return rows
+
+
+def _headings(text: str) -> list[tuple[int, str]]:
+    """Yield (line_number, title) for every ATX heading, fences excluded.
+
+    Every DEPTH, unlike _h2_headers: the regrowth guard has to see the "### "
+    subsections the canonical-section allowlist never covered.
+    """
+    headings: list[tuple[int, str]] = []
+    in_fence = False
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
+            if title:
+                headings.append((lineno, title))
+    return headings
 
 
 def page_errors(text: str, rules: PageRules) -> list[str]:
@@ -248,12 +372,18 @@ def page_errors(text: str, rules: PageRules) -> list[str]:
             "them (use commas, periods, parentheses, or hyphens)"
         )
 
-    if len(text) > rules.max_chars:
-        errors.append(
-            f"{rules.name} is {len(text)} chars, over the {rules.max_chars}-char "
-            f"{rules.kind} budget; per-attempt detail belongs in the record and "
-            "the lifecycle surfaces, not here"
-        )
+    # REGROWTH GUARD (see DATED_HEADING_RE). A dated heading is what a
+    # per-attempt entry looks like on this page, at any depth, and it fails at
+    # the FIRST one rather than once a count budget fills up.
+    for lineno, title in _headings(text):
+        if DATED_HEADING_RE.search(title):
+            errors.append(
+                f"line {lineno}: heading {title[:60]!r} names a date, so it is "
+                f"a PER-ATTEMPT entry; {rules.name} is a KEYED TABLE and a "
+                "checkpoint updates its ROW. Run "
+                "scripts/roll-benchmark-record.py --apply to move it verbatim "
+                f"into {RECORD_LINK}, and put the date in the row or the prose"
+            )
 
     for link in rules.required_links:
         if link not in text:
@@ -285,7 +415,7 @@ def page_errors(text: str, rules: PageRules) -> list[str]:
             f"{rules.min_table_rows} minimum; the {rules.kind} carries its "
             "content as keyed table rows, not as prose"
         )
-    for lineno, cells in rows:
+    for lineno, cells, raw_row in rows:
         for cell in cells:
             if len(cell) > MAX_CELL_CHARS:
                 errors.append(
@@ -293,6 +423,16 @@ def page_errors(text: str, rules: PageRules) -> list[str]:
                     f"{MAX_CELL_CHARS} (wall-of-prose smell; move the detail "
                     f"to {RECORD_LINK})"
                 )
+        # THE ENTRY CAP (see MAX_ROW_CHARS). This bounds YOUR row, so the cost
+        # of a new measurement is paid by shortening it, never by deleting a
+        # row someone else owns.
+        if len(raw_row) > MAX_ROW_CHARS:
+            errors.append(
+                f"line {lineno}: table row of {len(raw_row)} chars exceeds the "
+                f"{MAX_ROW_CHARS}-char ENTRY budget; shorten THIS row and move "
+                f"its forensics to {RECORD_LINK}. The page itself has no budget "
+                "and never needs an unrelated row deleted to make space"
+            )
     return errors
 
 
@@ -342,7 +482,15 @@ def features_errors(text: str) -> list[str]:
 STATUS = ROOT / "docs/STATUS.md"
 STATUS_RATCHET = {
     "h2_sections": 11,
-    "long_paragraphs": 82,
+    # 75, down from 82 on 2026-08-12. Not a compaction of the page:
+    # _prose_paragraphs now folds list items and blockquote lines into the
+    # paragraph running through them, so docs/STATUS.md's 29 list items join
+    # neighbouring paragraphs instead of splitting them, and the page measures
+    # 75 long paragraphs where it measured 82. A ratchet is pinned to what the
+    # page measures, so it follows the measurement DOWN in the same change that
+    # moved it. Leaving 82 would have banked 7 units of slack this row did not
+    # earn.
+    "long_paragraphs": 75,
     "oversized_cells": 44,
 }
 STATUS_REQUIRED = (
@@ -373,7 +521,7 @@ def status_errors(text: str) -> list[str]:
         ),
         "oversized_cells": sum(
             1
-            for _, cells in _table_rows(text)
+            for _, cells, _raw in _table_rows(text)
             for cell in cells
             if len(cell) > MAX_CELL_CHARS
         ),

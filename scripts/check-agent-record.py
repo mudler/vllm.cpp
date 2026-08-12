@@ -431,6 +431,12 @@ ID_RE = re.compile(
 )
 STATE_RE = re.compile(r"`(" + "|".join(re.escape(state) for state in STATES) + r")`")
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+# Group 1 is the run of fence characters, group 2 everything after it, which is
+# the INFO STRING on an opening fence and must be empty on a closing one. Both
+# groups are load-bearing: see strip_code_spans for the pairing rule and for the
+# live file that mis-paired without it.
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+INLINE_CODE_RE = re.compile(r"`+[^`\n]*`+")
 CLAIM_RE = re.compile(r"CLAIM-[A-Za-z0-9_.-]+")
 LINE_FRAGMENT_RE = re.compile(r"L(\d+)(?:-L?(\d+))?")
 COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
@@ -591,27 +597,108 @@ def parse_claim_rows(path: Path, errors: list[str]) -> list[ClaimRow]:
     return rows
 
 
-def link_base(source: Path, text: str) -> Path:
-    """Resolve migrated legacy links from their original .agents/ location."""
+def strip_code_spans(text: str) -> str:
+    """Blank out fenced blocks and inline code, preserving line and column count.
+
+    A target inside a code span is NOT a link: CommonMark renders it as literal
+    text, so no reader can follow it and there is nothing for "every link
+    resolves" to be about. Before 2026-08-12 this checker validated them anyway
+    (#460), which meant no document in the tree could SHOW a link in sample
+    output, and, worse, that a docs/BENCHMARKS.md row quoting its evidence link
+    could not be archived into .agents/ byte-for-byte.
+
+    THE PAIRING RULE IS COMMONMARK'S, not "the next line that looks like a
+    fence". A closing fence must use the OPENER'S character, be at least as
+    long, and carry nothing but whitespace after the marker; a line with an info
+    string opens a block and never closes one. Getting that wrong does not fail
+    safe, it INVERTS fence phase for the rest of the file: with the one
+    unbalanced fence this tree already has, a bare ``` at
+    .agents/completed/state-events/0000-00/STATE-LEGACY-000001.md:17697 was
+    "closed" by the ```sh at :17948, and ordinary prose at :18297 was blanked,
+    so a live reader-followable link stopped being validated. Measured
+    tree-wide, the loose rule dropped 5 targets and the CommonMark rule drops 4.
+
+    Blanking rather than deleting preserves every line and column offset. Note
+    that check_links reports no line numbers today, so this buys nothing yet; it
+    is kept so that a caller that does report positions cannot be broken by this
+    function, and test_stripping_preserves_line_and_column_positions holds it.
+    """
+    out: list[str] = []
+    fence: str | None = None
+    fence_len = 0
+    for line in text.splitlines():
+        marker = FENCE_RE.match(line)
+        if fence is None:
+            # CommonMark: a backtick opening fence's info string may not contain
+            # a backtick, which is what keeps `` `a` and `b` `` from opening one.
+            if marker is not None and not (
+                marker.group(1)[0] == "`" and "`" in marker.group(2)
+            ):
+                fence = marker.group(1)[0]
+                fence_len = len(marker.group(1))
+                out.append(" " * len(line))
+                continue
+            out.append(INLINE_CODE_RE.sub(lambda m: " " * len(m.group(0)), line))
+            continue
+        if (
+            marker is not None
+            and marker.group(1)[0] == fence
+            and len(marker.group(1)) >= fence_len
+            and not marker.group(2).strip()
+        ):
+            fence = None
+        out.append(" " * len(line))
+    return "\n".join(out)
+
+
+def extract_links(text: str) -> list[str]:
+    """Return every link target a READER could follow in this document."""
+    return LINK_RE.findall(strip_code_spans(text))
+
+
+def link_bases(source: Path, text: str) -> tuple[Path, ...]:
+    """Return every directory a relative link in this file may resolve from.
+
+    Normally exactly one, the file's own directory. Two files are archives that
+    hold content written somewhere else and moved here verbatim, so a target in
+    them was authored against the ORIGINAL directory: migrated legacy
+    state-event payloads came from .agents/, and .agents/benchmark-record.md is
+    the declared archive of docs/BENCHMARKS.md (#460).
+
+    BE PRECISE ABOUT WHAT THE SECOND BASE BUYS. It does NOT make the archived
+    copy clickable: a reader opening .agents/benchmark-record.md on GitHub and
+    clicking a docs/-relative target such as USAGE.md, BUILD.md or
+    bench-evidence/... gets a 404, because the browser resolves it against
+    .agents/. What it enforces is that the EVIDENCE STILL EXISTS in the tree
+    under one of the two declared bases, so archiving a row byte-for-byte cannot
+    silently orphan the file it points at. That is the property the archive
+    exists to give, and it is weaker than followability. Making the archived
+    copy followable means rewriting the target or recording its origin, which is
+    spec W5 and is deliberately not done here: rewriting a target would break
+    the byte-for-byte guarantee, and W5 records the origin instead.
+    """
     if (
         source.is_relative_to(AGENTS / "completed/state-events")
         and "<!-- legacy-payload:begin -->" in text
     ):
-        return AGENTS
-    return source.parent
+        return (AGENTS,)
+    if source == AGENTS / "benchmark-record.md":
+        return (source.parent, ROOT / "docs")
+    return (source.parent,)
 
 
 def check_links(errors: list[str]) -> None:
     for source in markdown_files():
         text = source.read_text(encoding="utf-8")
-        base = link_base(source, text)
-        for raw_target in LINK_RE.findall(text):
+        bases = link_bases(source, text)
+        for raw_target in extract_links(text):
             target = raw_target.strip().strip("<>")
             if not target or target.startswith(("http://", "https://", "mailto:")):
                 continue
             target_path, _, fragment = target.partition("#")
-            resolved = (base / target_path).resolve()
-            if not resolved.exists():
+            candidates = [(base / target_path).resolve() for base in bases]
+            resolved = next((c for c in candidates if c.exists()), None)
+            if resolved is None:
                 errors.append(f"{source.relative_to(ROOT)}: dangling link {raw_target}")
                 continue
             line_match = LINE_FRAGMENT_RE.fullmatch(fragment)

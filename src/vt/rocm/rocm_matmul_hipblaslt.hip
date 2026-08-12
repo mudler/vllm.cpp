@@ -154,6 +154,17 @@ bool GemvEnabled() {
   return on;
 }
 
+// wvSplitK skinny GEMM (rocm_skinny_gemm.hip, #487): the split-K/LDS-staged
+// decode path that beats the 128x128-tile rocBLAS GEMM at M<=4. Default ON for
+// decode-skinny shapes; VT_ROCM_SKINNY=0 restores the BLAS path for A/B.
+bool SkinnyGemmEnabled() {
+  static const bool on = [] {
+    if (const char* e = std::getenv("VT_ROCM_SKINNY")) return e[0] != '0';
+    return true;
+  }();
+  return on;
+}
+
 // y[n] = alpha * dot(x[0:K], W[n,0:K]) + beta * y[n]
 // grid = N — one block per output row; x cached in LDS; block-reduce over K.
 __global__ void Bf16GemvBTRowKernel(__hip_bfloat16* __restrict__ y,
@@ -454,6 +465,11 @@ void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 }
 
 // out[M,N] = a[M,K] @ b[N,K]^T
+// wvSplitK skinny-GEMM host entry (rocm_skinny_gemm.hip, #487). External
+// vt::rocm linkage to match the definition; declared beside its only caller.
+void WvSplitKBT(hipStream_t s, void* out, const void* a, const void* b, int M, int N,
+                int K, int device);
+
 // Row-major trick: gemm(OP_T, OP_N, N, M, K, B, K, A, a_rs, C, N)
 //   BLAS: C = op(A)*op(B) with opA=T => A is KxN in col form = row B[N,K]
 //   opB=N, B is KxM col = row A[M,K] with ld=a_rs
@@ -480,6 +496,16 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   }
   if (a.stride[0] < K) {
     throw std::runtime_error("vt rocm: matmul_bt: bad a stride");
+  }
+
+  // Decode-skinny (M<=4) bf16: the wvSplitK port wins over the 128-tile GEMM
+  // (#487). Gate on the LDS-fit the sml variant needs (K*M activation fits the
+  // 64KB staging buffer); everything else stays on the BLAS path.
+  if (bf16 && out.dtype == DType::kBF16 && M >= 1 && M <= 4 && (K % 8) == 0 &&
+      a.stride[0] == K && K * M <= 32768 && SkinnyGemmEnabled()) {
+    WvSplitKBT(s, out.data, a.data, b.data, static_cast<int>(M), static_cast<int>(N),
+               static_cast<int>(K), q.device.index);
+    return;
   }
 
   // Decode: M=1 BF16 GEMV

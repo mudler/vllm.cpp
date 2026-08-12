@@ -2073,6 +2073,62 @@ TEST_CASE("MoeRouterTopK matches the CPU oracle (f32 and bf16 logits)") {
   }
 }
 
+TEST_CASE("decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle") {
+  // The M<=4 bf16 decode GEMM routes to the wvSplitK port on ROCm (#487).
+  // Real decode shapes; bf16 in/out. NMSE vs the CPU oracle (split-K reduction
+  // order differs from the CPU sequential sum).
+  for (int64_t M : {1, 4}) {
+    for (auto [N, K] : {std::pair<int64_t,int64_t>{5120, 1024}, {1024, 2048}}) {
+      CAPTURE(M);
+      CAPTURE(N);
+      CAPTURE(K);
+      const size_t an = static_cast<size_t>(M) * K, bn = static_cast<size_t>(N) * K;
+      const std::vector<float> a = RandomVec(an, 991);
+      const std::vector<float> b = RandomVec(bn, 992, -0.5f, 0.5f);
+      const std::vector<uint16_t> a_bf = Bf16Bits(a), b_bf = Bf16Bits(b);
+
+      std::vector<uint16_t> ref(static_cast<size_t>(M) * N, 0);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint16_t> ca = a_bf, cb = b_bf;
+        Tensor ta = Tensor::Contiguous(ca.data(), DType::kBF16, cd, {M, K});
+        Tensor tb = Tensor::Contiguous(cb.data(), DType::kBF16, cd, {N, K});
+        Tensor to = Tensor::Contiguous(ref.data(), DType::kBF16, cd, {M, N});
+        vt::MatmulBT(cq, to, ta, tb);
+        cpu.DestroyQueue(cq);
+      }
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kMatmulBT, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBufBytes da(dev, q, an * 2), db(dev, q, bn * 2), dout(dev, q, static_cast<size_t>(M) * N * 2);
+        da.Upload(a_bf.data());
+        db.Upload(b_bf.data());
+        Tensor ta = Tensor::Contiguous(da.ptr(), DType::kBF16, d, {M, K});
+        Tensor tb = Tensor::Contiguous(db.ptr(), DType::kBF16, d, {N, K});
+        Tensor to = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+        vt::MatmulBT(q, to, ta, tb);
+        std::vector<uint16_t> got(static_cast<size_t>(M) * N);
+        dout.Download(got.data());
+        // bf16 outputs; compare as f32 NMSE.
+        std::vector<float> gf(got.size()), rf(got.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+          uint32_t ug = static_cast<uint32_t>(got[i]) << 16, ur = static_cast<uint32_t>(ref[i]) << 16;
+          std::memcpy(&gf[i], &ug, 4);
+          std::memcpy(&rf[i], &ur, 4);
+        }
+        CHECK(Nmse(rf, gf) <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
+
 TEST_CASE("reference tier: an op with no native kernel matches the CPU oracle (unified only)") {
   constexpr int64_t kRows = 7, kCols = 48;
   constexpr size_t kN = kRows * kCols;

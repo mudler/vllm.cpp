@@ -95,7 +95,16 @@ MoE-path coverage is partial: `MoeRouterTopK` (f32/bf16 logits, ungrouped
 softmax, no bias) and `MoeSiluMul` are native; the remaining chain
 (`kSharedExpertGate`, `kMoeCombine`/`kMoeCombineGate`, and the grouped quant
 expert GEMM) is not registered yet, so MoE-bearing models still throw on
-those ops. On a
+those ops.
+
+### ROCm decode GEMM routing (wvSplitK skinny path)
+
+Decode-shaped GEMMs (M<=4, bf16) route to a split-K skinny-GEMM kernel (a port
+of vLLM's `wvSplitK`) instead of the 128x128-tile rocBLAS GEMM that dominates
+decode GPU time ([#487](https://github.com/mudler/vllm.cpp/issues/487)). On by
+default where it fits; `VT_ROCM_SKINNY=0` restores the BLAS path for A/B.
+
+On a
 discrete card there is no CPU fallback tier, so a model whose layers call an op
 that is not registered yet fails loudly with `vt: no kernel for op N on device
 type 5` — that is the memory-safety design working, not a crash. Run with

@@ -12,6 +12,36 @@ zero real golden drift (27B-W4A4 + 32B-NVFP4A16 bit-identical, 35B/Coder
 byte-stable) and unblocked DFlash (vllm#40898), Gemma-4 (`transformers.gemma4`),
 and OLMo-3 (nested rope); a `vllm-oracle-v0.25.0-stage` rollback is preserved.
 
+**The pin, as a running oracle reports itself.** The paragraph above names the
+release; the block below carries the exact strings a runtime identity check can
+compare, measured 2026-08-12 from `~/venvs/vllm-oracle-next` on dgx. They are not
+derivable from the release number — the oracle reports
+`0.23.1rc1.dev1511+g555967922`, not `0.26.0.dev0`, and its distribution metadata
+adds a `.precompiled` suffix its runtime string lacks. `tools/bench/` reads this
+block rather than duplicating it (#520); the duplicate drifted once, and the
+harness spent 17 days *refusing* the oracle this record required. Advance it only
+as part of a sync cycle, from a measured oracle, never by transcribing a version
+number.
+
+```parity-pin
+vllm_commit = 5559679229bc961848b121ccdeaa8fa5d79bec98
+vllm_runtime_version = 0.23.1rc1.dev1511+g555967922
+vllm_distribution_version = 0.23.1rc1.dev1511+g555967922.precompiled
+flashinfer_version = 0.6.15.post1
+```
+
+**`vllm_runtime_version` must carry a `+g<sha>` segment naming `vllm_commit`.**
+That is a permanent constraint of this design, not a property of today's values:
+`assert_oracle_commit` extracts the segment and requires it to prefix
+`vllm_commit`. A released-wheel shape (`0.26.0`, no local version segment) is
+therefore unusable — set the block to one and the harness refuses every oracle
+including the pin itself; measured 2026-08-12, 34 of the 233 `tests/tools` cases
+go red. Fail-closed and CI-caught rather than silent, but it means a pin advance
+is taken from a source build's measured `vllm.__version__`, never transcribed
+from a release number. If a future pin is genuinely a released wheel, give the
+commit its own asserted field first; do not delete the assertion to make the
+block parse.
+
 **Prior cycle (2026-07-12):** audited target v0.25.0 `702f4814fe54`; report
 [`sync/2026-07-12-702f481.md`](sync/2026-07-12-702f481.md). The exact 145-commit
 `e24d1b24..702f481` delta was classified (94 `INVENTORY`, 51 `IGNORE`, no

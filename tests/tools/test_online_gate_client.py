@@ -60,6 +60,7 @@ from tools.bench.online_gate import (
     TRACE_SYSTEM_PATH,
     VLLM_DECODE_FAMILY_CONTRACTS,
     VLLM_GENERATION_WINDOW_CONTRACTS,
+    VLLM_DISTRIBUTION_VERSION,
     VLLM_ORACLE_VERSION,
     OnlineRun,
     build_client_command,
@@ -2047,7 +2048,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 path.write_text(f"{path.name}\n", encoding="utf-8")
             ninja.chmod(0o755)
             distribution = types.SimpleNamespace(
-                version=VLLM_ORACLE_VERSION,
+                version=VLLM_DISTRIBUTION_VERSION,
                 _path=dist_info,
             )
             pandas_distribution = types.SimpleNamespace(
@@ -2092,7 +2093,7 @@ class OnlineClientContractTests(unittest.TestCase):
                 mock.patch("tools.bench.online_gate.sys.executable", str(python)),
             ):
                 result = record_oracle_manifest(output, client=client)
-            self.assertEqual(result["oracle_version"], VLLM_ORACLE_VERSION)
+            self.assertEqual(result["oracle_version"], VLLM_DISTRIBUTION_VERSION)
             self.assertEqual(result["runtime_version"], VLLM_ORACLE_VERSION)
             self.assertEqual(
                 result["bench_dependencies"],
@@ -2289,7 +2290,7 @@ class OnlineClientContractTests(unittest.TestCase):
                         },
                         "client_contract_source_commit": VLLM_COMMIT,
                         "cutlass_source_tree": _fingerprint_tree(cutlass),
-                        "oracle_version": VLLM_ORACLE_VERSION,
+                        "oracle_version": VLLM_DISTRIBUTION_VERSION,
                         "runtime_version": VLLM_ORACLE_VERSION,
                     }
                 ),

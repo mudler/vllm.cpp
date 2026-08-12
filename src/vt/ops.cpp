@@ -1993,6 +1993,213 @@ void KdaChunkPrefill(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
       q, out, q_in, k, v, g_raw, beta, a_log, dt_bias, state, query_start_loc, args);
 }
 
+namespace {
+
+// W1 lands `tp_world_size == 1` only. An unimplemented arm is REFUSED with the
+// missing piece named, never silently mis-computed (mamba2-ssd.md §7): sharding
+// `n_groups` across ranks needs `extra_groups_for_head_shards`
+// (mamba_utils.py:187) plus `mamba_v2_sharded_weight_loader`
+// (mamba_mixer2.py:174-236), neither of which exists here.
+void CheckMamba2NoShard(int64_t tp_world_size, const char* name) {
+  VT_CHECK(tp_world_size == 1,
+           std::string(name) +
+               ": tp_world_size > 1 is NOT implemented (mamba2-ssd.md W1 lands "
+               "tp_world_size == 1); n_groups sharding needs "
+               "extra_groups_for_head_shards (mamba_utils.py:187)");
+}
+
+// A Mamba2 activation/state operand: float in, f32/bf16 out, contiguous, on the
+// queue's device. Every SSD tensor check funnels through here so a shape message
+// can never disagree with a dtype message.
+void CheckMamba2Operand(const Queue& q, const Tensor& t, const char* name, const char* what,
+                        bool is_output) {
+  VT_CHECK(is_output ? IsOutFloat(t.dtype) : IsFloat(t.dtype),
+           std::string(name) + ": " + what + (is_output ? " must be f32/bf16" : " must be float"));
+  VT_CHECK(t.IsContiguous(), std::string(name) + ": " + what + " must be contiguous");
+  VT_CHECK(t.device == q.device, std::string(name) + ": " + what + " must be on the queue device");
+}
+
+}  // namespace
+
+void Mamba2ChunkScan(Queue& q, Tensor& out, Tensor& final_states, const Tensor& x,
+                     const Tensor& dt, const Tensor& A, const Tensor& B, const Tensor& C,
+                     const Tensor* D, const Tensor* z, const Tensor* dt_bias,
+                     const Tensor* initial_states, const Tensor& cu_seqlens,
+                     const Tensor& cu_chunk_seqlens, const Tensor& last_chunk_indices,
+                     const Tensor& seq_idx, const Mamba2Args& args) {
+  constexpr const char* name = "mamba2_chunk_scan";
+  CheckMamba2NoShard(args.tp_world_size, name);
+  // chunk_size must be an integer power of two — `is_int_pow_2`, asserted at
+  // ssd_combined.py:48 before any stage runs.
+  VT_CHECK(args.chunk_size > 0 && (args.chunk_size & (args.chunk_size - 1)) == 0,
+           std::string(name) + ": chunk_size must be an integer power of 2 "
+                               "(ssd_combined.py:48)");
+  // dt_limit is caller-supplied and upstream's default is `(0.0, inf)`
+  // (ssd_combined.py:180). A negative `dt_min` would let `dt` go negative, which
+  // makes `dA_cumsum` NON-monotonic within a chunk and turns upstream's
+  // `min(., 0)` clamps (ssd_chunk_state.py:283-285, ssd_chunk_scan.py:339-341)
+  // from algebraic no-ops into a silent truncation of the recurrence. The
+  // companion precondition `A < 0` is checked against the tensor's contents in
+  // the kernel, where the data lives.
+  VT_CHECK(args.dt_min >= 0.0f && args.dt_max >= args.dt_min,
+           std::string(name) +
+               ": dt_limit must satisfy 0 <= dt_min <= dt_max (upstream default is "
+               "(0.0, inf), ssd_combined.py:180); a negative dt_min admits a negative "
+               "dt and breaks the dA_cumsum monotonicity the intra-chunk clamp rests on");
+  VT_CHECK(x.rank == 3 && dt.rank == 2 && A.rank == 1 && B.rank == 3 && C.rank == 3 &&
+               out.rank == 3 && final_states.rank == 4,
+           std::string(name) +
+               ": x/out [T,H,P], dt [T,H], A [H], B/C [T,G,N], final_states [S,H,P,N]");
+  const int64_t t = x.shape[0], h = x.shape[1], p = x.shape[2];
+  const int64_t g = B.shape[1], n = B.shape[2];
+  VT_CHECK(dt.shape[0] == t && dt.shape[1] == h, std::string(name) + ": dt must be [T,H]");
+  VT_CHECK(A.shape[0] == h, std::string(name) + ": A must be [H]");
+  VT_CHECK(B.shape[0] == t && C.shape[0] == t && C.shape[1] == g && C.shape[2] == n,
+           std::string(name) + ": B and C must both be [T,G,N] (ssd_combined.py:52-55)");
+  VT_CHECK(g >= 1 && h % g == 0,
+           std::string(name) + ": nheads must be divisible by ngroups (ssd_combined.py:51)");
+  VT_CHECK(out.shape[0] == t && out.shape[1] == h && out.shape[2] == p,
+           std::string(name) + ": out must be [T,H,P]");
+  const int64_t s = final_states.shape[0];
+  VT_CHECK(final_states.shape[1] == h && final_states.shape[2] == p &&
+               final_states.shape[3] == n,
+           std::string(name) + ": final_states must be [S,H,P,N]");
+  CheckMamba2Operand(q, x, name, "x", false);
+  CheckMamba2Operand(q, dt, name, "dt", false);
+  CheckMamba2Operand(q, B, name, "B", false);
+  CheckMamba2Operand(q, C, name, "C", false);
+  CheckMamba2Operand(q, out, name, "out", true);
+  // final_states carries `state_dtype` (ssd_combined.py:46,119,176), a knob that
+  // is deliberately INDEPENDENT of the activation dtype — never derive one from
+  // the other (mamba2-ssd.md §7).
+  CheckMamba2Operand(q, final_states, name, "final_states", true);
+  VT_CHECK(A.dtype == DType::kF32 && A.IsContiguous() && A.device == q.device,
+           std::string(name) + ": A must be f32 contiguous on the queue device");
+  if (D != nullptr) {
+    VT_CHECK(D->dtype == DType::kF32 && D->IsContiguous() && D->device == q.device,
+             std::string(name) + ": D must be f32 contiguous on the queue device");
+    VT_CHECK((D->rank == 1 && D->shape[0] == h) ||
+                 (D->rank == 2 && D->shape[0] == h && D->shape[1] == p),
+             std::string(name) + ": D must be [H] or [H,P] (ssd_combined.py:56-57)");
+  }
+  if (z != nullptr) {
+    VT_CHECK(z->rank == 3 && z->shape[0] == t && z->shape[1] == h && z->shape[2] == p,
+             std::string(name) + ": z must be [T,H,P] (ssd_combined.py:54-55)");
+    CheckMamba2Operand(q, *z, name, "z", false);
+  }
+  if (dt_bias != nullptr) {
+    VT_CHECK(dt_bias->rank == 1 && dt_bias->shape[0] == h && dt_bias->dtype == DType::kF32 &&
+                 dt_bias->IsContiguous() && dt_bias->device == q.device,
+             std::string(name) + ": dt_bias must be f32 [H] contiguous on the queue device");
+  }
+  if (initial_states != nullptr) {
+    VT_CHECK(initial_states->rank == 4 && initial_states->shape[0] == s &&
+                 initial_states->shape[1] == h && initial_states->shape[2] == p &&
+                 initial_states->shape[3] == n,
+             std::string(name) +
+                 ": initial_states must be [S,H,P,N] (ssd_combined.py:78-79, :194)");
+    CheckMamba2Operand(q, *initial_states, name, "initial_states", true);
+  }
+  CheckI32Meta(q, cu_seqlens, s + 1, name, "cu_seqlens");
+  CheckI32Meta(q, last_chunk_indices, s, name, "last_chunk_indices");
+  const int64_t nchunks = cu_chunk_seqlens.rank == 1 ? cu_chunk_seqlens.shape[0] - 1 : -1;
+  VT_CHECK(nchunks >= 0, std::string(name) + ": cu_chunk_seqlens must be i32 [nchunks+1]");
+  CheckI32Meta(q, cu_chunk_seqlens, nchunks + 1, name, "cu_chunk_seqlens");
+  // seq_idx is PER CHUNK, not per token — `seq_idx.shape == (nchunks,)`,
+  // asserted at ssd_combined.py:60-61 and documented at :189.
+  CheckI32Meta(q, seq_idx, nchunks, name, "seq_idx (PER CHUNK, ssd_combined.py:60-61)");
+  reinterpret_cast<Mamba2ChunkScanFn>(GetOp(OpId::kMamba2ChunkScan, q.device.type))(
+      q, out, final_states, x, dt, A, B, C, D, z, dt_bias, initial_states, cu_seqlens,
+      cu_chunk_seqlens, last_chunk_indices, seq_idx, args);
+}
+
+void Mamba2StateUpdate(Queue& q, Tensor& out, Tensor& state, const Tensor& x,
+                       const Tensor& dt, const Tensor& A, const Tensor& B, const Tensor& C,
+                       const Tensor* D, const Tensor* z, const Tensor* dt_bias,
+                       const Tensor* state_indices, const Mamba2Args& args) {
+  constexpr const char* name = "mamba2_state_update";
+  CheckMamba2NoShard(args.tp_world_size, name);
+  VT_CHECK(x.rank == 3 && dt.rank == 2 && A.rank == 1 && B.rank == 3 && C.rank == 3 &&
+               out.rank == 3 && state.rank == 4,
+           std::string(name) +
+               ": x/out [Nb,H,P], dt [Nb,H], A [H], B/C [Nb,G,N], state [S,H,P,N]");
+  const int64_t nb = x.shape[0], h = x.shape[1], p = x.shape[2];
+  const int64_t g = B.shape[1], n = B.shape[2];
+  VT_CHECK(dt.shape[0] == nb && dt.shape[1] == h,
+           std::string(name) + ": dt must be [Nb,H] (scalar per head; Mamba2 tie_hdim)");
+  VT_CHECK(A.shape[0] == h, std::string(name) + ": A must be [H]");
+  VT_CHECK(B.shape[0] == nb && C.shape[0] == nb && C.shape[1] == g && C.shape[2] == n,
+           std::string(name) + ": B and C must both be [Nb,G,N]");
+  VT_CHECK(g >= 1 && h % g == 0,
+           std::string(name) + ": nheads must be divisible by ngroups (mamba_ssm.py:583)");
+  VT_CHECK(out.shape[0] == nb && out.shape[1] == h && out.shape[2] == p,
+           std::string(name) + ": out must be [Nb,H,P]");
+  VT_CHECK(state.shape[1] == h && state.shape[2] == p && state.shape[3] == n,
+           std::string(name) + ": state must be [S,H,P,N]");
+  CheckMamba2Operand(q, x, name, "x", false);
+  CheckMamba2Operand(q, dt, name, "dt", false);
+  CheckMamba2Operand(q, B, name, "B", false);
+  CheckMamba2Operand(q, C, name, "C", false);
+  CheckMamba2Operand(q, out, name, "out", true);
+  // The SSM cache dtype is its own knob (mamba2_state_dtype, mamba_utils.py:73-81).
+  CheckMamba2Operand(q, state, name, "state", true);
+  VT_CHECK(A.dtype == DType::kF32 && A.IsContiguous() && A.device == q.device,
+           std::string(name) + ": A must be f32 contiguous on the queue device");
+  if (D != nullptr) {
+    VT_CHECK(D->rank == 1 && D->shape[0] == h && D->dtype == DType::kF32 &&
+                 D->IsContiguous() && D->device == q.device,
+             std::string(name) + ": D must be f32 [H] contiguous on the queue device");
+  }
+  if (z != nullptr) {
+    VT_CHECK(z->rank == 3 && z->shape[0] == nb && z->shape[1] == h && z->shape[2] == p,
+             std::string(name) + ": z must be [Nb,H,P]");
+    CheckMamba2Operand(q, *z, name, "z", false);
+  }
+  if (dt_bias != nullptr) {
+    VT_CHECK(dt_bias->rank == 1 && dt_bias->shape[0] == h && dt_bias->dtype == DType::kF32 &&
+                 dt_bias->IsContiguous() && dt_bias->device == q.device,
+             std::string(name) + ": dt_bias must be f32 [H] contiguous on the queue device");
+  }
+  if (state_indices == nullptr) {
+    VT_CHECK(state.shape[0] == nb,
+             std::string(name) +
+                 ": without state_indices the state is compact, one row per token");
+  } else {
+    CheckI32Meta(q, *state_indices, nb, name, "state_indices");
+  }
+  reinterpret_cast<Mamba2StateUpdateFn>(GetOp(OpId::kMamba2StateUpdate, q.device.type))(
+      q, out, state, x, dt, A, B, C, D, z, dt_bias, state_indices, args);
+}
+
+void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
+                       const Tensor* weight, const RmsNormGatedGroupArgs& args) {
+  constexpr const char* name = "rms_norm_gated_group";
+  CheckMamba2NoShard(args.tp_world_size, name);
+  VT_CHECK(x.rank >= 2 && x.rank <= 3, std::string(name) + ": x must be rank 2 or 3");
+  VT_CHECK(gate.rank == x.rank && out.rank == x.rank,
+           std::string(name) + ": gate and out must have x's rank");
+  for (int d = 0; d < x.rank; ++d) {
+    VT_CHECK(gate.shape[d] == x.shape[d] && out.shape[d] == x.shape[d],
+             std::string(name) + ": gate and out must have x's shape");
+  }
+  const int64_t hidden = x.shape[x.rank - 1];
+  VT_CHECK(args.n_groups >= 1 && hidden % args.n_groups == 0,
+           std::string(name) +
+               ": n_groups must divide the last dim (group_size = hidden / n_groups, "
+               "mamba_mixer2.py:80)");
+  CheckMamba2Operand(q, x, name, "x", false);
+  CheckMamba2Operand(q, gate, name, "gate", false);
+  CheckMamba2Operand(q, out, name, "out", true);
+  if (weight != nullptr) {
+    VT_CHECK(weight->rank == 1 && weight->shape[0] == hidden,
+             std::string(name) + ": weight must be [hidden]");
+    CheckMamba2Operand(q, *weight, name, "weight", false);
+  }
+  VT_CHECK(args.eps > 0.0f, std::string(name) + ": eps must be > 0");
+  reinterpret_cast<RmsNormGatedGroupFn>(GetOp(OpId::kRmsNormGatedGroup, q.device.type))(
+      q, out, x, gate, weight, args);
+}
+
 void GdnDecode(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k, const Tensor& v,
                const Tensor& g, const Tensor& beta, Tensor& state, const GdnArgs& args,
                const Tensor* state_idx) {

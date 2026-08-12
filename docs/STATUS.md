@@ -25,9 +25,14 @@ hardware here, it is stated as such rather than implied. **The parity pin
 advanced 2026-07-26 to vLLM 0.26.0.dev0 (`55596792`) + transformers 5.14.1**
 (from 0.25.0); correctness was re-validated bit-identical on the new oracle
 (zero golden drift; see [.agents/specs/pin-advance.md](../.agents/specs/pin-advance.md)),
-so the token-exact claims hold against the new pin. Historical speed figures
-citing "vLLM 0.25.0" are the last binding measurement against the prior oracle
-(our engine is unchanged by the advance); a re-benchmark against 0.26 is pending.
+so the token-exact claims hold against the new pin. Every speed figure citing
+"vLLM 0.25.0" was measured against the preserved rollback, and NOT only before
+the advance: the benchmark harness hard-enforced 0.25.0 and *raised* on the pin
+until 2026-08-12, so no run through it could have used the pin
+([#520](https://github.com/mudler/vllm.cpp/issues/520)). Those figures are
+attributed rather than withdrawn (our engine is unchanged by the advance, and
+the two oracles tie in speed where that was checked); a re-benchmark at the pin
+is pending and blocked on [#522](https://github.com/mudler/vllm.cpp/issues/522).
 
 ## Capability status
 

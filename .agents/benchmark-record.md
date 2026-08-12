@@ -20208,3 +20208,117 @@ Consequence: upstream's DRAM efficiency (210.7 GB/s) remains DERIVED from
 time x bytes rather than directly counted, and its L2 hit rate / occupancy cannot
 be compared against our measured 9.5% / 24.0%. The only remaining route is a
 standalone harness calling moe_wna16_marlin_gemm outside the engine.
+## ORACLE PROVENANCE: every online-serving ratio on this project ran against the 0.25.0 ROLLBACK, because the harness ENFORCED it (2026-08-12, `row/BENCH-ORACLE-PIN-RECONCILE`, #520, no GPU work)
+
+This entry adds no measurement. It records **which oracle the existing ones
+used**, which was not knowable from the numbers themselves, and it is filed here
+rather than in `docs/BENCHMARKS.md` because it re-labels many rows at once.
+
+### The mechanism, which is stronger than #375
+
+`.agents/upstream-sync.md:7-9` advanced the parity pin to `555967922` on
+2026-07-26. `tools/bench/online_gate.py:53-54` still read
+`VLLM_ORACLE_VERSION = "0.25.0"` / `FLASHINFER_VERSION = "0.6.13"`, and
+`serve_low_common.py:28` still read `VLLM_COMMIT = 702f4814…`, enforced by a
+`raise` at `online_gate.py:3509-3533`.
+
+So this is not the #375 story of an operator resolving a stale symlink. **The
+gate refused the pin.** For 17 days no run through the canonical harness could
+have named a compliant denominator, however careful the operator was. AGENTS.md
+calls this a record disagreeing with the tree; it is reconciled in this row.
+
+Confirmed live the same day: `~/venvs/vllm-oracle -> vllm-oracle-v0.25.0-stage`,
+and `scripts/dgx-online-serving.sh:35` resolves exactly that path, so the
+canonical driver took the rollback by construction.
+
+### Measured identity of both venvs (dgx, read-only ssh, 2026-08-12)
+
+| | `vllm-oracle-v0.25.0-stage` (what ran) | `vllm-oracle-next` (**the PIN**) |
+|---|---|---|
+| `vllm.__version__` | `0.25.0` | `0.23.1rc1.dev1511+g555967922` |
+| distribution metadata | `0.25.0` | `0.23.1rc1.dev1511+g555967922.precompiled` |
+| `flashinfer.__version__` | `0.6.13` | `0.6.15.post1` |
+| torch / transformers | 2.11.0 / 5.13.1 | 2.13.0 / 5.14.1 |
+| pandas | 2.2.3 | **MISSING** (#522) |
+| install shape | site-packages | **editable** → `~/work/vllm-src-5559679` @`5559679229bc9618` |
+
+**Two traps worth more than the table.** (1) The pin is an *editable* install, so
+`<venv>/lib/python3.12/site-packages/vllm` DOES NOT EXIST; a `grep -r` under that
+path returns nothing and reads exactly like "the feature is absent from the pin".
+(2) The pin's runtime string is `0.23.1rc1.dev1511+g555967922`, **not** the
+`0.26.0.dev0` the pin record's prose names, and its metadata carries a
+`.precompiled` suffix the runtime string lacks — so the old
+`metadata == runtime == CONST` check was unsatisfiable at the pin for ANY value.
+
+### What is now labelled, and what is NOT thereby wrong
+
+Every `0.25.0` row in the `docs/BENCHMARKS.md` online-serving table, the 27B
+canonical six-point grid (`0.9371x-0.9561x`), and the 35B canonical grid
+(`0.918x-0.972x`) name the ROLLBACK. #417 measured the rollback and the rebuilt
+pin **equivalent in speed** on the 27B at c1 (rollback/pin 0.9983 mean, 0.9996
+median, OVERLAPPING, n=3), so this is a **provenance defect, not a numbers
+defect** — the figures are not withdrawn, they are attributed. A binding grid
+against the pin is owed and is blocked by #522.
+
+The 35B grid measured 2026-08-12 (reported `0.9840` / `0.9817` at c1 falling to
+`0.9309` at c4) was **run through this same harness and therefore against the
+rollback**. It is not otherwise recorded in this tree, and its evidence artifacts
+are not committed, so it is named here for provenance only and is not quotable
+until recorded with them.
+
+**The figure `0.9781` does not exist in this repository.** Grepped across
+`docs/` and `.agents/`: zero hits. The nearest real values are the
+2026-08-10 `a0fa12c7` grid's c1 output-throughput ratio `0.979` and c1 mean TPOT
+`0.978` (this file, §"35B c2/c8 weak cells REFUTED"), which the 2026-08-11
+canonical grid at `348c265d` supersedes with c1 `0.9708`. Anyone carrying
+`0.9781` forward is carrying a number no artifact produced.
+
+### `docs/BENCHMARKS.md` disagreed with itself about the 35B, and now does not
+
+Its scoreboard row named the CANONICAL 2026-08-11 grid (`0.918x-0.972x`,
+`348c265d`) while its own by-concurrency table below still printed the SUPERSEDED
+2026-08-10 `a0fa12c7` grid (`0.935x-0.979x`) with no SHA on the rows. Both grids
+are real and both are binding-harness runs at different code SHAs; the page
+simply did not say which was which. Reconciled by labelling each row with its
+grid, keeping the `a0fa12c7` TPOT/TTFT/CoV detail that #414 and #417 both cite
+rather than evicting it.
+
+### `--language-model-only` EXISTS at the pin — the "it does not" report is REFUTED
+
+A live claim held that the flag is absent from the pinned vLLM (`grep -r
+language_model_only` empty, absent from `vllm serve --help`), which would have
+meant every 27B run quoting "oracle GRAPHED + `--language-model-only`" used
+something other than the pin. **Both premises were artifacts of how they were
+checked, and the flag is present and accepted on BOTH venvs:**
+
+| check | pin (`vllm-oracle-next`) | rollback (`v0.25.0-stage`) |
+|---|---|---|
+| `engine/arg_utils.py` registration | `:1276` | `:1241` |
+| `vllm serve --help=all` occurrences | **1** | **1** |
+| `vllm serve --help=language-model-only` | resolves, with help text | resolves, with help text |
+| config consumer | `config/multimodal.py:326` | `:325` |
+
+The grep was empty because the pin is an editable install (no `site-packages/vllm`
+to grep). The flag is missing from `vllm serve --help` because that output is a
+**summary**; it ends with "For full list: `vllm serve --help=all`". A null grep
+proved the path wrong, not the feature absent.
+
+**So no ratio needs re-labelling on account of the flag's existence.** The
+separate and still-live defect is #414: the canonical driver
+(`scripts/dgx-online-serving.sh:460-478`) never PASSES it, so the oracle runs the
+unfused QK-norm+RoPE+gate path while our arm runs the fused one. Note also that
+`tools/bench/run_serve_low.py:549`, the repo's only other mention, sits inside
+`build_dry_run_manifest` with `<VLLM_ORACLE>` / `<MODEL_SNAPSHOT>` placeholders —
+it is a RECORDED RECIPE, not executed argv, so nothing in the tree verifies that
+a serve-low server was actually launched with the flag it documents.
+
+### The repair, and why it is not just three new constants
+
+`.agents/upstream-sync.md` gains a machine-readable `parity-pin` block carrying
+the four exact strings a runtime check can compare; `tools/bench/` reads it
+instead of duplicating it. The assertion is **strengthened, not relaxed**: the
+resolved commit is now asserted via the `+g<sha>` segment of `vllm.__version__`,
+which is the only term that separates the pin from the rollback — the rollback
+runs, is deterministic, and reports a perfectly clean `0.25.0`. `PANDAS_VERSION`
+is deliberately left failing closed at the pin (#522) rather than papered over.
+18 new tests in `tests/tools/test_oracle_pin.py`; `tests/tools` 208 → 226, green.

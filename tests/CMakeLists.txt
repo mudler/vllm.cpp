@@ -191,6 +191,14 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
 target_include_directories(test_deepseek_v4_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# DeepSeek-V4-Pro shape-generality gate (#504): the Pro config descends through
+# the SAME ParseDeepseekV4Params with zero new keys, and compress_ratios alone
+# reproduces the compressor/indexer layer counts of BOTH real checkpoints
+# (Flash 41/21, Pro 61/30). No checkpoint / GPU — Pro's 805 GiB does not fit one
+# GB10, so a load gate is memory-infeasible (.agents/specs/deepseek-v4-pro.md).
+vllm_cpp_add_test(test_deepseek_v4_pro_variant vllm/models/test_deepseek_v4_pro_variant.cpp)
+target_include_directories(test_deepseek_v4_pro_variant PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # Laguna-S-2.1 W1/W2 scaffolding gate: LagunaForCausalLM RESOLVES through the
 # registry + ParseLagunaParams descends the shipped config (nested dual-rope +
 # variable Q-head + ungrouped sigmoid-noaux MoE). No 73 GB checkpoint / GPU — the
@@ -1169,6 +1177,15 @@ vllm_cpp_add_test(test_ops_kda_recurrence vt/test_ops_kda_recurrence.cpp)
 target_include_directories(test_ops_kda_recurrence PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_kda_chunk_prefill vt/test_ops_kda_chunk_prefill.cpp)
 target_include_directories(test_ops_kda_chunk_prefill PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# Mamba2 / SSD host references (.agents/specs/mamba2-ssd.md W1, #496). Three
+# sibling ops of the GDN/KDA lane above, gated against a sequential
+# double-precision reference and across chunk sizes.
+vllm_cpp_add_test(test_ops_mamba2_ssd vt/test_ops_mamba2_ssd.cpp)
+target_include_directories(test_ops_mamba2_ssd PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_mamba2_state_update vt/test_ops_mamba2_state_update.cpp)
+target_include_directories(test_ops_mamba2_state_update PRIVATE ${CMAKE_SOURCE_DIR}/src)
+vllm_cpp_add_test(test_ops_mamba2_gated_norm vt/test_ops_mamba2_gated_norm.cpp)
+target_include_directories(test_ops_mamba2_gated_norm PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe vt/test_ops_moe.cpp)
 vllm_cpp_add_test(test_ops_glue vt/test_ops_glue.cpp)
 vllm_cpp_add_test(test_ops_attn_preamble vt/test_ops_attn_preamble.cpp)

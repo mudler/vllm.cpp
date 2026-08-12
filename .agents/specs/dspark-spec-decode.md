@@ -1566,9 +1566,13 @@ allocator), not in anything the kernel or its inputs express.
    (no padding), and the whole slab is 268 MB on both sides. There is no
    oversizing or stride inflation to remove.
 2. `cudaMemAdvise` / preferred-location hints on the expert slab.
-3. Upstream's `ncu` counters (currently BLOCKED: its EngineCore will not
-   initialise under ncu kernel replay) to confirm its DRAM efficiency directly
-   rather than deriving it.
+3. Upstream's `ncu` counters -- **BLOCKED, both replay modes TRIED.** Its
+   EngineCore fails to initialise under `ncu` with the default kernel replay AND
+   with `--replay-mode application` (identical "Engine core initialization
+   failed"), so the profiler's mere presence breaks vLLM's init on this stack.
+   Its DRAM efficiency therefore stays DERIVED (210.7 GB/s from time x bytes),
+   not directly counted. A standalone harness that calls `moe_wna16_marlin_gemm`
+   outside the engine is the only remaining route.
 
 **Campaign verdict: 0.975x code cell, 1.012x prose cell, NOT parity.** The
 residual is now measured, localised to one kernel, quantified per unit of work,

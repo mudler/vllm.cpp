@@ -20195,3 +20195,16 @@ cannot recover the 12.9% bandwidth difference.
 That closes the last cheap lever. What remains needs upstream's ncu counters
 (blocked: its EngineCore will not initialise under ncu kernel replay) or
 cudaMemAdvise-style placement experiments whose premise is currently unverified.
+
+## SPEC-DSPARK: upstream ncu is blocked in BOTH replay modes (2026-08-12)
+
+Recorded earlier as "blocked under kernel replay" with `--replay-mode
+application` listed as an option. Tried it: identical failure ("Engine core
+initialization failed"), so vLLM's EngineCore will not initialise under ncu on
+this stack in either mode -- the profiler's presence alone breaks init, not the
+kernel serialisation.
+
+Consequence: upstream's DRAM efficiency (210.7 GB/s) remains DERIVED from
+time x bytes rather than directly counted, and its L2 hit rate / occupancy cannot
+be compared against our measured 9.5% / 24.0%. The only remaining route is a
+standalone harness calling moe_wna16_marlin_gemm outside the engine.

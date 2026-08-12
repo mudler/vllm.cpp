@@ -529,7 +529,16 @@ memory-system behaviour that no allocation change we can name would alter; upstr
 ncu in either replay mode. A C_tmp over-allocation (15-30 MB vs upstream's
 3.15 MB) was found and fixed, but an in-session A/B shows it is perf-NEUTRAL
 (+0.03%) -- an apparent +2.9% was machine drift, since GB10 cannot lock memory
-clocks. Editing
+clocks. The ratio has now been measured WITHIN a single session three times --
+0.9757, 0.9646 and (ours->oracle->ours at free clocks, drift -0.89%) 0.9569 --
+so it is **~0.966 +/- 0.01, consistently below 1.0**, while the absolute numbers
+move up to 5% BETWEEN sessions for the same binary. Storage was raised as a
+possible distortion and is refuted: the weights are on local NVMe (no NAS mount
+exists on the box), a run reads 22.06 GB once at load, decode-time RSS is 4.8 GB
+because the mapping is released after upload, and 8 warm reps hold a 0.5%
+spread -- decode touches no storage. (That NVMe is 98% full, 76 GB free, which
+is its own operational risk given ENOSPC has previously produced a green report
+over a gate that never ran.) Editing
 the kernel, its launch config, layout or flags is NOT indicated: all are proven
 identical. (The repack kernels that appear to take 40% of a long run are
 LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has

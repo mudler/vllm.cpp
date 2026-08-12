@@ -20353,3 +20353,34 @@ per stream), NOT as a perf fix; C_tmp size is ELIMINATED as an explanation of th
 Method: third time drift has fooled a before/after here. Pairing caught the
 first, pinned clocks the second, and only an in-process toggle catches this one.
 Future perf claims on this row need the toggle, not two runs.
+
+## SPEC-DSPARK: storage ruled out; ratio stable at ~0.966 across three sessions (2026-08-12)
+
+Question raised: are the weights on NAS, or not fully resident, distorting the
+measurements?
+
+Weights are on LOCAL NVMe (/dev/nvme0n1p2 ext4); no NAS mount exists on the box.
+A run reads 22.06 GB total = one full model read at load. Process RSS during
+decode is 4.8 GB, so weights are uploaded and the mapping released, not held.
+Decode is stable to 0.5% across 8 warm reps (146.0-147.6), which file-backed
+weights could not be. Storage is NOT a factor.
+
+Operational: that NVMe is 98% full (76 GB free), and this repo has already lost a
+gate run to ENOSPC reporting green over work that never ran.
+
+Within-session ratios, three independent measurements:
+
+| session | ours | oracle (modal) | ratio |
+|---|---|---|---|
+| pinned clocks, pre-C_tmp | 135.98 | 139.36 | 0.9757 |
+| pinned clocks, post-C_tmp | 139.20 | 144.32 | 0.9646 |
+| free clocks, ours->oracle->ours | 140.98 | 147.32 | 0.9569 |
+
+~0.966 +/- 0.01, consistently below 1.0. Absolute numbers move up to 5% between
+sessions for the SAME binary because GB10's memory clock cannot be pinned, so
+only the within-session ratio is quotable -- and all three agree.
+
+Oracle draws remain bimodal (~147.3 and ~155.6), the same one-extra-accepted-token
+effect as the fibacc run, so its MODAL draws are the honest denominator.
+
+Evidence: `dgx:~/work/dspark-w6/iocheck.log`, `final_pair.log`.

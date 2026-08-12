@@ -1623,6 +1623,47 @@ in-process A/B switch, because on a machine whose memory clock cannot be pinned,
 even a pinned-clock before/after across two runs is not a controlled experiment.
 Any future perf claim on this row needs the toggle, not two runs.
 
+## 6ac. STORAGE RULED OUT, and the ratio is stable at ~0.966 (2026-08-12)
+
+Developer question: could the weights being on NAS, or not fully resident in
+device memory, be distorting these measurements?
+
+**Tested, and no.**
+
+| check | result |
+|---|---|
+| weight location | local NVMe (`/dev/nvme0n1p2`, ext4) -- **no NAS mount exists on this box** |
+| total disk read for a run | 22.06 GB, i.e. ONE full model read at load |
+| process RSS during decode | 4.8 GB -- the weights are NOT held in host RSS; they are uploaded and the mapping released |
+| decode stability | 8 warm reps at 146.0 / 147.6 / 147.2 / 146.9 / 147.2 / 147.3 / 147.4 -- **0.5% spread** |
+
+If weights were still file-backed, decode would fault pages from NVMe and the
+per-rep numbers would be erratic; a 0.5% spread says they are resident and decode
+touches no storage. Worth keeping in mind that on GB10 the failure mode would be
+severe if it ever regressed -- host pages reach the GPU through ATS, which this
+repo measured at a 20-30% per-GEMM penalty.
+
+**Operational finding worth acting on separately:** that NVMe is **98% full**
+(3.4T of 3.6T, 76 GB free). This repo has already lost a gate run to ENOSPC
+producing a green-looking report over work that never executed.
+
+**And the ratio is now measured three times, each WITHIN one session:**
+
+| session | ours | oracle (modal) | ratio |
+|---|---|---|---|
+| pinned clocks, pre-C_tmp | 135.98 | 139.36 | 0.9757 |
+| pinned clocks, post-C_tmp | 139.20 | 144.32 | 0.9646 |
+| free clocks, ours->oracle->ours | 140.98 | 147.32 | **0.9569** |
+
+**~0.966 +/- 0.01, consistently below 1.0.** The absolute numbers move a lot
+between sessions (135.98 to 142.09 for the same binary) because GB10's memory
+clock cannot be pinned, which is exactly why only the within-session ratio is
+quotable -- and all three agree.
+
+Also visible in the last run: the oracle's draws are bimodal at ~147.3 and
+~155.6, the same one-extra-accepted-token effect as §6q, which is why its MODAL
+draws are the honest denominator.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.

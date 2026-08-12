@@ -556,7 +556,12 @@ recurrences + fused attn preamble; 27B prefill 21.5x, decode
 [campaign](../.agents/specs/vulkan-full-support.md)), ROCm (W0 community-green
 on 5 gfx archs; the APU unified-memory fix remains unverified; gfx1200 runs
 Gemma-3 and Qwen3 all-native, with Gemma-3 strict 48/48 against two vLLM-ROCm
-oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-native
+oracles and Qwen3 in a measured near-tie regime; on gfx1100 the M4 gate now
+runs against the **pinned vLLM-ROCm oracle built on the same box**
+(`555967922` / `0.23.1rc1.dev1511+g555967922`): Qwen3-0.6B **16/16 PASS**
+(11/16 strict token-exact, 5/16 near-tie band, max teacher-forced gap 0.125
+nats, 0 forward-divergent; oracle K=10 deterministic in every cell) with the
+ROCm device-golden lane in `test_qwen3_paged_engine`; Qwen3.5-0.8B GDN runs all-native
 but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
 contributor-measured on 2x R9700 and CPU-link-verified our side; a `head_dim=128`
 decode arm lands opt-in behind `VT_ATTN_DECODE_D128`, default OFF, which moves

@@ -199,14 +199,16 @@ always-on one:
 - `test_modelopt_mixed_precision` — always-on, curated fixture at
   `tests/fixtures/modelopt_mixed_precision/curated_config.json`, whose real
   entries are copied verbatim from the checkpoint and whose synthetic entries
-  are each annotated with the strategy they exist to reach. **22 cases, 137
-  assertions.**
+  are each annotated with the strategy they exist to reach. **26 cases, 167
+  assertions** (22 / 137 as first landed; see the W1 repair note below).
 - `test_modelopt_mixed_precision_checkpoint` — exhaustive, reads the real
   1.3 MB `config.json` from `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4`,
-  asserts all 5981 + 72 entries and the exact histogram. **2 cases, 12145
-  assertions, GREEN** (the checkpoint is staged on the NAS and reachable from
-  the CPU box, so this ran rather than skipping). Exits 77 — CTest *Skipped*,
-  with a loud banner — when the checkpoint is absent.
+  asserts all 5981 + 72 entries and the exact histogram, plus the standalone
+  `hf_quant_config.json` the repair below added. **3 cases, 12181 assertions,
+  GREEN** (2 / 12145 as first landed; the checkpoint is staged on the NAS and
+  reachable from the CPU box, so this ran rather than skipping). Exits 77 —
+  CTest *Skipped*, with a loud banner naming the exact export — when the
+  checkpoint is absent.
 
 **One deliberate divergence from upstream**, recorded here because it is a
 policy choice and not a port: an algorithm that resolves to something this
@@ -220,6 +222,61 @@ which is precisely the stop condition §0 names. A prefix simply ABSENT from
 
 **Still owed by later W's:** nothing consumes the resolver yet — no loader, no
 `get_quant_method` equivalent, no kernel selection. W3 wires it.
+
+### W1 repair — the fresh review returned FAIL (2026-08-12)
+
+Reviewed at `f5c901ce`; repaired on `row/MODEL-NEMOTRON-H-W1-FIX`. The review
+confirmed all five resolution strategies against a verbatim upstream
+transcription (63,787 + 6,493 prefixes, **0 diffs**) and found one real defect
+plus four guarantees the suite did not actually hold.
+
+**The defect: `Parse` refused the driver checkpoint's own `hf_quant_config.json`
+(HIGH).** `Parse` gated on `ExtractQuantAlgo`, which mirrors
+`_extract_modelopt_quant_algo` (`modelopt.py:245-263`) and requires a top-level
+`quant_method` starting with `"modelopt"`. That precondition belongs to the
+SELECTION hook — `override_quantization_method` uses it to tell a ModelOpt
+`quantization_config` apart from a compressed-tensors one in the same field of
+the same `config.json`. Upstream's PARSER, `from_config` (`:282-367`), never
+inspects `quant_method` at all: it dispatches on the SHAPE. The real file has
+top-level keys exactly `{producer, quantization}` and names no `quant_method`
+anywhere, so the header threw
+`std::invalid_argument: not a MIXED_PRECISION config (quant_algo="", quant_method="")`
+on the one config `get_config_filenames()` (`:265-267`) actually points at,
+while upstream parsed it and resolved all 5981 entries. Detection and parsing
+are now separate: `ShapeQuantAlgo` for `Parse`, `ExtractQuantAlgo` for
+`IsMixedPrecision`.
+
+**Four guarantees the tests did not hold.** Each survived the reviewer's
+mutation with the suite green; each now has a case that catches it, proven by
+re-applying that exact mutation:
+
+| Guarantee | Mutation that used to survive | Now caught by |
+|---|---|---|
+| Scans run in INSERTION order (`ordered_json`, header divergence 3) | load the fixture with plain `nlohmann::json` | `synthetic.layers.2.self_attn` resolves FP8, not W4A16_NVFP4 — sorted, `k_proj` comes first |
+| Strategies 3 and 4 return the FIRST matching child | return the LAST match | new `synthetic.layers.8.moe.{a,b}_proj`, the first parent whose first and last child DISAGREE |
+| Strategy 2's algo set spans ALL base candidates, unlike strategy 5 | rebuild the set per candidate | new `language_model.model...q_proj` / `model.language_model...k_proj` pair — the union raises, a per-candidate rebuild returns FP8 and never sees the second spelling |
+| `is_layer_skipped`'s `experts` branch (`quant_utils.py:559-565`) | invert `e.find(prefix)`, or delete the branch | an `ignore` naming ONE expert child must exclude the whole container |
+
+**`FnMatch` vs CPython, measured not assumed.** Two differential sweeps against
+`fnmatch.fnmatchcase`: 3,183,165 pairs (names ≤3, patterns ≤5) with **0**
+mismatches, and 6,291,453 pairs (names ≤2, patterns ≤6) with **108** across 20
+patterns — all one class, all CPython-True/ours-False, all a bracket whose
+contents reduce to a bare `!` after `translate` drops a REVERSED range
+(`[?-.!]` → `(?s:.)\Z`). Recorded in the header and NOT fixed: matching it means
+reproducing `translate`'s rewriting, and ModelOpt emits no bracket expressions
+at all, so no reachable input touches it.
+
+**Why a plain `ctest` skips the exhaustive arm.** `CHECKPOINT_ROOT` is a `.env`
+key and `.env` is not exported by anything; the repo's documented loader is
+`set -a; . ./.env; set +a` (`.env.example`, `.agents/environment.md`). There is
+no CTest-side `.env` reader, and `tests/parity/hf_snapshot.h` — the only other
+checkpoint gate — resolves a Hugging Face cache under `$HOME`, not a NAS
+directory, so it does not apply. The skip banner now names the exact export
+rather than pretending the arm ran.
+
+Gate after repair: **26 cases / 167 assertions** curated (was 22 / 137),
+**3 cases / 12181 assertions** exhaustive (was 2 / 12145), clean Release
+`-Werror`, ASan and UBSan clean, full `ctest` 396/396.
 
 ## 5. Gates
 

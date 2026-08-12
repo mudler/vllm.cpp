@@ -88,12 +88,26 @@ TEST_CASE("modelopt-mixed: MIXED_PRECISION is detected, other algos are not") {
   cased["quant_method"] = "ModelOpt";
   CHECK(MixedPrecisionConfig::IsMixedPrecision(cased));
 
-  // modelopt.py:2340-2347 also accepts the legacy nested shape.
+  // modelopt.py:2340-2347 also accepts the legacy nested shape. Built with the
+  // REAL top-level key set of an hf_quant_config.json — {producer,
+  // quantization} — which names NO quant_method anywhere in the file.
   nlohmann::ordered_json nested;
-  nested["quant_method"] = "modelopt";
+  nested["producer"] = nlohmann::ordered_json::object();
+  nested["producer"]["name"] = "modelopt";
   nested["quantization"] = nlohmann::ordered_json::object();
   nested["quantization"]["quant_algo"] = "MIXED_PRECISION";
   nested["quantization"]["quantized_layers"] = qc.at("quantized_layers");
+
+  // PARSING mirrors from_config (modelopt.py:282-367), which dispatches on the
+  // SHAPE and never reads quant_method. Gating Parse on quant_method — the
+  // precondition that belongs to the SELECTION hook :245-263 — refused the
+  // driver checkpoint's own hf_quant_config.json outright.
+  CHECK(MixedPrecisionConfig::Parse(nested).num_quantized_layers() ==
+        qc.at("quantized_layers").size());
+  // DETECTION does keep it: _extract_modelopt_quant_algo returns None for a
+  // config that does not name modelopt, so the override hook must not claim it.
+  CHECK_FALSE(MixedPrecisionConfig::IsMixedPrecision(nested));
+  nested["quant_method"] = "modelopt";
   CHECK(MixedPrecisionConfig::IsMixedPrecision(nested));
   CHECK(MixedPrecisionConfig::Parse(nested).num_quantized_layers() ==
         qc.at("quantized_layers").size());
@@ -101,7 +115,7 @@ TEST_CASE("modelopt-mixed: MIXED_PRECISION is detected, other algos are not") {
 
 TEST_CASE("modelopt-mixed: parse reads the fixture's shape") {
   const MixedPrecisionConfig c = Curated();
-  CHECK(c.num_quantized_layers() == 28);
+  CHECK(c.num_quantized_layers() == 32);
   CHECK(c.exclude_modules().size() == 14);
   // modelopt.py:2360-2372: no top-level group_size, so it is SEEDED from the
   // first NVFP4-family entry.
@@ -201,6 +215,33 @@ TEST_CASE("modelopt-mixed: strategy 2 RAISES when fused shards disagree") {
                        std::invalid_argument);
 }
 
+TEST_CASE("modelopt-mixed: strategy 2's algo set spans ALL base candidates") {
+  MixedPrecisionConfig c = Curated();
+  c.SetPackedModulesMapping(StandardPacked());
+
+  // Strategy 2 (modelopt.py:2429-2447) builds ONE algo set over every base
+  // prefix candidate and decides once. Strategy 5 (:2463-2486) rebuilds the set
+  // per candidate and returns on the first candidate that yields exactly one.
+  // The code carries a comment saying so, and every other fused entry in this
+  // fixture has a SINGLE prefix candidate — where the two are indistinguishable,
+  // so flattening strategy 2 into strategy 5's shape survives them all.
+  //
+  // Here the shards are split across the two `language_model` spellings
+  // (:2496-2503): q_proj=FP8 under "language_model.model.", k_proj=W4A16_NVFP4
+  // under "model.language_model.". The union is {FP8, W4A16_NVFP4} and must
+  // RAISE. Rebuilding per candidate would see {FP8} on the first spelling,
+  // return it, and never look at the second — a fused layer half loaded as 4-bit
+  // and half as 8-bit, silently.
+  CHECK_THROWS_AS(c.Resolve("language_model.model.layers.5.self_attn.qkv_proj"),
+                  std::invalid_argument);
+  CHECK_THROWS_WITH_AS(
+      c.Resolve("language_model.model.layers.5.self_attn.qkv_proj"),
+      doctest::Contains("W4A16_NVFP4"), std::invalid_argument);
+  // ...and from the other spelling, where the candidate ORDER is reversed.
+  CHECK_THROWS_AS(c.Resolve("model.language_model.layers.5.self_attn.qkv_proj"),
+                  std::invalid_argument);
+}
+
 // --- strategy 3: prefix lookup (modelopt.py:2449-2453) ---------------------
 
 TEST_CASE("modelopt-mixed: strategy 3 resolves a parent module by prefix") {
@@ -221,6 +262,50 @@ TEST_CASE("modelopt-mixed: strategy 3 resolves a parent module by prefix") {
         QuantAlgo::kUnquantized);
   CHECK(c.Resolve("backbone.layers.1.mixer.expert").algo ==
         QuantAlgo::kUnquantized);
+}
+
+TEST_CASE("modelopt-mixed: strategy 3 returns the FIRST child, not the last") {
+  const MixedPrecisionConfig c = Curated();
+
+  // modelopt.py:2449-2453 iterates `quantized_layers` and returns on the first
+  // key that startswith(candidate + "."). Every OTHER parent in this fixture
+  // has children that agree, or whose first and last child agree
+  // (synthetic.layers.2.self_attn is q/k/v = FP8/W4A16/FP8), so "return the
+  // LAST match" survives them. synthetic.layers.8.moe is a_proj=FP8 then
+  // b_proj=W4A16_NVFP4: first and last differ.
+  const ModuleQuant moe = c.Resolve("synthetic.layers.8.moe");
+  CHECK(moe.algo == QuantAlgo::kFp8);
+  CHECK(moe.how == Resolution::kPrefix);
+  CHECK(moe.group_size == 0);
+
+  // Strategy 4 (:2455-2461) scans the same way and owes the same guarantee.
+  const ModuleQuant experts = c.Resolve("synthetic.layers.8.moe.experts");
+  CHECK(experts.algo == QuantAlgo::kFp8);
+  CHECK(experts.how == Resolution::kExpertsParent);
+  CHECK(experts.group_size == 0);
+}
+
+TEST_CASE("modelopt-mixed: INSERTION order, not lexicographic, decides the scans") {
+  // Divergence 3 in the header: `Parse` is templated so callers can hand it
+  // `ordered_json`. Upstream iterates a Python dict, i.e. INSERTION order;
+  // plain `nlohmann::json` sorts object keys lexicographically. That is not a
+  // stylistic preference — it changes the ANSWER, and this case is what pins
+  // it. synthetic.layers.2.self_attn is inserted q_proj(FP8), k_proj(W4A16),
+  // v_proj(FP8); sorted, k_proj comes FIRST. So a plain-`json` load flips both
+  // the strategy-3 and the strategy-4 result from FP8 to W4A16_NVFP4 — a wrong
+  // scheme on a real module, which is exactly the invisible-to-a-token-gate
+  // failure this row exists for.
+  const MixedPrecisionConfig c = Curated();
+
+  const ModuleQuant parent = c.Resolve("synthetic.layers.2.self_attn");
+  CHECK(parent.algo == QuantAlgo::kFp8);
+  CHECK(parent.how == Resolution::kPrefix);
+  CHECK(parent.group_size == 0);
+
+  const ModuleQuant experts = c.Resolve("synthetic.layers.2.self_attn.experts");
+  CHECK(experts.algo == QuantAlgo::kFp8);
+  CHECK(experts.how == Resolution::kExpertsParent);
+  CHECK(experts.group_size == 0);
 }
 
 // --- strategy 4: the ".experts" special case (modelopt.py:2455-2461) -------
@@ -281,6 +366,44 @@ TEST_CASE("modelopt-mixed: ignore-list entries resolve to unquantized") {
   CHECK(c.IsLayerExcluded("mtp.layers.0.mixer.up_proj"));
   CHECK(c.Resolve("mtp.layers.0.mixer.up_proj").how == Resolution::kExcluded);
   CHECK_FALSE(c.IsLayerExcluded("backbone.layers.1.mixer.experts.0.up_proj"));
+}
+
+TEST_CASE("modelopt-mixed: an ignored expert CHILD excludes its CONTAINER") {
+  nlohmann::ordered_json qc = LoadFixture();
+  qc["ignore"] = nlohmann::ordered_json::array(
+      {"backbone.layers.1.mixer.experts.0.up_proj"});
+  const MixedPrecisionConfig c = MixedPrecisionConfig::Parse(qc);
+
+  // quant_utils.py:559-565 gives a prefix containing "experts" its own rule,
+  // and the direction is the surprising one: `prefix in layer_name` — the
+  // IGNORE ENTRY must contain the PREFIX, not the other way round. ModelOpt
+  // lists experts per index, while a FusedMoE layer is ONE module covering all
+  // of them, so naming a single expert child unquantizes the whole container.
+  //
+  // Nothing else can reach this branch: the exact pass wants equality, the
+  // legacy substring pass tests `prefix.find(entry)` (the OPPOSITE direction,
+  // which is npos here), and the wildcard pass has no wildcard to match. So
+  // without this case both inverting the test to `prefix.find(entry)` and
+  // deleting the branch outright leave the suite green.
+  CHECK(c.IsLayerExcluded("backbone.layers.1.mixer.experts"));
+  CHECK(c.Resolve("backbone.layers.1.mixer.experts").how == Resolution::kExcluded);
+  CHECK(c.Resolve("backbone.layers.1.mixer.experts").algo ==
+        QuantAlgo::kUnquantized);
+
+  // The named child itself, and every deeper path the entry contains.
+  CHECK(c.IsLayerExcluded("backbone.layers.1.mixer.experts.0.up_proj"));
+  CHECK(c.IsLayerExcluded("backbone.layers.1.mixer.experts.0"));
+
+  // ...but NOT a sibling the entry does not contain: expert 1 stays quantized,
+  // and so does a differently named container in the same layer.
+  CHECK_FALSE(c.IsLayerExcluded("backbone.layers.1.mixer.experts.1.up_proj"));
+  CHECK(c.Resolve("backbone.layers.1.mixer.experts.1.up_proj").algo ==
+        QuantAlgo::kW4A16Nvfp4);
+  CHECK_FALSE(c.IsLayerExcluded("backbone.layers.1.mixer.shared_experts"));
+
+  // A prefix WITHOUT "experts" never enters the branch, so the same entry does
+  // not exclude it even though it is a strict prefix of that entry.
+  CHECK_FALSE(c.IsLayerExcluded("backbone.layers.1.mixer"));
 }
 
 TEST_CASE("modelopt-mixed: the legacy SUBSTRING exclusion rule still applies") {

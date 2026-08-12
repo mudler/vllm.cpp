@@ -43,16 +43,36 @@ namespace {
   std::exit(77);
 }
 
-// $CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4/config.json — the path
+// $CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4/<file> — the path
 // .agents/specs/nemotron-h-model.md §0 records the checkpoint is staged at.
-std::string ConfigPath() {
+//
+// HOW TO MAKE THIS ARM RUN. `CHECKPOINT_ROOT` is a `.env` key, and `.env` is
+// not exported into a login shell by anything: `.env.example` and
+// `.agents/environment.md` document the loader as `set -a; . ./.env; set +a`,
+// and that IS the repo's convention — there is no CTest-side mechanism that
+// reads `.env`, and the only other checkpoint-gated helper here
+// (`tests/parity/hf_snapshot.h`) resolves a Hugging Face cache under `$HOME`
+// rather than a NAS-staged directory, so it does not apply. A plain `ctest`
+// from a shell that has not sourced `.env` therefore SKIPS this arm, which is
+// correct behavior and not a pass — the banner below names the exact export.
+std::string CheckpointFile(const char* filename) {
   const char* root = std::getenv("CHECKPOINT_ROOT");
   if (root == nullptr || *root == '\0') {
-    SkipGate("CHECKPOINT_ROOT is unset; the 30B NVFP4 checkpoint is not staged here");
+    SkipGate(
+        std::string("CHECKPOINT_ROOT is unset, so ") + filename +
+        " cannot be located.\n"
+        "*** To RUN this arm, load the repo env first — `.env.example` and\n"
+        "***   .agents/environment.md document exactly this:\n"
+        "***       set -a; . ./.env; set +a\n"
+        "***   then re-run ctest. Equivalently, export it for one run:\n"
+        "***       CHECKPOINT_ROOT=<shared checkpoint dir> ctest -R "
+        "test_modelopt_mixed_precision_checkpoint\n"
+        "***   The arm needs only\n"
+        "***   $CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4/{config,"
+        "hf_quant_config}.json — no weights, no GPU");
   }
-  const std::filesystem::path p = std::filesystem::path(root) /
-                                  "nemotron-3.5-lightning-30b-nvfp4" /
-                                  "config.json";
+  const std::filesystem::path p =
+      std::filesystem::path(root) / "nemotron-3.5-lightning-30b-nvfp4" / filename;
   std::error_code ec;
   if (!std::filesystem::exists(p, ec)) {
     SkipGate("not staged: " + p.string());
@@ -60,13 +80,19 @@ std::string ConfigPath() {
   return p.string();
 }
 
-nlohmann::ordered_json LoadQuantizationConfig() {
-  const std::string path = ConfigPath();
+nlohmann::ordered_json LoadJson(const char* filename) {
+  const std::string path = CheckpointFile(filename);
   std::ifstream f(path);
   REQUIRE_MESSAGE(f.good(), "cannot open: ", path);
-  nlohmann::ordered_json doc = nlohmann::ordered_json::parse(f);
+  return nlohmann::ordered_json::parse(f);
+}
+
+// config.json -> quantization_config: the FLAT (compressed-tensors style)
+// shape, `{"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", ...}`.
+nlohmann::ordered_json LoadQuantizationConfig() {
+  nlohmann::ordered_json doc = LoadJson("config.json");
   REQUIRE_MESSAGE(doc.contains("quantization_config"),
-                  "no quantization_config in ", path);
+                  "no quantization_config in config.json");
   return doc.at("quantization_config");
 }
 
@@ -153,4 +179,73 @@ TEST_CASE("modelopt-mixed[ckpt]: the module prefixes the loader will actually as
   // The whole MTP head is covered by the "mtp*" wildcard.
   CHECK(c.IsLayerExcluded("mtp.layers.0.mixer.up_proj"));
   CHECK(c.IsLayerExcluded("mtp.layers.0.eh_proj"));
+}
+
+// The checkpoint ships its quantization config TWICE: once flat inside
+// config.json's `quantization_config`, and once in the standalone
+// `hf_quant_config.json` that ModelOpt actually writes and that
+// `get_config_filenames()` (modelopt.py:265-267) names. Only the first shape
+// was gated, and the second is the one upstream's own file list points at.
+//
+// Its top-level key set is exactly {"producer", "quantization"} — there is NO
+// `quant_method` anywhere in the file. `from_config` (modelopt.py:282-367)
+// does not want one: it dispatches on the SHAPE and reads `quant_algo` out of
+// the nested section. Borrowing the SELECTION hook's `quant_method`
+// precondition (`_extract_modelopt_quant_algo`, :245-263, used only by
+// `override_quantization_method`) made `Parse` REFUSE this file outright while
+// a verbatim upstream transcription resolved all 5981 entries from it.
+TEST_CASE("modelopt-mixed[ckpt]: the standalone hf_quant_config.json parses") {
+  const nlohmann::ordered_json hq = LoadJson("hf_quant_config.json");
+
+  // Assert the SHAPE this case exists for, so a re-quantized publish that
+  // changed it fails here rather than quietly retargeting the case.
+  REQUIRE(hq.is_object());
+  REQUIRE(hq.contains("quantization"));
+  REQUIRE_FALSE(hq.contains("quant_method"));
+  REQUIRE_FALSE(hq.at("quantization").contains("quant_method"));
+  CHECK(hq.at("quantization").at("quant_algo") == "MIXED_PRECISION");
+
+  // DETECTION still refuses it, and that is upstream's behavior, not a bug:
+  // `_extract_modelopt_quant_algo` returns None for a config naming no
+  // quantizer. The override hook is for `config.json`'s `quantization_config`,
+  // where several vendors share one field and the name is what tells them apart.
+  CHECK_FALSE(MixedPrecisionConfig::IsMixedPrecision(hq));
+
+  // PARSING must accept it — this is the file the loader will be handed.
+  const MixedPrecisionConfig c = MixedPrecisionConfig::Parse(hq);
+  CHECK(c.num_quantized_layers() == 5981);
+  CHECK(c.exclude_modules().size() == 72);
+  CHECK(c.group_size() == 16);
+  // The nested shape spells kv cache as a plain algo STRING
+  // (`kv_cache_quant_algo`), where the flat shape uses a `kv_cache_scheme`
+  // dict. Both must land on the same answer.
+  CHECK(c.kv_cache_quant_algo() == "FP8");
+
+  // ABSOLUTE expectations first. Comparing the two shapes to each other proves
+  // consistency, not correctness — both arms call the same resolver, so a
+  // wrong answer agrees with itself perfectly.
+  CHECK(c.Resolve("backbone.layers.0.mixer.in_proj").algo == QuantAlgo::kFp8);
+  CHECK(c.Resolve("backbone.layers.0.mixer.in_proj").group_size == 0);
+  CHECK(c.Resolve("backbone.layers.1.mixer.experts").algo ==
+        QuantAlgo::kW4A16Nvfp4);
+  CHECK(c.Resolve("backbone.layers.1.mixer.experts").how == Resolution::kPrefix);
+  CHECK(c.Resolve("backbone.layers.1.mixer.experts").group_size == 16);
+  CHECK(c.Resolve("backbone.layers.5.mixer.q_proj").how == Resolution::kExcluded);
+  CHECK(c.Resolve("lm_head").algo == QuantAlgo::kW4A16Nvfp4);
+  CHECK(c.IsLayerExcluded("mtp.layers.0.eh_proj"));
+
+  // ...and only THEN that the flat shape agrees module for module.
+  const MixedPrecisionConfig flat =
+      MixedPrecisionConfig::Parse(LoadQuantizationConfig());
+  for (const char* p : {"backbone.layers.0.mixer.in_proj",
+                        "backbone.layers.1.mixer.experts",
+                        "backbone.layers.5.mixer.q_proj", "lm_head",
+                        "mtp.layers.0.eh_proj"}) {
+    CAPTURE(p);
+    const ModuleQuant a = c.Resolve(p);
+    const ModuleQuant b = flat.Resolve(p);
+    CHECK(a.algo == b.algo);
+    CHECK(a.how == b.how);
+    CHECK(a.group_size == b.group_size);
+  }
 }

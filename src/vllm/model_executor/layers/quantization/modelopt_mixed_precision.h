@@ -243,6 +243,28 @@ inline bool MatchOneToken(char c, const std::string& pat, std::size_t p,
 // itself only ever emits `module_path*` (the real checkpoint's one wildcard
 // entry is `mtp*`); the rest of the syntax is mirrored so a hand-edited or
 // future config cannot be silently mis-read.
+//
+// ONE KNOWN DIVERGENCE CLASS, measured and deliberately left alone. Swept
+// differentially against CPython 3.12 `fnmatch.fnmatchcase`:
+//
+//   names <=3 chars over {a,b,.,0} x patterns <=5 over {a,.,?,*,[,],!,-}
+//     3,183,165 pairs, 0 mismatches
+//   names <=2 chars over {a,b,.,0} x patterns <=6 over the same alphabet
+//     6,291,453 pairs, 108 mismatches spanning 20 distinct patterns
+//
+// All 108 are ONE class and all in the same direction (CPython True, this
+// False): a bracket whose contents reduce to a bare `!` once CPython's
+// `translate` has DROPPED a reversed range. `[?-.!]` is the smallest —
+// `?`(0x3f) down to `.`(0x2e) is empty, so `stuff` becomes `"!"`, and
+// translate's "negated empty class matches any character" rule compiles the
+// whole pattern to `(?s:.)\Z`. Matching that means reproducing translate's
+// REWRITING, not its matching: a bracket-by-bracket matcher cannot see it.
+//
+// Not fixed on purpose. It needs a reversed range AND a trailing `!` inside one
+// class; ModelOpt emits no bracket expressions at all (`mtp*` is the real
+// checkpoint's only wildcard), so nothing in the reachable input space can
+// touch it, and the risk of rewriting a matcher to chase a `translate` quirk
+// exceeds the risk of leaving it recorded here.
 inline bool FnMatch(const std::string& name, const std::string& pat) {
   std::size_t n = 0, p = 0, star = std::string::npos, retry = 0;
   while (n < name.size()) {
@@ -274,10 +296,13 @@ inline bool FnMatch(const std::string& name, const std::string& pat) {
 // `ignore` list, and the resolved config-level group size.
 class MixedPrecisionConfig {
  public:
-  // modelopt.py:2333-2339 override_quantization_method + :245-263
-  // _extract_modelopt_quant_algo. True only for a modelopt config whose
-  // quant_algo is MIXED_PRECISION, in either the flat (config.json
-  // `quantization_config`) or the legacy nested (`hf_quant_config.json`) shape.
+  // SELECTION, not parsing: modelopt.py:2333-2339 override_quantization_method
+  // + :245-263 _extract_modelopt_quant_algo. It answers "is this config MINE to
+  // claim?", so it requires the config to NAME modelopt in `quant_method`
+  // before its quant_algo is read at all — that is how upstream tells a
+  // ModelOpt `quantization_config` apart from a compressed-tensors one sitting
+  // in the same field of the same config.json. `Parse` must NOT share this
+  // precondition; see the comment on it.
   template <class Json>
   static bool IsMixedPrecision(const Json& cfg) {
     if (!cfg.is_object()) return false;
@@ -285,17 +310,28 @@ class MixedPrecisionConfig {
   }
 
   // modelopt.py:282-367 from_config + :2349-2410 _from_config.
+  //
+  // PARSING is deliberately NOT gated on `quant_method`. `from_config` never
+  // looks at it: it dispatches on the SHAPE (`"quantization" in config`,
+  // :283-318) and reads `quant_algo` out of whichever shape that was. The
+  // distinction is not academic — the driver checkpoint's own
+  // `hf_quant_config.json`
+  // ($CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4, repo
+  // nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 @29f2d174) has exactly
+  // two top-level keys, `producer` and `quantization`, and names no
+  // `quant_method` anywhere in the file. Borrowing the selection hook's
+  // precondition here refused that file outright while upstream parsed it and
+  // resolved all 5981 entries.
   template <class Json>
   static MixedPrecisionConfig Parse(const Json& cfg) {
     if (!cfg.is_object()) {
       throw std::invalid_argument(
           "modelopt: quantization config must be a JSON object");
     }
-    if (ExtractQuantAlgo(cfg) != "MIXED_PRECISION") {
+    if (ShapeQuantAlgo(cfg) != "MIXED_PRECISION") {
       throw std::invalid_argument(
           "modelopt: not a MIXED_PRECISION config (quant_algo=\"" +
-          ExtractQuantAlgo(cfg) + "\", quant_method=\"" +
-          StringField(cfg, "quant_method") + "\")");
+          ShapeQuantAlgo(cfg) + "\")");
     }
 
     // from_config picks BOTH shapes apart: the nested `{"quantization": {...}}`
@@ -478,7 +514,21 @@ class MixedPrecisionConfig {
     return cfg[key].template get<std::string>();
   }
 
-  // modelopt.py:245-263 _extract_modelopt_quant_algo.
+  // The `quant_algo` of whichever config SHAPE this is — the shape dispatch of
+  // from_config, modelopt.py:283-318, and like it blind to `quant_method`:
+  // nested `{"quantization": {...}}` for hf_quant_config.json, flat for a
+  // config.json `quantization_config`.
+  template <class Json>
+  static std::string ShapeQuantAlgo(const Json& cfg) {
+    if (cfg.contains("quantization")) {
+      if (!cfg["quantization"].is_object()) return std::string();
+      return detail::Upper(StringField(cfg["quantization"], "quant_algo"));
+    }
+    return detail::Upper(StringField(cfg, "quant_algo"));
+  }
+
+  // modelopt.py:245-263 _extract_modelopt_quant_algo — the SELECTION hook, and
+  // the ONLY place the `quant_method` precondition belongs.
   template <class Json>
   static std::string ExtractQuantAlgo(const Json& cfg) {
     std::string method = StringField(cfg, "quant_method");
@@ -486,11 +536,7 @@ class MixedPrecisionConfig {
       if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     }
     if (!detail::StartsWith(method, "modelopt")) return std::string();
-    if (cfg.contains("quantization")) {
-      if (!cfg["quantization"].is_object()) return std::string();
-      return detail::Upper(StringField(cfg["quantization"], "quant_algo"));
-    }
-    return detail::Upper(StringField(cfg, "quant_algo"));
+    return ShapeQuantAlgo(cfg);
   }
 
   const Entry* Find(const std::string& name) const {
@@ -562,8 +608,18 @@ class MixedPrecisionConfig {
       return skipped;
     }
 
+    // quant_utils.py:559-565. Note the direction, which is the opposite of
+    // every other rule here: `prefix in layer_name` — the IGNORE ENTRY must
+    // contain the PREFIX. ModelOpt lists experts one index at a time while a
+    // FusedMoE layer is ONE module spanning all of them, so naming any single
+    // expert child leaves the whole container unquantized.
     if (prefix.find("experts") != std::string::npos) {
       for (const std::string& e : exclude_modules_) {
+        // Upstream's `filter(lambda l: "experts" in l, ...)`, mirrored though
+        // provably redundant: the guard above says `prefix` contains "experts",
+        // and the next line only returns for an `e` that contains `prefix`, so
+        // any `e` that could return already contains "experts". Kept so the two
+        // implementations read alike; no input can make it change the answer.
         if (e.find("experts") == std::string::npos) continue;
         if (e.find(prefix) != std::string::npos) return true;
       }

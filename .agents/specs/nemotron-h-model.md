@@ -94,9 +94,45 @@ memory format against the oracle explicitly.
 | MTP | `models/nemotron_h_mtp.py::NemotronHMTP` (`registry.py:638`) |
 | MIXED_PRECISION resolution | `layers/quantization/modelopt.py:2280-2450`, per-layer lookup `:2416-2445` |
 
-The `quantized_layers` lookup is **direct name first, then shard prefix**
-(`modelopt.py:2426`, `:2437`). Mirror both, in that order; a merged/sharded
-local name that resolves only by prefix is the case that will bite.
+**Correction (W1, 2026-08-12).** This section previously said the
+`quantized_layers` lookup is "direct name first, then shard prefix
+(`modelopt.py:2426`, `:2437`)". That understated upstream and was a defect in
+this spec, not in upstream. `_resolve_quant_algo` (`modelopt.py:2412-2487`) has
+**five** strategies and tries them in this order:
+
+1. **Direct lookup** (`:2424-2427`) over `_quantized_layer_prefix_candidates`.
+2. **Packed/fused lookup** (`:2429-2447`): unfuse via the model's
+   `packed_modules_mapping`, collect each shard's algo **across all base
+   candidates**, and **raise `ValueError`** if the shards of one fused layer
+   disagree.
+3. **Prefix lookup** (`:2449-2453`): any `quantized_layers` key starting with
+   `prefix + "."`, returning the first in map order.
+4. **The `.experts` special case** (`:2455-2461`): a `FusedMoE` layer's prefix
+   is `...moe.experts` while ModelOpt lists `...moe.up_proj` / `...moe.down_proj`,
+   so the container falls back to its parent.
+5. **`fused_projection_shards` fallback** (`:2463-2486`): `qkv_proj ->
+   (q_proj, k_proj, v_proj)` and `gate_up_proj -> (gate_proj, up_proj)` for
+   configs that list shard names with no `packed_modules_mapping` registered.
+   The algo set is rebuilt **per candidate** here, unlike strategy 2, and it
+   raises on disagreement too.
+
+`_quantized_layer_prefix_candidates` (`:2489-2505`) itself yields the prefix, a
+bare `lm_head` when the prefix ends in `.lm_head` (the real checkpoint stores a
+BARE `lm_head` key), and the `language_model.model.` <-> `model.language_model.`
+swap, de-duplicated in order.
+
+Exclusion is separate and is checked **first**, in `get_quant_method`
+(`:2515-2522`): `is_layer_excluded` (`:145-181`) runs `is_layer_skipped`
+(`quant_utils.py:510-572`, which raises on a partially-excluded fused layer),
+then a legacy substring rule kept for pre-0.39 exports, then `fnmatch`
+wildcards — which is how the real `ignore` entry `mtp*` covers the whole MTP
+head.
+
+**Measured on the real config** (all 5981 `quantized_layers` entries and all 72
+`ignore` entries): the histogram is exactly `{W4A16_NVFP4: 5935, FP8: 46}`,
+every entry resolves by strategy **1** alone, and no entry collides with the
+`ignore` list. Strategies 2-5 are therefore not reachable from this checkpoint
+and are covered by synthetic fixture entries instead — see W1 below.
 
 Config note: `nemotron_h.py` reads `config.hybrid_override_pattern`, which
 newer transformers exposes as a property derived from `layers_block_type`
@@ -141,6 +177,49 @@ cannot.
 | **W4** | `nemotron_h.cpp` forward: hybrid layer loop, Mamba2 mixer wiring, 6 attention layers, MoE layers | CPU forward runs; per-layer activations vs a dumped oracle reference | #496 W1, W2, W3 |
 | **W5** | MTP head (`mtp.layers.0`, `eh_proj`/`enorm`/`hnorm`) on the existing spec-decode seam | draft acceptance non-zero; spec-off and spec-on token-identical | W4 |
 | **W6** | **GB10 e2e token gate vs the pinned oracle** | token-exact greedy, identical prompts/counts/batching/sampling; oracle identity asserted | #496 W2 (CUDA), W4, W5 |
+
+### W1 progress — the resolver has LANDED (2026-08-12)
+
+`src/vllm/model_executor/layers/quantization/modelopt_mixed_precision.h`,
+header-only, mirroring `modelopt.py` at the pin. It sits under `src/` rather
+than beside its two `include/vllm/...` siblings on purpose:
+`check-doc-checkpoint` classifies the whole `include/vllm/` prefix as a
+user-facing surface and demands `docs/USAGE.md` move with it, and nothing this
+header does is user-facing yet — it is not on the `include/vllm.h` ABI and no
+loader calls it, so that edit would have documented nothing. **W3 promotes it to
+`include/` when it becomes part of the consumed surface**, and pays the public
+document obligation that genuinely applies then. Parses either config shape,
+resolves a module prefix through all five strategies plus the exclusion pass,
+and returns a TYPED `ModuleQuant` (algo, which strategy answered, group size)
+rather than a raw string.
+
+Two gate arms, deliberately two binaries so the opt-in one cannot mask the
+always-on one:
+
+- `test_modelopt_mixed_precision` — always-on, curated fixture at
+  `tests/fixtures/modelopt_mixed_precision/curated_config.json`, whose real
+  entries are copied verbatim from the checkpoint and whose synthetic entries
+  are each annotated with the strategy they exist to reach. **22 cases, 137
+  assertions.**
+- `test_modelopt_mixed_precision_checkpoint` — exhaustive, reads the real
+  1.3 MB `config.json` from `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4`,
+  asserts all 5981 + 72 entries and the exact histogram. **2 cases, 12145
+  assertions, GREEN** (the checkpoint is staged on the NAS and reachable from
+  the CPU box, so this ran rather than skipping). Exits 77 — CTest *Skipped*,
+  with a loud banner — when the checkpoint is absent.
+
+**One deliberate divergence from upstream**, recorded here because it is a
+policy choice and not a port: an algorithm that resolves to something this
+consumer does not implement is **refused by name**. Upstream's
+`get_quant_method` falls through to `UnquantizedLinearMethod()` for anything
+outside {FP8, NVFP4, W4A16_NVFP4, MXFP8} — including `FP8_PB_WO` and
+`FP8_PER_CHANNEL_PER_TOKEN`, which are entries of its own `QUANT_ALGOS`. Silent
+dequantization is numerically correct and therefore invisible to a token gate,
+which is precisely the stop condition §0 names. A prefix simply ABSENT from
+`quantized_layers` is not this case and stays unquantized, as upstream.
+
+**Still owed by later W's:** nothing consumes the resolver yet — no loader, no
+`get_quant_method` equivalent, no kernel selection. W3 wires it.
 
 ## 5. Gates
 

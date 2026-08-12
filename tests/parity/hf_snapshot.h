@@ -41,19 +41,6 @@ inline constexpr const char* kQwen27NvfP4Revision =
 inline constexpr const char* kNemotron35LightningNvfP4Revision =
     "29f2d1746d8f41e316523194b19018707749b1b1";
 
-// The Nemotron-3.5-Lightning gate model (#517). Unlike the Qwen pins above,
-// this one is NOT in the HF cache: it is staged on the NAS as a `local_dir`
-// snapshot at `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4`, so there is
-// no `models--org--name/snapshots/<rev>` layout to resolve. The env override is
-// therefore the ONLY reachable path, and the cache spelling below exists so the
-// revision still names what the golden belongs to. Absent env var => "" => the
-// caller emits its loud SKIP, which is the intended behavior off the gate host.
-inline std::string Nemotron35LightningSnapshot() {
-  return HfSnapshot("models--nvidia--NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
-                    kNemotron35LightningNvfP4Revision,
-                    "VT_NEMOTRON35_SNAPSHOT");
-}
-
 // Snapshot directory for `<repo>` at `revision`, or "" when it is not cached
 // (the caller then emits its loud SKIP). `env_override`, when set and non-empty,
 // names an explicit snapshot directory for a deliberate different-checkpoint
@@ -177,6 +164,19 @@ inline constexpr const char* kQwen27DFlashDraftRevision =
 inline std::string Qwen27DFlashDraftSnapshot() {
   return HfSnapshot("models--z-lab--Qwen3.6-27B-DFlash",
                     kQwen27DFlashDraftRevision, "VT_DFLASH_DRAFT_SNAPSHOT");}
+
+// The Nemotron-3.5-Lightning gate model (#517). Unlike the Qwen pins above,
+// this one is NOT in the HF cache: it is staged on the NAS as a `local_dir`
+// snapshot at `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4`, so there is
+// no `models--org--name/snapshots/<rev>` layout to resolve. The env override is
+// therefore the ONLY reachable path, and the cache spelling below exists so the
+// revision still names what the golden belongs to. Absent env var => "" => the
+// caller emits its loud SKIP, which is the intended behavior off the gate host.
+inline std::string Nemotron35LightningSnapshot() {
+  return HfSnapshot("models--nvidia--NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+                    kNemotron35LightningNvfP4Revision,
+                    "VT_NEMOTRON35_SNAPSHOT");
+}
 
 }  // namespace parity
 

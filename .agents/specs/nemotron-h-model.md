@@ -486,7 +486,7 @@ For this row that means:
 | Arm | State |
 |---|---|
 | ModelOpt NVFP4 W4A16 g16 + FP8 W8A8 (the shipped checkpoint) | W1-W6, the critical path |
-| Safetensors bf16 | reachable via the same loader; owed a fixture |
+| Safetensors bf16 | reachable via the same loader; owed a fixture. Its ENUMERATION is now correct (§5d finding 1): a producer with no `quantization_config` claims the bare weights and none of the 92 FP8/NVFP4 scale companions |
 | **GGUF k-quants / i-quants** through the shared GGUF loader | **OWED.** No NemotronH GGUF arm exists |
 
 Until the GGUF arm lands it is **refused by name** at load, naming the missing
@@ -521,7 +521,8 @@ and disk:**
    property over `layers_block_type` whose setter discards the checkpoint's
    value (`configuration_nemotron_h.py:225-238`). §5a's live oracle run is what
    settles it on the real checkpoint. Both spellings are accepted here, the
-   modern one winning.
+   modern one winning — **for the SCHEDULE pair only**; see §5d, which corrects
+   the generalization this sentence originally made.
 2. **`moe_latent_size`: absent and `null` are the SAME state.** Upstream's
    predicate is `getattr(config, "moe_latent_size", None) is not None`
    (`nemotron_h.py:143`), so a missing key and an explicit `null` both mean "no
@@ -600,6 +601,141 @@ muse-glimmer precedent already used.
 
 **Not done here:** the forward (W4), the MTP head (W5), the e2e token gate (W6),
 the GGUF arm (W7). The row stays `INVENTORIED`.
+
+## 5d. W3 repair — the review's four findings, and two residuals (2026-08-13)
+
+The fresh review of `row/MODEL-NEMOTRON-H-W3C` @ `3295d0c1a` (PR #565) returned
+**PASS** with four MINOR/NIT findings and two report-only items. Repaired on
+`row/MODEL-NEMOTRON-H-W3-FIX` (base `3295d0c1a` + `origin/main` re-merged, W1's
+`MIXED_PRECISION` resolver having landed as `1bc5ef82c`).
+
+**1. `ClaimMamba` ignored `quantized` — FIXED.** Every other claimer
+(`ClaimNvfp4`, `ClaimMoe`, `ClaimMlp`, and `ClaimAttention`'s `fp8_kv`) gates on
+`quantized`; `ClaimFp8` did not. The released config MINUS `quantization_config`
+parsed without refusal and enumerated **92 tensors an unquantized checkpoint
+does not ship** — `backbone.layers.{mamba}.mixer.{in,out}_proj.{weight_scale,
+input_scale}`, 23x4, first `backbone.layers.0.mixer.in_proj.weight_scale`. That
+is exactly the shape §5b's owed **safetensors bf16 arm** will present. Nothing
+consumes the map yet, so no gated claim was wrong — but an unimplemented arm is
+refused BY NAME, never silently mis-enumerated. `quantized` now threads through
+`ClaimFp8`/`ClaimMamba` and both call sites (backbone `quantized`, MTP
+`mtp_quantized`). The 18487-tensor gate is unchanged: the released checkpoint is
+quantized, and its MTP schedule is `{attention, moe}` with no mamba block.
+
+**2. Legacy-alias precedence was INVERTED — FIXED, and the RECORD corrected.**
+`Get{Int,Double,Bool}Aliased` preferred the MODERN key. Upstream does the
+opposite for the `mamba_*` SCALARS: `configuration_nemotron_h.py:145-155` is
+`self.n_groups = kwargs.pop("mamba_n_groups") if "mamba_n_groups" in kwargs else
+self.n_groups`, which OVERWRITES an already-populated dataclass field, so
+**legacy wins**. Re-derived by RUNNING transformers @ `7d06b1a5` (the pin this
+port names), not by reading it:
+
+```
+NemotronHConfig(n_groups=8, mamba_n_groups=4, conv_kernel=4, mamba_d_conv=7)
+  -> n_groups=4, conv_kernel=7
+NemotronHConfig(chunk_size=128, mamba_chunk_size=77, expand=2, mamba_expand=9,
+                use_conv_bias=True, mamba_conv_bias=False,
+                time_step_min=1e-3, mamba_dt_min=0.5)
+  -> chunk=77 expand=9 conv_bias=False dt_min=0.5
+NemotronHConfig(layer_types=['mamba','mamba'], hybrid_override_pattern='*-')
+  -> ['mamba', 'mamba']
+NemotronHConfig(mtp_layers_block_type=['mamba'], mtp_hybrid_override_pattern='*E')
+  -> ['mamba']
+```
+
+So the two families **genuinely disagree** and each is mirrored on its own
+terms: legacy-wins for the `mamba_*` scalars (`:145-155`), modern-wins for both
+SCHEDULE pairs (`:158-165`, `:176-184`, where the legacy pattern is consulted
+only when the modern list is `None`). Worse than the behavior was the record:
+the code comment and §5c above asserted "the modern one wins" as if it were
+upstream's rule, which is what would mislead the next porter. Both polarities
+are now stated where they are implemented, each with its own upstream anchor and
+an explicit "do not unify these" note. **No released checkpoint ships both
+spellings of one field**, so this was a mirroring defect and a record defect,
+never a live one — which is precisely why it needed a test.
+
+**3. The forward refusal was claimed but never exercised — FIXED.** The case
+titled "the unported ARMS refuse by name" had one SUBCASE (GGUF).
+`ForwardNemotronHForCausalLM` is an unconditional `VT_CHECK`, which throws
+`std::runtime_error` (`vt/dtype.h:11-17`), so it is directly callable with a stub
+`LoadedModel`. Now asserted, including that the message NAMES the missing piece
+(W4 and this spec).
+
+**4. `NemotronHBlockName` had zero call sites — FIXED by using it.**
+`BlockFromName` now maps both directions through it and builds its refusal's
+expected-list from the enum, so a fifth block kind cannot arrive alongside a
+message that still lists four. A round-trip assertion pins every spelling the
+refusal offers to one that actually parses.
+
+**5. RESIDUAL, pre-existing, NOT fixed here — `docs/FEATURES.md:171` is off by
+two.** It says "27 of the 32 registered text-generation architectures" while
+`:173` implies 38 − 3 Parakeet − 1 `LlamaModel` = **34**, and
+`tests/vllm/models/test_model_registry.cpp:47` now says "34 text archs". W3's
+`+1` increment was correct; the BASE number was already stale before this row
+touched it, and no checker validates it. Left for the operator to file — the
+repair branch has no `docs/` authority, and fixing a pre-existing doc drift
+inside a scoped repair would hide it.
+
+**6. RESIDUAL, accepted by design — fixture DTYPE drift is invisible offline.**
+The committed index projection pins tensor NAMES and SHAPES offline; DTYPES are
+only re-verified by the live case
+(`test_nemotron_h_scaffold.cpp`, `VT_NEMOTRON35_SNAPSHOT`). CI has no
+checkpoint, so a re-quantization that changed dtypes while preserving names and
+shapes — which has happened before to an `unsloth` repo under an unchanged name
+— would pass CI and fail only where the checkpoint is staged. That is the
+declared design (the alternative is committing dtype metadata that nothing
+offline can falsify), and it is named here so W4/W6 do not rediscover it.
+
+**Mutation proof, re-run in full on the repaired tree.** Each defect applied
+alone to the restored tree, rebuilt, the gate run, then the file restored and
+its SHA-256 re-verified byte-for-byte (`git status --porcelain` empty
+afterwards). All fourteen turn it RED — the ten from the W3 review plus four
+this pass adds:
+
+| Mutation | Result |
+|---|---|
+| `layers_block_type` `"moe"` mapped to `kAttention` (at `BlockFromName`) | 7 cases / 12 assertions FAILURE |
+| `kMoe` claims attention tensors (at the enumeration switch) | 2 cases / 4 assertions FAILURE |
+| `LayerIndices` shifts every index by +1 | 2 cases / 2 assertions FAILURE |
+| `conv_dim` drops the `2*n_groups*state_size` term | 4 cases / 8 assertions FAILURE |
+| SSM cache dtype collapsed to the conv/activation dtype | 1 case / 2 assertions FAILURE |
+| mamba `dt_bias` left UNCLAIMED (23 tensors) | 2 cases / 3 assertions FAILURE |
+| MTP `final_layernorm` dropped | 2 cases / 3 assertions FAILURE |
+| attention KV group collapsed to ONE layer tag | 1 case / 1 assertion FAILURE |
+| the `mtp*` `ignore` entry not honored | 3 cases / 4 assertions FAILURE (assertions 38284 -> **39320**) |
+| mamba KV group collapsed to ONE layer tag | 1 case / 1 assertion FAILURE |
+| MTP `enorm` dropped | 2 cases / 3 assertions FAILURE |
+| **NEW** the forward returns `{}` instead of refusing (finding 3) | 1 case / 2 assertions FAILURE |
+| **NEW** `NemotronHBlockName` mislabels `kMoe` (finding 4) | 8 cases / **0 assertions** FAILURE |
+| **NEW** `ClaimFp8` ignores `quantized` again (finding 1) | 1 case / 1 assertion FAILURE |
+| **NEW** the aliased getters prefer MODERN again (finding 2) | 1 case / 4 assertions FAILURE |
+
+Two of those rows are worth keeping in view. The `mtp*` mutation makes the
+assertion COUNT go **up** by 1036 while the gate goes red — a changed count is
+itself the signal. And the `NemotronHBlockName` mutation reports
+**`assertions: 28 | 28 passed | 0 failed`** next to `8 failed` test cases: the
+cases THREW, so `grep 'assertions:'` alone would have read that mutation as
+clean. Read `Status:`.
+
+**Gate evidence (this repair).** Local CPU-only host (`VLLM_CPP_CUDA=OFF`), disk
+**68G free / 85% used** at every measurement below.
+
+| Arm | Result |
+|---|---|
+| Release `-Werror`, full build | 0 warnings, 0 errors |
+| Release `test_nemotron_h_scaffold`, offline | **12/12 cases, 38284/38284 assertions, `Status: SUCCESS!`** |
+| Release `test_nemotron_h_scaffold`, `VT_NEMOTRON35_SNAPSHOT` live | **12/12, 39152/39152, `Status: SUCCESS!`** |
+| Debug (`-g0`, asserts unmasked), offline | 12/12, 38284/38284, `Status: SUCCESS!` |
+| Debug (`-g0`), live | 12/12, 39152/39152, `Status: SUCCESS!` |
+| Full `ctest -j4` | **100% tests passed, 0 tests failed out of 403** (skipped: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e` — neither has its asset here) |
+
+The W3 baselines were 10/38245 offline and 10/39113 live; the deltas (+2 cases,
++39 offline / +39 live assertions) are this pass's three new cases and the
+`NemotronHBlockName` round-trip. RED-before on the pre-fix tree was
+12 cases / 9 failed assertions, reporting `92` companions with first
+`backbone.layers.0.mixer.in_proj.weight_scale`, and `8 == 4` / `4 == 7` /
+`2 == 9` / `128 == 77` / `0.001 == 0.5` / `0.1 == 0.6` / `0.0001 == 0.7` for the
+alias precedence.
 
 ## 6. Risks / decisions
 

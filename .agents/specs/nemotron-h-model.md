@@ -737,6 +737,41 @@ The W3 baselines were 10/38245 offline and 10/39113 live; the deltas (+2 cases,
 `2 == 9` / `128 == 77` / `0.001 == 0.5` / `0.1 == 0.6` / `0.0001 == 0.7` for the
 alias precedence.
 
+**ONE GATE IS RED, and it needs the operator — `doc-checkpoint range`.**
+`scripts/agent-preflight.sh --staged` reports every gate green EXCEPT:
+
+```
+Committed range vs origin/main:
+  ok   now-current range
+  FAIL doc-checkpoint range
+     ERROR: commit 3981de6a4: changed feature_surface but did not update
+     docs/FEATURES.md. This change alters what the project supports or how it
+     is used, which its purpose-specific document has to reflect.
+```
+
+This is not a defect in the change, and it is not a checker to weaken. The rule
+is unconditional and PER-COMMIT: `check-doc-checkpoint.py:79` classifies any
+path under `src/vllm/model_executor/models/` as `feature_surface`, `:313`
+requires `docs/FEATURES.md` in the SAME commit, and `commits_in_range` walks
+`rev-list --reverse --no-merges origin/main..HEAD` — so W3C's own
+`docs/FEATURES.md` edit in `3295d0c1a` does not cover a later commit. CI runs
+the identical invocation on the PR (`ci.yml:343`), so the PR is red for the same
+reason. The checker has no exemption mechanism, deliberately.
+
+The repair branch was dispatched with `docs/` explicitly excluded from its
+authority, so it did not take the obvious fix. **The operator holds that
+authority.** The minimal truthful edit is one clause on the
+`NemotronHForCausalLM` row (`docs/FEATURES.md:139`) — a real feature-surface
+fact this commit changed:
+
+> ... 18487/18487 released tensors claimed, 0 unaccounted; het-KV shapes match
+> `mamba2_state_shape`. **A bf16 producer (no `quantization_config`) claims the
+> bare weights and none of the 92 FP8/NVFP4 scale companions.**
+
+folded into `3981de6a4` (amend, or a squash-merge carrying both). It disturbs
+neither W3's existing `docs/` edits nor the separate finding-5 count drift,
+which stays open for its own issue.
+
 ## 6. Risks / decisions
 
 - **Non-gated MoE must not become a parallel path.** If

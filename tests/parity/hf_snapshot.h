@@ -90,21 +90,24 @@ inline std::string HfSnapshot(const char* repo_dir, const char* revision,
 // the path: `hf download --local-dir` writes a per-revision file manifest at
 // `<dir>/.cache/huggingface/trees/<revision>.json`. That is what is checked.
 //
-// Resolution order, and why:
+// Resolution order, in the order the code checks it, and why:
 //
-//  1. `CHECKPOINT_ROOT` -> `<root>/<kNemotron35LightningLocalDirName>`, and the
-//     revision manifest MUST be present. This is the DEFAULT path every gate
-//     takes, so it is the one that has to carry the pin: a re-download of the
-//     same repo name lands a different revision under the identical path, and a
-//     gate that cannot tell would substitute it silently. Missing manifest =>
-//     "" => the caller's loud skip, never a substitution.
-//  2. `VT_NEMOTRON35_SNAPSHOT` -> the explicit-directory escape `HfSnapshot`
-//     documents, with its semantics UNCHANGED, including that a set-but-wrong
-//     override refuses rather than falling back. Naming one directory outright
-//     is a deliberate different-checkpoint run; naming a ROOT is not, which is
-//     why only (1) is revision-gated. It is checked first so that setting it
-//     overrides `CHECKPOINT_ROOT` rather than racing it.
-//  3. The ordinary HF cache layout, for a host that fetched it that way.
+//  1. `VT_NEMOTRON35_SNAPSHOT`, when set and non-empty -> the explicit-directory
+//     escape `HfSnapshot` documents, with its semantics UNCHANGED, including
+//     that a set-but-wrong override refuses rather than falling back. First, so
+//     that setting it OVERRIDES `CHECKPOINT_ROOT` rather than racing it.
+//  2. Otherwise `CHECKPOINT_ROOT` -> `<root>/<kNemotron35LightningLocalDirName>`,
+//     and the revision manifest MUST be present. This is the DEFAULT path every
+//     gate takes, so it is the one that has to carry the pin: a re-download of
+//     the same repo name lands a different revision under the identical path,
+//     and a gate that cannot tell would substitute it silently. Missing
+//     manifest => "" => the caller's loud skip, never a substitution.
+//  3. Otherwise the ordinary HF cache layout, for a host that fetched it that
+//     way.
+//
+// Only (2) is revision-gated, deliberately: naming ONE directory outright is
+// the deliberate different-checkpoint run the override exists for, while naming
+// a ROOT is not.
 //
 // Absent both env vars => "" => the caller emits its loud SKIP, which is the
 // intended behavior off the gate host.

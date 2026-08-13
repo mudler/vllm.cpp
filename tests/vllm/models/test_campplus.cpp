@@ -104,3 +104,85 @@ TEST_CASE("campplus CAMLayer gates the local branch by the pooled context") {
   INFO("max abs diff vs upstream CAMLayer: ", d);
   CHECK(d < 1e-5);
 }
+
+namespace {
+// Fill a layer's parameters from the generator's stream. Names mirror torch's
+// `named_parameters()` / `named_buffers()` exactly, so a mismatch here shows up
+// as a tensor difference rather than as silently different weights.
+vllm::models::campplus::DenseTdnnLayerWeights LayerW(const std::string& p, int64_t in_ch,
+                                                     int64_t bn, int64_t growth, int64_t k) {
+  vllm::models::campplus::DenseTdnnLayerWeights w;
+  w.bn1_gamma = Rand(p + ".nonlinear1.batchnorm.weight", in_ch, 0.3);
+  w.bn1_beta = Rand(p + ".nonlinear1.batchnorm.bias", in_ch, 0.3);
+  w.bn1_mean = Rand(p + ".nonlinear1.batchnorm.running_mean", in_ch, 0.4);
+  w.bn1_var = Rand(p + ".nonlinear1.batchnorm.running_var", in_ch, 0.2);
+  for (float& v : w.bn1_var) v = std::fabs(v) + 0.5F;
+  w.linear1 = Rand(p + ".linear1.weight", bn * in_ch, 0.3);
+  w.bn2_gamma = Rand(p + ".nonlinear2.batchnorm.weight", bn, 0.3);
+  w.bn2_beta = Rand(p + ".nonlinear2.batchnorm.bias", bn, 0.3);
+  w.bn2_mean = Rand(p + ".nonlinear2.batchnorm.running_mean", bn, 0.4);
+  w.bn2_var = Rand(p + ".nonlinear2.batchnorm.running_var", bn, 0.2);
+  for (float& v : w.bn2_var) v = std::fabs(v) + 0.5F;
+  w.cam.linear_local = Rand(p + ".cam_layer.linear_local.weight", growth * bn * k, 0.3);
+  w.cam.linear1_weight = Rand(p + ".cam_layer.linear1.weight", (bn / 2) * bn, 0.3);
+  w.cam.linear1_bias = Rand(p + ".cam_layer.linear1.bias", bn / 2, 0.3);
+  w.cam.linear2_weight = Rand(p + ".cam_layer.linear2.weight", growth * (bn / 2), 0.3);
+  w.cam.linear2_bias = Rand(p + ".cam_layer.linear2.bias", growth, 0.3);
+  return w;
+}
+}  // namespace
+
+TEST_CASE("campplus TransitLayer applies the nonlinear BEFORE the projection") {
+  const std::vector<float> x = Rand("xt", kIn * kFrames, 1.0);
+  std::vector<float> var = Rand("transit.nonlinear.batchnorm.running_var", kIn, 0.2);
+  for (float& v : var) v = std::fabs(v) + 0.5F;
+  const std::vector<float> got = vllm::models::campplus::TransitLayer(
+      x, kIn, kFrames, kIn / 2, Rand("transit.nonlinear.batchnorm.weight", kIn, 0.3),
+      Rand("transit.nonlinear.batchnorm.bias", kIn, 0.3),
+      Rand("transit.nonlinear.batchnorm.running_mean", kIn, 0.4), var,
+      Rand("transit.linear.weight", (kIn / 2) * kIn, 0.3),
+      Rand("transit.linear.bias", kIn / 2, 0.3), 1e-5);
+  REQUIRE(got.size() == static_cast<size_t>((kIn / 2) * kFrames));
+  CHECK(Worst(got, kTransit, got.size()) < 1e-5);
+}
+
+TEST_CASE("campplus DenseLayer projects a POOLED stats vector as T=1") {
+  // The final dense consumes StatsPool's [2C] output, which upstream reaches by
+  // unsqueeze -> conv -> squeeze. Treating it as anything other than T=1 changes
+  // the shape rather than the numbers, so the length is asserted too.
+  const std::vector<float> stats = vllm::models::campplus::StatsPool(
+      Rand("x", kChannels * kFrames, 1.0), kChannels, kFrames);
+  std::vector<float> var = Rand("dense2d.nonlinear.batchnorm.running_var", 12, 0.2);
+  for (float& v : var) v = std::fabs(v) + 0.5F;
+  const std::vector<float> got = vllm::models::campplus::DenseLayer(
+      stats, 2 * kChannels, /*frames=*/1, 12, Rand("dense2d.linear.weight", 12 * 2 * kChannels, 0.3),
+      {}, {}, {}, Rand("dense2d.nonlinear.batchnorm.running_mean", 12, 0.4), var, 1e-5,
+      /*apply_relu=*/false);  // config_str="batchnorm_" => batchnorm only
+  REQUIRE(got.size() == 12U);
+  CHECK(Worst(got, kDense2d, got.size()) < 1e-5);
+}
+
+TEST_CASE("campplus CAMDenseTDNNLayer chains the two nonlinears around linear1") {
+  const std::vector<float> x = Rand("xt", kIn * kFrames, 1.0);
+  const std::vector<float> got = vllm::models::campplus::DenseTdnnLayer(
+      x, kIn, kFrames, kBnChannels, kGrowth, kKernel, kDilation, kSegLen,
+      LayerW("dl", kIn, kBnChannels, kGrowth, kKernel), 1e-5);
+  REQUIRE(got.size() == static_cast<size_t>(kGrowth * kFrames));
+  CHECK(Worst(got, kDenseTdnnLayer, got.size()) < 1e-5);
+}
+
+TEST_CASE("campplus CAMDenseTDNNBlock GROWS its channel count by concatenation") {
+  // x = cat([x, layer(x)], dim=1): each layer sees every earlier output, and the
+  // width grows by `growth` per layer. Appending in the wrong order still yields
+  // a correctly shaped tensor, so the values are what catch it.
+  const std::vector<float> x = Rand("xt", kIn * kFrames, 1.0);
+  std::vector<vllm::models::campplus::DenseTdnnLayerWeights> layers;
+  for (int64_t i = 0; i < kNumLayers; ++i) {
+    layers.push_back(LayerW("blk.tdnnd" + std::to_string(i + 1), kIn + i * kGrowth, kBnChannels,
+                            kGrowth, kKernel));
+  }
+  const std::vector<float> got = vllm::models::campplus::DenseTdnnBlock(
+      x, kIn, kFrames, kBnChannels, kGrowth, kKernel, kDilation, kSegLen, layers, 1e-5);
+  REQUIRE(got.size() == static_cast<size_t>((kIn + kNumLayers * kGrowth) * kFrames));
+  CHECK(Worst(got, kDenseTdnnBlock, got.size()) < 1e-5);
+}

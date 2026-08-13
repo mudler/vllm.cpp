@@ -50,6 +50,30 @@ with torch.no_grad():
 cam_out = cam(xb)
 seg = cam.seg_pooling(xb)
 
+
+# ---- TransitLayer / DenseLayer / CAMDenseTDNNLayer / Block ----
+IN, GROWTH, NL = 8, 3, 2
+def fill(mod, prefix):
+    with torch.no_grad():
+        for n, q in mod.named_parameters():
+            q.copy_(P(prefix + "." + n, tuple(q.shape), 0.3))
+        for n, b in mod.named_buffers():
+            if n.endswith("running_var"): b.copy_(P(prefix + "." + n, tuple(b.shape), 0.2).abs() + 0.5)
+            elif n.endswith("running_mean"): b.copy_(P(prefix + "." + n, tuple(b.shape), 0.4))
+
+xt = P("xt", (1, IN, T), 1.0)
+transit = m.TransitLayer(IN, IN // 2, bias=True).eval(); fill(transit, "transit")
+transit_out = transit(xt)
+
+dense2d = m.DenseLayer(2 * C, 12, config_str="batchnorm_").eval(); fill(dense2d, "dense2d")
+dense_out = dense2d(stats)                      # 2-D input path: unsqueeze -> conv -> squeeze
+
+dl = m.CAMDenseTDNNLayer(IN, GROWTH, BN, K, dilation=D).eval(); fill(dl, "dl")
+dl_out = dl(xt)
+
+blk = m.CAMDenseTDNNBlock(NL, IN, GROWTH, BN, K, dilation=D).eval(); fill(blk, "blk")
+blk_out = blk(xt)
+
 def emit(f, name, t):
     a = np.asarray(t.detach().numpy(), dtype=np.float32).reshape(-1)
     f.write(f"inline constexpr float {name}[] = {{\n")
@@ -71,5 +95,10 @@ with out.open("w") as f:
     f.write("\n")
     emit(f, "kStats", stats); emit(f, "kBatchNormEval", bn_out)
     emit(f, "kSegPooling", seg); emit(f, "kCamOut", cam_out)
+    for n, v in (("kIn", IN), ("kGrowth", GROWTH), ("kNumLayers", NL)):
+        f.write(f"inline constexpr int64_t {n} = {v};\n")
+    f.write("\n")
+    emit(f, "kTransit", transit_out); emit(f, "kDense2d", dense_out)
+    emit(f, "kDenseTdnnLayer", dl_out); emit(f, "kDenseTdnnBlock", blk_out)
     f.write("}  // namespace campplus_goldens\n")
 print("wrote", out, "T=", T, "seg segments=", -(-T//100))

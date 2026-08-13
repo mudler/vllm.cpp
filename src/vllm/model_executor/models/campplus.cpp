@@ -76,10 +76,8 @@ std::vector<float> SegPooling(const std::vector<float>& x, int64_t channels, int
   return out;
 }
 
-namespace {
-
 // 1-D convolution over [C, T] with `same` padding, as every CAMPPlus conv uses.
-std::vector<float> Conv1dSame(const std::vector<float>& in, int64_t in_ch, int64_t frames,
+static std::vector<float> Conv1dSame(const std::vector<float>& in, int64_t in_ch, int64_t frames,
                               const std::vector<float>& w, const std::vector<float>& bias,
                               int64_t out_ch, int64_t kernel, int64_t dilation) {
   const int64_t pad = (kernel - 1) / 2 * dilation;
@@ -100,8 +98,6 @@ std::vector<float> Conv1dSame(const std::vector<float>& in, int64_t in_ch, int64
   }
   return out;
 }
-
-}  // namespace
 
 std::vector<float> CamLayer(const std::vector<float>& x, int64_t bn_channels, int64_t frames,
                             int64_t out_channels, int64_t kernel, int64_t dilation,
@@ -136,6 +132,78 @@ std::vector<float> CamLayer(const std::vector<float>& x, int64_t bn_channels, in
   std::vector<float> out(y.size());
   for (size_t i = 0; i < y.size(); ++i) out[i] = y[i] * m[i];
   return out;
+}
+
+
+std::vector<float> BatchNormRelu(const std::vector<float>& x, int64_t channels, int64_t frames,
+                                 const std::vector<float>& gamma, const std::vector<float>& beta,
+                                 const std::vector<float>& running_mean,
+                                 const std::vector<float>& running_var, double eps) {
+  std::vector<float> out =
+      BatchNorm1dEval(x, channels, frames, gamma, beta, running_mean, running_var, eps);
+  for (float& v : out) v = v > 0.0F ? v : 0.0F;
+  return out;
+}
+
+std::vector<float> TransitLayer(const std::vector<float>& x, int64_t in_channels, int64_t frames,
+                                int64_t out_channels, const std::vector<float>& bn_gamma,
+                                const std::vector<float>& bn_beta,
+                                const std::vector<float>& bn_mean,
+                                const std::vector<float>& bn_var,
+                                const std::vector<float>& weight, const std::vector<float>& bias,
+                                double eps) {
+  // nonlinear FIRST, then the 1x1 projection.
+  const std::vector<float> h =
+      BatchNormRelu(x, in_channels, frames, bn_gamma, bn_beta, bn_mean, bn_var, eps);
+  return Conv1dSame(h, in_channels, frames, weight, bias, out_channels, 1, 1);
+}
+
+std::vector<float> DenseLayer(const std::vector<float>& x, int64_t in_channels, int64_t frames,
+                              int64_t out_channels, const std::vector<float>& weight,
+                              const std::vector<float>& bias, const std::vector<float>& bn_gamma,
+                              const std::vector<float>& bn_beta, const std::vector<float>& bn_mean,
+                              const std::vector<float>& bn_var, double eps, bool apply_relu) {
+  // 1x1 projection FIRST, then the nonlinear -- the opposite order to
+  // TransitLayer. A pooled stats vector arrives as frames == 1.
+  const std::vector<float> h =
+      Conv1dSame(x, in_channels, frames, weight, bias, out_channels, 1, 1);
+  std::vector<float> out =
+      BatchNorm1dEval(h, out_channels, frames, bn_gamma, bn_beta, bn_mean, bn_var, eps);
+  // `batchnorm_` is batchnorm ALONE (affine=false, no relu).
+  if (apply_relu) {
+    for (float& v : out) v = v > 0.0F ? v : 0.0F;
+  }
+  return out;
+}
+
+std::vector<float> DenseTdnnLayer(const std::vector<float>& x, int64_t in_channels, int64_t frames,
+                                  int64_t bn_channels, int64_t out_channels, int64_t kernel,
+                                  int64_t dilation, int64_t seg_len,
+                                  const DenseTdnnLayerWeights& w, double eps) {
+  const std::vector<float> a = BatchNormRelu(x, in_channels, frames, w.bn1_gamma, w.bn1_beta,
+                                             w.bn1_mean, w.bn1_var, eps);
+  const std::vector<float> b =
+      Conv1dSame(a, in_channels, frames, w.linear1, {}, bn_channels, 1, 1);
+  const std::vector<float> c = BatchNormRelu(b, bn_channels, frames, w.bn2_gamma, w.bn2_beta,
+                                             w.bn2_mean, w.bn2_var, eps);
+  return CamLayer(c, bn_channels, frames, out_channels, kernel, dilation, seg_len, w.cam);
+}
+
+std::vector<float> DenseTdnnBlock(const std::vector<float>& x, int64_t in_channels, int64_t frames,
+                                  int64_t bn_channels, int64_t growth, int64_t kernel,
+                                  int64_t dilation, int64_t seg_len,
+                                  const std::vector<DenseTdnnLayerWeights>& layers, double eps) {
+  std::vector<float> acc = x;
+  int64_t channels = in_channels;
+  for (const DenseTdnnLayerWeights& w : layers) {
+    const std::vector<float> y = DenseTdnnLayer(acc, channels, frames, bn_channels, growth, kernel,
+                                                dilation, seg_len, w, eps);
+    // cat([x, layer(x)], dim=1): the new channels are APPENDED, so every later
+    // layer sees all earlier outputs.
+    acc.insert(acc.end(), y.begin(), y.end());
+    channels += growth;
+  }
+  return acc;
 }
 
 }  // namespace campplus

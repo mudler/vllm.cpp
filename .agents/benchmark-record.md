@@ -20322,3 +20322,34 @@ which is the only term that separates the pin from the rollback — the rollback
 runs, is deterministic, and reports a perfectly clean `0.25.0`. `PANDAS_VERSION`
 is deliberately left failing closed at the pin (#522) rather than papered over.
 18 new tests in `tests/tools/test_oracle_pin.py`; `tests/tools` 208 → 226, green.
+
+## SPEC-DSPARK: C_tmp cap is performance-NEUTRAL; a +2.9% claim was drift (2026-08-12)
+
+Real divergence found: upstream caps the split-K reduce buffer at
+min(size_n * sorted_len, sms*4*moe_block_size*max_thread_n) (ops.cu:709-713); we
+allocated only the upper bound -- 15.3 MB vs 3.15 MB (gate_up) and 30.5 MB vs
+3.15 MB (down).
+
+First measurement suggested +2.91% (135.98 -> 139.93, pinned-clock harness).
+WRONG. Same binary, same session, interleaved capped/uncapped/capped behind
+VT_MARLIN_CTMP_UNCAPPED:
+
+| arm | median |
+|---|---|
+| capped (fix) | 137.36 |
+| uncapped | 137.32 |
+| gain | +0.03% |
+
+The same run shows the trap: first arm 119.74 (min 108.3), third arm 137.63 --
++14.9% drift INSIDE one session. GB10 cannot lock memory clocks (only SM), so a
+DRAM-bound kernel's absolute throughput wanders and cross-run before/after
+attributes that wander to whatever changed.
+
+Conclusions: the cap lands as memory hygiene (mirrors upstream, returns 12-27 MB
+per stream), NOT as a perf fix; C_tmp size is ELIMINATED as an explanation of the
+12.9% bandwidth gap; the standing within-session ratios are 0.9757 and 0.9646
+(~0.965-0.976) and the fix moved neither.
+
+Method: third time drift has fooled a before/after here. Pairing caught the
+first, pinned clocks the second, and only an in-process toggle catches this one.
+Future perf claims on this row need the toggle, not two runs.

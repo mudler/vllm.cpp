@@ -177,6 +177,7 @@ cannot.
 | **W4** | `nemotron_h.cpp` forward: hybrid layer loop, Mamba2 mixer wiring, 6 attention layers, MoE layers | CPU forward runs; per-layer activations vs a dumped oracle reference | #496 W1, W2, W3 |
 | **W5** | MTP head (`mtp.layers.0`, `eh_proj`/`enorm`/`hnorm`) on the existing spec-decode seam | draft acceptance non-zero; spec-off and spec-on token-identical | W4 |
 | **W6** | **GB10 e2e token gate vs the pinned oracle** | token-exact greedy, identical prompts/counts/batching/sampling; oracle identity asserted | #496 W2 (CUDA), W4, W5 |
+| **W7** | GGUF k-quant / i-quant arm through the shared GGUF loader (see §5b); refused by name until it lands | quant-matched load + token gate | W4 |
 
 ### W1 progress — the resolver has LANDED (2026-08-12)
 
@@ -303,6 +304,58 @@ the oracle explicitly, not inferred from matching tokens.
 **GPU discipline on dgx:** `flock $HOME/gpu.lock`, `local-ai-worker` parked,
 never a large oracle alongside `ctest` — `gpu_memory_utilization` reserves HOST
 RAM on GB10 and has OOM-rebooted the box.
+
+## 5a. Gateability: CLOSED — the pinned oracle loads and runs it (2026-08-12)
+
+`.agents/porting-a-model.md` §4 requires saying plainly whether the pinned
+oracle can load the model. **It can.** On GB10, from
+`$HOME/venvs/vllm-oracle-next` (vLLM `0.23.1rc1.dev1511+g555967922`,
+transformers 5.14.1, flashinfer 0.6.15.post1 — all three asserted, the run
+aborting on mismatch), against
+`$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4` at pinned revision
+`29f2d1746d8f41e316523194b19018707749b1b1`:
+
+- `ORACLE_IDENTITY_OK`
+- `CONFIG arch = ['NemotronHForCausalLM']`, `nlayers = 52`
+- `CONFIG pattern = MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME` —
+  confirming on the real checkpoint that newer transformers derives
+  `hybrid_override_pattern` from `layers_block_type`, which `nemotron_h.py`
+  reads. That was previously a source-level assumption.
+- `MODEL_LOADED_OK`, greedy decode, `EXIT=0`.
+
+Constructing a config proves nothing; this ran the model. Three greedy goldens
+(`temperature=0.0`, `max_tokens=32`) are committed at
+[`tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json`](../../tests/parity/goldens/nemotron_35_lightning_greedy/oracle.json),
+with the revision pinned as `parity::kNemotron35LightningNvfP4Revision`
+(`tests/parity/hf_snapshot.h`) so the gate names the revision its golden belongs
+to. Output is coherent — Fibonacci is `0, 1, 1, 2, 3, 5, 8, 13, 21, 34` — so
+this is a healthy denominator, not a degraded one.
+
+**Two traps recorded here because they cost time.** (1) `$HOME/venvs/vllm-oracle`
+on dgx symlinks to `vllm-oracle-v0.25.0-stage`, which predates
+`NemotronHMoEDecoderLayer`; a run through it fails and reads as "the model is
+unsupported". Use `vllm-oracle-next`. (2) A vLLM v1 driver script MUST guard its
+body with `if __name__ == "__main__":` — EngineCore is spawned, the module
+re-imports, and the failure surfaces as a `multiprocessing` traceback naming
+neither vLLM nor the caller. The tell is the banner printing twice.
+
+W6 consumes this golden; nothing else in this spec is unblocked by it.
+
+## 5b. Quantized arms owed (`porting-a-model.md` §2)
+
+`AGENTS.md` makes the quantized arms part of a model port, not a follow-up, and
+names **GGUF k-quants** a standing requirement rather than a per-model choice.
+For this row that means:
+
+| Arm | State |
+|---|---|
+| ModelOpt NVFP4 W4A16 g16 + FP8 W8A8 (the shipped checkpoint) | W1-W6, the critical path |
+| Safetensors bf16 | reachable via the same loader; owed a fixture |
+| **GGUF k-quants / i-quants** through the shared GGUF loader | **OWED.** No NemotronH GGUF arm exists |
+
+Until the GGUF arm lands it is **refused by name** at load, naming the missing
+piece, never silently dequantized to a supported path — a silent fallback is
+exactly what a token gate cannot see. Tracked as W7.
 
 ## 6. Risks / decisions
 

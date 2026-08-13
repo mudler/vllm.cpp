@@ -31,6 +31,16 @@ namespace parity {
 inline constexpr const char* kQwen27NvfP4Revision =
     "890bdef7a42feba6d83b6e17a03315c694112f2a";
 
+// The revision the committed Nemotron-3.5-Lightning-30B-A3B-NVFP4 goldens were
+// captured against (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4).
+// Captured 2026-08-12 on GB10 from the PINNED oracle -- vLLM
+// 0.23.1rc1.dev1511+g555967922, transformers 5.14.1, flashinfer 0.6.15.post1 --
+// with the identity asserted and the run aborting on mismatch. NOT the
+// `vllm-oracle` symlink, which resolves to the v0.25.0 rollback and predates
+// NemotronHMoEDecoderLayer entirely.
+inline constexpr const char* kNemotron35LightningNvfP4Revision =
+    "29f2d1746d8f41e316523194b19018707749b1b1";
+
 // Snapshot directory for `<repo>` at `revision`, or "" when it is not cached
 // (the caller then emits its loud SKIP). `env_override`, when set and non-empty,
 // names an explicit snapshot directory for a deliberate different-checkpoint
@@ -53,6 +63,19 @@ inline std::string HfSnapshot(const char* repo_dir, const char* revision,
                         "snapshots" / revision;
   if (!fs::exists(snap / "config.json", ec)) return "";
   return snap.string();
+}
+
+// The Nemotron-3.5-Lightning gate model (#517). Unlike the Qwen pins above,
+// this one is NOT in the HF cache: it is staged on the NAS as a `local_dir`
+// snapshot at `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4`, so there is
+// no `models--org--name/snapshots/<rev>` layout to resolve. The env override is
+// therefore the ONLY reachable path, and the cache spelling below exists so the
+// revision still names what the golden belongs to. Absent env var => "" => the
+// caller emits its loud SKIP, which is the intended behavior off the gate host.
+inline std::string Nemotron35LightningSnapshot() {
+  return HfSnapshot("models--nvidia--NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+                    kNemotron35LightningNvfP4Revision,
+                    "VT_NEMOTRON35_SNAPSHOT");
 }
 
 // The 27B NVFP4 gate model, pinned to the goldens' revision.

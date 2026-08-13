@@ -525,7 +525,11 @@ residual is therefore runtime and is now ATTRIBUTED: the kernel is DRAM-bound
 effective-bandwidth gap that IS the whole per-unit-work difference. Weight
 residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
 same size and stride as upstream's tensor (268 MB, no padding), so the cause is
-memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under ncu in either replay mode. Editing
+memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under
+ncu in either replay mode. A C_tmp over-allocation (15-30 MB vs upstream's
+3.15 MB) was found and fixed, but an in-session A/B shows it is perf-NEUTRAL
+(+0.03%) -- an apparent +2.9% was machine drift, since GB10 cannot lock memory
+clocks. Editing
 the kernel, its launch config, layout or flags is NOT indicated: all are proven
 identical. (The repack kernels that appear to take 40% of a long run are
 LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has

@@ -57,7 +57,15 @@ MATRICES = {
     # (324/373/356/310/261 is unchanged), because like the MuseGlimmer, KimiK3
     # and MiniMaxH3DiT rows they carry no pinned-registry target. Bumped
     # because seven new rows EXIST, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 369),
+    # 363 since 2026-08-11: +`MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model`
+    # (Lightricks LTX-2.5, 21.00B joint video+audio DiT, released 2026-08). A FOURTH
+    # beyond-pin row, and like Muse Glimmer it is absent from `555967922` because it
+    # did not exist yet. Unlike the others it is also out-of-repo: the architecture
+    # reference is Lightricks' own `LTX-2` (`ltx-core`), and vLLM-Omni's `ltx2` module
+    # stops at 2.3 (`ltx2_recipes.py:162-166`), with 2.5 still OPEN upstream at
+    # vllm-omni#6066. Same lane as the MiniMax-H3 diffusion row. Bumped because a new
+    # row EXISTS, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 370),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme

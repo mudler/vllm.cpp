@@ -142,7 +142,32 @@ extern "C" {
  * permanent. The flag surface mirrors vLLM's cli_args.py, which is the real
  * contract. Embedders wanting programmatic control keep the granular entry
  * points. Purely additive. */
-#define VLLM_ABI_VERSION 17
+/* v18 — THE GENERALIZED VIDEO SEAM (LTX-2.5 L1, .agents/specs/ltx-2-5.md §5,
+ * issue #435). The v12 video slice was H3-typed inside; it is now the C face of
+ * vllm::multimodal::VideoEngine, an abstract seam with a checkpoint-detected
+ * family registry, so a second video family (LTX-2.5) is an additive file
+ * rather than a second ABI. Three additions, all APPENDED:
+ *   - vllm_video_model_params.family — the family to load. NULL/empty (the
+ *     zero value) means DETECT it from the checkpoint, which is what v12
+ *     callers already get, since MiniMax-H3 is what a v12 checkpoint set is.
+ *     A name that is not registered is REFUSED naming what is registered; it
+ *     is never treated as a hint, and a checkpoint no family claims is refused
+ *     rather than handed to the only family present — an H3 DiT loaded as LTX
+ *     would not fail, it would render noise.
+ *   - extra_keys / extra_values / n_extras on vllm_video_model_params and on
+ *     vllm_video_params — parallel arrays carrying FAMILY-SPECIFIC settings as
+ *     strings, so a new family adds no permanent field to a struct every other
+ *     family must then ignore. n_extras 0 (the zero value) is "none".
+ *     vllm_video_model_params.partition is now the documented ALIAS for the
+ *     load extra "partition"; supplying both with DIFFERENT values is
+ *     VLLM_ERR_INVALID_ARGUMENT rather than a silent winner.
+ *   - vllm_video_engine_family() — which family a handle actually resolved to,
+ *     so detection is visible to a C caller rather than implicit.
+ * A v12 caller is byte-identical: it zero-fills the struct growth, so family
+ * stays NULL (detect), n_extras stays 0, `partition` keeps its exact v12
+ * meaning, and every v12 status/message contract is unchanged (the
+ * text-checkpoint refusal still names vllm_engine_load). */
+#define VLLM_ABI_VERSION 18
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -707,6 +732,19 @@ typedef struct vllm_video_model_params {
   int32_t device;       /* 0 cpu, 1 cuda */
   int32_t dequant_bf16; /* 0 keep-quant, 1 dequant/stream bf16 */
   int32_t fp4_resident; /* NVFP4+cuda: keep FP4 packed, Marlin W4A16 GEMM */
+  /* ── v18 additions (the generalized seam) ─────────────────────────────────
+   * The model family to load, e.g. "minimax-h3". NULL/empty DETECTS it from
+   * what the checkpoint holds; an unregistered name is refused naming the
+   * registered ones. Never a hint — a checkpoint no family claims is refused,
+   * because the wrong family does not fail, it renders noise. */
+  const char* family;
+  /* FAMILY-SPECIFIC load settings as parallel arrays of n_extras borrowed
+   * key/value strings (both arrays must hold n_extras non-NULL entries).
+   * `partition` above is the documented alias for the key "partition";
+   * supplying both with DIFFERENT values is VLLM_ERR_INVALID_ARGUMENT. */
+  const char* const* extra_keys;
+  const char* const* extra_values;
+  int32_t n_extras; /* 0 => none */
 } vllm_video_model_params;
 
 typedef struct vllm_video_params {
@@ -724,6 +762,12 @@ typedef struct vllm_video_params {
   float noise_aug;           /* keyframe pinning strength; <= 0 => 1.0 */
   /* Where frame_%06d.ppm + audio.wav land (created if absent). REQUIRED. */
   const char* output_dir;
+  /* v18: FAMILY-SPECIFIC per-generation settings, same parallel-array shape as
+   * the load-time extras. MiniMax-H3 defines none, and refuses any key it does
+   * not know rather than ignoring it. 0 => none. */
+  const char* const* extra_keys;
+  const char* const* extra_values;
+  int32_t n_extras;
 } vllm_video_params;
 
 /* One finished generation. OWNERSHIP: every member is library-allocated;
@@ -751,6 +795,11 @@ VLLM_API vllm_video_params vllm_video_params_default(void);
 VLLM_API vllm_status vllm_video_engine_load(const vllm_video_model_params* params,
                                             vllm_video_engine** out);
 VLLM_API void vllm_video_engine_free(vllm_video_engine* engine);
+
+/* v18: the family this handle RESOLVED to ("minimax-h3", ...) — the answer to
+ * "what did detection decide?". Points at storage the library owns for the
+ * lifetime of the handle; the caller must NOT free it. NULL engine => NULL. */
+VLLM_API const char* vllm_video_engine_family(const vllm_video_engine* engine);
 
 /* Run one BLOCKING generation, filling *out. Serialized per engine handle.
  * VLLM_ERR_INVALID_ARGUMENT for a missing output_dir / illegal reference

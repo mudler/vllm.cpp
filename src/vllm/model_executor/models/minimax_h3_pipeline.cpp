@@ -556,7 +556,7 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
     // BOX DOWN: measured 85 GiB resident at this point against a ~18 GiB decode
     // in a 122 GiB unified pool, and the driver OOM (NV_ERR_NO_MEMORY) rebooted
     // the machine. Draining costs one cudaFree per retained block, once.
-    const size_t drained = ActivePool()->Drain(vae_backend);
+    const size_t drained = ActivePool(vae_backend).Drain(vae_backend);
     if (std::getenv("VT_POOL_STATS") != nullptr) {
       std::fprintf(stderr, "[h3] drained %.2f GiB of denoise scratch before VAE decode\n",
                    static_cast<double>(drained) / (1024.0 * 1024.0 * 1024.0));

@@ -47,6 +47,18 @@ class Tokenizer {
   // not byte-level BPE with a recognized Split pre-tokenizer regex (no silent
   // wrong tokenization).
   static Tokenizer FromHfJson(const std::string& tokenizer_json_path);
+  // The same parse, from bytes already in hand. `source` appears in error
+  // messages exactly where the path would.
+  //
+  // Exists because a tokenizer does not always arrive as a FILE. LTX-2.5's text
+  // encoder ships its tokenizer AS A TENSOR — `tokenizer_json` U8 [32169626]
+  // inside the one safetensors file, alongside `hf_asset__*` sidecars
+  // (gemma_assets.py:34-36) — so a loader that assumes a sibling
+  // `tokenizer.json` cannot read that checkpoint at all. Spilling 32 MB to a
+  // temporary file just to read it back would put the temp directory on a model
+  // path and leave a 32 MB file behind on every failure.
+  static Tokenizer FromHfJsonBytes(std::string_view tokenizer_json,
+                                   const std::string& source);
   // Loads a GGUF byte-level BPE vocab (tokenizer.ggml.* kvs). Throws
   // std::runtime_error unless tokenizer.ggml.model == "gpt2" and
   // tokenizer.ggml.pre is a recognized pre-tokenizer name.

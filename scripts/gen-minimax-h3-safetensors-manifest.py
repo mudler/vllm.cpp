@@ -21,6 +21,28 @@ Used for two MiniMax-H3 arms:
     python3 scripts/gen-minimax-h3-safetensors-manifest.py videovae.head \\
         --symbol H3VideoVae --out tests/vllm/models/minimax_h3_video_vae_manifest.inc
 
+And for LTX-2.5 phase L6, where the two shipped checkpoints sit on the local NAS
+and are read in place rather than range-fetched — hence --captured-via / --spec,
+which name the real provenance instead of the MiniMax-H3 defaults:
+
+  FP8 DiT
+    python3 scripts/gen-minimax-h3-safetensors-manifest.py \\
+        "$CHECKPOINT_ROOT/ltx-2.5/vonkaiser-fp8-nvfp4/transformer/ltx-2.5-22b-distilled-fp8.safetensors" \\
+        --symbol Ltx25Fp8Dit \\
+        --label "vonkaiser/LTX-2.5-FP8-NVFP4 transformer/ltx-2.5-22b-distilled-fp8.safetensors" \\
+        --captured-via "a local read of the file on the NAS" \\
+        --spec .agents/specs/ltx-2-5.md \\
+        --out tests/vllm/models/ltx2_fp8_dit_manifest.inc
+
+  NVFP4 text encoder
+    python3 scripts/gen-minimax-h3-safetensors-manifest.py \\
+        "$CHECKPOINT_ROOT/ltx-2.5/vonkaiser-fp8-nvfp4/text_encoders/gemma4-12b-with-proj-nvfp4-torchao.safetensors" \\
+        --symbol Ltx25Nvfp4Te \\
+        --label "vonkaiser/LTX-2.5-FP8-NVFP4 text_encoders/gemma4-12b-with-proj-nvfp4-torchao.safetensors" \\
+        --captured-via "a local read of the file on the NAS" \\
+        --spec .agents/specs/ltx-2-5.md \\
+        --out tests/vllm/models/ltx2_nvfp4_te_manifest.inc
+
 Self-contained: no safetensors library needed, so it runs anywhere the file does.
 """
 
@@ -60,6 +82,22 @@ def main() -> int:
     parser.add_argument("--symbol", required=True, help="C++ symbol prefix, e.g. H3Nvfp4")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--label", default="", help="human label for the generated comment")
+    # PROVENANCE, and it has to be told rather than assumed. This script is no
+    # longer MiniMax-H3-only: LTX-2.5 phase L6 reads its two checkpoints off the
+    # local NAS, and emitting "captured via an HTTP range request. See
+    # .agents/specs/minimax-h3.md" over those files stated two things that were
+    # not true of them. The defaults keep every MiniMax-H3 regeneration
+    # byte-identical.
+    parser.add_argument(
+        "--captured-via",
+        default="an HTTP range request",
+        help="how the header was obtained, e.g. 'a local read on the NAS'",
+    )
+    parser.add_argument(
+        "--spec",
+        default=".agents/specs/minimax-h3.md",
+        help="the spec that owns this fixture",
+    )
     args = parser.parse_args()
 
     header = read_header(args.header_file)
@@ -73,7 +111,7 @@ def main() -> int:
             "//\n"
             f"// Tensor manifest of a REAL safetensors checkpoint ({label}): {len(tensors)} tensors,\n"
             "// names/dtypes/shapes only — no weight bytes. Captured from the file's own header via\n"
-            "// an HTTP range request. See .agents/specs/minimax-h3.md.\n"
+            f"// {args.captured_via}. See {args.spec}.\n"
             "#pragma once\n\n#include <cstdint>\n\nnamespace vllm_test {\n\n"
         )
         out.write(f"inline constexpr int64_t k{args.symbol}TensorCount = {len(tensors)};\n\n")

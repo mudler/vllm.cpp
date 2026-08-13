@@ -1193,9 +1193,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
             }
       Gemma4MoeScratch r;
       r.tensor = acc.t();
-      const size_t alloc = acc.alloc_bytes();
-      void* p = acc.Release();
-      r.storage = std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+      r.storage = acc.ReleaseShared();
       if (profile) {
         const auto t_all1 = clock::now();
         static std::atomic<uint64_t> ncalls{0};
@@ -1537,9 +1535,7 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
     // TLS-owned: non-owning view for DualRmsNorm; next call overwrites same buffer.
     r.storage = std::shared_ptr<void>(acc.ptr(), [](void*) {});
   } else {
-    const size_t alloc = acc.alloc_bytes();
-    void* p = acc.Release();
-    r.storage = std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+    r.storage = acc.ReleaseShared();
   }
 
   if (profile) {

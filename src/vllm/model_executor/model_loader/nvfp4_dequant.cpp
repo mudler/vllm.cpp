@@ -43,7 +43,7 @@ float F8E4M3ToF32(uint8_t byte) {
 
 void DequantNvfp4ToBf16(const uint8_t* packed, const uint8_t* weight_scale_fp8,
                         float weight_scale_2, int64_t out_dim, int64_t in_dim,
-                        uint16_t* out_bf16) {
+                        uint16_t* out_bf16, Nvfp4NibbleOrder order) {
   VT_CHECK(packed != nullptr, "nvfp4 dequant: packed weight is null");
   VT_CHECK(weight_scale_fp8 != nullptr, "nvfp4 dequant: weight_scale is null");
   VT_CHECK(out_bf16 != nullptr, "nvfp4 dequant: output buffer is null");
@@ -71,16 +71,23 @@ void DequantNvfp4ToBf16(const uint8_t* packed, const uint8_t* weight_scale_fp8,
       // 16 elements per group = 8 packed bytes.
       for (int64_t j = 0; j < kNvfp4GroupSize / 2; ++j) {
         const uint8_t b = packed_row[base_elem / 2 + j];
-        const uint8_t low = b & 0x0FU;   // element 2i
-        const uint8_t high = b >> 4;     // element 2i+1
+        const uint8_t low = b & 0x0FU;
+        const uint8_t high = b >> 4;
 
         const float lo_val =
             kE2M1Lut[low & 0x7U] * ((low & 0x8U) ? -1.0F : 1.0F);
         const float hi_val =
             kE2M1Lut[high & 0x7U] * ((high & 0x8U) ? -1.0F : 1.0F);
 
-        out_row[base_elem + 2 * j] = vt::F32ToBF16(lo_val * group_scale);
-        out_row[base_elem + 2 * j + 1] = vt::F32ToBF16(hi_val * group_scale);
+        // Which of the two is element 2j is the PRODUCER's convention. Selected,
+        // never guessed: nvfp4-nibble-order.md section 1. Both arms do the
+        // identical f32 multiply and bf16 store, so this cannot perturb the
+        // low-first result — only which slot each value lands in.
+        const bool low_first = order == Nvfp4NibbleOrder::kLowFirst;
+        out_row[base_elem + 2 * j] =
+            vt::F32ToBF16((low_first ? lo_val : hi_val) * group_scale);
+        out_row[base_elem + 2 * j + 1] =
+            vt::F32ToBF16((low_first ? hi_val : lo_val) * group_scale);
       }
     }
   }

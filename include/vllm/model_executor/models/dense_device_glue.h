@@ -17,6 +17,8 @@
 //   DBuf                    — move-only pooled device allocation + tensor view.
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -25,6 +27,8 @@
 #include "vllm/model_executor/models/qwen3_5_weights.h"   // OwnedTensor
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
+#include "vt/device.h"  // kNumDeviceTypes
+#include "vt/dtype.h"   // VT_CHECK
 #include "vt/ops.h"
 
 namespace vllm {
@@ -62,19 +66,40 @@ inline Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
 
 // The device-scratch residency policy (BACKEND-PLATFORM item 2), resolved from
 // the running device's platform. The DevicePool soft cap is platform data (0 ==
-// uncapped, GB10 today ⇒ pool behavior byte-for-byte unchanged). Memoized in a
-// function-local static: DBuf is a per-op hot path and the process runs on ONE
-// device, so the virtual dispatch is paid exactly once. Mirrors qwen3_5.cpp.
+// uncapped, GB10 today ⇒ pool behavior byte-for-byte unchanged). Mirrors
+// qwen3_5.cpp.
+//
+// Memoized PER DEVICE TYPE, not once per process. The previous single
+// function-local static cached whichever device asked FIRST and then applied its
+// cap to every later device — the same ambient-device assumption #516 fixed one
+// layer down, and a mixed-backend process would have run a CUDA DBuf under the
+// CPU platform's policy. DBuf is a per-op hot path, so the virtual dispatch is
+// still paid at most once per device type.
+//
+// A backend whose platform was never REGISTERED now throws out of
+// `platforms::GetPlatform` instead of inheriting whichever device asked first.
+// That is the point: a residency cap read off another platform is a wrong
+// number wearing a default's clothes. Gated by
+// tests/vllm/models/test_device_pool.cpp.
 struct DevicePoolPolicy {
   size_t cap_bytes = 0;  // residency_policy().device_pool_cap_bytes (0 == uncapped)
 };
 inline DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
-  static const DevicePoolPolicy p = [&] {
-    const auto rp =
-        vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
-    return DevicePoolPolicy{rp.device_pool_cap_bytes};
-  }();
-  return p;
+  // Stored as cap+1 so that 0 means "not resolved yet" and a genuine cap of 0
+  // (every platform today) still caches. Racing threads resolve the same device
+  // type to the same value, so the benign double-resolve needs no lock.
+  static std::array<std::atomic<size_t>, vt::kNumDeviceTypes> cached{};
+  // Same bound, same place, as platforms::Index() (src/vllm/platforms/
+  // platform.cpp) applies to this identical value before indexing ITS registry.
+  // An out-of-range DeviceType is only reachable by a cast, and the two lookups
+  // must not disagree about whether that is a throw or a stray write.
+  const size_t idx = static_cast<size_t>(d.q.device.type);
+  VT_CHECK(idx < vt::kNumDeviceTypes, "invalid device type");
+  const size_t seen = cached[idx].load(std::memory_order_relaxed);
+  if (seen != 0) return DevicePoolPolicy{seen - 1};
+  const auto rp = vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
+  cached[idx].store(rp.device_pool_cap_bytes + 1, std::memory_order_relaxed);
+  return DevicePoolPolicy{rp.device_pool_cap_bytes};
 }
 
 // Owned device allocation + tensor view, routed through the SHARED DevicePool so
@@ -91,7 +116,11 @@ class DBuf {
     bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dt);
     alloc_bytes_ = bytes_ == 0 ? 1 : bytes_;
     cap_ = ResolveDevicePoolPolicy(d).cap_bytes;
-    pool_ = ActivePool();
+    // THIS DEVICE's pool, unless an ActivePoolScope overrides it (the aux
+    // stream). Remembered so the block returns to the pool it came from even if
+    // this DBuf outlives the scope. See device_pool.h: there is no
+    // device-less pool to fall back on.
+    pool_ = &ActivePool(*b_);
     p_ = pool_->Get(*b_, alloc_bytes_);
     t_ = MakeTensor(p_, dt, d.q.device, shape);
     if (host != nullptr && bytes_ > 0) b_->Copy(d.q, p_, host, bytes_);
@@ -130,16 +159,44 @@ class DBuf {
     b_->Synchronize(d.q);
   }
   // Relinquish the pool block WITHOUT returning it (dtor becomes a no-op); the
-  // caller takes over the Pool().Put obligation for alloc_bytes().
+  // caller takes over the Put obligation for alloc_bytes(). Prefer
+  // ReleaseShared() below, which discharges that obligation correctly by
+  // construction.
   void* Release() {
     void* p = p_;
     p_ = nullptr;
     return p;
   }
 
+  // Move the block into a shared_ptr that returns it to THIS buffer's own pool
+  // and backend when the last owner drops it — the carrier every cross-step
+  // hand-off (device logits, MTP hidden states, MoE scratch) wants.
+  //
+  // It replaces ~28 copies of a hand-written deleter that closed over the byte
+  // count ALONE and called `Pool().Put(alloc, q)`. That idiom named neither the
+  // device nor the pool, so it returned every such block to the one global pool
+  // — a block from another device (#516), which was LIVE, and a block drawn
+  // from the aux-stream pool, which was not: none of the nine `Release()` sites
+  // sat inside or under any of the four `ActivePoolScope` regions, so the old
+  // deleter and the buffer's own `pool_` always agreed in practice. It was a
+  // hazard one new call site away from being real, and it is gone either way,
+  // because the carrier now captures the pool it came from rather than
+  // re-deriving it.
+  std::shared_ptr<void> ReleaseShared() {
+    DevicePool* const pool = pool_;
+    Backend* const b = b_;
+    const size_t alloc = alloc_bytes_;
+    void* const p = Release();
+    // A moved-from or already-released buffer owns nothing; a shared_ptr built
+    // over a null pointer with a custom deleter would still RUN that deleter and
+    // push null into the free list.
+    if (p == nullptr) return {};
+    return std::shared_ptr<void>(p, [pool, b, alloc](void* q) { pool->Put(*b, alloc, q); });
+  }
+
  private:
   Backend* b_;
-  DevicePool* pool_ = &Pool();
+  DevicePool* pool_ = nullptr;
   void* p_ = nullptr;
   size_t bytes_ = 0;
   size_t alloc_bytes_ = 0;

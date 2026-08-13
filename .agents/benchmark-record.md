@@ -20353,3 +20353,323 @@ per stream), NOT as a perf fix; C_tmp size is ELIMINATED as an explanation of th
 Method: third time drift has fooled a before/after here. Pairing caught the
 first, pinned clocks the second, and only an in-process toggle catches this one.
 Future perf claims on this row need the toggle, not two runs.
+
+## CLOCK PROVENANCE: the SM clock differs BETWEEN BOOTS on dgx.casa, and nothing recorded it (2026-08-12, `row/BENCH-ASSERT-CLOCK-STATE`, #543 / #545, no GPU work)
+
+This entry adds no measurement and withdraws none. It records the **box state**
+that every existing figure was taken at and could not name, and the assertion
+that stops the next one repeating it.
+
+### The observation
+
+Same binary, same argv, same model, driver `580.159.03`, persistence `Enabled`,
+`clocks_throttle_reasons.active = 0x0` on both sides:
+
+| boot | SM clock over the captured window | our ms/step |
+|---|---|---|
+| `f6bbbfc6` | n=61, min 2398 / **med 2470** / max 2489 | **82.1664** |
+| `2fca2b02` | n=50, **flat 2190** (`clocks.max.sm` 3003, applications 2418) | **88.1000** |
+
+A **12.79%** median-clock delta, **+7.22%** step time. The control settles it:
+`marlin::Marlin`, 129 calls/step, byte-identical invocation and **no source
+change** between `a170c81c` and `4064558d0`, moved **45.2845 -> 49.6544
+ms/step = +9.65%**.
+
+### What that retracts
+
+That control drift is **larger than either deficit it was used to rank** —
+`in_proj` +2.97%, `out_proj`/`o_proj` +6.28%. Both are **NOT ESTABLISHED**:
+neither was ever taken against a clock control. The same effect explains a
+same-binary same-arm swing of 382.60 -> 357.59 us/call (-6.5%) across a reboot,
+and two probes disagreeing ~6% uniformly eight minutes apart *within one boot*
+(2398 MHz against 1781).
+
+Nothing else on this page is withdrawn. Everything recorded before today
+predates clock assertion, which is a statement about attribution, not about
+correctness: these figures carry no clock, so a difference of a few percent
+between two of them is not established **by them alone**.
+
+### What now happens instead
+
+`tools/bench/gpu_clock_state.py` samples the SM clock across the measured
+window and records min/median/max/n, `clocks.max.sm`,
+`clocks.applications.graphics`, the union of active throttle reasons,
+persistence mode, and the **boot id**. Idle samples are excluded from the
+statistics and counted, never silently dropped. `online_gate_summary.py` folds
+an arm's three legs, refuses a cross-boot pair, voids a run whose within-window
+spread exceeds **5%** or whose arms' medians differ by more than **1%**, and
+attaches the clock block to every ratio so the clock can be sized against the
+effect without leaving the row. `--allow-cross-boot` stamps a recorded caveat and
+waives **`boot_id` and nothing else** — the GPU, driver, `clocks.max.sm`,
+applications clock and persistence mode are compared across the arms
+unconditionally, because same-boot equality was the only thing standing in for
+"same machine" and the override removes it.
+
+A window must also have been **observed**: at least **30 retained busy samples**
+and a **majority** of the window busy. Without those floors the incentive is
+inverted — `spread_pct` over `n == 1` is definitionally **0.00%**, the best score
+the gate can award, so six legs each holding one busy sample and 300 idle scored
+a clean pass at `+0.00%`. Both counts are now carried in the ratio's clock block
+and printed beside the offset.
+
+All four thresholds are arguments from the table above and from the grid
+definition, derived in `.agents/specs/bench-assert-clock-state.md`. The **5%**
+spread ceiling is deliberately *not* held to the forward criterion the **1%**
+offset was chosen by; the spec says why and states the residual. The transfer
+used to report an estimated effect — **0.7548** points of kernel time per point
+of clock — is `n = 1`, is reported and never gated on, and is owed a second pair
+once #545 allows one; the offset threshold no longer rests on it, holding
+instead at the transfer's physical ceiling of 1.0.
+
+### Live state at the time of writing
+
+A read-only `ssh dgx.casa` probe on 2026-08-12 returned boot id
+`13dc5579-455c-45c8-8e4d-d09c457fa826` — a **third** boot — at the degraded
+2190 MHz with `clocks.max.sm` 3003 and applications 2418. The defect is live,
+not historical. No clock was pinned and no GPU work was queued: another session
+held `$HOME/gpu.lock`, and `nvidia-smi -lgc` would have repriced their
+in-flight measurement.
+## SPEC-DSPARK: storage ruled out; ratio stable at ~0.966 across three sessions (2026-08-12)
+
+Question raised: are the weights on NAS, or not fully resident, distorting the
+measurements?
+
+Weights are on LOCAL NVMe (/dev/nvme0n1p2 ext4); no NAS mount exists on the box.
+A run reads 22.06 GB total = one full model read at load. Process RSS during
+decode is 4.8 GB, so weights are uploaded and the mapping released, not held.
+Decode is stable to 0.5% across 8 warm reps (146.0-147.6), which file-backed
+weights could not be. Storage is NOT a factor.
+
+Operational: that NVMe is 98% full (76 GB free), and this repo has already lost a
+gate run to ENOSPC reporting green over work that never ran.
+
+Within-session ratios, three independent measurements:
+
+| session | ours | oracle (modal) | ratio |
+|---|---|---|---|
+| pinned clocks, pre-C_tmp | 135.98 | 139.36 | 0.9757 |
+| pinned clocks, post-C_tmp | 139.20 | 144.32 | 0.9646 |
+| free clocks, ours->oracle->ours | 140.98 | 147.32 | 0.9569 |
+
+~0.966 +/- 0.01, consistently below 1.0. Absolute numbers move up to 5% between
+sessions for the SAME binary because GB10's memory clock cannot be pinned, so
+only the within-session ratio is quotable -- and all three agree.
+
+Oracle draws remain bimodal (~147.3 and ~155.6), the same one-extra-accepted-token
+effect as the fibacc run, so its MODAL draws are the honest denominator.
+
+Evidence: `dgx:~/work/dspark-w6/iocheck.log`, `final_pair.log`.
+
+## BENCH-CLOCK-CONTROLLED-PIN-GRID: the first series measured with the correct oracle, its production configuration, and a controlled clock at the same time (2026-08-13)
+
+Issues: [#520](https://github.com/mudler/vllm.cpp/issues/520) (the harness
+enforced the 0.25.0 ROLLBACK oracle and refused the pin),
+[#414](https://github.com/mudler/vllm.cpp/issues/414) (the oracle ran without
+`--language-model-only`, so its attention path was UNFUSED),
+[#543](https://github.com/mudler/vllm.cpp/issues/543) (the SM clock differs
+between boots and nothing recorded it),
+[#577](https://github.com/mudler/vllm.cpp/issues/577) (our SSE keepalive can
+drop the slowest requests from the metrics).
+
+Three defects were live simultaneously on every previously published online
+grid, and each one alone is sufficient to void a ratio. This series is the first
+that carries none of the first three. It carries the fourth, which is why its
+c16 column is recorded as VOID rather than as a set of numbers.
+
+### Oracle identity, asserted per leg
+
+| what | value |
+|---|---|
+| pin commit | `5559679229bc961848b121ccdeaa8fa5d79bec98` (`555967922`) |
+| runtime version string | `0.23.1rc1.dev1511+g555967922` |
+| FlashInfer | `0.6.15.post1` |
+| how it was selected | by EXPLICIT PATH, not by whatever a symlink resolved to |
+| how it was verified | identity asserted per leg, aborting on mismatch |
+| configuration | GRAPHED (production), never `--enforce-eager`, plus `--language-model-only` |
+
+The version strings match `.agents/upstream-sync.md` `parity-pin` block
+byte-for-byte. The explicit-path selection and the per-leg assertion are the
+answer to [#375](https://github.com/mudler/vllm.cpp/issues/375), where the
+oracle symlink pointed at a rollback and nothing noticed.
+
+`--language-model-only` is the [#414](https://github.com/mudler/vllm.cpp/issues/414)
+repair. At the pin the flag is what makes `language_model_only` true for a
+checkpoint that loads as `Qwen3_5*ForConditionalGeneration`, which is what
+enables `use_fused_qk_norm_rope_gate`
+(`vllm/model_executor/models/qwen3_next.py:322-329`, kernel
+`vllm/model_executor/layers/fused_qk_norm_rope.py:117`). Without it the oracle
+issues four ops per full-attention layer where its own production configuration
+issues one, while our arm has run the fused single launch by default since
+`src/vllm/model_executor/models/qwen3_5.cpp:1754` (`FuseAttnPreambleOn`; #414 cites this as :1679, which has since drifted). That is a handicapped
+denominator, and its cost scales with prompt tokens, so it lands hardest on
+exactly the TTFT axis where our deficit sat.
+
+### Clock protocol, so it is reproducible
+
+1. Take `$HOME/gpu.lock` FIRST. `nvidia-smi -lgc` is a shared-host mutation; run
+   it while another session holds the lock and it silently reprices their
+   in-flight measurement, which is the [#543](https://github.com/mudler/vllm.cpp/issues/543)
+   defect committed deliberately.
+2. `sudo -n nvidia-smi -lgc 2190`, under an always-fires reset trap so
+   `nvidia-smi -rgc` runs on every exit path, including a failed leg. Leaving the
+   box pinned makes every later run inherit a state nobody recorded.
+3. Sample a clock window per leg with `tools/bench/gpu_clock_state.py` and keep
+   the boot id with the numbers.
+
+**Why 2190 and not a value read from the device.** GB10 does not enumerate
+`SUPPORTED_CLOCKS`, so there is no list to pick a legal frequency from. 2190 was
+chosen empirically as the frequency the WORST observed boot sustained flat: the
+degraded boot recorded in the #543 entry above ran at a flat 2190 while a
+healthier boot ran a median 2470. Requesting the floor rather than the ceiling is
+what makes the request satisfiable on any boot, which is what makes two legs on
+different days comparable at all.
+
+**What the clock actually did.** Requested 2190, delivered a flat **2184 MHz**
+across every timed window. One leg reports n=861 retained busy samples,
+min 2158, median 2184, max 2184. A **single `boot_id` across all legs**, so no
+leg needed `--allow-cross-boot` and no cross-boot caveat is stamped on any ratio
+here. This is the first series where the clock is a recorded input rather than an
+unmeasured confound.
+
+### Workload
+
+1024 input / 128 output, n=3 per point, arms INTERLEAVED, greedy, closed loop,
+one `flock` across the series. Leg-to-leg spreads at or under 2% almost
+everywhere; the two exceptions are named below and are recorded as NOT
+ESTABLISHED rather than quoted.
+
+### The measurement
+
+Ratios are ours/reference for throughput and reference/ours for latency, so 1.0
+or higher is a win, matching `docs/BENCHMARKS.md`.
+
+| point | 27B decode TPOT | 27B decode tput | 27B prefill TTFT | 35B decode TPOT | 35B decode tput | 35B prefill TTFT |
+|---|---|---|---|---|---|---|
+| c1 | **0.976x** | 0.973x | **0.944x** | **0.995x** | 0.987x | **0.920x** |
+| c4 | **0.946x** | 0.958x | 0.982x (median) | **0.946x** | 0.944x | **0.849x** (mean) |
+| c16 | 0.928x VOID | 0.913x VOID | 0.989x VOID | NOT ESTABLISHED, 6.8% spread | 0.930x | NOT ESTABLISHED, 15.0% spread |
+
+The 27B c1 decode TPOT of **0.976x** is the best defensible decode parity number
+this project has produced against a correctly configured oracle.
+
+**Do not read the difference against the superseded figures as a delta.** The
+superseded 27B canonical read 0.9561x at c1 and this series reads 0.973x on the
+comparable throughput axis, which is HIGHER, even though both repaired defects
+were flattering us. That is not a contradiction and it is not a win: the oracle,
+its configuration, the clock regime and our own tree all moved between the two
+readings, so subtracting them attributes nothing. The superseded figures are void
+because of what they measured against, not because of the number they produced,
+and the honest reading of the pair is that the earlier one has no denominator
+worth differencing.
+
+### 27B c16 is VOID, and it is our defect
+
+Our arm completed **93 of 96** requests where the pin completed **96 of 96**, and
+the three that are missing are the SLOWEST three. That is
+[#577](https://github.com/mudler/vllm.cpp/issues/577): our SSE keepalive
+(`VT_SERVER_SSE_PING_S`, default **15 s**, `<=0` disables,
+`include/vllm/entrypoints/openai/serving_utils.h:40`) injects a bare comment
+frame `":\n\n"` into any stream silent for longer than the interval, and a
+request that goes silent that long is by construction in the tail.
+
+Removing the tail raises our median throughput and lowers our p90/p99, on our arm
+only, because vLLM emits no such frame. So 0.928x / 0.913x / 0.989x at c16 are
+**not numbers**. They are recorded here as what the run produced and are refused
+as parity points. A ping-disabled c16 re-measure is owed and is what sizes the
+bias; whether the pinned `vllm bench serve` client DROPS, mis-times, or correctly
+ignores the comment frame is still not established, so no magnitude is claimed.
+
+### The 35B c16 points are not void, they are unresolved
+
+35B c16 decode TPOT (6.8% leg spread) and prefill TTFT (15.0%) are recorded
+**NOT ESTABLISHED**. That is a precision statement, not a defect attribution:
+the spread exceeds the band this series holds everywhere else, so the point does
+not support a ratio. 35B c16 decode throughput reads 0.930x. Any c16 or
+higher-concurrency point on either model is additionally exposed to #577 for the
+reason above, so none of them is quotable until the keepalive is out of the
+measurement path.
+
+### Server-side knobs: what was disabled and what was not
+
+**Nothing disabled the SSE keepalive on any leg of this series.** The value is
+recorded plainly because an unrecorded server-side knob that changes measured
+latency is the same defect class as the unrecorded SM clock (#543) and the
+rollback oracle (#520), and this project has now been bitten by all three.
+
+| arm | `VT_SERVER_SSE_PING_S` | basis |
+|---|---|---|
+| vllm.cpp, every leg (c1, c4, c16, both models, lever legs included) | **default 15 s, ENABLED** | no harness in the tree sets it: grep finds the name only in `serving_utils.cpp:256`, its header, its test, `docs/USAGE.md` and `docs/ENVIRONMENT.md`. `scripts/dgx-online-serving.sh` does not export it |
+| vLLM, every leg | not applicable | vLLM has no such knob and emits no keepalive comment frame |
+| the owed re-measure | `0` (disabled) | staged, NOT run; it is the leg that sizes the #577 bias |
+
+So the correct reading is that the keepalive was ENABLED everywhere, and that
+this is a property of the recipe rather than a per-leg choice. It does not affect
+c1 or c4, where no request goes silent for 15 s, and it is exactly why c16 is
+void. The harness should assert the interval the way it now asserts oracle
+identity and clock state, which is #577 option 2.
+
+### 27B lever A/B: the fp8 tower pair, still DEFAULT OFF
+
+Same series, same clock, same oracle, same interleaving. `VT_GDN_PACKED_DECODE_FP8_TOWER=1`
+with `VT_GDN_FP8_IN_BF16=1`, both **default OFF**, both A/B'd against the same
+binary.
+
+| axis | c1 | c4 | c16 |
+|---|---|---|---|
+| decode | **1.007x** | **1.012x** | 1.027x |
+| prefill TTFT | **1.048x** | **1.041x** | not recorded |
+
+This supersedes the `PERF-GDN-PACKED-BRIDGE` (#365) reading of
+`0.977x -> 0.984x`, which was explicitly INDICATIVE: it came from a separate
+c1 `input_len=16` harness whose arms were not interleaved and did not share a
+background state. These legs are interleaved, on the 1024/128 workload, at a
+pinned clock, against the pin.
+
+Composed with the parity series, **27B c1 decode with both levers on is
+0.976 x 1.007 = about 0.983x**. The c16 lever figure inherits the #577 exposure
+of the c16 point it was measured on, so it is directional only.
+
+The levers stay default OFF. A lever that has to justify itself by measurement
+has now been measured positive on two concurrencies at c1/c4; flipping the
+default is a separate change with its own token gate, not a consequence of this
+record.
+
+### What this supersedes, and in which direction
+
+Every online-serving ratio published before this series went through
+`tools/bench/online_gate.py`, which hard-enforced `VLLM_ORACLE_VERSION = "0.25.0"`
+and RAISED on anything else until [#520](https://github.com/mudler/vllm.cpp/issues/520)
+landed at `4064558d0`. Nobody could have measured against the pin through that
+harness even if they had tried. The same runs went through
+`scripts/dgx-online-serving.sh`, which passes no `--language-model-only`.
+
+| superseded figure | where | defect |
+|---|---|---|
+| 35B `0.918x-0.972x` canonical @`348c265d` | `docs/BENCHMARKS.md` At a glance | rollback oracle (#520) + unfused denominator (#414) |
+| 35B `0.9708x` c1 / `0.9377x` c32 canonical row | `docs/BENCHMARKS.md` 35B by concurrency | same |
+| 27B `0.9561x` c1 / `0.9371x` c32 binding row | `docs/BENCHMARKS.md` 27B ModelOpt by concurrency | same |
+| 35B `0.93-1.03x` 3-rep grid @`1ea26427` | `docs/BENCHMARKS.md` axes-passing table | same |
+
+**Both defects flattered US.** This is the part that matters and it is stated
+plainly rather than left to be inferred from the word "superseded": the wrong
+engine and the handicapped denominator each moved the published ratio in our
+favour, so those figures are OPTIMISTIC, not merely stale. Correcting them is
+expected to make our numbers worse, and #414 said so before the run.
+
+Nothing is withdrawn or deleted. The superseded rows keep their values and gain
+the attribution, per AGENTS.md: evidence is moved and annotated, never removed.
+
+### What is owed
+
+- A ping-disabled c16 and c32 re-measure on both models, which is the only thing
+  that turns c16 back into a number and sizes the #577 bias.
+- The 35B c16 spread: re-run until the band matches the rest of the series, or
+  record why this point is intrinsically noisier.
+- 27B/35B c2, c8 and c32 at the pin under clock control, so the sweep is a sweep
+  and not three points.
+- A harness assertion on `VT_SERVER_SSE_PING_S`, alongside the oracle-identity
+  and clock-state assertions that already exist.
+- No ceiling is declared for any of these ratios. The next traceable hypothesis
+  for the residual TTFT gap is that it is the same prefill glue attributed at
+  92.5% for 27B, now measured against a correctly fused denominator for the first
+  time, so the attribution itself is owed a re-run.

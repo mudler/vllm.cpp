@@ -15,9 +15,10 @@
 | **DSR fix: async readback capability (2026-08-08)** | **No number owed**: behavior-neutral (CPU/CUDA async-ON, discrete non-CUDA async-OFF, unchanged); moves a `kCUDA` check onto `Backend`, unblocking red CI on #127/#154/#155 |
 | **`ROAD-V1-MEM` M1+M2 (2026-08-08)** | KV auto-sizing CPU brick: `--kv-cache-memory` sizes the pool from a byte budget via the group-aware `KVBytesPerBlock` divisor (ABI v16, CPU-gated). M3 profile run dgx-gated |
 | **Record/checker repair 2026-08-07–08** | Gates fixed. Public: `VT_GEMMA4_EXPERT_VRAM_MB` (positive-MiB LRU cap; unset/0 unlimited), `VT_SERVER_MAX_{PROMPT_CHARS,NEW_TOKENS}` (200000/4096; 0 disables); nine Gemma4/ROCm tuners internal. No runtime/perf change. |
-| **vLLM** | Qwen3.6-27B NVFP4 `unsloth` @`890bdef7`, GB10 | ahead 4.5% at c1, **tie** at c2 to c32 | identical |
-| **vLLM** | Qwen3.6-27B NVFP4 `nvidia` @`0893e160` (ModelOpt `modelopt_mixed`), GB10 | **0.937x to 0.956x, BEHIND** and FLAT over c1-c32 (canonical 6-point 2026-08-11). The 2026-08-10 c1 0.838 did NOT reproduce (#349); gap NOT attributed | near-tie |
-| **vLLM** | Qwen3.6-35B-A3B NVFP4 `nvidia` @`491c2f1e`, GB10 | **CANONICAL 2026-08-11 @`348c265d`: 0.918x-0.972x** over c1-c32 (first c16/c32); best c4 0.9719. Supersedes the ad-hoc grid | near-tie |
+| **Clock attribution (`BENCH-ASSERT-CLOCK-STATE`, #543)** | dgx.casa GB10, driver 580.159.03, no throttling either side | **A CLOCK-CONTROLLED series now exists:** flat **2184 MHz** (requested 2190), one `boot_id`, one leg n=861 / min 2158. Every OTHER figure predates clock assertion, where med 2470 vs 2190 repriced `marlin::Marlin` +9.65% | n/a, nothing withdrawn |
+| **vLLM** | Qwen3.6-27B NVFP4 `unsloth` @`890bdef7`, GB10 | ahead 4.5% at c1, **tie** at c2 to c32, all **SUPERSEDED**: rollback oracle (#520) + unfused denominator (#414), both flattering us. No pin re-run yet | identical |
+| **vLLM** | Qwen3.6-27B NVFP4 `nvidia` @`0893e160` (ModelOpt `modelopt_mixed`), GB10 | **BINDING at the pin, clocks pinned: 0.976x c1 / 0.946x c4 decode TPOT**, TTFT 0.944x c1. c16 VOID (#577). The 0.937x-0.956x canonical is **SUPERSEDED and optimistic**: rollback oracle (#520) + unfused denominator (#414) | near-tie |
+| **vLLM** | Qwen3.6-35B-A3B NVFP4 `nvidia` @`491c2f1e`, GB10 | **BINDING at the pin, clocks pinned: 0.995x c1 / 0.946x c4 decode TPOT**; TTFT 0.920x c1, 0.849x c4; c16 NOT ESTABLISHED. The 0.918x-0.972x canonical is **SUPERSEDED and optimistic** (#520, #414) | near-tie |
 | **vLLM** | DeepSeek-V2-Lite (MLA), GB10 | 0.86x to 0.95x throughput, TTFT wins at c4/c8 | identical |
 | **vLLM** | Laguna-S-2.1 NVFP4 (118B/8B MoE), GB10 | **parity+, 1.03x** (44.46 vs 43.10 tok/s, byte-exact, default config; bf16 weights now device-resident) | near-tie |
 | **llama.cpp** | Qwen3.5-2B GGUF, CPU aarch64 | 20-core Arm/i8mm: prefill **1.18x ahead**, decode tie, memory parity. RPi5/A76: vllm.cpp is **0.461x prefill / 0.653x decode+E2E**, but uses **24.2% less RSS** | byte-identical on both Arm lanes |
@@ -34,21 +35,22 @@ registry-bound list in [FEATURES.md](FEATURES.md).
 ## vLLM, online serving
 
 The binding comparison. vLLM runs its **production graphed config**, never
-`--enforce-eager`. The oracle column is what RAN, which is **not the pin**
-`555967922`: the harness enforced `0.25.0` and *raised* on anything else until
-2026-08-12, so those rows could not have been measured otherwise
-([#520](https://github.com/mudler/vllm.cpp/issues/520)). Attributed, not
-withdrawn; the two tie where checked (27B c1, 0.9983, n=3). A grid at the pin is
-owed ([#522](https://github.com/mudler/vllm.cpp/issues/522)), and the absent
-`--language-model-only` flatters these ratios
-([#414](https://github.com/mudler/vllm.cpp/issues/414)).
+`--enforce-eager`. Every `0.25.0` row below is **SUPERSEDED and OPTIMISTIC**, on
+two counts that both flattered us: the harness enforced the `0.25.0` ROLLBACK
+and *raised* on the pin until 2026-08-12
+([#520](https://github.com/mudler/vllm.cpp/issues/520)), and the same runs never
+passed `--language-model-only`, so the denominator ran vLLM's UNFUSED
+QK-norm+RoPE+gate path
+([#414](https://github.com/mudler/vllm.cpp/issues/414)). Nothing is withdrawn.
+The first series free of both, at the pin, graphed, and at a pinned clock is in
+[the benchmark record](../.agents/benchmark-record.md).
 
 | Model | Quant | vLLM oracle | Axes passing | Disposition |
 |---|---|---|---:|---|
-| Qwen3.6-27B | NVFP4 (`unsloth` @`890bdef7`) | 0.25.0 | **115/124** | Effective parity-or-better, two-grid totality. Revision-PINNED (the gate no longer lets `readdir` choose): @`ccdaab7e` is the same repo name re-quantized to FP8 W8A8 throughout, not NVFP4 |
-| Qwen3.6-27B | NVFP4 (`nvidia` @`0893e160`, ModelOpt `modelopt_mixed`) | 0.25.0 | 0/6 | **BEHIND, uniformly 0.94x** on decode, flat c1-c32 (6-point, `gate_pass:false`); greedy continuation IDENTICAL to vLLM. Different model from the `unsloth` row (NVFP4 MLP + FP8 W8A8 tower) |
-| Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x (c4 wins), c16 0.93x. Both c16 levers A/B'd NEG: drain event -1.9%, mirror 0.999x. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
-| DeepSeek-V2-Lite | bf16 MLA | 0.25.0 | 4/25 | Attributed miss, row stays `ACTIVE` |
+| Qwen3.6-27B | NVFP4 (`unsloth` @`890bdef7`) | 0.25.0 ROLLBACK, SUPERSEDED | **115/124** | Effective parity-or-better, two-grid totality. Revision-PINNED (the gate no longer lets `readdir` choose): @`ccdaab7e` is the same repo name re-quantized to FP8 W8A8 throughout, not NVFP4 |
+| Qwen3.6-27B | NVFP4 (`nvidia` @`0893e160`, ModelOpt `modelopt_mixed`) | 0.25.0 ROLLBACK, SUPERSEDED | 0/6 | BEHIND, uniformly 0.94x on decode, flat c1-c32, but **VOID as a ratio** (#520, #414). At the pin, clocks pinned: **0.976x c1 / 0.946x c4 TPOT**. Different model from the `unsloth` row (NVFP4 MLP + FP8 W8A8 tower) |
+| Qwen3.6-35B-A3B | NVFP4 `modelopt_mixed` | 0.25.0 ROLLBACK, SUPERSEDED | 2/18 | 3-rep grid 2026-08-05 @`1ea26427`: 0.93-1.03x, VOID as ratios (#520, #414). At the pin, clocks pinned: **0.995x c1 / 0.946x c4 TPOT**. ★ probe found a prod async batch-1 greedy DEGENERATION bug the mirror fixes |
+| DeepSeek-V2-Lite | bf16 MLA | 0.25.0 ROLLBACK, SUPERSEDED | 4/25 | Attributed miss, row stays `ACTIVE` |
 | Qwen3.5-4B | bf16 direct-load | 0.26.0.dev0 | **1.0283x tput, `PENDING`** | OPEN: TTFT/TPOT/E2E 1.085/1.017/1.029x, VRAM +118.7 MiB ([data](bench-evidence/qwen35-4b-sm120-main-20260807.md)) |
 
 ### GDN prefill kernels by GPU
@@ -93,7 +95,10 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 |---|---:|---:|---:|---:|---:|---:|
 | **vllm.cpp** tok/s (canonical 2026-08-11) | 10.756 | 19.232 | 32.365 | 50.520 | 69.040 | 84.064 |
 | vLLM 0.25.0 tok/s (canonical 2026-08-11) | 11.250 | 20.153 | 34.281 | 53.666 | 73.114 | 89.706 |
-| **Ratio BINDING (main @`348c265d`, n=3 both arms)** | **0.9561x** | **0.9543x** | **0.9441x** | **0.9414x** | **0.9443x** | **0.9371x** |
+| Ratio, SUPERSEDED and OPTIMISTIC (main @`348c265d`, rollback oracle #520, unfused denominator #414) | 0.9561x | 0.9543x | 0.9441x | 0.9414x | 0.9443x | 0.9371x |
+| **BINDING at the pin, graphed, `--language-model-only`, clocks 2184 MHz: decode TPOT** | **0.976x** | - | **0.946x** | - | VOID #577 | - |
+| Same series: decode tput / prefill TTFT (c4 TTFT is a median) | 0.973x / 0.944x | - | 0.958x / 0.982x | - | VOID #577 | - |
+| Levers `VT_GDN_PACKED_DECODE_FP8_TOWER=1 VT_GDN_FP8_IN_BF16=1` (both DEFAULT OFF), same-binary A/B: decode / TTFT | 1.007x / 1.048x | - | 1.012x / 1.041x | - | 1.027x / - | - |
 | Driver verdict | `{"gate_pass": false}`; first six-point grid here. Levers `lm_head`+qkvz ACTIVE by kernel signature | | | | | |
 | OPEN, and what it retracts | vLLM reproduces to 1.0%, OURS moved +14.8% at c1; lottery REFUTED (6 loads, 1.0046x); build diff leads. "c1 did not move" withdrawn: c1 was noise-dominated ([#349](https://github.com/mudler/vllm.cpp/issues/349)) | | | | | |
 
@@ -131,7 +136,9 @@ the same metric at higher concurrency (c8 p99 ITL 0.86x, but 1.055x at c16 and
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|---:|
-| **Ratio, CANONICAL @`348c265d`** | **0.9708x** | 0.9293x | **0.9719x** | 0.9183x | 0.9264x | 0.9377x |
+| **BINDING at the pin, graphed, `--language-model-only`, clocks 2184 MHz: decode TPOT** | **0.995x** | - | **0.946x** | - | NOT ESTABLISHED, 6.8% spread | - |
+| Same series: decode tput / prefill TTFT (c4 TTFT is a mean) | 0.987x / 0.920x | - | 0.944x / 0.849x | - | 0.930x / NOT ESTABLISHED, 15.0% spread | - |
+| Ratio, SUPERSEDED and OPTIMISTIC @`348c265d` (rollback oracle #520, unfused denominator #414) | 0.9708x | 0.9293x | 0.9719x | 0.9183x | 0.9264x | 0.9377x |
 | **vllm.cpp** tok/s @`348c265d` | 65.262 | 93.012 | 140.174 | 193.477 | 251.490 | 311.897 |
 | vLLM tok/s @`348c265d` | 67.223 | 100.088 | 144.226 | 210.679 | 271.479 | 332.606 |
 | Ratio, superseded @`a0fa12c7` | 0.979x | 0.937x | 0.949x | 0.935x | 0.939x | 0.969x |
@@ -344,7 +351,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE **0.975x** code / **1.012x** prose vs the pinned graphed oracle (PINNED CLOCKS, non-overlapping). NOT parity: **0.965x-0.976x** within-session; C_tmp cap landed but is perf-NEUTRAL (+0.03%) (#442) | `ACTIVE` |
+| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE **0.975x** code / **1.012x** prose vs the pinned graphed oracle (PINNED CLOCKS, non-overlapping). NOT parity: **~0.966x +/- 0.01** over three within-session pairs; C_tmp cap perf-NEUTRAL; storage refuted (#442) | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure
@@ -368,8 +375,10 @@ and steady-state per-step timing or `nsys` GPU-busy is the anchor. The
 2026-08-06 #77-slip tree-revert changed no benchmark content or number.
 
 **Oracle pin.** vLLM 0.26.0.dev0 (`55596792`) plus transformers 5.14.1, built from
-source for sm_121a. Speed figures labelled 0.25.0 are the last binding run; the
-engine is unchanged by the pin advance and a 0.26 re-benchmark is pending.
+source for sm_121a; the running oracle reports `0.23.1rc1.dev1511+g555967922` with
+FlashInfer `0.6.15.post1`, and the binding series selects it by explicit path and
+asserts that identity per leg. Speed figures labelled 0.25.0 ran the ROLLBACK the
+harness enforced until 2026-08-12 and are SUPERSEDED, never binding (#520).
 Correctness re-validated bit-identical across the advance, zero golden drift.
 
 **Protocol.** Greedy, closed loop, three interleaved repetitions per point, one
@@ -408,7 +417,9 @@ built on it rather than keeping the flattering one.
 | Track | Status | Next gate |
 |---|---|---|
 | Surface coverage (`ARCH-ONE-SURFACE`) | **CORRECTNESS COMPLETE:** #139 restores DSR 32 (`kcuda=0`) via registry/name resolution; ABI-v14 selection unchanged; no speed claim | Selector 2/2·11 plus execution-bound CMake/File-API/CTest + CI/preflight + manifest-integrity guard 52/52; CPU platform/loader/C-ABI tests green; CUDA A/B remains residual |
-| 35B prefill TTFT | 0.93x to 0.98x at every concurrency (2026-08-05) | Attribute the residual, then close |
+| 35B prefill TTFT | **0.920x c1 / 0.849x c4** against a correctly FUSED denominator at the pin; the 0.93x-0.98x reading came from an UNFUSED oracle (#414) and is void | Re-attribute the residual against the fused denominator, then close |
+| c16 and above, both models (#577) | **VOID, not a number.** Our arm completed 93/96 requests where the pin completed 96/96 and the three missing are the SLOWEST: our SSE keepalive (`VT_SERVER_SSE_PING_S`, default 15 s) was ENABLED on every leg | Disable the keepalive in the recipe, assert it in the harness, then re-run c16/c32 |
+| Clock-controlled pin grid (#520, #414, #543) | **First defensible series LANDED** at 1024/128, n=3, interleaved, one boot, flat 2184 MHz. Only c1, c4 and a partial c16 exist | c2, c8 and c32 at the pin under clock control, so the sweep is a sweep |
 | 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` **default ON for correctness**. `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) A/B'd speed-NEUTRAL | c16 lever is prefill glue (task #61), not the decode drain. `test_qwen36_async_serving` GREEN |
 | CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
@@ -453,6 +464,7 @@ built on it rather than keeping the flattering one.
 | Benchmark | Entry point |
 |---|---|
 | vLLM online grid | `.agents/specs/competitive-benchmarks.md`, evidence under `dgx:~/work/vllm.cpp-online-gate/evidence/` |
+| Clock-controlled pin series | `$HOME/gpu.lock` FIRST, then `sudo -n nvidia-smi -lgc 2190` under an always-fires `-rgc` trap; oracle by EXPLICIT PATH, identity asserted per leg; a `gpu_clock_state.py` window per leg |
 | CPU vs llama.cpp | Same GGUF both arms, 3 reps under one `flock $HOME/gpu.lock`; `VT_GGUF_KEEP_F16=0` reproduces the pre-L7 baseline |
 | Laguna NVFP4 decode | `flock $HOME/gpu.lock ./build-cuda/examples/laguna-gen --model ~/laguna-xs-nvfp4 --gpu` (that directory holds the S-2.1 checkpoint); `drop_caches` first, create the CUDA context before loading weights |
 | DeepSeek-V4-Flash decode | `deepseek-v4-gen --gpu --kv-cache` on `ds4flash.gguf`, captured under tmux |

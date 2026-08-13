@@ -342,6 +342,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
+| `NemotronHForCausalLM` | The Mamba2 forward is not ported yet (#517 W4, blocked on #496). Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.

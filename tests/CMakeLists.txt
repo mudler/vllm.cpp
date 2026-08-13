@@ -55,6 +55,31 @@ vllm_cpp_add_test(test_nvfp4_dequant vllm/test_nvfp4_dequant.cpp)
 vllm_cpp_add_test(test_awq_gptq_dequant vllm/test_awq_gptq_dequant.cpp)
 vllm_cpp_add_test(test_mxfp4_dequant vllm/test_mxfp4_dequant.cpp)
 vllm_cpp_add_test(test_ct_nvfp4_emulation vllm/test_ct_nvfp4_emulation.cpp)
+# MODEL-TEXT-nemotron-h W1 (#517): the ModelOpt MIXED_PRECISION per-module
+# quant-algo resolver. Two arms, deliberately two BINARIES: the curated fixture
+# arm is always-on, and the exhaustive real-config arm exits 77 (Skipped) when
+# the 30B checkpoint is not staged. Folding them into one target would let the
+# skip swallow the always-on gate as well.
+#
+# The resolver header is INTERNAL (src/, not include/) until a loader consumes
+# it, so both targets take ${CMAKE_SOURCE_DIR}/src on the include path — the
+# same arrangement test_linear_method and test_model_registry already use.
+vllm_cpp_add_test(test_modelopt_mixed_precision
+  vllm/model_executor/layers/quantization/test_modelopt_mixed_precision.cpp)
+target_include_directories(test_modelopt_mixed_precision PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_modelopt_mixed_precision PRIVATE
+  MODELOPT_MIXED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/modelopt_mixed_precision")
+vllm_cpp_add_test(test_modelopt_mixed_precision_checkpoint
+  vllm/model_executor/layers/quantization/test_modelopt_mixed_precision_checkpoint.cpp)
+# tests/parity as well as src/: the exhaustive arm resolves its checkpoint
+# through the SINGLE pinned parity::Nemotron35LightningSnapshot() rather than
+# joining $CHECKPOINT_ROOT by hand, so that one resolver owns the revision pin
+# for both env spellings (#517 LOW-3) -- the same arrangement test_qwen36_weights
+# uses for the 35B pin.
+target_include_directories(test_modelopt_mixed_precision_checkpoint PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 vllm_cpp_add_test(test_gguf_dequant vllm/test_gguf_dequant.cpp)
 vllm_cpp_add_test(test_gguf_nvfp4 vllm/test_gguf_nvfp4.cpp)
 # gguf_nvfp4_goldens.inc lives next to the test source.
@@ -326,6 +351,28 @@ target_include_directories(test_muse_glimmer_gguf PRIVATE
 # or mis-shaped tensor). CPU-only; the forward REFUSES-by-name (W3-W6).
 # .agents/specs/kimi-linear.md.
 vllm_cpp_add_test(test_kimi_linear_scaffold vllm/models/test_kimi_linear_scaffold.cpp)
+
+# Nemotron-H (NemotronHForCausalLM) W3 STRUCTURAL gate (#517,
+# .agents/specs/nemotron-h-model.md §4 W3): registry-resolve + config descent off
+# the REAL released config.json (52-entry layers_block_type schedule, the legacy
+# hybrid_override_pattern/mamba_* aliases, the refuse cases) + the on-disk name map
+# accounted BOTH WAYS against all 18487 tensors of the released index + the
+# heterogeneous KV topology (6-layer full-attention group + 23-layer Mamba2 group,
+# shapes from mamba2_state_shape). The structural half runs off a COMMITTED
+# headers-only fixture so CI never needs the 20.1 GiB NAS asset; a final case
+# re-verifies that fixture against the LIVE checkpoint when VT_NEMOTRON35_SNAPSHOT
+# names it, and SKIPs loudly otherwise. CPU-only, no forward (W4), no speed claim.
+vllm_cpp_add_test(test_nemotron_h_scaffold vllm/models/test_nemotron_h_scaffold.cpp)
+target_compile_definitions(test_nemotron_h_scaffold PRIVATE
+  NEMOTRON_H_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/nemotron_h_35_lightning")
+# GATE-PIN-UNPINNED-SNAPSHOTS (#471): the live re-verification resolves the
+# checkpoint through the pinned parity::HfSnapshot, so it needs tests/parity on
+# the include path.
+# nemotron_h.h is a MODEL-PRIVATE header under src/, not include/vllm/: W3 ships
+# nothing on the public ABI and include/vllm/ is a USER_USAGE_PREFIXES surface
+# (#515). Same call as the W1 resolver header.
+target_include_directories(test_nemotron_h_scaffold PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
 
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA

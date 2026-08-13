@@ -12,8 +12,11 @@
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 #include <variant>
+
+#include "vllm/support/platform_compat.h"
 
 namespace vllm {
 

@@ -28,8 +28,10 @@
 // this binary is only built + smoke-tested against a synthetic engine (see
 // tests/vllm/entrypoints/openai/test_api_server.cpp). The wiring below is the
 // same either way.
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -53,10 +55,8 @@
 // DSR-ALLOW(ARCH-ONE-SURFACE): VT_BENCH_PROFILE_CONTROL is a build-option guard for the CUDA-graph-replay profiler, not a device fork; #189 moved it here verbatim from examples/server/main.cpp, which the DSR scanner never covered.
 #if defined(VT_BENCH_PROFILE_CONTROL) && !defined(_WIN32)
 #include <cerrno>
-#include <chrono>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <thread>
 #endif
 
 #include "vllm.h"

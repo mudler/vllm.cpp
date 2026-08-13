@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -35,6 +36,8 @@
 #include "../gguf_builder.h"
 
 namespace minimax_h3_fold {
+
+namespace fs = std::filesystem;
 
 // ── deterministic parameter stream (FNV-1a name hash -> splitmix64) ──────────
 inline std::vector<float> Param(const std::string& name, int64_t count, double scale,
@@ -332,7 +335,7 @@ inline void WriteFoldPromptEmbeds(const FoldDitGeometry& g, const FoldRenderRequ
 // Files: dit.gguf, video_vae.safetensors, video_vae_config.json,
 // audio_vae.safetensors, audio_vae_config.json, prompt_embeds.f32.
 inline void WriteFoldFixture(const std::string& dir) {
-  ::mkdir(dir.c_str(), 0755);
+  fs::create_directories(dir);
   const FoldDitGeometry g;
   const FoldRenderRequest r;
   WriteFoldDitGguf(g, dir + "/dit.gguf");

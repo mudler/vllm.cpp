@@ -9,6 +9,7 @@
 #include <numbers>
 #include <stdexcept>
 
+#include "vllm/support/platform_compat.h"
 #include "vt/dtype.h"
 #include "vt/op_provider.h"
 

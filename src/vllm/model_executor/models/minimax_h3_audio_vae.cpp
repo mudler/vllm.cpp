@@ -43,6 +43,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/support/platform_compat.h"
 #include "vt/dtype.h"
 
 namespace vllm {

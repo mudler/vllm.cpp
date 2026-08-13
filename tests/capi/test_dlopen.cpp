@@ -16,15 +16,60 @@
 
 #include <doctest/doctest.h>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 #include <string>
 
 #ifndef VLLM_SHARED_LIB_PATH
-#error "VLLM_SHARED_LIB_PATH must be defined (path to the built libvllm.so)"
+#error "VLLM_SHARED_LIB_PATH must be defined (path to the built shared library)"
 #endif
 
 namespace {
+
+#if defined(_WIN32)
+using SharedLibraryHandle = HMODULE;
+
+std::string LastSharedLibraryError() {
+  const DWORD error = GetLastError();
+  return error == 0 ? std::string() : ("GetLastError=" + std::to_string(error));
+}
+
+SharedLibraryHandle OpenSharedLibrary(const char* path) {
+  return LoadLibraryA(path);
+}
+
+void* LoadSymbol(SharedLibraryHandle handle, const char* name) {
+  return reinterpret_cast<void*>(GetProcAddress(handle, name));
+}
+
+bool CloseSharedLibrary(SharedLibraryHandle handle) {
+  return FreeLibrary(handle) != 0;
+}
+#else
+using SharedLibraryHandle = void*;
+
+std::string LastSharedLibraryError() {
+  const char* error = dlerror();
+  return error != nullptr ? std::string(error) : std::string();
+}
+
+SharedLibraryHandle OpenSharedLibrary(const char* path) {
+  return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+
+void* LoadSymbol(SharedLibraryHandle handle, const char* name) {
+  return dlsym(handle, name);
+}
+
+bool CloseSharedLibrary(SharedLibraryHandle handle) {
+  return dlclose(handle) == 0;
+}
+#endif
+
 
 // Function-pointer types for the ABI symbols we dlsym. These mirror the
 // declarations in vllm.h; a header-less consumer would type them by hand.
@@ -58,26 +103,22 @@ using fn_string_free = void (*)(char*);
 using fn_completion_free = void (*)(vllm_completion*);
 using fn_last_error = const char* (*)(void);
 
-// Resolve `name` from `handle`; the returned pointer must be non-null (fails the
-// test otherwise). Uses a union-free reinterpret through void* (POSIX-sanctioned
-// for dlsym function pointers).
 template <typename Fn>
-Fn Sym(void* handle, const char* name) {
-  void* p = dlsym(handle, name);
-  INFO("dlsym(", name, ")");
-  REQUIRE(p != nullptr);
-  return reinterpret_cast<Fn>(p);
+Fn Sym(SharedLibraryHandle handle, const char* name) {
+  void* symbol = LoadSymbol(handle, name);
+  INFO("resolve(", name, ")");
+  REQUIRE(symbol != nullptr);
+  return reinterpret_cast<Fn>(symbol);
 }
 
 }  // namespace
 
 // ─── the packaging DoD: dlopen + dlsym every ABI symbol, drive header-free ────
-TEST_CASE("dlopen: libvllm.so resolves the whole C ABI by name and drives it") {
-  // (1) dlopen the built shared library (RTLD_NOW forces eager symbol binding —
-  //     an unresolved symbol would fail here, proving the .so is self-contained).
-  void* lib = dlopen(VLLM_SHARED_LIB_PATH, RTLD_NOW | RTLD_LOCAL);
-  INFO("dlopen error: ", (dlerror() != nullptr ? dlerror() : ""));
+TEST_CASE("shared library resolves the whole C ABI by name and drives it") {
+  SharedLibraryHandle lib = OpenSharedLibrary(VLLM_SHARED_LIB_PATH);
+  INFO("shared library load error: ", LastSharedLibraryError());
   REQUIRE(lib != nullptr);
+
 
   // (2) dlsym EVERY stable C ABI symbol by name — all must be non-null.
   auto p_version = Sym<fn_version>(lib, "vllm_version");
@@ -143,5 +184,5 @@ TEST_CASE("dlopen: libvllm.so resolves the whole C ABI by name and drives it") {
   // p_engine_free on null is a no-op (exercises the free pointer safely).
   p_engine_free(nullptr);
 
-  CHECK(dlclose(lib) == 0);
+  CHECK(CloseSharedLibrary(lib));
 }

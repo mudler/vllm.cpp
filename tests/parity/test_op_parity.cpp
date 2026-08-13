@@ -25,6 +25,7 @@
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/support/platform_compat.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -52,13 +53,13 @@ class ScopedEnv {
       had_old_ = true;
       old_ = old;
     }
-    setenv(name, value, 1);
+    if (!vllm::support::SetEnvVar(name, value)) std::abort();
   }
   ~ScopedEnv() {
     if (had_old_) {
-      setenv(name_.c_str(), old_.c_str(), 1);
+      if (!vllm::support::SetEnvVar(name_.c_str(), old_.c_str())) std::abort();
     } else {
-      unsetenv(name_.c_str());
+      if (!vllm::support::UnsetEnvVar(name_.c_str())) std::abort();
     }
   }
   ScopedEnv(const ScopedEnv&) = delete;

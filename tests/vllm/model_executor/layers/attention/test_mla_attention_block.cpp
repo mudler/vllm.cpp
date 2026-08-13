@@ -53,6 +53,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/mla_attention.h"
+#include "vllm/support/platform_compat.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"

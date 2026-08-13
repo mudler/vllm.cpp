@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/support/test_platform_compat.h"
 #include "vt/backend.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
@@ -331,7 +332,7 @@ TEST_CASE("Lever 1: CUDA Q8_0 preq-quant grid == legacy quant grid (bit-identica
       Tensor bt = DevTensor(d_w, DType::kQ8_0, {n, k});
 
       auto run = [&](const char* flag) {
-        setenv("VT_V4_Q8_PREQ_QUANT", flag, 1);
+        vllm::support::test::ScopedEnvVar env("VT_V4_Q8_PREQ_QUANT", flag);
         void* d_o = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
         Tensor ot = DevTensor(d_o, DType::kF32, {m, n});
         vt::MatmulBTQuant(gq, ot, at, bt);
@@ -343,7 +344,6 @@ TEST_CASE("Lever 1: CUDA Q8_0 preq-quant grid == legacy quant grid (bit-identica
       };
       std::vector<float> legacy = run("0");  // one-thread-per-block
       std::vector<float> preq = run("1");    // ds4-preq warp-per-block
-      unsetenv("VT_V4_Q8_PREQ_QUANT");
       for (size_t i = 0; i < legacy.size(); ++i) {
         REQUIRE(std::isfinite(preq[i]));
         CHECK(preq[i] == legacy[i]);  // BIT-IDENTICAL
@@ -391,7 +391,7 @@ TEST_CASE("Lever 2: CUDA Q8_0 sub-warp GEMV == plain (bit-exact big-K, NMSE≤5e
         Tensor bt = DevTensor(d_w, DType::kQ8_0, {n, k});
 
         auto run = [&](const char* flag) {
-          setenv("VT_V4_Q8_SUBWARP", flag, 1);
+          vllm::support::test::ScopedEnvVar env("VT_V4_Q8_SUBWARP", flag);
           void* d_o = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
           Tensor ot = DevTensor(d_o, DType::kF32, {m, n});
           vt::MatmulBTQuant(gq, ot, at, bt);
@@ -403,7 +403,6 @@ TEST_CASE("Lever 2: CUDA Q8_0 sub-warp GEMV == plain (bit-exact big-K, NMSE≤5e
         };
         std::vector<float> plain = run("0");    // full 32-lane warp per output
         std::vector<float> subw = run("1");     // sub-warp tiling
-        unsetenv("VT_V4_Q8_SUBWARP");
         double num = 0.0, den = 0.0;
         for (size_t i = 0; i < plain.size(); ++i) {
           REQUIRE(std::isfinite(subw[i]));
@@ -458,7 +457,7 @@ TEST_CASE("Brick 13: CUDA Q8_0 ILP multi-row GEMV == plain (byte-identical)") {
         Tensor bt = DevTensor(d_w, DType::kQ8_0, {n, k});
 
         auto run = [&](const char* flag) {
-          setenv("VT_V4_Q8_ILP", flag, 1);
+          vllm::support::test::ScopedEnvVar env("VT_V4_Q8_ILP", flag);
           void* d_o = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
           Tensor ot = DevTensor(d_o, DType::kF32, {m, n});
           vt::MatmulBTQuant(gq, ot, at, bt);
@@ -471,7 +470,6 @@ TEST_CASE("Brick 13: CUDA Q8_0 ILP multi-row GEMV == plain (byte-identical)") {
         std::vector<float> plain = run("1");   // one row per warp (baseline)
         std::vector<float> ilp2 = run("2");     // 2 rows per warp
         std::vector<float> ilp4 = run("4");     // 4 rows per warp
-        unsetenv("VT_V4_Q8_ILP");
         for (size_t i = 0; i < plain.size(); ++i) {
           REQUIRE(std::isfinite(ilp2[i]));
           REQUIRE(std::isfinite(ilp4[i]));
@@ -521,7 +519,7 @@ TEST_CASE("Brick 14: CUDA Q8_0 register-prefetch GEMV == plain (byte-identical)"
         Tensor bt = DevTensor(d_w, DType::kQ8_0, {n, k});
 
         auto run = [&](const char* flag) {
-          setenv("VT_V4_Q8_PREFETCH", flag, 1);
+          vllm::support::test::ScopedEnvVar env("VT_V4_Q8_PREFETCH", flag);
           void* d_o = gpu.Alloc(static_cast<size_t>(m * n) * sizeof(float));
           Tensor ot = DevTensor(d_o, DType::kF32, {m, n});
           vt::MatmulBTQuant(gq, ot, at, bt);
@@ -534,7 +532,6 @@ TEST_CASE("Brick 14: CUDA Q8_0 register-prefetch GEMV == plain (byte-identical)"
         std::vector<float> plain = run("1");   // one row per warp, no prefetch (baseline)
         std::vector<float> pf2 = run("2");      // prefetch depth 2
         std::vector<float> pf4 = run("4");      // prefetch depth 4
-        unsetenv("VT_V4_Q8_PREFETCH");
         for (size_t i = 0; i < plain.size(); ++i) {
           REQUIRE(std::isfinite(pf2[i]));
           REQUIRE(std::isfinite(pf4[i]));

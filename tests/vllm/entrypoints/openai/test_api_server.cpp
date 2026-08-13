@@ -10,6 +10,17 @@
 //
 // The synthetic model mirrors tests/vllm/entrypoints/openai/test_serving.cpp
 // (tiny hybrid-MoE Qwen3.6 + the BPE fixture, vocab ids 0..21).
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "vllm/entrypoints/openai/api_server.h"
 #include "vllm/entrypoints/openai/video_api.h"
 #include "vllm/multimodal/parakeet_transcription.h"

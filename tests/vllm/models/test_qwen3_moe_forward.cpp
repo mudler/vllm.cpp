@@ -31,6 +31,7 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_moe.h"
+#include "vllm/support/test_platform_compat.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -168,7 +169,7 @@ std::vector<float> RunForward(const HfConfig& c, const Qwen3MoeWeights& w) {
 }  // namespace
 
 TEST_CASE("qwen3-moe forward: CPU synthetic runs, finite, deterministic") {
-  setenv("VT_FUSED_CHAIN_ADOPT", "1", 1);
+  vllm::support::test::SetEnvOrThrow("VT_FUSED_CHAIN_ADOPT", "1");
   const HfConfig c = TinyConfig();
   const Qwen3MoeWeights w = TinyWeights(c);
 
@@ -185,11 +186,11 @@ TEST_CASE("qwen3-moe forward: fusion-catalog ADOPT == hand-call fallback (byte-e
   const HfConfig c = TinyConfig();
   const Qwen3MoeWeights w = TinyWeights(c);
 
-  setenv("VT_FUSED_CHAIN_ADOPT", "1", 1);
+  vllm::support::test::SetEnvOrThrow("VT_FUSED_CHAIN_ADOPT", "1");
   const std::vector<float> adopt = RunForward(c, w);
-  setenv("VT_FUSED_CHAIN_ADOPT", "0", 1);
+  vllm::support::test::SetEnvOrThrow("VT_FUSED_CHAIN_ADOPT", "0");
   const std::vector<float> hand = RunForward(c, w);
-  setenv("VT_FUSED_CHAIN_ADOPT", "1", 1);
+  vllm::support::test::SetEnvOrThrow("VT_FUSED_CHAIN_ADOPT", "1");
 
   // kFusedAddRmsNormStd (Tier-0 composite) dispatches to the SAME standalone ops
   // the fallback hand-calls -> byte-identical logits. (The MoE reference path is

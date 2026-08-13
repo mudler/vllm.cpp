@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "vllm/support/test_platform_compat.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
@@ -70,7 +71,9 @@ std::vector<uint8_t> Pack(const std::vector<float>& f, DType dt) {
   return out;
 }
 
-void SetTier(int tier) { setenv("VT_FUSED_TIER", tier == 1 ? "1" : "0", 1); }
+void SetTier(int tier) {
+  vllm::support::test::SetEnvOrThrow("VT_FUSED_TIER", tier == 1 ? "1" : "0");
+}
 
 // Runs the golden RmsNorm(residual) and both FusedChain tiers on CPU with the
 // SAME inputs, and asserts all three outputs (and residual streams) are byte-

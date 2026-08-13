@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "vllm/support/platform_compat.h"
+
 namespace gguf_test {
 
 inline std::string Utf8Path(const std::filesystem::path& path) {

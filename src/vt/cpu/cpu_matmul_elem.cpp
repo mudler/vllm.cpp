@@ -12,6 +12,11 @@
 #include <cstring>
 #include <string>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define VT_CPU_F16C_TARGET __attribute__((target("f16c")))
+#else
+#define VT_CPU_F16C_TARGET
+#endif
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #elif defined(__x86_64__) || defined(_M_X64)

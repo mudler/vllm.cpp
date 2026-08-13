@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "doctest/doctest.h"
+#include "vllm/support/test_platform_compat.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_vl.h"
 #include "vllm/model_executor/models/qwen3_vl_vision.h"
@@ -151,10 +152,11 @@ TEST_CASE("qwen3_5_27b_vision_tower_speed_AB") {
   // kernel is byte-identical to the warp kernel by construction (spec §16), so the
   // tower output must match to the bit — asserted below.
   auto run_arm = [&](const char* warp_env) {
-    if (warp_env != nullptr)
-      setenv("VT_QWEN3VL_ATTN_WARP", warp_env, 1);
-    else
-      unsetenv("VT_QWEN3VL_ATTN_WARP");
+    if (warp_env != nullptr) {
+      vllm::support::test::SetEnvOrThrow("VT_QWEN3VL_ATTN_WARP", warp_env);
+    } else {
+      vllm::support::test::UnsetEnvOrThrow("VT_QWEN3VL_ATTN_WARP");
+    }
     std::vector<double> ms;
     std::vector<float> out;
     for (int r = 0; r < kReps; ++r) {

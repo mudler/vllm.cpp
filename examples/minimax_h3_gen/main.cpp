@@ -34,8 +34,12 @@
 // pipeline and are gone with it; the capabilities they probed are gated by
 // test_minimax_h3 / test_minimax_h3_video_fold, and multi-image ref2va remains
 // reachable through the C++ seam (a named residual of the ABI's first slice).
+#if defined(_WIN32)
+#include <process.h>
+#else
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -55,6 +59,14 @@ int RunFfmpeg(const std::vector<std::string>& args) {
   argv.reserve(args.size() + 1);
   for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
   argv.push_back(nullptr);
+#if defined(_WIN32)
+  const intptr_t rc = _spawnvp(_P_WAIT, argv[0], argv.data());
+  if (rc == -1) {
+    std::fprintf(stderr, "error: _spawnvp failed\n");
+    return -1;
+  }
+  return static_cast<int>(rc);
+#else
   const pid_t pid = fork();
   if (pid < 0) {
     std::fprintf(stderr, "error: fork failed\n");
@@ -74,6 +86,7 @@ int RunFfmpeg(const std::vector<std::string>& args) {
     return -1;
   }
   return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
 }
 
 const char* Need(int argc, char** argv, int i, const char* flag) {

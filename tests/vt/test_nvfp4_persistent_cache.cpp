@@ -4,11 +4,6 @@
 // module; its source lifecycle plus the immutable GB10 cache are the spec.
 #include <doctest/doctest.h>
 
-// mkdtemp: declared in <stdlib.h> by glibc but in <unistd.h> by POSIX and by
-// Apple's libc, so a macOS build fails to find it without this
-// (BACKEND-METAL-MLX W0). Harmless on Linux.
-#include <unistd.h>
-
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -27,6 +22,8 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+
+#include "vllm/support/platform_compat.h"
 
 #include "vt/cuda/nvfp4_persistent_cache.h"
 
@@ -47,12 +44,23 @@ using vt::cuda::nvfp4::PlanKey;
 class TempDir {
  public:
   TempDir() {
-    std::string pattern = (fs::temp_directory_path() / "vllm-cpp-nvfp4-cache-XXXXXX").string();
-    std::vector<char> buffer(pattern.begin(), pattern.end());
-    buffer.push_back('\0');
-    char* created = ::mkdtemp(buffer.data());
-    if (created == nullptr) throw std::runtime_error("mkdtemp failed");
-    path_ = created;
+    static std::atomic<uint64_t> next_id{0};
+    const fs::path base = fs::temp_directory_path();
+    for (int attempt = 0; attempt < 128; ++attempt) {
+      const fs::path candidate =
+          base / ("vllm-cpp-nvfp4-cache-" +
+                  std::to_string(vllm::support::CurrentProcessId()) + "-" +
+                  std::to_string(next_id.fetch_add(1, std::memory_order_relaxed)));
+      std::error_code ec;
+      if (fs::create_directory(candidate, ec)) {
+        path_ = candidate;
+        return;
+      }
+      if (ec && ec != std::errc::file_exists) {
+        throw std::runtime_error("create_directory failed");
+      }
+    }
+    throw std::runtime_error("failed to allocate unique temp directory");
   }
 
   ~TempDir() {
@@ -82,8 +90,8 @@ class ScopedEnv {
  private:
   void Set(const std::optional<std::string>& value) const {
     if (value.has_value()) {
-      if (::setenv(name_.c_str(), value->c_str(), 1) != 0) std::abort();
-    } else if (::unsetenv(name_.c_str()) != 0) {
+      if (!vllm::support::SetEnvVar(name_.c_str(), value->c_str())) std::abort();
+    } else if (!vllm::support::UnsetEnvVar(name_.c_str())) {
       std::abort();
     }
   }

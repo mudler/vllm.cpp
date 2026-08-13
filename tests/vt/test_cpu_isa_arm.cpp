@@ -1,4 +1,6 @@
+#include <ostream>
 #include <string>
+#include <string_view>
 
 #include "doctest/doctest.h"
 #include "vt/cpu/cpu_isa_arm.h"

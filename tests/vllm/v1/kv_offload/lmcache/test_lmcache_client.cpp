@@ -28,10 +28,12 @@
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <limits>
 #include <mutex>
@@ -39,6 +41,7 @@
 #include <thread>
 #include <vector>
 
+#include "vllm/support/test_platform_compat.h"
 #include "vllm/v1/kv_offload/lmcache/memory_format.h"
 #include "vllm/v1/kv_offload/lmcache/remote_client.h"
 #include "vllm/v1/kv_offload/lmcache/remote_protocol.h"
@@ -460,6 +463,7 @@ void RunRoundTrip(LmcacheRemoteClient* client) {
 }  // namespace
 
 TEST_CASE("lmcache LmcacheRemoteClient round-trip vs in-process mock server") {
+  EnsureTestSockets();
   MockLmcacheServer server;
   LmcacheClientConfig cfg;
   cfg.host = "127.0.0.1";
@@ -651,6 +655,7 @@ TEST_CASE("lmcache LmcacheRemoteClient config from env") {
 // VT_LMCACHE_LIVE_HOST / VT_LMCACHE_LIVE_PORT.  Skipped (passing, no checks)
 // under plain ctest.
 TEST_CASE("lmcache LmcacheRemoteClient round-trip vs REAL lmcache.v1.server") {
+  EnsureTestSockets();
   const char* host = std::getenv("VT_LMCACHE_LIVE_HOST");
   const char* port = std::getenv("VT_LMCACHE_LIVE_PORT");
   if (host == nullptr || port == nullptr) {

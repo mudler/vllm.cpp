@@ -14,6 +14,7 @@
 
 #include "gguf_builder.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
+#include "vllm/support/test_platform_compat.h"
 
 namespace {
 

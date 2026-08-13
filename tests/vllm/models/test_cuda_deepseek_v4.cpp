@@ -26,6 +26,7 @@
 #include <cstring>
 #include <vector>
 
+#include "vllm/support/test_platform_compat.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"  // vt::F32ToBF16 / vt::BF16ToF32 (router_gate bf16 weights)
 
@@ -488,12 +489,18 @@ TEST_CASE("Lever 3 warp-topk router == single-thread RouteKernel BYTE-IDENTICAL 
     const auto bias = Rand(r, c.E, -0.3f, 0.3f);
     // (a) learned biased top-k (selection biased, weights unbiased), renorm on.
     {
-      setenv("VT_V4_ROUTE_WARP_TOPK", "0", 1);
-      const auto st = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, bias, true, 1.5f, {},
-                                              {}, c.vocab);
-      setenv("VT_V4_ROUTE_WARP_TOPK", "1", 1);
-      const auto wp = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, bias, true, 1.5f, {},
-                                              {}, c.vocab);
+      const auto st = [&] {
+        vllm::support::test::ScopedEnvVar single_thread_topk(
+            "VT_V4_ROUTE_WARP_TOPK", "0");
+        return dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, bias, true, 1.5f, {},
+                                       {}, c.vocab);
+      }();
+      const auto wp = [&] {
+        vllm::support::test::ScopedEnvVar warp_topk(
+            "VT_V4_ROUTE_WARP_TOPK", "1");
+        return dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, bias, true, 1.5f, {},
+                                       {}, c.vocab);
+      }();
       REQUIRE(wp.topk_ids.size() == st.topk_ids.size());
       for (size_t i = 0; i < st.topk_ids.size(); ++i) CHECK(wp.topk_ids[i] == st.topk_ids[i]);
       CHECK(bytes_equal(wp.topk_weights, st.topk_weights));  // BIT-EXACT, not near-tie
@@ -507,17 +514,22 @@ TEST_CASE("Lever 3 warp-topk router == single-thread RouteKernel BYTE-IDENTICAL 
         for (int64_t j = 0; j < c.topk; ++j)
           tid2eid[static_cast<size_t>(tok * c.topk + j)] =
               static_cast<int32_t>((tok * 5 + j) % c.E);
-      setenv("VT_V4_ROUTE_WARP_TOPK", "0", 1);
-      const auto st = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, {}, true, 1.5f,
-                                              in_tokens, tid2eid, c.vocab);
-      setenv("VT_V4_ROUTE_WARP_TOPK", "1", 1);
-      const auto wp = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, {}, true, 1.5f,
-                                              in_tokens, tid2eid, c.vocab);
+      const auto st = [&] {
+        vllm::support::test::ScopedEnvVar single_thread_topk(
+            "VT_V4_ROUTE_WARP_TOPK", "0");
+        return dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, {}, true, 1.5f,
+                                       in_tokens, tid2eid, c.vocab);
+      }();
+      const auto wp = [&] {
+        vllm::support::test::ScopedEnvVar warp_topk(
+            "VT_V4_ROUTE_WARP_TOPK", "1");
+        return dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, {}, true, 1.5f,
+                                       in_tokens, tid2eid, c.vocab);
+      }();
       for (size_t i = 0; i < st.topk_ids.size(); ++i) CHECK(wp.topk_ids[i] == st.topk_ids[i]);
       CHECK(bytes_equal(wp.topk_weights, st.topk_weights));
     }
   }
-  unsetenv("VT_V4_ROUTE_WARP_TOPK");
 }
 
 // ===========================================================================

@@ -14,6 +14,14 @@
 // the seed makes the two differ.
 #include <doctest/doctest.h>
 
+#if defined(_WIN32)
+
+TEST_CASE("none_hash cross-process determinism harness is skipped on Windows") {
+  MESSAGE("self-reexec /proc/self/exe harness is POSIX-only");
+}
+
+#else
+
 #include <unistd.h>
 
 #include <array>
@@ -194,3 +202,5 @@ TEST_CASE("an empty env value counts as UNSET (not as an empty seed)") {
   const std::string unset = RunChild("", "none_hash_child_emits_chain");
   CHECK(empty_env == unset);
 }
+
+#endif  // !_WIN32

@@ -67,6 +67,7 @@
 #include "vt/ops.h"      // vt::MatmulBT (auto-dispatches kMatmulBTQuant on block weights)
 #include "vt/tensor.h"   // vt::Tensor::Contiguous
 #include "vt/backend.h"  // vt::GetBackend / Backend::Synchronize (device GEMM drain)
+#include "vllm/support/platform_compat.h"
 
 namespace vllm {
 namespace {

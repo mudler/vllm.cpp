@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <cctype>
@@ -17,11 +18,11 @@
 #include <stdexcept>
 #include <system_error>
 #include <tuple>
-#include <unistd.h>
 #include <utility>
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/support/platform_compat.h"
 #include "vt/cuda/nvfp4_tactic_ids.h"
 
 namespace vt::cuda::nvfp4 {
@@ -679,42 +680,42 @@ void WriteNativeCacheAtomically(const std::filesystem::path& path,
                              path.string());
   }
 
-  std::string pattern =
-      (parent / ("." + path.filename().string() + ".XXXXXX")).string();
-  std::vector<char> temporary(pattern.begin(), pattern.end());
-  temporary.push_back('\0');
-  int descriptor = ::mkstemp(temporary.data());
-  if (descriptor < 0) {
-    throw std::runtime_error(ErrnoMessage("create NVFP4 cache temp", parent));
-  }
-  const std::filesystem::path temporary_path(temporary.data());
+  static std::atomic<uint64_t> temp_counter{0};
+  const std::filesystem::path temporary_path =
+      parent /
+      ("." + path.filename().string() + ".tmp." +
+       std::to_string(vllm::support::CurrentProcessId()) + "." +
+       std::to_string(temp_counter.fetch_add(1)));
   try {
-    size_t written = 0;
-    while (written < contents.size()) {
-      const ssize_t count = ::write(descriptor, contents.data() + written,
-                                    contents.size() - written);
-      if (count < 0 && errno == EINTR) continue;
-      if (count <= 0) {
+    {
+      std::ofstream output(temporary_path, std::ios::binary | std::ios::trunc);
+      if (!output) {
+        throw std::runtime_error(
+            ErrnoMessage("create NVFP4 cache temp", temporary_path));
+      }
+      output.write(contents.data(),
+                   static_cast<std::streamsize>(contents.size()));
+      output.flush();
+      if (!output) {
         throw std::runtime_error(
             ErrnoMessage("write NVFP4 cache temp", temporary_path));
       }
-      written += static_cast<size_t>(count);
     }
-    if (::fsync(descriptor) != 0) {
-      throw std::runtime_error(
-          ErrnoMessage("fsync NVFP4 cache temp", temporary_path));
-    }
-    if (::close(descriptor) != 0) {
-      descriptor = -1;
-      throw std::runtime_error(
-          ErrnoMessage("close NVFP4 cache temp", temporary_path));
-    }
-    descriptor = -1;
-    if (::rename(temporary_path.c_str(), path.c_str()) != 0) {
-      throw std::runtime_error(ErrnoMessage("replace NVFP4 cache", path));
+
+    std::error_code rename_error;
+    std::filesystem::rename(temporary_path, path, rename_error);
+    if (rename_error) {
+#if defined(_WIN32)
+      std::error_code remove_error;
+      std::filesystem::remove(path, remove_error);
+      rename_error.clear();
+      std::filesystem::rename(temporary_path, path, rename_error);
+#endif
+      if (rename_error) {
+        throw std::runtime_error(ErrnoMessage("replace NVFP4 cache", path));
+      }
     }
   } catch (...) {
-    if (descriptor >= 0) ::close(descriptor);
     std::error_code ignored;
     std::filesystem::remove(temporary_path, ignored);
     throw;

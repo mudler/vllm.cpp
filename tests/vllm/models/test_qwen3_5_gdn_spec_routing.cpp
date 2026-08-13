@@ -21,6 +21,7 @@
 // projection GEMM may retile — the spec routing itself is exact).
 
 #include <doctest/doctest.h>
+#include "vllm/support/test_platform_compat.h"
 
 #include <cmath>
 #include <cstdint>
@@ -295,7 +296,7 @@ GDNAttentionMetadata PrefillMeta(int Tp, int slot) {
 // of any model-level bf16 batch-nondeterminism (the e2e c>1 confound): the
 // CPU projection GEMM is row-invariant, so the split/merge is BIT-EXACT.
 void RunMixedRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
-  setenv("VT_GDN_INDEXED_STATE_IO", "1", 1);  // mixed needs widened indexed IO
+  vllm::support::test::ScopedEnvVar indexed_state_io("VT_GDN_INDEXED_STATE_IO", "1");
   const int64_t H = 128;
   const int Ts = 2, Tp = 3, T = Ts + Tp;
   const HfConfig c = MakeConfig(g, H);

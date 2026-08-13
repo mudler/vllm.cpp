@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/support/test_platform_compat.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
 
@@ -282,7 +283,8 @@ void RunRmsNormDecodeFastCase(int64_t t, int64_t h, bool gemma, uint32_t seed) {
   DeviceTensor dw(gpu, gq.q, DType::kBF16, {h}, wb.data());
 
   auto run = [&](bool fast, std::vector<uint8_t>& out_bytes, std::vector<uint8_t>& res_bytes) {
-    ::setenv("VT_RMSNORM_DECODE_FAST", fast ? "1" : "0", 1);
+    vllm::support::test::ScopedEnvVar env("VT_RMSNORM_DECODE_FAST",
+                                          fast ? "1" : "0");
     DeviceTensor dout(gpu, gq.q, DType::kBF16, {t, h});
     DeviceTensor dres(gpu, gq.q, DType::kBF16, {t, h}, rb.data());
     vt::RmsNorm(gq.q, dout.tensor(), dx.tensor(), dw.tensor(), args, &dres.tensor());
@@ -295,7 +297,6 @@ void RunRmsNormDecodeFastCase(int64_t t, int64_t h, bool gemma, uint32_t seed) {
   std::vector<uint8_t> out_ref, res_ref, out_fast, res_fast;
   run(/*fast=*/false, out_ref, res_ref);
   run(/*fast=*/true, out_fast, res_fast);
-  ::unsetenv("VT_RMSNORM_DECODE_FAST");
 
   // Output: BIT-EXACT (0-ulp). The 2026-07-17 bit-safety rework makes
   // RmsNormRowFastKernel's variance reduction (kBlock-thread strided Pass 1 +

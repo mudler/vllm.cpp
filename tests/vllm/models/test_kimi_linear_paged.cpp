@@ -41,10 +41,9 @@
 #include <string>
 #include <vector>
 
-#include <unistd.h>
-
 #include <nlohmann/json.hpp>
 
+#include "vllm/support/test_platform_compat.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/kimi_linear.h"
 #include "vllm/model_executor/models/model_registry.h"

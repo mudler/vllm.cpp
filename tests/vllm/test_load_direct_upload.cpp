@@ -16,6 +16,14 @@
 // A timing test would pass with the copy still in place. These do not.
 #include <doctest/doctest.h>
 
+#if defined(_WIN32)
+
+TEST_CASE("direct upload mmap/mincore harness is skipped on Windows") {
+  MESSAGE("mmap/mincore residency harness is POSIX-only");
+}
+
+#else
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -979,6 +987,8 @@ TEST_CASE("adopt: the general branch DROPS the host mirror's resident pages") {
   CHECK(static_cast<const void*>(w.bytes.data()) == w.d_dev.get());
   CHECK(w.bytes.size() == nb);
   CHECK(AllBytesMatchPattern(w.bytes.data(), nb));
-  CHECK(guard[0] == 0x5A);
+CHECK(guard[0] == 0x5A);
 }
 #endif  // __linux__ && __GLIBC__
+
+#endif  // !_WIN32

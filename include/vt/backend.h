@@ -6,6 +6,13 @@
 #include "vt/device.h"
 #include "vt/dtype.h"
 
+#if defined(_WIN32) && defined(CreateEvent)
+// Win32's CreateEvent macro rewrites our virtual method name to CreateEventA/W
+// in any TU that included Windows headers first, which then mismatches the
+// out-of-line Backend::CreateEvent definition in backend.cpp at link time.
+#undef CreateEvent
+#endif
+
 namespace vt {
 
 // Cross-stream event handle (CUDA event; no-op on synchronous backends).

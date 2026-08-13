@@ -374,8 +374,8 @@ TEST_CASE("ChunkedLocalAttention backend cache, delegation, and spec emission") 
       std::make_shared<FlashAttentionBackend>(), 32);
   auto backend_other_chunk =
       CreateChunkedLocalAttentionBackend(underlying, 64);
-  CHECK(backend_a == backend_b);
-  CHECK(backend_a != backend_other_chunk);
+  CHECK(backend_a.get() == backend_b.get());
+  CHECK(backend_a.get() != backend_other_chunk.get());
   CHECK(backend_a->get_name() == "ChunkedLocalAttention_32_FLASH_ATTN");
   CHECK(backend_a->get_kv_cache_shape(10, 16, 2, 128) ==
         std::vector<int64_t>{10, 2, 16, 2, 128});
@@ -399,7 +399,7 @@ TEST_CASE("ChunkedLocalAttention backend cache, delegation, and spec emission") 
   ChunkedLocalAttention layer(
       /*num_heads=*/8, /*head_size=*/128, /*scale=*/0.125f,
       /*attention_chunk_size=*/32, /*num_kv_heads=*/2, underlying);
-  CHECK(layer.backend == backend_a);
+  CHECK(layer.backend.get() == backend_a.get());
   auto spec = layer.get_kv_cache_spec(
       /*block_size=*/16, vt::DType::kBF16,
       vllm::v1::KVQuantMode::kNone, /*page_size_padded=*/65536,

@@ -23,6 +23,9 @@ function(vllm_cpp_add_test name)
     target_link_libraries(${name} PRIVATE vllm::vllm vllm_test_main)
   endif()
   vllm_cpp_set_warnings(${name})
+  if(MSVC)
+    target_compile_options(${name} PRIVATE /FIvllm/support/test_platform_compat.h)
+  endif()
   add_test(NAME ${name} COMMAND ${name})
   # A gate that cannot run must not report success. doctest exits 0 after a
   # TEST_CASE returns early, printing "assertions: 0 | 0 passed | 0 failed" and

@@ -29,6 +29,14 @@
 // runs against a REAL lmcache.v1.server (scripts/lmcache/run_live_roundtrip.sh).
 #include <doctest/doctest.h>
 
+#if defined(_WIN32)
+
+TEST_CASE("lmcache connector POSIX socket harness is skipped on Windows") {
+  MESSAGE("POSIX lm:// socket harness is not portable to Windows yet");
+}
+
+#else
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -453,6 +461,10 @@ TEST_CASE("LMCacheConnector e2e: store -> lookup -> shortcut -> load-identical")
   }
 }
 
+#endif  // !_WIN32
+
+#if !defined(_WIN32)
+
 // ---------------------------------------------------------------------------
 // FOREIGN-KEY REFUSAL: a chunk stored under a different model/dtype key MISSES;
 // a payload whose layout disagrees is REFUSED (throws), never mis-decoded.
@@ -508,11 +520,17 @@ TEST_CASE("LMCacheConnector: a foreign / mismatched block is refused, not served
             .ChunkKey(LMCacheConnector(f32, ClientConfig(server.port()))
                           .ChunkFolds(req->AllTokenIds())[0]));
 }
+#endif  // !_WIN32
 
 // ---------------------------------------------------------------------------
 // Live interop gate: only runs when pointed at a REAL lmcache.v1.server via
 // VT_LMCACHE_LIVE_HOST/PORT. Skipped (passing) under plain ctest.
 // ---------------------------------------------------------------------------
+#if defined(_WIN32)
+TEST_CASE("LMCacheConnector live round-trip is skipped on Windows") {
+  MESSAGE("live lmcache interop gate is currently disabled on Windows");
+}
+#else
 TEST_CASE("LMCacheConnector: store->load round-trip vs REAL lmcache.v1.server") {
   const char* host = std::getenv("VT_LMCACHE_LIVE_HOST");
   const char* port = std::getenv("VT_LMCACHE_LIVE_PORT");
@@ -554,3 +572,4 @@ TEST_CASE("LMCacheConnector: store->load round-trip vs REAL lmcache.v1.server") 
     }
   }
 }
+#endif

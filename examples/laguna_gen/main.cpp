@@ -32,6 +32,7 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/laguna.h"
+#include "vllm/support/platform_compat.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"  // vt::GetBackend / CreateQueue (--gpu: GEMMs on the GB10)
@@ -201,7 +202,9 @@ int main(int argc, char** argv) {
     // s/tok (2×; 2.56 → 5.0 tok/s), coherent + near-tie. `setenv(...,0)` respects an
     // explicit `VT_NVFP4_FP4_NATIVE=0` override. Scoped to this Laguna driver (the
     // 27B/35B use the separate DirectD cutlass path, untouched).
-    setenv("VT_NVFP4_FP4_NATIVE", "1", 0);
+    if (std::getenv("VT_NVFP4_FP4_NATIVE") == nullptr) {
+      (void)vllm::support::SetEnvVar("VT_NVFP4_FP4_NATIVE", "1");
+    }
     const std::string config_path = (fs::path(model) / "config.json").string();
     const std::string tok_path = (fs::path(model) / "tokenizer.json").string();
     std::fprintf(stderr, "[gen] NVFP4 safetensors dir %s\n", model.c_str());

@@ -1183,6 +1183,8 @@ if(MSVC)
   target_link_options(vllm INTERFACE "/WHOLEARCHIVE:$<TARGET_FILE:vllm>")
 elseif(APPLE)
   target_link_options(vllm INTERFACE "LINKER:-force_load,$<TARGET_FILE:vllm>")
+elseif(MSVC)
+  target_link_options(vllm INTERFACE "LINKER:/WHOLEARCHIVE:$<TARGET_FILE:vllm>")
 elseif(UNIX)
   target_link_options(vllm INTERFACE "LINKER:--whole-archive,$<TARGET_FILE:vllm>,--no-whole-archive")
 endif()
@@ -2156,6 +2158,7 @@ add_library(vllm_shared SHARED "${_vllm_shared_stub}")
 add_library(vllm::shared ALIAS vllm_shared)
 set_target_properties(vllm_shared PROPERTIES
   OUTPUT_NAME vllm
+  ARCHIVE_OUTPUT_NAME vllm_shared
   VERSION ${PROJECT_VERSION}
   SOVERSION ${PROJECT_VERSION_MAJOR}
   CXX_VISIBILITY_PRESET hidden
@@ -2168,7 +2171,11 @@ target_include_directories(vllm_shared PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 # Force-link the whole `vllm` archive (the C ABI + engine + the CPU-backend
 # static registrar) and inherit its PUBLIC deps (CUDA::cudart, Threads, ...).
-target_link_libraries(vllm_shared PRIVATE vllm)
+# On Windows the packaged shared target also needs the vendored BLAKE3 archive
+# explicitly on its own link line; relying on the static archive's usage
+# requirements is not sufficient once the C ABI DLL is assembled via
+# /WHOLEARCHIVE.
+target_link_libraries(vllm_shared PRIVATE vllm blake3_vendored)
 # Export only the C ABI: `vllm_*` stays global, everything else is localized.
 # UNLIKE the force-link guard above, `UNIX AND NOT APPLE` is CORRECT here: a
 # linker version script is a GNU-ld/ELF feature with no ld64 spelling (ld64 uses

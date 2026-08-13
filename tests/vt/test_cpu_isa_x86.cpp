@@ -4,6 +4,7 @@
 #include <ostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "doctest/doctest.h"
 #include "vllm/model_executor/models/device_pool.h"

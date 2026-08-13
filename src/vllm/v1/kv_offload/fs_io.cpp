@@ -25,6 +25,8 @@
 #include <system_error>
 #include <thread>
 
+#include "vllm/support/platform_compat.h"
+
 namespace vllm::v1::kv_offload {
 namespace {
 

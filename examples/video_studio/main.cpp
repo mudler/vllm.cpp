@@ -27,10 +27,15 @@
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <sys/wait.h>
 #include <thread>
-#include <unistd.h>
 #include <vector>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
@@ -94,6 +99,17 @@ bool RunMux(char** argv, int argc, std::string* err) {
   std::string ff = g_ffmpeg;
   a[0] = ff.data();
   a.push_back(nullptr);
+#if defined(_WIN32)
+  const intptr_t rc = _spawnvp(_P_WAIT, a[0], a.data());
+  if (rc == -1) {
+    *err = "_spawnvp failed";
+    return false;
+  }
+  if (rc == 0) return true;
+  *err = "ffmpeg exited " + std::to_string(static_cast<int>(rc)) +
+         " (is it installed? --ffmpeg PATH)";
+  return false;
+#else
   const pid_t pid = fork();
   if (pid < 0) {
     *err = "fork failed";
@@ -110,6 +126,7 @@ bool RunMux(char** argv, int argc, std::string* err) {
   *err = "ffmpeg exited " + std::to_string(WIFEXITED(st) ? WEXITSTATUS(st) : -1) +
          " (is it installed? --ffmpeg PATH)";
   return false;
+#endif
 }
 
 // ── the worker: ONE render at a time ─────────────────────────────────────────

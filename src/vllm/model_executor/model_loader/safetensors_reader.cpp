@@ -17,10 +17,13 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <system_error>
 #include <tuple>
 #include <utility>
 
 #include <nlohmann/json.hpp>
+
+#include "vllm/support/platform_compat.h"
 
 namespace vllm {
 
@@ -280,10 +283,7 @@ namespace {
 
 #if !defined(_WIN32)
 long HostPageSize() {
-  static const long page = [] {
-    const long p = ::sysconf(_SC_PAGESIZE);
-    return p > 0 ? p : 4096;
-  }();
+  static const long page = support::HostPageSize();
   return page;
 }
 #endif

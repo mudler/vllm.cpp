@@ -13,7 +13,7 @@
 #endif
 
 #include <mutex>
-#include <string>
+#include <cstring>
 
 #include "vt/dtype.h"  // VT_CHECK
 
@@ -105,6 +105,22 @@ bool ProbeWithOps(const VulkanLibraryOps& ops, bool close_success,
   return true;
 }
 
+#if !defined(_WIN32)
+void* OpenSharedLibrary(const char* name) {
+  return dlopen(name, RTLD_NOW | RTLD_LOCAL);
+}
+
+void* LoadSharedSymbol(void* handle, const char* name) {
+  return handle != nullptr ? dlsym(handle, name) : nullptr;
+}
+
+void CloseSharedLibrary(void* handle) {
+  if (handle != nullptr) {
+    dlclose(handle);
+  }
+}
+#endif
+
 }  // namespace
 
 bool ProbeVulkanLibraryForTesting(const VulkanLibraryOps& ops) {
@@ -121,7 +137,7 @@ bool LoadVulkanLibrary() {
     g_handle = reinterpret_cast<HMODULE>(retained);
 #else
     for (const char* name : kLibraryNames) {
-      g_handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+      g_handle = OpenSharedLibrary(name);
       if (g_handle != nullptr) break;
     }
     if (g_handle == nullptr) return;

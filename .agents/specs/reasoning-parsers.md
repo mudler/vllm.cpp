@@ -176,6 +176,45 @@ RED-first.
 - **W3** — the engine-backed reasoning adapters (`qwen3`/`mimo`, `gemma4`,
   `glm45/47`, `seed_oss`, `deepseek_v4`, `nemotron_v3`, `inkling`) as reasoning
   faces over the already-landed `TOOLS-STREAMING-PARSER` engine.
+
+### Ordering amendment 2026-08-13 — W3 runs BEFORE W2 (#605)
+
+The waves above were numbered without demand data. The recipe-surface sweep
+supplies it, and it inverts the order.
+
+Measured over `vllm-project/recipes` @ `86c7777aa699482ef1ebd0c5da9fc540ccc00a40`
+(157 official model recipes), `--reasoning-parser` is passed **76 times across 20
+distinct values**. We resolve 15 of those uses; the other **61 abort startup** with
+`unknown reasoning parser`.
+
+| Wave | Recipe uses it covers | Notable |
+|---|---:|---|
+| **W3** (engine-backed adapters) | **43 / 76** | `qwen3` 18, `glm45` 11, `gemma4` 6, `deepseek_v4` 2, `nemotron_v3` 3, `inkling` 2 |
+| W2 (remaining text families) | 18 / 76 | `kimi_k2` 4, `poolside_v1` 4, `hy_v3` 2, `step3p5` 2, `minimax_m3` 1 |
+| — | 0 | `ernie45`, `granite`, `cohere_command3/4`, `openai_gptoss` — **zero recipe demand**, all in W2 |
+
+`qwen3` alone (18 uses) outweighs every W2 name combined except `kimi_k2` and
+`poolside_v1`. It is also the parser the published Qwen3.5 and Qwen3.6 recipes pass
+to models **we already ship token-exact and gated** — so today the engine serves
+the model and rejects its own recipe's flag.
+
+**Therefore: W3 runs first, and within W3 the first brick is
+`Qwen3ParserReasoningAdapter`** (upstream `vllm/reasoning/qwen3_engine_reasoning_parser.py`,
+re-exported from `vllm/parser/engine/registered_adapters.py`), which serves BOTH
+`qwen3` and `mimo` — `vllm/reasoning/__init__.py:87` registers `mimo` onto the same
+class, so two names land for one port. `glm45` and `glm47` share
+`Glm47MoeParserReasoningAdapter` the same way (`__init__.py:55,59`).
+
+Three names belong in W3 and were missing from its list:
+
+- `nano_v3` (1 recipe use) — add to W3.
+- `kimi_k3` (1) and `ling3` (1) — **post-pin**; they are not in the registry at
+  `5559679229bc961848b121ccdeaa8fa5d79bec98`. Recorded here so they are not
+  rediscovered; they land with the next pin advance, not before.
+
+W2 is not cancelled — it is resequenced behind W3. The four zero-demand names stay
+in scope because upstream registers them and we mirror upstream; they are simply
+not what a user hits first.
 - **W4** — request-time `chat_template_kwargs` threading (`adjust_request`) +
   reasoning-gated grammar FSM hold (cross-ref structured-output).
 

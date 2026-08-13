@@ -1,0 +1,107 @@
+{
+  "_derivation": {
+    "purpose": "Curated ModelOpt MIXED_PRECISION fixture for the per-module quant-algo resolver (row MODEL-TEXT-nemotron-h-nemotron-hfor-causal-lm W1, issue #517).",
+    "derived_from": {
+      "checkpoint": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+      "revision": "29f2d1746d8f41e316523194b19018707749b1b1",
+      "file": "config.json -> quantization_config",
+      "real_shape": "5981 quantized_layers (5935 W4A16_NVFP4 group_size 16, 46 FP8), 72 ignore entries, kv_cache_scheme fp8"
+    },
+    "real_entries_copied_verbatim": [
+      "producer / quant_method / quant_algo / kv_cache_scheme are the real values",
+      "backbone.layers.0.mixer.in_proj  -> FP8            (real, mamba in_proj)",
+      "backbone.layers.0.mixer.out_proj -> FP8            (real, mamba out_proj)",
+      "backbone.layers.1.mixer.experts.{0,1}.{up,down}_proj -> W4A16_NVFP4 g16 (real; the real map has 128 experts per MoE layer, 2 are kept here)",
+      "backbone.layers.1.mixer.shared_experts.{up,down}_proj -> W4A16_NVFP4 g16 (real)",
+      "lm_head -> W4A16_NVFP4 g16                         (real, and really a BARE key with no 'model.' prefix)",
+      "ignore: backbone.embeddings, backbone.layers.0.mixer.conv1d, backbone.layers.1.mixer.gate, backbone.layers.{5,12}.mixer.{q,k,v,o}_proj, mtp*  (all real, verbatim)"
+    ],
+    "synthetic_entries_and_why": [
+      "The real checkpoint resolves ALL 5981 entries by the DIRECT strategy alone (verified: strategy histogram {direct: 5981}). It therefore cannot exercise the packed/fused, .experts-special-case, or fused_projection_shards strategies, nor a shard disagreement, nor an unknown algo. Those five paths exist in the pinned upstream (modelopt.py:2412-2487) and each gets a synthetic 'synthetic.*' entry below.",
+      "synthetic.layers.0.moe.{up,down}_proj  -> the '.experts' special case: ModelOpt lists '...moe.up_proj' while a FusedMoE layer's prefix is '...moe.experts' (upstream comment at modelopt.py:2455-2457).",
+      "synthetic.layers.1.self_attn.{q,k,v}_proj (all FP8)  -> packed_modules_mapping strategy 2 agreement.",
+      "synthetic.layers.2.self_attn.{q,k,v}_proj (q,v FP8 / k W4A16_NVFP4) -> packed strategy 2 DISAGREEMENT, which upstream RAISES on.",
+      "synthetic.layers.3.mlp.{gate,up}_proj (both FP8) -> fused_projection_shards fallback (strategy 5) agreement, reached with NO packed mapping registered.",
+      "synthetic.layers.4.mlp.{gate,up}_proj (gate FP8 / up W4A16_NVFP4) -> fused_projection_shards DISAGREEMENT, which upstream RAISES on.",
+      "synthetic.layers.5.mixer.in_proj -> quant_algo 'AWQ_LITE', an algorithm ModelOpt never emits: the resolver must REFUSE IT BY NAME rather than fall through to a supported path or to unquantized.",
+      "synthetic.layers.6.mixer.in_proj -> quant_algo 'FP8_PB_WO', a REAL ModelOpt algo name (upstream QUANT_ALGOS, modelopt.py:105-120) that the MIXED_PRECISION consumer has no branch for. Upstream silently returns UnquantizedLinearMethod for it; we refuse by name (spec stop condition: a silent fallback is invisible to a token gate).",
+      "language_model.model.layers.0.mlp.down_proj AND model.language_model.layers.9.mlp.up_proj -> the language_model/model prefix SWAP in _quantized_layer_prefix_candidates (modelopt.py:2491-2505), one entry per DIRECTION. One direction alone leaves the other branch untested (my own mutation run proved it).",
+      "ignore: legacy_substr.mixer -> the pre-ModelOpt-0.39 SUBSTRING exclusion rule (modelopt.py:165-174), which no exact match and no wildcard can reach.",
+      "ignore: synthetic.layers.7.self_attn.q_proj ONLY (k/v absent) -> is_layer_skipped's partial-fused-exclusion RAISE (quant_utils.py:549-556).",
+      "synthetic.layers.8.moe.{a,b}_proj (a FP8 / b W4A16_NVFP4) -> strategies 3 and 4 return the FIRST matching child in map order (modelopt.py:2450, :2458). A parent whose children AGREE cannot tell first from last: synthetic.layers.2.self_attn is q/k/v = FP8/W4A16/FP8, so its first and its last child are both FP8 and 'return the last match' survives it. These two disagree AND sort the same way under insertion and lexicographic order (a < b), so they isolate first-vs-last from the ordered_json question that synthetic.layers.2.self_attn pins.",
+      "language_model.model.layers.5.self_attn.q_proj (FP8) AND model.language_model.layers.5.self_attn.k_proj (W4A16_NVFP4) -> the strategy-2 / strategy-5 ASYMMETRY (modelopt.py:2429-2447 vs :2463-2486). Strategy 2 accumulates ONE algo set across ALL base prefix candidates; strategy 5 rebuilds it per candidate. Every other fused fixture entry has a single prefix candidate, where the two are indistinguishable. Split across the two language_model spellings, the union is {FP8, W4A16_NVFP4} and RAISES, while a per-candidate rebuild would return FP8 from the first spelling and never see the second."
+    ]
+  },
+  "architectures": ["NemotronHForCausalLM"],
+  "model_type": "nemotron_h",
+  "quantization_config": {
+    "producer": "modelopt 0.44.0rc5",
+    "quant_method": "modelopt",
+    "quant_algo": "MIXED_PRECISION",
+    "kv_cache_scheme": {
+      "dynamic": false,
+      "num_bits": 8,
+      "type": "float"
+    },
+    "ignore": [
+      "backbone.embeddings",
+      "backbone.layers.0.mixer.conv1d",
+      "backbone.layers.1.mixer.gate",
+      "backbone.layers.5.mixer.q_proj",
+      "backbone.layers.5.mixer.k_proj",
+      "backbone.layers.5.mixer.v_proj",
+      "backbone.layers.5.mixer.o_proj",
+      "backbone.layers.12.mixer.q_proj",
+      "backbone.layers.12.mixer.k_proj",
+      "backbone.layers.12.mixer.v_proj",
+      "backbone.layers.12.mixer.o_proj",
+      "mtp*",
+      "synthetic.layers.7.self_attn.q_proj",
+      "legacy_substr.mixer"
+    ],
+    "quantized_layers": {
+      "backbone.layers.0.mixer.in_proj": { "quant_algo": "FP8" },
+      "backbone.layers.0.mixer.out_proj": { "quant_algo": "FP8" },
+      "backbone.layers.1.mixer.experts.0.up_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+      "backbone.layers.1.mixer.experts.0.down_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+      "backbone.layers.1.mixer.experts.1.up_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+      "backbone.layers.1.mixer.experts.1.down_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+      "backbone.layers.1.mixer.shared_experts.up_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+      "backbone.layers.1.mixer.shared_experts.down_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+      "lm_head": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+
+      "synthetic.layers.0.moe.up_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+      "synthetic.layers.0.moe.down_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+
+      "synthetic.layers.1.self_attn.q_proj": { "quant_algo": "FP8" },
+      "synthetic.layers.1.self_attn.k_proj": { "quant_algo": "FP8" },
+      "synthetic.layers.1.self_attn.v_proj": { "quant_algo": "FP8" },
+
+      "synthetic.layers.2.self_attn.q_proj": { "quant_algo": "FP8" },
+      "synthetic.layers.2.self_attn.k_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+      "synthetic.layers.2.self_attn.v_proj": { "quant_algo": "FP8" },
+
+      "synthetic.layers.3.mlp.gate_proj": { "quant_algo": "FP8" },
+      "synthetic.layers.3.mlp.up_proj": { "quant_algo": "FP8" },
+
+      "synthetic.layers.4.mlp.gate_proj": { "quant_algo": "FP8" },
+      "synthetic.layers.4.mlp.up_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+
+      "synthetic.layers.5.mixer.in_proj": { "quant_algo": "AWQ_LITE" },
+      "synthetic.layers.6.mixer.in_proj": { "quant_algo": "FP8_PB_WO" },
+
+      "synthetic.layers.7.self_attn.q_proj": { "quant_algo": "FP8" },
+      "synthetic.layers.7.self_attn.k_proj": { "quant_algo": "FP8" },
+      "synthetic.layers.7.self_attn.v_proj": { "quant_algo": "FP8" },
+
+      "language_model.model.layers.0.mlp.down_proj": { "quant_algo": "FP8" },
+      "model.language_model.layers.9.mlp.up_proj": { "quant_algo": "FP8" },
+
+      "synthetic.layers.8.moe.a_proj": { "quant_algo": "FP8" },
+      "synthetic.layers.8.moe.b_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 },
+
+      "language_model.model.layers.5.self_attn.q_proj": { "quant_algo": "FP8" },
+      "model.language_model.layers.5.self_attn.k_proj": { "quant_algo": "W4A16_NVFP4", "group_size": 16 }
+    }
+  }
+}

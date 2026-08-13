@@ -55,6 +55,31 @@ vllm_cpp_add_test(test_nvfp4_dequant vllm/test_nvfp4_dequant.cpp)
 vllm_cpp_add_test(test_awq_gptq_dequant vllm/test_awq_gptq_dequant.cpp)
 vllm_cpp_add_test(test_mxfp4_dequant vllm/test_mxfp4_dequant.cpp)
 vllm_cpp_add_test(test_ct_nvfp4_emulation vllm/test_ct_nvfp4_emulation.cpp)
+# MODEL-TEXT-nemotron-h W1 (#517): the ModelOpt MIXED_PRECISION per-module
+# quant-algo resolver. Two arms, deliberately two BINARIES: the curated fixture
+# arm is always-on, and the exhaustive real-config arm exits 77 (Skipped) when
+# the 30B checkpoint is not staged. Folding them into one target would let the
+# skip swallow the always-on gate as well.
+#
+# The resolver header is INTERNAL (src/, not include/) until a loader consumes
+# it, so both targets take ${CMAKE_SOURCE_DIR}/src on the include path — the
+# same arrangement test_linear_method and test_model_registry already use.
+vllm_cpp_add_test(test_modelopt_mixed_precision
+  vllm/model_executor/layers/quantization/test_modelopt_mixed_precision.cpp)
+target_include_directories(test_modelopt_mixed_precision PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_modelopt_mixed_precision PRIVATE
+  MODELOPT_MIXED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/modelopt_mixed_precision")
+vllm_cpp_add_test(test_modelopt_mixed_precision_checkpoint
+  vllm/model_executor/layers/quantization/test_modelopt_mixed_precision_checkpoint.cpp)
+# tests/parity as well as src/: the exhaustive arm resolves its checkpoint
+# through the SINGLE pinned parity::Nemotron35LightningSnapshot() rather than
+# joining $CHECKPOINT_ROOT by hand, so that one resolver owns the revision pin
+# for both env spellings (#517 LOW-3) -- the same arrangement test_qwen36_weights
+# uses for the 35B pin.
+target_include_directories(test_modelopt_mixed_precision_checkpoint PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 vllm_cpp_add_test(test_gguf_dequant vllm/test_gguf_dequant.cpp)
 vllm_cpp_add_test(test_gguf_nvfp4 vllm/test_gguf_nvfp4.cpp)
 # gguf_nvfp4_goldens.inc lives next to the test source.

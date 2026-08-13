@@ -41,6 +41,13 @@ inline constexpr const char* kQwen27NvfP4Revision =
 inline constexpr const char* kNemotron35LightningNvfP4Revision =
     "29f2d1746d8f41e316523194b19018707749b1b1";
 
+// The directory this checkpoint is staged under inside `$CHECKPOINT_ROOT`. It
+// is a `hf download --local-dir` tree, not an HF cache repo, so the revision
+// does not appear in the PATH the way `snapshots/<rev>/` does -- see
+// Nemotron35LightningSnapshot below for where it does appear.
+inline constexpr const char* kNemotron35LightningLocalDirName =
+    "nemotron-3.5-lightning-30b-nvfp4";
+
 // Snapshot directory for `<repo>` at `revision`, or "" when it is not cached
 // (the caller then emits its loud SKIP). `env_override`, when set and non-empty,
 // names an explicit snapshot directory for a deliberate different-checkpoint
@@ -65,14 +72,59 @@ inline std::string HfSnapshot(const char* repo_dir, const char* revision,
   return snap.string();
 }
 
-// The Nemotron-3.5-Lightning gate model (#517). Unlike the Qwen pins above,
-// this one is NOT in the HF cache: it is staged on the NAS as a `local_dir`
-// snapshot at `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4`, so there is
-// no `models--org--name/snapshots/<rev>` layout to resolve. The env override is
-// therefore the ONLY reachable path, and the cache spelling below exists so the
-// revision still names what the golden belongs to. Absent env var => "" => the
-// caller emits its loud SKIP, which is the intended behavior off the gate host.
+// The Nemotron-3.5-Lightning gate model (#517), and the ONE resolver for it.
+//
+// Unlike the Qwen pins above, this one is NOT in the HF cache: it is staged on
+// the NAS as a `hf download --local-dir` tree at
+// `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4`, so there is no
+// `models--org--name/snapshots/<rev>` directory whose NAME carries the revision.
+//
+// LOW-3 (#517). Two env vars used to reach this same checkpoint --
+// `VT_NEMOTRON35_SNAPSHOT` here and `CHECKPOINT_ROOT` in
+// test_modelopt_mixed_precision_checkpoint.cpp -- and NEITHER enforced the
+// revision: the cache spelling above is unreachable for a `local_dir` tree, and
+// an env override is deliberately not revision-checked. So the pin named the
+// revision the goldens belong to and could not refuse a different one, which is
+// the exact failure `kQwen27NvfP4Revision` exists because of. Both spellings now
+// resolve HERE, and the `local_dir` layout does record its revision, just not in
+// the path: `hf download --local-dir` writes a per-revision file manifest at
+// `<dir>/.cache/huggingface/trees/<revision>.json`. That is what is checked.
+//
+// Resolution order, in the order the code checks it, and why:
+//
+//  1. `VT_NEMOTRON35_SNAPSHOT`, when set and non-empty -> the explicit-directory
+//     escape `HfSnapshot` documents, with its semantics UNCHANGED, including
+//     that a set-but-wrong override refuses rather than falling back. First, so
+//     that setting it OVERRIDES `CHECKPOINT_ROOT` rather than racing it.
+//  2. Otherwise `CHECKPOINT_ROOT` -> `<root>/<kNemotron35LightningLocalDirName>`,
+//     and the revision manifest MUST be present. This is the DEFAULT path every
+//     gate takes, so it is the one that has to carry the pin: a re-download of
+//     the same repo name lands a different revision under the identical path,
+//     and a gate that cannot tell would substitute it silently. Missing
+//     manifest => "" => the caller's loud skip, never a substitution.
+//  3. Otherwise the ordinary HF cache layout, for a host that fetched it that
+//     way.
+//
+// Only (2) is revision-gated, deliberately: naming ONE directory outright is
+// the deliberate different-checkpoint run the override exists for, while naming
+// a ROOT is not.
+//
+// Absent both env vars => "" => the caller emits its loud SKIP, which is the
+// intended behavior off the gate host.
 inline std::string Nemotron35LightningSnapshot() {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const char* over = std::getenv("VT_NEMOTRON35_SNAPSHOT");
+  const char* root = std::getenv("CHECKPOINT_ROOT");
+  if ((over == nullptr || *over == '\0') && root != nullptr && *root != '\0') {
+    const fs::path dir = fs::path(root) / kNemotron35LightningLocalDirName;
+    const fs::path tree = dir / ".cache/huggingface/trees" /
+                          (std::string(kNemotron35LightningNvfP4Revision) +
+                           ".json");
+    if (!fs::exists(dir / "config.json", ec)) return "";
+    if (!fs::exists(tree, ec)) return "";
+    return dir.string();
+  }
   return HfSnapshot("models--nvidia--NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
                     kNemotron35LightningNvfP4Revision,
                     "VT_NEMOTRON35_SNAPSHOT");

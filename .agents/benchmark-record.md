@@ -20473,3 +20473,41 @@ predates the perf-neutral C_tmp cap. Ours times with steady_clock over 80
 iterations, upstream with CUDA events.
 
 Evidence: `dgx.casa:~/work/marlin442/`.
+
+## SPEC-DSPARK / #442: the in-situ denominator was WRONG -- experts, not blocks (2026-08-13)
+
+Holding blocks roughly fixed while varying DISTINCT experts (upstream arm, gate_up):
+
+| M | blocks | distinct | us/call | us/block |
+|---|---|---|---|---|
+| 64 | 73 | 20 | 89.4 | 1.22 |
+| 64 | 82 | 40 | 227.1 | 2.77 |
+| 64 | 94 | 80 | 427.2 | 4.55 |
+| 64 | 216 | 216 | 1121.2 | 5.19 |
+| 128 | 137 | 20 | 149.9 | 1.09 |
+| 128 | 146 | 40 | 220.0 | 1.51 |
+| 128 | 255 | 250 | 1298.6 | 5.09 |
+
+M=128: 137 -> 146 blocks is +6.6% blocks and +46.7% TIME, because distinct
+experts doubled. Cost per DISTINCT EXPERT is flat at 5.2-5.7 us (1.125 MiB,
+~205-225 GB/s); cost per BLOCK varies 4.7x. So time ~= distinct_experts x
+1.125 MiB / ~215 GB/s and blocks are nearly irrelevant.
+
+Every in-situ comparison normalised by BLOCKS (38.9 ours vs 40.6 upstream), which
+is not the driver. Applying the model to the recorded launches: ours 164.0 us
+implies ~30 distinct experts, upstream 151.6 us implies ~28. About TWO distinct
+experts per launch reproduces the entire 8.2% with zero implementation
+difference, and the matched-work comparison already put the two kernels at
+0.27%.
+
+It also explains both in-situ arms beating the standalone plateau per block
+(4.21 and 3.73 vs ~5.3): in situ several blocks share an expert.
+
+RULE FOR FUTURE MoE COMPARISONS: control distinct experts per launch, or force
+both arms onto an identical token stream. Block counts compare the wrong
+quantity. VT_MOE_PAD_STATS should count distinct experts as well.
+
+Does NOT move the e2e ratio (~0.966, wall-clock on matched prompts); it removes
+the attribution of its residual.
+
+Evidence: `dgx.casa:~/work/marlin442/`.

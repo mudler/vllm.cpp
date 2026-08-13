@@ -1815,6 +1815,64 @@ with `steady_clock` around 80 iterations plus a final sync; upstream's arm uses
 CUDA events. Both amortise launch overhead over 80 calls, and the memset probe
 bounds that class of difference at noise.
 
+## 6af. THE DENOMINATOR WAS WRONG: EXPERTS, NOT BLOCKS (2026-08-13)
+
+6ae cleared the kernel. This says what the in-situ 8.2% actually measured.
+
+Holding the block count roughly fixed while varying how many DISTINCT experts
+the routing touches, upstream arm, `--arm gate_up`:
+
+| M | blocks | distinct experts | us/call | us/block |
+|---|---|---|---|---|
+| 64 | 73 | 20 | 89.4 | 1.22 |
+| 64 | 82 | 40 | 227.1 | 2.77 |
+| 64 | 94 | 80 | 427.2 | 4.55 |
+| 64 | 216 | 216 | 1121.2 | 5.19 |
+| 128 | 137 | 20 | 149.9 | 1.09 |
+| 128 | 146 | 40 | 220.0 | 1.51 |
+| 128 | 255 | 250 | 1298.6 | 5.09 |
+
+Read the M=128 rows: **137 -> 146 blocks is +6.6% of blocks, and time rises
++46.7%**, because distinct experts went 20 -> 40. Cost per DISTINCT EXPERT is
+flat at **5.2-5.7 us** across the whole table (1.125 MiB each, ~205-225 GB/s,
+the same plateau as 6ad). Cost per BLOCK varies 4.7x over the same rows.
+
+**So the model is `time ~= distinct_experts x 1.125 MiB / ~215 GB/s`, and block
+count is nearly irrelevant.** Every in-situ comparison in 6x and 6y normalised by
+BLOCKS -- 38.9 ours against 40.6 upstream -- which the data now shows is not the
+driver. Blocks are what `num_tokens_past_padded` reports and experts are what the
+kernel streams; with `block_size_m = 8` and correlated spec-decode tokens, one
+expert routinely spans several blocks, so the two numbers come apart.
+
+Apply the model to the recorded in-situ launches: ours 164.0 us implies ~30
+distinct experts, upstream 151.6 us implies ~28. **A difference of about two
+distinct experts per launch reproduces the entire 8.2% with ZERO implementation
+difference**, and 6ae has already shown that at matched work the two kernels are
+the same to 0.27%.
+
+That also explains why both in-situ arms beat the standalone plateau per block
+(4.21 and 3.73 against ~5.3): in situ, several blocks share an expert, so fewer
+bytes are streamed per block. It was never a sign of anything being wrong.
+
+**Consequences.**
+
+1. The 8.2% "kernel gap" is an artefact of comparing two different routing
+   draws. It is not evidence of an implementation defect, and it should not be
+   quoted again.
+2. Any future MoE comparison must control DISTINCT EXPERTS PER LAUNCH, or force
+   both arms onto an identical token stream. Comparing block counts is comparing
+   the wrong quantity.
+3. `VT_MOE_PAD_STATS` (qwen3_5.cpp) counts padded tokens and blocks. It should
+   count DISTINCT EXPERTS too; that is the number that predicts the time.
+
+**What this does NOT do.** It does not move the end-to-end ratio. That is
+wall-clock on matched prompts and token counts, and it stands at ~0.966. What
+changes is that its residual no longer has an attribution: the kernel is cleared
+and the number that appeared to localise it was measuring the token path. The
+open question is whether OUR token path systematically touches more experts per
+step -- a near-tie divergence consequence rather than a defect -- or whether the
+remaining wall-clock sits outside the MoE entirely.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.

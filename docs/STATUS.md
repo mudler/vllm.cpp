@@ -523,12 +523,22 @@ establish is the kernel's shape: a persistent single wave (grid 144 = 48 SMs x
 3 blocks, 32768 B shared against 102400 B/SM, 25% occupancy), a bandwidth-
 limited plateau of 203-226 GB/s that BOTH engines reach, and a 4.6x swing
 driven by how many DISTINCT EXPERTS a launch touches (1.15 us/block at 16,
-weights in L2; ~5.3 above ~27, streaming). Blocks are not experts, so the
-recorded 38.9-vs-40.6 block counts never settled which arm did more work;
-measuring distinct experts per launch in situ is the next step, not another
-kernel lever. One trap worth carrying: `dram__bytes.sum` reads `n/a` on GB10,
-so `ncu`'s "Memory Throughput %" excludes DRAM traffic and must not be read as
-a bandwidth utilisation. Weight
+weights in L2; ~5.3 above ~27, streaming). Blocks are not experts, and holding blocks fixed while varying distinct
+experts settles it: at M=128, going 137 to 146 blocks (+6.6%) while distinct
+experts doubled cost +46.7% TIME, and cost per DISTINCT EXPERT is flat at
+5.2-5.7 us across the table while cost per block varies 4.7x. Time is
+distinct_experts x 1.125 MiB / ~215 GB/s and blocks are nearly irrelevant, so
+every in-situ comparison normalised by the wrong quantity. Applying that model
+to the recorded launches, ours 164.0 us implies ~30 distinct experts against
+upstream's ~28: about TWO experts per launch reproduces the whole 8.2% with no
+implementation difference. It also explains both arms beating the standalone
+plateau per block (4.21 and 3.73 against ~5.3), since in situ several blocks
+share an expert. Future MoE comparisons must control distinct experts per
+launch, or force both arms onto one token stream. None of this moves the end-
+to-end ~0.966x, which is wall-clock on matched prompts; it removes the
+attribution of its residual. One trap worth carrying: dram__bytes.sum reads
+n/a on GB10, so ncu's Memory Throughput % excludes DRAM traffic and is not a
+bandwidth utilisation. Weight
 residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
 same size and stride as upstream's tensor (268 MB, no padding), so the cause is
 memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under

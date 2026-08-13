@@ -283,15 +283,97 @@ only the recorded number was.
 
 **Why a plain `ctest` skips the exhaustive arm.** `CHECKPOINT_ROOT` is a `.env`
 key and `.env` is not exported by anything; the repo's documented loader is
-`set -a; . ./.env; set +a` (`.env.example`, `.agents/environment.md`). There is
-no CTest-side `.env` reader, and `tests/parity/hf_snapshot.h` — the only other
-checkpoint gate — resolves a Hugging Face cache under `$HOME`, not a NAS
-directory, so it does not apply. The skip banner now names the exact export
-rather than pretending the arm ran.
+`set -a; . ./.env; set +a` (`.env.example:8`). There is no CTest-side `.env`
+reader, so a shell that has not sourced it skips the arm. The skip banner names
+the exact export rather than pretending the arm ran. (This paragraph also
+credited `.agents/environment.md` with that loader line and claimed
+`hf_snapshot.h` does not apply here; both were wrong — see LOW-3 below.)
 
 Gate after repair: **26 cases / 167 assertions** curated (was 22 / 137),
 **3 cases / 12181 assertions** exhaustive (was 2 / 12145), clean Release
 `-Werror`, ASan and UBSan clean, full `ctest` 396/396.
+
+### W1 land-prep — round-2 review PASS, its LOWs, and the two open dispositions (2026-08-13)
+
+Round 2 reviewed `e734fe9e` and returned **PASS** with three LOW findings. All
+three are repaired on `row/MODEL-NEMOTRON-H-W1-LAND`; each was re-verified
+against the file or the measurement rather than taken on report.
+
+**LOW-1 — the `27` above.** Recorded as `20` in two places. See the correction
+paragraph in the block above for the arithmetic and the re-measurement.
+
+**LOW-2 — `CAPTURE` on a `const char*` prints `1`.** doctest 2.5.2 has no
+stringifier for a `const char*` lvalue, and two loops in
+`test_modelopt_mixed_precision_checkpoint.cpp` (`:172`, `:248`) each compared
+FIVE prefixes through one, so a failure named none of them. Demonstrated RED by
+inverting both CHECKs in a scratch copy — `logged: p := 1`, ten times — and
+GREEN under the identical inversions after switching both loops to
+`const std::string`, which is what `:149` and `:161` already used:
+`logged: p := backbone.embeddings`, `... := lm_head`, and so on for all nine
+distinct prefixes.
+
+**LOW-3 — two env vars gated one checkpoint, and neither carried the pin.**
+Two parts.
+
+*(a) A half-true citation.* The test claimed `.env.example` **and**
+`.agents/environment.md` document the loader as `set -a; . ./.env; set +a`.
+`.env.example:8` does, verbatim; `.agents/environment.md` does not contain the
+string at all (`grep -n 'set -a'` exits 1) and instead points at `.env.example`
+at `:16`. Corrected to cite `.env.example:8` alone.
+
+*(b) The pin had no teeth.* `CHECKPOINT_ROOT` (this test, joining the staging
+directory name by hand) and `VT_NEMOTRON35_SNAPSHOT`
+(`parity::Nemotron35LightningSnapshot()`, landed on main with §5a) resolved the
+same NAS `local_dir`, and `kNemotron35LightningNvfP4Revision` could refuse
+neither: the accessor's HF-cache spelling is unreachable for a `local_dir` tree,
+because there is no `snapshots/<rev>/` whose NAME carries the revision, and an
+env override is deliberately never revision-checked. A re-download of the same
+repo name lands a different revision under the identical path — exactly the
+substitution `kQwen27NvfP4Revision` exists because of.
+
+`hf download --local-dir` does record the revision, just not in the path: it
+writes a per-revision file manifest at
+`<dir>/.cache/huggingface/trees/<revision>.json`, confirmed present on the NAS
+tree for `29f2d174…`. `Nemotron35LightningSnapshot()` is now the SINGLE resolver
+for both spellings and gates the `CHECKPOINT_ROOT` path on that manifest. Proven
+by construction, the manifest being the only thing that differs between A and B:
+
+| Run | Setup | Result |
+|---|---|---|
+| A | staged dir carries only `deadbeef….json` | `EXIT=77`, loud skip |
+| B | add `29f2d174….json`, nothing else changed | `EXIT=0`, 3 / 12181 |
+| C | `VT_NEMOTRON35_SNAPSHOT` at the real NAS dir | `EXIT=0`, 3 / 12181 |
+| D | neither env var set | `EXIT=77`, banner names the export AND the manifest |
+| E | `VT_` set to a nonexistent dir, `CHECKPOINT_ROOT` valid | `EXIT=77` — refuses, never falls back |
+
+`VT_NEMOTRON35_SNAPSHOT` keeps `HfSnapshot`'s documented escape semantics
+unchanged and is checked first. That asymmetry is deliberate: naming ONE
+directory outright is the deliberate different-checkpoint run the override
+exists for, while naming a ROOT is not, so only the root path is revision-gated.
+
+**Two round-1 dispositions that existed nowhere.** Round 1 returned findings 1-8
+and 7 and 8 were answered verbally only.
+
+- **Finding 7 — the header lives under `src/`, not `include/`.**
+  **ACCEPTED, by operator decision.** `check-doc-checkpoint` classifies the
+  whole `include/vllm/` prefix as user-facing and demands `docs/USAGE.md` move
+  with it; nothing consumes the resolver yet and it is not on the
+  `include/vllm.h` ABI, so that edit would have documented nothing. The checker
+  behavior is tracked as **#515**. **W3 must promote the header to `include/`
+  when it becomes consumed surface** and pay the public-document obligation that
+  genuinely applies then. Recorded here so the debt outlives the conversation.
+- **Finding 8 — the exhaustive arm is opt-in because `CHECKPOINT_ROOT` is not
+  exported.** **ANSWERED.** The repo convention is `set -a; . ./.env; set +a`
+  (`.env.example:8`); no new mechanism was invented, and the skip banner now
+  names the exact export. LOW-3(b) supersedes the part of this that claimed
+  `hf_snapshot.h` did not apply — it does, and it is now the resolver.
+
+**Reported, outside this row's authority to fix.**
+`.agents/environment.md:29-30` states that `CHECKPOINT_ROOT` "states an INTENT
+and nothing more: no code in the tree reads `CHECKPOINT_ROOT`". The exhaustive
+arm reads it — before this branch directly, now through
+`parity::Nemotron35LightningSnapshot()` — so that sentence is false as written
+and belongs to whoever owns `.agents/environment.md`.
 
 ## 5. Gates
 

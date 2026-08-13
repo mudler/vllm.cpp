@@ -155,10 +155,18 @@ upstream-only names below.
 - Upstream registers **44**, not 43.
 - The five upstream-only names are confirmed exactly as listed. But **two of our
   names are absent from upstream's registry at the pin** — `qwen3` (a local
-  alias) and `muse_glimmer` (decorator-registered at the older `e24d1b24` port
-  anchor, gone from `vllm/tool_parsers/` at `555967922`). 44 − 5 = 39 shared;
-  39 + 2 = 41. The earlier "40 = 43 − 3" arithmetic worked only because two
-  errors cancelled.
+  alias) and `muse_glimmer`. 44 − 5 = 39 shared; 39 + 2 = 41. The earlier
+  "40 = 43 − 3" arithmetic worked only because two errors cancelled.
+
+`muse_glimmer` is not a drifted anchor but the **off-pin exception** recorded in
+[porting-inventory.md](../porting-inventory.md) §16: it exists in NO vLLM
+revision in the pin's ancestry (absent at `555967922` AND at the older
+`e24d1b24`), and is decorator-registered only at
+`muse_glimmer_tool_parser.py:183` on the unmerged
+[vllm#51655](https://github.com/vllm-project/vllm/pull/51655), head `075d645af`.
+So the honest reading of "44 vs 41" is that our 41 spans two upstream sources,
+and a future pin advance that lands #51655 folds `muse_glimmer` into the shared
+set rather than adding a name.
 
 Of the five, only `minimax_m3` is Rust-backed; `inkling` is a ParserEngine
 adapter and `openai`/`cohere_command3`/`cohere_command4` are plain Python. The

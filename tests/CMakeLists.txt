@@ -870,6 +870,13 @@ if(VLLM_CPP_SERVER)
   # cause the starvation.)
   set_tests_properties(test_openai_api_server test_openai_conformance
     PROPERTIES RUN_SERIAL ON)
+  # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
+  # drives the REAL VllmServerMain (owned by the library behind the same
+  # VLLM_CPP_SERVER gate) by re-execing this binary, so it needs src/ on the
+  # include path for server_main.h, exactly as test_openai_api_server does.
+  vllm_cpp_add_test(test_serve_recipe_args
+    vllm/entrypoints/openai/test_serve_recipe_args.cpp)
+  target_include_directories(test_serve_recipe_args PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 

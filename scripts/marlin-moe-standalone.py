@@ -24,6 +24,11 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--arm", choices=["gate_up", "down", "both"], default="both")
+    ap.add_argument("--bps", type=int, default=-1,
+                    help="blocks_per_sm passed to the kernel (-1 = auto)")
+    ap.add_argument("--experts", type=int, default=0,
+                    help="draw routing from only this many distinct experts "
+                         "(0 = all E); controls occupied block count")
     args = ap.parse_args()
 
     import vllm
@@ -91,10 +96,15 @@ def main() -> int:
     w2, w2s, w2g = build(K, N)         # down:    size_n = 2048,  size_k = 512
     workspace = marlin_make_workspace_new(dev, 4)
 
-    topk_ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=dev)
+    pool = args.experts if args.experts > 0 else E
+    # SEEDED: routing dominates the time, so every configuration under
+    # comparison must see the IDENTICAL draw or the sweep measures the draw.
+    torch.manual_seed(20260813)
+    topk_ids = torch.randint(0, pool, (M, TOPK), dtype=torch.int32, device=dev)
     topk_w = torch.rand((M, TOPK), dtype=torch.float32, device=dev)
     sorted_ids, expert_ids, num_past = moe_align_block_size(
         topk_ids, BLOCK_M, E, None)
+    distinct = int(torch.unique(topk_ids).numel())
 
     a1 = torch.randn((M, K), dtype=dtype, device=dev)
     c1 = torch.empty((M * TOPK, 2 * N), dtype=dtype, device=dev)
@@ -108,14 +118,14 @@ def main() -> int:
             a1, c1, w1, None, w1s, None, w1g, None, None, None, workspace,
             sorted_ids, expert_ids, num_past, topk_w,
             BLOCK_M, TOPK, False, quant_type.id, M, 2 * N, K,
-            True, False, True, False, -1, -1, -1)
+            True, False, True, False, -1, -1, args.bps)
 
     def down():
         return ops.moe_wna16_marlin_gemm(
             a2, c2, w2, None, w2s, None, w2g, None, None, None, workspace,
             sorted_ids, expert_ids, num_past, topk_w,
             BLOCK_M, 1, True, quant_type.id, M * TOPK, K, N,
-            True, False, True, False, -1, -1, -1)
+            True, False, True, False, -1, -1, args.bps)
 
     arms = {"gate_up": gate_up, "down": down}
     if args.arm != "both":
@@ -132,8 +142,10 @@ def main() -> int:
         en.record()
         torch.cuda.synchronize()
         us = st.elapsed_time(en) * 1000.0 / args.iters
-        print(f"UPSTREAM {name} M={M} blocks_past={int(num_past.item())} "
-              f"us_per_call={us:.3f}", flush=True)
+        blocks = int(num_past.item()) // BLOCK_M
+        print(f"UPSTREAM {name} bps={args.bps} M={M} pool={pool} distinct={distinct} blocks={blocks} "
+              f"us_per_call={us:.3f} us_per_block={us/max(blocks,1):.4f}",
+              flush=True)
 
     print("DONE", flush=True)
     return 0

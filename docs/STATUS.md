@@ -555,9 +555,15 @@ execution modes. The only like-for-like Marlin comparison in evidence is
 therefore the standalone one, and it says parity. Closing the in-situ question
 needs blocks and time from the SAME graphed run, via a device-side counter
 read once at the end rather than a per-launch D2H sync. None of this moves the
-end-to-end ~0.966x, which is wall-clock on matched prompts. One trap worth
-carrying: dram__bytes.sum reads n/a on GB10, so ncu's Memory Throughput %
-excludes DRAM traffic and is not a bandwidth utilisation. Weight
+end-to-end ~0.966x, which is wall-clock on matched prompts. The kernel's one
+settable occupancy knob, blocks_per_sm, was then swept and is DEAD: with
+routing SEEDED so every configuration sees identical work, the between-
+configuration spread (4.3%) is no larger than the within-configuration spread,
+and an apparent 8.7% win in an unseeded first pass was the routing draw moving
+rather than the parameter. Two traps worth carrying: dram__bytes.sum reads n/a
+on GB10, so ncu's Memory Throughput % excludes DRAM traffic and is not a
+bandwidth utilisation; and any MoE comparison that lets routing vary between
+arms measures the draw, not the change. Weight
 residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
 same size and stride as upstream's tensor (268 MB, no padding), so the cause is
 memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under

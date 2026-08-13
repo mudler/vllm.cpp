@@ -20590,3 +20590,40 @@ that survives capture -- a device-side counter written by the kernel launcher,
 read once at the end, never a per-launch D2H sync.
 
 Evidence: `dgx.casa:~/work/marlin442/`.
+
+## SPEC-DSPARK / #442: blocks_per_sm is a DEAD lever, and the box is currently unfit to measure 3% (2026-08-13)
+
+`moe_wna16_marlin_gemm`'s last parameter is `blocks_per_sm`; both engines pass
+-1 (auto), which yields 32768 B of shared memory, 3 blocks/SM and 25% occupancy.
+Since the kernel runs at ~78% of peak bandwidth, forcing a higher value looked
+like a best-in-class lever. It is not.
+
+FIRST SWEEP, UNSEEDED, and it is a trap worth recording: bps -1/1/4 read slow and
+2/3/5/6/8 read fast, apparently 8.7%. The routing was redrawn per run, so
+`distinct` moved 35-41 and the sweep was measuring the DRAW, not the parameter.
+Time tracks distinct experts, so any comparison that lets routing vary measures
+nothing else.
+
+SEEDED (torch.manual_seed, identical 33 distinct / 33 blocks everywhere), 4
+interleaved reps at 120 iters:
+
+| bps | runs (us) | mean excl. outliers |
+|---|---|---|
+| -1 (auto) | 191.3, 367.8, 177.2 | 184.2 |
+| 3 | 181.1, 171.1, 177.6, 353.0 | 176.6 |
+| 4 | 177.7, 178.6, 179.8, 180.3 | 179.1 |
+| 5 | 181.7, 184.2, 179.4 | 181.7 |
+
+Between-config spread 4.3%; WITHIN-config spread comparable (bps=3 alone ranges
+171-181). No reliable effect. The lever is DEAD and the seeded single-shot 8.7%
+was noise.
+
+ENVIRONMENT, and this is the more useful finding: two of fourteen runs returned
+~2x (367.8 and 353.0) and two runs produced no output at all. A box that emits
+2x outliers cannot resolve a 3.4% question, and this one is currently contended
+-- a concurrent session has been building and rebuilding a ~79G tree on the same
+hardware. No parity measurement taken in this window should be trusted, in
+either direction. Earlier paired numbers in this file were taken before that
+contention began and were interleaved, which is what makes them survivable.
+
+Evidence: `dgx.casa:~/work/marlin442/`.

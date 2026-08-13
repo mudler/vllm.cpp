@@ -2,7 +2,13 @@
 
 Issue: [#606](https://github.com/mudler/vllm.cpp/issues/606)
 Row: `SERVE-RECIPE-ARGS` ([engine-matrix.md](../engine-matrix.md))
-Sweep that found it: `roadmap_v1.md` § Recipe-surface sweep (2026-08-13)
+Sweep that found it: the 2026-08-13 `recipes.vllm.ai` recipe-surface sweep. Its
+write-up is `roadmap_v1.md` § "Recipe-surface sweep (2026-08-13,
+`recipes.vllm.ai`)", which arrives with
+[#612](https://github.com/mudler/vllm.cpp/pull/612) together with the intake rows
+for #605–#608. Until that PR merges this is a **forward reference**, and it is
+deliberately not duplicated here: #612 owns those keys, and two branches adding
+the same keyed record merge cleanly and then define it twice.
 
 ## Scope
 
@@ -201,6 +207,15 @@ change and does not touch a forward pass.
   them would be the failure mode this seam exists to prevent.
 - **Out of scope**: `--language-model-only` (#607) is a real capability gap, not an
   inert flag, and must not be quietly added here.
+- **Named cold path**: `InertArg::takes_value` and its `NextArg` consumption are
+  correct but UNEXERCISED — both shipped entries are `kNoValue`, so no test drives
+  the value-taking branch and none can without inventing an entry. Kept because
+  the alternative is a retrofit at the moment a value-taking recipe flag arrives,
+  which is exactly when swallowing the flag but not its value would re-parse the
+  value as the next flag. **The first entry with `takes_value == true` owes a test
+  in the same change** — the value is consumed and the following flag still
+  parses. There is no `kTakesValue` constant yet either; only `kNoValue`. That
+  obligation is recorded here rather than paid with speculative code now.
 
 ## Now
 
@@ -210,7 +225,7 @@ review plus the operator's own rerun of the row's gate.
 
 The table, the notice, and the mirrored `cli_args.py:395` validation landed in
 `src/vllm/entrypoints/openai/server_main.cpp` (`kAcceptedInertArgs:289`,
-`FindAcceptedInertArg:308`, the parse branch `:501`, the validation `:557`), with
+`FindAcceptedInertArg:312`, the parse branch `:505`, the validation `:560`), with
 `docs/USAGE.md` § "Accepted for recipe compatibility" stating that both flags
 have **no** effect and that the list is enumerated rather than a catch-all.
 
@@ -237,14 +252,52 @@ Evidence:
 
 Two things a reviewer or the operator will meet and should not re-derive.
 
-**The PR cannot go fully green, and not because of this change.** `windows-msvc-cpu`
-and `windows-msvc-vulkan` fail with `test_openai_api_server.exe exited with status
--1073740791` (`0xC0000409`, `STATUS_STACK_BUFFER_OVERRUN`), which is
-[#584](https://github.com/mudler/vllm.cpp/issues/584). Attributed rather than
-assumed: [#625](https://github.com/mudler/vllm.cpp/pull/625) fails with the
+**The PR cannot go fully green, and not because of this change. THREE lanes are
+red, not two** — each named here, because a record that lists only some of them
+tells a reader the rest are green.
+
+`windows-msvc-cpu` and `windows-msvc-vulkan` fail with `test_openai_api_server.exe
+exited with status -1073740791` (`0xC0000409`, `STATUS_STACK_BUFFER_OVERRUN`),
+which is [#584](https://github.com/mudler/vllm.cpp/issues/584). Attributed rather
+than assumed: [#625](https://github.com/mudler/vllm.cpp/pull/625) fails with the
 byte-identical exit status and touches no `src/` or `include/` path at all, so a
 records-only PR reproduces it. `test_openai_api_server` is also not a consumer of
 this seam — it never calls `ParseArgs`.
+
+`build-test-cpu` fails on `test_cpu_threadpool`, 1 of 404, and that is
+[#631](https://github.com/mudler/vllm.cpp/issues/631):
+
+```
+tests/vt/test_cpu_threadpool.cpp:536: MESSAGE: empty-op dispatch: 2 threads 0.48 us, 5 threads 48.752 us, ratio 101.567
+tests/vt/test_cpu_threadpool.cpp:539: ERROR: CHECK( ratio < 100.0 ) is NOT correct!
+```
+
+Attributed rather than assumed, to the same standard as #584. The guard divides
+two wall-clock medians (`over_us / fits_us`) and compares the ratio to a fixed
+100, so both ends are machine-shape dependent and the denominator is the problem:
+on the 2-core runner `fits_us` collapsed to 0.48 us, small enough that ordinary
+scheduler noise in the numerator moves the ratio by tens. Same commit, same code,
+three observations:
+
+| Box | `fits` | `over` | ratio |
+|---|---|---|---|
+| 2-core CI runner | 2 threads, 0.48 us | 5 threads, 48.752 us | **101.567** RED |
+| 20-core box (#631's table) | 10 threads, 7.213 us | 21 threads, 19.467 us | **2.699** GREEN |
+| 20-core box, this branch rebuilt at the reviewed head | 10 threads, 13.256 us | 21 threads, 13.135 us | **0.990872** GREEN |
+
+The last row is the one measured while repairing this record — `test_cpu_threadpool`
+9 cases / 9 passed, 19602 assertions / 0 failed, `Status: SUCCESS!`. That it sits
+2.7x below the middle row on the *same class of box* is itself the finding: the
+statistic is not stable enough to carry a fixed threshold. `build-test-cpu` is
+also green on the scheduled `main` lane at baseline `7572b0f4e`, and
+`test_serve_recipe_args` passed on the very runner that went red. This diff is
+argument parsing inside `ParseArgs`; there is no path from it to a threadpool
+dispatch ratio. The test's own comment (`test_cpu_threadpool.cpp:496`) claims it
+can "be trusted ... never to fail spuriously on a busy one"; the CI run falsifies
+that, which is what #631 carries. Not fixed in flow deliberately: changing that
+guard changes a gate's semantics, so it takes its own spec and red-before
+evidence, and raising 100 to a larger number would be widening a scope to turn a
+red gate green.
 
 **A trap this change walked into, recorded so the next person does not.**
 `check-windows-portability.py` scans the shipped server sources with comments

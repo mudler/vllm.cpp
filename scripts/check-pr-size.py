@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Enforce explicit path classification and the checker-evidence contract.
 
-The per-class LINE BUDGETS this file used to enforce were retired 2026-08-10;
-see the note where they stood. What remains: every changed path must classify
-explicitly, binaries fail closed, a governance-checker change must carry
-executable mutation evidence, and product paths must arrive on a PR."""
+The per-class LINE BUDGETS this file used to enforce were retired 2026-08-10,
+and the fail-closed BINARY GUARD was retired 2026-08-13; see the notes where
+each stood. What remains: every changed path must classify explicitly, a
+governance-checker change must carry executable mutation evidence, and product
+paths must arrive on a PR. Nothing here measures the size of a diff."""
 
 from __future__ import annotations
 
@@ -54,8 +55,8 @@ PATH_CLASSES = frozenset(
 #
 # Everything else this checker enforces is unchanged and is NOT a size rule:
 # explicit path classification (no blanket directory exemptions), the
-# fail-closed binary guard, the checker-change mutation-evidence contract, and
-# the role checks that keep product paths on a PR.
+# checker-change mutation-evidence contract, and the role checks that keep
+# product paths on a PR.
 
 # Machine-generated artifacts, each of which MUST be (a) emitted by a tracked
 # generator in this repository, (b) reproduced byte-for-byte by a gate that runs
@@ -173,6 +174,12 @@ COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
 # this. A claim in its own file has one writer and cannot collide. Classified
 # with the other per-row records it now resembles.
 CLAIM = re.compile(r"\.agents/claims/[A-Za-z0-9_.-]+\.md\Z")
+# One file per secondary oracle (AGENTS.md, "When vLLM has no implementation").
+# Same shape and therefore the same class as SPEC and CLAIM: a per-key record
+# globbed for reading, deliberately NOT a shared table every change must write.
+# Absent until #668 -- the registry landed with no pattern here, so every one of
+# its files was unclassified and a required check refused any PR touching a pin.
+ORACLE = re.compile(r"\.agents/oracles/[A-Za-z0-9_.-]+\.md\Z")
 # Retired state evidence, moved wholesale under completed/ when history became
 # git. It is archived evidence, classified like every other completed record.
 COMPLETED_STATE_EVENT = re.compile(
@@ -367,6 +374,7 @@ def classify_path(path: str) -> str:
         path in PROCEDURE_FILES
         or SPEC.fullmatch(path)
         or CLAIM.fullmatch(path)
+        or ORACLE.fullmatch(path)
         or COMPLETED.fullmatch(path)
         or COMPLETED_STATE_EVENT.fullmatch(path)
     ):
@@ -477,9 +485,15 @@ def change_errors(
         except ValueError as exc:
             errors.append(str(exc))
             continue
-        if change.lines is None:
-            errors.append(f"binary change {change.path!r} is not reviewable as text")
-            continue
+        # NO BINARY GUARD. A `lines is None` path used to error here as "not
+        # reviewable as text" (GATE-PR-SIZE-BINARY, #615). Retired 2026-08-13:
+        # it made every golden-bearing PR unmergeable by construction -- parity
+        # goldens are binary by nature -- while adding nothing, because the
+        # protection that matters is classification, which runs directly above
+        # and still refuses any path without a class. The classifier was always
+        # built to give binaries a class; see the `SITE_ASSET` note. Note
+        # `lines is None` still matters downstream: the evidence contract below
+        # tests it, so a binary cannot serve as mutation evidence.
         if path_class == "governance_checker":
             evidence = recognized_evidence(change.path)
             evidence_change = changed_paths.get(evidence)

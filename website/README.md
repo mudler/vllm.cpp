@@ -57,9 +57,12 @@ The site loads nothing from another host. No CDN, no font service, no
 analytics. Typography is font stacks only: a serif does the display work and the
 monospace carries labels, kickers and table headers.
 
-Shipping woff2 files was considered and rejected: `check-pr-size.py` refuses
-binary changes outright ("binary change has no reviewable line budget"), and a
-waiver is for one-time migrations with an expiry, not for a permanent asset.
+Shipping woff2 files was considered and rejected, though no longer for the
+original reason: `check-pr-size.py` used to refuse binary changes outright, and
+that guard was retired 2026-08-13 (#615), so a woff2 under `website/static/`
+would now pass the gate as an `asset`. It stays rejected on its own merits —
+a self-hosted face is bytes every visitor pays for and a licence someone has to
+keep tracking, and the stacks below already carry the design.
 
 The logos and favicon are **mounted** from the repository's `assets/`, not
 copied here, the same rule as `docs/`: a logo refreshed upstream must not

@@ -341,27 +341,92 @@ class BudgetEnforcement(unittest.TestCase):
         self.assertEqual(checker.change_errors([huge]), [])
 
     def test_retiring_the_budget_did_not_retire_the_other_contracts(self) -> None:
-        """The three rules that share this checker must still bite.
+        """The rules that share this checker must still bite.
 
-        Dropping a size gate is not licence to drop classification, the binary
-        guard, or checker-evidence with it, which is exactly the kind of thing
-        that goes unnoticed when a constant is deleted.
+        Dropping a size gate is not licence to drop classification or
+        checker-evidence with it, which is exactly the kind of thing that goes
+        unnoticed when a constant is deleted.
         """
         unknown = checker.ChangedPath("no/such/surface.txt", 1, 0)
         self.assertTrue(checker.change_errors([unknown]))
-        # Asserted on the ERROR, not its wording: this is a regression guard
-        # that must hold on both sides of the retirement, so it must not be
-        # coupled to a message string that the retirement itself reworded.
-        binary = checker.ChangedPath("assets/logo.png", None, None)
-        self.assertTrue(checker.change_errors([binary]))
         lone_checker = self.change("scripts/check-pr-size.py", 10)
         self.assertTrue(
             any("mutation evidence" in e for e in checker.change_errors([lone_checker]))
         )
 
-    def test_binary_changes_fail_closed_instead_of_becoming_free(self) -> None:
-        errors = checker.change_errors([checker.ChangedPath("docs/image.png", None, None)])
-        self.assertTrue(any("binary" in error for error in errors), errors)
+    def test_every_secondary_oracle_file_classifies(self) -> None:
+        """One file per oracle must classify (GATE-PR-SIZE-BINARY follow-on, #668).
+
+        RED before the fix on EVERY tracked file under .agents/oracles/: the
+        secondary-oracle registry landed with no pattern in the checker, so a
+        required check refused any PR that recorded a pin -- which is the one
+        thing the registry exists to make cheap. Asserted on the whole tracked
+        set rather than a sample, so a ninth oracle added without a class is
+        caught here and not in someone's PR.
+        """
+        tracked = subprocess.run(
+            ["git", "ls-files", ".agents/oracles/"],
+            capture_output=True, text=True, check=True, cwd=checker.ROOT,
+        ).stdout.split()
+        self.assertTrue(tracked, "expected tracked .agents/oracles/ files")
+        for path in tracked:
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "procedure")
+
+    def test_oracles_is_a_pattern_not_a_blanket_directory_exemption(self) -> None:
+        """The class is earned by shape, not by living under .agents/oracles/.
+
+        AGENTS.md forbids hiding mutable files behind a blanket directory
+        exemption, so a non-.md file or a nested path there must still fail
+        closed rather than inherit `procedure`.
+        """
+        for path in (
+            ".agents/oracles/pin.txt",
+            ".agents/oracles/vllm.json",
+            ".agents/oracles/nested/dir.md",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
+    def test_a_classified_binary_is_accepted(self) -> None:
+        """A binary at a classified path is not an error (GATE-PR-SIZE-BINARY, #615).
+
+        RED before the retirement: `change_errors` short-circuited on every
+        `lines is None` path, so a captured parity golden could not reach main
+        at all and #431 was unmergeable by construction. The classifier was
+        always built to give binaries a class -- the `SITE_ASSET` comment says
+        so in as many words -- and the guard refused them anyway.
+        """
+        for path in (
+            "tests/parity/goldens/qwen3_greedy_0_6b/our_ids.npy",
+            "tests/parity/goldens/qwen35_greedy_0_8b/neartie_gap_mnats.npy",
+            "tests/parity/goldens/qwen3_greedy_0_6b/p0_prompt.i32",
+            "website/static/fonts/sora-700.woff2",
+        ):
+            with self.subTest(path=path):
+                # Asserted through classify_path rather than a hardcoded class
+                # so this stays true if a golden is later reclassified.
+                checker.classify_path(path)
+                binary = checker.ChangedPath(path, None, None)
+                self.assertEqual(checker.change_errors([binary]), [])
+
+    def test_an_unclassified_binary_is_still_refused(self) -> None:
+        """Retiring the guard must not turn an unclassified path into a free one.
+
+        This is the rail that keeps the retirement scoped: the protection was
+        never "binaries are unreviewable", it was "every path earns a class".
+        Green on both sides of the change -- classification runs first -- so it
+        is a regression pin, not the evidence for the retirement.
+        """
+        errors = checker.change_errors([checker.ChangedPath("no/such/surface.png", None, None)])
+        self.assertTrue(errors)
+        # The message must name the real defect. "Not reviewable as text" told
+        # the author to fix something about the file; an unclassified path is
+        # something they can actually act on.
+        self.assertFalse(
+            any("not reviewable as text" in error for error in errors), errors
+        )
 
     def test_checker_change_requires_its_recognized_mutation_test(self) -> None:
         changed = [

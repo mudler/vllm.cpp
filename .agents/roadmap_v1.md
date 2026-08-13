@@ -610,13 +610,24 @@ as coverage and is the opposite of it.
 
 The 79 `⬜` are scoped-but-unstarted, not missing — model-inventory coverage is
 genuinely broad. The 11 unrowed recipes resolve to **8 distinct architectures** —
-`MossTTSDelayModel` alone is reached by four of them — and split cleanly: 2 are
-pin-lag (present in vLLM `main`,
-[#609](https://github.com/mudler/vllm.cpp/issues/609)) and 6 live in `vllm-omni`
-([#610](https://github.com/mudler/vllm.cpp/issues/610)), of which 2 are in neither
-and need placing before scoping. Counting recipes where the unit is an
-architecture is what put "seven" in the first draft of #610; the row is the
-architecture, so 8 is the number that matters.
+`MossTTSDelayModel` alone is reached by four of them — of which **7 are owed here**
+and 1 is already owned elsewhere:
+
+- **1 pin-lag**, `BailingMoeV3ForCausalLM`
+  ([#609](https://github.com/mudler/vllm.cpp/issues/609)).
+- **6 in `vllm-omni`** ([#610](https://github.com/mudler/vllm.cpp/issues/610)), of
+  which 2 are in neither core `main` nor the omni doc and need placing before
+  scoping.
+- **1 already owned:** `Qwen3_5MoeForCausalLM` belongs to
+  [#490](https://github.com/mudler/vllm.cpp/issues/490) / PR
+  [#601](https://github.com/mudler/vllm.cpp/pull/601), which registers it rather
+  than merely rowing it.
+
+Two counting lessons, both paid for. The row is the ARCHITECTURE, not the recipe —
+counting recipes is what put "seven" in the first draft of #610. And a gap is only
+a gap after checking open PRs, not just issues: #601 was open before this sweep was
+written, and two branches adding the same keyed row merge cleanly and define it
+twice.
 
 **Caveat on the denominator.** 20 of the 157 recipe configs were unreadable
 (gated or 404 — `Voxtral-4B-TTS-2603`, `GLM-TTS`, `IndexTTS-2.5`,

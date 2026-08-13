@@ -1,4 +1,4 @@
-# TOOLS-PARSER-BREADTH — close the tool-parser mirror, and record the 40 already shipped
+# TOOLS-PARSER-BREADTH — close the tool-parser mirror, and record the 41 already shipped
 
 Issue: [#608](https://github.com/mudler/vllm.cpp/issues/608)
 Row: `TOOLS-PARSER-BREADTH` ([engine-matrix.md](../engine-matrix.md))
@@ -13,20 +13,22 @@ The row reads:
 
 All three parsers it names by title are **implemented**. `qwen3_coder`, `mistral`
 and `pythonic` are all in
-`src/vllm/entrypoints/openai/tool_parsers/abstract.cpp`, alongside 37 others —
-**40 registered names** with **38 test files** under
+`src/vllm/entrypoints/openai/tool_parsers/abstract.cpp`, alongside 38 others —
+**41 registered names** over 37 families, with **38 test files** under
 `tests/vllm/entrypoints/openai/tool_parsers/`. The row records none of it, and
-its spec was never written.
+its spec was never written. (This paragraph originally said 40; W0 re-derived it
+and corrected it — see `## Now`.)
 
 This is the shape `SAMPLE-REASONING` carried before its W0 ("the seam shipped
 under `da933828` but this row was never advanced"). **Backfill precedes
 extension**: without it, adding five parsers looks like a change that delivers
-forty.
+forty-one.
 
 ## The actual gap, from the registries — not from usage
 
-Upstream `vllm/tool_parsers/__init__.py` at the pin `5559679` registers **43**
-names. We register **40**. Exactly **five** are upstream-only:
+Upstream `vllm/tool_parsers/__init__.py:24-201` at the pin `5559679` registers
+**44** names. We register **41**. Exactly **five** are upstream-only (and two of
+ours are not in upstream's registry there — see `## Now`):
 
 | Name | Upstream module · class | Recipe uses |
 |---|---|---:|
@@ -69,17 +71,18 @@ empty arguments, surrounding text, escaped strings, and a list of malformed
 inputs. We have no equivalent — our 38 test files are hand-written per parser, so
 the floor differs per parser and nothing enforces one.
 
-Porting that harness raises the floor for all 40 existing parsers and gives the
+Porting that harness raises the floor for all 41 existing parsers and gives the
 five new ones a bar that is upstream's rather than invented. That is W3 below; it
 is the highest-value item here and deliberately does not block W1.
 
 ## Work breakdown
 
-- **W0 — backfill the row to reality.** Record the 40 registered names, the
-  factory anchor (`tool_parsers/abstract.cpp`), the autodetect table
-  (`tool_parsers/detect.cpp`), and the 38 existing test files. Move the state off
-  `INVENTORIED` to what that evidence backs, and reconcile the summary counts in
-  the same change (`scripts/check-agent-record.py` is CI-enforced). No new parser.
+- **W0 — backfill the row to reality. DONE 2026-08-13, see `## Now`.** Record the
+  41 registered names, the factory anchor (`tool_parsers/abstract.cpp`), the
+  autodetect table (`tool_parsers/detect.cpp`), and the 38 existing test files.
+  Move the state off `INVENTORIED` to what that evidence backs, and reconcile the
+  summary counts in the same change (`scripts/check-agent-record.py` is
+  CI-enforced). No new parser.
 - **W1 — the three with recipe demand**: `openai`, `inkling`, `minimax_m3`.
   `minimax_m3` ports its upstream test; the other two author one.
 - **W2 — complete the mirror**: `cohere_command3`, `cohere_command4`.
@@ -101,7 +104,8 @@ parser whose marker collides with an existing row must stay explicit — a wrong
 autodetect is worse than no autodetect, because it silently mis-parses a model
 the user never named.
 
-`docs/USAGE.md:878` states the parser-name count and must move with each wave.
+`docs/USAGE.md:902` states the parser-name count (already correct at 41 over 37
+families) and must move with each wave, as must the `docs/STATUS.md` row.
 
 ## Gates
 
@@ -130,5 +134,36 @@ new test did.
 
 ## Now
 
-`SPIKE` — spec committed, implementation not started. Next: a fresh implementer
-takes W0 alone, because a backfill mixed with a port cannot be reviewed cleanly.
+`PARTIAL` — **W0 landed 2026-08-13 (#608).** The row now records the shipped
+surface (41 names / 37 families, the factory and `tool_parser_names()` anchors,
+the 27-row autodetect table, the 38 test files and the count-pinning registry
+test), and moved `INVENTORIED` → `PARTIAL`; the engine-matrix summary counts and
+`docs/STATUS.md` moved with it. No parser was ported and no `src/` behaviour
+changed — this was a record repair.
+
+`PARTIAL` rather than `ANCHOR-BACKFILL` because that state means "code and tests
+but no leaf spike", and this spec is committed; what remains true is the other
+half, "the implementation is also known to omit upstream behavior" — the five
+upstream-only names below.
+
+**W0 corrected three counts this spec had wrong**, from the registries at
+`5559679`:
+
+- We register **41** names, not 40. `muse_glimmer` took it 40 → 41 on
+  2026-08-10 under `MODEL-MUSE-GLIMMER-W7`; `test_detect.cpp:221` already pinned
+  41, so the spec was stale against a committed test.
+- Upstream registers **44**, not 43.
+- The five upstream-only names are confirmed exactly as listed. But **two of our
+  names are absent from upstream's registry at the pin** — `qwen3` (a local
+  alias) and `muse_glimmer` (decorator-registered at the older `e24d1b24` port
+  anchor, gone from `vllm/tool_parsers/` at `555967922`). 44 − 5 = 39 shared;
+  39 + 2 = 41. The earlier "40 = 43 − 3" arithmetic worked only because two
+  errors cancelled.
+
+Of the five, only `minimax_m3` is Rust-backed; `inkling` is a ParserEngine
+adapter and `openai`/`cohere_command3`/`cohere_command4` are plain Python. The
+"three Rust/Harmony-backed ones" claim in `docs/STATUS.md` was wrong on both the
+count and the characterisation, and W0 repaired it.
+
+Next: W1 (`openai`, `inkling`, `minimax_m3`), then W2 (both Cohere), then W3
+(the `ToolParserTestConfig` harness) — each its own change and its own review.

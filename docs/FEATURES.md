@@ -185,6 +185,7 @@ on the committed fixture); reranking/classify models are not yet registered.
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
 | Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ all three modalities COHERENT on Q4_K_M (t2va, fl2va, ref2va; §8.20); the NVFP4 arm carries the patch grid; GGUF/NVFP4/bf16 loaders, unpruned AND pruned (§8.21); ABI v12 `vllm_video_*` | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Speech / audio GENERATION (TTS, vLLM-Omni lane) | ☐ not started. The six architectures reached by the nine official `vllm-project/recipes` TTS models are inventoried in `.agents/model-matrix.md` (#610); an inventoried row is not a supported one | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS) | not assessed | not assessed |
 | Multimodal over the OpenAI server | ◐ image request path wired, forward pending | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Over the HTTP
@@ -192,7 +193,9 @@ API the image **request** path is wired end to end (`ROAD-V1-MM` W1-W3): the
 production server attaches the seam at `server_main.cpp:826`. Two residuals keep
 it from ✅: the model runner has no mm-forward consuming `Request.mm_features`,
 and no image codec is vendored (raw RGB only). Video, audio and multi-image over
-HTTP are not started.
+HTTP are not started. Audio **in** is gated; audio **out** does not exist: we
+ship no TTS or speech-generation path on any surface, which is why that row is
+the only ☐ in our column here.
 
 ## Speculative decoding
 

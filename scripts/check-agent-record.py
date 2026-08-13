@@ -39,7 +39,25 @@ MATRICES = {
     # delegates it. Its only upstream implementation is the still-OPEN
     # vllm#51655; see porting-inventory.md §9 deviation 16. Bumped because a new
     # row EXISTS, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 362),
+    # 369 since 2026-08-13: +7 rows for the architectures behind official
+    # `vllm-project/recipes` models that had no row at all (#609, #610). One is
+    # pin-lag — `BailingMoeV3ForCausalLM` is registered on vLLM `main` and
+    # absent only at `555967922`. Six are out-of-repo: `MossTTSDelayModel`,
+    # `MossTTSRealtime`, `Qwen3TTSForConditionalGeneration` and
+    # `HiggsMultimodalQwen3ForConditionalGeneration` are registered by
+    # `vllm-project/vllm-omni`, and `VoxtralRealtimeForConditionalGeneration`
+    # and `BailingMMNativeForConditionalGeneration` are target-pending — their
+    # exact `config.json` architecture strings are registered in neither core
+    # vLLM `main` nor `vllm-omni`, so the rows record what was searched instead
+    # of an invented anchor. SEVEN, not eight: the audit's eighth architecture
+    # `Qwen3_5MoeForCausalLM` is rowed by #490 / PR #601, which registers it
+    # rather than only inventorying it. Two branches ADDING the same keyed row
+    # merge without a conflict and define it twice, so the row is left to its
+    # owner. None of the seven touches the at-the-pin model inventory below
+    # (324/373/356/310/261 is unchanged), because like the MuseGlimmer, KimiK3
+    # and MiniMaxH3DiT rows they carry no pinned-registry target. Bumped
+    # because seven new rows EXIST, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 369),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme

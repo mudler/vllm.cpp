@@ -72,21 +72,45 @@ retrained on a 200 000-entry music vocabulary. Vocabulary size is a config value
 not an architecture change, and `MODEL-TEXT-qwen3-qwen3-for-causal-lm` is ✅
 (token-exact 16/16). This is the single largest brick and it is already built.
 
-### 1.1 The one thing the sources disagree about
+### 1.1 Sample rate — RESOLVED 2026-08-13: a stage boundary, not a contradiction
 
-**Output sample rate is UNRESOLVED and must not be guessed.** The model card and
-SGLang-Omni's own README both say **32 kHz** stereo. Every config in the checkpoint
-says **44100**: `vocoder/config.json` `sampling_rate: 44100`, and
-`condition_encoder/config.json` `output_sampling_rate: 44100` with
-`output_hop_length: 512` (⇒ 86.13 Hz frame rate) against `input_sampling_rate:
-24000` / `input_hop_length: 960` (⇒ 25 Hz).
+The model card and SGLang-Omni's README say **32 kHz** stereo; every config says
+**44100**. Both are right, about different points in the pipeline. Read from
+source at the pinned SHAs:
 
-Both readings cannot be right, and the difference is audible — a waveform golden
-captured at the wrong rate is wrong by a resample, which no tensor-parity check on
-the latents would catch. W0 resolves it by reading `MiniMaxMusic3Vocoder` and the
-modular pipeline's `decoders.py` at the pinned diffusers SHA, and by measuring the
-sample count the oracle actually returns for a fixed request. **No waveform golden
-is captured before this is settled.**
+**The vocoder natively emits 44100 Hz, 2 channels**, and that is derivable rather
+than merely declared. The condition encoder's `output_sampling_rate: 44100` /
+`output_hop_length: 512` set a latent frame rate of 44100/512 = **86.133 Hz**
+(`condition_embedder_minimax_music3.py:40-41`; `modular_pipeline.py:48-53`
+documents `latent_hop_length` as "waveform samples per Flow-VAE latent frame").
+The decoder applies one `ConvTranspose1d` per `upsampling_ratios` entry
+(`minimax_music3_vocoder.py:84,92-95`), so 8·8·4·2 = **512×**, and
+86.133 × 512 = 44100. The declared `sampling_rate: 44100`
+(`minimax_music3_vocoder.py:85`) matches the convolution stack rather than being a
+stale annotation. SGLang-Omni's independent implementation agrees exactly
+(`dav.py:94,115`). Stereo comes from folding the 128 latent channels into two
+64-channel streams (`minimax_music3_vocoder.py:110,115`; `dav.py:140-142`).
+
+**diffusers returns 44.1 kHz with no resample** (`modular_pipeline.py:32-36`;
+`decoders.py:84-92`, whose block description says it "stitches the windows into
+the final stereo waveform at 44.1 kHz"). **SGLang-Omni's server resamples
+44100 → 32000 on the way out** (`constants.py:18-19` `DAV_SAMPLE_RATE` /
+`OUTPUT_SAMPLE_RATE`; `acoustic.py:55-58,422-431`). diffusers' own docs state the
+split: the pipeline "returns the vocoder's native 44.1 kHz stereo output. The
+reference server additionally resamples to 32 kHz."
+
+The 24000 / 960 pair in `condition_encoder/config.json` is the AR stage's 25 Hz
+frame rate and is unrelated to output.
+
+**Decision: goldens are captured at 44100 stereo** — the model's native generative
+rate, resample-free, and what the primary oracle hands the caller. The 32 kHz form
+is a **downstream delivery transform**, gated separately if and when SGLang-Omni
+byte parity is wanted. That is not a free conversion: `acoustic.py:58` passes no
+`lowpass_filter_width`, `rolloff` or `resampling_method`, so reproducing its bytes
+means reproducing torchaudio's default sinc filter, not merely converting
+44.1 → 32 by any correct method. **A latent-tensor parity check sits entirely
+upstream of that call and cannot see the difference** — which is why the rate is
+fixed here, before the first waveform golden, rather than discovered later.
 
 ---
 
@@ -218,12 +242,12 @@ the operator. Phases are separately claimable except where noted.
 
 | Phase | Scope | Done when |
 |---|---|---|
-| **W0** | This spec; both oracle records pinned; **stand the diffusers oracle up and prove it builds and runs**; resolve §1.1 | oracle executes the model at reduced dims and `diffusers.md` flips to `gateable = yes` with a path as evidence; sample rate settled from source |
+| **W0** | This spec; both oracle records pinned; §1.1 sample rate settled from source (**DONE**); **stand the diffusers oracle up and prove it builds and runs** | oracle executes the model and `diffusers.md` flips to `gateable = yes` with a path as evidence |
 | **W1** | Modular loader: the six-component layout, weight-norm folding, the fp32/bf16 policy of §2.1, native-arm refusal by name | every component loads with shapes asserted against §1; converted-vs-native tensor equality checked, not assumed |
 | **W2** | Global LLM on our landed Qwen3 path at vocab 200 000 | hidden-state parity vs `transformers`, then token-exact RVQ code parity vs the oracle |
 | **W3** | Condition mix (8-layer weighted) + RVQ depth decoder, 8 codebooks | per-stage tensor parity; the depth decoder's 16-position window exercised at its boundary |
 | **W4** | Flow-matching DiT + `FlowMatchEulerDiscreteScheduler` with `invert_sigmas` | per-step latent parity against the oracle at a fixed seed |
-| **W5** | Vocoder: snake activations, weight-norm, `[8,8,4,2]` upsampling, WAV at the resolved rate | waveform parity within a stated absolute tolerance |
+| **W5** | Vocoder: snake activations, weight-norm, `[8,8,4,2]` upsampling, WAV at **44100 stereo** (§1.1) | waveform parity within a stated absolute tolerance |
 | **W6** | e2e through the shared seams; **`include/vllm.h` surface**; **the example HTTP server as a thin ABI client**, never including internal headers | a song generates end to end from an HTTP request; SGLang-Omni cross-check; speed axis recorded with values and ratios |
 | **W7** | Quantized arms — GGUF k-quants are a standing requirement, not a per-model choice | each arm gated, or refused by name and recorded as owed |
 
@@ -256,10 +280,9 @@ buffering silently and calling it streaming.
 ## 8. Stop conditions
 
 Stop and report `NEEDS_DECISION` rather than proceeding if: the diffusers PR is
-closed unmerged or force-pushed to an incompatible tree; the converted-vs-native
-tensor check in W1 finds the two packagings are *not* the same weights (that
-invalidates the SGLang-Omni cross-check and this spec's §2 decision); or the
-sample rate cannot be resolved from source in W0.
+closed unmerged or force-pushed to an incompatible tree; or the converted-vs-native
+tensor check in W1 finds the two packagings are *not* the same weights, which
+invalidates the SGLang-Omni cross-check and this spec's §2 decision.
 
 Stop and report `NEEDS_CONTEXT` if the checkpoint cannot be fetched to the box the
 gate runs on, or if a component's upstream class has no readable definition at the

@@ -42,6 +42,19 @@ from a release number. If a future pin is genuinely a released wheel, give the
 commit its own asserted field first; do not delete the assertion to make the
 block parse.
 
+**vLLM-Omni needs a SECOND pin, and does not have one yet.** Everything above
+pins one repository: `vllm-project/vllm`. Architectures that live only in
+`vllm-project/vllm-omni` — MiniMax-H3, LTX-2.5, and roughly 40 further modules
+including the whole TTS family — have no oracle this protocol can name, so they
+cannot be gated at all. See [specs/upstream-omni-pin.md](specs/upstream-omni-pin.md)
+(#633) for the design; the four fields it defines
+(`vllm_omni_commit`, `vllm_omni_runtime_version`, `vllm_omni_requires_vllm`,
+`vllm_core_commit_used`) are **owed, not set** — measuring them needs an eligible
+host, and this record does not carry invented values. Two consequences hold the
+moment the pin exists: the two pins may legitimately disagree (vllm-omni requires
+vLLM 0.27.0+ against our 0.26.0.dev0 core pin), and an omni-gated result is never
+evidence about the core pin's surface.
+
 **Prior cycle (2026-07-12):** audited target v0.25.0 `702f4814fe54`; report
 [`sync/2026-07-12-702f481.md`](sync/2026-07-12-702f481.md). The exact 145-commit
 `e24d1b24..702f481` delta was classified (94 `INVENTORY`, 51 `IGNORE`, no
@@ -68,6 +81,12 @@ superseded it at **55/124 axes pass, 69 fail**; the current binding is `9ecd9d0`
   against. Gaps vs it are normal and tracked in the inventory, not hidden.
 - **Parity pin (post-MVP)** — one repo-wide vLLM commit. "We have feature X"
   always means "X as of the pin". Never compare against a moving target.
+- **Omni parity pin** — the same idea for `vllm-project/vllm-omni`, which is a
+  separate repository on its own cadence. It is a second pin rather than a
+  second value of the first: it names the vLLM commit *it* ran against, which
+  need not be ours. Gateability is per ARCHITECTURE, not per pin — pinning the
+  repo makes an architecture gateable only once the oracle is shown to build,
+  run and emit output for that model.
 - **Per-file pins** — every ported file's header records the upstream path +
   the upstream commit it matches. Normally equal to the parity pin; a file may
   be temporarily ahead (hot-fix port) but never behind without a ledger note.
@@ -116,6 +135,14 @@ superseded it at **55/124 axes pass, 69 fail**; the current binding is `9ecd9d0`
 ## Rules
 
 - Ledger and inventory updates are part of the cycle, not optional follow-ups.
+- An omni-gated number is labeled with BOTH commits and is never cited in a
+  vLLM-side parity claim, a binding grid, or a `docs/BENCHMARKS.md` row owned by
+  a core-pinned row.
+- Advancing the omni pin does not re-open the vLLM-side binding grids PROVIDED
+  the omni oracle is installed in its own virtualenv and touches neither
+  `${VLLM_SOURCE}` nor the environment the core pin measures itself from. If that
+  isolation does not hold, the advance is a core sync cycle and is re-validated
+  as one — the dependency tree under the denominator moved.
 - Never mix a sync cycle with feature work in the same commit.
 - If an upstream change conflicts with a recorded deviation (inventory §9),
   the deviation doc gets updated in the same cycle — deviations must always

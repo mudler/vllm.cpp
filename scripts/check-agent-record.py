@@ -373,7 +373,13 @@ ENGINE_PREFIXES = (
 # No build, artifact, runtime evidence, workflow, or publication is claimed by
 # this row-count bump.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 152
+# 153 since 2026-08-13: +`ENG-UPSTREAM-OMNI-PIN` (a parity pin for the separate
+# `vllm-project/vllm-omni` repository). A genuinely-new protocol capability, not a
+# restatement of the vLLM pin: it is a SECOND pin that may disagree with the first,
+# because vllm-omni requires vLLM 0.27.0+ against our 0.26.0.dev0 core pin. `READY`,
+# spec `specs/upstream-omni-pin.md`, issue #633.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 153
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

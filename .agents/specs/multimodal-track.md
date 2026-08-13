@@ -205,6 +205,64 @@ unchanged.
 
 ---
 
+### 1.5 Multimodal CONFIG and input limits — the seam this map missed (#607, 2026-08-13)
+
+The seam map above covers the input *pipeline* and the tower, but not the
+**config that decides whether either runs**. That gap surfaced from the
+`recipes.vllm.ai` sweep: `--language-model-only` is used by **43 of 157** official
+recipes, and we reject it.
+
+| vLLM seam | file:line @ `555967922` | What we build |
+|---|---|---|
+| `MultiModalConfig.limit_per_prompt` | `vllm/config/multimodal.py:81` | NEW per-modality input-count limits on the model config |
+| `get_limit_per_prompt(modality)` | `vllm/config/multimodal.py:321-336` (returns **0** when `language_model_only`, else the map, else the 999 default) | NEW accessor; the single place every consumer asks |
+| `language_model_only` | `vllm/config/multimodal.py:78` | NEW flag — **sugar**, see below |
+| `--limit-mm-per-prompt` / `--language-model-only` | `vllm/engine/arg_utils.py:555,1276,1691` | serve flags over the above |
+| **tower skip when all limits are 0** | `vllm/model_executor/models/interfaces.py:293` — builds the tower inside `no_init_weights(..., StageMissingLayer)` when `all(get_limit_per_prompt(m) == 0)` | the memory win; a CONSEQUENCE of zero limits, reachable by either flag |
+| kernel gate | `vllm/model_executor/models/qwen3_next.py:325` — `text_only` feeds `use_fused_qk_norm_rope_gate` | our fused path is currently unconditional; see below |
+| LoRA interaction | `vllm/lora/model_manager.py:233` | deferred with `LORA-RUNTIME` |
+
+**The correction that matters.** `--language-model-only` is **not** a
+"skip the encoder" boolean. Its own docstring is explicit: *"disables all
+multimodal inputs by setting all modality limits to 0. Equivalent to setting
+`--limit-mm-per-prompt` to 0 for every modality."* The encoder skip falls out of
+`interfaces.py:293` because the limits are zero — **any** route to zero limits
+gets it. So porting the boolean alone would be a bespoke path that does not exist
+upstream, which the mirror rule forbids: port `limit_per_prompt` +
+`get_limit_per_prompt` first, and the flag becomes three lines on top.
+
+**Our baseline is nothing.** `grep -rn 'limit_per_prompt\|MultimodalConfig' src/
+include/` returns no hits; no multimodal config surface exists, and nothing gates
+tower construction on config. This is a port, not an exposure.
+
+**A second-order consequence worth naming.** `qwen3_next.py:325` proves the flag
+is not purely a memory knob — upstream uses it to select the *fused* QK-norm+RoPE+
+gate path. Ours takes the fused route unconditionally (`qwen3_5.cpp`, "true for
+BOTH the 27B and the 35B"). That asymmetry is the serving-side twin of
+[#414](https://github.com/mudler/vllm.cpp/issues/414), which found our published
+ratios flattered because the oracle ran unfused while we ran fused. Any gate
+comparing the two arms must set the flag on both sides or state that it did not.
+
+**Waves** (additive to §3; none blocks M1's pipeline work):
+
+- **L1** — `limit_per_prompt` + `get_limit_per_prompt` on the model config, with
+  upstream's precedence exactly: `language_model_only` ⇒ 0, else the explicit map,
+  else 999. Unit-gated, no serve surface yet.
+- **L2** — `--limit-mm-per-prompt` and `--language-model-only` serve flags plus
+  the C-ABI field, over L1. This is the point at which the 43 recipes stop
+  aborting.
+- **L3** — the tower skip: construct-without-initialising when every limit is 0,
+  gated on **measured** RSS reduction against a multimodal checkpoint, plus
+  token-exactness of the text path with and without the flag.
+- **L4** — mirror the kernel gate, or record an explicit tracked exception with
+  the #414 cross-reference.
+
+L2 without L3 is honest and shippable: the flag would be accepted and would
+correctly zero the limits, with the memory win still owed. L2 must NOT be
+described as "frees VRAM" until L3 lands and is measured.
+
+---
+
 ## 2. Structured contract
 
 ### Scope

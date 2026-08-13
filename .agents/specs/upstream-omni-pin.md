@@ -24,7 +24,11 @@ those must stay separable.
 `vllm-project/vllm-omni` — a separate repository from `vllm-project/vllm`, on its
 own release cadence, with its own registry at
 `vllm_omni/model_executor/models/registry.py`. This project has source-audited it
-once already, at `a4ea67a2` (v0.26.0) — [minimax-h3.md](minimax-h3.md) §8.2.
+twice: at `a4ea67a2` (v0.26.0) for MiniMax-H3 ([minimax-h3.md](minimax-h3.md)
+§8.2), and more recently at `bbe6ccc512a404a2df8c977ea29003002f2683e8`, which the
+Moss-TTS, Qwen3-TTS and Higgs-Audio rows in [model-matrix.md](../model-matrix.md)
+anchor to (#609, #610). Neither audit is a pin: both read source, and a source
+read establishes what exists, never what runs.
 
 Roughly 40 modules there have no counterpart in the vLLM registry our inventory
 was derived from: the whole speech-synthesis family (IndexTTS2, Fish Speech,
@@ -46,9 +50,14 @@ blocker:
   parity PIN — the upstream-sync protocol covers only the vLLM repo".
 - [#435](https://github.com/mudler/vllm.cpp/issues/435) (LTX-2.5) needs the same.
 
-It is also a records defect. `model-matrix.md` claims an **exhaustive**
-architecture inventory totalling 329 rows. That claim is true of one repository
-and does not say so.
+It is also a records defect, though a shrinking one. `model-matrix.md` claims an
+**exhaustive** architecture inventory, and that claim is true of one repository
+without saying so. Since this row was opened, #609/#610 rowed several omni
+architectures explicitly as out-of-repo, so the surface is no longer wholly
+uninventoried — what remains is that the document's own scope sentence does not
+state the boundary those rows are working around, and every one of them records
+the same missing-pin blocker in its evidence cell. Fixing the sentence is this
+row's W2; inventorying the rest is not this row's job.
 
 ## Port map
 

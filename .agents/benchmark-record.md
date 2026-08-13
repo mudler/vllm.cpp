@@ -20434,3 +20434,42 @@ Absolute us/call is not comparable in-situ (uniform synthetic routing occupies
 bandwidth are.
 
 Evidence: `dgx.casa:~/work/marlin442/`.
+
+## SPEC-DSPARK / #442: our Marlin == upstream's at matched work; 6x REFUTED (2026-08-13)
+
+`benchmarks/marlin_moe_standalone.cpp` is the OUR-side arm of the harness in the
+previous entry: same 35B-A3B gate_up shapes, same expert-pool control over the
+occupied block count, driving `vt::MoeGroupedGemmNvfp4Marlin`.
+
+Sweep, us/block, ours vs upstream: 5.482/5.813 (pool 32), 5.525/5.323 (40),
+5.311/5.446 (48), 5.318/5.545 (64), 5.194/5.284 (128), 5.261/5.224 (256). Ours
+plateaus on the SAME 5.2-5.5 band.
+
+Two INTERLEAVED paired runs, pool 48 and 128, 3 reps each, 12 points per arm:
+
+| | n | mean us/block | sd | range |
+|---|---|---|---|---|
+| ours | 12 | 5.3187 | 0.124 | 5.083-5.562 |
+| upstream | 12 | 5.3330 | 0.151 | 5.042-5.560 |
+
+ours/upstream = 0.9973 (ours 0.27% FASTER), inside one sd, sign flipping between
+runs. A per-call workspace memset ours pays and upstream does not was isolated
+via `--zero-ws 0`: noise.
+
+CONSEQUENCE: the in-situ "8.2% slower inside one kernel / 12.8% per unit work /
+186.6 vs 210.7 GB/s" does NOT reproduce at matched work. Both engines reach the
+same 203-226 GB/s plateau. That attribution describes the in-situ RUNS, not the
+kernel, and the localisation of the residual to `marlin_moe_wna16::Marlin` is
+REFUTED.
+
+WHERE TO LOOK NEXT: the sweep shows time is set by DISTINCT EXPERTS touched per
+launch (1.15 us/block at 16 experts, weights in L2; ~5.3 above ~27, streaming --
+a 4.6x swing). Blocks are not experts, so the recorded 38.9 vs 40.6 blocks does
+not settle it. Measure distinct experts per launch on both arms IN SITU.
+
+CAVEATS: our arm links ~/work/pr234's build, vendored marlin_mm_moe.cu
+byte-identical to main (md5 85c40e4869bc6ec594b8cfb97fb58b3c), dispatcher
+predates the perf-neutral C_tmp cap. Ours times with steady_clock over 80
+iterations, upstream with CUDA events.
+
+Evidence: `dgx.casa:~/work/marlin442/`.

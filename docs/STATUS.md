@@ -504,40 +504,31 @@ MHz, 30 reps, drift bracketed at -0.088%, the oracle's non-modal draws excluded)
 the code cell is **0.975x with NON-OVERLAPPING distributions** — a real gap, not
 noise, and the earlier "within resolution" reading was too generous. Ours slowed
 more than the oracle when the clock was pinned, so the residual is
-SM-clock-sensitive work. PAIRED profiling localises it exactly: the SAME
-`marlin_moe_wna16::Marlin` kernel, the SAME 1520 launches, ours 249.22 ms vs
-upstream 230.39 ms -- **8.2% slower inside one kernel**, which at ~34% of wall is
-2.8% end-to-end and accounts for the whole measured 2.5%. Not an algorithm difference, and not the launch
-geometry either: the full template arguments match, `determine_exec_config` is
-byte-identical to the pinned upstream copy, and every OTHER kernel matches to
-0.2%. The inputs match too (scale bytes per expert,
-256-byte alignment, cudaMalloc residency), and the work counts were MEASURED:
-upstream loops 4.4% MORE blocks per launch (40.6 vs 38.9) and is still faster, so
-routing is refuted and normalising by work makes our deficit bigger -- **4.21 vs
-3.73 us per block, ~12.8% slower per unit of work**. Every source-level explanation is now
-eliminated -- kernel source, template instantiation, grid config, block size,
-shared-memory budget, reduction flags, scale layout, alignment, residency, CUDA
-toolkit (13.0 both) and arch all match -- and `ncu` plus cuobjdump then showed the
-COMPILED KERNELS ARE EQUIVALENT (94 registers and 3664 SASS instructions on both,
-upstream running its family-compatible sm_120 cubin against our sm_121a). The
-residual is therefore runtime and is ATTRIBUTED to effective DRAM bandwidth
-(186.6 vs 210.7 GB/s), an attribution now CORROBORATED by an independent
-measurement. `scripts/marlin-moe-standalone.py` drives upstream's own
-`moe_wna16_marlin_gemm` with no EngineCore, which is what finally lets `ncu`
-attach. Its static geometry is new and exact: GB10's 48 SMs hold 102400 B of
-shared memory, the kernel takes 32768 B per block, so occupancy is capped at
-3 blocks/SM (**25%**) and the grid is 48x3 = **144 CTAs, one persistent wave**.
-Sweeping the occupied block count then shows two regimes: under ~18 blocks the
-weights fit in L2 (1.15 us/block), above ~27 they stream and **us/block is FLAT
-at 5.2-5.5 across a 2.4x range of work** -- constant bytes/second, the
-bandwidth-limited signature, a **203-226 GB/s** plateau. Upstream's 210.7 sits
-INSIDE that plateau (it runs at the kernel's achievable bandwidth); ours at
-186.6 sits ~12% below. Note `ncu`'s SpeedOfLight memory percentage is unusable
-here -- `dram__bytes.sum` reads `n/a` on GB10, so "Memory Throughput 11.14%"
-excludes DRAM traffic and must not be read as latency-bound. What does NOT
-survive is the per-unit-work division: with a fixed 144-CTA grid the "38.9 vs
-40.6 blocks" are loop iterations, priced by the sweep at about +4.4%. Ours has
-NOT yet run through the harness, which is the decisive next measurement. Weight
+SM-clock-sensitive work. PAIRED profiling appeared to localise it to `marlin_moe_wna16::Marlin` (ours
+249.22 ms vs upstream 230.39 ms over the same 1520 launches), and every
+source-level explanation was eliminated -- kernel source, template
+instantiation, grid, block size, shared memory, flags, scale layout,
+alignment, residency, toolkit, arch -- with `ncu` and cuobjdump showing the
+compiled kernels EQUIVALENT (94 registers, 3664 SASS instructions on
+both). **That localisation is now REFUTED.** `scripts/marlin-moe-standalone.py` and
+`benchmarks/marlin_moe_standalone.cpp` drive each engine's own kernel outside
+its engine -- which is also what finally lets `ncu` attach to upstream, the
+blocker recorded as impossible in both replay modes -- and at matched work the
+two are indistinguishable: over 12 interleaved paired points ours
+averages **5.3187 us/block against upstream's 5.3330**, ratio **0.9973**, sign flipping
+between runs, inside one standard deviation either way. The in-situ 8.2%
+therefore describes the RUNS, not the kernel, and so do the 12.8%-per-unit-
+work and 186.6-vs-210.7 GB/s figures derived from it. What the harness does
+establish is the kernel's shape: a persistent single wave (grid 144 = 48 SMs x
+3 blocks, 32768 B shared against 102400 B/SM, 25% occupancy), a bandwidth-
+limited plateau of 203-226 GB/s that BOTH engines reach, and a 4.6x swing
+driven by how many DISTINCT EXPERTS a launch touches (1.15 us/block at 16,
+weights in L2; ~5.3 above ~27, streaming). Blocks are not experts, so the
+recorded 38.9-vs-40.6 block counts never settled which arm did more work;
+measuring distinct experts per launch in situ is the next step, not another
+kernel lever. One trap worth carrying: `dram__bytes.sum` reads `n/a` on GB10,
+so `ncu`'s "Memory Throughput %" excludes DRAM traffic and must not be read as
+a bandwidth utilisation. Weight
 residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
 same size and stride as upstream's tensor (268 MB, no padding), so the cause is
 memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under

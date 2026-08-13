@@ -1754,6 +1754,67 @@ occupies 61-65 blocks against the model's 38.9-40.6. The static geometry, the
 two-regime shape and the plateau bandwidth are comparable, since they do not
 depend on the routing draw.
 
+## 6ae. THE KERNEL IS NOT THE GAP -- 6x's LOCALISATION IS REFUTED (2026-08-13)
+
+6ad built the upstream arm. This is the arm it was built for:
+`benchmarks/marlin_moe_standalone.cpp` drives OUR
+`vt::MoeGroupedGemmNvfp4Marlin` through the same shapes, the same expert-pool
+control over the block count, and the same gate_up GEMM as the python arm.
+
+**Sweep, ours against upstream, us/block:**
+
+| pool | ours blocks / us-per-block | upstream blocks / us-per-block |
+|---|---|---|
+| 8 | 13 / 1.512 | 13 / 1.534 |
+| 16 | 16 / 1.411 | 18 / 1.153 |
+| 24 | 23 / 4.773 | 22 / 2.955 |
+| 32 | 30 / 5.482 | 27 / 5.813 |
+| 40 | 34 / 5.525 | 31 / 5.323 |
+| 48 | 39 / 5.311 | 38 / 5.446 |
+| 64 | 44 / 5.318 | 45 / 5.545 |
+| 128 | 54 / 5.194 | 58 / 5.284 |
+| 256 | 63 / 5.261 | 65 / 5.224 |
+
+Ours plateaus on the SAME 5.2-5.5 band, so ours reaches the same achievable
+bandwidth. Two INTERLEAVED paired runs at pool 48 and 128, three reps each,
+then settle it:
+
+| | n | mean us/block | sd | range |
+|---|---|---|---|---|
+| ours | 12 | **5.3187** | 0.124 | 5.083-5.562 |
+| upstream | 12 | **5.3330** | 0.151 | 5.042-5.560 |
+
+**ours/upstream = 0.9973, i.e. ours 0.27% FASTER, inside one standard deviation
+on either side.** The sign of the difference flips between runs. A per-call
+workspace memset that our arm pays and upstream's does not was isolated with
+`--zero-ws 0` and is noise.
+
+**So 6x's localisation does not survive.** Its "the SAME kernel, the SAME 1520
+launches, ours 249.22 ms vs upstream 230.39 ms, 8.2% slower inside one kernel"
+does NOT reproduce when the same kernel is driven with matched work on the same
+box. At matched blocks the two are indistinguishable. Correspondingly, the
+"12.8% slower per unit of work" and the 186.6-vs-210.7 GB/s reading it produced
+describe the in-situ RUNS, not the kernel: both engines reach the same 203-226
+GB/s plateau when asked to do the same thing.
+
+**What that leaves.** The in-situ difference must come from CONTEXT rather than
+from kernel efficiency, and the sweep shows precisely which context term
+dominates: time is set by how many DISTINCT EXPERTS a launch touches, from
+1.15 us/block at 16 experts (weights fit L2) to ~5.3 above ~27 (streaming) --
+a 4.6x swing that no kernel change causes. The leading hypothesis is therefore
+that the two in-situ arms were not touching the same number of distinct experts
+per launch, which the recorded 38.9 vs 40.6 blocks hints at but does not
+measure, because blocks are not experts. The next measurement is distinct
+experts per launch on both arms in situ, not another kernel lever.
+
+**Caveats, stated rather than buried.** Our arm links `~/work/pr234`'s build,
+whose vendored `marlin_mm_moe.cu` is byte-identical to current main
+(md5 85c40e4869bc6ec594b8cfb97fb58b3c on both) while its dispatcher predates the
+C_tmp cap, which was independently measured perf-neutral at +0.03%. Ours times
+with `steady_clock` around 80 iterations plus a final sync; upstream's arm uses
+CUDA events. Both amortise launch overhead over 80 calls, and the memset probe
+bounds that class of difference at noise.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.

@@ -21,6 +21,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "hf_snapshot.h"
 #include "vllm/model_executor/layers/quantization/modelopt_mixed_precision.h"
 
 using vllm::layers::modelopt::MixedPrecisionConfig;
@@ -43,36 +44,50 @@ namespace {
   std::exit(77);
 }
 
-// $CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4/<file> — the path
-// .agents/specs/nemotron-h-model.md §0 records the checkpoint is staged at.
+// `<snapshot>/<file>`, where the snapshot is resolved by the SINGLE pinned
+// resolver `parity::Nemotron35LightningSnapshot()` (tests/parity/hf_snapshot.h).
 //
-// HOW TO MAKE THIS ARM RUN. `CHECKPOINT_ROOT` is a `.env` key, and `.env` is
-// not exported into a login shell by anything: `.env.example` and
-// `.agents/environment.md` document the loader as `set -a; . ./.env; set +a`,
-// and that IS the repo's convention — there is no CTest-side mechanism that
-// reads `.env`, and the only other checkpoint-gated helper here
-// (`tests/parity/hf_snapshot.h`) resolves a Hugging Face cache under `$HOME`
-// rather than a NAS-staged directory, so it does not apply. A plain `ctest`
-// from a shell that has not sourced `.env` therefore SKIPS this arm, which is
-// correct behavior and not a pass — the banner below names the exact export.
+// LOW-3 (#517). This arm used to read `CHECKPOINT_ROOT` itself and join the
+// staging directory name by hand, which meant two env vars —
+// `VT_NEMOTRON35_SNAPSHOT` there, `CHECKPOINT_ROOT` here — reached one
+// checkpoint and neither refused a revision the goldens were not captured
+// against. Both spellings now go through that resolver, which gates the staged
+// `local_dir` on its own `.cache/huggingface/trees/<revision>.json` manifest, so
+// a re-download landing a different revision under the identical path SKIPS
+// here rather than being silently substituted.
+//
+// HOW TO MAKE THIS ARM RUN. `CHECKPOINT_ROOT` is a `.env` key, and `.env` is not
+// exported into a login shell by anything: `.env.example:8` documents the loader
+// verbatim as `set -a; . ./.env; set +a`, and `.agents/environment.md:16` points
+// at that file. (An earlier version of this comment credited the loader line to
+// `.agents/environment.md` as well; it is not there — LOW-3.) There is no
+// CTest-side mechanism that reads `.env`, so a plain `ctest` from a shell that
+// has not sourced it SKIPS this arm, which is correct behavior and not a pass —
+// the banner below names the exact export.
 std::string CheckpointFile(const char* filename) {
-  const char* root = std::getenv("CHECKPOINT_ROOT");
-  if (root == nullptr || *root == '\0') {
+  const std::string snapshot = parity::Nemotron35LightningSnapshot();
+  if (snapshot.empty()) {
     SkipGate(
-        std::string("CHECKPOINT_ROOT is unset, so ") + filename +
+        std::string("no pinned Nemotron-3.5-Lightning snapshot, so ") +
+        filename +
         " cannot be located.\n"
-        "*** To RUN this arm, load the repo env first — `.env.example` and\n"
-        "***   .agents/environment.md document exactly this:\n"
+        "*** To RUN this arm, load the repo env first — `.env.example:8`\n"
+        "***   documents exactly this:\n"
         "***       set -a; . ./.env; set +a\n"
         "***   then re-run ctest. Equivalently, export it for one run:\n"
         "***       CHECKPOINT_ROOT=<shared checkpoint dir> ctest -R "
         "test_modelopt_mixed_precision_checkpoint\n"
         "***   The arm needs only\n"
-        "***   $CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4/{config,"
-        "hf_quant_config}.json — no weights, no GPU");
+        "***   $CHECKPOINT_ROOT/" +
+        parity::kNemotron35LightningLocalDirName +
+        "/{config,hf_quant_config}.json — no weights, no GPU.\n"
+        "***   A staged directory that IS present skips too unless it carries\n"
+        "***   .cache/huggingface/trees/" +
+        parity::kNemotron35LightningNvfP4Revision +
+        ".json,\n"
+        "***   the revision the committed goldens were captured against.");
   }
-  const std::filesystem::path p =
-      std::filesystem::path(root) / "nemotron-3.5-lightning-30b-nvfp4" / filename;
+  const std::filesystem::path p = std::filesystem::path(snapshot) / filename;
   std::error_code ec;
   if (!std::filesystem::exists(p, ec)) {
     SkipGate("not staged: " + p.string());
@@ -164,10 +179,16 @@ TEST_CASE("modelopt-mixed[ckpt]: the module prefixes the loader will actually as
   }
 
   // Attention (layers 5/12/19/26/33/42), conv1d, gates and embeddings are bf16.
-  for (const char* p : {"backbone.layers.5.mixer.q_proj",
-                        "backbone.layers.42.mixer.o_proj",
-                        "backbone.layers.0.mixer.conv1d",
-                        "backbone.layers.1.mixer.gate", "backbone.embeddings"}) {
+  //
+  // `const std::string`, NOT `const char*`, and that is load-bearing: doctest
+  // 2.5.2 has no stringifier for a `const char*` VARIABLE, so `CAPTURE(p)` on
+  // one prints `logged: p := 1` and a failure here would name none of the five
+  // prefixes (LOW-2). The two loops above already spell it `std::string`.
+  for (const std::string p : {"backbone.layers.5.mixer.q_proj",
+                              "backbone.layers.42.mixer.o_proj",
+                              "backbone.layers.0.mixer.conv1d",
+                              "backbone.layers.1.mixer.gate",
+                              "backbone.embeddings"}) {
     CAPTURE(p);
     CHECK(c.Resolve(p).how == Resolution::kExcluded);
   }
@@ -237,10 +258,12 @@ TEST_CASE("modelopt-mixed[ckpt]: the standalone hf_quant_config.json parses") {
   // ...and only THEN that the flat shape agrees module for module.
   const MixedPrecisionConfig flat =
       MixedPrecisionConfig::Parse(LoadQuantizationConfig());
-  for (const char* p : {"backbone.layers.0.mixer.in_proj",
-                        "backbone.layers.1.mixer.experts",
-                        "backbone.layers.5.mixer.q_proj", "lm_head",
-                        "mtp.layers.0.eh_proj"}) {
+  // `const std::string` for the same reason as the loop above: a `const char*`
+  // capture prints `1` and this loop compares FIVE prefixes (LOW-2).
+  for (const std::string p : {"backbone.layers.0.mixer.in_proj",
+                              "backbone.layers.1.mixer.experts",
+                              "backbone.layers.5.mixer.q_proj", "lm_head",
+                              "mtp.layers.0.eh_proj"}) {
     CAPTURE(p);
     const ModuleQuant a = c.Resolve(p);
     const ModuleQuant b = flat.Resolve(p);

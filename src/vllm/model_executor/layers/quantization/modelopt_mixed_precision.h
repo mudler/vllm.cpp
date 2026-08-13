@@ -250,15 +250,22 @@ inline bool MatchOneToken(char c, const std::string& pat, std::size_t p,
 //   names <=3 chars over {a,b,.,0} x patterns <=5 over {a,.,?,*,[,],!,-}
 //     3,183,165 pairs, 0 mismatches
 //   names <=2 chars over {a,b,.,0} x patterns <=6 over the same alphabet
-//     6,291,453 pairs, 108 mismatches spanning 20 distinct patterns
+//     6,291,453 pairs, 108 mismatches spanning 27 distinct patterns
+//
+// The 27 is arithmetic, not a tally: every one of the 27 patterns translates to
+// `(?s:.)\Z`, which matches a name of length ONE and nothing else, so each
+// contributes exactly the 4 one-character names over {a,b,.,0} and 27 x 4 =
+// 108. A count of 20 would be impossible on its face (it was in this comment
+// until 2026-08-13; the ceiling is 4 per pattern, so 108 needs 27 of them).
 //
 // All 108 are ONE class and all in the same direction (CPython True, this
 // False): a bracket whose contents reduce to a bare `!` once CPython's
-// `translate` has DROPPED a reversed range. `[?-.!]` is the smallest —
-// `?`(0x3f) down to `.`(0x2e) is empty, so `stuff` becomes `"!"`, and
-// translate's "negated empty class matches any character" rule compiles the
-// whole pattern to `(?s:.)\Z`. Matching that means reproducing translate's
-// REWRITING, not its matching: a bracket-by-bracket matcher cannot see it.
+// `translate` has DROPPED a reversed range. All 27 have the shape `[X-Y!]`
+// with X > Y; `[?-.!]` is the worked example — `?`(0x3f) down to `.`(0x2e) is
+// empty, so `stuff` becomes `"!"`, and translate's "negated empty class matches
+// any character" rule compiles the whole pattern to `(?s:.)\Z`. Matching that
+// means reproducing translate's REWRITING, not its matching: a
+// bracket-by-bracket matcher cannot see it.
 //
 // Not fixed on purpose. It needs a reversed range AND a trailing `!` inside one
 // class; ModelOpt emits no bracket expressions at all (`mtp*` is the real

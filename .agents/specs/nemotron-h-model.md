@@ -260,12 +260,26 @@ re-applying that exact mutation:
 
 **`FnMatch` vs CPython, measured not assumed.** Two differential sweeps against
 `fnmatch.fnmatchcase`: 3,183,165 pairs (names ≤3, patterns ≤5) with **0**
-mismatches, and 6,291,453 pairs (names ≤2, patterns ≤6) with **108** across 20
-patterns — all one class, all CPython-True/ours-False, all a bracket whose
-contents reduce to a bare `!` after `translate` drops a REVERSED range
+mismatches, and 6,291,453 pairs (names ≤2, patterns ≤6) with **108** across
+**27** patterns — all one class, all CPython-True/ours-False, all a bracket
+whose contents reduce to a bare `!` after `translate` drops a REVERSED range
 (`[?-.!]` → `(?s:.)\Z`). Recorded in the header and NOT fixed: matching it means
 reproducing `translate`'s rewriting, and ModelOpt emits no bracket expressions
 at all, so no reachable input touches it.
+
+**LOW-1, corrected 2026-08-13.** That count read **20** here and at
+`modelopt_mixed_precision.h:253` when the branch went to review. It was wrong,
+and wrong in a way the numbers refute on their own: every one of those patterns
+translates to `(?s:.)\Z`, which matches a length-1 name and nothing else, so a
+pattern can contribute at most the **4** one-character names in the sweep
+alphabet `{a,b,.,0}` and 20 patterns cap out at 80 — below the 108 the same
+sentence reports. Re-measured independently against CPython 3.12
+`fnmatch.fnmatchcase` on this branch: sweep 1 reproduces `3,183,165 pairs,
+0 mismatches`; sweep 2 reproduces `6,291,453 pairs, 108 mismatches` and yields
+`27 distinct patterns`, 27 x 4 = 108, direction `{(True, False): 108}`,
+`distinct translations: {'(?s:.)\Z': 108}`, `mismatching name lengths: {1: 108}`.
+All 27 have the shape `[X-Y!]` with X > Y. `FnMatch`'s behavior is unchanged —
+only the recorded number was.
 
 **Why a plain `ctest` skips the exhaustive arm.** `CHECKPOINT_ROOT` is a `.env`
 key and `.env` is not exported by anything; the repo's documented loader is

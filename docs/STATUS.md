@@ -520,9 +520,22 @@ shared-memory budget, reduction flags, scale layout, alignment, residency, CUDA
 toolkit (13.0 both) and arch all match -- and `ncu` plus cuobjdump then showed the
 COMPILED KERNELS ARE EQUIVALENT (94 registers and 3664 SASS instructions on both,
 upstream running its family-compatible sm_120 cubin against our sm_121a). The
-residual is therefore runtime and is now ATTRIBUTED: the kernel is DRAM-bound
-(L2 hit 9.5%) and we sustain **186.6 GB/s against upstream's 210.7**, a 12.9%
-effective-bandwidth gap that IS the whole per-unit-work difference. Weight
+residual is therefore runtime. It was ATTRIBUTED to effective DRAM bandwidth
+(186.6 vs 210.7 GB/s) and that attribution is now **REFUTED**: those figures were
+DERIVED from time x analytic bytes, never counted, so they restated the time gap
+rather than explaining it. `scripts/marlin-moe-standalone.py` drives upstream's
+own `moe_wna16_marlin_gemm` with no EngineCore, which is what finally lets `ncu`
+attach, and the counters say **11.14% of memory peak and 11.42% of compute peak**
+-- the LATENCY-bound signature, not a bandwidth wall. GB10's 48 SMs hold 102400 B
+of shared memory each, the kernel takes 32768 B per block, so occupancy is capped
+at 3 blocks/SM (**25%**) and the grid is 48x3 = **144 CTAs, one persistent wave**.
+That also invalidates the per-unit-work normalisation: 38.9 vs 40.6 "blocks per
+launch" are loop iterations inside a FIXED grid, so cost is set by max work per
+CTA, and ncu flags load imbalance and uncoalesced access (20.2 of 32 bytes per
+load sector). Our kernel through the same harness is NOT yet run, so the 3.4% gap
+itself is unchanged -- only its cause is. Separately this leaves ~9x of absolute
+headroom that BOTH engines pay: a shared-memory budget under 25600 B would allow
+4 blocks/SM. Weight
 residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
 same size and stride as upstream's tensor (268 MB, no padding), so the cause is
 memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under

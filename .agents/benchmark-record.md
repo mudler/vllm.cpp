@@ -20384,3 +20384,44 @@ Oracle draws remain bimodal (~147.3 and ~155.6), the same one-extra-accepted-tok
 effect as the fibacc run, so its MODAL draws are the honest denominator.
 
 Evidence: `dgx:~/work/dspark-w6/iocheck.log`, `final_pair.log`.
+## SPEC-DSPARK / #442: upstream Marlin profiled under ncu at last; DRAM-bound REFUTED (2026-08-13)
+
+`scripts/marlin-moe-standalone.py` drives upstream's own
+`torch.ops._moe_C.moe_wna16_marlin_gemm` on the 35B-A3B decode shapes with no
+EngineCore, no multiprocessing and no model load, which is what makes `ncu`
+attach -- the blocker recorded as "BLOCKED, both replay modes TRIED".
+
+vLLM 0.23.1rc1.dev1511+g555967922 (identity asserted), torch 2.13.0+cu130,
+`--set full`, one launch, GB10:
+
+| counter | value |
+|---|---|
+| Memory Throughput | 11.14% of peak |
+| Compute (SM) Throughput | 11.42% of peak |
+| Theoretical / Achieved Occupancy | 25% / 25.98% |
+| Block Limit shared memory | 3 (registers 5, warps 12, SM 24) |
+| Waves Per SM | 1 |
+| L2 / L1 hit | 4.08% / 0.34% |
+| grid / block / shared per block | 144 / 128 / 32768 B |
+
+48 SMs x 102400 B shared per SM, 32768 B per block => 3 blocks/SM => 25%
+occupancy, and 48 x 3 = 144 = the grid. The launch is a persistent single wave.
+
+Both throughputs ~11% is the LATENCY-bound signature, not DRAM-bound. The
+186.6 vs 210.7 GB/s figures were derived (time x analytic bytes), never counted,
+so they restated the time difference rather than explaining it. The per-unit-work
+normalisation is invalid too: 38.9 vs 40.6 "blocks per launch" are loop
+iterations inside a FIXED 144-CTA grid, so cost is set by max work per CTA, and
+ncu flags load imbalance plus uncoalesced access (20.2/32 bytes per load sector).
+
+NOT yet run: our kernel through the same harness on identical routing. No claim
+about the 3.4% gap changes on this evidence; only its attribution does. Absolute
+us/call is not comparable in-situ (uniform synthetic routing gives 61 occupied
+blocks vs the model's 38.9-40.6); the static geometry and throughput percentages
+are.
+
+Standing headroom, applying to BOTH engines: occupancy is capped purely by a
+32 KB shared-memory budget (`max_shared_mem / blocks_per_sm - 1024`). Under
+25600 B would allow 4 blocks/SM.
+
+Evidence: `dgx.casa:~/work/marlin442/`.

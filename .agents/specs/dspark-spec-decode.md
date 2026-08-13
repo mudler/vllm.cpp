@@ -1663,6 +1663,80 @@ quotable -- and all three agree.
 Also visible in the last run: the oracle's draws are bimodal at ~147.3 and
 ~155.6, the same one-extra-accepted-token effect as §6q, which is why its MODAL
 draws are the honest denominator.
+## 6ad. THE ncu BLOCKER IS GONE, AND "DRAM-BOUND" IS REFUTED (2026-08-13)
+
+Section 6z listed upstream's `ncu` counters as the last open route and called it
+BLOCKED: vLLM's EngineCore will not initialise under `ncu` in either replay mode.
+`scripts/marlin-moe-standalone.py` routes around it. It drives upstream's OWN
+`torch.ops._moe_C.moe_wna16_marlin_gemm` on the 35B-A3B decode shapes -- hidden
+2048, moe_intermediate 512, E=256, top_k=8, `moe_block_size=8` -- with NO
+EngineCore, NO multiprocessing and NO model load, mirroring
+`prepare_nvfp4_moe_layer_for_marlin`'s scale pipeline exactly (per-expert
+`marlin_permute_scales` on the transposed scale, one shared scale factor,
+S0E5M3 conversion). It asserts the oracle identity and aborts on mismatch.
+
+**It profiles.** vLLM 0.23.1rc1.dev1511+g555967922, torch 2.13.0+cu130,
+`--set full`, one launch:
+
+| counter | value |
+|---|---|
+| Memory Throughput | **11.14%** of peak |
+| Compute (SM) Throughput | **11.42%** of peak |
+| Theoretical / Achieved Occupancy | 25% / 25.98% |
+| Block Limit -- **shared memory** | **3** (registers 5, warps 12, SM 24, barriers 24) |
+| Waves Per SM | **1** |
+| L2 hit / L1 hit | 4.08% / 0.34% |
+| registers per thread | 94 |
+| SM frequency | 2.14 GHz |
+
+**Both throughputs are ~11%.** Section 6z read "SM throughput 10.6%" as evidence
+the kernel was DRAM-bound and concluded that "for this kernel, time and achieved
+bandwidth are the same measurement". That inference does not survive the
+counters: a kernel at 11% of memory peak is nowhere near a bandwidth wall. Low
+compute AND low memory throughput at 25% occupancy is the LATENCY-bound
+signature. The 186.6 vs 210.7 GB/s figures were always DERIVED (time x analytic
+bytes), never counted, so they measured the time difference and renamed it
+bandwidth; they cannot also explain it.
+
+**The geometry says why.** GB10 has 48 SMs and 102400 bytes of shared memory per
+SM. The kernel takes 32768 bytes per block, so 102400/32768 = 3 blocks per SM,
+which is exactly the reported shared-memory block limit and caps occupancy at
+25%. The launch is `grid=144`, `block=128`, and 48 x 3 = 144: **the grid is a
+persistent single wave sized to the device.**
+
+That invalidates the per-unit-work normalisation in 6x. The "38.9 vs 40.6 blocks
+per launch" are work items each CTA LOOPS OVER, not parallel blocks -- the grid
+is a fixed 144 CTAs in both arms. So "4.21 vs 3.73 us per block" divided by the
+wrong denominator: more work items do not add parallel work, they add loop
+iterations spread over the same 144 CTAs. With a persistent grid the cost is set
+by the CTA with the MOST work, and `ncu` flags exactly that -- "avoid possible
+load imbalances due to highly different execution durations per [block]" -- along
+with uncoalesced access, 20.2 of 32 bytes per global load sector and 31.9 of 32
+per store.
+
+**Two consequences, and the second is the more valuable one.**
+
+1. The us/block gap is not established. Re-deriving it needs max-work-per-CTA,
+   not total work over block count.
+2. **The kernel has ~9x of absolute headroom on this device and BOTH engines
+   leave it on the table.** Occupancy is capped at 3 blocks/SM purely by a 32 KB
+   shared-memory budget that Marlin computes as
+   `max_shared_mem / blocks_per_sm - 1024`. This is not a parity lever -- upstream
+   pays it identically -- it is a BEST-IN-CLASS lever, which is the standing
+   goal. Getting under 25600 bytes would allow 4 blocks/SM.
+
+**Open, and honest about it:** this measures UPSTREAM standalone. The comparison
+this unblocks -- our kernel through the same harness on identical routing input,
+counters side by side -- is NOT yet run, so no claim about the 3.4% gap changes
+on this evidence. What changes is the ATTRIBUTION of the residual: "achieved
+memory bandwidth" is refuted as its cause, and the mechanism is latency at 25%
+occupancy in a one-wave persistent grid.
+
+The synthetic router draws uniformly over 256 experts, which yields 61 occupied
+blocks against the 38.9-40.6 the model produces (real routing over 9 near-identical
+spec-decode tokens is far more concentrated). Absolute us/call from this harness
+is therefore NOT comparable to the in-situ numbers; the static geometry, occupancy
+and throughput percentages are, since they do not depend on the routing draw.
 
 ## 7. Evidence, authority, stop conditions
 

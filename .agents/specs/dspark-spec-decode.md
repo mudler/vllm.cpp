@@ -1844,15 +1844,32 @@ driver. Blocks are what `num_tokens_past_padded` reports and experts are what th
 kernel streams; with `block_size_m = 8` and correlated spec-decode tokens, one
 expert routinely spans several blocks, so the two numbers come apart.
 
-Apply the model to the recorded in-situ launches: ours 164.0 us implies ~30
-distinct experts, upstream 151.6 us implies ~28. **A difference of about two
-distinct experts per launch reproduces the entire 8.2% with ZERO implementation
-difference**, and 6ae has already shown that at matched work the two kernels are
-the same to 0.27%.
+**Applying the model to the recorded in-situ launches requires care, and my
+first pass got it backwards.** 6y already measured both sides for the same
+prompt: ours 311.2 padded tokens / 38.9 blocks per call, upstream 324.8 / 40.6.
+At M=9 those 72 (token, expert) pairs spread over ~39 experts at under 8 tokens
+each, so `moe_align` emits ONE block per expert and **blocks and distinct
+experts coincide at this shape** -- that measurement was already counting
+experts. So upstream touches MORE distinct experts (40.6 vs 38.9) and is still
+faster, exactly as 6y concluded. The routing explanation stays refuted; an
+earlier draft of this section inferred ours touched ~30 against upstream's ~28
+by inverting the model, which the measured counts in this same file contradict.
 
-That also explains why both in-situ arms beat the standalone plateau per block
-(4.21 and 3.73 against ~5.3): in situ, several blocks share an expert, so fewer
-bytes are streamed per block. It was never a sign of anything being wrong.
+**Which leaves a sharp contradiction, and it is the useful output of this
+section.** Standalone at matched work the two kernels are equal to 0.27% (6ae).
+In situ ours does LESS work (38.9 against 40.6 expert-blocks) and takes MORE
+time (164.0 us against 151.6). Both in-situ arms also beat the standalone
+plateau per unit of work (4.21 and 3.73 us against ~5.3). A kernel that is
+identical in isolation cannot be slower in place because of its own code, so the
+deficit belongs to the CONTEXT the kernel runs in, not to the kernel and not to
+the routing. Candidates, in the order their evidence justifies: expert-weight
+residency in situ (this repo has already measured a 20-30% per-GEMM penalty for
+host/ATS-retagged decode weights, and the standalone arm allocates fresh device
+memory that cannot reproduce it), clock and power state across the two runs, and
+overlap with concurrent work on other streams. Note also that the in-situ
+per-launch times come from summed profiler kernel durations while the standalone
+numbers are wall-clock over 80 iterations, so the two bases are not
+interchangeable and the ~5.3-to-4.21 difference may be partly that.
 
 **Consequences.**
 

@@ -20511,3 +20511,37 @@ Does NOT move the e2e ratio (~0.966, wall-clock on matched prompts); it removes
 the attribution of its residual.
 
 Evidence: `dgx.casa:~/work/marlin442/`.
+
+## SPEC-DSPARK / #442: CORRECTION -- ours touches FEWER experts, not more (2026-08-13)
+
+The entry above inferred, from the distinct-experts model, that our in-situ
+launches touch ~30 distinct experts against upstream's ~28 and that this
+explained the 8.2%. That is BACKWARDS, and the counts contradicting it were
+already in this file: the 2026-08-12 both-sides measurement recorded ours 311.2
+padded tokens / 38.9 blocks per call against upstream 324.8 / 40.6.
+
+At M=9 the 72 (token, expert) pairs spread over ~39 experts at under 8 tokens
+each, so moe_align emits ONE block per expert and blocks and distinct experts
+COINCIDE at this shape. That measurement was therefore already counting experts,
+upstream touches MORE of them, and the routing explanation stays refuted exactly
+as it concluded. Blocks and experts do come apart at larger batches (spec §6af
+measures 4.7x divergence at M=64/128), which is why the distinction is worth
+keeping, but it does not apply at the decode shape.
+
+What survives, and it is sharper than what it replaces:
+
+  standalone, matched work   ours == upstream to 0.27%
+  in situ                    ours does LESS work (38.9 vs 40.6 expert-blocks)
+                             and takes MORE time (164.0 vs 151.6 us)
+
+A kernel identical in isolation cannot be slower in place because of its own
+code, so the deficit belongs to the CONTEXT, not the kernel and not the routing.
+Candidates in evidence order: expert-weight residency in situ (this repo has
+measured 20-30% per-GEMM for host/ATS-retagged decode weights, and the
+standalone arm's fresh cudaMalloc cannot reproduce that), clock/power state
+across runs, and overlap with concurrent stream work.
+
+Measurement-base caveat: in-situ per-launch times are summed profiler kernel
+durations, standalone are wall-clock over 80 iterations. Both in-situ arms beat
+the standalone plateau per unit work (4.21 and 3.73 vs ~5.3), which may be partly
+that difference rather than a physical one.

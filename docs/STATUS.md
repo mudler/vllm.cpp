@@ -528,14 +528,22 @@ experts settles it: at M=128, going 137 to 146 blocks (+6.6%) while distinct
 experts doubled cost +46.7% TIME, and cost per DISTINCT EXPERT is flat at
 5.2-5.7 us across the table while cost per block varies 4.7x. Time is
 distinct_experts x 1.125 MiB / ~215 GB/s and blocks are nearly irrelevant, so
-every in-situ comparison normalised by the wrong quantity. Applying that model
-to the recorded launches, ours 164.0 us implies ~30 distinct experts against
-upstream's ~28: about TWO experts per launch reproduces the whole 8.2% with no
-implementation difference. It also explains both arms beating the standalone
-plateau per block (4.21 and 3.73 against ~5.3), since in situ several blocks
-share an expert. Future MoE comparisons must control distinct experts per
-launch, or force both arms onto one token stream. None of this moves the end-
-to-end ~0.966x, which is wall-clock on matched prompts; it removes the
+every in-situ comparison normalised by the wrong quantity. At the M=9 decode shape blocks and distinct experts COINCIDE (72 pairs over
+~39 experts, under 8 each, one block per expert), so the both-sides count
+already measured experts: ours 38.9 against upstream's 40.6. That leaves a
+sharp contradiction rather than an explanation. Standalone at matched work the
+kernels are equal to 0.27%; in situ ours does LESS work and takes MORE time
+(164.0 us against 151.6). A kernel identical in isolation cannot be slower in
+place because of its own code, so the deficit belongs to the CONTEXT, not the
+kernel and not the routing. Candidates in evidence order: expert-weight
+residency in situ, where this repo has already measured 20-30% per GEMM for
+host/ATS-retagged decode weights and the standalone arm's fresh cudaMalloc
+cannot reproduce it; clock and power state across runs; and overlap with
+concurrent stream work. Measurement bases differ too, in-situ being summed
+profiler durations against standalone wall-clock. Future MoE comparisons must
+control distinct experts per launch or force both arms onto one token stream,
+since blocks and experts diverge 4.7x at larger batches. None of this moves
+the end-to-end ~0.966x, which is wall-clock on matched prompts; it removes the
 attribution of its residual. One trap worth carrying: dram__bytes.sum reads
 n/a on GB10, so ncu's Memory Throughput % excludes DRAM traffic and is not a
 bandwidth utilisation. Weight

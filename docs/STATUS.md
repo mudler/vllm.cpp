@@ -34,6 +34,22 @@ attributed rather than withdrawn (our engine is unchanged by the advance, and
 the two oracles tie in speed where that was checked); a re-benchmark at the pin
 is pending and blocked on [#522](https://github.com/mudler/vllm.cpp/issues/522).
 
+**Clock attribution (`BENCH-ASSERT-CLOCK-STATE`, ACTIVE, 2026-08-12,
+[#543](https://github.com/mudler/vllm.cpp/issues/543)):** the SM clock on
+`dgx.casa` differs BETWEEN BOOTS without throttling — a 12.79% delta repriced a
+byte-identical `marlin::Marlin` by +9.65%, larger than either deficit that
+comparison ranked. The harness now records the clock window, `clocks.max.sm`,
+the applications clock, the active throttle reasons, persistence mode and the
+**boot id** per leg, refuses a cross-boot pair, and voids a run whose window was
+over-spread or barely observed — a single busy sample scores a perfect 0.00%
+spread, so the retained sample count and the busy fraction are floored and
+printed. The cross-boot override waives the boot id and nothing else: the GPU,
+driver and clock ceilings are compared across the arms either way
+([spec](../.agents/specs/bench-assert-clock-state.md)). Every speed figure
+recorded before this date predates the assertion: not withdrawn, not restated,
+but carrying no clock attribution. The first attributable grid is pending on the
+box lock and on [#545](https://github.com/mudler/vllm.cpp/issues/545).
+
 ## Capability status
 
 Cold start: `MEASURED`. Load (#150): 27B bf16 loads **1.54x warm / 1.61x cold**, moving

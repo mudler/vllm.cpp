@@ -19,10 +19,66 @@ if ($ArtifactId -ne "windows-x86_64-msvc-$Backend") {
 }
 function Invoke-Checked {
     param([Parameter(Mandatory)][string]$Program,
-          [Parameter(Mandatory)][string[]]$Arguments)
-    & $Program @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Program exited with status $LASTEXITCODE"
+          [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
+          [scriptblock]$Runner)
+    if ($null -eq $Runner) {
+        & $Program @Arguments
+        $exitCode = $LASTEXITCODE
+    } else {
+        $exitCode = [int](& $Runner $Program $Arguments)
+    }
+    if ($exitCode -ne 0) {
+        throw "$Program exited with status $exitCode"
+    }
+}
+
+# Most of this script's checked invocations run a test executable that takes no
+# arguments, so `Invoke-Checked` must bind an explicitly empty argument list and
+# still forward it verbatim (#512).
+function Invoke-CheckedContractTests {
+    $calls = [System.Collections.Generic.List[object]]::new()
+    $recorder = {
+        param([string]$Program, [string[]]$Arguments)
+        $calls.Add([pscustomobject]@{
+            Program = $Program
+            Arguments = @($Arguments)
+        }) | Out-Null
+        return 0
+    }.GetNewClosure()
+
+    Invoke-Checked "fake-empty.exe" @() -Runner $recorder
+    Invoke-Checked "fake-args.exe" @("--help", "--verbose") -Runner $recorder
+
+    if ($calls.Count -ne 2) {
+        throw "checked-invocation fake runner was not invoked exactly twice"
+    }
+    if ($calls[0].Program -ne "fake-empty.exe" -or $calls[1].Program -ne "fake-args.exe") {
+        throw "checked invocation did not forward its exact program"
+    }
+    if ($calls[0].Arguments.Count -ne 0) {
+        throw "checked invocation did not forward an explicitly empty argument list"
+    }
+    if ($calls[1].Arguments.Count -ne 2 -or
+        $calls[1].Arguments[0] -ne "--help" -or
+        $calls[1].Arguments[1] -ne "--verbose") {
+        throw "checked invocation did not forward its exact argument list"
+    }
+
+    $failing = { param([string]$Program, [string[]]$Arguments) return 3 }
+    foreach ($rejectedName in @("empty", "non-empty")) {
+        $rejected = $false
+        try {
+            if ($rejectedName -eq "empty") {
+                Invoke-Checked "fake-fail.exe" @() -Runner $failing
+            } else {
+                Invoke-Checked "fake-fail.exe" @("--help") -Runner $failing
+            }
+        } catch {
+            $rejected = $true
+        }
+        if (-not $rejected) {
+            throw "nonzero $rejectedName-argument exit status was accepted"
+        }
     }
 }
 
@@ -157,6 +213,7 @@ function Invoke-UnsupportedTierContractTests {
 }
 
 if ($ContractTest) {
+    Invoke-CheckedContractTests
     Invoke-CrtContractTests
     Invoke-UnsupportedTierContractTests
     Write-Host "Windows PowerShell/CRT contract tests OK"

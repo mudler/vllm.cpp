@@ -51,10 +51,18 @@ namespace {
 // staging directory name by hand, which meant two env vars —
 // `VT_NEMOTRON35_SNAPSHOT` there, `CHECKPOINT_ROOT` here — reached one
 // checkpoint and neither refused a revision the goldens were not captured
-// against. Both spellings now go through that resolver, which gates the staged
-// `local_dir` on its own `.cache/huggingface/trees/<revision>.json` manifest, so
-// a re-download landing a different revision under the identical path SKIPS
-// here rather than being silently substituted.
+// against. Both spellings now go through that resolver.
+//
+// GATE-SNAPSHOT-CONTENT-PIN (#569). That resolver gates the staged `local_dir`
+// on the per-file `.cache/huggingface/download/<file>.metadata` sidecars, whose
+// first line is the revision the bytes were downloaded at, so a re-download
+// landing a different revision under the identical path SKIPS here rather than
+// being silently substituted. It used to gate on the presence of
+// `.cache/huggingface/trees/<revision>.json`, which records only that the
+// revision was fetched here once and is never deleted when a later one lands.
+// The resolver now hands back the reason it refused, and the banner below prints
+// it verbatim -- a skip that does not say WHICH file named WHICH revision gets
+// re-run instead of investigated.
 //
 // HOW TO MAKE THIS ARM RUN. `CHECKPOINT_ROOT` is a `.env` key, and `.env` is not
 // exported into a login shell by anything: `.env.example:8` documents the loader
@@ -65,12 +73,13 @@ namespace {
 // has not sourced it SKIPS this arm, which is correct behavior and not a pass —
 // the banner below names the exact export.
 std::string CheckpointFile(const char* filename) {
-  const std::string snapshot = parity::Nemotron35LightningSnapshot();
+  std::string why;
+  const std::string snapshot = parity::Nemotron35LightningSnapshot(&why);
   if (snapshot.empty()) {
     SkipGate(
         std::string("no pinned Nemotron-3.5-Lightning snapshot, so ") +
-        filename +
-        " cannot be located.\n"
+        filename + " cannot be located.\n*** REFUSED BECAUSE: " + why +
+        "\n"
         "*** To RUN this arm, load the repo env first — `.env.example:8`\n"
         "***   documents exactly this:\n"
         "***       set -a; . ./.env; set +a\n"
@@ -81,10 +90,11 @@ std::string CheckpointFile(const char* filename) {
         "***   $CHECKPOINT_ROOT/" +
         parity::kNemotron35LightningLocalDirName +
         "/{config,hf_quant_config}.json — no weights, no GPU.\n"
-        "***   A staged directory that IS present skips too unless it carries\n"
-        "***   .cache/huggingface/trees/" +
+        "***   A staged directory that IS present skips too unless EVERY file\n"
+        "***   in it records revision " +
         parity::kNemotron35LightningNvfP4Revision +
-        ".json,\n"
+        "\n"
+        "***   on line 1 of its .cache/huggingface/download/<file>.metadata —\n"
         "***   the revision the committed goldens were captured against.");
   }
   const std::filesystem::path p = std::filesystem::path(snapshot) / filename;

@@ -30,6 +30,68 @@ single pair is an anecdote.
 Prefer an instrument that is immune to page-cache effects (GPU-active time per
 step) over wall clock when the host is doing heavy I/O.
 
+## The clock is part of the measurement
+
+**The SM clock differs between boots and does not announce it.** On `dgx.casa`
+one boot ran the timed window at a median 2470 MHz and the next at a flat
+2190 — a 12.79% delta, with `clocks_throttle_reasons.active = 0x0` and
+persistence `Enabled` throughout, so nothing looked wrong. It repriced a
+byte-identical `marlin::Marlin` with no source change by **+9.65%**, which is
+larger than either deficit that comparison was being used to rank (#543). Two
+probes eight minutes apart *inside one boot* disagreed by ~6% uniformly.
+
+So a number is quotable only with the clock it was taken at.
+`tools/bench/gpu_clock_state.py` is the one helper that samples, folds and
+asserts it: the SM clock across the measured window (min/median/max, the
+retained sample count and the idle count), `clocks.max.sm`,
+`clocks.applications.graphics`, the active throttle reasons, persistence mode,
+and the **boot id**.
+
+**Only one harness calls it today.** `scripts/dgx-online-serving.sh` records a
+clock window per leg, and `tools/bench/online_gate_summary.py` asserts it. The
+trace and per-kernel harnesses — `finalize_*_trace.py`,
+`summarize_torch_kernels.py`, `gdn_packed_component.py` — are **not wired**, so
+a `us/call` or per-kernel figure from those paths carries **no clock
+attribution** and cannot be quoted as one. That is not a footnote: it is the
+path both retracted #543 findings came from. Wiring them is owed work tracked in
+[`specs/bench-assert-clock-state.md`](specs/bench-assert-clock-state.md); until
+it lands, import the helper and record a window yourself before ranking anything
+from a trace, or say plainly that the figure is unattributed. Any new harness
+imports this helper rather than rolling its own.
+
+Two arms on **different boots are not comparable**. The summary refuses that
+pair outright; `--allow-cross-boot` waives the **boot id and nothing else**, and
+stamps a recorded caveat rather than passing silently — the GPU, driver, maximum
+SM clock, applications clock and persistence mode are compared across the arms
+unconditionally, because a waived boot is not a waived machine. Within a run the
+SM-clock spread must stay at or below **5%**, and the two arms' medians within
+**1%** of each other. A window must also have been **observed**: at least **30
+retained busy samples** and a **majority** of the window busy, because the
+spread over one sample is definitionally 0.00% — the best score the gate can
+award — so without a floor the window nobody watched outscores the one that was.
+The argument for all four numbers, including why the spread ceiling is
+deliberately *not* held to the criterion the offset was chosen by, is in
+[`specs/bench-assert-clock-state.md`](specs/bench-assert-clock-state.md).
+
+**Pin the clocks before measuring, under the lock.** Passwordless `sudo` is
+available on `dgx`, and `-lgc` is supported:
+
+```sh
+sudo nvidia-smi -lgc 2100        # pin, before the first leg
+sudo nvidia-smi -rgc             # release, after the last one
+```
+
+Pinning is a **shared-host mutation**. Never run `-lgc` or `-rgc` while another
+session holds `$HOME/gpu.lock` — it silently reprices their in-flight
+measurement, which is the very defect this section exists for. Take the lock,
+pin, measure, reset, release. It is a **pre-measurement step**, not a standing
+configuration: leaving the box pinned makes every later run inherit a state
+nobody recorded, which is where this started.
+
+Figures recorded before 2026-08-12 predate clock assertion. They are not
+withdrawn and are not restated — they simply carry no clock attribution, so a
+delta smaller than ~10% between two of them is not established by them alone.
+
 Budget the disk before the run. A production RelWithDebInfo CUDA build tree is
 about **169 GiB** — the build contract claimed ~3 GiB until 2026-08-10, a 56x
 underestimate on the one number that decides whether a grid fits. A full disk
@@ -60,7 +122,8 @@ tool on the same workload and compare what actually ran.
 
 Record the exact build and run recipe, revisions, model hashes, environment,
 clock and contention state, raw output, and the same-binary A/B. Reproduce on an
-idle box before acceptance.
+idle box before acceptance. "Clock state" is the concrete list in §The clock is
+part of the measurement, boot id included, not a prose adjective.
 
 Record every required axis — throughput, latency, memory — as both values and
 ratios. An axis below floor is an open gap, not a rounding error.

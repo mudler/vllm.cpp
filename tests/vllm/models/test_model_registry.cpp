@@ -44,10 +44,10 @@ HfConfig Config(std::vector<std::string> architectures) {
 
 TEST_CASE("registry_imports: every registered architecture has a complete factory") {
   const auto registrations = ModelRegistry::Registrations();
-  // 30 text archs + the 3 Parakeet transcription-only archs (ARCH-ONE-SURFACE
+  // 34 text archs + the 3 Parakeet transcription-only archs (ARCH-ONE-SURFACE
   // ROW 1: ParakeetForCTC/ForRNNT/ForTDT, SupportsTranscription mirror) + the
   // LlamaModel embedding arch (ARCH-ONE-SURFACE ROW 6, is_pooling_model).
-  REQUIRE(registrations.size() == 37);
+  REQUIRE(registrations.size() == 38);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -139,7 +139,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 37);
+  REQUIRE(supported.size() == 38);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -169,6 +169,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "MistralForCausalLM",
       "MuseGlimmerForCausalLM",
       "MuseGlimmerForConditionalGeneration",
+      "NemotronHForCausalLM",
       "OPTForCausalLM",
       "Olmo2ForCausalLM",
       "Olmo3ForCausalLM",
@@ -241,6 +242,16 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
       // registrations (Kimi-K3 = KDA+MLA hybrid backbone + MoonViT-V2 vision).
       CHECK(registration.info.is_hybrid);
       CHECK(registration.info.supports_multimodal);
+    } else if (registration.architecture == "NemotronHForCausalLM") {
+      // Nemotron-H (MODEL-NEMOTRON-H W3, #517): text-only HYBRID -- 23 Mamba2
+      // layers carry a recurrent-state KV group alongside 6 GQA full-attention
+      // layers. Upstream's class carries HasInnerState + IsHybrid
+      // (nemotron_h.py:700-712); has_inner_state stays false here under the
+      // blanket assertion above, following the kQwen3_5Info / kKimiLinearInfo
+      // convention (our ModelInfo is a consumed subset whose only reader
+      // short-circuits on is_hybrid). Text-only: no vision or audio tower.
+      CHECK(registration.info.is_hybrid);
+      CHECK_FALSE(registration.info.supports_multimodal);
     } else if (registration.architecture == "KimiLinearForCausalLM") {
       // Kimi-Linear-48B-A3B: text-only HYBRID (20 KDA linear-attn layers ⇒ a GDN
       // recurrent-state KV group + 7 NoPE-MLA layers) — is_hybrid YES,
@@ -579,7 +590,7 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 37> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 38> kExampleConfigArchitectures{
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       "DeepseekV4ForCausalLM",
@@ -603,6 +614,7 @@ TEST_CASE("hf_registry_coverage: every registration has an example config fixtur
       "MistralForCausalLM",
       "MuseGlimmerForCausalLM",
       "MuseGlimmerForConditionalGeneration",
+      "NemotronHForCausalLM",
       "OPTForCausalLM",
       "Olmo2ForCausalLM",
       "Olmo3ForCausalLM",
@@ -696,6 +708,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'LagunaForCausalLM', "
       "'LlamaForCausalLM', 'LlamaModel', "
       "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', 'MuseGlimmerForCausalLM', 'MuseGlimmerForConditionalGeneration', "
+      "'NemotronHForCausalLM', "
       "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
       "'ParakeetForCTC', 'ParakeetForRNNT', 'ParakeetForTDT', "
       "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "
@@ -718,6 +731,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'LagunaForCausalLM', "
       "'LlamaForCausalLM', 'LlamaModel', "
       "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', 'MuseGlimmerForCausalLM', 'MuseGlimmerForConditionalGeneration', "
+      "'NemotronHForCausalLM', "
       "'OPTForCausalLM', 'Olmo2ForCausalLM', 'Olmo3ForCausalLM', "
       "'ParakeetForCTC', 'ParakeetForRNNT', 'ParakeetForTDT', "
       "'Phi3ForCausalLM', 'PhiForCausalLM', 'Qwen3ForCausalLM', "

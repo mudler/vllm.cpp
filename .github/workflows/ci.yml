@@ -412,10 +412,11 @@ jobs:
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
   pr-size:
     # PR-only. The per-class LINE BUDGETS this job used to enforce were retired
-    # 2026-08-10 (see scripts/check-pr-size.py); the job name is kept because it
-    # is a required check. What it enforces now: explicit path classification,
-    # the fail-closed binary guard, the checker-change mutation-evidence
-    # contract, and the role check that keeps product paths on a PR.
+    # 2026-08-10, and the fail-closed BINARY GUARD was retired 2026-08-13 (see
+    # scripts/check-pr-size.py for both); the job name is kept because it is a
+    # required check. What it enforces now: explicit path classification, the
+    # checker-change mutation-evidence contract, and the role check that keeps
+    # product paths on a PR. Nothing here measures the size of a diff.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:

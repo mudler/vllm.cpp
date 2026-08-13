@@ -93,7 +93,7 @@ are `VOID`; no product behavior changed.
 
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by
-`scripts/check-supported-models.py` (+ mutation test), so the 30
+`scripts/check-supported-models.py` (+ mutation test), so the 37
 `REGISTER_VLLM_MODEL` architectures and the FEATURES rows cannot drift.
 
 GCC 12 production-library maintenance (2026-07-31): the two known `-Werror`

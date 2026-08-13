@@ -284,3 +284,163 @@ TEST_CASE("the ROCm platform self-registers and is selected over CPU") {
   // is the reminder to update it deliberately.
   CHECK(rocm.get_attn_backend_priority({}).empty());
 }
+
+// Mirrors "CUDA backend: graph capture/replay re-executes captured ops" in
+// tests/vt/test_cuda_backend.cpp assertion for assertion. Same shape, same
+// persistent-buffer contract, hipGraph underneath.
+//
+// Step 5 is the load-bearing one and the reason this test exists. Replaying
+// must RE-EXECUTE the captured copy over the persistent buffers, not replay a
+// snapshot of their contents — that is precisely how a decode graph picks up
+// each new token's inputs. A capture that bakes values instead of addresses
+// passes step 4 and fails step 5, which is the silent-correctness-bug shape
+// rocm_backend.hip's scope note warns about.
+TEST_CASE("ROCm backend: graph capture/replay re-executes captured ops") {
+  if (NoDevice()) return;
+  Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  CHECK(rocm.SupportsGraphCapture());
+
+  Queue q = rocm.CreateQueue();
+  constexpr size_t kBytes = 64 * 1024;
+
+  // Allocated ONCE; the pointers stay fixed across every replay below. Only
+  // their CONTENTS change — the capture contract.
+  void* src = rocm.Alloc(kBytes);
+  void* dst = rocm.Alloc(kBytes);
+
+  std::vector<unsigned char> pattern_a(kBytes, 0x11);
+  std::vector<unsigned char> pattern_b(kBytes, 0x22);
+  std::vector<unsigned char> back(kBytes, 0);
+
+  rocm.Copy(q, src, pattern_a.data(), kBytes);
+  rocm.Memset(q, dst, 0, kBytes);
+  rocm.Synchronize(q);
+
+  // Recorded, NOT executed: dst must still be zero after EndCapture.
+  rocm.BeginCapture(q);
+  rocm.Copy(q, dst, src, kBytes);
+  rocm.EndCapture(q);
+  rocm.Copy(q, back.data(), dst, kBytes);
+  rocm.Synchronize(q);
+  CHECK(back.front() == 0x00);
+
+  // Replay #1 -> pattern A. Proves the graph ran at all.
+  rocm.Replay(q);
+  rocm.Synchronize(q);
+  rocm.Copy(q, back.data(), dst, kBytes);
+  rocm.Synchronize(q);
+  CHECK(back.front() == 0x11);
+  CHECK(back.back() == 0x11);
+
+  // Mutate src in place (SAME address) -> replay must observe the new contents.
+  rocm.Copy(q, src, pattern_b.data(), kBytes);
+  rocm.Replay(q);
+  rocm.Synchronize(q);
+  rocm.Copy(q, back.data(), dst, kBytes);
+  rocm.Synchronize(q);
+  CHECK(back.front() == 0x22);
+  CHECK(back.back() == 0x22);
+
+  // Handle variant — the path decode graphs actually take, since they keep one
+  // exec per padded batch size rather than a single stored graph. Captures
+  // into a DIFFERENT destination (dst2) than the stored-graph path above
+  // (dst), not the same op replayed twice: a mutation that returns the stale
+  // member exec_ (still the stored-graph path's Copy(dst, src)) instead of the
+  // freshly captured local exec must be distinguishable from the correct
+  // behaviour, and only fails here because the two graphs write different
+  // buffers.
+  void* dst2 = rocm.Alloc(kBytes);
+  rocm.Copy(q, src, pattern_a.data(), kBytes);
+  rocm.Memset(q, dst2, 0, kBytes);
+  rocm.Synchronize(q);
+
+  rocm.BeginCapture(q);
+  rocm.Copy(q, dst2, src, kBytes);
+  void* graph = rocm.EndCaptureGraph(q);
+  REQUIRE(graph != nullptr);
+
+  rocm.ReplayGraph(q, graph);
+  rocm.Synchronize(q);
+  rocm.Copy(q, back.data(), dst2, kBytes);
+  rocm.Synchronize(q);
+  CHECK(back.front() == 0x11);
+
+  rocm.Copy(q, src, pattern_b.data(), kBytes);
+  rocm.ReplayGraph(q, graph);
+  rocm.Synchronize(q);
+  rocm.Copy(q, back.data(), dst2, kBytes);
+  rocm.Synchronize(q);
+  CHECK(back.front() == 0x22);
+  CHECK(back.back() == 0x22);
+
+  rocm.DestroyGraph(graph);
+  rocm.Free(src);
+  rocm.Free(dst);
+  rocm.Free(dst2);
+  rocm.DestroyQueue(q);
+}
+
+// The capture contract's allocation clause, asserted rather than assumed
+// (.agents/specs/rocm-decode-graph.md D1). hipBLASLt sizes its workspace lazily
+// inside the GEMM path — LtWorkspace() in rocm_matmul_hipblaslt.hip does
+// hipFree+hipMalloc when a shape needs more than the current high-water mark —
+// and hipblasCreate() likewise initialises on first use. Both are illegal
+// mid-capture.
+//
+// MEASURED on gfx1200 during W1: capturing a cold GEMM fails loudly, with
+// `hipMalloc: operation not permitted when stream is capturing` (and hipFree,
+// and hipblasCreate INTERNAL_ERROR) — never silent corruption. Running the
+// identical GEMM once beforehand grows the workspace and creates the handle, so
+// the in-capture call is a pure pool hit.
+//
+// This case pins the MITIGATION, not the hazard: it asserts that a pre-warmed
+// GEMM captures and replays correctly. Deliberately not asserting that the cold
+// path throws — a future capture-safe allocator would be an improvement, and a
+// test that forbade it would be a ratchet in the wrong direction.
+TEST_CASE("ROCm backend: a pre-warmed GEMM captures and replays") {
+  if (NoDevice()) return;
+  Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  if (!rocm.SupportsGraphCapture()) return;
+
+  Queue q = rocm.CreateQueue();
+  const Device dev{DeviceType::kROCM, 0};
+  constexpr int kM = 1, kN = 2048, kK = 2048;  // a decode-shaped GEMM
+
+  const std::vector<float> ha(kM * kK, 0.01f);
+  const std::vector<float> hb(kN * kK, 0.02f);
+  const float expect = 0.01f * 0.02f * static_cast<float>(kK);
+
+  void* da = rocm.Alloc(ha.size() * sizeof(float));
+  void* db = rocm.Alloc(hb.size() * sizeof(float));
+  void* dc = rocm.Alloc(kM * kN * sizeof(float));
+  rocm.Copy(q, da, ha.data(), ha.size() * sizeof(float));
+  rocm.Copy(q, db, hb.data(), hb.size() * sizeof(float));
+  rocm.Synchronize(q);
+
+  Tensor ta = Tensor::Contiguous(da, DType::kF32, dev, {kM, kK});
+  Tensor tb = Tensor::Contiguous(db, DType::kF32, dev, {kN, kK});
+  Tensor tc = Tensor::Contiguous(dc, DType::kF32, dev, {kM, kN});
+
+  // Pre-warm: grows LtWorkspace's cap and creates the hipBLAS handle.
+  vt::MatmulBT(q, tc, ta, tb);
+  rocm.Synchronize(q);
+  rocm.Memset(q, dc, 0, kM * kN * sizeof(float));
+  rocm.Synchronize(q);
+
+  rocm.BeginCapture(q);
+  vt::MatmulBT(q, tc, ta, tb);
+  rocm.EndCapture(q);
+
+  rocm.Replay(q);
+  rocm.Synchronize(q);
+  std::vector<float> back(kM * kN, 0.0f);
+  rocm.Copy(q, back.data(), dc, back.size() * sizeof(float));
+  rocm.Synchronize(q);
+  CHECK(back.front() == doctest::Approx(expect).epsilon(0.01));
+  CHECK(back.back() == doctest::Approx(expect).epsilon(0.01));
+
+  rocm.Free(da);
+  rocm.Free(db);
+  rocm.Free(dc);
+  rocm.DestroyQueue(q);
+}

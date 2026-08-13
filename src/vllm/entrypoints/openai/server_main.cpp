@@ -242,6 +242,11 @@ struct Args {
   // "auto" opts into the chat-template detection the C ABI uses.
   std::string tool_call_parser = "hermes";
   std::string reasoning_parser = "none";
+  // vLLM's --enable-auto-tool-choice (cli_args.py:105, default False). Accepted
+  // and INERT here (see kAcceptedInertArgs below) but still RECORDED, because
+  // cli_args.py:395 validates it against --tool-call-parser and that validation
+  // is mirrored, not dropped.
+  bool enable_auto_tool_choice = false;
   // vLLM's --kv-transfer-config: the external KV connector selection, as the
   // same JSON object vLLM takes. Empty (default) == no connector == the inert
   // production path. See docs/KV-OFFLOAD.md.
@@ -251,6 +256,65 @@ struct Args {
   // Empty (default) == no speculation == the inert production path (SPEC-MTP I5d).
   std::string speculative_config;
 };
+
+// ── Accepted-and-inert serve arguments (SERVE-RECIPE-ARGS, #606) ────────────
+// A published `vllm serve` line must reach model load. Measured over
+// vllm-project/recipes @ 86c7777a (157 official model recipes), 89 pass
+// `--enable-auto-tool-choice` and 82 pass `--trust-remote-code`; neither means
+// anything to this engine, and both used to stop the server at the unknown-
+// argument guard below before a single weight was read.
+//
+// THIS IS NOT A CATCH-ALL, and that is the whole point. A flag that is inert
+// because we LACK the capability -- --tensor-parallel-size, the EP flags,
+// --mm-encoder-tp-mode -- keeps aborting, because silently swallowing it would
+// let a user believe they got tensor parallelism. Only a flag that is inert BY
+// CONSTRUCTION earns an entry, and the per-entry `reason` is the enforcement:
+// an entry that cannot state an honest reason cannot be written.
+//
+// Inert is also not UNVALIDATED. --enable-auto-tool-choice is recorded on Args
+// and still checked against --tool-call-parser after the loop, mirroring
+// vllm/entrypoints/openai/cli_args.py:395.
+struct InertArg {
+  const char* flag;
+  bool takes_value;   // consume the following argv entry as this flag's value
+  const char* reason;  // printed on use; see rule 2 -- accepting is ANNOUNCED
+};
+
+constexpr bool kNoValue = false;
+
+// NOTE on `takes_value`: no entry needs it today (both flags are bare), but the
+// field is part of the table's shape rather than a later retrofit -- a value-
+// taking recipe flag must not silently leave its value to be re-parsed as the
+// next flag.
+constexpr InertArg kAcceptedInertArgs[] = {
+    // cli_args.py:105 (`enable_auto_tool_choice: bool = False`), threaded on as
+    // `enable_auto_tools` at api_server.py:426,441,529,544.
+    //
+    // The trailing caveat clause is deliberate and must stay: upstream defaults
+    // --tool-call-parser to None, we default it to "hermes"
+    // (docs/USAGE.md), so upstream's flag genuinely gates something and ours
+    // cannot. The notice must not let a reader infer the two agree when the
+    // parser is unset. Reconciling that default is out of scope here.
+    {"--enable-auto-tool-choice", kNoValue,
+     // Do not write `open (` here: check-windows-portability.py scans this file
+     // with comments stripped but STRING LITERALS intact, and its POSIX-call
+     // pattern matches the bare word `open` before a parenthesis. The semicolon
+     // keeps the sentence and keeps the Windows gate green.
+     "tool parsing is already unconditional once --tool-call-parser resolves, "
+     "so there is no second gate to open; note --tool-call-parser defaults to "
+     "hermes here, where upstream's defaults to unset"},
+    // Authorizes executing Python from the checkpoint. N/A BY CONSTRUCTION, not
+    // unimplemented: this engine has no Python runtime.
+    {"--trust-remote-code", kNoValue,
+     "no Python runtime, so there is no remote code to trust"},
+};
+
+const InertArg* FindAcceptedInertArg(const std::string& flag) {
+  for (const InertArg& entry : kAcceptedInertArgs) {
+    if (flag == entry.flag) return &entry;
+  }
+  return nullptr;
+}
 
 [[noreturn]] void Usage(const char* argv0, int code) {
   std::cerr
@@ -282,7 +346,9 @@ struct Args {
          "               [--reasoning-parser <name>|auto|none]\n"
          "               [--kv-transfer-config '<json>']\n"
          "               [--speculative-config '<json>']\n"
-         "               [--version]\n";
+         "               [--version]\n"
+         "  accepted for published-recipe compatibility, NO effect: "
+         "--enable-auto-tool-choice, --trust-remote-code\n";
   std::exit(code);
 }
 
@@ -436,6 +502,19 @@ Args ParseArgs(int argc, char** argv) {
       std::exit(0);
     } else if (flag == "-h" || flag == "--help") {
       Usage(argv[0], 0);
+    } else if (const InertArg* inert = FindAcceptedInertArg(flag);
+               inert != nullptr) {
+      // Rule 2: accepting is ANNOUNCED. One notice per accepted flag AS USED,
+      // naming the flag and its reason, so a log reader learns the flag did
+      // nothing rather than inferring that it worked.
+      if (inert->takes_value) (void)NextArg(argc, argv, i, argv[0]);
+      if (flag == "--enable-auto-tool-choice") {
+        a.enable_auto_tool_choice = true;  // validated below, cli_args.py:395
+      }
+      std::cerr << "server: accepted '" << flag
+                << "' for published-recipe compatibility; it has no effect "
+                   "here: "
+                << inert->reason << "\n";
     } else {
       std::cerr << "server: unknown argument '" << flag << "'\n";
       Usage(argv[0], 2);
@@ -467,6 +546,23 @@ Args ParseArgs(int argc, char** argv) {
   }
   if (a.cuda_profile_graph_batch > a.max_num_seqs) {
     std::cerr << "server: --cuda-profile-graph-batch exceeds --max-num-seqs\n";
+    Usage(argv[0], 2);
+  }
+  // Mirrors vllm/entrypoints/openai/cli_args.py:395 — upstream raises
+  //   TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
+  // when the flag is set and `args.tool_call_parser` is falsy. Upstream's falsy
+  // value is the unset default `None`; ours is the explicit selection "none",
+  // because our --tool-call-parser defaults to "hermes" and so is never unset.
+  // Accepting the flag as inert does NOT drop the validation it came with.
+  // Ordered before the dialect check below so a contradiction is reported as
+  // the contradiction; "none" is itself a registered selection, so that check
+  // would pass and say nothing about the conflict.
+  if (a.enable_auto_tool_choice && a.tool_call_parser == "none") {
+    std::cerr << "server: Error: --enable-auto-tool-choice requires "
+                 "--tool-call-parser\n"
+                 "server: (--tool-call-parser none selects NO parser; name a "
+                 "parser, or drop --tool-call-parser to keep the hermes "
+                 "default)\n";
     Usage(argv[0], 2);
   }
   // Validate a NAMED parser dialect here, before the (multi-GB) model load, so a

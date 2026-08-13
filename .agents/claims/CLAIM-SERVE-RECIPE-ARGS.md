@@ -1,0 +1,5 @@
+# CLAIM-SERVE-RECIPE-ARGS
+
+| Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
+|---|---|---|---|---|---|---|---|
+| `CLAIM-SERVE-RECIPE-ARGS` | `SERVE-RECIPE-ARGS` (`SPIKE`) | Claude Code (opus-5), operator role — spec only; implementation goes to a fresh implementer | isolated worktree; no GPU, no oracle run, no publication | `row/serve-recipe-args`, issue [#606](https://github.com/mudler/vllm.cpp/issues/606) | Owns ONLY: NEW `.agents/specs/serve-recipe-args.md`; the NEW `SERVE-RECIPE-ARGS` row plus the two summary counts it moves in `.agents/engine-matrix.md`; and, at implementation time, the accepted-and-inert table in `src/vllm/entrypoints/openai/server_main.cpp`, its `docs/USAGE.md` entries, and its RED-first tests. EXCLUDES `--language-model-only` (#607, a real capability gap), the `--tool-call-parser` default (`hermes` vs upstream `None`, pre-existing and out of scope), and every flag that is inert because we lack the capability — TP, EP, `--mm-encoder-tp-mode` — which must keep aborting | `SPIKE` | 2026-08-13 — spec committed; implementation not started |

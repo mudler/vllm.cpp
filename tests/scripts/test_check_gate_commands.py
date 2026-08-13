@@ -333,6 +333,35 @@ class RatchetTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn(command, spec)
 
+    def test_serve_recipe_args_is_credited_for_real_commands(self):
+        # SERVE-RECIPE-ARGS (#606) enters the runnable population by leaving
+        # SPIKE for ACTIVE, which is the first state that puts it in
+        # GATED_STATES at all. The credit is earned the same way the two rows
+        # above earn it: the spec's Gates section names commands that can
+        # actually fail. The second assertion is the one specific to this row --
+        # its gate is CPU-only by construction, so the spec must say why no GPU
+        # or oracle leg is implicated rather than leaving the absence to be read
+        # as an omission.
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("SERVE-RECIPE-ARGS"), "runnable")
+        spec = (ROOT / ".agents/specs/serve-recipe-args.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("scripts/agent-preflight.sh", spec)
+        self.assertIn("No GPU, no oracle run", spec)
+
+    def test_dropping_serve_recipe_args_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved: the entry added
+        # for #606 must be what keeps the exact pin agreeing with the audit.
+        # Remove it and the equality assertion above has to go red, which is
+        # what proves the row was pinned because it entered the population and
+        # not to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"SERVE-RECIPE-ARGS"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"SERVE-RECIPE-ARGS"})
+
     def test_the_baseline_re_pin_is_load_bearing(self):
         # MUTATION: the re-pin that added this row must be what makes the audit
         # agree with the baseline. Drop the entry and the exact-pin assertion

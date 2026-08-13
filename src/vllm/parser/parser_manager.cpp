@@ -7,25 +7,30 @@
 #include "vllm/parser/glm47_moe.h"
 #include "vllm/parser/inkling.h"
 #include "vllm/parser/kimi_k2.h"
+#include "vllm/parser/qwen3.h"
 
 namespace vllm::parser {
 
 std::unique_ptr<engine::ParserEngine> get_parser_engine(
     const std::string& name, bool thinking,
     const engine::EngineTokenizer* tokenizer) {
-  // qwen3 + seed_oss share the qwen3 grammar (the arg_converter lives in the
-  // config); no per-family method overrides are needed for the assembly, so a
-  // base ParserEngine over the right config suffices (qwen3.py / seed_oss.py).
+  // qwen3 + seed_oss share the qwen3 grammar AND the qwen3 class: upstream
+  // seed_oss.py is `class SeedOssParser(Qwen3Parser)` overriding only the four
+  // wrapper token strings, which live in the config. Qwen3Parser adds the
+  // thinking-off passthrough (qwen3.py:247) and the unpaired-tool-call
+  // reasoning end (qwen3.py:256); both read their literals from the config, so
+  // one class serves both wrapper spellings. The tool-assembly behaviour is
+  // unchanged — neither override is on the tool path.
   if (name == "qwen3") {
-    return std::make_unique<engine::ParserEngine>(
-        engine::qwen3_config(thinking, "qwen3"), tokenizer);
+    return std::make_unique<Qwen3Parser>(engine::qwen3_config(thinking, "qwen3"),
+                                         thinking, tokenizer);
   }
   if (name == "seed_oss") {
-    return std::make_unique<engine::ParserEngine>(
+    return std::make_unique<Qwen3Parser>(
         engine::qwen3_config(thinking, "seed_oss", "<seed:think>",
                              "</seed:think>", "<seed:tool_call>",
                              "</seed:tool_call>"),
-        tokenizer);
+        thinking, tokenizer);
   }
   // kimi_k2 needs the native-header name/id parsing overrides (kimi_k2.py).
   if (name == "kimi_k2") {

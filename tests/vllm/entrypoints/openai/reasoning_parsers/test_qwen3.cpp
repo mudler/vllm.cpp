@@ -17,6 +17,20 @@
 //     cannot carry request kwargs (same deviation as deepseek_v3, threading is
 //     W4 in specs/reasoning-parsers.md), so the thinking flag is taken through
 //     the public constructor — the same seam test_deepseek_v3.cpp uses.
+//
+// BEYOND UPSTREAM (written from scratch, no upstream case is dropped — there is
+// none to drop). Upstream's reasoning suite has NO qwen3 `is_reasoning_end`
+// test at all (only test_base_thinking_reasoning_parser.py:111 for the base
+// family), and its thinking-disabled cases run with tool parsing suppressed.
+// The last three TEST_CASEs are therefore ours, and cover branches upstream's
+// fixtures cannot reach:
+//   - "engine thinking-off passthrough survives an unskipped tool" — the
+//     qwen3.py:247 override on the ENGINE, not the adapter.
+//   - "is_reasoning_end (text form, ...)" — the qwen3.py:256 override,
+//     including the reasoning-REOPEN branch (`<tool_call>` then `<think>`).
+//   - "seed_oss inherits the qwen3 thinking-off passthrough" — the shared
+//     class, which only the thinking-off arm can observe.
+// Recorded in .agents/specs/reasoning-parsers.md § Tests to port.
 #include <doctest/doctest.h>
 
 #include <optional>
@@ -28,6 +42,7 @@
 #include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/parser_engine_adapter.h"
 #include "vllm/parser/engine/configs.h"
+#include "vllm/parser/parser_manager.h"
 #include "vllm/parser/qwen3.h"
 
 using namespace vllm::entrypoints::openai;
@@ -263,4 +278,50 @@ TEST_CASE("qwen3: is_reasoning_end (text form, incl. unpaired <tool_call>)") {
   CHECK(p->is_reasoning_end("thinking<tool_call>\n<function=bash>") == true);
   CHECK(p->is_reasoning_end("thinking<tool_call>x</tool_call>") == false);
   CHECK(p->is_reasoning_end("<think>a<tool_call>b") == true);
+  // The three above all put <think> BEFORE the tool-call marker, where the
+  // re-open guard cannot fire. This one puts it AFTER: upstream's backwards walk
+  // (qwen3.py:263-268) tests the reasoning-start id at EVERY index before it
+  // tests the tool-call id, so it meets <think> first and returns False —
+  // reasoning has re-opened and the earlier unpaired <tool_call> no longer ends
+  // it. It is the only assertion here that fails if `ps > p` (qwen3.cpp:55) is
+  // dropped.
+  CHECK(p->is_reasoning_end("<tool_call>x<think>y") == false);
+}
+
+// Upstream seed_oss is `class SeedOssParser(Qwen3Parser)` (seed_oss.py:24)
+// overriding only the four wrapper token strings, so it INHERITS the
+// thinking-off passthrough (qwen3.py:247). Since #630 (#605) our
+// `get_parser_engine` mirrors that by building the same Qwen3Parser class over
+// the `<seed:...>` spelling (parser_manager.cpp:28); before that, seed_oss got
+// a bare ParserEngine and the thinking-off arm ran the state machine instead.
+//
+// Nothing else pins the inheritance. The only production call site,
+// `OpenAIServingChat::MakeParserEngine` (serving_chat.cpp:580), takes the
+// header default thinking=true, under which a bare engine and Qwen3Parser are
+// byte-identical — so ONLY the thinking-off arm can tell the two apart, which
+// is why this case exists.
+TEST_CASE("seed_oss inherits the qwen3 thinking-off passthrough") {
+  namespace pe = vllm::parser::engine;
+  // seed_oss.py:26-29 — the qwen3 grammar with `seed:`-prefixed wrappers;
+  // `<function=>`/`<parameter=>` are byte-identical.
+  const std::string seed_tool_body =
+      "<seed:tool_call>\n<function=bash>\n<parameter=command>"
+      "\ncat /etc/hosts\n</parameter>\n</function>\n</seed:tool_call>";
+  const std::string output = "I need to read the file.\n\n" + seed_tool_body;
+
+  auto off = vllm::parser::get_parser_engine("seed_oss", /*thinking=*/false);
+  REQUIRE(off != nullptr);
+  const auto [reasoning, content] =
+      off->extract_reasoning(output, pe::ParserRequest{});
+  CHECK(reasoning == std::nullopt);
+  CHECK(content == Opt(output));
+
+  // Same name, thinking ON: the initial state is REASONING and the unpaired
+  // <seed:tool_call> is an implicit reasoning end, so the content span is NOT
+  // the whole output. That difference is exactly what the override suppresses.
+  auto on = vllm::parser::get_parser_engine("seed_oss", /*thinking=*/true);
+  REQUIRE(on != nullptr);
+  const auto [r2, c2] = on->extract_reasoning(output, pe::ParserRequest{});
+  CHECK(r2 == Opt("I need to read the file.\n\n"));
+  CHECK(c2 != Opt(output));
 }

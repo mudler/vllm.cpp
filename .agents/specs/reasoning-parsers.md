@@ -6,6 +6,7 @@ registry) + `vllm/reasoning/abs_reasoning_parsers.py:26` (`ReasoningParser` ABC)
 `:213` (`ReasoningParserManager`).
 Pinned oracle: `/home/mudler/_git/vllm` @ `555967922` (vLLM 0.26.0.dev0).
 Claim: `CLAIM-SAMPLE-REASONING`.
+Issue: [#605](https://github.com/mudler/vllm.cpp/issues/605) (W3 resequencing + brick 1).
 
 ## Scope
 
@@ -133,12 +134,38 @@ factory branch + one test), or, for group D, wrap the already-landed
 | `test_minimax_m2_reasoning_parser.py` (+append) | end-only + append-think | `test_minimax_m2.cpp` | DONE |
 | `test_step3p5_reasoning_parser.py` | step3 | `test_step3.cpp` (step3); step3p5 pending | PARTIAL |
 | `test_olmo3_reasoning_parser.py` | olmo3 | `test_olmo3.cpp` | DONE |
-| `test_{granite,gptoss,qwen3,glm4_moe,gemma4,hunyuan,hy_v3,kimi_k2,cohere,nemotron_v3,minimax_m3,holo2}_reasoning_parser.py` | remaining families | — | MISSING (W2/W3) |
+| `test_qwen3_reasoning_parser.py` | qwen3 + mimo: engine-backed `<think>` + implicit `<tool_call>` reasoning end, thinking-off passthrough, multi-token deltas | `test_qwen3.cpp` | **DONE (W3 brick 1, 2026-08-13)** |
+| `test_{granite,gptoss,glm4_moe,gemma4,hunyuan,hy_v3,kimi_k2,cohere,nemotron_v3,minimax_m3,holo2}_reasoning_parser.py` | remaining families | — | MISSING (W3 rest / W2) |
 
 The v4-alias sub-case is SKIPPED-with-reason in `test_deepseek_v3.cpp`
 (engine-backed adapter, W3). Each ported parser is gated over the exact upstream
 input strings, non-streaming AND the per-delta streaming reconstruction,
 RED-first.
+
+### Coverage BEYOND upstream in `test_qwen3.cpp` (from scratch, recorded)
+
+Upstream drops nothing here — there is nothing to drop. `test_qwen3_reasoning_parser.py`
+has **no** `is_reasoning_end` case for qwen3 at all (the only one in the suite is
+`test_base_thinking_reasoning_parser.py:111`, for the base family), and its
+`THINKING_DISABLED_CASES` run through the adapter, which suppresses tool parsing.
+Both `Qwen3Parser` overrides therefore sit on branches upstream's own fixtures
+cannot reach, so three TEST_CASEs are written from scratch against the upstream
+SOURCE (`vllm/parser/qwen3.py:247,256-275`, `vllm/parser/seed_oss.py:24-29`):
+
+| our TEST_CASE | pins | mutation that proves it |
+|---|---|---|
+| `engine thinking-off passthrough survives an unskipped tool` | `qwen3.py:247` on the ENGINE, tool parsing NOT suppressed | drop the `extract_reasoning` override (#630) |
+| `is_reasoning_end (text form, incl. unpaired <tool_call>)` | `qwen3.py:256-275`, incl. the reasoning-REOPEN branch — a `<think>` AFTER the tool-call marker, which upstream's backwards walk meets first | drop `qwen3.cpp:55` `ps > p`; only `is_reasoning_end("<tool_call>x<think>y") == false` reds |
+| `seed_oss inherits the qwen3 thinking-off passthrough` | `get_parser_engine("seed_oss")` builds the shared `Qwen3Parser`, mirroring `class SeedOssParser(Qwen3Parser)` | route seed_oss back to a bare `ParserEngine` |
+
+The reopen and seed_oss rows are follow-up to the #630 fresh review's two LOW
+findings; before them, deleting `qwen3.cpp:55` left the focused suite fully green
+(7/7, 157/157), because all four existing tool-call assertions put `<think>`
+BEFORE the `<tool_call>`, where the guard cannot fire. Only the thinking-OFF arm
+can observe the seed_oss class change at all — the sole production call site,
+`OpenAIServingChat::MakeParserEngine` (`serving_chat.cpp:580`), takes the header
+default `thinking=true`, under which the refactor is byte-identical, so the
+production path was never affected.
 
 ## Gates
 
@@ -174,8 +201,57 @@ RED-first.
   `hunyuan_a13b`, `step3p5`, `hy_v3`, `kimi_k2`, `minimax_m3`, `cohere_command3/4`,
   `openai_gptoss` (each a direct text port + its upstream test).
 - **W3** — the engine-backed reasoning adapters (`qwen3`/`mimo`, `gemma4`,
-  `glm45/47`, `seed_oss`, `deepseek_v4`, `nemotron_v3`, `inkling`) as reasoning
-  faces over the already-landed `TOOLS-STREAMING-PARSER` engine.
+  `glm45/47`, `seed_oss`, `deepseek_v4`, `nemotron_v3`, `inkling`, `nano_v3`) as
+  reasoning faces over the already-landed `TOOLS-STREAMING-PARSER` engine.
+  **Brick 1 DONE 2026-08-13 (#605):** `qwen3` + `mimo` (one class, two registry
+  names). Landed the reusable base `ParserEngineReasoningAdapter`
+  (`adapters.py:35`) that every remaining W3 name plugs into, the `Qwen3Parser`
+  engine subclass (`qwen3.py:201`, now also serving `seed_oss` exactly as upstream
+  does), and the two engine methods the reasoning face needs —
+  `ParserEngine::extract_reasoning_streaming` (`parser_engine.py:519`) and the TEXT
+  form of `is_reasoning_end` (`parser_engine.py:595`). Coverage 10 -> 12 names;
+  covers 20 of the 76 recipe uses. Next bricks, by recipe demand: `glm45`+`glm47`
+  (11), `gemma4` (6), `nemotron_v3` (3), `deepseek_v4` (2), `inkling` (2),
+  `seed_oss`, `nano_v3`.
+
+### Ordering amendment 2026-08-13 — W3 runs BEFORE W2 (#605)
+
+The waves above were numbered without demand data. The recipe-surface sweep
+supplies it, and it inverts the order.
+
+Measured over `vllm-project/recipes` @ `86c7777aa699482ef1ebd0c5da9fc540ccc00a40`
+(157 official model recipes), `--reasoning-parser` is passed **76 times across 20
+distinct values**. We resolve 15 of those uses; the other **61 abort startup** with
+`unknown reasoning parser`.
+
+| Wave | Recipe uses it covers | Notable |
+|---|---:|---|
+| **W3** (engine-backed adapters) | **43 / 76** | `qwen3` 18, `glm45` 11, `gemma4` 6, `deepseek_v4` 2, `nemotron_v3` 3, `inkling` 2 |
+| W2 (remaining text families) | 18 / 76 | `kimi_k2` 4, `poolside_v1` 4, `hy_v3` 2, `step3p5` 2, `minimax_m3` 1 |
+| — | 0 | `ernie45`, `granite`, `cohere_command3/4`, `openai_gptoss` — **zero recipe demand**, all in W2 |
+
+`qwen3` alone (18 uses) outweighs every W2 name combined except `kimi_k2` and
+`poolside_v1`. It is also the parser the published Qwen3.5 and Qwen3.6 recipes pass
+to models **we already ship token-exact and gated** — so today the engine serves
+the model and rejects its own recipe's flag.
+
+**Therefore: W3 runs first, and within W3 the first brick is
+`Qwen3ParserReasoningAdapter`** (upstream `vllm/reasoning/qwen3_engine_reasoning_parser.py`,
+re-exported from `vllm/parser/engine/registered_adapters.py`), which serves BOTH
+`qwen3` and `mimo` — `vllm/reasoning/__init__.py:87` registers `mimo` onto the same
+class, so two names land for one port. `glm45` and `glm47` share
+`Glm47MoeParserReasoningAdapter` the same way (`__init__.py:55,59`).
+
+Three names belong in W3 and were missing from its list:
+
+- `nano_v3` (1 recipe use) — add to W3.
+- `kimi_k3` (1) and `ling3` (1) — **post-pin**; they are not in the registry at
+  `5559679229bc961848b121ccdeaa8fa5d79bec98`. Recorded here so they are not
+  rediscovered; they land with the next pin advance, not before.
+
+W2 is not cancelled — it is resequenced behind W3. The four zero-demand names stay
+in scope because upstream registers them and we mirror upstream; they are simply
+not what a user hits first.
 - **W4** — request-time `chat_template_kwargs` threading (`adjust_request`) +
   reasoning-gated grammar FSM hold (cross-ref structured-output).
 
@@ -187,9 +263,12 @@ RED-first.
   site. Threading it is W4. Risk: a caller expecting `deepseek_v3` +
   `{"thinking":true}` to split will instead get passthrough until W4 — mitigated
   by exposing `holo2` for the thinking path.
-- **Risk**: README:68 states "7 reasoning" families; after W1 it is 9 registered
-  names. This change is scoped NOT to touch README, so a README count bump is a
-  tracked follow-up.
+- **Risk (DISCHARGED 2026-08-13, #605)**: README stated a stale reasoning-family
+  count — "7" after W1 made it 9, then `muse_glimmer` made it 10 without a bump.
+  The W3 brick-1 change takes it to 12 and updates `README.md`, `docs/USAGE.md`
+  and `docs/STATUS.md` in the SAME change. The pinned count in
+  `test_detect.cpp` is what forces this: a factory branch added without listing
+  the name fails there.
 - **Risk/decision**: token-ID methods (`extract_content_ids`,
   `count_reasoning_tokens`) remain dropped under the text-only seam; needed only
   if we port the xgrammar token-ID gate. Deferred with the structured-output row.

@@ -39,7 +39,25 @@ MATRICES = {
     # delegates it. Its only upstream implementation is the still-OPEN
     # vllm#51655; see porting-inventory.md §9 deviation 16. Bumped because a new
     # row EXISTS, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 362),
+    # 369 since 2026-08-13: +7 rows for the architectures behind official
+    # `vllm-project/recipes` models that had no row at all (#609, #610). One is
+    # pin-lag — `BailingMoeV3ForCausalLM` is registered on vLLM `main` and
+    # absent only at `555967922`. Six are out-of-repo: `MossTTSDelayModel`,
+    # `MossTTSRealtime`, `Qwen3TTSForConditionalGeneration` and
+    # `HiggsMultimodalQwen3ForConditionalGeneration` are registered by
+    # `vllm-project/vllm-omni`, and `VoxtralRealtimeForConditionalGeneration`
+    # and `BailingMMNativeForConditionalGeneration` are target-pending — their
+    # exact `config.json` architecture strings are registered in neither core
+    # vLLM `main` nor `vllm-omni`, so the rows record what was searched instead
+    # of an invented anchor. SEVEN, not eight: the audit's eighth architecture
+    # `Qwen3_5MoeForCausalLM` is rowed by #490 / PR #601, which registers it
+    # rather than only inventorying it. Two branches ADDING the same keyed row
+    # merge without a conflict and define it twice, so the row is left to its
+    # owner. None of the seven touches the at-the-pin model inventory below
+    # (324/373/356/310/261 is unchanged), because like the MuseGlimmer, KimiK3
+    # and MiniMaxH3DiT rows they carry no pinned-registry target. Bumped
+    # because seven new rows EXIST, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 369),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -372,8 +390,20 @@ ENGINE_PREFIXES = (
 # while its committed specification awaits implementation and hosted evidence.
 # No build, artifact, runtime evidence, workflow, or publication is claimed by
 # this row-count bump.
+# 153 since 2026-08-13: +`SERVE-RECIPE-ARGS` (accepted-and-inert serve arguments).
+# `vllm-serve` aborts on any unrecognized flag, so `--enable-auto-tool-choice`
+# (89 of 157 official vLLM recipes) and `--trust-remote-code` (82 of 157) stop the
+# server before model load even though neither means anything to this engine —
+# including for models we ship token-exact and gated. Found by the 2026-08-13
+# recipe-surface sweep, issue #606. The row was `SPIKE` when this bump was first
+# written against the spec-only commit; it lands `ACTIVE`, because the squash that
+# carries this line also carries the seam (`kAcceptedInertArgs` in
+# `server_main.cpp`), its test (`test_serve_recipe_args.cpp`) and the
+# `docs/USAGE.md` entry. Stated as of THIS tree rather than as of the spec commit:
+# `main` is squash-only, so a justification framed at an intermediate commit would
+# ship as a comment that is false about the file it sits in.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 152
+ENGINE_ROWS = 153
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

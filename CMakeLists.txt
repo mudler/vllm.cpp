@@ -1031,6 +1031,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/reasoning_parsers/minimax_m2.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/step3.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/olmo3.cpp
+  src/vllm/entrypoints/openai/reasoning_parsers/parser_engine_adapter.cpp
   src/vllm/entrypoints/openai/tool_parsers/xlam.cpp
   src/vllm/entrypoints/openai/tool_parsers/phi4_mini.cpp
   src/vllm/entrypoints/openai/tool_parsers/internlm.cpp
@@ -1062,6 +1063,7 @@ add_library(vllm STATIC
   src/vllm/parser/engine/registry.cpp
   src/vllm/parser/engine/parser_engine.cpp
   src/vllm/parser/kimi_k2.cpp
+  src/vllm/parser/qwen3.cpp
   src/vllm/parser/glm47_moe.cpp
   src/vllm/parser/gemma4.cpp
   src/vllm/parser/inkling.cpp

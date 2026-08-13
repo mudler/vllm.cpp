@@ -1965,6 +1965,53 @@ deviation. Closing the in-situ question needs blocks AND time from the SAME
 graphed run, which needs a probe that survives capture: a device-side counter
 the launcher increments, read once at the end, never a per-launch D2H sync.
 
+## 6ah. THE FIRST FULLY-CONTROLLED PAIRED RUN: 0.9889, NOT 0.966 (2026-08-13)
+
+Every ratio recorded before this one was taken with a COLD leading arm.
+Correcting that moves the headline materially.
+
+**Four controls, all present together for the first time.** `$HOME/gpu.lock`
+(the standalone runs of 6ad-6af took `/tmp/gpu.lock`, which coordinates with
+nothing). A DISCARDED warm-up arm ahead of the first measured arm, because the
+GB10 SM clock ramps over MINUTES -- 1449 to 2190 MHz observed across one run --
+so dropping rep 1 is not enough and an entire first arm reads ~6% low. Settle
+barriers between arms, because vLLM asserts free GPU memory does not GROW during
+its startup profile while GB10 returns our engine's pages lazily, which killed
+every earlier paired attempt with "Initial free memory 68.53 GiB, current free
+memory 89.42 GiB". And a host-RAM headroom guard before the oracle, because
+`gpu_memory_utilization` reserves HOST RAM here, so an oracle without headroom
+takes the MACHINE down -- three reboots on 2026-08-13, at least the last ours.
+
+| arm | n | median tok/s | range |
+|---|---|---|---|
+| ours BEFORE | 9 | 142.604 | 141.67-142.79 |
+| ours AFTER | 9 | 142.140 | 135.23-142.87 |
+| ours combined | 18 | **142.534** | -- |
+| oracle | 15 | **144.130** | 141.86-151.84 |
+
+Drift before -> after is **-0.33%**, inside the 1% gate this harness sets for
+itself, so the run counts. Ratios: 0.9894 before, 0.9862 after,
+**0.9889 combined**.
+
+**The gap is 1.1%, not 3.4%.** The 0.9757 / 0.9646 / 0.9569 of 6ac were
+measuring an unwarmed first arm as much as they were measuring the engine.
+
+This is NOT parity: 0.9889 is below 1.0 and the row stays open. But it changes
+what remains to be found -- roughly a third of the deficit the record has been
+chasing all campaign, and it lands after 6ae had already cleared the kernel that
+deficit was attributed to.
+
+**Caveats, kept rather than buried.** n=1 paired run; a repeat is owed before
+this is settled. The ours-AFTER arm carries four low outliers (135.2, 135.5,
+139.0, 139.9) that the BEFORE arm does not, so something touched the box during
+it -- medians are unaffected, that arm's spread is not trustworthy. The oracle
+shows ONE fast draw (151.84) against fourteen near 144, the old bimodality
+appearing once, absorbed by the median. The oracle copy runs
+`gpu_memory_utilization=0.35` rather than 0.55; at max_num_seqs=2 and
+max_model_len=2048 the KV cache needed is a fraction of either, so it cannot
+change decode speed, but it IS a config delta on the denominator and is recorded
+as one.
+
 ## 7. Evidence, authority, stop conditions
 
 - Evidence root: `dgx:~/work/vllm.cpp-dspark-<slice>/`, one `flock`, named tmux.

@@ -3717,6 +3717,16 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
 // slice for the gated RMSNorm — the inner [Hv,Dv] block is contiguous while
 // the token stride follows the packed parent (upstream z.reshape(T,-1,Dv) on
 // the mixed_qkvz slice, qwen_gdn_linear_attn.py:934).
+// Resolved GDN output-gate activation. Upstream hands RMSNormGated the string
+// (`activation=output_gate_type`, qwen_gdn_linear_attn.py:452-464 @555967922);
+// vt::RmsNormGatedArgs models the same silu/sigmoid split as a bool. HfConfig
+// canonicalizes the key at LOAD time (only "silu"/"sigmoid" survive, "swish"
+// already collapsed, anything else refused), so this is a lookup and never a
+// second normalization -- exactly one place decides what the gate is.
+bool GdnSigmoidGate(const HfConfig& cfg) {
+  return cfg.output_gate_type == "sigmoid";
+}
+
 Tensor GdnGateView3(const Tensor& z, int64_t T, int64_t hv, int64_t dv) {
   Tensor g = z;
   g.rank = 3;
@@ -3825,6 +3835,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // flatten heads, out-project.
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
+  const bool sigmoid_gate = GdnSigmoidGate(cfg);
   const bool z_strided = z.stride[0] != value_dim;
   Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
@@ -3848,10 +3859,17 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // RmsNormGatedQuantFp8 kernel (byte-identical + perf-neutral). VT_FUSED_CHAIN_ADOPT=0
     // restores the direct hand-call.
     if (FusedChainAdoptEnabled()) {
-      vt::FusedChain(d.q, vt::kRmsNormGatedQuantFp8, a_fp8_v, core2, z2, dnw, eps,
+      // sigmoid_gate is a STRUCTURAL recipe flag (fused_recipe.h FStep), not a
+      // call scalar, so the sigmoid arm binds a COPY of the recipe with that
+      // step flag set. On the silu arm the copy is byte-identical to
+      // vt::kRmsNormGatedQuantFp8, so this stays perf- and bit-neutral.
+      vt::FusedRecipe gated_fp8 = vt::kRmsNormGatedQuantFp8;
+      gated_fp8.steps[0].sigmoid_gate = sigmoid_gate;
+      vt::FusedChain(d.q, gated_fp8, a_fp8_v, core2, z2, dnw, eps,
                      w.out_proj_fp8.input_scale);
     } else {
-      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false},
+      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw,
+                               vt::RmsNormGatedArgs{eps, sigmoid_gate},
                                w.out_proj_fp8.input_scale);
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
@@ -3860,11 +3878,13 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
-    vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated2, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
     Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
-    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
@@ -4299,6 +4319,7 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   // Byte-identical op sequence to GdnBlockPaged's tail. ──
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
+  const bool sigmoid_gate = GdnSigmoidGate(cfg);
   const bool z_strided = z.stride[0] != value_dim;
   Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
@@ -4308,11 +4329,17 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
     Tensor a_fp8_v = z_strided ? Reshape(a_fp8.t(), {T, Hv, Dv})
                                : Reshape(a_fp8.t(), {T * Hv, Dv});
     if (FusedChainAdoptEnabled()) {
-      vt::FusedChain(d.q, vt::kRmsNormGatedQuantFp8, a_fp8_v, core2, z2, dnw, eps,
+      // sigmoid_gate is a STRUCTURAL recipe flag (fused_recipe.h FStep), not a
+      // call scalar, so the sigmoid arm binds a COPY of the recipe with that
+      // step flag set. On the silu arm the copy is byte-identical to
+      // vt::kRmsNormGatedQuantFp8, so this stays perf- and bit-neutral.
+      vt::FusedRecipe gated_fp8 = vt::kRmsNormGatedQuantFp8;
+      gated_fp8.steps[0].sigmoid_gate = sigmoid_gate;
+      vt::FusedChain(d.q, gated_fp8, a_fp8_v, core2, z2, dnw, eps,
                      w.out_proj_fp8.input_scale);
     } else {
       vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw,
-                               vt::RmsNormGatedArgs{eps, false},
+                               vt::RmsNormGatedArgs{eps, sigmoid_gate},
                                w.out_proj_fp8.input_scale);
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
@@ -4321,11 +4348,13 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
-    vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated2, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
     Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
-    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
   return !w.out_proj_fp8.Empty()
@@ -4722,6 +4751,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // representable (same kernel and grid — only the gate addressing changes).
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
+  const bool sigmoid_gate = GdnSigmoidGate(cfg);
   const bool z_strided = z.stride[0] != value_dim;
   Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
@@ -4745,10 +4775,17 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // RmsNormGatedQuantFp8 kernel (byte-identical + perf-neutral). VT_FUSED_CHAIN_ADOPT=0
     // restores the direct hand-call.
     if (FusedChainAdoptEnabled()) {
-      vt::FusedChain(d.q, vt::kRmsNormGatedQuantFp8, a_fp8_v, core2, z2, dnw, eps,
+      // sigmoid_gate is a STRUCTURAL recipe flag (fused_recipe.h FStep), not a
+      // call scalar, so the sigmoid arm binds a COPY of the recipe with that
+      // step flag set. On the silu arm the copy is byte-identical to
+      // vt::kRmsNormGatedQuantFp8, so this stays perf- and bit-neutral.
+      vt::FusedRecipe gated_fp8 = vt::kRmsNormGatedQuantFp8;
+      gated_fp8.steps[0].sigmoid_gate = sigmoid_gate;
+      vt::FusedChain(d.q, gated_fp8, a_fp8_v, core2, z2, dnw, eps,
                      w.out_proj_fp8.input_scale);
     } else {
-      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false},
+      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw,
+                               vt::RmsNormGatedArgs{eps, sigmoid_gate},
                                w.out_proj_fp8.input_scale);
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
@@ -4757,11 +4794,13 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
-    vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated2, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
     Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
-    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes

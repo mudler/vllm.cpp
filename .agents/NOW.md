@@ -52,8 +52,9 @@ ENFORCE `agent-start.py` → claim → preflight. Review FAIL loops to a fresh
 implementer until PASS. Queue: 10 rows; backfill 79, 30 anchored.
 **Upstream inventory** ([spec](specs/upstream-derived-inventory-2026-08-05.md)):
 SM060/061/070 below vLLM's floor = OUT-OF-SCOPE; COMP-*/DISTRIBUTED-* are REAL
-unported work; **all 362 archs have rows**; llama.cpp's 11 extra devices IN
-SCOPE (`ROAD-V1-D6`).
+unported work; **every arch in the pinned registry has a row** (the count lives in
+[model-matrix.md](model-matrix.md), not here — #622); llama.cpp's 11 extra
+devices IN SCOPE (`ROAD-V1-D6`).
 
 ## Protocol invariants that bite most often
 

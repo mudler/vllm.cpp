@@ -10,7 +10,7 @@
 
 ## 0. Scope
 
-`DsaTopkKernel` (`src/vt/cuda/cuda_deepseek_v4.cu:624-665` pre-fix) sized two
+`DsaTopkKernel` (`src/vt/cuda/cuda_deepseek_v4.cu:624-669` pre-fix) sized two
 thread-local arrays by literal:
 
 ```cpp
@@ -68,14 +68,27 @@ asc — a total order because candidate indices are distinct):
 Exactly `topk` elements satisfy pass 2 under a total order, and they come out
 already in ascending key order, so the `O(topk^2)` emit sort disappears along with
 the buffers. **No per-thread scratch, no bound, no configurable limit.** Cost is
-unchanged at `O(topk*n)` for pass 1 and strictly better overall.
+unchanged at `O(topk*n)` for pass 1 and cheaper than the revision it replaces,
+which also paid the emit sort.
 
-Two defensive additions that are not load-bearing for ordered input: pass 1 stops
-if no strictly-worse element is found, and pass 2 carries a `w < topk` bound.
-Both exist so a NaN row — where every float comparison is false — cannot write
-past the thread's own row into the next one, which is the failure class this issue
-was about. The host reference is naturally immune (it resizes to `topk`), so this
-keeps the two arms equally safe rather than mirroring a weakness.
+That comparison is to the old kernel **only**, and is not a claim of fitness for
+the real geometry (corrected per the review, #552 finding 5). Pass 1 is one thread
+per token row with a dependent global load per iteration, so at V4-Pro's
+`index_topk=1024` the last row of a 4k prompt is on the order of 4.2M serial
+loads in a single thread. Asymptotically unchanged from the pre-fix kernel, and
+out of scope here — §5 names the real-geometry path as the residual that owns it.
+
+Two defensive additions, neither load-bearing: pass 1 stops if no strictly-worse
+element is found, and pass 2 carries a `w < topk` bound. **They are
+belt-and-braces, not a defence against a known way to overrun the row** — the
+emit count is bounded by construction. Pass 2's predicate is satisfied by exactly
+`rank(th)` elements and `rank(th) <= topk`, and a NaN never satisfies it either
+because `better(x, NaN)` is false, so `w` cannot exceed `topk` for any input. The
+review proved this by removing the bound and by weakening it to `w <= topk`: both
+left the device suite 4/4 SUCCESS and a 3M-shape fuzz clean. The original wording
+here named a NaN write-past-row as the defended failure class, which was an
+overclaim (#552 finding 1). The guards stay — they are free — but a comment that
+overstates what it protects is worse than none, because the next reader trusts it.
 
 ## 4. Evidence
 
@@ -184,6 +197,121 @@ kernel, not against our host reference. That work stays out of scope here.
   would prove only self-consistency.
 - Do **not** widen scope into the real-geometry DSA residual or the
   compressed-key-space candidate window (§5).
+
+## 7. Review follow-up — [#552](https://github.com/mudler/vllm.cpp/issues/552)
+
+A fresh reviewer (never the author) returned **PASS with 6 non-blocking
+findings**, having failed to find any input where the two-pass selection diverges
+from `DsaTopkSelect`: **3,000,081 fuzzed shapes across three independent
+implementations** — the host reference, a transcription of the kernel body, and
+the reviewer's own `O(n^2)` rank-count oracle so a shared misreading could not
+pass — with **zero divergence**, output slots poisoned with `-777` so an unwritten
+slot could not masquerade as legitimate `-1` padding. It reproduced the ASan
+overflow and the device SIGABRT independently, and ran a 12-row device mutation
+table on real sm_121a.
+
+Landed here:
+
+| # | finding | resolution |
+|---|---|---|
+| 1 | the `w < topk` comment named a NaN write-past-row as the defended failure class, which cannot occur | reworded in the kernel and in §3: belt-and-braces, bounded by construction. Guards kept. |
+| 2 | no case exercised `win_start < 0` or `win_end > num_keys`; mutating either clamp away left all four cases green | new case `OUT-OF-RANGE windows are clamped like host (#552)`, four rows driving under-run, over-run, both, and an in-range control |
+| 3 | `topk <= 0`: host asserts, device silently returned an empty vector | launcher now throws to mirror `deepseek_v4_dsa.cpp:76`; new case asserts **both** arms refuse |
+| 4 | `DsaTopkLaunch` had no post-launch `cudaGetLastError()` | `Check(cudaGetLastError(), "dsa_topk launch")` added, matching every sibling launcher — but the finding's stated *rationale* does not survive measurement, see below |
+| 5 | "strictly cheaper" could be read as real-geometry-ready | qualified in §3 and in the kernel comment: it is a comparison to the old kernel only |
+| 6 | trivia: pre-fix span cited `:624-665` (actual 624-669); the comment described `n > topk` as the overflow condition | both corrected; `n > topk` only selects the branch, the overflow needs `n > 512` or `topk > 64` |
+
+### 7.1 Finding 4's rationale was REFUTED by its own verification
+
+The review's finding 4 held that a post-launch `cudaGetLastError()` would make the
+next fault in this kernel attributable to it, instead of surfacing later as
+`cudaStreamDestroy` the way #505's did. **That is wrong, and the arm built to
+demonstrate it disproved it.**
+
+Arm `prefix_with_check` — the pre-fix #505 kernel body WITH the new
+`Check(cudaGetLastError(), "dsa_topk launch")` in place:
+
+```
+### prefix_with_check  exit=134
+[doctest] test cases:   2 |   1 passed | 1 failed | 23 skipped
+[doctest] assertions: 609 | 609 passed | 0 failed |
+[doctest] Status: FAILURE!
+  what():  vt cuda: cudaStreamDestroy: an illegal memory access was encountered
+test_cuda_deepseek_v4.cpp:214: FATAL ERROR: test case CRASHED: SIGABRT
+```
+
+The error text is **unchanged** — still `cudaStreamDestroy`, not `dsa_topk
+launch`. A stack-overflow illegal access is an *asynchronous execution* fault;
+`cudaGetLastError()` immediately after a launch reports launch-*configuration*
+errors (bad grid/block, shared memory over budget). Here it was not even caught by
+the following `cudaStreamSynchronize`, and latched only at stream destruction.
+
+The check is kept: it is free, it matches every sibling launcher, and it does
+cover the launch-configuration class. But its comment and this spec now say what
+it actually does. Writing "this makes the next fault attributable" would have
+repeated finding 1's defect — an overclaiming guard comment — in the very change
+that exists to correct one. The lesson is the finding's, not the reviewer's: a
+plausible rationale for a cheap, obviously-correct change is still a claim, and
+this one only failed because an arm was built to test it rather than to confirm it.
+
+### 7.2 Device evidence for this change
+
+`dgx.casa`, GB10 sm_121a, mandatory flags, fast path hard-verified in the run's own
+configure log (`CUTLASS found … sm120a NVFP4`, `FlashAttention-2 … [121a]`). Each
+arm is a fresh nvcc rebuild from a pristine kernel with the binary mtime verified
+to advance, scoped with `-tc=` (never `-ts=`), and run under `flock $HOME/gpu.lock`.
+
+| arm | exit | Status | reddened |
+|---|---|---|---|
+| baseline | 0 | `6 \| 6 passed` SUCCESS | — |
+| `no_topk_guard` (drop the launcher's `topk > 0` throw) | 1 | FAILURE | the new refusal case: `CHECK_THROWS … did NOT throw at all!` |
+| `no_ws_clamp` | **134** | FAILURE | the new clamp case CRASHED, SIGABRT, `illegal memory access` |
+| `no_we_clamp` | 1 | FAILURE | the new clamp case, **1052** failed assertions |
+| `no_launch_check` | 0 | SUCCESS | **nothing** — see §7.1; unobservable by construction |
+| `prefix_with_check` | 134 | FAILURE | refutes finding 4's rationale (§7.1) |
+| restored, full suite | 0 | `25 \| 25 passed \| 0 skipped`, 90062 assertions, SUCCESS | — |
+
+Both new cases therefore have teeth, each against the mutation it was written for.
+`no_launch_check` reddening nothing is the expected and honest outcome for a
+diagnostic that has no observable behaviour on a passing run.
+
+Note the false-green shape recurring twice more: `no_ws_clamp` printed
+`assertions: 16865 | 16865 passed | 0 failed` and `prefix_with_check` printed
+`609 | 609 passed | 0 failed`, both beside `Status: FAILURE!`.
+
+Two infrastructure incidents, both handled rather than absorbed: round 1's clamp
+mutations were **refused by their own uniqueness assertion** — the clamp pair
+appears in both `DsaLogitsKernel` (:604-605) and `DsaTopkKernel` (:628-629), so a
+one-line anchor was ambiguous and the assert declined to edit a kernel it was not
+aiming at; round 2 re-ran with a three-line anchor unique to `DsaTopkKernel`. Then
+the box **rebooted mid-arm** (`up 7 min`, the known GB10 unified-memory OOM-reboot
+class), killing the run with no marker written — the remaining arms were relaunched
+on the fresh box.
+
+**Findings the review closed rather than raised.** Five mutations left the suite
+green and are *semantics-preserving*, not coverage gaps — each is also undetected
+by a 200k-shape fuzz against the oracle, which is how the reviewer separated the
+two: removing `w < topk`, weakening it to `w <= topk`, simplifying pass 1's argmax
+to `v > best_val` (equivalent, since the scan is ascending), `n <= topk` →
+`n < topk` (equivalent, since at `n == topk` the full path selects all `n`), and
+dropping `if (th_idx < 0) return` (reachable only via NaN). No action owed.
+
+**The tie-heavy case is uniquely load-bearing** — confirmed, not assumed. It is
+the only case in the suite that reddens a tie-break inversion or a value-only
+threshold; the widths and offset cases use distinct random logits and stay green
+under both mutations.
+
+**Process deviation recorded, not repaired.** `b649a1ea2` introduced this spec in
+the *same* commit as the code, where the protocol requires the spec to be
+committed first. The substance was complete and the review supplies the
+independent pass that #542 lacked, but the ordering was wrong and is noted here
+rather than quietly dropped.
+
+**Gate-reading trap, from the reviewer's own run.** A first scoped attempt used
+`-ts='*DSA top-k*'` (suite filter) instead of `-tc=` (case filter) and printed
+`test cases: 0 | 0 passed | 0 failed | 23 skipped` beside `Status: SUCCESS!` — a
+live false green from a filter that matched nothing. Any scoped run of this suite
+must use `-tc=` and confirm the case count is non-zero.
 
 ## Outcome
 

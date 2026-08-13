@@ -29,10 +29,15 @@ so the token-exact claims hold against the new pin. Every speed figure citing
 "vLLM 0.25.0" was measured against the preserved rollback, and NOT only before
 the advance: the benchmark harness hard-enforced 0.25.0 and *raised* on the pin
 until 2026-08-12, so no run through it could have used the pin
-([#520](https://github.com/mudler/vllm.cpp/issues/520)). Those figures are
-attributed rather than withdrawn (our engine is unchanged by the advance, and
-the two oracles tie in speed where that was checked); a re-benchmark at the pin
-is pending and blocked on [#522](https://github.com/mudler/vllm.cpp/issues/522).
+([#520](https://github.com/mudler/vllm.cpp/issues/520)). **That re-benchmark
+has now RUN.** The 2026-08-13 series selects the oracle by explicit path
+(`0.23.1rc1.dev1511+g555967922`, FlashInfer `0.6.15.post1`), asserts that
+identity per leg, runs it graphed and passes `--language-model-only`, which the
+canonical driver never did
+([#414](https://github.com/mudler/vllm.cpp/issues/414)). Every figure citing
+"vLLM 0.25.0" is therefore SUPERSEDED and OPTIMISTIC on two counts that both
+flattered us, not merely stale: nothing is withdrawn, and the values keep their
+attribution.
 
 **Clock attribution (`BENCH-ASSERT-CLOCK-STATE`, ACTIVE, 2026-08-12,
 [#543](https://github.com/mudler/vllm.cpp/issues/543)):** the SM clock on
@@ -41,14 +46,16 @@ byte-identical `marlin::Marlin` by +9.65%, larger than either deficit that
 comparison ranked. The harness now records the clock window, `clocks.max.sm`,
 the applications clock, the active throttle reasons, persistence mode and the
 **boot id** per leg, refuses a cross-boot pair, and voids a run whose window was
-over-spread or barely observed — a single busy sample scores a perfect 0.00%
-spread, so the retained sample count and the busy fraction are floored and
-printed. The cross-boot override waives the boot id and nothing else: the GPU,
-driver and clock ceilings are compared across the arms either way
-([spec](../.agents/specs/bench-assert-clock-state.md)). Every speed figure
-recorded before this date predates the assertion: not withdrawn, not restated,
-but carrying no clock attribution. The first attributable grid is pending on the
-box lock and on [#545](https://github.com/mudler/vllm.cpp/issues/545).
+over-spread or barely observed. The cross-boot override waives the boot id and
+nothing else ([spec](../.agents/specs/bench-assert-clock-state.md)); the sample
+floors and the comparison it keeps are derived there. Every figure recorded
+before this date carries no clock attribution: not withdrawn, not restated. The
+first attributable grid has now landed (2026-08-13): clocks pinned with
+`sudo -n nvidia-smi -lgc 2190` while holding `$HOME/gpu.lock`, under an
+always-fires reset trap, delivering a flat 2184 MHz across every timed window on
+one boot id (a leg reads n=861, min 2158, med 2184). GB10 enumerates no
+`SUPPORTED_CLOCKS`, so 2190 is the frequency the worst observed boot sustained
+flat.
 
 ## Capability status
 
@@ -155,7 +162,7 @@ token-for-token correctness against the pinned oracle.
 | Sampling | Supported | Greedy, temperature, top-k/p, min-p, presence/frequency/repetition penalties, seed, stop/stop_token_ids, min_tokens, logit_bias, allowed_token_ids, bad_words, in vLLM's exact order. Custom logits processors are supported through a per-request C-ABI callback (`vllm_logits_processor`, ABI v8), absent by default (byte-identical). Sample logprobs are emitted end-to-end for `/v1/completions` and `/v1/chat/completions` (`logprobs`/`top_logprobs`). A request may instead score an EXPLICIT set of vocab ids (`logprob_token_ids`, generative scoring): exactly those ids plus the sampled token, whose rank is still over the full vocab, and no full-vocab sort — library surface only, the OpenAI request field is not wired yet. Parallel sampling (`n>1`) is supported, returned as n indexed `choices` (`n==1` byte-identical). Beam search is supported through the `BeamSearch` driver — an outer engine loop that scores beams by cumulative logprob with a length penalty and returns the top `beam_width` sequences (deterministic, token-exact vs vLLM's algorithm); it is wired on the OpenAI `use_beam_search` request field for `/v1/completions` and `/v1/chat/completions` over BOTH the synchronous engine AND the production AsyncLLM HTTP server (an async `BeamSearchAsync` driver, token-identical); the C-ABI beam params and streaming beam are not exposed yet; per-beam concurrent stepping is a named residual — beams are stepped sequentially). `best_of` is supported on both endpoints (`best_of==n` is the default no-op). `prompt_logprobs` is computed and returned on `RequestOutput`; the OpenAI `echo` serialization is not wired yet. All four `logprobs_mode` values work (`processed_*` shows the top-k mask); in-library only. |
 | Structured output | Supported (subset), engine-enforced; xgrammar backend W1 (CPU, not yet production-wired) | JSON schema, JSON object, regex, choice, GBNF grammar. Constrained decoding runs in the production engine (native grammar backend, per-step logits bitmask) and is reachable from OpenAI `response_format` and the C ABI (ABI v2 `structured_*` fields). A second, xgrammar-faithful backend (`XgrammarStructuredOutputBackend`, vLLM's default `auto`) is built behind the same seam: it reuses the native pushdown-FSM/trie matcher (xgrammar's own algorithm) and adds the xgrammar JSON-schema→EBNF converter that preserves property declaration order + `any_whitespace` + the `basic_*` grammar, closing the key-order/whitespace/exotic-schema parity gap. CPU-gated (`test_backend_xgrammar` 6/6, RED-first); production wiring + the `auto` fallback + GPU oracle parity are the named residuals (see `.agents/specs/xgrammar-backend.md`) |
 | Tool-call parsing | 36 parser families / 40 accepted names, streaming | Every vLLM tool parser at the pin except the three Rust/Harmony-backed ones: pure-text parsers ported 1:1, the six engine-backed families reimplemented from their wire formats, all held to the upstream test suites. Selection via `--tool-call-parser` (server), `tool_parser` (C ABI), or template auto-detection; native-syntax forced tool_choice where expressible. Tables: docs/BENCHMARKS.md |
-| Reasoning parsing (`SAMPLE-REASONING`, ACTIVE, partial coverage) | 9 parsers, streaming | think_auto (auto-detect default: content unless markers appear), deepseek_r1, deepseek_v3 (passthrough) / holo2 (thinking→R1), mistral ([THINK]), minimax_m2 (+append_think), step3, olmo3 - reasoning split engine-side BEFORE tool parsing, streamed as `reasoning` deltas in the chat chunks. Coverage: 9 of upstream's ~28 registered names (remaining text families + engine-backed adapters tracked as W2/W3 in specs/reasoning-parsers.md); each ported parser doctest-gated vs its tests/reasoning case |
+| Reasoning parsing (`SAMPLE-REASONING`, ACTIVE, partial coverage) | 12 names, streaming | think_auto (auto-detect default: content unless markers appear), deepseek_r1, deepseek_v3 (passthrough) / holo2 (thinking→R1), mistral ([THINK]), minimax_m2 (+append_think), step3, olmo3, muse_glimmer, and qwen3 / mimo - reasoning split engine-side BEFORE tool parsing, streamed as `reasoning` deltas in the chat chunks. qwen3+mimo are the first ENGINE-BACKED adapter (one reasoning face over the shared `src/vllm/parser/engine/` parser, so `<tool_call>` ends reasoning with no `</think>`); the rest are text parsers. Coverage: 12 of upstream's ~28 registered names (remaining engine-backed adapters + text families tracked as W3/W2 in specs/reasoning-parsers.md); each ported parser doctest-gated vs its tests/reasoning case |
 | Unified streaming parser engine | Core, assembly, serving-SSE dispatch landed, gated; all 10 engine-backed families ported (family parity closed); JSON-schema tool-arg type coercion landed | The vLLM 0.26 declarative `parser/engine/` (shared state machine plus all 10 configs: qwen3, seed_oss, kimi_k2, minimax_m2, glm47_moe, deepseek_v4/v32, nemotron_v3, gemma4, inkling) and assembly layer, gated field-for-field vs vLLM 0.26. An engine-backed `--tool-call-parser` name drives the live chat SSE chunks, off by default. When a request's tools declare typed parameters, the assembled tool-call arguments are coerced to the declared JSON types (int/number/bool/string/array/null) 1:1 with vLLM `_fix_arg_types`, in both streaming and one-shot; no schema means the arguments pass through as strings unchanged. Details: .agents/specs/parser-assembly-c8.md |
 | OpenAI server | Subset; v0.0.2 publishes eight server bundles; Windows v0.0.3-pre.1 pending | Completion/chat (SSE), models, health/version/ping, metrics, tokenize/detokenize, tokenizer/server info, prefix-cache reset, abort, and Sora-shaped video creation/content. Tokenizer info and abort are flag-gated; cache reset lacks live async backing. Details: docs/USAGE.md |
 | Pooling task class (embeddings / classify / score / rerank) | **EMBEDDINGS LIVE ON THE ONE SURFACE (ROW 6)**: `LlamaModel` registered, `PoolingRunner` in the engine step, `vllm_embed` (ABI v15) + live `/v1/embeddings`; classify/score/rerank engine-side only | The non-generative task class. W0 spike over the whole vLLM pooling surface (`.agents/specs/pooling-task-class.md`, `CLAIM-POOLING`). W1 landed the pooler OP (CLS/LAST/MEAN + Identity/Normalize/MultiLabelClassify/Classify activations, double-precision-gated). **W2 landed the pooler HEADS composite** (`EmbeddingPoolerHead`, `ClassifierPoolerHead`, `SequencePooler` + factories, `DispatchPooler` routing, `PoolerConfig`/`PoolingParams`; `test_pooler_heads` 27/27-240, RED-first). **W3 landed the pooling RUNNER path** (`PoolingRunner`: pooled embeddings instead of sampled tokens, structural cosine gate vs an f64 LAST+normalize reference, `test_pooling_runner` 5/5-14, RED-first). **ROW 6 (2026-08-08): embeddings LIVE** — fold gate `test_llama_embedding_fold` 4/4-231 (engine path == direct registry path, f64 LAST+normalize ref, chunked is_valid arm); residuals: REAL checkpoint + `LLM(task="embed")` oracle cosine (no number fabricated), score/rerank/classify endpoints, matryoshka/base64/token-array inputs, tokwise (W5). Detail: `.agents/specs/embeddings-one-surface.md` |
@@ -571,27 +578,27 @@ execution modes. The only like-for-like Marlin comparison in evidence is
 therefore the standalone one, and it says parity. Closing the in-situ question
 needs blocks and time from the SAME graphed run, via a device-side counter
 read once at the end rather than a per-launch D2H sync. None of this moves the
-end-to-end ~0.966x, which is wall-clock on matched prompts. The kernel's one
-settable occupancy knob, blocks_per_sm, was then swept and is DEAD: with
-routing SEEDED so every configuration sees identical work, the between-
-configuration spread (4.3%) is no larger than the within-configuration spread,
-and an apparent 8.7% win in an unseeded first pass was the routing draw moving
-rather than the parameter. A fresh review then corrected three things here. Cost per distinct expert is
-NOT flat: recomputed it spans 4.47-7.50 us, and two rows with identical expert
-counts differ 89.4 vs 149.9 us while blocks differ 73 vs 137, so in the
-L2-resident regime time tracks BLOCKS and the distinct-expert model applies
-only above ~40. Control BOTH, or state the regime. The plateau over the rows
-actually flat is 212.7-225.8 GB/s, not 203-226, and under that narrower range
-ours at 209.9 is NOT inside it. And the standalone runs took /tmp/gpu.lock
-rather than this box's $HOME/gpu.lock, so they ran unserialised: contention
-inflates TIME, which makes a bytes/time bandwidth a LOWER bound, so a clean
-re-take can only raise the plateau and would REVERSE the we-are-not-slow
-reading. That reading is provisional. What survives is the INTERLEAVED 0.9973
-ratio, since interleaving protects a ratio against both contention and routing
-draw. Two traps worth carrying: dram__bytes.sum reads n/a on GB10, so ncu's
-Memory Throughput % excludes DRAM traffic; and fuser -v $HOME/gpu.lock is the
-check, because nvidia-smi showing no compute apps does not mean the GPU is
-unreserved. Weight
+end-to-end ratio, which is wall-clock on matched prompts. The kernel's one
+settable occupancy knob, blocks_per_sm, was swept and is DEAD: with routing
+SEEDED the between-configuration spread (4.3%) is no larger than the within-
+configuration spread, and an apparent 8.7% win came from an unseeded pass
+where the routing draw moved. THE HEADLINE THEN CHANGED. Every earlier ratio
+was taken with a COLD leading arm. The first run with all four controls
+present -- the correct $HOME/gpu.lock, a DISCARDED warm-up arm (the GB10 SM
+clock ramps over minutes, 1449 to 2190 MHz, so dropping rep 1 leaves a whole
+arm ~6% low), settle barriers (vLLM asserts free GPU memory does not grow
+during its startup profile, and GB10 releases our pages lazily, which killed
+every earlier paired attempt), and a host-RAM headroom guard
+(gpu_memory_utilization reserves HOST RAM here, which took the machine down
+three times on 2026-08-13) -- measures ours at 142.534 tok/s against the
+oracle's 144.130, a ratio of **0.9889** with before/after drift of -0.33%,
+inside the 1% validity gate. So the gap is 1.1%, not 3.4%: the
+0.9757/0.9646/0.9569 recorded earlier were measuring an unwarmed first arm as
+much as the engine. Still NOT parity and the row stays open, with a repeat
+owed (n=1). Two traps worth carrying: dram__bytes.sum reads n/a on GB10, so
+ncu's Memory Throughput % excludes DRAM traffic; and fuser -v $HOME/gpu.lock
+is the check, because nvidia-smi showing no compute apps does not mean the GPU
+is unreserved. Weight
 residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
 same size and stride as upstream's tensor (268 MB, no padding), so the cause is
 memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under
@@ -1473,9 +1480,24 @@ binding: the arms were not interleaved and did not share a background state.
 Only the two structural kernel terms (-0.400, -0.131 ms/step) exceed the
 untouched control's own +0.262 drift. Tokens move on neither 27B checkpoint,
 which establishes no gross defect at ~50x coarser sensitivity than the
-perturbation introduced, not equivalence. Both toggles stay DEFAULT OFF
+perturbation introduced, not equivalence. **That indicative reading is now
+superseded by an interleaved same-binary A/B** on the 1024/128 workload at the
+pin and a pinned clock: decode **1.007x** (c1), **1.012x** (c4), 1.027x (c16,
+#577-exposed); TTFT **1.048x** (c1), **1.041x** (c4). Both toggles stay DEFAULT
+OFF; flipping a default is a separate change with its own token gate
 ([spec](../.agents/specs/perf-gdn-packed-bridge.md),
 [record](../.agents/benchmark-record.md)).
+
+**Binding parity at the pin (2026-08-13), 1024/128, n=3, arms interleaved,
+clocks flat at 2184 MHz:** 27B decode TPOT **0.976x** (c1) and **0.946x** (c4),
+prefill TTFT 0.944x (c1); 35B decode TPOT **0.995x** (c1) and **0.946x** (c4),
+prefill TTFT 0.920x (c1) and 0.849x (c4). 27B c16 is **VOID, not a number**: our
+arm completed 93 of 96 requests where the pin completed 96 of 96 and the three
+missing are the SLOWEST, because our SSE keepalive (`VT_SERVER_SSE_PING_S`,
+default 15 s) was ENABLED on every leg
+([#577](https://github.com/mudler/vllm.cpp/issues/577)). 35B c16 TPOT and TTFT
+are NOT ESTABLISHED (6.8% and 15.0% leg spread). Forensics in
+[the benchmark record](../.agents/benchmark-record.md).
 
 There is no front-page race clip yet; when one is produced it will follow the
 LocalAI house style (side-by-side, identical output, honest measured ratios).
@@ -1738,6 +1760,22 @@ runtime-verified yet.
 
 ## Serving and API notes
 
+- **Published recipe commands reach model load (`SERVE-RECIPE-ARGS`, `ACTIVE`,
+  issue #606, `.agents/specs/serve-recipe-args.md`).** `vllm-serve` rejects any
+  argument it does not recognise, which is the right default and was also why
+  copy-pasting an official `vllm serve` line aborted before a weight was read:
+  over `vllm-project/recipes` @ `86c7777a` (157 model recipes),
+  `--enable-auto-tool-choice` appears in 89 and `--trust-remote-code` in 82, and
+  neither means anything to this engine. Both are now **accepted and inert**,
+  each announcing itself and the reason it does nothing at startup. The list is
+  **enumerated, not a catch-all**: any other unrecognised flag still aborts with
+  the same message, including flags inert only because the capability is missing
+  (`--tensor-parallel-size` and the other parallelism flags), and upstream's
+  validation still fires — `--enable-auto-tool-choice` with
+  `--tool-call-parser none` is refused, mirroring
+  `vllm/entrypoints/openai/cli_args.py:395`. Not yet reviewed or gate-rerun by
+  the operator; `--language-model-only` (#607) is a real capability gap and is
+  deliberately NOT in this list.
 - **Surface coverage (ONE SURFACE, `ARCH-ONE-SURFACE`,
   `.agents/specs/surface-coverage-2026-08-07.md`).** 21/30 text archs
   on-framework; the recurring defect (a capability in a per-model CLI) is in seven

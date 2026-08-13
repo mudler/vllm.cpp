@@ -63,35 +63,63 @@ std::string GetString(const json& doc, const char* key,
   return v.get<std::string>();
 }
 
-// The legacy-alias reads of configuration_nemotron_h.py:142-155: the modern key
-// wins, the `mamba_*` alias fills in, and a checkpoint carrying only the alias
-// must not silently deserialize to the class default.
+// The legacy-alias reads of the `mamba_*` SCALARS
+// (configuration_nemotron_h.py:145-155). Upstream is:
+//
+//   self.n_groups = kwargs.pop("mamba_n_groups") if "mamba_n_groups" in kwargs
+//                   else self.n_groups
+//
+// The dataclass field already holds the modern value (or the class default) by
+// the time `__post_init__` runs, and the legacy alias OVERWRITES it whenever it
+// is present. So the precedence is LEGACY > modern > class default — the
+// opposite of what reads naturally, and the opposite of the SCHEDULE pair below.
+//
+// Verified by RUNNING transformers @ 7d06b1a5 rather than by reading it:
+//   NemotronHConfig(n_groups=8, mamba_n_groups=4,
+//                   conv_kernel=4, mamba_d_conv=7) -> n_groups=4, conv_kernel=7
+//
+// A checkpoint carrying only the alias must likewise not silently deserialize
+// to the class default. No released checkpoint ships both spellings of one
+// field, so this is a mirroring obligation, not a live defect — pinned by
+// "when BOTH spellings ship, the precedence is upstream's and it is PER-FAMILY"
+// so it cannot drift back.
 int64_t GetIntAliased(const json& doc, const char* key, const char* legacy,
                       int64_t fallback) {
-  if (Has(doc, key)) return GetInt(doc, key, fallback);
-  return GetInt(doc, legacy, fallback);
+  if (Has(doc, legacy)) return GetInt(doc, legacy, fallback);
+  return GetInt(doc, key, fallback);
 }
 
 double GetDoubleAliased(const json& doc, const char* key, const char* legacy,
                         double fallback) {
-  if (Has(doc, key)) return GetDouble(doc, key, fallback);
-  return GetDouble(doc, legacy, fallback);
+  if (Has(doc, legacy)) return GetDouble(doc, legacy, fallback);
+  return GetDouble(doc, key, fallback);
 }
 
 bool GetBoolAliased(const json& doc, const char* key, const char* legacy,
                     bool fallback) {
-  if (Has(doc, key)) return GetBool(doc, key, fallback);
-  return GetBool(doc, legacy, fallback);
+  if (Has(doc, legacy)) return GetBool(doc, legacy, fallback);
+  return GetBool(doc, key, fallback);
 }
 
+// The four block spellings, in enum order. The single source of truth for both
+// directions of the name<->enum map, so a fifth block kind cannot be added with
+// a refusal message that still lists four.
+constexpr NemotronHBlock kAllBlocks[] = {
+    NemotronHBlock::kMamba, NemotronHBlock::kAttention, NemotronHBlock::kMoe,
+    NemotronHBlock::kMlp};
+
 NemotronHBlock BlockFromName(const std::string& name) {
-  if (name == "mamba") return NemotronHBlock::kMamba;
-  if (name == "attention") return NemotronHBlock::kAttention;
-  if (name == "moe") return NemotronHBlock::kMoe;
-  if (name == "mlp") return NemotronHBlock::kMlp;
+  for (NemotronHBlock block : kAllBlocks) {
+    if (name == NemotronHBlockName(block)) return block;
+  }
   // Mirror of validate_layer_type (configuration_nemotron_h.py:195-204).
+  std::string expected;
+  for (NemotronHBlock block : kAllBlocks) {
+    if (!expected.empty()) expected += ", ";
+    expected += NemotronHBlockName(block);
+  }
   Refuse("layers_block_type contains the unsupported block type '" + name +
-         "' (expected one of mamba, attention, moe, mlp)");
+         "' (expected one of " + expected + ")");
 }
 
 NemotronHBlock BlockFromPatternChar(char c) {
@@ -114,6 +142,20 @@ NemotronHBlock BlockFromPatternChar(char c) {
 // One layer schedule, resolved with upstream's precedence: the explicit list,
 // else the legacy pattern string, else the class default. `list_key` /
 // `pattern_key` are the modern/legacy pair, `fallback` the class default.
+//
+// NOTE the polarity, which is the OPPOSITE of the `mamba_*` scalars above and
+// is deliberate on both sides. configuration_nemotron_h.py:158-165:
+//
+//   if "hybrid_override_pattern" in kwargs:
+//       pattern = kwargs.pop("hybrid_override_pattern")
+//       if self.layer_types is None:
+//           self.layer_types = self._pattern_to_list(pattern)
+//
+// the legacy pattern is consulted ONLY when the modern list is absent, so here
+// MODERN wins; :176-184 does the same for the MTP pair. Verified by running
+// transformers @ 7d06b1a5: `NemotronHConfig(layer_types=['mamba','mamba'],
+// hybrid_override_pattern='*-')` -> `['mamba','mamba']`. Do not "unify" the two
+// families — upstream genuinely disagrees with itself here.
 std::vector<NemotronHBlock> ResolveSchedule(
     const json& doc, const char* list_key, const char* pattern_key,
     const std::vector<NemotronHBlock>& fallback) {
@@ -204,19 +246,27 @@ void ClaimNvfp4(std::vector<NemotronHTensor>& out, const std::string& prefix,
 
 // An FP8 W8A8 static-scaled projection: the e4m3 weight, its fp32 weight scale
 // and the fp32 static input scale (config_groups group_0, 46 targets).
+// `quantized` gates the companions exactly as `ClaimNvfp4` does: an UNQUANTIZED
+// producer ships the bare bf16 weight and no scales at all.
 void ClaimFp8(std::vector<NemotronHTensor>& out, const std::string& prefix,
-              const std::string& consumer) {
+              const std::string& consumer, bool quantized) {
   Claim(out, prefix + ".weight", consumer);
+  if (!quantized) return;
   Claim(out, prefix + ".weight_scale", consumer + ".weight_scale[fp8]");
   Claim(out, prefix + ".input_scale", consumer + ".input_scale[fp8]");
 }
 
 // One Mamba2 mixer (MambaMixer2, nemotron_h.py:373-389). `use_conv_bias` and
-// `mamba_proj_bias` gate the two optional biases exactly as upstream does.
+// `mamba_proj_bias` gate the two optional biases exactly as upstream does, and
+// `quantized` gates the in/out projection scale companions. Released bf16
+// NemotronH safetensors checkpoints ship NO `quantization_config` and no
+// `mixer.{in,out}_proj.{weight_scale,input_scale}`; hard-coding the FP8 pair
+// here enumerated 92 tensors such a checkpoint does not have (23 mamba blocks x
+// 2 projections x 2 companions).
 void ClaimMamba(std::vector<NemotronHTensor>& out, const NemotronHParams& p,
-                const std::string& mixer) {
-  ClaimFp8(out, mixer + ".in_proj", "mamba2.in_proj");
-  ClaimFp8(out, mixer + ".out_proj", "mamba2.out_proj");
+                const std::string& mixer, bool quantized) {
+  ClaimFp8(out, mixer + ".in_proj", "mamba2.in_proj", quantized);
+  ClaimFp8(out, mixer + ".out_proj", "mamba2.out_proj", quantized);
   if (p.mamba_proj_bias) {
     Claim(out, mixer + ".in_proj.bias", "mamba2.in_proj.bias");
     Claim(out, mixer + ".out_proj.bias", "mamba2.out_proj.bias");
@@ -367,7 +417,7 @@ NemotronHParams ParseNemotronHParams(const HfConfig& config) {
     p.sliding_window = GetInt(doc, "sliding_window", 0);
   }
 
-  // --- Mamba2 (legacy aliases normalized, configuration_nemotron_h.py:142-155) ---
+  // --- Mamba2 (legacy aliases WIN, configuration_nemotron_h.py:145-155) ---
   p.mamba_num_heads = GetInt(doc, "mamba_num_heads", 128);
   p.mamba_head_dim = GetInt(doc, "mamba_head_dim", 64);
   p.n_groups = GetIntAliased(doc, "n_groups", "mamba_n_groups", 8);
@@ -496,7 +546,7 @@ std::vector<NemotronHTensor> EnumerateNemotronHTensors(
     Claim(out, layer + ".norm.weight", "layer_norm");
     switch (p.layers_block_type[i]) {
       case NemotronHBlock::kMamba:
-        ClaimMamba(out, p, mixer);
+        ClaimMamba(out, p, mixer, quantized);
         break;
       case NemotronHBlock::kAttention:
         ClaimAttention(out, p, mixer, quantized && p.quant.fp8_kv_cache);
@@ -540,7 +590,7 @@ std::vector<NemotronHTensor> EnumerateNemotronHTensors(
         ClaimMoe(out, p, mixer, mtp_quantized);
         break;
       case NemotronHBlock::kMamba:
-        ClaimMamba(out, p, mixer);
+        ClaimMamba(out, p, mixer, mtp_quantized);
         break;
       case NemotronHBlock::kMlp:
         ClaimMlp(out, p, mixer, mtp_quantized);

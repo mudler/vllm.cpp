@@ -77,6 +77,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "vllm/model_executor/models/model_registry.h"
@@ -152,6 +153,14 @@ struct NemotronHParams {
   std::optional<int64_t> sliding_window = std::nullopt;
 
   // --- Mamba2 ---
+  // Each `legacy alias` below WINS over the modern spelling when both ship —
+  // `self.n_groups = kwargs.pop("mamba_n_groups") if "mamba_n_groups" in kwargs
+  // else self.n_groups` (configuration_nemotron_h.py:145-155) overwrites the
+  // already-populated dataclass field. That is the OPPOSITE of the two SCHEDULE
+  // pairs (`layers_block_type`/`hybrid_override_pattern` and the `mtp_` pair,
+  // :158-184), where the legacy pattern is consulted only when the modern list
+  // is absent. Upstream disagrees with itself between the two families; both
+  // polarities are mirrored as-is and pinned by the "PER-FAMILY" test case.
   int64_t mamba_num_heads = 0;  // 64
   int64_t mamba_head_dim = 0;   // 64
   int64_t n_groups = 0;         // 8   (legacy alias `mamba_n_groups`)

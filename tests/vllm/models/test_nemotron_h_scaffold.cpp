@@ -44,8 +44,16 @@
 
 #include "hf_snapshot.h"
 #include "vllm/model_executor/models/model_registry.h"
+// The forward-refusal SUBCASE has to CALL the type-erased forward, so it needs
+// the concrete definitions of the seam types `model_registry.h` only forward-
+// declares. `nemotron_h_registry.cpp:28` reaches for the same header for the
+// same reason.
+#include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits, *KvCache
 #include "vllm/transformers_utils/hf_config.h"
+#include "vllm/v1/attention/backend.h"            // CommonAttentionMetadata
+#include "vllm/v1/attention/backends/gdn_attn.h"  // GDNAttentionMetadata
 #include "vllm/v1/kv_cache_interface.h"
+#include "vt/device.h"
 #include "vt/dtype.h"
 
 using vllm::EnumerateNemotronHTensors;
@@ -346,6 +354,25 @@ TEST_CASE("NemotronH config: unrepresentable configs REFUSE BY NAME") {
     TempConfig cfg(doc);
     CHECK_THROWS_AS(ParseNemotronHParams(LoadHfConfig(cfg.path())),
                     std::runtime_error);
+    // The refusal NAMES the offender and enumerates the four block spellings
+    // from `NemotronHBlockName`, so it cannot list four kinds after a fifth is
+    // added. `doctest::Contains` takes a `const char*` LITERAL here on purpose:
+    // doctest 2.5.2 stringifies a `const char*` VARIABLE as `1`.
+    CHECK_THROWS_WITH_AS(ParseNemotronHParams(LoadHfConfig(cfg.path())),
+                         doctest::Contains("'swa'"), std::runtime_error);
+    for (NemotronHBlock block : {NemotronHBlock::kMamba,
+                                 NemotronHBlock::kAttention,
+                                 NemotronHBlock::kMoe, NemotronHBlock::kMlp}) {
+      const std::string name(vllm::NemotronHBlockName(block));
+      CHECK_FALSE(name.empty());
+      CHECK(name != "unknown");
+      // Round-trip: every spelling the refusal offers must actually PARSE.
+      nlohmann::json ok = FixtureConfigDoc();
+      ok["layers_block_type"][0] = name;
+      TempConfig ok_cfg(ok);
+      const NemotronHParams p = ParseNemotronHParams(LoadHfConfig(ok_cfg.path()));
+      CHECK(p.layers_block_type.at(0) == block);
+    }
   }
   SUBCASE("a latent MoE") {
     nlohmann::json doc = FixtureConfigDoc();
@@ -421,6 +448,126 @@ TEST_CASE(
                                             : unaccounted.front())
                     << " (" << unaccounted.size() << " total)");
   CHECK(enumerated.size() == 18487);
+}
+
+TEST_CASE(
+    "NemotronH enumeration: an UNQUANTIZED producer claims NO scale "
+    "companions") {
+  // The released checkpoint is ModelOpt-quantized, so every `quantized` flag is
+  // true there and the 18487-tensor gate above cannot see a claimer that IGNORES
+  // the flag. Drop `quantization_config` — the shape a released bf16 NemotronH
+  // safetensors checkpoint actually ships (spec §5b) — and the scale companions
+  // must all disappear. A claimer that hard-codes its FP8/NVFP4 companions
+  // enumerates tensors that do not exist, which is the silent mis-enumeration
+  // AGENTS.md forbids ("an arm that is not implemented is refused by name").
+  nlohmann::json doc = FixtureConfigDoc();
+  doc.erase("quantization_config");
+  TempConfig cfg(doc);
+  const NemotronHParams p = ParseNemotronHParams(LoadHfConfig(cfg.path()));
+  REQUIRE_FALSE(p.quant.present);
+  REQUIRE_FALSE(p.quant.fp8_kv_cache);
+
+  const std::vector<NemotronHTensor> enumerated = EnumerateNemotronHTensors(p);
+  const auto ends_with = [](const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+  };
+  std::vector<std::string> companions;
+  for (const NemotronHTensor& t : enumerated) {
+    if (ends_with(t.name, ".weight_scale") ||
+        ends_with(t.name, ".weight_scale_2") ||
+        ends_with(t.name, ".input_scale") || ends_with(t.name, ".k_scale") ||
+        ends_with(t.name, ".v_scale")) {
+      companions.push_back(t.name);
+    }
+  }
+  CHECK_MESSAGE(companions.empty(),
+                "an unquantized producer still claims scale companions, first: "
+                    << (companions.empty() ? std::string("-")
+                                           : companions.front())
+                    << " (" << companions.size() << " total)");
+
+  // The quantized arm is unchanged: the released config still claims all 18487.
+  const std::vector<NemotronHTensor> quantized =
+      EnumerateNemotronHTensors(FixtureParams());
+  CHECK(quantized.size() == 18487);
+  // The bf16 arm is the same MODEL with the companions removed, nothing else:
+  // every unquantized name is also claimed by the quantized arm.
+  std::set<std::string> quantized_names;
+  for (const NemotronHTensor& t : quantized) quantized_names.insert(t.name);
+  std::vector<std::string> only_bf16;
+  for (const NemotronHTensor& t : enumerated) {
+    if (quantized_names.count(t.name) == 0) only_bf16.push_back(t.name);
+  }
+  CHECK_MESSAGE(only_bf16.empty(),
+                "the bf16 arm invented a name the quantized arm never claims, "
+                "first: "
+                    << (only_bf16.empty() ? std::string("-")
+                                          : only_bf16.front()));
+}
+
+TEST_CASE(
+    "NemotronH config: when BOTH spellings ship, the precedence is upstream's "
+    "and it is PER-FAMILY") {
+  // Re-derived by RUNNING transformers @ 7d06b1a5 (the pin this file's header
+  // names), not by reading it:
+  //   NemotronHConfig(n_groups=8, mamba_n_groups=4, conv_kernel=4,
+  //                   mamba_d_conv=7)  ->  n_groups=4, conv_kernel=7
+  //   NemotronHConfig(layer_types=['mamba','mamba'],
+  //                   hybrid_override_pattern='*-')  ->  ['mamba','mamba']
+  // The two families genuinely DISAGREE, and each is mirrored on its own terms:
+  //
+  //   mamba_* SCALARS (configuration_nemotron_h.py:145-155) — LEGACY wins.
+  //     `self.n_groups = kwargs.pop("mamba_n_groups") if "mamba_n_groups" in
+  //     kwargs else self.n_groups`: the dataclass field already holds the modern
+  //     value, and the legacy alias OVERWRITES it unconditionally.
+  //
+  //   SCHEDULES (configuration_nemotron_h.py:158-165, :176-184) — MODERN wins.
+  //     `if "hybrid_override_pattern" in kwargs: ... if self.layer_types is
+  //     None: self.layer_types = _pattern_to_list(pattern)`: the legacy pattern
+  //     is consulted ONLY when the modern list is absent.
+  //
+  // No released checkpoint ships both spellings of the same field, so this is a
+  // mirroring obligation rather than a live defect — which is exactly why it
+  // needs a test: nothing else can catch it drifting.
+  nlohmann::json doc = FixtureConfigDoc();
+  const std::vector<NemotronHBlock> modern_schedule =
+      ParseNemotronHParams(LoadHfConfig(TempConfig(doc).path()))
+          .layers_block_type;
+
+  // Every mamba_* scalar gets a legacy alias that DISAGREES with the modern key
+  // the fixture already ships.
+  doc["mamba_n_groups"] = 4;      // modern `n_groups` is 8
+  doc["mamba_d_conv"] = 7;        // modern `conv_kernel` is 4
+  doc["mamba_expand"] = 9;        // modern `expand` is 2
+  doc["mamba_chunk_size"] = 77;   // modern `chunk_size` is 128
+  doc["mamba_conv_bias"] = false; // modern `use_conv_bias` is true
+  doc["mamba_dt_min"] = 0.5;      // modern `time_step_min` is 1e-3
+  doc["mamba_dt_max"] = 0.6;      // modern `time_step_max` is 1e-1
+  doc["mamba_dt_init_floor"] = 0.7;  // modern `time_step_floor` is 1e-4
+  // ...and both schedules get a legacy pattern that disagrees too.
+  doc["hybrid_override_pattern"] = "*-";
+  doc["mtp_hybrid_override_pattern"] = "M-";
+
+  TempConfig cfg(doc);
+  const NemotronHParams p = ParseNemotronHParams(LoadHfConfig(cfg.path()));
+
+  // LEGACY wins for the scalars.
+  CHECK(p.n_groups == 4);
+  CHECK(p.conv_kernel == 7);
+  CHECK(p.expand == 9);
+  CHECK(p.chunk_size == 77);
+  CHECK_FALSE(p.use_conv_bias);
+  CHECK(p.time_step_min == 0.5);
+  CHECK(p.time_step_max == 0.6);
+  CHECK(p.time_step_floor == 0.7);
+
+  // MODERN wins for the schedules — do NOT "unify" these with the scalars.
+  CHECK(p.layers_block_type == modern_schedule);
+  CHECK(p.layers_block_type.size() == 52);
+  CHECK(p.mtp_layers_block_type ==
+        std::vector<NemotronHBlock>{NemotronHBlock::kAttention,
+                                    NemotronHBlock::kMoe});
 }
 
 TEST_CASE("NemotronH enumeration: the shapes it implies are the ones on disk") {
@@ -525,6 +672,45 @@ TEST_CASE("NemotronH: the unported arms REFUSE BY NAME") {
     source.kind = vllm::ModelSource::Kind::kGguf;
     CHECK_THROWS_WITH_AS(reg.factory->load_weights(reg, config, source),
                          doctest::Contains("NemotronHForCausalLM"),
+                         std::runtime_error);
+  }
+
+  SUBCASE("the forward is W4's, and REFUSES rather than returning zeros") {
+    // The case title says "arms", plural, but until now only the GGUF arm was
+    // exercised. `ForwardNemotronHForCausalLM` is an unconditional VT_CHECK,
+    // which throws std::runtime_error (vt/dtype.h:11-17), so it is directly
+    // callable: a stub LoadedModel is enough because the forward consumes
+    // neither the model nor the input. A forward that silently returned `{}`
+    // would produce zero logits and a plausible-looking garbage token.
+    struct StubModel : vllm::LoadedModel {
+      explicit StubModel(const vllm::ModelRegistration& r) : LoadedModel(r) {}
+    };
+    StubModel model(reg);
+    const std::vector<int32_t> token_ids{0};
+    const std::vector<int32_t> positions{0};
+    const std::vector<int32_t> logits_indices{0};
+    const vllm::v1::CommonAttentionMetadata attn_meta{};
+    const vllm::v1::GDNAttentionMetadata gdn_meta{};
+    std::vector<vllm::PagedKvCache> attn_kv;
+    std::vector<vllm::GdnStateCache> gdn_state;
+    vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    const vllm::ModelForwardInput input{.token_ids = token_ids,
+                                        .positions = positions,
+                                        .attn_meta = attn_meta,
+                                        .gdn_meta = gdn_meta,
+                                        .attn_kv = attn_kv,
+                                        .gdn_state = gdn_state,
+                                        .config = config,
+                                        .queue = queue,
+                                        .logits_indices = logits_indices,
+                                        .num_reqs = 1};
+    // The message must NAME the missing piece, not just fail.
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("NemotronHForCausalLM forward is "
+                                           "not implemented yet"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(reg.factory->forward(model, input),
+                         doctest::Contains("nemotron-h-model.md"),
                          std::runtime_error);
   }
 }

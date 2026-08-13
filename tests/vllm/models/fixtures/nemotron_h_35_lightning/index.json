@@ -1,0 +1,5014 @@
+{
+ "_provenance": "Projected from nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 @ 29f2d1746d8f41e316523194b19018707749b1b1 (model.safetensors.index.json + the 52 safetensors headers; HEADERS ONLY -- no tensor bytes were read). One entry per (layer index, tensor suffix) family; only the ROUTED-EXPERT index is collapsed to {E} and `count` is how many experts share it. Layer indices are preserved.",
+ "revision": "29f2d1746d8f41e316523194b19018707749b1b1",
+ "tensors": {
+  "backbone.embeddings.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    131072,
+    2688
+   ]
+  },
+  "backbone.layers.0.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.0.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.0.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.0.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.0.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.0.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.0.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.0.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.0.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.0.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.0.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.0.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.0.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.1.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.1.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.1.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.1.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.1.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.1.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.1.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.1.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.1.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.1.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.1.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.1.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.1.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.1.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.1.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.10.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.10.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.10.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.10.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.10.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.10.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.10.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.10.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.10.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.10.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.10.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.10.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.10.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.10.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.10.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.11.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.11.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.11.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.11.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.11.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.11.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.11.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.11.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.11.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.11.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.11.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.11.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.11.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.12.mixer.k_proj.k_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.12.mixer.k_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.12.mixer.o_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.12.mixer.q_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ]
+  },
+  "backbone.layers.12.mixer.v_proj.v_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.12.mixer.v_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.12.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.13.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.13.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.13.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.13.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.13.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.13.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.13.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.13.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.13.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.13.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.13.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.13.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.13.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.13.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.13.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.14.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.14.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.14.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.14.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.14.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.14.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.14.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.14.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.14.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.14.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.14.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.14.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.14.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.15.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.15.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.15.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.15.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.15.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.15.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.15.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.15.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.15.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.15.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.15.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.15.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.15.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.15.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.15.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.16.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.16.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.16.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.16.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.16.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.16.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.16.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.16.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.16.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.16.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.16.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.16.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.16.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.17.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.17.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.17.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.17.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.17.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.17.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.17.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.17.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.17.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.17.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.17.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.17.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.17.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.17.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.17.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.18.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.18.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.18.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.18.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.18.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.18.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.18.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.18.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.18.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.18.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.18.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.18.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.18.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.19.mixer.k_proj.k_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.19.mixer.k_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.19.mixer.o_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.19.mixer.q_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ]
+  },
+  "backbone.layers.19.mixer.v_proj.v_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.19.mixer.v_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.19.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.2.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.2.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.2.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.2.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.2.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.2.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.2.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.2.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.2.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.2.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.2.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.2.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.2.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.20.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.20.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.20.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.20.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.20.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.20.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.20.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.20.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.20.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.20.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.20.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.20.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.20.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.20.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.20.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.21.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.21.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.21.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.21.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.21.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.21.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.21.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.21.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.21.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.21.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.21.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.21.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.21.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.22.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.22.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.22.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.22.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.22.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.22.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.22.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.22.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.22.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.22.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.22.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.22.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.22.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.22.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.22.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.23.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.23.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.23.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.23.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.23.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.23.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.23.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.23.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.23.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.23.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.23.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.23.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.23.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.24.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.24.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.24.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.24.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.24.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.24.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.24.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.24.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.24.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.24.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.24.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.24.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.24.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.24.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.24.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.25.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.25.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.25.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.25.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.25.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.25.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.25.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.25.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.25.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.25.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.25.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.25.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.25.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.26.mixer.k_proj.k_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.26.mixer.k_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.26.mixer.o_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.26.mixer.q_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ]
+  },
+  "backbone.layers.26.mixer.v_proj.v_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.26.mixer.v_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.26.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.27.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.27.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.27.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.27.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.27.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.27.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.27.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.27.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.27.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.27.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.27.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.27.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.27.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.27.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.27.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.28.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.28.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.28.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.28.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.28.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.28.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.28.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.28.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.28.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.28.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.28.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.28.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.28.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.29.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.29.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.29.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.29.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.29.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.29.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.29.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.29.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.29.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.29.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.29.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.29.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.29.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.29.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.29.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.3.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.3.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.3.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.3.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.3.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.3.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.3.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.3.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.3.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.3.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.3.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.3.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.3.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.3.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.3.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.30.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.30.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.30.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.30.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.30.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.30.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.30.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.30.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.30.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.30.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.30.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.30.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.30.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.31.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.31.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.31.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.31.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.31.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.31.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.31.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.31.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.31.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.31.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.31.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.31.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.31.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.31.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.31.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.32.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.32.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.32.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.32.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.32.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.32.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.32.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.32.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.32.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.32.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.32.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.32.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.32.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.33.mixer.k_proj.k_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.33.mixer.k_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.33.mixer.o_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.33.mixer.q_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ]
+  },
+  "backbone.layers.33.mixer.v_proj.v_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.33.mixer.v_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.33.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.34.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.34.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.34.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.34.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.34.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.34.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.34.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.34.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.34.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.34.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.34.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.34.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.34.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.34.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.34.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.35.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.35.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.35.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.35.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.35.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.35.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.35.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.35.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.35.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.35.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.35.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.35.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.35.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.36.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.36.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.36.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.36.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.36.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.36.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.36.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.36.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.36.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.36.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.36.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.36.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.36.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.36.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.36.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.37.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.37.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.37.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.37.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.37.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.37.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.37.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.37.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.37.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.37.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.37.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.37.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.37.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.38.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.38.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.38.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.38.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.38.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.38.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.38.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.38.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.38.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.38.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.38.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.38.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.38.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.38.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.38.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.39.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.39.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.39.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.39.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.39.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.39.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.39.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.39.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.39.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.39.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.39.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.39.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.39.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.4.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.4.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.4.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.4.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.4.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.4.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.4.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.4.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.4.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.4.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.4.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.4.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.4.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.40.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.40.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.40.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.40.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.40.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.40.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.40.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.40.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.40.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.40.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.40.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.40.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.40.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.40.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.40.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.41.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.41.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.41.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.41.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.41.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.41.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.41.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.41.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.41.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.41.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.41.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.41.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.41.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.42.mixer.k_proj.k_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.42.mixer.k_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.42.mixer.o_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.42.mixer.q_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ]
+  },
+  "backbone.layers.42.mixer.v_proj.v_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.42.mixer.v_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.42.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.43.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.43.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.43.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.43.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.43.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.43.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.43.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.43.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.43.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.43.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.43.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.43.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.43.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.43.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.43.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.44.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.44.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.44.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.44.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.44.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.44.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.44.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.44.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.44.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.44.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.44.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.44.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.44.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.45.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.45.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.45.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.45.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.45.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.45.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.45.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.45.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.45.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.45.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.45.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.45.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.45.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.45.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.45.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.46.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.46.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.46.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.46.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.46.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.46.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.46.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.46.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.46.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.46.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.46.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.46.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.46.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.47.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.47.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.47.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.47.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.47.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.47.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.47.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.47.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.47.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.47.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.47.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.47.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.47.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.47.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.47.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.48.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.48.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.48.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.48.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.48.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.48.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.48.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.48.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.48.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.48.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.48.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.48.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.48.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.49.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.49.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.49.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.49.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.49.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.49.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.49.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.49.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.49.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.49.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.49.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.49.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.49.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.49.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.49.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.5.mixer.k_proj.k_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.5.mixer.k_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.5.mixer.o_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.5.mixer.q_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ]
+  },
+  "backbone.layers.5.mixer.v_proj.v_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.5.mixer.v_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "backbone.layers.5.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.50.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.50.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.50.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.50.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.50.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.50.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.50.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.50.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.50.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.50.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.50.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.50.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.50.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.51.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.51.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.51.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.51.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.51.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.51.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.51.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.51.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.51.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.51.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.51.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.51.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.51.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.51.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.51.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.6.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.6.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.6.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.6.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.6.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.6.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.6.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.6.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.6.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.6.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.6.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.6.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.6.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.6.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.6.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.7.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.7.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.7.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.7.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.7.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.7.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.7.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.7.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.7.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.7.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.7.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.7.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.7.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.8.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    928
+   ]
+  },
+  "backbone.layers.8.mixer.experts.{E}.down_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    116
+   ]
+  },
+  "backbone.layers.8.mixer.experts.{E}.down_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.8.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "U8",
+   "shape": [
+    1856,
+    1344
+   ]
+  },
+  "backbone.layers.8.mixer.experts.{E}.up_proj.weight_scale": {
+   "count": 128,
+   "dtype": "F8_E4M3",
+   "shape": [
+    1856,
+    168
+   ]
+  },
+  "backbone.layers.8.mixer.experts.{E}.up_proj.weight_scale_2": {
+   "count": 128,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.8.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "backbone.layers.8.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "backbone.layers.8.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "backbone.layers.8.mixer.shared_experts.down_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    232
+   ]
+  },
+  "backbone.layers.8.mixer.shared_experts.down_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.8.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    3712,
+    1344
+   ]
+  },
+  "backbone.layers.8.mixer.shared_experts.up_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    3712,
+    168
+   ]
+  },
+  "backbone.layers.8.mixer.shared_experts.up_proj.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.8.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.layers.9.mixer.A_log": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.9.mixer.D": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.9.mixer.conv1d.bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ]
+  },
+  "backbone.layers.9.mixer.conv1d.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    1,
+    4
+   ]
+  },
+  "backbone.layers.9.mixer.dt_bias": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    64
+   ]
+  },
+  "backbone.layers.9.mixer.in_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.9.mixer.in_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    10304,
+    2688
+   ]
+  },
+  "backbone.layers.9.mixer.in_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.9.mixer.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ]
+  },
+  "backbone.layers.9.mixer.out_proj.input_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    1
+   ]
+  },
+  "backbone.layers.9.mixer.out_proj.weight": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "backbone.layers.9.mixer.out_proj.weight_scale": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "backbone.layers.9.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "backbone.norm_f.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "lm_head.weight": {
+   "count": 1,
+   "dtype": "U8",
+   "shape": [
+    131072,
+    1344
+   ]
+  },
+  "lm_head.weight_scale": {
+   "count": 1,
+   "dtype": "F8_E4M3",
+   "shape": [
+    131072,
+    168
+   ]
+  },
+  "lm_head.weight_scale_2": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": []
+  },
+  "mtp.layers.0.eh_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    5376
+   ]
+  },
+  "mtp.layers.0.enorm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "mtp.layers.0.hnorm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "mtp.layers.0.mixer.k_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "mtp.layers.0.mixer.o_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    4096
+   ]
+  },
+  "mtp.layers.0.mixer.q_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    2688
+   ]
+  },
+  "mtp.layers.0.mixer.v_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    256,
+    2688
+   ]
+  },
+  "mtp.layers.0.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "mtp.layers.1.final_layernorm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  },
+  "mtp.layers.1.mixer.experts.{E}.down_proj.weight": {
+   "count": 128,
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    1856
+   ]
+  },
+  "mtp.layers.1.mixer.experts.{E}.up_proj.weight": {
+   "count": 128,
+   "dtype": "BF16",
+   "shape": [
+    1856,
+    2688
+   ]
+  },
+  "mtp.layers.1.mixer.gate.e_score_correction_bias": {
+   "count": 1,
+   "dtype": "F32",
+   "shape": [
+    128
+   ]
+  },
+  "mtp.layers.1.mixer.gate.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ]
+  },
+  "mtp.layers.1.mixer.shared_experts.down_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    3712
+   ]
+  },
+  "mtp.layers.1.mixer.shared_experts.up_proj.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    2688
+   ]
+  },
+  "mtp.layers.1.norm.weight": {
+   "count": 1,
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ]
+  }
+ },
+ "total_tensors": 18487
+}

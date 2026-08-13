@@ -20545,3 +20545,48 @@ Measurement-base caveat: in-situ per-launch times are summed profiler kernel
 durations, standalone are wall-clock over 80 iterations. Both in-situ arms beat
 the standalone plateau per unit work (4.21 and 3.73 vs ~5.3), which may be partly
 that difference rather than a physical one.
+
+## SPEC-DSPARK / #442: the GEMM MIX dissolves the anomaly, and the in-situ normalisation has a MODE hole (2026-08-13)
+
+Two arithmetic corrections close out this thread.
+
+1. THE MIX. The 1520 in-situ launches are 760 gate_up plus 760 down, and down's
+   per-expert bytes are exactly HALF gate_up's: gate_up is 2N x K/2 weights plus
+   2N x K/16 scales = 1.1250 MiB, down is K x N/2 plus K x N/16 = 0.5625 MiB, so
+   the mixed average is 0.8438 MiB per expert-block. Comparing a mixed in-situ
+   average against a gate_up-ONLY standalone plateau was apples to oranges, and
+   it is what made both arms appear to "beat" the plateau (4.21 and 3.73 us
+   against ~5.3). They did not.
+
+   Redone with the right bytes:
+
+   | | blocks | MiB/launch | us | implied GB/s |
+   |---|---|---|---|---|
+   | ours | 38.9 | 32.8 | 164.0 | **209.9** |
+   | upstream | 40.6 | 34.3 | 151.6 | **236.9** |
+
+   Standalone gate_up plateau, measured: 203-226 GB/s. **Ours sits INSIDE it.
+   Upstream sits ABOVE it.** So we run this kernel at the bandwidth it achieves
+   in isolation, and upstream gets something in place that the isolated kernel
+   does not -- cache reuse across the gate_up/down pair (down's weights are half
+   size, so more of the working set can persist) is the first candidate. The
+   framing inverts: we are not slow here, upstream is unusually fast.
+
+2. THE MODE HOLE. This file already warns "a work COUNT may be taken under
+   different execution modes; a TIME may not", and then the per-unit-work
+   normalisation does exactly what that warns against: the 38.9/40.6 counts were
+   taken EAGER (ours VT_SPEC_DECODE_GRAPH=0, upstream enforce_eager, both
+   because the probes could not survive capture/compile) while the 249.2/230.4 ms
+   times came from the GRAPHED profile. Nothing establishes that the graphed runs
+   had the same blocks per launch as the eager ones, so every ratio built by
+   dividing those times by those counts -- 4.21 vs 3.73 us/block, 12.8% per unit
+   work, 186.6 vs 210.7 GB/s -- rests on a denominator measured in a different
+   execution mode than its numerator.
+
+CONSEQUENCE: the only like-for-like Marlin comparison anyone has is the
+standalone one, and it says parity (0.9973, inside 1 sd). Closing the in-situ
+question needs blocks AND time from the SAME graphed run, which needs a probe
+that survives capture -- a device-side counter written by the kernel launcher,
+read once at the end, never a per-launch D2H sync.
+
+Evidence: `dgx.casa:~/work/marlin442/`.

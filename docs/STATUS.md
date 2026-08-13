@@ -539,14 +539,25 @@ kernel and not the routing. Candidates in evidence order: expert-weight
 residency in situ, where this repo has already measured 20-30% per GEMM for
 host/ATS-retagged decode weights and the standalone arm's fresh cudaMalloc
 cannot reproduce it; clock and power state across runs; and overlap with
-concurrent stream work. Measurement bases differ too, in-situ being summed
-profiler durations against standalone wall-clock. Future MoE comparisons must
-control distinct experts per launch or force both arms onto one token stream,
-since blocks and experts diverge 4.7x at larger batches. None of this moves
-the end-to-end ~0.966x, which is wall-clock on matched prompts; it removes the
-attribution of its residual. One trap worth carrying: dram__bytes.sum reads
-n/a on GB10, so ncu's Memory Throughput % excludes DRAM traffic and is not a
-bandwidth utilisation. Weight
+concurrent stream work. Two arithmetic corrections then close it out. The 1520 in-situ launches are
+760 gate_up plus 760 down, and down's per-expert bytes are exactly half, so
+the mixed average is 0.8438 MiB per expert-block; comparing that against a
+gate_up-only standalone plateau is what made both arms look like they beat it.
+Redone correctly, ours implies 209.9 GB/s and upstream 236.9 against a
+measured 203-226 plateau, so OURS SITS INSIDE IT AND UPSTREAM ABOVE IT: we run
+this kernel at the bandwidth it achieves in isolation and upstream gets
+something in place that the isolated kernel does not, cache reuse across the
+gate_up/down pair being the first candidate. Second, every in-situ per-unit-
+work ratio has a mode hole: the 38.9/40.6 block counts were taken EAGER
+because the probes could not survive capture, while the 249.2/230.4 ms times
+came from the GRAPHED profile, so numerator and denominator are from different
+execution modes. The only like-for-like Marlin comparison in evidence is
+therefore the standalone one, and it says parity. Closing the in-situ question
+needs blocks and time from the SAME graphed run, via a device-side counter
+read once at the end rather than a per-launch D2H sync. None of this moves the
+end-to-end ~0.966x, which is wall-clock on matched prompts. One trap worth
+carrying: dram__bytes.sum reads n/a on GB10, so ncu's Memory Throughput %
+excludes DRAM traffic and is not a bandwidth utilisation. Weight
 residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
 same size and stride as upstream's tensor (268 MB, no padding), so the cause is
 memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under

@@ -375,18 +375,13 @@ std::vector<int32_t> ReadGenerationConfigEosIds(const std::string& path) {
 
 }  // namespace
 
-HfConfig LoadHfConfig(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    throw std::runtime_error("hf_config: cannot open " + path);
-  }
-  nlohmann::json doc;
-  try {
-    doc = nlohmann::json::parse(in);
-  } catch (const nlohmann::json::exception& e) {
-    throw std::runtime_error("hf_config: JSON parse error in " + path + ": " +
-                             e.what());
-  }
+namespace {
+
+// The whole parse, shared by the path and the in-memory entry points. `path` is
+// what error messages name; `sibling_generation_config` is false when there is
+// no file and therefore no sibling generation_config.json to read.
+HfConfig ParseHfConfigDoc(nlohmann::json doc, const std::string& path,
+                          bool sibling_generation_config) {
   if (!doc.is_object()) {
     throw std::runtime_error("hf_config: top-level JSON is not an object in " +
                              path);
@@ -567,8 +562,31 @@ HfConfig LoadHfConfig(const std::string& path) {
   }
 
   cfg.raw = std::move(doc);
-  cfg.generation_config_eos_ids = ReadGenerationConfigEosIds(path);
+  if (sibling_generation_config) {
+    cfg.generation_config_eos_ids = ReadGenerationConfigEosIds(path);
+  }
   return cfg;
+}
+
+}  // namespace
+
+HfConfig LoadHfConfig(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    throw std::runtime_error("hf_config: cannot open " + path);
+  }
+  nlohmann::json doc;
+  try {
+    doc = nlohmann::json::parse(in);
+  } catch (const nlohmann::json::exception& e) {
+    throw std::runtime_error("hf_config: JSON parse error in " + path + ": " +
+                             e.what());
+  }
+  return ParseHfConfigDoc(std::move(doc), path, /*sibling_generation_config=*/true);
+}
+
+HfConfig ParseHfConfig(const nlohmann::json& doc, const std::string& source) {
+  return ParseHfConfigDoc(doc, source, /*sibling_generation_config=*/false);
 }
 
 }  // namespace vllm

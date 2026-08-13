@@ -28,6 +28,7 @@
 // this binary is only built + smoke-tested against a synthetic engine (see
 // tests/vllm/entrypoints/openai/test_api_server.cpp). The wiring below is the
 // same either way.
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -84,6 +85,7 @@
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/multimodal/minimax_h3_video.h"
 #include "vllm/multimodal/parakeet_transcription.h"
+#include "vllm/multimodal/video_engine.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/version.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -194,6 +196,18 @@ struct Args {
   int video_encoder_max_layers = 50;
   std::string video_ffmpeg = "ffmpeg", video_device = "cuda";
   std::string video_partition;  // served partition (fl2va|ref2va); see the #77 guard
+  // The video model FAMILY to load. EMPTY keeps detection, which is the default
+  // and what every pre-L9B invocation gets. See the --video-family block below
+  // for why it now exists.
+  std::string video_family;
+  // FAMILY-SPECIFIC load knobs, `--video-extra KEY=VALUE`, repeatable. Pinning a
+  // family is useless if that family's required load knobs are unreachable:
+  // LTX-2.5 cannot load without `dit_config_path` (the shipped FP8 DiT carries
+  // no __metadata__) and `audio_prompt_embeds_path` (its audio stream conditions
+  // at a second width), and neither has — or should have — a dedicated flag on a
+  // family-generic server. `--video-partition` remains the documented alias for
+  // the H3 key "partition".
+  std::vector<std::pair<std::string, std::string>> video_extras;
   // Keep-quant is the library seam's DEFAULT arm; --video-dequant-bf16 selects
   // the bf16 dequant/stream arm (the throughput trade the gen example ships).
   // --video-keep-quant is still accepted (it names the default).
@@ -428,6 +442,20 @@ Args ParseArgs(int argc, char** argv) {
       a.video_device = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-partition") {
       a.video_partition = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-family") {
+      a.video_family = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--video-extra") {
+      const std::string kv = NextArg(argc, argv, i, argv[0]);
+      const std::string::size_type eq = kv.find('=');
+      // A bare KEY is refused rather than read as KEY="": an extra whose value
+      // silently became empty is how a mistyped knob renders the default and
+      // looks like the feature not working, which is the same failure the
+      // families' own unknown-extra refusals exist to stop.
+      if (eq == std::string::npos || eq == 0) {
+        std::cerr << "server: --video-extra takes KEY=VALUE, got '" << kv << "'\n";
+        Usage(argv[0], 2);
+      }
+      a.video_extras.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
     } else if (flag == "--video-keep-quant") {
       // the seam's default arm; accepted for pre-fold CLI compatibility
       a.video_dequant_bf16 = false;
@@ -547,6 +575,24 @@ Args ParseArgs(int argc, char** argv) {
   if (a.cuda_profile_graph_batch > a.max_num_seqs) {
     std::cerr << "server: --cuda-profile-graph-batch exceeds --max-num-seqs\n";
     Usage(argv[0], 2);
+  }
+  // The declared video family, checked HERE for the same reason the parser
+  // dialects below are: `LoadVideoEngine` would refuse an unregistered name
+  // anyway, but only after the TEXT model has loaded, so a typo would cost a
+  // multi-GB load instead of a second. The REGISTRY is the authority — never a
+  // literal list here — so a family added in its own file is accepted with no
+  // edit to this one, which is the whole point of the registration seam.
+  if (!a.video_family.empty()) {
+    const std::vector<std::string> registered =
+        vllm::multimodal::RegisteredVideoFamilies();
+    if (std::find(registered.begin(), registered.end(), a.video_family) ==
+        registered.end()) {
+      std::cerr << "server: --video-family '" << a.video_family
+                << "' is not a registered video family. Registered families:";
+      for (const std::string& name : registered) std::cerr << " " << name;
+      std::cerr << "\n";
+      Usage(argv[0], 2);
+    }
   }
   // Mirrors vllm/entrypoints/openai/cli_args.py:395 — upstream raises
   //   TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
@@ -993,10 +1039,10 @@ int VllmServerMain(int argc, char** argv) {
     // file keeps exactly what an example may own: flag plumbing, the job
     // directory, and the ONE process spawn (ffmpeg, ratified 2026-08-03 — the
     // library builds the argv and spawns nothing). ────────────────────────────
-    std::shared_ptr<vllm::multimodal::MiniMaxH3VideoEngine> video_engine;
+    std::shared_ptr<vllm::multimodal::VideoEngine> video_engine;
     if (!args.video_dit.empty()) {
-      std::cerr << "server: loading MiniMax-H3 video checkpoints...\n";
-      vllm::multimodal::MiniMaxH3VideoModelParams vmp;
+      std::cerr << "server: loading video checkpoints...\n";
+      vllm::multimodal::VideoModelParams vmp;
       vmp.dit_path = args.video_dit;
       vmp.encoder_path = args.video_encoder;
       vmp.tokenizer_path = args.video_tokenizer;
@@ -1005,12 +1051,41 @@ int VllmServerMain(int argc, char** argv) {
       vmp.audio_vae_path = args.audio_vae;
       vmp.audio_vae_config_path = args.audio_vae_config;
       vmp.prompt_embeds_path = args.video_prompt_embeds;
-      vmp.partition = args.video_partition;
+      // The H3-specific partition rides in the generic extras (LTX-2.5 L1).
+      if (!args.video_partition.empty()) vmp.extras["partition"] = args.video_partition;
+      // ...and every other family-specific knob rides there too, from
+      // --video-extra KEY=VALUE. Applied AFTER the partition alias so the two
+      // spellings of one key cannot disagree silently: a --video-extra
+      // partition=X that contradicts --video-partition Y is refused by name
+      // rather than resolved by whichever assignment ran last.
+      for (const auto& kv : args.video_extras) {
+        const auto existing = vmp.extras.find(kv.first);
+        if (existing != vmp.extras.end() && existing->second != kv.second) {
+          throw std::runtime_error("server: --video-extra " + kv.first + "=" + kv.second +
+                                   " contradicts the value already supplied for '" + kv.first +
+                                   "' ('" + existing->second +
+                                   "'). Refusing rather than preferring one.");
+        }
+        vmp.extras[kv.first] = kv.second;
+      }
       vmp.device = args.video_device == "cuda" ? 1 : 0;
       vmp.dequant_bf16 = args.video_dequant_bf16 ? 1 : 0;
       vmp.encoder_max_layers = args.video_encoder_max_layers;
-      video_engine = vllm::multimodal::MiniMaxH3VideoEngine::Load(vmp);
-      std::cerr << "server: /v1/videos on (device=" << args.video_device
+      // --video-family PINS the family; empty keeps detection, which is what
+      // every invocation before this flag existed got and still gets. The flag
+      // exists now because a SECOND family is registered (LTX-2.5), and the two
+      // shipped LTX DiTs are separate files whose comparison is only a statement
+      // about the files if the family is declared rather than inferred. It is
+      // never a hint: an unregistered name was already refused at ParseArgs, and
+      // a declared family that cannot load the checkpoint fails loudly instead
+      // of falling back to detection.
+      vmp.family = args.video_family;
+      video_engine = vllm::multimodal::LoadVideoEngine(vmp);
+      std::cerr << "server: video family "
+                << (args.video_family.empty() ? "DETECTED" : "DECLARED (--video-family)")
+                << "\n";
+      std::cerr << "server: /v1/videos on (family=" << video_engine->family()
+                << ", device=" << args.video_device
                 << (args.video_dequant_bf16 ? ", dequant-bf16" : ", keep-quant") << ")\n";
       // HONEST LIMIT, stated at startup rather than buried: turning a PROMPT
       // into conditioning needs the H3-Encoder; without one every request is
@@ -1034,8 +1109,8 @@ int VllmServerMain(int argc, char** argv) {
         const std::string dir = workdir + "/job" + std::to_string(id);
         // The library-owned request mapping + generation: conditioning, task
         // resolution, the #77 partition guard, reference encoding, artifacts.
-        const vllm::multimodal::MiniMaxH3VideoResult out = video_engine->Generate(
-            vllm::multimodal::MiniMaxH3VideoGenParamsFromRequest(req, dir));
+        const vllm::multimodal::VideoResult out =
+            video_engine->Generate(vllm::multimodal::VideoGenParamsFromRequest(req, dir));
         // The ONE process spawn: exec the argv the library composed.
         std::vector<std::string> argv_mux = out.mux_argv;
         if (!argv_mux.empty()) argv_mux[0] = ffmpeg;

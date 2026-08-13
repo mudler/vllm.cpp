@@ -296,10 +296,11 @@ class AgentRecordMutationTests(unittest.TestCase):
 
         Mirrors the ENGINE ratchet above, for the same reason and with more
         force: the MODEL count is the one that actually moves, because every new
-        architecture re-pins it by hand. Muse Glimmer took it 361 -> 362; the
-        seven recipe architectures that had no row at all took it 362 -> 369
-        (#609, #610). Without this, bumping the number to silence a failure is
-        indistinguishable from bumping it because a row really landed.
+        architecture re-pins it by hand. Muse Glimmer took it 361 -> 362
+        (`c8fc24a50`); the seven recipe architectures that had no row at all took
+        it 362 -> 369 (#609, #610, `eba6ab7c7`); LTX-2.5 took it 369 -> 370
+        (#435, `cefacd2d0`). Without this, bumping the number to silence a
+        failure is indistinguishable from bumping it because a row really landed.
         """
         clean: list[str] = []
         agent_record.check_matrices(clean)

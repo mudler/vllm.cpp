@@ -132,6 +132,23 @@ struct HfConfig {
 // path) on missing file, malformed JSON, or missing required fields.
 HfConfig LoadHfConfig(const std::string& path);
 
+// The same parse, from a config object already in hand. `source` appears in
+// every error message exactly where the path would, so a refusal still names
+// where the config came from.
+//
+// Exists because a config does not always arrive as a sibling `config.json`.
+// LTX-2.5's text encoder ships as ONE safetensors file whose HuggingFace config
+// rides in the file's own `__metadata__["gemma_config"]`
+// (gemma_assets.py:34, :110-114) — and the shipped `vonkaiser` NVFP4 build
+// carries no `__metadata__` at all, so its caller has to source the config out
+// of band and hand it over as an object. Writing it to a temporary file just to
+// read it back would make the temp directory part of a model path.
+//
+// Reads no sibling `generation_config.json`: without a path there is no sibling
+// to read, so `generation_config_eos_ids` stays empty rather than picking up
+// whatever happens to sit in the working directory.
+HfConfig ParseHfConfig(const nlohmann::json& doc, const std::string& source);
+
 // Cheap, non-throwing peek at config.json's `architectures` array — empty on
 // any parse/read problem. Exists for TASK dispatch BEFORE the full text-model
 // HfConfig parse: a SupportsTranscription-only checkpoint (Parakeet) nests its

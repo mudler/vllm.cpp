@@ -45,7 +45,6 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v2.h"
-#include "vllm/model_executor/models/device_pool.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -576,20 +575,16 @@ TEST_CASE("deepseek-v2 forward: CUDA agrees with CPU and is bit-exact run to run
   REQUIRE(p.mla.qk_head_dim() == 192);  // the ONLY head_dim the CUDA MLA prefill has
   REQUIRE(p.mla.head_size() == 576);
 
-  // PER-BACKEND SCRATCH POOLS, deliberately. The shared `DevicePool`
-  // (device_pool.h) is a process-wide singleton keyed ONLY on a byte size class
-  // and is documented "backend-agnostic"; that is safe for the engine, which
-  // drives exactly one device per process, but NOT for a test binary that runs a
-  // CPU forward and a CUDA forward in the same process — the second backend
-  // would be handed the first backend's recycled pointers (observed: SIGSEGV in
-  // the CPU arm on a CUDA block). Giving each arm its own pool is a TEST-LOCAL
-  // fix; the hazard itself is pre-existing and unrelated to MLA, recorded in the
-  // W7 ledger row rather than papered over here.
-  static vllm::DevicePool cuda_pool;
-  static vllm::DevicePool cpu_pool;
+  // A CPU forward and a CUDA forward in ONE process, with NO per-arm pool
+  // scoping. This used to need `static vllm::DevicePool cuda_pool/cpu_pool` and
+  // an `ActivePoolScope` around each arm, because the shared `DevicePool` was a
+  // process-wide singleton keyed ONLY on a byte size class: the second backend
+  // was handed the first backend's recycled pointers, observed as a SIGSEGV in
+  // the CPU arm on a CUDA block. The pool is now one-per-device (device_pool.h,
+  // .agents/specs/pool-device-key.md, #516), so the workaround is removed and
+  // this case is once more a detector for the hazard. Do not re-add the scopes.
   std::vector<float> cuda, again, cpu;
   {
-    const vllm::ActivePoolScope scope(&cuda_pool);
     cuda = RunTinyCuda(w);
     // Bit-exact run to run on device (nothing in the chain is non-deterministic).
     again = RunTinyCuda(w);
@@ -602,10 +597,7 @@ TEST_CASE("deepseek-v2 forward: CUDA agrees with CPU and is bit-exact run to run
   // bf16-GEMM-accumulation-order wide (the CPU arm runs the per-expert reference
   // loop and cuBLASLt/grouped kernels reduce in a different order), so this is a
   // NUMERIC agreement check, not a bit check.
-  {
-    const vllm::ActivePoolScope scope(&cpu_pool);
-    cpu = RunTiny(w);
-  }
+  cpu = RunTiny(w);
   REQUIRE(cpu.size() == cuda.size());
   double scale = 1e-6, worst = 0.0;
   for (float x : cpu) scale = std::max(scale, std::abs(static_cast<double>(x)));

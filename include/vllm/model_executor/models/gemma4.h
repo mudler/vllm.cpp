@@ -147,9 +147,52 @@ Gemma4Weights LoadGemma4ForConditionalGenerationWeightsOwned(
 // end-to-end gate is BLOCKED on the runner allocating one uniform KV head_dim
 // (runner.cpp:600-646) — Gemma-4's per-layer 256/512 heads are not representable
 // without a shared-path change to attn_kv_ construction. See gemma4-multimodal.md.
+// MODEL-DIFFUSION-LTX25 L3. What `output_hidden_states=True` returns, for the
+// consumers that condition on the WHOLE stack rather than on the logits — LTX-2.5's
+// text encoder is one (base_encoder.py:68-71: it runs the inner model, takes
+// `outputs.hidden_states`, and never touches lm_head).
+//
+// `hidden_states` has `num_hidden_layers + 1` entries, each [T, H] host f32, in
+// transformers' own append order:
+//   [0]   the input embeddings, already sqrt(hidden)-scaled
+//   [i]   the output of decoder layer i-1, for i in 1..num_hidden_layers-1
+//   [L]   model.norm(output of the LAST decoder layer)
+// The RAW output of the last decoder layer is NOT in the tuple. A consumer that
+// assumes it is gets 49 finite tensors of the right shape and the wrong content,
+// which is why this order is stated here and gated in
+// tests/vllm/models/test_ltx2_text_encoder.cpp rather than left to the reader.
+struct Gemma4HiddenStatesResult {
+  // HOST f32, and that is a WIDENING of upstream's dtype — recorded here rather
+  // than left as bare fact, per AGENTS.md's dtype-polarity rule. Upstream runs the
+  // whole text tower in ONE resolved dtype, bf16 by default
+  // (`LTXGemmaTextEncoder.__init__`, base_encoder.py:41
+  // `dtype: torch.dtype = torch.bfloat16`), and the `hidden_states` tuple it
+  // passes to the feature extractor is bf16. These states are downloaded from BF16
+  // device buffers (gemma4.cpp:571-578) and widened on the way out because this is
+  // the CPU REFERENCE ARM: it is what the LTX-2.5 parity gate compares against
+  // upstream executed in torch float32, and every LTX entry point REFUSES a
+  // non-f32 compute dtype by name rather than widening silently
+  // (ltx2_text_encoder.h, the DTYPE note). Cost of the widening, stated so it is
+  // not discovered later: at the shipped 49 x 1024 x 3840 x 4B this holds ~771 MB
+  // host where upstream holds ~385 MB. The bf16 / FP8 / NVFP4 arms are phase L6 of
+  // .agents/specs/ltx-2-5.md and are OWED, not shipped.
+  std::vector<std::vector<float>> hidden_states;
+  std::vector<float> logits;  // [n_out, vocab], as Forward() returns
+};
+
 class Gemma4Model {
  public:
   static std::vector<float> Forward(
+      const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const std::vector<PagedKvCache>& attn_kv, const Gemma4Weights& weights,
+      const HfConfig& config, vt::Queue& queue,
+      const std::vector<int32_t>& logits_indices = {});
+
+  // The same forward as Forward(), additionally returning every hidden state in
+  // transformers' order (see Gemma4HiddenStatesResult). Capture is OFF on every
+  // other entry point, so no shipped path changes shape or cost.
+  static Gemma4HiddenStatesResult ForwardHiddenStates(
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const Gemma4Weights& weights,
@@ -207,6 +250,30 @@ std::vector<int32_t> Gemma4GenerateGreedyViaRegistry(
     int32_t eos_token_id, const Gemma4Weights& weights, const HfConfig& config,
     vt::Queue& queue, int max_new_tokens,
     std::vector<float>* out_margins = nullptr);
+
+// The FULL-attention layers' "proportional" rope cos|sin table, on host in f32 —
+// the exact values the forward builds (BuildProportionalRopeCache rounds them to
+// bf16 to match the q/k it rotates; nothing else differs). Returns
+// [max_pos + 1, head_dim]: the first head_dim/2 columns are cos and the second
+// half sin, over the head_dim/2 DISTINCT angle pairs, mirroring upstream's
+// `emb = cat((freqs, freqs))` with each angle stored once
+// (`Gemma4UnifiedTextRotaryEmbedding.forward`, modeling_gemma4_unified.py:259-275
+// — the `cat` itself is :271; the inv_freq it consumes comes from
+// modeling_rope_utils.py:187-254).
+//
+// This is a GATE SURFACE, and it exists because of a measurement rather than a
+// preference. `partial_rotary_factor` decides how many angle pairs are rotated
+// and how many are zero-padded to identity, and it is the one field on this path
+// that the tower's hidden states cannot resolve: on the reduced LTX tower
+// fixture, forcing it from the config's 0.25 to 1.0 displaces the worst hidden
+// state by 1.09e-01 against that state's measured bf16 noise floor of 9.99e-02
+// — a ratio of 1.09, inside the tolerance the states are gated at — and a LARGER
+// fixture makes it worse, not better (0.65 at head_dim 16/32, seq 32), because
+// bf16 accumulation noise grows at least as fast as the rope contribution. So
+// the states are the wrong instrument and this table is the right one: f32, no
+// accumulation, compared element-wise against the oracle's own rotary embedding.
+std::vector<float> Gemma4ProportionalRopeCosSin(const HfConfig& config,
+                                                int64_t head_dim, int64_t max_pos);
 
 // Wrap already-loaded Gemma-4 weights in the registered LoadedModel so a caller
 // that owns the weights (the mm e2e gate) can drive ModelRegistry::Forward without

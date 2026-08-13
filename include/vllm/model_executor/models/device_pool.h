@@ -1,10 +1,9 @@
 // Shared process-wide caching device allocator (DevicePool) — extracted VERBATIM
 // from the Qwen3.6 forward (qwen3_5.cpp) so the dense Qwen3 forward (qwen3.cpp)
 // reuses the SAME pooled-scratch machinery instead of raw per-op Backend
-// Alloc/Free. This is a pure relocation: the class body, the Pool()/AuxPool()
-// singletons, and the thread-local ActivePool()/ActivePoolScope are byte-for-byte
-// the qwen3_5.cpp definitions, so the 27B/35B gate-model behavior is unchanged
-// (the header is included by qwen3_5.cpp in place of its old inline copies).
+// Alloc/Free. The relocation was byte-for-byte the qwen3_5.cpp definitions; what
+// has changed since is that a pool is now bound to ONE DEVICE (see below), and
+// the accessors take the backend that names it.
 //
 // Rationale: both cudaMalloc AND cudaFree SYNCHRONIZE the whole device, so the
 // per-op DBuf alloc/free churn in a forward (thousands of tiny scratch buffers per
@@ -15,8 +14,28 @@
 // on the same queue, and CUDA stream ordering guarantees the op that last touched
 // the block has completed before any reused op runs — no host sync needed. Blocks
 // are never returned to the driver (leak at process exit, like the cublasLt
-// workspace); the pool is bounded by the forward's peak concurrent scratch. The
-// pool is backend-agnostic (CPU malloc/free too — a harmless bounded cache there).
+// workspace); the pool is bounded by the forward's peak concurrent scratch.
+//
+// ONE POOL PER DEVICE (#516, .agents/specs/pool-device-key.md). Until this was
+// fixed there was ONE pool for the whole process and its free list was keyed by
+// byte size class alone, so a block allocated through one backend was handed to
+// the next caller of that size class whatever device it was running on. One
+// fault, two symptoms, chosen by direction: a cudaMalloc block reaching a
+// CPU-backend forward SIGSEGVs host-side (and compute-sanitizer is CLEAN,
+// because the fault is not on the device), while a host block reaching a CUDA
+// forward returned a UNIFORM 0x7fff0000 quiet NaN — computed and propagated, not
+// garbage read. vLLM never had the bug because it never had the design: its
+// allocation handle carries the device as field 0
+// (vllm/device_allocator/__init__.py:12-14 @ pin 555967922) and torch's cache is
+// per-device by construction (c10/cuda/CUDACachingAllocator.h:118-172).
+//
+// So a `DevicePool` is BOUND to one backend, `Pool(b)` resolves the pool for a
+// device, and there is deliberately NO way to spell "the pool" without naming a
+// device. The `vt::Backend*` IS the device identity: the registry hands out
+// exactly one Backend* per Device{type,index} (vt/backend.h, kMaxDevicesPerType),
+// and GetBackend(type) and GetBackend(Device{type,0}) return the identical
+// pointer — so the device enters the key with no new virtual on vt::Backend and
+// therefore no edit to any backend implementation.
 #pragma once
 
 #include <atomic>
@@ -26,9 +45,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "vt/backend.h"
@@ -49,9 +70,21 @@ namespace vllm {
 // its own class bucket. VT_POOL_EXACT=1 restores exact keying (A/B measurement).
 class DevicePool {
  public:
+  // A pool serves exactly ONE device, named at construction. Resolve one with
+  // Pool(b) / AuxPool(b) rather than building your own; a directly-constructed
+  // pool is for tests that want an isolated free list.
+  explicit DevicePool(vt::Backend& b) : backend_(&b) {}
+  DevicePool(const DevicePool&) = delete;
+  DevicePool& operator=(const DevicePool&) = delete;
+
+  // Size-class rounding is `private static`, and `tests/vt/test_cpu_isa_x86.cpp`
+  // exercises it directly (including the overflow throw) without a backend to
+  // build a pool on — this is that seam. It is deliberately `static`, so binding
+  // a pool to a device did not change it.
   static size_t SizeClassForTest(size_t bytes) { return ClassOf(bytes); }
 
   void* Get(vt::Backend& b, size_t bytes) {
+    RequireOwnDevice(b, "Get");
     // BYPASS lane (VT_POOL_BYPASS=1) — the pool is a DETECTOR BLIND SPOT and
     // this is how you see through it. Two ways it hides a real defect from
     // compute-sanitizer:
@@ -65,12 +98,7 @@ class DevicePool {
     // a real Free, which restores both boundaries for the detector. It is a
     // debugging lane only: it reinstates the per-op cudaMalloc/cudaFree sync
     // storm this pool exists to remove, so it is never a timing configuration.
-    // The backend is remembered here so the no-backend Put overload (the
-    // cross-step shared_ptr deleter) can free through it.
-    if (Bypass()) {
-      backend_ = &b;
-      return b.Alloc(bytes);
-    }
+    if (Bypass()) return b.Alloc(bytes);
     const size_t key = ClassOf(bytes);
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -89,13 +117,24 @@ class DevicePool {
   // Uncapped retention (deliberately-retained cross-step buffers: the device
   // logits / MTP hidden handed off via a shared_ptr deleter). Bytes are always
   // returned to the free list — the cross-step buffers are not cap-evicted.
-  void Put(size_t bytes, void* p) {
-    // Bypass: free for real so a later use-after-free traps. `backend_` is set by
-    // the Get that produced `p`, so it is non-null whenever a Put can be reached;
-    // the null guard keeps the lane from leaking a block if that ever stops
-    // holding rather than dereferencing a null backend.
+  //
+  // This used to take no backend at all, which is how ~28 copy-pasted
+  // `shared_ptr` deleters came to name neither the device nor the pool: they
+  // closed over a byte count and called `Pool().Put(alloc, q)`, so a block from
+  // ANY device was returned to the one global pool. The aux-stream half of that
+  // was LATENT rather than live: the deleter would have returned an AuxPool
+  // block to the main pool, but no `Release()` site sat under an
+  // `ActivePoolScope` — the four scope regions are leaf-ward of all nine of
+  // them — so the wrong-pool return was reachable only by adding a site, which
+  // is precisely the mistake that then costs a debugging campaign.
+  // `DBuf::ReleaseShared()` is now the only way to build that carrier and it
+  // captures the buffer's own pool and backend, so neither half can come back
+  // (#516).
+  void Put(vt::Backend& b, size_t bytes, void* p) {
+    RequireOwnDevice(b, "Put");
+    // Bypass: free for real so a later use-after-free traps.
     if (Bypass()) {
-      if (backend_ != nullptr) backend_->Free(p);
+      b.Free(p);
       return;
     }
     const size_t key = ClassOf(bytes);
@@ -110,6 +149,7 @@ class DevicePool {
   // When a discrete GPU sets a bound, scratch over the cap is freed to the driver
   // rather than pooled, so the reuse pool self-limits without a model edit.
   void Put(vt::Backend& b, size_t bytes, void* p, size_t cap) {
+    RequireOwnDevice(b, "Put");
     if (Bypass()) {
       b.Free(p);
       return;
@@ -137,8 +177,11 @@ class DevicePool {
   //
   // SAFETY: `free_` only ever holds blocks a DBuf already returned, so nothing
   // live is touched. Under VT_POOL_BYPASS the free list is always empty (Put
-  // frees straight through) and this is a no-op.
+  // frees straight through) and this is a no-op. And because a pool now holds
+  // ONE device's blocks, `b.Free` is guaranteed to be the allocator that made
+  // them — before #516 a drain could hand one device's block to another's Free.
   size_t Drain(vt::Backend& b) {
+    RequireOwnDevice(b, "Drain");
     std::lock_guard<std::mutex> lk(mu_);
     size_t freed = 0;
     for (auto& entry : free_) {
@@ -156,14 +199,38 @@ class DevicePool {
     if (std::getenv("VT_POOL_STATS") != nullptr) {
       const uint64_t h = hits_.load(), m = misses_.load();
       const double rate = (h + m) ? 100.0 * static_cast<double>(h) / static_cast<double>(h + m) : 0.0;
+      // The backend pointer identifies WHICH device's pool this line is about:
+      // a mixed-backend process now prints one line per device, and two lines
+      // with no way to tell them apart would be worse than one wrong line.
       std::fprintf(stderr,
-                   "[DevicePool] hits=%llu misses(cudaMalloc)=%llu hit-rate=%.2f%% distinct-classes=%zu\n",
+                   "[DevicePool backend=%p] hits=%llu misses(cudaMalloc)=%llu hit-rate=%.2f%% "
+                   "distinct-classes=%zu\n",
+                   static_cast<const void*>(backend_),
                    static_cast<unsigned long long>(h), static_cast<unsigned long long>(m),
                    rate, free_.size());
     }
   }
 
  private:
+  // The device check, on EVERY pool operation. A hard runtime throw and NOT an
+  // `assert`: the SACRED gate builds are Release/NDEBUG, where an assert is
+  // compiled out and the pre-fix behavior — a block silently crossing devices —
+  // would come straight back. It is one predictable compare against a member,
+  // against a `cudaMalloc` this pool exists to avoid.
+  //
+  // The only way to reach it is an `ActivePoolScope` pointing at another
+  // device's pool, which is precisely the mistake this row exists to make
+  // impossible to make quietly.
+  void RequireOwnDevice(vt::Backend& b, const char* op) const {
+    if (&b == backend_) return;
+    char msg[192];
+    std::snprintf(msg, sizeof(msg),
+                  "DevicePool::%s called with backend %p on a pool bound to backend %p: a scratch "
+                  "block must never cross devices (see .agents/specs/pool-device-key.md, #516)",
+                  op, static_cast<const void*>(&b), static_cast<const void*>(backend_));
+    throw std::logic_error(msg);
+  }
+
   // VT_POOL_BYPASS=1 turns every Get/Put into a raw driver Alloc/Free (see Get).
   // Read once: it must not change between an allocation and its matching free,
   // or a pooled block would be handed to Backend::Free (or a driver block leaked
@@ -197,19 +264,64 @@ class DevicePool {
   }
 
   std::mutex mu_;
-  // Backend the last Get allocated through, so the no-backend Put overload can
-  // free under bypass. One device per process (see ResolveDevicePoolPolicy), so
-  // this is stable; unused when bypass is off.
-  vt::Backend* backend_ = nullptr;
+  // THE DEVICE, and the reason this class exists in this shape. Every block in
+  // `free_` was allocated by this backend and will be freed by it; nothing else
+  // may draw from or return to this pool.
+  vt::Backend* backend_;
   std::unordered_map<size_t, std::vector<void*>> free_;
   size_t retained_ = 0;  // bytes (class-rounded) held in free_, for the soft cap
   std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> misses_{0};
 };
 
-inline DevicePool& Pool() {
-  static DevicePool p;
+namespace detail {
+
+// Process-wide table of per-device pools. Tiny by construction: one entry per
+// `vt::Backend*` the process ever allocates through, i.e. one per
+// Device{type,index}. Entries are never erased, which is what lets Pool()'s
+// memo below hold a raw pointer.
+class PoolTable {
+ public:
+  DevicePool& For(vt::Backend& b) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& e : pools_)
+      if (e.first == &b) return *e.second;
+    pools_.emplace_back(&b, std::unique_ptr<DevicePool>(new DevicePool(b)));
+    return *pools_.back().second;
+  }
+
+ private:
+  std::mutex mu_;
+  std::vector<std::pair<vt::Backend*, std::unique_ptr<DevicePool>>> pools_;
+};
+
+inline PoolTable& MainPoolTable() {
+  static PoolTable t;
+  return t;
+}
+
+// The (backend -> pool) resolution, memoized per thread. A DBuf resolves its
+// pool on EVERY construction — thousands per forward step — and this pool's
+// whole purpose is to avoid a synchronizing cudaMalloc, so paying a lock and a
+// scan for it would be self-defeating. A process drives one device per host
+// thread at a time, so the steady state here is a single pointer compare.
+inline DevicePool& MemoizedPool(PoolTable& table, vt::Backend& b,
+                                vt::Backend*& last_backend, DevicePool*& last_pool) {
+  if (last_backend == &b) return *last_pool;
+  DevicePool& p = table.For(b);
+  last_backend = &b;
+  last_pool = &p;
   return p;
+}
+
+}  // namespace detail
+
+// THE scratch pool for a device. There is deliberately no no-argument spelling:
+// "the pool" without a device is the defect (#516), not an ergonomic shortcut.
+inline DevicePool& Pool(vt::Backend& b) {
+  thread_local vt::Backend* last_backend = nullptr;
+  thread_local DevicePool* last_pool = nullptr;
+  return detail::MemoizedPool(detail::MainPoolTable(), b, last_backend, last_pool);
 }
 
 // --- Aux-stream scratch pool (ENG-MOE-SHARED-AUX) ----------------------------
@@ -228,26 +340,47 @@ inline DevicePool& Pool() {
 // share a live block. Blocks are handed back to the pool they came from (DBuf
 // stores its owning pool), so a buffer allocated in the aux region and destroyed
 // after the join still returns to the aux pool.
+// The aux pool is per-device too: the stream distinction and the device
+// distinction are independent, and a process with two devices running the MoE
+// overlap needs one aux pool per device, not one shared between them.
 #ifdef VT_MARLIN_NVFP4  // only the Marlin MoE overlap path draws from AuxPool
-inline DevicePool& AuxPool() {
-  static DevicePool p;
-  return p;
+namespace detail {
+inline PoolTable& AuxPoolTable() {
+  static PoolTable t;
+  return t;
+}
+}  // namespace detail
+inline DevicePool& AuxPool(vt::Backend& b) {
+  thread_local vt::Backend* last_backend = nullptr;
+  thread_local DevicePool* last_pool = nullptr;
+  return detail::MemoizedPool(detail::AuxPoolTable(), b, last_backend, last_pool);
 }
 #endif
 
-// Thread-local "active" scratch pool a DBuf constructs from. Defaults to the main
-// Pool(); the aux-stream overlap region swaps it to AuxPool() for the duration of
-// the shared-expert issue via ActivePoolScope. Single host thread drives the
+// Thread-local OVERRIDE of the scratch pool a DBuf constructs from. Null means
+// "this device's own Pool(b)" — the default, and the only correct default, since
+// a thread-local cannot know which device the next DBuf will be built on. The
+// aux-stream overlap region swaps it to AuxPool(b) for the duration of the
+// shared-expert issue via ActivePoolScope. Single host thread drives the
 // forward, and the aux ops are issued in one contiguous block, so the swap is a
 // simple RAII stack.
-inline DevicePool*& ActivePool() {
-  thread_local DevicePool* p = &Pool();
+//
+// An override pointing at ANOTHER device's pool is no longer a silent
+// corruption: the pool checks its backend on every operation and throws.
+inline DevicePool*& ActivePoolOverride() {
+  thread_local DevicePool* p = nullptr;
   return p;
+}
+inline DevicePool& ActivePool(vt::Backend& b) {
+  DevicePool* const override_pool = ActivePoolOverride();
+  return override_pool != nullptr ? *override_pool : Pool(b);
 }
 struct ActivePoolScope {
   DevicePool* prev;
-  explicit ActivePoolScope(DevicePool* p) : prev(ActivePool()) { ActivePool() = p; }
-  ~ActivePoolScope() { ActivePool() = prev; }
+  explicit ActivePoolScope(DevicePool* p) : prev(ActivePoolOverride()) {
+    ActivePoolOverride() = p;
+  }
+  ~ActivePoolScope() { ActivePoolOverride() = prev; }
   ActivePoolScope(const ActivePoolScope&) = delete;
   ActivePoolScope& operator=(const ActivePoolScope&) = delete;
 };

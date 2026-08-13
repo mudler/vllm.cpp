@@ -87,12 +87,22 @@ std::vector<double> KaiserWindow(int64_t length, double beta) {
   return window;
 }
 
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// The shared 1-D BigVGAN primitives (declared in minimax_h3.h). They were private
+// to this translation unit until LTX-2.5's audio VAE — the same BigVGAN lineage —
+// needed them and copied them instead; see the header for why one implementation
+// gated by two suites beats two implementations each with its own green gate.
+// ---------------------------------------------------------------------------
+
 // One 1-D convolution over [C_in, T] with dilation/stride/groups.
 // Weight is [C_out, C_in/groups, K]; input is assumed ALREADY padded.
-std::vector<float> Conv1d(const std::vector<float>& in, int64_t in_channels, int64_t in_len,
-                          const std::vector<float>& weight, const std::vector<float>* bias,
-                          int64_t out_channels, int64_t kernel, int64_t stride, int64_t dilation,
-                          int64_t groups, int64_t* out_len) {
+std::vector<float> MiniMaxH3Conv1d(const std::vector<float>& in, int64_t in_channels,
+                                   int64_t in_len, const std::vector<float>& weight,
+                                   const std::vector<float>* bias, int64_t out_channels,
+                                   int64_t kernel, int64_t stride, int64_t dilation,
+                                   int64_t groups, int64_t* out_len) {
   const int64_t effective = dilation * (kernel - 1) + 1;
   const int64_t length = (in_len - effective) / stride + 1;
   VT_CHECK(length > 0, "minimax_h3 audio vae: conv1d output length is empty");
@@ -120,11 +130,11 @@ std::vector<float> Conv1d(const std::vector<float>& in, int64_t in_channels, int
 
 // torch.nn.functional.conv_transpose1d over [C_in, T].
 // Weight is [C_in, C_out/groups, K]; output length = (T-1)*stride - 2*padding + K.
-std::vector<float> ConvTranspose1d(const std::vector<float>& in, int64_t in_channels,
-                                   int64_t in_len, const std::vector<float>& weight,
-                                   const std::vector<float>* bias, int64_t out_channels,
-                                   int64_t kernel, int64_t stride, int64_t padding, int64_t groups,
-                                   int64_t* out_len) {
+std::vector<float> MiniMaxH3ConvTranspose1d(const std::vector<float>& in, int64_t in_channels,
+                                            int64_t in_len, const std::vector<float>& weight,
+                                            const std::vector<float>* bias, int64_t out_channels,
+                                            int64_t kernel, int64_t stride, int64_t padding,
+                                            int64_t groups, int64_t* out_len) {
   const int64_t full = (in_len - 1) * stride + kernel;
   const int64_t length = full - 2 * padding;
   VT_CHECK(length > 0, "minimax_h3 audio vae: conv_transpose1d output length is empty");
@@ -157,15 +167,19 @@ std::vector<float> ConvTranspose1d(const std::vector<float>& in, int64_t in_chan
   return out;
 }
 
-// F.pad(..., mode="replicate") along the time axis.
-std::vector<float> PadReplicate(const std::vector<float>& in, int64_t channels, int64_t in_len,
-                                int64_t left, int64_t right, int64_t* out_len) {
+// F.pad along the time axis: mode="replicate", or the zero pad an ordinary
+// nn.Conv1d `padding=` argument performs.
+std::vector<float> MiniMaxH3Pad1d(const std::vector<float>& in, int64_t channels, int64_t in_len,
+                                  int64_t left, int64_t right, bool replicate, int64_t* out_len) {
   const int64_t length = in_len + left + right;
-  std::vector<float> out(static_cast<size_t>(channels * length));
+  std::vector<float> out(static_cast<size_t>(channels * length), 0.0f);
   for (int64_t c = 0; c < channels; ++c) {
     for (int64_t t = 0; t < length; ++t) {
       int64_t src = t - left;
-      src = std::max<int64_t>(0, std::min<int64_t>(in_len - 1, src));
+      if (src < 0 || src >= in_len) {
+        if (!replicate) continue;  // already zero
+        src = std::max<int64_t>(0, std::min<int64_t>(in_len - 1, src));
+      }
       out[static_cast<size_t>(c * length + t)] = in[static_cast<size_t>(c * in_len + src)];
     }
   }
@@ -173,18 +187,22 @@ std::vector<float> PadReplicate(const std::vector<float>& in, int64_t channels, 
   return out;
 }
 
-// SnakeBeta: x + (beta + 1e-9)^-1 * sin^2(alpha * x), with alpha/beta exponentiated
-// when the checkpoint stores them in log scale (H3 does).
-void SnakeBeta(std::vector<float>& x, int64_t channels, int64_t length,
-               const std::vector<float>& alpha, const std::vector<float>& beta, bool logscale) {
+// Snake / SnakeBeta: x + (b + kMiniMaxH3SnakeEps)^-1 * sin^2(a * x). A null `beta`
+// is plain Snake, which reuses ALPHA as the reciprocal scale (LTX-2.5
+// vocoder.py:198); a non-null one is SnakeBeta (vocoder.py:221), which is what
+// every MiniMax-H3 checkpoint carries. Both are exponentiated when the checkpoint
+// stores them in log scale.
+void MiniMaxH3SnakeActivation(std::vector<float>& x, int64_t channels, int64_t length,
+                              const std::vector<float>& alpha, const std::vector<float>* beta,
+                              bool logscale) {
   for (int64_t c = 0; c < channels; ++c) {
     double a = alpha[static_cast<size_t>(c)];
-    double b = beta[static_cast<size_t>(c)];
+    double b = beta != nullptr ? (*beta)[static_cast<size_t>(c)] : a;
     if (logscale) {
       a = std::exp(a);
       b = std::exp(b);
     }
-    const double inv_beta = 1.0 / (b + 1e-9);
+    const double inv_beta = 1.0 / (b + kMiniMaxH3SnakeEps);
     for (int64_t t = 0; t < length; ++t) {
       const double v = x[static_cast<size_t>(c * length + t)];
       const double s = std::sin(a * v);
@@ -192,8 +210,6 @@ void SnakeBeta(std::vector<float>& x, int64_t channels, int64_t length,
     }
   }
 }
-
-}  // namespace
 
 // kaiser_sinc_filter1d (dac_alias_free_filter.py:26-60). Returns [kernel_size].
 std::vector<float> MiniMaxH3KaiserSincFilter1d(double cutoff, double half_width,
@@ -265,74 +281,68 @@ std::vector<float> MiniMaxH3MaterializeWeightNorm(const std::vector<float>& g,
   return out;
 }
 
+// The anti-aliased activation, `Activation1d`: upsample by `ratio` -> Snake(Beta)
+// -> downsample by `ratio` (MiniMax-H3: dac_alias_free_act.py +
+// dac_alias_free_resample.py; LTX-2.5: audio_vae/vocoder.py:104-184). Declared in
+// minimax_h3.h and shared with ltx2_audio_vae.cpp — the pad/trim geometry below is
+// exactly the arithmetic that must not exist twice.
+void MiniMaxH3AliasFreeActivation1d::Build() {
+  // Up and down use the same cutoff/half_width/kernel, so one window serves both.
+  filter = MiniMaxH3KaiserSincFilter1d(0.5 / static_cast<double>(ratio),
+                                       0.6 / static_cast<double>(ratio), kernel_size);
+}
+
+std::vector<float> MiniMaxH3AliasFreeActivation1d::Apply(const std::vector<float>& in,
+                                                         int64_t channels, int64_t in_len,
+                                                         const std::vector<float>& alpha,
+                                                         const std::vector<float>* beta,
+                                                         bool logscale, int64_t* out_len) const {
+  // --- UpSample1d ---
+  const int64_t pad = kernel_size / ratio - 1;
+  const int64_t pad_left = pad * ratio + (kernel_size - ratio) / 2;
+  const int64_t pad_right = pad * ratio + (kernel_size - ratio + 1) / 2;
+  int64_t padded_len = 0;
+  const std::vector<float> padded =
+      MiniMaxH3Pad1d(in, channels, in_len, pad, pad, /*replicate=*/true, &padded_len);
+  // Depthwise transposed conv: filter.expand(C, -1, -1) => weight [C, 1, K].
+  std::vector<float> depthwise(static_cast<size_t>(channels * kernel_size));
+  for (int64_t c = 0; c < channels; ++c) {
+    for (int64_t k = 0; k < kernel_size; ++k) {
+      depthwise[static_cast<size_t>(c * kernel_size + k)] = filter[static_cast<size_t>(k)];
+    }
+  }
+  int64_t up_len = 0;
+  std::vector<float> up =
+      MiniMaxH3ConvTranspose1d(padded, channels, padded_len, depthwise, nullptr, channels,
+                               kernel_size, ratio, /*padding=*/0, /*groups=*/channels, &up_len);
+  for (float& value : up) value *= static_cast<float>(ratio);
+  // x[..., pad_left : -pad_right]
+  const int64_t trimmed_len = up_len - pad_left - pad_right;
+  VT_CHECK(trimmed_len > 0, "minimax_h3 audio vae: upsample trim emptied the signal");
+  std::vector<float> trimmed(static_cast<size_t>(channels * trimmed_len));
+  for (int64_t c = 0; c < channels; ++c) {
+    for (int64_t t = 0; t < trimmed_len; ++t) {
+      trimmed[static_cast<size_t>(c * trimmed_len + t)] =
+          up[static_cast<size_t>(c * up_len + pad_left + t)];
+    }
+  }
+
+  // --- Snake / SnakeBeta ---
+  MiniMaxH3SnakeActivation(trimmed, channels, trimmed_len, alpha, beta, logscale);
+
+  // --- DownSample1d (LowPassFilter1d, stride = ratio, replicate padding) ---
+  const bool even = (kernel_size % 2) == 0;
+  const int64_t lp_left = kernel_size / 2 - (even ? 1 : 0);
+  const int64_t lp_right = kernel_size / 2;
+  int64_t lp_padded_len = 0;
+  const std::vector<float> lp_padded = MiniMaxH3Pad1d(trimmed, channels, trimmed_len, lp_left,
+                                                      lp_right, /*replicate=*/true, &lp_padded_len);
+  return MiniMaxH3Conv1d(lp_padded, channels, lp_padded_len, depthwise, nullptr, channels,
+                         kernel_size, /*stride=*/ratio, /*dilation=*/1, /*groups=*/channels,
+                         out_len);
+}
+
 namespace {
-
-// The anti-aliased activation: upsample 2x -> SnakeBeta -> downsample 2x
-// (dac_alias_free_act.py + dac_alias_free_resample.py).
-struct AliasFreeActivation {
-  int64_t ratio = 2;
-  int64_t kernel_size = 12;
-  std::vector<float> up_filter;
-  std::vector<float> down_filter;
-
-  void Build() {
-    up_filter = MiniMaxH3KaiserSincFilter1d(0.5 / static_cast<double>(ratio),
-                                            0.6 / static_cast<double>(ratio), kernel_size);
-    down_filter = up_filter;  // same cutoff/half_width/kernel for ratio 2
-  }
-
-  std::vector<float> Apply(const std::vector<float>& in, int64_t channels, int64_t in_len,
-                           const std::vector<float>& alpha, const std::vector<float>& beta,
-                           bool logscale, int64_t* out_len) const {
-    // --- UpSample1d ---
-    const int64_t pad = kernel_size / ratio - 1;
-    const int64_t pad_left = pad * ratio + (kernel_size - ratio) / 2;
-    const int64_t pad_right = pad * ratio + (kernel_size - ratio + 1) / 2;
-    int64_t padded_len = 0;
-    const std::vector<float> padded = PadReplicate(in, channels, in_len, pad, pad, &padded_len);
-    // Depthwise transposed conv: filter.expand(C, -1, -1) => weight [C, 1, K].
-    std::vector<float> up_weight(static_cast<size_t>(channels * kernel_size));
-    for (int64_t c = 0; c < channels; ++c) {
-      for (int64_t k = 0; k < kernel_size; ++k) {
-        up_weight[static_cast<size_t>(c * kernel_size + k)] = up_filter[static_cast<size_t>(k)];
-      }
-    }
-    int64_t up_len = 0;
-    std::vector<float> up = ConvTranspose1d(padded, channels, padded_len, up_weight, nullptr,
-                                            channels, kernel_size, ratio, /*padding=*/0,
-                                            /*groups=*/channels, &up_len);
-    for (float& value : up) value *= static_cast<float>(ratio);
-    // x[..., pad_left : -pad_right]
-    const int64_t trimmed_len = up_len - pad_left - pad_right;
-    VT_CHECK(trimmed_len > 0, "minimax_h3 audio vae: upsample trim emptied the signal");
-    std::vector<float> trimmed(static_cast<size_t>(channels * trimmed_len));
-    for (int64_t c = 0; c < channels; ++c) {
-      for (int64_t t = 0; t < trimmed_len; ++t) {
-        trimmed[static_cast<size_t>(c * trimmed_len + t)] =
-            up[static_cast<size_t>(c * up_len + pad_left + t)];
-      }
-    }
-
-    // --- SnakeBeta ---
-    SnakeBeta(trimmed, channels, trimmed_len, alpha, beta, logscale);
-
-    // --- DownSample1d (LowPassFilter1d, stride = ratio, replicate padding) ---
-    const bool even = (kernel_size % 2) == 0;
-    const int64_t lp_left = kernel_size / 2 - (even ? 1 : 0);
-    const int64_t lp_right = kernel_size / 2;
-    int64_t lp_padded_len = 0;
-    const std::vector<float> lp_padded =
-        PadReplicate(trimmed, channels, trimmed_len, lp_left, lp_right, &lp_padded_len);
-    std::vector<float> down_weight(static_cast<size_t>(channels * kernel_size));
-    for (int64_t c = 0; c < channels; ++c) {
-      for (int64_t k = 0; k < kernel_size; ++k) {
-        down_weight[static_cast<size_t>(c * kernel_size + k)] = down_filter[static_cast<size_t>(k)];
-      }
-    }
-    return Conv1d(lp_padded, channels, lp_padded_len, down_weight, nullptr, channels, kernel_size,
-                  /*stride=*/ratio, /*dilation=*/1, /*groups=*/channels, out_len);
-  }
-};
 
 int64_t GetPadding(int64_t kernel_size, int64_t dilation) {
   return (kernel_size * dilation - dilation) / 2;
@@ -352,7 +362,7 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
            "minimax_h3 audio vae: upsample rates/kernels length mismatch");
   VT_CHECK(static_cast<int64_t>(config.resblock_dilation_sizes.size()) == num_kernels,
            "minimax_h3 audio vae: resblock kernels/dilations length mismatch");
-  AliasFreeActivation act;
+  MiniMaxH3AliasFreeActivation1d act;
   act.Build();
 
   auto conv_weight = [&](const std::string& prefix, int64_t out_channels) {
@@ -361,7 +371,7 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
                                           out_channels);
   };
 
-  // --- dec_in_proj: Conv1d(vae_latent_channels -> num_mels, k=1) ---
+  // --- dec_in_proj: MiniMaxH3Conv1d(vae_latent_channels -> num_mels, k=1) ---
   // DacAudioVAE.decode applies this BEFORE BigVGAN (dac_audio_vae.py:218-231). It
   // is absent when the caller already supplies a num_mels-wide tensor, which is
   // what the standalone BigVGAN gate does.
@@ -377,7 +387,7 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
     int64_t projected_len = 0;
     const std::vector<float>* bias =
         weights.Has("dec_in_proj.bias") ? &weights.Get("dec_in_proj.bias") : nullptr;
-    mels = Conv1d(latent, in_channels, frames, w, bias, config.num_mels, 1, 1, 1, 1, &projected_len);
+    mels = MiniMaxH3Conv1d(latent, in_channels, frames, w, bias, config.num_mels, 1, 1, 1, 1, &projected_len);
     VT_CHECK(projected_len == frames, "minimax_h3 audio vae: dec_in_proj changed the length");
     mel_source = mels.data();
   } else {
@@ -385,7 +395,7 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
              "minimax_h3 audio vae: latent size does not match [num_mels, frames]");
   }
 
-  // --- conv_pre: Conv1d(num_mels -> upsample_initial_channel, k=7, padding=3) ---
+  // --- conv_pre: MiniMaxH3Conv1d(num_mels -> upsample_initial_channel, k=7, padding=3) ---
   int64_t channels = config.upsample_initial_channel;
   int64_t length = 0;
   std::vector<float> x;
@@ -399,7 +409,7 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
     const int64_t padded_len = frames + 6;  // zero padding 3 on each side
     const std::vector<float> w = conv_weight("conv_pre", channels);
     const std::vector<float>& b = weights.Get("conv_pre.bias");
-    x = Conv1d(padded, config.num_mels, padded_len, w, &b, channels, 7, 1, 1, 1, &length);
+    x = MiniMaxH3Conv1d(padded, config.num_mels, padded_len, w, &b, channels, 7, 1, 1, 1, &length);
   }
 
   // --- upsample stages ---
@@ -412,7 +422,7 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
     const std::vector<float> w = conv_weight(prefix, channels);
     const std::vector<float>& b = weights.Get(prefix + ".bias");
     int64_t up_len = 0;
-    x = ConvTranspose1d(x, channels, length, w, &b, out_channels, kernel, rate,
+    x = MiniMaxH3ConvTranspose1d(x, channels, length, w, &b, out_channels, kernel, rate,
                         /*padding=*/(kernel - rate) / 2, /*groups=*/1, &up_len);
     channels = out_channels;
     length = up_len;
@@ -433,7 +443,7 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
 
         int64_t act_len = 0;
         std::vector<float> xt = act.Apply(h, channels, length, weights.Get(a1 + ".act.alpha"),
-                                          weights.Get(a1 + ".act.beta"), config.snake_logscale,
+                                          &weights.Get(a1 + ".act.beta"), config.snake_logscale,
                                           &act_len);
         VT_CHECK(act_len == length, "minimax_h3 audio vae: anti-aliased activation changed length");
         int64_t padded_len = 0;
@@ -447,11 +457,12 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
         }
         padded_len = length + 2 * pad1;
         int64_t conv_len = 0;
-        xt = Conv1d(padded, channels, padded_len, conv_weight(c1, channels),
-                    &weights.Get(c1 + ".bias"), channels, kernel_size, 1, dilation, 1, &conv_len);
+        xt = MiniMaxH3Conv1d(padded, channels, padded_len, conv_weight(c1, channels),
+                             &weights.Get(c1 + ".bias"), channels, kernel_size, 1, dilation, 1,
+                             &conv_len);
 
         xt = act.Apply(xt, channels, conv_len, weights.Get(a2 + ".act.alpha"),
-                       weights.Get(a2 + ".act.beta"), config.snake_logscale, &act_len);
+                       &weights.Get(a2 + ".act.beta"), config.snake_logscale, &act_len);
         const int64_t pad2 = GetPadding(kernel_size, 1);
         std::vector<float> padded2(static_cast<size_t>(channels * (act_len + 2 * pad2)), 0.0f);
         for (int64_t c = 0; c < channels; ++c) {
@@ -461,8 +472,9 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
           }
         }
         int64_t conv2_len = 0;
-        xt = Conv1d(padded2, channels, act_len + 2 * pad2, conv_weight(c2, channels),
-                    &weights.Get(c2 + ".bias"), channels, kernel_size, 1, 1, 1, &conv2_len);
+        xt = MiniMaxH3Conv1d(padded2, channels, act_len + 2 * pad2, conv_weight(c2, channels),
+                             &weights.Get(c2 + ".bias"), channels, kernel_size, 1, 1, 1,
+                             &conv2_len);
         VT_CHECK(conv2_len == length, "minimax_h3 audio vae: resblock changed the sequence length");
         for (size_t n = 0; n < h.size(); ++n) h[n] += xt[n];
       }
@@ -476,7 +488,7 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
   {
     int64_t act_len = 0;
     x = act.Apply(x, channels, length, weights.Get("activation_post.act.alpha"),
-                  weights.Get("activation_post.act.beta"), config.snake_logscale, &act_len);
+                  &weights.Get("activation_post.act.beta"), config.snake_logscale, &act_len);
     length = act_len;
   }
   {
@@ -496,7 +508,7 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
       b = &bias_storage;
     }
     int64_t final_len = 0;
-    x = Conv1d(padded, channels, length + 2 * pad, w, b, 1, 7, 1, 1, 1, &final_len);
+    x = MiniMaxH3Conv1d(padded, channels, length + 2 * pad, w, b, 1, 7, 1, 1, 1, &final_len);
     length = final_len;
   }
   // H3 sets use_tanh_at_final=false, so the output is CLAMPED, not squashed.
@@ -569,7 +581,7 @@ std::vector<float> WnConv1d(const MiniMaxH3AudioVaeWeights& weights, const std::
   const std::vector<float>& bias = weights.Get(prefix + ".bias");
   int64_t padded_len = 0;
   const std::vector<float> padded = PadZero(in, in_channels, in_len, padding, padding, &padded_len);
-  return Conv1d(padded, in_channels, padded_len, w, &bias, out_channels, kernel, stride, dilation,
+  return MiniMaxH3Conv1d(padded, in_channels, padded_len, w, &bias, out_channels, kernel, stride, dilation,
                 /*groups=*/1, out_len);
 }
 
@@ -927,7 +939,7 @@ std::vector<float> MiniMaxH3AudioVaeEncodeToLatent(const MiniMaxH3AudioVaeEncode
     width = projected;
   }
 
-  // mean_proj: a PLAIN Conv1d(attn_proj_dim -> vae_latent_channels, k=1); the VAE's
+  // mean_proj: a PLAIN MiniMaxH3Conv1d(attn_proj_dim -> vae_latent_channels, k=1); the VAE's
   // distribution MEAN. `logs_proj` is never evaluated — a reference must be
   // deterministic, so nothing is sampled.
   const std::vector<float>& w = weights.Get("mean_proj.weight");
@@ -935,7 +947,7 @@ std::vector<float> MiniMaxH3AudioVaeEncodeToLatent(const MiniMaxH3AudioVaeEncode
   VT_CHECK(static_cast<int64_t>(w.size()) == config.vae_latent_channels * width,
            "minimax_h3 audio encoder: mean_proj is not [vae_latent_channels, attn_proj_dim, 1]");
   int64_t out_len = 0;
-  std::vector<float> mean = Conv1d(latent, width, frames, w, &b, config.vae_latent_channels,
+  std::vector<float> mean = MiniMaxH3Conv1d(latent, width, frames, w, &b, config.vae_latent_channels,
                                    /*kernel=*/1, /*stride=*/1, /*dilation=*/1, /*groups=*/1,
                                    &out_len);
   VT_CHECK(out_len == frames, "minimax_h3 audio encoder: mean_proj changed the frame count");

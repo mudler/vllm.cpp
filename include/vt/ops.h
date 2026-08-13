@@ -107,6 +107,7 @@ enum class OpId : uint8_t {
   kMoeRouterTopK,
   kMoeCombine,
   kAttention,
+  kAttentionCross,
   kAttentionDenseFast,
   kAttentionDenseFlash,
   kAttentionDenseFa2,
@@ -384,6 +385,18 @@ enum class OpId : uint8_t {
   kMamba2ChunkScan,
   kMamba2StateUpdate,
   kRmsNormGatedGroup,
+  // LTX-2.5 DiT device-resident-forward glue table (phase L8). Only the seven
+  // small ops the shared vt:: surface does NOT already cover: the AdaLN table
+  // lookup, the AdaZero affine, the gated residual accumulate, the per-head
+  // attention gate, LTX's split/interleaved RoPE, the output head's
+  // table+embedded affine, and plain ungated SiLU. Everything else in the DiT
+  // forward reuses tuned shared ops (kMatmulBT, kRmsNorm, kLayerNorm, kGeluTanh,
+  // kAdd, kAttention, kAttentionCross), so this table stays deliberately small.
+  // Registered on BOTH kCPU and kCUDA (cpu_ltx2.cpp / cuda_ltx2.cu) so the
+  // device forward is exercised in CPU CI too; resolved via ltx2::Ltx2Device().
+  // Additive: only Ltx2DitForwardDevice dispatches it. Appended before kCount
+  // so no existing op's id shifts.
+  kLtx2,
   kCount
 };
 
@@ -550,6 +563,26 @@ struct AttentionArgs {
   // Causal masking: key position j attends only when j <= query position i.
   // Always true for the M0.9 decoder path (bidirectional is a M1.6+ concern).
   bool causal = true;
+};
+
+// Dense NON-CAUSAL CROSS attention args. vt::Attention requires key/value to
+// carry the SAME token count as query (ops.cpp: "query/key/value token count must
+// match"), which no cross-attention can satisfy: LTX-2.5's text cross-attention
+// (transformer.py:113 `attn2`) and its audio<->video cross-attention
+// (transformer.py:154 `audio_to_video_attn`, :166 `video_to_audio_attn`) each
+// project queries from one stream and keys/values from another, so Tq != S by
+// construction. This is that seam, kept SEPARATE from vt::Attention so every
+// existing self-attention call stays byte-identical.
+//
+// query [Tq,Hq,D], key/value [S,Hkv,D], out [Tq,Hq,D]; Hq a multiple of Hkv
+// (GQA broadcast, exactly as vt::Attention). Query i attends to EVERY key j in
+// [0,S) — bidirectional, no causal mask; the only masking is the optional
+// additive `bias` (see vt::AttentionCross). f32 softmax with max subtraction.
+struct AttentionCrossArgs {
+  // Softmax scale applied to the qk dot product. torch SDPA's default is
+  // E**-0.5 with E = query.size(-1) = head_dim, which is what every LTX
+  // attention gets (attention.py:98). Must be set explicitly (> 0).
+  float scale = 0.0f;
 };
 
 // --- Conformer / FastConformer audio-encoder op args (spike
@@ -1037,6 +1070,8 @@ using MoeCombineGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&);
 using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                              const AttentionArgs&);
+using AttentionCrossFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
+                                  const Tensor* /*bias*/, const AttentionCrossArgs&);
 // Conformer / FastConformer audio-encoder kernels (spike P1/P2/P3).
 using Conv2dFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/, const Tensor& /*weight*/,
                           const Tensor* /*bias*/, const Conv2dArgs&);
@@ -2374,6 +2409,45 @@ void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tenso
 // f32 or bf16 in, f32/bf16 out; all softmax/accumulation math in f32.
 void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                const Tensor& value, const AttentionArgs& args);
+
+// --- Dense non-causal CROSS attention (LTX-2.5 L2). See AttentionCrossArgs for
+// why vt::Attention cannot serve it. Per q-head h (kv-head g = h/(Hq/Hkv)),
+// query i in [0,Tq), keys j in [0,S):
+//   s[j] = scale * (query[i,h] · key[j,g]) + bias[i or 0, j]
+//   p    = softmax_j(s)                       (f32, max-subtracted)
+//   out[i,h] = Σ_j p[j] * value[j,g]
+// `bias` is an OPTIONAL rank-2 additive score bias [Tq, S] or [1, S] (the
+// broadcast key-only form a padding mask produces), f32, on the same device;
+// nullptr means no bias. It is additive in torch SDPA's sense — upstream builds
+// it as `(mask - 1) * finfo.max` for the prompt mask (transformer_args.py:204)
+// and as log-space attenuation for the self-attention strength mask (:232-237),
+// so a fully masked key reaches the softmax as a large negative number, NOT as
+// -inf, and an all-masked row degenerates to a uniform average exactly as torch's
+// does. All softmax/accumulation math is f32.
+//
+// BACKENDS, recorded so it cannot be discovered later: this op ships with a CPU
+// kernel (`AttentionCrossKernel`, src/vt/cpu/cpu_ops.cpp) AND — since phase L8,
+// 2026-08-12 — a NATIVE CUDA kernel (src/vt/cuda/cuda_attention_cross.cu). An
+// earlier revision of this paragraph recorded the CUDA one as OWED "alongside the
+// LTX-2.5 device-resident forward, which is the first caller that would need it";
+// that caller arrived and so did the kernel, in the same change, and a CUDA
+// device now has a real provider rather than a refusal or a unified-memory
+// fallback to the host.
+//
+// The CUDA kernel is a structural port of `AttentionDenseFlashKernel`
+// (src/vt/cuda/cuda_ops.cu), generalized on the three axes AttentionCrossArgs
+// exists for. It uses the online-softmax recurrence where the CPU kernel uses the
+// explicit three-pass max/exp/normalize, so the two agree to f32 summation-order
+// slack and are NOT bit-identical — the same relationship `AttentionDenseFast`
+// already has with `AttentionKernel`.
+//
+// A device with NO provider — kXPU, say — still refuses through `GetOp`, naming
+// this op via `vt::OpName` rather than falling back. Callers route on what a call
+// MEANS, not on whether its numbers happen to be square, so that refusal is
+// deterministic per call site instead of per prompt length — see Ltx2Attention
+// (src/vllm/model_executor/models/ltx2.cpp).
+void AttentionCross(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                    const Tensor& value, const Tensor* bias, const AttentionCrossArgs& args);
 
 // --- Conformer / FastConformer audio-encoder kernels -------------------------
 // Spike: .agents/specs/parakeet-conformer-encoder.md (rows P1/P2/P3). Upstream

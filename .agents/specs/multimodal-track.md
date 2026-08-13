@@ -205,6 +205,101 @@ unchanged.
 
 ---
 
+### 1.5 Multimodal CONFIG and input limits — the seam this map missed (#607, 2026-08-13)
+
+The seam map above covers the input *pipeline* and the tower, but not the
+**config that decides whether either runs**. That gap surfaced from the
+`recipes.vllm.ai` sweep: `--language-model-only` is used by **43 of 157** official
+recipes, and we reject it.
+
+| vLLM seam | file:line @ `555967922` | What we build |
+|---|---|---|
+| `MultiModalConfig.limit_per_prompt` | `vllm/config/multimodal.py:81` | NEW per-modality input-count limits on the model config |
+| `get_limit_per_prompt(modality)` | `vllm/config/multimodal.py:321-336` (returns **0** when `language_model_only`, else the map, else the 999 default) | NEW accessor; the single place every consumer asks |
+| `language_model_only` | `vllm/config/multimodal.py:78` | NEW flag — **sugar**, see below |
+| `--limit-mm-per-prompt` | `vllm/engine/arg_utils.py:556,1279,1692` | serve flag — **the primary one**; the limits are the mechanism |
+| `--language-model-only` | `vllm/engine/arg_utils.py:555,1276,1691` | serve flag over the boolean |
+| **`validate_num_items` — what makes a limit a limit** | `vllm/multimodal/processing/context.py:409-428` — raises `VLLMValidationError("At most {limit} {modality}(s) may be provided in one prompt.")`, appending `" Set --limit-mm-per-prompt to increase this limit."` when the MODEL supports more (`:425-426`) | NEW — the **enforcement** point; without it a limit is a number nothing reads |
+| its two call sites | `context.py:461` inside `parse_mm_data` (`:430`), and `vllm/entrypoints/chat_utils.py:662` per tracked item, whose only escape is `enable_mm_embeds` + a `*_embeds` modality at limit 0 (`chat_utils.py:653-660`) | NEW — mirror both, including that escape |
+| `allowed_mm_limits` | `vllm/multimodal/processing/context.py:392-405` — folds the USER limit with the model's own `supported_mm_limits` by `min()` | NEW — a user limit never raises a model's ceiling |
+| further limit consumers | `vllm/multimodal/registry.py:126` (every supported modality at limit 0 ⇒ mm processing disabled, unless `enable_mm_embeds`); `vllm/v1/worker/encoder_cudagraph.py:139` (`video` limit 0 ⇒ `max_frames_per_batch = 0`) | NEW — the limits reach past the tower |
+| **tower skip when all limits are 0** | `vllm/model_executor/models/interfaces.py:293` — builds the tower inside `no_init_weights(..., StageMissingLayer)` when `all(get_limit_per_prompt(m) == 0)` | the memory win; a CONSEQUENCE of zero limits, reachable by either flag |
+| kernel gate | `vllm/model_executor/models/qwen3_next.py:325` — `text_only` feeds `use_fused_qk_norm_rope_gate` | our fused path is currently unconditional; see below |
+| LoRA interaction | `vllm/lora/model_manager.py:233` | deferred with `LORA-RUNTIME` |
+
+**The correction that matters.** `--language-model-only` is **not** a
+"skip the encoder" boolean. Its own docstring is explicit: *"disables all
+multimodal inputs by setting all modality limits to 0. Equivalent to setting
+`--limit-mm-per-prompt` to 0 for every modality."* The encoder skip falls out of
+`interfaces.py:293` because the limits are zero — **any** route to zero limits
+gets it. So porting the boolean alone would be a bespoke path that does not exist
+upstream, which the mirror rule forbids: port `limit_per_prompt` +
+`get_limit_per_prompt` first, and the flag becomes three lines on top.
+
+**The consequence that matters more: upstream `--language-model-only` REFUSES
+every multimodal request.** This was missing from the first draft of this
+section, which mapped the memory consequence and the kernel gate but not the
+enforcement. Follow the chain: `get_limit_per_prompt` returns **0** for every
+modality (`multimodal.py:321-327`), so `validate_num_items` computes `limit = 0`
+and raises `VLLMValidationError` for any request carrying one or more items
+(`context.py:409-428`), on both the `parse_mm_data` path (`:461`) and the OpenAI
+chat path (`chat_utils.py:662`). The user-visible behaviour of the flag is not
+"the same server, minus some VRAM" — it is a server that answers an image
+request with *"At most 0 image(s) may be provided in one prompt."*
+
+That is what makes the limits the mechanism and the flag the sugar, and it is
+the half a port can most easily leave out, because omitting it breaks nothing
+that a text-only workload would notice.
+
+**Our baseline is nothing.** `grep -rn 'limit_per_prompt\|MultimodalConfig' src/
+include/` returns no hits; no multimodal config surface exists, and nothing gates
+tower construction on config. This is a port, not an exposure.
+
+**A second-order consequence worth naming.** `qwen3_next.py:325` proves the flag
+is not purely a memory knob — upstream uses it to select the *fused* QK-norm+RoPE+
+gate path. Ours takes the fused route unconditionally (`qwen3_5.cpp`, "true for
+BOTH the 27B and the 35B"). That asymmetry is the serving-side twin of
+[#414](https://github.com/mudler/vllm.cpp/issues/414), which found our published
+ratios flattered because the oracle ran unfused while we ran fused. Any gate
+comparing the two arms must set the flag on both sides or state that it did not.
+
+**Waves** (additive to §3; none blocks M1's pipeline work):
+
+- **L1** — `limit_per_prompt` + `get_limit_per_prompt` on the model config, with
+  upstream's precedence exactly: `language_model_only` ⇒ 0, else the explicit map,
+  else 999 — **and the refusal that gives those numbers effect**: mirror
+  `allowed_mm_limits` (`min()` against the model's supported limits) and
+  `validate_num_items`, message text included, at both call sites, with
+  upstream's `enable_mm_embeds` escape. Unit-gated, no serve surface yet. The
+  refusal belongs here, not in L3: it is the limits' own semantics, and a limit
+  nothing enforces is not a limit.
+- **L2** — `--limit-mm-per-prompt` and `--language-model-only` serve flags plus
+  the C-ABI field, over L1. This is the point at which the 43 recipes stop
+  aborting.
+- **L3** — the tower skip: construct-without-initialising when every limit is 0,
+  gated on **measured** RSS reduction against a multimodal checkpoint, plus
+  token-exactness of the text path with and without the flag.
+- **L4** — mirror the kernel gate, or record an explicit tracked exception with
+  the #414 cross-reference.
+
+**L2 is shippable without L3 only because L1 carries the refusal.** The first
+draft of this section said "L2 without L3 is honest and shippable: the flag
+would be accepted and would correctly zero the limits". That was too generous,
+and the caveat it carried guarded the wrong thing — it guarded "frees VRAM"
+while leaving a much larger divergence unguarded. Zeroing a limit that nothing
+enforces is not correct behaviour: we would ACCEPT an image request that
+upstream REFUSES, which is the flag's main observable effect, and the flag would
+be inert on exactly the axis a user would test first.
+
+So the honest statement is conditional. **With L1's refusal, L2 ships honestly**
+and only the memory win is owed; it must still NOT be described as "frees VRAM"
+until L3 lands and is measured. **Without the refusal, L2 is not shippable at
+all** — it is a flag that is accepted and inert, which is worse than the abort
+it replaces, because an abort is visible and a silently-served image request is
+not.
+
+---
+
 ## 2. Structured contract
 
 ### Scope

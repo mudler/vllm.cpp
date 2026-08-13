@@ -2546,6 +2546,63 @@ void AttentionKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key
   });
 }
 
+// Dense non-causal CROSS attention (LTX-2.5 L2) — the CPU REFERENCE. Same three
+// pass structure as AttentionKernel, with the key extent taken from KEY's own
+// token count (not query's) and an optional additive score bias. Semantics
+// ported from torch's `scaled_dot_product_attention(q,k,v,attn_mask=...,
+// is_causal=False)` as LTX's PytorchAttention calls it
+// (ltx_core/model/transformer/attention.py:97-102).
+void AttentionCrossKernel(Queue&, Tensor& out, const Tensor& query, const Tensor& key,
+                          const Tensor& value, const Tensor* bias,
+                          const AttentionCrossArgs& args) {
+  const int64_t tq = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t s = key.shape[0], hk = key.shape[1];
+  const int64_t qpk = hq / hk;  // q-heads per kv-head (GQA ratio)
+  const float scale = args.scale;
+  const float* bias_data = bias != nullptr ? bias->Ptr<float>() : nullptr;
+  const int64_t bias_rows = bias != nullptr ? bias->shape[0] : 0;
+  ForRows(hq * tq, [&](int64_t r0, int64_t r1) {
+  std::vector<float> probs(static_cast<size_t>(s));
+  std::vector<float> acc(static_cast<size_t>(d));
+  for (int64_t r = r0; r < r1; ++r) {
+    const int64_t h = r / tq;
+    const int64_t g = h / qpk;
+    const int64_t i = r % tq;
+    const int64_t qoff = (i * hq + h) * d;
+    // The bias row this query reads: its own, or the single broadcast row.
+    const float* brow = bias_data == nullptr ? nullptr
+                                             : bias_data + (bias_rows == 1 ? 0 : i) * s;
+    // Pass 1: scores + running max.
+    float m = -std::numeric_limits<float>::infinity();
+    for (int64_t j = 0; j < s; ++j) {
+      const int64_t koff = (j * hk + g) * d;
+      float dot = 0.0f;
+      for (int64_t e = 0; e < d; ++e) dot += LoadF32(query, qoff + e) * LoadF32(key, koff + e);
+      dot *= scale;
+      if (brow != nullptr) dot += brow[j];
+      probs[static_cast<size_t>(j)] = dot;
+      if (dot > m) m = dot;
+    }
+    // Pass 2: exp + normalization denominator.
+    float denom = 0.0f;
+    for (int64_t j = 0; j < s; ++j) {
+      const float e = std::exp(probs[static_cast<size_t>(j)] - m);
+      probs[static_cast<size_t>(j)] = e;
+      denom += e;
+    }
+    const float inv = 1.0f / denom;  // denom >= 1 (the argmax term is exp(0)=1)
+    // Pass 3: weighted sum of v (f32 accumulation), stored at out's dtype.
+    for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] = 0.0f;
+    for (int64_t j = 0; j < s; ++j) {
+      const float p = probs[static_cast<size_t>(j)] * inv;
+      const int64_t voff = (j * hk + g) * d;
+      for (int64_t e = 0; e < d; ++e) acc[static_cast<size_t>(e)] += p * LoadF32(value, voff + e);
+    }
+    for (int64_t e = 0; e < d; ++e) StoreF32(out, qoff + e, acc[static_cast<size_t>(e)]);
+  }
+  });
+}
+
 // DFlash in-block attention (SPEC-DFLASH D2, DF-DRAFT-MODEL) — the CPU REFERENCE
 // for the project's first non-causal / bidirectional attention. Semantics ported
 // from DFlashQwen3Attention + _resolve_layer_attention (qwen3_dflash.py:86-146,
@@ -3126,6 +3183,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernel)));
     RegisterOp(OpId::kAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<AttentionFn>(&AttentionKernel)));
+    RegisterOp(OpId::kAttentionCross, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<AttentionCrossFn>(&AttentionCrossKernel)));
     // Dense-fast shares the CPU reference (the warp variant is a CUDA-only
     // optimization); byte-identical to kAttention on CPU.
     RegisterOp(OpId::kAttentionDenseFast, DeviceType::kCPU,

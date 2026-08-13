@@ -275,15 +275,22 @@ tests/vt/test_cpu_threadpool.cpp:539: ERROR: CHECK( ratio < 100.0 ) is NOT corre
 Attributed rather than assumed, to the same standard as #584. The guard divides
 two wall-clock medians (`over_us / fits_us`) and compares the ratio to a fixed
 100, so both ends are machine-shape dependent and the denominator is the problem:
-on the 2-core runner `fits_us` collapsed to 0.48 us, small enough that ordinary
+on the 4-core runner `fits_us` collapsed to 0.48 us, small enough that ordinary
 scheduler noise in the numerator moves the ratio by tens. Same commit, same code,
 three observations:
 
 | Box | `fits` | `over` | ratio |
 |---|---|---|---|
-| 2-core CI runner | 2 threads, 0.48 us | 5 threads, 48.752 us | **101.567** RED |
+| 4-core CI runner | 2 threads, 0.48 us | 5 threads, 48.752 us | **101.567** RED |
 | 20-core box (#631's table) | 10 threads, 7.213 us | 21 threads, 19.467 us | **2.699** GREEN |
 | 20-core box, this branch rebuilt at the reviewed head | 10 threads, 13.256 us | 21 threads, 13.135 us | **0.990872** GREEN |
+
+The runner's core count is read off the failure itself, not assumed: the case
+returns early at `test_cpu_threadpool.cpp:501` when `cores < 4`, so a box that
+produced a ratio at all has at least 4; and `fits = cores / 2` (`:512`) reporting
+2 threads with `over = cores + 1` (`:513`) reporting 5 pins it at exactly 4 —
+which is what GitHub gives `ubuntu-latest` on a public repo. An earlier revision
+of this section said 2-core, a number no run on that lane can produce.
 
 The last row is the one measured while repairing this record — `test_cpu_threadpool`
 9 cases / 9 passed, 19602 assertions / 0 failed, `Status: SUCCESS!`. That it sits

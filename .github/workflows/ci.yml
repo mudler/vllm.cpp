@@ -170,6 +170,17 @@ jobs:
           python3 scripts/check-snapshot-pins.py
           python3 scripts/check-snapshot-pins.py --self-test
           python3 tests/scripts/test_check_snapshot_pins.py
+      - name: Every oracle is named, pinned, and honest about gateability (#647)
+        # The fallback rule (AGENTS.md "When vLLM has no implementation") admits
+        # a secondary oracle only at a recorded pin. Ungated, the registry decays
+        # the way the scattered pins it replaced already had: an upstream gets
+        # compared against at whatever revision happened to be checked out, and
+        # the pin that does exist lands in one spec where no other spec can see
+        # it. `--self-test` sweeps the fixture corpus in both directions.
+        run: |
+          python3 scripts/check-oracle-pins.py
+          python3 scripts/check-oracle-pins.py --self-test
+          python3 tests/scripts/test_check_oracle_pins.py
       - name: cuBLASLt GEMM invocation stays dtype-faithful (template parity)
         run: |
           python3 scripts/check-gemv-invocation-consistency.py

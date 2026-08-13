@@ -257,7 +257,7 @@ class AgentRecordMutationTests(unittest.TestCase):
         Mirrors the ENGINE ratchet above, for the same reason and with more
         force: the MODEL count is the one that actually moves, because every new
         architecture re-pins it by hand. Muse Glimmer took it 361 -> 362; the
-        eight recipe architectures that had no row at all took it 362 -> 370
+        seven recipe architectures that had no row at all took it 362 -> 369
         (#609, #610). Without this, bumping the number to silence a failure is
         indistinguishable from bumping it because a row really landed.
         """

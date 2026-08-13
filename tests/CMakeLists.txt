@@ -109,6 +109,7 @@ vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
 vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
 vllm_cpp_add_test(test_model_registry vllm/models/test_model_registry.cpp)
+vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the

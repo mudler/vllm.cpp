@@ -1203,10 +1203,14 @@ std::vector<int64_t> DsaTopkLaunch(Queue& q, const std::vector<float>& logits,
       static_cast<const float*>(dl.p), static_cast<const int64_t*>(dws.p),
       static_cast<const int64_t*>(dwe.p), static_cast<int>(T), static_cast<int>(nk),
       static_cast<int>(topk), static_cast<int64_t*>(dout.p));
-  // Attribute a fault to THIS launch. Without it the #505 stack overflow
-  // surfaced as `cudaStreamDestroy: an illegal memory access` — an error raised
-  // by whatever ran next — which is what the whole #505 evidence chain ended up
-  // quoting. Every sibling launcher here already checks (e.g. `hc_head_ip`).
+  // Catches LAUNCH-CONFIGURATION errors (bad grid/block, shared-memory over
+  // budget) at the call site, and matches every sibling launcher here
+  // (e.g. `hc_head_ip`). It does NOT catch an asynchronous execution fault:
+  // MEASURED on GB10 (#552), the pre-fix #505 kernel with this very check in
+  // place still surfaced its illegal access later, as
+  // `cudaStreamDestroy: an illegal memory access`. So this does not make a
+  // device-side fault in the kernel attributable to this launch — a claim an
+  // earlier revision of this comment made and the measurement refuted.
   Check(cudaGetLastError(), "dsa_topk launch");
   Download(out, dout.p, s);
   Check(cudaStreamSynchronize(s), "sync topk");

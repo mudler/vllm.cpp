@@ -217,9 +217,76 @@ Landed here:
 | 1 | the `w < topk` comment named a NaN write-past-row as the defended failure class, which cannot occur | reworded in the kernel and in §3: belt-and-braces, bounded by construction. Guards kept. |
 | 2 | no case exercised `win_start < 0` or `win_end > num_keys`; mutating either clamp away left all four cases green | new case `OUT-OF-RANGE windows are clamped like host (#552)`, four rows driving under-run, over-run, both, and an in-range control |
 | 3 | `topk <= 0`: host asserts, device silently returned an empty vector | launcher now throws to mirror `deepseek_v4_dsa.cpp:76`; new case asserts **both** arms refuse |
-| 4 | `DsaTopkLaunch` had no post-launch `cudaGetLastError()`, which is why the #505 fault surfaced as `cudaStreamDestroy` | `Check(cudaGetLastError(), "dsa_topk launch")` added, matching every sibling launcher |
+| 4 | `DsaTopkLaunch` had no post-launch `cudaGetLastError()` | `Check(cudaGetLastError(), "dsa_topk launch")` added, matching every sibling launcher — but the finding's stated *rationale* does not survive measurement, see below |
 | 5 | "strictly cheaper" could be read as real-geometry-ready | qualified in §3 and in the kernel comment: it is a comparison to the old kernel only |
 | 6 | trivia: pre-fix span cited `:624-665` (actual 624-669); the comment described `n > topk` as the overflow condition | both corrected; `n > topk` only selects the branch, the overflow needs `n > 512` or `topk > 64` |
+
+### 7.1 Finding 4's rationale was REFUTED by its own verification
+
+The review's finding 4 held that a post-launch `cudaGetLastError()` would make the
+next fault in this kernel attributable to it, instead of surfacing later as
+`cudaStreamDestroy` the way #505's did. **That is wrong, and the arm built to
+demonstrate it disproved it.**
+
+Arm `prefix_with_check` — the pre-fix #505 kernel body WITH the new
+`Check(cudaGetLastError(), "dsa_topk launch")` in place:
+
+```
+### prefix_with_check  exit=134
+[doctest] test cases:   2 |   1 passed | 1 failed | 23 skipped
+[doctest] assertions: 609 | 609 passed | 0 failed |
+[doctest] Status: FAILURE!
+  what():  vt cuda: cudaStreamDestroy: an illegal memory access was encountered
+test_cuda_deepseek_v4.cpp:214: FATAL ERROR: test case CRASHED: SIGABRT
+```
+
+The error text is **unchanged** — still `cudaStreamDestroy`, not `dsa_topk
+launch`. A stack-overflow illegal access is an *asynchronous execution* fault;
+`cudaGetLastError()` immediately after a launch reports launch-*configuration*
+errors (bad grid/block, shared memory over budget). Here it was not even caught by
+the following `cudaStreamSynchronize`, and latched only at stream destruction.
+
+The check is kept: it is free, it matches every sibling launcher, and it does
+cover the launch-configuration class. But its comment and this spec now say what
+it actually does. Writing "this makes the next fault attributable" would have
+repeated finding 1's defect — an overclaiming guard comment — in the very change
+that exists to correct one. The lesson is the finding's, not the reviewer's: a
+plausible rationale for a cheap, obviously-correct change is still a claim, and
+this one only failed because an arm was built to test it rather than to confirm it.
+
+### 7.2 Device evidence for this change
+
+`dgx.casa`, GB10 sm_121a, mandatory flags, fast path hard-verified in the run's own
+configure log (`CUTLASS found … sm120a NVFP4`, `FlashAttention-2 … [121a]`). Each
+arm is a fresh nvcc rebuild from a pristine kernel with the binary mtime verified
+to advance, scoped with `-tc=` (never `-ts=`), and run under `flock $HOME/gpu.lock`.
+
+| arm | exit | Status | reddened |
+|---|---|---|---|
+| baseline | 0 | `6 \| 6 passed` SUCCESS | — |
+| `no_topk_guard` (drop the launcher's `topk > 0` throw) | 1 | FAILURE | the new refusal case: `CHECK_THROWS … did NOT throw at all!` |
+| `no_ws_clamp` | **134** | FAILURE | the new clamp case CRASHED, SIGABRT, `illegal memory access` |
+| `no_we_clamp` | 1 | FAILURE | the new clamp case, **1052** failed assertions |
+| `no_launch_check` | 0 | SUCCESS | **nothing** — see §7.1; unobservable by construction |
+| `prefix_with_check` | 134 | FAILURE | refutes finding 4's rationale (§7.1) |
+| restored, full suite | 0 | `25 \| 25 passed \| 0 skipped`, 90062 assertions, SUCCESS | — |
+
+Both new cases therefore have teeth, each against the mutation it was written for.
+`no_launch_check` reddening nothing is the expected and honest outcome for a
+diagnostic that has no observable behaviour on a passing run.
+
+Note the false-green shape recurring twice more: `no_ws_clamp` printed
+`assertions: 16865 | 16865 passed | 0 failed` and `prefix_with_check` printed
+`609 | 609 passed | 0 failed`, both beside `Status: FAILURE!`.
+
+Two infrastructure incidents, both handled rather than absorbed: round 1's clamp
+mutations were **refused by their own uniqueness assertion** — the clamp pair
+appears in both `DsaLogitsKernel` (:604-605) and `DsaTopkKernel` (:628-629), so a
+one-line anchor was ambiguous and the assert declined to edit a kernel it was not
+aiming at; round 2 re-ran with a three-line anchor unique to `DsaTopkKernel`. Then
+the box **rebooted mid-arm** (`up 7 min`, the known GB10 unified-memory OOM-reboot
+class), killing the run with no marker written — the remaining arms were relaunched
+on the fresh box.
 
 **Findings the review closed rather than raised.** Five mutations left the suite
 green and are *semantics-preserving*, not coverage gaps — each is also undetected

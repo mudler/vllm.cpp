@@ -285,6 +285,56 @@ TEST_CASE("W7-device DSA top-k select: OFFSET window at real width matches host 
       CHECK(got[static_cast<size_t>(t * topk + j)] >= 137);
 }
 
+// #552 finding 2: the kernel clamps its window with `s0 = ws[t] > 0 ? ws[t] : 0`
+// and `s1 = we[t] < nk ? we[t] : nk` (cuda_deepseek_v4.cu:628-629), but no case
+// passed a window that NEEDS clamping. Mutating either clamp away left all four
+// #505 cases green while an off-device fuzz caught both immediately; on device
+// they become out-of-bounds `logits` reads. These rows drive both clamps at a
+// real width, against the same host reference.
+TEST_CASE("W7-device DSA top-k select: OUT-OF-RANGE windows are clamped like host (#552)") {
+  if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t topk = 512, nk = 700, T = 4;
+  const auto logits = Rand(r, T * nk, -3.0f, 3.0f);
+
+  // Row 0 under-runs (ws < 0), row 1 over-runs (we > nk), row 2 does both, row 3
+  // is in range as the control. Every row still has n > topk after clamping.
+  std::vector<int64_t> ws{-9, 0, -4, 100};
+  std::vector<int64_t> we{nk, nk + 37, nk + 12, nk};
+  const auto ref = dv4::DsaTopkSelect(logits, ws, we, T, nk, topk);
+  const auto got = dv4::DsaDevice()->topk(g.q, logits, ws, we, T, nk, topk);
+  REQUIRE(got.size() == ref.size());
+  for (size_t i = 0; i < ref.size(); ++i) CHECK(got[i] == ref[i]);
+
+  // No emitted key may escape the clamped window, which is what an unclamped
+  // read would produce.
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t j = 0; j < topk; ++j) {
+      const int64_t s = got[static_cast<size_t>(t * topk + j)];
+      CHECK(s >= 0);
+      CHECK(s < nk);
+    }
+}
+
+// #552 finding 3: `DsaTopkSelect` asserts `topk > 0` (deepseek_v4_dsa.cpp:76)
+// while the device launcher used to return an empty vector instead. The two arms
+// must refuse the same inputs, not just agree on the accepted ones.
+TEST_CASE("W7-device DSA top-k select: non-positive topk REFUSED on both arms (#552)") {
+  if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t nk = 8, T = 2;
+  const auto logits = Rand(r, T * nk, -1.0f, 1.0f);
+  std::vector<int64_t> ws(T, 0), we(T, nk);
+  for (const int64_t bad : {static_cast<int64_t>(0), static_cast<int64_t>(-1)}) {
+    CHECK_THROWS(dv4::DsaTopkSelect(logits, ws, we, T, nk, bad));
+    CHECK_THROWS(dv4::DsaDevice()->topk(g.q, logits, ws, we, T, nk, bad));
+  }
+}
+
 TEST_CASE("W7-device attention-sink softmax + grouped output-LoRA: CUDA vs host (near-tie)") {
   if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
   vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);

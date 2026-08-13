@@ -296,9 +296,13 @@ constexpr InertArg kAcceptedInertArgs[] = {
     // cannot. The notice must not let a reader infer the two agree when the
     // parser is unset. Reconciling that default is out of scope here.
     {"--enable-auto-tool-choice", kNoValue,
+     // Do not write `open (` here: check-windows-portability.py scans this file
+     // with comments stripped but STRING LITERALS intact, and its POSIX-call
+     // pattern matches the bare word `open` before a parenthesis. The semicolon
+     // keeps the sentence and keeps the Windows gate green.
      "tool parsing is already unconditional once --tool-call-parser resolves, "
-     "so there is no second gate to open (note --tool-call-parser defaults to "
-     "hermes here, where upstream's defaults to unset)"},
+     "so there is no second gate to open; note --tool-call-parser defaults to "
+     "hermes here, where upstream's defaults to unset"},
     // Authorizes executing Python from the checkpoint. N/A BY CONSTRUCTION, not
     // unimplemented: this engine has no Python runtime.
     {"--trust-remote-code", kNoValue,

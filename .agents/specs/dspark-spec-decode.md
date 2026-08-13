@@ -1663,7 +1663,7 @@ quotable -- and all three agree.
 Also visible in the last run: the oracle's draws are bimodal at ~147.3 and
 ~155.6, the same one-extra-accepted-token effect as §6q, which is why its MODAL
 draws are the honest denominator.
-## 6ad. THE ncu BLOCKER IS GONE, AND "DRAM-BOUND" IS REFUTED (2026-08-13)
+## 6ad. THE ncu BLOCKER IS GONE, AND 6z's DRAM ATTRIBUTION IS CORROBORATED (2026-08-13)
 
 Section 6z listed upstream's `ncu` counters as the last open route and called it
 BLOCKED: vLLM's EngineCore will not initialise under `ncu` in either replay mode.
@@ -1671,72 +1671,88 @@ BLOCKED: vLLM's EngineCore will not initialise under `ncu` in either replay mode
 `torch.ops._moe_C.moe_wna16_marlin_gemm` on the 35B-A3B decode shapes -- hidden
 2048, moe_intermediate 512, E=256, top_k=8, `moe_block_size=8` -- with NO
 EngineCore, NO multiprocessing and NO model load, mirroring
-`prepare_nvfp4_moe_layer_for_marlin`'s scale pipeline exactly (per-expert
-`marlin_permute_scales` on the transposed scale, one shared scale factor,
-S0E5M3 conversion). It asserts the oracle identity and aborts on mismatch.
+`prepare_nvfp4_moe_layer_for_marlin`'s scale pipeline exactly. It asserts the
+oracle identity and aborts on mismatch. It profiles.
 
-**It profiles.** vLLM 0.23.1rc1.dev1511+g555967922, torch 2.13.0+cu130,
-`--set full`, one launch:
+### The static geometry (trustworthy, and new)
 
-| counter | value |
+| property | value |
 |---|---|
-| Memory Throughput | **11.14%** of peak |
-| Compute (SM) Throughput | **11.42%** of peak |
-| Theoretical / Achieved Occupancy | 25% / 25.98% |
-| Block Limit -- **shared memory** | **3** (registers 5, warps 12, SM 24, barriers 24) |
-| Waves Per SM | **1** |
-| L2 hit / L1 hit | 4.08% / 0.34% |
+| grid / block / shared per block | 144 / 128 / 32768 B |
+| GB10 | 48 SMs, 102400 B shared per SM |
+| block limit -- **shared memory** | **3** (registers 5, warps 12, SM 24) |
+| occupancy, theoretical / achieved | 25% / 25.98% |
+| waves per SM | 1 |
 | registers per thread | 94 |
-| SM frequency | 2.14 GHz |
 
-**Both throughputs are ~11%.** Section 6z read "SM throughput 10.6%" as evidence
-the kernel was DRAM-bound and concluded that "for this kernel, time and achieved
-bandwidth are the same measurement". That inference does not survive the
-counters: a kernel at 11% of memory peak is nowhere near a bandwidth wall. Low
-compute AND low memory throughput at 25% occupancy is the LATENCY-bound
-signature. The 186.6 vs 210.7 GB/s figures were always DERIVED (time x analytic
-bytes), never counted, so they measured the time difference and renamed it
-bandwidth; they cannot also explain it.
+102400/32768 = 3 blocks per SM, and 48 x 3 = 144 = the grid exactly. **The launch
+is a persistent single wave sized to the device**, so the "38.9 vs 40.6 blocks per
+launch" of 6x are work items each CTA LOOPS OVER, not parallel blocks.
 
-**The geometry says why.** GB10 has 48 SMs and 102400 bytes of shared memory per
-SM. The kernel takes 32768 bytes per block, so 102400/32768 = 3 blocks per SM,
-which is exactly the reported shared-memory block limit and caps occupancy at
-25%. The launch is `grid=144`, `block=128`, and 48 x 3 = 144: **the grid is a
-persistent single wave sized to the device.**
+### `ncu`'s memory percentages are NOT usable on this chip
 
-That invalidates the per-unit-work normalisation in 6x. The "38.9 vs 40.6 blocks
-per launch" are work items each CTA LOOPS OVER, not parallel blocks -- the grid
-is a fixed 144 CTAs in both arms. So "4.21 vs 3.73 us per block" divided by the
-wrong denominator: more work items do not add parallel work, they add loop
-iterations spread over the same 144 CTAs. With a persistent grid the cost is set
-by the CTA with the MOST work, and `ncu` flags exactly that -- "avoid possible
-load imbalances due to highly different execution durations per [block]" -- along
-with uncoalesced access, 20.2 of 32 bytes per global load sector and 31.9 of 32
-per store.
+`dram__bytes.sum` and `dram__bytes.sum.per_second` return **`n/a`** on GB10 --
+there are no DRAM counters to read. What the SpeedOfLight section still prints,
+"Memory Throughput 11.14%" against "Compute (SM) Throughput 11.42%", therefore
+does NOT include DRAM traffic, and reading those two as "neither is saturated,
+so the kernel is latency-bound" is WRONG. An `n/a` on the byte counter is the
+tell that the percentage beside it is derived from something else.
 
-**Two consequences, and the second is the more valuable one.**
+### What the kernel actually does, measured by sweeping the work
 
-1. The us/block gap is not established. Re-deriving it needs max-work-per-CTA,
-   not total work over block count.
-2. **The kernel has ~9x of absolute headroom on this device and BOTH engines
-   leave it on the table.** Occupancy is capped at 3 blocks/SM purely by a 32 KB
-   shared-memory budget that Marlin computes as
-   `max_shared_mem / blocks_per_sm - 1024`. This is not a parity lever -- upstream
-   pays it identically -- it is a BEST-IN-CLASS lever, which is the standing
-   goal. Getting under 25600 bytes would allow 4 blocks/SM.
+Concentrating the synthetic router over a controlled pool of experts moves the
+occupied block count. `--arm gate_up`, 80 iterations per point:
 
-**Open, and honest about it:** this measures UPSTREAM standalone. The comparison
-this unblocks -- our kernel through the same harness on identical routing input,
-counters side by side -- is NOT yet run, so no claim about the 3.4% gap changes
-on this evidence. What changes is the ATTRIBUTION of the residual: "achieved
-memory bandwidth" is refuted as its cause, and the mechanism is latency at 25%
-occupancy in a one-wave persistent grid.
+| distinct-expert pool | blocks | us/call | us/block | implied GB/s |
+|---|---|---|---|---|
+| 8 | 13 | 19.9 | 1.53 | -- (fits L2) |
+| 16 | 18 | 20.8 | **1.15** | -- (fits L2) |
+| 24 | 22 | 65.0 | 2.96 | transition |
+| 32 | 27 | 157.0 | 5.81 | 202.9 |
+| 40 | 31 | 165.0 | 5.32 | -- |
+| 48 | 38 | 207.0 | 5.45 | 216.6 |
+| 64 | 45 | 249.5 | 5.55 | 212.7 |
+| 128 | 58 | 306.5 | 5.28 | 223.2 |
+| 256 | 65 | 339.6 | 5.22 | 225.8 |
 
-The synthetic router draws uniformly over 256 experts, which yields 61 occupied
-blocks against the 38.9-40.6 the model produces (real routing over 9 near-identical
-spec-decode tokens is far more concentrated). Absolute us/call from this harness
-is therefore NOT comparable to the in-situ numbers; the static geometry, occupancy
-and throughput percentages are, since they do not depend on the routing draw.
+Each block streams one expert's gate_up weights (2N x K/2 = 1 MiB) plus its
+scales (2N x K/16 = 128 KiB) = 1179648 B. Two regimes are visible. Under ~18
+blocks the touched weights fit in L2 and cost 1.15 us/block. Above ~27 they
+stream, and **us/block is FLAT at 5.2-5.5 across a 2.4x range of work** --
+a constant bytes-per-second, which is the bandwidth-limited signature.
+
+**So 6z was right and this section's first draft was wrong.** The kernel IS
+memory-bound; the standalone plateau is **203-226 GB/s**, and 6z's derived
+in-situ numbers land exactly on it: upstream's **210.7 GB/s is INSIDE the
+plateau**, i.e. upstream runs at this kernel's achievable bandwidth, while our
+**186.6 GB/s is ~12% BELOW** it. An independent standalone measurement of the
+same kernel now corroborates the derived attribution instead of replacing it.
+
+The one thing 6x should not keep is the per-unit-work DIVISION: with a fixed
+144-CTA grid, block count is loop iterations, and at the operating point the
+sweep says +1.7 blocks (38.9 -> 40.6) should cost about +4.4%. Upstream carries
+those extra iterations and is still faster, which is not a contradiction once the
+denominator is bandwidth rather than block count -- it is the same 12-13%
+bandwidth-achievement gap seen twice.
+
+### What is now open
+
+Ours has NOT been through this harness. That is the decisive experiment: our
+kernel, same shapes, same routing input, same box, us/block against the 5.2-5.5
+plateau. If ours plateaus at 5.2-5.5 too, the in-situ deficit is NOT in the
+kernel and 6x's localisation is wrong; if ours plateaus ~12% higher, the kernel
+owns it and the next question is why the same SASS sustains less bandwidth.
+
+Occupancy stays a real but SECONDARY lever: 25% capped by a 32 KB shared-memory
+budget (`max_shared_mem / blocks_per_sm - 1024`), where under 25600 B would buy
+4 blocks/SM. At ~75-80% of this device's ~273 GB/s that is worth far less than
+the earlier "~9x of headroom" first draft claimed, which was an artefact of the
+same unusable percentage.
+
+Absolute us/call here is not comparable in-situ: uniform synthetic routing
+occupies 61-65 blocks against the model's 38.9-40.6. The static geometry, the
+two-regime shape and the plateau bandwidth are comparable, since they do not
+depend on the routing draw.
 
 ## 7. Evidence, authority, stop conditions
 

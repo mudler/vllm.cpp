@@ -520,22 +520,24 @@ shared-memory budget, reduction flags, scale layout, alignment, residency, CUDA
 toolkit (13.0 both) and arch all match -- and `ncu` plus cuobjdump then showed the
 COMPILED KERNELS ARE EQUIVALENT (94 registers and 3664 SASS instructions on both,
 upstream running its family-compatible sm_120 cubin against our sm_121a). The
-residual is therefore runtime. It was ATTRIBUTED to effective DRAM bandwidth
-(186.6 vs 210.7 GB/s) and that attribution is now **REFUTED**: those figures were
-DERIVED from time x analytic bytes, never counted, so they restated the time gap
-rather than explaining it. `scripts/marlin-moe-standalone.py` drives upstream's
-own `moe_wna16_marlin_gemm` with no EngineCore, which is what finally lets `ncu`
-attach, and the counters say **11.14% of memory peak and 11.42% of compute peak**
--- the LATENCY-bound signature, not a bandwidth wall. GB10's 48 SMs hold 102400 B
-of shared memory each, the kernel takes 32768 B per block, so occupancy is capped
-at 3 blocks/SM (**25%**) and the grid is 48x3 = **144 CTAs, one persistent wave**.
-That also invalidates the per-unit-work normalisation: 38.9 vs 40.6 "blocks per
-launch" are loop iterations inside a FIXED grid, so cost is set by max work per
-CTA, and ncu flags load imbalance and uncoalesced access (20.2 of 32 bytes per
-load sector). Our kernel through the same harness is NOT yet run, so the 3.4% gap
-itself is unchanged -- only its cause is. Separately this leaves ~9x of absolute
-headroom that BOTH engines pay: a shared-memory budget under 25600 B would allow
-4 blocks/SM. Weight
+residual is therefore runtime and is ATTRIBUTED to effective DRAM bandwidth
+(186.6 vs 210.7 GB/s), an attribution now CORROBORATED by an independent
+measurement. `scripts/marlin-moe-standalone.py` drives upstream's own
+`moe_wna16_marlin_gemm` with no EngineCore, which is what finally lets `ncu`
+attach. Its static geometry is new and exact: GB10's 48 SMs hold 102400 B of
+shared memory, the kernel takes 32768 B per block, so occupancy is capped at
+3 blocks/SM (**25%**) and the grid is 48x3 = **144 CTAs, one persistent wave**.
+Sweeping the occupied block count then shows two regimes: under ~18 blocks the
+weights fit in L2 (1.15 us/block), above ~27 they stream and **us/block is FLAT
+at 5.2-5.5 across a 2.4x range of work** -- constant bytes/second, the
+bandwidth-limited signature, a **203-226 GB/s** plateau. Upstream's 210.7 sits
+INSIDE that plateau (it runs at the kernel's achievable bandwidth); ours at
+186.6 sits ~12% below. Note `ncu`'s SpeedOfLight memory percentage is unusable
+here -- `dram__bytes.sum` reads `n/a` on GB10, so "Memory Throughput 11.14%"
+excludes DRAM traffic and must not be read as latency-bound. What does NOT
+survive is the per-unit-work division: with a fixed 144-CTA grid the "38.9 vs
+40.6 blocks" are loop iterations, priced by the sweep at about +4.4%. Ours has
+NOT yet run through the harness, which is the decisive next measurement. Weight
 residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
 same size and stride as upstream's tensor (268 MB, no padding), so the cause is
 memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under

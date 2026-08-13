@@ -20384,44 +20384,53 @@ Oracle draws remain bimodal (~147.3 and ~155.6), the same one-extra-accepted-tok
 effect as the fibacc run, so its MODAL draws are the honest denominator.
 
 Evidence: `dgx:~/work/dspark-w6/iocheck.log`, `final_pair.log`.
-## SPEC-DSPARK / #442: upstream Marlin profiled under ncu at last; DRAM-bound REFUTED (2026-08-13)
+## SPEC-DSPARK / #442: upstream Marlin profiled under ncu at last; 6z CORROBORATED (2026-08-13)
 
 `scripts/marlin-moe-standalone.py` drives upstream's own
 `torch.ops._moe_C.moe_wna16_marlin_gemm` on the 35B-A3B decode shapes with no
 EngineCore, no multiprocessing and no model load, which is what makes `ncu`
-attach -- the blocker recorded as "BLOCKED, both replay modes TRIED".
+attach -- the blocker recorded as "BLOCKED, both replay modes TRIED". vLLM
+0.23.1rc1.dev1511+g555967922 (identity asserted), torch 2.13.0+cu130, GB10.
 
-vLLM 0.23.1rc1.dev1511+g555967922 (identity asserted), torch 2.13.0+cu130,
-`--set full`, one launch, GB10:
+STATIC GEOMETRY (trustworthy): grid 144, block 128, 32768 B shared per block.
+48 SMs x 102400 B shared => 3 blocks/SM => 25% occupancy (achieved 25.98%), and
+48 x 3 = 144 = the grid. A persistent single wave; 94 registers/thread.
 
-| counter | value |
-|---|---|
-| Memory Throughput | 11.14% of peak |
-| Compute (SM) Throughput | 11.42% of peak |
-| Theoretical / Achieved Occupancy | 25% / 25.98% |
-| Block Limit shared memory | 3 (registers 5, warps 12, SM 24) |
-| Waves Per SM | 1 |
-| L2 / L1 hit | 4.08% / 0.34% |
-| grid / block / shared per block | 144 / 128 / 32768 B |
+MEASUREMENT TRAP: `dram__bytes.sum` is `n/a` on GB10 -- no DRAM counters exist.
+The SpeedOfLight "Memory Throughput 11.14%" therefore excludes DRAM traffic, and
+reading it beside "Compute (SM) 11.42%" as "latency-bound" is WRONG.
 
-48 SMs x 102400 B shared per SM, 32768 B per block => 3 blocks/SM => 25%
-occupancy, and 48 x 3 = 144 = the grid. The launch is a persistent single wave.
+WHAT THE WORK SWEEP SHOWS (gate_up, 80 iters/point; pool = distinct experts):
 
-Both throughputs ~11% is the LATENCY-bound signature, not DRAM-bound. The
-186.6 vs 210.7 GB/s figures were derived (time x analytic bytes), never counted,
-so they restated the time difference rather than explaining it. The per-unit-work
-normalisation is invalid too: 38.9 vs 40.6 "blocks per launch" are loop
-iterations inside a FIXED 144-CTA grid, so cost is set by max work per CTA, and
-ncu flags load imbalance plus uncoalesced access (20.2/32 bytes per load sector).
+| pool | blocks | us/call | us/block | implied GB/s |
+|---|---|---|---|---|
+| 8 | 13 | 19.9 | 1.53 | fits L2 |
+| 16 | 18 | 20.8 | 1.15 | fits L2 |
+| 24 | 22 | 65.0 | 2.96 | transition |
+| 32 | 27 | 157.0 | 5.81 | 202.9 |
+| 48 | 38 | 207.0 | 5.45 | 216.6 |
+| 64 | 45 | 249.5 | 5.55 | 212.7 |
+| 128 | 58 | 306.5 | 5.28 | 223.2 |
+| 256 | 65 | 339.6 | 5.22 | 225.8 |
 
-NOT yet run: our kernel through the same harness on identical routing. No claim
-about the 3.4% gap changes on this evidence; only its attribution does. Absolute
-us/call is not comparable in-situ (uniform synthetic routing gives 61 occupied
-blocks vs the model's 38.9-40.6); the static geometry and throughput percentages
-are.
+1179648 B streamed per block (1 MiB weights + 128 KiB scales). us/block is FLAT
+at 5.2-5.5 across a 2.4x range of work: constant bytes/second, i.e. bandwidth
+limited. Plateau 203-226 GB/s.
 
-Standing headroom, applying to BOTH engines: occupancy is capped purely by a
-32 KB shared-memory budget (`max_shared_mem / blocks_per_sm - 1024`). Under
-25600 B would allow 4 blocks/SM.
+CONSEQUENCE: the derived in-situ figures land ON this plateau. Upstream's
+210.7 GB/s is INSIDE it (upstream runs at the kernel's achievable bandwidth);
+ours at 186.6 GB/s is ~12% BELOW. An independent standalone measurement now
+CORROBORATES the DRAM attribution rather than replacing it. What does not
+survive is the per-unit-work DIVISION: with a fixed 144-CTA grid, block count is
+loop iterations, and the sweep prices 38.9 -> 40.6 blocks at about +4.4%.
+
+NOT YET RUN, and decisive: our kernel through this same harness, us/block against
+the 5.2-5.5 plateau. Occupancy (25%, shared-memory capped, under 25600 B would
+buy 4 blocks/SM) is a real but SECONDARY lever at ~75-80% of this device's
+~273 GB/s.
+
+Absolute us/call is not comparable in-situ (uniform synthetic routing occupies
+61-65 blocks vs the model's 38.9-40.6); geometry, regime shape and plateau
+bandwidth are.
 
 Evidence: `dgx.casa:~/work/marlin442/`.

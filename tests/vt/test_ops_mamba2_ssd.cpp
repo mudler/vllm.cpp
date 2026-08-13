@@ -999,3 +999,750 @@ TEST_CASE("mamba2 chunk scan refuses the arms it does not implement") {
                                      nullptr, nullptr, cust, ccst, lcit, sit, args));
   }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// (8) THE CUDA ARM — .agents/specs/mamba2-ssd.md W2, issue #496.
+//
+// ─── THE DECLARED EQUIVALENCE CONTRACT ──────────────────────────────────────
+// The CUDA kernels keep f32 accumulation THROUGHOUT and do NOT mirror the tile
+// downcasts inside upstream's Triton dots (`b.to(x_ptr.dtype.element_ty)`
+// ssd_chunk_state.py:283-285; `cb.to(...)` / `prev_states.to(C_ptr.dtype...)`
+// ssd_chunk_scan.py:266-269, :359-363). Those casts are the input-precision
+// requirement of `tl.dot`, i.e. of a tensor-core MMA — every one of those tiles is
+// loaded `.to(tl.float32)` and computed in f32 right up to the MMA. Our kernels
+// are scalar-FMA kernels with no MMA, so the bar here is NOT a downcast-derived
+// tolerance. The memory format is unchanged: every load and store goes through the
+// operand's own dtype, and the inter-chunk `passed` buffer is allocated at
+// `state_dtype`, not at the host reference's f32 working width (§8.2 F9).
+//
+// Two gates, in order of authority:
+//
+//   G1 (PRIMARY, INDEPENDENT). The device outputs are held to the SAME
+//   double-precision sequential reference (`SequentialSsdRef`) at the SAME
+//   upstream-ported tolerances as the host arm. Every structural defect — a
+//   dropped inter-chunk term, `states[c]` for `states[c-1]`, ignored
+//   `initial_states`, a missing `D` skip — is an O(1) error and fails here,
+//   against a reference the kernel was not written from.
+//
+//   G2 (DEVICE vs HOST, DERIVED). A BYTE COMPARE IS NOT REACHABLE, for TWO
+//   named reasons and no others:
+//
+//     (a) LIBM. The two arms call different ones. CUDA's `expf` is documented to
+//         <= 2 ulp and glibc's to <= 0.5, and they disagree in the last ulp on
+//         some inputs, so `exp`/`log1p` alone put the two arms off each other by
+//         ulps that the recurrence then amplifies.
+//     (b) FMA CONTRACTION. Host C++ is pinned `-ffp-contract=off`
+//         (CMakeLists.txt:41-56), so `a*b + c` keeps two roundings; nothing
+//         passes `--fmad=false` to nvcc, so the device arm compiles at the
+//         DEFAULT `--fmad=true` and every `acc += a*b` is a single-rounding
+//         `fma` whose host twin is not. `-fmad=false` was weighed and rejected
+//         at src/vt/cuda/cuda_mamba2_ssd.cuh — it is a per-TU flag on a header
+//         included by a hot GDN TU — so the bound carries the term.
+//
+//   Summation ORDER is not a third source: the device kernels accumulate every
+//   output element in ONE thread, over the same index range in the same
+//   direction as the host arm. `DerivedRtol` below propagates (a) and (b), and
+//   only those. Nothing in it was tuned, and the slack actually USED is reported
+//   on every comparison — if it ever approached the bar, the bar would have
+//   stopped being a statement about libm and contraction and the finding would
+//   be a NEEDS_DECISION, not a wider tolerance.
+// ═════════════════════════════════════════════════════════════════════════════
+#ifdef VLLM_CPP_CUDA
+
+#include <memory>
+#include <stdexcept>
+
+namespace {
+
+using vt::Backend;
+
+Backend* MaybeCuda() {
+  try {
+    return &vt::GetBackend(DeviceType::kCUDA);
+  } catch (const std::exception&) {
+    return nullptr;
+  }
+}
+
+// A GREEN TEST DOES NOT PROVE THE DEVICE RAN IT — and on THIS box it very nearly
+// proves the opposite. GB10 is `integrated && pageable_memory_access`, so
+// `Backend::UnifiedMemory()` is TRUE (cuda_backend.cu Registrar) and therefore
+// `ReferenceTierEligible(kCUDA)` is TRUE. Absent a native kernel, `GetOp` does
+// not throw: it installs the CPU HOST kernel as a `kReferenceProviderName`
+// provider and runs THAT over the device pointers (op_provider.h, "portable
+// reference tier"). Every numeric assertion below would then pass — the device
+// arm would be gated by running the host arm twice, the exact false-green shape
+// of [[absent-hook-looks-like-armed-instrument]] and
+// [[gate-comparing-shared-helper-proves-consistency-not-correctness]].
+//
+// So every CUDA case asserts the SELECTED provider is native. These are EAGER
+// dispatches rather than a captured graph, so the counters are genuinely
+// populated ([[graph-replay-does-no-host-dispatch-counters-read-zero]]).
+void RequireNativeCudaProvider(vt::OpId op, const std::string& what) {
+  const vt::OpProviderStats st = vt::GetOpProviderStats(op, DeviceType::kCUDA);
+  INFO(what << ": selected CUDA provider = "
+            << (st.last_selected != nullptr ? st.last_selected : "<none>")
+            << "; process-wide reference-tier hits = " << vt::GetReferenceTierHits());
+  REQUIRE(st.last_selected != nullptr);
+  CHECK(std::string(st.last_selected) != std::string(vt::kReferenceProviderName));
+}
+
+// f32 unit roundoff, and the bound the two arms are held to.
+//
+// A value that has run through a product of at most K decay factors and a
+// length-K f32 sum of products carries, between the two arms, THREE terms:
+//
+//   libm         <= 2.5 ulp PER FACTOR — CUDA `expf` <= 2 ulp, glibc <= 0.5 —
+//                through a product of at most K, i.e. <= 2.5*K*u;
+//   summation    the standard (K-1)*u forward error of a length-K f32 sum,
+//                which is what AMPLIFIES the libm difference in the inputs;
+//   contraction  the device arm's `acc += a*b` is ONE nvcc-`fmad` rounding and
+//                the host arm's is TWO (`-ffp-contract=off`, CMakeLists.txt:55),
+//                so the host carries K product roundings the device does not:
+//                <= K*u. See the FMA-contraction note in
+//                src/vt/cuda/cuda_mamba2_ssd.cuh for why the flag is not simply
+//                turned off instead.
+//
+// Total <= 2.5*K*u + (K-1)*u + K*u = 4.5*K*u - u. `5*(K + 2)*u` is that,
+// rounded up to integers, and it covers the model for every K >= 0 because
+// 5K + 10 >= 4.5K - 1 reduces to 0.5K + 11 >= 0.
+//
+// THE OLD `4*(K + 2)*u` DID NOT. It omitted the contraction term, and
+// 4.5K - 1 <= 4K + 8 holds only for K <= 18 — while the driver-shapes case runs
+// at K = T = 200. The constant moved because the DERIVATION gained a term the
+// build actually emits, not because a run needed slack: at 4*(K+2) the worst of
+// the 55 audited comparisons used 7.66% of budget, so at 5*(K+2) it uses 6.13%,
+// and mutant M3's 962173% becomes 769738% — still caught by four orders of
+// magnitude (§8.4).
+//
+// K is the case's own recurrence length; nothing here is fitted, and the slack
+// actually USED is reported on every comparison so a bar that had stopped doing
+// work would be visible rather than silently absorbing a defect.
+constexpr double kUnitRoundoff = 5.9604644775390625e-08;  // 2^-24
+double DerivedRtol(int64_t K) { return 5.0 * static_cast<double>(K + 2) * kUnitRoundoff; }
+
+// atol is `rtol * max|host|` rather than 0: a bound proportional to |want| alone
+// is vacuous for an element that is near zero through cancellation of O(max)
+// terms, which this recurrence produces routinely.
+void ExpectDeviceMatchesHost(const std::string& what, const std::vector<float>& dev,
+                             const std::vector<float>& host, int64_t K) {
+  REQUIRE(dev.size() == host.size());
+  REQUIRE(!dev.empty());
+  double scale = 0.0;
+  for (float v : host) scale = std::max(scale, std::abs(static_cast<double>(v)));
+  const double rtol = DerivedRtol(K);
+  const double atol = rtol * scale;
+  size_t bit_differing = 0, worst_i = 0;
+  double worst_ratio = -1.0, worst_diff = 0.0;
+  for (size_t i = 0; i < dev.size(); ++i) {
+    if (dev[i] != host[i]) ++bit_differing;
+    const double d = std::abs(static_cast<double>(dev[i]) - static_cast<double>(host[i]));
+    const double budget = atol + rtol * std::abs(static_cast<double>(host[i]));
+    const double ratio = budget > 0.0 ? d / budget : (d > 0.0 ? 1e30 : 0.0);
+    if (!std::isfinite(static_cast<double>(dev[i])) || ratio > worst_ratio) {
+      worst_ratio = ratio;
+      worst_i = i;
+      worst_diff = d;
+      if (!std::isfinite(static_cast<double>(dev[i]))) break;
+    }
+  }
+  // MESSAGE, not INFO: doctest prints an INFO context only when an assertion in
+  // its scope FAILS, so a claim that the used slack "is reported" would be false
+  // on the green run that matters. This line is emitted unconditionally, which is
+  // what makes the derived bar auditable rather than merely asserted.
+  MESSAGE(what << ": K=" << K << " rtol=" << rtol << " scale=" << scale << "; "
+               << bit_differing << " of " << dev.size()
+               << " elements differ in any bit; worst element [" << worst_i
+               << "] dev=" << dev[worst_i] << " host=" << host[worst_i]
+               << " |diff|=" << worst_diff << " used " << (worst_ratio * 100.0)
+               << "% of its derived budget");
+  CHECK(std::isfinite(static_cast<double>(dev[worst_i])));
+  CHECK(worst_ratio <= 1.0);
+}
+
+Tensor MakeTDev(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
+  Tensor t;
+  t.data = data;
+  t.dtype = dt;
+  t.device = dev;
+  t.rank = static_cast<int>(shape.size());
+  int64_t stride = 1;
+  for (int i = t.rank - 1; i >= 0; --i) {
+    t.shape[i] = shape[static_cast<size_t>(i)];
+    t.stride[i] = stride;
+    stride *= shape[static_cast<size_t>(i)];
+  }
+  return t;
+}
+
+// Owning device allocation, uploaded from host bytes (or left zero-sized).
+class DBuf {
+ public:
+  DBuf(Backend& b, Queue& q, const void* host, size_t bytes) : b_(&b), bytes_(bytes) {
+    p_ = b.Alloc(bytes == 0 ? 1 : bytes);
+    if (host != nullptr && bytes > 0) b.Copy(q, p_, host, bytes);
+  }
+  ~DBuf() {
+    if (p_ != nullptr) b_->Free(p_);
+  }
+  DBuf(const DBuf&) = delete;
+  DBuf& operator=(const DBuf&) = delete;
+  void* get() const { return p_; }
+  void Download(Queue& q, void* dst) const {
+    if (bytes_ > 0) b_->Copy(q, dst, p_, bytes_);
+    b_->Synchronize(q);
+  }
+
+ private:
+  Backend* b_;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+};
+
+// The CUDA twin of RunChunkScan, argument for argument.
+//
+// `lci_override` / `sidx_override` replace the metadata `ComputeVarlenChunkMetadata`
+// derived, and exist for ONE caller: the clamp case below, which must reach the
+// device kernels with metadata the host arm refuses. Every other caller passes
+// nullptr and gets the derived metadata unchanged.
+RunOut RunChunkScanCuda(Backend& gpu, const Inputs& in, int64_t T, int64_t H, int64_t P,
+                        int64_t G, int64_t N, const std::vector<int32_t>& cu_seqlens,
+                        const std::vector<float>* D, const std::vector<float>* z,
+                        const std::vector<float>* dt_bias,
+                        const std::vector<float>* initial_states, const RunCfg& cfg,
+                        const std::vector<int32_t>* lci_override = nullptr,
+                        const std::vector<int32_t>* sidx_override = nullptr) {
+  Queue q = gpu.CreateQueue();
+  const Device dev{DeviceType::kCUDA, 0};
+  const int64_t S = static_cast<int64_t>(cu_seqlens.size()) - 1;
+  ChunkMeta meta = ComputeVarlenChunkMetadata(cu_seqlens, cfg.chunk_size);
+  const int64_t nchunks = static_cast<int64_t>(meta.seq_idx.size());
+  if (lci_override != nullptr) meta.last_chunk_indices = *lci_override;
+  if (sidx_override != nullptr) meta.seq_idx = *sidx_override;
+
+  const std::vector<uint8_t> xb = Pack(in.x, cfg.act_dtype);
+  const std::vector<uint8_t> dtb = Pack(in.dt, cfg.act_dtype);
+  const std::vector<uint8_t> Bb = Pack(in.B, cfg.act_dtype);
+  const std::vector<uint8_t> Cb = Pack(in.C, cfg.act_dtype);
+  const size_t out_bytes = static_cast<size_t>(T * H * P) * vt::SizeOf(cfg.act_dtype);
+  const size_t fs_bytes = static_cast<size_t>(S * H * P * N) * vt::SizeOf(cfg.state_dtype);
+  std::vector<int32_t> cus = cu_seqlens;
+
+  DBuf dx(gpu, q, xb.data(), xb.size());
+  DBuf ddt(gpu, q, dtb.data(), dtb.size());
+  DBuf dA(gpu, q, in.A.data(), in.A.size() * sizeof(float));
+  DBuf dB(gpu, q, Bb.data(), Bb.size());
+  DBuf dC(gpu, q, Cb.data(), Cb.size());
+  DBuf dout(gpu, q, nullptr, out_bytes);
+  DBuf dfs(gpu, q, nullptr, fs_bytes);
+  DBuf dcus(gpu, q, cus.data(), cus.size() * sizeof(int32_t));
+  DBuf dccs(gpu, q, meta.cu_chunk_seqlens.data(), meta.cu_chunk_seqlens.size() * sizeof(int32_t));
+  DBuf dlci(gpu, q, meta.last_chunk_indices.data(),
+            meta.last_chunk_indices.size() * sizeof(int32_t));
+  DBuf dsi(gpu, q, meta.seq_idx.data(), meta.seq_idx.size() * sizeof(int32_t));
+
+  Tensor xt = MakeTDev(dx.get(), cfg.act_dtype, dev, {T, H, P});
+  Tensor dtt = MakeTDev(ddt.get(), cfg.act_dtype, dev, {T, H});
+  Tensor At = MakeTDev(dA.get(), DType::kF32, dev, {H});
+  Tensor Bt = MakeTDev(dB.get(), cfg.act_dtype, dev, {T, G, N});
+  Tensor Ct = MakeTDev(dC.get(), cfg.act_dtype, dev, {T, G, N});
+  Tensor outt = MakeTDev(dout.get(), cfg.act_dtype, dev, {T, H, P});
+  Tensor fst = MakeTDev(dfs.get(), cfg.state_dtype, dev, {S, H, P, N});
+  Tensor cust = MakeTDev(dcus.get(), DType::kI32, dev, {S + 1});
+  Tensor ccst = MakeTDev(dccs.get(), DType::kI32, dev, {nchunks + 1});
+  Tensor lcit = MakeTDev(dlci.get(), DType::kI32, dev, {S});
+  Tensor sit = MakeTDev(dsi.get(), DType::kI32, dev, {nchunks});
+
+  std::vector<float> Dc;
+  std::unique_ptr<DBuf> dD;
+  Tensor Dt;
+  if (D != nullptr) {
+    Dc = *D;
+    dD = std::make_unique<DBuf>(gpu, q, Dc.data(), Dc.size() * sizeof(float));
+    Dt = cfg.d_has_hdim ? MakeTDev(dD->get(), DType::kF32, dev, {H, P})
+                        : MakeTDev(dD->get(), DType::kF32, dev, {H});
+  }
+  std::vector<uint8_t> zb;
+  std::unique_ptr<DBuf> dz;
+  Tensor zt;
+  if (z != nullptr) {
+    zb = Pack(*z, cfg.act_dtype);
+    dz = std::make_unique<DBuf>(gpu, q, zb.data(), zb.size());
+    zt = MakeTDev(dz->get(), cfg.act_dtype, dev, {T, H, P});
+  }
+  std::vector<float> dbc;
+  std::unique_ptr<DBuf> ddb;
+  Tensor dbt;
+  if (dt_bias != nullptr) {
+    dbc = *dt_bias;
+    ddb = std::make_unique<DBuf>(gpu, q, dbc.data(), dbc.size() * sizeof(float));
+    dbt = MakeTDev(ddb->get(), DType::kF32, dev, {H});
+  }
+  std::vector<uint8_t> isb;
+  std::unique_ptr<DBuf> dis;
+  Tensor ist;
+  if (initial_states != nullptr) {
+    isb = Pack(*initial_states, cfg.state_dtype);
+    dis = std::make_unique<DBuf>(gpu, q, isb.data(), isb.size());
+    ist = MakeTDev(dis->get(), cfg.state_dtype, dev, {S, H, P, N});
+  }
+
+  Mamba2Args args;
+  args.chunk_size = cfg.chunk_size;
+  args.dt_softplus = cfg.dt_softplus;
+  args.dt_min = cfg.dt_min;
+  args.dt_max = cfg.dt_max;
+
+  vt::Mamba2ChunkScan(q, outt, fst, xt, dtt, At, Bt, Ct, D != nullptr ? &Dt : nullptr,
+                      z != nullptr ? &zt : nullptr, dt_bias != nullptr ? &dbt : nullptr,
+                      initial_states != nullptr ? &ist : nullptr, cust, ccst, lcit, sit, args);
+
+  std::vector<uint8_t> outb(out_bytes), fsb(fs_bytes);
+  dout.Download(q, outb.data());
+  dfs.Download(q, fsb.data());
+  gpu.Synchronize(q);
+
+  RunOut r;
+  r.y = Unpack(outb, static_cast<size_t>(T * H * P), cfg.act_dtype);
+  r.final_states = Unpack(fsb, static_cast<size_t>(S * H * P * N), cfg.state_dtype);
+  gpu.DestroyQueue(q);
+  return r;
+}
+
+}  // namespace
+
+// G1 + G2 on the shapes the row exists for: Nemotron-3.5-Lightning-30B-A3B's
+// mamba layer — nheads 64, headdim 64, dstate 128, ngroups 8, chunk_size 128,
+// mamba_ssm_cache_dtype float32 (mamba2-ssd.md §1.4). T is 200 so `nchunks == 2`
+// and the arm actually exercises inter-chunk state passing — the failure shape of
+// [[h3-video-decode-temporal-and-tiling-compose]], and of §8.2 F6.
+TEST_CASE("mamba2 chunk scan CUDA arm on the driver shapes") {
+  Backend* gpu = MaybeCuda();
+  if (gpu == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered (CPU-only build/box)");
+    return;
+  }
+  const int64_t T = 200, H = 64, P = 64, G = 8, N = 128, chunk = 128;
+  const Inputs in = GenerateInputs(T, H, P, G, N, 0x4E33Au);
+  const std::vector<int32_t> cu{0, static_cast<int32_t>(T)};
+  REQUIRE(ComputeVarlenChunkMetadata(cu, chunk).seq_idx.size() > 1);
+
+  std::mt19937 rng(0x77u);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<float> D(static_cast<size_t>(H));
+  for (auto& v : D) v = nd(rng);
+
+  RunCfg cfg;
+  cfg.chunk_size = chunk;
+  const SeqRefOut ref =
+      SequentialSsdRef(in, T, H, P, G, N, cu, &D, false, nullptr, nullptr, nullptr, {});
+  const RunOut host = RunChunkScan(in, T, H, P, G, N, cu, &D, nullptr, nullptr, nullptr, cfg);
+  const RunOut dev =
+      RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, &D, nullptr, nullptr, nullptr, cfg);
+  RequireNativeCudaProvider(vt::OpId::kMamba2ChunkScan, "driver shapes");
+
+  // G1 — the device arm against the INDEPENDENT double reference, at upstream's
+  // own f32 threshold for the chunked single-example test (atol 8e-3 / rtol 5e-3,
+  // test_mamba_ssm_ssd.py:210-213). THE HOST ARM IS HELD TO THE SAME NUMBERS on
+  // the same inputs, so a failure separates cleanly: device-only means a device
+  // defect, both means the cited threshold does not cover this shape and the
+  // finding is a NEEDS_DECISION rather than a wider tolerance.
+  ExpectClose("host y vs sequential double", host.y, ref.y, 8e-3, 5e-3);
+  ExpectClose("host final_states vs sequential double", host.final_states, ref.final_states,
+              8e-3, 5e-3);
+  ExpectClose("device y vs sequential double", dev.y, ref.y, 8e-3, 5e-3);
+  ExpectClose("device final_states vs sequential double", dev.final_states, ref.final_states,
+              8e-3, 5e-3);
+  // G2 — device vs host, at the derived libm bound.
+  ExpectDeviceMatchesHost("y device vs host", dev.y, host.y, T);
+  ExpectDeviceMatchesHost("final_states device vs host", dev.final_states, host.final_states, T);
+}
+
+// The structural properties the chunked factorisation lives on, on device:
+// chunk-size invariance, sequence boundaries INSIDE a physical chunk, and
+// `initial_states`. Small shapes so the sweep stays cheap; the driver shapes are
+// covered above.
+TEST_CASE("mamba2 chunk scan CUDA arm holds the chunked-factorisation properties") {
+  Backend* gpu = MaybeCuda();
+  if (gpu == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered (CPU-only build/box)");
+    return;
+  }
+
+  SUBCASE("invariant to chunk_size") {
+    const int64_t T = 300, H = 8, P = 16, G = 2, N = 32;
+    const Inputs in = GenerateInputs(T, H, P, G, N, 0xC0FFEEu);
+    const std::vector<int32_t> cu{0, static_cast<int32_t>(T)};
+    const SeqRefOut ref =
+        SequentialSsdRef(in, T, H, P, G, N, cu, nullptr, false, nullptr, nullptr, nullptr, {});
+    std::vector<float> first_y, first_state;
+    for (int64_t chunk : {8, 16, 32, 64, 128}) {
+      RunCfg cfg;
+      cfg.chunk_size = chunk;
+      const int64_t nchunks =
+          static_cast<int64_t>(ComputeVarlenChunkMetadata(cu, chunk).seq_idx.size());
+      INFO("chunk_size=" << chunk << " nchunks=" << nchunks);
+      REQUIRE(nchunks > 1);
+      const RunOut dev =
+          RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, cfg);
+      RequireNativeCudaProvider(vt::OpId::kMamba2ChunkScan, "chunk_size invariance");
+      const RunOut host =
+          RunChunkScan(in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, cfg);
+      ExpectClose("device y vs sequential", dev.y, ref.y, 1e-2, 5e-3);
+      ExpectClose("device final_states vs sequential", dev.final_states, ref.final_states, 1e-2,
+                  5e-3);
+      ExpectDeviceMatchesHost("y device vs host", dev.y, host.y, T);
+      ExpectDeviceMatchesHost("final_states device vs host", dev.final_states, host.final_states,
+                              T);
+      if (first_y.empty()) {
+        first_y = dev.y;
+        first_state = dev.final_states;
+      } else {
+        ExpectCloseF("device y vs chunk_size=8", dev.y, first_y, 1e-2, 5e-3);
+        ExpectCloseF("device final_states vs chunk_size=8", dev.final_states, first_state, 1e-2,
+                     5e-3);
+      }
+    }
+  }
+
+  SUBCASE("continuous batches, with and without initial_states") {
+    struct Case {
+      std::vector<int32_t> lens;
+      int64_t chunk;
+    };
+    const std::vector<Case> cases{
+        {{64, 32}, 8},    {{4, 4, 4, 4}, 8}, {{5, 30, 1, 2}, 256},
+        {{138, 225}, 128}, {{270, 88}, 8},
+    };
+    const int64_t H = 8, P = 16, G = 2, N = 16;
+    for (const Case& c : cases) {
+      std::vector<int32_t> cu{0};
+      for (int32_t l : c.lens) cu.push_back(cu.back() + l);
+      const int64_t T = cu.back();
+      const int64_t S = static_cast<int64_t>(c.lens.size());
+      const int64_t maxlen = *std::max_element(c.lens.begin(), c.lens.end());
+      const double atol = maxlen > 256 ? 1e-2 : 5e-3;
+      const Inputs in = GenerateInputs(T, H, P, G, N, 0xBEEF01u + static_cast<uint32_t>(c.chunk));
+      INFO("chunk=" << c.chunk << " nseq=" << S << " T=" << T);
+      RunCfg cfg;
+      cfg.chunk_size = c.chunk;
+
+      // (a) fresh sequences — the `seq_idx[c] != seq_idx[c-1]` branch must take
+      //     ZEROS as the previous state (ssd_chunk_scan.py:271-274).
+      {
+        const SeqRefOut ref = SequentialSsdRef(in, T, H, P, G, N, cu, nullptr, false, nullptr,
+                                               nullptr, nullptr, {});
+        const RunOut dev = RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr,
+                                            nullptr, nullptr, cfg);
+        RequireNativeCudaProvider(vt::OpId::kMamba2ChunkScan, "continuous batch (fresh)");
+        const RunOut host =
+            RunChunkScan(in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, cfg);
+        ExpectClose("device y (fresh)", dev.y, ref.y, atol, 5e-3);
+        ExpectClose("device final_states (fresh)", dev.final_states, ref.final_states, atol,
+                    5e-3);
+        ExpectDeviceMatchesHost("y (fresh) device vs host", dev.y, host.y, maxlen);
+        ExpectDeviceMatchesHost("final_states (fresh) device vs host", dev.final_states,
+                                host.final_states, maxlen);
+      }
+      // (b) with initial_states — the same branch must instead take
+      //     initial_states[seq_idx[c]] (ssd_chunk_scan.py:236-243).
+      {
+        std::mt19937 rng(1234u);
+        std::normal_distribution<float> nd(0.0f, 0.5f);
+        std::vector<float> init(static_cast<size_t>(S * H * P * N));
+        for (auto& v : init) v = nd(rng);
+        const std::vector<double> initd(init.begin(), init.end());
+        const SeqRefOut ref = SequentialSsdRef(in, T, H, P, G, N, cu, nullptr, false, nullptr,
+                                               nullptr, &initd, {});
+        const RunOut dev =
+            RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, &init, cfg);
+        const RunOut host =
+            RunChunkScan(in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, &init, cfg);
+        ExpectClose("device y (init states)", dev.y, ref.y, atol, 5e-3);
+        ExpectClose("device final_states (init states)", dev.final_states, ref.final_states, atol,
+                    5e-3);
+        ExpectDeviceMatchesHost("y (init) device vs host", dev.y, host.y, maxlen);
+        ExpectDeviceMatchesHost("final_states (init) device vs host", dev.final_states,
+                                host.final_states, maxlen);
+      }
+    }
+  }
+}
+
+// The optional arms and the dtype knobs, on device: D as [H] and [H,P], the z
+// silu gate, dt_bias + dt_softplus, the dt_limit clamp, a bf16 activation stream
+// and a bf16 SSM state.
+TEST_CASE("mamba2 chunk scan CUDA arm covers the optional arms and the dtype knobs") {
+  Backend* gpu = MaybeCuda();
+  if (gpu == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered (CPU-only build/box)");
+    return;
+  }
+  const int64_t T = 100, H = 8, P = 12, G = 2, N = 16, chunk = 32;
+  const Inputs in = GenerateInputs(T, H, P, G, N, 0xD00D42u);
+  const std::vector<int32_t> cu{0, 40, static_cast<int32_t>(T)};
+  const int64_t maxlen = 60;  // the longer of the two sequences
+
+  std::mt19937 rng(7u);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::uniform_real_distribution<float> ud(0.0f, 1.0f);
+  std::vector<float> d_head_scalar(static_cast<size_t>(H));
+  for (auto& v : d_head_scalar) v = nd(rng);
+  std::vector<float> d_hdim(static_cast<size_t>(H * P));
+  for (auto& v : d_hdim) v = nd(rng);
+  std::vector<float> z(static_cast<size_t>(T * H * P));
+  for (auto& v : z) v = nd(rng);
+  std::vector<float> dt_bias(static_cast<size_t>(H));
+  for (auto& v : dt_bias) v = ud(rng) - 4.0f;
+
+  SUBCASE("D as [H]") {
+    RunCfg cfg;
+    cfg.chunk_size = chunk;
+    const SeqRefOut ref = SequentialSsdRef(in, T, H, P, G, N, cu, &d_head_scalar, false, nullptr,
+                                           nullptr, nullptr, {});
+    const RunOut dev = RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, &d_head_scalar, nullptr,
+                                        nullptr, nullptr, cfg);
+    RequireNativeCudaProvider(vt::OpId::kMamba2ChunkScan, "D as [H]");
+    const RunOut host =
+        RunChunkScan(in, T, H, P, G, N, cu, &d_head_scalar, nullptr, nullptr, nullptr, cfg);
+    ExpectClose("device y", dev.y, ref.y, 5e-3, 5e-3);
+    ExpectDeviceMatchesHost("y device vs host", dev.y, host.y, maxlen);
+  }
+  SUBCASE("D as [H,P]") {
+    RunCfg cfg;
+    cfg.chunk_size = chunk;
+    cfg.d_has_hdim = true;
+    const SeqRefOut ref =
+        SequentialSsdRef(in, T, H, P, G, N, cu, &d_hdim, true, nullptr, nullptr, nullptr, {});
+    const RunOut dev =
+        RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, &d_hdim, nullptr, nullptr, nullptr, cfg);
+    const RunOut host =
+        RunChunkScan(in, T, H, P, G, N, cu, &d_hdim, nullptr, nullptr, nullptr, cfg);
+    ExpectClose("device y", dev.y, ref.y, 5e-3, 5e-3);
+    ExpectDeviceMatchesHost("y device vs host", dev.y, host.y, maxlen);
+  }
+  SUBCASE("z silu gate") {
+    RunCfg cfg;
+    cfg.chunk_size = chunk;
+    const SeqRefOut ref =
+        SequentialSsdRef(in, T, H, P, G, N, cu, nullptr, false, &z, nullptr, nullptr, {});
+    const RunOut dev =
+        RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, &z, nullptr, nullptr, cfg);
+    const RunOut host = RunChunkScan(in, T, H, P, G, N, cu, nullptr, &z, nullptr, nullptr, cfg);
+    ExpectClose("device y", dev.y, ref.y, 5e-3, 5e-3);
+    ExpectDeviceMatchesHost("y device vs host", dev.y, host.y, maxlen);
+  }
+  SUBCASE("dt_bias + dt_softplus, then the dt_limit clamp") {
+    RefCfg rc;
+    rc.dt_softplus = true;
+    RunCfg cfg;
+    cfg.chunk_size = chunk;
+    cfg.dt_softplus = true;
+    {
+      const SeqRefOut ref =
+          SequentialSsdRef(in, T, H, P, G, N, cu, nullptr, false, nullptr, &dt_bias, nullptr, rc);
+      const RunOut dev =
+          RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, &dt_bias, nullptr, cfg);
+      const RunOut host =
+          RunChunkScan(in, T, H, P, G, N, cu, nullptr, nullptr, &dt_bias, nullptr, cfg);
+      ExpectClose("device y", dev.y, ref.y, 5e-3, 5e-3);
+      ExpectClose("device final_states", dev.final_states, ref.final_states, 5e-3, 5e-3);
+      ExpectDeviceMatchesHost("y device vs host", dev.y, host.y, maxlen);
+    }
+    RefCfg clamped = rc;
+    clamped.dt_min = 0.05;
+    clamped.dt_max = 0.10;
+    RunCfg ccfg = cfg;
+    ccfg.dt_min = 0.05f;
+    ccfg.dt_max = 0.10f;
+    const SeqRefOut cref = SequentialSsdRef(in, T, H, P, G, N, cu, nullptr, false, nullptr,
+                                            &dt_bias, nullptr, clamped);
+    const RunOut cdev =
+        RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, &dt_bias, nullptr, ccfg);
+    ExpectClose("device y (clamped)", cdev.y, cref.y, 5e-3, 5e-3);
+    // The clamp must actually BITE, or the comparison is trivial.
+    const SeqRefOut loose =
+        SequentialSsdRef(in, T, H, P, G, N, cu, nullptr, false, nullptr, &dt_bias, nullptr, rc);
+    double max_diff = 0.0;
+    for (size_t i = 0; i < loose.y.size(); ++i)
+      max_diff = std::max(max_diff, std::abs(loose.y[i] - cref.y[i]));
+    CHECK(max_diff > 1e-2);
+  }
+  SUBCASE("bf16 activations") {
+    Inputs bin = in;
+    RoundInputsTo(bin, DType::kBF16);
+    RunCfg cfg;
+    cfg.chunk_size = chunk;
+    cfg.act_dtype = DType::kBF16;
+    const SeqRefOut bref =
+        SequentialSsdRef(bin, T, H, P, G, N, cu, nullptr, false, nullptr, nullptr, nullptr, {});
+    const RunOut dev =
+        RunChunkScanCuda(*gpu, bin, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, cfg);
+    ExpectClose("device y bf16", dev.y, bref.y, 5e-2, 5e-2);
+  }
+  // `state_dtype` is a SEPARATE knob (ssd_combined.py:46,119,176), and it moves
+  // `out` as well as `final_states` because `_chunk_scan_fwd` reads the stored
+  // copy back (:249-250, :266-269). The device arm allocates its inter-chunk
+  // buffer at that width — NOT at the host reference's f32 working width (§8.2 F9)
+  // — so the two arms must agree on BOTH outputs.
+  SUBCASE("bf16 SSM state with f32 activations") {
+    const int64_t T2 = 96, H2 = 4, P2 = 8, G2 = 2, N2 = 16, chunk2 = 16;
+    const Inputs in2 = GenerateInputs(T2, H2, P2, G2, N2, 0x51A7Eu);
+    const std::vector<int32_t> cu2{0, static_cast<int32_t>(T2)};
+    RunCfg cfg;
+    cfg.chunk_size = chunk2;
+    cfg.state_dtype = DType::kBF16;
+    const RunOut dev = RunChunkScanCuda(*gpu, in2, T2, H2, P2, G2, N2, cu2, nullptr, nullptr,
+                                        nullptr, nullptr, cfg);
+    RequireNativeCudaProvider(vt::OpId::kMamba2ChunkScan, "bf16 SSM state");
+    const RunOut host =
+        RunChunkScan(in2, T2, H2, P2, G2, N2, cu2, nullptr, nullptr, nullptr, nullptr, cfg);
+    for (float v : dev.final_states) CHECK(vt::BF16ToF32(vt::F32ToBF16(v)) == v);
+    ExpectDeviceMatchesHost("y (bf16 state) device vs host", dev.y, host.y, T2);
+    ExpectDeviceMatchesHost("final_states (bf16 state) device vs host", dev.final_states,
+                            host.final_states, T2);
+    // ... and the bf16 state really does move `out` on the device arm too.
+    RunCfg f32cfg = cfg;
+    f32cfg.state_dtype = DType::kF32;
+    const RunOut f32dev = RunChunkScanCuda(*gpu, in2, T2, H2, P2, G2, N2, cu2, nullptr, nullptr,
+                                           nullptr, nullptr, f32cfg);
+    double max_out_diff = 0.0;
+    for (size_t i = 0; i < dev.y.size(); ++i)
+      max_out_diff =
+          std::max(max_out_diff, std::abs(static_cast<double>(dev.y[i]) - f32dev.y[i]));
+    INFO("device max|out(bf16 state) - out(f32 state)| = " << max_out_diff);
+    CHECK(max_out_diff > 1e-6);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OUT-OF-CONTRACT METADATA, DEVICE ONLY.
+//
+// The shared validator checks metadata SHAPE / DTYPE / DEVICE only
+// (`CheckI32Meta`, ops.cpp); every VALUE check lives in the HOST kernel, which
+// reads the tensors (cpu_ops.cpp). The device arm therefore runs with NONE of
+// them. src/vt/cuda/cuda_mamba2_ssd.cuh enumerates all six and says which are
+// memory-unsafe; this case covers the TWO that are both memory-unsafe and
+// bounded by a register-local clamp:
+//   * `last_chunk_indices[b] >= nchunks` makes the `passed` store run past its
+//     `cudaMallocAsync` allocation, and
+//   * a `seq_idx[c]` outside `[0,S)` reads `initial_states` out of bounds, with
+//     `seq_idx[0] < 0` additionally indexing `passed` at chunk -1.
+// It PINS the clamped behaviour so it is a test, not a sentence in a header.
+// The `cu_chunk_seqlens` checks are NOT clamped and are NOT covered here; the
+// header states that as an open memory-safety gap rather than hiding it.
+//
+// THIS CASE HAS NO HOST TWIN, deliberately: the host kernel REFUSES both inputs,
+// which is exactly why the device arm needed the clamp. Each clamp is pinned
+// against an IN-CONTRACT reference run whose result the clamp is defined to
+// reproduce, so the assertions are EXACT — a tolerance here would be wide enough
+// to hide the defect it is meant to catch.
+//
+// What this case does NOT establish is memory safety itself. An out-of-bounds
+// write into a `cudaMallocAsync` pool very often does not fault, so a green run
+// is necessary and not sufficient; `compute-sanitizer memcheck` on this case is
+// what proves it, and is recorded as owed in mamba2-ssd.md §8.5.
+TEST_CASE("mamba2 chunk scan CUDA arm clamps out-of-contract metadata in registers") {
+  Backend* gpu = MaybeCuda();
+  if (gpu == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered (CPU-only build/box)");
+    return;
+  }
+  // Four one-chunk sequences, so `nchunks == S == 4` and every chunk opens a new
+  // sequence. That makes the in-contract `seq_idx` {0,1,2,3} and the in-contract
+  // `last_chunk_indices` {0,1,2,3}.
+  const int64_t H = 4, P = 8, G = 2, N = 16, chunk = 16;
+  const std::vector<int32_t> cu{0, 16, 32, 48, 64};
+  const int64_t T = cu.back(), S = static_cast<int64_t>(cu.size()) - 1;
+  const Inputs in = GenerateInputs(T, H, P, G, N, 0xC1A47u);
+  const ChunkMeta meta = ComputeVarlenChunkMetadata(cu, chunk);
+  const int64_t nchunks = static_cast<int64_t>(meta.seq_idx.size());
+  REQUIRE(nchunks == S);
+  // A braced init-list cannot appear inside a doctest macro — the preprocessor
+  // splits it on the commas — so the expectation is named first.
+  const std::vector<int32_t> in_contract{0, 1, 2, 3};
+  REQUIRE(meta.last_chunk_indices == in_contract);
+  REQUIRE(meta.seq_idx == in_contract);
+
+  std::mt19937 rng(0xB0B0u);
+  std::normal_distribution<float> nd(0.0f, 0.5f);
+  std::vector<float> init(static_cast<size_t>(S * H * P * N));
+  for (auto& v : init) v = nd(rng);
+
+  RunCfg cfg;
+  cfg.chunk_size = chunk;
+
+  auto max_abs_diff = [](const std::vector<float>& a, const std::vector<float>& b) {
+    REQUIRE(a.size() == b.size());
+    double worst = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+      worst = std::max(worst, std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+    return worst;
+  };
+  auto count_differing = [](const std::vector<float>& a, const std::vector<float>& b) {
+    REQUIRE(a.size() == b.size());
+    size_t n = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+      if (a[i] != b[i]) ++n;
+    return n;
+  };
+
+  SUBCASE("last_chunk_indices past the end stops the chunk loop at nchunks") {
+    // In contract, the last sequence's `lci` is `nchunks - 1`. The clamp is
+    // defined to make anything >= nchunks behave as nchunks - 1, so these two
+    // runs must agree BIT FOR BIT — in `final_states` as much as in `y`, since
+    // the clamp is inside the state-passing kernel that produces both.
+    const RunOut ref =
+        RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, &init, cfg);
+    RequireNativeCudaProvider(vt::OpId::kMamba2ChunkScan, "lci clamp reference");
+    for (int32_t past : {static_cast<int32_t>(nchunks), static_cast<int32_t>(nchunks + 41)}) {
+      std::vector<int32_t> lci = meta.last_chunk_indices;
+      lci.back() = past;
+      const RunOut got = RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr,
+                                          &init, cfg, &lci, nullptr);
+      INFO("last_chunk_indices.back() = " << past << " (nchunks = " << nchunks << ")");
+      CHECK(count_differing(got.y, ref.y) == 0);
+      CHECK(count_differing(got.final_states, ref.final_states) == 0);
+    }
+  }
+
+  SUBCASE("a seq_idx outside [0,S) opens the chunk with a ZERO previous state") {
+    // The reference is an IN-CONTRACT run with NO initial states: `seq_idx`
+    // {0,1,2,3} makes every chunk open a new sequence, and with `initial_states
+    // == nullptr` every one of them therefore opens from zero. That is exactly
+    // what the clamp is defined to do for an out-of-range index, so `y` must
+    // match bit for bit. `final_states` is NOT compared: the state-passing
+    // kernel reads `initial_states` by `b`, not by `seq_idx`, so it legitimately
+    // differs between a run that was given initial states and one that was not.
+    const RunOut zero_ref =
+        RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, nullptr, cfg);
+    RequireNativeCudaProvider(vt::OpId::kMamba2ChunkScan, "seq_idx clamp reference");
+    // ... and the pin is not vacuous: with the SAME metadata in contract, the
+    // initial states genuinely move `y`, so "matches the zero-init run" is a
+    // real statement rather than two identical computations
+    // ([[gate-comparing-shared-helper-proves-consistency-not-correctness]]).
+    const RunOut init_ref =
+        RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr, &init, cfg);
+    INFO("max|y(initial_states) - y(none)| = " << max_abs_diff(init_ref.y, zero_ref.y));
+    REQUIRE(max_abs_diff(init_ref.y, zero_ref.y) > 1e-6);
+
+    // Over the top: every index >= S, which unclamped indexes `initial_states`
+    // out of bounds. Under the bottom: every index negative, which unclamped
+    // ALSO makes `si == si_prev` at c == 0 and indexes `passed` at chunk -1.
+    const std::vector<std::vector<int32_t>> bad{
+        {static_cast<int32_t>(S), static_cast<int32_t>(S + 1), static_cast<int32_t>(S + 2),
+         static_cast<int32_t>(S + 900)},
+        {-1, -1, -1, -1},
+    };
+    for (const std::vector<int32_t>& sidx : bad) {
+      REQUIRE(static_cast<int64_t>(sidx.size()) == nchunks);
+      const RunOut got = RunChunkScanCuda(*gpu, in, T, H, P, G, N, cu, nullptr, nullptr, nullptr,
+                                          &init, cfg, nullptr, &sidx);
+      INFO("seq_idx = {" << sidx[0] << ", " << sidx[1] << ", " << sidx[2] << ", " << sidx[3]
+                         << "}, S = " << S);
+      CHECK(count_differing(got.y, zero_ref.y) == 0);
+    }
+  }
+}
+
+#endif  // VLLM_CPP_CUDA

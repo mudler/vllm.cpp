@@ -221,6 +221,114 @@ Until the GGUF arm lands it is **refused by name** at load, naming the missing
 piece, never silently dequantized to a supported path — a silent fallback is
 exactly what a token gate cannot see. Tracked as W7.
 
+## 5c. W3 result — registered, parsed, enumerated, KV-shaped (2026-08-13)
+
+W3 landed on `row/MODEL-NEMOTRON-H-W3B` (base `fafa16f0`). It makes the
+architecture KNOWN; it runs nothing. The forward and GGUF arms REFUSE BY NAME.
+
+**Enumeration, the hard numbers.** `EnumerateNemotronHTensors` claims **18487 of
+18487** released tensors; **0 unaccounted, 0 invented, 0 refused** — every tensor
+has a named consumer, so no refusal was needed. Composition: 5 root (embeddings,
+`norm_f`, the NVFP4 `lm_head` triple), 23 mamba layers x 13, 6 attention x 7,
+23 MoE x 777 (2 router + 128x6 expert + 6 shared + 1 norm), and 270 MTP
+(`mtp.layers.0` 8, `mtp.layers.1` 262). Both directions are gated against a
+committed headers-only projection of the index, and a second case re-verifies
+that projection against the LIVE checkpoint when `VT_NEMOTRON35_SNAPSHOT` names
+it.
+
+**Four things the reconnaissance had wrong or unstated, settled against source
+and disk:**
+
+1. **`layers_block_type` really is the source of truth, but for a subtler
+   reason than "the config says so".** vLLM VENDORS its own `NemotronHConfig`
+   (`transformers_utils/configs/nemotron_h.py:277-287`) in which the polarity is
+   REVERSED — `hybrid_override_pattern` is the ctor argument and
+   `layers_block_type` the derived property. That class is imported by
+   `nemotron_h.py:83` for TYPE ANNOTATION only; the object that reaches the
+   model comes from transformers `AutoConfig`, where `num_hidden_layers` is a
+   property over `layers_block_type` whose setter discards the checkpoint's
+   value (`configuration_nemotron_h.py:225-238`). §5a's live oracle run is what
+   settles it on the real checkpoint. Both spellings are accepted here, the
+   modern one winning.
+2. **`moe_latent_size`: absent and `null` are the SAME state.** Upstream's
+   predicate is `getattr(config, "moe_latent_size", None) is not None`
+   (`nemotron_h.py:143`), so a missing key and an explicit `null` both mean "no
+   latent MoE". A three-state representation would have been inventing a
+   distinction upstream does not make. `std::optional` covers both; a real value
+   REFUSES (§0).
+3. **The shared `detail::ResolveMambaSsmCacheDType` is the WRONG reader here,
+   and using it silently halves the recurrent state.** It reads
+   `HfConfig::mamba_ssm_dtype`, which `hf_config.cpp:439` parses from the key
+   **`mamba_ssm_dtype`** — Qwen3.5/3.6's spelling. NemotronH ships
+   **`mamba_ssm_cache_dtype`** (`configuration_nemotron_h.py:121`), so the
+   shared helper saw an empty string and returned the CONVOLUTION dtype. Caught
+   by the KV gate as `page_size_bytes() == 1085440` against an expected
+   `2134016` — the SSM state at bf16 instead of f32. This is not a Qwen bug;
+   the two families genuinely use different config keys. Resolved locally by
+   `NemotronHSsmCacheDType`, with the reason recorded at the call site.
+4. **The conv-state layout discrepancy is real and deliberate.** Upstream's
+   default is `"SD"` = `(state_len, dim)` (`mamba_utils.py:27-48`,
+   `VLLM_SSM_CONV_STATE_LAYOUT` unset); our local convention across
+   `qwen3_5_common.cpp:85` and `kimi_linear_registry.cpp:156` is
+   `(dim, state_len)`. Same bytes, same page size; the local convention is kept
+   so the shared runner sees one orientation, and the divergence is commented
+   rather than left for W4.
+
+**KV topology.** Two groups carrying their REAL per-layer names — 6
+`backbone.layers.{5,12,19,26,33,42}.mixer` on a `FullAttentionSpec(2 kv heads,
+head_size 128)`, and 23 mamba layers on a `MambaSpec` with shapes
+`{{6144, 3}, {64, 64, 128}}` and dtypes `{bf16, f32}`. `conv_dim == 6144` is
+falsified straight off disk by `mixer.conv1d.weight` BF16 `[6144, 1, 4]`, and
+`in_proj` `[10304, 2688]` confirms `z + xBC + dt`. The names are load-bearing:
+`kv_cache_utils.cpp:979` multiplies a mamba group's page by
+`layer_names.size()`, and `kv_cache_interface.cpp:151-158` does the same for an
+attention group, so a one-element tag would under-count both by 23x and 6x.
+
+**Scope boundary held.** No per-module quant algorithm is resolved — that is W1,
+which is not on `main`. W3 reads four coarse, individually falsifiable keys
+(`quant_method`, `quant_algo`, `kv_cache_scheme`, and the `mtp*` entry in
+`ignore`) and derives the scale companions STRUCTURALLY; the enumeration gate is
+what proves that derivation against all 18487 tensors. A non-ModelOpt producer
+refuses by name. One piece of honest debt is recorded in the code: the quantized
+companion layout of a dense `mlp` block is DERIVED from the shared linear
+layout, because no in-scope released NemotronH checkpoint ships one.
+
+**Fixture.** `tests/vllm/models/fixtures/nemotron_h_35_lightning/` holds the
+released `config.json` minus exactly `quantization_config.{config_groups,
+quantized_layers}` (865 KB of 1.34 MB, the 5981-entry maps W1 owns) and a
+707-family projection of the index. `ignore` is KEPT, unlike the original plan:
+at 2.4 KB it is small, and its `mtp*` wildcard is what makes the MTP tower
+unquantized — eliding it would have forced a guess about 270 tensors.
+
+**Mutation proof (IMP-MUTATE).** Each defect applied alone to the restored tree,
+rebuilt, the gate run, then `git checkout` and `git status --porcelain` verified
+empty. All five turn it RED:
+
+| Mutation | Result |
+|---|---|
+| `layers_block_type` `"moe"` mapped to `kAttention` | 4 cases / 9 assertions FAILURE |
+| `LayerIndices` shifts the FIRST attention index by +1 | 2 cases / 2 assertions FAILURE |
+| `conv_dim` drops the `2*n_groups*state_size` term | 4 cases / 8 assertions FAILURE |
+| SSM cache dtype collapsed to the conv/activation dtype | 1 case / 2 assertions FAILURE |
+| mamba `dt_bias` left UNCLAIMED (23 tensors) | 1 case / 2 assertions FAILURE |
+
+**Gate evidence.** Release `-Werror` CPU: `test_nemotron_h_scaffold` 10/10 cases,
+38245/38245 assertions, `Status: SUCCESS!`; with `VT_NEMOTRON35_SNAPSHOT` set,
+10/10 and 39113/39113. Debug arm (asserts unmasked): identical. Full `ctest`:
+`100% tests passed, 0 tests failed out of 401` (`test_voxtral_e2e` skipped, no
+asset). `test_model_registry` 24/24 and `test_model_loader_gguf` 3/3 after their
+pinned 37-architecture ledgers were reconciled to 38.
+
+One defect was found this way rather than by inspection: the live re-verification
+first died with `[json.exception.type_error.304] cannot use at() with null` from
+inside a loop nowhere near its cause. `nlohmann::json::parse(x).items()` binds a
+range to a TEMPORARY that is destroyed before the body runs. It reads as a clean
+one-liner and it is undefined behaviour; the materialized form is what the
+muse-glimmer precedent already used.
+
+**Not done here:** the forward (W4), the MTP head (W5), the e2e token gate (W6),
+the GGUF arm (W7). The row stays `INVENTORIED`.
+
 ## 6. Risks / decisions
 
 - **Non-gated MoE must not become a parallel path.** If

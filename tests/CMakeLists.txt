@@ -791,6 +791,8 @@ vllm_cpp_add_test(test_reasoning_olmo3
   vllm/entrypoints/openai/reasoning_parsers/test_olmo3.cpp)
 vllm_cpp_add_test(test_reasoning_deepseek_v3
   vllm/entrypoints/openai/reasoning_parsers/test_deepseek_v3.cpp)
+vllm_cpp_add_test(test_reasoning_qwen3
+  vllm/entrypoints/openai/reasoning_parsers/test_qwen3.cpp)
 vllm_cpp_add_test(test_tool_parser_xlam
   vllm/entrypoints/openai/tool_parsers/test_xlam_tool_parser.cpp)
 vllm_cpp_add_test(test_tool_parser_phi4mini

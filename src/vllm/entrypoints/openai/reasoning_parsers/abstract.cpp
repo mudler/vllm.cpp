@@ -14,6 +14,7 @@
 #include "vllm/entrypoints/openai/reasoning_parsers/mistral.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/muse_glimmer.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/olmo3.h"
+#include "vllm/entrypoints/openai/reasoning_parsers/parser_engine_adapter.h"
 #include "vllm/entrypoints/openai/reasoning_parsers/step3.h"
 
 namespace vllm::entrypoints::openai {
@@ -55,6 +56,14 @@ std::unique_ptr<ReasoningParser> get_reasoning_parser(const std::string& name) {
   if (name == "muse_glimmer") {
     return std::make_unique<MuseGlimmerReasoningParser>();
   }
+  // __init__.py:115 ("qwen3") and :87 ("mimo") register the SAME class,
+  // Qwen3ParserReasoningAdapter (qwen3_engine_reasoning_parser.py, a re-export
+  // of registered_adapters.py:48) — the engine-backed reasoning face, NOT a
+  // text splitter. Constructed with upstream's default thinking=True
+  // (chat_template_kwargs threading is W4, see specs/reasoning-parsers.md).
+  if (name == "qwen3" || name == "mimo") {
+    return std::make_unique<Qwen3ParserReasoningAdapter>();
+  }
   return nullptr;
 }
 
@@ -64,7 +73,7 @@ const std::vector<std::string>& reasoning_parser_names() {
   static const std::vector<std::string> names = {
       "think_auto", "deepseek_r1", "deepseek_v3", "holo2",
       "mistral", "minimax_m2", "minimax_m2_append_think", "step3", "olmo3",
-      "muse_glimmer",
+      "muse_glimmer", "qwen3", "mimo",
   };
   return names;
 }

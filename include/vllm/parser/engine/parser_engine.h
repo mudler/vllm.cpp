@@ -126,6 +126,17 @@ class ParserEngine {
       const std::string& delta_text, const std::vector<int>& delta_token_ids,
       const ParserRequest& request, bool finished);
 
+  // parser_engine.py:519 extract_reasoning_streaming — the REASONING face of the
+  // incremental parse: initialize, feed the delta, assemble. Upstream takes the
+  // previous/current text and the three token-ID spans and reads NONE of them
+  // (only delta_text and delta_token_ids reach the lexer), so the C++ signature
+  // carries just what is consumed. Unlike extract_tool_calls_streaming this does
+  // NOT run _check_skip_tool_parsing: the reasoning adapter suppresses tool
+  // parsing around the call instead (adapters.py:51 _skip_tool_parsing).
+  std::optional<oai::DeltaMessage> extract_reasoning_streaming(
+      const std::string& delta_text,
+      const std::vector<int>& delta_token_ids = {});
+
   std::optional<oai::DeltaMessage> extract_tool_calls_streaming(
       const std::string& previous_text, const std::string& current_text,
       const std::string& delta_text, const ParserRequest& request);
@@ -146,6 +157,14 @@ class ParserEngine {
   std::tuple<std::optional<std::string>, std::optional<std::string>,
              std::optional<std::vector<oai::FunctionCall>>>
   parse(const std::string& model_output, const ParserRequest& request);
+
+  // ── Reasoning state query ─────────────────────────────────────────
+  // parser_engine.py:595 is_reasoning_end, in the TEXT form our reasoning seam
+  // uses (reasoning_parsers/abstract.h documents the token-ID -> text
+  // deviation; the think markers are self-delimiting so a substring scan is
+  // equivalent for a well-formed stream). virtual: qwen3 also ends reasoning on
+  // an unpaired tool-call marker (qwen3.py:256).
+  virtual bool is_reasoning_end(const std::string& text) const;
 
  protected:
   // Overridable per-family hooks (kimi_k2 overrides several).

@@ -6,6 +6,7 @@ registry) + `vllm/reasoning/abs_reasoning_parsers.py:26` (`ReasoningParser` ABC)
 `:213` (`ReasoningParserManager`).
 Pinned oracle: `/home/mudler/_git/vllm` @ `555967922` (vLLM 0.26.0.dev0).
 Claim: `CLAIM-SAMPLE-REASONING`.
+Issue: [#605](https://github.com/mudler/vllm.cpp/issues/605) (W3 resequencing + brick 1).
 
 ## Scope
 
@@ -133,7 +134,8 @@ factory branch + one test), or, for group D, wrap the already-landed
 | `test_minimax_m2_reasoning_parser.py` (+append) | end-only + append-think | `test_minimax_m2.cpp` | DONE |
 | `test_step3p5_reasoning_parser.py` | step3 | `test_step3.cpp` (step3); step3p5 pending | PARTIAL |
 | `test_olmo3_reasoning_parser.py` | olmo3 | `test_olmo3.cpp` | DONE |
-| `test_{granite,gptoss,qwen3,glm4_moe,gemma4,hunyuan,hy_v3,kimi_k2,cohere,nemotron_v3,minimax_m3,holo2}_reasoning_parser.py` | remaining families | — | MISSING (W2/W3) |
+| `test_qwen3_reasoning_parser.py` | qwen3 + mimo: engine-backed `<think>` + implicit `<tool_call>` reasoning end, thinking-off passthrough, multi-token deltas | `test_qwen3.cpp` | **DONE (W3 brick 1, 2026-08-13)** |
+| `test_{granite,gptoss,glm4_moe,gemma4,hunyuan,hy_v3,kimi_k2,cohere,nemotron_v3,minimax_m3,holo2}_reasoning_parser.py` | remaining families | — | MISSING (W3 rest / W2) |
 
 The v4-alias sub-case is SKIPPED-with-reason in `test_deepseek_v3.cpp`
 (engine-backed adapter, W3). Each ported parser is gated over the exact upstream
@@ -174,8 +176,18 @@ RED-first.
   `hunyuan_a13b`, `step3p5`, `hy_v3`, `kimi_k2`, `minimax_m3`, `cohere_command3/4`,
   `openai_gptoss` (each a direct text port + its upstream test).
 - **W3** — the engine-backed reasoning adapters (`qwen3`/`mimo`, `gemma4`,
-  `glm45/47`, `seed_oss`, `deepseek_v4`, `nemotron_v3`, `inkling`) as reasoning
-  faces over the already-landed `TOOLS-STREAMING-PARSER` engine.
+  `glm45/47`, `seed_oss`, `deepseek_v4`, `nemotron_v3`, `inkling`, `nano_v3`) as
+  reasoning faces over the already-landed `TOOLS-STREAMING-PARSER` engine.
+  **Brick 1 DONE 2026-08-13 (#605):** `qwen3` + `mimo` (one class, two registry
+  names). Landed the reusable base `ParserEngineReasoningAdapter`
+  (`adapters.py:35`) that every remaining W3 name plugs into, the `Qwen3Parser`
+  engine subclass (`qwen3.py:201`, now also serving `seed_oss` exactly as upstream
+  does), and the two engine methods the reasoning face needs —
+  `ParserEngine::extract_reasoning_streaming` (`parser_engine.py:519`) and the TEXT
+  form of `is_reasoning_end` (`parser_engine.py:595`). Coverage 10 -> 12 names;
+  covers 20 of the 76 recipe uses. Next bricks, by recipe demand: `glm45`+`glm47`
+  (11), `gemma4` (6), `nemotron_v3` (3), `deepseek_v4` (2), `inkling` (2),
+  `seed_oss`, `nano_v3`.
 
 ### Ordering amendment 2026-08-13 — W3 runs BEFORE W2 (#605)
 
@@ -226,9 +238,12 @@ not what a user hits first.
   site. Threading it is W4. Risk: a caller expecting `deepseek_v3` +
   `{"thinking":true}` to split will instead get passthrough until W4 — mitigated
   by exposing `holo2` for the thinking path.
-- **Risk**: README:68 states "7 reasoning" families; after W1 it is 9 registered
-  names. This change is scoped NOT to touch README, so a README count bump is a
-  tracked follow-up.
+- **Risk (DISCHARGED 2026-08-13, #605)**: README stated a stale reasoning-family
+  count — "7" after W1 made it 9, then `muse_glimmer` made it 10 without a bump.
+  The W3 brick-1 change takes it to 12 and updates `README.md`, `docs/USAGE.md`
+  and `docs/STATUS.md` in the SAME change. The pinned count in
+  `test_detect.cpp` is what forces this: a factory branch added without listing
+  the name fails there.
 - **Risk/decision**: token-ID methods (`extract_content_ids`,
   `count_reasoning_tokens`) remain dropped under the text-only seam; needed only
   if we port the xgrammar token-ID gate. Deferred with the structured-output row.

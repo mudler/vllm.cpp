@@ -345,6 +345,31 @@ std::optional<oai::DeltaMessage> ParserEngine::parse_delta(
   return result;
 }
 
+// parser_engine.py:519 extract_reasoning_streaming.
+std::optional<oai::DeltaMessage> ParserEngine::extract_reasoning_streaming(
+    const std::string& delta_text, const std::vector<int>& delta_token_ids) {
+  initialize_streaming();
+  std::vector<SemanticEvent> events = feed(delta_text, delta_token_ids);
+  return strip_trailing_reasoning(events_to_delta(events, /*finished=*/false));
+}
+
+// parser_engine.py:595 is_reasoning_end — TEXT form. Upstream walks the token
+// ids BACKWARDS and returns True at the first reasoning-end token, False at the
+// first reasoning-start token. Over text that is exactly "the LAST end marker
+// lies after the LAST start marker" (neither literal is a substring of the
+// other, so their occurrences cannot alias).
+bool ParserEngine::is_reasoning_end(const std::string& text) const {
+  const std::optional<std::string> end = reasoning_end_str();
+  if (!end) return reasoning_ended_;
+  if (text.empty()) return config_.initial_state != ParserState::REASONING;
+  const std::size_t pe = text.rfind(*end);
+  if (pe == std::string::npos) return false;
+  const std::optional<std::string> start = reasoning_start_str();
+  if (!start) return true;
+  const std::size_t ps = text.rfind(*start);
+  return ps == std::string::npos || pe > ps;
+}
+
 std::optional<oai::DeltaMessage> ParserEngine::extract_tool_calls_streaming(
     const std::string& /*previous_text*/, const std::string& /*current_text*/,
     const std::string& delta_text, const ParserRequest& request) {

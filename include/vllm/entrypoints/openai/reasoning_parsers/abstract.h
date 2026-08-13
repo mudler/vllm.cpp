@@ -89,7 +89,8 @@ class ReasoningParser {
 // (ReasoningParserManager.get_reasoning_parser). Returns a fresh parser for
 // `name`, or nullptr when the name is not one of the T0-registered formats
 // (upstream raises KeyError). Registered names: "deepseek_r1", "mistral",
-// "minimax_m2", "minimax_m2_append_think", "step3", "olmo3".
+// "minimax_m2", "minimax_m2_append_think", "step3", "olmo3", and the
+// engine-backed "qwen3"/"mimo" pair (reasoning_parsers/parser_engine_adapter.h).
 std::unique_ptr<ReasoningParser> get_reasoning_parser(const std::string& name);
 
 // Every name get_reasoning_parser accepts, in factory order (the analogue of

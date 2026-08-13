@@ -347,6 +347,30 @@ tokens quietly.
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
+### GDN checkpoints: the `output_gate_type` key
+
+A Gated DeltaNet checkpoint (the Qwen3.5 / Qwen3-Next family) chooses its
+output-gate activation in `config.json`:
+
+| `output_gate_type` | Gate applied |
+|---|---|
+| absent | `silu` — the upstream default |
+| `"silu"` or `"swish"` | `silu` — `swish` is an alias, collapsed at load |
+| `"sigmoid"` | `sigmoid` |
+| present but `null`, `""`, or not a string | refused |
+
+The key is read from the **resolved text config**, so a flat text-only
+`config.json` and a multimodal wrapper that nests the text model under
+`text_config` behave identically. Any other value is **refused at load** with a
+message naming the key and the accepted set — never silently defaulted, because
+the wrong gate is a numerics change that still emits plausible tokens
+([#489](https://github.com/mudler/vllm.cpp/issues/489)).
+
+Only an **absent** key takes the default. A key that is present but `null` or
+empty is a value, not an absence: upstream hands it straight to its
+`assert output_gate_type in ["silu", "swish", "sigmoid"]` and errors, so this
+loader refuses it as well rather than quietly reading it as `silu`.
+
 ### Muse Glimmer: exactly what has been checked
 
 `MuseGlimmerForCausalLM` / `MuseGlimmerForConditionalGeneration` are not in that
@@ -888,6 +912,41 @@ a stop token early.
 | `--cuda-profile-graph-replays N` | `0` (off) | Trace-only diagnostic: arm the CUDA-graph-replay profiler and stop after N replays, printing a pid to signal with `SIGUSR2`. Requires a build with `VT_BENCH_PROFILE_CONTROL` |
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |
 | `-h`, `--help` | | Print usage and exit |
+
+#### Accepted for recipe compatibility — these flags have NO effect
+
+A published `vllm serve` line has to reach model load. The flags below appear in
+most official [vllm-project/recipes](https://github.com/vllm-project/recipes)
+commands, mean nothing to this engine, and are therefore **accepted and ignored**
+rather than rejected. Each one prints a notice on startup naming itself and the
+reason it does nothing, so a log never implies it took effect.
+
+| Flag | Effect here | Why it is inert |
+|---|---|---|
+| `--enable-auto-tool-choice` | **none** | Tool parsing is already unconditional once `--tool-call-parser` resolves; there is no second gate to open. Note `--tool-call-parser` defaults to `hermes` here, where upstream's defaults to unset, so the two flags do not line up when the parser is omitted. Upstream's validation is still mirrored: combining it with `--tool-call-parser none` is refused, as in `vllm/entrypoints/openai/cli_args.py:395` |
+| `--trust-remote-code` | **none** | It authorizes executing Python from the checkpoint. This engine has no Python runtime, so there is nothing to authorize — N/A by construction, not unimplemented |
+
+The notice is on stderr at startup, one line per flag actually passed, so what
+you see in a log matches this table:
+
+```text
+server: accepted '--trust-remote-code' for published-recipe compatibility; it has no effect here: no Python runtime, so there is no remote code to trust
+```
+
+The mirrored validation is reported before the parser dialect is checked, so a
+contradiction is named as a contradiction rather than passing silently (`none` is
+itself a valid selection):
+
+```text
+server: Error: --enable-auto-tool-choice requires --tool-call-parser
+server: (--tool-call-parser none selects NO parser; name a parser, or drop --tool-call-parser to keep the hermes default)
+```
+
+This list is **enumerated, not a catch-all**. Any other unrecognized flag still
+aborts with `server: unknown argument '<flag>'`, including flags that are inert
+only because the capability is missing (`--tensor-parallel-size` and the other
+parallelism flags) — silently accepting those would let you believe you got
+tensor parallelism when you did not.
 
 #### Context length vs the KV pool
 

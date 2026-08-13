@@ -284,8 +284,15 @@ def audit() -> list[dict]:
 # agent-integration invocations plus the per-commit re-verification of
 # f64f2b71, and records that no CUDA/GPU/SACRED gate is implicated because no
 # product source is touched. Growth, so the set is re-pinned in the same change.
+# 2026-08-13: +SERVE-RECIPE-ARGS. The row leaves SPIKE for ACTIVE on its
+# implementation (issue #606), which puts it in GATED_STATES for the first time;
+# its spec's Gates section names `scripts/agent-preflight.sh --staged` plus the
+# focused test file, and records that no CUDA/GPU/SACRED/oracle gate is
+# implicated because the change is argument parsing and reaches no forward pass.
+# Growth from a lifecycle move, so the set is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
+    "SERVE-RECIPE-ARGS",
     "ENG-FORGE-COAUTHOR",
     "ENG-RECORD-CONFLICT-SURFACES",
     "SAMPLE-PROMPT-LOGPROBS",

@@ -50,7 +50,7 @@ are our reading of their documented behavior, not measurements.
 | Feature | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
 | Block-paged KV with refcount and LRU evict | ✅ | ✅ | ✅ | ◐ |
-| Hybrid KV groups (full attention + GDN/Mamba) | ◐ | ✅ | ◐ | ◐ |
+| Hybrid KV groups (full attention + GDN/Mamba) | ◐ GDN gate activation resolved from the checkpoint's `output_gate_type` (silu/swish/sigmoid; anything else refused at load, #489) | ✅ | ◐ | ◐ |
 | Sliding-window and chunked-local attention | ◐ | ✅ | ✅ | ✅ |
 | fp8 KV cache | ◐ CPU only | ✅ | ✅ | ✅ |
 | KV offload to host memory | ✅ | ✅ | ✅ | ☐ |

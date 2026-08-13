@@ -372,8 +372,20 @@ ENGINE_PREFIXES = (
 # while its committed specification awaits implementation and hosted evidence.
 # No build, artifact, runtime evidence, workflow, or publication is claimed by
 # this row-count bump.
+# 153 since 2026-08-13: +`SERVE-RECIPE-ARGS` (accepted-and-inert serve arguments).
+# `vllm-serve` aborts on any unrecognized flag, so `--enable-auto-tool-choice`
+# (89 of 157 official vLLM recipes) and `--trust-remote-code` (82 of 157) stop the
+# server before model load even though neither means anything to this engine —
+# including for models we ship token-exact and gated. Found by the 2026-08-13
+# recipe-surface sweep, issue #606. The row was `SPIKE` when this bump was first
+# written against the spec-only commit; it lands `ACTIVE`, because the squash that
+# carries this line also carries the seam (`kAcceptedInertArgs` in
+# `server_main.cpp`), its test (`test_serve_recipe_args.cpp`) and the
+# `docs/USAGE.md` entry. Stated as of THIS tree rather than as of the spec commit:
+# `main` is squash-only, so a justification framed at an intermediate commit would
+# ship as a comment that is false about the file it sits in.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 152
+ENGINE_ROWS = 153
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

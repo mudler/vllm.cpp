@@ -26,12 +26,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
+#include "vllm/platforms/interface.h"  // supports_fp8() gates the fp8 GDN tail
 #include "vllm/v1/attention/backends/gdn_attn.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -83,6 +85,13 @@ struct GdnDims {
   int64_t hk, hv, dk, dv, kw;
   const char* name;
 };
+
+// Every case below runs at BOTH gate dims, so a failure log has to say which.
+// `CAPTURE(g.name)` does NOT: doctest 2.5.2 stringifies a `const char*` through
+// its generic path and prints `g.name := 1` (the pointer decayed to bool), so
+// the one thing the capture exists to disambiguate is exactly what is lost.
+// Wrap in std::string, which has a real stringifier. Applies to `INFO(... <<
+// ptr)` too — the `<<` form goes through the same DOCTEST_STRINGIFY.
 
 // Minimal dense (num_experts==0) GDN config at the real gate-checkpoint GDN dims.
 HfConfig MakeConfig(const GdnDims& g, int64_t H) {
@@ -212,7 +221,7 @@ void RunSpecRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
         if (bad == 0) first = i;
         ++bad;
       }
-    CAPTURE(g.name);
+    INFO("dims := ", std::string(g.name));
     CAPTURE(bad);
     CAPTURE(first);
     if (bad != 0) {
@@ -224,7 +233,7 @@ void RunSpecRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
     float maxabs = 0.0f;
     for (size_t i = 0; i < spec_out.size(); ++i)
       maxabs = std::max(maxabs, std::fabs(spec_out[i] - ref_out[i]));
-    CAPTURE(g.name);
+    INFO("dims := ", std::string(g.name));
     CAPTURE(maxabs);
     // Tight band: only the M=1-vs-M=T projection GEMM retile differs; the spec
     // conv/recurrence routing is exact. A broken split would blow past this.
@@ -351,7 +360,7 @@ void RunMixedRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
         if (bad == 0) first = i;
         ++bad;
       }
-    CAPTURE(g.name);
+    INFO("dims := ", std::string(g.name));
     CAPTURE(bad);
     CAPTURE(first);
     if (bad != 0) { CAPTURE(mixed_out[first]); CAPTURE(ref[first]); }
@@ -360,7 +369,7 @@ void RunMixedRoutingCase(vt::DeviceType dev, const GdnDims& g, bool bit_exact) {
     float maxabs = 0.0f;
     for (size_t i = 0; i < mixed_out.size(); ++i)
       maxabs = std::max(maxabs, std::fabs(mixed_out[i] - ref[i]));
-    CAPTURE(g.name);
+    INFO("dims := ", std::string(g.name));
     CAPTURE(maxabs);
     CHECK(maxabs < 0.05f);
   }
@@ -566,3 +575,344 @@ TEST_CASE("GDN merged FP8 qkvz resident is built pre-capture, at prepare") {
   CHECK_FALSE(static_cast<bool>(weights.layers[0].gdn.d_qkvz_fp8_alpha));
 }
 #endif
+
+namespace {
+
+// The gate ACTIVATION must reach the PAGED GDN tails, not just the eager one.
+//
+// Upstream qwen_gdn_linear_attn.py:452-464 @555967922 resolves
+// `output_gate_type` once per layer and hands it to RMSNormGated as
+// `activation=`; vt::RmsNormGatedArgs::sigmoid_gate is the same switch. Our
+// paged forward has TWO independently wired gated-RMSNorm tails --
+// GdnBlockPaged's shared tail and GdnBlockPagedMixedSpec's own -- so each is
+// driven here. Every gate checkpoint we own resolves to silu, so a silu-only
+// corpus cannot see either wiring being absent: the proof has to be that the
+// sigmoid arm MOVES the output.
+//
+// `mixed=false` runs the pure-prefill batch (GdnBlockPaged's tail);
+// `mixed=true` runs the spec+prefill batch (GdnBlockPagedMixedSpec's tail).
+void RunGateActivationCase(const GdnDims& g, bool mixed) {
+  setenv("VT_GDN_INDEXED_STATE_IO", "1", 1);  // mixed needs widened indexed IO
+  const int64_t H = 128;
+  const int Ts = 2, Tp = 3;
+  const int64_t T = mixed ? Ts + Tp : Tp;
+  const HfConfig silu = MakeConfig(g, H);
+  // MakeConfig never sets the key: the struct default IS the upstream default.
+  REQUIRE(silu.output_gate_type == "silu");
+  HfConfig sigmoid = MakeConfig(g, H);
+  sigmoid.output_gate_type = "sigmoid";
+
+  const GdnLayerWeights w = MakeGdnWeights(silu);
+  const int64_t Hv = g.hv, Dv = g.dv, Dk = g.dk, Kw = g.kw;
+  const int64_t key_dim = g.hk * Dk, value_dim = Hv * Dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t ssm_row = Hv * Dv * Dk;
+  const int64_t conv_len = (Kw - 1) + 1;  // widened spec row (k = 1)
+  const int64_t slots = 3;
+
+  std::vector<float> h(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < h.size(); ++i) h[i] = RandV(5000 + i, -1.0f, 1.0f);
+  std::vector<float> ssm0(static_cast<size_t>(slots * ssm_row));
+  for (size_t i = 0; i < ssm0.size(); ++i) ssm0[i] = RandV(6000 + i, -0.5f, 0.5f);
+  std::vector<float> conv0(static_cast<size_t>(slots * conv_dim * conv_len), 0.0f);
+  for (int64_t s = 0; s < slots; ++s)
+    for (int64_t ch = 0; ch < conv_dim; ++ch)
+      for (int64_t j = 0; j < Kw - 1; ++j)
+        conv0[static_cast<size_t>((s * conv_dim + ch) * conv_len + j)] =
+            RandV(7000 + (s * conv_dim + ch) * (Kw - 1) + j, -1.0f, 1.0f);
+
+  const auto run = [&](const HfConfig& c) {
+    std::vector<float> ssm = ssm0, conv = conv0;
+    const GDNAttentionMetadata meta = mixed ? MixedMeta(Tp) : PrefillMeta(Tp, 2);
+    return vllm::GdnBlockPagedForTest(Q(vt::DeviceType::kCPU), w, c, h, meta, ssm,
+                                      conv, slots, conv_len, T);
+  };
+
+  const std::vector<float> silu_out = run(silu);
+  const std::vector<float> sigmoid_out = run(sigmoid);
+  REQUIRE(static_cast<int64_t>(silu_out.size()) == T * H);
+  REQUIRE(sigmoid_out.size() == silu_out.size());
+
+  double maxd = 0.0;
+  for (size_t i = 0; i < silu_out.size(); ++i)
+    maxd = std::max(maxd,
+                    std::abs(static_cast<double>(silu_out[i]) - sigmoid_out[i]));
+  INFO("dims := ", std::string(g.name));
+  CAPTURE(mixed);
+  CAPTURE(maxd);
+  CHECK(maxd > 0.0);
+
+  // The same arm twice is BIT-identical, so the delta above is the gate and not
+  // run-to-run noise.
+  const std::vector<float> silu_again = run(silu);
+  size_t bad = 0;
+  for (size_t i = 0; i < silu_out.size(); ++i)
+    if (std::memcmp(&silu_out[i], &silu_again[i], sizeof(float)) != 0) ++bad;
+  CAPTURE(bad);
+  CHECK(bad == 0);
+}
+
+// WHICH activation each paged tail applies, not merely that the arms differ.
+//
+// RunGateActivationCase proves the outputs MOVE; it would pass unchanged with
+// the boolean INVERTED, i.e. a silu checkpoint driving the sigmoid kernel --
+// this row's bug class turned inside out. The polarity therefore needs a
+// reference that never consults our gate.
+//
+// Arithmetic supplies one: silu(0) = 0 * sigmoid(0) = 0 EXACTLY, while
+// sigmoid(0) = 0.5. The gate input is z = h @ in_proj_z, a plain GEMM with no
+// bias (qwen3_5.cpp ProjectGdnQkvz), so a zeroed in_proj_z makes z identically
+// zero. A SILU tail then computes norm(core) * 0 = 0 and the block returns
+// 0 @ out_proj = ZERO, whatever the recurrence produced; a SIGMOID tail
+// computes 0.5 * norm(core) and returns something non-zero. Inverting the
+// resolution flips both assertions at once.
+void RunGatePolarityCase(const GdnDims& g, bool mixed) {
+  setenv("VT_GDN_INDEXED_STATE_IO", "1", 1);  // mixed needs widened indexed IO
+  const int64_t H = 128;
+  const int Ts = 2, Tp = 3;
+  const int64_t T = mixed ? Ts + Tp : Tp;
+  const HfConfig silu = MakeConfig(g, H);
+  REQUIRE(silu.output_gate_type == "silu");
+  HfConfig sigmoid = MakeConfig(g, H);
+  sigmoid.output_gate_type = "sigmoid";
+
+  const int64_t Hv = g.hv, Dv = g.dv, Dk = g.dk, Kw = g.kw;
+  const int64_t key_dim = g.hk * Dk, value_dim = Hv * Dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t ssm_row = Hv * Dv * Dk;
+  const int64_t conv_len = (Kw - 1) + 1;
+  const int64_t slots = 3;
+
+  GdnLayerWeights w = MakeGdnWeights(silu);
+  // z ≡ 0. lo == hi == 0 makes every element exactly +0.0f.
+  w.in_proj_z = MakeOwned(DType::kBF16, {H, value_dim}, 20, 0.0f, 0.0f);
+
+  std::vector<float> h(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < h.size(); ++i) h[i] = RandV(5000 + i, -1.0f, 1.0f);
+  std::vector<float> ssm0(static_cast<size_t>(slots * ssm_row));
+  for (size_t i = 0; i < ssm0.size(); ++i) ssm0[i] = RandV(6000 + i, -0.5f, 0.5f);
+  std::vector<float> conv0(static_cast<size_t>(slots * conv_dim * conv_len), 0.0f);
+  for (int64_t s = 0; s < slots; ++s)
+    for (int64_t ch = 0; ch < conv_dim; ++ch)
+      for (int64_t j = 0; j < Kw - 1; ++j)
+        conv0[static_cast<size_t>((s * conv_dim + ch) * conv_len + j)] =
+            RandV(7000 + (s * conv_dim + ch) * (Kw - 1) + j, -1.0f, 1.0f);
+
+  const auto run = [&](const HfConfig& c) {
+    std::vector<float> ssm = ssm0, conv = conv0;
+    const GDNAttentionMetadata meta = mixed ? MixedMeta(Tp) : PrefillMeta(Tp, 2);
+    return vllm::GdnBlockPagedForTest(Q(vt::DeviceType::kCPU), w, c, h, meta, ssm,
+                                      conv, slots, conv_len, T);
+  };
+
+  const std::vector<float> silu_out = run(silu);
+  const std::vector<float> sigmoid_out = run(sigmoid);
+  REQUIRE(static_cast<int64_t>(silu_out.size()) == T * H);
+  REQUIRE(sigmoid_out.size() == silu_out.size());
+  INFO("dims := ", std::string(g.name));
+  CAPTURE(mixed);
+
+  // silu(0) == 0 annihilates the block output, exactly.
+  size_t silu_nonzero = 0;
+  for (size_t i = 0; i < silu_out.size(); ++i)
+    if (silu_out[i] != 0.0f) ++silu_nonzero;
+  CAPTURE(silu_nonzero);
+  CHECK(silu_nonzero == 0);
+
+  // sigmoid(0) == 0.5 does not. Without this the check above would also pass on
+  // a fixture whose core happened to be zero, which would prove nothing.
+  double max_sigmoid = 0.0;
+  for (size_t i = 0; i < sigmoid_out.size(); ++i)
+    max_sigmoid = std::max(max_sigmoid, std::abs(static_cast<double>(sigmoid_out[i])));
+  CAPTURE(max_sigmoid);
+  CHECK(max_sigmoid > 0.0);
+}
+
+}  // namespace
+
+TEST_CASE("GDN output_gate_type=sigmoid reaches GdnBlockPaged's gate (CPU)") {
+  RunGateActivationCase(kGate27B, /*mixed=*/false);
+  RunGateActivationCase(kGate35B, /*mixed=*/false);
+}
+
+TEST_CASE("GDN output_gate_type=sigmoid reaches the MIXED spec batch gate (CPU)") {
+  RunGateActivationCase(kGate27B, /*mixed=*/true);
+  RunGateActivationCase(kGate35B, /*mixed=*/true);
+}
+
+TEST_CASE("GDN gate POLARITY: GdnBlockPaged's silu arm is silu (CPU)") {
+  RunGatePolarityCase(kGate27B, /*mixed=*/false);
+  RunGatePolarityCase(kGate35B, /*mixed=*/false);
+}
+
+TEST_CASE("GDN gate POLARITY: the MIXED spec batch's silu arm is silu (CPU)") {
+  RunGatePolarityCase(kGate27B, /*mixed=*/true);
+  RunGatePolarityCase(kGate35B, /*mixed=*/true);
+}
+
+#ifdef VLLM_CPP_CUDA
+namespace {
+
+// THE FP8 GATED-RMSNORM TAIL — the arm no backend had ever executed.
+//
+// MODEL-GDN-OUTPUT-GATE-TYPE (#489) wired `output_gate_type` into TWELVE
+// gate-carrying constructions across the three Qwen3.5 GDN tails. SIX of them
+// are fp8: the `vt::kRmsNormGatedQuantFp8` FusedRecipe copy and the direct
+// `vt::RmsNormGatedQuantFp8` call in each tail (qwen3_5.cpp:3641-3647,
+// :4111-4117, :4539-4545). They are reachable only when `out_proj_fp8` is
+// populated AND `GdnOutFp8FuseEnabled()` AND `GlueFuseEnabled()` AND
+// `Platform::supports_fp8()`. The last term is FALSE on every non-CUDA
+// platform, so the row's CPU gate could not touch them and did not: they
+// shipped WIRED BUT NEVER EXECUTED, which is precisely the footing this row
+// exists to remove.
+//
+// The polarity argument is the bf16 one, unchanged (RunGatePolarityCase above):
+// silu(0) = 0*sigmoid(0) = 0 EXACTLY while sigmoid(0) = 0.5, and z = h @
+// in_proj_z is a bias-free GEMM, so a zeroed in_proj_z makes the SILU tail
+// annihilate the block output and leaves the SIGMOID tail non-zero. It survives
+// the fp8 store: quantizing 0.0 yields the fp8 zero byte and 0 @ out_proj is
+// still exactly 0, while the sigmoid arm's 0.5*norm(core) quantizes well inside
+// e4m3 range at these scales.
+//
+// WHY THIS CANNOT PASS VACUOUSLY. `out_proj_fp8` non-empty also routes the
+// UNFUSED bf16 tail to an fp8 GEMM, so "the output is fp8-ish" proves nothing
+// about which gated-RMSNorm ran. What pins it is the mutation: hardwiring
+// `sigmoid_gate` to `false` at the SIX fp8 constructions ONLY — leaving the six
+// bf16 ones untouched — must turn this case RED while every CPU polarity case
+// above stays GREEN. That mutation WAS run, on the dgx at b9d172f6, and is
+// recorded in `.agents/specs/gdn-output-gate-type.md`. It inverted both fp8
+// KINDS at once, so it does not yet demonstrate what the
+// `_fused_chain_off` CTest entry adds over the default entry — the default
+// entry alone would have caught it. The SPLIT mutation that would demonstrate
+// it (the 3 direct `RmsNormGatedQuantFp8` sites alone, then the 3 recipe-copy
+// sites alone, each showing exactly one of the two entries fail) is recorded in
+// that spec as OWED at the next GPU run. It has not been performed.
+vllm::Fp8Weight MakeFp8OutProj(int64_t n, int64_t k, uint64_t seed) {
+  vllm::Fp8Weight f;
+  f.n = n;
+  f.k = k;
+  // Per-tensor scales in the shape the 35B loader produces (powers of two, so
+  // the dequant introduces no rounding of its own).
+  f.input_scale = 0.0078125F;
+  f.weight_scale = 0.00390625F;
+  f.alpha = f.input_scale * f.weight_scale;
+  f.packed.dtype = DType::kI8;
+  f.packed.rank = 2;
+  f.packed.shape[0] = n;
+  f.packed.shape[1] = k;
+  f.packed.bytes.resize(static_cast<size_t>(n * k));
+  auto* bytes = f.packed.bytes.data();
+  // 0x00..0x7D: finite non-negative e4m3 bytes (0x7F is NaN). Same construction
+  // as the merged-qkvz resident case above.
+  for (int64_t i = 0; i < n * k; ++i)
+    bytes[static_cast<size_t>(i)] =
+        static_cast<uint8_t>(Mix(seed + static_cast<uint64_t>(i)) % 0x7EU);
+  return f;
+}
+
+void RunGatePolarityFp8Case(const GdnDims& g, bool mixed) {
+  setenv("VT_GDN_INDEXED_STATE_IO", "1", 1);  // mixed needs widened indexed IO
+  vt::GetBackend(vt::DeviceType::kCUDA);      // skip cleanly if no device
+
+  // An ABSENT precondition is a SKIP, never a failure — tests/CMakeLists.txt:26-33
+  // ("A test whose preconditions are absent exits 77") and the try/catch at
+  // tests/vt/test_ops_fp8_cutlass.cpp:33-39. `supports_fp8()` is
+  // `has_device_capability(8, 9)` (src/vllm/platforms/cuda.cpp:39), so a CUDA
+  // build running on a pre-sm_89 board has NO fp8 gated-RMSNorm tail to reach:
+  // the branch under test is unreachable, not broken. The Jetson AGX Orin
+  // (sm_87) is a recorded runtime-gate host (.agents/benchmark-record.md:2402-2426),
+  // and a `REQUIRE` here turned this whole suite RED on it for a capability the
+  // board never claimed.
+  //
+  // The skip cannot swallow a real defect: it returns BEFORE any of this case's
+  // CHECKs and ONLY on the missing capability. Where fp8 IS supported the guard
+  // is not taken and every assertion below runs unchanged, so broken gate wiring
+  // still fails loudly. The cost is that a skipped run reports Passed with the
+  // fp8 cases contributing zero assertions — read the assertion COUNT, not the
+  // status, to tell a run that exercised the fp8 tail from one that did not.
+  if (!vllm::platforms::GetPlatform(vt::DeviceType::kCUDA).supports_fp8()) {
+    MESSAGE(
+        "SKIP: this device does not support fp8 (Platform::supports_fp8() == "
+        "has_device_capability(8, 9) is false) — the GDN fp8 gated-RMSNorm tail "
+        "is unreachable here, so the fp8 gate-polarity case did NOT run");
+    return;
+  }
+
+  const int64_t H = 128;
+  const int Ts = 2, Tp = 3;
+  const int64_t T = mixed ? Ts + Tp : Tp;
+  const HfConfig silu = MakeConfig(g, H);
+  REQUIRE(silu.output_gate_type == "silu");
+  HfConfig sigmoid = MakeConfig(g, H);
+  sigmoid.output_gate_type = "sigmoid";
+
+  const int64_t Hv = g.hv, Dv = g.dv, Dk = g.dk, Kw = g.kw;
+  const int64_t key_dim = g.hk * Dk, value_dim = Hv * Dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t ssm_row = Hv * Dv * Dk;
+  const int64_t conv_len = (Kw - 1) + 1;
+  const int64_t slots = 3;
+
+  GdnLayerWeights w = MakeGdnWeights(silu);
+  // z == 0. lo == hi == 0 makes every element exactly +0.0f.
+  w.in_proj_z = MakeOwned(DType::kBF16, {H, value_dim}, 20, 0.0f, 0.0f);
+  // THE branch selector: a populated W8A8 out_proj is what routes the tail into
+  // the fused fp8 gated-RMSNorm (the 35B production shape).
+  w.out_proj_fp8 = MakeFp8OutProj(H, value_dim, 700);
+  REQUIRE_FALSE(w.out_proj_fp8.Empty());
+
+  std::vector<float> h(static_cast<size_t>(T * H));
+  for (size_t i = 0; i < h.size(); ++i) h[i] = RandV(5000 + i, -1.0f, 1.0f);
+  std::vector<float> ssm0(static_cast<size_t>(slots * ssm_row));
+  for (size_t i = 0; i < ssm0.size(); ++i) ssm0[i] = RandV(6000 + i, -0.5f, 0.5f);
+  std::vector<float> conv0(static_cast<size_t>(slots * conv_dim * conv_len), 0.0f);
+  for (int64_t s = 0; s < slots; ++s)
+    for (int64_t ch = 0; ch < conv_dim; ++ch)
+      for (int64_t j = 0; j < Kw - 1; ++j)
+        conv0[static_cast<size_t>((s * conv_dim + ch) * conv_len + j)] =
+            RandV(7000 + (s * conv_dim + ch) * (Kw - 1) + j, -1.0f, 1.0f);
+
+  const auto run = [&](const HfConfig& c) {
+    std::vector<float> ssm = ssm0, conv = conv0;
+    const GDNAttentionMetadata meta = mixed ? MixedMeta(Tp) : PrefillMeta(Tp, 2);
+    return vllm::GdnBlockPagedForTest(Q(vt::DeviceType::kCUDA), w, c, h, meta, ssm,
+                                      conv, slots, conv_len, T);
+  };
+
+  const std::vector<float> silu_out = run(silu);
+  const std::vector<float> sigmoid_out = run(sigmoid);
+  REQUIRE(static_cast<int64_t>(silu_out.size()) == T * H);
+  REQUIRE(sigmoid_out.size() == silu_out.size());
+  INFO("dims := ", std::string(g.name));
+  CAPTURE(mixed);
+
+  // silu(0) == 0 annihilates the block output, exactly — through the fp8 store
+  // and the fp8 out_proj GEMM alike.
+  size_t silu_nonzero = 0;
+  for (size_t i = 0; i < silu_out.size(); ++i)
+    if (silu_out[i] != 0.0f) ++silu_nonzero;
+  CAPTURE(silu_nonzero);
+  CHECK(silu_nonzero == 0);
+
+  // sigmoid(0) == 0.5 does not. Without this the check above would also pass on
+  // a fixture whose core happened to be zero, or one whose fp8 quantization
+  // flushed everything to zero — neither of which would prove anything.
+  double max_sigmoid = 0.0;
+  for (size_t i = 0; i < sigmoid_out.size(); ++i)
+    max_sigmoid = std::max(max_sigmoid, std::abs(static_cast<double>(sigmoid_out[i])));
+  CAPTURE(max_sigmoid);
+  CHECK(max_sigmoid > 0.0);
+}
+
+}  // namespace
+
+TEST_CASE("GDN gate POLARITY on the FP8 tail: GdnBlockPaged (CUDA)") {
+  RunGatePolarityFp8Case(kGate27B, /*mixed=*/false);
+  RunGatePolarityFp8Case(kGate35B, /*mixed=*/false);
+}
+
+TEST_CASE("GDN gate POLARITY on the FP8 tail: the MIXED spec batch (CUDA)") {
+  RunGatePolarityFp8Case(kGate27B, /*mixed=*/true);
+  RunGatePolarityFp8Case(kGate35B, /*mixed=*/true);
+}
+#endif  // VLLM_CPP_CUDA

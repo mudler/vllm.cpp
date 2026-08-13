@@ -528,3 +528,141 @@ TEST_CASE("qwen27 dense forward: merged qkvz owner equals split raw-NK fields") 
     maxd = std::max(maxd, std::abs(static_cast<double>(base[i]) - got[i]));
   CHECK(maxd == 0.0);
 }
+
+// The gate ACTIVATION must reach the kernel, not just the config struct.
+//
+// Upstream qwen_gdn_linear_attn.py:452-464 @555967922 resolves
+// `output_gate_type` and hands it to RMSNormGated as `activation=`; our
+// vt::RmsNormGatedArgs::sigmoid_gate is the same switch. Every gate checkpoint
+// we own today resolves to silu, so a silu-only corpus cannot see this wiring
+// being absent -- a config-field assertion would pass with the model layer
+// still hard-coding silu. This drives the sigmoid arm through the real dense
+// forward (GdnBlock -> vt::RmsNormGated) and requires the logits to MOVE.
+//
+// Sensitivity note: silu(z) = z*sigmoid(z) and sigmoid(z) differ for every
+// z != 1, and the synthetic z gate spans a non-degenerate range, so the two
+// arms cannot coincide by construction.
+TEST_CASE("qwen27 dense forward: output_gate_type=sigmoid reaches the GDN gate") {
+  const HfConfig silu = MakeConfig();
+  // The struct default is the upstream default; MakeConfig never sets it.
+  REQUIRE(silu.output_gate_type == "silu");
+  HfConfig sigmoid = MakeConfig();
+  sigmoid.output_gate_type = "sigmoid";
+
+  const Qwen3_5DenseWeights w = MakeWeights(silu);
+  vt::Queue q = Q();
+  const std::vector<int32_t> ids = {5, 9, 2, 31, 17, 3};
+  const std::vector<int32_t> pos = {0, 1, 2, 3, 4, 5};
+
+  const std::vector<float> silu_logits =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, w, silu, q);
+  const std::vector<float> sigmoid_logits =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, w, sigmoid, q);
+  REQUIRE(sigmoid_logits.size() == silu_logits.size());
+
+  double maxd = 0.0;
+  for (size_t i = 0; i < silu_logits.size(); ++i) {
+    CHECK(std::isfinite(sigmoid_logits[i]));
+    maxd = std::max(maxd,
+                    std::abs(static_cast<double>(silu_logits[i]) - sigmoid_logits[i]));
+  }
+  MESSAGE("silu vs sigmoid GDN gate moved logits by max|diff| = " << maxd);
+  CHECK(maxd > 0.0);
+
+  // Same config twice is deterministic: the difference above is the gate, not
+  // run-to-run noise.
+  const std::vector<float> silu_again =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, w, silu, q);
+  double repeat = 0.0;
+  for (size_t i = 0; i < silu_logits.size(); ++i)
+    repeat = std::max(repeat,
+                      std::abs(static_cast<double>(silu_logits[i]) - silu_again[i]));
+  CHECK(repeat == 0.0);
+}
+
+namespace {
+
+// A zero-filled copy of an existing weight: same dtype, rank and shape, all
+// bytes 0 (so every bf16 element is +0.0f exactly).
+OwnedTensor ZeroLike(const OwnedTensor& src) {
+  OwnedTensor t;
+  t.dtype = src.dtype;
+  t.rank = src.rank;
+  for (int i = 0; i < src.rank; ++i) t.shape[i] = src.shape[i];
+  t.nk = src.nk;
+  t.bytes.assign(src.bytes.size(), 0);
+  return t;
+}
+
+}  // namespace
+
+// WHICH activation, not merely "a different one".
+//
+// The case above proves the two arms DIFFER. It would pass just as happily
+// with the boolean INVERTED -- a silu checkpoint driving the sigmoid kernel,
+// which is exactly this row's bug class turned inside out. So the polarity
+// needs a reference that does not go through our gate at all.
+//
+// It comes from arithmetic: silu(0) = 0 * sigmoid(0) = 0 EXACTLY, while
+// sigmoid(0) = 0.5. The GDN gate input is z = h @ in_proj_z (a plain GEMM, no
+// bias -- qwen3_5.cpp ProjectGdnQkvz), so zeroing in_proj_z makes z
+// identically zero. Under a SILU gate the tail then computes
+// norm(core) * 0 = 0 and the block returns 0 @ out_proj = 0, i.e. the GDN
+// layers contribute exactly nothing -- indistinguishable from having zeroed
+// out_proj itself, which is the independent reference this case compares
+// against. Under a SIGMOID gate the same tail computes 0.5 * norm(core) and
+// the layer contributes, so the two models must NOT agree.
+//
+// The reference model never consults output_gate_type, and the assertion is a
+// bit-identity, not "they differ": inverting the resolution makes the silu arm
+// diverge from it and the sigmoid arm coincide with it, so both halves flip.
+TEST_CASE("qwen27 dense forward: the silu arm is silu, not merely 'not sigmoid'") {
+  const HfConfig silu = MakeConfig();
+  REQUIRE(silu.output_gate_type == "silu");
+  HfConfig sigmoid = MakeConfig();
+  sigmoid.output_gate_type = "sigmoid";
+
+  // z ≡ 0 on every GDN layer: silu annihilates the gate, sigmoid does not.
+  Qwen3_5DenseWeights zero_z = MakeWeights(silu);
+  // The INDEPENDENT reference: the GDN blocks contribute nothing because their
+  // out_proj is zero, whatever the gate does.
+  Qwen3_5DenseWeights no_gdn = MakeWeights(silu);
+  size_t gdn_layers = 0;
+  for (size_t l = 0; l < zero_z.layers.size(); ++l) {
+    if (!zero_z.layers[l].is_linear_attention) continue;
+    ++gdn_layers;
+    zero_z.layers[l].gdn.in_proj_z = ZeroLike(zero_z.layers[l].gdn.in_proj_z);
+    no_gdn.layers[l].gdn.in_proj_z = ZeroLike(no_gdn.layers[l].gdn.in_proj_z);
+    no_gdn.layers[l].gdn.out_proj = ZeroLike(no_gdn.layers[l].gdn.out_proj);
+  }
+  REQUIRE(gdn_layers == 3);  // the fixture's [LA, LA, LA, FA]
+
+  vt::Queue q = Q();
+  const std::vector<int32_t> ids = {5, 9, 2, 31, 17, 3};
+  const std::vector<int32_t> pos = {0, 1, 2, 3, 4, 5};
+
+  const std::vector<float> ref =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, no_gdn, silu, q);
+  const std::vector<float> silu_out =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, zero_z, silu, q);
+  const std::vector<float> sigmoid_out =
+      Qwen3_5DenseModel::ForwardDense(ids, pos, zero_z, sigmoid, q);
+  REQUIRE(silu_out.size() == ref.size());
+  REQUIRE(sigmoid_out.size() == ref.size());
+
+  // silu(0) == 0: BIT-identical to the GDN-contributes-nothing reference.
+  size_t silu_differs = 0;
+  for (size_t i = 0; i < ref.size(); ++i)
+    if (std::memcmp(&ref[i], &silu_out[i], sizeof(float)) != 0) ++silu_differs;
+  CAPTURE(silu_differs);
+  CHECK(silu_differs == 0);
+
+  // sigmoid(0) == 0.5: the same weights must NOT reduce to that reference, or
+  // the fixture would be degenerate and the check above would prove nothing.
+  double sigmoid_gap = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i)
+    sigmoid_gap = std::max(sigmoid_gap,
+                           std::abs(static_cast<double>(ref[i]) - sigmoid_out[i]));
+  MESSAGE("z=0 sigmoid arm departs from the no-GDN reference by " << sigmoid_gap);
+  CHECK(sigmoid_gap > 0.0);
+}

@@ -251,6 +251,24 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(windows), 1)
         self.assertEqual(windows[0].path.name, "engine-matrix.md")
 
+    def test_serve_recipe_args_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #606 row and its 152 -> 153 ratchet bump are one semantic change.
+
+        Same shape as the #117 assertion above, and it exists for the same
+        reason: the bump and the row have to arrive together, or a number was
+        moved to silence a failure. This one also pins WHICH matrix owns the
+        row, because SERVE-* IDs are reachable from more than one, and a row
+        that drifted into another matrix would leave the engine count short
+        while the pin still read 153.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+        recipe = [row for row in rows if row.item_id == "SERVE-RECIPE-ARGS"]
+        self.assertEqual(len(recipe), 1)
+        self.assertEqual(recipe[0].path.name, "engine-matrix.md")
+
     def test_model_row_ratchet_is_load_bearing(self) -> None:
         """The MODEL row pin must catch a row appearing or vanishing.
 

@@ -119,6 +119,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#347](https://github.com/mudler/vllm.cpp/issues/347) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | GGUF tokenizer: no pre-tokenizer for the GPT-4o family, so `tokenizer.ggml.pre "llama4"` files cannot generate at all | bug |
 | [#359](https://github.com/mudler/vllm.cpp/issues/359) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer GGUF k-quant generates INCOHERENT text where llama.cpp on the same file is coherent | bug |
 | [#412](https://github.com/mudler/vllm.cpp/issues/412) | `MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation` | Muse Glimmer config defaults are neutral values, not the architecture's constants: the released GGUF's sandwich post-norms ran at 1e-5 instead of 1e-8 | bug |
+| [#489](https://github.com/mudler/vllm.cpp/issues/489) | `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation` | GDN `output_gate_type` is never parsed: a "sigmoid" checkpoint silently computes silu gating, and no token gate can see it | bug |
 | [#298](https://github.com/mudler/vllm.cpp/issues/298) | `PERF-27B-LMHEAD-DSR` | `main` is RED on the `device-leakage` DSR ratchet: `PrepareLmHeadResident` added a 33rd `vt_ifdef` to the shared layer | bug |
 | [#213](https://github.com/mudler/vllm.cpp/issues/213) | `PERF-27B-LMHEAD-FP4` | Qwen3.6 NVFP4 baselines (27B and 35B-A3B) must reach vLLM speed parity | perf |
 | [#339](https://github.com/mudler/vllm.cpp/issues/339) | `PERF-27B-LMHEAD-FP4` | 27B c1: every fp8 input projection asks for an f32 output, selecting the slower nvjet template family where vLLM emits bf16 (48 f32-out projections 18.51 ms vs 48 bf16-out 7.05 ms). The merged GDN `in_proj` arm is built DEFAULT OFF as `VT_GDN_FP8_IN_BF16`, spec [`perf-fp8-alpha-fold.md`](specs/perf-fp8-alpha-fold.md) §Attempt 4 — UNMEASURED: no committed gate loads the fp8 tower (`row/GATE-27B-FP8-TOWER-GOLDEN` builds that arm) | perf |
@@ -142,7 +143,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#264](https://github.com/mudler/vllm.cpp/issues/264) | `SAMPLE-LOGPROB-TOKEN-IDS` | `logprob_token_ids`: generative scoring over an explicit token set is unported | feature |
 | [#365](https://github.com/mudler/vllm.cpp/issues/365) | `PERF-27B-DENSE-MARLIN-GATEUP` | 27B gap decomposed vs vLLM's own decode profile; dense W4A16 MLP bypassed the fused gate_up seam (spec `specs/perf-27b-dense-marlin-gateup.md`) | bug |
 | [#362](https://github.com/mudler/vllm.cpp/issues/362) | — | First VALID 27B per-kernel decode attribution: whole-run trace windowed by the profiler's own cudaProfilerStart/Stop | bug |
-| [#605](https://github.com/mudler/vllm.cpp/issues/605) | `SAMPLE-REASONING` | `vllm-serve` rejects 61 of 76 official-recipe `--reasoning-parser` uses, including `qwen3` on our own gate models | bug |
+| [#605](https://github.com/mudler/vllm.cpp/issues/605) | `SAMPLE-REASONING` | `--reasoning-parser` resolved 10 of upstream's 28 names, so 61 of 76 official-recipe uses aborted at startup — including `qwen3` (18 uses), which the published Qwen3.5/3.6 recipes pass to models we already gate token-exact. W3 runs before W2 on measured demand (W3 covers 43/76, W2 covers 18 and four of its names have zero). **Brick 1 landed:** `qwen3` + `mimo`, coverage 10 -> 12, 20 of the 76 uses | feature |
 | [#223](https://github.com/mudler/vllm.cpp/issues/223) | `SAMPLE-PROMPT-LOGPROBS` | `prompt_logprobs` is a silent no-op: the runner never computes logits at prompt positions | bug |
 | [#294](https://github.com/mudler/vllm.cpp/issues/294) | `SERVE-ASYNC-LLM` | `test_async_llm`: reusing an aborted request id races the core abort — 26% failure rate under contention, on main | bug |
 | [#222](https://github.com/mudler/vllm.cpp/issues/222) | `SERVE-GATE-ONLINE` | The online-serving gate aborts on current main: harness looks for `examples/server`, the build produces `examples/vllm-server` — paths repaired by `2b262622`/`8fce04d3`; residue is the drift guard, the `27n` key and a model gate that recorded a skip as passed | bug |
@@ -170,6 +171,9 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#552](https://github.com/mudler/vllm.cpp/issues/552) | `MODEL-TEXT-deepseek-v4-deepseek-v4-for-causal-lm` | DSA top-k review findings: the `w < topk` guard comment overclaims what it defends, the window clamps and non-positive `topk` are ungated, and `DsaTopkLaunch` swallows its launch error (spec `specs/dsa-topk-bounds.md` §7) | bug |
 | [#469](https://github.com/mudler/vllm.cpp/issues/469) | — | `test_ops_glue.cpp:190`'s `CHECK_THROWS` is satisfied by the CPU kernel's second guard, not the dispatch guard it names — mutation M8 survives. Behavior is correct; test strength only | bug |
 | [#558](https://github.com/mudler/vllm.cpp/issues/558) | — | `tests/parity/hf_snapshot.h` has no guard against declaration-order breaks: the C++ build catches them, but the records-only lane that broke it never builds C++, and all 14 TUs that include the header are checkpoint-gated so `ctest` reports the break as `***Not Run`. `fafa16f0f` (#546, #551) fixed the ordering and carried no guard | bug |
+| [#606](https://github.com/mudler/vllm.cpp/issues/606) | — | `vllm-serve` aborts on `--enable-auto-tool-choice` (89/157 recipes) and `--trust-remote-code` (82/157), both of which are no-ops for us, so a copy-pasted official recipe command never reaches model load. Needs an accepted-and-inert seam with a per-flag reason; no row owns serve CLI recipe compatibility | feature |
+| [#607](https://github.com/mudler/vllm.cpp/issues/607) | — | No `--language-model-only`: 43 recipes skip the vision encoder to hand its VRAM to the KV cache and we load the tower unconditionally. The flag appears in this repo only in `tools/bench/run_serve_low.py`, which passes it to the ORACLE — a grep reads as coverage and is not | feature |
+| [#608](https://github.com/mudler/vllm.cpp/issues/608) | `TOOLS-PARSER-BREADTH` | Six `--tool-call-parser` names missing (`openai`, `inkling`, `minimax_m3`, `nemotron_json`, `kimi_k3`, `ling3`), closing the last 8 of 90 official-recipe uses; four are portable at the pin, two are post-pin | feature |
 
 ## Top-level portfolio
 
@@ -546,6 +550,104 @@ llama.cpp Q4_K, near-tie vs vLLM NVFP4) → W5 speed (+ optional DFlash lane, SP
 reuse). Risks: variable-Q-head + dual-RoPE×partial×YaRN composition (medium), the
 oracle-blocked residual if remote-code is refused (falls back to llama.cpp-only,
 de-risked by the W1 config check).
+
+## Recipe-surface sweep (2026-08-13, `recipes.vllm.ai`)
+
+`recipes.vllm.ai` is a front end over **`vllm-project/recipes`**; the audit read
+that repo at `86c7777aa699482ef1ebd0c5da9fc540ccc00a40` — **157 model recipes**
+under `models/*/*.yaml`, plus `taxonomy.yaml`, `platforms.yaml` and `strategies/`.
+Architectures were resolved from each model's HF `config.json` (137/157 — the rest
+are gated repos or diffusion pipelines with no top-level `architectures`), then
+joined against `model-matrix.md` and checked against vLLM's registry at the pin.
+
+This is the **user-facing** complement to the 2026-07-28 feature-gap sweep. That
+one asked what vLLM has that we lack; this one asks whether a user can run the
+published recipe for a model we already ship. The two disagree, and where they do,
+this one is the sharper signal: a model gated token-exact whose own recipe command
+aborts at argument parsing is not usable, however good the kernels are.
+
+### What a recipe lets a user tweak
+
+Six axes: `base_args`/`base_env`, **7 named feature toggles** (`tool_calling` 90,
+`reasoning` 76, `spec_decoding` 53, `text_only` 43, `encoder_parallel` 34,
+`thinking_always_on`, `video_compression`), **variants** (9 precisions — bf16 151,
+fp8 79, nvfp4 50, int4 19, mxfp4 10), **9 parallelism strategies**,
+`hardware_overrides`, and the **KV-offload row**. In total **70 distinct CLI flags
+and 15 env vars**.
+
+### Coverage against our serve surface
+
+`vllm-serve` accepts 65 flags and **hard-errors on an unknown argument**
+(`src/vllm/entrypoints/openai/server_main.cpp:440`), so an unmapped flag is not a
+degraded run — it is no run at all.
+
+| Axis | State | Issue |
+|---|---|---|
+| `--tool-call-parser` | 41 names, **82/90 recipe uses (91%)** — the healthy axis | [#608](https://github.com/mudler/vllm.cpp/issues/608) for the last 8 |
+| `--reasoning-parser` | 10 of 28 names, **15/76 uses (20%)**; `qwen3` (18) rejected on our own gate models | [#605](https://github.com/mudler/vllm.cpp/issues/605) |
+| `--enable-auto-tool-choice`, `--trust-remote-code` | no-ops for us, yet **abort startup** on 89 and 82 recipes | [#606](https://github.com/mudler/vllm.cpp/issues/606) |
+| `--language-model-only` | absent; 43 recipes use it to free encoder VRAM | [#607](https://github.com/mudler/vllm.cpp/issues/607) |
+| `--kv-cache-dtype` | not a serve flag; residual on the `KV-FP8` row | — |
+| `--speculative-config` | MTP + DFlash land; `eagle`/`eagle3` (7 uses) do not | — |
+| TP / EP / multi-node (`--tensor-parallel-size`, `--enable-expert-parallel`, `--mm-encoder-tp-mode`) | absent by scope, not by defect — single-box engine | see the TP W-plan above |
+| KV offload | **ahead** — 45 recipes mark `offloading_cpu`/`offloading_fs` verified; we ship `--kv-transfer-config` + `docs/KV-OFFLOAD.md` | — |
+
+A trap worth recording: `--language-model-only`, `--async-scheduling`,
+`--enforce-eager` and `--mamba-ssm-cache-dtype` all appear in this repo **only in
+`tools/bench/` scripts that drive the vLLM oracle**. A grep for the flag name reads
+as coverage and is the opposite of it.
+
+### Coverage against the model matrix
+
+| Matrix state | Recipes |
+|---|---:|
+| ✅ gated / correctness-complete | 23 |
+| 🚧 in progress | 5 |
+| 📋 spiked | 6 |
+| 🚫 blocked | 13 |
+| ⬜ inventoried (row exists, unstarted) | 79 |
+| **no row anywhere** | **11** recipes = **8** architectures → [#609](https://github.com/mudler/vllm.cpp/issues/609), [#610](https://github.com/mudler/vllm.cpp/issues/610) |
+| architecture unresolved (gated / diffusion repo) | 20 |
+
+The 79 `⬜` are scoped-but-unstarted, not missing — model-inventory coverage is
+genuinely broad. The 11 unrowed recipes resolve to **8 distinct architectures** —
+`MossTTSDelayModel` alone is reached by four of them — of which **7 are owed here**
+and 1 is already owned elsewhere:
+
+- **1 pin-lag**, `BailingMoeV3ForCausalLM`
+  ([#609](https://github.com/mudler/vllm.cpp/issues/609)).
+- **6 in `vllm-omni`** ([#610](https://github.com/mudler/vllm.cpp/issues/610)), of
+  which 2 are in neither core `main` nor the omni doc and need placing before
+  scoping.
+- **1 already owned:** `Qwen3_5MoeForCausalLM` belongs to
+  [#490](https://github.com/mudler/vllm.cpp/issues/490) / PR
+  [#601](https://github.com/mudler/vllm.cpp/pull/601), which registers it rather
+  than merely rowing it.
+
+Two counting lessons, both paid for. The row is the ARCHITECTURE, not the recipe —
+counting recipes is what put "seven" in the first draft of #610. And a gap is only
+a gap after checking open PRs, not just issues: #601 was open before this sweep was
+written, and two branches adding the same keyed row merge cleanly and define it
+twice.
+
+**Caveat on the denominator.** 20 of the 157 recipe configs were unreadable
+(gated or 404 — `Voxtral-4B-TTS-2603`, `GLM-TTS`, `IndexTTS-2.5`,
+`stable-audio-open-1.0`, several `meta-llama`), so their architectures are
+UNVERIFIED and the 8 is a floor, not a total. Several `vllm-omni` TTS
+architectures visible in that repo's supported-models doc are also unreached by
+any recipe and therefore invisible to this sweep. Closing that hole is its own
+audit, not an inference from this one.
+
+### GB10 recipes are upstream-authored parity workloads
+
+`taxonomy.yaml` defines a restricted `dgx_spark_gb10` profile, and **8 recipes
+declare it** in `meta.hardware` — vLLM has published GB10-validated configurations
+for our exact gate box: **DeepSeek-V4-Flash, Qwen3.6-27B, Qwen3.6-35B-A3B,
+Gemma-4-26B-A4B, MiniMax-H3, Muse-Glimmer-30B, Nemotron-3-Super-120B-A12B,
+DiffusionGemma-26B-A4B**. Six are already active rows. These are ready-made,
+upstream-authored workloads for the every-axis gate and should be preferred over
+hand-rolled ones wherever they cover the same model — the recipe fixes the honest
+denominator for us instead of us choosing it.
 
 ## Decision rules carried forward
 

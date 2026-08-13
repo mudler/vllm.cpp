@@ -93,6 +93,13 @@ struct HfConfig {
   int64_t linear_key_head_dim = 0;
   int64_t linear_value_head_dim = 0;
   int64_t linear_conv_kernel_dim = 0;
+  // GDN output-gate activation, CANONICALIZED at parse time: only "silu" or
+  // "sigmoid" ever reach a consumer. Mirrors
+  // vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:452-456
+  // (`getattr(config, "output_gate_type", "silu")`, "swish" collapsed to
+  // "silu", membership in {silu, swish, sigmoid} asserted); LoadHfConfig
+  // REFUSES anything else instead of silently defaulting.
+  std::string output_gate_type = "silu";
   // Qwen3.5/3.6 checkpoint contract for the recurrent (SSM) cache. Upstream's
   // verify hook copies this into mamba_ssm_cache_dtype when the CLI setting is
   // "auto"; an absent value leaves the recurrent cache at the convolution-cache

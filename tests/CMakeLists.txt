@@ -117,6 +117,34 @@ vllm_cpp_add_test(test_qwen3_5_gguf_mtp vllm/models/test_qwen3_5_gguf_mtp.cpp)
 vllm_cpp_add_test(test_qwen3_dflash_gguf vllm/models/test_qwen3_dflash_gguf.cpp)
 target_include_directories(test_qwen3_5_gdn_spec_routing PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
+# MODEL-GDN-OUTPUT-GATE-TYPE (#489): `GlueFuseEnabled()` defaults ON and is read
+# ONCE per process into a function-local static, so one run of these two suites
+# can only ever execute the glue-FUSED gated-RMSNorm tail. The UNFUSED tail
+# carries its own `vt::RmsNormGatedArgs{eps, sigmoid_gate}` construction in each
+# of the three GDN blocks, and inverting only that construction left the entire
+# declared focused gate GREEN (test_hf_config 210|210, test_qwen27_dense_forward
+# 583|583, test_qwen3_5_gdn_spec_routing 52|52) — live code, but ungated.
+# Re-run the SAME binaries with the lever forced to 0 so the `VT_GLUE_FUSE=0`
+# fallback is gated too, mirroring the precedent the fusion row itself set
+# (parity-ledger.md:112 — "fused ON default AND `VT_GLUE_FUSE=0` fallback 16/16")
+# and the per-lever re-run below.
+foreach(_glue_fuse_test test_qwen27_dense_forward test_qwen3_5_gdn_spec_routing)
+  add_test(NAME ${_glue_fuse_test}_glue_fuse_off COMMAND ${_glue_fuse_test})
+  set_tests_properties(${_glue_fuse_test}_glue_fuse_off PROPERTIES
+    ENVIRONMENT "VT_GLUE_FUSE=0" SKIP_RETURN_CODE 77)
+endforeach()
+# MODEL-GDN-OUTPUT-GATE-TYPE (#489), the FP8 half. Each GDN tail carries TWO fp8
+# gate-carrying constructions: the `vt::kRmsNormGatedQuantFp8` FusedRecipe copy
+# (taken at the `VT_FUSED_CHAIN_ADOPT` default) and the direct
+# `vt::RmsNormGatedQuantFp8` hand-call (taken only at =0). `FusedChainAdoptEnabled()`
+# is another read-once static, so a single run reaches exactly one of the two and
+# the other is live-but-ungated — the same defect the `_glue_fuse_off` entries
+# above were added for. Re-run the SAME binary with the lever forced to 0.
+# CUDA-only in effect: the fp8 tail needs `Platform::supports_fp8()`.
+add_test(NAME test_qwen3_5_gdn_spec_routing_fused_chain_off
+  COMMAND test_qwen3_5_gdn_spec_routing)
+set_tests_properties(test_qwen3_5_gdn_spec_routing_fused_chain_off PROPERTIES
+  ENVIRONMENT "VT_FUSED_CHAIN_ADOPT=0" SKIP_RETURN_CODE 77)
 # PERF-27B-DENSE-MARLIN-GATEUP (#365): the pre-kernel DECISIONS that route the
 # 27B's dense W4A16 MLP through the fused Marlin gate_up pair. CPU-only by
 # construction — the fused GEMM itself is CUDA + VT_MARLIN_NVFP4.
@@ -872,6 +900,13 @@ if(VLLM_CPP_SERVER)
   # cause the starvation.)
   set_tests_properties(test_openai_api_server test_openai_conformance
     PROPERTIES RUN_SERIAL ON)
+  # SERVE-RECIPE-ARGS (#606): the accepted-and-inert serve-argument seam. It
+  # drives the REAL VllmServerMain (owned by the library behind the same
+  # VLLM_CPP_SERVER gate) by re-execing this binary, so it needs src/ on the
+  # include path for server_main.h, exactly as test_openai_api_server does.
+  vllm_cpp_add_test(test_serve_recipe_args
+    vllm/entrypoints/openai/test_serve_recipe_args.cpp)
+  target_include_directories(test_serve_recipe_args PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 

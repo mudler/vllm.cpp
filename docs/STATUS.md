@@ -1707,6 +1707,22 @@ runtime-verified yet.
 
 ## Serving and API notes
 
+- **Published recipe commands reach model load (`SERVE-RECIPE-ARGS`, `ACTIVE`,
+  issue #606, `.agents/specs/serve-recipe-args.md`).** `vllm-serve` rejects any
+  argument it does not recognise, which is the right default and was also why
+  copy-pasting an official `vllm serve` line aborted before a weight was read:
+  over `vllm-project/recipes` @ `86c7777a` (157 model recipes),
+  `--enable-auto-tool-choice` appears in 89 and `--trust-remote-code` in 82, and
+  neither means anything to this engine. Both are now **accepted and inert**,
+  each announcing itself and the reason it does nothing at startup. The list is
+  **enumerated, not a catch-all**: any other unrecognised flag still aborts with
+  the same message, including flags inert only because the capability is missing
+  (`--tensor-parallel-size` and the other parallelism flags), and upstream's
+  validation still fires — `--enable-auto-tool-choice` with
+  `--tool-call-parser none` is refused, mirroring
+  `vllm/entrypoints/openai/cli_args.py:395`. Not yet reviewed or gate-rerun by
+  the operator; `--language-model-only` (#607) is a real capability gap and is
+  deliberately NOT in this list.
 - **Surface coverage (ONE SURFACE, `ARCH-ONE-SURFACE`,
   `.agents/specs/surface-coverage-2026-08-07.md`).** 21/30 text archs
   on-framework; the recurring defect (a capability in a per-model CLI) is in seven

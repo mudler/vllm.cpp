@@ -363,9 +363,9 @@ traceable. The
 review protocol behind these numbers is guarded the same way: the reviewer and
 implementer sub-agent prompts are tracked artifacts checked by
 `check-protocol-consistency` (orchestration harness step 5/5), and
-`check-gate-commands` pins the 25 record rows that name a gate command able to
+`check-gate-commands` pins the record rows that name a gate command able to
 FAIL. That pin is exact, not shrink-only: gaining a gate command reddens it too,
-so the set is never re-pinned silently in either direction. Since 2026-08-07,
+so the set is never re-pinned silently in either direction (#621). Since 2026-08-07,
 a PR verified green merges in that same session (disposition rule).
 
 **Hardware.** NVIDIA GB10 / DGX Spark (sm_121a) for CUDA, `dgx.casa` aarch64 for
@@ -422,6 +422,7 @@ built on it rather than keeping the flattering one.
 | Clock-controlled pin grid (#520, #414, #543) | **First defensible series LANDED** at 1024/128, n=3, interleaved, one boot, flat 2184 MHz. Only c1, c4 and a partial c16 exist | c2, c8 and c32 at the pin under clock control, so the sweep is a sweep |
 | 35B low-batch MoE decode | CLOSED at low batch (c1 0.975x, c4 wins); c16 0.93x. `VT_ASYNC_DEVICE_MIRROR` **default ON for correctness**. `VT_ASYNC_EXECUTOR` Option A (H2D out of capture) A/B'd speed-NEUTRAL | c16 lever is prefill glue (task #61), not the decode drain. `test_qwen36_async_serving` GREEN |
 | CPU keep-quant MoE decode | **No number owed**: correctness-only P0. The grouped keep-quant GEMM read activations as f32 whatever their dtype, so CPU MoE decode emitted token-0 garbage from `b4f5610a` (2026-07-31) | Speed unmeasured and unclaimed; `test_ops_quant_dot` GREEN (150224 assertions) |
+| Accepted-and-inert serve args (`SERVE-RECIPE-ARGS`, #606) | **No number owed**: argument parsing only, so nothing to time and no oracle leg. Correctness gate 4 cases / 58 asserts GREEN, RED-first, mutation-proven | None. A speed axis would be fabricated; closes on review plus the operator gate rerun |
 | DeepSeek-V2-Lite MLA | Attributed miss, `ACTIVE` | Throughput at every concurrency |
 | Qwen3.5 upstream throughput levers (roadmap C10) | NOT MEASURED. vLLM's 2026-08-06 25K tok/s/GPU is a GB200/NVLink72 disaggregated cluster result, not comparable to one GB10, and is NOT adopted as our bar | Advance the parity pin past `555967922` so the referenced PRs exist, re-capture goldens at zero drift, then port the GDN prefill kernel |
 | DeepSeek-V4-Flash | **Parity with ds4 (0.997x)** | Optional beat-path: f16 tensor-core DSA/router (near-tie class) |

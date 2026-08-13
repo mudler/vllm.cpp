@@ -560,16 +560,22 @@ settable occupancy knob, blocks_per_sm, was then swept and is DEAD: with
 routing SEEDED so every configuration sees identical work, the between-
 configuration spread (4.3%) is no larger than the within-configuration spread,
 and an apparent 8.7% win in an unseeded first pass was the routing draw moving
-rather than the parameter. Three traps worth carrying. dram__bytes.sum reads n/a on GB10, so ncu's Memory
-Throughput % excludes DRAM traffic and is not a bandwidth utilisation. Any MoE
-comparison that lets routing vary between arms measures the draw, not the
-change. And this box's GPU lock is $HOME/gpu.lock, not /tmp/gpu.lock: the
-standalone runs above took the wrong file and so ran UNLOCKED against a
-concurrent GPU test, which makes their absolute timings (including the 203-226
-GB/s plateau) upper bounds needing a re-take, while the INTERLEAVED ratio, the
-two-regime shape and the distinct-experts scaling survive because contention
-lands on both arms alike. nvidia-smi showing no compute apps does not mean the
-GPU is unreserved; fuser -v $HOME/gpu.lock is the check. Weight
+rather than the parameter. A fresh review then corrected three things here. Cost per distinct expert is
+NOT flat: recomputed it spans 4.47-7.50 us, and two rows with identical expert
+counts differ 89.4 vs 149.9 us while blocks differ 73 vs 137, so in the
+L2-resident regime time tracks BLOCKS and the distinct-expert model applies
+only above ~40. Control BOTH, or state the regime. The plateau over the rows
+actually flat is 212.7-225.8 GB/s, not 203-226, and under that narrower range
+ours at 209.9 is NOT inside it. And the standalone runs took /tmp/gpu.lock
+rather than this box's $HOME/gpu.lock, so they ran unserialised: contention
+inflates TIME, which makes a bytes/time bandwidth a LOWER bound, so a clean
+re-take can only raise the plateau and would REVERSE the we-are-not-slow
+reading. That reading is provisional. What survives is the INTERLEAVED 0.9973
+ratio, since interleaving protects a ratio against both contention and routing
+draw. Two traps worth carrying: dram__bytes.sum reads n/a on GB10, so ncu's
+Memory Throughput % excludes DRAM traffic; and fuser -v $HOME/gpu.lock is the
+check, because nvidia-smi showing no compute apps does not mean the GPU is
+unreserved. Weight
 residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
 same size and stride as upstream's tensor (268 MB, no padding), so the cause is
 memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under

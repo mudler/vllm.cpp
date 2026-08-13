@@ -20615,8 +20615,9 @@ interleaved reps at 120 iters:
 | 5 | 181.7, 184.2, 179.4 | 181.7 |
 
 Between-config spread 4.3%; WITHIN-config spread comparable (bps=3 alone ranges
-171-181). No reliable effect. The lever is DEAD and the seeded single-shot 8.7%
-was noise.
+171-181). No reliable effect. The lever is DEAD, and the 8.7%
+came from the UNSEEDED first pass, i.e. the routing draw moving rather than the
+parameter.
 
 ENVIRONMENT, and this is the more useful finding: two of fourteen runs returned
 ~2x (367.8 and 353.0) and two runs produced no output at all. A box that emits
@@ -20657,3 +20658,58 @@ scaling are robust to a uniform slowdown and do not need re-taking.
 RULE: take `$HOME/gpu.lock`, not `/tmp/gpu.lock`. Check `fuser -v ~/gpu.lock`
 before assuming the GPU is free; `nvidia-smi` showing no compute apps does NOT
 mean it is unreserved, since a holder may be between phases.
+
+## SPEC-DSPARK / #442: CORRECTIONS from fresh review -- per-expert cost is NOT flat, and the bound direction was wrong (2026-08-13)
+
+A fresh review of the branch found two blocking errors in the entries above.
+Both are recorded here rather than edited away, since this log is append-only.
+
+1. "Cost per DISTINCT EXPERT is flat at 5.2-5.7 us" is FALSE. Recomputing
+   us/call / distinct from the table's own numbers gives 4.470, 5.678, 5.340,
+   5.191, 7.495, 5.500, 5.194 -- a range of 4.47 to 7.50. The two distinct=20
+   rows are the tell: identical expert counts, 89.4 vs 149.9 us, blocks 73 vs
+   137. THERE, TIME TRACKS BLOCKS, which is what a flat-per-expert model calls
+   irrelevant.
+
+   The honest model has the same two regimes as the L2 finding. Weights fitting
+   L2 (low distinct) => not re-streamed => cost set by per-block work => time
+   tracks BLOCKS. Weights not fitting (distinct >= ~40 here) => cost set by
+   streaming => time tracks DISTINCT EXPERTS at 5.2-5.7 us each.
+   `time ~= distinct x 1.125 MiB / ~215 GB/s` applies ONLY in the second regime;
+   at distinct=20 it predicts 109.7 us against 89.4 and 149.9 measured, off by
+   -19% and +37%.
+
+   The rule this file stated -- "control distinct experts per launch" -- is
+   therefore INCOMPLETE. Control BOTH distinct experts AND blocks, or state
+   which regime the comparison is in.
+
+2. The lock caveat gave the bound the WRONG DIRECTION. It called the plateau an
+   upper bound. Contention inflates TIME, so a bandwidth computed as bytes/time
+   is a LOWER BOUND on what the kernel achieves. A re-take under
+   `$HOME/gpu.lock` can only move the plateau UP, which would move our in-situ
+   209.9 GB/s BELOW it and REVERSE the "ours is inside it, upstream above it"
+   inversion. That inversion is the least favourable reading to us the data
+   admits and the one most likely to change on a clean re-take.
+
+3. The plateau range 203-226 GB/s mixes bands: over the rows actually flat
+   (>= 38 blocks) it is 212.7-225.8, and the 203 endpoint is the 27-block row at
+   5.81 us/block, which the same paragraph places OUTSIDE the flat band. Under
+   the narrower, self-consistent range, "ours (209.9) sits INSIDE it" is FALSE.
+
+4. The harness arms draw routing from independent RNG streams (python
+   torch.manual_seed, C++ mt19937(1234)), so at the same pool they occupy
+   different block counts (48: 39 vs 38; 128: 54 vs 58). "At matched blocks" was
+   inaccurate -- blocks are NORMALISED, not matched. Neither arm accepts an
+   external routing tensor, so the harness cannot yet satisfy the "force both
+   arms onto one token stream" rule stated one section later. The 0.9973 ratio
+   is probably still sound at M=9, but its error bars carry an undisclosed draw
+   term on top of the contention term.
+
+5. `benchmarks/marlin_moe_standalone.cpp` is not wired into any build target, so
+   nothing compiles it and it will rot against
+   `vt::MoeGroupedGemmNvfp4Marlin`'s signature. Tracked as owed.
+
+NET EFFECT ON CONCLUSIONS: 6ae's interleaved 0.9973 (the kernel is not the gap)
+SURVIVES, since interleaving is what protects a ratio against both contention
+and draw. 6ag's "we are not slow, upstream is unusually fast" DOES NOT survive
+as stated and is now marked provisional pending a re-take under the right lock.

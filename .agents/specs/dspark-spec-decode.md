@@ -1722,7 +1722,9 @@ stream, and **us/block is FLAT at 5.2-5.5 across a 2.4x range of work** --
 a constant bytes-per-second, which is the bandwidth-limited signature.
 
 **So 6z was right and this section's first draft was wrong.** The kernel IS
-memory-bound; the standalone plateau is **203-226 GB/s**, and 6z's derived
+memory-bound; the standalone plateau is **212.7-225.8 GB/s** over the rows that
+are actually flat (>= 38 blocks) -- the widely quoted 203 endpoint is the
+27-block row, which sits outside the flat band -- and 6z's derived
 in-situ numbers land exactly on it: upstream's **210.7 GB/s is INSIDE the
 plateau**, i.e. upstream runs at this kernel's achievable bandwidth, while our
 **186.6 GB/s is ~12% BELOW** it. An independent standalone measurement of the
@@ -1792,7 +1794,15 @@ workspace memset that our arm pays and upstream's does not was isolated with
 **So 6x's localisation does not survive.** Its "the SAME kernel, the SAME 1520
 launches, ours 249.22 ms vs upstream 230.39 ms, 8.2% slower inside one kernel"
 does NOT reproduce when the same kernel is driven with matched work on the same
-box. At matched blocks the two are indistinguishable. Correspondingly, the
+box. Normalised by blocks the two are indistinguishable -- and note NORMALISED, not
+matched: the two arms draw routing from independent RNG streams (python
+`torch.manual_seed`, C++ `mt19937(1234)`), so at the same pool they occupy
+different block counts (pool 48: 39 vs 38; pool 128: 54 vs 58). Neither harness
+accepts an externally supplied routing tensor, so it cannot yet satisfy the
+"force both arms onto one token stream" rule this spec states. At M=9, blocks
+track distinct experts and us/block is flat in the streaming regime, so the
+ratio is probably sound -- but its error bars carry an undisclosed draw term on
+top of the contention term. Correspondingly, the
 "12.8% slower per unit of work" and the 186.6-vs-210.7 GB/s reading it produced
 describe the in-situ RUNS, not the kernel: both engines reach the same 203-226
 GB/s plateau when asked to do the same thing.
@@ -1833,16 +1843,26 @@ the routing touches, upstream arm, `--arm gate_up`:
 | 128 | 255 | 250 | 1298.6 | 5.09 |
 
 Read the M=128 rows: **137 -> 146 blocks is +6.6% of blocks, and time rises
-+46.7%**, because distinct experts went 20 -> 40. Cost per DISTINCT EXPERT is
-flat at **5.2-5.7 us** across the whole table (1.125 MiB each, ~205-225 GB/s,
-the same plateau as 6ad). Cost per BLOCK varies 4.7x over the same rows.
++46.7%**, because distinct experts went 20 -> 40.
 
-**So the model is `time ~= distinct_experts x 1.125 MiB / ~215 GB/s`, and block
-count is nearly irrelevant.** Every in-situ comparison in 6x and 6y normalised by
-BLOCKS -- 38.9 ours against 40.6 upstream -- which the data now shows is not the
-driver. Blocks are what `num_tokens_past_padded` reports and experts are what the
-kernel streams; with `block_size_m = 8` and correlated spec-decode tokens, one
-expert routinely spans several blocks, so the two numbers come apart.
+**But the per-expert cost is NOT flat, and an earlier draft of this section said
+it was.** Dividing us/call by distinct gives 4.470, 5.678, 5.340, 5.191, 7.495,
+5.500, 5.194 -- a **4.47 to 7.50** range, not 5.2-5.7. The two `distinct=20`
+rows are the tell: same expert count, 89.4 vs 149.9 us, while blocks differ
+73 vs 137. There, time tracks BLOCKS, which is exactly what a flat-per-expert
+model calls irrelevant.
+
+**So the honest model has two regimes, and it is the same two regimes as 6ad.**
+When the touched weights fit L2 (low distinct), the weights are not re-streamed
+and cost is set by the per-block work, so time tracks BLOCKS. When they do not
+(distinct >= ~40 here), cost is set by streaming and time tracks DISTINCT
+EXPERTS at 5.2-5.7 us each. `time ~= distinct x 1.125 MiB / ~215 GB/s` applies
+ONLY in the second regime; at distinct=20 it predicts 109.7 us against measured
+89.4 and 149.9, off by -19% and +37%.
+
+The rule that follows is therefore **control BOTH**: a MoE comparison must match
+distinct experts AND blocks, or state which regime it is in. Matching one alone
+is what makes two runs look comparable when they are not.
 
 **Applying the model to the recorded in-situ launches requires care, and my
 first pass got it backwards.** 6y already measured both sides for the same
@@ -1907,8 +1927,22 @@ bytes:
 | ours | 38.9 | 32.8 | 164.0 | **209.9** |
 | upstream | 40.6 | 34.3 | 151.6 | **236.9** |
 
-Measured standalone gate_up plateau: 203-226 GB/s. **Ours sits INSIDE it,
-upstream ABOVE it.** We run this kernel at the bandwidth it achieves in
+Measured standalone gate_up plateau: 212.7-225.8 GB/s over the flat rows.
+Ours appears INSIDE it and upstream ABOVE it -- **but read the next paragraph
+before using that.**
+
+**THE LOCK CAVEAT, WHICH APPLIES TO EVERY ABSOLUTE NUMBER IN 6ad THROUGH 6ag.**
+Those standalone runs took `flock /tmp/gpu.lock`. This box's GPU lock is
+`$HOME/gpu.lock`, so they ran UNSERIALISED against concurrent GPU work. Timings
+taken under contention are inflated, and a bandwidth computed as bytes/time is
+therefore a **LOWER BOUND** on what the kernel achieves, not an upper one. A
+re-take under the correct lock can only move the plateau UP -- which would move
+our in-situ 209.9 GB/s BELOW it and **reverse the inversion below**. The
+"we are not slow, upstream is unusually fast" reading is the LEAST favourable
+interpretation to us that the data admits, and it is the one most likely to
+change on a clean re-take. Do not build on it until the plateau is re-measured
+under `$HOME/gpu.lock`. What survives contention is the INTERLEAVED ratio of
+6ae, because contention lands on both arms alike. We run this kernel at the bandwidth it achieves in
 isolation; upstream gets something in place the isolated kernel does not. First
 candidate is cache reuse across the gate_up/down pair, down's weights being half
 size so more of the working set can persist. The framing inverts: on this

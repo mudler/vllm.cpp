@@ -27,7 +27,7 @@ import torch
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--m", type=int, default=9, help="tokens (1 + k spec draft)")
-    ap.add_argument("--iters", type=int, default=200)
+    ap.add_argument("--iters", type=int, default=80)  # matches the C++ arm
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--arm", choices=["gate_up", "down", "both"], default="both")
     ap.add_argument("--bps", type=int, default=-1,

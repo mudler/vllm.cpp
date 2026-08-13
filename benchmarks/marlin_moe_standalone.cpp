@@ -12,6 +12,17 @@
 // not mean the GPU is unreserved, so check `fuser -v $HOME/gpu.lock` first.
 // Absolute timings taken unlocked are upper bounds; only interleaved RATIOS
 // survive contention.
+//
+// NOT WIRED INTO ANY BUILD TARGET (#442). Nothing compiles this file, so it
+// carries no -Werror and no CI, and it will rot against
+// vt::MoeGroupedGemmNvfp4Marlin's signature. The recorded measurements were
+// taken from an out-of-tree build. Wiring it into examples/CMakeLists.txt the
+// way benchmarks/vulkan_gemm_ab.cpp is wired is owed.
+//
+// Its routing RNG is a DIFFERENT stream from the python arm's, so the two
+// arms occupy different block counts at the same --experts pool. Comparisons
+// between them are NORMALISED by blocks, not matched on them; neither arm can
+// yet take an externally supplied routing tensor.
 
 #include <cstdint>
 #include <cstdio>

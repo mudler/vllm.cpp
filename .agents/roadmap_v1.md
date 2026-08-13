@@ -174,7 +174,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#607](https://github.com/mudler/vllm.cpp/issues/607) | — | No `--language-model-only`: 43 recipes skip the vision encoder to hand its VRAM to the KV cache and we load the tower unconditionally. The flag appears in this repo only in `tools/bench/run_serve_low.py`, which passes it to the ORACLE — a grep reads as coverage and is not | feature |
 | [#608](https://github.com/mudler/vllm.cpp/issues/608) | `TOOLS-PARSER-BREADTH` | Six `--tool-call-parser` names missing (`openai`, `inkling`, `minimax_m3`, `nemotron_json`, `kimi_k3`, `ling3`), closing the last 8 of 90 official-recipe uses; four are portable at the pin, two are post-pin | feature |
 | [#609](https://github.com/mudler/vllm.cpp/issues/609) | — | Model matrix is short two recipe architectures that exist in vLLM `main` but not at our pin: `Qwen3_5MoeForCausalLM` (Qwen3.8-2.4T-A95B — a new registry entry for the Qwen3.5-MoE family we already ship gated) and `BailingMoeV3ForCausalLM` (Ling-3.0-flash, successor to the rowed `BailingMoeV2_5ForCausalLM`) | records |
-| [#610](https://github.com/mudler/vllm.cpp/issues/610) | — | Seven `vllm-omni` recipe architectures have no model-matrix row, so the TTS / audio-generation modality is entirely unplaced: four confirmed in `vllm-omni`'s supported-models doc, two located in neither core `main` nor omni. Precedent for rowing an omni-repo architecture already exists (`MiniMaxH3DiTModel`) | records |
+| [#610](https://github.com/mudler/vllm.cpp/issues/610) | — | Six `vllm-omni` recipe architectures (reached by ten recipes -- `MossTTSDelayModel` serves four of them) have no model-matrix row, so the TTS / audio-generation modality is entirely unplaced: four confirmed in `vllm-omni`'s supported-models doc, two located in neither core `main` nor omni. Precedent for rowing an omni-repo architecture already exists (`MiniMaxH3DiTModel`) | records |
 
 ## Top-level portfolio
 
@@ -607,14 +607,26 @@ as coverage and is the opposite of it.
 | 📋 spiked | 6 |
 | 🚫 blocked | 13 |
 | ⬜ inventoried (row exists, unstarted) | 79 |
-| **no row anywhere** | **11** → [#609](https://github.com/mudler/vllm.cpp/issues/609), [#610](https://github.com/mudler/vllm.cpp/issues/610) |
+| **no row anywhere** | **11** recipes = **8** architectures → [#609](https://github.com/mudler/vllm.cpp/issues/609), [#610](https://github.com/mudler/vllm.cpp/issues/610) |
 | architecture unresolved (gated / diffusion repo) | 20 |
 
 The 79 `⬜` are scoped-but-unstarted, not missing — model-inventory coverage is
-genuinely broad. The 11 unrowed split cleanly: 2 are pin-lag (present in vLLM
-`main`, [#609](https://github.com/mudler/vllm.cpp/issues/609)) and 7 live in
-`vllm-omni` ([#610](https://github.com/mudler/vllm.cpp/issues/610)); 2 of that 7
-are in neither and need placing before scoping.
+genuinely broad. The 11 unrowed recipes resolve to **8 distinct architectures** —
+`MossTTSDelayModel` alone is reached by four of them — and split cleanly: 2 are
+pin-lag (present in vLLM `main`,
+[#609](https://github.com/mudler/vllm.cpp/issues/609)) and 6 live in `vllm-omni`
+([#610](https://github.com/mudler/vllm.cpp/issues/610)), of which 2 are in neither
+and need placing before scoping. Counting recipes where the unit is an
+architecture is what put "seven" in the first draft of #610; the row is the
+architecture, so 8 is the number that matters.
+
+**Caveat on the denominator.** 20 of the 157 recipe configs were unreadable
+(gated or 404 — `Voxtral-4B-TTS-2603`, `GLM-TTS`, `IndexTTS-2.5`,
+`stable-audio-open-1.0`, several `meta-llama`), so their architectures are
+UNVERIFIED and the 8 is a floor, not a total. Several `vllm-omni` TTS
+architectures visible in that repo's supported-models doc are also unreached by
+any recipe and therefore invisible to this sweep. Closing that hole is its own
+audit, not an inference from this one.
 
 ### GB10 recipes are upstream-authored parity workloads
 

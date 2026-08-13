@@ -1,0 +1,1169 @@
+// LTX-2.5 PIPELINE — see include/vllm/model_executor/models/ltx2_pipeline.h for
+// the upstream mapping, the recipe provenance, and why the refusals exist.
+//
+// EVERY numeric expression below mirrors upstream's ARITHMETIC WIDTH, not just
+// its algebra, because the two schedulers do not agree on it and a port that
+// picked one width for both would be wrong on one of them:
+//
+//   LTX2Scheduler          torch float32 tensors throughout (schedulers.py:33-57),
+//                          with the shift term alone computed as a Python double
+//                          before torch sees it (:37-44).
+//   LinearQuadraticScheduler  PYTHON FLOATS — i.e. double — for the whole
+//                          schedule, cast to float32 once by `torch.FloatTensor`
+//                          at the very end (:75-88).
+//
+// The diffusion steps are float32 (each casts `.to(torch.float32)` on entry), and
+// their scalar coefficients are 0-dim float32 tensors, so `eta`, `s_noise` and
+// friends round to f32 at every binary op rather than staying double.
+//
+// ONE KNOWN EXCEPTION TO THE "EVERY" ABOVE, found 2026-08-12 and NOT yet
+// repaired. `Ltx2SigmaSchedule`'s shift (:105-109) is written as f32/f32, but
+// upstream's is a PYTHON SCALAR divided by a tensor (schedulers.py:43-45), and
+// torch evaluates scalar/tensor as `scalar * reciprocal(tensor)` — so at
+// sigma == 1 upstream yields 0.99999994, one ulp below 1, where this file yields
+// exactly 1.0. It is invisible for steps >= 2 (the stretch renormalizes it away,
+// within the 5e-06 gate), but at steps == 1 that residue is the ONLY non-zero
+// sigma and therefore the whole stretch anchor: upstream returns
+// {0.10000002, 0} and this returns {-nan, 0}. The `OneStep` golden already
+// carries upstream's correct value and did not catch it because the suite's
+// `MaxAbsDiff` drops NaN. Left unrepaired deliberately: mirroring torch's
+// reciprocal-multiply moves every sigma on every arm, so it owes its own
+// red-first change and a fresh review rather than a drive-by edit. Gated as far
+// as it can be without the fix by the "terminates at exactly 0" case in
+// tests/vllm/models/test_ltx2_pipeline.cpp, which sweeps steps 1..200.
+#include "vllm/model_executor/models/ltx2_pipeline.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <limits>
+#include <stdexcept>
+
+namespace vllm {
+namespace {
+
+[[noreturn]] void Refuse(const std::string& message) { throw std::runtime_error(message); }
+
+void Require(bool condition, const std::string& message) {
+  if (!condition) Refuse(message);
+}
+
+// torch.linspace on CPU (aten RangeFactories.cpp): `step` is computed in the
+// tensor's own dtype and the SECOND HALF is walked backwards from `end`, which is
+// what makes the terminal value exactly `end` instead of an accumulated
+// near-zero. The schedule's last sigma being exactly 0 is what every terminal
+// early-out branches on, so this is mirrored rather than approximated.
+std::vector<float> LinspaceF32(float start, float end, int64_t count) {
+  std::vector<float> out(static_cast<size_t>(count));
+  if (count == 1) {
+    out[0] = start;
+    return out;
+  }
+  const float step = (end - start) / static_cast<float>(count - 1);
+  const int64_t halfway = count / 2;
+  for (int64_t i = 0; i < count; ++i) {
+    out[static_cast<size_t>(i)] = i < halfway
+                                      ? start + step * static_cast<float>(i)
+                                      : end - step * static_cast<float>(count - i - 1);
+  }
+  return out;
+}
+
+// math.isclose's defaults: rel_tol = 1e-9, abs_tol = 0.0. MultiModalGuider uses
+// it where CFGGuider uses `!=` (guiders.py:26 vs :277), and the two are not
+// interchangeable — the difference decides whether an extra full DiT forward runs.
+bool IsClose(double a, double b) {
+  const double tol = 1e-9 * std::max(std::fabs(a), std::fabs(b));
+  return std::fabs(a - b) <= tol;
+}
+
+// Lexicographic tuple comparison, matching Python's: a shorter tuple that is a
+// prefix of a longer one compares LESS, which is what makes `()` (an unset or
+// unparseable version) fall below every real generation.
+int CompareVersion(const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
+  const size_t common = std::min(a.size(), b.size());
+  for (size_t i = 0; i < common; ++i) {
+    if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  if (a.size() == b.size()) return 0;
+  return a.size() < b.size() ? -1 : 1;
+}
+
+std::string NormalizeVersionSeparator(const std::string& version) {
+  // utils/constants.py:159-161. Pre-release tags come both dot- and
+  // hyphen-separated; without this "2.4-rc2" parses to (2,) and lands a release
+  // candidate on the 2.0 recipe.
+  std::string normalized = version;
+  std::replace(normalized.begin(), normalized.end(), '-', '.');
+  return normalized;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Sigma schedules
+// ---------------------------------------------------------------------------
+
+std::vector<float> Ltx2SigmaSchedule(int64_t steps, int64_t tokens,
+                                     const Ltx2SchedulerParams& params) {
+  Require(steps >= 1, "ltx2 scheduler: steps must be >= 1, got " + std::to_string(steps));
+  const int64_t resolved_tokens = tokens > 0 ? tokens : params.default_number_of_tokens;
+
+  std::vector<float> sigmas = LinspaceF32(1.0f, 0.0f, steps + 1);
+
+  // schedulers.py:35-39, all Python doubles before torch sees them.
+  const double x1 = static_cast<double>(kLtx2BaseShiftAnchor);
+  const double x2 = static_cast<double>(kLtx2MaxShiftAnchor);
+  const double mm = (params.max_shift - params.base_shift) / (x2 - x1);
+  const double b = params.base_shift - mm * x1;
+  const double sigma_shift = static_cast<double>(resolved_tokens) * mm + b;
+  const float shift_exp = static_cast<float>(std::exp(sigma_shift));
+
+  // schedulers.py:42-46 — `torch.where(sigmas != 0, ..., 0)`. The zero branch is
+  // taken structurally rather than by evaluating 1/0 and relying on inf.
+  for (float& sigma : sigmas) {
+    if (sigma == 0.0f) continue;
+    const float shifted = std::pow(1.0f / sigma - 1.0f, static_cast<float>(kLtx2SigmaShiftPower));
+    sigma = shift_exp / (shift_exp + shifted);
+  }
+
+  if (params.stretch) {
+    // schedulers.py:49-55. `one_minus_z[-1]` is the LAST non-zero entry, which
+    // for a linspace(1, 0) is the one just before the terminal 0.
+    int64_t last_non_zero = -1;
+    for (int64_t i = 0; i < static_cast<int64_t>(sigmas.size()); ++i) {
+      if (sigmas[static_cast<size_t>(i)] != 0.0f) last_non_zero = i;
+    }
+    if (last_non_zero >= 0) {
+      const float terminal_gap = static_cast<float>(1.0 - params.terminal);
+      const float scale_factor = (1.0f - sigmas[static_cast<size_t>(last_non_zero)]) / terminal_gap;
+      for (float& sigma : sigmas) {
+        if (sigma == 0.0f) continue;
+        sigma = 1.0f - (1.0f - sigma) / scale_factor;
+      }
+    }
+  }
+  return sigmas;
+}
+
+std::vector<float> Ltx2LinearQuadraticSchedule(int64_t steps, double threshold_noise,
+                                               int64_t linear_steps) {
+  Require(steps >= 1,
+          "ltx2 linear-quadratic scheduler: steps must be >= 1, got " + std::to_string(steps));
+  // schedulers.py:70-71 — the one-step schedule is a literal, not a formula.
+  if (steps == 1) return {1.0f, 0.0f};
+
+  const int64_t linear = linear_steps < 0 ? steps / 2 : linear_steps;
+  Require(linear > 0,
+          "ltx2 linear-quadratic scheduler: linear_steps must be > 0 (upstream divides by it "
+          "at schedulers.py:75), got " +
+              std::to_string(linear));
+
+  // Python floats, i.e. DOUBLE, for the whole schedule. Only `torch.FloatTensor`
+  // at :88 narrows it.
+  std::vector<double> schedule;
+  schedule.reserve(static_cast<size_t>(steps + 1));
+  for (int64_t i = 0; i < linear; ++i) {
+    schedule.push_back(static_cast<double>(i) * threshold_noise / static_cast<double>(linear));
+  }
+  const double step_diff = static_cast<double>(linear) - threshold_noise * static_cast<double>(steps);
+  const int64_t quadratic_steps = steps - linear;
+  if (quadratic_steps > 0) {
+    const double qs = static_cast<double>(quadratic_steps);
+    const double quadratic_coef = step_diff / (static_cast<double>(linear) * qs * qs);
+    const double linear_coef =
+        threshold_noise / static_cast<double>(linear) - 2.0 * step_diff / (qs * qs);
+    const double constant = quadratic_coef * static_cast<double>(linear) * static_cast<double>(linear);
+    for (int64_t i = linear; i < steps; ++i) {
+      const double x = static_cast<double>(i);
+      schedule.push_back(quadratic_coef * x * x + linear_coef * x + constant);
+    }
+  }
+  schedule.push_back(1.0);
+
+  std::vector<float> out(schedule.size());
+  for (size_t i = 0; i < schedule.size(); ++i) {
+    out[i] = static_cast<float>(1.0 - schedule[i]);
+  }
+  return out;
+}
+
+std::vector<float> Ltx2Schedule(Ltx2SchedulerKind kind, int64_t steps, int64_t tokens,
+                                const Ltx2SchedulerParams& params) {
+  switch (kind) {
+    case Ltx2SchedulerKind::kLtx2:
+      return Ltx2SigmaSchedule(steps, tokens, params);
+    case Ltx2SchedulerKind::kLinearQuadratic:
+      return Ltx2LinearQuadraticSchedule(steps);
+    case Ltx2SchedulerKind::kBeta:
+      Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature::kBetaScheduler);
+  }
+  Refuse("ltx2 scheduler: unknown Ltx2SchedulerKind");
+}
+
+// ---------------------------------------------------------------------------
+// The noiser
+// ---------------------------------------------------------------------------
+
+std::vector<float> Ltx2GaussianNoise(const float* latent, const float* clean_latent,
+                                     const float* denoise_mask, const float* noise,
+                                     int64_t count, float noise_scale) {
+  Require(latent != nullptr && clean_latent != nullptr && denoise_mask != nullptr &&
+              noise != nullptr,
+          "ltx2 noiser: latent, clean_latent, denoise_mask and noise are all required");
+  std::vector<float> out(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) {
+    const size_t k = static_cast<size_t>(i);
+    // noisers.py:32 — lerp toward the NOISE by noise_scale...
+    const float noised = latent[k] + noise_scale * (noise[k] - latent[k]);
+    // ...then :33 — lerp from the CLEAN latent toward that, by the denoise mask.
+    // Mask 0 keeps the clean value (a conditioned token); mask 1 takes the noised
+    // one. Swapping these two operands still renders.
+    out[k] = clean_latent[k] + denoise_mask[k] * (noised - clean_latent[k]);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Diffusion steps
+// ---------------------------------------------------------------------------
+
+namespace {
+
+void RequireStepIndex(int64_t sigma_count, int64_t step_index) {
+  Require(step_index >= 0 && step_index + 1 < sigma_count,
+          "ltx2 diffusion step: step_index " + std::to_string(step_index) +
+              " is outside a " + std::to_string(sigma_count) + "-sigma schedule");
+}
+
+}  // namespace
+
+std::vector<float> Ltx2EulerStep(const float* sample, const float* denoised,
+                                 const float* sigmas, int64_t sigma_count, int64_t step_index,
+                                 int64_t count) {
+  RequireStepIndex(sigma_count, step_index);
+  const float sigma = sigmas[step_index];
+  const float sigma_next = sigmas[step_index + 1];
+  // to_velocity (utils.py:34-35) REFUSES a zero sigma rather than dividing.
+  Require(sigma != 0.0f, "ltx2 Euler step: sigma can't be 0.0 (utils.py:34-35)");
+  const float dt = sigma_next - sigma;
+
+  std::vector<float> out(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) {
+    const size_t k = static_cast<size_t>(i);
+    const float velocity = (sample[k] - denoised[k]) / sigma;
+    out[k] = sample[k] + velocity * dt;
+  }
+  return out;
+}
+
+std::vector<float> Ltx2EulerAncestralStep(const float* sample, const float* denoised,
+                                          const float* sigmas, int64_t sigma_count,
+                                          int64_t step_index, int64_t count, double eta,
+                                          double s_noise, const float* noise) {
+  RequireStepIndex(sigma_count, step_index);
+  const float sigma = sigmas[step_index];
+  const float sigma_next = sigmas[step_index + 1];
+  // diffusion_steps.py:85-86 — the terminal step returns the denoised prediction
+  // outright. This is checked BEFORE the noise requirement, exactly as upstream
+  // orders it.
+  if (sigma_next == 0.0f) {
+    return std::vector<float>(denoised, denoised + count);
+  }
+  Require(!(eta > 0.0 && noise == nullptr),
+          "ltx2 EulerAncestral step: requires a noise tensor when eta > 0 "
+          "(diffusion_steps.py:87-88)");
+
+  const float eta_f = static_cast<float>(eta);
+  const float downstep_ratio = 1.0f + (sigma_next / sigma - 1.0f) * eta_f;
+  const float sigma_down = sigma_next * downstep_ratio;
+  const float sigma_down_ratio = sigma_down / sigma;
+
+  float renoise_coeff = 0.0f;
+  float alpha_scale = 1.0f;
+  if (eta > 0.0) {
+    const float alpha_next = 1.0f - sigma_next;
+    const float alpha_down = 1.0f - sigma_down;
+    const float inner = sigma_next * sigma_next -
+                        sigma_down * sigma_down * alpha_next * alpha_next /
+                            (alpha_down * alpha_down);
+    renoise_coeff = std::sqrt(std::max(inner, 0.0f));
+    alpha_scale = alpha_next / alpha_down;
+  }
+  const float s_noise_f = static_cast<float>(s_noise);
+
+  std::vector<float> out(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) {
+    const size_t k = static_cast<size_t>(i);
+    float value = sigma_down_ratio * sample[k] + (1.0f - sigma_down_ratio) * denoised[k];
+    if (eta > 0.0) {
+      value = alpha_scale * value + noise[k] * s_noise_f * renoise_coeff;
+    }
+    out[k] = value;
+  }
+  return out;
+}
+
+Ltx2SdeCoeff Ltx2Res2sSdeCoeff(double sigma_next, double sigma_up) {
+  // diffusion_steps.py:136-155, the `sigma_up is not None` arm — the only one
+  // `Res2sDiffusionStep.step` reaches (:179).
+  const float next = static_cast<float>(sigma_next);
+  float up = static_cast<float>(sigma_up);
+  up = std::min(up, next * static_cast<float>(kLtx2Res2sSigmaUpClamp));
+
+  const float sigma_signal = 1.0f - next;  // `sigmax` defaults to ones_like
+  const float residual = std::sqrt(std::max(next * next - up * up, 0.0f));
+  float alpha_ratio = sigma_signal + residual;
+  float down = residual / alpha_ratio;
+
+  // :149-153 — the NaN scrubbing, which is what keeps a degenerate schedule from
+  // poisoning the whole latent.
+  if (std::isnan(up)) up = 0.0f;
+  if (std::isnan(down)) down = next;
+  if (std::isnan(alpha_ratio)) alpha_ratio = 1.0f;
+
+  Ltx2SdeCoeff coeff;
+  coeff.alpha_ratio = alpha_ratio;
+  coeff.sigma_down = down;
+  coeff.sigma_up = up;
+  return coeff;
+}
+
+std::vector<float> Ltx2Res2sStep(const float* sample, const float* denoised,
+                                 const float* sigmas, int64_t sigma_count, int64_t step_index,
+                                 int64_t count, const float* noise, double eta) {
+  RequireStepIndex(sigma_count, step_index);
+  const float sigma = sigmas[step_index];
+  const float sigma_next = sigmas[step_index + 1];
+  const Ltx2SdeCoeff coeff =
+      Ltx2Res2sSdeCoeff(sigma_next, static_cast<double>(sigma_next * static_cast<float>(eta)));
+
+  // :181-182 — returned UNCHANGED, not cast, when either is zero.
+  if (coeff.sigma_up == 0.0 || sigma_next == 0.0f) {
+    return std::vector<float>(denoised, denoised + count);
+  }
+  Require(noise != nullptr, "ltx2 Res2s step: requires a noise tensor");
+
+  const float alpha_ratio = static_cast<float>(coeff.alpha_ratio);
+  const float sigma_down = static_cast<float>(coeff.sigma_down);
+  const float sigma_up = static_cast<float>(coeff.sigma_up);
+  const float denom = sigma - sigma_next;
+
+  std::vector<float> out(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) {
+    const size_t k = static_cast<size_t>(i);
+    const float eps_next = (sample[k] - denoised[k]) / denom;
+    const float denoised_next = sample[k] - sigma * eps_next;
+    out[k] = alpha_ratio * (denoised_next + sigma_down * eps_next) + sigma_up * noise[k];
+  }
+  return out;
+}
+
+Ltx2AncestralSigmas Ltx2AncestralStep(double sigma_from, double sigma_to, double eta) {
+  Ltx2AncestralSigmas result;
+  // :17-18 — `if not eta`, i.e. exactly 0.0, short-circuits before any division.
+  if (eta == 0.0) {
+    result.sigma_down = sigma_to;
+    result.sigma_up = 0.0;
+    return result;
+  }
+  const float from = static_cast<float>(sigma_from);
+  const float to = static_cast<float>(sigma_to);
+  const float variance = to * to * std::max(from * from - to * to, 0.0f) / (from * from);
+  float up = static_cast<float>(eta) * std::sqrt(variance);
+  up = std::min(up, to);
+  const float down = std::sqrt(std::max(to * to - up * up, 0.0f));
+  result.sigma_down = down;
+  result.sigma_up = up;
+  return result;
+}
+
+std::vector<float> Ltx2EulerCfgPpStep(const float* sample, const float* denoised,
+                                      const float* uncond_denoised, const float* sigmas,
+                                      int64_t sigma_count, int64_t step_index, int64_t count,
+                                      double eta, double s_noise, const float* noise) {
+  RequireStepIndex(sigma_count, step_index);
+  Require(uncond_denoised != nullptr,
+          "ltx2 CFG++ step: requires an unconditioned prediction (diffusion_steps.py:214)");
+  const float sigma_s = sigmas[step_index];
+  const float sigma_t = sigmas[step_index + 1];
+  // :233-235 — the clamp that keeps `alpha = 1 - sigma` off zero when sigma is
+  // EXACTLY 1.0, which the first step of an unstretched schedule is.
+  const float eps = static_cast<float>(kLtx2CfgPpAlphaEps);
+  const float alpha_s = std::max(1.0f - sigma_s, eps);
+  const float alpha_t = std::max(1.0f - sigma_t, eps);
+
+  const Ltx2AncestralSigmas ancestral =
+      Ltx2AncestralStep(static_cast<double>(sigma_s / alpha_s),
+                        static_cast<double>(sigma_t / alpha_t), eta);
+  const float sigma_down = alpha_t * static_cast<float>(ancestral.sigma_down);
+  const float sigma_up = static_cast<float>(ancestral.sigma_up);
+  const bool renoise = noise != nullptr && eta > 0.0 && s_noise > 0.0;
+  const float s_noise_f = static_cast<float>(s_noise);
+
+  std::vector<float> out(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) {
+    const size_t k = static_cast<size_t>(i);
+    // :243 — the derivative uses the UNCONDITIONED prediction. That is the whole
+    // CFG++ correction; using the conditioned one is a plain Euler step.
+    const float d = (sample[k] - alpha_s * uncond_denoised[k]) / sigma_s;
+    float value = alpha_t * denoised[k] + sigma_down * d;
+    if (renoise) value += alpha_t * noise[k] * s_noise_f * sigma_up;
+    out[k] = value;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Guidance
+// ---------------------------------------------------------------------------
+
+std::vector<float> Ltx2ProjectionCoef(const float* to_project, const float* project_onto,
+                                      int64_t batch, int64_t count) {
+  std::vector<float> out(static_cast<size_t>(batch));
+  for (int64_t b = 0; b < batch; ++b) {
+    double dot = 0.0;
+    double squared_norm = 0.0;
+    for (int64_t i = 0; i < count; ++i) {
+      const size_t k = static_cast<size_t>(b * count + i);
+      dot += static_cast<double>(to_project[k]) * static_cast<double>(project_onto[k]);
+      squared_norm += static_cast<double>(project_onto[k]) * static_cast<double>(project_onto[k]);
+    }
+    const float denominator = static_cast<float>(squared_norm) +
+                              static_cast<float>(kLtx2ProjectionCoefEps);
+    out[static_cast<size_t>(b)] = static_cast<float>(dot) / denominator;
+  }
+  return out;
+}
+
+std::vector<float> Ltx2CfgDelta(const float* cond, const float* uncond, int64_t count,
+                                double scale) {
+  // guiders.py:24 — `(self.scale - 1)` is evaluated in Python (double) and only
+  // then meets the tensor.
+  const float gain = static_cast<float>(scale - 1.0);
+  std::vector<float> out(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) {
+    const size_t k = static_cast<size_t>(i);
+    out[k] = gain * (cond[k] - uncond[k]);
+  }
+  return out;
+}
+
+std::vector<float> Ltx2StgDelta(const float* cond, const float* perturbed, int64_t count,
+                                double scale) {
+  const float gain = static_cast<float>(scale);
+  std::vector<float> out(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) {
+    const size_t k = static_cast<size_t>(i);
+    out[k] = gain * (cond[k] - perturbed[k]);
+  }
+  return out;
+}
+
+bool Ltx2MultiModalGuiderParams::DoUnconditionalGeneration() const {
+  return !IsClose(cfg_scale, 1.0);
+}
+bool Ltx2MultiModalGuiderParams::DoPerturbedGeneration() const {
+  return !IsClose(stg_scale, 0.0);
+}
+bool Ltx2MultiModalGuiderParams::DoIsolatedModalityGeneration() const {
+  return !IsClose(modality_scale, 1.0);
+}
+bool Ltx2MultiModalGuiderParams::ShouldSkipStep(int64_t step) const {
+  // guiders.py:287-291. `skip_step == 0` means "never skip"; otherwise every
+  // `skip_step + 1`-th step runs and the rest are skipped.
+  if (skip_step == 0) return false;
+  return step % (skip_step + 1) != 0;
+}
+
+std::vector<float> Ltx2MultiModalGuidance(const Ltx2MultiModalGuiderParams& params,
+                                          const float* cond, const float* uncond_text,
+                                          const float* uncond_perturbed,
+                                          const float* uncond_modality, int64_t count) {
+  Require(cond != nullptr, "ltx2 MultiModalGuider: `cond` is required");
+  // A null stands for upstream's `float` union member at its only reachable
+  // value: the 0.0 a disabled arm passes (guiders.py:247-249).
+  auto at = [](const float* buffer, size_t k) {
+    return buffer != nullptr ? buffer[k] : 0.0f;
+  };
+  const float cfg_gain = static_cast<float>(params.cfg_scale - 1.0);
+  const float stg_gain = static_cast<float>(params.stg_scale);
+  const float modality_gain = static_cast<float>(params.modality_scale - 1.0);
+
+  std::vector<float> pred(static_cast<size_t>(count));
+  for (int64_t i = 0; i < count; ++i) {
+    const size_t k = static_cast<size_t>(i);
+    // guiders.py:261-266, summed left to right exactly as written.
+    float value = cond[k];
+    value += cfg_gain * (cond[k] - at(uncond_text, k));
+    value += stg_gain * (cond[k] - at(uncond_perturbed, k));
+    value += modality_gain * (cond[k] - at(uncond_modality, k));
+    pred[k] = value;
+  }
+
+  if (params.rescale_scale != 0.0) {
+    // :268-271. torch's `std` is the UNBIASED (N-1) estimator by default; the
+    // biased one would be a small, everywhere, resolution-dependent gain error.
+    auto unbiased_std = [count](const float* buffer) {
+      double mean = 0.0;
+      for (int64_t i = 0; i < count; ++i) mean += static_cast<double>(buffer[i]);
+      mean /= static_cast<double>(count);
+      double sum_sq = 0.0;
+      for (int64_t i = 0; i < count; ++i) {
+        const double d = static_cast<double>(buffer[i]) - mean;
+        sum_sq += d * d;
+      }
+      return static_cast<float>(std::sqrt(sum_sq / static_cast<double>(count - 1)));
+    };
+    const float factor_raw = unbiased_std(cond) / unbiased_std(pred.data());
+    const float factor = static_cast<float>(params.rescale_scale) * factor_raw +
+                         static_cast<float>(1.0 - params.rescale_scale);
+    for (float& value : pred) value *= factor;
+  }
+  return pred;
+}
+
+std::vector<float> Ltx2Guidance(Ltx2GuiderKind kind, const Ltx2MultiModalGuiderParams& params,
+                                const float* cond, const float* uncond_text,
+                                const float* uncond_perturbed, const float* uncond_modality,
+                                int64_t count) {
+  switch (kind) {
+    case Ltx2GuiderKind::kCfg:
+      return Ltx2CfgDelta(cond, uncond_text, count, params.cfg_scale);
+    case Ltx2GuiderKind::kStg:
+      return Ltx2StgDelta(cond, uncond_perturbed, count, params.stg_scale);
+    case Ltx2GuiderKind::kMultiModal:
+      return Ltx2MultiModalGuidance(params, cond, uncond_text, uncond_perturbed,
+                                    uncond_modality, count);
+    case Ltx2GuiderKind::kCfgStarRescaling:
+    case Ltx2GuiderKind::kLtxApg:
+    case Ltx2GuiderKind::kLegacyStatefulApg:
+      break;
+  }
+  // UNREACHABLE, not unshapeable — see the header. Nothing in the LTX-2 tree
+  // constructs these three; they appear only at their own `class` statements.
+  // (An earlier revision refused them on a shape argument instead. That premise
+  // was measured and is FALSE: at B = 1 the (B, 1) coefficient is a scalar and
+  // composes correctly on any rank. The real predicate is
+  // `B > 1 && shape[-2] not in {1, B}` and it is gated in the test, not here.)
+  Refuse(
+      "ltx2 guidance: CFGStarRescalingGuider / LtxAPGGuider / LegacyStatefulAPGGuider are not "
+      "ported. Nothing upstream constructs them: all three appear in the LTX-2 tree only at "
+      "their own class statements (guiders.py:31, 78, 129), and every pipeline builds "
+      "MultiModalGuider from MultiModalGuiderParams (ltx-pipelines utils/constants.py:49-68). "
+      "This arm is owed and recorded in .agents/specs/ltx-2-5.md phase L5 and "
+      ".agents/porting-inventory.md 9.18(b).");
+}
+
+const Ltx2MultiModalGuiderParams& Ltx2GuiderParamsForSigma(
+    const std::vector<Ltx2GuiderSigmaBin>& bins, double sigma) {
+  Require(!bins.empty(), "ltx2 guider factory: params_by_sigma must be non-empty");
+  // guiders.py:226-230. Keys sorted DESCENDING; the bin is the smallest key that
+  // is still >= sigma, and a sigma above every key falls back to the largest.
+  // Sorting here rather than trusting the caller mirrors `from_dict` (:329).
+  const Ltx2GuiderSigmaBin* largest = &bins[0];
+  const Ltx2GuiderSigmaBin* chosen = nullptr;
+  for (const Ltx2GuiderSigmaBin& bin : bins) {
+    if (bin.sigma_upper_bound > largest->sigma_upper_bound) largest = &bin;
+    if (bin.sigma_upper_bound >= sigma) {
+      if (chosen == nullptr || bin.sigma_upper_bound < chosen->sigma_upper_bound) chosen = &bin;
+    }
+  }
+  return chosen != nullptr ? chosen->params : largest->params;
+}
+
+// ---------------------------------------------------------------------------
+// Perturbations
+// ---------------------------------------------------------------------------
+
+bool Ltx2PerturbationConfig::IsPerturbed(Ltx2PerturbationType type, int64_t block) const {
+  for (const Ltx2Perturbation& perturbation : perturbations) {
+    if (perturbation.type != type) continue;
+    if (perturbation.all_blocks) return true;
+    if (std::find(perturbation.blocks.begin(), perturbation.blocks.end(), block) !=
+        perturbation.blocks.end()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Ltx2BatchedPerturbationConfig::Ltx2BatchedPerturbationConfig(
+    const std::vector<Ltx2PerturbationConfig>& configs, int64_t num_blocks)
+    : batch_(static_cast<int64_t>(configs.size())), num_blocks_(num_blocks) {
+  // perturbations.py:77-84 — [type, block, sample], 1 = KEEP.
+  masks_.assign(static_cast<size_t>(kLtx2PerturbationTypeCount * num_blocks * batch_), 1);
+  for (int64_t direction = 0; direction < kLtx2PerturbationTypeCount; ++direction) {
+    for (int64_t block = 0; block < num_blocks; ++block) {
+      for (int64_t sample = 0; sample < batch_; ++sample) {
+        const bool perturbed = configs[static_cast<size_t>(sample)].IsPerturbed(
+            static_cast<Ltx2PerturbationType>(direction), block);
+        masks_[static_cast<size_t>((direction * num_blocks + block) * batch_ + sample)] =
+            perturbed ? 0 : 1;
+      }
+    }
+  }
+}
+
+Ltx2BatchedPerturbationConfig Ltx2BatchedPerturbationConfig::Empty(int64_t batch,
+                                                                   int64_t num_blocks) {
+  return Ltx2BatchedPerturbationConfig(
+      std::vector<Ltx2PerturbationConfig>(static_cast<size_t>(batch)), num_blocks);
+}
+
+std::vector<int32_t> Ltx2BatchedPerturbationConfig::Mask(Ltx2PerturbationType type,
+                                                         int64_t block) const {
+  const int64_t base = (static_cast<int64_t>(type) * num_blocks_ + block) * batch_;
+  return std::vector<int32_t>(masks_.begin() + base, masks_.begin() + base + batch_);
+}
+
+bool Ltx2BatchedPerturbationConfig::AnyInBatch(Ltx2PerturbationType type, int64_t block) const {
+  const std::vector<int32_t> mask = Mask(type, block);
+  return std::any_of(mask.begin(), mask.end(), [](int32_t v) { return v == 0; });
+}
+
+bool Ltx2BatchedPerturbationConfig::AllInBatch(Ltx2PerturbationType type, int64_t block) const {
+  const std::vector<int32_t> mask = Mask(type, block);
+  return std::all_of(mask.begin(), mask.end(), [](int32_t v) { return v == 0; });
+}
+
+Ltx2BatchedPerturbationConfig Ltx2BatchedPerturbationConfig::BatchSlice(int64_t start,
+                                                                       int64_t end) const {
+  Require(start >= 0 && end <= batch_ && start <= end,
+          "ltx2 perturbation config: batch slice [" + std::to_string(start) + ", " +
+              std::to_string(end) + ") is outside a batch of " + std::to_string(batch_));
+  Ltx2BatchedPerturbationConfig sliced;
+  sliced.batch_ = end - start;
+  sliced.num_blocks_ = num_blocks_;
+  sliced.masks_.reserve(
+      static_cast<size_t>(kLtx2PerturbationTypeCount * num_blocks_ * sliced.batch_));
+  for (int64_t direction = 0; direction < kLtx2PerturbationTypeCount; ++direction) {
+    for (int64_t block = 0; block < num_blocks_; ++block) {
+      const int64_t base = (direction * num_blocks_ + block) * batch_;
+      for (int64_t sample = start; sample < end; ++sample) {
+        sliced.masks_.push_back(masks_[static_cast<size_t>(base + sample)]);
+      }
+    }
+  }
+  return sliced;
+}
+
+// ---------------------------------------------------------------------------
+// Patchifiers
+// ---------------------------------------------------------------------------
+
+int64_t Ltx2VideoTokenCount(const Ltx2VideoLatentShape& shape, int64_t patch_size) {
+  // patchifiers.py:24-25 — `prod(shape[2:]) // prod(patch_size)`, and the
+  // temporal patch is always 1.
+  return shape.frames * shape.height * shape.width / (patch_size * patch_size);
+}
+
+namespace {
+
+void RequireVideoGeometry(const Ltx2VideoLatentShape& shape, int64_t patch_size) {
+  Require(patch_size >= 1, "ltx2 video patchifier: patch_size must be >= 1");
+  Require(shape.height % patch_size == 0 && shape.width % patch_size == 0,
+          "ltx2 video patchifier: height " + std::to_string(shape.height) + " and width " +
+              std::to_string(shape.width) + " must both be divisible by patch_size " +
+              std::to_string(patch_size));
+}
+
+}  // namespace
+
+std::vector<float> Ltx2VideoPatchify(const float* latent, const Ltx2VideoLatentShape& shape,
+                                     int64_t patch_size) {
+  RequireVideoGeometry(shape, patch_size);
+  const int64_t gh = shape.height / patch_size;
+  const int64_t gw = shape.width / patch_size;
+  const int64_t tokens = shape.frames * gh * gw;
+  const int64_t token_dim = shape.channels * patch_size * patch_size;
+  std::vector<float> out(static_cast<size_t>(shape.batch * tokens * token_dim));
+
+  // `b c (f p1) (h p2) (w p3) -> b (f h w) (c p1 p2 p3)` with p1 == 1.
+  for (int64_t b = 0; b < shape.batch; ++b) {
+    for (int64_t f = 0; f < shape.frames; ++f) {
+      for (int64_t h = 0; h < gh; ++h) {
+        for (int64_t w = 0; w < gw; ++w) {
+          const int64_t token = (f * gh + h) * gw + w;
+          for (int64_t c = 0; c < shape.channels; ++c) {
+            for (int64_t p2 = 0; p2 < patch_size; ++p2) {
+              for (int64_t p3 = 0; p3 < patch_size; ++p3) {
+                const int64_t feature = (c * patch_size + p2) * patch_size + p3;
+                const int64_t src =
+                    (((b * shape.channels + c) * shape.frames + f) * shape.height +
+                     h * patch_size + p2) *
+                        shape.width +
+                    w * patch_size + p3;
+                out[static_cast<size_t>((b * tokens + token) * token_dim + feature)] =
+                    latent[src];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<float> Ltx2VideoUnpatchify(const float* tokens, const Ltx2VideoLatentShape& shape,
+                                       int64_t patch_size) {
+  RequireVideoGeometry(shape, patch_size);
+  const int64_t gh = shape.height / patch_size;
+  const int64_t gw = shape.width / patch_size;
+  const int64_t token_count = shape.frames * gh * gw;
+  const int64_t token_dim = shape.channels * patch_size * patch_size;
+  std::vector<float> out(
+      static_cast<size_t>(shape.batch * shape.channels * shape.frames * shape.height *
+                          shape.width));
+
+  // `b (f h w) (c p q) -> b c f (h p) (w q)`. `p` takes HEIGHT and `q` takes
+  // WIDTH; they are not interchangeable (ops.py's unpatchify makes the same
+  // mistake available with r and q).
+  for (int64_t b = 0; b < shape.batch; ++b) {
+    for (int64_t f = 0; f < shape.frames; ++f) {
+      for (int64_t h = 0; h < gh; ++h) {
+        for (int64_t w = 0; w < gw; ++w) {
+          const int64_t token = (f * gh + h) * gw + w;
+          for (int64_t c = 0; c < shape.channels; ++c) {
+            for (int64_t p = 0; p < patch_size; ++p) {
+              for (int64_t q = 0; q < patch_size; ++q) {
+                const int64_t feature = (c * patch_size + p) * patch_size + q;
+                const int64_t dst =
+                    (((b * shape.channels + c) * shape.frames + f) * shape.height +
+                     h * patch_size + p) *
+                        shape.width +
+                    w * patch_size + q;
+                out[static_cast<size_t>(dst)] =
+                    tokens[(b * token_count + token) * token_dim + feature];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<int64_t> Ltx2VideoPatchBounds(const Ltx2VideoLatentShape& shape,
+                                          int64_t patch_size) {
+  RequireVideoGeometry(shape, patch_size);
+  Require(shape.frames > 0 && shape.height > 0 && shape.width > 0 && shape.batch > 0,
+          "ltx2 video patchifier: frames, height, width and batch must all be positive");
+  const int64_t gh = shape.height / patch_size;
+  const int64_t gw = shape.width / patch_size;
+  const int64_t tokens = shape.frames * gh * gw;
+  // [batch, 3, tokens, 2], axis order (frame, height, width).
+  std::vector<int64_t> out(static_cast<size_t>(shape.batch * 3 * tokens * 2));
+  const int64_t sizes[3] = {1, patch_size, patch_size};
+
+  for (int64_t f = 0; f < shape.frames; ++f) {
+    for (int64_t h = 0; h < gh; ++h) {
+      for (int64_t w = 0; w < gw; ++w) {
+        const int64_t token = (f * gh + h) * gw + w;
+        const int64_t starts[3] = {f, h * patch_size, w * patch_size};
+        for (int64_t axis = 0; axis < 3; ++axis) {
+          for (int64_t b = 0; b < shape.batch; ++b) {
+            const size_t base = static_cast<size_t>(((b * 3 + axis) * tokens + token) * 2);
+            out[base] = starts[axis];
+            out[base + 1] = starts[axis] + sizes[axis];
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<int64_t> Ltx2PixelCoords(const std::vector<int64_t>& latent_coords, int64_t batch,
+                                     int64_t tokens, const Ltx2ScaleFactors& factors,
+                                     bool causal_fix) {
+  Require(latent_coords.size() == static_cast<size_t>(batch * 3 * tokens * 2),
+          "ltx2 pixel coords: latent_coords must be [batch, 3, tokens, 2]");
+  const int64_t scale[3] = {factors.time, factors.height, factors.width};
+  std::vector<int64_t> out(latent_coords.size());
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t axis = 0; axis < 3; ++axis) {
+      for (int64_t t = 0; t < tokens * 2; ++t) {
+        const size_t index = static_cast<size_t>(((b * 3 + axis) * tokens * 2) + t);
+        int64_t value = latent_coords[index] * scale[axis];
+        // patchifiers.py:166-169 — the TEMPORAL axis only, and clamped at 0. The
+        // VAE's stride for the very first frame is 1, not `time`.
+        if (causal_fix && axis == 0) value = std::max<int64_t>(value + 1 - factors.time, 0);
+        out[index] = value;
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<float> Ltx2AudioPatchify(const float* latent, const Ltx2AudioLatentShape& shape) {
+  // `b c t f -> b t (c f)`.
+  const int64_t token_dim = shape.channels * shape.mel_bins;
+  std::vector<float> out(static_cast<size_t>(shape.batch * shape.frames * token_dim));
+  for (int64_t b = 0; b < shape.batch; ++b) {
+    for (int64_t t = 0; t < shape.frames; ++t) {
+      for (int64_t c = 0; c < shape.channels; ++c) {
+        for (int64_t f = 0; f < shape.mel_bins; ++f) {
+          const int64_t src = ((b * shape.channels + c) * shape.frames + t) * shape.mel_bins + f;
+          out[static_cast<size_t>((b * shape.frames + t) * token_dim + c * shape.mel_bins + f)] =
+              latent[src];
+        }
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<float> Ltx2AudioUnpatchify(const float* tokens, const Ltx2AudioLatentShape& shape) {
+  const int64_t token_dim = shape.channels * shape.mel_bins;
+  std::vector<float> out(
+      static_cast<size_t>(shape.batch * shape.channels * shape.frames * shape.mel_bins));
+  for (int64_t b = 0; b < shape.batch; ++b) {
+    for (int64_t t = 0; t < shape.frames; ++t) {
+      for (int64_t c = 0; c < shape.channels; ++c) {
+        for (int64_t f = 0; f < shape.mel_bins; ++f) {
+          const int64_t dst = ((b * shape.channels + c) * shape.frames + t) * shape.mel_bins + f;
+          out[static_cast<size_t>(dst)] =
+              tokens[(b * shape.frames + t) * token_dim + c * shape.mel_bins + f];
+        }
+      }
+    }
+  }
+  return out;
+}
+
+std::vector<float> Ltx2AudioPatchTimings(const Ltx2AudioLatentShape& shape,
+                                         const Ltx2AudioPatchifierParams& params) {
+  // _get_audio_latent_time_in_sec (patchifiers.py:216-249), evaluated twice — once
+  // from `shift` and once from `shift + 1` — and stacked into [start, end).
+  auto seconds = [&params](int64_t latent_frame) {
+    float mel = static_cast<float>(latent_frame) *
+                static_cast<float>(params.audio_latent_downsample_factor);
+    if (params.is_causal) {
+      // The "+1" is what makes the timestamp the first FULLY available sample.
+      mel = std::max(mel + 1.0f - static_cast<float>(params.audio_latent_downsample_factor),
+                     0.0f);
+    }
+    return mel * static_cast<float>(params.hop_length) / static_cast<float>(params.sample_rate);
+  };
+
+  // [batch, 1, frames, 2].
+  std::vector<float> out(static_cast<size_t>(shape.batch * shape.frames * 2));
+  for (int64_t b = 0; b < shape.batch; ++b) {
+    for (int64_t t = 0; t < shape.frames; ++t) {
+      const size_t base = static_cast<size_t>((b * shape.frames + t) * 2);
+      out[base] = seconds(params.shift + t);
+      out[base + 1] = seconds(params.shift + 1 + t);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// The recipes
+// ---------------------------------------------------------------------------
+
+std::vector<int64_t> Ltx2ParseModelVersion(const std::string& version) {
+  // loader/helpers.py:74-81. Parsing stops at the first dot-separated component
+  // that is not a plain integer, so "2.3.rc1" is (2, 3) and "banana" is {}.
+  std::vector<int64_t> parts;
+  if (version.empty()) return parts;
+  size_t start = 0;
+  while (start <= version.size()) {
+    const size_t dot = version.find('.', start);
+    const std::string part =
+        version.substr(start, dot == std::string::npos ? std::string::npos : dot - start);
+    if (part.empty() ||
+        !std::all_of(part.begin(), part.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) {
+      break;
+    }
+    parts.push_back(std::stoll(part));
+    if (dot == std::string::npos) break;
+    start = dot + 1;
+  }
+  return parts;
+}
+
+Ltx2PipelineParams Ltx2Params20() {
+  // utils/constants.py:40-80 (PipelineParams' own defaults).
+  Ltx2PipelineParams params;
+  params.video_guider.cfg_scale = 3.0;
+  params.video_guider.stg_scale = 1.0;
+  params.video_guider.rescale_scale = 0.7;
+  params.video_guider.modality_scale = 3.0;
+  params.video_guider.skip_step = 0;
+  params.video_guider.stg_blocks = {29};
+  params.audio_guider.cfg_scale = 7.0;
+  params.audio_guider.stg_scale = 1.0;
+  params.audio_guider.rescale_scale = 0.7;
+  params.audio_guider.modality_scale = 3.0;
+  params.audio_guider.skip_step = 0;
+  params.audio_guider.stg_blocks = {29};
+  return params;
+}
+
+Ltx2PipelineParams Ltx2Params23() {
+  // utils/constants.py:83-88 — 2.0's params with 30 steps and STG on block 28.
+  Ltx2PipelineParams params = Ltx2Params20();
+  params.num_inference_steps = 30;
+  params.video_guider.stg_blocks = {28};
+  params.audio_guider.stg_blocks = {28};
+  return params;
+}
+
+Ltx2PipelineParams Ltx2Params24() {
+  // utils/constants.py:124 — 2.3's lineage, moving only the image CRF. Deriving
+  // it from 2.0 instead would silently hand a 2.4 checkpoint the 2.0 step count
+  // and STG block, which upstream's comment calls out explicitly.
+  Ltx2PipelineParams params = Ltx2Params23();
+  params.default_image_crf = 18;
+  return params;
+}
+
+Ltx2PipelineParams Ltx2Params23Hq() {
+  // utils/constants.py:95-115. A plain constant upstream, not a `replace` of
+  // anything: it overrides every knob that varies between generations.
+  Ltx2PipelineParams params;
+  params.num_inference_steps = 15;
+  params.stage_1_height = 1088 / 2;
+  params.stage_1_width = 1920 / 2;
+  params.video_guider.cfg_scale = 3.0;
+  params.video_guider.stg_scale = 0.0;
+  params.video_guider.rescale_scale = 0.45;
+  params.video_guider.modality_scale = 3.0;
+  params.video_guider.skip_step = 0;
+  params.video_guider.stg_blocks = {};
+  params.audio_guider.cfg_scale = 7.0;
+  params.audio_guider.stg_scale = 0.0;
+  params.audio_guider.rescale_scale = 1.0;
+  params.audio_guider.modality_scale = 3.0;
+  params.audio_guider.skip_step = 0;
+  params.audio_guider.stg_blocks = {};
+  return params;
+}
+
+Ltx2PipelineParams Ltx2DetectPipelineParams(const std::string& version) {
+  // utils/constants.py:130-179 — the newest generation the version is at or
+  // above, so an unrecognised NEWER version inherits the closest known one
+  // instead of falling back to 2.0. This is what gives LTX-2.5 the 2.4 params.
+  const std::vector<int64_t> parsed =
+      Ltx2ParseModelVersion(NormalizeVersionSeparator(version));
+  if (CompareVersion(parsed, {2, 4}) >= 0) return Ltx2Params24();
+  if (CompareVersion(parsed, {2, 3}) >= 0) return Ltx2Params23();
+  return Ltx2Params20();
+}
+
+bool Ltx2ShouldUseAncestralSampler(const std::string& version) {
+  // distilled.py:76-84, through `detect_model_version`'s separator normalization.
+  const std::vector<int64_t> parsed =
+      Ltx2ParseModelVersion(NormalizeVersionSeparator(version));
+  return CompareVersion(parsed, {kLtx2AncestralSinceMajor, kLtx2AncestralSinceMinor}) >= 0;
+}
+
+int64_t Ltx2PhaseRecipe::num_inference_steps() const {
+  // ltx2_recipes.py:48-50 — `None` when the schedule is not explicit.
+  return sigmas.empty() ? -1 : static_cast<int64_t>(sigmas.size()) - 1;
+}
+
+int64_t Ltx2PipelineRecipe::max_spatial_downscale() const {
+  int64_t worst = 1;
+  for (const Ltx2PhaseRecipe& phase : phases) {
+    worst = std::max(worst, phase.spatial_downscale);
+  }
+  return worst;
+}
+
+namespace {
+
+// vLLM-Omni's LTX_DEFAULT_NEGATIVE_PROMPT (ltx2_recipes.py:11-23).
+const char* const kOmniNegativePrompt =
+    "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, "
+    "excessive noise, grainy texture, poor lighting, flickering, motion blur, distorted "
+    "proportions, unnatural skin tones, deformed facial features, asymmetrical face, missing "
+    "facial features, extra limbs, disfigured hands, wrong hand count, artifacts around text, "
+    "inconsistent perspective, camera shake, incorrect depth of field, background too sharp, "
+    "background clutter, distracting reflections, harsh shadows, inconsistent lighting "
+    "direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, "
+    "uncanny valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong "
+    "gaze direction, mismatched lip sync, silent or muted audio, distorted voice, robotic "
+    "voice, echo, background noise, off-sync audio, incorrect dialogue, added dialogue, "
+    "repetitive speech, jittery movement, awkward pauses, incorrect timing, unnatural "
+    "transitions, inconsistent framing, tilted camera, flat lighting, inconsistent tone, "
+    "cinematic oversaturation, stylized filters, or AI artifacts.";
+
+// Lightricks' DEFAULT_NEGATIVE_PROMPT (utils/constants.py:186-199). It is
+// vLLM-Omni's with FIVE leading tags the other lacks. The two references
+// disagree; spec section 3 says the disagreement is the finding, so both are
+// kept and each recipe row takes its own source's value.
+const char* const kLightricksNegativePromptPrefix =
+    "has_subtitles, has_blurbox, transition from black, transition to black, "
+    "speech_ending_short, ";
+
+std::string LightricksNegativePrompt() {
+  return std::string(kLightricksNegativePromptPrefix) + kOmniNegativePrompt;
+}
+
+// utils/constants.py:17-23 / ltx2_recipes.py:25-26. Both references carry these
+// byte-for-byte; the suite asserts that agreement rather than assuming it.
+const std::vector<float>& DistilledSigmas() {
+  static const std::vector<float> sigmas = {1.0f,      0.99375f, 0.9875f,   0.98125f, 0.975f,
+                                            0.909375f, 0.725f,   0.421875f, 0.0f};
+  return sigmas;
+}
+const std::vector<float>& Stage2DistilledSigmas() {
+  static const std::vector<float> sigmas = {0.909375f, 0.725f, 0.421875f, 0.0f};
+  return sigmas;
+}
+
+// `_official_guidance` (ltx2_recipes.py:90-106) built from a resolved
+// PipelineParams, so the one_stage rows and the Lightricks constants cannot
+// drift apart.
+Ltx2PhaseRecipe OneStagePhase(const Ltx2PipelineParams& params) {
+  Ltx2PhaseRecipe phase;
+  phase.name = "generate";
+  phase.video_guidance = params.video_guider;
+  phase.audio_guidance = params.audio_guider;
+  return phase;
+}
+
+Ltx2PipelineRecipe OneStageRecipe(const Ltx2PipelineParams& params,
+                                  const std::string& negative_prompt) {
+  Ltx2PipelineRecipe recipe;
+  recipe.phases = {OneStagePhase(params)};
+  recipe.height = params.stage_1_height;
+  recipe.width = params.stage_1_width;
+  recipe.num_frames = params.num_frames;
+  recipe.frame_rate = params.frame_rate;
+  recipe.num_inference_steps = params.num_inference_steps;
+  recipe.default_image_crf = params.default_image_crf;
+  recipe.negative_prompt = negative_prompt;
+  return recipe;
+}
+
+// LTX_POSITIVE_ONLY_RECIPE (ltx2_recipes.py:116-124): every guidance knob at its
+// no-op value, and the official sigma schedule turned OFF.
+Ltx2PipelineRecipe PositiveOnlyRecipe() {
+  Ltx2PipelineRecipe recipe;
+  Ltx2PhaseRecipe phase;
+  phase.name = "generate";
+  phase.use_official_sigma_schedule = false;
+  recipe.phases = {phase};
+  recipe.negative_prompt = kOmniNegativePrompt;
+  return recipe;
+}
+
+// LTX2_DISTILLED_TWO_STAGE_RECIPE (ltx2_recipes.py:125-158), plus — for
+// generation 2.5 and later — `should_use_ancestral_sampler` (distilled.py:76-84),
+// which is the SINGLE thing distilled.py changes for 2.5.
+Ltx2PipelineRecipe DistilledTwoStageRecipe(const std::string& version) {
+  Ltx2PipelineRecipe recipe;
+  const Ltx2PipelineParams params = Ltx2DetectPipelineParams(version);
+
+  Ltx2PhaseRecipe stage1;
+  stage1.name = "generate_lowres";
+  stage1.spatial_downscale = 2;
+  stage1.sigmas = DistilledSigmas();
+  stage1.noise_scale = 1.0;
+  stage1.allow_guidance_override = false;
+  stage1.use_official_sigma_schedule = false;
+  if (Ltx2ShouldUseAncestralSampler(version)) {
+    stage1.stepper = Ltx2StepperKind::kEulerAncestral;
+    stage1.stepper_eta = kLtx2AncestralEta;
+    stage1.stepper_s_noise = kLtx2AncestralSNoise;
+    stage1.noise_seed_offset = kLtx2AncestralNoiseSeedOffset;
+  }
+
+  Ltx2PhaseRecipe stage2;
+  stage2.name = "refine";
+  stage2.sigmas = Stage2DistilledSigmas();
+  // ltx2_recipes.py:146 / distilled.py:305 — stage 2 re-noises to its OWN first
+  // sigma, which is what makes the upsampled latent valid at that noise level.
+  stage2.noise_scale = Stage2DistilledSigmas().front();
+  stage2.input_transform = Ltx2PhaseInputTransform::kSpatialUpsample;
+  stage2.allow_guidance_override = false;
+  stage2.use_official_sigma_schedule = false;
+  // Always deterministic: a 3-step refinement cannot remove freshly injected
+  // noise (distilled.py:206-209).
+  stage2.stepper = Ltx2StepperKind::kEuler;
+
+  recipe.phases = {stage1, stage2};
+  // The distilled arguments describe the FINAL output; stage 1 runs at half.
+  recipe.height = params.stage_2_height();
+  recipe.width = params.stage_2_width();
+  recipe.num_frames = params.num_frames;
+  recipe.frame_rate = params.frame_rate;
+  recipe.num_inference_steps = static_cast<int64_t>(DistilledSigmas().size()) - 1;
+  recipe.default_image_crf = params.default_image_crf;
+  recipe.negative_prompt = "";
+  recipe.video_output_phase = 1;
+  recipe.audio_output_phase = 1;
+  recipe.allow_request_sigmas = false;
+  recipe.allow_request_latents = false;
+  recipe.allow_negative_prompt = false;
+  recipe.fixed_num_inference_steps = true;
+  return recipe;
+}
+
+}  // namespace
+
+Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
+                                             const std::string& model_version) {
+  // Keyed on the EXACT pair, never defaulted — see the header. Rows sourced from
+  // vLLM-Omni carry its negative prompt; the 2.4 / 2.5 rows are Lightricks' and
+  // carry Lightricks'.
+  if (pipeline_kind == "one_stage") {
+    if (model_version == "2") return OneStageRecipe(Ltx2Params20(), kOmniNegativePrompt);
+    if (model_version == "2.3") return OneStageRecipe(Ltx2Params23(), kOmniNegativePrompt);
+    if (model_version == "2.4") {
+      return OneStageRecipe(Ltx2DetectPipelineParams("2.4"), LightricksNegativePrompt());
+    }
+    if (model_version == "2.5") {
+      return OneStageRecipe(Ltx2DetectPipelineParams("2.5"), LightricksNegativePrompt());
+    }
+  } else if (pipeline_kind == "distilled_two_stage") {
+    if (model_version == "2" || model_version == "2.5") {
+      return DistilledTwoStageRecipe(model_version);
+    }
+  } else if (pipeline_kind == "dmd2") {
+    if (model_version == "2" || model_version == "2.3") return PositiveOnlyRecipe();
+  }
+  Refuse("Unsupported LTX pipeline kind/version: '" + pipeline_kind + "'/'" + model_version +
+         "'. Recipes are resolved from an EXACT (kind, version) table "
+         "(vllm_omni/diffusion/models/ltx2/ltx2_recipes.py:170-175) and never defaulted: a "
+         "plausible-but-wrong sigma schedule or guidance scale renders a video rather than "
+         "failing.");
+}
+
+void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature) {
+  const std::string owed =
+      " Not ported by phase L5; recorded as owed in .agents/specs/ltx-2-5.md.";
+  switch (feature) {
+    case Ltx2UnportedPipelineFeature::kTemporalUpsampler:
+      Refuse("ltx2: the temporal x2 latent upsampler (model/upsampler/model.py:55-72, "
+             "temporal_upsample=True) is out of scope." +
+             owed);
+    case Ltx2UnportedPipelineFeature::kLoraFusion:
+      Refuse("ltx2: LoRA fusion (loader/LoraPathStrengthAndSDOps) is out of scope." + owed);
+    case Ltx2UnportedPipelineFeature::kMultishot:
+      Refuse("ltx2: multishot generation is out of scope." + owed);
+    case Ltx2UnportedPipelineFeature::kInt8ConvRot:
+      Refuse("ltx2: the int8-convrot quantization (ComfyUI-only) is out of scope." + owed);
+    case Ltx2UnportedPipelineFeature::kCfgParallelism:
+      Refuse("ltx2: CFG / multi-GPU parallelism (ltx-pipelines/multigpu) is out of scope." +
+             owed);
+    case Ltx2UnportedPipelineFeature::kVideoEngineWiring:
+      Refuse("ltx2: end-to-end wiring through vllm::multimodal::VideoEngine is phase L7, not "
+             "L5." +
+             owed);
+    case Ltx2UnportedPipelineFeature::kBetaScheduler:
+      Refuse("ltx2: BetaScheduler (components/schedulers.py:91-120) is not ported. It inverts "
+             "a Beta CDF through scipy.stats.beta.ppf, and no ltx-pipelines entry point "
+             "constructs it." +
+             owed);
+  }
+  Refuse("ltx2: unknown unported pipeline feature." + owed);
+}
+
+}  // namespace vllm

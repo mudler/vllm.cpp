@@ -46,6 +46,7 @@
 #include "minimax_h3_video_vae_goldens.inc"
 #include "minimax_h3_encoder_goldens.inc"
 
+#include "support/max_abs_diff.h"
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
@@ -139,15 +140,11 @@ vt::Tensor View2D(std::vector<float>& buffer, int64_t rows, int64_t cols) {
   return vt::Tensor::Contiguous(buffer.data(), vt::DType::kF32, Cpu(), {rows, cols});
 }
 
-// Max absolute difference against a golden array.
-double MaxAbsDiff(const std::vector<float>& got, const float* want, size_t count) {
-  REQUIRE(got.size() == count);
-  double worst = 0.0;
-  for (size_t i = 0; i < count; ++i) {
-    worst = std::max(worst, std::abs(static_cast<double>(got[i]) - static_cast<double>(want[i])));
-  }
-  return worst;
-}
+// Max absolute difference against a golden array — the shared, NaN-hardened
+// reduction. The local copy this replaces used `std::max(worst, ...)`, which is
+// `a < b ? b : a`; `a < NaN` is false, so an all-NaN result against a correct
+// golden reduced to 0.0 and passed every bound (issue #449).
+using vllm_test::MaxAbsDiff;
 
 template <typename T>
 void CheckI64(const std::vector<T>& got, const int64_t* want, size_t count) {

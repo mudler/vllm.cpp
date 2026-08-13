@@ -28,8 +28,9 @@
 //
 // WHAT IS STILL STUBBED: everything else — the whole quant tier, the GDN/MoE/MLA
 // families, MRoPE (rank-2 rope-from-cache positions), and every sampler op except
-// greedy argmax. `vt::GetOp` throws its normal "no kernel for op N on device type
-// 2" for them (a partial backend is a supported, tested state).
+// greedy argmax. `vt::GetOp` throws its normal "no kernel for op <Name> (id N) on
+// device metal (type 2)" for them (a partial backend is a supported, tested
+// state).
 //
 // DISPATCH MODEL (M3c-1): dispatches are BATCHED into one shared command buffer
 // and committed at a flush point, not one buffer per op. See the Batch struct

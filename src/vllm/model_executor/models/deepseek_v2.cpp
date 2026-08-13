@@ -635,10 +635,7 @@ ForwardLogits WrapDeviceLogits(DBuf&& dlogits, int64_t rows, int64_t vocab) {
   fl.rows = rows;
   fl.vocab = vocab;
   fl.device_tensor = dlogits.t();
-  const size_t alloc = dlogits.alloc_bytes();
-  void* p = dlogits.Release();
-  fl.device_storage =
-      std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+  fl.device_storage = dlogits.ReleaseShared();
   return fl;
 }
 

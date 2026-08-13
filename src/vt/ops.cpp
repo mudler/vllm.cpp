@@ -2593,6 +2593,47 @@ void Attention(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
                                                                         value, args);
 }
 
+// Dense non-causal CROSS attention (LTX-2.5 L2). Same validation shape as
+// vt::Attention, MINUS the token-count equality it enforces between query and
+// key/value — that equality is precisely what a cross-attention cannot satisfy.
+void AttentionCross(Queue& q, Tensor& out, const Tensor& query, const Tensor& key,
+                    const Tensor& value, const Tensor* bias, const AttentionCrossArgs& args) {
+  VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
+           "attention_cross: query/key/value/out rank-3 [T,H,D]");
+  const int64_t tq = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t s = key.shape[0], hk = key.shape[1];
+  VT_CHECK(tq > 0 && s > 0, "attention_cross: query and key token counts must be positive");
+  VT_CHECK(value.shape[0] == s, "attention_cross: key/value token counts must match");
+  VT_CHECK(key.shape[2] == d && value.shape[2] == d,
+           "attention_cross: key/value head_dim must match query");
+  VT_CHECK(value.shape[1] == hk, "attention_cross: key/value must share the kv-head count");
+  VT_CHECK(out.shape[0] == tq && out.shape[1] == hq && out.shape[2] == d,
+           "attention_cross: out must be [Tq,Hq,D] matching query");
+  VT_CHECK(hk >= 1 && hq >= 1 && hq % hk == 0,
+           "attention_cross: Hq must be a positive multiple of Hkv (GQA broadcast)");
+  VT_CHECK(args.scale > 0.0f, "attention_cross: scale must be set (> 0), e.g. head_dim^-0.5");
+  VT_CHECK(IsFloat(query.dtype) && key.dtype == query.dtype && value.dtype == query.dtype,
+           "attention_cross: query/key/value must share one float dtype");
+  VT_CHECK(IsOutFloat(out.dtype), "attention_cross: out must be f32 or bf16");
+  VT_CHECK(query.IsContiguous() && key.IsContiguous() && value.IsContiguous() &&
+               out.IsContiguous(),
+           "attention_cross: contiguous tensors required");
+  VT_CHECK(query.device == q.device && key.device == q.device && value.device == q.device &&
+               out.device == q.device,
+           "attention_cross: device mismatch (query/key/value/out/queue)");
+  if (bias != nullptr) {
+    VT_CHECK(bias->rank == 2, "attention_cross: bias must be rank-2 [Tq or 1, S]");
+    VT_CHECK(bias->shape[0] == tq || bias->shape[0] == 1,
+             "attention_cross: bias rows must be Tq or 1 (key-only broadcast)");
+    VT_CHECK(bias->shape[1] == s, "attention_cross: bias columns must equal the key count");
+    VT_CHECK(bias->dtype == DType::kF32, "attention_cross: bias must be f32");
+    VT_CHECK(bias->IsContiguous(), "attention_cross: bias must be contiguous");
+    VT_CHECK(bias->device == q.device, "attention_cross: bias device mismatch");
+  }
+  reinterpret_cast<AttentionCrossFn>(GetOp(OpId::kAttentionCross, q.device.type))(
+      q, out, query, key, value, bias, args);
+}
+
 // --- Conformer / FastConformer audio-encoder kernels (spike P1/P2/P3) --------
 // Upstream mirror: transformers 5.3.0
 // transformers/models/parakeet/modeling_parakeet.py (:357 subsampling Conv2d,

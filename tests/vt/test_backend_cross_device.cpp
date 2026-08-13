@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "support/test_env.h"  // SetEnv/UnsetEnv — MSVC has no setenv (#603)
 #include "vt/backend.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
@@ -1001,7 +1002,7 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
 
   for (int tier : {0, 1}) {
     CAPTURE(tier);
-    setenv("VT_FUSED_TIER", tier == 0 ? "0" : "1", 1);
+    vllm_test::SetEnv("VT_FUSED_TIER", tier == 0 ? "0" : "1");
     // ASSERT the tier actually took effect rather than trusting the log: doctest
     // CAPTURE is lazily stringified, so a mis-set environment would silently
     // run the same path twice and still look like two-tier coverage.
@@ -1045,9 +1046,9 @@ TEST_CASE("FusedChain matches the CPU oracle within NMSE <= 5e-4 (both tiers)") 
   }
 
   if (had_prev) {
-    setenv("VT_FUSED_TIER", saved.c_str(), 1);
+    vllm_test::SetEnv("VT_FUSED_TIER", saved);
   } else {
-    unsetenv("VT_FUSED_TIER");
+    vllm_test::UnsetEnv("VT_FUSED_TIER");
   }
 }
 

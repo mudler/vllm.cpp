@@ -22,6 +22,7 @@
 #include <doctest/doctest.h>
 
 #include <cstring>
+#include <set>
 #include <string>
 
 #include "vt/op_provider.h"
@@ -206,6 +207,33 @@ TEST_CASE("op provider: an unrealized (op, device) still probes false and throws
   // The probe stays false after the throw (the negative resolution is memoized,
   // it is not a one-shot).
   CHECK_FALSE(vt::OpRegistered(OpId::kPagedAttention, DeviceType::kXPU));
+}
+
+// A refusal that says "op 30 on device type 4" makes the reader open the header
+// and count enumerators. Every other refusal in this tree names what it refused;
+// this one is the seam's own, so it is held to the same bar.
+TEST_CASE("op provider: the refusal NAMES the op and the device, not their integers") {
+  std::string msg;
+  try {
+    (void)vt::GetOp(OpId::kMlaPrefillAttention, DeviceType::kXPU);
+    FAIL("an unrealized (op, device) must refuse");
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
+  CHECK(msg.find("MlaPrefillAttention") != std::string::npos);
+  CHECK(msg.find("xpu") != std::string::npos);
+
+  // vt::OpName is TOTAL over the enum: every op has a real name, and no two ops
+  // share one. A missing case would compile to the "unknown" fallthrough and
+  // hand every future reader the same unusable message this case exists to stop.
+  std::set<std::string> seen;
+  for (int i = 0; i < static_cast<int>(OpId::kCount); ++i) {
+    CAPTURE(i);
+    const char* name = vt::OpName(static_cast<OpId>(i));
+    REQUIRE(name != nullptr);
+    CHECK(std::string(name) != "unknown");
+    CHECK(seen.insert(std::string(name)).second);
+  }
 }
 
 TEST_CASE("op provider: the real CPU backend resolves to vt-native") {

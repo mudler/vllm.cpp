@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -135,4 +136,59 @@ TEST_CASE("DequantNvfp4ToBf16 two rows two groups") {
   CHECK(vt::BF16ToF32(out[16]) == doctest::Approx(4.0F));
   // Row 1 elem 0: 4.0 * (1.5 * 2.0) = 12.0
   CHECK(vt::BF16ToF32(out[in_dim + 0]) == doctest::Approx(12.0F));
+}
+
+// --- The NIBBLE ORDER, which is a PRODUCER convention and not a fact about
+// NVFP4. .agents/specs/nvfp4-nibble-order.md.
+//
+// The default is LOW-first: element 2j in the low nibble. That is torchao's
+// `pack_uint4` (torchao/prototype/mx_formats/kernels.py:160,
+// `uint8_data[::2] | uint8_data[1::2] << 4`) and what vLLM's own reader assumes
+// (`break_fp4_bytes`, nvfp4_emulation_utils.py:321-324). Lightricks'
+// `nvfp4-prequant` packs the other way (ltx-kernels/docs/NVFP4.md:27-29), and the
+// H3 community converter does too (minimax_h3.h:1500-1503).
+//
+// WHY THIS NEEDS A GATE AND NOT A COMMENT: reading a file with the wrong order
+// transposes every adjacent pair. Magnitudes, per-group extrema and every
+// summary statistic survive intact — only the POSITIONS move — so nothing
+// downstream can notice. The final CHECK states that blindness outright.
+TEST_CASE("DequantNvfp4ToBf16 nibble order is selectable and defaults to low-first") {
+  // One group. Element 0 = +0.5 (0x1) low, element 1 = +6.0 (0x7) high.
+  std::vector<uint8_t> packed(8, 0x00);
+  packed[0] = 0x71;
+  std::vector<uint8_t> scale = {0x38};  // fp8-e4m3 = 1.0
+  const float ws2 = 1.0F;
+
+  std::vector<uint16_t> lo(16, 0xFFFF), hi(16, 0xFFFF), dflt(16, 0xFFFF);
+  DequantNvfp4ToBf16(packed.data(), scale.data(), ws2, 1, 16, dflt.data());
+  DequantNvfp4ToBf16(packed.data(), scale.data(), ws2, 1, 16, lo.data(),
+                     vllm::Nvfp4NibbleOrder::kLowFirst);
+  DequantNvfp4ToBf16(packed.data(), scale.data(), ws2, 1, 16, hi.data(),
+                     vllm::Nvfp4NibbleOrder::kHighFirst);
+
+  // The DEFAULT must be low-first, bit for bit. This is what makes "every caller
+  // predating the parameter is unchanged" true by construction rather than by
+  // inspection of call sites.
+  CHECK(dflt == lo);
+
+  // Low-first: element 0 is the LOW nibble (0x1 = +0.5).
+  CHECK(vt::BF16ToF32(lo[0]) == doctest::Approx(0.5F));
+  CHECK(vt::BF16ToF32(lo[1]) == doctest::Approx(6.0F));
+  // High-first: element 0 is the HIGH nibble (0x7 = +6.0). Exactly transposed.
+  CHECK(vt::BF16ToF32(hi[0]) == doctest::Approx(6.0F));
+  CHECK(vt::BF16ToF32(hi[1]) == doctest::Approx(0.5F));
+
+  // The two differ ONLY by a pairwise swap, and every element is still present.
+  for (int j = 0; j < 8; ++j) {
+    CHECK(lo[2 * j] == hi[2 * j + 1]);
+    CHECK(lo[2 * j + 1] == hi[2 * j]);
+  }
+
+  // THE BLINDNESS, stated as a gated fact: the two readings are the same multiset,
+  // so no magnitude summary can tell them apart. Anything checking "is the output
+  // finite / correctly scaled / the right absmax" passes under BOTH.
+  std::vector<uint16_t> lo_sorted = lo, hi_sorted = hi;
+  std::sort(lo_sorted.begin(), lo_sorted.end());
+  std::sort(hi_sorted.begin(), hi_sorted.end());
+  CHECK(lo_sorted == hi_sorted);
 }

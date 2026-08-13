@@ -528,11 +528,19 @@ void Tokenizer::FinalizeTables() {
 Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
   std::ifstream in(tokenizer_json_path, std::ios::binary);
   if (!in) Fail("cannot open " + tokenizer_json_path);
+  std::string bytes((std::istreambuf_iterator<char>(in)),
+                    std::istreambuf_iterator<char>());
+  return FromHfJsonBytes(
+      std::string_view(bytes.data(), bytes.size()), tokenizer_json_path);
+}
+
+Tokenizer Tokenizer::FromHfJsonBytes(std::string_view tokenizer_json,
+                                     const std::string& source) {
   json doc;
   try {
-    doc = json::parse(in);
+    doc = json::parse(tokenizer_json);
   } catch (const json::exception& e) {
-    Fail("JSON parse error in " + tokenizer_json_path + ": " + e.what());
+    Fail("JSON parse error in " + source + ": " + e.what());
   }
   if (!doc.is_object()) Fail("top-level JSON is not an object");
 

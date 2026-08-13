@@ -142,6 +142,31 @@ The v4-alias sub-case is SKIPPED-with-reason in `test_deepseek_v3.cpp`
 input strings, non-streaming AND the per-delta streaming reconstruction,
 RED-first.
 
+### Coverage BEYOND upstream in `test_qwen3.cpp` (from scratch, recorded)
+
+Upstream drops nothing here — there is nothing to drop. `test_qwen3_reasoning_parser.py`
+has **no** `is_reasoning_end` case for qwen3 at all (the only one in the suite is
+`test_base_thinking_reasoning_parser.py:111`, for the base family), and its
+`THINKING_DISABLED_CASES` run through the adapter, which suppresses tool parsing.
+Both `Qwen3Parser` overrides therefore sit on branches upstream's own fixtures
+cannot reach, so three TEST_CASEs are written from scratch against the upstream
+SOURCE (`vllm/parser/qwen3.py:247,256-275`, `vllm/parser/seed_oss.py:24-29`):
+
+| our TEST_CASE | pins | mutation that proves it |
+|---|---|---|
+| `engine thinking-off passthrough survives an unskipped tool` | `qwen3.py:247` on the ENGINE, tool parsing NOT suppressed | drop the `extract_reasoning` override (#630) |
+| `is_reasoning_end (text form, incl. unpaired <tool_call>)` | `qwen3.py:256-275`, incl. the reasoning-REOPEN branch — a `<think>` AFTER the tool-call marker, which upstream's backwards walk meets first | drop `qwen3.cpp:55` `ps > p`; only `is_reasoning_end("<tool_call>x<think>y") == false` reds |
+| `seed_oss inherits the qwen3 thinking-off passthrough` | `get_parser_engine("seed_oss")` builds the shared `Qwen3Parser`, mirroring `class SeedOssParser(Qwen3Parser)` | route seed_oss back to a bare `ParserEngine` |
+
+The reopen and seed_oss rows are follow-up to the #630 fresh review's two LOW
+findings; before them, deleting `qwen3.cpp:55` left the focused suite fully green
+(7/7, 157/157), because all four existing tool-call assertions put `<think>`
+BEFORE the `<tool_call>`, where the guard cannot fire. Only the thinking-OFF arm
+can observe the seed_oss class change at all — the sole production call site,
+`OpenAIServingChat::MakeParserEngine` (`serving_chat.cpp:580`), takes the header
+default `thinking=true`, under which the refactor is byte-identical, so the
+production path was never affected.
+
 ## Gates
 
 - CORRECTNESS: doctest parity — each parser's `(reasoning, content)` over the

@@ -220,10 +220,7 @@ ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t voca
   fl.device_tensor = dlogits.t();
   // The pool block's lifetime moves into a shared_ptr whose deleter returns it to
   // the DevicePool — no per-step cudaMalloc/cudaFree (mirrors qwen3.cpp).
-  const size_t alloc = dlogits.alloc_bytes();
-  void* p = dlogits.Release();
-  fl.device_storage =
-      std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+  fl.device_storage = dlogits.ReleaseShared();
   (void)d;
   return fl;
 }

@@ -1722,6 +1722,202 @@ TEST_CASE("capi v12: video argument contract") {
   vllm_video_mux_argv_free(nullptr, 3);  // no-op
 }
 
+// ─── ABI v18: the generalized video seam (LTX-2.5 L1, issue #435) ────────────
+// The v12 cases above are the byte-identity guard: they drive the SAME zeroed
+// structs a v12 caller does, and they still reach the H3 goldens. These cases
+// gate the ADDITIONS — the family selector, the extras arrays, and the refusals
+// that keep "detect" from decaying into "guess".
+
+TEST_CASE("capi v18: the added fields default to detect/none") {
+  const vllm_video_model_params mp = vllm_video_model_params_default();
+  CHECK(mp.family == nullptr);  // NULL => detect from the checkpoint
+  CHECK(mp.extra_keys == nullptr);
+  CHECK(mp.extra_values == nullptr);
+  CHECK(mp.n_extras == 0);
+
+  const vllm_video_params vp = vllm_video_params_default();
+  CHECK(vp.extra_keys == nullptr);
+  CHECK(vp.extra_values == nullptr);
+  CHECK(vp.n_extras == 0);
+
+  CHECK(vllm_video_engine_family(nullptr) == nullptr);
+}
+
+TEST_CASE("capi v18: a v12 zeroed load DETECTS minimax-h3") {
+  VideoFoldWorkspace ws;
+  VideoFixtureParams fp(ws.fixture);  // family NULL, n_extras 0 — the v12 shape
+  vllm_video_engine* eng = nullptr;
+  REQUIRE_MESSAGE(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK, vllm_last_error());
+  REQUIRE(eng != nullptr);
+  REQUIRE(vllm_video_engine_family(eng) != nullptr);
+  CHECK(std::string(vllm_video_engine_family(eng)) == "minimax-h3");
+  vllm_video_engine_free(eng);
+}
+
+TEST_CASE("capi v18: an EXPLICIT family selector loads, an unregistered one is refused") {
+  VideoFoldWorkspace ws;
+  vllm_video_engine* eng = nullptr;
+
+  VideoFixtureParams declared(ws.fixture);
+  declared.mp.family = "minimax-h3";
+  REQUIRE_MESSAGE(vllm_video_engine_load(&declared.mp, &eng) == VLLM_OK, vllm_last_error());
+  CHECK(std::string(vllm_video_engine_family(eng)) == "minimax-h3");
+  vllm_video_engine_free(eng);
+
+  // An unregistered name is REFUSED naming what is registered — never treated
+  // as a hint and never detected around.
+  //
+  // THE NAME MUST BE ONE THAT CANNOT BECOME REGISTERED. This case was written at
+  // L1 against "ltx-2.5" while H3 was the only family, and phase L7 registered
+  // exactly that name: the load then resolved to the LTX loader, which failed on
+  // an H3 fixture, so the unregistered-family branch under test was never taken
+  // at all. Note how it failed — the "ltx-2.5" assertion kept PASSING the whole
+  // time, matching the LTX loader's own failure text rather than a registry
+  // listing. A test whose premise can expire is a test that goes green for the
+  // wrong reason first and red second. Its C++-seam twin
+  // (test_video_engine.cpp, "an unknown family names what was asked and what
+  // exists") was repaired at L7; this C-ABI copy was missed because the phase
+  // baselines ran `test_capi -tc='capi v12*'` and never executed the v18 section.
+  VideoFixtureParams unknown(ws.fixture);
+  unknown.mp.family = "not-a-video-family";
+  eng = reinterpret_cast<vllm_video_engine*>(0x1);
+  CHECK(vllm_video_engine_load(&unknown.mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  const std::string refusal = vllm_last_error();
+  INFO("refusal: ", refusal);
+  CHECK(refusal.find("not-a-video-family") != std::string::npos);
+  // Pin the BRANCH, not just the words in it. Without this the case cannot tell
+  // "the registry refused an unregistered name" from "a family loader was
+  // reached and threw", which is precisely the confusion that let the premise
+  // above rot undetected: a name that quietly becomes registered now fails here,
+  // naming the reason, instead of passing on a loader's error text.
+  CHECK(refusal.find("no family named") != std::string::npos);
+  // EVERY registered family is listed, not just the first. That is a stronger
+  // guarantee than this case could state at L1 with one family registered: a
+  // refusal is how a caller learns what it could have asked for instead, so one
+  // that named only some of the registry would send them away from a family that
+  // would have loaded their checkpoint.
+  CHECK(refusal.find("minimax-h3") != std::string::npos);
+  CHECK(refusal.find("ltx-2.5") != std::string::npos);
+}
+
+TEST_CASE("capi v18: an unrecognizable checkpoint is refused, and no family is guessed") {
+  VideoFoldWorkspace ws;
+  // A real safetensors file that is a VAE, not a DiT: readable, well-formed, and
+  // carrying no family's DiT signature, so ZERO detectors claim it.
+  //
+  // This case read "not handed to the ONLY family" at L1, when H3 was the sole
+  // registrant and the hazard was the "there is only one, so it must be that
+  // one" fallback. Phase L7 registered a second family, which makes that exact
+  // fallback unreachable in this binary — so the old title now overstates what
+  // the case can prove. What it still gates, and what it is renamed to state, is
+  // the zero-claimant refusal itself: nothing is loaded, and the message carries
+  // both halves a caller needs — the artifact that was inspected and the whole
+  // registry it failed to match.
+  const std::string not_a_dit = ws.fixture + "/video_vae.safetensors";
+  vllm_video_model_params mp = vllm_video_model_params_default();
+  mp.dit_path = not_a_dit.c_str();
+  vllm_video_engine* eng = reinterpret_cast<vllm_video_engine*>(0x1);
+  CHECK(vllm_video_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  const std::string refusal = vllm_last_error();
+  INFO("refusal: ", refusal);
+  CHECK(refusal.find("video_vae.safetensors") != std::string::npos);
+  // Both registered families, for the same reason as the case above: the listing
+  // is the caller's only route out of the refusal.
+  CHECK(refusal.find("minimax-h3") != std::string::npos);
+  CHECK(refusal.find("ltx-2.5") != std::string::npos);
+}
+
+TEST_CASE("capi v18: the extras arrays carry the family knob, and disagreement is refused") {
+  VideoFoldWorkspace ws;
+  const char* keys[] = {"partition"};
+
+  SUBCASE("the partition arrives through extras alone and still guards") {
+    const char* values[] = {"ref2va"};
+    VideoFixtureParams fp(ws.fixture);
+    fp.mp.partition = nullptr;  // ONLY the extra declares it
+    fp.mp.extra_keys = keys;
+    fp.mp.extra_values = values;
+    fp.mp.n_extras = 1;
+    vllm_video_engine* eng = nullptr;
+    REQUIRE_MESSAGE(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK, vllm_last_error());
+    const std::string out_dir = ws.root + "/out";
+    vllm_video_params vp = vllm_video_params_default();
+    vp.num_frames = 5;
+    vp.height = 32;
+    vp.width = 32;
+    vp.steps = 3;
+    vp.output_dir = out_dir.c_str();
+    vllm_video_result out;
+    CHECK(vllm_video_generate(eng, &vp, &out) == VLLM_ERR_RUNTIME);
+    CHECK(std::string(vllm_last_error()).find("ref2va") != std::string::npos);
+    vllm_video_engine_free(eng);
+  }
+
+  SUBCASE("the v12 field and an AGREEING extra are accepted") {
+    const char* values[] = {"fl2va"};
+    VideoFixtureParams fp(ws.fixture);  // its .partition is already "fl2va"
+    fp.mp.extra_keys = keys;
+    fp.mp.extra_values = values;
+    fp.mp.n_extras = 1;
+    vllm_video_engine* eng = nullptr;
+    CHECK(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK);
+    vllm_video_engine_free(eng);
+  }
+
+  SUBCASE("the v12 field and a DISAGREEING extra are refused, not silently resolved") {
+    const char* values[] = {"ref2va"};
+    VideoFixtureParams fp(ws.fixture);  // .partition == "fl2va"
+    fp.mp.extra_keys = keys;
+    fp.mp.extra_values = values;
+    fp.mp.n_extras = 1;
+    vllm_video_engine* eng = reinterpret_cast<vllm_video_engine*>(0x1);
+    CHECK(vllm_video_engine_load(&fp.mp, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+    CHECK(eng == nullptr);
+    CHECK(std::string(vllm_last_error()).find("disagree") != std::string::npos);
+  }
+
+  SUBCASE("malformed extras arrays are a caller error, never a read past the end") {
+    VideoFixtureParams fp(ws.fixture);
+    fp.mp.n_extras = 1;  // ...with NULL arrays
+    vllm_video_engine* eng = nullptr;
+    CHECK(vllm_video_engine_load(&fp.mp, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+    fp.mp.n_extras = -1;
+    fp.mp.extra_keys = keys;
+    const char* values[] = {"fl2va"};
+    fp.mp.extra_values = values;
+    CHECK(vllm_video_engine_load(&fp.mp, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+    const char* null_key[] = {nullptr};
+    fp.mp.n_extras = 1;
+    fp.mp.extra_keys = null_key;
+    CHECK(vllm_video_engine_load(&fp.mp, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  }
+}
+
+TEST_CASE("capi v18: an unknown per-generation extra is refused, not ignored") {
+  VideoFoldWorkspace ws;
+  VideoFixtureParams fp(ws.fixture);
+  vllm_video_engine* eng = nullptr;
+  REQUIRE(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK);
+
+  const std::string out_dir = ws.root + "/out";
+  const char* keys[] = {"pipeline_kind"};  // an LTX key, on an H3 engine
+  const char* values[] = {"distilled_two_stage"};
+  vllm_video_params vp = vllm_video_params_default();
+  vp.num_frames = 5;
+  vp.height = 32;
+  vp.width = 32;
+  vp.steps = 3;
+  vp.output_dir = out_dir.c_str();
+  vp.extra_keys = keys;
+  vp.extra_values = values;
+  vp.n_extras = 1;
+  vllm_video_result out;
+  CHECK(vllm_video_generate(eng, &vp, &out) == VLLM_ERR_RUNTIME);
+  CHECK(std::string(vllm_last_error()).find("pipeline_kind") != std::string::npos);
+  vllm_video_engine_free(eng);
+}
 
 // ─── ABI v14: explicit device selection (ARCH-ONE-SURFACE ROW 8) ─────────────
 // The device knob: 0=auto (the byte-identical accelerator-first probe), 1=cpu,

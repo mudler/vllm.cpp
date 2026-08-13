@@ -42,6 +42,16 @@ from a release number. If a future pin is genuinely a released wheel, give the
 commit its own asserted field first; do not delete the assertion to make the
 block parse.
 
+**vLLM-Omni's pin does NOT live here.** It is a separate repository, and under
+AGENTS.md §"When vLLM has no implementation" every oracle carries its own file:
+[`.agents/oracles/vllm-omni.md`](oracles/vllm-omni.md), whose `oracle-pin` block
+is the one place its revision is recorded. Do not add a second pin block to this
+file; one file per oracle, read by glob, is what keeps a pin from becoming a
+surface every change has to write. What belongs HERE is only the part that is
+about the relationship between the two, which the oracle file cannot state on its
+own: see the omni rules under §Rules, and
+[specs/upstream-omni-pin.md](specs/upstream-omni-pin.md) (#633) for why they hold.
+
 **Prior cycle (2026-07-12):** audited target v0.25.0 `702f4814fe54`; report
 [`sync/2026-07-12-702f481.md`](sync/2026-07-12-702f481.md). The exact 145-commit
 `e24d1b24..702f481` delta was classified (94 `INVENTORY`, 51 `IGNORE`, no
@@ -68,6 +78,10 @@ superseded it at **55/124 axes pass, 69 fail**; the current binding is `9ecd9d0`
   against. Gaps vs it are normal and tracked in the inventory, not hidden.
 - **Parity pin (post-MVP)** — one repo-wide vLLM commit. "We have feature X"
   always means "X as of the pin". Never compare against a moving target.
+- **Omni parity pin** — the same idea for `vllm-project/vllm-omni`, recorded in
+  [`.agents/oracles/vllm-omni.md`](oracles/vllm-omni.md), not here. It is a
+  second pin rather than a second value of this one: it names the vLLM commit
+  *it* ran against, which need not be ours.
 - **Per-file pins** — every ported file's header records the upstream path +
   the upstream commit it matches. Normally equal to the parity pin; a file may
   be temporarily ahead (hot-fix port) but never behind without a ledger note.
@@ -116,6 +130,14 @@ superseded it at **55/124 axes pass, 69 fail**; the current binding is `9ecd9d0`
 ## Rules
 
 - Ledger and inventory updates are part of the cycle, not optional follow-ups.
+- An omni-gated number is labeled with BOTH commits and is never cited in a
+  vLLM-side parity claim, a binding grid, or a `docs/BENCHMARKS.md` row owned by
+  a core-pinned row.
+- Advancing the omni pin does not re-open the vLLM-side binding grids PROVIDED
+  the omni oracle is installed in its own virtualenv and touches neither
+  `${VLLM_SOURCE}` nor the environment the core pin measures itself from. If that
+  isolation does not hold, the advance is a core sync cycle and is re-validated
+  as one — the dependency tree under the denominator moved.
 - Never mix a sync cycle with feature work in the same commit.
 - If an upstream change conflicts with a recorded deviation (inventory §9),
   the deviation doc gets updated in the same cycle — deviations must always

@@ -65,7 +65,13 @@ MATRICES = {
     # stops at 2.3 (`ltx2_recipes.py:162-166`), with 2.5 still OPEN upstream at
     # vllm-omni#6066. Same lane as the MiniMax-H3 diffusion row. Bumped because a new
     # row EXISTS, never to make a transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 370),
+    # 372 since 2026-08-13: +2 for IndexTTS-2.5, which vLLM-Omni registers as TWO
+    # architectures (`IndexTTS2TalkerForConditionalGeneration` stage 0 and
+    # `IndexTTS2S2MelDecoder` stage 1), so a port described in prose as "a model"
+    # moves this pin by two. Both land `INVENTORIED`, unclaimed and blocked on the
+    # absent vllm-omni pin (#633). Bumped because two rows EXIST, never to make a
+    # transition pass. #634.
+    "MODEL": (AGENTS / "model-matrix.md", 372),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -411,7 +417,15 @@ ENGINE_PREFIXES = (
 # `main` is squash-only, so a justification framed at an intermediate commit would
 # ship as a comment that is false about the file it sits in.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 153
+# 154 since 2026-08-13: +`ENG-UPSTREAM-OMNI-PIN` (a parity pin for the separate
+# `vllm-project/vllm-omni` repository). A genuinely-new protocol capability, not a
+# restatement of the vLLM pin: it is a SECOND pin that may legitimately disagree
+# with the first, because vllm-omni requires vLLM 0.27.0+ against our 0.26.0.dev0
+# core pin. Landed the same day as the 153 bump above and merged against it: both
+# rows are real and neither replaces the other, which is why this line reads 154
+# rather than restating 153. `READY`, spec `specs/upstream-omni-pin.md`, issue #633.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 154
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

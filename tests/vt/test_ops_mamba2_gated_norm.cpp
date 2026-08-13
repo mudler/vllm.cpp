@@ -543,3 +543,352 @@ TEST_CASE("mamba2 gated group norm refuses the arms it does not implement") {
     CHECK_THROWS(RunNorm(in, {rows, hidden}, 7, 1e-6f, DType::kF32, true));
   }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// (10) THE CUDA ARM — .agents/specs/mamba2-ssd.md W2, issue #496.
+//
+// The declared equivalence contract is stated in full at the head of the CUDA
+// section of tests/vt/test_ops_mamba2_ssd.cpp and in
+// src/vt/cuda/cuda_mamba2_ssd.cuh, including the FMA-contraction term: `part +=
+// v * v` is one nvcc-`fmad` rounding on device and two under the host's
+// `-ffp-contract=off`. ONE further thing is different for this op, and it is
+// stated here rather than inherited: the group reduction is a BLOCK reduction on
+// device and a sequential sum on host, so this arm admits a THIRD source of
+// divergence — summation ORDER — on top of libm and contraction. Its summands
+// are all squares, hence non-negative, so there is no cancellation and the
+// reordering carries the plain forward-error bound: for a length-m sum,
+// |fl_a - fl_b| <= 2(m-1)*u*sum|x| = 2(m-1)*u*sum(x) because sum|x| IS the sum.
+// That is 2(K-1)*u for the reorder plus K*u for the contraction plus the silu
+// `expf` difference, comfortably inside the `5*(K + 10)*u` that
+// `DerivedRtol(group_size)` — the same expression the other two suites use —
+// gives, K being the group's own length. Nothing is tuned.
+// ═════════════════════════════════════════════════════════════════════════════
+#ifdef VLLM_CPP_CUDA
+
+#include <memory>
+#include <stdexcept>
+
+namespace {
+
+using vt::Backend;
+
+Backend* MaybeCuda() {
+  try {
+    return &vt::GetBackend(DeviceType::kCUDA);
+  } catch (const std::exception&) {
+    return nullptr;
+  }
+}
+
+// A GREEN TEST DOES NOT PROVE THE DEVICE RAN IT. GB10 is
+// `integrated && pageable_memory_access`, so `Backend::UnifiedMemory()` is TRUE
+// and `ReferenceTierEligible(kCUDA)` with it: absent a native kernel, `GetOp`
+// does not throw — it installs the CPU HOST kernel as a `kReferenceProviderName`
+// provider and runs THAT over the device pointers (op_provider.h, "portable
+// reference tier"), so every assertion below would pass while nothing ran on the
+// GPU. Every CUDA case therefore asserts the SELECTED provider is native. These
+// are EAGER dispatches, so the counters are populated
+// ([[graph-replay-does-no-host-dispatch-counters-read-zero]]).
+void RequireNativeCudaProvider(vt::OpId op, const std::string& what) {
+  const vt::OpProviderStats st = vt::GetOpProviderStats(op, DeviceType::kCUDA);
+  INFO(what << ": selected CUDA provider = "
+            << (st.last_selected != nullptr ? st.last_selected : "<none>")
+            << "; process-wide reference-tier hits = " << vt::GetReferenceTierHits());
+  REQUIRE(st.last_selected != nullptr);
+  CHECK(std::string(st.last_selected) != std::string(vt::kReferenceProviderName));
+}
+
+// `5*(K + 2)*u` — the bound derived at the head of the CUDA section of
+// tests/vt/test_ops_mamba2_ssd.cpp, which for this op covers the reordering of a
+// length-K non-negative reduction (2(K-1)*u, no cancellation because sum|x| IS
+// the sum), plus K*u for the contraction of `part += v * v` on the device side
+// only, plus the libm difference in silu's `expf`.
+constexpr double kUnitRoundoff = 5.9604644775390625e-08;  // 2^-24
+double DerivedRtol(int64_t K) { return 5.0 * static_cast<double>(K + 2) * kUnitRoundoff; }
+
+void ExpectDeviceMatchesHost(const std::string& what, const std::vector<float>& dev,
+                             const std::vector<float>& host, int64_t K) {
+  REQUIRE(dev.size() == host.size());
+  REQUIRE(!dev.empty());
+  double scale = 0.0;
+  for (float v : host) scale = std::max(scale, std::abs(static_cast<double>(v)));
+  const double rtol = DerivedRtol(K);
+  const double atol = rtol * scale;
+  size_t bit_differing = 0, worst_i = 0;
+  double worst_ratio = -1.0, worst_diff = 0.0;
+  for (size_t i = 0; i < dev.size(); ++i) {
+    if (dev[i] != host[i]) ++bit_differing;
+    const double d = std::abs(static_cast<double>(dev[i]) - static_cast<double>(host[i]));
+    const double budget = atol + rtol * std::abs(static_cast<double>(host[i]));
+    const double ratio = budget > 0.0 ? d / budget : (d > 0.0 ? 1e30 : 0.0);
+    if (!std::isfinite(static_cast<double>(dev[i])) || ratio > worst_ratio) {
+      worst_ratio = ratio;
+      worst_i = i;
+      worst_diff = d;
+      if (!std::isfinite(static_cast<double>(dev[i]))) break;
+    }
+  }
+  // MESSAGE, not INFO: doctest prints an INFO context only when an assertion in
+  // its scope FAILS, so the used slack has to be logged unconditionally for the
+  // derived bar to be auditable on the green run that matters.
+  MESSAGE(what << ": K=" << K << " rtol=" << rtol << " scale=" << scale << "; "
+               << bit_differing << " of " << dev.size()
+               << " elements differ in any bit; worst element [" << worst_i
+               << "] dev=" << dev[worst_i] << " host=" << host[worst_i]
+               << " |diff|=" << worst_diff << " used " << (worst_ratio * 100.0)
+               << "% of its derived budget");
+  CHECK(std::isfinite(static_cast<double>(dev[worst_i])));
+  CHECK(worst_ratio <= 1.0);
+}
+
+Tensor MakeTDev(void* data, DType dt, Device dev, const std::vector<int64_t>& shape) {
+  Tensor t;
+  t.data = data;
+  t.dtype = dt;
+  t.device = dev;
+  t.rank = static_cast<int>(shape.size());
+  int64_t stride = 1;
+  for (int i = t.rank - 1; i >= 0; --i) {
+    t.shape[i] = shape[static_cast<size_t>(i)];
+    t.stride[i] = stride;
+    stride *= shape[static_cast<size_t>(i)];
+  }
+  return t;
+}
+
+class DBuf {
+ public:
+  DBuf(Backend& b, Queue& q, const void* host, size_t bytes) : b_(&b), bytes_(bytes) {
+    p_ = b.Alloc(bytes == 0 ? 1 : bytes);
+    if (host != nullptr && bytes > 0) b.Copy(q, p_, host, bytes);
+  }
+  ~DBuf() {
+    if (p_ != nullptr) b_->Free(p_);
+  }
+  DBuf(const DBuf&) = delete;
+  DBuf& operator=(const DBuf&) = delete;
+  void* get() const { return p_; }
+  void Download(Queue& q, void* dst) const {
+    if (bytes_ > 0) b_->Copy(q, dst, p_, bytes_);
+    b_->Synchronize(q);
+  }
+
+ private:
+  Backend* b_;
+  void* p_ = nullptr;
+  size_t bytes_ = 0;
+};
+
+// The CUDA twin of RunNorm, argument for argument.
+std::vector<float> RunNormCuda(Backend& gpu, const NormInputs& in,
+                               const std::vector<int64_t>& shape, int64_t n_groups, float eps,
+                               DType dt, bool use_rms_norm, int64_t tp_world_size = 1,
+                               DType weight_dt = DType::kF32, DType out_dt = kSameAsAct) {
+  Queue q = gpu.CreateQueue();
+  const Device dev{DeviceType::kCUDA, 0};
+  if (out_dt == kSameAsAct) out_dt = dt;
+  size_t n = 1;
+  for (int64_t d : shape) n *= static_cast<size_t>(d);
+  const std::vector<uint8_t> xb = Pack(in.x, dt);
+  const std::vector<uint8_t> gb = Pack(in.gate, dt);
+  const std::vector<uint8_t> wb = Pack(in.weight, weight_dt);
+  const size_t out_bytes = n * vt::SizeOf(out_dt);
+
+  DBuf dx(gpu, q, xb.data(), xb.size());
+  DBuf dg(gpu, q, gb.data(), gb.size());
+  DBuf dw(gpu, q, wb.data(), wb.size());
+  DBuf dout(gpu, q, nullptr, out_bytes);
+
+  Tensor xt = MakeTDev(dx.get(), dt, dev, shape);
+  Tensor gt = MakeTDev(dg.get(), dt, dev, shape);
+  Tensor ot = MakeTDev(dout.get(), out_dt, dev, shape);
+  Tensor wt = MakeTDev(dw.get(), weight_dt, dev, {shape.back()});
+
+  RmsNormGatedGroupArgs args;
+  args.eps = eps;
+  args.n_groups = n_groups;
+  args.tp_world_size = tp_world_size;
+  vt::RmsNormGatedGroup(q, ot, xt, gt, use_rms_norm ? &wt : nullptr, args);
+
+  std::vector<uint8_t> ob(out_bytes);
+  dout.Download(q, ob.data());
+  gpu.Synchronize(q);
+  gpu.DestroyQueue(q);
+  return Unpack(ob, n, out_dt);
+}
+
+}  // namespace
+
+TEST_CASE("mamba2 gated group norm CUDA arm matches forward_native") {
+  Backend* gpu = MaybeCuda();
+  if (gpu == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered (CPU-only build/box)");
+    return;
+  }
+  // Upstream's shapes (batch 8, seq 128, hidden 64, n_groups in {1,2,4},
+  // test_mamba_mixer2.py:21-33) plus one at the driver's own width: the mamba
+  // layer's gated norm runs over `intermediate_size` with n_groups = 8
+  // (mamba2-ssd.md §1.4), which is the case whose group_size is large enough for
+  // the block reduction to differ from the host's sequential sum at all.
+  struct Case {
+    int64_t rows, hidden, n_groups;
+  };
+  const std::vector<Case> cases{{8 * 128, 64, 1}, {8 * 128, 64, 2},
+                                {8 * 128, 64, 4}, {64, 4096, 8}};
+  const float eps = 1e-6f;
+  for (const Case& c : cases) {
+    const NormInputs in = GenerateNorm(c.rows, c.hidden, 0x9A17Eu);
+    const int64_t group_size = c.hidden / c.n_groups;
+    INFO("rows=" << c.rows << " hidden=" << c.hidden << " n_groups=" << c.n_groups);
+
+    const std::vector<double> ref =
+        GatedGroupNormRef(in.x, in.gate, &in.weight, c.rows, c.hidden, c.n_groups, eps);
+    const std::vector<float> host =
+        RunNorm(in, {c.rows, c.hidden}, c.n_groups, eps, DType::kF32, true);
+    const std::vector<float> dev =
+        RunNormCuda(*gpu, in, {c.rows, c.hidden}, c.n_groups, eps, DType::kF32, true);
+    RequireNativeCudaProvider(vt::OpId::kRmsNormGatedGroup, "forward_native shapes");
+    // G1 — device vs the INDEPENDENT double reference at upstream's tolerance.
+    ExpectClose("device out f32", dev, ref, 5e-3, 1e-3);
+    // G2 — device vs host, at the derived bound for a length-group_size reduction.
+    ExpectDeviceMatchesHost("out f32 device vs host", dev, host, group_size);
+
+    // bf16 activation arm (upstream runs float16; the vt `out` contract is
+    // f32/bf16). `input_dtype` is x's dtype (:113), so the reference casts
+    // through bf16 at :149 too.
+    const std::vector<double> bref =
+        GatedGroupNormRef(in.x, in.gate, &in.weight, c.rows, c.hidden, c.n_groups, eps,
+                          DType::kBF16);
+    ExpectClose("device out bf16",
+                RunNormCuda(*gpu, in, {c.rows, c.hidden}, c.n_groups, eps, DType::kBF16, true),
+                bref, 5e-2, 1e-2);
+  }
+}
+
+// The two differences that make this a SIBLING of vt::RmsNormGated rather than a
+// mode of it, pinned on device: the reduction extent (per GROUP, not per row) and
+// the activation (silu, not sigmoid).
+TEST_CASE("mamba2 gated group norm CUDA arm keeps both sibling differences") {
+  Backend* gpu = MaybeCuda();
+  if (gpu == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered (CPU-only build/box)");
+    return;
+  }
+  const int64_t rows = 32, hidden = 64;
+  const float eps = 1e-6f;
+  const NormInputs in = GenerateNorm(rows, hidden, 0x6A7Eu);
+
+  SUBCASE("the reduction is per group, not per row") {
+    const std::vector<float> g1 =
+        RunNormCuda(*gpu, in, {rows, hidden}, 1, eps, DType::kF32, true);
+    const std::vector<float> g4 =
+        RunNormCuda(*gpu, in, {rows, hidden}, 4, eps, DType::kF32, true);
+    RequireNativeCudaProvider(vt::OpId::kRmsNormGatedGroup, "per-group reduction");
+    REQUIRE(g1.size() == g4.size());
+    double max_diff = 0.0;
+    for (size_t i = 0; i < g1.size(); ++i)
+      max_diff = std::max(max_diff, std::abs(static_cast<double>(g1[i]) - g4[i]));
+    INFO("max|n_groups=1 - n_groups=4| on device = " << max_diff);
+    // A whole-row variance would make these IDENTICAL. They must not be.
+    CHECK(max_diff > 1e-3);
+    // ... and n_groups=4 is the one that matches a per-group double reference.
+    ExpectClose("device n_groups=4", g4,
+                GatedGroupNormRef(in.x, in.gate, &in.weight, rows, hidden, 4, eps), 5e-3, 1e-3);
+  }
+
+  SUBCASE("the gate is silu, not sigmoid") {
+    // A sigmoid-gated reference must NOT match what the device produced.
+    const NormInputs& sig = in;
+    const std::vector<float> dev =
+        RunNormCuda(*gpu, in, {rows, hidden}, 2, eps, DType::kF32, true);
+    // The reference a SIGMOID gate would give, written out here rather than
+    // parameterised, so it shares nothing with the op under test.
+    std::vector<double> sigmoid_ref(static_cast<size_t>(rows * hidden), 0.0);
+    {
+      const int64_t group_size = hidden / 2;
+      for (int64_t r = 0; r < rows; ++r) {
+        std::vector<double> v(static_cast<size_t>(hidden));
+        for (int64_t j = 0; j < hidden; ++j) {
+          const double zv = sig.gate[static_cast<size_t>(r * hidden + j)];
+          v[static_cast<size_t>(j)] =
+              static_cast<double>(sig.x[static_cast<size_t>(r * hidden + j)]) /
+              (1.0 + std::exp(-zv));  // SIGMOID, not silu
+        }
+        for (int64_t g = 0; g < 2; ++g) {
+          double ss = 0.0;
+          for (int64_t j = 0; j < group_size; ++j) {
+            const double t = v[static_cast<size_t>(g * group_size + j)];
+            ss += t * t;
+          }
+          const double inv = 1.0 / std::sqrt(ss / static_cast<double>(group_size) + eps);
+          for (int64_t j = 0; j < group_size; ++j) {
+            const int64_t idx = g * group_size + j;
+            sigmoid_ref[static_cast<size_t>(r * hidden + idx)] =
+                static_cast<double>(sig.weight[static_cast<size_t>(idx)]) *
+                v[static_cast<size_t>(idx)] * inv;
+          }
+        }
+      }
+    }
+    double max_diff = 0.0;
+    for (size_t i = 0; i < dev.size(); ++i)
+      max_diff = std::max(max_diff, std::abs(static_cast<double>(dev[i]) - sigmoid_ref[i]));
+    INFO("max|device - sigmoid-gated reference| = " << max_diff);
+    CHECK(max_diff > 1e-2);
+  }
+}
+
+// `use_rms_norm == False`: no parameter, no norm, just the gated value cast back
+// to the input dtype (mamba_mixer2.py:94-96, :115-116); and every leading dim is
+// a row (`*prefix_dims, hidden_dim`, :136), so a rank-3 [T,H,D] input is the same
+// computation as its flattened rank-2 view.
+TEST_CASE("mamba2 gated group norm CUDA arm covers the no-weight and rank-3 arms") {
+  Backend* gpu = MaybeCuda();
+  if (gpu == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered (CPU-only build/box)");
+    return;
+  }
+  const float eps = 1e-6f;
+
+  SUBCASE("no weight: the gated value, unnormalised") {
+    const int64_t rows = 40, hidden = 64;
+    const NormInputs in = GenerateNorm(rows, hidden, 0x1234u);
+    const std::vector<double> ref =
+        GatedGroupNormRef(in.x, in.gate, nullptr, rows, hidden, 4, eps);
+    const std::vector<float> dev =
+        RunNormCuda(*gpu, in, {rows, hidden}, 4, eps, DType::kF32, false);
+    RequireNativeCudaProvider(vt::OpId::kRmsNormGatedGroup, "no-weight arm");
+    ExpectClose("device out (no weight)", dev, ref, 5e-3, 1e-3);
+    ExpectDeviceMatchesHost("no-weight device vs host", dev,
+                            RunNorm(in, {rows, hidden}, 4, eps, DType::kF32, false), 1);
+  }
+
+  SUBCASE("rank 3 [T,H,D] equals its flattened rank-2 view") {
+    const int64_t T = 12, Hh = 4, Dd = 32;
+    const int64_t rows = T * Hh;
+    const NormInputs in = GenerateNorm(rows, Dd, 0x5678u);
+    const std::vector<float> flat =
+        RunNormCuda(*gpu, in, {rows, Dd}, 2, eps, DType::kF32, true);
+    const std::vector<float> cube =
+        RunNormCuda(*gpu, in, {T, Hh, Dd}, 2, eps, DType::kF32, true);
+    REQUIRE(flat.size() == cube.size());
+    for (size_t i = 0; i < flat.size(); ++i) CHECK(flat[i] == cube[i]);
+  }
+
+  SUBCASE("the weight is read at the WEIGHT's dtype") {
+    // `Mixer2RMSNormGated.weight` is created at the MODEL dtype (:91), bf16 for
+    // every checkpoint that ships this layer. A kernel that read it as f32 would
+    // over-read a real allocation and shift every output — the W1 F1 finding
+    // (mamba2-ssd.md §8.2), re-pinned here for the device arm.
+    const int64_t rows = 32, hidden = 64;
+    NormInputs in = GenerateNorm(rows, hidden, 0x9999u);
+    for (auto& w : in.weight) w = vt::BF16ToF32(vt::F32ToBF16(w));
+    const std::vector<double> ref =
+        GatedGroupNormRef(in.x, in.gate, &in.weight, rows, hidden, 2, eps);
+    const std::vector<float> dev = RunNormCuda(*gpu, in, {rows, hidden}, 2, eps, DType::kF32,
+                                               true, 1, DType::kBF16);
+    ExpectClose("device out, bf16 weight", dev, ref, 5e-3, 1e-3);
+  }
+}
+
+#endif  // VLLM_CPP_CUDA

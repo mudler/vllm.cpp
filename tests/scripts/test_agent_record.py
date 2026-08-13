@@ -269,6 +269,28 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(recipe), 1)
         self.assertEqual(recipe[0].path.name, "engine-matrix.md")
 
+    def test_omni_pin_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #633 row and its 153 -> 154 ratchet bump are one semantic change.
+
+        Same shape as the #117 and #606 assertions above, and it carries one
+        extra hazard worth pinning. This bump COLLIDED: `main` took the constant
+        152 -> 153 for `SERVE-RECIPE-ARGS` while the omni-pin branch took the
+        same 152 -> 153 for its own row, so both sides read 153 and the merge
+        looked clean. Resolving it by keeping either 153 would have dropped a
+        real row while leaving the matrix internally consistent, which is
+        exactly the state no other assertion here can see. Naming BOTH rows is
+        what makes 154 checkable rather than plausible.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+
+        for item_id in ("ENG-UPSTREAM-OMNI-PIN", "SERVE-RECIPE-ARGS"):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "engine-matrix.md", item_id)
+
     def test_model_row_ratchet_is_load_bearing(self) -> None:
         """The MODEL row pin must catch a row appearing or vanishing.
 
@@ -300,6 +322,33 @@ class AgentRecordMutationTests(unittest.TestCase):
         ):
             agent_record.check_matrices(errors)
         require(errors, r"\d+ MODEL rows; expected \d+")
+
+    def test_indextts_rows_are_inside_the_model_ratchet(self) -> None:
+        """The #634 rows and the 370 -> 372 bump are one semantic change.
+
+        IndexTTS-2.5 is registered by vLLM-Omni as TWO architectures, a talker
+        and an S2Mel decoder, so it moves the pin by two rather than one. That
+        is the hazard worth pinning: a port described in prose as "a model" is
+        the shape that lands one row and a bump of two, and the count alone
+        cannot tell that from two rows landing. Both are named here, and both
+        are asserted `INVENTORIED` rather than `SPIKE` — they are unclaimed and
+        blocked on #633, and `SPIKE` would owe a `CLAIM-*` owner they do not
+        have.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        for item_id in (
+            "MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-s2-mel-decoder",
+        ):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+            self.assertEqual(
+                found[0].field("state").strip().strip("`"), "INVENTORIED", item_id
+            )
 
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
         """The #609/#610 rows and the 362 -> 369 bump are one semantic change.

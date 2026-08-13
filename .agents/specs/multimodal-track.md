@@ -251,9 +251,12 @@ That is what makes the limits the mechanism and the flag the sugar, and it is
 the half a port can most easily leave out, because omitting it breaks nothing
 that a text-only workload would notice.
 
-**Our baseline is nothing.** `grep -rn 'limit_per_prompt\|MultimodalConfig' src/
-include/` returns no hits; no multimodal config surface exists, and nothing gates
-tower construction on config. This is a port, not an exposure.
+**Our baseline was nothing** (as of 2026-08-13, before L1): `grep -rn
+'limit_per_prompt\|MultimodalConfig' src/ include/` returned no hits; no
+multimodal config surface existed, and nothing gated tower construction on
+config. This is a port, not an exposure. L1 has since landed the config and the
+refusal (see the wave list below); tower construction is still ungated by
+config, which is L3.
 
 **A second-order consequence worth naming.** `qwen3_next.py:325` proves the flag
 is not purely a memory knob — upstream uses it to select the *fused* QK-norm+RoPE+
@@ -273,6 +276,40 @@ comparing the two arms must set the flag on both sides or state that it did not.
   upstream's `enable_mm_embeds` escape. Unit-gated, no serve surface yet. The
   refusal belongs here, not in L3: it is the limits' own semantics, and a limit
   nothing enforces is not a limit.
+
+  **LANDED 2026-08-13 (#607, `row/mm-limits-l1`).** `include/vllm/config/multimodal.h`
+  carries `vllm::MultiModalConfig` with the three ported fields and
+  `GetLimitPerPrompt`, mirroring `multimodal.py:78,81,98,321-336` — the config
+  directory is a 1:1 mirror of `vllm/config/<name>.py`, so `multimodal.h` is the
+  only home that is not bespoke. The enforcement is
+  `include/vllm/multimodal/processing/context.h` + `src/…/context.cpp`:
+  `BaseProcessingInfo::{AllowedMmLimits,ValidateNumItems,ValidateParsedMmData,
+  ValidateTrackedChatItem}`, mirroring `processing/context.py:392-405,409-428,
+  441-461` and `chat_utils.py:630-662` including the `enable_mm_embeds` escape in
+  both of its spellings. The refusal throws `vllm::v1::InputValidationError` —
+  the type `api_server.cpp:185,252` already maps to HTTP 400, which is what
+  upstream's `VLLMValidationError` gets; a second refusal class would have landed
+  a too-many-images request as a 500. That type moved from
+  `v1/engine/input_processor.h` into `v1/engine/validation_error.h` (same name,
+  same namespace, no behaviour change) so the multimodal layer can throw it
+  without including the input processor and without a header cycle at L2's call
+  site. Gated `test_multimodal_config` 7/7 (21 assertions) +
+  `test_processing_limits` 19/19 (78 assertions); both suites port the upstream
+  parametrizations verbatim from `tests/multimodal/test_processing.py:902-941,
+  944-985`, `tests/entrypoints/multimodal/llm/test_mm_embeds_only.py:41-49` and
+  `tests/entrypoints/unit_tests/test_chat_utils.py:1498-1560`.
+
+  **What L1 deliberately does NOT do, so L2 knows what it inherits.** Nothing
+  constructs a `MultiModalConfig` yet and nothing calls the validators on a live
+  request: no model config owns one, so `process_inputs_mm`
+  (`input_processor.cpp:321,352` — our `context.py:461`) and the chat seam
+  (`chat_mm.cpp`, our `chat_utils.py:662`) still validate nothing. Wiring those
+  two call sites is L2's, together with the flags and the C-ABI field, because it
+  is the config reaching them that the flags exist to set. Separately noted for
+  whoever takes L2: `chat_mm.cpp:256-270` takes the FIRST image part and silently
+  ignores the rest, so today a 5-image request is neither served nor refused — it
+  is quietly truncated to one. That is the divergence L2 closes by calling
+  `ValidateTrackedChatItem` per tracked item.
 - **L2** — `--limit-mm-per-prompt` and `--language-model-only` serve flags plus
   the C-ABI field, over L1. This is the point at which the 43 recipes stop
   aborting.

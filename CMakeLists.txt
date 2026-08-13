@@ -885,6 +885,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_vl_registry.cpp
   src/vllm/model_executor/models/voxtral.cpp
   src/vllm/multimodal/hasher.cpp
+  # Per-modality input-count limits and the refusal they carry
+  # (ENG-MM-INPUT-PIPELINE L1, #607).
+  src/vllm/multimodal/processing/context.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end

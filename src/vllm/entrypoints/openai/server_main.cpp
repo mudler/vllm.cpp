@@ -290,7 +290,7 @@ constexpr InertArg kAcceptedInertArgs[] = {
     // cli_args.py:105 (`enable_auto_tool_choice: bool = False`), threaded on as
     // `enable_auto_tools` at api_server.py:426,441,529,544.
     //
-    // The parenthetical is deliberate and must stay: upstream defaults
+    // The trailing caveat clause is deliberate and must stay: upstream defaults
     // --tool-call-parser to None, we default it to "hermes"
     // (docs/USAGE.md), so upstream's flag genuinely gates something and ours
     // cannot. The notice must not let a reader infer the two agree when the
@@ -548,16 +548,15 @@ Args ParseArgs(int argc, char** argv) {
     std::cerr << "server: --cuda-profile-graph-batch exceeds --max-num-seqs\n";
     Usage(argv[0], 2);
   }
-  // Validate a NAMED parser dialect here, before the (multi-GB) model load, so a
-  // typo costs a second rather than a full load. "auto" cannot be checked yet —
-  // it resolves against the chat template — but detection only ever returns
-  // registered names, so it cannot fail later either.
   // Mirrors vllm/entrypoints/openai/cli_args.py:395 — upstream raises
   //   TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
   // when the flag is set and `args.tool_call_parser` is falsy. Upstream's falsy
   // value is the unset default `None`; ours is the explicit selection "none",
   // because our --tool-call-parser defaults to "hermes" and so is never unset.
   // Accepting the flag as inert does NOT drop the validation it came with.
+  // Ordered before the dialect check below so a contradiction is reported as
+  // the contradiction; "none" is itself a registered selection, so that check
+  // would pass and say nothing about the conflict.
   if (a.enable_auto_tool_choice && a.tool_call_parser == "none") {
     std::cerr << "server: Error: --enable-auto-tool-choice requires "
                  "--tool-call-parser\n"
@@ -566,6 +565,10 @@ Args ParseArgs(int argc, char** argv) {
                  "default)\n";
     Usage(argv[0], 2);
   }
+  // Validate a NAMED parser dialect here, before the (multi-GB) model load, so a
+  // typo costs a second rather than a full load. "auto" cannot be checked yet —
+  // it resolves against the chat template — but detection only ever returns
+  // registered names, so it cannot fail later either.
   namespace oai = vllm::entrypoints::openai;
   if (a.tool_call_parser != "auto") {
     (void)oai::ResolveToolParserName(a.tool_call_parser, "");

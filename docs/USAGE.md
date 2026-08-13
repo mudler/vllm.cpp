@@ -909,6 +909,15 @@ you see in a log matches this table:
 server: accepted '--trust-remote-code' for published-recipe compatibility; it has no effect here: no Python runtime, so there is no remote code to trust
 ```
 
+The mirrored validation is reported before the parser dialect is checked, so a
+contradiction is named as a contradiction rather than passing silently (`none` is
+itself a valid selection):
+
+```text
+server: Error: --enable-auto-tool-choice requires --tool-call-parser
+server: (--tool-call-parser none selects NO parser; name a parser, or drop --tool-call-parser to keep the hermes default)
+```
+
 This list is **enumerated, not a catch-all**. Any other unrecognized flag still
 aborts with `server: unknown argument '<flag>'`, including flags that are inert
 only because the capability is missing (`--tensor-parallel-size` and the other

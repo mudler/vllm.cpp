@@ -235,6 +235,27 @@ Evidence:
   present, exit status 0 instead of 2 — and leaves the other three GREEN. The
   guard is defended by the test, not by inspection.
 
+Two things a reviewer or the operator will meet and should not re-derive.
+
+**The PR cannot go fully green, and not because of this change.** `windows-msvc-cpu`
+and `windows-msvc-vulkan` fail with `test_openai_api_server.exe exited with status
+-1073740791` (`0xC0000409`, `STATUS_STACK_BUFFER_OVERRUN`), which is
+[#584](https://github.com/mudler/vllm.cpp/issues/584). Attributed rather than
+assumed: [#625](https://github.com/mudler/vllm.cpp/pull/625) fails with the
+byte-identical exit status and touches no `src/` or `include/` path at all, so a
+records-only PR reproduces it. `test_openai_api_server` is also not a consumer of
+this seam — it never calls `ParseArgs`.
+
+**A trap this change walked into, recorded so the next person does not.**
+`check-windows-portability.py` scans the shipped server sources with comments
+stripped but STRING LITERALS INTACT, and its POSIX-call pattern matches a bare
+`open` before a parenthesis. The notice text originally read "...no second gate to
+open (note --tool-call-parser defaults to hermes...)", and `open (` inside a
+user-facing message was reported as an unguarded POSIX call reaching Windows. It
+is a semicolon clause now, with a comment at the site. The gate is Windows-only
+and is NOT part of `scripts/agent-preflight.sh`, so a fully green local preflight
+says nothing about it.
+
 Not claimed: `GATING` or `DONE`. `GATING` would require closing
 `CLAIM-SERVE-RECIPE-ARGS`, which this implementer does not own; `DONE`
 additionally needs the fresh review, the operator gate rerun, and a

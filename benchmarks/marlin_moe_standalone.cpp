@@ -6,6 +6,12 @@
 // us/call and us/block so our plateau can be laid against upstream's 5.2-5.5.
 //
 // Not a test: no assertions, no goldens. It measures the kernel only.
+//
+// RUN IT UNDER THE BOX LOCK: `flock $HOME/gpu.lock ...`, NOT /tmp/gpu.lock,
+// which coordinates with nothing. `nvidia-smi` showing no compute apps does
+// not mean the GPU is unreserved, so check `fuser -v $HOME/gpu.lock` first.
+// Absolute timings taken unlocked are upper bounds; only interleaved RATIOS
+// survive contention.
 
 #include <cstdint>
 #include <cstdio>

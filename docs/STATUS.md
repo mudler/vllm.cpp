@@ -560,10 +560,16 @@ settable occupancy knob, blocks_per_sm, was then swept and is DEAD: with
 routing SEEDED so every configuration sees identical work, the between-
 configuration spread (4.3%) is no larger than the within-configuration spread,
 and an apparent 8.7% win in an unseeded first pass was the routing draw moving
-rather than the parameter. Two traps worth carrying: dram__bytes.sum reads n/a
-on GB10, so ncu's Memory Throughput % excludes DRAM traffic and is not a
-bandwidth utilisation; and any MoE comparison that lets routing vary between
-arms measures the draw, not the change. Weight
+rather than the parameter. Three traps worth carrying. dram__bytes.sum reads n/a on GB10, so ncu's Memory
+Throughput % excludes DRAM traffic and is not a bandwidth utilisation. Any MoE
+comparison that lets routing vary between arms measures the draw, not the
+change. And this box's GPU lock is $HOME/gpu.lock, not /tmp/gpu.lock: the
+standalone runs above took the wrong file and so ran UNLOCKED against a
+concurrent GPU test, which makes their absolute timings (including the 203-226
+GB/s plateau) upper bounds needing a re-take, while the INTERLEAVED ratio, the
+two-regime shape and the distinct-experts scaling survive because contention
+lands on both arms alike. nvidia-smi showing no compute apps does not mean the
+GPU is unreserved; fuser -v $HOME/gpu.lock is the check. Weight
 residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
 same size and stride as upstream's tensor (268 MB, no padding), so the cause is
 memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under

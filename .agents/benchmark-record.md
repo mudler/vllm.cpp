@@ -20627,3 +20627,33 @@ either direction. Earlier paired numbers in this file were taken before that
 contention began and were interleaved, which is what makes them survivable.
 
 Evidence: `dgx.casa:~/work/marlin442/`.
+
+## SPEC-DSPARK / #442: CORRECTION -- the standalone runs were taken UNLOCKED (2026-08-13)
+
+Every standalone Marlin run in the entries above was wrapped in
+`flock /tmp/gpu.lock`. That is the WRONG FILE. This box's GPU lock is
+`$HOME/gpu.lock` -- it is what `final_pair.sh` takes and what other sessions
+hold. `/tmp/gpu.lock` coordinates with nothing, so those runs executed
+unserialised against whatever else was on the GPU, and at least one concurrent
+`test_qwen27_spec_decode_concurrent` (15.9 GB RSS) overlapped them.
+
+That is the likeliest source of the ~2x outliers (367.8 and 353.0 us) in the
+blocks_per_sm sweep, and it was mine, not the other session's. An earlier note
+in this session blamed them for not locking; the reverse is true.
+
+WHAT SURVIVES. The ours-vs-upstream comparisons were INTERLEAVED within a single
+run (ours, upstream, ours, upstream), so contention lands on both arms alike and
+the RATIO is the quantity interleaving protects. 0.9973 with the sign flipping
+between reps still stands as "indistinguishable", though the error bars are wider
+than the quoted sd suggests.
+
+WHAT DOES NOT. Absolute us/call and us/block from those runs, including the
+203-226 GB/s plateau, are upper-bounded rather than exact -- an unlocked box can
+only make them slower. The plateau should be re-taken under `$HOME/gpu.lock`
+before it is quoted as the kernel's achievable bandwidth. The two-regime SHAPE
+(L2-resident under ~18 blocks, streaming above ~27) and the distinct-experts
+scaling are robust to a uniform slowdown and do not need re-taking.
+
+RULE: take `$HOME/gpu.lock`, not `/tmp/gpu.lock`. Check `fuser -v ~/gpu.lock`
+before assuming the GPU is free; `nvidia-smi` showing no compute apps does NOT
+mean it is unreserved, since a holder may be between phases.

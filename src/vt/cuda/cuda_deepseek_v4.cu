@@ -635,36 +635,60 @@ __global__ void DsaTopkKernel(const float* logits, const int64_t* ws, const int6
     for (int64_t s = s0; s < s1; ++s) dst[w++] = s;
     return;
   }
-  // Pick `topk` best by (logit desc, index asc); chosen tracked in a local mask.
-  bool chosen[512];  // nk (candidate window) small in the structural gate
-  for (int64_t s = 0; s < n; ++s) chosen[s] = false;
-  int64_t picked[64];  // topk small
-  for (int j = 0; j < topk; ++j) {
+  // Pick the `topk` best under the SAME total order the host reference sorts by
+  // (`DsaTopkSelect`: logit desc, then index asc — a total order because the
+  // candidate indices are distinct). Two passes, NO per-thread scratch:
+  //
+  //   pass 1 walks the order downwards `topk` times to land on the topk-th best
+  //          element, which is the selection THRESHOLD;
+  //   pass 2 scans the window once in ascending index order and emits every
+  //          element better-or-equal to that threshold.
+  //
+  // Pass 2 emits exactly `topk` entries already in ascending key order, so the
+  // ascending sort the previous revision needed is gone with the buffers.
+  //
+  // This replaces a `bool chosen[512]` + `int64_t picked[64]` pair of literals
+  // that could not represent the real `index_topk` (512 on V4-Flash, 1024 on
+  // V4-Pro) and overflowed the thread stack on any window wider than `topk`
+  // (#505). Cost is unchanged at O(topk*n) for pass 1, and strictly better
+  // overall: the O(topk^2) emit sort is eliminated.
+  const int64_t row = static_cast<int64_t>(t) * nk;
+  // `better(va, a, vb, b)` == "(va, a) outranks (vb, b)".
+  auto better = [](float va, int64_t a, float vb, int64_t b) -> bool {
+    return va > vb || (va == vb && a < b);
+  };
+  float th_val = 0.0f;
+  int64_t th_idx = -1;
+  for (int64_t j = 0; j < topk; ++j) {
+    float best_val = 0.0f;
     int64_t best = -1;
-    float bestv = -INFINITY;
     for (int64_t s = s0; s < s1; ++s) {
-      if (chosen[s - s0]) continue;
-      const float v = logits[static_cast<int64_t>(t) * nk + s];
-      if (best < 0 || v > bestv) {  // strict > keeps the SMALLER index on a tie
-        bestv = v;
+      const float v = logits[row + s];
+      // Skip anything at or above the previous step's element, so each step
+      // descends exactly one rank.
+      if (th_idx >= 0 && !better(th_val, th_idx, v, s)) continue;
+      if (best < 0 || better(v, s, best_val, best)) {
+        best_val = v;
         best = s;
       }
     }
-    chosen[best - s0] = true;
-    picked[j] = best;
+    // n > topk holds here, so a strictly worse element always exists under a
+    // total order. `best < 0` is therefore unreachable on ordered input; it can
+    // only arise if the row carries NaN, which makes every comparison false. Stop
+    // rather than reset the threshold, so pass 2 still emits a bounded prefix.
+    if (best < 0) break;
+    th_val = best_val;
+    th_idx = best;
   }
-  // Emit ascending key order (insertion sort of `topk` picks).
-  for (int a = 0; a < topk; ++a) {
-    int64_t mn = picked[a];
-    int mi = a;
-    for (int b = a + 1; b < topk; ++b)
-      if (picked[b] < mn) {
-        mn = picked[b];
-        mi = b;
-      }
-    picked[mi] = picked[a];
-    picked[a] = mn;
-    dst[a] = mn;
+  if (th_idx < 0) return;  // pathological row: leave the -1 padding in place
+  // Exactly `topk` elements outrank-or-equal the threshold, so `w` lands on topk.
+  // The `w < topk` bound is not load-bearing for ordered input — it is here so a
+  // NaN row can never write past this thread's row into the next one, which is
+  // the failure class #505 was about.
+  int64_t w = 0;
+  for (int64_t s = s0; s < s1 && w < topk; ++s) {
+    const float v = logits[row + s];
+    if (better(v, s, th_val, th_idx) || (v == th_val && s == th_idx)) dst[w++] = s;
   }
 }
 

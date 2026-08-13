@@ -277,7 +277,8 @@ class AgentRecordMutationTests(unittest.TestCase):
         architecture re-pins it by hand. Muse Glimmer took it 361 -> 362
         (`c8fc24a50`); the seven recipe architectures that had no row at all took
         it 362 -> 369 (#609, #610, `eba6ab7c7`); LTX-2.5 took it 369 -> 370
-        (#435, `cefacd2d0`). Without this, bumping the number to silence a
+        (#435, `cefacd2d0`); MiniMax-Music3 took it 370 -> 371 (#672). Without
+        this, bumping the number to silence a
         failure is indistinguishable from bumping it because a row really landed.
         """
         clean: list[str] = []

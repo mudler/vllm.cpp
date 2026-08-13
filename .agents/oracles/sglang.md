@@ -1,4 +1,4 @@
-# SGLang, including SGLang-Omni
+# SGLang — cross-check, performance floor, and vLLM-absent model paths
 
 Two distinct roles, and one forbidden one — the methodology is
 [`../specs/sglang-parity-oracle.md`](../specs/sglang-parity-oracle.md) and the
@@ -10,9 +10,9 @@ enumerated surface is [`../sglang-matrix.md`](../sglang-matrix.md):
 - **Performance floor.** Wherever SGLang beats vLLM on an equivalent workload,
   SGLang is the binding floor.
 - **Model paths vLLM does not implement at all.** This is the case the fallback
-  rule was written for, and today it is SGLang-Omni: `MiniMax-Music3`
-  (`minimax_music3`) is served by SGLang-Omni and registered nowhere in vLLM.
-  Here SGLang is not a cross-check, it is the only available reference.
+  rule was written for. Where that path is served by the SGLang-Omni pipeline
+  runtime rather than SGLang proper — `MiniMax-Music3` is the first — the binding
+  record is [`sglang-omni.md`](sglang-omni.md), not this one.
 - **Forbidden:** porting SGLang's data structures as a second, incompatible
   abstraction. A SGLang-distinct behavior is an opt-in over our vLLM-derived
   design, never a fork of the engine.
@@ -25,9 +25,10 @@ separately pins tag `v0.5.13` / `28b095c01005d4a3a2a5b637b7d028b07fba31b2` and
 its runtime image, and that pin is never silently substituted into the other's
 evidence.
 
-**SGLang-Omni is a third repository and has no pin of its own yet.** It is
-covered by this record's scope, not by this record's revision; a Music3-class
-lane that needs it owes the pin before it can claim a gate.
+**SGLang-Omni is a third repository and has its own record**, since #672:
+[`sglang-omni.md`](sglang-omni.md). This record covers SGLang proper. A model
+present in one and absent from the other is the normal case, which is why the two
+are not folded together.
 
 **Not gateable yet:** no SGLang run has been recorded on this project's hardware.
 The parity-oracle spec is explicitly a read-only scoping spike ("no engine code,

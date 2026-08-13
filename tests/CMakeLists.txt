@@ -17,6 +17,10 @@ set_tests_properties(test_serve_low_tools PROPERTIES
 
 function(vllm_cpp_add_test name)
   add_executable(${name} ${ARGN})
+  # tests/ on the include path so every suite can reach the shared test helpers
+  # under tests/support/ as "support/<name>.h". No header name under tests/
+  # collides with one under include/ or src/, so nothing else resolves here.
+  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   if(TARGET vllm::sanitize_test_shared)
     target_link_libraries(${name} PRIVATE vllm::sanitize_test_shared vllm_test_main)
   else()
@@ -33,6 +37,17 @@ function(vllm_cpp_add_test name)
   # returns 77, which today is all but test_voxtral_e2e.
   set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
 endfunction()
+
+# The gate on the golden-comparison helper itself (issue #449): a NaN operand
+# must be a FAILURE, never the 0.0 that both historical spellings returned.
+vllm_cpp_add_test(test_max_abs_diff support/test_max_abs_diff.cpp)
+# ...and the wrapper must RAISE, not merely return +infinity, so the
+# "these must differ" callers cannot read a NaN as a difference. That case is
+# skipped in the normal run because a raised failure would count as one; here it
+# is forced on and REQUIRED to exit non-zero. Without the guard this entry fails.
+add_test(NAME test_max_abs_diff_nan_raises
+  COMMAND test_max_abs_diff --no-skip --test-case=*RAISES*)
+set_tests_properties(test_max_abs_diff_nan_raises PROPERTIES WILL_FAIL TRUE)
 
 vllm_cpp_add_test(test_version vllm/test_version.cpp)
 set(_vllm_cpp_expected_build_version "${PROJECT_VERSION}")
@@ -101,6 +116,45 @@ vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 vllm_cpp_add_test(test_minimax_h3_video_fold vllm/models/test_minimax_h3_video_fold.cpp)
 target_compile_definitions(test_minimax_h3_video_fold PRIVATE
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# LTX-2.5 L1: the GENERALIZED VideoEngine seam + its family registry, held to
+# the SAME pre-fold goldens through the abstract path (and to the never-guess
+# refusals). Needs the fold fixture builder, which lives beside the H3 test.
+vllm_cpp_add_test(test_video_engine vllm/multimodal/test_video_engine.cpp)
+target_include_directories(test_video_engine PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_compile_definitions(test_video_engine PRIVATE
+  MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold")
+# LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
+# over a reduced-dimension checkpoint set written in the SHIPPED file format.
+vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
+# LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
+# live next to the test source, like every other generated .inc.
+vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
+# LTX-2.5 L8: the DEVICE-RESIDENT forward, held to the SAME ltx2_goldens.inc the
+# L2 CPU gate above is held to. Its own target so test_ltx2's recorded 29/1615
+# baseline stays exactly where it is; it runs on the CPU backend everywhere and
+# adds the CUDA cases when a CUDA backend is registered.
+vllm_cpp_add_test(test_ltx2_device vllm/models/test_ltx2_device.cpp)
+# LTX-2.5 L4: the VAE bricks, gated against upstream ltx_core executed at reduced
+# dimensions. ltx2_vae_goldens.inc lives next to the test source.
+vllm_cpp_add_test(test_ltx2_vae vllm/models/test_ltx2_vae.cpp)
+target_include_directories(test_ltx2_vae PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX-2.5 L3: the text conditioning path, gated against upstream ltx_core executed
+# at reduced dimensions. ltx2_text_goldens.inc lives next to the test source.
+vllm_cpp_add_test(test_ltx2_text_encoder vllm/models/test_ltx2_text_encoder.cpp)
+target_include_directories(test_ltx2_text_encoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX-2.5 L5: the pipeline layer — sigma schedule, noiser, diffusion steps,
+# guidance, patchifiers, the recipe table, the latent spatial upsampler, the
+# duration head and the embeddings connector. ltx2_pipeline_goldens.inc lives
+# next to the test source.
+vllm_cpp_add_test(test_ltx2_pipeline vllm/models/test_ltx2_pipeline.cpp)
+target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# LTX-2.5 L6: the quantized loaders, gated three ways — the SHIPPED checkpoints'
+# own manifests, a few hundred of their own bytes against torch, and synthetic
+# files for whole-model materialization. All three .inc files live beside the
+# test source.
+vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
+target_include_directories(test_ltx2_loader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
@@ -164,6 +218,13 @@ foreach(_gateup_lever VT_DENSE_MARLIN_GATEUP VT_NVFP4_MARLIN VT_MOE_FUSED_W13)
     PROPERTIES ENVIRONMENT "${_gateup_lever}=0")
 endforeach()
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+# POOL-DEVICE-KEY (#516, .agents/specs/pool-device-key.md): the shared scratch
+# pool's free list must be keyed by DEVICE as well as size class, or a block
+# allocated through one backend is handed to a DBuf running on another —
+# host-side SIGSEGV in one direction, silent all-NaN output in the other.
+# Hardware-free: two fake backends stand in for two devices, so this runs
+# everywhere and in ~milliseconds rather than only where a GPU is present.
+vllm_cpp_add_test(test_device_pool vllm/models/test_device_pool.cpp)
 vllm_cpp_add_test(test_moe_resident_lifetime vllm/models/test_moe_resident_lifetime.cpp)
 vllm_cpp_add_test(test_qwen3_load vllm/models/test_qwen3_load.cpp)
 vllm_cpp_add_test(test_qwen3_forward vllm/models/test_qwen3_forward.cpp)
@@ -1259,6 +1320,13 @@ vllm_cpp_add_test(test_ops_attention vt/test_ops_attention.cpp)
 # byte-exact scalar kernel, full-key-range coverage, fall-through totality, and the
 # VT_FA2_DENSE A/B knob. CUDA-only content; skips cleanly on a CPU box.
 vllm_cpp_add_test(test_ops_attention_dense_fa2 vt/test_ops_attention_dense_fa2.cpp)
+# vt::AttentionCross, DIRECTLY, on every backend that registers it. Its own
+# target rather than more cases in test_ops_attention or test_ltx2_device, both
+# of which carry recorded baselines. It exists because the CUDA kernel's whole
+# flash-tiling machinery (cross-tile rescale, multi-block launch, npl>1 head
+# split, GQA broadcast, ChooseTileCols' halving) is unreachable from every
+# LTX-2.5 call geometry, which is tiles=1/npl=1/nblk=1/Hq==Hkv throughout.
+vllm_cpp_add_test(test_ops_attention_cross vt/test_ops_attention_cross.cpp)
 vllm_cpp_add_test(test_ops_dflash_block_attn vt/test_ops_dflash_block_attn.cpp)
 vllm_cpp_add_test(test_ops_dflash_paged_block_attn vt/test_ops_dflash_paged_block_attn.cpp)
 vllm_cpp_add_test(test_ops_reshape_cache vt/test_ops_reshape_cache.cpp)

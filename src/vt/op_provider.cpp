@@ -237,6 +237,258 @@ void Announce(OpId op, DeviceType device, Slot& slot, const OpProvider* chosen,
                caps.compute_minor, caps.valid ? "valid" : "unprobed");
 }
 
+// The canonical spelling of an op, for user-facing messages. Mirrors
+// DeviceTypeName (include/vt/device.h): a data list, not a device-specific
+// branch. The switch is deliberately EXHAUSTIVE and carries no `default` — with
+// -Wall -Werror, appending an OpId without naming it fails the build, which is
+// what keeps this from drifting behind the enum.
+const char* OpNameImpl(OpId op) {
+  switch (op) {
+    case OpId::kMatmul:
+      return "Matmul";
+    case OpId::kRmsNorm:
+      return "RmsNorm";
+    case OpId::kSiluAndMul:
+      return "SiluAndMul";
+    case OpId::kRopeNeox:
+      return "RopeNeox";
+    case OpId::kEmbedding:
+      return "Embedding";
+    case OpId::kCausalConv1dFwd:
+      return "CausalConv1dFwd";
+    case OpId::kCausalConv1dUpdate:
+      return "CausalConv1dUpdate";
+    case OpId::kCausalConv1dSpecUpdate:
+      return "CausalConv1dSpecUpdate";
+    case OpId::kL2Norm:
+      return "L2Norm";
+    case OpId::kRmsNormGated:
+      return "RmsNormGated";
+    case OpId::kGdnPrefill:
+      return "GdnPrefill";
+    case OpId::kGdnDecode:
+      return "GdnDecode";
+    case OpId::kGdnSpecDecode:
+      return "GdnSpecDecode";
+    case OpId::kGdnPackedDecode:
+      return "GdnPackedDecode";
+    case OpId::kKdaGatedDeltaRule:
+      return "KdaGatedDeltaRule";
+    case OpId::kKdaChunkPrefill:
+      return "KdaChunkPrefill";
+    case OpId::kMoeRouterTopK:
+      return "MoeRouterTopK";
+    case OpId::kMoeCombine:
+      return "MoeCombine";
+    case OpId::kAttention:
+      return "Attention";
+    case OpId::kAttentionCross:
+      return "AttentionCross";
+    case OpId::kAttentionDenseFast:
+      return "AttentionDenseFast";
+    case OpId::kAttentionDenseFlash:
+      return "AttentionDenseFlash";
+    case OpId::kDFlashBlockAttention:
+      return "DFlashBlockAttention";
+    case OpId::kDFlashPagedBlockAttention:
+      return "DFlashPagedBlockAttention";
+    case OpId::kReshapeAndCache:
+      return "ReshapeAndCache";
+    case OpId::kConcatAndCacheMla:
+      return "ConcatAndCacheMla";
+    case OpId::kMlaDecodeAttention:
+      return "MlaDecodeAttention";
+    case OpId::kMlaPrefillAttention:
+      return "MlaPrefillAttention";
+    case OpId::kGatherMlaCache:
+      return "GatherMlaCache";
+    case OpId::kMergeAttnStates:
+      return "MergeAttnStates";
+    case OpId::kPagedAttention:
+      return "PagedAttention";
+    case OpId::kApplyTemperature:
+      return "ApplyTemperature";
+    case OpId::kGreedyArgmax:
+      return "GreedyArgmax";
+    case OpId::kApplyTopKTopP:
+      return "ApplyTopKTopP";
+    case OpId::kComputeProbs:
+      return "ComputeProbs";
+    case OpId::kComputeLogprobs:
+      return "ComputeLogprobs";
+    case OpId::kRandomSample:
+      return "RandomSample";
+    case OpId::kApplyPenalties:
+      return "ApplyPenalties";
+    case OpId::kApplyMinP:
+      return "ApplyMinP";
+    case OpId::kApplyLogitBias:
+      return "ApplyLogitBias";
+    case OpId::kApplyTokenMask:
+      return "ApplyTokenMask";
+    case OpId::kApplyAllowedTokenIds:
+      return "ApplyAllowedTokenIds";
+    case OpId::kMatmulNvfp4:
+      return "MatmulNvfp4";
+    case OpId::kScaledFp4Quant:
+      return "ScaledFp4Quant";
+    case OpId::kSiluMulFp4Quant:
+      return "SiluMulFp4Quant";
+    case OpId::kSiluAndMulFp4Quant:
+      return "SiluAndMulFp4Quant";
+    case OpId::kSigmoidGateFp4Quant:
+      return "SigmoidGateFp4Quant";
+    case OpId::kMatmulNvfp4Fp4:
+      return "MatmulNvfp4Fp4";
+    case OpId::kMatmulNvfp4Cutlass:
+      return "MatmulNvfp4Cutlass";
+    case OpId::kMatmulFp8Cutlass:
+      return "MatmulFp8Cutlass";
+    case OpId::kMatmulFp8CublasLt:
+      return "MatmulFp8CublasLt";
+    case OpId::kQuantFp8Static:
+      return "QuantFp8Static";
+    case OpId::kSwizzleBlockscale:
+      return "SwizzleBlockscale";
+    case OpId::kMoeGroupedGemmNvfp4:
+      return "MoeGroupedGemmNvfp4";
+    case OpId::kMoeSiluMul:
+      return "MoeSiluMul";
+    case OpId::kCastBf16:
+      return "CastBf16";
+    case OpId::kCastF32:
+      return "CastF32";
+    case OpId::kMulColVecF32:
+      return "MulColVecF32";
+    case OpId::kAttnGateSplit:
+      return "AttnGateSplit";
+    case OpId::kSigmoidGateBf16:
+      return "SigmoidGateBf16";
+    case OpId::kGdnGBeta:
+      return "GdnGBeta";
+    case OpId::kGdnConvSplit:
+      return "GdnConvSplit";
+    case OpId::kQkvSplit:
+      return "QkvSplit";
+    case OpId::kSharedExpertGate:
+      return "SharedExpertGate";
+    case OpId::kMoeCombineGate:
+      return "MoeCombineGate";
+    case OpId::kMoeGroupedGemmNvfp4Marlin:
+      return "MoeGroupedGemmNvfp4Marlin";
+    case OpId::kGdnPostConv:
+      return "GdnPostConv";
+    case OpId::kRopeCosSinCache:
+      return "RopeCosSinCache";
+    case OpId::kAttnQkNormRopeGate:
+      return "AttnQkNormRopeGate";
+    case OpId::kAttnQkNormRope:
+      return "AttnQkNormRope";
+    case OpId::kFusedChain:
+      return "FusedChain";
+    case OpId::kRmsNormQuantFp8:
+      return "RmsNormQuantFp8";
+    case OpId::kRmsNormGatedQuantFp8:
+      return "RmsNormGatedQuantFp8";
+    case OpId::kMatmulBT:
+      return "MatmulBT";
+    case OpId::kMatmulBTQuant:
+      return "MatmulBTQuant";
+    case OpId::kMatmulBTQuantGrouped:
+      return "MatmulBTQuantGrouped";
+    case OpId::kDropinProbe:
+      return "DropinProbe";
+    case OpId::kRopeFromCache:
+      return "RopeFromCache";
+    case OpId::kGdnStateGather:
+      return "GdnStateGather";
+    case OpId::kGdnStateScatter:
+      return "GdnStateScatter";
+    case OpId::kIndexSelect:
+      return "IndexSelect";
+    case OpId::kIndexCopy:
+      return "IndexCopy";
+    case OpId::kMoeGroupedGemmBf16:
+      return "MoeGroupedGemmBf16";
+    case OpId::kLayerNorm:
+      return "LayerNorm";
+    case OpId::kRelu:
+      return "Relu";
+    case OpId::kGeluTanh:
+      return "GeluTanh";
+    case OpId::kGeluErf:
+      return "GeluErf";
+    case OpId::kAdd:
+      return "Add";
+    case OpId::kBatchedMatmul:
+      return "BatchedMatmul";
+    case OpId::kConcatMlaNopeRope:
+      return "ConcatMlaNopeRope";
+    case OpId::kGeluAndMul:
+      return "GeluAndMul";
+    case OpId::kMulScalar:
+      return "MulScalar";
+    case OpId::kSoftCap:
+      return "SoftCap";
+    case OpId::kGreedyRejectionSample:
+      return "GreedyRejectionSample";
+    case OpId::kAllReduce:
+      return "AllReduce";
+    case OpId::kAllGather:
+      return "AllGather";
+    case OpId::kSend:
+      return "Send";
+    case OpId::kRecv:
+      return "Recv";
+    case OpId::kDeepseekV4Mhc:
+      return "DeepseekV4Mhc";
+    case OpId::kDeepseekV4Dsa:
+      return "DeepseekV4Dsa";
+    case OpId::kDeepseekV4Compressor:
+      return "DeepseekV4Compressor";
+    case OpId::kDeepseekV4Moe:
+      return "DeepseekV4Moe";
+    case OpId::kReshapeAndCacheFp8:
+      return "ReshapeAndCacheFp8";
+    case OpId::kMoeGateUpSwiGLUGrouped:
+      return "MoeGateUpSwiGLUGrouped";
+    case OpId::kFusedNormRope:
+      return "FusedNormRope";
+    case OpId::kMoeGroupedGemmBf16GateUpSilu:
+      return "MoeGroupedGemmBf16GateUpSilu";
+    case OpId::kLaguna:
+      return "Laguna";
+    case OpId::kMarlinDenseGemm:
+      return "MarlinDenseGemm";
+    case OpId::kMiniMaxH3:
+      return "MiniMaxH3";
+    // Absorbed from origin/main, named in enum order. This exhaustive switch IS
+    // the drift guard (0541cbeaa), and it carries no `default`, so merging main
+    // is precisely when it is supposed to fire.
+    case OpId::kAttentionDenseFa2:
+      return "AttentionDenseFa2";
+    case OpId::kMatmulFp8CublasLtAlphaVec:
+      return "MatmulFp8CublasLtAlphaVec";
+    case OpId::kMamba2ChunkScan:
+      return "Mamba2ChunkScan";
+    case OpId::kMamba2StateUpdate:
+      return "Mamba2StateUpdate";
+    case OpId::kRmsNormGatedGroup:
+      return "RmsNormGatedGroup";
+    case OpId::kLtx2:
+      return "Ltx2";
+    case OpId::kConv2d:
+      return "Conv2d";
+    case OpId::kDepthwiseConv1d:
+      return "DepthwiseConv1d";
+    case OpId::kAttentionRelPos:
+      return "AttentionRelPos";
+    case OpId::kCount:
+      break;
+  }
+  return "unknown";
+}
+
 void* Resolve(OpId op, DeviceType device, Slot& slot) {
   ProviderCaps caps = GetDeviceProviderCaps(device);
   const OpProvider* chosen = Choose(slot, caps, nullptr);
@@ -251,9 +503,12 @@ void* Resolve(OpId op, DeviceType device, Slot& slot) {
   if (chosen == nullptr) {
     slot.fallbacks.fetch_add(1, std::memory_order_relaxed);
     slot.resolved_none.store(true, std::memory_order_relaxed);
-    VT_CHECK(false, std::string("no kernel for op ") +
-                        std::to_string(static_cast<int>(op)) + " on device type " +
-                        std::to_string(static_cast<int>(device)));
+    // Refuse BY NAME. The integers stay for grep-ability, but a reader must not
+    // have to count enumerators in include/vt/ops.h to learn what was refused.
+    VT_CHECK(false, std::string("no kernel for op ") + OpNameImpl(op) + " (id " +
+                        std::to_string(static_cast<int>(op)) + ") on device " +
+                        DeviceTypeName(device) + " (type " +
+                        std::to_string(static_cast<int>(device)) + ")");
     return nullptr;
   }
   // Reference-tier accounting: count it, and warn LOUDLY exactly once per
@@ -263,9 +518,9 @@ void* Resolve(OpId op, DeviceType device, Slot& slot) {
     RefTierHits().fetch_add(1, std::memory_order_relaxed);
     if (!slot.ref_announced.exchange(true, std::memory_order_relaxed)) {
       std::fprintf(stderr,
-                   "[vt reference-tier] op=%d device=%d has NO native kernel; "
+                   "[vt reference-tier] op=%s device=%s has NO native kernel; "
                    "running the PORTABLE CPU fallback (correct but slow)\n",
-                   static_cast<int>(op), static_cast<int>(device));
+                   OpNameImpl(op), DeviceTypeName(device));
     }
   }
   slot.last_selected.store(chosen->name, std::memory_order_relaxed);
@@ -340,6 +595,8 @@ void RegisterOp(OpId op, DeviceType device, void* fn) {
   p.fn = fn;
   RegisterOpProvider(op, device, p);
 }
+
+const char* OpName(OpId op) { return OpNameImpl(op); }
 
 void* GetOp(OpId op, DeviceType device) {
   Slot& slot = At(op, device);

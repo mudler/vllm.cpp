@@ -2571,7 +2571,7 @@ struct LagunaGraph {
           vt::Backend& b = vt::GetBackend(dev);
           b.RecordEvent(aux_fork, q);          // event0.record() on the main stream (hn ready)
           b.QueueWaitEvent(aux_q, aux_fork);   // aux waits event0 before reading hn
-          ActivePoolScope guard(&AuxPool());   // shared scratch from AuxPool (see device_pool.h)
+          ActivePoolScope guard(&AuxPool(b));  // shared scratch from AuxPool (see device_pool.h)
           LagunaSharedExpertMarlinInto(aux_q, lw.moe, hn.data(), H, so.data());  // fp4 shared on aux
           b.RecordEvent(aux_done, aux_q);      // event1.record() on the aux stream (join target)
         }

@@ -14,6 +14,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -44,6 +45,7 @@
 #include "vllm/model_executor/models/minimax_h3.h"    // mux argv (v12)
 #include "vllm/multimodal/parakeet_transcription.h"     // vllm_transcribe (v11)
 #include "vllm/multimodal/minimax_h3_video.h"          // vllm_video_* (v12)
+#include "vllm/multimodal/video_engine.h"              // the v18 family registry
 #include "vllm/entrypoints/openai/server_main.h"   // vllm_server_main (v17)
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
@@ -1396,10 +1398,11 @@ VLLM_API void vllm_embedding_result_free(vllm_embedding_result* out) {
   out->prompt_tokens = 0;
 }
 
-// ── Video+audio generation (ABI v12, MiniMax-H3) ────────────────────────────
-// Thin C wrappers over the ONE library seam
-// (vllm::multimodal::MiniMaxH3VideoEngine) the server's /v1/videos routes and
-// the minimax-h3-gen example drive — see include/vllm.h for the contract.
+// ── Video+audio generation (ABI v12; generalized at v18) ────────────────────
+// Thin C wrappers over the ONE library seam — since v18 the ABSTRACT one
+// (vllm::multimodal::VideoEngine + LoadVideoEngine's family registry), which
+// the server's /v1/videos routes and the minimax-h3-gen example also drive.
+// See include/vllm.h for the contract.
 
 VLLM_API vllm_video_model_params vllm_video_model_params_default(void) {
   vllm_video_model_params p;
@@ -1414,9 +1417,42 @@ VLLM_API vllm_video_params vllm_video_params_default(void) {
 }
 
 // The opaque video handle: owns the loaded checkpoint set + staged weights.
+// `family` caches the resolved name so vllm_video_engine_family can hand back
+// storage that lives exactly as long as the handle.
 struct vllm_video_engine {
-  std::unique_ptr<vllm::multimodal::MiniMaxH3VideoEngine> engine;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine;
+  std::string family;
 };
+
+namespace {
+
+// Lower the v18 parallel key/value arrays into the seam's extras map. Returns
+// false with *error set when the arrays are malformed — a NULL entry is a
+// caller bug, and reading past it would be undefined rather than merely wrong.
+bool VideoExtrasFromArrays(const char* const* keys, const char* const* values, int32_t n,
+                           const char* field, std::map<std::string, std::string>* out,
+                           std::string* error) {
+  if (n == 0) return true;
+  if (n < 0) {
+    *error = std::string(field) + ": n_extras is negative";
+    return false;
+  }
+  if (keys == nullptr || values == nullptr) {
+    *error = std::string(field) + ": n_extras > 0 but extra_keys/extra_values is null";
+    return false;
+  }
+  for (int32_t i = 0; i < n; ++i) {
+    if (keys[i] == nullptr || values[i] == nullptr || keys[i][0] == '\0') {
+      *error = std::string(field) + ": extra " + std::to_string(i) +
+               " has a null/empty key or a null value";
+      return false;
+    }
+    (*out)[keys[i]] = values[i];
+  }
+  return true;
+}
+
+}  // namespace
 
 VLLM_API vllm_status vllm_video_engine_load(const vllm_video_model_params* params,
                                             vllm_video_engine** out) {
@@ -1429,22 +1465,45 @@ VLLM_API vllm_status vllm_video_engine_load(const vllm_video_model_params* param
     SetError("vllm_video_engine_load: params or params->dit_path is null");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
+  vllm::multimodal::VideoModelParams mp;
+  mp.dit_path = OrEmpty(params->dit_path);
+  mp.encoder_path = OrEmpty(params->encoder_path);
+  mp.tokenizer_path = OrEmpty(params->tokenizer_path);
+  mp.video_vae_path = OrEmpty(params->video_vae_path);
+  mp.video_vae_config_path = OrEmpty(params->video_vae_config_path);
+  mp.audio_vae_path = OrEmpty(params->audio_vae_path);
+  mp.audio_vae_config_path = OrEmpty(params->audio_vae_config_path);
+  mp.prompt_embeds_path = OrEmpty(params->prompt_embeds_path);
+  mp.family = OrEmpty(params->family);
+  mp.device = params->device;
+  mp.dequant_bf16 = params->dequant_bf16;
+  mp.fp4_resident = params->fp4_resident;
+
+  std::string extras_error;
+  if (!VideoExtrasFromArrays(params->extra_keys, params->extra_values, params->n_extras,
+                             "vllm_video_engine_load", &mp.extras, &extras_error)) {
+    SetError(extras_error);
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  // The v12 `partition` field is the documented ALIAS for the load extra
+  // "partition". Both spellings disagreeing is a caller error with no defensible
+  // winner, so it is refused rather than resolved silently.
+  const std::string partition = OrEmpty(params->partition);
+  if (!partition.empty()) {
+    const auto it = mp.extras.find("partition");
+    if (it != mp.extras.end() && it->second != partition) {
+      SetError("vllm_video_engine_load: params->partition ('" + partition +
+               "') and the extra \"partition\" ('" + it->second +
+               "') disagree; supply one spelling");
+      return VLLM_ERR_INVALID_ARGUMENT;
+    }
+    mp.extras["partition"] = partition;
+  }
+
   try {
-    vllm::multimodal::MiniMaxH3VideoModelParams mp;
-    mp.dit_path = OrEmpty(params->dit_path);
-    mp.encoder_path = OrEmpty(params->encoder_path);
-    mp.tokenizer_path = OrEmpty(params->tokenizer_path);
-    mp.video_vae_path = OrEmpty(params->video_vae_path);
-    mp.video_vae_config_path = OrEmpty(params->video_vae_config_path);
-    mp.audio_vae_path = OrEmpty(params->audio_vae_path);
-    mp.audio_vae_config_path = OrEmpty(params->audio_vae_config_path);
-    mp.prompt_embeds_path = OrEmpty(params->prompt_embeds_path);
-    mp.partition = OrEmpty(params->partition);
-    mp.device = params->device;
-    mp.dequant_bf16 = params->dequant_bf16;
-    mp.fp4_resident = params->fp4_resident;
     auto handle = std::make_unique<vllm_video_engine>();
-    handle->engine = vllm::multimodal::MiniMaxH3VideoEngine::Load(mp);
+    handle->engine = vllm::multimodal::LoadVideoEngine(mp);
+    handle->family = handle->engine->family();
     *out = handle.release();
     ClearError();
     return VLLM_OK;
@@ -1458,6 +1517,10 @@ VLLM_API vllm_status vllm_video_engine_load(const vllm_video_model_params* param
 }
 
 VLLM_API void vllm_video_engine_free(vllm_video_engine* engine) { delete engine; }
+
+VLLM_API const char* vllm_video_engine_family(const vllm_video_engine* engine) {
+  return engine == nullptr ? nullptr : engine->family.c_str();
+}
 
 namespace {
 
@@ -1498,8 +1561,16 @@ VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
     SetError("vllm_video_generate: output_dir is required (frames + WAV land there)");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
+  vllm::multimodal::VideoGenParams gen;
+  {
+    std::string extras_error;
+    if (!VideoExtrasFromArrays(params->extra_keys, params->extra_values, params->n_extras,
+                               "vllm_video_generate", &gen.extras, &extras_error)) {
+      SetError(extras_error);
+      return VLLM_ERR_INVALID_ARGUMENT;
+    }
+  }
   try {
-    vllm::multimodal::MiniMaxH3VideoGenParams gen;
     gen.prompt = OrEmpty(params->prompt);
     gen.width = params->width;
     gen.height = params->height;
@@ -1519,7 +1590,7 @@ VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
     gen.ref_audio_path = OrEmpty(params->ref_audio);
     gen.output_dir = params->output_dir;
 
-    const vllm::multimodal::MiniMaxH3VideoResult result = engine->engine->Generate(gen);
+    const vllm::multimodal::VideoResult result = engine->engine->Generate(gen);
 
     vllm_video_result r;
     std::memset(&r, 0, sizeof(r));

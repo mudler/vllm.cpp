@@ -274,6 +274,8 @@ MiniMaxH3VideoEngine::MiniMaxH3VideoEngine(MiniMaxH3VideoEngine&&) noexcept = de
 MiniMaxH3VideoEngine& MiniMaxH3VideoEngine::operator=(MiniMaxH3VideoEngine&&) noexcept = default;
 MiniMaxH3VideoEngine::~MiniMaxH3VideoEngine() = default;
 
+std::string MiniMaxH3VideoEngine::family() const { return kMiniMaxH3VideoFamily; }
+
 vt::Device MiniMaxH3VideoEngine::device() const { return impl_->device; }
 bool MiniMaxH3VideoEngine::has_encoder() const { return impl_->has_encoder; }
 bool MiniMaxH3VideoEngine::has_prompt_embeds() const { return !impl_->prompt_embeds.empty(); }
@@ -695,42 +697,146 @@ MiniMaxH3VideoResult MiniMaxH3VideoEngine::Generate(const MiniMaxH3VideoGenParam
 }
 
 // ── the /v1/videos request mapping (library-owned so HTTP and FFI cannot
-// drift; absorbed from the pre-fold server lambda) ───────────────────────────
+// drift; absorbed from the pre-fold server lambda). At L1 the mapping itself
+// moved to the FAMILY-AGNOSTIC seam (VideoGenParamsFromRequest) — nothing in it
+// was H3-specific — and this stays as the H3-typed spelling its callers use, so
+// there is one implementation rather than two that can disagree. ─────────────
 MiniMaxH3VideoGenParams MiniMaxH3VideoGenParamsFromRequest(
     const ::vllm::openai::VideoRequest& request, const std::string& output_dir) {
+  return MiniMaxH3VideoGenParamsFromGeneric(VideoGenParamsFromRequest(request, output_dir));
+}
+
+// ── The generalized VideoEngine seam (LTX-2.5 L1) ────────────────────────────
+// Adapters ONLY. Every one of these converts and calls the H3-typed member
+// above; none of them re-implements a step, which is what keeps the fold gate's
+// byte-identity claim true for the generic path as well.
+
+MiniMaxH3VideoModelParams MiniMaxH3VideoModelParamsFromGeneric(const VideoModelParams& params) {
+  MiniMaxH3VideoModelParams mp;
+  mp.dit_path = params.dit_path;
+  mp.encoder_path = params.encoder_path;
+  mp.tokenizer_path = params.tokenizer_path;
+  mp.video_vae_path = params.video_vae_path;
+  mp.video_vae_config_path = params.video_vae_config_path;
+  mp.audio_vae_path = params.audio_vae_path;
+  mp.audio_vae_config_path = params.audio_vae_config_path;
+  mp.prompt_embeds_path = params.prompt_embeds_path;
+  // The ONE H3-specific load field. An absent key is the empty string, which is
+  // declared-but-unknown — the #77 guard then refuses every full render, which
+  // is the same thing an omitted `--partition` has always done.
+  mp.partition = VideoExtra(params.extras, "partition");
+  mp.device = params.device;
+  mp.dequant_bf16 = params.dequant_bf16;
+  mp.fp4_resident = params.fp4_resident;
+  mp.encoder_max_layers = params.encoder_max_layers;
+  return mp;
+}
+
+VideoModelParams MiniMaxH3VideoModelParamsToGeneric(const MiniMaxH3VideoModelParams& params) {
+  VideoModelParams out;
+  out.dit_path = params.dit_path;
+  out.encoder_path = params.encoder_path;
+  out.tokenizer_path = params.tokenizer_path;
+  out.video_vae_path = params.video_vae_path;
+  out.video_vae_config_path = params.video_vae_config_path;
+  out.audio_vae_path = params.audio_vae_path;
+  out.audio_vae_config_path = params.audio_vae_config_path;
+  out.prompt_embeds_path = params.prompt_embeds_path;
+  out.family = kMiniMaxH3VideoFamily;
+  out.device = params.device;
+  out.dequant_bf16 = params.dequant_bf16;
+  out.fp4_resident = params.fp4_resident;
+  out.encoder_max_layers = params.encoder_max_layers;
+  // Only set the key when there is something to say: an empty value would read
+  // as "declared as the empty partition" to a caller inspecting the map.
+  if (!params.partition.empty()) out.extras["partition"] = params.partition;
+  return out;
+}
+
+MiniMaxH3VideoGenParams MiniMaxH3VideoGenParamsFromGeneric(const VideoGenParams& params) {
   MiniMaxH3VideoGenParams gen;
-  gen.prompt = request.prompt;
-  gen.task = request.task;
-  gen.duration_seconds = request.duration_seconds;
-  gen.num_frames = request.num_frames;
-  gen.height = request.height;
-  gen.width = request.width;
-  gen.steps = request.num_inference_steps;
-  gen.flow_shift = request.flow_shift;
-  gen.audio_flow_shift = request.audio_flow_shift;
-  gen.seed = static_cast<uint64_t>(request.seed);
-  gen.has_seed = request.has_seed;
-  // OpenAI `input_reference` -> fl2va FIRST-FRAME conditioning: OpenAI
-  // documents it as the image the video STARTS FROM (image-to-video), which is
-  // exactly what a frame-0 keyframe expresses. The ref2va modalities OpenAI
-  // has no slot for enter through `metadata` instead; ParseVideoRequest has
-  // already refused the combinations the pipeline forbids.
-  if (!request.input_reference_bytes.empty()) {
-    gen.first_frame_ppm.assign(request.input_reference_bytes.begin(),
-                               request.input_reference_bytes.end());
-  } else {
-    gen.first_frame_path = request.input_reference_path;
+  gen.prompt = params.prompt;
+  gen.task = params.task;
+  gen.duration_seconds = params.duration_seconds;
+  gen.num_frames = params.num_frames;
+  gen.height = params.height;
+  gen.width = params.width;
+  gen.steps = params.steps;
+  gen.flow_shift = params.flow_shift;
+  gen.audio_flow_shift = params.audio_flow_shift;
+  gen.seed = params.seed;
+  gen.has_seed = params.has_seed;
+  gen.first_frame_path = params.first_frame_path;
+  gen.last_frame_path = params.last_frame_path;
+  gen.first_frame_ppm = params.first_frame_ppm;
+  gen.noise_aug = params.noise_aug;
+  gen.ref_image_paths = params.ref_image_paths;
+  gen.ref_video_dir = params.ref_video_dir;
+  gen.ref_audio_path = params.ref_audio_path;
+  gen.ref_audio_wav = params.ref_audio_wav;
+  gen.output_dir = params.output_dir;
+  // H3 defines no per-request family knob; an unknown extra is REFUSED rather
+  // than ignored, so a caller who mistypes a future LTX key on an H3 engine
+  // learns about it instead of silently getting the default render.
+  if (!params.extras.empty()) {
+    throw std::runtime_error("minimax_h3 video: unknown per-generation extra '" +
+                             params.extras.begin()->first + "' (this family defines none)");
   }
-  gen.noise_aug = 1.0;  // pin the frame exactly (the pre-fold server's choice)
-  gen.ref_video_dir = request.input_reference_video_dir;
-  if (!request.input_reference_audio_bytes.empty()) {
-    gen.ref_audio_wav.assign(request.input_reference_audio_bytes.begin(),
-                             request.input_reference_audio_bytes.end());
-  } else {
-    gen.ref_audio_path = request.input_reference_audio_path;
-  }
-  gen.output_dir = output_dir;
   return gen;
 }
+
+VideoResult MiniMaxH3VideoResultToGeneric(const MiniMaxH3VideoResult& result) {
+  VideoResult out;
+  out.frame_dir = result.frame_dir;
+  out.audio_path = result.audio_path;
+  out.frame_count = result.frame_count;
+  out.width = result.width;
+  out.height = result.height;
+  out.fps = result.fps;
+  out.sample_rate = result.sample_rate;
+  out.mux_argv = result.mux_argv;
+  out.mux_output_path = result.mux_output_path;
+  return out;
+}
+
+VideoResult MiniMaxH3VideoEngine::Generate(const VideoGenParams& params) {
+  return MiniMaxH3VideoResultToGeneric(Generate(MiniMaxH3VideoGenParamsFromGeneric(params)));
+}
+
+namespace {
+
+// Does this checkpoint set hold an H3 DiT? The discriminator is the DUAL patch
+// projection: H3 packs video and audio into ONE sequence through
+// `video_patch_proj` + `audio_patch_proj` (minimax_h3_gguf.cpp:100-103, the
+// names the loader binds by), and the four loader arms — ComfyUI GGUF, NVFP4
+// safetensors, the bf16 release shards, and the reduced fixtures — all carry
+// the checkpoint's own parameter names, so this one test covers every arm.
+// LTX-2.5 has neither name (it patchifies through `patchify_proj` and carries
+// its audio stream as `audio_ff.*` / `audio_attn*`), so the two cannot collide.
+//
+// Deliberately NOT keyed on the file extension or on "is it a directory": which
+// container a checkpoint was repackaged into says nothing about which model it
+// holds, and both families ship GGUF, safetensors and sharded arms.
+bool DetectMiniMaxH3Video(const VideoModelParams& params) {
+  std::vector<std::string> names;
+  std::string why;
+  if (!ReadVideoCheckpointTensorNames(params.dit_path, &names, &why)) return false;
+  bool video_patch = false, audio_patch = false;
+  for (const std::string& n : names) {
+    if (n == "video_patch_proj.weight") video_patch = true;
+    if (n == "audio_patch_proj.weight") audio_patch = true;
+    if (video_patch && audio_patch) return true;
+  }
+  return false;
+}
+
+std::unique_ptr<VideoEngine> LoadMiniMaxH3VideoFamily(const VideoModelParams& params) {
+  return MiniMaxH3VideoEngine::Load(MiniMaxH3VideoModelParamsFromGeneric(params));
+}
+
+}  // namespace
+
+REGISTER_VLLM_VIDEO_FAMILY(minimax_h3, kMiniMaxH3VideoFamily, DetectMiniMaxH3Video,
+                           LoadMiniMaxH3VideoFamily)
 
 }  // namespace vllm::multimodal

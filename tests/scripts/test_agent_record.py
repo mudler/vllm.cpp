@@ -278,6 +278,10 @@ class AgentRecordMutationTests(unittest.TestCase):
         seven recipe architectures that had no row at all took it 362 -> 369
         (#609, #610). Without this, bumping the number to silence a failure is
         indistinguishable from bumping it because a row really landed.
+        architecture re-pins it by hand. Muse Glimmer took it 361 -> 362, and
+        LTX-2.5 took it 362 -> 363. Without
+        this, bumping the number to silence a failure is indistinguishable from
+        bumping it because a row really landed.
         """
         clean: list[str] = []
         agent_record.check_matrices(clean)

@@ -128,6 +128,32 @@ context is never torn down, so the pointers stayed mapped — it simply produced
 corrupted or zeroed output tokens, intermittently
 ([#237](https://github.com/mudler/vllm.cpp/issues/237)).
 
+More than one **backend** in one process is likewise supported — a CPU forward
+running beside a CUDA one, which is what a diffusion pipeline with a host-side
+stage does. Until
+[#516](https://github.com/mudler/vllm.cpp/issues/516) it was not: the shared
+device-scratch pool was a single process-wide free list keyed by byte size class
+with no device in the key, so a block allocated through one backend was handed
+to the next caller of that size class on another. It has two symptoms and the
+direction picks which: a `cudaMalloc` block reaching a CPU forward segfaults in
+the host `memcpy`, and a host block reaching a CUDA forward produces output that
+is uniformly NaN rather than wrong. Neither can happen now — a scratch pool is
+bound to one backend and refuses any other with a `std::logic_error` naming both
+— and no user-facing flag or env var selects the behaviour: it is unconditional.
+
+One consequence is worth knowing before you add a backend. The scratch pool's
+residency cap now comes from *that device's* platform rather than from whichever
+device resolved first, so constructing a buffer on a backend whose platform was
+never registered raises instead of silently inheriting another platform's cap. A
+cap read off the wrong platform is a wrong number, not a default, and every
+backend the tree ships registers one.
+
+`VT_POOL_BYPASS=1` and `VT_POOL_EXACT=1` keep exactly the meanings
+[ENVIRONMENT.md](ENVIRONMENT.md) records for them. They are debugging lanes, not
+timing configurations, and the pool's own test suite is green under both, so
+either one stays usable as a discriminator when something else is under
+suspicion.
+
 ## Starting an agent-assisted contribution
 
 Run `scripts/agent-start.py` first. It reports an inherited worktree role or,
@@ -347,6 +373,204 @@ tokens quietly.
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
 
+### LTX-2.5: what runs, and what it cannot do
+
+LTX-2.5 is reachable as video family `ltx-2.5`, through the same
+`vllm_video_engine_load` / `vllm_video_generate` C ABI that serves MiniMax-H3,
+and through the `ltx2-gen` example that drives it. Its two VAE decoders, its two
+VAE ENCODERS with the mel front-end, the conditioning items that place encoded
+latents into the token stream, and its pipeline layer (the sigma schedule, the
+diffusion steps, guidance, the latent spatial x2 upsampler, the duration head and
+the embeddings connector) are implemented and gated. Several limits decide what
+you can actually ask for, and each refuses by name rather than rendering
+something else.
+
+In particular, the encoders being present does NOT mean image, keyframe,
+reference-video or reference-audio conditioning is usable: the video engine
+still refuses every one of those by name, because the request-side work between
+a file on disk and a tensor the encoder accepts — image decode, aspect-fill
+resize, and the H.264 CRF re-compression upstream performs before encoding
+whenever the resolved CRF is not `0` and the image is at least 2 pixels on its
+shorter side — is not ported. The engine also holds no
+encoder to call: it materializes the VAE DECODER key filters only, so no
+encoder weights are ever in memory, and the refusal names that rather than
+claiming the encoder itself is missing. Two encoder-level limits are worth
+stating in advance because they are refusals rather than approximations. A
+reference waveform whose sample rate differs from the audio VAE's is refused
+rather than resampled, since upstream uses a polyphase kaiser resampler this
+project does not carry. And a VAE configured with `latent_log_var: none` is
+refused, because upstream itself raises on it.
+
+**A typed prompt works.** `--encoder` names the Gemma-4 12B text tower and
+`--prompt` carries the words. The tower tokenizes them with its OWN embedded
+tokenizer — the shipped encoder stores `tokenizer.json` as a TENSOR, so there is
+no sibling file to point at — runs, aggregates all 49 hidden states, projects
+them to 4096 and 2048, and passes both streams through the embeddings connector
+before cross-attention. The tower is ~24 GB of host bf16 and stays resident,
+because a prompt arrives per request.
+
+One tokenization detail is a KNOWN DIVERGENCE rather than a mirror, and it is
+checkpoint-conditional: upstream tokenizes through the HuggingFace `__call__`
+with its default `add_special_tokens=True`, so it runs the tokenizer's
+post_processor, while this port calls the plain encode and prepends BOS by hand.
+On the shipped checkpoint the two are identical — its post_processor declares an
+EMPTY special-token map, measured on the shipped file rather than assumed — so
+nothing is lost today. A checkpoint whose post_processor DID add tokens would
+tokenize differently here.
+
+`--encoder-config` supplies the Gemma config, and it is required for the only
+shipped encoder: `vonkaiser`'s
+`gemma4-12b-with-proj-nvfp4-torchao.safetensors` carries no `__metadata__` at
+all. An encoder that declares one (the official bf16 build does, under
+`__metadata__["gemma_config"]`) needs no flag, and supplying both is refused
+rather than resolved — `layer_types`, `global_head_dim`,
+`num_global_key_value_heads` and `attention_k_eq_v` each resolve a different
+tower out of a byte-identical tensor set.
+
+Without `--encoder`, conditioning comes from `--prompt-embeds` plus
+`--audio-prompt-embeds`: rows of little-endian f32, 4096 wide for the video
+stream and 2048 for the audio stream, with the same row count in both. A
+`--prompt` with no tower is refused, and supplying only one of the two files is
+refused, because a stream left unconditioned renders instead of failing.
+
+**Asking what a clip was conditioned on.** `Ltx2VideoEngine::last_conditioning()`
+returns the trace of the last `Generate()` — whether the conditioning came from a
+prompt or from embeds, the prompt string, the row count and both stream widths, an
+FNV-1a digest over the exact f32 buffers cross-attention read, and each stream's
+absmax. It is returned **by value, under the engine's own lock**, so it is safe to
+call from a server thread while another thread renders — but `Generate` holds that
+same lock for the WHOLE render, so such a call blocks for minutes rather than
+returning a stale answer immediately. `completed` is true only if that
+`Generate()` returned: the trace is filled before the denoise loop, so a
+render that throws later leaves a populated trace behind, and this flag is what
+separates the two.
+
+It is a **change detector, not a quality measure**. It answers "did this render
+depend on this prompt, through these weights" and nothing else — it does not say
+the conditioning values are the ones upstream would produce.
+
+The text path runs on the CPU even when `--device cuda` puts the DiT on the GPU:
+everything in the text encoder is f32 by declaration and its device arm is owed.
+That is one host-side 12B forward over the prompt's own tokens per request,
+against a denoise loop of many 21B forwards.
+
+**Either source goes through the embeddings connector.** Both shipped LTX-2.5 DiTs
+carry two `*_embeddings_connector` families, 129 tensors each, and they are the
+8-layer 1-D transformer upstream runs between the caption projections and the
+DiT's cross-attention. The render applies it with the checkpoint's own weights,
+under the checkpoint's own `connector_*` configuration. Two consequences for the
+command line: the row count must be a multiple of the connector's learnable
+register count (128 on the shipped files), and `--prompt-valid-rows N` says how
+many of those rows are real tokens. The rest are padding, and padding is not
+inert here: the connector REPLACES it with its learnable register table, so a
+run that leaves the default renders as if every supplied row were caption.
+`--prompt-valid-rows` applies to the embeds path only — with `--encoder` the
+tokenizer supplies the mask, which is what that flag exists to stand in for.
+
+**The DiT config is required when the checkpoint does not carry one.** The
+shipped `vonkaiser` FP8 transformer has no `__metadata__` at all, and the values
+a config decides are ones no tensor shape encodes: `frequencies_precision` and
+`av_ca_timestep_scale_multiplier` move every RoPE angle and every audio/video
+modulation. Defaulting them resolves a different model from the same file, so
+the loader refuses and `--dit-config` supplies LTX-2.5's declared values.
+
+```sh
+ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
+         --dit-config ltx-2.5-transformer-config.json \
+         --model-version 2.5 --allow-unported \
+         --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+         --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+         --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+         --encoder gemma4-12b-with-proj-nvfp4-torchao.safetensors \
+         --encoder-config ltx-2.5-gemma4-text-config.json \
+         --prompt "a red fox running through deep snow at sunrise" \
+         --frames 25 --width 320 --height 192 --seed 20260812 \
+         --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
+```
+
+Swap the two `--encoder*` flags and `--prompt` for `--prompt-embeds` +
+`--audio-prompt-embeds` to condition from files instead.
+
+`--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
+64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
+half resolution). Omitting all three renders the recipe default, which is
+1024x1536 at 121 frames and is a much larger request than it looks.
+
+`--upsampler` is what the distilled recipe's second phase needs. Without it that
+phase refuses rather than skipping: its three-step refinement is what makes the
+upscaled latent valid, and decoding the half-resolution latent instead would hand
+back a smaller clip that looks like a completed request. `--max-phase 0` stops
+after the first phase deliberately.
+
+On the server, `--video-family ltx-2.5` pins the family instead of detecting it,
+and `--video-extra KEY=VALUE` (repeatable) carries the same family-specific load
+knobs the flags above map onto. Both are described under
+[the server's video flags](#video-family-and-family-specific-load-knobs).
+
+**Three things about that command are worth knowing before you run it.**
+
+*It is bounded by the VIDEO DECODE, well below the recipe's own defaults.*
+Staging the 21.00B FP8 transformer costs about 44 GB on a 119 GB GB10, and
+`--encoder` adds the text tower on top of that — roughly 24 GB of host bf16 that
+stays resident, because a prompt arrives per request. Every memory figure here
+was measured WITHOUT the tower, on the prompt-embeds path, so budget for both.
+**320x192 at 25 frames completes** through both distilled phases; 448x256 at 25
+frames finishes its denoise and then loses about 59 GB in 24 seconds inside the decode
+and has to be stopped. The denoise itself is flat at either size. Unified memory
+makes those host bytes and this class of box reboots rather than OOM-killing, so
+start small and grow, and put a memory watchdog in front of anything larger. The
+recipe default (1024x1536 at 121 frames) is far beyond what one GB10 holds today.
+Expect minutes, not seconds: most of a 320x192/25f render is spent single-threaded
+in the host VAE decode at 0% GPU.
+
+*The render behind those numbers was NOT prompted, and it renders a scene without
+rendering YOUR scene.* It was the EMBEDS path — `--prompt-embeds` with
+`--prompt-valid-rows 24`, over synthetic N(0, 0.2) rows, with no text tower on the
+path at all. With the connector wired the shipped 21.00B FP8 transformer produced
+a temporally coherent photorealistic clip at 320x192 / 25 frames: consistent
+subject, consistent background, frame-to-frame motion, where before the connector
+the same weights at the same settings produced smooth colour fields. But 104 of
+its 128 connector rows were the connector's own trained `learnable_registers`
+table, which is what upstream substitutes at PADDED positions, and the other 24
+were noise. So what conditioned that clip is the checkpoint's own learned default,
+not a depiction of anything anyone asked for — and on the embeds path it could not
+be otherwise, because rows read from a file are whatever you put in them rather
+than an encoded caption. Ask a `--prompt-embeds` run for a subject and you will
+not get it.
+
+*Nobody has yet run the command above end to end, and this page claims nothing
+about what it renders.* The typed-prompt path is gated all the way through —
+tokenizer, Gemma-4 tower, connector, cross-attention — but the gate is a
+REDUCED-DIMENSION synthetic encoder under CPU Release, with no real checkpoint
+anywhere in it. A real-checkpoint prompted render is OWED. Until it runs, neither
+claim is available: not that `--prompt "a red fox…"` puts a fox on the screen, and
+not that it fails to. `last_conditioning()` answers a narrower question — that the
+render depended on your prompt, through these weights — which is not the same
+question as whether the frames depict it.
+
+LTX-2.5 ships two video decoders behind one checkpoint field. The convolutional
+one is implemented; the higher quality diffusion one (`NADiffusionDecoder`) is
+not, and asking for it fails with a message naming the missing
+neighborhood-attention kernel. It never falls back to the convolutional decoder,
+because that would hand back a lower quality render as if it were the one you
+asked for. Keyframe and reference conditioning is refused for the same reason: it
+runs through the video VAE's encoder, and only the decoder is ported.
+
+**The refusal that used to stand here is gone, and what replaced it is an owed
+ORACLE rather than an owed feature.** Through L10 this page said a prompt was
+refused because the `Embeddings1DConnector` weights, which ship inside the DiT
+file, were among the modules the DiT loader would not load. They are loaded
+(`ltx2_loader.cpp:416-427` carries them as their own contract, outside the DiT's),
+so `encoder_path` is accepted, `has_encoder()` is true, and a prompt no longer
+needs a matching pair of embeds files. The gap that remains is a numeric one: the
+tower, the connector's forward and both caption projections each have an oracle
+against executed upstream, and the two JOINS between them —
+`create_embeddings`, and the render composition that chains it onto the tower's
+output — have none. Upstream's `EmbeddingsProcessor.process_hidden_states` is
+that whole chain in one function and is the oracle this owes; until it is
+executed, the composition's VALUES rest on the per-brick oracles either side of
+it. That is also why `last_conditioning()` is described above as a change
+detector and not as a check on the conditioning.
 ### GDN checkpoints: the `output_gate_type` key
 
 A Gated DeltaNet checkpoint (the Qwen3.5 / Qwen3-Next family) chooses its
@@ -1297,11 +1521,47 @@ The library never spawns a process, so generation and muxing enter through a
 caller-supplied `VideoRunner` callback (`examples/server/main.cpp` supplies one
 that invokes `ffmpeg`, path configurable with `--video-ffmpeg`).
 
+### Video family, and family-specific load knobs
+
+`/v1/videos` serves whichever video family the `--video-dit` checkpoint belongs
+to. By default the family is **detected** from what the checkpoint holds, and
+that is unchanged.
+
+`--video-family NAME` pins it instead. Two registered families exist,
+`minimax-h3` and `ltx-2.5`, and a name outside that set is refused at argument
+parsing, before the text model loads, with the registered names printed. It is
+never a hint: a declared family that cannot load the checkpoint fails loudly
+rather than falling back to detection, because a checkpoint handed to the wrong
+family does not fail, it renders noise.
+
+`--video-extra KEY=VALUE`, repeatable, carries a family's own load knobs. LTX-2.5
+cannot load without `dit_config_path`, and it needs `encoder_config_path` beside
+`--video-encoder` when the text encoder declares no `gemma_config` (the shipped
+one does not); MiniMax-H3
+defines `partition`, for which `--video-partition` remains the documented alias.
+A bare `KEY` with no `=` is refused rather than read as an empty value, and a
+`--video-extra partition=X` contradicting `--video-partition Y` is refused rather
+than resolved by whichever assignment ran last. A family refuses any key it does
+not define, so a mistyped knob is an error instead of a silently defaulted
+render.
+
+```sh
+vllm-server --model /path/to/text-model \
+  --video-family ltx-2.5 \
+  --video-dit ltx-2.5-22b-distilled-fp8.safetensors \
+  --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+  --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+  --video-encoder gemma4-12b-with-proj-nvfp4-torchao.safetensors \
+  --video-extra encoder_config_path=ltx-2.5-gemma4-text-config.json \
+  --video-extra dit_config_path=ltx-2.5-transformer-config.json \
+  --video-extra model_version=2.5 --video-extra allow_unported_modules=1
+```
+
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 17`,
-35 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 18`,
+36 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
 #include "vllm.h"
@@ -1347,6 +1607,7 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v15 | Embeddings through `vllm_embed` |
 | v16 | Absolute KV-cache memory sizing |
 | v17 | The OpenAI server as a thin ABI client through `vllm_server_main` |
+| v18 | Video model-family selection (`family`, `vllm_video_engine_family`) and family-specific `extra_keys`/`extra_values` on `vllm_video_*` |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.
@@ -1370,6 +1631,64 @@ auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, ep);
 
 The underlying portable tensor runtime is `vt::` ([`include/vt/`](../include/vt/)),
 which carries no ggml or PyTorch dependency.
+
+Video and audio generation is reached through `vllm::multimodal::VideoEngine`
+([`multimodal/video_engine.h`](../include/vllm/multimodal/video_engine.h)).
+`LoadVideoEngine` resolves the model family from what the checkpoint HOLDS, never
+from a filename, and refuses rather than guessing: zero claimants, several
+claimants, and an unregistered declared `family` are all errors that name what was
+seen and what is registered. A caller who supplies no `dit_path` is told which
+artifact is missing rather than being advised to declare a family, which would not
+help. A family adds itself with `RegisterVideoFamily`, which refuses a name that
+is already registered, because two families under one name would collapse into a
+single claimant and leave the choice of loader to link order.
+
+Two families are registered. `minimax-h3` is detected by `video_patch_proj` plus
+`audio_patch_proj`; `ltx-2.5` by `patchify_proj` plus `audio_patchify_proj`, with
+or without the ComfyUI `model.diffusion_model.` prefix. Each family reads its own
+knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
+`audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
+seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
+(default `distilled_two_stage`), `model_version` (only for a checkpoint that
+declares none), `dit_config_path`, `allow_unported_modules`, `max_phase`,
+`prompt_embeds_valid_rows`, `upsampler_path` and `duration_head_path`. An extra a
+family does not define is refused, never ignored. One caveat inside that set:
+`duration_head_path` is accepted but INERT — the duration head is ported and gated
+as a brick, nothing in the video engine constructs one, and no code reads that
+key, so supplying it neither loads a head nor enables an AUTO duration. Give
+`num_frames` (or `duration`, which is exact arithmetic against the recipe's frame
+rate) instead.
+
+`prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
+tokens; absent, every row is. It matters because the embeddings connector
+substitutes its learnable register table at PADDED positions, so padding decides
+which of the connector's inputs are learned constants rather than caption
+features. Upstream always knows this because its tokenizer produced the mask;
+this seam reads conditioning from a file, which carries none.
+
+`dit_config_path` names a JSON file holding the DiT's `{"transformer": {...}}`
+configuration, and it exists because only one of the two shipped LTX-2.5 DiTs
+carries one. The first-party NVFP4 file embeds it in `__metadata__["config"]`;
+the ungated `vonkaiser/LTX-2.5-FP8-NVFP4` FP8 DiT has no `__metadata__` at all.
+Tensor shapes resolve the geometry but not the values no shape encodes, so
+without a config `double_precision_rope` would default to false and
+`av_ca_timestep_scale_multiplier` to 1, where LTX-2.5 declares `float64` and
+`1000`. Both move every RoPE angle and every audio-to-video modulation, so a DiT
+that declares no config is refused until one is supplied rather than rendered
+under defaults that contradict the model family. A supplied config is adopted
+only when it reproduces the identical weight contract the shapes describe, and
+supplying one for a checkpoint that already declares its own is refused rather
+than ordered.
+
+The LTX-2.5 arm runs on the CPU in f32 and on CUDA in bf16. `device = 0` takes
+the f32 parity forward; `device = 1` stages the DiT to the GPU one tensor at a
+time and runs the device-resident forward, so a CUDA handle means a CUDA forward.
+On a build with no CUDA backend, `device = 1` is refused by name rather than
+served the CPU forward behind a CUDA handle. `encoder_path` loads the Gemma-4
+text tower, and the request's own `prompt` then conditions the render; the tower
+itself runs on the CPU in f32 whichever device the DiT is on. Without one,
+conditioning comes from the two prompt-embeds files, which must agree on their
+row count.
 
 `Sampler`'s `logprobs_mode` selects which tensor the returned logprobs are read
 from, and all four of vLLM's values now work: `raw_logprobs` (the default) and
@@ -1591,6 +1910,199 @@ Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `example
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
 routes stay unregistered.
 
+## LTX-2.5: reproducing the DiT parity gate
+
+**This section is the DiT's own parity gate, not the way to run LTX-2.5.** The
+render path ships and is documented above under
+[LTX-2.5: what runs, and what it cannot do](#ltx-25-what-runs-and-what-it-cannot-do):
+`ltx-2.5` is one of the two registered video families
+(`REGISTER_VLLM_VIDEO_FAMILY` at `src/vllm/multimodal/ltx2_video.cpp:1529`), the
+Gemma-4 text tower loads from `--encoder` and sets `has_encoder`
+(`ltx2_video.cpp:893`), both VAEs and the pipeline layer are implemented
+(`ltx2_video_vae.cpp`, `ltx2_audio_vae.cpp`, `ltx2_pipeline.cpp`), and the
+`/v1/videos` routes register for whatever family `--video-dit` resolves —
+`server_main.cpp` calls the family-agnostic `LoadVideoEngine` and then prints the
+resolved family. What follows here is how to regenerate the DiT's goldens. The
+C++ surface is `include/vllm/model_executor/models/ltx2.h`, and it refuses by
+name every arm it does not carry (a non-f32 stream dtype, the 19B
+caption-projection checkpoint form, keyframe absolute-position embeddings, the
+video-only / audio-only model types).
+
+Provenance, so this can be re-checked rather than trusted: the paragraph above
+replaces one that arrived at `3d89f6fc4` — the first LTX commit, where it was
+true — and was never revisited as L3 through L13 built each of the six pieces it
+denied.
+
+The prompt-K/V cache (`Ltx2PromptKvCache`) is reusable across the DENOISE STEPS of
+one prompt, and only those. It records a fingerprint of the prompt it was filled
+for, and a forward whose context tensors, context geometry or prompt masks differ
+from that prompt is refused by name rather than served K/V that would render the
+cached prompt. Call `Ltx2PromptKvCache::Reset()` to rebind the same allocation to
+a new request.
+
+The gate runs the UPSTREAM modules at reduced dimensions on CPU, so it needs a
+Lightricks LTX-2 checkout and the system `python3` with torch — **no checkpoint, no
+venv and no gated download**. Regenerate the goldens and run it:
+
+```sh
+git clone https://github.com/Lightricks/LTX-2 ~/_git/LTX-2
+python3 scripts/gen-ltx2-goldens.py \
+  --ltx2 ~/_git/LTX-2 \
+  --out tests/vllm/models/ltx2_goldens.inc
+cmake --build build --target test_ltx2 && ./build/tests/test_ltx2
+```
+
+The generator asserts the `ltx_core` it imported came from that checkout and not
+from anything installed in site-packages, and it writes the upstream revision it
+executed into the generated header. Neither side checks in a weight byte: both
+rebuild every tensor from one deterministic stream keyed by the parameter's name.
+
+The pipeline layer has its own gate, and it needs a second checkout: the recipe
+table is read from vLLM-Omni, which is the binding oracle for LTX even though it
+carries no 2.5 row of its own. Both checkouts must be CLEAN, because a revision
+anchor read from a tree with uncommitted edits stamps a SHA the goldens do not
+come from.
+
+```sh
+git clone https://github.com/vllm-project/vllm-omni ~/_git/vllm-omni
+python3 scripts/gen-ltx2-pipeline-goldens.py \
+  --ltx2 ~/_git/LTX-2 \
+  --vllm-omni ~/_git/vllm-omni \
+  --out tests/vllm/models/ltx2_pipeline_goldens.inc
+cmake --build build --target test_ltx2_pipeline && ./build/tests/test_ltx2_pipeline
+```
+
+If you regenerate that `.inc` against a moved upstream, expect the goldens to
+carry the change rather than only the pin cases. The pipeline goldens reach the
+GroupNorm eps and group count in the latent upsampler, the connector's
+`rms_norm` eps, the `BlurDownsample` width (on the 1.5 arm only, since the blur
+runs on the rational denominator) and the Res2s `sigma_up` clamp — that last one
+on the eta = 1 arm, where the clamp binds on every step. A regeneration that
+moves one of those constants alone reds a value comparison; one that moves the
+constant AND the tensors together passes it, and is caught only by the cases that
+compare each constant against upstream's own signature. Both layers are there
+deliberately, and neither is redundant.
+### The Gemma-4 text tower gate, and the interpreter it needs
+
+The text tower is gated against the UPSTREAM HuggingFace implementation built and
+run at reduced dimensions. It needs a `transformers` that registers
+`gemma4_unified` in `CONFIG_MAPPING` — **5.8 or newer; 5.3.0 does not have it and
+fails in a way that reads exactly like "Gemma-4 is unsupported"**. The generator
+refuses such an interpreter by name rather than emitting goldens from a tower it
+could not build.
+
+```sh
+/path/to/venv/bin/python scripts/gen-ltx2-gemma-tower-goldens.py \
+  --out tests/vllm/models/ltx2_gemma_tower_goldens.inc
+cmake --build build --target test_ltx2_text_encoder && ./build/tests/test_ltx2_text_encoder
+```
+
+No checkpoint and no download: the reduced config comes from
+`tests/vllm/models/ltx2_gemma4_text_config.json`, which is the
+`__metadata__["gemma_config"]` of the official bf16 text encoder, and every weight
+is rebuilt on both sides from the deterministic stream. The tolerance is not a
+constant — the generator MEASURES how far upstream's own answer moves between f32
+and bf16 and emits that per state as the bound.
+
+Two more gates want the real checkpoint. The prompt-token goldens are regenerated
+from the tokenizer the text encoder ships **as a tensor**, and the end-to-end case
+dequantizes the 12B tower to roughly 24 GB of host bf16, so it is opt-in rather
+than checkpoint-presence gated:
+
+```sh
+TE=$CHECKPOINT_ROOT/ltx-2.5/vonkaiser-fp8-nvfp4/text_encoders/gemma4-12b-with-proj-nvfp4-torchao.safetensors
+/path/to/venv/bin/python scripts/gen-ltx2-prompt-tokens-goldens.py \
+  --text-encoder "$TE" \
+  --out tests/vllm/models/ltx2_prompt_tokens_goldens.inc
+
+# real vocab, token-exact vs HuggingFace
+CHECKPOINT_ROOT=... ./build/tests/test_ltx2_text_encoder --test-case="ltx2 prompt: REAL*"
+
+# the full 12B vertical: ~33 GB host, minutes of CPU
+CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
+  ./build/tests/test_ltx2_text_encoder --test-case="ltx2 e2e*"
+```
+
+`VLLM_CPP_LTX2_TEXT_ENCODER` names the file directly when it does not sit under
+`CHECKPOINT_ROOT` at the path above.
+
+Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
+anything else by name rather than defaulting, because a plausible but wrong sigma
+schedule or guidance scale renders a video instead of failing. The pairs that
+resolve are `one_stage` at 2, 2.3, 2.4 and 2.5, `distilled_two_stage` at 2 and
+2.5, and `dmd2` at 2 and 2.3.
+
+`Ltx2Guidance` serves `CFGGuider`, `STGGuider` and `MultiModalGuider`. It refuses
+`CFGStarRescalingGuider`, `LtxAPGGuider` and `LegacyStatefulAPGGuider` by name,
+because nothing upstream constructs them: all three appear in the Lightricks tree
+only at their own `class` statements. Two known gaps in the schedule are open:
+`Ltx2SigmaSchedule(1, ...)` returns a NaN first sigma where upstream returns
+0.10000002, and the suite's `MaxAbsDiff` drops NaN so a golden alone will not
+catch it.
+
+## LTX-2.5 quantized loaders
+
+`include/vllm/model_executor/models/ltx2_loader.h` materializes the shipped
+LTX-2.5 checkpoints: the FP8 DiT, both NVFP4 DiTs, and the torchao-NVFP4 Gemma-4
+text encoder with its embedded tokenizer. These are the entry points the render
+path itself drives: `--dit` (`--video-dit` on the server) reaches
+`Ltx2StreamDitToDevice` / `Ltx2LoadDitFromSafetensors` at
+`ltx2_video.cpp:576-577`, and `--encoder` (`--video-encoder`) reaches
+`Ltx2LoadTextEncoderFromSafetensors` at `ltx2_video.cpp:851`. This section
+documents them at the library level, where the gate below runs.
+
+The two NVFP4 checkpoints were written by different producers that disagree about
+both the group-scale framing and which nibble holds which weight, so the loader
+resolves the producer from the `torchao_nvfp4` marker: present means torchao
+(`to_blocked` framing, low-nibble-first), absent means the Lightricks
+`nvfp4-prequant` tool (cuBLAS-padded framing, high-nibble-first). A marker whose
+stored scale shape contradicts it, and a marker-less file whose shape is the
+`to_blocked` framing or neither framing, are refused by name rather than guessed,
+because both readings type-check and produce finite, correctly scaled, wrong
+weights.
+
+The refusal cannot cover everything, and the limit is worth knowing before you
+point this loader at a checkpoint it was not built for. A marker-less NVFP4 file
+whose `weight_scale` is stored **linear** `[N, K/16]` — what ModelOpt,
+llm-compressor and compressed-tensors write, none of which emit a
+`torchao_nvfp4` sidecar — has, whenever `N % 128 == 0` and `K/16 % 4 == 0`, a
+shape indistinguishable from the cuBLAS-padded one. Such a file is resolved as
+`nvfp4-prequant` and read swizzled and high-first: it loads, and it is wrong.
+Only the LTX-2.5 DiT is gated against an independent oracle here, so treat any
+other marker-less NVFP4 checkpoint as unsupported until it is. See
+`.agents/specs/nvfp4-nibble-order.md`.
+
+Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES the
+shipped DiT by default, because that file carries **three** module families phase
+L2 does not port (`prompt_adaln_single`, `audio_prompt_adaln_single` and
+`keyframes_abs_pos_embedding`); pass `Ltx2DitLoadOptions::allow_unported_modules`
+to load the ported subset, which still reports every one of them in
+`Ltx2DitCheckpoint::unported`. The two `*_embeddings_connector` towers are
+**not** among them and never will be:
+`UnportedFamilies` filters them out at `ltx2_loader.cpp:439` (`LoadedElsewhere`),
+`RefuseUnported`'s own message says so in capitals at `ltx2_loader.cpp:461-464`,
+and `Ltx2LoadConnectorWeights` loads them under their own contract — which is
+what the video engine calls, so a checkpoint this port reads completely is never
+made to ask for `allow_unported_modules` on their account. (The "five" this
+paragraph used to say arrived at `5966ffef3` and was true until `e48c86253`
+added `LoadedElsewhere` — the same claim the "what runs" section above already
+retired, which survived here because it was never swept for.) And loading is
+**bf16** by default, the checkpoint's own model dtype; `widen_to_f32` is opt-in
+and exists only for the f32 parity forward.
+
+`Ltx2StreamDitToDevice` is the GB10 arm. It dequantizes and uploads one tensor at
+a time so peak residency is the device copy plus one tensor, and it stages at
+load because host-resident weights measure 20 to 30 percent slower there.
+
+The gate needs the three checkpoint headers, a vLLM checkout and an LTX-2
+checkout (the two nibble-order authorities); it reads a few hundred bytes at
+their own offsets and never a payload:
+
+```sh
+python3 scripts/gen-ltx2-quant-goldens.py --vllm ~/_git/vllm --ltx2 ~/_git/LTX-2 --checkpoint-root /mnt/nas_share/checkpoints --out tests/vllm/models/ltx2_quant_goldens.inc
+cmake --build build --target test_ltx2_loader && ./build/tests/test_ltx2_loader
+```
+
 ## SSE keepalives on long prefill
 
 Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while
@@ -1605,3 +2117,59 @@ Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
 This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
 (those stay lab-only until a CUDA token-exact gate can land them).
+
+## LTX-2.5 text conditioning
+
+This documents **one brick of the shipped render path** — the text conditioning
+the DiT consumes — and how to reproduce its gate. The render itself is above
+under [LTX-2.5: what runs, and what it cannot do](#ltx-25-what-runs-and-what-it-cannot-do);
+`--encoder` is what puts this brick on that path, and `has_encoder` is set at
+`ltx2_video.cpp:893` once the tower loads.
+
+LTX-2.5 does not condition on a text encoder's last hidden state. It takes every
+Gemma-4 hidden state (the embedding output plus all 48 decoder outputs, 49 in
+total), normalizes them, concatenates across the layer axis, and projects the
+result twice: a 4096-wide video caption projection and a 2048-wide audio one.
+That is why the shipped projections take 3840 x 49 = 188160 inputs.
+
+Two things about the shipped checkpoint are easy to trip over:
+
+* the tokenizer is stored **as a tensor**, `tokenizer_json`, alongside
+  `hf_asset__*` sidecars, so a loader that expects a sibling `tokenizer.json`
+  file cannot read it;
+* `vonkaiser/LTX-2.5-FP8-NVFP4`'s text encoder carries **no** safetensors
+  `__metadata__` block, so the Gemma config has to be supplied out of band.
+  `Ltx2LoadGemmaAssets(file, /*require_config=*/false)` is the opt-out; the
+  default refuses, exactly as upstream does.
+
+Reproduce the parity gate (CPU only, no checkpoint and no gated download; needs
+torch, numpy and einops plus a Lightricks LTX-2 checkout):
+
+```sh
+python3 scripts/gen-ltx2-text-goldens.py \
+    --ltx2 ~/_git/LTX-2 \
+    --out tests/vllm/models/ltx2_text_goldens.inc
+cmake --build build --target test_ltx2_text_encoder
+./build/tests/test_ltx2_text_encoder
+```
+
+The generator imports the upstream modules by path and executes them at reduced
+dimensions; both sides rebuild every weight from one deterministic stream, so no
+weight byte is checked in. It also runs four degenerate inputs through upstream
+and emits each one's full output tensor, not a "still finite" flag, because the
+normalization epsilons and the width they are added in are invisible to a random
+fixture. The mean's denominator is one of those: upstream adds it in float32
+(`sequence_lengths * d` is an int64 tensor and `eps` a python float, which
+promotes to the default dtype), so computing it in float64 is finer arithmetic
+and the wrong answer.
+
+A third thing to know if you are wiring a loader to it: the feature extractor
+refuses, by name, any disagreement between what the checkpoint config declares
+and what the weights actually carry. That covers the declared bias against
+`bias.empty()`, the declared `out_features` against the weight's own width, and
+`embedding_dim x (num_hidden_layers + 1)` against the weight's `in_features`. The
+case worth naming is a loader that binds `video_aggregate_embed.weight` (U8,
+NVFP4) and misses `.bias` (BF16, so a different unpack path) while the config
+still says the projection is biased. Without the refusal that renders a plausible
+video for the wrong prompt: every conditioning row is shifted by the missing bias
+and every padded row projects to 0 instead of to the bias.

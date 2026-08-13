@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "support/max_abs_diff.h"
 #include "vllm/v1/spec_decode/rejection_sampler.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
@@ -212,12 +213,12 @@ bool AllFinite(const std::vector<float>& v) {
     if (!std::isfinite(x)) return false;
   return true;
 }
-float MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b) {
-  float m = 0.0f;
-  for (size_t i = 0; i < a.size() && i < b.size(); ++i)
-    m = std::max(m, std::fabs(a[i] - b[i]));
-  return m;
-}
+// The shared, NaN-hardened reduction. The local copy this replaces used
+// `std::max(m, ...)`, which is `a < b ? b : a`; `a < NaN` is false, so a NaN
+// reduced to 0.0 — and the `> 1e-5f` "the miswire MUST change the draft" checks
+// below would have read a NaN as a difference (issue #449). It also compared only
+// the shorter prefix; the shared helper REQUIRES equal sizes.
+using vllm_test::MaxAbsDiff;
 int32_t Argmax(const float* row, int64_t n) {
   int32_t best = 0;
   for (int64_t v = 1; v < n; ++v)

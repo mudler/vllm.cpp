@@ -352,6 +352,28 @@ target_include_directories(test_muse_glimmer_gguf PRIVATE
 # .agents/specs/kimi-linear.md.
 vllm_cpp_add_test(test_kimi_linear_scaffold vllm/models/test_kimi_linear_scaffold.cpp)
 
+# Nemotron-H (NemotronHForCausalLM) W3 STRUCTURAL gate (#517,
+# .agents/specs/nemotron-h-model.md §4 W3): registry-resolve + config descent off
+# the REAL released config.json (52-entry layers_block_type schedule, the legacy
+# hybrid_override_pattern/mamba_* aliases, the refuse cases) + the on-disk name map
+# accounted BOTH WAYS against all 18487 tensors of the released index + the
+# heterogeneous KV topology (6-layer full-attention group + 23-layer Mamba2 group,
+# shapes from mamba2_state_shape). The structural half runs off a COMMITTED
+# headers-only fixture so CI never needs the 20.1 GiB NAS asset; a final case
+# re-verifies that fixture against the LIVE checkpoint when VT_NEMOTRON35_SNAPSHOT
+# names it, and SKIPs loudly otherwise. CPU-only, no forward (W4), no speed claim.
+vllm_cpp_add_test(test_nemotron_h_scaffold vllm/models/test_nemotron_h_scaffold.cpp)
+target_compile_definitions(test_nemotron_h_scaffold PRIVATE
+  NEMOTRON_H_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/nemotron_h_35_lightning")
+# GATE-PIN-UNPINNED-SNAPSHOTS (#471): the live re-verification resolves the
+# checkpoint through the pinned parity::HfSnapshot, so it needs tests/parity on
+# the include path.
+# nemotron_h.h is a MODEL-PRIVATE header under src/, not include/vllm/: W3 ships
+# nothing on the public ABI and include/vllm/ is a USER_USAGE_PREFIXES surface
+# (#515). Same call as the W1 resolver header.
+target_include_directories(test_nemotron_h_scaffold PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
 # reference; sigmoid noaux_tc router + block vs a hand-computed case) and the whole

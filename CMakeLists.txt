@@ -787,6 +787,11 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/kimi_linear_forward.cpp
   src/vllm/model_executor/models/kimi_linear.cpp
   src/vllm/model_executor/models/kimi_linear_device.cpp
+  # MODEL-NEMOTRON-H W3 (#517): the additive NemotronH structural bring-up —
+  # config descent, the on-disk name map, the registry entry and the het-KV
+  # topology. No forward: nemotron_h.cpp is W4.
+  src/vllm/model_executor/models/nemotron_h_registry.cpp
+  src/vllm/model_executor/models/nemotron_h_weights.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
   src/vllm/model_executor/models/glm4_weights.cpp
   src/vllm/model_executor/models/glm4.cpp

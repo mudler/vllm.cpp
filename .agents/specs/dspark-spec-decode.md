@@ -2001,8 +2001,17 @@ what remains to be found -- roughly a third of the deficit the record has been
 chasing all campaign, and it lands after 6ae had already cleared the kernel that
 deficit was attributed to.
 
-**Caveats, kept rather than buried.** n=1 paired run; a repeat is owed before
-this is settled. The ours-AFTER arm carries four low outliers (135.2, 135.5,
+**Caveats, kept rather than buried.** n=1 paired run. **The repeat RAN and was
+REJECTED by this harness's own drift gate**: its arms measured 146.740 before
+and 143.619 after, a -2.13% drift against a 1% gate, so its 0.9795 does not
+count and is not averaged in. Bracketing on its own arms it spans 0.9912 to
+0.9701 -- it cannot separate parity from a 3% deficit. Two things it did
+establish: the oracle's BIMODALITY IS BOOT-DEPENDENT (run 1 unimodal at ~144,
+run 2 clearly bimodal with 10 draws at 148.05 and 5 at 156.61, same script and
+pin), so a harness cannot assume either shape; and absolutes moved together
+across the reboot (ours +1.8%, oracle +2.8%), consistent with the recorded 12.8%
+boot-to-boot clock variation. So the standing claim is **~0.98, NOT parity, on
+one valid paired run** -- not "0.9889 confirmed". The ours-AFTER arm carries four low outliers (135.2, 135.5,
 139.0, 139.9) that the BEFORE arm does not, so something touched the box during
 it -- medians are unaffected, that arm's spread is not trustworthy. The oracle
 shows ONE fast draw (151.84) against fourteen near 144, the old bimodality

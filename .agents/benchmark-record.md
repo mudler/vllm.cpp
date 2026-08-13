@@ -21363,3 +21363,50 @@ refusal never fired: `Ltx2SelectTextFeatureVariant` **does** refuse a partial se
 (`ltx2_text_encoder.cpp:184-192`). It never fired because **no production path
 called the selector before L13** — the marker keys and the engine's first call to
 it landed in the same commit, so there was no earlier run for it to refuse.
+
+## SPEC-DSPARK: the n=2 repeat FAILS its own drift gate (2026-08-13)
+
+The confirmation run for the 0.9889 result. Reported in full because it does not
+confirm cleanly, and the gate that rejects it was set before the number existed.
+
+| | run 1 | run 2 |
+|---|---|---|
+| ours BEFORE (n=9) | 142.604 | 146.740 |
+| ours AFTER (n=9) | 142.140 | 143.619 |
+| DRIFT before->after | **-0.33%** | **-2.13%** |
+| validity (gate: abs(drift) < 1%) | PASS | **FAIL** |
+| ours combined | 142.534 | 145.117 |
+| oracle (n=15) | 144.130, UNIMODAL | 148.150, BIMODAL |
+| ratio | **0.9889** | 0.9795 (not usable) |
+
+RUN 2 IS REJECTED, not averaged in. Its two `ours` arms disagree by 2.13%,
+which is twice the effect being measured, and the drift is DOWNWARD (the closing
+arm slower than the opening one) -- thermal or contention, the opposite sign
+from the cold-start ramp the warm-up arm was built to remove. Bracketing on its
+own arms gives 0.9912 (before) to 0.9701 (after): it cannot distinguish parity
+from a 3% deficit.
+
+TWO THINGS IT DOES ESTABLISH.
+
+The oracle's BIMODALITY IS BOOT-DEPENDENT. Run 1, unimodal: 15 draws at ~144
+with one outlier. Run 2, clearly bimodal: 10 draws at 148.05 and 5 at 156.61,
+the same one-extra-accepted-token effect seen in earlier sessions. Same script,
+same pin, same prompt, different boot. So whether the modal-value correction is
+needed is a property of the BOOT, not of the workload, and a harness cannot
+assume either shape.
+
+ABSOLUTES MOVED AGAIN ACROSS THE REBOOT, both arms together: ours 142.5 -> 145.1
+(+1.8%), oracle 144.1 -> 148.2 (+2.8%). Consistent with the recorded 12.8%
+boot-to-boot SM clock variation, and further reason no absolute from this box is
+quotable across boots.
+
+WHERE THAT LEAVES THE RATIO: one VALID paired run at 0.9889, one REJECTED run
+bracketing 0.970-0.991. Both are consistent with a deficit of roughly 1-2%, and
+neither reaches parity. The honest statement is "~0.98, not parity, n=1 valid"
+-- not "0.9889 confirmed".
+
+The box rebooted or dropped FIVE times on 2026-08-13 (08:57, 09:29, 16:29,
+~21:16, plus an outage around 20:40), which is the binding constraint on
+resolving 1% here at all.
+
+Evidence: `dgx.casa:~/work/dspark-w6/paired_lm.log`, `paired_lm2.log`.

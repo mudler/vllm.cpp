@@ -591,12 +591,19 @@ arm ~6% low), settle barriers (vLLM asserts free GPU memory does not grow
 during its startup profile, and GB10 releases our pages lazily, which killed
 every earlier paired attempt), and a host-RAM headroom guard
 (gpu_memory_utilization reserves HOST RAM here, which took the machine down
-three times on 2026-08-13) -- measures ours at 142.534 tok/s against the
-oracle's 144.130, a ratio of **0.9889** with before/after drift of -0.33%,
-inside the 1% validity gate. So the gap is 1.1%, not 3.4%: the
-0.9757/0.9646/0.9569 recorded earlier were measuring an unwarmed first arm as
-much as the engine. Still NOT parity and the row stays open, with a repeat
-owed (n=1). Two traps worth carrying: dram__bytes.sum reads n/a on GB10, so
+three times on 2026-08-13) -- measures ours at 142.534 tok/s against the oracle's 144.130, a ratio
+of **0.9889** with before/after drift of -0.33%, inside the 1% validity gate. So
+the gap is ~1%, not 3.4%: the 0.9757/0.9646/0.9569 recorded earlier were
+measuring an unwarmed first arm as much as the engine. The n=2 repeat RAN and
+was REJECTED by the same gate at -2.13% drift, so its 0.9795 is not averaged
+in and the standing claim is ~0.98 on ONE valid paired run, still NOT parity.
+The repeat did establish two things: the oracle's bimodality is BOOT-DEPENDENT
+(unimodal near 144 in one run, 10-at-148 plus 5-at-157 in the next, same
+script and pin), so no harness may assume either shape; and both arms'
+absolutes moved together across the reboot, ours +1.8% and oracle +2.8%,
+matching the recorded 12.8% boot-to-boot clock variation. The binding
+constraint on resolving 1% here is the box, which rebooted or dropped five
+times on 2026-08-13. Two traps worth carrying: dram__bytes.sum reads n/a on GB10, so
 ncu's Memory Throughput % excludes DRAM traffic; and fuser -v $HOME/gpu.lock
 is the check, because nvidia-smi showing no compute apps does not mean the GPU
 is unreserved. Weight

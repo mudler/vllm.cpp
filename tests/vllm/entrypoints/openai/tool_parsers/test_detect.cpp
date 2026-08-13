@@ -218,7 +218,8 @@ TEST_CASE("Registry: every enumerated tool-parser name resolves") {
   // dialect. 40 accepted names over 36 parser families (aliases:
   // llama3_json/llama4_json, qwen3_coder/qwen3_xml/mimo, glm45/glm47).
   // 2026-08-10 (MODEL-MUSE-GLIMMER-W7): 40 -> 41, adding "muse_glimmer".
-  CHECK(names.size() == 41);
+  // 2026-08-13 (TOOLS-PARSER-BREADTH W1, #608): 41 -> 42, adding "inkling".
+  CHECK(names.size() == 42);
   // Every name the marker table can emit must itself be a registered name.
   std::size_t marker_count = 0;
   const ToolParserMarker* markers = ToolParserMarkerTable(&marker_count);

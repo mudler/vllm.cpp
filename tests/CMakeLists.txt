@@ -848,6 +848,8 @@ vllm_cpp_add_test(test_longcat
   vllm/entrypoints/openai/tool_parsers/test_longcat.cpp)
 vllm_cpp_add_test(test_kimi_k2
   vllm/entrypoints/openai/tool_parsers/test_kimi_k2.cpp)
+vllm_cpp_add_test(test_tool_parser_inkling
+  vllm/entrypoints/openai/tool_parsers/test_inkling.cpp)
 vllm_cpp_add_test(test_granite_tool_parser
   vllm/entrypoints/openai/tool_parsers/test_granite_tool_parser.cpp)
 vllm_cpp_add_test(test_granite4_tool_parser

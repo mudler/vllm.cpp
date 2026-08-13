@@ -218,6 +218,30 @@ std::string safe_arg_prefix(
 
 }  // namespace
 
+// See parser_engine.h. Relocated here from serving_chat.cpp's anonymous
+// namespace so the tool_parsers ParserEngineToolAdapter shares ONE projection
+// with the serving path rather than carrying a second copy of it.
+ParserRequest ParserRequestFromChatCompletion(
+    const oai::ChatCompletionRequest& request) {
+  ParserRequest pr;
+  pr.include_reasoning = request.include_reasoning;
+  pr.tool_choice = request.tool_choice.has_value() ? request.tool_choice->mode
+                                                   : std::string("auto");
+  if (request.tools.has_value()) {
+    for (const oai::ChatCompletionToolsParam& t : *request.tools) {
+      ParserTool pt;
+      pt.name = t.function.name;
+      // Carry the function's JSON-Schema parameters so the assembly can coerce
+      // argument values to their declared types (parser_engine.py _fix_arg_types /
+      // find_tool_properties). Absent parameters => no schema (identity path).
+      pt.parameters = t.function.parameters;
+      pr.tools.push_back(std::move(pt));
+    }
+  }
+  pr.history_tool_call_cnt = 0;
+  return pr;
+}
+
 ParserEngine::ParserEngine(ParserEngineConfig config,
                            const EngineTokenizer* tokenizer)
     : config_(std::move(config)),

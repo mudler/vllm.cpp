@@ -95,7 +95,7 @@ memory format against the oracle explicitly.
 | MoE | `nemotron_h.py:126-256` (`NemotronHMoE`), decoder layer `:317` |
 | non-gated activation | `activation_without_mul(config.mlp_hidden_act)` -> `ReLUSquaredActivation` (`layers/activation.py`) |
 | expert ckpt naming | `ckpt_names=("up_proj", "down_proj", "")` (`nemotron_h.py:220`) |
-| routed scale applied to OUTPUT | `apply_routed_scale_to_output=True` (`nemotron_h.py:246`) |
+| routed scale applied to OUTPUT | `apply_routed_scale_to_output=True` (`nemotron_h.py:234`), factor `:233` |
 | router dtype | `GateLinear(..., out_dtype=torch.float32, force_fp32_compute=True)` (`nemotron_h.py:150-156`) |
 | state shape / dtype | `mamba_utils.py:174-199`, `:73-81` |
 | MTP | `models/nemotron_h_mtp.py::NemotronHMTP` (`registry.py:638`) |
@@ -179,7 +179,7 @@ cannot.
 | W | Content | Gate | Depends on |
 |---|---|---|---|
 | **W1** | ModelOpt `MIXED_PRECISION` resolver: parse `quantization_config`, resolve per-module `quant_algo` (direct then shard-prefix), expose it to weight loading. Refuse an unknown algo by name | unit tests on the REAL `config.json` (committed as a fixture, weights not needed): every one of the 5981 entries resolves, the `ignore` list resolves to unquantized, an unknown algo refuses | — |
-| **W2** | Non-gated `relu²` grouped MoE through `MlpGateUpMethodBase` / `vt::MergedGemmGroup`; bf16 arm then NVFP4 W4A16 g16 | byte/tolerance tests vs a host reference; `relu²` mutation caught; routed scale applied to the OUTPUT, not the logits | — |
+| **W2** | Non-gated `relu²` grouped MoE; bf16 arm then NVFP4 W4A16 g16. **As built it is NOT a merged pair** — the planned `MlpGateUpMethodBase` / `vt::MergedGemmGroup` routing was refuted during implementation and the arm is the EXISTING grouped GEMM plus a new `vt::MoeRelu2`; §6a is the authority on the seam | byte/tolerance tests vs a host reference; `relu²` mutation caught; routed scale applied to the OUTPUT, not the logits | — |
 | **W3** | `nemotron_h_weights.cpp` + `_registry.cpp`: `layers_block_type` dispatch, `backbone.` prefix, het-KV group construction (1 Mamba group + 1 full-attn group over 6 layers), enumeration gate vs the released index | enumeration: every tensor in `model.safetensors.index.json` is claimed or explicitly refused; KV spec shapes match `mamba2_state_shape` | #496 W1 |
 | **W4** | `nemotron_h.cpp` forward: hybrid layer loop, Mamba2 mixer wiring, 6 attention layers, MoE layers | CPU forward runs; per-layer activations vs a dumped oracle reference | #496 W1, W2, W3 |
 | **W5** | MTP head (`mtp.layers.0`, `eh_proj`/`enorm`/`hnorm`) on the existing spec-decode seam | draft acceptance non-zero; spec-off and spec-on token-identical | W4 |
@@ -879,15 +879,214 @@ Read `Status:`.
   non-attention layers and may not move tokens on short prompts. Gate with a
   long-prompt arm, not only a 6-token one.
 
+## 6a. W2 note — the non-gated `relu²` expert, as built
+
+**Seam verdict: the non-gated expert is NOT a merged pair, and does not get a
+`MergedGemmGroup` descriptor.** `MergedGemmGroup` describes N GEMMs *sharing
+operand A* collapsed into one launch (`merged_gemm.h:1-22`). NemotronH's expert
+has exactly one projection — `ckpt_names=("up_proj", "down_proj", "")`
+(`nemotron_h.py:220`, the empty third entry being the absent gate) — so with
+N == 1 there is nothing to merge and no launch to save; an arity-1 descriptor
+would name a fusion that does not exist. `MlpGateUpMethodBase`
+(`linear.h:82-86`) is likewise a *merged `[2I,H]` gate_up* seam and has no pair
+to hold either.
+
+The arm is therefore the **existing** grouped projection plus the activation we
+did not have — exactly the shape the gated bf16 archs had before their pair was
+folded (`kMoeGroupedGemmBf16` + `kMoeSiluMul`):
+
+```
+up   : kMoeGroupedGemmBf16   (bf16)  |  kMoeGroupedGemmNvfp4Marlin (W4A16 g16)
+act  : kMoeRelu2                          <- NEW, the only new kernel
+down : kMoeGroupedGemmBf16   (bf16)  |  kMoeGroupedGemmNvfp4Marlin (W4A16 g16)
+comb : kMoeCombine(..., routed_scale)     <- routed scale on the OUTPUT
+```
+
+No parallel MoE path was added. The reasoning is recorded next to the seam it
+excludes (`merged_gemm.h`, the note after the bf16-sibling block).
+
+**`vt::MoeRelu2` (`OpId::kMoeRelu2`, CPU + CUDA).** Mirrors
+`ReLUSquaredActivation` (`layers/activation.py:609-628`) as the fused-MoE path
+reaches it: `activation_without_mul("relu2")` → `MoEActivation.RELU2_NO_MUL`
+(`layers/fused_moe/activation.py:34`; `activation_without_mul` is `:98`, the
+enumerator at `:33` is `GELU_TANH_NO_MUL`) → `apply_moe_activation`'s (`:184`)
+`F.relu(input, inplace=True); torch.square(input, out=output)`. The **dtype
+order is the mirrored part**: upstream's kernel
+(`csrc/libtorch_stable/activation_kernels.cu:673-678`) widens to f32, clamps at
+zero in f32, squares in f32 and rounds ONCE on the store. No new f32 buffer is
+introduced — the op reads and writes the caller's dtype and only its arithmetic
+is f32, which is what `LoadF32`/`StoreF32` already are elsewhere in `vt`.
+
+**`routed_scaling_factor` is applied to the OUTPUT**
+(`apply_routed_scale_to_output=True`, `nemotron_h.py:234`). `vt::MoeCombine`
+gained a trailing `routed_scale` (default `1.0f`, so every landed caller is
+byte-identical) which multiplies the routed sum *before* the shared term is
+added — literally `moe_runner.py:390-407` (`:402-406` `fused_output *= routed_scaling_factor`,
+`shared_output` untouched) followed by `:722-725` (`shared_output + fused_output`).
+Upstream forces the ROUTER's factor to `1.0` in exactly this case
+(`layer.py:291-300`), so `MoeRouterTopKArgs::routed_scaling_factor` stays 1.0 on
+this path. Note this is the *opposite* polarity from Laguna, which folds the same
+factor into the router weights by linearity (`laguna_ops.h:48`); NemotronH takes
+the literal upstream form.
+
+**`group_size=16` NVFP4 — SUPPORTED, risk closed by source.** `MoeMarlinArgs`
+already defaults to `group_size = 16` with `mxfp4 = false` (`ops.h`), and
+`cuda_moe_marlin.cu:7,115-129` documents and consumes exactly that
+(`group_blocks=1`, `s_type = kFE4M3fn`, `num_groups = size_k / group_size`); 32
+is reachable only via the MXFP4 branch. It is the configuration the landed
+NVFP4 MoE archs (Laguna, Qwen3.5) already run. A unit test pins the default so a
+later widening cannot silently re-point these experts.
+
+**CUDA arms — what was actually run, and by whom.** The implementer did NOT
+compile them: their worktree had no `nvcc`, so at `e2d68404` the CUDA arms were
+*written and reviewed*, never built, and the earlier wording here
+("compiled-and-reviewed") overstated it. They have since been compiled and
+GPU-verified **by the fresh reviewer**, on `dgx.casa` (GB10, nvcc 13.0.88), from
+a `git archive` of `e2d68404`:
+
+- Release `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a
+  -DVLLM_CPP_CUTLASS_DIR=$HOME/cutlass-4.5.0 -DVLLM_CPP_TRITON=ON` exited 0 with
+  **671/671 targets and zero warnings**; `cuda_moe.cu.o` compiled under
+  `-Werror=all-warnings`.
+- A reviewer-authored GPU parity test proved `MoeRelu2` CUDA == CPU
+  **bit-for-bit** over 4097 elements in all four dtype arms; that CUDA
+  `routed_scale` scales the routed sum only; and that the `1.0f` default is
+  byte-identical to the landed 4-arg call across all 8 dtype combinations.
+- Branch tests on the GPU box: `test_ops_moe_nongated_relu2` 10/10,
+  `test_ops_moe` 9/9 with 33451 assertions.
+
+**That GPU build is NOT a proof about this head, and the merge messages that
+implied otherwise were wrong (corrected 2026-08-13).** Four of this branch's
+land-prep merge commits carry a sentence of the form "`src/vt/cuda/cuda_moe.cu`
+and `vt/ops.h` are untouched by this merge, so the CUDA arm the fresh reviewer
+compiled and GPU-verified on GB10 at `e2d68404` is unchanged." Each half is
+individually true — `git diff --shortstat <merge>^1 <merge> -- include/vt/ops.h`
+is empty for `57e4301489`, `40908db153`, `6ac8eed85e`, `721f44d38d` and
+`f6a7f87090` — but the CONCLUSION does not follow, because the compile inputs
+moved in commits those merges do not cover. Measured on this branch:
+
+| Since `e2d68404` (the GPU-verified tree) | Delta |
+|---|---|
+| `include/vt/ops.h` | **+180 / −1** (`git diff --numstat e2d68404 HEAD`) |
+| `src/vt/cuda/cuda_moe.cu` | **+7 / −1** |
+
+The header movement is `d3cd442e6`, the merge that brought Mamba2 SSD W1
+(`fe81bd3b5`, #496) — a merge that DID touch `include/vt/ops.h`, by +179 lines
+against its first parent (`git show --stat d3cd442e6`) — and the `.cu` movement
+is this row's own `dd7a6477d` repair. So `cuda_moe.cu` has been compiled at
+`e2d68404` and nowhere since, and no local GPU host is reachable to redo it
+(`dgx.casa` is down). The standing evidence for the CUDA arm at THIS head is
+therefore the PR's `cuda-fat-build` CI job, which compiles `cuda_moe.cu`
+against the merged `include/vt/ops.h` for 10 architectures under
+`-Werror=all-warnings`; the GB10 run remains the evidence for the arm's
+RUNTIME behaviour at `e2d68404`, which the eight-line `.cu` delta since is a
+comment change plus the `routed_scale` parameter the reviewer's own GPU parity
+test exercised.
+
+**Scope of the "bit-for-bit" claim.** The reviewer's GPU parity result is a
+MEASUREMENT on GB10, not a guarantee the build flags provide: `-ffp-contract=off`
+is pinned for CXX, HIP and OBJCXX (`CMakeLists.txt:55`, `:393`, `:467`) but
+nothing passes nvcc `--fmad=false`, and `CMakeLists.txt:41-56` carves CUDA out
+deliberately ("GPU parity tests compare GPU-vs-GPU"). `MoeRelu2` is safe by
+construction — a compare-select and one multiply, with no multiply-add to
+contract — and the `routed_scale` step is one standalone multiply on the
+finished accumulator, which is why §6a's evidence is stated for exactly those
+two. `MoeCombine`'s `acc += w * Load(...)` reduction is the contractable one
+and is NOT covered; the comment in `cuda_moe.cu` claiming it was has been
+narrowed to what holds. The flag gap itself is repo-wide and tracked as **#591**
+(found independently in `cuda_mamba2_ssd.cuh`); it is not repaired here.
+
+**Still OWED** (no GPU in the implementer/repair worktrees, and not covered by
+the above): `kMoeGroupedGemmNvfp4Marlin` exercised on the real NemotronH g16
+tensors, and the end-to-end NemotronH MoE block on GB10. Both remain owed to W6
+or an earlier GPU-host spot check. The `group_size` unit test pins the default
+only — it is not a run of the Marlin arm.
+
+**Evidence.** `tests/vt/test_ops_moe_nongated_relu2.cpp` (**12 cases / 81
+assertions**): the activation against hand-computed exact values, the
+`relu`/`silu` mis-ports, a bf16-in/f32-out arm that catches narrowing the square,
+a bf16-out raw-bit arm, the shape/dtype/**device** contract refusals, the routed
+scale on the routed sum only, the routed scale on the **assembled sum rather than
+each router weight** (bitwise), the f16-out refusal that makes upstream's fp16
+arm unreachable, the 1.0 default being byte-identical to the landed call, and the
+whole expert `up → relu² → down → scaled combine` against an
+independently-written scalar reference.
+
+Mutations executed and caught (Release, `-ffp-contract=off`; every one restored
+and md5-verified afterwards):
+
+| # | Mutation | Target | Result |
+|---|---|---|---|
+| M1 | `relu` (square dropped) | `test_ops_moe_nongated_relu2` | RED 5 cases / 27 assertions |
+| M2 | `silu` (the gated family's activation) | same | RED 5 / 35 |
+| M3 | square narrowed through bf16 | same | RED 2 / 20 |
+| M4 | `routed_scale` dropped | same | RED 3 / 32 |
+| M5 | `routed_scale` applied to routed **+ shared** | same | RED 2 / 29 |
+| M6 | `routed_scale` **folded into each router weight** | same | RED 1 / 4 |
+| M7 | routed scale folded into the router **logits** | `test_ops_moe_router_grouped` | RED 3 / **525** (was recorded 498 — see below) |
+| M8 | NVFP4 `group_size` default 16 → 32 | `test_ops_moe_nongated_relu2` | RED 1 / 1 |
+| M9 | `MoeRelu2` device `VT_CHECK` dropped | same | RED 1 / 2 |
+| M10 | `IsOutFloat` widened to admit `kF16` | same | RED 1 / 2 |
+
+M6 is the one this repair added. At `e2d68404` it **survived green** (10/10
+cases, 71/71 assertions): the landed cases all compared with a tolerance, and the
+fold is exact-arithmetic-equal, so nothing could see it. It is also the most
+likely W4 mistake, because Laguna performs exactly that fold
+(`laguna_ops.h:48`) — legally, since Laguna passes no `shared`. The new case
+pins it bitwise on decimal-grid data whose f32 products carry full mantissas
+(rows separate by 10 and 4 ULP), with a `REQUIRE` that the data separates the two
+forms so the green cannot be vacuous. M7 does NOT red the NemotronH file by
+design — this path forces the router factor to 1.0 (`layer.py:291-300`), so the
+router's own suite is where that defect is visible.
+
+**M7's assertion count was recorded wrong (repaired 2026-08-13).** The table and
+the `dd7a6477d` commit message both said `RED 3 / 498`. Three independent
+re-measurements — the fresh review's, the operator's, and this repair's — all
+read **3 cases / 525 assertions** failing, out of the unchanged 14 / 941
+baseline. The CASE count was right; only the assertion count was wrong, and 498
+is reproducible by nobody. `tests/vt/test_ops_moe_router_grouped.cpp` and the
+grouped-router kernel it exercises have not moved since `e2d68404`
+(`git log --oneline e2d68404..HEAD -- tests/vt/test_ops_moe_router_grouped.cpp`
+is empty), so the count is stable and the original entry was a transcription
+slip, not drift. Re-measured here by folding
+`args.routed_scaling_factor` into the logits fed to sigmoid/softmax in
+`MoeRouterGroupedTopKKernel` (`cpu_ops.cpp:2325-2339`) and disabling the
+post-renormalize weight scale (`:2430-2434`); Release, `-ffp-contract=off`;
+tree restored and md5-verified (`cd409b9465c00834be373cf3ecfb4c1d`), rebuilt,
+back to 14/941 SUCCESS.
+
 ## 7. Now
 
-**State at this commit:** spec committed, implementation **not started**. The
-row stays `INVENTORIED`; this commit changes no lifecycle state. The checkpoint
-is staged on the NAS and the oracle smoke run is queued behind the GPU lock.
+**State at this commit:** **W1 and W3 have LANDED on `main`; W2 is in
+re-review.** The `MIXED_PRECISION` resolver landed at `1bc5ef82c` (#561) and the
+W3 scaffold at `c6b240edd` (#576); both are merged into this branch, and their
+spec sections (§4's three W1 subsections, §5c/§5d/§5e) are main's, carried here
+byte for byte. The Mamba2 SSD kernel work W1 landed earlier at `47960a009`
+(#496), so `include/vt/ops.h` carries main's
+`kMamba2ChunkScan`/`kMamba2StateUpdate`/`kRmsNormGatedGroup` first and appends
+`kMoeRelu2` after them; no existing op id shifted. W2 (the non-gated `relu²`
+expert, §6a) was reviewed PASS at `e2d68404`, repaired for that review's six
+findings at `dd7a6477d`, and this branch is its land-prep: re-merged onto
+`origin/main` and fully re-gated. A second fresh review (PR #586 @ `f6a7f8709`)
+returned **PASS** — it established that the repair delta changes zero executable
+lines — with four RECORD findings, all repaired on
+`row/MODEL-NEMOTRON-H-W2-RECORDS`: two stale `activation.py:33` anchors
+(`include/vt/ops.h`, this spec), M7's assertion count (§6a), §4's W2 seam text
+contradicting §6a, and an overstated bit-identity comment in `cuda_moe.cu`
+(#591). That repair touches comments and this spec only; no executable line
+moved. `tests/vt/test_ops_moe_nongated_relu2.cpp:12` already carried the
+corrected anchors and needed no change.
 
-**Next action:** dispatch fresh implementers for **W1** and **W2** (both
-independent of #496) as soon as `row/KERNEL-SSM-MAMBA-SSD-W1` clears review,
-so the ops-header churn does not collide.
+The row stays `INVENTORIED`; this commit changes no lifecycle state, so it owes
+no `STATUS`/`BENCHMARKS` write. **Oracle gateability is CLOSED** — §5a records
+the pinned oracle loading and running the checkpoint on GB10 with three greedy
+goldens committed, so W6 has a denominator whenever it is reached.
+
+**Next action:** land W2 after a fresh scoped re-review, then dispatch **W4**
+(W3 having landed). Three things are carried forward, not resolved here: the two
+OWED GPU items in §6a (`kMoeGroupedGemmNvfp4Marlin` on the real g16 tensors, and
+the end-to-end NemotronH MoE block on GB10), and the OWED GGUF k-quant arm
+tracked as W7 (§5b).
 
 ## 8. Stop conditions
 

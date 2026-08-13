@@ -12,6 +12,7 @@
 // .agents/specs/minimax-h3.md sections 0 and 4.
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // W-FP4a: W4A16 exec stats
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/model_executor/models/vocoder1d.h"
 
 #include <doctest/doctest.h>
 
@@ -1851,7 +1852,7 @@ TEST_CASE("minimax_h3: the audio VAE decoder matches the checkpoint's own remote
   // The kaiser-sinc filter is COMPUTED, not loaded. Prove it first: if the filter
   // is wrong, every anti-aliased activation is wrong and the decoder mismatch
   // would be impossible to localize.
-  const std::vector<float> filter = vllm::MiniMaxH3KaiserSincFilter1d(0.5 / 2, 0.6 / 2, 12);
+  const std::vector<float> filter = vllm::vocoder1d::KaiserSincFilter1d(0.5 / 2, 0.6 / 2, 12);
   REQUIRE(filter.size() == std::size(vllm_test::kH3AudioVaeUpFilterGolden));
   double filter_err = 0.0;
   double filter_sum = 0.0;

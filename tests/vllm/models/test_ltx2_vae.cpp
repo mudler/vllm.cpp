@@ -28,9 +28,10 @@
 #include "vllm/model_executor/models/ltx2_conditioning.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
-// kMiniMaxH3SnakeEps: the Snake/SnakeBeta stabilizer is SHARED with MiniMax-H3's
+// vocoder1d::kSnakeEps: the Snake/SnakeBeta stabilizer is SHARED with MiniMax-H3's
 // BigVGAN, so the constant this suite pins lives in that header.
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/model_executor/models/vocoder1d.h"
 
 #include "ltx2_vae_goldens.inc"
 
@@ -1282,7 +1283,7 @@ TEST_CASE("ltx2 vae: every stabilizing epsilon is pinned to its upstream line") 
   // stabilizer in `1 / (beta + eps)`. Shared with MiniMax-H3's BigVGAN, which is
   // why it lives in minimax_h3.h. Mutation: 1e-9 -> 0.0 left every golden green,
   // because beta is O(1) here and never approaches zero.
-  CHECK(vllm::kMiniMaxH3SnakeEps == doctest::Approx(1e-9).epsilon(1e-12).scale(0.0));
+  CHECK(vllm::vocoder1d::kSnakeEps == doctest::Approx(1e-9).epsilon(1e-12).scale(0.0));
 
   // `_RMSNorm2D` is `F.normalize(x, dim=1) * (sqrt(C) * gamma)`
   // (video_vae/attention.py:11-30), so the floor is torch's `F.normalize` DEFAULT

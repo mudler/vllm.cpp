@@ -269,6 +269,28 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(recipe), 1)
         self.assertEqual(recipe[0].path.name, "engine-matrix.md")
 
+    def test_omni_pin_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #633 row and its 153 -> 154 ratchet bump are one semantic change.
+
+        Same shape as the #117 and #606 assertions above, and it carries one
+        extra hazard worth pinning. This bump COLLIDED: `main` took the constant
+        152 -> 153 for `SERVE-RECIPE-ARGS` while the omni-pin branch took the
+        same 152 -> 153 for its own row, so both sides read 153 and the merge
+        looked clean. Resolving it by keeping either 153 would have dropped a
+        real row while leaving the matrix internally consistent, which is
+        exactly the state no other assertion here can see. Naming BOTH rows is
+        what makes 154 checkable rather than plausible.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+
+        for item_id in ("ENG-UPSTREAM-OMNI-PIN", "SERVE-RECIPE-ARGS"):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "engine-matrix.md", item_id)
+
     def test_model_row_ratchet_is_load_bearing(self) -> None:
         """The MODEL row pin must catch a row appearing or vanishing.
 

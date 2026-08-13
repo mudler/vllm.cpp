@@ -375,6 +375,46 @@ arm reads it — before this branch directly, now through
 `parity::Nemotron35LightningSnapshot()` — so that sentence is false as written
 and belongs to whoever owns `.agents/environment.md`.
 
+**Land-prep gate, re-run on the re-merged tree.** Baselines are unchanged, which
+is the point: the merge moved the spec and nothing else this row owns.
+
+| Arm | Result |
+|---|---|
+| curated `test_modelopt_mixed_precision` | **26 cases / 167 assertions**, `Status: SUCCESS!` |
+| exhaustive `test_modelopt_mixed_precision_checkpoint` | **3 cases / 12181 assertions**, `Status: SUCCESS!` (`CHECKPOINT_ROOT=/mnt/nas_share/checkpoints`) |
+| clean Release, CUDA off, `-Werror` | 1209/1209 built, **0 warnings** |
+| full `ctest` (Release) | **402 tests, 401 passed**; `test_engine_core_proc` failed under `-j` and passed on a serial re-run (the known starvation set); `test_modelopt_mixed_precision_checkpoint` and `test_voxtral_e2e` correctly *Skipped* with no `CHECKPOINT_ROOT` |
+| Debug + `VLLM_CPP_SANITIZE=address,undefined`, the four targets this change touches | **4/4 Passed**, including under CI's own `ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1`, `UBSAN_OPTIONS=print_stacktrace=1`, `VT_POOL_BYPASS=1` |
+| `scripts/agent-preflight.sh` | green |
+| `scripts/check-doc-checkpoint.py` | `OK: public documents match the claims this change makes.` |
+| `scripts/check-commit-trailers.py --range origin/main..HEAD` | `OK: commit trailer contract` |
+
+The whole-tree sanitizer run reports 39 LeakSanitizer failures across unrelated
+model/serving binaries. Those are the lane's known pre-existing state, not this
+change: `.github/workflows/ci.yml:775-793` marks `sanitize-cpu`
+`continue-on-error: true` precisely so "a pre-existing finding cannot block
+unrelated work" and cites a live run whose conclusion is `success` with both
+sanitizer lanes `failure`. This change cannot reach them either — the only `src/`
+file it touches is `modelopt_mixed_precision.h`, which `grep -rln` finds included
+by exactly two files, both of them its own tests, so every object in `libvllm.a`
+is byte-identical to one built from `origin/main`.
+
+**The six mutations, re-run against the re-merged tree.** All six RED on the
+curated arm; the baseline is `26 | 26 passed | 0 failed` before each.
+
+| Mutation | Curated result |
+|---|---|
+| `Parse` back on `ExtractQuantAlgo` | `FAILURE!` 25 passed / 1 failed — and REDs the exhaustive arm too, where the thrown case drops the assertion count to 12152 |
+| fixture loaded with plain `nlohmann::json` | `FAILURE!` 163 passed / 4 failed |
+| strategies 3+4 return the LAST match | `FAILURE!` 163 passed / 4 failed |
+| strategy 2 rebuilds the algo set per candidate | `FAILURE!` 164 passed / 3 failed |
+| `e.find(prefix)` → `prefix.find(e)` | `FAILURE!` 163 passed / 4 failed |
+| the `experts` branch deleted | `FAILURE!` 163 passed / 4 failed |
+
+Read `Status:`, not `assertions:` — mutation 1 prints `0 failed` on the
+exhaustive arm while failing, because the case THREW and its remaining
+assertions were never reached.
+
 ## 5. Gates
 
 **Correctness first, always.** No throughput number is recorded by this row

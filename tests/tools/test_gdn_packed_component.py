@@ -58,6 +58,12 @@ from tests.tools.test_online_gate_client import (
 SOURCE_SHA = "c" * 40
 SOURCE_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
+# The driver resolves its lock from `${GPU_LOCK:-$HOME/gpu.lock}` (#777), so the
+# order log records a host-dependent path. The fixture uses a fixed stand-in --
+# what the validator pins is one acquisition, one release, and the SAME path in
+# both, never a particular file.
+GPU_LOCK_PATH = "/fixture-home/gpu.lock"
+
 # Text anchors bounding the diagnostic-c16 flow inside the driver script.
 DIAG_BEGIN = "# >>> diagnostic-c16 flow"
 DIAG_END = "# <<< diagnostic-c16 flow"
@@ -827,7 +833,7 @@ def _write_complete_evidence(root: pathlib.Path, *, packed_better: bool = True) 
 
     raw_records = _records(packed_better=packed_better)
     memory_records = _memory(packed_better=packed_better)
-    run_lines = ["corpus_validated", "gpu_lock_acquired path=/tmp/gpu"]
+    run_lines = ["corpus_validated", f"gpu_lock_acquired path={GPU_LOCK_PATH}"]
     for arm in ARMS:
         run_lines.append(f"model_gate_complete arm={arm}")
     run_lines.append("model_gates_validated")
@@ -1067,7 +1073,9 @@ def _write_complete_evidence(root: pathlib.Path, *, packed_better: bool = True) 
             run_lines.append(
                 f"leg_end concurrency={concurrency} arm={arm} repetition={repetition}"
             )
-    run_lines.extend(["gpu_series_complete", "gpu_lock_released path=/tmp/gpu"])
+    run_lines.extend(
+        ["gpu_series_complete", f"gpu_lock_released path={GPU_LOCK_PATH}"]
+    )
     (root / "component-order.log").write_text(
         "\n".join(run_lines) + "\n", encoding="utf-8"
     )

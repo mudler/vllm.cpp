@@ -7,7 +7,8 @@
 #
 # FOUR CONTROLS, none of which is optional -- each was added because its
 # absence produced a wrong number:
-#   * $HOME/gpu.lock, NOT /tmp/gpu.lock. The latter coordinates with nothing.
+#   * `${GPU_LOCK:-$HOME/gpu.lock}`, the repo's ONE mutex (#777). Any other
+#     path coordinates with nothing, and `flock` succeeds on it either way.
 #   * a DISCARDED warm-up arm: the GB10 SM clock ramps over MINUTES
 #     (1449 -> 2190 MHz observed), so dropping rep 1 is not enough.
 #   * settle barriers between arms: vLLM asserts free GPU memory does not GROW
@@ -82,5 +83,5 @@ go() {
 export -f go ours settle clocks; export OUT DIR CLI T35 D35 P HOME
 
 docker stop local-ai-worker >> "$OUT" 2>&1 || true
-flock -w 28800 "$HOME/gpu.lock" bash -c go
+flock -w 28800 "${GPU_LOCK:-$HOME/gpu.lock}" bash -c go
 echo "=== paired_e2e done $(date -Is)" >> "$OUT"

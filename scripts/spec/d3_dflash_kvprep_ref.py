@@ -26,9 +26,9 @@
 # 555967922). MEMORY: the 27B target is MULTIMODAL -> vision-encoder profiling
 # OOM-reboots the GB10 (see [[gb10-unified-memory-oom-reboots-box]]); use
 # limit_mm_per_prompt={image:0,video:0} + gpu_memory_utilization=0.30 (the D0 fix).
-# Run under `flock $HOME/gpu.lock`, oracle venv on PATH (FlashInfer JIT needs ninja),
+# Run under `flock "${GPU_LOCK:-$HOME/gpu.lock}"`, oracle venv on PATH (FlashInfer JIT needs ninja),
 # VLLM_USE_V2_MODEL_RUNNER=1, no FLASH_ATTN pin:
-#   flock $HOME/gpu.lock env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
+#   flock "${GPU_LOCK:-$HOME/gpu.lock}" env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
 #     VLLM_USE_V2_MODEL_RUNNER=1 ~/venvs/vllm-oracle/bin/python \
 #     scripts/spec/d3_dflash_kvprep_ref.py --out-dir tests/parity/goldens/dflash_27b_kvprep
 import argparse

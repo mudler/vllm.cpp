@@ -120,6 +120,7 @@ SUITES=(
   test_cpu_x86_llamacpp_floor
   test_audit_live_rows
   test_check_gate_commands
+  test_gpu_lock_one_truth
   test_main_baseline
 )
 

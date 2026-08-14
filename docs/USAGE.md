@@ -170,6 +170,36 @@ refused, `scripts/agent-role.py show` lists the other live coordinators, and
 concurrent coordinators safe is that `main` is never force-pushed, so a plain
 `git push` refuses any non-fast-forward.
 
+### `GPU_LOCK`: one file mutex, and only one
+
+Copy `.env.example` to `.env` and load it with `set -a; . ./.env; set +a`. Every
+key there may be left empty to mean "my setup does not have this" — **except
+`GPU_LOCK`**, which ships a real default:
+
+```sh
+GPU_LOCK=$HOME/gpu.lock
+```
+
+On a shared box, every GPU job takes that file for the whole job or the whole
+benchmark series:
+
+```sh
+flock "${GPU_LOCK:-$HOME/gpu.lock}" -c '<command>'
+```
+
+Do not point it somewhere else. A mutex only works if everyone opens the **same
+file**, and `flock` on a different path *succeeds* — that is what a mutex does —
+so a divergent value serialises you with nobody and never says so. The damage
+shows up much later as timing noise, and it does not read as "my number is
+wrong", it reads as "someone else misbehaved": a whole benchmark series was lost
+to this, with every absolute timing downgraded to an upper bound because only
+interleaved ratios survive contention (#777). Every script in this repo falls
+back to the same default, so change it only if every agent and harness on the
+box moves with you.
+
+If your `.env` predates this default and names another path, fix it by hand —
+`.env` is untracked, so a shipped default cannot reach it.
+
 ## Running inference (CLI)
 
 `vllm-cli` runs a one-shot completion through the C ABI. Source:

@@ -10,11 +10,12 @@ Shapes come from nvidia/Qwen3.6-35B-A3B-NVFP4: hidden 2048, moe_intermediate
 512, E=256, top_k=8. Marlin's runtime is data-independent, so random weights
 measure the same kernel the model does.
 
-RUN IT UNDER THE BOX LOCK: `flock $HOME/gpu.lock ...`, NOT /tmp/gpu.lock, which
-coordinates with nothing. `nvidia-smi` reporting no compute apps does not mean
-the GPU is unreserved -- a holder may be between phases -- so check
-`fuser -v $HOME/gpu.lock` first. Absolute timings taken unlocked are upper
-bounds; only interleaved RATIOS survive contention.
+RUN IT UNDER THE BOX LOCK: `flock "${GPU_LOCK:-$HOME/gpu.lock}" ...` -- the repo's
+ONE mutex (#777). Any other path coordinates with nothing, and `flock` succeeds
+on it either way, so the divergence is silent. `nvidia-smi` reporting no compute
+apps does not mean the GPU is unreserved -- a holder may be between phases -- so
+check `fuser -v "${GPU_LOCK:-$HOME/gpu.lock}"` first. Absolute timings taken
+unlocked are upper bounds; only interleaved RATIOS survive contention.
 """
 
 import argparse

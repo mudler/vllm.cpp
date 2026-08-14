@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Exact local Qwen3.5-4B direct-load comparison. Invoke once under:
-#   flock /tmp/gpu tools/bench/run_qwen35_4b_compare.sh \
+#   flock "${GPU_LOCK:-$HOME/gpu.lock}" tools/bench/run_qwen35_4b_compare.sh \
 #     /tmp/qwen35-transplant-4b-<commit>
 set -euo pipefail
 

@@ -1933,6 +1933,12 @@ _WARMUP_MARKER_RE = re.compile(
     r"^warmup_leg_(begin|end) arm=(packed|rollback) "
     rf"label={re.escape(WARMUP_LABEL)}$"
 )
+# The lock path is resolved on the running host from `${GPU_LOCK:-$HOME/gpu.lock}`
+# (#777), so the marker records WHICH file was held rather than asserting a
+# literal here. `\S+` and not `.+`: an empty or whitespace path is a driver bug,
+# not a lock, and must not read as a recorded acquisition.
+_LOCK_ACQUIRED_RE = re.compile(r"^gpu_lock_acquired path=(?P<path>\S+)$")
+_LOCK_RELEASED_RE = re.compile(r"^gpu_lock_released path=(?P<path>\S+)$")
 
 
 def _validate_run_order(evidence: pathlib.Path) -> dict[str, Any]:
@@ -1941,10 +1947,24 @@ def _validate_run_order(evidence: pathlib.Path) -> dict[str, Any]:
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError as error:
         raise HarnessError(f"missing evidence artifact: {path}") from error
-    if lines.count("gpu_lock_acquired path=/tmp/gpu") != 1:
+    # The lock PATH is `${GPU_LOCK:-$HOME/gpu.lock}` and therefore host-resolved
+    # (#777) -- it used to be a literal here, naming the private lock file that
+    # serialised with nothing. What this must still pin is unchanged: exactly one
+    # acquisition and exactly one release, and they name the SAME file. A run
+    # that acquired one path and released another never held one lock, and that
+    # is now expressible, so it is checked rather than assumed.
+    acquired = [line for line in lines if _LOCK_ACQUIRED_RE.fullmatch(line)]
+    released = [line for line in lines if _LOCK_RELEASED_RE.fullmatch(line)]
+    if len(acquired) != 1:
         raise HarnessError("component does not record one GPU-lock acquisition")
-    if lines.count("gpu_lock_released path=/tmp/gpu") != 1:
+    if len(released) != 1:
         raise HarnessError("component does not record one GPU-lock release")
+    lock_path = _LOCK_ACQUIRED_RE.fullmatch(acquired[0]).group("path")
+    if _LOCK_RELEASED_RE.fullmatch(released[0]).group("path") != lock_path:
+        raise HarnessError(
+            "component acquires and releases DIFFERENT GPU-lock paths, so it "
+            "never held one lock"
+        )
     if lines.count("gpu_series_complete") != 1:
         raise HarnessError("component GPU series terminus is absent")
     if lines.count("corpus_validated") != 1:
@@ -1980,9 +2000,9 @@ def _validate_run_order(evidence: pathlib.Path) -> dict[str, Any]:
         raise HarnessError(
             "component warmup discard legs do not follow the exact per-arm order"
         )
-    acquisition = lines.index("gpu_lock_acquired path=/tmp/gpu")
+    acquisition = lines.index(acquired[0])
     corpus_validated = lines.index("corpus_validated")
-    release = lines.index("gpu_lock_released path=/tmp/gpu")
+    release = lines.index(released[0])
     first_marker = lines.index(
         f"leg_begin concurrency={CONCURRENCIES[0]} arm=packed repetition=1"
     )

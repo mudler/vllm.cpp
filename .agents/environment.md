@@ -131,13 +131,20 @@ environment:
     here. Serialising also means every other probe queues behind the suite, so
     run attribution arms BEFORE a full suite, never during one.
   - **GPU mutex:** every CUDA test/model/serve/benchmark/profile holds the
-    `${GPU_LOCK}` file mutex for the whole job or multi-arm series WHEN other
-    agents may run GPU work concurrently (sole owner verified idle via
+    `${GPU_LOCK}` file mutex — **`$HOME/gpu.lock`**, which is what `.env.example`
+    ships and what every script here falls back to via
+    `${GPU_LOCK:-$HOME/gpu.lock}` — for the whole job or multi-arm series WHEN
+    other agents may run GPU work concurrently (sole owner verified idle via
     `nvidia-smi` may skip). Mechanism: run GPU work as
-    `flock ${GPU_LOCK} -c '<command>'`, or take the lock once around an entire
-    benchmark series so arms are never interleaved; waiting on the lock is
-    normal, stealing it is not. Compilation, source inspection and file
-    transfer do not need the lock. Never kill an unowned PID.
+    `flock ${GPU_LOCK:-$HOME/gpu.lock} -c '<command>'`, or take the lock once
+    around an entire benchmark series so arms are never interleaved; waiting on
+    the lock is normal, stealing it is not. Compilation, source inspection and
+    file transfer do not need the lock. Never kill an unowned PID.
+    **Check your `.env` before you measure anything:** a `GPU_LOCK` naming any
+    other path takes a mutex nobody else holds, and `flock` succeeds on it, so
+    the run is unserialised and only looks like someone else misbehaving. That
+    cost a whole Marlin series (#777); an existing `.env` predating that fix
+    must be repaired by hand.
   - Disk cleanup 2026-07-10 reclaimed ~368 GB from unrelated cached model sets,
     April-era autoresearch logits/F16-GGUF cache artifacts, the vLLM compile
     cache and stale rebuildable CUDA build trees. Active latency/PR workspaces,

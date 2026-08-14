@@ -4,7 +4,7 @@
 # The accepted contract is .agents/specs/cuda-online-serving-gate.md. Timed
 # requests are issued only by pinned vLLM `bench serve`; this script owns server
 # lifecycle, interleaving, the one-model/one-lock boundary, memory return, and
-# artifact capture.  --dry-run and --prepare-corpus never acquire /tmp/gpu;
+# artifact capture.  --dry-run and --prepare-corpus never acquire the GPU lock;
 # --trace-only performs the model gate plus the paired trace without the grid.
 set -euo pipefail
 
@@ -1105,9 +1105,14 @@ PY
 }
 
 # One lock for every ours/vLLM leg of this model, including the model gate.
-exec 9>/tmp/gpu
+# `${GPU_LOCK:-$HOME/gpu.lock}` is the repo's ONE mutex (#777). This campaign
+# used to open a private lock file of its own, which serialised against nothing
+# else in the tree -- and `flock` succeeds on a private file, so the divergence
+# was invisible.
+gpu_lock="${GPU_LOCK:-$HOME/gpu.lock}"
+exec 9>"${gpu_lock}"
 flock 9
-gpu_idle || { echo "GPU has a compute owner after acquiring /tmp/gpu" >&2; exit 1; }
+gpu_idle || { echo "GPU has a compute owner after acquiring ${gpu_lock}" >&2; exit 1; }
 
 # --startup-only measures ONE axis: cold launch -> first /health, interleaved
 # ours/vLLM under this single lock. It deliberately skips the token model gate

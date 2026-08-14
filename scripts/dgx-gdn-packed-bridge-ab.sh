@@ -32,16 +32,20 @@ if [ "$avail" -lt 100 ]; then
   echo "REFUSE: only ${avail} GiB available (<100). Someone else is active." >&2
   exit 3
 fi
-if ! /usr/bin/flock -n "$HOME/gpu.lock" true; then
-  echo "REFUSE: \$HOME/gpu.lock is held. Holder:" >&2
-  fuser -v "$HOME/gpu.lock" >&2 || true
+# THE box mutex, resolved once. `${GPU_LOCK:-$HOME/gpu.lock}` is the repo's one
+# truth (#777): a hardcoded path here would take a different file from whoever
+# followed the docs, and `flock` succeeds on it, so neither side would ever know.
+GPU_LOCK="${GPU_LOCK:-$HOME/gpu.lock}"
+if ! /usr/bin/flock -n "$GPU_LOCK" true; then
+  echo "REFUSE: $GPU_LOCK is held. Holder:" >&2
+  fuser -v "$GPU_LOCK" >&2 || true
   exit 3
 fi
 
 run_locked() {  # everything GPU-touching runs inside ONE lock for the whole run
   systemd-run --user --pipe --wait --collect \
     --unit="gdn-bridge-$$" \
-    /usr/bin/flock "$HOME/gpu.lock" -c "$1"
+    /usr/bin/flock "$GPU_LOCK" -c "$1"
 }
 
 # ------------------------------------------------------------------------ build

@@ -10,7 +10,7 @@ vLLM's own draft-acceptance so our 16/16 can be compared to vLLM's on the same
 prompt. Mirrors the LLM setup of tools/parity/dump_qwen3_5_mtp.py
 (enforce_eager, bfloat16, conservative gpu_memory_utilization).
 
-Usage (dgx, in the vllm-oracle venv, under flock $HOME/gpu.lock):
+Usage (dgx, in the vllm-oracle venv, under flock "${GPU_LOCK:-$HOME/gpu.lock}"):
   python tools/parity/capture_qwen36_spec_greedy.py \
       --model <35B-snapshot> --spec on  --max-tokens 32 --gpu-mem 0.45
   python tools/parity/capture_qwen36_spec_greedy.py \

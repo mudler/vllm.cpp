@@ -1067,8 +1067,10 @@ Registered in
 The reference-audio side of IndexTTS-2.5 is complete in the library -- a 16 kHz
 clip goes through the SeamlessM4T feature extractor, the w2v-bert Conformer, the
 layer-17 hidden-state tap, the checkpoint's stored-statistics normalization and
-the semantic codec to discrete codes -- but none of it is reachable from a
-command or a route yet.
+the semantic codec to discrete codes, and the talker's prompt is assembled from
+that conditioning plus the text -- but none of it is reachable from a command or
+a route yet, and nothing yet runs the generate loop that would turn the prompt
+into mel codes.
 
 There is **no `/v1/audio/speech`**. Text to speech is not servable: the
 IndexTTS-2.5 stages are ported and gated at reduced dimensions, with further

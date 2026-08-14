@@ -2348,3 +2348,16 @@ depths, and the expected values are quoted in `tests/vllm/models/test_dit_skip.c
 ```sh
 python3 scripts/gen-dit-skip-schedule.py /path/to/index-tts/indextts/s2mel/modules
 ```
+
+Convert the checkpoints once, then point the loader gate at the result to check
+the real weights (it is skipped, loudly, when the variable is unset):
+
+```sh
+python3 scripts/convert-indextts2-checkpoint.py \
+  --checkpoint $CHECKPOINT_ROOT/IndexTTS-2.5 \
+  --out $CHECKPOINT_ROOT/IndexTTS-2.5-safetensors \
+  --manifest tests/vllm/models/indextts2_pth_manifest.json
+
+VLLM_CPP_INDEXTTS2_S2MEL=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/s2mel.safetensors \
+  ./build/tests/test_indextts2_s2mel_loader
+```

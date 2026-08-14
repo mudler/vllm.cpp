@@ -246,6 +246,31 @@ std::vector<float> EncoderLayer(const std::vector<float>& x, int64_t frames, int
   return LayerNorm(h, frames, hidden, w.final_ln_gamma, w.final_ln_beta, eps);
 }
 
+
+std::vector<float> FeatureProjection(const std::vector<float>& x, int64_t frames, int64_t in_dim,
+                                     int64_t hidden, const std::vector<float>& ln_gamma,
+                                     const std::vector<float>& ln_beta,
+                                     const std::vector<float>& proj_w,
+                                     const std::vector<float>& proj_b, double eps,
+                                     std::vector<float>* norm_out) {
+  const std::vector<float> normed = LayerNorm(x, frames, in_dim, ln_gamma, ln_beta, eps);
+  if (norm_out != nullptr) *norm_out = normed;
+  return Linear(normed, frames, in_dim, hidden, proj_w, proj_b);
+}
+
+std::vector<float> EncoderStack(const std::vector<float>& x, int64_t frames, int64_t hidden,
+                                int64_t heads, int64_t intermediate, int64_t conv_kernel,
+                                int64_t left_max, int64_t right_max,
+                                const std::vector<EncoderLayerWeights>& layers, double eps) {
+  std::vector<float> h = x;
+  for (const EncoderLayerWeights& l : layers) {
+    h = EncoderLayer(h, frames, hidden, heads, intermediate, conv_kernel, left_max, right_max, l,
+                     eps);
+  }
+  // No final layer norm: the encoder returns the last layer's output directly.
+  return h;
+}
+
 }  // namespace w2vbert
 }  // namespace models
 }  // namespace vllm

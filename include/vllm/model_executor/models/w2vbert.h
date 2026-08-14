@@ -107,6 +107,28 @@ std::vector<float> EncoderLayer(const std::vector<float>& x, int64_t frames, int
                                 int64_t left_max, int64_t right_max,
                                 const EncoderLayerWeights& weights, double eps);
 
+
+// Wav2Vec2BertFeatureProjection: layer_norm THEN a linear projection from the
+// feature dim to hidden. Upstream also returns the PRE-projection normalized
+// tensor (it is what quantization consumes); this returns the projected one, and
+// `norm_out` optionally captures the other.
+std::vector<float> FeatureProjection(const std::vector<float>& x, int64_t frames, int64_t in_dim,
+                                     int64_t hidden, const std::vector<float>& ln_gamma,
+                                     const std::vector<float>& ln_beta,
+                                     const std::vector<float>& proj_w,
+                                     const std::vector<float>& proj_b, double eps,
+                                     std::vector<float>* norm_out = nullptr);
+
+// Wav2Vec2BertEncoder for position_embeddings_type == "relative_key": the layer
+// stack and NOTHING else. `embed_positions` is None for this type (only
+// "relative" and "rotary" construct one), and there is NO final layer norm after
+// the stack -- adding one is the obvious-looking mistake, since most encoders
+// have it.
+std::vector<float> EncoderStack(const std::vector<float>& x, int64_t frames, int64_t hidden,
+                                int64_t heads, int64_t intermediate, int64_t conv_kernel,
+                                int64_t left_max, int64_t right_max,
+                                const std::vector<EncoderLayerWeights>& layers, double eps);
+
 }  // namespace w2vbert
 }  // namespace models
 }  // namespace vllm

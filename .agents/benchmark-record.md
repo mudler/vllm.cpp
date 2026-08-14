@@ -21531,3 +21531,47 @@ contention lands on both arms alike -- which is now the third independent reason
 this row quotes ratios and not absolutes.
 
 `scripts/dspark-paired-e2e.sh` should take BOTH names before it is used again.
+
+## SPEC-DSPARK: the gate host was REIMAGED -- every `Evidence:` path above is DEAD (2026-08-14)
+
+`dgx.casa` was reprovisioned today. `/home` was created at 13:37 UTC on a new
+Kairos/COS partition layout (`COS_GRUB` / `COS_OEM` / `COS_RECOVERY` /
+`COS_STATE` / `COS_PERSISTENT`); the 3.6T volume that held everything is gone
+and `nvme0n1p2`, formerly `/home` at 99% full, is now a 64 MB `COS_OEM`
+partition. `/home` is 2% used and `~/work` is EMPTY.
+
+DESTROYED, and this is the complete list for this row:
+
+  * `~/work/dspark-w6` -- our engine build (`vllm-cli`), `fibacc.py`, and every
+    paired-run log (`final_pair.log`, `paired_lm.log`, `paired_lm2.log`)
+  * `~/venvs/vllm-oracle-next` -- THE PINNED ORACLE
+  * `~/work/vllm-src-5559679` -- the pinned vLLM source (555967922)
+  * the 35B-A3B NVFP4 and DSpark draft checkpoints (~40 GB)
+  * `~/work/marlin442` and the `pr234` build tree -- the standalone Marlin runs
+
+SO EVERY `Evidence:` LINE IN THE ENTRIES ABOVE POINTS AT NOTHING. Read them as
+provenance, not as retrievable artefacts.
+
+WHAT SURVIVES, AND WHY. The reproduction path is in the tree, because a fresh
+review demanded it hours before the reimage: `scripts/marlin-moe-standalone.py`,
+`benchmarks/marlin_moe_standalone.cpp`, `scripts/dspark-paired-e2e.sh`, and the
+per-rep values for both paired runs recorded inline rather than as medians
+alone. That finding ("the harness is not in the repo and no per-rep values are
+recorded, so the medians cannot be recomputed from the tree") was filed as LOW
+severity. It turned out to be the difference between a reproducible result and
+an unverifiable one.
+
+THE STANDING NUMBERS ARE UNCHANGED and remain quotable, because they are
+recorded values rather than files: valid within-session ratios 0.9757, 0.9646,
+0.9569, 0.9889 (one run rejected on drift), a 0.957-0.989 spread across boots,
+NOT parity; and the interleaved matched-work Marlin ratio 0.9973 that clears the
+kernel.
+
+TO RESUME MEASUREMENT the environment must be rebuilt: re-fetch the checkpoints
+from the NAS, recreate the oracle venv at pinned commit 555967922, rebuild our
+engine, and re-assert the oracle identity check before trusting a single number.
+Until then this row cannot produce a new ratio.
+
+The five reboots recorded on 2026-08-13 and the repeated "host back with a new
+uptime" observations are retrospectively consistent with reprovisioning rather
+than with crashes alone.

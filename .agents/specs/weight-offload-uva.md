@@ -170,6 +170,17 @@ Structural deviations, and why each is forced:
   TODO admitting it is under-specified. We mirror the *behavior* (UVA requires
   pinned memory) and record the divergence if our platform layer answers
   differently.
+- **We have no `make_layers`, so the wrap site is `ModelRegistry::Prepare`.**
+  W1's row assumed a seam this tree does not have. Upstream installs the
+  offloader in ONE place, `make_layers` (`models/utils.py:816,824`), which every
+  model calls, so a single `wrap_modules` covers every architecture. Here, 28
+  model headers each declare their own `std::vector<...LayerWeights> layers` and
+  no shared layer constructor exists. The analogue is
+  `ModelRegistry::Prepare` (`models/model_registry.h:366`), the type-erased seam
+  every production load passes through as it materialises resident weights. The
+  process-global instance is kept exactly as upstream has it, and for upstream's
+  reason: it lets the engine select a backend at construction without threading
+  an `OffloadConfig` through `GPUModelRunner`'s two constructors.
 - **The `_vllm_is_uva_offloaded` tag becomes a property of our weight record**,
   not an attribute monkey-patched onto a tensor, since the loader interaction
   above depends on it surviving a parameter being rebuilt.
@@ -290,6 +301,22 @@ auto-selection order, the layer grouping, and JSON parsing on the
 cases, 51/122 assertions red, build rc=0) then green 11/11, 126/126, and
 mutation-proven 6/6 with each mutation's compile status reported so a
 non-building mutation could not read as a pass.
+
+**W1 landed** (2026-08-14): the offloader seam. `WeightOffloader` interface,
+`NoopWeightOffloader` default, the process-global `Get`/`SetWeightOffloader`,
+and `CreateWeightOffloader`, all mirroring `offloader/base.py:46-162`. The
+engine installs the instance before any weight I/O and `ModelRegistry::Prepare`
+reads it back. A config that selects a backend gets the no-op plus one line
+naming the backend this build cannot honour yet, because a `cpu_offload_gb`
+that silently frees nothing is a memory bug the operator cannot see.
+
+Mutation testing changed the design, not only the tests. Two mutants survived
+because `GetWeightOffloader()` self-healed a null slot, which made both
+invariants unfalsifiable. The setter already guarantees non-null, so that
+fallback was dead code whose only effect was hiding bugs, and it is removed. A
+third mutant survived because no case drove a model, so the wrap-site call could
+be deleted unnoticed; `ModelRegistry::Prepare reaches the installed offloader`
+closes that and is the only proof the two ends are connected.
 
 **W0b landed** (2026-08-14), finishing W0: the config now reaches the engine
 end to end — `offload_config` on `vllm_model_params` (ABI v21), parsed and

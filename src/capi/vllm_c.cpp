@@ -483,6 +483,22 @@ namespace {
 // Keep helpers that return or take C++ types on THIS side of the boundary.
 std::string OrEmpty(const char* s) { return s == nullptr ? std::string() : std::string(s); }
 
+// The process-global speech registry, populated ONCE. A half-populated
+// registry would make detection depend on which entry point ran first, which
+// is the never-guess guarantee defeated by construction. (Issue #805: this
+// helper was added inside the `extern "C"` block below; a C-linkage function
+// returning a C++ reference is an error under clang's
+// -Wreturn-type-c-linkage, which this project's -Werror build promotes. It
+// lives beside OrEmpty, on the C++ side of the boundary, per the note above.)
+vllm::multimodal::SpeechRegistry& SpeechRegistry() {
+  static vllm::multimodal::SpeechRegistry& registry = [] () -> vllm::multimodal::SpeechRegistry& {
+    vllm::multimodal::SpeechRegistry& global = vllm::multimodal::GlobalSpeechRegistry();
+    vllm::models::music3::RegisterBuiltinSpeechFamilies(global);
+    return global;
+  }();
+  return registry;
+}
+
 }  // namespace
 
 extern "C" {
@@ -1663,22 +1679,6 @@ struct vllm_speech_engine {
   // handle: serialize here rather than trusting every family to.
   std::mutex mutex;
 };
-
-namespace {
-
-// The process-global registry, populated ONCE. A half-populated registry would
-// make detection depend on which entry point ran first, which is the
-// never-guess guarantee defeated by construction.
-vllm::multimodal::SpeechRegistry& SpeechRegistry() {
-  static vllm::multimodal::SpeechRegistry& registry = [] () -> vllm::multimodal::SpeechRegistry& {
-    vllm::multimodal::SpeechRegistry& global = vllm::multimodal::GlobalSpeechRegistry();
-    vllm::models::music3::RegisterBuiltinSpeechFamilies(global);
-    return global;
-  }();
-  return registry;
-}
-
-}  // namespace
 
 VLLM_API vllm_speech_model_params vllm_speech_model_params_default(void) {
   vllm_speech_model_params p;

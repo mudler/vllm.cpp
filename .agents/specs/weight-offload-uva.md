@@ -281,7 +281,27 @@ hardware we do not have, which is the opposite balance from
 
 ## Now
 
-`READY`. Spec committed; no implementation. Issue
+`ACTIVE` since 2026-08-14 (`CLAIM-WEIGHT-OFFLOAD-W0A`). **W0a landed**: the
+config surface — the backend enum, both sub-configs with upstream's bounds and
+defaults, `Validate()` carrying the two hard errors and the three collected
+warnings, the dot-anchored segment match, the `int(gb*1024**3)` truncation, the
+auto-selection order, the layer grouping, and JSON parsing on the
+`kv_transfer_config` precedent. RED-first captured on a compiling stub (11/11
+cases, 51/122 assertions red, build rc=0) then green 11/11, 126/126, and
+mutation-proven 6/6 with each mutation's compile status reported so a
+non-building mutation could not read as a pass.
+
+It is deliberately UNREACHABLE: nothing constructs an `OffloadConfig` yet, which
+is why every existing gate is byte-identical by construction. **Owed to finish
+W0**: the `include/vllm.h` JSON field and the server CLI flag. Then W1.
+
+One correction the RED pass forced, recorded because the distinction is easy to
+lose: `ResolvedBackend()` mirrors `create_offloader` exactly — an EXPLICIT
+backend is selected even at a zero budget — and `is_offloading_enabled()` is a
+separate predicate for "would anything actually move". Conflating them would let
+a zero-budget explicit backend read as offloading-on.
+
+Issue
 [#797](https://github.com/mudler/vllm.cpp/issues/797) is the owning issue.
 This row is the dense half of [#149](https://github.com/mudler/vllm.cpp/issues/149),
 whose CPU-MoE half is `ENG-HYBRID-PLACEMENT` and whose multi-GPU half is

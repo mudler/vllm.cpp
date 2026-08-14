@@ -480,7 +480,10 @@ oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-nativ
 but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
 contributor-measured on 2x R9700 and CPU-link-verified our side;
 [guide](ROCM.md)), inference-time CPU weight offload (`ENG-WEIGHT-OFFLOAD`
-READY, spec only: vLLM's `cpu_offload_gb` UVA arm with dotted-segment
+ACTIVE; the config surface landed W0a (the backend enum, both sub-configs, the
+validator's two errors and three warnings, and the dot-anchored segment match),
+all UNREACHABLE for now because nothing constructs an `OffloadConfig` yet, so
+no engine behaviour changes. Still owed: vLLM's `cpu_offload_gb` UVA arm with dotted-segment
 `cpu_offload_params` targeting, plus the layer-group `PrefetchOffloader` — a
 pure mirror floor, and #149's dense half. Its memory and speed gates need a
 discrete-GPU rig, because on unified-memory GB10 offloading to "CPU" frees

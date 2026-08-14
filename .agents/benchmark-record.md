@@ -21531,3 +21531,34 @@ contention lands on both arms alike -- which is now the third independent reason
 this row quotes ratios and not absolutes.
 
 `scripts/dspark-paired-e2e.sh` should take BOTH names before it is used again.
+
+## `ENG-WEIGHT-OFFLOAD` W6 memory ratio: BLOCKED, not pending (2026-08-14)
+
+No number, and none is obtainable on current hardware. Recorded here so nobody
+re-attempts it and reports a spurious 1.000x.
+
+The axis W6 owes is resident DEVICE bytes with and without `cpu_offload_gb`.
+Two independent reasons it cannot be produced today:
+
+1. **Nothing constructs an `OffloadConfig` yet.** W0a landed the config surface
+   only (`include/vllm/config/offload.h`), deliberately unreachable. Any A/B run
+   right now measures the same binary twice and returns 1.000x, which would be a
+   number that looks like a result and is an artefact.
+2. **GB10 cannot show the effect even once the offloader exists.** Unified
+   memory means host and device draw on ONE physical pool, so moving a weight to
+   "CPU" frees no device bytes. Upstream already knows this class of host:
+   `vllm/model_executor/offloader/base.py:23-33` `should_pin_memory()` exists
+   because pinned memory eats the shared pool on unified-memory systems, and its
+   docstring names GH200. GB10 is the same class. This is the same finding
+   `expert-streaming.md` reached for tmpfs, arrived at independently.
+
+So W6 needs a DISCRETE-GPU rig. #149 records community test rigs offered, and
+#147 records the same offer for multi-GPU; that is the unblocking path. Until
+then the honest state is BLOCKED, and `ENG-WEIGHT-OFFLOAD` must not be called
+done on the strength of W0-W5 landing, because the axis that justifies the whole
+row would still be unmeasured.
+
+Note the asymmetry with the row's sibling `ENG-HYBRID-PLACEMENT`: there, W0/W1
+are the blocked measurements and the correctness work follows them. Here it is
+inverted, W0-W5 are all reachable on GB10 and only W6 is blocked, which is why
+this row is the safer of the two to start.

@@ -246,6 +246,7 @@ Qwen3.6-27B NVFP4, GB10, whole serving window.
 | Peak RSS | 24.88 GiB | 28.56 GiB | 1.148x | **PASS** |
 | Peak GPU memory | 40,996 MiB | 70,531 MiB | 1.720x | **PASS** |
 | Peak `MemAvailable` drop | 68.35 GiB | 80.66 GiB | 1.180x | **PASS** |
+| Weight offload, resident device bytes (`ENG-WEIGHT-OFFLOAD` W6) | not measured | not measured | n/a | **BLOCKED**, not pending: unmeasurable on every host we own (GB10 shares one pool, so `cpu_offload_gb` frees nothing). Needs a discrete-GPU rig ([record](../.agents/benchmark-record.md)) |
 
 35B steady-serving PSS is 3.53 GiB against vLLM's 13.3 GiB after the routed-expert
 host mirror is freed once the device Marlin resident is built.

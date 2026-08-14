@@ -208,3 +208,176 @@ TEST_CASE("text longer than the declared slots is REFUSED") {
   CHECK_THROWS(vllm::models::talker::PrepareInputs(PromptCfg(), PromptW(), cond, 3,
                                                    {2, 3, 4, 5, 6, 7}, 0));
 }
+
+// ---------------------------------------------------------------------------
+// The autoregressive loop (#634).
+//
+// Driven by weights built so the argmax is PREDICTABLE: the mel head is an
+// identity-like projection, so whichever hidden dimension is largest names the
+// code. That makes the loop's control flow -- stop token, length cap, position
+// indexing -- checkable by hand rather than against a table of floats.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A backbone that passes its input through unchanged: zero attention output,
+// zero MLP output, and identity layer norms are impossible, so instead every
+// weight is zero EXCEPT the layer norms, which makes each block's residual
+// dominate. What matters for these cases is only that the last row's hidden
+// state is a deterministic function of the last input row.
+vllm::gpt2::Params GenParams(int64_t dim) {
+  vllm::gpt2::Params p;
+  p.hidden_size = dim;
+  p.num_attention_heads = 1;
+  p.num_hidden_layers = 1;
+  p.inner_size = dim;
+  p.vocab_size = 8;
+  p.max_position_embeddings = 8;
+  p.layer_norm_eps = 1e-5;
+  return p;
+}
+
+vllm::gpt2::Weights GenBackbone(int64_t dim) {
+  vllm::gpt2::Weights w;
+  w.wte.assign(static_cast<size_t>(8 * dim), 0.0F);
+  w.wpe.assign(static_cast<size_t>(8 * dim), 0.0F);
+  w.ln_f_weight.assign(static_cast<size_t>(dim), 1.0F);
+  w.ln_f_bias.assign(static_cast<size_t>(dim), 0.0F);
+  vllm::gpt2::LayerWeights l;
+  l.ln_1_weight.assign(static_cast<size_t>(dim), 1.0F);
+  l.ln_1_bias.assign(static_cast<size_t>(dim), 0.0F);
+  l.ln_2_weight.assign(static_cast<size_t>(dim), 1.0F);
+  l.ln_2_bias.assign(static_cast<size_t>(dim), 0.0F);
+  l.c_attn_weight.assign(static_cast<size_t>(3 * dim * dim), 0.0F);
+  l.c_attn_bias.assign(static_cast<size_t>(3 * dim), 0.0F);
+  l.c_proj_weight.assign(static_cast<size_t>(dim * dim), 0.0F);
+  l.c_proj_bias.assign(static_cast<size_t>(dim), 0.0F);
+  l.c_fc_weight.assign(static_cast<size_t>(dim * dim), 0.0F);
+  l.c_fc_bias.assign(static_cast<size_t>(dim), 0.0F);
+  l.mlp_c_proj_weight.assign(static_cast<size_t>(dim * dim), 0.0F);
+  l.mlp_c_proj_bias.assign(static_cast<size_t>(dim), 0.0F);
+  w.layers.push_back(std::move(l));
+  return w;
+}
+
+vllm::models::talker::GenerateConfig GenCfg(int64_t codes, int64_t stop, int64_t maxlen) {
+  vllm::models::talker::GenerateConfig c;
+  c.dim = 2;
+  c.mel_codes = codes;
+  c.start_mel_token = codes - 1;
+  c.stop_mel_token = stop;
+  c.max_mel_tokens = maxlen;
+  return c;
+}
+
+// The head selects `bias_favoured` unconditionally: every head row is zero and
+// only that row carries a positive bias.
+vllm::models::talker::GenerateWeights GenW(int64_t codes, int64_t dim, int64_t favoured) {
+  vllm::models::talker::GenerateWeights w;
+  w.mel_embedding.assign(static_cast<size_t>(codes * dim), 0.0F);
+  w.mel_pos_embedding.assign(static_cast<size_t>(64 * dim), 0.0F);
+  w.final_norm_w.assign(static_cast<size_t>(dim), 1.0F);
+  w.final_norm_b.assign(static_cast<size_t>(dim), 0.0F);
+  w.mel_head_w.assign(static_cast<size_t>(codes * dim), 0.0F);
+  w.mel_head_b.assign(static_cast<size_t>(codes), 0.0F);
+  w.mel_head_b[static_cast<size_t>(favoured)] = 1.0F;
+  return w;
+}
+
+}  // namespace
+
+TEST_CASE("generation stops at the stop token, which is NOT emitted") {
+  const int64_t dim = 2, codes = 5;
+  // The head always favours code 3, and 3 IS the stop token, so nothing is
+  // emitted at all.
+  const auto out = vllm::models::talker::GenerateMelCodes(
+      GenCfg(codes, /*stop=*/3, /*maxlen=*/8), GenW(codes, dim, 3), GenParams(dim),
+      GenBackbone(dim), std::vector<float>(static_cast<size_t>(3 * dim), 0.1F), 3);
+  CHECK(out.empty());
+}
+
+TEST_CASE("generation is capped by max_mel_tokens") {
+  const int64_t dim = 2, codes = 5;
+  // The head always favours code 2, which is NOT the stop token, so the loop
+  // runs to the cap.
+  const auto out = vllm::models::talker::GenerateMelCodes(
+      GenCfg(codes, /*stop=*/3, /*maxlen=*/6), GenW(codes, dim, 2), GenParams(dim),
+      GenBackbone(dim), std::vector<float>(static_cast<size_t>(3 * dim), 0.1F), 3);
+  REQUIRE(out.size() == 6);
+  for (const int64_t c : out) {
+    CHECK(c == 2);
+  }
+}
+
+TEST_CASE("an out-of-range mel code is refused rather than indexed") {
+  const int64_t dim = 2, codes = 5;
+  auto w = GenW(codes, dim, 2);
+  w.mel_embedding.resize(static_cast<size_t>(2 * dim));  // too short for code 2
+  CHECK_THROWS(vllm::models::talker::GenerateMelCodes(
+      GenCfg(codes, 3, 4), w, GenParams(dim), GenBackbone(dim),
+      std::vector<float>(static_cast<size_t>(3 * dim), 0.1F), 3));
+}
+
+TEST_CASE("a prompt whose length disagrees with its rows is refused") {
+  const int64_t dim = 2, codes = 5;
+  CHECK_THROWS(vllm::models::talker::GenerateMelCodes(
+      GenCfg(codes, 3, 4), GenW(codes, dim, 2), GenParams(dim), GenBackbone(dim),
+      std::vector<float>(static_cast<size_t>(3 * dim), 0.1F), /*prompt_len=*/4));
+}
+
+TEST_CASE("the mel POSITION table is indexed by step, not absolute position") {
+  // A position table only long enough for the generated run proves the index is
+  // the step: an absolute index would run off the end of it and throw.
+  const int64_t dim = 2, codes = 5;
+  auto w = GenW(codes, dim, 2);
+  w.mel_pos_embedding.assign(static_cast<size_t>(5 * dim), 0.0F);  // 4 steps + start
+  const auto out = vllm::models::talker::GenerateMelCodes(
+      GenCfg(codes, 3, 4), w, GenParams(dim), GenBackbone(dim),
+      std::vector<float>(static_cast<size_t>(16 * dim), 0.1F), 16);
+  CHECK(out.size() == 4);
+}
+
+TEST_CASE("the START token is SEEDED, and the loop sees it") {
+  // The all-zero fixtures above cannot tell a seeded run from an unseeded one:
+  // with a zero backbone and a bias-only head, both predict identically. So
+  // this one makes the prediction depend on the LAST ROW. The start token
+  // embeds to a large negative value while the prompt rows are positive, and
+  // the head reads dimension 0, so whether the start row was appended decides
+  // which code wins.
+  const int64_t dim = 2, codes = 5;
+  auto w = GenW(codes, dim, 0);
+  w.mel_head_b.assign(static_cast<size_t>(codes), 0.0F);
+  // code 2 fires on a POSITIVE dim-0, code 1 on a negative one.
+  w.mel_head_w.assign(static_cast<size_t>(codes * dim), 0.0F);
+  w.mel_head_w[static_cast<size_t>(2 * dim)] = 1.0F;
+  w.mel_head_w[static_cast<size_t>(1 * dim)] = -1.0F;
+  // The start token (code 4) embeds to a strong negative on dim 0.
+  w.mel_embedding.assign(static_cast<size_t>(codes * dim), 0.0F);
+  w.mel_embedding[static_cast<size_t>(4 * dim)] = -50.0F;
+
+  const std::vector<float> prompt{5.0F, -5.0F, 5.0F, -5.0F, 5.0F, -5.0F};
+  const auto out = vllm::models::talker::GenerateMelCodes(
+      GenCfg(codes, /*stop=*/3, /*maxlen=*/1), w, GenParams(dim), GenBackbone(dim),
+      prompt, 3);
+  REQUIRE(out.size() == 1);
+  // Layer-norming a row whose dim 0 is the NEGATIVE start value leaves dim 0
+  // negative, so code 1 wins. Without the seeding the last row would be a
+  // prompt row with a POSITIVE dim 0, and code 2 would win instead.
+  CHECK(out[0] == 1);
+}
+
+TEST_CASE("argmax ties keep the LOWEST code") {
+  // Two codes with identical logits. Upstream's argmax returns the first, and a
+  // `>=` comparison silently returns the last -- both produce a legal code, and
+  // on a real checkpoint exact ties are rare enough that a golden would never
+  // catch it.
+  const int64_t dim = 2, codes = 5;
+  auto w = GenW(codes, dim, 1);
+  w.mel_head_b[4] = 1.0F;  // code 1 and code 4 now tie
+  const auto out = vllm::models::talker::GenerateMelCodes(
+      GenCfg(codes, /*stop=*/3, /*maxlen=*/2), w, GenParams(dim), GenBackbone(dim),
+      std::vector<float>(static_cast<size_t>(3 * dim), 0.1F), 3);
+  REQUIRE(out.size() == 2);
+  CHECK(out[0] == 1);
+  CHECK(out[1] == 1);
+}

@@ -137,24 +137,40 @@ std::vector<float> ForwardHost(const Params& params, const Weights& weights,
                                const std::vector<int64_t>& input_ids,
                                const std::vector<int64_t>& positions) {
   VT_CHECK(input_ids.size() == positions.size(), "gpt2: ids and positions must be the same length");
-  const int64_t seq = static_cast<int64_t>(input_ids.size());
   const int64_t h = params.hidden_size;
-  const int64_t heads = params.num_attention_heads;
-  const int64_t head_dim = params.head_dim();
-  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));  // gpt2.py:76
+  const int64_t seq = static_cast<int64_t>(input_ids.size());
 
-  // gpt2.py:225-229 — inputs_embeds + position_embeds.
-  std::vector<float> x(static_cast<size_t>(seq * h));
+  // gpt2.py:225-229 — inputs_embeds + position_embeds. Everything after this is
+  // independent of WHERE the embeddings came from, which is why the rest is a
+  // separate entry point: the IndexTTS talker's prompt is a mix of projected
+  // conditioning rows and embedded text, and has no token ids at all.
+  std::vector<float> embeds(static_cast<size_t>(seq * h));
   for (int64_t t = 0; t < seq; ++t) {
     const int64_t id = input_ids[static_cast<size_t>(t)];
     const int64_t pos = positions[static_cast<size_t>(t)];
     VT_CHECK(id >= 0 && id < params.vocab_size, "gpt2: input id out of range");
     VT_CHECK(pos >= 0 && pos < params.max_position_embeddings, "gpt2: position out of range");
     for (int64_t j = 0; j < h; ++j) {
-      x[static_cast<size_t>(t * h + j)] =
-          weights.wte[static_cast<size_t>(id * h + j)] + weights.wpe[static_cast<size_t>(pos * h + j)];
+      embeds[static_cast<size_t>(t * h + j)] =
+          weights.wte[static_cast<size_t>(id * h + j)] +
+          weights.wpe[static_cast<size_t>(pos * h + j)];
     }
   }
+  return ForwardHostEmbeds(params, weights, embeds);
+}
+
+std::vector<float> ForwardHostEmbeds(const Params& params, const Weights& weights,
+                                     const std::vector<float>& inputs_embeds) {
+  const int64_t h = params.hidden_size;
+  VT_CHECK(h > 0 && inputs_embeds.size() % static_cast<size_t>(h) == 0,
+           "gpt2: inputs_embeds must be [seq, hidden]");
+  const int64_t seq = static_cast<int64_t>(inputs_embeds.size()) / h;
+  VT_CHECK(seq > 0, "gpt2: inputs_embeds must hold at least one row");
+  const int64_t heads = params.num_attention_heads;
+  const int64_t head_dim = params.head_dim();
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));  // gpt2.py:76
+
+  std::vector<float> x = inputs_embeds;
 
   std::vector<float> normed(static_cast<size_t>(seq * h));
   std::vector<float> qkv(static_cast<size_t>(seq * 3 * h));

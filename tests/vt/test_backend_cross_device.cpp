@@ -2125,7 +2125,7 @@ TEST_CASE("MoE combine/gate ops match the CPU oracle") {
       Tensor tw = T2(cw.data(), cd, T, K);
       Tensor to2 = T2(ref_c.data(), cd, T, H);
       if (OpAvailable(vt::OpId::kMoeCombine, DeviceType::kCPU))
-        vt::MoeCombine(cq, to2, teo, tw, &tsd);
+        vt::MoeCombine(cq, to2, teo, tw, &tsd, 1.0f);
       cpu.DestroyQueue(cq);
       // MoeCombineGate has no CPU op registration; the oracle is the composite
       // computed on host: MoeCombine (no shared) + bf16-round(sigmoid(gl)*sd).
@@ -2159,7 +2159,7 @@ TEST_CASE("MoE combine/gate ops match the CPU oracle") {
       CHECK(gotb == ref_sg_b);  // both sides store bf16: bit-exact
     }
     if (OpAvailable(vt::OpId::kMoeCombine, dt)) {
-      vt::MoeCombine(q, tout, teo, tw, &tsd);
+      vt::MoeCombine(q, tout, teo, tw, &tsd, 1.0f);
       // Thread-per-element, single store rounding, no cross-lane reduction:
       // bit-exact is the achievable and asserted bar (review sweep on #509).
       CHECK(dout.Download() == ref_c);
@@ -2193,10 +2193,10 @@ TEST_CASE("MoE combine/gate ops match the CPU oracle") {
         Tensor teo_c = Tensor::Contiguous(ceo.data(), DType::kBF16, cd, {T, K, H});
         Tensor tw_c = T2(cw.data(), cd, T, K);
         Tensor tsd_c = Tensor::Contiguous(csd.data(), DType::kBF16, cd, {T, H});
-        vt::MoeCombine(cq, r, teo_c, tw_c, &tsd_c);
+        vt::MoeCombine(cq, r, teo_c, tw_c, &tsd_c, 0.7f);
         cpu.DestroyQueue(cq);
       }
-      vt::MoeCombine(q, tout_b, teo_b, tw, &tsd_b);
+      vt::MoeCombine(q, tout_b, teo_b, tw, &tsd_b, 0.7f);
       std::vector<uint16_t> got_b(on);
       dout_bf.Download(got_b.data());
       CHECK(got_b == ref_b);

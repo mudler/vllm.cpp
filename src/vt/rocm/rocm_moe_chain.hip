@@ -61,7 +61,8 @@ __global__ void SharedExpertGateK(Tout* out, const Tsd* sd, const float* gl, int
 // MoeCombine (cuda_moe.cu:473).
 template <typename Teo, typename Tsh, typename Tout>
 __global__ void MoeCombineK(Tout* out, const Teo* expert_out, const float* weights,
-                            const Tsh* shared, int64_t t, int64_t h, int k) {
+                            const Tsh* shared, int64_t t, int64_t h, int k,
+                            float routed_scale) {
   const int64_t n = t * h;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
@@ -71,6 +72,11 @@ __global__ void MoeCombineK(Tout* out, const Teo* expert_out, const float* weigh
     float acc = 0.0f;
     for (int j = 0; j < k; ++j)
       acc += weights[row * k + j] * Ld(expert_out, (row * k + j) * h + col);
+    // routed_scale multiplies the ROUTED sum only, BEFORE the shared term is
+    // added (upstream apply_routed_scale_to_output: fused_output *= factor,
+    // shared untouched) — one standalone f32 multiply on the finished
+    // accumulator, bit-identical to the CPU reference under -ffp-contract=off.
+    acc *= routed_scale;
     if (shared != nullptr) acc += Ld(shared, idx);
     St(out, idx, acc);
   }
@@ -128,7 +134,7 @@ void SharedExpertGateKernelRocm(Queue& q, Tensor& out, const Tensor& sd, const T
 }
 
 void MoeCombineKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
-                          const Tensor& weights, const Tensor* shared) {
+                          const Tensor& weights, const Tensor* shared, float routed_scale) {
   // The donor's dtype refusals (cuda_moe.cu:520-524) — f16 is admitted by the
   // seam's IsFloat gate, and Tensor::Ptr<T>() is an unchecked cast, so without
   // these an f16 expert_out would be read at 4 bytes/element from a 2-byte
@@ -149,7 +155,7 @@ void MoeCombineKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
     using Teo = decltype(eo); using Tsh = decltype(sh); using Tout = decltype(ot);
     MoeCombineK<Teo, Tsh, Tout><<<GridFor(n), kBlock, 0, s>>>(
         out.Ptr<Tout>(), expert_out.Ptr<Teo>(), weights.Ptr<float>(),
-        shared != nullptr ? shared->Ptr<Tsh>() : nullptr, t, h, k);
+        shared != nullptr ? shared->Ptr<Tsh>() : nullptr, t, h, k, routed_scale);
   };
   auto by_shared = [&](auto eo, auto ot) {
     if (shared != nullptr && shared->dtype == DType::kBF16) launch(eo, __hip_bfloat16{}, ot);

@@ -58,7 +58,7 @@ void MoeSiluMulKernelRocm(Queue& q, Tensor& out, const Tensor& gate, const Tenso
 // weighted expert combinations.
 void SharedExpertGateKernelRocm(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl);
 void MoeCombineKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
-                          const Tensor& weights, const Tensor* shared);
+                          const Tensor& weights, const Tensor* shared, float routed_scale);
 void MoeCombineGateKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
                               const Tensor& weights, const Tensor& sd, const Tensor& gl);
 // BACKEND-ROCM-GDN-KERNELS family 1 (rocm_gdn_state.hip): the indexed state I/O

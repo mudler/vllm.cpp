@@ -125,8 +125,20 @@ chat request content-part array          [MM-SERVE-PARSE — CPU, THIS BRICK]
   overloads via `InputProcessor::process_inputs_mm` carry the expanded prompt +
   `mm_features` onto `EngineCoreRequest`/`Request`; serving_chat routes mm
   requests through them via the `MultiModalChatFn` seam. See "Brick 2 — landed".
-- **Streaming mm, multiple images, video parts, image_embeds/prompt_embeds** — the
+- **Streaming mm, video parts, image_embeds/prompt_embeds** — the
   parse tolerates them (empty payload under their `type`) but they are not routed.
+- **Multiple images — NOT "not routed": SILENTLY TRUNCATED** (#686). This line
+  previously grouped them with the above, which understated it.
+  `entrypoints/openai/chat_mm.cpp:256-262` locates the **first** `image_url` part
+  and `break`s, so a three-image request is *served with one*, with no error and no
+  warning. "Not routed" is accurate for video, audio and `*_embeds` — nothing is
+  sent and the user notices. Truncation is the case where they do not.
+  AGENTS.md requires an unimplemented arm to be "refused with a message naming the
+  missing piece", and upstream does exactly that:
+  `MultiModalProcessingInfo.validate_num_items`
+  (`vllm/multimodal/processing/context.py:409-428`) raises `VLLMValidationError`.
+  #607's L1 has now ported that refusal (`BaseProcessingInfo::ValidateNumItems`);
+  wiring this call site to it is L2, and this is the reason L2 exists.
 
 ## Brick 2 (`MM-SERVE-ENGINE`) — landed
 

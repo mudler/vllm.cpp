@@ -55,14 +55,25 @@ spec and run `git log -S`. Do not derive the history again.
 
 **Do not start work without an open GitHub issue.** Before you claim a row or
 write code, make sure that an issue tracks the work. Open one if none exists.
-Link the issue in three places that must agree: the issue table in
-[`.agents/roadmap_v1.md`](.agents/roadmap_v1.md), the row's spec, and the pull
+Link the issue in three places that must agree: the index in
+[`.agents/issue-index.md`](.agents/issue-index.md), the row's spec, and the pull
 request body.
+
+The index is append-only and carries `merge=union`, so two branches that each
+append a row merge without a conflict. Append a row at the end. Never edit a row
+and never delete one, because GitHub holds the open and closed state and an
+edited row is duplicated rather than merged.
 
 A bug that you find during other work still needs an issue. Filing the issue
 does not defer the fix. File it, fix it in the same flow, reference it in the
 commit, and close it. The person who found the bug has the context to fix it.
 Traceability is the goal, not another round trip.
+
+**An issue you do not fix in the same flow has to say who owns it.** Every index
+row names an owning row ID, or names a spec that lists the issue under `##
+Owed`. `scripts/check-agent-record.py` counts the rows that do neither and
+refuses a count above the recorded mark. Filing without fixing is therefore a
+gate failure rather than a habit.
 
 This in-flow rule applies to small and clear fixes. Use the normal row, spec,
 and fresh-review path for a surprising fix. Use that path when a fix needs its
@@ -363,9 +374,19 @@ lifecycle write.
 
 ## Work happens in a worktree
 
-**Do every unit of work in its own linked worktree and task branch.** This rule
-includes a feature, fix, policy, document, record, and one-line gate repair. A
-claimed row uses `row/<ID>`. Pin the base SHA when you create the worktree.
+**Do every unit of work in its own linked worktree and task branch.** A unit of
+work is one issue's change together with the records that change invalidates. A
+feature, a fix, a policy change, a document, and a one-line gate repair are each
+a unit. A claimed row uses `row/<ID>`. Pin the base SHA when you create the
+worktree.
+
+**A record edit rides in the pull request whose change made the record stale.**
+It is not a unit of work by itself. A record-only pull request is still correct
+when the record is the work: a stale row, a corrected pin, a newly filed gap. It
+is wrong when it only restates what just landed, because that costs a branch, a
+gate run, and a fresh review to say something the landing change already knew.
+This narrows what counts as a unit. It never licenses bundling unrelated work
+into one branch.
 
 Keep the shared checkout on a clean `main`. **Never use it as a work surface.**
 Other worktrees branch from it, so it must remain current and safe. Never edit,

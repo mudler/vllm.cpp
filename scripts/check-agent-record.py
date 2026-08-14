@@ -524,6 +524,7 @@ REQUIRED = [
     ROOT / "README.md",
     ROOT / "docs/BENCHMARKS.md",
     AGENTS / "roadmap_v1.md",
+    AGENTS / "issue-index.md",
     AGENTS / "coordination.md",
     AGENTS / "feature-matrix.md",
     AGENTS / "specs/model-family-inventory.md",
@@ -1311,45 +1312,147 @@ ISSUE_ROW = re.compile(
 )
 
 
-def check_issue_table(errors: list[str]) -> None:
-    """Every tracked issue is well-formed and its row link is consistent.
+ISSUE_INDEX = AGENTS / "issue-index.md"
+
+# The index carries `merge=union`, so an edited preamble line is DUPLICATED
+# rather than merged. Holding the expected text here means the preamble cannot
+# drift without a deliberate edit to both sides.
+INDEX_PREAMBLE = """# Issue index
+
+**No work without an open issue.** Before claiming a row or writing code,
+confirm an issue tracks the work; open one if it does not. The number is linked
+from here, from the row's spec, and from the PR.
+
+This file is append-only. Add a row at the end. Never edit a row and never
+delete one. GitHub holds the open and closed state, so closing an issue costs no
+edit here. `Row` is the owning roadmap block or area-matrix row, or a dash when
+a spec lists the issue under `## Owed`.
+
+The path carries `merge=union` in `.gitattributes`, so two branches that each
+append a row merge without a conflict. That driver is only safe while the rule
+above holds. An edited row and an edited line of this preamble are duplicated
+rather than merged. `scripts/check-agent-record.py` gates both.
+
+| Issue | Row | Title | Kind |
+|---:|---|---|---|
+"""
+
+# Rows naming no owning row AND not listed under a spec's `## Owed`. A RATCHET:
+# it may only fall, and a fall must lower this number in the same change.
+# Measured 2026-08-14 on 186 rows. Raising it is a checker semantic change and
+# needs a spec plus a red-before test, which is the point.
+UNOWNED_HIGH_WATER = 33
+
+
+def owed_issues() -> set[str]:
+    """Issue numbers a spec claims under `## Owed`, read with a glob.
+
+    Per-row surface by construction: one file per spec, so filing an owed issue
+    never makes two branches write the same line.
+    """
+
+    owed: set[str] = set()
+    for path in sorted((AGENTS / "specs").glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        if "\n## Owed" not in text:
+            continue
+        body = text.split("\n## Owed", 1)[1].split("\n## ", 1)[0]
+        owed |= set(re.findall(r"#(\d+)", body))
+        owed |= set(re.findall(r"issues/(\d+)", body))
+    return owed
+
+
+def check_issue_index(
+    errors: list[str],
+    text: str | None = None,
+    owed: set[str] | None = None,
+    high_water: int | None = None,
+) -> None:
+    """Every tracked issue is well-formed, consistent, and owned.
 
     Deliberately NETWORK-FREE. Querying GitHub would make this gate fail on
     connectivity, which is exactly the class of flake this protocol exists to
-    remove. It checks the FORM and the internal consistency; whether the issue
-    is still open is the agent's job at intake, not a CI blocker.
+    remove. It checks the FORM, the internal consistency, and whether an owner
+    is named; whether the issue is still open is GitHub's record, not a CI
+    blocker.
+
+    `text`, `owed` and `high_water` are injectable so a test can build a small
+    index. Without an injectable mark every fixture would be red for having the
+    wrong number of unowned rows, which would hide whatever the fixture is
+    actually about.
     """
 
-    path = AGENTS / "roadmap_v1.md"
-    text = path.read_text(encoding="utf-8")
-    if "## Open issues" not in text:
-        errors.append(f"{path.relative_to(ROOT)}: missing the '## Open issues' intake table")
-        return
+    label = ISSUE_INDEX.relative_to(ROOT)
+    if text is None:
+        if not ISSUE_INDEX.is_file():
+            errors.append(f"{label}: missing the issue index")
+            return
+        text = ISSUE_INDEX.read_text(encoding="utf-8")
+    if owed is None:
+        owed = owed_issues()
+    if high_water is None:
+        high_water = UNOWNED_HIGH_WATER
 
-    section = text.split("## Open issues", 1)[1].split("\n## ", 1)[0]
+    if not text.startswith(INDEX_PREAMBLE):
+        actual = text.split("| [#", 1)[0]
+        expected_lines = INDEX_PREAMBLE.splitlines()
+        for number, line in enumerate(actual.splitlines(), 1):
+            if number > len(expected_lines) or line != expected_lines[number - 1]:
+                errors.append(
+                    f"{label}:{number}: preamble drifted from the checker's copy; "
+                    f"got {line[:60]!r}. A union merge DUPLICATES an edited "
+                    "preamble line instead of merging it"
+                )
+                break
+        else:
+            errors.append(f"{label}: preamble is shorter than the checker's copy")
+
     seen: set[str] = set()
     rows = 0
-    for line in section.splitlines():
+    unowned: list[str] = []
+    for line in text.splitlines():
+        # Any table line that is not the header or the separator. Matching only
+        # `| [#` would make a row that LOST its link invisible instead of
+        # malformed, which is the failure this loop exists to report.
         if not line.startswith("|") or line.startswith("| Issue") or set(line) <= set("|-: "):
             continue
         match = ISSUE_ROW.match(line)
         if not match:
             errors.append(
-                f"{path.relative_to(ROOT)}: malformed issue row {line[:60]!r}; "
+                f"{label}: malformed issue row {line[:60]!r}; "
                 "expected | [#N](https://github.com/.../issues/N) | `ROW-ID` or — | title | kind |"
             )
             continue
         rows += 1
         number, url, url_number, row_id = match.group(1), match.group(2), match.group(3), match.group(4)
         if number != url_number:
-            errors.append(
-                f"{path.relative_to(ROOT)}: issue #{number} links to {url}, a different issue"
-            )
+            errors.append(f"{label}: issue #{number} links to {url}, a different issue")
         if number in seen:
-            errors.append(f"{path.relative_to(ROOT)}: issue #{number} listed twice")
+            errors.append(
+                f"{label}: issue #{number} listed twice. Under `merge=union` a "
+                "duplicate is what two branches appending the same issue look like"
+            )
         seen.add(number)
+        if row_id is None and number not in owed:
+            unowned.append(number)
+
     if rows == 0:
-        errors.append(f"{path.relative_to(ROOT)}: the open-issue table has no rows")
+        errors.append(f"{label}: the issue index has no rows")
+
+    if len(unowned) > high_water:
+        fresh = unowned[high_water:]
+        errors.append(
+            f"{label}: {len(unowned)} rows name no owner, above the recorded "
+            f"{high_water}: {', '.join('#' + n for n in fresh[:5])}. "
+            "Name an owning row ID, or list the issue under `## Owed` in the "
+            "spec that owes it. Filing an issue does not defer the fix"
+        )
+    elif len(unowned) < high_water:
+        errors.append(
+            f"{label}: {len(unowned)} rows name no owner, below the recorded "
+            f"{high_water}. Lower UNOWNED_HIGH_WATER to {len(unowned)} "
+            "in the same change, so the ratchet cannot slip back"
+        )
 
 
 def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
@@ -1408,7 +1511,7 @@ def main() -> int:
     by_id: dict[str, ClaimRow] = {}
     if not errors:
         check_links(errors)
-        check_issue_table(errors)
+        check_issue_index(errors)
         rows, by_id = check_matrices(errors)
         check_engine_summary(rows, errors)
         check_row_contracts(rows, by_id, errors)

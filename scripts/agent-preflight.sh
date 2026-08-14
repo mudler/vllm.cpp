@@ -84,6 +84,7 @@ SUITES=(
   test_check_prompt_contract
   test_agent_gates
   test_agent_record
+  test_check_issue_index_append_only
   test_check_release_binary_contract
   test_release_manifest
   test_release_archive
@@ -216,6 +217,8 @@ if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
   run "now-current range" python3 scripts/check-now-current.py \
     --base origin/main --head HEAD
   run "doc-checkpoint range" python3 scripts/check-doc-checkpoint.py \
+    --base origin/main --head HEAD
+  run "issue-index append-only" python3 scripts/check-issue-index-append-only.py \
     --base origin/main --head HEAD
 fi
 

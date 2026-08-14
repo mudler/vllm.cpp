@@ -75,6 +75,7 @@ jobs:
         run: |
           python3 scripts/check-agent-record.py
           python3 tests/scripts/test_agent_record.py
+          python3 tests/scripts/test_check_issue_index_append_only.py
           python3 tests/scripts/test_doc_checkpoint.py
       - name: Accepted binary-release design and record anchors stay in sync
         run: |

@@ -373,4 +373,47 @@ handle; `git log --grep POLICY-SINGLE-PR-AND-STYLE` finds them.
 Operator verification also reproduced the checker survey independently, in both
 windows, and confirmed both mutation-restoration hashes byte-for-byte.
 
-Fresh review of the `AGENTS.md` rewrite, the full gate, and landing remain.
+### Fresh review of the rewrite
+
+A fresh reviewer that did not write the rewrite compared it with
+`e73eb67177b1d0f570523b163c5e12d318bf8854` rule by rule. It traced all 43 prior
+`never` occurrences and all 22 prior `only` occurrences individually, diffed
+every table mechanically, and swept 52 load-bearing identifiers. No identifier,
+command, script name, seam symbol, or state name was lost. The four tables and
+the commands block are byte-identical: 6 history rows, 8 oracle rows, 6
+public-document rows, 9 task-guide rows, 6 commands, 3 trailers.
+
+It returned two findings that changed policy meaning outside this row's two
+permitted changes, and both are repaired:
+
+1. `Spec before code` turned the stop condition "reconcile the record first and
+   do not implement" into the ordering statement "reconcile the record before
+   you implement". That permits implementing work already landed or already
+   claimed, which is what the sentence exists to prevent.
+2. `How work gets done` step 4 narrowed "an implementer or reviewer report is an
+   input, never a gate result" to "not the operator's gate result", and dropped
+   "itself" from the operator sentence.
+
+Fourteen smaller repairs restored modality or reasoning: see the `fix(...)`
+commit for the list. One finding was accepted as an improvement rather than
+repaired — the protocol marker is now described as a paragraph rather than a
+line, which matches `scripts/check-commit-trailers.py:151-155`, where the
+checker already requires a separate paragraph.
+
+The reviewer also found the two gated commit checks stated in no `AGENTS.md`
+prose, against this file's own rule that it states the rule while the checker's
+message is the authority on enforcement. `## How we write` now states both.
+
+This spec's rule-preservation inventory was checked row by row. Sixteen of its
+17 rows were true as written. Row 5, `Spec before code`, was false: it claimed
+the section "adds only the approved pull request choice" while the section had
+also dropped a prohibition. The repair makes the claim true.
+
+**One honest gap.** The repairs above were made by the operator session that
+commissioned the review, not by a separate fresh implementer, and they have had
+no fresh review of their own. `AGENTS.md` asks for a fresh implementer to repair
+findings. The operator did not write the rewrite under review, so this is not a
+session reviewing its own code, but it is not the full loop either. A reviewer
+of this pull request should read the `fix(...)` commit as unreviewed work.
+
+The full gate and landing remain.

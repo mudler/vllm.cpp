@@ -470,7 +470,8 @@ MiniMaxMusic3ComponentWeights MiniMaxMusic3LoadComponent(
 // `<module>.weight` and no `_g`/`_v` name surviving. F32 throughout — the
 // checkpoint's own dtype (spec section 2.1), not a widening.
 //
-// `folded` counts the pairs collapsed; 20 for the shipped checkpoint, and it is
+// `folded` counts the pairs collapsed; 30 for the shipped checkpoint — the same
+// 30 the weight-norm note above counts (2 + 30*3 + 29 = 121 tensors) — and it is
 // returned rather than assumed so a file that lost a pair is visible.
 struct MiniMaxMusic3VocoderWeights {
   std::map<std::string, std::vector<float>> tensors;

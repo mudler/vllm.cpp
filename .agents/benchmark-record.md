@@ -21513,3 +21513,21 @@ run 1 14.400 / 15.902 / 19.830, run 2 13.323 / 15.902 / 19.830 equivalents.)
 The harness itself is now committed as `scripts/dspark-paired-e2e.sh`; it was
 previously only on the gate host, which is why nothing in the tree could
 reproduce these medians.
+
+## SPEC-DSPARK: there are THREE gpu.lock spellings, and the paired runs took only one (2026-08-14)
+
+The correction two entries up said the lock is `$HOME/gpu.lock` and
+`/tmp/gpu.lock` is dead. Both true, and both incomplete: `/tmp/gpu` (NO suffix)
+is ALSO live. `.env:22` sets `GPU_LOCK=/tmp/gpu`, `.env.example:66` prescribes
+`flock $GPU_LOCK`, and `.agents/coordination.md:99` documents it, so some
+sessions genuinely serialise on that third name (issue #587).
+
+CONSEQUENCE FOR THIS ROW: the paired end-to-end runs took `$HOME/gpu.lock` only.
+Any session serialising on `/tmp/gpu` was therefore NOT excluded from them, so
+even the "correctly locked" runs are only partially serialised, and their
+ABSOLUTE numbers keep the same lower-bound status as the unlocked ones. The
+INTERLEAVED and within-run paired structure still protects the ratios, since
+contention lands on both arms alike -- which is now the third independent reason
+this row quotes ratios and not absolutes.
+
+`scripts/dspark-paired-e2e.sh` should take BOTH names before it is used again.

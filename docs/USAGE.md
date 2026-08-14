@@ -1070,9 +1070,13 @@ layer-17 hidden-state tap, the checkpoint's stored-statistics normalization and
 the semantic codec to discrete codes, and the talker's prompt is assembled from
 that conditioning plus the text -- but none of it is reachable from a command or
 a route yet. The greedy generate loop that turns the prompt into mel codes is
-ported too, so text plus a reference clip reaches mel CODES in the library; what
-is still missing before audio is the emotion vector the prompt expects, BigVGAN's
-separately-downloaded checkpoint, and any command or route to call it from.
+ported too, and so is the STATED-emotion path -- eight weights selecting rows
+from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
+text plus a reference clip and an emotion reaches mel CODES in the library. What
+is still missing before audio is reading those matrices out of the converted
+checkpoint, BigVGAN's separately-downloaded checkpoint, and any command or route
+to call it from. Inferring the emotion from a clip instead of stating it needs a
+Conformer and a Perceiver that are not ported.
 
 There is **no `/v1/audio/speech`**. Text to speech is not servable: the
 IndexTTS-2.5 stages are ported and gated at reduced dimensions, with further
@@ -2473,3 +2477,98 @@ bound is therefore
 calibrated against torch's own `sdpa_kernel(MATH)` arm on the identical inputs
 (46.34% bit-identical, mean absolute error 1.659e-03) rather than against a
 bit-exactness that no second implementation can reach.
+
+## MiniMax-Music3: the acoustic half
+
+Phases W4 and W5 of #672.
+`include/vllm/model_executor/models/minimax_music3_acoustic.h` is the rest of the
+pipeline: the 2.4B fp32 flow-matching DiT, the `FlowMatchEulerDiscreteScheduler`
+with `invert_sigmas`, the classifier-free-guidance mix, the denoise loop's
+overlapping-window bookkeeping, and the DAC Flow-VAE vocoder that turns latents
+into a **44100 Hz stereo** waveform. **It still does not generate a song end to
+end** — joining the two halves through `SpeechRegistry`, the `vllm_speech_*` ABI
+and the example server is W6, and the 8.6B `Qwen3ForCausalLM` forward is the
+remainder of W2.
+
+Configs are W1's (`MiniMaxMusic3TransformerConfig`,
+`MiniMaxMusic3VocoderConfig`, `MiniMaxMusic3SchedulerConfig`) rather than new
+ones, and every convolution, transposed convolution, pad and activation is a
+call into the shared `vllm::vocoder1d` primitives. Nothing in `vocoder1d` is
+modified, so MiniMax-H3 and IndexTTS-2.5 are byte-identical.
+
+### There is no token gate on this half, and that is not a gap
+
+A flow-matching denoise loop has no logits, no vocabulary and no sampler, so no
+token gate exists to have. (That is a *different* fact from the autoregressive
+half's withdrawn token gate above, which was withdrawn because upstream has no
+greedy path there. Two withdrawals, two causes.) What binds instead is per-stage
+tensor parity against the oracle capture, each stage against its own entry.
+
+### Running the gates
+
+The reduced-dimension gate needs no checkpoint. Its goldens come from executing
+upstream's own `MiniMaxMusic3Transformer1DModel`, `MiniMaxMusic3Vocoder`,
+`FlowMatchEulerDiscreteScheduler` and `ClassifierFreeGuidance` at small
+dimensions in float32:
+
+```sh
+cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON
+cmake --build build -j 8 --target test_minimax_music3_acoustic
+./build/tests/test_minimax_music3_acoustic
+```
+
+The full-scale gate drives the real fp32 weights on the capture's own inputs and
+skips loudly without the checkpoint. Its scheduler and vocoder cases run in
+about ninety seconds:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_acoustic_real
+```
+
+The **DiT** cases are opt-in behind a second variable, because they load 9.1 GB
+of fp32 weights and run four 2.4B forwards on the host — about fifteen minutes,
+not ninety seconds:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 VLLM_CPP_MUSIC3_DIT=1 \
+  ./build/tests/test_minimax_music3_acoustic_real
+```
+
+Regenerate the reduced-dimension goldens with the pinned oracle's interpreter
+(see `tools/oracle/README.md`) after an upstream change:
+
+```sh
+~/venvs/music3-oracle/bin/python \
+  scripts/gen-minimax-music3-acoustic-goldens.py \
+  --out tests/vllm/models/minimax_music3_acoustic_goldens.inc
+```
+
+### Three things that will bite a later phase
+
+**float32 here is not a precision knob either, but it is the opposite polarity
+from the AR half.** The acoustic half runs fp32 because upstream does; there is
+no `Compute` parameter, because there is no second configuration. Separately,
+and on a different axis: every reduction accumulates in `double` and stores
+`float`, which is the tree's existing host-reference convention
+(`vocoder1d::Conv1d`, `music3::LinearNoBias`) and costs no memory. Short
+*elementwise* expressions — the sigma shift, the Euler step, the CFG mix, the
+overlap blend — are computed in `float` on purpose, because upstream computes
+them in float32 and the results are bit-exact there. Widening those to double
+produces a different number: `shift * s / (1 + (shift - 1) * s)` at shift 3 is
+`0.100000024` in float32 and `0.100000001` in double, and the goldens say the
+former.
+
+**A close-enough bound on an exactly-reproducible quantity hides real defects.**
+Measured here: at a 1e-5 relative tolerance, dropping upstream's `(1 - 1e-6)`
+factor from the overlap blend moves values by only 3.3e-07 relative and the
+mutation stays **green**. The blend has no reduction, so its gate is bit-exact
+instead. The same reasoning makes the Euler step and the DiT-to-vocoder handoff
+bit-exact assertions rather than tolerances.
+
+**The stereo fold is a contiguous split, not an interleave.** The 128 latent
+channels reshape into two 64-channel streams: the *first* 64 become the left
+channel and the second 64 the right, and each stream is decoded independently by
+the same weights (`minimax_music3_vocoder.py:110,115`). Interleaving them is the
+other obvious reading of "fold 128 into 2 x 64" and produces a correctly shaped,
+correctly ranged, wrong waveform that no length or dtype check can see.

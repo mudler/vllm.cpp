@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** **W0 + W1 DONE, W3 DONE, W2 PARTIAL.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, and the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path. The 8.6B language-model forward and W4-W7 are owed.
+**Status:** **W0 + W1 DONE, W3 DONE, W4 + W5 DONE, W2 PARTIAL.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. The 8.6B language-model forward, W6 and W7 are owed.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -372,8 +372,8 @@ the operator. Phases are separately claimable except where noted.
 | **W1** | Modular loader: the six-component layout, weight-norm folding, the fp32/bf16 policy of §2.1, native-arm refusal by name | every component loads with shapes asserted against §1; converted-vs-native tensor equality checked, not assumed |
 | **W2** | Global LLM on our landed Qwen3 path at vocab 200 000 | hidden-state parity vs `transformers`, then token-exact RVQ code parity vs the oracle |
 | **W3** | Condition mix (8-layer weighted) + RVQ depth decoder, 8 codebooks | per-stage tensor parity; the depth decoder's 16-position window exercised at its boundary |
-| **W4** | Flow-matching DiT + `FlowMatchEulerDiscreteScheduler` with `invert_sigmas` | per-step latent parity against the oracle at a fixed seed |
-| **W5** | Vocoder **through the shared `Vocoder1D`** (§4.1): snake activations, weight-norm, `[8,8,4,2]` upsampling, the 128→2×64 stereo fold, WAV at **44100 stereo** (§1.1) | waveform parity within a stated absolute tolerance, and H3/IndexTTS-2.5 behaviour byte-identical |
+| **W4** (**DONE**) | Flow-matching DiT + `FlowMatchEulerDiscreteScheduler` with `invert_sigmas` | per-step latent parity against the oracle at a fixed seed — DONE: scheduler BIT-EXACT on both recorded steps, DiT guided velocity inside the measured torch-vs-torch control |
+| **W5** (**DONE**) | Vocoder **through the shared `vocoder1d` primitives** (§4.1): snake activations, weight-norm, `[8,8,4,2]` upsampling, the 128→2×64 stereo fold, at **44100 stereo** (§1.1) | waveform parity within a stated absolute tolerance, and H3/IndexTTS-2.5 behaviour byte-identical — DONE: 88 064 samples, 0 outside tolerance, `vocoder1d` unmodified. WAV WRITING itself is W6's, with the rest of the delivery surface |
 | **W6** | Register as a `SpeechRegistry` family; extend `SpeechGenParams` ADDITIVELY for lyrics + description + controls (§4.1); NEW `vllm_speech_*` **`include/vllm.h`** surface with the ABI version bump; **the example HTTP server as a thin ABI client** | a song generates end to end from an HTTP request; IndexTTS-2.5 unchanged; SGLang-Omni cross-check; speed axis recorded with values and ratios |
 | **W7** | Quantized arms — GGUF k-quants are a standing requirement, not a per-model choice | each arm gated, or refused by name and recorded as owed |
 
@@ -448,9 +448,52 @@ finding rather than a footnote: upstream's AR stage has no greedy path at all, s
 `rvq_codes.npy` is a seeded sample and is consumed as an input by these gates.
 §5 now records the reasoning and the tensor gates that replace it.
 
-Next: W4/W5 acoustic, W6 the speech-family registration plus the `vllm_speech_*`
-ABI and the example HTTP server, W7 the quantized arms. W4 is unblocked and does
-not depend on W2's remainder.
+**W4 + W5 are complete and gated at both scales.**
+[`minimax_music3_acoustic.h`](../../include/vllm/model_executor/models/minimax_music3_acoustic.h)
+carries the flow-matching DiT, the `FlowMatchEulerDiscreteScheduler`, the CFG
+mix, the denoise loop's window bookkeeping and the DAC Flow-VAE vocoder. Latents
+now become a waveform.
+
+* **Reduced dimensions, float32, no checkpoint:** 27 cases / 265 assertions
+  against goldens produced by *executing* upstream's own
+  `MiniMaxMusic3Transformer1DModel`, `MiniMaxMusic3Vocoder`,
+  `FlowMatchEulerDiscreteScheduler` and `ClassifierFreeGuidance`
+  (`scripts/gen-minimax-music3-acoustic-goldens.py`).
+* **Full scale, float32, real weights:** the scheduler step reproduces the
+  capture's own trajectory **bit-exactly** at both recorded steps (22 016 of
+  22 016 values), `denoise_last_latents_out` is bit-identical to
+  `vocoder_input_chunk0` so the stage handoff is proved rather than assumed, and
+  the 0.054B vocoder reproduces `waveform.npy` over **88 064 samples** with zero
+  values outside tolerance (mean |d| 3.19e-08, max |d| 3.18e-07). The 2.4B DiT
+  arm reproduces the guided velocity at both recorded steps and is opt-in behind
+  `VLLM_CPP_MUSIC3_DIT` because it is four 2.4B fp32 host forwards.
+
+**The full-scale bounds are calibrated against a measured control**, not chosen:
+upstream's own modules on the identical inputs under `torch.set_num_threads(1)`
+— the capture ran at the box's default 20 — reproduce the goldens to 1.911 %
+bit-identical (vocoder, mean |d| 3.015e-08, max |d| 3.576e-07) and 15.416 % /
+5.596 % (DiT first / last step, mean |d| 7.526e-07 / 1.424e-06). Two correct
+float32 implementations differ by that much on these tensors, so no bit-exact
+claim is made where none is available — and the **absolute** floor is what binds,
+because the control's own max *relative* deviation is 7.4e-02, attained on
+near-zero samples.
+
+**Three findings from this phase, recorded because each was nearly missed.**
+(1) `minimax_music3_loader.h` documented `folded == 20` for the shipped vocoder
+while its own weight-norm paragraph counts 30 and the checkpoint yields 30; the
+comment is corrected in the same change. (2) A relative tolerance of 1e-5 is
+loose enough to hide upstream's `(1 - 1e-6)` overlap-blend factor, which moves
+values by only 3.3e-07 relative — the mutation stayed **green** until the blend
+assertion became bit-exact, which it can be because the blend has no reduction.
+(3) CFG at scale 1 does **not** recover the conditional row bit-for-bit in
+float32 (10 of 12 values here), so the gate asserts scale **0** against the
+unconditional row instead, which is exact and is what actually discriminates the
+two formulations.
+
+Next: W2's remaining 8.6B language-model forward, W6 the speech-family
+registration plus the `vllm_speech_*` ABI and the example HTTP server, W7 the
+quantized arms. Nothing generates a song end to end yet — W6 is what joins the
+two halves.
 
 Two things are owed and neither is this phase's to close: **no speed number
 exists** — every capture so far ran on CPU because `dgx.casa` was down, so

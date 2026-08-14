@@ -2348,6 +2348,9 @@ DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
 
 BIGVGAN_SRC=/path/to/index-tts/indextts/s2mel/modules/bigvgan \
   python3 scripts/gen-bigvgan-goldens.py --out tests/vllm/models/bigvgan_goldens.inc
+
+CODEC_SRC=/path/to/index-tts/indextts \
+  python3 scripts/gen-codec-encoder-goldens.py --out tests/vllm/models/codec_encoder_goldens.inc
 ```
 
 The U-Net skip routing is recorded rather than generated into an `.inc`: this

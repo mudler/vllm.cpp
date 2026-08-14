@@ -2,6 +2,8 @@
 #include "vllm/model_executor/models/campplus.h"
 
 #include <cmath>
+#include <stdexcept>
+#include <string>
 #include <cstddef>
 #include <vector>
 
@@ -288,6 +290,176 @@ std::vector<float> ResBlock2d(const std::vector<float>& x, int64_t in_planes, in
   for (float& v : out) v = v > 0.0F ? v : 0.0F;
   *out_h = h2;
   return out;
+}
+
+
+const std::vector<float>& CampplusWeights::Get(const std::string& name) const {
+  const auto it = t.find(name);
+  VT_CHECK(it != t.end(), "campplus: missing checkpoint tensor '" + name + "'");
+  return it->second;
+}
+
+namespace {
+
+// Conv1d with an EXPLICIT stride and padding (the TDNN head strides TIME by 2,
+// unlike every `same` convolution elsewhere in this file).
+std::vector<float> Conv1dStrided(const std::vector<float>& in, int64_t in_ch, int64_t len,
+                                 const std::vector<float>& w, const std::vector<float>& bias,
+                                 int64_t out_ch, int64_t kernel, int64_t stride, int64_t dilation,
+                                 int64_t pad, int64_t* out_len) {
+  const int64_t L = (len + 2 * pad - dilation * (kernel - 1) - 1) / stride + 1;
+  std::vector<float> out(static_cast<size_t>(out_ch * L));
+  for (int64_t o = 0; o < out_ch; ++o) {
+    for (int64_t t = 0; t < L; ++t) {
+      double acc = bias.empty() ? 0.0 : static_cast<double>(bias[static_cast<size_t>(o)]);
+      for (int64_t c = 0; c < in_ch; ++c) {
+        for (int64_t k = 0; k < kernel; ++k) {
+          const int64_t src = t * stride + k * dilation - pad;
+          if (src < 0 || src >= len) continue;
+          acc += static_cast<double>(w[static_cast<size_t>((o * in_ch + c) * kernel + k)]) *
+                 static_cast<double>(in[static_cast<size_t>(c * len + src)]);
+        }
+      }
+      out[static_cast<size_t>(o * L + t)] = static_cast<float>(acc);
+    }
+  }
+  *out_len = L;
+  return out;
+}
+
+ResBlock2dWeights ResW(const CampplusWeights& w, const std::string& p, bool shortcut) {
+  ResBlock2dWeights r;
+  r.conv1 = w.Get(p + ".conv1.weight");
+  r.bn1_gamma = w.Get(p + ".bn1.weight"); r.bn1_beta = w.Get(p + ".bn1.bias");
+  r.bn1_mean = w.Get(p + ".bn1.running_mean"); r.bn1_var = w.Get(p + ".bn1.running_var");
+  r.conv2 = w.Get(p + ".conv2.weight");
+  r.bn2_gamma = w.Get(p + ".bn2.weight"); r.bn2_beta = w.Get(p + ".bn2.bias");
+  r.bn2_mean = w.Get(p + ".bn2.running_mean"); r.bn2_var = w.Get(p + ".bn2.running_var");
+  r.has_shortcut = shortcut;
+  if (shortcut) {
+    r.short_conv = w.Get(p + ".shortcut.0.weight");
+    r.short_gamma = w.Get(p + ".shortcut.1.weight"); r.short_beta = w.Get(p + ".shortcut.1.bias");
+    r.short_mean = w.Get(p + ".shortcut.1.running_mean");
+    r.short_var = w.Get(p + ".shortcut.1.running_var");
+  }
+  return r;
+}
+
+DenseTdnnLayerWeights DlW(const CampplusWeights& w, const std::string& p) {
+  DenseTdnnLayerWeights d;
+  d.bn1_gamma = w.Get(p + ".nonlinear1.batchnorm.weight");
+  d.bn1_beta = w.Get(p + ".nonlinear1.batchnorm.bias");
+  d.bn1_mean = w.Get(p + ".nonlinear1.batchnorm.running_mean");
+  d.bn1_var = w.Get(p + ".nonlinear1.batchnorm.running_var");
+  d.linear1 = w.Get(p + ".linear1.weight");
+  d.bn2_gamma = w.Get(p + ".nonlinear2.batchnorm.weight");
+  d.bn2_beta = w.Get(p + ".nonlinear2.batchnorm.bias");
+  d.bn2_mean = w.Get(p + ".nonlinear2.batchnorm.running_mean");
+  d.bn2_var = w.Get(p + ".nonlinear2.batchnorm.running_var");
+  d.cam.linear_local = w.Get(p + ".cam_layer.linear_local.weight");
+  d.cam.linear1_weight = w.Get(p + ".cam_layer.linear1.weight");
+  d.cam.linear1_bias = w.Get(p + ".cam_layer.linear1.bias");
+  d.cam.linear2_weight = w.Get(p + ".cam_layer.linear2.weight");
+  d.cam.linear2_bias = w.Get(p + ".cam_layer.linear2.bias");
+  return d;
+}
+
+}  // namespace
+
+std::vector<float> Forward(const CampplusParams& p, const CampplusWeights& w,
+                           const std::vector<float>& feats, int64_t frames, ForwardTrace* trace) {
+  VT_CHECK(feats.size() == static_cast<size_t>(frames * p.feat_dim), "campplus: feats shape");
+
+  // forward() permutes (T, F) -> (F, T), then FCM treats it as a 1-channel image
+  // of height feat_dim and width T.
+  std::vector<float> img(feats.size());
+  for (int64_t t = 0; t < frames; ++t) {
+    for (int64_t f = 0; f < p.feat_dim; ++f) {
+      img[static_cast<size_t>(f * frames + t)] = feats[static_cast<size_t>(t * p.feat_dim + f)];
+    }
+  }
+
+  int64_t h = p.feat_dim, wid = frames, oh = 0, ow = 0;
+  std::vector<float> x = Conv2d(img, 1, h, wid, w.Get("head.conv1.weight"), p.m_channels, 3, 1, 1, 1,
+                                &oh, &ow);
+  BatchNorm2dEvalInPlace(x, p.m_channels, oh * ow, w.Get("head.bn1.weight"), w.Get("head.bn1.bias"),
+                         w.Get("head.bn1.running_mean"), w.Get("head.bn1.running_var"), p.eps);
+  for (float& v : x) v = v > 0.0F ? v : 0.0F;
+  h = oh; wid = ow;
+
+  // layer1 / layer2: two BasicResBlocks each, the FIRST striding frequency by 2.
+  for (int layer = 1; layer <= 2; ++layer) {
+    for (int b = 0; b < 2; ++b) {
+      const std::string pre = "head.layer" + std::to_string(layer) + "." + std::to_string(b);
+      const int64_t stride = (b == 0) ? 2 : 1;
+      const bool shortcut = w.Has(pre + ".shortcut.0.weight");
+      int64_t nh = 0;
+      x = ResBlock2d(x, p.m_channels, h, wid, p.m_channels, stride, ResW(w, pre, shortcut), p.eps,
+                     &nh);
+      h = nh;
+    }
+  }
+
+  x = Conv2d(x, p.m_channels, h, wid, w.Get("head.conv2.weight"), p.m_channels, 3, 2, 1, 1, &oh, &ow);
+  BatchNorm2dEvalInPlace(x, p.m_channels, oh * ow, w.Get("head.bn2.weight"), w.Get("head.bn2.bias"),
+                         w.Get("head.bn2.running_mean"), w.Get("head.bn2.running_var"), p.eps);
+  for (float& v : x) v = v > 0.0F ? v : 0.0F;
+  h = oh; wid = ow;
+
+  // reshape (C, H, W) -> (C*H, W): the channel-major layout already matches.
+  int64_t channels = p.m_channels * h;
+  int64_t len = wid;
+
+  // xvector.tdnn: Conv1d(k=5, stride=2, padding=(5-1)//2*1) then batchnorm-relu.
+  int64_t nl = 0;
+  x = Conv1dStrided(x, channels, len, w.Get("xvector.tdnn.linear.weight"), {}, p.init_channels, 5, 2,
+                    1, 2, &nl);
+  len = nl;
+  channels = p.init_channels;
+  x = BatchNormRelu(x, channels, len, w.Get("xvector.tdnn.nonlinear.batchnorm.weight"),
+                    w.Get("xvector.tdnn.nonlinear.batchnorm.bias"),
+                    w.Get("xvector.tdnn.nonlinear.batchnorm.running_mean"),
+                    w.Get("xvector.tdnn.nonlinear.batchnorm.running_var"), p.eps);
+
+  if (trace != nullptr) {
+    trace->tdnn = x;
+    trace->tdnn_channels = channels;
+    trace->tdnn_frames = len;
+  }
+
+  const int64_t bn_channels = p.bn_size * p.growth_rate;
+  const int64_t counts[3] = {12, 24, 16};
+  const int64_t dilations[3] = {1, 2, 2};
+  for (int i = 0; i < 3; ++i) {
+    std::vector<DenseTdnnLayerWeights> layers;
+    for (int64_t j = 0; j < counts[i]; ++j) {
+      layers.push_back(DlW(w, "xvector.block" + std::to_string(i + 1) + ".tdnnd" +
+                                  std::to_string(j + 1)));
+    }
+    x = DenseTdnnBlock(x, channels, len, bn_channels, p.growth_rate, 3, dilations[i], p.seg_len,
+                       layers, p.eps);
+    channels += counts[i] * p.growth_rate;
+
+    const std::string tp = "xvector.transit" + std::to_string(i + 1);
+    x = TransitLayer(x, channels, len, channels / 2, w.Get(tp + ".nonlinear.batchnorm.weight"),
+                     w.Get(tp + ".nonlinear.batchnorm.bias"),
+                     w.Get(tp + ".nonlinear.batchnorm.running_mean"),
+                     w.Get(tp + ".nonlinear.batchnorm.running_var"), w.Get(tp + ".linear.weight"),
+                     {}, p.eps);
+    channels /= 2;
+  }
+
+  x = BatchNormRelu(x, channels, len, w.Get("xvector.out_nonlinear.batchnorm.weight"),
+                    w.Get("xvector.out_nonlinear.batchnorm.bias"),
+                    w.Get("xvector.out_nonlinear.batchnorm.running_mean"),
+                    w.Get("xvector.out_nonlinear.batchnorm.running_var"), p.eps);
+
+  const std::vector<float> stats = StatsPool(x, channels, len);
+  // The final dense is `batchnorm_`: affine=false AND no relu.
+  return DenseLayer(stats, 2 * channels, 1, p.embedding_size, w.Get("xvector.dense.linear.weight"),
+                    {}, {}, {}, w.Get("xvector.dense.nonlinear.batchnorm.running_mean"),
+                    w.Get("xvector.dense.nonlinear.batchnorm.running_var"), p.eps,
+                    /*apply_relu=*/false);
 }
 
 }  // namespace campplus

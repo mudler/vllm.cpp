@@ -387,8 +387,9 @@ Measured: 4000 samples at 16 kHz produce 12 frames of 160.
 That differs from `Ltx2WaveformToLogMel`, which is the Slaney/torchaudio kind
 with no preemphasis and no DC removal. Reusing it would be the mistake this spec
 elsewhere warns about -- a gate that passes because both arms call the same
-helper proves consistency, not correctness -- so the extractor is a NEW unit and
-remains **unported**.
+helper proves consistency, not correctness -- so the extractor is a NEW unit. It is now **ported** in
+`w2v_fbank.cpp`; what remains unported on this path is the
+`hidden_states[17]` tap and the stored-statistics normalization.
 
 **What IS ported on this path**: the w2v-bert Conformer itself
 (`w2vbert::FeatureProjection` and `w2vbert::EncoderStack`, including the
@@ -462,9 +463,7 @@ values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
 
 **Not started or not finished**, in the order that unblocks a render:
 
-1. the SeamlessM4T feature extractor (above) -- the last gap between a reference
-   clip and the semantic codes;
-2. an intermediate-layer tap on `EncoderStack` for `hidden_states[17]`, plus the
+1. an intermediate-layer tap on `EncoderStack` for `hidden_states[17]`, plus the
    stored-statistics normalization;
 3. the talker's emotion path: the `emo_conditioning_encoder` Conformer and the
    `emo_perceiver_encoder` Perceiver resampler;

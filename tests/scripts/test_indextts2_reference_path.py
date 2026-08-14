@@ -50,11 +50,10 @@ class SpecRecordsThePath(unittest.TestCase):
         # shape of assertion and was the first version's mistake.
         i = self.spec.find("the extractor is a NEW unit")
         self.assertNotEqual(i, -1, "the spec no longer says the extractor is new")
-        self.assertIn(
-            "unported",
-            self.spec[i : i + 200],
-            "the spec must keep saying the feature EXTRACTOR is unported",
-        )
+        # It is ported now (w2v_fbank.cpp); what the spec must keep straight is
+        # that the REST of this path -- the hidden-state tap and the stored
+        # statistics -- is not.
+        self.assertIn("hidden_states[17]` tap", self.spec[i : i + 400])
 
 
 class ConfigAgreesWithThePath(unittest.TestCase):

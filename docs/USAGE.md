@@ -2366,6 +2366,9 @@ python3 scripts/convert-indextts2-checkpoint.py \
 
 VLLM_CPP_INDEXTTS2_S2MEL=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/s2mel.safetensors \
   ./build/tests/test_indextts2_s2mel_loader
+
+VLLM_CPP_INDEXTTS2_GPT=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/gpt.safetensors \
+  ./build/tests/test_indextts2_talker_loader
 ```
 
 ## MiniMax-Music3: the autoregressive half

@@ -781,6 +781,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dit_front.cpp
   src/vllm/model_executor/models/dit_stack.cpp
   src/vllm/model_executor/models/indextts2_s2mel_loader.cpp
+  src/vllm/model_executor/models/indextts2_talker_loader.cpp
   src/vllm/model_executor/models/vocos.cpp
   src/vllm/model_executor/models/lenreg.cpp
   src/vllm/model_executor/models/cfm.cpp

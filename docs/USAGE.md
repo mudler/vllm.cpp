@@ -2316,3 +2316,27 @@ python3 scripts/gen-minimax-music3-manifest.py \
   --checkpoint /path/to/minimax-music3 \
   --output tests/vllm/models/minimax_music3_manifest.inc
 ```
+
+### IndexTTS-2.5 goldens and checkpoint manifests
+
+The speech lane is not servable yet (see `/v1/audio/speech` above); these
+regenerate its gates. `read-torch-manifest.py` reads a torch `.pth`'s tensor
+names and shapes from its pickle header over HTTP range requests, so it inspects
+a multi-GB checkpoint without downloading the weights:
+
+```sh
+python3 scripts/read-torch-manifest.py \
+  https://huggingface.co/IndexTeam/IndexTTS-2.5/resolve/main/s2mel.pth
+```
+
+The stage goldens need the upstream source checked out, and emit `.inc` files
+that carry no weight bytes: both sides rebuild parameters from one shared
+pseudo-random stream.
+
+```sh
+WAVENET_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-wavenet-goldens.py --out tests/vllm/models/wavenet_goldens.inc
+
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-tail-goldens.py --out tests/vllm/models/dit_tail_goldens.inc
+```

@@ -302,8 +302,8 @@ they pass over a smaller network than the checkpoint holds:
 | Where | Unported | Note |
 |---|---|---|
 | ~~`s2mel.pth` `net.cfm.estimator`~~ | ~~`wavenet.*`~~ | **PORTED** in `wavenet.cpp`, gated against upstream `WN` at reduced dims (3 cases / 133 assertions, 6 mutations caught). Not a conditioning stack but the DiT's FINAL LAYER: the config sets `final_layer_type: wavenet`, which is also what `t_embedder2`, `conv1` and `conv2` belong to |
-| same | `skip_linear`, `layers.N.skip_in_linear` | U-Net skip connections across DiT depth. Our `dit::Block` carries both residuals but no skip-in |
-| same | `t_embedder2`, `conv1`, `conv2` | The rest of the wavenet final layer: a SECOND timestep embedder at the wavenet width, and the two projections either side of it. `cfm::TimestepFeatures` modeled one embedder |
+| same | ~~`skip_linear`~~, `layers.N.skip_in_linear` | `skip_linear` is the LONG skip and is **PORTED** in `dit_tail.cpp`. `skip_in_linear`, the per-layer U-Net skip across DiT depth (`uvit_skip_connection: true`), is still unported: our `dit::Block` carries both residuals but no skip-in |
+| ~~same~~ | ~~`t_embedder2`, `conv1`, `conv2`~~ | **PORTED** in `dit_tail.cpp` together with `skip_linear`, `res_projection` and `final_layer`, gated against upstream's own DiT modules end to end (4 cases, 6 mutations caught). Note the coupling upstream hides by setting both to 512: `final_layer` is sized at the WAVENET width but conditioned on `t1` at the DiT width, so the two must be equal. We refuse unequal widths by name |
 | same | `cond_embedder`, `content_mask_embedder`, `cond_projection`, `cond_x_merge_linear`, `res_projection`, `conv1`, `conv2` | The conditioning front end |
 | `s2mel.pth` `net.length_regulator` | `mask_token`, `embedding`, `content_in_proj` | Our `lenreg` port has the interpolate/GroupNorm/Mish stack and none of these |
 | `s2mel.pth` | `net.gpt_layer` | Three weight/bias pairs; unmodeled and unexplained |

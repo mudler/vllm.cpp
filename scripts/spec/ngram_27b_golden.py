@@ -22,8 +22,8 @@
 # defaults 5/5), vllm/v1/spec_decode/ngram_proposer.py (the matcher). Metrics
 # exactly like tests/v1/e2e/spec_decode/test_spec_decode.py::compute_acceptance_len.
 #
-# Run on dgx with the oracle venv, under flock $HOME/gpu.lock:
-#   flock $HOME/gpu.lock env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
+# Run on dgx with the oracle venv, under flock "${GPU_LOCK:-$HOME/gpu.lock}":
+#   flock "${GPU_LOCK:-$HOME/gpu.lock}" env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
 #     ~/venvs/vllm-oracle/bin/python scripts/spec/ngram_27b_golden.py \
 #       --out-dir tests/parity/goldens/ngram_27b
 import argparse

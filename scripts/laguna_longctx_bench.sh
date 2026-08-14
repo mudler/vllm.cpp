@@ -6,7 +6,8 @@
 #   Lever A = VT_LAGUNA_KV_BF16    (near-tie bf16 paged KV, default OFF / opt-in)
 #
 # RUN ON GB10 (dgx.casa), from the extracted build tree (git-archive transfer — NOT rsync),
-# with the checkpoint at ~/laguna-xs-nvfp4. Serializes on $HOME/gpu.lock (never force).
+# with the checkpoint at ~/laguna-xs-nvfp4. Serializes on GPU_LOCK, default $HOME/gpu.lock
+# (never force).
 # Park local-ai-worker before, restore after (see AGENTS box-safety). Median-of-3, drop-caches.
 #
 #   scripts/laguna_longctx_bench.sh <nvfp4-dir> <laguna-gen-binary>
@@ -19,7 +20,7 @@ MODEL="${1:-$HOME/laguna-xs-nvfp4}"
 BIN="${2:-$HOME/laguna-n4-build/build-cuda/examples/laguna-gen}"
 IDS="2,785,9626,377,15360,395"          # prompt ids (same stream as prior Laguna gates)
 BASE_ENV="VT_LAGUNA_RESIDENT_DECODE=1 VT_LAGUNA_MARLIN_MOE=1 VT_LAGUNA_DECODE_GRAPH=1"
-LOCK="$HOME/gpu.lock"
+LOCK="${GPU_LOCK:-$HOME/gpu.lock}"   # THE box mutex, one truth (#777)
 OUT="$HOME/laguna-longctx-$(date +%s)"
 mkdir -p "$OUT"
 

@@ -3,7 +3,7 @@
 #
 # Pinned by .agents/specs/cuda-sglang-low-concurrency.md.  This checkpoint only
 # supports --dry-run: it emits a fail-closed evidence manifest without pulling
-# an image, starting a container, or acquiring /tmp/gpu.  P2 will add the exact
+# an image, starting a container, or acquiring the GPU lock (`${GPU_LOCK:-$HOME/gpu.lock}`).  P2 will add the exact
 # checkpoint-load execution behind one whole-campaign flock.
 set -euo pipefail
 

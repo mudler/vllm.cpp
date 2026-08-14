@@ -13,7 +13,7 @@
 #     for every prompt (the OPT lesson). The C++ table embeds vLLM's EXACT prompt token
 #     ids so the gate is tokenizer-free.
 #
-# Run on dgx with the oracle venv, ALONE, under flock $HOME/gpu.lock:
+# Run on dgx with the oracle venv, ALONE, under flock "${GPU_LOCK:-$HOME/gpu.lock}":
 #   HF_TOKEN=... HF_HUB_DISABLE_XET=1 \
 #     ~/venvs/vllm-oracle/bin/python scripts/gemma-oracle-capture.py \
 #       --model google/gemma-2-2b-it --tag GEMMA2 --runs 5 --max-tokens 8

@@ -47,8 +47,8 @@
 #
 # Run on dgx with the oracle venv; PATH MUST include ~/venvs/vllm-oracle/bin (the
 # FlashInfer JIT needs `ninja` on PATH or engine-core init dies in
-# determine_available_memory), under `flock $HOME/gpu.lock`:
-#   flock $HOME/gpu.lock env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
+# determine_available_memory), under `flock "${GPU_LOCK:-$HOME/gpu.lock}"`:
+#   flock "${GPU_LOCK:-$HOME/gpu.lock}" env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
 #     ~/venvs/vllm-oracle/bin/python scripts/spec/d0_dflash_oracle_capture.py \
 #       --mode spec-on --out-dir tests/parity/goldens/dflash_27b
 import argparse

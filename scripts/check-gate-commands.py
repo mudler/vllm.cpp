@@ -87,9 +87,10 @@ _TOOL = re.compile(
 )
 # `flock <lock> -c '<gate>'` is this repo's MANDATED shape for any gate touching
 # the GPU, and the wrapper QUOTES the real command, putting it out of reach of
-# every other rule here. It needs a lockfile AND something to run: the bare
-# `flock` and `flock /tmp/gpu` that appear in three specs name the idiom, not a
-# gate, and a plain vocabulary entry credits all three with a command.
+# every other rule here. It needs a lockfile AND something to run: a bare
+# `flock`, and a `flock` plus a lockfile with nothing after it, appear in three
+# specs naming the idiom rather than a gate, and a plain vocabulary entry would
+# credit all three with a command.
 _WRAPPER = re.compile(r"(?:^|\s)flock\s+\S+\s+\S")
 # `./anything` is an explicit invocation, arguments or not -- a built test binary
 # (`./build-cuda-121a/tests/test_dropin_abi`) is run, not referred to. A bare

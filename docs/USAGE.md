@@ -170,6 +170,36 @@ refused, `scripts/agent-role.py show` lists the other live coordinators, and
 concurrent coordinators safe is that `main` is never force-pushed, so a plain
 `git push` refuses any non-fast-forward.
 
+### `GPU_LOCK`: one file mutex, and only one
+
+Copy `.env.example` to `.env` and load it with `set -a; . ./.env; set +a`. Every
+key there may be left empty to mean "my setup does not have this" — **except
+`GPU_LOCK`**, which ships a real default:
+
+```sh
+GPU_LOCK=$HOME/gpu.lock
+```
+
+On a shared box, every GPU job takes that file for the whole job or the whole
+benchmark series:
+
+```sh
+flock "${GPU_LOCK:-$HOME/gpu.lock}" -c '<command>'
+```
+
+Do not point it somewhere else. A mutex only works if everyone opens the **same
+file**, and `flock` on a different path *succeeds* — that is what a mutex does —
+so a divergent value serialises you with nobody and never says so. The damage
+shows up much later as timing noise, and it does not read as "my number is
+wrong", it reads as "someone else misbehaved": a whole benchmark series was lost
+to this, with every absolute timing downgraded to an upper bound because only
+interleaved ratios survive contention (#777). Every script in this repo falls
+back to the same default, so change it only if every agent and harness on the
+box moves with you.
+
+If your `.env` predates this default and names another path, fix it by hand —
+`.env` is untracked, so a shipped default cannot reach it.
+
 ## Running inference (CLI)
 
 `vllm-cli` runs a one-shot completion through the C ABI. Source:
@@ -1073,12 +1103,34 @@ a route yet. The greedy generate loop that turns the prompt into mel codes is
 ported too, and so is the STATED-emotion path -- eight weights selecting rows
 from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
 text plus a reference clip and an emotion reaches mel CODES in the library. What
-is still missing is a single entry point, and any command or route to call it
-from. The ACOUSTIC CHAIN itself runs on real weights end to end: the length
-regulator resamples a content sequence to the mel frame rate, a classifier-free
-guided CFM Euler loop integrates the S2Mel estimator to a mel, and the real
-BigVGAN turns that mel into a bounded 22.05 kHz waveform at 256 samples per
-frame. Inferring the emotion from a clip instead of stating it needs a
+is still missing is a COMMAND or ROUTE. TEXT DOES REACH AUDIO in the library:
+`test_indextts2_e2e` tokenizes with the checkpoint's own vocabulary, runs the
+talker to mel codes, and drives those through the length regulator, the CFM loop
+and BigVGAN to samples. Point it at all four checkpoint paths:
+
+```sh
+VLLM_CPP_INDEXTTS2_S2MEL=... VLLM_CPP_INDEXTTS2_BIGVGAN=... \
+VLLM_CPP_INDEXTTS2_GPT=... VLLM_CPP_INDEXTTS2_TIKTOKEN=... \
+  ./build/tests/test_indextts2_e2e
+```
+
+It asserts STRUCTURE, not quality: nothing is compared against vLLM-Omni, which
+is unpinned (#633). The TOKENIZER it uses:
+`tiktoken::LoadRanks` reads the shipped `.tiktoken` vocabulary and
+`tiktoken::Encode` reproduces python tiktoken's ids exactly on the cases
+gated, CJK included. The checkpoint now
+LOADS through `vllm::multimodal::SpeechRegistry`, reports its family and its
+22.05 kHz output rate, and states that a reference clip is required; asking
+it to synthesize refuses by naming the one gap between text and the render
+path, which is that the shipped vocabulary is tiktoken and this tree has no
+reader for one. The pipeline itself renders on the real
+checkpoints: the talker emits its own mel codes, the length regulator resamples
+them to the mel frame rate, a classifier-free guided CFM Euler loop integrates
+the S2Mel estimator, and BigVGAN turns the mel into a bounded 22.05 kHz
+waveform. `indextts2::Render` is the entry point, and
+`test_indextts2_render` drives it end to end when the three checkpoint
+environment variables are set. It is NOT yet measured against the vLLM-Omni
+oracle, which is unpinned (#633), so nothing here is a quality claim. Inferring the emotion from a clip instead of stating it needs a
 Conformer and a Perceiver that are not ported.
 
 There is **no `/v1/audio/speech`**. Text to speech is not servable: the

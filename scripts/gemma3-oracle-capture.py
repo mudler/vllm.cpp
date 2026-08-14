@@ -17,7 +17,7 @@
 # gate is tokenizer-free (our BPE tokenizer does not validate Gemma's byte_fallback
 # tokenizer.json).
 #
-# Run on dgx with the oracle venv, ALONE, under flock $HOME/gpu.lock:
+# Run on dgx with the oracle venv, ALONE, under flock "${GPU_LOCK:-$HOME/gpu.lock}":
 #   HF_TOKEN=... HF_HUB_DISABLE_XET=1 \
 #     ~/venvs/vllm-oracle/bin/python scripts/gemma3-oracle-capture.py \
 #       --model google/gemma-3-1b-it --runs 5 --max-tokens 8

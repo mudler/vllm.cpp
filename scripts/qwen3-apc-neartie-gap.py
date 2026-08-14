@@ -21,7 +21,7 @@
 #
 # Run on dgx with a working oracle venv (0.25.0-stage is fine; Qwen3-4B is
 # byte-stable across the 0.25->0.26 pin):
-#   flock $HOME/gpu.lock env PATH=$V/bin:$PATH $V/bin/python \
+#   flock "${GPU_LOCK:-$HOME/gpu.lock}" env PATH=$V/bin:$PATH $V/bin/python \
 #     scripts/qwen3-apc-neartie-gap.py --model Qwen/Qwen3-4B \
 #       --golden-dir tests/parity/goldens/qwen3_apc_4b
 import argparse

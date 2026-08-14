@@ -20,7 +20,7 @@
 # to ACCEPTED DRAFT-TOK/STEP: vLLM = acceptance_len - 1; ours = accept_rate * k.
 #
 # Run (dgx, flock, oracle venv, mm-off + gpu_util 0.30, VLLM_USE_V2_MODEL_RUNNER=1):
-#   flock $HOME/gpu.lock env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
+#   flock "${GPU_LOCK:-$HOME/gpu.lock}" env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
 #     VLLM_USE_V2_MODEL_RUNNER=1 ~/venvs/vllm-oracle/bin/python \
 #     scripts/spec/d8_acceptance_rca.py --dataset /tmp/dflash_golden4.json --out /tmp/d8_vllm_rca.json
 import argparse

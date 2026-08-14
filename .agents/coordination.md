@@ -96,7 +96,9 @@ device-idleness probe, shared-host rules, and any service-quiescence procedure.
 Do not use an infrastructure-specific lock or manage a service merely because a
 historical entry names it.
 
-On Ettore's DGX profile, `${GPU_LOCK}` is `flock /tmp/gpu` and the detailed
+On Ettore's DGX profile, `${GPU_LOCK}` is `$HOME/gpu.lock` — that is the value
+`.env.example` ships and the value every script in this repo falls back to, so a
+`.env` naming anything else serialises with nobody (#777). The detailed
 shared-host procedure lives at
 `/home/mudler/_git/skills/sharing-a-gpu-with-flock/SKILL.md`. That flock is an
 inter-agent mutex because the LocalAI worker is normally stopped. Other

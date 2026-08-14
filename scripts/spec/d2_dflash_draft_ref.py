@@ -34,9 +34,9 @@
 # [[gb10-unified-memory-oom-reboots-box]]): the 27B target is MULTIMODAL, so vLLM
 # profiles the vision encoder at max image size on init. limit_mm_per_prompt
 # ={image:0,video:0} + gpu_memory_utilization=0.30 (the D0 fix, this tool's
-# default). Run under `flock $HOME/gpu.lock`, oracle venv on PATH (FlashInfer JIT
+# default). Run under `flock "${GPU_LOCK:-$HOME/gpu.lock}"`, oracle venv on PATH (FlashInfer JIT
 # needs ninja), VLLM_USE_V2_MODEL_RUNNER=1, no FLASH_ATTN pin:
-#   flock $HOME/gpu.lock env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
+#   flock "${GPU_LOCK:-$HOME/gpu.lock}" env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
 #     VLLM_USE_V2_MODEL_RUNNER=1 ~/venvs/vllm-oracle/bin/python \
 #     scripts/spec/d2_dflash_draft_ref.py --out-dir tests/parity/goldens/dflash_27b_draft
 import argparse

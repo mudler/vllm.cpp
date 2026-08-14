@@ -1,9 +1,12 @@
 // IndexTTS-2.5 speech-family registration. See indextts2.h for why it refuses.
 #include "vllm/model_executor/models/indextts2.h"
 
+#include "vllm/model_executor/models/indextts2_config.h"
+
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -34,6 +37,51 @@ bool LooksLikeIndexTts2(const multimodal::SpeechModelParams& params) {
          text.find("semantic_codec") != std::string::npos;
 }
 
+
+// The seam implementation. Everything it needs is ported and gated; what it
+// CANNOT do is turn text into tokens, because the checkpoint's tokenizer is
+// tiktoken and this tree has no reader for one -- the constraint already
+// recorded for Kimi-Linear. So loading SUCCEEDS, the capability is reachable
+// and describable through the seam, and `Synthesize` refuses by naming exactly
+// that one missing piece rather than a stale list.
+class IndexTts2Engine : public multimodal::SpeechEngine {
+ public:
+  explicit IndexTts2Engine(std::string path) : path_(std::move(path)) {}
+
+  std::string family() const override { return "indextts2"; }
+
+  // 22050, from the shipped config; NOT the talker's 24 kHz mel front end,
+  // which is a different rate in the same model.
+  int64_t sample_rate() const override { return indextts2::kOutputSampleRate; }
+
+  // Upstream has no text-only synthesis, so this is true and a server can
+  // reject before staging any weights.
+  bool requires_reference_audio() const override { return true; }
+
+  multimodal::SpeechResult Synthesize(const multimodal::SpeechGenParams& params) override {
+    if (params.reference_audio.empty()) {
+      throw std::runtime_error(
+          "indextts2: a reference clip is REQUIRED -- IndexTTS-2 has no "
+          "text-only synthesis, so an empty clip is a refusal rather than a "
+          "default voice");
+    }
+    throw std::runtime_error(
+        "indextts2: cannot tokenize '" + params.text +
+        "'. The render path itself is implemented and runs on the real "
+        "checkpoints -- see `indextts2::Render`, which takes the talker's mel "
+        "codes through the length regulator, the CFM loop over the S2Mel "
+        "estimator and BigVGAN. What is missing between text and that path is "
+        "the TOKENIZER: this checkpoint ships "
+        "`multilingual_zh_ja_yue_char_del.tiktoken` and no `tokenizer.json`, "
+        "and this tree has no tiktoken reader (the same constraint recorded for "
+        "Kimi-Linear). Issue #634. Correctness against vLLM-Omni additionally "
+        "needs the oracle pin, #633.");
+  }
+
+ private:
+  std::string path_;
+};
+
 }  // namespace
 
 void RegisterIndexTts2SpeechFamily(multimodal::SpeechRegistry& registry) {
@@ -42,17 +90,7 @@ void RegisterIndexTts2SpeechFamily(multimodal::SpeechRegistry& registry) {
   reg.detect = LooksLikeIndexTts2;
   reg.load = [](const multimodal::SpeechModelParams& params)
       -> std::unique_ptr<multimodal::SpeechEngine> {
-    // Name every missing piece. "unsupported" with no evidence is what sends the
-    // next person reading loader source to work out what was meant.
-    throw std::runtime_error(
-        "indextts2: recognized an IndexTTS-2.5 checkpoint at '" + params.path +
-        "' but the lane is not implemented yet. Ported so far: the GPT-2 talker "
-        "backbone (W2) and the shared BigVGAN 1-D core (W1). Still missing: the "
-        "mandatory reference-audio conditioning path (w2v-bert-2.0, the MaskGCT "
-        "semantic codec, CAMPPlus), the EnhancedCodec, and the S2Mel CFM/DiT "
-        "decoder — W3-W5 of .agents/specs/indextts-2-5.md, issue #634. Note "
-        "IndexTTS-2 has no text-only synthesis, so the conditioning path is "
-        "required rather than optional.");
+    return std::make_unique<IndexTts2Engine>(params.path);
   };
   registry.Register(std::move(reg));
 }

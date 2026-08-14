@@ -511,15 +511,15 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
       }
     std::vector<float> ref_comb = combined;
     {
-      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
-      Queue cq = cpu.CreateQueue();
-      const Device cd{DeviceType::kCPU, 0};
-      std::vector<float> ck = knew, cv = vnew, cslots_f;
-      std::vector<int64_t> cslots = slots;
-      Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {kTokens, kHk, kD});
-      Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {kTokens, kHk, kD});
+      vt::Backend& fcpu = vt::GetBackend(DeviceType::kCPU);
+      Queue fq = fcpu.CreateQueue();
+      const Device fd{DeviceType::kCPU, 0};
+      std::vector<float> fk = knew, fv = vnew, fslots_f;
+      std::vector<int64_t> fslots = slots;
+      Tensor tk = Tensor::Contiguous(fk.data(), DType::kF32, fd, {kTokens, kHk, kD});
+      Tensor tv = Tensor::Contiguous(fv.data(), DType::kF32, fd, {kTokens, kHk, kD});
       Tensor tcomb =
-          Tensor::Contiguous(ref_comb.data(), DType::kF32, cd, {kBlocks * 2 * within});
+          Tensor::Contiguous(ref_comb.data(), DType::kF32, fd, {kBlocks * 2 * within});
       auto slice = [&](int which) {
         Tensor t = tcomb;
         t.data = static_cast<char*>(t.data) +
@@ -535,10 +535,10 @@ TEST_CASE("ReshapeAndCache scatters into the KV cache BIT-EXACTLY") {
         t.stride[3] = 1;
         return t;
       };
-      Tensor tsm = Tensor::Contiguous(cslots.data(), DType::kI64, cd, {kTokens});
+      Tensor tsm = Tensor::Contiguous(fslots.data(), DType::kI64, fd, {kTokens});
       Tensor tkc = slice(0), tvc = slice(1);
-      vt::ReshapeAndCache(cq, tk, tv, tkc, tvc, tsm);
-      cpu.DestroyQueue(cq);
+      vt::ReshapeAndCache(fq, tk, tv, tkc, tvc, tsm);
+      fcpu.DestroyQueue(fq);
     }
 
     for (DeviceType dt : RegisteredDevices()) {

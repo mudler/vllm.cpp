@@ -16,7 +16,7 @@
 #
 # The lm:// server is CPU-only (CUDA_VISIBLE_DEVICES= empty). Only the model
 # forward touches the GPU, so the TEST runs are serialized under
-# `flock $HOME/gpu.lock` (one series, one lock). Async scheduling is pinned OFF
+# `flock ${GPU_LOCK:-$HOME/gpu.lock}` (one series, one lock). Async scheduling is OFF
 # (VT_ASYNC_SCHED=0) so schedule->execute stays strictly paired for the
 # connector's synchronous load/store timing; both arms use the SAME setting, so
 # the A/B is apples-to-apples.

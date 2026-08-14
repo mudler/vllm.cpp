@@ -519,8 +519,11 @@ def build_dry_run_manifest(
                 "--output-details",
                 "--output-file", "/evidence/raw/<MODEL>/<ENGINE>/c<C>-r<REP>.jsonl",
             ],
+            # THE box mutex, one truth (#777): this planned command named a
+            # private lock file, which serialises with nothing else in the tree.
             "execution_lock": [
-                "flock", "/tmp/gpu", "<one-whole-P2-or-P3-campaign-command>"
+                "flock", "${GPU_LOCK:-$HOME/gpu.lock}",
+                "<one-whole-P2-or-P3-campaign-command>",
             ],
             "ours_server": [
                 "<VLLM_CPP_BUILD>/examples/vllm-server",

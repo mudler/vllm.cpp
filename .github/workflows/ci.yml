@@ -262,6 +262,12 @@ jobs:
         run: |
           python3 scripts/check-gate-commands.py --check
           python3 tests/scripts/test_check_gate_commands.py
+      - name: The GPU mutex has exactly one truth (#777)
+        # Registered HERE and not only in preflight: a `flock` on the wrong file
+        # SUCCEEDS, so a second mutex is silent at runtime and surfaces only as
+        # timing noise attributed to whoever else was on the box. Nothing at run
+        # time can catch it; this is the only place it can be caught.
+        run: python3 tests/scripts/test_gpu_lock_one_truth.py
       - name: Agent role machinery and role discipline
         # Same split as the step above: the two suites are tree-scoped and run
         # on every lane; `check-role-discipline.py --base/--head` is DIFF-scoped

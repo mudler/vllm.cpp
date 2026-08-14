@@ -481,7 +481,7 @@ behind the pin.
 ## Now
 
 `INVENTORIED`, blocked on [#633](https://github.com/mudler/vllm.cpp/issues/633)
-for any parity or e2e claim. **There is no render yet, and no route.**
+for any parity or e2e claim. **Text renders to audio end to end on the real checkpoints** (`test_indextts2_e2e`), but that gate asserts STRUCTURE only -- nothing is measured against the oracle, and there is no route.
 
 **Landed.** W1 the shared 1-D vocoder core; W2 the GPT-2 talker backbone; W6a the
 `SpeechEngine` seam and family refusal; CAMPPlus, w2v-bert's Conformer, the
@@ -503,11 +503,16 @@ values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
 2. ~~BigVGAN's separate checkpoint~~ DOWNLOADED, converted and LOADED:
    `nvidia/bigvgan_v2_22khz_80band_256x`, 783 tensors, and it renders a bounded
    waveform through `bigvgan::Forward`;
-3. W5 compose: the ACOUSTIC CHAIN is done -- length regulator, CFG'd CFM
-   Euler loop over the real estimator, BigVGAN, WAV, all on real weights.
-   What remains is one entry point that takes text and a reference clip and
-   runs the talker's codes through it;
-4. W6b, the two routes and ABI v19;
+3. ~~W5 compose~~ DONE for the library path: `indextts2::Render` joins the
+   talker's OWN codes to the regulator, the CFG'd CFM loop over the real
+   estimator with a REAL rotary table, and BigVGAN. Measured 6 codes ->
+   6144 samples, 0.279 s at 22.05 kHz. NOT measured against the oracle;
+4. the `exact` flag on `tiktoken::Pretokenize` is NOT proven load-bearing: a
+   mutation disabling every range check still passes. The flag is kept and
+   the gap is recorded in the test; a case that fails without it is owed;
+5. W6b, the two routes and the ABI entry points. The SEAM is populated now --
+   the family loads and describes itself -- so what is left is the C API and
+   the HTTP surface, plus a tiktoken reader before text can reach the render;
 5. W7 speed, which additionally needs #633;
 6. the INFERRED emotion path (Path A): the `emo_conditioning_encoder` Conformer
    and the `emo_perceiver_encoder` Perceiver. BEHIND a render, not in front of

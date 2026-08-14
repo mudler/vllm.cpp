@@ -788,6 +788,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/bigvgan.cpp
   src/vllm/model_executor/models/bigvgan_loader.cpp
   src/vllm/model_executor/models/indextts2_s2mel_loader.cpp
+  src/vllm/model_executor/models/indextts2_render.cpp
   src/vllm/model_executor/models/indextts2_talker_loader.cpp
   src/vllm/model_executor/models/vocos.cpp
   src/vllm/model_executor/models/lenreg.cpp
@@ -795,6 +796,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/adaln.cpp
   src/vllm/model_executor/models/dit.cpp
   src/vllm/model_executor/models/talker.cpp
+  src/vllm/model_executor/models/tiktoken_bpe.cpp
   src/vllm/model_executor/models/indextts2_pipeline.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae_device.cpp

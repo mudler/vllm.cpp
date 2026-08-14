@@ -503,10 +503,10 @@ values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
 2. ~~BigVGAN's separate checkpoint~~ DOWNLOADED, converted and LOADED:
    `nvidia/bigvgan_v2_22khz_80band_256x`, 783 tensors, and it renders a bounded
    waveform through `bigvgan::Forward`;
-3. W5 compose: the ACOUSTIC CHAIN is done -- length regulator, CFG'd CFM
-   Euler loop over the real estimator, BigVGAN, WAV, all on real weights.
-   What remains is one entry point that takes text and a reference clip and
-   runs the talker's codes through it;
+3. ~~W5 compose~~ DONE for the library path: `indextts2::Render` joins the
+   talker's OWN codes to the regulator, the CFG'd CFM loop over the real
+   estimator with a REAL rotary table, and BigVGAN. Measured 6 codes ->
+   6144 samples, 0.279 s at 22.05 kHz. NOT measured against the oracle;
 4. W6b, the two routes and ABI v19;
 5. W7 speed, which additionally needs #633;
 6. the INFERRED emotion path (Path A): the `emo_conditioning_encoder` Conformer

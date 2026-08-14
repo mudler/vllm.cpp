@@ -507,10 +507,15 @@ TEST_CASE("chat-mm seam body: MakeQwen3VLImageChatFn -> expanded engine input") 
     return out;
   };
 
-  // The seam body, wired exactly as examples/server/main.cpp does (real
-  // tokenizer + the chat-prompt renderer).
+  // The seam body, wired exactly as server_main.cpp does (real tokenizer + the
+  // chat-prompt renderer + the seam's own processing info, #607 L2). The config
+  // is DEFAULT here — 999 per modality — so this pre-existing single-image case
+  // is byte-identical to before the limits landed.
+  const vllm::MultiModalConfig default_mm_config;
+  const vllm::multimodal::BaseProcessingInfo info(
+      default_mm_config, oai::Qwen3VLChatSupportedMmLimits());
   auto mm_fn = oai::MakeQwen3VLImageChatFn(
-      proc, tok, oai::DefaultChatPromptFallback, std::move(codec));
+      proc, tok, oai::DefaultChatPromptFallback, std::move(codec), info);
 
   // An OpenAI image chat request (image then text, matching the M0 golden order).
   const std::string uri = "data:image/x-raw-rgb;base64," + EncodeBase64(rgb);
@@ -553,4 +558,252 @@ TEST_CASE("chat-mm seam body: MakeQwen3VLImageChatFn -> expanded engine input") 
       {"messages", {{{"role", "user"}, {"content", "hello there"}}}}};
   const ChatCompletionRequest text_req = jt.get<ChatCompletionRequest>();
   CHECK_FALSE(mm_fn(text_req.messages).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// 8. THE LIMIT CHECK ON THE CHAT PATH (#607 wave L2, closing #686).
+//
+//    Ported from vllm/entrypoints/chat_utils.py:630-662 @ 5559679229bc — the
+//    tracker that counts every parsed multimodal content part and validates the
+//    RUNNING count before the request reaches the engine — over
+//    BaseProcessingInfo::{AllowedMmLimits,ValidateNumItems,ValidateTrackedChatItem}
+//    (#607 L1, multimodal/processing/context.py:392-405,409-428).
+//
+//    RED line, and it is a BEHAVIOURAL one rather than an absence: before this
+//    wave the seam located the FIRST image_url part and `break`ed
+//    (PRE-L2 chat_mm.cpp:256-268; the same loop is chat_mm.cpp:313-323 today,
+//    now preceded by the check at :311), so a three-image request was neither
+//    served nor refused, it was quietly reduced to one — no
+//    error, no warning, a confident answer about a subset of the input (#686).
+//    Every CHECK_THROWS below fails against that code, because it does not
+//    throw; it returns the first image's 196 tokens and discards two.
+// ---------------------------------------------------------------------------
+namespace {
+
+// One `image_url` content part carrying the committed raw-RGB fixture. The
+// payload is only decoded AFTER the limit check passes, so the refusal cases
+// never reach the codec — which is the point of validating first.
+ChatContentPart ImagePart(const std::string& uri) {
+  ChatContentPart p;
+  p.type = "image_url";
+  p.url = uri;
+  return p;
+}
+
+ChatContentPart TypedPart(const std::string& type) {
+  ChatContentPart p;
+  p.type = type;
+  p.url = "data:application/octet-stream;base64,AAAA";
+  return p;
+}
+
+// N image parts in ONE user message.
+std::vector<ChatMessage> ImageMessages(int n, const std::string& uri) {
+  ChatMessage m;
+  m.role = "user";
+  m.content = std::string("what is in these?");
+  std::vector<ChatContentPart> parts;
+  for (int i = 0; i < n; ++i) parts.push_back(ImagePart(uri));
+  m.content_parts = std::move(parts);
+  std::vector<ChatMessage> out;
+  out.push_back(std::move(m));
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("chat mm limits: ChatPartModality mirrors MM_PARSER_MAP") {
+  namespace oai = vllm::entrypoints::openai;
+  // chat_utils.py:1478-1483.
+  CHECK(oai::ChatPartModality(ImagePart("data:image/x-raw-rgb;base64,AA")) ==
+        std::optional<std::string>("image"));
+  CHECK(oai::ChatPartModality(TypedPart("video_url")) ==
+        std::optional<std::string>("video"));
+  CHECK(oai::ChatPartModality(TypedPart("audio_url")) ==
+        std::optional<std::string>("audio"));
+  CHECK(oai::ChatPartModality(TypedPart("input_audio")) ==
+        std::optional<std::string>("audio"));
+  // Text is not multimodal input; it never reaches a limit.
+  CHECK_FALSE(oai::ChatPartModality(TypedPart("text")).has_value());
+  CHECK_FALSE(oai::ChatPartModality(TypedPart("refusal")).has_value());
+  // `*_embeds` passes THROUGH verbatim (chat_utils.py:635): the suffix strip and
+  // the enable_mm_embeds escape belong to ValidateTrackedChatItem, not here.
+  CHECK(oai::ChatPartModality(TypedPart("image_embeds")) ==
+        std::optional<std::string>("image_embeds"));
+}
+
+TEST_CASE("chat mm limits: THREE images are REFUSED, not truncated (#686)") {
+  namespace oai = vllm::entrypoints::openai;
+  const std::string dir = ImgFixDir();
+  const nlohmann::json manifest = ReadJson(dir + "/manifest.json");
+  auto cfg = ImageConfigFromManifest(manifest);
+  const int64_t H = manifest.at("image").at("shape")[0].get<int64_t>();
+  const int64_t W = manifest.at("image").at("shape")[1].get<int64_t>();
+  const std::vector<uint8_t> rgb =
+      ReadBytes(dir + "/image_rgb_uint8_448x448x3.bin");
+  static const vllm::tok::Tokenizer tok = vllm::tok::Tokenizer::FromHfJson(
+      std::string(PARITY_GOLDENS_DIR) + "/tokenizer_qwen36/tokenizer.json");
+  const std::vector<int32_t> pad_ids =
+      tok.EncodeWithSpecialTokens("<|image_pad|>");
+  REQUIRE(pad_ids.size() == 1u);
+  cfg.image_token_id = pad_ids[0];
+  vllm::multimodal::Qwen3VLImageProcessor proc(cfg);
+
+  oai::ImageCodecFn codec =
+      [&](const oai::DecodedMedia& media) -> oai::DecodedImageRgb {
+    oai::DecodedImageRgb out;
+    out.rgb = media.bytes;
+    out.height = H;
+    out.width = W;
+    return out;
+  };
+  const std::string uri = "data:image/x-raw-rgb;base64," + EncodeBase64(rgb);
+
+  // The DEFAULT config: no --limit-mm-per-prompt, no --language-model-only. The
+  // refusal below therefore comes from the SEAM's own ceiling
+  // (Qwen3VLChatSupportedMmLimits: one image), folded by min() against the
+  // user's 999 (context.py:392-405). #686 asked exactly this question — "the
+  // model's own supported limit, the min() fold's other operand; today nothing
+  // declares one" — and this is the declaration.
+  const vllm::MultiModalConfig default_cfg;
+  const vllm::multimodal::BaseProcessingInfo info(
+      default_cfg, oai::Qwen3VLChatSupportedMmLimits());
+  CHECK(info.AllowedMmLimits().at("image") == 1);
+
+  auto mm_fn = oai::MakeQwen3VLImageChatFn(
+      proc, tok, oai::DefaultChatPromptFallback, codec, info);
+
+  // ONE image still works, byte-identically: 196 expanded tokens.
+  const std::optional<vllm::multimodal::MultiModalInputs> one =
+      mm_fn(ImageMessages(1, uri));
+  REQUIRE(one.has_value());
+  CHECK(one->mm_features.size() == 1u);
+
+  // THREE images are REFUSED. Before L2 this returned the first image's 196
+  // tokens and dropped two, which is the defect #686 records.
+  CHECK_THROWS_AS(mm_fn(ImageMessages(3, uri)), vllm::v1::InputValidationError);
+  try {
+    mm_fn(ImageMessages(3, uri));
+    FAIL("expected the seam to refuse three images");
+  } catch (const vllm::v1::InputValidationError& e) {
+    // Upstream's message VERBATIM (context.py:421-423).
+    CHECK(std::string(e.what()) ==
+          "At most 1 image(s) may be provided in one prompt.");
+    // ...and WITHOUT the "--limit-mm-per-prompt" hint (:425-426): raising the
+    // user's limit would not help, because it is the seam that caps at one, so
+    // a hint would send the user to a flag that cannot fix their request.
+    CHECK(std::string(e.what()).find("--limit-mm-per-prompt") ==
+          std::string::npos);
+  }
+
+  // TWO images across TWO messages are refused too: the tracker's count is
+  // cumulative (chat_utils.py:648-652), so splitting the turn does not evade it.
+  std::vector<ChatMessage> split = ImageMessages(1, uri);
+  split.push_back(ImageMessages(1, uri)[0]);
+  CHECK_THROWS_AS(mm_fn(split), vllm::v1::InputValidationError);
+
+  // A VIDEO part through the IMAGE seam is refused rather than dropped: video is
+  // absent from the seam's supported limits, which context.py:414-415 reads as
+  // "not supported", limit 0.
+  {
+    ChatMessage m;
+    m.role = "user";
+    m.content = std::string("describe");
+    m.content_parts = std::vector<ChatContentPart>{TypedPart("video_url")};
+    std::vector<ChatMessage> msgs;
+    msgs.push_back(std::move(m));
+    try {
+      mm_fn(msgs);
+      FAIL("expected the seam to refuse a video part");
+    } catch (const vllm::v1::InputValidationError& e) {
+      CHECK(std::string(e.what()) ==
+            "At most 0 video(s) may be provided in one prompt.");
+    }
+  }
+}
+
+TEST_CASE("chat mm limits: --limit-mm-per-prompt and --language-model-only bite") {
+  namespace oai = vllm::entrypoints::openai;
+  const std::string dir = ImgFixDir();
+  const nlohmann::json manifest = ReadJson(dir + "/manifest.json");
+  auto cfg = ImageConfigFromManifest(manifest);
+  const int64_t H = manifest.at("image").at("shape")[0].get<int64_t>();
+  const int64_t W = manifest.at("image").at("shape")[1].get<int64_t>();
+  const std::vector<uint8_t> rgb =
+      ReadBytes(dir + "/image_rgb_uint8_448x448x3.bin");
+  static const vllm::tok::Tokenizer tok = vllm::tok::Tokenizer::FromHfJson(
+      std::string(PARITY_GOLDENS_DIR) + "/tokenizer_qwen36/tokenizer.json");
+  cfg.image_token_id = tok.EncodeWithSpecialTokens("<|image_pad|>")[0];
+  vllm::multimodal::Qwen3VLImageProcessor proc(cfg);
+  oai::ImageCodecFn codec =
+      [&](const oai::DecodedMedia& media) -> oai::DecodedImageRgb {
+    oai::DecodedImageRgb out;
+    out.rgb = media.bytes;
+    out.height = H;
+    out.width = W;
+    return out;
+  };
+  const std::string uri = "data:image/x-raw-rgb;base64," + EncodeBase64(rgb);
+
+  // (a) --language-model-only: EVERY modality limit becomes 0
+  // (multimodal.py:78-80,326-327), so the ONE image a default server serves is
+  // refused. This is the flag's main observable effect and the half a port most
+  // easily leaves out, because omitting it breaks nothing a text-only workload
+  // would notice.
+  {
+    vllm::MultiModalConfig lm_only;
+    lm_only.language_model_only = true;
+    const vllm::multimodal::BaseProcessingInfo info(
+        lm_only, oai::Qwen3VLChatSupportedMmLimits());
+    auto mm_fn = oai::MakeQwen3VLImageChatFn(
+        proc, tok, oai::DefaultChatPromptFallback, codec, info);
+    try {
+      mm_fn(ImageMessages(1, uri));
+      FAIL("expected --language-model-only to refuse an image request");
+    } catch (const vllm::v1::InputValidationError& e) {
+      // HERE the hint IS appended (context.py:425-426): the seam CAN take this
+      // image, the configuration is what refused it, so raising the limit helps.
+      CHECK(std::string(e.what()) ==
+            "At most 0 image(s) may be provided in one prompt. "
+            "Set `--limit-mm-per-prompt` to increase this limit.");
+    }
+    // A text-only request is untouched by the flag — it limits multimodal INPUT,
+    // it does not refuse the server.
+    ChatMessage text;
+    text.role = "user";
+    text.content = std::string("hello there");
+    std::vector<ChatMessage> text_msgs;
+    text_msgs.push_back(std::move(text));
+    CHECK_FALSE(mm_fn(text_msgs).has_value());
+  }
+
+  // (b) --limit-mm-per-prompt '{"image": 0}' reaches the same refusal by the
+  // other route, which is the whole reason L1 ported the limits before the flag:
+  // the flag is sugar, the limits are the mechanism.
+  {
+    vllm::MultiModalConfig zeroed;
+    zeroed.limit_per_prompt = {{"image", 0}};
+    const vllm::multimodal::BaseProcessingInfo info(
+        zeroed, oai::Qwen3VLChatSupportedMmLimits());
+    auto mm_fn = oai::MakeQwen3VLImageChatFn(
+        proc, tok, oai::DefaultChatPromptFallback, codec, info);
+    CHECK_THROWS_AS(mm_fn(ImageMessages(1, uri)),
+                    vllm::v1::InputValidationError);
+  }
+
+  // (c) A user limit can only LOWER the seam's ceiling, never raise it
+  // (context.py:392-405 folds by min). `image=99` still refuses the second
+  // image.
+  {
+    vllm::MultiModalConfig raised;
+    raised.limit_per_prompt = {{"image", 99}};
+    const vllm::multimodal::BaseProcessingInfo info(
+        raised, oai::Qwen3VLChatSupportedMmLimits());
+    CHECK(info.AllowedMmLimits().at("image") == 1);
+    auto mm_fn = oai::MakeQwen3VLImageChatFn(
+        proc, tok, oai::DefaultChatPromptFallback, codec, info);
+    CHECK(mm_fn(ImageMessages(1, uri)).has_value());
+    CHECK_THROWS_AS(mm_fn(ImageMessages(2, uri)),
+                    vllm::v1::InputValidationError);
+  }
 }

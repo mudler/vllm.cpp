@@ -1779,8 +1779,16 @@ runtime-verified yet.
   validation still fires — `--enable-auto-tool-choice` with
   `--tool-call-parser none` is refused, mirroring
   `vllm/entrypoints/openai/cli_args.py:395`. Not yet reviewed or gate-rerun by
-  the operator; `--language-model-only` (#607) is a real capability gap and is
-  deliberately NOT in this list.
+  the operator; `--language-model-only` was excluded from this list because it
+  is a real capability, not a no-op — and as of 2026-08-14 (#607 wave L2) it is
+  **implemented** rather than accepted-and-inert, alongside
+  `--limit-mm-per-prompt`. Both set `vllm::MultiModalConfig` and are ENFORCED: a
+  server started with `--language-model-only` answers a multimodal request with
+  HTTP 400 `At most 0 image(s) may be provided in one prompt.`, which is what
+  upstream's flag does. The 43 recipes that pass it now reach model load. It
+  does **not** free memory yet — nothing gates vision-tower construction on the
+  limits (wave L3, owed with a measured RSS reduction), so the flag must not be
+  described as a VRAM knob until that lands.
 - **Surface coverage (ONE SURFACE, `ARCH-ONE-SURFACE`,
   `.agents/specs/surface-coverage-2026-08-07.md`).** 21/30 text archs
   on-framework; the recurring defect (a capability in a per-model CLI) is in seven

@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/multimodal/audio_processor.h"
 #include "vllm/multimodal/inputs.h"
+#include "vllm/multimodal/processing/context.h"
 #include "vllm/multimodal/qwen3vl_processor.h"
 
 namespace vllm {
@@ -137,6 +139,71 @@ std::vector<std::string> CollectChatPlaceholders(const ChatMessage& message);
 // content unchanged (byte-identical text path).
 std::string BuildMarkerInjectedContent(const ChatMessage& message);
 
+// ── The per-item LIMIT check on the chat path (#607 wave L2, #686) ─────────
+//
+// Ported from: vllm/entrypoints/chat_utils.py:630-662 — the tracker that counts
+// every multimodal content part it parses and validates the RUNNING count
+// against the configured limit before the request reaches the engine.
+// `BaseProcessingInfo::ValidateTrackedChatItem` (#607 L1) is the check itself;
+// what follows is the WALK that reaches it, which is the half L1 deliberately
+// left out because nothing constructed a config on a live request yet.
+
+// The tracked mm modality for one content part — the modality
+// `validate_num_items` is asked about, or nullopt for a part that is not
+// multimodal input at all. Mirrors MM_PARSER_MAP (chat_utils.py:1478) reduced to
+// the part types this server's protocol.h parses:
+//   image_url             -> "image"      (chat_utils.py:1479)
+//   video_url             -> "video"      (chat_utils.py:1483)
+//   input_audio/audio_url -> "audio"      (chat_utils.py:1481-1482)
+//   *_embeds              -> passed THROUGH verbatim, because
+//                            ValidateTrackedChatItem owns the suffix strip and
+//                            the enable_mm_embeds escape (chat_utils.py:635,653-660)
+//   text (and anything else) -> nullopt
+std::optional<std::string> ChatPartModality(const ChatContentPart& part);
+
+// The WALK (chat_utils.py:648-662): every mm content part of every message, IN
+// ORDER, maintaining the running per-modality count and validating each item as
+// it is counted. The count is cumulative ACROSS messages, exactly as upstream's
+// tracker is, so a limit cannot be evaded by splitting the items over two turns.
+//
+// Throws vllm::v1::InputValidationError — the type api_server.cpp:185,252 maps
+// to HTTP 400 — carrying upstream's own message text. This is what turns the
+// silent truncation of #686 into upstream's refusal: before it, chat_mm.cpp took
+// the FIRST image part and dropped the rest without a word.
+void ValidateChatMmLimits(const multimodal::BaseProcessingInfo& info,
+                          const std::vector<ChatMessage>& messages);
+
+// The Qwen3-VL IMAGE chat seam's OWN supported limits — the `min()` fold's other
+// operand (context.py:392-405), which #686 recorded as undeclared.
+//
+// Upstream's Qwen3-VL declares image and video UNLIMITED —
+// `get_supported_mm_limits` is not defined on Qwen3VLProcessingInfo at all
+// (qwen3_vl.py:848 subclasses Qwen2VLProcessingInfo); it is INHERITED from
+// qwen2_vl.py:851-852, `return {"image": None, "video": None}` — because its
+// processor handles N of each. Ours handles exactly ONE image
+// (MakeQwen3VLImageChatFn locates a single image part) and no video or audio at
+// all, so the honest ceiling is {"image": 1} and every other modality is
+// ABSENT — which context.py:414-415 reads as "not supported", limit 0. That is
+// not a policy choice, it is this seam's implemented arm stated as a NUMBER. A
+// user limit can only LOWER it (the fold is a min), so
+// `--limit-mm-per-prompt image=99` still refuses the second image.
+//
+// WHAT THIS DOES NOT YET SATISFY (#758, found in the #749 review). AGENTS.md
+// asks that an unimplemented arm be "refused with a message naming the missing
+// piece". The number is stated here, but the message a client receives is
+// upstream's generic "At most 0 video(s) may be provided in one prompt." — which
+// names nothing, and which a user cannot tell apart from an operator having set
+// `--limit-mm-per-prompt '{"video": 0}'`. The only signal today is by OMISSION:
+// ValidateNumItems withholds the "Set `--limit-mm-per-prompt` to increase this
+// limit." hint when raising the configured limit would not help. Changing the
+// text is a deliberate divergence from a verbatim-ported message that three
+// suites assert byte-for-byte, so it is owed to #758 with its own spec rather
+// than folded in here.
+//
+// When the multi-image / video arms land they raise these numbers here, and
+// nothing else changes.
+std::map<std::string, std::optional<int>> Qwen3VLChatSupportedMmLimits();
+
 // ── The multimodal chat SEAM BODY (MM-SERVE-E2E) ───────────────────────────
 //
 // A decoded RGB image: raw HWC uint8 (height*width*3) + dims. Turning the
@@ -177,9 +244,18 @@ using ChatPromptRenderFn = std::function<std::string(
 //      id to N = prod(grid_thw)/merge^2 copies + build the mm_features handle
 //      the engine mm generate overload carries onto Request.mm_features.
 // Returns nullopt when no message carries an image part (the text path stays
-// byte-identical). IMAGE only for now — video / audio / multiple-image are named
-// residuals. `proc` and `tokenizer` must outlive the returned function (the
-// server owns them for the process lifetime, like set_beam_search_tokenizer).
+// byte-identical). `proc`, `tokenizer` and `info` must outlive the returned
+// function (the server owns them for the process lifetime, like
+// set_beam_search_tokenizer).
+//
+// STEP 0, ahead of everything above (#607 L2, #686): ValidateChatMmLimits(info,
+// messages). IMAGE-only is no longer a silent truncation — a request carrying
+// more images than `info` allows, or any video/audio part, is REFUSED with
+// upstream's message and reaches the client as HTTP 400. `info`'s supported
+// limits are this seam's own (Qwen3VLChatSupportedMmLimits); its MultiModalConfig
+// is where `--limit-mm-per-prompt` / `--language-model-only` land, so
+// --language-model-only makes this seam answer every image request with
+// "At most 0 image(s) may be provided in one prompt."
 //
 // This is the seam-body half of MM-SERVE-E2E: it produces the token-correct
 // engine input; the GPU worker consuming Request.mm_features through the vision
@@ -190,7 +266,8 @@ std::function<std::optional<multimodal::MultiModalInputs>(
     const std::vector<ChatMessage>&)>
 MakeQwen3VLImageChatFn(const multimodal::Qwen3VLImageProcessor& proc,
                        const vllm::tok::Tokenizer& tokenizer,
-                       ChatPromptRenderFn prompt_fn, ImageCodecFn codec);
+                       ChatPromptRenderFn prompt_fn, ImageCodecFn codec,
+                       const multimodal::BaseProcessingInfo& info);
 
 }  // namespace vllm::entrypoints::openai
 

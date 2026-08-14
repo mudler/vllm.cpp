@@ -30,6 +30,7 @@
 
 #include "capi/engine_handle.h"
 #include "vllm/config/device.h"
+#include "vllm/config/multimodal.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/platforms/interface.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
@@ -252,10 +253,10 @@ vllm_engine* MakeSyntheticEngine() {
 // Chat-capable synthetic engine: same stack, but the chat serving is built with
 // an IN-VOCAB prompt seam (the tiny fixture vocab cannot spell a real chat
 // template), mirroring the api-server harness's InVocabChatPrompt.
-vllm_engine* MakeSyntheticChatEngine() {
+vllm_engine* MakeSyntheticChatEngine(EngineParams p) {
   const HfConfig c = MakeConfig();
-  auto loaded = std::make_unique<LoadedEngine>(c, MakeWeights(c), BuildFixture(),
-                                               SyntheticParams());
+  auto loaded =
+      std::make_unique<LoadedEngine>(c, MakeWeights(c), BuildFixture(), p);
   return vllm::capi::MakeEngineHandle(
       std::move(loaded),
       [](const std::vector<vllm::entrypoints::openai::ChatMessage>& messages,
@@ -267,6 +268,10 @@ vllm_engine* MakeSyntheticChatEngine() {
           if (m.content.has_value()) p += *m.content;
         return p;
       });
+}
+
+vllm_engine* MakeSyntheticChatEngine() {
+  return MakeSyntheticChatEngine(SyntheticParams());
 }
 
 vllm_sampling_params GreedyParams(int32_t max_tokens) {
@@ -1243,6 +1248,142 @@ TEST_CASE("capi: enable_jump_forward=on reaches the engine; default is inert (AB
     LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
     CHECK(e.jump_forward_enabled() == false);
   }
+}
+
+// ── ABI v19: the multimodal input limits (#607 wave L2) ────────────────────
+//
+// Ported from vllm/config/multimodal.py:78,81,212-236,321-336 and the two flags
+// that set them (vllm/engine/arg_utils.py:555-556,1276-1279,1691-1692) @
+// 5559679229bc. Two fields, and the load-bearing property is that they and the
+// SERVER FLAGS land on ONE config object — EngineParams::multimodal ->
+// LoadedEngine::mm_config() — so the two entry points cannot resolve a limit
+// differently.
+TEST_CASE("capi: multimodal input limits (ABI v19)") {
+  // The zero values keep a pre-v19 caller byte-identical: the flag off and NO
+  // limits configured, which resolves to 999 per modality (multimodal.py:331-333)
+  // — NOT 0. An empty map is "no limits", not "nothing allowed".
+  vllm_model_params def = vllm_model_params_default();
+  CHECK(def.language_model_only == 0);
+  CHECK(def.limit_mm_per_prompt == nullptr);
+
+  // A well-formed limit reaches model load (which then fails on the missing
+  // directory) rather than being rejected as a caller error.
+  vllm_model_params ok = vllm_model_params_default();
+  ok.model_path = "/nonexistent/vllm-cpp/model/dir";
+  ok.limit_mm_per_prompt = "{\"image\": 2, \"video\": 0}";
+  vllm_engine* eng = nullptr;
+  CHECK(vllm_engine_load(&ok, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+
+  // ...and so does the flag, which needs no value at all.
+  vllm_model_params lm_only = vllm_model_params_default();
+  lm_only.model_path = "/nonexistent/vllm-cpp/model/dir";
+  lm_only.language_model_only = 1;
+  vllm_engine* eng_lm = nullptr;
+  CHECK(vllm_engine_load(&lm_only, &eng_lm) == VLLM_ERR_MODEL_LOAD);
+
+  // Every upstream validation is a CALLER error here, reported before any model
+  // I/O — never a silent default to 999, which would leave the caller believing
+  // they set a limit they did not.
+  for (const char* bad_value :
+       {"{not json", "[1,2]", "{\"image\": \"two\"}", "{\"image\": -1}",
+        "{\"video\": {\"fps\": 2}}", "{\"video\": {\"num_frames\": 0}}"}) {
+    CAPTURE(bad_value);
+    vllm_model_params bad = vllm_model_params_default();
+    bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+    bad.limit_mm_per_prompt = bad_value;
+    vllm_engine* eng_bad = reinterpret_cast<vllm_engine*>(0x1);
+    CHECK(vllm_engine_load(&bad, &eng_bad) == VLLM_ERR_INVALID_ARGUMENT);
+    CHECK(eng_bad == nullptr);
+  }
+  CHECK(std::string(vllm_last_error()).find("limit_mm_per_prompt") !=
+        std::string::npos);
+}
+
+TEST_CASE("capi: EngineParams::multimodal reaches LoadedEngine::mm_config()") {
+  // The hop the ABI field and the two server flags SHARE. Without it the flags
+  // would be recorded on a struct nobody reads, which is exactly the
+  // "accepted and inert" failure the limits wave exists to avoid.
+  const HfConfig c = MakeConfig();
+  {
+    EngineParams p = SyntheticParams();
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    // Default: no limits configured => 999 per modality, the pre-L2 behaviour.
+    CHECK(e.mm_config().GetLimitPerPrompt("image") ==
+          vllm::kDefaultLimitPerPrompt);
+  }
+  {
+    EngineParams p = SyntheticParams();
+    p.multimodal.limit_per_prompt = {{"image", 2}};
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.mm_config().GetLimitPerPrompt("image") == 2);
+    // A modality nobody named keeps the default — an explicit limit for one
+    // modality is not a global switch.
+    CHECK(e.mm_config().GetLimitPerPrompt("video") ==
+          vllm::kDefaultLimitPerPrompt);
+  }
+  {
+    // The precedence that matters (multimodal.py:326-327): the flag is checked
+    // BEFORE the map, so an explicit non-zero entry does not survive it.
+    EngineParams p = SyntheticParams();
+    p.multimodal.language_model_only = true;
+    p.multimodal.limit_per_prompt = {{"image", 4}};
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.mm_config().GetLimitPerPrompt("image") == 0);
+    CHECK(e.mm_config().GetLimitPerPrompt("video") == 0);
+  }
+}
+
+// The PIN for the ABI v19 paragraph in include/vllm.h. That paragraph is a
+// permanent public contract, and the thing it must not claim is that setting
+// these fields makes a C-ABI call REFUSE a multimodal request. It does not:
+// ValidateNumItems is reached only behind the multimodal chat seam, and
+// server_main.cpp is the sole caller of set_multimodal_chat_fn — vllm_chat and
+// vllm_chat_stream never install one, so serving_chat.cpp's `if (mm_chat_fn_)`
+// gate is never taken on this path and no MultiModalInputs is ever built.
+//
+// What a C-ABI caller gets today, asserted rather than described: the request
+// PARSES (protocol.cpp does read `image_url` content parts), the image part is
+// DROPPED, its text siblings still form the prompt, and the answer is an
+// ordinary 200-shaped chat.completion — with language_model_only set, which on
+// the server path would be an HTTP 400. Wire the seam into the ABI without
+// revisiting that paragraph and this case goes red, which is the point.
+TEST_CASE("capi: the v19 limits are RECORDED on a C-ABI engine; there is no "
+          "multimodal request path to enforce them on") {
+  EngineParams p = SyntheticParams();
+  p.multimodal.language_model_only = true;  // every modality limit => 0
+  vllm_engine* eng = MakeSyntheticChatEngine(p);
+  REQUIRE(eng != nullptr);
+
+  // A real OpenAI multimodal chat body: one text part, one image_url part.
+  const char* request =
+      "{\"messages\":[{\"role\":\"user\",\"content\":["
+      "{\"type\":\"text\",\"text\":\"hello\"},"
+      "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,"
+      "iVBORw0KGgo=\"}}"
+      "]}],\"temperature\":0,\"max_tokens\":6}";
+  char* response = nullptr;
+  const vllm_status st = vllm_chat(eng, request, &response);
+  CAPTURE(std::string(vllm_last_error() == nullptr ? "" : vllm_last_error()));
+  REQUIRE(st == VLLM_OK);
+  REQUIRE(response != nullptr);
+  const json body = json::parse(response);
+  CAPTURE(std::string(response));
+  // NOT a refusal: served as text, exactly as if the image part were absent.
+  CHECK(body.at("object") == "chat.completion");
+  CHECK(body.at("choices").size() == 1);
+  CHECK(!body.at("choices").at(0).at("message").at("content")
+             .get<std::string>()
+             .empty());
+  CHECK(body.count("error") == 0);
+  vllm_string_free(response);
+  vllm_engine_free(eng);
+
+  // The limits ARE on the config all the same — recorded, just not consulted by
+  // anything this ABI can reach. That is the exact wording include/vllm.h owes.
+  const HfConfig c = MakeConfig();
+  LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+  CHECK(e.mm_config().GetLimitPerPrompt("image") == 0);
 }
 
 TEST_CASE("capi: kv_transfer_config parses and validates the connector name") {

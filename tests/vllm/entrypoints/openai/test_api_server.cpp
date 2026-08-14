@@ -55,7 +55,9 @@
 
 #include "vllm/config/device.h"
 #include "vllm/config/scheduler.h"
+#include "vllm/config/multimodal.h"
 #include "vllm/entrypoints/model_loader.h"
+#include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
@@ -2663,3 +2665,196 @@ TEST_CASE("platform shutdown: teardown drains an acquired console handler") {
   CloseHandle(acquired);
 }
 #endif
+
+// ── MULTIMODAL INPUT LIMITS, END TO END (#607 wave L2, #686) ────────────────
+//
+// The gate PR #685's reviewer owed to this wave: L1 ported the refusal and
+// proved it throws, but nothing called it on a live request, so the claim "and
+// it becomes HTTP 400" was unproven end to end. This is that proof, and it is
+// deliberately written to distinguish 400 from BOTH of the wrong answers:
+//
+//   * NOT 500. `InputValidationError` is caught at api_server.cpp:252, AHEAD of
+//     the generic `std::exception -> InternalServerError` arm. A refusal thrown
+//     as any other type would land as a 500 — a client mistake reported as a
+//     server fault — which is exactly why L1 reused the ONE validation type
+//     instead of adding a multimodal-only one. Leg 3 below pins that by
+//     throwing a bespoke type through the same seam and observing the 500.
+//   * NOT a truncated 200. Before this wave the seam took the first image_url
+//     part and `break`ed, so THREE images produced a perfectly ordinary 200
+//     about one of them (#686). Leg 2 shows a within-limit request still
+//     answering 200, so the 400 is a LIMIT decision, not "multimodal is off".
+//
+// RECORDED, because the RED run says something #686 does not: against the code
+// before this wave, leg 2 (the validate-then-build shape) returned the truncated
+// 200 exactly as #686 describes, but leg 1 — the REAL MakeQwen3VLImageChatFn —
+// returned a FIVE HUNDRED. It injects one placeholder marker per image part but
+// routes only the first image, so ExpandImagePlaceholders raised "more image
+// placeholders than grids" and the client saw a server fault carrying an
+// internal message. Both are wrong in the same way (neither is upstream's
+// refusal) and both become the 400 below, but the issue's "served with one,
+// silently" understates the production seam's case rather than overstating it.
+//
+// Upstream chain: chat_utils.py:662 (the per-item check) ->
+// multimodal/processing/context.py:409-428 (VLLMValidationError) ->
+// serve/utils/error_response.py:62-65 (BadRequestError / 400), all at
+// 5559679229bc.
+TEST_CASE("api_server: an over-limit multimodal chat request is HTTP 400") {
+  namespace oai = vllm::entrypoints::openai;
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  // A chat body carrying `n` image parts, in the OpenAI array-content form.
+  auto ImageBody = [](int n) {
+    json parts = json::array();
+    for (int i = 0; i < n; ++i) {
+      parts.push_back({{"type", "image_url"},
+                       {"image_url",
+                        {{"url", "data:image/x-raw-rgb;base64,AAAA"}}}});
+    }
+    parts.push_back({{"type", "text"}, {"text", "hello"}});
+    const json body = {
+        {"messages", json::array({{{"role", "user"}, {"content", parts}}})},
+        {"max_completion_tokens", 4},
+        {"temperature", 0.0}};
+    return body.dump();
+  };
+
+  // The seam's own limits, folded with a DEFAULT MultiModalConfig (no
+  // --limit-mm-per-prompt, no --language-model-only): image=1.
+  const vllm::MultiModalConfig default_cfg;
+  const vllm::multimodal::BaseProcessingInfo info(
+      default_cfg, oai::Qwen3VLChatSupportedMmLimits());
+
+  // ── LEG 1: the REAL production seam. MakeQwen3VLImageChatFn validates before
+  // it decodes anything, so the processor and codec below are never reached on
+  // this path — which is why a synthetic processor config is honest here: the
+  // refusal is the whole code path under test.
+  vllm::multimodal::Qwen3VLProcessorConfig pcfg;
+  pcfg.image_token_id = 3;  // inside the fixture vocab (ids 0..21)
+  const vllm::multimodal::Qwen3VLImageProcessor proc(pcfg);
+  oai::ImageCodecFn never_reached =
+      [](const oai::DecodedMedia&) -> oai::DecodedImageRgb {
+    FAIL("the codec must not run: the limit check refuses first");
+    return {};
+  };
+  h.chat.set_multimodal_chat_fn(oai::MakeQwen3VLImageChatFn(
+      proc, Fixture(), InVocabChatPrompt, never_reached, info));
+
+  ApiServer::DispatchResult refused =
+      h.server.handle_chat_completions(ImageBody(3));
+  CHECK(refused.status == 400);
+  // Explicitly NOT the 500 arm, and explicitly not a 200 body.
+  CHECK(refused.status != 500);
+  CHECK(refused.status != 200);
+  {
+    const json j = json::parse(refused.body);
+    CHECK(j.at("error").at("type") == "BadRequestError");
+    // Upstream's message text VERBATIM (context.py:421-423), reaching the wire.
+    CHECK(j.at("error").at("message") ==
+          "At most 1 image(s) may be provided in one prompt.");
+    // A truncated 200 would have carried a completion instead.
+    CHECK_FALSE(j.contains("choices"));
+  }
+
+  // ── LEG 2: the SAME server, a WITHIN-limit request, still 200. This is what
+  // separates "the limit refused you" from "multimodal requests are off": the
+  // seam here is the production SHAPE (validate, then build the engine input),
+  // with the synthetic engine's in-vocab ids standing in for the real
+  // processor's expansion, because the fixture vocab is 22 tokens wide and a
+  // real Qwen image id (151655) would run off the end of it.
+  h.chat.set_multimodal_chat_fn(
+      [&info](const std::vector<ChatMessage>& messages)
+          -> std::optional<vllm::multimodal::MultiModalInputs> {
+        oai::ValidateChatMmLimits(info, messages);
+        vllm::multimodal::MultiModalInputs mm;
+        mm.prompt_token_ids = {13, 17};  // "hello", " world"
+        vllm::multimodal::MultiModalFeatureSpec spec;
+        spec.modality = "image";
+        spec.offset = 0;
+        spec.length = 1;
+        mm.mm_features.push_back(std::move(spec));
+        return mm;
+      });
+  ApiServer::DispatchResult served =
+      h.server.handle_chat_completions(ImageBody(1));
+  CHECK(served.status == 200);
+  {
+    const json j = json::parse(served.body);
+    CHECK(j.at("object") == "chat.completion");
+    CHECK(j.at("choices").at(0).at("message").at("role") == "assistant");
+  }
+  // ...and the same seam refuses three, so leg 1's 400 was not an artifact of
+  // the production seam's own decode path.
+  CHECK(h.server.handle_chat_completions(ImageBody(3)).status == 400);
+
+  // ── LEG 3: the DISCRIMINATOR. A seam that throws anything OTHER than
+  // InputValidationError lands as a 500. Without this leg, "status == 400"
+  // could be satisfied by a handler that answered 400 to every seam failure,
+  // and the type L1 chose would be doing no work.
+  h.chat.set_multimodal_chat_fn(
+      [](const std::vector<ChatMessage>&)
+          -> std::optional<vllm::multimodal::MultiModalInputs> {
+        throw std::runtime_error("a seam failure that is NOT a validation error");
+      });
+  ApiServer::DispatchResult faulted =
+      h.server.handle_chat_completions(ImageBody(1));
+  CHECK(faulted.status == 500);
+  CHECK(json::parse(faulted.body).at("error").at("type") ==
+        "InternalServerError");
+}
+
+TEST_CASE("api_server: --language-model-only answers an image request with 400") {
+  // The flag's main observable effect, at the HTTP boundary. Upstream's
+  // --language-model-only is not "the same server, minus some VRAM" — it is a
+  // server that answers an image request with "At most 0 image(s) may be
+  // provided in one prompt." (multimodal.py:78-80 -> :326-327 ->
+  // context.py:409-428). The VRAM half is wave L3 and is NOT claimed here.
+  namespace oai = vllm::entrypoints::openai;
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  vllm::MultiModalConfig lm_only;
+  lm_only.language_model_only = true;
+  const vllm::multimodal::BaseProcessingInfo info(
+      lm_only, oai::Qwen3VLChatSupportedMmLimits());
+
+  vllm::multimodal::Qwen3VLProcessorConfig pcfg;
+  pcfg.image_token_id = 3;
+  const vllm::multimodal::Qwen3VLImageProcessor proc(pcfg);
+  oai::ImageCodecFn never_reached =
+      [](const oai::DecodedMedia&) -> oai::DecodedImageRgb {
+    FAIL("the codec must not run under --language-model-only");
+    return {};
+  };
+  h.chat.set_multimodal_chat_fn(oai::MakeQwen3VLImageChatFn(
+      proc, Fixture(), InVocabChatPrompt, never_reached, info));
+
+  const json body = {
+      {"messages",
+       json::array({{{"role", "user"},
+                     {"content",
+                      json::array({{{"type", "image_url"},
+                                    {"image_url",
+                                     {{"url",
+                                       "data:image/x-raw-rgb;base64,AAAA"}}}},
+                                   {{"type", "text"}, {"text", "hello"}}})}}})},
+      {"max_completion_tokens", 4},
+      {"temperature", 0.0}};
+  const ApiServer::DispatchResult r =
+      h.server.handle_chat_completions(body.dump());
+  CHECK(r.status == 400);
+  const json j = json::parse(r.body);
+  CHECK(j.at("error").at("type") == "BadRequestError");
+  CHECK(j.at("error").at("message") ==
+        "At most 0 image(s) may be provided in one prompt. "
+        "Set `--limit-mm-per-prompt` to increase this limit.");
+
+  // A TEXT-only request on the same server is unaffected — the flag limits
+  // multimodal INPUT, it does not turn the server off.
+  const ApiServer::DispatchResult text = h.server.handle_chat_completions(
+      R"({"messages":[{"role":"user","content":"hello"}],)"
+      R"("max_completion_tokens":4,"temperature":0.0})");
+  CHECK(text.status == 200);
+}

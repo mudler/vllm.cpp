@@ -1084,6 +1084,13 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_recipe_args
     vllm/entrypoints/openai/test_serve_recipe_args.cpp)
   target_include_directories(test_serve_recipe_args PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # ENG-MM-INPUT-PIPELINE wave L2 (#607): --language-model-only /
+  # --limit-mm-per-prompt. Same shape and the same reason as the row above — it
+  # re-execs the REAL VllmServerMain to observe the flags reaching the config and
+  # a malformed limit aborting before the load.
+  vllm_cpp_add_test(test_serve_mm_limits
+    vllm/entrypoints/openai/test_serve_mm_limits.cpp)
+  target_include_directories(test_serve_mm_limits PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 

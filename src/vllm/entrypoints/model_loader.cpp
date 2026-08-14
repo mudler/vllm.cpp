@@ -972,6 +972,10 @@ LoadedEngine::LoadedEngine(HfConfig config,
       dflash_draft_(std::move(dflash_draft)),
       model_(std::move(model)),
       tokenizer_(std::move(tokenizer)),
+      // #607 L2: carry the multimodal input limits onto the engine, so the ONE
+      // config object every consumer asks (GetLimitPerPrompt) is the one the
+      // server flags / the C ABI set. Default-constructed == the pre-L2 999.
+      mm_config_(params.multimodal),
       // ROAD-V1-MEM M1: resolve the block count from the sizing knobs
       // (num_blocks override > kv_cache_memory_bytes > util fallback) against the
       // model's own per-block byte geometry. FIRST, because max_model_len_ is

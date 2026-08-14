@@ -25,6 +25,13 @@ from pathlib import Path
 
 SOURCES = ("gpt.pth", "codec.pth", "s2mel.pth")
 
+# The auxiliary tensors, which are bare tensors or small dicts rather than state
+# dicts. They are TINY and they are on the render path: feat1/feat2 are the
+# speaker and emotion matrices `emovec::Select` consumes, and the stats are what
+# normalizes the w2v-bert features. Converting them here means the engine never
+# has to read pickle for them either.
+AUX = ("feat1.pt", "feat2.pt", "wav2vec2bert_stats.pt")
+
 # `codec.pth` ships optimizer state alongside the weights. It is training
 # residue, cannot be loaded by anything here, and is a large fraction of the
 # file, so it is dropped -- loudly, with a count, never silently.
@@ -89,6 +96,27 @@ def main() -> int:
                 raise SystemExit(
                     f"{name}: converted {got} tensors but the manifest records "
                     f"{expected}; the checkpoint changed under the record")
+
+    # A bare tensor has no name of its own, so it takes the file's stem.
+    aux = {}
+    for name in AUX:
+        src = a.checkpoint / name
+        if not src.exists():
+            raise SystemExit(f"missing {src}")
+        obj = torch.load(src, map_location="cpu", weights_only=False)
+        stem = name.replace(".pt", "")
+        if hasattr(obj, "shape"):
+            aux[stem] = obj.detach().cpu().contiguous().clone()
+        else:
+            for key, value in flatten(obj, stem):
+                aux[key] = value.detach().cpu().contiguous().clone()
+    dst = a.out / "aux.safetensors"
+    save_file(aux, str(dst), metadata={"source": ",".join(AUX), "model": "IndexTTS-2.5"})
+    summary["aux"] = {"kept": len(aux), "dropped": 0, "out": dst.name,
+                      "bytes": dst.stat().st_size,
+                      "names": sorted(aux)}
+    print(f"{'aux':<12} -> {dst.name:<22} {len(aux):5d} tensors  "
+          f"({', '.join(sorted(aux))})")
 
     (a.out / "conversion.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0

@@ -39,6 +39,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 namespace vllm {
 
@@ -86,6 +87,66 @@ struct MultiModalConfig {
     return it->second;
   }
 };
+
+// Parse the value of `--limit-mm-per-prompt` (arg_utils.py:556,1279) / the C-ABI
+// `vllm_model_params.limit_mm_per_prompt` into `limit_per_prompt`.
+//
+// Ported from `MultiModalConfig._validate_limit_per_prompt`
+// (multimodal.py:212-236) together with the DummyOptions dataclasses it feeds
+// (:17-45). Upstream reaches this through argparse `type=parse_type(json.loads)`
+// (_compute_kwargs, arg_utils.py:379-381 — the plain-dict branch; the
+// `union_dict_and_str` branch immediately above it at :374-378 is a DIFFERENT
+// rule and is not the one `limit_per_prompt: dict[str, BaseDummyOptions]` takes,
+// because that annotation contains no `str` arm and `dict[...]` reports
+// `__module__ == "builtins"`, so `is_not_builtin` is False), so the flag's value
+// is a JSON OBJECT and every spelling below is the object's, not the flag's:
+//
+//   * the LEGACY format, count only — {"image": 16, "video": 2} (:87-88,220-222,
+//     which rewrites a bare int to {"count": <int>});
+//   * the CONFIGURABLE format — {"video": {"count": 1, "num_frames": 32,
+//     "width": 512, "height": 512}} (:90-92,224-232);
+//   * the two MIXED in one object (:94-96).
+//
+// Refusals, all of them upstream's own, none of them invented here:
+//   * a non-object document, or a value that is neither an int nor an object —
+//     upstream's json.loads/pydantic pair rejects both;
+//   * `count` absent-and-not-an-int, or NEGATIVE — `count: int = Field(999,
+//     ge=0)` (:21), declared on BaseDummyOptions and therefore checked for EVERY
+//     modality;
+//   * for a BUILTIN modality only — video, image, audio, the three
+//     `_validate_limit_per_prompt` routes to a dataclass of their own
+//     (:226-232) — an option key the modality does not define, or an option
+//     <= 0: those three are the dataclasses carrying
+//     `config=ConfigDict(extra="forbid")` (:24,33,41) over `Field(None, gt=0)`
+//     (:28-30,37-38,45). video takes num_frames/width/height, image
+//     width/height, audio length.
+//
+// And the one that is deliberately NOT a refusal: any OTHER modality falls to
+// the `else` at :233 and is built as a bare `BaseDummyOptions`, which is the ONE
+// dummy-options dataclass declared WITHOUT `extra="forbid"` (:17-21). Pydantic's
+// default `extra='ignore'` therefore applies, so an unknown option key on a
+// non-builtin modality is DROPPED, not refused, and its value is never
+// validated: upstream accepts `{"pointcloud": {"count": 2, "foo": 3}}` and
+// yields `BaseDummyOptions(count=2)`. We mirror that — refusing it would refuse
+// a document the reference accepts. Only `count` is validated there.
+//
+// Refusing rather than defaulting is the point wherever upstream refuses: a
+// typo'd limit that silently became 999 is a limit that is not there, which is
+// exactly the failure this wave exists to remove.
+//
+// DEVIATION, recorded: the option keys are parsed and VALIDATED, then DROPPED.
+// They size DUMMY multimodal inputs during memory profiling, a surface we do not
+// have (see the header comment above on `limit_per_prompt`'s mapped type), and
+// only `.count` participates in get_limit_per_prompt (:335). `ignored_options`,
+// when non-null, collects "<modality>.<key>" for every option dropped — both the
+// builtin options validated above and the non-builtin extras upstream itself
+// discards — so the caller can ANNOUNCE the drop rather than let a user infer
+// that `num_frames` took effect.
+//
+// Throws std::invalid_argument, carrying the offending key/value, on anything
+// above.
+std::map<std::string, int> ParseLimitMmPerPromptJson(
+    const std::string& json, std::vector<std::string>* ignored_options);
 
 }  // namespace vllm
 

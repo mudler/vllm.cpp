@@ -140,6 +140,24 @@ chat request content-part array          [MM-SERVE-PARSE — CPU, THIS BRICK]
   #607's L1 has now ported that refusal (`BaseProcessingInfo::ValidateNumItems`);
   wiring this call site to it is L2, and this is the reason L2 exists.
 
+  **CLOSED 2026-08-14 by #607 wave L2** (`row/mm-limits-l2`), with one correction
+  to the description above that the RED run produced and that is recorded rather
+  than quietly dropped. Through the PRODUCTION seam the pre-L2 behaviour was not
+  a truncated 200: `MakeQwen3VLImageChatFn` injects one placeholder marker per
+  image part while routing only the first image, so `ExpandImagePlaceholders`
+  raised *"more image placeholders than grids"* and the client got an **HTTP 500**
+  carrying an internal message. The silent truncation is real for the
+  validate-then-build seam shape (pinned as its own leg in
+  `test_api_server.cpp`), so the issue's diagnosis — first image, `break`, no
+  refusal — stands; only its stated consequence was understated. Both cases are
+  now the same answer: `ValidateChatMmLimits` (`chat_mm.cpp:311`, ahead of the
+  unchanged first-image loop at `:313-326`) runs first, and a request over the
+  seam's declared ceiling (`Qwen3VLChatSupportedMmLimits() == {"image": 1}`,
+  the `min()` fold operand the issue asked for) is refused with
+  **HTTP 400 "At most 1 image(s) may be provided in one prompt."** Video and
+  audio parts are refused the same way rather than dropped, because a modality
+  absent from the seam's supported limits reads as limit 0 (`context.py:414-415`).
+
 ## Brick 2 (`MM-SERVE-ENGINE`) — landed
 
 - `include/vllm/v1/engine/input_processor.{h,cpp}` — `process_inputs_mm`: the

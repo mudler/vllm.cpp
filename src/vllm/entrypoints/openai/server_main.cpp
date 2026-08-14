@@ -63,6 +63,7 @@
 #include "vllm.h"
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
+#include "vllm/config/multimodal.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
 #include "vllm/entrypoints/model_loader.h"
@@ -269,6 +270,17 @@ struct Args {
   // JSON object vLLM takes (e.g. '{"method":"mtp","num_speculative_tokens":1}').
   // Empty (default) == no speculation == the inert production path (SPEC-MTP I5d).
   std::string speculative_config;
+  // ── Multimodal input limits (ENG-MM-INPUT-PIPELINE wave L2, #607) ─────────
+  // --language-model-only (arg_utils.py:555,1276,1691) and --limit-mm-per-prompt
+  // (arg_utils.py:556,1279,1692), the two flags 43 of the 157 official recipes
+  // need. They are sugar over vllm::MultiModalConfig, which is the mechanism:
+  // the flag sets every modality limit to 0, and the REFUSAL those zeros produce
+  // (BaseProcessingInfo::ValidateNumItems, #607 L1) is the observable effect.
+  //
+  // Defaults reproduce today's behaviour exactly: language_model_only false and
+  // an empty map resolve to the 999-per-modality default, so a server started
+  // without either flag refuses nothing it used to serve.
+  vllm::MultiModalConfig multimodal;
 };
 
 // ── Accepted-and-inert serve arguments (SERVE-RECIPE-ARGS, #606) ────────────
@@ -360,6 +372,8 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--reasoning-parser <name>|auto|none]\n"
          "               [--kv-transfer-config '<json>']\n"
          "               [--speculative-config '<json>']\n"
+         "               [--[no-]language-model-only]\n"
+         "               [--limit-mm-per-prompt '<json>']\n"
          "               [--version]\n"
          "  accepted for published-recipe compatibility, NO effect: "
          "--enable-auto-tool-choice, --trust-remote-code\n";
@@ -524,6 +538,53 @@ Args ParseArgs(int argc, char** argv) {
       a.kv_transfer_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--language-model-only" ||
+               flag == "--no-language-model-only") {
+      // arg_utils.py:1276 over a bool field, which _compute_kwargs gives
+      // argparse.BooleanOptionalAction (arg_utils.py:346-348) — so upstream
+      // accepts BOTH spellings and the negative one is the default. Mirrored,
+      // rather than accepting only the positive: a recipe that switches the flag
+      // off explicitly must not die on an unknown argument.
+      a.multimodal.language_model_only = flag == "--language-model-only";
+    } else if (flag == "--limit-mm-per-prompt") {
+      // arg_utils.py:1279 over a dict field => type=parse_type(json.loads)
+      // (arg_utils.py:379-381 — the plain-dict branch, NOT the
+      // `union_dict_and_str` one at :374-378, which needs a `str` arm or a
+      // non-builtin hint that `dict[str, BaseDummyOptions]` does not have):
+      // the value is a JSON OBJECT. Parsed HERE, before
+      // the multi-GB model load, for the same reason the parser dialects are:
+      // a malformed limit costs a second rather than a full load, and it is
+      // REFUSED rather than defaulted — a typo that silently became 999 is a
+      // limit that is not there.
+      //
+      // NAMED RESIDUAL, and it is not this flag's: upstream's dotted spelling
+      // (`--limit-mm-per-prompt.image 2`) is a FlexibleArgumentParser feature
+      // that rewrites any dotted key into the JSON form before argparse sees it
+      // (argparse_utils.py:389-425). It applies equally to --kv-transfer-config
+      // and --speculative-config, which this server also takes as JSON only, so
+      // adding it for one flag would be the bespoke path. It belongs to a parser
+      // brick covering all three.
+      const std::string value = NextArg(argc, argv, i, argv[0]);
+      std::vector<std::string> ignored_options;
+      try {
+        a.multimodal.limit_per_prompt =
+            vllm::ParseLimitMmPerPromptJson(value, &ignored_options);
+      } catch (const std::exception& e) {
+        std::cerr << "server: --limit-mm-per-prompt: " << e.what() << "\n";
+        Usage(argv[0], 2);
+      }
+      // Accepting is ANNOUNCED (the kAcceptedInertArgs rule, applied to a
+      // partially-inert VALUE): the dummy-profiling options are validated and
+      // then dropped, so a reader learns `num_frames` did nothing here instead
+      // of inferring that it worked.
+      for (const std::string& key : ignored_options) {
+        std::cerr << "server: --limit-mm-per-prompt " << key
+                  << " accepted and IGNORED: only the modality's count is read "
+                     "here. A key upstream DECLARES sizes dummy inputs for "
+                     "memory profiling, a surface this engine does not have; a "
+                     "key it does not declare is one its BaseDummyOptions "
+                     "fallback drops too\n";
+      }
     } else if (flag == "--version") {
       std::cout << "vllm.cpp " << vllm::Version()
                 << " c-abi=" << VLLM_ABI_VERSION << "\n";
@@ -654,6 +715,37 @@ int VllmServerMain(int argc, char** argv) {
                 << " max_log_len=" << log_cfg.max_log_len
                 << " debug_stages=" << (log_cfg.debug_stages ? "ON" : "OFF")
                 << "\n";
+    }
+
+    // The RESOLVED multimodal limits, printed before the model load so the
+    // startup log records what the two flags actually produced rather than what
+    // was typed. GetLimitPerPrompt is the single accessor every consumer asks
+    // (multimodal.py:321-336), so printing through it is what makes the flag's
+    // PRECEDENCE visible: --language-model-only alongside an explicit
+    // `image=4` prints image=0, because the flag is checked before the map.
+    {
+      std::cerr << "server: multimodal limits language-model-only="
+                << (args.multimodal.language_model_only ? "ON" : "OFF");
+      // Print every modality the user named, plus the ones the flag zeroes even
+      // though nobody named them, so "--language-model-only" is not a line that
+      // says only "ON" with no consequence next to it.
+      std::vector<std::string> shown;
+      for (const auto& [modality, unused] : args.multimodal.limit_per_prompt) {
+        (void)unused;
+        shown.push_back(modality);
+      }
+      if (shown.empty() && args.multimodal.language_model_only) {
+        shown = {"audio", "image", "video"};
+      }
+      for (const std::string& modality : shown) {
+        std::cerr << " " << modality << "="
+                  << args.multimodal.GetLimitPerPrompt(modality);
+      }
+      if (shown.empty()) {
+        std::cerr << " (no per-modality limit set; default "
+                  << vllm::kDefaultLimitPerPrompt << ")";
+      }
+      std::cerr << "\n";
     }
 
     const fs::path dir = NativeUtf8Path(args.model_dir);
@@ -805,6 +897,10 @@ int VllmServerMain(int argc, char** argv) {
     engine_params.max_num_seqs = args.max_num_seqs;
     engine_params.max_num_batched_tokens = args.max_num_batched_tokens;
     engine_params.enable_prefix_caching = args.enable_prefix_caching;
+    // #607 L2: the multimodal input limits go onto the ENGINE, not into a
+    // server-local variable, so the C ABI and this server resolve one limit the
+    // same way and the chat seam can borrow the engine's copy.
+    engine_params.multimodal = args.multimodal;
     // --device: explicit device selection (ARCH-ONE-SURFACE ROW 8). "auto"
     // (default) keeps the accelerator-first probe byte-identical; an unknown
     // name throws HERE (a startup error), and an explicitly named ABSENT
@@ -967,6 +1063,19 @@ int VllmServerMain(int argc, char** argv) {
     // tower + merge + MRoPE/DeepStack on the GPU worker consuming
     // Request.mm_features) is the remaining MM-SERVE-E2E residual — the engine
     // model runner has no mm-forward path yet. Kept alive for the server loop.
+    //
+    // #607 L2 / #686: the seam now REFUSES rather than truncates. It is
+    // constructed with a BaseProcessingInfo folding the engine's limits
+    // (loaded->mm_config(), where --limit-mm-per-prompt / --language-model-only
+    // landed) against this seam's own ceiling (Qwen3VLChatSupportedMmLimits —
+    // one image, no video, no audio), so a three-image request is answered with
+    // HTTP 400 "At most 1 image(s) may be provided in one prompt." instead of
+    // being served with its first image. Declared AFTER `loaded` so it is
+    // destroyed BEFORE the MultiModalConfig it references. It shares
+    // `mm_image_proc`'s lifetime shape exactly — both are borrowed by the
+    // closure `chat` holds and both outlive the server loop, which is the only
+    // time the closure runs.
+    std::unique_ptr<vllm::multimodal::BaseProcessingInfo> mm_proc_info;
     std::unique_ptr<vllm::multimodal::Qwen3VLImageProcessor> mm_image_proc;
     const std::string preprocessor_config_path =
         PathUtf8(dir / "preprocessor_config.json");
@@ -1002,8 +1111,16 @@ int VllmServerMain(int argc, char** argv) {
               "multimodal image: container-format decode (PNG/JPEG -> RGB) is a "
               "named MM-SERVE residual; supply raw RGB (image/x-raw-rgb)");
         };
+        mm_proc_info =
+            std::make_unique<vllm::multimodal::BaseProcessingInfo>(
+                loaded->mm_config(), oai::Qwen3VLChatSupportedMmLimits());
         chat.set_multimodal_chat_fn(oai::MakeQwen3VLImageChatFn(
-            *mm_image_proc, tokenizer, chat_prompt_fn, std::move(codec)));
+            *mm_image_proc, tokenizer, chat_prompt_fn, std::move(codec),
+            *mm_proc_info));
+        for (const auto& [modality, limit] : mm_proc_info->AllowedMmLimits()) {
+          std::cerr << "server: multimodal limit " << modality << "=" << limit
+                    << " (over the request limit for this seam)\n";
+        }
         std::cerr << "server: multimodal image seam wired (Qwen3-VL processor "
                      "from "
                   << preprocessor_config_path << ")\n";

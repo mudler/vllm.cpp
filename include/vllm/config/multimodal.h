@@ -39,6 +39,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 namespace vllm {
 
@@ -86,6 +87,48 @@ struct MultiModalConfig {
     return it->second;
   }
 };
+
+// Parse the value of `--limit-mm-per-prompt` (arg_utils.py:556,1279) / the C-ABI
+// `vllm_model_params.limit_mm_per_prompt` into `limit_per_prompt`.
+//
+// Ported from `MultiModalConfig._validate_limit_per_prompt`
+// (multimodal.py:212-236) together with the DummyOptions dataclasses it feeds
+// (:17-43). Upstream reaches this through argparse `type=parse_type(json.loads)`
+// (_compute_kwargs, arg_utils.py:375-377), so the flag's value is a JSON OBJECT
+// and every spelling below is the object's, not the flag's:
+//
+//   * the LEGACY format, count only — {"image": 16, "video": 2} (:87-88,220-222,
+//     which rewrites a bare int to {"count": <int>});
+//   * the CONFIGURABLE format — {"video": {"count": 1, "num_frames": 32,
+//     "width": 512, "height": 512}} (:90-92,224-232);
+//   * the two MIXED in one object (:94-96).
+//
+// Refusals, all of them upstream's own, none of them invented here:
+//   * a non-object document, or a value that is neither an int nor an object —
+//     upstream's json.loads/pydantic pair rejects both;
+//   * `count` absent-and-not-an-int, or NEGATIVE — `count: int = Field(999,
+//     ge=0)` (:20);
+//   * an option key the modality does not define, or an option <= 0 — every
+//     DummyOptions dataclass is `extra="forbid"` with `Field(None, gt=0)`
+//     (:23-43). video takes num_frames/width/height, image width/height, audio
+//     length, and any OTHER modality takes `count` alone (BaseDummyOptions,
+//     :233-234).
+// Refusing rather than defaulting is the point: a typo'd limit that silently
+// became 999 is a limit that is not there, which is exactly the failure this
+// wave exists to remove.
+//
+// DEVIATION, recorded: the option keys are parsed and VALIDATED, then DROPPED.
+// They size DUMMY multimodal inputs during memory profiling, a surface we do not
+// have (see the header comment above on `limit_per_prompt`'s mapped type), and
+// only `.count` participates in get_limit_per_prompt (:335). `ignored_options`,
+// when non-null, collects "<modality>.<key>" for every option dropped, so the
+// caller can ANNOUNCE the drop rather than let a user infer that `num_frames`
+// took effect.
+//
+// Throws std::invalid_argument, carrying the offending key/value, on anything
+// above.
+std::map<std::string, int> ParseLimitMmPerPromptJson(
+    const std::string& json, std::vector<std::string>* ignored_options);
 
 }  // namespace vllm
 

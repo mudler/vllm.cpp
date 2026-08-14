@@ -167,7 +167,34 @@ extern "C" {
  * stays NULL (detect), n_extras stays 0, `partition` keeps its exact v12
  * meaning, and every v12 status/message contract is unchanged (the
  * text-checkpoint refusal still names vllm_engine_load). */
-#define VLLM_ABI_VERSION 18
+/* v19 — MULTIMODAL INPUT LIMITS on vllm_model_params (ENG-MM-INPUT-PIPELINE
+ * wave L2, issue #607). Two APPENDED fields mirroring vLLM's MultiModalConfig
+ * (vllm/config/multimodal.py:78,81) as its own two serve flags expose it
+ * (vllm/engine/arg_utils.py:555-556,1276-1279,1691-1692):
+ *   - vllm_model_params.language_model_only — the flag whose name misleads and
+ *     whose docstring does not: it "disables all multimodal inputs by setting
+ *     all modality limits to 0" (multimodal.py:78-80). It is sugar; the limits
+ *     are the mechanism.
+ *   - vllm_model_params.limit_mm_per_prompt — the per-modality input-count
+ *     limits, as the SAME JSON object the flag takes ('{"image": 2,
+ *     "video": 0}', or the option form '{"video": {"count": 1}}'), following
+ *     the v9 precedent that a dict-valued vLLM flag crosses this ABI as its own
+ *     JSON rather than as a fixed struct of modalities the ABI would then owe
+ *     forever. A malformed document, an unknown per-modality option, or a
+ *     negative count fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT
+ *     rather than defaulting — mirroring the pydantic validation upstream does
+ *     at parse time (multimodal.py:17-43,212-236).
+ * Both are ENFORCED, not recorded: a modality's limit is what
+ * BaseProcessingInfo::ValidateNumItems refuses against, so an engine loaded
+ * with language_model_only answers a multimodal request with
+ * "At most 0 image(s) may be provided in one prompt." rather than serving it.
+ * The memory win upstream also gets from zero limits (skipping the vision tower
+ * weights, interfaces.py:293) is NOT in this version — it is wave L3, and until
+ * it lands and is MEASURED this field must not be described as freeing VRAM.
+ * Appended at the END of vllm_model_params, so a zero-initialized v18 struct is
+ * byte-identical: language_model_only 0 (off) and limit_mm_per_prompt NULL (no
+ * limits configured => the 999-per-modality default, multimodal.py:331-333). */
+#define VLLM_ABI_VERSION 19
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -359,6 +386,38 @@ typedef struct vllm_model_params {
    * (cache.py:182,189). 0 => unset. A budget smaller than a single KV block
    * fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT. */
   int64_t kv_cache_memory_bytes;
+  /* ── Multimodal input limits (ABI v19) ────────────────────────────────────
+   * The mirror of vLLM's --language-model-only / --limit-mm-per-prompt
+   * (arg_utils.py:555-556,1276-1279,1691-1692) over MultiModalConfig
+   * (multimodal.py:78,81). These are ONE mechanism, not two: the flag is
+   * defined as "disables all multimodal inputs by setting all modality limits
+   * to 0" (:78-80), so it is checked BEFORE the map and an explicit non-zero
+   * entry does not survive it (get_limit_per_prompt, :321-336).
+   *
+   * language_model_only: 0 => off (the zero value, byte-identical to pre-v19);
+   * nonzero => every modality limit becomes 0, which makes the engine REFUSE
+   * every multimodal request with "At most 0 <modality>(s) may be provided in
+   * one prompt." That refusal is the flag's main observable effect and it is
+   * live at v19; the tower-skip memory win it also produces upstream is not
+   * (wave L3). */
+  int32_t language_model_only;
+  /* limit_mm_per_prompt: the per-modality maximum input-item count, as the same
+   * JSON object the flag takes. NULL/empty (the zero value) => no limit
+   * configured => 999 per modality (:331-333), NOT zero — an empty map is "no
+   * limits", not "nothing allowed". Accepted spellings, all upstream's own
+   * (:87-96,212-236):
+   *     {"image": 16, "video": 2}                        (count only)
+   *     {"video": {"count": 1, "num_frames": 32}}        (with options)
+   *     {"image": 16, "video": {"count": 1}}             (mixed)
+   * The option keys are validated exactly as upstream's per-modality
+   * dataclasses do (video: num_frames/width/height, image: width/height, audio:
+   * length; each an integer > 0; anything else is refused, `extra="forbid"`)
+   * and then DROPPED: they size dummy inputs for memory profiling, which this
+   * engine does not do, and only `count` feeds the limit (:335).
+   * Invalid JSON, a non-object document, a negative count, an unknown option,
+   * or a non-integer value fails vllm_engine_load with
+   * VLLM_ERR_INVALID_ARGUMENT. Borrowed for the call only. */
+  const char* limit_mm_per_prompt;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────

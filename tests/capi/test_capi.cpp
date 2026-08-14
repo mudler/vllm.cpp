@@ -30,6 +30,7 @@
 
 #include "capi/engine_handle.h"
 #include "vllm/config/device.h"
+#include "vllm/config/multimodal.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/platforms/interface.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
@@ -1242,6 +1243,90 @@ TEST_CASE("capi: enable_jump_forward=on reaches the engine; default is inert (AB
     p.enable_jump_forward = false;
     LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
     CHECK(e.jump_forward_enabled() == false);
+  }
+}
+
+// ── ABI v19: the multimodal input limits (#607 wave L2) ────────────────────
+//
+// Ported from vllm/config/multimodal.py:78,81,212-236,321-336 and the two flags
+// that set them (vllm/engine/arg_utils.py:555-556,1276-1279,1691-1692) @
+// 5559679229bc. Two fields, and the load-bearing property is that they and the
+// SERVER FLAGS land on ONE config object — EngineParams::multimodal ->
+// LoadedEngine::mm_config() — so the two entry points cannot resolve a limit
+// differently.
+TEST_CASE("capi: multimodal input limits (ABI v19)") {
+  // The zero values keep a pre-v19 caller byte-identical: the flag off and NO
+  // limits configured, which resolves to 999 per modality (multimodal.py:331-333)
+  // — NOT 0. An empty map is "no limits", not "nothing allowed".
+  vllm_model_params def = vllm_model_params_default();
+  CHECK(def.language_model_only == 0);
+  CHECK(def.limit_mm_per_prompt == nullptr);
+
+  // A well-formed limit reaches model load (which then fails on the missing
+  // directory) rather than being rejected as a caller error.
+  vllm_model_params ok = vllm_model_params_default();
+  ok.model_path = "/nonexistent/vllm-cpp/model/dir";
+  ok.limit_mm_per_prompt = "{\"image\": 2, \"video\": 0}";
+  vllm_engine* eng = nullptr;
+  CHECK(vllm_engine_load(&ok, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+
+  // ...and so does the flag, which needs no value at all.
+  vllm_model_params lm_only = vllm_model_params_default();
+  lm_only.model_path = "/nonexistent/vllm-cpp/model/dir";
+  lm_only.language_model_only = 1;
+  vllm_engine* eng_lm = nullptr;
+  CHECK(vllm_engine_load(&lm_only, &eng_lm) == VLLM_ERR_MODEL_LOAD);
+
+  // Every upstream validation is a CALLER error here, reported before any model
+  // I/O — never a silent default to 999, which would leave the caller believing
+  // they set a limit they did not.
+  for (const char* bad_value :
+       {"{not json", "[1,2]", "{\"image\": \"two\"}", "{\"image\": -1}",
+        "{\"video\": {\"fps\": 2}}", "{\"video\": {\"num_frames\": 0}}"}) {
+    CAPTURE(bad_value);
+    vllm_model_params bad = vllm_model_params_default();
+    bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+    bad.limit_mm_per_prompt = bad_value;
+    vllm_engine* eng_bad = reinterpret_cast<vllm_engine*>(0x1);
+    CHECK(vllm_engine_load(&bad, &eng_bad) == VLLM_ERR_INVALID_ARGUMENT);
+    CHECK(eng_bad == nullptr);
+  }
+  CHECK(std::string(vllm_last_error()).find("limit_mm_per_prompt") !=
+        std::string::npos);
+}
+
+TEST_CASE("capi: EngineParams::multimodal reaches LoadedEngine::mm_config()") {
+  // The hop the ABI field and the two server flags SHARE. Without it the flags
+  // would be recorded on a struct nobody reads, which is exactly the
+  // "accepted and inert" failure the limits wave exists to avoid.
+  const HfConfig c = MakeConfig();
+  {
+    EngineParams p = SyntheticParams();
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    // Default: no limits configured => 999 per modality, the pre-L2 behaviour.
+    CHECK(e.mm_config().GetLimitPerPrompt("image") ==
+          vllm::kDefaultLimitPerPrompt);
+  }
+  {
+    EngineParams p = SyntheticParams();
+    p.multimodal.limit_per_prompt = {{"image", 2}};
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.mm_config().GetLimitPerPrompt("image") == 2);
+    // A modality nobody named keeps the default — an explicit limit for one
+    // modality is not a global switch.
+    CHECK(e.mm_config().GetLimitPerPrompt("video") ==
+          vllm::kDefaultLimitPerPrompt);
+  }
+  {
+    // The precedence that matters (multimodal.py:326-327): the flag is checked
+    // BEFORE the map, so an explicit non-zero entry does not survive it.
+    EngineParams p = SyntheticParams();
+    p.multimodal.language_model_only = true;
+    p.multimodal.limit_per_prompt = {{"image", 4}};
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.mm_config().GetLimitPerPrompt("image") == 0);
+    CHECK(e.mm_config().GetLimitPerPrompt("video") == 0);
   }
 }
 

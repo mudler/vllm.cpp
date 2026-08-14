@@ -186,7 +186,7 @@ configs, token-for-token the same output. Switching to it should be boring. Ever
 you get on top, most of it borrowed from whichever engine does it best:
 
 - **One 66 MiB binary instead of a 9.1 GiB install.** A flat, exception-free, llama.cpp-style C ABI
-  ([`include/vllm.h`](include/vllm.h), ABI v18, 36 functions) for C, C++, Go, or Rust. No Python
+  ([`include/vllm.h`](include/vllm.h), ABI v19, 36 functions) for C, C++, Go, or Rust. No Python
   interpreter in the process.
 - **GGUF as a first-class citizen.** Load the same quantized files llama.cpp uses, and on CPU
   **compute directly on the compressed blocks** (Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) with no BF16
@@ -385,7 +385,7 @@ behind a model gallery, multi-model serving, the full OpenAI API surface, auth, 
 ## Use it as a library (C API)
 
 Link `libvllm` and include [`include/vllm.h`](include/vllm.h): a flat, exception-free,
-llama.cpp-style C ABI (`VLLM_ABI_VERSION 18`, 36 exported functions) suitable for `dlopen` / FFI.
+llama.cpp-style C ABI (`VLLM_ABI_VERSION 19`, 36 exported functions) suitable for `dlopen` / FFI.
 
 ```c
 vllm_model_params mp = vllm_model_params_default();

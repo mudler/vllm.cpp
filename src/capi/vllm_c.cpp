@@ -30,6 +30,7 @@
 #include "capi/chat_prompt.h"
 #include "capi/engine_handle.h"
 #include "vllm/config/kv_transfer.h"   // ParseKVTransferConfigJson (ABI v9)
+#include "vllm/config/multimodal.h"    // ParseLimitMmPerPromptJson (ABI v19)
 #include "vllm/config/scheduler.h"     // SchedulerPolicyFromString (ABI v9)
 #include "vllm/v1/kv_offload/kv_connector.h"  // KVConnectorFactory (ABI v9)
 #include "vllm/entrypoints/chat_template.h"
@@ -502,6 +503,8 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.device = 0;  // 0 => auto: the accelerator-first probe (ABI v14).
   p.gpu_memory_utilization = 0.92;  // vLLM default fraction (ABI v16).
   p.kv_cache_memory_bytes = 0;      // 0 => unset (ABI v16).
+  p.language_model_only = 0;        // 0 => off; limits stay at 999 (ABI v19).
+  p.limit_mm_per_prompt = nullptr;  // NULL => no limits configured (ABI v19).
   return p;
 }
 
@@ -603,6 +606,19 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
           throw std::invalid_argument(msg);
         }
         ep.kv_transfer_config = std::move(kv_cfg);
+      }
+      // ABI v19: the multimodal input limits (#607 L2). Parsed HERE so a
+      // malformed document is a CALLER error reported before any model I/O,
+      // exactly as the server refuses --limit-mm-per-prompt before the load.
+      // The flag half is deliberately not a second knob: language_model_only
+      // zeroes every limit inside GetLimitPerPrompt, ahead of the map
+      // (multimodal.py:326-327), so setting both is well-defined and the flag
+      // wins — mirrored rather than reimplemented here.
+      ep.multimodal.language_model_only = params->language_model_only != 0;
+      if (params->limit_mm_per_prompt != nullptr &&
+          params->limit_mm_per_prompt[0] != '\0') {
+        ep.multimodal.limit_per_prompt = vllm::ParseLimitMmPerPromptJson(
+            params->limit_mm_per_prompt, /*ignored_options=*/nullptr);
       }
     } catch (const std::invalid_argument& e) {
       SetError(std::string("vllm_engine_load: ") + e.what());

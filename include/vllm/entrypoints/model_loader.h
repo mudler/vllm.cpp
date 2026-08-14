@@ -17,6 +17,7 @@
 
 #include "vllm/config/device.h"
 #include "vllm/config/kv_transfer.h"
+#include "vllm/config/multimodal.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/config/speculative.h"
 #include "vllm/model_executor/models/model_registry.h"
@@ -168,6 +169,19 @@ struct EngineParams {
   // vllm_model_params.device (ABI v14: 0=auto, 1=cpu, 2=cuda) and on the
   // server as --device.
   vllm::Device device = vllm::Device::kAuto;
+
+  // ENG-MM-INPUT-PIPELINE wave L2 (#607): the per-modality multimodal input
+  // limits, mirroring vLLM threading MultiModalConfig onto the model config
+  // (arg_utils.py:1691-1692 -> ModelConfig -> multimodal_config). Exposed on the
+  // server as --language-model-only / --limit-mm-per-prompt and on the C ABI as
+  // vllm_model_params.language_model_only / .limit_mm_per_prompt (ABI v19).
+  //
+  // The DEFAULT is the pre-L2 behaviour byte for byte: an empty map with the
+  // flag off resolves to 999 per modality (multimodal.py:331-333), which no
+  // real request reaches. It is deliberately a VALUE and not an optional — a
+  // "no config" state distinct from "the default config" would be a second
+  // spelling of the same thing, and upstream has one.
+  vllm::MultiModalConfig multimodal;
 };
 
 // The shared queue-selection seam used by every LoadedEngine construction
@@ -271,6 +285,13 @@ class LoadedEngine {
       std::optional<vt::DeviceType> named_platform_type);
 
   vllm::v1::LLMEngine& engine() { return engine_; }
+  // The multimodal input limits this engine was loaded with (#607 L2). ONE
+  // config object per engine, whether it was set by the server's
+  // --language-model-only / --limit-mm-per-prompt or by the C ABI's
+  // vllm_model_params, so the two entry points cannot resolve a limit
+  // differently. It outlives every consumer that borrows it (declared before
+  // input_processor_), which is what lets the OpenAI chat seam hold a reference.
+  const vllm::MultiModalConfig& mm_config() const { return mm_config_; }
   // ARCH-ONE-SURFACE ROW 6: whether the loaded model registration declares the
   // POOLING task class (is_pooling_model). The entrypoints dispatch BY TASK on
   // this — text-generation refuses on a pooling engine (naming vllm_embed /
@@ -415,6 +436,11 @@ class LoadedEngine {
   // the ctor body once runner_ geometry is known; see model_loader.cpp.
   std::unique_ptr<vllm::v1::kv_offload::KVConnector> kv_connector_;
   tok::Tokenizer tokenizer_;
+  // #607 L2: the engine's multimodal input limits, copied from EngineParams.
+  // Declared here — before input_processor_ and before anything that can borrow
+  // it — because the OpenAI chat seam holds a reference for the process
+  // lifetime. A default-constructed one is the pre-L2 behaviour exactly.
+  vllm::MultiModalConfig mm_config_;
   // kv_cfg_ is declared BEFORE max_model_len_: the serving length is resolved
   // AGAINST the KV pool (ResolveMaxModelLen auto-fits it down to what the pool
   // holds, or refuses an explicit --max-model-len the pool cannot serve), and

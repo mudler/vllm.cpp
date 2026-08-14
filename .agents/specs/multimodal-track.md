@@ -313,6 +313,93 @@ comparing the two arms must set the flag on both sides or state that it did not.
 - **L2** — `--limit-mm-per-prompt` and `--language-model-only` serve flags plus
   the C-ABI field, over L1. This is the point at which the 43 recipes stop
   aborting.
+
+  **LANDED 2026-08-14 (#607, #686, `row/mm-limits-l2`).** Three surfaces, and
+  the third is the one that makes the other two mean anything:
+
+  1. **The flags** (`server_main.cpp`). `--language-model-only` /
+     `--no-language-model-only`, mirroring `arg_utils.py:555,1276,1691` — both
+     spellings, because `_compute_kwargs` gives a bool field
+     `argparse.BooleanOptionalAction` (`arg_utils.py:346-348`) and a recipe that
+     turns the flag off explicitly must not die on an unknown argument.
+     `--limit-mm-per-prompt '<json>'`, mirroring `arg_utils.py:556,1279,1692`,
+     whose dict type resolves to `type=parse_type(json.loads)`
+     (`arg_utils.py:375-377`) — so the value is a JSON object.
+     `ParseLimitMmPerPromptJson` (`src/vllm/config/multimodal.cpp`) ports
+     `_validate_limit_per_prompt` (`multimodal.py:212-236`) and the DummyOptions
+     dataclasses behind it (`:17-43`): the legacy count-only, the configurable
+     `{"count": N, …}` and the mixed spellings all parse; a non-object document,
+     a negative count (`count: int = Field(999, ge=0)`, `:20`), an unknown
+     per-modality option (`extra="forbid"`) or a non-positive one
+     (`Field(None, gt=0)`) is REFUSED before the model load rather than
+     defaulted, because a mistyped limit that silently became 999 is a limit
+     that is not there. The profiling options are validated and then dropped
+     (only `.count` feeds `get_limit_per_prompt`, `:335`) and the drop is
+     ANNOUNCED per key. **NAMED RESIDUAL:** upstream's dotted spelling
+     (`--limit-mm-per-prompt.image 2`) is a `FlexibleArgumentParser` feature
+     (`argparse_utils.py:389-425`) that applies equally to `--kv-transfer-config`
+     and `--speculative-config`, which this server also takes as JSON only.
+     Adding it for one flag would be the bespoke path; it belongs to a parser
+     brick covering all three.
+  2. **The C-ABI field** — `vllm_model_params.language_model_only` +
+     `.limit_mm_per_prompt`, `VLLM_ABI_VERSION` 18 → **19**, appended so a
+     zero-initialised v18 struct is byte-identical. `limit_mm_per_prompt` is the
+     same JSON object the flag takes, following the v9 `kv_transfer_config`
+     precedent that a dict-valued vLLM flag crosses the ABI as its own JSON
+     rather than as a fixed struct of modalities the ABI would then owe forever.
+     Malformed input fails `vllm_engine_load` with `VLLM_ERR_INVALID_ARGUMENT`.
+     Both land on `EngineParams::multimodal` → `LoadedEngine::mm_config()`, so
+     the server flags and the ABI resolve ONE config object per engine and
+     cannot drift.
+  3. **The call site — this is what L2 is for.** `chat_mm.cpp` now calls
+     `ValidateChatMmLimits` (the port of the `chat_utils.py:648-662` tracker)
+     as step 0 of `MakeQwen3VLImageChatFn`, over a `BaseProcessingInfo` folding
+     the engine's config with the seam's own declared ceiling,
+     `Qwen3VLChatSupportedMmLimits() == {"image": 1}`. That declaration is the
+     answer to the open question #686 left ("the model's own supported limit —
+     today nothing declares one"): this seam locates a single image part and
+     handles no video or audio, so its honest ceiling is one image and every
+     other modality is absent, which `context.py:414-415` reads as limit 0. A
+     user limit can only LOWER it (the fold is a `min`), so
+     `--limit-mm-per-prompt image=99` still refuses the second image, and the
+     refusal then carries no `--limit-mm-per-prompt` hint because raising the
+     user's limit would not help.
+
+  **#686 is CLOSED by this.** A three-image request is answered
+  `400 BadRequestError "At most 1 image(s) may be provided in one prompt."`
+  instead of being served with its first image. One correction to the issue's
+  own text, found by the RED run and recorded rather than quietly fixed: against
+  the production seam the pre-L2 behaviour was not the truncated 200 the issue
+  describes but an **HTTP 500** — `MakeQwen3VLImageChatFn` injects one
+  placeholder marker per image part while routing only the first image, so
+  `ExpandImagePlaceholders` raised "more image placeholders than grids" and the
+  client saw a server fault carrying an internal message. The truncated 200 is
+  real for the validate-then-build shape and is pinned as its own leg. Both are
+  wrong the same way — neither is upstream's refusal — so the issue's diagnosis
+  stands and only its consequence was understated.
+
+  **Gates** (aarch64, the `build-test-cpu-arm64` lane; `-DVLLM_CPP_CUDA=OFF`):
+  `test_chat_mm` 11/11 (126 assertions), `test_serve_mm_limits` 10/10 (101),
+  `test_openai_api_server` 56/56 (638). RED before the change: `test_chat_mm`
+  2 cases failing (`CHECK_THROWS_AS ... threw a DIFFERENT exception: "Expand
+  ImagePlaceholders: more image placeholders than grids"` and `FATAL ERROR:
+  expected --language-model-only to refuse an image request`), and the HTTP legs
+  failing `CHECK(500 == 400)`, `CHECK("InternalServerError" == BadRequestError)`
+  and `CHECK(200 == 400)` — the last of those being the truncated 200 itself.
+
+  **What L2 does NOT do, so L3 knows what it inherits.** No memory claim is made
+  or implied: nothing gates tower CONSTRUCTION on the limits, so
+  `--language-model-only` today refuses multimodal requests and frees nothing.
+  That is L3 and it is owed with a MEASURED RSS reduction. Separately owed and
+  named rather than assumed: the SECOND call site,
+  `process_inputs_mm` (`input_processor.cpp:321,352`, upstream's
+  `context.py:461`), is still unwired. It needs the per-model
+  `get_supported_mm_limits()` hook that L1 already recorded as absent (the models
+  that would implement it are the M2 towers); wiring it before that hook exists
+  would mean inventing a supported-limits source inside the engine, which is the
+  bespoke path the mirror rule forbids. The chat call site is wired because it
+  HAS a concrete source — the seam's own implemented arm. Every path the OpenAI
+  server can reach today goes through the wired one.
 - **L3** — the tower skip: construct-without-initialising when every limit is 0,
   gated on **measured** RSS reduction against a multimodal checkpoint, plus
   token-exactness of the text path with and without the flag.

@@ -21,7 +21,7 @@ Explicitly NOT in scope, each for its own reason:
 
 | Excluded | Why |
 |---|---|
-| `--language-model-only` | a real capability gap, tracked as [#607](https://github.com/mudler/vllm.cpp/issues/607) — accepting it would hide missing behaviour |
+| `--language-model-only` | a real capability gap, tracked as [#607](https://github.com/mudler/vllm.cpp/issues/607) — accepting it would hide missing behaviour. **Resolved the right way 2026-08-14**: #607 wave L2 IMPLEMENTED it (and `--limit-mm-per-prompt`) rather than adding it here, so it is a real flag with real enforcement and `kAcceptedInertArgs` still holds only genuine no-ops |
 | the `--tool-call-parser` default (`hermes` vs upstream `None`) | pre-existing divergence, worth its own issue; changing it here would mix a behaviour change into a parsing change |
 | `--tensor-parallel-size`, the EP flags, `--mm-encoder-tp-mode` | inert only because the CAPABILITY is missing; they must keep aborting |
 | any change to a forward pass, kernel, or model path | none is reached — this is argument parsing |

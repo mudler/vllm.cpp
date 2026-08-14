@@ -772,6 +772,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/indextts2.cpp
   src/vllm/model_executor/models/campplus.cpp
   src/vllm/model_executor/models/w2vbert.cpp
+  src/vllm/model_executor/models/fvq.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae_device.cpp
   src/vllm/model_executor/models/minimax_h3_vae_cnn.cpp

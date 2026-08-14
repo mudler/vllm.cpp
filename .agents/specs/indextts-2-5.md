@@ -353,6 +353,50 @@ The full manifest is 22 files: `gpt.pth`, `codec.pth`, `s2mel.pth`,
 `wav2vec2bert_stats.pt`, `feat1.pt`, `feat2.pt`, the tiktoken vocabulary, the
 Qwen emotion directory, and `config.yaml`.
 
+### The reference-audio path, read from the running code
+
+`infer_v2_5.py:280-295` and `:630`. Three facts here each produce a model that
+runs and sounds wrong, and none is visible from the architecture:
+
+**The features come from HIDDEN STATE 17, not the final layer.**
+`get_emb` takes `vq_emb.hidden_states[17]` out of `Wav2Vec2BertModel`. A port
+that used the encoder's output would get features of the right shape from the
+right model, conditioned on the wrong representation. Our `w2vbert::EncoderStack`
+returns the final state, so consuming it for this path needs an intermediate tap.
+
+**They are then normalized by STORED statistics**, not per-utterance ones:
+`feat = (feat - semantic_mean) / semantic_std`, where both come from
+`wav2vec2bert_stats.pt` in the checkpoint (`w2v_stat` in `config.yaml`). Using
+per-utterance statistics is the natural assumption and is wrong.
+
+**The feature extractor is KALDI-style, and this tree's existing one is not.**
+`SeamlessM4TFeatureExtractor` is fully specified by
+`transformers/models/seamless_m4t/feature_extraction_seamless_m4t.py`:
+
+| Parameter | Value |
+|---|---|
+| pre-scale | waveform x 2^15 (Kaldi expects 16-bit integers) |
+| window | `povey`, non-periodic, length 400 |
+| frame / hop / FFT | 400 / 160 / 512 |
+| preemphasis | 0.97, with `remove_dc_offset` |
+| power, log | 2.0, `log`, `mel_floor` 1.192092955078125e-07 |
+| mel bins | 80, then a **stride-2 stack** giving 160 columns |
+
+Measured: 4000 samples at 16 kHz produce 12 frames of 160.
+
+That differs from `Ltx2WaveformToLogMel`, which is the Slaney/torchaudio kind
+with no preemphasis and no DC removal. Reusing it would be the mistake this spec
+elsewhere warns about -- a gate that passes because both arms call the same
+helper proves consistency, not correctness -- so the extractor is a NEW unit and
+remains **unported**.
+
+**What IS ported on this path**: the w2v-bert Conformer itself
+(`w2vbert::FeatureProjection` and `w2vbert::EncoderStack`, including the
+relative-key attention, the causal left-only conv pad and the absent final
+norm), the semantic codec encoder and quantizer (`codec_encoder`, `fvq`), and
+CAMPPlus. What is missing between a WAV file and those is exactly the feature
+extractor above.
+
 ## Work breakdown
 
 | W | Work | Depends on |
@@ -402,19 +446,29 @@ behind the pin.
 ## Now
 
 `INVENTORIED`, blocked on [#633](https://github.com/mudler/vllm.cpp/issues/633)
-for any parity or e2e claim.
+for any parity or e2e claim. **There is no render yet, and no route.**
 
-**Landed** (PR #681): W1, the shared 1-D vocoder core in `vllm::vocoder1d` with a
-structural anti-fork guard and hand-computed numerics; W2, the GPT-2 backbone
-host reference, token-exact against upstream at the parity pin and proven
-load-bearing by three mutations.
+**Landed.** W1 the shared 1-D vocoder core; W2 the GPT-2 talker backbone; W6a the
+`SpeechEngine` seam and family refusal; CAMPPlus, w2v-bert's Conformer, the
+semantic codec quantizer and encoder, Vocos, the length regulator, the CFM
+scaffolding and adaLN; the S2Mel DiT complete front to tail (front end, block
+stack with U-Net skips, wavenet final layer); BigVGAN; the offline checkpoint
+converter; and loaders that bind the real `s2mel.safetensors` and
+`gpt.safetensors`.
 
-**Next, in forced order:** W3 CAMPPlus (upstream of the talker, see the inventory
-above), then the w2v-bert-2.0 Conformer and EnhancedCodec, then W4 S2Mel, then W5
-compose. W6a/W6b (the `SpeechEngine` seam and ABI v19) need no oracle and can be
-taken in parallel by a second claim.
+**Two stages run on the REAL shipped weights**: the S2Mel DiT tail (80 x 8 mel,
+values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
+[-1.25, 0.84]).
 
-**Groundwork done for whoever picks it up:** the reference implementation is
-cloned and its component sizes measured, the NAS is mounted, and
-`huggingface.co/IndexTeam/IndexTTS-2.5` resolves. What is NOT done: the ~6 GB
-checkpoint is not downloaded, and no golden generator exists past W2.
+**Not started or not finished**, in the order that unblocks a render:
+
+1. the SeamlessM4T feature extractor (above) -- the last gap between a reference
+   clip and the semantic codes;
+2. an intermediate-layer tap on `EncoderStack` for `hidden_states[17]`, plus the
+   stored-statistics normalization;
+3. the talker's emotion path: the `emo_conditioning_encoder` Conformer and the
+   `emo_perceiver_encoder` Perceiver resampler;
+4. the talker generate loop and its heads;
+5. BigVGAN's separate checkpoint, which is not in this repository;
+6. W6b, the two routes and ABI v19;
+7. W5 compose and W7 speed, both of which additionally need #633.

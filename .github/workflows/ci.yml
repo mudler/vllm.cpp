@@ -165,6 +165,7 @@ jobs:
           python3 tests/scripts/test_indextts2_emotion_arch_covered.py
           python3 tests/scripts/test_indextts2_pth_manifest.py
           python3 tests/scripts/test_indextts2_convert.py
+          python3 tests/scripts/test_indextts2_reference_path.py
           python3 tests/scripts/test_vocoder1d_single_home.py
       - name: Critical regression tests remain executable and CTest-registered
         run: |

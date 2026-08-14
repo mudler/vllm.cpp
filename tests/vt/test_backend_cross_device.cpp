@@ -2088,13 +2088,20 @@ static float Bf16ToF32(uint16_t b) {
 }
 
 TEST_CASE("MoE combine/gate ops match the CPU oracle") {
-  // SharedExpertGate (sigmoid*mul), MoeCombine (weighted expert sum +/-
-  // shared), MoeCombineGate (combine + folded shared gate). f32 and bf16 arms.
   constexpr int64_t T = 5, H = 64, K = 3;
   const size_t en = static_cast<size_t>(T) * K * H, on = static_cast<size_t>(T) * H;
   const std::vector<float> eo = RandomVec(en, 911);
   const std::vector<float> w = RandomVec(static_cast<size_t>(T) * K, 912, 0.0f, 1.0f);
   const std::vector<float> sd = RandomVec(on, 913);
+  const std::vector<uint16_t> eo_bf = Bf16Bits(eo), sd_bf = Bf16Bits(sd);
+  // SharedExpertGate (sigmoid*mul), MoeCombine (weighted expert sum +/-
+  // shared), MoeCombineGate (combine + folded shared gate). f32 and bf16 arms,
+  // PLUS the production dtype mix the model actually runs (review sweep on
+  // #509): expert_out bf16 (qwen3_5.cpp DBuf ddown), shared bf16, out bf16.
+  // MoeCombine/MoeCombineGate are thread-per-element with a single store
+  // rounding and NO cross-lane reduction (cuda_moe.cu:465-468), so both arms
+  // are asserted BIT-EXACT — the NMSE aggregate would tolerate a few wrong
+  // elements, which is exactly how a 2x OOB read hides.
   const std::vector<float> gl = RandomVec(static_cast<size_t>(T), 914);
 
   for (DeviceType dt : RegisteredDevices()) {
@@ -2153,11 +2160,46 @@ TEST_CASE("MoE combine/gate ops match the CPU oracle") {
     }
     if (OpAvailable(vt::OpId::kMoeCombine, dt)) {
       vt::MoeCombine(q, tout, teo, tw, &tsd);
-      CHECK(Nmse(ref_c, dout.Download()) <= kNmseTol);
+      // Thread-per-element, single store rounding, no cross-lane reduction:
+      // bit-exact is the achievable and asserted bar (review sweep on #509).
+      CHECK(dout.Download() == ref_c);
     }
     if (OpAvailable(vt::OpId::kMoeCombineGate, dt)) {
       vt::MoeCombineGate(q, tout, teo, tw, tsd, tgl);
       CHECK(Nmse(ref_cg, dout.Download()) <= kNmseTol);
+    }
+
+    // The production bf16 arm: expert_out bf16 + shared bf16 + out bf16
+    // (qwen3_5.cpp:5463 ddown / :5326 shared). The CPU oracle runs the same
+    // ops on the same bf16 tensors; both sides thread-per-element with the
+    // same sequential K order, so the assertion is BIT-EXACT.
+    DevBufBytes deo_bf(dev, q, en * 2), dsd_bf(dev, q, on * 2), dout_bf(dev, q, on * 2);
+    deo_bf.Upload(eo_bf.data());
+    dsd_bf.Upload(sd_bf.data());
+    Tensor teo_b = Tensor::Contiguous(deo_bf.ptr(), DType::kBF16, d, {T, K, H});
+    Tensor tsd_b = Tensor::Contiguous(dsd_bf.ptr(), DType::kBF16, d, {T, H});
+    Tensor tout_b = Tensor::Contiguous(dout_bf.ptr(), DType::kBF16, d, {T, H});
+    if (OpAvailable(vt::OpId::kMoeCombine, dt) &&
+        OpAvailable(vt::OpId::kMoeCombine, DeviceType::kCPU)) {
+      // CPU reference on bf16 tensors.
+      std::vector<uint16_t> ref_b(on, 0);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint16_t> ceo = eo_bf, csd = sd_bf;
+        std::vector<float> cw = w;
+        Tensor r = Tensor::Contiguous(ref_b.data(), DType::kBF16, cd, {T, H});
+        Tensor teo_c = Tensor::Contiguous(ceo.data(), DType::kBF16, cd, {T, K, H});
+        Tensor tw_c = T2(cw.data(), cd, T, K);
+        Tensor tsd_c = Tensor::Contiguous(csd.data(), DType::kBF16, cd, {T, H});
+        vt::MoeCombine(cq, r, teo_c, tw_c, &tsd_c);
+        cpu.DestroyQueue(cq);
+      }
+      vt::MoeCombine(q, tout_b, teo_b, tw, &tsd_b);
+      std::vector<uint16_t> got_b(on);
+      dout_bf.Download(got_b.data());
+      CHECK(got_b == ref_b);
     }
     dev.DestroyQueue(q);
   }

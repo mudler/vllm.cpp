@@ -100,6 +100,12 @@ __global__ void MoeCombineGateK(Tout* out, const Teo* expert_out, const float* w
 }  // namespace
 
 void SharedExpertGateKernelRocm(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl) {
+  // Same f16 hazard as the combine ops (review sweep on #509): the seam admits
+  // any float dtype and Tensor::Ptr<T>() is unchecked.
+  VT_CHECK(sd.dtype == DType::kF32 || sd.dtype == DType::kBF16,
+           "rocm shared_expert_gate: unsupported sd dtype (f32/bf16 only)");
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "rocm shared_expert_gate: unsupported out dtype (f32/bf16 only)");
   const int64_t t = out.shape[0], h = out.shape[1];
   if (t == 0 || h == 0) return;
   hipStream_t s = AsStream(q);
@@ -123,6 +129,17 @@ void SharedExpertGateKernelRocm(Queue& q, Tensor& out, const Tensor& sd, const T
 
 void MoeCombineKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
                           const Tensor& weights, const Tensor* shared) {
+  // The donor's dtype refusals (cuda_moe.cu:520-524) — f16 is admitted by the
+  // seam's IsFloat gate, and Tensor::Ptr<T>() is an unchecked cast, so without
+  // these an f16 expert_out would be read at 4 bytes/element from a 2-byte
+  // allocation (review sweep on #509).
+  VT_CHECK(expert_out.dtype == DType::kF32 || expert_out.dtype == DType::kBF16,
+           "rocm moe_combine: unsupported expert_out dtype (f32/bf16 only)");
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "rocm moe_combine: unsupported out dtype (f32/bf16 only)");
+  VT_CHECK(shared == nullptr || shared->dtype == DType::kF32 ||
+               shared->dtype == DType::kBF16,
+           "rocm moe_combine: unsupported shared dtype (f32/bf16 only)");
   const int64_t t = out.shape[0], h = out.shape[1];
   const int k = static_cast<int>(weights.shape[1]);
   const int64_t n = t * h;
@@ -149,6 +166,13 @@ void MoeCombineKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
 
 void MoeCombineGateKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
                               const Tensor& weights, const Tensor& sd, const Tensor& gl) {
+  // Same donor refusals as MoeCombine (cuda_moe.cu:597-604).
+  VT_CHECK(expert_out.dtype == DType::kF32 || expert_out.dtype == DType::kBF16,
+           "rocm moe_combine_gate: unsupported expert_out dtype (f32/bf16 only)");
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "rocm moe_combine_gate: unsupported out dtype (f32/bf16 only)");
+  VT_CHECK(sd.dtype == DType::kF32 || sd.dtype == DType::kBF16,
+           "rocm moe_combine_gate: unsupported sd dtype (f32/bf16 only)");
   const int64_t t = out.shape[0], h = out.shape[1];
   const int k = static_cast<int>(weights.shape[1]);
   const int64_t n = t * h;

@@ -571,7 +571,9 @@ TEST_CASE("chat-mm seam body: MakeQwen3VLImageChatFn -> expanded engine input") 
 //
 //    RED line, and it is a BEHAVIOURAL one rather than an absence: before this
 //    wave the seam located the FIRST image_url part and `break`ed
-//    (chat_mm.cpp:256-268), so a three-image request was SERVED WITH ONE — no
+//    (PRE-L2 chat_mm.cpp:256-268; the same loop is chat_mm.cpp:313-323 today,
+//    now preceded by the check at :311), so a three-image request was neither
+//    served nor refused, it was quietly reduced to one — no
 //    error, no warning, a confident answer about a subset of the input (#686).
 //    Every CHECK_THROWS below fails against that code, because it does not
 //    throw; it returns the first image's 196 tokens and discards two.

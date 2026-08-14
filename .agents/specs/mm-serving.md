@@ -150,7 +150,8 @@ chat request content-part array          [MM-SERVE-PARSE — CPU, THIS BRICK]
   validate-then-build seam shape (pinned as its own leg in
   `test_api_server.cpp`), so the issue's diagnosis — first image, `break`, no
   refusal — stands; only its stated consequence was understated. Both cases are
-  now the same answer: `ValidateChatMmLimits` runs first and a request over the
+  now the same answer: `ValidateChatMmLimits` (`chat_mm.cpp:311`, ahead of the
+  unchanged first-image loop at `:313-326`) runs first, and a request over the
   seam's declared ceiling (`Qwen3VLChatSupportedMmLimits() == {"image": 1}`,
   the `min()` fold operand the issue asked for) is refused with
   **HTTP 400 "At most 1 image(s) may be provided in one prompt."** Video and

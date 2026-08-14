@@ -1,0 +1,344 @@
+{
+ "captured_on": "2026-08-14T08:05:51+0000",
+ "checkpoint": {
+  "bytes": 28517614641,
+  "path": "/mnt/nas_share/checkpoints/minimax-music3"
+ },
+ "environment": {
+  "device": "cpu",
+  "device_name": null,
+  "diffusers_commit": "c6da9936e4bda83107943a16eb8682e9a37d8527",
+  "diffusers_commit_source": "dist-info/direct_url.json",
+  "diffusers_path": "/home/mudler/venvs/music3-oracle/lib/python3.12/site-packages/diffusers/__init__.py",
+  "diffusers_version": "0.40.0.dev0",
+  "dtype_policy": "reference",
+  "host": "mudler-ubuntu-box",
+  "numpy": "2.3.5",
+  "platform": "Linux-6.8.0-136-generic-x86_64",
+  "python": "3.12.3",
+  "torch": "2.11.0+cu130",
+  "torch_cuda": "13.0",
+  "transformers": "5.14.1"
+ },
+ "generated_by": "tools/oracle/music3_oracle.py",
+ "issue": "#672",
+ "model": "MiniMaxAI/MiniMax-Music3 (diffusers arm)",
+ "oracle": {
+  "pin": "c6da9936e4bda83107943a16eb8682e9a37d8527",
+  "pin_source": "dist-info/direct_url.json",
+  "pull_request": "https://github.com/huggingface/diffusers/pull/14456",
+  "upstream": "https://github.com/huggingface/diffusers"
+ },
+ "request": {
+  "audio_duration_s": 1.0,
+  "dtype_policy": "reference",
+  "dtypes": {
+   "condition_encoder": "torch.bfloat16",
+   "default": "torch.float32",
+   "language_model": "torch.bfloat16",
+   "rvq_depth_decoder": "torch.bfloat16"
+  },
+  "generator_device": "cpu",
+  "lyrics": "[verse]\nMorning light filtering through the pine\n",
+  "num_inference_steps": 4,
+  "prompt": "Genre: acoustic pop. BPM: 96. Key: C major. Warm and intimate. Vocals: soft female lead, close and breathy. Arrangement: fingerpicked guitar and soft piano.",
+  "seed": 7
+ },
+ "result": {
+  "ar_frames": 25,
+  "chunk_starts": [
+   0
+  ],
+  "denoise_sigmas": [
+   0.0,
+   0.25,
+   0.5,
+   0.75
+  ],
+  "denoise_steps_recorded": 4,
+  "duration_s": 0.9984580498866213,
+  "load_seconds": 110.73,
+  "num_latent_chunks": 1,
+  "run_seconds": 926.4,
+  "rvq_code_rows": 26,
+  "sampling_rate": 44100,
+  "waveform_shape": [
+   1,
+   2,
+   44032
+  ]
+ },
+ "spec": ".agents/specs/minimax-music3.md",
+ "spec_disagreements": [],
+ "spec_facts": {
+  "condition_encoder": {
+   "condition_hidden_dim": 4096,
+   "dtypes": [
+    "torch.bfloat16"
+   ],
+   "input_hop_length": 960,
+   "input_sampling_rate": 24000,
+   "num_condition_layers": 8,
+   "out_dim": 2048,
+   "output_hop_length": 512,
+   "output_sampling_rate": 44100,
+   "params": 25167881,
+   "tensor_names": [
+    "layer_scale",
+    "layer_weight_logits",
+    "proj.bias",
+    "proj.weight"
+   ]
+  },
+  "language_model": {
+   "class": "Qwen3ForCausalLM",
+   "dtypes": [
+    "torch.bfloat16"
+   ],
+   "hidden_size": 4096,
+   "num_attention_heads": 32,
+   "num_hidden_layers": 36,
+   "num_key_value_heads": 8,
+   "params": 8584475648,
+   "tie_word_embeddings": false,
+   "vocab_size": 200000
+  },
+  "pipeline": {
+   "audio_vocab_size": 1024,
+   "derived_latent_frame_rate": 86.1328125,
+   "derived_sampling_rate": 44100.0,
+   "frame_rate": 25.0,
+   "latent_hop_length": 512,
+   "num_channels_latents": 128,
+   "num_codebooks": 8,
+   "sampling_rate": 44100,
+   "scheduler": "FlowMatchEulerDiscreteScheduler",
+   "scheduler_config": {
+    "base_image_seq_len": 256,
+    "base_shift": 0.5,
+    "invert_sigmas": true,
+    "max_image_seq_len": 4096,
+    "max_shift": 1.15,
+    "num_train_timesteps": 1,
+    "shift": 1.0,
+    "shift_terminal": null,
+    "stochastic_sampling": false,
+    "time_shift_type": "exponential",
+    "use_beta_sigmas": false,
+    "use_dynamic_shifting": false,
+    "use_exponential_sigmas": false,
+    "use_karras_sigmas": false
+   }
+  },
+  "rvq_depth_decoder": {
+   "audio_vocab_size": 1024,
+   "dtypes": [
+    "torch.bfloat16"
+   ],
+   "max_position_embeddings": 16,
+   "num_codebooks": 8,
+   "params": 646025216
+  },
+  "transformer": {
+   "attention_head_dim": 64,
+   "condition_dim": 2048,
+   "dtypes": [
+    "torch.float32"
+   ],
+   "ff_inner_dim": 8192,
+   "in_channels": 128,
+   "num_attention_heads": 32,
+   "num_layers": 36,
+   "params": 2431905920,
+   "rotary_dim": 32
+  },
+  "vocoder": {
+   "derived_hop": 512,
+   "dtypes": [
+    "torch.float32"
+   ],
+   "latent_channels": 128,
+   "params": 54170722,
+   "sampling_rate": 44100,
+   "upsampling_ratios": [
+    8,
+    8,
+    4,
+    2
+   ],
+   "weight_norm_tensors": 60
+  }
+ },
+ "tensors": {
+  "condition_chunk0": {
+   "bytes": 704640,
+   "device_dtype": "torch.float32",
+   "file": "condition_chunk0.npy",
+   "max": 5.0625,
+   "mean": -0.00562003960709093,
+   "min": -8.125,
+   "note": "condition mix output for window 0 [latent_length, out_dim]",
+   "sha256": "9298b9cad6002295d0a4caf840323b3371ed986a227df744b27ab1289c2cc75f",
+   "shape": [
+    86,
+    2048
+   ],
+   "stored_dtype": "float32"
+  },
+  "denoise_first_latents_out": {
+   "bytes": 44160,
+   "device_dtype": "torch.float32",
+   "file": "denoise_first_latents_out.npy",
+   "max": 4.62675142288208,
+   "mean": 0.024868314077963968,
+   "min": -2.9962313175201416,
+   "note": "latents after scheduler.step 0 (first)",
+   "sha256": "5d2ae39c872e457af0039d54f8902d8f84c11463e10fd43cd4358dc16ca80e2d",
+   "shape": [
+    128,
+    86
+   ],
+   "stored_dtype": "float32"
+  },
+  "denoise_first_sample_in": {
+   "bytes": 44160,
+   "device_dtype": "torch.float32",
+   "file": "denoise_first_sample_in.npy",
+   "max": 4.157993316650391,
+   "mean": 0.0001749317077180982,
+   "min": -3.8161070346832275,
+   "note": "DiT denoise step 0 (first) input latents, sigma=0.0",
+   "sha256": "c32669a810fe6050bf1569e71edb37987cf018522276bb64c37c1e66b63282cf",
+   "shape": [
+    128,
+    86
+   ],
+   "stored_dtype": "float32"
+  },
+  "denoise_first_velocity": {
+   "bytes": 44160,
+   "device_dtype": "torch.float32",
+   "file": "denoise_first_velocity.npy",
+   "max": 16.83685302734375,
+   "mean": 0.09877353013820708,
+   "min": -6.052973747253418,
+   "note": "guided velocity at step 0 (first)",
+   "sha256": "d19334c89de2cbf7f4b686ed7d52423afc69aae3dece33e8ffc97b6253ac7f02",
+   "shape": [
+    128,
+    86
+   ],
+   "stored_dtype": "float32"
+  },
+  "denoise_last_latents_out": {
+   "bytes": 44160,
+   "device_dtype": "torch.float32",
+   "file": "denoise_last_latents_out.npy",
+   "max": 14.601004600524902,
+   "mean": 0.0751615571372345,
+   "min": -4.820544242858887,
+   "note": "latents after scheduler.step 3 (last)",
+   "sha256": "0a694a3a4de05a930ab2db049dfc37ec28b5da72ef9311efbe0cee420b559cd1",
+   "shape": [
+    128,
+    86
+   ],
+   "stored_dtype": "float32"
+  },
+  "denoise_last_sample_in": {
+   "bytes": 44160,
+   "device_dtype": "torch.float32",
+   "file": "denoise_last_sample_in.npy",
+   "max": 11.183774948120117,
+   "mean": 0.05831872769061213,
+   "min": -3.8610992431640625,
+   "note": "DiT denoise step 3 (last) input latents, sigma=0.75",
+   "sha256": "76de50cd5a482465886054dbdf0bc9ba9ff05988be18eb831fecfaa39de253c5",
+   "shape": [
+    128,
+    86
+   ],
+   "stored_dtype": "float32"
+  },
+  "denoise_last_velocity": {
+   "bytes": 44160,
+   "device_dtype": "torch.float32",
+   "file": "denoise_last_velocity.npy",
+   "max": 14.486239433288574,
+   "mean": 0.06737131688680885,
+   "min": -5.618948936462402,
+   "note": "guided velocity at step 3 (last)",
+   "sha256": "e16d6fec262ad78cad768b0f6513b9fbfe260740a0f01cf7c9814285949445e2",
+   "shape": [
+    128,
+    86
+   ],
+   "stored_dtype": "float32"
+  },
+  "frame_hiddens": {
+   "bytes": 3276928,
+   "device_dtype": "torch.bfloat16",
+   "file": "frame_hiddens.npy",
+   "max": 46.25,
+   "mean": -0.00723531141935382,
+   "min": -81.0,
+   "note": "AR per-frame hidden states [frames, num_codebooks*hidden]; the condition mix's INPUT",
+   "sha256": "5811cd4671dfb0e004b4204ce34ac7736152602d81db56907fa5601013a412e0",
+   "shape": [
+    25,
+    32768
+   ],
+   "stored_dtype": "float32"
+  },
+  "rvq_codes": {
+   "bytes": 960,
+   "device_dtype": "torch.int32",
+   "file": "rvq_codes.npy",
+   "max": 15141.0,
+   "mean": 1418.0336538461538,
+   "min": 13.0,
+   "note": "RVQ codes [calls, num_codebooks], column 0 semantic + 7 residual. The first row is the priming decode step that emits no frame, so rows[1:] align with frame_hiddens",
+   "sha256": "220ddc4b95c39eb02b1ae833301479ec4cf9f0342de77a491ebcf0f1f1a29510",
+   "shape": [
+    26,
+    8
+   ],
+   "stored_dtype": "int32"
+  },
+  "vocoder_input_chunk0": {
+   "bytes": 44160,
+   "device_dtype": "torch.float32",
+   "file": "vocoder_input_chunk0.npy",
+   "max": 14.601004600524902,
+   "mean": 0.0751615571372345,
+   "min": -4.820544242858887,
+   "note": "vocoder input latents for window 0 [latent_channels, latent_length]",
+   "sha256": "0a694a3a4de05a930ab2db049dfc37ec28b5da72ef9311efbe0cee420b559cd1",
+   "shape": [
+    128,
+    86
+   ],
+   "stored_dtype": "float32"
+  },
+  "waveform": {
+   "bytes": 352384,
+   "device_dtype": "torch.float32",
+   "file": "waveform.npy",
+   "max": 0.30632224678993225,
+   "mean": 0.0014041685989284122,
+   "min": -0.3024851083755493,
+   "note": "final stereo waveform [channels, samples] at 44100 Hz, resample-free (spec \u00a71.1)",
+   "sha256": "36f60c7ce0bbf973260696be73f4c2b8424831f6386acf9b0c4c38aef5bca5b6",
+   "shape": [
+    2,
+    44032
+   ],
+   "stored_dtype": "float32"
+  }
+ },
+ "wav": {
+  "bytes": 176172,
+  "file": "waveform.wav",
+  "sha256": "08d8ce106e2dca9bb1f0e2feab19a74e88b4acb84cb420242902ba00df29757b"
+ }
+}

@@ -60,6 +60,16 @@ struct ParserRequest {
   int history_tool_call_cnt = 0;      // count_history_tool_calls(request)
 };
 
+// The ChatCompletionRequest -> ParserRequest projection. Upstream has no such
+// function (chat_completion/serving.py hands the request object straight to
+// parse_delta / parse); it exists here only because ParserRequest models the
+// subset the assembly path reads. Shared so the serving path and the
+// tool_parsers ParserEngineToolAdapter cannot drift into two projections of the
+// same request. history_tool_call_cnt stays 0 for a fresh request, matching
+// abstract_parser.py _initialize_history_tool_call_cnt.
+ParserRequest ParserRequestFromChatCompletion(
+    const oai::ChatCompletionRequest& request);
+
 // Ported from: parser_engine.py:48 (ToolCallSlot).
 struct ToolCallSlot {
   std::string id;

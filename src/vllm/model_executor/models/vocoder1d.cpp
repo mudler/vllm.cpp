@@ -275,5 +275,33 @@ std::vector<float> AliasFreeActivation1d::Apply(const std::vector<float>& in,
                          out_len);
 }
 
+// torch weight_norm: w = g * v / ||v||, norm over every dim except dim 0.
+// Moved here from `minimax_h3_audio_vae.cpp` when MiniMax-Music3's vocoder
+// became its second consumer; see the declaration for why the axis is named
+// `dim0` and not `out_channels`.
+std::vector<float> MaterializeWeightNorm(const std::vector<float>& g,
+                                         const std::vector<float>& v, int64_t dim0) {
+  VT_CHECK(dim0 > 0 && v.size() % static_cast<size_t>(dim0) == 0,
+           "vocoder1d: weight-norm direction does not divide by dim 0");
+  const int64_t per_slice = static_cast<int64_t>(v.size()) / dim0;
+  VT_CHECK(static_cast<int64_t>(g.size()) == dim0,
+           "vocoder1d: weight-norm magnitude must have one value per dim-0 slice");
+  std::vector<float> out(v.size());
+  for (int64_t c = 0; c < dim0; ++c) {
+    double norm = 0.0;
+    for (int64_t i = 0; i < per_slice; ++i) {
+      const double value = v[static_cast<size_t>(c * per_slice + i)];
+      norm += value * value;
+    }
+    norm = std::sqrt(norm);
+    const double scale = norm > 0.0 ? static_cast<double>(g[static_cast<size_t>(c)]) / norm : 0.0;
+    for (int64_t i = 0; i < per_slice; ++i) {
+      out[static_cast<size_t>(c * per_slice + i)] =
+          static_cast<float>(v[static_cast<size_t>(c * per_slice + i)] * scale);
+    }
+  }
+  return out;
+}
+
 }  // namespace vocoder1d
 }  // namespace vllm

@@ -51,6 +51,17 @@ namespace {
 //     hermes), GigaChat 3.0's header form (3.1's <|function_call|> is rowed),
 //     qwen3_coder/qwen3_xml/mimo (surface byte-identical to step3p5's), and
 //     glm45/glm47 (surface identical to poolside_v1/hy_v3's arg tags).
+//   - inkling: EXPLICIT-ONLY for a different reason than every row above — not
+//     marker collision but the ABSENCE of anything to sniff. This table matches
+//     against a CHAT TEMPLATE string, and Inkling has no jinja chat template at
+//     the pin: its prompt rendering is a native renderer
+//     (vllm/renderers/inkling_encoding.py, mirrored by the Rust
+//     rust/src/chat/src/renderer/inkling/), and `examples/` carries no
+//     tool_chat_template_inkling.jinja. Its "<|content_invoke_tool_json|>"
+//     marker collides with no row here, so a row would be harmless-looking, but
+//     it would also be unreachable through the only input this function gets
+//     while claiming template-stability we cannot demonstrate. Select it with
+//     --tool-call-parser inkling.
 //   - muse_glimmer's "<atem:function_calls>" is a full literal that no other
 //     row contains and that contains no other row's marker, so its position
 //     is free; it sits first because it is the most specific. The Muse

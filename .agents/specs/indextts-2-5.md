@@ -223,6 +223,41 @@ layers, each carrying a `CAMLayer` attention, separated by `TransitLayer`s, then
 `StatsPool` and a `DenseLayer`. That is 52 dense layers plus batch norms; the
 line count is small because the blocks are looped.
 
+## What the SHIPPED checkpoint actually contains
+
+Read from the repository manifest and `config.yaml` itself (not the recipe page,
+not the paper). Four findings change the plan, and two of them settle questions
+this spec previously left open.
+
+**The model runs at TWO sample rates.** The talker's mel front end is 24 kHz with
+100 mel bins; S2Mel and the vocoder work at 22.05 kHz with 80. The OUTPUT is
+22.05 kHz. Conflating them yields audio at the wrong speed rather than an error,
+so both are pinned in `indextts2_config.h` and gated.
+
+**The language question is SETTLED, and the recipe page was wrong.** The shipped
+tokenizer is `multilingual_zh_ja_yue_char_del.tiktoken` — zh, ja, yue. That
+matches the vLLM-Omni docs (zh/en/zhen/ja/yue) and contradicts the recipe page's
+zh/en/ja/es/ar. Nothing may claim Spanish or Arabic.
+
+**The text tokenizer is TIKTOKEN, not a HuggingFace `tokenizer.json`.** This lane
+therefore inherits the constraint already recorded for Kimi-Linear: a tiktoken-only
+checkpoint has no `tokenizer.json`, so any path that assumes one is unavailable.
+
+**A Qwen-0.6B EMOTION MODEL ships inside the checkpoint** (`qwen0.6bemo4-merge/`,
+with its own `model.safetensors`, tokenizer and config), alongside `feat1.pt` /
+`feat2.pt` speaker and emotion matrices and an `emo_condition_module`. This was
+NOT in the original scope of this spec and is not covered by any work item here.
+It is a second language model inside a TTS lane.
+
+**Two components are NOT in this repository at all**: BigVGAN
+(`bigvgan_generator.pt`, fetched into `hf_cache/bigvgan`) and w2v-bert-2.0. They
+download separately at first run, so a byte count of this repo understates what a
+render needs.
+
+The full manifest is 22 files: `gpt.pth`, `codec.pth`, `s2mel.pth`,
+`wav2vec2bert_stats.pt`, `feat1.pt`, `feat2.pt`, the tiktoken vocabulary, the
+Qwen emotion directory, and `config.yaml`.
+
 ## Work breakdown
 
 | W | Work | Depends on |
@@ -230,7 +265,7 @@ line count is small because the blocks are looped.
 | W1 | Relocate the ALREADY-SHARED vocoder core out of the `minimax_h3.h` header into a neutral home, plus WAV. Smaller than it first looked: the sharing exists and is gated by two suites, so this is a rename/relocate with a live precedent, not a generalization | — |
 | W2 | GPT-2 talker backbone, additive, on the existing decode framework | — |
 | W3 | Reference-encoder path (w2v-bert-2.0, MaskGCT, CAMPPlus) | — |
-| W4 | EnhancedCodec + S2Mel CFM/DiT on the H3 denoise loop | W1 |
+| W4 | EnhancedCodec + S2Mel CFM/DiT (13 blocks, hidden 512, 8 heads, in_channels 80) | W1 |
 | W5 | Compose the render; goldens per stage | W2-W4, #633 |
 | W6a | `SpeechEngine` seam + ABI v19 entry points + `test_capi` section | W5 |
 | W6b | `/v1/audio/speech` + `/v1/audio/voices` on `ApiServer`, routed through the seam; example as a thin ABI client | W6a |

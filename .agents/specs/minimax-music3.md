@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** W0 — spec committed, no engine code.
+**Status:** **W0 DONE, W1 LANDED.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, and the modular loader in the tree. W2/W3 dispatched.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -29,10 +29,11 @@ from what is still assumed.
 **Measured** (safetensors headers by HTTP range request, and each component's
 `config.json`): every geometry and dtype in §1. **Read** (upstream source at the
 pinned SHAs): the component decomposition, the native↔diffusers relationship, and
-the dtype policy. **Not established:** that the oracle runs here at all — no
-diffusers execution of this model has happened on this project's hardware, which
-is why `.agents/oracles/diffusers.md` still records `gateable = no`. W0 is not
-complete until it does.
+the dtype policy. **Established 2026-08-14, after this section was
+written:** the oracle runs here — `tools/oracle/music3_oracle.py` loaded all seven
+components and generated audio, so `.agents/oracles/diffusers.md` records
+`gateable = yes` against a golden path. That measurement was taken on CPU;
+nothing about speed is established.
 
 **This model has no token-exact gate on its generative half.** Like MiniMax-H3, the
 acoustic path is a flow-matching denoise loop with no logits and no sampler, so the
@@ -152,20 +153,47 @@ assumed from reading the script.
 that layout is **refused by name** with a message saying so. It is not silently
 mis-loaded, and it is recorded as owed rather than discovered later.
 
-### 2.1 The dtype policy is upstream's, and it is deliberate
+### 2.1 dtype — ON DISK IS NOT RUNNABLE (corrected 2026-08-14 by the oracle)
 
-`convert_minimax_music3_to_diffusers.py:267` defaults `--dtype float32`; the
-transformer, condition encoder and vocoder take that dtype (`:208-211`) while the
-RVQ depth decoder is forced to bf16 regardless (`:214`). That matches the measured
-headers exactly, and SGLang-Omni's README states both of its placements "run the
-acoustic stage in FP32".
+**An earlier revision of this section was wrong, and the correction is the point.**
+It read the converter — `convert_minimax_music3_to_diffusers.py:267` defaults
+`--dtype float32`, transformer/condition_encoder/vocoder take it (`:208-211`), the
+RVQ depth decoder is forced to bf16 (`:214`) — saw that it matched the measured
+headers exactly, and concluded that the on-disk set *was* upstream's resolved
+runtime policy, to be mirrored as-is. Standing the oracle up refuted that.
 
-So fp32 on the DiT and the vocoder is **upstream's resolved choice, not a
-too-wide accident** — the case AGENTS.md warns about (a token gate cannot see a
-dtype that is too wide) does not apply here, because the oracle is fp32 too. Each
-fp32 buffer on this path still carries the one-line reason the policy requires,
-naming this section. Any future narrowing to bf16 is a measured change with its
-own evidence, never a silent default.
+**Loading the on-disk dtypes and running upstream's own pipeline raises**
+`RuntimeError: Input type (c10::BFloat16) and bias type (float) should be the
+same` at `condition_embedder_minimax_music3.py:64`. The reason is that upstream
+casts in exactly **two** places and nowhere else — `denoise.py:83` (condition →
+`transformer.dtype`) and `decoders.py:84` (latents → `vocoder.dtype`) — so the
+condition encoder and the depth decoder consume the language model's hidden states
+**uncast**.
+
+**The invariant every runnable configuration satisfies:**
+
+```
+dtype(language_model) == dtype(rvq_depth_decoder) == dtype(condition_encoder)
+```
+
+**The gated configuration is bf16 AR half / fp32 acoustic half**: language model,
+depth decoder and condition encoder in bf16; transformer and vocoder in fp32. That
+is the converter's default for the DiT and vocoder, and what SGLang-Omni states it
+runs ("both layouts run the acoustic stage in FP32").
+
+Two things follow, and they are the reason this correction is worth its space.
+**On-disk dtype and runtime dtype are different facts about this checkpoint**, and
+a per-tensor header read answers only the first — the measurement in §1 is still
+correct, the inference drawn from it was not. And **fp32 on the acoustic half is
+still upstream's choice rather than a too-wide accident**, so the original
+conclusion survives for the DiT and vocoder even though its reasoning did not;
+each fp32 buffer carries the one-line reason AGENTS.md requires, naming this
+section.
+
+**W1 therefore enforces the equality above at load time and refuses a violating
+configuration BY NAME**, naming the three components and their dtypes, rather than
+letting it surface as a type error deep inside a forward pass. The oracle keeps
+`--dtype-policy on-disk` selectable so the failure stays reproducible.
 
 ---
 
@@ -188,9 +216,14 @@ force-pushed under us, and a comparison against "whatever the branch was that da
 is not reproducible. If the PR merges, advancing to the merge commit is a pin
 advance with its own reconciliation, not a silent follow.
 
-Both pins go into `.agents/oracles/` in W0. SGLang-Omni gets its **own record**
-rather than riding on `sglang.md`: it is a third repository with its own cadence,
-and this row binds to it directly.
+**Both pins are recorded** — [`../oracles/diffusers.md`](../oracles/diffusers.md)
+and [`../oracles/sglang-omni.md`](../oracles/sglang-omni.md), landed in #679 and
+advanced in #708. SGLang-Omni has its **own record** rather than riding on
+`sglang.md`: it is a third repository with its own cadence, and this row binds to
+it directly. (An earlier revision said the pins "go into `.agents/oracles/` in
+W0", which read as future work and misled two implementers into reporting the
+SGLang-Omni record as owed after it existed. Present tense, because the record
+is a fact and not a plan.)
 
 ---
 
@@ -203,12 +236,59 @@ and this row binds to it directly.
 | audio VAE decode + WAV writing | H3 audio VAE, LTX-2 audio VAE, `minimax_h3_wav.cpp` | `src/vllm/model_executor/models/` |
 | diffusion request planning / pipeline shape | H3 planner + pipeline, LTX-2.5 pipeline | `minimax_h3_planner.cpp`, `ltx2_pipeline.cpp` |
 | quantized arms on a diffusion model | H3 GGUF + NVFP4 arms | [minimax-h3.md](minimax-h3.md) §0 |
+| **an audio-GENERATION engine seam** | `multimodal::SpeechEngine` + `SpeechRegistry`, landed 2026-08-13 by the IndexTTS-2.5 lane | `include/vllm/multimodal/speech_engine.h` |
+| **a 1D vocoder** | `Vocoder1D`, same lane | `src/vllm/model_executor/models/vocoder1d.cpp` |
+
+### 4.1 Music3 routes through `SpeechEngine`, which needs ONE additive extension
+
+`multimodal::SpeechEngine` did not exist when this spec was first written. It does
+now, and AGENTS.md is explicit that a capability not reachable through the shared
+surface is not done, and that a seam is extended rather than forked. Music3 is a
+speech-family registration, not a new engine.
+
+It fits better than it might look. `SpeechResult` already carries `channels` and
+already documents `sample_rate` as "the family's native rate ... rather than a
+resampled one, so the caller decides whether to resample" — which is exactly
+§1.1's 44100 stereo, and exactly why SGLang-Omni's 32 kHz stays a caller-side
+concern. `requires_reference_audio()` exists so a server can refuse before
+staging; Music3 returns `false`, where IndexTTS-2 returns `true`.
+
+**The one genuine gap is `SpeechGenParams`.** It carries a single `text` field,
+because IndexTTS-2 synthesises one utterance. Music3 takes **two** distinct
+inputs — lyrics (with `[Verse]` / `[Chorus]` section tags) and a structured music
+description — plus generation controls (duration or frame count, denoise steps,
+CFG). Squeezing both into `text` with a separator would be a private protocol
+inside a shared struct, which is the fork this rule exists to prevent.
+
+W6 therefore **extends `SpeechGenParams` additively** and leaves IndexTTS-2.5's
+behaviour byte-identical. A field an existing family ignores costs it nothing; a
+second parallel params struct costs every future family a choice. If the
+extension cannot be made additive, that is a `NEEDS_DECISION`, not a fork.
+
+**`SpeechEngine` is not yet on the ABI.** `include/vllm.h` (v18) exposes the
+video engine but no `vllm_speech_*` surface, and no open PR adds one. W6 owns
+that: the ABI surface, the version bump, and the example HTTP server as a thin
+client of it — never including internal headers.
 
 Genuinely new: the eight-codebook RVQ frame path, the depth decoder, the learned
 8-layer condition mix, snake-activated DAC decoding with weight-norm, and the
 LLM→diffusion handoff on *continuous hidden states* rather than discrete tokens.
 
 ---
+
+## 4G. The row's structured record
+
+| Field | Value |
+|---|---|
+| Scope | IN: the diffusers-arm six-component checkpoint, all five modules, load through waveform; lyrics + structured description in, 44100 Hz stereo out; registration as a `SpeechRegistry` family with the `vllm_speech_*` ABI and the example HTTP server as a thin client (§4.1); quantized arms incl. GGUF k-quants (W7). OUT: the native `AbabForCausalLM` + `.pth` arm, refused by name (§2); streaming, which upstream does not support and which is refused rather than faked; a 32 kHz delivery arm, which is a downstream resample gated separately (§1.1); any change to `SpeechEngine` behaviour for IndexTTS-2.5. |
+| Upstream chain | `minimax_music3` is ABSENT from the pinned vLLM, from vLLM `main` and from `vllm-omni` — this row is why AGENTS.md §"When vLLM has no implementation" exists. Primary oracle `diffusers` PR [#14456](https://github.com/huggingface/diffusers/pull/14456) head `c6da9936` (OPEN), [`../oracles/diffusers.md`](../oracles/diffusers.md) `gateable = yes`. Cross-check SGLang-Omni `748a0b43`, [`../oracles/sglang-omni.md`](../oracles/sglang-omni.md) `gateable = no`, which serves the NATIVE layout (§2). `transformers` 5.14.1 for the `Qwen3ForCausalLM` half. Checkpoint `MiniMaxAI/MiniMax-Music3` diffusers arm, 27 GB, at `/mnt/nas_share/checkpoints/minimax-music3`. |
+| Our baseline | LANDED for this row: the modular loader `minimax_music3_loader.{h,cpp}` (#714, 1413/1413 assertions against the real tree, all 1012 tensors accounted, native arm refused by name) and the gateable oracle `tools/oracle/music3_oracle.py` with 13 per-stage goldens (#708). REUSED rather than rebuilt: the token-exact Qwen3 dense forward and paged KV, the `vocoder1d` primitives, `multimodal::SpeechEngine`, and the H3 / LTX-2.5 flow-matching and audio-VAE precedent (§4, §4.1). Before this row there was no music generation and no text-to-audio path of any kind. |
+| Port map | loader -> `src/vllm/model_executor/models/minimax_music3_loader.cpp` (LANDED, from `scripts/convert_minimax_music3_to_diffusers.py`). `language_model` -> the landed Qwen3 dense path (W2). `condition_embedder_minimax_music3.py` -> W3. `minimax_music3_rvq_depth_decoder.py` -> W3. `transformer_minimax_music3.py` + `FlowMatchEulerDiscreteScheduler` -> W4. `minimax_music3_vocoder.py` -> W5, over the shared `vocoder1d` primitives. `modular_pipelines/minimax_music3/{encoders,before_denoise,denoise,decoders}.py` -> W6. |
+| Tests to port | Upstream ships NO unit tests for this model at the pinned SHA — the PR carries docs, a conversion script and the modules, and nothing test-shaped was found in the seven PR files fetched. So the references are CAPTURED, not ported, and this spec says so rather than implying a port that never happened: `tests/parity/goldens/minimax_music3_oracle/` holds per-stage tensors with a manifest recording shape, dtype, sha256 and min/max/mean per entry. Each phase gates against its own stage's entry. If upstream later adds tests, they are ported in the same change that touches the corresponding module. |
+| Gates | Split by half, and conflating them is the failure mode §0 warns about. LLM half: TOKEN-EXACT against `rvq_codes.npy` `[26,8]` int32, where row 0 is the priming decode that emits no frame so `rows[1:]` align with the 25 frames. Acoustic half: per-stage tensor parity at fixed seed and reduced dimensions against `condition_chunk0`, `denoise_{first,last}_*`, `vocoder_input_chunk0`, `waveform` — no logits exist, so no token gate does either. A correlation coefficient is NOT a gate here: Pearson is scale-invariant and cannot see a uniformly scaled latent. Speed is measured against SGLang-Omni in its production configuration (both CUDA graphs, compiled DIT and DAV, batched seeded sampling), never with those disabled. |
+| Dependencies | `multimodal::SpeechEngine` + `SpeechRegistry` for W6, extended additively per §4.1 with IndexTTS-2.5 left byte-identical. The landed Qwen3 dense forward and paged KV for W2. The `vocoder1d` primitives for W5. The diffusers oracle staying gateable at its pin, for every phase. NO dependency on vLLM-Omni, and none on `dgx.casa`, which was down throughout W0 — the correctness gate runs on CPU by design. |
+| Work breakdown | §6. W0 spec + both oracle pins + §1.1 + oracle stand-up (DONE). W1 modular loader, weight-norm folding, dtype invariant, native-arm refusal (DONE). W2 global LLM. W3 condition mix + RVQ depth decoder. W4 flow-matching DiT + scheduler. W5 vocoder over `vocoder1d`. W6 speech-family registration + `vllm_speech_*` ABI + example HTTP server. W7 quantized arms, anything unimplemented refused by name. |
+| Risks/decisions | The primary oracle is an OPEN PR: it may be rebased or refactored in review, so the pin is the head SHA and the W1 tensor mapping is re-checked at merge. The on-disk dtype set is NOT runnable (§2.1) — an early revision of this spec asserted the opposite, and the correction is why the loader enforces `dtype(LM) == dtype(rvq) == dtype(cond)` and refuses violations by name. fp32 on the acoustic half is upstream's choice, mirrored, and sets a speed baseline in a regime this project has not optimised for — W7 is where that becomes interesting. The 5000-token prompt and 9000-frame ceilings are enforced, not discovered. Non-streaming is refused by name rather than buffered and called streaming. |
 
 ## 5. Gates
 
@@ -234,7 +314,7 @@ against it with those off would be a dishonest denominator.
 
 ---
 
-## 6. Phases
+## 6. Phases (work breakdown)
 
 Each phase is dispatched to a **fresh implementer** from this spec, reviewed by a
 **fresh reviewer** who mutates the claimed guarantees, and its gate is rerun by
@@ -242,13 +322,13 @@ the operator. Phases are separately claimable except where noted.
 
 | Phase | Scope | Done when |
 |---|---|---|
-| **W0** | This spec; both oracle records pinned; §1.1 sample rate settled from source (**DONE**); **stand the diffusers oracle up and prove it builds and runs** | oracle executes the model and `diffusers.md` flips to `gateable = yes` with a path as evidence |
+| **W0** | This spec; both oracle records pinned; §1.1 sample rate settled from source (**DONE**) and confirmed at runtime (**DONE**); stand the diffusers oracle up and prove it builds and runs (**DONE**, `tools/oracle/music3_oracle.py`) | oracle executes the model and `diffusers.md` flips to `gateable = yes` with a path as evidence |
 | **W1** | Modular loader: the six-component layout, weight-norm folding, the fp32/bf16 policy of §2.1, native-arm refusal by name | every component loads with shapes asserted against §1; converted-vs-native tensor equality checked, not assumed |
 | **W2** | Global LLM on our landed Qwen3 path at vocab 200 000 | hidden-state parity vs `transformers`, then token-exact RVQ code parity vs the oracle |
 | **W3** | Condition mix (8-layer weighted) + RVQ depth decoder, 8 codebooks | per-stage tensor parity; the depth decoder's 16-position window exercised at its boundary |
 | **W4** | Flow-matching DiT + `FlowMatchEulerDiscreteScheduler` with `invert_sigmas` | per-step latent parity against the oracle at a fixed seed |
-| **W5** | Vocoder: snake activations, weight-norm, `[8,8,4,2]` upsampling, WAV at **44100 stereo** (§1.1) | waveform parity within a stated absolute tolerance |
-| **W6** | e2e through the shared seams; **`include/vllm.h` surface**; **the example HTTP server as a thin ABI client**, never including internal headers | a song generates end to end from an HTTP request; SGLang-Omni cross-check; speed axis recorded with values and ratios |
+| **W5** | Vocoder **through the shared `Vocoder1D`** (§4.1): snake activations, weight-norm, `[8,8,4,2]` upsampling, the 128→2×64 stereo fold, WAV at **44100 stereo** (§1.1) | waveform parity within a stated absolute tolerance, and H3/IndexTTS-2.5 behaviour byte-identical |
+| **W6** | Register as a `SpeechRegistry` family; extend `SpeechGenParams` ADDITIVELY for lyrics + description + controls (§4.1); NEW `vllm_speech_*` **`include/vllm.h`** surface with the ABI version bump; **the example HTTP server as a thin ABI client** | a song generates end to end from an HTTP request; IndexTTS-2.5 unchanged; SGLang-Omni cross-check; speed axis recorded with values and ratios |
 | **W7** | Quantized arms — GGUF k-quants are a standing requirement, not a per-model choice | each arm gated, or refused by name and recorded as owed |
 
 **W0 blocks everything.** Until the oracle demonstrably runs, no phase can produce
@@ -292,7 +372,15 @@ pinned SHA.
 
 ## Now
 
-W0 — spec committed, no engine code. Next: pin both oracles in `.agents/oracles/`,
-stand the diffusers oracle up far enough to prove it builds and runs this model,
-and resolve the sample-rate contradiction in §1.1 from source. W1 is not
-dispatched until W0's oracle is gateable.
+**W0 DONE, W1 LANDED, row `ACTIVE`.** The diffusers oracle generates audio and is
+`gateable = yes` against 13 committed per-stage goldens; both oracles are pinned;
+§1.1 is resolved and confirmed at runtime; the modular loader is in the tree with
+the dtype invariant §2.1 enforced and the native arm refused by name.
+
+W2/W3 (the autoregressive half) are dispatched. Then W4/W5 acoustic, W6 the
+speech-family registration plus the `vllm_speech_*` ABI and the example HTTP
+server, W7 the quantized arms.
+
+Two things are owed and neither is W0's to close: **no speed number exists** — the
+oracle capture was CPU-only because `dgx.casa` was down, so nothing here touches
+the speed axis — and SGLang-Omni remains `gateable = no`, read but never executed.

@@ -291,8 +291,18 @@ def audit() -> list[dict]:
 # focused test file, and records that no CUDA/GPU/SACRED/oracle gate is
 # implicated because the change is argument parsing and reaches no forward pass.
 # Growth from a lifecycle move, so the set is re-pinned in the same change.
+# 2026-08-14: +ENG-RECORD-ANCHOR-RATCHET. The row leaves SPIKE for ACTIVE on its
+# implementation (issue #632), which puts it in GATED_STATES for the first time.
+# Its spec's Gates section names five invocations, and this is a STRONG credit
+# rather than one of the weak ones described above: the row's gate IS
+# `scripts/check-agent-record.py`, so the credited command is the thing under
+# test, and it fails on either direction of the ratchet. The suite
+# (`tests/scripts/test_agent_record.py`) is proven red against the BASE checker
+# by `scripts/check-pr-size.py`, which is itself one of the five. Growth from a
+# lifecycle move, so the set is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
+    "ENG-RECORD-ANCHOR-RATCHET",
     "SERVE-RECIPE-ARGS",
     "ENG-FORGE-COAUTHOR",
     "ENG-RECORD-CONFLICT-SURFACES",

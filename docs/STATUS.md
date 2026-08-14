@@ -91,6 +91,16 @@ Lifecycle changes still update STATUS and BENCHMARKS, while the moved row spec's
 `## Now` replaces the per-row write to `.agents/NOW.md`. Runtime and performance
 are `VOID`; no product behavior changed.
 
+Record-anchor ratchet (2026-08-14, `ENG-RECORD-ANCHOR-RATCHET` `ACTIVE`, #632):
+the record's own `file.cpp:123` citations were 83% unparsed. 479 markdown-link
+anchors were checked; 2134 bare citations were not, and the ones checked were
+only proven in range. `scripts/check-agent-record.py` now parses both forms,
+classifies each OK, STALE or BROKEN, and gates the rot against
+`scripts/record-anchor-baseline.json` in both directions. Backlog at adoption:
+**40** (33 stale, 7 broken) over 800 correct. `ACTIVE` rows join the count. No
+product behavior changed; existing citations are not rewritten, so the backlog
+falls as rows are touched.
+
 Supported-model registry guard (2026-08-06): the public per-architecture list in
 [FEATURES](FEATURES.md) is CI-bound to the C++ registry by
 `scripts/check-supported-models.py` (+ mutation test), so the 37

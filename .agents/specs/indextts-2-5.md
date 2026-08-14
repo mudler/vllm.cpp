@@ -519,8 +519,22 @@ MUSIC3's W6 (#799) and this family reaches both through
    | `facebook/w2v-bert-2.0` | `$CHECKPOINT_ROOT/w2v-bert-2.0` | ships `model.safetensors` already; NO conversion needed |
    | `funasr/campplus` | `$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/campplus.safetensors` | converted from `campplus_cn_common.bin`, 937 tensors, `head.*` / `xvector.*` naming that matches `campplus.h` |
 
-   What remains is loaders binding those onto the ported `w2vbert` and
-   `campplus` structs, and then feeding the result into the three conditioning
+   `campplus::LoadCampplus` LANDED and reads the converted file: 815 weights
+   after skipping the 122 `num_batches_tracked` I64 training counters, which
+   are skipped BY NAME so a real weight in an unexpected dtype still refuses.
+
+   **OPEN DEFECT, found immediately and NOT fixed.** `campplus::Forward` on
+   those real weights returns NaN with a synthetic log-mel input (values around
+   -1.7e33 before the norm collapses). The tensor NAMES match -- `head.*` and
+   `xvector.*` are exactly what the port looks up, so it is not a failed
+   lookup. It is one of: the synthetic input being outside the trained range,
+   a missing input normalization (`infer_v2_5.py` mean-centres the features
+   before CAMPPlus), or a defect in the port that the reduced-dimension goldens
+   do not reach. Diagnosing it is the next step and it must happen BEFORE the
+   conditioning is wired -- a style vector that is quietly NaN would poison the
+   talker's prompt while every shape stayed valid.
+
+   Then: the same for `w2vbert`, and feeding both into the three conditioning
    rows `talker::PrepareInputs` already accepts.
 2. **The INFERRED emotion path** (`emo_conditioning_encoder` Conformer,
    `emo_perceiver_encoder` Perceiver) is unported. A caller can STATE the

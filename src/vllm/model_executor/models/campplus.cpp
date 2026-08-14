@@ -1,7 +1,12 @@
 // CAMPPlus primitives. See campplus.h for the upstream anchors.
 #include "vllm/model_executor/models/campplus.h"
 
+#include <stdexcept>
+
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
+
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <cstddef>
@@ -460,6 +465,35 @@ std::vector<float> Forward(const CampplusParams& p, const CampplusWeights& w,
                     {}, {}, {}, w.Get("xvector.dense.nonlinear.batchnorm.running_mean"),
                     w.Get("xvector.dense.nonlinear.batchnorm.running_var"), p.eps,
                     /*apply_relu=*/false);
+}
+
+CampplusWeights LoadCampplus(const std::string& path) {
+  const SafetensorsFile file = SafetensorsFile::Open(path);
+  CampplusWeights w;
+  for (const std::string& name : file.Names()) {
+    // `num_batches_tracked` is an I64 TRAINING COUNTER -- BatchNorm's momentum
+    // bookkeeping -- and inference never reads it. It is skipped BY NAME rather
+    // than by "ignore anything that is not F32", because that broader rule
+    // would silently drop a real weight the day one ships in another dtype.
+    if (name.size() >= 19 &&
+        name.compare(name.size() - 19, 19, "num_batches_tracked") == 0) {
+      continue;
+    }
+    const StTensor& tensor = file.Get(name);
+    if (tensor.dtype != "F32") {
+      throw std::runtime_error("campplus: tensor '" + name + "' is " + tensor.dtype +
+                               ", expected F32");
+    }
+    std::vector<float> values(tensor.nbytes / sizeof(float));
+    if (!values.empty()) {
+      std::memcpy(values.data(), tensor.data, tensor.nbytes);
+    }
+    w.t.emplace(name, std::move(values));
+  }
+  if (w.t.empty()) {
+    throw std::runtime_error("campplus: '" + path + "' held no tensors");
+  }
+  return w;
 }
 
 }  // namespace campplus

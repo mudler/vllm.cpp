@@ -1147,6 +1147,13 @@ VLLM_CPP_INDEXTTS2_GPT=... VLLM_CPP_INDEXTTS2_TIKTOKEN=... \
   ./build/tests/test_indextts2_e2e
 ```
 
+A REAL LIMITATION to know before using it: the reference clip is required and
+then IGNORED. Its encoders are ported and their checkpoints are staged, but the
+conditioning rows are zeros, so two different reference voices give the same
+output today. `campplus::LoadCampplus` reads its weights but
+`campplus::Forward` returns NaN on them, which is an open defect recorded in
+the spec and blocks the wiring.
+
 It asserts STRUCTURE, not quality: nothing is compared against vLLM-Omni, which
 is unpinned (#633). The TOKENIZER it uses:
 `tiktoken::LoadRanks` reads the shipped `.tiktoken` vocabulary and

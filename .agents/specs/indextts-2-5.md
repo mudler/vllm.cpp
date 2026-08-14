@@ -509,8 +509,19 @@ MUSIC3's W6 (#799) and this family reaches both through
 1. **The reference clip does not condition anything.** `Synthesize` validates
    it and refuses without it, but the encoders that would turn it into speaker
    and semantic conditioning are ported and NOT WIRED -- the conditioning rows
-   are zeros. Wiring them needs two more downloads: `facebook/w2v-bert-2.0`
-   and the CAMPPlus checkpoint, neither of which ships in the repository.
+   are zeros. This is the first thing to fix.
+
+   The two checkpoints it needs are now STAGED, so nobody has to find them
+   again:
+
+   | Artifact | Where | Note |
+   |---|---|---|
+   | `facebook/w2v-bert-2.0` | `$CHECKPOINT_ROOT/w2v-bert-2.0` | ships `model.safetensors` already; NO conversion needed |
+   | `funasr/campplus` | `$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/campplus.safetensors` | converted from `campplus_cn_common.bin`, 937 tensors, `head.*` / `xvector.*` naming that matches `campplus.h` |
+
+   What remains is loaders binding those onto the ported `w2vbert` and
+   `campplus` structs, and then feeding the result into the three conditioning
+   rows `talker::PrepareInputs` already accepts.
 2. **The INFERRED emotion path** (`emo_conditioning_encoder` Conformer,
    `emo_perceiver_encoder` Perceiver) is unported. A caller can STATE the
    emotion instead, which is why this sits behind a render rather than in front.

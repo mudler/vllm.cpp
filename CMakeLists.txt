@@ -774,6 +774,7 @@ add_library(vllm STATIC
   src/vllm/multimodal/speech_engine.cpp
   src/vllm/model_executor/models/indextts2.cpp
   src/vllm/model_executor/models/campplus.cpp
+  src/vllm/model_executor/models/emovec.cpp
   src/vllm/model_executor/models/w2vbert.cpp
   src/vllm/model_executor/models/w2v_fbank.cpp
   src/vllm/model_executor/models/fvq.cpp

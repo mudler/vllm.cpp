@@ -497,8 +497,8 @@ values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
 
 **Not started or not finished**, in the order that unblocks a render:
 
-1. the SUPPLIED emotion vector (Path B above): `feat1.pt` / `feat2.pt`, a cosine
-   similarity and a weighted sum. Small, and it is what a first render needs;
+1. ~~the SUPPLIED emotion vector~~ PORTED as `emovec::Select`; what remains is
+   reading `feat1.pt` / `feat2.pt` out of the converted checkpoint;
 2. BigVGAN's separate checkpoint, which is not in this repository;
 3. W5 compose: drive the whole chain on real weights and emit a WAV;
 4. W6b, the two routes and ABI v19;

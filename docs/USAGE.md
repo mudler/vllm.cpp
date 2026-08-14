@@ -1070,9 +1070,13 @@ layer-17 hidden-state tap, the checkpoint's stored-statistics normalization and
 the semantic codec to discrete codes, and the talker's prompt is assembled from
 that conditioning plus the text -- but none of it is reachable from a command or
 a route yet. The greedy generate loop that turns the prompt into mel codes is
-ported too, so text plus a reference clip reaches mel CODES in the library; what
-is still missing before audio is the emotion vector the prompt expects, BigVGAN's
-separately-downloaded checkpoint, and any command or route to call it from.
+ported too, and so is the STATED-emotion path -- eight weights selecting rows
+from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
+text plus a reference clip and an emotion reaches mel CODES in the library. What
+is still missing before audio is reading those matrices out of the converted
+checkpoint, BigVGAN's separately-downloaded checkpoint, and any command or route
+to call it from. Inferring the emotion from a clip instead of stating it needs a
+Conformer and a Perceiver that are not ported.
 
 There is **no `/v1/audio/speech`**. Text to speech is not servable: the
 IndexTTS-2.5 stages are ported and gated at reduced dimensions, with further

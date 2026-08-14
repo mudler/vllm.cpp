@@ -2082,17 +2082,22 @@ TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, s
   // cannot see.
   constexpr int64_t T = 20, Hq = 8, Hkv = 2, Dh = 256, BS = 16;
   constexpr int64_t kBlocks = 4;                 // 4 blocks x 16 slots = 64 >= 20
-  constexpr int64_t qstride = Hq * Dh + 64;      // padded row (fused-view shape)
-  const size_t qn = static_cast<size_t>(T) * qstride;
+  const size_t qn = static_cast<size_t>(T) * Hq * Dh;
   const size_t kvn = static_cast<size_t>(T) * Hkv * Dh;
   const size_t cachen = static_cast<size_t>(kBlocks) * BS * Hkv * Dh;
   const std::vector<float> q = RandomVec(qn, 711);
   const std::vector<float> k = RandomVec(kvn, 712);
   const std::vector<float> v = RandomVec(kvn, 713);
-  // Non-sequential slot mapping (reverse-ish) to exercise the scatter.
-  std::vector<int64_t> slots(T);
-  for (int64_t i = 0; i < T; ++i) slots[i] = (i * 7 + 3) % (kBlocks * BS);
+  // The slot mapping must DERIVE from the logical position through the
+  // (shuffled) block table — exactly what the engine produces — otherwise the
+  // attention read of logical position p lands on a slot nothing wrote and
+  // both backends compare zeros (review on #497: the first version's
+  // (i*7+3)%64 scatter was disjoint from the block table, so the composition
+  // exercised mostly-unwritten cache).
   std::vector<int32_t> block_table = {3, 1, 2, 0};  // shuffled physical blocks
+  std::vector<int64_t> slots(T);
+  for (int64_t i = 0; i < T; ++i)
+    slots[i] = static_cast<int64_t>(block_table[static_cast<size_t>(i / BS)]) * BS + (i % BS);
   std::vector<int32_t> seq_lens = {T};
   std::vector<int32_t> qsl = {0, T};
   vt::PagedAttentionArgs pa;
@@ -2148,6 +2153,30 @@ TEST_CASE("ReshapeAndCache->PagedAttention composition matches CPU (real dims, s
     Tensor to = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, Hq, Dh});
     vt::PagedAttention(q_, to, tq, tkc, tvc, tbt, tsl, tqsl, pa);
     CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+
+    // Anti-vacuity guard (review on #497): a WRONG physical mapping must NOT
+    // reproduce the reference — if the composition were vacuous (reads never
+    // hitting writes), a corrupted table would compare equal. Blocks 0 and 2
+    // both carry real tokens under the true table, so swapping them must
+    // change the output.
+    // Swap the mapping of the first two LOGICAL blocks — both hold real
+    // tokens (0-15 and 16-19), so the read path changes. (The first version
+    // of this guard swapped two blocks OUTSIDE the logical range and was
+    // itself vacuous — the guard proved the guard.)
+    std::vector<int32_t> bad_table = {1, 3, 2, 0};
+    DevBufBytes dbt_bad(dev, q_, kBlocks * 4);
+    dbt_bad.Upload(bad_table.data());
+    DevBuf dout2(dev, q_, static_cast<size_t>(T) * Hq * Dh);
+    Tensor tbt2 = Tensor::Contiguous(dbt_bad.ptr(), DType::kI32, d, {1, kBlocks});
+    Tensor to2 = Tensor::Contiguous(dout2.ptr(), DType::kF32, d, {T, Hq, Dh});
+    vt::PagedAttention(q_, to2, tq, tkc, tvc, tbt2, tsl, tqsl, pa);
+    const std::vector<float> bad_out = dout2.Download();
+    bool any_diff = false;
+    for (size_t i = 0; i < ref_out.size(); ++i)
+      if (std::fabs(bad_out[i] - ref_out[i]) > 1e-3f) { any_diff = true; break; }
+    CHECK_MESSAGE(any_diff,
+                  "a corrupted block table must change the attention output — "
+                  "otherwise the composition test is vacuous");
     dev.DestroyQueue(q_);
   }
 }

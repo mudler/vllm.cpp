@@ -26,8 +26,10 @@
 #include <vector>
 
 #include "vt/ops.h"
+#include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_getblas_dualslot.h"
+#include "vt/rocm/rocm_runtime.h"
 
 namespace vt::rocm {
 namespace {
@@ -163,6 +165,20 @@ bool SkinnyGemmEnabled() {
     return true;
   }();
   return on;
+}
+
+// The wvSplitK port carries ONLY the wave32 reduction arm (`__shfl_xor(x,16)`);
+// upstream branches to ROW_BCAST15/31 on gfx9 (wave64) — NOT ported. Dispatch
+// must therefore be limited to wave32 architectures (gfx11xx/gfx12xx): on gfx9
+// the kernel would compile and produce SILENTLY WRONG sums (the xor-16 shuffle
+// does not complete a 64-wide reduction). Mirrors upstream's double guard
+// (`on_gfx9() or on_gfx1x()` at dispatch + the compile-time arch ifdef, with
+// UNREACHABLE_CODE for anything else) minus the gfx9 arm we do not have.
+bool SkinnyGemmArchOk(int device_index) {
+  static const std::string arch = vt::rocm::DeviceArchName(device_index);
+  const auto cap = vt::rocm::CapabilityFromGcnArch(arch);
+  if (!cap.has_value()) return false;  // unknown arch: refuse, never guess
+  return cap->first == 11 || cap->first == 12;  // gfx11xx / gfx12xx = wave32
 }
 
 // y[n] = alpha * dot(x[0:K], W[n,0:K]) + beta * y[n]
@@ -499,10 +515,19 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   }
 
   // Decode-skinny (M<=4) bf16: the wvSplitK port wins over the 128-tile GEMM
-  // (#487). Gate on the LDS-fit the sml variant needs (K*M activation fits the
-  // 64KB staging buffer); everything else stays on the BLAS path.
+  // (#487). The dispatch guards mirror the donor EXACTLY (review sweep on
+  // #506 found all three of these dropped, two of them memory-unsafe):
+  //   * N > 8 (upstream `m > 8`, utils.py:181 — the feature-dim lower bound;
+  //     at N==1 the kernel's y=1 store writes C[1] past the end of a 1-wide
+  //     output);
+  //   * N % YTILE == 0 (skinny_gemms.cu:1217 `M_in % _YTILE == 0`; YTILE=2 —
+  //     the last wave's y=1 store lands at C[N] on odd N);
+  //   * wave32 arch only (the gfx9 ROW_BCAST reduction arm is not ported);
+  //   * K % 8 == 0 and the LDS-fit (K*M activation fits the staging buffer);
+  //   everything else stays on the BLAS path.
   if (bf16 && out.dtype == DType::kBF16 && M >= 1 && M <= 4 && (K % 8) == 0 &&
-      a.stride[0] == K && K * M <= 32768 && SkinnyGemmEnabled()) {
+      N > 8 && (N % 2) == 0 && a.stride[0] == K && K * M <= 32768 &&
+      SkinnyGemmEnabled() && SkinnyGemmArchOk(q.device.index)) {
     WvSplitKBT(s, out.data, a.data, b.data, static_cast<int>(M), static_cast<int>(N),
                static_cast<int>(K), q.device.index);
     return;

@@ -2074,17 +2074,48 @@ TEST_CASE("MoeRouterTopK matches the CPU oracle (f32 and bf16 logits)") {
 }
 
 TEST_CASE("decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle") {
-  // The M<=4 bf16 decode GEMM routes to the wvSplitK port on ROCm (#487).
-  // Real decode shapes; bf16 in/out. NMSE vs the CPU oracle (split-K reduction
-  // order differs from the CPU sequential sum).
-  for (int64_t M : {1, 4}) {
-    for (auto [N, K] : {std::pair<int64_t,int64_t>{5120, 1024}, {1024, 2048}}) {
-      CAPTURE(M);
-      CAPTURE(N);
-      CAPTURE(K);
+  // Port of upstream's tests/kernels/quantization/test_rocm_skinny_gemms.py
+  // ::test_rocm_wvsplitk_kernel @ pin 55596792 (review sweep on #506: the first
+  // version of this case had aggregate-NMSE tolerance that ten completely
+  // wrong elements would still pass, every K a multiple of the 512 stride so
+  // the K-tail path never ran, and no guard-boundary shapes at all).
+  //
+  // Preserved from upstream: the NKM factor list (the applicable subset — see
+  // below), the xavier on/off scaling, and the ELEMENTWISE tolerance
+  // atol = eps_bf16 * sqrt(K), rtol = 1e-2 (torch.testing.assert_close
+  // semantics). Deferred with reason: fp16 (our port is bf16-only), bias
+  // (the vt::MatmulBT seam has no bias operand), padded strides (our dispatch
+  // requires contiguous rows — a documented precondition), and the fp8/rc
+  // kernel variants (not ported). The (n,k,m) upstream triple = (tokens, K,
+  // features) here.
+  struct Shape { int64_t tok, k, feat; const char* why; };
+  const Shape shapes[] = {
+      // the upstream sweep (token counts 1-4 = our template arms)
+      {1, 32, 16, "upstream"}, {1, 64, 64, "upstream"}, {2, 256, 256, "upstream"},
+      {3, 1024, 1024, "upstream"}, {4, 4096, 4096, "upstream"},
+      // K-tail: K % 512 != 0 exercises the `if (k_ >= K) break` remainder path
+      {4, 4096 + 16, 4096, "k-tail"}, {1, 9216, 512, "upstream"},
+      // guard boundaries (must stay CORRECT via the BLAS fallback)
+      {2, 256, 8, "features<=8 declines (upstream m>8)"},
+      {2, 256, 254, "even below bound: takes skinny"},
+      {2, 256, 255, "odd features decline (YTILE=2 OOB class)"},
+      {2, 254, 256, "K%8!=0 declines"},
+  };
+  const double kEpsBf16 = 0.0078125;  // 2^-8
+  for (const Shape& sh : shapes) {
+    for (bool xnorm : {false, true}) {
+      CAPTURE(sh.why);
+      CAPTURE(sh.tok);
+      CAPTURE(sh.k);
+      CAPTURE(sh.feat);
+      CAPTURE(xnorm);
+      const int64_t M = sh.tok, N = sh.feat, K = sh.k;
       const size_t an = static_cast<size_t>(M) * K, bn = static_cast<size_t>(N) * K;
-      const std::vector<float> a = RandomVec(an, 991);
-      const std::vector<float> b = RandomVec(bn, 992, -0.5f, 0.5f);
+      const double xavier = xnorm ? std::sqrt(2.0 / static_cast<double>(K)) : 1.0;
+      std::vector<float> a = RandomVec(an, 991, -1.0f, 1.0f);
+      std::vector<float> b = RandomVec(bn, 992, -1.0f, 1.0f);
+      for (float& x : a) x = static_cast<float>(x * xavier);
+      for (float& x : b) x = static_cast<float>(x * xavier);
       const std::vector<uint16_t> a_bf = Bf16Bits(a), b_bf = Bf16Bits(b);
 
       std::vector<uint16_t> ref(static_cast<size_t>(M) * N, 0);
@@ -2105,23 +2136,34 @@ TEST_CASE("decode-skinny MatmulBT (wvSplitK path) matches the CPU oracle") {
         vt::Backend& dev = vt::GetBackend(dt);
         Queue q = dev.CreateQueue();
         const Device d{dt, 0};
-        DevBufBytes da(dev, q, an * 2), db(dev, q, bn * 2), dout(dev, q, static_cast<size_t>(M) * N * 2);
+        // Sentinel-padded output: the dispatch must never write past M*N
+        // elements (the odd-features OOB class from the review).
+        const size_t out_elems = static_cast<size_t>(M) * N;
+        const size_t guard_elems = 128;
+        DevBufBytes da(dev, q, an * 2), db(dev, q, bn * 2),
+            dout(dev, q, (out_elems + guard_elems) * 2);
+        std::vector<uint16_t> fill(out_elems + guard_elems, 0xDEAD);
+        dout.Upload(fill.data());
         da.Upload(a_bf.data());
         db.Upload(b_bf.data());
         Tensor ta = Tensor::Contiguous(da.ptr(), DType::kBF16, d, {M, K});
         Tensor tb = Tensor::Contiguous(db.ptr(), DType::kBF16, d, {N, K});
         Tensor to = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
         vt::MatmulBT(q, to, ta, tb);
-        std::vector<uint16_t> got(static_cast<size_t>(M) * N);
+        std::vector<uint16_t> got(out_elems + guard_elems);
         dout.Download(got.data());
-        // bf16 outputs; compare as f32 NMSE.
-        std::vector<float> gf(got.size()), rf(got.size());
-        for (size_t i = 0; i < got.size(); ++i) {
+        // Elementwise tolerance (upstream assert_close), never aggregate NMSE.
+        const double atol = kEpsBf16 * std::sqrt(static_cast<double>(K));
+        for (size_t i = 0; i < out_elems; ++i) {
           uint32_t ug = static_cast<uint32_t>(got[i]) << 16, ur = static_cast<uint32_t>(ref[i]) << 16;
-          std::memcpy(&gf[i], &ug, 4);
-          std::memcpy(&rf[i], &ur, 4);
+          float gf, rf;
+          std::memcpy(&gf, &ug, 4);
+          std::memcpy(&rf, &ur, 4);
+          CHECK(std::fabs(gf - rf) <= atol + 1e-2 * std::fabs(rf));
         }
-        CHECK(Nmse(rf, gf) <= kNmseTol);
+        // The guard band must be untouched by ANY path (skinny or BLAS).
+        for (size_t i = out_elems; i < out_elems + guard_elems; ++i)
+          CHECK(got[i] == 0xDEAD);
         dev.DestroyQueue(q);
       }
     }

@@ -55,30 +55,7 @@ const std::vector<float>& MiniMaxH3AudioVaeWeights::Get(const std::string& name)
 }
 
 
-std::vector<float> MiniMaxH3MaterializeWeightNorm(const std::vector<float>& g,
-                                                  const std::vector<float>& v,
-                                                  int64_t out_channels) {
-  VT_CHECK(out_channels > 0 && v.size() % static_cast<size_t>(out_channels) == 0,
-           "minimax_h3 audio vae: weight-norm direction does not divide by out_channels");
-  const int64_t per_out = static_cast<int64_t>(v.size()) / out_channels;
-  VT_CHECK(static_cast<int64_t>(g.size()) == out_channels,
-           "minimax_h3 audio vae: weight-norm magnitude must have one value per output channel");
-  std::vector<float> out(v.size());
-  for (int64_t c = 0; c < out_channels; ++c) {
-    double norm = 0.0;
-    for (int64_t i = 0; i < per_out; ++i) {
-      const double value = v[static_cast<size_t>(c * per_out + i)];
-      norm += value * value;
-    }
-    norm = std::sqrt(norm);
-    const double scale = norm > 0.0 ? static_cast<double>(g[static_cast<size_t>(c)]) / norm : 0.0;
-    for (int64_t i = 0; i < per_out; ++i) {
-      out[static_cast<size_t>(c * per_out + i)] =
-          static_cast<float>(v[static_cast<size_t>(c * per_out + i)] * scale);
-    }
-  }
-  return out;
-}
+// The weight-norm fold now lives in `vocoder1d::MaterializeWeightNorm`.
 
 // The anti-aliased activation, `Activation1d`: upsample by `ratio` -> Snake(Beta)
 // -> downsample by `ratio` (MiniMax-H3: dac_alias_free_act.py +
@@ -110,7 +87,7 @@ std::vector<float> MiniMaxH3AudioVaeDecode(const MiniMaxH3AudioVaeConfig& config
   act.Build();
 
   auto conv_weight = [&](const std::string& prefix, int64_t out_channels) {
-    return MiniMaxH3MaterializeWeightNorm(weights.Get(prefix + ".parametrizations.weight.original0"),
+    return vocoder1d::MaterializeWeightNorm(weights.Get(prefix + ".parametrizations.weight.original0"),
                                           weights.Get(prefix + ".parametrizations.weight.original1"),
                                           out_channels);
   };
@@ -317,7 +294,7 @@ std::vector<float> WnConv1d(const MiniMaxH3AudioVaeWeights& weights, const std::
                             int64_t out_channels, int64_t kernel, int64_t stride, int64_t dilation,
                             int64_t padding, int64_t* out_len) {
   const std::vector<float> w =
-      MiniMaxH3MaterializeWeightNorm(weights.Get(prefix + ".parametrizations.weight.original0"),
+      vocoder1d::MaterializeWeightNorm(weights.Get(prefix + ".parametrizations.weight.original0"),
                                      weights.Get(prefix + ".parametrizations.weight.original1"),
                                      out_channels);
   VT_CHECK(static_cast<int64_t>(w.size()) == out_channels * in_channels * kernel,

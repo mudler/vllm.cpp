@@ -487,11 +487,11 @@ struct MiniMaxH3AudioVaeWeights {
   bool Has(const std::string& name) const { return tensors.count(name) != 0; }
 };
 
-// torch weight_norm: w = g * v / ||v||, norm over every dim except dim 0. Every
-// conv in this decoder is weight-normalized, so the checkpoint stores (g, v).
-std::vector<float> MiniMaxH3MaterializeWeightNorm(const std::vector<float>& g,
-                                                  const std::vector<float>& v,
-                                                  int64_t out_channels);
+// Every conv in this decoder is weight-normalized, so the checkpoint stores
+// (g, v). The fold `w = g * v / ||v||` moved to `vocoder1d::MaterializeWeightNorm`
+// when MiniMax-Music3's vocoder became its second consumer: a model's header is
+// not a home for something two lanes share, and a second copy of the reduction
+// axis is the duplicate that goes wrong quietly.
 
 struct StTensor;
 class SafetensorsFile;

@@ -11,6 +11,8 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <string>
 #include <vector>
 
 namespace vllm {
@@ -112,6 +114,67 @@ std::vector<float> DenseTdnnBlock(const std::vector<float>& x, int64_t in_channe
                                   int64_t bn_channels, int64_t growth, int64_t kernel,
                                   int64_t dilation, int64_t seg_len,
                                   const std::vector<DenseTdnnLayerWeights>& layers, double eps);
+
+
+// ── FCM 2-D front end (DTDNN.py:13-47) ──────────────────────────────────────
+// The head runs over the [1, feat_dim, T] spectrogram as a 2-D image, so these
+// are genuine Conv2d/BatchNorm2d, not the 1-D forms above.
+
+struct ResBlock2dWeights {
+  std::vector<float> conv1, bn1_gamma, bn1_beta, bn1_mean, bn1_var;
+  std::vector<float> conv2, bn2_gamma, bn2_beta, bn2_mean, bn2_var;
+  // Present only when the block downsamples or changes width.
+  std::vector<float> short_conv, short_gamma, short_beta, short_mean, short_var;
+  bool has_shortcut = false;
+};
+
+// BasicResBlock (layers.py:218-252). THE STRIDE IS (stride, 1): it subsamples
+// the FREQUENCY axis and leaves TIME untouched. Striding both still yields a
+// well-formed tensor at half the frame rate, which every later layer accepts.
+// Returns [planes, ceil(h/stride), w]; `out_h` reports the height.
+std::vector<float> ResBlock2d(const std::vector<float>& x, int64_t in_planes, int64_t h, int64_t w,
+                              int64_t planes, int64_t stride, const ResBlock2dWeights& weights,
+                              double eps, int64_t* out_h);
+
+
+// ── the whole encoder ───────────────────────────────────────────────────────
+
+// Weights keyed by UPSTREAM state_dict name, which is what a real checkpoint
+// carries. Looking a tensor up by name (rather than by position) is what makes a
+// missing one throw BY NAME instead of reading as zeros.
+struct CampplusWeights {
+  std::map<std::string, std::vector<float>> t;
+  const std::vector<float>& Get(const std::string& name) const;
+  bool Has(const std::string& name) const { return t.count(name) != 0; }
+};
+
+struct CampplusParams {
+  int64_t feat_dim = 80;
+  int64_t embedding_size = 512;
+  int64_t growth_rate = 32;
+  int64_t bn_size = 4;
+  int64_t init_channels = 128;
+  int64_t m_channels = 32;   // FCM's fixed width (DTDNN.py:17)
+  int64_t seg_len = 100;
+  double eps = 1e-5;
+};
+
+// Optional capture of an intermediate activation. StatsPool averages over time,
+// so the final embedding CANNOT see a frame-count change: a wrong stride,
+// dilation or padding in the TDNN head still yields a plausible embedding. The
+// post-TDNN tensor is therefore gated directly rather than through the output.
+struct ForwardTrace {
+  std::vector<float> tdnn;
+  int64_t tdnn_channels = 0;
+  int64_t tdnn_frames = 0;
+};
+
+// CAMPPlus::forward (DTDNN.py:111-115). Input is [T, feat_dim] in (T, F) order,
+// as `infer_v2_5.py` supplies it; the encoder permutes to (F, T) internally.
+// Returns the embedding, [embedding_size].
+std::vector<float> Forward(const CampplusParams& params, const CampplusWeights& weights,
+                           const std::vector<float>& feats, int64_t frames,
+                           ForwardTrace* trace = nullptr);
 
 }  // namespace campplus
 }  // namespace models

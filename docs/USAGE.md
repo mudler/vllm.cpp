@@ -198,6 +198,26 @@ build/examples/vllm-cli \
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
 
+`--model` resolves a Qwen3.5-family checkpoint's backbone under EITHER weight
+namespace. The multimodal wrappers (`Qwen3_5ForConditionalGeneration`,
+`Qwen3_5MoeForConditionalGeneration`) publish the text backbone nested under
+`model.language_model.`; the text-only arms (`Qwen3_5ForCausalLM`,
+`Qwen3_5MoeForCausalLM`) publish it flat under `model.`. The loader decides which
+ONCE per checkpoint from the shard index, and REFUSES a checkpoint that carries
+backbone tensors under both rather than binding half the model from each.
+
+**Resolving the namespace is not the same as loading the checkpoint, and the
+MoE and dense arms differ.** The dense loader routes each projection to BF16,
+FP8 or NVFP4 by tensor presence, so a flat bf16 `Qwen3_5ForCausalLM` checkpoint
+is expected to load. The **MoE** loader reads only PER-EXPERT NVFP4 routed
+experts, while the published MoE repos (`Qwen/Qwen3.8-2.4T-A95B`,
+`Qwen/Qwen3.6-35B-A3B`) ship 3-D stacked, unquantized experts — that arm is
+**not implemented**, and such a checkpoint is refused at load with a message
+naming what is missing. Use an NVFP4 requant (e.g.
+`nvidia/Qwen3.6-35B-A3B-NVFP4`) for the MoE path. No text-only Qwen3.5
+checkpoint has been RUN here at all — see [STATUS.md](STATUS.md) for the owed
+run gates.
+
 GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
 host's native filesystem encoding, including Unicode paths on Windows. Native
 Windows release artifacts are not published yet; they will remain unavailable
@@ -368,7 +388,7 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
-| `NemotronHForCausalLM` | The Mamba2 forward is not ported yet (#517 W4, blocked on #496). Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
+| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) but there is no weight LOADER yet, so a checkpoint still cannot be run: loading leaves the weights unmaterialized and the forward refuses by name. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
@@ -1044,6 +1064,13 @@ Registered in
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
 
+There is **no `/v1/audio/speech`**. Text to speech is not servable: the
+IndexTTS-2.5 stages are ported and gated, but no route is registered, the public
+ABI carries no synthesis entry point, and loading the family refuses with a
+message naming the missing pieces (#634). Asking a running server for speech
+today is a 404 at the route table, not a runtime error, and that is the accurate
+signal: the capability does not reach any surface yet.
+
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it — every prompt position is scored against the token
 that followed it, accumulated across chunked prefill — but the **response body
@@ -1123,7 +1150,7 @@ a stop token early.
 | `--enable-radix-attention` / `--disable-radix-attention` | model default | SGLang-named alias for the prefix-cache toggle |
 | `--enable-jump-forward` | off | Jump-forward decoding for structured output (token-unique subset) |
 | `--enable-force-include-usage` | off | Force the usage block in responses |
-| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls` |
+| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (42 names over 38 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls`. **`inkling` needs `"skip_special_tokens": false` on the request today** — its whole grammar is special tokens and we have no `adjust_request` seam to force the flag off for you, so at the `true` default the detokenizer strips the markers before the parser runs ([#695](https://github.com/mudler/vllm.cpp/issues/695)). `--reasoning-parser inkling` is not registered at all ([#703](https://github.com/mudler/vllm.cpp/issues/703)) |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
@@ -1802,6 +1829,26 @@ Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
 | `video_url` | video |
 | `input_audio` / `audio_url` | audio |
 
+### Per-prompt input limits — the mechanism exists, the flags do not yet
+
+vLLM caps how many items of each modality one prompt may carry
+(`--limit-mm-per-prompt`), and `--language-model-only` is sugar for setting every
+one of those limits to 0, which makes the server refuse multimodal requests
+outright. **Neither flag is accepted yet** — `vllm-server` still exits on both,
+and there is no config key or C ABI field for them.
+
+What landed (#607, wave L1) is the mechanism underneath, as library-internal
+headers only: `vllm::MultiModalConfig::GetLimitPerPrompt`
+([`config/multimodal.h`](../include/vllm/config/multimodal.h)) resolving
+upstream's precedence, and the refusal it carries
+([`multimodal/processing/context.h`](../include/vllm/multimodal/processing/context.h)),
+which raises `vllm::v1::InputValidationError` — the same type the API server
+answers with HTTP 400. Nothing constructs that config on a live request, so
+**today no request is limited or refused on item count**, and a chat request
+carrying several images still has all but the first silently dropped by
+`chat_mm.cpp`. Wave L2 adds the two flags, the C ABI field, and the call-site
+wiring that makes the limits take effect.
+
 ## MiniMax-H3 browser console (`vllm-video-studio`)
 
 A standalone browser console for MiniMax-H3, deliberately **separate** from the
@@ -2176,3 +2223,95 @@ NVFP4) and misses `.bias` (BF16, so a different unpack path) while the config
 still says the projection is biased. Without the refusal that renders a plausible
 video for the wrong prompt: every conditioning row is shifted by the missing bias
 and every padded row projects to 0 instead of to the bias.
+
+## MiniMax-Music3: the checkpoint loader
+
+**It loads, it does not generate.** `include/vllm/model_executor/models/`
+`minimax_music3_loader.h` is phase W1 of #672 — it resolves the shipped
+`diffusers` layout, parses the six component configs, and accounts every tensor
+in the files against what those configs owe. No forward, no scheduler step and
+no audio; those are W2-W7, and nothing below produces a song.
+
+Point it at the **diffusers arm**, the six-component tree:
+
+```
+minimax-music3/
+  modular_model_index.json
+  transformer/           config.json + 2 shards + index   441 tensors  F32
+  condition_encoder/     config.json + 1 file               4 tensors  F32
+  rvq_depth_decoder/     config.json + 1 file              47 tensors  BF16
+  vocoder/               config.json + 1 file             121 tensors  F32
+  language_model/        config.json + 4 shards + index   399 tensors  BF16
+  scheduler/scheduler_config.json
+  tokenizer/
+```
+
+`MiniMaxMusic3ResolveCheckpoint` refuses anything else **by name**, and the
+refusal you are most likely to hit is the useful one. The same repository also
+ships a **native** arm — `qwen_7B/qwen_7B/`, `flowmatching_vae.pth`, `dav.pth` —
+which SGLang-Omni serves and which holds every weight this port needs in a layout
+nothing here reads. Pointed at that tree the loader names it as the native arm,
+lists the diffusers components it lacks, and tells you to convert it with
+diffusers' `scripts/convert_minimax_music3_to_diffusers.py`. It is never
+silently mis-loaded.
+
+Two things the loader enforces that a correctness gate later could not catch:
+
+**On-disk dtype and runtime dtype are different things, and the loader keeps
+them apart.** The files store F32 for the transformer, condition encoder and
+vocoder and BF16 for the RVQ depth decoder and language model, and
+`MiniMaxMusic3AccountTensors` refuses a file that disagrees. That set is *not* a
+runnable configuration. Upstream casts in exactly two places, `denoise.py:83`
+(condition encoder output into the transformer) and `decoders.py:84` (latents
+into the vocoder), and never on the way in: `denoise.py:82` hands the language
+model's hidden states to the condition encoder with a device move and no dtype
+move. So the autoregressive half must share one dtype, and loading the on-disk
+set raises `Input type (c10::BFloat16) and bias type (float) should be the same`
+from `condition_embedder_minimax_music3.py:64`.
+
+`MiniMaxMusic3ResolveRuntimeDtypes` answers the runtime question.
+`kBf16ArFp32Acoustic` is the gated configuration: language model, depth decoder
+and condition encoder in bf16, transformer and vocoder in fp32.
+`MiniMaxMusic3CheckRuntimeDtypes` refuses a violation by name, listing all three
+autoregressive components with their dtypes, because upstream's own error names
+a bias dtype and never says which component disagreed with which.
+`kAsStored` is kept selectable so that failure stays reproducible; it is
+reported as not runnable rather than quietly repaired.
+
+**The vocoder's weight norm is folded at load.** Its 30 weight-normed
+convolutions ship as torch's legacy `weight_g`/`weight_v` pairs;
+`MiniMaxMusic3LoadVocoderWeights` collapses each to a single `<module>.weight`
+through `vocoder1d::MaterializeWeightNorm`, so no `_g`/`_v` name survives and
+nothing downstream can read the direction `v` as if it were the weight. Four of
+the thirty are `ConvTranspose1d`, whose weight is `[C_in, C_out, K]` — torch
+reduces over dimension 0 either way, which for those four is the *input* channel.
+
+### Running its gate
+
+The suite needs no checkpoint. `tests/vllm/models/minimax_music3_manifest.inc`
+carries the real checkpoint's own safetensors headers — 1012 entries of names,
+dtypes and shapes, no weight bytes — and every geometry claim is asserted
+against it:
+
+```sh
+cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON
+cmake --build build -j 8 --target test_minimax_music3_loader
+./build/tests/test_minimax_music3_loader
+```
+
+One test case additionally exercises the real 27 GB tree when you name it, and
+loudly skips when you do not:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_loader
+```
+
+Regenerate the manifest after a checkpoint revision moves — it reads headers
+only, so it does not stream the weights:
+
+```sh
+python3 scripts/gen-minimax-music3-manifest.py \
+  --checkpoint /path/to/minimax-music3 \
+  --output tests/vllm/models/minimax_music3_manifest.inc
+```

@@ -30,6 +30,24 @@ inline constexpr ModelInfo kQwen3_5Info{
     .score_type = "bi-encoder",
 };
 
+// The same record for the TEXT-ONLY arms `Qwen3_5ForCausalLM` /
+// `Qwen3_5MoeForCausalLM`, whose upstream base `Qwen3_5ForCausalLMBase`
+// inherits HasInnerState + IsHybrid but NOT SupportsMultiModal
+// (vllm/model_executor/models/qwen3_5.py:287-296 @ `ad5d29db7`, PR #50210 —
+// AHEAD of our `555967922` parity pin and recorded as such). Their multimodal
+// wrappers are the separate `ForConditionalGeneration` registrations, so the
+// ONLY difference is supports_multimodal. `has_inner_state` stays false for the
+// same reason `KimiLinearForCausalLM` leaves it false: our ModelInfo is a
+// consumed subset whose only reader short-circuits on is_hybrid.
+inline constexpr ModelInfo kQwen3_5TextInfo{
+    .is_text_generation_model = true,
+    .is_pooling_model = false,
+    .is_hybrid = true,
+    .has_inner_state = false,
+    .supports_multimodal = false,
+    .score_type = "bi-encoder",
+};
+
 // Per-family config hook. LoadHfConfig/HfConfigFromGguf already materialize the
 // consumed Qwen fields; this explicit hook is where a family adds normalization
 // or validation without changing the registry/runner contract.

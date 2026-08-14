@@ -155,6 +155,16 @@ jobs:
         # so this needs no model, no GPU and no quiet box.
         run: |
           python3 tests/scripts/test_cpu_x86_llamacpp_floor.py
+      - name: The IndexTTS-2.5 port still matches the shipped checkpoint (#634)
+        # These three read committed copies of the checkpoint's own config and
+        # safetensors header, so they need no network, no weights and no GPU.
+        # They landed in #727 and earlier WITHOUT a CI line, which made them
+        # run-if-you-remember rather than gates; wiring them is the point.
+        run: |
+          python3 tests/scripts/test_indextts2_config_contract.py
+          python3 tests/scripts/test_indextts2_emotion_arch_covered.py
+          python3 tests/scripts/test_indextts2_pth_manifest.py
+          python3 tests/scripts/test_vocoder1d_single_home.py
       - name: Critical regression tests remain executable and CTest-registered
         run: |
           python3 scripts/check-test-registration.py

@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Emit tests/vllm/models/w2vbert_goldens.inc — the w2v-bert-2.0 parity oracle.
+
+IndexTTS-2.5's reference-audio path runs `Wav2Vec2BertModel` (infer_v2_5.py:174)
+over the 16 kHz clip to produce the semantic features EnhancedCodec quantizes.
+The encoder is a CONFORMER: macaron feed-forwards around self-attention and a
+depthwise convolution module.
+
+The oracle is HuggingFace `transformers` executed DIRECTLY — the class IndexTTS
+itself instantiates, so there is no restatement and no risk of being faithful to
+the wrong thing. `transformers` is an admissible secondary oracle under AGENTS.md
+for exactly this case: a model's own reference implementation, which vLLM mirrors
+rather than replaces.
+
+Reduced dimensions on CPU; weights rebuilt both sides from one FNV-1a ->
+splitmix64 stream, so no weight byte is checked in.
+
+Usage:  python3 scripts/gen-w2vbert-goldens.py --out tests/vllm/models/w2vbert_goldens.inc
+"""
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import numpy as np, torch
+from transformers import Wav2Vec2BertConfig
+from transformers.models.wav2vec2_bert.modeling_wav2vec2_bert import (
+    Wav2Vec2BertEncoderLayer, Wav2Vec2BertFeatureProjection, Wav2Vec2BertEncoder)
+
+MASK = (1 << 64) - 1
+def fnv(n: str) -> int:
+    h = 0xCBF29CE484222325
+    for b in n.encode(): h ^= b; h = (h * 0x100000001B3) & MASK
+    return h
+def sm(x: int) -> int:
+    x = (x + 0x9E3779B97F4A7C15) & MASK
+    z = x
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & MASK
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & MASK
+    return z ^ (z >> 31)
+def rnd(name: str, n: int, scale: float) -> np.ndarray:
+    s = fnv(name); o = np.empty(n)
+    for i in range(n): o[i] = (((sm((s + i) & MASK) >> 11) * 2.0**-53) * 2 - 1) * scale
+    return o
+def P(name, shape, scale=0.3):
+    n = 1
+    for d in shape: n *= d
+    return torch.tensor(rnd(name, n, scale), dtype=torch.float64).reshape(shape).float()
+
+def main() -> int:
+    ap = argparse.ArgumentParser(); ap.add_argument("--out", required=True)
+    a = ap.parse_args()
+    torch.manual_seed(0)
+
+    cfg = Wav2Vec2BertConfig(
+        hidden_size=16, num_attention_heads=2, intermediate_size=32,
+        conv_depthwise_kernel_size=7, position_embeddings_type="relative_key",
+        hidden_act="swish", layer_norm_eps=1e-5,
+    )
+    layer = Wav2Vec2BertEncoderLayer(cfg).eval()
+    manifest = []
+    with torch.no_grad():
+        for n, q in list(layer.named_parameters()) + list(layer.named_buffers()):
+            if n.endswith("num_batches_tracked"): continue
+            v = P(n, tuple(q.shape) if q.dim() else (1,))
+            if n.endswith("running_var"): v = v.abs() + 0.5
+            q.copy_(v.reshape(q.shape)); manifest.append((n, list(q.shape)))
+    T = 12
+    x = P("hidden", (1, T, cfg.hidden_size), 1.0)
+    tap = {}
+    layer.ffn1.register_forward_hook(lambda m, i, o: tap.__setitem__("ffn1", o.detach().clone()))
+    layer.conv_module.register_forward_hook(lambda m, i, o: tap.__setitem__("conv", o.detach().clone()))
+    layer.self_attn.register_forward_hook(lambda m, i, o: tap.__setitem__("attn", o[0].detach().clone()))
+    attn_in = {}
+    # self_attn is called with KEYWORD args, so a positional pre-hook sees an
+    # empty tuple; the preceding layer_norm's OUTPUT is the same tensor.
+    layer.self_attn_layer_norm.register_forward_hook(
+        lambda m, i, o: attn_in.__setitem__("x", o.detach().clone()))
+    with torch.no_grad():
+        out, _ = layer(x)
+    # the conv module's INPUT is the post-attention state; capture it so the
+    # module can be gated standalone rather than only through the whole layer.
+    conv_in = {}
+    layer.conv_module.register_forward_pre_hook(
+        lambda m, i: conv_in.__setitem__("x", i[0].detach().clone()))
+    with torch.no_grad():
+        layer(x)
+
+    # ---- feature projection + a 2-layer encoder stack ----
+    # `embed_positions` is None for relative_key (only "relative"/"rotary" build
+    # one), and the encoder applies NO final norm after the stack.
+    IN_DIM = 10
+    cfg2 = Wav2Vec2BertConfig(
+        hidden_size=cfg.hidden_size, num_attention_heads=cfg.num_attention_heads,
+        intermediate_size=cfg.intermediate_size,
+        conv_depthwise_kernel_size=cfg.conv_depthwise_kernel_size,
+        position_embeddings_type="relative_key", hidden_act="swish",
+        layer_norm_eps=cfg.layer_norm_eps, feature_projection_input_dim=IN_DIM,
+        num_hidden_layers=2,
+    )
+    proj = Wav2Vec2BertFeatureProjection(cfg2).eval()
+    enc = Wav2Vec2BertEncoder(cfg2).eval()
+    pman = []
+    with torch.no_grad():
+        for mod, pre in ((proj, "fp"), (enc, "enc")):
+            for n, q in list(mod.named_parameters()) + list(mod.named_buffers()):
+                if n.endswith("num_batches_tracked"): continue
+                nm = pre + "." + n
+                v = P(nm, tuple(q.shape) if q.dim() else (1,))
+                q.copy_(v.reshape(q.shape)); pman.append((nm, list(q.shape)))
+    feats_in = P("feats_in", (1, T, IN_DIM), 1.0)
+    with torch.no_grad():
+        projected, _ = proj(feats_in)
+        stacked = enc(projected).last_hidden_state
+
+    def emit(f, name, t):
+        arr = np.asarray(t.detach().numpy(), dtype=np.float32).reshape(-1)
+        f.write(f"inline constexpr float {name}[] = {{\n")
+        for i in range(0, len(arr), 6):
+            f.write("    " + ", ".join(f"{v:.9e}F" for v in arr[i:i+6]) + ",\n")
+        f.write("};\n\n")
+
+    p = Path(a.out)
+    with p.open("w") as f:
+        f.write("// GENERATED by scripts/gen-w2vbert-goldens.py -- do not edit.\n")
+        f.write("// HuggingFace transformers Wav2Vec2BertEncoderLayer executed DIRECTLY\n")
+        f.write("// (the class IndexTTS-2.5 instantiates, infer_v2_5.py:174), at reduced\n")
+        f.write("// dimensions on CPU. Weights rebuilt both sides from one FNV-1a ->\n")
+        f.write("// splitmix64 stream; no weight byte is checked in.\n")
+        f.write("#pragma once\n\n#include <cstdint>\n\nnamespace w2vbert_goldens {\n\n")
+        for n, v in (("kHidden", cfg.hidden_size), ("kHeads", cfg.num_attention_heads),
+                     ("kIntermediate", cfg.intermediate_size),
+                     ("kConvKernel", cfg.conv_depthwise_kernel_size), ("kFrames", T)):
+            f.write(f"inline constexpr int64_t {n} = {v};\n")
+        f.write(f'inline constexpr double kLayerNormEps = {cfg.layer_norm_eps!r};\n')
+        f.write(f"\ninline constexpr int64_t kManifestSize = {len(manifest)};\n\n")
+        f.write("struct ManifestEntry { const char* name; int64_t rank; int64_t d0, d1, d2; };\n")
+        f.write("inline constexpr ManifestEntry kManifest[] = {\n")
+        for nm, sh in manifest:
+            d = list(sh) + [1, 1, 1]
+            f.write(f'    {{"{nm}", {len(sh)}, {d[0]}, {d[1]}, {d[2]}}},\n')
+        f.write("};\n\n")
+        f.write(f"inline constexpr int64_t kLeftMax = {cfg.left_max_position_embeddings};\n")
+        f.write(f"inline constexpr int64_t kRightMax = {cfg.right_max_position_embeddings};\n\n")
+        emit(f, "kAttnIn", attn_in["x"])
+        emit(f, "kAttnOut", tap["attn"])
+        emit(f, "kFfn1Out", tap["ffn1"])
+        emit(f, "kConvIn", conv_in["x"])
+        emit(f, "kConvOut", tap["conv"])
+        emit(f, "kLayerOut", out)
+        f.write(f"inline constexpr int64_t kInDim = {IN_DIM};\n")
+        f.write("inline constexpr int64_t kNumLayers = 2;\n")
+        f.write(f"inline constexpr int64_t kModelManifestSize = {len(pman)};\n\n")
+        f.write("inline constexpr ManifestEntry kModelManifest[] = {\n")
+        for nm, sh in pman:
+            d = list(sh) + [1, 1, 1]
+            f.write(f'    {{"{nm}", {len(sh)}, {d[0]}, {d[1]}, {d[2]}}},\n')
+        f.write("};\n\n")
+        emit(f, "kFeatsIn", feats_in)
+        emit(f, "kProjected", projected)
+        emit(f, "kStacked", stacked)
+        f.write("}  // namespace w2vbert_goldens\n")
+    print(f"wrote {p}: {len(manifest)} tensors, T={T}, hidden={cfg.hidden_size}")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -89,5 +89,26 @@ struct AliasFreeActivation1d {
 std::vector<float> KaiserSincFilter1d(double cutoff, double half_width,
                                                int64_t kernel_size);
 
+// torch `weight_norm`: w = g * v / ||v||, the norm taken over every dimension
+// EXCEPT dim 0. A pure function of the stored parameters, so every consumer
+// folds it once at load rather than reproducing the parameterization per
+// forward — which is what torch itself caches.
+//
+// `dim0` is the size of dimension 0 of `v`, and naming it that rather than
+// `out_channels` is deliberate: for an `nn.Conv1d` weight [C_out, C_in, K] dim 0
+// IS the output channel, but for the `nn.ConvTranspose1d` weight
+// [C_in, C_out, K] it is the INPUT channel, and torch normalizes over dim 0
+// either way. MiniMax-Music3's vocoder carries both spellings in one file
+// (minimax_music3_vocoder.py:55 transpose, :42/:44/:89/:98 conv), so a helper
+// that assumed "out channels" would fold four of its thirty convolutions over
+// the wrong axis while still producing finite, correctly shaped weights.
+//
+// Second consumer, hence its home here rather than in a model's header:
+// MiniMax-H3's audio VAE (`parametrizations.weight.original0/1`, the modern
+// spelling) and MiniMax-Music3's vocoder (`weight_g`/`weight_v`, the legacy
+// one). Same arithmetic, different era.
+std::vector<float> MaterializeWeightNorm(const std::vector<float>& g,
+                                         const std::vector<float>& v, int64_t dim0);
+
 }  // namespace vocoder1d
 }  // namespace vllm

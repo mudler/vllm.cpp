@@ -22,10 +22,28 @@ reconciliation, not a silent follow. The same shape applies to any future
 diffusers-only model: the H3 integration landed the same way (#14355, refactored
 by #14371).
 
-**Not gateable yet:** nothing in this repository has executed `diffusers` as an
-oracle. #647 owes the measurement; [`../specs/minimax-music3.md`](../specs/minimax-music3.md)
-W0 is where it gets taken, and this record flips to `gateable = yes` when the
-oracle demonstrably builds and runs the model.
+**Gateable since 2026-08-14, because it generated audio.** The bar is that the
+oracle demonstrably *builds and runs the model* — constructing a pipeline object
+proves nothing — and it now does:
+[`tools/oracle/music3_oracle.py`](../../tools/oracle/music3_oracle.py) loads all
+seven MiniMax-Music3 components from the local diffusers-arm checkpoint and
+generates a 44100 Hz stereo waveform of shape `(1, 2, 44032)` from a fixed seed.
+The per-stage reference tensors, the resolved environment and the request that
+produced them are in
+[`tests/parity/goldens/minimax_music3_oracle/manifest.json`](../../tests/parity/goldens/minimax_music3_oracle/manifest.json).
+
+The script **asserts the installed revision** against the pin below before it
+loads a weight, reading the distribution's recorded VCS commit rather than
+trusting the venv, because a venv silently holding a different revision than the
+record claims is a failure this project has already paid for once.
+
+Two facts that record scope rather than success. The capture ran **on CPU**, so
+nothing here is a speed measurement — it is a correctness reference. And the
+on-disk dtypes are **not** a runnable configuration: upstream's pipeline casts
+only condition→transformer and latents→vocoder, so the condition encoder and the
+depth decoder must share the language model's dtype. The gated configuration is
+bf16 autoregressive half / fp32 acoustic half; `tools/oracle/README.md` records
+the exact error the alternative raises.
 
 ```oracle-pin
 id = diffusers
@@ -34,7 +52,7 @@ upstream = https://github.com/huggingface/diffusers
 scope = schedulers, VAEs and diffusion pipelines vLLM-Omni does not implement, including models whose only reference implementation is an unmerged diffusers PR
 pin = c6da9936e4bda83107943a16eb8682e9a37d8527
 pin_label = PR #14456 head (minimax-music3-integration)
-pinned_on = 2026-08-13
-gateable = no
-evidence = #647
+pinned_on = 2026-08-14
+gateable = yes
+evidence = tests/parity/goldens/minimax_music3_oracle/manifest.json
 ```

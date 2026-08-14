@@ -48,6 +48,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"  // MakeOwned + bf16 helpers
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 namespace {
@@ -65,8 +66,16 @@ bool RawBool(const nlohmann::json& doc, const char* key, bool fallback) {
 
 // Downcast a contiguous F32 buffer to bf16 (round-to-nearest-even), the same
 // rounding torch's .to(bfloat16) and vt::F32ToBF16 use.
-void F32ToBf16Into(const float* src, int64_t n, uint16_t* dst) {
-  for (int64_t i = 0; i < n; ++i) dst[i] = vt::F32ToBF16(src[i]);
+// `src` is `const void*`: every caller below hands it a pointer INTO the mmap'd
+// safetensors payload, whose per-tensor byte offset is the running total of
+// everything ahead of it and so need not be a multiple of 4. Forming or loading
+// through a `const float*` there is undefined (issue #627); vt::LoadUnaligned is
+// the project's seam for it.
+void F32ToBf16Into(const void* src, int64_t n, uint16_t* dst) {
+  const auto* bytes = static_cast<const uint8_t*>(src);
+  for (int64_t i = 0; i < n; ++i) {
+    dst[i] = vt::F32ToBF16(vt::LoadUnaligned<float>(bytes + i * 4));
+  }
 }
 
 // F32 tensor -> owned bf16, copied verbatim (optionally reshaped). Mirrors
@@ -80,8 +89,7 @@ OwnedTensor LoadF32ToBf16Direct(const TensorResolver& get, const std::string& na
   const int64_t n = o.Numel();
   VT_CHECK(t.nbytes == static_cast<size_t>(n) * sizeof(float),
            "olmo2: byte-size mismatch for " + name);
-  F32ToBf16Into(reinterpret_cast<const float*>(t.data), n,
-                reinterpret_cast<uint16_t*>(o.bytes.data()));
+  F32ToBf16Into(t.data, n, reinterpret_cast<uint16_t*>(o.bytes.data()));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
@@ -96,11 +104,13 @@ OwnedTensor LoadF32ToBf16Transposed(const TensorResolver& get,
   const int64_t out_dim = t.shape[0];
   const int64_t in_dim = t.shape[1];
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-  const auto* src = reinterpret_cast<const float*>(t.data);
+  // Unaligned: `t.data` is an arbitrary byte offset into the mmap (#627).
+  const uint8_t* src = t.data;
   auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
   for (int64_t r = 0; r < out_dim; ++r)
     for (int64_t c = 0; c < in_dim; ++c)
-      dst[c * out_dim + r] = vt::F32ToBF16(src[r * in_dim + c]);
+      dst[c * out_dim + r] =
+          vt::F32ToBF16(vt::LoadUnaligned<float>(src + (r * in_dim + c) * 4));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
@@ -136,7 +146,7 @@ OwnedTensor LoadMergedF32ToBf16RawNK(const TensorResolver& get,
     const int64_t n = shard.shape[0] * in_dim;
     VT_CHECK(shard.nbytes == static_cast<size_t>(n) * sizeof(float),
              "olmo2: byte-size mismatch for " + names[i]);
-    F32ToBf16Into(reinterpret_cast<const float*>(shard.data), n, dst + off);
+    F32ToBf16Into(shard.data, n, dst + off);
     off += static_cast<size_t>(n);
     MaybeReleaseSourcePages(shard.data, shard.nbytes);
   }

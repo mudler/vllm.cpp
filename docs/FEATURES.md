@@ -80,7 +80,7 @@ are our reading of their documented behavior, not measurements.
 | Merged fp8 projection folds per-column alpha in the GEMM epilogue | ◐ `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off, ungated; refuses split-K under a bf16-D equivalence claim (`claims_splitk1_premise`, default off) | n/a | n/a | n/a |
 | `vt::MulColVecF32` carries a bf16 store width | ✅ f32 arm byte-identical; bf16 arm rounds once; CPU + CUDA | n/a | ☐ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
-| Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
+| Safetensors direct load, no conversion | ✅ at ANY tensor byte offset: the format aligns nothing, so the `*_weights.cpp` loaders never form a typed pointer into the mapping (#627). `voxtral.cpp`, `qwen3_vl.cpp`, `qwen3_5_mtp.cpp` still do and are OWED | ✅ | ✅ | ☐ |
 | Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16); arbitrary-offset reads are defined, including Laguna graph staging. Merged/transposed and merged FP4 weights still copy | ✅ | ✅ | ✅ mmap |
 
 ## Model coverage
@@ -111,6 +111,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 |---|---|---|---|
 | `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B NVFP4 (`unsloth` @`890bdef7`, `nvidia` @`0893e160`); Qwen3.5-4B BF16 | 27B strict 235/235 text + 32/32 image/video; 4B cached 3/3 | `unsloth` 27B at/above vLLM, `nvidia` ModelOpt 0.85x; 4B throughput 1.021x. Loads BF16, FP8 and NVFP4 (CT + ModelOpt naming); a `modelopt_mixed` FP8 tower stays NATIVE (#164), GDN `in_proj_qkvz` merged. CUDA/CPU only |
 | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | strict 315/315 text vs vLLM 0.25.0 | gate model: 0.93x to 1.03x grid |
+| `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM` | none: no text-only Qwen3.5 checkpoint fits this hardware | **NO RUN GATE, OWED.** Dispatch/config/namespace gated on `test_qwen3_8_text_only.cpp`; NO token claim. MoE reads ONLY per-expert NVFP4: the published stacked/bf16 layout is unimplemented, OWED, refused by name | not measured |
 | `Qwen3ForCausalLM` | Qwen3 dense 0.6B/1.7B/4B/32B, NVFP4A16 | near-tie strict 16/16 vs vLLM 0.25.0 | c1 every-axis parity, c8 decode residual |
 | `Qwen3MoeForCausalLM` | Qwen3-Coder-30B-A3B | strict 6/6 vs vLLM 0.25.0 | 11/16 grid cells at or above graphed vLLM |
 | `Qwen3VLForConditionalGeneration` | Qwen3-VL-4B-Instruct (image + video) | image strict 32/32, video near-tie vs vLLM 0.25.0 | vision tower 0.57x vs vLLM encode; umbrella pending |
@@ -137,7 +138,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on, via the `laguna-gen` CLI; the registered engine forward VT_CHECKs non-bf16 (`ARCH-ONE-SURFACE` fold) |
 | `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | **Folded onto the shared paged runner (ROW 7 §21, #122): engine==CLI 128/128 byte-identical; vs golden 122/128 (the intrinsic near-tie profile); FA2 paged MLA default-ON; SACRED post-fold green** | Served via `vllm_engine_load` + `vllm_complete_tokens` (ABI v13); server 19.0 tok/s wall vs vLLM ~21 (~0.90×), speed residual open |
 | `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
-| `NemotronHForCausalLM` | Nemotron-3.5-Lightning-30B-A3B-NVFP4 (`nvidia` @`29f2d174`) | scaffold: registry+config+enumeration+KV-shape gated, forward refuses. 18487/18487 tensors claimed; a bf16 config claims that set minus its scale companions. Nothing runs yet (spec #517, blocked on #496) | no run; GGUF k-quants refuse by name and are owed |
+| `NemotronHForCausalLM` | Nemotron-3.5-Lightning-30B-A3B-NVFP4 (`nvidia` @`29f2d174`) | registry+config+enumeration+KV-shape gated; the hybrid Mamba2/GQA/relu2-MoE forward COMPUTES, gated elementwise vs independent double references. No weight loader, so nothing runs end to end (spec #517 W4) | no run; GGUF k-quants refuse by name and are owed |
 | `MuseGlimmerForCausalLM` | real tensors, **bf16 depth 4/52 only**: 5 prefill argmax positions match a torch transcription of vllm#51655 and HF. GGUF full depth generates coherently (#347, #359) but is **NOT token-exact** | text forward + loader vs an fp32 reference, per-mechanism property tests, scaffold 11/11, GGUF gate 17/17. An ABSENT config key now takes the architecture's constant (#412): GGUF post-norms ran at 1e-5, not 1e-8 | no vLLM denominator (pin cannot load it); SECONDARY llama.cpp, same GGUF, GB10 CPU: prefill tie **0.997x**, decode 0.232x, RSS 1.92x (#333) |
 | `MuseGlimmerForConditionalGeneration` | vision: **no reference run of any kind**; enumeration gated vs the released 30B index (1436/1436). Image/video need bf16 safetensors: `mmproj-kquant.gguf` is refused by name | perception encoder loaded and wired, so an image or video prompt runs; `perception_emb_norm` now armed by default (#405). Reachability plus placeholder scatter only, no image or video correctness | not measurable; anchored to open vllm#51655 |
 | `LlamaModel` | landed tiny synthetic embedding fixture (engine path == direct pooler path, identical vectors; f64 LAST+normalize reference); real checkpoint (e5-mistral class) is a NAMED residual | pooling/embed only, text paths refuse by task; `vllm_embed` + `/v1/embeddings` | n/a (CPU correctness-grade embeddings) |
@@ -162,7 +163,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
 | MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 79/79; all three modalities COHERENT on Q4_K_M (§8.20); PRUNED ckpts run, Q8_0 seam 0.9941 (§8.21); ref2va grid was NVFP4 quant error, §8.9 REFUTED; GGUF/NVFP4/bf16 shards stream | FP4/Marlin landed; speed pending; no bf16 render yet. Render from the Q4_K_M GGUF, not the NVFP4 arm. Krea 2 text-to-image (roadmap C11) is scoped to reuse these DiT seams |
 | LTX-2.5 DiT (`LTX2VideoTransformer3DModel`, Lightricks lane) | LTX-2.5 (21.00B video+audio) | `SPIKE`. DiT, VAEs+ENCODERS, conditioning, pipeline, quant loaders gated at reduced dims. Prompt-side AdaLN ported, host+device. Typed prompt to Gemma-4 to cross-attn, FIXTURE-gated. A prompted render is OWED | Family `ltx-2.5`, `ltx2-gen`. ~29 GB NVFP4/GB10, FP8 ~44 GB, +~24 GB tower. FP8/torchao/1st-party NVFP4 load; `keyframes_abs_pos_embedding` alone needs `allow_unported`. DiffVAE, LoRA, image cond refused. Speed PENDING |
-| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, diffusers lane) | MiniMax-Music3 (8.6B Qwen3 LLM + 0.646B RVQ decoder + 2.4B fp32 DiT + DAC Flow-VAE); diffusers arm, ~28.5 GB | `SPIKE`. Scoped only, nothing implemented. Geometry measured from each `config.json` and the safetensors headers. Output is 44100 Hz stereo (the model card's 32 kHz is SGLang-Omni's server-side resample) | Not measured. The denominator will be SGLang-Omni in its production configuration (both CUDA graphs, compiled DIT and DAV, batched seeded sampling) |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, diffusers lane) | MiniMax-Music3 (8.6B Qwen3 LLM + 0.646B RVQ decoder + 2.4B fp32 DiT + DAC Flow-VAE); diffusers arm, ~28.5 GB | `ACTIVE`. Oracle gateable with 13 per-stage goldens (#708); modular loader gated 1413/1413 on the real 27 GB checkpoint, all 1012 tensors accounted (#714). Output 44100 Hz stereo. No stage runs yet: W2-W7 owed | Not measured. The denominator will be SGLang-Omni in its production configuration (both CUDA graphs, compiled DIT and DAV, batched seeded sampling) |
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
@@ -194,8 +195,8 @@ on the committed fixture); reranking/classify models are not yet registered.
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
 | Video+audio GENERATION (MiniMax-H3 DiT, LTX-2.5 DiT) | ◐ H3: all three modalities COHERENT on Q4_K_M (t2va, fl2va, ref2va; §8.20); the NVFP4 arm carries the patch grid; GGUF/NVFP4/bf16 loaders, pruned too (§8.21). LTX-2.5: a second lane, `SPIKE`, gated at reduced dims | ✅ H3 (vllm-omni, BF16-only, no quantized arm); LTX-2.5 only through the generic diffusers adapter, no native recipe ([vllm-omni#6066](https://github.com/vllm-project/vllm-omni/issues/6066)) | ☐ | ☐ |
-| Speech / audio GENERATION (TTS, vLLM-Omni lane) | ☐ not started. Eight architectures inventoried in `.agents/model-matrix.md`: six from the recipes sweep (#610) plus IndexTTS-2.5 (#634). Inventoried is not supported; all block on the absent `vllm-omni` pin (#633) | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS, IndexTTS-2.5) | not assessed | not assessed |
-| MUSIC generation (MiniMax-Music3) | ☐ scoped, not started ([spec](../.agents/specs/minimax-music3.md), #672). Lyrics plus a structured description in, a multi-minute stereo song out | ☐ absent from the pin, from vLLM `main` and from `vllm-omni` alike | ◐ served by SGLang-Omni, a third repository, which loads the NATIVE checkpoint layout | ☐ |
+| Speech / audio GENERATION (TTS, vLLM-Omni lane) | ◐ IndexTTS-2.5 only: every stage ported and gated at reduced dims, composed structurally; the family still REFUSES by name. No loader, no render, no route (#634). Seven more inventoried (#610), which is not support | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS, IndexTTS-2.5) | not assessed | not assessed |
+| MUSIC generation (MiniMax-Music3) | ☐ not generating. The W1 checkpoint LOADER has landed ([spec](../.agents/specs/minimax-music3.md), #672); no stage runs yet. Lyrics plus a structured description in, a multi-minute stereo song out | ☐ absent from the pin, from vLLM `main` and from `vllm-omni` alike | ◐ served by SGLang-Omni, a third repository, which loads the NATIVE checkpoint layout | ☐ |
 | Multimodal over the OpenAI server | ◐ image request path wired, forward pending | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Over the HTTP
@@ -203,9 +204,9 @@ API the image **request** path is wired end to end (`ROAD-V1-MM` W1-W3): the
 production server attaches the seam at `server_main.cpp:826`. Two residuals keep
 it from ✅: the model runner has no mm-forward consuming `Request.mm_features`,
 and no image codec is vendored (raw RGB only). Video, audio and multi-image over
-HTTP are not started. Audio **in** is gated; audio **out** does not exist: we
-ship no TTS or speech-generation path on any surface, which is why that row is
-the only ☐ in our column here.
+HTTP are not started. Audio **in** is gated; audio **out** reaches no surface:
+the IndexTTS-2.5 ◐ reads "assembled, never run", so asking for speech today
+gets a refusal naming what is missing.
 
 ## Speculative decoding
 
@@ -229,7 +230,7 @@ the only ☐ in our column here.
 | GBNF grammars | ✅ | ☐ | ☐ | ✅ |
 | xgrammar backend | ✅ | ✅ | ✅ | ☐ |
 | Jump-forward decoding | ✅ opt-in | ☐ | ✅ | ☐ |
-| Tool-call parsers | ✅ 37 families | ✅ | ✅ | ◐ |
+| Tool-call parsers | ✅ 38 families | ✅ | ✅ | ◐ |
 | Reasoning-content parsers | ✅ 10 | ✅ | ✅ | ☐ |
 | Muse Glimmer ATEM parsers (`muse_glimmer`) | ◐ UNIT-GATED ON STRINGS; **CHANNEL SCOPING FAILS AT SERVER DEFAULTS**: no `adjust_request` seam, so `skip_special_tokens: true` strips the framing. OPEN GAP, [spec](../.agents/specs/muse-glimmer.md) §6.7 | ✅ | ☐ | ☐ |
 | Custom logits processors | ◐ CPU-verified | ✅ | ✅ | ☐ |

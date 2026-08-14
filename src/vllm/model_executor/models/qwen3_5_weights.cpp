@@ -3,6 +3,7 @@
 // (.agents/specs/qwen36-forward-notes.md §6).
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -20,6 +22,7 @@
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 
@@ -288,12 +291,20 @@ float ReadF32Scalar(const StTensor& t) {
 }
 
 // src bf16 [rows, cols] -> dst bf16 [cols, rows].
-void TransposeBf16(const uint16_t* src, int64_t rows, int64_t cols,
-                   uint16_t* dst) {
+//
+// `src` is `const void*`, not `const uint16_t*`, because the caller below hands
+// it a pointer INTO the mmap'd safetensors payload. A tensor's offset there is
+// the running byte total of everything ahead of it, so a bf16 tensor that
+// follows an odd-length one starts on an odd byte and the typed pointer is
+// undefined to form or load through (issue #627). `vt::LoadUnaligned` is the
+// project's seam for that — the same one `ReadF32Scalar` above open-codes with
+// memcpy and `dense_loaders::TransposeBf16` already uses for this exact loop.
+void TransposeBf16(const void* src, int64_t rows, int64_t cols, uint16_t* dst) {
+  const auto* bytes = static_cast<const uint8_t*>(src);
   for (int64_t r = 0; r < rows; ++r) {
-    const uint16_t* src_row = src + r * cols;
+    const uint8_t* src_row = bytes + r * cols * 2;
     for (int64_t c = 0; c < cols; ++c) {
-      dst[c * rows + r] = src_row[c];
+      dst[c * rows + r] = vt::LoadUnaligned<uint16_t>(src_row + c * 2);
     }
   }
 }
@@ -329,7 +340,7 @@ OwnedTensor LoadBf16Transposed(const TensorResolver& get,
   const int64_t out_dim = t.shape[0];
   const int64_t in_dim = t.shape[1];
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-  TransposeBf16(reinterpret_cast<const uint16_t*>(t.data), out_dim, in_dim,
+  TransposeBf16(t.data, out_dim, in_dim,
                 reinterpret_cast<uint16_t*>(o.bytes.data()));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
@@ -343,9 +354,12 @@ OwnedTensor LoadBf16ToF32(const TensorResolver& get, const std::string& name) {
            "qwen3_5 weights: expected 1-D tensor for " + name);
   const int64_t n = t.shape[0];
   OwnedTensor o = MakeOwned(vt::DType::kF32, {n});
-  const auto* src = reinterpret_cast<const uint16_t*>(t.data);
+  // Unaligned: `t.data` is an arbitrary byte offset into the mmap (#627).
+  const uint8_t* src = t.data;
   auto* dst = reinterpret_cast<float*>(o.bytes.data());
-  for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+  for (int64_t i = 0; i < n; ++i) {
+    dst[i] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(src + i * 2));
+  }
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
@@ -555,9 +569,10 @@ MoeBlockWeights LoadMoe(const TensorResolver& get, const std::string& base,
 Qwen3_5MoeLayerWeights LoadLayerImpl(const TensorResolver& get,
                                      const std::string& layer_type,
                                      int64_t layer_idx, int64_t num_experts,
-                                     bool with_experts) {
+                                     bool with_experts,
+                                     const std::string& backbone_prefix) {
   const std::string base =
-      "model.language_model.layers." + std::to_string(layer_idx) + ".";
+      backbone_prefix + "layers." + std::to_string(layer_idx) + ".";
   Qwen3_5MoeLayerWeights layer;
   layer.input_layernorm = LoadBf16Direct(get, base + "input_layernorm.weight");
   layer.post_attention_layernorm =
@@ -575,7 +590,121 @@ Qwen3_5MoeLayerWeights LoadLayerImpl(const TensorResolver& get,
   return layer;
 }
 
+// True iff any name in `names` is a backbone tensor under `prefix`. Only the
+// three structural backbone spellings vote (see qwen3_5_weights.h): the
+// vision tower (`model.visual.*`) and the top-level `lm_head.*` / `mtp.*` are
+// deliberately NOT backbone names, so they cannot decide the namespace.
+bool HasBackboneUnder(const std::vector<std::string>& names,
+                      std::string_view prefix) {
+  const std::string embed = std::string(prefix) + "embed_tokens.weight";
+  const std::string norm = std::string(prefix) + "norm.weight";
+  const std::string layers = std::string(prefix) + "layers.";
+  for (const std::string& name : names) {
+    if (name == embed || name == norm) return true;
+    if (name.compare(0, layers.size(), layers) == 0) return true;
+  }
+  return false;
+}
+
+// --- Unimplemented MoE expert arms, REFUSED BY NAME (issue #490) -------------
+//
+// `LoadMoeExpertsInto` above reads exactly ONE routed-expert layout: per-expert
+// NVFP4 (`...mlp.experts.<e>.{gate,up,down}_proj` through `LoadNvfp4Raw`, which
+// hard-requires a `U8` `.weight`, an `F8_E4M3` `.weight_scale` and a
+// `.weight_scale_2`). There is no stacked branch and no bf16 branch — unlike
+// `gemma4_weights.cpp:326`, which dispatches between layouts.
+//
+// The PUBLISHED Qwen3.5-family MoE repos do not have that layout. Read off the
+// live safetensors indices 2026-08-12: `Qwen/Qwen3.8-2.4T-A95B` has 93x
+// `mlp.experts.gate_up_proj` + 93x `.down_proj` (3-D STACKED) and ZERO
+// `weight_scale` / `input_scale` tensors; `Qwen/Qwen3.6-35B-A3B` is the same
+// under the VL prefix. Our gated 35B row reads the REQUANTIZED
+// `nvidia/Qwen3.6-35B-A3B-NVFP4`, so this loader has never read a published
+// Qwen bf16 MoE checkpoint. Left alone, such a load dies at
+// `LoadNvfp4Raw(get, "lm_head")` with "expected U8 for lm_head.weight" — which
+// reads as a corrupt checkpoint, not as an unimplemented arm.
+//
+// AGENTS.md: an arm that is not implemented "is refused with a message naming
+// the missing piece ... never left to be discovered later", and the row's spec
+// (.agents/specs/qwen38-text-only.md) says the same in its stop conditions.
+// This is that refusal and ONLY that: the stacked/bf16 MoE expert arm is OWED,
+// and implementing it needs its own spec, RED-first test and NVFP4 inertness
+// proof. Inert on the supported layout — every name it inspects already has to
+// exist for the load to succeed at all.
+void CheckMoeExpertLayoutSupported(const std::vector<std::string>& names,
+                                   const std::string& backbone) {
+  static const std::string kRequired =
+      " This loader implements only the per-expert NVFP4 layout: "
+      "<layer>.mlp.experts.<e>.{gate,up,down}_proj.weight (U8 packed) + "
+      ".weight_scale (F8_E4M3) + .weight_scale_2, and lm_head the same way. The "
+      "published bf16 repos (Qwen/Qwen3.8-2.4T-A95B, Qwen/Qwen3.6-35B-A3B) ship "
+      "the 3-D stacked, unquantized layout; an NVFP4 requant (e.g. "
+      "nvidia/Qwen3.6-35B-A3B-NVFP4) ships the supported one. The stacked and "
+      "unquantized MoE expert arms are OWED, not silently unsupported: see "
+      ".agents/specs/qwen38-text-only.md.";
+  const std::string layers = backbone + "layers.";
+  const std::string experts = ".mlp.experts.";
+  const std::string weight = ".weight";
+  const std::unordered_set<std::string> present(names.begin(), names.end());
+  for (const std::string& name : names) {
+    if (name.compare(0, layers.size(), layers) != 0) continue;
+    const size_t at = name.find(experts);
+    if (at == std::string::npos) continue;
+    const size_t rest = at + experts.size();
+    if (rest >= name.size()) continue;
+    // `experts.<digit>` is the per-expert spelling; anything else — the
+    // published `experts.gate_up_proj` / `experts.down_proj` — is the stacked
+    // one, where a single 3-D tensor holds every expert.
+    if (std::isdigit(static_cast<unsigned char>(name[rest])) == 0) {
+      VT_CHECK(false,
+               "qwen3_5 weights: 3-D stacked routed experts are not implemented "
+               "for the safetensors MoE arm -- found \"" +
+                   name + "\"." + kRequired);
+    }
+    if (name.size() > weight.size() &&
+        name.compare(name.size() - weight.size(), weight.size(), weight) == 0 &&
+        present.count(name + "_scale") == 0) {
+      VT_CHECK(false,
+               "qwen3_5 weights: unquantized routed experts are not implemented "
+               "for the safetensors MoE arm -- \"" +
+                   name + "\" has no \"" + name + "_scale\" beside it." +
+                   kRequired);
+    }
+  }
+  // The MoE head is likewise NVFP4-only here, where the DENSE loader routes a
+  // head by dtype (`LoadDenseLmHead` / `LoadLmHeadAnyDtype`). A checkpoint with
+  // no `lm_head.weight` at all is the tied-head case and is not this refusal.
+  if (present.count("lm_head.weight") != 0 &&
+      present.count("lm_head.weight_scale") == 0) {
+    VT_CHECK(false,
+             "qwen3_5 weights: an unquantized lm_head is not implemented for "
+             "the safetensors MoE arm -- \"lm_head.weight\" has no "
+             "\"lm_head.weight_scale\" beside it." +
+                 kRequired);
+  }
+}
+
 }  // namespace
+
+std::string ResolveQwen3_5BackbonePrefix(
+    const std::vector<std::string>& tensor_names) {
+  // `model.language_model.` is tested FIRST because it is also a `model.`
+  // name: a plain "starts with model." test would match both spellings.
+  const bool vl = HasBackboneUnder(tensor_names, kQwen3_5VlBackbonePrefix);
+  // ...so the canonical probe must EXCLUDE the VL-prefixed names, which the
+  // backbone spellings above already do (`model.language_model.` is neither
+  // `model.embed_tokens.weight`, nor `model.norm.weight`, nor `model.layers.`).
+  const bool flat = HasBackboneUnder(tensor_names, kQwen3_5TextBackbonePrefix);
+  VT_CHECK(!(vl && flat),
+           "qwen3_5 weights: checkpoint carries backbone tensors under BOTH "
+           "\"model.language_model.\" and \"model.\"; refusing a mixed weight "
+           "namespace rather than binding half the model from each");
+  VT_CHECK(vl || flat,
+           "qwen3_5 weights: no Qwen3.5 backbone tensors found under either "
+           "\"model.language_model.\" or \"model.\"");
+  return std::string(vl ? kQwen3_5VlBackbonePrefix
+                        : kQwen3_5TextBackbonePrefix);
+}
 
 // External-linkage seam so the DENSE loader can keep an FP8 GDN tower native.
 Fp8Weight LoadFp8RawShared(const TensorResolver& get, const std::string& proj) {
@@ -585,9 +714,10 @@ Fp8Weight LoadFp8RawShared(const TensorResolver& get, const std::string& proj) {
 Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
                                            const std::string& layer_type,
                                            int64_t layer_idx,
-                                           int64_t num_experts) {
+                                           int64_t num_experts,
+                                           const std::string& backbone_prefix) {
   return LoadLayerImpl(get, layer_type, layer_idx, num_experts,
-                       /*with_experts=*/true);
+                       /*with_experts=*/true, backbone_prefix);
 }
 
 Qwen3_5MoeWeights LoadQwen3_5Moe(
@@ -601,9 +731,21 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
   // which `shards_owner` keeps mmap'd.
   auto where =
       std::make_shared<std::unordered_map<std::string, const SafetensorsFile*>>();
+  std::vector<std::string> all_names;
   for (const SafetensorsFile& shard : shards) {
-    for (const std::string& name : shard.Names()) (*where)[name] = &shard;
+    for (const std::string& name : shard.Names()) {
+      (*where)[name] = &shard;
+      all_names.push_back(name);
+    }
   }
+  // ONE namespace decision for the whole checkpoint (qwen3_5_weights.h): the
+  // VL-nested spelling for the wrappers we gate, the flat `model.` spelling for
+  // a text-only arm, and a refusal for a mixed index.
+  const std::string backbone = ResolveQwen3_5BackbonePrefix(all_names);
+  // ...and ONE decision about the routed-expert layout, before any tensor is
+  // touched, so an arm we do not implement is refused by name rather than
+  // discovered as a dtype complaint about `lm_head` (issue #490).
+  CheckMoeExpertLayoutSupported(all_names, backbone);
   const TensorResolver get =
       [where](const std::string& name) -> const StTensor& {
     auto it = where->find(name);
@@ -628,16 +770,16 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
   const bool defer_experts = shards_owner != nullptr;
 
   Qwen3_5MoeWeights w;
-  w.embed_tokens =
-      LoadBf16Direct(get, "model.language_model.embed_tokens.weight");
-  w.final_norm = LoadBf16Direct(get, "model.language_model.norm.weight");
+  w.embed_tokens = LoadBf16Direct(get, backbone + "embed_tokens.weight");
+  w.final_norm = LoadBf16Direct(get, backbone + "norm.weight");
   w.lm_head_fp4 = LoadNvfp4Raw(get, "lm_head");  // M2.2b fp4-resident
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     w.layers.push_back(LoadLayerImpl(get,
                                      config.layer_types[static_cast<size_t>(l)],
                                      l, config.num_experts,
-                                     /*with_experts=*/!defer_experts));
+                                     /*with_experts=*/!defer_experts,
+                                     backbone));
   }
 
   if (defer_experts) {
@@ -647,7 +789,9 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
     // last layer is built. Does NOT capture the (movable) Qwen3_5MoeWeights — the
     // target MoE block is passed in by reference, so the closure survives the
     // model's move into the LoadedModel.
-    w.load_layer_experts = [where, shards_owner, num_experts](
+    // `backbone` is captured BY VALUE: the closure outlives this frame, and it
+    // must keep using the ONE namespace resolved above rather than re-deciding.
+    w.load_layer_experts = [where, shards_owner, num_experts, backbone](
                                int64_t layer, MoeBlockWeights& moe) {
       const TensorResolver g =
           [where](const std::string& name) -> const StTensor& {
@@ -656,8 +800,8 @@ Qwen3_5MoeWeights LoadQwen3_5Moe(
                  "qwen3_5 weights: tensor not found: " + name);
         return it->second->Get(name);
       };
-      const std::string mlp = "model.language_model.layers." +
-                              std::to_string(layer) + ".mlp.";
+      const std::string mlp =
+          backbone + "layers." + std::to_string(layer) + ".mlp.";
       LoadMoeExpertsInto(g, mlp, num_experts, moe);
     };
   }

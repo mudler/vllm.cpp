@@ -78,7 +78,26 @@ MATRICES = {
     # architecture. Re-derived, which is the only way this pin is ever allowed to
     # move. test_music3_and_indextts_rows_both_survive_their_collision names all
     # three rows, because a count alone cannot see that failure.
-    "MODEL": (AGENTS / "model-matrix.md", 373),
+    # 375 since 2026-08-14: +`MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm` and
+    # +`MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm` (issue #490), the TEXT-ONLY
+    # arms of the Qwen3.5 backbone — the eighth architecture the #609/#610 audit
+    # found and deliberately left to its owner, plus its dense sibling. Both are
+    # beyond-pin: they are not among the 355 registry architectures at
+    # `555967922` because they landed upstream afterwards (PR vllm#50210 @
+    # `ad5d29db7`), exactly like the Muse Glimmer row above. Their Upstream cells
+    # deliberately carry no pinned module/class target, so the pin-derived static
+    # invariants in check_model_invariants are UNCHANGED (324/373/356/310/261) —
+    # this is the row-EXISTS count only, bumped because two new rows exist, never
+    # to make a transition pass. This row was authored against 362 -> 364, then
+    # re-derived to 370 -> 372, and is now RE-DERIVED AGAIN to 373 -> 375: the
+    # #609/#610 backfill, LTX-2.5, IndexTTS-2.5 and MiniMax-Music3 all landed
+    # while it was in review, and every one of them moved this pin. The number is
+    # counted off the matrix as it stands after the merge, never carried forward
+    # from the branch — a justification framed against a number this file no
+    # longer carries would be false about the file it sits in, and
+    # `Qwen35TextOnlyRowsAreCounted` is what ties this value to the two rows the
+    # matrix actually holds.
+    "MODEL": (AGENTS / "model-matrix.md", 375),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme

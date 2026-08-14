@@ -56,6 +56,7 @@
 #include "vllm/model_executor/models/parakeet_encoder.h"
 #include "vllm/model_executor/models/parakeet_transducer.h"
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm::multimodal {
 namespace {
@@ -100,9 +101,11 @@ std::vector<float> ToF32(const std::string& name, const StTensor& t) {
     if (t.nbytes != out.size() * sizeof(uint16_t)) {
       throw std::runtime_error("parakeet: byte count mismatch for " + name);
     }
-    const uint16_t* src = reinterpret_cast<const uint16_t*>(t.data);
+    // Unaligned: `t.data` is an arbitrary byte offset into the mmap (#627).
+    const bool f16 = (t.dtype == "F16");
     for (size_t i = 0; i < out.size(); ++i) {
-      out[i] = (t.dtype == "F16") ? vt::F16ToF32(src[i]) : vt::BF16ToF32(src[i]);
+      const uint16_t bits = vt::LoadUnaligned<uint16_t>(t.data + i * 2);
+      out[i] = f16 ? vt::F16ToF32(bits) : vt::BF16ToF32(bits);
     }
   } else {
     throw std::runtime_error("parakeet: unsupported dtype " + t.dtype + " for " + name);

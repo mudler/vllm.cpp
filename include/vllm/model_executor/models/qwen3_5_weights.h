@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
@@ -488,6 +489,52 @@ struct Qwen3_5MoeWeights {
 // Resolves a tensor name to its StTensor (across shards). Throws if absent.
 using TensorResolver = std::function<const StTensor&(const std::string&)>;
 
+// --- Backbone weight namespace (MODEL-TEXT-qwen3-5-*-for-causal-lm) -----------
+//
+// A Qwen3.5-family checkpoint publishes its text backbone under ONE of two
+// spellings. The multimodal wrappers we already gate (Qwen3.6-27B / 35B-A3B /
+// Coder) nest it under `model.language_model.`; the TEXT-ONLY arms
+// (`Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM`, e.g.
+// `Qwen/Qwen3.8-2.4T-A95B`) publish it flat under `model.`. The BACKBONE names
+// are otherwise identical — same `mlp.shared_expert_gate.weight`, same
+// top-level `lm_head`.
+//
+// THE PREFIX IS NOT THE ONLY THING BETWEEN THIS LOADER AND A PUBLISHED
+// CHECKPOINT, and an earlier revision of this comment wrongly implied it was.
+// The published Qwen3.5-family MoE repos ship 3-D STACKED routed experts
+// (`...mlp.experts.gate_up_proj` / `.down_proj`) and carry no quantization
+// scales at all, while `LoadQwen3_5Moe` reads ONLY per-expert NVFP4. That arm
+// is OWED and is refused by name (`CheckMoeExpertLayoutSupported`,
+// `qwen3_5_weights.cpp`). The DENSE loader is different: it routes BF16 vs FP8
+// vs NVFP4 per projection by tensor presence, so it may genuinely read a flat
+// bf16 checkpoint. Resolving the namespace is what THIS seam does; it is not a
+// support claim for either published checkpoint.
+//
+// Upstream normalizes the two with ONE mapper —
+//   WeightsMapper(orig_to_new_prefix={"model.language_model.": "model."})
+//   (vllm/model_executor/models/qwen3_5.py:296-300 @ `ad5d29db7`, PR #50210,
+//    which is AHEAD OF our `555967922` parity pin and recorded as such) —
+// so `model.` is canonical and the VL spelling is its accepted alias.
+inline constexpr std::string_view kQwen3_5VlBackbonePrefix =
+    "model.language_model.";
+inline constexpr std::string_view kQwen3_5TextBackbonePrefix = "model.";
+
+// Decides which of the two the checkpoint uses, ONCE, from the shard index, so
+// every subsequent lookup in a load uses one namespace. Deliberately NOT a
+// per-lookup fallback: a fallback would let a checkpoint bind half its tensors
+// from one namespace and half from the other and still appear to load.
+//
+// Only BACKBONE spellings vote — `<prefix>embed_tokens.weight`,
+// `<prefix>norm.weight` and `<prefix>layers.`. `model.visual.*` (the
+// vision-inclusive 27B/35B towers) and the top-level `lm_head.*` / `mtp.*`
+// therefore cast no vote, which is what keeps a vision checkpoint from looking
+// like a flat text one.
+//
+// Throws std::runtime_error when BOTH namespaces carry backbone tensors (a
+// mixed index is refused, never half-loaded) and when NEITHER does.
+std::string ResolveQwen3_5BackbonePrefix(
+    const std::vector<std::string>& tensor_names);
+
 // --- ENG-LOAD-DIRECT-UPLOAD (issue #150) -------------------------------------
 //
 // THE DEFECT THIS CLOSES. Loading a checkpoint copies the weights TWICE: the
@@ -532,11 +579,14 @@ void SetLoadDirectUploadOverrideForTesting(std::optional<bool> value);
 // Load one decoder layer's weights from real tensors. `layer_type` is
 // "linear_attention" or "full_attention"; `num_experts` drives the expert loop.
 // Exercised on real data by the Task 3 unit test (both layer types live in
-// shard 1). Prefix is "model.language_model.layers.{layer_idx}.".
-Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
-                                           const std::string& layer_type,
-                                           int64_t layer_idx,
-                                           int64_t num_experts);
+// shard 1). Prefix is "{backbone_prefix}layers.{layer_idx}.", and the default
+// is the VL spelling every checkpoint we gate today uses, so this seam is
+// byte-identical for the 27B/35B/Coder callers. `LoadQwen3_5Moe` passes the
+// prefix it resolved once from the shard index.
+Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(
+    const TensorResolver& get, const std::string& layer_type, int64_t layer_idx,
+    int64_t num_experts,
+    const std::string& backbone_prefix = std::string(kQwen3_5VlBackbonePrefix));
 
 // Full-model load: resolves every param across the given shards (name -> shard
 // looked up from each file's own header), dequantizes/transposes, and returns

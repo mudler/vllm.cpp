@@ -479,7 +479,17 @@ Gemma-3 and Qwen3 all-native, with Gemma-3 strict 48/48 against two vLLM-ROCm
 oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-native
 but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
 contributor-measured on 2x R9700 and CPU-link-verified our side;
-[guide](ROCM.md)), and the full tool-calling template surface. **Muse Glimmer's
+[guide](ROCM.md)), inference-time CPU weight offload (`ENG-WEIGHT-OFFLOAD`
+ACTIVE; the config surface landed W0a (the backend enum, both sub-configs, the
+validator's two errors and three warnings, and the dot-anchored segment match),
+all UNREACHABLE for now because nothing constructs an `OffloadConfig` yet, so
+no engine behaviour changes. Still owed: vLLM's `cpu_offload_gb` UVA arm with dotted-segment
+`cpu_offload_params` targeting, plus the layer-group `PrefetchOffloader` — a
+pure mirror floor, and #149's dense half. Its memory and speed gates need a
+discrete-GPU rig, because on unified-memory GB10 offloading to "CPU" frees
+nothing, so those gates are blocked rather than pending
+[spec](../.agents/specs/weight-offload-uva.md)), and the full tool-calling
+template surface. **Muse Glimmer's
 GGUF arm generates coherently** (#347, #359), is NOT token-exact, and has
 only a llama.cpp bar (#333). Its CPU decode was **synchronisation-bound, not
 kernel-bound**: the threadpool's never-yielding spin-wait cost a full scheduler
@@ -570,6 +580,15 @@ take can only raise the plateau; any MoE comparison that lets routing vary
 between arms measures the draw, not the change; and both blocks AND distinct
 experts must be controlled, since cost per distinct expert spans 4.47-7.50 us
 and is flat only above ~40 experts. NOT parity, and the row stays open.
+MEASUREMENT IS CURRENTLY IMPOSSIBLE: the gate host was REIMAGED on 2026-08-14
+(new COS partition layout, /home created 13:37 UTC, ~/work empty), destroying
+the pinned oracle venv, the pinned vLLM source, the 35B and draft checkpoints,
+our engine build and every run log, so the Evidence paths in the benchmark
+record point at nothing. The RESULTS stand, because the harnesses
+(scripts/marlin-moe-standalone.py, benchmarks/marlin_moe_standalone.cpp,
+scripts/dspark-paired-e2e.sh) and the per-rep values are in-tree; resuming
+needs the checkpoints re-fetched, the oracle rebuilt at pinned commit
+555967922, and its identity re-asserted before any number is trusted.
 
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has

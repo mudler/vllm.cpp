@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <system_error>
@@ -691,10 +692,37 @@ TEST_CASE("NemotronH: the unported arms REFUSE BY NAME") {
     // checkpoint THROWS and NAMES the gap. A forward that silently returned
     // `{}` would produce zero logits and a plausible-looking garbage token.
     // What moved is only which piece the message names.
-    struct StubModel : vllm::LoadedModel {
-      explicit StubModel(const vllm::ModelRegistration& r) : LoadedModel(r) {}
-    };
-    StubModel model(reg);
+    // The model handed to `factory->forward` MUST be the one
+    // `factory->load_weights` produced. `ForwardNemotronHForCausalLM`
+    // (nemotron_h_registry.cpp:100) opens the handle with
+    // `static_cast<NemotronHLoadedModel&>(model)` — the universal registry seam,
+    // shared verbatim by every other arch's forward — and that downcast is
+    // undefined behaviour on any object that is not really a
+    // `NemotronHLoadedModel`. Two DISTINCT lines, and the sanitizer names the
+    // second, not the first: the cast is nemotron_h_registry.cpp:102, while the
+    // member call made THROUGH the resulting reference — where the vptr check
+    // actually fires, and what the report quoted below is anchored to — is
+    // nemotron_h_registry.cpp:112:30, `nh.params()`.
+    // This subcase used to fabricate a bare
+    // `struct StubModel : vllm::LoadedModel` instead, which W3 got away with
+    // only because the forward was then an unconditional `VT_CHECK(false)` that
+    // never touched `model`. W4 added the downcast, and the stub turned it into
+    // a live type-confusion: UBSan's vptr check reported "member call on address
+    // ... which does not point to an object of type 'NemotronHLoadedModel'" and
+    // `-fno-sanitize-recover=all` aborted the process (issue #730).
+    //
+    // `LoadNemotronHForCausalLM` reads only `source.kind` and the config — there
+    // is no NemotronH weight loader yet — so it builds a REAL
+    // `NemotronHLoadedModel` with `NemotronHHostWeights` unmaterialized without
+    // touching a checkpoint. That is exactly the state this subcase is about,
+    // and it reaches the refusal through the real object rather than a
+    // look-alike, so the guarantee below is now asserted on the production type.
+    vllm::ModelSource source;
+    source.kind = vllm::ModelSource::Kind::kSafetensors;
+    const std::unique_ptr<vllm::LoadedModel> loaded =
+        reg.factory->load_weights(reg, config, source);
+    REQUIRE(loaded != nullptr);
+    vllm::LoadedModel& model = *loaded;
     const std::vector<int32_t> token_ids{0};
     const std::vector<int32_t> positions{0};
     const std::vector<int32_t> logits_indices{0};

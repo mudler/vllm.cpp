@@ -480,46 +480,92 @@ behind the pin.
 
 ## Now
 
-`INVENTORIED`, blocked on [#633](https://github.com/mudler/vllm.cpp/issues/633)
-for any parity or e2e claim. **Text renders to audio end to end on the real checkpoints** (`test_indextts2_e2e`), but that gate asserts STRUCTURE only -- nothing is measured against the oracle, and there is no route.
+**Text renders to audio on the real checkpoints.** `test_indextts2_e2e`
+tokenizes with the shipped vocabulary, runs the 24-layer talker to mel codes,
+and drives those through the length regulator, a CFG'd CFM Euler loop over the
+13-layer S2Mel estimator with a real rotary table, and BigVGAN.
+`vllm_synthesize` does the same from C and returns 8192 samples for
+"hello world".
 
-**Landed.** W1 the shared 1-D vocoder core; W2 the GPT-2 talker backbone; W6a the
-`SpeechEngine` seam and family refusal; CAMPPlus, w2v-bert's Conformer, the
-semantic codec quantizer and encoder, Vocos, the length regulator, the CFM
-scaffolding and adaLN; the S2Mel DiT complete front to tail (front end, block
-stack with U-Net skips, wavenet final layer); BigVGAN; the offline checkpoint
-converter; and loaders that bind the real `s2mel.safetensors` and
-`gpt.safetensors`.
+**NOTHING HERE IS A CORRECTNESS CLAIM.** Every gate asserts STRUCTURE -- finite,
+bounded, correctly-shaped, not silence, not a rail. vLLM-Omni is unpinned
+(#633), so no one can say whether any of it resembles what upstream produces.
+That is the single largest open item and no code in this repository moves it.
 
-**Two stages run on the REAL shipped weights**: the S2Mel DiT tail (80 x 8 mel,
-values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
-[-1.25, 0.84]).
+### What is DONE
 
-**Not started or not finished**, in the order that unblocks a render:
+The feature extractor, the w2v-bert Conformer with the `hidden_states[17]` tap
+and stored-statistics normalization, the semantic codec encoder and FVQ,
+CAMPPlus, the stated-emotion selector and its banks, the tiktoken reader, the
+talker prompt and greedy loop, the S2Mel DiT (front end, stack with U-Net
+skips, wavenet tail), the length regulator, BigVGAN, the offline converter,
+loaders for every artifact, the `SpeechEngine` implementation, and
+`indextts2::Render`. The ABI entry points and `/v1/audio/speech` came from
+MUSIC3's W6 (#799) and this family reaches both through
+`GlobalSpeechRegistry`.
 
-1. ~~the SUPPLIED emotion vector~~ PORTED end to end: `emovec::Select` plus
-   `emovec::LoadBanks`, which reads the converted `feat1` / `feat2` and splits
-   them by `emo_num`;
-2. ~~BigVGAN's separate checkpoint~~ DOWNLOADED, converted and LOADED:
-   `nvidia/bigvgan_v2_22khz_80band_256x`, 783 tensors, and it renders a bounded
-   waveform through `bigvgan::Forward`;
-3. ~~W5 compose~~ DONE for the library path: `indextts2::Render` joins the
-   talker's OWN codes to the regulator, the CFG'd CFM loop over the real
-   estimator with a REAL rotary table, and BigVGAN. Measured 6 codes ->
-   6144 samples, 0.279 s at 22.05 kHz. NOT measured against the oracle;
-4. the `exact` flag on `tiktoken::Pretokenize` is NOT proven load-bearing: a
-   mutation disabling every range check still passes. The flag is kept and
-   the gap is recorded in the test; a case that fails without it is owed;
-5. W6b, the two routes and the ABI entry points. The SEAM is populated now --
-   the family loads and describes itself -- so what is left is the C API and
-   the HTTP surface, plus a tiktoken reader before text can reach the render;
-5. W7 speed, which additionally needs #633;
-6. the INFERRED emotion path (Path A): the `emo_conditioning_encoder` Conformer
-   and the `emo_perceiver_encoder` Perceiver. BEHIND a render, not in front of
-   it, because a caller can state the emotion instead of having it inferred.
+### What is NOT
 
-**Already done and previously listed here as outstanding**: the SeamlessM4T
-feature extractor, the `hidden_states[17]` tap, the stored-statistics
-normalization, the talker prompt (`prepare_gpt_inputs`) and the greedy
-autoregressive loop. Text plus a reference clip reaches mel CODES in the
-library; what stands between that and audio is items 1 to 3.
+1. **The reference clip does not condition anything.** `Synthesize` validates
+   it and refuses without it, but the encoders that would turn it into speaker
+   and semantic conditioning are ported and NOT WIRED -- the conditioning rows
+   are zeros. This is the first thing to fix.
+
+   The two checkpoints it needs are now STAGED, so nobody has to find them
+   again:
+
+   | Artifact | Where | Note |
+   |---|---|---|
+   | `facebook/w2v-bert-2.0` | `$CHECKPOINT_ROOT/w2v-bert-2.0` | ships `model.safetensors` already; NO conversion needed |
+   | `funasr/campplus` | `$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/campplus.safetensors` | converted from `campplus_cn_common.bin`, 937 tensors, `head.*` / `xvector.*` naming that matches `campplus.h` |
+
+   `campplus::LoadCampplus` LANDED and reads the converted file: 815 weights
+   after skipping the 122 `num_batches_tracked` I64 training counters, which
+   are skipped BY NAME so a real weight in an unexpected dtype still refuses.
+
+   **OPEN DEFECT, NARROWED to the PORT (#817).** `campplus::Forward` returns
+   NaN on the real weights. The tensor NAMES match -- `head.*` and `xvector.*`
+   are exactly what the port looks up -- so it was never a failed lookup, and
+   two of the three original candidates are now eliminated BY MEASUREMENT:
+
+   | Input | Result |
+   |---|---|
+   | a REAL kaldi log-mel (98 frames, range [-1.687, 24.180]) | NaN, absmax 4279 |
+   | the same, mean-centred per column as `infer_v2_5.py:647` does | NaN, absmax 981 |
+
+   Centring cuts the magnitude about fourfold, so it is clearly the right
+   preprocessing and clearly not the cause. What remains is a defect the
+   reduced-dimension goldens do not reach. The likeliest sites, from the port's
+   own notes: `BatchNorm1dEval` reading the real `running_var`, which no small
+   fixture ever supplied, and `StatsPool`'s UNBIASED (N-1) deviation, a sqrt of
+   something non-positive at low frame counts or on a zero-variance channel.
+   The goldens run ~20 frames through a handful of channels; the real model is
+   98 frames through 52 dense layers, so a per-layer error only shows at depth.
+
+   This is the lane's clearest case of what a reduced-dimension golden CANNOT
+   see: every CAMPPlus gate passes and the stage is unusable on its own weights.
+
+   It must be fixed BEFORE the conditioning is wired -- a style vector that is
+   quietly NaN would poison the talker's prompt while every shape stayed valid.
+
+   Then: the same for `w2vbert`, and feeding both into the three conditioning
+   rows `talker::PrepareInputs` already accepts.
+2. **The INFERRED emotion path** (`emo_conditioning_encoder` Conformer,
+   `emo_perceiver_encoder` Perceiver) is unported. A caller can STATE the
+   emotion instead, which is why this sits behind a render rather than in front.
+3. **`/v1/audio/speech` is unproven by request.** The wiring was read, not
+   exercised: `server_main.cpp` loads from the same registry this family
+   registers into. A live check needs a TEXT model too -- `vllm-server` refuses
+   `--speech-model` without `--model`, so the speech route cannot be served
+   standalone. Worth knowing before someone tries.
+4. **The `exact` flag on `tiktoken::Pretokenize` is not proven load-bearing**: a
+   mutation disabling every range check still passes. Recorded in the test.
+5. **W7 speed**, which additionally needs #633.
+
+### A process note for whoever continues
+
+This lane was built while several other agents merged in parallel, and twice a
+gap named here had already been closed by someone else's work -- once after a
+whole duplicate ABI slice had been written, which only a merge conflict caught.
+Re-verify each item against `origin/main` before implementing it. The protocol
+already says so; on this repository it is not optional.

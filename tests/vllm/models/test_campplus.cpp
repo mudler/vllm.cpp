@@ -296,3 +296,38 @@ TEST_CASE("campplus TDNN head geometry is gated where pooling cannot hide it") {
   REQUIRE(trace.tdnn.size() == static_cast<size_t>(kTdnnChannels * kTdnnFrames));
   CHECK(Worst(trace.tdnn, kTdnnOut, trace.tdnn.size()) < 1e-5);
 }
+
+// ---------------------------------------------------------------------------
+// Loading the converted CAMPPlus checkpoint (#634).
+// ---------------------------------------------------------------------------
+#include <cstdlib>
+
+TEST_CASE("the SHIPPED CAMPPlus checkpoint loads, minus the training counters") {
+  const char* env = std::getenv("VLLM_CPP_INDEXTTS2_CAMPPLUS");
+  if (env == nullptr) {
+    MESSAGE("SKIPPED: set VLLM_CPP_INDEXTTS2_CAMPPLUS to the converted "
+            "campplus.safetensors");
+    return;
+  }
+  const auto w = vllm::models::campplus::LoadCampplus(std::string(env));
+  // 937 tensors ship; 122 are `num_batches_tracked` counters that inference
+  // never reads, leaving 815 weights and buffers.
+  CHECK(w.t.size() == 815);
+  // The two top-level modules the port was written against.
+  CHECK(w.Has("head.bn1.weight"));
+  CHECK(w.Has("head.bn1.running_mean"));
+  CHECK(w.Has("head.bn1.running_var"));
+  // And the counters are GONE rather than present-and-garbage.
+  CHECK_FALSE(w.Has("head.bn1.num_batches_tracked"));
+  // Running stats are kept: BatchNorm1dEval needs them at inference, and
+  // dropping them alongside the counter would be the easy over-correction.
+  bool has_xvector_stats = false;
+  for (const auto& kv : w.t) {
+    if (kv.first.rfind("xvector.", 0) == 0 &&
+        kv.first.find("running_mean") != std::string::npos) {
+      has_xvector_stats = true;
+      break;
+    }
+  }
+  CHECK(has_xvector_stats);
+}

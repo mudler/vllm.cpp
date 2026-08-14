@@ -246,6 +246,78 @@ class RangeContract(unittest.TestCase):
         )
         self.assertTrue(any("Following-Agents-Protocol" in error for error in errors))
 
+    def test_range_is_taken_from_the_merge_base_when_the_base_branch_moved(self) -> None:
+        """A PR branch diverges the moment main moves; that must still validate.
+
+        RED before GATE-FORK-ANCESTRY (#773): CI passes
+        `pull_request.base.sha`, the TIP of the base branch, which stops being an
+        ancestor of head as soon as main advances. `validate_range` raised
+        "range base must be an ancestor of range head" and returned WITHOUT
+        READING A SINGLE COMMIT -- so the trailer contract was never enforced on
+        any external contribution.
+        """
+        root = self.commit("root\n\nFOLLOWING_AGENTS_PROTOCOL\n")
+        # The PR branch, cut from root.
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-b", "pr", root],
+            check=True,
+        )
+        head = self.commit(STRICT_MESSAGE)
+        # Main moves on after the branch was cut. This is the ordinary case.
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-B", "main", root],
+            check=True,
+        )
+        moved_main = self.commit(STRICT_MESSAGE.replace("policy:", "mainline:"))
+        self.assertNotEqual(moved_main, root)
+
+        errors = self.checker.validate_range(
+            self.repo, moved_main, head, cutover=None
+        )
+        self.assertEqual(errors, [], "the PR's own commits must validate")
+
+    def test_a_bad_trailer_in_the_merge_base_range_is_still_reported(self) -> None:
+        """Changing WHICH commits are read must not change what is demanded.
+
+        Green on both sides of #773 in the ancestor case; the point is that it
+        stays green in the DIVERGED case too, so the range fix cannot be
+        mistaken for a way to smuggle a non-conforming commit past the gate.
+        """
+        root = self.commit("root\n\nFOLLOWING_AGENTS_PROTOCOL\n")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-b", "pr2", root],
+            check=True,
+        )
+        self.commit("no trailers here at all\n")
+        head = self.commit(STRICT_MESSAGE)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-B", "main2", root],
+            check=True,
+        )
+        moved_main = self.commit(STRICT_MESSAGE.replace("policy:", "mainline2:"))
+
+        errors = self.checker.validate_range(
+            self.repo, moved_main, head, cutover=None
+        )
+        self.assertTrue(errors, "the offending commit must still be reported")
+
+    def test_unrelated_histories_still_fail_closed(self) -> None:
+        """No merge base at all is absence of INFORMATION, and must still raise.
+
+        This is the half of the old non-ancestor assertion that must NOT move:
+        an orphan branch shares no commit with the base, so there is no range to
+        compute and reporting one would be an invention.
+        """
+        base = self.commit("base\n\nFOLLOWING_AGENTS_PROTOCOL\n")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "--orphan", "orphan"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(self.repo), "rm", "-qrf", "."], check=True)
+        orphan = self.commit(STRICT_MESSAGE)
+        with self.assertRaises(ValueError):
+            self.checker.validate_range(self.repo, base, orphan, cutover=None)
+
     def test_missing_unreachable_and_non_ancestor_revisions_fail_closed(self) -> None:
         base = self.commit("base\n\nFOLLOWING_AGENTS_PROTOCOL\n")
         head = self.commit(STRICT_MESSAGE)
@@ -253,12 +325,13 @@ class RangeContract(unittest.TestCase):
             self.checker.validate_range(
                 self.repo, "missing", head, cutover=head
             )
-        subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", "--detach", base], check=True)
-        side = self.commit(STRICT_MESSAGE.replace("policy:", "side:"))
-        with self.assertRaises(ValueError):
-            self.checker.validate_range(
-                self.repo, side, head, cutover=head
-            )
+        # The divergent-but-RELATED half of this case moved to
+        # test_range_is_taken_from_the_merge_base_when_the_base_branch_moved
+        # (#773): two branches off a common root share a merge base, which is
+        # the ordinary shape of every pull request and must validate rather than
+        # raise. The genuinely unrelated case -- no shared history at all -- is
+        # asserted in test_unrelated_histories_still_fail_closed, so the
+        # fail-closed behaviour this case was written for is still pinned.
 
     def test_ambiguous_revision_name_fails_closed(self) -> None:
         base = self.commit("base\n\nFOLLOWING_AGENTS_PROTOCOL\n")

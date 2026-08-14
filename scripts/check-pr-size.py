@@ -548,16 +548,39 @@ def resolve_commit(repo: Path, revision: str) -> str:
     return oid
 
 
-def require_ancestor(repo: Path, base_oid: str, head_oid: str) -> None:
+def range_base(repo: Path, base_oid: str, head_oid: str) -> str:
+    """The merge base of base and head -- i.e. what a pull request actually is.
+
+    This used to demand that `base_oid` be an ANCESTOR of head (#773). CI passes
+    `pull_request.base.sha`, the TIP of the base branch, which stops being an
+    ancestor the moment main advances after the branch was cut -- continuously,
+    on this repo. So the checker aborted BEFORE classifying anything, and no
+    fork PR was ever checked. The sibling trailer gate aborted the same way,
+    which is why CI has never validated an external contributor's trailers.
+
+    Diffing two-dot against a moved main is not merely stricter, it is WRONG:
+    main's own commits appear as reversions inside the contributor's diff, so
+    paths they never touched get classified and charged to them. `git diff
+    A...B` is defined as `git diff $(git merge-base A B) B` and is what GitHub
+    itself shows.
+
+    Unrelated histories still fail closed. No merge base means there is no range
+    to compute, and reporting one would be an invention -- absence of
+    information must never look like absence of work.
+    """
     result = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", base_oid, head_oid],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        ["git", "-C", str(repo), "merge-base", base_oid, head_oid],
+        capture_output=True,
+        text=True,
         timeout=EVIDENCE_TIMEOUT_SECONDS,
         shell=False,
     )
-    if result.returncode == 1:
-        raise ValueError("base must be an ancestor of head")
+    if result.returncode != 0:
+        raise ValueError("base and head have no merge base (unrelated histories)")
+    oid = result.stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}", oid) is None:
+        raise ValueError("merge base did not resolve to one commit")
+    return oid
     if result.returncode != 0:
         raise ValueError("could not establish base/head ancestry")
 
@@ -565,9 +588,10 @@ def require_ancestor(repo: Path, base_oid: str, head_oid: str) -> None:
 def changed_paths(base: str, head: str, *, repo: Path = ROOT) -> list[ChangedPath]:
     base_oid = resolve_commit(repo, base)
     head_oid = resolve_commit(repo, head)
-    require_ancestor(repo, base_oid, head_oid)
+    # From the MERGE BASE, not the base tip -- see range_base() (#773).
     return parse_numstat(
-        git("diff", "--no-renames", "--numstat", base_oid, head_oid, repo=repo)
+        git("diff", "--no-renames", "--numstat",
+            range_base(repo, base_oid, head_oid), head_oid, repo=repo)
     )
 
 
@@ -667,7 +691,9 @@ def executable_evidence(
 
     base_oid = resolve_commit(repo, base)
     head_oid = resolve_commit(repo, head)
-    require_ancestor(repo, base_oid, head_oid)
+    # The BASE version of a checker, for the red-before half, is the one at the
+    # merge base -- not at a base tip that has moved past this branch (#773).
+    base_oid = range_base(repo, base_oid, head_oid)
     changed = {item.path for item in changes}
     checkers = sorted(
         item.path

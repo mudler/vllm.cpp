@@ -2340,3 +2340,11 @@ WAVENET_SRC=/path/to/index-tts/indextts/s2mel/modules \
 DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
   python3 scripts/gen-dit-tail-goldens.py --out tests/vllm/models/dit_tail_goldens.inc
 ```
+
+The U-Net skip routing is recorded rather than generated into an `.inc`: this
+prints the schedule upstream's own Transformer actually performs, at several
+depths, and the expected values are quoted in `tests/vllm/models/test_dit_skip.cpp`.
+
+```sh
+python3 scripts/gen-dit-skip-schedule.py /path/to/index-tts/indextts/s2mel/modules
+```

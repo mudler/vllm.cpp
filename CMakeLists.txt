@@ -776,6 +776,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/fvq.cpp
   src/vllm/model_executor/models/wavenet.cpp
   src/vllm/model_executor/models/dit_tail.cpp
+  src/vllm/model_executor/models/dit_skip.cpp
   src/vllm/model_executor/models/vocos.cpp
   src/vllm/model_executor/models/lenreg.cpp
   src/vllm/model_executor/models/cfm.cpp

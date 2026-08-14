@@ -1073,9 +1073,10 @@ a route yet. The greedy generate loop that turns the prompt into mel codes is
 ported too, and so is the STATED-emotion path -- eight weights selecting rows
 from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
 text plus a reference clip and an emotion reaches mel CODES in the library. What
-is still missing before audio is BigVGAN's separately-downloaded checkpoint, a
-step that drives the whole chain and writes a WAV, and any command or route to
-call it from. Inferring the emotion from a clip instead of stating it needs a
+is still missing is a step that drives the whole chain from text through to the
+vocoder in one go, and any command or route to call it from. The vocoder ITSELF
+now renders: the real BigVGAN checkpoint turns a mel into a bounded waveform at
+22.05 kHz, 256 samples per frame. Inferring the emotion from a clip instead of stating it needs a
 Conformer and a Perceiver that are not ported.
 
 There is **no `/v1/audio/speech`**. Text to speech is not servable: the
@@ -2425,6 +2426,14 @@ VLLM_CPP_INDEXTTS2_GPT=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/gpt.safetensors
 
 VLLM_CPP_INDEXTTS2_AUX=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/aux.safetensors \
   ./build/tests/test_emovec
+
+The vocoder is a SEPARATE download (`nvidia/bigvgan_v2_22khz_80band_256x`),
+which IndexTTS-2.5 fetches rather than ships. Convert it the same way, then:
+
+```sh
+VLLM_CPP_INDEXTTS2_BIGVGAN=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/bigvgan.safetensors \
+  ./build/tests/test_bigvgan
+```
 ```
 
 ## MiniMax-Music3: the autoregressive half

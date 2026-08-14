@@ -57,7 +57,7 @@ MATRICES = {
     # (324/373/356/310/261 is unchanged), because like the MuseGlimmer, KimiK3
     # and MiniMaxH3DiT rows they carry no pinned-registry target. Bumped
     # because seven new rows EXIST, never to make a transition pass.
-    # 363 since 2026-08-11: +`MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model`
+    # 370 since 2026-08-13: +`MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model`
     # (Lightricks LTX-2.5, 21.00B joint video+audio DiT, released 2026-08). A FOURTH
     # beyond-pin row, and like Muse Glimmer it is absent from `555967922` because it
     # did not exist yet. Unlike the others it is also out-of-repo: the architecture
@@ -65,6 +65,20 @@ MATRICES = {
     # stops at 2.3 (`ltx2_recipes.py:162-166`), with 2.5 still OPEN upstream at
     # vllm-omni#6066. Same lane as the MiniMax-H3 diffusion row. Bumped because a new
     # row EXISTS, never to make a transition pass.
+    #
+    # This entry READ `363 since 2026-08-11` until #651. Both halves were wrong,
+    # and 363 is a value this pin has never held at any commit in its history —
+    # so the entry described a transition that never happened, in a log whose
+    # whole job is to say why each bump was legitimate. Re-derived from git
+    # rather than carried forward, which is the only way any number in this
+    # block is ever allowed to move: `git log -S` on the row id finds exactly
+    # one commit, `cefacd2d0` (2026-08-13), and the pin reads 369 at
+    # `cefacd2d0~1` and 370 at `cefacd2d0`. What makes that checkable rather
+    # than plausible is the block itself — 358, 360, 361, 362, 369, 370, 372,
+    # 373, 375, 377 is the sequence of values this pin has actually held, in the
+    # order it held them, and an append-log that ran 369, 363, 372 was
+    # self-evidently not a history. `test_model_pin_log_records_only_transitions_that_happened`
+    # is what ties this entry to that sequence.
     # 372 since 2026-08-13: +2 for IndexTTS-2.5, which vLLM-Omni registers as TWO
     # architectures (`IndexTTS2TalkerForConditionalGeneration` stage 0 and
     # `IndexTTS2S2MelDecoder` stage 1), so a port described in prose as "a model"

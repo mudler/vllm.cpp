@@ -500,7 +500,9 @@ values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
 1. ~~the SUPPLIED emotion vector~~ PORTED end to end: `emovec::Select` plus
    `emovec::LoadBanks`, which reads the converted `feat1` / `feat2` and splits
    them by `emo_num`;
-2. BigVGAN's separate checkpoint, which is not in this repository;
+2. ~~BigVGAN's separate checkpoint~~ DOWNLOADED, converted and LOADED:
+   `nvidia/bigvgan_v2_22khz_80band_256x`, 783 tensors, and it renders a bounded
+   waveform through `bigvgan::Forward`;
 3. W5 compose: drive the whole chain on real weights and emit a WAV;
 4. W6b, the two routes and ABI v19;
 5. W7 speed, which additionally needs #633;

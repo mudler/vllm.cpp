@@ -355,6 +355,83 @@ class AgentRecordMutationTests(unittest.TestCase):
             agent_record.check_matrices(errors)
         require(errors, r"\d+ MODEL rows; expected \d+")
 
+    def test_model_pin_log_records_only_transitions_that_happened(self) -> None:
+        """The MODEL pin's justification log must not name a value the pin never held.
+
+        Every assertion above checks the pin against the ROWS. None of them can
+        see the other half of the record: the `# <N> since <date>` block
+        directly above the pin, which is the append-log of the values this pin
+        has held and the only place the REASON for each bump is written down.
+        Nothing read it, so it drifted -- an entry claimed LTX-2.5 took the pin
+        to `363 since 2026-08-11` (#651), and both halves were wrong. `git log
+        -S` on the row id finds exactly one commit, `cefacd2d0` on 2026-08-13,
+        and the pin reads 369 before it and 370 after. 363 is a value this pin
+        has never held at any commit in its history.
+
+        That is not a cosmetic defect. This log is what a later re-derivation
+        reads to decide whether a number was bumped because a row landed or
+        bumped to silence a failure, which is the exact distinction
+        `test_model_row_ratchet_is_load_bearing` exists to force -- and the two
+        collisions recorded above (#634/#672, #490/#699) were both resolved by
+        reading it. An entry naming a transition that never happened makes the
+        next collision unresolvable from the record.
+
+        Two properties are checked, because either alone is satisfiable by a
+        wrong number. The values must INCREASE in file order and end at the pin
+        -- an append-log that goes 369, 363, 372 is self-evidently not a history
+        -- and the LTX-2.5 entry must name 370 specifically, which is what
+        catches a stale value that happens to fall in sequence.
+        """
+
+        source = CHECKER.read_text(encoding="utf-8").splitlines()
+        pin_lines = [
+            index
+            for index, line in enumerate(source)
+            if '"MODEL": (AGENTS / "model-matrix.md"' in line
+        ]
+        self.assertEqual(len(pin_lines), 1, "the MODEL pin must be assigned exactly once")
+        pin_index = pin_lines[0]
+
+        start = pin_index - 1
+        while start >= 0 and source[start].lstrip().startswith("#"):
+            start -= 1
+        block = source[start + 1 : pin_index]
+        self.assertTrue(block, "the MODEL pin must carry its justification log")
+
+        # The date is followed by ':' on most entries and by ', and RE-DERIVED
+        # ...' on the two that were recounted after a merge collision, so the
+        # parse stops at the date rather than requiring what comes after it.
+        entries = [
+            (int(match.group(1)), match.group(2), index)
+            for index, line in enumerate(block)
+            for match in [re.match(r"\s*#\s*(\d+) since (\d{4}-\d{2}-\d{2})\b", line)]
+            if match
+        ]
+        self.assertGreater(len(entries), 1, "the log must record more than one bump")
+
+        values = [value for value, _, _ in entries]
+        self.assertEqual(
+            values,
+            sorted(values),
+            f"the MODEL pin log is not in the order the pin moved: {values}",
+        )
+        self.assertEqual(len(values), len(set(values)), f"a value is logged twice: {values}")
+        self.assertEqual(
+            values[-1],
+            agent_record.MATRICES["MODEL"][1],
+            "the last logged value must be the value the pin now carries",
+        )
+
+        ltx = [
+            entry
+            for entry in entries
+            if "MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model"
+            in "\n".join(block[entry[2] : entry[2] + 3])
+        ]
+        self.assertEqual(len(ltx), 1, "LTX-2.5 must own exactly one entry in the log")
+        self.assertEqual(ltx[0][0], 370, "LTX-2.5 took the MODEL pin 369 -> 370 (`cefacd2d0`)")
+        self.assertEqual(ltx[0][1], "2026-08-13", "`cefacd2d0` landed on 2026-08-13")
+
     def test_indextts_rows_are_inside_the_model_ratchet(self) -> None:
         """The #634 rows and the 370 -> 372 bump are one semantic change.
 

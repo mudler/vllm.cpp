@@ -580,6 +580,15 @@ take can only raise the plateau; any MoE comparison that lets routing vary
 between arms measures the draw, not the change; and both blocks AND distinct
 experts must be controlled, since cost per distinct expert spans 4.47-7.50 us
 and is flat only above ~40 experts. NOT parity, and the row stays open.
+MEASUREMENT IS CURRENTLY IMPOSSIBLE: the gate host was REIMAGED on 2026-08-14
+(new COS partition layout, /home created 13:37 UTC, ~/work empty), destroying
+the pinned oracle venv, the pinned vLLM source, the 35B and draft checkpoints,
+our engine build and every run log, so the Evidence paths in the benchmark
+record point at nothing. The RESULTS stand, because the harnesses
+(scripts/marlin-moe-standalone.py, benchmarks/marlin_moe_standalone.cpp,
+scripts/dspark-paired-e2e.sh) and the per-rep values are in-tree; resuming
+needs the checkpoints re-fetched, the oracle rebuilt at pinned commit
+555967922, and its identity re-asserted before any number is trusted.
 
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has

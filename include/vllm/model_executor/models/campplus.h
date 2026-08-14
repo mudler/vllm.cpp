@@ -176,6 +176,21 @@ std::vector<float> Forward(const CampplusParams& params, const CampplusWeights& 
                            const std::vector<float>& feats, int64_t frames,
                            ForwardTrace* trace = nullptr);
 
+
+// Read the weights from the converted `campplus.safetensors` (#634).
+//
+// `funasr/campplus` ships `campplus_cn_common.bin`, a pickle; the offline
+// converter turns it into safetensors like everything else in this lane, so the
+// engine reads no pickle. The names are preserved verbatim -- `head.*` and
+// `xvector.*` -- because `Forward` looks them up by the names the checkpoint
+// uses, and renaming on the way in would be a private protocol.
+//
+// Throws std::runtime_error naming the file or the offending tensor. The one
+// exception is `num_batches_tracked`, BatchNorm's I64 momentum counter, which
+// inference never reads; it is skipped BY NAME, so a real weight arriving in an
+// unexpected dtype still refuses rather than vanishing.
+CampplusWeights LoadCampplus(const std::string& path);
+
 }  // namespace campplus
 }  // namespace models
 }  // namespace vllm

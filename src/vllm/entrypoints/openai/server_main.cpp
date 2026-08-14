@@ -16,7 +16,7 @@
 //          [--scheduling-policy fcfs|priority]
 //          [--tool-call-parser <name>|auto|none]
 //          [--reasoning-parser <name>|auto|none]
-//          [--kv-transfer-config '<json>']
+//          [--kv-transfer-config '<json>'] [--offload-config '<json>']
 //
 // A directory holds config.json, tokenizer.json and supported safetensors
 // shards. A supported GGUF file is also accepted and supplies model metadata
@@ -66,6 +66,7 @@
 #include "vllm/config/multimodal.h"
 #include "vllm/config/scheduler.h"
 #include "vllm/entrypoints/chat_template.h"
+#include "vllm/config/offload.h"
 #include "vllm/entrypoints/model_loader.h"
 #include <fstream>
 #include "vllm/entrypoints/openai/server_main.h"
@@ -281,6 +282,12 @@ struct Args {
   // same JSON object vLLM takes. Empty (default) == no connector == the inert
   // production path. See docs/KV-OFFLOAD.md.
   std::string kv_transfer_config;
+  // ENG-WEIGHT-OFFLOAD W0b — vLLM's OffloadConfig, the WEIGHT-offload selection
+  // (distinct from --kv-transfer-config, which offloads KV blocks), as the same
+  // JSON object vLLM takes. Empty (default) == no offloading == the inert
+  // production path. Accepted and validated today; the offloader that MOVES a
+  // weight is W2/W5.
+  std::string offload_config;
   // vLLM's --speculative-config: the speculative-decoding selection, as the same
   // JSON object vLLM takes (e.g. '{"method":"mtp","num_speculative_tokens":1}').
   // Empty (default) == no speculation == the inert production path (SPEC-MTP I5d).
@@ -386,6 +393,7 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--tool-call-parser <name>|auto|none]\n"
          "               [--reasoning-parser <name>|auto|none]\n"
          "               [--kv-transfer-config '<json>']\n"
+         "               [--offload-config '<json>']\n"
          "               [--speculative-config '<json>']\n"
          "               [--[no-]language-model-only]\n"
          "               [--limit-mm-per-prompt '<json>']\n"
@@ -557,6 +565,8 @@ Args ParseArgs(int argc, char** argv) {
       a.reasoning_parser = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--kv-transfer-config") {
       a.kv_transfer_config = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--offload-config") {
+      a.offload_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--speculative-config") {
       a.speculative_config = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--language-model-only" ||
@@ -985,6 +995,20 @@ int VllmServerMain(int argc, char** argv) {
         throw std::invalid_argument(msg);
       }
       engine_params.kv_transfer_config = std::move(kv_cfg);
+    }
+    // --offload-config: WEIGHT offload (ENG-WEIGHT-OFFLOAD W0b). Empty (default)
+    // leaves the optional unset — the byte-identical no-offload path. Parsed and
+    // VALIDATED here so a malformed document or a validator violation is refused
+    // at startup rather than surfacing later. Upstream's three backend/field
+    // mismatches are WARNINGS in vLLM and stay warnings here.
+    if (!args.offload_config.empty()) {
+      vllm::OffloadConfig off_cfg =
+          vllm::parse_offload_config_json(args.offload_config);
+      off_cfg.Validate();
+      for (const std::string& w : off_cfg.warnings) {
+        std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
+      }
+      engine_params.offload_config = std::move(off_cfg);
     }
     // --speculative-config: speculative decoding (SPEC-MTP I5d). Absent (default)
     // leaves the optional unset — the byte-identical no-speculation path. The

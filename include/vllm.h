@@ -385,6 +385,30 @@ typedef struct vllm_model_params {
    * engine construction (VLLM_ERR_MODEL_LOAD). `kv_role` is REQUIRED whenever
    * `kv_connector` is set. Borrowed for the call only. See docs/KV-OFFLOAD.md. */
   const char* kv_transfer_config;
+  /* ── Weight offload / OffloadConfig (ABI v21) ──────────────────────────────
+   * The JSON object vLLM's OffloadConfig takes, selecting the WEIGHT-offload
+   * backend. This is a DIFFERENT subject from kv_transfer_config above, which
+   * offloads KV blocks: this one offloads model WEIGHTS. Example:
+   *   {"offload_backend":"uva","uva":{"cpu_offload_gb":10,
+   *                                   "cpu_offload_params":["experts"]}}
+   * NULL or "" => the default inert config: no backend selected, nothing
+   * offloaded, the byte-identical engine. Mirrors vllm/config/offload.py at the
+   * pin: `offload_backend` is one of "auto" (default; prefetch when
+   * offload_group_size > 0, else uva when cpu_offload_gb > 0, else nothing),
+   * "uva" or "prefetch". A malformed document, an unknown backend name, a
+   * wrong-typed field, or a config that fails upstream's validator
+   * (offload_num_in_group > offload_group_size, or offload_prefetch_step < 1
+   * when prefetch is enabled) fails vllm_engine_load with
+   * VLLM_ERR_INVALID_ARGUMENT.
+   *
+   * ACCEPTED BUT NOT YET ACTED ON: `ENG-WEIGHT-OFFLOAD` W0b wires the config
+   * surface end to end (CLI -> ABI -> EngineParams) and validates it; the
+   * offloader that would MOVE a weight is W2/W5. So a valid config parses,
+   * validates and is recorded, and no weight moves yet. It is spelled out here
+   * rather than left silent because a user who sets cpu_offload_gb and sees no
+   * memory change deserves to know it was accepted and is inert, not ignored.
+   * Borrowed for the call only. */
+  const char* offload_config;
   /* ── Jump-forward decoding (ABI v10) ───────────────────────────────────────
    * Tri-state toggle for jump-forward decoding — the SGLang grammar-speed
    * behavior (ENG-SGLANG-BEHAVIOR-FLAG SW3): when the structured-output grammar

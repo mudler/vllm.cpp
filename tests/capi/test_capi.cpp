@@ -1386,6 +1386,71 @@ TEST_CASE("capi: the v19 limits are RECORDED on a C-ABI engine; there is no "
   CHECK(e.mm_config().GetLimitPerPrompt("image") == 0);
 }
 
+TEST_CASE("capi: offload_config defaults to NULL and is parsed+validated (ABI v21)") {
+  // ENG-WEIGHT-OFFLOAD W0b. The field carries vLLM's OffloadConfig JSON. It is
+  // parsed AND run through Validate() at the ABI boundary, so a caller error is
+  // reported before any model I/O — the same contract kv_transfer_config and
+  // limit_mm_per_prompt already hold.
+
+  // Default is NULL == no offloading == the byte-identical engine.
+  vllm_model_params def = vllm_model_params_default();
+  CHECK(def.offload_config == nullptr);
+
+  // A well-formed config gets PAST the argument gate and fails at model load,
+  // which is how we prove it was accepted rather than rejected.
+  vllm_model_params ok = vllm_model_params_default();
+  ok.model_path = "/nonexistent/vllm-cpp/model/dir";
+  ok.offload_config =
+      "{\"offload_backend\":\"uva\",\"uva\":{\"cpu_offload_gb\":10,"
+      "\"cpu_offload_params\":[\"experts\"]}}";
+  vllm_engine* eng = nullptr;
+  CHECK(vllm_engine_load(&ok, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+
+  // Empty string is the same as NULL: inert, still reaches model load.
+  vllm_model_params empty = vllm_model_params_default();
+  empty.model_path = "/nonexistent/vllm-cpp/model/dir";
+  empty.offload_config = "";
+  vllm_engine* eng_empty = nullptr;
+  CHECK(vllm_engine_load(&empty, &eng_empty) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng_empty == nullptr);
+
+  // Every rejection below must be INVALID_ARGUMENT, never MODEL_LOAD: the
+  // distinction is the whole point of validating at the boundary.
+  struct Bad { const char* json; const char* why; };
+  const Bad bad_cases[] = {
+      {"{not json", "malformed document"},
+      {"{\"offload_backend\":\"disk\"}", "unknown backend (disk is ENG-EXPERT-STREAM's idea, not this row's)"},
+      {"{\"uva\":{\"cpu_offload_gb\":\"ten\"}}", "wrong-typed field"},
+      {"{\"uva\":5}", "sub-config that is not an object"},
+      {"{\"uva\":{\"cpu_offload_gb\":-1}}", "negative budget (the ge=0 bound)"},
+      {"{\"prefetch\":{\"offload_group_size\":4,\"offload_num_in_group\":5}}",
+       "num_in_group > group_size (upstream validator error 1)"},
+      {"{\"prefetch\":{\"offload_group_size\":8,\"offload_num_in_group\":2,"
+       "\"offload_prefetch_step\":0}}",
+       "prefetch_step < 1 while enabled (upstream validator error 2)"},
+  };
+  for (const Bad& b : bad_cases) {
+    vllm_model_params bad = vllm_model_params_default();
+    bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+    bad.offload_config = b.json;
+    vllm_engine* e = reinterpret_cast<vllm_engine*>(0x1);
+    CHECK_MESSAGE(vllm_engine_load(&bad, &e) == VLLM_ERR_INVALID_ARGUMENT, b.why);
+    CHECK_MESSAGE(e == nullptr, b.why);
+  }
+
+  // A backend/field MISMATCH is a warning upstream, so it must NOT be refused:
+  // uva backend with prefetch fields set still reaches model load.
+  vllm_model_params warn = vllm_model_params_default();
+  warn.model_path = "/nonexistent/vllm-cpp/model/dir";
+  warn.offload_config =
+      "{\"offload_backend\":\"uva\",\"uva\":{\"cpu_offload_gb\":1},"
+      "\"prefetch\":{\"offload_group_size\":8,\"offload_num_in_group\":2}}";
+  vllm_engine* eng_warn = nullptr;
+  CHECK(vllm_engine_load(&warn, &eng_warn) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng_warn == nullptr);
+}
+
 TEST_CASE("capi: kv_transfer_config parses and validates the connector name") {
   // A well-formed config naming a REGISTERED connector passes the gate and
   // reaches model load.

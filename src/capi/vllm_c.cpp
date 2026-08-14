@@ -29,6 +29,7 @@
 
 #include "capi/chat_prompt.h"
 #include "capi/engine_handle.h"
+#include "vllm/config/offload.h"
 #include "vllm/config/kv_transfer.h"   // ParseKVTransferConfigJson (ABI v9)
 #include "vllm/config/multimodal.h"    // ParseLimitMmPerPromptJson (ABI v19)
 #include "vllm/config/scheduler.h"     // SchedulerPolicyFromString (ABI v9)
@@ -508,6 +509,7 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.kv_cache_memory_bytes = 0;      // 0 => unset (ABI v16).
   p.language_model_only = 0;        // 0 => off; limits stay at 999 (ABI v19).
   p.limit_mm_per_prompt = nullptr;  // NULL => no limits configured (ABI v19).
+  p.offload_config = nullptr;       // NULL => no weight offload (ABI v21).
   return p;
 }
 
@@ -609,6 +611,22 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
           throw std::invalid_argument(msg);
         }
         ep.kv_transfer_config = std::move(kv_cfg);
+      }
+      // ABI v21: WEIGHT offload (ENG-WEIGHT-OFFLOAD W0b). NULL/empty => the
+      // default inert config. Parsed AND validated here so a malformed document,
+      // an unknown backend name or a validator violation is a CALLER error
+      // reported before any model I/O, exactly as the two configs above are.
+      // Validate() also collects upstream's three backend/field-mismatch
+      // WARNINGS; they are warnings in vLLM too, so they are surfaced on the
+      // engine log rather than turned into a refusal.
+      if (params->offload_config != nullptr && params->offload_config[0] != '\0') {
+        vllm::OffloadConfig off_cfg =
+            vllm::parse_offload_config_json(params->offload_config);
+        off_cfg.Validate();
+        for (const std::string& w : off_cfg.warnings) {
+          std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
+        }
+        ep.offload_config = std::move(off_cfg);
       }
       // ABI v19: the multimodal input limits (#607 L2). Parsed HERE so a
       // malformed document is a CALLER error reported before any model I/O,

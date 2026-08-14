@@ -291,9 +291,17 @@ cases, 51/122 assertions red, build rc=0) then green 11/11, 126/126, and
 mutation-proven 6/6 with each mutation's compile status reported so a
 non-building mutation could not read as a pass.
 
-It is deliberately UNREACHABLE: nothing constructs an `OffloadConfig` yet, which
-is why every existing gate is byte-identical by construction. **Owed to finish
-W0**: the `include/vllm.h` JSON field and the server CLI flag. Then W1.
+**W0b landed** (2026-08-14), finishing W0: the config now reaches the engine
+end to end — `offload_config` on `vllm_model_params` (ABI v21), parsed and
+`Validate()`d at the C-API boundary so a caller error is refused before any
+model I/O, recorded on `EngineParams::offload_config`, and exposed as the server
+`--offload-config` flag. Upstream's three backend/field mismatches stay
+WARNINGS, printed rather than refused, because that is what vLLM does.
+
+It remains deliberately UNREACHABLE: the config is validated and recorded, and
+NO weight moves, because the offloader is W2/W5. `docs/USAGE.md` says so in the
+flag's own row rather than leaving a user to discover that a `cpu_offload_gb`
+they set freed nothing. Next is W1.
 
 One correction the RED pass forced, recorded because the distinction is easy to
 lose: `ResolvedBackend()` mirrors `create_offloader` exactly — an EXPLICIT

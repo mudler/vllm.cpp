@@ -1,9 +1,9 @@
 # AGENTS.md: the rules
 
-This file contains the complete policy for `vllm.cpp`. Every agent loads this
-file automatically, so every rule lives here. Files under `.agents/` are task
-guides. They explain how to do a specific job. They cannot add or weaken a rule
-in this file.
+This file contains the complete policy for `vllm.cpp`. It is the only file that
+every agent loads automatically, so every rule lives here. Files under
+`.agents/` are task guides. They explain how to do a specific job. They cannot
+add or weaken a rule in this file.
 
 The project mirrors vLLM in C++ without PyTorch or a ggml dependency. vLLM
 defines the reference behavior and the performance target.
@@ -98,9 +98,9 @@ the spec and implementation. Do not add a checker that selects the pull request
 shape.
 
 Before you claim a row, verify the gap against the current code, tests, issues,
-pull requests, `NOW.md`, and the owning row. Reconcile the record before you
-implement if the work already landed or has an owner. Do the same if the gap no
-longer matches the record.
+pull requests, `NOW.md`, and the owning row. If the work already landed, already
+has an owner, or no longer matches its record, reconcile the record first and do
+not implement.
 
 When a row reaches `DONE`, add an `## Outcome` section to its spec. Record what
 you measured, what you rejected and why, and why each default has its value.
@@ -119,32 +119,46 @@ These guides control language and document structure. They cannot add unrelated
 project policy or weaken this file. This file takes precedence when a guide
 conflicts with a repository convention or rule.
 
+Two of those rules are gated, and `scripts/check-commit-style.py` enforces them.
+A commit subject does not end in a period. A commit has an authored body,
+because the reader of a commit already has the diff and lacks the reason. One
+sentence satisfies the body rule.
+
+Subject length and body wrapping stay guidance in the guide, and no gate
+enforces them. Measured over the last 200 non-merge commits, a 72-character
+subject limit fails 164 commits and a 72-column body wrap fails 3658 lines. A
+gate that fires on ordinary work is the defect, not the discipline.
+
+The guides bind new prose. Rewriting an existing file to satisfy a style rule is
+out of scope unless a row asks for that rewrite.
+
 ## How work gets done
 
-Another person or agent reviews every implementation. The operator verifies the
-result. Use this sequence:
+Work is delegated. Another person or agent reviews every implementation, and the
+operator verifies the result. This sequence is the method, not a suggestion:
 
 1. A **fresh implementer** works from the committed spec. The implementer ports
    or writes the smallest test that fails for the intended reason. They capture
    the red result, make the minimum complete change, and get focused green.
    Then they run the full gate.
 2. A **fresh reviewer** reviews the immutable head. The reviewer cannot be the
-   agent that wrote the code. They inspect the change and mutate each claimed
-   guarantee in a scratch copy. This mutation proves that the tests detect the
-   defect. The reviewer restores the tree byte-for-byte after each mutation.
+   agent that wrote the code. They inspect the change statically and mutate each
+   claimed guarantee in a scratch copy. This mutation proves that the tests
+   detect the defect. Mutate the guarantee. Do not only read it. The reviewer
+   restores the tree byte-for-byte after each mutation.
 3. A **fresh implementer** repairs each finding. The coordinating session never
    repairs a finding. Repeat the focused gate, full gate, and fresh scoped
    review until the result is `PASS`. Attempt budgets control scheduling. They
    never stop a correctable finding. Only explicit developer direction or a
    precise external blocker stops the loop.
-4. The **operator reruns the row's gate**. An implementer or reviewer report is
-   an input. It is not the operator's gate result.
+4. The **operator reruns the row's gate itself**. An implementer or reviewer
+   report is an input, never a gate result.
 
 Every delegated task states the goal, context, exact scope, exclusions,
 constraints, completion condition, required evidence, authority, output
 contract, and stop conditions. Return `NEEDS_CONTEXT` when binding context is
-missing. Do not guess. Return `NEEDS_DECISION` for a material disagreement. Do
-not change scope without notice. Use the versioned contracts in
+missing. Do not guess. Return `NEEDS_DECISION` for a material disagreement
+rather than changing the scope silently. Use the versioned contracts in
 [`.agents/prompts/`](.agents/prompts/).
 
 The operator is a **coordinator**. It holds the plan and the graphics processing
@@ -163,13 +177,13 @@ and push again. Never force the update.
 ## vLLM is the reference
 
 **Mirror vLLM.** When vLLM defines behavior, mirror every applicable mode,
-default, error, and edge case. Escalate only a product decision. Never ask how a
+default, error, and edge case. Escalate only a genuine product decision. Never ask how a
 mirrored feature must behave.
 
 **Pin vLLM.** Compare against the pinned oracle in
 [`.agents/upstream-sync.md`](.agents/upstream-sync.md). Advance the pin only
-after you reconcile every affected row and gate. An oracle becomes gateable
-after it demonstrably builds and runs the model. Constructing a config proves
+after you reconcile every affected row and gate. An oracle is only gateable once
+it demonstrably builds and runs the model. Constructing a config proves
 nothing.
 
 **Run the oracle and read its source.** Check every change in two ways. Run the
@@ -201,8 +215,8 @@ resolved template dtypes in the same tool.
 ## When vLLM has no implementation
 
 vLLM, including `vllm-project/vllm-omni`, is the primary reference. It is the
-only reference wherever it implements the behavior. When vLLM implements no
-path, run the work against a **secondary oracle**. A secondary oracle is valid
+only reference wherever it implements the behavior. Where it implements nothing, the work is
+still not ungated. Run it against a **secondary oracle**. A secondary oracle is valid
 only when it appears in this table and has a recorded pin:
 
 <!-- oracle-registry:begin -->
@@ -214,7 +228,7 @@ only when it appears in this table and has a recorded pin:
 | HuggingFace `transformers` | `transformers` | a model, processor, or tokenizer reference implementation that vLLM mirrors |
 | `diffusers` | `diffusers` | schedulers, VAEs, and diffusion pipelines |
 | SGLang | `sglang` | a model or serving path that SGLang implements and vLLM does not |
-| SGLang-Omni | `sglang-omni` | omni, speech, TTS, and music models in the separate SGLang-Omni repository |
+| SGLang-Omni | `sglang-omni` | omni, speech, TTS, and music models served by SGLang's pipeline runtime, in a third repository that is not SGLang |
 | llama.cpp | `llama-cpp` | CPU and GGUF k-quant floors |
 | Tenstorrent tt-forge | `tt-forge` | Tenstorrent hardware, for which vLLM has no backend |
 
@@ -230,9 +244,9 @@ and read the files with a glob. Never require every change to write one shared
 table.
 
 **A secondary oracle answers one question:** what correct output looks like on
-a path that vLLM cannot run. It does not outrank vLLM or become the mirror
+a path that vLLM cannot run. It never outranks vLLM, and it never becomes the mirror
 source. Mirror vLLM behavior, defaults, structure, and naming wherever vLLM
-defines them. A different SGLang implementation is not enough reason to diverge.
+defines them. "SGLang does it differently" is never on its own a reason to diverge.
 When vLLM implements the path, reconcile the row onto vLLM and record the
 change in the spec.
 
@@ -263,7 +277,7 @@ accept it.
 an unresolved implementation difference. Keep the gap open and name the next
 traceable hypothesis.
 
-Report one result for each applicable rule. The result is satisfied, narrowly
+Report exactly one result for each applicable rule. The result is satisfied, narrowly
 waived, pending a named external authority or resource, or failing. A permanent
 report-only state is not a result.
 
@@ -290,7 +304,7 @@ A model port includes the **quantized arms, not only bf16**. GGUF k-quants are a
 standing requirement. They are not a choice for each model. Most users run the
 quantized arms, and a quant-matched llama.cpp comparison needs them. Refuse an
 unimplemented arm with a message that names the missing part. Record the arm as
-owed. Do not let a user discover the missing path later. Use
+owed. Never leave the missing path to be discovered later. Use
 [`.agents/porting-a-model.md`](.agents/porting-a-model.md) as the checklist.
 
 ## Records
@@ -316,8 +330,8 @@ one of these shapes:
 Rewrite every other record surface into one of these shapes.
 
 Two rules follow. **Limit an entry, not a shared file.** A shared-file budget
-forces each addition to remove another entry. Two clean merges can then apply
-both removals. **Never store a measurement of one file inside another file.** A
+forces each addition to remove another entry. Merging two such edits cleanly is worse than
+conflicting, because it applies both removals. **Never store a measurement of one file inside another file.** A
 number that changes after each edit couples every pull request to lines that it
 does not own.
 
@@ -405,15 +419,16 @@ generated, and product paths explicitly. Never hide mutable files behind a
 general directory exemption. The project has no line budget. It retired the
 per-class limits on 10 August 2026. Nine of the previous 22 merged pull requests
 exceeded the product limit. Tests were one-third to one-half of each large
-change. The gate therefore failed normal work and charged red-first mutation
-tests against kernel code. Size is a review decision. Split a change when parts
+change. The gate therefore failed normal work, and it charged red-first
+mutation tests against the same allowance as kernel code. Size is a review decision. Split a change when parts
 help the reviewer, not when a counter requires it.
 
 ## Changing the rules or a checker
 
 A checker's message defines what it enforces. This file states the rule in
-prose. No gate checks whether the two descriptions agree. Two synchronized
-descriptions create the drift that this protocol avoids.
+prose. No gate checks whether the two descriptions agree, and that is deliberate.
+Keeping two descriptions in sync is the failure mode that this protocol was
+built to remove.
 
 A semantic checker change needs a spec, a red-before test or mutation, and
 green-after evidence. Never make a red gate green by deleting an assertion or
@@ -454,4 +469,5 @@ python3 scripts/agent-integration.py --base origin/main
 ```
 
 Never push, merge, manage services, use external compute, or download large
-assets without authority in developer preferences or the current task.
+assets without authority recorded in developer preferences or given for the current
+task.

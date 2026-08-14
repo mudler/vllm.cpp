@@ -1103,7 +1103,19 @@ a route yet. The greedy generate loop that turns the prompt into mel codes is
 ported too, and so is the STATED-emotion path -- eight weights selecting rows
 from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
 text plus a reference clip and an emotion reaches mel CODES in the library. What
-is still missing is a COMMAND or ROUTE. The TOKENIZER now exists:
+is still missing is a COMMAND or ROUTE. TEXT DOES REACH AUDIO in the library:
+`test_indextts2_e2e` tokenizes with the checkpoint's own vocabulary, runs the
+talker to mel codes, and drives those through the length regulator, the CFM loop
+and BigVGAN to samples. Point it at all four checkpoint paths:
+
+```sh
+VLLM_CPP_INDEXTTS2_S2MEL=... VLLM_CPP_INDEXTTS2_BIGVGAN=... \
+VLLM_CPP_INDEXTTS2_GPT=... VLLM_CPP_INDEXTTS2_TIKTOKEN=... \
+  ./build/tests/test_indextts2_e2e
+```
+
+It asserts STRUCTURE, not quality: nothing is compared against vLLM-Omni, which
+is unpinned (#633). The TOKENIZER it uses:
 `tiktoken::LoadRanks` reads the shipped `.tiktoken` vocabulary and
 `tiktoken::Encode` reproduces python tiktoken's ids exactly on the cases
 gated, CJK included. The checkpoint now

@@ -481,7 +481,7 @@ behind the pin.
 ## Now
 
 `INVENTORIED`, blocked on [#633](https://github.com/mudler/vllm.cpp/issues/633)
-for any parity or e2e claim. **There is no render yet, and no route.**
+for any parity or e2e claim. **Text renders to audio end to end on the real checkpoints** (`test_indextts2_e2e`), but that gate asserts STRUCTURE only -- nothing is measured against the oracle, and there is no route.
 
 **Landed.** W1 the shared 1-D vocoder core; W2 the GPT-2 talker backbone; W6a the
 `SpeechEngine` seam and family refusal; CAMPPlus, w2v-bert's Conformer, the

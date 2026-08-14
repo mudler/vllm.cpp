@@ -64,9 +64,13 @@ class RocmPlatform final : public Platform {
   // supports_fp8() stays false: gfx942/gfx950 have hardware fp8 and rocm.py lists
   //   "fp8" in supported_quantization (rocm.py:457-467), but we have no ROCm fp8
   //   kernel, and this predicate gates a fused path that would then not exist.
-  // support_static_graph_mode() stays false: hipGraph is the mapping and is not
-  //   implemented. Capture that bakes a wrong address is a silent correctness
-  //   bug, so this flips only alongside a real capture implementation.
+  // support_static_graph_mode() stays false: the vt::Backend hipGraph capture
+  //   seam is implemented as of BACKEND-ROCM W1 (rocm_backend.hip; see
+  //   .agents/specs/rocm-decode-graph.md) and the address-baking concern that
+  //   used to justify leaving this false is now an assertion, not a worry —
+  //   the mutate-src-then-replay test step fails if replay ever returns a
+  //   snapshot. This flag still stays false because flipping it to engage a
+  //   real model's decode-graph path is W2, not W1.
   // needs_weight_staging() stays false: this is the memory-model POLICY that
   //   selects the device-resident forward over the host-resident reference path.
   //   HIP's programming model does stage (hipMalloc hands back a distinct

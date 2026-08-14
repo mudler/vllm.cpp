@@ -114,7 +114,7 @@ struct Ltx2VideoDecoderBlock {
 // the direction and MAGNITUDE of the mutation are therefore part of the verdict.
 // MEASURED, by mutating each in turn, with the bound each number actually holds:
 //
-//   kMiniMaxH3SnakeEps      1e-9  -> 0.0   green
+//   vocoder1d::kSnakeEps      1e-9  -> 0.0   green
 //   kLtx2RmsNorm2dEps       1e-12 -> 0.0   green ...but NOT green upward:
 //     escalating it to 1.0 REDS "the video ENCODER (*_res family)" and "the video
 //     encoder CROPS a frame count that is not 1 + k*factor", both at 0.000525832

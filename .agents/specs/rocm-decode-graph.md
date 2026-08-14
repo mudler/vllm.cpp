@@ -59,13 +59,16 @@ like a confound but are not — launches and compute both scale with layers, so
 the layer count cancels and `L/C` depends only on per-layer width
 (`1 / (hidden x intermediate)`). All three sit on one curve.
 
-**It also bounds the win.** Fitting `ratio = alpha + beta / (hidden x inter)`
-across the three points gives **alpha ~= 1.36x** (size-independent: kernel
-quality, inductor fusion, the Triton attention path) and **beta ~= 1.65** in
-units where 0.6B's `hidden x inter` = 1 — an overhead contribution of ~1.65x at
-0.6B, ~0.41x at 1.7B, ~0.21x at 4B. So roughly half the 0.6B gap is fixed
-overhead, and the expected outcome is all three sizes converging on **~1.36x**:
-a real win, and **not parity**. A ~1.4x residual would remain.
+**It also bounded the win — WRONGLY; this paragraph is the falsified
+prediction, preserved verbatim rather than quietly reworded.** Fitting
+`ratio = alpha + beta / (hidden x inter)` across the three points gave
+**alpha ~= 1.36x** (size-independent: kernel quality, inductor fusion, the
+Triton attention path) and **beta ~= 1.65** in units where 0.6B's
+`hidden x inter` = 1 — an overhead contribution of ~1.65x at 0.6B, ~0.41x at
+1.7B, ~0.21x at 4B. The reasoning WAS that roughly half the 0.6B gap is fixed
+overhead, so the expected outcome WAS all three sizes converging on **~1.36x**.
+**That did not happen.** D7 (§8) has the measurement: capture moved throughput
+0-2%, indistinguishable from zero, not the predicted convergence.
 
 Treat the fit as provisional. An earlier two-point version gave `alpha ~= 1.54x`;
 Qwen3-4B then measured 1.46x, below that asymptote, which a curve cannot do, so
@@ -258,6 +261,13 @@ mutations that must turn it red, in a scratch copy, restored byte-for-byte:
    fixed-overhead term is smaller than the fit implies, and redirect to D4.
    **Do not describe any outcome as parity**; ~1.36x is the predicted floor for
    this change alone.
+
+   **SUPERSEDED.** This is the pre-registered prediction, kept verbatim per
+   AGENTS.md ("never trade correctness for throughput" applies equally to
+   quietly rewriting a call before the result). W2/W3 ran it: capture engaged
+   correctly on all three sizes and moved throughput 0-2%, not toward ~1.36x.
+   See D7 (§8) for the measurement and why. Any future W2/W3 claim on this row
+   starts from D7, not from this table.
 6. **`GetReferenceTierHits()` == 0** in any perf measurement — structurally
    impossible on a discrete board, assert anyway.
 7. **Records green:** `agent-preflight.sh --staged`, `check-agent-record.py`,
@@ -279,6 +289,30 @@ capture, which should grow `cap` to its high-water mark. *If it does not:*
 `hipStreamEndCapture` fails loudly rather than corrupting — the acceptable
 direction. **W1 verifies this rather than trusting it**; a shape appearing only
 at capture time would be a latent, board-specific trap.
+
+**VERIFIED in W1 on gfx1200, and it is worse than written above — there are TWO
+lazy initialisations, not one.** Capturing a cold `MatmulBT` ([1,2048] x
+[2048,2048]^T) fails with all three of:
+
+```text
+vt rocm: hipMalloc: operation not permitted when stream is capturing
+vt rocm: hipFree:   operation not permitted when stream is capturing
+vt rocm: matmul: hipblasCreate: hipblas 6 (INTERNAL_ERROR)
+```
+
+`hipblasCreate` was not anticipated: the handle initialises on first use in the
+same path, so a pre-warm must cover **handle creation as well as workspace
+growth**. Both fail loudly; neither corrupts. Running the identical GEMM once
+beforehand clears both, and the captured graph then replays numerically correct
+(0.409606 vs 0.409600 expected, f32). Pinned by `ROCm backend: a pre-warmed GEMM
+captures and replays` in `test_rocm_backend.cpp`, which asserts the MITIGATION
+rather than the hazard — a future capture-safe allocator would be an
+improvement, and a test forbidding it would ratchet the wrong way.
+
+*Consequence for W2:* the decode-graph pre-warm must reach every GEMM shape the
+captured region will execute, including the first call that creates the handle.
+A shape reached only under capture still aborts, so W2's gate 4 replay count is
+what proves the pre-warm was complete.
 
 **D2 — the Qwen3-0.6B near-tie may move.** Covered by gate 3. Separate because
 it is the one outcome that could look like a regression while being nothing of
@@ -305,6 +339,78 @@ as a floor — it is the next thing to attack.
 the four #41 boards are likelier-supported RDNA3/CDNA parts, but none has run
 this. Records say gfx1200; the other boards stay `PENDING-community` exactly as
 the W1 approach-(b) delta does today.
+
+**D6 — `DestroyGraph`/`EndCapture` `Check()` the destroy where CUDA silently
+ignores it.** `rocm_backend.hip`'s `DestroyGraph` and the prior-`exec_` destroy
+inside `EndCapture` both `Check()` `hipGraphExecDestroy`'s return and throw on
+failure; the CUDA leg ignores it. Destroying (or recapturing over) an exec still
+in flight would throw on HIP where CUDA would succeed silently. Not a W1 defect
+— the model-level path is not engaged (`support_static_graph_mode()` is false
+until W2), and W1's tests always `Synchronize` before destroying or recapturing.
+Found in the W1 review (`review-rocm-decode-graph-w1.md`, INFO-1).
+
+*Consequence for W2:* the decode-graph class must synchronize before destroying
+or recapturing an exec on HIP — a teardown or column-change recapture that races
+an in-flight replay is exactly the case this asymmetry would surface as a thrown
+`Check()` instead of a silent no-op.
+
+**D7 — the §1/gate-5 rationale is REFUTED. W2 and W3 ran (on a follow-on
+branch, not shipped in this PR) and the pre-registered convergence prediction
+did not hold.** Recorded here so the next agent to open this spec does not
+re-derive a closed negative result from a still-live-looking prediction.
+
+Same-binary A/B on gfx1200, 128in/128out batch 8, capture ON vs
+`VLLM_CPP_CUDAGRAPH=0`, gate 4's `VT_DECODE_GRAPH_STATS=1` confirming capture
+engaged (**126 replays over 128 decode steps**, one capture at padded size
+`S=8`, not eager fallback):
+
+| Model | capture ON | capture OFF | delta |
+|---|---|---|---|
+| Qwen3-0.6B | 190-194 tok/s | 188-192 tok/s | **0-2%**, indistinguishable from zero |
+| Qwen3-1.7B | 148.72 tok/s | 147.80 tok/s | +0.6% |
+| Qwen3-4B | 100.22 tok/s | 101.27 tok/s | -1.0% |
+
+Qwen3-0.6B needed a second pass: the first same-binary run measured +3.2%
+(193.67 vs 187.62), but an independent reviewer's own 3-rep A/B measured
++0.7%. The discrepancy traced to one low outlier in the original OFF arm
+(reps 191.88 / 179.29 / 191.70); dropping it moves the original delta to
++1.0%, and pooling both reviewers' reps gives +2.0%. **0-2% is the honest
+figure; +3.2% must not be quoted as a measured win.**
+
+Not batch-size dilution: single-stream is capture's best case and shows no
+gain either (TPOT 13.99 ms OFF vs 13.82-14.98 ms ON). And the host/device
+split says why capture isn't paying off here — it removes no host CPU work:
+
+```console
+capture ON    wall 11.31s  user 13.81s  sys 14.09s   247% CPU
+capture OFF   wall 11.36s  user 13.78s  sys 13.54s   240% CPU
+```
+
+Collapsing hundreds of per-step launches into one call should cut `sys` time
+visibly; it is marginally *higher*. §1's scaling-curve argument — that roughly
+half the 0.6B gap is fixed launch overhead recoverable by capture — is
+directly refuted by this intervention. `cuda_backend.cu`'s
+"88%-of-wall host-API overhead" figure is a CUDA measurement and does not
+transfer to this board.
+
+Against §1's oracle figures the ratios are 2.85x / 1.93x / 1.43x versus
+2.99x / 1.90x / 1.46x before capture — **unmoved**. §10's stop condition
+(Qwen3-0.6B below ~2.2x) was not met; W3 stopped there per the spec's own
+rule, rather than iterating blind.
+
+**Not a ceiling claim.** The gap is unexplained, not irreducible. Next
+hypotheses, in order: (1) where the ~14 ms decode step actually goes on the
+device — same-tool `rocprof` both sides, the trace D4 already flagged as
+missing; (2) what burns ~2.5 cores of host CPU to produce ~50 tok/s with `sys`
+exceeding wall.
+
+**What this leaves standing, unaffected by the refutation:** the seam itself
+— mirrored call-for-call, mutation-tested, behaviour-neutral across four
+models (Qwen3-0.6B/1.7B/4B dense, Qwen3.5-0.8B GDN hybrid) and a 6.7x
+parameter range, capture ON vs OFF byte-identical. What died is the reason it
+was built, not the code. Whether to carry an unused capability given the
+refuted rationale is a product call, not a technical one — see the row's PR
+discussion for that decision; it does not belong in this spec.
 
 ## 9. Work breakdown
 

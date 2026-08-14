@@ -354,6 +354,8 @@ const char* OpNameImpl(OpId op) {
       return "MoeGroupedGemmNvfp4";
     case OpId::kMoeSiluMul:
       return "MoeSiluMul";
+    case OpId::kMoeRelu2:
+      return "MoeRelu2";
     case OpId::kCastBf16:
       return "CastBf16";
     case OpId::kCastF32:

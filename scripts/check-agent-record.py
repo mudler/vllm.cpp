@@ -71,7 +71,14 @@ MATRICES = {
     # moves this pin by two. Both land `INVENTORIED`, unclaimed and blocked on the
     # absent vllm-omni pin (#633). Bumped because two rows EXIST, never to make a
     # transition pass. #634.
-    "MODEL": (AGENTS / "model-matrix.md", 372),
+    # 373 since 2026-08-13: +1 for `MiniMaxMusic3ForConditionalGeneration`, landing
+    # `SPIKE` with its spec committed (#672). Two independent rows moved this pin on
+    # the same day and BOTH branches read 371, so an auto-merge taking either side
+    # would have left the matrix internally consistent while short a real
+    # architecture. Re-derived, which is the only way this pin is ever allowed to
+    # move. test_music3_and_indextts_rows_both_survive_their_collision names all
+    # three rows, because a count alone cannot see that failure.
+    "MODEL": (AGENTS / "model-matrix.md", 373),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme

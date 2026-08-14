@@ -20,6 +20,7 @@
 // future refactor made lookups lenient, a decoder reading zeros. The mapping is
 // therefore asserted against the real manifest in the test, not just exercised.
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/model_executor/models/vocoder1d.h"
 
 #include <cmath>
 #include <cstdint>
@@ -118,7 +119,7 @@ MiniMaxH3AudioVaeWeights LoadMiniMaxH3AudioVaeWeights(const SafetensorsFile& fil
     if (key.rfind("decoder.", 0) == 0) key = key.substr(std::strlen("decoder."));
 
     // The kaiser-sinc anti-aliasing filters are COMPUTED at load
-    // (MiniMaxH3KaiserSincFilter1d), never read.
+    // (vocoder1d::KaiserSincFilter1d), never read.
     if (key.size() >= 7 && key.compare(key.size() - 7, 7, ".filter") == 0) continue;
 
     const StTensor& tensor = file.Get(name);

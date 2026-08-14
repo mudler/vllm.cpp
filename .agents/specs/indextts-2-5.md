@@ -185,6 +185,44 @@ never `--enforce-eager`.
   encoders, at pinned revisions on the NAS.
 - W1 touches a header two shipped lanes already depend on, so it coordinates with both H3 and LTX-2.5 (#435, merged).
 
+## Measured component inventory
+
+Taken from the reference implementation itself (`github.com/index-tts/index-tts`,
+cloned 2026-08-13), not estimated. This is what W3-W5 actually contain, and it is
+the reason this lane is a campaign rather than a change.
+
+| Reference component | Python LOC | Ours |
+|---|---:|---|
+| `indextts/gpt` (UnifiedVoice talker) | 17,171 | backbone DONE (W2); the talker head, conditioning and generate loop remain |
+| `indextts/s2mel` (CFM/DiT + length regulator + CAMPPlus) | 15,011 | not started |
+| `indextts/utils` | 18,265 | not started; much is training-only and will not be ported |
+| `indextts/codec` (EnhancedCodec) | 1,930 | not started |
+| `indextts/BigVGAN` | 3,740 | 1-D core DONE (W1), shared with H3 and LTX-2.5 |
+| `indextts/vqvae` | 395 | not started |
+| `Wav2Vec2BertModel` (HF transformers) | external | not started; a Conformer, so `parakeet_encoder.cpp` is partial reuse |
+
+**The pipeline order, read from `infer_v2_5.py`** (`infer_generator`, lines
+569-660), which supersedes the recipe page's prose:
+
+1. `SeamlessM4TFeatureExtractor` -> features from the 16 kHz reference clip
+2. `Wav2Vec2BertModel` (`semantic_model`) -> `vq_emb`
+3. `EnhancedCodec.quantize` -> `semantic_code`, `feat`
+4. `CAMPPlus` -> a 192-d global style vector from `feat`
+5. `s2mel.models['length_regulator']` -> `prompt_condition`
+6. `UnifiedVoice` (GPT-2 talker, `spk_cond_mode="campplus"`) -> mel codes
+7. `s2mel` CFM/DiT -> mel, then BigVGAN -> 22.05 kHz waveform
+
+Note step 6: the talker is conditioned on the CAMPPlus style vector, so **CAMPPlus
+is upstream of the talker, not a post-hoc speaker check**. Sequencing W3 after W2
+but before W5 is therefore forced, not a preference.
+
+**CAMPPlus is not the small brick its file size suggests.** 436 lines define a
+2-D conv front end (`FCM`: Conv2d + BatchNorm2d + `BasicResBlock` x4) and an
+`xvector` stack of `TDNNLayer` + three `CAMDenseTDNNBlock`s of 12, 24 and 16
+layers, each carrying a `CAMLayer` attention, separated by `TransitLayer`s, then
+`StatsPool` and a `DenseLayer`. That is 52 dense layers plus batch norms; the
+line count is small because the blocks are looped.
+
 ## Work breakdown
 
 | W | Work | Depends on |
@@ -233,7 +271,20 @@ behind the pin.
 
 ## Now
 
-`INVENTORIED`, unclaimed, blocked on
-[#633](https://github.com/mudler/vllm.cpp/issues/633). Nothing implemented. W1-W4
-can start against frozen goldens once the row is claimed; no parity or speed
-claim is possible until the omni pin exists.
+`INVENTORIED`, blocked on [#633](https://github.com/mudler/vllm.cpp/issues/633)
+for any parity or e2e claim.
+
+**Landed** (PR #681): W1, the shared 1-D vocoder core in `vllm::vocoder1d` with a
+structural anti-fork guard and hand-computed numerics; W2, the GPT-2 backbone
+host reference, token-exact against upstream at the parity pin and proven
+load-bearing by three mutations.
+
+**Next, in forced order:** W3 CAMPPlus (upstream of the talker, see the inventory
+above), then the w2v-bert-2.0 Conformer and EnhancedCodec, then W4 S2Mel, then W5
+compose. W6a/W6b (the `SpeechEngine` seam and ABI v19) need no oracle and can be
+taken in parallel by a second claim.
+
+**Groundwork done for whoever picks it up:** the reference implementation is
+cloned and its component sizes measured, the NAS is mounted, and
+`huggingface.co/IndexTeam/IndexTTS-2.5` resolves. What is NOT done: the ~6 GB
+checkpoint is not downloaded, and no golden generator exists past W2.

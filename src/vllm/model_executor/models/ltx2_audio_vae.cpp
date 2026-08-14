@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/model_executor/models/vocoder1d.h"
 #include "vt/dtype.h"
 
 #ifndef M_PI
@@ -405,7 +406,7 @@ AudioMap Upsample(const AudioMap& x, const AudioConvSpec& config,
 // MiniMax-H3 audio VAE already ports, so this DELEGATES rather than standing up a
 // second copy; the golden proves the shared code matches LTX's upstream too.
 std::vector<float> Ltx2KaiserSincFilter1d(double cutoff, double half_width, int64_t kernel_size) {
-  return MiniMaxH3KaiserSincFilter1d(cutoff, half_width, kernel_size);
+  return vocoder1d::KaiserSincFilter1d(cutoff, half_width, kernel_size);
 }
 
 // UpSample1d's HANN-windowed sinc (vocoder.py:116-128) — the BWE resampler's
@@ -545,7 +546,7 @@ namespace {
 // AMPBlock1 (vocoder.py:283-290) and ResBlock1 (resnet.py:73-80): the two residual
 // stacks a Vocoder can carry.
 std::vector<float> VocoderResBlock(const Ltx2VocoderConfig& config, const Ltx2VaeWeights& weights,
-                                   const std::string& prefix, const MiniMaxH3AliasFreeActivation1d& act,
+                                   const std::string& prefix, const vocoder1d::AliasFreeActivation1d& act,
                                    const std::vector<float>& x, int64_t channels, int64_t length,
                                    int64_t kernel, const std::vector<int64_t>& dilations) {
   std::vector<float> current = x;
@@ -573,10 +574,10 @@ std::vector<float> VocoderResBlock(const Ltx2VocoderConfig& config, const Ltx2Va
       }
       int64_t padded_len = 0;
       const std::vector<float> padded =
-          MiniMaxH3Pad1d(input, channels, in_len, left, right, /*replicate=*/false, &padded_len);
+          vocoder1d::Pad1d(input, channels, in_len, left, right, /*replicate=*/false, &padded_len);
       int64_t produced = 0;
       std::vector<float> result =
-          MiniMaxH3Conv1d(padded, channels, padded_len, weights.Get(name + ".weight"),
+          vocoder1d::Conv1d(padded, channels, padded_len, weights.Get(name + ".weight"),
                  &weights.Get(name + ".bias"), channels, kernel, 1, dil, 1, &produced);
       VT_CHECK(produced == in_len, "ltx2 vocoder: resblock conv changed the length");
       return result;
@@ -626,18 +627,18 @@ std::vector<float> VocoderForwardFromRows(const Ltx2VocoderConfig& config,
            "ltx2 vocoder: input size does not match [rows, frames]");
 
   const std::string p = config.prefix;
-  MiniMaxH3AliasFreeActivation1d act;
+  vocoder1d::AliasFreeActivation1d act;
   if (config.amp) act.Build();
 
-  // conv_pre: MiniMaxH3Conv1d(128 -> upsample_initial_channel, k=7, padding=3).
+  // conv_pre: vocoder1d::Conv1d(128 -> upsample_initial_channel, k=7, padding=3).
   int64_t channels = config.upsample_initial_channel;
   int64_t length = 0;
   std::vector<float> x;
   {
     int64_t padded_len = 0;
     const std::vector<float> padded =
-        MiniMaxH3Pad1d(rows, row_count, frames, 3, 3, /*replicate=*/false, &padded_len);
-    x = MiniMaxH3Conv1d(padded, row_count, padded_len, weights.Get(p + "conv_pre.weight"),
+        vocoder1d::Pad1d(rows, row_count, frames, 3, 3, /*replicate=*/false, &padded_len);
+    x = vocoder1d::Conv1d(padded, row_count, padded_len, weights.Get(p + "conv_pre.weight"),
                &weights.Get(p + "conv_pre.bias"), channels, 7, 1, 1, 1, &length);
   }
 
@@ -648,7 +649,7 @@ std::vector<float> VocoderForwardFromRows(const Ltx2VocoderConfig& config,
     const int64_t out_channels = config.upsample_initial_channel / (int64_t{1} << (i + 1));
     const std::string up = p + "ups." + std::to_string(i);
     int64_t up_len = 0;
-    x = MiniMaxH3ConvTranspose1d(x, channels, length, weights.Get(up + ".weight"),
+    x = vocoder1d::ConvTranspose1d(x, channels, length, weights.Get(up + ".weight"),
                         &weights.Get(up + ".bias"), out_channels, kernel, stride,
                         /*padding=*/(kernel - stride) / 2, /*groups=*/1, &up_len);
     channels = out_channels;
@@ -692,11 +693,11 @@ std::vector<float> VocoderForwardFromRows(const Ltx2VocoderConfig& config,
 
   int64_t padded_len = 0;
   const std::vector<float> padded =
-      MiniMaxH3Pad1d(x, channels, length, 3, 3, /*replicate=*/false, &padded_len);
+      vocoder1d::Pad1d(x, channels, length, 3, 3, /*replicate=*/false, &padded_len);
   const std::vector<float>* post_bias =
       config.use_bias_at_final ? &weights.Get(p + "conv_post.bias") : nullptr;
   int64_t final_len = 0;
-  std::vector<float> out = MiniMaxH3Conv1d(padded, channels, padded_len, weights.Get(p + "conv_post.weight"),
+  std::vector<float> out = vocoder1d::Conv1d(padded, channels, padded_len, weights.Get(p + "conv_post.weight"),
                                   post_bias, 2, 7, 1, 1, 1, &final_len);
 
   if (config.apply_final_activation) {
@@ -760,7 +761,7 @@ std::vector<float> Ltx2VocoderWithBweForward(const Ltx2VocoderBweConfig& config,
   const int64_t remainder = low_len % config.hop_length;
   if (remainder != 0) {
     std::vector<float> grown;
-    grown = MiniMaxH3Pad1d(x, out_channels, low_len, 0, config.hop_length - remainder, /*replicate=*/false,
+    grown = vocoder1d::Pad1d(x, out_channels, low_len, 0, config.hop_length - remainder, /*replicate=*/false,
                   &padded_len);
     x.swap(grown);
   }
@@ -786,9 +787,9 @@ std::vector<float> Ltx2VocoderWithBweForward(const Ltx2VocoderBweConfig& config,
     // CAUSAL: left-only padding, so a frame never depends on future samples
     // (vocoder.py:469-470).
     const std::vector<float> padded =
-        MiniMaxH3Pad1d(channel, 1, padded_len, left_pad, 0, /*replicate=*/false, &padded_wave);
+        vocoder1d::Pad1d(channel, 1, padded_len, left_pad, 0, /*replicate=*/false, &padded_wave);
     const std::vector<float> spec =
-        MiniMaxH3Conv1d(padded, 1, padded_wave, forward_basis, nullptr, n_freqs * 2, config.filter_length,
+        vocoder1d::Conv1d(padded, 1, padded_wave, forward_basis, nullptr, n_freqs * 2, config.filter_length,
                config.hop_length, 1, 1, &stft_len);
     if (c == 0) {
       mel_frames = stft_len;
@@ -829,10 +830,10 @@ std::vector<float> Ltx2VocoderWithBweForward(const Ltx2VocoderBweConfig& config,
   }
   int64_t skip_padded = 0;
   const std::vector<float> skip_in =
-      MiniMaxH3Pad1d(x, out_channels, padded_len, pad, pad, /*replicate=*/true, &skip_padded);
+      vocoder1d::Pad1d(x, out_channels, padded_len, pad, pad, /*replicate=*/true, &skip_padded);
   int64_t skip_full = 0;
   std::vector<float> skip =
-      MiniMaxH3ConvTranspose1d(skip_in, out_channels, skip_padded, depthwise, nullptr, out_channels,
+      vocoder1d::ConvTranspose1d(skip_in, out_channels, skip_padded, depthwise, nullptr, out_channels,
                       kernel_size, ratio, /*padding=*/0, /*groups=*/out_channels, &skip_full);
   for (float& value : skip) value *= static_cast<float>(ratio);
   const int64_t skip_len = skip_full - pad_left - pad_right;

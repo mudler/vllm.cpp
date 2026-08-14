@@ -461,6 +461,23 @@ void MoeSiluMulKernel(Queue&, Tensor& out, const Tensor& gate, const Tensor& up)
   });
 }
 
+// The NON-GATED MoE activation: out[i] = relu(x[i])^2, the whole epilogue of a
+// NemotronH expert (nemotron_h.py:227 -> MoEActivation.RELU2_NO_MUL). Mirrors
+// vLLM's relu_squared_kernel (csrc/libtorch_stable/activation_kernels.cu:673-678)
+// EXACTLY in dtype order: widen to f32, clamp at zero in f32, square in f32, and
+// round ONCE on the store. LoadF32/StoreF32 are that widen/round pair, so a bf16
+// input with an f32 output keeps the full f32 square (no intermediate narrowing).
+void MoeRelu2Kernel(Queue&, Tensor& out, const Tensor& x) {
+  const int64_t n = out.Numel();
+  ForRows(n, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
+    const float f = LoadF32(x, i);
+    const float v = f > 0.0f ? f : 0.0f;
+    StoreF32(out, i, v * v);
+  }
+  });
+}
+
 // --- TRUE W4A4 (fp4xfp4) helpers + kernels (notes §7). Self-contained fp8/fp4
 // codec (vt does not depend on vllm), bit-matching vllm::F8E4M3ToF32 /
 // F32ToF8E4M3 / CastToFp4 / kE2M1Lut so the op equals vllm::RunNvfp4Emulation.
@@ -2475,8 +2492,23 @@ void MoeRouterTopKKernel(Queue&, Tensor& weights, Tensor& indices, const Tensor&
 
 // §4/§6 weighted scatter-combine: out[t,:] = sum_j w[t,j]*expert_out[t,j,:]
 // (f32 accumulation) + shared[t,:] (optional). Stored at out's dtype.
+// `routed_scale` multiplies the ROUTED sum only, BEFORE the shared term is added
+// — upstream's apply_routed_scale_to_output arm (moe_runner.py:390-407, :402-406 scales
+// `fused_output`, leaves `shared_output` alone, then :722-725 adds them). The
+// default 1.0f is the fold-into-router-weights polarity every landed caller uses.
+// It scales the ASSEMBLED sum, not each router weight: upstream's
+// `fused_output *= factor` (:404) is one multiply on the finished tensor, so the
+// scale rounds ONCE after the K-term reduction. Folding it into `weights[j]` is
+// equal in exact arithmetic and a different f32 value (it rounds K times inside
+// the sum); Laguna is entitled to that fold (`laguna_ops.h:48`, no `shared`),
+// this path is not. Pinned bitwise in test_ops_moe_nongated_relu2.cpp.
+// NOT MIRRORED, UNREACHABLE: upstream's fp16 arm (:403-406) instead divides
+// `shared_output` by the factor to dodge an fp16 overflow. That branch is keyed
+// on `fused_output.dtype == torch.float16`; the analogue here is `out`, whose
+// dtype `MoeCombine` gates through `IsOutFloat` (ops.cpp:22 — f32/bf16 only, no
+// kF16), so no caller can reach it. Pinned by the f16-out refusal test.
 void MoeCombineKernel(Queue&, Tensor& out, const Tensor& expert_out, const Tensor& weights,
-                      const Tensor* shared) {
+                      const Tensor* shared, float routed_scale) {
   const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t row = r0; row < r1; ++row) {
@@ -2485,6 +2517,7 @@ void MoeCombineKernel(Queue&, Tensor& out, const Tensor& expert_out, const Tenso
       for (int64_t j = 0; j < k; ++j)
         acc += weights.Ptr<float>()[row * k + j] *
                LoadF32(expert_out, (row * k + j) * h + col);
+      if (routed_scale != 1.0f) acc *= routed_scale;
       if (shared != nullptr) acc += LoadF32(*shared, row * h + col);
       StoreF32(out, row * h + col, acc);
     }
@@ -3097,6 +3130,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<SoftCapFn>(&SoftCapKernel)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernel)));
+    RegisterOp(OpId::kMoeRelu2, DeviceType::kCPU,
+               reinterpret_cast<void*>(static_cast<MoeRelu2Fn>(&MoeRelu2Kernel)));
     RegisterOp(OpId::kScaledFp4Quant, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<ScaledFp4QuantFn>(&ScaledFp4QuantKernel)));
     RegisterOp(OpId::kSiluMulFp4Quant, DeviceType::kCPU,

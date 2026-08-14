@@ -176,7 +176,8 @@ pin:
 | vLLM-Omni | `vllm-omni` | diffusion, TTS and the omni-only architectures vLLM proper never registers |
 | HuggingFace `transformers` | `transformers` | a model, processor or tokenizer's own reference implementation — the source vLLM itself mirrors |
 | `diffusers` | `diffusers` | schedulers, VAEs and diffusion pipelines |
-| SGLang, including SGLang-Omni | `sglang` | a model or serving path SGLang implements and vLLM does not |
+| SGLang | `sglang` | a model or serving path SGLang implements and vLLM does not |
+| SGLang-Omni | `sglang-omni` | omni, speech, TTS and music models served by SGLang's pipeline runtime — a third repository, not SGLang |
 | llama.cpp | `llama-cpp` | CPU and GGUF k-quant floors |
 | Tenstorrent tt-forge | `tt-forge` | Tenstorrent hardware, which vLLM has no backend for at all |
 

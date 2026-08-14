@@ -291,6 +291,35 @@ class AgentRecordMutationTests(unittest.TestCase):
             self.assertEqual(len(found), 1, item_id)
             self.assertEqual(found[0].path.name, "engine-matrix.md", item_id)
 
+    def test_music3_and_indextts_rows_both_survive_their_collision(self) -> None:
+        """373 needs BOTH rows named, because the merge that produced it collided.
+
+        The same hazard the omni-pin assertion above records, on the MODEL pin
+        and on the same day. `main` took the constant 370 -> 372 for IndexTTS-2.5
+        (two architectures) while the Music3 branch took 370 -> 371 for its own
+        row. Neither side was wrong about its own change, and neither number was
+        373 -- so whichever side an auto-merge kept, the tree would have been
+        internally consistent while silently short a real architecture.
+
+        A count assertion alone cannot see that: it only knows the pin matches
+        the rows it can find. Naming the three rows is what makes 373 checkable
+        rather than plausible.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        collided = (
+            "MODEL-MUSIC-minimax-music3-mini-max-music3-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-s2-mel-decoder",
+        )
+        for item_id in collided:
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+
     def test_model_row_ratchet_is_load_bearing(self) -> None:
         """The MODEL row pin must catch a row appearing or vanishing.
 
@@ -299,8 +328,10 @@ class AgentRecordMutationTests(unittest.TestCase):
         architecture re-pins it by hand. Muse Glimmer took it 361 -> 362
         (`c8fc24a50`); the seven recipe architectures that had no row at all took
         it 362 -> 369 (#609, #610, `eba6ab7c7`); LTX-2.5 took it 369 -> 370
-        (#435, `cefacd2d0`). Without this, bumping the number to silence a
-        failure is indistinguishable from bumping it because a row really landed.
+        (#435, `cefacd2d0`); IndexTTS-2.5 took it 370 -> 372, being two
+        architectures (#634); MiniMax-Music3 took it to 373 (#672). Without this,
+        bumping the number to silence a failure is indistinguishable from bumping
+        it because a row really landed.
         """
         clean: list[str] = []
         agent_record.check_matrices(clean)

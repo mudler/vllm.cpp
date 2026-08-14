@@ -310,8 +310,38 @@ is out-of-tree. The conclusion the paragraph draws survives — of the five, onl
 `--tool-call-parser inkling` now resolves. **41 → 42 accepted names, 37 → 38
 families**, re-derived from `abstract.cpp` rather than incremented (42 names, 38
 distinct factory classes, 27 marker rows unchanged); `test_detect.cpp:222`,
-`docs/USAGE.md:1126`, `docs/STATUS.md` and the engine-matrix row moved with it.
-`README.md` and `docs/FEATURES.md` carry no parser count, so neither is owed.
+`docs/USAGE.md:1126`, `docs/FEATURES.md:232`, `docs/STATUS.md` and the
+engine-matrix row moved with it.
+
+**Correction (2026-08-14, review repair of #683).** An earlier version of this
+paragraph said "`README.md` and `docs/FEATURES.md` carry no parser count, so
+neither is owed." Both do. `docs/FEATURES.md:232` carries `Tool-call parsers | ✅
+N families` and this change moved it 37 → 38 — the sentence contradicted its own
+diff. `README.md` carries the count TWICE (`:81`, `:219`) and both were ALREADY stale
+before W1: at `43a6c5518` they read 36 families / 40 names against a true 37/41,
+so README had missed the `muse_glimmer` addition too, and W1 widens the drift to
+38/42. The true values, re-derived from `abstract.cpp` rather than incremented,
+are **38 families / 42 accepted names** (42 `tool_parser_names()` entries; 42
+`name ==` branches over 38 distinct `std::make_unique<T>` classes).
+
+**README is NOT corrected here, and the reason is a gate, not a preference.**
+`check-doc-checkpoint.py --staged` refuses any README edit in a change that does
+not touch a landing source (`.agents/mission.md`, `CMakeLists.txt`, the three
+`benchmarks/demo/*.json`, `examples/{cli,server}/main.cpp`) — "Co-edited public
+projections can NEVER justify README churn", a rule the checker's own comment
+calls deliberate and directly tested. This change touches none of them, and
+weakening a checker to make a transition pass is forbidden. So the correction is
+filed as [#704](https://github.com/mudler/vllm.cpp/issues/704) and linked from
+the `roadmap_v1.md` issue table, which is the other option the review named.
+#704 carries one thing worth knowing before someone picks it up: the same rule
+refuses a README-ONLY fix too, so closing it needs either a change that
+legitimately moves a landing source or an argued exception in its own commit
+message.
+
+Neither `check-readme-structure.py` nor `check-public-doc-tables.py`
+cross-checks a prose count against the registry, which is why the drift survived
+two waves; [#649](https://github.com/mudler/vllm.cpp/issues/649) covers only the
+`TOOLS-CALLING-CORE` engine-matrix row, a different surface.
 
 **The gap was smaller and stranger than the spec assumed.** The Inkling engine
 was ALREADY fully ported — `src/vllm/parser/inkling.cpp`, `inkling_config()` with
@@ -348,46 +378,159 @@ cannot demonstrate.
 **No structural-tag row is owed.** `inkling_tool_parser.py:10-11` sets
 `structural_tag_model = None` / `supports_required_and_named = False`; our
 `ToolChoiceStructuralTagSpecFor` already returns nullopt for every mode of an
-unmapped family, which is that behaviour exactly.
+unmapped family, which is that behaviour exactly. Since the 2026-08-14 repair
+that equivalence is GATED, not just argued: the ported `test_adapters_resolve`
+checks nullopt for auto, required and named.
 
 **The test PORTS; it was not authored.** This spec said "test authored from
 scratch" on the assumption that a missing `tests/tool_parsers/
 test_inkling_tool_parser.py` meant no upstream test. There is one, in the other
-place: `tests/parser/engine/test_inkling.py` @ `5559679`. **15 of its tool-facing
+place: `tests/parser/engine/test_inkling.py` @ `5559679`. **19 of its tool-facing
 cases port** into `tests/vllm/entrypoints/openai/tool_parsers/test_inkling.cpp`
-keeping their upstream names verbatim, with two documented harness adaptations (a
-`<|message_model|>` prefix reproduces upstream's MESSAGE_HEADER initial state on
-the CONTENT-seeded tool adapter; the streaming cases use upstream's
+keeping their upstream names verbatim, with four documented harness adaptations
+(a `<|message_model|>` prefix reproduces upstream's MESSAGE_HEADER initial state
+on the CONTENT-seeded tool adapter; the streaming cases use upstream's
 `_stream_text_only` character-chunk harness because our ToolParser seam is
-text-only, which is a strictly stronger split). Its `TestArgConverter` class and
-the token-id/reasoning cases are deliberately NOT re-ported: they gate the engine
-layer, which the assembly goldens already gate against the oracle.
+text-only, which is a strictly stronger split; a registered CLASS assertion
+becomes an instance `dynamic_cast`; and the `tool_choice="none"` case drops the
+reasoning third of its assertion, which this seam does not return). Its
+`TestArgConverter` class and the token-id/reasoning cases are deliberately NOT
+re-ported: they gate the engine layer, which the assembly goldens already gate
+against the oracle.
 
-**3 of the 18 cases are AUTHORED**, recorded as from-scratch, each saying so at
-its site:
+**Correction (2026-08-14, review repair of #683).** The first version of this
+paragraph said **15**, and both it and the commit, PR body and test-file header
+claimed upstream "drives `InklingParser` directly and never constructs the
+adapter". That was FALSE, and it hid two portable cases. `test_inkling.py:487
+class TestRegisteredAdapters` resolves through the registry and constructs the
+adapter:
+
+- `:488 test_adapters_resolve` — PORTED. Upstream asserts
+  `tool_cls._parser_engine_cls is InklingParser` and
+  `tool_cls.supports_required_and_named is False`. Adaptation 3: our registry
+  returns an instance, so the engine binding is a `dynamic_cast` to
+  `InklingEngineToolParser`, whose ctor is `get_parser_engine("inkling")` and
+  admits no other engine. `supports_required_and_named = False` is asserted
+  through the surface that flag controls here —
+  `ToolChoiceStructuralTagSpecFor("inkling", …)` must be nullopt for auto,
+  required AND named. Its reasoning half
+  (`ReasoningParserManager.get_reasoning_parser("inkling")`) is DECLINED: we have
+  no such registry row (see "Still owed").
+- `:498 test_adapter_round_trip` — PORTED verbatim.
+
+`TestToolCallFiltering` (`:430`) was likewise never assessed. Two of its three
+cases port and now do:
+
+- `:465 test_tool_choice_none_non_streaming` — PORTED with adaptation 4 (the
+  reasoning third of the assertion is dropped; content and tool suppression are
+  kept verbatim). It is the case that exercises the `tool_choice` field of the
+  `ParserRequestFromChatCompletion` projection this wave MOVED.
+- `:477 test_tool_choice_none_streaming` — PORTED verbatim.
+- `:436 test_skip_tool_parsing_round_trip` — **DECLINED, with reason.** It sets
+  `skip_tool_parsing = True` on one `InklingParser`, calls `extract_reasoning`,
+  and re-extracts from the returned content with a second parser. Our `ToolParser`
+  ABC exposes neither a skip-tool-parsing setter nor `extract_reasoning`, and the
+  reasoning half has no registry face at all, so porting it would mean driving
+  `parser::engine::ParserEngine` directly — the engine layer this file
+  deliberately does not re-gate.
+
+The review's two coverage gaps: one CLOSED, one MEASURED AND STILL OPEN.
+
+- **Closed.** `StreamTextOnly` now calls `finish_streaming()` and appends its
+  delta, exactly as upstream's `_stream_text_only` does. The port had omitted it
+  and compensated by appending `<|end_message|>` to the authored case's input;
+  the compensation is gone and the harness matches upstream.
+- **Still open, and now measured.** That gives
+  `ParserEngineToolAdapter::finish_streaming()` its only CALLER — it has none in
+  `src/`, `include/` or `examples/`, and will have none while `MakeToolParser`
+  routes engine-backed names away from this adapter
+  (`serving_chat.cpp:546-548`) — but **not a guarantee**. Mutating the body to
+  `return std::nullopt` leaves all 22 cases GREEN. A streaming twin of
+  `test_text_after_tool_call` was authored to try to move it and did not: the
+  trailing text is not deferred past the last delta on this path, so that case
+  was DELETED rather than shipped with a false rationale. The method ships
+  functionally ungated, and the header and the test harness both say so. An
+  unmoved mutation is a measurement, not a licence to claim coverage.
+
+**3 of the 22 cases are AUTHORED**, each saying so at its site:
 
 - "the registry name resolves and is enumerated" and "EXPLICIT-ONLY — no
   autodetect row" gate OUR packaging surface, which has no upstream analogue to
   port: upstream's registry is a lazy dict and it has no chat-template marker
   table at all, so `DetectToolParser` is an ORIGINAL component.
 - "the tool adapter seeds the engine in CONTENT state" gates UPSTREAM behaviour
-  (`adapters.py:158/167`) that upstream's own suite never exercises, because it
-  drives `InklingParser` directly and never constructs the adapter. It exists
-  *because* a mutation survived without it.
+  (`adapters.py:178`) that upstream's own suite never exercises. The corrected
+  reason: upstream DOES construct the adapter (`test_adapter_round_trip`), but
+  only through the NON-streaming `extract_tool_calls`, which delegates to
+  `extract_tool_calls_from_content` with no seed (`adapters.py:158`); the CONTENT
+  seed lives exclusively in `extract_tool_calls_streaming` (`adapters.py:178`),
+  which no upstream case reaches. It exists *because* a mutation survived without
+  it.
 
 These are test-side authorship on an otherwise straight port, recorded here and
 at each case rather than as a new numbered entry in `porting-inventory.md` §9 —
 that section enumerates forced STRUCTURAL deviations of the port itself, and this
-change has none. Flagged for a reviewer who reads §9's scope more broadly.
+change has none. The fresh review of #683 read §9 the same way and agreed, so the
+judgement stands; what it flagged was a test COMMENT that asserted a §9 entry had
+been written when none had. That sentence is deleted.
 
 Mutation results (each restored byte-for-byte, verified by sha256):
 
 | Mutation | Caught by |
 |---|---|
-| `InklingEngineToolParser` builds a base `ParserEngine` over `inkling_config()` instead of `InklingParser` (drops the trailing-text flush hook, `inkling.py:376`) | NEW `test_inkling.cpp:248` `test_text_after_tool_call` |
-| drop `"inkling"` from `tool_parser_names()`, keep the factory branch | NEW `test_inkling.cpp:138`, AND the pre-existing count pin `test_detect.cpp:222` — the existing guard catches it too |
-| drop the adapter's `initialize_streaming(CONTENT)` seed | **SURVIVED** the first suite; caught only after adding the authored case, at `test_inkling.cpp:174` |
+| `InklingEngineToolParser` builds a base `ParserEngine` over `inkling_config()` instead of `InklingParser` (drops the trailing-text flush hook, `inkling.py:376`) | NEW `test_inkling.cpp:385` (`test_text_after_tool_call`, case at `:373`) |
+| drop `"inkling"` from `tool_parser_names()`, keep the factory branch | NEW `test_inkling.cpp:243` (case at `:233`), AND the pre-existing count pin `test_detect.cpp:222` — the existing guard catches it too |
+| drop the adapter's `initialize_streaming(CONTENT)` seed | **SURVIVED** the first suite; caught only after adding the authored case, at `test_inkling.cpp:284` (case at `:256`) |
 | `inkling_arg_converter` returns the raw `{"name":…,"args":…}` wrapper | NEW `test_inkling.cpp` (5 cases / 14 assertions) AND the pre-existing `test_parser_engine_assembly` goldens (3 cases / 33 assertions) — the existing gate catches this one first, since the carver is engine-layer |
+
+**Mutations for the cases the 2026-08-14 repair added** (aarch64, each restored
+by byte copy and sha256-verified; the restore is `cp` + `touch`, never `cp -p` —
+a preserved mtime makes ninja skip the relink and the NEXT mutation then runs
+against the PREVIOUS one's object, which is how the first attempt at this table
+produced four identical-looking failures):
+
+| Mutation | Result |
+|---|---|
+| `get_tool_parser("inkling")` returns `HermesToolParser` instead of `InklingEngineToolParser` (breaks `_parser_engine_cls is InklingParser`) | **CAUGHT** — `test_adapters_resolve` at `:539`/`:540`, `test_adapter_round_trip` at `:575`/`:576`, and the 18 `MakeParser()` cases at `:121`. 2 passed / 20 failed |
+| `ToolChoiceStructuralTagSpecFor` gives `inkling` the hermes spec (i.e. `supports_required_and_named = True`) | **CAUGHT** — `test_adapters_resolve` at `:557`, all three modes |
+| `ParserRequestFromChatCompletion` drops `tool_choice` and hardcodes `"auto"` (the projection this wave MOVED) | **CAUGHT** — `test_tool_choice_none_non_streaming` at `:510`/`:511` and `test_tool_choice_none_streaming` at `:522`. 20 passed / 2 failed |
+| `ParserEngineToolAdapter::finish_streaming()` returns `std::nullopt` | **SURVIVED — 22/22 still green.** Recorded, not hidden: see "Still open, and now measured" above |
+
+### Owed by W1's landing, but NOT this row's to fix
+
+Two gaps that `inkling`'s registration made real. Both are recorded here so they
+are visible from the row that created them, and both are owned elsewhere.
+
+- **`--reasoning-parser inkling` still throws
+  ([#703](https://github.com/mudler/vllm.cpp/issues/703)).** Upstream registers
+  `inkling` in BOTH registries — `vllm/reasoning/__init__.py:131` names
+  `InklingParserReasoningAdapter`, the reasoning half of the SAME
+  `make_adapters(InklingParser)` call (`registered_adapters.py:67-70`) whose tool
+  half W1 landed. `reasoning_parser_names()` has no `inkling` row, so a user
+  following an Inkling recipe now gets a tool parser that resolves and a hard
+  startup abort on the reasoning flag in the same command line. Before W1 both
+  flags refused it, which was at least consistent. The FIX belongs to
+  `SAMPLE-REASONING` ([#605](https://github.com/mudler/vllm.cpp/issues/605)),
+  whose table already lists `inkling`; it is out of scope here and deliberately
+  not implemented. It is also why the reasoning half of the ported
+  `test_adapters_resolve` had to be declined.
+- **Engine-backed names run with `skip_special_tokens=true`
+  ([#695](https://github.com/mudler/vllm.cpp/issues/695)).** `adjust_request`
+  (`adapters.py:151`) is dropped, and the shared `ToolParser` seam has no
+  dispatch site for it at all — `KimiK2ToolParser::adjust_request`
+  (`kimi_k2.cpp:87`) has no callers either, the same pre-existing seam gap
+  `reasoning_parsers/muse_glimmer.h` records. It is MATERIAL for Inkling, whose
+  entire grammar is special tokens: `skip_special_tokens` defaults `true`
+  (`protocol.h:240`/`:461`), is forwarded verbatim by `to_sampling_params`
+  (`protocol.cpp:583`) and honoured at `v1/engine/detokenizer.cpp:68`, so at
+  server defaults the markers are stripped before the parser runs. The cases in
+  `test_inkling.cpp` pass because they feed the adapter marker text directly;
+  they do not traverse the detokenizer, and the header now says so. Closing it is
+  a seam change owned by no parser row. What IS fixed here is the silence:
+  `docs/USAGE.md:1126` now tells a user the one thing they can do about it today,
+  which is send `"skip_special_tokens": false` on the request
+  (`protocol.cpp:484` parses it), rather than leaving them to discover a dialect
+  that resolves and then returns no tool calls.
 
 ### Still owed on this row
 

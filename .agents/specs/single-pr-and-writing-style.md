@@ -1,4 +1,4 @@
-# One PR carries the spec and its code, and the prose around both has a stated style
+# One PR usually carries the spec and its code, and the prose around both has a stated style
 
 Issues: [#811](https://github.com/mudler/vllm.cpp/issues/811),
 [#812](https://github.com/mudler/vllm.cpp/issues/812)
@@ -18,10 +18,11 @@ order**. It is being read as **PR order** — land a spec-only PR, wait for the
 merge, open a second PR with the code.
 
 The reading is understandable and it is wrong. Commit order is what the rule
-protects, because commit order is what proves the spec was not written up
-afterwards, and `git log` on the branch shows it either way. Two PRs buy nothing
-extra and cost a review round trip, leave a spec on `main` describing code no
-reader can see yet, and let the two halves drift.
+protects, because commit order proves the spec was not written afterwards.
+`git log` shows that order within one branch. For ordinary scoped work, two PRs
+add a review round trip and let the two halves drift. A separate spec PR remains
+available when the developer chooses it. It can help with a large campaign or
+with work that deliberately changes only roadmap items, issues, or specs.
 
 ### The prose
 
@@ -125,10 +126,19 @@ line and three trailers, its `Signed-off-by` prohibition, or its
 
 `AGENTS.md` gains a short `## How we write` section pointing at both files.
 
-**The style binds new prose only.** No existing file is rewritten to satisfy it.
-`AGENTS.md` is dense, rhetorical and does not comply; an agent rewriting it to
-pass a style rule would be a worse outcome than the drift. The rule says so in
-its own text, because otherwise it will happen.
+This change includes a full `AGENTS.md` rewrite in the same PR. The rewrite gets
+an isolated implementation commit. It applies the ported prose guide to every
+existing section of `AGENTS.md`, not only to text added by this change.
+
+The rewrite preserves every prior obligation, prohibition, authority boundary,
+workflow step, and table entry. Only the PR-shape and writing-style changes in
+this spec can change policy meaning. The implementation records a
+rule-preservation inventory against the `AGENTS.md` version before the rewrite.
+The row's `## Outcome` section owns that inventory.
+
+A fresh reviewer checks the rewritten file and the inventory. The reviewer maps
+each old rule to its rewritten location and reports any missing or changed rule.
+The reviewer also checks that each table keeps every prior entry.
 
 ### C. The checker
 
@@ -150,23 +160,31 @@ New: `.agents/style/commits.md`, `.agents/style/prose.md`,
 `.claude/skills/writing-technical-english/SKILL.md`,
 `scripts/check-commit-style.py`, `tests/scripts/test_check_commit_style.py`.
 
-Edited: `AGENTS.md` (§*Spec before code*, new §*How we write*),
+Edited: `AGENTS.md` (full rewrite, §*Spec before code*, new §*How we write*),
 `.agents/workflow.md`, `.agents/porting-a-model.md:52`,
 `.agents/developer-preferences.example.md` (the new `## Git integration` key),
 `.github/pull_request_template.md`, `scripts/agent-preflight.sh` (wire the
 checker), `.agents/roadmap_v1.md` (the issue table, two rows).
+
+The full `AGENTS.md` rewrite stays in an isolated implementation commit. That
+commit must follow the spec commits and remain in the same PR for this row.
 
 Explicitly **not** touched: `scripts/ready-for-helper.py`,
 `.agents/coordination.md:1938`. The base-reachable-spec proof stays exactly as it
 is. Changing it would be a checker semantics change owing its own red-before
 evidence, and it is the correct behaviour for the flow it guards.
 
-Also not touched: any existing prose, anywhere, for style reasons.
+Existing prose outside `AGENTS.md` stays unchanged for style reasons. The
+planned supporting edits remain in scope where this spec lists them.
 
 ## Gates
 
-Part A and part B are prose. Their gate is `scripts/agent-preflight.sh` green and
-a fresh reviewer reading the result.
+Part A and part B are prose. Their gate is `scripts/agent-preflight.sh` green.
+A fresh reviewer also checks the complete `AGENTS.md` rewrite against its prior
+version and the rule-preservation inventory. Every prior obligation,
+prohibition, authority boundary, workflow step, and table entry must map to the
+rewritten file. The only accepted policy changes are the PR-shape and
+writing-style changes in this spec.
 
 Part C adds a checker, so it owes the evidence `AGENTS.md` §*Changing the rules or
 a checker* requires:
@@ -189,9 +207,13 @@ a checker* requires:
 recent history. Accepted with the developer's explicit decision, and one sentence
 clears it.
 
-**An agent rewrites existing files to satisfy the new style.** The most likely
-failure of part B, and the reason "new prose only" is written into the rule
-itself rather than left implicit.
+**The `AGENTS.md` rewrite changes policy meaning.** A cleaner sentence can drop
+a condition, actor, exception, or prohibition. The rule-preservation inventory
+and fresh review compare each rule with the file before the rewrite.
+
+**The rewrite becomes hard to review beside unrelated edits.** The isolated
+implementation commit lets the reviewer inspect the prose transformation on its
+own. The complete change remains in the developer-selected single PR.
 
 **The three split cases become a loophole.** "This is a large campaign" could
 excuse any split. It does not need guarding: the split was never forbidden and the
@@ -214,9 +236,15 @@ Stop and report rather than proceeding if:
 - Either ported skill contradicts a standing `AGENTS.md` rule in a way the house
   rules header cannot resolve by simple precedence. That is a real conflict and a
   developer decision, not an editing problem.
+- An existing obligation, prohibition, authority boundary, workflow step, or
+  table entry cannot map to the rewritten `AGENTS.md`. Stop before accepting the
+  rewrite and report the exact unmapped rule.
+- The fresh reviewer finds a semantic change outside the PR-shape and
+  writing-style changes in this spec. Return the finding to a fresh implementer.
 
 ## Now
 
-Spec committed as the first commit on `row/POLICY-SINGLE-PR-AND-STYLE`, which is
-this change dogfooding its own rule. Implementation follows in the same PR, after
-developer review of this file.
+The developer selected the recommended single PR for this row. The first commit
+contains the original spec. This spec-only correction requires the complete
+`AGENTS.md` rewrite before implementation starts. The rewrite follows in an
+isolated implementation commit in the same PR.

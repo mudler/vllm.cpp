@@ -2858,3 +2858,270 @@ TEST_CASE("api_server: --language-model-only answers an image request with 400")
       R"("max_completion_tokens":4,"temperature":0.0})");
   CHECK(text.status == 200);
 }
+
+// ---------------------------------------------------------------------------
+// POST /v1/audio/speech (W6 of #672). ADDITIVE and OPT-IN, exactly like the
+// video runner and the transcriber above: without a synthesizer attached the
+// handler refuses and the route is never registered at all.
+// ---------------------------------------------------------------------------
+
+namespace {
+std::string MusicBody() {
+  return R"({"model":"minimax-music3","lyrics":"[Verse]\nMorning light\n",
+             "description":"Genre: acoustic pop. BPM: 96.",
+             "audio_duration":12.5,"num_inference_steps":4,"seed":7})";
+}
+
+// A 44100 Hz STEREO RIFF/WAVE, so the route's output can be checked for the
+// rate and channel count Music3 declares rather than for "some bytes".
+vllm::openai::SpeechResponse StereoWav(int64_t frames) {
+  std::string wav;
+  const uint32_t payload = static_cast<uint32_t>(frames * 2 * 2);
+  const auto put32 = [&wav](uint32_t v) {
+    for (int i = 0; i < 4; ++i) wav += static_cast<char>((v >> (8 * i)) & 0xFF);
+  };
+  const auto put16 = [&wav](uint16_t v) {
+    for (int i = 0; i < 2; ++i) wav += static_cast<char>((v >> (8 * i)) & 0xFF);
+  };
+  wav += "RIFF";
+  put32(36u + payload);
+  wav += "WAVE";
+  wav += "fmt ";
+  put32(16u);
+  put16(1u);
+  put16(2u);       // stereo
+  put32(44100u);   // the family's NATIVE rate
+  put32(44100u * 4u);
+  put16(4u);
+  put16(16u);
+  wav += "data";
+  put32(payload);
+  for (int64_t i = 0; i < frames * 2; ++i) put16(static_cast<uint16_t>(i & 0xFFFF));
+  vllm::openai::SpeechResponse out;
+  out.wav = wav;
+  out.sample_rate = 44100;
+  out.channels = 2;
+  out.samples_per_channel = frames;
+  return out;
+}
+
+uint32_t WavU32(const std::string& wav, size_t offset) {
+  return static_cast<uint32_t>(static_cast<unsigned char>(wav[offset])) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(wav[offset + 1])) << 8) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(wav[offset + 2])) << 16) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(wav[offset + 3])) << 24);
+}
+uint16_t WavU16(const std::string& wav, size_t offset) {
+  return static_cast<uint16_t>(static_cast<unsigned char>(wav[offset]) |
+                               (static_cast<unsigned char>(wav[offset + 1]) << 8));
+}
+}  // namespace
+
+TEST_CASE("api_server: /v1/audio/speech without a synthesizer is a 500, not a crash") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  // ADDITIVITY: with nothing attached the handler refuses and NO speech
+  // envelope leaks — the body is the ordinary OpenAI error object, and the
+  // route itself is never registered, so the socket answers 404 as before.
+  ApiServer::DispatchResult r = h.server.handle_audio_speech(MusicBody());
+  CHECK(r.status == 500);
+  CHECK(r.content_type == "application/json");
+  CHECK(r.body.find("No speech synthesizer configured") != std::string::npos);
+  CHECK(r.body.find("RIFF") == std::string::npos);
+  CHECK(r.body.find("minimax-music3") == std::string::npos);
+}
+
+TEST_CASE("api_server: /v1/audio/speech serves the family's 44100 Hz stereo WAV") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  vllm::openai::SpeechRequest seen;
+  int64_t calls = 0;
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "minimax-music3";
+  caps.sample_rate = 44100;
+  caps.channels = 2;
+  caps.requires_reference_audio = false;  // Music3 conditions on text alone
+  h.server.set_synthesizer(
+      [&](const vllm::openai::SpeechRequest& req) {
+        seen = req;
+        ++calls;
+        return StereoWav(1024);
+      },
+      caps);
+
+  ApiServer::DispatchResult r = h.server.handle_audio_speech(MusicBody());
+  CHECK(r.status == 200);
+  // AUDIO BYTES, not a JSON envelope around them.
+  CHECK(r.content_type == "audio/wav");
+  REQUIRE(r.body.size() > 44);
+  CHECK(r.body.compare(0, 4, "RIFF") == 0);
+  CHECK(WavU16(r.body, 22) == 2);      // stereo
+  CHECK(WavU32(r.body, 24) == 44100u); // the native rate, unresampled
+  CHECK(WavU16(r.body, 34) == 16);     // 16-bit PCM
+  CHECK(r.body.size() == 44u + 1024u * 2u * 2u);
+
+  // Every field reached the seam, and each value DIFFERS from its default.
+  CHECK(calls == 1);
+  CHECK(seen.lyrics == "[Verse]\nMorning light\n");
+  CHECK(seen.description == "Genre: acoustic pop. BPM: 96.");
+  CHECK(seen.text.empty());
+  CHECK(seen.audio_duration_s == doctest::Approx(12.5));
+  CHECK(seen.num_inference_steps == 4);
+  CHECK(seen.seed == 7);
+  CHECK(seen.model == "minimax-music3");
+}
+
+TEST_CASE("api_server: requires_reference_audio REFUSES before the runner is called") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+
+  int64_t calls = 0;
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "indextts2";
+  caps.sample_rate = 22050;
+  caps.channels = 1;
+  // TRUE — IndexTTS-2 has NO text-only synthesis, so an absent clip is a
+  // refusal rather than a default voice. This is the value that DIFFERS from
+  // Music3's, so a pass proves the flag was consulted.
+  caps.requires_reference_audio = true;
+  h.server.set_synthesizer(
+      [&](const vllm::openai::SpeechRequest&) {
+        ++calls;
+        return StereoWav(8);
+      },
+      caps);
+
+  ApiServer::DispatchResult r = h.server.handle_audio_speech(R"({"input":"hello"})");
+  CHECK(r.status == 400);
+  CHECK(r.body.find("indextts2") != std::string::npos);
+  CHECK(r.body.find("reference_audio") != std::string::npos);
+  // THE POINT: nothing staged and nothing synthesized.
+  CHECK(calls == 0);
+
+  // And the SAME request against a family that needs no clip is served.
+  ServerHarness other(c, w, Fixture());
+  int64_t other_calls = 0;
+  vllm::openai::SpeechCapabilities music;
+  music.family = "minimax-music3";
+  music.sample_rate = 44100;
+  music.channels = 2;
+  music.requires_reference_audio = false;
+  other.server.set_synthesizer(
+      [&](const vllm::openai::SpeechRequest&) {
+        ++other_calls;
+        return StereoWav(8);
+      },
+      music);
+  ApiServer::DispatchResult served =
+      other.server.handle_audio_speech(R"({"lyrics":"[Verse]\nx\n"})");
+  CHECK(served.status == 200);
+  CHECK(other_calls == 1);
+}
+
+TEST_CASE("api_server: /v1/audio/speech surfaces the family's own refusal verbatim") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  ServerHarness h(c, w, Fixture());
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "minimax-music3";
+  caps.sample_rate = 44100;
+  caps.channels = 2;
+  h.server.set_synthesizer(
+      [](const vllm::openai::SpeechRequest&) -> vllm::openai::SpeechResponse {
+        throw std::runtime_error(
+            "MiniMax-Music3: the AUTOREGRESSIVE HEAD is not implemented (W2, issue #672)");
+      },
+      caps);
+  ApiServer::DispatchResult r = h.server.handle_audio_speech(MusicBody());
+  CHECK(r.status == 500);
+  // The message NAMES the missing stage; a generic body would throw that away
+  // and send the caller to read loader source.
+  CHECK(r.body.find("AUTOREGRESSIVE HEAD") != std::string::npos);
+  CHECK(r.body.find("#672") != std::string::npos);
+
+  // A malformed body is a 400 BEFORE the runner, and an unsupported field is
+  // refused rather than dropped.
+  CHECK(h.server.handle_audio_speech("{not json").status == 400);
+  CHECK(h.server.handle_audio_speech("{}").status == 400);
+  CHECK(h.server.handle_audio_speech(R"({"input":"hi","voice":"alloy"})").status == 400);
+  CHECK(h.server.handle_audio_speech(R"({"input":"hi","stream":true})").status == 400);
+}
+
+TEST_CASE("api_server: /v1/audio/speech route registration is ADDITIVE over a real socket") {
+  // The handler-dispatch cases above prove the LOGIC; this one proves the ROUTE
+  // TABLE, which is where additivity actually lives: without a synthesizer the
+  // endpoint must not exist at all, so a server built before W6 and one built
+  // after are indistinguishable to a client that never asks for speech.
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+
+  auto with_socket = [](ServerHarness& h, auto&& body) {
+    const int port = h.server.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread server_thread([&h]() { h.server.serve(); });
+    for (int i = 0; i < 500 && !h.server.is_running(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    REQUIRE(h.server.is_running());
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(15, 0);
+    body(client);
+    h.server.stop();
+    server_thread.join();
+  };
+
+  SUBCASE("with NO speech family attached the route is 404 and nothing leaks") {
+    ServerHarness h(c, w, Fixture());
+    with_socket(h, [](httplib::Client& client) {
+      auto res = client.Post("/v1/audio/speech", MusicBody(), "application/json");
+      REQUIRE(res);
+      // 404 from the route table, NOT a 500 from a handler — the endpoint does
+      // not exist, exactly as before W6 existed.
+      CHECK(res->status == 404);
+      // No speech envelope of any kind reaches the wire.
+      CHECK(res->body.find("minimax-music3") == std::string::npos);
+      CHECK(res->body.find("synthesizer") == std::string::npos);
+      CHECK(res->body.find("RIFF") == std::string::npos);
+      // And the routes that were always there are untouched.
+      auto health = client.Get("/health");
+      REQUIRE(health);
+      CHECK(health->status == 200);
+      auto models = client.Get("/v1/models");
+      REQUIRE(models);
+      CHECK(models->status == 200);
+    });
+  }
+
+  SUBCASE("with a speech family attached the route serves audio/wav bytes") {
+    ServerHarness h(c, w, Fixture());
+    vllm::openai::SpeechCapabilities caps;
+    caps.family = "minimax-music3";
+    caps.sample_rate = 44100;
+    caps.channels = 2;
+    caps.requires_reference_audio = false;
+    h.server.set_synthesizer(
+        [](const vllm::openai::SpeechRequest&) { return StereoWav(2048); }, caps);
+    with_socket(h, [](httplib::Client& client) {
+      auto res = client.Post("/v1/audio/speech", MusicBody(), "application/json");
+      REQUIRE(res);
+      CHECK(res->status == 200);
+      CHECK(res->get_header_value("Content-Type") == "audio/wav");
+      REQUIRE(res->body.size() == 44u + 2048u * 2u * 2u);
+      CHECK(res->body.compare(0, 4, "RIFF") == 0);
+      CHECK(WavU16(res->body, 22) == 2);       // stereo
+      CHECK(WavU32(res->body, 24) == 44100u);  // the family's native rate
+      // Every OTHER route is exactly where it was: attaching a synthesizer adds
+      // one endpoint and moves none.
+      auto health = client.Get("/health");
+      REQUIRE(health);
+      CHECK(health->status == 200);
+      auto videos = client.Post("/v1/videos", R"({"prompt":"x"})", "application/json");
+      REQUIRE(videos);
+      CHECK(videos->status == 404);  // still unregistered, no video runner attached
+    });
+  }
+}

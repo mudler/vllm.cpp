@@ -87,6 +87,10 @@
 #include "vllm/multimodal/minimax_h3_video.h"
 #include "vllm/multimodal/parakeet_transcription.h"
 #include "vllm/multimodal/video_engine.h"
+#include "vllm/multimodal/speech_engine.h"
+#include "vllm/model_executor/models/minimax_music3_speech.h"
+#include "vllm/entrypoints/openai/speech_api.h"
+#include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/tokenizer/tokenizer.h"
 #include "vllm/version.h"
 #include "vllm/v1/core/kv_cache_utils.h"
@@ -201,6 +205,17 @@ struct Args {
   // and what every pre-L9B invocation gets. See the --video-family block below
   // for why it now exists.
   std::string video_family;
+  // ── Speech + music generation (W6 of #672). OPT-IN: absent =>
+  // /v1/audio/speech is never registered and the server answers 404 exactly as
+  // it did before this flag existed. ────────────────────────────────────────
+  // The checkpoint SET directory (MiniMax-Music3 ships six component
+  // directories beside a modular_model_index.json).
+  std::string speech_model;
+  // The family to load. EMPTY keeps DETECTION, which inspects the artifact; an
+  // unregistered name is refused at ParseArgs naming what is registered, and is
+  // never treated as a hint, because the wrong family would not fail — it would
+  // render noise.
+  std::string speech_family;
   // FAMILY-SPECIFIC load knobs, `--video-extra KEY=VALUE`, repeatable. Pinning a
   // family is useless if that family's required load knobs are unreachable:
   // LTX-2.5 cannot load without `dit_config_path` (the shipped FP8 DiT carries
@@ -374,6 +389,8 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--speculative-config '<json>']\n"
          "               [--[no-]language-model-only]\n"
          "               [--limit-mm-per-prompt '<json>']\n"
+         "               [--speech-model <checkpoint-dir>] "
+         "[--speech-family <name>]\n"
          "               [--version]\n"
          "  accepted for published-recipe compatibility, NO effect: "
          "--enable-auto-tool-choice, --trust-remote-code\n";
@@ -458,6 +475,10 @@ Args ParseArgs(int argc, char** argv) {
       a.video_partition = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-family") {
       a.video_family = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--speech-model") {
+      a.speech_model = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--speech-family") {
+      a.speech_family = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--video-extra") {
       const std::string kv = NextArg(argc, argv, i, argv[0]);
       const std::string::size_type eq = kv.find('=');
@@ -654,6 +675,23 @@ Args ParseArgs(int argc, char** argv) {
       std::cerr << "\n";
       Usage(argv[0], 2);
     }
+  }
+  if (!a.speech_family.empty()) {
+    vllm::multimodal::SpeechRegistry& registry = vllm::multimodal::GlobalSpeechRegistry();
+    vllm::models::music3::RegisterBuiltinSpeechFamilies(registry);
+    const std::vector<std::string> registered = registry.families();
+    if (std::find(registered.begin(), registered.end(), a.speech_family) == registered.end()) {
+      std::cerr << "server: --speech-family '" << a.speech_family
+                << "' is not a registered speech family. Registered families:";
+      for (const std::string& name : registered) std::cerr << " " << name;
+      std::cerr << "\n";
+      Usage(argv[0], 2);
+    }
+  }
+  if (!a.speech_family.empty() && a.speech_model.empty()) {
+    std::cerr << "server: --speech-family names a family but --speech-model names no "
+                 "checkpoint; there is nothing to load it from\n";
+    Usage(argv[0], 2);
   }
   // Mirrors vllm/entrypoints/openai/cli_args.py:395 — upstream raises
   //   TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
@@ -1237,6 +1275,69 @@ int VllmServerMain(int argc, char** argv) {
         }
         return out.mux_output_path;
       });
+    }
+
+    // ── Speech + music generation (W6 of #672). OPT-IN: with no --speech-model
+    // the route is never registered and the server is byte-identical to one
+    // built before this existed. ─────────────────────────────────────────────
+    std::shared_ptr<vllm::multimodal::SpeechEngine> speech_engine;
+    if (!args.speech_model.empty()) {
+      vllm::multimodal::SpeechRegistry& registry = vllm::multimodal::GlobalSpeechRegistry();
+      vllm::models::music3::RegisterBuiltinSpeechFamilies(registry);
+      vllm::multimodal::SpeechModelParams smp;
+      smp.path = args.speech_model;
+      smp.family = args.speech_family;  // empty => DETECT by inspecting the artifact
+      std::string why;
+      std::unique_ptr<vllm::multimodal::SpeechEngine> loaded = registry.Load(smp, &why);
+      if (loaded == nullptr) {
+        // `why` names every family that was tried and the path, so a startup
+        // failure is evidence rather than a verdict.
+        throw std::runtime_error("server: --speech-model " + args.speech_model + ": " + why);
+      }
+      speech_engine = std::move(loaded);
+      vllm::openai::SpeechCapabilities caps;
+      caps.family = speech_engine->family();
+      caps.sample_rate = speech_engine->sample_rate();
+      caps.requires_reference_audio = speech_engine->requires_reference_audio();
+      std::cerr << "server: /v1/audio/speech on (family=" << caps.family << ", "
+                << caps.sample_rate << " Hz, "
+                << (caps.requires_reference_audio ? "reference clip REQUIRED"
+                                                  : "text-only synthesis")
+                << ", speech family "
+                << (args.speech_family.empty() ? "DETECTED" : "DECLARED (--speech-family)")
+                << ")\n";
+      server.set_synthesizer(
+          [speech_engine](const vllm::openai::SpeechRequest& req)
+              -> vllm::openai::SpeechResponse {
+            // The library-owned request mapping: the route validated the
+            // ENVELOPE, the family validates its own fields and refuses by name.
+            vllm::multimodal::SpeechGenParams gen;
+            gen.text = req.text;
+            gen.language = req.language;
+            gen.lyrics = req.lyrics;
+            gen.description = req.description;
+            gen.reference_audio = req.reference_audio;
+            gen.reference_sample_rate = req.reference_sample_rate;
+            gen.audio_duration_s = req.audio_duration_s;
+            gen.num_inference_steps = req.num_inference_steps;
+            // NEGATIVE means "the family decides": 0 is a legal guidance scale.
+            gen.guidance_scale = req.has_guidance_scale ? req.guidance_scale : -1.0;
+            gen.seed = req.seed;
+            const vllm::multimodal::SpeechResult result = speech_engine->Synthesize(gen);
+            vllm::openai::SpeechResponse out;
+            out.sample_rate = result.sample_rate;
+            out.channels = result.channels;
+            out.samples_per_channel =
+                result.channels > 0
+                    ? static_cast<int64_t>(result.samples.size()) / result.channels
+                    : 0;
+            // The SHARED RIFF writer the H3 and LTX-2.5 audio paths already
+            // use, so HTTP and the ABI cannot emit different bytes.
+            out.wav = vllm::MiniMaxH3WriteWav(result.samples, out.channels,
+                                              out.samples_per_channel, out.sample_rate);
+            return out;
+          },
+          caps);
     }
 
     oai::UtilityEndpointOptions endpoint_opts;

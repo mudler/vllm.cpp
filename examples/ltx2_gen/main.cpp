@@ -100,6 +100,7 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                [--max-phase N] [--allow-unported]\n"
       "                [--prompt-valid-rows N]   how many embed rows are real tokens\n"
       "                [--frames N] [--width N] [--height N] [--seed N]\n"
+      "                [--first-frame <image.ppm>] [--image-crf 0]\n"
       "                [--device cpu|cuda]\n\n"
       "Renders LTX-2.5 (family \"ltx-2.5\") through vllm_video_engine_load +\n"
       "vllm_video_generate.\n\n"
@@ -121,7 +122,17 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "weights. The row count must then be a multiple of the connector's learnable\n"
       "register count (128 on the shipped files), and --prompt-valid-rows says how\n"
       "many of them are real: the rest are padding, and padding is REPLACED by the\n"
-      "learnable register table rather than ignored.\n");
+      "learnable register table rather than ignored.\n\n"
+      "IMAGE CONDITIONING (image-to-video). --first-frame takes a binary PPM (P6,\n"
+      "maxval 255) and pins latent frame 0 to it: it is decoded, aspect-filled and\n"
+      "centre-cropped to each phase's own resolution, VAE-encoded, and written into\n"
+      "the clean latent. It needs --image-crf 0, and that is DELIBERATELY not the\n"
+      "default. Upstream re-compresses a conditioning image through H.264 at the CRF\n"
+      "the checkpoint's generation was trained with, which for LTX-2.5 is 18; that\n"
+      "round trip needs libx264 and none is vendored here, so leaving --image-crf out\n"
+      "resolves 18 and REFUSES by name. --image-crf 0 is upstream-legal and OUT OF\n"
+      "DISTRIBUTION: the model sees pixels it was not trained on. That is a quality\n"
+      "cost, and this tool states it rather than turning it on quietly.\n");
   std::exit(code);
 }
 
@@ -133,7 +144,7 @@ int main(int argc, char** argv) {
   std::string workdir = "/tmp/ltx2_gen", out_path, ffmpeg = "ffmpeg", device = "cuda";
   // BORROWED by `vllm_video_generate`, like the extras below, so it is owned
   // here and pointed at only after parsing.
-  std::string prompt;
+  std::string prompt, first_frame, image_crf;
 
   // The extras are BORROWED by the load call, so the strings must outlive it.
   // Kept as two parallel vectors of owned strings plus the char* views the ABI
@@ -174,6 +185,14 @@ int main(int argc, char** argv) {
     else if (f == "--prompt-valid-rows")
       SetExtra("prompt_embeds_valid_rows", Need(argc, argv, ++i, f.c_str()));
     else if (f == "--allow-unported") SetExtra("allow_unported_modules", "1");
+    // Image conditioning (row LTX25-IMAGE-COND, issue #644). `--first-frame` is
+    // a binary PPM; `--image-crf` is the PER-GENERATION extra, so it rides
+    // vp.extra_* rather than mp.extra_*. Only 0 is served, and it is NOT
+    // defaulted here — leaving it out lets the engine resolve the checkpoint's
+    // own 18 and refuse, which is the point: this CLI must not be the thing that
+    // quietly turns an out-of-distribution render on.
+    else if (f == "--first-frame") first_frame = Need(argc, argv, ++i, "--first-frame");
+    else if (f == "--image-crf") image_crf = Need(argc, argv, ++i, "--image-crf");
     else if (f == "--device") device = Need(argc, argv, ++i, "--device");
     else if (f == "--frames") vp.num_frames = std::atoi(Need(argc, argv, ++i, "--frames"));
     else if (f == "--width") vp.width = std::atoi(Need(argc, argv, ++i, "--width"));
@@ -203,6 +222,27 @@ int main(int argc, char** argv) {
   mp.family = "ltx-2.5";
   vp.output_dir = workdir.c_str();
   if (!prompt.empty()) vp.prompt = prompt.c_str();
+  if (!first_frame.empty()) vp.first_frame = first_frame.c_str();
+
+  // The PER-GENERATION extras are a SEPARATE array from the load-time ones, and
+  // conflating them is the whole failure this keeps apart: `image_crf` handed to
+  // the load call is an unknown LOAD extra and is refused there, which would
+  // read as "the flag does not work" rather than as "it goes on the other call".
+  std::vector<std::string> gen_keys, gen_values;
+  if (!image_crf.empty()) {
+    gen_keys.emplace_back("image_crf");
+    gen_values.push_back(image_crf);
+  }
+  std::vector<const char*> gkeys, gvalues;
+  for (size_t i = 0; i < gen_keys.size(); ++i) {
+    gkeys.push_back(gen_keys[i].c_str());
+    gvalues.push_back(gen_values[i].c_str());
+  }
+  if (!gkeys.empty()) {
+    vp.extra_keys = gkeys.data();
+    vp.extra_values = gvalues.data();
+    vp.n_extras = static_cast<int32_t>(gkeys.size());
+  }
 
   std::vector<const char*> keys, values;
   keys.reserve(extra_keys.size());

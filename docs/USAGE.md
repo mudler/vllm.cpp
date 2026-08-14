@@ -435,21 +435,44 @@ the embeddings connector) are implemented and gated. Several limits decide what
 you can actually ask for, and each refuses by name rather than rendering
 something else.
 
-In particular, the encoders being present does NOT mean image, keyframe,
-reference-video or reference-audio conditioning is usable: the video engine
-still refuses every one of those by name, because the request-side work between
-a file on disk and a tensor the encoder accepts — image decode, aspect-fill
-resize, and the H.264 CRF re-compression upstream performs before encoding
-whenever the resolved CRF is not `0` and the image is at least 2 pixels on its
-shorter side — is not ported. The engine also holds no
-encoder to call: it materializes the VAE DECODER key filters only, so no
-encoder weights are ever in memory, and the refusal names that rather than
-claiming the encoder itself is missing. Two encoder-level limits are worth
+**Image conditioning (image-to-video) runs at `image_crf=0`, and only there.**
+Pass a first frame as binary PPM (`first_frame_path` / `first_frame_ppm`) plus
+the per-generation extra `image_crf=0`; the engine decodes it, aspect-fills and
+centre-crops it to each phase's own resolution, VAE-encodes it, and replaces
+latent frame 0's clean tokens. `noise_aug` is the pinning strength (`1.0`, the
+default, pins the frame exactly).
+
+`image_crf=0` must be asked for **explicitly**, and it is **out of
+distribution**. Upstream re-compresses a conditioning image through H.264 at the
+CRF the checkpoint's generation was trained with, and an LTX-2.5 checkpoint
+resolves that to **18**. That round trip needs libx264 and no codec is vendored
+here, so a non-zero CRF — including the default a caller gets by saying nothing —
+is refused by name. `image_crf=0` is upstream-legal (upstream short-circuits it
+and documents an explicit `0` as "skip re-compression entirely") but conditions
+the model on pixels it was not trained to see. That is a render-quality cost, and
+it is stated rather than applied silently.
+
+Keyframe, reference-image, reference-video and reference-audio conditioning are
+still refused, each naming a different missing piece: a last-frame keyframe needs
+the token-APPEND machinery — a keyframe is appended to the sequence with its own
+positions and a rebuilt attention mask, then trimmed back off, and this engine's
+phase loop is fixed at the target grid's token count — while the served
+first-frame arm only REPLACES tokens that already exist; the reference arms need
+the IC-LoRA's scale factors, which live in LoRA metadata this project does not
+read; reference audio additionally needs the AUDIO VAE's encoder key filter,
+which is not built. (Until 2026-08-13 this said a last-frame keyframe needs the
+DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyframe
+is appended unmarked, so the embedding never applies to it. Where the embedding
+does bite is the FIRST latent frame of every render, which is a separate gap,
+tracked as issue #658.) Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this
-project does not carry. And a VAE configured with `latent_log_var: none` is
-refused, because upstream itself raises on it.
+project does not carry. A VAE configured with `latent_log_var: none` is
+refused, because upstream itself raises on it. And a video-VAE `res_x` encoder
+block that declares no `num_layers` is refused rather than defaulted, because
+upstream subscripts that key and raises `KeyError` on it; no other encoder block
+kind reads it.
 
 **A typed prompt works.** `--encoder` names the Gemma-4 12B text tower and
 `--prompt` carries the words. The tower tokenizes them with its OWN embedded
@@ -487,7 +510,11 @@ refused, because a stream left unconditioned renders instead of failing.
 returns the trace of the last `Generate()` — whether the conditioning came from a
 prompt or from embeds, the prompt string, the row count and both stream widths, an
 FNV-1a digest over the exact f32 buffers cross-attention read, and each stream's
-absmax. It is returned **by value, under the engine's own lock**, so it is safe to
+absmax. When the request carried an image it also reports the CRF and strength it
+was conditioned at, how many tokens the encoded image replaced, and a digest over
+**those tokens as written into the state** — not over the encoder's output, so a
+build that encoded an image and never placed it reads as unconditioned rather
+than healthy. It is returned **by value, under the engine's own lock**, so it is safe to
 call from a server thread while another thread renders — but `Generate` holds that
 same lock for the WHOLE render, so such a call blocks for minutes rather than
 returning a stale answer immediately. `completed` is true only if that
@@ -540,6 +567,11 @@ ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
 
 Swap the two `--encoder*` flags and `--prompt` for `--prompt-embeds` +
 `--audio-prompt-embeds` to condition from files instead.
+
+Add `--first-frame frame.ppm --image-crf 0` for image-to-video. The PPM is
+binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
+required and is not the default, because omitting it resolves the checkpoint's
+own CRF 18 and refuses — see the out-of-distribution note above.
 
 `--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
 64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
@@ -1093,6 +1125,7 @@ Registered in
 | POST | `/v1/videos/sync` | Same, but runs to completion before answering |
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
+| POST | `/v1/audio/speech` | Text (or lyrics + a music description) to audio; responds with `audio/wav` bytes. Registered **only** when a synthesizer is attached (`--speech-model`) |
 
 The reference-audio side of IndexTTS-2.5 is complete in the library -- a 16 kHz
 clip goes through the SeamlessM4T feature extractor, the w2v-bert Conformer, the
@@ -1103,7 +1136,19 @@ a route yet. The greedy generate loop that turns the prompt into mel codes is
 ported too, and so is the STATED-emotion path -- eight weights selecting rows
 from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
 text plus a reference clip and an emotion reaches mel CODES in the library. What
-is still missing is a COMMAND or ROUTE. The TOKENIZER now exists:
+is still missing is a COMMAND or ROUTE. TEXT DOES REACH AUDIO in the library:
+`test_indextts2_e2e` tokenizes with the checkpoint's own vocabulary, runs the
+talker to mel codes, and drives those through the length regulator, the CFM loop
+and BigVGAN to samples. Point it at all four checkpoint paths:
+
+```sh
+VLLM_CPP_INDEXTTS2_S2MEL=... VLLM_CPP_INDEXTTS2_BIGVGAN=... \
+VLLM_CPP_INDEXTTS2_GPT=... VLLM_CPP_INDEXTTS2_TIKTOKEN=... \
+  ./build/tests/test_indextts2_e2e
+```
+
+It asserts STRUCTURE, not quality: nothing is compared against vLLM-Omni, which
+is unpinned (#633). The TOKENIZER it uses:
 `tiktoken::LoadRanks` reads the shipped `.tiktoken` vocabulary and
 `tiktoken::Encode` reproduces python tiktoken's ids exactly on the cases
 gated, CJK included. The checkpoint now
@@ -1152,6 +1197,74 @@ The four `/v1/videos` routes are registered **only** when the server was started
 with `--video-dit`; without it they are absent (404) and the server is identical
 to one built without video support. See
 [MiniMax-H3: video + audio generation](#minimax-h3-video--audio-generation).
+
+`/v1/audio/speech` is registered **only** when the server was started with
+`--speech-model`; without it the route is absent (404) and the server is
+identical to one built before it existed. See
+[Speech and music generation](#speech-and-music-generation).
+
+### Speech and music generation
+
+    vllm-server --model /path/to/text-model \
+      --speech-model /path/to/minimax-music3 \
+      [--speech-family minimax-music3]
+
+`--speech-model` names the checkpoint **set** — MiniMax-Music3 ships six
+component directories beside a `modular_model_index.json`, so this is not a
+single model directory. `--speech-family` is optional: omitted, the family is
+**detected** by inspecting the artifact, and a directory no registered family
+claims is refused at startup naming every family that was tried. A name that is
+not registered is refused too; it is never treated as a hint, because the wrong
+family would not fail — it would render noise.
+
+The route is OpenAI's `createSpeech` shape, with the two **music** inputs as
+additional named fields:
+
+    curl http://localhost:8000/v1/audio/speech \
+      -H 'Content-Type: application/json' \
+      -d '{"model": "minimax-music3",
+           "lyrics": "[Verse]\nMorning light filtering through the pine\n",
+           "description": "Genre: acoustic pop. BPM: 96. Key: C major.",
+           "audio_duration": 30, "num_inference_steps": 30, "seed": 7}' \
+      --output song.wav
+
+The response body is RIFF/WAVE 16-bit PCM at the family's **native** rate
+(44100 Hz stereo for MiniMax-Music3, never resampled), with content type
+`audio/wav`.
+
+`lyrics` and `description` are separate fields rather than one `input` behind a
+separator because upstream runs a different normalizer over each. A
+one-utterance family keeps using OpenAI's `input`. `prompt` is the documented
+alias for `description`, and supplying both with different values is a 400
+rather than a silent winner.
+
+Refused by name rather than ignored, because honouring any of them silently
+would return audio the caller did not ask for: `voice` (no registered family
+exposes named voices), `speed` (no family implements a rate control), `stream` /
+`stream_format` (MiniMax-Music3 generates the whole song before the first sample
+exists, so buffering it would be a stream in name only) and any
+`response_format` other than `"wav"` (no mp3/opus/aac/flac encoder is vendored).
+
+A family with no text-only synthesis — IndexTTS-2.5 is one — is refused
+**before** anything stages: the route asks the loaded engine's
+`requires_reference_audio()` and answers 400 naming the family and the missing
+`reference_audio`, which is supplied as a `data:` URL carrying a 16-bit PCM mono
+WAV.
+
+**What this does NOT do yet.** No family renders a song from a prompt.
+MiniMax-Music3's condition mix, flow-matching DiT, scheduler, window
+bookkeeping and DAC vocoder are implemented and gated against the oracle's own
+waveform, but the 8.6B `Qwen3ForCausalLM` forward that produces the frame
+hidden states is not, so a request is answered with a 500 naming that stage, the
+phase that owes it (W2 of `.agents/specs/minimax-music3.md`) and issue #672.
+IndexTTS-2.5 refuses naming its own missing pieces.
+
+The same seam is reachable from the C ABI at v20 — `vllm_speech_engine_load`,
+`vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio`,
+`vllm_synthesize` and `vllm_speech_result_free` — so HTTP and FFI drive one
+implementation. `vllm_speech_result` carries both the float waveform and the
+RIFF/WAVE bytes, so an embedder writes a playable file without a second encoder.
+
 
 ### `max_tokens`: what a non-positive value means
 

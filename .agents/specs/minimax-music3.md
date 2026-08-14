@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** **W0 + W1 DONE, W3 DONE, W4 + W5 DONE, W2 PARTIAL.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. The 8.6B language-model forward, W6 and W7 are owed.
+**Status:** **W0 + W1 DONE, W3 DONE, W4 + W5 DONE, W6 DONE, W2 PARTIAL.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. The 8.6B language-model forward and W7 are owed.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -494,6 +494,71 @@ Next: W2's remaining 8.6B language-model forward, W6 the speech-family
 registration plus the `vllm_speech_*` ABI and the example HTTP server, W7 the
 quantized arms. Nothing generates a song end to end yet — W6 is what joins the
 two halves.
+
+**W6 is complete: the model reaches the SHARED SURFACE.**
+[`minimax_music3_speech.h`](../../include/vllm/model_executor/models/minimax_music3_speech.h)
+registers `minimax-music3` as a `SpeechRegistry` family — detection INSPECTS
+`modular_model_index.json` for the pipeline CLASS plus all seven component
+directories, never the path spelling — declares 44100 Hz stereo and
+`requires_reference_audio() == false`, and composes the four modular-pipeline
+blocks nothing had composed: `before_denoise.py` -> `Music3ChunkPlan`,
+`denoise.py` -> `Music3DenoiseChunks`, `decoders.py` -> `Music3DecodeChunks`.
+
+**§4.1's additive extension held.** `multimodal::SpeechGenParams` grew by
+`lyrics`, `description`, `audio_duration_s`, `num_inference_steps` and
+`guidance_scale`; every default means "the family decides", and `guidance_scale`
+uses a NEGATIVE sentinel because **0 is a legal guidance scale** and a
+0-means-default would make the unconditional branch unreachable. IndexTTS-2.5 is
+byte-identical: `indextts2.{h,cpp}` and `speech_engine.cpp` have zero lines
+changed, and its gates still read 4 cases / 8 assertions and 7 cases / 20.
+
+**The ABI is v20, not v19.** `origin/main` took v19 for the multimodal input
+limits (#607 L2) while this phase was in flight. That is a renumber, not a
+conflict: the speech surface is appended and no v19 field moved.
+
+**The route is `POST /v1/audio/speech`**, OpenAI's createSpeech spelling with the
+two music inputs as ADDITIONAL named fields, registered only when a synthesizer
+is attached. `voice`, `speed`, streaming and any non-`wav` `response_format` are
+refused BY NAME. The `requires_reference_audio()` refusal fires BEFORE the runner
+is called, which is the reason that method exists on the seam.
+
+**What W6 gates, and the tolerance that binds.** The delivery path reproduces
+`waveform.npy` over 88 064 values with 0 outside W5's own measured bound, and the
+WAV payload is BIT-EXACT against the quantization of that golden (88 064 int16
+samples, 0 mismatched) — there is no reduction there, so a tolerance would be
+slack for no reason. The WHOLE TAIL, driven from `frame_hiddens.npy` and the
+capture's own `denoise_first_sample_in.npy` through the condition mix, four
+guided 2.4B DiT steps and the vocoder, lands at max|d| 4.523e-06 / mean|d|
+1.225e-07 on the waveform and max|d| 2.396e-05 on the latents — exactly where the
+DiT's own measured per-step error carried over four Euler steps says it should,
+so the composition introduced no error of its own. The first bounds written for
+this file were 5e-4/5e-5; the measurement showed them to be ~100x slack and they
+were tightened to under an order of magnitude of headroom, because a bound nobody
+measured is not a bound.
+
+**A request's waveform can never equal the golden, and that is structural.**
+The AR codes are a seeded `torch.multinomial` draw (§5) and the denoise loop's
+initial latents are a seeded `randn_tensor` (`denoise.py:117-121`). So
+`Music3NoiseSource` is a PARAMETER of the loop rather than a private detail: the
+engine supplies a seeded normal draw and the gate supplies the capture's own
+noise. That is the ONLY entry at which this pipeline is comparable to the oracle,
+and hiding it would have made the e2e gate impossible rather than inconvenient.
+
+**W2's remainder is REFUSED BY NAME, not silently absent.** `Synthesize` resolves
+the whole request — every field refusal, the frame budget, the assembled prompt —
+and then names the 8.6B `Qwen3ForCausalLM` forward, the `inputs_embeds` entry it
+needs, the phase that owes it and the issue. A real Music3 request over HTTP
+therefore gets that message, not a song and not silence. **Nothing generates a
+song end to end yet, and W6 did not change that** — it built everything around
+the one stage that is missing.
+
+**One coverage gap, named rather than discovered.** The MULTI-WINDOW arm of
+`Music3DenoiseChunks` and `Music3DecodeChunks` — the overlap blend, the carry
+span, the post-loop restore and the waveform crop across windows — is not gated
+end to end, because the oracle capture is a single 25-frame window and no
+multi-window golden exists. Each primitive is gated individually by W4 at reduced
+dimensions, and `Music3ChunkPlan` is gated at two and four windows; the
+COMPOSITION across windows is not. Closing it needs a longer capture.
 
 Two things are owed and neither is this phase's to close: **no speed number
 exists** — every capture so far ran on CPU because `dgx.casa` was down, so

@@ -1448,6 +1448,9 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // test_dlopen compare against the same macro and move with it (the #121
   // lesson: an == floor moves with the macro and proves nothing).
   CHECK(vllm_abi_version() >= 16);
+  // The multimodal input limits are ABI v19; the speech/music slice
+  // (vllm_speech_* / vllm_synthesize) is ABI v20.
+  CHECK(vllm_abi_version() >= 20);
 }
 
 // ─── ABI v16: KV-pool sizing knobs (ROAD-V1-MEM M1) ──────────────────────────
@@ -2317,4 +2320,203 @@ TEST_CASE("capi v15: vllm_embed argument contract") {
   CHECK(out.values == nullptr);
   CHECK(out.n_embeddings == 0);
   vllm_engine_free(eng);
+}
+
+// ─── ABI v20: speech + music generation (W6 of #672) ─────────────────────────
+//
+// The C face of vllm::multimodal::SpeechEngine. These cases use a SYNTHETIC
+// MiniMax-Music3 component tree (configs only, zero-byte shard placeholders):
+// the engine resolves the checkpoint, parses all six configs and enforces the
+// dtype invariant before a weight byte is read, so its declared contract is
+// reachable without the 28.5 GB asset.
+
+namespace {
+
+void WriteCapiFile(const std::filesystem::path& path, const std::string& text) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::binary);
+  REQUIRE(out.good());
+  out << text;
+}
+
+// The RELEASED checkpoint's own configs, so a drift in the shipped values is a
+// CI failure rather than a surprise on the box that has the weights.
+std::filesystem::path WriteSyntheticMusic3(const char* tag) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / (std::string("vllm_capi_music3_") + tag);
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  WriteCapiFile(root / "modular_model_index.json",
+                R"({"_class_name": "MiniMaxMusic3ModularPipeline"})");
+  WriteCapiFile(root / "condition_encoder" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3ConditionEncoder", "condition_hidden_dim": 4096,
+                    "input_hop_length": 960, "input_sampling_rate": 24000,
+                    "num_condition_layers": 8, "out_dim": 2048, "output_hop_length": 512,
+                    "output_sampling_rate": 44100})");
+  WriteCapiFile(root / "condition_encoder" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "vocoder" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3Vocoder", "decoder_hidden_dim": 1536,
+                    "decoder_input_dim": 1024, "latent_channels": 128, "sampling_rate": 44100,
+                    "upsampling_ratios": [8, 8, 4, 2]})");
+  WriteCapiFile(root / "vocoder" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "rvq_depth_decoder" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3RVQDepthDecoder", "audio_vocab_size": 1024,
+                    "hidden_size": 4096, "intermediate_size": 6144,
+                    "max_position_embeddings": 16, "num_attention_heads": 16,
+                    "num_codebooks": 8, "num_layers": 4})");
+  WriteCapiFile(root / "rvq_depth_decoder" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "transformer" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3Transformer1DModel", "attention_head_dim": 64,
+                    "condition_dim": 2048, "ff_inner_dim": 8192, "fourier_embedding_dim": 256,
+                    "in_channels": 128, "num_attention_heads": 32, "num_layers": 36,
+                    "rotary_dim": 32})");
+  WriteCapiFile(root / "transformer" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "language_model" / "config.json",
+                R"({"architectures": ["Qwen3ForCausalLM"], "dtype": "bfloat16", "head_dim": 128,
+                    "hidden_size": 4096, "intermediate_size": 12288,
+                    "max_position_embeddings": 10240, "model_type": "qwen3",
+                    "num_attention_heads": 32, "num_hidden_layers": 36,
+                    "num_key_value_heads": 8, "rms_norm_eps": 1e-06,
+                    "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"},
+                    "tie_word_embeddings": false, "vocab_size": 200000})");
+  WriteCapiFile(root / "language_model" / "model.safetensors", "");
+  WriteCapiFile(root / "scheduler" / "scheduler_config.json",
+                R"({"_class_name": "FlowMatchEulerDiscreteScheduler", "invert_sigmas": true,
+                    "num_train_timesteps": 1, "shift": 1.0, "shift_terminal": null,
+                    "stochastic_sampling": false, "time_shift_type": "exponential",
+                    "use_dynamic_shifting": false})");
+  WriteCapiFile(root / "tokenizer" / "tokenizer_config.json", "{}");
+  return root;
+}
+
+}  // namespace
+
+TEST_CASE("capi: v20 speech params zero-fill to the FAMILY's defaults") {
+  const vllm_speech_model_params mp = vllm_speech_model_params_default();
+  CHECK(mp.path == nullptr);
+  CHECK(mp.family == nullptr);  // NULL => detect by inspecting the artifact
+
+  const vllm_speech_params p = vllm_speech_params_default();
+  CHECK(p.text == nullptr);
+  CHECK(p.lyrics == nullptr);
+  CHECK(p.description == nullptr);
+  CHECK(p.reference_audio == nullptr);
+  CHECK(p.n_reference_audio == 0);
+  CHECK(p.audio_duration_s == doctest::Approx(0.0));
+  CHECK(p.num_inference_steps == 0);
+  CHECK(p.seed == 0);
+  // 0 IS A LEGAL guidance scale, so the "family decides" signal is the FLAG.
+  // A zeroed struct must therefore leave the flag clear rather than requesting
+  // guidance 0, which would select the unconditional branch.
+  CHECK(p.has_guidance_scale == 0);
+}
+
+TEST_CASE("capi: v20 speech handles refuse null arguments without touching *out") {
+  vllm_speech_engine* eng = nullptr;
+  CHECK(vllm_speech_engine_load(nullptr, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(eng == nullptr);
+  vllm_speech_model_params empty = vllm_speech_model_params_default();
+  CHECK(vllm_speech_engine_load(&empty, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_speech_engine_load(&empty, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+
+  // A NULL handle answers, rather than crashing, and answers the SAFE value.
+  CHECK(vllm_speech_engine_family(nullptr) == nullptr);
+  CHECK(vllm_speech_engine_sample_rate(nullptr) == 0);
+  CHECK(vllm_speech_engine_requires_reference_audio(nullptr) == 0);
+  vllm_speech_engine_free(nullptr);
+
+  vllm_speech_result out;
+  std::memset(&out, 0xAB, sizeof(out));
+  const vllm_speech_params params = vllm_speech_params_default();
+  CHECK(vllm_synthesize(nullptr, &params, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(out.samples == nullptr);  // zeroed even though it arrived poisoned
+  CHECK(out.wav == nullptr);
+  CHECK(out.n_samples == 0);
+  vllm_speech_result_free(nullptr);
+  vllm_speech_result_free(&out);
+}
+
+TEST_CASE("capi: v20 refuses a directory no speech family claims, NAMING what was tried") {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / "vllm_capi_speech_unclaimed";
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  std::filesystem::create_directories(root);
+  WriteCapiFile(root / "config.json", R"({"architectures": ["Qwen3ForCausalLM"]})");
+
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  const std::string path = root.string();
+  mp.path = path.c_str();
+  vllm_speech_engine* eng = nullptr;
+  CHECK(vllm_speech_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  const std::string why = vllm_last_error();
+  // The refusal is EVIDENCE: it names every family that was tried and points a
+  // text checkpoint at the entry point that does serve it.
+  CHECK(why.find("minimax-music3") != std::string::npos);
+  CHECK(why.find("indextts2") != std::string::npos);
+  CHECK(why.find("vllm_engine_load") != std::string::npos);
+
+  // An UNREGISTERED family name is refused too, never treated as a hint.
+  mp.family = "sora-audio";
+  CHECK(vllm_speech_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(std::string(vllm_last_error()).find("sora-audio") != std::string::npos);
+  std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference clip") {
+  const std::filesystem::path root = WriteSyntheticMusic3("declared");
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  const std::string path = root.string();
+  mp.path = path.c_str();
+  vllm_speech_engine* eng = nullptr;
+  REQUIRE_MESSAGE(vllm_speech_engine_load(&mp, &eng) == VLLM_OK, vllm_last_error());
+  REQUIRE(eng != nullptr);
+
+  // Detection resolved it without being told, which is what NULL family means.
+  CHECK(std::string(vllm_speech_engine_family(eng)) == "minimax-music3");
+  // The NATIVE rate (spec §1.1), not 22050 and not SGLang-Omni's 32000.
+  CHECK(vllm_speech_engine_sample_rate(eng) == 44100);
+  // 0 — Music3 conditions on text alone. This is the value that DIFFERS from a
+  // voice-cloning family's, so a pass proves the override was reached.
+  CHECK(vllm_speech_engine_requires_reference_audio(eng) == 0);
+
+  // A DECLARED family loads the same checkpoint identically.
+  vllm_speech_engine* declared = nullptr;
+  mp.family = "minimax-music3";
+  REQUIRE_MESSAGE(vllm_speech_engine_load(&mp, &declared) == VLLM_OK, vllm_last_error());
+  CHECK(std::string(vllm_speech_engine_family(declared)) == "minimax-music3");
+  vllm_speech_engine_free(declared);
+
+  // And the owed stage is a RUNTIME refusal naming the missing piece, not a
+  // silent zero-length waveform.
+  vllm_speech_params params = vllm_speech_params_default();
+  params.lyrics = "[Verse]\nMorning light\n";
+  params.description = "Genre: acoustic pop. BPM: 96.";
+  params.audio_duration_s = 12.5;   // differs from the family's 60.0
+  params.num_inference_steps = 4;   // differs from the family's 30
+  params.seed = 7;
+  vllm_speech_result out;
+  std::memset(&out, 0xAB, sizeof(out));
+  CHECK(vllm_synthesize(eng, &params, &out) == VLLM_ERR_RUNTIME);
+  CHECK(out.samples == nullptr);
+  CHECK(out.wav == nullptr);
+  CHECK(std::string(vllm_last_error()).find("Qwen3ForCausalLM") != std::string::npos);
+
+  // A field the family cannot honour is refused BY NAME rather than dropped.
+  vllm_speech_params with_text = params;
+  with_text.text = "sing something";
+  CHECK(vllm_synthesize(eng, &with_text, &out) == VLLM_ERR_RUNTIME);
+  CHECK(std::string(vllm_last_error()).find("`text` is not this family's input") !=
+        std::string::npos);
+
+  // n_reference_audio without a buffer is a CALLER error, caught before the
+  // family sees it.
+  vllm_speech_params bad_ref = params;
+  bad_ref.n_reference_audio = 4;
+  CHECK(vllm_synthesize(eng, &bad_ref, &out) == VLLM_ERR_INVALID_ARGUMENT);
+
+  vllm_speech_engine_free(eng);
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
 }

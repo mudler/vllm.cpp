@@ -1,0 +1,463 @@
+// See minimax_music3_speech.h for why the composition lives here and why the
+// noise source is a parameter.
+#include "vllm/model_executor/models/minimax_music3_speech.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "vllm/model_executor/models/indextts2.h"
+
+namespace vllm {
+namespace models {
+namespace music3 {
+namespace {
+
+namespace fs = std::filesystem;
+
+[[noreturn]] void Fail(const std::string& message) { throw std::runtime_error(message); }
+
+// The pipeline class `modular_model_index.json` names for this model
+// (modular_pipeline.py). Matching the CLASS rather than the directory name is
+// what makes detection an inspection of the artifact.
+constexpr const char* kPipelineClass = "MiniMaxMusic3ModularPipeline";
+
+bool ReadWholeFile(const fs::path& path, std::string* out) {
+  std::error_code ec;
+  if (!fs::is_regular_file(path, ec) || ec) return false;
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  *out = buffer.str();
+  return true;
+}
+
+}  // namespace
+
+double Music3FrameRate(const MiniMaxMusic3ConditionEncoderConfig& config) {
+  if (config.input_hop_length <= 0) {
+    Fail("MiniMax-Music3: the condition encoder's `input_hop_length` must be positive");
+  }
+  return static_cast<double>(config.input_sampling_rate) /
+         static_cast<double>(config.input_hop_length);
+}
+
+// ---------------------------------------------------------------------------
+// Detection
+// ---------------------------------------------------------------------------
+
+bool Music3DetectCheckpoint(const std::string& path) {
+  std::error_code ec;
+  if (path.empty() || !fs::is_directory(path, ec) || ec) return false;
+
+  std::string index;
+  if (!ReadWholeFile(fs::path(path) / "modular_model_index.json", &index)) return false;
+  // The class name, not the directory spelling. A repackager renames the
+  // directory; the index carries what the pipeline IS.
+  if (index.find(kPipelineClass) == std::string::npos) return false;
+
+  // Every component W1 resolves must be present, so a truncated download is not
+  // claimed and then refused three stages later. `vocoder` is the seventh
+  // directory the index lists beside the six named components.
+  for (const char* component : kMusic3Components) {
+    if (!fs::is_directory(fs::path(path) / component, ec) || ec) return false;
+  }
+  return fs::is_directory(fs::path(path) / kMusic3VocoderComponent, ec) && !ec;
+}
+
+// ---------------------------------------------------------------------------
+// The chunk plan
+// ---------------------------------------------------------------------------
+
+std::vector<Music3Chunk> Music3ChunkPlan(int64_t num_frames, const ConditionMixConfig& config) {
+  if (num_frames <= 0) Fail("MiniMax-Music3: the chunk plan needs at least one AR frame");
+  const std::vector<int64_t> starts = ChunkStarts(num_frames);
+  std::vector<Music3Chunk> out;
+  out.reserve(starts.size());
+  for (const int64_t start : starts) {
+    Music3Chunk chunk;
+    chunk.frame_start = start;
+    // denoise.py:80 — `min(start + _CHUNK_FRAMES, frame_hiddens.shape[1])`. The
+    // clamp is what makes the LAST window shorter than 200 frames.
+    chunk.frame_end = std::min<int64_t>(start + kChunkFrames, num_frames);
+    chunk.latent_length = ConditionLatentLength(chunk.frames(), config);
+    out.push_back(chunk);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// The noise source
+// ---------------------------------------------------------------------------
+
+Music3NoiseSource Music3SeededNoise(int64_t seed) {
+  return [seed](int64_t channels, int64_t length, int64_t chunk_index) {
+    if (channels <= 0 || length <= 0) {
+      Fail("MiniMax-Music3: the initial latents need positive channels and length");
+    }
+    // The window index enters the seed so two windows of one request do not draw
+    // the same noise, which upstream's single running generator also avoids.
+    std::mt19937_64 engine(static_cast<uint64_t>(seed) * 0x9E3779B97F4A7C15ull +
+                           static_cast<uint64_t>(chunk_index));
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> out(static_cast<size_t>(channels * length));
+    for (float& value : out) value = normal(engine);
+    return out;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The denoise loop
+// ---------------------------------------------------------------------------
+
+std::vector<std::vector<float>> Music3DenoiseChunks(const std::vector<float>& frame_hiddens,
+                                                    int64_t num_frames,
+                                                    const MiniMaxMusic3Config& config,
+                                                    const Music3AcousticWeights& weights,
+                                                    const Music3DenoiseOptions& options,
+                                                    const Music3NoiseSource& noise) {
+  if (!noise) Fail("MiniMax-Music3: the denoise loop needs a noise source");
+  if (options.num_inference_steps <= 0) {
+    Fail("MiniMax-Music3: `num_inference_steps` must be positive, got " +
+         std::to_string(options.num_inference_steps));
+  }
+
+  ConditionMixConfig mix;
+  mix.condition_hidden_dim = config.condition_encoder.condition_hidden_dim;
+  mix.num_condition_layers = config.condition_encoder.num_condition_layers;
+  mix.out_dim = config.condition_encoder.out_dim;
+  mix.input_sampling_rate = config.condition_encoder.input_sampling_rate;
+  mix.input_hop_length = config.condition_encoder.input_hop_length;
+  mix.output_sampling_rate = config.condition_encoder.output_sampling_rate;
+  mix.output_hop_length = config.condition_encoder.output_hop_length;
+
+  const int64_t row = mix.num_condition_layers * mix.condition_hidden_dim;
+  if (static_cast<int64_t>(frame_hiddens.size()) != num_frames * row) {
+    Fail("MiniMax-Music3: frame_hiddens holds " + std::to_string(frame_hiddens.size()) +
+         " values, " + std::to_string(num_frames) + " frames x " + std::to_string(row) +
+         " needs " + std::to_string(num_frames * row));
+  }
+
+  const int64_t channels = config.transformer.in_channels;
+  const int64_t condition_dim = config.transformer.condition_dim;
+  const std::vector<Music3Chunk> plan = Music3ChunkPlan(num_frames, mix);
+
+  // The schedule is the SAME for every window (denoise.py:152-156 resets it per
+  // window from the same ramp), so it is built once and walked from 0 each time.
+  const FlowMatchSchedule schedule =
+      FlowMatchSetTimesteps(DenoiseSigmaRamp(options.num_inference_steps), config.scheduler);
+
+  std::vector<std::vector<float>> latent_chunks;
+  latent_chunks.reserve(plan.size());
+  std::vector<float> previous_latent;
+  std::vector<float> previous_condition;  // [prev_len, condition_dim]
+  int64_t previous_length = 0;
+
+  for (size_t k = 0; k < plan.size(); ++k) {
+    const Music3Chunk& chunk = plan[k];
+    const std::vector<float> window(
+        frame_hiddens.begin() + static_cast<ptrdiff_t>(chunk.frame_start * row),
+        frame_hiddens.begin() + static_cast<ptrdiff_t>(chunk.frame_end * row));
+    // The condition encoder runs bf16 (spec §2.1); its OUTPUT is then consumed
+    // by an fp32 DiT, which is upstream's one cast at denoise.py:83.
+    std::vector<float> condition =
+        ConditionMix(window, chunk.frames(), mix, weights.condition, ArCompute::kBFloat16);
+    const int64_t length = static_cast<int64_t>(condition.size()) / condition_dim;
+    if (length * condition_dim != static_cast<int64_t>(condition.size())) {
+      Fail("MiniMax-Music3: the condition mix returned a non-rectangular tensor");
+    }
+
+    // denoise.py:85-88: splice the PREVIOUS window's condition over the overlap
+    // BEFORE the noise is drawn, so the noise follows the spliced condition.
+    const int64_t overlap = previous_length > 0 ? std::min(previous_length, length) : 0;
+    for (int64_t t = 0; t < overlap; ++t) {
+      for (int64_t d = 0; d < condition_dim; ++d) {
+        condition[static_cast<size_t>(t * condition_dim + d)] =
+            previous_condition[static_cast<size_t>(t * condition_dim + d)];
+      }
+    }
+
+    std::vector<float> latents = noise(channels, length, static_cast<int64_t>(k));
+    if (static_cast<int64_t>(latents.size()) != channels * length) {
+      Fail("MiniMax-Music3: the noise source returned " + std::to_string(latents.size()) +
+           " values, window " + std::to_string(k) + " needs " +
+           std::to_string(channels * length));
+    }
+    // denoise.py:122 — the blend prompt is a SNAPSHOT of the initial noise over
+    // the overlap, taken before the first step overwrites those columns.
+    std::vector<float> noise_prompt;
+    if (overlap > 0) {
+      noise_prompt.resize(static_cast<size_t>(channels * overlap));
+      for (int64_t c = 0; c < channels; ++c) {
+        for (int64_t t = 0; t < overlap; ++t) {
+          noise_prompt[static_cast<size_t>(c * overlap + t)] =
+              latents[static_cast<size_t>(c * length + t)];
+        }
+      }
+    }
+
+    const std::vector<float> zero_condition(condition.size(), 0.0f);
+    for (int64_t step = 0; step < options.num_inference_steps; ++step) {
+      const double time_value = schedule.timesteps[static_cast<size_t>(step)];
+      if (overlap > 0) {
+        BlendOverlap(latents, channels, length, noise_prompt, previous_latent, previous_length,
+                     overlap, time_value);
+      }
+      const std::vector<float> conditional =
+          DitForward(latents, length, condition, time_value, config.transformer, weights.dit);
+      const std::vector<float> unconditional =
+          DitForward(latents, length, zero_condition, time_value, config.transformer, weights.dit);
+      const std::vector<float> velocity =
+          ClassifierFreeGuidanceMix(conditional, unconditional, options.guidance_scale);
+      latents = FlowMatchStep(latents, velocity, step, schedule);
+    }
+
+    // denoise.py:249-250: the overlap is RESTORED exactly after the loop. The
+    // per-step blend approaches it but never reaches it, so skipping this leaves
+    // the seam audible.
+    for (int64_t c = 0; c < channels; ++c) {
+      for (int64_t t = 0; t < overlap; ++t) {
+        latents[static_cast<size_t>(c * length + t)] =
+            previous_latent[static_cast<size_t>(c * previous_length + t)];
+      }
+    }
+
+    const WindowCarrySpan carry = ChunkCarrySpan(length);
+    previous_length = carry.length();
+    previous_latent.assign(static_cast<size_t>(channels * previous_length), 0.0f);
+    for (int64_t c = 0; c < channels; ++c) {
+      for (int64_t t = 0; t < previous_length; ++t) {
+        previous_latent[static_cast<size_t>(c * previous_length + t)] =
+            latents[static_cast<size_t>(c * length + carry.start + t)];
+      }
+    }
+    previous_condition.assign(static_cast<size_t>(previous_length * condition_dim), 0.0f);
+    for (int64_t t = 0; t < previous_length; ++t) {
+      for (int64_t d = 0; d < condition_dim; ++d) {
+        previous_condition[static_cast<size_t>(t * condition_dim + d)] =
+            condition[static_cast<size_t>((carry.start + t) * condition_dim + d)];
+      }
+    }
+
+    latent_chunks.push_back(std::move(latents));
+  }
+  return latent_chunks;
+}
+
+// ---------------------------------------------------------------------------
+// The decode
+// ---------------------------------------------------------------------------
+
+std::vector<float> Music3DecodeChunks(const std::vector<std::vector<float>>& latent_chunks,
+                                      const MiniMaxMusic3VocoderConfig& config,
+                                      const VocoderWeights& weights,
+                                      int64_t* out_samples_per_channel) {
+  if (latent_chunks.empty()) Fail("MiniMax-Music3: the decode needs at least one latent window");
+  if (out_samples_per_channel == nullptr) {
+    Fail("MiniMax-Music3: the decode needs an out_samples_per_channel pointer");
+  }
+  const int64_t hop = config.hop_length();
+  const int64_t num_chunks = static_cast<int64_t>(latent_chunks.size());
+
+  std::vector<std::vector<float>> left_channel;
+  std::vector<std::vector<float>> right_channel;
+  int64_t total = 0;
+  for (int64_t k = 0; k < num_chunks; ++k) {
+    const std::vector<float>& latents = latent_chunks[static_cast<size_t>(k)];
+    const int64_t length = static_cast<int64_t>(latents.size()) / config.latent_channels;
+    if (length * config.latent_channels != static_cast<int64_t>(latents.size())) {
+      Fail("MiniMax-Music3: latent window " + std::to_string(k) + " is not rectangular");
+    }
+    int64_t samples = 0;
+    const std::vector<float> waveform = VocoderDecode(latents, length, config, weights, &samples);
+    const WaveformCropSpan span = VocoderCropSpan(k, num_chunks, samples, hop);
+    if (span.length() <= 0) {
+      Fail("MiniMax-Music3: window " + std::to_string(k) + " crops to nothing (" +
+           std::to_string(samples) + " samples, hop " + std::to_string(hop) + ")");
+    }
+    std::vector<float> l(static_cast<size_t>(span.length()));
+    std::vector<float> r(static_cast<size_t>(span.length()));
+    for (int64_t i = 0; i < span.length(); ++i) {
+      l[static_cast<size_t>(i)] = waveform[static_cast<size_t>(span.left + i)];
+      r[static_cast<size_t>(i)] = waveform[static_cast<size_t>(samples + span.left + i)];
+    }
+    total += span.length();
+    left_channel.push_back(std::move(l));
+    right_channel.push_back(std::move(r));
+  }
+
+  // decoders.py:89 — the concatenated waveform is CLAMPED to [-1, 1]. The
+  // vocoder's own tanh already bounds it, so this is inert on a correct decode
+  // and is mirrored anyway rather than argued away.
+  std::vector<float> out(static_cast<size_t>(2 * total));
+  int64_t written = 0;
+  for (size_t k = 0; k < left_channel.size(); ++k) {
+    for (size_t i = 0; i < left_channel[k].size(); ++i) {
+      out[static_cast<size_t>(written + static_cast<int64_t>(i))] =
+          std::min(1.0f, std::max(-1.0f, left_channel[k][i]));
+      out[static_cast<size_t>(total + written + static_cast<int64_t>(i))] =
+          std::min(1.0f, std::max(-1.0f, right_channel[k][i]));
+    }
+    written += static_cast<int64_t>(left_channel[k].size());
+  }
+  *out_samples_per_channel = total;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// The request contract
+// ---------------------------------------------------------------------------
+
+Music3Request Music3ResolveRequest(const multimodal::SpeechGenParams& params,
+                                   const MiniMaxMusic3ConditionEncoderConfig& config) {
+  if (!params.text.empty()) {
+    Fail("MiniMax-Music3: `text` is not this family's input — a music request carries "
+         "`lyrics` (the sung text, with [Verse]/[Chorus] tags) and `description` (genre, "
+         "BPM, key, instrumentation) as SEPARATE fields, because upstream normalizes them "
+         "differently (encoders.py:54-91). Move the text into one of the two rather than "
+         "having it silently dropped");
+  }
+  if (params.lyrics.empty()) {
+    Fail("MiniMax-Music3: `lyrics` is required — there is nothing to sing, and an empty "
+         "lyric normalizes to a bare '[start]' prompt");
+  }
+  if (!params.reference_audio.empty()) {
+    Fail("MiniMax-Music3: `reference_audio` is not supported — this family has no voice "
+         "cloning and no reference conditioning, which is why requires_reference_audio() "
+         "is false. Supply `description` instead");
+  }
+  if (!params.language.empty()) {
+    Fail("MiniMax-Music3: `language` is not supported — the prompt template has no "
+         "language slot (encoders.py:207-210), so it can be neither honoured nor honestly "
+         "ignored. State the language in `description` or in the lyrics themselves");
+  }
+
+  // ZERO means "omitted, take the family default"; NEGATIVE is an explicit,
+  // impossible value and is REFUSED. Collapsing the two turns upstream's
+  // `audio_duration must be positive` (encoders.py:277-278) into a silent 60 s
+  // song — which is exactly what this branch did until the gate caught it.
+  if (params.audio_duration_s < 0.0) {
+    Fail("MiniMax-Music3: `audio_duration_s` must be positive, got " +
+         std::to_string(params.audio_duration_s) +
+         " (leave it 0 to take the family's 60 s default)");
+  }
+  if (params.num_inference_steps < 0) {
+    Fail("MiniMax-Music3: `num_inference_steps` must be positive, got " +
+         std::to_string(params.num_inference_steps) +
+         " (leave it 0 to take the family's 30-step default)");
+  }
+
+  Music3Request out;
+  out.audio_duration_s =
+      params.audio_duration_s > 0.0 ? params.audio_duration_s : kMusic3DefaultDurationSeconds;
+  // MaxArFrames raises upstream's own two errors (encoders.py:277-291).
+  out.max_frames = MaxArFrames(out.audio_duration_s, Music3FrameRate(config));
+  out.num_inference_steps = params.num_inference_steps > 0 ? params.num_inference_steps
+                                                           : kMusic3DefaultInferenceSteps;
+  // NEGATIVE means default, because 0 is a legal guidance scale.
+  out.guidance_scale = params.guidance_scale >= 0.0 ? params.guidance_scale : kDitGuidanceScale;
+  out.seed = params.seed;
+  // Assembled LAST: it raises on an empty description, and the field refusals
+  // above are the ones that name a `SpeechGenParams` field.
+  out.prompt = AssembleArPrompt(params.description, params.lyrics);
+  if (static_cast<int64_t>(out.prompt.size()) > kMaxPromptTokens) {
+    // A byte count is an UPPER bound on the token count for any BPE, so a prompt
+    // that passes this can still be too long — the tokenizer-side check belongs
+    // with the AR head. This one catches the case that is already impossible.
+    Fail("MiniMax-Music3: the assembled prompt is " + std::to_string(out.prompt.size()) +
+         " bytes, past the checkpoint's " + std::to_string(kMaxPromptTokens) +
+         "-token ceiling however it tokenizes");
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// The engine
+// ---------------------------------------------------------------------------
+
+namespace {
+
+class Music3SpeechEngine final : public multimodal::SpeechEngine {
+ public:
+  explicit Music3SpeechEngine(std::string path) : path_(std::move(path)) {
+    paths_ = MiniMaxMusic3ResolveCheckpoint(path_);
+    config_ = MiniMaxMusic3LoadConfig(paths_);
+    // The dtype invariant of spec §2.1, enforced BEFORE anything stages, so a
+    // violating configuration is named here rather than surfacing as a torch-
+    // shaped type error inside a forward.
+    MiniMaxMusic3CheckRuntimeDtypes(
+        MiniMaxMusic3ResolveRuntimeDtypes(MiniMaxMusic3DtypePolicy::kBf16ArFp32Acoustic));
+  }
+
+  std::string family() const override { return kMusic3SpeechFamily; }
+  int64_t sample_rate() const override { return config_.vocoder.sampling_rate; }
+  // FALSE, and it is load-bearing rather than a default: Music3 conditions on
+  // text alone (spec §4.1), where IndexTTS-2 has no text-only synthesis at all.
+  // A server consults this to refuse before staging, so getting it backwards
+  // would reject every valid music request.
+  bool requires_reference_audio() const override { return false; }
+
+  multimodal::SpeechResult Synthesize(const multimodal::SpeechGenParams& params) override {
+    // Validate FIRST: every field refusal is free, and a caller learns its
+    // request was malformed without waiting for 28.5 GB to stage.
+    const Music3Request request = Music3ResolveRequest(params, config_.condition_encoder);
+    (void)request;
+    // THE AUTOREGRESSIVE HEAD IS OWED. Naming the missing piece, the phase and
+    // the issue is the contract .agents/porting-a-model.md sets for an arm that
+    // is not implemented; returning silence, or a waveform produced by anything
+    // other than this model, is not.
+    Fail("MiniMax-Music3: the request is valid and the checkpoint at '" + path_ +
+         "' resolves, but the AUTOREGRESSIVE HEAD is not implemented. Ported and gated: "
+         "the prompt assembly, the CFG logit pipeline, the RVQ depth decoder, the learned "
+         "8-layer condition mix, the flow-matching DiT, the FlowMatchEulerDiscrete "
+         "scheduler, the window bookkeeping and the DAC Flow-VAE vocoder. MISSING: the "
+         "8.6B Qwen3ForCausalLM forward that produces frame_hiddens[:, :4096], which needs "
+         "an `inputs_embeds` entry point the landed Qwen3 dense path does not have — W2 of "
+         ".agents/specs/minimax-music3.md, issue #672");
+  }
+
+ private:
+  std::string path_;
+  MiniMaxMusic3Paths paths_;
+  MiniMaxMusic3Config config_;
+};
+
+}  // namespace
+
+void RegisterMiniMaxMusic3SpeechFamily(multimodal::SpeechRegistry& registry) {
+  multimodal::SpeechFamilyRegistration reg;
+  reg.name = kMusic3SpeechFamily;
+  reg.detect = [](const multimodal::SpeechModelParams& params) {
+    return Music3DetectCheckpoint(params.path);
+  };
+  reg.load = [](const multimodal::SpeechModelParams& params)
+      -> std::unique_ptr<multimodal::SpeechEngine> {
+    return std::make_unique<Music3SpeechEngine>(params.path);
+  };
+  registry.Register(std::move(reg));
+}
+
+void RegisterBuiltinSpeechFamilies(multimodal::SpeechRegistry& registry) {
+  const std::vector<std::string> present = registry.families();
+  const auto has = [&present](const char* name) {
+    return std::find(present.begin(), present.end(), name) != present.end();
+  };
+  // Idempotent by construction: `SpeechRegistry::Register` THROWS on a duplicate
+  // name (deliberately — two claimants sharing one listed name defeats the
+  // never-guess guarantee), and a process-global registry can be populated from
+  // more than one entry point.
+  if (!has("indextts2")) RegisterIndexTts2SpeechFamily(registry);
+  if (!has(kMusic3SpeechFamily)) RegisterMiniMaxMusic3SpeechFamily(registry);
+}
+
+}  // namespace music3
+}  // namespace models
+}  // namespace vllm

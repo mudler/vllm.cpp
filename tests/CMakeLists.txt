@@ -126,6 +126,7 @@ vllm_cpp_add_test(test_dit_stack vllm/models/test_dit_stack.cpp)
 vllm_cpp_add_test(test_bigvgan vllm/models/test_bigvgan.cpp)
 vllm_cpp_add_test(test_indextts2_s2mel_loader vllm/models/test_indextts2_s2mel_loader.cpp)
 vllm_cpp_add_test(test_indextts2_render vllm/models/test_indextts2_render.cpp)
+vllm_cpp_add_test(test_indextts2_e2e vllm/models/test_indextts2_e2e.cpp)
 vllm_cpp_add_test(test_indextts2_talker_loader vllm/models/test_indextts2_talker_loader.cpp)
 vllm_cpp_add_test(test_vocos vllm/models/test_vocos.cpp)
 vllm_cpp_add_test(test_lenreg vllm/models/test_lenreg.cpp)
@@ -197,6 +198,17 @@ target_compile_definitions(test_minimax_music3_acoustic_real PRIVATE
   MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
 target_include_directories(test_minimax_music3_acoustic_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
+# W6 (#672): the SPEECH-FAMILY seam, the request contract and the chunk plan.
+# Pure or synthetic-tree only, so it needs neither the checkpoint nor a golden.
+vllm_cpp_add_test(test_minimax_music3_speech vllm/models/test_minimax_music3_speech.cpp)
+# W6's FULL-SCALE companion: the pipeline TAIL driven on the shipped weights,
+# against the capture's own waveform, and the WAV the delivery path emits.
+# Checkpoint-gated with a loud SKIP, exactly as the W4/W5 real gate is.
+vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
+target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_e2e_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
 # branch base (frames + WAV byte-identical, mux argv pinned).
@@ -214,6 +226,13 @@ target_compile_definitions(test_video_engine PRIVATE
 # LTX-2.5 L7: the family behind the VideoEngine seam and the driving loop, run
 # over a reduced-dimension checkpoint set written in the SHIPPED file format.
 vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
+# LTX-2.5 image conditioning (row LTX25-IMAGE-COND, issue #644): the CHAIN from
+# PPM bytes to conditioned, noised tokens, gated against upstream ltx_core AND
+# ltx_pipelines executed at reduced dimensions. ltx2_image_cond_goldens.inc
+# lives next to the test source.
+vllm_cpp_add_test(test_ltx2_image_cond vllm/multimodal/test_ltx2_image_cond.cpp)
+target_include_directories(test_ltx2_image_cond
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/multimodal)
 # LTX-2.5 DiT parity gate (row MODEL-DIFFUSION-LTX25, spec phase L2). The goldens
 # live next to the test source, like every other generated .inc.
 vllm_cpp_add_test(test_ltx2 vllm/models/test_ltx2.cpp)
@@ -243,6 +262,7 @@ target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
 target_include_directories(test_ltx2_loader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_video_api vllm/entrypoints/openai/test_video_api.cpp)
+vllm_cpp_add_test(test_speech_api vllm/entrypoints/openai/test_speech_api.cpp)
 target_include_directories(test_model_registry PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_platform vllm/platforms/test_platform.cpp)
 vllm_cpp_add_test(test_device_selection

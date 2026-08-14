@@ -234,6 +234,28 @@ inline constexpr char kLtx2PromptValidRowsExtra[] = "prompt_embeds_valid_rows";
 // resolved in either direction, for the same reason.
 inline constexpr char kLtx2EncoderConfigPathExtra[] = "encoder_config_path";
 
+// ── the PER-GENERATION extra (VideoGenParams::extras) ───────────────────────
+
+// The H.264 CRF the image conditioning is re-compressed at, `ImageConditioner`'s
+// `resolve_crf` (ltx-pipelines/utils/blocks.py:977-983). Row LTX25-IMAGE-COND,
+// issue #644.
+//
+// ABSENT MEANS "WHAT THE MODEL WAS TRAINED WITH", which for an LTX-2.5
+// checkpoint is **18** — `detect_params` maps a version at or above `(2, 4)`
+// onto `LTX_2_4_PARAMS` and its `LTX_2_4_IMAGE_CRF` (utils/constants.py:37,
+// 124, 130-133). And that round trip is NOT ported: it needs libx264
+// (media_io/decode.py:430-434 -> encode_single_frame:386-400) and no codec is
+// vendored here. So the DEFAULT REFUSES, by name.
+//
+// `image_crf=0` is the supported value and is served. It is upstream-legal —
+// `preprocess` short-circuits at `if crf == 0: return image` (decode.py:425-426)
+// and an explicit 0 is documented as "skip re-compression entirely"
+// (utils/args.py:58-59) — and it is OUT OF DISTRIBUTION, because the model was
+// trained on images that had been through the codec. Both halves are said out
+// loud rather than one of them: a caller has to ask for 0 knowingly, and gets a
+// render conditioned on uncompressed pixels rather than a refusal.
+inline constexpr char kLtx2ImageCrfExtra[] = "image_crf";
+
 // WHAT THE LAST `Generate()` ACTUALLY HANDED THE DiT's CROSS-ATTENTION.
 //
 // Every field is read off the exact f32 buffers `Ltx2ModalityInput::context`
@@ -265,16 +287,22 @@ inline constexpr char kLtx2EncoderConfigPathExtra[] = "encoder_config_path";
 //   * the conditioning rows REVERSED, putting every caption row on the wrong
 //     token,
 //
-// and BOTH passed `test_ltx2_video` at 30 cases / 499 assertions with exit 0.
-// The digest moved, as it must — but no assertion says WHICH value it should
-// have moved to.
+// and BOTH passed `test_ltx2_video` with exit 0 — at 30 cases / 499 assertions
+// when the pair was last re-run. The digest moved, as it must — but no assertion
+// says WHICH value it should have moved to.
 //
-// THAT COUNT IS THIS HEAD'S, and the distinction is the point of writing it
-// down. A reviewer first measured the pair at `43aa58377`, where the suite stood
-// at 485 assertions; the numbers were carried forward unchanged while the suite
-// grew, so the comment named a count no run of it could produce. Re-run here
-// (CPU Release, mutant recompiled and relinked each leg, tree restored
-// byte-for-byte and re-verified green between legs): 499/499, exit 0, both.
+// THE COUNT IS DELIBERATELY NOT RESTATED AS A CURRENT FIGURE, and the reason is
+// the history: a reviewer first measured the pair at `43aa58377`, where the
+// suite stood at 485 assertions; the numbers were carried forward unchanged
+// while the suite grew, so the comment named a count no run of it could produce.
+// It was re-measured at 499 (CPU Release, mutant recompiled and relinked each
+// leg, tree restored byte-for-byte and re-verified green between legs) — and
+// then row LTX25-IMAGE-COND (#644) added the image-conditioning cases and the
+// suite moved to 32 / 550, which is exactly how the previous number went stale
+// the first time. A count in a header is a MEASUREMENT OF ANOTHER FILE stored
+// here, which AGENTS.md §Records names as the thing that couples every PR to
+// lines it does not own. What survives is the finding — the mutations passed —
+// and the SHA-dated measurement above it; `ctest` is the authority on the count.
 //
 // THE VALUE ORACLE THE COMPOSITION IS OWED. The per-brick oracles are real and
 // strong: the Gemma-4 tower against a running `transformers` at a measured bf16
@@ -311,6 +339,30 @@ struct Ltx2ConditioningTrace {
   // two prompts the SAME digest and RED any dependence check, but it would do so
   // for the wrong reason; this says which happened.
   double video_absmax = 0.0, audio_absmax = 0.0;
+  // ── the IMAGE conditioning (row LTX25-IMAGE-COND, issue #644) ────────────
+  //
+  // Zero everywhere when the request carried no image. `image_tokens` is how
+  // many of the video stream's tokens the encoded image REPLACED in the clean
+  // latent, and `image_digest` is FNV-1a over THOSE TOKENS' raw f32 bytes — the
+  // same instrument, and with the same limits, as the two prompt digests above:
+  // it detects CHANGE, it does not pin VALUES.
+  //
+  // OVER THE TOKENS, NOT OVER THE ENCODER'S OUTPUT, and that choice is load
+  // bearing: a digest of the encoder's output answers "was an image encoded",
+  // which stays true of a build that encodes one and then never places it — an
+  // unconditioned render with a perfectly healthy trace.
+  //
+  // IT IS ALSO THE ONLY WAY TO ASK WHETHER THE ENCODER WEIGHTS WERE READ. "The
+  // conditioning loaded" and "the conditioning was used" are different claims,
+  // and a render cannot be inspected for either. Perturbing one encoder tensor
+  // and watching this digest move is what separates them, which is exactly the
+  // check `test_ltx2_video` runs.
+  int64_t image_tokens = 0;
+  uint64_t image_digest = 0;
+  double image_absmax = 0.0;
+  int64_t image_crf = 0;      // the CRF this render actually preprocessed at
+  double image_strength = 0.0;  // `ImageConditioningInput.strength` (args.py:64)
+
   // True only once the `Generate` that produced this conditioning RETURNED. The
   // trace is filled immediately after the connector and BEFORE the denoise loop,
   // because that is the only point at which the exact buffers cross-attention

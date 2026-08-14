@@ -218,7 +218,38 @@ extern "C" {
  * Appended at the END of vllm_model_params, so a zero-initialized v18 struct is
  * byte-identical: language_model_only 0 (off) and limit_mm_per_prompt NULL (no
  * limits configured => the 999-per-modality default, multimodal.py:331-333). */
-#define VLLM_ABI_VERSION 19
+/* v20 — SPEECH AND MUSIC GENERATION (.agents/specs/minimax-music3.md §4.1 W6,
+ * issue #672). The C face of vllm::multimodal::SpeechEngine, the seam the
+ * IndexTTS-2.5 lane landed and MiniMax-Music3 is the first family to implement:
+ * an opaque vllm_speech_engine loaded from a checkpoint SET
+ * (vllm_speech_engine_load/free, vllm_speech_model_params + _default), one
+ * blocking vllm_synthesize (vllm_speech_params + _default) producing a
+ * vllm_speech_result — the float waveform AND the RIFF/WAVE bytes, so a server
+ * hands a client a playable file without a second encoder — plus
+ * vllm_speech_result_free, and three interrogations of the loaded handle
+ * (vllm_speech_engine_family / _sample_rate / _requires_reference_audio).
+ *
+ * WHY THE HANDLE ANSWERS QUESTIONS. `sample_rate` is the family's NATIVE rate
+ * (44100 stereo for Music3, 22050 mono for IndexTTS-2.5) and never a resampled
+ * one, so the caller decides whether to resample.
+ * `requires_reference_audio` exists so a server can REFUSE a request before
+ * staging tens of gigabytes: true for a family with no text-only synthesis,
+ * false for one conditioned on text alone.
+ *
+ * A MUSIC family takes TWO texts. `lyrics` and `description` are separate
+ * fields rather than one `text` behind a separator, because upstream runs a
+ * DIFFERENT normalizer over each (encoders.py:54-91); a one-utterance family
+ * keeps using `text` and ignores them. Every generation control is inert at its
+ * zero value, which selects the family's own default — EXCEPT `guidance_scale`,
+ * which carries `has_guidance_scale` beside it (the vllm_video_params.has_seed
+ * precedent) because 0 IS A LEGAL GUIDANCE SCALE and a 0-means-default sentinel
+ * would make the unconditional branch unreachable.
+ *
+ * Purely additive: no struct changed, no existing signature moved, and a pre-v19
+ * caller that never touches a speech symbol is byte-identical. A directory no
+ * speech family claims is refused NAMING every family that was tried, because
+ * the wrong family does not fail, it renders noise. */
+#define VLLM_ABI_VERSION 20
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -853,8 +884,16 @@ typedef struct vllm_video_params {
   /* Where frame_%06d.ppm + audio.wav land (created if absent). REQUIRED. */
   const char* output_dir;
   /* v18: FAMILY-SPECIFIC per-generation settings, same parallel-array shape as
-   * the load-time extras. MiniMax-H3 defines none, and refuses any key it does
-   * not know rather than ignoring it. 0 => none. */
+   * the load-time extras. Every family refuses a key it does not know rather
+   * than ignoring it. 0 => none.
+   *   MiniMax-H3: none.
+   *   LTX-2.5:    "image_crf" — the H.264 CRF an image conditioning is
+   *               re-compressed at. Only "0" is served; an LTX-2.5 checkpoint
+   *               RESOLVES 18 when this is absent and the codec round trip is
+   *               unported, so leaving it out refuses BY NAME rather than
+   *               rendering. "0" is upstream-legal and out of distribution;
+   *               see docs/USAGE.md. No ABI change was needed for it, which is
+   *               what this parallel-array shape exists for. */
   const char* const* extra_keys;
   const char* const* extra_values;
   int32_t n_extras;
@@ -923,6 +962,112 @@ VLLM_API vllm_video_mux_params vllm_video_mux_params_default(void);
 VLLM_API vllm_status vllm_video_mux_argv(const vllm_video_mux_params* params,
                                          char*** out_argv, int32_t* out_argc);
 VLLM_API void vllm_video_mux_argv_free(char** argv, int32_t argc);
+
+/* ── Speech + music generation (ABI v20) ─────────────────────────────────────
+ * The C face of vllm::multimodal::SpeechEngine: text (and, for a music family,
+ * lyrics + a structured description) in, a waveform out, through the SAME
+ * library seam the bundled server's /v1/audio/speech route drives — so HTTP and
+ * FFI cannot drift.
+ *
+ * A speech engine is loaded from a checkpoint SET (MiniMax-Music3 ships six
+ * component directories beside a modular_model_index.json), not from one model
+ * directory, which is why this is a separate handle from vllm_engine. Loading a
+ * TEXT checkpoint here fails naming vllm_engine_load; a directory NO registered
+ * family claims is refused naming every family that was tried, because the
+ * wrong family would not fail — it would render noise. */
+typedef struct vllm_speech_engine vllm_speech_engine;
+
+typedef struct vllm_speech_model_params {
+  /* The checkpoint set's root directory. REQUIRED. */
+  const char* path;
+  /* The family to load, e.g. "minimax-music3". NULL/empty (the zero value)
+   * DETECTS it by inspecting the artifact. An unregistered name is refused
+   * naming what IS registered; it is never treated as a hint. */
+  const char* family;
+} vllm_speech_model_params;
+
+typedef struct vllm_speech_params {
+  /* ── One-utterance families (IndexTTS-2.5) ─────────────────────────────── */
+  const char* text;
+  const char* language; /* NULL/empty => the family's default */
+  /* The reference clip, for a family whose requires_reference_audio() is 1.
+   * `reference_audio` is n_reference_audio interleaved-free mono f32 samples in
+   * [-1, 1); NULL/0 means none. Borrowed for the call. */
+  const float* reference_audio;
+  int64_t n_reference_audio;
+  int32_t reference_sample_rate;
+
+  /* ── Music families (MiniMax-Music3) ───────────────────────────────────────
+   * TWO texts, not one: upstream normalizes the sung lyrics and the structured
+   * description differently, so packing both into `text` behind a separator
+   * would be a private protocol. A one-utterance family ignores both. */
+  const char* lyrics;      /* with [Verse]/[Chorus] section tags */
+  const char* description; /* genre, BPM, key, instrumentation, mood */
+
+  /* ── Generation controls; every zero selects the family's own default ───── */
+  double audio_duration_s;     /* <= 0 => family default */
+  int32_t num_inference_steps; /* <= 0 => family default */
+  double guidance_scale;       /* honoured ONLY when has_guidance_scale != 0 */
+  /* 0 IS A LEGAL guidance scale (it selects the unconditional branch), so the
+   * "use the family default" signal cannot be the value 0 and is this flag
+   * instead — the vllm_video_params.has_seed precedent. */
+  int32_t has_guidance_scale;
+  int64_t seed;
+} vllm_speech_params;
+
+/* One rendered waveform. OWNERSHIP: every pointer is library-allocated; free
+ * the struct's members via vllm_speech_result_free(out).
+ *   - samples: CHANNEL-MAJOR f32, channels * n_samples entries — channel c
+ *     occupies samples[c*n_samples .. (c+1)*n_samples);
+ *   - n_samples: samples PER CHANNEL;
+ *   - sample_rate: the family's NATIVE rate, never resampled;
+ *   - wav / n_wav: the same waveform as RIFF/WAVE 16-bit PCM, interleaved, so
+ *     a caller can write or serve a playable file without a second encoder. */
+typedef struct vllm_speech_result {
+  float* samples;
+  int64_t n_samples;
+  int32_t sample_rate;
+  int32_t channels;
+  char* wav;
+  int64_t n_wav;
+} vllm_speech_result;
+
+/* Zero-initialized params. For the model params that means "detect the family";
+ * for the generation params it means every control at its family default. */
+VLLM_API vllm_speech_model_params vllm_speech_model_params_default(void);
+VLLM_API vllm_speech_params vllm_speech_params_default(void);
+
+/* Resolve the checkpoint set to a registered family and stage its weights once.
+ * On VLLM_OK, *out is a handle the caller frees via vllm_speech_engine_free.
+ * On error, *out is NULL and vllm_last_error() carries the detail: a directory
+ * nothing claims maps to VLLM_ERR_MODEL_LOAD listing the families tried. */
+VLLM_API vllm_status vllm_speech_engine_load(const vllm_speech_model_params* params,
+                                             vllm_speech_engine** out);
+VLLM_API void vllm_speech_engine_free(vllm_speech_engine* engine);
+
+/* Which family this handle RESOLVED to. Library-owned storage, valid for the
+ * lifetime of the handle; the caller must NOT free it. NULL engine => NULL. */
+VLLM_API const char* vllm_speech_engine_family(const vllm_speech_engine* engine);
+/* The family's NATIVE output rate in Hz (44100 for MiniMax-Music3). 0 for a
+ * NULL handle. */
+VLLM_API int32_t vllm_speech_engine_sample_rate(const vllm_speech_engine* engine);
+/* 1 when the family cannot synthesize without a reference clip, 0 when it can
+ * synthesize from text alone, and 0 for a NULL handle. Ask BEFORE building a
+ * request, so a missing clip is a caller-side refusal rather than a failed job. */
+VLLM_API int32_t vllm_speech_engine_requires_reference_audio(const vllm_speech_engine* engine);
+
+/* Run one BLOCKING synthesis, filling *out. Serialized per engine handle.
+ * VLLM_ERR_INVALID_ARGUMENT for a NULL engine/params/out;
+ * VLLM_ERR_RUNTIME when the family refuses the request (a field it cannot
+ * honour, a missing reference clip, a stage that is not implemented) or the
+ * forward fails. On any non-OK status *out is zeroed. */
+VLLM_API vllm_status vllm_synthesize(vllm_speech_engine* engine,
+                                     const vllm_speech_params* params,
+                                     vllm_speech_result* out);
+
+/* Free the owned members of a result and zero the struct. The struct itself is
+ * caller storage. NULL is a no-op. */
+VLLM_API void vllm_speech_result_free(vllm_speech_result* out);
 
 /* ── Memory helpers ───────────────────────────────────────────────────────────
  * Free a heap string returned by the library. NULL is a no-op. */

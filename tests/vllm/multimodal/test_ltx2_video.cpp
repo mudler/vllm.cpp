@@ -40,6 +40,7 @@
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
+#include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — the seam the engine asks
 #include "vllm.h"
 #include "vt/backend.h"
@@ -683,38 +684,305 @@ TEST_CASE("ltx2 video: the recipe comes from the CHECKPOINT's own model_version"
   }
 }
 
-TEST_CASE("ltx2 video: keyframe and reference conditioning is refused by name") {
+// A binary PPM the engine can actually condition on. Deliberately NOT the
+// generation's own resolution: `load_image_and_preprocess` aspect-fills and
+// centre-crops to the phase's height/width (media_io/resize.py:41-73), and an
+// image that already fits would leave that untested.
+std::string ConditioningPpm(int height, int width, unsigned seed) {
+  std::string out = "P6\n" + std::to_string(width) + " " + std::to_string(height) + "\n255\n";
+  for (int i = 0; i < height * width * 3; ++i) {
+    out.push_back(static_cast<char>((i * 37 + static_cast<int>(seed) * 101) % 251));
+  }
+  return out;
+}
+
+// BOTH phases, which for image conditioning is not a detail: the two-stage
+// recipe renders its stages at DIFFERENT resolutions, so the image is decoded,
+// resized and encoded once per phase against that phase's own height and width
+// (ltx-pipelines/utils/helpers.py:274-275 are the parameters; distilled.py:251,
+// :255-256 and :285-286 are where the two stages pass different values). A
+// `max_phase = 0` fixture would
+// leave the second encode — and the whole reason the conditioning lives inside
+// the phase loop — untested.
+vllm::multimodal::VideoModelParams ConditioningParams(const ltx2_fixture::Paths& paths) {
+  vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
+  mp.extras["upsampler_path"] = paths.upsampler;
+  return mp;
+}
+
+TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS MISSING") {
+  // Row LTX25-IMAGE-COND (#644) SPLIT this refusal. It used to cover every
+  // conditioning kind with one message whose reason was "no encoder weights can
+  // be materialized here" — true when written, and no longer: this engine now
+  // loads them through `Ltx2VideoVaeEncoderKeyRules`, and the first-frame arm is
+  // served (see the case below).
+  //
+  // So each surviving refusal is held to naming a DIFFERENT missing piece. The
+  // point is not that the message is long; it is that a later reader can go and
+  // check the named symbol and find out whether the reason still holds — which
+  // is the thing five refusals in this campaign failed at.
   Workspace ws;
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
-      vllm::multimodal::LoadVideoEngine(FixtureParams(ws.paths));
-  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/keyframed");
-  gen.first_frame_path = ws.paths.video_embeds;  // any path: the refusal precedes the read
-  try {
-    (void)engine->Generate(gen);
-    FAIL("keyframe conditioning must be refused while no encoder is reachable from here");
-  } catch (const std::exception& e) {
-    const std::string msg = e.what();
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+
+  auto refusal = [&](const char* what,
+                     void (*arm)(vllm::multimodal::VideoGenParams&, const Workspace&)) {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/refused");
+    arm(gen, ws);
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK(what << " must be refused, never dropped");
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+
+  SUBCASE("a LAST-frame keyframe names the TOKEN-APPEND machinery, not the embedding") {
+    const std::string msg = refusal("a last-frame keyframe",
+                                    [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
+                                      g.last_frame_path = w.paths.video_embeds;
+                                    });
     INFO(msg);
-    CHECK(msg.find("ImageConditioner") != std::string::npos);
-    // A refusal whose stated REASON has gone stale is worse than a vague one: it
-    // sends the next reader to build something that already exists. Phase L11
-    // ported the video VAE encoder, so the message may no longer claim the
-    // encoder is missing, and these two assertions hold it to the pieces that
-    // actually are — the loader path that would put encoder weights in memory,
-    // and the CRF re-compression upstream applies before encoding.
-    CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") != std::string::npos);
-    CHECK(msg.find("default_image_crf") != std::string::npos);
-    // And the QUALIFIER on that re-compression, which the two substrings above do
-    // not reach: `preprocess` returns the image UNTOUCHED at `crf == 0`
-    // (media_io/decode.py:413-435, the `if crf == 0:` early return at :425-426 —
-    // NOT the one at :427-428, which is the degenerate-size guard), so "re-compresses
-    // before encoding" is only true of a nonzero resolved CRF. Naming the round
-    // trip without naming its exception overstates what is unported and sends the
-    // next reader to build an H.264 path for a case that needs none — the same
-    // failure mode as a stale reason, one step subtler. Gated here so deleting the
-    // qualifier goes RED rather than quietly restoring the overstatement.
-    CHECK(msg.find("unless that CRF is 0") != std::string::npos);
+    // THIS ASSERTION USED TO PIN A FALSE REASON. It required the message to
+    // blame `keyframes_abs_pos_embedding`, and at pin `fd4ded7f` that is not
+    // what blocks a supplied keyframe: `apply_to` appends it with
+    // `marked=False` (keyframe_cond.py:84-86) and the sole consumer adds
+    // `mask * embedding` (transformer_args.py:42-43, called at :269), so the
+    // embedding contributes exactly nothing to those tokens. Porting it would
+    // not serve this arm. The gate enforced the wrong thing, which is worse
+    // than not gating the message at all.
+    //
+    // What actually blocks it is the append: extended `positions`,
+    // `update_attention_mask`, extended `clean_latent` / `denoise_mask`, and
+    // `clear_conditioning` trimming back — none of which this engine's
+    // fixed-length phase loop can express.
+    CHECK(msg.find("update_attention_mask") != std::string::npos);
+    CHECK(msg.find("clear_conditioning") != std::string::npos);
+    CHECK(msg.find("keyframe_cond.py") != std::string::npos);
+    CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") == std::string::npos);
+    // The refuted reason may still be NAMED — it is worth telling a reader that
+    // it was ruled out — but never as the thing that is missing, and only next
+    // to the issue that tracks where the embedding really does bite (#658).
+    if (msg.find("keyframes_abs_pos_embedding") != std::string::npos) {
+      CHECK(msg.find("NOT* THE REASON") != std::string::npos);
+      CHECK(msg.find("#658") != std::string::npos);
+    }
   }
+  SUBCASE("a reference video names the IC-LoRA metadata this project does not read") {
+    const std::string msg = refusal("a reference video",
+                                    [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
+                                      g.ref_video_dir = w.root;
+                                    });
+    INFO(msg);
+    CHECK(msg.find("temporal_scale_factor") != std::string::npos);
+    CHECK(msg.find("LoRA") != std::string::npos);
+  }
+  SUBCASE("reference audio names the AUDIO encoder, which this row did not build") {
+    const std::string msg = refusal("reference audio",
+                                    [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
+                                      g.ref_audio_path = w.paths.audio_embeds;
+                                    });
+    INFO(msg);
+    CHECK(msg.find("audio VAE") != std::string::npos);
+    CHECK(msg.find("encode_audio") != std::string::npos);
+  }
+  SUBCASE("a non-zero CRF names the codec round trip, and says 0 is supported") {
+    // AND THIS IS THE DEFAULT PATH. An LTX-2.5 checkpoint resolves
+    // `default_image_crf = 18` (constants.py:37/124/130-133), so a caller who
+    // says nothing about the CRF lands here — which is what makes the
+    // out-of-distribution `crf = 0` arm a deliberate request rather than a
+    // silent downgrade.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/crf");
+    gen.first_frame_ppm = ConditioningPpm(20, 28, 3);
+    try {
+      (void)engine->Generate(gen);
+      FAIL("an unset CRF resolves 18 for a 2.5 checkpoint and must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("CRF 18") != std::string::npos);
+      CHECK(msg.find("encode_single_frame") != std::string::npos);
+      CHECK(msg.find("CRF 0 IS supported") != std::string::npos);
+    }
+  }
+  SUBCASE("an explicit non-zero CRF is refused just as an unset one is") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/crf33");
+    gen.first_frame_ppm = ConditioningPpm(20, 28, 4);
+    gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "33";
+    CHECK_THROWS_WITH_AS((void)engine->Generate(gen), doctest::Contains("CRF 33"),
+                         std::runtime_error);
+  }
+  SUBCASE("a mistyped per-generation extra is refused, not ignored") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/typo");
+    gen.first_frame_ppm = ConditioningPpm(20, 28, 5);
+    gen.extras["image_crf_"] = "0";
+    CHECK_THROWS_WITH_AS((void)engine->Generate(gen), doctest::Contains("image_crf_"),
+                         std::runtime_error);
+  }
+}
+
+TEST_CASE("ltx2 video: an image at crf 0 conditions the render, and the ENCODER weights are read") {
+  // The arm row LTX25-IMAGE-COND (#644) opened. Two separate claims are made
+  // here and they are NOT the same claim:
+  //
+  //   1. the conditioning REACHES the render — the trace reports the encoded
+  //      image, and a different image gives a different digest; and
+  //   2. the ENCODER WEIGHTS are READ — perturbing ONE encoder tensor in the
+  //      checkpoint moves the digest, with every byte of the REQUEST identical.
+  //
+  // (2) is the one that is easy to fake. A path that loaded the weights and then
+  // conditioned on something else — zeros, the raw pixels, a re-used decoder
+  // tensor — satisfies (1) completely.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/img");
+  gen.first_frame_ppm = ConditioningPpm(20, 28, 1);
+  gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  CHECK(trace.completed);
+  CHECK(trace.image_crf == 0);
+  CHECK(trace.image_strength == 1.0);  // noise_aug defaults to 1.0 => the frame is PINNED
+  // WHICH PHASE this describes is the claim, and `image_tokens > 0` did not make
+  // it. MEASURED: changing the guard to `wants_image && phase_index == 0` — the
+  // shape of an obvious refactor that hoists the per-phase decode+encode out of
+  // the loop — left this whole binary at 32 cases / 550 assertions / exit 0
+  // while `refine`, the phase whose latent is actually rendered, ran with the
+  // pinned frame re-noised away. The design's own reason for living inside the
+  // loop (spec section 8.5) was gated by nothing.
+  //
+  // So the count is pinned to the LAST phase's per-latent-frame token count.
+  // This fixture's two-stage recipe runs `generate_lowres` at
+  // `spatial_downscale = 2` and `refine` at 1, so the latent grid doubles in
+  // each spatial dimension and the placed count is 1 then 4 — a per-phase value,
+  // which is exactly why `image_tokens == 4` falsifies a stage-1-only build.
+  constexpr int64_t kRefineImageTokens = 4;
+  CHECK(trace.image_tokens == kRefineImageTokens);
+  CHECK(trace.image_digest != 0);
+  // A conditioning that collapsed to zeros would give every image the same
+  // digest and still satisfy every check below it, so the magnitude is asked for
+  // separately — the same reason `video_absmax` exists next to `video_digest`.
+  CHECK(trace.image_absmax > 0.0);
+  // The render still produced its artifacts; conditioning is not a bypass.
+  CHECK(result.frame_count == 9);
+
+  SUBCASE("the trace describes the LAST phase, and stage 1 is a different count") {
+    // The other half of the same claim, and the half a literal cannot make: the
+    // number above is not a constant of the fixture, it TRACKS the phase that
+    // ran last. Same request, capped at phase 0, must report stage 1's smaller
+    // count — and the ratio is checked between two MEASURED values rather than
+    // between two compile-time constants, which would assert nothing.
+    // `max_phase` is a LOAD-time extra, not a per-generation one, so the cap
+    // needs its own engine over the same fixture.
+    vllm::multimodal::VideoModelParams capped = ConditioningParams(ws.paths);
+    capped.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+    const std::unique_ptr<vllm::multimodal::VideoEngine> stage1_engine =
+        vllm::multimodal::LoadVideoEngine(capped);
+    auto* stage1_ltx2 =
+        dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(stage1_engine.get());
+    REQUIRE(stage1_ltx2 != nullptr);
+    vllm::multimodal::VideoGenParams lowres = FixtureGen(ws.root + "/img_stage1");
+    lowres.first_frame_ppm = ConditioningPpm(20, 28, 1);
+    lowres.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    (void)stage1_engine->Generate(lowres);
+    const vllm::multimodal::Ltx2ConditioningTrace stage1 = stage1_ltx2->last_conditioning();
+    CHECK(stage1.image_tokens == 1);
+    CHECK(trace.image_tokens == 4 * stage1.image_tokens);
+    // And it is a DIFFERENT encode, not the same one carried forward: the image
+    // is resized and encoded against each phase's own height and width
+    // (ltx-pipelines/utils/helpers.py:274-275, per-stage h/w at
+    // distilled.py:251, 255-256, 285-286).
+    CHECK(stage1.image_digest != trace.image_digest);
+  }
+
+  SUBCASE("a DIFFERENT image is a different conditioning") {
+    vllm::multimodal::VideoGenParams other = FixtureGen(ws.root + "/img2");
+    other.first_frame_ppm = ConditioningPpm(20, 28, 2);
+    other.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    (void)engine->Generate(other);
+    CHECK(ltx2->last_conditioning().image_digest != trace.image_digest);
+  }
+
+  SUBCASE("the SAME image is the same conditioning") {
+    vllm::multimodal::VideoGenParams again = FixtureGen(ws.root + "/img3");
+    again.first_frame_ppm = ConditioningPpm(20, 28, 1);
+    again.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    (void)engine->Generate(again);
+    CHECK(ltx2->last_conditioning().image_digest == trace.image_digest);
+  }
+
+  SUBCASE("the ENCODER's own weights decide the conditioning") {
+    // ONE tensor of the encoder half, perturbed in a SECOND fixture, with the
+    // request byte-identical. If the engine were conditioning on anything but
+    // the encoder's output — or had loaded the DECODER's tensors under the
+    // encoder's names — this digest would not move.
+    Workspace mutated;
+    const std::string path = mutated.paths.video_vae;
+    std::string bytes = ReadAll(path);
+    // The PAYLOAD is what gets perturbed, and its position is READ from the
+    // safetensors header rather than guessed at. An earlier revision of this
+    // case searched for the tensor's NAME and flipped a byte a fixed distance
+    // past it, which lands inside the JSON header of whatever tensor happens to
+    // be stored next — the file still parsed, the render still ran, and the
+    // digest did not move. The case failed, which is the only reason that is a
+    // footnote and not a false green.
+    REQUIRE(bytes.size() > 8);
+    uint64_t header_len = 0;
+    std::memcpy(&header_len, bytes.data(), sizeof(header_len));
+    REQUIRE(8 + header_len <= bytes.size());
+    const nlohmann::json header =
+        nlohmann::json::parse(bytes.substr(8, static_cast<size_t>(header_len)));
+    const std::string needle = "encoder.conv_in.conv.weight";
+    REQUIRE_MESSAGE(header.contains(needle),
+                    "the fixture must carry an encoder half for this to prove anything");
+    const size_t data_start =
+        8 + static_cast<size_t>(header_len) +
+        header.at(needle).at("data_offsets").at(0).get<size_t>();
+    REQUIRE(data_start + 1 < bytes.size());
+    // bf16 is stored little-endian, so byte 0 of a word carries the mantissa's
+    // top bits; flipping 0x40 there moves that ONE weight by ~50% without any
+    // risk of manufacturing an Inf or a NaN out of the exponent — which would
+    // change the digest for a reason that has nothing to do with this claim.
+    bytes[data_start] = static_cast<char>(bytes[data_start] ^ 0x40);
+    {
+      std::ofstream out(path, std::ios::binary | std::ios::trunc);
+      REQUIRE(out.good());
+      out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+    const std::unique_ptr<vllm::multimodal::VideoEngine> other =
+        vllm::multimodal::LoadVideoEngine(ConditioningParams(mutated.paths));
+    auto* other_ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(other.get());
+    REQUIRE(other_ltx2 != nullptr);
+    vllm::multimodal::VideoGenParams same = FixtureGen(mutated.root + "/img");
+    same.first_frame_ppm = ConditioningPpm(20, 28, 1);
+    same.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    (void)other->Generate(same);
+    CHECK(other_ltx2->last_conditioning().image_digest != trace.image_digest);
+  }
+}
+
+TEST_CASE("ltx2 video: a request WITHOUT an image leaves the trace's image fields empty") {
+  // Otherwise "this render was conditioned on an image" and "this render was
+  // not" would be indistinguishable after the fact, which is the one question
+  // `Ltx2ConditioningTrace` exists to answer.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  (void)engine->Generate(FixtureGen(ws.root + "/plain"));
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  CHECK(trace.completed);
+  CHECK(trace.image_tokens == 0);
+  CHECK(trace.image_digest == 0);
+  CHECK(trace.image_absmax == 0.0);
+  CHECK(trace.image_strength == 0.0);
 }
 
 
@@ -1027,6 +1295,34 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     // upstream's SDOps drop it.
     CHECK(!weights.Has("encoder.conv_in.conv.weight"));
     MESSAGE("shipped conv video VAE: " << weights.tensors.size() << " decoder tensors");
+
+    // ...and the ENCODER half of the SAME file resolves through the other
+    // filter (row LTX25-IMAGE-COND, #644). This is the only place the encoder
+    // load path meets a real shipped checkpoint rather than the fixture, so it
+    // is the only place the CHANNEL arithmetic can be wrong in a way the fixture
+    // agrees with: `latent_channels` is 128 while the top-level `out_channels`
+    // is 3, and reading the second builds a 3-channel-latent encoder that runs.
+    REQUIRE(vllm::Ltx2CheckpointHasVideoEncoder(file.Names()));
+    const vllm::Ltx2ConvVideoEncoderConfig enc =
+        vllm::Ltx2ParseConvVideoEncoderConfig(vllm::Ltx2ReadCheckpointConfig(file));
+    CHECK(enc.out_channels == 128);
+    CHECK(enc.in_channels == 3);
+    CHECK(enc.patch_size == cfg.patch_size);
+    // The encoder's block list must multiply out to the SAME scale factors the
+    // decoder's does, or an encoded image does not fit the grid it is placed in.
+    CHECK(vllm::Ltx2VideoSpatialScaleFactor(enc.encoder_blocks, enc.patch_size) == spatial);
+    CHECK(vllm::Ltx2VideoTemporalScaleFactor(enc.encoder_blocks) == temporal);
+    const vllm::Ltx2VaeWeights enc_weights =
+        vllm::Ltx2LoadVaeWeights(file, vllm::Ltx2VideoVaeEncoderKeyRules());
+    CHECK(enc_weights.Has("conv_in.conv.weight"));
+    CHECK(enc_weights.Has("conv_out.conv.weight"));
+    // The encoder normalizes its output by these (video_vae.py:336), so the
+    // filter has to carry them even though they are not `encoder.*` keys.
+    CHECK(enc_weights.Has("per_channel_statistics.std-of-means"));
+    // And the DECODER's half must be dropped, or the two bags would collide on
+    // names like `conv_in.conv.weight` and bind half a model to the other half.
+    CHECK(!enc_weights.Has("decoder.conv_in.conv.weight"));
+    MESSAGE("shipped conv video VAE: " << enc_weights.tensors.size() << " encoder tensors");
   }
 
   SUBCASE("the audio VAE and its BWE vocoder load and configure") {
@@ -1786,11 +2082,17 @@ TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
   // was never produced, and every field would look entirely healthy: real
   // prompt, non-zero absmax, plausible digests.
   //
-  // THE PROBE IS A REAL REFUSAL, not an injected one. Keyframe / reference
-  // conditioning is refused by name (ltx2_video.cpp, the `ImageConditioner`
-  // note) and that refusal sits AFTER the trace is written, so a prompted
-  // request carrying a reference image walks the whole encode path, fills the
-  // trace, and then fails — exactly the shape this flag exists to report.
+  // THE PROBE IS A REAL REFUSAL, not an injected one. Reference conditioning is
+  // refused by name (ltx2_video.cpp, the `ImageConditioner` note) and that
+  // refusal sits AFTER the trace is written, so a prompted request carrying a
+  // reference image walks the whole encode path, fills the trace, and then
+  // fails — exactly the shape this flag exists to report.
+  //
+  // IT IS STILL A REFUSAL AFTER ROW LTX25-IMAGE-COND (#644), which served the
+  // first-frame arm and would have made a `first_frame_ppm` probe stop
+  // refusing. The reference arm stays refused for a reason this row did not
+  // touch (the IC-LoRA scale factors), so the probe was moved to it rather than
+  // to whatever happened to still throw.
   Workspace ws;
   const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
@@ -1803,11 +2105,11 @@ TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
   gen.ref_image_paths.push_back(ws.root + "/nonexistent-reference.png");
   try {
     (void)engine->Generate(gen);
-    FAIL("keyframe / reference conditioning must be refused");
+    FAIL("reference conditioning must be refused");
   } catch (const std::exception& e) {
     const std::string msg = e.what();
     INFO(msg);
-    CHECK(msg.find("reference conditioning") != std::string::npos);
+    CHECK(msg.find("reference-image / reference-video conditioning") != std::string::npos);
   }
 
   const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();

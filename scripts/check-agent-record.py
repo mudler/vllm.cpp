@@ -485,7 +485,17 @@ ENGINE_PREFIXES = (
 # rows are real and neither replaces the other, which is why this line reads 154
 # rather than restating 153. `READY`, spec `specs/upstream-omni-pin.md`, issue #633.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 154
+# 155 since 2026-08-14: +`ENG-HYBRID-PLACEMENT` (per-tensor-group device placement,
+# delivering routed-MoE expert COMPUTE on the CPU backend while the rest of the
+# model stays on GPU). Genuinely new, not a restatement of either offload row it
+# sits beside: `ENG-WEIGHT-OFFLOAD` and `ENG-EXPERT-STREAM` both move weights
+# toward the compute, and this row moves compute toward the weights, so no
+# existing row can express it. Surpass-track — vLLM ships CPU MoE kernels but
+# selects them platform-wide via `current_platform.is_cpu()`, so hybrid placement
+# is absent at the pin and the gate runs against llama.cpp `237ad9b96`.
+# `READY`, spec `specs/hybrid-placement.md`, issue #149.
+# Bumped for a real new row, never to make a failing state transition pass.
+ENGINE_ROWS = 155
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

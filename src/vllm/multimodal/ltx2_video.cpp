@@ -26,13 +26,16 @@
 #include "vllm/model_executor/models/device_pool.h"  // ActivePool(b)/DevicePool::Drain
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
+#include "vllm/model_executor/models/ltx2_conditioning.h"
 #include "vllm/model_executor/models/ltx2_connector.h"
 #include "vllm/model_executor/models/ltx2_device.h"
+#include "vllm/model_executor/models/ltx2_image_preprocess.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
+#include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/platforms/interface.h"  // CurrentPlatform() — which accelerator, if any
 #include "vllm/tokenizer/tokenizer.h"
@@ -243,7 +246,7 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
     if (consumed != raw.size()) throw std::invalid_argument("trailing");
     return static_cast<int64_t>(value);
   } catch (const std::exception&) {
-    Fail("the load extra '" + key + "' is '" + raw + "', which is not an integer");
+    Fail("the extra '" + key + "' is '" + raw + "', which is not an integer");
   }
 }
 
@@ -440,6 +443,18 @@ struct Ltx2VideoEngine::Impl {
   Ltx2VideoDecoderKind video_kind = Ltx2VideoDecoderKind::kConv;
   Ltx2ConvVideoDecoderConfig video_cfg;
   Ltx2VaeWeights video_weights;
+
+  // The ENCODER half of the same file (row LTX25-IMAGE-COND, issue #644). Its
+  // absence is what every conditioning arm was refused for: before this row the
+  // load below materialized `Ltx2VideoVaeDecoderKeyRules()` alone and no encoder
+  // key filter existed anywhere in the tree, so `Ltx2ConvVideoEncode` — ported
+  // and gated since phase L11 — had no weights to run on.
+  //
+  // A Comfy-split `vae/` file may carry the decoder alone, so this is OPTIONAL
+  // and its absence is reported by name at the request rather than guessed at.
+  bool has_video_encoder = false;
+  Ltx2ConvVideoEncoderConfig video_encoder_cfg;
+  Ltx2VaeWeights video_encoder_weights;
 
   Ltx2AudioDecoderConfig audio_cfg;
   Ltx2VaeWeights audio_weights;
@@ -773,8 +788,46 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   if (params.video_vae_path.empty()) Fail("video_vae_path is required");
   {
     const SafetensorsFile f = SafetensorsFile::Open(params.video_vae_path);
-    im.video_cfg = Ltx2ParseConvVideoDecoderConfig(Ltx2ReadCheckpointConfig(f), &im.video_kind);
+    const nlohmann::json vae_config = Ltx2ReadCheckpointConfig(f);
+    im.video_cfg = Ltx2ParseConvVideoDecoderConfig(vae_config, &im.video_kind);
     im.video_weights = Ltx2LoadVaeWeights(f, Ltx2VideoVaeDecoderKeyRules());
+
+    // `ImageConditioner` builds its VideoEncoder from the SAME checkpoint with
+    // `VAE_ENCODER_COMFY_KEYS_FILTER` (blocks.py:956-961). It builds it lazily
+    // and frees it after the callable returns (:988-993); this engine keeps it
+    // resident instead, because the encoder is small next to the DiT and a
+    // conditioning image arrives per request. That is a deliberate divergence
+    // from upstream's lifecycle and nothing else: same filter, same
+    // configurator, same weights.
+    if (Ltx2CheckpointHasVideoEncoder(f.Names())) {
+      im.video_encoder_cfg = Ltx2ParseConvVideoEncoderConfig(vae_config);
+      im.video_encoder_weights = Ltx2LoadVaeWeights(f, Ltx2VideoVaeEncoderKeyRules());
+      im.has_video_encoder = true;
+
+      // The encoder's LATENT WIDTH against the DiT's input, asserted rather
+      // than assumed. `_prepare_video_encoder_kwargs` reads it from
+      // `latent_channels` and NOT from the top-level `out_channels`
+      // (model_configurator.py:41-43); a config that got that wrong builds a
+      // 3-channel-latent encoder that still runs, still returns a latent, and
+      // conditions the DiT on a tensor of the wrong width.
+      if (im.video_encoder_cfg.out_channels != im.dit.params.in_channels) {
+        Fail("the video VAE encoder emits " +
+             std::to_string(im.video_encoder_cfg.out_channels) +
+             " latent channels but the DiT takes " +
+             std::to_string(im.dit.params.in_channels) +
+             ". `_prepare_video_encoder_kwargs` reads this from `vae.latent_channels`, never "
+             "from the top-level `vae.out_channels`, which is the DECODER's RGB count "
+             "(video_vae/model_configurator.py:41-42, and the flat-layout read at :52).");
+      }
+      // And its INPUT width, for the same reason in the other direction: the
+      // encoder takes RGB, and a config declaring otherwise would silently
+      // reinterpret the image planes.
+      if (im.video_encoder_cfg.in_channels != 3) {
+        Fail("the video VAE encoder declares " +
+             std::to_string(im.video_encoder_cfg.in_channels) +
+             " input channels; this seam supplies RGB");
+      }
+    }
   }
   if (im.video_cfg.in_channels != im.dit.params.out_channels) {
     Fail("the video VAE takes " + std::to_string(im.video_cfg.in_channels) +
@@ -1005,9 +1058,17 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   std::lock_guard<std::mutex> guard(im.mutex);
 
   if (gen.output_dir.empty()) Fail("output_dir is required");
-  if (!gen.extras.empty()) {
-    Fail("unknown per-generation extra '" + gen.extras.begin()->first +
-         "' (this family defines none)");
+  for (const auto& kv : gen.extras) {
+    // `image_crf` is the only per-generation extra this family defines (row
+    // LTX25-IMAGE-COND). Everything else is refused rather than ignored, for the
+    // reason `CheckKnownExtras` gives for the load side: a mistyped knob that is
+    // silently dropped renders the DEFAULT and looks like the feature not
+    // working — and for THIS knob the default is a refusal, so a typo would turn
+    // a served request into an unexplained one.
+    if (kv.first != kLtx2ImageCrfExtra) {
+      Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
+           std::string(kLtx2ImageCrfExtra));
+    }
   }
   if (!gen.prompt.empty() && !im.has_encoder) {
     Fail(
@@ -1135,27 +1196,125 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     im.trace.video_absmax = AbsMax(v);
     im.trace.audio_absmax = AbsMax(a);
   }
-  // Image / reference conditioning is `ImageConditioner` upstream
-  // (ltx-pipelines/utils/blocks.py:936-993, called at distilled.py:212). The
-  // ENCODER it needs is no longer what is missing — phase L11 ported it as
-  // `Ltx2ConvVideoEncode` — so the refusal names what actually is: this engine
-  // holds no encoder to call. Refused by name rather than dropped: a keyframe
-  // that is silently ignored renders an unconditioned clip that looks like the
-  // feature not working.
-  if (!gen.first_frame_path.empty() || !gen.first_frame_ppm.empty() ||
-      !gen.last_frame_path.empty() || !gen.ref_image_paths.empty() ||
-      !gen.ref_video_dir.empty() || !gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
+  // ── conditioning on pixels (row LTX25-IMAGE-COND, issue #644) ─────────────
+  //
+  // Upstream this is `ImageConditioner` (ltx-pipelines/utils/blocks.py:936-993,
+  // called at distilled.py:212) feeding `combined_image_conditionings`
+  // (utils/helpers.py:272-308). ONE of its four arms is served here, and the
+  // other three are refused BY NAME rather than dropped — a keyframe that is
+  // silently ignored renders an unconditioned clip that looks like the feature
+  // not working.
+  //
+  // THESE MESSAGES ARE WRITTEN TO BE RE-CHECKABLE, and the count is now SIX
+  // refusals in this campaign whose stated reason turned out to be false or
+  // stale. Two of the six stood right here. The first said no encoder weights
+  // could be materialized — true when written, and what this row fixed. The
+  // second replaced it and blamed `keyframes_abs_pos_embedding`, which was
+  // verifiably NOT the blocker at the pin (see the last-frame message below for
+  // the three anchors that refute it), and a test had been written to assert
+  // that wrong reason by name.
+  //
+  // So: name the exact symbol or upstream `file:line` that would have to change
+  // for the refusal to become false, never a category — and where a plausible
+  // reason has already been ruled OUT, say so and cite what ruled it out, so the
+  // next reader re-checks the claim instead of re-deriving the refutation. Local
+  // anchors are SYMBOLS, not line numbers in this file: same-file line numbers
+  // drift on every edit, which is how the previous message's citation went stale.
+  const bool wants_image = !gen.first_frame_path.empty() || !gen.first_frame_ppm.empty();
+  if (!gen.last_frame_path.empty()) {
     Fail(
-        "keyframe / reference conditioning is not ported for this family. The video VAE "
-        "ENCODER itself landed in phase L11 (Ltx2ConvVideoEncode), but nothing can reach it "
-        "from here: this engine materializes the DECODER key filter only, so no "
-        "VAE_ENCODER_COMFY_KEYS_FILTER / VideoEncoderConfigurator path "
-        "(video_vae/model_configurator.py:72, 267) puts encoder weights in memory, and "
-        "upstream resolves each image conditioning's CRF against the checkpoint's "
-        "default_image_crf when the caller left it unset (ImageConditioner.resolve_crf, "
-        "ltx-pipelines/utils/blocks.py:977-983) and then re-compresses through an H.264 "
-        "round trip unless that CRF is 0 (media_io/decode.py:413-435, from "
-        "load_image_and_preprocess :75), which this build does not do. Recorded as owed.");
+        "a LAST-frame keyframe is not served. What is missing is the TOKEN-APPEND machinery. "
+        "`Ltx2ConvVideoEncode` and `Ltx2ConditionVideoByKeyframe` are both ported and gated, "
+        "and this engine materializes encoder weights through Ltx2VideoVaeEncoderKeyRules, so "
+        "none of those is the gap. The gap is that `VideoConditionByKeyframeIndex.apply_to` "
+        "(conditioning/types/keyframe_cond.py:36-90) APPENDS tokens to the sequence: it "
+        "concatenates onto `latent`, `denoise_mask`, `positions` and `clean_latent` (:79-82), "
+        "gives the appended tokens their own pixel coordinates offset to `frame_idx` (:46-59), "
+        "and rebuilds the attention mask through `update_attention_mask` (:68-76) — and then "
+        "`clear_conditioning` (ltx_core/tools.py:88-105) trims those extra tokens back off "
+        "before unpatchify. This engine cannot do any of that yet: `Ltx2LatentState` has no "
+        "attention-mask field at all (see the note on its declaration in ltx2_conditioning.h), "
+        "and the phase loop is fixed at the target grid's token count — one "
+        "`Ltx2VideoTokenCount(vshape, 1)` feeds the sigma schedule, the `Ltx2ModalityInput` "
+        "handed to the DiT, and `Ltx2VideoUnpatchify`, with the clear step an explicit identity "
+        "because nothing was ever appended. Serving this arm means growing that sequence "
+        "through the DiT and trimming it back. Conditioning on the FIRST frame needs none of "
+        "it, which is why that arm IS served: `VideoConditionByLatentIndex` REPLACES tokens "
+        "that already exist (conditioning/types/latent_cond.py:38-39) and the token count never "
+        "changes. WHAT IS *NOT* THE REASON, because this refusal used to say it was: "
+        "`keyframes_abs_pos_embedding`. A SUPPLIED keyframe is appended with `marked=False` "
+        "(keyframe_cond.py:84-86, whose comment says given keyframe content carries no keyframe "
+        "marker), and its sole consumer adds `mask * embedding` with `mask = keyframes_mask > 0` "
+        "(model/transformer/transformer_args.py:42-43, called once at :269) — so on exactly "
+        "these tokens the embedding contributes nothing, and porting it would not serve this "
+        "arm. The tokens that DO reach it are the target's own first latent frame, marked "
+        "unconditionally by `_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) — which "
+        "is the frame the SERVED first-frame arm writes into. That omission is real and is "
+        "tracked as issue #658; it is not what blocks a last-frame keyframe.");
+  }
+  if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
+    Fail(
+        "reference-image / reference-video conditioning is not served. The encoder and the "
+        "placement are both here — `Ltx2ConditionVideoByReference` is ported and gated — but "
+        "it takes a `downscale_factor` and a `temporal_scale_factor` that must match what the "
+        "IC-LoRA was TRAINED with (conditioning/types/reference_video_cond.py:36-37, applied at "
+        ":65-77), and "
+        "upstream carries those in the LoRA's own metadata, which this project does not read. "
+        "A guessed pair places the reference plausibly and wrongly, which no output check can "
+        "see, so it is refused instead. Use first_frame_ppm / first_frame_path for "
+        "image-to-video.");
+  }
+  if (!gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
+    Fail(
+        "reference-AUDIO conditioning is not served. `Ltx2ConditionAudioByReference` is ported "
+        "and gated (conditioning/types/reference_audio_cond.py:34-65), and what it needs is an "
+        "encoded waveform: `encode_audio` through the audio VAE's ENCODER "
+        "(ltx-pipelines/utils/helpers.py:264-269). This row built the VIDEO encoder's load "
+        "path only — there is no AUDIO_VAE_ENCODER key filter — so nothing can turn a WAV into "
+        "audio latents here. Recorded as owed.");
+  }
+
+  // The CRF, resolved the way `ImageConditioner.resolve_crf` resolves it
+  // (blocks.py:966-983) over `detect_params` (utils/constants.py:166-179): from
+  // the CHECKPOINT's own generation when the caller left it unset. For LTX-2.5
+  // that is 18, and 18 is not ported — so the DEFAULT REFUSES and a caller has
+  // to ask for 0 knowingly. Resolved and checked BEFORE any pixel is read, so an
+  // unsupported request costs nothing and reports the same thing every time.
+  int64_t image_crf = 0;
+  double image_strength = 0.0;
+  std::string image_bytes;
+  if (wants_image) {
+    if (!im.has_video_encoder) {
+      Fail(
+          "an image conditioning was supplied but the video VAE checkpoint at '" +
+          im.params.video_vae_path +
+          "' carries no ENCODER half: no tensor in it is named `vae.encoder.*` or `encoder.*`, "
+          "which is what `VAE_ENCODER_COMFY_KEYS_FILTER` matches "
+          "(video_vae/model_configurator.py:267-276). A Comfy-split `vae/` file holding the "
+          "decoder alone reads exactly like this. Supply the monolithic VAE checkpoint, or the "
+          "encoder file, rather than rendering unconditioned.");
+    }
+    image_crf = ExtraInt(gen.extras, kLtx2ImageCrfExtra,
+                         Ltx2ResolveDefaultImageCrf(Ltx2ParseModelVersion(im.model_version)));
+    // Throws by name at any non-zero value, naming the unported codec round
+    // trip and saying that 0 is the supported — and out-of-distribution — one.
+    Ltx2PreprocessImageCrf(image_crf);
+
+    // `ImageConditioningInput.strength` (utils/args.py:64). The seam's
+    // `noise_aug` is documented as "keyframe pinning strength; <= 0 => 1.0"
+    // (include/vllm.h), which is the same polarity: 1 pins, and the item turns
+    // it into `denoise_mask = 1 - strength` (latent_cond.py:41).
+    image_strength = gen.noise_aug > 0.0 ? gen.noise_aug : 1.0;
+    if (image_strength > 1.0) {
+      Fail("the image conditioning strength is " + std::to_string(image_strength) +
+           "; upstream's denoise mask is `1 - strength` (latent_cond.py:41) and a strength "
+           "above 1 makes it negative, which the noiser extrapolates PAST the clean latent "
+           "rather than toward it (components/noisers.py:33)");
+    }
+    image_bytes = gen.first_frame_ppm.empty() ? ReadFileBytes("first_frame", gen.first_frame_path)
+                                              : gen.first_frame_ppm;
+    im.trace.image_crf = image_crf;
+    im.trace.image_strength = image_strength;
   }
 
   // ── geometry ──────────────────────────────────────────────────────────────
@@ -1286,7 +1445,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       video_initial = up.data;
     }
 
-    // ── build the two states (create_noised_state, helpers.py:428-447) ───────
+    // ── build the two states (create_noised_state, helpers.py:428-445) ───────
     StreamState video;
     video.width = vshape.channels;  // patch_size 1 (VideoLatentPatchifier(1))
     video.tokens = Ltx2VideoTokenCount(vshape, 1);
@@ -1340,8 +1499,93 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       audio.positions.assign(timings.begin(), timings.end());
     }
 
+    // ── the image conditioning (issue #644) ─────────────────────────────────
+    //
+    // BEFORE THE NOISER AND AFTER THE STATE, which is upstream's order
+    // (`create_noised_state`, helpers.py:428-445: initial state, THEN the
+    // conditioning items, THEN the noiser) and is not interchangeable: the
+    // item writes ONLY `clean_latent` and `denoise_mask` (latent_cond.py:38-39)
+    // and the noiser is what composes them into the noisy tensor
+    // (components/noisers.py:31-34). Applying it afterwards leaves the
+    // conditioned tokens pinned to NOISE, with an identical clean tensor and an
+    // identical mask — so nothing but the noised latent itself can see it.
+    //
+    // PER PHASE, and encoded per phase, because the two-stage recipe renders its
+    // stages at DIFFERENT resolutions (`phase.spatial_downscale`) and upstream
+    // passes each stage's own height/width to `combined_image_conditionings`,
+    // whose `height` / `width` are per-call parameters (helpers.py:274-275) that
+    // distilled.py fills differently per stage: `stage_1_w, stage_1_h = width //
+    // 2, height // 2` at :251 passed at :255-256, against the full-resolution
+    // `height` / `width` at :285-286. Conditioning stage 1 only would let stage 2 re-noise
+    // the pinned frame away; conditioning stage 2 with stage 1's latent would
+    // place a half-resolution image into a full-resolution grid.
+    if (wants_image) {
+      const std::vector<float> pixels = Ltx2LoadImageAndPreprocess(
+          "first_frame", image_bytes, phase_h, phase_w, image_crf);
+      int64_t cropped = 0;
+      const Ltx2LatentVolume encoded = Ltx2ConvVideoEncode(
+          im.video_encoder_cfg, im.video_encoder_weights, pixels,
+          im.video_encoder_cfg.in_channels, /*frame_count=*/1, phase_h, phase_w, &cropped);
+      if (encoded.frames != 1) {
+        Fail("the video VAE encoder returned " + std::to_string(encoded.frames) +
+             " latent frames for a single image; `VideoConditionByLatentIndex` places one "
+             "(ltx-pipelines/utils/helpers.py:294-300)");
+      }
+      if (encoded.channels != vshape.channels || encoded.height != vshape.height ||
+          encoded.width != vshape.width) {
+        Fail("the encoded image is " + std::to_string(encoded.channels) + "x" +
+             std::to_string(encoded.height) + "x" + std::to_string(encoded.width) +
+             " but phase '" + phase.name + "' needs " + std::to_string(vshape.channels) + "x" +
+             std::to_string(vshape.height) + "x" + std::to_string(vshape.width) +
+             ". Upstream raises ConditioningError on exactly this "
+             "(conditioning/types/latent_cond.py:25-30): the encoder's spatial factor and the "
+             "pipeline's VIDEO_SCALE_FACTORS must agree, and they do not.");
+      }
+
+      // `Ltx2ConditionVideoByLatentIndex` writes `clean` and `mask` and reads
+      // `tokens` / `width`; `latent` and `positions` are carried so the struct
+      // is coherent rather than half-filled, not because the item consults them.
+      Ltx2LatentState state;
+      state.tokens = video.tokens;
+      state.width = video.width;
+      state.pos_dims = 3;
+      state.latent = video.latent;
+      state.clean = video.clean;
+      state.mask = video.mask;
+      Ltx2ConditionVideoByLatentIndex(&state, vshape, /*patch_size=*/1, encoded, image_strength,
+                                      /*latent_idx=*/0);
+      video.clean = state.clean;
+      video.mask = state.mask;
+
+      // The witness, taken from the TOKENS THAT WERE WRITTEN rather than from
+      // `encoded` — and the difference is not cosmetic. Digesting the encoder's
+      // output would answer "was an image encoded", which stays true of a build
+      // that encodes an image and then never places it: the render would be
+      // unconditioned and every field here would look healthy. Digesting the
+      // conditioned slice of the clean latent answers "did those tokens reach
+      // the state", which is the question. Filled on the LAST phase, so it
+      // describes the conditioning the finished latent carries.
+      //
+      // IT IS STILL A CHANGE DETECTOR, not a value gate — the same limit the two
+      // prompt digests carry. What the placed tokens should NUMERICALLY be is
+      // gated against executed upstream in `test_ltx2_image_cond`, which drives
+      // these very functions; MEASURED, because a mutation that moved the
+      // composition inside this loop and left `test_ltx2_video` green is how
+      // this comment came to be here.
+      const int64_t placed = Ltx2VideoTokenCount({1, vshape.channels, 1, vshape.height,
+                                                  vshape.width},
+                                                 1);
+      const std::vector<float> written(
+          video.clean.begin(),
+          video.clean.begin() + static_cast<ptrdiff_t>(placed * video.width));
+      im.trace.image_tokens = placed;
+      im.trace.image_digest = DigestF32(written);
+      im.trace.image_absmax = AbsMax(written);
+    }
+
     // The noiser draws VIDEO first, AUDIO second, from one generator
-    // (blocks.py:576-580 builds the video state before the audio one).
+    // (blocks.py:554-563 builds the video state before the audio one; :576-580,
+    // which this used to cite, is the TEARDOWN and proves nothing about order).
     const float noise_scale = static_cast<float>(phase.noise_scale);
     ApplyGaussianNoise(video, state_noise.Draw(static_cast<int64_t>(video.latent.size())),
                        noise_scale);

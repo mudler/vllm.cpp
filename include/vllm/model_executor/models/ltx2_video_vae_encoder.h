@@ -28,7 +28,7 @@
 //
 // ─── THE FIVE THINGS THAT FAIL SILENTLY ──────────────────────────────────────
 //  * THE ENCODER'S DEFAULT SPATIAL PADDING IS `zeros`; THE DECODER'S IS
-//    `reflect` (model_configurator.py:63-67 vs :90). They read the SAME
+//    `reflect` (model_configurator.py:63-68 vs :92). They read the SAME
 //    checkpoint key `spatial_padding_mode` on a flat CausalVideoAutoencoder
 //    config, so they only diverge when the key is ABSENT — and then they diverge
 //    silently, by a half-pixel border, in opposite directions.
@@ -62,6 +62,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/ltx2_audio_vae.h"    // Ltx2VaeWeights
+#include "vllm/model_executor/models/ltx2_loader.h"       // Ltx2VaeKeyRule, nlohmann::json
 #include "vllm/model_executor/models/ltx2_upsampler.h"    // Ltx2LatentVolume
 #include "vllm/model_executor/models/ltx2_video_vae.h"    // Ltx2NormLayer, Ltx2PaddingMode
 
@@ -179,5 +180,47 @@ Ltx2LatentVolume Ltx2ConvVideoEncode(const Ltx2ConvVideoEncoderConfig& config,
                                      const std::vector<float>& frames, int64_t channels,
                                      int64_t frame_count, int64_t height, int64_t width,
                                      int64_t* out_cropped_frames = nullptr);
+
+// ─── THE DELIVERY ROUTE (row LTX25-IMAGE-COND, issue #644) ───────────────────
+//
+// Everything above is the encoder's MATH, and it landed in phase L11 with
+// goldens. What did not land is any way to reach it from a checkpoint: until
+// this row, `Ltx2VideoVaeEncoderKeyRules` matched NOWHERE in the tree and no
+// parser produced an `Ltx2ConvVideoEncoderConfig` from a `vae` config object.
+// `ltx2_video.cpp:752` materialized `Ltx2VideoVaeDecoderKeyRules()` alone, so
+// the encoder was a brick with no delivery route and every conditioning arm
+// refused for that reason. These three declarations are that route.
+
+// `VAE_ENCODER_COMFY_KEYS_FILTER` (video_vae/model_configurator.py:267-276), in
+// the same first-match-wins prefix form `Ltx2VideoVaeDecoderKeyRules` uses.
+//
+// `per_channel_statistics.` IS IN BOTH FILTERS UPSTREAM and must be in both
+// here: `Ltx2ConvVideoEncode` divides its conv output by
+// `per_channel_statistics.std-of-means` (video_vae.py:336), so an encoder bag
+// filtered without them cannot produce a latent in the DiT's space at all — it
+// throws on the missing key rather than emitting an unnormalized one, which is
+// the one mercy in this arrangement.
+std::vector<Ltx2VaeKeyRule> Ltx2VideoVaeEncoderKeyRules();
+
+// Does this checkpoint carry an ENCODER half? A Comfy-split `vae/` file may hold
+// the decoder alone, and the answer decides whether image conditioning is served
+// or refused BY NAME. Asked of the file's declared tensor names only; no payload
+// is read.
+bool Ltx2CheckpointHasVideoEncoder(const std::vector<std::string>& tensor_names);
+
+// `VideoEncoderConfigurator.from_metadata` (model_configurator.py:72-78) over
+// `_prepare_video_encoder_kwargs` (:37-69), key for key.
+//
+// THE TWO FIELDS THAT FAIL SILENTLY IF READ FROM THE WRONG PLACE:
+//   * the LATENT WIDTH. On a flat `CausalVideoAutoencoder` config it is
+//     `vae.latent_channels`; the top-level `vae.out_channels` is the DECODER's
+//     RGB count and reading it builds a 3-channel-latent encoder that still runs
+//     (:41-43). On a nested `CausalDiffusionVAE` config it is
+//     `vae.encoder.out_channels` (:46-49) — the same spelling, the other object.
+//   * `spatial_padding_mode`. The ENCODER's default is `zeros`; the decoder's is
+//     `reflect` (:63-68 vs :92). Both read the same checkpoint key on a flat
+//     config, so they diverge only when the key is ABSENT, silently, by a
+//     half-pixel border, in opposite directions.
+Ltx2ConvVideoEncoderConfig Ltx2ParseConvVideoEncoderConfig(const nlohmann::json& config);
 
 }  // namespace vllm

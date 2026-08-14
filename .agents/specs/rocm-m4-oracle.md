@@ -72,3 +72,23 @@ tie in the oracle's own logits.
   near-tie-robust gate is the M4 evidence for the lane.
 - The oracle image and `/home/vikash/oracle/` scratch are machine-local, not
   committed; this spec is the reproduction recipe.
+
+## Review rework (2026-08-13 sweep, localai-bot on #559)
+
+The first shape landed the 0.8B gate RED with the pre-fix goldens committed.
+Review findings, all accepted and fixed in the current shape:
+1. **CI-red manifest**: `qwen35_0_8b_greedy` had no runner — added to
+   `PendingRunnerOps()` in test_op_parity.cpp (the `qwen36_gguf_greedy`
+   precedent); the manifest itself stays (its oracle identity is the point).
+2. **Fail-safe by device**: the gate now exits 77 (CTest Skipped) on any
+   non-ROCm device instead of comparing a foreign engine against ROCm-derived
+   goldens, and the checkpoint-absent path exits 77 too (issue #463's pattern)
+   instead of a silent `return` that printed SUCCESS with 0 assertions.
+3. **Green-shaped landing**: the committed goldens are the FIXED engine's
+   sequence, oracle-re-derived (the kernel fix lands below this commit in the
+   stack); the RED capture (13/16, first-divergence gaps 0.375-1.062 nats —
+   5 of 6 over band) stays as evidence here and in the parity ledger, not as
+   committed goldens that no code can pass.
+4. **Anchor message honesty**: anchor drift now reads "REGRESSION SUSPECTED:
+   bisect the engine change first" — re-deriving goldens is the last step of a
+   justified re-capture, never the response to a failure.

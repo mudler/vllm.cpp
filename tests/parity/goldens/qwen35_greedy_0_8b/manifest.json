@@ -1,0 +1,23 @@
+{
+ "op": "qwen35_0_8b_greedy",
+ "oracle": {
+  "engine": "pinned vLLM-ROCm oracle built from source on the gate host (issue #41 M4)",
+  "vllm_commit": "5559679229bc961848b121ccdeaa8fa5d79bec98",
+  "vllm_runtime_version": "0.23.1rc1.dev1511+g555967922",
+  "wheel": "vllm-0.23.1rc1.dev1511+g555967922.rocm723-cp312-cp312-linux_x86_64.whl",
+  "container_image": "vllm-rocm-oracle:555967922-gfx1100 (rocm/vllm-dev:base + the wheel)",
+  "hardware": "4x RX 7900 XTX (gfx1100), ROCm 7.14 host driver, HIP 7.2.5 userland",
+  "invocation": "scripts/qwen3-oracle-capture.py --model Qwen/Qwen3.5-0.8B --runs 10 --per-prompt --gpu-mem 0.8 (enforce_eager=True, batch=1); teacher-forced gaps via scripts/qwen3-neartie-gap.py",
+  "date": "2026-08-12",
+  "note": "There is no dgx/CUDA capture of this model: the 0.8B GDN checkpoint was only ever stood up on the gfx1100 box, which is also the only board hosting a vLLM-ROCm oracle. The base golden pair is ROCm-captured; K=10 per-prompt greedy is deterministic in every (prompt,pos) cell (greedy_dist.npy). GATE STATUS: GREEN -- 16/16 PASS (15/16 strict token-exact, 1/16 near-tie band, max gap 0.125 nats) with the AttnQkNormRopeGate output-dtype dispatch fix (row/ROCM-GDN-08B-FIX). The PRE-FIX capture showed 13/16 forward-divergent with first-token divergences on 6 prompts (first-divergence gaps 0.375-1.062 nats; 5 of 6 over the 0.5-nat band) -- recorded in the spec and parity ledger."
+ },
+ "model": {
+  "repo": "Qwen/Qwen3.5-0.8B",
+  "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "architectures": [
+   "Qwen3_5ForConditionalGeneration"
+  ],
+  "note": "revision verified via the checkpoint's huggingface_hub download metadata (2026-08-12)"
+ },
+ "prompts": "the standard 16-prompt battery shared with scripts/qwen3-oracle-capture.py / test_qwen3_paged_engine.cpp"
+}

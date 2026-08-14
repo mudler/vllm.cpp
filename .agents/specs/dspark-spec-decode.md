@@ -1663,6 +1663,381 @@ quotable -- and all three agree.
 Also visible in the last run: the oracle's draws are bimodal at ~147.3 and
 ~155.6, the same one-extra-accepted-token effect as §6q, which is why its MODAL
 draws are the honest denominator.
+## 6ad. THE ncu BLOCKER IS GONE, AND 6z's DRAM ATTRIBUTION IS CORROBORATED (2026-08-13)
+
+Section 6z listed upstream's `ncu` counters as the last open route and called it
+BLOCKED: vLLM's EngineCore will not initialise under `ncu` in either replay mode.
+`scripts/marlin-moe-standalone.py` routes around it. It drives upstream's OWN
+`torch.ops._moe_C.moe_wna16_marlin_gemm` on the 35B-A3B decode shapes -- hidden
+2048, moe_intermediate 512, E=256, top_k=8, `moe_block_size=8` -- with NO
+EngineCore, NO multiprocessing and NO model load, mirroring
+`prepare_nvfp4_moe_layer_for_marlin`'s scale pipeline exactly. It asserts the
+oracle identity and aborts on mismatch. It profiles.
+
+### The static geometry (trustworthy, and new)
+
+| property | value |
+|---|---|
+| grid / block / shared per block | 144 / 128 / 32768 B |
+| GB10 | 48 SMs, 102400 B shared per SM |
+| block limit -- **shared memory** | **3** (registers 5, warps 12, SM 24) |
+| occupancy, theoretical / achieved | 25% / 25.98% |
+| waves per SM | 1 |
+| registers per thread | 94 |
+
+102400/32768 = 3 blocks per SM, and 48 x 3 = 144 = the grid exactly. **The launch
+is a persistent single wave sized to the device**, so the "38.9 vs 40.6 blocks per
+launch" of 6x are work items each CTA LOOPS OVER, not parallel blocks.
+
+### `ncu`'s memory percentages are NOT usable on this chip
+
+`dram__bytes.sum` and `dram__bytes.sum.per_second` return **`n/a`** on GB10 --
+there are no DRAM counters to read. What the SpeedOfLight section still prints,
+"Memory Throughput 11.14%" against "Compute (SM) Throughput 11.42%", therefore
+does NOT include DRAM traffic, and reading those two as "neither is saturated,
+so the kernel is latency-bound" is WRONG. An `n/a` on the byte counter is the
+tell that the percentage beside it is derived from something else.
+
+### What the kernel actually does, measured by sweeping the work
+
+Concentrating the synthetic router over a controlled pool of experts moves the
+occupied block count. `--arm gate_up`, 80 iterations per point:
+
+| distinct-expert pool | blocks | us/call | us/block | implied GB/s |
+|---|---|---|---|---|
+| 8 | 13 | 19.9 | 1.53 | -- (fits L2) |
+| 16 | 18 | 20.8 | **1.15** | -- (fits L2) |
+| 24 | 22 | 65.0 | 2.96 | transition |
+| 32 | 27 | 157.0 | 5.81 | 202.9 |
+| 40 | 31 | 165.0 | 5.32 | -- |
+| 48 | 38 | 207.0 | 5.45 | 216.6 |
+| 64 | 45 | 249.5 | 5.55 | 212.7 |
+| 128 | 58 | 306.5 | 5.28 | 223.2 |
+| 256 | 65 | 339.6 | 5.22 | 225.8 |
+
+Each block streams one expert's gate_up weights (2N x K/2 = 1 MiB) plus its
+scales (2N x K/16 = 128 KiB) = 1179648 B. Two regimes are visible. Under ~18
+blocks the touched weights fit in L2 and cost 1.15 us/block. Above ~27 they
+stream, and **us/block is FLAT at 5.2-5.5 across a 2.4x range of work** --
+a constant bytes-per-second, which is the bandwidth-limited signature.
+
+**So 6z was right and this section's first draft was wrong.** The kernel IS
+memory-bound; the standalone plateau is **212.7-225.8 GB/s** over the rows that
+are actually flat (>= 38 blocks) -- the widely quoted 203 endpoint is the
+27-block row, which sits outside the flat band -- and 6z's derived
+in-situ numbers land exactly on it: upstream's **210.7 GB/s is INSIDE the
+plateau**, i.e. upstream runs at this kernel's achievable bandwidth, while our
+**186.6 GB/s is ~12% BELOW** it. An independent standalone measurement of the
+same kernel now corroborates the derived attribution instead of replacing it.
+
+The one thing 6x should not keep is the per-unit-work DIVISION: with a fixed
+144-CTA grid, block count is loop iterations, and at the operating point the
+sweep says +1.7 blocks (38.9 -> 40.6) should cost about +4.4%. Upstream carries
+those extra iterations and is still faster, which is not a contradiction once the
+denominator is bandwidth rather than block count -- it is the same 12-13%
+bandwidth-achievement gap seen twice.
+
+### What is now open
+
+Ours has NOT been through this harness. That is the decisive experiment: our
+kernel, same shapes, same routing input, same box, us/block against the 5.2-5.5
+plateau. If ours plateaus at 5.2-5.5 too, the in-situ deficit is NOT in the
+kernel and 6x's localisation is wrong; if ours plateaus ~12% higher, the kernel
+owns it and the next question is why the same SASS sustains less bandwidth.
+
+Occupancy stays a real but SECONDARY lever: 25% capped by a 32 KB shared-memory
+budget (`max_shared_mem / blocks_per_sm - 1024`), where under 25600 B would buy
+4 blocks/SM. At ~75-80% of this device's ~273 GB/s that is worth far less than
+the earlier "~9x of headroom" first draft claimed, which was an artefact of the
+same unusable percentage.
+
+Absolute us/call here is not comparable in-situ: uniform synthetic routing
+occupies 61-65 blocks against the model's 38.9-40.6. The static geometry, the
+two-regime shape and the plateau bandwidth are comparable, since they do not
+depend on the routing draw.
+
+## 6ae. THE KERNEL IS NOT THE GAP -- 6x's LOCALISATION IS REFUTED (2026-08-13)
+
+6ad built the upstream arm. This is the arm it was built for:
+`benchmarks/marlin_moe_standalone.cpp` drives OUR
+`vt::MoeGroupedGemmNvfp4Marlin` through the same shapes, the same expert-pool
+control over the block count, and the same gate_up GEMM as the python arm.
+
+**Sweep, ours against upstream, us/block:**
+
+| pool | ours blocks / us-per-block | upstream blocks / us-per-block |
+|---|---|---|
+| 8 | 13 / 1.512 | 13 / 1.534 |
+| 16 | 16 / 1.411 | 18 / 1.153 |
+| 24 | 23 / 4.773 | 22 / 2.955 |
+| 32 | 30 / 5.482 | 27 / 5.813 |
+| 40 | 34 / 5.525 | 31 / 5.323 |
+| 48 | 39 / 5.311 | 38 / 5.446 |
+| 64 | 44 / 5.318 | 45 / 5.545 |
+| 128 | 54 / 5.194 | 58 / 5.284 |
+| 256 | 63 / 5.261 | 65 / 5.224 |
+
+Ours plateaus on the SAME 5.2-5.5 band, so ours reaches the same achievable
+bandwidth. Two INTERLEAVED paired runs at pool 48 and 128, three reps each,
+then settle it:
+
+| | n | mean us/block | sd | range |
+|---|---|---|---|---|
+| ours | 12 | **5.3187** | 0.124 | 5.083-5.562 |
+| upstream | 12 | **5.3330** | 0.151 | 5.042-5.560 |
+
+**ours/upstream = 0.9973, i.e. ours 0.27% FASTER, inside one standard deviation
+on either side.** The sign of the difference flips between runs. A per-call
+workspace memset that our arm pays and upstream's does not was isolated with
+`--zero-ws 0` and is noise.
+
+**So 6x's localisation does not survive.** Its "the SAME kernel, the SAME 1520
+launches, ours 249.22 ms vs upstream 230.39 ms, 8.2% slower inside one kernel"
+does NOT reproduce when the same kernel is driven with matched work on the same
+box. Normalised by blocks the two are indistinguishable -- and note NORMALISED, not
+matched: the two arms draw routing from independent RNG streams (python
+`torch.manual_seed`, C++ `mt19937(1234)`), so at the same pool they occupy
+different block counts (pool 48: 39 vs 38; pool 128: 54 vs 58). Neither harness
+accepts an externally supplied routing tensor, so it cannot yet satisfy the
+"force both arms onto one token stream" rule this spec states. At M=9, blocks
+track distinct experts and us/block is flat in the streaming regime, so the
+ratio is probably sound -- but its error bars carry an undisclosed draw term on
+top of the contention term. Correspondingly, the
+"12.8% slower per unit of work" and the 186.6-vs-210.7 GB/s reading it produced
+describe the in-situ RUNS, not the kernel: both engines reach the same 203-226
+GB/s plateau when asked to do the same thing.
+
+**What that leaves.** The in-situ difference must come from CONTEXT rather than
+from kernel efficiency, and the sweep shows precisely which context term
+dominates: time is set by how many DISTINCT EXPERTS a launch touches, from
+1.15 us/block at 16 experts (weights fit L2) to ~5.3 above ~27 (streaming) --
+a 4.6x swing that no kernel change causes. The leading hypothesis is therefore
+that the two in-situ arms were not touching the same number of distinct experts
+per launch, which the recorded 38.9 vs 40.6 blocks hints at but does not
+measure, because blocks are not experts. The next measurement is distinct
+experts per launch on both arms in situ, not another kernel lever.
+
+**Caveats, stated rather than buried.** Our arm links `~/work/pr234`'s build,
+whose vendored `marlin_mm_moe.cu` is byte-identical to current main
+(md5 85c40e4869bc6ec594b8cfb97fb58b3c on both) while its dispatcher predates the
+C_tmp cap, which was independently measured perf-neutral at +0.03%. Ours times
+with `steady_clock` around 80 iterations plus a final sync; upstream's arm uses
+CUDA events. Both amortise launch overhead over 80 calls, and the memset probe
+bounds that class of difference at noise.
+
+## 6af. THE DENOMINATOR WAS WRONG: EXPERTS, NOT BLOCKS (2026-08-13)
+
+6ae cleared the kernel. This says what the in-situ 8.2% actually measured.
+
+Holding the block count roughly fixed while varying how many DISTINCT experts
+the routing touches, upstream arm, `--arm gate_up`:
+
+| M | blocks | distinct experts | us/call | us/block |
+|---|---|---|---|---|
+| 64 | 73 | 20 | 89.4 | 1.22 |
+| 64 | 82 | 40 | 227.1 | 2.77 |
+| 64 | 94 | 80 | 427.2 | 4.55 |
+| 64 | 216 | 216 | 1121.2 | 5.19 |
+| 128 | 137 | 20 | 149.9 | 1.09 |
+| 128 | 146 | 40 | 220.0 | 1.51 |
+| 128 | 255 | 250 | 1298.6 | 5.09 |
+
+Read the M=128 rows: **137 -> 146 blocks is +6.6% of blocks, and time rises
++46.7%**, because distinct experts went 20 -> 40.
+
+**But the per-expert cost is NOT flat, and an earlier draft of this section said
+it was.** Dividing us/call by distinct gives 4.470, 5.678, 5.340, 5.191, 7.495,
+5.500, 5.194 -- a **4.47 to 7.50** range, not 5.2-5.7. The two `distinct=20`
+rows are the tell: same expert count, 89.4 vs 149.9 us, while blocks differ
+73 vs 137. There, time tracks BLOCKS, which is exactly what a flat-per-expert
+model calls irrelevant.
+
+**So the honest model has two regimes, and it is the same two regimes as 6ad.**
+When the touched weights fit L2 (low distinct), the weights are not re-streamed
+and cost is set by the per-block work, so time tracks BLOCKS. When they do not
+(distinct >= ~40 here), cost is set by streaming and time tracks DISTINCT
+EXPERTS at 5.2-5.7 us each. `time ~= distinct x 1.125 MiB / ~215 GB/s` applies
+ONLY in the second regime; at distinct=20 it predicts 109.7 us against measured
+89.4 and 149.9, off by -19% and +37%.
+
+The rule that follows is therefore **control BOTH**: a MoE comparison must match
+distinct experts AND blocks, or state which regime it is in. Matching one alone
+is what makes two runs look comparable when they are not.
+
+**Applying the model to the recorded in-situ launches requires care, and my
+first pass got it backwards.** 6y already measured both sides for the same
+prompt: ours 311.2 padded tokens / 38.9 blocks per call, upstream 324.8 / 40.6.
+At M=9 those 72 (token, expert) pairs spread over ~39 experts at under 8 tokens
+each, so `moe_align` emits ONE block per expert and **blocks and distinct
+experts coincide at this shape** -- that measurement was already counting
+experts. So upstream touches MORE distinct experts (40.6 vs 38.9) and is still
+faster, exactly as 6y concluded. The routing explanation stays refuted; an
+earlier draft of this section inferred ours touched ~30 against upstream's ~28
+by inverting the model, which the measured counts in this same file contradict.
+
+**Which leaves a sharp contradiction, and it is the useful output of this
+section.** Standalone at matched work the two kernels are equal to 0.27% (6ae).
+In situ ours does LESS work (38.9 against 40.6 expert-blocks) and takes MORE
+time (164.0 us against 151.6). Both in-situ arms also beat the standalone
+plateau per unit of work (4.21 and 3.73 us against ~5.3). A kernel that is
+identical in isolation cannot be slower in place because of its own code, so the
+deficit belongs to the CONTEXT the kernel runs in, not to the kernel and not to
+the routing. Candidates, in the order their evidence justifies: expert-weight
+residency in situ (this repo has already measured a 20-30% per-GEMM penalty for
+host/ATS-retagged decode weights, and the standalone arm allocates fresh device
+memory that cannot reproduce it), clock and power state across the two runs, and
+overlap with concurrent work on other streams. Note also that the in-situ
+per-launch times come from summed profiler kernel durations while the standalone
+numbers are wall-clock over 80 iterations, so the two bases are not
+interchangeable and the ~5.3-to-4.21 difference may be partly that.
+
+**Consequences.**
+
+1. The 8.2% "kernel gap" is an artefact of comparing two different routing
+   draws. It is not evidence of an implementation defect, and it should not be
+   quoted again.
+2. Any future MoE comparison must control DISTINCT EXPERTS PER LAUNCH, or force
+   both arms onto an identical token stream. Comparing block counts is comparing
+   the wrong quantity.
+3. `VT_MOE_PAD_STATS` (qwen3_5.cpp) counts padded tokens and blocks. It should
+   count DISTINCT EXPERTS too; that is the number that predicts the time.
+
+**What this does NOT do.** It does not move the end-to-end ratio. That is
+wall-clock on matched prompts and token counts, and it stands at ~0.966. What
+changes is that its residual no longer has an attribution: the kernel is cleared
+and the number that appeared to localise it was measuring the token path. The
+open question is whether OUR token path systematically touches more experts per
+step -- a near-tie divergence consequence rather than a defect -- or whether the
+remaining wall-clock sits outside the MoE entirely.
+
+## 6ag. THE MIX, AND THE MODE HOLE UNDER EVERY IN-SITU RATIO (2026-08-13)
+
+Two arithmetic corrections close this thread out.
+
+**The mix.** The 1520 in-situ launches are 760 gate_up plus 760 down, and down's
+per-expert bytes are exactly HALF gate_up's -- gate_up 2N x K/2 weights plus
+2N x K/16 scales = 1.1250 MiB, down K x N/2 plus K x N/16 = 0.5625 MiB, mixed
+average 0.8438 MiB per expert-block. 6af compared a MIXED in-situ average against
+a gate_up-ONLY standalone plateau, which is what made both arms look like they
+beat it (4.21 and 3.73 us against ~5.3). They did not. Redone with the right
+bytes:
+
+| | blocks | MiB / launch | us | implied GB/s |
+|---|---|---|---|---|
+| ours | 38.9 | 32.8 | 164.0 | **209.9** |
+| upstream | 40.6 | 34.3 | 151.6 | **236.9** |
+
+Measured standalone gate_up plateau: 212.7-225.8 GB/s over the flat rows.
+Ours appears INSIDE it and upstream ABOVE it -- **but read the next paragraph
+before using that.**
+
+**THE LOCK CAVEAT, WHICH APPLIES TO EVERY ABSOLUTE NUMBER IN 6ad THROUGH 6ag.**
+Those standalone runs took `flock /tmp/gpu.lock`. This box's GPU lock is
+`$HOME/gpu.lock`, so they ran UNSERIALISED against concurrent GPU work. Timings
+taken under contention are inflated, and a bandwidth computed as bytes/time is
+therefore a **LOWER BOUND** on what the kernel achieves, not an upper one. A
+re-take under the correct lock can only move the plateau UP -- which would move
+our in-situ 209.9 GB/s BELOW it and **reverse the inversion below**. The
+"we are not slow, upstream is unusually fast" reading is the LEAST favourable
+interpretation to us that the data admits, and it is the one most likely to
+change on a clean re-take. Do not build on it until the plateau is re-measured
+under `$HOME/gpu.lock`. What survives contention is the INTERLEAVED ratio of
+6ae, because contention lands on both arms alike. We run this kernel at the bandwidth it achieves in
+isolation; upstream gets something in place the isolated kernel does not. First
+candidate is cache reuse across the gate_up/down pair, down's weights being half
+size so more of the working set can persist. The framing inverts: on this
+evidence we are not slow, upstream is unusually fast in situ.
+
+**The mode hole.** 6y warns, correctly, that "a work COUNT may be taken under
+different execution modes; a TIME may not" -- and then the per-unit-work
+normalisation does the thing that warning forbids. The 38.9/40.6 counts were
+taken EAGER (ours `VT_SPEC_DECODE_GRAPH=0`, upstream `enforce_eager`, both
+because the probes could not survive capture and compile respectively) while the
+249.2/230.4 ms times came from the GRAPHED profile. Nothing establishes the
+graphed runs had the same blocks per launch as the eager ones. So every ratio
+built by dividing those times by those counts -- 4.21 vs 3.73 us/block, 12.8%
+per unit of work, 186.6 vs 210.7 GB/s -- has a denominator from a different
+execution mode than its numerator.
+
+**Consequence.** The only like-for-like Marlin comparison in evidence is the
+standalone one of 6ae, and it says parity: 0.9973, inside one standard
+deviation. Closing the in-situ question needs blocks AND time from the SAME
+graphed run, which needs a probe that survives capture: a device-side counter
+the launcher increments, read once at the end, never a per-launch D2H sync.
+
+## 6ah. THE FIRST FULLY-CONTROLLED PAIRED RUN: 0.9889, NOT 0.966 (2026-08-13)
+
+Every ratio recorded before this one was taken with a COLD leading arm.
+Correcting that moves the headline materially.
+
+**Four controls, all present together for the first time.** `$HOME/gpu.lock`
+(the standalone runs of 6ad-6af took `/tmp/gpu.lock`, which coordinates with
+nothing). A DISCARDED warm-up arm ahead of the first measured arm, because the
+GB10 SM clock ramps over MINUTES -- 1449 to 2190 MHz observed across one run --
+so dropping rep 1 is not enough and an entire first arm reads ~6% low. Settle
+barriers between arms, because vLLM asserts free GPU memory does not GROW during
+its startup profile while GB10 returns our engine's pages lazily, which killed
+every earlier paired attempt with "Initial free memory 68.53 GiB, current free
+memory 89.42 GiB". And a host-RAM headroom guard before the oracle, because
+`gpu_memory_utilization` reserves HOST RAM here, so an oracle without headroom
+takes the MACHINE down -- three reboots on 2026-08-13, at least the last ours.
+
+| arm | n | median tok/s | range |
+|---|---|---|---|
+| ours BEFORE | 9 | 142.604 | 141.67-142.79 |
+| ours AFTER | 9 | 142.140 | 135.23-142.87 |
+| ours combined | 18 | **142.534** | -- |
+| oracle | 15 | **144.130** | 141.86-151.84 |
+
+Drift before -> after is **-0.33%**, inside the 1% gate this harness sets for
+itself, so the run counts. Ratios: 0.9894 before, 0.9862 after,
+**0.9889 combined**.
+
+**"The gap is 1.1%, not 3.4%" is WITHDRAWN** -- it was published here and does
+not survive its own arithmetic. Decomposing 6ac session 3 (0.9569) against this
+run (0.9889): our arm moved **+1.10%**, the ORACLE denominator moved **-2.17%**,
+so two thirds of the change is the oracle being slower on a different boot. The
+comparison is also one this spec forbids elsewhere -- absolutes move several
+percent across boots -- so differencing a boot-A ratio against a boot-B ratio is
+the cross-boot reasoning the record rejects when anyone else does it. Two more
+checks it fails: 6ac session 3 was ALREADY ours -> oracle -> ours with drift
+-0.89%, the CLOSING arm slower, which is the opposite sign from a cold leading
+arm; and the load-bearing "an entire first arm reads ~6% low" is inferred from an
+SM-clock reading with **no warm-up-arm on/off A/B anywhere**. What the warm-up
+arm demonstrably fixes is a 6.6% WITHIN-RUN drift, which makes a run internally
+valid without establishing that the ratio moved.
+
+**The honest statement:** valid within-session ratios on this row are 0.9757,
+0.9646, 0.9569 and 0.9889, a spread of 0.957-0.989 across boots with no single
+value being "the" ratio. The gap is somewhere in 1-4% and is NOT resolved better
+than that on this hardware.
+
+This is NOT parity: 0.9889 is below 1.0 and the row stays open. But it changes
+what remains to be found -- roughly a third of the deficit the record has been
+chasing all campaign, and it lands after 6ae had already cleared the kernel that
+deficit was attributed to.
+
+**Caveats, kept rather than buried.** n=1 paired run. **The repeat RAN and was
+REJECTED by this harness's own drift gate**: its arms measured 146.740 before
+and 143.619 after, a -2.13% drift against a 1% gate, so its 0.9795 does not
+count and is not averaged in. Bracketing on its own arms it spans 0.9905 to
+0.9694 -- it cannot separate parity from a 3% deficit. (Published first as
+0.9912-0.9701, which used the low-mode 148.05 rather than the table's 148.150
+denominator and flattered the top end.) Two things it did
+establish: the oracle's BIMODALITY IS BOOT-DEPENDENT (run 1 unimodal at ~144,
+run 2 clearly bimodal with 10 draws at 148.05 and 5 at 156.61, same script and
+pin), so a harness cannot assume either shape; and absolutes moved together
+across the reboot (ours +1.8%, oracle +2.8%), consistent with the recorded 12.8%
+boot-to-boot clock variation. So the standing claim is **~0.98, NOT parity, on
+one valid paired run** -- not "0.9889 confirmed". The ours-AFTER arm carries four low outliers (135.2, 135.5,
+139.0, 139.9) that the BEFORE arm does not, so something touched the box during
+it -- medians are unaffected, that arm's spread is not trustworthy. The oracle
+shows ONE fast draw (151.84) against fourteen near 144, the old bimodality
+appearing once, absorbed by the median. The oracle copy runs
+`gpu_memory_utilization=0.35` rather than 0.55; at max_num_seqs=2 and
+max_model_len=2048 the KV cache needed is a fraction of either, so it cannot
+change decode speed, but it IS a config delta on the denominator and is recorded
+as one.
 
 ## 7. Evidence, authority, stop conditions
 

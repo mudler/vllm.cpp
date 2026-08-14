@@ -1840,15 +1840,108 @@ const std::set<std::string>& PendingRunnerOps() {
   return kPending;
 }
 
+// GATE-OP-PARITY-MANIFEST (#755). tests/parity/goldens/ is a SHARED surface and
+// its schema used to be implicit: RunGoldenPass walked every manifest.json and
+// indexed m["op"] unconditionally, so an oracle capture recorded at
+// goldens/<name>/manifest.json — a perfectly reasonable place for it — took
+// down a test belonging to a different row through an unhandled key lookup
+// ("type must be string, but is null", not naming the offending case). It
+// happened once with minimax_music3_oracle (34dc57876, #672/#708) and cost an
+// unrelated campaign a 453/454 ctest it had to trace before trusting.
+//
+// The schema is now DECLARED (goldens/README.md) and the walker's input set is
+// CLOSED: every manifest.json under the goldens root is either an op golden
+// declaring a string "op", or a directory named here. Anything else is a hard,
+// by-name FAILURE, so the next oracle capture that lands in the walker's path
+// cannot do so unnoticed — exactly the shape of PendingRunnerOps above, which
+// makes listed ops a loud skip while everything unlisted still hard-FAILs.
+//
+// Listing a directory here is a claim that its manifest.json is NOT an op
+// golden at all. It is deliberately NOT a way to silence a real op case: a
+// listed directory whose manifest DOES declare "op" is itself a failure, so
+// this set cannot rot into a mute exclusion list, and the `cases >= N` floors
+// in the callers still catch an op golden that stops being gated.
+const std::set<std::string>& NonOpGoldenDirs() {
+  static const std::set<std::string> kNonOp = {
+      // MODEL-MUSIC-MUSIC3 (#672, capture #708): a diffusers oracle CAPTURE —
+      // per-stage .npy tensors with a provenance manifest recording the pin,
+      // checkpoint, environment and per-tensor sha256. It has no op, no runner
+      // and no tolerances; its tensors are consumed by name (never through this
+      // manifest) by tests/parity/test_minimax_music3_ar_real.cpp, and the
+      // manifest itself is the `evidence =` path of .agents/oracles/diffusers.md,
+      // which scripts/check-oracle-pins.py requires to exist in this tree.
+      // That committed path is why the capture stays here rather than moving to
+      // a root of its own: relocating it would need edits to .agents/oracles/,
+      // .agents/model-matrix.md and tools/oracle/, which this row does not own.
+      "minimax_music3_oracle",
+  };
+  return kNonOp;
+}
+
+// What a manifest.json under the goldens root declares itself to be.
+enum class ManifestVerdict {
+  kOpGolden,     // declares a string "op" — run it
+  kNonOpGolden,  // named in NonOpGoldenDirs() and declares no "op" — loud skip
+  kMalformed,    // neither — a by-name failure, never a silent skip
+};
+
+struct ManifestClass {
+  ManifestVerdict verdict = ManifestVerdict::kMalformed;
+  std::string op;       // set iff kOpGolden
+  std::string message;  // human-facing, always names `case_name`
+};
+
+// Pure classifier: no filesystem, no doctest macros, so the mutation tests
+// below can drive it with synthetic manifests instead of mutating the tree.
+ManifestClass ClassifyGoldenManifest(const std::string& case_name, const json& m) {
+  const bool listed = NonOpGoldenDirs().count(case_name) != 0;
+  const bool declares_op = m.contains("op");
+  if (listed && declares_op) {
+    return {ManifestVerdict::kMalformed, "",
+            "goldens/" + case_name +
+                "/manifest.json declares \"op\" but is listed in "
+                "NonOpGoldenDirs(): it IS an op golden, so remove it from that "
+                "list rather than leaving a real op case ungated"};
+  }
+  if (listed) {
+    return {ManifestVerdict::kNonOpGolden, "",
+            "SKIP " + case_name +
+                ": listed in NonOpGoldenDirs() — not an op-parity golden (see "
+                "tests/parity/goldens/README.md)"};
+  }
+  if (!declares_op) {
+    return {ManifestVerdict::kMalformed, "",
+            "goldens/" + case_name +
+                "/manifest.json has no \"op\" key. Every manifest.json under "
+                "tests/parity/goldens/ is walked by test_op_parity: an op-parity "
+                "golden must declare a string \"op\" naming its runner, and an "
+                "artifact that is not one (an oracle capture, an engine "
+                "acceptance fixture) must be named in NonOpGoldenDirs() in "
+                "tests/parity/test_op_parity.cpp so it becomes a loud, counted "
+                "skip. See tests/parity/goldens/README.md"};
+  }
+  if (!m.at("op").is_string()) {
+    return {ManifestVerdict::kMalformed, "",
+            "goldens/" + case_name +
+                "/manifest.json declares a non-string \"op\" (" +
+                std::string(m.at("op").type_name()) +
+                "); it must name its runner as a string"};
+  }
+  return {ManifestVerdict::kOpGolden, m.at("op").get<std::string>(), ""};
+}
+
 // Runs every golden case on `dev` and returns how many ran. Both passes use
 // the same manifests and the same tolerances — the committed goldens are the
-// bar for every backend.
-int RunGoldenPass(Device dev) {
+// bar for every backend. `non_op_out`, when given, receives how many manifests
+// were skipped as declared non-op artifacts, so the skip is counted and not
+// merely quiet.
+int RunGoldenPass(Device dev, int* non_op_out = nullptr) {
   fs::path root = PARITY_GOLDENS_DIR;
   REQUIRE(fs::exists(root));
   Backend& b = vt::GetBackend(dev.type);
   Queue q = b.CreateQueue();
   int cases = 0;
+  int non_op = 0;
   for (const auto& entry : fs::directory_iterator(root)) {
     if (!entry.is_directory()) continue;
     fs::path mf = entry.path() / "manifest.json";
@@ -1857,7 +1950,20 @@ int RunGoldenPass(Device dev) {
     // in the callers still guards against op cases silently disappearing.
     if (!fs::exists(mf)) continue;
     json m = json::parse(std::ifstream(mf));
-    std::string op = m["op"];
+    const ManifestClass mc =
+        ClassifyGoldenManifest(entry.path().filename().string(), m);
+    if (mc.verdict == ManifestVerdict::kMalformed) {
+      // FAIL_CHECK, not FAIL: name EVERY offender in one run rather than
+      // aborting the pass at the first one.
+      FAIL_CHECK(mc.message);
+      continue;
+    }
+    if (mc.verdict == ManifestVerdict::kNonOpGolden) {
+      MESSAGE(mc.message);
+      ++non_op;
+      continue;
+    }
+    const std::string& op = mc.op;
     INFO("case " << entry.path().filename().string());
     if (std::getenv("VLLM_PARITY_PRINT_MARGINS") != nullptr)
       std::printf("case %s (%s)\n", entry.path().filename().string().c_str(),
@@ -1935,6 +2041,13 @@ int RunGoldenPass(Device dev) {
     ++cases;
   }
   b.DestroyQueue(q);
+  // std::string, not the bare ternary: doctest 2.5.2 streams a `const char*`
+  // through this macro as `1`.
+  MESSAGE("golden pass ("
+          << std::string(dev.type == DeviceType::kCUDA ? "cuda" : "cpu")
+          << "): " << cases << " op cases ran, " << non_op
+          << " declared non-op manifest(s) skipped by name");
+  if (non_op_out != nullptr) *non_op_out = non_op;
   return cases;
 }
 
@@ -1986,11 +2099,90 @@ TEST_CASE("CompareTensors is NaN- and Inf-loud and catches mismatches") {
   CHECK(inf_want->find("non-finite in want") != std::string::npos);
 }
 
+// GATE-OP-PARITY-MANIFEST (#755). The goldens tree's schema is declared, and
+// the walker's input set is closed by it. These drive the pure classifier with
+// synthetic manifests, so each guarantee is proved by the shape that would
+// break it rather than by mutating committed evidence.
+TEST_CASE("golden manifest classifier is loud and by name (#755)") {
+  const std::string kUnlisted = "some_new_case";
+  REQUIRE(NonOpGoldenDirs().count(kUnlisted) == 0);
+
+  // An op golden classifies as one and hands back its runner name.
+  const ManifestClass op_case =
+      ClassifyGoldenManifest(kUnlisted, json{{"op", "rmsnorm"}});
+  CHECK(op_case.verdict == ManifestVerdict::kOpGolden);
+  CHECK(op_case.op == "rmsnorm");
+
+  // THE MUTATION THIS GUARD EXISTS FOR: a manifest that should be an op golden
+  // but has no "op" must FAIL, naming itself — never be skipped into silence.
+  const ManifestClass missing_op =
+      ClassifyGoldenManifest(kUnlisted, json{{"tensors", json::object()}});
+  CHECK(missing_op.verdict == ManifestVerdict::kMalformed);
+  CHECK(missing_op.verdict != ManifestVerdict::kNonOpGolden);
+  CHECK(missing_op.message.find(kUnlisted) != std::string::npos);
+  CHECK(missing_op.message.find("no \"op\" key") != std::string::npos);
+
+  // An "op" that is not a string is malformed too — that is the exact JSON
+  // shape (null) whose unhandled lookup threw out of the CPU pass on main.
+  const ManifestClass null_op =
+      ClassifyGoldenManifest(kUnlisted, json{{"op", nullptr}});
+  CHECK(null_op.verdict == ManifestVerdict::kMalformed);
+  CHECK(null_op.message.find(kUnlisted) != std::string::npos);
+
+  // A declared non-op artifact is skipped LOUDLY and by name.
+  const std::string kListed = "minimax_music3_oracle";
+  REQUIRE(NonOpGoldenDirs().count(kListed) == 1);
+  const ManifestClass capture =
+      ClassifyGoldenManifest(kListed, json{{"oracle", json::object()}});
+  CHECK(capture.verdict == ManifestVerdict::kNonOpGolden);
+  CHECK(capture.message.find(kListed) != std::string::npos);
+
+  // The list cannot rot into a mute exclusion: a listed directory that DOES
+  // declare an op is a failure, not a silent pass.
+  const ManifestClass listed_but_op =
+      ClassifyGoldenManifest(kListed, json{{"op", "rmsnorm"}});
+  CHECK(listed_but_op.verdict == ManifestVerdict::kMalformed);
+  CHECK(listed_but_op.message.find(kListed) != std::string::npos);
+}
+
+// Binds the committed artifact, not just the classifier: the MUSIC3 oracle
+// capture stays exactly where .agents/oracles/diffusers.md cites it, and is
+// classified as the non-op capture it is.
+TEST_CASE("every committed goldens manifest declares what it is (#755)") {
+  const fs::path root = PARITY_GOLDENS_DIR;
+  REQUIRE(fs::exists(root));
+  int op_goldens = 0, non_op = 0;
+  for (const auto& entry : fs::directory_iterator(root)) {
+    if (!entry.is_directory()) continue;
+    const fs::path mf = entry.path() / "manifest.json";
+    if (!fs::exists(mf)) continue;
+    const std::string name = entry.path().filename().string();
+    const ManifestClass mc =
+        ClassifyGoldenManifest(name, json::parse(std::ifstream(mf)));
+    if (mc.verdict == ManifestVerdict::kMalformed) {
+      FAIL_CHECK(mc.message);
+      continue;
+    }
+    (mc.verdict == ManifestVerdict::kOpGolden ? op_goldens : non_op)++;
+  }
+  MESSAGE("goldens tree: " << op_goldens << " op manifests, " << non_op
+                           << " declared non-op manifest(s)");
+  CHECK(op_goldens > 0);
+  // The MUSIC3 capture is the one committed non-op manifest today; a floor,
+  // not an equality, so a later capture does not have to edit this number.
+  CHECK(non_op >= 1);
+  CHECK(fs::exists(root / "minimax_music3_oracle" / "manifest.json"));
+}
+
 TEST_CASE("op parity vs upstream goldens (CPU)") {
-  int cases = RunGoldenPass(Cpu());
+  int non_op = 0;
+  int cases = RunGoldenPass(Cpu(), &non_op);
   // 24 pre-M0.8 + 5 MoE + 2 dense_attention + 6 W5 YaRN/MRoPE +
   // 3 W6 Llama 3 + 3 W7 LongRoPE + 3 W8 dynamic-NTK.
   CHECK(cases >= 46);
+  // #755: the non-op skip is counted, so a declared capture disappearing from
+  // the tree is visible rather than indistinguishable from a quiet `continue`.
+  CHECK(non_op >= 1);
 }
 
 TEST_CASE("qwen3.5 MTP standalone head parity (dgx-only, CUDA)") {

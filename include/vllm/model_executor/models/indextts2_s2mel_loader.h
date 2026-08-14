@@ -22,6 +22,8 @@
 #include <string>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/dit_front.h"
+#include "vllm/model_executor/models/dit_stack.h"
 #include "vllm/model_executor/models/dit_tail.h"
 
 namespace vllm {
@@ -32,6 +34,23 @@ struct S2MelTail {
   dit_tail::Config config;
   dit_tail::Weights weights;
 };
+
+// The WHOLE estimator: conditioning front end, transformer stack, tail. With
+// this the S2Mel decoder is loadable end to end from the converted checkpoint.
+struct S2MelEstimator {
+  dit_front::Config front_config;
+  dit_front::Weights front;
+  dit_stack::Config stack_config;
+  dit_stack::Weights stack;
+  dit_tail::Config tail_config;
+  dit_tail::Weights tail;
+};
+
+// `num_heads` is the one dimension the weights cannot express: `wqkv` is
+// [3 * heads * head_dim, dim] whatever the head count. It comes from the config
+// and is an explicit ARGUMENT, as the talker loader's is.
+S2MelEstimator LoadS2MelEstimator(const SafetensorsFile& file, int64_t num_heads);
+S2MelEstimator LoadS2MelEstimator(const std::string& path, int64_t num_heads);
 
 // Throws std::runtime_error naming the missing or misshapen tensor. A checkpoint
 // that is merely INCOMPLETE must not load as if it were whole.

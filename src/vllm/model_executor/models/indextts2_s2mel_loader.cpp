@@ -183,6 +183,98 @@ S2MelTail LoadS2MelTail(const SafetensorsFile& file) {
   return out;
 }
 
+namespace {
+
+int64_t CountLayers(const SafetensorsFile& file) {
+  int64_t n = 0;
+  const std::string stem = std::string(kPrefix) + "transformer.layers.";
+  for (const std::string& name : file.Names()) {
+    if (name.rfind(stem, 0) == 0 &&
+        name.find(".attention.wqkv.weight") != std::string::npos) {
+      ++n;
+    }
+  }
+  return n;
+}
+
+}  // namespace
+
+S2MelEstimator LoadS2MelEstimator(const SafetensorsFile& file, int64_t num_heads) {
+  S2MelEstimator out;
+
+  const S2MelTail tail = LoadS2MelTail(file);
+  out.tail_config = tail.config;
+  out.tail = tail.weights;
+  const int64_t dim = tail.config.hidden;
+
+  // The conditioning front end. `cond_x_merge_linear` is [dim, wide] where wide
+  // is dim + 2 * in_channels + style, so the STYLE width falls out of it and is
+  // not guessed.
+  const std::vector<int64_t> merge = Shape(file, "cond_x_merge_linear.weight");
+  if (merge.size() != 2 || merge[0] != dim) {
+    Fail("cond_x_merge_linear.weight must be [hidden, wide]");
+  }
+  const int64_t style = merge[1] - dim - 2 * tail.config.in_channels;
+  if (style <= 0) {
+    Fail("cond_x_merge_linear.weight is not [hidden, hidden + 2*in_channels + style]");
+  }
+  out.front_config.hidden = dim;
+  out.front_config.in_channels = tail.config.in_channels;
+  out.front_config.style = style;
+  out.front.cond_proj_w = Read(file, "cond_projection.weight");
+  out.front.cond_proj_b = Read(file, "cond_projection.bias");
+  out.front.merge_w = Read(file, "cond_x_merge_linear.weight");
+  out.front.merge_b = Read(file, "cond_x_merge_linear.bias");
+
+  // The transformer stack.
+  const int64_t layers = CountLayers(file);
+  if (layers <= 0) {
+    Fail("no transformer layers found; this is not an S2Mel estimator");
+  }
+  if (num_heads <= 0 || dim % num_heads != 0) {
+    Fail("num_heads (" + std::to_string(num_heads) +
+         ") must be positive and divide the hidden width (" + std::to_string(dim) + ")");
+  }
+  const std::vector<int64_t> w1 = Shape(file, "transformer.layers.0.feed_forward.w1.weight");
+  if (w1.size() != 2 || w1[1] != dim) {
+    Fail("transformer.layers.0.feed_forward.w1.weight must be [intermediate, hidden]");
+  }
+  out.stack_config.dim = dim;
+  out.stack_config.heads = num_heads;
+  out.stack_config.head_dim = dim / num_heads;
+  out.stack_config.intermediate = w1[0];
+  out.stack_config.eps = 1e-5;
+
+  for (int64_t i = 0; i < layers; ++i) {
+    const std::string p = "transformer.layers." + std::to_string(i) + ".";
+    dit_stack::LayerWeights l;
+    l.block.wqkv = Read(file, p + "attention.wqkv.weight");
+    l.block.wo = Read(file, p + "attention.wo.weight");
+    l.block.w1 = Read(file, p + "feed_forward.w1.weight");
+    l.block.w2 = Read(file, p + "feed_forward.w2.weight");
+    l.block.w3 = Read(file, p + "feed_forward.w3.weight");
+    l.block.attn_proj_w = Read(file, p + "attention_norm.project_layer.weight");
+    l.block.attn_proj_b = Read(file, p + "attention_norm.project_layer.bias");
+    l.block.attn_norm_w = Read(file, p + "attention_norm.norm.weight");
+    l.block.ffn_proj_w = Read(file, p + "ffn_norm.project_layer.weight");
+    l.block.ffn_proj_b = Read(file, p + "ffn_norm.project_layer.bias");
+    l.block.ffn_norm_w = Read(file, p + "ffn_norm.norm.weight");
+    // Present on EVERY layer upstream, consulted only on receiving ones.
+    l.skip_in_w = Read(file, p + "skip_in_linear.weight");
+    l.skip_in_b = Read(file, p + "skip_in_linear.bias");
+    out.stack.layers.push_back(std::move(l));
+  }
+  out.stack.norm_proj_w = Read(file, "transformer.norm.project_layer.weight");
+  out.stack.norm_proj_b = Read(file, "transformer.norm.project_layer.bias");
+  out.stack.norm_w = Read(file, "transformer.norm.norm.weight");
+  return out;
+}
+
+S2MelEstimator LoadS2MelEstimator(const std::string& path, int64_t num_heads) {
+  const SafetensorsFile file = SafetensorsFile::Open(path);
+  return LoadS2MelEstimator(file, num_heads);
+}
+
 S2MelTail LoadS2MelTail(const std::string& path) {
   const SafetensorsFile file = SafetensorsFile::Open(path);
   return LoadS2MelTail(file);

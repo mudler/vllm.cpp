@@ -532,48 +532,45 @@ token, 17 steps instead of 18), and our acceptance equals its modal value
 (48.6%, 4.94 tokens/step). Per-step the engines are aligned (30.4 vs ~30.1 ms,
 34.7 vs ~34.5). Under a LOW-NOISE harness (clocks pinned at 1800
 MHz, 30 reps, drift bracketed at -0.088%, the oracle's non-modal draws excluded)
-the code cell is **0.975x with NON-OVERLAPPING distributions** — a real gap, not
-noise, and the earlier "within resolution" reading was too generous. Ours slowed
+that session's code cell measured **0.975x with NON-OVERLAPPING
+distributions** — a real gap, not noise, and the earlier "within resolution"
+reading was too generous. It is one of four within-session ratios, listed
+below. Ours slowed
 more than the oracle when the clock was pinned, so the residual is
-SM-clock-sensitive work. PAIRED profiling localises it exactly: the SAME
-`marlin_moe_wna16::Marlin` kernel, the SAME 1520 launches, ours 249.22 ms vs
-upstream 230.39 ms -- **8.2% slower inside one kernel**, which at ~34% of wall is
-2.8% end-to-end and accounts for the whole measured 2.5%. Not an algorithm difference, and not the launch
-geometry either: the full template arguments match, `determine_exec_config` is
-byte-identical to the pinned upstream copy, and every OTHER kernel matches to
-0.2%. The inputs match too (scale bytes per expert,
-256-byte alignment, cudaMalloc residency), and the work counts were MEASURED:
-upstream loops 4.4% MORE blocks per launch (40.6 vs 38.9) and is still faster, so
-routing is refuted and normalising by work makes our deficit bigger -- **4.21 vs
-3.73 us per block, ~12.8% slower per unit of work**. Every source-level explanation is now
-eliminated -- kernel source, template instantiation, grid config, block size,
-shared-memory budget, reduction flags, scale layout, alignment, residency, CUDA
-toolkit (13.0 both) and arch all match -- and `ncu` plus cuobjdump then showed the
-COMPILED KERNELS ARE EQUIVALENT (94 registers and 3664 SASS instructions on both,
-upstream running its family-compatible sm_120 cubin against our sm_121a). The
-residual is therefore runtime and is now ATTRIBUTED: the kernel is DRAM-bound
-(L2 hit 9.5%) and we sustain **186.6 GB/s against upstream's 210.7**, a 12.9%
-effective-bandwidth gap that IS the whole per-unit-work difference. Weight
-residency is already staged correctly (cudaMalloc + one upload), and the slab itself is byte-for-byte the
-same size and stride as upstream's tensor (268 MB, no padding), so the cause is
-memory-system behaviour that no allocation change we can name would alter; upstream's ncu counters would settle it but its engine will not initialise under
-ncu in either replay mode. A C_tmp over-allocation (15-30 MB vs upstream's
-3.15 MB) was found and fixed, but an in-session A/B shows it is perf-NEUTRAL
-(+0.03%) -- an apparent +2.9% was machine drift, since GB10 cannot lock memory
-clocks. The ratio has now been measured WITHIN a single session three times --
-0.9757, 0.9646 and (ours->oracle->ours at free clocks, drift -0.89%) 0.9569 --
-so it is **~0.966 +/- 0.01, consistently below 1.0**, while the absolute numbers
-move up to 5% BETWEEN sessions for the same binary. Storage was raised as a
-possible distortion and is refuted: the weights are on local NVMe (no NAS mount
-exists on the box), a run reads 22.06 GB once at load, decode-time RSS is 4.8 GB
-because the mapping is released after upload, and 8 warm reps hold a 0.5%
-spread -- decode touches no storage. (That NVMe is 98% full, 76 GB free, which
-is its own operational risk given ENOSPC has previously produced a green report
-over a gate that never ran.) Editing
-the kernel, its launch config, layout or flags is NOT indicated: all are proven
-identical. (The repack kernels that appear to take 40% of a long run are
-LOAD-TIME.) NOT parity. The Gemma4 `1 + N` layout is coded and unit-tested but has
-never run on real weights.
+SM-clock-sensitive work. PAIRED profiling appeared to localise the residual to
+`marlin_moe_wna16::Marlin` (ours 249.22 ms vs upstream 230.39 ms over the same
+1520 launches), and every source-level explanation was eliminated -- kernel
+source, template instantiation, grid, block size, shared memory, flags, scale
+layout, alignment, residency, toolkit, arch -- with ncu and cuobjdump showing
+the compiled kernels EQUIVALENT (94 registers, 3664 SASS instructions on
+both). THAT LOCALISATION IS REFUTED. `scripts/marlin-moe-standalone.py` and
+`benchmarks/marlin_moe_standalone.cpp` drive each engine's own kernel outside
+its engine -- which is also what finally lets ncu attach to upstream,
+previously recorded as impossible in both replay modes -- and at matched work
+the two are indistinguishable: over 12 interleaved paired points ours averages
+5.3187 us/block against upstream's 5.3330, ratio 0.9973, sign flipping between
+runs, inside one standard deviation. The in-situ 8.2% therefore describes the
+RUNS, not the kernel, and so do the 12.8%-per-unit-work and 186.6-vs-210.7
+GB/s figures derived from it -- the latter also divided GRAPHED times by
+EAGER-mode block counts, so numerator and denominator came from different
+execution modes. END-TO-END, valid within-session paired ratios are 0.9757,
+0.9646, 0.9569 and 0.9889 (a fifth run was REJECTED on a -2.13% drift gate): a
+spread of 0.957-0.989 ACROSS BOOTS, with no single value being the ratio and
+the gap not resolved better than 1-4% on this hardware. An earlier claim here
+that the gap was 1.1% rather than 3.4% is WITHDRAWN: decomposed, our arm moved
++1.10% between those sessions while the ORACLE denominator moved -2.17%, so
+most of it was the oracle's boot state, and differencing ratios across boots
+is what this page forbids elsewhere. The warm-up arm does demonstrably remove
+a 6.6% WITHIN-RUN drift, which makes a run internally valid without moving the
+ratio. Standing traps: dram__bytes.sum reads n/a on GB10, so ncu's Memory
+Throughput % excludes DRAM traffic and is not a bandwidth utilisation; the GPU
+lock is $HOME/gpu.lock, and absolute timings from runs that took /tmp/gpu.lock
+ran unserialised and are LOWER bounds on achievable bandwidth, so a clean re-
+take can only raise the plateau; any MoE comparison that lets routing vary
+between arms measures the draw, not the change; and both blocks AND distinct
+experts must be controlled, since cost per distinct expert spans 4.47-7.50 us
+and is flat only above ~40 experts. NOT parity, and the row stays open.
+
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has
 landed all three CPU bricks (content-part parse + processor routing, the

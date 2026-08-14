@@ -503,7 +503,10 @@ values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
 2. ~~BigVGAN's separate checkpoint~~ DOWNLOADED, converted and LOADED:
    `nvidia/bigvgan_v2_22khz_80band_256x`, 783 tensors, and it renders a bounded
    waveform through `bigvgan::Forward`;
-3. W5 compose: drive the whole chain on real weights and emit a WAV;
+3. W5 compose: the ACOUSTIC CHAIN is done -- length regulator, CFG'd CFM
+   Euler loop over the real estimator, BigVGAN, WAV, all on real weights.
+   What remains is one entry point that takes text and a reference clip and
+   runs the talker's codes through it;
 4. W6b, the two routes and ABI v19;
 5. W7 speed, which additionally needs #633;
 6. the INFERRED emotion path (Path A): the `emo_conditioning_encoder` Conformer

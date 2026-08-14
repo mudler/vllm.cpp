@@ -20459,6 +20459,335 @@ Oracle draws remain bimodal (~147.3 and ~155.6), the same one-extra-accepted-tok
 effect as the fibacc run, so its MODAL draws are the honest denominator.
 
 Evidence: `dgx:~/work/dspark-w6/iocheck.log`, `final_pair.log`.
+## SPEC-DSPARK / #442: upstream Marlin profiled under ncu at last; 6z CORROBORATED (2026-08-13)
+
+`scripts/marlin-moe-standalone.py` drives upstream's own
+`torch.ops._moe_C.moe_wna16_marlin_gemm` on the 35B-A3B decode shapes with no
+EngineCore, no multiprocessing and no model load, which is what makes `ncu`
+attach -- the blocker recorded as "BLOCKED, both replay modes TRIED". vLLM
+0.23.1rc1.dev1511+g555967922 (identity asserted), torch 2.13.0+cu130, GB10.
+
+STATIC GEOMETRY (trustworthy): grid 144, block 128, 32768 B shared per block.
+48 SMs x 102400 B shared => 3 blocks/SM => 25% occupancy (achieved 25.98%), and
+48 x 3 = 144 = the grid. A persistent single wave; 94 registers/thread.
+
+MEASUREMENT TRAP: `dram__bytes.sum` is `n/a` on GB10 -- no DRAM counters exist.
+The SpeedOfLight "Memory Throughput 11.14%" therefore excludes DRAM traffic, and
+reading it beside "Compute (SM) 11.42%" as "latency-bound" is WRONG.
+
+WHAT THE WORK SWEEP SHOWS (gate_up, 80 iters/point; pool = distinct experts):
+
+| pool | blocks | us/call | us/block | implied GB/s |
+|---|---|---|---|---|
+| 8 | 13 | 19.9 | 1.53 | fits L2 |
+| 16 | 18 | 20.8 | 1.15 | fits L2 |
+| 24 | 22 | 65.0 | 2.96 | transition |
+| 32 | 27 | 157.0 | 5.81 | 202.9 |
+| 48 | 38 | 207.0 | 5.45 | 216.6 |
+| 64 | 45 | 249.5 | 5.55 | 212.7 |
+| 128 | 58 | 306.5 | 5.28 | 223.2 |
+| 256 | 65 | 339.6 | 5.22 | 225.8 |
+
+1179648 B streamed per block (1 MiB weights + 128 KiB scales). us/block is FLAT
+at 5.2-5.5 across a 2.4x range of work: constant bytes/second, i.e. bandwidth
+limited. Plateau 203-226 GB/s.
+
+CONSEQUENCE: the derived in-situ figures land ON this plateau. Upstream's
+210.7 GB/s is INSIDE it (upstream runs at the kernel's achievable bandwidth);
+ours at 186.6 GB/s is ~12% BELOW. An independent standalone measurement now
+CORROBORATES the DRAM attribution rather than replacing it. What does not
+survive is the per-unit-work DIVISION: with a fixed 144-CTA grid, block count is
+loop iterations, and the sweep prices 38.9 -> 40.6 blocks at about +4.4%.
+
+NOT YET RUN, and decisive: our kernel through this same harness, us/block against
+the 5.2-5.5 plateau. Occupancy (25%, shared-memory capped, under 25600 B would
+buy 4 blocks/SM) is a real but SECONDARY lever at ~75-80% of this device's
+~273 GB/s.
+
+Absolute us/call is not comparable in-situ (uniform synthetic routing occupies
+61-65 blocks vs the model's 38.9-40.6); geometry, regime shape and plateau
+bandwidth are.
+
+Evidence: `dgx.casa:~/work/marlin442/`.
+
+## SPEC-DSPARK / #442: our Marlin == upstream's at matched work; 6x REFUTED (2026-08-13)
+
+`benchmarks/marlin_moe_standalone.cpp` is the OUR-side arm of the harness in the
+previous entry: same 35B-A3B gate_up shapes, same expert-pool control over the
+occupied block count, driving `vt::MoeGroupedGemmNvfp4Marlin`.
+
+Sweep, us/block, ours vs upstream: 5.482/5.813 (pool 32), 5.525/5.323 (40),
+5.311/5.446 (48), 5.318/5.545 (64), 5.194/5.284 (128), 5.261/5.224 (256). Ours
+plateaus on the SAME 5.2-5.5 band.
+
+Two INTERLEAVED paired runs, pool 48 and 128, 3 reps each, 12 points per arm:
+
+| | n | mean us/block | sd | range |
+|---|---|---|---|---|
+| ours | 12 | 5.3187 | 0.124 | 5.083-5.562 |
+| upstream | 12 | 5.3330 | 0.151 | 5.042-5.560 |
+
+ours/upstream = 0.9973 (ours 0.27% FASTER), inside one sd, sign flipping between
+runs. A per-call workspace memset ours pays and upstream does not was isolated
+via `--zero-ws 0`: noise.
+
+CONSEQUENCE: the in-situ "8.2% slower inside one kernel / 12.8% per unit work /
+186.6 vs 210.7 GB/s" does NOT reproduce at matched work. Both engines reach the
+same 203-226 GB/s plateau. That attribution describes the in-situ RUNS, not the
+kernel, and the localisation of the residual to `marlin_moe_wna16::Marlin` is
+REFUTED.
+
+WHERE TO LOOK NEXT: the sweep shows time is set by DISTINCT EXPERTS touched per
+launch (1.15 us/block at 16 experts, weights in L2; ~5.3 above ~27, streaming --
+a 4.6x swing). Blocks are not experts, so the recorded 38.9 vs 40.6 blocks does
+not settle it. Measure distinct experts per launch on both arms IN SITU.
+
+CAVEATS: our arm links ~/work/pr234's build, vendored marlin_mm_moe.cu
+byte-identical to main (md5 85c40e4869bc6ec594b8cfb97fb58b3c), dispatcher
+predates the perf-neutral C_tmp cap. Ours times with steady_clock over 80
+iterations, upstream with CUDA events.
+
+Evidence: `dgx.casa:~/work/marlin442/`.
+
+## SPEC-DSPARK / #442: the in-situ denominator was WRONG -- experts, not blocks (2026-08-13)
+
+Holding blocks roughly fixed while varying DISTINCT experts (upstream arm, gate_up):
+
+| M | blocks | distinct | us/call | us/block |
+|---|---|---|---|---|
+| 64 | 73 | 20 | 89.4 | 1.22 |
+| 64 | 82 | 40 | 227.1 | 2.77 |
+| 64 | 94 | 80 | 427.2 | 4.55 |
+| 64 | 216 | 216 | 1121.2 | 5.19 |
+| 128 | 137 | 20 | 149.9 | 1.09 |
+| 128 | 146 | 40 | 220.0 | 1.51 |
+| 128 | 255 | 250 | 1298.6 | 5.09 |
+
+M=128: 137 -> 146 blocks is +6.6% blocks and +46.7% TIME, because distinct
+experts doubled. Cost per DISTINCT EXPERT is flat at 5.2-5.7 us (1.125 MiB,
+~205-225 GB/s); cost per BLOCK varies 4.7x. So time ~= distinct_experts x
+1.125 MiB / ~215 GB/s and blocks are nearly irrelevant.
+
+Every in-situ comparison normalised by BLOCKS (38.9 ours vs 40.6 upstream), which
+is not the driver. Applying the model to the recorded launches: ours 164.0 us
+implies ~30 distinct experts, upstream 151.6 us implies ~28. About TWO distinct
+experts per launch reproduces the entire 8.2% with zero implementation
+difference, and the matched-work comparison already put the two kernels at
+0.27%.
+
+It also explains both in-situ arms beating the standalone plateau per block
+(4.21 and 3.73 vs ~5.3): in situ several blocks share an expert.
+
+RULE FOR FUTURE MoE COMPARISONS: control distinct experts per launch, or force
+both arms onto an identical token stream. Block counts compare the wrong
+quantity. VT_MOE_PAD_STATS should count distinct experts as well.
+
+Does NOT move the e2e ratio (~0.966, wall-clock on matched prompts); it removes
+the attribution of its residual.
+
+Evidence: `dgx.casa:~/work/marlin442/`.
+
+## SPEC-DSPARK / #442: CORRECTION -- ours touches FEWER experts, not more (2026-08-13)
+
+The entry above inferred, from the distinct-experts model, that our in-situ
+launches touch ~30 distinct experts against upstream's ~28 and that this
+explained the 8.2%. That is BACKWARDS, and the counts contradicting it were
+already in this file: the 2026-08-12 both-sides measurement recorded ours 311.2
+padded tokens / 38.9 blocks per call against upstream 324.8 / 40.6.
+
+At M=9 the 72 (token, expert) pairs spread over ~39 experts at under 8 tokens
+each, so moe_align emits ONE block per expert and blocks and distinct experts
+COINCIDE at this shape. That measurement was therefore already counting experts,
+upstream touches MORE of them, and the routing explanation stays refuted exactly
+as it concluded. Blocks and experts do come apart at larger batches (spec §6af
+measures 4.7x divergence at M=64/128), which is why the distinction is worth
+keeping, but it does not apply at the decode shape.
+
+What survives, and it is sharper than what it replaces:
+
+  standalone, matched work   ours == upstream to 0.27%
+  in situ                    ours does LESS work (38.9 vs 40.6 expert-blocks)
+                             and takes MORE time (164.0 vs 151.6 us)
+
+A kernel identical in isolation cannot be slower in place because of its own
+code, so the deficit belongs to the CONTEXT, not the kernel and not the routing.
+Candidates in evidence order: expert-weight residency in situ (this repo has
+measured 20-30% per-GEMM for host/ATS-retagged decode weights, and the
+standalone arm's fresh cudaMalloc cannot reproduce that), clock/power state
+across runs, and overlap with concurrent stream work.
+
+Measurement-base caveat: in-situ per-launch times are summed profiler kernel
+durations, standalone are wall-clock over 80 iterations. Both in-situ arms beat
+the standalone plateau per unit work (4.21 and 3.73 vs ~5.3), which may be partly
+that difference rather than a physical one.
+
+## SPEC-DSPARK / #442: the GEMM MIX dissolves the anomaly, and the in-situ normalisation has a MODE hole (2026-08-13)
+
+Two arithmetic corrections close out this thread.
+
+1. THE MIX. The 1520 in-situ launches are 760 gate_up plus 760 down, and down's
+   per-expert bytes are exactly HALF gate_up's: gate_up is 2N x K/2 weights plus
+   2N x K/16 scales = 1.1250 MiB, down is K x N/2 plus K x N/16 = 0.5625 MiB, so
+   the mixed average is 0.8438 MiB per expert-block. Comparing a mixed in-situ
+   average against a gate_up-ONLY standalone plateau was apples to oranges, and
+   it is what made both arms appear to "beat" the plateau (4.21 and 3.73 us
+   against ~5.3). They did not.
+
+   Redone with the right bytes:
+
+   | | blocks | MiB/launch | us | implied GB/s |
+   |---|---|---|---|---|
+   | ours | 38.9 | 32.8 | 164.0 | **209.9** |
+   | upstream | 40.6 | 34.3 | 151.6 | **236.9** |
+
+   Standalone gate_up plateau, measured: 203-226 GB/s. **Ours sits INSIDE it.
+   Upstream sits ABOVE it.** So we run this kernel at the bandwidth it achieves
+   in isolation, and upstream gets something in place that the isolated kernel
+   does not -- cache reuse across the gate_up/down pair (down's weights are half
+   size, so more of the working set can persist) is the first candidate. The
+   framing inverts: we are not slow here, upstream is unusually fast.
+
+2. THE MODE HOLE. This file already warns "a work COUNT may be taken under
+   different execution modes; a TIME may not", and then the per-unit-work
+   normalisation does exactly what that warns against: the 38.9/40.6 counts were
+   taken EAGER (ours VT_SPEC_DECODE_GRAPH=0, upstream enforce_eager, both
+   because the probes could not survive capture/compile) while the 249.2/230.4 ms
+   times came from the GRAPHED profile. Nothing establishes that the graphed runs
+   had the same blocks per launch as the eager ones, so every ratio built by
+   dividing those times by those counts -- 4.21 vs 3.73 us/block, 12.8% per unit
+   work, 186.6 vs 210.7 GB/s -- rests on a denominator measured in a different
+   execution mode than its numerator.
+
+CONSEQUENCE: the only like-for-like Marlin comparison anyone has is the
+standalone one, and it says parity (0.9973, inside 1 sd). Closing the in-situ
+question needs blocks AND time from the SAME graphed run, which needs a probe
+that survives capture -- a device-side counter written by the kernel launcher,
+read once at the end, never a per-launch D2H sync.
+
+Evidence: `dgx.casa:~/work/marlin442/`.
+
+## SPEC-DSPARK / #442: blocks_per_sm is a DEAD lever, and the box is currently unfit to measure 3% (2026-08-13)
+
+`moe_wna16_marlin_gemm`'s last parameter is `blocks_per_sm`; both engines pass
+-1 (auto), which yields 32768 B of shared memory, 3 blocks/SM and 25% occupancy.
+Since the kernel runs at ~78% of peak bandwidth, forcing a higher value looked
+like a best-in-class lever. It is not.
+
+FIRST SWEEP, UNSEEDED, and it is a trap worth recording: bps -1/1/4 read slow and
+2/3/5/6/8 read fast, apparently 8.7%. The routing was redrawn per run, so
+`distinct` moved 35-41 and the sweep was measuring the DRAW, not the parameter.
+Time tracks distinct experts, so any comparison that lets routing vary measures
+nothing else.
+
+SEEDED (torch.manual_seed, identical 33 distinct / 33 blocks everywhere), 4
+interleaved reps at 120 iters:
+
+| bps | runs (us) | mean excl. outliers |
+|---|---|---|
+| -1 (auto) | 191.3, 367.8, 177.2 | 184.2 |
+| 3 | 181.1, 171.1, 177.6, 353.0 | 176.6 |
+| 4 | 177.7, 178.6, 179.8, 180.3 | 179.1 |
+| 5 | 181.7, 184.2, 179.4 | 181.7 |
+
+Between-config spread 4.3%; WITHIN-config spread comparable (bps=3 alone ranges
+171-181). No reliable effect. The lever is DEAD, and the 8.7%
+came from the UNSEEDED first pass, i.e. the routing draw moving rather than the
+parameter.
+
+ENVIRONMENT, and this is the more useful finding: two of fourteen runs returned
+~2x (367.8 and 353.0) and two runs produced no output at all. A box that emits
+2x outliers cannot resolve a 3.4% question, and this one is currently contended
+-- a concurrent session has been building and rebuilding a ~79G tree on the same
+hardware. No parity measurement taken in this window should be trusted, in
+either direction. Earlier paired numbers in this file were taken before that
+contention began and were interleaved, which is what makes them survivable.
+
+Evidence: `dgx.casa:~/work/marlin442/`.
+
+## SPEC-DSPARK / #442: CORRECTION -- the standalone runs were taken UNLOCKED (2026-08-13)
+
+Every standalone Marlin run in the entries above was wrapped in
+`flock /tmp/gpu.lock`. That is the WRONG FILE. This box's GPU lock is
+`$HOME/gpu.lock` -- it is what `final_pair.sh` takes and what other sessions
+hold. `/tmp/gpu.lock` coordinates with nothing, so those runs executed
+unserialised against whatever else was on the GPU, and at least one concurrent
+`test_qwen27_spec_decode_concurrent` (15.9 GB RSS) overlapped them.
+
+That is the likeliest source of the ~2x outliers (367.8 and 353.0 us) in the
+blocks_per_sm sweep, and it was mine, not the other session's. An earlier note
+in this session blamed them for not locking; the reverse is true.
+
+WHAT SURVIVES. The ours-vs-upstream comparisons were INTERLEAVED within a single
+run (ours, upstream, ours, upstream), so contention lands on both arms alike and
+the RATIO is the quantity interleaving protects. 0.9973 with the sign flipping
+between reps still stands as "indistinguishable", though the error bars are wider
+than the quoted sd suggests.
+
+WHAT DOES NOT. Absolute us/call and us/block from those runs, including the
+203-226 GB/s plateau, are upper-bounded rather than exact -- an unlocked box can
+only make them slower. The plateau should be re-taken under `$HOME/gpu.lock`
+before it is quoted as the kernel's achievable bandwidth. The two-regime SHAPE
+(L2-resident under ~18 blocks, streaming above ~27) and the distinct-experts
+scaling are robust to a uniform slowdown and do not need re-taking.
+
+RULE: take `$HOME/gpu.lock`, not `/tmp/gpu.lock`. Check `fuser -v ~/gpu.lock`
+before assuming the GPU is free; `nvidia-smi` showing no compute apps does NOT
+mean it is unreserved, since a holder may be between phases.
+
+## SPEC-DSPARK / #442: CORRECTIONS from fresh review -- per-expert cost is NOT flat, and the bound direction was wrong (2026-08-13)
+
+A fresh review of the branch found two blocking errors in the entries above.
+Both are recorded here rather than edited away, since this log is append-only.
+
+1. "Cost per DISTINCT EXPERT is flat at 5.2-5.7 us" is FALSE. Recomputing
+   us/call / distinct from the table's own numbers gives 4.470, 5.678, 5.340,
+   5.191, 7.495, 5.500, 5.194 -- a range of 4.47 to 7.50. The two distinct=20
+   rows are the tell: identical expert counts, 89.4 vs 149.9 us, blocks 73 vs
+   137. THERE, TIME TRACKS BLOCKS, which is what a flat-per-expert model calls
+   irrelevant.
+
+   The honest model has the same two regimes as the L2 finding. Weights fitting
+   L2 (low distinct) => not re-streamed => cost set by per-block work => time
+   tracks BLOCKS. Weights not fitting (distinct >= ~40 here) => cost set by
+   streaming => time tracks DISTINCT EXPERTS at 5.2-5.7 us each.
+   `time ~= distinct x 1.125 MiB / ~215 GB/s` applies ONLY in the second regime;
+   at distinct=20 it predicts 109.7 us against 89.4 and 149.9 measured, off by
+   -19% and +37%.
+
+   The rule this file stated -- "control distinct experts per launch" -- is
+   therefore INCOMPLETE. Control BOTH distinct experts AND blocks, or state
+   which regime the comparison is in.
+
+2. The lock caveat gave the bound the WRONG DIRECTION. It called the plateau an
+   upper bound. Contention inflates TIME, so a bandwidth computed as bytes/time
+   is a LOWER BOUND on what the kernel achieves. A re-take under
+   `$HOME/gpu.lock` can only move the plateau UP, which would move our in-situ
+   209.9 GB/s BELOW it and REVERSE the "ours is inside it, upstream above it"
+   inversion. That inversion is the least favourable reading to us the data
+   admits and the one most likely to change on a clean re-take.
+
+3. The plateau range 203-226 GB/s mixes bands: over the rows actually flat
+   (>= 38 blocks) it is 212.7-225.8, and the 203 endpoint is the 27-block row at
+   5.81 us/block, which the same paragraph places OUTSIDE the flat band. Under
+   the narrower, self-consistent range, "ours (209.9) sits INSIDE it" is FALSE.
+
+4. The harness arms draw routing from independent RNG streams (python
+   torch.manual_seed, C++ mt19937(1234)), so at the same pool they occupy
+   different block counts (48: 39 vs 38; 128: 54 vs 58). "At matched blocks" was
+   inaccurate -- blocks are NORMALISED, not matched. Neither arm accepts an
+   external routing tensor, so the harness cannot yet satisfy the "force both
+   arms onto one token stream" rule stated one section later. The 0.9973 ratio
+   is probably still sound at M=9, but its error bars carry an undisclosed draw
+   term on top of the contention term.
+
+5. `benchmarks/marlin_moe_standalone.cpp` is not wired into any build target, so
+   nothing compiles it and it will rot against
+   `vt::MoeGroupedGemmNvfp4Marlin`'s signature. Tracked as owed.
+
+NET EFFECT ON CONCLUSIONS: 6ae's interleaved 0.9973 (the kernel is not the gap)
+SURVIVES, since interleaving is what protects a ratio against both contention
+and draw. 6ag's "we are not slow, upstream is unusually fast" DOES NOT survive
+as stated and is now marked provisional pending a re-take under the right lock.
 
 ## BENCH-CLOCK-CONTROLLED-PIN-GRID: the first series measured with the correct oracle, its production configuration, and a controlled clock at the same time (2026-08-13)
 
@@ -20673,6 +21002,52 @@ the attribution, per AGENTS.md: evidence is moved and annotated, never removed.
   for the residual TTFT gap is that it is the same prefill glue attributed at
   92.5% for 27B, now measured against a correctly fused denominator for the first
   time, so the attribution itself is owed a re-run.
+
+## SPEC-DSPARK: the FIRST fully-controlled paired run -- 0.9889, not 0.966 (2026-08-13)
+
+Every earlier ratio in this file was taken with a COLD leading arm. Correcting
+that moves the number materially.
+
+Controls, all four present for the first time:
+  * `$HOME/gpu.lock` (earlier standalone runs took /tmp/gpu.lock, which
+    coordinates with nothing)
+  * a DISCARDED warm-up arm before the first measured arm -- the GB10 SM clock
+    ramps over MINUTES (1449 -> 2190 MHz observed), so dropping rep 1 is not
+    enough and a whole first arm reads ~6% low
+  * settle barriers between arms: vLLM asserts free GPU memory does not GROW
+    during its startup profile, and GB10 returns our engine's pages lazily, so
+    an oracle launched straight after our arm dies with
+    "Initial free memory 68.53 GiB, current free memory 89.42 GiB"
+  * a host-RAM headroom guard before the oracle. gpu_memory_utilization
+    reserves HOST RAM on GB10, so an oracle without headroom takes the MACHINE
+    down: three reboots on 2026-08-13 (08:57, 09:29, 16:29), at least the last
+    of them ours. The oracle copy runs at 0.35 instead of 0.55; at
+    max_num_seqs=2 / max_model_len=2048 the KV cache needed is a fraction of
+    either budget, so this cannot change decode speed.
+
+| arm | n | median tok/s | range |
+|---|---|---|---|
+| ours BEFORE | 9 | 142.604 | 141.67-142.79 |
+| ours AFTER | 9 | 142.140 | 135.23-142.87 |
+| ours combined | 18 | 142.534 | -- |
+| oracle | 15 | 144.130 | 141.86-151.84 |
+
+DRIFT before -> after = **-0.33%**, inside the 1% validity gate this harness
+sets for itself, so the run counts. Ratios: 0.9894 (before), 0.9862 (after),
+**0.9889 (combined)**.
+
+**So the gap is 1.1%, not 3.4%.** The 0.9757 / 0.9646 / 0.9569 recorded earlier
+were measuring an unwarmed first arm as much as the engine. NOT parity -- 0.9889
+is still below 1.0 -- but the deficit is a third of what the record claimed.
+
+Caveats kept deliberately: n=1 paired run, so this needs a repeat before it is
+treated as settled. The ours-AFTER arm carries four low outliers (135.2, 135.5,
+139.0, 139.9) absent from the BEFORE arm, so something touched the box during
+it; the medians are unaffected but the after arm's spread is not trustworthy.
+The oracle shows ONE fast draw (151.84) against fourteen at ~144, the old
+bimodality appearing once, which the median absorbs.
+
+Evidence: `dgx.casa:~/work/dspark-w6/paired_lm.log`, `~/paired_lm.sh`.
 ## LTX-2.5 L9c — the per-phase pool drain is worth 0.11 GiB, and L9B's 58 GB runaway does not reproduce (2026-08-13, `row/LTX25-L9C-CONNECTOR-DRAIN`, issue [#435](https://github.com/mudler/vllm.cpp/issues/435))
 
 **No speed number is claimed and none is implied.** LTX-2.5's speed axis is
@@ -20989,6 +21364,52 @@ refusal never fired: `Ltx2SelectTextFeatureVariant` **does** refuse a partial se
 called the selector before L13** — the marker keys and the engine's first call to
 it landed in the same commit, so there was no earlier run for it to refuse.
 
+## SPEC-DSPARK: the n=2 repeat FAILS its own drift gate (2026-08-13)
+
+The confirmation run for the 0.9889 result. Reported in full because it does not
+confirm cleanly, and the gate that rejects it was set before the number existed.
+
+| | run 1 | run 2 |
+|---|---|---|
+| ours BEFORE (n=9) | 142.604 | 146.740 |
+| ours AFTER (n=9) | 142.140 | 143.619 |
+| DRIFT before->after | **-0.33%** | **-2.13%** |
+| validity (gate: abs(drift) < 1%) | PASS | **FAIL** |
+| ours combined | 142.534 | 145.117 |
+| oracle (n=15) | 144.130, UNIMODAL | 148.150, BIMODAL |
+| ratio | **0.9889** | 0.9795 (not usable) |
+
+RUN 2 IS REJECTED, not averaged in. Its two `ours` arms disagree by 2.13%,
+which is twice the effect being measured, and the drift is DOWNWARD (the closing
+arm slower than the opening one) -- thermal or contention, the opposite sign
+from the cold-start ramp the warm-up arm was built to remove. Bracketing on its
+own arms gives 0.9912 (before) to 0.9701 (after): it cannot distinguish parity
+from a 3% deficit.
+
+TWO THINGS IT DOES ESTABLISH.
+
+The oracle's BIMODALITY IS BOOT-DEPENDENT. Run 1, unimodal: 15 draws at ~144
+with one outlier. Run 2, clearly bimodal: 10 draws at 148.05 and 5 at 156.61,
+the same one-extra-accepted-token effect seen in earlier sessions. Same script,
+same pin, same prompt, different boot. So whether the modal-value correction is
+needed is a property of the BOOT, not of the workload, and a harness cannot
+assume either shape.
+
+ABSOLUTES MOVED AGAIN ACROSS THE REBOOT, both arms together: ours 142.5 -> 145.1
+(+1.8%), oracle 144.1 -> 148.2 (+2.8%). Consistent with the recorded 12.8%
+boot-to-boot SM clock variation, and further reason no absolute from this box is
+quotable across boots.
+
+WHERE THAT LEAVES THE RATIO: one VALID paired run at 0.9889, one REJECTED run
+bracketing 0.970-0.991. Both are consistent with a deficit of roughly 1-2%, and
+neither reaches parity. The honest statement is "~0.98, not parity, n=1 valid"
+-- not "0.9889 confirmed".
+
+The box rebooted or dropped FIVE times on 2026-08-13 (08:57, 09:29, 16:29,
+~21:16, plus an outage around 20:40), which is the binding constraint on
+resolving 1% here at all.
+
+Evidence: `dgx.casa:~/work/dspark-w6/paired_lm.log`, `paired_lm2.log`.
 ## BACKEND-TENSTORRENT-MISTRAL — Mistral-7B-v0.3 first data point (2026-08-14)
 
 `vllm-cli --prompt "Hello" --max-tokens 32 --repeat 2 --device auto` on a
@@ -21011,3 +21432,102 @@ rather than a comparison that was run and lost.
 
 Measured by lu-zero (PR #431, issue #670); recorded here because a measurement
 belongs on the measurement surfaces, not only in a row spec.
+
+## SPEC-DSPARK: RETRACTION -- the "cold arm explains it" causal claim does not hold (2026-08-14)
+
+A fresh review returned FAIL on the headline attached to the 0.9889 run. The
+number stands; the EXPLANATION does not, and the explanation is what made it
+sound like progress.
+
+CLAIMED: "every earlier ratio was taken with a COLD leading arm, and correcting
+that moves the gap from 3.4% to ~1%."
+
+DECOMPOSED, session 3 (§6ac, 140.98 / 147.32 = 0.9569) against run 1
+(142.534 / 144.130 = 0.9889):
+
+| | change |
+|---|---|
+| OUR arm | **+1.10%** |
+| ORACLE denominator | **-2.17%** |
+| ratio if only OUR arm had moved | 0.9675 |
+| ratio if only the ORACLE had moved | 0.9781 |
+
+**Two thirds of the improvement is the oracle being SLOWER on the new boot.**
+Our arm moved 1.1%, which is not enough to carry a 3.3-point ratio change.
+
+Worse, the comparison is one this file forbids elsewhere: absolutes move
+several percent across boots (measured +1.8% ours and +2.8% oracle between run 1
+and run 2), so a ratio from boot A and a ratio from boot B cannot be
+differenced. Attributing their difference to a harness change is exactly the
+cross-boot reasoning the record rejects when anyone else does it.
+
+Two further checks the causal claim fails:
+
+  * SIGN. §6ac session 3 was ALREADY ours -> oracle -> ours and its drift was
+    -0.89% -- the CLOSING arm slower. A cold leading arm predicts the opposite
+    sign. Run 2 is the same shape at -2.13%, and this file already calls that
+    sign "the opposite from the cold-start ramp".
+  * NO A/B. The load-bearing "an entire first arm reads ~6% low" is inferred
+    from an SM-clock observation. No warm-up-arm on/off A/B exists anywhere.
+    That single experiment is what would establish the mechanism, and it was
+    never run.
+
+Corroborating: in run 2 our arm was FASTER in absolute terms than in run 1
+(145.117 vs 142.534) and the ratio was WORSE (0.9795), because the oracle was
+faster too. The ratio tracks the oracle's boot state at least as much as ours.
+
+WHAT THE HONEST STATEMENT IS. Valid within-session ratios measured on this row:
+0.9757, 0.9646, 0.9569, and 0.9889 (run 2 rejected on drift). That is a spread
+of 0.957 to 0.989 ACROSS BOOTS, and no single value is "the" ratio. The gap is
+somewhere in 1-4%, it is not resolved to better than that on this hardware, and
+the claim "the gap is 1.1%, not 3.4%" is WITHDRAWN. What the warm-up arm
+demonstrably fixes is a 6.6% within-run drift (§6ah run before/after), which is
+worth keeping for its own sake -- it makes a run INTERNALLY valid without
+telling us the ratio moved.
+
+ALSO CORRECTED, an arithmetic slip found in the same review: the run-2 bracket
+was published as 0.9912-0.9701. From the stated inputs (146.740 and 143.619
+against the table's oracle median 148.150) it is **0.9905-0.9694**. The
+published pair reproduces only against 148.05, the low-mode cluster value rather
+than the table's denominator, and the error moved the top end in the flattering
+direction.
+
+PER-REP VALUES, so these medians can be recomputed rather than trusted:
+
+  run 1 ours BEFORE: 141.666 142.604 142.592 142.672 142.630 142.787 142.746
+                     142.364 142.283
+  run 1 ours AFTER:  139.024 139.850 142.140 135.515 142.590 142.791 135.226
+                     142.478 142.870
+  run 1 oracle:      144.47 151.84 144.01 144.42 144.45 144.11 144.13 141.86
+                     144.16 144.09 144.11 144.28 144.68 143.89 144.02
+  run 2 ours BEFORE: 146.246 146.740 146.192 146.392 146.878 147.059 146.857
+                     146.706 147.083
+  run 2 ours AFTER:  143.027 143.819 143.608 143.954 144.042 143.619 143.507
+                     143.993 142.982
+  run 2 oracle:      157.18 156.84 156.48 148.29 148.15 148.04 153.10 147.80
+                     156.61 148.03 148.15 147.95 148.39 147.99 148.06
+
+(rep 1 of each `ours` arm is a cold outlier and is excluded from the medians:
+run 1 14.400 / 15.902 / 19.830, run 2 13.323 / 15.902 / 19.830 equivalents.)
+
+The harness itself is now committed as `scripts/dspark-paired-e2e.sh`; it was
+previously only on the gate host, which is why nothing in the tree could
+reproduce these medians.
+
+## SPEC-DSPARK: there are THREE gpu.lock spellings, and the paired runs took only one (2026-08-14)
+
+The correction two entries up said the lock is `$HOME/gpu.lock` and
+`/tmp/gpu.lock` is dead. Both true, and both incomplete: `/tmp/gpu` (NO suffix)
+is ALSO live. `.env:22` sets `GPU_LOCK=/tmp/gpu`, `.env.example:66` prescribes
+`flock $GPU_LOCK`, and `.agents/coordination.md:99` documents it, so some
+sessions genuinely serialise on that third name (issue #587).
+
+CONSEQUENCE FOR THIS ROW: the paired end-to-end runs took `$HOME/gpu.lock` only.
+Any session serialising on `/tmp/gpu` was therefore NOT excluded from them, so
+even the "correctly locked" runs are only partially serialised, and their
+ABSOLUTE numbers keep the same lower-bound status as the unlocked ones. The
+INTERLEAVED and within-run paired structure still protects the ratios, since
+contention lands on both arms alike -- which is now the third independent reason
+this row quotes ratios and not absolutes.
+
+`scripts/dspark-paired-e2e.sh` should take BOTH names before it is used again.

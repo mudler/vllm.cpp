@@ -205,6 +205,47 @@ std::vector<float> SelfAttentionRelativeKey(const std::vector<float>& x, int64_t
   return Linear(ctx, frames, hidden, hidden, w.out_w, w.out_b);
 }
 
+
+std::vector<float> EncoderLayer(const std::vector<float>& x, int64_t frames, int64_t hidden,
+                                int64_t heads, int64_t intermediate, int64_t conv_kernel,
+                                int64_t left_max, int64_t right_max, const EncoderLayerWeights& w,
+                                double eps) {
+  std::vector<float> h = x;
+
+  // 1. macaron feed-forward, HALF weighted.
+  {
+    const std::vector<float> n = LayerNorm(h, frames, hidden, w.ffn1_ln_gamma, w.ffn1_ln_beta, eps);
+    const std::vector<float> f = FeedForward(n, frames, hidden, intermediate, w.ffn1_in_w,
+                                             w.ffn1_in_b, w.ffn1_out_w, w.ffn1_out_b);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = f[i] * 0.5F + h[i];
+  }
+
+  // 2. self-attention, FULL residual.
+  {
+    const std::vector<float> n = LayerNorm(h, frames, hidden, w.attn_ln_gamma, w.attn_ln_beta, eps);
+    const std::vector<float> a =
+        SelfAttentionRelativeKey(n, frames, hidden, heads, left_max, right_max, w.attn);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = a[i] + h[i];
+  }
+
+  // 3. convolution module -- it applies its OWN layer_norm internally, so there
+  //    is no norm here; adding one would double-normalize.
+  {
+    const std::vector<float> c = ConvModule(h, frames, hidden, conv_kernel, w.conv, eps);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = h[i] + c[i];
+  }
+
+  // 4. second macaron feed-forward, HALF weighted.
+  {
+    const std::vector<float> n = LayerNorm(h, frames, hidden, w.ffn2_ln_gamma, w.ffn2_ln_beta, eps);
+    const std::vector<float> f = FeedForward(n, frames, hidden, intermediate, w.ffn2_in_w,
+                                             w.ffn2_in_b, w.ffn2_out_w, w.ffn2_out_b);
+    for (size_t i = 0; i < h.size(); ++i) h[i] = f[i] * 0.5F + h[i];
+  }
+
+  return LayerNorm(h, frames, hidden, w.final_ln_gamma, w.final_ln_beta, eps);
+}
+
 }  // namespace w2vbert
 }  // namespace models
 }  // namespace vllm

@@ -165,3 +165,48 @@ TEST_CASE("w2vbert attention is NOT causal: every frame sees the whole sequence"
   }
   CHECK(first > 1e-6);
 }
+
+TEST_CASE("w2vbert EncoderLayer reproduces the whole upstream Conformer block") {
+  // The macaron 0.5 factors live HERE, not in FeedForward, so only a whole-layer
+  // comparison can see them: every piecewise case above passes with or without.
+  const auto m = Weights();
+  vllm::models::w2vbert::EncoderLayerWeights w;
+  w.ffn1_ln_gamma = m.at("ffn1_layer_norm.weight");
+  w.ffn1_ln_beta = m.at("ffn1_layer_norm.bias");
+  w.ffn1_in_w = m.at("ffn1.intermediate_dense.weight");
+  w.ffn1_in_b = m.at("ffn1.intermediate_dense.bias");
+  w.ffn1_out_w = m.at("ffn1.output_dense.weight");
+  w.ffn1_out_b = m.at("ffn1.output_dense.bias");
+  w.attn_ln_gamma = m.at("self_attn_layer_norm.weight");
+  w.attn_ln_beta = m.at("self_attn_layer_norm.bias");
+  w.attn.q_w = m.at("self_attn.linear_q.weight"); w.attn.q_b = m.at("self_attn.linear_q.bias");
+  w.attn.k_w = m.at("self_attn.linear_k.weight"); w.attn.k_b = m.at("self_attn.linear_k.bias");
+  w.attn.v_w = m.at("self_attn.linear_v.weight"); w.attn.v_b = m.at("self_attn.linear_v.bias");
+  w.attn.out_w = m.at("self_attn.linear_out.weight");
+  w.attn.out_b = m.at("self_attn.linear_out.bias");
+  w.attn.distance_embedding = m.at("self_attn.distance_embedding.weight");
+  w.conv.ln_gamma = m.at("conv_module.layer_norm.weight");
+  w.conv.ln_beta = m.at("conv_module.layer_norm.bias");
+  w.conv.pointwise1 = m.at("conv_module.pointwise_conv1.weight");
+  w.conv.depthwise = m.at("conv_module.depthwise_conv.weight");
+  w.conv.dw_ln_gamma = m.at("conv_module.depthwise_layer_norm.weight");
+  w.conv.dw_ln_beta = m.at("conv_module.depthwise_layer_norm.bias");
+  w.conv.pointwise2 = m.at("conv_module.pointwise_conv2.weight");
+  w.ffn2_ln_gamma = m.at("ffn2_layer_norm.weight");
+  w.ffn2_ln_beta = m.at("ffn2_layer_norm.bias");
+  w.ffn2_in_w = m.at("ffn2.intermediate_dense.weight");
+  w.ffn2_in_b = m.at("ffn2.intermediate_dense.bias");
+  w.ffn2_out_w = m.at("ffn2.output_dense.weight");
+  w.ffn2_out_b = m.at("ffn2.output_dense.bias");
+  w.final_ln_gamma = m.at("final_layer_norm.weight");
+  w.final_ln_beta = m.at("final_layer_norm.bias");
+
+  const std::vector<float> x = Rand("hidden", kFrames * kHidden, 1.0);
+  const std::vector<float> got = vllm::models::w2vbert::EncoderLayer(
+      x, kFrames, kHidden, kHeads, kIntermediate, kConvKernel, kLeftMax, kRightMax, w,
+      kLayerNormEps);
+  REQUIRE(got.size() == static_cast<size_t>(kFrames * kHidden));
+  const double worst = Worst(got, kLayerOut, got.size());
+  INFO("max abs diff vs upstream Wav2Vec2BertEncoderLayer: ", worst);
+  CHECK(worst < 2e-5);
+}

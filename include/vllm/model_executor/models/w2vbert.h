@@ -78,6 +78,35 @@ std::vector<float> SelfAttentionRelativeKey(const std::vector<float>& x, int64_t
                                             int64_t hidden, int64_t heads, int64_t left_max,
                                             int64_t right_max, const SelfAttentionWeights& weights);
 
+
+struct EncoderLayerWeights {
+  std::vector<float> ffn1_ln_gamma, ffn1_ln_beta;
+  std::vector<float> ffn1_in_w, ffn1_in_b, ffn1_out_w, ffn1_out_b;
+  std::vector<float> attn_ln_gamma, attn_ln_beta;
+  SelfAttentionWeights attn;
+  ConvModuleWeights conv;
+  std::vector<float> ffn2_ln_gamma, ffn2_ln_beta;
+  std::vector<float> ffn2_in_w, ffn2_in_b, ffn2_out_w, ffn2_out_b;
+  std::vector<float> final_ln_gamma, final_ln_beta;
+};
+
+// Wav2Vec2BertEncoderLayer: the CONFORMER block.
+//
+//   x = ffn1(ln(x)) * 0.5 + x        <- macaron HALF step
+//   x = attn(ln(x))       + x
+//   x = conv(x)           + x        <- conv module normalizes internally
+//   x = ffn2(ln(x)) * 0.5 + x        <- macaron HALF step
+//   x = final_ln(x)
+//
+// THE 0.5 FACTORS are what make it macaron rather than two ordinary
+// feed-forwards. Dropping them still runs, still trains, and is a different
+// architecture -- so they are gated by comparing the whole layer, where the
+// piecewise cases cannot see them.
+std::vector<float> EncoderLayer(const std::vector<float>& x, int64_t frames, int64_t hidden,
+                                int64_t heads, int64_t intermediate, int64_t conv_kernel,
+                                int64_t left_max, int64_t right_max,
+                                const EncoderLayerWeights& weights, double eps);
+
 }  // namespace w2vbert
 }  // namespace models
 }  // namespace vllm

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "doctest/doctest.h"
+#include "vllm/model_executor/models/indextts2_config.h"
 #include "vllm/model_executor/models/indextts2_s2mel_loader.h"
 
 namespace {
@@ -315,5 +316,177 @@ TEST_CASE("the SHIPPED weights actually RUN through the ported tail") {
   CHECK(hi > lo);
   CHECK(std::fabs(sum / static_cast<double>(mel.size())) < 1e3);
   MESSAGE("real S2Mel tail ran: 80 x " << frames << " mel, range ["
+          << lo << ", " << hi << "]");
+}
+
+namespace {
+
+// A COMPLETE small estimator: the tail plus a front end and a one-layer stack,
+// at dimensions deliberately unlike the shipped ones so a hardcoded constant
+// cannot pass. hidden 8, in_channels 4, STYLE 5, heads 2, intermediate 12.
+std::string BuildEstimator(int64_t hidden = 8, int64_t in_ch = 4, int64_t style = 5,
+                           int64_t layers = 1, int64_t inter = 12) {
+  // Reuse the tail builder, then append the front and stack tensors.
+  const std::string tail = BuildTail(hidden, in_ch, hidden, 2, 3, 16);
+  // Rebuild from scratch: the two headers cannot simply be concatenated.
+  Builder b;
+  const std::string p = kP;
+  const int64_t wn = hidden;
+  b.Add(p + "skip_linear.weight", {hidden, hidden + in_ch});
+  b.Add(p + "skip_linear.bias", {hidden});
+  b.Add(p + "conv1.weight", {wn, hidden});
+  b.Add(p + "conv1.bias", {wn});
+  b.Add(p + "res_projection.weight", {wn, hidden});
+  b.Add(p + "res_projection.bias", {wn});
+  b.Add(p + "conv2.weight", {in_ch, wn, 1});
+  b.Add(p + "conv2.bias", {in_ch});
+  b.Add(p + "t_embedder2.mlp.0.weight", {wn, 16});
+  b.Add(p + "t_embedder2.mlp.0.bias", {wn});
+  b.Add(p + "t_embedder2.mlp.2.weight", {wn, wn});
+  b.Add(p + "t_embedder2.mlp.2.bias", {wn});
+  b.Add(p + "wavenet.cond_layer.conv.conv.weight_g", {2 * wn * 2, 1, 1});
+  b.Add(p + "wavenet.cond_layer.conv.conv.weight_v", {2 * wn * 2, wn, 1});
+  b.Add(p + "wavenet.cond_layer.conv.conv.bias", {2 * wn * 2});
+  for (int64_t i = 0; i < 2; ++i) {
+    const std::string idx = std::to_string(i);
+    b.Add(p + "wavenet.in_layers." + idx + ".conv.conv.weight_g", {2 * wn, 1, 1});
+    b.Add(p + "wavenet.in_layers." + idx + ".conv.conv.weight_v", {2 * wn, wn, 3});
+    b.Add(p + "wavenet.in_layers." + idx + ".conv.conv.bias", {2 * wn});
+    const int64_t rs = (i < 1) ? 2 * wn : wn;
+    b.Add(p + "wavenet.res_skip_layers." + idx + ".conv.conv.weight_g", {rs, 1, 1});
+    b.Add(p + "wavenet.res_skip_layers." + idx + ".conv.conv.weight_v", {rs, wn, 1});
+    b.Add(p + "wavenet.res_skip_layers." + idx + ".conv.conv.bias", {rs});
+  }
+  b.Add(p + "final_layer.adaLN_modulation.1.weight", {2 * wn, wn});
+  b.Add(p + "final_layer.adaLN_modulation.1.bias", {2 * wn});
+  b.Add(p + "final_layer.linear.weight_g", {wn, 1});
+  b.Add(p + "final_layer.linear.weight_v", {wn, wn});
+  b.Add(p + "final_layer.linear.bias", {wn});
+  // Front end. `wide` = hidden + 2 * in_channels + style.
+  b.Add(p + "cond_projection.weight", {hidden, hidden});
+  b.Add(p + "cond_projection.bias", {hidden});
+  b.Add(p + "cond_x_merge_linear.weight", {hidden, hidden + 2 * in_ch + style});
+  b.Add(p + "cond_x_merge_linear.bias", {hidden});
+  // Stack.
+  for (int64_t i = 0; i < layers; ++i) {
+    const std::string lp = p + "transformer.layers." + std::to_string(i) + ".";
+    b.Add(lp + "attention.wqkv.weight", {3 * hidden, hidden});
+    b.Add(lp + "attention.wo.weight", {hidden, hidden});
+    b.Add(lp + "feed_forward.w1.weight", {inter, hidden});
+    b.Add(lp + "feed_forward.w2.weight", {hidden, inter});
+    b.Add(lp + "feed_forward.w3.weight", {inter, hidden});
+    b.Add(lp + "attention_norm.project_layer.weight", {2 * hidden, hidden});
+    b.Add(lp + "attention_norm.project_layer.bias", {2 * hidden});
+    b.Add(lp + "attention_norm.norm.weight", {hidden});
+    b.Add(lp + "ffn_norm.project_layer.weight", {2 * hidden, hidden});
+    b.Add(lp + "ffn_norm.project_layer.bias", {2 * hidden});
+    b.Add(lp + "ffn_norm.norm.weight", {hidden});
+    b.Add(lp + "skip_in_linear.weight", {hidden, 2 * hidden});
+    b.Add(lp + "skip_in_linear.bias", {hidden});
+  }
+  b.Add(p + "transformer.norm.project_layer.weight", {2 * hidden, hidden});
+  b.Add(p + "transformer.norm.project_layer.bias", {2 * hidden});
+  b.Add(p + "transformer.norm.norm.weight", {hidden});
+  (void)tail;
+  return b.Finish();
+}
+
+}  // namespace
+
+TEST_CASE("the style width comes from cond_x_merge_linear, not a constant") {
+  // Style 5, unlike the shipped 192, so a hardcoded value cannot pass.
+  const std::string path = WriteTemp(BuildEstimator(), "style");
+  const auto est = vllm::models::indextts2::LoadS2MelEstimator(path, 2);
+  CHECK(est.front_config.style == 5);
+  CHECK(est.front_config.hidden == 8);
+  CHECK(est.front_config.in_channels == 4);
+  CHECK(est.stack_config.intermediate == 12);
+  CHECK(est.stack.layers.size() == 1);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("a head count that does not divide the hidden width is REFUSED") {
+  const std::string path = WriteTemp(BuildEstimator(), "heads");  // hidden 8
+  CHECK_THROWS_AS(vllm::models::indextts2::LoadS2MelEstimator(path, 3),
+                  std::runtime_error);
+  CHECK_THROWS_AS(vllm::models::indextts2::LoadS2MelEstimator(path, 0),
+                  std::runtime_error);
+  CHECK_NOTHROW(vllm::models::indextts2::LoadS2MelEstimator(path, 4));
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("the WHOLE S2Mel estimator loads at its declared geometry") {
+  const char* env = std::getenv("VLLM_CPP_INDEXTTS2_S2MEL");
+  if (env == nullptr) {
+    MESSAGE("SKIPPED: no VLLM_CPP_INDEXTTS2_S2MEL, so the estimator was never loaded");
+    return;
+  }
+  const auto est = vllm::models::indextts2::LoadS2MelEstimator(
+      std::string(env), vllm::models::indextts2::kDitNumHeads);
+  // Every one of these is in config.yaml; every one here came from the WEIGHTS.
+  CHECK(est.stack_config.dim == vllm::models::indextts2::kDitHiddenDim);
+  CHECK(est.front_config.in_channels == vllm::models::indextts2::kDitInChannels);
+  CHECK(est.front_config.style == vllm::models::indextts2::kStyleDim);
+  CHECK(static_cast<int64_t>(est.stack.layers.size()) ==
+        vllm::models::indextts2::kDitDepth);
+  CHECK(est.stack_config.heads == vllm::models::indextts2::kDitNumHeads);
+  CHECK(est.stack_config.head_dim == 64);
+  CHECK(est.stack_config.intermediate == 1536);
+  // Every layer carries a skip_in_linear upstream, even the ones that never
+  // receive one.
+  for (const auto& l : est.stack.layers) {
+    CHECK(!l.skip_in_w.empty());
+  }
+}
+
+TEST_CASE("the real estimator turns conditioning into a MEL") {
+  const char* env = std::getenv("VLLM_CPP_INDEXTTS2_S2MEL");
+  if (env == nullptr) {
+    MESSAGE("SKIPPED: no VLLM_CPP_INDEXTTS2_S2MEL, so no mel was produced");
+    return;
+  }
+  auto est = vllm::models::indextts2::LoadS2MelEstimator(
+      std::string(env), vllm::models::indextts2::kDitNumHeads);
+  const int64_t frames = 8;
+  est.front_config.frames = frames;
+  est.stack_config.frames = frames;
+  est.tail_config.frames = frames;
+
+  auto ramp = [](size_t n, float amp) {
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) {
+      v[i] = amp * std::sin(0.03F * static_cast<float>(i));
+    }
+    return v;
+  };
+  const int64_t D = est.stack_config.dim;
+  const int64_t C = est.front_config.in_channels;
+  const auto x = ramp(static_cast<size_t>(C * frames), 0.4F);
+  const auto t1 = ramp(static_cast<size_t>(D), 0.02F);
+
+  const auto x_in = vllm::models::dit_front::BuildXIn(
+      est.front_config, est.front, x, ramp(static_cast<size_t>(C * frames), 0.2F),
+      ramp(static_cast<size_t>(frames * D), 0.1F),
+      ramp(static_cast<size_t>(est.front_config.style), 0.05F), false);
+  REQUIRE(x_in.size() == static_cast<size_t>(frames * D));
+
+  std::vector<float> freqs(static_cast<size_t>(frames * est.stack_config.head_dim), 0.0F);
+  const auto x_res = vllm::models::dit_stack::Forward(est.stack_config, est.stack,
+                                                      x_in, t1, freqs);
+  const auto mel = vllm::models::dit_tail::Forward(est.tail_config, est.tail, x_res, x,
+                                                   0.37F, t1, {});
+  REQUIRE(mel.size() == static_cast<size_t>(C * frames));
+  float lo = mel[0];
+  float hi = mel[0];
+  for (const float v : mel) {
+    REQUIRE(std::isfinite(v));
+    lo = std::min(lo, v);
+    hi = std::max(hi, v);
+  }
+  CHECK(hi > lo);
+  // A log-mel, so plausibly negative and not enormous. Sanity bounds, NOT a
+  // correctness gate: parity needs the vLLM-Omni oracle (#633).
+  CHECK(std::fabs(static_cast<double>(lo)) < 1e3);
+  MESSAGE("real S2Mel estimator produced " << mel.size() << " mel values, range ["
           << lo << ", " << hi << "]");
 }

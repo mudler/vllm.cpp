@@ -1073,10 +1073,12 @@ a route yet. The greedy generate loop that turns the prompt into mel codes is
 ported too, and so is the STATED-emotion path -- eight weights selecting rows
 from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
 text plus a reference clip and an emotion reaches mel CODES in the library. What
-is still missing is a step that drives the whole chain from text through to the
-vocoder in one go, and any command or route to call it from. The vocoder ITSELF
-now renders: the real BigVGAN checkpoint turns a mel into a bounded waveform at
-22.05 kHz, 256 samples per frame. Inferring the emotion from a clip instead of stating it needs a
+is still missing is the join between the talker's mel CODES and the S2Mel
+decoder -- the length regulator and the CFM Euler loop -- and any command or
+route to call any of it from. The ACOUSTIC half already runs on real weights:
+the S2Mel estimator loads whole (front end, 13-layer stack, tail) and produces a
+mel, and the real BigVGAN turns that mel into a bounded waveform at 22.05 kHz,
+256 samples per frame. Inferring the emotion from a clip instead of stating it needs a
 Conformer and a Perceiver that are not ported.
 
 There is **no `/v1/audio/speech`**. Text to speech is not servable: the

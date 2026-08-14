@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Emit C++ goldens for EnhancedCodec.quantize: features -> SEMANTIC CODES.
+
+Upstream `indextts/codec/models.py:179-199`, index-tts
+@4f8792ff120cd3ea470dd511e997a17c86cddd10:
+
+    x = down(x^T); x = gelu(x); x = x^T      # stride-2 Conv1d, only when
+                                             # downsample_scale > 1
+    x = encoder(x^T)^T                       # VocosBackbone then Linear
+    indices, quantized = quantizer(x)        # FactorizedVectorQuantize
+
+This is the reference-audio path's second half: w2v-bert features in, the
+discrete codes the talker consumes out. The Vocos backbone and the quantizer are
+already ported (`vocos`, `fvq`), so what this gates is the composition and the
+two things around it -- the stride-2 downsample and the GELU between them.
+
+Usage: CODEC_SRC=<path to indextts> python3 \
+           scripts/gen-codec-encoder-goldens.py --out tests/vllm/models/codec_encoder_goldens.inc
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import sys
+import types
+from pathlib import Path
+
+import torch
+
+
+def rnd(name: str, n: int, scale: float = 1.0) -> list:
+    h = 0xCBF29CE484222325
+    for ch in name.encode():
+        h = ((h ^ ch) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    out = []
+    for _ in range(n):
+        h = (h + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        z = h
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+        z ^= z >> 31
+        out.append(((z >> 11) * (1.0 / 9007199254740992.0) * 2.0 - 1.0) * scale)
+    return out
+
+
+def tensor(name: str, shape, scale: float = 1.0) -> torch.Tensor:
+    n = 1
+    for d in shape:
+        n *= d
+    return torch.tensor(rnd(name, n, scale), dtype=torch.float64).reshape(shape).float()
+
+
+def fmt(values, cast="F") -> str:
+    lines, row = [], []
+    for v in values:
+        row.append(f"{float(v):.9e}{cast}" if cast else str(int(v)))
+        if len(row) == 6:
+            lines.append("    " + ", ".join(row) + ",")
+            row = []
+    if row:
+        lines.append("    " + ", ".join(row) + ",")
+    return "\n".join(lines)
+
+
+# The fixture must produce DISTINCT codes. A first attempt at 8 frames over a
+# 32-entry codebook collapsed to a single index four times over, which makes the
+# discrete gate vacuous -- matching "4, 4, 4, 4" proves almost nothing. More
+# frames and a wider input spread give the quantizer something to discriminate,
+# and the test asserts the codes are not all equal so this cannot regress.
+HIDDEN, VDIM, VINT, VLAYERS, CB_SIZE, CB_DIM, FRAMES = 6, 4, 8, 2, 32, 3, 16
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    a = ap.parse_args()
+    src = Path(os.environ["CODEC_SRC"])
+    sys.path.insert(0, str(src.parent))
+    for name in ("munch",):
+        if name not in sys.modules:
+            stub = types.ModuleType(name)
+            stub.Munch = dict
+            sys.modules[name] = stub
+    spec = importlib.util.spec_from_file_location(
+        "indextts.codec.models", src / "codec" / "models.py"
+    )
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    torch.manual_seed(0)
+    codec = m.EnhancedCodec(
+        codebook_size=CB_SIZE, codebook_dim=CB_DIM, hidden_size=HIDDEN,
+        vocos_dim=VDIM, vocos_intermediate_dim=VINT, vocos_num_layers=VLAYERS,
+        num_quantizers=1, downsample_scale=2, cfg=None,
+    ).eval()
+
+    with torch.no_grad():
+        for pname, p in sorted(codec.named_parameters()):
+            p.copy_(tensor("codec." + pname, list(p.shape), 0.4))
+
+    # Biases are ZEROED on the encoder path. With random weights the biases
+    # dominate and every frame lands on the same codebook entry, which makes the
+    # discrete gate vacuous. Zeroing them lets the frame-to-frame signal through.
+    with torch.no_grad():
+        for pname, prm in codec.named_parameters():
+            if pname.endswith(".bias") and (pname.startswith("encoder.")
+                                            or pname.startswith("down.")):
+                prm.zero_()
+
+    x = tensor("codec.x", [1, FRAMES, HIDDEN], 2.5)
+    with torch.no_grad():
+        # The latent the QUANTIZER sees, which is the part this port computes:
+        # down -> gelu -> backbone -> linear. The quantizer itself is gated
+        # separately by test_fvq, so pinning `z` exactly is what tests THIS code.
+        xd = x.transpose(1, 2)
+        xd = codec.down(xd)
+        xd = torch.nn.functional.gelu(xd)
+        xd = xd.transpose(1, 2)
+        after_down = xd.transpose(1, 2).reshape(-1).tolist()  # [H, T/2]
+        z = codec.encoder(xd.transpose(1, 2)).transpose(1, 2)
+        indices, quantized = codec.quantize(x)
+
+    names = sorted(n for n, _ in codec.named_parameters())
+    idx = indices.reshape(-1).tolist()
+    q = quantized.reshape(-1).tolist()
+
+    body = [
+        "// GENERATED by scripts/gen-codec-encoder-goldens.py -- do not edit.",
+        "// Oracle: indextts/codec/models.py EnhancedCodec.quantize, index-tts",
+        "// @4f8792ff120cd3ea470dd511e997a17c86cddd10.",
+        "#pragma once",
+        "",
+        "#include <cstdint>",
+        "",
+        "namespace codec_encoder_goldens {",
+        "",
+        f"inline constexpr int64_t kHidden = {HIDDEN};",
+        f"inline constexpr int64_t kVocosDim = {VDIM};",
+        f"inline constexpr int64_t kVocosIntermediate = {VINT};",
+        f"inline constexpr int64_t kVocosLayers = {VLAYERS};",
+        f"inline constexpr int64_t kCodebookSize = {CB_SIZE};",
+        f"inline constexpr int64_t kCodebookDim = {CB_DIM};",
+        f"inline constexpr int64_t kFrames = {FRAMES};",
+        f"inline constexpr int64_t kOutFrames = {len(idx)};",
+        "",
+        "inline constexpr const char* kParamNames[] = {",
+    ]
+    body += [f'    "codec.{n}",' for n in names]
+    body += [
+        "};",
+        "",
+        "// After down -> gelu ONLY, [kHidden, kOutFrames] channel-major.",
+        "inline constexpr float kAfterDown[] = {",
+        fmt(after_down),
+        "};",
+        "",
+        "// The latent the quantizer sees, [kHidden, kOutFrames] CHANNEL-major:",
+        "// down -> gelu -> backbone -> linear. This is the part this port",
+        "// computes, so it is the primary gate.",
+        "inline constexpr float kLatent[] = {",
+        fmt(z.reshape(-1).tolist()),
+        "};",
+        "",
+        "// The DISCRETE codes -- exact, never a tolerance.",
+        "inline constexpr int64_t kIndices[] = {",
+        fmt(idx, cast=""),
+        "};",
+        "",
+        "// quantized_out as UPSTREAM returns it: [kOutFrames, kHidden],",
+        "// FRAME-major, because quantize() transposes before returning. Our",
+        "// Result::quantized is CHANNEL-major like the rest of this port, so the",
+        "// test transposes when comparing rather than silently reorienting either.",
+        "inline constexpr float kQuantized[] = {",
+        fmt(q),
+        "};",
+        "",
+        "}  // namespace codec_encoder_goldens",
+        "",
+    ]
+    Path(a.out).write_text("\n".join(body))
+    print(f"wrote {a.out}: {len(names)} params, {FRAMES} frames -> {len(idx)} codes")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

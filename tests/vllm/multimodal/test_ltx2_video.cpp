@@ -1088,6 +1088,116 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
   }
 }
 
+// ─── the payload has NO alignment guarantee (issue #674) ────────────────────
+//
+// A tensor's first byte sits at `8 + <JSON header length> + <sum of the
+// preceding tensors' sizes>`. Not one of those three terms is required to be
+// even, so a BF16 tensor beginning on an ODD address is an ordinary safetensors
+// file and not a corrupt one. `Ltx2LoadVaeWeights` formed a `const uint16_t*`
+// over that address and dereferenced it, which is undefined behaviour on every
+// target and a real fault on the strict-alignment ones this project builds for
+// (`build-test-cpu-arm64`, Jetson/Orin sm_110). UBSan reported it as
+//
+//   ltx2_loader.cpp:1288:91: runtime error: load of misaligned address ...
+//   for type 'const uint16_t', which requires 2 byte alignment
+//
+// and the `sanitize-cpu (address,undefined)` lane had been red on it since
+// `cefacd2d0`. Third recurrence of one class: #301 (closed, and the source of
+// the `vt::LoadUnaligned` seam) and #627 (`qwen3_5_weights.cpp`) are the others,
+// and `minimax_h3_vae_loader.cpp:87-101` already carries the repair AND the
+// reason in prose.
+//
+// WHY THIS CASE EXISTS AT ALL, given the suite above already reached the defect:
+// it reached it BY ACCIDENT. `ltx2_fixture`'s JSON header happens to land one
+// VAE tensor on an odd byte today, and any rename or reshape in that fixture
+// silently retires the coverage while leaving every assertion green. So here the
+// odd offset is FORCED, and the parity it depends on is ASSERTED — an edit that
+// makes the address even fails the REQUIRE instead of passing while covering
+// nothing.
+namespace {
+
+// A bare temp directory. Deliberately NOT `Workspace`: writing the whole LTX-2.5
+// fixture here would make this case depend on the very fixture whose accidental
+// coverage it exists to replace.
+struct TempDir {
+  std::string root;
+  TempDir() {
+    static int counter = 0;
+    root = "/tmp/vllm_ltx2_align_" + std::to_string(::getpid()) + "_" +
+           std::to_string(counter++);
+    ::mkdir(root.c_str(), 0755);
+  }
+  ~TempDir() {
+    const int rc = std::system(("rm -rf '" + root + "'").c_str());
+    (void)rc;
+  }
+};
+
+// safetensors written by hand, so the header length — and with it the payload's
+// parity — is ours to choose. `header_pad` spaces are appended INSIDE the
+// counted header; trailing whitespace is legal JSON and padding the header is
+// exactly how real writers align their payloads. Returns the absolute file
+// offset of the single tensor's first byte.
+size_t WriteOneBf16Safetensors(const std::string& path, const std::string& name,
+                               const std::vector<float>& values, size_t header_pad) {
+  std::string header = "{\"" + name + "\":{\"dtype\":\"BF16\",\"shape\":[" +
+                       std::to_string(values.size()) + "],\"data_offsets\":[0," +
+                       std::to_string(values.size() * sizeof(uint16_t)) + "]}}";
+  header.append(header_pad, ' ');
+  std::string payload;
+  for (const float v : values) {
+    const uint16_t b = ltx2_fixture::F32ToBf16(v);
+    payload.append(reinterpret_cast<const char*>(&b), sizeof(b));
+  }
+  std::string out;
+  const uint64_t len = header.size();
+  for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((len >> (8 * i)) & 0xFFU));
+  out += header;
+  out += payload;
+  ltx2_fixture::WriteFileBytes(path, out);
+  return 8 + header.size();
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 VAE weights load from an ODD safetensors payload offset (#674)") {
+  TempDir ws;
+  // Values chosen so every one survives a bf16 store EXACTLY, which is what lets
+  // the check below be equality rather than a tolerance: a wrong-by-one-byte
+  // read is then a hard failure and not something a band could absorb.
+  const std::vector<float> values = {1.0F, -2.0F, 0.5F, 384.0F, -0.125F, 3.0F, -48.0F};
+  const std::string name = "decoder.conv_in.conv.weight";
+
+  // The unpadded header lands the payload on some parity; one space flips it.
+  // Write both and keep whichever is ODD, so this does not depend on the exact
+  // length of the JSON above.
+  const std::string a = ws.root + "/odd_offset_a.safetensors";
+  const std::string b = ws.root + "/odd_offset_b.safetensors";
+  const size_t off_a = WriteOneBf16Safetensors(a, name, values, 0);
+  const size_t off_b = WriteOneBf16Safetensors(b, name, values, 1);
+  REQUIRE((off_a % 2) != (off_b % 2));
+  const std::string path = (off_a % 2 == 1) ? a : b;
+
+  const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
+  // The fixture really is what this case claims: the tensor's mapped address is
+  // ODD, so the loader below cannot satisfy a `uint16_t`'s alignment by luck.
+  // Page-aligned mmap base means file-offset parity IS address parity, but assert
+  // the address rather than infer it.
+  REQUIRE((reinterpret_cast<uintptr_t>(file.Get(name).data) % 2) == 1);
+
+  const vllm::Ltx2VaeWeights weights =
+      vllm::Ltx2LoadVaeWeights(file, vllm::Ltx2VideoVaeDecoderKeyRules());
+  // `decoder.` is rewritten away by the video-VAE rules, exactly as upstream's
+  // SDOps do.
+  REQUIRE(weights.Has("conv_in.conv.weight"));
+  const std::vector<float>& got = weights.Get("conv_in.conv.weight");
+  REQUIRE(got.size() == values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    INFO("element " << i);
+    CHECK(got[i] == doctest::Approx(values[i]).scale(0.0));
+  }
+}
+
 // ─── the embeddings connector (phase L9c) ───────────────────────────────────
 //
 // WHAT THESE ARE FOR. Until L9c the conditioning this engine handed the DiT was

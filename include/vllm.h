@@ -218,7 +218,7 @@ extern "C" {
  * Appended at the END of vllm_model_params, so a zero-initialized v18 struct is
  * byte-identical: language_model_only 0 (off) and limit_mm_per_prompt NULL (no
  * limits configured => the 999-per-modality default, multimodal.py:331-333). */
-#define VLLM_ABI_VERSION 19
+#define VLLM_ABI_VERSION 20
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -801,6 +801,68 @@ VLLM_API void vllm_embedding_result_free(vllm_embedding_result* out);
  * THE PROCESS BOUNDARY: the library writes frames + WAV and COMPOSES the
  * ffmpeg argv, and spawns nothing. The caller execs mux_argv to get an MP4. */
 typedef struct vllm_video_engine vllm_video_engine;
+
+/* v20: SPEECH SYNTHESIS. Symmetric with the video entry points above, and with
+ * vllm_transcribe on the other side of the audio surface -- that one consumes
+ * audio, this one produces it.
+ *
+ * IndexTTS-2.5 has NO text-only synthesis, so `reference_audio` is REQUIRED for
+ * that family and an empty clip is a refusal rather than a default voice. Ask
+ * vllm_speech_requires_reference() before staging weights rather than
+ * discovering it from a failed request. */
+typedef struct vllm_speech_engine vllm_speech_engine;
+
+typedef struct vllm_speech_model_params {
+  const char* model_path; /* the checkpoint DIRECTORY */
+  const char* family;     /* NULL or "" => detect; never overrides a detector */
+} vllm_speech_model_params;
+
+typedef struct vllm_speech_params {
+  const char* text;
+  const char* language;          /* NULL => the family's default */
+  const float* reference_audio;  /* mono, interleaved is meaningless here */
+  int64_t reference_samples;
+  int32_t reference_sample_rate;
+  int64_t seed;                  /* controls AR sampling AND the CFM noise */
+} vllm_speech_params;
+
+/* One rendered waveform. OWNERSHIP: `samples` is library-allocated; release it
+ * with vllm_speech_result_free. `sample_rate` is the family's NATIVE rate
+ * (22050 for IndexTTS-2.5), never resampled, so the caller decides. */
+typedef struct vllm_speech_result {
+  float* samples;
+  int64_t sample_count;
+  int32_t sample_rate;
+  int32_t channels;
+} vllm_speech_result;
+
+VLLM_API vllm_speech_model_params vllm_speech_model_params_default(void);
+VLLM_API vllm_speech_params vllm_speech_params_default(void);
+
+/* Load a speech checkpoint set. On VLLM_OK *out is a handle the caller frees
+ * with vllm_speech_engine_free; on error *out is NULL and vllm_last_error()
+ * carries which families were tried and why none claimed the path. */
+VLLM_API vllm_status vllm_speech_engine_load(const vllm_speech_model_params* params,
+                                             vllm_speech_engine** out);
+VLLM_API void vllm_speech_engine_free(vllm_speech_engine* engine);
+
+/* The family this handle RESOLVED to ("indextts2", ...). Library-owned storage
+ * valid for the handle's lifetime; do NOT free. NULL engine => NULL. */
+VLLM_API const char* vllm_speech_engine_family(const vllm_speech_engine* engine);
+
+/* The family's native output rate, or 0 for a NULL handle. */
+VLLM_API int32_t vllm_speech_sample_rate(const vllm_speech_engine* engine);
+
+/* Non-zero when this family cannot synthesize without a reference clip. */
+VLLM_API int32_t vllm_speech_requires_reference(const vllm_speech_engine* engine);
+
+/* One BLOCKING synthesis, serialized per handle. VLLM_ERR_INVALID_ARGUMENT for
+ * a missing text or a required-but-absent reference clip; VLLM_ERR_RUNTIME when
+ * the pipeline refuses. On any non-OK status *out is zeroed. */
+VLLM_API vllm_status vllm_synthesize(vllm_speech_engine* engine,
+                                     const vllm_speech_params* params,
+                                     vllm_speech_result* out);
+VLLM_API void vllm_speech_result_free(vllm_speech_result* result);
 
 /* All paths; NULL/empty means "not supplied". Borrowed for the load call. */
 typedef struct vllm_video_model_params {

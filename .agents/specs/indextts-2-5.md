@@ -111,7 +111,7 @@ LTX-2.5 both sit behind it, which is the proof the shape holds for a second lane
 | Piece | Shape |
 |---|---|
 | `vllm::multimodal::SpeechEngine` | abstract seam, checkpoint-detected, in `include/vllm/multimodal/speech_engine.h`; IndexTTS-2.5 is its first implementation and must not be its only possible one, since the omni TTS family is ~10 more architectures |
-| ABI v19 | `vllm_speech_engine_load` / `_free` / `_family`, `vllm_synthesize` (naming symmetric with the existing `vllm_transcribe`), `vllm_speech_params` / `_default`, `vllm_speech_result` / `_free`, and a voice-enumeration pair for the voices route |
+| ABI v20 (landed) | `vllm_speech_engine_load` / `_free` / `_family`, `vllm_synthesize` (naming symmetric with the existing `vllm_transcribe`), `vllm_speech_params` / `_default`, `vllm_speech_result` / `_free`, and a voice-enumeration pair for the voices route |
 | `/v1/audio/speech` | additive route on `ApiServer`, routing through the SAME seam, in OpenAI's wire shape; the reference clip arrives per-request because upstream has no text-only synthesis |
 | `/v1/audio/voices` | enumerates registered reference voices; upstream exposes it alongside speech |
 | `examples/` | a thin `vllm.h` client only. No internal headers, per the ABI-clients rule |
@@ -510,7 +510,7 @@ values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
 4. the `exact` flag on `tiktoken::Pretokenize` is NOT proven load-bearing: a
    mutation disabling every range check still passes. The flag is kept and
    the gap is recorded in the test; a case that fails without it is owed;
-5. W6b, the two routes and the ABI entry points. The SEAM is populated now --
+5. W6b: the ABI entry points are DONE at v20; the two HTTP routes remain. The SEAM is populated now --
    the family loads and describes itself -- so what is left is the C API and
    the HTTP surface, plus a tiktoken reader before text can reach the render;
 5. W7 speed, which additionally needs #633;

@@ -1448,6 +1448,61 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // test_dlopen compare against the same macro and move with it (the #121
   // lesson: an == floor moves with the macro and proves nothing).
   CHECK(vllm_abi_version() >= 16);
+  // The SPEECH slice (vllm_speech_* / vllm_synthesize) is ABI v20 -- the other
+  // half of the audio surface from vllm_transcribe, which consumes audio.
+  CHECK(vllm_abi_version() >= 20);
+}
+
+// ─── ABI v20: speech synthesis (#634) ────────────────────────────────────────
+TEST_CASE("capi: v20 speech params default to a zeroed struct") {
+  const vllm_speech_model_params mp = vllm_speech_model_params_default();
+  CHECK(mp.model_path == nullptr);
+  CHECK(mp.family == nullptr);
+  const vllm_speech_params sp = vllm_speech_params_default();
+  CHECK(sp.text == nullptr);
+  CHECK(sp.reference_audio == nullptr);
+  CHECK(sp.reference_samples == 0);
+  CHECK(sp.seed == 0);
+}
+
+TEST_CASE("capi: v20 speech accessors are NULL-safe") {
+  // A caller that got an error from the load holds a NULL handle; every
+  // accessor must answer rather than crash.
+  CHECK(vllm_speech_engine_family(nullptr) == nullptr);
+  CHECK(vllm_speech_sample_rate(nullptr) == 0);
+  CHECK(vllm_speech_requires_reference(nullptr) == 0);
+  vllm_speech_engine_free(nullptr);  // must not crash
+  vllm_speech_result_free(nullptr);  // must not crash
+}
+
+TEST_CASE("capi: v20 speech load refuses a missing path BY ARGUMENT") {
+  vllm_speech_engine* eng = reinterpret_cast<vllm_speech_engine*>(0x1);
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  CHECK(vllm_speech_engine_load(&mp, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(eng == nullptr);  // and it must ZERO the out-param on failure
+  CHECK(vllm_speech_engine_load(&mp, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+}
+
+TEST_CASE("capi: v20 speech load refuses an unclaimed directory with EVIDENCE") {
+  vllm_speech_engine* eng = nullptr;
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  mp.model_path = ".";  // a real directory that no speech family claims
+  const vllm_status st = vllm_speech_engine_load(&mp, &eng);
+  CHECK(st == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  // The refusal must NAME what was tried, not just say no.
+  const std::string err = vllm_last_error();
+  CHECK(err.find("vllm_speech_engine_load") != std::string::npos);
+}
+
+TEST_CASE("capi: v20 synthesize refuses without an engine or text") {
+  vllm_speech_result out;
+  out.samples = reinterpret_cast<float*>(0x1);
+  vllm_speech_params sp = vllm_speech_params_default();
+  sp.text = "hello";
+  CHECK(vllm_synthesize(nullptr, &sp, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(out.samples == nullptr);  // zeroed even on the argument path
+  CHECK(vllm_synthesize(nullptr, &sp, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
 }
 
 // ─── ABI v16: KV-pool sizing knobs (ROAD-V1-MEM M1) ──────────────────────────

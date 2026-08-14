@@ -1135,7 +1135,14 @@ a route yet. The greedy generate loop that turns the prompt into mel codes is
 ported too, and so is the STATED-emotion path -- eight weights selecting rows
 from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
 text plus a reference clip and an emotion reaches mel CODES in the library. What
-is still missing is a COMMAND or ROUTE. TEXT DOES REACH AUDIO in the library:
+is still missing is the HTTP ROUTE. The capability DOES reach the public C ABI
+at v20: `vllm_speech_engine_load` / `_free` / `_family`, `vllm_speech_sample_rate`,
+`vllm_speech_requires_reference`, `vllm_synthesize` and `vllm_speech_result_free`
+-- the producing half of the audio surface, symmetric with `vllm_transcribe`.
+Ask `vllm_speech_requires_reference()` before staging: IndexTTS-2.5 refuses a
+request with no reference clip rather than substituting a default voice.
+
+TEXT DOES REACH AUDIO in the library:
 `test_indextts2_e2e` tokenizes with the checkpoint's own vocabulary, runs the
 talker to mel codes, and drives those through the length regulator, the CFM loop
 and BigVGAN to samples. Point it at all four checkpoint paths:

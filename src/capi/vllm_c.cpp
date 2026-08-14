@@ -8,6 +8,8 @@
 // llama.cpp's llama.h (handle-based load -> complete -> free).
 #include "vllm.h"
 
+#include "vllm/multimodal/speech_engine.h"
+
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -1536,6 +1538,142 @@ VLLM_API void vllm_video_engine_free(vllm_video_engine* engine) { delete engine;
 
 VLLM_API const char* vllm_video_engine_family(const vllm_video_engine* engine) {
   return engine == nullptr ? nullptr : engine->family.c_str();
+}
+
+// ---------------------------------------------------------------------------
+// v20: speech synthesis. Symmetric with the video handles above.
+// ---------------------------------------------------------------------------
+
+struct vllm_speech_engine {
+  std::unique_ptr<vllm::multimodal::SpeechEngine> engine;
+  std::string family;  // cached so the family accessor can hand back a pointer
+  std::mutex lock;     // one blocking synthesis at a time, as the ABI promises
+};
+
+VLLM_API vllm_speech_model_params vllm_speech_model_params_default(void) {
+  vllm_speech_model_params p{};
+  return p;
+}
+
+VLLM_API vllm_speech_params vllm_speech_params_default(void) {
+  vllm_speech_params p{};
+  return p;
+}
+
+VLLM_API vllm_status vllm_speech_engine_load(const vllm_speech_model_params* params,
+                                             vllm_speech_engine** out) {
+  if (out == nullptr) {
+    SetError("vllm_speech_engine_load: out must not be NULL");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  *out = nullptr;
+  if (params == nullptr || params->model_path == nullptr || params->model_path[0] == 0) {
+    SetError("vllm_speech_engine_load: model_path is required");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    vllm::multimodal::SpeechModelParams sp;
+    sp.path = params->model_path;
+    sp.family = (params->family == nullptr) ? std::string() : std::string(params->family);
+    std::string why;
+    auto engine = vllm::multimodal::GlobalSpeechRegistry().Load(sp, &why);
+    if (engine == nullptr) {
+      // `why` names every family tried and the path: a refusal that is
+      // evidence rather than a verdict.
+      SetError("vllm_speech_engine_load: " + why);
+      return VLLM_ERR_MODEL_LOAD;
+    }
+    auto* handle = new vllm_speech_engine();
+    handle->family = engine->family();
+    handle->engine = std::move(engine);
+    *out = handle;
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_speech_engine_load: ") + e.what());
+    return VLLM_ERR_MODEL_LOAD;
+  } catch (...) {
+    SetError("vllm_speech_engine_load: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API void vllm_speech_engine_free(vllm_speech_engine* engine) { delete engine; }
+
+VLLM_API const char* vllm_speech_engine_family(const vllm_speech_engine* engine) {
+  return engine == nullptr ? nullptr : engine->family.c_str();
+}
+
+VLLM_API int32_t vllm_speech_sample_rate(const vllm_speech_engine* engine) {
+  return engine == nullptr ? 0 : static_cast<int32_t>(engine->engine->sample_rate());
+}
+
+VLLM_API int32_t vllm_speech_requires_reference(const vllm_speech_engine* engine) {
+  return (engine != nullptr && engine->engine->requires_reference_audio()) ? 1 : 0;
+}
+
+VLLM_API vllm_status vllm_synthesize(vllm_speech_engine* engine,
+                                     const vllm_speech_params* params,
+                                     vllm_speech_result* out) {
+  if (out == nullptr) {
+    SetError("vllm_synthesize: out must not be NULL");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  *out = vllm_speech_result{};
+  if (engine == nullptr || params == nullptr || params->text == nullptr ||
+      params->text[0] == 0) {
+    SetError("vllm_synthesize: an engine and non-empty text are required");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  // Refuse the missing clip HERE, before staging anything, which is what
+  // exposing `requires_reference` on the handle is for.
+  if (engine->engine->requires_reference_audio() &&
+      (params->reference_audio == nullptr || params->reference_samples <= 0)) {
+    SetError("vllm_synthesize: this family cannot synthesize without a reference "
+             "clip; vllm_speech_requires_reference() reports that before staging");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    const std::lock_guard<std::mutex> guard(engine->lock);
+    vllm::multimodal::SpeechGenParams gen;
+    gen.text = params->text;
+    gen.language = (params->language == nullptr) ? std::string()
+                                                 : std::string(params->language);
+    if (params->reference_audio != nullptr && params->reference_samples > 0) {
+      gen.reference_audio.assign(
+          params->reference_audio,
+          params->reference_audio + static_cast<size_t>(params->reference_samples));
+    }
+    gen.reference_sample_rate = params->reference_sample_rate;
+    gen.seed = params->seed;
+
+    const vllm::multimodal::SpeechResult result = engine->engine->Synthesize(gen);
+    auto* samples = static_cast<float*>(
+        std::malloc(sizeof(float) * (result.samples.empty() ? 1 : result.samples.size())));
+    if (samples == nullptr) {
+      SetError("vllm_synthesize: out of memory");
+      return VLLM_ERR_RUNTIME;
+    }
+    std::memcpy(samples, result.samples.data(), sizeof(float) * result.samples.size());
+    out->samples = samples;
+    out->sample_count = static_cast<int64_t>(result.samples.size());
+    out->sample_rate = static_cast<int32_t>(result.sample_rate);
+    out->channels = static_cast<int32_t>(result.channels);
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_synthesize: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_synthesize: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API void vllm_speech_result_free(vllm_speech_result* result) {
+  if (result == nullptr) {
+    return;
+  }
+  std::free(result->samples);
+  *result = vllm_speech_result{};
 }
 
 namespace {

@@ -206,6 +206,90 @@ std::vector<float> DenseTdnnBlock(const std::vector<float>& x, int64_t in_channe
   return acc;
 }
 
+
+namespace {
+
+// 2-D convolution over [C, H, W], zero-padded, stride (sh, sw).
+std::vector<float> Conv2d(const std::vector<float>& in, int64_t in_ch, int64_t h, int64_t w,
+                          const std::vector<float>& weight, int64_t out_ch, int64_t kernel,
+                          int64_t sh, int64_t sw, int64_t pad, int64_t* oh, int64_t* ow) {
+  const int64_t H = (h + 2 * pad - kernel) / sh + 1;
+  const int64_t W = (w + 2 * pad - kernel) / sw + 1;
+  std::vector<float> out(static_cast<size_t>(out_ch * H * W), 0.0F);
+  for (int64_t o = 0; o < out_ch; ++o) {
+    for (int64_t y = 0; y < H; ++y) {
+      for (int64_t x = 0; x < W; ++x) {
+        double acc = 0.0;
+        for (int64_t c = 0; c < in_ch; ++c) {
+          for (int64_t ky = 0; ky < kernel; ++ky) {
+            const int64_t sy = y * sh + ky - pad;
+            if (sy < 0 || sy >= h) continue;
+            for (int64_t kx = 0; kx < kernel; ++kx) {
+              const int64_t sx = x * sw + kx - pad;
+              if (sx < 0 || sx >= w) continue;
+              acc += static_cast<double>(
+                         weight[static_cast<size_t>(((o * in_ch + c) * kernel + ky) * kernel + kx)]) *
+                     static_cast<double>(in[static_cast<size_t>((c * h + sy) * w + sx)]);
+            }
+          }
+        }
+        out[static_cast<size_t>((o * H + y) * W + x)] = static_cast<float>(acc);
+      }
+    }
+  }
+  *oh = H; *ow = W;
+  return out;
+}
+
+// BatchNorm2d in eval: per-CHANNEL running statistics over the H*W plane.
+void BatchNorm2dEvalInPlace(std::vector<float>& x, int64_t channels, int64_t plane,
+                            const std::vector<float>& g, const std::vector<float>& b,
+                            const std::vector<float>& mean, const std::vector<float>& var,
+                            double eps) {
+  for (int64_t c = 0; c < channels; ++c) {
+    const double m = static_cast<double>(mean[static_cast<size_t>(c)]);
+    const double inv = 1.0 / std::sqrt(static_cast<double>(var[static_cast<size_t>(c)]) + eps);
+    const double gc = g.empty() ? 1.0 : static_cast<double>(g[static_cast<size_t>(c)]);
+    const double bc = b.empty() ? 0.0 : static_cast<double>(b[static_cast<size_t>(c)]);
+    for (int64_t i = 0; i < plane; ++i) {
+      const size_t k = static_cast<size_t>(c * plane + i);
+      x[k] = static_cast<float>((static_cast<double>(x[k]) - m) * inv * gc + bc);
+    }
+  }
+}
+
+}  // namespace
+
+std::vector<float> ResBlock2d(const std::vector<float>& x, int64_t in_planes, int64_t h, int64_t w,
+                              int64_t planes, int64_t stride, const ResBlock2dWeights& wt,
+                              double eps, int64_t* out_h) {
+  int64_t h1 = 0, w1 = 0;
+  // stride is (stride, 1): FREQUENCY only.
+  std::vector<float> out =
+      Conv2d(x, in_planes, h, w, wt.conv1, planes, 3, stride, 1, 1, &h1, &w1);
+  BatchNorm2dEvalInPlace(out, planes, h1 * w1, wt.bn1_gamma, wt.bn1_beta, wt.bn1_mean, wt.bn1_var, eps);
+  for (float& v : out) v = v > 0.0F ? v : 0.0F;
+
+  int64_t h2 = 0, w2 = 0;
+  out = Conv2d(out, planes, h1, w1, wt.conv2, planes, 3, 1, 1, 1, &h2, &w2);
+  BatchNorm2dEvalInPlace(out, planes, h2 * w2, wt.bn2_gamma, wt.bn2_beta, wt.bn2_mean, wt.bn2_var, eps);
+
+  std::vector<float> shortcut;
+  if (wt.has_shortcut) {
+    int64_t sh = 0, sw = 0;
+    shortcut = Conv2d(x, in_planes, h, w, wt.short_conv, planes, 1, stride, 1, 0, &sh, &sw);
+    BatchNorm2dEvalInPlace(shortcut, planes, sh * sw, wt.short_gamma, wt.short_beta, wt.short_mean,
+                           wt.short_var, eps);
+  } else {
+    shortcut = x;
+  }
+  VT_CHECK(shortcut.size() == out.size(), "campplus: residual shape mismatch");
+  for (size_t i = 0; i < out.size(); ++i) out[i] += shortcut[i];
+  for (float& v : out) v = v > 0.0F ? v : 0.0F;
+  *out_h = h2;
+  return out;
+}
+
 }  // namespace campplus
 }  // namespace models
 }  // namespace vllm

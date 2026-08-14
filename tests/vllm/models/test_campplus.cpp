@@ -186,3 +186,35 @@ TEST_CASE("campplus CAMDenseTDNNBlock GROWS its channel count by concatenation")
   REQUIRE(got.size() == static_cast<size_t>((kIn + kNumLayers * kGrowth) * kFrames));
   CHECK(Worst(got, kDenseTdnnBlock, got.size()) < 1e-5);
 }
+
+TEST_CASE("campplus BasicResBlock strides FREQUENCY only, never time") {
+  // stride=(stride, 1) in layers.py:224. Striding both axes still yields a
+  // well-formed tensor -- at half the frame rate -- which every later layer
+  // accepts, so the WIDTH is asserted unchanged alongside the values.
+  const std::vector<float> x = Rand("x4", kFcmIn * kFcmH * kFcmW, 1.0);
+  vllm::models::campplus::ResBlock2dWeights w;
+  auto var = [](std::vector<float> v) { for (float& f : v) f = std::fabs(f) + 0.5F; return v; };
+  w.conv1 = Rand("rb.conv1.weight", kFcmPlanes * kFcmIn * 9, 0.3);
+  w.bn1_gamma = Rand("rb.bn1.weight", kFcmPlanes, 0.3);
+  w.bn1_beta = Rand("rb.bn1.bias", kFcmPlanes, 0.3);
+  w.bn1_mean = Rand("rb.bn1.running_mean", kFcmPlanes, 0.4);
+  w.bn1_var = var(Rand("rb.bn1.running_var", kFcmPlanes, 0.2));
+  w.conv2 = Rand("rb.conv2.weight", kFcmPlanes * kFcmPlanes * 9, 0.3);
+  w.bn2_gamma = Rand("rb.bn2.weight", kFcmPlanes, 0.3);
+  w.bn2_beta = Rand("rb.bn2.bias", kFcmPlanes, 0.3);
+  w.bn2_mean = Rand("rb.bn2.running_mean", kFcmPlanes, 0.4);
+  w.bn2_var = var(Rand("rb.bn2.running_var", kFcmPlanes, 0.2));
+  w.has_shortcut = true;  // stride != 1 and in_planes != planes
+  w.short_conv = Rand("rb.shortcut.0.weight", kFcmPlanes * kFcmIn, 0.3);
+  w.short_gamma = Rand("rb.shortcut.1.weight", kFcmPlanes, 0.3);
+  w.short_beta = Rand("rb.shortcut.1.bias", kFcmPlanes, 0.3);
+  w.short_mean = Rand("rb.shortcut.1.running_mean", kFcmPlanes, 0.4);
+  w.short_var = var(Rand("rb.shortcut.1.running_var", kFcmPlanes, 0.2));
+
+  int64_t out_h = 0;
+  const std::vector<float> got = vllm::models::campplus::ResBlock2d(
+      x, kFcmIn, kFcmH, kFcmW, kFcmPlanes, /*stride=*/2, w, 1e-5, &out_h);
+  CHECK(out_h == kFcmOutH);                       // 16 -> 8: frequency halved
+  REQUIRE(got.size() == static_cast<size_t>(kFcmPlanes * kFcmOutH * kFcmOutW));
+  CHECK(Worst(got, kResBlock, got.size()) < 1e-5);
+}

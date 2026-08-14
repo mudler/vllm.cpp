@@ -113,6 +113,27 @@ std::vector<float> DenseTdnnBlock(const std::vector<float>& x, int64_t in_channe
                                   int64_t dilation, int64_t seg_len,
                                   const std::vector<DenseTdnnLayerWeights>& layers, double eps);
 
+
+// ── FCM 2-D front end (DTDNN.py:13-47) ──────────────────────────────────────
+// The head runs over the [1, feat_dim, T] spectrogram as a 2-D image, so these
+// are genuine Conv2d/BatchNorm2d, not the 1-D forms above.
+
+struct ResBlock2dWeights {
+  std::vector<float> conv1, bn1_gamma, bn1_beta, bn1_mean, bn1_var;
+  std::vector<float> conv2, bn2_gamma, bn2_beta, bn2_mean, bn2_var;
+  // Present only when the block downsamples or changes width.
+  std::vector<float> short_conv, short_gamma, short_beta, short_mean, short_var;
+  bool has_shortcut = false;
+};
+
+// BasicResBlock (layers.py:218-252). THE STRIDE IS (stride, 1): it subsamples
+// the FREQUENCY axis and leaves TIME untouched. Striding both still yields a
+// well-formed tensor at half the frame rate, which every later layer accepts.
+// Returns [planes, ceil(h/stride), w]; `out_h` reports the height.
+std::vector<float> ResBlock2d(const std::vector<float>& x, int64_t in_planes, int64_t h, int64_t w,
+                              int64_t planes, int64_t stride, const ResBlock2dWeights& weights,
+                              double eps, int64_t* out_h);
+
 }  // namespace campplus
 }  // namespace models
 }  // namespace vllm

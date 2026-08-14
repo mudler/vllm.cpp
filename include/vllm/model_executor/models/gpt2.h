@@ -82,6 +82,19 @@ std::vector<float> ForwardHost(const Params& params, const Weights& weights,
                                const std::vector<int64_t>& input_ids,
                                const std::vector<int64_t>& positions);
 
+// The same stack, driven from EMBEDDINGS rather than token ids.
+//
+// The IndexTTS talker's prompt has no token ids: it is projected conditioning
+// rows concatenated with embedded text, assembled by `talker::PrepareInputs`.
+// Everything after gpt2.py:225-229 is independent of where the embeddings came
+// from, so `ForwardHost` now builds them and delegates here.
+//
+// `inputs_embeds` is [seq, hidden]. NOTE that position embeddings are NOT added
+// here -- the caller owns them, because the talker uses its own mel and text
+// position tables rather than `wpe`.
+std::vector<float> ForwardHostEmbeds(const Params& params, const Weights& weights,
+                                     const std::vector<float>& inputs_embeds);
+
 // Tied lm_head: GPT-2 ties the output projection to `wte`. Returns [seq, vocab].
 std::vector<float> LogitsHost(const Params& params, const Weights& weights,
                               const std::vector<float>& hidden);

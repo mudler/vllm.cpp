@@ -78,7 +78,42 @@ MATRICES = {
     # architecture. Re-derived, which is the only way this pin is ever allowed to
     # move. test_music3_and_indextts_rows_both_survive_their_collision names all
     # three rows, because a count alone cannot see that failure.
-    "MODEL": (AGENTS / "model-matrix.md", 373),
+    # 375 since 2026-08-14: +`MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm` and
+    # +`MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm` (issue #490), the TEXT-ONLY
+    # arms of the Qwen3.5 backbone — the eighth architecture the #609/#610 audit
+    # found and deliberately left to its owner, plus its dense sibling. Both are
+    # beyond-pin: they are not among the 355 registry architectures at
+    # `555967922` because they landed upstream afterwards (PR vllm#50210 @
+    # `ad5d29db7`), exactly like the Muse Glimmer row above. Their Upstream cells
+    # deliberately carry no pinned module/class target, so the pin-derived static
+    # invariants in check_model_invariants are UNCHANGED (324/373/356/310/261) —
+    # this is the row-EXISTS count only, bumped because two new rows exist, never
+    # to make a transition pass. This row was authored against 362 -> 364, then
+    # re-derived to 370 -> 372, and is now RE-DERIVED AGAIN to 373 -> 375: the
+    # #609/#610 backfill, LTX-2.5, IndexTTS-2.5 and MiniMax-Music3 all landed
+    # while it was in review, and every one of them moved this pin. The number is
+    # counted off the matrix as it stands after the merge, never carried forward
+    # from the branch — a justification framed against a number this file no
+    # longer carries would be false about the file it sits in, and
+    # `Qwen35TextOnlyRowsAreCounted` is what ties this value to the two rows the
+    # matrix actually holds.
+    # 377 since 2026-08-14, and RE-DERIVED rather than carried forward: +2 for
+    # dots3-note, which vLLM registers as TWO architectures
+    # (`Dots3NoteForCausalLM` and its speculative head `Dots3NoteMTPModel`),
+    # landing `SPIKE` and `INVENTORIED` respectively with the spec committed
+    # (#699). This is the collision the Music3/IndexTTS comment above warns
+    # about, happening again on the same day: the #490 branch took 373 -> 375
+    # for the Qwen3.5 text-only arms while the dots3 branch took 373 -> 375 for
+    # its own two rows. BOTH read 375 and neither was right -- the merged tree
+    # holds four new rows, so it is 377. An auto-merge keeping either side would
+    # have left this file internally consistent while silently short two real
+    # architectures, which is why the number is counted off the matrix AFTER the
+    # merge and why `test_dots3_rows_are_inside_the_model_ratchet` names the rows
+    # instead of trusting the count. dots3-note is beyond-pin (vLLM `main` only,
+    # vllm#51255, still being patched), carries no pinned-registry target, and
+    # leaves the at-the-pin inventory (324/373/356/310/261) unchanged. Bumped
+    # because two rows EXIST, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 377),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
@@ -246,7 +281,11 @@ MATRICES = {
     # row owing residual-RMS numerics evidence at the device boundary (rows>=32
     # bf16 device path vs CPU f32 oracle). Bot-flagged on #289; READY once the
     # RED-first probe lands.
-    "BACKEND": (AGENTS / "backend-matrix.md", 81),
+    # 82 since 2026-08-11: +`BACKEND-TENSTORRENT-MISTRAL`, allowlist
+    # MistralForCausalLM on TT + device-aware SACRED gate. Reuses Qwen3-dense
+    # forward; no new kernel. Pending 7B checkpoint + vLLM oracle for the e2e
+    # gate.
+    "BACKEND": (AGENTS / "backend-matrix.md", 82),
 }
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"

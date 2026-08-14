@@ -48,9 +48,14 @@ class TenstorrentPlatform final : public Platform {
   // Explicit allow-list of architectures whose full op set is registered for
   // kTENSTORRENT (mirrors MetalPlatform::supports_model_architecture). OPT-125m
   // was the first bring-up; Qwen3-dense is the second (same OPT→Qwen3 sequence
-  // Metal used for M3a/M3b). Anything else falls back to CPU via SelectQueue.
+  // Metal used for M3a/M3b). Mistral-7B-v0.3 is the third: it reuses the
+  // Qwen3-dense forward verbatim (qk-norm skipped, plain rope, untied lm_head),
+  // so every op is already registered — no new kernel. Anything else falls back
+  // to CPU via SelectQueue.
   bool supports_model_architecture(std::string_view architecture) const override {
-    return architecture == "OPTForCausalLM" || architecture == "Qwen3ForCausalLM";
+    return architecture == "OPTForCausalLM" ||
+           architecture == "Qwen3ForCausalLM" ||
+           architecture == "MistralForCausalLM";
   }
 
   // kPagedAttention + kReshapeAndCache are registered against the NHD

@@ -11,14 +11,14 @@
 #include <cassert>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
-
-#include <sys/stat.h>
 
 #include <nlohmann/json.hpp>
 
@@ -54,14 +54,44 @@ std::vector<VideoFamilyRegistration>& RegistryStorage() {
 // detector may claim a checkpoint and exactly one entry may carry a name.
 const std::vector<VideoFamilyRegistration>& OrderedRegistry() { return RegistryStorage(); }
 
+// A caller's UTF-8 path as a native filesystem path. Byte-for-byte the spelling
+// in v1/kv_offload/fs_io.cpp:31, and the same job the loader lane's Utf8Path
+// does (gguf_reader.cpp:22, safetensors_reader.cpp:29) — no shared helper
+// exists to call, because each is file-local to its own TU. The u8string step
+// is not decoration: on Windows a narrow std::string handed to
+// std::filesystem::path is interpreted in the ACTIVE CODE PAGE, so every
+// non-ASCII checkpoint path silently resolves to the wrong file (or to none).
+// Saying char8_t makes the UTF-8 explicit and the conversion to UTF-16 exact.
+std::filesystem::path NativePath(const std::string& utf8) {
+#if defined(_WIN32)
+  const std::u8string value(reinterpret_cast<const char8_t*>(utf8.data()), utf8.size());
+  return std::filesystem::path(value);
+#else
+  return std::filesystem::path(utf8);
+#endif
+}
+
+// BOTH probes take the std::error_code overloads, and that is load-bearing
+// rather than stylistic. The `::stat` calls these replaced reported an
+// uninspectable path — ENAMETOOLONG, ELOOP, EACCES on a parent — by returning
+// -1, which arrived here as a plain `false` and became the registry's ordinary
+// "no such file or directory" refusal. The THROWING
+// std::filesystem::exists(p) / is_directory(p) overloads raise
+// filesystem_error for exactly those cases instead, which would escape
+// ReadVideoCheckpointTensorNames — whose header contract is to return false
+// with *why set — and, through DescribeCheckpoint, escape LoadVideoEngine in
+// place of the refusal that names the registered families. Returning false on
+// error keeps the POSIX behaviour these calls had. Issue #664.
 bool IsDir(const std::string& path) {
-  struct stat st {};
-  return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+  std::error_code error;
+  const bool result = std::filesystem::is_directory(NativePath(path), error);
+  return !error && result;
 }
 
 bool Exists(const std::string& path) {
-  struct stat st {};
-  return ::stat(path.c_str(), &st) == 0;
+  std::error_code error;
+  const bool result = std::filesystem::exists(NativePath(path), error);
+  return !error && result;
 }
 
 std::string StripTrailingSlash(const std::string& dir) {

@@ -329,7 +329,8 @@ class AgentRecordMutationTests(unittest.TestCase):
         (`c8fc24a50`); the seven recipe architectures that had no row at all took
         it 362 -> 369 (#609, #610, `eba6ab7c7`); LTX-2.5 took it 369 -> 370
         (#435, `cefacd2d0`); IndexTTS-2.5 took it 370 -> 372, being two
-        architectures (#634); MiniMax-Music3 took it to 373 (#672). Without this,
+        architectures (#634); MiniMax-Music3 took it to 373 (#672); and the two
+        text-only Qwen3.5 arms took it 373 -> 375 (#490). Without this,
         bumping the number to silence a failure is indistinguishable from bumping
         it because a row really landed.
         """
@@ -380,6 +381,44 @@ class AgentRecordMutationTests(unittest.TestCase):
             self.assertEqual(
                 found[0].field("state").strip().strip("`"), "INVENTORIED", item_id
             )
+
+    def test_dots3_rows_are_inside_the_model_ratchet(self) -> None:
+        """The #699 rows and the 373 -> 375 bump are one semantic change.
+
+        dots3-note is the IndexTTS-2.5 shape again on a different lane: vLLM
+        registers it as TWO architectures, `Dots3NoteForCausalLM` and its
+        speculative head `Dots3NoteMTPModel`, so a port described in prose as
+        "a model" moves the pin by two. Naming both is what makes 375 checkable
+        rather than plausible.
+
+        What this catches that nothing else does, measured: RENAMING the MTP row
+        leaves the count at 375, touches no claim, and every other check stays
+        green -- only this assertion goes red. That is the whole point of naming
+        rows rather than counting them.
+
+        The state assertions are deliberately weaker evidence, and the record
+        says so rather than implying otherwise: mutating either row's lifecycle
+        is already caught upstream of here by the claim-ownership and
+        spec-structure rules (INVENTORIED -> SPIKE trips "SPIKE row has no
+        CLAIM-* owner"; SPIKE -> ACTIVE trips the structured-spec requirement).
+        They are pinned anyway because the asymmetry is intentional -- the
+        target row is `SPIKE` with a committed spec and an owner, the MTP row is
+        `INVENTORIED` because it is unclaimed and blocked behind the target's
+        oracle and hardware gaps -- and a future refactor of those rules should
+        not silently take the pin with it.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        for item_id, state in (
+            ("MODEL-MM-dots3-note-dots3-note-for-causal-lm", "SPIKE"),
+            ("MODEL-SPEC-dots3-note-dots3-note-mtp", "INVENTORIED"),
+        ):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+            self.assertEqual(found[0].field("state").strip().strip("`"), state, item_id)
 
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
         """The #609/#610 rows and the 362 -> 369 bump are one semantic change.
@@ -884,6 +923,126 @@ class TenstorrentResidualGoldenRowIsCounted(unittest.TestCase):
         self.assertTrue(
             any("backend rows" in e.lower() for e in errors),
             f"the BACKEND pin must bind; got {errors}",
+        )
+
+
+class Qwen35TextOnlyRowsAreCounted(unittest.TestCase):
+    """The MODEL ratchet bump 373 -> 375 is backed by two real rows (#490).
+
+    Same shape, and the same reason, as the BACKEND class above: the count is
+    re-pinned by hand, so a bump with nothing behind it is indistinguishable
+    from a bump for rows that really landed. `test_model_row_ratchet_is_
+    load_bearing` proves the pin BINDS by moving it, which holds for any value
+    of the pin; it cannot say whether THIS value is the right one. These two
+    tests do, by tying the pin to the rows the matrix actually carries.
+    """
+
+    ROWS = (
+        "MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm",
+        "MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm",
+    )
+
+    def test_both_text_only_rows_exist_in_the_model_matrix(self) -> None:
+        lines = (
+            (ROOT / ".agents/model-matrix.md")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        for row in self.ROWS:
+            matching = [line for line in lines if line.startswith(f"| `{row}` |")]
+            self.assertEqual(len(matching), 1, f"{row} must appear exactly once")
+
+    def test_the_model_pin_equals_the_rows_the_matrix_carries(self) -> None:
+        """MUTATION: the pin and the tree disagreeing by one row must be RED.
+
+        Counted the way `check_matrices` counts, so a pin left behind by a
+        landing row -- or moved ahead of one -- fails here and not only inside
+        the checker's own error list.
+        """
+        path, expected = agent_record.MATRICES["MODEL"]
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        actual = sum(
+            row.item_id.startswith("MODEL-") for row in rows if row.path == path
+        )
+        self.assertEqual(
+            actual,
+            expected,
+            "the MODEL pin must equal the MODEL rows model-matrix.md carries",
+        )
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+
+class TenstorrentMistralRowIsCounted(unittest.TestCase):
+    """The BACKEND ratchet bump to 82 is backed by a real row (#670).
+
+    Same shape as TenstorrentResidualGoldenRowIsCounted and for the same
+    reason: the count is re-pinned by hand, so a bump with no row behind it is
+    indistinguishable from a bump for a new row. `b55f6ec14` set the precedent
+    that a ratchet bump lands with a case keyed to ITS OWN row; this is that
+    case for BACKEND-TENSTORRENT-MISTRAL.
+    """
+
+    ROW = "BACKEND-TENSTORRENT-MISTRAL"
+
+    def test_the_row_exists_in_the_backend_matrix(self) -> None:
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_row_names_its_issue_and_its_spec(self) -> None:
+        """A row whose issue is only in the PR body is untraceable from the tree.
+
+        This row shipped originally citing PR #354 -- a merged PR, not an issue
+        -- so nothing in the repository pointed at anything trackable. Pin both
+        links here so a future edit cannot quietly drop them again.
+        """
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("tenstorrent-mistral.md", row)
+        roadmap = (ROOT / ".agents/roadmap_v1.md").read_text(encoding="utf-8")
+        self.assertIn("issues/670", roadmap)
+
+    def test_the_backend_pin_is_load_bearing_for_this_row(self) -> None:
+        """MUTATION: with this row removed, the pinned count must disagree.
+
+        Redirects only the BACKEND entry at a mutated copy on disk. Patching
+        `Path.read_text` globally would feed backend content to every matrix and
+        this test would then pass on errors that have nothing to do with the
+        removal -- green for the wrong reason, which is the failure mode these
+        cases exist to catch.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "backend rows" in e.lower()], [])
+
+        path, count = agent_record.MATRICES["BACKEND"]
+        text = path.read_text(encoding="utf-8")
+        without = "\n".join(
+            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
+        )
+        self.assertNotEqual(without, text, "the row must be present to remove")
+
+        # Under ROOT, not /tmp: check_matrices reports via
+        # `path.relative_to(ROOT)`, which raises on a path outside the repo.
+        # And BOTH tables need redirecting -- rows are parsed from
+        # MATRIX_PATHS while the count is pinned in MATRICES, so patching only
+        # the latter counts zero rows for a reason unrelated to the removal.
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            mutated = Path(tmp) / "backend-matrix.md"
+            mutated.write_text(without, encoding="utf-8")
+            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.dict(
+                     agent_record.MATRICES, {"BACKEND": (mutated, count)}
+                 ):
+                agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("backend rows" in e.lower() for e in errors),
+            f"removing {self.ROW} must break the BACKEND count; got {errors}",
         )
 
 

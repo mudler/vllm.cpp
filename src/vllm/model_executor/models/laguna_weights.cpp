@@ -37,6 +37,7 @@
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"  // DequantCtNvfp4WeightToF32
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 namespace {
@@ -264,10 +265,12 @@ OwnedTensor LnLoadF32Direct(const TensorResolver& get, const std::string& name) 
   } else if (t.dtype == "BF16") {
     const size_t n = t.nbytes / 2;  // bf16 = 2 bytes/elem
     VT_CHECK(o.bytes.size() == n * 4, "laguna nvfp4: BF16->F32 size mismatch " + name);
-    const auto* src = reinterpret_cast<const uint16_t*>(t.data);
+    // Unaligned: `t.data` is an arbitrary byte offset into the mmap (#627).
     auto* dst = reinterpret_cast<float*>(o.bytes.data());
     for (size_t i = 0; i < n; ++i) {
-      const uint32_t bits = static_cast<uint32_t>(src[i]) << 16;  // bf16 -> high 16 bits of f32
+      const uint32_t bits = static_cast<uint32_t>(
+                                vt::LoadUnaligned<uint16_t>(t.data + i * 2))
+                            << 16;  // bf16 -> high 16 bits of f32
       std::memcpy(&dst[i], &bits, 4);
     }
   } else {

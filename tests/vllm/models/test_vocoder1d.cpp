@@ -17,6 +17,7 @@
 // ABSOLUTE floor under any epsilon, which would accept almost anything.
 #include <cmath>
 #include <cstdint>
+#include <numbers>
 #include <vector>
 
 #include "doctest/doctest.h"
@@ -103,7 +104,7 @@ TEST_CASE("vocoder1d Pad1d zero mode does not replicate") {
 TEST_CASE("vocoder1d SnakeActivation adds sin^2 scaled by 1/beta") {
   // x + (beta + eps)^-1 * sin^2(alpha * x), alpha = 1, beta = 1, x = pi/2.
   // sin(pi/2) = 1, so the result is pi/2 + 1/(1 + 1e-9).
-  const double x0 = M_PI / 2.0;
+  const double x0 = std::numbers::pi_v<double> / 2.0;
   std::vector<float> x{static_cast<float>(x0)};
   const std::vector<float> alpha{1.0F};
   const std::vector<float> beta{1.0F};
@@ -118,7 +119,7 @@ TEST_CASE("vocoder1d SnakeActivation with a null beta reuses alpha as the scale"
   // separate beta. alpha = 2, x = pi/4 => sin(2 * pi/4) = sin(pi/2) = 1, so the
   // result is pi/4 + 1/(2 + eps). Passing beta here instead would give a
   // different number, which is what makes the null-beta arm distinguishable.
-  const double x0 = M_PI / 4.0;
+  const double x0 = std::numbers::pi_v<double> / 4.0;
   std::vector<float> x{static_cast<float>(x0)};
   const std::vector<float> alpha{2.0F};
   vllm::vocoder1d::SnakeActivation(x, 1, 1, alpha, /*beta=*/nullptr, /*logscale=*/false);

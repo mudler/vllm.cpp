@@ -25,7 +25,9 @@
 #include <vector>
 
 #include "vllm/model_executor/models/nemotron_h.h"
-#include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits
+#include "vllm/model_executor/models/nemotron_h_forward.h"
+#include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits
+#include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
@@ -55,9 +57,17 @@ class NemotronHLoadedModel final : public LoadedModel {
                        NemotronHParams params)
       : LoadedModel(registration), params_(std::move(params)) {}
   const NemotronHParams& params() const { return params_; }
+  // W4 ports the forward MECHANISM (nemotron_h.cpp). The weight LOAD that fills
+  // this — the 18487 enumerated tensors, NVFP4 W4A16 g16 experts and FP8 W8A8
+  // mamba projections included — is still owed, so `materialized` stays false on
+  // the checkpoint path and `NemotronHForward` refuses by name. A direct caller
+  // (the unit gate) constructs the weights itself and reaches the same forward.
+  NemotronHHostWeights& weights() { return weights_; }
+  const NemotronHHostWeights& weights() const { return weights_; }
 
  private:
   NemotronHParams params_;
+  NemotronHHostWeights weights_;
 };
 
 std::unique_ptr<LoadedModel> LoadNemotronHForCausalLM(
@@ -89,15 +99,17 @@ void PrepareNemotronHForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardNemotronHForCausalLM(LoadedModel& model,
                                           const ModelForwardInput& input) {
-  (void)model;
-  (void)input;
-  // W4 owns the hybrid layer loop, the Mamba2 mixer wiring, the 6 attention
-  // layers and the MoE layers (spec §4 W4), and is itself blocked on the
-  // Mamba2 SSD CUDA arm (#496 W2). Refuse loudly rather than return zeros.
-  VT_CHECK(false,
-           "NemotronHForCausalLM forward is not implemented yet (W4 of "
-           ".agents/specs/nemotron-h-model.md, issue #517)");
-  return {};
+  auto& nh = static_cast<NemotronHLoadedModel&>(model);
+  // W4: the hybrid layer loop, the Mamba2 mixer wiring, the 6 attention layers
+  // and the MoE layers are ported (nemotron_h.cpp) and reached HERE, through the
+  // shared `ModelRegistry::Forward` seam — never through a parallel entry point.
+  // `NemotronHForward` refuses BY NAME when the host weights are not
+  // materialized, which is the state every checkpoint load leaves them in until
+  // the weight loader lands (spec §5b); that refusal names the missing piece
+  // instead of returning a silent zero forward.
+  return HostLogits(NemotronHForward(nh.weights(), nh.params(), input.token_ids,
+                                     input.logits_indices, input.queue),
+                    nh.params().vocab_size);
 }
 
 const ModelFactory kNemotronHFactory{

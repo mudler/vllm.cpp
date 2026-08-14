@@ -1993,8 +1993,24 @@ Drift before -> after is **-0.33%**, inside the 1% gate this harness sets for
 itself, so the run counts. Ratios: 0.9894 before, 0.9862 after,
 **0.9889 combined**.
 
-**The gap is 1.1%, not 3.4%.** The 0.9757 / 0.9646 / 0.9569 of 6ac were
-measuring an unwarmed first arm as much as they were measuring the engine.
+**"The gap is 1.1%, not 3.4%" is WITHDRAWN** -- it was published here and does
+not survive its own arithmetic. Decomposing 6ac session 3 (0.9569) against this
+run (0.9889): our arm moved **+1.10%**, the ORACLE denominator moved **-2.17%**,
+so two thirds of the change is the oracle being slower on a different boot. The
+comparison is also one this spec forbids elsewhere -- absolutes move several
+percent across boots -- so differencing a boot-A ratio against a boot-B ratio is
+the cross-boot reasoning the record rejects when anyone else does it. Two more
+checks it fails: 6ac session 3 was ALREADY ours -> oracle -> ours with drift
+-0.89%, the CLOSING arm slower, which is the opposite sign from a cold leading
+arm; and the load-bearing "an entire first arm reads ~6% low" is inferred from an
+SM-clock reading with **no warm-up-arm on/off A/B anywhere**. What the warm-up
+arm demonstrably fixes is a 6.6% WITHIN-RUN drift, which makes a run internally
+valid without establishing that the ratio moved.
+
+**The honest statement:** valid within-session ratios on this row are 0.9757,
+0.9646, 0.9569 and 0.9889, a spread of 0.957-0.989 across boots with no single
+value being "the" ratio. The gap is somewhere in 1-4% and is NOT resolved better
+than that on this hardware.
 
 This is NOT parity: 0.9889 is below 1.0 and the row stays open. But it changes
 what remains to be found -- roughly a third of the deficit the record has been
@@ -2004,8 +2020,10 @@ deficit was attributed to.
 **Caveats, kept rather than buried.** n=1 paired run. **The repeat RAN and was
 REJECTED by this harness's own drift gate**: its arms measured 146.740 before
 and 143.619 after, a -2.13% drift against a 1% gate, so its 0.9795 does not
-count and is not averaged in. Bracketing on its own arms it spans 0.9912 to
-0.9701 -- it cannot separate parity from a 3% deficit. Two things it did
+count and is not averaged in. Bracketing on its own arms it spans 0.9905 to
+0.9694 -- it cannot separate parity from a 3% deficit. (Published first as
+0.9912-0.9701, which used the low-mode 148.05 rather than the table's 148.150
+denominator and flattered the top end.) Two things it did
 establish: the oracle's BIMODALITY IS BOOT-DEPENDENT (run 1 unimodal at ~144,
 run 2 clearly bimodal with 10 draws at 148.05 and 5 at 156.61, same script and
 pin), so a harness cannot assume either shape; and absolutes moved together

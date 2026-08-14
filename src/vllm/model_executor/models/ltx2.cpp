@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <numbers>
 #include <string>
 #include <vector>
 
@@ -69,7 +70,7 @@ float Silu(float x) { return x / (1.0f + std::exp(-x)); }
 // torch.nn.functional.gelu(..., approximate="tanh"), the activation
 // `activation_fn="gelu-approximate"` selects (gelu_approx.py:10).
 float GeluTanh(float x) {
-  const float kBeta = static_cast<float>(std::sqrt(2.0 / M_PI));
+  const float kBeta = static_cast<float>(std::sqrt(2.0 / std::numbers::pi_v<double>));
   const float kKappa = 0.044715f;
   const float inner = kBeta * (x + kKappa * x * x * x);
   return 0.5f * x * (1.0f + std::tanh(inner));
@@ -554,7 +555,8 @@ std::vector<float> FreqGridPytorch(double theta, int64_t n_pos_dims, int64_t dim
     const float t = i < halfway ? step * static_cast<float>(i)
                                 : 1.0f - step * static_cast<float>(n - 1 - i);
     out[static_cast<size_t>(i)] =
-        std::pow(static_cast<float>(theta), t) * static_cast<float>(M_PI / 2.0);
+        std::pow(static_cast<float>(theta), t) *
+        static_cast<float>(std::numbers::pi_v<double> / 2.0);
   }
   return out;
 }
@@ -569,7 +571,8 @@ std::vector<float> FreqGridNumpy(double theta, int64_t n_pos_dims, int64_t dim) 
   for (int64_t i = 0; i < n; ++i) {
     // numpy's linspace is arange(n) * step, with the final sample forced to `stop`.
     const double t = (i == n - 1) ? 1.0 : step * static_cast<double>(i);
-    out[static_cast<size_t>(i)] = static_cast<float>(std::pow(theta, t) * (M_PI / 2.0));
+    out[static_cast<size_t>(i)] =
+        static_cast<float>(std::pow(theta, t) * (std::numbers::pi_v<double> / 2.0));
   }
   return out;
 }

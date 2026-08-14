@@ -32,6 +32,11 @@ SYMBOLS = (
     "SnakeActivation",
     "AliasFreeActivation1d",
     "KaiserSincFilter1d",
+    # MiniMax-Music3's vocoder (#672) made the weight-norm fold a second
+    # consumer's problem. `w = g * v / ||v||` over every dim but dim 0 is one
+    # line of arithmetic with two ways to get the axis wrong, and a fork agrees
+    # on the day it is made -- the same reason every symbol above is here.
+    "MaterializeWeightNorm",
 )
 
 # The spellings the move retires. A reappearance means someone re-forked, or
@@ -89,7 +94,8 @@ class Vocoder1dSingleHomeTests(unittest.TestCase):
         """Two definitions is the fork this guard exists to catch."""
         pattern = re.compile(
             r"^(?:std::vector<float>|void|double)\s+(?:vocoder1d::)?"
-            r"(Conv1d|ConvTranspose1d|Pad1d|SnakeActivation|KaiserSincFilter1d)\s*\(",
+            r"(Conv1d|ConvTranspose1d|Pad1d|SnakeActivation|KaiserSincFilter1d"
+            r"|MaterializeWeightNorm)\s*\(",
             re.M,
         )
         counts: dict[str, int] = {name: 0 for name in pattern.pattern and SYMBOLS}

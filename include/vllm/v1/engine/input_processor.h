@@ -62,6 +62,7 @@
 #include "vllm/sampling_params.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/engine/types.h"
+#include "vllm/v1/engine/validation_error.h"  // InputValidationError (was defined here)
 
 namespace vllm::tok {
 class Tokenizer;  // vllm/tokenizer/tokenizer.h
@@ -69,21 +70,10 @@ class Tokenizer;  // vllm/tokenizer/tokenizer.h
 
 namespace vllm::v1 {
 
-// A request the engine REFUSES because the caller asked for something it can
-// never serve — today: a prompt longer than the resolved max_model_len
-// (_validate_prompt_len, input_processor.py:387-432 @ 555967922).
-//
-// Upstream raises a bare ValueError here and the OpenAI server maps ValueError
-// to `BadRequestError` / HTTP 400 in create_error_response
-// (vllm/entrypoints/serve/utils/error_response.py:62-65). C++ has no equivalent
-// of "the user-input exception class", so the mapping needs a NAMED type: the
-// api_server handlers catch this ahead of their generic `std::exception` ->
-// HTTP 500 arm, which is what makes the status code 400 rather than 500.
-class InputValidationError : public std::invalid_argument {
- public:
-  explicit InputValidationError(const std::string& msg)
-      : std::invalid_argument(msg) {}
-};
+// InputValidationError — the refusal this processor throws — now lives in
+// vllm/v1/engine/validation_error.h, included above, so that the multimodal
+// limit check can throw the SAME type without including this header. Same name,
+// same namespace: every existing thrower and catcher is unaffected.
 
 class InputProcessor {
  public:

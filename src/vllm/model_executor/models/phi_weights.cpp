@@ -32,6 +32,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 namespace {
@@ -46,8 +47,16 @@ using dense_loaders::MakeOwned;
 // `.to(bfloat16)` uses (F16 is a subset of F32, so F16ToF32 is exact).
 inline uint16_t F16ToBf16(uint16_t h) { return vt::F32ToBF16(vt::F16ToF32(h)); }
 
-void F16ToBf16Into(const uint16_t* src, int64_t n, uint16_t* dst) {
-  for (int64_t i = 0; i < n; ++i) dst[i] = F16ToBf16(src[i]);
+// `src` is `const void*`: every caller below hands it a pointer INTO the mmap'd
+// safetensors payload, whose per-tensor byte offset is the running total of
+// everything ahead of it and so need not be even. Forming or loading through a
+// `const uint16_t*` there is undefined (issue #627); vt::LoadUnaligned is the
+// project's seam for it.
+void F16ToBf16Into(const void* src, int64_t n, uint16_t* dst) {
+  const auto* bytes = static_cast<const uint8_t*>(src);
+  for (int64_t i = 0; i < n; ++i) {
+    dst[i] = F16ToBf16(vt::LoadUnaligned<uint16_t>(bytes + i * 2));
+  }
 }
 
 // F16 tensor -> owned bf16, copied verbatim (optionally reshaped). Mirrors
@@ -61,8 +70,7 @@ OwnedTensor LoadF16ToBf16Direct(const TensorResolver& get, const std::string& na
   const int64_t n = o.Numel();
   VT_CHECK(t.nbytes == static_cast<size_t>(n) * sizeof(uint16_t),
            "phi: byte-size mismatch for " + name);
-  F16ToBf16Into(reinterpret_cast<const uint16_t*>(t.data), n,
-                reinterpret_cast<uint16_t*>(o.bytes.data()));
+  F16ToBf16Into(t.data, n, reinterpret_cast<uint16_t*>(o.bytes.data()));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
@@ -76,11 +84,13 @@ OwnedTensor LoadF16ToBf16Transposed(const TensorResolver& get,
   const int64_t out_dim = t.shape[0];
   const int64_t in_dim = t.shape[1];
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {in_dim, out_dim});
-  const auto* src = reinterpret_cast<const uint16_t*>(t.data);
+  // Unaligned: `t.data` is an arbitrary byte offset into the mmap (#627).
+  const uint8_t* src = t.data;
   auto* dst = reinterpret_cast<uint16_t*>(o.bytes.data());
   for (int64_t r = 0; r < out_dim; ++r)
     for (int64_t c = 0; c < in_dim; ++c)
-      dst[c * out_dim + r] = F16ToBf16(src[r * in_dim + c]);
+      dst[c * out_dim + r] =
+          F16ToBf16(vt::LoadUnaligned<uint16_t>(src + (r * in_dim + c) * 2));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return o;
 }
@@ -115,7 +125,7 @@ OwnedTensor LoadMergedF16ToBf16RawNK(const TensorResolver& get,
     const int64_t n = shard.shape[0] * in_dim;
     VT_CHECK(shard.nbytes == static_cast<size_t>(n) * sizeof(uint16_t),
              "phi: byte-size mismatch for " + names[i]);
-    F16ToBf16Into(reinterpret_cast<const uint16_t*>(shard.data), n, dst + off);
+    F16ToBf16Into(shard.data, n, dst + off);
     off += static_cast<size_t>(n);
     MaybeReleaseSourcePages(shard.data, shard.nbytes);
   }
@@ -148,7 +158,7 @@ OwnedTensor LoadMergedF16ToBf16Vector(const TensorResolver& get,
     const int64_t n = shard.shape[0];
     VT_CHECK(shard.nbytes == static_cast<size_t>(n) * sizeof(uint16_t),
              "phi: byte-size mismatch for " + names[i]);
-    F16ToBf16Into(reinterpret_cast<const uint16_t*>(shard.data), n, dst + off);
+    F16ToBf16Into(shard.data, n, dst + off);
     off += static_cast<size_t>(n);
     MaybeReleaseSourcePages(shard.data, shard.nbytes);
   }

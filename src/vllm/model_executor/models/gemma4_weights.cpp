@@ -135,7 +135,16 @@ OwnedTensor LoadFp8ChannelToBf16RawNk(const TensorResolver& get, const std::stri
   VT_CHECK(s.shape[0] == N, "gemma4 fp8: scale N");
   OwnedTensor o = MakeOwned(vt::DType::kBF16, {N, K});
   o.nk = true;
-  DequantFp8ChannelToBf16(w.data, reinterpret_cast<const uint16_t*>(s.data), N, K,
+  // `s.data` points into the mmap'd safetensors payload at an arbitrary byte
+  // offset, so a `const uint16_t*` onto it is undefined to form or load through
+  // (issue #627), and DequantFp8ChannelToBf16 takes a typed scale pointer. Copy
+  // the N-element scale row into an aligned buffer first — N is the output
+  // channel count, negligible next to the N*K dequant it feeds.
+  std::vector<uint16_t> scale(static_cast<size_t>(N));
+  VT_CHECK(s.nbytes >= scale.size() * sizeof(uint16_t),
+           "gemma4 fp8: scale tensor too small for " + base);
+  std::memcpy(scale.data(), s.data, scale.size() * sizeof(uint16_t));
+  DequantFp8ChannelToBf16(w.data, scale.data(), N, K,
                           reinterpret_cast<uint16_t*>(o.bytes.data()));
   MaybeReleaseSourcePages(w.data, w.nbytes);
   MaybeReleaseSourcePages(s.data, s.nbytes);

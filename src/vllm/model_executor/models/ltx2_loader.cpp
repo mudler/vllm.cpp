@@ -33,6 +33,7 @@
 
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vt/unaligned.h"  // LoadUnaligned — safetensors offsets carry no alignment
 
 namespace vllm {
 namespace {
@@ -1321,8 +1322,23 @@ Ltx2VaeWeights Ltx2LoadVaeWeights(const SafetensorsFile& file,
              " BF16 bytes but its shape needs " +
              std::to_string(static_cast<size_t>(numel) * sizeof(uint16_t)));
       }
-      const uint16_t* src = reinterpret_cast<const uint16_t*>(t.data);
-      for (int64_t i = 0; i < numel; ++i) values[static_cast<size_t>(i)] = Bf16ToF32(src[i]);
+      // Byte-wise load through the shared seam, NOT
+      // `reinterpret_cast<const uint16_t*>(t.data)[i]`. `t.data` points into the
+      // safetensors mmap at `8 + <JSON header length> + <sum of the preceding
+      // tensors' sizes>`, and NONE of those three terms is required to be even,
+      // so this tensor's first byte is 2-byte aligned only when the writer
+      // happened to pad. The cast was UB on every such file, UBSan caught it
+      // here (issue #674, "load of misaligned address ... requires 2 byte
+      // alignment"), and it is a genuine fault on the strict-alignment targets
+      // this builds for (build-test-cpu-arm64, Jetson/Orin sm_110).
+      // `vt::LoadUnaligned` is a memcpy with no alignment precondition and
+      // compiles to the same single load where the address does happen to be
+      // aligned; it is the seam #301 left behind, and
+      // minimax_h3_vae_loader.cpp:87-101 took the same repair.
+      for (int64_t i = 0; i < numel; ++i) {
+        values[static_cast<size_t>(i)] = Bf16ToF32(
+            vt::LoadUnaligned<uint16_t>(t.data + static_cast<size_t>(i) * sizeof(uint16_t)));
+      }
     } else if (t.dtype == "F32") {
       if (t.nbytes != static_cast<size_t>(numel) * sizeof(float)) {
         Fail("'" + name + "' declares " + std::to_string(t.nbytes) +

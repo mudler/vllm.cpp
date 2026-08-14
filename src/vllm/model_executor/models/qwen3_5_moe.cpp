@@ -215,4 +215,20 @@ std::unique_ptr<LoadedModel> BorrowQwen3_5MoeLoadedModel(
 REGISTER_VLLM_MODEL(qwen3_5_moe, "Qwen3_5MoeForConditionalGeneration",
                     kQwen3_5MoeFactory, kQwen3_5Info)
 
+// TEXT-ONLY arm of the SAME backbone. Upstream registers it against the same
+// `qwen3_5` module (registry.py:202-203 @ `ad5d29db7`, PR #50210) and its class
+// is `Qwen3_5ForCausalLMBase` plus `set_moe_parameters()` — not a separate model
+// (qwen3_5.py:443-449). So this is the SAME factory, additively: no forward, no
+// KV-cache spec and no loader fork. `Qwen/Qwen3.8-2.4T-A95B` is the motivating
+// checkpoint; it declares `Qwen3_5MoeForCausalLM` / `qwen3_5_moe_text` and is
+// the 35B-A3B architecture at larger scale, all of it config-driven.
+//
+// AHEAD OF THE PIN, DELIBERATELY. `555967922` (.agents/upstream-sync.md) carries
+// only the ForConditionalGeneration entries; the text-only arms landed upstream
+// after it. This is a forward port of ONE upstream PR and does not advance the
+// pin. There is NO run gate for the 2.4T checkpoint on this hardware — see
+// .agents/specs/qwen38-text-only.md §Gates, which records that gate as OWED.
+REGISTER_VLLM_MODEL(qwen3_5_moe_text, "Qwen3_5MoeForCausalLM",
+                    kQwen3_5MoeFactory, kQwen3_5TextInfo)
+
 }  // namespace vllm

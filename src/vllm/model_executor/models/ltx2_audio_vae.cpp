@@ -24,16 +24,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <numbers>
 #include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/model_executor/models/vocoder1d.h"
 #include "vt/dtype.h"
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 namespace vllm {
 
@@ -433,9 +430,14 @@ std::vector<float> Ltx2HannSincResampleFilter1d(int64_t ratio, int64_t* kernel_s
     const double clamped =
         std::max(-static_cast<double>(lowpass_filter_width),
                  std::min(static_cast<double>(lowpass_filter_width), t));
-    const double window =
-        std::pow(std::cos(clamped * M_PI / static_cast<double>(lowpass_filter_width) / 2.0), 2.0);
-    const double sinc = t == 0.0 ? 1.0 : std::sin(M_PI * t) / (M_PI * t);
+    const double window = std::pow(
+        std::cos(clamped * std::numbers::pi_v<double> /
+                 static_cast<double>(lowpass_filter_width) / 2.0),
+        2.0);
+    const double sinc =
+        t == 0.0 ? 1.0
+                 : std::sin(std::numbers::pi_v<double> * t) /
+                       (std::numbers::pi_v<double> * t);
     filter[static_cast<size_t>(i)] =
         static_cast<float>(sinc * window * rolloff / static_cast<double>(ratio));
   }
@@ -1043,7 +1045,8 @@ std::vector<float> Ltx2WaveformToLogMel(const Ltx2AudioProcessorConfig& config,
   std::vector<double> window(static_cast<size_t>(n_fft));
   for (int64_t i = 0; i < n_fft; ++i) {
     window[static_cast<size_t>(i)] =
-        0.5 - 0.5 * std::cos(2.0 * M_PI * static_cast<double>(i) / static_cast<double>(n_fft));
+        0.5 - 0.5 * std::cos(2.0 * std::numbers::pi_v<double> *
+                             static_cast<double>(i) / static_cast<double>(n_fft));
   }
 
   // `center=True, pad_mode="reflect"`: pad n_fft/2 on BOTH sides, so frame 0 is
@@ -1081,7 +1084,8 @@ std::vector<float> Ltx2WaveformToLogMel(const Ltx2AudioProcessorConfig& config,
       for (int64_t f = 0; f < n_freqs; ++f) {
         double real = 0.0;
         double imag = 0.0;
-        const double omega = -2.0 * M_PI * static_cast<double>(f) / static_cast<double>(n_fft);
+        const double omega = -2.0 * std::numbers::pi_v<double> *
+                             static_cast<double>(f) / static_cast<double>(n_fft);
         for (int64_t i = 0; i < n_fft; ++i) {
           const double angle = omega * static_cast<double>(i);
           real += frame[static_cast<size_t>(i)] * std::cos(angle);

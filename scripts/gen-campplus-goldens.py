@@ -1,6 +1,6 @@
 import importlib.util, sys, types, numpy as np, torch
 from pathlib import Path
-SRC = Path("/tmp/claude-1000/-home-mudler--git-vllm-cpp/38b1c7ca-4dbc-4077-a36b-a9495dd81893/scratchpad/it2/indextts/s2mel/modules/campplus/layers.py")
+SRC = Path(__import__("os").environ.get("CAMPPLUS_LAYERS", "/tmp/campplus/layers.py"))
 # load the UPSTREAM module by file path (no package __init__, no vllm deps)
 spec = importlib.util.spec_from_file_location("cp_layers", SRC)
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -74,6 +74,45 @@ dl_out = dl(xt)
 blk = m.CAMDenseTDNNBlock(NL, IN, GROWTH, BN, K, dilation=D).eval(); fill(blk, "blk")
 blk_out = blk(xt)
 
+
+# ---- BasicResBlock: Conv2d strides (stride, 1) -- FREQUENCY axis only ----
+FIN, FPLANES, FH, FW = 2, 3, 16, 20
+x4 = P("x4", (1, FIN, FH, FW), 1.0)
+rb = m.BasicResBlock(FIN, FPLANES, stride=2).eval(); fill(rb, "rb")
+rb_out = rb(x4)
+
+
+# ---- the WHOLE CAMPPlus at reduced config ----
+# Every parameter and buffer is rebuilt from the name stream by ONE rule the C++
+# mirrors, so the manifest below is the contract: a tensor one side builds and
+# the other does not is a failure, not a silent zero.
+import importlib.util as _il
+_dt = _il.spec_from_file_location("dt", SRC.parent / "DTDNN.py")
+_dtm = _il.module_from_spec(_dt)
+import sys as _sys
+_sys.path.insert(0, str(SRC.parents[4]))
+_dt.loader.exec_module(_dtm)
+
+FEAT, EMB, GROW, BNSZ, INIT, FT = 32, 16, 2, 2, 8, 40
+full = _dtm.CAMPPlus(feat_dim=FEAT, embedding_size=EMB, growth_rate=GROW,
+                     bn_size=BNSZ, init_channels=INIT).eval()
+MANIFEST = []
+with torch.no_grad():
+    for name, q in list(full.named_parameters()) + list(full.named_buffers()):
+        if name.endswith("num_batches_tracked"):
+            continue
+        vals = P(name, tuple(q.shape) if q.dim() else (1,), 0.3)
+        if name.endswith("running_var"):
+            vals = vals.abs() + 0.5
+        q.copy_(vals.reshape(q.shape))
+        MANIFEST.append((name, list(q.shape)))
+feats = P("feats", (1, FT, FEAT), 1.0)   # (B, T, F) -- forward permutes to (B,F,T)
+_tap = {}
+def _hook(_m, _i, o): _tap["tdnn"] = o.detach().clone()
+full.xvector.tdnn.register_forward_hook(_hook)
+full_out = full(feats)
+tdnn_out = _tap["tdnn"]
+
 def emit(f, name, t):
     a = np.asarray(t.detach().numpy(), dtype=np.float32).reshape(-1)
     f.write(f"inline constexpr float {name}[] = {{\n")
@@ -100,5 +139,24 @@ with out.open("w") as f:
     f.write("\n")
     emit(f, "kTransit", transit_out); emit(f, "kDense2d", dense_out)
     emit(f, "kDenseTdnnLayer", dl_out); emit(f, "kDenseTdnnBlock", blk_out)
+    for n, v in (("kFcmIn", FIN), ("kFcmPlanes", FPLANES), ("kFcmH", FH), ("kFcmW", FW),
+                 ("kFcmOutH", rb_out.shape[2]), ("kFcmOutW", rb_out.shape[3])):
+        f.write(f"inline constexpr int64_t {n} = {v};\n")
+    f.write("\n")
+    emit(f, "kResBlock", rb_out)
+    for n, v in (("kFeatDim", FEAT), ("kEmbedding", EMB), ("kGrowth2", GROW),
+                 ("kBnSize", BNSZ), ("kInitChannels", INIT), ("kFullFrames", FT)):
+        f.write(f"inline constexpr int64_t {n} = {v};\n")
+    f.write(f"\ninline constexpr int64_t kManifestSize = {len(MANIFEST)};\n\n")
+    f.write("struct ManifestEntry { const char* name; int64_t rank; int64_t d0, d1, d2, d3; };\n")
+    f.write("inline constexpr ManifestEntry kManifest[] = {\n")
+    for nm, sh in MANIFEST:
+        d = list(sh) + [1, 1, 1, 1]
+        f.write(f'    {{"{nm}", {len(sh)}, {d[0]}, {d[1]}, {d[2]}, {d[3]}}},\n')
+    f.write("};\n\n")
+    f.write(f"inline constexpr int64_t kTdnnChannels = {tdnn_out.shape[1]};\n")
+    f.write(f"inline constexpr int64_t kTdnnFrames = {tdnn_out.shape[2]};\n\n")
+    emit(f, "kTdnnOut", tdnn_out)
+    emit(f, "kFullEmbedding", full_out)
     f.write("}  // namespace campplus_goldens\n")
 print("wrote", out, "T=", T, "seg segments=", -(-T//100))

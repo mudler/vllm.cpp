@@ -767,10 +767,31 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_sharded.cpp
   src/vllm/model_executor/models/minimax_h3_audio_vae.cpp
   src/vllm/model_executor/models/vocoder1d.cpp
+  src/vllm/model_executor/models/minimax_music3_loader.cpp
+  src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/gpt2.cpp
   src/vllm/multimodal/speech_engine.cpp
   src/vllm/model_executor/models/indextts2.cpp
   src/vllm/model_executor/models/campplus.cpp
+  src/vllm/model_executor/models/w2vbert.cpp
+  src/vllm/model_executor/models/w2v_fbank.cpp
+  src/vllm/model_executor/models/fvq.cpp
+  src/vllm/model_executor/models/codec_encoder.cpp
+  src/vllm/model_executor/models/wavenet.cpp
+  src/vllm/model_executor/models/dit_tail.cpp
+  src/vllm/model_executor/models/dit_skip.cpp
+  src/vllm/model_executor/models/dit_front.cpp
+  src/vllm/model_executor/models/dit_stack.cpp
+  src/vllm/model_executor/models/bigvgan.cpp
+  src/vllm/model_executor/models/indextts2_s2mel_loader.cpp
+  src/vllm/model_executor/models/indextts2_talker_loader.cpp
+  src/vllm/model_executor/models/vocos.cpp
+  src/vllm/model_executor/models/lenreg.cpp
+  src/vllm/model_executor/models/cfm.cpp
+  src/vllm/model_executor/models/adaln.cpp
+  src/vllm/model_executor/models/dit.cpp
+  src/vllm/model_executor/models/talker.cpp
+  src/vllm/model_executor/models/indextts2_pipeline.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae_device.cpp
   src/vllm/model_executor/models/minimax_h3_vae_cnn.cpp
@@ -825,6 +846,7 @@ add_library(vllm STATIC
   # MODEL-NEMOTRON-H W3 (#517): the additive NemotronH structural bring-up —
   # config descent, the on-disk name map, the registry entry and the het-KV
   # topology. No forward: nemotron_h.cpp is W4.
+  src/vllm/model_executor/models/nemotron_h.cpp
   src/vllm/model_executor/models/nemotron_h_registry.cpp
   src/vllm/model_executor/models/nemotron_h_weights.cpp
   src/vllm/model_executor/models/glm4_registry.cpp
@@ -890,6 +912,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_vl_registry.cpp
   src/vllm/model_executor/models/voxtral.cpp
   src/vllm/multimodal/hasher.cpp
+  # Per-modality input-count limits and the refusal they carry
+  # (ENG-MM-INPUT-PIPELINE L1, #607).
+  src/vllm/multimodal/processing/context.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
@@ -1099,6 +1124,7 @@ add_library(vllm STATIC
   src/vllm/entrypoints/openai/tool_parsers/gemma4.cpp
   src/vllm/entrypoints/openai/tool_parsers/seed_oss.cpp
   src/vllm/entrypoints/openai/tool_parsers/muse_glimmer.cpp
+  src/vllm/entrypoints/openai/tool_parsers/parser_engine_adapter.cpp
   src/vllm/entrypoints/openai/reasoning_parsers/muse_glimmer.cpp
   src/vllm/parser/engine/incremental_lexer.cpp
   src/vllm/parser/engine/token_id_scanner.cpp

@@ -113,10 +113,67 @@ vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
 vllm_cpp_add_test(test_speech_engine vllm/multimodal/test_speech_engine.cpp)
 vllm_cpp_add_test(test_indextts2_family vllm/models/test_indextts2_family.cpp)
 vllm_cpp_add_test(test_campplus vllm/models/test_campplus.cpp)
+vllm_cpp_add_test(test_w2vbert vllm/models/test_w2vbert.cpp)
+vllm_cpp_add_test(test_fvq vllm/models/test_fvq.cpp)
+vllm_cpp_add_test(test_codec_encoder vllm/models/test_codec_encoder.cpp)
+vllm_cpp_add_test(test_w2v_fbank vllm/models/test_w2v_fbank.cpp)
+vllm_cpp_add_test(test_wavenet vllm/models/test_wavenet.cpp)
+vllm_cpp_add_test(test_dit_tail vllm/models/test_dit_tail.cpp)
+vllm_cpp_add_test(test_dit_skip vllm/models/test_dit_skip.cpp)
+vllm_cpp_add_test(test_dit_front vllm/models/test_dit_front.cpp)
+vllm_cpp_add_test(test_dit_stack vllm/models/test_dit_stack.cpp)
+vllm_cpp_add_test(test_bigvgan vllm/models/test_bigvgan.cpp)
+vllm_cpp_add_test(test_indextts2_s2mel_loader vllm/models/test_indextts2_s2mel_loader.cpp)
+vllm_cpp_add_test(test_indextts2_talker_loader vllm/models/test_indextts2_talker_loader.cpp)
+vllm_cpp_add_test(test_vocos vllm/models/test_vocos.cpp)
+vllm_cpp_add_test(test_lenreg vllm/models/test_lenreg.cpp)
+vllm_cpp_add_test(test_cfm vllm/models/test_cfm.cpp)
+vllm_cpp_add_test(test_adaln vllm/models/test_adaln.cpp)
+vllm_cpp_add_test(test_dit vllm/models/test_dit.cpp)
+vllm_cpp_add_test(test_talker vllm/models/test_talker.cpp)
+vllm_cpp_add_test(test_indextts2_pipeline vllm/models/test_indextts2_pipeline.cpp)
+target_include_directories(test_dit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_adaln PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_cfm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_lenreg PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_vocos PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_fvq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_codec_encoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_w2v_fbank PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_wavenet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_dit_tail PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_dit_front PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_dit_stack PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_bigvgan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+target_include_directories(test_w2vbert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
 target_include_directories(test_gpt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
+# MiniMax-Music3 W1 (#672): the six-component diffusers-arm loader, gated against
+# the REAL checkpoint's headers (minimax_music3_manifest.inc, 1012 tensors, no
+# weight bytes) so CI never needs the 28.5 GB asset.
+vllm_cpp_add_test(test_minimax_music3_loader vllm/models/test_minimax_music3_loader.cpp)
+target_include_directories(test_minimax_music3_loader PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# MiniMax-Music3 W2+W3 (#672): the AUTOREGRESSIVE half — prompt assembly, the
+# semantic CFG logit pipeline, the learned 8-layer condition mix and the RVQ
+# depth decoder — against goldens produced by EXECUTING upstream's own classes at
+# reduced dimensions in float32 (minimax_music3_ar_goldens.inc, no weight bytes).
+# The full-scale bf16 companion is tests/parity/test_minimax_music3_ar_real.cpp.
+vllm_cpp_add_test(test_minimax_music3_ar vllm/models/test_minimax_music3_ar.cpp)
+target_include_directories(test_minimax_music3_ar PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+# The FULL-SCALE companion: the REAL bf16 checkpoint driven on the REAL inputs,
+# against the committed oracle capture (frame_hiddens / condition_chunk0 /
+# rvq_codes). Checkpoint-gated on MUSIC3_CHECKPOINT or CHECKPOINT_ROOT; every
+# case emits a loud SKIP when the 28.5 GB asset is absent, so CI still compiles,
+# links and runs it.
+vllm_cpp_add_test(test_minimax_music3_ar_real parity/test_minimax_music3_ar_real.cpp)
+target_compile_definitions(test_minimax_music3_ar_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_ar_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
 # branch base (frames + WAV byte-identical, mux argv pinned).
@@ -225,6 +282,12 @@ foreach(_gateup_lever VT_DENSE_MARLIN_GATEUP VT_NVFP4_MARLIN VT_MOE_FUSED_W13)
     PROPERTIES ENVIRONMENT "${_gateup_lever}=0")
 endforeach()
 vllm_cpp_add_test(test_qwen35_plain_weights vllm/models/test_qwen35_plain_weights.cpp)
+vllm_cpp_add_test(test_qwen3_8_text_only vllm/models/test_qwen3_8_text_only.cpp)
+# The PUBLISHED `Qwen/Qwen3.8-2.4T-A95B` config.json, committed VERBATIM, so the
+# config-resolution case reads the real document (nested `rope_parameters`, 92
+# `layer_types`, transformers-4.57.3 `dtype`) instead of a paraphrase of it.
+target_compile_definitions(test_qwen3_8_text_only PRIVATE
+  QWEN3_8_CONFIG_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/config.json")
 # POOL-DEVICE-KEY (#516, .agents/specs/pool-device-key.md): the shared scratch
 # pool's free list must be keyed by DEVICE as well as size class, or a block
 # allocated through one backend is handed to a DBuf running on another —
@@ -469,6 +532,22 @@ target_compile_definitions(test_nemotron_h_scaffold PRIVATE
 # (#515). Same call as the W1 resolver header.
 target_include_directories(test_nemotron_h_scaffold PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity ${CMAKE_SOURCE_DIR}/src)
+
+# Nemotron-H W4 FORWARD gate (#517, .agents/specs/nemotron-h-model.md §4 W4): the
+# hybrid layer loop over all three block kinds, every block compared ELEMENTWISE
+# against a reference written independently in `double` from the upstream
+# formulas — not against a second call of the code under test, and not through a
+# helper both arms share. Both dtype arms (f32 and the released bf16) on every
+# case; a LONG-prompt arm as well as a short one, because only 6 of 52 layers are
+# attention; the SSD chunk-size invariance; the SSM state dtype carried across
+# two legs, which is the only way it is observable at all; the routed scale on
+# the OUTPUT rather than the router weights or logits; the f32 router; and the
+# no-RoPE finding. CPU-only, no checkpoint, no speed claim.
+vllm_cpp_add_test(test_nemotron_h_forward vllm/models/test_nemotron_h_forward.cpp)
+# nemotron_h.h / nemotron_h_forward.h are MODEL-PRIVATE headers under src/, not
+# include/vllm/: W4 ships nothing on the public ABI and include/vllm/ is a
+# USER_USAGE_PREFIXES surface (#515). Same call as the W1 resolver header.
+target_include_directories(test_nemotron_h_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # Kimi-Linear CPU REFERENCE FORWARD gates (W2-W6): the per-op reference forwards
 # (KDA layer vs the kimi_kda host-ref composition; NoPE-MLA vs a materialized-MHA
@@ -747,6 +826,13 @@ vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
 # SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
 # lookahead slots, draft identity).
 vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
+# ENG-MM-INPUT-PIPELINE L1 (#607): get_limit_per_prompt precedence —
+# language_model_only ⇒ 0 BEFORE the map, else the map, else the 999 default.
+vllm_cpp_add_test(test_multimodal_config vllm/config/test_multimodal_config.cpp)
+# ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
+# fold against the model's own ceiling, upstream's exact message, and both call
+# sites with the enable_mm_embeds escape.
+vllm_cpp_add_test(test_processing_limits vllm/multimodal/test_processing_limits.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)
 vllm_cpp_add_test(test_scheduler vllm/v1/test_scheduler.cpp)
@@ -855,6 +941,8 @@ vllm_cpp_add_test(test_longcat
   vllm/entrypoints/openai/tool_parsers/test_longcat.cpp)
 vllm_cpp_add_test(test_kimi_k2
   vllm/entrypoints/openai/tool_parsers/test_kimi_k2.cpp)
+vllm_cpp_add_test(test_tool_parser_inkling
+  vllm/entrypoints/openai/tool_parsers/test_inkling.cpp)
 vllm_cpp_add_test(test_granite_tool_parser
   vllm/entrypoints/openai/tool_parsers/test_granite_tool_parser.cpp)
 vllm_cpp_add_test(test_granite4_tool_parser

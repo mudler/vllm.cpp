@@ -256,6 +256,52 @@ TEST_CASE("video engine registry: an unrecognizable checkpoint refuses instead o
   }
 }
 
+// A path the OS cannot inspect AT ALL — one 300-character component, which is
+// ENAMETOOLONG rather than ENOENT. This is the case that separates a REFUSAL
+// from a THROW, and it is why the registry's existence probes must use the
+// std::error_code overloads of <filesystem>:
+//
+//   ::stat(path, &st)                       -> -1, so the probe returned false
+//   std::filesystem::exists(p, ec)          -> false, ec = "File name too long"
+//   std::filesystem::exists(p)  [throwing]  -> THROWS filesystem_error
+//
+// The header's contract for ReadVideoCheckpointTensorNames is "returns false
+// with *why holding the reason when the artifact cannot be enumerated"
+// (include/vllm/multimodal/video_engine.h). A throwing overload silently trades
+// that documented refusal for an exception escaping a registry query, and no
+// token- or golden-based gate would ever see it, because every checkpoint those
+// gates hand over is perfectly stattable. Issue #664.
+TEST_CASE("video engine registry: an UNINSPECTABLE path refuses, and never throws") {
+  SeamWorkspace ws;
+  const std::string unstattable = ws.root + "/" + std::string(300, 'x');
+
+  std::vector<std::string> names{"stale"};
+  std::string why;
+  bool enumerated = true;
+  REQUIRE_NOTHROW(enumerated = vllm::multimodal::ReadVideoCheckpointTensorNames(
+                      unstattable, &names, &why));
+  CHECK_FALSE(enumerated);
+  CHECK(names.empty());
+  CHECK(why == "no such file or directory");
+
+  // ...and the same path through the seam ends in the registry's OWN refusal,
+  // which names the registered families. std::filesystem::filesystem_error
+  // derives from std::runtime_error, so CHECK_THROWS_AS(std::runtime_error)
+  // would NOT tell the two apart — the message is what discriminates them, and
+  // a filesystem_error's what() knows nothing about video families.
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.fixture);
+  mp.dit_path = unstattable;
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(mp);
+    FAIL("an uninspectable dit_path must be refused, not detected around");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("minimax-h3") != std::string::npos);
+    CHECK(msg.find("no such file or directory") != std::string::npos);
+  }
+}
+
 // ─── extras carry the family-specific knob, in BOTH directions ──────────────
 TEST_CASE("video engine seam: H3's partition rides in extras and still guards") {
   SeamWorkspace ws;

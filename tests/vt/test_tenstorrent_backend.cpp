@@ -68,6 +68,9 @@ TEST_CASE("kTENSTORRENT Platform mirrors the registered Backend") {
   CHECK(p.supports_model_architecture("OPTForCausalLM"));
   // Qwen3-dense after RmsNorm / SiluAndMul / Cast / RoPE landed (Metal M3b twin).
   CHECK(p.supports_model_architecture("Qwen3ForCausalLM"));
+  // Mistral-7B-v0.3 reuses the Qwen3-dense forward verbatim (qk-norm skipped,
+  // plain rope, untied lm_head) — every op already registered, no new kernel.
+  CHECK(p.supports_model_architecture("MistralForCausalLM"));
   CHECK_FALSE(p.supports_model_architecture("LlamaForCausalLM"));
 }
 

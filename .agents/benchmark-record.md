@@ -21410,3 +21410,106 @@ The box rebooted or dropped FIVE times on 2026-08-13 (08:57, 09:29, 16:29,
 resolving 1% here at all.
 
 Evidence: `dgx.casa:~/work/dspark-w6/paired_lm.log`, `paired_lm2.log`.
+## BACKEND-TENSTORRENT-MISTRAL — Mistral-7B-v0.3 first data point (2026-08-14)
+
+`vllm-cli --prompt "Hello" --max-tokens 32 --repeat 2 --device auto` on a
+Blackhole P150. Run 1 (cold) 182.6 s for the 7B JIT shape set; run 2 (warm)
+7.5 s → **4.26 tok/s**. Batch 1, 32 tokens, single run.
+
+Context on the same box: Qwen3-0.6B measures 7.3 tok/s warm at 64 tokens, so a
+7B at 4.26 is in the expected band rather than an anomaly.
+
+**Not a gate, and deliberately not a claim.** One run, no idle-box statement, no
+clock state, no same-binary A/B — it does not meet the bar in
+`.agents/benchmarking.md` and is recorded here so the next person does not
+re-run it believing it is unmeasured, not so it can be quoted.
+
+**No vLLM denominator exists or can:** vLLM has no Tenstorrent backend at all,
+which is the AGENTS.md "When vLLM has no implementation" case. The correctness
+oracle for this lane is `transformers` (`.agents/oracles/transformers.md`); there
+is no throughput oracle, so the vLLM speed axis is an **OPEN GAP** for this row
+rather than a comparison that was run and lost.
+
+Measured by lu-zero (PR #431, issue #670); recorded here because a measurement
+belongs on the measurement surfaces, not only in a row spec.
+
+## SPEC-DSPARK: RETRACTION -- the "cold arm explains it" causal claim does not hold (2026-08-14)
+
+A fresh review returned FAIL on the headline attached to the 0.9889 run. The
+number stands; the EXPLANATION does not, and the explanation is what made it
+sound like progress.
+
+CLAIMED: "every earlier ratio was taken with a COLD leading arm, and correcting
+that moves the gap from 3.4% to ~1%."
+
+DECOMPOSED, session 3 (§6ac, 140.98 / 147.32 = 0.9569) against run 1
+(142.534 / 144.130 = 0.9889):
+
+| | change |
+|---|---|
+| OUR arm | **+1.10%** |
+| ORACLE denominator | **-2.17%** |
+| ratio if only OUR arm had moved | 0.9675 |
+| ratio if only the ORACLE had moved | 0.9781 |
+
+**Two thirds of the improvement is the oracle being SLOWER on the new boot.**
+Our arm moved 1.1%, which is not enough to carry a 3.3-point ratio change.
+
+Worse, the comparison is one this file forbids elsewhere: absolutes move
+several percent across boots (measured +1.8% ours and +2.8% oracle between run 1
+and run 2), so a ratio from boot A and a ratio from boot B cannot be
+differenced. Attributing their difference to a harness change is exactly the
+cross-boot reasoning the record rejects when anyone else does it.
+
+Two further checks the causal claim fails:
+
+  * SIGN. §6ac session 3 was ALREADY ours -> oracle -> ours and its drift was
+    -0.89% -- the CLOSING arm slower. A cold leading arm predicts the opposite
+    sign. Run 2 is the same shape at -2.13%, and this file already calls that
+    sign "the opposite from the cold-start ramp".
+  * NO A/B. The load-bearing "an entire first arm reads ~6% low" is inferred
+    from an SM-clock observation. No warm-up-arm on/off A/B exists anywhere.
+    That single experiment is what would establish the mechanism, and it was
+    never run.
+
+Corroborating: in run 2 our arm was FASTER in absolute terms than in run 1
+(145.117 vs 142.534) and the ratio was WORSE (0.9795), because the oracle was
+faster too. The ratio tracks the oracle's boot state at least as much as ours.
+
+WHAT THE HONEST STATEMENT IS. Valid within-session ratios measured on this row:
+0.9757, 0.9646, 0.9569, and 0.9889 (run 2 rejected on drift). That is a spread
+of 0.957 to 0.989 ACROSS BOOTS, and no single value is "the" ratio. The gap is
+somewhere in 1-4%, it is not resolved to better than that on this hardware, and
+the claim "the gap is 1.1%, not 3.4%" is WITHDRAWN. What the warm-up arm
+demonstrably fixes is a 6.6% within-run drift (§6ah run before/after), which is
+worth keeping for its own sake -- it makes a run INTERNALLY valid without
+telling us the ratio moved.
+
+ALSO CORRECTED, an arithmetic slip found in the same review: the run-2 bracket
+was published as 0.9912-0.9701. From the stated inputs (146.740 and 143.619
+against the table's oracle median 148.150) it is **0.9905-0.9694**. The
+published pair reproduces only against 148.05, the low-mode cluster value rather
+than the table's denominator, and the error moved the top end in the flattering
+direction.
+
+PER-REP VALUES, so these medians can be recomputed rather than trusted:
+
+  run 1 ours BEFORE: 141.666 142.604 142.592 142.672 142.630 142.787 142.746
+                     142.364 142.283
+  run 1 ours AFTER:  139.024 139.850 142.140 135.515 142.590 142.791 135.226
+                     142.478 142.870
+  run 1 oracle:      144.47 151.84 144.01 144.42 144.45 144.11 144.13 141.86
+                     144.16 144.09 144.11 144.28 144.68 143.89 144.02
+  run 2 ours BEFORE: 146.246 146.740 146.192 146.392 146.878 147.059 146.857
+                     146.706 147.083
+  run 2 ours AFTER:  143.027 143.819 143.608 143.954 144.042 143.619 143.507
+                     143.993 142.982
+  run 2 oracle:      157.18 156.84 156.48 148.29 148.15 148.04 153.10 147.80
+                     156.61 148.03 148.15 147.95 148.39 147.99 148.06
+
+(rep 1 of each `ours` arm is a cold outlier and is excluded from the medians:
+run 1 14.400 / 15.902 / 19.830, run 2 13.323 / 15.902 / 19.830 equivalents.)
+
+The harness itself is now committed as `scripts/dspark-paired-e2e.sh`; it was
+previously only on the gate host, which is why nothing in the tree could
+reproduce these medians.

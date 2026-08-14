@@ -1073,9 +1073,9 @@ a route yet. The greedy generate loop that turns the prompt into mel codes is
 ported too, and so is the STATED-emotion path -- eight weights selecting rows
 from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
 text plus a reference clip and an emotion reaches mel CODES in the library. What
-is still missing before audio is reading those matrices out of the converted
-checkpoint, BigVGAN's separately-downloaded checkpoint, and any command or route
-to call it from. Inferring the emotion from a clip instead of stating it needs a
+is still missing before audio is BigVGAN's separately-downloaded checkpoint, a
+step that drives the whole chain and writes a WAV, and any command or route to
+call it from. Inferring the emotion from a clip instead of stating it needs a
 Conformer and a Perceiver that are not ported.
 
 There is **no `/v1/audio/speech`**. Text to speech is not servable: the
@@ -2391,6 +2391,9 @@ VLLM_CPP_INDEXTTS2_S2MEL=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/s2mel.safeten
 
 VLLM_CPP_INDEXTTS2_GPT=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/gpt.safetensors \
   ./build/tests/test_indextts2_talker_loader
+
+VLLM_CPP_INDEXTTS2_AUX=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/aux.safetensors \
+  ./build/tests/test_emovec
 ```
 
 ## MiniMax-Music3: the autoregressive half

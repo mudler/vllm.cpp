@@ -100,3 +100,132 @@ TEST_CASE("mismatched shapes are refused") {
   CHECK_THROWS(ev::Select({1.0F, 0.0F}, 2, Banks(), {1.0F}, 2));      // too few weights
   CHECK_THROWS(ev::Select({1.0F}, 2, Banks(), {1.0F, 1.0F}, 2));      // short style
 }
+
+// ---------------------------------------------------------------------------
+// Loading the banks from the converted aux.safetensors (#634).
+// ---------------------------------------------------------------------------
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+namespace {
+
+std::atomic<uint64_t> kUnique{0};
+
+std::string U64Le(uint64_t v) {
+  std::string out(8, '\0');
+  for (int i = 0; i < 8; ++i) {
+    out[static_cast<size_t>(i)] = static_cast<char>((v >> (8 * i)) & 0xFF);
+  }
+  return out;
+}
+
+// A minimal aux file: feat1 [rows, style], feat2 [rows, out].
+std::string BuildAux(int64_t rows, int64_t style, int64_t out) {
+  std::string header = "{";
+  std::string data;
+  auto add = [&](const std::string& name, int64_t r, int64_t c, float base) {
+    const size_t begin = data.size();
+    for (int64_t i = 0; i < r * c; ++i) {
+      const float v = base + static_cast<float>(i);
+      data.append(reinterpret_cast<const char*>(&v), 4);
+    }
+    const size_t end = data.size();
+    if (header.size() > 1) header += ",";
+    header += "\"" + name + "\":{\"dtype\":\"F32\",\"shape\":[" + std::to_string(r) + "," +
+              std::to_string(c) + "],\"data_offsets\":[" + std::to_string(begin) + "," +
+              std::to_string(end) + "]}";
+  };
+  add("feat1", rows, style, 0.0F);
+  add("feat2", rows, out, 1000.0F);
+  header += "}";
+  return U64Le(header.size()) + header + data;
+}
+
+std::string WriteAux(const std::string& bytes) {
+  const std::filesystem::path p = std::filesystem::temp_directory_path() /
+      ("indextts2_aux_" + std::to_string(kUnique.fetch_add(1)) + ".safetensors");
+  std::ofstream f(p, std::ios::binary);
+  f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  return p.string();
+}
+
+}  // namespace
+
+TEST_CASE("the banks are SPLIT by emo_num, not left as one") {
+  // 6 rows split [1, 2, 3]. Without the split there would be one bank and one
+  // index, which is exactly the defect the selection cases above catch.
+  const std::string path = WriteAux(BuildAux(6, 2, 3));
+  int64_t style = 0, out = 0;
+  const auto banks = ev::LoadBanks(path, {1, 2, 3}, &style, &out);
+  REQUIRE(banks.size() == 3);
+  CHECK(style == 2);
+  CHECK(out == 3);
+  CHECK(banks[0].rows == 1);
+  CHECK(banks[1].rows == 2);
+  CHECK(banks[2].rows == 3);
+  // Bank 1 must start at row 1 of feat1, i.e. value 2.0 (row 0 held 0, 1).
+  CHECK(banks[1].speakers[0] == 2.0F);
+  // Bank 2 starts at row 3 of feat2: 1000 + 3*3 = 1009.
+  CHECK(banks[2].emotions[0] == 1009.0F);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("an emo_num that does not sum to the row count is REFUSED") {
+  const std::string path = WriteAux(BuildAux(6, 2, 3));
+  int64_t style = 0, out = 0;
+  // Sums to 5, not 6: the last row would be silently dropped and every bank
+  // after the first would address the wrong rows.
+  CHECK_THROWS(ev::LoadBanks(path, {1, 2, 2}, &style, &out));
+  // Sums to 7: reads past the end.
+  CHECK_THROWS(ev::LoadBanks(path, {1, 2, 4}, &style, &out));
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("feat1 and feat2 disagreeing on row count is REFUSED") {
+  // The two matrices are indexed by the SAME row, so a mismatch means one of
+  // them is addressed out of step with the other. Every shape stays valid and
+  // the selection silently reads the wrong emotion rows.
+  std::string header = "{";
+  std::string data;
+  auto add = [&](const std::string& name, int64_t r, int64_t c) {
+    const size_t begin = data.size();
+    for (int64_t i = 0; i < r * c; ++i) {
+      const float v = static_cast<float>(i);
+      data.append(reinterpret_cast<const char*>(&v), 4);
+    }
+    if (header.size() > 1) header += ",";
+    header += "\"" + name + "\":{\"dtype\":\"F32\",\"shape\":[" + std::to_string(r) +
+              "," + std::to_string(c) + "],\"data_offsets\":[" + std::to_string(begin) +
+              "," + std::to_string(data.size()) + "]}";
+  };
+  add("feat1", 6, 2);
+  add("feat2", 5, 3);  // one row SHORT
+  header += "}";
+  const std::string path = WriteAux(U64Le(header.size()) + header + data);
+  int64_t style = 0, out = 0;
+  CHECK_THROWS(ev::LoadBanks(path, {1, 2, 3}, &style, &out));
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("the SHIPPED aux file loads with the emo_num config.yaml declares") {
+  const char* env = std::getenv("VLLM_CPP_INDEXTTS2_AUX");
+  if (env == nullptr) {
+    MESSAGE("SKIPPED: set VLLM_CPP_INDEXTTS2_AUX to the converted aux.safetensors");
+    return;
+  }
+  int64_t style = 0, out = 0;
+  const auto banks = ev::LoadBanks(std::string(env), {3, 17, 2, 8, 4, 5, 10, 24},
+                                   &style, &out);
+  CHECK(banks.size() == 8);
+  CHECK(style == 192);   // kStyleDim
+  CHECK(out == 1280);    // kTalkerDim
+  int64_t rows = 0;
+  for (const auto& b : banks) {
+    rows += b.rows;
+  }
+  CHECK(rows == 73);
+}

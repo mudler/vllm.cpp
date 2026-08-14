@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace vllm {
@@ -43,6 +44,23 @@ std::vector<float> Select(const std::vector<float>& style, int64_t style_dim,
                           const std::vector<EmotionBank>& banks,
                           const std::vector<float>& weights, int64_t out_dim,
                           std::vector<int64_t>* chosen_rows = nullptr);
+
+
+// Load the banks from the converted `aux.safetensors`.
+//
+// `feat1.pt` and `feat2.pt` ship as SINGLE tensors -- [73, 192] and [73, 1280]
+// in the released checkpoint -- and upstream splits them with
+// `torch.split(matrix, emo_num)` where `emo_num` comes from config.yaml
+// (`[3, 17, 2, 8, 4, 5, 10, 24]`, summing to 73). The split is the whole reason
+// the emotions can select different rows: without it there is one bank and one
+// index, which is exactly the mistake `emovec::Select`'s gate catches.
+//
+// Throws naming the tensor when one is missing, and refuses an `emo_num` whose
+// sum disagrees with the row count -- a mismatch there silently reassigns rows
+// to the wrong emotions while every shape stays valid.
+std::vector<EmotionBank> LoadBanks(const std::string& aux_path,
+                                   const std::vector<int64_t>& emo_num,
+                                   int64_t* style_dim, int64_t* out_dim);
 
 }  // namespace emovec
 }  // namespace models

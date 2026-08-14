@@ -69,17 +69,12 @@ TEST_CASE("indextts2 refusal names the missing piece and its issue") {
     FAIL("synthesis must refuse while the tokenizer is missing");
   } catch (const std::runtime_error& e) {
     const std::string msg = e.what();
-    // Naming the piece is the whole point: "unsupported" sends the next person
-    // reading loader source. Match the EXPLANATION, not the filename -- the
-    // shipped vocabulary is called `...char_del.tiktoken`, so searching for
-    // "tiktoken" alone passes on the filename even when the reason is gone.
-    // That is what a mutation removing the explanation revealed.
-    CHECK(msg.find("no tiktoken reader") != std::string::npos);
-    CHECK(msg.find("cannot tokenize") != std::string::npos);
+    // CHANGED DELIBERATELY. This used to assert the refusal named a MISSING
+    // TIKTOKEN READER; that reader landed and the engine tokenizes now, so the
+    // refusal moved to what a bare fixture is actually missing -- the shipped
+    // vocabulary file itself. Naming the piece is still the whole point.
+    CHECK(msg.find("multilingual_zh_ja_yue_char_del.tiktoken") != std::string::npos);
     CHECK(msg.find("#634") != std::string::npos);
-    // And it must name the ORACLE separately, since that blocks a different
-    // thing -- correctness, not capability.
-    CHECK(msg.find("#633") != std::string::npos);
   }
 }
 
@@ -153,7 +148,7 @@ TEST_CASE("synthesis without a reference clip is refused FIRST") {
   }
 }
 
-TEST_CASE("with a clip, the refusal names the TOKENIZER and nothing stale") {
+TEST_CASE("with a clip, the refusal names the VOCABULARY and nothing stale") {
   vllm::multimodal::SpeechRegistry registry;
   vllm::models::RegisterIndexTts2SpeechFamily(registry);
   vllm::multimodal::SpeechModelParams params;
@@ -173,13 +168,13 @@ TEST_CASE("with a clip, the refusal names the TOKENIZER and nothing stale") {
     FAIL("synthesis must refuse while the tokenizer is missing");
   } catch (const std::runtime_error& e) {
     const std::string what = e.what();
-    CHECK(what.find("no tiktoken reader") != std::string::npos);
-    CHECK(what.find("cannot tokenize") != std::string::npos);
+    CHECK(what.find("multilingual_zh_ja_yue_char_del.tiktoken") != std::string::npos);
     CHECK(what.find("#634") != std::string::npos);
-    // The refusal must NOT still claim the render path is unimplemented: that
-    // was true when this family was registered and is not true now, and a
-    // stale refusal sends the next reader to build what already exists.
+    // The refusal must NOT claim anything already built is missing. Both of
+    // these were in it once and both are now done; a stale refusal sends the
+    // next reader to build what already exists.
     CHECK(what.find("S2Mel CFM/DiT decoder") == std::string::npos);
     CHECK(what.find("not implemented yet") == std::string::npos);
+    CHECK(what.find("no tiktoken reader") == std::string::npos);
   }
 }

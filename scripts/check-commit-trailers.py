@@ -253,6 +253,22 @@ def _resolve_commit(repo: Path, revision: str) -> str:
     return resolved[0]
 
 
+def _merge_base(repo: Path, a: str, b: str) -> str:
+    """The merge base of two revisions; raises when they share no history."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", a, b],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("range base and head have no merge base (unrelated histories)")
+    oid = result.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", oid):
+        raise ValueError("merge base did not resolve to one commit")
+    return oid
+
+
 def _is_ancestor(repo: Path, older: str, newer: str) -> bool:
     result = subprocess.run(
         ["git", "-C", str(repo), "merge-base", "--is-ancestor", older, newer],
@@ -277,8 +293,13 @@ def validate_range(
 
     base_oid = _resolve_commit(repo, base)
     head_oid = _resolve_commit(repo, head)
-    if not _is_ancestor(repo, base_oid, head_oid):
-        raise ValueError("range base must be an ancestor of range head")
+    # From the MERGE BASE, not the base tip (#773). CI passes
+    # `pull_request.base.sha`, which stops being an ancestor of head as soon as
+    # main advances past the branch -- so this used to raise and return WITHOUT
+    # READING A SINGLE COMMIT, meaning the trailer contract was never enforced
+    # on any external contribution. Unrelated histories still fail closed: no
+    # merge base means no range, and inventing one would be worse than refusing.
+    base_oid = _merge_base(repo, base_oid, head_oid)
     cutover_oid = _resolve_commit(repo, cutover) if cutover is not None else None
     if cutover_oid is not None and not _is_ancestor(repo, cutover_oid, head_oid):
         raise ValueError("cutover must be reachable from range head")

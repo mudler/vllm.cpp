@@ -246,6 +246,7 @@ Qwen3.6-27B NVFP4, GB10, whole serving window.
 | Peak RSS | 24.88 GiB | 28.56 GiB | 1.148x | **PASS** |
 | Peak GPU memory | 40,996 MiB | 70,531 MiB | 1.720x | **PASS** |
 | Peak `MemAvailable` drop | 68.35 GiB | 80.66 GiB | 1.180x | **PASS** |
+| Weight offload, resident device bytes (`ENG-WEIGHT-OFFLOAD` W6) | not measured | not measured | n/a | **BLOCKED**, not pending: unmeasurable on every host we own (GB10 shares one pool, so `cpu_offload_gb` frees nothing). Needs a discrete-GPU rig ([record](../.agents/benchmark-record.md)) |
 
 35B steady-serving PSS is 3.53 GiB against vLLM's 13.3 GiB after the routed-expert
 host mirror is freed once the device Marlin resident is built.
@@ -351,7 +352,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE 35B-A3B: valid within-session ratios **0.957-0.989** across boots (one run rejected on a drift gate). NOT parity; Marlin localisation REFUTED (#442) | `ACTIVE` |
+| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE 35B-A3B: within-session ratios **0.957-0.989** across boots, NOT parity. Re-measurement BLOCKED: gate host reimaged 2026-08-14, oracle and checkpoints gone (#442) | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure

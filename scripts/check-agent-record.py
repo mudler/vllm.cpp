@@ -485,7 +485,16 @@ ENGINE_PREFIXES = (
 # rows are real and neither replaces the other, which is why this line reads 154
 # rather than restating 153. `READY`, spec `specs/upstream-omni-pin.md`, issue #633.
 # Bumped for a real new row, never to make a failing state transition pass.
-# 155 since 2026-08-14: +`ENG-RECORD-ANCHOR-RATCHET` (the record's own `path:line`
+# 155 since 2026-08-14: +`ENG-HYBRID-PLACEMENT` (per-tensor-group device placement,
+# delivering routed-MoE expert COMPUTE on the CPU backend while the rest of the
+# model stays on GPU). Genuinely new, not a restatement of either offload row it
+# sits beside: `ENG-WEIGHT-OFFLOAD` and `ENG-EXPERT-STREAM` both move weights
+# toward the compute, and this row moves compute toward the weights, so no
+# existing row can express it. Surpass-track — vLLM ships CPU MoE kernels but
+# selects them platform-wide via `current_platform.is_cpu()`, so hybrid placement
+# is absent at the pin and the gate runs against llama.cpp `237ad9b96`.
+# `READY`, spec `specs/hybrid-placement.md`, issue #149.
+# 156 since 2026-08-14: +`ENG-RECORD-ANCHOR-RATCHET` (the record's own `path:line`
 # citations are 82% unchecked -- `LINK_RE` in THIS file matches only markdown
 # links, so 2137 bare `file.cpp:123` citations across the five matrices are never
 # parsed, against 480 that are; and the 18% seen is only range-checked, never
@@ -494,7 +503,7 @@ ENGINE_PREFIXES = (
 # Issue #632; `SPIKE` on its committed spec. The row claims no implementation: no
 # parser, no baseline and no test exists yet.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 155
+ENGINE_ROWS = 156
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

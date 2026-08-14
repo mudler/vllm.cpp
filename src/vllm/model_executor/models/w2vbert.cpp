@@ -147,6 +147,64 @@ std::vector<float> ConvModule(const std::vector<float>& x, int64_t frames, int64
   return out;
 }
 
+
+std::vector<float> SelfAttentionRelativeKey(const std::vector<float>& x, int64_t frames,
+                                            int64_t hidden, int64_t heads, int64_t left_max,
+                                            int64_t right_max, const SelfAttentionWeights& w) {
+  VT_CHECK(hidden % heads == 0, "w2vbert: hidden must divide by heads");
+  const int64_t head_dim = hidden / heads;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+
+  const std::vector<float> q = Linear(x, frames, hidden, hidden, w.q_w, w.q_b);
+  const std::vector<float> k = Linear(x, frames, hidden, hidden, w.k_w, w.k_b);
+  const std::vector<float> v = Linear(x, frames, hidden, hidden, w.v_w, w.v_b);
+
+  std::vector<float> ctx(static_cast<size_t>(frames * hidden));
+  for (int64_t h = 0; h < heads; ++h) {
+    for (int64_t i = 0; i < frames; ++i) {
+      std::vector<double> scores(static_cast<size_t>(frames));
+      for (int64_t j = 0; j < frames; ++j) {
+        double dot = 0.0;
+        for (int64_t d = 0; d < head_dim; ++d) {
+          dot += static_cast<double>(q[static_cast<size_t>(i * hidden + h * head_dim + d)]) *
+                 static_cast<double>(k[static_cast<size_t>(j * hidden + h * head_dim + d)]);
+        }
+        dot *= scale;
+
+        // distance is key MINUS query, clamped asymmetrically, then shifted into
+        // the embedding table by +left_max.
+        int64_t dist = j - i;
+        if (dist < -left_max) dist = -left_max;
+        if (dist > right_max) dist = right_max;
+        const int64_t row = dist + left_max;
+        double rel = 0.0;
+        for (int64_t d = 0; d < head_dim; ++d) {
+          rel += static_cast<double>(q[static_cast<size_t>(i * hidden + h * head_dim + d)]) *
+                 static_cast<double>(
+                     w.distance_embedding[static_cast<size_t>(row * head_dim + d)]);
+        }
+        // divided by sqrt(d) AGAIN, separately from the score above.
+        scores[static_cast<size_t>(j)] = dot + rel * scale;
+      }
+
+      double best = scores[0];
+      for (const double s : scores) best = std::max(best, s);
+      double denom = 0.0;
+      for (double& s : scores) { s = std::exp(s - best); denom += s; }
+      for (int64_t d = 0; d < head_dim; ++d) {
+        double acc = 0.0;
+        for (int64_t j = 0; j < frames; ++j) {
+          acc += scores[static_cast<size_t>(j)] *
+                 static_cast<double>(v[static_cast<size_t>(j * hidden + h * head_dim + d)]);
+        }
+        ctx[static_cast<size_t>(i * hidden + h * head_dim + d)] =
+            static_cast<float>(acc / denom);
+      }
+    }
+  }
+  return Linear(ctx, frames, hidden, hidden, w.out_w, w.out_b);
+}
+
 }  // namespace w2vbert
 }  // namespace models
 }  // namespace vllm

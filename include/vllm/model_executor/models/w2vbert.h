@@ -54,6 +54,30 @@ struct ConvModuleWeights {
 std::vector<float> ConvModule(const std::vector<float>& x, int64_t frames, int64_t hidden,
                               int64_t kernel, const ConvModuleWeights& weights, double eps);
 
+
+struct SelfAttentionWeights {
+  std::vector<float> q_w, q_b, k_w, k_b, v_w, v_b;   // [H, H], [H]
+  std::vector<float> out_w, out_b;
+  std::vector<float> distance_embedding;             // [left+right+1, head_size]
+};
+
+// Wav2Vec2BertSelfAttention with position_embeddings_type == "relative_key".
+//
+//   scores = q k^T / sqrt(d)
+//   distance = clamp(pos_key - pos_query, -left_max, +right_max)
+//   scores += einsum("hld,lrd->hlr", q, embedding[distance + left_max]) / sqrt(d)
+//
+// THE CLAMP IS ASYMMETRIC (64 left, 8 right by default): a symmetric clamp still
+// produces well-formed attention, and only diverges for key positions further
+// ahead than right_max, which short fixtures never reach. The goldens use T=12 so
+// the RIGHT clamp genuinely bites.
+//
+// Note the relative term is divided by sqrt(d) SEPARATELY, after the scores
+// already were -- not folded into one division.
+std::vector<float> SelfAttentionRelativeKey(const std::vector<float>& x, int64_t frames,
+                                            int64_t hidden, int64_t heads, int64_t left_max,
+                                            int64_t right_max, const SelfAttentionWeights& weights);
+
 }  // namespace w2vbert
 }  // namespace models
 }  // namespace vllm

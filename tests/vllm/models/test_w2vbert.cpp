@@ -121,3 +121,47 @@ TEST_CASE("w2vbert conv module cannot see the future") {
   }
   CHECK(delta > 1e-6);  // the last frame MUST move, or the probe proves nothing
 }
+
+TEST_CASE("w2vbert relative-key self-attention matches upstream") {
+  const auto w = Weights();
+  vllm::models::w2vbert::SelfAttentionWeights a;
+  a.q_w = w.at("self_attn.linear_q.weight"); a.q_b = w.at("self_attn.linear_q.bias");
+  a.k_w = w.at("self_attn.linear_k.weight"); a.k_b = w.at("self_attn.linear_k.bias");
+  a.v_w = w.at("self_attn.linear_v.weight"); a.v_b = w.at("self_attn.linear_v.bias");
+  a.out_w = w.at("self_attn.linear_out.weight"); a.out_b = w.at("self_attn.linear_out.bias");
+  a.distance_embedding = w.at("self_attn.distance_embedding.weight");
+
+  const std::vector<float> x(std::begin(kAttnIn), std::end(kAttnIn));
+  const std::vector<float> got = vllm::models::w2vbert::SelfAttentionRelativeKey(
+      x, kFrames, kHidden, kHeads, kLeftMax, kRightMax, a);
+  REQUIRE(got.size() == static_cast<size_t>(kFrames * kHidden));
+  const double worst = Worst(got, kAttnOut, got.size());
+  INFO("max abs diff vs upstream self-attention: ", worst);
+  CHECK(worst < 1e-5);
+}
+
+TEST_CASE("w2vbert attention is NOT causal: every frame sees the whole sequence") {
+  // The Conformer encoder is bidirectional. Perturbing the LAST frame must move
+  // the FIRST output -- the opposite of the conv module's guarantee, and worth
+  // pinning so a stray causal mask cannot be introduced unnoticed.
+  const auto w = Weights();
+  vllm::models::w2vbert::SelfAttentionWeights a;
+  a.q_w = w.at("self_attn.linear_q.weight"); a.q_b = w.at("self_attn.linear_q.bias");
+  a.k_w = w.at("self_attn.linear_k.weight"); a.k_b = w.at("self_attn.linear_k.bias");
+  a.v_w = w.at("self_attn.linear_v.weight"); a.v_b = w.at("self_attn.linear_v.bias");
+  a.out_w = w.at("self_attn.linear_out.weight"); a.out_b = w.at("self_attn.linear_out.bias");
+  a.distance_embedding = w.at("self_attn.distance_embedding.weight");
+
+  std::vector<float> x(std::begin(kAttnIn), std::end(kAttnIn));
+  const std::vector<float> base = vllm::models::w2vbert::SelfAttentionRelativeKey(
+      x, kFrames, kHidden, kHeads, kLeftMax, kRightMax, a);
+  x[static_cast<size_t>((kFrames - 1) * kHidden)] += 2.0F;
+  const std::vector<float> moved = vllm::models::w2vbert::SelfAttentionRelativeKey(
+      x, kFrames, kHidden, kHeads, kLeftMax, kRightMax, a);
+  double first = 0.0;
+  for (int64_t d = 0; d < kHidden; ++d) {
+    first = std::max(first, std::fabs(static_cast<double>(base[static_cast<size_t>(d)] -
+                                                          moved[static_cast<size_t>(d)])));
+  }
+  CHECK(first > 1e-6);
+}

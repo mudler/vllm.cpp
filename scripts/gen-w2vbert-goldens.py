@@ -67,6 +67,12 @@ def main() -> int:
     tap = {}
     layer.ffn1.register_forward_hook(lambda m, i, o: tap.__setitem__("ffn1", o.detach().clone()))
     layer.conv_module.register_forward_hook(lambda m, i, o: tap.__setitem__("conv", o.detach().clone()))
+    layer.self_attn.register_forward_hook(lambda m, i, o: tap.__setitem__("attn", o[0].detach().clone()))
+    attn_in = {}
+    # self_attn is called with KEYWORD args, so a positional pre-hook sees an
+    # empty tuple; the preceding layer_norm's OUTPUT is the same tensor.
+    layer.self_attn_layer_norm.register_forward_hook(
+        lambda m, i, o: attn_in.__setitem__("x", o.detach().clone()))
     with torch.no_grad():
         out, _ = layer(x)
     # the conv module's INPUT is the post-attention state; capture it so the
@@ -104,6 +110,10 @@ def main() -> int:
             d = list(sh) + [1, 1, 1]
             f.write(f'    {{"{nm}", {len(sh)}, {d[0]}, {d[1]}, {d[2]}}},\n')
         f.write("};\n\n")
+        f.write(f"inline constexpr int64_t kLeftMax = {cfg.left_max_position_embeddings};\n")
+        f.write(f"inline constexpr int64_t kRightMax = {cfg.right_max_position_embeddings};\n\n")
+        emit(f, "kAttnIn", attn_in["x"])
+        emit(f, "kAttnOut", tap["attn"])
         emit(f, "kFfn1Out", tap["ffn1"])
         emit(f, "kConvIn", conv_in["x"])
         emit(f, "kConvOut", tap["conv"])

@@ -1802,6 +1802,26 @@ Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
 | `video_url` | video |
 | `input_audio` / `audio_url` | audio |
 
+### Per-prompt input limits — the mechanism exists, the flags do not yet
+
+vLLM caps how many items of each modality one prompt may carry
+(`--limit-mm-per-prompt`), and `--language-model-only` is sugar for setting every
+one of those limits to 0, which makes the server refuse multimodal requests
+outright. **Neither flag is accepted yet** — `vllm-server` still exits on both,
+and there is no config key or C ABI field for them.
+
+What landed (#607, wave L1) is the mechanism underneath, as library-internal
+headers only: `vllm::MultiModalConfig::GetLimitPerPrompt`
+([`config/multimodal.h`](../include/vllm/config/multimodal.h)) resolving
+upstream's precedence, and the refusal it carries
+([`multimodal/processing/context.h`](../include/vllm/multimodal/processing/context.h)),
+which raises `vllm::v1::InputValidationError` — the same type the API server
+answers with HTTP 400. Nothing constructs that config on a live request, so
+**today no request is limited or refused on item count**, and a chat request
+carrying several images still has all but the first silently dropped by
+`chat_mm.cpp`. Wave L2 adds the two flags, the C ABI field, and the call-site
+wiring that makes the limits take effect.
+
 ## MiniMax-H3 browser console (`vllm-video-studio`)
 
 A standalone browser console for MiniMax-H3, deliberately **separate** from the

@@ -203,6 +203,39 @@ and this row binds to it directly.
 | audio VAE decode + WAV writing | H3 audio VAE, LTX-2 audio VAE, `minimax_h3_wav.cpp` | `src/vllm/model_executor/models/` |
 | diffusion request planning / pipeline shape | H3 planner + pipeline, LTX-2.5 pipeline | `minimax_h3_planner.cpp`, `ltx2_pipeline.cpp` |
 | quantized arms on a diffusion model | H3 GGUF + NVFP4 arms | [minimax-h3.md](minimax-h3.md) §0 |
+| **an audio-GENERATION engine seam** | `multimodal::SpeechEngine` + `SpeechRegistry`, landed 2026-08-13 by the IndexTTS-2.5 lane | `include/vllm/multimodal/speech_engine.h` |
+| **a 1D vocoder** | `Vocoder1D`, same lane | `src/vllm/model_executor/models/vocoder1d.cpp` |
+
+### 4.1 Music3 routes through `SpeechEngine`, which needs ONE additive extension
+
+`multimodal::SpeechEngine` did not exist when this spec was first written. It does
+now, and AGENTS.md is explicit that a capability not reachable through the shared
+surface is not done, and that a seam is extended rather than forked. Music3 is a
+speech-family registration, not a new engine.
+
+It fits better than it might look. `SpeechResult` already carries `channels` and
+already documents `sample_rate` as "the family's native rate ... rather than a
+resampled one, so the caller decides whether to resample" — which is exactly
+§1.1's 44100 stereo, and exactly why SGLang-Omni's 32 kHz stays a caller-side
+concern. `requires_reference_audio()` exists so a server can refuse before
+staging; Music3 returns `false`, where IndexTTS-2 returns `true`.
+
+**The one genuine gap is `SpeechGenParams`.** It carries a single `text` field,
+because IndexTTS-2 synthesises one utterance. Music3 takes **two** distinct
+inputs — lyrics (with `[Verse]` / `[Chorus]` section tags) and a structured music
+description — plus generation controls (duration or frame count, denoise steps,
+CFG). Squeezing both into `text` with a separator would be a private protocol
+inside a shared struct, which is the fork this rule exists to prevent.
+
+W6 therefore **extends `SpeechGenParams` additively** and leaves IndexTTS-2.5's
+behaviour byte-identical. A field an existing family ignores costs it nothing; a
+second parallel params struct costs every future family a choice. If the
+extension cannot be made additive, that is a `NEEDS_DECISION`, not a fork.
+
+**`SpeechEngine` is not yet on the ABI.** `include/vllm.h` (v18) exposes the
+video engine but no `vllm_speech_*` surface, and no open PR adds one. W6 owns
+that: the ABI surface, the version bump, and the example HTTP server as a thin
+client of it — never including internal headers.
 
 Genuinely new: the eight-codebook RVQ frame path, the depth decoder, the learned
 8-layer condition mix, snake-activated DAC decoding with weight-norm, and the
@@ -247,8 +280,8 @@ the operator. Phases are separately claimable except where noted.
 | **W2** | Global LLM on our landed Qwen3 path at vocab 200 000 | hidden-state parity vs `transformers`, then token-exact RVQ code parity vs the oracle |
 | **W3** | Condition mix (8-layer weighted) + RVQ depth decoder, 8 codebooks | per-stage tensor parity; the depth decoder's 16-position window exercised at its boundary |
 | **W4** | Flow-matching DiT + `FlowMatchEulerDiscreteScheduler` with `invert_sigmas` | per-step latent parity against the oracle at a fixed seed |
-| **W5** | Vocoder: snake activations, weight-norm, `[8,8,4,2]` upsampling, WAV at **44100 stereo** (§1.1) | waveform parity within a stated absolute tolerance |
-| **W6** | e2e through the shared seams; **`include/vllm.h` surface**; **the example HTTP server as a thin ABI client**, never including internal headers | a song generates end to end from an HTTP request; SGLang-Omni cross-check; speed axis recorded with values and ratios |
+| **W5** | Vocoder **through the shared `Vocoder1D`** (§4.1): snake activations, weight-norm, `[8,8,4,2]` upsampling, the 128→2×64 stereo fold, WAV at **44100 stereo** (§1.1) | waveform parity within a stated absolute tolerance, and H3/IndexTTS-2.5 behaviour byte-identical |
+| **W6** | Register as a `SpeechRegistry` family; extend `SpeechGenParams` ADDITIVELY for lyrics + description + controls (§4.1); NEW `vllm_speech_*` **`include/vllm.h`** surface with the ABI version bump; **the example HTTP server as a thin ABI client** | a song generates end to end from an HTTP request; IndexTTS-2.5 unchanged; SGLang-Omni cross-check; speed axis recorded with values and ratios |
 | **W7** | Quantized arms — GGUF k-quants are a standing requirement, not a per-model choice | each arm gated, or refused by name and recorded as owed |
 
 **W0 blocks everything.** Until the oracle demonstrably runs, no phase can produce

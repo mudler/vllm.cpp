@@ -113,6 +113,8 @@ vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
 vllm_cpp_add_test(test_speech_engine vllm/multimodal/test_speech_engine.cpp)
 vllm_cpp_add_test(test_indextts2_family vllm/models/test_indextts2_family.cpp)
 vllm_cpp_add_test(test_campplus vllm/models/test_campplus.cpp)
+vllm_cpp_add_test(test_w2vbert vllm/models/test_w2vbert.cpp)
+target_include_directories(test_w2vbert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
 target_include_directories(test_gpt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
@@ -747,6 +749,13 @@ vllm_cpp_add_test(test_speculative_draft_max_position_embeddings
 # SPEC-DSPARK W1: the DSpark config slice (method acceptance, block-size floor,
 # lookahead slots, draft identity).
 vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cpp)
+# ENG-MM-INPUT-PIPELINE L1 (#607): get_limit_per_prompt precedence —
+# language_model_only ⇒ 0 BEFORE the map, else the map, else the 999 default.
+vllm_cpp_add_test(test_multimodal_config vllm/config/test_multimodal_config.cpp)
+# ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
+# fold against the model's own ceiling, upstream's exact message, and both call
+# sites with the enable_mm_embeds escape.
+vllm_cpp_add_test(test_processing_limits vllm/multimodal/test_processing_limits.cpp)
 vllm_cpp_add_test(test_request_queue vllm/v1/test_request_queue.cpp)
 vllm_cpp_add_test(test_sched_output vllm/v1/test_sched_output.cpp)
 vllm_cpp_add_test(test_scheduler vllm/v1/test_scheduler.cpp)

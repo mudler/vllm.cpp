@@ -1,4 +1,4 @@
-// Ported from: vllm/config/multimodal.py:17-43,212-236 @ 5559679229bc
+// Ported from: vllm/config/multimodal.py:17-45,212-236 @ 5559679229bc
 // (see include/vllm/config/multimodal.h for scope and deviations).
 #include "vllm/config/multimodal.h"
 
@@ -11,11 +11,18 @@
 namespace vllm {
 namespace {
 
-// The option keys each DummyOptions subclass declares, beyond `count`
-// (multimodal.py:23-43). `extra="forbid"` is what makes an unlisted key an
-// error rather than a silently-kept extra, so the lookup below is exhaustive by
-// construction: a modality with no entry here is BaseDummyOptions, which
-// declares NOTHING but `count` (:233-234).
+// The modalities `_validate_limit_per_prompt` routes to a dataclass of their own
+// (multimodal.py:226-231). Everything else falls to the `else` at :232-233 and
+// is built as a bare BaseDummyOptions.
+bool IsBuiltinModality(const std::string& modality) {
+  return modality == "video" || modality == "image" || modality == "audio";
+}
+
+// The option keys each BUILTIN DummyOptions subclass declares, beyond `count`
+// (multimodal.py:24-45). Only those three carry
+// `@dataclass(config=ConfigDict(extra="forbid"))` (:24,33,41), which is what
+// makes an unlisted key an error rather than a silently-kept extra, so this
+// lookup is exhaustive for exactly the modalities IsBuiltinModality names.
 bool IsKnownOption(const std::string& modality, const std::string& key) {
   if (modality == "video") {
     return key == "num_frames" || key == "width" || key == "height";
@@ -36,7 +43,8 @@ int ParseCount(const std::string& modality, const nlohmann::json& value) {
     Refuse("\"" + modality + "\".count must be an integer, got " + value.dump());
   }
   const int64_t count = value.get<int64_t>();
-  // count: int = Field(999, ge=0) (multimodal.py:20).
+  // count: int = Field(999, ge=0) (multimodal.py:21) — declared on
+  // BaseDummyOptions, so it is validated for EVERY modality, builtin or not.
   if (count < 0) {
     Refuse("\"" + modality + "\".count must be >= 0, got " +
            std::to_string(count));
@@ -80,12 +88,27 @@ std::map<std::string, int> ParseLimitMmPerPromptJson(
         count = ParseCount(modality, option);
         continue;
       }
+      if (!IsBuiltinModality(modality)) {
+        // BaseDummyOptions (multimodal.py:17-21) is the ONE dummy-options
+        // dataclass declared WITHOUT `config=ConfigDict(extra="forbid")`, unlike
+        // the three at :24,33,41 — so pydantic's default `extra='ignore'`
+        // applies and an unlisted key on a modality outside image/video/audio is
+        // DROPPED, not refused, with its value never validated. Re-derived
+        // against the pinned oracle's own declarations under pydantic 2.12.5:
+        // `BaseDummyOptions(count=2, foo=3)` returns `BaseDummyOptions(count=2)`
+        // while `ImageDummyOptions(count=2, foo=3)` raises ValidationError.
+        // Refusing here instead would refuse a document upstream accepts.
+        if (ignored_options != nullptr) {
+          ignored_options->push_back(modality + "." + key);
+        }
+        continue;
+      }
       if (!IsKnownOption(modality, key)) {
-        // extra="forbid" (multimodal.py:23,32,39). Naming the key is the whole
+        // extra="forbid" (multimodal.py:24,33,41). Naming the key is the whole
         // value of the refusal: a dropped `num_frame` typo is invisible.
         Refuse("\"" + modality + "\" has no option \"" + key + "\"");
       }
-      // Field(None, gt=0) on every option (multimodal.py:26-28,35-36,42).
+      // Field(None, gt=0) on every option (multimodal.py:28-30,37-38,45).
       if (!option.is_number_integer() || option.get<int64_t>() <= 0) {
         Refuse("\"" + modality + "\".\"" + key + "\" must be an integer > 0, "
                "got " + option.dump());

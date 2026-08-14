@@ -176,16 +176,29 @@ void ValidateChatMmLimits(const multimodal::BaseProcessingInfo& info,
 // The Qwen3-VL IMAGE chat seam's OWN supported limits — the `min()` fold's other
 // operand (context.py:392-405), which #686 recorded as undeclared.
 //
-// Upstream's Qwen3-VL declares image and video UNLIMITED
-// (get_supported_mm_limits, qwen3_vl.py) because its processor handles N of
-// each. Ours handles exactly ONE image (MakeQwen3VLImageChatFn locates a single
-// image part) and no video or audio at all, so the honest ceiling is
-// {"image": 1} and every other modality is ABSENT — which context.py:414-415
-// reads as "not supported", limit 0. That is not a policy choice, it is this
-// seam's implemented arm stated as a number, and AGENTS.md requires exactly
-// that: an unimplemented arm is refused with a message naming the missing piece,
-// never left to be discovered. A user limit can only LOWER it (the fold is a
-// min), so `--limit-mm-per-prompt image=99` still refuses the second image.
+// Upstream's Qwen3-VL declares image and video UNLIMITED —
+// `get_supported_mm_limits` is not defined on Qwen3VLProcessingInfo at all
+// (qwen3_vl.py:848 subclasses Qwen2VLProcessingInfo); it is INHERITED from
+// qwen2_vl.py:851-852, `return {"image": None, "video": None}` — because its
+// processor handles N of each. Ours handles exactly ONE image
+// (MakeQwen3VLImageChatFn locates a single image part) and no video or audio at
+// all, so the honest ceiling is {"image": 1} and every other modality is
+// ABSENT — which context.py:414-415 reads as "not supported", limit 0. That is
+// not a policy choice, it is this seam's implemented arm stated as a NUMBER. A
+// user limit can only LOWER it (the fold is a min), so
+// `--limit-mm-per-prompt image=99` still refuses the second image.
+//
+// WHAT THIS DOES NOT YET SATISFY (#758, found in the #749 review). AGENTS.md
+// asks that an unimplemented arm be "refused with a message naming the missing
+// piece". The number is stated here, but the message a client receives is
+// upstream's generic "At most 0 video(s) may be provided in one prompt." — which
+// names nothing, and which a user cannot tell apart from an operator having set
+// `--limit-mm-per-prompt '{"video": 0}'`. The only signal today is by OMISSION:
+// ValidateNumItems withholds the "Set `--limit-mm-per-prompt` to increase this
+// limit." hint when raising the configured limit would not help. Changing the
+// text is a deliberate divergence from a verbatim-ported message that three
+// suites assert byte-for-byte, so it is owed to #758 with its own spec rather
+// than folded in here.
 //
 // When the multi-image / video arms land they raise these numbers here, and
 // nothing else changes.

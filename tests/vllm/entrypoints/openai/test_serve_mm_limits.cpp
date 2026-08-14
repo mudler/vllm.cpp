@@ -7,12 +7,17 @@
 //     reaching the config);
 //   - vllm/engine/arg_utils.py:556 (`limit_mm_per_prompt: dict[...] =
 //     get_field(MultiModalConfig, "limit_per_prompt")`), :1279, :1692, whose
-//     dict type resolves to `type=parse_type(json.loads)` (:375-377) — so the
-//     value is a JSON OBJECT;
-//   - vllm/config/multimodal.py:17-43 (the DummyOptions dataclasses: `count:
-//     int = Field(999, ge=0)`, `extra="forbid"`, every option `Field(None,
-//     gt=0)`) and :212-236 (`_validate_limit_per_prompt`, which rewrites a bare
-//     int to {"count": <int>} and routes each modality to its own dataclass);
+//     dict type resolves to `type=parse_type(json.loads)` (:379-381, the
+//     plain-dict branch — the `union_dict_and_str` branch at :374-378 is a
+//     different rule and needs a `str` arm the annotation does not have) — so
+//     the value is a JSON OBJECT;
+//   - vllm/config/multimodal.py:17-45 (the DummyOptions dataclasses: `count:
+//     int = Field(999, ge=0)` on BaseDummyOptions :21; `extra="forbid"` on the
+//     video/image/audio subclasses ONLY, :24,33,41; every declared option
+//     `Field(None, gt=0)`, :28-30,37-38,45) and :212-236
+//     (`_validate_limit_per_prompt`, which rewrites a bare int to
+//     {"count": <int>} and routes each modality to its own dataclass, falling to
+//     the bare BaseDummyOptions at :233 for anything outside those three);
 //   - vllm/config/multimodal.py:321-336 (`get_limit_per_prompt`, the precedence
 //     the startup banner prints THROUGH so the flag ordering is observable).
 // All at 5559679229bc, the pinned oracle in .agents/upstream-sync.md.
@@ -200,7 +205,7 @@ TEST_CASE("limit-mm-per-prompt: the CONFIGURABLE + MIXED objects (multimodal.py:
   CHECK(mixed.at("image") == 16);
   CHECK(mixed.at("video") == 1);
 
-  // An object with no `count` keeps the dataclass default (:20), not 0 — the
+  // An object with no `count` keeps the dataclass default (:21), not 0 — the
   // object exists to carry OPTIONS, so omitting the count is not a refusal.
   const std::map<std::string, int> options_only =
       vllm::ParseLimitMmPerPromptJson(R"({"image": {"width": 512}})", nullptr);
@@ -216,14 +221,13 @@ TEST_CASE("limit-mm-per-prompt: malformed input is REFUSED, never defaulted") {
       "\"image\"",                            // not an object
       R"({"image": "two"})",                  // count is not an int
       R"({"image": 2.5})",                    // count is not an int
-      R"({"image": -1})",                     // count: Field(999, ge=0), :20
+      R"({"image": -1})",                     // count: Field(999, ge=0), :21
       R"({"image": {"count": -1}})",          // same, through the object form
       R"({"image": {"count": "two"}})",       // same, wrong type
-      R"({"image": {"num_frames": 32}})",     // image has no num_frames, :32-37
-      R"({"video": {"fps": 2}})",             // extra="forbid", :23
-      R"({"audio": {"width": 2}})",           // audio takes `length`, :39-43
-      R"({"tactile": {"count": 1, "width": 2}})",  // BaseDummyOptions: count ONLY
-      R"({"video": {"num_frames": 0}})",      // Field(None, gt=0), :26
+      R"({"image": {"num_frames": 32}})",     // image has no num_frames, :33-38
+      R"({"video": {"fps": 2}})",             // extra="forbid", :24
+      R"({"audio": {"width": 2}})",           // audio takes `length`, :41-45
+      R"({"video": {"num_frames": 0}})",      // Field(None, gt=0), :28
       R"({"video": {"num_frames": -4}})",     // same
       R"({"image": {"width": "big"}})",       // option is not an int
   };
@@ -245,10 +249,64 @@ TEST_CASE("limit-mm-per-prompt: malformed input is REFUSED, never defaulted") {
   }
 
   // An accepted modality name is NOT enumerated: upstream routes an unknown
-  // modality to BaseDummyOptions (:233-234) rather than rejecting it, because
+  // modality to BaseDummyOptions (:233) rather than rejecting it, because
   // the modality set is the model's, not the config's.
   CHECK(vllm::ParseLimitMmPerPromptJson(R"({"tactile": 3})", nullptr)
             .at("tactile") == 3);
+}
+
+TEST_CASE("limit-mm-per-prompt: forbidding extras is the BUILTIN modalities' "
+          "rule, not a global one") {
+  // The divergence the #749 review caught. `extra="forbid"` is declared on
+  // VideoDummyOptions / ImageDummyOptions / AudioDummyOptions ONLY
+  // (multimodal.py:24,33,41). BaseDummyOptions — what :233's `else` builds for
+  // every OTHER modality name — is a plain `@dataclass` (:17-21), so pydantic's
+  // default `extra='ignore'` applies and an unlisted key is DROPPED with its
+  // value never validated.
+  //
+  // Re-derived at the pinned oracle 5559679229bc under pydantic 2.12.5, by
+  // declaring those two dataclasses verbatim and calling them:
+  //     BaseDummyOptions(**{"count": 2, "foo": 3})  -> BaseDummyOptions(count=2)
+  //     ImageDummyOptions(**{"count": 2, "foo": 3}) -> ValidationError
+  // Refusing the first would refuse a document the reference accepts, which is
+  // what this port did before the repair.
+  std::vector<std::string> ignored;
+  const std::map<std::string, int> limits = vllm::ParseLimitMmPerPromptJson(
+      R"({"pointcloud": {"count": 2, "foo": 3}})", &ignored);
+  CHECK(limits.at("pointcloud") == 2);
+  // Dropped, but ANNOUNCED — upstream discards it silently; we say so, exactly
+  // as we do for the builtin options we also drop.
+  REQUIRE(ignored.size() == 1);
+  CHECK(ignored.at(0) == "pointcloud.foo");
+
+  // The extra's VALUE is not validated either: `Field(None, gt=0)` guards
+  // declared fields, and `foo` is not one. `0` and a string both survive on a
+  // non-builtin modality...
+  CHECK(vllm::ParseLimitMmPerPromptJson(R"({"tactile": {"count": 1, "foo": 0}})",
+                                        nullptr)
+            .at("tactile") == 1);
+  CHECK(vllm::ParseLimitMmPerPromptJson(
+            R"({"tactile": {"count": 1, "foo": "big"}})", nullptr)
+            .at("tactile") == 1);
+  // ...while the same shapes on a BUILTIN modality are still refused, because
+  // there the key either is declared (and then gt=0 applies) or extra="forbid"
+  // rejects it. This half is what keeps the repair from becoming "accept
+  // everything".
+  const std::vector<std::string> still_refused = {
+      R"({"image": {"count": 1, "foo": 3}})",
+      R"({"image": {"count": 1, "width": 0}})",
+      R"({"video": {"count": 1, "num_frames": "big"}})"};
+  for (const std::string& doc : still_refused) {
+    CAPTURE(doc);
+    CHECK_THROWS_AS(vllm::ParseLimitMmPerPromptJson(doc, nullptr),
+                    std::invalid_argument);
+  }
+
+  // `count` is declared on BaseDummyOptions itself (:21), so ITS validation is
+  // global — a non-builtin modality does not escape `Field(999, ge=0)`.
+  CHECK_THROWS_AS(
+      vllm::ParseLimitMmPerPromptJson(R"({"tactile": {"count": -1}})", nullptr),
+      std::invalid_argument);
 }
 
 // ── The FLAGS (arg_utils.py:1276,1279) reaching the CONFIG ──────────────────

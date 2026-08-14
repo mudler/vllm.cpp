@@ -324,16 +324,30 @@ comparing the two arms must set the flag on both sides or state that it did not.
      turns the flag off explicitly must not die on an unknown argument.
      `--limit-mm-per-prompt '<json>'`, mirroring `arg_utils.py:556,1279,1692`,
      whose dict type resolves to `type=parse_type(json.loads)`
-     (`arg_utils.py:375-377`) — so the value is a JSON object.
+     (`arg_utils.py:379-381` — the plain-`dict` branch; the `union_dict_and_str`
+     branch immediately above at `:374-378` is a different rule and needs a `str`
+     arm or a non-builtin type hint, which `limit_per_prompt: dict[str,
+     BaseDummyOptions]` does not have because `dict[…]` reports
+     `__module__ == "builtins"`) — so the value is a JSON object.
      `ParseLimitMmPerPromptJson` (`src/vllm/config/multimodal.cpp`) ports
      `_validate_limit_per_prompt` (`multimodal.py:212-236`) and the DummyOptions
-     dataclasses behind it (`:17-43`): the legacy count-only, the configurable
+     dataclasses behind it (`:17-45`): the legacy count-only, the configurable
      `{"count": N, …}` and the mixed spellings all parse; a non-object document,
-     a negative count (`count: int = Field(999, ge=0)`, `:20`), an unknown
-     per-modality option (`extra="forbid"`) or a non-positive one
-     (`Field(None, gt=0)`) is REFUSED before the model load rather than
-     defaulted, because a mistyped limit that silently became 999 is a limit
-     that is not there. The profiling options are validated and then dropped
+     a negative count (`count: int = Field(999, ge=0)`, `:21`), and — **for the
+     three builtin modalities only** — an unknown per-modality option
+     (`extra="forbid"`, `:24,33,41`) or a non-positive one (`Field(None, gt=0)`,
+     `:28-30,37-38,45`) is REFUSED before the model load rather than defaulted,
+     because a mistyped limit that silently became 999 is a limit that is not
+     there. A modality OUTSIDE image/video/audio falls to the bare
+     `BaseDummyOptions` at `:233`, the one dummy-options dataclass declared
+     without `extra="forbid"` (`:17-21`), so pydantic's default `extra='ignore'`
+     applies and its unknown keys are dropped rather than refused — re-derived
+     under pydantic 2.12.5 against the pinned declarations:
+     `BaseDummyOptions(count=2, foo=3)` → `BaseDummyOptions(count=2)`, while
+     `ImageDummyOptions(count=2, foo=3)` raises. We mirror both halves; refusing
+     the second would refuse a document upstream accepts (repaired in the #749
+     review round — the original L2 landing refused it for every modality).
+     The profiling options are validated and then dropped
      (only `.count` feeds `get_limit_per_prompt`, `:335`) and the drop is
      ANNOUNCED per key. **NAMED RESIDUAL:** upstream's dotted spelling
      (`--limit-mm-per-prompt.image 2`) is a `FlexibleArgumentParser` feature
@@ -351,6 +365,20 @@ comparing the two arms must set the flag on both sides or state that it did not.
      Both land on `EngineParams::multimodal` → `LoadedEngine::mm_config()`, so
      the server flags and the ABI resolve ONE config object per engine and
      cannot drift.
+     **What the ABI fields do NOT do, corrected in the #749 review round.** The
+     v19 header initially said the fields are "ENFORCED, not recorded" and that
+     an engine loaded with `language_model_only` answers a multimodal request
+     with `At most 0 image(s)…`. That is true of the OpenAI-server path and false
+     of the C ABI: `set_multimodal_chat_fn` has exactly one caller,
+     `server_main.cpp`, and `serving_chat.cpp` gates the whole multimodal branch
+     on that seam being set — `vllm_chat` / `vllm_chat_stream` never install one.
+     On a C-ABI engine the two fields are therefore RECORDED on the config and
+     consulted by nothing the ABI can reach: an `image_url` content part parses,
+     is dropped, and the request is answered as text. The header now says so, and
+     `tests/capi/test_capi.cpp` pins it behaviourally (a `language_model_only`
+     engine + an `image_url` body → `VLLM_OK` and a `chat.completion`) so the
+     wording cannot go stale on a permanent public contract. Adding a C-ABI
+     multimodal REQUEST path is a new capability, not an L2 repair.
   3. **The call site — this is what L2 is for.** `chat_mm.cpp` now calls
      `ValidateChatMmLimits` (the port of the `chat_utils.py:648-662` tracker)
      as step 0 of `MakeQwen3VLImageChatFn`, over a `BaseProcessingInfo` folding
@@ -364,6 +392,19 @@ comparing the two arms must set the flag on both sides or state that it did not.
      `--limit-mm-per-prompt image=99` still refuses the second image, and the
      refusal then carries no `--limit-mm-per-prompt` hint because raising the
      user's limit would not help.
+     **The ceiling is a number, not yet a message (#758).** The L2 landing
+     claimed this declaration satisfies AGENTS.md's "an unimplemented arm is
+     refused with a message naming the missing piece"; the #749 review found it
+     does not. The text a client receives is upstream's generic `At most 0
+     video(s) may be provided in one prompt.`, which is indistinguishable from an
+     operator having configured that limit. The only present signal is by
+     OMISSION — the withheld `--limit-mm-per-prompt` hint. Naming the arm means
+     diverging from a verbatim-ported message that three suites assert
+     byte-for-byte, so it is owed to #758 with its own spec rather than repaired
+     in review. Also corrected there: `get_supported_mm_limits` is not defined on
+     `Qwen3VLProcessingInfo`; it is inherited from `Qwen2VLProcessingInfo`
+     (`qwen2_vl.py:851-852`, `{"image": None, "video": None}`), which
+     `qwen3_vl.py:848` subclasses.
 
   **#686 is CLOSED by this.** A three-image request is answered
   `400 BadRequestError "At most 1 image(s) may be provided in one prompt."`
@@ -378,9 +419,23 @@ comparing the two arms must set the flag on both sides or state that it did not.
   wrong the same way — neither is upstream's refusal — so the issue's diagnosis
   stands and only its consequence was understated.
 
-  **Gates** (aarch64, the `build-test-cpu-arm64` lane; `-DVLLM_CPP_CUDA=OFF`):
-  `test_chat_mm` 11/11 (126 assertions), `test_serve_mm_limits` 10/10 (101),
-  `test_openai_api_server` 56/56 (638). RED before the change: `test_chat_mm`
+  **Gates** (aarch64, the `build-test-cpu-arm64` lane; `-DVLLM_CPP_CUDA=OFF`).
+  At the #749 REVIEW-REPAIR head, on `kairos-4db2`: clean rebuild 1355/1355
+  targets, 0 warnings under `-Werror`; `ctest -j 6` 456/457 with 2 skipped, the
+  single failure being `test_op_parity` (#737, reproduced from pristine main);
+  `test_serve_mm_limits` 11/11 (109 assertions), `test_chat_mm` 11/11 (126),
+  `test_openai_api_server` 56/56, `test_capi` 58/58 (536),
+  `test_processing_limits` 19/19 (78), `test_multimodal_config` 7/7 (21).
+  Mutations, `cp` + `touch` + rebuild + re-verified green between each and both
+  files md5-identical afterwards: `IsBuiltinModality` forced to `true` (the
+  pre-repair "forbid extras everywhere") takes `test_serve_mm_limits` to
+  10 passed / 1 failed, and wiring an image refusal into `vllm_chat` takes
+  `test_capi` to 57 passed / 1 failed on `REQUIRE(1 == 0)`.
+  **`test_openai_api_server`'s ASSERTION count is not a pin** — measured 632,
+  648 and 651 across three runs of one binary, because SSE-chunk loops assert
+  per chunk received. Its CASE count, 56/56, is stable and is the number to
+  quote. At the L2 landing the assertion count was recorded as 638.
+  RED before the L2 change: `test_chat_mm`
   2 cases failing (`CHECK_THROWS_AS ... threw a DIFFERENT exception: "Expand
   ImagePlaceholders: more image placeholders than grids"` and `FATAL ERROR:
   expected --language-model-only to refuse an image request`), and the HTTP legs

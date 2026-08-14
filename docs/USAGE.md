@@ -1155,8 +1155,8 @@ a stop token early.
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
-| `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with `400 At most 0 image(s) may be provided in one prompt. Set --limit-mm-per-prompt to increase this limit.` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
-| `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count or an unknown per-modality option is refused at startup rather than defaulted. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
+| `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
+| `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
 | `--enable-log-outputs` | off | Also log the generated output, not just the request |
 | `--max-log-len N` | `256` | Truncate logged prompts and outputs to N characters |
@@ -1836,9 +1836,15 @@ Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
 
 vLLM caps how many items of each modality one prompt may carry
 (`--limit-mm-per-prompt`), and `--language-model-only` is sugar for setting every
-one of those limits to 0. Both flags are accepted (#607, waves L1+L2), both are
-enforced, and both are also C ABI fields
-(`vllm_model_params.language_model_only` / `.limit_mm_per_prompt`, ABI v19).
+one of those limits to 0. Both flags are accepted (#607, waves L1+L2) and both
+are enforced **on this server's chat path**, which is the one place that installs
+the multimodal chat seam the check runs behind.
+
+Both are also C ABI fields (`vllm_model_params.language_model_only` /
+`.limit_mm_per_prompt`, ABI v19), and there they configure the engine — including
+a server built on it — but they do not change what a `vllm_chat` call returns:
+the C ABI has no multimodal request path yet, so an `image_url` content part sent
+through it is dropped and answered as text. The refusals below are the server's.
 
 The limits are the mechanism and the flag is the sugar, so it is worth stating
 what the flag actually does: it does not "skip the encoder", it makes the server
@@ -1863,9 +1869,12 @@ Two things follow from how the limit is computed
   not routed at all, so their limit is 0 and they are refused by name rather
   than dropped — this is what closed
   [#686](https://github.com/mudler/vllm.cpp/issues/686)).
-- The `Set --limit-mm-per-prompt to increase this limit.` hint appears only when
-  raising the limit would actually help — that is, when the seam could take the
-  items and the configuration is what refused them.
+- The ``Set `--limit-mm-per-prompt` to increase this limit.`` hint appears only
+  when raising the limit would actually help — that is, when the seam could take
+  the items and the configuration is what refused them. Its absence is currently
+  the only way to tell an unimplemented arm from a configured limit; the
+  refusal message itself does not say which
+  ([#758](https://github.com/mudler/vllm.cpp/issues/758)).
 
 **Not yet:** `--language-model-only` frees no memory. Nothing gates vision-tower
 construction on the limits, so the flag today changes what the server accepts,

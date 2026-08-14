@@ -180,14 +180,38 @@ extern "C" {
  *     "video": 0}', or the option form '{"video": {"count": 1}}'), following
  *     the v9 precedent that a dict-valued vLLM flag crosses this ABI as its own
  *     JSON rather than as a fixed struct of modalities the ABI would then owe
- *     forever. A malformed document, an unknown per-modality option, or a
- *     negative count fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT
- *     rather than defaulting — mirroring the pydantic validation upstream does
- *     at parse time (multimodal.py:17-43,212-236).
- * Both are ENFORCED, not recorded: a modality's limit is what
- * BaseProcessingInfo::ValidateNumItems refuses against, so an engine loaded
- * with language_model_only answers a multimodal request with
+ *     forever. A malformed document, a negative count, or an unknown option on
+ *     one of the three modalities upstream gives an `extra="forbid"` dataclass
+ *     (image/video/audio) fails vllm_engine_load with
+ *     VLLM_ERR_INVALID_ARGUMENT rather than defaulting — mirroring the pydantic
+ *     validation upstream does at parse time (multimodal.py:17-45,212-236).
+ *     An unknown option on any OTHER modality is dropped, not refused, because
+ *     the BaseDummyOptions it falls back to (:17-21,233) is the one such
+ *     dataclass declared without extra="forbid".
+ * WHERE THEY BITE, stated exactly, because this contract is permanent. Both
+ * fields land on the engine's ONE MultiModalConfig
+ * (vllm_engine_load -> EngineParams::multimodal -> LoadedEngine::mm_config()),
+ * and that config is what BaseProcessingInfo::ValidateNumItems refuses against.
+ * The caller that reaches ValidateNumItems on a live request is the OPENAI
+ * SERVER: it is the one place that installs the multimodal chat seam
+ * (server_main.cpp `chat.set_multimodal_chat_fn(...)`), and serving_chat.cpp
+ * gates the whole multimodal branch on that seam being set. So a server started
+ * with --language-model-only answers a multimodal chat request with HTTP 400
  * "At most 0 image(s) may be provided in one prompt." rather than serving it.
+ *
+ * THIS ABI HAS NO MULTIMODAL CHAT REQUEST PATH YET, so on a C-ABI engine the
+ * two fields are RECORDED and read by nothing the ABI itself can reach.
+ * vllm_chat / vllm_chat_stream never install that seam. A chat request whose
+ * content array carries an `image_url` part is therefore answered as TEXT: the
+ * part is dropped, its text siblings still form the prompt, no limit is
+ * consulted, and language_model_only changes neither the status nor the body.
+ * Setting these fields configures the ENGINE — including an OpenAI server built
+ * on one — but it does not make a C-ABI chat call refuse an image. Carrying
+ * media across this ABI is a later version, and the refusal arm becomes
+ * reachable from here only when it lands. That is pinned behaviourally by
+ * tests/capi/test_capi.cpp ("capi: the v19 limits are RECORDED on a C-ABI
+ * engine; there is no multimodal request path to enforce them on"), so this
+ * paragraph cannot silently become false.
  * The memory win upstream also gets from zero limits (skipping the vision tower
  * weights, interfaces.py:293) is NOT in this version — it is wave L3, and until
  * it lands and is MEASURED this field must not be described as freeing VRAM.
@@ -395,11 +419,15 @@ typedef struct vllm_model_params {
    * entry does not survive it (get_limit_per_prompt, :321-336).
    *
    * language_model_only: 0 => off (the zero value, byte-identical to pre-v19);
-   * nonzero => every modality limit becomes 0, which makes the engine REFUSE
-   * every multimodal request with "At most 0 <modality>(s) may be provided in
-   * one prompt." That refusal is the flag's main observable effect and it is
-   * live at v19; the tower-skip memory win it also produces upstream is not
-   * (wave L3). */
+   * nonzero => every modality limit resolves to 0 on this engine's
+   * MultiModalConfig. On the OPENAI-SERVER path that is a refusal — HTTP 400
+   * "At most 0 <modality>(s) may be provided in one prompt." — because the
+   * server installs the multimodal chat seam that reaches ValidateNumItems. On
+   * this ABI's own vllm_chat there is no multimodal request to refuse yet, so
+   * the field configures the engine without changing any C-ABI call's result;
+   * see the v19 note in the version log above for exactly what a C-ABI caller
+   * gets today. The tower-skip memory win upstream also produces is not here
+   * either (wave L3). */
   int32_t language_model_only;
   /* limit_mm_per_prompt: the per-modality maximum input-item count, as the same
    * JSON object the flag takes. NULL/empty (the zero value) => no limit
@@ -411,11 +439,14 @@ typedef struct vllm_model_params {
    *     {"image": 16, "video": {"count": 1}}             (mixed)
    * The option keys are validated exactly as upstream's per-modality
    * dataclasses do (video: num_frames/width/height, image: width/height, audio:
-   * length; each an integer > 0; anything else is refused, `extra="forbid"`)
-   * and then DROPPED: they size dummy inputs for memory profiling, which this
-   * engine does not do, and only `count` feeds the limit (:335).
-   * Invalid JSON, a non-object document, a negative count, an unknown option,
-   * or a non-integer value fails vllm_engine_load with
+   * length; each an integer > 0; anything else on those three is refused,
+   * `extra="forbid"`, :24,33,41) and then DROPPED: they size dummy inputs for
+   * memory profiling, which this engine does not do, and only `count` feeds the
+   * limit (:335). A modality outside those three is upstream's bare
+   * BaseDummyOptions (:233), which has no `extra="forbid"`, so its unknown keys
+   * are dropped rather than refused — mirrored, not invented.
+   * Invalid JSON, a non-object document, a negative count, or a refused option
+   * per the paragraph above fails vllm_engine_load with
    * VLLM_ERR_INVALID_ARGUMENT. Borrowed for the call only. */
   const char* limit_mm_per_prompt;
 } vllm_model_params;

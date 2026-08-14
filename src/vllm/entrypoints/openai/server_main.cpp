@@ -548,7 +548,10 @@ Args ParseArgs(int argc, char** argv) {
       a.multimodal.language_model_only = flag == "--language-model-only";
     } else if (flag == "--limit-mm-per-prompt") {
       // arg_utils.py:1279 over a dict field => type=parse_type(json.loads)
-      // (arg_utils.py:375-377): the value is a JSON OBJECT. Parsed HERE, before
+      // (arg_utils.py:379-381 — the plain-dict branch, NOT the
+      // `union_dict_and_str` one at :374-378, which needs a `str` arm or a
+      // non-builtin hint that `dict[str, BaseDummyOptions]` does not have):
+      // the value is a JSON OBJECT. Parsed HERE, before
       // the multi-GB model load, for the same reason the parser dialects are:
       // a malformed limit costs a second rather than a full load, and it is
       // REFUSED rather than defaulted — a typo that silently became 999 is a
@@ -576,9 +579,11 @@ Args ParseArgs(int argc, char** argv) {
       // of inferring that it worked.
       for (const std::string& key : ignored_options) {
         std::cerr << "server: --limit-mm-per-prompt " << key
-                  << " accepted and IGNORED: it sizes dummy inputs for memory "
-                     "profiling, a surface this engine does not have; only the "
-                     "count is read\n";
+                  << " accepted and IGNORED: only the modality's count is read "
+                     "here. A key upstream DECLARES sizes dummy inputs for "
+                     "memory profiling, a surface this engine does not have; a "
+                     "key it does not declare is one its BaseDummyOptions "
+                     "fallback drops too\n";
       }
     } else if (flag == "--version") {
       std::cout << "vllm.cpp " << vllm::Version()

@@ -1103,7 +1103,10 @@ a route yet. The greedy generate loop that turns the prompt into mel codes is
 ported too, and so is the STATED-emotion path -- eight weights selecting rows
 from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
 text plus a reference clip and an emotion reaches mel CODES in the library. What
-is still missing is a COMMAND or ROUTE, and a TOKENIZER. The checkpoint now
+is still missing is a COMMAND or ROUTE. The TOKENIZER now exists:
+`tiktoken::LoadRanks` reads the shipped `.tiktoken` vocabulary and
+`tiktoken::Encode` reproduces python tiktoken's ids exactly on the cases
+gated, CJK included. The checkpoint now
 LOADS through `vllm::multimodal::SpeechRegistry`, reports its family and its
 22.05 kHz output rate, and states that a reference clip is required; asking
 it to synthesize refuses by naming the one gap between text and the render

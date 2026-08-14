@@ -1073,7 +1073,12 @@ a route yet. The greedy generate loop that turns the prompt into mel codes is
 ported too, and so is the STATED-emotion path -- eight weights selecting rows
 from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
 text plus a reference clip and an emotion reaches mel CODES in the library. What
-is still missing is a COMMAND or ROUTE. The pipeline itself renders on the real
+is still missing is a COMMAND or ROUTE, and a TOKENIZER. The checkpoint now
+LOADS through `vllm::multimodal::SpeechRegistry`, reports its family and its
+22.05 kHz output rate, and states that a reference clip is required; asking
+it to synthesize refuses by naming the one gap between text and the render
+path, which is that the shipped vocabulary is tiktoken and this tree has no
+reader for one. The pipeline itself renders on the real
 checkpoints: the talker emits its own mel codes, the length regulator resamples
 them to the mel frame rate, a classifier-free guided CFM Euler loop integrates
 the S2Mel estimator, and BigVGAN turns the mel into a bounded 22.05 kHz

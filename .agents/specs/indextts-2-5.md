@@ -507,7 +507,9 @@ values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
    talker's OWN codes to the regulator, the CFG'd CFM loop over the real
    estimator with a REAL rotary table, and BigVGAN. Measured 6 codes ->
    6144 samples, 0.279 s at 22.05 kHz. NOT measured against the oracle;
-4. W6b, the two routes and ABI v19;
+4. W6b, the two routes and the ABI entry points. The SEAM is populated now --
+   the family loads and describes itself -- so what is left is the C API and
+   the HTTP surface, plus a tiktoken reader before text can reach the render;
 5. W7 speed, which additionally needs #633;
 6. the INFERRED emotion path (Path A): the `emo_conditioning_encoder` Conformer
    and the `emo_perceiver_encoder` Perceiver. BEHIND a render, not in front of

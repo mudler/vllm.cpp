@@ -780,6 +780,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/adaln.cpp
   src/vllm/model_executor/models/dit.cpp
   src/vllm/model_executor/models/talker.cpp
+  src/vllm/model_executor/models/indextts2_pipeline.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae.cpp
   src/vllm/model_executor/models/minimax_h3_video_vae_device.cpp
   src/vllm/model_executor/models/minimax_h3_vae_cnn.cpp

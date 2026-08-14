@@ -359,10 +359,16 @@ spec commits precede the implementation commits in that pull request.
 
 The implementation first landed the `AGENTS.md` rewrite bundled with twelve
 other files, which this spec forbids. Operator verification caught it and split
-the commit: `8f549e6f6` carries the two guides, the skill routes, the checker
-and its test, and the supporting edits; `b4536cbb2` carries the `AGENTS.md`
-rewrite alone. The split changed no content — the resulting tree is identical to
-the bundled commit's tree apart from this file.
+the commit into a `policy(...)` commit carrying the two guides, the skill routes,
+the checker and its test, and the supporting edits, followed by a second
+`policy(...)` commit carrying the `AGENTS.md` rewrite alone. The split changed no
+content: the resulting tree was identical to the bundled commit's tree apart from
+this file.
+
+No intermediate SHA is quoted here on purpose. This branch squash-merges, so a
+SHA recorded mid-branch names a commit that will not exist on `main`, and any
+later amend on the branch invalidates it. The commit subjects are the durable
+handle; `git log --grep POLICY-SINGLE-PR-AND-STYLE` finds them.
 
 Operator verification also reproduced the checker survey independently, in both
 windows, and confirmed both mutation-restoration hashes byte-for-byte.

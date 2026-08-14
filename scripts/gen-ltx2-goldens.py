@@ -316,10 +316,19 @@ def build_modalities(masked: bool, audio_enabled: bool = True, dense_self_mask: 
     return video, audio
 
 
-def build_model(rope_type_name: str, double_rope: bool):
+def build_model(rope_type_name: str, double_rope: bool, prompt_adaln: bool | None = None):
+    """`prompt_adaln` overrides ARCH's `use_prompt_adaln_single` for the flag-ON arm.
+
+    Every OTHER parameter keeps its name, and the deterministic stream is keyed by
+    NAME alone, so the two arms share their common weights bit-for-bit. That is
+    what makes the flag-ON and flag-OFF forwards directly subtractable, which is
+    how the magnitude in section 6 is measured.
+    """
     from ltx_core.model.transformer.model import LTXModel, LTXModelType  # noqa: PLC0415
     from ltx_core.model.transformer.rope import LTXRopeType  # noqa: PLC0415
 
+    if prompt_adaln is None:
+        prompt_adaln = ARCH["use_prompt_adaln_single"]
     model = LTXModel(
         model_type=LTXModelType.AudioVideo,
         num_attention_heads=ARCH["num_attention_heads"],
@@ -344,7 +353,7 @@ def build_model(rope_type_name: str, double_rope: bool):
         double_precision_rope=double_rope,
         apply_gated_attention=ARCH["apply_gated_attention"],
         cross_attention_adaln=ARCH["cross_attention_adaln"],
-        use_prompt_adaln_single=ARCH["use_prompt_adaln_single"],
+        use_prompt_adaln_single=prompt_adaln,
         ff_bias=ARCH["ff_bias"],
         audio_ff_bias=ARCH["audio_ff_bias"],
     )
@@ -617,18 +626,144 @@ def emit_bricks(out, model) -> None:
 def emit_forward(
     out, tag: str, rope_type_name: str, double_rope: bool, masked: bool,
     audio_enabled: bool = True, dense_self_mask: bool = False,
+    prompt_adaln: bool | None = None,
 ) -> None:
     out.write(
         f"// --- forward case {tag}: rope={rope_type_name} float64_freqs={double_rope} "
-        f"masked={masked} audio_enabled={audio_enabled} dense_self_mask={dense_self_mask} ---\n"
+        f"masked={masked} audio_enabled={audio_enabled} dense_self_mask={dense_self_mask} "
+        f"prompt_adaln={ARCH['use_prompt_adaln_single'] if prompt_adaln is None else prompt_adaln}"
+        " ---\n"
     )
-    model = build_model(rope_type_name, double_rope)
+    model = build_model(rope_type_name, double_rope, prompt_adaln)
     video, audio = build_modalities(masked, audio_enabled, dense_self_mask)
     with torch.no_grad():
         vx, ax = model(video=video, audio=audio, perturbations=None)
     emit_f32(out, f"kLtx2Forward{tag}Video", tensor(vx))
     emit_f32(out, f"kLtx2Forward{tag}Audio", tensor(ax))
     return model
+
+
+def emit_prompt_adaln(out) -> None:
+    """Section 6 — the PROMPT-SIDE AdaLN arm (`use_prompt_adaln_single=True`).
+
+    This is upstream's DEFAULT (model.py:77, model_configurator.py:76 and :138;
+    diffusers transformer_ltx2.py:1185) and what the shipped LTX-2.5 DiT carries.
+    Everything above this point runs the flag OFF, so nothing above can observe a
+    port that drops the term — which is exactly what happened.
+
+    Emitted here:
+      * the flag-ON parameter list, i.e. the 18-tensor contract the flag adds
+        (12 video + 6 audio), in upstream's own registration order;
+      * the prompt AdaLN MLP run STANDALONE on `sigma * timestep_scale_multiplier`
+        (transformer_args.py:274-277 -> :173-186), so a failure localizes to the
+        MLP rather than to the threading;
+      * two full forwards, unmasked and masked;
+      * the MAGNITUDE: flag-ON minus flag-OFF over the same shared weights.
+    """
+    out.write("// --- section 6: the prompt-side AdaLN arm (use_prompt_adaln_single=TRUE) ---\n")
+    model = build_model("split", False, prompt_adaln=True)
+
+    names, ranks, dims = [], [], []
+    for name, param in model.named_parameters():
+        names.append(name)
+        ranks.append(len(param.shape))
+        dims.extend(int(d) for d in param.shape)
+    out.write("inline constexpr const char* kLtx2PromptAdalnParamNames[] = {\n")
+    for name in names:
+        out.write(f'    "{name}",\n')
+    out.write("};\n\n")
+    emit_i64(out, "kLtx2PromptAdalnParamRanks", ranks)
+    emit_i64(out, "kLtx2PromptAdalnParamDims", dims)
+    emit_scalar(out, "kLtx2PromptAdalnParamCount", len(names))
+    out.write("\n")
+
+    # The MLP alone. `_prepare_timestep` scales by timestep_scale_multiplier and
+    # feeds the modality's SIGMA -- (B,), one scalar per sample -- not its
+    # per-token `timesteps`. Emitting both halves keeps that distinction gateable.
+    scale = float(ARCH["timestep_scale_multiplier"])
+    vsigma = rand_input("input.video.sigma", (BATCH,), 0.25, 0.5) * scale
+    asigma = rand_input("input.audio.sigma", (BATCH,), 0.25, 0.5) * scale
+    vmod, _ = model.prompt_adaln_single(vsigma.flatten(), hidden_dtype=torch.float32)
+    amod, _ = model.audio_prompt_adaln_single(asigma.flatten(), hidden_dtype=torch.float32)
+    emit_f32(out, "kLtx2PromptAdalnVideoTimesteps", tensor(vsigma))
+    emit_f32(out, "kLtx2PromptAdalnAudioTimesteps", tensor(asigma))
+    emit_f32(out, "kLtx2PromptAdalnVideoModulation", tensor(vmod))
+    emit_f32(out, "kLtx2PromptAdalnAudioModulation", tensor(amod))
+
+    emit_forward(out, "PromptAdaln", "split", False, False, prompt_adaln=True)
+    emit_forward(out, "PromptAdalnMasked", "split", False, True, prompt_adaln=True)
+
+
+def measure_prompt_adaln_magnitude() -> str:
+    """How far the conditioning MOVES when the term is included, vs when it is not.
+
+    Both arms share every common parameter bit-for-bit (the stream is keyed by
+    parameter NAME), so the difference below is the term itself and nothing else.
+    Reported as a comment in the generated header AND on stderr, because "does
+    this matter" is a number, not an argument.
+    """
+    lines = []
+    off = build_model("split", False, prompt_adaln=False)
+    on = build_model("split", False, prompt_adaln=True)
+    video, audio = build_modalities(False)
+    with torch.no_grad():
+        vx_off, ax_off = off(video=video, audio=audio, perturbations=None)
+        vx_on, ax_on = on(video=video, audio=audio, perturbations=None)
+
+    def rel(a, b):
+        a32 = a.to(torch.float32)
+        b32 = b.to(torch.float32)
+        denom = float(a32.abs().max())
+        return float((b32 - a32).abs().max()), (
+            float((b32 - a32).abs().max()) / denom if denom > 0 else float("nan")
+        )
+
+    vabs, vrel = rel(vx_off, vx_on)
+    aabs, arel = rel(ax_off, ax_on)
+    lines.append(f"//   DiT video output: max|on-off| = {vabs:.6g}  ({vrel * 100:.2f}% of max|off|)")
+    lines.append(f"//   DiT audio output: max|on-off| = {aabs:.6g}  ({arel * 100:.2f}% of max|off|)")
+
+    # The modulated prompt context of block 0, which is where the term enters.
+    scale = float(ARCH["timestep_scale_multiplier"])
+    with torch.no_grad():
+        vmod, _ = on.prompt_adaln_single(
+            (video.sigma * scale).flatten(), hidden_dtype=torch.float32
+        )
+        vmod = vmod.view(BATCH, -1, vmod.size(-1))
+        table = on.transformer_blocks[0].prompt_scale_shift_table[None, None]
+        static = table.expand(BATCH, 1, 2, video_dim())
+        full = static + vmod.reshape(BATCH, vmod.shape[1], 2, -1)
+        shift_off, scale_off = static.unbind(dim=2)
+        shift_on, scale_on = full.unbind(dim=2)
+        ctx = video.context
+        kv_off = ctx * (1 + scale_off) + shift_off
+        kv_on = ctx * (1 + scale_on) + shift_on
+    kabs, krel = rel(kv_off, kv_on)
+    lines.append(
+        f"//   block 0 modulated prompt K/V: max|on-off| = {kabs:.6g}  "
+        f"({krel * 100:.2f}% of max|off|)"
+    )
+    # How much of the K/V modulation is timestep-conditioned at all: the MLP row
+    # against the static per-block table it is added to (transformer.py:441-443).
+    static_max = float(table.abs().max())
+    term_max = float(vmod.abs().max())
+    lines.append(
+        f"//   timestep term vs static table: max|term| = {term_max:.6g} vs "
+        f"max|table| = {static_max:.6g}  ({term_max / static_max * 100:.1f}%)"
+    )
+    lines.append(
+        "// The two output rows are bounded by this generator's SYNTHETIC weight scale"
+    )
+    lines.append(
+        "// (0.05, param_spec above) and by a 2-block stack; they are the FLOOR the gate"
+    )
+    lines.append(
+        "// needs, not a claim about the trained checkpoint. The K/V row is where the"
+    )
+    lines.append("// term actually enters and is the number that answers 'does this matter'.")
+    text = "\n".join(lines)
+    print("prompt-AdaLN magnitude:\n" + text, file=sys.stderr)
+    return text
 
 
 def emit_masks(out) -> None:
@@ -680,6 +815,14 @@ def main() -> int:
         # only this case — separates a kernel that indexes the bias by query from
         # one that reads bias row 0 for every query.
         emit_forward(out, "DenseMask", "split", False, True, dense_self_mask=True)
+        # Upstream's DEFAULT arm, and the one the shipped checkpoint runs.
+        emit_prompt_adaln(out)
+        out.write(
+            "// --- the MEASURED magnitude of the prompt-AdaLN term ---\n"
+            "// Same shared weights, same inputs, flag ON vs OFF:\n"
+            + measure_prompt_adaln_magnitude()
+            + "\n"
+        )
         out.write("}  // namespace vllm_test\n")
     print(f"wrote {args.out}", file=sys.stderr)
     return 0

@@ -51,8 +51,14 @@
 //     checkpoint: `caption_proj_before_connector=true` puts them in the TEXT
 //     ENCODER, so the DiT has none (model_configurator.py:199-219). They are
 //     phase L3.
-//   - `prompt_adaln_single` (model.py:223-227). LTX-2.5 sets
-//     `use_prompt_adaln_single=false`; see Ltx2PromptKvCache.
+//
+// PORTED 2026-08-13 — `prompt_adaln_single` / `audio_prompt_adaln_single`
+// (model.py:222-227, :252-257), which this list previously carried as unported on
+// the strength of "LTX-2.5 sets use_prompt_adaln_single=false". It does not: the
+// flag defaults TRUE in both references (model.py:77,
+// model_configurator.py:76/:138, diffusers transformer_ltx2.py:1185) and the
+// shipped DiT carries the module's tensors. See
+// .agents/specs/ltx25-prompt-adaln.md and issue #644.
 #pragma once
 
 #include <cstdint>
@@ -112,8 +118,12 @@ struct Ltx2DitParams {
   bool double_precision_rope = false;
   bool apply_gated_attention = false;
   bool cross_attention_adaln = false;
-  // model_configurator.py:74-76. FALSE on LTX-2.5, which is what makes the
-  // cross-attention K/V timestep-independent — see Ltx2PromptKvCache.
+  // model_configurator.py:74-76 (`config.get("use_prompt_adaln_single", True)`),
+  // model.py:77, diffusers transformer_ltx2.py:1185 — TRUE by default in every
+  // reference, and TRUE for the shipped LTX-2.5 DiT, which carries the module's
+  // tensors. When true a prompt-side AdaLN MLP adds a timestep term to the
+  // cross-attention K/V modulation (transformer.py:441-443), which is what makes
+  // those K/V timestep-DEPENDENT and so uncacheable — see Ltx2PromptKvCache.
   bool use_prompt_adaln_single = true;
   // model_configurator.py:77-80. LTX-2.5 (gemma4) sets ff_bias=false and leaves
   // audio_ff_bias at its true default; the checkpoint's shapes agree.
@@ -214,6 +224,11 @@ struct Ltx2BlockWeights {
 struct Ltx2DitWeights {
   Ltx2LinearWeight patchify_proj, proj_out;
   Ltx2AdaLayerNormSingleWeights adaln_single;
+  // model.py:222-227 / :252-257 — built only when `cross_attention_adaln AND
+  // use_prompt_adaln_single`, with embedding_coefficient 2 (shift + scale for the
+  // prompt K/V), NOT `adaln_embedding_coefficient()`. Left unbound otherwise.
+  Ltx2AdaLayerNormSingleWeights prompt_adaln_single;
+  Ltx2AdaLayerNormSingleWeights audio_prompt_adaln_single;
   vt::Tensor scale_shift_table;  // [2, dim] — the OUTPUT table (:230), not the block's [9, dim]
   Ltx2LinearWeight audio_patchify_proj, audio_proj_out;
   Ltx2AdaLayerNormSingleWeights audio_adaln_single;
@@ -295,13 +310,19 @@ Ltx2AdalnOut Ltx2AdaLayerNormSingle(vt::Device device, const Ltx2AdaLayerNormSin
 std::vector<float> Ltx2FeedForward(vt::Device device, const Ltx2FeedForwardWeights& w,
                                    const float* x, int64_t rows, int64_t dim, int64_t inner);
 
-// The K/V half of Attention.forward, split out because LTX-2.5 can CACHE it:
-// with `use_prompt_adaln_single=false` the prompt modulation carries no timestep
-// term (transformer.py:441), so `to_k`/`to_v` over the modulated context — and
-// their k_norm, and the absence of RoPE on the text path — depend only on the
-// prompt. The denoise loop computes them ONCE PER REQUEST and reuses them for
-// every step. Layout: k/v are [batch * context_tokens, heads * dim_head], held
-// exactly as the attention op consumes them (post-norm, post-RoPE).
+// The K/V half of Attention.forward, split out because a checkpoint that sets
+// `use_prompt_adaln_single=false` can CACHE it: the prompt modulation then
+// carries no timestep term (transformer.py:441-443), so `to_k`/`to_v` over the
+// modulated context — and their k_norm, and the absence of RoPE on the text path
+// — depend only on the prompt. The denoise loop computes them ONCE PER REQUEST
+// and reuses them for every step. Layout: k/v are
+// [batch * context_tokens, heads * dim_head], held exactly as the attention op
+// consumes them (post-norm, post-RoPE).
+//
+// THIS DOES NOT APPLY TO THE SHIPPED LTX-2.5 DiT, which sets the flag TRUE
+// (.agents/specs/ltx-2-5.md §1.2, and .agents/specs/ltx25-prompt-adaln.md). The
+// mechanism stays here, gated bit-identical, for a checkpoint that does set it
+// false; `Ltx2DitForward` refuses a cache when the flag is on.
 struct Ltx2CrossKv {
   std::vector<float> k, v;
 };
@@ -463,6 +484,14 @@ struct Ltx2BlockArgs {
   // Per-token AdaLN modulation, [batch, tokens, coefficient * dim].
   const float* video_timestep_modulation = nullptr;
   const float* audio_timestep_modulation = nullptr;
+  // The PROMPT-side AdaLN modulation, [batch, 1, 2 * dim] — shift then scale, one
+  // row per batch element broadcast over the prompt tokens (transformer.py:443,
+  // whose `prompt_timestep` has token dimension 1 because `_prepare_timestep` ran
+  // on the modality's per-sample `sigma`). `nullptr` is upstream's
+  // `prompt_timestep is None`, i.e. `use_prompt_adaln_single=false`, in which case
+  // only the static per-block table applies (:441).
+  const float* video_prompt_modulation = nullptr;
+  const float* audio_prompt_modulation = nullptr;
   // Audio<->video cross-attention AdaLN inputs (transformer_args.py:388-411).
   const float* video_cross_scale_shift = nullptr;  // [batch, video tokens, 4 * dim]
   const float* video_cross_gate = nullptr;         // [batch, 1, dim]

@@ -2073,11 +2073,14 @@ other marker-less NVFP4 checkpoint as unsupported until it is. See
 `.agents/specs/nvfp4-nibble-order.md`.
 
 Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES the
-shipped DiT by default, because that file carries **three** module families phase
-L2 does not port (`prompt_adaln_single`, `audio_prompt_adaln_single` and
-`keyframes_abs_pos_embedding`); pass `Ltx2DitLoadOptions::allow_unported_modules`
+shipped DiT by default, because that file carries **one** module family this port
+does not carry (`keyframes_abs_pos_embedding`); pass
+`Ltx2DitLoadOptions::allow_unported_modules`
 to load the ported subset, which still reports every one of them in
-`Ltx2DitCheckpoint::unported`. The two `*_embeddings_connector` towers are
+`Ltx2DitCheckpoint::unported`. `prompt_adaln_single` and
+`audio_prompt_adaln_single` were on that list until 2026-08-13 and are now
+PORTED, so a checkpoint carrying them needs no opt-in on their account, and the
+opt-in no longer disables them. The two `*_embeddings_connector` towers are
 **not** among them and never will be:
 `UnportedFamilies` filters them out at `ltx2_loader.cpp:439` (`LoadedElsewhere`),
 `RefuseUnported`'s own message says so in capitals at `ltx2_loader.cpp:461-464`,

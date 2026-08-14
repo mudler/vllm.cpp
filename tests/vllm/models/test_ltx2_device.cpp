@@ -304,8 +304,9 @@ struct CaseResult {
 CaseResult RunDeviceCase(vt::Queue& q, vt::DType stream, Ltx2RopeType rope_type,
                          bool double_precision, bool masked, const float* want_video,
                          const float* want_audio, bool audio_enabled = true,
-                         bool dense_self_mask = false) {
-  const Ltx2DitParams p = ReducedParams(rope_type, double_precision);
+                         bool dense_self_mask = false, bool prompt_adaln = false) {
+  Ltx2DitParams p = ReducedParams(rope_type, double_precision);
+  p.use_prompt_adaln_single = prompt_adaln;
   WeightSet set = BuildWeights(p);
   // Staged at the SAME dtype the stream computes in. Staging f32 weights under a
   // bf16 stream would compare a DIFFERENT MODEL, not a different dtype policy.
@@ -404,6 +405,74 @@ void CheckBf16Stream(vt::Queue& q, const char* label) {
   // round-off would mean the staging or the kernels silently kept f32, which is
   // exactly the too-WIDE dtype a golden gate cannot catch on its own.
   CHECK(bf16.video > kDeviceRoundOff);
+}
+
+// The prompt-side AdaLN arm — upstream's DEFAULT and what the shipped DiT runs
+// (.agents/specs/ltx25-prompt-adaln.md, issue #644). The device path forms
+// `kv_modulation = table + prompt_timestep` (transformer.py:441-443) through
+// `ada_value` and then broadcasts one row per BATCH element over that element's
+// prompt tokens, which is a DIFFERENT `modulate` call shape from the static
+// arm — so it needs its own case rather than riding on the loop above.
+void CheckPromptAdalnCases(vt::Queue& q, const char* label) {
+  {
+    INFO(label << " / prompt AdaLN, f32");
+    const CaseResult r =
+        RunDeviceCase(q, vt::DType::kF32, Ltx2RopeType::kSplit, false, false,
+                      vllm_test::kLtx2ForwardPromptAdalnVideo,
+                      vllm_test::kLtx2ForwardPromptAdalnAudio, /*audio_enabled=*/true,
+                      /*dense_self_mask=*/false, /*prompt_adaln=*/true);
+    MESSAGE("prompt AdaLN f32: max|diff| video=" << r.video << " audio=" << r.audio);
+    CHECK(r.video < kDeviceRoundOff);
+    CHECK(r.audio < kDeviceRoundOff);
+  }
+  {
+    // The masked case: the prompt mask and the prompt modulation act on the SAME
+    // context tensor, and a per-batch broadcast written as a per-token one would
+    // survive the unmasked case at batch 1.
+    INFO(label << " / prompt AdaLN + masks, f32");
+    const CaseResult r =
+        RunDeviceCase(q, vt::DType::kF32, Ltx2RopeType::kSplit, false, true,
+                      vllm_test::kLtx2ForwardPromptAdalnMaskedVideo,
+                      vllm_test::kLtx2ForwardPromptAdalnMaskedAudio, /*audio_enabled=*/true,
+                      /*dense_self_mask=*/false, /*prompt_adaln=*/true);
+    MESSAGE("prompt AdaLN masked f32: max|diff| video=" << r.video << " audio=" << r.audio);
+    CHECK(r.video < kDeviceRoundOff);
+    CHECK(r.audio < kDeviceRoundOff);
+  }
+  {
+    // AND IT IS LOAD-BEARING. The flag-ON and flag-OFF goldens share every common
+    // weight bit-for-bit, so a device path that bound the module and never added
+    // its output would reproduce the flag-OFF numbers exactly.
+    //
+    // The bound is `kDeviceRoundOff` itself, and that is the precise statement:
+    // the flag-ON run must miss the flag-OFF golden by MORE than the tolerance
+    // the flag-OFF case is held to, or a dropped term would pass that gate.
+    // Measured here: video 1.46e-4 (7.3x the bound), audio 7.37e-5 (3.7x).
+    INFO(label << " / prompt AdaLN is load-bearing");
+    const CaseResult r =
+        RunDeviceCase(q, vt::DType::kF32, Ltx2RopeType::kSplit, false, false,
+                      vllm_test::kLtx2ForwardSplitVideo, vllm_test::kLtx2ForwardSplitAudio,
+                      /*audio_enabled=*/true, /*dense_self_mask=*/false,
+                      /*prompt_adaln=*/true);
+    MESSAGE("prompt AdaLN vs flag-OFF golden: video=" << r.video << " audio=" << r.audio);
+    CHECK(r.video > kDeviceRoundOff);
+    CHECK(r.audio > kDeviceRoundOff);
+  }
+  {
+    // The bf16 PRODUCTION stream on the same arm: `ada_value` stores the
+    // table+timestep sum at the stream dtype, so this is where a bf16 store of the
+    // new sum is exercised at all.
+    INFO(label << " / prompt AdaLN, bf16");
+    const CaseResult r =
+        RunDeviceCase(q, vt::DType::kBF16, Ltx2RopeType::kSplit, false, false,
+                      vllm_test::kLtx2ForwardPromptAdalnVideo,
+                      vllm_test::kLtx2ForwardPromptAdalnAudio, /*audio_enabled=*/true,
+                      /*dense_self_mask=*/false, /*prompt_adaln=*/true);
+    MESSAGE("prompt AdaLN bf16: max|diff| video=" << r.video << " audio=" << r.audio);
+    CHECK(r.video < kBf16RoundOff);
+    CHECK(r.audio < kBf16RoundOff);
+    CHECK(r.video > kDeviceRoundOff);
+  }
 }
 
 vt::Backend* TryCuda() { return vt::TryGetBackend(vt::DeviceType::kCUDA); }
@@ -525,6 +594,21 @@ TEST_CASE("ltx2 device: the DEVICE-RESIDENT forward matches upstream on CUDA") {
   }
   vt::Queue q = cuda->CreateQueue();
   CheckAllForwardCases(q, "cuda");
+}
+
+TEST_CASE("ltx2 device: the prompt-side AdaLN arm matches upstream (CPU backend)") {
+  vt::Queue q{Cpu(), nullptr};
+  CheckPromptAdalnCases(q, "cpu-backend");
+}
+
+TEST_CASE("ltx2 device: the prompt-side AdaLN arm matches upstream on CUDA") {
+  vt::Backend* cuda = TryCuda();
+  if (cuda == nullptr) {
+    MESSAGE("SKIP: no CUDA backend registered");
+    return;
+  }
+  vt::Queue q = cuda->CreateQueue();
+  CheckPromptAdalnCases(q, "cuda");
 }
 
 TEST_CASE("ltx2 device: the bf16 PRODUCTION stream matches upstream (CPU backend)") {

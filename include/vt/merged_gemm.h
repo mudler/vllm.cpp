@@ -76,6 +76,21 @@ inline constexpr MergedGemmGroup kKeepQuantGateUpSwiGLU = {
 // op vt::MoeGroupedGemmBf16GateUpSilu / OpId::kMoeGroupedGemmBf16GateUpSilu — the
 // bf16 twin of kMoeGateUpSwiGLUGrouped, BIT-IDENTICAL to {2x MoeGroupedGemmBf16 +
 // MoeSiluMul}. Same family, distinct weight-marshaling seam.
+//
+// NON-GATED experts are NOT in this family at all, and deliberately get no
+// descriptor. NemotronH's expert (models/nemotron_h.py:126-256 @ 555967922) has
+// NO gate half — `ckpt_names=("up_proj", "down_proj", "")` (:220), the empty
+// third entry being the absent gate — so the expert is
+//     h = up_proj(x); h = relu(h)^2; y = down_proj(h)
+// with `activation_without_mul(config.mlp_hidden_act)` (:227). A MergedGemmGroup
+// describes N GEMMs SHARING operand A collapsed into one launch; with N == 1
+// there is nothing to merge and no launch to save, so an arity-1 descriptor would
+// name a fusion that does not exist. The non-gated arm is therefore realized as
+// the EXISTING single grouped GEMM plus the activation — kMoeGroupedGemmBf16 (or
+// kMoeGroupedGemmNvfp4Marlin for the W4A16 group-16 arm) followed by
+// OpId::kMoeRelu2 — which is exactly the shape the gated bf16 archs had before
+// their pair was folded. See vt::MoeRelu2 (ops.h) and
+// .agents/specs/nemotron-h-model.md §4 W2.
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────
 // Run a merged-GEMM group. For an arity-2 kSiluMulClamp group over keep-quant

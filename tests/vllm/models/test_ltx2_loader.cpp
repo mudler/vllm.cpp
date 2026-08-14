@@ -827,8 +827,10 @@ TEST_CASE("ltx2 loader: the shipped FP8 DiT manifest is fully accounted for") {
   CHECK(bf16 == 2284);
   CHECK(f32 == 290);   // the tables; the 1775 scalar scales were counted above
 
-  // The four families outside the phase-L2 contract, named so their absence
-  // from the port cannot be discovered later.
+  // The five families the file carries beyond the ORIGINAL L2 contract, named so
+  // their status cannot be discovered later. Two are ported (the prompt AdaLN
+  // pair), two are loaded elsewhere (the connectors), one is genuinely unported
+  // (keyframes).
   CHECK(families.count("prompt_adaln_single") == 1);
   CHECK(families.count("audio_prompt_adaln_single") == 1);
   CHECK(families.count("keyframes_abs_pos_embedding") == 1);
@@ -886,18 +888,19 @@ TEST_CASE("ltx2 loader: the L2 contract's every name is present in the shipped D
   CHECK(p.cross_attention_adaln);
   CHECK_FALSE(p.ff_bias);
   CHECK(p.audio_ff_bias);
-  // MEASURED, and it contradicts .agents/specs/ltx-2-5.md section 1.2 and
-  // ltx2.h:115-117: the SHIPPED checkpoint carries prompt_adaln_single, which
-  // upstream builds only when use_prompt_adaln_single is TRUE (model.py:222-226).
-  // The prompt-K/V cache's premise does not hold for this checkpoint.
+  // MEASURED: the SHIPPED checkpoint carries prompt_adaln_single, which upstream
+  // builds only when use_prompt_adaln_single is TRUE (model.py:222-226), so the
+  // prompt-K/V cache's premise does not hold for this checkpoint
+  // (.agents/specs/ltx-2-5.md §1.2) and the module is PORTED
+  // (.agents/specs/ltx25-prompt-adaln.md, issue #644).
   CHECK(p.use_prompt_adaln_single);
 
-  // Enumerate the contract for the subset this port DOES carry, and require
-  // every one of its names in the file.
-  Ltx2DitParams contract = p;
-  contract.use_prompt_adaln_single = false;
-  const std::vector<Ltx2TensorSpec> want = vllm::EnumerateLtx2DitTensors(contract);
-  CHECK(want.size() == 4078);
+  // Enumerate the contract AS THE FILE DESCRIBES IT — no flag is forced here any
+  // more — and require every one of its names in the file. This line used to read
+  // `contract.use_prompt_adaln_single = false`, which is the shape of the defect:
+  // the gate agreed with the port about a module they were both dropping.
+  const std::vector<Ltx2TensorSpec> want = vllm::EnumerateLtx2DitTensors(p);
+  CHECK(want.size() == 4078 + 12);
   int64_t missing = 0;
   std::string first_missing;
   for (const Ltx2TensorSpec& spec : want) {
@@ -913,15 +916,16 @@ TEST_CASE("ltx2 loader: the L2 contract's every name is present in the shipped D
   // ... and account for every name the file has that the contract does not, so
   // "the rest is fine" is a counted claim rather than a hope.
   //   258 = 2 connectors x (8 blocks x 16 + 1 learnable_registers)
-  //    12 = prompt_adaln_single + audio_prompt_adaln_single, 6 tensors each
   //     1 = keyframes_abs_pos_embedding
+  // The 12 prompt-AdaLN tensors are no longer here: they moved INTO `want` when
+  // the module was ported, which is the whole delta this row landed.
   std::set<std::string> want_set;
   for (const Ltx2TensorSpec& spec : want) want_set.insert(spec.name);
   int64_t extra = 0;
   for (const std::string& name : present) {
     if (want_set.count(name) == 0) ++extra;
   }
-  CHECK(extra == 258 + 12 + 1);
+  CHECK(extra == 258 + 1);
 }
 
 // ===========================================================================
@@ -1542,8 +1546,7 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   const Ltx2DitParams p = TinyParams();
   const SyntheticDit syn = BuildSyntheticDit(
       p, Ltx2DitQuant::kFp8,
-      {"prompt_adaln_single.linear.weight", "audio_prompt_adaln_single.linear.weight",
-       "keyframes_abs_pos_embedding", "video_embeddings_connector.learnable_registers",
+      {"keyframes_abs_pos_embedding", "video_embeddings_connector.learnable_registers",
        "audio_embeddings_connector.learnable_registers"});
   const std::string path = TmpPath("unported");
   WriteSafetensors(syn.entries, path);
@@ -1557,12 +1560,18 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   }
   const std::string what_msg = "what: " + what;
   INFO(what_msg);
-  // THREE families now, not five. `audio_prompt_adaln_single` is here because it
-  // goes through the identical generic FamilyOf path as its video twin and
-  // covering it literally is one line.
-  CHECK(what.find("prompt_adaln_single") != std::string::npos);
-  CHECK(what.find("audio_prompt_adaln_single") != std::string::npos);
-  CHECK(what.find("keyframes_abs_pos_embedding") != std::string::npos);
+  // ONE family in the LIST now, not five. `prompt_adaln_single` /
+  // `audio_prompt_adaln_single` left it when they were PORTED (issue #644); the
+  // case below proves a checkpoint carrying them needs no opt-in at all.
+  //
+  // The list is asserted as a whole rather than by substring, because the message
+  // deliberately goes on to NAME the families that are not in it — a
+  // `find(...) == npos` over the whole message would only test the prose.
+  const std::string head = "does NOT carry: ";
+  const size_t at = what.find(head);
+  REQUIRE(at != std::string::npos);
+  const std::string list = what.substr(at + head.size(), what.find('.', at) - at - head.size());
+  CHECK(list == "keyframes_abs_pos_embedding");
 
   // THE TWO CONNECTOR FAMILIES ARE NOT UNPORTED AS OF PHASE L9c. They are
   // outside the DiT's contract by design — upstream loads them into the text
@@ -1574,17 +1583,15 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   CHECK(what.find("video_embeddings_connector") == std::string::npos);
   CHECK(what.find("audio_embeddings_connector") == std::string::npos);
 
-  // The opt-in still REPORTS every one of the three; it does not make them vanish.
+  // The opt-in still REPORTS it; it does not make it vanish.
   Ltx2DitLoadOptions options;
   options.allow_unported_modules = true;
   const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file, options);
-  CHECK(ck.unported.size() == 3);
+  CHECK(ck.unported.size() == 1);
   for (const std::string& family : ck.unported) {
     CHECK(family != "video_embeddings_connector");
     CHECK(family != "audio_embeddings_connector");
   }
-  CHECK(ck.checkpoint_params.use_prompt_adaln_single);
-  CHECK_FALSE(ck.params.use_prompt_adaln_single);
   std::remove(path.c_str());
 
   // AND THE CONNECTOR-ONLY CHECKPOINT LOADS WITH NO OPT-IN AT ALL, which is the
@@ -1602,6 +1609,131 @@ TEST_CASE("ltx2 loader: the unported families are refused by name, not absorbed"
   const vllm::Ltx2DitCheckpoint conn_ck = vllm::Ltx2LoadDitFromSafetensors(conn_file);
   CHECK(conn_ck.unported.empty());
   std::remove(conn_path.c_str());
+}
+
+// THE REGRESSION GATE FOR ISSUE #644 ROW 0.
+//
+// A checkpoint that carries `prompt_adaln_single` — which the shipped LTX-2.5 DiT
+// does — used to be refused without `allow_unported_modules=1`, and setting that
+// extra reached three assignments that CLEARED `use_prompt_adaln_single`. So the
+// only way to load a real DiT was also the way to silently drop the timestep half
+// of every cross-attention K/V modulation.
+//
+// Both halves are asserted here, and neither is true by construction: the load
+// with no opt-in exercises the contract, and the resolved flag is read back off
+// the checkpoint the loader actually bound.
+TEST_CASE("ltx2 loader: a DiT carrying prompt_adaln_single loads with NO opt-in") {
+  Ltx2DitParams p = TinyParams();
+  p.use_prompt_adaln_single = true;
+  const SyntheticDit syn = BuildSyntheticDit(p, Ltx2DitQuant::kFp8, {});
+  const std::string path = TmpPath("prompt_adaln");
+  WriteSafetensors(syn.entries, path);
+  const SafetensorsFile file = SafetensorsFile::Open(path);
+
+  // No options at all: the families are in the contract, so nothing is unported.
+  const vllm::Ltx2DitCheckpoint ck = vllm::Ltx2LoadDitFromSafetensors(file);
+  CHECK(ck.unported.empty());
+  CHECK(ck.checkpoint_params.use_prompt_adaln_single);
+  // The flag the FORWARD reads. This is the assertion the defect broke: it was
+  // false while `checkpoint_params` said true.
+  CHECK(ck.params.use_prompt_adaln_single);
+  // And the weights are bound, not merely enumerated — a contract that listed the
+  // tensors while `BindLtx2DitWeights` left the views null would render the same
+  // wrong picture with a different failure mode.
+  CHECK(ck.weights.prompt_adaln_single.linear.weight.data != nullptr);
+  CHECK(ck.weights.audio_prompt_adaln_single.linear.weight.data != nullptr);
+  CHECK(ck.weights.prompt_adaln_single.linear.weight.shape[0] == 2 * p.inner_dim());
+  CHECK(ck.weights.audio_prompt_adaln_single.linear.weight.shape[0] == 2 * p.audio_inner_dim());
+  // The 12 tensors, counted rather than assumed.
+  Ltx2DitParams off = p;
+  off.use_prompt_adaln_single = false;
+  CHECK(vllm::EnumerateLtx2DitTensors(p).size() -
+            vllm::EnumerateLtx2DitTensors(off).size() ==
+        12);
+  std::remove(path.c_str());
+
+  // AND THE OPT-IN CANNOT UNDO IT. `allow_unported_modules` is what a real render
+  // still passes for `keyframes_abs_pos_embedding`; it must leave a ported feature
+  // alone. Same bytes, opt-in set, same resolved flag.
+  const std::string path2 = TmpPath("prompt_adaln_optin");
+  WriteSafetensors(syn.entries, path2);
+  const SafetensorsFile file2 = SafetensorsFile::Open(path2);
+  Ltx2DitLoadOptions options;
+  options.allow_unported_modules = true;
+  const vllm::Ltx2DitCheckpoint ck2 = vllm::Ltx2LoadDitFromSafetensors(file2, options);
+  CHECK(ck2.params.use_prompt_adaln_single);
+  CHECK(ck2.weights.prompt_adaln_single.linear.weight.data != nullptr);
+  std::remove(path2.c_str());
+}
+
+// The DECLARED config path. `Ltx2AdoptDeclaredDitParams` no longer forces both
+// sides of its comparison to a cleared flag, so a config that disagrees with the
+// file's shapes about `use_prompt_adaln_single` now produces two DIFFERENT
+// contracts and is refused — which is an INPUT-driven gate, not a mutation-only
+// one. Both directions are checked, because the equality is the point.
+TEST_CASE("ltx2 loader: a config that disagrees about use_prompt_adaln_single is REFUSED") {
+  Ltx2DitParams shapes = TinyParams();
+  shapes.use_prompt_adaln_single = true;
+
+  nlohmann::json t;
+  t["num_attention_heads"] = shapes.num_attention_heads;
+  t["attention_head_dim"] = shapes.attention_head_dim;
+  t["in_channels"] = shapes.in_channels;
+  t["out_channels"] = shapes.out_channels;
+  t["num_layers"] = shapes.num_layers;
+  t["cross_attention_dim"] = shapes.cross_attention_dim;
+  t["audio_num_attention_heads"] = shapes.audio_num_attention_heads;
+  t["audio_attention_head_dim"] = shapes.audio_attention_head_dim;
+  t["audio_in_channels"] = shapes.audio_in_channels;
+  t["audio_out_channels"] = shapes.audio_out_channels;
+  t["audio_cross_attention_dim"] = shapes.audio_cross_attention_dim;
+  t["apply_gated_attention"] = true;
+  t["cross_attention_adaln"] = true;
+  t["ff_bias"] = false;
+  t["audio_ff_bias"] = true;
+  t["rope_type"] = "split";
+  // The checks ParseLtx2DitParams asserts verbatim (model_configurator.py:26-44).
+  t["dropout"] = 0.0;
+  t["attention_bias"] = true;
+  t["num_vector_embeds"] = nullptr;
+  t["activation_fn"] = "gelu-approximate";
+  t["num_embeds_ada_norm"] = 1000;
+  t["use_linear_projection"] = false;
+  t["only_cross_attention"] = false;
+  t["cross_attention_norm"] = true;
+  t["double_self_attention"] = false;
+  t["upcast_attention"] = false;
+  t["standardization_norm"] = "rms_norm";
+  t["norm_elementwise_affine"] = false;
+  t["qk_norm"] = "rms_norm";
+  t["positional_embedding_type"] = "rope";
+  t["use_audio_video_cross_attention"] = true;
+  t["share_ff"] = false;
+  t["av_cross_ada_norm"] = true;
+  t["use_middle_indices_grid"] = true;
+  t["caption_proj_before_connector"] = true;
+
+  nlohmann::json agreeing;
+  agreeing["transformer"] = t;
+  agreeing["transformer"]["use_prompt_adaln_single"] = true;
+  // Agreement is adopted, and carries the flag through.
+  const Ltx2DitParams adopted =
+      vllm::Ltx2AdoptDeclaredDitParams(agreeing, shapes, false, "the test config");
+  CHECK(adopted.use_prompt_adaln_single);
+
+  nlohmann::json disagreeing;
+  disagreeing["transformer"] = t;
+  disagreeing["transformer"]["use_prompt_adaln_single"] = false;
+  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(disagreeing, shapes, false, "the test config"));
+  // The opt-in must not rescue it: clearing a PORTED flag in the config copy is
+  // exactly what made this comparison blind before.
+  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(disagreeing, shapes, true, "the test config"));
+
+  // And the other direction: shapes WITHOUT the module against a config that
+  // declares it.
+  Ltx2DitParams shapes_off = shapes;
+  shapes_off.use_prompt_adaln_single = false;
+  CHECK_THROWS(vllm::Ltx2AdoptDeclaredDitParams(agreeing, shapes_off, false, "the test config"));
 }
 
 TEST_CASE("ltx2 loader: the f32 widening is OPT-IN and bit-exact over bf16") {

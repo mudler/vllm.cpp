@@ -540,16 +540,51 @@ std::vector<Ltx2TensorSpec> ContractOf(const Ltx2DitParams& params) {
     list += families[i];
   }
   Fail(
-      "the checkpoint carries modules phase L2 does NOT port: " + list +
-      ". They are not dropped silently: prompt_adaln_single / "
-      "audio_prompt_adaln_single mean use_prompt_adaln_single is TRUE, which "
-      "contradicts .agents/specs/ltx-2-5.md section 1.2 and voids the prompt-K/V "
-      "cache's premise; keyframes_abs_pos_embedding contradicts ltx2.h:47-49. The "
-      "two *_embeddings_connector families are NOT in this list and never will be "
-      "— they are outside the DiT contract by design and are loaded by "
+      "the checkpoint carries modules this port does NOT carry: " + list +
+      ". They are not dropped silently: keyframes_abs_pos_embedding means "
+      "use_keyframes_abs_pos_embedding is TRUE, and nothing here applies it. "
+      "prompt_adaln_single / audio_prompt_adaln_single are NO LONGER in this list "
+      "— they were ported by row LTX25-PROMPT-ADALN "
+      "(.agents/specs/ltx25-prompt-adaln.md, issue #644) and are now part of the "
+      "contract whenever the checkpoint carries them. The two "
+      "*_embeddings_connector families are not in this list either and never will "
+      "be — they are outside the DiT contract by design and are loaded by "
       "Ltx2LoadConnectorWeights, which is what the video engine calls. Pass "
       "Ltx2DitLoadOptions::allow_unported_modules to load the ported SUBSET, which "
       "still reports every one of them.");
+}
+
+// THE GUARD THAT REPLACED THREE `use_prompt_adaln_single = false` ASSIGNMENTS.
+//
+// Those assignments existed only so `EnumerateLtx2DitTensors` would not throw on
+// a module this port did not carry. The module is carried now, so the contract
+// simply includes it — and the assignments would have become a silent DROP of the
+// module's 12 parameters (18 entries in the shipped FP8 manifest, which carries a
+// `weight_scale` per quantized weight), reachable through
+// `allow_unported_modules=1`, which is exactly the defect issue #644 row 0 fixes.
+//
+// So the invariant they violated is asserted instead: the resolved flag must say
+// what the FILE says. Deliberately an EQUALITY. Clearing it with the tensors
+// present is the old defect; setting it with them absent would bind weights that
+// are not there. Either way this refuses by name rather than rendering.
+void CheckPromptAdalnAgreesWithFile(const DitPlan& plan, const Ltx2DitParams& params,
+                                    const char* where) {
+  bool file_has = false;
+  for (const Ltx2TensorSpec& spec : plan.manifest) {
+    if (spec.name == "prompt_adaln_single.linear.weight") {
+      file_has = true;
+      break;
+    }
+  }
+  if (file_has == params.use_prompt_adaln_single) return;
+  Fail(std::string(where) + ": use_prompt_adaln_single resolved to " +
+       (params.use_prompt_adaln_single ? "TRUE" : "FALSE") + " while the file " +
+       (file_has ? "DOES" : "does NOT") +
+       " carry prompt_adaln_single. Upstream builds that module exactly when the flag is set "
+       "(model.py:222-226), so the two cannot disagree. A FALSE flag over a file that carries "
+       "the module would drop the timestep term from every cross-attention K/V modulation "
+       "(transformer.py:441-443) and render with only the static table — finite, same-shaped, "
+       "and invisible to every gate, which is why this is checked rather than assumed.");
 }
 
 }  // namespace
@@ -568,9 +603,7 @@ Ltx2DitCheckpoint Ltx2LoadDitFromSafetensors(const SafetensorsFile& file,
   out.quant = plan.quant;
   out.checkpoint_params = ParseLtx2DitParamsFromManifest(plan.manifest);
   out.params = out.checkpoint_params;
-  // The one flag whose module this port does not carry. Cleared for the CONTRACT
-  // only; `checkpoint_params` keeps what the file actually says.
-  out.params.use_prompt_adaln_single = false;
+  CheckPromptAdalnAgreesWithFile(plan, out.params, "Ltx2LoadDitFromSafetensors");
 
   const std::vector<Ltx2TensorSpec> contract = ContractOf(out.params);
   out.unported = UnportedFamilies(plan, contract);
@@ -623,7 +656,7 @@ Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile&
   out.quant = plan.quant;
   out.checkpoint_params = ParseLtx2DitParamsFromManifest(plan.manifest);
   out.params = out.checkpoint_params;
-  out.params.use_prompt_adaln_single = false;
+  CheckPromptAdalnAgreesWithFile(plan, out.params, "Ltx2StreamDitToDevice");
 
   const std::vector<Ltx2TensorSpec> contract = ContractOf(out.params);
   out.unported = UnportedFamilies(plan, contract);
@@ -976,16 +1009,20 @@ Ltx2DitParams Ltx2AdoptDeclaredDitParams(const nlohmann::json& config,
   // first-party LTX-2.5 DiT declares it, so reading the declared config verbatim
   // would refuse a real checkpoint the loader has just accepted under
   // `allow_unported_modules`.
+  //
+  // EXACTLY ONE FLAG, and that is now structural rather than a comment. This block
+  // also cleared `use_prompt_adaln_single`, whose module IS ported
+  // (.agents/specs/ltx25-prompt-adaln.md, issue #644) — so `allow_unported=1`,
+  // which a real render needs, silently turned off a correctness setting. Whatever
+  // is cleared here must be a module nothing below applies; a ported one belongs
+  // in the contract, where the equality check further down can see it.
   if (allow_unported_modules && copy.contains("transformer") &&
       copy["transformer"].is_object()) {
     copy["transformer"]["use_keyframes_abs_pos_embedding"] = false;
   }
   nlohmann::json wrapper;
   wrapper["config"] = copy;
-  Ltx2DitParams declared = ParseLtx2DitParams(wrapper);
-  // The one flag the L2 contract clears, mirroring the manifest path above
-  // ("cleared for the CONTRACT only").
-  declared.use_prompt_adaln_single = false;
+  const Ltx2DitParams declared = ParseLtx2DitParams(wrapper);
 
   const std::vector<Ltx2TensorSpec> a = EnumerateLtx2DitTensors(from_shapes);
   const std::vector<Ltx2TensorSpec> b = EnumerateLtx2DitTensors(declared);

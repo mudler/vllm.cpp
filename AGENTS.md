@@ -160,6 +160,51 @@ establish what actually ran. A GEMM/GEMV invocation-parity claim proves output
 dtype, compute and scale type, entry point, algorithm policy, and resolved
 template dtypes *in the same tool*.
 
+## When vLLM has no implementation
+
+vLLM — including `vllm-project/vllm-omni` — is the primary reference, and
+wherever it implements the behavior it is the only one. Where it implements
+nothing, the work is still not ungated. It runs against a **secondary oracle**,
+which is admissible only if it is one of these upstreams and only at a recorded
+pin:
+
+<!-- oracle-registry:begin -->
+
+| Oracle | Registry id | Reach for it when |
+|---|---|---|
+| vLLM | `vllm` | always, wherever it implements the behavior — the primary |
+| vLLM-Omni | `vllm-omni` | diffusion, TTS and the omni-only architectures vLLM proper never registers |
+| HuggingFace `transformers` | `transformers` | a model, processor or tokenizer's own reference implementation — the source vLLM itself mirrors |
+| `diffusers` | `diffusers` | schedulers, VAEs and diffusion pipelines |
+| SGLang | `sglang` | a model or serving path SGLang implements and vLLM does not |
+| SGLang-Omni | `sglang-omni` | omni, speech, TTS and music models served by SGLang's pipeline runtime — a third repository, not SGLang |
+| llama.cpp | `llama-cpp` | CPU and GGUF k-quant floors |
+| Tenstorrent tt-forge | `tt-forge` | Tenstorrent hardware, which vLLM has no backend for at all |
+
+<!-- oracle-registry:end -->
+
+**Pin every one of them.** Each has a file of its own,
+[`.agents/oracles/<id>.md`](.agents/oracles/), carrying the revision, the date it
+was measured, whether it is gateable, and the evidence. An upstream with no pin is
+not an oracle, it is a moving target, and a number measured against it cannot be
+reproduced. The vLLM parity pin keeps its home in
+[`.agents/upstream-sync.md`](.agents/upstream-sync.md); its oracle file points
+there rather than restating it. One file per oracle, read by glob — never a
+shared table every change has to write.
+
+**A secondary oracle answers one question and no others:** what correct output
+looks like on a path vLLM cannot produce at all. It never outranks vLLM, and it
+never becomes the mirror source — behavior, defaults, structure and naming still
+mirror vLLM wherever vLLM speaks, which is why "SGLang does it differently" is
+never on its own a reason to diverge. When vLLM later implements the path, the
+row reconciles onto vLLM and says so in its spec.
+
+**Gateability is measured, not assumed.** The primary's rule holds for all of
+them: an oracle is gateable once it demonstrably *builds and runs* the model.
+Until it does, its file records `gateable = no` and names the issue that owes the
+measurement, so an ungateable lane is visible debt rather than a discovery
+someone makes mid-campaign.
+
 ## Gates
 
 Correctness first, always. Establish the declared token-exact gate — or an

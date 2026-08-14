@@ -114,18 +114,45 @@ void PostSelfAttention(float* x, const float* y, const std::vector<float>& gate,
 }
 
 // apply_cross_attention_adaln (transformer.py:420-447). `prompt_table` is the
-// STATIC [2, dim] per-block table; with use_prompt_adaln_single=false there is no
-// timestep term at all (:441-443), which is exactly what makes the resulting K/V
-// cacheable across denoise steps.
+// STATIC [2, width] per-block table (:441). `prompt_mod` is the prompt-side AdaLN
+// MLP's output for this stream, [batch, 2 * width] — shift row then scale row,
+// one row per BATCH element because `_prepare_timestep` ran on the modality's
+// per-sample `sigma` (transformer_args.py:274-277). It is nullptr exactly when
+// upstream's `prompt_timestep is None` (:442), i.e. use_prompt_adaln_single=false
+// — which is what makes the resulting K/V cacheable across denoise steps.
+//
+// ORDER. Upstream sums the table and the timestep row FIRST and only then
+// applies `(1 + scale)` (:441-446). Folding the two additions the other way round
+// would round differently, so the sum is materialized here as upstream forms it.
 std::vector<float> ModulateContext(const float* context, const vt::Tensor& prompt_table,
-                                   int64_t rows, int64_t width) {
-  const float* shift_kv = prompt_table.Ptr<float>();
-  const float* scale_kv = prompt_table.Ptr<float>() + width;
-  std::vector<float> out(static_cast<size_t>(rows * width));
-  for (int64_t r = 0; r < rows; ++r) {
-    const float* src = context + r * width;
-    float* dst = out.data() + r * width;
-    for (int64_t c = 0; c < width; ++c) dst[c] = src[c] * (1.0f + scale_kv[c]) + shift_kv[c];
+                                   const float* prompt_mod, int64_t batch,
+                                   int64_t context_tokens, int64_t width) {
+  const float* table_shift = prompt_table.Ptr<float>();
+  const float* table_scale = prompt_table.Ptr<float>() + width;
+  std::vector<float> out(static_cast<size_t>(batch * context_tokens * width));
+  std::vector<float> shift_kv(static_cast<size_t>(width));
+  std::vector<float> scale_kv(static_cast<size_t>(width));
+  for (int64_t b = 0; b < batch; ++b) {
+    for (int64_t c = 0; c < width; ++c) {
+      shift_kv[static_cast<size_t>(c)] = table_shift[c];
+      scale_kv[static_cast<size_t>(c)] = table_scale[c];
+    }
+    if (prompt_mod != nullptr) {
+      const float* m = prompt_mod + b * 2 * width;
+      for (int64_t c = 0; c < width; ++c) {
+        shift_kv[static_cast<size_t>(c)] += m[c];
+        scale_kv[static_cast<size_t>(c)] += m[width + c];
+      }
+    }
+    for (int64_t s = 0; s < context_tokens; ++s) {
+      const int64_t r = b * context_tokens + s;
+      const float* src = context + r * width;
+      float* dst = out.data() + r * width;
+      for (int64_t c = 0; c < width; ++c) {
+        dst[c] = src[c] * (1.0f + scale_kv[static_cast<size_t>(c)]) +
+                 shift_kv[static_cast<size_t>(c)];
+      }
+    }
   }
   return out;
 }
@@ -148,7 +175,8 @@ void AddGatedBroadcast(float* x, const std::vector<float>& y, const std::vector<
 void TextCrossAttention(vt::Device device, const Ltx2DitParams& params,
                         const Ltx2AttentionWeights& attn, const vt::Tensor& sst,
                         const vt::Tensor& prompt_table, const float* modulation,
-                        const float* x_normed, const float* context, const float* context_bias,
+                        const float* prompt_modulation, const float* x_normed,
+                        const float* context, const float* context_bias,
                         int64_t batch, int64_t tokens, int64_t context_tokens, int64_t width,
                         int64_t heads, int64_t dim_head, const Ltx2CrossKv* kv_in,
                         Ltx2CrossKv* kv_out, float* x) {
@@ -174,7 +202,8 @@ void TextCrossAttention(vt::Device device, const Ltx2DitParams& params,
   // The modulated context is only needed when the K/V are actually recomputed.
   std::vector<float> encoder;
   if (kv_in == nullptr) {
-    encoder = ModulateContext(context, prompt_table, batch * context_tokens, width);
+    encoder = ModulateContext(context, prompt_table, prompt_modulation, batch, context_tokens,
+                              width);
   }
 
   Ltx2AttentionArgs a;
@@ -250,7 +279,8 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
     PostSelfAttention(video_x, msa.data(), gate, batch * tv, dim, eps, &vx_normed);
 
     TextCrossAttention(device, params, w.attn2, w.scale_shift_table, w.prompt_scale_shift_table,
-                       args.video_timestep_modulation, vx_normed.data(), args.video_context,
+                       args.video_timestep_modulation, args.video_prompt_modulation,
+                       vx_normed.data(), args.video_context,
                        args.video_context_bias, batch, tv, args.video_context_tokens, dim,
                        params.num_attention_heads, params.attention_head_dim,
                        args.prompt_kv_filled ? args.video_prompt_kv : nullptr,
@@ -287,6 +317,7 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
 
     TextCrossAttention(device, params, w.audio_attn2, w.audio_scale_shift_table,
                        w.audio_prompt_scale_shift_table, args.audio_timestep_modulation,
+                       args.audio_prompt_modulation,
                        ax_normed.data(), args.audio_context, args.audio_context_bias, batch, ta,
                        args.audio_context_tokens, adim, params.audio_num_attention_heads,
                        params.audio_attention_head_dim,
@@ -432,6 +463,7 @@ struct PreparedStream {
   Ltx2FreqsCis cross_pe;
   std::vector<float> cross_scale_shift;  // [batch, tokens, 4 * width]
   std::vector<float> cross_gate;         // [batch, 1, width]
+  std::vector<float> prompt_modulation;  // [batch, 1, 2 * width], empty when the flag is off
 };
 
 // _prepare_timestep (transformer_args.py:173-186) + AdaLayerNormSingle.
@@ -451,6 +483,7 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
                              const Ltx2AdaLayerNormSingleWeights& adaln,
                              const Ltx2AdaLayerNormSingleWeights& cross_scale_shift_adaln,
                              const Ltx2AdaLayerNormSingleWeights& cross_gate_adaln,
+                             const Ltx2AdaLayerNormSingleWeights* prompt_adaln,
                              const Ltx2ModalityInput& m, int64_t width, int64_t in_channels,
                              int64_t n_pos_dims, const std::vector<int64_t>& max_pos,
                              int64_t heads, const Ltx2ModalityInput* cross) {
@@ -477,6 +510,21 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
 
   PrepareTimestep(device, adaln, m.timesteps, rows, width, params.timestep_scale_multiplier,
                   &out.modulation, &out.embedded);
+
+  // transformer_args.py:274-277 — the PROMPT-side AdaLN runs on this modality's
+  // own SIGMA, [batch], not on its per-token `timesteps`. `_prepare_timestep`
+  // applies the same timestep_scale_multiplier, and the result views to
+  // [batch, 1, 2 * width]: one row per sample, broadcast over the prompt tokens.
+  if (prompt_adaln != nullptr) {
+    VT_CHECK(m.sigma != nullptr,
+             "ltx2: use_prompt_adaln_single=true needs this modality's sigma "
+             "(transformer_args.py:274-277); it drives the prompt-side AdaLN MLP whose output is "
+             "added to the cross-attention K/V modulation, and a missing sigma would silently "
+             "fall back to the static table");
+    std::vector<float> unused;
+    PrepareTimestep(device, *prompt_adaln, m.sigma, m.batch, width,
+                    params.timestep_scale_multiplier, &out.prompt_modulation, &unused);
+  }
 
   if (m.context_mask != nullptr) {
     out.context_bias = Ltx2PrepareContextMask(m.context_mask, m.batch, m.context_tokens);
@@ -675,19 +723,25 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
              "timestep term and caching them would be wrong");
   }
 
+  // model.py:222-226 / :252-256 — the module exists only when BOTH flags hold, and
+  // `prompt_adaln=getattr(self, "prompt_adaln_single", None)` (:313, :333) is how
+  // upstream turns its absence into `prompt_timestep is None`.
+  const bool prompt_adaln = params.cross_attention_adaln && params.use_prompt_adaln_single;
   const bool have_both = video != nullptr && audio != nullptr;
   PreparedStream vs, as;
   if (video != nullptr) {
     VT_CHECK(video->context_tokens == 0 || video->context != nullptr,
              "ltx2: the video stream needs a context when context_tokens > 0");
     vs = PrepareStream(device, params, weights.patchify_proj, weights.adaln_single,
-                       weights.av_ca_video_scale_shift, weights.av_ca_a2v_gate, *video, dim,
+                       weights.av_ca_video_scale_shift, weights.av_ca_a2v_gate,
+                       prompt_adaln ? &weights.prompt_adaln_single : nullptr, *video, dim,
                        params.in_channels, 3, params.positional_embedding_max_pos,
                        params.num_attention_heads, have_both ? audio : nullptr);
   }
   if (audio != nullptr) {
     as = PrepareStream(device, params, weights.audio_patchify_proj, weights.audio_adaln_single,
-                       weights.av_ca_audio_scale_shift, weights.av_ca_v2a_gate, *audio, adim,
+                       weights.av_ca_audio_scale_shift, weights.av_ca_v2a_gate,
+                       prompt_adaln ? &weights.audio_prompt_adaln_single : nullptr, *audio, adim,
                        params.audio_in_channels, 1, params.audio_positional_embedding_max_pos,
                        params.audio_num_attention_heads, have_both ? video : nullptr);
   }
@@ -719,6 +773,10 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
     a.audio_enabled = audio != nullptr && audio->enabled;
     a.video_timestep_modulation = vs.modulation.empty() ? nullptr : vs.modulation.data();
     a.audio_timestep_modulation = as.modulation.empty() ? nullptr : as.modulation.data();
+    a.video_prompt_modulation =
+        vs.prompt_modulation.empty() ? nullptr : vs.prompt_modulation.data();
+    a.audio_prompt_modulation =
+        as.prompt_modulation.empty() ? nullptr : as.prompt_modulation.data();
     a.video_cross_scale_shift = vs.cross_scale_shift.empty() ? nullptr : vs.cross_scale_shift.data();
     a.video_cross_gate = vs.cross_gate.empty() ? nullptr : vs.cross_gate.data();
     a.audio_cross_scale_shift = as.cross_scale_shift.empty() ? nullptr : as.cross_scale_shift.data();

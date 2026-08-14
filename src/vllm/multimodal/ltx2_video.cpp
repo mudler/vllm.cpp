@@ -34,6 +34,7 @@
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vllm/platforms/interface.h"  // CurrentPlatform() — which accelerator, if any
 #include "vllm/tokenizer/tokenizer.h"
 
 namespace vllm::multimodal {
@@ -418,9 +419,10 @@ bool DetectLtx2Video(const VideoModelParams& params) {
 
 struct Ltx2VideoEngine::Impl {
   VideoModelParams params;
-  // CPU, or the CUDA device `params.device - 1` names. Phase L8 made the second
-  // real: the DiT is staged with `Ltx2StreamDitToDevice` and driven by
-  // `Ltx2DitForwardDevice`, so a CUDA handle now denotes a CUDA forward.
+  // CPU, or the accelerator index `params.device - 1` names on whichever device
+  // type the platform seam resolves. Phase L8 made the second real: the DiT is
+  // staged with `Ltx2StreamDitToDevice` and driven by `Ltx2DitForwardDevice`, so
+  // a non-zero handle now denotes a device-resident forward.
   vt::Device device;
   // The stream dtype the DiT was staged at, and the one the forward computes in.
   // bf16 on an accelerator — upstream resolves ONE model dtype and every layer
@@ -517,24 +519,46 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
 
   // ── where this engine runs (phase L8) ─────────────────────────────────────
   //
-  // `device` is 0 for the CPU and 1 + <cuda index> for an accelerator, which is
-  // the mapping the seam already documents. Phase L7 REFUSED anything but 0,
-  // because the f32-only forward and the bf16-only staging did not meet; phase
-  // L8 is the forward that closes that, so the refusal is gone and the handle
-  // now means what it says.
+  // `device` is 0 for the CPU and 1 + <accelerator index> for an accelerator,
+  // which is the mapping the seam already documents. Phase L7 REFUSED anything
+  // but 0, because the f32-only forward and the bf16-only staging did not meet;
+  // phase L8 is the forward that closes that, so the refusal is gone and the
+  // handle now means what it says.
   //
-  // What is NOT gone is the refusal to fake it: if the CUDA backend is not
-  // registered in this build, the load is refused BY NAME rather than served the
-  // CPU forward behind a CUDA-looking handle. That substitution is exactly what
-  // would make every later timing and every "it ran on the GPU" claim false.
+  // WHICH accelerator is the PLATFORM's question, not this model file's. This
+  // asked `TryGetBackend(kCUDA)` — the same defect work row M3a repaired in
+  // `SelectQueueForModel` (src/vllm/entrypoints/model_loader.cpp:75-104 — the
+  // full path matters, there is also a src/vllm/model_executor/model_loader/
+  // DIRECTORY and the bare file name sends a reader there), where a hardcoded
+  // `GetBackend(kCUDA)` was the one line standing between a complete non-NVIDIA
+  // backend and running a model. `CurrentPlatform()` walks the probe order
+  // {kCUDA, kROCM, kXPU, kVULKAN, kMETAL, kTENSTORRENT, kCPU}
+  // (src/vllm/platforms/platform.cpp:62-64) and returns the first one REGISTERED
+  // (:91-98) — and a platform registers only where its own probe found a device,
+  // e.g. src/vllm/platforms/cuda.cpp:136-138 returns early on a box with the CUDA
+  // toolkit and no usable GPU — so on a CUDA box this resolves EXACTLY the device
+  // the hardcoded lookup did.
+  // Nothing below this line names a device either: `Ltx2StreamDitToDevice` and
+  // `Ltx2DitForwardDevice` drive `vt::Queue` and the op table, so a backend that
+  // registers those ops reaches this forward with no edit here.
+  //
+  // What is NOT gone is the refusal to fake it: if this build registers no
+  // accelerator backend, the load is refused BY NAME rather than served the CPU
+  // forward behind an accelerator-looking handle. That substitution is exactly
+  // what would make every later timing and every "it ran on the GPU" claim false.
   im.on_device = params.device != 0;
   if (im.on_device) {
-    vt::Backend* backend = vt::TryGetBackend(vt::DeviceType::kCUDA);
-    if (backend == nullptr) {
+    const vt::DeviceType accelerator =
+        vllm::platforms::CurrentPlatform().device_type();
+    if (accelerator == vt::DeviceType::kCPU ||
+        vt::TryGetBackend(accelerator) == nullptr) {
       Fail("device " + std::to_string(params.device) +
-           " asks for CUDA, but no CUDA backend is registered in this build. The LTX-2.5 "
-           "device-resident forward is present (Ltx2DitForwardDevice); what is missing is "
-           "the backend. Refusing rather than running the CPU forward behind a CUDA handle.");
+           " asks for an accelerator, but no accelerator backend is registered in this "
+           "build (the platform seam resolves to '" +
+           std::string(vt::DeviceTypeName(accelerator)) +
+           "'). The LTX-2.5 device-resident forward is present (Ltx2DitForwardDevice); "
+           "what is missing is the backend. Refusing rather than running the CPU forward "
+           "behind an accelerator handle.");
     }
     // `vt::CreateQueue(Device)`, NOT `Backend::CreateQueue()`. backend.h:212-217
     // records the method as a "temporary index-0 migration shim" and says new
@@ -546,9 +570,10 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     // has one GPU so it cannot be reached there, which is exactly why it has to
     // be right before a second device exists.
     const int32_t index = static_cast<int32_t>(params.device - 1);
-    im.device = vt::Device{vt::DeviceType::kCUDA, index};
+    im.device = vt::Device{accelerator, index};
     if (vt::TryGetBackend(im.device) == nullptr) {
-      Fail("device " + std::to_string(params.device) + " names CUDA device index " +
+      Fail("device " + std::to_string(params.device) + " names " +
+           std::string(vt::DeviceTypeName(accelerator)) + " device index " +
            std::to_string(index) +
            ", and no backend is registered for it. Refusing rather than creating a queue "
            "on device 0 and labelling it with an index nothing runs on.");

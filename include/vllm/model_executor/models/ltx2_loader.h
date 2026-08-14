@@ -98,27 +98,38 @@
 // holds both copies at once, which is what wedged the box during MiniMax-H3's
 // port (minimax_h3.h:1598-1606). Same shape, same reason.
 //
-// ─── WHAT THE SHIPPED DiT CARRIES THAT PHASE L2 DOES NOT PORT ────────────────
+// ─── WHAT THE SHIPPED DiT CARRIES THAT THIS PORT DOES NOT CARRY ──────────────
 //
 // MEASURED 2026-08-12 from the FP8 checkpoint's own header, and reported rather
-// than absorbed. The file carries four families outside the L2 contract, and
-// they fall into TWO groups that this comment used to conflate — corrected
-// 2026-08-13, because the conflation is what made a downstream refusal state
-// something untrue about the tree for a whole phase.
+// than absorbed. The file carries four families outside the ORIGINAL L2 contract,
+// and they fall into THREE groups. Two of them this comment once conflated
+// (corrected 2026-08-13, because the conflation made a downstream refusal state
+// something untrue about the tree for a whole phase); the third is a family that
+// has since been ported.
 //
 // UNPORTED. `Ltx2LoadDitFromSafetensors` REFUSES the load by naming these, and
 // only an explicit `allow_unported_modules` — which exists so the ported subset
 // stays gateable — proceeds, still reporting every one of them in `unported`:
 //
-//   prompt_adaln_single.*, audio_prompt_adaln_single.*
-//       Upstream builds these only when `cross_attention_adaln AND
-//       use_prompt_adaln_single` (model.py:222-226, :253-257). Their presence
-//       means the shipped LTX-2.5 sets `use_prompt_adaln_single = TRUE`, which
-//       contradicts .agents/specs/ltx-2-5.md §1.2 and ltx2.h:115-117 — and with
-//       it the prompt-K/V "free win", whose whole premise is that the prompt
-//       modulation carries no timestep term.
 //   keyframes_abs_pos_embedding  [1, 4096]
 //       So `use_keyframes_abs_pos_embedding = TRUE`, contradicting ltx2.h:47-49.
+//       This is now the ONLY flag `Ltx2AdoptDeclaredDitParams` clears in its
+//       config copy, and it must stay that way: a flag cleared there is invisible
+//       to the contract-equality check, so clearing a PORTED one silently drops
+//       its tensors.
+//
+// PORTED 2026-08-13 — no longer named in that refusal:
+//
+//   prompt_adaln_single.*, audio_prompt_adaln_single.*
+//       Upstream builds these exactly when `cross_attention_adaln AND
+//       use_prompt_adaln_single` (model.py:222-226, :252-256), and the flag
+//       defaults TRUE in every reference (model.py:77,
+//       model_configurator.py:76/:138, diffusers transformer_ltx2.py:1185). Their
+//       presence means the shipped LTX-2.5 sets it TRUE — which is what
+//       .agents/specs/ltx-2-5.md §1.2 established and what row LTX25-PROMPT-ADALN
+//       (.agents/specs/ltx25-prompt-adaln.md, issue #644) implemented. The
+//       prompt-K/V cache stays correct-and-inapplicable for this checkpoint, and
+//       is refused by name rather than served.
 //
 // LOADED ELSEWHERE — NOT UNPORTED, and never named in that refusal:
 //
@@ -515,10 +526,16 @@ nlohmann::json Ltx2ReadCheckpointConfig(const SafetensorsFile& file);
 // `Ltx2StreamDitToDevice` directly and therefore owes the same adoption.
 //
 // `allow_unported_modules` clears `use_keyframes_abs_pos_embedding` IN A COPY of
-// the config before parsing, mirroring what the loader does for
-// `use_prompt_adaln_single`: the flag is cleared for the CONTRACT, the module
+// the config before parsing: the flag is cleared for the CONTRACT, the module
 // stays unported, and the checkpoint's `unported` list still names it. Without
 // the opt-in `ParseLtx2DitParams` throws, which is the refusal.
+//
+// IT CLEARS EXACTLY THAT ONE FLAG, and the scoping is the rule, not an accident.
+// It also used to clear `use_prompt_adaln_single`, whose module has been ported
+// since 2026-08-13 — so the opt-in a real render REQUIRES was silently turning a
+// correctness setting off, and the contract-equality check below could not see it
+// because both sides had been forced to the same cleared value. A ported module's
+// flag belongs in the contract; only a module nothing applies may be cleared here.
 //
 // `source` names the config in every refusal, so a reader knows whether the
 // checkpoint declared it or a caller supplied it.

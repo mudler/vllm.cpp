@@ -458,6 +458,10 @@ struct BlockArgsDev {
   bool video_enabled = true, audio_enabled = true;
   const Tensor* video_timestep_modulation = nullptr;
   const Tensor* audio_timestep_modulation = nullptr;
+  // The prompt-side AdaLN modulation, [batch, 2 * width] — nullptr is upstream's
+  // `prompt_timestep is None` (transformer.py:442), i.e. the flag is off.
+  const Tensor* video_prompt_modulation = nullptr;
+  const Tensor* audio_prompt_modulation = nullptr;
   const Tensor* video_cross_scale_shift = nullptr;
   const Tensor* video_cross_gate = nullptr;
   const Tensor* audio_cross_scale_shift = nullptr;
@@ -480,6 +484,7 @@ struct BlockArgsDev {
 // device twin of ltx2_dit.cpp's TextCrossAttention.
 void TextCrossAttentionDev(Ctx& c, const Ltx2AttentionWeights& attn, const Tensor& sst,
                            const Tensor& prompt_table, const Tensor& modulation,
+                           const Tensor* prompt_modulation,
                            const Tensor& x_normed, const Tensor& context,
                            const Tensor* context_bias, int64_t batch, int64_t tokens,
                            int64_t context_tokens, int64_t width, int64_t heads,
@@ -501,18 +506,44 @@ void TextCrossAttentionDev(Ctx& c, const Ltx2AttentionWeights& attn, const Tenso
                 c.s, c.s);
 
   // apply_cross_attention_adaln (transformer.py:420-447): the STATIC [2, dim]
-  // per-block table, with no timestep term at all when use_prompt_adaln_single is
-  // false (:441-443). `src_row_stride = 0` is that broadcast, and the table is
-  // read at F32 while the stream stays at c.s — which is the whole reason
-  // `modulate` carries a separate src_dtype.
+  // per-block table (:441), plus the prompt-side AdaLN row when the flag is on
+  // (:442-443).
   VT_CHECK(prompt_table.dtype == DType::kF32,
            "ltx2 device: the prompt scale-shift table is F32 in the checkpoint and is read as "
            "F32 here; a narrowed table would be the dtype rule applied backwards");
   DBuf encoder(c.d, c.s, {batch * context_tokens, width});
   c.d.b.Copy(c.d.q, encoder.ptr(), context.data, encoder.bytes());
-  auto* table = prompt_table.Ptr<float>();
-  c.k->modulate(c.d.q, encoder.t().data, table + width, table, batch * context_tokens, width, 0,
-                c.s, DType::kF32);
+  if (prompt_modulation == nullptr) {
+    // No timestep term at all. `src_row_stride = 0` is the broadcast of the
+    // table's single row over every token, and the table is read at F32 while the
+    // stream stays at c.s — which is the whole reason `modulate` carries a
+    // separate src_dtype.
+    auto* table = prompt_table.Ptr<float>();
+    c.k->modulate(c.d.q, encoder.t().data, table + width, table, batch * context_tokens, width, 0,
+                  c.s, DType::kF32);
+  } else {
+    // `kv_modulation = table[None, None] + prompt_timestep.reshape(B, 1, 2, -1)`
+    // (:441-443) is EXACTLY `ada_value`'s `table[row] + modulation[r, row]` over
+    // a 2-parameter modulation with one row per BATCH element, so the sum is
+    // formed here the way every other table+modulation sum in this file is —
+    // before `(1 + scale)` applies, which is the order upstream rounds in.
+    DBuf shift_kv = AdaValueDev(c, prompt_table, *prompt_modulation, batch, width,
+                                /*num_params=*/2, /*index=*/0);
+    DBuf scale_kv = AdaValueDev(c, prompt_table, *prompt_modulation, batch, width,
+                                /*num_params=*/2, /*index=*/1);
+    // `modulate`'s `src_row_stride` is a single stride, so it can broadcast ONE
+    // row over every token (stride 0) or give every row its own (stride width) —
+    // but not "row b for this batch element's context_tokens rows". The batch
+    // loop supplies that offset rather than widening the kernel's contract for a
+    // dimension that is 1 or 2 in every shipped call.
+    const int64_t elem = static_cast<int64_t>(vt::SizeOf(c.s));
+    for (int64_t b = 0; b < batch; ++b) {
+      void* dst = static_cast<uint8_t*>(encoder.ptr()) + b * context_tokens * width * elem;
+      const void* sc = static_cast<const uint8_t*>(scale_kv.t().data) + b * width * elem;
+      const void* sh = static_cast<const uint8_t*>(shift_kv.t().data) + b * width * elem;
+      c.k->modulate(c.d.q, dst, sc, sh, context_tokens, width, 0, c.s, c.s);
+    }
+  }
 
   AttnArgsDev a;
   a.batch = batch;
@@ -575,7 +606,8 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
     RmsNormNoWeight(c, vx_normed->t(), *video_x, rows, dim);
 
     TextCrossAttentionDev(c, w.attn2, w.scale_shift_table, w.prompt_scale_shift_table,
-                          *args.video_timestep_modulation, vx_normed->t(), *args.video_context,
+                          *args.video_timestep_modulation, args.video_prompt_modulation,
+                          vx_normed->t(), *args.video_context,
                           args.video_context_bias, batch, tv, args.video_context_tokens, dim,
                           c.p->num_attention_heads, c.p->attention_head_dim, *video_x);
   }
@@ -609,6 +641,7 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
 
     TextCrossAttentionDev(c, w.audio_attn2, w.audio_scale_shift_table,
                           w.audio_prompt_scale_shift_table, *args.audio_timestep_modulation,
+                          args.audio_prompt_modulation,
                           ax_normed->t(), *args.audio_context, args.audio_context_bias, batch, ta,
                           args.audio_context_tokens, adim, c.p->audio_num_attention_heads,
                           c.p->audio_attention_head_dim, *audio_x);
@@ -740,6 +773,8 @@ struct PreparedStreamDev {
   DevFreqs pe, cross_pe;
   std::optional<DBuf> cross_scale_shift;
   std::optional<DBuf> cross_gate;
+  // [batch, 2 * width] — empty when use_prompt_adaln_single is false.
+  std::optional<DBuf> prompt_modulation;
 };
 
 // _prepare_timestep (transformer_args.py:173-186) + AdaLayerNormSingle.
@@ -757,6 +792,7 @@ PreparedStreamDev PrepareStreamDev(Ctx& c, const Ltx2LinearWeight& patchify,
                                    const Ltx2AdaLayerNormSingleWeights& adaln,
                                    const Ltx2AdaLayerNormSingleWeights& cross_scale_shift_adaln,
                                    const Ltx2AdaLayerNormSingleWeights& cross_gate_adaln,
+                                   const Ltx2AdaLayerNormSingleWeights* prompt_adaln,
                                    const Ltx2ModalityInput& m, int64_t width, int64_t in_channels,
                                    int64_t n_pos_dims, const std::vector<int64_t>& max_pos,
                                    int64_t heads, const Ltx2ModalityInput* cross,
@@ -773,6 +809,19 @@ PreparedStreamDev PrepareStreamDev(Ctx& c, const Ltx2LinearWeight& patchify,
       PrepareTimestepDev(c, adaln, m.timesteps, rows, width, c.p->timestep_scale_multiplier);
   out.modulation = std::move(ada.modulation);
   out.embedded = std::move(ada.embedded);
+
+  // transformer_args.py:274-277 — the PROMPT-side AdaLN runs on this modality's
+  // own SIGMA, [batch], not on its per-token `timesteps`.
+  if (prompt_adaln != nullptr) {
+    VT_CHECK(m.sigma != nullptr,
+             "ltx2: use_prompt_adaln_single=true needs this modality's sigma "
+             "(transformer_args.py:274-277); it drives the prompt-side AdaLN MLP whose output is "
+             "added to the cross-attention K/V modulation, and a missing sigma would silently "
+             "fall back to the static table");
+    AdalnOutDev prompt = PrepareTimestepDev(c, *prompt_adaln, m.sigma, m.batch, width,
+                                            c.p->timestep_scale_multiplier);
+    out.prompt_modulation = std::move(prompt.modulation);
+  }
 
   if (m.context != nullptr && m.context_tokens > 0) {
     out.context = UploadStream(c.d, c.s, m.context, {m.batch * m.context_tokens, context_dim});
@@ -892,6 +941,10 @@ void CheckWeightsResident(const Ltx2DitWeights& w, vt::Device dev) {
   CheckLinearResident(w.audio_proj_out, dev, "audio_proj_out");
   CheckAdalnResident(w.adaln_single, dev, "adaln_single");
   CheckAdalnResident(w.audio_adaln_single, dev, "audio_adaln_single");
+  // Bound only when use_prompt_adaln_single is on; `CheckResident` no-ops on an
+  // unbound view, so this needs no flag and cannot go stale against one.
+  CheckAdalnResident(w.prompt_adaln_single, dev, "prompt_adaln_single");
+  CheckAdalnResident(w.audio_prompt_adaln_single, dev, "audio_prompt_adaln_single");
   CheckAdalnResident(w.av_ca_video_scale_shift, dev, "av_ca_video_scale_shift");
   CheckAdalnResident(w.av_ca_audio_scale_shift, dev, "av_ca_audio_scale_shift");
   CheckAdalnResident(w.av_ca_a2v_gate, dev, "av_ca_a2v_gate");
@@ -1044,14 +1097,18 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
   OnesCache ones(d);
   Ctx c{d, compute_dtype, Glue(d), &params, &ones};
 
+  // model.py:222-226 / :252-256 — the module exists only when BOTH flags hold.
+  const bool prompt_adaln = params.cross_attention_adaln && params.use_prompt_adaln_single;
   PreparedStreamDev vs = PrepareStreamDev(
       c, weights.patchify_proj, weights.adaln_single, weights.av_ca_video_scale_shift,
-      weights.av_ca_a2v_gate, *video, dim, params.in_channels, 3,
+      weights.av_ca_a2v_gate, prompt_adaln ? &weights.prompt_adaln_single : nullptr, *video, dim,
+      params.in_channels, 3,
       params.positional_embedding_max_pos, params.num_attention_heads, audio,
       params.cross_attention_dim);
   PreparedStreamDev as = PrepareStreamDev(
       c, weights.audio_patchify_proj, weights.audio_adaln_single, weights.av_ca_audio_scale_shift,
-      weights.av_ca_v2a_gate, *audio, adim, params.audio_in_channels, 1,
+      weights.av_ca_v2a_gate, prompt_adaln ? &weights.audio_prompt_adaln_single : nullptr, *audio,
+      adim, params.audio_in_channels, 1,
       params.audio_positional_embedding_max_pos, params.audio_num_attention_heads, video,
       params.audio_cross_attention_dim);
 
@@ -1066,6 +1123,8 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
     a.audio_enabled = audio->enabled;
     a.video_timestep_modulation = &vs.modulation->t();
     a.audio_timestep_modulation = &as.modulation->t();
+    a.video_prompt_modulation = vs.prompt_modulation ? &vs.prompt_modulation->t() : nullptr;
+    a.audio_prompt_modulation = as.prompt_modulation ? &as.prompt_modulation->t() : nullptr;
     a.video_cross_scale_shift = vs.cross_scale_shift ? &vs.cross_scale_shift->t() : nullptr;
     a.video_cross_gate = vs.cross_gate ? &vs.cross_gate->t() : nullptr;
     a.audio_cross_scale_shift = as.cross_scale_shift ? &as.cross_scale_shift->t() : nullptr;

@@ -248,7 +248,14 @@ inline vllm::Ltx2DitParams ReducedDitParams() {
   p.use_middle_indices_grid = true;
   p.apply_gated_attention = true;   // every LTX-2.5 attention is gated
   p.cross_attention_adaln = true;   // the shipped config sets it
-  p.use_prompt_adaln_single = false;
+  // TRUE, exactly as both shipped DiTs resolve it: the FP8 file carries no
+  // config at all and the NVFP4 file's config OMITS the key, so upstream's
+  // default (model.py:77, model_configurator.py:76) decides — and both files
+  // carry `prompt_adaln_single`'s tensors. `ReducedDitTransformerConfig` below
+  // likewise omits the key, so this fixture reproduces the shipped shape rather
+  // than a configuration nothing ships, and the whole video engine renders
+  // through the prompt-side AdaLN path (.agents/specs/ltx25-prompt-adaln.md).
+  p.use_prompt_adaln_single = true;
   p.ff_bias = false;                // LTX-2.5 (gemma4) sets ff_bias=false
   p.audio_ff_bias = true;
   return p;

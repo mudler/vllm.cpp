@@ -170,11 +170,20 @@ inline constexpr char kLtx2ModelVersionExtra[] = "model_version";
 // belonging to another checkpoint is refused rather than bound.
 inline constexpr char kLtx2DitConfigPathExtra[] = "dit_config_path";
 
-// Proceed past the module families the L2 contract does not carry —
-// `prompt_adaln_single` / `audio_prompt_adaln_single` and
+// Proceed past the module families this port does not carry —
 // `keyframes_abs_pos_embedding` (ltx2_loader.h). "1" opts in; anything else
-// leaves the loader's refusal in place. The shipped DiTs all carry at least one
-// of them, so this is the flag that says "gate the ported subset knowingly".
+// leaves the loader's refusal in place. The shipped DiTs carry it, so this is the
+// flag that says "gate the ported subset knowingly".
+//
+// IT MUST NEVER DISABLE A PORTED FEATURE, and until 2026-08-13 it did:
+// `prompt_adaln_single` / `audio_prompt_adaln_single` were on this list, and
+// setting the extra reached three loader assignments that cleared
+// `use_prompt_adaln_single`, so every real render dropped the timestep half of
+// the prompt K/V modulation — finite, same-shaped, and invisible to every gate.
+// Those families are ported now (.agents/specs/ltx25-prompt-adaln.md, issue
+// #644), the loader asserts the flag against the file rather than clearing it,
+// and this extra is scoped to the one module nothing applies. Adding a family
+// here only ever means "the forward genuinely has no code for this".
 //
 // The two `*_embeddings_connector` families are NOT in that set and this extra
 // has nothing to do with them: they are outside the DiT contract by design and

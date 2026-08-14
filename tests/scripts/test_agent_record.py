@@ -269,19 +269,69 @@ class AgentRecordMutationTests(unittest.TestCase):
         self.assertEqual(len(recipe), 1)
         self.assertEqual(recipe[0].path.name, "engine-matrix.md")
 
+    def test_omni_pin_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #633 row and its 153 -> 154 ratchet bump are one semantic change.
+
+        Same shape as the #117 and #606 assertions above, and it carries one
+        extra hazard worth pinning. This bump COLLIDED: `main` took the constant
+        152 -> 153 for `SERVE-RECIPE-ARGS` while the omni-pin branch took the
+        same 152 -> 153 for its own row, so both sides read 153 and the merge
+        looked clean. Resolving it by keeping either 153 would have dropped a
+        real row while leaving the matrix internally consistent, which is
+        exactly the state no other assertion here can see. Naming BOTH rows is
+        what makes 154 checkable rather than plausible.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+
+        for item_id in ("ENG-UPSTREAM-OMNI-PIN", "SERVE-RECIPE-ARGS"):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "engine-matrix.md", item_id)
+
+    def test_music3_and_indextts_rows_both_survive_their_collision(self) -> None:
+        """373 needs BOTH rows named, because the merge that produced it collided.
+
+        The same hazard the omni-pin assertion above records, on the MODEL pin
+        and on the same day. `main` took the constant 370 -> 372 for IndexTTS-2.5
+        (two architectures) while the Music3 branch took 370 -> 371 for its own
+        row. Neither side was wrong about its own change, and neither number was
+        373 -- so whichever side an auto-merge kept, the tree would have been
+        internally consistent while silently short a real architecture.
+
+        A count assertion alone cannot see that: it only knows the pin matches
+        the rows it can find. Naming the three rows is what makes 373 checkable
+        rather than plausible.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        collided = (
+            "MODEL-MUSIC-minimax-music3-mini-max-music3-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-s2-mel-decoder",
+        )
+        for item_id in collided:
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+
     def test_model_row_ratchet_is_load_bearing(self) -> None:
         """The MODEL row pin must catch a row appearing or vanishing.
 
         Mirrors the ENGINE ratchet above, for the same reason and with more
         force: the MODEL count is the one that actually moves, because every new
-        architecture re-pins it by hand. Muse Glimmer took it 361 -> 362; the
-        seven recipe architectures that had no row at all took it 362 -> 369
-        (#609, #610). Without this, bumping the number to silence a failure is
-        indistinguishable from bumping it because a row really landed.
-        architecture re-pins it by hand. Muse Glimmer took it 361 -> 362, and
-        LTX-2.5 took it 362 -> 363. Without
-        this, bumping the number to silence a failure is indistinguishable from
-        bumping it because a row really landed.
+        architecture re-pins it by hand. Muse Glimmer took it 361 -> 362
+        (`c8fc24a50`); the seven recipe architectures that had no row at all took
+        it 362 -> 369 (#609, #610, `eba6ab7c7`); LTX-2.5 took it 369 -> 370
+        (#435, `cefacd2d0`); IndexTTS-2.5 took it 370 -> 372, being two
+        architectures (#634); MiniMax-Music3 took it to 373 (#672). Without this,
+        bumping the number to silence a failure is indistinguishable from bumping
+        it because a row really landed.
         """
         clean: list[str] = []
         agent_record.check_matrices(clean)
@@ -303,6 +353,33 @@ class AgentRecordMutationTests(unittest.TestCase):
         ):
             agent_record.check_matrices(errors)
         require(errors, r"\d+ MODEL rows; expected \d+")
+
+    def test_indextts_rows_are_inside_the_model_ratchet(self) -> None:
+        """The #634 rows and the 370 -> 372 bump are one semantic change.
+
+        IndexTTS-2.5 is registered by vLLM-Omni as TWO architectures, a talker
+        and an S2Mel decoder, so it moves the pin by two rather than one. That
+        is the hazard worth pinning: a port described in prose as "a model" is
+        the shape that lands one row and a bump of two, and the count alone
+        cannot tell that from two rows landing. Both are named here, and both
+        are asserted `INVENTORIED` rather than `SPIKE` — they are unclaimed and
+        blocked on #633, and `SPIKE` would owe a `CLAIM-*` owner they do not
+        have.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        for item_id in (
+            "MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation",
+            "MODEL-MM-indextts2-index-tts2-s2-mel-decoder",
+        ):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+            self.assertEqual(
+                found[0].field("state").strip().strip("`"), "INVENTORIED", item_id
+            )
 
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
         """The #609/#610 rows and the 362 -> 369 bump are one semantic change.

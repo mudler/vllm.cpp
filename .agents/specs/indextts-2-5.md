@@ -1,0 +1,290 @@
+# SPEC — IndexTTS-2.5, the first audio-GENERATING lane
+
+**Rows:** `MODEL-MM-indextts2-index-tts2-talker-for-conditional-generation`,
+`MODEL-MM-indextts2-index-tts2-s2-mel-decoder`
+**Issue:** [#634](https://github.com/mudler/vllm.cpp/issues/634)
+**State:** `INVENTORIED` — scoped in this spec, unclaimed, and blocked on
+[#633](https://github.com/mudler/vllm.cpp/issues/633). `SPIKE` would owe a
+`CLAIM-*` owner these rows do not have.
+
+## Scope
+
+Port IndexTTS-2.5 — upstream-supported at
+`https://recipes.vllm.ai/IndexTeam/IndexTTS-2.5` and served by vLLM-Omni — so
+that text plus a reference clip renders 22.05 kHz speech through our own engine
+and the OpenAI-compatible speech surface.
+
+This is the project's **first audio-generating model**. Every audio path we ship
+today consumes audio (Parakeet, Voxtral, `audio_processor.cpp`); nothing
+synthesizes it, and `/v1/audio/speech` does not exist.
+
+In scope: both registered architectures, the mandatory reference-audio
+conditioning path, bf16 inference, **the `SpeechEngine` seam, the ABI entry
+points and the two OpenAI routes** (none of which exist today — see Shared seams
+and ABI), and the gates below. Out of scope: quantized arms (see Risks/decisions), streaming
+(`async_chunk=false` upstream, disabled for correctness), and any language whose
+support cannot be confirmed against the shipped config.
+
+## Upstream chain
+
+`vllm-project/vllm-omni` registers **two** architectures for this model, at
+`vllm_omni/model_executor/models/registry.py` @
+`bbe6ccc512a404a2df8c977ea29003002f2683e8` (the same commit the Moss-TTS rows
+anchor to):
+
+| Registry key | Module | Class |
+|---|---|---|
+| `IndexTTS2TalkerForConditionalGeneration` | `indextts2/indextts2_talker.py` | `IndexTTS2TalkerForConditionalGeneration` |
+| `IndexTTS2S2MelDecoder` | `indextts2/indextts2_s2mel_decoder.py` | `IndexTTS2S2MelDecoder` |
+
+Deploy config `vllm_omni/deploy/indextts2_5.yaml`, selected by `model_type`.
+Offline entry point `vllm_omni.model_executor.models.indextts2.end2end`. Serving
+is `vllm-omni serve IndexTeam/IndexTTS-2.5 --omni --trust-remote-code`, exposing
+`/v1/audio/speech` and `/v1/audio/voices`.
+
+**Pipeline.** Stage 0 is a ~0.8B GPT-2 AR talker turning text + reference audio
+into mel codes. Stage 1 is EnhancedCodec (2.5 replaces IndexTTS-2's RepCodec, and
+sets `use_gpt_latent=false`), then an S2Mel CFM/DiT flow-matching decoder, then
+BigVGAN, emitting 22.05 kHz mono. About 6 GB VRAM — it fits GB10 with enormous
+headroom.
+
+**Reference audio is mandatory.** Upstream states IndexTTS-2 does not support
+text-only synthesis, so the voice-cloning encoders (w2v-bert-2.0, MaskGCT
+semantic codec, CAMPPlus speaker embedding) are required port surface, not an
+optional extra. They fetch into `checkpoints/hf_cache/` on first run and need
+revisions pinned under the NAS checkpoint policy.
+
+## Our baseline
+
+Nothing named IndexTTS exists in the tree. What exists and is reusable:
+
+| Piece | Where | Note |
+|---|---|---|
+| BigVGAN 1-D core (Conv1d, ConvTranspose1d, replicate/zero pad, Snake/SnakeBeta, alias-free `Activation1d`) | published from `include/vllm/model_executor/models/minimax_h3.h`, gated by BOTH the H3 and LTX-2.5 suites | **already shared across two consumers.** LTX-2.5 (#435, merged) deliberately did NOT copy it: `ltx2_audio_vae.cpp:223-230` records that a second copy of the alias-free trim geometry "goes wrong quietly, because each copy keeps its own green gate while the two audio VAEs drift apart". IndexTTS-2.5 would be the THIRD consumer |
+| WAV serialization | `minimax_h3_wav.cpp` | channel-major → interleaved, clamped |
+| Flow-matching denoise loop, AdaLN/timestep machinery | the H3 lane | S2Mel is the same shape of computation |
+| Conformer encoder | `parakeet_encoder.cpp` | w2v-bert-2.0 is a Conformer |
+| Mel front end | `whisper_audio.cpp`, plus LTX-2.5's own (`ltx2_audio_vae_encoder.h`, #641) | two exist; which one w2v-bert-2.0 needs is a W3 question, not an assumption |
+| Generation serving seam | `vllm::multimodal::VideoEngine` (abstract, checkpoint-detected; H3 and LTX-2.5 both behind it since #641) | the template for a speech engine seam, and the precedent that a second generative lane extends the seam rather than forking it |
+| GPT-2-family backbone | `opt.cpp` | learned absolute positions + LayerNorm; the talker is an additive delta, not a fresh transformer |
+
+New from scratch: EnhancedCodec, S2Mel, and the three reference encoders.
+
+## Port map
+
+| Stage | Upstream | Ours | Kind |
+|---|---|---|---|
+| AR talker | `indextts2_talker.py` | additive GPT-2 arch routed through `ModelRegistry::Forward` + `dense_attn::AttnBlock` + on-device sampling | new, small |
+| Reference encoders | aux checkpoints under `hf_cache/` | partial reuse of `parakeet_encoder.cpp` / `whisper_audio.cpp` | new, largest |
+| EnhancedCodec | `indextts2/` | — | new |
+| S2Mel CFM/DiT | `indextts2_s2mel_decoder.py` | H3 denoise loop | reuse |
+| BigVGAN | — | the shared 1-D core published from `minimax_h3.h`, relocated to a neutral home (W1) | reuse, third consumer |
+| WAV 22.05 kHz | — | `minimax_h3_wav.cpp` | reuse |
+| `/v1/audio/speech`, `/v1/audio/voices` | `vllm_omni/entrypoints/openai/` | a `SpeechEngine` seam + ABI v19 + two additive routes; see Shared seams and ABI | new |
+
+Examples and servers stay ABI clients; no internal headers.
+
+## Shared seams and ABI
+
+A capability that is not reachable through the shared surface is not done, so
+this is scope, not follow-up.
+
+**Verified state today: nothing is wired.** `include/vllm.h` is at
+`VLLM_ABI_VERSION 18` and contains no speech or TTS entry point of any kind.
+`ApiServer` registers `/v1/chat/completions`, `/v1/completions`,
+`/v1/embeddings`, `/v1/models`, `/v1/audio/transcriptions`, `/v1/videos` and
+`/v1/videos/sync`. `audio/speech` and `audio/voices` have zero hits across
+`src/`, `include/` and `examples/`. Every audio route we serve today consumes
+audio; none produces it.
+
+**The precedent to mirror is the video lane**, which solved the same problem for
+a generative modality: an abstract `vllm::multimodal::VideoEngine`
+(`include/vllm/multimodal/video_engine.h:135`) with checkpoint detection, the
+whole assembly library-owned behind ABI entry points (`vllm_video_engine_load`,
+`vllm_video_generate`, `vllm_video_result_free`, `vllm_video_params_default`,
+`vllm_video_engine_family`, and the mux argv pair), `/v1/videos` routing through
+that same seam, and `minimax_h3_gen` reduced to a thin `vllm.h` client. H3 and
+LTX-2.5 both sit behind it, which is the proof the shape holds for a second lane.
+
+**What this lane adds**, mirroring that structure rather than inventing one:
+
+| Piece | Shape |
+|---|---|
+| `vllm::multimodal::SpeechEngine` | abstract seam, checkpoint-detected, in `include/vllm/multimodal/speech_engine.h`; IndexTTS-2.5 is its first implementation and must not be its only possible one, since the omni TTS family is ~10 more architectures |
+| ABI v19 | `vllm_speech_engine_load` / `_free` / `_family`, `vllm_synthesize` (naming symmetric with the existing `vllm_transcribe`), `vllm_speech_params` / `_default`, `vllm_speech_result` / `_free`, and a voice-enumeration pair for the voices route |
+| `/v1/audio/speech` | additive route on `ApiServer`, routing through the SAME seam, in OpenAI's wire shape; the reference clip arrives per-request because upstream has no text-only synthesis |
+| `/v1/audio/voices` | enumerates registered reference voices; upstream exposes it alongside speech |
+| `examples/` | a thin `vllm.h` client only. No internal headers, per the ABI-clients rule |
+
+The ABI bump is a real version increment with the `test_capi` section that goes
+with it, not a header edit: the video lane's v12 bump is the template.
+
+**Refusal is part of the surface.** Asking a non-TTS checkpoint to synthesize, or
+asking for a quant arm that is not implemented, refuses at load naming the
+missing piece. An arm that is silently absent is the failure this project has
+already recorded; an arm that refuses by name is owed debt.
+
+## Tests to port
+
+Upstream's modules are Python and the checkpoint carries its own remote code
+under `--trust-remote-code`, which a pure-C++ engine cannot execute. So the
+oracle is upstream's modules executed offline and frozen, exactly the
+`scripts/gen-minimax-h3-goldens.py` pattern — a `scripts/gen-indextts2-5-goldens.py`
+that imports them by file path, with both sides rebuilding weights and inputs
+from an identical deterministic stream so no checkpoint byte is committed.
+
+| Golden | Stage |
+|---|---|
+| talker logits + emitted mel codes at fixed seed | Stage 0 |
+| reference-encoder embeddings (w2v-bert-2.0, MaskGCT, CAMPPlus) | conditioning |
+| EnhancedCodec round trip | Stage 1 |
+| S2Mel mel output at supplied noise | Stage 1 |
+| BigVGAN waveform | vocoder |
+| full render, fixed seed / c1 / fixed batch composition | e2e |
+
+Noise is **supplied**, never sampled, wherever a stage is stochastic — the
+comparison must isolate the computation from the RNG, as the H3
+condition-noise gate does.
+
+## Gates
+
+**Binding: per-stage numerics vs the checkpoint's own remote code**, at the
+tolerances the H3 lane already achieves (that port landed 1.6e-7 worst case on
+the DiT forward and 4.2e-9 on BigVGAN), plus **token-exact mel codes** out of the
+AR talker at fixed seed.
+
+Gate conditions are pinned by upstream's own statement that a seed controls both
+AR sampling and per-request CFM noise, and that differing concurrent batch
+composition does not guarantee a bit-identical waveform: **fixed seed, c1, fixed
+batch composition**. A token-exact e2e waveform gate is therefore not available
+and is not claimed.
+
+**Additional ratchet: e2e perceptual.** ASR round-trip through our own Parakeet
+(WER against the input text) plus a speaker-similarity band against the reference
+clip. This bounds **max relative error from both sides with a measured band**. It
+is explicitly NOT a correlation gate — Pearson is scale-invariant and cannot see
+a scale error — and NOT a count-based tolerance, which bounds nothing.
+
+**Memory format is checked against the oracle explicitly.** A token gate cannot
+see a dtype that is too wide: it stays numerically correct while moving twice the
+bytes. Every f32 on this path owes a one-line reason.
+
+**Speed axes:** RTF (audio seconds per wall second), TTFB, peak VRAM/RSS,
+startup. Denominator is vLLM-Omni's production configuration, bf16 both sides,
+never `--enforce-eager`.
+
+## Dependencies
+
+- **[#633](https://github.com/mudler/vllm.cpp/issues/633) — hard blocker.** The
+  oracle is registered at [`.agents/oracles/vllm-omni.md`](../oracles/vllm-omni.md)
+  (#650) and that file states the position exactly: `pin = UNPINNED`,
+  `gateable = no`, `evidence = #633`. vllm-omni additionally requires vLLM 0.27.0+
+  against our 0.26.0.dev0 parity pin. Until it is pinned there is no oracle this
+  row can be gated against, and it does not advance past `INVENTORIED`.
+- Checkpoint access for `IndexTeam/IndexTTS-2.5` plus the three auxiliary
+  encoders, at pinned revisions on the NAS.
+- W1 touches a header two shipped lanes already depend on, so it coordinates with both H3 and LTX-2.5 (#435, merged).
+
+## Measured component inventory
+
+Taken from the reference implementation itself (`github.com/index-tts/index-tts`,
+cloned 2026-08-13), not estimated. This is what W3-W5 actually contain, and it is
+the reason this lane is a campaign rather than a change.
+
+| Reference component | Python LOC | Ours |
+|---|---:|---|
+| `indextts/gpt` (UnifiedVoice talker) | 17,171 | backbone DONE (W2); the talker head, conditioning and generate loop remain |
+| `indextts/s2mel` (CFM/DiT + length regulator + CAMPPlus) | 15,011 | not started |
+| `indextts/utils` | 18,265 | not started; much is training-only and will not be ported |
+| `indextts/codec` (EnhancedCodec) | 1,930 | not started |
+| `indextts/BigVGAN` | 3,740 | 1-D core DONE (W1), shared with H3 and LTX-2.5 |
+| `indextts/vqvae` | 395 | not started |
+| `Wav2Vec2BertModel` (HF transformers) | external | not started; a Conformer, so `parakeet_encoder.cpp` is partial reuse |
+
+**The pipeline order, read from `infer_v2_5.py`** (`infer_generator`, lines
+569-660), which supersedes the recipe page's prose:
+
+1. `SeamlessM4TFeatureExtractor` -> features from the 16 kHz reference clip
+2. `Wav2Vec2BertModel` (`semantic_model`) -> `vq_emb`
+3. `EnhancedCodec.quantize` -> `semantic_code`, `feat`
+4. `CAMPPlus` -> a 192-d global style vector from `feat`
+5. `s2mel.models['length_regulator']` -> `prompt_condition`
+6. `UnifiedVoice` (GPT-2 talker, `spk_cond_mode="campplus"`) -> mel codes
+7. `s2mel` CFM/DiT -> mel, then BigVGAN -> 22.05 kHz waveform
+
+Note step 6: the talker is conditioned on the CAMPPlus style vector, so **CAMPPlus
+is upstream of the talker, not a post-hoc speaker check**. Sequencing W3 after W2
+but before W5 is therefore forced, not a preference.
+
+**CAMPPlus is not the small brick its file size suggests.** 436 lines define a
+2-D conv front end (`FCM`: Conv2d + BatchNorm2d + `BasicResBlock` x4) and an
+`xvector` stack of `TDNNLayer` + three `CAMDenseTDNNBlock`s of 12, 24 and 16
+layers, each carrying a `CAMLayer` attention, separated by `TransitLayer`s, then
+`StatsPool` and a `DenseLayer`. That is 52 dense layers plus batch norms; the
+line count is small because the blocks are looped.
+
+## Work breakdown
+
+| W | Work | Depends on |
+|---|---|---|
+| W1 | Relocate the ALREADY-SHARED vocoder core out of the `minimax_h3.h` header into a neutral home, plus WAV. Smaller than it first looked: the sharing exists and is gated by two suites, so this is a rename/relocate with a live precedent, not a generalization | — |
+| W2 | GPT-2 talker backbone, additive, on the existing decode framework | — |
+| W3 | Reference-encoder path (w2v-bert-2.0, MaskGCT, CAMPPlus) | — |
+| W4 | EnhancedCodec + S2Mel CFM/DiT on the H3 denoise loop | W1 |
+| W5 | Compose the render; goldens per stage | W2-W4, #633 |
+| W6a | `SpeechEngine` seam + ABI v19 entry points + `test_capi` section | W5 |
+| W6b | `/v1/audio/speech` + `/v1/audio/voices` on `ApiServer`, routed through the seam; example as a thin ABI client | W6a |
+| W7 | Speed axes vs the omni oracle | W5, #633 |
+
+W1-W4 are gateable against frozen upstream goldens without a pin, since they
+compare against upstream modules executed offline. W5's e2e claim, W7 entirely,
+and any parity statement need #633. W6a/W6b need no oracle at all: a seam and an
+ABI are gateable against their own contract, which is why they are not deferred
+behind the pin.
+
+## Risks/decisions
+
+- **Quantization: bf16 for v1, arms refused and owed.** vLLM-Omni ships no
+  quantized IndexTTS arm, the same situation recorded for H3, and the model fits
+  GB10 unquantized. Every unimplemented quant arm refuses at load naming the
+  missing piece and is recorded as owed — never left to be discovered.
+- **We mirror vLLM-Omni, which itself deviates from IndexTeam.** Upstream's
+  Stage 0 uses plain vLLM sampling and deliberately does not reproduce the
+  official `num_beams=3` beam search. Mirroring vLLM-Omni is the rule; the
+  divergence from the reference implementation is recorded, not silently
+  inherited.
+- **Language claims disagree between upstream surfaces.** The recipe page says
+  zh/en/ja/es/ar; the vllm-omni docs say zh/en/zhen/ja/yue. Resolve against
+  `indextts2_5.yaml` before anything reaches `docs/FEATURES.md`. Shipping the
+  wrong list is a user-visible false claim.
+- **Licensing.** The checkpoint is under a custom bilibili-model-license, not
+  Apache-2.0. Check it before any fixture or golden derived from those weights
+  lands in-tree.
+- **The shared vocoder core is gated at H3's and LTX-2.5's hyperparameters, not
+  this model's.** Reuse is right, and the two existing consumers prove the seam
+  holds, but it must be re-gated at IndexTTS-2.5's own configuration against the
+  checkpoint's own remote code. A gate that passes because both arms call the
+  same helper proves consistency, not correctness.
+- **Stop** if the reference-encoder path cannot be reproduced without executing
+  checkpoint Python: that would make the mandatory conditioning path
+  un-portable, which is a scope question, not an implementation detail.
+
+## Now
+
+`INVENTORIED`, blocked on [#633](https://github.com/mudler/vllm.cpp/issues/633)
+for any parity or e2e claim.
+
+**Landed** (PR #681): W1, the shared 1-D vocoder core in `vllm::vocoder1d` with a
+structural anti-fork guard and hand-computed numerics; W2, the GPT-2 backbone
+host reference, token-exact against upstream at the parity pin and proven
+load-bearing by three mutations.
+
+**Next, in forced order:** W3 CAMPPlus (upstream of the talker, see the inventory
+above), then the w2v-bert-2.0 Conformer and EnhancedCodec, then W4 S2Mel, then W5
+compose. W6a/W6b (the `SpeechEngine` seam and ABI v19) need no oracle and can be
+taken in parallel by a second claim.
+
+**Groundwork done for whoever picks it up:** the reference implementation is
+cloned and its component sizes measured, the NAS is mounted, and
+`huggingface.co/IndexTeam/IndexTTS-2.5` resolves. What is NOT done: the ~6 GB
+checkpoint is not downloaded, and no golden generator exists past W2.

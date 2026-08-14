@@ -135,6 +135,16 @@ Ltx2DitParams ReducedParams(Ltx2RopeType rope_type, bool double_precision) {
   return p;
 }
 
+// Upstream's DEFAULT arm (model.py:77, model_configurator.py:76/:138, diffusers
+// transformer_ltx2.py:1185) and the one the shipped LTX-2.5 DiT carries: the
+// prompt-side AdaLN MLP is built, so the cross-attention K/V modulation carries a
+// timestep term on top of the static per-block table (transformer.py:441-443).
+Ltx2DitParams ReducedParamsPromptAdaln(Ltx2RopeType rope_type, bool double_precision) {
+  Ltx2DitParams p = ReducedParams(rope_type, double_precision);
+  p.use_prompt_adaln_single = true;
+  return p;
+}
+
 // A materialized weight set: owned f32 storage plus the views the forward takes.
 struct WeightSet {
   std::map<std::string, std::vector<float>> storage;
@@ -829,6 +839,137 @@ TEST_CASE("ltx2 forward: a disabled audio stream still feeds audio->video") {
   CheckForward(Ltx2RopeType::kSplit, false, false, vllm_test::kLtx2ForwardAudioOffVideo,
                vllm_test::kLtx2ForwardAudioOffAudio, "audio disabled",
                /*audio_enabled=*/false);
+}
+
+// ---------------------------------------------------------------------------
+// The prompt-side AdaLN arm — upstream's DEFAULT
+// (.agents/specs/ltx25-prompt-adaln.md, issue #644)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The same forward, run with `use_prompt_adaln_single = true`. Kept separate from
+// CheckForward rather than folded into it, because the two arms have DIFFERENT
+// weight contracts (12 extra parameters) and sharing one helper would hide which
+// contract a case ran under.
+vllm::Ltx2DitOutputs RunPromptAdalnForward(const Ltx2DitParams& p, WeightSet& set,
+                                           Modalities* m, bool masked) {
+  BuildModalities(m, masked);
+  return Ltx2DitForward(Cpu(), p, set.weights, &m->video, &m->audio, vt::DType::kF32);
+}
+
+void CheckPromptAdalnForward(bool masked, const float* want_video, const float* want_audio,
+                             const char* label) {
+  INFO("prompt-AdaLN forward case: " << std::string(label));
+  const Ltx2DitParams p = ReducedParamsPromptAdaln(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  Modalities m;
+  const vllm::Ltx2DitOutputs out = RunPromptAdalnForward(p, set, &m, masked);
+  const size_t vcount = static_cast<size_t>(m.video.batch * m.video.tokens * p.out_channels);
+  const size_t acount =
+      static_cast<size_t>(m.audio.batch * m.audio.tokens * p.audio_out_channels);
+  const double vdiff = MaxAbsDiff(out.video, want_video, vcount);
+  const double adiff = MaxAbsDiff(out.audio, want_audio, acount);
+  MESSAGE("max|diff| video=" << vdiff << " audio=" << adiff);
+  CHECK(vdiff < kRoundOff);
+  CHECK(adiff < kRoundOff);
+}
+
+}  // namespace
+
+// The 12 parameters the flag adds (6 per stream: three linears x weight+bias),
+// which the shipped FP8 checkpoint carries as 18 manifest entries because each
+// quantized weight also has a `weight_scale`. Order matters as much as presence:
+// upstream registers `prompt_adaln_single` between `adaln_single` and `proj_out`
+// inside `_init_video` (model.py:222-232), and the audio twin in `_init_audio`
+// (:252-262).
+TEST_CASE("ltx2 layout: the flag-ON contract matches upstream named_parameters()") {
+  const Ltx2DitParams p = ReducedParamsPromptAdaln(Ltx2RopeType::kSplit, false);
+  const std::vector<Ltx2TensorSpec> manifest = EnumerateLtx2DitTensors(p);
+  REQUIRE(static_cast<int64_t>(manifest.size()) == vllm_test::kLtx2PromptAdalnParamCount);
+  // The flag is the ONLY difference, so the count delta is exactly the module.
+  CHECK(vllm_test::kLtx2PromptAdalnParamCount - vllm_test::kLtx2ParamCount == 12);
+  size_t dim_cursor = 0;
+  for (size_t i = 0; i < manifest.size(); ++i) {
+    CAPTURE(i);
+    CAPTURE(manifest[i].name);
+    CHECK(manifest[i].name == std::string(vllm_test::kLtx2PromptAdalnParamNames[i]));
+    const int64_t rank = vllm_test::kLtx2PromptAdalnParamRanks[i];
+    REQUIRE(static_cast<int64_t>(manifest[i].shape.size()) == rank);
+    for (int64_t d = 0; d < rank; ++d) {
+      CHECK(manifest[i].shape[static_cast<size_t>(d)] ==
+            vllm_test::kLtx2PromptAdalnParamDims[dim_cursor]);
+      ++dim_cursor;
+    }
+  }
+}
+
+// The MLP on its own, so a failure localizes here rather than in the threading.
+// The input is the modality's SIGMA scaled by timestep_scale_multiplier
+// (transformer_args.py:274-277 -> :173-186) — one scalar per batch element, NOT
+// the per-token `timesteps` the main AdaLN consumes.
+TEST_CASE("ltx2 brick: the prompt AdaLN MLP runs on sigma, not on the per-token timesteps") {
+  const Ltx2DitParams p = ReducedParamsPromptAdaln(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  const int64_t b = vllm_test::kLtx2Batch;
+  const int64_t dim = p.inner_dim();
+  const int64_t adim = p.audio_inner_dim();
+
+  std::vector<float> vts(vllm_test::kLtx2PromptAdalnVideoTimesteps,
+                         vllm_test::kLtx2PromptAdalnVideoTimesteps + b);
+  const vllm::Ltx2AdalnOut vout = vllm::Ltx2AdaLayerNormSingle(
+      Cpu(), set.weights.prompt_adaln_single, vts.data(), b, dim);
+  REQUIRE(vout.modulation.size() == static_cast<size_t>(b * 2 * dim));
+  CHECK(MaxAbsDiff(vout.modulation, vllm_test::kLtx2PromptAdalnVideoModulation,
+                   static_cast<size_t>(b * 2 * dim)) < kRoundOff);
+
+  std::vector<float> ats(vllm_test::kLtx2PromptAdalnAudioTimesteps,
+                         vllm_test::kLtx2PromptAdalnAudioTimesteps + b);
+  const vllm::Ltx2AdalnOut aout = vllm::Ltx2AdaLayerNormSingle(
+      Cpu(), set.weights.audio_prompt_adaln_single, ats.data(), b, adim);
+  REQUIRE(aout.modulation.size() == static_cast<size_t>(b * 2 * adim));
+  CHECK(MaxAbsDiff(aout.modulation, vllm_test::kLtx2PromptAdalnAudioModulation,
+                   static_cast<size_t>(b * 2 * adim)) < kRoundOff);
+}
+
+TEST_CASE("ltx2 forward: the prompt-side AdaLN arm") {
+  CheckPromptAdalnForward(false, vllm_test::kLtx2ForwardPromptAdalnVideo,
+                          vllm_test::kLtx2ForwardPromptAdalnAudio, "prompt AdaLN");
+}
+
+TEST_CASE("ltx2 forward: the prompt-side AdaLN arm, with both masks") {
+  CheckPromptAdalnForward(true, vllm_test::kLtx2ForwardPromptAdalnMaskedVideo,
+                          vllm_test::kLtx2ForwardPromptAdalnMaskedAudio,
+                          "prompt AdaLN + masks");
+}
+
+// THE INSTRUMENT THAT MAKES THE ARM ABOVE MEAN SOMETHING.
+//
+// Both goldens come from the same deterministic weight stream, keyed by parameter
+// NAME, so every weight the two arms share is bit-identical and the ONLY thing
+// separating `kLtx2ForwardPromptAdaln*` from `kLtx2ForwardSplit*` is the timestep
+// term. A port that accepted the flag, bound the 12 tensors and then never added
+// their output would reproduce the flag-OFF numbers exactly and pass nothing here.
+//
+// Measured on this fixture (generator stderr, and the comment block at the end of
+// ltx2_goldens.inc): the term is 51.7% the magnitude of the static per-block
+// table it is added to, moves the block-0 modulated prompt K/V by 5.82%, and
+// moves the DiT's own output by 1.46e-4 — 73x the kRoundOff floor. The bound
+// below is set at 20x kRoundOff so it is comfortably inside the measured signal
+// and comfortably outside f32 noise.
+TEST_CASE("ltx2 forward: the prompt-AdaLN term is LOAD-BEARING, not decoration") {
+  const Ltx2DitParams p = ReducedParamsPromptAdaln(Ltx2RopeType::kSplit, false);
+  WeightSet set = BuildWeights(p);
+  Modalities m;
+  const vllm::Ltx2DitOutputs out = RunPromptAdalnForward(p, set, &m, false);
+  const size_t vcount = static_cast<size_t>(m.video.batch * m.video.tokens * p.out_channels);
+  const size_t acount =
+      static_cast<size_t>(m.audio.batch * m.audio.tokens * p.audio_out_channels);
+  const double vdiff = MaxAbsDiff(out.video, vllm_test::kLtx2ForwardSplitVideo, vcount);
+  const double adiff = MaxAbsDiff(out.audio, vllm_test::kLtx2ForwardSplitAudio, acount);
+  MESSAGE("flag-ON vs flag-OFF: video=" << vdiff << " audio=" << adiff);
+  CHECK(vdiff > 20.0 * kRoundOff);
+  CHECK(adiff > 20.0 * kRoundOff);
 }
 
 TEST_CASE("ltx2 forward: a single-stream model type is REFUSED") {

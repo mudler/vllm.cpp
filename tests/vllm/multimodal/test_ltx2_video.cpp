@@ -40,6 +40,7 @@
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
+#include "vllm/platforms/interface.h"  // CurrentPlatform() — the seam the engine asks
 #include "vllm.h"
 #include "vt/backend.h"
 #include "vt/device.h"
@@ -358,26 +359,35 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
 // L7 had to refuse `device = 1` outright: the forward was f32-only by
 // declaration and the staging was bf16 and refused to widen, so no combination
 // put the DiT on an accelerator. L8 is the device-resident forward that closes
-// that (`Ltx2DitForwardDevice`), so a CUDA handle now denotes a CUDA forward and
-// the load must SUCCEED where a CUDA backend exists.
+// that (`Ltx2DitForwardDevice`), so a non-zero handle now denotes a
+// device-resident forward and the load must SUCCEED where an accelerator backend
+// exists.
 //
-// What must never come back is the substitution: on a build with no CUDA backend
-// the load is still refused, and the refusal must name the missing BACKEND. If it
-// ever again names the f32/bf16 gap, the device forward has been un-wired; if it
-// silently succeeds with a CPU device, the engine is lying about where it ran.
-TEST_CASE("ltx2 video: device 1 runs on CUDA, and is refused by name without it") {
+// The DSR repair (#553) changed WHICH accelerator from a hardcoded `kCUDA` to
+// the platform seam's own answer, so this case now asks the seam the same
+// question the engine asks instead of naming a device itself. On a CUDA box that
+// resolves to kCUDA and the assertions below are the ones L8 shipped.
+//
+// What must never come back is the substitution: on a build with no accelerator
+// backend the load is still refused, and the refusal must name the missing
+// BACKEND. If it ever again names the f32/bf16 gap, the device forward has been
+// un-wired; if it silently succeeds with a CPU device, the engine is lying about
+// where it ran.
+TEST_CASE("ltx2 video: device 1 runs on the resolved accelerator, refused by name without one") {
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.device = 1;
-  vt::Backend* cuda = vt::TryGetBackend(vt::DeviceType::kCUDA);
-  if (cuda == nullptr) {
+  const vt::DeviceType accelerator = vllm::platforms::CurrentPlatform().device_type();
+  const bool have_accelerator = accelerator != vt::DeviceType::kCPU &&
+                                vt::TryGetBackend(accelerator) != nullptr;
+  if (!have_accelerator) {
     try {
       (void)vllm::multimodal::LoadVideoEngine(mp);
-      FAIL("a CUDA load must be refused when no CUDA backend is registered");
+      FAIL("a device-1 load must be refused when no accelerator backend is registered");
     } catch (const std::exception& e) {
       const std::string msg = e.what();
       INFO(msg);
-      CHECK(msg.find("no CUDA backend") != std::string::npos);
+      CHECK(msg.find("no accelerator backend") != std::string::npos);
       // The L7 gap must NOT be what is named any more; naming it would mean the
       // device forward is no longer wired in.
       CHECK(msg.find("kF32") == std::string::npos);
@@ -387,8 +397,10 @@ TEST_CASE("ltx2 video: device 1 runs on CUDA, and is refused by name without it"
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
   REQUIRE(engine != nullptr);
-  // The handle means what it says: a CUDA device, not a CPU one behind it.
-  CHECK(engine->device().type == vt::DeviceType::kCUDA);
+  // The handle means what it says: the accelerator the seam resolved, never a
+  // CPU device behind it.
+  CHECK(engine->device().type == accelerator);
+  CHECK(engine->device().type != vt::DeviceType::kCPU);
   CHECK(engine->family() == std::string(vllm::multimodal::kLtx2VideoFamily));
 }
 
@@ -927,10 +939,12 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     const vllm::SafetensorsFile file = vllm::SafetensorsFile::Open(path);
     vllm::Ltx2DitQuant quant = vllm::Ltx2DitQuant::kFp8;
     vllm::Ltx2DitParams from_shapes = vllm::Ltx2ParseDitParamsFromCheckpoint(file, &quant);
-    // The manifest parser leaves `use_prompt_adaln_single` at its default; the
-    // LOADER clears it for the contract (ltx2_loader.cpp), and so does the
-    // engine. Mirror that here so the two contracts are compared like for like.
-    from_shapes.use_prompt_adaln_single = false;
+    // MEASURED from this file's own header: it carries `prompt_adaln_single`, so
+    // the manifest parser resolves `use_prompt_adaln_single = TRUE` — and nothing
+    // clears it any more (.agents/specs/ltx25-prompt-adaln.md, issue #644). This
+    // line used to force it false on BOTH sides of the comparison below, which is
+    // what made a config/shape disagreement about it unobservable.
+    CHECK(from_shapes.use_prompt_adaln_single);
     CHECK(quant == vllm::Ltx2DitQuant::kNvfp4);
     CHECK(from_shapes.num_layers == 48);
     CHECK(from_shapes.inner_dim() == 4096);
@@ -950,8 +964,12 @@ TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
     config["transformer"]["use_keyframes_abs_pos_embedding"] = false;
     nlohmann::json wrapper;
     wrapper["config"] = config;
-    vllm::Ltx2DitParams declared = vllm::ParseLtx2DitParams(wrapper);
-    declared.use_prompt_adaln_single = false;
+    const vllm::Ltx2DitParams declared = vllm::ParseLtx2DitParams(wrapper);
+    // The shipped config OMITS `use_prompt_adaln_single`, so it resolves to
+    // upstream's TRUE default (model_configurator.py:76) — which is what the
+    // file's own tensors say. Asserted rather than forced: the two sides of the
+    // contract comparison below must AGREE about it, not be made to.
+    CHECK(declared.use_prompt_adaln_single);
     CHECK(declared.double_precision_rope);              // frequencies_precision float64
     CHECK(declared.av_ca_timestep_scale_multiplier == 1000);
     CHECK(declared.apply_gated_attention);

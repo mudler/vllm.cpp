@@ -271,6 +271,47 @@ std::vector<float> EncoderStack(const std::vector<float>& x, int64_t frames, int
   return h;
 }
 
+std::vector<float> EncoderHiddenState(const std::vector<float>& x, int64_t frames,
+                                      int64_t hidden, int64_t heads, int64_t intermediate,
+                                      int64_t conv_kernel, int64_t left_max, int64_t right_max,
+                                      const std::vector<EncoderLayerWeights>& layers,
+                                      double eps, int64_t index) {
+  const int64_t depth = static_cast<int64_t>(layers.size());
+  VT_CHECK(index >= 0 && index <= depth,
+           "w2vbert: hidden-state index is out of range for this encoder");
+  // HuggingFace appends BEFORE each layer, so index 0 is the input and index i
+  // is the output of layer i - 1. Running `index` layers is therefore exactly
+  // right, and running `index + 1` is the off-by-one this comment exists for.
+  std::vector<float> h = x;
+  for (int64_t i = 0; i < index; ++i) {
+    h = EncoderLayer(h, frames, hidden, heads, intermediate, conv_kernel, left_max, right_max,
+                     layers[static_cast<size_t>(i)], eps);
+  }
+  return h;
+}
+
+std::vector<float> NormalizeWithStats(const std::vector<float>& feat, int64_t frames,
+                                      int64_t dim, const std::vector<float>& mean,
+                                      const std::vector<float>& stddev) {
+  VT_CHECK(frames > 0 && dim > 0, "w2vbert: frames and dim must be positive");
+  VT_CHECK(feat.size() == static_cast<size_t>(frames * dim),
+           "w2vbert: feat must be [frames, dim]");
+  VT_CHECK(mean.size() == static_cast<size_t>(dim) &&
+               stddev.size() == static_cast<size_t>(dim),
+           "w2vbert: the stored statistics must have one value per feature");
+  std::vector<float> out(feat.size());
+  for (int64_t f = 0; f < frames; ++f) {
+    for (int64_t d = 0; d < dim; ++d) {
+      const size_t i = static_cast<size_t>(f * dim + d);
+      const double sd = static_cast<double>(stddev[static_cast<size_t>(d)]);
+      VT_CHECK(sd != 0.0, "w2vbert: a stored standard deviation is zero");
+      out[i] = static_cast<float>(
+          (static_cast<double>(feat[i]) - static_cast<double>(mean[static_cast<size_t>(d)])) / sd);
+    }
+  }
+  return out;
+}
+
 }  // namespace w2vbert
 }  // namespace models
 }  // namespace vllm

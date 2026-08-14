@@ -1064,6 +1064,12 @@ Registered in
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
 
+The reference-audio side of IndexTTS-2.5 is complete in the library -- a 16 kHz
+clip goes through the SeamlessM4T feature extractor, the w2v-bert Conformer, the
+layer-17 hidden-state tap, the checkpoint's stored-statistics normalization and
+the semantic codec to discrete codes -- but none of it is reachable from a
+command or a route yet.
+
 There is **no `/v1/audio/speech`**. Text to speech is not servable: the
 IndexTTS-2.5 stages are ported and gated at reduced dimensions, with further
 stages named as missing by the checkpoint's own manifest, and no route is

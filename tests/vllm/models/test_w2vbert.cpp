@@ -288,3 +288,82 @@ TEST_CASE("w2vbert EncoderStack applies NO final norm after the layers") {
   INFO("max abs diff vs upstream Wav2Vec2BertEncoder: ", worst);
   CHECK(worst < 5e-5);
 }
+
+// ---------------------------------------------------------------------------
+// The hidden-state tap and the stored-statistics normalization (#634).
+//
+// IndexTTS-2.5 conditions on `hidden_states[17]`, not the encoder's output, and
+// normalizes it with statistics shipped in the checkpoint. Both are gated here
+// because both produce a real feature of the right shape when wrong.
+// ---------------------------------------------------------------------------
+
+namespace {
+std::vector<vllm::models::w2vbert::EncoderLayerWeights> StackLayers() {
+  const auto m = ModelWeights();
+  std::vector<vllm::models::w2vbert::EncoderLayerWeights> layers;
+  for (int64_t i = 0; i < kNumLayers; ++i) {
+    layers.push_back(LayerFrom(m, "enc.layers." + std::to_string(i) + "."));
+  }
+  return layers;
+}
+std::vector<float> StackInput() {
+  return std::vector<float>(std::begin(kProjected), std::end(kProjected));
+}
+std::vector<float> TapAt(int64_t index) {
+  return vllm::models::w2vbert::EncoderHiddenState(
+      StackInput(), kFrames, kHidden, kHeads, kIntermediate, kConvKernel, kLeftMax, kRightMax,
+      StackLayers(), kLayerNormEps, index);
+}
+}  // namespace
+
+TEST_CASE("hidden-state index 0 is the INPUT, not the first layer's output") {
+  // HuggingFace appends to the tuple BEFORE each layer, so index 0 is the
+  // encoder's input unchanged. Reading it as "after layer 0" is off by one, and
+  // an off-by-one here returns a real hidden state from the right model.
+  CHECK(TapAt(0) == StackInput());
+  CHECK(TapAt(1) != StackInput());
+}
+
+TEST_CASE("the LAST index reproduces EncoderStack exactly") {
+  const std::vector<float> full = vllm::models::w2vbert::EncoderStack(
+      StackInput(), kFrames, kHidden, kHeads, kIntermediate, kConvKernel, kLeftMax, kRightMax,
+      StackLayers(), kLayerNormEps);
+  CHECK(TapAt(kNumLayers) == full);
+  // And an earlier tap must DIFFER from it, or the index is being ignored.
+  if (kNumLayers > 1) {
+    CHECK(TapAt(kNumLayers - 1) != full);
+  }
+}
+
+TEST_CASE("an out-of-range hidden-state index is refused") {
+  CHECK_THROWS(TapAt(kNumLayers + 1));
+  CHECK_THROWS(TapAt(-1));
+}
+
+TEST_CASE("stored-statistics normalization uses the STORED values") {
+  // Hand-computed, and deliberately built so per-utterance statistics would give
+  // a DIFFERENT answer: the two frames have mean 2 and 4 per column, while the
+  // stored mean is 1 and the stored std is 2.
+  const std::vector<float> feat{1.0F, 3.0F, 3.0F, 5.0F};  // 2 frames, dim 2
+  const std::vector<float> mean{1.0F, 1.0F};
+  const std::vector<float> sd{2.0F, 2.0F};
+  const std::vector<float> got =
+      vllm::models::w2vbert::NormalizeWithStats(feat, 2, 2, mean, sd);
+  REQUIRE(got.size() == 4);
+  CHECK(got[0] == 0.0F);   // (1 - 1) / 2
+  CHECK(got[1] == 1.0F);   // (3 - 1) / 2
+  CHECK(got[2] == 1.0F);
+  CHECK(got[3] == 2.0F);   // (5 - 1) / 2
+
+  // Per-utterance normalization would have made every column zero-mean, so this
+  // separates the two.
+  const double col0 = (got[0] + got[2]) / 2.0;
+  CHECK(col0 != doctest::Approx(0.0).epsilon(1e-6));
+}
+
+TEST_CASE("a zero stored deviation is refused rather than dividing") {
+  const std::vector<float> feat{1.0F, 2.0F};
+  const std::vector<float> mean{0.0F, 0.0F};
+  const std::vector<float> sd{1.0F, 0.0F};
+  CHECK_THROWS(vllm::models::w2vbert::NormalizeWithStats(feat, 1, 2, mean, sd));
+}

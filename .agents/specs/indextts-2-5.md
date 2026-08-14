@@ -388,8 +388,10 @@ That differs from `Ltx2WaveformToLogMel`, which is the Slaney/torchaudio kind
 with no preemphasis and no DC removal. Reusing it would be the mistake this spec
 elsewhere warns about -- a gate that passes because both arms call the same
 helper proves consistency, not correctness -- so the extractor is a NEW unit. It is now **ported** in
-`w2v_fbank.cpp`; what remains unported on this path is the
-`hidden_states[17]` tap and the stored-statistics normalization.
+`w2v_fbank.cpp`; the `hidden_states[17]` tap and the
+stored-statistics normalization are ported too (`w2vbert::EncoderHiddenState`
+and `w2vbert::NormalizeWithStats`), so this path is complete from waveform to
+semantic codes.
 
 **What IS ported on this path**: the w2v-bert Conformer itself
 (`w2vbert::FeatureProjection` and `w2vbert::EncoderStack`, including the

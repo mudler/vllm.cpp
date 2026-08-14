@@ -129,6 +129,36 @@ std::vector<float> EncoderStack(const std::vector<float>& x, int64_t frames, int
                                 int64_t left_max, int64_t right_max,
                                 const std::vector<EncoderLayerWeights>& layers, double eps);
 
+// The same stack, returning ONE INTERMEDIATE hidden state instead of the last.
+//
+// IndexTTS-2.5 does not use this encoder's output. `infer_v2_5.py:287` takes
+// `vq_emb.hidden_states[17]`, and everything downstream -- the codec, the codes,
+// the talker -- is conditioned on that.
+//
+// `index` follows HUGGINGFACE'S CONVENTION, which is the trap. `hidden_states[0]`
+// is the INPUT to layer 0, not its output, because the tuple is appended to
+// BEFORE each layer runs and once more at the end. So `hidden_states[17]` is the
+// output of layer 16 zero-indexed, i.e. after seventeen layers. Reading it as
+// "layer 17" is off by one, and off-by-one here returns a real hidden state from
+// the right model, so nothing downstream can notice.
+//
+// `index` must be in [0, layers.size()].
+std::vector<float> EncoderHiddenState(const std::vector<float>& x, int64_t frames,
+                                      int64_t hidden, int64_t heads, int64_t intermediate,
+                                      int64_t conv_kernel, int64_t left_max, int64_t right_max,
+                                      const std::vector<EncoderLayerWeights>& layers,
+                                      double eps, int64_t index);
+
+// `feat = (feat - mean) / std`, broadcast over frames.
+//
+// The statistics are STORED, shipped as `wav2vec2bert_stats.pt` and named by
+// `w2v_stat` in config.yaml -- `std` is the SQUARE ROOT of the stored `var`.
+// Computing them per utterance instead is the natural assumption and gives a
+// differently-scaled feature the codec then quantizes into different codes.
+std::vector<float> NormalizeWithStats(const std::vector<float>& feat, int64_t frames,
+                                      int64_t dim, const std::vector<float>& mean,
+                                      const std::vector<float>& stddev);
+
 }  // namespace w2vbert
 }  // namespace models
 }  // namespace vllm

@@ -227,3 +227,5 @@ VT_W4A4_TRUE
 # selects a kernel or a batching strategy for the expert GEMMs and each
 # treats a name here as a known kernel-internal knob. A NEW production env
 # var must be documented in docs/ENVIRONMENT.md OR added here.
+VT_DUMP_ACT_SUB
+VT_DUMP_ATTN

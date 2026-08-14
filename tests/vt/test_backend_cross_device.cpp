@@ -1885,6 +1885,67 @@ TEST_CASE("AttnQkNormRopeGate matches the CPU oracle within NMSE <= 5e-4") {
     }
   }
 
+  // The in-context production mix (issue #41 M4 W2): the 0.8B bf16 model feeds
+  // the preamble a BF16 projection output but wants F32 q/k/gate out (the f32
+  // attention path — FA-2 is off on ROCm). The ROCm dispatcher once keyed on
+  // the SOURCE dtype and mis-launched all-bf16, writing bf16 bits through the
+  // f32 out pointers; this arm pins the (bf16 src -> f32 out) combo at the real
+  // 0.8B dims so the bug class cannot return silently.
+  {
+    const int64_t HQr = 8, HKVr = 2, DHr = 256, ROTr = 64;
+    const std::vector<float> qg = RandomVec(static_cast<size_t>(T * HQr * 2 * DHr), 991, -0.5f, 0.5f);
+    const std::vector<float> kfv = RandomVec(static_cast<size_t>(T * HKVr * DHr), 992, -0.5f, 0.5f);
+    const std::vector<float> qnr = RandomVec(static_cast<size_t>(DHr), 993, 0.2f, 1.0f);
+    const std::vector<float> knr = RandomVec(static_cast<size_t>(DHr), 994, 0.2f, 1.0f);
+    const std::vector<float> csr = RandomVec(static_cast<size_t>(T * ROTr), 995, -1.0f, 1.0f);
+    const std::vector<uint16_t> qg_bf = Bf16Bits(qg), kf_bf = Bf16Bits(kfv);
+    vt::RmsNormArgs na3; na3.eps = 1e-6f; na3.gemma = true;
+    vt::RopeArgs ra3; ra3.rotary_dim = static_cast<int>(ROTr);
+    // CPU reference: bf16 in (exact upcast inside the op) -> f32 out.
+    std::vector<float> rq(static_cast<size_t>(T * HQr * DHr));
+    std::vector<float> rk(static_cast<size_t>(T * HKVr * DHr));
+    std::vector<float> rg(static_cast<size_t>(T * HQr * DHr));
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<uint16_t> a = qg_bf, b = kf_bf; std::vector<float> e = qnr, f = knr, g = csr;
+      Tensor tqg = Tensor::Contiguous(a.data(), DType::kBF16, cd, {T, HQr * 2 * DHr});
+      Tensor tkf = Tensor::Contiguous(b.data(), DType::kBF16, cd, {T, HKVr * DHr});
+      Tensor tqn = T1(e.data(), cd, DHr), tkn = T1(f.data(), cd, DHr);
+      Tensor tcs = T2(g.data(), cd, T, ROTr);
+      Tensor tqo = Tensor::Contiguous(rq.data(), DType::kF32, cd, {T, HQr, DHr});
+      Tensor tko = Tensor::Contiguous(rk.data(), DType::kF32, cd, {T, HKVr, DHr});
+      Tensor tgo = Tensor::Contiguous(rg.data(), DType::kF32, cd, {T, HQr, DHr});
+      vt::AttnQkNormRopeGate(cq, tqo, tko, tgo, tqg, tkf, tqn, tkn, tcs, na3, ra3);
+      cpu.DestroyQueue(cq);
+    }
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kAttnQkNormRopeGate, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBufBytes dqg(dev, q, qg_bf.size() * 2), dkf(dev, q, kf_bf.size() * 2);
+      DevBuf dqn(dev, q, DHr), dkn(dev, q, DHr), dcs(dev, q, csr.size());
+      DevBuf dqo(dev, q, rq.size()), dko(dev, q, rk.size()), dgo(dev, q, rg.size());
+      dqg.Upload(qg_bf.data()); dkf.Upload(kf_bf.data());
+      dqn.Upload(qnr); dkn.Upload(knr); dcs.Upload(csr);
+      Tensor tqg = Tensor::Contiguous(dqg.ptr(), DType::kBF16, d, {T, HQr * 2 * DHr});
+      Tensor tkf = Tensor::Contiguous(dkf.ptr(), DType::kBF16, d, {T, HKVr * DHr});
+      Tensor tqn = T1(dqn.ptr(), d, DHr), tkn = T1(dkn.ptr(), d, DHr);
+      Tensor tcs = T2(dcs.ptr(), d, T, ROTr);
+      Tensor tqo = Tensor::Contiguous(dqo.ptr(), DType::kF32, d, {T, HQr, DHr});
+      Tensor tko = Tensor::Contiguous(dko.ptr(), DType::kF32, d, {T, HKVr, DHr});
+      Tensor tgo = Tensor::Contiguous(dgo.ptr(), DType::kF32, d, {T, HQr, DHr});
+      vt::AttnQkNormRopeGate(q, tqo, tko, tgo, tqg, tkf, tqn, tkn, tcs, na3, ra3);
+      CHECK(Nmse(rq, dqo.Download()) <= kNmseTol);
+      CHECK(Nmse(rk, dko.Download()) <= kNmseTol);
+      CHECK(Nmse(rg, dgo.Download()) <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+
   const int64_t HQ = 3, HKV = 2, DH = 32, ROT = 16;
   const int64_t qg_outer = HQ * 2 * DH + 7, kf_outer = HKV * DH + 5;
   const std::vector<float> qgate = RandomVec(static_cast<size_t>(T * qg_outer), 881, -0.5f, 0.5f);

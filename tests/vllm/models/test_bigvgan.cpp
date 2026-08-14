@@ -1,4 +1,5 @@
 // BigVGAN generator against upstream goldens. See bigvgan.h.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -139,4 +140,73 @@ TEST_CASE("every AMP kernel contributes") {
     w.resblocks[static_cast<size_t>(j)].convs1[0].bias[0] += 0.5F;
     CHECK(vllm::models::bigvgan::Forward(Cfg(), w, x, kFrames) != base);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Loading the SHIPPED BigVGAN checkpoint (#634).
+//
+// Runs when VLLM_CPP_INDEXTTS2_BIGVGAN points at the converted
+// bigvgan.safetensors, and skips LOUDLY otherwise.
+// ---------------------------------------------------------------------------
+#include <cstdlib>
+
+#include "vllm/model_executor/models/bigvgan_loader.h"
+
+TEST_CASE("the SHIPPED BigVGAN loads with the geometry its config declares") {
+  const char* env = std::getenv("VLLM_CPP_INDEXTTS2_BIGVGAN");
+  if (env == nullptr) {
+    MESSAGE("SKIPPED: set VLLM_CPP_INDEXTTS2_BIGVGAN to the converted "
+            "bigvgan.safetensors to check the real checkpoint");
+    return;
+  }
+  const auto g = vllm::models::bigvgan::Load(std::string(env));
+  CHECK(g.config.mels == 80);
+  CHECK(g.config.init_channels == 1536);
+  CHECK(g.config.up_rates.size() == 6);
+  CHECK(g.config.num_kernels == 3);
+  CHECK(g.weights.resblocks.size() == 18);  // 6 stages x 3 kernels
+  CHECK(g.config.tanh_at_final == false);   // use_tanh_at_final is false
+  CHECK(g.weights.conv_post.bias.empty());  // use_bias_at_final is false
+
+  // The upsample product must be the HOP LENGTH: 4*4*2*2*2*2 = 256, which is
+  // `kHopLength`. If they disagreed the audio would come out at the wrong rate.
+  int64_t product = 1;
+  for (const int64_t r : g.config.up_rates) {
+    product *= r;
+  }
+  CHECK(product == 256);
+}
+
+TEST_CASE("the SHIPPED BigVGAN turns a mel into a bounded WAVEFORM") {
+  const char* env = std::getenv("VLLM_CPP_INDEXTTS2_BIGVGAN");
+  if (env == nullptr) {
+    MESSAGE("SKIPPED: no VLLM_CPP_INDEXTTS2_BIGVGAN, so no audio was rendered");
+    return;
+  }
+  const auto g = vllm::models::bigvgan::Load(std::string(env));
+  const int64_t frames = 6;
+  std::vector<float> mel(static_cast<size_t>(g.config.mels * frames));
+  for (size_t i = 0; i < mel.size(); ++i) {
+    mel[i] = -4.0F + 2.0F * std::sin(0.05F * static_cast<float>(i));
+  }
+  const auto wave = vllm::models::bigvgan::Forward(g.config, g.weights, mel, frames);
+
+  REQUIRE(wave.size() == static_cast<size_t>(frames * 256));
+  float lo = wave[0];
+  float hi = wave[0];
+  double energy = 0.0;
+  for (const float v : wave) {
+    REQUIRE(std::isfinite(v));
+    CHECK(v >= -1.0F);
+    CHECK(v <= 1.0F);
+    lo = std::min(lo, v);
+    hi = std::max(hi, v);
+    energy += static_cast<double>(v) * static_cast<double>(v);
+  }
+  // Not silence, and not a rail: a real vocoder on a real mel.
+  const double rms = std::sqrt(energy / static_cast<double>(wave.size()));
+  CHECK(rms > 1e-3);
+  CHECK(hi > lo);
+  MESSAGE("rendered " << wave.size() << " samples, range [" << lo << ", " << hi
+          << "], rms " << rms);
 }

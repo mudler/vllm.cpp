@@ -382,6 +382,44 @@ class AgentRecordMutationTests(unittest.TestCase):
                 found[0].field("state").strip().strip("`"), "INVENTORIED", item_id
             )
 
+    def test_dots3_rows_are_inside_the_model_ratchet(self) -> None:
+        """The #699 rows and the 373 -> 375 bump are one semantic change.
+
+        dots3-note is the IndexTTS-2.5 shape again on a different lane: vLLM
+        registers it as TWO architectures, `Dots3NoteForCausalLM` and its
+        speculative head `Dots3NoteMTPModel`, so a port described in prose as
+        "a model" moves the pin by two. Naming both is what makes 375 checkable
+        rather than plausible.
+
+        What this catches that nothing else does, measured: RENAMING the MTP row
+        leaves the count at 375, touches no claim, and every other check stays
+        green -- only this assertion goes red. That is the whole point of naming
+        rows rather than counting them.
+
+        The state assertions are deliberately weaker evidence, and the record
+        says so rather than implying otherwise: mutating either row's lifecycle
+        is already caught upstream of here by the claim-ownership and
+        spec-structure rules (INVENTORIED -> SPIKE trips "SPIKE row has no
+        CLAIM-* owner"; SPIKE -> ACTIVE trips the structured-spec requirement).
+        They are pinned anyway because the asymmetry is intentional -- the
+        target row is `SPIKE` with a committed spec and an owner, the MTP row is
+        `INVENTORIED` because it is unclaimed and blocked behind the target's
+        oracle and hardware gaps -- and a future refactor of those rules should
+        not silently take the pin with it.
+        """
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "MODEL rows" in error], [])
+
+        for item_id, state in (
+            ("MODEL-MM-dots3-note-dots3-note-for-causal-lm", "SPIKE"),
+            ("MODEL-SPEC-dots3-note-dots3-note-mtp", "INVENTORIED"),
+        ):
+            found = [row for row in rows if row.item_id == item_id]
+            self.assertEqual(len(found), 1, item_id)
+            self.assertEqual(found[0].path.name, "model-matrix.md", item_id)
+            self.assertEqual(found[0].field("state").strip().strip("`"), state, item_id)
+
     def test_recipe_backfill_rows_are_inside_the_model_ratchet(self) -> None:
         """The #609/#610 rows and the 362 -> 369 bump are one semantic change.
 

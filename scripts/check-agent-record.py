@@ -97,7 +97,23 @@ MATRICES = {
     # longer carries would be false about the file it sits in, and
     # `Qwen35TextOnlyRowsAreCounted` is what ties this value to the two rows the
     # matrix actually holds.
-    "MODEL": (AGENTS / "model-matrix.md", 375),
+    # 377 since 2026-08-14, and RE-DERIVED rather than carried forward: +2 for
+    # dots3-note, which vLLM registers as TWO architectures
+    # (`Dots3NoteForCausalLM` and its speculative head `Dots3NoteMTPModel`),
+    # landing `SPIKE` and `INVENTORIED` respectively with the spec committed
+    # (#699). This is the collision the Music3/IndexTTS comment above warns
+    # about, happening again on the same day: the #490 branch took 373 -> 375
+    # for the Qwen3.5 text-only arms while the dots3 branch took 373 -> 375 for
+    # its own two rows. BOTH read 375 and neither was right -- the merged tree
+    # holds four new rows, so it is 377. An auto-merge keeping either side would
+    # have left this file internally consistent while silently short two real
+    # architectures, which is why the number is counted off the matrix AFTER the
+    # merge and why `test_dots3_rows_are_inside_the_model_ratchet` names the rows
+    # instead of trusting the count. dots3-note is beyond-pin (vLLM `main` only,
+    # vllm#51255, still being patched), carries no pinned-registry target, and
+    # leaves the at-the-pin inventory (324/373/356/310/261) unchanged. Bumped
+    # because two rows EXIST, never to make a transition pass.
+    "MODEL": (AGENTS / "model-matrix.md", 377),
     # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
     # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
     # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme

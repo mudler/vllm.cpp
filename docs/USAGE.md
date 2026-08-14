@@ -1044,6 +1044,13 @@ Registered in
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
 
+There is **no `/v1/audio/speech`**. Text to speech is not servable: the
+IndexTTS-2.5 stages are ported and gated, but no route is registered, the public
+ABI carries no synthesis entry point, and loading the family refuses with a
+message naming the missing pieces (#634). Asking a running server for speech
+today is a 404 at the route table, not a runtime error, and that is the accurate
+signal: the capability does not reach any surface yet.
+
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it — every prompt position is scored against the token
 that followed it, accumulated across chunked prefill — but the **response body

@@ -13,6 +13,7 @@
 #include "doctest/doctest.h"
 #include "fvq_goldens.inc"
 #include "vllm/model_executor/models/fvq.h"
+#include "vllm/model_executor/models/vocoder1d.h"
 
 namespace {
 using namespace fvq_goldens;
@@ -87,7 +88,7 @@ TEST_CASE("fvq weight-norm materialization is g * v / ||v||") {
   // axis wrong still produces a weight of the right shape.
   const std::vector<float> g{2.0F, 3.0F};
   const std::vector<float> v{3.0F, 4.0F, 0.0F, 5.0F};  // rows [3,4] (norm 5), [0,5] (norm 5)
-  const std::vector<float> w = vllm::models::fvq::MaterializeWeightNorm(g, v, 2);
+  const std::vector<float> w = vllm::vocoder1d::MaterializeWeightNorm(g, v, 2);
   REQUIRE(w.size() == 4U);
   CHECK(w[0] == doctest::Approx(2.0 * 3.0 / 5.0).epsilon(1e-6));
   CHECK(w[1] == doctest::Approx(2.0 * 4.0 / 5.0).epsilon(1e-6));

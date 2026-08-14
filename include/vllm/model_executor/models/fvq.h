@@ -23,9 +23,10 @@ struct Weights {
   std::vector<float> codebook;               // [codebook_size, codebook_dim]
 };
 
-// Materialize a weight-normed 1x1 conv weight: w = g * v / ||v||.
-std::vector<float> MaterializeWeightNorm(const std::vector<float>& g, const std::vector<float>& v,
-                                         int64_t out_channels);
+// The fold w = g * v / ||v|| is NOT declared here. It has one home,
+// `vocoder1d::MaterializeWeightNorm`, and this file forked it: the copy that
+// lived here was byte-equivalent but skipped that one's check that `g` carries
+// one magnitude per dim-0 slice. Call the shared one.
 
 struct QuantizeResult {
   std::vector<int64_t> indices;  // [frames]

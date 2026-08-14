@@ -245,9 +245,26 @@ checkpoint has no `tokenizer.json`, so any path that assumes one is unavailable.
 
 **A Qwen-0.6B EMOTION MODEL ships inside the checkpoint** (`qwen0.6bemo4-merge/`,
 with its own `model.safetensors`, tokenizer and config), alongside `feat1.pt` /
-`feat2.pt` speaker and emotion matrices and an `emo_condition_module`. This was
-NOT in the original scope of this spec and is not covered by any work item here.
-It is a second language model inside a TTS lane.
+`feat2.pt` speaker and emotion matrices and an `emo_condition_module`.
+
+*Corrected from the first reading.* It was recorded here as unscoped work, on the
+assumption that a second language model inside a TTS lane implied a second port.
+Its safetensors header says otherwise. Read by HTTP range request — 2 MB, no
+weights — it is **310 BF16 tensors of stock `Qwen3ForCausalLM`**: hidden 1024, 28
+layers, GQA 16 query heads over 8 KV heads at `head_dim` 128, `intermediate_size`
+3072, vocab 151936, `tie_word_embeddings: true`. `config.json` names that
+architecture literally, this tree registers it in
+`src/vllm/model_executor/models/qwen3_dense.cpp`, and
+`src/vllm/model_executor/models/qwen3_weights.cpp:168` already has the tying
+branch that explains the absent `lm_head.weight`.
+
+So the emotion model needs **no port**. What it needs is the surrounding wiring —
+`feat1.pt` / `feat2.pt` and `emo_condition_module`, which are IndexTTS-specific
+and stay in scope. The reduction is pinned by
+`tests/scripts/test_indextts2_emotion_arch_covered.py` against a committed
+manifest, so if the emotion model is re-exported under another name, or our
+loader is renamed, or tying is dropped, the claim fails here rather than rotting
+in this paragraph.
 
 **Two components are NOT in this repository at all**: BigVGAN
 (`bigvgan_generator.pt`, fetched into `hf_cache/bigvgan`) and w2v-bert-2.0. They

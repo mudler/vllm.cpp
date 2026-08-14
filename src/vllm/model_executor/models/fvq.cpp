@@ -6,33 +6,12 @@
 #include <limits>
 #include <vector>
 
+#include "vllm/model_executor/models/vocoder1d.h"
 #include "vt/dtype.h"
 
 namespace vllm {
 namespace models {
 namespace fvq {
-
-std::vector<float> MaterializeWeightNorm(const std::vector<float>& g, const std::vector<float>& v,
-                                         int64_t out_channels) {
-  VT_CHECK(out_channels > 0 && v.size() % static_cast<size_t>(out_channels) == 0,
-           "fvq: weight_v does not divide by out_channels");
-  const int64_t per = static_cast<int64_t>(v.size()) / out_channels;
-  std::vector<float> w(v.size());
-  for (int64_t o = 0; o < out_channels; ++o) {
-    double norm = 0.0;
-    for (int64_t i = 0; i < per; ++i) {
-      const double x = static_cast<double>(v[static_cast<size_t>(o * per + i)]);
-      norm += x * x;
-    }
-    norm = std::sqrt(norm);
-    const double scale = (norm > 0.0) ? static_cast<double>(g[static_cast<size_t>(o)]) / norm : 0.0;
-    for (int64_t i = 0; i < per; ++i) {
-      w[static_cast<size_t>(o * per + i)] =
-          static_cast<float>(static_cast<double>(v[static_cast<size_t>(o * per + i)]) * scale);
-    }
-  }
-  return w;
-}
 
 namespace {
 
@@ -60,7 +39,7 @@ QuantizeResult Quantize(const std::vector<float>& z, int64_t frames, int64_t inp
                         int64_t codebook_dim, int64_t codebook_size, const Weights& wts) {
   VT_CHECK(z.size() == static_cast<size_t>(input_dim * frames), "fvq: z shape");
 
-  const std::vector<float> in_w = MaterializeWeightNorm(wts.in_g, wts.in_v, codebook_dim);
+  const std::vector<float> in_w = vocoder1d::MaterializeWeightNorm(wts.in_g, wts.in_v, codebook_dim);
   const std::vector<float> z_e = Pointwise(z, input_dim, frames, codebook_dim, in_w, wts.in_bias);
 
   // Codebook rows are normalized ONCE, for the search only.
@@ -118,7 +97,7 @@ QuantizeResult Quantize(const std::vector<float>& z, int64_t frames, int64_t inp
     }
   }
 
-  const std::vector<float> out_w = MaterializeWeightNorm(wts.out_g, wts.out_v, input_dim);
+  const std::vector<float> out_w = vocoder1d::MaterializeWeightNorm(wts.out_g, wts.out_v, input_dim);
   r.z_q = Pointwise(picked, codebook_dim, frames, input_dim, out_w, wts.out_bias);
   return r;
 }

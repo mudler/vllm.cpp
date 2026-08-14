@@ -291,6 +291,26 @@ class AgentRecordMutationTests(unittest.TestCase):
             self.assertEqual(len(found), 1, item_id)
             self.assertEqual(found[0].path.name, "engine-matrix.md", item_id)
 
+    def test_anchor_ratchet_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #632 row and its 154 -> 155 bump are one semantic change.
+
+        Same shape as the #117, #606 and #633 assertions above. Worth naming
+        here for one reason beyond the count: this row exists BECAUSE the
+        `path:line` citations in these matrices are 82% unparsed by the very
+        checker this test guards, so the row's own anchors into
+        `check-agent-record.py` are — until it lands — as unchecked as the ones
+        it is filed about. Pinning the row is the only mechanical statement
+        available about it today.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+
+        found = [row for row in rows if row.item_id == "ENG-RECORD-ANCHOR-RATCHET"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].path.name, "engine-matrix.md")
+
     def test_music3_and_indextts_rows_both_survive_their_collision(self) -> None:
         """373 needs BOTH rows named, because the merge that produced it collided.
 

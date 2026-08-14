@@ -694,11 +694,16 @@ TEST_CASE("NemotronH: the unported arms REFUSE BY NAME") {
     // What moved is only which piece the message names.
     // The model handed to `factory->forward` MUST be the one
     // `factory->load_weights` produced. `ForwardNemotronHForCausalLM`
-    // (nemotron_h_registry.cpp:112) opens the handle with
+    // (nemotron_h_registry.cpp:100) opens the handle with
     // `static_cast<NemotronHLoadedModel&>(model)` — the universal registry seam,
     // shared verbatim by every other arch's forward — and that downcast is
     // undefined behaviour on any object that is not really a
-    // `NemotronHLoadedModel`. This subcase used to fabricate a bare
+    // `NemotronHLoadedModel`. Two DISTINCT lines, and the sanitizer names the
+    // second, not the first: the cast is nemotron_h_registry.cpp:102, while the
+    // member call made THROUGH the resulting reference — where the vptr check
+    // actually fires, and what the report quoted below is anchored to — is
+    // nemotron_h_registry.cpp:112:30, `nh.params()`.
+    // This subcase used to fabricate a bare
     // `struct StubModel : vllm::LoadedModel` instead, which W3 got away with
     // only because the forward was then an unconditional `VT_CHECK(false)` that
     // never touched `model`. W4 added the downcast, and the stub turned it into

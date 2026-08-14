@@ -258,13 +258,59 @@ architecture literally, this tree registers it in
 `src/vllm/model_executor/models/qwen3_weights.cpp:168` already has the tying
 branch that explains the absent `lm_head.weight`.
 
-So the emotion model needs **no port**. What it needs is the surrounding wiring —
-`feat1.pt` / `feat2.pt` and `emo_condition_module`, which are IndexTTS-specific
-and stay in scope. The reduction is pinned by
+So the emotion *language model* needs **no port**. That reduction is pinned by
 `tests/scripts/test_indextts2_emotion_arch_covered.py` against a committed
-manifest, so if the emotion model is re-exported under another name, or our
-loader is renamed, or tying is dropped, the claim fails here rather than rotting
-in this paragraph.
+manifest, so if it is re-exported under another name, or our loader is renamed,
+or tying is dropped, the claim fails there rather than rotting in this paragraph.
+
+**But the emotion PATH is much larger than that model, and the same day's first
+correction understated it.** It was written here as "surrounding wiring:
+`feat1.pt` / `feat2.pt` and `emo_condition_module`". Reading `gpt.pth`'s own
+pickle header (below) shows the emotion path is two unported networks living
+inside the talker checkpoint:
+
+| Group | What it is | Evidence |
+|---|---|---|
+| `emo_conditioning_encoder` | A **Conformer** encoder at width 512: relative-position MHA carrying `pos_bias_u` / `pos_bias_v` `[4, 128]`, macaron feed-forwards, a conv module with depthwise kernel 15, and a Conv2d-subsampling front end whose `embed.out` is `[512, 261632]` | 38 name patterns in `gpt.pth` |
+| `emo_perceiver_encoder` | A **Perceiver resampler**: learned `latents [1, 1024]`, `to_q` / `to_kv` / `to_out`, a GEGLU feed-forward at 2730, `proj_context [1024, 512]` | 9 patterns |
+| `emo_layer`, `emovec_layer` | The two projections into the talker: `[1280, 1280]` and `[1280, 1024]` | 4 patterns |
+
+Neither network is ported, and neither is one this tree already has. The lesson
+is the one this campaign keeps re-learning: an architecture name settles what a
+*model* costs, and settles nothing about what a *checkpoint* contains.
+
+### What the three .pth checkpoints actually hold
+
+`gpt.pth`, `codec.pth` and `s2mel.pth` are torch ZIPs: one small pickle names
+every tensor, and the gigabytes are separate blobs. `scripts/read-torch-manifest.py`
+fetches the central directory and that pickle by range request and unpickles it
+with a stub Unpickler, so the full manifest of **1712 tensors across 4.0 GiB**
+costs a few hundred KB and needs no torch. The record is committed at
+`tests/vllm/models/indextts2_pth_manifest.json`.
+
+It confirms four constants in `indextts2_config.h` from a source independent of
+`config.yaml`: `kTalkerDim` 1280 is `emo_layer.weight`'s square, `kStyleDim` 192
+is `spk_emb_proj.weight`'s input, `kVocosDim` 384 and `kVocosIntermediateDim`
+2048 are the codec decoder's ConvNeXt widths, and `kCodecHiddenSize` 1024 is that
+decoder's input. `test_indextts2_config_contract.py` compares the header to the
+config, which shares its source; `test_indextts2_pth_manifest.py` compares it to
+the weights, which does not.
+
+It also names what our ports do NOT model. The reduced-dim gates all pass, and
+they pass over a smaller network than the checkpoint holds:
+
+| Where | Unported | Note |
+|---|---|---|
+| `s2mel.pth` `net.cfm.estimator` | `wavenet.*` | A WaveNet conditioning stack inside the CFM estimator. Absent from the port map entirely |
+| same | `skip_linear`, `layers.N.skip_in_linear` | U-Net skip connections across DiT depth. Our `dit::Block` carries both residuals but no skip-in |
+| same | `t_embedder2` | A SECOND timestep embedder. `cfm::TimestepFeatures` modeled one |
+| same | `cond_embedder`, `content_mask_embedder`, `cond_projection`, `cond_x_merge_linear`, `res_projection`, `conv1`, `conv2` | The conditioning front end |
+| `s2mel.pth` `net.length_regulator` | `mask_token`, `embedding`, `content_in_proj` | Our `lenreg` port has the interpolate/GroupNorm/Mish stack and none of these |
+| `s2mel.pth` | `net.gpt_layer` | Three weight/bias pairs; unmodeled and unexplained |
+| `codec.pth` | `model.encoder.*`, `model.down`, `model.up` | Only the quantizer (`fvq`) and the Vocos-shaped decoder are ported |
+
+`codec.pth` also ships `optimizer.state`, so part of its 0.57 GiB is training
+residue rather than weights.
 
 **Two components are NOT in this repository at all**: BigVGAN
 (`bigvgan_generator.pt`, fetched into `hf_cache/bigvgan`) and w2v-bert-2.0. They

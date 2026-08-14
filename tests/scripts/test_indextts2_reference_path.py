@@ -56,6 +56,27 @@ class SpecRecordsThePath(unittest.TestCase):
         self.assertIn("hidden_states[17]` tap", self.spec[i : i + 400])
 
 
+class EmotionPathsAreDistinguished(unittest.TestCase):
+    """The cheap emotion path must not be confused with the expensive one."""
+
+    def setUp(self):
+        self.spec = SPEC.read_text()
+
+    def test_both_paths_are_named(self):
+        self.assertIn("emo_conditioning_encoder", self.spec)
+        self.assertIn("find_most_similar_cosine", self.spec)
+
+    def test_the_supplied_path_is_recorded_as_NOT_running_the_networks(self):
+        i = self.spec.find("Path B, SUPPLIED")
+        self.assertNotEqual(i, -1, "the spec no longer distinguishes the two paths")
+        window = self.spec[i : i + 400]
+        self.assertIn("NOT RUN AT ALL", window)
+
+    def test_the_matrices_are_named(self):
+        for token in ("feat1.pt", "feat2.pt", "spk_matrix", "emo_matrix"):
+            self.assertIn(token, self.spec)
+
+
 class ConfigAgreesWithThePath(unittest.TestCase):
     def test_the_stats_file_is_the_one_the_config_names(self):
         text = CONFIG.read_text()

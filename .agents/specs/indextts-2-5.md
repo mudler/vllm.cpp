@@ -353,6 +353,38 @@ The full manifest is 22 files: `gpt.pth`, `codec.pth`, `s2mel.pth`,
 `wav2vec2bert_stats.pt`, `feat1.pt`, `feat2.pt`, the tiktoken vocabulary, the
 Qwen emotion directory, and `config.yaml`.
 
+### The emotion vector has TWO paths, and the cheap one is not the ported-looking one
+
+`infer_v2_5.py:668-677` against `:723-726`. This matters because it reorders
+what a first render needs.
+
+**Path A, inferred from audio.** `get_emo_conditioning` runs the
+`emo_conditioning_encoder` Conformer and the `emo_perceiver_encoder` Perceiver
+resampler over an emotion reference clip, then `emovec_layer` and `emo_layer`
+project into the talker. That is the ~50 name patterns in `gpt.pth` this spec
+records as unported, and it is the path taken when no vector is supplied.
+
+**Path B, SUPPLIED.** When `emo_vector` is given -- eight weights, one per
+emotion, either passed in or produced from text by the bundled Qwen model -- the
+Conformer and the Perceiver are NOT RUN AT ALL. Instead:
+
+```
+weight_vector = tensor(emo_vector)                      # 8 emotions
+random_index  = [find_most_similar_cosine(style, m) for m in spk_matrix]
+emo_matrix    = [m[i] for i, m in zip(random_index, emo_matrix)]
+emovec_mat    = weight_vector.unsqueeze(1) * emo_matrix
+```
+
+`spk_matrix` and `emo_matrix` are `feat1.pt` and `feat2.pt`, both shipped in the
+checkpoint and both small. So Path B is a cosine similarity, a row selection and
+a weighted sum -- no new network at all.
+
+**Consequence for sequencing.** The emotion Conformer and Perceiver are NOT on
+the critical path to a first render; they are what a caller needs when the
+emotion should be *inferred from a clip* rather than stated. A render can supply
+the vector directly. That moves both networks behind the render rather than in
+front of it, and moves `feat1.pt` / `feat2.pt` in front.
+
 ### The reference-audio path, read from the running code
 
 `infer_v2_5.py:280-295` and `:630`. Three facts here each produce a model that
@@ -465,11 +497,18 @@ values in [-1.14, -0.31]) and the 24-layer talker backbone (6 tokens x 1280,
 
 **Not started or not finished**, in the order that unblocks a render:
 
-1. an intermediate-layer tap on `EncoderStack` for `hidden_states[17]`, plus the
-   stored-statistics normalization;
-3. the talker's emotion path: the `emo_conditioning_encoder` Conformer and the
-   `emo_perceiver_encoder` Perceiver resampler;
-4. the talker generate loop and its heads;
-5. BigVGAN's separate checkpoint, which is not in this repository;
-6. W6b, the two routes and ABI v19;
-7. W5 compose and W7 speed, both of which additionally need #633.
+1. the SUPPLIED emotion vector (Path B above): `feat1.pt` / `feat2.pt`, a cosine
+   similarity and a weighted sum. Small, and it is what a first render needs;
+2. BigVGAN's separate checkpoint, which is not in this repository;
+3. W5 compose: drive the whole chain on real weights and emit a WAV;
+4. W6b, the two routes and ABI v19;
+5. W7 speed, which additionally needs #633;
+6. the INFERRED emotion path (Path A): the `emo_conditioning_encoder` Conformer
+   and the `emo_perceiver_encoder` Perceiver. BEHIND a render, not in front of
+   it, because a caller can state the emotion instead of having it inferred.
+
+**Already done and previously listed here as outstanding**: the SeamlessM4T
+feature extractor, the `hidden_states[17]` tap, the stored-statistics
+normalization, the talker prompt (`prepare_gpt_inputs`) and the greedy
+autoregressive loop. Text plus a reference clip reaches mel CODES in the
+library; what stands between that and audio is items 1 to 3.

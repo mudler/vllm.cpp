@@ -473,7 +473,14 @@ Gemma-3 and Qwen3 all-native, with Gemma-3 strict 48/48 against two vLLM-ROCm
 oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-native
 but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
 contributor-measured on 2x R9700 and CPU-link-verified our side;
-[guide](ROCM.md)), and the full tool-calling template surface. **Muse Glimmer's
+[guide](ROCM.md)), inference-time CPU weight offload (`ENG-WEIGHT-OFFLOAD`
+READY, spec only: vLLM's `cpu_offload_gb` UVA arm with dotted-segment
+`cpu_offload_params` targeting, plus the layer-group `PrefetchOffloader` — a
+pure mirror floor, and #149's dense half. Its memory and speed gates need a
+discrete-GPU rig, because on unified-memory GB10 offloading to "CPU" frees
+nothing, so those gates are blocked rather than pending
+[spec](../.agents/specs/weight-offload-uva.md)), and the full tool-calling
+template surface. **Muse Glimmer's
 GGUF arm generates coherently** (#347, #359), is NOT token-exact, and has
 only a llama.cpp bar (#333). Its CPU decode was **synchronisation-bound, not
 kernel-bound**: the threadpool's never-yielding spin-wait cost a full scheduler

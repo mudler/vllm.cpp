@@ -7,10 +7,11 @@
 
 ## Before starting
 
-<!-- Record what you found before implementation. "No matching issue or PR" is
-     valid; do not invent one for small governance or documentation work. -->
+<!-- Record what you found before implementation. Every change needs an open
+     issue. -->
 
 - Issue/PR search and existing claim:
+- Pull request shape selected at row claim:
 - Roadmap or matrix row, plus `scripts/ready-for-helper.py` result when applicable:
 - Exact current-code and test/evidence anchors inspected:
 

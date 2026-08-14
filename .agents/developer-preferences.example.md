@@ -23,6 +23,9 @@ choices below; `.env` keeps the paths and hosts.
 - Base ref: `upstream/main`.
 - Working branch: create or reuse a feature branch; do not work on local
   `main`.
+- Pull request shape: `<one PR for spec and implementation (recommended), or
+  separate spec and implementation PRs>`. Record the answer at row claim and do
+  not ask again for that row.
 - Fetch: allowed from `<read-only remote>`.
 - Push: ask first; if allowed, name the remote and permitted ref namespace.
 - Merge to `main`: not allowed unless explicitly requested for the current

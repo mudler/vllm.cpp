@@ -49,7 +49,9 @@ not applicable.
       revision. If the model does not exist at the pin, that is an exception:
       record it in [`porting-inventory.md`](porting-inventory.md) §9 and argue
       for it in the commit that introduces it.
-- [ ] The spec is committed **before** implementation.
+- [ ] The spec is committed **before** implementation. At row claim, ask the
+      developer whether the spec and implementation use one pull request or
+      separate pull requests. Recommend one pull request and record the answer.
 
 ## 1. Config
 

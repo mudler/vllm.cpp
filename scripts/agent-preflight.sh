@@ -201,6 +201,8 @@ for suite in "${SUITES[@]}"; do
 done
 run "trailer suites" python3 -m unittest \
   tests.scripts.test_check_commit_trailers
+run "commit style suites" python3 -m unittest \
+  tests.scripts.test_check_commit_style
 
 # The COMMITTED range, checked the way CI checks it. Deliberately OUTSIDE the
 # --staged block: `--staged` inspects staged paths and is therefore VACUOUS after
@@ -223,6 +225,8 @@ if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
    [ "$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)" -gt 0 ]; then
   echo "Commit trailers vs origin/main:"
   run "commit-trailers" python3 scripts/check-commit-trailers.py \
+    --range "origin/main..HEAD"
+  run "commit-style" python3 scripts/check-commit-style.py \
     --range "origin/main..HEAD"
 fi
 

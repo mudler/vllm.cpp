@@ -464,6 +464,12 @@ Parakeet ASR (2026-08-07): *CPU-correct, ON THE ONE SURFACE (ROW 1)*. Ids exact 
 ## Not supported yet
 
 LoRA (W1 CPU runtime brick landed; not yet usable end-to-end), multi-GPU,
+hybrid CPU+GPU device placement (`ENG-HYBRID-PLACEMENT` READY, spec only:
+routed-MoE expert COMPUTE on the CPU backend with the rest on GPU, the inverse
+of weight offload; #149's CPU-MoE half. Its speed floor vs llama.cpp `-ncmoe`
+needs a discrete-GPU rig, which unified-memory GB10 cannot provide, so that
+gate is blocked rather than pending
+[spec](../.agents/specs/hybrid-placement.md)),
 Vulkan (opt-125m exact; 25 native +8 GDN, both
 recurrences + fused attn preamble; 27B prefill 21.5x, decode
 4.36/4.35 MET; 27B load 100.8 -> 53.4 GiB; #125

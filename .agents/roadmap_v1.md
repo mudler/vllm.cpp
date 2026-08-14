@@ -174,7 +174,7 @@ issue is not yet placed. Keyed record: update in place, never append.
 | [#146](https://github.com/mudler/vllm.cpp/issues/146) | — | Pascal support | feature |
 | [#147](https://github.com/mudler/vllm.cpp/issues/147) | — | Multi-GPU tensor parallel on real hardware | feature |
 | [#148](https://github.com/mudler/vllm.cpp/issues/148) | — | Volta (sm_70) and Turing (sm_75) support | feature |
-| [#149](https://github.com/mudler/vllm.cpp/issues/149) | — | CPU/RAM offload and CPU-MoE hybrid execution | feature |
+| [#149](https://github.com/mudler/vllm.cpp/issues/149) | `ENG-HYBRID-PLACEMENT` | CPU/RAM offload and CPU-MoE hybrid execution — this row covers the CPU-MoE half only (routed-expert COMPUTE placed on the CPU backend); the dense layer-offload half is `ENG-WEIGHT-OFFLOAD` and the multi-GPU half is [#147](https://github.com/mudler/vllm.cpp/issues/147)/`BACKEND-DISTRIBUTED-TP`, so #149 closes when all three land | feature |
 | [#192](https://github.com/mudler/vllm.cpp/issues/192) | — | `OrEmpty` C-linkage returns `std::string` (fixed by #195) | bug |
 | [#193](https://github.com/mudler/vllm.cpp/issues/193) | — | A100 (sm_80): crashes and wrong GDN output in fast paths | bug |
 | [#230](https://github.com/mudler/vllm.cpp/issues/230) | — | `test_agent_record.py`: 7 issue-intake tests never run, and error when they do | bug |

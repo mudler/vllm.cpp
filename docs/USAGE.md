@@ -2339,6 +2339,9 @@ WAVENET_SRC=/path/to/index-tts/indextts/s2mel/modules \
 
 DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
   python3 scripts/gen-dit-tail-goldens.py --out tests/vllm/models/dit_tail_goldens.inc
+
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-front-goldens.py --out tests/vllm/models/dit_front_goldens.inc
 ```
 
 The U-Net skip routing is recorded rather than generated into an `.inc`: this

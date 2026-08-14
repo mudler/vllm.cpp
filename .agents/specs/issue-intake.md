@@ -244,6 +244,49 @@ Stop if the ownership definition cannot reach 33 on the current tree. A mark
 that does not match the measured count means the definition is wrong, not that
 the mark needs adjusting.
 
+## Outcome
+
+**What was measured.** The union driver binds in this repository, not only in a
+scratch directory. Two branches each appended one row to the real index and
+merged with both rows present and no conflict. The same shape conflicts without
+the driver.
+
+**What the mutations found.** Nine guarantees were mutated and all nine fire:
+preamble drift, a deleted preamble line, a duplicate row, a row whose number and
+URL disagree, a row that lost its link, an extra unowned row, a ratchet that did
+not fall, an empty index, and both range cases for a deleted and an edited row.
+
+One mutation exposed a real defect rather than confirming a guarantee. The first
+version of the row loop skipped any line not starting with `| [#`, so a row that
+lost its link was invisible instead of malformed. The pre-existing
+`test_a_bare_issue_number_without_a_link_is_rejected` case caught it. The loop
+now matches any table line that is not the header or the separator.
+
+**What was rejected.** Deleting the index outright. 152 of its 185 rows name an
+owning row, which is what lets the ownership gate run without a network call.
+Deriving the index from specs was rejected for the same round, because 148 of
+304 specs cite an issue and 3 of 15 sampled rows are absent from their owning
+spec. Deriving would have dropped about a fifth of the mapping silently.
+
+**Why the mark lives in the checker.** A number in the data file is an ordinary
+edit. A number in the checker is a checker semantic change, which `AGENTS.md`
+already gates behind a spec and a red-before test. The cost is that every
+legitimate ratchet-down edits the checker, and that cost is the point.
+
+**Why `high_water` is injectable.** Without it every small fixture is red for
+having the wrong number of unowned rows, which would hide whatever the fixture
+is actually about. That is the mute-switch shape this protocol exists to avoid.
+
+**A vacuous pass, found and understood.** The range check reported OK after a
+committed row was deleted on this branch. It is not a mute switch. The index is
+added in this range, so its net diff has no removals at all. Re-run against a
+base where the file exists, both the deleted-row and the edited-row cases fail
+as intended. The committed suite builds real repositories for exactly this
+reason.
+
+**What this does not do.** The 88 issues already open stay open. This change
+stops the unowned count from growing and does not retire the backlog.
+
 ## Now
 
-Spec written and awaiting developer review. No implementation started.
+Implemented and gated. Awaiting review on the pull request.

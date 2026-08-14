@@ -826,7 +826,7 @@ class LinkExtraction(unittest.TestCase):
 
 
 class IssueIntakeTable(unittest.TestCase):
-    """The roadmap issue table is the intake surface: no work without an issue.
+    """The issue index is the intake surface: no work without an issue.
 
     The validator is deliberately NETWORK-FREE, so these mutations are all about
     FORM and internal consistency. Whether an issue is still open is the agent's

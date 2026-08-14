@@ -41,7 +41,7 @@ not applicable.
 
 ## 0. Before claiming
 
-- [ ] An open issue tracks the work, linked from the roadmap issue table, the
+- [ ] An open issue tracks the work, linked from the append-only issue index, the
       row's spec, and the PR body.
 - [ ] The gap is re-verified against the *current* pin and local head, not
       against a spec's description of them.
@@ -139,7 +139,7 @@ Each applicable, or recorded not-applicable:
 ## 7. Records, in the same change
 
 - [ ] Row + checklist entry + rollup in the owning matrix.
-- [ ] `roadmap_v1.md` issue table, `coordination.md` claim.
+- [ ] `issue-index.md` row appended, `coordination.md` claim.
 - [ ] `docs/STATUS.md`, `docs/BENCHMARKS.md`, `.agents/NOW.md` on a lifecycle
       change; `docs/FEATURES.md` / `docs/USAGE.md` / `README.md` when the
       user-visible surface moves.

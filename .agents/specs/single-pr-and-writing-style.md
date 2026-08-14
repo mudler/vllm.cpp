@@ -193,10 +193,13 @@ a checker* requires:
   is empty passes the tree as it stands today. Captured before the checker exists.
 - **Green after.** The same commit is reported, with both failures named
   separately. A commit that fixes only one of the two still fails on the other.
-- **No false red on ordinary work.** The checker runs over the last 200 non-merge
-  commits and reports exactly the 23 empty-body cases and zero trailing-period
-  cases, matching the measurement above. A different count means the checker is
-  measuring something other than what was surveyed, and the design is wrong.
+- **No false red on ordinary work.** The checker reports zero trailing-period
+  cases and the same empty-body count the survey found **over the same window**.
+  Name the window when quoting the number: `git log --no-merges -200` is 200
+  commits and yields 23, while the Git range `e73eb6717~200..e73eb6717` is 338
+  non-merge commits and yields 34. A count that differs *for one fixed window*
+  means the checker is measuring something other than what was surveyed, and the
+  design is wrong.
 - **Cutover holds.** With the cutover set, the same 200-commit run is silent.
 - Full `scripts/agent-preflight.sh` green. No checker starts passing something it
   previously failed.
@@ -242,9 +245,126 @@ Stop and report rather than proceeding if:
 - The fresh reviewer finds a semantic change outside the PR-shape and
   writing-style changes in this spec. Return the finding to a fresh implementer.
 
+## Outcome
+
+The implementation keeps the developer-selected single pull request. The
+policy now recommends that shape, asks at row claim before the spec is written,
+and records the answer as a developer preference. Separate pull requests remain
+available whenever the developer selects them. The policy names helper
+dispatch, large campaigns, and deliberate roadmap, issue, or spec-only changes
+as useful split cases.
+
+The repository now owns one canonical copy of each writing guide. The commit
+guide covers subjects, bodies, pull request titles and descriptions, branch
+names, changelog entries, release-note lines, convention detection, repository
+trailers, and precedence. The prose guide covers technical documents and all
+session prose. The two Claude skill files are thin routes to those canonical
+files.
+
+The checker evidence produced these results:
+
+- The existing trailer checker returned `errors=[]` for a protocol-valid
+  message with a final subject period and no authored prose.
+- The new unit suite failed with `FileNotFoundError` before the checker existed.
+- The focused suite then passed 12 tests. It covers valid messages, each
+  independent failure, both failures together, merge commits, revision and
+  ancestry errors, cutover behavior, incomparable history, complete CLI error
+  output, and a fixed 200-message sample shape.
+- The last 200 non-merge commits contained 0 final subject periods and 23 empty
+  authored bodies. This result matches the pre-change measurement.
+- **The window matters, and the spec states it imprecisely above.** "The last 200
+  non-merge commits" means `git log --no-merges -200`, which is exactly 200
+  commits. It is not the Git range `e73eb6717~200..e73eb6717`, which reaches 471
+  commits and 338 non-merge commits because a `~200..` range also pulls in every
+  side-branch commit the merges bring with them. Over that larger range the
+  checker reports 34 empty bodies. Operator re-verification walked both windows
+  under the same counting rule and reproduced both numbers, so the survey and the
+  checker agree and neither number is wrong. They answer different questions.
+- The same surveyed history was silent with `HEAD` as the cutover.
+- Negative mutations removed or inverted the subject check, body check,
+  protocol-block exclusion, merge exclusion, cutover, base ancestry,
+  cutover reachability, incomparable-history error, complete range walk, CLI
+  exit status, valid-message path, and combined-error path. Each focused test
+  failed. The restored checker hash was
+  `c0f59c90c6636f82f32591ce10815297804dede9faf7e2922a65e71a3810b89f`.
+  The restored test hash was
+  `e32071b55f2309b0a178bac7485ba47f336fae4c7c1639fac224bf2f8e0badf4`.
+
+The body requirement is the selected default because the diff cannot record the
+reason for a change. The implementation does not add a subject-length or body
+wrap checker. The measured history rejects those mechanical gates. The writing
+guide keeps them as review guidance.
+
+### Rule-preservation inventory
+
+The comparison base is `e73eb67177b1d0f570523b163c5e12d318bf8854`, the
+parent of the first spec commit. Each prior top-level section maps to the named
+anchor in the rewritten file:
+
+| Prior section | Rewritten anchor | Preserved content |
+|---|---|---|
+| Preamble | `# AGENTS.md: the rules` | Complete-policy authority, task-guide limit, C++ scope, vLLM behavior and speed targets |
+| `Start here` | `## Start here` | Bootstrap, role selection, headless authority, live state, scoped reading, preflight, and no inferred environment or preference |
+| `History is git` | `## History is git` | No state log, all six history commands, and spec plus Git as the historical source |
+| `Every change starts from an issue` | `## Every change starts from an issue` | Open issue, three matching links, in-flow bug traceability, and the normal path for surprising fixes or checker changes |
+| `Spec before code` | `## Spec before code` | Committed spec before implementation, gap re-verification, and the required `Outcome`; adds only the approved pull request choice |
+| `How work gets done` | `## How work gets done` | Fresh implementer, red-first work, fresh mutation reviewer, fresh repair, operator gate, delegation envelope, multiple operators, and no force push |
+| `vLLM is the reference` | `## vLLM is the reference` | Mirror and pin rules, running and source oracles, full execution chain, dtype defaults, upstream tests, and same-tool traces |
+| `When vLLM has no implementation` | `## When vLLM has no implementation` | Primary-reference priority, all eight registry entries, per-oracle pins, secondary-oracle limit, and measured gateability |
+| `Gates` | `## Gates` | Correctness before speed, identical inputs, production denominator, all performance axes, idle same-binary A/B, no ceiling, and one result state |
+| `Shared seams` | `## Shared seams` | All four routing and ABI seams, tracked exceptions, additive files, and quantized model arms |
+| `Records` | `## Records` | Stable inventory fields, paired lifecycle writes, keyed merge procedure, three no-lock record shapes, entry limits, derived measurements, and evidence retention |
+| `Public documents` | `## Public documents` | All six table entries and the exact lifecycle, projection, and `NOW.md` triggers |
+| `Work happens in a worktree` | `## Work happens in a worktree` | One task branch and linked worktree per unit, clean shared checkout, pinned base, and cleanup |
+| `Landing work` | `## Landing work` | Branch-to-main path, helper and operator authority, exact-SHA gate and push, remote unknown state, merge cadence, trailers, attribution, path classes, and no line budget |
+| `Changing the rules or a checker` | `## Changing the rules or a checker` | Checker-message authority, spec and red-before evidence, no weakened assertions, no waiver registry, and Git-held exceptions |
+| `Task guides` | `## Task guides` | All nine task-guide entries |
+| `Commands` | `## Commands` | All six commands and the final authority boundary for remote, service, compute, and download actions |
+
+The high-risk rules map as follows:
+
+- Issue-first and spec-first remain under `Every change starts from an issue`
+  and `Spec before code`.
+- The delegation, independent review, negative mutation, and fresh-repair loop
+  remains under `How work gets done`.
+- The prohibition on force-pushing `main` remains under `How work gets done`.
+  The general no-force landing rule remains under `Landing work`.
+- vLLM remains the primary and only reference wherever it implements a path.
+  The secondary-oracle registry and its limits remain under
+  `When vLLM has no implementation`.
+- The single model dtype, annotated `f32` exception, and too-wide dtype warning
+  remain under `vLLM is the reference`.
+- Correctness-before-performance, production vLLM, identical workloads, all
+  performance axes, and same-binary A/B remain under `Gates`.
+- The four shared seams and the no-parallel-path rule remain under
+  `Shared seams`.
+- Stable records, keyed merge behavior, and the one-file, append-only, or
+  derived-at-read-time shapes remain under `Records`.
+- All public-document triggers remain under `Public documents`. The existing
+  checker-required `BENCHMARKS` cell and lifecycle sentence remain exact.
+- Worktree isolation and the clean shared checkout remain under
+  `Work happens in a worktree`.
+- Helper and operator landing authority, exact-SHA push order, remote unknown
+  state, and merge cadence remain under `Landing work`.
+- The protocol marker, three trailers, AI attribution rules, forge exception,
+  and `Signed-off-by` prohibition remain under `Landing work`.
+- Checker-message authority, red-before evidence, and the no-weakening rule
+  remain under `Changing the rules or a checker`.
+- All task-guide routes remain under `Task guides`.
+
 ## Now
 
-The developer selected the recommended single PR for this row. The first commit
-contains the original spec. This spec-only correction requires the complete
-`AGENTS.md` rewrite before implementation starts. The rewrite follows in an
-isolated implementation commit in the same PR.
+The developer selected the recommended single pull request for this row. The
+spec commits precede the implementation commits in that pull request.
+
+The implementation first landed the `AGENTS.md` rewrite bundled with twelve
+other files, which this spec forbids. Operator verification caught it and split
+the commit: `8f549e6f6` carries the two guides, the skill routes, the checker
+and its test, and the supporting edits; `b4536cbb2` carries the `AGENTS.md`
+rewrite alone. The split changed no content — the resulting tree is identical to
+the bundled commit's tree apart from this file.
+
+Operator verification also reproduced the checker survey independently, in both
+windows, and confirmed both mutation-restoration hashes byte-for-byte.
+
+Fresh review of the `AGENTS.md` rewrite, the full gate, and landing remain.

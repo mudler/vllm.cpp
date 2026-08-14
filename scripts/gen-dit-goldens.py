@@ -71,6 +71,32 @@ def main() -> int:
     q = P("dq", (1, T, HEADS, HEAD_DIM), 1.0)
     rot = m.apply_rotary_emb(q, freqs)
 
+
+    # ---- SwiGLU feed-forward and the whole TransformerBlock ----
+    INTER = 16
+    cfg = m.ModelArgs(block_size=64, n_layer=1, n_head=HEADS, dim=DIM,
+                      head_dim=HEAD_DIM, vocab_size=32, intermediate_size=INTER)
+    ff = m.FeedForward(cfg).eval()
+    with torch.no_grad():
+        for n, par in ff.named_parameters():
+            par.copy_(P("ff." + n, tuple(par.shape)).reshape(par.shape))
+    ff_in = P("ffin", (1, T, DIM), 1.0)
+    ff_out = ff(ff_in)
+
+    blk = m.TransformerBlock(cfg).eval()
+    bman = []
+    with torch.no_grad():
+        for n, par in list(blk.named_parameters()) + list(blk.named_buffers()):
+            if n.endswith("num_batches_tracked"): continue
+            par.copy_(P("blk." + n, tuple(par.shape) if par.dim() else (1,)).reshape(par.shape))
+            bman.append((n, list(par.shape)))
+    bx = P("bx", (1, T, DIM), 1.0)
+    bc = P("bc", (1, 1, DIM), 1.0)
+    input_pos = torch.arange(T)
+    mask = torch.ones(1, 1, T, T, dtype=torch.bool)
+    with torch.no_grad():
+        blk_out = blk(bx, bc, input_pos, freqs, mask)
+
     def emit(f, name, t):
         # .float() first: precompute_freqs_cis returns BFLOAT16 upstream, so the
         # rotary table already carries bf16 precision before any rotation runs.
@@ -93,6 +119,16 @@ def main() -> int:
         emit(f, "kX", x); emit(f, "kRmsOut", rms_out)
         emit(f, "kEmb", emb); emit(f, "kAlnOut", aln_out)
         emit(f, "kFreqs", freqs); emit(f, "kQ", q); emit(f, "kRotOut", rot)
+        f.write(f"inline constexpr int64_t kInter = {INTER};\n\n")
+        emit(f, "kFfIn", ff_in); emit(f, "kFfOut", ff_out)
+        f.write(f"inline constexpr int64_t kBlockManifestSize = {len(bman)};\n")
+        f.write("struct BlockEntry { const char* name; int64_t rank; int64_t d0, d1; };\n")
+        f.write("inline constexpr BlockEntry kBlockManifest[] = {\n")
+        for nm, sh in bman:
+            d = list(sh) + [1, 1]
+            f.write(f'    {{"{nm}", {len(sh)}, {d[0]}, {d[1]}}},\n')
+        f.write("};\n\n")
+        emit(f, "kBx", bx); emit(f, "kBc", bc); emit(f, "kBlockOut", blk_out)
         f.write("}  // namespace dit_goldens\n")
     print(f"wrote {p}: dim={DIM} heads={HEADS} head_dim={HEAD_DIM} T={T}")
     return 0

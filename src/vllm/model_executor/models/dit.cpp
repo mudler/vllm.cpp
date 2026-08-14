@@ -2,6 +2,7 @@
 #include "vllm/model_executor/models/dit.h"
 
 #include <cmath>
+#include <limits>
 #include <cstddef>
 #include <vector>
 
@@ -87,6 +88,112 @@ std::vector<float> ApplyRotary(const std::vector<float>& x, int64_t frames, int6
       }
     }
   }
+  return out;
+}
+
+
+namespace {
+
+std::vector<float> Linear(const std::vector<float>& x, int64_t frames, int64_t in_dim,
+                          int64_t out_dim, const std::vector<float>& w) {
+  std::vector<float> out(static_cast<size_t>(frames * out_dim));
+  for (int64_t t = 0; t < frames; ++t) {
+    for (int64_t o = 0; o < out_dim; ++o) {
+      double acc = 0.0;
+      for (int64_t i = 0; i < in_dim; ++i) {
+        acc += static_cast<double>(w[static_cast<size_t>(o * in_dim + i)]) *
+               static_cast<double>(x[static_cast<size_t>(t * in_dim + i)]);
+      }
+      out[static_cast<size_t>(t * out_dim + o)] = static_cast<float>(acc);
+    }
+  }
+  return out;
+}
+
+double Silu(double x) { return x / (1.0 + std::exp(-x)); }
+
+}  // namespace
+
+std::vector<float> SwiGlu(const std::vector<float>& x, int64_t frames, int64_t dim,
+                          int64_t intermediate, const std::vector<float>& w1,
+                          const std::vector<float>& w3, const std::vector<float>& w2) {
+  const std::vector<float> gate = Linear(x, frames, dim, intermediate, w1);
+  const std::vector<float> up = Linear(x, frames, dim, intermediate, w3);
+  std::vector<float> mid(gate.size());
+  for (size_t i = 0; i < gate.size(); ++i) {
+    // SiLU applies to W1's output only.
+    mid[i] = static_cast<float>(Silu(static_cast<double>(gate[i])) * static_cast<double>(up[i]));
+  }
+  return Linear(mid, frames, intermediate, dim, w2);
+}
+
+std::vector<float> Block(const std::vector<float>& x, const std::vector<float>& cond,
+                         int64_t frames, int64_t dim, int64_t heads, int64_t head_dim,
+                         int64_t intermediate, const std::vector<float>& freqs,
+                         const BlockWeights& w, double eps) {
+  VT_CHECK(x.size() == static_cast<size_t>(frames * dim), "dit: block shape");
+
+  // ── attention half ────────────────────────────────────────────────────────
+  const std::vector<float> normed =
+      AdaptiveLayerNorm(x, frames, dim, cond, w.attn_proj_w, w.attn_proj_b, w.attn_norm_w, eps);
+
+  const int64_t qkv_dim = heads * head_dim;
+  const std::vector<float> qkv = Linear(normed, frames, dim, 3 * qkv_dim, w.wqkv);
+  std::vector<float> q(static_cast<size_t>(frames * qkv_dim));
+  std::vector<float> k(q.size()), v(q.size());
+  for (int64_t t = 0; t < frames; ++t) {
+    for (int64_t i = 0; i < qkv_dim; ++i) {
+      const size_t base = static_cast<size_t>(t * 3 * qkv_dim);
+      q[static_cast<size_t>(t * qkv_dim + i)] = qkv[base + static_cast<size_t>(i)];
+      k[static_cast<size_t>(t * qkv_dim + i)] = qkv[base + static_cast<size_t>(qkv_dim + i)];
+      v[static_cast<size_t>(t * qkv_dim + i)] = qkv[base + static_cast<size_t>(2 * qkv_dim + i)];
+    }
+  }
+  // Rotary applies to q and k, never to v.
+  const std::vector<float> qr = ApplyRotary(q, frames, heads, head_dim, freqs);
+  const std::vector<float> kr = ApplyRotary(k, frames, heads, head_dim, freqs);
+
+  const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+  std::vector<float> ctx(static_cast<size_t>(frames * qkv_dim));
+  for (int64_t hd = 0; hd < heads; ++hd) {
+    for (int64_t i = 0; i < frames; ++i) {
+      std::vector<double> scores(static_cast<size_t>(frames));
+      double best = -std::numeric_limits<double>::infinity();
+      for (int64_t j = 0; j < frames; ++j) {
+        double dot = 0.0;
+        for (int64_t d = 0; d < head_dim; ++d) {
+          dot += static_cast<double>(qr[static_cast<size_t>(i * qkv_dim + hd * head_dim + d)]) *
+                 static_cast<double>(kr[static_cast<size_t>(j * qkv_dim + hd * head_dim + d)]);
+        }
+        dot *= scale;
+        scores[static_cast<size_t>(j)] = dot;
+        best = std::max(best, dot);
+      }
+      double denom = 0.0;
+      for (double& sc : scores) { sc = std::exp(sc - best); denom += sc; }
+      for (int64_t d = 0; d < head_dim; ++d) {
+        double acc = 0.0;
+        for (int64_t j = 0; j < frames; ++j) {
+          acc += scores[static_cast<size_t>(j)] *
+                 static_cast<double>(v[static_cast<size_t>(j * qkv_dim + hd * head_dim + d)]);
+        }
+        ctx[static_cast<size_t>(i * qkv_dim + hd * head_dim + d)] =
+            static_cast<float>(acc / denom);
+      }
+    }
+  }
+  const std::vector<float> attn_out = Linear(ctx, frames, qkv_dim, dim, w.wo);
+
+  std::vector<float> h(x.size());
+  for (size_t i = 0; i < h.size(); ++i) h[i] = x[i] + attn_out[i];  // FULL residual
+
+  // ── feed-forward half ─────────────────────────────────────────────────────
+  const std::vector<float> ffn_normed =
+      AdaptiveLayerNorm(h, frames, dim, cond, w.ffn_proj_w, w.ffn_proj_b, w.ffn_norm_w, eps);
+  const std::vector<float> ffn = SwiGlu(ffn_normed, frames, dim, intermediate, w.w1, w.w3, w.w2);
+
+  std::vector<float> out(h.size());
+  for (size_t i = 0; i < out.size(); ++i) out[i] = h[i] + ffn[i];  // FULL residual
   return out;
 }
 

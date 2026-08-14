@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -100,4 +101,49 @@ TEST_CASE("dit rotary preserves the norm of each ADJACENT pair") {
       }
     }
   }
+}
+
+TEST_CASE("dit SwiGLU gates on W1, not W3") {
+  // w2(silu(w1 x) * w3 x). Swapping w1 and w3 gives an identically shaped
+  // network that still trains; the checkpoint stores them separately, so only
+  // the values distinguish them.
+  const std::vector<float> x(std::begin(kFfIn), std::end(kFfIn));
+  const std::vector<float> got = vllm::models::dit::SwiGlu(
+      x, kFrames, kDim, kInter, Rand("ff.w1.weight", kInter * kDim, 0.3),
+      Rand("ff.w3.weight", kInter * kDim, 0.3), Rand("ff.w2.weight", kDim * kInter, 0.3));
+  REQUIRE(got.size() == static_cast<size_t>(kFrames * kDim));
+  CHECK(Worst(got, kFfOut, got.size()) < 1e-5);
+}
+
+TEST_CASE("dit TransformerBlock reproduces the whole upstream block") {
+  std::map<std::string, std::vector<float>> m;
+  for (int64_t i = 0; i < kBlockManifestSize; ++i) {
+    const auto& e = kBlockManifest[i];
+    const int64_t d[2] = {e.d0, e.d1};
+    int64_t n = 1;
+    for (int64_t k = 0; k < e.rank; ++k) n *= d[k];
+    m[e.name] = Rand(std::string("blk.") + e.name, n, 0.3);
+  }
+  vllm::models::dit::BlockWeights w;
+  w.wqkv = m.at("attention.wqkv.weight");
+  w.wo = m.at("attention.wo.weight");
+  w.w1 = m.at("feed_forward.w1.weight");
+  w.w3 = m.at("feed_forward.w3.weight");
+  w.w2 = m.at("feed_forward.w2.weight");
+  w.attn_proj_w = m.at("attention_norm.project_layer.weight");
+  w.attn_proj_b = m.at("attention_norm.project_layer.bias");
+  w.attn_norm_w = m.at("attention_norm.norm.weight");
+  w.ffn_proj_w = m.at("ffn_norm.project_layer.weight");
+  w.ffn_proj_b = m.at("ffn_norm.project_layer.bias");
+  w.ffn_norm_w = m.at("ffn_norm.norm.weight");
+
+  const std::vector<float> x(std::begin(kBx), std::end(kBx));
+  const std::vector<float> c(std::begin(kBc), std::end(kBc));
+  const std::vector<float> freqs(std::begin(kFreqs), std::end(kFreqs));
+  const std::vector<float> got = vllm::models::dit::Block(
+      x, c, kFrames, kDim, kHeads, kHeadDim, kInter, freqs, w, 1e-5);
+  REQUIRE(got.size() == x.size());
+  const double worst = Worst(got, kBlockOut, got.size());
+  INFO("max abs diff vs upstream TransformerBlock: ", worst);
+  CHECK(worst < 5e-5);
 }

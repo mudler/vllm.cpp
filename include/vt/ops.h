@@ -397,6 +397,13 @@ enum class OpId : uint8_t {
   // Additive: only Ltx2DitForwardDevice dispatches it. Appended before kCount
   // so no existing op's id shifts.
   kLtx2,
+  // The NON-GATED MoE activation: out = relu(x)^2, the whole epilogue of a
+  // NemotronH expert (models/nemotron_h.py:227 activation_without_mul("relu2")
+  // -> MoEActivation.RELU2_NO_MUL). Sibling of kMoeSiluMul with ONE input
+  // instead of two, because a non-gated expert has no gate half to multiply by
+  // (nemotron_h.py:220 ckpt_names=("up_proj","down_proj","")). See vt::MoeRelu2.
+  // Appended before kCount so no existing op's id shifts.
+  kMoeRelu2,
   kCount
 };
 
@@ -941,6 +948,8 @@ using MarlinDenseGemmFn =
              const Tensor& /*b_scales*/, const Tensor& /*global_scale*/, Tensor& /*workspace*/,
              const MarlinDenseArgs&);
 using MoeSiluMulFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+// kMoeRelu2: out[i] = relu(x[i])^2 — the NON-GATED MoE activation (one input).
+using MoeRelu2Fn = void (*)(Queue&, Tensor&, const Tensor&);
 // --- Qwen3.6 elementwise "glue" ops (M0.9 forward). These replace host-side
 // loops so the decode step can run entirely on-device (CUDA-graph capture).
 // All math in f32; dims are inferred from the tensor shapes (no args structs).
@@ -1064,8 +1073,10 @@ using IndexSelectFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using IndexCopyFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using MoeRouterTopKFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
                                  const MoeRouterTopKArgs&, const Tensor*);
+// The trailing float is `routed_scale` — the routed_scaling_factor applied to
+// the ROUTED sum before the shared term is added (see vt::MoeCombine).
 using MoeCombineFn =
-    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, float);
 using MoeCombineGateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                   const Tensor&);
 using AttentionFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
@@ -1683,6 +1694,30 @@ void MarlinDenseGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_wei
 // vt::SiluAndMul (single [T,2D] input), this takes the two separately-produced
 // projections so no concat/copy is needed. CPU + CUDA.
 void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
+
+// out[R,I] = relu(x[R,I])^2 — the NON-GATED MoE activation, and the whole
+// epilogue of a NemotronH expert. Mirror of vLLM's `ReLUSquaredActivation`
+// (layers/activation.py:609-628, forward_native = torch.square(F.relu(x))) as
+// reached through the fused-MoE path: `activation_without_mul("relu2")` ->
+// `MoEActivation.RELU2_NO_MUL` -> `apply_moe_activation`'s
+// `F.relu(input, inplace=True); torch.square(input, out=output)`
+// (layers/fused_moe/activation.py:34 `RELU2_NO_MUL`, :98
+// `activation_without_mul`, and the :184 RELU2_NO_MUL branch; `:33` is
+// GELU_TANH_NO_MUL, the neighbouring enumerator).
+//
+// Why this is NOT a MergedGemmGroup epilogue: a NON-gated expert has no gate
+// half to merge with (nemotron_h.py:220 `ckpt_names=("up_proj","down_proj","")`
+// — the empty third entry IS the absent gate). There is exactly ONE projection,
+// so the expert is the EXISTING grouped GEMM plus this activation, exactly as
+// the gated bf16 archs are kMoeGroupedGemmBf16 + kMoeSiluMul. See
+// merged_gemm.h's note on the non-gated family.
+//
+// DTYPE/ROUNDING ORDER is the mirrored part, not an implementation detail:
+// upstream's kernel (csrc/libtorch_stable/activation_kernels.cu:673-678)
+// widens to f32, clamps at zero in f32, squares in f32 and rounds ONCE on the
+// store — so a bf16 input with an f32 output keeps the FULL f32 square. x f32
+// or bf16, out f32/bf16. CPU + CUDA.
+void MoeRelu2(Queue& q, Tensor& out, const Tensor& x);
 
 // out[T,H] = x[T,H] / sqrt(mean(x^2) + eps) * w  (or *(1+w) when gemma);
 // out f32 or bf16 (computed in f32, rounded on store).
@@ -2372,7 +2407,7 @@ void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& log
                    const Tensor* e_score_correction_bias = nullptr);
 
 // Weighted scatter-combine of the per-expert outputs (moe-semantics.md §4/§6).
-//   out[t,:] = sum_j weights[t,j] * expert_out[t,j,:]   (f32 accumulation)
+//   out[t,:] = routed_scale * sum_j weights[t,j] * expert_out[t,j,:]  (f32 accum)
 //              + shared[t,:]                            (when shared != nullptr)
 // expert_out [T,K,H] any float dtype (the K per-slot expert MLP outputs for
 // token t), weights [T,K] f32 (router weights, §3), optional shared [T,H] any
@@ -2381,8 +2416,18 @@ void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& log
 // (§6 combine order: shared_output + routed_output). The activation-dtype
 // rounding of the routed sum before the shared add is carried by the caller
 // materializing expert_out/shared in the activation dtype.
+//
+// `routed_scale` is upstream's `apply_routed_scale_to_output=True` arm
+// (layers/fused_moe/runner/moe_runner.py:390-407, :402-406 `fused_output *=
+// routed_scaling_factor`, then :722-725 `result = shared_output + fused_output`).
+// It multiplies the ROUTED sum ONLY — the shared-expert term is added unscaled,
+// which is the whole point of the flag and the error a token gate catches late.
+// The DEFAULT 1.0f is the `apply_routed_scale_to_output=False` polarity every
+// landed caller uses, where the factor is instead folded into the router weights
+// by MoeRouterTopKArgs::routed_scaling_factor (layer.py:291-300 forces the
+// router's factor to 1.0 exactly when this one is not).
 void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
-                const Tensor* shared = nullptr);
+                const Tensor* shared = nullptr, float routed_scale = 1.0f);
 
 // --- Fused MoE combine + shared-expert gate (MoE glue fusion). Equivalent to
 // SharedExpertGate(shared=bf16(sigmoid(gl)*sd)) followed by MoeCombine(...,shared),

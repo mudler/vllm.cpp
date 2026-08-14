@@ -923,6 +923,15 @@ void MoeSiluMul(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up) {
   reinterpret_cast<MoeSiluMulFn>(GetOp(OpId::kMoeSiluMul, q.device.type))(q, out, gate, up);
 }
 
+void MoeRelu2(Queue& q, Tensor& out, const Tensor& x) {
+  VT_CHECK(x.Numel() == out.Numel(), "moe_relu2: out/x must have the same element count");
+  VT_CHECK(IsFloat(x.dtype) && IsOutFloat(out.dtype), "moe_relu2: float x, f32/bf16 out");
+  VT_CHECK(out.IsContiguous() && x.IsContiguous(), "moe_relu2: contiguous tensors required");
+  VT_CHECK(out.device == q.device && x.device == q.device,
+           "moe_relu2: device mismatch (out/x/queue)");
+  reinterpret_cast<MoeRelu2Fn>(GetOp(OpId::kMoeRelu2, q.device.type))(q, out, x);
+}
+
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual) {
   VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 1, "rmsnorm: x/out rank-2, w rank-1");
@@ -2510,7 +2519,7 @@ void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& log
 }
 
 void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
-                const Tensor* shared) {
+                const Tensor* shared, float routed_scale) {
   VT_CHECK(expert_out.rank == 3 && weights.rank == 2 && out.rank == 2,
            "moe_combine: expert_out [T,K,H], weights [T,K], out [T,H]");
   const int64_t t = out.shape[0], h = out.shape[1], k = weights.shape[1];
@@ -2531,8 +2540,8 @@ void MoeCombine(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& w
                  shared->device == q.device,
              "moe_combine: shared must be float [T,H] contiguous on the queue device");
   }
-  reinterpret_cast<MoeCombineFn>(GetOp(OpId::kMoeCombine, q.device.type))(q, out, expert_out,
-                                                                          weights, shared);
+  reinterpret_cast<MoeCombineFn>(GetOp(OpId::kMoeCombine, q.device.type))(
+      q, out, expert_out, weights, shared, routed_scale);
 }
 
 void MoeCombineGate(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,

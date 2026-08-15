@@ -108,6 +108,41 @@ class NoopWeightOffloader final : public WeightOffloader {
   bool moves_weights() const override { return false; }
 };
 
+// Upstream: class UVAOffloader (offloader/uva.py:21-137). The concrete arm that
+// keeps a weight off the device under a byte budget.
+//
+// WHAT THIS CLASS DOES AND DOES NOT DO. It answers the DECISION, delegating to
+// the `WeightOffloadPolicy` it owns, and it counts the bytes it has approved.
+// It does not copy, pin, or map anything: the caller that asked keeps the
+// weight in host memory instead of materialising it on the device, so the move
+// is an ABSENCE of work rather than work. That is the whole reason the decision
+// had to move into the loaders (see weight_offload_policy.h).
+//
+// The pinned-host-copy and device-view halves of upstream's UVA arm
+// (uva.py:97-105) have no equivalent yet and are NOT silently skipped: they
+// belong to the loader-side application, which owns the buffer.
+class UvaWeightOffloader final : public WeightOffloader {
+ public:
+  explicit UvaWeightOffloader(WeightOffloadPolicy policy)
+      : policy_(std::move(policy)) {}
+
+  WeightOffloadDecision ConsiderWeight(const std::string& canonical_name,
+                                       int64_t bytes) override {
+    return policy_.Consider(canonical_name, bytes);
+  }
+  const char* name() const override { return "UvaWeightOffloader"; }
+  int64_t offloaded_bytes() const override { return policy_.offloaded_bytes(); }
+  bool moves_weights() const override { return policy_.active(); }
+
+  // Upstream logs the total once when wrap_modules finishes (uva.py:57-61). We
+  // have no single finish point, so the engine reports it here after the model
+  // is prepared.
+  int64_t max_bytes() const { return policy_.max_bytes(); }
+
+ private:
+  WeightOffloadPolicy policy_;
+};
+
 // Upstream: get_offloader / set_offloader and the module-global `_instance`
 // (offloader/base.py:106-125). The default is the no-op, so an engine that
 // never calls the setter behaves exactly as it does today.

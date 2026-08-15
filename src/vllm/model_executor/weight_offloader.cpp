@@ -52,9 +52,17 @@ WeightOffloaderChoice CreateWeightOffloader(const OffloadConfig& config) {
   const std::optional<OffloadBackend> backend = config.ResolvedBackend();
   if (!backend.has_value()) return choice;
 
-  // W1: neither backend exists yet. Record which one was asked for so the
-  // caller can report it once. Returning the no-op silently would make a
-  // configured budget look honoured.
+  // W2b: the UVA arm exists. It answers the decision under its byte budget; the
+  // loader that asks is W2c, so today it is installed and never consulted.
+  if (*backend == OffloadBackend::kUva) {
+    choice.offloader = std::make_unique<UvaWeightOffloader>(
+        WeightOffloadPolicy::FromConfig(config));
+    return choice;
+  }
+
+  // Prefetch is W5. Record which backend was asked for so the caller can report
+  // it once. Returning the no-op silently would make a configured budget look
+  // honoured.
   choice.selected_backend_pending = offload_backend_str(*backend);
   return choice;
 }

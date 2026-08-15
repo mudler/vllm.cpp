@@ -352,7 +352,23 @@ an untargeted weight that consumes budget, targeting checked before the budget,
 a budget compared against the weight size, and a negative size advancing the
 total.
 
-Still owed for W2: the application itself, in the loaders.
+**W2b landed** (2026-08-15): `UvaWeightOffloader`, the concrete arm that owns a
+`WeightOffloadPolicy` and answers `ConsiderWeight` through it. The factory now
+builds it for the `uva` backend, so `uva` is no longer reported as a backend
+this build lacks; `prefetch` still is, and W5 owns that.
+
+The engine now distinguishes two cases that both offload nothing, because a bug
+report needs to name the right one: a backend this build cannot construct at
+all, and a backend that IS constructed but that no loader consults yet.
+
+W1's "the factory NAMES a requested backend it cannot honour yet" case was
+UPDATED rather than deleted. It encoded W1's state, where neither backend
+existed. The expectation moved and the assertion stayed, because that assertion
+is what the two engine messages rest on.
+
+Still owed for W2 (W2c): the first loader that asks `ConsiderWeight` and honours
+the answer, plus the pinned-host-copy and device-view halves of upstream's arm
+(uva.py:97-105), which belong to whoever owns the buffer.
 
 **W1 landed** (2026-08-14): the offloader seam. `WeightOffloader` interface,
 `NoopWeightOffloader` default, the process-global `Get`/`SetWeightOffloader`,

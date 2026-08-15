@@ -438,9 +438,10 @@ and through the `ltx2-gen` example that drives it. Its two VAE decoders, its two
 VAE ENCODERS with the mel front-end, the conditioning items that place encoded
 latents into the token stream, and its pipeline layer (the sigma schedule, the
 diffusion steps, guidance, the latent spatial x2 upsampler, the duration head and
-the embeddings connector) are implemented and gated. Several limits decide what
-you can actually ask for, and each refuses by name rather than rendering
-something else.
+the embeddings connector) are implemented and gated. The latent **temporal** x2
+upsampler is implemented and gated too, but no pipeline here drives it — see the
+`--upsampler` note below. Several limits decide what you can actually ask for,
+and each refuses by name rather than rendering something else.
 
 **Image conditioning (image-to-video) runs at `image_crf=0`, and only there.**
 Pass a first frame as binary PPM (`first_frame_path` / `first_frame_ppm`) plus
@@ -590,6 +591,20 @@ phase refuses rather than skipping: its three-step refinement is what makes the
 upscaled latent valid, and decoding the half-resolution latent instead would hand
 back a smaller clip that looks like a completed request. `--max-phase 0` stops
 after the first phase deliberately.
+
+It must be the **spatial** upsampler,
+`ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`. Lightricks also ships
+`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors`, which is the same
+class with `temporal_upsample: true` in its config and the same
+`upsampler.0.*` tensor names — so it loads and runs, and returns a latent with
+`2f - 1` frames at the ORIGINAL resolution where this phase needs the original
+frame count at double resolution. It is `2f - 1` and not `2f` because that arm
+doubles the frame axis and then drops the first frame, which upstream encodes as
+a single pixel frame. Passing it is refused by name rather than
+reported as a shape mismatch. The temporal arm itself is implemented and gated
+against upstream, but **nothing drives it**: its only upstream consumer is
+`DFRPipeline`'s multi-round loop, which is not ported, so there is no flag that
+makes a request use it and no reason to pass that file today.
 
 On the server, `--video-family ltx-2.5` pins the family instead of detecting it,
 and `--video-extra KEY=VALUE` (repeatable) carries the same family-specific load

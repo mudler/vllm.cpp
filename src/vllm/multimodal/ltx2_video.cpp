@@ -1422,6 +1422,26 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              "Supply 'upsampler_path', or stop before this phase with '" +
              std::string(kLtx2MaxPhaseExtra) + "'.");
       }
+      // The phase wants the SPATIAL x2 upsampler. The temporal x2 arm is a
+      // different model with the same class name and the same tensor NAMES
+      // (`upsampler.0.*`), so pointing 'upsampler_path' at
+      // `ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` loads and runs
+      // cleanly and returns `[c, 2f-1, h, w]` where this phase needs
+      // `[c, f, 2h, 2w]`. The shape check below would catch it, but it would
+      // report a mismatch and leave the caller guessing; naming the swap here is
+      // the difference between "you gave me the wrong checkpoint" and "something
+      // is 3 frames short". Ported and gated, not driven — see
+      // .agents/specs/ltx25-temporal-upsampler.md section 7.
+      if (im.upsampler_cfg.temporal_upsample) {
+        Fail("phase '" + phase.name +
+             "' needs the latent SPATIAL x2 upsampler, but the checkpoint at 'upsampler_path' "
+             "declares temporal_upsample=true, i.e. it is the TEMPORAL x2 upsampler. That arm "
+             "upsamples the frame axis and drops the first frame "
+             "(model/upsampler/model.py:68-71, 109-113); no phase of any recipe this engine "
+             "serves consumes it, because its only upstream consumer is DFRPipeline's rounds "
+             "loop, which is not ported. Supply the spatial upsampler "
+             "('ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors').");
+      }
       Ltx2LatentVolume in;
       in.batch = 1;
       in.channels = video_lc;

@@ -37,7 +37,7 @@ carry more than one class list the dominant one first.
 | `ROAD-V1-C1` extensibility | **DONE** (cornerstone) | Drop-in kernel ABI W0, Platform seam, model self-registration, and the **portable op-fusion framework ORDER-1 milestone** (W0–W4 merged+gated, `KERNEL-FUSION-FRAMEWORK`); consistency-audit CI check landed. `BACKEND-ABI-VT`/`BACKEND-CUDA-ARCH-ADDITIVITY` seams gated on sm_121a. | Row stays SPIKE-open only for **non-blocking** tail: Tier-1 fusion perf interpreter (composite-only → single-launch), `FUSION-DENSE-MIGRATE` (route 5 drift models — CLOSED 2026-08-10, [#299](https://github.com/mudler/vllm.cpp/issues/299)), a real Metal/Vulkan catalog realization (M4-reachable / HW-blocked), and migrating a production kernel family onto the common adapter. Correctness cornerstone is closed. |
 | `ROAD-V1-C2` model families | **RI** (+HW/EXT sub) | First additive model (Qwen3 dense) + a broad **text sweep correctness-complete + SACRED-gated**: Qwen3/Qwen3Moe/Coder, Llama/Yi/InternLM3, Mistral, GLM-4-9B/GLM-4.7-Flash, Gemma-1/2/3, OPT, DeepSeek-V2-Lite (MLA), OLMo-2, Phi-3/4, Phi-1/2, Granite-3, StableLM, InternLM2, MiniCPM, MiniCPM3 (MLA). 20 ACTIVE model rows. | **SPEED close** on every one (all 20 are "correctness-complete, speed pending"). MoE/SSM breadth (Qwen3-Next, Falcon, Falcon-H1, GraniteMoe*, Cohere2Moe, PhiMoE, Mamba/Jamba/Zamba2/NemotronH) = RI (INVENTORIED/SPIKE). Frontier: Kimi-Linear-48B fits (RI, +KDA kernel); DeepSeek-V3/GLM-5/MiniMax-M2/M3/Kimi-K2 = HW (>119 GiB); Command-R = EXT (HF token). |
 | `ROAD-V1-C2-LOCAL-BF16` | **RI** (S) | Local Qwen3.5-4B plain-BF16 diagnostic rebased onto current additive seams; CPU/CUDA + direct ON/OFF token-equivalence green; H32 AOT / plain-BF16 graphs / ratio-4 FA2 landed + trace-proven. | Port device-resident sampled-token mapping to discrete CUDA (remove the measured main-stream wait) and rerun the exact 4B series. Small. |
-| `ROAD-V1-C3` spec-decode | **DONE** (core) | **MTP k=1 DONE + gated on BOTH gate models** (`SPEC-MTP`, c1 token-exact + above vLLM, c2–c8 on-par-or-above); **DFlash DONE + speed gate MET** (`SPEC-DFLASH` D14, our-ON ≥ vLLM-ON). | Named tail only: DSpark (`SPEC-DSPARK`) + heterogeneous-vocabulary TLI (`SPEC-TLI`) unspiked — overlaps `ROAD-V1-D3`. Core spec-decode is gate-closed. |
+| `ROAD-V1-C3` spec-decode | **DONE** (core) | **MTP k=1 DONE + gated on BOTH gate models** (`SPEC-MTP`, c1 token-exact + above vLLM, c2–c8 on-par-or-above); **DFlash DONE + speed gate MET** (`SPEC-DFLASH` D14, our-ON ≥ vLLM-ON). | ~~Named tail only: DSpark (`SPEC-DSPARK`) + heterogeneous-vocabulary TLI (`SPEC-TLI`) unspiked — overlaps `ROAD-V1-D3`.~~ **SUPERSEDED 2026-08-12** ([#536](https://github.com/mudler/vllm.cpp/issues/536), see §3 item 17): `SPEC-DSPARK` is `ACTIVE` — W1–W8 implemented and GPU-gated, 35B-A3B MoE **0.975x** code / **1.012x** prose vs the pinned graphed oracle (#442), remaining work a perf tail plus owed gates. `SPEC-TLI` is genuinely untouched and belongs under `SPEC-DRAFT-MODEL`, whose W3 blocks it. `ROAD-V1-D3` excludes both by its own spec, so it overlaps nothing here. Core spec-decode is gate-closed. |
 | `ROAD-V1-C4` quantization | **RI** | **3 schemes DONE**: NVFP4-MO-W4A16, NVFP4-CT-W4A4, FP8-MO-STATIC (all R/M/C/E/P). **GGUF CPU vs llama.cpp is CLOSED** (2026-07-22, aarch64 binding host): decode **at parity** (1.03× behind, inside llama.cpp's ±1.8% run spread — the elementwise f16/bf16 GEMM lever `KERNEL-GEMM-CPU-ELEM` E1-E4 `18094ee2` took it 3.38×→1.03×), prefill **1.18× ahead** (q8_0 repack-at-load G7), RSS **1.01×**, byte-identical greedy tokens. | NVFP4-CT-W4A16 perf gate. FP8-generic dispatch (static/dyn × tensor/channel/token/block). Breadth: AWQ/GPTQ/Marlin-wiring, i-quants, MXFP4/MX, bitsandbytes, KV-quant — all INVENTORIED. (GGUF-vs-llama.cpp speed is no longer an open C4 blocker.) |
 | `ROAD-V1-C5` sliding/YaRN | **RI** | Joint spike accepted; all W1–W8 leaves implemented and CPU/oracle/sanitizer green. **CUDA GPU CLOSURE 2026-07-27 (`CLAIM-ROADMAP-C5`, dgx GB10 sm_121a, clean build of `489f7771`, oracle vLLM 0.26.0.dev0):** shared scaled-RoPE + local-mask CUDA path compiles `-Werror`-clean + RUNS on GB10; feature-positive correctness gates PASS — SWA Gemma-2/Gemma-3 48/48, LongRoPE Phi-4-mini 16/16 (RED-first), llama3 Llama-3.2-1B 16/16, dynamic-NTK InternLM2 16/16; both RoPE 0.26-oracle recaptures BIT-IDENTICAL to goldens. `ATTN-SLIDING-WINDOW`/`ATTN-ROPE-{LLAMA3,LONGROPE,DYNAMIC-NTK}`/`ATTN-YARN` → `ACTIVE`; `ATTN-CHUNKED-LOCAL` + `KV-*-SPEC` honest. | **Honest residual (vehicle-blocked, not skipped):** YaRN model e2e (no cached Nomic/gpt-oss consumer) + chunked-local model e2e (no Llama4 row) REACHABLE-BLOCKED; long-context positive-mask (prompt > W) SWA e2e + KV-memory G8; every-axis **SPEED** tail (all leaves correctness-complete, speed-pending). |
 | `ROAD-V1-C6` async/priority serving | **RI** | `ENG-ASYNC-SCHED` **DONE** (`6ea7856`, default-ON, DGX token-neutral). W1/W2/W4 landed. | `SERVE-ASYNC-LLM` (GATING → prod-ON, blocks the SGLang floor + `ROAD-V1-A`), `ENG-PRIORITY-SCHED` + `ENG-CORE-BUSY-LOOP` GPU gates (GATING, held behind SERVE-GATE-ONLINE). |
@@ -213,7 +213,56 @@ gate → size (S/M/L) → vehicle model. `[H]` = user-directed headline.
     leaving only entries that need the shared layer extended. The dgx paged-engine
     confirmation for those five is OWED.
 16. **`ROAD-V1-C9` 0.26 denominators/goldens refresh** (recurring). **Size S, ongoing.**
-17. **`ROAD-V1-C3` DSpark + TLI** (core spec-decode done; overlaps D3). **Size M.**
+17. ~~**`ROAD-V1-C3` DSpark + TLI** (core spec-decode done; overlaps D3). **Size M.**~~
+    **RECONCILED 2026-08-12** ([#536](https://github.com/mudler/vllm.cpp/issues/536)):
+    the item was written when both halves were untouched. Neither half is what
+    it says, and they are not one item.
+    **DSpark is not unspiked.** Its spike spec landed 2026-08-09 (`2b342620e`,
+    [dspark-spec-decode.md](dspark-spec-decode.md)), `SPEC-DSPARK` has been
+    `ACTIVE` since, and W1–W8 are implemented and GPU-gated: the Markov head,
+    the sequential sampler, native **and** Speculators-format loading, the `d2t`
+    reduced draft vocab, the runner/one-surface wiring, the device sequential
+    sample ([#436](https://github.com/mudler/vllm.cpp/issues/436)) and the T=1+k
+    verify capture ([#442](https://github.com/mudler/vllm.cpp/issues/442),
+    mirroring vLLM's `uniform_decode_query_len = 1 + num_speculative_tokens`).
+    En route it fixed an engine-wide defect: `EngineCoreProc` never threaded
+    `check_for_draft_tokens`, so EVERY speculator's drafts were dropped on the
+    CLI and server paths. Measured against the pinned graphed oracle under
+    pinned clocks the 35B-A3B MoE lane measured **0.975x** (code cell,
+    non-overlapping distributions) and **1.012x** (prose cell) ON THE
+    PRE-REIMAGE BOX. Both figures are SUPERSEDED: that machine no longer
+    exists, and on the rebuilt stack the matched-and-warm paired ratio is
+    **0.834** -- see the benchmark record entries of 2026-08-15, which also
+    record that every earlier ratio used a single COLD oracle invocation. With the
+    residual localised to one kernel and attributed to a **12.9%
+    effective-DRAM-bandwidth** gap on byte-equivalent machine code (94 registers
+    / 3664 SASS instructions on both sides, spec §§6t–6aa). **Remaining is a
+    perf tail plus owed gates, not a port: Size S–M**, and its next lever is
+    named (`cudaMemAdvise`/placement on the expert slab; upstream `ncu` counters
+    are BLOCKED in both replay modes, so a standalone `moe_wna16_marlin_gemm`
+    harness is the only remaining route). Owed for a binding W6: the SACRED-corpus
+    token gate under the ratified near-tie protocol, the 27B dense re-measure
+    (its earlier cells were never like-for-like), the Gemma4 `1 + N` layout on
+    real weights, and padded/multi-request spec capture shapes.
+    **TLI is untouched — and it is not a DSpark tail.** No commit, no code, no
+    spec, no issue; `SPEC-TLI` is `INVENTORIED`. Upstream TLI is
+    `use_heterogeneous_vocab` (`config/speculative.py:150`) + `VocabMapping`
+    (`v1/spec_decode/vocab_mapping.py:68`), consumed ONLY by
+    `v1/spec_decode/llm_base_proposer.py` (`SpecDecodeBaseProposer`) and
+    `v1/spec_decode/draft_model.py:19`. The V2-runner speculators our
+    DFlash/DSpark port mirrors (`v1/worker/gpu/spec_decode/{dflash,dspark}/`)
+    have no heterogeneous-vocab path at all, so TLI's host is `SPEC-DRAFT-MODEL`
+    — a CPU propose brick with no runner construction — and TLI is
+    prerequisite-blocked behind that row's W3, not merely unspiked. DSpark's
+    `d2t` does not cover it: `d2t` is an offset table inside ONE tokenizer's
+    vocabulary (`draft_id + d2t[draft_id]`), while TLI builds a string-level
+    intersection ACROSS tokenizer families (BPE `Ġ` vs SentencePiece `▁`,
+    probed at init). **Size M, and it should be re-filed under `SPEC-DRAFT-MODEL`.**
+    **The D3 overlap is backwards.**
+    [spec-decode-breadth-d3.md](spec-decode-breadth-d3.md) §Scope puts DSpark and
+    TLI explicitly *out of* `ROAD-V1-D3` and back under `ROAD-V1-C3`; D3's
+    landing covers no part of this tail. What DSpark reused is C3's own
+    MTP/DFlash verify/reject loop.
 
 ## 4. Bottom line
 

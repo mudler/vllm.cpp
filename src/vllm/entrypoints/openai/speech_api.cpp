@@ -193,6 +193,45 @@ SpeechRequest ParseSpeechRequest(const std::string& body) {
     out.has_guidance_scale = true;
   }
   if (Has(extra, "seed")) out.seed = static_cast<int64_t>(ReadNumber(extra, "seed"));
+
+  // ── The keys UPSTREAM refuses, refused here too (#672) ────────────────────
+  //
+  // SGLang-Omni's own `/v1/audio/speech` accepts these on the schema
+  // (`serve/protocol.py:361-364`) and then REFUSES them for MiniMax-Music3 when
+  // they are explicitly set — `models/minimax_music3/request_builders.py:14-19`
+  // lists them and `:109-114` raises
+  //   "MiniMax Music 3 does not support sampling parameters: …".
+  // It refuses them because this model's AR stage has no temperature and no
+  // nucleus branch at all: `_sample_top_k` is the ONLY sampler either stage
+  // uses, and `_AR_SAMPLING_TOP_K` is a module constant of 50
+  // (diffusers `encoders.py:48,94-103`). A knob that cannot be honoured must
+  // not return 200.
+  //
+  // We were SILENT on them, which is the #925 failure class exactly: a caller
+  // porting an SGLang or OpenAI recipe sends `temperature`, gets a well-formed
+  // WAV, and has no way to learn the knob was dropped. The cost of that
+  // silence is already recorded in this file, one refusal above.
+  for (const char* key : {"temperature", "top_p", "top_k", "repetition_penalty"}) {
+    VT_CHECK(!Has(extra, key),
+             std::string("speech request: `") + key +
+                 "` is not supported — MiniMax-Music3's autoregressive stage has no "
+                 "temperature and no nucleus sampling; its only sampler is a fixed top-50 "
+                 "draw (encoders.py:48,94-103), so the knob can be neither honoured nor "
+                 "honestly ignored. Upstream refuses it by name too "
+                 "(request_builders.py:109-114). Use `seed` to control the draw");
+  }
+  // SGLang-Omni spells the LENGTH as `max_new_tokens`, counted in 25 Hz audio
+  // FRAMES rather than in seconds (`request_builders.py:56-68`,
+  // `constants.py:4-5`). Our wire key is diffusers' `audio_duration`, in
+  // SECONDS, because diffusers is this row's primary oracle. Two duration
+  // spellings on one route is what #925 was, so the second one is REFUSED and
+  // converted for the caller rather than accepted as a near-synonym.
+  VT_CHECK(!Has(extra, "max_new_tokens"),
+           "speech request: `max_new_tokens` is SGLang-Omni's spelling of the length, counted "
+           "in 25 Hz audio frames (request_builders.py:56-68). This route takes "
+           "`audio_duration` in SECONDS instead — divide by 25 — because accepting both would "
+           "be two names for one meaning, and a duration key that is read by nobody is how "
+           "this project shipped a 750x job behind a 200 (#925)");
   return out;
 }
 

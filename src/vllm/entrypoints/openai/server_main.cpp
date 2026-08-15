@@ -400,6 +400,8 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--speech-model <checkpoint-dir>] "
          "[--speech-family <name>]\n"
          "               [--version]\n"
+         "  --speech-model WITHOUT --model serves /v1/audio/speech ALONE (no "
+         "text model is loaded)\n"
          "  accepted for published-recipe compatibility, NO effect: "
          "--enable-auto-tool-choice, --trust-remote-code\n";
   std::exit(code);
@@ -640,8 +642,22 @@ Args ParseArgs(int argc, char** argv) {
       Usage(argv[0], 2);
     }
   }
-  if (a.model_dir.empty()) {
-    std::cerr << "server: --model <dir> is required\n";
+  // --model is required EXCEPT for a speech-only server (#672). Upstream's own
+  // spelling for MiniMax-Music3 is `sgl-omni serve --model MiniMaxAI/MiniMax-Music3`
+  // and nothing else — there is no text model in that command, because a music
+  // model is not an accessory to one. Requiring --model here made the documented
+  // recipe unrunnable on any box whose smallest text checkpoint is tens of GB:
+  // serving a 28.5 GB music model also staged a model no request would touch.
+  //
+  // This is a NEW ACCEPTED COMBINATION, not a change of behaviour: `--model` with
+  // or without `--speech-model` resolves exactly as before, and the case that
+  // changes verdict — NEITHER flag — was and remains an error. It mirrors the
+  // task-conditional dispatch already in this file for pooling and
+  // transcription-only models (vLLM api_server.py:255-265): the routes a server
+  // registers follow from what it loaded.
+  if (a.model_dir.empty() && a.speech_model.empty()) {
+    std::cerr << "server: --model <dir> is required (or --speech-model <dir> for "
+                 "a speech/music-only server)\n";
     Usage(argv[0], 2);
   }
   if (a.max_num_seqs <= 0 || a.max_num_batched_tokens < 0 ||
@@ -794,6 +810,67 @@ int VllmServerMain(int argc, char** argv) {
                   << vllm::kDefaultLimitPerPrompt << ")";
       }
       std::cerr << "\n";
+    }
+
+    // ── SPEECH TASK DISPATCH (#672): --speech-model with NO --model serves
+    // /v1/audio/speech and nothing else. It is the same task-conditional shape
+    // the pooling and transcription-only branches below take, and the same one
+    // vLLM's api_server.py:255-265 uses: a server registers the routes its
+    // loaded task can answer, rather than every route it knows how to spell.
+    //
+    // It exists because upstream's own recipe is `sgl-omni serve --model
+    // MiniMaxAI/MiniMax-Music3` — one model, no text tower — and because pairing
+    // a 28.5 GB music checkpoint with an unrelated text checkpoint nobody
+    // queries is not a smaller cost than the music model itself. NOTHING here
+    // touches the combined path: --model + --speech-model still loads both and
+    // registers both, byte for byte as before.
+    if (args.model_dir.empty()) {
+      vllm::multimodal::SpeechRegistry& registry = vllm::multimodal::GlobalSpeechRegistry();
+      vllm::models::music3::RegisterBuiltinSpeechFamilies(registry);
+      vllm::multimodal::SpeechModelParams smp;
+      smp.path = args.speech_model;
+      smp.family = args.speech_family;  // empty => DETECT by inspecting the artifact
+      std::string why;
+      std::unique_ptr<vllm::multimodal::SpeechEngine> loaded_speech = registry.Load(smp, &why);
+      if (loaded_speech == nullptr) {
+        throw std::runtime_error("server: --speech-model " + args.speech_model + ": " + why);
+      }
+      std::shared_ptr<vllm::multimodal::SpeechEngine> speech_only(std::move(loaded_speech));
+      // The served name defaults to the FAMILY rather than to the directory
+      // basename, because a speech-only server has no config.json to name and
+      // the family is what a client puts in `"model"`. An explicit
+      // --served-model-name still wins.
+      const std::string speech_served_name =
+          args.served_model_name.empty() ? speech_only->family() : args.served_model_name;
+      vllm::openai::SpeechCapabilities caps;
+      caps.family = speech_only->family();
+      caps.sample_rate = speech_only->sample_rate();
+      caps.requires_reference_audio = speech_only->requires_reference_audio();
+      std::cerr << "server: speech/music-only model (family=" << caps.family << ", "
+                << caps.sample_rate << " Hz, "
+                << (caps.requires_reference_audio ? "reference clip REQUIRED"
+                                                  : "text-only synthesis")
+                << ", family "
+                << (args.speech_family.empty() ? "DETECTED" : "DECLARED (--speech-family)")
+                << "); serving /v1/audio/speech\n";
+      namespace oai = vllm::entrypoints::openai;
+      oai::OpenAIServingModels speech_models(speech_served_name);
+      oai::ApiServer speech_server(speech_models, vllm::Version());
+      speech_server.set_synthesizer(
+          [speech_only](const vllm::openai::SpeechRequest& req)
+              -> vllm::openai::SpeechResponse {
+            return vllm::openai::SynthesizeSpeechRequest(*speech_only, req);
+          },
+          caps);
+      std::cerr << "server: listening on http://" << args.host << ":" << args.port
+                << " (model '" << speech_served_name << "')\n";
+      vllm::platform::ConsoleShutdown shutdown_on_signal(
+          [&]() { speech_server.stop(); });
+      if (!speech_server.listen(args.host, args.port)) {
+        std::cerr << "server: failed to bind " << args.host << ":" << args.port << "\n";
+        return 1;
+      }
+      return 0;
     }
 
     const fs::path dir = NativeUtf8Path(args.model_dir);

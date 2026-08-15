@@ -702,6 +702,9 @@ add_library(vllm STATIC
   src/vllm/config/scheduler.cpp
   src/vllm/config/device.cpp
   src/vllm/config/kv_transfer.cpp
+  src/vllm/config/offload.cpp
+  src/vllm/model_executor/weight_offloader.cpp
+  src/vllm/model_executor/weight_offload_policy.cpp
   src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp
@@ -769,8 +772,10 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/minimax_h3_audio_vae.cpp
   src/vllm/model_executor/models/vocoder1d.cpp
   src/vllm/model_executor/models/minimax_music3_loader.cpp
+  src/vllm/model_executor/models/minimax_music3_quant.cpp
   src/vllm/model_executor/models/minimax_music3_ar.cpp
   src/vllm/model_executor/models/minimax_music3_acoustic.cpp
+  src/vllm/model_executor/models/minimax_music3_llm.cpp
   src/vllm/model_executor/models/minimax_music3_speech.cpp
   src/vllm/model_executor/models/gpt2.cpp
   src/vllm/multimodal/speech_engine.cpp
@@ -825,6 +830,12 @@ add_library(vllm STATIC
   # VAE and its vocoder. Additive files mirroring ltx_core's own structure.
   src/vllm/model_executor/models/ltx2_audio_vae.cpp
   src/vllm/model_executor/models/ltx2_video_vae.cpp
+  # LTX-2.5 (ROW LTX25-TILED-DECODE, issue #644): the tiling algebra and the
+  # STREAMING tiled decode. Own translation units so the untiled decode above
+  # stays the gated reference and the tiled path cannot drift from it by sharing
+  # an internal helper only one of them exercises.
+  src/vllm/model_executor/models/ltx2_tiling.cpp
+  src/vllm/model_executor/models/ltx2_video_vae_tiled.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L3): the Gemma-4 multi-layer feature
   # aggregation, the two caption projections and the embedded asset pack. An
   # additive file mirroring ltx_core's own structure.
@@ -852,6 +863,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/ltx2_loader.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/entrypoints/openai/speech_api.cpp
+  src/vllm/entrypoints/openai/speech_api_synthesize.cpp
   src/vllm/model_executor/models/kimi_kda.cpp
   src/vllm/model_executor/models/kimi_linear_registry.cpp
   src/vllm/model_executor/models/kimi_linear_weights.cpp

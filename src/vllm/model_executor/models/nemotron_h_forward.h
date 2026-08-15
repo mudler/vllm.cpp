@@ -79,16 +79,93 @@ inline constexpr bool kNemotronHAttentionHasNoRope = true;
 // explicitly so a gate can assert the memory format instead of inferring it from
 // matching tokens — a dtype that is too WIDE is numerically correct and
 // therefore invisible to a token comparison.
+// The MEMORY FORMAT a materialized weight is held in. This is the whole point
+// of the enum existing: the released checkpoint is `quant_algo:
+// MIXED_PRECISION` and is NOT uniform — routed/shared experts and `lm_head` are
+// NVFP4 W4A16 group-16, the 46 mamba `in_proj`/`out_proj` are FP8 W8A8 static,
+// and attention, conv1d, gates, norms and embeddings are plain bf16. Holding
+// any of those in a WIDER form than it ships is numerically correct, invisible
+// to a token gate, and moves the wrong bytes (AGENTS.md).
+//
+// It is also what makes the checkpoint fit at all. The 5888 routed-expert
+// projections alone are 29.4e9 parameters; dequantized to bf16 at load they are
+// 58.7 GB, against 16.5 GB packed (15.4 GiB — nibbles plus group scales, and
+// both figures here are DECIMAL GB). So `kNvfp4W4A16G16` is not an optimization
+// — a load that widens it does not run on any box this project owns.
+enum class NemotronHWeightForm : uint8_t {
+  // `bytes` holds Numel() elements of `dtype`, contiguous. Every W4-era weight.
+  kDense,
+  // ModelOpt `W4A16_NVFP4`, `group_size=16` (spec §1, config_groups group_1):
+  //   bytes  U8      [rows, cols/2]   two E2M1 nibbles per byte, LOW nibble
+  //                                   first (the torchao/ModelOpt convention,
+  //                                   `Nvfp4NibbleOrder::kLowFirst`)
+  //   scale  F8_E4M3 [rows, cols/16]  one linear e4m3 scale per 16 inputs
+  //   global_scale    F32 scalar      `weight_scale_2`, MULTIPLIED (not
+  //                                   reciprocated)
+  // `shape`/`dtype` stay LOGICAL: [rows, cols] at the model dtype, which is what
+  // a dequantized view yields and what every shape check compares against.
+  kNvfp4W4A16G16,
+  // ModelOpt FP8 W8A8 static (config_groups group_0, the 46 mamba projections):
+  //   bytes         F8_E4M3 [rows, cols]  one IEEE e4m3 byte per element
+  //   global_scale  F32 scalar            `weight_scale`, MULTIPLIED
+  //   input_scale   F32 scalar            the STATIC activation scale
+  // The host reference forward is weight-only (W4A16-shaped): it consumes
+  // `global_scale` and carries `input_scale` without applying it, because
+  // nothing here quantizes the activation. That is recorded rather than
+  // silently dropped — W6's device path is where the activation scale is live.
+  kFp8W8A8Static,
+};
+
 struct NemotronHOwned {
+  // The payload. Its meaning is `form`'s (see NemotronHWeightForm): dense
+  // elements of `dtype` for kDense, packed nibbles for NVFP4, e4m3 bytes for
+  // FP8.
   std::vector<uint8_t> bytes;
+  // The LOGICAL dtype — what a dense view of this weight yields. Not the
+  // storage dtype when `form != kDense`.
   vt::DType dtype = vt::DType::kF32;
+  // The LOGICAL shape, likewise: [out, in] for every projection, whatever the
+  // packing.
   std::vector<int64_t> shape;
 
+  NemotronHWeightForm form = NemotronHWeightForm::kDense;
+  // NVFP4 only: the per-16-element e4m3 group scales, [rows, cols/16] bytes.
+  std::vector<uint8_t> scale;
+  // NVFP4 `weight_scale_2` / FP8 `weight_scale`. Multiplied, never reciprocated.
+  float global_scale = 1.0F;
+  // FP8 W8A8 `input_scale`, carried for the device path (W6). `has_input_scale`
+  // distinguishes "the checkpoint shipped 1.0" from "no scale shipped", because
+  // a defaulted 1.0 that silently stands in for a missing tensor is exactly the
+  // class of load defect a token gate absorbs.
+  float input_scale = 1.0F;
+  bool has_input_scale = false;
+
   bool Empty() const { return bytes.empty(); }
+  bool IsDense() const { return form == NemotronHWeightForm::kDense; }
   int64_t Numel() const;
+  // Bytes actually resident for this weight, payload + scales. The number a
+  // load report adds up; not derivable from `shape` once `form != kDense`.
+  int64_t HostBytes() const {
+    return static_cast<int64_t>(bytes.size() + scale.size());
+  }
   // A non-owning contiguous view over the current buffer. Rebuilt on each call
-  // so it survives moves/reallocations of the owning struct.
+  // so it survives moves/reallocations of the owning struct. DENSE ONLY: a view
+  // over packed nibbles typed as bf16 reads plausible garbage, so this refuses
+  // rather than handing one out.
   vt::Tensor View(vt::Device device) const;
+
+  // Materialize a DENSE bf16 copy of a quantized weight, through the SHARED
+  // ModelOpt dequant seam (`model_loader/nvfp4_dequant.h`), which is the one
+  // this tree's other ModelOpt consumers use. bf16 is the target because that is
+  // what the shared seam produces AND the released checkpoint's model dtype; a
+  // caller running the f32 reference arm widens the result losslessly.
+  //
+  // This exists because the HOST reference forward has NO NVFP4 and NO FP8 GEMM
+  // — those are the CUDA `kMoeGroupedGemmNvfp4Marlin` / fp8-linear arms W6
+  // selects. It is a DECLARED host dequant, counted and reported by the loader,
+  // never a silent fallback: the weight keeps its quantized form in memory, and
+  // only the GEMM operand is widened, transiently, at the call site.
+  std::vector<uint8_t> DenseBf16() const;
 
   // Pack canonical f32 values into `dtype`. This is the seam a real loader
   // replaces: it hands over checkpoint bytes that are ALREADY in the model
@@ -127,6 +204,16 @@ struct NemotronHAttentionWeights {
   NemotronHOwned k_proj;  // [num_key_value_heads*head_dim, hidden_size]
   NemotronHOwned v_proj;  // [num_key_value_heads*head_dim, hidden_size]
   NemotronHOwned o_proj;  // [hidden_size, num_attention_heads*head_dim]
+  // The fp8 KV-cache scales the checkpoint ships as `k_proj.k_scale` /
+  // `v_proj.v_scale` (`quantization_config.kv_cache_scheme`, num_bits 8, type
+  // float). MATERIALIZED but UNUSED on this path: the host reference forward
+  // holds K and V in the model dtype for the whole prompt and pages nothing, so
+  // there is no fp8 KV store to scale. W6's paged device path is where they
+  // become live. They are loaded rather than skipped so the tensor accounting
+  // is honest — 12 tensors dropped on the floor is 12 tensors nobody notices.
+  float k_scale = 1.0F;
+  float v_scale = 1.0F;
+  bool has_kv_scales = false;
 };
 
 // One NON-GATED expert: `ckpt_names=("up_proj","down_proj","")`

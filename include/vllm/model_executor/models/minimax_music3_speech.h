@@ -164,6 +164,18 @@ struct Music3AcousticWeights {
   VocoderWeights vocoder;
 };
 
+// Load `condition_encoder/`, `transformer/` and `vocoder/` from a resolved
+// checkpoint, at spec §2.1's runtime dtypes: the condition mix bf16 (its FILE is
+// fp32 — the AR half's dtype is what it runs in), the DiT and the vocoder fp32,
+// with every `weight_g`/`weight_v` pair folded.
+//
+// ~10 GB, and staged SEPARATELY from the AR half's ~18.5 GB on purpose: upstream
+// drives its own offload hooks between the two stages (encoders.py:302-309) and
+// nothing needs both resident at once, since `frame_hiddens` is the only thing
+// that crosses.
+Music3AcousticWeights Music3LoadAcousticWeights(const MiniMaxMusic3Paths& paths,
+                                                const MiniMaxMusic3Config& config);
+
 struct Music3DenoiseOptions {
   int64_t num_inference_steps = kMusic3DefaultInferenceSteps;
   double guidance_scale = kDitGuidanceScale;

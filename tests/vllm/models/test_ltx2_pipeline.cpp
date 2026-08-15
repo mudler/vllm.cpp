@@ -1235,7 +1235,7 @@ TEST_CASE("ltx2 every L5 out-of-scope feature is refused BY NAME") {
   // Spec section 2 "Out", plus the L7 boundary. A silent downgrade of any of
   // these produces a video, which is exactly why none of them may fall back.
   const std::vector<std::pair<vllm::Ltx2UnportedPipelineFeature, std::string>> owed = {
-      {vllm::Ltx2UnportedPipelineFeature::kTemporalUpsampler, "temporal"},
+      {vllm::Ltx2UnportedPipelineFeature::kSpatiotemporalUpsampler, "temporal"},
       {vllm::Ltx2UnportedPipelineFeature::kLoraFusion, "LoRA"},
       {vllm::Ltx2UnportedPipelineFeature::kMultishot, "multishot"},
       {vllm::Ltx2UnportedPipelineFeature::kInt8ConvRot, "int8-convrot"},
@@ -1291,6 +1291,33 @@ vllm::Ltx2LatentVolume ReducedUpsamplerLatent() {
   latent.height = vllm_test::kLtx2UpsHeight;
   latent.width = vllm_test::kLtx2UpsWidth;
   latent.data = Make("ltx2.ups.latent", latent.elems(), 1.0);
+  return latent;
+}
+
+// `spatial_upsample=False, temporal_upsample=True` (model.py:68-71) — the arm
+// with `Conv3d(mid, 2*mid)` + `PixelShuffleND(1)` and the dropped first frame.
+vllm::Ltx2UpsamplerConfig TemporalUpsamplerConfig(const std::string& prefix) {
+  vllm::Ltx2UpsamplerConfig config;
+  config.in_channels = vllm_test::kLtx2UpsInChannels;
+  config.mid_channels = vllm_test::kLtx2UpsMidChannels;
+  config.num_blocks_per_stage = vllm_test::kLtx2UpsBlocksPerStage;
+  config.dims = 3;
+  config.spatial_upsample = false;
+  config.temporal_upsample = true;
+  config.prefix = prefix;
+  return config;
+}
+
+// A separate fixture from ReducedUpsamplerLatent: 3 frames, so the frame axis
+// differs from H (4) and W (6) and `2F - 1 = 5` differs from `2F = 6`.
+vllm::Ltx2LatentVolume TemporalUpsamplerLatent() {
+  vllm::Ltx2LatentVolume latent;
+  latent.batch = 1;
+  latent.channels = vllm_test::kLtx2UpsInChannels;
+  latent.frames = vllm_test::kLtx2UpsTemporalFrames;
+  latent.height = vllm_test::kLtx2UpsHeight;
+  latent.width = vllm_test::kLtx2UpsWidth;
+  latent.data = Make("ltx2.ups.temporal.latent", latent.elems(), 1.0);
   return latent;
 }
 
@@ -1411,6 +1438,45 @@ TEST_CASE("ltx2 the latent spatial upsampler reproduces upstream") {
   CHECK(vllm::kLtx2UpsamplerNormEps == 1e-5);
 }
 
+TEST_CASE("ltx2 the latent temporal upsampler reproduces upstream") {
+  // model.py:68-71 builds `Conv3d(mid, 2*mid, k=3, p=1)` + `PixelShuffleND(1)`,
+  // and :113 drops the first frame after it (:109-113 is the whole branch).
+  // Everything else in the class is
+  // the same module set the three spatial arms above already gate, so this case
+  // is aimed at exactly two things: the temporal shuffle and the slice.
+  const vllm::Ltx2UpsamplerConfig config = TemporalUpsamplerConfig("ltx2.ups.Temporal.");
+  const ParamBag bag = BuildUpsamplerParams(config);
+  // The parameter CONTRACT first. `upsampler.0.weight` here is a Conv3d kernel
+  // [2*mid, mid, 3, 3, 3]; the non-rational SPATIAL arm's identically-named
+  // tensor is a 4-D Conv2d kernel (model.py:64-66). A port that reused the
+  // spatial enumeration builds the wrong element count and dies here.
+  CheckManifest(bag, vllm_test::kLtx2UpsTemporalParamNames,
+                vllm_test::kLtx2UpsTemporalParamCounts,
+                std::size(vllm_test::kLtx2UpsTemporalParamNames));
+
+  const vllm::Ltx2LatentVolume latent = TemporalUpsamplerLatent();
+  const vllm::Ltx2LatentVolume got = vllm::Ltx2LatentUpsample(config, bag.weights, latent);
+  CHECK(got.batch == vllm_test::kLtx2UpsTemporalOutShape[0]);
+  CHECK(got.channels == vllm_test::kLtx2UpsTemporalOutShape[1]);
+  // 2F - 1, not 2F: the drop is observable in the SHAPE, so a port that kept the
+  // first frame fails here before any value is compared.
+  CHECK(got.frames == vllm_test::kLtx2UpsTemporalOutShape[2]);
+  CHECK(got.frames == vllm_test::kLtx2UpsTemporalFactor * latent.frames - 1);
+  CHECK(got.height == vllm_test::kLtx2UpsTemporalOutShape[3]);
+  CHECK(got.width == vllm_test::kLtx2UpsTemporalOutShape[4]);
+
+  const double worst = MaxAbsDiff(got.data, vllm_test::kLtx2UpsTemporalGolden,
+                                  std::size(vllm_test::kLtx2UpsTemporalGolden));
+  INFO("LatentUpsampler arm = Temporal max|diff| = ", worst);
+  CHECK(worst <= kRoundOff);
+
+  // `PixelShuffleND.__init__`'s `upscale_factors` default (pixel_shuffle.py:25),
+  // which no construction site overrides. The goldens above move WITH it if it
+  // is regenerated, so this line is the only one that compares against upstream's
+  // own signature rather than against a tensor we produced.
+  CHECK(vllm::kLtx2UpsamplerTemporalFactor == vllm_test::kLtx2UpsTemporalFactor);
+}
+
 TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
   const vllm::Ltx2LatentVolume latent = ReducedUpsamplerLatent();
   const ParamBag bag = BuildUpsamplerParams(ReducedUpsamplerConfig(false, 2.0, "ltx2.ups.x."));
@@ -1423,13 +1489,29 @@ TEST_CASE("ltx2 the upsampler refuses the arms it does not implement") {
     return message;
   };
 
-  vllm::Ltx2UpsamplerConfig temporal = ReducedUpsamplerConfig(false, 2.0, "");
-  temporal.temporal_upsample = true;
-  CHECK(Mentions(refuse("temporal", temporal), "temporal"));
+  // BOTH flags — `Conv3d(mid, 8*mid)` + `PixelShuffleND(3)` (model.py:55-59), a
+  // different operator from the temporal-only arm above and still unported. The
+  // upsampler weight upstream would build for it is 8*mid, emitted by the
+  // generator off the real module so this is not gated against a remembered
+  // shape.
+  CHECK(vllm_test::kLtx2UpsSpatiotemporalUpsamplerShape[0] ==
+        8 * vllm_test::kLtx2UpsMidChannels);
+  vllm::Ltx2UpsamplerConfig spatiotemporal = ReducedUpsamplerConfig(false, 2.0, "");
+  spatiotemporal.temporal_upsample = true;
+  const std::string spatiotemporal_message = refuse("spatial+temporal", spatiotemporal);
+  CHECK(Mentions(spatiotemporal_message, "temporal"));
+  CHECK(Mentions(spatiotemporal_message, "PixelShuffleND(3)"));
 
   vllm::Ltx2UpsamplerConfig two_d = ReducedUpsamplerConfig(false, 2.0, "");
   two_d.dims = 2;
   CHECK(Mentions(refuse("dims=2", two_d), "dims"));
+
+  // dims=2 is refused for the TEMPORAL arm too, and it has to be checked
+  // separately: the two arms take different branches, so a `dims` guard placed
+  // inside the spatial branch would let a 2-D temporal config through.
+  vllm::Ltx2UpsamplerConfig temporal_two_d = TemporalUpsamplerConfig("");
+  temporal_two_d.dims = 2;
+  CHECK(Mentions(refuse("temporal dims=2", temporal_two_d), "dims"));
 
   // Upstream's own ValueError when neither flag is set (model.py:73-74).
   vllm::Ltx2UpsamplerConfig neither = ReducedUpsamplerConfig(false, 2.0, "");

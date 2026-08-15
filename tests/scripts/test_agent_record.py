@@ -291,6 +291,26 @@ class AgentRecordMutationTests(unittest.TestCase):
             self.assertEqual(len(found), 1, item_id)
             self.assertEqual(found[0].path.name, "engine-matrix.md", item_id)
 
+    def test_anchor_ratchet_row_is_inside_the_engine_ratchet(self) -> None:
+        """The #632 row and its 154 -> 155 bump are one semantic change.
+
+        Same shape as the #117, #606 and #633 assertions above. Worth naming
+        here for one reason beyond the count: this row exists BECAUSE the
+        `path:line` citations in these matrices are 82% unparsed by the very
+        checker this test guards, so the row's own anchors into
+        `check-agent-record.py` are — until it lands — as unchecked as the ones
+        it is filed about. Pinning the row is the only mechanical statement
+        available about it today.
+        """
+
+        errors: list[str] = []
+        rows, _ = agent_record.check_matrices(errors)
+        self.assertEqual([error for error in errors if "engine rows" in error], [])
+
+        found = [row for row in rows if row.item_id == "ENG-RECORD-ANCHOR-RATCHET"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].path.name, "engine-matrix.md")
+
     def test_music3_and_indextts_rows_both_survive_their_collision(self) -> None:
         """373 needs BOTH rows named, because the merge that produced it collided.
 
@@ -806,7 +826,7 @@ class LinkExtraction(unittest.TestCase):
 
 
 class IssueIntakeTable(unittest.TestCase):
-    """The roadmap issue table is the intake surface: no work without an issue.
+    """The issue index is the intake surface: no work without an issue.
 
     The validator is deliberately NETWORK-FREE, so these mutations are all about
     FORM and internal consistency. Whether an issue is still open is the agent's
@@ -815,48 +835,45 @@ class IssueIntakeTable(unittest.TestCase):
     """
 
     GOOD = (
-        "## Open issues\n\n"
-        "| Issue | Row | Title | Kind |\n"
-        "|---:|---|---|---|\n"
-        "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | x | bug |\n"
-        "| [#85](https://github.com/mudler/vllm.cpp/issues/85) | — | y | bug |\n"
-        "\n## Top-level portfolio\n"
+        agent_record.INDEX_PREAMBLE
+        + "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | `BACKEND-ROCM` | x | bug |\n"
+        + "| [#85](https://github.com/mudler/vllm.cpp/issues/85) | — | y | bug |\n"
     )
 
-    def run_check(self, section):
-        import importlib.util
+    # The fixture has ONE unowned row. Passing that as the mark keeps every
+    # case below about the thing it names, rather than about the ratchet.
+    MARK = 1
 
-        path = ROOT / ".agents/roadmap_v1.md"
-        original = path.read_text(encoding="utf-8")
-        try:
-            path.write_text(section, encoding="utf-8")
-            errors = []
-            agent_record.check_issue_table(errors)
-            return errors
-        finally:
-            path.write_text(original, encoding="utf-8")
+    def run_check(self, text, owed=None, mark=None):
+        errors = []
+        agent_record.check_issue_index(
+            errors,
+            text=text,
+            owed=owed or set(),
+            high_water=self.MARK if mark is None else mark,
+        )
+        return errors
 
     def test_a_well_formed_table_passes(self):
         self.assertEqual(self.run_check(self.GOOD), [])
 
-    def test_a_missing_table_is_rejected(self):
+    def test_a_missing_preamble_is_rejected(self):
         errors = self.run_check("# Roadmap\n\n## Top-level portfolio\n")
-        self.assertTrue(any("Open issues" in e for e in errors), errors)
+        self.assertTrue(any("preamble" in e for e in errors), errors)
 
     def test_an_empty_table_is_rejected(self):
-        section = "## Open issues\n\n| Issue | Row | Title | Kind |\n|---:|---|---|---|\n\n## Top-level portfolio\n"
-        errors = self.run_check(section)
+        errors = self.run_check(agent_record.INDEX_PREAMBLE)
         self.assertTrue(any("no rows" in e for e in errors), errors)
 
     def test_a_bare_issue_number_without_a_link_is_rejected(self):
         section = self.GOOD.replace(
             "| [#85](https://github.com/mudler/vllm.cpp/issues/85) |", "| #85 |"
         )
-        errors = self.run_check(section)
+        errors = self.run_check(section, mark=0)
         self.assertTrue(any("malformed issue row" in e for e in errors), errors)
 
     def test_a_link_pointing_at_a_different_issue_is_rejected(self):
-        """The number and its URL must agree, or the table lies."""
+        """The number and its URL must agree, or the index lies."""
         section = self.GOOD.replace(
             "[#201](https://github.com/mudler/vllm.cpp/issues/201)",
             "[#201](https://github.com/mudler/vllm.cpp/issues/999)",
@@ -865,17 +882,18 @@ class IssueIntakeTable(unittest.TestCase):
         self.assertTrue(any("a different issue" in e for e in errors), errors)
 
     def test_a_duplicated_issue_is_rejected(self):
-        section = self.GOOD.replace(
-            "\n## Top-level portfolio",
+        """Under `merge=union` this is what two branches appending one issue
+        produce. The driver combines silently, so this check is the only thing
+        that reports it."""
+        section = self.GOOD + (
             "| [#201](https://github.com/mudler/vllm.cpp/issues/201) | — | dup | bug |\n"
-            "\n## Top-level portfolio",
         )
-        errors = self.run_check(section)
+        errors = self.run_check(section, mark=2)
         self.assertTrue(any("listed twice" in e for e in errors), errors)
 
-    def test_the_tracked_roadmap_table_is_valid(self):
+    def test_the_tracked_index_is_valid(self):
         errors = []
-        agent_record.check_issue_table(errors)
+        agent_record.check_issue_index(errors)
         self.assertEqual(errors, [])
 
 
@@ -1079,8 +1097,11 @@ class TenstorrentMistralRowIsCounted(unittest.TestCase):
         text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
         row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
         self.assertIn("tenstorrent-mistral.md", row)
-        roadmap = (ROOT / ".agents/roadmap_v1.md").read_text(encoding="utf-8")
-        self.assertIn("issues/670", roadmap)
+        # The intake surface moved out of roadmap_v1.md and into the
+        # append-only issue index (POLICY-ISSUE-INTAKE, #840). The pin is the
+        # same pin: this row's issue link must still exist somewhere trackable.
+        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        self.assertIn("issues/670", index)
 
     def test_the_backend_pin_is_load_bearing_for_this_row(self) -> None:
         """MUTATION: with this row removed, the pinned count must disagree.
@@ -1121,6 +1142,77 @@ class TenstorrentMistralRowIsCounted(unittest.TestCase):
             any("backend rows" in e.lower() for e in errors),
             f"removing {self.ROW} must break the BACKEND count; got {errors}",
         )
+
+
+class IssueIndexTests(unittest.TestCase):
+    """Every guarantee of the issue index, mutated rather than read.
+
+    The index carries `merge=union`. That driver is silent: it combines two
+    sides and never reports it. These checks are the only thing standing
+    between a silent combination and a wrong record, so a mute one is worse
+    than none.
+    """
+
+    OWNER = "`BACKEND-ROCM`"
+
+    def row(self, number: int, owner: str | None = None) -> str:
+        owner = self.OWNER if owner is None else owner
+        return (
+            f"| [#{number}](https://github.com/mudler/vllm.cpp/issues/{number})"
+            f" | {owner} | title | bug |"
+        )
+
+    def index(self, owned: int = 3, unowned: int | None = None) -> str:
+        if unowned is None:
+            unowned = agent_record.UNOWNED_HIGH_WATER
+        rows = [self.row(1000 + i) for i in range(owned)]
+        rows += [self.row(2000 + i, "—") for i in range(unowned)]
+        return agent_record.INDEX_PREAMBLE + "\n".join(rows) + "\n"
+
+    def errors_for(self, text: str, owed: set[str] | None = None) -> list[str]:
+        errors: list[str] = []
+        agent_record.check_issue_index(errors, text=text, owed=owed or set())
+        return errors
+
+    def test_unmutated_index_is_green(self) -> None:
+        # Guards every case below: a baseline that is already red would make
+        # each mutation pass for the wrong reason.
+        self.assertEqual(self.errors_for(self.index()), [])
+
+    def test_real_index_matches_the_checkers_preamble(self) -> None:
+        # The literal in the checker is the anti-drift device. If the shipped
+        # file and the literal disagree, every preamble case below is vacuous.
+        text = agent_record.ISSUE_INDEX.read_text(encoding="utf-8")
+        self.assertTrue(
+            text.startswith(agent_record.INDEX_PREAMBLE),
+            "the shipped index preamble drifted from INDEX_PREAMBLE",
+        )
+
+    def test_edited_preamble_is_caught(self) -> None:
+        mutated = self.index().replace(
+            "This file is append-only.", "This file is editable.", 1
+        )
+        require(self.errors_for(mutated), r"preamble drifted")
+
+    def test_an_extra_unowned_row_is_caught(self) -> None:
+        mutated = self.index() + self.row(3000, "—") + "\n"
+        require(self.errors_for(mutated), r"rows name no owner, above the recorded")
+
+    def test_a_spec_owed_section_owns_a_dashed_row(self) -> None:
+        # The escape hatch has to work, or the gate just forces a fake row ID.
+        mutated = self.index() + self.row(3000, "—") + "\n"
+        self.assertEqual(self.errors_for(mutated, owed={"3000"}), [])
+
+    def test_the_ratchet_refuses_to_slip_back(self) -> None:
+        # Owning one issue must LOWER the mark in the same change. Without this
+        # case the mark is a ceiling that never falls.
+        mutated = self.index(unowned=agent_record.UNOWNED_HIGH_WATER - 1)
+        require(self.errors_for(mutated), r"below the recorded")
+
+    def test_owed_issues_reads_specs_with_a_glob(self) -> None:
+        # A per-row surface by construction: one file per spec, so filing an
+        # owed issue never makes two branches write the same line.
+        self.assertIsInstance(agent_record.owed_issues(), set)
 
 
 if __name__ == "__main__":

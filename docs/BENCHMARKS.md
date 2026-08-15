@@ -246,6 +246,7 @@ Qwen3.6-27B NVFP4, GB10, whole serving window.
 | Peak RSS | 24.88 GiB | 28.56 GiB | 1.148x | **PASS** |
 | Peak GPU memory | 40,996 MiB | 70,531 MiB | 1.720x | **PASS** |
 | Peak `MemAvailable` drop | 68.35 GiB | 80.66 GiB | 1.180x | **PASS** |
+| Weight offload, resident device bytes (`ENG-WEIGHT-OFFLOAD` W6) | not measured | not measured | n/a | **BLOCKED**, not pending: unmeasurable on every host we own (GB10 shares one pool, so `cpu_offload_gb` frees nothing). Needs a discrete-GPU rig ([record](../.agents/benchmark-record.md)) |
 
 35B steady-serving PSS is 3.53 GiB against vLLM's 13.3 GiB after the routed-expert
 host mirror is freed once the device Marlin resident is built.
@@ -351,7 +352,7 @@ in the tree, default-OFF, for reproducibility; detail in the benchmark record.
 | MTP | Qwen3.6-27B NVFP4 | token-identical to vLLM MTP, **~4% faster at c1**; on-par at c2-c8 | `DONE` |
 | DFlash | Qwen3.6-27B NVFP4 | **2.9x over spec-off** (10.16 → 29.32 tok/s), at/above vLLM DFlash-on (**1.003x**, non-overlapping bands) | `DONE` |
 | n-gram | Qwen3.6-27B NVFP4 | draft-free (`SPEC-NGRAM`); 27B 5/5 STRICT our-ngram-ON == vLLM-ngram-ON, 180/180 drafts accepted (correctness only, no speed row yet) | `DONE` |
-| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE 35B-A3B: within-session ratios **0.957-0.989** across boots, NOT parity. Re-measurement BLOCKED: gate host reimaged 2026-08-14, oracle and checkpoints gone (#442) | `ACTIVE` |
+| DSpark | 27B NVFP4 dense k=15; 35B-A3B MoE k=8 | MoE 35B-A3B: **0.835x** paired on kairos-17dd (matched 89 tokens, warm oracle cache). Prior 0.957-0.989 came from a different machine with a cold oracle (#442) | `ACTIVE` |
 | Breadth (EAGLE1/3, suffix, ngram-gpu, dynamic-k, ...) | n/a | enumerated from vLLM source + `INVENTORIED` 2026-08-06 (`.agents/specs/spec-decode-inventory.md`), unmeasured | `INVENTORIED` |
 
 ## How we measure
@@ -437,7 +438,7 @@ built on it rather than keeping the flattering one.
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | MiniMax-H3 FP4 speed (W-FP4a) | **Measured GB10 (`row/H3-FP4-GPU-E2E`).** Marlin W4A16 byte-exact vs bf16; fp4 a memory win, 0.8x bf16/forward. Real-ckpt fp4-resident e2e RUNS (mp4/wav) | fp4 speed CLOSED. bf16-vs-quant A/B: ENCODER half MEASURED (§8.15), DiT half NOT (no bf16 render exists). Detail: benchmark-record + spec §8 |
 | LTX-2.5 axes | Speed `PENDING` (vllm-omni#6066 has no native 2.5), binding oracle too. **SIZE: 320x192/25f completes on GB10, 448x256 does not**; that render was REGISTER-conditioned, not prompted | Wall is the HOST VAE decode, not the pool: drain returns 0.11 GiB, byte-inert. 2 baselines UNRESOLVED (lock). A real-checkpoint PROMPTED render is OWED |
-| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`) | **Every axis `PENDING`; none owed yet.** W0/W1 are correctness scaffolding; no forward pass exists to time | Denominator when it does: SGLang-Omni `748a0b43` in its production configuration. First number owed at W6 |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`) | **Every axis `PENDING`, now OWED.** The pipeline runs end to end, so a forward pass exists to time; every gate was taken on CPU with `dgx.casa` down, and a CPU number against a graphed denominator is dishonest | Denominator: SGLang-Omni `748a0b43` in its production configuration (both CUDA graphs, compiled DIT and DAV, batched seeded sampling) |
 | MiniMax-H3 render coherence (`row/H3-RENDER-CLOSE` #77) | **CLOSED: a COHERENT scene on GB10.** #70/#74 white was wrong-PARTITION usage (t2va on the ref2va ckpt); t2va on the FL2VA GGUF renders a prompt-matched orange cat (adj-cos 0.95 vs 0.06, no patch-grid) | Verified first: t2va inputs byte-exact vs upstream; CUDA device==host at seq 1920. Follow-up `H3-TASK-PARTITION-GUARD`: the task/partition mismatch now RAISES 1:1 with `_resolve_task` (spec §8.6-8.7) |
 | MiniMax-H3 image conditioning (`row/H3-CONDITIONED-E2E`, `row/H3-VISION-SCATTER`, `row/H3-REF2VA-ASSEMBLY`) | **fl2va COHERENT; ref2va assembly bug FIXED+gated.** vision→cond scatter gated; ref2va block-dim double-division fixed + RED-first gated (128 vs 512) + a permanent ref2va DiT-forward rung (§8.10) | grid RE-ATTRIBUTED: with the fix ref2va grids in fp4 AND bf16, and t2va with no refs on the ref2va NVFP4 also grids while FL2VA-GGUF renders, so it is the **NVFP4 checkpoint/loader**, NOT assembly/fp4 (§8.10) |
 | MiniMax-H3 Thor render speed (sm_110, no FA2) | **34.6 s/step** at 864x480/124f/50 steps on Q4_K_M, **16.6x** off 574.5 (render ~28 min, was ~8 h). Landed: warp-per-query, chunked warp reduce-scatter (1.76x), bf16 `mma.sync` (9.82x) | Shared-memory K/V tiling (23% SLOWER) and register Q-blocking (-0.8%) both measured and REVERTED: memory traffic is not the bound (one head's K+V is 3.9 MB against 32 MB of L2) |

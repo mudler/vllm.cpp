@@ -54,6 +54,18 @@ permissions:
 env:
   REGISTRY_PACKAGE: ghcr.io/mudler/vllm.cpp
 
+# 2026-08-15 (#822): this workflow had NO concurrency policy at all and was
+# named as the largest source of superseded queued runs -- 32 obsolete runs were
+# cancelled by hand on 2026-08-14.
+#
+# Pull request and main-push runs are latest-only. A TAG run keys on the tag and
+# is never cancelled: publish, manifest, attest and promote push by digest, and
+# a cancelled publish can leave a manifest half-joined. Schedule and dispatch
+# keep their own partition through the event_name token.
+concurrency:
+  group: containers-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.repository }}
+  cancel-in-progress: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   plan:
     permissions:

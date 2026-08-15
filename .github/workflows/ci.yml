@@ -2,7 +2,11 @@ name: ci
 on:
   push:
     branches: [main]
+  # `closed` so a merged or abandoned pull request ENTERS the concurrency
+  # group and supersedes its own in-flight run. Every job below excludes it, so
+  # the run finishes immediately without executing a gate (#822).
   pull_request:
+    types: [opened, synchronize, reopened, closed]
   # THE BASELINE LANE (issue #274, spec .agents/specs/main-verifiability.md).
   #
   # The push lane below cannot answer "is main green?", by construction. Every
@@ -55,9 +59,23 @@ on:
 # sharing group `ci-<sha>-<repo>` with that push's run and QUEUEING behind it.
 # For `push` and `pull_request` the added token is a constant, so their
 # partition into groups is exactly what it was.
+# 2026-08-15 (#822): the push lane becomes LATEST-ONLY. The group keys on
+# `github.ref` for a push rather than `github.sha`, so consecutive pushes to main
+# share a group and the older one is cancelled.
+#
+# This was previously unsafe and is now safe. It was unsafe because a cancelled
+# run's diff-scoped range was never re-covered: the next run's `before` is this
+# run's `sha`. The gates now walk from the last SUCCESSFULLY gated commit
+# (`last-gated-commit`), so a cancelled run is lossless -- the next run walks a
+# wider range and reports the same red. Reverting that base to `before` without
+# reverting this reintroduces #863.
+#
+# `schedule` and `workflow_dispatch` keep their own partition through the
+# event_name token and stay non-cancellable, so the baseline lane (#274) is
+# untouched.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}-${{ github.repository }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ github.repository }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
   agent-record:
@@ -66,6 +84,12 @@ jobs:
     concurrency:
       group: ci-agent-record-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    # always(): `last-gated-commit` is skipped on the PR lane, and a
+    # skipped dependency would otherwise skip this gate too.
+    if: always() && github.event.action != 'closed'
+    needs: [last-gated-commit]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,6 +99,7 @@ jobs:
         run: |
           python3 scripts/check-agent-record.py
           python3 tests/scripts/test_agent_record.py
+          python3 tests/scripts/test_check_issue_index_append_only.py
           python3 tests/scripts/test_doc_checkpoint.py
       - name: Accepted binary-release design and record anchors stay in sync
         run: |
@@ -222,10 +247,6 @@ jobs:
         # body with EVENT_NAME=schedule, PUSH_BASE="".
         env:
           EVENT_NAME: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          PUSH_BASE: ${{ github.event.before }}
-          PUSH_HEAD: ${{ github.sha }}
         run: |
           set -eu
           python3 scripts/check-prompt-contract.py
@@ -233,19 +254,6 @@ jobs:
             tests.scripts.test_check_commit_trailers
           python3 tests/scripts/test_check_prompt_contract.py
           python3 tests/scripts/test_agent_gates.py
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            base="$PR_BASE"
-            head="$PR_HEAD"
-          else
-            base="$PUSH_BASE"
-            head="$PUSH_HEAD"
-          fi
-          if [ -z "$base" ]; then
-            echo "no diff range on the $EVENT_NAME lane: the trailer walk is"
-            echo "diff-scoped and every commit's own push already ran it."
-          else
-            python3 scripts/check-commit-trailers.py --range "$base..$head"
-          fi
       - name: NOW.md stays a short one-Read resume surface
         run: |
           python3 scripts/check-now-current.py
@@ -284,6 +292,7 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
+          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
           PUSH_HEAD: ${{ github.sha }}
         run: |
           set -eu
@@ -293,7 +302,12 @@ jobs:
             head="$PR_HEAD"
             pending_args=(--pending-pr-head "$PR_HEAD")
           else
-            base="$PUSH_BASE"
+            # The last SUCCESSFULLY gated commit, not the previous push: a
+            # cancelled run must not advance the base, or its commits are
+            # skipped forever. That is what lets the push lane be latest-only
+            # (#822, #863). Falls back to `before`, today's behaviour.
+            base="${LAST_GREEN:-}"
+            [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
           if [ -z "$base" ]; then
@@ -330,8 +344,25 @@ jobs:
         # the triggering ref, on a PR `refs/pull/N/merge`); with no match it
         # writes FETCH_HEAD only. Naming the refspec creates the ref whatever
         # the checkout is configured to do.
+        #
+        # The `row/*` refspec is the OTHER half of the same argument (#726).
+        # The classifier's IN-FLIGHT verdict is reached only through a ref named
+        # `row/<ID>`, and fetching `main` alone left none in the checkout -- so
+        # IN-FLIGHT was unreachable and a row whose work is genuinely in flight
+        # produced the same verdict as one nobody is working on. Every PR that
+        # moves a row to ACTIVE before its code lands failed here, which is the
+        # normal shape of the work. `require_branch_information` now aborts
+        # rather than misreport if this refspec is ever dropped again.
+        #
+        # It does not cover a FORK, whose branch is a ref `origin` cannot hold;
+        # that case is covered inside the audit, by reading `origin/main..HEAD`.
+        #
+        # Cost measured at `af026e524`: 267 `row/*` heads carrying 648 commits
+        # not on `origin/main`, over a `fetch-depth: 0` checkout that already
+        # holds main's history.
         run: |
-          git fetch -q origin +refs/heads/main:refs/remotes/origin/main
+          git fetch -q origin +refs/heads/main:refs/remotes/origin/main \
+            '+refs/heads/row/*:refs/remotes/origin/row/*'
           python3 scripts/audit-live-rows.py --check
           python3 tests/scripts/test_audit_live_rows.py
   documentation-checkpoint:
@@ -347,7 +378,10 @@ jobs:
     # and the gate vacuous. The push that landed each commit already ran this,
     # which is exactly why it carries no group. The baseline's subject is the
     # TREE at a SHA, and `scripts/main-baseline.py` names the jobs it covered.
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    # always(): `last-gated-commit` is skipped on the PR lane, and a
+    # skipped dependency would otherwise skip this gate too.
+    if: always() && github.event.action != 'closed' && (github.event_name != 'schedule' && github.event_name != 'workflow_dispatch')
+    needs: [last-gated-commit]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -359,6 +393,7 @@ jobs:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
+          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
           PUSH_HEAD: ${{ github.sha }}
         run: |
           set -eu
@@ -366,7 +401,12 @@ jobs:
             base="$PR_BASE"
             head="$PR_HEAD"
           else
-            base="$PUSH_BASE"
+            # The last SUCCESSFULLY gated commit, not the previous push: a
+            # cancelled run must not advance the base, or its commits are
+            # skipped forever. That is what lets the push lane be latest-only
+            # (#822, #863). Falls back to `before`, today's behaviour.
+            base="${LAST_GREEN:-}"
+            [ -n "$base" ] || base="$PUSH_BASE"
             head="$PUSH_HEAD"
           fi
           python3 scripts/check-doc-checkpoint.py --base "$base" --head "$head"
@@ -377,6 +417,46 @@ jobs:
           fi
           python3 scripts/check-role-discipline.py \
             --base "$base" --head "$head" "${pending_args[@]}"
+  last-gated-commit:
+    # The head of the most recent SUCCESSFUL push run of this workflow on this
+    # branch. It is the base the diff-scoped gates walk from, instead of
+    # `github.event.before`.
+    #
+    # `before` is the previous push's sha whether or not that push was gated, so
+    # a cancelled run's commits are skipped and NOTHING re-covers them -- the
+    # reason a superseded main run could not be cancelled at all (#822, #863).
+    # Basing on the last GREEN commit makes a cancelled run lossless: the next
+    # run simply walks a wider range.
+    #
+    # Carries NO concurrency group, like the gates that consume it.
+    #
+    # This is workflow plumbing resolving an input, not a checker. The
+    # protocol's ban on network calls is about a CHECKER failing on
+    # connectivity; this falls back to `before` when the query returns nothing,
+    # so a failed query is the status quo rather than a skipped gate.
+    if: github.event.action != 'closed' && (github.event_name == 'push')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -eu
+          sha="$(gh api \
+            "repos/$REPO/actions/workflows/ci.yml/runs?branch=$BRANCH&event=push&status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)"
+          # NOT `[ ... ] && sha=""`: that returns non-zero when the test is
+          # false, which aborts the step under `set -e`.
+          if [ "$sha" = "null" ]; then sha=""; fi
+          echo "last successfully gated commit: ${sha:-<none, falling back to before>}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
   commit-protocol-tag:
     # Gate: every NEW commit must carry the FOLLOWING_AGENTS_PROTOCOL trailer,
     # asserting the contributor read AGENTS.md. See .agents/ai-coding-assistants.md.
@@ -387,20 +467,25 @@ jobs:
     #
     # Not on the baseline lane (#274), same reasoning: no `before` on a
     # `schedule` or `workflow_dispatch` payload, so the walk has no range.
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    needs: [last-gated-commit]
+    if: always() && github.event.action != 'closed' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Every new commit carries FOLLOWING_AGENTS_PROTOCOL
+        env:
+          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
         run: |
           set -eu
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="${{ github.event.pull_request.base.sha }}"
             head="${{ github.event.pull_request.head.sha }}"
           else
-            base="${{ github.event.before }}"
+            # Same self-healing base as the strict walk below (#822, #863).
+            base="${LAST_GREEN:-}"
+            [ -n "$base" ] || base="${{ github.event.before }}"
             head="${{ github.sha }}"
           fi
           # Enforce on the FIRST-PARENT mainline (the commits the submitter
@@ -428,6 +513,60 @@ jobs:
             exit 1
           fi
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
+      - name: Every new commit satisfies the strict trailer contract
+        # DIFF-scoped, and therefore HERE rather than in agent-record. It lived
+        # in that job until #863: agent-record carries a cancellable group keyed
+        # on `github.ref`, which for a push is the constant `refs/heads/main`, so
+        # consecutive pushes cancelled it. Measured on run 31851003245, the push
+        # of 51e0cb5b1: agent-record cancelled, this job succeeded, and the
+        # commit fails the strict walk. The grep above passed it because the
+        # marker was PRESENT three times -- presence is not parseability, and
+        # only the strict walk knows the difference.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
+          PUSH_HEAD: ${{ github.sha }}
+          # Passed as an ENV VAR, never interpolated into the script: a body is
+          # attacker-controlled text on a fork pull request.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -eu
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE"
+            head="$PR_HEAD"
+          else
+            # The last SUCCESSFULLY gated commit, not the previous push. A
+            # cancelled or failed run must not advance the base, or its commits
+            # are skipped forever -- that is the whole reason a superseded main
+            # run could not be cancelled before (#822, #863). Falls back to
+            # `before`, which is the previous behaviour, when nothing is found.
+            base="${LAST_GREEN:-}"
+            [ -n "$base" ] || base="$PUSH_BASE"
+            head="$PUSH_HEAD"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "no usable diff range on the $EVENT_NAME lane: base=${base:-<empty>}"
+            echo "checking the tip commit alone rather than passing vacuously."
+            python3 scripts/check-commit-trailers.py --range "$head~1..$head"
+          else
+            echo "strict trailer walk over ${base}..${head}"
+            python3 scripts/check-commit-trailers.py --range "$base..$head"
+          fi
+          # `squash_merge_commit_message = PR_BODY` makes the pull request body
+          # the landed commit message, so it is held to the contract its commit
+          # will be held to, by the same checker (#848). `${PR_BODY:-}` because
+          # this runs under `set -eu` and the variable is UNSET, not empty, on a
+          # lane with no pull request. An empty body is not skipped: it lands a
+          # commit carrying no trailers at all.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            body_file="$(mktemp)"
+            printf '%s' "${PR_BODY:-}" > "$body_file"
+            python3 scripts/check-commit-trailers.py \
+              --message-file "$body_file" --filled
+          fi
   pr-size:
     # PR-only. The per-class LINE BUDGETS this job used to enforce were retired
     # 2026-08-10, and the fail-closed BINARY GUARD was retired 2026-08-13 (see
@@ -435,7 +574,7 @@ jobs:
     # required check. What it enforces now: explicit path classification, the
     # checker-change mutation-evidence contract, and the role check that keeps
     # product paths on a PR. Nothing here measures the size of a diff.
-    if: github.event_name == 'pull_request'
+    if: github.event.action != 'closed' && (github.event_name == 'pull_request')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -459,6 +598,9 @@ jobs:
     concurrency:
       group: ci-cuda-arch-features-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -485,6 +627,9 @@ jobs:
     concurrency:
       group: ci-cuda-fat-build-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     container: nvidia/cuda:13.3.0-devel-ubuntu24.04
@@ -557,6 +702,9 @@ jobs:
     concurrency:
       group: ci-vulkan-spirv-freshness-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -591,6 +739,9 @@ jobs:
     concurrency:
       group: ci-build-test-vulkan-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -633,6 +784,9 @@ jobs:
     concurrency:
       group: ci-device-leakage-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -644,7 +798,7 @@ jobs:
     # Native Windows release portability must be proven before merge. This PR
     # lane calls the authoritative driver but retains no artifact and has no
     # release, upload, write-token, or OIDC authority (#117).
-    if: github.event_name == 'pull_request'
+    if: github.event.action != 'closed' && (github.event_name == 'pull_request')
     permissions:
       contents: read
     runs-on: windows-2022
@@ -667,7 +821,7 @@ jobs:
   windows-msvc-vulkan:
     # Independent Vulkan build/loader/backend proof on the native MSVC ABI.
     # Like the CPU lane it is PR-only, read-only, and retains no release asset.
-    if: github.event_name == 'pull_request'
+    if: github.event.action != 'closed' && (github.event_name == 'pull_request')
     permissions:
       contents: read
     runs-on: windows-2022
@@ -692,6 +846,9 @@ jobs:
     concurrency:
       group: ci-build-test-cpu-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -743,6 +900,9 @@ jobs:
     concurrency:
       group: ci-build-test-cpu-arm64-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed'
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -827,6 +987,9 @@ jobs:
     concurrency:
       group: ci-sanitize-cpu-${{ matrix.lane }}-${{ github.event_name }}-${{ github.ref }}-${{ github.repository }}
       cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+    # Skip when the pull request was CLOSED: the run exists only to enter
+    # the concurrency group and supersede the in-flight one (#822).
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -870,7 +1033,7 @@ jobs:
     # On the day this lands the first run is EXPECTED RED, on the six sanitizer
     # failures of #274 finding #1 / #301. That is the correct first verdict. A
     # baseline that hid them would certify nothing.
-    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: always() && github.event.action != 'closed' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     needs:
       - agent-record
       - cuda-arch-features

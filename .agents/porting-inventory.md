@@ -1631,9 +1631,21 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     cycle reconciles it deliberately, and until then a Qwen3.5 change must check
     both anchors; (b) **no token or speed axis is claimable for
     `Qwen/Qwen3.8-2.4T-A95B`** — 2.4T bf16 is ~4.8 TB and the released FP8
-    variant ~2.4 TB against GB10's 128 GB unified, with no smaller Qwen3.8
-    sibling, so the run gate is OWED (both rows are `PARTIAL`, never `DONE`, and
+    variant ~2.4 TB against GB10's 128 GB unified, so the run gate for that
+    checkpoint is OWED (both rows are `PARTIAL`, never `DONE`, and
     the gap is recorded in [BENCHMARKS](../docs/BENCHMARKS.md) §Open gaps). The
+    A smaller sibling DOES exist and this row previously claimed otherwise:
+    `Qwen/Qwen3.8-27B` (55.6 GB bf16, 18 shards, revision
+    `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`) fits GB10 and **loads on current
+    `main` with no code change** — evidenced by reaching the engine
+    constructor's terminal log statement (`entrypoints/model_loader.cpp:1153`),
+    which is emitted only after every weight binds and the hybrid KV geometry
+    resolves. It does NOT close either text-only gate below: it declares
+    `Qwen3_5ForConditionalGeneration`, not `Qwen3_5[Moe]ForCausalLM`. It is the
+    already-gated Qwen3.6-27B shape retrained — `config.json` differs in exactly
+    one key (`transformers_version`) and the safetensors tensor-name set is
+    identical (1199 names, zero difference either direction). Its own
+    token-exact gate is OWED and unrun.
     DENSE gate closes when a `Qwen3_5ForCausalLM` checkpoint that fits GB10
     appears; **the MoE one does not** — per (e) below, a fitting PUBLISHED MoE
     checkpoint would still be refused at load, so the MoE gate needs a fitting

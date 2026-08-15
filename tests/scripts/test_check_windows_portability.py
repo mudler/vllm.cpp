@@ -33,6 +33,11 @@ NOMINMAX_REAL_CLOSURE = (
 )
 
 
+# The single MSVC warning arm of the safe fixture, replaced wholesale by the
+# #774 warning-policy tests. Anchored by count, never by "it is in there".
+MSVC_WARNING_ARM = "add_compile_options(/fp:strict /W4 /WX)"
+
+
 SAFE_FILES = {
     "CMakeLists.txt": """
         set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -314,6 +319,99 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
         ):
             with self.subTest(token=token):
                 self.assertIn(token, contract)
+
+    def msvc_warning_arm(self, replacement: str) -> str:
+        """Return the safe CMakeLists with its MSVC warning arm replaced."""
+        cmake = textwrap.dedent(SAFE_FILES["CMakeLists.txt"])
+        if cmake.count(MSVC_WARNING_ARM) != 1:
+            raise AssertionError("expected exactly one MSVC warning arm")
+        return cmake.replace(MSVC_WARNING_ARM, replacement)
+
+    def test_real_tree_msvc_warning_policy_reaches_the_cxx_compile(self) -> None:
+        """#774: the tokens must survive the reader the checker actually uses."""
+        cmake = (REPO / "CMakeLists.txt").read_text(encoding="utf-8")
+        warnings = (REPO / "cmake/CompilerWarnings.cmake").read_text(
+            encoding="utf-8"
+        )
+        reaching = checker.msvc_cxx_flag_text(cmake + "\n" + warnings)
+        for flag in ("/W4", "/WX"):
+            with self.subTest(required=flag):
+                self.assertTrue(checker.has_msvc_flag(reaching, flag))
+        for flag in ("/WX-", "/W0", "/w"):
+            with self.subTest(negation=flag):
+                self.assertFalse(checker.has_msvc_flag(reaching, flag))
+        # The prose in CMakeLists.txt is NOT what answers for the policy.
+        self.assertIn("/W4 /WX remains unchanged", cmake)
+        self.assertFalse(
+            checker.has_msvc_flag(checker.msvc_cxx_flag_text(cmake), "/WX")
+        )
+
+    def test_rejects_warnings_as_errors_disabled_by_wx_minus(self) -> None:
+        """`"/WX" in "/WX-"` is True, and /WX- is the INVERSE policy (#774)."""
+        disabled = self.msvc_warning_arm(
+            "add_compile_options(/fp:strict /W4 /WX-)"
+        )
+        self.assert_rejected("CMakeLists.txt", disabled, "negated on the C/C++")
+        self.assert_rejected("CMakeLists.txt", disabled, "missing /WX")
+
+    def test_rejects_policy_satisfied_only_on_objcxx(self) -> None:
+        """The measured PR #640 shape at commit 74ba3823f (#774).
+
+        Objective-C++ is the Metal backend and never compiles under MSVC, so a
+        bare /WX confined to it answers for nothing on Windows.
+        """
+        objcxx_only = self.msvc_warning_arm(
+            "set_property(TARGET vllm PROPERTY COMPILE_WARNING_AS_ERROR OFF)\n"
+            "add_compile_options(/fp:strict\n"
+            "  $<$<COMPILE_LANGUAGE:CXX>:/W4>\n"
+            "  $<$<COMPILE_LANGUAGE:CXX>:/WX->\n"
+            "  $<$<COMPILE_LANGUAGE:OBJCXX>:/W4>\n"
+            "  $<$<COMPILE_LANGUAGE:OBJCXX>:/WX>)"
+        )
+        self.assert_rejected("CMakeLists.txt", objcxx_only, "missing /WX")
+        self.assert_rejected("CMakeLists.txt", objcxx_only, "negated on the C/C++")
+
+    def test_rejects_prefix_lookalike_warning_flags(self) -> None:
+        """/W44996 sets ONE warning to level 4; /WXsomething is not /WX."""
+        lookalikes = self.msvc_warning_arm(
+            "add_compile_options(/fp:strict /W44996 /WXsomething)"
+        )
+        self.assert_rejected("CMakeLists.txt", lookalikes, "missing /W4 /WX")
+
+    def test_rejects_warning_level_disabled_alongside_the_policy(self) -> None:
+        """/w is the disable spelling of /W4 and wins as the later flag."""
+        self.assert_rejected(
+            "CMakeLists.txt",
+            self.msvc_warning_arm("add_compile_options(/fp:strict /W4 /WX /w)"),
+            "negated on the C/C++ compile by /w",
+        )
+
+    def test_rejects_policy_declared_only_in_a_comment(self) -> None:
+        self.assert_rejected(
+            "CMakeLists.txt",
+            self.msvc_warning_arm("# the MSVC policy is /W4 /WX"),
+            "missing /W4 /WX",
+        )
+
+    def test_accepts_the_policy_on_every_shape_that_reaches_cxx(self) -> None:
+        """The inverse pin: repaired does not mean stricter about everything."""
+        for label, arm in (
+            ("cxx genex", "add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4 /WX>)"),
+            ("c and cxx", "add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/W4 /WX>)"),
+            ("config genex",
+             "add_compile_options($<$<CONFIG:Debug>:/W4> $<$<CONFIG:Debug>:/WX>)"),
+            # Targeted suppressions are a DELIBERATE non-goal of #774: they
+            # narrow what /W4 reports, they do not invert /W4 or /WX.
+            ("targeted suppression",
+             "add_compile_options(/fp:strict /W4 /WX /wd4324)"),
+        ):
+            with self.subTest(shape=label):
+                result = self.run_checker(
+                    self.make_tree({"CMakeLists.txt": self.msvc_warning_arm(arm)})
+                )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr
+                )
 
     def test_real_tree_has_no_unguarded_local_nominmax_redefinitions(self) -> None:
         cmake = (REPO / "CMakeLists.txt").read_text(encoding="utf-8")
@@ -1780,9 +1878,21 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             ),
             "exact unsupported-tier probe body",
         ))
+        # The checker reads `$calls.Add(` inside the `$good` scriptblock of
+        # Invoke-UnsupportedTierContractTests (`good_runner`), and NOWHERE
+        # else. `script.replace(..., 1)` mutates the first occurrence in the
+        # file, which since #583 added Invoke-CheckedContractTests (#512) is a
+        # DIFFERENT function the checker never looks at -- so the checker
+        # stayed green and this case has been failing on main ever since
+        # (#680). Anchor the mutation to the governed occurrence, and assert
+        # that occurrence is unique rather than assuming it.
+        governed_at = script.index("function Invoke-UnsupportedTierContractTests")
+        self.assertEqual(script[governed_at:].count("$calls.Add("), 1)
         mutations.extend((
             (
-                script.replace("$calls.Add(", "$calls.Append(", 1),
+                script[:governed_at] + script[governed_at:].replace(
+                    "$calls.Add(", "$calls.Append(", 1
+                ),
                 "fake runner call recording",
             ),
             (

@@ -1386,6 +1386,71 @@ TEST_CASE("capi: the v19 limits are RECORDED on a C-ABI engine; there is no "
   CHECK(e.mm_config().GetLimitPerPrompt("image") == 0);
 }
 
+TEST_CASE("capi: offload_config defaults to NULL and is parsed+validated (ABI v21)") {
+  // ENG-WEIGHT-OFFLOAD W0b. The field carries vLLM's OffloadConfig JSON. It is
+  // parsed AND run through Validate() at the ABI boundary, so a caller error is
+  // reported before any model I/O — the same contract kv_transfer_config and
+  // limit_mm_per_prompt already hold.
+
+  // Default is NULL == no offloading == the byte-identical engine.
+  vllm_model_params def = vllm_model_params_default();
+  CHECK(def.offload_config == nullptr);
+
+  // A well-formed config gets PAST the argument gate and fails at model load,
+  // which is how we prove it was accepted rather than rejected.
+  vllm_model_params ok = vllm_model_params_default();
+  ok.model_path = "/nonexistent/vllm-cpp/model/dir";
+  ok.offload_config =
+      "{\"offload_backend\":\"uva\",\"uva\":{\"cpu_offload_gb\":10,"
+      "\"cpu_offload_params\":[\"experts\"]}}";
+  vllm_engine* eng = nullptr;
+  CHECK(vllm_engine_load(&ok, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+
+  // Empty string is the same as NULL: inert, still reaches model load.
+  vllm_model_params empty = vllm_model_params_default();
+  empty.model_path = "/nonexistent/vllm-cpp/model/dir";
+  empty.offload_config = "";
+  vllm_engine* eng_empty = nullptr;
+  CHECK(vllm_engine_load(&empty, &eng_empty) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng_empty == nullptr);
+
+  // Every rejection below must be INVALID_ARGUMENT, never MODEL_LOAD: the
+  // distinction is the whole point of validating at the boundary.
+  struct Bad { const char* json; const char* why; };
+  const Bad bad_cases[] = {
+      {"{not json", "malformed document"},
+      {"{\"offload_backend\":\"disk\"}", "unknown backend (disk is ENG-EXPERT-STREAM's idea, not this row's)"},
+      {"{\"uva\":{\"cpu_offload_gb\":\"ten\"}}", "wrong-typed field"},
+      {"{\"uva\":5}", "sub-config that is not an object"},
+      {"{\"uva\":{\"cpu_offload_gb\":-1}}", "negative budget (the ge=0 bound)"},
+      {"{\"prefetch\":{\"offload_group_size\":4,\"offload_num_in_group\":5}}",
+       "num_in_group > group_size (upstream validator error 1)"},
+      {"{\"prefetch\":{\"offload_group_size\":8,\"offload_num_in_group\":2,"
+       "\"offload_prefetch_step\":0}}",
+       "prefetch_step < 1 while enabled (upstream validator error 2)"},
+  };
+  for (const Bad& b : bad_cases) {
+    vllm_model_params bad = vllm_model_params_default();
+    bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+    bad.offload_config = b.json;
+    vllm_engine* e = reinterpret_cast<vllm_engine*>(0x1);
+    CHECK_MESSAGE(vllm_engine_load(&bad, &e) == VLLM_ERR_INVALID_ARGUMENT, b.why);
+    CHECK_MESSAGE(e == nullptr, b.why);
+  }
+
+  // A backend/field MISMATCH is a warning upstream, so it must NOT be refused:
+  // uva backend with prefetch fields set still reaches model load.
+  vllm_model_params warn = vllm_model_params_default();
+  warn.model_path = "/nonexistent/vllm-cpp/model/dir";
+  warn.offload_config =
+      "{\"offload_backend\":\"uva\",\"uva\":{\"cpu_offload_gb\":1},"
+      "\"prefetch\":{\"offload_group_size\":8,\"offload_num_in_group\":2}}";
+  vllm_engine* eng_warn = nullptr;
+  CHECK(vllm_engine_load(&warn, &eng_warn) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng_warn == nullptr);
+}
+
 TEST_CASE("capi: kv_transfer_config parses and validates the connector name") {
   // A well-formed config naming a REGISTERED connector passes the gate and
   // reaches model load.
@@ -2488,8 +2553,18 @@ TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference cl
   CHECK(std::string(vllm_speech_engine_family(declared)) == "minimax-music3");
   vllm_speech_engine_free(declared);
 
-  // And the owed stage is a RUNTIME refusal naming the missing piece, not a
-  // silent zero-length waveform.
+  // W6 refused HERE by name, because the 8.6B `Qwen3ForCausalLM` forward it
+  // needed had no `inputs_embeds` entry on the landed dense path. That entry
+  // exists now (`Qwen3DenseModel::ForwardEmbeds`) and the loop that drives it is
+  // `Music3GenerateFrameHiddens`, so this assertion is INVERTED: a valid request
+  // must no longer stop at a missing stage.
+  //
+  // This checkpoint is SYNTHETIC — valid configs, empty weight files — so the
+  // request runs the whole contract and then fails ON THE ARTIFACT, naming the
+  // file it could not read. Pinning that boundary is the point: the message must
+  // be about these bytes and must NOT be about an unimplemented forward. Whether
+  // the pipeline produces a song is a question only the real 28.5 GB checkpoint
+  // answers, and tests/parity/test_minimax_music3_e2e_real.cpp asks it.
   vllm_speech_params params = vllm_speech_params_default();
   params.lyrics = "[Verse]\nMorning light\n";
   params.description = "Genre: acoustic pop. BPM: 96.";
@@ -2501,7 +2576,18 @@ TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference cl
   CHECK(vllm_synthesize(eng, &params, &out) == VLLM_ERR_RUNTIME);
   CHECK(out.samples == nullptr);
   CHECK(out.wav == nullptr);
-  CHECK(std::string(vllm_last_error()).find("Qwen3ForCausalLM") != std::string::npos);
+  {
+    const std::string message = vllm_last_error();
+    MESSAGE("a valid request against a synthetic checkpoint stops at: " << message);
+    // It reached the LANGUAGE MODEL's own weight file — the first thing the AR
+    // head touches, and the thing this checkpoint does not really have.
+    CHECK(message.find("language_model") != std::string::npos);
+    // And it is NOT the by-name refusal W6 shipped. Both spellings are asserted
+    // absent because either surviving would mean the stage is still owed; the
+    // message is printed above so a reader can check rather than trust.
+    CHECK(message.find("inputs_embeds") == std::string::npos);
+    CHECK(message.find("not implemented") == std::string::npos);
+  }
 
   // A field the family cannot honour is refused BY NAME rather than dropped.
   vllm_speech_params with_text = params;

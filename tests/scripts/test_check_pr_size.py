@@ -110,6 +110,19 @@ class PathClassification(unittest.TestCase):
             "docker/Dockerfile.arm64": "configuration",
             "docker/healthcheck.sh": "configuration",
             "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
+            # Same failure as the Dockerfile entries above, one row later.
+            # #840 moved the intake table out of roadmap_v1.md into its own
+            # append-only file and never classified it, and classify_path FAILS
+            # CLOSED -- so pr-size aborted on every pull request that appends an
+            # index row, which under that same policy is nearly all of them
+            # (#856). It is a project record for the same reason roadmap_v1.md
+            # is: it IS the table roadmap_v1.md used to hold.
+            ".agents/roadmap_v1.md": "project_record",
+            ".agents/issue-index.md": "project_record",
+            ".agents/style/commits.md": "procedure",
+            ".agents/style/prose.md": "procedure",
+            ".claude/skills/writing-commits-and-prs/SKILL.md": "procedure",
+            ".claude/skills/writing-technical-english/SKILL.md": "procedure",
         }
         for path, path_class in expected.items():
             with self.subTest(path=path):
@@ -685,6 +698,58 @@ class BudgetEnforcement(unittest.TestCase):
             )
             self.assertFalse(any("{" in change.path or "=>" in change.path for change in changes))
 
+    def test_changed_paths_uses_the_merge_base_when_the_base_branch_moved(self) -> None:
+        """A PR diff is merge_base..head, not base_tip..head (#773).
+
+        RED before GATE-FORK-ANCESTRY: CI passes `pull_request.base.sha`, the
+        TIP of the base branch, which stops being an ancestor of head the moment
+        main advances -- so `changed_paths` raised and classification never ran
+        on any fork PR. Worse than strict: two-dot diffing a moved main renders
+        MAIN's own commits as reversions inside the contributor's diff, so paths
+        they never touched get classified and charged to them. This asserts both
+        halves: the PR's path is present, main's is absent.
+        """
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            repo = Path(directory)
+            run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            run("config", "user.name", "Test")
+            run("config", "user.email", "test@example.com")
+            (repo / "src").mkdir()
+            (repo / "src" / "root.cpp").write_text("root\n", encoding="utf-8")
+            run("add", ".")
+            run("commit", "-qm", "root")
+            root = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            # The contributor's branch, cut from root.
+            run("checkout", "-q", "-b", "pr", root)
+            (repo / "src" / "from_pr.cpp").write_text("pr\n", encoding="utf-8")
+            run("add", ".")
+            run("commit", "-qm", "pr work")
+            head = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            # main moves on afterwards -- the ordinary case, not an edge case.
+            run("checkout", "-q", "-B", "main", root)
+            (repo / "src" / "from_main.cpp").write_text("main\n", encoding="utf-8")
+            run("add", ".")
+            run("commit", "-qm", "mainline work")
+            moved_main = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            self.assertNotEqual(moved_main, root)
+
+            paths = {c.path for c in checker.changed_paths(moved_main, head, repo=repo)}
+            self.assertIn("src/from_pr.cpp", paths)
+            self.assertNotIn(
+                "src/from_main.cpp",
+                paths,
+                "main's own commit must not appear in the contributor's diff",
+            )
+
     def test_missing_and_nonancestor_objects_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
             repo = Path(directory)
@@ -705,7 +770,12 @@ class BudgetEnforcement(unittest.TestCase):
             side = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
             with self.assertRaises(ValueError):
                 checker.changed_paths("missing", side, repo=repo)
-            with self.assertRaisesRegex(ValueError, "ancestor"):
+            # Still RAISES -- the fail-closed half of the old non-ancestor rule
+            # is deliberately preserved (#773). `side` here is an ORPHAN branch,
+            # so there is no merge base and therefore no range to compute. Only
+            # the message changed: what used to be reported as "not an ancestor"
+            # is now named for what it actually is.
+            with self.assertRaisesRegex(ValueError, "no merge base"):
                 checker.changed_paths(base, side, repo=repo)
 
     def test_production_pr_classifier_covers_every_governed_path_class(self) -> None:

@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** **W0 + W1 DONE, W3 DONE, W4 + W5 DONE, W6 DONE, W2 PARTIAL.** Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. The 8.6B language-model forward and W7 are owed.
+**Status:** **W0-W7 DONE, W2 INCLUDED.** Every stage is implemented and gated; a COMPOSED request is not yet observed to completion on CPU (see `## Now`). Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. W7 has landed (§9): quantized checkpoints for this model exist in five formats; the RVQ depth decoder's GGUF Q4_K arm IS implemented and value-gated against a pinned artifact, and every other format and lineage is refused by name with the missing piece rather than surfacing as a confusing shape error. The 8.6B language-model forward and the other four components' GGUF arms are owed.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -335,12 +335,14 @@ that no closed-form rounding model reproduced. Ours is 43.61% and 1.824e-03,
 inside that spread. Chasing a particular kernel's rounding below the control is
 not "more correct" (AGENTS.md's near-tie discipline).
 
-**Still owed on the LLM half:** the 8.6B `Qwen3ForCausalLM` forward itself.
-`frame_hiddens[:, :4096]` is the language model's own hidden state, and
-reproducing it means running that model teacher-forced on the golden codes
-through our landed Qwen3 path, which needs an `inputs_embeds` entry it does not
-have. That is the remainder of W2 and it is recorded here rather than discovered
-later.
+**The LLM half is now gated too, and the same way.** `frame_hiddens[:, :4096]`
+is the language model's own hidden state; it is reproduced by running the model
+TEACHER-FORCED on the golden codes through the landed Qwen3 dense path, reached
+by the additive `Qwen3DenseModel::ForwardEmbeds` entry (see `## Now`). The bound
+is in bf16 ULPs against a matched control, and it is joined by a RANK statistic
+that no scaling can pass: the oracle's own sampled semantic codes rank 2.48 on
+average under our reproduced guided logits, where chance over the 16384-entry
+semantic window is 8191.5.
 
 **Acoustic half — per-stage tensor parity.** No logits, no sampler, so no token
 gate exists to have. Each stage is compared against the oracle's own output for
@@ -369,13 +371,13 @@ the operator. Phases are separately claimable except where noted.
 | Phase | Scope | Done when |
 |---|---|---|
 | **W0** | This spec; both oracle records pinned; §1.1 sample rate settled from source (**DONE**) and confirmed at runtime (**DONE**); stand the diffusers oracle up and prove it builds and runs (**DONE**, `tools/oracle/music3_oracle.py`) | oracle executes the model and `diffusers.md` flips to `gateable = yes` with a path as evidence |
-| **W1** | Modular loader: the six-component layout, weight-norm folding, the fp32/bf16 policy of §2.1, native-arm refusal by name | every component loads with shapes asserted against §1; converted-vs-native tensor equality checked, not assumed |
-| **W2** | Global LLM on our landed Qwen3 path at vocab 200 000 | hidden-state parity vs `transformers`, then token-exact RVQ code parity vs the oracle |
-| **W3** | Condition mix (8-layer weighted) + RVQ depth decoder, 8 codebooks | per-stage tensor parity; the depth decoder's 16-position window exercised at its boundary |
+| **W1** (**DONE**) | Modular loader: the six-component layout, weight-norm folding, the fp32/bf16 policy of §2.1, native-arm refusal by name | every component loads with shapes asserted against §1; converted-vs-native tensor equality checked, not assumed |
+| **W2** (**DONE**) | Global LLM on our landed Qwen3 path at vocab 200 000 | hidden-state parity against the oracle capture — DONE: an additive `inputs_embeds` entry on the dense path (bit-identical to the token-id forward), 25 teacher-forced steps inside a measured torch-vs-torch control, and the oracle's own codes ranking 2.48 under our guided logits. The token-exact RVQ code parity this row once promised is WITHDRAWN (§5): upstream has no greedy path |
+| **W3** (**DONE**) | Condition mix (8-layer weighted) + RVQ depth decoder, 8 codebooks | per-stage tensor parity; the depth decoder's 16-position window exercised at its boundary |
 | **W4** (**DONE**) | Flow-matching DiT + `FlowMatchEulerDiscreteScheduler` with `invert_sigmas` | per-step latent parity against the oracle at a fixed seed — DONE: scheduler BIT-EXACT on both recorded steps, DiT guided velocity inside the measured torch-vs-torch control |
 | **W5** (**DONE**) | Vocoder **through the shared `vocoder1d` primitives** (§4.1): snake activations, weight-norm, `[8,8,4,2]` upsampling, the 128→2×64 stereo fold, at **44100 stereo** (§1.1) | waveform parity within a stated absolute tolerance, and H3/IndexTTS-2.5 behaviour byte-identical — DONE: 88 064 samples, 0 outside tolerance, `vocoder1d` unmodified. WAV WRITING itself is W6's, with the rest of the delivery surface |
-| **W6** | Register as a `SpeechRegistry` family; extend `SpeechGenParams` ADDITIVELY for lyrics + description + controls (§4.1); NEW `vllm_speech_*` **`include/vllm.h`** surface with the ABI version bump; **the example HTTP server as a thin ABI client** | a song generates end to end from an HTTP request; IndexTTS-2.5 unchanged; SGLang-Omni cross-check; speed axis recorded with values and ratios |
-| **W7** | Quantized arms — GGUF k-quants are a standing requirement, not a per-model choice | each arm gated, or refused by name and recorded as owed |
+| **W6** (**DONE**) | Register as a `SpeechRegistry` family; extend `SpeechGenParams` ADDITIVELY for lyrics + description + controls (§4.1); NEW `vllm_speech_*` **`include/vllm.h`** surface with the ABI version bump; **the example HTTP server as a thin ABI client** | a song generates end to end from an HTTP request; IndexTTS-2.5 unchanged; SGLang-Omni cross-check; speed axis recorded with values and ratios |
+| **W7** (**DONE**) | Quantized arms — GGUF k-quants are a standing requirement, not a per-model choice | each arm gated, or refused by name and recorded as owed — BOTH branches exercised. Quantized checkpoints for this model DO exist (14 repos, 5 formats, surveyed with counts in §9.1). The RVQ depth decoder's GGUF Q4_K arm is IMPLEMENTED and value-gated against a pinned artifact at a DERIVED bound (§9.6); every other component, lineage and format is diagnosed and refused BY NAME with the missing piece. 29/125 without a checkpoint plus 6/319 against the artifact; 18 of 18 mutations RED. §9.6 records the gate-design finding: an upper-bound-only tolerance cannot separate a real quantized arm from a dequant fallback, because the fallback is CLOSER |
 
 **W0 blocks everything.** Until the oracle demonstrably runs, no phase can produce
 evidence, and an implementer told to "gate against diffusers" would have nothing
@@ -413,6 +415,264 @@ invalidates the SGLang-Omni cross-check and this spec's §2 decision.
 Stop and report `NEEDS_CONTEXT` if the checkpoint cannot be fetched to the box the
 gate runs on, or if a component's upstream class has no readable definition at the
 pinned SHA.
+
+---
+
+## 9. W7 — the quantized arms: the survey, and what is owed
+
+### 9.1 The survey, and why it is written down rather than summarized
+
+W7 opened with the question AGENTS.md forces: *which* quantized arms does this
+checkpoint family actually ship? The H3 precedent (§0 of
+[minimax-h3.md](minimax-h3.md)) is why the question is asked before any code is
+written — there, third-party GGUF and NVFP4 arms changed a row's verdict from
+"hardware-blocked" to "reachable", and reasoning from the first-party release
+alone had produced the wrong conclusion.
+
+**Every query is recorded with its result count**, because an absence claimed
+from a search nobody can re-run is not evidence. Queries were run against the
+HuggingFace HTTP API (authoritative; `search=` is substring-over-repo-id) on
+2026-08-14, with web search used only as a labelled cross-check and every repo id
+it produced re-verified against the API.
+
+| Query | Endpoint | Results | Notable |
+|---|---|---|---|
+| `?author=MiniMaxAI&limit=200` | models | 30 | `MiniMaxAI/MiniMax-Music3` (the base repo); **no quantized repo under the org** |
+| `?author=MiniMax&limit=200` / `?author=MiniMax-AI&limit=200` | models | 0 / 0 | the org id is `MiniMaxAI` |
+| `?search=music3&limit=100` | models | 68 | 14 are MiniMax-Music3 derivatives |
+| `?search=minimax-music&limit=100` | models | 42 | |
+| `?search=MiniMax-Music3&limit=100` | models | 27 | |
+| `?filter=gguf&search=minimax` | models | 11 | 6 are Music3 |
+| `?filter=gguf&search=music3` | models | 6 | |
+| `?search=music3-gguf` / `-nvfp4` / `-awq` / `-fp8` / `-int8` / `-w4a8` | models | 6 / 0 / 0 / 0 / 1 / 2 | |
+| `?author=<quantizer>` for QuantStack, city96, calcuis, Kijai, mradermacher, bartowski, unsloth, nvidia, RedHatAI | models | 9 authors swept, **0 Music3 repos** | the usual quantizers had not touched it |
+
+**The finding is that first-party ships bf16/fp32 ONLY, and the community had
+already published fourteen quantized repositories in five formats within days of
+the release.** The relevant ones:
+
+| Format | Repos | Coverage |
+|---|---|---|
+| GGUF | `audio-cpp/MiniMax-Music3-GGUF` | **all five components**, one GGUF each, bf16 and Q4_K arms |
+| GGUF | `scragnog/MiniMax-Music3-GGUF` | 2-file split (`mm3-lm-*` / `mm3-synth-*`), 13 tiers incl. MXFP4 and NVFP4 as GGML tensor types |
+| GGUF | `Abiray/…`, `realrebelai/MiniMax-Music-3_GGUFs`, `molbal/…`, `ChrisColeTech/…` | the 2.46B **DiT alone**, ComfyUI-style, Q2_K…Q8_0 (0.9–2.7 GB) |
+| int8 / w4a8 | `Comfy-Org/MiniMax-Music-3` (`_int8_convrot`), `NidAll/MiniMax-Music3-W4A8`, `dummy9996/…-w4a8-bf16-comfyui` | DiT |
+| MLX 4/6/8-bit | `ddalcu/…`, `vanch007/…`, `elishabjm/…` | |
+| proprietary | `infosave/MiniMax-Music-3-cmf` (Cortiq 4-bit) | not implementable; recorded only |
+
+**NOT found by the queries above**: AWQ, GPTQ, compressed-tensors, fp8 /
+`fp8_e4m3fn` / `fp8_scaled`, or bitsandbytes. That is "not found by these
+queries on this date", never "does not exist".
+
+### 9.2 The GGUF headers, MEASURED — and the finding that matters
+
+Ten published GGUFs had their **headers read by HTTP range request** (56 MiB
+total; the metadata and tensor-info table sit at the start of the file, so no
+weight byte was fetched). This is the same instrument §1 used for the bf16 arm's
+geometry, and it is what turns §9.1's repo list into a contract.
+
+**"The GGUF arm" is THREE MUTUALLY INCOMPATIBLE LINEAGES, and
+`general.architecture` cannot separate them.** It reads `audiocpp`, `mm3`,
+`qwen3` and `wan` across files of the same model — and `wan` collides with
+genuine Wan video GGUFs, so keying on it would bind another model's checkpoint.
+The usable discriminators are:
+
+* `audiocpp.model_spec.family == "minimax_music3"` — **EXACT diffusers tensor
+  names, no rename table**, but the geometry lives only in the sibling
+  `config.json`, so the file is not self-describing;
+* `mm3.model == "MiniMax-Music3"` — **fully self-describing metadata**, but it
+  needs a rename table *plus* fused QKV to split and folded weight-norm to
+  invert;
+* co-occurring `diffusion_transformer.` + `latent_conditioners.` prefixes — the
+  ComfyUI lineage, which ships **the DiT and condition encoder only**: no
+  language model, no depth decoder, no vocoder, so it **cannot generate audio by
+  itself** whatever we implement.
+
+Two further measurements: `comfy.gguf.orig_shape.*` — the H3 arm's shape-override
+key — is **absent from all ten files** (0 occurrences), so H3's reshape handling
+does not carry over; and scragnog's NVFP4 tier uses GGML tensor type id **40**,
+which is not a standard llama.cpp id and would need its own resolution.
+
+### 9.3 What W7 implemented, and what it deliberately did not
+
+**ONE arm is implemented and value-gated — the RVQ depth decoder at GGUF Q4_K
+(§9.6). The other four are refused by name and owed (§9.5).** That split is not
+a compromise: §9.6 records why this component is the only one whose bound can be
+*derived* today rather than asserted, and adding a second arm to look thorough
+would have meant claiming tolerances nothing measured.
+
+**W7 also implemented the refusal**, which AGENTS.md makes non-optional whether
+or not a checkpoint exists: *"an arm that is not implemented is refused with a
+message naming the missing piece and recorded as owed, never left to be
+discovered later."*
+
+`minimax_music3_quant.{h,cpp}` is a **separate translation unit**, per
+[porting-a-model.md](../porting-a-model.md) ("GGUF is its own translation unit,
+not an afterthought bolted onto the safetensors loader") and per the H3 layout
+(`minimax_h3_gguf.cpp`, `minimax_h3_nvfp4.cpp`). When an arm lands it lands
+beside this file and the detector routes to it; the detection is not embedded in
+W1's loader, so the first real arm is not a rewrite of W1.
+
+**Three detectors, because a quantized checkpoint announces itself in three
+places and no single detector sees all three:**
+
+| Level | Sees | What it caught that W1 could not |
+|---|---|---|
+| TREE | `.gguf` files (nested to depth 2), and any `config.json` declaring a quantization | a GGUF tree has **none** of the seven diffusers directories, so W1 told it "missing transformer, condition_encoder, …" — seven directories the user does not have and never will, with no mention of GGUF |
+| MANIFEST | the NVFP4 triple, MXFP4 packs, AWQ `qweight`, bitsandbytes `absmax`, and **dtype-only** formats (fp8, int8) | a real NVFP4 `condition_encoder` refused on **`layer_scale`** — a tensor that is not quantized, is not wrong, and has nothing to do with the problem; it is simply the name that sorts first |
+| CONFIG | `quantization_config.quant_method`, and MLX's bare `quantization` | nothing: W1 ignored both, so an MLX or compressed-tensors tree fell through to a shape mismatch |
+
+**What the detector refuses to guess.** A bare `weight_scale` with no
+`weight_scale_2` and no `weight_packed` is consistent with NVFP4 missing its
+global scale, with a compressed-tensors block scheme, and with a per-channel int8
+scale. It resolves to `kUnknownScheme` and the refusal **names all three
+candidates rather than picking one** — `ltx2_loader.h:232-268` records what
+picking one costs: a finite, correctly shaped, correctly scaled, WRONG result
+that no shape gate can see.
+
+### 9.4 Evidence
+
+`tests/vllm/models/test_minimax_music3_quant.cpp` — **29 cases / 125 assertions**,
+no checkpoint and no network. `tests/parity/test_minimax_music3_quant_real.cpp` —
+**6 cases / 319 assertions** against the pinned artifact (§9.6), skipping loudly
+without it.
+
+RED first, against the tree as it stood: a probe asserting that a GGUF tree, an
+NVFP4 component and an fp8 component are each diagnosed by format failed **8 of
+8** checks, and printed the three misleading messages quoted in §9.3's table. The
+same probe passes 8 of 8 after the change.
+
+**Eighteen mutations across both layers, all eighteen RED** — each hook removed,
+each detection rule neutered, each clause of the refusal text deleted, the
+dequant given the wrong ggml type, the resident-type report falsified, the GGUF
+dim order reversed a second time, and each lineage guard defeated; sources
+restored and verified `sha256`-identical, final rebuild green. Three are worth
+recording rather than counting:
+
+* **One mutation initially STAYED GREEN** and it was a genuine coverage hole:
+  hardcoding `matched = 1` passed every case in the file, because each happened
+  to carry exactly one marker. The count was reported but never *discriminated*,
+  so a refusal reading "1 of 400" on a fully quantized checkpoint would have read
+  as one stray tensor. A 36-marker case was added; the mutation then fires.
+* **One mutation was INVALID as first written** — reverting the config hook by
+  deleting its only caller tripped `-Werror` unused-function, so the *compiler*
+  refused it and the gate never got to speak. A build failure is not a red gate.
+  Re-run as neutering the call while keeping the function used: RED.
+
+The negatives are gated too, because a detector that fired on the shipped
+checkpoint would refuse every real load: the bf16/fp32 dtypes, the real
+transformer config, a `null` quantization_config, and — specifically — the
+vocoder's 30 legacy `weight_g`/`weight_v` weight-norm pairs, which are a
+*parameterization* and not a quantization. The existing suites are unchanged:
+loader 21/1393, AR 25/338, acoustic 27/265, speech 9/222.
+
+### 9.5 What is OWED
+
+**The remaining GGUF k-quant arms are the highest-priority debt on this row.**
+The bf16/fp32 arm is ~28.5 GB; the same weights at Q4_K are ~9 GB. That is the
+difference between a model most users cannot run and one they can, and it is
+what a quant-matched llama.cpp comparison needs.
+
+| Candidate | Size | State |
+|---|---|---|
+| `audio-cpp/MiniMax-Music3-GGUF` → `rvq_depth_decoder_q4_k` | 406 MB | **DONE — §9.6** |
+| `audio-cpp/…` → `transformer_q4_k` | 1 396 MB | OWED. Gateable against W4's per-step latents, whose fp32 control is measured, so its bound is derivable the same way |
+| `audio-cpp/…` → `language_model_q4_k` | 7 184 MB | OWED, and blocked behind W2's LM forward regardless |
+| `audio-cpp/…` → `vocoder`, `condition_encoder` | 217 / 101 MB | OWED, and note these are **bf16 GGUF, not k-quant** — same size as the safetensors, so they buy nothing |
+
+Also owed, and recorded rather than discovered later: **the ComfyUI-lineage
+GGUFs can never be a complete arm** (§9.2 — DiT and condition encoder only), so
+a user pointing one at us must be told that even a finished GGUF arm would not
+make their file generate audio; **the `mm3` (scragnog) lineage** needs a rename
+table plus fused QKV to split and folded weight-norm to invert, and is refused
+by name; the Cortiq `.cmf` format is proprietary and is recorded as not
+implementable rather than owed; and MLX and bitsandbytes are **new shared seams**
+this project implements for no model, so they are not per-model additions.
+
+### 9.6 The one arm that IS implemented — and the gate-design finding
+
+**Artifact, pinned. An unpinned quantized checkpoint is not reproducible**, and
+this project has already been bitten by a repo re-quantized in place under an
+unchanged id:
+
+| Field | Value |
+|---|---|
+| repo | `audio-cpp/MiniMax-Music3-GGUF` |
+| revision | `c36aaeed683f33b05796788e4204f4eeba8fa547` |
+| file | `rvq_depth_decoder_q4_k.gguf` |
+| size | 405 752 480 bytes |
+| sha256 | `4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0` |
+| staged at | `$CHECKPOINT_ROOT/minimax-music3-gguf/` |
+
+The digest was verified against the repository's own LFS record at fetch time.
+47 tensors — exactly the count the safetensors contract owes — as **36 Q4_K
+projections, 9 BF16 norms and 2 F16 embedding tables**, with
+`audiocpp.tensor_name_format = native`, so every name binds to
+`EnumerateMiniMaxMusic3RvqDepthDecoderTensors` with **no rename table**.
+
+**THE FINDING, and it generalizes past this row: for a quantized arm, an
+upper-bound-only tolerance cannot distinguish a real quantized path from a
+silent dequant fallback — because the fallback is CLOSER to the golden.**
+
+Measured, on the identical forward over identical inputs against the W3 golden's
+716 800 values:
+
+| Arm | bit-identical | mean\|d\| | max\|d\| |
+|---|---|---|---|
+| Q4_K, the real quantized path | 2.84 % | **0.0324** | 0.3125 |
+| bf16 weights — a simulated dequant fallback | 43.61 % | **0.00182** | 0.125 |
+| (bf16 control from §5, for reference) | 46.34 % | 0.00166 | 0.125 |
+
+The fallback is **17.8x closer** to the golden than the genuine arm. So every
+upper bound the Q4_K arm could plausibly be given — mean, max, identical
+fraction — *passes on the fallback*, and passes comfortably. A gate built only
+from upper bounds would have reported the quantized arm correct while the
+quantized bytes were never read. That is the dequant-fallback class this project
+has been bitten by before, and the reason it survives review is that the failing
+configuration produces *better-looking* numbers than the passing one.
+
+**What catches it is a LOWER bound**: the deviation must EXCEED the unquantized
+arm's. `kQ4KMeanAbsFloor = 5e-3` sits between the two measurements (0.00182 <
+0.005 < 0.0324). A result that is "too good" on a quantized arm is not a better
+port; it is a different set of weights.
+
+**The lower bound and the resident-dtype proof are complementary, not
+redundant**, and W7 keeps both. The resident-type report is *bookkeeping the
+loader does about itself* — it proves which bytes were selected, and it is what
+localizes a fault to a named tensor — but a loader that lied about its own
+tallies would still pass it (mutation QM2 exists precisely to show that
+assertion has teeth). The lower bound is *a property of the output* and needs no
+cooperation from the loader at all. And the Q4_K **lattice** check is a third,
+independent leg: within any 32-element sub-block the dequantized values take at
+most 16 distinct values, which is a structural signature of 4-bit block
+quantization that a bf16 read cannot produce — measured 0 of 524 288 windows
+over 16, against a bf16 control from the same file at 127 of 128 windows over 16.
+Three legs, keyed on three different things: what the loader selected, what the
+data structurally is, and how the output behaves.
+
+**Tolerances, each derived and each printed on every run:**
+
+| Bound | Measured | Set to | Why it still discriminates |
+|---|---|---|---|
+| worst per-tensor relative L2, Q4_K | 0.0742 | < 0.10 | a mis-decoded k-quant block yields ~1.0 — an order of magnitude of margin |
+| per-tensor relative L2, BF16 islands | exactly 0 | == 0 | stored unquantized; anything else is a mangled read |
+| per-tensor relative L2, F16 islands | 3.23e-08 / 2.37e-08 | < 1e-6 | see the F16 finding below |
+| full-scale mean\|d\| | 0.0324 | 5e-3 … 0.045 | two-sided; the floor is the fallback detector above |
+| full-scale max\|d\| | 0.3125 | < 0.50 | |
+| full-scale bit-identical | 2.84 % | > 2 % | |
+
+**A second finding, small but exactly the kind that is otherwise discovered
+later: the two F16 islands do NOT round-trip exactly, and it is the artifact's
+doing, not ours.** The quantizer re-encoded `audio_embeddings.weight` and
+`pos_embedding.weight` from BF16 to F16. F16's exponent range is *narrower* than
+BF16's, so weights below ~6e-08 flush to zero and cannot come back. The gate
+therefore splits the islands: BF16-stored tensors must be bit-exact, F16-stored
+tensors are bounded. Asserting "unquantized means exact" for all eleven — which
+is what the first draft did — reds on a correct reader.
+
+**No speed number is claimed.** Nothing here was measured for throughput, the
+box is CPU-only for this row, and a 4-bit arm's speed on a path with no
+quantized GEMM would be a number about dequantization, not about the model.
 
 ---
 
@@ -544,13 +804,9 @@ engine supplies a seeded normal draw and the gate supplies the capture's own
 noise. That is the ONLY entry at which this pipeline is comparable to the oracle,
 and hiding it would have made the e2e gate impossible rather than inconvenient.
 
-**W2's remainder is REFUSED BY NAME, not silently absent.** `Synthesize` resolves
-the whole request — every field refusal, the frame budget, the assembled prompt —
-and then names the 8.6B `Qwen3ForCausalLM` forward, the `inputs_embeds` entry it
-needs, the phase that owes it and the issue. A real Music3 request over HTTP
-therefore gets that message, not a song and not silence. **Nothing generates a
-song end to end yet, and W6 did not change that** — it built everything around
-the one stage that is missing.
+**W2's remainder was REFUSED BY NAME by W6, and is now CLOSED.** What W6 shipped
+was a `Synthesize` that resolved the whole request and then named the missing
+8.6B forward. The final section below is what closed it.
 
 **One coverage gap, named rather than discovered.** The MULTI-WINDOW arm of
 `Music3DenoiseChunks` and `Music3DecodeChunks` — the overlap blend, the carry
@@ -564,3 +820,207 @@ Two things are owed and neither is this phase's to close: **no speed number
 exists** — every capture so far ran on CPU because `dgx.casa` was down, so
 nothing here touches the speed axis — and SGLang-Omni remains `gateable = no`,
 read but never executed.
+
+**W7 is complete: ONE arm implemented and value-gated, the rest refused.**
+§9 records it in full. **Quantized MiniMax-Music3 checkpoints DO exist** — the
+survey found 14 community repositories in 5 formats within days of the release,
+with counts per query in §9.1 — and the **RVQ depth decoder's GGUF Q4_K arm now
+loads and is gated** against a pinned artifact (`audio-cpp/MiniMax-Music3-GGUF`
+@`c36aaeed`, sha256 `4c5d41b2…c70cbdd0`), routed through the shared
+`gguf_dequant.h` seam. The other four components, the other two GGUF lineages,
+and every non-GGUF format are refused BY NAME and owed (§9.5).
+
+`minimax_music3_quant.{h,cpp}` is a SEPARATE translation unit per
+[porting-a-model.md](../porting-a-model.md). It diagnoses every format at the
+three places a quantized checkpoint announces itself — the TREE (`.gguf` files),
+the MANIFEST (sidecar tensors, and the dtype-only formats no name carries), and
+the CONFIG (`quantization_config.quant_method`, and MLX's bare `quantization`) —
+each refused with the missing piece, the supported arm, the phase and the issue.
+**29 cases / 125 assertions** with no checkpoint, **6 cases / 319 assertions**
+against the artifact; RED first at 8 of 8 probe checks; **18 of 18 mutations
+fire**.
+
+**The finding worth carrying off this row (§9.6): for a quantized arm, an
+upper-bound-only tolerance CANNOT distinguish a real quantized path from a silent
+dequant fallback, because the fallback is CLOSER to the golden.** Measured on the
+identical forward: the genuine Q4_K arm lands at mean|d| **0.0324**, a bf16
+fallback at **0.00182** — 17.8x nearer. Every plausible upper bound passes the
+failure. What catches it is a **lower** bound, plus two independent legs that need
+no cooperation from the loader's own bookkeeping: the resident ggml type of all
+47 tensors, and the Q4_K lattice (0 of 524 288 sub-blocks exceed 16 distinct
+values; a bf16 control from the same file gives 127 of 128).
+
+**Three things W7 measured that a later phase would otherwise re-derive.**
+(1) "The GGUF arm" is THREE MUTUALLY INCOMPATIBLE LINEAGES and
+`general.architecture` cannot separate them — it reads `audiocpp`, `mm3`,
+`qwen3` and `wan` for the same model, and `wan` collides with genuine Wan video
+GGUFs. (2) The ComfyUI lineage ships **the DiT and condition encoder only**, so it
+can never generate audio however complete our arm becomes.
+(3) `comfy.gguf.orig_shape.*`, which the H3 GGUF arm depends on, is absent from
+all ten files measured.
+
+**No speed number is claimed** and none was measured; the box is CPU-only for
+this row.
+
+---
+
+**W2 IS COMPLETE: the pipeline is WHOLE. What is NOT claimed is a request observed to completion.**
+[`minimax_music3_llm.h`](../../include/vllm/model_executor/models/minimax_music3_llm.h)
+carries `MiniMaxMusic3SemanticGenerationStep.__call__` (`encoders.py:299-353`)
+and `_generate_depth_codes` (`:117-142`), driven through the landed Qwen3 dense
+path. `Synthesize` no longer refuses.
+
+**The door the dense path did not have.** Upstream calls
+`language_model.model(inputs_embeds=...)` twice and `input_ids` never
+(`encoders.py:311`, `:353`), because `_embed_audio_frame` (`:106-115`) is a SUM
+of one language-model embedding row and seven depth-decoder rows scaled by
+`num_codebooks^-0.5` — a continuous vector corresponding to no vocabulary entry,
+which no token id can spell. `Qwen3DenseModel::ForwardEmbeds` is that entry. The
+Qwen3 family already had it on its multimodal siblings
+([`qwen3_vl.h:145,159`](../../include/vllm/model_executor/models/qwen3_vl.h),
+`gemma4.h:210-218`, `muse_glimmer.h:369-380`); only the DENSE registration had
+never wired it, and upstream's own `Qwen3Model.forward` has always accepted
+either input. `out_hidden` is the second half of the same entry: the
+post-final-norm rows, from the forward that produced the logits, because upstream
+reads `last_hidden_state[:, -1]` and applies `lm_head` to that very row.
+
+**Additive, and proved rather than argued.** Five registrations —
+`Qwen3ForCausalLM`, `LlamaForCausalLM`, `MistralForCausalLM`,
+`InternLM2ForCausalLM`, `InternLM3ForCausalLM` — ride that one forward, and one
+of them is a ✅ token-exact row, so nothing less than bit-identity was
+acceptable. `tests/vllm/models/test_qwen3_forward.cpp` feeds the embedding OF
+THE SAME TOKEN IDS through the new entry and asserts it reproduces `Forward` bit
+for bit in the logits (500 of 500 identical) AND in the paged KV it wrote — the
+second half matters because a forward that agreed on this step's logits while
+writing a different cache would decode differently on the NEXT one, which no
+logits comparison can see. Three mutations were run against it and all three
+fire: an extra scale on the embedded rows (500 differing logits), the hidden
+tail ignoring the `logits_indices` gather (throws), and the shape refusal
+deleted (a different, less specific exception). A FOURTH mutation — scaling the
+rows by 1.0009 — did NOT move, and it is a BAD MUTATION rather than a coverage
+hole: bf16's relative spacing is 1/256, so a 9e-4 perturbation rounds back to
+the same bf16 value before anything can see it.
+
+**§1's "learned weighted mix over 8 LLM hidden layers" needs one correction, and
+it is the reading that would have cost a phase.** `num_condition_layers: 8` does
+NOT mean eight of the language model's 36 transformer layers. The eight rows of
+a `frame_hiddens` entry are `cat(last_hidden, depth_hidden_1..7)`
+(`encoders.py:343`) — ONE language-model hidden state and the SEVEN per-depth-step
+states of the RVQ decoder. So the Qwen3 stack needs no per-layer output capture
+at all, and `ForwardEmbeds` returning only the post-final-norm rows is
+sufficient. §1's phrase is about the condition encoder's own input width, not
+about where those rows come from; this paragraph is the disambiguation.
+
+**The gate: teacher-forced, and calibrated against a MATCHED CONTROL.** §5
+withdrew the token gate, so the codes are consumed as INPUTS here exactly as
+W2/W3 consumes them: `rvq_codes.npy` is fed back frame by frame and what is
+COMPARED is the model's hidden state at each step, against
+`frame_hiddens[:, :4096]`. That is 25 steps deep through 36 decoder layers over a
+61-token KV history, so an error at step 1 is carried by 24 further steps of
+attention over the cache it poisoned.
+
+| | bit-identical | mean\|d\| | max\|d\| | outside 2 ULP-or-2^-6 |
+|---|---|---|---|---|
+| **CONTROL** (upstream's own model, `sdpa_kernel(MATH)`, vs default-backend goldens) | 12 036 / 102 400 (11.75%) | 1.475e-02 | 5.000e-01 | 29 968 (29.27%) |
+| **OURS** | 9 337 / 102 400 (9.12%) | 1.763e-02 | 1.000 | 37 572 (36.69%) |
+| **NEGATIVE CONTROL** (ours, one-step-shifted alignment) | 201 / 98 304 (0.20%) | 8.025e-01 | 34.44 | 96 537 (98.20%) |
+
+Ours is 1.20x the control's mean absolute error — a near tie, and chasing one
+kernel's rounding below the control is not "more correct" (AGENTS.md). Two things
+make that a real result rather than a loose bound. **The per-step error does not
+grow**: step 0 mean|d| 1.794e-02, step 24 1.645e-02, which is the signature of a
+rounding floor and not of a compounding divergence — a wrong KV write would
+diverge, not plateau. And **the gate carries its own negative control**: the same
+bounds applied to a one-step-shifted alignment (our step k against the golden's
+k+1, every value a real hidden state of this very model on this very prompt, and
+exactly the off-by-one that `rvq_codes` having one more row than `frame_hiddens`
+invites) read 46x outside. A bf16 model this deep is noisy enough that a loose
+bound would be indistinguishable from no bound, so the gate demonstrates that its
+bound discriminates instead of asserting it.
+
+**The strongest statement is the RANK, and it is scale-free.** The oracle's own
+sampled semantic codes rank **2.48 on average** under our reproduced guided
+logits — worst 15, 10 of 25 at rank 0 — where chance over the 16384-entry
+semantic window is 8191.5 and `_AR_SAMPLING_TOP_K` is 50. Every code the oracle
+actually drew is inside our top 50, which is a distributional claim a uniformly
+scaled or slightly-wrong hidden state cannot satisfy. It is the same instrument
+W2/W3 used on the depth heads (mean rank 8.99 where chance is 511.5), at the
+stage above.
+
+**The prompt is not a variable.** The assembled prompt tokenizes to the SAME 61
+ids HF `transformers` 5.14.1's `Qwen2Tokenizer` produces on the identical string,
+verified both ways before the first hidden state was compared, so a tokenizer
+divergence could never present as a model divergence 25 steps later.
+
+**One recorded dtype deviation, mirrored rather than forked.** The shared Qwen3
+dense forward emits f32 logits from an f32-accumulating lm_head GEMM; upstream's
+`language_model.lm_head` is a bf16 `nn.Linear` whose output is bf16 and is only
+then widened by `.float()` (`encoders.py:312`). The shared seam is not forked for
+that — five registrations ride it — so the rounding is restored in the Music3 TU,
+on the way out, at the one place it is observable. It is a NARROWING, which is
+the direction `.agents/porting.md` cares about.
+
+**End to end, over HTTP — WRITTEN AND WIRED, NOT YET OBSERVED. Read this
+before believing anything about a running request.** The gate exists
+(`tests/parity/test_minimax_music3_e2e_real.cpp`, "an HTTP request generates a
+real 44100 Hz stereo WAV"): it posts a body at `ApiServer::handle_audio_speech`,
+and it asserts the RIFF header, the length the request's duration implies, and
+four properties that each rule out a different way of returning a well-formed
+non-song — non-zero, unclipped (a scale error would otherwise hide behind the
+decode's own clamp), non-constant, and two channels that DIFFER. The request
+mapping was hoisted out of `server_main.cpp`'s lambda into
+`vllm::openai::SynthesizeSpeechRequest` so the gate calls the code HTTP runs
+rather than a test-only copy of it; the server is a one-line client of it now.
+
+**IT HAS NOT BEEN SEEN TO PASS.** Two runs were taken on this box, at the
+shortest request that still enters every stage (0.1 s of audio -> 2 AR frames,
+2 denoise steps, a 26-token prompt). Both were stopped, at 85 and 34 minutes,
+and neither reached a waveform. The evidence about WHERE they were is specific
+rather than inferred: the four `language_model/*.safetensors` file descriptors
+were still OPEN, so `Music3LoadArWeights` had not returned; the depth decoder's
+file was never opened; resident size was flat at 17.38 GiB; and ~1.9 cores were
+burning. That places both runs inside `LoadQwen3ForCausalLMWeights`, after the
+bytes are materialized — so in the qkv/gate_up merges or the 200000 x 4096
+`lm_head` transpose — and NOT in any Music3 code.
+
+The first run was self-inflicted (a full `ctest -j 6` and a full build were
+running against the same 18.5 GB working set, forcing reclaim). The second was
+not: the box was quiet, and a sequential `cat` of the same 17.2 GB completes in
+20.6 s, so the mount is not the bottleneck either. It is therefore REPRODUCIBLE
+and unexplained, and the honest statement is that it is unexplained.
+
+**What makes this a performance question and not a correctness one** is that the
+same `Music3LmSession`, the same `ForwardEmbeds`, and the same weights DO load
+and run in `tests/parity/test_minimax_music3_llm_real.cpp`, which loads in about
+3 minutes and completes 25 teacher-forced decode steps — so the load path and the
+forward are both exercised end to end there, against the oracle. Every stage
+below the language model was already gated by W3-W6 against the capture. What is
+missing is one observation of the composition, and NOT a stage.
+
+**Owed, and named rather than discovered:** find out why
+`LoadQwen3ForCausalLMWeights` takes 30+ minutes on this checkpoint in one binary
+and ~3 in another, then run the e2e case and record its numbers here. Until that
+is done, no document in this tree may say this model has produced a song.
+
+**Why the CPU run is slow, named rather than left to be rediscovered.** The
+autoregressive half's host GEMM (`LinearNoBias`, `minimax_music3_ar.cpp`) is a
+scalar triple loop with a DOUBLE accumulator under `-ffp-contract=off` — it does
+not vectorize, by construction, because W2/W3 needed a reproducible reduction
+order to gate rounding against torch. That is fine for the W2/W3 gate, which
+makes 25 calls at sequence length 8. The GENERATION loop makes 42 calls at
+sequence lengths 2..8, and the depth decoder streams its whole 2.3 GB of weights
+per call, so the short sequences get roughly 4x less arithmetic per streamed byte
+than the gate's single seq-8 call does. MEASURED on this box: the AR half of one
+0.1 s request is ~1500 s of single-threaded CPU, and the `vt` CPU backend's
+threadpool is idle throughout it because none of this code goes through `vt`.
+This is a correctness-first implementation doing exactly what it was written to
+do; it is recorded here because the obvious first read of a slow run is "the
+language model is slow", and the language model is not the part that is slow.
+
+**Two things are still true and are not this phase's to change.** The
+multi-window coverage gap W6 named is unchanged — the capture is a single
+25-frame window. And there is **still no speed number**: every gate for this row
+was taken on CPU because `dgx.casa` was down throughout, the acoustic half is
+upstream's own fp32, and a CPU number against SGLang-Omni's CUDA-graphed compiled
+production configuration would be a dishonest denominator. `PENDING` on the
+hardware, not on the work. W7's quantized arms are owed.

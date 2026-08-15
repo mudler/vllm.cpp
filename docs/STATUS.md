@@ -140,7 +140,7 @@ token-for-token correctness against the pinned oracle.
 | InternLM2 dense (fused-`wqkv` interleaved split) | Correctness-complete, speed-pending | Token-exact 16/16 (internlm2-chat-1_8b): 12/16 strict + 4/16 bf16 near-tie (max gap 0.0 nats), 0 divergent; first InternLM model; ZERO new compute kernel (reuses the Llama dense forward; the only delta is a loader-side de-interleave of the fused `wqkv`, which packs q/k/v interleaved by KV-group) |
 | MiniMax-H3 (`MiniMaxH3DiTModel`, video+audio DIFFUSION) | **ABI v12 ONE SURFACE; device selector uses generic `DeviceType`; DSR 32.** t2va+fl2va COHERENT; bf16 shards STREAM | ref2va ckpt fidelity §8.12; encoder A/B §8.15; GB10 re-verify residual; CPU fold 6/137 (one queue + device provenance mutation-gated) |
 | LTX-2.5 (`LTX2VideoTransformer3DModel`, video+audio DIFFUSION) | **L1-L9c landed (#435).** 21.00B / 48 blocks. `VideoEngine` seam + ABI **v18**, DiT forward (CPU f32 parity, bf16 device-resident), Gemma-4 TE, both VAEs, the embeddings connector, pipeline, NVFP4/FP8 arms, `/v1/videos` | A shipped 21.00B FP8 DiT runs device-resident on GB10. The 320x192/25f frames ARE a scene, register-conditioned. L13 encodes a typed prompt, FIXTURE-gated; a prompted render is OWED. Speed and oracle parity `PENDING` |
-| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0, W1, W2/W3 and W4/W5 landed (#672).** First row whose oracle is not vLLM: the OPEN diffusers PR #14456 `c6da9936`, which generates audio here | W2's LM forward, W6 and W7 owed. Loader 1413/1413, AR and acoustic halves gated on the real checkpoint; no speed number exists or is claimed |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, text-to-MUSIC) | **`ACTIVE`: W0-W7 landed; every stage including the 8.6B LM forward is implemented and gated (#672).** Oracle is the OPEN diffusers PR #14456 `c6da9936` | GGUF arms for 4 components owed. The LM forward is gated teacher-forced inside a measured control. A composed request is not yet observed to completion on CPU |
 | Command-R / Cohere dense (`CohereForCausalLM`) | Implemented, gate-blocked | ZERO-new-kernel port grounded in vLLM `commandr.py`: weight-only Cohere LayerNorm + GPT-J full-width RoPE + PARALLEL residual + `logit_scale` + tied embeddings, all reuse; compiles, links, self-registers. No SACRED gate yet (real checkpoints HF-gated, ungated ones tiny-random, GPU box disk-full); oracle run-verified at W0. See docs/BENCHMARKS.md |
 | Phi-1 / Phi-2 dense (`PhiForCausalLM`, parallel residual) | Correctness-complete, speed-pending | Token-exact 16/16 (microsoft/phi-2): 9/16 strict + 7/16 bf16 near-ties (max gap 0.25 nats), 0 forward-divergent; the OLDER Microsoft Phi arch, DISTINCT from Phi-3/Phi-4; ZERO new compute kernel (GPT-J parallel residual, LayerNorm-with-bias, biased qkv/dense, partial NeoX rope 32/80, non-gated NewGELU MLP reusing `vt::GeluTanh`, untied biased lm_head); F16 dtype-aware loader |
 | MiniCPM dense (`MiniCPMForCausalLM`, three scalars) | Correctness-complete, speed-pending | Token-exact 16/16 (openbmb/MiniCPM-2B-sft-bf16): 10/16 strict + 6/16 bf16 near-ties (max gap 0.0 nats), 0 forward-divergent; first OpenBMB MiniCPM model; ZERO new compute kernel (the Llama/Granite dense forward plus three scalars: scale_emb, scale_depth/sqrt(layers) residual, dim_model_base logit scaling), tied lm_head; `.bin`-only weights converted to safetensors via trusted torch |
@@ -194,7 +194,7 @@ concurrency-1 A/B our-on 29.32 tok/s vs vLLM-on 29.24, non-overlapping bands,
 vLLM 0.26.0.dev0 stack (which resolves vllm#40898), and it remains gated behind
 a spike while its user-facing serving surface is finalized.
 
-**Method surface (enumerated from vLLM source 2026-08-06, `.agents/specs/spec-decode-inventory.md`).** Of the 13 vLLM `SpeculativeMethod` strings we ship MTP (k=1), DFlash and n-gram; draft_model is a CPU brick and Medusa a spike; EAGLE1/EAGLE3, ngram-gpu, suffix, dspark, custom_class, extract_hidden_states, dynamic-k and the synthetic/block acceptance variants are INVENTORIED; mlp_speculator is upstream-deprecated (no V1 proposer). Draft DEPTH (k>1, dynamic, adaptive) unbuilt (`ROAD-V1-D3-SPEC-K`, #81).
+**Method surface (enumerated from vLLM source 2026-08-06, `.agents/specs/spec-decode-inventory.md`).** Of the 13 vLLM `SpeculativeMethod` strings we ship MTP (k=1), DFlash, DSpark and n-gram; draft_model is a CPU brick and Medusa a spike; EAGLE1/EAGLE3, ngram-gpu, suffix, custom_class, extract_hidden_states, dynamic-k and the synthetic/block acceptance variants are INVENTORIED; mlp_speculator is upstream-deprecated (no V1 proposer). Draft DEPTH (k>1, dynamic, adaptive) unbuilt (`ROAD-V1-D3-SPEC-K`, #81).
 
 **DeepSeek-V4 native MTP** (`DeepSeekV4MTPModel`, ACTIVE — W1 self-spec wiring,
 2026-07-30) has its nextn draft head wired to the same lossless spec-decode path.
@@ -480,7 +480,10 @@ oracles and Qwen3 in a measured near-tie regime; Qwen3.5-0.8B GDN runs all-nativ
 but its CPU/ROCm divergence remains open; gfx1201 Gemma-4 FP8 MoE is
 contributor-measured on 2x R9700 and CPU-link-verified our side;
 [guide](ROCM.md)), inference-time CPU weight offload (`ENG-WEIGHT-OFFLOAD`
-READY, spec only: vLLM's `cpu_offload_gb` UVA arm with dotted-segment
+ACTIVE; the config surface landed W0a (the backend enum, both sub-configs, the
+validator's two errors and three warnings, and the dot-anchored segment match),
+all UNREACHABLE for now because nothing constructs an `OffloadConfig` yet, so
+no engine behaviour changes. Still owed: vLLM's `cpu_offload_gb` UVA arm with dotted-segment
 `cpu_offload_params` targeting, plus the layer-group `PrefetchOffloader` — a
 pure mirror floor, and #149's dense half. Its memory and speed gates need a
 discrete-GPU rig, because on unified-memory GB10 offloading to "CPU" frees
@@ -577,15 +580,25 @@ take can only raise the plateau; any MoE comparison that lets routing vary
 between arms measures the draw, not the change; and both blocks AND distinct
 experts must be controlled, since cost per distinct expert spans 4.47-7.50 us
 and is flat only above ~40 experts. NOT parity, and the row stays open.
-MEASUREMENT IS CURRENTLY IMPOSSIBLE: the gate host was REIMAGED on 2026-08-14
-(new COS partition layout, /home created 13:37 UTC, ~/work empty), destroying
-the pinned oracle venv, the pinned vLLM source, the 35B and draft checkpoints,
-our engine build and every run log, so the Evidence paths in the benchmark
-record point at nothing. The RESULTS stand, because the harnesses
-(scripts/marlin-moe-standalone.py, benchmarks/marlin_moe_standalone.cpp,
-scripts/dspark-paired-e2e.sh) and the per-rep values are in-tree; resuming
-needs the checkpoints re-fetched, the oracle rebuilt at pinned commit
-555967922, and its identity re-asserted before any number is trusted.
+The environment was REBUILT after the reimage (engine, both checkpoints at the
+pinned revision, and the TRUE pinned oracle 555967922 + torch 2.13.0 +
+flashinfer 0.6.15.post1, built from source because vllm==0.26.0 hard-pins
+torch==2.11.0). On it, with generation length MATCHED at 89 tokens and the
+container compile cache PERSISTED, the oracle is stable at 171.4 tok/s and our
+engine at 143.2, a paired ratio of **0.835** -- far below the 0.957-0.989 this
+row recorded. Two causes are possible and this data cannot separate them:
+every earlier paired run invoked the oracle ONCE, so a cold-JIT denominator
+would have been handicapped ~17%; and the BOX IS NOT THE SAME MACHINE, since
+dgx.casa now resolves to kairos-17dd while the recorded ratios were taken on
+promaxgb10-4ad8, which no longer exists. Our arm reads ~142 on both, which
+argues against a pure hardware explanation without excluding one. Safe to say:
+on this box, matched and warm, we are at 0.835 of the pinned oracle, NOT
+parity. Not safe to say: that the older numbers were wrong, since cross-
+machine ratios cannot be differenced any more than cross-boot absolutes can.
+Owed: re-run the pre-reimage single-cold-invocation protocol HERE -- ~0.97
+would convict cold JIT, ~0.83 would mean the machine changed.
+
+
 
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has

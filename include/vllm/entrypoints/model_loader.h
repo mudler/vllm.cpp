@@ -37,6 +37,7 @@
 #include "vllm/v1/engine/output_processor.h"
 #include "vllm/v1/executor/executor.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/config/offload.h"
 #include "vllm/v1/kv_offload/kv_connector.h"
 #include "vllm/v1/structured_output/manager.h"
 #include "vllm/v1/worker/gpu/runner.h"
@@ -145,6 +146,12 @@ struct EngineParams {
   // extra_config, and wires it to BOTH the scheduler (prefix lookup / prefill
   // shortcut) and the runner (worker-side KV store/load).
   std::optional<vllm::KVTransferConfig> kv_transfer_config = std::nullopt;
+
+  // ENG-WEIGHT-OFFLOAD W0b: opt-in WEIGHT-offload configuration (distinct from
+  // kv_transfer_config above, which offloads KV blocks). Absent (default) == no
+  // offloading == the byte-identical engine. Validated at construction; the
+  // offloader that consumes it is W2/W5, so today this is recorded and inert.
+  std::optional<vllm::OffloadConfig> offload_config = std::nullopt;
 
   // SPEC-MTP I5d-pre: opt-in speculative-decoding configuration. Empty/absent
   // (default) == NO speculation == byte-identical production engine (mirrors

@@ -32,6 +32,7 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vt/dtype.h"
+#include "vt/unaligned.h"  // LoadUnaligned — mmap'd payloads have no alignment guarantee
 
 namespace vllm {
 namespace {
@@ -91,13 +92,18 @@ std::vector<float> MiniMaxH3ReadSafetensorF32(const StTensor& tensor) {
     // happened to pad; the format does not require it. The cast was UB on such a
     // file and UBSan caught it ("load of misaligned address ... requires 2 byte
     // alignment") the first time a checkpoint with an odd header reached this
-    // path. memcpy has no alignment precondition and compiles to the same load
-    // where the address does happen to be aligned.
+    // path. `vt::LoadUnaligned` has no alignment precondition and compiles to
+    // the same load where the address does happen to be aligned.
+    //
+    // It is the SHARED seam for this (include/vt/unaligned.h, born of #301):
+    // this loop used to hand-roll its own std::memcpy, which is the parallel
+    // path AGENTS.md's shared-seam rule exists to prevent — and the reason the
+    // three loaders in #772 could ship the cast next to a file that had already
+    // carried the repair in prose.
     const auto* bytes = static_cast<const unsigned char*>(tensor.data);
     const bool bf16 = (tensor.dtype == "BF16");
     for (int64_t i = 0; i < numel; ++i) {
-      uint16_t bits;
-      std::memcpy(&bits, bytes + static_cast<size_t>(i) * 2, sizeof(bits));
+      const auto bits = vt::LoadUnaligned<uint16_t>(bytes + static_cast<size_t>(i) * 2);
       out[static_cast<size_t>(i)] = bf16 ? Bf16ToF32(bits) : F16ToF32(bits);
     }
   } else {

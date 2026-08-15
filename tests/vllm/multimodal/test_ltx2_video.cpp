@@ -38,6 +38,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
+#include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
@@ -324,6 +325,82 @@ TEST_CASE("ltx2 video: an auto-detected load renders frames, a WAV and a mux arg
   CHECK(joined.find(result.mux_output_path) != std::string::npos);
 }
 
+TEST_CASE("ltx2 video: a MULTI-CHUNK render numbers its frames globally, and clears the last one") {
+  // The fixture above is 9 frames — ONE temporal chunk — so the render path's
+  // `chunk.first_frame + f` (ltx2_video.cpp, the streaming sink) was never driven
+  // through the PPM writer with more than one chunk. Per-chunk numbering would
+  // restart at frame_000000 for the second chunk, overwrite the first chunk's
+  // files and leave the clip's tail missing, and every assertion in the 9-frame
+  // case would still pass.
+  //
+  // 81 frames is the smallest request that chunks, and that is not a coincidence:
+  // `latent_t = (81 - 1) / 8 + 1 = 11` against the AUTO layout's 80-frame / 10
+  // latent-frame temporal tile. It is asserted below rather than assumed, because
+  // a test that silently stopped chunking would be green and vacuous.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  // The fixture's factors, as documented at `FixtureGen`: (8, 32, 32). Phase 0
+  // halves the spatial request, so 64x64 decodes at 32x32 — one latent cell each
+  // way — and only the temporal axis can chunk here.
+  const vllm::Ltx2ScaleFactors factors{8, 32, 32};
+  const vllm::Ltx2TileSizeConfig layout = vllm::Ltx2AutoTileSizeConfig(32, 32, factors);
+  const int64_t latent_t = (81 - 1) / factors.time + 1;
+  CHECK(latent_t == 11);
+  const std::vector<vllm::Ltx2Tile> tiles =
+      vllm::Ltx2CreateTiles(latent_t, 1, 1, layout, factors);
+  const size_t groups = vllm::Ltx2GroupTilesByTemporalSlice(tiles).size();
+  REQUIRE_MESSAGE(groups > 1u, "this request no longer chunks; the case below proves nothing");
+
+  const std::string out_dir = ws.root + "/multichunk";
+  vllm::multimodal::VideoGenParams gen = FixtureGen(out_dir);
+  gen.num_frames = 81;
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  REQUIRE(result.frame_count == 81);
+
+  // EVERY global index exists exactly once, and the one past the end does not.
+  // Per-chunk numbering fails here on both counts at the same time.
+  for (int64_t f = 0; f < result.frame_count; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    std::ifstream in(out_dir + name, std::ios::binary);
+    CHECK_MESSAGE(in.good(), "frame ", f, " of a ", result.frame_count,
+                  "-frame streamed render is missing");
+  }
+  {
+    std::ifstream beyond(out_dir + "/frame_000081.ppm", std::ios::binary);
+    CHECK(!beyond.good());
+  }
+  // ...and the last frame is not a copy of the first, which is what a writer that
+  // reused chunk-local indices would leave behind after the overwrite.
+  CHECK(ReadAll(out_dir + "/frame_000080.ppm") != ReadAll(out_dir + "/frame_000000.ppm"));
+
+  // THE STALE TAIL. Rendering a SHORTER clip into the same directory must not
+  // leave the longer render's frames behind: `mux.frame_pattern` is
+  // `frame_%06d.ppm` with no count, so ffmpeg would mux 72 frames past the end of
+  // a clip that reported 9. Pre-existing, and widened by streaming — a chunk that
+  // throws mid-render leaves a partial clip on disk too.
+  const vllm::multimodal::VideoResult shorter = engine->Generate(FixtureGen(out_dir));
+  REQUIRE(shorter.frame_count == 9);
+  for (int64_t f = 9; f < 81; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    std::ifstream stale(out_dir + name, std::ios::binary);
+    CHECK_MESSAGE(!stale.good(), "frame ", f, " survived a shorter re-render into the same "
+                                              "directory and would be muxed past its end");
+  }
+  for (int64_t f = 0; f < 9; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    std::ifstream in(out_dir + name, std::ios::binary);
+    CHECK_MESSAGE(in.good(), "the cleanup removed frame ", f, ", which the new render owns");
+  }
+}
+
 TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") {
   Workspace ws;
   SUBCASE("without an upsampler the phase is refused BY NAME, not skipped") {
@@ -338,6 +415,38 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
       INFO(msg);
       CHECK(msg.find("upsampler_path") != std::string::npos);
       CHECK(msg.find("refine") != std::string::npos);
+    }
+  }
+  SUBCASE("a TEMPORAL upsampler checkpoint is refused BY NAME, not shape-mismatched") {
+    // The temporal x2 arm is ported and gated (test_ltx2_pipeline.cpp, "ltx2 the
+    // latent temporal upsampler reproduces upstream") but NOTHING drives it. It
+    // shares the class name and the `upsampler.0.*` tensor names with the
+    // spatial arm, so this checkpoint loads and runs; what it returns is
+    // [c, 2f-1, h, w] where the phase needs [c, f, 2h, 2w]. Without the guard
+    // the caller gets a shape mismatch and has to work out that they handed over
+    // the wrong file.
+    vllm::Ltx2UpsamplerConfig temporal =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    temporal.spatial_upsample = false;
+    temporal.temporal_upsample = true;
+    const std::string path = ws.root + "/temporal_upsampler.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(temporal, path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = path;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    try {
+      (void)engine->Generate(FixtureGen(ws.root + "/temporal_ups"));
+      FAIL("a temporal upsampler checkpoint must be refused, not run for this phase");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("temporal_upsample=true") != std::string::npos);
+      CHECK(msg.find("SPATIAL") != std::string::npos);
+      // The message must not be the generic shape complaint — that is the
+      // failure mode this guard exists to replace.
+      CHECK(msg.find("the upsampled latent is") == std::string::npos);
     }
   }
   SUBCASE("with one, the render lands at the FULL requested size") {

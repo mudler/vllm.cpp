@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/minimax_music3_quant.h"
 #include "vllm/model_executor/models/vocoder1d.h"
 #include "vt/dtype.h"
 
@@ -83,6 +84,27 @@ nlohmann::json ReadJson(const std::string& path) {
   } catch (const std::exception& error) {
     throw std::runtime_error("minimax_music3: " + path + " is not valid JSON: " + error.what());
   }
+}
+
+// Read one COMPONENT's config, and refuse a quantized checkpoint by name before
+// a single geometry key is parsed (W7, #672).
+//
+// This is the third of the three places a quantized checkpoint announces itself
+// (minimax_music3_quant.h): the file DECLARES it, in
+// `quantization_config.quant_method` or in MLX's bare `quantization`. Catching
+// it here means a compressed-tensors or MLX tree never reaches the tensor
+// accounting that would blame an arbitrary tensor's shape for it.
+//
+// The component is the config's parent directory name, which is exactly the
+// component spelling everywhere else in this file, so the two cannot drift.
+// The document is re-serialized for the detector rather than shared: it keeps
+// the public header free of the JSON dependency, and a component config is
+// kilobytes.
+nlohmann::json ReadComponentJson(const std::string& path) {
+  const nlohmann::json parsed = ReadJson(path);
+  MiniMaxMusic3CheckQuantArm(MiniMaxMusic3DetectQuantConfig(
+      fs::path(path).parent_path().filename().string(), parsed.dump()));
+  return parsed;
 }
 
 // Read a required key, refusing BY NAME rather than defaulting. A config key
@@ -388,6 +410,15 @@ MiniMaxMusic3Paths MiniMaxMusic3ResolveCheckpoint(const std::string& root) {
         "mis-loaded.");
   }
 
+  // QUANTIZED arms, before the generic refusal below (W7, #672). Order matters
+  // and is the whole point: a `.gguf` tree has none of the seven diffusers
+  // directories, so without this it was told it was "missing transformer,
+  // condition_encoder, ..." -- seven directories a GGUF user does not have and
+  // never will, and no mention of GGUF. It sits AFTER the native-arm check
+  // because `.pth` is a packaging, not a quantization, and that diagnosis is
+  // the more specific one.
+  MiniMaxMusic3CheckQuantArm(MiniMaxMusic3DetectQuantTree(root));
+
   if (!missing.empty()) {
     throw std::runtime_error(
         "minimax_music3: " + root +
@@ -424,7 +455,7 @@ MiniMaxMusic3Config MiniMaxMusic3LoadConfig(const MiniMaxMusic3Paths& paths) {
 
   {
     const std::string source = paths.transformer_dir + "/config.json";
-    const nlohmann::json json = ReadJson(source);
+    const nlohmann::json json = ReadComponentJson(source);
     RequireClassName(json, "MiniMaxMusic3Transformer1DModel", source);
     MiniMaxMusic3TransformerConfig& config = out.transformer;
     config.in_channels = RequireInt(json, "in_channels", source);
@@ -441,7 +472,7 @@ MiniMaxMusic3Config MiniMaxMusic3LoadConfig(const MiniMaxMusic3Paths& paths) {
   }
   {
     const std::string source = paths.condition_encoder_dir + "/config.json";
-    const nlohmann::json json = ReadJson(source);
+    const nlohmann::json json = ReadComponentJson(source);
     RequireClassName(json, "MiniMaxMusic3ConditionEncoder", source);
     MiniMaxMusic3ConditionEncoderConfig& config = out.condition_encoder;
     config.condition_hidden_dim = RequireInt(json, "condition_hidden_dim", source);
@@ -456,7 +487,7 @@ MiniMaxMusic3Config MiniMaxMusic3LoadConfig(const MiniMaxMusic3Paths& paths) {
   }
   {
     const std::string source = paths.rvq_depth_decoder_dir + "/config.json";
-    const nlohmann::json json = ReadJson(source);
+    const nlohmann::json json = ReadComponentJson(source);
     RequireClassName(json, "MiniMaxMusic3RVQDepthDecoder", source);
     MiniMaxMusic3RvqDepthDecoderConfig& config = out.rvq_depth_decoder;
     config.hidden_size = RequireInt(json, "hidden_size", source);
@@ -469,7 +500,7 @@ MiniMaxMusic3Config MiniMaxMusic3LoadConfig(const MiniMaxMusic3Paths& paths) {
   }
   {
     const std::string source = paths.vocoder_dir + "/config.json";
-    const nlohmann::json json = ReadJson(source);
+    const nlohmann::json json = ReadComponentJson(source);
     RequireClassName(json, "MiniMaxMusic3Vocoder", source);
     MiniMaxMusic3VocoderConfig& config = out.vocoder;
     config.latent_channels = RequireInt(json, "latent_channels", source);
@@ -492,7 +523,7 @@ MiniMaxMusic3Config MiniMaxMusic3LoadConfig(const MiniMaxMusic3Paths& paths) {
   }
   {
     const std::string source = paths.language_model_dir + "/config.json";
-    const nlohmann::json json = ReadJson(source);
+    const nlohmann::json json = ReadComponentJson(source);
     RequireClassName(json, "Qwen3ForCausalLM", source);
     MiniMaxMusic3LanguageModelConfig& config = out.language_model;
     config.hidden_size = RequireInt(json, "hidden_size", source);
@@ -521,7 +552,7 @@ MiniMaxMusic3Config MiniMaxMusic3LoadConfig(const MiniMaxMusic3Paths& paths) {
   }
   {
     const std::string source = paths.scheduler_config;
-    const nlohmann::json json = ReadJson(source);
+    const nlohmann::json json = ReadComponentJson(source);
     RequireClassName(json, "FlowMatchEulerDiscreteScheduler", source);
     MiniMaxMusic3SchedulerConfig& config = out.scheduler;
     config.num_train_timesteps = RequireInt(json, "num_train_timesteps", source);
@@ -748,6 +779,14 @@ std::map<std::string, std::vector<MiniMaxMusic3TensorSpec>> EnumerateMiniMaxMusi
 MiniMaxMusic3AccountReport MiniMaxMusic3AccountTensors(
     const std::string& component, const std::vector<MiniMaxMusic3TensorSpec>& required,
     const std::vector<MiniMaxMusic3ManifestEntry>& present) {
+  // QUANTIZED arms FIRST (W7, #672), because every refusal below is true and
+  // useless on a quantized file. A real NVFP4 condition_encoder accounted
+  // against the bf16 contract refuses on `layer_scale` -- a tensor that is not
+  // quantized, is not wrong, and has nothing to do with the problem -- because
+  // that is simply the first name that sorts. Naming the FORMAT is the only
+  // diagnosis a user can act on.
+  MiniMaxMusic3CheckQuantArm(MiniMaxMusic3DetectQuantManifest(component, present));
+
   MiniMaxMusic3AccountReport report;
   report.required = static_cast<int64_t>(required.size());
   report.present = static_cast<int64_t>(present.size());

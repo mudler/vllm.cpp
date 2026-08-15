@@ -1140,10 +1140,14 @@ void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature) {
   const std::string owed =
       " Not ported by phase L5; recorded as owed in .agents/specs/ltx-2-5.md.";
   switch (feature) {
-    case Ltx2UnportedPipelineFeature::kTemporalUpsampler:
-      Refuse("ltx2: the temporal x2 latent upsampler (model/upsampler/model.py:55-72, "
-             "temporal_upsample=True) is out of scope." +
-             owed);
+    case Ltx2UnportedPipelineFeature::kSpatiotemporalUpsampler:
+      Refuse("ltx2: the SPATIOTEMPORAL latent upsampler (spatial_upsample AND "
+             "temporal_upsample, model/upsampler/model.py:55-59) is not ported. It is a "
+             "different operator from the temporal-only arm, which IS ported: 8 * "
+             "mid_channels out of its Conv3d and PixelShuffleND(3), against 2 * mid_channels "
+             "and PixelShuffleND(1). Owed and recorded in "
+             ".agents/specs/ltx25-temporal-upsampler.md section 2, under the campaign "
+             ".agents/specs/ltx-2-5.md.");
     case Ltx2UnportedPipelineFeature::kLoraFusion:
       Refuse("ltx2: LoRA fusion (loader/LoraPathStrengthAndSDOps) is out of scope." + owed);
     case Ltx2UnportedPipelineFeature::kMultishot:

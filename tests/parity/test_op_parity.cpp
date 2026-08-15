@@ -1930,6 +1930,136 @@ ManifestClass ClassifyGoldenManifest(const std::string& case_name, const json& m
   return {ManifestVerdict::kOpGolden, m.at("op").get<std::string>(), ""};
 }
 
+// GATE-OP-PARITY-MANIFEST (#776). Formats the by-name refusal for a golden
+// that made the walker throw. `stage` names which half threw: parsing the
+// manifest, or the runner reading a field out of it.
+//
+// The classifier above closed the walker's INPUT set; it did not close the
+// walker's exception surface. Two throw sites remain — `json::parse` on a
+// manifest that is not valid JSON, and any runner reading a field that is
+// absent or null. Either one escaping `RunGoldenPass` aborts the whole test
+// case, so every golden the walker had not reached yet goes UNCHECKED, and the
+// doctest report names a TEST_CASE line and no file. That is the shape of #776
+// and it is why diagnosing it needed a bisect.
+//
+// Pure, so the mutation test below drives it without touching committed
+// evidence.
+std::string GoldenExceptionMessage(const std::string& case_name,
+                                   const std::string& stage,
+                                   const std::string& what) {
+  return "goldens/" + case_name + "/manifest.json: " + stage + " threw \"" +
+         what +
+         "\" — a malformed golden is refused BY NAME and the pass continues, "
+         "because an exception escaping the walker leaves every later golden "
+         "unchecked (#776). See tests/parity/goldens/README.md";
+}
+
+// Runs `body` and converts any std::exception it throws into that by-name
+// refusal. Returns nullopt when `body` completed.
+//
+// std::exception is the deliberate width: it catches json's type_error and
+// parse_error AND the std::runtime_error that LoadTensor raises for a shape or
+// dtype-size mismatch, all of which name a manifest the caller knows and the
+// exception does not. doctest's own TestFailureException is NOT derived from
+// std::exception (third_party/doctest/doctest.h:2563), so a REQUIRE or FAIL
+// inside a runner still aborts the case exactly as before — in particular the
+// `no runner for op` FAIL that this walker exists to raise.
+template <class F>
+std::optional<std::string> GuardGoldenStage(const std::string& case_name,
+                                            const std::string& stage,
+                                            F&& body) {
+  try {
+    body();
+  } catch (const std::exception& e) {
+    return GoldenExceptionMessage(case_name, stage, e.what());
+  }
+  return std::nullopt;
+}
+
+// Dispatches one classified op golden to its runner. Returns true when the case
+// RAN and counts toward the callers' floors; false when it declared itself
+// skipped (no checkpoint, wrong device, or owned by a focused test).
+//
+// Extracted from the walker so the whole chain sits inside one guarded call:
+// the old `continue` statements are `return false` here, which is what lets a
+// throw be caught per case instead of unwinding the entire pass.
+bool RunGoldenCase(Backend& b, Queue& q, Device dev, const fs::path& dir,
+                   const std::string& op, const json& m) {
+  if (op == "rmsnorm") {
+    RunRmsNorm(b, q, dir, m);
+  } else if (op == "matmul") {
+    RunMatmul(b, q, dir, m);
+  } else if (op == "silu_and_mul") {
+    RunSiluAndMul(b, q, dir, m);
+  } else if (op == "embedding") {
+    RunEmbedding(b, q, dir, m);
+  } else if (op == "rope") {
+    RunRope(b, q, dir, m);
+  } else if (op == "long_context_rope") {
+    RunLongContextRope(b, q, dir, m);
+  } else if (op == "causal_conv1d_fwd") {
+    RunCausalConv1dFwd(b, q, dir, m);
+  } else if (op == "causal_conv1d_update") {
+    RunCausalConv1dUpdate(b, q, dir, m);
+  } else if (op == "l2norm") {
+    RunL2Norm(b, q, dir, m);
+  } else if (op == "rmsnorm_gated") {
+    RunRmsNormGated(b, q, dir, m);
+  } else if (op == "gdn_prefill") {
+    RunGdnPrefill(b, q, dir, m);
+  } else if (op == "gdn_decode") {
+    RunGdnDecode(b, q, dir, m);
+  } else if (op == "moe_router_topk") {
+    RunMoeRouterTopK(b, q, dir, m);
+  } else if (op == "moe_block") {
+    RunMoeBlock(b, q, dir, m);
+  } else if (op == "dense_attention") {
+    RunDenseAttention(b, q, dir, m);
+  } else if (op == "qwen36_embed") {
+    if (!RunQwen36Embed(b, q, dir, m)) return false;  // skip (no ckpt)
+  } else if (op == "qwen36_norm") {
+    if (!RunQwen36Norm(b, q, dir, m)) return false;
+  } else if (op == "qwen36_gdn_layer" || op == "qwen36_fullattn_layer") {
+    if (!RunQwen36Layer(b, q, dir, m)) return false;
+  } else if (op == "qwen36_logits") {
+    if (dev.type != DeviceType::kCUDA) {
+      MESSAGE("SKIP " << dir.filename().string()
+                      << ": full real-model logits gate is CUDA-only");
+      return false;
+    }
+    // Same op for both gates; dispatch by tag (27B dense vs 35B MoE loader).
+    const bool ran = (GoldenTag(dir) == 27) ? RunQwen27Logits(b, q, dir, m)
+                                            : RunQwen36Logits(b, q, dir, m);
+    if (!ran) return false;
+  } else if (op == "qwen3_5_mtp_head") {
+    // Multi-GiB, two-checkpoint gate owned by the focused test case below.
+    // Recognize it here so committed goldens never trip the stale-runner
+    // guard, but do not make every generic op-parity pass reload both models.
+    MESSAGE("SKIP op '" << op << "' case '" << dir.filename().string()
+                        << "': owned by focused Qwen3.5 MTP head parity test");
+    return false;
+  } else if (op == "gdn_packed_decode_bf16") {
+    // This diagnostic replays several alternative consumer boundaries and
+    // requires CUDA. Keep it in the focused test below instead of making the
+    // generic CPU/CUDA golden pass execute the same fixture twice.
+    MESSAGE("SKIP op '" << op << "' case '" << dir.filename().string()
+                        << "': owned by focused GDN packed-decode boundary test");
+    return false;
+  } else if (PendingRunnerOps().count(op)) {
+    MESSAGE("SKIP op '" << op << "' case '" << dir.filename().string()
+                        << "': runner pending (see PendingRunnerOps)");
+    return false;  // does not count toward the case floor
+  } else {
+    // THE #559 GUARD. FAIL throws doctest's TestFailureException, which is not
+    // a std::exception, so GuardGoldenStage does NOT swallow it: a golden
+    // naming an unregistered op still aborts the pass, loudly, as it always
+    // did. The `return false` below is unreachable and exists for the compiler.
+    FAIL("no runner for op '" << op << "' — add one before committing goldens");
+    return false;
+  }
+  return true;
+}
+
 // Runs every golden case on `dev` and returns how many ran. Both passes use
 // the same manifests and the same tolerances — the committed goldens are the
 // bar for every backend. `non_op_out`, when given, receives how many manifests
@@ -1949,9 +2079,14 @@ int RunGoldenPass(Device dev, int* non_op_out = nullptr) {
     // test_tokenizer_parity) carry no manifest.json; the `cases >= 24` floor
     // in the callers still guards against op cases silently disappearing.
     if (!fs::exists(mf)) continue;
-    json m = json::parse(std::ifstream(mf));
-    const ManifestClass mc =
-        ClassifyGoldenManifest(entry.path().filename().string(), m);
+    const std::string name = entry.path().filename().string();
+    json m;
+    if (auto bad = GuardGoldenStage(name, "parsing manifest.json",
+                                    [&] { m = json::parse(std::ifstream(mf)); })) {
+      FAIL_CHECK(*bad);
+      continue;
+    }
+    const ManifestClass mc = ClassifyGoldenManifest(name, m);
     if (mc.verdict == ManifestVerdict::kMalformed) {
       // FAIL_CHECK, not FAIL: name EVERY offender in one run rather than
       // aborting the pass at the first one.
@@ -1964,81 +2099,20 @@ int RunGoldenPass(Device dev, int* non_op_out = nullptr) {
       continue;
     }
     const std::string& op = mc.op;
-    INFO("case " << entry.path().filename().string());
+    INFO("case " << name);
     if (std::getenv("VLLM_PARITY_PRINT_MARGINS") != nullptr)
-      std::printf("case %s (%s)\n", entry.path().filename().string().c_str(),
+      std::printf("case %s (%s)\n", name.c_str(),
                   dev.type == DeviceType::kCUDA ? "cuda" : "cpu");
-    if (op == "rmsnorm") {
-      RunRmsNorm(b, q, entry.path(), m);
-    } else if (op == "matmul") {
-      RunMatmul(b, q, entry.path(), m);
-    } else if (op == "silu_and_mul") {
-      RunSiluAndMul(b, q, entry.path(), m);
-    } else if (op == "embedding") {
-      RunEmbedding(b, q, entry.path(), m);
-    } else if (op == "rope") {
-      RunRope(b, q, entry.path(), m);
-    } else if (op == "long_context_rope") {
-      RunLongContextRope(b, q, entry.path(), m);
-    } else if (op == "causal_conv1d_fwd") {
-      RunCausalConv1dFwd(b, q, entry.path(), m);
-    } else if (op == "causal_conv1d_update") {
-      RunCausalConv1dUpdate(b, q, entry.path(), m);
-    } else if (op == "l2norm") {
-      RunL2Norm(b, q, entry.path(), m);
-    } else if (op == "rmsnorm_gated") {
-      RunRmsNormGated(b, q, entry.path(), m);
-    } else if (op == "gdn_prefill") {
-      RunGdnPrefill(b, q, entry.path(), m);
-    } else if (op == "gdn_decode") {
-      RunGdnDecode(b, q, entry.path(), m);
-    } else if (op == "moe_router_topk") {
-      RunMoeRouterTopK(b, q, entry.path(), m);
-    } else if (op == "moe_block") {
-      RunMoeBlock(b, q, entry.path(), m);
-    } else if (op == "dense_attention") {
-      RunDenseAttention(b, q, entry.path(), m);
-    } else if (op == "qwen36_embed") {
-      if (!RunQwen36Embed(b, q, entry.path(), m)) continue;  // skip (no ckpt)
-    } else if (op == "qwen36_norm") {
-      if (!RunQwen36Norm(b, q, entry.path(), m)) continue;
-    } else if (op == "qwen36_gdn_layer" || op == "qwen36_fullattn_layer") {
-      if (!RunQwen36Layer(b, q, entry.path(), m)) continue;
-    } else if (op == "qwen36_logits") {
-      if (dev.type != DeviceType::kCUDA) {
-        MESSAGE("SKIP " << entry.path().filename().string()
-                        << ": full real-model logits gate is CUDA-only");
-        continue;
-      }
-      // Same op for both gates; dispatch by tag (27B dense vs 35B MoE loader).
-      const bool ran = (GoldenTag(entry.path()) == 27)
-                           ? RunQwen27Logits(b, q, entry.path(), m)
-                           : RunQwen36Logits(b, q, entry.path(), m);
-      if (!ran) continue;
-    } else if (op == "qwen3_5_mtp_head") {
-      // Multi-GiB, two-checkpoint gate owned by the focused test case below.
-      // Recognize it here so committed goldens never trip the stale-runner
-      // guard, but do not make every generic op-parity pass reload both models.
-      MESSAGE("SKIP op '" << op << "' case '"
-                          << entry.path().filename().string()
-                          << "': owned by focused Qwen3.5 MTP head parity test");
+    bool ran = false;
+    if (auto bad = GuardGoldenStage(
+            name, "the runner for op \"" + op + "\"",
+            [&] { ran = RunGoldenCase(b, q, dev, entry.path(), op, m); })) {
+      // FAIL_CHECK, not FAIL, for the same reason the classifier uses it: name
+      // every offender in one run instead of stopping at the first.
+      FAIL_CHECK(*bad);
       continue;
-    } else if (op == "gdn_packed_decode_bf16") {
-      // This diagnostic replays several alternative consumer boundaries and
-      // requires CUDA. Keep it in the focused test below instead of making the
-      // generic CPU/CUDA golden pass execute the same fixture twice.
-      MESSAGE("SKIP op '" << op << "' case '"
-                          << entry.path().filename().string()
-                          << "': owned by focused GDN packed-decode boundary test");
-      continue;
-    } else if (PendingRunnerOps().count(op)) {
-      MESSAGE("SKIP op '" << op << "' case '" << entry.path().filename().string()
-                          << "': runner pending (see PendingRunnerOps)");
-      continue;  // does not count toward the case floor
-    } else {
-      FAIL("no runner for op '" << op << "' — add one before committing goldens");
     }
-    ++cases;
+    if (ran) ++cases;
   }
   b.DestroyQueue(q);
   // std::string, not the bare ternary: doctest 2.5.2 streams a `const char*`
@@ -2157,8 +2231,16 @@ TEST_CASE("every committed goldens manifest declares what it is (#755)") {
     const fs::path mf = entry.path() / "manifest.json";
     if (!fs::exists(mf)) continue;
     const std::string name = entry.path().filename().string();
-    const ManifestClass mc =
-        ClassifyGoldenManifest(name, json::parse(std::ifstream(mf)));
+    // Guarded for the same reason the walker is (#776): this case audits EVERY
+    // committed manifest, so an unparsable one must be named and counted, not
+    // allowed to throw and leave the rest of the tree unaudited.
+    json m;
+    if (auto bad = GuardGoldenStage(name, "parsing manifest.json",
+                                    [&] { m = json::parse(std::ifstream(mf)); })) {
+      FAIL_CHECK(*bad);
+      continue;
+    }
+    const ManifestClass mc = ClassifyGoldenManifest(name, m);
     if (mc.verdict == ManifestVerdict::kMalformed) {
       FAIL_CHECK(mc.message);
       continue;
@@ -2172,6 +2254,72 @@ TEST_CASE("every committed goldens manifest declares what it is (#755)") {
   // not an equality, so a later capture does not have to edit this number.
   CHECK(non_op >= 1);
   CHECK(fs::exists(root / "minimax_music3_oracle" / "manifest.json"));
+}
+
+// GATE-OP-PARITY-MANIFEST (#776). The classifier above closed WHICH files the
+// walker accepts; this closes what happens when one of them throws anyway.
+// The property under test is not "the message is nicer" — it is that a single
+// malformed golden can no longer take the rest of the pass down with it, which
+// is how #776 left the unregistered-op guard silently not running.
+TEST_CASE("a golden that throws is refused by name and does not abort (#776)") {
+  // The exact exception that closed the CPU pass on main: nlohmann raises
+  // type_error.302 for a string read of a null, and its what() names neither
+  // the file nor the key.
+  const auto null_read = [] {
+    const json spec = json{{"dtype", nullptr}};
+    (void)spec.at("dtype").get<std::string>();
+  };
+  const auto raw = [&]() -> std::string {
+    try {
+      null_read();
+    } catch (const std::exception& e) {
+      return e.what();
+    }
+    return "";
+  }();
+  REQUIRE(raw.find("302") != std::string::npos);
+  CHECK(raw.find("rmsnorm_f32_8x128") == std::string::npos);  // names no file
+
+  // Guarded, the same throw becomes a refusal that names the case.
+  const std::optional<std::string> bad =
+      GuardGoldenStage("rmsnorm_f32_8x128", "the runner for op \"rmsnorm\"",
+                       null_read);
+  REQUIRE(bad.has_value());
+  CHECK(bad->find("goldens/rmsnorm_f32_8x128/manifest.json") !=
+        std::string::npos);
+  CHECK(bad->find("the runner for op \"rmsnorm\"") != std::string::npos);
+  CHECK(bad->find(raw) != std::string::npos);  // keeps the original diagnosis
+
+  // A parse failure — the walker's other throw site — is named the same way.
+  const std::optional<std::string> unparsable =
+      GuardGoldenStage("some_case", "parsing manifest.json", [] {
+        const json parsed = json::parse("{,}");
+        (void)parsed;
+      });
+  REQUIRE(unparsable.has_value());
+  CHECK(unparsable->find("goldens/some_case/manifest.json") !=
+        std::string::npos);
+
+  // THE MUTATION THIS GUARD EXISTS FOR: the pass keeps going. A case after the
+  // offender still runs, so the goldens behind it stay gated.
+  int later_ran = 0;
+  const std::optional<std::string> ok =
+      GuardGoldenStage("next_case", "the runner for op \"matmul\"",
+                       [&] { ++later_ran; });
+  CHECK_FALSE(ok.has_value());
+  CHECK(later_ran == 1);
+
+  // And the widening must NOT reach doctest's own abort: TestFailureException
+  // is what FAIL("no runner for op ...") throws, so swallowing it here would
+  // turn the #559 guard into a message nobody fails on.
+  bool propagated = false;
+  try {
+    (void)GuardGoldenStage("some_case", "the runner for op \"nope\"",
+                           [] { throw doctest::detail::TestFailureException{}; });
+  } catch (const doctest::detail::TestFailureException&) {
+    propagated = true;
+  }
+  CHECK(propagated);
 }
 
 TEST_CASE("op parity vs upstream goldens (CPU)") {

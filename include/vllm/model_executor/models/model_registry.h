@@ -184,6 +184,46 @@ class LoadedModel {
   const TensorParallel* tensor_parallel_ = nullptr;
 };
 
+// ── The type-erasure seam's OTHER half (#775) ───────────────────────────────
+// Every registered `prepare`/`forward` is handed a type-erased `LoadedModel&`
+// and has to open it as its own concrete model. Doing that with a bare
+// `static_cast` down the hierarchy is a PROMISE, not a check: on an object
+// whose dynamic type is not that model, every member call through the resulting
+// reference is undefined behaviour, and the compiler is entitled to act on the
+// promise. UBSan reports it as "member call on address ... which does not point
+// to an object of type 'X'". It is invisible without a sanitizer whenever the
+// entry point was going to refuse anyway, which is precisely the state a model
+// still missing its weight loader is in.
+//
+// `ModelAs` is the checked form: it establishes the dynamic type first and
+// refuses BY NAME when the caller paired one architecture's registration with
+// another architecture's model. The cost is one `dynamic_cast` per forward
+// step (the seam is entered once per `ModelRegistry::Forward`, not per layer),
+// against a step that is milliseconds of GEMMs.
+//
+// `architecture` is the caller's OWN architecture name, so the refusal says
+// which entry point refused rather than only that something did.
+[[noreturn]] void RaiseModelTypeMismatch(std::string_view architecture,
+                                         const LoadedModel& model);
+
+template <typename Model>
+Model& ModelAs(LoadedModel& model, std::string_view architecture) {
+  Model* typed = dynamic_cast<Model*>(&model);
+  if (typed == nullptr) {
+    RaiseModelTypeMismatch(architecture, model);
+  }
+  return *typed;
+}
+
+template <typename Model>
+const Model& ModelAs(const LoadedModel& model, std::string_view architecture) {
+  const Model* typed = dynamic_cast<const Model*>(&model);
+  if (typed == nullptr) {
+    RaiseModelTypeMismatch(architecture, model);
+  }
+  return *typed;
+}
+
 // MM-ENGINE-FORWARD: one multimodal (vision/audio-language) forward step's
 // vision-conditioned inputs, carried as an OPTIONAL sub-field of ModelForwardInput
 // (below). Set (non-nullopt) ONLY by the runner mm-path when the request carries

@@ -519,8 +519,36 @@ MUSIC3's W6 (#799) and this family reaches both through
    | `facebook/w2v-bert-2.0` | `$CHECKPOINT_ROOT/w2v-bert-2.0` | ships `model.safetensors` already; NO conversion needed |
    | `funasr/campplus` | `$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/campplus.safetensors` | converted from `campplus_cn_common.bin`, 937 tensors, `head.*` / `xvector.*` naming that matches `campplus.h` |
 
-   What remains is loaders binding those onto the ported `w2vbert` and
-   `campplus` structs, and then feeding the result into the three conditioning
+   `campplus::LoadCampplus` LANDED and reads the converted file: 815 weights
+   after skipping the 122 `num_batches_tracked` I64 training counters, which
+   are skipped BY NAME so a real weight in an unexpected dtype still refuses.
+
+   **OPEN DEFECT, NARROWED to the PORT (#817).** `campplus::Forward` returns
+   NaN on the real weights. The tensor NAMES match -- `head.*` and `xvector.*`
+   are exactly what the port looks up -- so it was never a failed lookup, and
+   two of the three original candidates are now eliminated BY MEASUREMENT:
+
+   | Input | Result |
+   |---|---|
+   | a REAL kaldi log-mel (98 frames, range [-1.687, 24.180]) | NaN, absmax 4279 |
+   | the same, mean-centred per column as `infer_v2_5.py:647` does | NaN, absmax 981 |
+
+   Centring cuts the magnitude about fourfold, so it is clearly the right
+   preprocessing and clearly not the cause. What remains is a defect the
+   reduced-dimension goldens do not reach. The likeliest sites, from the port's
+   own notes: `BatchNorm1dEval` reading the real `running_var`, which no small
+   fixture ever supplied, and `StatsPool`'s UNBIASED (N-1) deviation, a sqrt of
+   something non-positive at low frame counts or on a zero-variance channel.
+   The goldens run ~20 frames through a handful of channels; the real model is
+   98 frames through 52 dense layers, so a per-layer error only shows at depth.
+
+   This is the lane's clearest case of what a reduced-dimension golden CANNOT
+   see: every CAMPPlus gate passes and the stage is unusable on its own weights.
+
+   It must be fixed BEFORE the conditioning is wired -- a style vector that is
+   quietly NaN would poison the talker's prompt while every shape stayed valid.
+
+   Then: the same for `w2vbert`, and feeding both into the three conditioning
    rows `talker::PrepareInputs` already accepts.
 2. **The INFERRED emotion path** (`emo_conditioning_encoder` Conformer,
    `emo_perceiver_encoder` Perceiver) is unported. A caller can STATE the

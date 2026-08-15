@@ -26,6 +26,7 @@
 #include "vt/backend.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
+#include "vt/unaligned.h"  // LoadUnaligned — mmap'd payloads have no alignment guarantee
 
 namespace vllm {
 namespace {
@@ -69,13 +70,20 @@ void RoundToBf16(std::vector<float>& v) {
 }
 
 // ---- vision weight loader: model.visual.* bf16 -> host f32 (matches M2a dump) ----
+// `t.data` points into the safetensors mmap, whose payload offset carries NO
+// alignment guarantee (issue #772), so the bytes are read through
+// vt::LoadUnaligned rather than handed to Bf16BitsToF32 as a `const uint16_t*`.
+// Bf16BitsToF32 keeps that signature for its OTHER callers, which pass
+// std::vector<uint16_t>::data() and are suitably aligned by construction.
 std::vector<float> LoadVisionF32(const TensorResolver& get,
                                  const std::string& name) {
   const StTensor& t = get(name);
   VT_CHECK(t.dtype == "BF16", "qwen3-vl vision: expected BF16 for " + name);
-  const int64_t n = static_cast<int64_t>(t.nbytes / sizeof(uint16_t));
-  std::vector<float> out =
-      Bf16BitsToF32(reinterpret_cast<const uint16_t*>(t.data), n);
+  const auto n = static_cast<size_t>(t.nbytes / sizeof(uint16_t));
+  const auto* src = static_cast<const unsigned char*>(static_cast<const void*>(t.data));
+  std::vector<float> out(n);
+  for (size_t i = 0; i < n; ++i)
+    out[i] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(src + i * 2));
   MaybeReleaseSourcePages(t.data, t.nbytes);
   return out;
 }

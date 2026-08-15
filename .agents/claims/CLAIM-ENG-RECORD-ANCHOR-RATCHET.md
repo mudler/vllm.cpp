@@ -1,0 +1,5 @@
+# CLAIM-ENG-RECORD-ANCHOR-RATCHET
+
+| Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
+|---|---|---|---|---|---|---|---|
+| `CLAIM-ENG-RECORD-ANCHOR-RATCHET` | `ENG-RECORD-ANCHOR-RATCHET` (`SPIKE`) | Claude Code (opus-5), operator role — spec only; implementation goes to a fresh implementer | isolated worktree; no GPU, no build | `row/anchor-ratchet-spec`, issue [#632](https://github.com/mudler/vllm.cpp/issues/632) | Owns ONLY: NEW `.agents/specs/record-anchor-ratchet.md`; the NEW `ENG-RECORD-ANCHOR-RATCHET` row plus the summary counts it moves; and, at implementation time, the bare-citation parser, the STALE/BROKEN classifier, `scripts/record-anchor-baseline.json`, and the six RED-first cases. EXCLUDES rewriting any existing citation, and EXCLUDES every historical record (`benchmark-record.md`, `parity-ledger.md`, `state-events/`, specs recording past runs) — those cite code as it WAS and are evidence | `SPIKE` | 2026-08-14 — spec committed; implementation not started |

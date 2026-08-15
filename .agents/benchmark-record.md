@@ -21575,3 +21575,151 @@ Until then this row cannot produce a new ratio.
 The five reboots recorded on 2026-08-13 and the repeated "host back with a new
 uptime" observations are retrospectively consistent with reprovisioning rather
 than with crashes alone.
+
+## `ENG-WEIGHT-OFFLOAD` W6 memory ratio: BLOCKED, not pending (2026-08-14)
+
+No number, and none is obtainable on current hardware. Recorded here so nobody
+re-attempts it and reports a spurious 1.000x.
+
+The axis W6 owes is resident DEVICE bytes with and without `cpu_offload_gb`.
+Two independent reasons it cannot be produced today:
+
+1. **Nothing constructs an `OffloadConfig` yet.** W0a landed the config surface
+   only (`include/vllm/config/offload.h`), deliberately unreachable. Any A/B run
+   right now measures the same binary twice and returns 1.000x, which would be a
+   number that looks like a result and is an artefact.
+2. **GB10 cannot show the effect even once the offloader exists.** Unified
+   memory means host and device draw on ONE physical pool, so moving a weight to
+   "CPU" frees no device bytes. Upstream already knows this class of host:
+   `vllm/model_executor/offloader/base.py:23-33` `should_pin_memory()` exists
+   because pinned memory eats the shared pool on unified-memory systems, and its
+   docstring names GH200. GB10 is the same class. This is the same finding
+   `expert-streaming.md` reached for tmpfs, arrived at independently.
+
+So W6 needs a DISCRETE-GPU rig. #149 records community test rigs offered, and
+#147 records the same offer for multi-GPU; that is the unblocking path. Until
+then the honest state is BLOCKED, and `ENG-WEIGHT-OFFLOAD` must not be called
+done on the strength of W0-W5 landing, because the axis that justifies the whole
+row would still be unmeasured.
+
+Note the asymmetry with the row's sibling `ENG-HYBRID-PLACEMENT`: there, W0/W1
+are the blocked measurements and the correctness work follows them. Here it is
+inverted, W0-W5 are all reachable on GB10 and only W6 is blocked, which is why
+this row is the safer of the two to start.
+
+## SPEC-DSPARK: the ORACLE varies 20% BETWEEN INVOCATIONS, and every recorded ratio used ONE (2026-08-15)
+
+The environment was rebuilt from nothing after the reimage (our engine, both
+checkpoints at the pinned revision, and the TRUE pinned oracle
+`0.23.1rc1.dev1511+g555967922` + torch 2.13.0+cu130 + flashinfer 0.6.15.post1,
+built from source because `vllm==0.26.0` hard-pins torch==2.11.0 and would have
+been a different denominator). The first paired run on it produced this:
+
+| arm | median tok/s |
+|---|---|
+| ours (4 arms) | 141.9 / 140.7 / 141.8 / 142.3 -- **~1% total spread** |
+| ORACLE invocation 1 | **145.4** (bimodal 145/154, cold draws 108.8 and 128.6) |
+| ORACLE invocation 2 | **174.3** (tight, unimodal) |
+
+Same boot, same stack, same prompt, minutes apart. **The ratio is 0.98 against
+invocation 1 and 0.82 against invocation 2**, so which oracle you run decides the
+answer.
+
+HYPOTHESIS TESTED AND REFUTED. The obvious explanation was a torch.compile /
+flashinfer cache warming between invocations. It is wrong: the caches live at
+`/root/.cache/vllm` and `/root/.cache/flashinfer` INSIDE the container, which
+`docker run --rm` discards, and the host's `~/.cache/vllm` stayed at **24K**
+across all four invocations. Both the 145 and the 174 run paid FULL JIT
+compilation. The spread is therefore unexplained, not benign.
+
+The confirmation probe (invocations 3 and 4) could not settle it: both died
+RC=1 with flashinfer JIT emitting 2 `FAILED` compiles for `gen_gemm_sm120`
+kernels, an unrelated failure.
+
+WHY THIS MATTERS BEYOND THIS RUN: **every ratio this row has recorded --
+0.9757, 0.9646, 0.9569, 0.9889 -- was taken with exactly ONE oracle invocation
+per paired run.** If the oracle can vary 20% between invocations, a single draw
+does not characterise the denominator, and the drift gate this row applies to
+OUR arms has no counterpart on the oracle side. The recorded ratios are not
+thereby wrong, but their error bars are unknown and are wider than the +/-0.01
+this file has been quoting.
+
+WHAT IS SOLID: our engine measures extremely stably on the rebuilt stack -- four
+independent arms within ~1%, medians within 0.4%, tighter than anything before
+the reimage. The instability is on the ORACLE side and it is now visible instead
+of hidden inside a single cold invocation.
+
+OWED BEFORE ANY FURTHER PARITY CLAIM:
+  1. N>=5 oracle invocations per paired run, with the same drift/dispersion gate
+     applied to the oracle that is applied to ours.
+  2. A fix or explanation for the flashinfer `gen_gemm_sm120` JIT failures, since
+     a partial fallback would change which kernels the oracle actually runs.
+  3. Persisting the container caches (mount `/root/.cache`) so JIT cost is not
+     re-paid per invocation, and re-testing whether the spread survives that.
+
+STATUS: parity remains UNMEASURED on the rebuilt stack. Not 0.98, not 0.82 --
+unmeasured, because picking between them is picking the answer.
+
+## SPEC-DSPARK: CORRECTION -- the cache hypothesis was RIGHT, and the matched ratio is ~0.83 (2026-08-15)
+
+The entry above said the compile-cache explanation for the oracle's 20% spread
+was REFUTED. That was wrong, and the error was in the check: I looked at the
+HOST cache (`~/.cache/vllm`, which stayed at 24K) when the cache that matters is
+`/root/.cache` INSIDE the container, discarded by `docker run --rm`.
+
+Mounting it changes everything. With `/root/.cache` PERSISTED across
+invocations, the oracle stops moving:
+
+| invocation | median tok/s (128-token) |
+|---|---|
+| 1 | (cold, builds the cache: 205M) |
+| 2-5 | 174.8, 175.3, 175.9, 175.1 |
+
+So the 145.4 reading was cold JIT and 174.3 was the warm truth.
+
+A SECOND ERROR, caught before it was published, would have been worse. Our arm
+generates **89** tokens (`finish_reason=stop`); the oracle runner I wrote after
+the reimage generated **128**. Longer generations amortise the same prefill over
+more decode steps and inflate tok/s, so 142/175 = 0.81 compared two different
+workloads. The pre-reimage `fibacc.py` used 89, matching ours; the mismatch was
+introduced when the reimage destroyed it and I rewrote it.
+
+MATCHED (89 tokens) AND WARM, TWO pairs, both arms interleaved, all RCs 0:
+
+| | n | median tok/s | range |
+|---|---|---|---|
+| ours | 22 | **142.876** | -- |
+| oracle | 19 | **171.300** | 148.78-175.11 |
+
+Drift between our closing arms across the two pairs is **-0.28%**, inside the 1%
+gate this row applies, so the run counts.
+
+**RATIO = 0.8341.**
+
+That is far below the 0.9757 / 0.9646 / 0.9569 / 0.9889 this row has recorded,
+and the difference has TWO candidate causes which this data cannot separate:
+
+  1. Every earlier paired run invoked the oracle ONCE. If that invocation paid
+     cold JIT, the denominator was handicapped ~17% and our engine looked much
+     closer to parity than it is.
+  2. THE BOX IS NOT THE SAME MACHINE. `dgx.casa` now resolves to hostname
+     `kairos-17dd` (machine-id 17dd5b4e3f38452d, GPU-cb5c11ff-4ea1-5472-a9a6-
+     c7a468a4d9f1). The recorded ratios were taken on `promaxgb10-4ad8`, which
+     no longer exists. Same GB10 class, different host, and this platform has a
+     documented 12.8% boot-to-boot SM clock swing.
+
+Our arm reads ~142 on BOTH machines, which argues against a pure hardware
+explanation, but does not exclude one.
+
+WHAT IS SAFE TO SAY: on `kairos-17dd`, with matched generation length, a warm
+oracle, both arms interleaved in one run, ours is **0.835** of the pinned
+oracle. NOT parity, and materially worse than this row has been reporting.
+
+WHAT IS NOT SAFE TO SAY: that the earlier numbers were wrong. They were taken on
+a machine that no longer exists, and cross-machine ratios cannot be differenced
+-- the same rule this file applies to cross-boot absolutes.
+
+OWED: re-run the pre-reimage protocol (single cold oracle invocation) on THIS
+box. If it reproduces ~0.97 here, cold JIT is confirmed as the inflator and every
+recorded ratio needs revising. If it reproduces ~0.83, the machine changed and
+the old numbers stand for the old box.

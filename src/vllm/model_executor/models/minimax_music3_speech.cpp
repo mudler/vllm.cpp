@@ -13,7 +13,11 @@
 #include <utility>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/indextts2.h"
+#include "vllm/model_executor/models/minimax_music3_llm.h"
+#include "vt/backend.h"
+#include "vt/dtype.h"
 
 namespace vllm {
 namespace models {
@@ -112,6 +116,66 @@ Music3NoiseSource Music3SeededNoise(int64_t seed) {
     for (float& value : out) value = normal(engine);
     return out;
   };
+}
+
+// ---------------------------------------------------------------------------
+// The acoustic weights
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One acoustic tensor, refused BY NAME when its dtype is not the F32 spec §2.1
+// fixes for the acoustic half rather than being silently reinterpreted.
+std::vector<float> AcousticF32(const StTensor& tensor, const std::string& name) {
+  if (tensor.dtype != "F32") {
+    Fail("MiniMax-Music3: acoustic tensor '" + name + "' is " + tensor.dtype +
+         ", and the acoustic half runs F32 (spec §2.1)");
+  }
+  std::vector<float> out(tensor.nbytes / sizeof(float));
+  std::memcpy(out.data(), tensor.data, tensor.nbytes);
+  return out;
+}
+
+// The condition encoder's FILE is fp32 while its RUNTIME is bf16 (spec §2.1's
+// invariant `dtype(LM) == dtype(rvq) == dtype(cond)`), so its tensors are
+// ROUNDED here rather than widened.
+std::vector<float> ConditionAtRuntimeDtype(const StTensor& tensor, const std::string& name) {
+  std::vector<float> out = AcousticF32(tensor, name);
+  for (float& value : out) value = vt::BF16ToF32(vt::F32ToBF16(value));
+  return out;
+}
+
+}  // namespace
+
+Music3AcousticWeights Music3LoadAcousticWeights(const MiniMaxMusic3Paths& paths,
+                                                const MiniMaxMusic3Config& config) {
+  Music3AcousticWeights out;
+
+  const SafetensorsFile condition_file = SafetensorsFile::Open(
+      (fs::path(paths.condition_encoder_dir) / "diffusion_pytorch_model.safetensors").string());
+  const auto condition_get = [&condition_file](const std::string& name) {
+    return ConditionAtRuntimeDtype(condition_file.Get(name), name);
+  };
+  out.condition.layer_weight_logits = condition_get("layer_weight_logits");
+  out.condition.layer_scale = condition_get("layer_scale");
+  out.condition.proj_weight = condition_get("proj.weight");
+  out.condition.proj_bias = condition_get("proj.bias");
+
+  const SafetensorsFile vocoder_file = SafetensorsFile::Open(
+      (fs::path(paths.vocoder_dir) / "diffusion_pytorch_model.safetensors").string());
+  out.vocoder = VocoderWeightsFromLoader(
+      config.vocoder, MiniMaxMusic3LoadVocoderWeights(config.vocoder, vocoder_file));
+
+  if (paths.transformer_shards.empty()) {
+    Fail("MiniMax-Music3: the transformer has no safetensors shards");
+  }
+  std::map<std::string, std::vector<float>> dit;
+  for (const std::string& shard : paths.transformer_shards) {
+    const SafetensorsFile file = SafetensorsFile::Open(shard);
+    for (const std::string& name : file.Names()) dit[name] = AcousticF32(file.Get(name), name);
+  }
+  out.dit = DitWeightsFromTensors(config.transformer, dit);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,19 +473,58 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
     // Validate FIRST: every field refusal is free, and a caller learns its
     // request was malformed without waiting for 28.5 GB to stage.
     const Music3Request request = Music3ResolveRequest(params, config_.condition_encoder);
-    (void)request;
-    // THE AUTOREGRESSIVE HEAD IS OWED. Naming the missing piece, the phase and
-    // the issue is the contract .agents/porting-a-model.md sets for an arm that
-    // is not implemented; returning silence, or a waveform produced by anything
-    // other than this model, is not.
-    Fail("MiniMax-Music3: the request is valid and the checkpoint at '" + path_ +
-         "' resolves, but the AUTOREGRESSIVE HEAD is not implemented. Ported and gated: "
-         "the prompt assembly, the CFG logit pipeline, the RVQ depth decoder, the learned "
-         "8-layer condition mix, the flow-matching DiT, the FlowMatchEulerDiscrete "
-         "scheduler, the window bookkeeping and the DAC Flow-VAE vocoder. MISSING: the "
-         "8.6B Qwen3ForCausalLM forward that produces frame_hiddens[:, :4096], which needs "
-         "an `inputs_embeds` entry point the landed Qwen3 dense path does not have — W2 of "
-         ".agents/specs/minimax-music3.md, issue #672");
+
+    // ── the AUTOREGRESSIVE half (encoders.py) ────────────────────────────────
+    //
+    // SCOPED, so the 8.6B language model and the 0.65B depth decoder (~18.5 GB
+    // together) are released before the fp32 acoustic half (~10 GB) stages.
+    // Upstream does the same by hand rather than by luck — encoders.py:302-309
+    // drives the offload hooks itself, with the comment that both models must be
+    // co-resident for the loop and neither may evict the other. Only
+    // `frame_hiddens` crosses the boundary.
+    std::vector<float> frame_hiddens;
+    int64_t frames = 0;
+    int64_t calls = 0;
+    {
+      // The AR stage's language model runs through `vt`, so the queue is the
+      // only thing that decides where. CPU is what W2 ships and what every gate
+      // for this row has been taken on; a device arm is a queue, not a fork.
+      vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+      const Music3ArWeights ar = Music3LoadArWeights(paths_, config_);
+      const std::vector<int32_t> prompt_ids = ar.Encode(request.prompt);
+      Music3ArResult generated = Music3GenerateFrameHiddens(
+          prompt_ids, request.max_frames, ar, Music3SeededSampler(request.seed), queue);
+      frame_hiddens = std::move(generated.frame_hiddens);
+      frames = generated.frames;
+      calls = generated.calls;
+    }
+    (void)calls;
+
+    // ── the ACOUSTIC half (before_denoise.py / denoise.py / decoders.py) ─────
+    const Music3AcousticWeights acoustic = Music3LoadAcousticWeights(paths_, config_);
+    Music3DenoiseOptions options;
+    options.num_inference_steps = request.num_inference_steps;
+    options.guidance_scale = request.guidance_scale;
+    const std::vector<std::vector<float>> chunks =
+        Music3DenoiseChunks(frame_hiddens, frames, config_, acoustic, options,
+                            Music3SeededNoise(request.seed));
+
+    int64_t samples = 0;
+    multimodal::SpeechResult out;
+    out.samples =
+        Music3DecodeChunks(chunks, config_.vocoder, acoustic.vocoder, &samples);
+    // spec §1.1: the vocoder's NATIVE rate, resample-free. The 32 kHz form is a
+    // downstream delivery transform and the caller's decision, which is exactly
+    // what `SpeechResult`'s own contract says `sample_rate` means.
+    out.sample_rate = config_.vocoder.sampling_rate;
+    out.channels = kMusic3Channels;
+    if (samples <= 0 ||
+        static_cast<int64_t>(out.samples.size()) != kMusic3Channels * samples) {
+      Fail("MiniMax-Music3: the decode returned " + std::to_string(out.samples.size()) +
+           " values for " + std::to_string(samples) + " frames of " +
+           std::to_string(kMusic3Channels) + "-channel audio");
+    }
+    return out;
   }
 
  private:

@@ -86,6 +86,11 @@ PROJECT_RECORD_FILES = frozenset(
         ".agents/NOW.md",
         ".agents/coordination.md",
         ".agents/roadmap_v1.md",
+        # The intake surface moved out of roadmap_v1.md into its own append-only
+        # file (#840) and was never classified here. Classification is a hard
+        # error by design, so pr-size aborted on EVERY pull request that appends
+        # an index row, which under the same policy is nearly all of them (#856).
+        ".agents/issue-index.md",
         ".agents/porting-inventory.md",
         ".agents/engine-matrix.md",
         ".agents/feature-matrix.md",
@@ -112,6 +117,14 @@ PROCEDURE_FILES = frozenset(
         ".agents/porting-a-model.md",
         ".agents/benchmarking.md",
         ".agents/bugfixing.md",
+        # The writing guides AGENTS.md delegates to, and the skill routes that
+        # point at them (#827). Same procedure class as their sibling guides.
+        # They were never classified, so classify_path FAILED CLOSED and this
+        # test has been red on main ever since that row landed (#856).
+        ".agents/style/commits.md",
+        ".agents/style/prose.md",
+        ".claude/skills/writing-commits-and-prs/SKILL.md",
+        ".claude/skills/writing-technical-english/SKILL.md",
         ".agents/prompts/implementer.md",
         ".agents/prompts/operator.md",
         ".agents/prompts/reviewer.md",
@@ -548,16 +561,39 @@ def resolve_commit(repo: Path, revision: str) -> str:
     return oid
 
 
-def require_ancestor(repo: Path, base_oid: str, head_oid: str) -> None:
+def range_base(repo: Path, base_oid: str, head_oid: str) -> str:
+    """The merge base of base and head -- i.e. what a pull request actually is.
+
+    This used to demand that `base_oid` be an ANCESTOR of head (#773). CI passes
+    `pull_request.base.sha`, the TIP of the base branch, which stops being an
+    ancestor the moment main advances after the branch was cut -- continuously,
+    on this repo. So the checker aborted BEFORE classifying anything, and no
+    fork PR was ever checked. The sibling trailer gate aborted the same way,
+    which is why CI has never validated an external contributor's trailers.
+
+    Diffing two-dot against a moved main is not merely stricter, it is WRONG:
+    main's own commits appear as reversions inside the contributor's diff, so
+    paths they never touched get classified and charged to them. `git diff
+    A...B` is defined as `git diff $(git merge-base A B) B` and is what GitHub
+    itself shows.
+
+    Unrelated histories still fail closed. No merge base means there is no range
+    to compute, and reporting one would be an invention -- absence of
+    information must never look like absence of work.
+    """
     result = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", base_oid, head_oid],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        ["git", "-C", str(repo), "merge-base", base_oid, head_oid],
+        capture_output=True,
+        text=True,
         timeout=EVIDENCE_TIMEOUT_SECONDS,
         shell=False,
     )
-    if result.returncode == 1:
-        raise ValueError("base must be an ancestor of head")
+    if result.returncode != 0:
+        raise ValueError("base and head have no merge base (unrelated histories)")
+    oid = result.stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}", oid) is None:
+        raise ValueError("merge base did not resolve to one commit")
+    return oid
     if result.returncode != 0:
         raise ValueError("could not establish base/head ancestry")
 
@@ -565,9 +601,10 @@ def require_ancestor(repo: Path, base_oid: str, head_oid: str) -> None:
 def changed_paths(base: str, head: str, *, repo: Path = ROOT) -> list[ChangedPath]:
     base_oid = resolve_commit(repo, base)
     head_oid = resolve_commit(repo, head)
-    require_ancestor(repo, base_oid, head_oid)
+    # From the MERGE BASE, not the base tip -- see range_base() (#773).
     return parse_numstat(
-        git("diff", "--no-renames", "--numstat", base_oid, head_oid, repo=repo)
+        git("diff", "--no-renames", "--numstat",
+            range_base(repo, base_oid, head_oid), head_oid, repo=repo)
     )
 
 
@@ -667,7 +704,9 @@ def executable_evidence(
 
     base_oid = resolve_commit(repo, base)
     head_oid = resolve_commit(repo, head)
-    require_ancestor(repo, base_oid, head_oid)
+    # The BASE version of a checker, for the red-before half, is the one at the
+    # merge base -- not at a base tip that has moved past this branch (#773).
+    base_oid = range_base(repo, base_oid, head_oid)
     changed = {item.path for item in changes}
     checkers = sorted(
         item.path

@@ -1,3 +1,7 @@
 # Vendored Triton AOT artifacts are generated code (embedded cubins): collapse
 # in diffs/review and exclude from language stats. Regen: scripts/regen-triton-aot.sh
 src/vt/cuda/triton_aot_vendored/** linguist-generated=true
+
+# The issue index is append-only, so two branches appending a row merge
+# cleanly instead of conflicting. See .agents/specs/issue-intake.md
+.agents/issue-index.md merge=union

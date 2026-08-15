@@ -12,6 +12,8 @@
 // rather than a fixed in-file array.
 #include "vllm/model_executor/models/model_registry.h"
 
+#include "vllm/model_executor/weight_offloader.h"
+
 #include <algorithm>
 #include <array>
 #include <memory>
@@ -158,6 +160,29 @@ const ModelRegistration& RegistrationFor(std::string_view architecture) {
 }
 
 LoadedModel::~LoadedModel() = default;
+
+// #775: the refusal behind `ModelAs`. Out-of-line so the header template stays
+// a `dynamic_cast` and a branch, and so the message is authored in ONE place
+// rather than once per registered architecture.
+//
+// It names the entry point that refused and the architecture the passed model's
+// own registration claims. Those two are usually the SAME string, and that is
+// the informative case rather than a redundant one: the realistic defect is a
+// caller that resolved a registration and then handed `factory->forward` a
+// model some other path produced, so the registration is right and the object
+// is not.
+void RaiseModelTypeMismatch(std::string_view architecture,
+                            const LoadedModel& model) {
+  throw std::runtime_error(
+      std::string(architecture) +
+      ": the LoadedModel handed to this registry entry point was not produced "
+      "by " +
+      std::string(architecture) +
+      "'s own load_weights (the model's registration names architecture '" +
+      std::string(model.registration().architecture) +
+      "'). Refusing by name rather than downcasting a foreign model, which is "
+      "undefined behaviour on every member call that follows (issue #775).");
+}
 
 // SPEC-MTP I5d-pre base defaults: a non-MTP architecture cannot retain draft
 // weights and builds no draft. The concrete Qwen3.5 dense/MoE models override
@@ -310,6 +335,14 @@ std::unique_ptr<LoadedModel> ModelRegistry::Load(const HfConfig& config,
 void ModelRegistry::Prepare(LoadedModel& model, const HfConfig& config,
                             vt::Queue& queue) {
   model.registration().factory->prepare(model, config, queue);
+  // ENG-WEIGHT-OFFLOAD: the post-load hook, upstream's `post_init`
+  // (offloader/base.py:68-76). This is NOT where a weight is offloaded. The
+  // offload decision is asked during LOADING, through
+  // `WeightOffloader::ConsiderWeight`, because a weight that reached here has
+  // already paid the device allocation the feature exists to avoid. The default
+  // instance is the no-op, so this line is inert until an engine installs a
+  // backend.
+  GetWeightOffloader().OnModelPrepared(model);
 }
 
 ForwardLogits ModelRegistry::Forward(LoadedModel& model,

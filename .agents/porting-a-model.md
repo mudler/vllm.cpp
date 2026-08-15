@@ -41,7 +41,7 @@ not applicable.
 
 ## 0. Before claiming
 
-- [ ] An open issue tracks the work, linked from the roadmap issue table, the
+- [ ] An open issue tracks the work, linked from the append-only issue index, the
       row's spec, and the PR body.
 - [ ] The gap is re-verified against the *current* pin and local head, not
       against a spec's description of them.
@@ -49,7 +49,9 @@ not applicable.
       revision. If the model does not exist at the pin, that is an exception:
       record it in [`porting-inventory.md`](porting-inventory.md) §9 and argue
       for it in the commit that introduces it.
-- [ ] The spec is committed **before** implementation.
+- [ ] The spec is committed **before** implementation. At row claim, ask the
+      developer whether the spec and implementation use one pull request or
+      separate pull requests. Recommend one pull request and record the answer.
 
 ## 1. Config
 
@@ -137,7 +139,7 @@ Each applicable, or recorded not-applicable:
 ## 7. Records, in the same change
 
 - [ ] Row + checklist entry + rollup in the owning matrix.
-- [ ] `roadmap_v1.md` issue table, `coordination.md` claim.
+- [ ] `issue-index.md` row appended, `coordination.md` claim.
 - [ ] `docs/STATUS.md`, `docs/BENCHMARKS.md`, `.agents/NOW.md` on a lifecycle
       change; `docs/FEATURES.md` / `docs/USAGE.md` / `README.md` when the
       user-visible surface moves.

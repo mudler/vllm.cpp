@@ -17,7 +17,7 @@
 | Dependencies | Landed: `SPEC-DFLASH` (`DONE`), `SPEC-REJECTION` verify half, `SPEC-GDN-SEGMENTS`. External, PENDING developer authority: checkpoint downloads (2.79-8.80 GB), dgx GPU time, push/draft-PR. Blocking unknown: R1, whether the pinned oracle runs DSpark at all. |
 | Work breakdown | §4 — W1 config, W2 Markov head + draft model, W3 loader (native + Speculators), W4 speculator (anchor layout + sequential sampling), W5 runner + one-surface, W6 gates. W1-W4 are CPU-gateable. |
 | Risks/decisions | §6 — R1 oracle runnability (V2 runner), R2 Speculators format is a new subsystem, R3 the community 27B checkpoint's `attn_output_gate`, R4 the `k >= dspark_block_size` garbling trap, R5 sequential sampling vs CUDA-graph capture, R6 greedy before probabilistic, R7 GB10 host-RAM pressure. |
-| Status | W1-W5 LANDED and DSpark now genuinely speculates on the 35B gate model (real acceptance, 6.78 -> 41.89 tok/s) after fixing an engine-wide `check_for_draft_tokens` wiring bug that silently disabled EVERY speculator on the CLI/server path. W6 PARTIAL: spec-ON output is token-identical to spec-OFF and reproducible on the 35B gate model (§6b), but speed is ~2% BEHIND spec-off and the cross-engine + acceptance-band gates are still owed. R1 answered (§6a). |
+| Status | **`ACTIVE`. W1-W8 LANDED and GPU-gated** (last refreshed 2026-08-12, [#536](https://github.com/mudler/vllm.cpp/issues/536); §8 records why this field had drifted). W1-W5 gave a working speculator on the 35B gate model after fixing an engine-wide `check_for_draft_tokens` wiring bug that silently disabled EVERY speculator on the CLI/server path (§6b); W7 ([#436](https://github.com/mudler/vllm.cpp/issues/436)) moved the sequential Markov sample on device, byte-identical (§6k); W8 ([#442](https://github.com/mudler/vllm.cpp/issues/442)) captured the T=1+k verify by mirroring vLLM's uniform-decode dispatch predicate, +12.2%/+3.5% same-binary (§§6m-6n). **Cross-engine under pinned clocks the 35B-A3B MoE lane is 0.975x (code cell, non-overlapping) / 1.012x (prose cell) — NOT parity**, with the residual localised to `marlin_moe_wna16::Marlin` and attributed to a 12.9% effective-DRAM-bandwidth gap on byte-equivalent machine code (§§6s-6aa). R1 answered (§6a). Still owed for a binding W6: the SACRED-corpus token gate under the ratified near-tie protocol, the 27B dense re-measure, the Gemma4 `1 + N` layout on real weights, padded/multi-request capture shapes, and the next bandwidth lever (§6aa). ~~W1-W5 LANDED … W6 PARTIAL: … speed is ~2% BEHIND spec-off …~~ (the 2026-08-10 text, superseded by §§6c-6aa; the "~2% behind" was a cold single-shot reading corrected in §6c). |
 | Goal (developer, 2026-08-09) | a FULL DSpark implementation in vllm.cpp, mirrored from vLLM |
 
 ## 0. Verdict
@@ -2053,3 +2053,46 @@ as one.
 
 Sources: pin files cited inline at `555967922`; HF API queried 2026-08-09;
 our anchors cited against `bc6e3d72`.
+
+## 8. Record reconciliation (2026-08-12, [#536](https://github.com/mudler/vllm.cpp/issues/536))
+
+`ROAD-V1-C3`'s named tail still read "DSpark (`SPEC-DSPARK`) +
+heterogeneous-vocabulary TLI (`SPEC-TLI`) **unspiked** — overlaps `ROAD-V1-D3`"
+three days after this row's W1-W8 landed and were measured cross-engine. Every
+clause was wrong, and a punch-list reader would have dispatched a port that
+already exists.
+
+| Surface | Said | Now |
+|---|---|---|
+| [roadmap-v1-completion.md](roadmap-v1-completion.md) §2 C3 row, §3 item 17 | DSpark + TLI "unspiked", "overlaps D3", Size M | superseded in place; DSpark is a perf tail plus owed gates (S-M), TLI is a separate row (M) |
+| [roadmap_v1.md](../roadmap_v1.md) rows 3 and C3 | "DFlash Part C + DSpark/TLI remain"; "their dedicated spikes are not written" | `SPEC-DFLASH` is `DONE` (D13/D14, `489a7544`); this spike exists (`2b342620e`) |
+| [roadmap_v1.md](../roadmap_v1.md) §DSpark grounding note | `SPEC-DSPARK` "(engine matrix, `INVENTORIED`)", spike "future" | `ACTIVE`, spike written |
+| [spec-decode-inventory.md](spec-decode-inventory.md) `dspark` row + lifecycle summary | **INVENTORIED** | **ACTIVE** |
+| [spec-decode-inventory.md](spec-decode-inventory.md) §HF speculators | "no `speculators`-format adapter" | W3 shipped the DSpark one (`qwen3_dspark.cpp:227-300`) |
+| [docs/STATUS.md](../../docs/STATUS.md) method surface | `dspark` INVENTORIED, contradicting the same page's own DSpark paragraph | ships DSpark |
+| This spec's `Status` field | 2026-08-10 "W1-W5 … W6 PARTIAL … ~2% BEHIND spec-off" | W1-W8; cross-engine 0.975x/1.012x on the pre-reimage box, SUPERSEDED by 0.834x matched-and-warm on the rebuilt stack |
+| [roadmap_v1.md](../roadmap_v1.md) Open issues | #436, #442, #513 absent from the intake table | listed |
+
+**The TLI half is filed under the wrong row, and that is the more useful
+finding.** Upstream TLI is `use_heterogeneous_vocab`
+(`config/speculative.py:150`) plus `VocabMapping`
+(`v1/spec_decode/vocab_mapping.py:68`), and both are consumed ONLY by
+`v1/spec_decode/llm_base_proposer.py:432-495,688-691,831-837`
+(`SpecDecodeBaseProposer`) and `v1/spec_decode/draft_model.py:19,34-58`. The
+V2-runner speculators this row ports (`v1/worker/gpu/spec_decode/dspark/`,
+`.../dflash/`) contain no heterogeneous-vocab path at all, so nothing DSpark
+lands moves TLI, and TLI's host is `SPEC-DRAFT-MODEL` — locally a CPU propose
+brick with no runner construction. In particular this row's `d2t` work is NOT
+TLI: `d2t` offsets ids inside ONE tokenizer's vocabulary
+(`draft_id + d2t[draft_id]`, §2 D), while `VocabMapping` builds a string-level
+intersection ACROSS tokenizer families, probing the space prefix at init to
+handle a BPE draft against a SentencePiece target.
+
+**Why the drift happened, since the row can be told from the outside.** The
+punch-list is written from row summaries, and this row's summaries were the
+thing not updated: the spike went straight from "planned" to twenty-odd
+`measure(SPEC-DSPARK)` commits without either the inventory's lifecycle summary
+or `STATUS.md`'s one-line method surface following. Both are derived statements
+about a row that lives elsewhere, which is exactly the shape AGENTS.md's Records
+section warns about — a fact stored away from the thing it describes drifts
+silently, because nothing fails when it does.

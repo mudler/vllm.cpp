@@ -276,6 +276,72 @@ def windows_possible_lines(text: str):
             yield number, line
 
 
+C_FAMILY_COMPILE_LANGUAGES = {"C", "CXX"}
+
+
+def _generator_expression_spans(text: str) -> list[tuple[int, int]]:
+    """Return (start, end) for every balanced `$<...>` generator expression."""
+    spans: list[tuple[int, int]] = []
+    stack: list[int] = []
+    index = 0
+    while index < len(text):
+        if text.startswith("$<", index):
+            stack.append(index)
+            index += 2
+            continue
+        if text[index] == ">" and stack:
+            spans.append((stack.pop(), index + 1))
+        index += 1
+    return spans
+
+
+def msvc_cxx_flag_text(cmake_text: str) -> str:
+    """Return the flag text that can reach an MSVC C/C++ translation unit.
+
+    Two things are removed, both of which satisfied the old substring test
+    without compiling anything (#774):
+
+    * `#` comments. `CMakeLists.txt` says `/W4 /WX` in prose, and a policy
+      cannot be satisfied by prose.
+    * Generator expressions whose `COMPILE_LANGUAGE` names only languages
+      outside C/C++. `$<$<COMPILE_LANGUAGE:OBJCXX>:/WX>` is the Metal backend,
+      which never compiles under MSVC, so it answers for nothing here. A
+      generator expression naming no language at all is KEPT: it does reach
+      C/C++.
+
+    Spans are blanked rather than cut so reported offsets stay meaningful,
+    matching `without_set_source_properties`.
+    """
+    active = re.sub(r"(?m)#.*$", "", cmake_text)
+    out = list(active)
+    for start, end in _generator_expression_spans(active):
+        languages: set[str] = set()
+        for mention in re.finditer(
+            r"COMPILE_LANGUAGE\s*:\s*([^>]*)", active[start:end]
+        ):
+            languages |= {
+                name.strip().upper()
+                for name in mention.group(1).split(",")
+                if name.strip()
+            }
+        if languages and not (languages & C_FAMILY_COMPILE_LANGUAGES):
+            out[start:end] = " " * (end - start)
+    return "".join(out)
+
+
+def has_msvc_flag(text: str, flag: str) -> bool:
+    """Return whether `flag` appears as a WHOLE token, not as a substring.
+
+    `"/WX" in "/WX-"` is True and `/WX-` DISABLES warnings-as-errors; `"/W4" in
+    "/W44996"` is True and `/W44996` sets one warning to level 4 rather than
+    raising the level. Both satisfied the old test (#774). Matching stays
+    case-sensitive because `cl` is: `/w` and `/W4` are different flags.
+    """
+    return re.search(
+        rf"(?<![A-Za-z0-9_-]){re.escape(flag)}(?![A-Za-z0-9_-])", text
+    ) is not None
+
+
 def without_set_source_properties(text: str) -> str:
     """Remove balanced set_source_files_properties commands."""
     lowered = text.lower()
@@ -1708,8 +1774,30 @@ def check(root: Path, build_dir: Path | None = None,
     global_options = without_set_source_properties(cmake)
     if re.search(r"(?i)/arch\s*:\s*AVX2", global_options):
         errors.append("CMakeLists.txt: global /arch:AVX2 contaminates the portable baseline")
-    if not all(token in warnings for token in ("/W4", "/WX")):
-        errors.append("CMakeLists.txt: MSVC /W4 /WX policy is required")
+    # Asserted on the flags that reach the C/C++ compile, by TOKEN. A substring
+    # test passed a tree whose CXX arm said `/WX-` because the only bare `/WX`
+    # left was on `$<COMPILE_LANGUAGE:OBJCXX>` (#774).
+    cxx_warning_flags = msvc_cxx_flag_text(warnings)
+    missing = [
+        flag for flag in ("/W4", "/WX")
+        if not has_msvc_flag(cxx_warning_flags, flag)
+    ]
+    if missing:
+        errors.append(
+            "CMakeLists.txt: MSVC /W4 /WX policy is required on the C/C++ "
+            f"compile; missing {' '.join(missing)}"
+        )
+    # The disable spellings of the SAME two flags. Present-and-cancelled is a
+    # different repair from absent, so it is a different error.
+    negated = [
+        flag for flag in ("/WX-", "/W0", "/w")
+        if has_msvc_flag(cxx_warning_flags, flag)
+    ]
+    if negated:
+        errors.append(
+            "CMakeLists.txt: MSVC /W4 /WX policy is negated on the C/C++ "
+            f"compile by {' '.join(negated)}"
+        )
     if re.search(r"__attribute__\s*\(\(\s*target\s*\(\s*\"f16c\"", cpu_baseline):
         errors.append("cpu_matmul_elem.cpp: F16C must be isolated in a dedicated translation unit")
     f16c_properties = source_properties(cmake, "src/vt/cpu/cpu_matmul_elem_f16c.cpp")

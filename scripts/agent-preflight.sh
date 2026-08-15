@@ -84,6 +84,7 @@ SUITES=(
   test_check_prompt_contract
   test_agent_gates
   test_agent_record
+  test_check_issue_index_append_only
   test_check_release_binary_contract
   test_release_manifest
   test_release_archive
@@ -201,6 +202,8 @@ for suite in "${SUITES[@]}"; do
 done
 run "trailer suites" python3 -m unittest \
   tests.scripts.test_check_commit_trailers
+run "commit style suites" python3 -m unittest \
+  tests.scripts.test_check_commit_style
 
 # The COMMITTED range, checked the way CI checks it. Deliberately OUTSIDE the
 # --staged block: `--staged` inspects staged paths and is therefore VACUOUS after
@@ -215,6 +218,8 @@ if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
     --base origin/main --head HEAD
   run "doc-checkpoint range" python3 scripts/check-doc-checkpoint.py \
     --base origin/main --head HEAD
+  run "issue-index append-only" python3 scripts/check-issue-index-append-only.py \
+    --base origin/main --head HEAD
 fi
 
 # Trailer enforcement reads only committed Git objects.
@@ -223,6 +228,8 @@ if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
    [ "$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)" -gt 0 ]; then
   echo "Commit trailers vs origin/main:"
   run "commit-trailers" python3 scripts/check-commit-trailers.py \
+    --range "origin/main..HEAD"
+  run "commit-style" python3 scripts/check-commit-style.py \
     --range "origin/main..HEAD"
 fi
 

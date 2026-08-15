@@ -256,10 +256,16 @@ jobs:
           # failure moves from "caught on the PR" to "no trailers, caught
           # on main after the merge" -- and #822 cancels the main push run
           # that would report it.
+          # `${PR_BODY:-}` because this step runs under `set -eu` and the
+          # variable is UNSET, not empty, on a lane with no pull request.
+          # `mktemp` rather than $RUNNER_TEMP for the same reason. An empty body
+          # is not skipped: under PR_BODY it lands a commit carrying no trailers
+          # at all, which is exactly what this is here to catch.
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
+            body_file="$(mktemp)"
+            printf '%s' "${PR_BODY:-}" > "$body_file"
             python3 scripts/check-commit-trailers.py \
-              --message-file "$RUNNER_TEMP/pr-body.txt" --filled
+              --message-file "$body_file" --filled
           fi
       - name: NOW.md stays a short one-Read resume surface
         run: |

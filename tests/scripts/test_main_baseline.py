@@ -852,15 +852,25 @@ class AgentRecordDiffRangeTests(unittest.TestCase):
                 for argv in invocations:
                     joined = " ".join(argv)
                     for checker in self.RANGE_SCOPED:
-                        if checker in joined:
-                            invoked.add(checker)
-                            self.assertIn(
-                                f"{self.FAKE_BASE}..{self.FAKE_HEAD}"
-                                if checker == "check-commit-trailers.py"
-                                else self.FAKE_BASE,
-                                joined,
-                                f"{checker} got the wrong range on {event}",
-                            )
+                        if checker not in joined:
+                            continue
+                        # `check-commit-trailers.py --message-file` validates the
+                        # pull request BODY, which under `PR_BODY` becomes the
+                        # landed commit message (#848). That invocation is not
+                        # diff-scoped and has no range to carry. It does not
+                        # count as the range-scoped run this case demands, so
+                        # `invoked` stays untouched and the assertion below still
+                        # requires the real range walk to have happened.
+                        if "--message-file" in joined:
+                            continue
+                        invoked.add(checker)
+                        self.assertIn(
+                            f"{self.FAKE_BASE}..{self.FAKE_HEAD}"
+                            if checker == "check-commit-trailers.py"
+                            else self.FAKE_BASE,
+                            joined,
+                            f"{checker} got the wrong range on {event}",
+                        )
             with self.subTest(event=event):
                 self.assertEqual(invoked, set(self.RANGE_SCOPED))
 

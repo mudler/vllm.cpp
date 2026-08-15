@@ -58,6 +58,14 @@ So the ported arm has no running oracle to compare against yet. That is visible
 debt rather than a gap to be discovered later, which is what `gateable = no` is
 for.
 
+What HAS been done, so the gap is not overstated: the ported decoder was run on
+real `UD-Q1_0` bytes and compared against an independent transcription of the
+fork's own `dequantize_row_iq1_xxxs`, bit-identical over 1179648 weights across
+three tensor roles, two layers and two shards. See the census section of
+[`.agents/specs/expert-streaming.md`](../specs/expert-streaming.md). That removes
+transcription error from our side. It cannot detect a defect in the FORK itself,
+because both sides read the same source, which is exactly the residue #933 owes.
+
 ## Pin
 
 ```oracle-pin

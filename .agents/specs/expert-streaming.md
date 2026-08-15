@@ -527,6 +527,36 @@ implementing, per the reconciliation note's own warning):
 | `iq1s_grid`, uint64, `NGRID_IQ1S` = 2048 | `ggml/src/ggml-common.h:1124` |
 | `iq1s_grid_gpu`, uint32, 2048 | `ggml/src/ggml-common.h:1639` |
 
+### The IQ1_XXXS decode was checked against REAL checkpoint bytes
+
+Synthetic random blocks sweep bit patterns, but they cannot catch a
+misunderstanding of the FILE: a wrong field order, a wrong stride, or a codebook
+that turns real weights into legal-looking noise. So the decode was also run on
+the downloaded `UD-Q1_0` shards, 15 August 2026.
+
+Two independent things were compared on the SAME bytes: this tree's
+`DequantIQ1_XXXS`, and a separate transcription of the fork's
+`dequantize_row_iq1_xxxs` reading the fork's grid directly out of its own tree.
+
+| Tensor | Layer | K | Weights | Result |
+|---|---|---|---|---|
+| `ffn_gate_exps` | 0 | 8192 | 524288 | bit-identical |
+| `ffn_up_exps` | 0, 23 | 8192 | 262144 | bit-identical |
+| `ffn_down_exps` | 0, 23 | 2048 | 65536 | bit-identical |
+
+**1179648 real weights, max absolute difference 0.0.** The decoded values also
+look like weights rather than noise: mean -4.2e-7, sd 8.6e-4, symmetric tails,
+24 discrete levels, and no non-finite value. The file layout resolves exactly as
+the port assumes, `row_bytes = K/256*38`, and the implied tensor size of
+1275068416 bytes matches 512 experts times 2048x8192 at 1.1875 bpw.
+
+Be precise about what this does and does not establish. It removes transcription
+error from OUR C++, which is the failure this port was most exposed to, and it
+proves the reader addresses the real file correctly. It does NOT make the fork
+oracle gateable: both sides are transcriptions of the same source, so a defect in
+the FORK would be reproduced identically by both. Only building and running the
+fork closes that, which is what #933 owes.
+
 Why this is in this spec rather than its own row: the encoding is the load
 path's half of the same capability. A streamer that can address an expert slice
 it cannot decode moves bytes for nothing, so the row's own gate cannot be met

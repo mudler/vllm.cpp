@@ -86,6 +86,11 @@ PROJECT_RECORD_FILES = frozenset(
         ".agents/NOW.md",
         ".agents/coordination.md",
         ".agents/roadmap_v1.md",
+        # The intake surface moved out of roadmap_v1.md into its own append-only
+        # file (#840) and was never classified here. Classification is a hard
+        # error by design, so pr-size aborted on EVERY pull request that appends
+        # an index row, which under the same policy is nearly all of them (#856).
+        ".agents/issue-index.md",
         ".agents/porting-inventory.md",
         ".agents/engine-matrix.md",
         ".agents/feature-matrix.md",

@@ -583,19 +583,20 @@ and is flat only above ~40 experts. NOT parity, and the row stays open.
 The environment was REBUILT after the reimage (engine, both checkpoints at the
 pinned revision, and the TRUE pinned oracle 555967922 + torch 2.13.0 +
 flashinfer 0.6.15.post1, built from source because vllm==0.26.0 hard-pins
-torch==2.11.0 and would be a different denominator). On it our engine measures
-very stably -- four arms within ~1%, medians within 0.4% -- but THE ORACLE
-VARIES 20% BETWEEN INVOCATIONS on one boot (145.4 then 174.3 tok/s), which
-puts the ratio at 0.98 or 0.82 depending on which invocation is used. The
-compile-cache explanation is REFUTED: those caches live inside the container
-and are discarded by --rm, and the host cache stayed at 24K, so both
-invocations paid full JIT. This matters beyond one run, because every ratio
-this row has recorded used exactly ONE oracle invocation, so the drift gate
-applied to our arms has no counterpart on the denominator and the quoted
-+/-0.01 error bars are too narrow. Parity is therefore UNMEASURED on the
-rebuilt stack -- not 0.98, not 0.82 -- pending N>=5 oracle invocations per
-pair with a dispersion gate, an explanation for the flashinfer gen_gemm_sm120
-JIT failures, and persisted container caches.
+torch==2.11.0). On it, with generation length MATCHED at 89 tokens and the
+container compile cache PERSISTED, the oracle is stable at 171.4 tok/s and our
+engine at 143.2, a paired ratio of **0.835** -- far below the 0.957-0.989 this
+row recorded. Two causes are possible and this data cannot separate them:
+every earlier paired run invoked the oracle ONCE, so a cold-JIT denominator
+would have been handicapped ~17%; and the BOX IS NOT THE SAME MACHINE, since
+dgx.casa now resolves to kairos-17dd while the recorded ratios were taken on
+promaxgb10-4ad8, which no longer exists. Our arm reads ~142 on both, which
+argues against a pure hardware explanation without excluding one. Safe to say:
+on this box, matched and warm, we are at 0.835 of the pinned oracle, NOT
+parity. Not safe to say: that the older numbers were wrong, since cross-
+machine ratios cannot be differenced any more than cross-boot absolutes can.
+Owed: re-run the pre-reimage single-cold-invocation protocol HERE -- ~0.97
+would convict cold JIT, ~0.83 would mean the machine changed.
 
 
 

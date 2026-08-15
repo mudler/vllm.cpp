@@ -623,6 +623,31 @@ binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
 required and is not the default, because omitting it resolves the checkpoint's
 own CRF 18 and refuses — see the out-of-distribution note above.
 
+Add `--audio-path take.wav` for **audio-to-video**: the render is conditioned on
+a soundtrack you supply rather than one the model invents. The take is encoded
+through the audio VAE's encoder and then held frozen through every denoise
+phase, and the `audio.wav` that comes back is your own input rather than a VAE
+round trip. `--audio-start-time` seeks into the file and `--audio-max-duration`
+caps how much is read; both default to covering exactly the clip's duration, and
+either without `--audio-path` is refused rather than ignored.
+
+What is upstream's here is the **conditioning mechanism** — decode, encode,
+truncate to the clip, freeze — and not the denoise schedule. Upstream's
+audio-to-video stage 1 is a caller-configured guided one, with its
+`a2v_guidance_scale` acting as the guider's modality scale, while a take here
+rides whichever recipe the checkpoint resolves, in practice `distilled_two_stage`
+with fixed sigmas. So the audio drives the render, and no claim is made that the
+result reproduces upstream's own audio-to-video output.
+
+The WAV has to match the checkpoint already: 16-bit PCM RIFF/WAVE, the audio
+VAE's own sample rate (16 kHz on the shipped one), its encoder's channel count
+(2), and at least as long as the clip. None of the four is converted. There is
+no resampler for an arbitrary ratio here and no demuxer at all, and a take
+shorter than the clip is an error upstream too, so each mismatch is refused with
+both numbers in the message — a resampled-wrong, upmixed or silence-padded take
+renders a finished clip conditioned on audio nobody supplied. This needs an
+audio VAE that carries encoder weights; a decoder-only one refuses by name.
+
 `--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
 64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
 half resolution). Omitting all three renders the recipe default, which is

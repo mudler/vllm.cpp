@@ -101,6 +101,8 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                [--prompt-valid-rows N]   how many embed rows are real tokens\n"
       "                [--frames N] [--width N] [--height N] [--seed N]\n"
       "                [--first-frame <image.ppm>] [--image-crf 0]\n"
+      "                [--audio-path <in.wav>] [--audio-start-time S]\n"
+      "                [--audio-max-duration S]\n"
       "                [--device cpu|cuda]\n\n"
       "Renders LTX-2.5 (family \"ltx-2.5\") through vllm_video_engine_load +\n"
       "vllm_video_generate.\n\n"
@@ -132,7 +134,29 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "round trip needs libx264 and none is vendored here, so leaving --image-crf out\n"
       "resolves 18 and REFUSES by name. --image-crf 0 is upstream-legal and OUT OF\n"
       "DISTRIBUTION: the model sees pixels it was not trained on. That is a quality\n"
-      "cost, and this tool states it rather than turning it on quietly.\n");
+      "cost, and this tool states it rather than turning it on quietly.\n\n"
+      "AUDIO-TO-VIDEO. --audio-path takes a 16-bit PCM WAV and CONDITIONS the render\n"
+      "on it: the take is decoded, encoded through the audio VAE\'s encoder, truncated\n"
+      "to the clip\'s duration, and then held FROZEN through every denoise phase, so\n"
+      "the video is generated around a soundtrack you supplied rather than one the\n"
+      "model invented. The CONDITIONING MECHANISM is upstream\'s A2VidPipelineTwoStage:\n"
+      "decode, encode, truncate to the clip, freeze through both stages. The SCHEDULE\n"
+      "is NOT. Upstream\'s stage 1 is a caller-configured GUIDED one whose\n"
+      "--a2v-guidance-scale is the guider\'s modality_scale; a take here rides whichever\n"
+      "recipe the checkpoint resolves, in practice distilled_two_stage, whose sigmas are\n"
+      "fixed. So no claim is made that this reproduces upstream\'s A2Vid output.\n\n"
+      "The WAV must already match the checkpoint: its sample rate must equal the audio\n"
+      "VAE\'s mel front-end rate and its channel count the encoder\'s in_channels.\n"
+      "Neither is converted, because upstream resamples with a polyphase kaiser\n"
+      "resampler that is not ported here and feeds the file\'s own channel count into a\n"
+      "fixed-width convolution; both mismatches are refused with both numbers, since a\n"
+      "resampled-wrong or upmixed take renders a finished clip conditioned on audio you\n"
+      "never supplied. The take must also be at least as long as the clip: upstream\n"
+      "truncates a long one and asserts on a short one, so a short one is refused.\n\n"
+      "--audio-start-time seeks into the file (default 0) and --audio-max-duration caps\n"
+      "how much is read (default: the clip\'s own duration). Either without\n"
+      "--audio-path is refused rather than ignored. The rendered audio.wav is your own\n"
+      "input, not a VAE round trip, which is upstream\'s deliberate choice.\n");
   std::exit(code);
 }
 
@@ -145,6 +169,7 @@ int main(int argc, char** argv) {
   // BORROWED by `vllm_video_generate`, like the extras below, so it is owned
   // here and pointed at only after parsing.
   std::string prompt, first_frame, image_crf;
+  std::string audio_path, audio_start_time, audio_max_duration;
 
   // The extras are BORROWED by the load call, so the strings must outlive it.
   // Kept as two parallel vectors of owned strings plus the char* views the ABI
@@ -196,6 +221,15 @@ int main(int argc, char** argv) {
     // quietly turns an out-of-distribution render on.
     else if (f == "--first-frame") first_frame = Need(argc, argv, ++i, "--first-frame");
     else if (f == "--image-crf") image_crf = Need(argc, argv, ++i, "--image-crf");
+    // AUDIO-TO-VIDEO (#922). Upstream's `--audio-path` is REQUIRED because that
+    // CLI drives the A2V pipeline and nothing else (a2vid_two_stage.py:312-317);
+    // here one binary serves every LTX-2.5 path, so supplying it is what selects
+    // the audio-conditioned one. Per-generation, so it rides vp.extra_* too.
+    else if (f == "--audio-path") audio_path = Need(argc, argv, ++i, "--audio-path");
+    else if (f == "--audio-start-time")
+      audio_start_time = Need(argc, argv, ++i, "--audio-start-time");
+    else if (f == "--audio-max-duration")
+      audio_max_duration = Need(argc, argv, ++i, "--audio-max-duration");
     else if (f == "--device") device = Need(argc, argv, ++i, "--device");
     else if (f == "--frames") vp.num_frames = std::atoi(Need(argc, argv, ++i, "--frames"));
     else if (f == "--width") vp.width = std::atoi(Need(argc, argv, ++i, "--width"));
@@ -235,6 +269,18 @@ int main(int argc, char** argv) {
   if (!image_crf.empty()) {
     gen_keys.emplace_back("image_crf");
     gen_values.push_back(image_crf);
+  }
+  if (!audio_path.empty()) {
+    gen_keys.emplace_back("audio_path");
+    gen_values.push_back(audio_path);
+  }
+  if (!audio_start_time.empty()) {
+    gen_keys.emplace_back("audio_start_time");
+    gen_values.push_back(audio_start_time);
+  }
+  if (!audio_max_duration.empty()) {
+    gen_keys.emplace_back("audio_max_duration");
+    gen_values.push_back(audio_max_duration);
   }
   std::vector<const char*> gkeys, gvalues;
   for (size_t i = 0; i < gen_keys.size(); ++i) {

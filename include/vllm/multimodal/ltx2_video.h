@@ -259,6 +259,42 @@ inline constexpr char kLtx2EncoderConfigPathExtra[] = "encoder_config_path";
 // render conditioned on uncompressed pixels rather than a refusal.
 inline constexpr char kLtx2ImageCrfExtra[] = "image_crf";
 
+// ── AUDIO-TO-VIDEO: the driving waveform. Row LTX25-A2V-AUDIO-INPUT (#922) ──
+//
+// Upstream's `--audio-path` (`a2vid_two_stage.py:312-317`, required there
+// because that CLI drives the A2V pipeline and nothing else). Here it is
+// per-generation and OPTIONAL: supplying it selects the audio-conditioned path
+// on a checkpoint that carries audio VAE encoder weights, and leaving it out is
+// the ordinary text-to-video render.
+//
+// A 16-bit PCM RIFF/WAVE file whose channel count matches the checkpoint's audio
+// VAE encoder `in_channels` and whose sample rate matches its mel front-end.
+// Neither is converted: upstream resamples with an arbitrary-ratio polyphase
+// kaiser resampler (`ops.py:40`) this project has not ported, and it feeds the
+// file's own channel count straight into a conv that declares 2
+// (`model_configurator.py:172`). Both mismatches are refused with both numbers
+// in the message, because a resampled-wrong or upmixed-wrong take conditions the
+// render on a waveform the caller never supplied and still finishes.
+//
+// The audio is held FROZEN through every denoise phase — upstream's
+// `ModalitySpec(frozen=True, noise_scale=0.0)` at `a2vid_two_stage.py:251-256`
+// and `:291-296` — so the video is generated around it and the encoded latent
+// is returned unchanged. The rendered soundtrack is the caller's own file, not
+// a VAE round trip, which is upstream's deliberate choice at `:301-303`.
+inline constexpr char kLtx2AudioPathExtra[] = "audio_path";
+
+// Seconds into the file to start reading (`--audio-start-time`,
+// `a2vid_two_stage.py:318-323`, default 0.0).
+inline constexpr char kLtx2AudioStartTimeExtra[] = "audio_start_time";
+
+// Seconds of audio to read (`--audio-max-duration`,
+// `a2vid_two_stage.py:324-329`). ABSENT MEANS the video's own duration,
+// `num_frames / frame_rate` — and note that the default is applied by upstream's
+// CLI (`:369-371`), not by the pipeline, whose own default is `None` (`:157`).
+// Mirrored at the same layer, so a caller who omits it gets exactly as much
+// audio as the clip is long.
+inline constexpr char kLtx2AudioMaxDurationExtra[] = "audio_max_duration";
+
 // WHAT THE LAST `Generate()` ACTUALLY HANDED THE DiT's CROSS-ATTENTION.
 //
 // Every field is read off the exact f32 buffers `Ltx2ModalityInput::context`
@@ -365,6 +401,48 @@ struct Ltx2ConditioningTrace {
   double image_absmax = 0.0;
   int64_t image_crf = 0;      // the CRF this render actually preprocessed at
   double image_strength = 0.0;  // `ImageConditioningInput.strength` (args.py:64)
+
+  // ── AUDIO-TO-VIDEO: the supplied take, as the DiT received it (#922) ───────
+  //
+  // Zero and false everywhere when the request carried no `audio_path`.
+  //
+  // These describe the AUDIO STREAM STATE of the last phase that ran, read off
+  // the same patchified buffer `Ltx2ModalityInput::latent` pointed at. They
+  // exist for the reason `image_digest` does: "the audio latent has the right
+  // token count" is satisfied completely by a path that encoded the file and
+  // then conditioned on zeros, and no rendered clip can tell the difference.
+  //
+  // `audio_frozen` is the one that cannot be inferred from the others. Upstream
+  // holds the audio at `frozen=True, noise_scale=0.0` through both stages
+  // (a2vid_two_stage.py:251-256, :291-296), and a build that seeded the latent
+  // correctly and then let the sampler denoise it produces a soundtrack drifting
+  // away from the caller's file while every count and digest above still looks
+  // populated.
+  bool audio_conditioned = false;
+  bool audio_frozen = false;
+  int64_t audio_tokens = 0;
+  uint64_t audio_latent_digest = 0;
+  double audio_latent_absmax = 0.0;
+
+  // The LARGEST scalar `Modality.sigma` the audio stream was handed across
+  // EVERY step of EVERY phase — upstream's `Modality.sigma`, the second half of
+  // `frozen` (utils/types.py:104-106), which is a separate DiT input from the
+  // per-token timesteps and which the denoise mask cannot reach.
+  //
+  // ALL PHASES, and that is deliberate, so it is the ONE field in this block
+  // that is not last-phase-only. Every sibling above reports the conditioning as
+  // the final phase saw it, because that is the state the rendered clip came
+  // from. This one is an assertion about a FREEZE, and a freeze that holds in
+  // the last phase and broke in the first is not a freeze — a per-phase reset
+  // would make exactly that build read as frozen. There is no reset in the loop
+  // and none is wanted; the wider window is the stronger claim.
+  //
+  // A MAXIMUM rather than the last value, because the last step's schedule sigma
+  // is 0 anyway: reporting that would read as frozen on every render. MEASURED:
+  // with this field absent, a mutation leaving the audio at the schedule's sigma
+  // — telling the DiT the caller's clean take is noisy — left this suite green.
+  // The claim was made in a comment and observed by nothing.
+  double audio_sigma_max = 0.0;
 
   // True only once the `Generate` that produced this conditioning RETURNED. The
   // trace is filled immediately after the connector and BEFORE the denoise loop,

@@ -26,6 +26,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/device_pool.h"  // ActivePool(b)/DevicePool::Drain
 #include "vllm/model_executor/models/ltx2.h"
+#include "vllm/model_executor/models/ltx2_audio_input.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_conditioning.h"
 #include "vllm/model_executor/models/ltx2_connector.h"
@@ -257,6 +258,26 @@ int64_t ExtraInt(const std::map<std::string, std::string>& extras, const std::st
   }
 }
 
+// The same, for a SECONDS-valued knob. Separate from `ExtraInt` rather than
+// folded into it, because the two disagree about what "3" means to a parser and
+// silently truncating `audio_start_time=1.5` to 1 would window the wrong second
+// of a take and still render. `consumed != size` catches the trailing-garbage
+// case that `stod` otherwise accepts.
+double ExtraDouble(const std::map<std::string, std::string>& extras, const std::string& key,
+                   double fallback) {
+  const std::string raw = VideoExtra(extras, key);
+  if (raw.empty()) return fallback;
+  try {
+    size_t consumed = 0;
+    const double value = std::stod(raw, &consumed);
+    if (consumed != raw.size()) throw std::invalid_argument("trailing");
+    if (!std::isfinite(value)) throw std::invalid_argument("not finite");
+    return value;
+  } catch (const std::exception&) {
+    Fail("the extra '" + key + "' is '" + raw + "', which is not a finite number of seconds");
+  }
+}
+
 // The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
 // ported and gated as a brick (`ltx2_duration_head.h`), but nothing here
 // constructs one, so a supplied path names a file the engine never opens.
@@ -281,7 +302,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 690 745 841 857 859 929 954 1059 1100
+// 719 774 870 886 888 966 991 1096 1137
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
@@ -509,6 +530,14 @@ struct Ltx2VideoEngine::Impl {
   Ltx2VaeWeights audio_weights;
   Ltx2VocoderBweConfig vocoder_cfg;
   Ltx2VaeWeights vocoder_weights;
+
+  // The ANALYSIS half, for audio-to-video (row LTX25-A2V-AUDIO-INPUT, #922).
+  // Present only when the audio VAE checkpoint carries `audio_vae.encoder.`
+  // tensors; a decoder-only checkpoint leaves this false and `audio_path` is
+  // then refused BY NAME rather than rendering an unconditioned clip.
+  bool has_audio_encoder = false;
+  Ltx2AudioEncoderLoad audio_encoder_cfg;
+  Ltx2VaeWeights audio_encoder_weights;
 
   bool has_upsampler = false;
   Ltx2UpsamplerConfig upsampler_cfg;
@@ -923,6 +952,14 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
     im.audio_weights = Ltx2LoadVaeWeights(f, Ltx2AudioVaeDecoderKeyRules());
     im.vocoder_cfg = Ltx2ParseVocoderBweConfig(config);
     im.vocoder_weights = Ltx2LoadVaeWeights(f, Ltx2VocoderKeyRules());
+    // The ENCODER half, when the checkpoint carries it (#922). Loaded from the
+    // same file and the same metadata object, so the encoder and its mel
+    // front-end cannot disagree with the decoder about sample rate or mel bins.
+    if (Ltx2CheckpointHasAudioEncoder(f.Names())) {
+      im.audio_encoder_cfg = Ltx2ParseAudioEncoderConfig(config);
+      im.audio_encoder_weights = Ltx2LoadVaeWeights(f, Ltx2AudioVaeEncoderKeyRules());
+      im.has_audio_encoder = true;
+    }
   }
 
   // ── the optional latent spatial upsampler (the two-stage recipe's phase 2) ─
@@ -1145,9 +1182,26 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // silently dropped renders the DEFAULT and looks like the feature not
     // working — and for THIS knob the default is a refusal, so a typo would turn
     // a served request into an unexplained one.
-    if (kv.first != kLtx2ImageCrfExtra) {
+    const bool known = kv.first == kLtx2ImageCrfExtra || kv.first == kLtx2AudioPathExtra ||
+                       kv.first == kLtx2AudioStartTimeExtra ||
+                       kv.first == kLtx2AudioMaxDurationExtra;
+    if (!known) {
       Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
-           std::string(kLtx2ImageCrfExtra));
+           std::string(kLtx2ImageCrfExtra) + ", " + kLtx2AudioPathExtra + ", " +
+           kLtx2AudioStartTimeExtra + ", " + kLtx2AudioMaxDurationExtra);
+    }
+  }
+  // The two audio WINDOW knobs only mean something alongside a file. Accepting
+  // one on its own would silently do nothing, which is the defect the whole
+  // extras surface refuses by name elsewhere.
+  {
+    const std::string path = VideoExtra(gen.extras, kLtx2AudioPathExtra);
+    for (const char* dependent : {kLtx2AudioStartTimeExtra, kLtx2AudioMaxDurationExtra}) {
+      if (path.empty() && !VideoExtra(gen.extras, dependent).empty()) {
+        Fail("the '" + std::string(dependent) + "' extra was supplied without '" +
+             std::string(kLtx2AudioPathExtra) +
+             "', so there is no audio for it to window. Refused rather than ignored");
+      }
     }
   }
   if (!gen.prompt.empty() && !im.has_encoder) {
@@ -1451,6 +1505,85 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   std::vector<float> audio_latent_volume;  // [C, F, M], unpatchified
   int64_t audio_lc = 0, audio_lf = 0, audio_lm = 0;
 
+  // ── AUDIO-TO-VIDEO: the driving waveform (#922) ────────────────────────────
+  //
+  // `A2VidPipelineTwoStage.__call__` lines 196-202: decode the file, encode it
+  // through the audio VAE, truncate it to the clip's own duration. The result
+  // then rides FROZEN through every phase (`ModalitySpec(frozen=True,
+  // noise_scale=0.0)`, :251-256 and :291-296), which is what makes this
+  // audio-to-video rather than joint generation: the soundtrack is an input, and
+  // the video is denoised around it.
+  //
+  // Done ONCE, before the phase loop, and deliberately not per phase: upstream
+  // encodes once at :200 and hands the SAME tensor to both stages. Re-encoding
+  // per phase would be pure waste on a path where the latent cannot change.
+  std::vector<float> a2v_audio_volume;
+  // The take as DECODED, kept for the output. Upstream returns the caller's own
+  // waveform rather than the VAE's reconstruction of it, in as many words:
+  // "Return the original input audio instead of VAE-decoded audio to preserve
+  // fidelity" (a2vid_two_stage.py:301-303). Round-tripping a file the caller
+  // already has through an encoder and a vocoder can only lose to it.
+  Ltx2DecodedAudio a2v_source;
+  const std::string a2v_audio_path = VideoExtra(gen.extras, kLtx2AudioPathExtra);
+  if (!a2v_audio_path.empty()) {
+    if (!im.has_audio_encoder) {
+      Fail("'" + std::string(kLtx2AudioPathExtra) + "' names '" + a2v_audio_path +
+           "', but the audio VAE checkpoint loaded here carries no `audio_vae.encoder.` "
+           "tensors, so there is nothing to turn that waveform into latents with. "
+           "`Ltx2AudioEncoderForward` and its mel front-end are ported and gated "
+           "(audio_vae.py:190-246, ops.py:8-55); what this checkpoint is missing is the "
+           "WEIGHTS. Supply an audio VAE that carries the encoder half. Refused rather than "
+           "rendering the clip unconditioned, which would look like the feature working");
+    }
+    // `AudioLatentShape.from_duration` (types.py:164-181), the same expression
+    // the phase loop uses for `ashape.frames` below. Computed here so the
+    // truncation target and the stream's token count cannot drift apart.
+    const Ltx2AudioPatchifierParams ap;
+    const double latents_per_second = static_cast<double>(ap.sample_rate) /
+                                      static_cast<double>(ap.hop_length) /
+                                      static_cast<double>(ap.audio_latent_downsample_factor);
+    const int64_t target_frames = static_cast<int64_t>(
+        std::llround(static_cast<double>(frames) / fps * latents_per_second));
+
+    // `--audio-max-duration` defaults to the CLIP's duration, and that default
+    // is applied by upstream's CLI (a2vid_two_stage.py:369-371), not by the
+    // pipeline, whose own default is None (:157). Mirrored at the same layer.
+    const double start_time =
+        ExtraDouble(gen.extras, kLtx2AudioStartTimeExtra, 0.0);
+    const double max_duration =
+        ExtraDouble(gen.extras, kLtx2AudioMaxDurationExtra, static_cast<double>(frames) / fps);
+    if (start_time < 0.0) {
+      Fail("'" + std::string(kLtx2AudioStartTimeExtra) + "' is " + std::to_string(start_time) +
+           "; it is a position in seconds and cannot be negative");
+    }
+    if (max_duration <= 0.0) {
+      Fail("'" + std::string(kLtx2AudioMaxDurationExtra) + "' is " + std::to_string(max_duration) +
+           "; it is a duration in seconds and must be positive");
+    }
+
+    a2v_source = Ltx2DecodeAudioWav(
+        ReadFileBytes(kLtx2AudioPathExtra, a2v_audio_path), a2v_audio_path,
+        im.audio_encoder_cfg.encoder.in_channels,
+        im.audio_encoder_cfg.processor.target_sample_rate, start_time, max_duration);
+
+    const Ltx2AudioSpectrogram encoded = Ltx2EncodeAudioToLatent(
+        im.audio_encoder_cfg.encoder, im.audio_encoder_cfg.processor, im.audio_encoder_weights,
+        a2v_source, target_frames);
+
+    // The DiT's audio stream is `channels x mel_bins` wide and the engine
+    // already refuses a checkpoint whose product disagrees. Check the encoder's
+    // OWN output against the same two numbers rather than only the product: a
+    // (16, 8) latent has the same width as an (8, 16) one and unpatchifies into
+    // a different tensor.
+    if (encoded.channels != kAudioLatentChannels || encoded.mel_bins != kAudioLatentMelBins) {
+      Fail("the audio VAE encoder produced a " + std::to_string(encoded.channels) + " x " +
+           std::to_string(encoded.mel_bins) +
+           " latent and this DiT's audio stream takes " + std::to_string(kAudioLatentChannels) +
+           " x " + std::to_string(kAudioLatentMelBins) + " (types.py:184-200)");
+    }
+    a2v_audio_volume = encoded.data;
+  }
+
   for (int64_t phase_index = 0; phase_index <= last_phase; ++phase_index) {
     const Ltx2PhaseRecipe& phase = recipe.phases[static_cast<size_t>(phase_index)];
     const int64_t phase_h = height / phase.spatial_downscale;
@@ -1595,6 +1728,9 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       }
     }
 
+    // Hoisted out of the state block below because the FORWARD needs it too:
+    // upstream's `frozen` sets the scalar `Modality.sigma` as well as the mask.
+    const bool audio_frozen = !a2v_audio_volume.empty();
     StreamState audio;
     audio.width = ashape.channels * ashape.mel_bins;
     audio.tokens = ashape.frames;
@@ -1611,12 +1747,57 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         }
         volume = audio_latent_volume;
       }
+      // ── audio-to-video: the supplied take, FROZEN (#922) ──────────────────
+      //
+      // `ModalitySpec(context=..., frozen=True, noise_scale=0.0,
+      // initial_latent=encoded_audio_latent)` — a2vid_two_stage.py:251-256 for
+      // stage 1 and :291-296 for stage 2, identical on both. It replaces the
+      // carry-over above rather than adding to it: upstream hands the SAME
+      // encoded tensor to both stages, so phase 2 must not inherit phase 1's
+      // audio state.
+      if (audio_frozen) {
+        if (a2v_audio_volume.size() != volume.size()) {
+          Fail("the encoded audio latent is " + std::to_string(a2v_audio_volume.size()) +
+               " values and phase '" + phase.name + "' wants " + std::to_string(volume.size()));
+        }
+        volume = a2v_audio_volume;
+      }
       audio.latent = Ltx2AudioPatchify(volume.data(), ashape);
       audio.clean = audio.latent;
-      audio.mask.assign(static_cast<size_t>(audio.tokens), 1.0F);
+      // `frozen=True` "zeros the denoise mask and marks the resulting
+      // LatentState so Modality.sigma is forced to 0 (not only per-token
+      // timesteps)" — upstream's own words at utils/types.py:104-106. The
+      // zeroed mask is the whole of the first half here, and it is load-bearing
+      // three times over, because every consumer of `mask` already broadcasts
+      // it: `ApplyGaussianNoise` leaves the latent at `clean`, so
+      // `noise_scale=0.0` needs no separate branch; `TimestepsFromMask` yields
+      // per-token timestep 0, so the DiT sees the audio as clean conditioning;
+      // and the STEP cannot move the latent either.
+      //
+      // That third one holds by a DIFFERENT argument on each stepper arm, and
+      // "`PostProcessLatent` blends it back every step" — which this comment
+      // used to say — is true of only one of them. On `kEulerAncestral` the
+      // stepped latent IS passed back through `PostProcessLatent`, which
+      // restores `clean` wherever the mask is 0. The plain `kEuler` arm never
+      // calls it, and does not need to: `a_denoised` is itself post-processed,
+      // so on a frozen stream `a_denoised == clean == latent`, the Euler
+      // derivative `d = (x - denoised) / sigma` is exactly 0, and
+      // `x + (sigma_next - sigma) * d` returns `x` unchanged. Two arms, two
+      // reasons, one invariant — and the weaker one is the one that had to be
+      // written down, because a reader who checks the strong claim against
+      // `kEuler` finds no `PostProcessLatent` there and concludes the freeze
+      // leaks.
+      //
+      // The SECOND half — the scalar `Modality.sigma` —
+      // is not expressible through the mask and is applied at the forward
+      // below; upstream's parenthesis says exactly that the two are different.
+      audio.mask.assign(static_cast<size_t>(audio.tokens), audio_frozen ? 0.0F : 1.0F);
       const std::vector<float> timings = Ltx2AudioPatchTimings(ashape, Ltx2AudioPatchifierParams{});
       audio.positions.assign(timings.begin(), timings.end());
     }
+
+    im.trace.audio_conditioned = !a2v_audio_volume.empty();
+    im.trace.audio_tokens = audio.tokens;
 
     // ── the image conditioning (issue #644) ─────────────────────────────────
     //
@@ -1711,6 +1892,23 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     ApplyGaussianNoise(audio, state_noise.Draw(static_cast<int64_t>(audio.latent.size())),
                        noise_scale);
 
+    // The audio arm of the trace (#922), read AFTER the noiser and off the mask
+    // the loop will actually use.
+    //
+    // BOTH OF THOSE ARE THE POINT, and neither was true when this block sat
+    // above the noiser and reported the REQUEST's `audio_frozen` flag. MEASURED:
+    // with the trace there, a mutation that never zeroed the denoise mask —
+    // i.e. that noised and denoised the caller's take instead of holding it —
+    // left this suite at 3 cases / 51 assertions / exit 0. The digest was taken
+    // before the noise it was supposed to detect, and the flag restated the
+    // request rather than observing the state. Reading the mask makes the
+    // instrument answer the question the freeze claim actually makes.
+    im.trace.audio_frozen =
+        !audio.mask.empty() &&
+        std::all_of(audio.mask.begin(), audio.mask.end(), [](float m) { return m == 0.0F; });
+    im.trace.audio_latent_digest = DigestF32(audio.latent);
+    im.trace.audio_latent_absmax = AbsMax(audio.latent);
+
     // ── the schedule ────────────────────────────────────────────────────────
     std::vector<float> sigmas = phase.sigmas;
     if (sigmas.empty()) {
@@ -1802,7 +2000,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       ain.context_tokens = context_tokens;
       ain.latent = audio.latent.data();
       ain.timesteps = a_timesteps.data();
-      ain.sigma = &sigma_row;
+      // The SECOND half of upstream's `frozen` (utils/types.py:104-106): the
+      // per-modality scalar sigma is forced to 0, "not only per-token
+      // timesteps". The zeroed denoise mask above already carries the per-token
+      // half through `TimestepsFromMask`, and this scalar is a separate input to
+      // the DiT that the mask cannot reach. Leaving it at the schedule's sigma
+      // would tell the model the audio it is conditioning on is noisy when it is
+      // the caller's own clean take — a wrong conditioning signal that still
+      // renders a finished clip.
+      const float audio_sigma_row = audio_frozen ? 0.0F : sigma_row;
+      ain.sigma = &audio_sigma_row;
+      // Observed, not asserted in prose: see `audio_sigma_max` in the header for
+      // the mutation that survived while this was only a comment.
+      im.trace.audio_sigma_max =
+          std::max(im.trace.audio_sigma_max, static_cast<double>(audio_sigma_row));
       ain.positions = audio.positions.data();
       ain.context = audio_context;
 
@@ -2038,12 +2249,32 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         rendered_channels = chunk.frames.channels;
       });
 
-  const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
-      im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
+  // ── the soundtrack ────────────────────────────────────────────────────────
+  //
+  // On the AUDIO-TO-VIDEO path the caller's own take is returned UNCHANGED, and
+  // the audio VAE decode and the vocoder do not run at all. Upstream says why in
+  // as many words: "Return the original input audio instead of VAE-decoded audio
+  // to preserve fidelity" (a2vid_two_stage.py:301-303). The latent was frozen
+  // all the way through, so the reconstruction could at best equal the file the
+  // caller already has, and in practice loses an encode and a vocoder pass to
+  // it. Skipping the chain is upstream's behaviour, not an optimisation.
+  int64_t audio_channels = 0;
   int64_t audio_samples = 0;
-  const std::vector<float> waveform =
-      Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data, mel.channels,
-                                mel.frames, mel.mel_bins, &audio_samples);
+  int64_t audio_rate = 0;
+  std::vector<float> waveform;
+  if (!a2v_audio_volume.empty()) {
+    waveform = a2v_source.samples;
+    audio_channels = a2v_source.channels;
+    audio_samples = a2v_source.samples_per_channel;
+    audio_rate = a2v_source.sample_rate;
+  } else {
+    const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
+        im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
+    waveform = Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data,
+                                         mel.channels, mel.frames, mel.mel_bins, &audio_samples);
+    audio_channels = mel.channels;
+    audio_rate = im.vocoder_cfg.output_sampling_rate;
+  }
 
   VideoResult result;
   result.frame_dir = gen.output_dir;
@@ -2058,13 +2289,12 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   }
   result.audio_path = JoinPath(gen.output_dir, "audio.wav");
   WriteFileBytes(result.audio_path,
-                 MiniMaxH3WriteWav(waveform, mel.channels, audio_samples,
-                                   im.vocoder_cfg.output_sampling_rate));
+                 MiniMaxH3WriteWav(waveform, audio_channels, audio_samples, audio_rate));
   result.frame_count = rendered_frames;
   result.width = rendered_w;
   result.height = rendered_h;
   result.fps = static_cast<int64_t>(std::llround(fps));
-  result.sample_rate = im.vocoder_cfg.output_sampling_rate;
+  result.sample_rate = audio_rate;
 
   MiniMaxH3MuxRequest mux;
   mux.frame_pattern = JoinPath(gen.output_dir, "frame_%06d.ppm");

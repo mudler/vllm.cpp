@@ -69,6 +69,11 @@ unchanged. The pull request body is then held to exactly the rule its landed
 commit will be held to, by the same code, which is the only way the two cannot
 drift.
 
+**`AGENTS.md` records that the setting is part of the contract.** No gate can
+hold it: reading a repository setting needs a network call, and no checker here
+may make one. The note sits in the landing section and names the failure to look
+for, so a silent revert is diagnosed by reading rather than rediscovered.
+
 **CI validates the body on the pull request lane.** The existing trailer step
 gains a branch that writes `github.event.pull_request.body` to a file and runs
 the new mode. It is skipped on the push lane, where there is no body.
@@ -80,7 +85,7 @@ checker, which is what stops the template and the rule from drifting apart.
 
 ## Scope
 
-In scope: `.github/pull_request_template.md`, `scripts/check-commit-trailers.py`
+In scope: `AGENTS.md` (the landing note), `.github/pull_request_template.md`, `scripts/check-commit-trailers.py`
 (one new argument, no rule change), `.github/workflows/ci.yml` (one step),
 `tests/scripts/test_check_commit_trailers.py`, and the issue index rows.
 

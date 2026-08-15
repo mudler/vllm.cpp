@@ -415,6 +415,20 @@ Merge each verified pull request in the current session. Close an obsolete pull
 request and record the reason. Never end a session with a verified, unmerged
 pull request.
 
+**The pull request body is the landed commit message.** The repository sets
+`squash_merge_commit_message = PR_BODY`, so write the body to the same standard
+as a commit message and end it with the trailer block below. This setting is
+part of the contract, not a convenience. Under the previous `COMMIT_MESSAGES`
+value GitHub wrote a `---------` separator between the concatenated commit
+messages, and on a multi-commit squash the last one fell between the trailer
+block and the `Co-authored-by:` line GitHub appends. That orphaned the block,
+and the gate reported trailers the commit plainly carried as missing.
+
+No gate can hold that setting, because reading it needs a network call and no
+checker here may make one. If the landed commits start failing the trailer gate
+again, read the setting first. `tests/scripts/test_check_commit_trailers.py`
+pins both squash shapes, so the difference between them is executable.
+
 Every commit contains a bare `FOLLOWING_AGENTS_PROTOCOL` paragraph and these
 trailers:
 

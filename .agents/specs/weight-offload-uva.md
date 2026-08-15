@@ -328,6 +328,35 @@ hardware we do not have, which is the opposite balance from
 
 ## Now
 
+**HARDWARE VERIFIED 2026-08-15 on dgx.casa (GB10, sm_121a).** Everything from
+W0a to the totality guard had been proven on CPU only. A full CUDA build
+(cmake 3.28.3, nvcc 13.0.88, `-DVLLM_CPP_CUDA_ARCHITECTURES=121a
+-DVLLM_CPP_TRITON=ON -DVLLM_CPP_CUTLASS_FETCH=ON`) passed the degraded-build
+guards, so it carries CUTLASS NVFP4 and FP8, marlin-nvfp4, Triton AOT sm_121a
+and FlashAttention-2 rather than the silent fallbacks that have voided work on
+this box before.
+
+The row's own tests pass: `test_weight_offloader` 78 of 78,
+`test_weight_offload_policy` 47 of 47, `test_offload_config` 126 of 126. Those
+assertion counts are IDENTICAL to the CPU run, which is the check that the same
+cases ran rather than a subset being filtered out.
+
+Inertness: 444 of 451 test binaries pass. Two of the seven that do not exit 77
+with zero assertions, because the tree was transferred with `git archive` and
+carries no checkpoints. The other five were proven PRE-EXISTING by a control
+build at `10b8bbdaa`, the commit before this row's first code change, verified
+to contain zero weight-offload files. The control reproduces all five with the
+same exit codes, the same assertion counts and the same crash site, including
+`test_capi`'s SIGSEGV in an ABI v8 custom-logits-processor case. Recorded as
+issue #907.
+
+The verification took five attempts and four failed for environmental reasons
+rather than code: a link with no `libcuda.so.1` because the build container had
+no `--gpus`, a test stage made VOID by a suppressed apt failure that hid a
+missing `ctest`, an OOM kill at `-j16` under another session's 67 GiB GPU job,
+and an apt abort because the container had no network. Each would have read as a
+verdict about this row if its exit status had been taken at face value.
+
 `ACTIVE` since 2026-08-14 (`CLAIM-WEIGHT-OFFLOAD-W0A`). **W0a landed**: the
 config surface — the backend enum, both sub-configs with upstream's bounds and
 defaults, `Validate()` carrying the two hard errors and the three collected

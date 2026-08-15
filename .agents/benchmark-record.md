@@ -21839,3 +21839,78 @@ the legs with `clocks_event_reasons.active = 0x0`, one boot id
 `03717c9d-63c8-4652-a8fe-a63d012c5718`, persistence mode Disabled. 2184 MHz is
 the same clock the existing clock-controlled 27B and 35B grids were taken at, so
 those are comparable to this one.
+## Q38-27B-BF16 SSE KEEPALIVE A/B — the #915 dropped requests were our own comment frame, and the cold-start cell is not like-for-like (2026-08-15, `row/FIX-SERVER-CONCURRENCY-931`, GB10 sm_121a, #931, #915)
+
+ONE VARIABLE, on the BYTE-IDENTICAL #915 binary (`vllm-server` md5
+`bda95d34a7e2587c6e2195e365f77bc0`), same workload, same box, clocks flat at
+2184 MHz. Evidence at `dgx:~/fix931/out_noping_run1/`.
+
+| leg | keepalive ON (the old default) | `VT_SERVER_SSE_PING_S=0` |
+|---|---|---|
+| c1 | 5 of 6, failed 1 (index 0) | 6 of 6, failed 0 |
+| c8 | 37 of 48, failed 11 | 48 of 48, failed 0 |
+
+Server log 27 lines in all four legs, `diff` empty throughout. All 12 failures
+across both default-arm legs carry ONE distinct error string, byte-identical to
+the single-comment-frame signature reproduced over a socket without a GPU:
+`Never received a valid chunk to calculate TTFT.This response will be marked as
+failed!`. c8 reproduces #915 (37/11 here against 36/37/36 and 12/11/12 there).
+The keepalive is CAUSAL AT BOTH CONCURRENCIES; c8 is not a second defect.
+
+THROUGHPUT, INDICATIVE ONLY, NOT #915'S RE-RUN. Single unpaired legs, and the
+vLLM arm was NOT re-run, so the denominators are #915's. This is not the paired
+interleaved 3-rep protocol and must never be quoted as if it were.
+
+| leg | default | no-ping | ratio then -> now |
+|---|---:|---:|---|
+| c1 output tok/s | 2.3954 | 2.8553 | 0.675x -> 0.816x |
+| c8 output tok/s | 16.4185 | 21.0875 | 0.572x -> 0.757x |
+
+#915's c1 and c8 cells stay WITHHELD. Both remain REAL GAPS once honest: 0.816x
+and 0.757x are not parity. The fix makes the numbers honest, not good. It stops
+us deleting our own slowest requests from a measurement taken with vLLM's own
+client, and what is left is the deficit that was underneath.
+
+WHAT THE IMPUTATION COST, kept because it prices the technique. Before per-request
+data existed, failed-request TTFTs were imputed by treating the leg's wall
+duration as a slot budget. Measured against that imputation:
+
+| leg | imputed | measured | error |
+|---|---|---|---|
+| c1 | 93.9 s | 91.613 s | +2.5% |
+| c8 | 47.0 / 47.5 / 46.7 s | 33.8-40.8 s | +25% to +40% |
+
+At c1 the semaphore serialises and the arithmetic was nearly exact. At c8 it
+assumed perfectly packed slots and ran 25-40% high. The claim it supported, that
+"the 15 s threshold separates the two populations exactly, in every leg, in all
+three repeats", OVERCLAIMED and is withdrawn. A later retraction saying the
+threshold "neither predicts failure nor follows from it" UNDERCLAIMED. Measured:
+failure implies TTFT > 15 s in 11 of 11; TTFT > 15 s implies failure in 11 of 12.
+Index 1 SURVIVED at 38.58 s (43.88 s in the default arm) and is UNEXPLAINED.
+The trigger is not TTFT: the ping bounds a wait on ONE REQUEST'S COLLECTOR, and
+the stream loops on empty-but-unfinished outputs (`serving_completion.cpp:73-89`),
+so a long prefill that keeps yielding intermediate entries never pings.
+
+COLD START, 53 s vs 780 s = 14.7x, NEEDS A CAVEAT AND KEEPS ITS VALUE. The two
+servers answer `/health` at different points in startup, so the ratio compares
+two different quantities. Ours returns an unconditional 200
+(`api_server.cpp:286-294`, "process liveness only"); weights load before the
+socket listens, but there is no dummy run, no kernel warmup, and the decode CUDA
+graph captures once per padded batch size on the first pure-decode step
+(`runner.cpp:1329-1334`). vLLM runs `compile_or_warm_up_model` (dummy runs,
+`kernel_warmup`, `capture_model`, `gpu_worker.py:697-708`) inside the engine
+client's construction, BEFORE the app is served (`api_server.py:780-785`), and
+its `/health` additionally calls `check_health()`
+(`serve/instrumentator/health.py:22-33`). So 53 s is "process up, weights
+loaded" and 780 s is "process up, weights loaded, warmed and graph-captured".
+
+CONFIRMED, and NOT caused by the keepalive: `ttfts[0] = 91.613 s` appears in BOTH
+arms, so the first request's cost is genuine first-inference work our readiness
+signal does not wait for. Likewise the c8 tail, 11 requests at 33.8-40.8 s, is a
+real scheduling tail the keepalive was DELETING from the measurement rather than
+causing. Both are now reported.
+
+UNVERIFIED, stated so it is not re-derived as fact: whether dropping the page
+cache before every leg makes the first request fault in the ~55 GB of weights.
+The loader runs before `listen`, so the read is nominally inside the 53 s; no
+claim here depends on the answer.

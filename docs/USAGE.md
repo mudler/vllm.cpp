@@ -2590,6 +2590,19 @@ Comment frames are not `data:` events and carry no tokens. Token streaming uses
 a timed wait on the request collector either way, so deltas are never collapsed
 by a poll loop.
 
+**A value the server cannot parse disables the keepalive; it is not an error.**
+`VT_SERVER_SSE_PING_S=fifteen`, an empty value and an unset variable all resolve
+to `0`, so if you enable this and no comment frames appear, check the spelling
+before looking anywhere else. The fallback points at OFF deliberately: under the
+previous default a typo silently switched the keepalive ON, and that is the
+direction that costs you requests.
+
+**The interval bounds silence on one request's stream, not its time to first
+token.** Each wait restarts whenever anything reaches that request, so a long
+prefill that keeps producing intermediate results never pings however long its
+first token takes, while a request whose stream goes quiet for the whole
+interval does.
+
 ## Gemma4 FP8 on ROCm (RDNA4)
 
 Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via

@@ -81,9 +81,15 @@ class RequireCompleteRequestSetTest(unittest.TestCase):
             )
 
     def test_failed_is_refused_even_when_completed_matches(self):
-        # The pinned client counts a request that never yielded a parseable
-        # chunk as failed while `completed` can still name the requests it
-        # measured. Either counter alone is enough to void the leg.
+        # BELT AND BRACES, and recorded as such. At the pin this record shape
+        # cannot occur: `completed` counts only successes (serve.py:618) and
+        # `failed = len(failed_outputs)` (:728), so `completed + failed ==
+        # num_prompts` identically and a non-zero `failed` always drags
+        # `completed` below `num_prompts`. The guard reads `failed` anyway,
+        # because it is cheap and because the client's schema is not ours to
+        # pin: a future counter that reports both independently must not be
+        # able to walk past a non-zero `failed` on the strength of a matching
+        # `completed`.
         record = _serve_record()
         record["failed"] = 1
         with self.assertRaisesRegex(HarnessError, "partial"):
@@ -217,6 +223,54 @@ class ClosedLoopDerivationTest(unittest.TestCase):
     def test_a_complete_set_is_accepted(self):
         vllm_closed_loop_metrics.require_every_request_returned(
             records=[{}, {}, {}], expected_requests=3
+        )
+
+    @staticmethod
+    def _closed_loop_record(*, output_len: int = OUTPUT_LEN) -> dict:
+        """One returned request, in `run_closed_loop`'s record schema."""
+
+        return {
+            "arrival_s": 0.0,
+            "first_token_s": 0.1,
+            "last_token_s": 1.0,
+            "completion_s": 1.0,
+            "itls_s": [0.01] * (output_len - 1),
+            "output_token_ids": list(range(output_len)),
+            "core_ttft_s": 0.05,
+        }
+
+    def _derive(self, records, prompt_count: int):
+        return vllm_closed_loop_metrics.derive_metrics(
+            records,
+            [[7] * INPUT_LEN for _ in range(prompt_count)],
+            10.0,
+            output_len=OUTPUT_LEN,
+            max_concurrency=1,
+            async_scheduling="default",
+        )
+
+    def test_derive_metrics_refuses_a_partial_record_set(self):
+        # The two cases above call the guard by hand, which proves the guard
+        # works and nothing about whether the tool reaches it. Deleting the
+        # call from `derive_metrics` left all 328 tool tests green (#931
+        # review). This is the case that goes red instead: two records
+        # returned where three prompts were submitted, and without the guard
+        # the tool happily divides three prompts' input tokens by a duration
+        # that spans a request it never got back.
+        with self.assertRaisesRegex(RuntimeError, "partial"):
+            self._derive([self._closed_loop_record()] * 2, prompt_count=3)
+
+    def test_derive_metrics_computes_a_complete_record_set(self):
+        # The complementary half: the guard must not refuse a whole set, or
+        # the case above would pass against a tool that refuses everything.
+        result, token_ids = self._derive(
+            [self._closed_loop_record()] * 3, prompt_count=3
+        )
+        self.assertEqual(result["successful_requests"], 3)
+        self.assertEqual(len(token_ids), 3)
+        self.assertAlmostEqual(result["request_throughput"], 0.3)
+        self.assertAlmostEqual(
+            result["input_token_throughput"], 3 * INPUT_LEN / 10.0
         )
 
 

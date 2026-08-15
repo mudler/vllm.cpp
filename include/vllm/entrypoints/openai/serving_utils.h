@@ -37,7 +37,12 @@ namespace vllm::entrypoints::openai {
 std::string SanitizeUtf8(const std::string& s);
 
 // SSE comment keepalives while the stream is silent (long prefill / TTFT).
-// VT_SERVER_SSE_PING_S: seconds between pings; default 15; <=0 disables.
+// VT_SERVER_SSE_PING_S: seconds between pings; DEFAULT 0 — OFF (#931); <=0,
+// unset and unparsable all disable; a positive value is capped at 600.
+// Off is the default because vLLM emits no comment frame from any streaming
+// endpoint, and vLLM's own `vllm bench serve` marks a request FAILED when one
+// arrives ahead of its first data frame. The full reason, and what it cost, is
+// at the definition in serving_utils.cpp.
 int SsePingIntervalSec();
 inline constexpr const char kSsePingFrame[] = ":\n\n";
 

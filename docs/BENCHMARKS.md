@@ -200,7 +200,9 @@ record. The same P0 hit classic dense `Qwen3ForCausalLM` (quant-independent), fi
 | Median E2EL, over completed only | 1.003x | 0.974x | 0.983x |
 | ours / vLLM output tok/s | 2.37 / 3.50 | 15.01 / 15.58 | 15.96 / 27.85 |
 | ours / vLLM median TPOT ms | 220.6 / 223.6 | 239.0 / 234.3 | 261.1 / 241.4 |
-| Cold start to first `/health` | **53 s vs 780 s = 14.7x**, medians of 3 (ours 53/53/53, vLLM 786/780/771) | same binary | same binary |
+| Cold start to first `/health` | **53 s vs 780 s = 14.7x**, medians of 3 (ours 53/53/53, vLLM 786/780/771), NOT like-for-like readiness (next two rows) | same binary | same binary |
+| Why that ratio is not like-for-like | ours answers `/health` on process liveness only (`api_server.cpp:286-294`); no dummy run, no kernel warmup, decode CUDA graph captures lazily on first use | vLLM warms up and captures before it serves (`gpu_worker.py:697-708`, `api_server.py:780-785`) | 53 s is "weights loaded", 780 s is "warmed and graph-captured" |
+| What our readiness signal defers | first request TTFT **91.613 s**, the same with the SSE keepalive on and off, so it is genuine first-inference cost, not the [#931](https://github.com/mudler/vllm.cpp/issues/931) defect | cell stands as measured; a like-for-like comparison has not been taken | forensics in `.agents/benchmark-record.md` |
 | Host memory after warmup | **42.5 vs 110.1 GiB = 2.59x**, but vLLM's is set by `--gpu-memory-utilization 0.85` pre-reserving KV, so it is what the configured engine holds, not what the model needs | | |
 | Why only c4 counts | `output_throughput` divides tokens by a wall duration that still contains the dead request, so a cell where one arm dropped requests is withheld, not quoted | 3 paired reps, clocks 2184 MHz | token gate: 4/7 strict, 3 exact fp32 ties ([#915](https://github.com/mudler/vllm.cpp/issues/915)) |
 

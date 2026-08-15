@@ -17,7 +17,7 @@ Run both arms (the oracle venv supplies the client; nothing here needs a GPU):
       --save-result --save-detailed --result-dir <out> \
       --result-filename noping.json --disable-tqdm
 
-    # ... and again with --comment-on 1 (ordinal 0 is the client's own test run).
+    # ... and again with --comment-on 1 (see --comment-on below for the ordinals).
 
 Measured on 2026-08-15 against `0.23.1rc1.dev1511+g555967922`:
 
@@ -40,8 +40,16 @@ own HTTP chunk because cpp-httplib writes one chunk per content-provider call
 (api_server.cpp:976-1006) and TCP_NODELAY is on (api_server.cpp:80).
 
 --comment-on N: emit ONE comment frame immediately before the first data frame
-of request ordinal N (0 is the client's own initial test run). Anything else is
-byte-identical between the two arms.
+of request ordinal N. Anything else is byte-identical between the two arms.
+
+Ordinal N counts the connections this server accepts, and under the recipe
+above ordinal 0 is the client's FIRST TIMED REQUEST -- not an untimed test run.
+At the pin `--ready-check-timeout-sec` defaults to 0, so the initial test
+request is skipped ("Skipping endpoint ready check.", serve.py:857-872), and
+`--num-warmups` defaults to 0, so no warmup request is issued (:875-899); the
+recipe passes neither flag. Pass either one and every ordinal shifts. The
+measurement above is unaffected: it was taken with `--comment-on 1`, which is
+the second timed request, and the failure it recorded is at index 1.
 """
 import argparse
 import json

@@ -1573,7 +1573,7 @@ prefill TTFT 0.944x (c1); 35B decode TPOT **0.995x** (c1) and **0.946x** (c4),
 prefill TTFT 0.920x (c1) and 0.849x (c4). 27B c16 is **VOID, not a number**: our
 arm completed 93 of 96 requests where the pin completed 96 of 96 and the three
 missing are the SLOWEST, because our SSE keepalive (`VT_SERVER_SSE_PING_S`,
-default 15 s) was ENABLED on every leg
+then-default 15 s, now OFF per #931) was ENABLED on every leg
 ([#577](https://github.com/mudler/vllm.cpp/issues/577)). 35B c16 TPOT and TTFT
 are NOT ESTABLISHED (6.8% and 15.0% leg spread). Forensics in
 [the benchmark record](../.agents/benchmark-record.md).

@@ -38,6 +38,7 @@
 
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "vllm/config/offload.h"
 #include "vllm/model_executor/weight_offload_policy.h"
@@ -91,6 +92,12 @@ class WeightOffloader {
   // same total once at the end of wrap_modules (uva.py:57-61).
   virtual int64_t offloaded_bytes() const = 0;
 
+  // How many weights this offloader was ASKED about. It is the evidence that a
+  // loader which declares `supports_weight_offload` actually consulted the
+  // seam. A model can declare the capability and then never ask, and without
+  // this counter that lie is invisible: the run simply offloads nothing.
+  virtual int64_t weights_considered() const = 0;
+
   virtual bool moves_weights() const = 0;
 };
 
@@ -101,11 +108,16 @@ class NoopWeightOffloader final : public WeightOffloader {
   // Every weight stays resident, so the engine's existing path is unchanged BY
   // CONSTRUCTION rather than by a flag a caller has to remember to check.
   WeightOffloadDecision ConsiderWeight(const std::string&, int64_t) override {
+    ++considered_;
     return WeightOffloadDecision::kBudgetExhausted;
   }
   const char* name() const override { return "NoopWeightOffloader"; }
   int64_t offloaded_bytes() const override { return 0; }
+  int64_t weights_considered() const override { return considered_; }
   bool moves_weights() const override { return false; }
+
+ private:
+  int64_t considered_ = 0;
 };
 
 // Upstream: class UVAOffloader (offloader/uva.py:21-137). The concrete arm that
@@ -128,10 +140,12 @@ class UvaWeightOffloader final : public WeightOffloader {
 
   WeightOffloadDecision ConsiderWeight(const std::string& canonical_name,
                                        int64_t bytes) override {
+    ++considered_;
     return policy_.Consider(canonical_name, bytes);
   }
   const char* name() const override { return "UvaWeightOffloader"; }
   int64_t offloaded_bytes() const override { return policy_.offloaded_bytes(); }
+  int64_t weights_considered() const override { return considered_; }
   bool moves_weights() const override { return policy_.active(); }
 
   // Upstream logs the total once when wrap_modules finishes (uva.py:57-61). We
@@ -141,6 +155,7 @@ class UvaWeightOffloader final : public WeightOffloader {
 
  private:
   WeightOffloadPolicy policy_;
+  int64_t considered_ = 0;
 };
 
 // Upstream: get_offloader / set_offloader and the module-global `_instance`
@@ -171,6 +186,34 @@ struct WeightOffloaderChoice {
   std::string selected_backend_pending;
 };
 WeightOffloaderChoice CreateWeightOffloader(const OffloadConfig& config);
+
+// THE TOTALITY GUARD. Throws std::invalid_argument when `config` would offload
+// a weight but `supports_weight_offload` is false for the resolved model.
+//
+// This exists because there is no single upload seam to enforce the obligation
+// structurally: each model allocates its own device buffers. Without the guard,
+// a model nobody wired accepts a budget and keeps every weight on the device,
+// with no error anywhere. Refusing names the architecture, which is what turns
+// an invisible memory bug into a message the operator can act on.
+//
+// Mirrors the project rule that an unimplemented arm is refused with a message
+// naming the missing piece, rather than silently doing nothing.
+void RefuseUnsupportedWeightOffload(const OffloadConfig& config,
+                                    std::string_view architecture,
+                                    bool supports_weight_offload);
+
+// THE SECOND HALF OF THE GUARD, checked after the model is loaded. A model can
+// declare `supports_weight_offload` and then never call `ConsiderWeight`, and
+// the first guard cannot see that lie: the run just offloads nothing. Throws
+// std::invalid_argument when the offloader would move weights, the model
+// declared support, and it was asked about ZERO weights.
+//
+// Zero is the only value that proves a defect. Any other count means the loader
+// consulted the seam, and whether it asked about every weight is the loader's
+// own test to make.
+void VerifyWeightOffloadWasConsulted(const WeightOffloader& offloader,
+                                     std::string_view architecture,
+                                     bool supports_weight_offload);
 
 }  // namespace vllm
 

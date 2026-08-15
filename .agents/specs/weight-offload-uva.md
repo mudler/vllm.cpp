@@ -366,9 +366,35 @@ UPDATED rather than deleted. It encoded W1's state, where neither backend
 existed. The expectation moved and the assertion stayed, because that assertion
 is what the two engine messages rest on.
 
+**The totality guard landed** (2026-08-15), which is what makes the remaining
+W2c work mechanical and safe. The cost recorded earlier was real: residency is
+decided in several loaders, there is no single upload helper, and
+`load_stats::AddDeviceUpload` reaches only 9 call sites in 6 files, so neither
+is a chokepoint that could enforce the obligation structurally. A model whose
+loader was never wired would have accepted a budget and kept every weight on the
+device with no error anywhere.
+
+`ModelFactory::supports_weight_offload` now declares the capability and DEFAULTS
+TO FALSE, which is the mechanism rather than a convenience. The engine refuses a
+configured offload against a model that does not claim support, before any
+weight I/O, naming the architecture. A new model inherits false and is refused
+until someone wires it. That is the same polarity as the `-Werror=switch`
+totality proof in `gguf_keep_quant.cpp`, expressed at run time because there is
+no enum to switch over.
+
+A second guard catches the lie the first cannot see: a model that DECLARES
+support and then never calls `ConsiderWeight`. Zero consulted weights is the
+only count that proves a defect, and it is reported as a defect in that loader
+rather than as a configuration error.
+
+A test pins that NO model declares support yet. When the first loader is wired
+that test fails, and whoever wired it must come back and say which model
+changed.
+
 Still owed for W2 (W2c): the first loader that asks `ConsiderWeight` and honours
 the answer, plus the pinned-host-copy and device-view halves of upstream's arm
-(uva.py:97-105), which belong to whoever owns the buffer.
+(uva.py:97-105), which belong to whoever owns the buffer. Neither has been
+verified on a device: dgx.casa was unreachable throughout this work.
 
 **W1 landed** (2026-08-14): the offloader seam. `WeightOffloader` interface,
 `NoopWeightOffloader` default, the process-global `Get`/`SetWeightOffloader`,

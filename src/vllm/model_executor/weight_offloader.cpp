@@ -2,6 +2,8 @@
 #include "vllm/model_executor/weight_offloader.h"
 
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace vllm {
@@ -65,6 +67,33 @@ WeightOffloaderChoice CreateWeightOffloader(const OffloadConfig& config) {
   // honoured.
   choice.selected_backend_pending = offload_backend_str(*backend);
   return choice;
+}
+
+void RefuseUnsupportedWeightOffload(const OffloadConfig& config,
+                                    std::string_view architecture,
+                                    bool supports_weight_offload) {
+  if (!config.is_offloading_enabled()) return;
+  if (supports_weight_offload) return;
+  throw std::invalid_argument(
+      "weight offload is configured but architecture \"" +
+      std::string(architecture) +
+      "\" does not support it: its loader does not consult the weight "
+      "offloader, so every weight would stay on the device and the budget "
+      "would free nothing (ENG-WEIGHT-OFFLOAD W2c). Remove --offload-config, "
+      "or wire this model's loader.");
+}
+
+void VerifyWeightOffloadWasConsulted(const WeightOffloader& offloader,
+                                     std::string_view architecture,
+                                     bool supports_weight_offload) {
+  if (!offloader.moves_weights()) return;
+  if (!supports_weight_offload) return;
+  if (offloader.weights_considered() > 0) return;
+  throw std::invalid_argument(
+      "architecture \"" + std::string(architecture) +
+      "\" declares supports_weight_offload but its loader asked the weight "
+      "offloader about ZERO weights, so the configured budget freed nothing. "
+      "This is a defect in that loader, not a configuration error.");
 }
 
 }  // namespace vllm

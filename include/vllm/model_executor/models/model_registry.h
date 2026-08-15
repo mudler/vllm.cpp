@@ -352,6 +352,23 @@ struct ModelFactory {
   // per-tensor stage-and-release; Kimi-Linear's 91.5 GiB bf16-resident loader).
   // Default false: every existing arch's engine load path is byte-identical.
   bool stage_on_load = false;
+  // ENG-WEIGHT-OFFLOAD: whether THIS model's loader asks
+  // `WeightOffloader::ConsiderWeight` for each weight and honours the answer.
+  //
+  // THE DEFAULT IS FALSE, AND THAT IS THE MECHANISM. There is no single upload
+  // helper in this tree: each model allocates its own device buffers, and
+  // `load_stats::AddDeviceUpload` reaches only 9 call sites in 6 files, so
+  // neither is a chokepoint that could enforce this. A model whose loader was
+  // never wired would therefore accept a `cpu_offload_gb` and silently keep
+  // every weight on the device, which is a memory bug with no error anywhere.
+  //
+  // Declaring the capability makes that case LOUD instead: the engine refuses a
+  // configured offload against a model that does not claim support, naming the
+  // architecture. A new model inherits false and is refused until someone wires
+  // it, which is the same polarity as the `-Werror=switch` totality proof in
+  // `gguf_keep_quant.cpp`, expressed at run time because there is no enum to
+  // switch over.
+  bool supports_weight_offload = false;
 };
 
 struct ModelRegistration {

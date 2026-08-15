@@ -21,6 +21,7 @@
 #include <doctest/doctest.h>
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "vllm/config/offload.h"
@@ -60,6 +61,7 @@ class CountingOffloader final : public WeightOffloader {
   bool moves_weights() const override { return true; }
 
   int64_t offloaded_bytes() const override { return bytes_seen; }
+  int64_t weights_considered() const override { return considered; }
 
   int prepared = 0;
   int considered = 0;
@@ -286,4 +288,94 @@ TEST_CASE("prefetch is still reported as a backend this build lacks") {
   REQUIRE(c.offloader != nullptr);
   CHECK(std::string(c.offloader->name()) == "NoopWeightOffloader");
   CHECK(c.selected_backend_pending == "prefetch");
+}
+
+TEST_CASE("the totality guard refuses an offload the model cannot honour") {
+  // THE POINT OF THE GUARD. There is no single upload seam in this tree, so a
+  // model whose loader was never wired would accept a budget and keep every
+  // weight on the device with no error anywhere. That is a memory bug the
+  // operator cannot see, and the guard converts it into a refusal that names
+  // the architecture.
+  OffloadConfig on;
+  on.uva.cpu_offload_gb = 4.0;
+  on.Validate();
+
+  // Unsupported model + configured offload => refused.
+  CHECK_THROWS_AS(
+      vllm::RefuseUnsupportedWeightOffload(on, "Qwen3MoeForCausalLM", false),
+      std::invalid_argument);
+
+  // Supported model => allowed through.
+  CHECK_NOTHROW(
+      vllm::RefuseUnsupportedWeightOffload(on, "Qwen3MoeForCausalLM", true));
+
+  // No offload configured => never refused, whatever the model declares. This
+  // is what keeps every existing engine path untouched.
+  OffloadConfig off;
+  CHECK_NOTHROW(vllm::RefuseUnsupportedWeightOffload(off, "AnyArch", false));
+  CHECK_NOTHROW(vllm::RefuseUnsupportedWeightOffload(off, "AnyArch", true));
+
+  // A backend selected at a ZERO budget would move nothing, so it is not
+  // refused either. Refusing it would train the operator to ignore the message.
+  OffloadConfig zero;
+  zero.offload_backend = OffloadBackend::kUva;
+  zero.Validate();
+  CHECK_FALSE(zero.is_offloading_enabled());
+  CHECK_NOTHROW(vllm::RefuseUnsupportedWeightOffload(zero, "AnyArch", false));
+}
+
+TEST_CASE("the refusal message names the architecture and the reason") {
+  // An operator reading a log needs the model name, not just "unsupported".
+  OffloadConfig on;
+  on.uva.cpu_offload_gb = 1.0;
+  on.Validate();
+  try {
+    vllm::RefuseUnsupportedWeightOffload(on, "DeepseekV4ForCausalLM", false);
+    FAIL("expected a refusal");
+  } catch (const std::invalid_argument& e) {
+    const std::string msg = e.what();
+    CHECK(msg.find("DeepseekV4ForCausalLM") != std::string::npos);
+    CHECK(msg.find("free nothing") != std::string::npos);
+  }
+}
+
+TEST_CASE("the second guard catches a model that declares support and never asks") {
+  // A model can declare the capability and then never call ConsiderWeight. The
+  // first guard cannot see that: the run simply offloads nothing. ZERO is the
+  // only count that proves the defect.
+  UvaWeightOffloader off(WeightOffloadPolicy(1024, {}));
+  CHECK(off.moves_weights());
+  CHECK(off.weights_considered() == 0);
+  CHECK_THROWS_AS(
+      vllm::VerifyWeightOffloadWasConsulted(off, "SomeArch", true),
+      std::invalid_argument);
+
+  // One question is enough to prove the loader consulted the seam. Whether it
+  // asked about EVERY weight is that loader's own test to make.
+  off.ConsiderWeight("mlp.experts.w2_weight", 8);
+  CHECK(off.weights_considered() == 1);
+  CHECK_NOTHROW(vllm::VerifyWeightOffloadWasConsulted(off, "SomeArch", true));
+
+  // A model that does NOT declare support is already refused by the first
+  // guard, so this one stays silent rather than reporting the same fault twice.
+  UvaWeightOffloader other(WeightOffloadPolicy(1024, {}));
+  CHECK_NOTHROW(vllm::VerifyWeightOffloadWasConsulted(other, "SomeArch", false));
+
+  // An offloader that moves nothing is never a defect.
+  NoopWeightOffloader noop;
+  CHECK_NOTHROW(vllm::VerifyWeightOffloadWasConsulted(noop, "SomeArch", true));
+}
+
+TEST_CASE("no model in the tree declares weight-offload support yet") {
+  // The default is false, and that default is the mechanism. This case pins it:
+  // when the first loader is wired, this assertion fails and whoever wired it
+  // must come back here and say which model changed. That is the record the
+  // capability is supposed to leave.
+  int supporting = 0;
+  for (const vllm::ModelRegistration& r : vllm::ModelRegistry::Registrations()) {
+    if (r.factory != nullptr && r.factory->supports_weight_offload) ++supporting;
+  }
+  CHECK_MESSAGE(supporting == 0,
+                "a model now declares supports_weight_offload; update this "
+                "count and the spec's W2c note");
 }

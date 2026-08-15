@@ -1402,6 +1402,16 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   }
   HfConfig config = vllm::LoadHfConfig(config_path);
   const ModelRegistration& registration = ModelRegistry::Resolve(config);
+  // ENG-WEIGHT-OFFLOAD totality guard. Refuse a configured offload against a
+  // model whose loader does not consult the offloader, BEFORE any weight I/O.
+  // Without this the budget would be accepted and free nothing, with no error
+  // anywhere, because there is no single upload seam that could enforce the
+  // obligation structurally.
+  vllm::RefuseUnsupportedWeightOffload(
+      params.offload_config.value_or(vllm::OffloadConfig{}),
+      registration.architecture,
+      registration.factory != nullptr &&
+          registration.factory->supports_weight_offload);
   tok::Tokenizer tokenizer = tok::Tokenizer::FromHfJson(tokenizer_path);
 
   // Shared ownership so a loader may retain the mmap'd shards past the load: the

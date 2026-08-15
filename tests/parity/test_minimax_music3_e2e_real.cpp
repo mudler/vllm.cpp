@@ -51,16 +51,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "npy.h"
+#include "vllm/entrypoints/openai/api_server.h"
+#include "vllm/entrypoints/openai/speech_api.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/minimax_h3.h"
 #include "vllm/model_executor/models/minimax_music3_acoustic.h"
 #include "vllm/model_executor/models/minimax_music3_loader.h"
 #include "vllm/model_executor/models/minimax_music3_speech.h"
+#include "vllm/multimodal/speech_engine.h"
 #include "vt/dtype.h"
 
 namespace fs = std::filesystem;
@@ -516,4 +521,187 @@ TEST_CASE("music3 e2e real: the whole tail reaches waveform.npy from frame_hidde
   CHECK(ReadU16(wav, 22) == kWaveformChannels);
   MESSAGE("full tail WAV: " << wav.size() << " bytes, " << samples << " frames per channel, "
                             << (static_cast<double>(samples) / kSampleRate) << " s");
+}
+
+// ---------------------------------------------------------------------------
+// END TO END: an HTTP request in, a real WAV out (W2's remainder, #672)
+// ---------------------------------------------------------------------------
+//
+// Everything above drives the pipeline's TAIL from the capture's own recorded
+// tensors, because that is the only entry at which it is comparable to the
+// oracle. This case drives the WHOLE thing from a request, which is comparable
+// to nothing — spec §5 and this file's header say why twice over — and so it
+// asserts what a request can honestly be held to: that the stages RUN, that
+// what comes back is real 44100 Hz stereo audio, and that its shape is the one
+// the request asked for.
+//
+// ─── THE REQUEST, AND WHY THIS ONE ──────────────────────────────────────────
+//
+// 0.1 s at 2 denoise steps. Chosen to be the SHORTEST request that still enters
+// every stage, because every stage here is host-side scalar float on CPU (the
+// box the whole row was gated on; dgx.casa was down for all of it):
+//
+//   audio_duration_s 0.1  -> MaxArFrames = int(0.1 * 25 Hz) = 2 frames, so the
+//                            AR loop runs its PRIMING step, one emitting step
+//                            and one more — the feedback path is exercised, not
+//                            just the prefill — and the depth decoder runs 3
+//                            times x 7 codebooks x 2 CFG rows = 42 forwards.
+//   num_inference_steps 2 -> the Euler loop runs MORE THAN ONCE (a 1-step run
+//                            cannot tell a loop from a straight line) at 2 x 2
+//                            guided 2.4B fp32 host forwards.
+//   2 frames              -> ConditionLatentLength = 6, so the vocoder's
+//                            [8,8,4,2] stack emits 6 * 512 = 3072 samples per
+//                            channel, 0.0697 s of audio.
+//   a SHORT prompt        -> the prefill is 2 rows x N tokens through 8.6B and
+//                            is the single largest cost in the run, linear in N.
+//                            The capture's own 61-token prompt costs ~3x this
+//                            one and exercises not one extra line: the prompt's
+//                            CONTENT is gated by test_minimax_music3_llm_real,
+//                            against the oracle, on the capture's own string.
+//
+// A LONGER request changes no code path this one misses: `Music3ChunkPlan` only
+// splits past 200 frames, which is 8 s of audio and hours of scalar CPU, and
+// the multi-window composition is W6's named coverage gap either way.
+//
+// ─── WHY IT GOES THROUGH `handle_audio_speech` ──────────────────────────────
+//
+// Because the claim is about an HTTP request. `ApiServer::handle_audio_speech`
+// is the route's own body: it parses the JSON, applies the
+// `requires_reference_audio` pre-refusal, calls the synthesizer and sets the
+// `audio/wav` content type. The synthesizer it is handed here is
+// `vllm::openai::SynthesizeSpeechRequest` — the SAME function `server_main.cpp`
+// hands it — so nothing on this path is a test-only reimplementation of the
+// server.
+TEST_CASE("music3 e2e real: an HTTP request generates a real 44100 Hz stereo WAV") {
+  if (SkipIfMissing("music3 e2e http")) return;
+  if (SkipIfDitNotRequested("music3 e2e http")) return;
+
+  vllm::multimodal::SpeechRegistry registry;
+  m3::RegisterBuiltinSpeechFamilies(registry);
+  vllm::multimodal::SpeechModelParams model;
+  model.path = CheckpointRoot();
+  std::string why;
+  std::shared_ptr<vllm::multimodal::SpeechEngine> engine = registry.Load(model, &why);
+  REQUIRE_MESSAGE(engine != nullptr, why);
+  CHECK(engine->family() == "minimax-music3");
+
+  // The TASK-CONDITIONAL constructor: a music server has no AsyncLLM, so
+  // /v1/completions and /v1/chat/completions are simply not registered — the
+  // same shape a transcription-only server takes.
+  vllm::entrypoints::openai::OpenAIServingModels models{"minimax-music3"};
+  vllm::entrypoints::openai::ApiServer server{models, "music3-e2e"};
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = engine->family();
+  caps.sample_rate = engine->sample_rate();
+  caps.channels = kWaveformChannels;
+  caps.requires_reference_audio = engine->requires_reference_audio();
+  server.set_synthesizer(
+      [engine](const vllm::openai::SpeechRequest& req) -> vllm::openai::SpeechResponse {
+        return vllm::openai::SynthesizeSpeechRequest(*engine, req);
+      },
+      caps);
+
+  // The body a client posts. `lyrics` and `description` are the two music
+  // inputs; `input` is deliberately absent, because Music3 REFUSES it.
+  const std::string body = R"({
+    "model": "minimax-music3",
+    "lyrics": "[verse]\nMorning light\n",
+    "description": "Genre: acoustic pop. BPM: 96.",
+    "audio_duration_s": 0.1,
+    "num_inference_steps": 2,
+    "seed": 7,
+    "response_format": "wav"
+  })";
+
+  const vllm::entrypoints::openai::ApiServer::DispatchResult response = server.handle_audio_speech(body);
+  MESSAGE("POST /v1/audio/speech -> " << response.status << " " << response.content_type << ", "
+                                      << response.body.size() << " bytes");
+  REQUIRE_MESSAGE(response.status == 200, response.body);
+  CHECK(response.content_type == "audio/wav");
+
+  // ── the RIFF header ──────────────────────────────────────────────────────
+  const std::string& wav = response.body;
+  REQUIRE(wav.size() > 44);
+  CHECK(wav.compare(0, 4, "RIFF") == 0);
+  CHECK(wav.compare(8, 4, "WAVE") == 0);
+  CHECK(ReadU16(wav, 20) == 1);                      // PCM
+  CHECK(ReadU16(wav, 22) == kWaveformChannels);      // STEREO
+  CHECK(ReadU32(wav, 24) == kSampleRate);            // 44100, spec §1.1
+  CHECK(ReadU16(wav, 34) == 16);                     // 16-bit
+  CHECK(ReadU16(wav, 32) == 2 * kWaveformChannels);  // block align
+
+  // ── the SHAPE the request asked for ──────────────────────────────────────
+  //
+  // Derived from the request rather than pasted: 2 AR frames -> the condition
+  // encoder's own latent length -> the vocoder's 512x stack.
+  const vllm::MiniMaxMusic3Config config = vllm::MiniMaxMusic3LoadConfig(Paths());
+  m3::ConditionMixConfig mix;
+  mix.condition_hidden_dim = config.condition_encoder.condition_hidden_dim;
+  mix.num_condition_layers = config.condition_encoder.num_condition_layers;
+  mix.out_dim = config.condition_encoder.out_dim;
+  mix.input_sampling_rate = config.condition_encoder.input_sampling_rate;
+  mix.input_hop_length = config.condition_encoder.input_hop_length;
+  mix.output_sampling_rate = config.condition_encoder.output_sampling_rate;
+  mix.output_hop_length = config.condition_encoder.output_hop_length;
+  const int64_t expected_frames = m3::MaxArFrames(0.1, m3::Music3FrameRate(config.condition_encoder));
+  const int64_t expected_latents = m3::ConditionLatentLength(expected_frames, mix);
+  const int64_t expected_samples = expected_latents * config.vocoder.hop_length();
+  const uint32_t payload = ReadU32(wav, 40);
+  MESSAGE("request shape: " << expected_frames << " AR frames -> " << expected_latents
+                            << " latent frames -> " << expected_samples << " samples/channel ("
+                            << (static_cast<double>(expected_samples) / kSampleRate) << " s)");
+  CHECK(expected_frames == 2);
+  CHECK(payload == static_cast<uint32_t>(2 * kWaveformChannels * expected_samples));
+  CHECK(wav.size() == static_cast<size_t>(44) + payload);
+
+  // ── it is REAL AUDIO, not silence and not a constant ─────────────────────
+  //
+  // Four properties, and each one rules out a different way of returning a
+  // technically-well-formed WAV that is not a song: all-zero (a stage that
+  // returned nothing), clipped (a scale error, which the decode's own clamp
+  // would otherwise HIDE behind a valid range), constant (a broadcast bug), and
+  // two identical channels (the 128 latent channels interleaved rather than
+  // folded into two streams of 64 — correctly shaped, correctly ranged, wrong).
+  int64_t nonzero = 0;
+  int64_t clipped = 0;
+  int64_t channels_differ = 0;
+  int32_t min_sample = 32767;
+  int32_t max_sample = -32768;
+  double energy = 0.0;
+  for (int64_t s = 0; s < expected_samples; ++s) {
+    const auto left =
+        static_cast<int16_t>(ReadU16(wav, static_cast<size_t>(44 + 4 * s)));
+    const auto right =
+        static_cast<int16_t>(ReadU16(wav, static_cast<size_t>(44 + 4 * s + 2)));
+    for (const int16_t value : {left, right}) {
+      if (value != 0) ++nonzero;
+      if (value >= 32767 || value <= -32767) ++clipped;
+      min_sample = std::min<int32_t>(min_sample, value);
+      max_sample = std::max<int32_t>(max_sample, value);
+      energy += static_cast<double>(value) * value;
+    }
+    if (left != right) ++channels_differ;
+  }
+  const int64_t total = 2 * expected_samples;
+  const double rms = std::sqrt(energy / static_cast<double>(total)) / 32768.0;
+  MESSAGE("waveform: " << total << " int16 samples, " << nonzero << " non-zero, " << clipped
+                       << " clipped, range [" << min_sample << ", " << max_sample << "], RMS "
+                       << rms << ", " << channels_differ << " of " << expected_samples
+                       << " positions differ between L and R");
+  CHECK(nonzero > total / 2);
+  CHECK(clipped == 0);
+  CHECK(max_sample > min_sample);
+  CHECK(rms > 1e-4);
+  CHECK(channels_differ > expected_samples / 2);
+
+  // The bytes, written where a human can listen to them. Under the build tree,
+  // never under tests/ — no golden is created, replaced or implied by this.
+  const fs::path out = fs::path(BUILD_ARTIFACT_DIR) / "minimax_music3_e2e_http.wav";
+  std::error_code ec;
+  fs::create_directories(out.parent_path(), ec);
+  std::ofstream sink(out, std::ios::binary);
+  sink.write(wav.data(), static_cast<std::streamsize>(wav.size()));
+  sink.close();
+  MESSAGE("wrote " << wav.size() << " bytes to " << out.string());
+  CHECK(fs::is_regular_file(out, ec));
 }

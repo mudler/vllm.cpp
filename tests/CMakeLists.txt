@@ -178,6 +178,17 @@ target_compile_definitions(test_minimax_music3_ar_real PRIVATE
   MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
 target_include_directories(test_minimax_music3_ar_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
+# MiniMax-Music3 W2's remainder (#672): the 8.6B `Qwen3ForCausalLM` forward
+# itself, driven through the ADDITIVE `Qwen3DenseModel::ForwardEmbeds` entry and
+# TEACHER-FORCED on the capture's own rvq_codes, against frame_hiddens[:, :4096].
+# Checkpoint-gated like its two siblings; every case emits a loud SKIP when the
+# 28.5 GB asset is absent, so CI still compiles, links and runs it. SEPARATE from
+# test_minimax_music3_ar_real because it stages 18.5 GB that gate does not need.
+vllm_cpp_add_test(test_minimax_music3_llm_real parity/test_minimax_music3_llm_real.cpp)
+target_compile_definitions(test_minimax_music3_llm_real PRIVATE
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+target_include_directories(test_minimax_music3_llm_real PRIVATE
+  ${CMAKE_SOURCE_DIR}/tests/parity)
 # MiniMax-Music3 W4+W5 (#672): the ACOUSTIC half — the flow-matching DiT, the
 # FlowMatchEulerDiscreteScheduler with invert_sigmas, the CFG mix, the denoise
 # loop's window bookkeeping and the DAC Flow-VAE vocoder — against goldens
@@ -223,7 +234,11 @@ target_compile_definitions(test_minimax_music3_quant_real PRIVATE
 
 vllm_cpp_add_test(test_minimax_music3_e2e_real parity/test_minimax_music3_e2e_real.cpp)
 target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
-  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle")
+  MUSIC3_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens/minimax_music3_oracle"
+  # Where the e2e case writes the WAV it generated, so a human can listen to it.
+  # The BUILD tree, never the source tree: it is an artifact of a run and not a
+  # golden, and nothing under tests/parity/goldens/ is created or replaced.
+  BUILD_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/music3")
 target_include_directories(test_minimax_music3_e2e_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold

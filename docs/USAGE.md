@@ -1258,13 +1258,26 @@ A family with no text-only synthesis — IndexTTS-2.5 is one — is refused
 `reference_audio`, which is supplied as a `data:` URL carrying a 16-bit PCM mono
 WAV.
 
-**What this does NOT do yet.** No family renders a song from a prompt.
-MiniMax-Music3's condition mix, flow-matching DiT, scheduler, window
-bookkeeping and DAC vocoder are implemented and gated against the oracle's own
-waveform, but the 8.6B `Qwen3ForCausalLM` forward that produces the frame
-hidden states is not, so a request is answered with a 500 naming that stage, the
-phase that owes it (W2 of `.agents/specs/minimax-music3.md`) and issue #672.
-IndexTTS-2.5 refuses naming its own missing pieces.
+**Every stage of MiniMax-Music3 is implemented and gated**, and a request
+reaches all of them: the 8.6B `Qwen3ForCausalLM` autoregressive stage, the RVQ
+depth decoder, the learned condition mix, the flow-matching DiT and the DAC
+Flow-VAE vocoder. **A composed request has not yet been observed to completion
+on CPU** — see the caveat below, and `.agents/specs/minimax-music3.md`. There is
+no by-name refusal left: nothing here is unimplemented. IndexTTS-2.5 still
+refuses naming its own missing pieces.
+
+**It runs on CPU and it is slow.** Every gate this row has was taken on CPU
+(`dgx.casa` was down throughout), and the acoustic half is upstream's own fp32.
+A 0.1 s request takes tens of minutes; no speed number exists and none is
+claimed. Ask for a short duration and few `num_inference_steps` while you are
+checking that it works.
+
+The part that dominates is *not* the one you would guess. The 8.6B language
+model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder and
+the DiT do not — they are scalar host loops with a double accumulator, written
+that way in W2-W5 so their reduction order is reproducible against torch, and
+they run single-threaded. In one 0.1 s request the depth decoder alone is the
+majority of the wall clock.
 
 The same seam is reachable from the C ABI at v20 — `vllm_speech_engine_load`,
 `vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio`,
@@ -2777,10 +2790,10 @@ Phases W4 and W5 of #672.
 pipeline: the 2.4B fp32 flow-matching DiT, the `FlowMatchEulerDiscreteScheduler`
 with `invert_sigmas`, the classifier-free-guidance mix, the denoise loop's
 overlapping-window bookkeeping, and the DAC Flow-VAE vocoder that turns latents
-into a **44100 Hz stereo** waveform. **It still does not generate a song end to
-end** — joining the two halves through `SpeechRegistry`, the `vllm_speech_*` ABI
-and the example server is W6, and the 8.6B `Qwen3ForCausalLM` forward is the
-remainder of W2.
+into a **44100 Hz stereo** waveform. Joining the two halves through
+`SpeechRegistry`, the `vllm_speech_*` ABI and the example server is W6, and the
+8.6B `Qwen3ForCausalLM` forward at the front of the pipeline is the rest of W2 —
+see [the language model](#minimax-music3-the-language-model-and-the-end-to-end-path).
 
 Configs are W1's (`MiniMaxMusic3TransformerConfig`,
 `MiniMaxMusic3VocoderConfig`, `MiniMaxMusic3SchedulerConfig`) rather than new
@@ -2864,3 +2877,90 @@ channel and the second 64 the right, and each stream is decoded independently by
 the same weights (`minimax_music3_vocoder.py:110,115`). Interleaving them is the
 other obvious reading of "fold 128 into 2 x 64" and produces a correctly shaped,
 correctly ranged, wrong waveform that no length or dtype check can see.
+
+## MiniMax-Music3: the language model, and the end-to-end path
+
+The rest of phase W2 of #672, and the piece that made the pipeline whole.
+`include/vllm/model_executor/models/minimax_music3_llm.h` carries the
+autoregressive loop itself (`encoders.py:299-353`) and the 8.6B
+`Qwen3ForCausalLM` at its centre. With it, a request generates a song.
+
+### The `inputs_embeds` entry the dense path did not have
+
+Upstream calls `language_model.model(inputs_embeds=...)` twice and
+`input_ids` never (`encoders.py:311`, `:353`), because the frame feedback
+`_embed_audio_frame` is a *sum* of one language-model embedding row and seven
+depth-decoder rows scaled by `num_codebooks^-0.5` — a continuous vector that
+corresponds to no vocabulary entry and that no token id can spell.
+
+`Qwen3DenseModel::ForwardEmbeds` is that door. The Qwen3 family already had it
+on its multimodal siblings — `qwen3_vl.h` takes `inputs_embeds_bf16` after
+scattering the vision tower's rows into it, and Gemma-4 and Muse-Glimmer do the
+same — because upstream's own `Qwen3Model.forward` accepts either input. Only the
+**dense** registration had never wired it.
+
+It is additive, and that is asserted rather than argued: feeding the embedding
+*of the same token ids* through the new entry reproduces `Forward` **bit for
+bit**, in the logits and in the paged KV it wrote, and
+`tests/vllm/models/test_qwen3_forward.cpp` checks both. `Qwen3ForCausalLM`,
+`LlamaForCausalLM`, `MistralForCausalLM`, `InternLM2ForCausalLM` and
+`InternLM3ForCausalLM` all ride that one forward, so nothing less than
+bit-identity would do.
+
+`out_hidden` is the second half of the same entry: the post-final-norm rows,
+returned from the forward that produced the logits. Music3 reads
+`last_hidden_state[:, -1]` and then applies `lm_head` to that very row, so
+fetching the two halves with two 8.6B passes would be pure waste.
+
+### `num_condition_layers: 8` does not mean eight transformer layers
+
+Worth stating because it is the reading a fresh implementer reaches for. The
+eight rows of a `frame_hiddens` entry are `cat(last_hidden, depth_hidden_1..7)`
+(`encoders.py:343`) — **one** language-model hidden state and the **seven**
+per-depth-step states of the RVQ decoder. Nothing captures per-layer outputs
+from the Qwen3 stack, and nothing needs to.
+
+### Running the gates
+
+The language-model gate drives the real 8.6B bf16 weights **teacher-forced** on
+the capture's own `rvq_codes.npy`, and skips loudly without the checkpoint:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_llm_real
+```
+
+It stages ~18.5 GB and runs 25 decode steps on CPU — several minutes, most of it
+the prefill. It compares 102 400 values against `frame_hiddens[:, :4096]`, ranks
+the oracle's own sampled codes under the reproduced guided logits, and pushes the
+result through the condition mix to `condition_chunk0.npy`.
+
+The end-to-end gate posts a request at `POST /v1/audio/speech` and asserts the
+WAV that comes back:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  VLLM_CPP_MUSIC3_DIT=1 \
+  ./build/tests/test_minimax_music3_e2e_real
+```
+
+`VLLM_CPP_MUSIC3_DIT=1` is required because the DiT arm is four to eight 2.4B
+fp32 host forwards. The generated WAV is written to `build/music3/` so you can
+listen to it; nothing under `tests/parity/goldens/` is created or replaced.
+
+### Why no gate compares a generated song to the oracle's
+
+Twice over, and both reasons are structural. The autoregressive codes are a
+seeded `torch.multinomial` draw (`encoders.py:94-103`) and the denoise loop's
+initial latents are a seeded `randn_tensor` (`denoise.py:117-121`). So both the
+code draw and the noise draw are **parameters** — `Music3CodeSampler` and
+`Music3NoiseSource` — and a gate supplies the capture's own values where the
+engine supplies a seeded draw of its own. That is the only entry at which this
+pipeline is comparable to the oracle at all.
+
+What an end-to-end request can honestly be held to is therefore what the gate
+asserts: that every stage runs, that the WAV is 44100 Hz 16-bit stereo, that its
+length is the one the request's duration implies, and that it is **real audio** —
+non-zero, unclipped, non-constant, and with two channels that differ (the stereo
+fold is a contiguous split of the 128 latent channels, and an interleave produces
+a correctly shaped, correctly ranged, wrong song).

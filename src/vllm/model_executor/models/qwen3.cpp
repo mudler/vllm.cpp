@@ -228,7 +228,8 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                    const std::vector<PagedKvCache>& attn_kv,
                    const Qwen3DenseWeights& weights, const HfConfig& config,
                    const std::vector<int32_t>& logits_indices,
-                   bool return_hidden = false) {
+                   bool return_hidden = false,
+                   std::optional<DBuf>* out_hidden = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;
@@ -284,6 +285,21 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
     return dhid;
   }
 
+  // MODEL-MUSIC-MUSIC3 W2: the SAME post-final-norm rows as the pooling tail
+  // above, emitted ALONGSIDE the logits instead of instead of them. MiniMax-
+  // Music3's autoregressive stage needs both from ONE forward — it reads
+  // `output.last_hidden_state[:, -1]` and then applies `lm_head` to that very
+  // row (encoders.py:311-313, :318, :353) — and running the 8.6B stack twice to
+  // get the two halves is the alternative this branch removes.
+  //
+  // `nullptr` (every existing caller, including the decode-graph capture) adds
+  // NO op: the branch is not taken, so the captured sequence is byte-identical.
+  if (out_hidden != nullptr) {
+    DBuf dhid(d, DType::kF32, {n_out, H});
+    vt::CastF32(d.q, dhid.t(), src);
+    *out_hidden = std::move(dhid);
+  }
+
   // lm_head. Tied (Qwen3-0.6B): logits = hidden @ embed_tokens^T via MatmulBT
   // over the [vocab,H] embed table (== [N=vocab,K=H]). Untied: the loaded
   // Matmul-B [H,vocab] lm_head via vt::Matmul.
@@ -302,18 +318,45 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
 // Used by Qwen3DenseModel::Forward/ForwardDevice and by the graph driver's eager
 // fallback / cold-size pre-warm step (one contiguous stream, no capture). Byte-
 // identical op sequence to the graph (eager output == replay output).
+//
+// `inputs_embeds_bf16` (MODEL-MUSIC-MUSIC3 W2) is the ADDITIVE `inputs_embeds`
+// entry, mirroring what the Qwen3 family already has on its multimodal siblings
+// (qwen3_vl.h:145,159 `inputs_embeds_bf16`; gemma4.cpp:400-447
+// `inputs_embeds_override`; muse_glimmer.cpp:346-381): the caller has already
+// built the [T, H] bf16 hidden rows and the stream STARTS from them, so
+// `EmbedInto` — and with it the token-id lookup — is skipped entirely. Upstream
+// transformers exposes exactly this door (`Qwen3Model.forward(inputs_embeds=)`,
+// which encoders.py:311 and :353 are the only Music3 callers of), and it is the
+// door a continuous frame-feedback embedding needs because it corresponds to no
+// vocabulary row. NULL on every existing caller ⇒ the token path is untouched.
 DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                  const std::vector<int32_t>& positions,
                  const CommonAttentionMetadata& attn_meta,
                  const std::vector<PagedKvCache>& attn_kv,
                  const Qwen3DenseWeights& weights, const HfConfig& config,
                  const std::vector<int32_t>& logits_indices,
-                 bool return_hidden = false) {
-  const int64_t T = static_cast<int64_t>(token_ids.size());
-  DBuf hidden(d, DType::kBF16, {T, config.hidden_size});
-  EmbedInto(d, hidden, token_ids, weights, config);
+                 bool return_hidden = false,
+                 const std::vector<uint16_t>* inputs_embeds_bf16 = nullptr,
+                 std::optional<DBuf>* out_hidden = nullptr) {
+  const int64_t H = config.hidden_size;
+  const int64_t T = inputs_embeds_bf16 != nullptr
+                        ? static_cast<int64_t>(inputs_embeds_bf16->size()) / H
+                        : static_cast<int64_t>(token_ids.size());
+  VT_CHECK(T > 0, "qwen3 dense: a forward needs at least one input row");
+  VT_CHECK(inputs_embeds_bf16 == nullptr ||
+               static_cast<int64_t>(inputs_embeds_bf16->size()) == T * H,
+           "qwen3 dense: inputs_embeds must be [num_tokens, hidden_size]");
+  DBuf hidden(d, DType::kBF16, {T, H});
+  if (inputs_embeds_bf16 != nullptr) {
+    // The rows ARE the embedding; nothing scales or norms them here, exactly as
+    // `Qwen3Model.forward` assigns `inputs_embeds` straight through.
+    d.b.Copy(d.q, hidden.ptr(), inputs_embeds_bf16->data(),
+             static_cast<size_t>(T) * static_cast<size_t>(H) * vt::SizeOf(DType::kBF16));
+  } else {
+    EmbedInto(d, hidden, token_ids, weights, config);
+  }
   return ForwardLayers(d, hidden.t(), positions, attn_meta, attn_kv, weights, config,
-                       logits_indices, return_hidden);
+                       logits_indices, return_hidden, out_hidden);
 }
 
 ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t vocab) {
@@ -450,6 +493,30 @@ ForwardLogits Qwen3DenseModel::ForwardHidden(
   fl.host.resize(static_cast<size_t>(n_out) * static_cast<size_t>(H));
   dhidden.Download(d, fl.host.data());
   return fl;
+}
+
+std::vector<float> Qwen3DenseModel::ForwardEmbeds(
+    const std::vector<uint16_t>& inputs_embeds_bf16, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const std::vector<PagedKvCache>& attn_kv,
+    const Qwen3DenseWeights& weights, const HfConfig& config, vt::Queue& queue,
+    const std::vector<int32_t>& logits_indices, std::vector<float>* out_hidden) {
+  // MODEL-MUSIC-MUSIC3 W2. The layer stack, the final RMSNorm, the gather and
+  // the lm_head are the SAME ones Forward runs — only the first step differs,
+  // and it differs exactly as `Qwen3Model.forward(inputs_embeds=...)` does.
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  std::optional<DBuf> dhidden;
+  DBuf dlogits = ForwardBody(d, /*token_ids=*/{}, positions, attn_meta, attn_kv, weights,
+                             config, logits_indices, /*return_hidden=*/false,
+                             &inputs_embeds_bf16, out_hidden != nullptr ? &dhidden : nullptr);
+  const int64_t n_out = dlogits.t().shape[0];
+  if (out_hidden != nullptr) {
+    VT_CHECK(dhidden.has_value(), "qwen3 dense: the hidden rows were not produced");
+    out_hidden->resize(static_cast<size_t>(n_out) * static_cast<size_t>(config.hidden_size));
+    dhidden->Download(d, out_hidden->data());
+  }
+  std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
+  dlogits.Download(d, logits.data());
+  return logits;
 }
 
 // ─── Qwen3DenseDecodeGraph (shared pure-dense decode CUDA-graph driver) ───────

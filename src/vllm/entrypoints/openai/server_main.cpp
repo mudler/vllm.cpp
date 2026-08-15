@@ -1330,36 +1330,14 @@ int VllmServerMain(int argc, char** argv) {
                 << ", speech family "
                 << (args.speech_family.empty() ? "DETECTED" : "DECLARED (--speech-family)")
                 << ")\n";
+      // The request mapping is `vllm::openai::SynthesizeSpeechRequest` (library,
+      // speech_api.h) rather than a lambda body here: a mapping that only a
+      // running server can reach is a mapping no gate can call, and this route
+      // is the one an end-to-end claim is made about.
       server.set_synthesizer(
           [speech_engine](const vllm::openai::SpeechRequest& req)
               -> vllm::openai::SpeechResponse {
-            // The library-owned request mapping: the route validated the
-            // ENVELOPE, the family validates its own fields and refuses by name.
-            vllm::multimodal::SpeechGenParams gen;
-            gen.text = req.text;
-            gen.language = req.language;
-            gen.lyrics = req.lyrics;
-            gen.description = req.description;
-            gen.reference_audio = req.reference_audio;
-            gen.reference_sample_rate = req.reference_sample_rate;
-            gen.audio_duration_s = req.audio_duration_s;
-            gen.num_inference_steps = req.num_inference_steps;
-            // NEGATIVE means "the family decides": 0 is a legal guidance scale.
-            gen.guidance_scale = req.has_guidance_scale ? req.guidance_scale : -1.0;
-            gen.seed = req.seed;
-            const vllm::multimodal::SpeechResult result = speech_engine->Synthesize(gen);
-            vllm::openai::SpeechResponse out;
-            out.sample_rate = result.sample_rate;
-            out.channels = result.channels;
-            out.samples_per_channel =
-                result.channels > 0
-                    ? static_cast<int64_t>(result.samples.size()) / result.channels
-                    : 0;
-            // The SHARED RIFF writer the H3 and LTX-2.5 audio paths already
-            // use, so HTTP and the ABI cannot emit different bytes.
-            out.wav = vllm::MiniMaxH3WriteWav(result.samples, out.channels,
-                                              out.samples_per_channel, out.sample_rate);
-            return out;
+            return vllm::openai::SynthesizeSpeechRequest(*speech_engine, req);
           },
           caps);
     }

@@ -2553,8 +2553,18 @@ TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference cl
   CHECK(std::string(vllm_speech_engine_family(declared)) == "minimax-music3");
   vllm_speech_engine_free(declared);
 
-  // And the owed stage is a RUNTIME refusal naming the missing piece, not a
-  // silent zero-length waveform.
+  // W6 refused HERE by name, because the 8.6B `Qwen3ForCausalLM` forward it
+  // needed had no `inputs_embeds` entry on the landed dense path. That entry
+  // exists now (`Qwen3DenseModel::ForwardEmbeds`) and the loop that drives it is
+  // `Music3GenerateFrameHiddens`, so this assertion is INVERTED: a valid request
+  // must no longer stop at a missing stage.
+  //
+  // This checkpoint is SYNTHETIC — valid configs, empty weight files — so the
+  // request runs the whole contract and then fails ON THE ARTIFACT, naming the
+  // file it could not read. Pinning that boundary is the point: the message must
+  // be about these bytes and must NOT be about an unimplemented forward. Whether
+  // the pipeline produces a song is a question only the real 28.5 GB checkpoint
+  // answers, and tests/parity/test_minimax_music3_e2e_real.cpp asks it.
   vllm_speech_params params = vllm_speech_params_default();
   params.lyrics = "[Verse]\nMorning light\n";
   params.description = "Genre: acoustic pop. BPM: 96.";
@@ -2566,7 +2576,18 @@ TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference cl
   CHECK(vllm_synthesize(eng, &params, &out) == VLLM_ERR_RUNTIME);
   CHECK(out.samples == nullptr);
   CHECK(out.wav == nullptr);
-  CHECK(std::string(vllm_last_error()).find("Qwen3ForCausalLM") != std::string::npos);
+  {
+    const std::string message = vllm_last_error();
+    MESSAGE("a valid request against a synthetic checkpoint stops at: " << message);
+    // It reached the LANGUAGE MODEL's own weight file — the first thing the AR
+    // head touches, and the thing this checkpoint does not really have.
+    CHECK(message.find("language_model") != std::string::npos);
+    // And it is NOT the by-name refusal W6 shipped. Both spellings are asserted
+    // absent because either surviving would mean the stage is still owed; the
+    // message is printed above so a reader can check rather than trust.
+    CHECK(message.find("inputs_embeds") == std::string::npos);
+    CHECK(message.find("not implemented") == std::string::npos);
+  }
 
   // A field the family cannot honour is refused BY NAME rather than dropped.
   vllm_speech_params with_text = params;

@@ -239,14 +239,21 @@ backbone tensors under both rather than binding half the model from each.
 **Resolving the namespace is not the same as loading the checkpoint, and the
 MoE and dense arms differ.** The dense loader routes each projection to BF16,
 FP8 or NVFP4 by tensor presence, so a flat bf16 `Qwen3_5ForCausalLM` checkpoint
-is expected to load. The **MoE** loader reads only PER-EXPERT NVFP4 routed
-experts, while the published MoE repos (`Qwen/Qwen3.8-2.4T-A95B`,
-`Qwen/Qwen3.6-35B-A3B`) ship 3-D stacked, unquantized experts — that arm is
-**not implemented**, and such a checkpoint is refused at load with a message
-naming what is missing. Use an NVFP4 requant (e.g.
-`nvidia/Qwen3.6-35B-A3B-NVFP4`) for the MoE path. No text-only Qwen3.5
-checkpoint has been RUN here at all — see [STATUS.md](STATUS.md) for the owed
-run gates.
+is expected to load. The **MoE** loader reads two ROUTED-EXPERT layouts and
+decides between them ONCE per checkpoint from the shard index: per-expert NVFP4
+(`experts.<e>.<proj>.weight` U8 + `.weight_scale` + `.weight_scale_2`, what an
+NVFP4 requant ships) and the 3-D stacked BF16
+`experts.{gate_up_proj,down_proj}` the published repos (`Qwen/Qwen3.8-2.4T-A95B`,
+`Qwen/Qwen3.6-35B-A3B`) ship. A checkpoint carrying BOTH spellings under its
+backbone is refused rather than half-bound.
+
+**A published bf16 MoE repo still does not load end to end.** It is bf16
+*throughout*, and the MoE arm implements only per-tensor FP8 for the
+attention/GDN tower and NVFP4 for the shared expert and `lm_head`; those arms are
+OWED, and such a checkpoint is refused at load with a message naming what is
+missing. Use an NVFP4 requant (e.g. `nvidia/Qwen3.6-35B-A3B-NVFP4`) for the MoE
+path. No text-only Qwen3.5 checkpoint has been RUN here at all — see
+[STATUS.md](STATUS.md) for the owed run gates.
 
 GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
 host's native filesystem encoding, including Unicode paths on Windows. Native

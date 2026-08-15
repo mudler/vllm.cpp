@@ -380,8 +380,12 @@ vllm_cpp_add_test(test_qwen3_8_text_only vllm/models/test_qwen3_8_text_only.cpp)
 # The PUBLISHED `Qwen/Qwen3.8-2.4T-A95B` config.json, committed VERBATIM, so the
 # config-resolution case reads the real document (nested `rope_parameters`, 92
 # `layer_types`, transformers-4.57.3 `dtype`) instead of a paraphrase of it.
+# Its `model.safetensors.index.json` (1609 tensors, 213 shards, 4.89 TB) is
+# committed the same way, so the load-plan dry run resolves every name against
+# the real document rather than a summary of it (#740).
 target_compile_definitions(test_qwen3_8_text_only PRIVATE
-  QWEN3_8_CONFIG_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/config.json")
+  QWEN3_8_CONFIG_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/config.json"
+  QWEN3_8_INDEX_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen3_8_2_4t_a95b/model.safetensors.index.json")
 # POOL-DEVICE-KEY (#516, .agents/specs/pool-device-key.md): the shared scratch
 # pool's free list must be keyed by DEVICE as well as size class, or a block
 # allocated through one backend is handed to a DBuf running on another —

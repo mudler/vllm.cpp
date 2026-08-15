@@ -2731,7 +2731,7 @@ that revision's own LFS record for the file.
 | `condition_encoder/` | `diffusion_pytorch_model.safetensors` | **101 MB** | F32 |
 | `tokenizer/` | `tokenizer.json` + `tokenizer_config.json` + `chat_template.jinja` | **11 MB** | — |
 | `scheduler/` | `scheduler_config.json` | 483 B | — |
-| `` (root) | `modular_model_index.json`, `config.json`, `README.md` | 14 KB | — |
+| the root itself | `modular_model_index.json`, `config.json`, `README.md` | 14 KB | — |
 | | **resident total** | **28.5 GB** (28 517 617 303 B) | |
 
 The transformer being 9.73 GB for a 2.4B model is **fp32 storage, not a 4.9B

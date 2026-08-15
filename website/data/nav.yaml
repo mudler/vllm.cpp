@@ -22,6 +22,8 @@ docs:
     label: Speculative decoding
   - file: KV-OFFLOAD.md
     label: KV offload
+  - file: WEIGHT-OFFLOAD.md
+    label: Weight offload
   - file: SGLANG-COMPAT.md
     label: SGLang compatibility
   - file: ROCM.md

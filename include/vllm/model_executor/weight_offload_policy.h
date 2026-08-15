@@ -6,8 +6,14 @@
 // its size, this answers whether that weight is offloaded, and it keeps the
 // running byte budget. It moves nothing and it knows nothing about a device.
 //
-// WHY THE DECISION IS SPLIT FROM THE MOVE, and why the move is NOT in W1's
-// `PrepareModel` hook:
+// This type is the UVA arm's INTERNAL state, not a second public decision
+// surface. Callers ask `WeightOffloader::ConsiderWeight`, which the concrete
+// backend answers by delegating here. Two public surfaces that both answered
+// "is this weight offloaded" would be exactly the parallel path the protocol
+// forbids.
+//
+// WHY THE DECISION IS SPLIT FROM THE MOVE, and why the move is NOT in a
+// post-load hook:
 //
 //   Upstream offloads by walking a constructed model
 //   (`module.named_parameters()`), which is safe there because PyTorch builds

@@ -26,6 +26,7 @@
 #include "vllm/config/offload.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/weight_offload_policy.h"
 #include "vllm/model_executor/weight_offloader.h"
 #include "vt/tensor.h"
 
@@ -36,6 +37,7 @@ using vllm::OffloadBackend;
 using vllm::OffloadConfig;
 using vllm::SetWeightOffloader;
 using vllm::WeightOffloader;
+using vllm::WeightOffloadDecision;
 using vllm::WeightOffloaderChoice;
 
 namespace {
@@ -44,15 +46,22 @@ namespace {
 // it exists to prove the install point and the read point are connected.
 class CountingOffloader final : public WeightOffloader {
  public:
-  void PrepareModel(vllm::LoadedModel&) override { ++prepared; }
-  void PostInit() override { ++post_init; }
+  WeightOffloadDecision ConsiderWeight(const std::string&, int64_t bytes) override {
+    ++considered;
+    bytes_seen += bytes;
+    return WeightOffloadDecision::kOffload;
+  }
+  void OnModelPrepared(vllm::LoadedModel&) override { ++prepared; }
   void SyncPrevOnload() override { ++sync_prev; }
   void JoinAfterForward() override { ++join_after; }
   const char* name() const override { return "CountingOffloader"; }
   bool moves_weights() const override { return true; }
 
+  int64_t offloaded_bytes() const override { return bytes_seen; }
+
   int prepared = 0;
-  int post_init = 0;
+  int considered = 0;
+  int64_t bytes_seen = 0;
   int sync_prev = 0;
   int join_after = 0;
 };
@@ -99,7 +108,6 @@ TEST_CASE("the no-op accepts every hook without effect") {
   // base.py:68-85: post_init, sync_prev_onload and join_after_forward are
   // defaulted no-ops upstream, so the graph seam can call them unconditionally.
   NoopWeightOffloader noop;
-  CHECK_NOTHROW(noop.PostInit());
   CHECK_NOTHROW(noop.SyncPrevOnload());
   CHECK_NOTHROW(noop.JoinAfterForward());
   CHECK_FALSE(noop.moves_weights());
@@ -171,7 +179,7 @@ TEST_CASE("an explicit backend at a zero budget is NOT reported as pending") {
 
 TEST_CASE("ModelRegistry::Prepare reaches the installed offloader") {
   // THE WIRING TEST. Mutation testing showed the other cases in this file all
-  // stayed green when the `GetWeightOffloader().PrepareModel(model)` call was
+  // stayed green when the `GetWeightOffloader().OnModelPrepared(model)` call was
   // deleted from ModelRegistry::Prepare, because none of them drives a model.
   // This case closes that gap: it is the only proof that the install point and
   // the wrap site are connected.
@@ -196,4 +204,20 @@ TEST_CASE("ModelRegistry::Prepare reaches the installed offloader") {
   CHECK(raw->prepared == 1);
   CHECK_NOTHROW(vllm::ModelRegistry::Prepare(*model, config, q));
   CHECK(raw->prepared == 2);
+}
+
+TEST_CASE("the no-op keeps every weight resident, whatever it is asked") {
+  // The inertness property, now expressed on the DECISION seam rather than on a
+  // hook nobody implements. A loader that consults the default offloader gets
+  // the same answer for every weight, so the existing path is unchanged by
+  // construction and not by a flag the caller must remember to check.
+  NoopWeightOffloader noop;
+  const char* names[] = {"mlp.experts.w2_weight", "self_attn.q_proj.weight",
+                         "model.embed_tokens.weight", ""};
+  for (const char* n : names) {
+    CHECK(noop.ConsiderWeight(n, 1 << 20) ==
+          WeightOffloadDecision::kBudgetExhausted);
+  }
+  CHECK(noop.offloaded_bytes() == 0);
+  CHECK_FALSE(noop.moves_weights());
 }

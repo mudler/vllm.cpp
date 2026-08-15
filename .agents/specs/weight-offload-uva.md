@@ -188,7 +188,19 @@ Structural deviations, and why each is forced:
   several loaders, and one that forgets to consult the policy silently does not
   offload, so the application leaves owe a totality argument like the
   `-Werror=switch` one `gguf_keep_quant.cpp` already uses.
-- **W1's `PrepareModel(LoadedModel&)` hook is therefore NOT where the UVA arm
+- **The seam was refactored once that was understood (2026-08-15).** The ABC
+  now carries `ConsiderWeight(canonical_name, bytes)`, which a loader asks per
+  weight, and ONE post-load hook, `OnModelPrepared`, which is upstream's
+  `post_init`. Two defects were removed. `PrepareModel` was a port of
+  `wrap_modules` that nothing could implement once the decision moved into the
+  loaders, and it duplicated `PostInit`. And `WeightOffloadPolicy` had become a
+  SECOND public surface answering "is this weight offloaded" beside the
+  offloader itself, which is the parallel path this protocol forbids; it is now
+  the concrete backend's internal state, reached only through `ConsiderWeight`.
+  `NoopWeightOffloader::ConsiderWeight` refuses every weight, so the existing
+  engine path is unchanged BY CONSTRUCTION rather than by a flag a caller must
+  remember to check.
+- **The earlier `PrepareModel(LoadedModel&)` hook was NOT where the UVA arm
   acts.** The rest of W1 stands: the process-global, the factory, the
   config-to-backend resolution, the no-op default and the graph hooks are all
   still correct and needed. The hook itself was built against the assumption

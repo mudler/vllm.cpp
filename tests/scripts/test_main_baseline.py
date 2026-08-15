@@ -1062,6 +1062,39 @@ class ConcurrencySemanticsTests(unittest.TestCase):
             with self.subTest(job=name):
                 self.assertIn("closed", str(job.get("if", "")))
 
+    def test_no_workflow_has_a_duplicate_mapping_key(self) -> None:
+        """PyYAML keeps the LAST duplicate key and says nothing. GitHub rejects
+        the whole file.
+
+        This is not hypothetical: an edit to this row added `LAST_GREEN` twice
+        to one env block. Every yaml.safe_load in this suite passed, and GitHub
+        refused to parse ci.yml at all -- the run carried the workflow's PATH
+        instead of its name, ran zero jobs, and reported failure. No PyYAML
+        based test can see that, so the check has to be structural.
+        """
+        import yaml
+
+        class Strict(yaml.SafeLoader):
+            pass
+
+        def no_duplicates(loader, node, deep=False):
+            seen = set()
+            for key_node, _ in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in seen:
+                    raise AssertionError(
+                        f"duplicate key {key!r} at line {key_node.start_mark.line + 1}"
+                    )
+                seen.add(key)
+            return yaml.SafeLoader.construct_mapping(loader, node, deep)
+
+        Strict.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, no_duplicates
+        )
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            with self.subTest(workflow=path.name):
+                yaml.load(path.read_text(encoding="utf-8"), Loader=Strict)
+
     def test_containers_has_a_concurrency_policy(self) -> None:
         """#822 names it the largest source of queued duplicates, and it had
         none at all."""

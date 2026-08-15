@@ -452,7 +452,9 @@ jobs:
           sha="$(gh api \
             "repos/$REPO/actions/workflows/ci.yml/runs?branch=$BRANCH&event=push&status=success&per_page=1" \
             --jq '.workflow_runs[0].head_sha' 2>/dev/null || true)"
-          [ "$sha" = "null" ] && sha=""
+          # NOT `[ ... ] && sha=""`: that returns non-zero when the test is
+          # false, which aborts the step under `set -e`.
+          if [ "$sha" = "null" ]; then sha=""; fi
           echo "last successfully gated commit: ${sha:-<none, falling back to before>}"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
   commit-protocol-tag:
@@ -530,7 +532,6 @@ jobs:
           # Passed as an ENV VAR, never interpolated into the script: a body is
           # attacker-controlled text on a fork pull request.
           PR_BODY: ${{ github.event.pull_request.body }}
-          LAST_GREEN: ${{ needs.last-gated-commit.outputs.sha }}
         run: |
           set -eu
           if [ "$EVENT_NAME" = "pull_request" ]; then

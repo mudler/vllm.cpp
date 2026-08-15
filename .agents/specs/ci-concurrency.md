@@ -158,6 +158,21 @@ ratified away. `agent-record` was pinned as unconditional, and now carries
 exactly one permitted condition. Each keeps its original intent in its
 docstring.
 
+**GitHub refused the file and no local test could see it.** A blanket insert put
+`LAST_GREEN` into one env block twice. `yaml.safe_load` keeps the last duplicate
+and reports nothing, so all 54 cases passed while GitHub rejected `ci.yml`
+outright: the run carried the workflow's PATH instead of its name, ran zero
+jobs, and reported failure on a branch whose pushes the workflow does not even
+subscribe to. `test_no_workflow_has_a_duplicate_mapping_key` closes the class
+with a strict loader, because no `safe_load`-based assertion ever can.
+
+## Owed
+
+- [#869](https://github.com/mudler/vllm.cpp/issues/869). `github.event.pull_request.head.ref` is interpolated into an
+  inline script (`ci.yml:584`). Pre-existing, confirmed by linting the base
+  revision, and not introduced here. It is untrusted input on a fork pull request and should move
+  to an environment variable.
+
 ## Now
 
 Implemented and gated. Awaiting review on the pull request.

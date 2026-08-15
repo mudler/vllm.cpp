@@ -389,6 +389,38 @@ class BudgetEnforcement(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     checker.classify_path(path)
 
+    def test_the_issue_index_is_classified_append_only(self) -> None:
+        """#840 created it with no class, so pr-size aborted on every PR (#856).
+
+        RED before this fix: `classify_path` raised and the checker reported
+        "could not classify the change: unclassified repository path", which
+        aborts BEFORE any rule runs -- so path classification and the
+        checker-evidence contract went unenforced repo-wide, not just on the
+        PR that touched the index. Same shape as .agents/oracles/ in #668.
+
+        Asserted as append_only_record rather than any class that happens to
+        pass: the file's own header says "This file is append-only" and it
+        carries merge=union in .gitattributes, which is what the class means.
+        """
+        self.assertEqual(
+            checker.classify_path(".agents/issue-index.md"), "append_only_record"
+        )
+
+    def test_every_append_only_record_really_is_append_only(self) -> None:
+        """The class is only sound while each member declares itself so.
+
+        Guards the hole this class would otherwise become: a mutable keyed
+        record parked here would inherit union-merge semantics it does not
+        have, and two branches editing the same row would merge cleanly into
+        a duplicate rather than conflicting.
+        """
+        root = Path(checker.ROOT)
+        self.assertTrue(checker.APPEND_ONLY_FILES, "the class must not be empty")
+        for rel in sorted(checker.APPEND_ONLY_FILES):
+            with self.subTest(path=rel):
+                head = (root / rel).read_text(errors="replace")[:2000].lower()
+                self.assertIn("append-only", head)
+
     def test_a_classified_binary_is_accepted(self) -> None:
         """A binary at a classified path is not an error (GATE-PR-SIZE-BINARY, #615).
 

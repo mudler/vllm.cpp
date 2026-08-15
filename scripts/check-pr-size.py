@@ -79,6 +79,14 @@ APPEND_ONLY_FILES = frozenset(
     {
         ".agents/benchmark-record.md",
         ".agents/parity-ledger.md",
+        # The issue intake index, created by #840 when the issue table moved out
+        # of roadmap_v1.md so it stopped being a surface every row-advancing PR
+        # had to write. It arrived WITHOUT a path class, so classify_path raised
+        # and pr-size aborted on every PR that touched it (#856) -- the same
+        # shape as .agents/oracles/ in #668. Append-only by its own header, and
+        # it carries merge=union in .gitattributes, which is what the class
+        # means here.
+        ".agents/issue-index.md",
     }
 )
 PROJECT_RECORD_FILES = frozenset(
@@ -174,6 +182,17 @@ COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
 # this. A claim in its own file has one writer and cannot collide. Classified
 # with the other per-row records it now resembles.
 CLAIM = re.compile(r"\.agents/claims/[A-Za-z0-9_.-]+\.md\Z")
+# The writing guides AGENTS.md points at for prose that ships with a change
+# (#827). Same class as the other .agents/ task guides -- porting.md,
+# verification.md, workflow.md -- which are PROCEDURE_FILES by name. A pattern
+# rather than a blanket .agents/style/ rule, so a non-.md file parked there
+# still fails closed.
+STYLE_GUIDE = re.compile(r"\.agents/style/[A-Za-z0-9_.-]+\.md\Z")
+# Agent-tooling entry points for those same guides (#827): a SKILL.md is the
+# machine-readable face of a writing rule, so it is the same procedure class as
+# the guide it fronts. Named to the SKILL.md leaf rather than the directory, so
+# anything else parked under .claude/skills/ still fails closed.
+SKILL_GUIDE = re.compile(r"\.claude/skills/[A-Za-z0-9_.-]+/SKILL\.md\Z")
 # One file per secondary oracle (AGENTS.md, "When vLLM has no implementation").
 # Same shape and therefore the same class as SPEC and CLAIM: a per-key record
 # globbed for reading, deliberately NOT a shared table every change must write.
@@ -374,6 +393,8 @@ def classify_path(path: str) -> str:
         path in PROCEDURE_FILES
         or SPEC.fullmatch(path)
         or CLAIM.fullmatch(path)
+        or STYLE_GUIDE.fullmatch(path)
+        or SKILL_GUIDE.fullmatch(path)
         or ORACLE.fullmatch(path)
         or COMPLETED.fullmatch(path)
         or COMPLETED_STATE_EVENT.fullmatch(path)

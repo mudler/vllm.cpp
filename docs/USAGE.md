@@ -2565,11 +2565,30 @@ cmake --build build --target test_ltx2_loader && ./build/tests/test_ltx2_loader
 
 ## SSE keepalives on long prefill
 
-Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while
-waiting on the engine (long prefill / TTFT). Interval is `VT_SERVER_SSE_PING_S`
-(default 15s; `0` disables). Comment frames are not `data:` events and do not
-carry tokens. Token streaming still uses a timed wait on the request collector
-so deltas are not collapsed by a poll loop.
+Async chat/completion streams can emit SSE **comment** frames (`:\n\n`) while
+waiting on the engine (long prefill / TTFT), so a proxy with an inactivity
+timeout sees body bytes before the first token. Interval is
+`VT_SERVER_SSE_PING_S`, **default `0` — off**; a positive value enables it and
+is clamped to 600.
+
+**It is off by default, and it should stay off unless a proxy forces your
+hand.** vLLM's streaming endpoints emit no comment frame at any point, so a
+server that sends one is putting a byte on the wire that OpenAI-compatible
+clients written against vLLM have never had to parse. vLLM's own benchmark
+client is one of them: `vllm bench serve` strips each network chunk before
+parsing, which destroys the `\n\n` separator at chunk boundaries, and its only
+resynchronisation path looks for a `data: ` prefix — so one comment frame
+arriving before a request's first token makes it report
+`Never received a valid chunk to calculate TTFT` and count that request
+**failed**, while this server completes it normally and logs nothing. The
+requests that reach a keepalive are by construction the slowest ones, so the
+effect is to delete your own worst latencies from a measurement
+([#931](https://github.com/mudler/vllm.cpp/issues/931),
+[#577](https://github.com/mudler/vllm.cpp/issues/577)).
+
+Comment frames are not `data:` events and carry no tokens. Token streaming uses
+a timed wait on the request collector either way, so deltas are never collapsed
+by a poll loop.
 
 ## Gemma4 FP8 on ROCm (RDNA4)
 

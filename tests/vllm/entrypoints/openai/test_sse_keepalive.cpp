@@ -107,10 +107,48 @@ TEST_CASE("SSE keepalive: later real output is a separate framing step") {
   CHECK(frames[1] != frames[0] + frames[1]);
 }
 
+// #931. The default was 15 seconds, and that put a byte on the wire that the
+// reference never emits.
+//
+// vLLM serves its streaming completions through uvicorn/starlette and yields
+// nothing but `data: ` frames: grepping the pinned oracle
+// (0.23.1rc1.dev1511+g555967922) for a yielded comment across ALL of
+// vllm/entrypoints/ returns no hit. So a comment frame is not a mirrored
+// behaviour, it is an invention — and vLLM's OWN benchmark client cannot
+// survive one. `vllm bench serve` strips each network chunk before parsing
+// (benchmarks/lib/endpoint_request_func.py:207), which destroys the "\n\n"
+// separator at chunk boundaries, and its only resynchronisation path requires a
+// `data: ` prefix (:48). A comment arriving before the first data frame
+// therefore poisons its buffer permanently: it reports "Never received a valid
+// chunk to calculate TTFT" and counts the request FAILED, while the server
+// completes it normally and logs nothing.
+//
+// That is not hypothetical. It voided the 27B c16 leg at 93/96 (#577) and then
+// the Qwen3.8-27B c1 and c8 legs at 5/6 and 36/48 (#931, #915) — in both cases
+// taking exactly the SLOWEST requests, because those are the ones that reach a
+// 15 s silence. In the #931 legs the failed requests' imputed TTFT was 92-94 s
+// (c1, all three reps) against a p99 of 4.2 s among the successes: the timeout
+// separated the two populations precisely.
+//
+// So the default mirrors vLLM — no keepalive — and #316's capability stays
+// reachable for a deployment behind a proxy that needs it, as an opt-in whose
+// cost is now stated.
+TEST_CASE("SSE keepalive: DEFAULT OFF, mirroring vLLM's frame set") {
+  EnvRestorer rest("VT_SERVER_SSE_PING_S");
+  ::unsetenv("VT_SERVER_SSE_PING_S");
+  CHECK(SsePingIntervalSec() == 0);
+  ::setenv("VT_SERVER_SSE_PING_S", "", 1);
+  CHECK(SsePingIntervalSec() == 0);
+  // An unparsable spelling falls back to the DEFAULT, and the default is off.
+  // It used to fall back to 15, so a typo silently enabled the frame.
+  ::setenv("VT_SERVER_SSE_PING_S", "fifteen", 1);
+  CHECK(SsePingIntervalSec() == 0);
+}
+
 TEST_CASE("SSE keepalive: VT_SERVER_SSE_PING_S <=0 disables") {
   EnvRestorer rest("VT_SERVER_SSE_PING_S");
   ::unsetenv("VT_SERVER_SSE_PING_S");
-  CHECK(SsePingIntervalSec() == 15);
+  CHECK(SsePingIntervalSec() == 0);
   ::setenv("VT_SERVER_SSE_PING_S", "0", 1);
   CHECK(SsePingIntervalSec() == 0);
   ::setenv("VT_SERVER_SSE_PING_S", "-3", 1);

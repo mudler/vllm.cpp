@@ -115,4 +115,135 @@ Candidate causes to separate, not to assume:
 
 ## Now
 
-Row is `READY`. Spec committed; implementation not started.
+Both phases implemented on `row/FIX-SERVER-CONCURRENCY-931`. The measurement
+guard landed first and stands on its own; the server fix follows the recorded
+cause below.
+
+## Outcome
+
+### The cause, and it is ONE cause for c1 and for c8
+
+**Our server emits an SSE comment frame that vLLM never emits, by default, and
+vLLM's own benchmark client cannot survive one.**
+
+`serving_utils.h:42` defines `kSsePingFrame = ":\n\n"`. `AssignSseWaitResult`
+(`serving_utils.cpp:242-251`) emits it whenever the request's output collector
+produces nothing for `VT_SERVER_SSE_PING_S` seconds — **default 15**
+(`serving_utils.cpp:253-264`), reached from both `CompletionSseStream::WaitOutput`
+(`serving_completion.cpp:39-49`) and `ChatSseStream::WaitOutput`
+(`serving_chat.cpp:332-342`). It is the only non-`data:` frame either stream can
+produce, and it was added by [#316](https://github.com/mudler/vllm.cpp/issues/316)
+for proxies with inactivity timeouts.
+
+The pinned oracle emits nothing of the kind: grepping `0.23.1rc1.dev1511+g555967922`
+for a yielded comment across all of `vllm/entrypoints/` returns no hit. So this
+is not a mirrored behaviour, it is an invention — and `vllm bench serve` cannot
+parse it. The client strips every network chunk before parsing
+(`benchmarks/lib/endpoint_request_func.py:207`), which destroys the `\n\n`
+separator at chunk boundaries, and `StreamedResponseHandler`'s only
+resynchronisation path requires a `data: ` prefix (`:48`). A comment frame
+therefore lands in the buffer as a bare `:` that no later frame can clear:
+
+- **before the first data frame** → `first_chunk_received` stays false, the
+  client reports `Never received a valid chunk to calculate TTFT` and marks the
+  request **failed** (`:249-257`) — with an HTTP **200**, a normal server-side
+  completion, and nothing logged;
+- **mid-decode** → the request still "succeeds" but every later frame is
+  swallowed, so tokens and the usage frame are silently lost.
+
+### Proven end to end, over a socket, with the real client
+
+A socket server replaying our exact frame bytes, driven by the pinned
+`vllm bench serve` at `--max-concurrency 1 --num-prompts 6`, one variable:
+
+| arm | completed | failed | error |
+|---|---:|---:|---|
+| no comment frame | 6 | **0** | — |
+| one comment frame before request 1's first data frame | 5 | **1** | `Never received a valid chunk to calculate TTFT` |
+
+`output_lens[1]` is `0` and `ttfts[1]` is `0.0` in the failing arm, and the
+`total_input_tokens` of 5025 for five completions is the same shape the #915 c1
+legs show. Nothing but the comment frame differs between the two arms.
+
+### Why exactly those requests, in exactly those legs
+
+`vllm bench serve` records no TTFT for a failed request, but at a fixed
+concurrency the leg's wall duration is a budget: slot-seconds not spent on a
+successful request were spent on a failed one. Subtracting the decode time the
+same file measures (`median_tpot_ms x 127`) leaves the failed request's TTFT.
+From the committed #915 records:
+
+| leg | completed | failed | imputed TTFT per failed request | p99 TTFT among successes |
+|---|---:|---:|---:|---:|
+| c1 r1/r2/r3 | 5 of 6 | 1 | **93.9 / 92.2 / 92.2 s** | 4.24 s |
+| c4 r1/r2/r3 | 24 of 24 | 0 | — | 5.62 s |
+| c8 r1/r2/r3 | 36/37/36 of 48 | 12/11/12 | **47.0 / 47.5 / 46.7 s** | 7.23 s |
+
+The 15 s threshold separates the two populations exactly, in every leg, in all
+three repeats. At c1 the arithmetic is exact — the semaphore serialises the
+requests — and it reproduces to within 1.7 s across reps, which is why the c1
+failure is deterministic rather than a race: the runner starts one server per
+rep and runs c1 first, so the first timed request is the first inference that
+process ever does and pays the whole warm-up. By c4 the server is warm and
+nothing crosses 15 s. At c8, queueing behind 8-way concurrency puts a dozen
+requests back over the line. The c8 figure assumes perfectly packed slots and so
+overstates the span, but not by the factor of three that would be needed to drop
+it under 15 s.
+
+**This is a recurrence, not a discovery.** [#577](https://github.com/mudler/vllm.cpp/issues/577)
+already recorded the same mechanism — the keepalive made 27B c16 VOID at 93/96
+and *"the three missing are the SLOWEST"* — and its recorded remedy was to
+disable the keepalive **in the recipe**. `run_bench_main.sh` for #915 did not,
+so it came back. A recipe is not a fix.
+
+### What was refuted
+
+**HTTP worker-pool starvation, at every concurrency.** The #915 server log
+records `HTTP worker pool 36 fixed` (`--max-num-seqs 32` + `kControlWorkerHeadroom`),
+against an offered concurrency of 8. A pool of 36 cannot starve at 8, and
+certainly not at 1. The related mirror gap — `--max-num-seqs` doubling as our
+HTTP concurrency ceiling where upstream bounds only the scheduler batch — is
+real, is not this bug, and is filed as
+[#952](https://github.com/mudler/vllm.cpp/issues/952).
+
+**A per-prompt cause.** The failing request is not a particular prompt: at c1 it
+is whichever request runs first, and the c1 prompt set is a prefix of the c4 set
+that failed nothing.
+
+### The fix
+
+`SsePingIntervalSec()` defaults to **0**. Both streams then take the blocking
+`get_output()` path, which #316 itself records as byte-identical to the
+behaviour before it, so our default wire format is `data: ` frames only — the
+frame set vLLM has. The capability stays reachable at `VT_SERVER_SSE_PING_S=<n>`
+for a deployment behind a proxy that needs it, with the client-compatibility
+cost now stated in `docs/USAGE.md` and `docs/ENVIRONMENT.md`.
+
+This removes the cause rather than the symptom. It is not a retry, not a longer
+timeout and not a swallowed error, and it is not flattering: the requests that
+used to vanish now complete and their 47-to-94-second TTFTs enter the latency
+distribution, where they belong.
+
+### The measurement guard, which is what stops the next one
+
+`serve_low_common.require_complete_request_set` refuses to derive any rate from
+a record that cannot prove its request set is whole, and is called at the
+derivation sites rather than only at whichever validator runs first. Had it
+existed, #915's c1 leg would have aborted instead of publishing 0.675x. It also
+converts any future re-enabling of the keepalive from a silent 25% loss into a
+loud failure, which is the protection #577 asked for and did not get.
+
+## Owed
+
+- The #915 c1 and c8 output-throughput cells stay WITHHELD until re-run on a
+  binary carrying this fix; that re-run is the acceptance evidence and belongs
+  to [#915](https://github.com/mudler/vllm.cpp/issues/915).
+- A ~47 s TTFT for a quarter of the c8 requests is a real scheduling tail that
+  the keepalive was hiding. It is not a failure and is not this row's scope, but
+  it is now visible and unexplained.
+- [#952](https://github.com/mudler/vllm.cpp/issues/952) — `--max-num-seqs` also
+  bounds our HTTP concurrency, where upstream bounds only the scheduler batch.
+  Found here while refuting worker-pool starvation as this bug's cause, and
+  refuted as that cause: the pool was 36 against an offered concurrency of 8. It
+  is a real mirror gap and needs its own change, because the next person raising
+  `--max-num-seqs` for throughput silently raises the HTTP ceiling with it.

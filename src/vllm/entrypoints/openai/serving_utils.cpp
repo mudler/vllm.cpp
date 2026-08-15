@@ -251,13 +251,35 @@ bool AssignSseWaitResult(std::optional<vllm::RequestOutput> ready,
 }
 
 int SsePingIntervalSec() {
-  // Default 15s. <=0 disables. Long MoE prefill needs body bytes so proxies /
-  // Hermes inactivity_timeout do not drop the stream.
+  // DEFAULT OFF (#931). Opt in with a positive VT_SERVER_SSE_PING_S; <=0, unset
+  // and unparsable all disable, which takes both streams down the blocking
+  // get_output() path #316 recorded as byte-identical to the behaviour before
+  // it.
+  //
+  // The keepalive exists because a long MoE prefill produces no body bytes, so
+  // a proxy or Hermes inactivity_timeout can drop the stream before the first
+  // token. That is a real deployment problem, and the frame is legal SSE. It is
+  // still not the default, for one reason: vLLM emits NO comment frame from any
+  // streaming endpoint, so every OpenAI-compatible client written against vLLM
+  // has never had to parse one — and vLLM's own `vllm bench serve` is such a
+  // client. It strips each network chunk before parsing
+  // (benchmarks/lib/endpoint_request_func.py:207), destroying the "\n\n"
+  // separator, and resynchronises only on a `data: ` prefix (:48); one comment
+  // frame ahead of a request's first token leaves a bare ":" in its buffer that
+  // nothing clears, so it reports "Never received a valid chunk to calculate
+  // TTFT" and counts the request FAILED while we answer 200, finish normally
+  // and log nothing.
+  //
+  // The requests that reach a keepalive are by construction the SLOWEST, so the
+  // default deleted our own worst latencies from measurements taken with vLLM's
+  // client: 93/96 at 27B c16 (#577) and then 5/6 at c1 and 36/48 at c8 on
+  // Qwen3.8-27B (#931, #915), where the failed requests' imputed TTFT was 92-94 s
+  // against a 4.2 s p99 among the successes.
   const char* e = std::getenv("VT_SERVER_SSE_PING_S");
-  if (e == nullptr || e[0] == '\0') return 15;
+  if (e == nullptr || e[0] == '\0') return 0;
   char* end = nullptr;
   long v = std::strtol(e, &end, 10);
-  if (end == e) return 15;
+  if (end == e) return 0;
   if (v <= 0) return 0;
   if (v > 600) v = 600;
   return static_cast<int>(v);

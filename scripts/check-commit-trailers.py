@@ -74,6 +74,9 @@ def _git(repo: Path, *args: str, input_text: str | None = None) -> str:
 
 
 TRAILER_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:[ \t].+$")
+# The bare rule GitHub writes above the `Co-authored-by:` block it appends to a
+# squash message. Matched as a whole paragraph only, never inside prose (#861).
+FORGE_SEPARATOR = re.compile(r"-{3,}")
 CONTINUATION_LINE = re.compile(r"^[ \t]+\S")
 
 
@@ -107,8 +110,31 @@ def join_trailing_trailer_paragraphs(message: str) -> str:
     if not paragraphs:
         return message
     fused: list[str] = []
-    while paragraphs and _is_trailer_paragraph(paragraphs[-1]):
-        fused.insert(0, paragraphs.pop())
+    while paragraphs:
+        if _is_trailer_paragraph(paragraphs[-1]):
+            fused.insert(0, paragraphs.pop())
+            continue
+        # GitHub writes a bare rule before the `Co-authored-by:` block it appends
+        # to a squash message. Measured on `617d6f452`, the FIRST squash landed
+        # under `squash_merge_commit_message = PR_BODY`: the body appears once,
+        # there is one trailer block, and the separator is still there. So it is
+        # not a separator between concatenated commit messages, which is what
+        # #829 and #850 assumed on the strength of a simulation that omitted it.
+        # It belongs to the co-author block (#861).
+        #
+        # Stepped over ONLY when trailer-shaped paragraphs sit on both sides, so
+        # a prose paragraph still terminates the block and trailers buried
+        # mid-message stay invalid. That is the property this helper exists to
+        # protect, and it is untouched.
+        if (
+            FORGE_SEPARATOR.fullmatch(paragraphs[-1].strip())
+            and fused
+            and len(paragraphs) >= 2
+            and _is_trailer_paragraph(paragraphs[-2])
+        ):
+            paragraphs.pop()
+            continue
+        break
     if len(fused) < 2:
         return message
     return "\n\n".join(paragraphs + ["\n".join(fused)])

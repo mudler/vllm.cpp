@@ -489,10 +489,11 @@ class ForgeAttribution(unittest.TestCase):
 class SquashShapes(unittest.TestCase):
     """The two squash bodies GitHub can compose, pinned as executable evidence.
 
-    `squash_merge_commit_message` decides which one lands. Under
-    `COMMIT_MESSAGES` GitHub writes a `---------` separator between the
-    concatenated commit messages, and the last one falls between the protocol
-    trailer block and the `Co-authored-by:` line GitHub appends.
+    `squash_merge_commit_message` decides which body lands. GitHub writes a
+    `---------` separator above the `Co-authored-by:` block it appends, and that
+    happens under BOTH settings -- #829 and #850 believed it came from
+    concatenation, and `617d6f452` disproved it (#861). The separator is now
+    stepped over when trailers sit on both sides.
     `join_trailing_trailer_paragraphs` fuses only trailer-SHAPED paragraphs, so
     the separator orphans the block and the gate reports trailers the commit
     plainly carries as missing (#829).
@@ -518,6 +519,27 @@ class SquashShapes(unittest.TestCase):
             "AI-Assisted: true\n"
             "Assisted-by: AGENT:claude-opus-5 [Claude Code]"
         )
+
+    def test_the_real_forge_shape_is_green(self) -> None:
+        """Block, separator, co-author. This is what `617d6f452` actually is,
+        and it is the shape every squash lands in."""
+        message = f"{self.body()}\n\n---------\n\n{self.COAUTHOR}\n"
+        self.assertEqual(
+            self.checker.validate_commit_message(message, strict=True), []
+        )
+
+    def test_prose_after_the_block_still_terminates_it(self) -> None:
+        """The property the separator step-over must not cost."""
+        message = f"{self.body()}\n\nSome prose afterwards.\n"
+        self.assertTrue(self.checker.validate_commit_message(message, strict=True))
+
+    def test_a_separator_followed_by_prose_is_not_stepped_over(self) -> None:
+        message = f"{self.body()}\n\n---------\n\nSome prose.\n"
+        self.assertTrue(self.checker.validate_commit_message(message, strict=True))
+
+    def test_a_separator_with_prose_above_it_is_not_stepped_over(self) -> None:
+        message = f"subject (#1)\n\nprose.\n\n---------\n\n{self.COAUTHOR}\n"
+        self.assertTrue(self.checker.validate_commit_message(message, strict=True))
 
     def test_pr_body_shape_is_green(self) -> None:
         """What lands now: one body, then the forge's Co-authored-by."""

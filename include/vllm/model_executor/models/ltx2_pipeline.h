@@ -578,7 +578,10 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
 // is why none of them falls back. `Ltx2RefuseUnportedPipelineFeature` throws with
 // a message naming the missing piece and the phase or row that owes it.
 enum class Ltx2UnportedPipelineFeature {
-  kTemporalUpsampler,   // model/upsampler with temporal_upsample=True
+  // model/upsampler with BOTH flags set. The temporal-ONLY arm is ported
+  // (.agents/specs/ltx25-temporal-upsampler.md); this one is a different
+  // operator — `Conv3d(mid, 8*mid)` + `PixelShuffleND(3)`, model.py:55-59.
+  kSpatiotemporalUpsampler,
   kLoraFusion,          // loader/LoraPathStrengthAndSDOps
   kMultishot,           // ltx-pipelines multishot entry points
   kInt8ConvRot,         // ComfyUI-only quantization

@@ -227,6 +227,9 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
           PUSH_HEAD: ${{ github.sha }}
+          # Passed as an ENV VAR, never interpolated into the script: a
+          # body is attacker-controlled text on a fork pull request.
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -eu
           python3 scripts/check-prompt-contract.py
@@ -246,6 +249,23 @@ jobs:
             echo "diff-scoped and every commit's own push already ran it."
           else
             python3 scripts/check-commit-trailers.py --range "$base..$head"
+          fi
+          # `squash_merge_commit_message = PR_BODY` makes THIS BODY the
+          # landed commit message, so it is held to the contract its commit
+          # will be held to, by the same checker (#848). Without this the
+          # failure moves from "caught on the PR" to "no trailers, caught
+          # on main after the merge" -- and #822 cancels the main push run
+          # that would report it.
+          # `${PR_BODY:-}` because this step runs under `set -eu` and the
+          # variable is UNSET, not empty, on a lane with no pull request.
+          # `mktemp` rather than $RUNNER_TEMP for the same reason. An empty body
+          # is not skipped: under PR_BODY it lands a commit carrying no trailers
+          # at all, which is exactly what this is here to catch.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            body_file="$(mktemp)"
+            printf '%s' "${PR_BODY:-}" > "$body_file"
+            python3 scripts/check-commit-trailers.py \
+              --message-file "$body_file" --filled
           fi
       - name: NOW.md stays a short one-Read resume surface
         run: |

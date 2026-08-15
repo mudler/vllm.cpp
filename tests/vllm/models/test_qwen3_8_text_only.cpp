@@ -39,6 +39,7 @@
 //                          loader has no analogue of.
 //   5. inertness         — the VL spelling stays the per-layer seam DEFAULT.
 #include <doctest/doctest.h>
+#include <nlohmann/json.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -47,12 +48,18 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+// The PUBLISHED shape manifests of Qwen/Qwen3.8-2.4T-A95B and
+// Qwen/Qwen3.6-35B-A3B (issue #740). Names, dtypes and shapes only — no weight
+// bytes. Regenerate with fixtures/gen_qwen3_5_stacked_shapes.py.
+#include "fixtures/qwen3_5_stacked_shapes.inc"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
@@ -128,6 +135,44 @@ int64_t Numel(const std::vector<int64_t>& shape) {
   return n;
 }
 
+// The ONE definition of a fixture's bf16 payload: element `e` of the tensor at
+// position `i` in a spec list. `BuildSafetensors` writes exactly this, and the
+// stacked-expert case below recomputes its EXPECTATION from it rather than from
+// anything the loader touched.
+//
+// That independence is the point. Comparing a stacked load against a per-expert
+// load would compare two arms of the same loader, and a shared defect -- a
+// mis-ordered gate/up split applied consistently -- would pass. Deriving the
+// expected bytes here, from the index arithmetic of the DECLARED shape, cannot.
+//
+// IT IS A HASH, AND THAT IS LOAD-BEARING. This was `0x3d00 + ((i*37 + e*7) &
+// 0x1ff)`, which is AFFINE IN `e` WITH PERIOD 512. The two defects the stacked
+// reader most plausibly has -- swapping the gate and up halves, and dropping the
+// per-expert stride -- shift `e` by exactly `I*H` and `2*I*H`, and for any
+// fixture whose block sizes are multiples of that period BOTH shifts land on the
+// IDENTICAL value. Measured, not reasoned: with the affine generator, mutating
+// the loader to swap gate/up and to read expert 0 for every expert BOTH left
+// this suite fully green at 19400/19400. A generator whose stride happens to
+// alias with the layout under test proves nothing about the layout.
+//
+// The mix below (an xorshift-multiply finalizer) has no such structure, so two
+// distinct source offsets agree only by chance -- and a single disagreeing
+// element out of the thousands compared fails the case.
+uint16_t Bf16At(size_t tensor_index, size_t elem) {
+  auto h = static_cast<uint32_t>(tensor_index * 0x9E3779B1u +
+                                 elem * 0x85EBCA6Bu);
+  h ^= h >> 16;
+  h *= 0x7FEB352Du;
+  h ^= h >> 15;
+  h *= 0x846CA68Bu;
+  h ^= h >> 16;
+  // 0x3c00..0x3fff: 1024 distinct FINITE, positive, normal bf16 values. Finite
+  // matters -- the F32 sibling below explains why a NaN would make a derived
+  // scalar assertion meaningless, and the same applies to a byte comparison
+  // being readable when it fails.
+  return static_cast<uint16_t>(0x3c00u + (h & 0x03ffu));
+}
+
 // Byte width of the safetensors dtypes this file emits. Must agree with the
 // reader's own table (safetensors_reader.cpp:41-48), which REJECTS a header
 // whose shape times dtype width does not equal its data_offsets span.
@@ -141,7 +186,14 @@ size_t ElemSize(const std::string& dtype) {
 // ONLY on its position in `specs`, so two files built from the same specs with
 // different NAMES carry byte-identical payloads — which is what lets the
 // namespace test compare two loads for byte equality.
-std::string BuildSafetensors(const std::vector<Spec>& specs) {
+// `header_pad` appends that many SPACES after the header's closing brace.
+// Trailing whitespace is legal JSON and padding the header is exactly how real
+// writers move their payload, so this shifts every tensor's byte offset by
+// `header_pad` without changing one byte of content -- which is what lets the
+// odd-offset case below put a stacked expert tensor on an ODD address
+// (issues #627, #772; mirrors tests/vllm/models/test_loader_unaligned_offsets.cpp).
+std::string BuildSafetensors(const std::vector<Spec>& specs,
+                             size_t header_pad = 0) {
   std::string header = "{";
   std::string body;
   uint64_t offset = 0;
@@ -166,7 +218,7 @@ std::string BuildSafetensors(const std::vector<Spec>& specs) {
     if (dtype == "BF16") {
       for (size_t e = 0; e < static_cast<size_t>(n); ++e) {
         // A finite, distinct bf16 per (tensor index, element index).
-        const auto v = static_cast<uint16_t>(0x3d00 + ((i * 37 + e * 7) & 0x1ff));
+        const uint16_t v = Bf16At(i, e);
         std::memcpy(dst + e * 2, &v, 2);
       }
     } else if (dtype == "F32") {
@@ -185,6 +237,7 @@ std::string BuildSafetensors(const std::vector<Spec>& specs) {
     }
   }
   header += "}";
+  header.append(header_pad, ' ');
   return U64Le(header.size()) + header + body;
 }
 
@@ -443,6 +496,173 @@ std::vector<Spec> MoeSpecsWithBf16LmHead(const std::string& p) {
   }
   s.push_back({"lm_head.weight", {kMoeVocab, kMoeHidden}});
   return s;
+}
+
+// ---------------------------------------------------------------------------
+// The 3-D STACKED bf16 routed-expert arm (issue #740). THIS is the layout every
+// published Qwen3.5-family MoE repo ships, and the one the loader gained here.
+//
+// THE ROUTED-EXPERT INTERMEDIATE IS DELIBERATELY *NOT* `kMoeInter`. The loader
+// resolves a stacked tensor's orientation exactly as upstream does -- last dim
+// is hidden => `[E, 2I, H]`, else `[E, H, 2I]`
+// (vllm/model_executor/layers/fused_moe/routed_experts.py:923-934 @ 555967922)
+// -- so a fixture with I == H makes the two orientations INDISTINGUISHABLE and
+// the expectation below unfalsifiable. 32 against a hidden of 16 keeps H (16),
+// I (32) and 2I (64) pairwise distinct, which is what lets the transposed
+// subcase prove it took the other branch. bf16 experts carry no NVFP4 alignment
+// constraint, so this is free; the shared expert and head stay on `kMoeInter`.
+constexpr int64_t kStackedInter = 32;
+
+// The supported-everything-else fixture: `MoeOneLayerSpecs` with the per-expert
+// NVFP4 routed experts REPLACED by the published stacked bf16 pair.
+//
+// READ THIS BEFORE CONCLUDING `Qwen/Qwen3.6-35B-A3B` LOADS. It does not, and
+// this fixture is not it. A published bf16 repo is bf16 THROUGHOUT -- bf16
+// attention/GDN tower and a bf16 `lm_head` -- and the MoE arm still implements
+// only per-tensor FP8 for the tower and NVFP4 for the head. Those are separate
+// owed arms, explicitly out of scope in .agents/specs/moe-bf16-stacked-experts
+// .md, and the refusal case below pins that a fully-published index STILL
+// refuses (at the head, which is now the first unimplemented thing it meets).
+// What this fixture isolates is exactly the one arm this row added.
+std::vector<Spec> StackedBf16MoeSpecs(const std::string& p, bool transposed) {
+  std::vector<Spec> s;
+  const std::string per_expert = p + "layers.0.mlp.experts.";
+  for (const Spec& x : MoeOneLayerSpecs(p)) {
+    if (x.name.rfind(per_expert, 0) != 0) s.push_back(x);
+  }
+  const std::string mlp = p + "layers.0.mlp.";
+  if (transposed) {
+    s.push_back({mlp + "experts.gate_up_proj",
+                 {kMoeExperts, kMoeHidden, 2 * kStackedInter}});
+    s.push_back({mlp + "experts.down_proj",
+                 {kMoeExperts, kStackedInter, kMoeHidden}});
+  } else {
+    s.push_back({mlp + "experts.gate_up_proj",
+                 {kMoeExperts, 2 * kStackedInter, kMoeHidden}});
+    s.push_back({mlp + "experts.down_proj",
+                 {kMoeExperts, kMoeHidden, kStackedInter}});
+  }
+  return s;
+}
+
+// A checkpoint carrying BOTH spellings under the backbone. Nothing published
+// looks like this; the loader must refuse it rather than bind half the experts
+// from each, which is the same failure `ResolveQwen3_5BackbonePrefix` refuses
+// for a mixed namespace.
+std::vector<Spec> MixedLayoutMoeSpecs(const std::string& p) {
+  std::vector<Spec> s = MoeOneLayerSpecs(p);
+  const std::string mlp = p + "layers.0.mlp.";
+  s.push_back({mlp + "experts.gate_up_proj",
+               {kMoeExperts, 2 * kStackedInter, kMoeHidden}});
+  s.push_back({mlp + "experts.down_proj",
+               {kMoeExperts, kMoeHidden, kStackedInter}});
+  return s;
+}
+
+// Position of `name` in `specs` -- the first argument of `Bf16At`. REQUIREs
+// exactly one match: two same-named entries would make the expectation read a
+// payload the loader never saw.
+size_t SpecIndex(const std::vector<Spec>& specs, const std::string& name) {
+  size_t found = specs.size();
+  int hits = 0;
+  for (size_t i = 0; i < specs.size(); ++i) {
+    if (specs[i].name == name) {
+      found = i;
+      ++hits;
+    }
+  }
+  REQUIRE(hits == 1);
+  return found;
+}
+
+uint16_t Bf16Of(const vllm::OwnedTensor& t, int64_t index) {
+  uint16_t v = 0;
+  std::memcpy(&v, t.bytes.data() + index * 2, 2);
+  return v;
+}
+
+// Every routed expert of `moe`, checked ELEMENT BY ELEMENT against the payload
+// the fixture declared -- the gate/up split, the per-expert stride and the
+// orientation all at once.
+//
+// The loader's bf16 expert convention (qwen3_5_weights.h:420-422) is
+// gate/up `[H, I]` and down `[I, H]`, i.e. transposed from the checkpoint's
+// `[out, in]`, matching what the GGUF and synthetic arms already produce.
+void CheckStackedExperts(const vllm::MoeBlockWeights& moe,
+                         const std::vector<Spec>& specs, const std::string& p,
+                         bool transposed) {
+  const std::string mlp = p + "layers.0.mlp.";
+  const size_t gu = SpecIndex(specs, mlp + "experts.gate_up_proj");
+  const size_t dn = SpecIndex(specs, mlp + "experts.down_proj");
+  constexpr int64_t H = kMoeHidden;
+  constexpr int64_t I = kStackedInter;
+
+  // THE FIXTURE MUST BE ABLE TO SEE THE DEFECTS THIS CASE EXISTS FOR. Both
+  // live mutations shift the source offset by a whole block -- gate<->up by
+  // I*H, a dropped expert stride by 2*I*H -- so if the payload happened to
+  // repeat with either period, every element-wise check below would pass on a
+  // wrong read. The earlier affine generator did exactly that. These four
+  // REQUIREs are the standing proof that it does not: they compare the very
+  // offsets the mutations exchange.
+  {
+    constexpr int64_t H0 = kMoeHidden;
+    constexpr int64_t I0 = kStackedInter;
+    REQUIRE(kMoeExperts >= 2);
+    // gate(e=0, row 0) vs up(e=0, row 0), in BOTH declared orientations.
+    REQUIRE(Bf16At(gu, 0) != Bf16At(gu, static_cast<size_t>(I0 * H0)));
+    REQUIRE(Bf16At(gu, 0) != Bf16At(gu, static_cast<size_t>(I0)));
+    // expert 0 vs expert 1, ditto.
+    REQUIRE(Bf16At(gu, 0) != Bf16At(gu, static_cast<size_t>(2 * I0 * H0)));
+    REQUIRE(Bf16At(dn, 0) != Bf16At(dn, static_cast<size_t>(I0 * H0)));
+  }
+
+  REQUIRE(moe.expert_gate.size() == static_cast<size_t>(kMoeExperts));
+  REQUIRE(moe.expert_up.size() == static_cast<size_t>(kMoeExperts));
+  REQUIRE(moe.expert_down.size() == static_cast<size_t>(kMoeExperts));
+  // The NVFP4 vectors stay EMPTY on this arm; exactly one set is populated
+  // (qwen3_5_weights.h:436-439). A stacked load that ALSO filled them would be
+  // a second, contradictory binding of the same experts.
+  CHECK(moe.expert_gate_fp4.empty());
+  CHECK(moe.expert_up_fp4.empty());
+  CHECK(moe.expert_down_fp4.empty());
+
+  for (int64_t e = 0; e < kMoeExperts; ++e) {
+    CAPTURE(e);
+    const vllm::OwnedTensor& g = moe.expert_gate[static_cast<size_t>(e)];
+    const vllm::OwnedTensor& u = moe.expert_up[static_cast<size_t>(e)];
+    const vllm::OwnedTensor& d = moe.expert_down[static_cast<size_t>(e)];
+    REQUIRE(g.rank == 2);
+    CHECK(g.shape[0] == H);
+    CHECK(g.shape[1] == I);
+    REQUIRE(u.rank == 2);
+    CHECK(u.shape[0] == H);
+    CHECK(u.shape[1] == I);
+    REQUIRE(d.rank == 2);
+    CHECK(d.shape[0] == I);
+    CHECK(d.shape[1] == H);
+    REQUIRE(g.bytes.size() == static_cast<size_t>(H * I) * 2);
+    REQUIRE(u.bytes.size() == g.bytes.size());
+    REQUIRE(d.bytes.size() == g.bytes.size());
+
+    for (int64_t h = 0; h < H; ++h) {
+      for (int64_t i = 0; i < I; ++i) {
+        // Source element index inside the DECLARED stacked shape. Canonical
+        // `[E, 2I, H]`: gate row i, up row I + i. Transposed `[E, H, 2I]`:
+        // gate column i, up column I + i. Either way gate is the FIRST half.
+        const int64_t gate_src =
+            transposed ? (e * H + h) * 2 * I + i : ((e * 2 * I) + i) * H + h;
+        const int64_t up_src = transposed
+                                   ? (e * H + h) * 2 * I + I + i
+                                   : ((e * 2 * I) + I + i) * H + h;
+        // down: canonical `[E, H, I]` vs transposed `[E, I, H]`.
+        const int64_t down_src =
+            transposed ? (e * I + i) * H + h : (e * H + h) * I + i;
+        CHECK(Bf16Of(g, h * I + i) == Bf16At(gu, static_cast<size_t>(gate_src)));
+        CHECK(Bf16Of(u, h * I + i) == Bf16At(gu, static_cast<size_t>(up_src)));
+        CHECK(Bf16Of(d, i * H + h) == Bf16At(dn, static_cast<size_t>(down_src)));
+      }
+    }
+  }
 }
 
 // Runs `fn` and returns the `what()` of whatever it threw, or "" if it returned
@@ -967,24 +1187,44 @@ TEST_CASE("qwen3_8: the published stacked/unquantized MoE arm is REFUSED, and th
     CHECK_FALSE(Mentions(message, "tensor not found"));
   };
 
-  SUBCASE("3-D stacked experts, flat namespace — the Qwen3.8-2.4T-A95B shape") {
+  // WHAT CHANGED IN THESE TWO SUBCASES, AND WHY THEY WERE NOT DELETED (#740).
+  //
+  // They were written when the STACKED EXPERT SPELLING was itself the refusal.
+  // It is not any more — case 4d loads it — so asserting that a stacked name is
+  // refused would now assert the opposite of the implemented behavior. Deleting
+  // them instead would have quietly dropped the only CPU-visible pin on what a
+  // FULLY published bf16 index does, which is the claim most likely to be
+  // over-read from this row ("the stacked arm landed, so Qwen3.6-35B-A3B
+  // loads").
+  //
+  // So they are RETAINED WITH THEIR SUBJECT NARROWED: a published repo is bf16
+  // THROUGHOUT, and the MoE arm still implements only NVFP4 for `lm_head` (and
+  // only per-tensor FP8 for the attention/GDN tower). The refusal therefore
+  // still fires, one layer further in, and must still NAME what is missing.
+  // Both remain out of scope in .agents/specs/moe-bf16-stacked-experts.md
+  // §Scope, and this is where that stays visible.
+  SUBCASE("a FULLY published index, flat namespace — the Qwen3.8-2.4T-A95B shape") {
     const std::string message = load(PublishedStackedMoeSpecs("model."), "stacked_flat");
     CAPTURE(message);
-    CHECK(Mentions(message, "model.layers.0.mlp.experts.gate_up_proj"));
-    CHECK(Mentions(message, "stacked"));
+    // NOT a complaint about a stacked expert name, and NOT the raw dtype
+    // complaint #490 replaced: the head is the first unimplemented thing here.
+    CHECK_FALSE(Mentions(message, "model.layers.0.mlp.experts.gate_up_proj"));
+    CHECK(Mentions(message, "lm_head.weight_scale"));
+    CHECK(Mentions(message, "unquantized"));
     names_the_requirement(message);
   }
 
-  SUBCASE("3-D stacked experts, VL namespace — the Qwen3.6-35B-A3B shape") {
-    // The published 35B repo is stacked too; only the NVFP4 REQUANT loads. So
-    // this refusal is not a text-only-arm quirk — the MoE loader has never read
-    // a published Qwen bf16 MoE checkpoint under EITHER spelling.
+  SUBCASE("a FULLY published index, VL namespace — the Qwen3.6-35B-A3B shape") {
+    // The published 35B repo is stacked and unquantized throughout; only the
+    // NVFP4 REQUANT loads end to end. This row made its ROUTED EXPERTS
+    // readable, which is not the same claim.
     const std::string message =
         load(PublishedStackedMoeSpecs("model.language_model."), "stacked_vl");
     CAPTURE(message);
-    CHECK(Mentions(message,
-                   "model.language_model.layers.0.mlp.experts.gate_up_proj"));
-    CHECK(Mentions(message, "stacked"));
+    CHECK_FALSE(Mentions(
+        message, "model.language_model.layers.0.mlp.experts.gate_up_proj"));
+    CHECK(Mentions(message, "lm_head.weight_scale"));
+    CHECK(Mentions(message, "unquantized"));
     names_the_requirement(message);
   }
 
@@ -1049,6 +1289,209 @@ TEST_CASE("qwen3_8: the published stacked/unquantized MoE arm is REFUSED, and th
     CHECK(load(MoeOneLayerSpecs("model."), "mtp_stacked_flat").empty());
     CHECK(load(MoeOneLayerSpecs("model.language_model."), "mtp_stacked_vl")
               .empty());
+  }
+
+  SUBCASE("a stacked expert tensor that is NOT bf16 is refused by dtype") {
+    // The stacked arm this row added is the UNQUANTIZED one. A stacked tensor
+    // in some quantized dtype is a further owed arm, and it cannot be caught by
+    // a name scan — only the reader sees the dtype — so this is the one refusal
+    // that fires from inside the loader rather than the up-front check.
+    std::vector<Spec> specs = StackedBf16MoeSpecs("model.", false);
+    bool retyped = false;
+    for (Spec& x : specs) {
+      if (x.name == "model.layers.0.mlp.experts.gate_up_proj") {
+        x.dtype = "F8_E4M3";
+        retyped = true;
+      }
+    }
+    REQUIRE(retyped);
+    const std::string message = load(specs, "stacked_fp8");
+    CAPTURE(message);
+    CHECK(Mentions(message, "model.layers.0.mlp.experts.gate_up_proj"));
+    CHECK(Mentions(message, "BF16"));
+    CHECK(Mentions(message, "F8_E4M3"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+
+  SUBCASE("BOTH spellings under the backbone is refused, not half-bound") {
+    const std::string message =
+        load(MixedLayoutMoeSpecs("model."), "mixed_layout");
+    CAPTURE(message);
+    CHECK(Mentions(message, "qwen3_5 weights"));
+    CHECK(Mentions(message, "BOTH"));
+    CHECK(Mentions(message, "experts.gate_up_proj"));
+    CHECK_FALSE(Mentions(message, "tensor not found"));
+  }
+}
+
+// ===========================================================================
+// 4d. THE 3-D STACKED BF16 ROUTED-EXPERT ARM (issue #740,
+//     .agents/specs/moe-bf16-stacked-experts.md). This is the layout every
+//     published Qwen3.5-family MoE repo ships and the one 4c used to refuse
+//     outright.
+//
+//     THE SLICING ORDER IS NOT GUESSED FROM SHAPES. It is upstream's, read at
+//     the parity pin `555967922`:
+//
+//       vllm/model_executor/layers/fused_moe/routed_experts.py:1081-1083
+//         (f"{w13}weight", f"experts.gate_up_proj", 0, "w1"),
+//         (f"{w13}weight", f"experts.gate_up_proj", 1, "w3"),
+//         (f"{w2}weight",  f"experts.down_proj",    0, "w2"),
+//       vllm/model_executor/layers/fused_moe/routed_experts.py:923-934
+//         if fused_weight.shape[-1] != unpadded_hidden:
+//             fused_weight = fused_weight.transpose(-1, -2)
+//         experts_shard = fused_weight.chunk(2, dim=1)[expert_id]   # w1 | w3
+//         ...
+//         if fused_weight.shape[-2] != unpadded_hidden:
+//             fused_weight = fused_weight.transpose(-1, -2)
+//       vllm/model_executor/layers/fused_moe/routed_experts.py:942
+//         loaded_experts = experts_shard.unbind()   # expert stride is dim 0
+//
+//     And the HuggingFace side declares the same axis order outright, which is
+//     what makes the runtime sniff above a compatibility branch rather than the
+//     authority — transformers 5.3.0
+//     models/qwen3_5_moe/modeling_qwen3_5_moe.py:820-821:
+//         self.gate_up_proj = nn.Parameter(
+//             torch.empty(num_experts, 2 * intermediate_dim, hidden_dim))
+//         self.down_proj = nn.Parameter(
+//             torch.empty(num_experts, hidden_dim, intermediate_dim))
+//     with :842 `linear(x, gate_up_proj[e]).chunk(2, dim=-1)` -> gate is rows
+//     [0, I) of that weight. `modular_qwen3_5_moe.py:164` names the same split
+//     in its TP plan: "layers.*.mlp.experts.gate_up_proj": "packed_colwise".
+//
+//     So: normalize `gate_up_proj` to `[E, 2I, H]` (last dim hidden), split it
+//     in half along dim 1 with the FIRST half gate/w1 and the second up/w3;
+//     normalize `down_proj` to `[E, H, I]` (dim -2 hidden); expert `e` is slice
+//     `e` of dim 0 in both.
+//
+//     Corroborated independently against the real published index
+//     `Qwen/Qwen3.6-35B-A3B` @ 995ad96e (hidden 2048, moe_intermediate 512,
+//     256 experts): `gate_up_proj` is BF16 `[256, 1024, 2048]` and `down_proj`
+//     BF16 `[256, 2048, 512]`, and the sibling `shared_expert.gate_proj.weight`
+//     `[512, 2048]` / `down_proj.weight` `[2048, 512]` pin which of I and H is
+//     which. `gemma4_weights.cpp:194-199` asserts the same two shapes in tree.
+//
+//     WHY EXACT BYTES AND NOT A CROSS-LOADER COMPARISON. A wrong gate/up split
+//     or a wrong expert stride LOADS CLEANLY and only shows up in logits, and a
+//     comparison against a second arm of this same loader would share the
+//     defect. The expectation here is recomputed from `Bf16At` and the declared
+//     shape, so nothing the loader does can move it.
+// ===========================================================================
+TEST_CASE("qwen3_8: 3-D stacked bf16 routed experts load, with upstream's gate/up split") {
+  auto run = [](const std::string& p, bool transposed, bool deferred) {
+    CAPTURE(p);
+    CAPTURE(transposed);
+    CAPTURE(deferred);
+    const std::vector<Spec> specs = StackedBf16MoeSpecs(p, transposed);
+    const TempFile file(BuildSafetensors(specs), "stacked_bf16");
+    const HfConfig config = OneLayerMoeConfig();
+    if (!deferred) {
+      std::vector<vllm::SafetensorsFile> shards;
+      shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+      const vllm::Qwen3_5MoeWeights w = vllm::LoadQwen3_5Moe(shards, config);
+      CHECK_FALSE(static_cast<bool>(w.load_layer_experts));
+      REQUIRE(w.layers.size() == 1u);
+      CheckStackedExperts(w.layers[0].moe, specs, p, transposed);
+      return;
+    }
+    auto owner = std::make_shared<std::vector<vllm::SafetensorsFile>>();
+    owner->push_back(vllm::SafetensorsFile::Open(file.path()));
+    vllm::Qwen3_5MoeWeights w = vllm::LoadQwen3_5Moe(*owner, config, owner);
+    REQUIRE(static_cast<bool>(w.load_layer_experts));
+    REQUIRE(w.layers.size() == 1u);
+    // Deferred precondition: nothing routed is resident yet, so what the check
+    // below sees is what the CLOSURE produced and not an eager load.
+    CHECK(w.layers[0].moe.expert_gate.empty());
+    CHECK(w.layers[0].moe.expert_gate_fp4.empty());
+    // Move first, exactly as the real load moves the weights into the
+    // LoadedModel before PrepareMarlinResident drives the closure.
+    vllm::Qwen3_5MoeWeights moved = std::move(w);
+    moved.load_layer_experts(0, moved.layers[0].moe);
+    CheckStackedExperts(moved.layers[0].moe, specs, p, transposed);
+  };
+
+  SUBCASE("canonical [E,2I,H] / [E,H,I], EAGER experts (no shards owner)") {
+    run("model.", /*transposed=*/false, /*deferred=*/false);
+    run("model.language_model.", /*transposed=*/false, /*deferred=*/false);
+  }
+
+  SUBCASE("canonical [E,2I,H] / [E,H,I], DEFERRED experts — the closure runs") {
+    // The closure captures the layout decision BY VALUE and runs long after the
+    // resolution frame is gone; a per-lookup re-probe would be free to answer
+    // differently here, which is the failure this drives.
+    run("model.", /*transposed=*/false, /*deferred=*/true);
+    run("model.language_model.", /*transposed=*/false, /*deferred=*/true);
+  }
+
+  SUBCASE("the stacked payload begins on an ODD byte (#627, #772)") {
+    // WHY THIS IS NOT COVERED BY THE CASES ABOVE. Safetensors aligns nothing: a
+    // tensor starts at `8 + <header length> + <preceding sizes>`, and none of
+    // those is required to be even, so a BF16 tensor on an ODD address is an
+    // ordinary file. The stacked reader is the one that most obviously invites
+    // the mistake — it forms a per-expert base by pointer arithmetic and then
+    // reads 2-byte elements out of it — and `qwen3_5_weights.cpp` is itself the
+    // subject of #627, one of the FOUR recurrences
+    // tests/vllm/models/test_loader_unaligned_offsets.cpp enumerates. The other
+    // subcases here take whatever offset the writer happened to produce, which
+    // is an even one, so none of them can fail if a `uint16_t*` is formed.
+    //
+    // The offset is FORCED and then ASSERTED, never inferred: the header is
+    // padded with spaces (legal JSON, and how real writers move a payload) until
+    // the mapped address of `experts.gate_up_proj` is odd, and a fixture edit
+    // that made it even fails the REQUIRE instead of passing while covering
+    // nothing.
+    for (const bool transposed : {false, true}) {
+      CAPTURE(transposed);
+      const std::string p = "model.";
+      const std::vector<Spec> specs = StackedBf16MoeSpecs(p, transposed);
+      const std::string gu_name = p + "layers.0.mlp.experts.gate_up_proj";
+
+      size_t pad = 0;
+      for (; pad < 2; ++pad) {
+        const TempFile probe(BuildSafetensors(specs, pad), "stacked_odd_probe");
+        const vllm::SafetensorsFile shard =
+            vllm::SafetensorsFile::Open(probe.path());
+        const auto addr = reinterpret_cast<uintptr_t>(shard.Get(gu_name).data);
+        if ((addr & 1u) != 0u) break;
+      }
+      REQUIRE(pad < 2);  // one of the two parities must land odd
+
+      const TempFile file(BuildSafetensors(specs, pad), "stacked_odd");
+      std::vector<vllm::SafetensorsFile> shards;
+      shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+      // The precondition, asserted on the very file the load below reads.
+      const auto gu_addr =
+          reinterpret_cast<uintptr_t>(shards[0].Get(gu_name).data);
+      REQUIRE((gu_addr & 1u) == 1u);
+
+      const vllm::Qwen3_5MoeWeights w =
+          vllm::LoadQwen3_5Moe(shards, OneLayerMoeConfig());
+      REQUIRE(w.layers.size() == 1u);
+      // VALUES, not merely "it returned".
+      //
+      // BE PRECISE ABOUT WHAT THIS CATCHES ON WHICH TARGET. x86_64 permits
+      // unaligned loads, so replacing `vt::LoadUnaligned` with a
+      // `reinterpret_cast<const uint16_t*>` here would still produce the right
+      // BYTES and this case would stay green on this box. What it buys is the
+      // other two halves of the guarantee: it is the only case that EXERCISES
+      // the stacked path from an odd base at all, which is what lets the
+      // sanitizer lane's `-fsanitize=alignment` fire on such a cast (all three
+      // recurrences before #772 were found exactly that way) and what makes the
+      // strict-alignment builds -- `build-test-cpu-arm64`, Jetson/Orin sm_110 --
+      // fault instead of quietly passing; and it catches any reader that
+      // "fixes" alignment by rounding the base pointer down, which no
+      // even-offset fixture can see. Mutation-proven in that last form.
+      CheckStackedExperts(w.layers[0].moe, specs, p, transposed);
+    }
+  }
+
+  SUBCASE("transposed [E,H,2I] / [E,I,H] — upstream's other orientation") {
+    // `shape[-1] != hidden` / `shape[-2] != hidden` are upstream's own tests,
+    // and H=16, I=32, 2I=64 are pairwise distinct here so exactly one branch
+    // can match. Reading this fixture with the canonical branch produces
+    // garbage, not an error.
+    run("model.", /*transposed=*/true, /*deferred=*/false);
+    run("model.", /*transposed=*/true, /*deferred=*/true);
   }
 }
 
@@ -1119,5 +1562,500 @@ TEST_CASE("qwen3_8: the VL prefix stays the default for the gated 27B/35B checkp
     CAPTURE(message);
     CHECK(Mentions(message,
                    "model.language_model.layers.0.input_layernorm.weight"));
+  }
+}
+
+// ===========================================================================
+// 5. THE LOAD-PLAN DRY RUN (issue #740,
+//    .agents/specs/moe-bf16-stacked-experts.md §"Loadability of the 2.4T
+//    itself, without 4.8 TB").
+//
+//    `Qwen/Qwen3.8-2.4T-A95B` is 4.89 TB over 213 shards. Nothing here can hold
+//    it, so section 4d's byte-exact stacked-expert proof runs at toy dimensions
+//    and section 4c's refusals run on synthetic indices. Neither shows that the
+//    2.4T's OWN names, shapes and dtypes resolve, nor that the per-expert offset
+//    arithmetic survives its dimensions — ONE layer's `gate_up_proj` is
+//    34,359,738,368 bytes, sixteen times INT32_MAX.
+//
+//    `PlanQwen3_5MoeLoad` walks the whole load for a config and reports every
+//    tensor it would fetch, touching no weight byte. Checked against the
+//    PUBLISHED index, that answers "would it load on hardware that can hold it?"
+//    for exactly the part answerable without the hardware — and, just as
+//    usefully, says precisely which tensors would NOT.
+//
+//    THE PLAN IS ONLY WORTH ANYTHING IF IT IS A PROJECTION OF THE LOADER.
+//    Case 5a is what makes it one: it builds a checkpoint from the plan ALONE,
+//    requires the production `LoadQwen3_5Moe` to read it, then deletes each
+//    planned tensor in turn and requires the load to fail NAMING that tensor.
+//    A plan entry the loader never wanted survives its own deletion; a tensor
+//    the loader wants that the plan omits breaks the very first load. Only a
+//    plan that is exactly the loader's request set passes both.
+// ===========================================================================
+namespace {
+
+// Dimensions for the plan round-trip. `kPlanInter` is deliberately NOT
+// `kMoeHidden`: the stacked reader resolves orientation by comparing dims
+// against hidden, so I == H would make the canonical and transposed readings
+// indistinguishable. NVFP4 needs K % 16 == 0, which both 16 and 32 satisfy.
+constexpr int64_t kPlanInter = 32;
+constexpr int64_t kPlanKeyHeads = 2;
+constexpr int64_t kPlanKeyHeadDim = 4;
+constexpr int64_t kPlanValueHeads = 2;
+constexpr int64_t kPlanValueHeadDim = 4;
+
+// TWO layers, one of EACH attention kind, so the round-trip drives `PlanAttn`
+// and `PlanGdn` both. A one-layer config would leave the GDN half of the plan
+// — nine of its tensor families, including the rank-3 conv weight and the two
+// rank-1 f32 upcasts — completely unexercised.
+HfConfig PlanMoeConfig() {
+  HfConfig config = OneLayerMoeConfig();
+  config.num_hidden_layers = 2;
+  config.layer_types = {"full_attention", "linear_attention"};
+  config.vocab_size = kMoeVocab;
+  config.head_dim = kMoeHeadDim;
+  config.moe_intermediate_size = kPlanInter;
+  config.shared_expert_intermediate_size = kPlanInter;
+  config.linear_num_key_heads = kPlanKeyHeads;
+  config.linear_key_head_dim = kPlanKeyHeadDim;
+  config.linear_num_value_heads = kPlanValueHeads;
+  config.linear_value_head_dim = kPlanValueHeadDim;
+  config.linear_conv_kernel_dim = 4;
+  return config;
+}
+
+// A planned tensor as a `Spec` the synthetic writer can emit. A plan entry with
+// NO shape is one the loader reads off the header (the attention projections,
+// whose width depends on `attn_output_gate`); any rank-2 shape loads, so the
+// test picks one rather than the planner inventing one.
+std::vector<Spec> SpecsFromPlan(const std::vector<vllm::PlannedTensor>& plan) {
+  std::vector<Spec> specs;
+  specs.reserve(plan.size());
+  for (const vllm::PlannedTensor& t : plan) {
+    std::vector<int64_t> shape = t.shape;
+    if (shape.empty()) {
+      // Scalars (`weight_scale` / `input_scale` / `weight_scale_2`) are rank 1
+      // here exactly as the NVFP4 and FP8 fixtures above emit them; the loader
+      // reads them through ReadF32Scalar, which cares only about byte count.
+      shape = (t.dtype == "F32") ? std::vector<int64_t>{1}
+                                 : std::vector<int64_t>{kMoeQ, kMoeHidden};
+    }
+    specs.push_back({t.name, shape, t.dtype});
+  }
+  return specs;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// 5a. The plan IS the loader's request set — proven in both directions.
+// ---------------------------------------------------------------------------
+TEST_CASE("qwen3_8: the load plan is exactly what LoadQwen3_5Moe fetches") {
+  const HfConfig config = PlanMoeConfig();
+
+  auto exercise = [&config](const std::string& prefix,
+                            vllm::MoeExpertLayout layout) {
+    CAPTURE(prefix);
+    CAPTURE(layout == vllm::MoeExpertLayout::kStackedBf16);
+    const std::vector<vllm::PlannedTensor> plan =
+        vllm::PlanQwen3_5MoeLoad(config, prefix, layout);
+    REQUIRE(plan.size() > 40u);
+
+    // No plan entry may repeat: a duplicate would let the deletion sweep below
+    // remove one copy, leave the other, and score a false "the loader did not
+    // need it".
+    std::set<std::string> unique;
+    for (const vllm::PlannedTensor& t : plan) {
+      CAPTURE(t.name);
+      REQUIRE(unique.insert(t.name).second);
+    }
+
+    const std::vector<Spec> full = SpecsFromPlan(plan);
+
+    // DIRECTION 1 — the plan is SUFFICIENT. A checkpoint containing exactly the
+    // planned tensors, and nothing else, loads through the production entry
+    // point. Anything the loader wants that the plan forgot fails right here.
+    {
+      const TempFile file(BuildSafetensors(full), "plan_full");
+      std::vector<vllm::SafetensorsFile> shards;
+      shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+      const std::string message =
+          CaptureThrow([&] { (void)vllm::LoadQwen3_5Moe(shards, config); });
+      CAPTURE(message);
+      CHECK(message.empty());
+    }
+
+    // The layout the plan was built for is the one the resulting index resolves
+    // to. A plan that emitted the other spelling would still load above (it is
+    // self-consistent), and only this catches it.
+    std::vector<std::string> names;
+    names.reserve(full.size());
+    for (const Spec& s : full) names.push_back(s.name);
+    CHECK(vllm::ResolveQwen3_5BackbonePrefix(names) == prefix);
+    CHECK(vllm::ResolveQwen3_5MoeExpertLayout(names, prefix) == layout);
+
+    // DIRECTION 2 — the plan is NECESSARY. Remove one planned tensor at a time;
+    // the load must fail, and the failure must NAME the tensor removed. A plan
+    // entry the loader never asked for would load fine without it.
+    for (size_t i = 0; i < full.size(); ++i) {
+      CAPTURE(full[i].name);
+      std::vector<Spec> without = full;
+      without.erase(without.begin() + static_cast<ptrdiff_t>(i));
+      const TempFile file(BuildSafetensors(without), "plan_minus");
+      std::vector<vllm::SafetensorsFile> shards;
+      shards.push_back(vllm::SafetensorsFile::Open(file.path()));
+      const std::string message =
+          CaptureThrow([&] { (void)vllm::LoadQwen3_5Moe(shards, config); });
+      CAPTURE(message);
+      REQUIRE_FALSE(message.empty());
+      // Either the resolver's "tensor not found: <name>", or an up-front
+      // refusal that quotes the now-missing scale beside the weight it belongs
+      // to. Both name it; a failure that did not would leave a user guessing.
+      CHECK(Mentions(message, full[i].name.c_str()));
+    }
+  };
+
+  SUBCASE("stacked bf16 experts, flat namespace") {
+    exercise("model.", vllm::MoeExpertLayout::kStackedBf16);
+  }
+  SUBCASE("stacked bf16 experts, VL namespace") {
+    exercise("model.language_model.", vllm::MoeExpertLayout::kStackedBf16);
+  }
+  SUBCASE("per-expert NVFP4 experts — the arm every gated row reads") {
+    exercise("model.", vllm::MoeExpertLayout::kPerExpertNvfp4);
+  }
+}
+
+namespace {
+
+// The published shape manifests, keyed by name. Captured from each shard's own
+// safetensors header — `model.safetensors.index.json` carries NO shapes.
+struct PublishedRepo {
+  std::string name;
+  std::map<std::string, std::pair<std::string, std::vector<int64_t>>> tensors;
+  int64_t total_size = 0;
+};
+
+PublishedRepo LoadPublished(const vllm_test::StackedRepoTensor* rows,
+                            int64_t count, int64_t total_size,
+                            const char* repo) {
+  PublishedRepo r;
+  r.name = repo;
+  r.total_size = total_size;
+  for (int64_t i = 0; i < count; ++i) {
+    std::vector<int64_t> shape(rows[i].shape, rows[i].shape + rows[i].rank);
+    REQUIRE(r.tensors.emplace(rows[i].name,
+                              std::make_pair(std::string(rows[i].dtype),
+                                             std::move(shape)))
+                .second);
+  }
+  return r;
+}
+
+int64_t DtypeBytes(const std::string& dtype) {
+  if (dtype == "BF16" || dtype == "F16") return 2;
+  if (dtype == "F32") return 4;
+  return 1;  // U8 / I8 / F8_E4M3
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// 5b. The pinned manifest is the PUBLISHED index, not a retyping of it.
+//
+//     `fixtures/qwen3_8_2_4t_a95b/model.safetensors.index.json` is committed
+//     VERBATIM (as this row's `config.json` already is). It gives names and one
+//     scalar: `metadata.total_size`. The shapes live in the shards' own headers
+//     and are captured in `qwen3_5_stacked_shapes.inc`.
+//
+//     Those two independent artifacts are cross-checked here. The summed
+//     `numel * sizeof(dtype)` over every captured shape must equal the byte
+//     total the published index declares — 4,892,365,451,008 — and the name
+//     sets must be identical. A mis-transcribed shape anywhere in 1609 tensors
+//     moves that sum and fails this case, which is what makes the manifest
+//     usable as ground truth below.
+// ---------------------------------------------------------------------------
+TEST_CASE("qwen3_8: the pinned 2.4T shape manifest agrees with the published index") {
+  std::ifstream in(QWEN3_8_INDEX_FIXTURE);
+  REQUIRE(in.good());
+  const nlohmann::json index = nlohmann::json::parse(in);
+  REQUIRE(index.contains("weight_map"));
+  REQUIRE(index.contains("metadata"));
+
+  const PublishedRepo repo =
+      LoadPublished(vllm_test::kQwen38_2_4TTensors,
+                    vllm_test::kQwen38_2_4TTensorCount,
+                    vllm_test::kQwen38_2_4TTotalSize, vllm_test::kQwen38_2_4TRepo);
+
+  CHECK(index["weight_map"].size() == repo.tensors.size());
+  CHECK(repo.tensors.size() == 1609u);
+  for (const auto& entry : index["weight_map"].items()) {
+    CAPTURE(entry.key());
+    CHECK(repo.tensors.count(entry.key()) == 1u);
+  }
+
+  // The arithmetic cross-check. int64 throughout: the total is 4.89e12.
+  int64_t summed = 0;
+  for (const auto& [name, dt_shape] : repo.tensors) {
+    int64_t numel = 1;
+    for (const int64_t d : dt_shape.second) numel *= d;
+    summed += numel * DtypeBytes(dt_shape.first);
+  }
+  CHECK(summed == vllm_test::kQwen38_2_4TTotalSize);
+  CHECK(static_cast<int64_t>(index["metadata"]["total_size"].get<double>()) ==
+        vllm_test::kQwen38_2_4TTotalSize);
+  CHECK(vllm_test::kQwen38_2_4TTotalSize == 4892365451008LL);
+
+  // BOTH ARTIFACTS ARE PINNED TO A COMMIT, not to `main`. A published repo can
+  // be re-quantized under its own name — `unsloth/...-27B` went from NVFP4 to
+  // FP8 that way — and a manifest captured from a moving ref records shapes
+  // nobody can re-derive. The committed `model.safetensors.index.json` above is
+  // byte-identical to
+  //   https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B/raw/<kQwen38_2_4TRevision>/
+  // and re-running the generator at these two revisions reproduces the manifest
+  // exactly. Asserting them here is what makes the pin falsifiable in tree: a
+  // regenerated fixture that silently moved to another revision fails this.
+  CHECK(std::string(vllm_test::kQwen38_2_4TRevision) ==
+        "207bd685a7e3696cfaff12ded7c6a7ea0f88c996");
+  CHECK(std::string(vllm_test::kQwen36_35BRevision) ==
+        "995ad96eacd98c81ed38be0c5b274b04031597b0");
+}
+
+namespace {
+
+// Runs the whole plan against one published repo and reports the partition.
+struct PlanAudit {
+  std::vector<std::string> satisfied;   // name present, dtype and shape agree
+  std::vector<std::string> missing;     // name absent from the published index
+  std::vector<std::string> mismatched;  // present, but dtype or shape differs
+  std::vector<std::string> unplanned;   // published, but the plan never asks
+};
+
+PlanAudit AuditPlan(const std::vector<vllm::PlannedTensor>& plan,
+                    const PublishedRepo& repo) {
+  PlanAudit a;
+  std::set<std::string> planned;
+  for (const vllm::PlannedTensor& t : plan) {
+    planned.insert(t.name);
+    const auto it = repo.tensors.find(t.name);
+    if (it == repo.tensors.end()) {
+      a.missing.push_back(t.name);
+    } else if (it->second.first != t.dtype ||
+               (!t.shape.empty() && it->second.second != t.shape)) {
+      a.mismatched.push_back(t.name);
+    } else {
+      a.satisfied.push_back(t.name);
+    }
+  }
+  for (const auto& [name, unused] : repo.tensors) {
+    if (planned.count(name) == 0) a.unplanned.push_back(name);
+  }
+  return a;
+}
+
+bool Contains(const std::string& haystack, const std::string& needle) {
+  return haystack.find(needle) != std::string::npos;
+}
+
+// The three arms `.agents/specs/moe-bf16-stacked-experts.md` §Scope puts OUT of
+// scope, and which a published bf16 repo therefore cannot satisfy: the FP8
+// attention tower, the FP8 GDN tower, the NVFP4 shared expert, and the NVFP4
+// head. Anything unsatisfied outside these is a defect in the reader, not an
+// owed arm, and this predicate is what keeps the two apart.
+bool IsOwedArm(const std::string& name) {
+  return Contains(name, ".self_attn.") || Contains(name, ".linear_attn.") ||
+         Contains(name, ".mlp.shared_expert.") ||
+         name.rfind("lm_head.", 0) == 0;
+}
+
+// Walks a published repo the way `LoadQwen3_5Moe` would: resolve the namespace
+// once, resolve the routed-expert layout once, then plan.
+PlanAudit AuditPublished(const PublishedRepo& repo, const HfConfig& config,
+                         const std::string& expect_prefix,
+                         vllm::MoeExpertLayout expect_layout) {
+  std::vector<std::string> names;
+  names.reserve(repo.tensors.size());
+  for (const auto& [name, unused] : repo.tensors) names.push_back(name);
+
+  const std::string prefix = vllm::ResolveQwen3_5BackbonePrefix(names);
+  CHECK(prefix == expect_prefix);
+  const vllm::MoeExpertLayout layout =
+      vllm::ResolveQwen3_5MoeExpertLayout(names, prefix);
+  CHECK(layout == expect_layout);
+  return AuditPlan(vllm::PlanQwen3_5MoeLoad(config, prefix, layout), repo);
+}
+
+// Every claim that holds for BOTH published repos, so neither is a special case.
+void CheckPublishedPlan(const PublishedRepo& repo, const HfConfig& config,
+                        const std::string& prefix, int64_t layers,
+                        int64_t experts, int64_t inter, int64_t hidden,
+                        int64_t expect_unplanned) {
+  CAPTURE(repo.name);
+  const PlanAudit audit =
+      AuditPublished(repo, config, prefix, vllm::MoeExpertLayout::kStackedBf16);
+
+  // (1) THE ROUTED EXPERTS RESOLVE EXACTLY, at this repo's real dimensions.
+  //     Two stacked tensors per layer, and their shapes are the ones the READER
+  //     enforces (`shape_enforced`), not ones this planner merely computed.
+  const std::vector<vllm::PlannedTensor> plan = vllm::PlanQwen3_5MoeLoad(
+      config, prefix, vllm::MoeExpertLayout::kStackedBf16);
+  int64_t enforced = 0;
+  for (const vllm::PlannedTensor& t : plan) {
+    if (!t.shape_enforced) continue;
+    ++enforced;
+    CAPTURE(t.name);
+    const auto it = repo.tensors.find(t.name);
+    REQUIRE(it != repo.tensors.end());
+    CHECK(it->second.first == "BF16");
+    CHECK(it->second.second == t.shape);
+    const bool gate_up = Contains(t.name, "experts.gate_up_proj");
+    CHECK(t.shape == (gate_up ? std::vector<int64_t>{experts, 2 * inter, hidden}
+                              : std::vector<int64_t>{experts, hidden, inter}));
+  }
+  CHECK(enforced == 2 * layers);
+
+  // (2) EVERY BF16 REQUEST IS SATISFIED, shape and dtype exact. That is the
+  //     whole backbone this arm implements: embeds, norms, every layernorm, the
+  //     router gate, the shared-expert gate, the GDN's bf16 tail and both
+  //     attention norms — plus the stacked experts above.
+  const std::set<std::string> satisfied(audit.satisfied.begin(),
+                                        audit.satisfied.end());
+  int64_t bf16_planned = 0;
+  for (const vllm::PlannedTensor& t : plan) {
+    if (t.dtype != "BF16") continue;
+    ++bf16_planned;
+    CAPTURE(t.name);
+    CHECK(satisfied.count(t.name) == 1u);
+  }
+  CHECK(bf16_planned == static_cast<int64_t>(audit.satisfied.size()));
+
+  // (3) NOTHING ELSE IS SATISFIED, AND WHAT IS NOT IS EXACTLY THE OWED SET.
+  //     A published repo is bf16 THROUGHOUT, so every quantized request fails —
+  //     the `.weight`s by dtype and the `.weight_scale`s by absence. This is the
+  //     claim most likely to be over-read from this row ("the stacked arm
+  //     landed, so Qwen3.6-35B-A3B loads"), and it is pinned here rather than
+  //     left to a reader's optimism.
+  CHECK_FALSE(audit.missing.empty());
+  CHECK_FALSE(audit.mismatched.empty());
+  for (const std::string& name : audit.missing) {
+    CAPTURE(name);
+    CHECK(IsOwedArm(name));
+  }
+  for (const std::string& name : audit.mismatched) {
+    CAPTURE(name);
+    CHECK(IsOwedArm(name));
+  }
+
+  // (4) THE PUBLISHED TENSORS THE PLAN DOES NOT WANT ARE EXACTLY TWO FAMILIES,
+  //     both loaded by a DIFFERENT entry point:
+  //       `mtp.*`           the optional draft head, `LoadQwen3_5MTP`, and only
+  //                         under speculative decoding. 19 in both repos.
+  //       `model.visual.*`  the vision tower of the VL wrapper. 333 on the 35B
+  //                         (`Qwen3_5MoeForConditionalGeneration`), 0 on the
+  //                         text-only 2.4T (`Qwen3_5MoeForCausalLM`) — which is
+  //                         the structural difference between the two arms, and
+  //                         why the 35B's backbone is prefixed at all.
+  //     Anything else unplanned would be a tensor this loader silently ignores,
+  //     so the COUNT is asserted too: a prefix filter alone would let a newly
+  //     ignored tensor hide inside an already-accepted family.
+  for (const std::string& name : audit.unplanned) {
+    CAPTURE(name);
+    CHECK((name.rfind("mtp.", 0) == 0 || name.rfind("model.visual.", 0) == 0));
+  }
+  CHECK(static_cast<int64_t>(audit.unplanned.size()) == expect_unplanned);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// 5c. The 2.4T and the 35B, planned against their REAL published indices.
+//
+//     WHAT THIS ESTABLISHES: for both published repos, every name the reader
+//     would request under the arm this row implements resolves, and the two
+//     stacked routed-expert tensors per layer carry exactly the shape and dtype
+//     the reader enforces — at 512 experts / hidden 8192 / intermediate 2048 for
+//     the 2.4T, and 256 / 2048 / 512 for the 35B.
+//
+//     WHAT IT DOES NOT ESTABLISH: any generated token, any throughput, any
+//     memory headroom, or that an allocation path survives 4.89 TB. It reads no
+//     weight byte. The gate/up split and expert stride are proven byte-exact
+//     only at toy dimensions in 4d and, upstream, by source; a wrong split still
+//     passes everything on this machine.
+// ---------------------------------------------------------------------------
+TEST_CASE("qwen3_8: the PUBLISHED 2.4T and 35B indices satisfy the load plan's stacked-expert arm") {
+  SUBCASE("Qwen/Qwen3.8-2.4T-A95B — 1609 tensors, 213 shards, 4.89 TB") {
+    const PublishedRepo repo = LoadPublished(
+        vllm_test::kQwen38_2_4TTensors, vllm_test::kQwen38_2_4TTensorCount,
+        vllm_test::kQwen38_2_4TTotalSize, vllm_test::kQwen38_2_4TRepo);
+    const HfConfig config = vllm::LoadHfConfig(QWEN3_8_CONFIG_FIXTURE);
+    REQUIRE(config.num_hidden_layers == 92);
+    REQUIRE(config.num_experts == 512);
+    // 19 unplanned, every one of them `mtp.*`: a TEXT-ONLY repo has no vision
+    // tower, so `Qwen3_5MoeForCausalLM` leaves nothing else behind.
+    CheckPublishedPlan(repo, config, "model.", /*layers=*/92, /*experts=*/512,
+                       /*inter=*/2048, /*hidden=*/8192,
+                       /*expect_unplanned=*/19);
+
+    // THE DIMENSION THAT ONLY THIS CHECKPOINT HAS. One layer's `gate_up_proj` is
+    // 512 * 4096 * 8192 * 2 bytes. Every offset the stacked reader forms inside
+    // it — `e * two_i * hidden * 2` at e = 511 — is far outside int32, so this
+    // is where a 32-bit intermediate would wrap and silently read the wrong
+    // expert. Computed here in int64, as the reader computes it.
+    const int64_t two_i = 2 * config.moe_intermediate_size;
+    const int64_t layer_bytes =
+        config.num_experts * two_i * config.hidden_size * 2;
+    CHECK(layer_bytes == 34359738368LL);
+    CHECK(layer_bytes > 16LL * 2147483647LL);
+    const int64_t last_expert_offset =
+        (config.num_experts - 1) * two_i * config.hidden_size * 2;
+    CHECK(last_expert_offset == 34292629504LL);
+    CHECK(last_expert_offset > 2147483647LL);
+  }
+
+  SUBCASE("Qwen/Qwen3.6-35B-A3B — the checkpoint the BINDING token gate uses") {
+    // 71.9 GB over 26 shards, and the row's binding gate. Planning it here says,
+    // before anyone stages 71.9 GB, exactly which tensors that load will and
+    // will not resolve — and exercises the VL backbone spelling on the
+    // namespace `ResolveQwen3_5BackbonePrefix` was written for.
+    const PublishedRepo repo = LoadPublished(
+        vllm_test::kQwen36_35BTensors, vllm_test::kQwen36_35BTensorCount,
+        vllm_test::kQwen36_35BTotalSize, vllm_test::kQwen36_35BRepo);
+    CHECK(vllm_test::kQwen36_35BTotalSize == 71903645408LL);
+
+    // The 35B's published config nests the text knobs under `text_config`; this
+    // case is about the INDEX, so the dimensions come from the manifest's own
+    // stacked tensor rather than from a second committed config document.
+    const auto gate_up =
+        repo.tensors.find("model.language_model.layers.0.mlp.experts.gate_up_proj");
+    REQUIRE(gate_up != repo.tensors.end());
+    REQUIRE(gate_up->second.second.size() == 3u);
+    const int64_t experts = gate_up->second.second[0];
+    const int64_t hidden = gate_up->second.second[2];
+    const int64_t inter = gate_up->second.second[1] / 2;
+    CHECK(experts == 256);
+    CHECK(hidden == 2048);
+    CHECK(inter == 512);
+
+    HfConfig config;
+    config.model_type = "qwen3_5_moe_text";
+    config.hidden_size = hidden;
+    config.vocab_size = 248320;
+    config.head_dim = 256;
+    config.num_hidden_layers = 40;
+    config.num_experts = experts;
+    config.moe_intermediate_size = inter;
+    config.shared_expert_intermediate_size = 512;
+    config.linear_num_key_heads = 16;
+    config.linear_key_head_dim = 128;
+    config.linear_num_value_heads = 32;
+    config.linear_value_head_dim = 128;
+    config.linear_conv_kernel_dim = 4;
+    for (int64_t i = 0; i < 40; ++i) {
+      config.layer_types.push_back((i % 4 == 3) ? "full_attention"
+                                                : "linear_attention");
+    }
+    // 352 unplanned: 19 `mtp.*` plus the 333-tensor `model.visual.*` vision
+    // tower, which is a different loader's business entirely.
+    CheckPublishedPlan(repo, config, "model.language_model.", /*layers=*/40,
+                       experts, inter, hidden, /*expect_unplanned=*/352);
   }
 }

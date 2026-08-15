@@ -14,8 +14,13 @@
 //    raises TypeError; this raises with the same reason named.
 //  * `dims == 2` / `dims == (2, 1)` (Conv2d and DualConv3d, convolution.py:27-71)
 //    are not ported: the decoder is built with `convolution_dimensions=3`.
-//  * The ENCODER half and the TILED decode path (`tiled_decode`,
-//    conv_video_decoder.py:383-484) are out of this phase and owed.
+//  * The ENCODER half is out of this phase and owed.
+//  * The TILED decode path (`tiled_decode`, conv_video_decoder.py:383-484) is NO
+//    LONGER owed: it landed in row `LTX25-TILED-DECODE` (#644) and lives next
+//    door in ltx2_video_vae_tiled.cpp, reached through `Ltx2VideoDecodeStreaming`.
+//    This line named it as debt, and the row's spec cited this exact anchor as
+//    the debt it pays, so leaving the two disagreeing was the record contradicting
+//    the tree.
 //
 // ─── DTYPE: THIS IS THE CPU REFERENCE ARM, AND f32 IS NOT WHAT SHIPS ─────────
 // Every buffer below is f32, and unlike the audio VAE next door that is NOT an

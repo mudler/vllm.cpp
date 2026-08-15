@@ -580,15 +580,25 @@ take can only raise the plateau; any MoE comparison that lets routing vary
 between arms measures the draw, not the change; and both blocks AND distinct
 experts must be controlled, since cost per distinct expert spans 4.47-7.50 us
 and is flat only above ~40 experts. NOT parity, and the row stays open.
-MEASUREMENT IS CURRENTLY IMPOSSIBLE: the gate host was REIMAGED on 2026-08-14
-(new COS partition layout, /home created 13:37 UTC, ~/work empty), destroying
-the pinned oracle venv, the pinned vLLM source, the 35B and draft checkpoints,
-our engine build and every run log, so the Evidence paths in the benchmark
-record point at nothing. The RESULTS stand, because the harnesses
-(scripts/marlin-moe-standalone.py, benchmarks/marlin_moe_standalone.cpp,
-scripts/dspark-paired-e2e.sh) and the per-rep values are in-tree; resuming
-needs the checkpoints re-fetched, the oracle rebuilt at pinned commit
-555967922, and its identity re-asserted before any number is trusted.
+The environment was REBUILT after the reimage (engine, both checkpoints at the
+pinned revision, and the TRUE pinned oracle 555967922 + torch 2.13.0 +
+flashinfer 0.6.15.post1, built from source because vllm==0.26.0 hard-pins
+torch==2.11.0). On it, with generation length MATCHED at 89 tokens and the
+container compile cache PERSISTED, the oracle is stable at 171.4 tok/s and our
+engine at 143.2, a paired ratio of **0.835** -- far below the 0.957-0.989 this
+row recorded. Two causes are possible and this data cannot separate them:
+every earlier paired run invoked the oracle ONCE, so a cold-JIT denominator
+would have been handicapped ~17%; and the BOX IS NOT THE SAME MACHINE, since
+dgx.casa now resolves to kairos-17dd while the recorded ratios were taken on
+promaxgb10-4ad8, which no longer exists. Our arm reads ~142 on both, which
+argues against a pure hardware explanation without excluding one. Safe to say:
+on this box, matched and warm, we are at 0.835 of the pinned oracle, NOT
+parity. Not safe to say: that the older numbers were wrong, since cross-
+machine ratios cannot be differenced any more than cross-boot absolutes can.
+Owed: re-run the pre-reimage single-cold-invocation protocol HERE -- ~0.97
+would convict cold JIT, ~0.83 would mean the machine changed.
+
+
 
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has

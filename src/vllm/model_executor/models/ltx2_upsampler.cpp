@@ -252,6 +252,64 @@ Volume PixelShuffle2d(const Volume& in, int64_t up_h, int64_t up_w) {
   return out;
 }
 
+// PixelShuffleND(1) — `b (c p1) f h w -> b c (f p1) h w` (pixel_shuffle.py:47-52).
+// Both groupings put `p1` FASTEST: the source channel is `c * p1 + j` because the
+// pattern is `(c p1)`, and the destination frame is `f * p1 + j` because it is
+// `(f p1)`. Reversing either factor order yields a correctly shaped, finite,
+// plausible latent, which is why the golden — not a shape check — is what holds
+// this down.
+Volume PixelShuffle1d(const Volume& in, int64_t up_f) {
+  Require(in.channels % up_f == 0,
+          "ltx2 upsampler: temporal pixel shuffle requires channels divisible by " +
+              std::to_string(up_f));
+  Volume out;
+  out.channels = in.channels / up_f;
+  out.frames = in.frames * up_f;
+  out.height = in.height;
+  out.width = in.width;
+  out.data.assign(static_cast<size_t>(out.elems()), 0.0f);
+  for (int64_t c = 0; c < out.channels; ++c) {
+    for (int64_t j = 0; j < up_f; ++j) {
+      const int64_t src_c = c * up_f + j;
+      for (int64_t f = 0; f < in.frames; ++f) {
+        for (int64_t y = 0; y < in.height; ++y) {
+          for (int64_t x = 0; x < in.width; ++x) {
+            out.at(c, f * up_f + j, y, x) = in.at(src_c, f, y, x);
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// `x = x[:, :, 1:, :, :]` (model.py:111-113): "remove the first frame after
+// upsampling. This is done because the first frame encodes one pixel frame."
+// Frames go 2F -> 2F - 1, which is exactly the count the only upstream consumer
+// keeps for itself (`num_frames = 2 * (num_frames - 1) + 1`, dfr_pipeline.py:408).
+Volume DropFirstFrame(const Volume& in) {
+  Require(in.frames >= 2,
+          "ltx2 upsampler: the temporal arm drops the first frame after upsampling "
+          "(model/upsampler/model.py:109-113), so it needs at least 2 frames out of the "
+          "shuffle");
+  Volume out;
+  out.channels = in.channels;
+  out.frames = in.frames - 1;
+  out.height = in.height;
+  out.width = in.width;
+  out.data.assign(static_cast<size_t>(out.elems()), 0.0f);
+  for (int64_t c = 0; c < out.channels; ++c) {
+    for (int64_t f = 0; f < out.frames; ++f) {
+      for (int64_t y = 0; y < out.height; ++y) {
+        for (int64_t x = 0; x < out.width; ++x) {
+          out.at(c, f, y, x) = in.at(c, f + 1, y, x);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 // BlurDownsample._apply_2d (blur_downsample.py:49-53): a DEPTHWISE conv2d with
 // the fixed binomial kernel, stride `den`, padding `kernel_size // 2`, per frame.
 Volume BlurDownsample(const Volume& in, int64_t stride, int64_t kernel_size) {
@@ -358,7 +416,15 @@ std::vector<Ltx2UpsamplerTensorSpec> EnumerateLtx2UpsamplerTensors(
     res_block(p + "res_blocks." + std::to_string(i) + ".");
   }
 
-  if (config.spatial_upsample && !config.temporal_upsample) {
+  if (config.temporal_upsample && !config.spatial_upsample) {
+    // `torch.nn.Sequential(Conv3d(mid, 2*mid, 3, padding=1), PixelShuffleND(1))`
+    // names its conv `upsampler.0` (model.py:68-71). Note the RANK: this is a
+    // Conv3d, so the weight is 5-D, where the non-rational SPATIAL arm's
+    // identically-named tensor is a 4-D Conv2d kernel (model.py:64-66).
+    specs.push_back({p + "upsampler.0.weight",
+                     {kLtx2UpsamplerTemporalFactor * mid, mid, 3, 3, 3}});
+    specs.push_back({p + "upsampler.0.bias", {kLtx2UpsamplerTemporalFactor * mid}});
+  } else if (config.spatial_upsample && !config.temporal_upsample) {
     if (config.rational_resampler) {
       // SpatialRationalResampler names its conv `upsampler.conv`
       // (spatial_rational_resampler.py:36); the blur kernel is a BUFFER, not a
@@ -391,8 +457,12 @@ Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
   Require(config.spatial_upsample || config.temporal_upsample,
           "ltx2 upsampler: either spatial_upsample or temporal_upsample must be True "
           "(model/upsampler/model.py:73-74)");
-  if (config.temporal_upsample) {
-    Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature::kTemporalUpsampler);
+  // The SPATIOTEMPORAL arm is a different operator, not "the temporal arm with
+  // spatial on": model.py:55-59 builds `Conv3d(mid, 8*mid)` + `PixelShuffleND(3)`.
+  // Refused BEFORE any weight is touched, so it reports an unported feature
+  // rather than a wrong element count on `upsampler.0.weight`.
+  if (config.temporal_upsample && config.spatial_upsample) {
+    Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature::kSpatiotemporalUpsampler);
   }
   Require(config.dims == 3,
           "ltx2 upsampler: dims=" + std::to_string(config.dims) +
@@ -428,7 +498,16 @@ Ltx2LatentVolume Ltx2LatentUpsample(const Ltx2UpsamplerConfig& config,
       x = ResBlockForward(weights, p + "res_blocks." + std::to_string(i) + ".", x);
     }
 
-    if (config.rational_resampler) {
+    if (config.temporal_upsample) {
+      // model.py:109-113, and the branch order is upstream's: `if
+      // self.temporal_upsample` (:109) is tested BEFORE the resampler check
+      // (:114). A full 3-D conv (not per-frame): the temporal arm's
+      // `upsampler.0` is a Conv3d (model.py:70), unlike the spatial arm's Conv2d.
+      x = Conv3dPad1(x, kLtx2UpsamplerTemporalFactor * config.mid_channels,
+                     weights.Get(p + "upsampler.0.weight"), weights.Get(p + "upsampler.0.bias"));
+      x = PixelShuffle1d(x, kLtx2UpsamplerTemporalFactor);
+      x = DropFirstFrame(x);
+    } else if (config.rational_resampler) {
       // SpatialRationalResampler.forward (:40-47): per-frame conv, pixel shuffle
       // by `num`, then an anti-aliased stride-`den` blur.
       const Ltx2RationalScale rational = Ltx2RationalForScale(config.spatial_scale);

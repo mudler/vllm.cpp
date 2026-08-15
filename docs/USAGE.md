@@ -239,14 +239,21 @@ backbone tensors under both rather than binding half the model from each.
 **Resolving the namespace is not the same as loading the checkpoint, and the
 MoE and dense arms differ.** The dense loader routes each projection to BF16,
 FP8 or NVFP4 by tensor presence, so a flat bf16 `Qwen3_5ForCausalLM` checkpoint
-is expected to load. The **MoE** loader reads only PER-EXPERT NVFP4 routed
-experts, while the published MoE repos (`Qwen/Qwen3.8-2.4T-A95B`,
-`Qwen/Qwen3.6-35B-A3B`) ship 3-D stacked, unquantized experts — that arm is
-**not implemented**, and such a checkpoint is refused at load with a message
-naming what is missing. Use an NVFP4 requant (e.g.
-`nvidia/Qwen3.6-35B-A3B-NVFP4`) for the MoE path. No text-only Qwen3.5
-checkpoint has been RUN here at all — see [STATUS.md](STATUS.md) for the owed
-run gates.
+is expected to load. The **MoE** loader reads two ROUTED-EXPERT layouts and
+decides between them ONCE per checkpoint from the shard index: per-expert NVFP4
+(`experts.<e>.<proj>.weight` U8 + `.weight_scale` + `.weight_scale_2`, what an
+NVFP4 requant ships) and the 3-D stacked BF16
+`experts.{gate_up_proj,down_proj}` the published repos (`Qwen/Qwen3.8-2.4T-A95B`,
+`Qwen/Qwen3.6-35B-A3B`) ship. A checkpoint carrying BOTH spellings under its
+backbone is refused rather than half-bound.
+
+**A published bf16 MoE repo still does not load end to end.** It is bf16
+*throughout*, and the MoE arm implements only per-tensor FP8 for the
+attention/GDN tower and NVFP4 for the shared expert and `lm_head`; those arms are
+OWED, and such a checkpoint is refused at load with a message naming what is
+missing. Use an NVFP4 requant (e.g. `nvidia/Qwen3.6-35B-A3B-NVFP4`) for the MoE
+path. No text-only Qwen3.5 checkpoint has been RUN here at all — see
+[STATUS.md](STATUS.md) for the owed run gates.
 
 GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
 host's native filesystem encoding, including Unicode paths on Windows. Native
@@ -431,9 +438,10 @@ and through the `ltx2-gen` example that drives it. Its two VAE decoders, its two
 VAE ENCODERS with the mel front-end, the conditioning items that place encoded
 latents into the token stream, and its pipeline layer (the sigma schedule, the
 diffusion steps, guidance, the latent spatial x2 upsampler, the duration head and
-the embeddings connector) are implemented and gated. Several limits decide what
-you can actually ask for, and each refuses by name rather than rendering
-something else.
+the embeddings connector) are implemented and gated. The latent **temporal** x2
+upsampler is implemented and gated too, but no pipeline here drives it — see the
+`--upsampler` note below. Several limits decide what you can actually ask for,
+and each refuses by name rather than rendering something else.
 
 **Image conditioning (image-to-video) runs at `image_crf=0`, and only there.**
 Pass a first frame as binary PPM (`first_frame_path` / `first_frame_ppm`) plus
@@ -584,6 +592,20 @@ upscaled latent valid, and decoding the half-resolution latent instead would han
 back a smaller clip that looks like a completed request. `--max-phase 0` stops
 after the first phase deliberately.
 
+It must be the **spatial** upsampler,
+`ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`. Lightricks also ships
+`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors`, which is the same
+class with `temporal_upsample: true` in its config and the same
+`upsampler.0.*` tensor names — so it loads and runs, and returns a latent with
+`2f - 1` frames at the ORIGINAL resolution where this phase needs the original
+frame count at double resolution. It is `2f - 1` and not `2f` because that arm
+doubles the frame axis and then drops the first frame, which upstream encodes as
+a single pixel frame. Passing it is refused by name rather than
+reported as a shape mismatch. The temporal arm itself is implemented and gated
+against upstream, but **nothing drives it**: its only upstream consumer is
+`DFRPipeline`'s multi-round loop, which is not ported, so there is no flag that
+makes a request use it and no reason to pass that file today.
+
 On the server, `--video-family ltx-2.5` pins the family instead of detecting it,
 and `--video-extra KEY=VALUE` (repeatable) carries the same family-specific load
 knobs the flags above map onto. Both are described under
@@ -637,6 +659,34 @@ neighborhood-attention kernel. It never falls back to the convolutional decoder,
 because that would hand back a lower quality render as if it were the one you
 asked for. Keyframe and reference conditioning is refused for the same reason: it
 runs through the video VAE's encoder, and only the decoder is ported.
+
+**The convolutional decode is TILED and STREAMED, on upstream's own defaults, and
+there is no knob.** The layout is the one `ltx_pipelines` builds for a Conv VAE
+when you pass `AUTO_TILING`: a 768 px tile with a 64 px overlap on the long side,
+aspect coupled to the short one, and 80 frame temporal chunks overlapping by 24.
+Each temporal chunk is written to its PPM files and dropped, so the full pixel
+volume never exists at once. Two consequences worth knowing before you read a
+memory number:
+
+- **Below a 768 px long side and 81 frames the layout does not tile at all.** A
+  single tile comes out, and that path reproduces the untiled decode bit for bit
+  (`test_ltx2_tiling`'s one tile control, on both causality settings). So
+  448x256/25f renders byte identically to how it rendered before tiling existed,
+  and its memory is unchanged. Tiling starts doing something at 896x512, and
+  temporal chunking at 81 frames.
+- **A tiled render is not the same image as an untiled one**, and that is
+  upstream's behaviour, not a defect here. Each tile decodes a crop of the latent,
+  the decoder's receptive field is wider than the 64 px overlap, and the seam is
+  blended rather than eliminated. Do not compare a 1920x1088 render against a
+  hypothetical untiled one and read the difference as an error.
+- **81 to 120 frames is already the tiled regime, and the recipe default is
+  inside it.** The default request is 1024x1536 at 121 frames. At 81 frames the
+  latent is 11 frames deep against a 10 frame temporal tile, so it splits into two
+  chunks. Measured on the shipped conv VAE at 64x64 / 81 frames: max abs diff
+  0.0503 against the untiled decode, on an output whose own max is 0.7513 — 6.70%
+  of that range — with 962983 of 995328 channel values (96.75%) not bit identical.
+  So nearly every value moves, by a few percent of the signal. If you need the pre
+  tiling render back, ask for 73 frames or fewer.
 
 **The refusal that used to stand here is gone, and what replaced it is an owed
 ORACLE rather than an owed feature.** Through L10 this page said a prompt was

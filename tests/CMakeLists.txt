@@ -241,6 +241,12 @@ target_compile_definitions(test_minimax_music3_e2e_real PRIVATE
   BUILD_ARTIFACT_DIR="${CMAKE_BINARY_DIR}/music3")
 target_include_directories(test_minimax_music3_e2e_real PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/parity)
+# This suite binds a REAL cpp-httplib server on an ephemeral port (the
+# speech-only route-table cases, #672), which is the same reason
+# test_openai_api_server and test_openai_conformance carry RUN_SERIAL below:
+# under a saturated `ctest -jN` the server's accept thread starves and the
+# client sees a connection failure rather than the defect it was looking for.
+set_tests_properties(test_minimax_music3_e2e_real PROPERTIES RUN_SERIAL ON)
 # ARCH-ONE-SURFACE ROW 2 fold gate: the video seam == the replicated pre-fold
 # pipeline == the goldens the PRE-fold minimax-h3-gen binary rendered at the
 # branch base (frames + WAV byte-identical, mux argv pinned).

@@ -399,6 +399,35 @@ void DequantIQ1_S(const uint8_t* data, int64_t nb, float* y) {
   }
 }
 
+// block_iq1_xxxs = { f16 d; u8 qs[32]; u8 sc[4]; } (38 bytes)
+// dequantize_row_iq1_xxxs:2727 of the PINNED FORK oracle `llama-cpp-unsloth`
+// @ 36fe8e1cc. Like IQ1_S but wound tighter: the 256-entry grid means qs[l] is
+// a WHOLE index (no high bits to splice), and one nibble of sc carries both the
+// sub-block scale (bits 0-2, dl = d*(2*ls+1)) and the delta sign (bit 3). The
+// delta magnitude is upstream's own IQ1S_DELTA, reused unchanged by the fork.
+void DequantIQ1_XXXS(const uint8_t* data, int64_t nb, float* y) {
+  constexpr int qk = 256;
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t* blk = data + i * 38;
+    const float d = ReadF16(blk);
+    const uint8_t* qs = blk + 2;
+    const uint8_t* sc = blk + 34;
+    for (int ib = 0; ib < qk / 32; ++ib) {
+      const int nib = (sc[ib / 2] >> (4 * (ib & 1))) & 0xf;
+      const float dl = d * static_cast<float>(2 * (nib & 7) + 1);
+      const float delta = (nib & 8) ? -kIq1sDelta : kIq1sDelta;
+      for (int l = 0; l < 4; ++l) {
+        const int8_t* grid =
+            reinterpret_cast<const int8_t*>(kIq1xxxsGrid + qs[l]);
+        for (int j = 0; j < 8; ++j)
+          y[j] = dl * (static_cast<float>(grid[j]) + delta);
+        y += 8;
+      }
+      qs += 4;
+    }
+  }
+}
+
 // block_mxfp4 = { u8 e; u8 qs[16]; } (17 bytes) dequantize_row_mxfp4:511.
 // OCP micro-scaling fp4: d = E8M0ToF32Half(e) is one power-of-two block scale;
 // each of the 32 elements is an e2m1 nibble looked up in kValuesMxfp4. The
@@ -444,6 +473,7 @@ ToFloatFn BlockToFloat(DType dtype) {
     case DType::kIQ3_XXS: return &ToFloatAdapter<&DequantIQ3_XXS, 256>;
     case DType::kIQ2_S: return &ToFloatAdapter<&DequantIQ2_S, 256>;
     case DType::kIQ1_S: return &ToFloatAdapter<&DequantIQ1_S, 256>;
+    case DType::kIQ1_XXXS: return &ToFloatAdapter<&DequantIQ1_XXXS, 256>;
     case DType::kMXFP4: return &ToFloatAdapter<&DequantMXFP4, 32>;
     default: return nullptr;
   }

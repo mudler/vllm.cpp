@@ -168,6 +168,7 @@ TEST_CASE("IQ/MXFP4 keep-quant block dtypes (geometry + vec_dot)") {
       {vt::DType::kIQ2_S, 22, 256, 82, vt::DType::kQ8_K, "iq2_s"},
       {vt::DType::kMXFP4, 39, 32, 17, vt::DType::kQ8_0, "mxfp4"},
       {vt::DType::kIQ1_S, 19, 256, 50, vt::DType::kQ8_K, "iq1_s"},
+      {vt::DType::kIQ1_XXXS, 66, 256, 38, vt::DType::kQ8_K, "iq1_xxxs"},
   };
   for (const KeepQuantCase& c : cases) {
     CAPTURE(c.name);

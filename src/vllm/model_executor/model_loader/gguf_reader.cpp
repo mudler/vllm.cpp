@@ -259,6 +259,16 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{256, 50, "IQ1_S"};
       return &t;
     }
+    case 66: {
+      // block_iq1_xxxs, from the PINNED FORK oracle `llama-cpp-unsloth`
+      // (.agents/oracles/llama-cpp-unsloth.md, ggml-common.h:478-483):
+      // f16 d + QK_K/8 u8 qs + QK_K/64 u8 sc = 2 + 32 + 4 = 38, i.e.
+      // 1.1875 bpw. NO upstream llama.cpp defines type 66. It carries the
+      // routed experts of the Qwen3.8-2.4T-A95B UD-Q1_0 checkpoint, 96.92 % of
+      // that model's parameters.
+      static constexpr GgmlTypeTraits t{256, 38, "IQ1_XXXS"};
+      return &t;
+    }
     case 22: {
       // block_iq2_s: f16 d + QK_K/4 qs + QK_K/16 qh = 2 + 64 + 16.
       // Used by the APEX "Mini" GGUFs for expert weights.

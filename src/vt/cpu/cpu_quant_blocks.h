@@ -178,6 +178,24 @@ struct BlockIQ1_S {
 };
 static_assert(sizeof(BlockIQ1_S) == 50, "wrong iq1_s block size/padding");
 
+// PINNED FORK oracle `llama-cpp-unsloth` @ 36fe8e1cc, ggml-common.h:478-483
+// block_iq1_xxxs. 1.1875 bpw codebook quant, ggml type 66, which no upstream
+// llama.cpp defines. It carries 96.92 % of `Qwen3.8-2.4T-A95B UD-Q1_0`. See
+// .agents/oracles/llama-cpp-unsloth.md for why a fork is admitted for it.
+//
+// The same ternary codebook idea as IQ1_S, wound tighter in two ways. The grid
+// has 256 entries rather than 2048, so `qs` is a WHOLE 8-bit index and there
+// are no high bits to splice in from elsewhere. And the per-32 scale plus delta
+// sign live in one NIBBLE of `sc` (bits 0-2 scale, bit 3 delta sign) rather
+// than in a u16 per sub-block, which is where most of the 0.375 bpw saving
+// against IQ1_S comes from.
+struct BlockIQ1_XXXS {
+  uint16_t d;                   // super-block scale (ggml_half)
+  uint8_t qs[kQK_K / 8];        // 32: one whole 8-bit grid index per lane group
+  uint8_t sc[kQK_K / 64];       // 4: two sub-block nibbles per byte
+};
+static_assert(sizeof(BlockIQ1_XXXS) == 38, "wrong iq1_xxxs block size/padding");
+
 // ggml-common.h:204-209 block_mxfp4. OCP micro-scaling fp4: `e` is one E8M0
 // (power-of-two) shared exponent for the whole 32-element block, `qs` packs the
 // 32 e2m1 4-bit elements two-per-byte (element j in the low nibble of qs[j],

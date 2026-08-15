@@ -100,6 +100,16 @@ const BlockGeometry* FindBlockGeometry(DType dtype) {
       static constexpr BlockGeometry g{256, 50, 19, "iq1_s"};
       return &g;
     }
+    case DType::kIQ1_XXXS: {
+      // block_iq1_xxxs, from the PINNED FORK oracle `llama-cpp-unsloth`
+      // (ggml-common.h:478-483 @ 36fe8e1cc): f16 d + u8 qs[QK_K/8]
+      // + u8 sc[QK_K/64] = 2 + 32 + 4 = 38, i.e. 1.1875 bpw. ggml type id 66,
+      // which NO upstream llama.cpp defines. The grid holds 256 entries, so qs
+      // is a whole 8-bit index with no high bits to splice; sc packs one nibble
+      // per 32-element sub-block, bits 0-2 the scale and bit 3 the delta sign.
+      static constexpr BlockGeometry g{256, 38, 66, "iq1_xxxs"};
+      return &g;
+    }
     case DType::kMXFP4: {
       // block_mxfp4 (ggml-common.h:204-209): u8 e (E8M0 shared exponent)
       // + u8 qs[QK_MXFP4/2] = 1 + 16 = 17, QK_MXFP4 = 32. ggml type id 39.
@@ -140,7 +150,8 @@ bool BlockDTypeFromGgmlTypeId(uint32_t ggml_type, DType* out) {
   static constexpr DType kBlockDTypes[] = {
       DType::kQ4_0, DType::kQ8_0,    DType::kQ2_K,     DType::kQ3_K, DType::kQ4_K,
       DType::kQ5_K, DType::kQ6_K,    DType::kQ8_K,     DType::kIQ2_XXS,
-      DType::kIQ3_XXS, DType::kIQ2_S, DType::kMXFP4, DType::kIQ1_S};
+      DType::kIQ3_XXS, DType::kIQ2_S, DType::kMXFP4, DType::kIQ1_S,
+      DType::kIQ1_XXXS};
   for (DType d : kBlockDTypes) {
     if (FindBlockGeometry(d)->ggml_type == ggml_type) {
       if (out != nullptr) *out = d;
@@ -185,6 +196,7 @@ size_t SizeOf(DType dtype) {
     case DType::kIQ3_XXS:
     case DType::kIQ2_S:
     case DType::kIQ1_S:
+    case DType::kIQ1_XXXS:
     case DType::kMXFP4:
       VT_CHECK(false, std::string("SizeOf: block-quantized dtype ") +
                           Name(dtype) + " has no per-element size");
@@ -214,6 +226,7 @@ const char* Name(DType dtype) {
     case DType::kIQ3_XXS: return "iq3_xxs";
     case DType::kIQ2_S: return "iq2_s";
     case DType::kIQ1_S: return "iq1_s";
+    case DType::kIQ1_XXXS: return "iq1_xxxs";
     case DType::kMXFP4: return "mxfp4";
   }
   return "?";

@@ -146,6 +146,11 @@ const WeightCase kWeightCases[] = {
     // the delta sign 5.7, and ignoring the 3 high grid-index bits 5.7e+1. So
     // the ceiling sits in the empty band between noise and every defect.
     {vt::DType::kIQ1_S, 256, 50, 0, -1, -1, "iq1_s", 2e-3},
+    // IQ1_XXXS (1.1875 bpw) is 96.92 % of the Qwen3.8-2.4T-A95B UD-Q1_0
+    // checkpoint. Type 66, from the pinned FORK oracle `llama-cpp-unsloth`.
+    // Same ceiling and the same reason as IQ1_S: ternary lanes times a per-32
+    // scale against a Q8_K activation that gets one scale per 256.
+    {vt::DType::kIQ1_XXXS, 256, 38, 0, -1, -1, "iq1_xxxs", 2e-3},
     {vt::DType::kMXFP4, 32, 17, -1, -1, 0, "mxfp4"},
 };
 
@@ -196,6 +201,19 @@ std::vector<uint8_t> RandomBlocks(const WeightCase& c, int64_t nblocks,
         const uint16_t ls = static_cast<uint16_t>(2 + ((i + ib) % 3));
         qh = static_cast<uint16_t>((qh & 0x8FFFU) | (ls << 12));
         std::memcpy(blk + 34 + 2 * ib, &qh, sizeof(qh));
+      }
+    }
+    // IQ1_XXXS packs the same scale, plus the delta sign, into one NIBBLE of
+    // sc (bits 0-2 scale, bit 3 sign), two sub-blocks per byte. Same narrowing
+    // and same reason as IQ1_S above; the sign bit stays random.
+    if (c.dtype == vt::DType::kIQ1_XXXS) {
+      for (int ib = 0; ib < 8; ++ib) {
+        uint8_t& byte = blk[34 + ib / 2];
+        const int shift = 4 * (ib & 1);
+        const uint8_t ls = static_cast<uint8_t>(2 + ((i + ib) % 3));
+        const uint8_t keep_sign = static_cast<uint8_t>((byte >> shift) & 0x8);
+        byte = static_cast<uint8_t>((byte & ~(0xFU << shift)) |
+                                    ((keep_sign | ls) << shift));
       }
     }
   }
@@ -612,6 +630,39 @@ TEST_CASE("kIq1sGrid is the PINNED upstream table, not a look-alike") {
   CHECK(lanes[0] == 4875);  // -1
   CHECK(lanes[1] == 6649);  //  0
   CHECK(lanes[2] == 4860);  // +1
+}
+
+TEST_CASE("kIq1xxxsGrid is the PINNED FORK table, not a look-alike") {
+  // Same argument as the IQ1_S seal above, and it binds harder here. This table
+  // does not come from an upstream release but from a BRANCH,
+  // unslothai/llama.cpp @ iq1-narrow (36fe8e1cc), pinned in
+  // .agents/oracles/llama-cpp-unsloth.md. A branch can be rebased or amended
+  // under its own name, so a digest over the bytes we actually ported is the
+  // only thing that makes "the pin" mean something a year from now.
+  CHECK(std::size(vt::cpu::kIq1xxxsGrid) == 256);  // NGRID_IQ1XXXS
+
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (uint64_t v : vt::cpu::kIq1xxxsGrid) {
+    for (int b = 0; b < 8; ++b) {
+      h ^= static_cast<uint8_t>(v >> (8 * b));
+      h *= 0x100000001b3ULL;
+    }
+  }
+  CHECK(h == 0x24421301ff77509cULL);
+
+  int lanes[3] = {0, 0, 0};
+  for (uint64_t v : vt::cpu::kIq1xxxsGrid) {
+    for (int b = 0; b < 8; ++b) {
+      const int8_t lane = static_cast<int8_t>(v >> (8 * b));
+      REQUIRE((lane == -1 || lane == 0 || lane == 1));
+      ++lanes[lane + 1];
+    }
+  }
+  // Far sparser than IQ1_S, which is what the smaller bit budget buys: 1243 of
+  // the 2048 lanes are zero here, against 6649 of 16384 for IQ1_S.
+  CHECK(lanes[0] == 408);   // -1
+  CHECK(lanes[1] == 1243);  //  0
+  CHECK(lanes[2] == 397);   // +1
 }
 
 TEST_CASE("G3 vec_dot is bit-exact run to run (fixed reduction order)") {

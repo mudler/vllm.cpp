@@ -459,20 +459,42 @@ is **not decodable by any admissible oracle** and was rejected:
   derived independently here from GGUF offset deltas is **1.1875**, matching that
   declaration exactly, which is what confirms the identification.
 
-Supporting it would mean implementing an encoding with no upstream definition and
-no pinned oracle, so it is refused today, not deferred silently. Adding the fork
-branch to `.agents/oracles/` is a separate decision with its own issue; the
-encoding is visible debt, and the three narrow types (`IQ1_XS` 64, `IQ1_XXS` 65,
-`IQ1_XXXS` 66) travel together if it is ever taken.
+**That refusal was overruled by developer direction on 15 August 2026, and the
+fork is now pinned.** The refusal rested on a policy premise, no upstream
+definition and no pinned oracle, rather than on a technical one. The fork is
+public and pinnable, so the developer directed anchoring the encoding to it, and
+that resolves the objection at its root: the encoding now HAS a recorded
+upstream and a fixed revision to cite.
 
-`UD-IQ1_S` (473 GiB) is the target instead, and its census is the scope
-statement. Encodings, with support status read from the code rather than from
+`unslothai/llama.cpp` is therefore admitted to the oracle table as
+`llama-cpp-unsloth`, pinned at `36fe8e1cc` on branch `iq1-narrow` and scoped to
+the sub-IQ1_S encodings alone. It records `gateable = no`, because the port was
+grounded in the fork's SOURCE rather than in a running comparison, and issue
+#933 owes the build-and-run measurement. See
+[`.agents/oracles/llama-cpp-unsloth.md`](../oracles/llama-cpp-unsloth.md).
+
+Both checkpoints are therefore targets, and the order is UD-Q1_0 first per
+developer direction, then UD-IQ1_S. The two are structurally IDENTICAL, censused
+the same way over all shards, 1702 records against 1702 declared in each: same
+276 expert tensors, same 96.92 %, same six other encodings with the same counts.
+Only the expert encoding differs, ggml 66 against ggml 19. So the same streaming
+lane serves both, and each needed exactly one new encoding.
+
+The census is the scope statement for both targets, `UD-Q1_0` (370 GiB) and
+`UD-IQ1_S` (473 GiB). Support status is read from the CODE rather than from
 comments (`BlockDTypeFromGgmlTypeId` in `src/vt/dtype.cpp`, `BlockVecDot` in
-`src/vt/cpu/cpu_quant_dot.cpp`, and the `DType` enum itself):
+`src/vt/cpu/cpu_quant_dot.cpp`, and the `DType` enum itself). That distinction
+earned itself: a stale header comment listing six encodings led this section to
+record Q2_K as missing, and reading the dispatch showed it has been served all
+along.
+
+Both censuses, side by side. The `UD-Q1_0` row set is identical apart from the
+expert encoding:
 
 | Encoding | ggml id | Tensors | Gparams | % params | Status |
 |---|---|---|---|---|---|
-| IQ1_S | 19 | 276 | 2370.8 | **96.92** | **absent from this tree** |
+| IQ1_XXXS (`UD-Q1_0` experts) | 66 | 276 | 2370.8 | **96.92** | added, fork-anchored |
+| IQ1_S (`UD-IQ1_S` experts) | 19 | 276 | 2370.8 | **96.92** | added |
 | Q5_K | 13 | 420 | 34.0 | 1.39 | served (`VecDotQ5_KQ8_K`) |
 | Q2_K | 10 | 3 | 25.8 | 1.05 | served (`VecDotQ2_KQ8_K`) |
 | Q6_K | 14 | 162 | 10.8 | 0.44 | served (`VecDotQ6_KQ8_K`) |
@@ -480,11 +502,12 @@ comments (`BlockDTypeFromGgmlTypeId` in `src/vt/dtype.cpp`, `BlockVecDot` in
 | Q8_0 | 8 | 1 | 0.1 | 0.01 | served |
 | F32 | 0 | 838 | 0.5 | 0.02 | served (not keep-quant) |
 
-**Exactly one encoding is missing, and it is 96.92 % of the model.** The IQ1_S
-tensors are precisely the 92 non-MTP layers times three expert matrices
-(`ffn_down_exps`, `ffn_gate_exps`, `ffn_up_exps`); the Q2_K trio is block 92, the
-`nextn` MTP layer. So IQ1_S alone makes a complete 92-layer forward pass
-loadable, and no second encoding gates the first benchmark.
+**Each checkpoint was missing exactly ONE encoding, and it was 96.92 % of the
+model.** In both, the expert tensors are precisely the 92 non-MTP layers times
+three expert matrices (`ffn_down_exps`, `ffn_gate_exps`, `ffn_up_exps`), and the
+Q2_K trio is block 92, the `nextn` MTP layer. So one encoding per checkpoint
+makes a complete 92-layer forward pass loadable, and nothing else gates the
+first benchmark.
 
 IQ1_S is an ordinary upstream k-quant at the existing pin, and this tree already
 carries the whole grid-table pattern it needs, built for DeepSeek-V4 under
@@ -518,7 +541,9 @@ records why the target checkpoint changed.
 |---|---|---|---|
 | W9 IQ1_S decode | `DType::kIQ1_S`, geometry `{256, 50, 19}`, `BlockDTypeFromGgmlTypeId` row, CPU `iq1s_grid` + `VecDotIQ1_SQ8_K` traits row, dequant path | - | CPU tests green against upstream-derived vectors; `KeepQuantDType(19)` true |
 | W10 IQ1_S device decode | `iq1s_grid_gpu` + CUDA `vec_dot`, so streamed slices dot on device. NOT optional polish: `cuda_quant_dot.cu:1531` maps an unknown weight dtype to `return false`, which is a SILENT CPU fallback. Tokens would still be correct, so no token gate can see it, and a 2.4 T model would simply run at CPU speed while looking healthy | W9 | CUDA tests; parity with the CPU arm; the fallback must be observable rather than inferred |
-| W11 checkpoint load | UD-IQ1_S loads end to end on dgx.casa, refusing any encoding it cannot honour by name | W9, W10 | model loads; token output captured |
+| W11 checkpoint load | UD-Q1_0 first, then UD-IQ1_S, loads end to end on dgx.casa, refusing any encoding it cannot honour by name | W9, W10, W12 | model loads; token output captured |
+| W12 IQ1_XXXS decode | `DType::kIQ1_XXXS`, geometry `{256, 38, 66}`, the 256-entry fork codebook, `VecDotIQ1_XXXSQ8_K`, dequant, traits row and the reader's `case 66`. Grounded in the pinned fork oracle, cited per site | - | CPU tests green; `KeepQuantDType(66)` true; grid digest sealed |
+| W13 IQ1_XXXS device decode | the CUDA arm, for the same silent-fallback reason as W10 | W12 | CUDA tests; parity with the CPU arm |
 
 ## Risks/decisions
 
@@ -529,7 +554,7 @@ records why the target checkpoint changed.
 | Uniform-routing h≈f may undershoot G3 | W5 measures h(f), but G3 stays fixed at f=0.5/12 tok/s. A miss is an open gap; changing the fraction is a new recorded gate, never silent rebasing |
 | Expert bank = second copy of expert bytes on disk (~17 GiB) | Accepted: one-time build, keyed+versioned, evictable file; alternative (per-miss repack kernel) taxes every miss forever |
 | GGUF checkpoints (APEX 35B, and every Qwen3.8-class checkpoint that exists) not covered by W1-W6 | Still out of scope for W1-W6, but the stated blocker is GONE: the slicer landed 2026-07-22. What remains is the residency policy, and the GGUF lane needs NO bank at all (see the reconciliation note) |
-| Target checkpoint carries an encoding no admissible oracle defines (`UD-Q1_0`, ggml type 66) | REJECTED as a target, not deferred quietly. It is `IQ1_XXXS` on the fork branch `unslothai/llama.cpp @ iq1-narrow` only, so implementing it means an encoding with no upstream definition and no pinned oracle to gate against. `UD-IQ1_S` is the target instead; the fork-branch oracle question gets its own issue if it is ever wanted |
+| Target checkpoint carries an encoding no UPSTREAM oracle defines (`UD-Q1_0`, ggml type 66) | First refused, then admitted on developer direction (15 August 2026) by pinning the fork as `llama-cpp-unsloth` at `36fe8e1cc`. The objection was policy, not feasibility, and a recorded pin answers it. The cost is honest and recorded rather than hidden: the pin is a BRANCH, which can be rebased under its own name, so the ported grid carries a digest seal, and `gateable = no` with issue #933 owing the build-and-run measurement. The oracle is scoped to the sub-IQ1_S encodings only and never outranks vLLM or upstream llama.cpp |
 | IQ1_S at 1.5625 bpw may cost accuracy versus the 1.1875 bpw quant originally chosen | Accepted, and it moves the other way too: IQ1_S is the HIGHER-fidelity encoding of the two. The cost is 473 GiB rather than 370 GiB on disk, which the 3.0 TB free on dgx.casa absorbs. Quality is not asserted here; the row's gate is token output against an oracle, and any accuracy claim needs its own measurement |
 | One encoding is 96.92 % of the target model | This is why W9 blocks W11 and why no partial-decode fallback is offered. A model that expands its experts to bf16 to avoid IQ1_S would need multiple TB of memory, so "unsupported encoding" here means refusal by name, never a silent widening |
 | tmpfs "tier" temptation on GB10 | Rejected with reasons (§Scope verdict): tmpfs is the same unified memory; documented so it is not re-proposed |

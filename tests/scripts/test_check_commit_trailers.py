@@ -589,6 +589,40 @@ class PullRequestBodyMode(unittest.TestCase):
         result = self.run_checker("--message-file", "-", "--filled", stdin=body)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_filled_ignores_the_placeholder_MENTIONED_in_prose(self) -> None:
+        """A body that DOCUMENTS the flag must not trip it.
+
+        The first implementation searched the raw message, so any body naming
+        `AGENT:MODEL [TOOL]` while explaining the check was rejected -- including
+        the spec for this row and the body of the pull request that introduced
+        it. The comparison is against the PARSED Assisted-by value instead.
+        """
+        body = (
+            "fix(ROW): a subject (#1)\n\n"
+            "This flag rejects the placeholder AGENT:MODEL [TOOL], which "
+            "satisfies the grammar while crediting nobody.\n\n"
+            "FOLLOWING_AGENTS_PROTOCOL\n\n"
+            "Following-Agents-Protocol: true\n"
+            "AI-Assisted: true\n"
+            "Assisted-by: AGENT:claude-opus-5 [Claude Code]\n"
+        )
+        result = self.run_checker("--message-file", "-", "--filled", stdin=body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_filled_still_rejects_the_placeholder_as_a_real_trailer(self) -> None:
+        """The other half: prose is exempt, a real trailer value is not."""
+        body = (
+            "fix(ROW): a subject (#1)\n\n"
+            "A body.\n\n"
+            "FOLLOWING_AGENTS_PROTOCOL\n\n"
+            "Following-Agents-Protocol: true\n"
+            "AI-Assisted: true\n"
+            "Assisted-by: AGENT:MODEL [TOOL]\n"
+        )
+        result = self.run_checker("--message-file", "-", "--filled", stdin=body)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("placeholder", result.stderr)
+
     def test_exactly_one_of_range_or_message_file(self) -> None:
         both = self.run_checker("--range", "HEAD~1..HEAD", "--message-file", "-")
         self.assertNotEqual(both.returncode, 0)

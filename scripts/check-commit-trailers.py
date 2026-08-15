@@ -379,12 +379,23 @@ def main() -> int:
             )
             return 1
         errors = validate_commit_message(message, strict=True)
-        if args.filled and PLACEHOLDER_ASSISTED_BY in message:
-            errors.append(
-                f"[{ATTRIBUTION_RULE}] Assisted-by still reads "
-                f"{PLACEHOLDER_ASSISTED_BY!r}, the template's placeholder. Name "
-                "the agent and model that did the work"
-            )
+        # Compare the PARSED trailer value, never the raw text. A substring
+        # search over the whole message flags any body that merely MENTIONS the
+        # placeholder, which this repository's own specs and pull request bodies
+        # do whenever they document the flag. Found by running this check on the
+        # body of the pull request that introduces it.
+        if args.filled:
+            placeholders = [
+                value
+                for _, value in _trailer_map(message).get("assisted-by", [])
+                if value == PLACEHOLDER_ASSISTED_BY
+            ]
+            if placeholders:
+                errors.append(
+                    f"[{ATTRIBUTION_RULE}] Assisted-by still reads "
+                    f"{PLACEHOLDER_ASSISTED_BY!r}, the template's placeholder. "
+                    "Name the agent and model that did the work"
+                )
         if errors:
             print("commit trailer check FAILED:", file=sys.stderr)
             for error in errors:

@@ -24,6 +24,11 @@
 #include <stdexcept>
 #include <utility>
 
+// The SHARED ModelOpt dequant seam (DequantNvfp4ToBf16 / DequantFp8ToBf16 /
+// kNvfp4GroupSize). The host reference forward has no NVFP4 and no FP8 GEMM, so
+// a quantized operand is widened here rather than in a hand-rolled sibling of
+// the utility every other ModelOpt consumer in this tree already uses.
+#include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"
 
@@ -185,6 +190,82 @@ void RequireWeight(const NemotronHOwned& w, const char* what, DType want,
                                  what + "' has the wrong shape");
 }
 
+// A DENSE operand for one GEMM, in `want`.
+//
+// Dense weights are viewed in place — no copy, byte-identical to the W4 path.
+// A quantized weight (NVFP4 W4A16 g16 experts / lm_head, FP8 W8A8 static mamba
+// projections) is dequantized through the SHARED ModelOpt seam into a TRANSIENT
+// buffer that lives exactly as long as this GEMM.
+//
+// This is the declared host arm, not a silent fallback. The host reference
+// forward composes `vt::MatmulBT`, which has no NVFP4 and no FP8 entry point;
+// the quantized GEMMs are the CUDA `kMoeGroupedGemmNvfp4Marlin` and fp8-linear
+// registrations W6 selects. Two properties keep it honest: the weight KEEPS its
+// quantized memory format in host memory (so RSS and the load report describe
+// the checkpoint, not a widened copy of it), and the arm is NAMED by the loader
+// header and reported by the load report rather than being discoverable only by
+// reading this function.
+//
+// What the report counts is the QUANTIZED WEIGHTS — 5935 NVFP4 W4A16 g16
+// projections and 46 FP8 W8A8 static ones, the population this widening can be
+// applied to. It does NOT count dequant EVENTS: a dequant here is transient and
+// per GEMM call, so its count is a property of the workload, not of the load.
+struct DenseOperand {
+  std::vector<uint8_t> owned;  // non-empty only when a dequant happened
+  Tensor view;
+};
+
+DenseOperand DenseFor(const NemotronHOwned& w, DType want, vt::Device dev) {
+  DenseOperand d;
+  if (w.IsDense()) {
+    d.view = w.View(dev);
+    return d;
+  }
+  // The shared seam produces bf16; widen losslessly for the f32 reference arm.
+  d.owned = w.DenseBf16();
+  const int64_t n = w.Numel();
+  if (want == DType::kF32) {
+    std::vector<uint8_t> wide(static_cast<size_t>(n) * sizeof(float));
+    const auto* src = reinterpret_cast<const uint16_t*>(d.owned.data());
+    auto* dst = reinterpret_cast<float*>(wide.data());
+    for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+    d.owned = std::move(wide);
+  }
+  d.view.data = d.owned.data();
+  d.view.dtype = want;
+  d.view.device = dev;
+  d.view.rank = static_cast<int>(w.shape.size());
+  VT_CHECK(d.view.rank >= 1 && d.view.rank <= vt::kMaxRank,
+           "NemotronH forward: dequantized operand rank out of range");
+  int64_t stride = 1;
+  for (int i = d.view.rank - 1; i >= 0; --i) {
+    d.view.shape[i] = w.shape[static_cast<size_t>(i)];
+    d.view.stride[i] = stride;
+    stride *= w.shape[static_cast<size_t>(i)];
+  }
+  return d;
+}
+
+// An OWNED dense `NemotronHOwned` at `want`, so one dequant can serve several
+// GEMMs (the expert-major MoE loop). Same seam and same declared-arm reasoning
+// as `DenseFor`; a dense input is returned unchanged.
+NemotronHOwned DenseCopy(const NemotronHOwned& w, DType want) {
+  if (w.IsDense()) return w;
+  NemotronHOwned out;
+  out.dtype = want;
+  out.shape = w.shape;
+  out.bytes = w.DenseBf16();
+  if (want == DType::kF32) {
+    const int64_t n = w.Numel();
+    std::vector<uint8_t> wide(static_cast<size_t>(n) * sizeof(float));
+    const auto* src = reinterpret_cast<const uint16_t*>(out.bytes.data());
+    auto* dst = reinterpret_cast<float*>(wide.data());
+    for (int64_t i = 0; i < n; ++i) dst[i] = vt::BF16ToF32(src[i]);
+    out.bytes = std::move(wide);
+  }
+  return out;
+}
+
 // out[M,N] = a[M,K] @ b^T, b [N,K] — the torch-Linear orientation every weight
 // above is stored in.
 Buf Linear(Queue& q, const Buf& a, const NemotronHOwned& w, int64_t M, int64_t K,
@@ -192,9 +273,9 @@ Buf Linear(Queue& q, const Buf& a, const NemotronHOwned& w, int64_t M, int64_t K
   RequireWeight(w, what, a.dtype, {N, K});
   Buf out(a.dtype, {M, N});
   Tensor at = a.t(q.device, {M, K});
-  Tensor wt = w.View(q.device);
+  const DenseOperand wd = DenseFor(w, a.dtype, q.device);
   Tensor ot = out.t(q.device);
-  vt::MatmulBT(q, ot, at, wt);
+  vt::MatmulBT(q, ot, at, wd.view);
   return out;
 }
 
@@ -239,6 +320,16 @@ int64_t NemotronHOwned::Numel() const {
 }
 
 vt::Tensor NemotronHOwned::View(vt::Device device) const {
+  // A view over packed NVFP4 nibbles or e4m3 bytes, TYPED as the logical dtype,
+  // reads finite plausible garbage of the right shape — no kernel and no shape
+  // check can catch it, and a token gate cannot see it. So the dense view
+  // refuses a quantized weight by name and `DenseFor` is the only way to a GEMM
+  // operand.
+  VT_CHECK(form == NemotronHWeightForm::kDense,
+           "NemotronHOwned::View: this weight is held in its SHIPPED quantized "
+           "form (NVFP4 W4A16 g16 or FP8 W8A8 static); a dense view of it would "
+           "reinterpret packed bytes as the model dtype. Materialize it with "
+           "DenseBf16() at the call site instead.");
   Tensor t;
   t.data = const_cast<uint8_t*>(bytes.data());
   t.dtype = dtype;
@@ -253,6 +344,43 @@ vt::Tensor NemotronHOwned::View(vt::Device device) const {
     stride *= shape[static_cast<size_t>(i)];
   }
   return t;
+}
+
+std::vector<uint8_t> NemotronHOwned::DenseBf16() const {
+  VT_CHECK(shape.size() == 2,
+           "NemotronHOwned::DenseBf16: only a 2-D [out, in] projection is "
+           "quantized in this architecture");
+  const int64_t rows = shape[0];
+  const int64_t cols = shape[1];
+  std::vector<uint8_t> out(static_cast<size_t>(rows * cols) * sizeof(uint16_t));
+  auto* dst = reinterpret_cast<uint16_t*>(out.data());
+  switch (form) {
+    case NemotronHWeightForm::kNvfp4W4A16G16:
+      VT_CHECK(bytes.size() == static_cast<size_t>(rows * cols / 2),
+               "NemotronHOwned::DenseBf16: NVFP4 payload is not [rows, cols/2]");
+      VT_CHECK(scale.size() == static_cast<size_t>(rows * cols / kNvfp4GroupSize),
+               "NemotronHOwned::DenseBf16: NVFP4 group scales are not "
+               "[rows, cols/16]");
+      // The SHARED ModelOpt seam, at the DEFAULTED nibble order — ModelOpt and
+      // compressed-tensors checkpoints are low-first
+      // (.agents/specs/nvfp4-nibble-order.md), and this is one.
+      DequantNvfp4ToBf16(bytes.data(), scale.data(), global_scale, rows, cols,
+                         dst);
+      return out;
+    case NemotronHWeightForm::kFp8W8A8Static:
+      VT_CHECK(bytes.size() == static_cast<size_t>(rows * cols),
+               "NemotronHOwned::DenseBf16: FP8 payload is not [rows, cols]");
+      // Weight-only: `input_scale` is carried, not applied. Nothing on the host
+      // path quantizes the activation, so applying it here would scale the
+      // product by a factor upstream applies to the OTHER operand.
+      DequantFp8ToBf16(bytes.data(), global_scale, rows * cols, dst);
+      return out;
+    case NemotronHWeightForm::kDense:
+      break;
+  }
+  VT_CHECK(false,
+           "NemotronHOwned::DenseBf16: called on a weight that is already dense");
+  return out;
 }
 
 NemotronHOwned NemotronHOwned::FromF32(const std::vector<float>& values, vt::DType dtype,
@@ -585,16 +713,44 @@ std::vector<float> NemotronHMoeMixer(const NemotronHMoeWeights& w,
   const Buf x = PackF32(hidden_normed, act_dtype, {T, H});
   Buf expert_out(act_dtype, {T, Kk, H});
   const size_t esz = vt::SizeOf(act_dtype);
+  // EXPERT-MAJOR iteration over the (token, slot) pairs. Each pair's own
+  // `NonGatedExpert` call is unchanged — one row against one expert, so every
+  // output row's arithmetic is byte-identical to the token-major order this
+  // replaces — but visiting the pairs grouped by expert lets ONE dequant of a
+  // quantized expert serve all of that expert's rows. On the released
+  // checkpoint an expert is an NVFP4 W4A16 g16 pair (~10e6 elements); the
+  // token-major order re-materializes it per row.
+  //
+  // Ordering cannot change the RESULT: each pair writes its own disjoint
+  // `expert_out` slot and reads nothing another pair wrote.
+  std::vector<std::vector<int64_t>> pairs(static_cast<size_t>(E));
   for (int64_t t = 0; t < T; ++t) {
     for (int64_t j = 0; j < Kk; ++j) {
       const int32_t e = topk_id[static_cast<size_t>(t * Kk + j)];
       VT_CHECK(e >= 0 && e < E, "NemotronH moe: router emitted an invalid expert id");
+      pairs[static_cast<size_t>(e)].push_back(t * Kk + j);
+    }
+  }
+  for (int64_t e = 0; e < E; ++e) {
+    const std::vector<int64_t>& slots = pairs[static_cast<size_t>(e)];
+    if (slots.empty()) continue;
+    const NemotronHExpertWeights& src = w.experts[static_cast<size_t>(e)];
+    // The dense stand-in exists only while this expert is being served, so peak
+    // host RSS carries ONE dequantized expert, not 128 of them.
+    NemotronHExpertWeights dense;
+    const NemotronHExpertWeights* use = &src;
+    if (!src.up_proj.IsDense() || !src.down_proj.IsDense()) {
+      dense.up_proj = DenseCopy(src.up_proj, act_dtype);
+      dense.down_proj = DenseCopy(src.down_proj, act_dtype);
+      use = &dense;
+    }
+    for (int64_t slot : slots) {
+      const int64_t t = slot / Kk;
       Buf row(act_dtype, {1, H});
       std::memcpy(row.bytes.data(), x.bytes.data() + static_cast<size_t>(t * H) * esz,
                   static_cast<size_t>(H) * esz);
-      const Buf y = NonGatedExpert(queue, row, w.experts[static_cast<size_t>(e)], 1, H, I,
-                                   "mixer.experts");
-      std::memcpy(expert_out.bytes.data() + static_cast<size_t>((t * Kk + j) * H) * esz,
+      const Buf y = NonGatedExpert(queue, row, *use, 1, H, I, "mixer.experts");
+      std::memcpy(expert_out.bytes.data() + static_cast<size_t>(slot * H) * esz,
                   y.bytes.data(), static_cast<size_t>(H) * esz);
     }
   }

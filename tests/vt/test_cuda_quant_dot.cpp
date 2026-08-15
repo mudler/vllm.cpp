@@ -98,6 +98,12 @@ const WeightCase kCases[] = {
     {DType::kIQ2_XXS, 256, 66, 0, -1, "iq2_xxs"},   // DeepSeek-V4 gate/up
     {DType::kIQ3_XXS, 256, 98, 0, -1, "iq3_xxs"},   // DeepSeek-V4 down
     {DType::kIQ2_S, 256, 82, 0, -1, "iq2_s"},       // DeepSeek-V4 UD-IQ2_M gate/up
+    // The two sub-2-bit codebooks the Qwen3.8-2.4T checkpoints store their
+    // routed experts in (96.92 % of each model). Without a CUDA arm these fall
+    // to the CPU path and still emit CORRECT tokens, just at CPU speed, which
+    // no token gate can see -- so device parity is gated HERE.
+    {DType::kIQ1_S, 256, 50, 0, -1, "iq1_s"},       // Qwen3.8 UD-IQ1_S experts
+    {DType::kIQ1_XXXS, 256, 38, 0, -1, "iq1_xxxs"},  // Qwen3.8 UD-Q1_0 experts
     {DType::kQ2_K, 256, 84, 80, 82, "q2_K"},        // DeepSeek-V4 UD-Q2_K_XL
     {DType::kQ3_K, 256, 110, 108, -1, "q3_K"},
     {DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
@@ -128,6 +134,33 @@ std::vector<uint8_t> RandomBlocks(const WeightCase& c, int64_t nblocks,
     const float jitter = 1.0F + 0.05F * static_cast<float>(i % 7);
     if (c.d_off >= 0) put_f16(c.d_off, 0.0125F * jitter);
     if (c.dmin_off >= 0) put_f16(c.dmin_off, 0.0075F * jitter);
+    // IQ1_S and IQ1_XXXS carry their per-32 sub-block scale INSIDE the weight
+    // (qh bits 12-14, and the sc nibble's bits 0-2). Uniformly random bits
+    // spread neighbouring 32-groups over a 15x scale range, which no encoder
+    // emits, and Q8_K gives the ACTIVATION one scale per 256 elements -- so the
+    // f64-dequant bound below would measure that synthetic dynamic range rather
+    // than the kernel. The scale still VARIES per sub-block, so a kernel that
+    // dropped or hoisted it is still caught; the delta sign bit stays random.
+    // Mirrors the identical narrowing in tests/vt/test_ops_quant_dot.cpp.
+    if (c.dtype == DType::kIQ1_S) {
+      for (int ib = 0; ib < 8; ++ib) {
+        uint16_t qh = 0;
+        std::memcpy(&qh, blk + 34 + 2 * ib, sizeof(qh));
+        const uint16_t ls = static_cast<uint16_t>(2 + ((i + ib) % 3));
+        qh = static_cast<uint16_t>((qh & 0x8FFFU) | (ls << 12));
+        std::memcpy(blk + 34 + 2 * ib, &qh, sizeof(qh));
+      }
+    }
+    if (c.dtype == DType::kIQ1_XXXS) {
+      for (int ib = 0; ib < 8; ++ib) {
+        uint8_t& byte = blk[34 + ib / 2];
+        const int shift = 4 * (ib & 1);
+        const uint8_t ls = static_cast<uint8_t>(2 + ((i + ib) % 3));
+        const uint8_t keep_sign = static_cast<uint8_t>((byte >> shift) & 0x8);
+        byte = static_cast<uint8_t>((byte & ~(0xFU << shift)) |
+                                    ((keep_sign | ls) << shift));
+      }
+    }
   }
   return bytes;
 }

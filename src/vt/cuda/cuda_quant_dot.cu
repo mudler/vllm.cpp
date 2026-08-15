@@ -56,6 +56,8 @@
 namespace vt::cuda {
 namespace {
 
+using vt::cpu::BlockIQ1_S;
+using vt::cpu::BlockIQ1_XXXS;
 using vt::cpu::BlockIQ2_S;
 using vt::cpu::BlockIQ2_XXS;
 using vt::cpu::BlockIQ3_XXS;
@@ -370,6 +372,62 @@ __device__ inline float DotIQ3XXS(const BlockIQ3_XXS* xb, const BlockQ8_K* yb) {
 // d_iq2s_grid; the DIRECT sign byte signs[l] (= qs + QK_K/8, NO ksigns lookup)
 // flips lanes; per-32 ls = 1 + 2*ls_nibble fold in; final *0.125 after the warp
 // reduction. BIT-IDENTICAL integer core to the CPU reference.
+// IQ1_S (quants.c:1099) and IQ1_XXXS (fork quants.c:1281), transcribed from the
+// CPU kernels they must agree with bit for bit.
+//
+// Both split into an integer grid dot PLUS a delta term over the activation's
+// per-16 sums, which is why they read `bsums` where no other device dot here
+// does. The grids are ternary, so there is no sign table and no FinalFactor
+// scaling: the whole value is already in the returned sum.
+__device__ inline float DotIQ1S(const BlockIQ1_S* xb, const BlockQ8_K* yb) {
+  const int8_t* q8 = yb->qs;
+  const uint8_t* qs = xb->qs;
+  const uint16_t* qh = xb->qh;
+  int32_t sumi = 0;
+  int32_t sumi1 = 0;
+  for (int ib = 0; ib < kQK_K / 32; ++ib) {
+    const int ls = 2 * ((qh[ib] >> 12) & 7) + 1;
+    const int delta = (qh[ib] & 0x8000) ? -1 : 1;
+    int lsum = 0;
+    for (int l = 0; l < 4; ++l) {
+      const int8_t* grid = reinterpret_cast<const int8_t*>(
+          &d_iq1s_grid[qs[l] | (((qh[ib] >> (3 * l)) & 7) << 8)]);
+      for (int j = 0; j < 8; ++j) lsum += q8[j] * grid[j];
+      q8 += 8;
+    }
+    sumi += ls * lsum;
+    sumi1 += ls * delta * (yb->bsums[2 * ib + 0] + yb->bsums[2 * ib + 1]);
+    qs += 4;
+  }
+  return DF16ToF32(xb->d) * yb->d *
+         (static_cast<float>(sumi) + 0.125f * static_cast<float>(sumi1));
+}
+
+__device__ inline float DotIQ1XXXS(const BlockIQ1_XXXS* xb, const BlockQ8_K* yb) {
+  const int8_t* q8 = yb->qs;
+  const uint8_t* qs = xb->qs;
+  const uint8_t* sc = xb->sc;
+  int32_t sumi = 0;
+  int32_t sumi1 = 0;
+  for (int ib = 0; ib < kQK_K / 32; ++ib) {
+    const int nib = (sc[ib / 2] >> (4 * (ib & 1))) & 0xf;
+    const int ls = 2 * (nib & 7) + 1;
+    const int delta = (nib & 8) ? -1 : 1;
+    int lsum = 0;
+    for (int l = 0; l < 4; ++l) {
+      const int8_t* grid =
+          reinterpret_cast<const int8_t*>(&d_iq1xxxs_grid[qs[l]]);
+      for (int j = 0; j < 8; ++j) lsum += q8[j] * grid[j];
+      q8 += 8;
+    }
+    sumi += ls * lsum;
+    sumi1 += ls * delta * (yb->bsums[2 * ib + 0] + yb->bsums[2 * ib + 1]);
+    qs += 4;
+  }
+  return DF16ToF32(xb->d) * yb->d *
+         (static_cast<float>(sumi) + 0.125f * static_cast<float>(sumi1));
+}
+
 __device__ inline float DotIQ2S(const BlockIQ2_S* xb, const BlockQ8_K* yb) {
   const float d = DF16ToF32(xb->d) * yb->d;
   const int8_t* q8 = yb->qs;
@@ -647,6 +705,8 @@ enum class WType : int {
   kQ5_K = 5,
   kQ6_K = 6,
   kIQ2_S = 7,  // UD-IQ2_M ffn_gate/up (Q8_K activation, fits this GEMM)
+  kIQ1_S = 8,     // Qwen3.8-2.4T UD-IQ1_S routed experts (96.92 % of it)
+  kIQ1_XXXS = 9,  // Qwen3.8-2.4T UD-Q1_0 routed experts (96.92 % of it)
   // NOTE: MXFP4 is intentionally ABSENT — it dots against a 32-element Q8_0
   // activation, not Q8_K, so it cannot slot into this Q8_K super-block GEMM
   // (see DotMXFP4). It CPU-fallbacks until a Q8_0-activation GEMM variant lands.
@@ -685,6 +745,14 @@ __device__ inline float DotSuperblock<WType::kQ6_K>(const void* w, const BlockQ8
 template <>
 __device__ inline float DotSuperblock<WType::kIQ2_S>(const void* w, const BlockQ8_K* a) {
   return DotIQ2S(static_cast<const BlockIQ2_S*>(w), a);
+}
+template <>
+__device__ inline float DotSuperblock<WType::kIQ1_S>(const void* w, const BlockQ8_K* a) {
+  return DotIQ1S(static_cast<const BlockIQ1_S*>(w), a);
+}
+template <>
+__device__ inline float DotSuperblock<WType::kIQ1_XXXS>(const void* w, const BlockQ8_K* a) {
+  return DotIQ1XXXS(static_cast<const BlockIQ1_XXXS*>(w), a);
 }
 
 template <WType W>
@@ -1526,6 +1594,11 @@ bool IsCudaKeepQuantSupported(DType dt, WType* out) {
     case DType::kQ5_K: *out = WType::kQ5_K; return true;
     case DType::kQ6_K: *out = WType::kQ6_K; return true;
     case DType::kIQ2_S: *out = WType::kIQ2_S; return true;
+    // Without these two the 2.4 T Qwen3.8 experts fall to the CPU arm below
+    // and still emit CORRECT tokens, just at CPU speed, which no token gate
+    // can see. That is why they are here and not left owed.
+    case DType::kIQ1_S: *out = WType::kIQ1_S; return true;
+    case DType::kIQ1_XXXS: *out = WType::kIQ1_XXXS; return true;
     // MXFP4 (Q8_0-activation, 32-elem blocks) is NOT handled by this Q8_K GEMM;
     // it falls through to CPU like Q4_0 / Q8_0 until a Q8_0-activation GEMM lands.
     default: return false;  // Q4_0 / Q8_0 / MXFP4 (Q8_0-activation) -> CPU fallback
@@ -1796,6 +1869,8 @@ void MatmulBTQuantKernelCuda(Queue& q, Tensor& out, const Tensor& a,
     case WType::kQ5_K: LaunchGemm<WType::kQ5_K>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     case WType::kQ6_K: LaunchGemm<WType::kQ6_K>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     case WType::kIQ2_S: LaunchGemm<WType::kIQ2_S>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kIQ1_S: LaunchGemm<WType::kIQ1_S>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kIQ1_XXXS: LaunchGemm<WType::kIQ1_XXXS>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
   }
   CheckCuda(cudaGetLastError(), "matmul_bt_quant launch");
 }

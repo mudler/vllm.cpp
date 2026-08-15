@@ -33,3 +33,6 @@ a.out
 # Logs and local capture artifacts (demo recordings, screencasts)
 *.log
 *.mp4
+# ...except rendered evidence, which benchmarks/media has tracked since
+# concurrency_race.mp4. A force-add per file hides that intent in reflog only.
+!benchmarks/media/*.mp4

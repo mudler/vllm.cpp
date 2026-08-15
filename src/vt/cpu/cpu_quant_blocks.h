@@ -155,6 +155,29 @@ struct BlockIQ2_S {
 };
 static_assert(sizeof(BlockIQ2_S) == 82, "wrong iq2_s block size/padding");
 
+// ggml-common.h:414-419 block_iq1_s. 1.5625 bpw codebook quant, and the
+// encoding that carries 96.92 % of `Qwen3.8-2.4T-A95B UD-IQ1_S` (see the target
+// checkpoint census in .agents/specs/expert-streaming.md).
+//
+// Unlike every other codebook here, the grid entry is not an index into
+// magnitudes: each kIq1sGrid u64 packs 8 TERNARY signed bytes (-1, 0 or +1),
+// and the reconstructed value is `dl * (grid[j] + delta)`, so the codebook
+// supplies the sign pattern and `delta` (+/- 0.125) shifts the whole lane group
+// off the ternary lattice. That is why there is no sign-byte array and no
+// ksigns lookup: the sign IS the codebook entry.
+//
+// `qh` does three jobs at once per 32-element sub-block: bits 0-8 give the
+// three high index bits for each of the 4 lane groups (`(qh >> 3*l) & 7`,
+// widening qs's 8-bit index to the 11 bits that address 2048 entries), bits
+// 12-14 give the sub-block scale (`2*((qh >> 12) & 7) + 1`), and bit 15 selects
+// the sign of `delta`.
+struct BlockIQ1_S {
+  uint16_t d;                   // super-block scale (ggml_half)
+  uint8_t qs[kQK_K / 8];        // 32: one 8-bit grid-index low byte per group
+  uint16_t qh[kQK_K / 32];      // 8: high index bits, scale, delta sign
+};
+static_assert(sizeof(BlockIQ1_S) == 50, "wrong iq1_s block size/padding");
+
 // ggml-common.h:204-209 block_mxfp4. OCP micro-scaling fp4: `e` is one E8M0
 // (power-of-two) shared exponent for the whole 32-element block, `qs` packs the
 // 32 e2m1 4-bit elements two-per-byte (element j in the low nibble of qs[j],

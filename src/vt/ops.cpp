@@ -44,6 +44,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kIQ2_XXS:
     case DType::kIQ3_XXS:
     case DType::kIQ2_S:
+    case DType::kIQ1_S:
     case DType::kMXFP4:
       break;
   }

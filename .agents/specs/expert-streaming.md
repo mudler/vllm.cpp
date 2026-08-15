@@ -434,6 +434,92 @@ corrects the record so the next person to cost that leaf starts from what is
 true. Re-verify these anchors before implementing: they were re-derived at HEAD
 on 2026-08-14 and this spec has already been wrong about them once.
 
+## Target checkpoint census and the quant encodings it needs (2026-08-15, issue #912)
+
+The GGUF reconciliation note above establishes that the GGUF lane needs no bank
+and only a residency policy. It did not ask a prior question: **can this tree
+decode the bytes of the checkpoint the row exists to run?** Measuring that
+changed the target.
+
+Every published GGUF of `unsloth/Qwen3.8-2.4T-A95B-GGUF` at revision
+`567d3e6ac26c5474b18311e619c04350fb9a5556` was censused by parsing tensor
+headers directly (HTTP range requests, no full download). Coverage is total, not
+sampled: **1702 tensor records parsed against 1702 declared in
+`split.tensors.count`.**
+
+`UD-Q1_0` (370 GiB), the smallest quant and the one first chosen for this row,
+is **not decodable by any admissible oracle** and was rejected:
+
+- Its expert tensors carry ggml type **66**, holding ~97 % of all parameters.
+- Type 66 exists in neither the pinned llama.cpp (`237ad9b96`, whose enum ends
+  at `GGML_TYPE_Q1_0 = 41`) nor upstream `ggml-org/llama.cpp` master
+  (`ad1de39e0`, 2026-08-15, ends at `GGML_TYPE_Q2_0 = 42`, `COUNT = 43`).
+- It is defined only on the fork branch `unslothai/llama.cpp @ iq1-narrow` as
+  `GGML_TYPE_IQ1_XXXS = 66, // 1.1875 bpw, 256-entry grid`. The bits-per-weight
+  derived independently here from GGUF offset deltas is **1.1875**, matching that
+  declaration exactly, which is what confirms the identification.
+
+Supporting it would mean implementing an encoding with no upstream definition and
+no pinned oracle, so it is refused today, not deferred silently. Adding the fork
+branch to `.agents/oracles/` is a separate decision with its own issue; the
+encoding is visible debt, and the three narrow types (`IQ1_XS` 64, `IQ1_XXS` 65,
+`IQ1_XXXS` 66) travel together if it is ever taken.
+
+`UD-IQ1_S` (473 GiB) is the target instead, and its census is the scope
+statement. Encodings, with support status read from the code rather than from
+comments (`BlockDTypeFromGgmlTypeId` in `src/vt/dtype.cpp`, `BlockVecDot` in
+`src/vt/cpu/cpu_quant_dot.cpp`, and the `DType` enum itself):
+
+| Encoding | ggml id | Tensors | Gparams | % params | Status |
+|---|---|---|---|---|---|
+| IQ1_S | 19 | 276 | 2370.8 | **96.92** | **absent from this tree** |
+| Q5_K | 13 | 420 | 34.0 | 1.39 | served (`VecDotQ5_KQ8_K`) |
+| Q2_K | 10 | 3 | 25.8 | 1.05 | served (`VecDotQ2_KQ8_K`) |
+| Q6_K | 14 | 162 | 10.8 | 0.44 | served (`VecDotQ6_KQ8_K`) |
+| Q4_K | 12 | 2 | 4.1 | 0.17 | served (`VecDotQ4_KQ8_K`) |
+| Q8_0 | 8 | 1 | 0.1 | 0.01 | served |
+| F32 | 0 | 838 | 0.5 | 0.02 | served (not keep-quant) |
+
+**Exactly one encoding is missing, and it is 96.92 % of the model.** The IQ1_S
+tensors are precisely the 92 non-MTP layers times three expert matrices
+(`ffn_down_exps`, `ffn_gate_exps`, `ffn_up_exps`); the Q2_K trio is block 92, the
+`nextn` MTP layer. So IQ1_S alone makes a complete 92-layer forward pass
+loadable, and no second encoding gates the first benchmark.
+
+IQ1_S is an ordinary upstream k-quant at the existing pin, and this tree already
+carries the whole grid-table pattern it needs, built for DeepSeek-V4 under
+`.agents/specs/gguf-iquant-dsv4.md`: `kIQ2_XXS`, `kIQ3_XXS`, `kIQ2_S` and
+`kMXFP4` each have a keep-quant `vec_dot` against the Q8_K activation encoding,
+CPU grids in `src/vt/cpu/cpu_quant_iq_tables.h` and device grids in
+`src/vt/cuda/cuda_quant_iq_tables.cuh`. IQ1_S adds one more row on those rails.
+
+Upstream anchors, re-derived at the pin `237ad9b96` (re-verify before
+implementing, per the reconciliation note's own warning):
+
+| Piece | Anchor |
+|---|---|
+| `block_iq1_s` (`ggml_half d; uint8_t qs[32]; uint16_t qh[8]`) | `ggml/src/ggml-common.h:414-419` |
+| block size assert, 50 bytes per 256 elements = 1.5625 bpw | `ggml/src/ggml-common.h:420` |
+| `ggml_vec_dot_iq1_s_q8_K_generic` | `ggml/src/ggml-cpu/quants.c:1099` |
+| `iq1s_grid`, uint64, `NGRID_IQ1S` = 2048 | `ggml/src/ggml-common.h:1124` |
+| `iq1s_grid_gpu`, uint32, 2048 | `ggml/src/ggml-common.h:1639` |
+
+Why this is in this spec rather than its own row: the encoding is the load
+path's half of the same capability. A streamer that can address an expert slice
+it cannot decode moves bytes for nothing, so the row's own gate cannot be met
+without it. It is nonetheless useful beyond this row, since any low-bit GGUF
+gains it, which is the standing k-quant obligation in `AGENTS.md` rather than a
+detour for one model.
+
+This note does not re-scope W1-W7 or claim a date. It adds the leaves below and
+records why the target checkpoint changed.
+
+| Leaf | Scope | Depends on | Gate slice |
+|---|---|---|---|
+| W9 IQ1_S decode | `DType::kIQ1_S`, geometry `{256, 50, 19}`, `BlockDTypeFromGgmlTypeId` row, CPU `iq1s_grid` + `VecDotIQ1_SQ8_K` traits row, dequant path | - | CPU tests green against upstream-derived vectors; `KeepQuantDType(19)` true |
+| W10 IQ1_S device decode | `iq1s_grid_gpu` + CUDA `vec_dot`, so streamed slices dot on device. NOT optional polish: `cuda_quant_dot.cu:1531` maps an unknown weight dtype to `return false`, which is a SILENT CPU fallback. Tokens would still be correct, so no token gate can see it, and a 2.4 T model would simply run at CPU speed while looking healthy | W9 | CUDA tests; parity with the CPU arm; the fallback must be observable rather than inferred |
+| W11 checkpoint load | UD-IQ1_S loads end to end on dgx.casa, refusing any encoding it cannot honour by name | W9, W10 | model loads; token output captured |
+
 ## Risks/decisions
 
 | Risk / decision | Call |
@@ -443,6 +529,9 @@ on 2026-08-14 and this spec has already been wrong about them once.
 | Uniform-routing h≈f may undershoot G3 | W5 measures h(f), but G3 stays fixed at f=0.5/12 tok/s. A miss is an open gap; changing the fraction is a new recorded gate, never silent rebasing |
 | Expert bank = second copy of expert bytes on disk (~17 GiB) | Accepted: one-time build, keyed+versioned, evictable file; alternative (per-miss repack kernel) taxes every miss forever |
 | GGUF checkpoints (APEX 35B, and every Qwen3.8-class checkpoint that exists) not covered by W1-W6 | Still out of scope for W1-W6, but the stated blocker is GONE: the slicer landed 2026-07-22. What remains is the residency policy, and the GGUF lane needs NO bank at all (see the reconciliation note) |
+| Target checkpoint carries an encoding no admissible oracle defines (`UD-Q1_0`, ggml type 66) | REJECTED as a target, not deferred quietly. It is `IQ1_XXXS` on the fork branch `unslothai/llama.cpp @ iq1-narrow` only, so implementing it means an encoding with no upstream definition and no pinned oracle to gate against. `UD-IQ1_S` is the target instead; the fork-branch oracle question gets its own issue if it is ever wanted |
+| IQ1_S at 1.5625 bpw may cost accuracy versus the 1.1875 bpw quant originally chosen | Accepted, and it moves the other way too: IQ1_S is the HIGHER-fidelity encoding of the two. The cost is 473 GiB rather than 370 GiB on disk, which the 3.0 TB free on dgx.casa absorbs. Quality is not asserted here; the row's gate is token output against an oracle, and any accuracy claim needs its own measurement |
+| One encoding is 96.92 % of the target model | This is why W9 blocks W11 and why no partial-decode fallback is offered. A model that expands its experts to bf16 to avoid IQ1_S would need multiple TB of memory, so "unsupported encoding" here means refusal by name, never a silent widening |
 | tmpfs "tier" temptation on GB10 | Rejected with reasons (§Scope verdict): tmpfs is the same unified memory; documented so it is not re-proposed |
 | CUDA graphs vs data-dependent miss handling | Phase 1 explicitly disables graphs. Current Marlin has no address table; graph compatibility would require a separately spiked kernel/dispatch change after W3 profiling |
 | Full-layer prefill with C<E | A single unmodified Marlin launch cannot address experts absent from slots. W4 uses exact chunk filters + scatter accumulation and proves every routed pair once; it may not allocate a hidden E-sized buffer |

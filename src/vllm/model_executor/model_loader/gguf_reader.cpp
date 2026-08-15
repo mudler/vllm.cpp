@@ -250,6 +250,15 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{256, 98, "IQ3_XXS"};
       return &t;
     }
+    case 19: {
+      // block_iq1_s (ggml-common.h:414-419): f16 d + QK_K/8 u8 qs
+      // + QK_K/32 u16 qh = 2 + 32 + 16 = 50, i.e. 1.5625 bpw. Carries the
+      // routed experts (ffn_down/gate/up_exps) of the Qwen3.8-2.4T-A95B
+      // UD-IQ1_S checkpoint, which is 96.92 % of that model's parameters
+      // (codebook dequant in cpu_quant_dequant.cpp / vt DType kIQ1_S).
+      static constexpr GgmlTypeTraits t{256, 50, "IQ1_S"};
+      return &t;
+    }
     case 22: {
       // block_iq2_s: f16 d + QK_K/4 qs + QK_K/16 qh = 2 + 64 + 16.
       // Used by the APEX "Mini" GGUFs for expert weights.

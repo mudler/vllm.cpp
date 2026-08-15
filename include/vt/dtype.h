@@ -75,6 +75,7 @@ enum class DType : uint8_t {
   kIQ2_XXS,
   kIQ3_XXS,
   kIQ2_S,
+  kIQ1_S,
   kMXFP4,
 };
 

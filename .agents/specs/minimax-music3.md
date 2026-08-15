@@ -1200,3 +1200,40 @@ The revision is **verified rather than copied**:
 `condition_encoder/diffusion_pytorch_model.safetensors` on disk hashes to
 `83179c5eaa9a68a370affe0c1b96c2179f659ea4175666b31071490a202c2a4d`, which is that
 revision's own LFS record for the file.
+
+### 10.5 The first sample a human can hear, and where it is not
+
+**2.0 s of 44100 Hz stereo, from this engine, in 3286 s of wall clock.** The
+e2e gate's own artifact is 0.07 s — the shortest request that still enters every
+stage — which nobody can listen to. `minimax-music3-gen` at `--duration 2.0
+--steps 2 --seed 7` produced 88 064 frames per channel: RMS 0.03169, peak
+0.97437 full-scale with **0 clipped samples**, 175 858 of 176 128 int16 samples
+non-zero, and 84 073 of 88 064 positions differing between left and right, so
+the 128 latent channels are folded into two streams of 64 rather than
+interleaved. Verified independently of the generator, by re-reading the RIFF
+file.
+
+x86 20-core CPU, load average swinging 7 to 150 across the run (several other
+sessions on the box), 17.8 GB resident. No speed claim is made or implied: the
+acoustic half is upstream's own fp32 and the depth decoder and DiT are scalar
+host loops by construction (see `## Now`).
+
+**Its samples are compared to nothing, and that is structural rather than an
+omission.** §5 withdrew the token gate; §6/W6 records that a request's waveform
+can never equal `waveform.npy` because both the codes and the initial latents
+are seeded random draws. The clip demonstrates the pipeline runs and emits a
+well-formed, non-silent, non-clipped, genuinely stereo signal. The per-stage
+gates are what speak to correctness.
+
+**It is NOT committed, and the reason is a checker rather than a preference.**
+`scripts/check-pr-size.py` classifies every repository path; `ASSET` accepts
+`assets/*.{png,svg}`, `BENCH_EVIDENCE` accepts
+`benchmarks/{demo,media}/*.{json,png,gif,mp4,log}`, and neither takes a `.wav`.
+The only classified home for one is under `tests/`, where a file compared to
+nothing would sit beside the oracle goldens and imply it was one — which
+`test_minimax_music3_e2e_real.cpp` explicitly refuses for its own artifact
+("under the build tree, never under tests/ — no golden is created, replaced or
+implied by this"). Widening either pattern would be widening a checker's scope
+to make a change pass, which AGENTS.md forbids without its own spec and
+red-before evidence, and this clip does not justify one. Regenerating it is one
+command.

@@ -277,6 +277,69 @@ TEST_CASE("KeepQuantDType covers the executable encodings") {
   }
 }
 
+TEST_CASE("every encoding in the Qwen3.8-2.4T UD-IQ1_S checkpoint decodes") {
+  // Census of unsloth/Qwen3.8-2.4T-A95B-GGUF @ 567d3e6ac2, quant UD-IQ1_S,
+  // taken by parsing the tensor header of all 12 shards: 1702 tensor records
+  // against the 1702 declared in `split.tensors.count`, so this list is TOTAL
+  // rather than sampled. See the target-checkpoint census section of
+  // .agents/specs/expert-streaming.md.
+  //
+  // This is the row's real precondition: ENG-EXPERT-STREAM streams routed
+  // expert slices off NVMe, and a slice it can address but cannot DECODE moves
+  // bytes for nothing. IQ1_S alone is 96.92 % of the parameters (the
+  // ffn_{down,gate,up}_exps of all 92 non-MTP layers), so an unsupported
+  // encoding here is a refusal to run the model, never a slow path.
+  struct Present {
+    uint32_t ggml_type;
+    const char* name;
+    int tensors;
+  };
+  constexpr Present kCheckpoint[] = {
+      {19, "iq1_s", 276},  // 96.92 % of params
+      {13, "q5_k", 420},  {10, "q2_k", 3}, {14, "q6_k", 162},
+      {12, "q4_k", 2},    {8, "q8_0", 1},
+  };
+  vt::DType dt = vt::DType::kF32;
+  for (const Present& p : kCheckpoint) {
+    CAPTURE(p.name);
+    CAPTURE(p.ggml_type);
+    CAPTURE(p.tensors);
+    CHECK(KeepQuantDType(p.ggml_type, &dt));
+    CHECK(vt::cpu::HasQuantDotKernel(dt));
+  }
+}
+
+TEST_CASE("every encoding in the Qwen3.8-2.4T UD-Q1_0 checkpoint decodes") {
+  // Same census method and the same revision as the UD-IQ1_S case above, over
+  // all 10 shards: 1702 tensor records against the 1702 declared. UD-Q1_0 is
+  // structurally IDENTICAL to UD-IQ1_S apart from the expert encoding, which is
+  // ggml 66 (IQ1_XXXS, 1.1875 bpw) instead of ggml 19 (IQ1_S, 1.5625 bpw). The
+  // other six encodings and their tensor counts match exactly.
+  //
+  // Type 66 is defined by NO upstream llama.cpp. It comes from the pinned fork
+  // oracle `llama-cpp-unsloth` (.agents/oracles/llama-cpp-unsloth.md), which is
+  // admitted for this encoding family alone and is `gateable = no` until #933
+  // measures it.
+  struct Present {
+    uint32_t ggml_type;
+    const char* name;
+    int tensors;
+  };
+  constexpr Present kCheckpoint[] = {
+      {66, "iq1_xxxs", 276},  // 96.92 % of params
+      {13, "q5_k", 420}, {10, "q2_k", 3}, {14, "q6_k", 162},
+      {12, "q4_k", 2},   {8, "q8_0", 1},
+  };
+  vt::DType dt = vt::DType::kF32;
+  for (const Present& p : kCheckpoint) {
+    CAPTURE(p.name);
+    CAPTURE(p.ggml_type);
+    CAPTURE(p.tensors);
+    CHECK(KeepQuantDType(p.ggml_type, &dt));
+    CHECK(vt::cpu::HasQuantDotKernel(dt));
+  }
+}
+
 TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // The expectation is written out LONGHAND here rather than derived from the
   // implementation, so this is a real cross-check and not a tautology.

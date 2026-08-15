@@ -89,6 +89,19 @@ const QuantTypeTraits* FindQuantTraits(DType dtype) {
       static const QuantTypeTraits t = MakeTraits(DType::kIQ2_S, DType::kQ8_K);
       return &t;
     }
+    // IQ1_S (1.5625 bpw) is 96.92 % of Qwen3.8-2.4T-A95B UD-IQ1_S; keep-quant
+    // against Q8_K, no from_float into it (nothing quantizes INTO a codebook).
+    case DType::kIQ1_S: {
+      static const QuantTypeTraits t = MakeTraits(DType::kIQ1_S, DType::kQ8_K);
+      return &t;
+    }
+    // IQ1_XXXS (1.1875 bpw) is 96.92 % of Qwen3.8-2.4T-A95B UD-Q1_0. Same
+    // keep-quant contract as IQ1_S, from the fork oracle `llama-cpp-unsloth`.
+    case DType::kIQ1_XXXS: {
+      static const QuantTypeTraits t =
+          MakeTraits(DType::kIQ1_XXXS, DType::kQ8_K);
+      return &t;
+    }
     // ggml-cpu.c:277-282 — MXFP4 -> Q8_0 activations (NOT Q8_K: MXFP4's 32-elem
     // blocks pair with the legacy 32-elem Q8_0 encoding). The UD-IQ2_M ffn_down
     // routed-expert slabs; keep-quant, no from_float into it.

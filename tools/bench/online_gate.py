@@ -47,6 +47,7 @@ from tools.bench.serve_low_common import (
     assert_oracle_commit,
     canonical_json,
     read_jsonl,
+    require_complete_request_set,
     require_number,
     sha256_file,
     write_json_atomic,
@@ -753,12 +754,11 @@ def validate_raw_result(
         raise HarnessError(
             f"num_prompts={record.get('num_prompts')!r}; expected {expected}"
         )
-    if record.get("completed") != expected or record.get("failed") != 0:
-        raise HarnessError(
-            "request set is partial: "
-            f"completed={record.get('completed')!r}, failed={record.get('failed')!r}, "
-            f"expected={expected}"
-        )
+    # Completion counters are checked by the shared precondition so this
+    # validator and every rate-deriving site refuse the same records (#931).
+    require_complete_request_set(
+        record, expected_requests=expected, source="online-gate raw result"
+    )
     if record.get("max_concurrency") != concurrency:
         raise HarnessError(
             f"configured max_concurrency={record.get('max_concurrency')!r}; "

@@ -58,6 +58,7 @@ from tools.bench.serve_low_common import (
     coefficient_of_variation,
     percentile,
     read_jsonl,
+    require_complete_request_set,
     require_number,
     sha256_file,
     write_json_atomic,
@@ -385,6 +386,10 @@ def _run_metrics(record: Mapping[str, Any]) -> dict[str, float]:
 def _recompute_timing_metrics(record: Mapping[str, Any]) -> dict[str, float]:
     """Recompute every accepted timing axis from the detailed raw samples."""
 
+    # #931: every axis below is a rate over the leg's wall duration, and that
+    # duration still contains whatever a dead request spent before failing.
+    # The caller validates too; this is the site that produces the number.
+    require_complete_request_set(record, source="component raw result")
     duration = require_number(record.get("duration"), "duration")
     if duration <= 0.0:
         raise HarnessError("duration must be positive")

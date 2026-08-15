@@ -113,6 +113,23 @@ def run_closed_loop(llm, prompts, sampling, concurrency: int, request_id_base: i
     return duration, [records[index] for index in range(len(prompts))]
 
 
+def require_every_request_returned(records, expected_requests: int) -> int:
+    """Refuse to divide by a wall duration that outlived some of its requests.
+
+    `duration` spans the whole closed loop, so a request that never came back
+    still contributes seconds to every rate below while contributing no tokens
+    (#931). The gather above indexes by request id and would raise KeyError on
+    a gap, but a KeyError names nothing; this names the count.
+    """
+
+    if len(records) != expected_requests:
+        raise RuntimeError(
+            f"closed-loop request set is partial: {len(records)} of "
+            f"{expected_requests} requests returned; no rate may be derived"
+        )
+    return len(records)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -166,6 +183,7 @@ def main() -> int:
     duration, records = run_closed_loop(
         llm, prompts, sampling, args.max_concurrency, args.request_id_base
     )
+    require_every_request_returned(records, len(prompts))
 
     request_rows = []
     all_itls_ms: list[float] = []

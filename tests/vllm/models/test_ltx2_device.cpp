@@ -720,9 +720,15 @@ TEST_CASE("ltx2 device: an f32 keyframes embedding under a bf16 stream is REFUSE
   // Positive control for that substring search: the SAME helper over the SAME
   // call with the bf16 view restored must return the empty string, so a refusal
   // that names anything at all cannot be mistaken for this one.
+  //
+  // `restaged` has to be a named local. A `vt::Tensor` is a borrowed view, and
+  // the storage it points into is owned by the Ltx2DitDeviceWeights it came
+  // from. Reading the view out of a temporary leaves the pointer dangling the
+  // moment the full-expression ends (#904).
+  const Ltx2DitDeviceWeights restaged =
+      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kBF16);
   staged.weights.keyframes_abs_pos_embedding =
-      Ltx2StageDitWeightsToDevice(q, p, set.views, vt::DType::kBF16)
-          .weights.keyframes_abs_pos_embedding;
+      restaged.weights.keyframes_abs_pos_embedding;
   CHECK(RefusalMessage([&] {
           (void)Ltx2DitForwardDevice(q, p, staged.weights, &m.video, &m.audio, vt::DType::kBF16);
         }).empty());

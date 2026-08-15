@@ -704,6 +704,7 @@ add_library(vllm STATIC
   src/vllm/config/kv_transfer.cpp
   src/vllm/config/offload.cpp
   src/vllm/model_executor/weight_offloader.cpp
+  src/vllm/model_executor/weight_offload_policy.cpp
   src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp

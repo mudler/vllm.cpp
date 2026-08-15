@@ -170,6 +170,30 @@ Structural deviations, and why each is forced:
   TODO admitting it is under-specified. We mirror the *behavior* (UVA requires
   pinned memory) and record the divergence if our platform layer answers
   differently.
+- **Offload is decided in the LOADERS, not over a constructed model
+  (user-directed 2026-08-15).** Upstream walks `module.named_parameters()` on a
+  built model, which is safe there because PyTorch builds modules on the meta
+  device and materialises them during load, so `wrap_modules` runs BEFORE the
+  real allocation. Our loaders materialise directly, so by the time a
+  `LoadedModel` exists the device copy is already allocated. Offloading there
+  would allocate and then move back, paying the exact peak the feature exists to
+  avoid, and on a memory-constrained device it can fail before it helps.
+  `LoadedModel` also exposes no parameter enumeration, deliberately. So the
+  decision is asked during loading, beside the residency policy that already
+  lives there (`GgufKeepQuantPolicy::Route` returns a `GgufResidency` per
+  tensor). RECORDED COST: upstream matches DOTTED parameter names, and
+  loader-side names differ by format (GGUF `blk.0.ffn_gate_exps`, safetensors
+  `model.layers.0.mlp.experts...`), so a caller must pass a canonical name or
+  the targeting semantics do not transfer. Second cost: residency is decided in
+  several loaders, and one that forgets to consult the policy silently does not
+  offload, so the application leaves owe a totality argument like the
+  `-Werror=switch` one `gguf_keep_quant.cpp` already uses.
+- **W1's `PrepareModel(LoadedModel&)` hook is therefore NOT where the UVA arm
+  acts.** The rest of W1 stands: the process-global, the factory, the
+  config-to-backend resolution, the no-op default and the graph hooks are all
+  still correct and needed. The hook itself was built against the assumption
+  above before that assumption was checked, and it is recorded here rather than
+  quietly left to confuse the next reader.
 - **We have no `make_layers`, so the wrap site is `ModelRegistry::Prepare`.**
   W1's row assumed a seam this tree does not have. Upstream installs the
   offloader in ONE place, `make_layers` (`models/utils.py:816,824`), which every
@@ -301,6 +325,22 @@ auto-selection order, the layer grouping, and JSON parsing on the
 cases, 51/122 assertions red, build rc=0) then green 11/11, 126/126, and
 mutation-proven 6/6 with each mutation's compile status reported so a
 non-building mutation could not read as a pass.
+
+**W2a landed** (2026-08-15): the offload DECISION and its byte budget,
+`WeightOffloadPolicy`, mirroring `uva.py:74-107`. It answers offload, not
+targeted, or budget exhausted for one weight and keeps the running total. It
+moves nothing and knows nothing about a device, so both the loader-side
+application chosen above and any future model-side application can use it.
+
+The two properties a reimplementation gets wrong are pinned by name: upstream
+BREAKS on an exhausted budget and CONTINUES on an untargeted parameter, and the
+total advances only for a weight that was really offloaded. Five mutants, all
+caught, none failing to compile: targeting that breaks instead of continuing,
+an untargeted weight that consumes budget, targeting checked before the budget,
+a budget compared against the weight size, and a negative size advancing the
+total.
+
+Still owed for W2: the application itself, in the loaders.
 
 **W1 landed** (2026-08-14): the offloader seam. `WeightOffloader` interface,
 `NoopWeightOffloader` default, the process-global `Get`/`SetWeightOffloader`,

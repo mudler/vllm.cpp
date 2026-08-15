@@ -972,6 +972,7 @@ vllm_cpp_add_test(test_speculative_dspark vllm/config/test_speculative_dspark.cp
 vllm_cpp_add_test(test_multimodal_config vllm/config/test_multimodal_config.cpp)
 vllm_cpp_add_test(test_offload_config vllm/config/test_offload_config.cpp)
 vllm_cpp_add_test(test_weight_offloader vllm/model_executor/test_weight_offloader.cpp)
+vllm_cpp_add_test(test_weight_offload_policy vllm/model_executor/test_weight_offload_policy.cpp)
 # ENG-MM-INPUT-PIPELINE L1 (#607): the refusal those limits carry — the min()
 # fold against the model's own ceiling, upstream's exact message, and both call
 # sites with the enable_mm_embeds escape.

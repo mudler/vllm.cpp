@@ -117,6 +117,14 @@ PROCEDURE_FILES = frozenset(
         ".agents/porting-a-model.md",
         ".agents/benchmarking.md",
         ".agents/bugfixing.md",
+        # The writing guides AGENTS.md delegates to, and the skill routes that
+        # point at them (#827). Same procedure class as their sibling guides.
+        # They were never classified, so classify_path FAILED CLOSED and this
+        # test has been red on main ever since that row landed (#856).
+        ".agents/style/commits.md",
+        ".agents/style/prose.md",
+        ".claude/skills/writing-commits-and-prs/SKILL.md",
+        ".claude/skills/writing-technical-english/SKILL.md",
         ".agents/prompts/implementer.md",
         ".agents/prompts/operator.md",
         ".agents/prompts/reviewer.md",

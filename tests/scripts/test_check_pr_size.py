@@ -110,6 +110,19 @@ class PathClassification(unittest.TestCase):
             "docker/Dockerfile.arm64": "configuration",
             "docker/healthcheck.sh": "configuration",
             "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
+            # Same failure as the Dockerfile entries above, one row later.
+            # #840 moved the intake table out of roadmap_v1.md into its own
+            # append-only file and never classified it, and classify_path FAILS
+            # CLOSED -- so pr-size aborted on every pull request that appends an
+            # index row, which under that same policy is nearly all of them
+            # (#856). It is a project record for the same reason roadmap_v1.md
+            # is: it IS the table roadmap_v1.md used to hold.
+            ".agents/roadmap_v1.md": "project_record",
+            ".agents/issue-index.md": "project_record",
+            ".agents/style/commits.md": "procedure",
+            ".agents/style/prose.md": "procedure",
+            ".claude/skills/writing-commits-and-prs/SKILL.md": "procedure",
+            ".claude/skills/writing-technical-english/SKILL.md": "procedure",
         }
         for path, path_class in expected.items():
             with self.subTest(path=path):

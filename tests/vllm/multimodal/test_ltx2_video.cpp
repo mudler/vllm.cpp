@@ -1608,6 +1608,15 @@ TEST_CASE("ltx2 video: an ABI client loads, detects and generates through vllm.h
 // It is NOT interchangeable with the `vonkaiser` FP8 copy — they differ in a
 // TRAINED `keyframes_abs_pos_embedding` (spec section 3.1) — so the file this
 // case reads is named here and in every report of its result.
+// WHEN QUOTING THIS SUITE'S ASSERTION COUNT, QUOTE THE CONFIGURATION WITH IT.
+// This case skips by default, and it is most of the suite: with the variable
+// UNSET the binary measures 37 cases / 784 assertions, and with it SET, 37 /
+// 9031 — measured 2026-08-15, exit 0 both ways. So the CASE count is identical in
+// both configurations and only the assertion count moves; an unchanged case count
+// across a change therefore says nothing about whether the real headers were read.
+// Quote the number WITH its configuration and its date: these figures move
+// whenever a case is added here, and they already have (they read 30 / 502 and
+// 30 / 8734 before the keyframe-bias port, issue #658).
 TEST_CASE("ltx2 video: the SHIPPED Lightricks checkpoints parse and load") {
   const char* root_env = std::getenv("LTX2_CHECKPOINT_ROOT");
   if (root_env == nullptr) {

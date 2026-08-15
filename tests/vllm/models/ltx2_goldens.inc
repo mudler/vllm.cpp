@@ -3227,16 +3227,21 @@ inline constexpr float kLtx2ForwardPromptAdalnMaskedAudio[] = {
     -0.09456487f, 0.0829611197f, 0.000701400219f, -0.243942767f, 0.0671276823f, 0.0765738413f,
 };
 
-// --- the MEASURED magnitude of the prompt-AdaLN term ---
+// --- the prompt-AdaLN term's magnitude ON THIS SYNTHETIC FIXTURE ---
 // Same shared weights, same inputs, flag ON vs OFF:
 //   DiT video output: max|on-off| = 0.000145674  (0.04% of max|off|)
 //   DiT audio output: max|on-off| = 7.36713e-05  (0.03% of max|off|)
-//   block 0 modulated prompt K/V: max|on-off| = 0.0309528  (5.82% of max|off|)
-//   timestep term vs static table: max|term| = 0.0252012 vs max|table| = 0.0487142  (51.7%)
-// The two output rows are bounded by this generator's SYNTHETIC weight scale
-// (0.05, param_spec above) and by a 2-block stack; they are the FLOOR the gate
-// needs, not a claim about the trained checkpoint. The K/V row is where the
-// term actually enters and is the number that answers 'does this matter'.
+//   block 0 modulated prompt K/V (VIDEO stream): max|on-off| = 0.0309528  (5.82% of max|off|)
+//   timestep term vs static table (VIDEO stream): max|term| = 0.0252012 vs max|table| = 0.0487142  (51.7%)
+// ALL FOUR ROWS ARE GATE-FLOOR NUMBERS FROM SYNTHETIC WEIGHTS. The table and
+// the prompt-AdaLN MLP are BOTH drawn at param_spec's scale=0.05 above, so every
+// ratio here is a property of THIS FIXTURE and moves with that scale; the output
+// rows are bounded by it AND by a 2-block stack. They are reported because a
+// mutation has to be shown to move something -- NOT as a claim about the trained
+// checkpoint. On the SHIPPED DiT the term DOMINATES the table it is added to:
+// rms|term|/rms|table| = 1347% video, 1583% audio, measured through upstream's
+// own AdaLayerNormSingle on the real weights. See
+// .agents/specs/ltx25-prompt-adaln.md section Outcome.
 // --- section 7: the keyframe absolute-position embedding arm ---
 inline constexpr const char* kLtx2KeyframesParamNames[] = {
     "keyframes_abs_pos_embedding",

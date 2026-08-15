@@ -912,8 +912,13 @@ def measure_prompt_adaln_magnitude() -> str:
         kv_off = ctx * (1 + scale_off) + shift_off
         kv_on = ctx * (1 + scale_on) + shift_on
     kabs, krel = rel(kv_off, kv_on)
+    # NAME THE STREAM. Both rows below are computed from `vmod` and the VIDEO
+    # `prompt_scale_shift_table`, and neither said so, which is how the Outcome came
+    # to divide a shipped AUDIO ratio by this VIDEO denominator (issue #644). The
+    # audio stream's own value differs -- 40.6% against this row's 51.7% -- so an
+    # unlabelled ratio here is a denominator waiting to be misapplied.
     lines.append(
-        f"//   block 0 modulated prompt K/V: max|on-off| = {kabs:.6g}  "
+        f"//   block 0 modulated prompt K/V (VIDEO stream): max|on-off| = {kabs:.6g}  "
         f"({krel * 100:.2f}% of max|off|)"
     )
     # How much of the K/V modulation is timestep-conditioned at all: the MLP row
@@ -921,19 +926,34 @@ def measure_prompt_adaln_magnitude() -> str:
     static_max = float(table.abs().max())
     term_max = float(vmod.abs().max())
     lines.append(
-        f"//   timestep term vs static table: max|term| = {term_max:.6g} vs "
-        f"max|table| = {static_max:.6g}  ({term_max / static_max * 100:.1f}%)"
+        f"//   timestep term vs static table (VIDEO stream): max|term| = {term_max:.6g} "
+        f"vs max|table| = {static_max:.6g}  ({term_max / static_max * 100:.1f}%)"
     )
     lines.append(
-        "// The two output rows are bounded by this generator's SYNTHETIC weight scale"
+        "// ALL FOUR ROWS ARE GATE-FLOOR NUMBERS FROM SYNTHETIC WEIGHTS. The table and"
     )
     lines.append(
-        "// (0.05, param_spec above) and by a 2-block stack; they are the FLOOR the gate"
+        "// the prompt-AdaLN MLP are BOTH drawn at param_spec's scale=0.05 above, so every"
     )
     lines.append(
-        "// needs, not a claim about the trained checkpoint. The K/V row is where the"
+        "// ratio here is a property of THIS FIXTURE and moves with that scale; the output"
     )
-    lines.append("// term actually enters and is the number that answers 'does this matter'.")
+    lines.append(
+        "// rows are bounded by it AND by a 2-block stack. They are reported because a"
+    )
+    lines.append(
+        "// mutation has to be shown to move something -- NOT as a claim about the trained"
+    )
+    lines.append(
+        "// checkpoint. On the SHIPPED DiT the term DOMINATES the table it is added to:"
+    )
+    lines.append(
+        "// rms|term|/rms|table| = 1347% video, 1583% audio, measured through upstream's"
+    )
+    lines.append(
+        "// own AdaLayerNormSingle on the real weights. See"
+    )
+    lines.append("// .agents/specs/ltx25-prompt-adaln.md section Outcome.")
     text = "\n".join(lines)
     print("prompt-AdaLN magnitude:\n" + text, file=sys.stderr)
     return text
@@ -991,7 +1011,7 @@ def main() -> int:
         # Upstream's DEFAULT arm, and the one the shipped checkpoint runs.
         emit_prompt_adaln(out)
         out.write(
-            "// --- the MEASURED magnitude of the prompt-AdaLN term ---\n"
+            "// --- the prompt-AdaLN term's magnitude ON THIS SYNTHETIC FIXTURE ---\n"
             "// Same shared weights, same inputs, flag ON vs OFF:\n"
             + measure_prompt_adaln_magnitude()
             + "\n"

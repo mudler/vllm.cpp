@@ -968,12 +968,24 @@ TEST_CASE("ltx2 forward: the prompt-side AdaLN arm, with both masks") {
 // term. A port that accepted the flag, bound the 12 tensors and then never added
 // their output would reproduce the flag-OFF numbers exactly and pass nothing here.
 //
-// Measured on this fixture (generator stderr, and the comment block at the end of
-// ltx2_goldens.inc): the term is 51.7% the magnitude of the static per-block
-// table it is added to, moves the block-0 modulated prompt K/V by 5.82%, and
-// moves the DiT's own output by 1.46e-4 — 73x the kRoundOff floor. The bound
-// below is set at 20x kRoundOff so it is comfortably inside the measured signal
-// and comfortably outside f32 noise.
+// WHAT THIS FIXTURE'S NUMBERS ARE, AND ARE NOT. The generator's stderr and the
+// comment at the end of ltx2_goldens.inc report the VIDEO stream's term at 51.7%
+// of its static per-block table — that ratio is emitted for the video stream ONLY,
+// and the audio stream's own value on the same fixture is 40.6%, so the 51.7% is
+// not a denominator for anything audio — the block-0 prompt K/V moving 5.82%, and
+// the DiT output moving
+// 1.46e-4 (73x kRoundOff). ALL FOUR are GATE-FLOOR numbers from SYNTHETIC weights,
+// not a claim about the trained checkpoint: the table and the prompt-AdaLN MLP are
+// both drawn at `param_spec`'s scale=0.05 (gen-ltx2-goldens.py:100-106), so every
+// ratio is a property of THIS FIXTURE and moves with the init scale.
+//
+// On the SHIPPED DiT the term DOMINATES the table rather than halving it —
+// rms|term|/rms|table| = 1347% video, 1583% audio, measured through upstream's own
+// AdaLayerNormSingle on the real weights (.agents/specs/ltx25-prompt-adaln.md
+// §Outcome). So this fixture UNDERSTATES the defect; it does not bound it.
+//
+// The bound below is set at 20x kRoundOff: comfortably inside the signal this
+// fixture does produce, and comfortably outside f32 noise.
 TEST_CASE("ltx2 forward: the prompt-AdaLN term is LOAD-BEARING, not decoration") {
   const Ltx2DitParams p = ReducedParamsPromptAdaln(Ltx2RopeType::kSplit, false);
   WeightSet set = BuildWeights(p);

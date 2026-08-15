@@ -9,9 +9,10 @@ Selection mirrors vLLM's own configuration: `--offload-config '<json>'`, taking
 the same JSON object vLLM's `OffloadConfig` takes, so a config written for vLLM
 is accepted here.
 
-> **Read [What works today](#what-works-today) before you enable anything.** The
-> configuration surface is complete and validated, and **no weight moves yet**.
-> A budget you set is accepted, reported, and does not free memory.
+> **Enabling weight offload fails startup today, on every model.** No loader
+> consults the offloader yet, so the engine refuses the configuration rather
+> than accept a budget that would free nothing. Read
+> [What works today](#what-works-today) before you enable anything.
 
 ## What works today
 
@@ -21,12 +22,17 @@ is accepted here.
 | The `uva` backend object and its byte budget | Built. It answers the offload decision and counts approved bytes |
 | The `prefetch` backend | Not built. A config that selects it is accepted and reported as unbuilt |
 | A loader that asks the offloader and keeps a weight off the device | **Not wired.** This is the part that frees memory, and it does not exist yet |
+| A model that accepts an enabled offload | **None.** Every architecture is refused at startup — see [What the engine refuses](#what-the-engine-refuses-and-what-it-only-warns-about) |
 | Pinned host copies and device views | Not built |
 
-So the honest summary is: you can configure weight offload, the engine tells you
-what it resolved, and your device memory does not change. The engine prints one
-line at startup saying so, because a budget that silently frees nothing is worse
-than a budget the engine refuses.
+So the honest summary is: you can write and validate a weight-offload
+configuration, and you cannot yet run with one enabled. A budget that silently
+frees nothing is worse than a budget the engine refuses, so the engine refuses
+it.
+
+A configuration that leaves offloading **disabled** is unaffected: the guard
+only fires when `is_offloading_enabled()` is true, so parsing, validation, and
+the resolved-backend report all still work for inspecting a config.
 
 Progress is tracked in [issue #797](https://github.com/mudler/vllm.cpp/issues/797).
 
@@ -89,6 +95,29 @@ server: fatal: offload_num_in_group (5) must be <= offload_group_size (4)
 Refusals cover a malformed document, an unknown backend name, a field of the
 wrong type, a negative budget, `offload_num_in_group` above `offload_group_size`,
 and `offload_prefetch_step` below 1 while prefetch is enabled.
+
+### The model has to claim support, and none does yet
+
+A valid configuration is still refused when the resolved architecture's loader
+does not consult the offloader. This is the refusal you will actually hit, since
+**no model declares support today**:
+
+```text
+weight offload is configured but architecture "Qwen3MoeForCausalLM" does not
+support it: its loader does not consult the weight offloader, so every weight
+would stay on the device and the budget would free nothing
+(ENG-WEIGHT-OFFLOAD W2c). Remove --offload-config, or wire this model's loader.
+```
+
+It is raised after the architecture resolves and **before any weight I/O**, so
+nothing is read from disk before you are told. The support flag defaults to off,
+which means a newly added model is refused until someone wires its loader —
+the default is the mechanism, not an oversight.
+
+A model that *claims* support and then never asks the offloader about a single
+weight is refused too, after load, and reported as a defect in that loader
+rather than as a configuration error. Zero consulted weights is the only count
+that can prove that particular lie.
 
 A backend that disagrees with the fields you set is a **warning**, not a refusal,
 which mirrors vLLM. The named backend wins and the other fields are ignored:

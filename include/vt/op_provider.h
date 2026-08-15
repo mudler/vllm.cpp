@@ -126,9 +126,18 @@ void RegisterOpProvider(OpId op, DeviceType device, const OpProvider& provider);
 // keeps winning, because nothing else registers at priority 0 under that name.
 void RegisterOp(OpId op, DeviceType device, void* fn);
 
+// The canonical spelling of an op — the enumerator without its `k`. The
+// counterpart of DeviceTypeName (include/vt/device.h), and what every refusal
+// and reference-tier warning in this seam reports, so no reader has to count
+// enumerators in include/vt/ops.h to find out what was refused. Total over the
+// enum: the defining switch is exhaustive and `default`-free, so appending an
+// OpId without naming it fails the -Werror build.
+const char* OpName(OpId op);
+
 // The selected provider's kernel for (op, device): highest priority whose
 // `supports(caps)` holds, ties by name. Throws when nothing is registered or
-// nothing supports the device — the pre-existing GetOp contract, unchanged.
+// nothing supports the device — the pre-existing GetOp contract, naming the op
+// and the device rather than their integers.
 void* GetOp(OpId op, DeviceType device);
 
 // DECLINE-AND-FALL-BACK. A provider kernel that cannot serve a particular call

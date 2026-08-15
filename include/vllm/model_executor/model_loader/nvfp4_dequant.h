@@ -37,6 +37,50 @@ inline constexpr int kNvfp4GroupSize = 16;
 inline constexpr float kE2M1Lut[8] = {0.0F, 0.5F, 1.0F, 1.5F,
                                       2.0F, 3.0F, 4.0F, 6.0F};
 
+// WHICH LOGICAL ELEMENT SITS IN WHICH NIBBLE — a PRODUCER convention, and the two
+// producers this project reads DISAGREE. See .agents/specs/nvfp4-nibble-order.md.
+//
+// Read the wrong way round, every adjacent fp4 pair is transposed. The result is
+// finite, correctly shaped and correctly scaled, so nothing downstream notices:
+// a decoder emits fluent tokens, a DiT renders a plausible-but-wrong frame.
+//
+// This parameter IS defaulted, to kLowFirst, and that is the deliberate design:
+// every caller predating .agents/specs/nvfp4-nibble-order.md consumes a ModelOpt
+// or compressed-tensors checkpoint, which is low-first, so the default makes
+// "this change moved nothing else" true BY CONSTRUCTION rather than by
+// inspection. Four callers rely on it today — minimax_h3_nvfp4.cpp:112,
+// minimax_h3_device.cpp:1311, qwen3_5.cpp:1298 and
+// dense_nvfp4_gemm.h DequantNvfp4ToBLayout — and H3 reaches low-first by
+// normalizing its bytes at load (MiniMaxH3Nvfp4SwapNibbles) rather than by
+// passing an order.
+//
+// The seam where the order is NEVER defaulted is `Ltx2DequantNvfp4ToBf16`
+// (ltx2_loader.h), which takes a resolved `Ltx2Nvfp4Producer` with no default,
+// because that is the path where the two conventions actually meet and a default
+// would let a caller that never thought about it get the silent wrong answer.
+enum class Nvfp4NibbleOrder {
+  // Element 2j in the LOW nibble, 2j+1 in the HIGH. torchao's `pack_uint4`
+  // (torchao/prototype/mx_formats/kernels.py:160,
+  // `uint8_data[::2] | uint8_data[1::2] << 4`), which is what NVIDIA ModelOpt and
+  // compressed-tensors checkpoints carry, and what vLLM's own reader assumes
+  // (`break_fp4_bytes`, nvfp4_emulation_utils.py:321-324: `low = a_flat & 0x0F`
+  // then `torch.stack((low, high))`). THE DEFAULT — every caller predating
+  // .agents/specs/nvfp4-nibble-order.md means this one.
+  kLowFirst,
+  // Element 2j in the HIGH nibble. Lightricks' `nvfp4-prequant`, which wrote the
+  // first-party LTX-2.5 NVFP4 DiT (ltx-kernels/docs/NVFP4.md:27-29: "`hi_first=True`
+  // (default) puts element `2j` in the **high** nibble of byte `j`"; the same
+  // statement at ltx-core/quantization/nvfp4/linear.py:6).
+  //
+  // MiniMax-H3's community NVFP4 checkpoints are also high-first and are handled a
+  // DIFFERENT way — `MiniMaxH3Nvfp4SwapNibbles` normalizes the bytes at load
+  // (minimax_h3.h:1500-1517) because H3 also feeds a Marlin fp4-RESIDENT path, and
+  // one byte transform fixes both arms where a host-dequant flag fixes only one.
+  // Both mechanisms are deliberate; nvfp4-nibble-order.md section 3.1 records which
+  // to use when, and the condition under which LTX-2.5 must switch to H3's.
+  kHighFirst,
+};
+
 // Decode one IEEE fp8-e4m3fn byte (1 sign, 4 exp, 3 mantissa; bias 7; no inf;
 // NaN = 0x7F/0xFF; 0x00 = +0) to f32. Matches
 // torch.Tensor.view(torch.float8_e4m3fn).to(torch.float32).
@@ -45,10 +89,14 @@ float F8E4M3ToF32(uint8_t byte);
 // Dequantize a modelopt W4A16_NVFP4 weight matrix to bf16 (row-major bit
 // patterns in out_bf16).
 //
-//   packed            [out_dim, in_dim/2]  U8, low-nibble-first packing
+//   packed            [out_dim, in_dim/2]  U8, packed per `order`
 //   weight_scale_fp8  [out_dim, in_dim/16] fp8-e4m3fn bytes, linear layout
 //   weight_scale_2    per-tensor f32 global scale (multiplied, not reciprocated)
 //   out_bf16          [out_dim, in_dim]    bf16 bit patterns (caller-owned)
+//   order             which nibble holds element 2j; DEFAULTS to the torchao /
+//                     ModelOpt convention, so every caller written before
+//                     .agents/specs/nvfp4-nibble-order.md is unchanged BY
+//                     CONSTRUCTION rather than by inspection
 //
 // Requires in_dim % 16 == 0. Aborts (VT_CHECK) otherwise.
 //
@@ -58,7 +106,8 @@ float F8E4M3ToF32(uint8_t byte);
 // (the safetensors reader validates every span).
 void DequantNvfp4ToBf16(const uint8_t* packed, const uint8_t* weight_scale_fp8,
                         float weight_scale_2, int64_t out_dim, int64_t in_dim,
-                        uint16_t* out_bf16);
+                        uint16_t* out_bf16,
+                        Nvfp4NibbleOrder order = Nvfp4NibbleOrder::kLowFirst);
 
 // Dequantize a modelopt per-tensor FP8 (W8A16) weight to bf16. The 35B gate
 // checkpoint stores its attention/GDN projections this way (hf_quant_config

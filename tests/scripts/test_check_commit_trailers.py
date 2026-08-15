@@ -246,6 +246,78 @@ class RangeContract(unittest.TestCase):
         )
         self.assertTrue(any("Following-Agents-Protocol" in error for error in errors))
 
+    def test_range_is_taken_from_the_merge_base_when_the_base_branch_moved(self) -> None:
+        """A PR branch diverges the moment main moves; that must still validate.
+
+        RED before GATE-FORK-ANCESTRY (#773): CI passes
+        `pull_request.base.sha`, the TIP of the base branch, which stops being an
+        ancestor of head as soon as main advances. `validate_range` raised
+        "range base must be an ancestor of range head" and returned WITHOUT
+        READING A SINGLE COMMIT -- so the trailer contract was never enforced on
+        any external contribution.
+        """
+        root = self.commit("root\n\nFOLLOWING_AGENTS_PROTOCOL\n")
+        # The PR branch, cut from root.
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-b", "pr", root],
+            check=True,
+        )
+        head = self.commit(STRICT_MESSAGE)
+        # Main moves on after the branch was cut. This is the ordinary case.
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-B", "main", root],
+            check=True,
+        )
+        moved_main = self.commit(STRICT_MESSAGE.replace("policy:", "mainline:"))
+        self.assertNotEqual(moved_main, root)
+
+        errors = self.checker.validate_range(
+            self.repo, moved_main, head, cutover=None
+        )
+        self.assertEqual(errors, [], "the PR's own commits must validate")
+
+    def test_a_bad_trailer_in_the_merge_base_range_is_still_reported(self) -> None:
+        """Changing WHICH commits are read must not change what is demanded.
+
+        Green on both sides of #773 in the ancestor case; the point is that it
+        stays green in the DIVERGED case too, so the range fix cannot be
+        mistaken for a way to smuggle a non-conforming commit past the gate.
+        """
+        root = self.commit("root\n\nFOLLOWING_AGENTS_PROTOCOL\n")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-b", "pr2", root],
+            check=True,
+        )
+        self.commit("no trailers here at all\n")
+        head = self.commit(STRICT_MESSAGE)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "-B", "main2", root],
+            check=True,
+        )
+        moved_main = self.commit(STRICT_MESSAGE.replace("policy:", "mainline2:"))
+
+        errors = self.checker.validate_range(
+            self.repo, moved_main, head, cutover=None
+        )
+        self.assertTrue(errors, "the offending commit must still be reported")
+
+    def test_unrelated_histories_still_fail_closed(self) -> None:
+        """No merge base at all is absence of INFORMATION, and must still raise.
+
+        This is the half of the old non-ancestor assertion that must NOT move:
+        an orphan branch shares no commit with the base, so there is no range to
+        compute and reporting one would be an invention.
+        """
+        base = self.commit("base\n\nFOLLOWING_AGENTS_PROTOCOL\n")
+        subprocess.run(
+            ["git", "-C", str(self.repo), "checkout", "-q", "--orphan", "orphan"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(self.repo), "rm", "-qrf", "."], check=True)
+        orphan = self.commit(STRICT_MESSAGE)
+        with self.assertRaises(ValueError):
+            self.checker.validate_range(self.repo, base, orphan, cutover=None)
+
     def test_missing_unreachable_and_non_ancestor_revisions_fail_closed(self) -> None:
         base = self.commit("base\n\nFOLLOWING_AGENTS_PROTOCOL\n")
         head = self.commit(STRICT_MESSAGE)
@@ -253,12 +325,13 @@ class RangeContract(unittest.TestCase):
             self.checker.validate_range(
                 self.repo, "missing", head, cutover=head
             )
-        subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", "--detach", base], check=True)
-        side = self.commit(STRICT_MESSAGE.replace("policy:", "side:"))
-        with self.assertRaises(ValueError):
-            self.checker.validate_range(
-                self.repo, side, head, cutover=head
-            )
+        # The divergent-but-RELATED half of this case moved to
+        # test_range_is_taken_from_the_merge_base_when_the_base_branch_moved
+        # (#773): two branches off a common root share a merge base, which is
+        # the ordinary shape of every pull request and must validate rather than
+        # raise. The genuinely unrelated case -- no shared history at all -- is
+        # asserted in test_unrelated_histories_still_fail_closed, so the
+        # fail-closed behaviour this case was written for is still pinned.
 
     def test_ambiguous_revision_name_fails_closed(self) -> None:
         base = self.commit("base\n\nFOLLOWING_AGENTS_PROTOCOL\n")
@@ -411,6 +484,172 @@ class ForgeAttribution(unittest.TestCase):
         self.assertEqual(
             self.checker.validate_commit_message(message, strict=True), []
         )
+
+
+class SquashShapes(unittest.TestCase):
+    """The two squash bodies GitHub can compose, pinned as executable evidence.
+
+    `squash_merge_commit_message` decides which body lands. GitHub writes a
+    `---------` separator above the `Co-authored-by:` block it appends, and that
+    happens under BOTH settings -- #829 and #850 believed it came from
+    concatenation, and `617d6f452` disproved it (#861). The separator is now
+    stepped over when trailers sit on both sides.
+    `join_trailing_trailer_paragraphs` fuses only trailer-SHAPED paragraphs, so
+    the separator orphans the block and the gate reports trailers the commit
+    plainly carries as missing (#829).
+
+    The repetition in that body is NOT the defect. `git interpret-trailers
+    --parse` reads only the trailing block, so N copies parse as one. Changing
+    the count rule would not have fixed anything. The separator is the defect,
+    and the setting removed it.
+    """
+
+    COAUTHOR = "Co-authored-by: Ettore Di Giacinto <mudler@localai.io>"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.checker = load_checker()
+
+    def body(self) -> str:
+        return (
+            "policy(ROW): a subject (#1)\n\n"
+            "A body paragraph that explains the reason.\n\n"
+            "FOLLOWING_AGENTS_PROTOCOL\n\n"
+            "Following-Agents-Protocol: true\n"
+            "AI-Assisted: true\n"
+            "Assisted-by: AGENT:claude-opus-5 [Claude Code]"
+        )
+
+    def test_the_real_forge_shape_is_green(self) -> None:
+        """Block, separator, co-author. This is what `617d6f452` actually is,
+        and it is the shape every squash lands in."""
+        message = f"{self.body()}\n\n---------\n\n{self.COAUTHOR}\n"
+        self.assertEqual(
+            self.checker.validate_commit_message(message, strict=True), []
+        )
+
+    def test_prose_after_the_block_still_terminates_it(self) -> None:
+        """The property the separator step-over must not cost."""
+        message = f"{self.body()}\n\nSome prose afterwards.\n"
+        self.assertTrue(self.checker.validate_commit_message(message, strict=True))
+
+    def test_a_separator_followed_by_prose_is_not_stepped_over(self) -> None:
+        message = f"{self.body()}\n\n---------\n\nSome prose.\n"
+        self.assertTrue(self.checker.validate_commit_message(message, strict=True))
+
+    def test_a_separator_with_prose_above_it_is_not_stepped_over(self) -> None:
+        message = f"subject (#1)\n\nprose.\n\n---------\n\n{self.COAUTHOR}\n"
+        self.assertTrue(self.checker.validate_commit_message(message, strict=True))
+
+    def test_pr_body_shape_is_green(self) -> None:
+        """What lands now: one body, then the forge's Co-authored-by."""
+        message = f"{self.body()}\n\n{self.COAUTHOR}\n"
+        self.assertEqual(
+            self.checker.validate_commit_message(message, strict=True), []
+        )
+
+    def test_commit_messages_shape_with_the_separator_is_red(self) -> None:
+        """What used to land, and what would land again if the repository
+        setting were reverted to COMMIT_MESSAGES."""
+        message = (
+            f"{self.body()}\n\n---------\n\n{self.body()}\n\n{self.COAUTHOR}\n"
+        )
+        errors = self.checker.validate_commit_message(message, strict=True)
+        self.assertTrue(errors, "the orphaning separator must still be caught")
+
+    def test_repetition_alone_is_not_what_breaks_it(self) -> None:
+        """Same two blocks, NO separator between them. This isolates the cause:
+        if this were red, the count rule would be the problem."""
+        message = f"{self.body()}\n\n{self.body()}\n\n{self.COAUTHOR}\n"
+        errors = self.checker.validate_commit_message(message, strict=True)
+        self.assertTrue(
+            any("FOLLOWING_AGENTS_PROTOCOL" in error for error in errors),
+            f"expected the marker rule to be what fires, got {errors}",
+        )
+
+
+class PullRequestBodyMode(unittest.TestCase):
+    """The body is the commit message now, so it is gated like one (#848)."""
+
+    TEMPLATE = ROOT / ".github/pull_request_template.md"
+
+    def run_checker(self, *args: str, stdin: str | None = None):
+        return subprocess.run(
+            [sys.executable, str(CHECKER), *args],
+            input=stdin, capture_output=True, text=True, check=False, cwd=ROOT,
+        )
+
+    def test_the_shipped_template_satisfies_the_contract(self) -> None:
+        """If this fails, every pull request opened from the template lands a
+        commit that fails the trailer gate AFTER the merge."""
+        result = self.run_checker("--message-file", str(self.TEMPLATE))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_body_without_the_block_is_rejected(self) -> None:
+        result = self.run_checker("--message-file", "-", stdin="Just a description.\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FOLLOWING_AGENTS_PROTOCOL", result.stderr)
+
+    def test_an_empty_body_is_rejected(self) -> None:
+        result = self.run_checker("--message-file", "-", stdin="")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("empty", result.stderr)
+
+    def test_filled_rejects_the_unreplaced_placeholder(self) -> None:
+        """The template must pass, and a body that is STILL the template must
+        not. Otherwise the landed commit attributes the work to nobody."""
+        result = self.run_checker(
+            "--message-file", str(self.TEMPLATE), "--filled"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("placeholder", result.stderr)
+
+    def test_filled_accepts_a_real_identity(self) -> None:
+        body = self.TEMPLATE.read_text(encoding="utf-8").replace(
+            "AGENT:MODEL [TOOL]", "AGENT:claude-opus-5 [Claude Code]"
+        )
+        result = self.run_checker("--message-file", "-", "--filled", stdin=body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_filled_ignores_the_placeholder_MENTIONED_in_prose(self) -> None:
+        """A body that DOCUMENTS the flag must not trip it.
+
+        The first implementation searched the raw message, so any body naming
+        `AGENT:MODEL [TOOL]` while explaining the check was rejected -- including
+        the spec for this row and the body of the pull request that introduced
+        it. The comparison is against the PARSED Assisted-by value instead.
+        """
+        body = (
+            "fix(ROW): a subject (#1)\n\n"
+            "This flag rejects the placeholder AGENT:MODEL [TOOL], which "
+            "satisfies the grammar while crediting nobody.\n\n"
+            "FOLLOWING_AGENTS_PROTOCOL\n\n"
+            "Following-Agents-Protocol: true\n"
+            "AI-Assisted: true\n"
+            "Assisted-by: AGENT:claude-opus-5 [Claude Code]\n"
+        )
+        result = self.run_checker("--message-file", "-", "--filled", stdin=body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_filled_still_rejects_the_placeholder_as_a_real_trailer(self) -> None:
+        """The other half: prose is exempt, a real trailer value is not."""
+        body = (
+            "fix(ROW): a subject (#1)\n\n"
+            "A body.\n\n"
+            "FOLLOWING_AGENTS_PROTOCOL\n\n"
+            "Following-Agents-Protocol: true\n"
+            "AI-Assisted: true\n"
+            "Assisted-by: AGENT:MODEL [TOOL]\n"
+        )
+        result = self.run_checker("--message-file", "-", "--filled", stdin=body)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("placeholder", result.stderr)
+
+    def test_exactly_one_of_range_or_message_file(self) -> None:
+        both = self.run_checker("--range", "HEAD~1..HEAD", "--message-file", "-")
+        self.assertNotEqual(both.returncode, 0)
+        neither = self.run_checker()
+        self.assertNotEqual(neither.returncode, 0)
 
 
 if __name__ == "__main__":

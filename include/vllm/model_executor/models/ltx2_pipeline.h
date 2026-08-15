@@ -1,0 +1,591 @@
+// LTX-2.5 PIPELINE — the flow-matching schedule, the noiser, the diffusion
+// steps, guidance, the patchifiers, and the recipe table.
+//
+// Row: MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model. Spec:
+// .agents/specs/ltx-2-5.md (phase L5). Issue #435.
+//
+// ─── WHAT THIS IS A PORT OF (file:line on BOTH sides) ────────────────────────
+// Upstream A: Lightricks/LTX-2, packages/ltx-core/src/ltx_core/
+//   OURS                            <-  UPSTREAM
+//   Ltx2SigmaSchedule               <-  components/schedulers.py:21-57  (LTX2Scheduler)
+//   Ltx2LinearQuadraticSchedule     <-  components/schedulers.py:67-88
+//   Ltx2GaussianNoise               <-  components/noisers.py:30-37
+//   Ltx2EulerStep                   <-  components/diffusion_steps.py:32-40
+//   Ltx2EulerAncestralStep          <-  components/diffusion_steps.py:63-106
+//   Ltx2Res2sStep / Ltx2SdeCoeff    <-  components/diffusion_steps.py:118-190
+//   Ltx2EulerCfgPpStep              <-  components/diffusion_steps.py:208-252
+//   Ltx2AncestralStep               <-  components/diffusion_steps.py:7-22
+//   Ltx2ProjectionCoef              <-  components/guiders.py:363-369
+//   Ltx2CfgDelta / Ltx2StgDelta     <-  components/guiders.py:23-27, 70-74
+//   Ltx2MultiModalGuidance          <-  components/guiders.py:244-291
+//   Ltx2GuiderParamsForSigma        <-  components/guiders.py:214-230, 332-335
+//   Ltx2BatchedPerturbationConfig   <-  guidance/perturbations.py:53-143
+//   Ltx2VideoPatchify / …           <-  components/patchifiers.py:11-134
+//   Ltx2PixelCoords                 <-  components/patchifiers.py:137-171
+//   Ltx2AudioPatchify / …           <-  components/patchifiers.py:174-353
+//
+// Upstream B: Lightricks/LTX-2, packages/ltx-pipelines/src/ltx_pipelines/
+//   Ltx2ParseModelVersion           <-  (ltx-core) loader/helpers.py:62-81
+//   Ltx2DetectPipelineParams        <-  utils/constants.py:130-179
+//   Ltx2ShouldUseAncestralSampler   <-  distilled.py:62-84
+//   the distilled sigma constants   <-  utils/constants.py:17-25
+//
+// Upstream C: vLLM-Omni, vllm_omni/diffusion/models/ltx2/ltx2_recipes.py
+//   Ltx2PipelineRecipe / …Phase…    <-  ltx2_recipes.py:29-87
+//   ResolveLtx2PipelineRecipe       <-  ltx2_recipes.py:161-175
+//
+// ─── WHICH UPSTREAM OWNS WHICH VALUE ─────────────────────────────────────────
+// vLLM-Omni is this project's BINDING oracle (spec section 3) and it carries NO
+// 2.5 row — its table stops at 2.3. So the SHAPE of the recipe model and the
+// values of every pre-2.5 row come from vLLM-Omni, and the values of the 2.4 and
+// 2.5 rows come from Lightricks `ltx-pipelines`, which is the model author's own
+// runtime. Each row below names its source. Where the two references DISAGREE the
+// disagreement is recorded rather than resolved by preference: they ship
+// different default negative prompts, and both strings are exposed
+// (kLtx2LightricksNegativePrompt vs kLtx2OmniNegativePrompt in the goldens).
+//
+// ─── THE REFUSAL IS THE POINT ────────────────────────────────────────────────
+// `resolve_ltx_pipeline_recipe` RAISES on an unknown (kind, version) rather than
+// defaulting (ltx2_recipes.py:170-175), and this port mirrors that exactly. A
+// sigma schedule or a guidance scale that is plausible but wrong does not fail —
+// it renders. Defaulting an unknown checkpoint generation onto 2.0's 40-step,
+// STG-block-29 recipe would produce a video, and nothing downstream could tell.
+//
+// ─── DTYPE ───────────────────────────────────────────────────────────────────
+// Every buffer here is f32, and that is upstream's OWN width on these paths, not
+// a widening: the noiser lerps in `.float()` (noisers.py:32-33), every diffusion
+// step casts to `torch.float32` and back to the sample dtype
+// (diffusion_steps.py:40, 83-84, 90-91, 231-240), and MultiModalGuider.calculate
+// opens with `cond.float()` (guiders.py:256-260). The schedules are float32
+// tensors upstream too (schedulers.py:57, 88). Sigma SHIFT arithmetic is the one
+// double: `mm`, `b` and `math.exp(sigma_shift)` are Python floats before torch
+// sees them (schedulers.py:37-44), so they are computed in double here and
+// rounded to f32 at exactly the point torch rounds them.
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace vllm {
+
+// ---------------------------------------------------------------------------
+// Sigma schedules (components/schedulers.py)
+// ---------------------------------------------------------------------------
+
+// schedulers.py:10-11. The token axis the shift is fitted on. These are module
+// constants, not arguments: they decide how a resolution maps to a shift, so a
+// port that moved either would produce a valid-looking schedule for the wrong
+// resolution.
+inline constexpr int64_t kLtx2BaseShiftAnchor = 1024;
+inline constexpr int64_t kLtx2MaxShiftAnchor = 4096;
+
+// schedulers.py:41. The exponent applied to `(1/sigma - 1)`. A literal upstream,
+// pinned here because `power != 1` would change every sigma while still
+// producing a monotone schedule that renders.
+inline constexpr double kLtx2SigmaShiftPower = 1.0;
+
+// LTX2Scheduler.execute's keyword defaults (schedulers.py:21-31).
+struct Ltx2SchedulerParams {
+  double max_shift = 2.05;
+  double base_shift = 0.95;
+  bool stretch = true;
+  double terminal = 0.1;
+  // `default_number_of_tokens` — used when no latent is supplied.
+  int64_t default_number_of_tokens = kLtx2MaxShiftAnchor;
+};
+
+// LTX2Scheduler.execute (schedulers.py:21-57). Returns `steps + 1` sigmas, from
+// ~1 down to exactly 0. `tokens` is `math.prod(latent.shape[2:])` — pass 0 to
+// take `params.default_number_of_tokens`, which is what a caller with no latent
+// yet does. Throws when `steps < 1`.
+std::vector<float> Ltx2SigmaSchedule(int64_t steps, int64_t tokens,
+                                     const Ltx2SchedulerParams& params = {});
+
+// LinearQuadraticScheduler.execute (schedulers.py:67-88). `linear_steps < 0`
+// takes upstream's `steps // 2` default.
+std::vector<float> Ltx2LinearQuadraticSchedule(int64_t steps, double threshold_noise = 0.025,
+                                               int64_t linear_steps = -1);
+
+// Which scheduler a caller is asking for. `kBeta` is upstream's third
+// (schedulers.py:91-120) and is NOT ported: it inverts a Beta CDF through
+// `scipy.stats.beta.ppf`, no ltx-pipelines entry point constructs it, and
+// approximating an inverse incomplete beta would be a numerical port of its own.
+// `Ltx2Schedule` REFUSES it by name rather than substituting LTX2Scheduler.
+enum class Ltx2SchedulerKind { kLtx2, kLinearQuadratic, kBeta };
+
+// The seam a caller reaches for when it holds a configured kind. Forwards to the
+// two ported schedulers and throws for `kBeta`.
+std::vector<float> Ltx2Schedule(Ltx2SchedulerKind kind, int64_t steps, int64_t tokens,
+                                const Ltx2SchedulerParams& params = {});
+
+// ---------------------------------------------------------------------------
+// The noiser (components/noisers.py)
+// ---------------------------------------------------------------------------
+
+// GaussianNoiser.__call__ (noisers.py:30-37), elementwise over `count`:
+//   latent = lerp(latent, noise, noise_scale)
+//   latent = lerp(clean_latent, latent, denoise_mask)
+// The SECOND lerp is the one a port gets backwards: `denoise_mask` selects
+// toward the NOISED latent, so a conditioned token (mask 0) keeps its clean value
+// and an unconditioned one (mask 1) is fully noised. Swapping the operands still
+// produces a plausible video with the conditioning frames re-noised away.
+//
+// `noise` is drawn by the caller (upstream uses `torch.randn(generator=...)`,
+// noisers.py:22-28); this port takes the draw as an argument so the stream stays
+// the caller's, exactly as Ltx2NoiseStream does for the VAE.
+std::vector<float> Ltx2GaussianNoise(const float* latent, const float* clean_latent,
+                                     const float* denoise_mask, const float* noise,
+                                     int64_t count, float noise_scale = 1.0f);
+
+// ---------------------------------------------------------------------------
+// Diffusion steps (components/diffusion_steps.py)
+// ---------------------------------------------------------------------------
+
+// EulerDiffusionStep.step (diffusion_steps.py:32-40): `x + to_velocity(...) * dt`.
+// `to_velocity` (utils.py:21-36) REFUSES sigma == 0 rather than dividing, so a
+// terminal step_index throws here too.
+std::vector<float> Ltx2EulerStep(const float* sample, const float* denoised,
+                                 const float* sigmas, int64_t sigma_count, int64_t step_index,
+                                 int64_t count);
+
+// EulerAncestralDiffusionStep.step (diffusion_steps.py:63-106). The
+// rectified-flow parameterization (alpha = 1 - sigma), which is LTX-2's; it is
+// deliberately NOT the DDIM one `Ltx2AncestralStep` implements, and the two agree
+// only at eta == 0 (the class docstring says so at :51-56).
+//
+// `noise` may be null only when `eta == 0`; anything else throws, mirroring
+// upstream's own ValueError (:87-88). When `sigmas[step_index + 1] == 0` the
+// denoised prediction is returned unchanged (:85-86).
+std::vector<float> Ltx2EulerAncestralStep(const float* sample, const float* denoised,
+                                          const float* sigmas, int64_t sigma_count,
+                                          int64_t step_index, int64_t count, double eta = 1.0,
+                                          double s_noise = 1.0, const float* noise = nullptr);
+
+// Res2sDiffusionStep.get_sde_coeff (diffusion_steps.py:118-155), the `sigma_up`
+// arm — the only one `step` uses (:179). `sigma_up` is clamped IN to
+// `sigma_next * kLtx2Res2sSigmaUpClamp` before anything else.
+struct Ltx2SdeCoeff {
+  double alpha_ratio = 1.0;
+  double sigma_down = 0.0;
+  double sigma_up = 0.0;
+};
+
+// diffusion_steps.py:138. What keeps `sqrt(sigma_next^2 - sigma_up^2)` off zero,
+// and it BINDS on the ordinary eta = 1 schedule rather than only on a malformed
+// one. `step` forms `sigma_up = sigma_next * eta`, so eta <= 1 gives
+// sigma_up <= sigma_next — but <= includes ==, and at equality `min` takes
+// `sigma_next * 0.9999`, which is the whole point: without it the residual is
+// exactly 0 and `sigma_down` collapses. The earlier note reasoned from the
+// inequality and skipped its boundary, calling the constant invisible; it is not.
+// A 1% move (0.9999 -> 0.99) REDS the Eta1 arm the suite already runs, at
+// max|diff| = 0.086 (index 0) and 0.130563 (index 1), because the residual scales
+// as sqrt(1 - clamp^2) and that is 10x larger at 0.99. The EtaHalf arm stays green
+// (0.5 * sigma_next is below the clamp) and Eta1 index 2 stays green
+// (sigma_next == 0 returns the denoised prediction unchanged, :181-182). Pinned
+// as well, because a regenerated golden would move with the constant.
+inline constexpr double kLtx2Res2sSigmaUpClamp = 0.9999;
+
+Ltx2SdeCoeff Ltx2Res2sSdeCoeff(double sigma_next, double sigma_up);
+
+// Res2sDiffusionStep.step (diffusion_steps.py:157-190). Returns the denoised
+// prediction unchanged when `sigma_up` or `sigma_next` is 0 (:181-182).
+std::vector<float> Ltx2Res2sStep(const float* sample, const float* denoised,
+                                 const float* sigmas, int64_t sigma_count, int64_t step_index,
+                                 int64_t count, const float* noise, double eta = 0.5);
+
+// _get_ancestral_step (diffusion_steps.py:7-22): the DDIM / variance-exploding
+// ancestral coefficients, in the rescaled `sigma / alpha` space. Used only by
+// CFG++.
+struct Ltx2AncestralSigmas {
+  double sigma_down = 0.0;
+  double sigma_up = 0.0;
+};
+Ltx2AncestralSigmas Ltx2AncestralStep(double sigma_from, double sigma_to, double eta = 1.0);
+
+// diffusion_steps.py:233-235. `torch.finfo(torch.float32).eps`, the clamp that
+// keeps `alpha = 1 - sigma` off zero when sigma is EXACTLY 1.0 — which the first
+// step of every unstretched schedule is. Unlike most of the invisible-constant
+// class this one DOES bind on a real schedule, and the goldens include the arm
+// where it decides the numbers.
+inline constexpr double kLtx2CfgPpAlphaEps = 1.1920928955078125e-07;
+
+// EulerCfgPpDiffusionStep.step (diffusion_steps.py:208-252).
+std::vector<float> Ltx2EulerCfgPpStep(const float* sample, const float* denoised,
+                                      const float* uncond_denoised, const float* sigmas,
+                                      int64_t sigma_count, int64_t step_index, int64_t count,
+                                      double eta = 1.0, double s_noise = 1.0,
+                                      const float* noise = nullptr);
+
+// ---------------------------------------------------------------------------
+// Guidance (components/guiders.py)
+// ---------------------------------------------------------------------------
+
+// guiders.py:368. The stabilizer under `squared_norm`. It is ~1e-8 relative
+// against an O(1) denominator, so a tensor comparison cannot see it — except on
+// the one arm where `project_onto` is all zeros, which the goldens carry.
+inline constexpr double kLtx2ProjectionCoefEps = 1e-8;
+
+// projection_coef (guiders.py:363-369): per BATCH ROW,
+// `dot(to_project, project_onto) / (||project_onto||^2 + eps)`. `count` is the
+// number of elements per row, i.e. the product of every axis after the batch.
+std::vector<float> Ltx2ProjectionCoef(const float* to_project, const float* project_onto,
+                                      int64_t batch, int64_t count);
+
+// CFGGuider.delta (guiders.py:23-24) and STGGuider.delta (:70-71). Both are
+// elementwise and rank-agnostic, which is why they are the two that survive
+// contact with a real 5-D latent — see the refusal below.
+std::vector<float> Ltx2CfgDelta(const float* cond, const float* uncond, int64_t count,
+                                double scale);
+std::vector<float> Ltx2StgDelta(const float* cond, const float* perturbed, int64_t count,
+                                double scale);
+
+// NOT PORTED, refused by name: CFGStarRescalingGuider (guiders.py:30-52),
+// LtxAPGGuider (:77-125) and LegacyStatefulAPGGuider (:128-191).
+//
+// THE REASON IS REACHABILITY. Nothing in the LTX-2 tree constructs any of the
+// three: they appear only at their own `class` statements (:31, :78, :129), and
+// every pipeline builds MultiModalGuider from MultiModalGuiderParams
+// (utils/constants.py:49-68). Porting an arm upstream cannot reach would be
+// inventing behaviour, so `Ltx2Guidance` refuses them by name and they are
+// recorded as owed (.agents/porting-inventory.md 9.18(b)).
+//
+// IT IS *NOT* BECAUSE THE SHAPES CANNOT WORK — an earlier revision of this
+// comment said so and was wrong, and the correction is kept here because the
+// wrong version had been frozen as a golden (spec §7.0(b)). All three do
+// multiply `projection_coef`'s rank-2 `(B, 1)` result straight into the latent
+// (`proj_coeff * cond`, :48, :118, :184) and torch does right-align it onto the
+// LAST TWO axes, but the measured predicate is
+//
+//     raises  <=>  B > 1 and shape[-2] not in {1, B}
+//
+// so at B = 1 — the ordinary single-request video latent — it composes and is
+// numerically CORRECT, `(1, 1)` being a scalar. Where it composes with B > 1 it
+// is silently wrong, applying the per-batch coefficient along axis -2 rather
+// than the batch axis. LtxAPG's `norm(dim=[-1, -2, -3])` (:114) is a SEPARATE
+// constraint needing rank >= 3. The measured matrix is a golden
+// (kLtx2GuideProbeComposes), now including B = 1 and shape[-2] == B rows, so
+// upstream changing either the shapes or the reachability fails this gate
+// instead of going unnoticed.
+enum class Ltx2GuiderKind {
+  kCfg,
+  kStg,
+  kMultiModal,
+  kCfgStarRescaling,   // refused
+  kLtxApg,             // refused
+  kLegacyStatefulApg,  // refused
+};
+
+// MultiModalGuiderParams (guiders.py:194-211) — the ONLY guider parameter object
+// any ltx-pipelines entry point constructs.
+struct Ltx2MultiModalGuiderParams {
+  double cfg_scale = 1.0;
+  double stg_scale = 0.0;
+  std::vector<int64_t> stg_blocks;
+  double rescale_scale = 0.0;
+  double modality_scale = 1.0;
+  int64_t skip_step = 0;
+
+  // guiders.py:275-291. `math.isclose` with its DEFAULT rel_tol of 1e-9, not
+  // `!=`: a scale of 1.0 + 1e-12 is "no guidance" here and "guidance" under an
+  // exact comparison, and the difference decides whether an extra full DiT
+  // forward runs per step.
+  bool DoUnconditionalGeneration() const;
+  bool DoPerturbedGeneration() const;
+  bool DoIsolatedModalityGeneration() const;
+  bool ShouldSkipStep(int64_t step) const;
+};
+
+// MultiModalGuider.calculate (guiders.py:244-273). `uncond_*` may be null, which
+// mirrors upstream's `torch.Tensor | float` union at its only reachable scalar
+// value: a null stands for the float 0.0 that a disabled arm passes.
+//
+// The rescale (`:268-271`) divides by `pred.std()`. torch's `std` is the UNBIASED
+// (N-1) estimator by default, and using the biased one instead is a small,
+// everywhere, resolution-dependent gain error that no shape or finiteness check
+// can see.
+std::vector<float> Ltx2MultiModalGuidance(const Ltx2MultiModalGuiderParams& params,
+                                          const float* cond, const float* uncond_text,
+                                          const float* uncond_perturbed,
+                                          const float* uncond_modality, int64_t count);
+
+// The seam a caller reaches for when it holds a configured kind: forwards to the
+// three ported guiders and throws by name for the other three.
+std::vector<float> Ltx2Guidance(Ltx2GuiderKind kind, const Ltx2MultiModalGuiderParams& params,
+                                const float* cond, const float* uncond_text,
+                                const float* uncond_perturbed, const float* uncond_modality,
+                                int64_t count);
+
+// One bin of the sigma-dependent factory (guiders.py:294-342). `sigma_upper_bound`
+// is the bin's INCLUSIVE upper edge; bin i is `(key[i+1], key[i]]`.
+struct Ltx2GuiderSigmaBin {
+  double sigma_upper_bound = 0.0;
+  Ltx2MultiModalGuiderParams params;
+};
+
+// _params_for_sigma_from_sorted_dict (guiders.py:214-230). `bins` need not be
+// sorted — this sorts descending exactly as `from_dict` does (:329) — but it must
+// be non-empty, which upstream also requires (:223-224, :327-328).
+const Ltx2MultiModalGuiderParams& Ltx2GuiderParamsForSigma(
+    const std::vector<Ltx2GuiderSigmaBin>& bins, double sigma);
+
+// ---------------------------------------------------------------------------
+// Perturbations (guidance/perturbations.py)
+// ---------------------------------------------------------------------------
+
+// perturbations.py:8-16. The VALUE is the row index into the mask tensor's dim 0,
+// so these are not free to renumber.
+enum class Ltx2PerturbationType {
+  kSkipVideoSelfAttn = 0,
+  kSkipAudioSelfAttn = 1,
+  kSkipA2vCrossAttn = 2,
+  kSkipV2aCrossAttn = 3,
+};
+inline constexpr int64_t kLtx2PerturbationTypeCount = 4;
+
+// perturbations.py:19-33. `all_blocks` is upstream's `blocks is None`.
+struct Ltx2Perturbation {
+  Ltx2PerturbationType type = Ltx2PerturbationType::kSkipVideoSelfAttn;
+  bool all_blocks = false;
+  std::vector<int64_t> blocks;
+};
+
+// perturbations.py:36-50. An empty list is "nothing perturbed"; it is what
+// `PerturbationConfig.empty()` builds and what LTX-2.5 actually runs.
+struct Ltx2PerturbationConfig {
+  std::vector<Ltx2Perturbation> perturbations;
+  bool IsPerturbed(Ltx2PerturbationType type, int64_t block) const;
+};
+
+// BatchedPerturbationConfig (perturbations.py:53-143): the per-block KEEP mask,
+// 1 = keep and 0 = perturbed, indexed [type, block, sample]. The no-perturbation
+// configuration — all ones — is the shipped LTX-2.5 path (spec section 2 routes
+// STG through the guider), so it is the default here rather than a corner case.
+class Ltx2BatchedPerturbationConfig {
+ public:
+  Ltx2BatchedPerturbationConfig() = default;
+  Ltx2BatchedPerturbationConfig(const std::vector<Ltx2PerturbationConfig>& configs,
+                                int64_t num_blocks);
+  // `BatchedPerturbationConfig.empty` (:134-143).
+  static Ltx2BatchedPerturbationConfig Empty(int64_t batch, int64_t num_blocks);
+
+  int64_t batch() const { return batch_; }
+  int64_t num_blocks() const { return num_blocks_; }
+  // The whole [type, block, sample] mask, row-major.
+  const std::vector<int32_t>& block_masks() const { return masks_; }
+  // `mask` (:118-124): this block's per-sample keep mask for one type.
+  std::vector<int32_t> Mask(Ltx2PerturbationType type, int64_t block) const;
+  bool AnyInBatch(Ltx2PerturbationType type, int64_t block) const;
+  bool AllInBatch(Ltx2PerturbationType type, int64_t block) const;
+  // `batch_slice` (:111-116): a view over samples [start, end), rebuilt by
+  // slicing rather than by re-reading the config list.
+  Ltx2BatchedPerturbationConfig BatchSlice(int64_t start, int64_t end) const;
+
+ private:
+  int64_t batch_ = 0;
+  int64_t num_blocks_ = 0;
+  std::vector<int32_t> masks_;
+};
+
+// ---------------------------------------------------------------------------
+// Patchifiers (components/patchifiers.py)
+// ---------------------------------------------------------------------------
+
+// VideoLatentShape (types.py:73-98) and AudioLatentShape (:134-160).
+struct Ltx2VideoLatentShape {
+  int64_t batch = 1, channels = 0, frames = 0, height = 0, width = 0;
+};
+struct Ltx2AudioLatentShape {
+  int64_t batch = 1, channels = 0, frames = 0, mel_bins = 0;
+};
+
+// SpatioTemporalScaleFactors.default() (types.py:31-33) — the Conv VAE's
+// downsampling, which is what turns latent bounds into pixel timestamps.
+struct Ltx2ScaleFactors {
+  int64_t time = 8, height = 32, width = 32;
+};
+
+// VideoLatentPatchifier (patchifiers.py:11-134). The temporal patch size is
+// always 1 (:15) — `unpatchify` asserts it (:46) — so `patch_size` is the
+// SPATIAL one only.
+int64_t Ltx2VideoTokenCount(const Ltx2VideoLatentShape& shape, int64_t patch_size);
+// `b c (f p1) (h p2) (w p3) -> b (f h w) (c p1 p2 p3)` (:31-38). Output is
+// [batch, tokens, channels * patch_size^2].
+std::vector<float> Ltx2VideoPatchify(const float* latent, const Ltx2VideoLatentShape& shape,
+                                     int64_t patch_size);
+// `b (f h w) (c p q) -> b c f (h p) (w q)` (:52-60).
+std::vector<float> Ltx2VideoUnpatchify(const float* tokens, const Ltx2VideoLatentShape& shape,
+                                       int64_t patch_size);
+// get_patch_grid_bounds (:64-134): [batch, 3, tokens, 2] of [start, end) bounds
+// in (frame, height, width) order.
+std::vector<int64_t> Ltx2VideoPatchBounds(const Ltx2VideoLatentShape& shape, int64_t patch_size);
+// get_pixel_coords (:137-171). `causal_fix` rewrites the TEMPORAL axis only, and
+// clamps at 0 — the first latent frame covers one pixel frame, not `time`.
+std::vector<int64_t> Ltx2PixelCoords(const std::vector<int64_t>& latent_coords, int64_t batch,
+                                     int64_t tokens, const Ltx2ScaleFactors& factors,
+                                     bool causal_fix);
+
+// AudioPatchifier (patchifiers.py:174-353). The three rates below are its
+// constructor defaults (:177-180) and they set the seconds-per-latent-frame the
+// DiT's audio RoPE is indexed by, so a wrong one is a silently mistimed
+// soundtrack rather than an error.
+struct Ltx2AudioPatchifierParams {
+  int64_t sample_rate = 16000;
+  int64_t hop_length = 160;
+  int64_t audio_latent_downsample_factor = 4;
+  bool is_causal = true;
+  int64_t shift = 0;
+};
+// `b c t f -> b t (c f)` (:301-306).
+std::vector<float> Ltx2AudioPatchify(const float* latent, const Ltx2AudioLatentShape& shape);
+// `b t (c f) -> b c t f` (:325-331).
+std::vector<float> Ltx2AudioUnpatchify(const float* tokens, const Ltx2AudioLatentShape& shape);
+// get_patch_grid_bounds (:334-353): [batch, 1, frames, 2] of [start, end)
+// timestamps in SECONDS.
+std::vector<float> Ltx2AudioPatchTimings(const Ltx2AudioLatentShape& shape,
+                                         const Ltx2AudioPatchifierParams& params);
+
+// ---------------------------------------------------------------------------
+// The recipes
+// ---------------------------------------------------------------------------
+
+// parse_model_version (ltx-core loader/helpers.py:62-81): the dot-separated
+// numeric PREFIX, stopping at the first non-numeric component, so "2.3.rc1" is
+// (2, 3) and "banana" is {}. Callers that want "2.4-rc2" to compare equal to its
+// own generation normalize the separator first, exactly as `detect_model_version`
+// does (utils/constants.py:161) — `Ltx2DetectPipelineParams` does that here.
+std::vector<int64_t> Ltx2ParseModelVersion(const std::string& version);
+
+// MultiModalGuiderParams for both streams plus the geometry defaults —
+// PipelineParams (utils/constants.py:40-76).
+struct Ltx2PipelineParams {
+  int64_t seed = 10;
+  int64_t stage_1_height = 512;
+  int64_t stage_1_width = 768;
+  int64_t num_frames = 121;
+  double frame_rate = 24.0;
+  int64_t num_inference_steps = 40;
+  int64_t default_image_crf = 33;
+  Ltx2MultiModalGuiderParams video_guider;
+  Ltx2MultiModalGuiderParams audio_guider;
+
+  int64_t stage_2_height() const { return stage_1_height * 2; }
+  int64_t stage_2_width() const { return stage_1_width * 2; }
+};
+
+// The three generations upstream declares (utils/constants.py:80-124).
+Ltx2PipelineParams Ltx2Params20();
+Ltx2PipelineParams Ltx2Params23();
+Ltx2PipelineParams Ltx2Params24();
+Ltx2PipelineParams Ltx2Params23Hq();
+
+// detect_params (utils/constants.py:166-179) applied to a version STRING: the
+// params of the newest generation that version is at or above. This is the rule
+// that gives LTX-2.5 its parameters — (2,5) >= (2,4), so 2.5 inherits
+// LTX_2_4_PARAMS — and it is why a 2.5 recipe can be written from upstream at all
+// rather than being invented here.
+Ltx2PipelineParams Ltx2DetectPipelineParams(const std::string& version);
+
+// distilled.py:62-84. Generation 2.5 and later sample STAGE 1 with the ancestral
+// (SDE) Euler step; earlier ones use the deterministic one. Stage 2 is always
+// deterministic — its 3-step refinement is too short to remove freshly injected
+// noise (distilled.py:206-209).
+inline constexpr int64_t kLtx2AncestralSinceMajor = 2;
+inline constexpr int64_t kLtx2AncestralSinceMinor = 5;
+inline constexpr double kLtx2AncestralEta = 1.0;
+inline constexpr double kLtx2AncestralSNoise = 1.0;
+// distilled.py:69-73. Offsets the loop's noise generator off the pipeline seed so
+// its first draw is not bit-identical to the initial latent noise.
+inline constexpr int64_t kLtx2AncestralNoiseSeedOffset = 10000;
+bool Ltx2ShouldUseAncestralSampler(const std::string& version);
+
+// ltx2_recipes.py:38 — how a phase builds its input.
+enum class Ltx2PhaseInputTransform { kInitial, kSpatialUpsample };
+// Which stepper a phase samples with (distilled.py:170-185).
+enum class Ltx2StepperKind { kEuler, kEulerAncestral };
+
+// LTXPhaseRecipe (ltx2_recipes.py:29-50).
+struct Ltx2PhaseRecipe {
+  std::string name;
+  Ltx2MultiModalGuiderParams video_guidance;
+  Ltx2MultiModalGuiderParams audio_guidance;
+  int64_t spatial_downscale = 1;
+  // Empty means "derive the schedule from the scheduler at run time"; a non-empty
+  // one is an explicit distilled schedule and fixes `num_inference_steps`.
+  std::vector<float> sigmas;
+  double noise_scale = 0.0;
+  Ltx2PhaseInputTransform input_transform = Ltx2PhaseInputTransform::kInitial;
+  bool allow_guidance_override = true;
+  bool use_official_sigma_schedule = true;
+  Ltx2StepperKind stepper = Ltx2StepperKind::kEuler;
+  double stepper_eta = 0.0;
+  double stepper_s_noise = 1.0;
+  int64_t noise_seed_offset = 0;
+
+  // ltx2_recipes.py:48-50: `None` when the schedule is not explicit. -1 here.
+  int64_t num_inference_steps() const;
+};
+
+// LTXPipelineRecipe (ltx2_recipes.py:53-87).
+struct Ltx2PipelineRecipe {
+  std::vector<Ltx2PhaseRecipe> phases;
+  int64_t height = 512;
+  int64_t width = 768;
+  int64_t num_frames = 121;
+  double frame_rate = 24.0;
+  int64_t num_inference_steps = 40;
+  // Not a vLLM-Omni field: Lightricks resolves the conditioning-image CRF per
+  // generation (utils/constants.py:36-37, 124) and it is a property of the model
+  // generation, so it travels with the recipe rather than being re-derived.
+  int64_t default_image_crf = 33;
+  std::string negative_prompt;
+  int64_t video_output_phase = -1;
+  int64_t audio_output_phase = -1;
+  bool allow_request_sigmas = true;
+  bool allow_request_latents = true;
+  bool allow_negative_prompt = true;
+  bool fixed_num_inference_steps = false;
+
+  int64_t max_spatial_downscale() const;
+};
+
+// resolve_ltx_pipeline_recipe (ltx2_recipes.py:170-175). Keyed on the EXACT
+// (pipeline_kind, model_version) pair and throwing by name on anything else —
+// never defaulting. The table:
+//
+//   ("one_stage",          "2")    vLLM-Omni LTX2_ONE_STAGE_RECIPE (:109-111)
+//   ("one_stage",          "2.3")  vLLM-Omni LTX23_ONE_STAGE_RECIPE (:112-115)
+//   ("one_stage",          "2.4")  Lightricks LTX_2_4_PARAMS (constants.py:124)
+//   ("one_stage",          "2.5")  Lightricks, via _PARAMS_SINCE_VERSION (:130-133)
+//   ("distilled_two_stage","2")    vLLM-Omni LTX2_DISTILLED_TWO_STAGE_RECIPE (:125-158)
+//   ("distilled_two_stage","2.5")  Lightricks distilled.py + constants.py:17-23
+//   ("dmd2",               "2")    vLLM-Omni LTX_POSITIVE_ONLY_RECIPE (:116-124)
+//   ("dmd2",               "2.3")  same
+//
+// The 2.4 and 2.5 rows exist here and not upstream in vLLM-Omni, which carries no
+// row past 2.3 (spec section 3). Their VALUES are Lightricks', not invented: the
+// one_stage rows are `detect_params`' own resolution of that version, and the
+// distilled 2.5 row is the 2.0 one plus `should_use_ancestral_sampler`, which is
+// the single thing distilled.py changes for generation 2.5.
+Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
+                                             const std::string& model_version);
+
+// ---------------------------------------------------------------------------
+// Out of scope for L5, refused by name (spec section 2, "Out")
+// ---------------------------------------------------------------------------
+
+// Each of these renders something plausible if it is silently downgraded, which
+// is why none of them falls back. `Ltx2RefuseUnportedPipelineFeature` throws with
+// a message naming the missing piece and the phase or row that owes it.
+enum class Ltx2UnportedPipelineFeature {
+  kTemporalUpsampler,   // model/upsampler with temporal_upsample=True
+  kLoraFusion,          // loader/LoraPathStrengthAndSDOps
+  kMultishot,           // ltx-pipelines multishot entry points
+  kInt8ConvRot,         // ComfyUI-only quantization
+  kCfgParallelism,      // ltx-pipelines/multigpu
+  kVideoEngineWiring,   // end-to-end through vllm::multimodal::VideoEngine (L7)
+  kBetaScheduler,       // components/schedulers.py:91-120
+};
+[[noreturn]] void Ltx2RefuseUnportedPipelineFeature(Ltx2UnportedPipelineFeature feature);
+
+}  // namespace vllm

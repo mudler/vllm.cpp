@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
@@ -488,6 +489,52 @@ struct Qwen3_5MoeWeights {
 // Resolves a tensor name to its StTensor (across shards). Throws if absent.
 using TensorResolver = std::function<const StTensor&(const std::string&)>;
 
+// --- Backbone weight namespace (MODEL-TEXT-qwen3-5-*-for-causal-lm) -----------
+//
+// A Qwen3.5-family checkpoint publishes its text backbone under ONE of two
+// spellings. The multimodal wrappers we already gate (Qwen3.6-27B / 35B-A3B /
+// Coder) nest it under `model.language_model.`; the TEXT-ONLY arms
+// (`Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM`, e.g.
+// `Qwen/Qwen3.8-2.4T-A95B`) publish it flat under `model.`. The BACKBONE names
+// are otherwise identical — same `mlp.shared_expert_gate.weight`, same
+// top-level `lm_head`.
+//
+// THE PREFIX IS NOT THE ONLY THING BETWEEN THIS LOADER AND A PUBLISHED
+// CHECKPOINT, and an earlier revision of this comment wrongly implied it was.
+// The published Qwen3.5-family MoE repos ship 3-D STACKED routed experts
+// (`...mlp.experts.gate_up_proj` / `.down_proj`) and carry no quantization
+// scales at all, while `LoadQwen3_5Moe` reads ONLY per-expert NVFP4. That arm
+// is OWED and is refused by name (`CheckMoeExpertLayoutSupported`,
+// `qwen3_5_weights.cpp`). The DENSE loader is different: it routes BF16 vs FP8
+// vs NVFP4 per projection by tensor presence, so it may genuinely read a flat
+// bf16 checkpoint. Resolving the namespace is what THIS seam does; it is not a
+// support claim for either published checkpoint.
+//
+// Upstream normalizes the two with ONE mapper —
+//   WeightsMapper(orig_to_new_prefix={"model.language_model.": "model."})
+//   (vllm/model_executor/models/qwen3_5.py:296-300 @ `ad5d29db7`, PR #50210,
+//    which is AHEAD OF our `555967922` parity pin and recorded as such) —
+// so `model.` is canonical and the VL spelling is its accepted alias.
+inline constexpr std::string_view kQwen3_5VlBackbonePrefix =
+    "model.language_model.";
+inline constexpr std::string_view kQwen3_5TextBackbonePrefix = "model.";
+
+// Decides which of the two the checkpoint uses, ONCE, from the shard index, so
+// every subsequent lookup in a load uses one namespace. Deliberately NOT a
+// per-lookup fallback: a fallback would let a checkpoint bind half its tensors
+// from one namespace and half from the other and still appear to load.
+//
+// Only BACKBONE spellings vote — `<prefix>embed_tokens.weight`,
+// `<prefix>norm.weight` and `<prefix>layers.`. `model.visual.*` (the
+// vision-inclusive 27B/35B towers) and the top-level `lm_head.*` / `mtp.*`
+// therefore cast no vote, which is what keeps a vision checkpoint from looking
+// like a flat text one.
+//
+// Throws std::runtime_error when BOTH namespaces carry backbone tensors (a
+// mixed index is refused, never half-loaded) and when NEITHER does.
+std::string ResolveQwen3_5BackbonePrefix(
+    const std::vector<std::string>& tensor_names);
+
 // --- ENG-LOAD-DIRECT-UPLOAD (issue #150) -------------------------------------
 //
 // THE DEFECT THIS CLOSES. Loading a checkpoint copies the weights TWICE: the
@@ -529,14 +576,113 @@ namespace detail {
 void SetLoadDirectUploadOverrideForTesting(std::optional<bool> value);
 }  // namespace detail
 
+// How a checkpoint spells its ROUTED experts (issue #740). Resolved ONCE per
+// checkpoint from the shard index and threaded, exactly as the backbone
+// namespace is: a per-lookup fallback would let one checkpoint bind half its
+// experts from each layout and still appear to load.
+//
+//  kPerExpertNvfp4  `<layer>.mlp.experts.<e>.{gate,up,down}_proj.weight` U8 +
+//                   `.weight_scale` F8_E4M3 + `.weight_scale_2` -- what an
+//                   NVFP4 requant (nvidia/Qwen3.6-35B-A3B-NVFP4) ships and what
+//                   every gated row reads today. Populates `expert_*_fp4`.
+//  kStackedBf16     `<layer>.mlp.experts.{gate_up_proj,down_proj}`, ONE 3-D bf16
+//                   tensor per projection holding every expert -- what the
+//                   PUBLISHED repos (Qwen/Qwen3.8-2.4T-A95B,
+//                   Qwen/Qwen3.6-35B-A3B) ship. Populates the bf16 `expert_*`.
+enum class MoeExpertLayout { kPerExpertNvfp4, kStackedBf16 };
+
+// Decides which of the two a checkpoint uses, ONCE, from its shard index —
+// the routed-expert sibling of `ResolveQwen3_5BackbonePrefix`, and public for
+// the same reason: a caller that wants to know what a published index implies
+// must ask the same question the loader asks, not a paraphrase of it.
+//
+// Only names under `<backbone_prefix>layers.` vote. The top-level `mtp.` draft
+// head carries the STACKED spelling even in `nvidia/Qwen3.6-35B-A3B-NVFP4`,
+// whose model is per-expert NVFP4, so a scan that counted every `.mlp.experts.`
+// name would flip that checkpoint's whole model onto the wrong arm.
+//
+// Throws when BOTH spellings appear under the backbone (a mixed index is
+// refused, never half-bound). An index with NEITHER resolves to the per-expert
+// arm — the status quo — and the load then fails at its first missing tensor.
+MoeExpertLayout ResolveQwen3_5MoeExpertLayout(
+    const std::vector<std::string>& tensor_names,
+    const std::string& backbone_prefix);
+
+// --- The load PLAN (issue #740, .agents/specs/moe-bf16-stacked-experts.md) ---
+//
+// WHAT PROBLEM THIS SOLVES. `Qwen/Qwen3.8-2.4T-A95B` is ~4.8 TB over 213 shards.
+// Nothing here can hold it, so "the reader works at 35B" is the only byte-level
+// evidence available — and on its own it does not show that the 2.4T's OWN
+// names, shapes and dtypes resolve, nor that the per-expert offset arithmetic
+// survives its dimensions (one layer's `gate_up_proj` is 34,359,738,368 bytes,
+// which overflows int32 by four orders of magnitude).
+//
+// So: walk the whole load for a config WITHOUT allocating or reading a single
+// weight byte, and report every tensor it would fetch. Checked against the
+// published `model.safetensors.index.json`, that answers "would it load on
+// hardware that can hold it?" for exactly the part that can be answered without
+// the hardware.
+//
+// WHAT IT DELIBERATELY DOES NOT CLAIM: a generated token, throughput, memory
+// headroom, or that any allocation path survives at that scale.
+//
+// THE PLAN IS ONLY WORTH ANYTHING IF IT IS A PROJECTION OF THE LOADER RATHER
+// THAN A SECOND MODEL OF IT. `PlanQwen3_5MoeLoad` therefore mirrors
+// `LoadQwen3_5Moe` helper for helper, including the `DenseNativeEnabled()`
+// decision that adds `.input_scale` to every FP8 projection, and the test suite
+// binds the two: it builds a synthetic checkpoint from the plan ALONE, requires
+// the production loader to read it, and then removes each planned tensor in turn
+// and requires the load to fail naming exactly that tensor. A plan entry the
+// loader does not want, or a tensor it wants that the plan omits, fails there.
+struct PlannedTensor {
+  std::string name;
+  // The safetensors dtype string the load hard-requires (`LoadBf16Direct` wants
+  // BF16, `LoadFp8Raw` F8_E4M3, `LoadNvfp4Raw` U8 + F8_E4M3 + F32, ...).
+  std::string dtype;
+  // The shape the CONFIG implies. EMPTY when neither the loader nor the config
+  // determines it: the attention projections' output width depends on
+  // `attn_output_gate`, which `HfConfig` does not carry, so this planner states
+  // no shape for them rather than a plausible one that is wrong on every real
+  // checkpoint (the 2.4T's `q_proj` is [32768, 8192], twice heads*head_dim).
+  std::vector<int64_t> shape;
+  // True when the LOADER ITSELF checks this shape against config, rather than
+  // reading it off the header. Only the 3-D stacked routed experts do — which is
+  // exactly the arithmetic this row added, so it is the one shape whose
+  // agreement with the published index is a statement about the reader and not
+  // about this planner.
+  bool shape_enforced = false;
+};
+
+// Every tensor `LoadQwen3_5Moe` would fetch for `config`, in load order, without
+// touching a weight byte. `backbone_prefix` and `layout` are what
+// `ResolveQwen3_5BackbonePrefix` / `ResolveQwen3_5MoeExpertLayout` resolved from
+// the index. Does NOT include `mtp.*`: `LoadQwen3_5MTP` loads that optional
+// draft head separately, and only when speculative decoding is enabled.
+//
+// Identical for the eager and DEFERRED (`load_layer_experts`) residency paths —
+// deferring changes WHEN the routed experts are read, never WHICH.
+std::vector<PlannedTensor> PlanQwen3_5MoeLoad(const HfConfig& config,
+                                              const std::string& backbone_prefix,
+                                              MoeExpertLayout layout);
+
 // Load one decoder layer's weights from real tensors. `layer_type` is
 // "linear_attention" or "full_attention"; `num_experts` drives the expert loop.
 // Exercised on real data by the Task 3 unit test (both layer types live in
-// shard 1). Prefix is "model.language_model.layers.{layer_idx}.".
-Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(const TensorResolver& get,
-                                           const std::string& layer_type,
-                                           int64_t layer_idx,
-                                           int64_t num_experts);
+// shard 1). Prefix is "{backbone_prefix}layers.{layer_idx}.", and the default
+// is the VL spelling every checkpoint we gate today uses, so this seam is
+// byte-identical for the 27B/35B/Coder callers. `LoadQwen3_5Moe` passes the
+// prefix it resolved once from the shard index.
+//
+// `layout` likewise defaults to the arm every gated caller uses, so this seam
+// stays byte-identical for them. `hidden` is read ONLY by the stacked arm, which
+// needs it to resolve the 3-D tensors' orientation the way upstream does; it is
+// unused (and may be 0) for the per-expert arm.
+Qwen3_5MoeLayerWeights LoadQwen3_5MoeLayer(
+    const TensorResolver& get, const std::string& layer_type, int64_t layer_idx,
+    int64_t num_experts,
+    const std::string& backbone_prefix = std::string(kQwen3_5VlBackbonePrefix),
+    MoeExpertLayout layout = MoeExpertLayout::kPerExpertNvfp4,
+    int64_t hidden = 0);
 
 // Full-model load: resolves every param across the given shards (name -> shard
 // looked up from each file's own header), dequantizes/transposes, and returns

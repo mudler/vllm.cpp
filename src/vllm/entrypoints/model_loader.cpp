@@ -21,6 +21,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/weight_offloader.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"  // deepseek4 GGUF dispatch arm
@@ -972,6 +973,10 @@ LoadedEngine::LoadedEngine(HfConfig config,
       dflash_draft_(std::move(dflash_draft)),
       model_(std::move(model)),
       tokenizer_(std::move(tokenizer)),
+      // #607 L2: carry the multimodal input limits onto the engine, so the ONE
+      // config object every consumer asks (GetLimitPerPrompt) is the one the
+      // server flags / the C ABI set. Default-constructed == the pre-L2 999.
+      mm_config_(params.multimodal),
       // ROAD-V1-MEM M1: resolve the block count from the sizing knobs
       // (num_blocks override > kv_cache_memory_bytes > util fallback) against the
       // model's own per-block byte geometry. FIRST, because max_model_len_ is
@@ -1226,6 +1231,28 @@ vllm::v1::AsyncLLM& LoadedEngine::async_engine() {
 
 std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     const std::string& model_dir, const EngineParams& params) {
+  // ENG-WEIGHT-OFFLOAD W1: install the weight offloader BEFORE any weight I/O,
+  // mirroring vLLM setting the process-global at
+  // v1/worker/gpu_model_runner.py:939. `ModelRegistry::Prepare` reads it back
+  // (our analogue of models/utils.py:824). An absent config installs the no-op,
+  // which is the current engine path, so this is inert by default.
+  //
+  // W1 has no backend, so a config that asks for one gets the no-op and ONE
+  // line saying so. A configured `cpu_offload_gb` that silently frees nothing
+  // is a memory bug the operator cannot see, and an honest line is cheaper than
+  // the bug report it prevents.
+  {
+    vllm::WeightOffloaderChoice choice = vllm::CreateWeightOffloader(
+        params.offload_config.value_or(vllm::OffloadConfig{}));
+    if (!choice.selected_backend_pending.empty()) {
+      std::cerr << "engine: offload_config selected backend \""
+                << choice.selected_backend_pending
+                << "\" but this build has no weight offloader yet "
+                   "(ENG-WEIGHT-OFFLOAD W2/W5); NO weight is offloaded"
+                << std::endl;
+    }
+    vllm::SetWeightOffloader(std::move(choice.offloader));
+  }
   // ARCH-ONE-SURFACE ROW 8: resolve an EXPLICIT device selection up front,
   // BEFORE any path/config/weight I/O — the mirror of vLLM resolving
   // DeviceConfig at config-creation time, ahead of the model load

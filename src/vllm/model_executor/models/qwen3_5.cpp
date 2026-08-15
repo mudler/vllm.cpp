@@ -611,20 +611,30 @@ Tensor Reshape(const Tensor& src, const std::vector<int64_t>& shape) {
 // the running device's platform (per-object: keyed on the DBuf's own
 // device.type, NOT the process-global CurrentPlatform). The DevicePool soft cap
 // is now platform data, not an inline constant — a discrete GPU sets a bound and
-// this file is unchanged. Memoized in a function-local static because DBuf is a
-// per-op hot path and the process runs on ONE device (all DBufs share it), so the
-// virtual dispatch is paid exactly once; platforms are fixed at static
-// registration, so the value never changes afterward.
+// this file is unchanged. Memoized PER DEVICE TYPE because DBuf is a per-op hot
+// path; platforms are fixed at static registration, so the value never changes
+// afterward. It used to be ONE function-local static, which cached whichever
+// device asked first and applied that cap to every later one — the same
+// ambient-device assumption #516 fixed one layer down (dense_device_glue.h
+// carries the identical repair). A backend whose platform was never REGISTERED
+// therefore throws out of GetPlatform rather than inheriting the first device's
+// cap — a cap read off another platform is a wrong number, not a default.
 struct DevicePoolPolicy {
   size_t cap_bytes = 0;  // residency_policy().device_pool_cap_bytes (0 == uncapped)
 };
 DevicePoolPolicy ResolveDevicePoolPolicy(const Dev& d) {
-  static const DevicePoolPolicy p = [&] {
-    const auto rp =
-        vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
-    return DevicePoolPolicy{rp.device_pool_cap_bytes};
-  }();
-  return p;
+  // cap+1, so 0 means "not resolved yet" and a genuine cap of 0 (every platform
+  // today) still caches. Racing threads resolve the same type to the same value.
+  static std::array<std::atomic<size_t>, vt::kNumDeviceTypes> cached{};
+  // Same bound platforms::Index() applies to this identical value before
+  // indexing ITS registry (src/vllm/platforms/platform.cpp).
+  const size_t idx = static_cast<size_t>(d.q.device.type);
+  VT_CHECK(idx < vt::kNumDeviceTypes, "invalid device type");
+  const size_t seen = cached[idx].load(std::memory_order_relaxed);
+  if (seen != 0) return DevicePoolPolicy{seen - 1};
+  const auto rp = vllm::platforms::GetPlatform(d.q.device.type).residency_policy();
+  cached[idx].store(rp.device_pool_cap_bytes + 1, std::memory_order_relaxed);
+  return DevicePoolPolicy{rp.device_pool_cap_bytes};
 }
 
 // --- Fused-MoE per-layer resident constants (M2.5 Phase 2, CUDA-graph unblock) -
@@ -839,11 +849,12 @@ class DBuf {
     // (BACKEND-PLATFORM item 2), not an inline constant. 0 == uncapped (GB10
     // today) ⇒ pool behavior is byte-for-byte unchanged.
     cap_ = ResolveDevicePoolPolicy(d).cap_bytes;
-    // Draw from the thread-local active pool (main Pool() by default, AuxPool()
-    // inside the shared-expert overlap region), and REMEMBER it so the block
-    // returns to the same pool even when this DBuf outlives the ActivePoolScope
-    // (the aux region returns sd/gl, destroyed after the join). See AuxPool().
-    pool_ = ActivePool();
+    // Draw from THIS DEVICE's pool (Pool(b)) unless an ActivePoolScope overrides
+    // it for the shared-expert overlap region (AuxPool(b)), and REMEMBER the
+    // pool so the block returns to the one it came from even when this DBuf
+    // outlives the scope (the aux region returns sd/gl, destroyed after the
+    // join). See AuxPool().
+    pool_ = &ActivePool(*b_);
     p_ = pool_->Get(*b_, alloc_bytes_);
     t_ = MakeTensor(p_, dt, d.q.device, shape);
     if (host != nullptr) b_->Copy(d.q, p_, host, bytes_);
@@ -879,12 +890,27 @@ class DBuf {
   size_t bytes() const { return bytes_; }
   size_t alloc_bytes() const { return alloc_bytes_; }
   // Relinquish ownership of the pool block WITHOUT returning it (the dtor becomes
-  // a no-op). The caller takes over the Pool().Put obligation for `alloc_bytes()`.
-  // The Tensor view (t()) still holds the raw data pointer after this.
+  // a no-op). The caller takes over the Put obligation for `alloc_bytes()`.
+  // The Tensor view (t()) still holds the raw data pointer after this. Prefer
+  // ReleaseShared(), which discharges that obligation correctly by construction.
   void* Release() {
     void* p = p_;
     p_ = nullptr;
     return p;
+  }
+
+  // Move the block into a shared_ptr that returns it to THIS buffer's own pool
+  // and backend. Replaces the hand-written deleter that closed over the byte
+  // count alone and called `Pool().Put(alloc, q)`, naming neither the device nor
+  // the pool — so it returned another device's block, and an aux-stream block,
+  // to the main device's free list (#516; see dense_device_glue.h).
+  std::shared_ptr<void> ReleaseShared() {
+    DevicePool* const pool = pool_;
+    Backend* const b = b_;
+    const size_t alloc = alloc_bytes_;
+    void* const p = Release();
+    if (p == nullptr) return {};
+    return std::shared_ptr<void>(p, [pool, b, alloc](void* q) { pool->Put(*b, alloc, q); });
   }
   void Zero(Dev d) { b_->Memset(d.q, p_, 0, bytes_); }
   // Copies the buffer back to host and blocks until the queue is idle.
@@ -895,7 +921,7 @@ class DBuf {
 
  private:
   Backend* b_;
-  DevicePool* pool_ = &Pool();  // owning scratch pool (main Pool() or AuxPool())
+  DevicePool* pool_ = nullptr;  // owning scratch pool (this device's Pool() or AuxPool())
   void* p_ = nullptr;
   size_t bytes_ = 0;
   size_t alloc_bytes_ = 0;
@@ -3717,6 +3743,16 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
 // slice for the gated RMSNorm — the inner [Hv,Dv] block is contiguous while
 // the token stride follows the packed parent (upstream z.reshape(T,-1,Dv) on
 // the mixed_qkvz slice, qwen_gdn_linear_attn.py:934).
+// Resolved GDN output-gate activation. Upstream hands RMSNormGated the string
+// (`activation=output_gate_type`, qwen_gdn_linear_attn.py:452-464 @555967922);
+// vt::RmsNormGatedArgs models the same silu/sigmoid split as a bool. HfConfig
+// canonicalizes the key at LOAD time (only "silu"/"sigmoid" survive, "swish"
+// already collapsed, anything else refused), so this is a lookup and never a
+// second normalization -- exactly one place decides what the gate is.
+bool GdnSigmoidGate(const HfConfig& cfg) {
+  return cfg.output_gate_type == "sigmoid";
+}
+
 Tensor GdnGateView3(const Tensor& z, int64_t T, int64_t hv, int64_t dv) {
   Tensor g = z;
   g.rank = 3;
@@ -3825,6 +3861,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // flatten heads, out-project.
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
+  const bool sigmoid_gate = GdnSigmoidGate(cfg);
   const bool z_strided = z.stride[0] != value_dim;
   Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
@@ -3848,10 +3885,17 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // RmsNormGatedQuantFp8 kernel (byte-identical + perf-neutral). VT_FUSED_CHAIN_ADOPT=0
     // restores the direct hand-call.
     if (FusedChainAdoptEnabled()) {
-      vt::FusedChain(d.q, vt::kRmsNormGatedQuantFp8, a_fp8_v, core2, z2, dnw, eps,
+      // sigmoid_gate is a STRUCTURAL recipe flag (fused_recipe.h FStep), not a
+      // call scalar, so the sigmoid arm binds a COPY of the recipe with that
+      // step flag set. On the silu arm the copy is byte-identical to
+      // vt::kRmsNormGatedQuantFp8, so this stays perf- and bit-neutral.
+      vt::FusedRecipe gated_fp8 = vt::kRmsNormGatedQuantFp8;
+      gated_fp8.steps[0].sigmoid_gate = sigmoid_gate;
+      vt::FusedChain(d.q, gated_fp8, a_fp8_v, core2, z2, dnw, eps,
                      w.out_proj_fp8.input_scale);
     } else {
-      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false},
+      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw,
+                               vt::RmsNormGatedArgs{eps, sigmoid_gate},
                                w.out_proj_fp8.input_scale);
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
@@ -3860,11 +3904,13 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
-    vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated2, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
     Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
-    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
@@ -4299,6 +4345,7 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   // Byte-identical op sequence to GdnBlockPaged's tail. ──
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
+  const bool sigmoid_gate = GdnSigmoidGate(cfg);
   const bool z_strided = z.stride[0] != value_dim;
   Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
@@ -4308,11 +4355,17 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
     Tensor a_fp8_v = z_strided ? Reshape(a_fp8.t(), {T, Hv, Dv})
                                : Reshape(a_fp8.t(), {T * Hv, Dv});
     if (FusedChainAdoptEnabled()) {
-      vt::FusedChain(d.q, vt::kRmsNormGatedQuantFp8, a_fp8_v, core2, z2, dnw, eps,
+      // sigmoid_gate is a STRUCTURAL recipe flag (fused_recipe.h FStep), not a
+      // call scalar, so the sigmoid arm binds a COPY of the recipe with that
+      // step flag set. On the silu arm the copy is byte-identical to
+      // vt::kRmsNormGatedQuantFp8, so this stays perf- and bit-neutral.
+      vt::FusedRecipe gated_fp8 = vt::kRmsNormGatedQuantFp8;
+      gated_fp8.steps[0].sigmoid_gate = sigmoid_gate;
+      vt::FusedChain(d.q, gated_fp8, a_fp8_v, core2, z2, dnw, eps,
                      w.out_proj_fp8.input_scale);
     } else {
       vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw,
-                               vt::RmsNormGatedArgs{eps, false},
+                               vt::RmsNormGatedArgs{eps, sigmoid_gate},
                                w.out_proj_fp8.input_scale);
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
@@ -4321,11 +4374,13 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
-    vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated2, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
     Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
-    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
   return !w.out_proj_fp8.Empty()
@@ -4722,6 +4777,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // representable (same kernel and grid — only the gate addressing changes).
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
+  const bool sigmoid_gate = GdnSigmoidGate(cfg);
   const bool z_strided = z.stride[0] != value_dim;
   Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
@@ -4745,10 +4801,17 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
     // RmsNormGatedQuantFp8 kernel (byte-identical + perf-neutral). VT_FUSED_CHAIN_ADOPT=0
     // restores the direct hand-call.
     if (FusedChainAdoptEnabled()) {
-      vt::FusedChain(d.q, vt::kRmsNormGatedQuantFp8, a_fp8_v, core2, z2, dnw, eps,
+      // sigmoid_gate is a STRUCTURAL recipe flag (fused_recipe.h FStep), not a
+      // call scalar, so the sigmoid arm binds a COPY of the recipe with that
+      // step flag set. On the silu arm the copy is byte-identical to
+      // vt::kRmsNormGatedQuantFp8, so this stays perf- and bit-neutral.
+      vt::FusedRecipe gated_fp8 = vt::kRmsNormGatedQuantFp8;
+      gated_fp8.steps[0].sigmoid_gate = sigmoid_gate;
+      vt::FusedChain(d.q, gated_fp8, a_fp8_v, core2, z2, dnw, eps,
                      w.out_proj_fp8.input_scale);
     } else {
-      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false},
+      vt::RmsNormGatedQuantFp8(d.q, a_fp8_v, core2, z2, dnw,
+                               vt::RmsNormGatedArgs{eps, sigmoid_gate},
                                w.out_proj_fp8.input_scale);
     }
     return MatmulFp8CutlassPreQuantD(d, a_fp8.t(), w.out_proj_fp8, DType::kBF16);
@@ -4757,11 +4820,13 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   if (GlueFuseEnabled()) {
     Tensor gated2 = z_strided ? Reshape(gated_bf16.t(), {T, Hv, Dv})
                               : Reshape(gated_bf16.t(), {T * Hv, Dv});
-    vt::RmsNormGated(d.q, gated2, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated2, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
   } else {
     DBuf dgated(d, DType::kF32, {T * Hv, Dv});
     Tensor gated_f32 = z_strided ? Reshape(dgated.t(), {T, Hv, Dv}) : dgated.t();
-    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw, vt::RmsNormGatedArgs{eps, false});
+    vt::RmsNormGated(d.q, gated_f32, core2, z2, dnw,
+                     vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
@@ -5733,7 +5798,7 @@ DBuf MoeBlockFusedMarlinCuda(Dev d, const MoeBlockWeights& w, const HfConfig& cf
     Dev auxd{d.b, ax->q};
     // Draw the shared path's scratch from AuxPool so the concurrent main-stream
     // routed allocations never share a live block with it (see AuxPool()).
-    ActivePoolScope guard(&AuxPool());
+    ActivePoolScope guard(&AuxPool(d.b));
     sp_aux.emplace(SharedExpertUngated(auxd, w, cfg, dh, T, true));
     d.b.RecordEvent(ax->done, ax->q);     // event1.record() on the aux stream
   }
@@ -6618,10 +6683,7 @@ Qwen3_5MTPHiddenStates MtpFinalize(Dev device, const Qwen3_5MTPWeights& weights,
               vt::RmsNormArgs{eps, true}, &residual.t());
   Qwen3_5MTPHiddenStates out;
   out.tensor = normalized.t();
-  const size_t allocation = normalized.alloc_bytes();
-  void* storage = normalized.Release();
-  out.storage = std::shared_ptr<void>(
-      storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
+  out.storage = normalized.ReleaseShared();
   return out;
 }
 
@@ -6814,10 +6876,7 @@ MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
   DBuf out = MoeBlock(d, weights, config, dh, T);
   MoeBlockOutput r;
   r.tensor = out.t();
-  const size_t alloc = out.alloc_bytes();
-  void* p = out.Release();  // dtor now a no-op; we own the Pool().Put obligation
-  r.storage =
-      std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+  r.storage = out.ReleaseShared();
   return r;
 }
 
@@ -7114,10 +7173,7 @@ static ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t vocab) {
   fl.rows = dlogits.t().shape[0];
   fl.vocab = vocab;
   fl.device_tensor = dlogits.t();  // view (raw data ptr survives Release)
-  const size_t alloc = dlogits.alloc_bytes();
-  void* p = dlogits.Release();     // dtor now a no-op; we own the Pool().Put
-  fl.device_storage = std::shared_ptr<void>(
-      p, [alloc](void* q) { Pool().Put(alloc, q); });
+  fl.device_storage = dlogits.ReleaseShared();
   (void)d;
   return fl;
 }
@@ -7394,10 +7450,7 @@ ForwardLogits Qwen3_5Model::ForwardDeviceTap(
                              gdn_state, weights, config, logits_indices, &tap_view);
   if (hidden_out != nullptr) {
     hidden_out->tensor = tap.t();
-    const size_t allocation = tap.alloc_bytes();
-    void* storage = tap.Release();
-    hidden_out->storage = std::shared_ptr<void>(
-        storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
+    hidden_out->storage = tap.ReleaseShared();
   }
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
@@ -7428,10 +7481,7 @@ ForwardLogits Qwen3_5Model::ForwardDeviceMultiTap(
                              gdn_state, weights, config, logits_indices,
                              /*hidden_tap=*/nullptr, &aux_out->layer_ids, &aux_view);
   aux_out->tensor = aux.t();
-  const size_t allocation = aux.alloc_bytes();
-  void* storage = aux.Release();
-  aux_out->storage = std::shared_ptr<void>(
-      storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
+  aux_out->storage = aux.ReleaseShared();
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
 
@@ -8328,10 +8378,7 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceTap(
                                   logits_indices, &tap_view);
   if (hidden_out != nullptr) {
     hidden_out->tensor = tap.t();
-    const size_t allocation = tap.alloc_bytes();
-    void* storage = tap.Release();
-    hidden_out->storage = std::shared_ptr<void>(
-        storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
+    hidden_out->storage = tap.ReleaseShared();
   }
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
@@ -8359,10 +8406,7 @@ ForwardLogits Qwen3_5DenseModel::ForwardDeviceMultiTap(
                                   logits_indices, /*hidden_tap=*/nullptr,
                                   &aux_out->layer_ids, &aux_view);
   aux_out->tensor = aux.t();
-  const size_t allocation = aux.alloc_bytes();
-  void* storage = aux.Release();
-  aux_out->storage = std::shared_ptr<void>(
-      storage, [allocation](void* ptr) { Pool().Put(allocation, ptr); });
+  aux_out->storage = aux.ReleaseShared();
   return WrapDeviceLogits(d, std::move(dlogits), config.vocab_size);
 }
 
@@ -8629,11 +8673,14 @@ struct PinnedStepInputs {
 // cudaMalloc mid-capture (aborts capture). Isolating them in their own pool leaves
 // the main Pool() exactly as the eager pre-warm step left it, so every allocation
 // the captured region makes is a pool HIT. DBuf remembers its owning pool, so these
-// buffers return here on slot reset. Single device per process (ResolveDevicePool
-// Policy), so a static instance is safe.
-static DevicePool& PersistentDecodeInputPool() {
-  static DevicePool p;
-  return p;
+// buffers return here on slot reset.
+//
+// PER DEVICE, like every other pool (#516): the isolation this wants is from the
+// main scratch pool of the SAME device, and a process-wide instance would hand
+// one device's retained decode inputs to another's captured forward.
+static DevicePool& PersistentDecodeInputPool(vt::Backend& b) {
+  static detail::PoolTable table;
+  return table.For(b);
 }
 
 // Option A per-step input staging: copy the slot's refreshed host inputs into its
@@ -9072,7 +9119,7 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
         return false;
       }();
       {
-        ActivePoolScope persistent_scope(&PersistentDecodeInputPool());
+        ActivePoolScope persistent_scope(&PersistentDecodeInputPool(d.b));
         s.dev = std::make_unique<StepDevInputs>(BuildStepDevInputs(
             d, s.positions, s.attn_meta, s.gdn_meta, gdn_state_slots));
         MaybeBuildAttnCosSin(d, *s.dev, impl_->config, S, fp4_attn);
@@ -9493,7 +9540,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
         return false;
       }();
       {
-        ActivePoolScope persistent_scope(&PersistentDecodeInputPool());
+        ActivePoolScope persistent_scope(&PersistentDecodeInputPool(d.b));
         s.dev = std::make_unique<StepDevInputs>(BuildStepDevInputs(
             d, s.positions, s.attn_meta, s.gdn_meta, gdn_state_slots));
         MaybeBuildAttnCosSin(d, *s.dev, impl_->config, S, fp4_attn);

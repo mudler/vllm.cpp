@@ -20,8 +20,10 @@
 // pass. Publishers re-quantize in place; a correctness gate must name the
 // revision its golden belongs to.
 
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <system_error>
 
@@ -30,6 +32,23 @@ namespace parity {
 // The revision the committed 27B goldens were captured against.
 inline constexpr const char* kQwen27NvfP4Revision =
     "890bdef7a42feba6d83b6e17a03315c694112f2a";
+
+// The revision the committed Nemotron-3.5-Lightning-30B-A3B-NVFP4 goldens were
+// captured against (nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4).
+// Captured 2026-08-12 on GB10 from the PINNED oracle -- vLLM
+// 0.23.1rc1.dev1511+g555967922, transformers 5.14.1, flashinfer 0.6.15.post1 --
+// with the identity asserted and the run aborting on mismatch. NOT the
+// `vllm-oracle` symlink, which resolves to the v0.25.0 rollback and predates
+// NemotronHMoEDecoderLayer entirely.
+inline constexpr const char* kNemotron35LightningNvfP4Revision =
+    "29f2d1746d8f41e316523194b19018707749b1b1";
+
+// The directory this checkpoint is staged under inside `$CHECKPOINT_ROOT`. It
+// is a `hf download --local-dir` tree, not an HF cache repo, so the revision
+// does not appear in the PATH the way `snapshots/<rev>/` does -- see
+// Nemotron35LightningSnapshot below for where it does appear.
+inline constexpr const char* kNemotron35LightningLocalDirName =
+    "nemotron-3.5-lightning-30b-nvfp4";
 
 // Snapshot directory for `<repo>` at `revision`, or "" when it is not cached
 // (the caller then emits its loud SKIP). `env_override`, when set and non-empty,
@@ -53,6 +72,210 @@ inline std::string HfSnapshot(const char* repo_dir, const char* revision,
                         "snapshots" / revision;
   if (!fs::exists(snap / "config.json", ec)) return "";
   return snap.string();
+}
+
+// GATE-SNAPSHOT-CONTENT-PIN (issue #569). The revision the bytes of
+// `<local_dir>/<name>` were actually downloaded as, or "" when nothing records
+// it.
+//
+// A `hf download --local-dir` tree keeps one sidecar per file at
+// `<local_dir>/.cache/huggingface/download/<name>.metadata`, three lines:
+// commit hash, etag, timestamp. That layout is the library's own -- see the
+// `huggingface_hub/_local_folder.py` module docstring, and
+// `read_download_metadata`, which parses the three back in that order into
+// `LocalDownloadFileMetadata.commit_hash`.
+//
+// Line 1 is the record this header needs, and the reason it is trustworthy is
+// that it is rewritten IN PLACE on every download:
+// `huggingface_hub/file_download.py` calls
+// `write_download_metadata(..., commit_hash=commit_hash, ...)` on all four
+// outcomes -- fresh download, copy out of the shared cache, LFS hash matched,
+// and the `local_metadata.etag == etag` early return that downloads nothing at
+// all. So after re-fetching a repo at a new revision, every file's sidecar names
+// the new one, including files whose bytes did not change.
+inline std::string HfLocalDownloadCommit(const std::filesystem::path& local_dir,
+                                         const std::string& name) {
+  std::ifstream in(local_dir / ".cache/huggingface/download" /
+                   (name + ".metadata"));
+  std::string line;
+  if (!std::getline(in, line)) return "";
+  while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+    line.pop_back();
+  }
+  return line;
+}
+
+// True when EVERY file staged directly in `local_dir` was downloaded at
+// `revision`. `why`, when non-null, receives the first thing that was wrong, so
+// the caller's skip banner can name it.
+//
+// WHY EVERY FILE AND NOT JUST `config.json`. The cheap version of this check
+// reads one sidecar, and one sidecar answers a question nobody asked: the
+// goldens depend on the WEIGHTS. `hf download <repo> config.json --revision B`
+// into a tree fetched at A leaves a config from B beside 52 shards from A, and
+// the reverse -- shards re-fetched at B under a config still recording A -- is
+// the substitution that matters and the one a config-only check cannot see. The
+// sweep costs 69 sidecar reads of ~130 bytes each against a 20.1 GiB checkpoint
+// the gate is about to load, so there is nothing to trade off.
+//
+// It is symmetric on purpose. A file with NO sidecar refuses just as a file with
+// the wrong one does, because otherwise substituting a shard would cost one `rm`
+// of its sidecar, and a foreign file dropped into the tree would carry no
+// provenance at all. Directories are skipped -- `.cache` is the bookkeeping
+// itself -- and a tree with no staged files refuses rather than passing
+// vacuously.
+inline bool HfLocalDirIsRevision(const std::filesystem::path& local_dir,
+                                 const std::string& revision,
+                                 std::string* why) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::directory_iterator end;
+  fs::directory_iterator it(local_dir, ec);
+  if (ec) {
+    if (why != nullptr) {
+      *why = "cannot list " + local_dir.string() + ": " + ec.message();
+    }
+    return false;
+  }
+  std::size_t checked = 0;
+  for (; it != end; it.increment(ec)) {
+    if (ec) {
+      if (why != nullptr) {
+        *why = "cannot list " + local_dir.string() + ": " + ec.message();
+      }
+      return false;
+    }
+    std::error_code kind;
+    if (!it->is_regular_file(kind) || kind) continue;
+    const std::string name = it->path().filename().string();
+    const std::string got = HfLocalDownloadCommit(local_dir, name);
+    if (got.empty()) {
+      if (why != nullptr) {
+        *why = name + " has no .cache/huggingface/download/" + name +
+               ".metadata, so nothing records which revision its bytes are";
+      }
+      return false;
+    }
+    if (got != revision) {
+      if (why != nullptr) {
+        *why = name + " was downloaded at revision " + got + ", not " +
+               revision;
+      }
+      return false;
+    }
+    ++checked;
+  }
+  if (checked == 0) {
+    if (why != nullptr) {
+      *why = "no files staged in " + local_dir.string();
+    }
+    return false;
+  }
+  return true;
+}
+
+// The Nemotron-3.5-Lightning gate model (#517), and the ONE resolver for it.
+//
+// Unlike the Qwen pins above, this one is NOT in the HF cache: it is staged on
+// the NAS as a `hf download --local-dir` tree at
+// `$CHECKPOINT_ROOT/nemotron-3.5-lightning-30b-nvfp4`, so there is no
+// `models--org--name/snapshots/<rev>` directory whose NAME carries the revision.
+//
+// LOW-3 (#517). Two env vars used to reach this same checkpoint --
+// `VT_NEMOTRON35_SNAPSHOT` here and `CHECKPOINT_ROOT` in
+// test_modelopt_mixed_precision_checkpoint.cpp -- and NEITHER enforced the
+// revision: the cache spelling above is unreachable for a `local_dir` tree, and
+// an env override is deliberately not revision-checked. So the pin named the
+// revision the goldens belong to and could not refuse a different one, which is
+// the exact failure `kQwen27NvfP4Revision` exists because of. Both spellings now
+// resolve HERE.
+//
+// GATE-SNAPSHOT-CONTENT-PIN (issue #569). LOW-3 first gated this arm on the
+// EXISTENCE of `<dir>/.cache/huggingface/trees/<revision>.json`, the manifest
+// `hf download --local-dir` writes per revision. That records "this revision was
+// downloaded into this directory once". It does not record "these bytes are that
+// revision", and DEMONSTRATED during review: a directory holding a different
+// model's `config.json`, whose own
+// `.cache/huggingface/download/config.json.metadata` named a different revision,
+// still resolved -- with the manifest an empty `touch`ed file and a decoy
+// manifest beside it changing nothing.
+//
+// The two records come apart, and huggingface_hub is explicit about why.
+// `_tree_cache.py` (1.23.0 / 1.24.0, the versions on the gate host that wrote
+// this tree; 1.7.2 here has no `trees` code at all) opens with "Because a commit
+// hash is immutable, its tree listing never changes and can be cached forever
+// WITHOUT ANY INVALIDATION LOGIC". `write_tree_cache` only ever `os.replace`s
+// `<commit>.json`, and no code path in the library removes one -- the string
+// `trees` appears exactly five times in it, all reads and path joins. So
+// manifests ACCUMULATE: re-download at a later revision and the pinned
+// revision's manifest is still sitting there, vouching for bytes that are no
+// longer it. The existence check could not have been salvaged; it is not a
+// weaker version of the right check, it is a check of a different fact.
+//
+// The per-file sidecar is the right fact and it does not accumulate -- see
+// `HfLocalDownloadCommit` above for the four call sites that rewrite it. The
+// manifest check is therefore REPLACED rather than kept as an extra term: as an
+// AND-term it can no longer refuse anything the sidecar sweep does not already
+// refuse, while it CAN refuse a good tree fetched by a huggingface_hub older
+// than 1.23, which writes sidecars and no manifest at all.
+//
+// Resolution order, in the order the code checks it, and why:
+//
+//  1. `VT_NEMOTRON35_SNAPSHOT`, when set and non-empty -> the explicit-directory
+//     escape `HfSnapshot` documents, with its semantics UNCHANGED, including
+//     that a set-but-wrong override refuses rather than falling back. First, so
+//     that setting it OVERRIDES `CHECKPOINT_ROOT` rather than racing it.
+//  2. Otherwise `CHECKPOINT_ROOT` -> `<root>/<kNemotron35LightningLocalDirName>`,
+//     and EVERY file staged there must record the pinned revision as the one it
+//     was downloaded at. This is the DEFAULT path every gate takes, so it is the
+//     one that has to carry the pin: a re-download of the same repo name lands a
+//     different revision under the identical path, and a gate that cannot tell
+//     would substitute it silently. Any mismatch => "" plus a reason in `why`
+//     => the caller's loud skip, never a substitution.
+//  3. Otherwise the ordinary HF cache layout, for a host that fetched it that
+//     way.
+//
+// Only (2) is revision-gated, deliberately: naming ONE directory outright is
+// the deliberate different-checkpoint run the override exists for, while naming
+// a ROOT is not.
+//
+// Absent both env vars => "" => the caller emits its loud SKIP, which is the
+// intended behavior off the gate host.
+//
+// `why`, when non-null, receives the reason for a "" -- an empty string when the
+// answer is non-empty. A token-exact gate that silently loaded the wrong
+// checkpoint is the failure this header exists to prevent, and a skip that says
+// only "not staged" gets re-run rather than investigated.
+inline std::string Nemotron35LightningSnapshot(std::string* why = nullptr) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (why != nullptr) why->clear();
+  const char* over = std::getenv("VT_NEMOTRON35_SNAPSHOT");
+  const char* root = std::getenv("CHECKPOINT_ROOT");
+  if ((over == nullptr || *over == '\0') && root != nullptr && *root != '\0') {
+    const fs::path dir = fs::path(root) / kNemotron35LightningLocalDirName;
+    if (!fs::exists(dir / "config.json", ec)) {
+      if (why != nullptr) *why = "no config.json under " + dir.string();
+      return "";
+    }
+    // Bound to a local rather than passed inline: tests/scripts/
+    // test_check_snapshot_pins.py asserts each `k*Revision` constant is followed
+    // by a comma EXACTLY once in this header, so that a pin cannot exist without
+    // an accessor resolving through it. That single use is the HfSnapshot call
+    // below, and it stays the single use.
+    const std::string want = kNemotron35LightningNvfP4Revision;
+    if (!HfLocalDirIsRevision(dir, want, why)) return "";
+    return dir.string();
+  }
+  const std::string resolved = HfSnapshot(
+      "models--nvidia--NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+      kNemotron35LightningNvfP4Revision, "VT_NEMOTRON35_SNAPSHOT");
+  if (resolved.empty() && why != nullptr) {
+    *why = std::string("neither VT_NEMOTRON35_SNAPSHOT nor CHECKPOINT_ROOT "
+                       "resolves a checkpoint at revision ") +
+           kNemotron35LightningNvfP4Revision;
+  }
+  return resolved;
 }
 
 // The 27B NVFP4 gate model, pinned to the goldens' revision.

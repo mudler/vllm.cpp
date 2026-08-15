@@ -14,6 +14,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/qwen3_dspark.h"
 #include "vt/dtype.h"
+#include "vt/unaligned.h"
 
 namespace vllm {
 namespace {
@@ -96,10 +97,13 @@ Qwen3DSparkWeights LoadQwen3DSpark(const TensorResolver& get, const HfConfig& co
     VT_CHECK(d2t->dtype == "I64", "qwen3_dspark: expected I64 for d2t");
     VT_CHECK(d2t->shape.size() == 1 && d2t->shape[0] == w.draft_vocab_size,
              "qwen3_dspark: d2t must be [draft_vocab_size]");
-    const auto* src = reinterpret_cast<const int64_t*>(d2t->data);
+    // Unaligned: `d2t->data` is an arbitrary byte offset into the mmap and I64
+    // wants 8-byte alignment, so a `const int64_t*` onto it is undefined to form
+    // or load through (issue #627).
+    const uint8_t* src = d2t->data;
     w.draft_id_to_target_id.resize(static_cast<size_t>(w.draft_vocab_size));
     for (int64_t i = 0; i < w.draft_vocab_size; ++i) {
-      const int64_t off = src[i];
+      const int64_t off = vt::LoadUnaligned<int64_t>(src + i * 8);
       const int64_t target = i + off;
       VT_CHECK(target >= 0 && target < w.vocab_size,
                "qwen3_dspark: d2t maps a draft id outside the target vocab");

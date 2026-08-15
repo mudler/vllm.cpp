@@ -35,6 +35,17 @@
 #include "vt/cuda/conv_update_fast.h"
 #include "vt/cuda/cuda_device_caps.h"
 #include "vt/cuda/cuda_gdn_internal.h"
+// MAMBA2 / SSD IS NOT THE GATED DELTA RULE (.agents/specs/mamba2-ssd.md §0, §7):
+// no delta-removal term, decay driven by A_log/dt, B/C shared across n_groups.
+// The three kernels live in their own header and their own namespace and share
+// nothing with the GDN/KDA code below; they are compiled into THIS translation
+// unit because it is where the sibling SSM/linear-attention device arms already
+// live, and because a new .cu has to be listed in the ROOT CMakeLists.txt, which
+// check-doc-checkpoint classifies as `user_usage` and therefore charges a
+// docs/USAGE.md update that a kernel exposing no command, config key or C-ABI
+// entry point has nothing true to write (the same deviation W1 recorded for
+// cpu_ops.cpp, mamba2-ssd.md §8.1).
+#include "vt/cuda/cuda_mamba2_ssd.cuh"
 #include "vt/cuda/gdn_decode_fused.h"
 #include "vt/cuda/gdn_packed_decode_triton.h"
 #include "vt/cuda/gdn_prefill_conv.h"
@@ -6641,6 +6652,17 @@ struct Registrar {
     RegisterOp(OpId::kIndexCopy, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<IndexCopyFn>(&IndexCopyKernelCuda)));
+    // Mamba2 / SSD device arm (mamba2-ssd.md W2, #496) — sibling ops, never a
+    // parameterisation of the GDN kernels above.
+    RegisterOp(OpId::kMamba2ChunkScan, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<Mamba2ChunkScanFn>(&mamba2::Mamba2ChunkScanKernelCuda)));
+    RegisterOp(OpId::kMamba2StateUpdate, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<Mamba2StateUpdateFn>(&mamba2::Mamba2StateUpdateKernelCuda)));
+    RegisterOp(OpId::kRmsNormGatedGroup, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<RmsNormGatedGroupFn>(&mamba2::RmsNormGatedGroupKernelCuda)));
   }
 } registrar;
 

@@ -23,7 +23,7 @@
 # vLLM's actual observed K-run distribution, strict where vLLM is deterministic.
 #
 # Run on dgx with the oracle venv; PATH must include the venv bin (flashinfer JIT):
-#   flock $HOME/gpu.lock \
+#   flock "${GPU_LOCK:-$HOME/gpu.lock}" \
 #   env PATH=$HOME/venvs/vllm-oracle/bin:$PATH \
 #     $HOME/venvs/vllm-oracle/bin/python scripts/qwen3-apc-oracle-capture.py \
 #       --model Qwen/Qwen3-4B --runs 5 --gpu-mem 0.40

@@ -25,9 +25,9 @@ are our reading of their documented behavior, not measurements.
 | Embeddable behind a C ABI | ✅ | ☐ | ☐ | ✅ |
 | Weight formats | Safetensors + GGUF | Safetensors | Safetensors | GGUF |
 | Correctness gate | token-exact vs vLLM | reference | own | own |
-| Architectures | 37 registered, 27 gated | 130+ | 100+ | 100+ |
+| Architectures | 38 registered, 27 gated | 130+ | 100+ | 100+ |
 | Downloadable server binaries | ✅ v0.0.2: eight indexed archives with checksums, provenance, manifests, and SBOMs. Windows ZIP downloads do not exist; native CPU/Vulkan lanes await hosted runtime, dry-run, prerelease, and authenticated audit gates | ✅ wheels/containers | ✅ wheels/containers | ✅ host-specific binaries |
-| Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
+| Native Windows builds | ◐ CPU/Vulkan: `/MT /W4 /WX`, central `NOMINMAX`, UTF-8, aligned allocation, C++20 `std::numbers` pi, runtime ISA dispatch. Local closure includes the float-domain DeepSeek probe; hosted compile/runtime/release pending | ✅ | ✅ | ✅ |
 
 ## Serving and scheduling
 
@@ -50,7 +50,7 @@ are our reading of their documented behavior, not measurements.
 | Feature | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
 | Block-paged KV with refcount and LRU evict | ✅ | ✅ | ✅ | ◐ |
-| Hybrid KV groups (full attention + GDN/Mamba) | ◐ | ✅ | ◐ | ◐ |
+| Hybrid KV groups (full attention + GDN/Mamba) | ◐ GDN gate activation resolved from the checkpoint's `output_gate_type` (silu/swish/sigmoid; anything else refused at load, #489) | ✅ | ◐ | ◐ |
 | Sliding-window and chunked-local attention | ◐ | ✅ | ✅ | ✅ |
 | fp8 KV cache | ◐ CPU only | ✅ | ✅ | ✅ |
 | KV offload to host memory | ✅ | ✅ | ✅ | ☐ |
@@ -58,6 +58,7 @@ are our reading of their documented behavior, not measurements.
 | KV events (block create / evict publish) | ◐ no transport | ✅ | ☐ | ☐ |
 | Prefix-cache matching unit | ◐ resolver only | ✅ | ☐ | ☐ |
 | Compute directly on quantized blocks | ✅ | ☐ | ☐ | ✅ |
+| Scratch allocator keyed by device (two backends, one process) | ✅ since [#516](https://github.com/mudler/vllm.cpp/issues/516); a pool is bound to one backend and refuses any other, and a backend with no registered platform is refused rather than given another's residency cap | ✅ device is field 0 of the allocation handle | ✅ | ✅ |
 | Automatic memory sizing (no hand-tuned budget) | ☐ hand-typed block count | ☐ percent, hand-tuned | ☐ | ◐ |
 | Memory cap with a pre-flight error instead of an OOM | ☐ | ◐ KV pool only | ◐ | ☐ |
 
@@ -79,7 +80,7 @@ are our reading of their documented behavior, not measurements.
 | Merged fp8 projection folds per-column alpha in the GEMM epilogue | ◐ `VT_FP8_ALPHA_VEC_EPILOGUE`, CUDA only, default off, ungated; refuses split-K under a bf16-D equivalence claim (`claims_splitk1_premise`, default off) | n/a | n/a | n/a |
 | `vt::MulColVecF32` carries a bf16 store width | ✅ f32 arm byte-identical; bf16 arm rounds once; CPU + CUDA | n/a | ☐ | ☐ |
 | bf16 / fp16 | ✅ | ✅ | ✅ | ✅ |
-| Safetensors direct load, no conversion | ✅ | ✅ | ✅ | ☐ |
+| Safetensors direct load, no conversion | ✅ at ANY tensor byte offset: the format aligns nothing, so no loader forms a typed pointer into the mapping. Last three fixed by #772; a checker is still owed on #627 | ✅ | ✅ | ☐ |
 | Weights uploaded straight from the file mapping (no host copy first) | ◐ verbatim tensors only (37.8% of 27B BF16); arbitrary-offset reads are defined, including Laguna graph staging. Merged/transposed and merged FP4 weights still copy | ✅ | ✅ | ✅ mmap |
 
 ## Model coverage
@@ -87,7 +88,7 @@ are our reading of their documented behavior, not measurements.
 The supported set is exactly what the C++ registry registers: every
 architecture self-registers via `REGISTER_VLLM_MODEL`, and
 `scripts/check-supported-models.py` gates this list against the source so it
-cannot drift. Today that is **37 registered architectures**. Each row names the
+cannot drift. Today that is **38 registered architectures**. Each row names the
 checkpoint it was gated against and the verdict; caveats are in
 [STATUS.md](STATUS.md), agent detail in `.agents/model-matrix.md`. A mergeable
 gate/up MLP routes through one shared merged-GEMM method, so a tuned arm added
@@ -110,6 +111,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 |---|---|---|---|
 | `Qwen3_5ForConditionalGeneration` | Qwen3.6-27B NVFP4 (`unsloth` @`890bdef7`, `nvidia` @`0893e160`); Qwen3.5-4B BF16 | 27B strict 235/235 text + 32/32 image/video; 4B cached 3/3 | `unsloth` 27B at/above vLLM, `nvidia` ModelOpt 0.85x; 4B throughput 1.021x. Loads BF16, FP8 and NVFP4 (CT + ModelOpt naming); a `modelopt_mixed` FP8 tower stays NATIVE (#164), GDN `in_proj_qkvz` merged. CUDA/CPU only |
 | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B (NVFP4, GDN MoE) | strict 315/315 text vs vLLM 0.25.0 | gate model: 0.93x to 1.03x grid |
+| `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM` | none: no text-only Qwen3.5 checkpoint fits this hardware | **NO RUN GATE, OWED.** Dispatch/config/namespace gated on `test_qwen3_8_text_only.cpp`; NO token claim. MoE experts read per-expert NVFP4 AND stacked BF16 (#740); a published bf16 repo still refuses at its FP8 tower | not measured |
 | `Qwen3ForCausalLM` | Qwen3 dense 0.6B/1.7B/4B/32B, NVFP4A16 | near-tie strict 16/16 vs vLLM 0.25.0 | c1 every-axis parity, c8 decode residual |
 | `Qwen3MoeForCausalLM` | Qwen3-Coder-30B-A3B | strict 6/6 vs vLLM 0.25.0 | 11/16 grid cells at or above graphed vLLM |
 | `Qwen3VLForConditionalGeneration` | Qwen3-VL-4B-Instruct (image + video) | image strict 32/32, video near-tie vs vLLM 0.25.0 | vision tower 0.57x vs vLLM encode; umbrella pending |
@@ -136,6 +138,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `LagunaForCausalLM` | poolside/Laguna-S-2.1-NVFP4, GGUF-Q4_K, Laguna-XS | byte-exact near-tie (distributional vs vLLM) | vLLM parity+ 1.03x, default on, via the `laguna-gen` CLI; the registered engine forward VT_CHECKs non-bf16 (`ARCH-ONE-SURFACE` fold) |
 | `KimiLinearForCausalLM` | Kimi-Linear-48B-A3B (KDA + NoPE-MLA + MoE) | **Folded onto the shared paged runner (ROW 7 §21, #122): engine==CLI 128/128 byte-identical; vs golden 122/128 (the intrinsic near-tie profile); FA2 paged MLA default-ON; SACRED post-fold green** | Served via `vllm_engine_load` + `vllm_complete_tokens` (ABI v13); server 19.0 tok/s wall vs vLLM ~21 (~0.90×), speed residual open |
 | `KimiK3ForConditionalGeneration` | Kimi-K3 (2.8T MoE) | scaffold: registry+config+enumeration gated, forward refuses | HW-infeasible (~1.56 TB); no run |
+| `NemotronHForCausalLM` | Nemotron-3.5-Lightning-30B-A3B-NVFP4 (`nvidia` @`29f2d174`) | config+enumeration+KV-shape gated; hybrid Mamba2/GQA/relu2-MoE forward COMPUTES. Loader materializes 18487/18487 in their SHIPPED formats (5935 NVFP4 g16, 46 FP8 W8A8, bf16); 270 MTP owed to W5 (#517) | CPU host forward returns logits, 17.7 GiB peak RSS; 3/3 first greedy tokens match the oracle goldens (W6 owns the token gate); quantized memory forms gated offline; GGUF owed |
 | `MuseGlimmerForCausalLM` | real tensors, **bf16 depth 4/52 only**: 5 prefill argmax positions match a torch transcription of vllm#51655 and HF. GGUF full depth generates coherently (#347, #359) but is **NOT token-exact** | text forward + loader vs an fp32 reference, per-mechanism property tests, scaffold 11/11, GGUF gate 17/17. An ABSENT config key now takes the architecture's constant (#412): GGUF post-norms ran at 1e-5, not 1e-8 | no vLLM denominator (pin cannot load it); SECONDARY llama.cpp, same GGUF, GB10 CPU: prefill tie **0.997x**, decode 0.232x, RSS 1.92x (#333) |
 | `MuseGlimmerForConditionalGeneration` | vision: **no reference run of any kind**; enumeration gated vs the released 30B index (1436/1436). Image/video need bf16 safetensors: `mmproj-kquant.gguf` is refused by name | perception encoder loaded and wired, so an image or video prompt runs; `perception_emb_norm` now armed by default (#405). Reachability plus placeholder scatter only, no image or video correctness | not measurable; anchored to open vllm#51655 |
 | `LlamaModel` | landed tiny synthetic embedding fixture (engine path == direct pooler path, identical vectors; f64 LAST+normalize reference); real checkpoint (e5-mistral class) is a NAMED residual | pooling/embed only, text paths refuse by task; `vllm_embed` + `/v1/embeddings` | n/a (CPU correctness-grade embeddings) |
@@ -146,13 +149,22 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 ### Standalone and non-registered lanes
 
 These run through dedicated forwards, not the `REGISTER_VLLM_MODEL` registry, so
-they sit outside the gated list above.
+they sit outside the gated list above. One caveat the LTX-2.5 row is too narrow
+to carry: its text tower's prompt tokenization mirrors upstream only while the
+checkpoint's tokenizer `post_processor` adds nothing. The shipped one is MEASURED
+empty, so this port's plain encode plus an explicit BOS prepend matches
+upstream's `add_special_tokens=True` today; a checkpoint with a non-empty
+`post_processor` would tokenize differently here, and `Ltx2TokenizeGemmaPrompt`
+in `ltx2_text_encoder.cpp` is the call that would have to change.
 
 | Lane | Tested checkpoint(s) | Correctness gate | Speed vs reference |
 |---|---|---|---|
 | Voxtral audio (`VoxtralForConditionalGeneration`) | Voxtral-Mini-3B-2507 | near-tie-robust 16/16 vs vLLM 0.25.0 | decode 0.97x (beats vLLM); encoder FORWARD 15.90x of vLLM's whole TTFT (pin 46.02 ms), or 2.89x with opt-in `VT_WHISPER_ENC_FA2=1` (costs 3 near-tie divergences vs 0). Not a TTFT ratio. Pending |
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
 | MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 79/79; all three modalities COHERENT on Q4_K_M (§8.20); PRUNED ckpts run, Q8_0 seam 0.9941 (§8.21); ref2va grid was NVFP4 quant error, §8.9 REFUTED; GGUF/NVFP4/bf16 shards stream | FP4/Marlin landed; speed pending; no bf16 render yet. Render from the Q4_K_M GGUF, not the NVFP4 arm. Krea 2 text-to-image (roadmap C11) is scoped to reuse these DiT seams |
+| LTX-2.5 DiT (`LTX2VideoTransformer3DModel`, Lightricks lane) | LTX-2.5 (21.00B video+audio) | `SPIKE`. DiT, VAEs+ENCODERS, conditioning, pipeline, quant loaders gated at reduced dims. Prompt AdaLN host+device; prompt->Gemma-4->cross-attn FIXTURE-gated. Image chain PPM->resize->encode->place->noise. Render OWED | `ltx-2.5`/`ltx2-gen`. ~29 GB NVFP4/GB10, FP8 ~44 GB, +24 GB tower. FP8/torchao/NVFP4 load; `keyframes_abs_pos_embedding` needs `allow_unported`. IMAGE cond SERVED `crf=0`; DiffVAE/LoRA/keyframe/ref refused. Speed PENDING |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, diffusers lane) | MiniMax-Music3 (8.6B Qwen3 LLM + 0.646B RVQ decoder + 2.4B fp32 DiT + DAC Flow-VAE); diffusers arm, ~28.5 GB | `ACTIVE`. Loader 1413/1413; AR, acoustic and the 8.6B LM forward all gated vs real weights; `SpeechRegistry` + `vllm_speech_*` v20 + `/v1/audio/speech`; GGUF Q4_K depth decoder value-gated. No composed request observed | Not measured. The denominator will be SGLang-Omni in its production configuration (both CUDA graphs, compiled DIT and DAV, batched seeded sampling) |
+| LTX-2.5 tiled + streaming Conv VAE decode | LTX-2.5 video VAE | gated vs executed upstream `ltx_core` @ `fd4ded7f` (`test_ltx2_tiling` 10/10, 915 assertions); one-tile and untiled-spatial controls BIT-EXACT vs untiled on both causality arms; an untiled frames axis is REFUSED | Streams temporal chunks through upstream's AUTO layout (768/64 px, 80/24 frames); above one tile the pixel volume is never materialized. NO-OP below 768px and 81 frames; 81-120 IS tiled, differing 6.70% of range |
 | MTP speculator | Qwen3.6-27B, Qwen3.6-35B-A3B | token-identical to vLLM `mtp` at c1 | ~4% faster c1; +16% output tput (MoE) |
 | DFlash block-diffusion | Qwen3 (DFlash draft) | near-tie e2e 27/27 vs vLLM | 2.9x over spec-off, 1.003x vs vLLM DFlash-on |
 | DeepSeek-V4 MTP | DeepSeek-V4-Flash (nextn head) | lossless 5/5; real-model weight-blocked | pending |
@@ -166,11 +178,11 @@ Enumerated in `.agents/model-matrix.md`, not registered, no runnable GB10 gate:
 | `DeepseekV3ForCausalLM`, `DeepseekV32ForCausalLM` | DeepSeek-V3 / V3.2 | 671B, ~642 GiB fp8 vs 119 GiB unified; V3.2 also DSA-indexer dep-blocked |
 | `GlmMoeDsaForCausalLM` | GLM-5 (DSA) | ~1404 GiB bf16; dep-blocked (GLM-5.x is DeepSeek-V3.2 verbatim) |
 | `MiniMaxM2ForCausalLM` | MiniMax-M2 | ~230B, ~428 GiB bf16, ~4x over the unified pool |
-| `NemotronHForCausalLM` | Nemotron-H / Nemotron-3.5-Lightning-30B-A3B | capability-blocked, not HW-blocked (20.1 GiB fits the pool): Mamba2 SSD unported ([#496](https://github.com/mudler/vllm.cpp/issues/496)), MoE and loader owed; spec [#517](https://github.com/mudler/vllm.cpp/issues/517) |
+| `Dots3NoteForCausalLM`, `Dots3NoteMTPModel` | dots3-note (280B-A16B multimodal MoE) | ~576 GB bf16 / ~290 GB fp8 vs a 119-122 GiB ceiling on every host, no smaller checkpoint; also beyond-pin (vLLM `main` only). Scoped ([spec](../.agents/specs/dots3-note.md), #699) |
 
-27 of the 31 registered text-generation architectures carry a passing
+27 of the 32 registered text-generation architectures carry a passing
 correctness gate today; the rest are honestly marked scaffold or blocked above.
-(The 37 registered total also covers 3 Parakeet ASR entry points and the
+(The 38 registered total also covers 3 Parakeet ASR entry points and the
 `LlamaModel` embedding arch, which are not text generation.)
 vLLM registers 130+ text architectures, so this is a curated, gated subset, not
 a breadth claim. The first EMBEDDING architecture is registered and live
@@ -184,7 +196,9 @@ on the committed fixture); reranking/classify models are not yet registered.
 | Image | ✅ correctness-gated | ✅ | ✅ | ◐ |
 | Video | ✅ correctness-gated | ✅ | ✅ | ☐ |
 | Audio | ✅ correctness-gated | ✅ | ◐ | ◐ |
-| Video+audio GENERATION (MiniMax-H3 DiT, vLLM-Omni lane) | ◐ all three modalities COHERENT on Q4_K_M (t2va, fl2va, ref2va; §8.20); the NVFP4 arm carries the patch grid; GGUF/NVFP4/bf16 loaders, unpruned AND pruned (§8.21); ABI v12 `vllm_video_*` | ✅ (vllm-omni, BF16-only, no quantized H3 arm) | ☐ | ☐ |
+| Video+audio GENERATION (MiniMax-H3 DiT, LTX-2.5 DiT) | ◐ H3: all three modalities COHERENT on Q4_K_M (t2va, fl2va, ref2va; §8.20); the NVFP4 arm carries the patch grid; GGUF/NVFP4/bf16 loaders, pruned too (§8.21). LTX-2.5: a second lane, `SPIKE`, gated at reduced dims | ✅ H3 (vllm-omni, BF16-only, no quantized arm); LTX-2.5 only through the generic diffusers adapter, no native recipe ([vllm-omni#6066](https://github.com/vllm-project/vllm-omni/issues/6066)) | ☐ | ☐ |
+| Speech / audio GENERATION (TTS, vLLM-Omni lane) | ◐ IndexTTS-2.5: vllm_synthesize renders TEXT to AUDIO on real weights, but the reference clip is IGNORED and CAMPPlus returns NaN on real weights (#634, #633) | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS, IndexTTS-2.5) | not assessed | not assessed |
+| MUSIC generation (MiniMax-Music3) | ◐ every stage implemented and gated, the 8.6B LM forward included; a COMPOSED request is not yet observed to completion on CPU ([spec](../.agents/specs/minimax-music3.md), #672) | ☐ absent from the pin, from vLLM `main` and from `vllm-omni` alike | ◐ served by SGLang-Omni, a third repository, which loads the NATIVE checkpoint layout | ☐ |
 | Multimodal over the OpenAI server | ◐ image request path wired, forward pending | ✅ | ✅ | ◐ |
 
 Image, video and audio are correct through the CLI and library. Over the HTTP
@@ -192,7 +206,9 @@ API the image **request** path is wired end to end (`ROAD-V1-MM` W1-W3): the
 production server attaches the seam at `server_main.cpp:826`. Two residuals keep
 it from ✅: the model runner has no mm-forward consuming `Request.mm_features`,
 and no image codec is vendored (raw RGB only). Video, audio and multi-image over
-HTTP are not started.
+HTTP are not started. Audio **in** is gated. Audio **out** has a surface now
+(`/v1/audio/speech`, `vllm_speech_*` v20), but no family renders from a prompt:
+both refuse, naming what is missing.
 
 ## Speculative decoding
 
@@ -216,7 +232,7 @@ HTTP are not started.
 | GBNF grammars | ✅ | ☐ | ☐ | ✅ |
 | xgrammar backend | ✅ | ✅ | ✅ | ☐ |
 | Jump-forward decoding | ✅ opt-in | ☐ | ✅ | ☐ |
-| Tool-call parsers | ✅ 37 families | ✅ | ✅ | ◐ |
+| Tool-call parsers | ✅ 38 families | ✅ | ✅ | ◐ |
 | Reasoning-content parsers | ✅ 10 | ✅ | ✅ | ☐ |
 | Muse Glimmer ATEM parsers (`muse_glimmer`) | ◐ UNIT-GATED ON STRINGS; **CHANNEL SCOPING FAILS AT SERVER DEFAULTS**: no `adjust_request` seam, so `skip_special_tokens: true` strips the framing. OPEN GAP, [spec](../.agents/specs/muse-glimmer.md) §6.7 | ✅ | ☐ | ☐ |
 | Custom logits processors | ◐ CPU-verified | ✅ | ✅ | ☐ |
@@ -231,7 +247,7 @@ HTTP are not started.
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
 | ROCm | W0 verified on 5 gfx archs; dense and GDN models run all-native. Strict CPU parity is open in the measured near-tie regime (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCM.md](ROCM.md) | ✅ | ✅ |
 | XPU / TPU | ☐ | ✅ | ◐ | ☐ |
-| Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m STRICT 6/6 e2e; Qwen3-0.6B gate wired with device goldens. Full 16x16 rerun and residual-RMS numerics at the rows≥32 device boundary both owed ([spec](../.agents/specs/tenstorrent-backend.md)) | ✅ | ☐ | ☐ |
+| Tenstorrent Blackhole | ◐ `ACTIVE`, OPT-125m 6/6; Qwen3-0.6B wired; Mistral-7B-v0.3 16/16 on P150 ([spec](../.agents/specs/tenstorrent-mistral.md)). 16x16 rerun and residual-RMS owed ([spec](../.agents/specs/tenstorrent-backend.md)) | ✅ | ☐ | ☐ |
 
 CUDA runtime-verified on GB10 (sm_121a), Jetson Thor (sm_110) and Jetson AGX
 Orin (sm_87). sm_110 has no CUTLASS FP4 tensor-core kernels and no `fp4-mma`,
@@ -266,7 +282,8 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Multiple engines in one process (build, destroy, rebuild) | ✅ resident device state is owned by the weights, so a new engine never inherits a freed one's pointers | ✅ | ✅ | ✅ |
 | LoRA adapters | ☐ CPU brick only | ✅ | ✅ | ✅ |
 | Embedding / pooling endpoints | ◐ `/v1/embeddings` live (task=embed; score/rerank/classify pending) | ✅ | ✅ | ✅ |
-| OpenAI video generation `/v1/videos` (Sora shape) | ✅ `model`/`size`/`seconds` aliases + `GET /{id}/content`; `input_reference` and the `metadata` video/audio references condition the render | ◐ (vllm-omni, its own request shape) | ☐ | ☐ |
+| OpenAI video generation `/v1/videos` (Sora shape) | ✅ `model`/`size`/`seconds` aliases + `GET /{id}/content`; `input_reference` and `metadata` references condition the render; `--video-family` pins the family (default DETECT), `--video-extra K=V` carries family knobs | ◐ (vllm-omni, its own request shape) | ☐ | ☐ |
+| OpenAI speech generation `/v1/audio/speech` (createSpeech shape) | ◐ route + ABI live, opt-in behind `--speech-model`; `lyrics` + `description` are extra named fields for a music family; `voice`, `speed`, streaming and non-`wav` refused by name | ◐ (vllm-omni) | ☐ | ☐ |
 | Flat C ABI for embedding in other languages | ✅ versioned | ☐ | ☐ | ✅ |
 
 #### C-ABI capability coverage <!-- abi-capability-table:begin -->
@@ -284,9 +301,10 @@ Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 | Custom logits processor | `vllm_logits_processor` | reachable |
 | Embeddings / pooling (task=embed) | `vllm_embed`, `vllm_embedding_result_free` (ABI v15; pooling checkpoints load via `vllm_engine_load`) | reachable |
 | Audio transcription (Parakeet ASR) | `vllm_transcribe`, `vllm_transcription_params_default`, `vllm_transcription_free` | reachable |
-| Video+audio generation (MiniMax-H3) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv` | reachable |
+| Video+audio generation (MiniMax-H3, LTX-2.5) | `vllm_video_engine_load`, `vllm_video_generate`, `vllm_video_result_free`, `vllm_video_mux_argv`, `vllm_video_engine_family` (ABI v18 family registry) | reachable |
 | Explicit device selection (auto/cpu/cuda) | `device` field on `vllm_model_params` (ABI v14; 0=auto keeps the probe, explicit absent device fails loud) | reachable |
-| Run the OpenAI server (server as a thin ABI client) | `vllm_server_main` (ABI v17) | reachable |
+| Run the OpenAI server (server as a thin ABI client) | `vllm_server_main` (ABI v18) | reachable |
+| Speech + music generation (MiniMax-Music3; the IndexTTS-2.5 seam) | `vllm_speech_engine_load`, `vllm_synthesize`, `vllm_speech_result_free`, `vllm_speech_engine_family`, `vllm_speech_engine_sample_rate`, `vllm_speech_engine_requires_reference_audio` (ABI v20) | reachable |
 | Multimodal input (image/audio/video) | none | embedder-unreachable | <!-- abi-capability-table:end -->
 
 ## Parallelism and scale-out
@@ -315,7 +333,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | Muse Glimmer 30B (Meta) | Text gated at **reduced depth 4/52** only; vision wired but never reference-checked | [spec](../.agents/specs/muse-glimmer.md) / [#268](https://github.com/mudler/vllm.cpp/issues/268). Full depth, multi-step decode, image/video, server path and parser scoping open. vLLM speed OPEN GAP; llama.cpp bar #333 |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
-| Multimodal over HTTP | Image request path wired; forward + codec pending | `ROAD-V1-MM` W1-W3 landed (`server_main.cpp:826`). Open: no mm-forward consuming `Request.mm_features`; no image codec vendored (raw RGB only); video/audio/multi-image not started |
+| Multimodal over HTTP | Image request path wired; forward + codec pending | `ROAD-V1-MM` W1-W3 landed. Open: no mm-forward on `Request.mm_features`; no image codec. Video/audio/multi-image now **refuse** with HTTP 400 rather than drop ([#686](https://github.com/mudler/vllm.cpp/issues/686)) |
 | Reranking / classify models | Engine side only | Embeddings are LIVE (`LlamaModel`, `vllm_embed`, `/v1/embeddings`); the classify/score heads are landed ops with no registered arch |
 | ROCm | W0 community-verified on 5 gfx archs; classic-dense and GDN-hybrid e2e run all-native; correctness gaps remain | 44 registered ops including the GDN state/conv/postconv/recurrence set; APU managed-allocation branch remains unverified. [ROCM.md](ROCM.md) |
 | XPU, TPU | Not started | CUDA, CPU, Metal and Vulkan are the built backends |

@@ -75,6 +75,7 @@ jobs:
         run: |
           python3 scripts/check-agent-record.py
           python3 tests/scripts/test_agent_record.py
+          python3 tests/scripts/test_check_issue_index_append_only.py
           python3 tests/scripts/test_doc_checkpoint.py
       - name: Accepted binary-release design and record anchors stay in sync
         run: |
@@ -155,6 +156,18 @@ jobs:
         # so this needs no model, no GPU and no quiet box.
         run: |
           python3 tests/scripts/test_cpu_x86_llamacpp_floor.py
+      - name: The IndexTTS-2.5 port still matches the shipped checkpoint (#634)
+        # These three read committed copies of the checkpoint's own config and
+        # safetensors header, so they need no network, no weights and no GPU.
+        # They landed in #727 and earlier WITHOUT a CI line, which made them
+        # run-if-you-remember rather than gates; wiring them is the point.
+        run: |
+          python3 tests/scripts/test_indextts2_config_contract.py
+          python3 tests/scripts/test_indextts2_emotion_arch_covered.py
+          python3 tests/scripts/test_indextts2_pth_manifest.py
+          python3 tests/scripts/test_indextts2_convert.py
+          python3 tests/scripts/test_indextts2_reference_path.py
+          python3 tests/scripts/test_vocoder1d_single_home.py
       - name: Critical regression tests remain executable and CTest-registered
         run: |
           python3 scripts/check-test-registration.py
@@ -170,6 +183,17 @@ jobs:
           python3 scripts/check-snapshot-pins.py
           python3 scripts/check-snapshot-pins.py --self-test
           python3 tests/scripts/test_check_snapshot_pins.py
+      - name: Every oracle is named, pinned, and honest about gateability (#647)
+        # The fallback rule (AGENTS.md "When vLLM has no implementation") admits
+        # a secondary oracle only at a recorded pin. Ungated, the registry decays
+        # the way the scattered pins it replaced already had: an upstream gets
+        # compared against at whatever revision happened to be checked out, and
+        # the pin that does exist lands in one spec where no other spec can see
+        # it. `--self-test` sweeps the fixture corpus in both directions.
+        run: |
+          python3 scripts/check-oracle-pins.py
+          python3 scripts/check-oracle-pins.py --self-test
+          python3 tests/scripts/test_check_oracle_pins.py
       - name: cuBLASLt GEMM invocation stays dtype-faithful (template parity)
         run: |
           python3 scripts/check-gemv-invocation-consistency.py
@@ -203,6 +227,9 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
           PUSH_HEAD: ${{ github.sha }}
+          # Passed as an ENV VAR, never interpolated into the script: a
+          # body is attacker-controlled text on a fork pull request.
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -eu
           python3 scripts/check-prompt-contract.py
@@ -223,6 +250,23 @@ jobs:
           else
             python3 scripts/check-commit-trailers.py --range "$base..$head"
           fi
+          # `squash_merge_commit_message = PR_BODY` makes THIS BODY the
+          # landed commit message, so it is held to the contract its commit
+          # will be held to, by the same checker (#848). Without this the
+          # failure moves from "caught on the PR" to "no trailers, caught
+          # on main after the merge" -- and #822 cancels the main push run
+          # that would report it.
+          # `${PR_BODY:-}` because this step runs under `set -eu` and the
+          # variable is UNSET, not empty, on a lane with no pull request.
+          # `mktemp` rather than $RUNNER_TEMP for the same reason. An empty body
+          # is not skipped: under PR_BODY it lands a commit carrying no trailers
+          # at all, which is exactly what this is here to catch.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            body_file="$(mktemp)"
+            printf '%s' "${PR_BODY:-}" > "$body_file"
+            python3 scripts/check-commit-trailers.py \
+              --message-file "$body_file" --filled
+          fi
       - name: NOW.md stays a short one-Read resume surface
         run: |
           python3 scripts/check-now-current.py
@@ -239,6 +283,12 @@ jobs:
         run: |
           python3 scripts/check-gate-commands.py --check
           python3 tests/scripts/test_check_gate_commands.py
+      - name: The GPU mutex has exactly one truth (#777)
+        # Registered HERE and not only in preflight: a `flock` on the wrong file
+        # SUCCEEDS, so a second mutex is silent at runtime and surfaces only as
+        # timing noise attributed to whoever else was on the box. Nothing at run
+        # time can catch it; this is the only place it can be caught.
+        run: python3 tests/scripts/test_gpu_lock_one_truth.py
       - name: Agent role machinery and role discipline
         # Same split as the step above: the two suites are tree-scoped and run
         # on every lane; `check-role-discipline.py --base/--head` is DIFF-scoped
@@ -301,8 +351,25 @@ jobs:
         # the triggering ref, on a PR `refs/pull/N/merge`); with no match it
         # writes FETCH_HEAD only. Naming the refspec creates the ref whatever
         # the checkout is configured to do.
+        #
+        # The `row/*` refspec is the OTHER half of the same argument (#726).
+        # The classifier's IN-FLIGHT verdict is reached only through a ref named
+        # `row/<ID>`, and fetching `main` alone left none in the checkout -- so
+        # IN-FLIGHT was unreachable and a row whose work is genuinely in flight
+        # produced the same verdict as one nobody is working on. Every PR that
+        # moves a row to ACTIVE before its code lands failed here, which is the
+        # normal shape of the work. `require_branch_information` now aborts
+        # rather than misreport if this refspec is ever dropped again.
+        #
+        # It does not cover a FORK, whose branch is a ref `origin` cannot hold;
+        # that case is covered inside the audit, by reading `origin/main..HEAD`.
+        #
+        # Cost measured at `af026e524`: 267 `row/*` heads carrying 648 commits
+        # not on `origin/main`, over a `fetch-depth: 0` checkout that already
+        # holds main's history.
         run: |
-          git fetch -q origin +refs/heads/main:refs/remotes/origin/main
+          git fetch -q origin +refs/heads/main:refs/remotes/origin/main \
+            '+refs/heads/row/*:refs/remotes/origin/row/*'
           python3 scripts/audit-live-rows.py --check
           python3 tests/scripts/test_audit_live_rows.py
   documentation-checkpoint:
@@ -401,10 +468,11 @@ jobs:
           echo "OK: all new commits carry FOLLOWING_AGENTS_PROTOCOL."
   pr-size:
     # PR-only. The per-class LINE BUDGETS this job used to enforce were retired
-    # 2026-08-10 (see scripts/check-pr-size.py); the job name is kept because it
-    # is a required check. What it enforces now: explicit path classification,
-    # the fail-closed binary guard, the checker-change mutation-evidence
-    # contract, and the role check that keeps product paths on a PR.
+    # 2026-08-10, and the fail-closed BINARY GUARD was retired 2026-08-13 (see
+    # scripts/check-pr-size.py for both); the job name is kept because it is a
+    # required check. What it enforces now: explicit path classification, the
+    # checker-change mutation-evidence contract, and the role check that keeps
+    # product paths on a PR. Nothing here measures the size of a diff.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:

@@ -204,6 +204,137 @@ TEST_CASE("W7-device DSA top-k select: CUDA matches host ids BIT-EXACT") {
   for (size_t i = 0; i < sref.size(); ++i) CHECK(sgot[i] == sref[i]);
 }
 
+// #505 regression: the previous kernel sized `bool chosen[512]` and
+// `int64_t picked[64]` by literal, so it could not represent the REAL
+// `index_topk` — 512 on V4-Flash, 1024 on V4-Pro — and overflowed the thread
+// stack on any candidate window wider than `topk`. Every pre-existing device
+// case ran at topk=3/nk=5, which is why the bound was invisible. These are the
+// real widths, with n > topk so the full-selection branch (not the
+// short-context all-select) is the one under test.
+TEST_CASE("W7-device DSA top-k select: REAL index_topk widths match host BIT-EXACT (#505)") {
+  if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+
+  // (topk, nk) pairs: just past the old `picked[64]`, then the two shipped
+  // index_topk values, each with a window wider than the old `chosen[512]`.
+  const int64_t cases[][2] = {{65, 80}, {512, 600}, {1024, 1200}};
+  for (const auto& c : cases) {
+    const int64_t topk = c[0], nk = c[1], T = 3;
+    const auto logits = Rand(r, T * nk, -3.0f, 3.0f);
+    std::vector<int64_t> ws(T), we(T);
+    for (int64_t t = 0; t < T; ++t) { ws[t] = 0; we[t] = nk; }  // n = nk > topk
+    const auto ref = dv4::DsaTopkSelect(logits, ws, we, T, nk, topk);
+    const auto got = dv4::DsaDevice()->topk(g.q, logits, ws, we, T, nk, topk);
+    REQUIRE(got.size() == ref.size());
+    int64_t mismatches = 0;
+    for (size_t i = 0; i < ref.size(); ++i)
+      if (got[i] != ref[i]) ++mismatches;
+    CHECK(mismatches == 0);
+    // The selection must be a full row of real keys — no -1 padding leaks in
+    // when n > topk, and every emitted key is inside the window.
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t j = 0; j < topk; ++j) {
+        const int64_t s = got[static_cast<size_t>(t * topk + j)];
+        CHECK(s >= 0);
+        CHECK(s < nk);
+        if (j > 0) CHECK(s > got[static_cast<size_t>(t * topk + j - 1)]);  // ascending
+      }
+  }
+}
+
+// Ties are the case the total order (logit desc, index asc) exists to pin: with
+// a coarsely quantized logit field many candidates share a value, so a kernel
+// that resolved ties differently from the host reference would diverge here
+// while passing on distinct random logits.
+TEST_CASE("W7-device DSA top-k select: TIE-HEAVY rows match host BIT-EXACT (#505)") {
+  if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t topk = 128, nk = 300, T = 3;
+  auto logits = Rand(r, T * nk, -2.0f, 2.0f);
+  for (float& v : logits) v = static_cast<float>(static_cast<int>(v * 2.0f)) * 0.5f;
+  std::vector<int64_t> ws(T), we(T);
+  for (int64_t t = 0; t < T; ++t) { ws[t] = 0; we[t] = nk; }
+  const auto ref = dv4::DsaTopkSelect(logits, ws, we, T, nk, topk);
+  const auto got = dv4::DsaDevice()->topk(g.q, logits, ws, we, T, nk, topk);
+  REQUIRE(got.size() == ref.size());
+  for (size_t i = 0; i < ref.size(); ++i) CHECK(got[i] == ref[i]);
+}
+
+// A non-zero window start is what the real indexer passes once a prefix has been
+// evicted; the old emit path indexed its mask by `s - s0` and its picks by
+// absolute `s`, so the two bounds interacted with s0 differently.
+TEST_CASE("W7-device DSA top-k select: OFFSET window at real width matches host (#505)") {
+  if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t topk = 512, nk = 900, T = 2;
+  const auto logits = Rand(r, T * nk, -3.0f, 3.0f);
+  std::vector<int64_t> ws(T), we(T);
+  for (int64_t t = 0; t < T; ++t) { ws[t] = 137; we[t] = nk; }  // n = 763 > topk
+  const auto ref = dv4::DsaTopkSelect(logits, ws, we, T, nk, topk);
+  const auto got = dv4::DsaDevice()->topk(g.q, logits, ws, we, T, nk, topk);
+  REQUIRE(got.size() == ref.size());
+  for (size_t i = 0; i < ref.size(); ++i) CHECK(got[i] == ref[i]);
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t j = 0; j < topk; ++j)
+      CHECK(got[static_cast<size_t>(t * topk + j)] >= 137);
+}
+
+// #552 finding 2: the kernel clamps its window with `s0 = ws[t] > 0 ? ws[t] : 0`
+// and `s1 = we[t] < nk ? we[t] : nk` (cuda_deepseek_v4.cu:628-629), but no case
+// passed a window that NEEDS clamping. Mutating either clamp away left all four
+// #505 cases green while an off-device fuzz caught both immediately; on device
+// they become out-of-bounds `logits` reads. These rows drive both clamps at a
+// real width, against the same host reference.
+TEST_CASE("W7-device DSA top-k select: OUT-OF-RANGE windows are clamped like host (#552)") {
+  if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t topk = 512, nk = 700, T = 4;
+  const auto logits = Rand(r, T * nk, -3.0f, 3.0f);
+
+  // Row 0 under-runs (ws < 0), row 1 over-runs (we > nk), row 2 does both, row 3
+  // is in range as the control. Every row still has n > topk after clamping.
+  std::vector<int64_t> ws{-9, 0, -4, 100};
+  std::vector<int64_t> we{nk, nk + 37, nk + 12, nk};
+  const auto ref = dv4::DsaTopkSelect(logits, ws, we, T, nk, topk);
+  const auto got = dv4::DsaDevice()->topk(g.q, logits, ws, we, T, nk, topk);
+  REQUIRE(got.size() == ref.size());
+  for (size_t i = 0; i < ref.size(); ++i) CHECK(got[i] == ref[i]);
+
+  // No emitted key may escape the clamped window, which is what an unclamped
+  // read would produce.
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t j = 0; j < topk; ++j) {
+      const int64_t s = got[static_cast<size_t>(t * topk + j)];
+      CHECK(s >= 0);
+      CHECK(s < nk);
+    }
+}
+
+// #552 finding 3: `DsaTopkSelect` asserts `topk > 0` (deepseek_v4_dsa.cpp:76)
+// while the device launcher used to return an empty vector instead. The two arms
+// must refuse the same inputs, not just agree on the accepted ones.
+TEST_CASE("W7-device DSA top-k select: non-positive topk REFUSED on both arms (#552)") {
+  if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t nk = 8, T = 2;
+  const auto logits = Rand(r, T * nk, -1.0f, 1.0f);
+  std::vector<int64_t> ws(T, 0), we(T, nk);
+  for (const int64_t bad : {static_cast<int64_t>(0), static_cast<int64_t>(-1)}) {
+    CHECK_THROWS(dv4::DsaTopkSelect(logits, ws, we, T, nk, bad));
+    CHECK_THROWS(dv4::DsaDevice()->topk(g.q, logits, ws, we, T, nk, bad));
+  }
+}
+
 TEST_CASE("W7-device attention-sink softmax + grouped output-LoRA: CUDA vs host (near-tie)") {
   if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
   vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);

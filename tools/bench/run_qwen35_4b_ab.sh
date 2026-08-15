@@ -9,7 +9,7 @@
 # celebrated as a speedup.
 #
 # Invoke once, under the lock, from inside the CUDA dev shell:
-#   flock /tmp/gpu tools/bench/run_qwen35_4b_ab.sh /tmp/qwen35-ab-<name> \
+#   flock "${GPU_LOCK:-$HOME/gpu.lock}" tools/bench/run_qwen35_4b_ab.sh /tmp/qwen35-ab-<name> \
 #     A_NAME 'ENV=VAL ...' B_NAME 'ENV=VAL ...'
 #
 # Both arms get the identical request corpus, sampling and concurrency; the ONLY

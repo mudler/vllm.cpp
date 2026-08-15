@@ -125,6 +125,32 @@ def main_commits(item_id: str) -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
+def head_commits(item_id: str) -> list[str]:
+    """Commits on HEAD but not yet on origin/main whose message names this row.
+
+    The other half of the IN-FLIGHT evidence, and the only half that survives a
+    FORK. A contributor's `row/<ID>` branch lives on their own repository, so no
+    refspec `origin` can be given will ever produce that ref in the runner's
+    checkout; on a pull request HEAD is the merge commit GitHub builds, and it
+    already contains those commits. Without this arm, every PR that moves a row
+    to ACTIVE and carries its implementation reads ABANDONED (#726).
+
+    The range is `origin/main..HEAD`, never bare HEAD: on the push-to-main lane
+    HEAD *is* origin/main, and a bare HEAD would re-report every landed commit
+    as live work, so no ACTIVE row could ever be reported stale again.
+
+    Matched by the same anchored, whole-token pattern as main_commits, and by
+    the same `--grep` over the whole message rather than a filter on `--oneline`
+    output: a row ID often appears only in the commit BODY (`25df7468f` is the
+    shipped example), which a subject-only filter would miss.
+    """
+    out = git(
+        "log", "--oneline", "-E", f"--grep={id_grep_pattern(item_id)}", "-n", "20",
+        "origin/main..HEAD",
+    )
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
 def require_origin_main() -> None:
     """Abort unless origin/main resolves.
 
@@ -142,6 +168,36 @@ def require_origin_main() -> None:
         )
 
 
+def require_branch_information() -> None:
+    """Abort unless the checkout holds at least one `row/<ID>` ref.
+
+    The guard require_origin_main has, applied to the input it never covered.
+    row_branches() returning {} means either "nobody holds a branch" or "this
+    checkout was never told about branches", and classify_active reads both as
+    the first. CI fetched `main` and nothing else, so the IN-FLIGHT verdict was
+    literally unreachable there and in-flight work wore abandoned work's face
+    (#726). Absence of work and absence of information must never look the same.
+
+    A PRECONDITION, not a check on the result, because the damage is not
+    confined to the ABANDONED verdict: with no branch refs a row that is
+    IN-FLIGHT *and* has landed groundwork reports LANDED instead -- a live claim
+    reported as finished, the false negative classify_active's own comment
+    names. The whole census is untrustworthy, not just its abandoned rows.
+
+    HEAD deliberately does not satisfy this. It carries evidence about the row
+    the current pull request advances and no other, so counting it would make
+    the guard vacuous -- HEAD always resolves -- while every other row stayed
+    silently misclassified.
+    """
+    if not row_branches():
+        raise SystemExit(
+            "no `row/<ID>` ref resolves -- run `git fetch origin "
+            "'+refs/heads/row/*:refs/remotes/origin/row/*'` first. Without them "
+            "the IN-FLIGHT verdict is unreachable, so this audit would report "
+            "every row whose work is on a branch as abandoned or as finished."
+        )
+
+
 def unmerged(branch: str) -> list[str]:
     """Commits on branch that are not yet on origin/main."""
     out = git("log", "--oneline", f"origin/main..{branch}")
@@ -155,12 +211,18 @@ def classify_active(
     branches: list[str],
     unmerged_by_branch: dict[str, list[str]],
     commits: list[str],
+    head_commits: list[str],
 ) -> tuple[str, str]:
     """Classify one ACTIVE row from already-gathered evidence.
 
     IN-FLIGHT wins over LANDED whenever both are present: a row can have landed
     groundwork and still have open follow-up work, and calling that finished
-    would silently steal a live claim.
+    would silently steal a live claim. That is why BOTH in-flight arms -- the
+    branch and HEAD -- sit above both landed arms.
+
+    `head_commits` is required, not defaulted. A default would let a caller
+    gather the branch evidence, forget this, and lose the only source that
+    survives a fork, with every test here still green.
     """
     # Indexed, never .get(): `branches` is the authority for which keys must
     # exist, so a missing key is a CALLER bug, not data. .get() would return
@@ -171,6 +233,10 @@ def classify_active(
     if live_branches:
         joined = ", ".join(sorted(live_branches))
         return "IN-FLIGHT", f"unmerged commits on {joined}"
+    # Below the branch arm because a named branch is the more specific evidence
+    # -- both are IN-FLIGHT, so only the REASON can tell a reader which it was.
+    if head_commits:
+        return "IN-FLIGHT", f"unmerged commits on HEAD: {head_commits[0]}"
     if branches:
         joined = ", ".join(sorted(branches))
         return "LANDED", f"branch {joined} exists and is fully merged into main"
@@ -267,6 +333,7 @@ def duplicate_live_ids(rows: list) -> dict[str, list[str]]:
 def audit() -> list[dict]:
     """One record per live row, with verdict (ACTIVE) and flag (PARTIAL)."""
     require_origin_main()
+    require_branch_information()
     parse_errors: list[str] = []
     rows = live_rows(parse_errors)
     if parse_errors:
@@ -285,7 +352,10 @@ def audit() -> list[dict]:
             branches = branches_by_id.get(row.item_id, [])
             unmerged_by_branch = {b: unmerged(b) for b in branches}
             verdict, reason = classify_active(
-                branches, unmerged_by_branch, main_commits(row.item_id)
+                branches,
+                unmerged_by_branch,
+                main_commits(row.item_id),
+                head_commits(row.item_id),
             )
         if row.state == "PARTIAL":
             marker = matched_marker(row.raw)

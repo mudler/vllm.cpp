@@ -243,4 +243,17 @@ std::unique_ptr<LoadedModel> BorrowQwen3_5DenseLoadedModel(
 REGISTER_VLLM_MODEL(qwen3_5_dense, "Qwen3_5ForConditionalGeneration",
                     kQwen3_5DenseFactory, kQwen3_5Info)
 
+// TEXT-ONLY arm of the SAME backbone. Upstream's `Qwen3_5ForCausalLM` IS
+// `Qwen3_5ForCausalLMBase` unchanged (`class Qwen3_5ForCausalLM(...): pass`,
+// qwen3_5.py:439-440 @ `ad5d29db7`) and is registered against the same `qwen3_5`
+// module (registry.py:202 @ `ad5d29db7`, PR #50210), so this is the SAME
+// factory, additively: no forward, no KV-cache spec and no loader fork.
+//
+// AHEAD OF THE PIN, DELIBERATELY. `555967922` (.agents/upstream-sync.md) carries
+// only the ForConditionalGeneration entries; the text-only arms landed upstream
+// after it. This is a forward port of ONE upstream PR and does not advance the
+// pin. See .agents/specs/qwen38-text-only.md §Gates for the owed run gate.
+REGISTER_VLLM_MODEL(qwen3_5_dense_text, "Qwen3_5ForCausalLM",
+                    kQwen3_5DenseFactory, kQwen3_5TextInfo)
+
 }  // namespace vllm

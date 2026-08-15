@@ -186,7 +186,7 @@ configs, token-for-token the same output. Switching to it should be boring. Ever
 you get on top, most of it borrowed from whichever engine does it best:
 
 - **One 66 MiB binary instead of a 9.1 GiB install.** A flat, exception-free, llama.cpp-style C ABI
-  ([`include/vllm.h`](include/vllm.h), ABI v17, 35 functions) for C, C++, Go, or Rust. No Python
+  ([`include/vllm.h`](include/vllm.h), ABI v19, 36 functions) for C, C++, Go, or Rust. No Python
   interpreter in the process.
 - **GGUF as a first-class citizen.** Load the same quantized files llama.cpp uses, and on CPU
   **compute directly on the compressed blocks** (Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K) with no BF16
@@ -216,8 +216,8 @@ you get on top, most of it borrowed from whichever engine does it best:
   sample logprobs.
 - **Structured output.** JSON schema, JSON object, regex, choice, and GBNF grammar, enforced in the
   engine with a per-step logits bitmask.
-- **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 10 reasoning
-  parsers, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`. Chat templates
+- **Tool calling and reasoning.** 36 tool-parser families (40 accepted names) and 12 reasoning
+  parser names, streaming, selectable with `--tool-call-parser` / `--reasoning-parser`. Chat templates
   render through the vendored google/minja engine, the same renderer llama.cpp ships.
 - **Multimodal.** Image, video, and audio to text, correctness-complete. Image chat requests are
   wired through the OpenAI server (content parts on `/v1/chat/completions`) into the engine's
@@ -385,7 +385,7 @@ behind a model gallery, multi-model serving, the full OpenAI API surface, auth, 
 ## Use it as a library (C API)
 
 Link `libvllm` and include [`include/vllm.h`](include/vllm.h): a flat, exception-free,
-llama.cpp-style C ABI (`VLLM_ABI_VERSION 17`, 35 exported functions) suitable for `dlopen` / FFI.
+llama.cpp-style C ABI (`VLLM_ABI_VERSION 19`, 36 exported functions) suitable for `dlopen` / FFI.
 
 ```c
 vllm_model_params mp = vllm_model_params_default();

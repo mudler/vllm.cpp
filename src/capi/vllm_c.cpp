@@ -14,6 +14,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -28,7 +29,9 @@
 
 #include "capi/chat_prompt.h"
 #include "capi/engine_handle.h"
+#include "vllm/config/offload.h"
 #include "vllm/config/kv_transfer.h"   // ParseKVTransferConfigJson (ABI v9)
+#include "vllm/config/multimodal.h"    // ParseLimitMmPerPromptJson (ABI v19)
 #include "vllm/config/scheduler.h"     // SchedulerPolicyFromString (ABI v9)
 #include "vllm/v1/kv_offload/kv_connector.h"  // KVConnectorFactory (ABI v9)
 #include "vllm/entrypoints/chat_template.h"
@@ -44,6 +47,10 @@
 #include "vllm/model_executor/models/minimax_h3.h"    // mux argv (v12)
 #include "vllm/multimodal/parakeet_transcription.h"     // vllm_transcribe (v11)
 #include "vllm/multimodal/minimax_h3_video.h"          // vllm_video_* (v12)
+#include "vllm/multimodal/video_engine.h"              // the v18 family registry
+#include "vllm/multimodal/speech_engine.h"             // vllm_speech_* (v20)
+#include "vllm/model_executor/models/minimax_music3_speech.h"  // the v20 family registry
+#include "vllm/model_executor/models/minimax_h3.h"     // MiniMaxH3WriteWav, the shared RIFF writer
 #include "vllm/entrypoints/openai/server_main.h"   // vllm_server_main (v17)
 #include "vllm/outputs.h"
 #include "vllm/sampling_params.h"
@@ -500,6 +507,9 @@ VLLM_API vllm_model_params vllm_model_params_default(void) {
   p.device = 0;  // 0 => auto: the accelerator-first probe (ABI v14).
   p.gpu_memory_utilization = 0.92;  // vLLM default fraction (ABI v16).
   p.kv_cache_memory_bytes = 0;      // 0 => unset (ABI v16).
+  p.language_model_only = 0;        // 0 => off; limits stay at 999 (ABI v19).
+  p.limit_mm_per_prompt = nullptr;  // NULL => no limits configured (ABI v19).
+  p.offload_config = nullptr;       // NULL => no weight offload (ABI v21).
   return p;
 }
 
@@ -601,6 +611,35 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
           throw std::invalid_argument(msg);
         }
         ep.kv_transfer_config = std::move(kv_cfg);
+      }
+      // ABI v21: WEIGHT offload (ENG-WEIGHT-OFFLOAD W0b). NULL/empty => the
+      // default inert config. Parsed AND validated here so a malformed document,
+      // an unknown backend name or a validator violation is a CALLER error
+      // reported before any model I/O, exactly as the two configs above are.
+      // Validate() also collects upstream's three backend/field-mismatch
+      // WARNINGS; they are warnings in vLLM too, so they are surfaced on the
+      // engine log rather than turned into a refusal.
+      if (params->offload_config != nullptr && params->offload_config[0] != '\0') {
+        vllm::OffloadConfig off_cfg =
+            vllm::parse_offload_config_json(params->offload_config);
+        off_cfg.Validate();
+        for (const std::string& w : off_cfg.warnings) {
+          std::fprintf(stderr, "[vllm.cpp] offload_config: %s\n", w.c_str());
+        }
+        ep.offload_config = std::move(off_cfg);
+      }
+      // ABI v19: the multimodal input limits (#607 L2). Parsed HERE so a
+      // malformed document is a CALLER error reported before any model I/O,
+      // exactly as the server refuses --limit-mm-per-prompt before the load.
+      // The flag half is deliberately not a second knob: language_model_only
+      // zeroes every limit inside GetLimitPerPrompt, ahead of the map
+      // (multimodal.py:326-327), so setting both is well-defined and the flag
+      // wins — mirrored rather than reimplemented here.
+      ep.multimodal.language_model_only = params->language_model_only != 0;
+      if (params->limit_mm_per_prompt != nullptr &&
+          params->limit_mm_per_prompt[0] != '\0') {
+        ep.multimodal.limit_per_prompt = vllm::ParseLimitMmPerPromptJson(
+            params->limit_mm_per_prompt, /*ignored_options=*/nullptr);
       }
     } catch (const std::invalid_argument& e) {
       SetError(std::string("vllm_engine_load: ") + e.what());
@@ -1396,10 +1435,11 @@ VLLM_API void vllm_embedding_result_free(vllm_embedding_result* out) {
   out->prompt_tokens = 0;
 }
 
-// ── Video+audio generation (ABI v12, MiniMax-H3) ────────────────────────────
-// Thin C wrappers over the ONE library seam
-// (vllm::multimodal::MiniMaxH3VideoEngine) the server's /v1/videos routes and
-// the minimax-h3-gen example drive — see include/vllm.h for the contract.
+// ── Video+audio generation (ABI v12; generalized at v18) ────────────────────
+// Thin C wrappers over the ONE library seam — since v18 the ABSTRACT one
+// (vllm::multimodal::VideoEngine + LoadVideoEngine's family registry), which
+// the server's /v1/videos routes and the minimax-h3-gen example also drive.
+// See include/vllm.h for the contract.
 
 VLLM_API vllm_video_model_params vllm_video_model_params_default(void) {
   vllm_video_model_params p;
@@ -1414,9 +1454,42 @@ VLLM_API vllm_video_params vllm_video_params_default(void) {
 }
 
 // The opaque video handle: owns the loaded checkpoint set + staged weights.
+// `family` caches the resolved name so vllm_video_engine_family can hand back
+// storage that lives exactly as long as the handle.
 struct vllm_video_engine {
-  std::unique_ptr<vllm::multimodal::MiniMaxH3VideoEngine> engine;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine;
+  std::string family;
 };
+
+namespace {
+
+// Lower the v18 parallel key/value arrays into the seam's extras map. Returns
+// false with *error set when the arrays are malformed — a NULL entry is a
+// caller bug, and reading past it would be undefined rather than merely wrong.
+bool VideoExtrasFromArrays(const char* const* keys, const char* const* values, int32_t n,
+                           const char* field, std::map<std::string, std::string>* out,
+                           std::string* error) {
+  if (n == 0) return true;
+  if (n < 0) {
+    *error = std::string(field) + ": n_extras is negative";
+    return false;
+  }
+  if (keys == nullptr || values == nullptr) {
+    *error = std::string(field) + ": n_extras > 0 but extra_keys/extra_values is null";
+    return false;
+  }
+  for (int32_t i = 0; i < n; ++i) {
+    if (keys[i] == nullptr || values[i] == nullptr || keys[i][0] == '\0') {
+      *error = std::string(field) + ": extra " + std::to_string(i) +
+               " has a null/empty key or a null value";
+      return false;
+    }
+    (*out)[keys[i]] = values[i];
+  }
+  return true;
+}
+
+}  // namespace
 
 VLLM_API vllm_status vllm_video_engine_load(const vllm_video_model_params* params,
                                             vllm_video_engine** out) {
@@ -1429,22 +1502,45 @@ VLLM_API vllm_status vllm_video_engine_load(const vllm_video_model_params* param
     SetError("vllm_video_engine_load: params or params->dit_path is null");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
+  vllm::multimodal::VideoModelParams mp;
+  mp.dit_path = OrEmpty(params->dit_path);
+  mp.encoder_path = OrEmpty(params->encoder_path);
+  mp.tokenizer_path = OrEmpty(params->tokenizer_path);
+  mp.video_vae_path = OrEmpty(params->video_vae_path);
+  mp.video_vae_config_path = OrEmpty(params->video_vae_config_path);
+  mp.audio_vae_path = OrEmpty(params->audio_vae_path);
+  mp.audio_vae_config_path = OrEmpty(params->audio_vae_config_path);
+  mp.prompt_embeds_path = OrEmpty(params->prompt_embeds_path);
+  mp.family = OrEmpty(params->family);
+  mp.device = params->device;
+  mp.dequant_bf16 = params->dequant_bf16;
+  mp.fp4_resident = params->fp4_resident;
+
+  std::string extras_error;
+  if (!VideoExtrasFromArrays(params->extra_keys, params->extra_values, params->n_extras,
+                             "vllm_video_engine_load", &mp.extras, &extras_error)) {
+    SetError(extras_error);
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  // The v12 `partition` field is the documented ALIAS for the load extra
+  // "partition". Both spellings disagreeing is a caller error with no defensible
+  // winner, so it is refused rather than resolved silently.
+  const std::string partition = OrEmpty(params->partition);
+  if (!partition.empty()) {
+    const auto it = mp.extras.find("partition");
+    if (it != mp.extras.end() && it->second != partition) {
+      SetError("vllm_video_engine_load: params->partition ('" + partition +
+               "') and the extra \"partition\" ('" + it->second +
+               "') disagree; supply one spelling");
+      return VLLM_ERR_INVALID_ARGUMENT;
+    }
+    mp.extras["partition"] = partition;
+  }
+
   try {
-    vllm::multimodal::MiniMaxH3VideoModelParams mp;
-    mp.dit_path = OrEmpty(params->dit_path);
-    mp.encoder_path = OrEmpty(params->encoder_path);
-    mp.tokenizer_path = OrEmpty(params->tokenizer_path);
-    mp.video_vae_path = OrEmpty(params->video_vae_path);
-    mp.video_vae_config_path = OrEmpty(params->video_vae_config_path);
-    mp.audio_vae_path = OrEmpty(params->audio_vae_path);
-    mp.audio_vae_config_path = OrEmpty(params->audio_vae_config_path);
-    mp.prompt_embeds_path = OrEmpty(params->prompt_embeds_path);
-    mp.partition = OrEmpty(params->partition);
-    mp.device = params->device;
-    mp.dequant_bf16 = params->dequant_bf16;
-    mp.fp4_resident = params->fp4_resident;
     auto handle = std::make_unique<vllm_video_engine>();
-    handle->engine = vllm::multimodal::MiniMaxH3VideoEngine::Load(mp);
+    handle->engine = vllm::multimodal::LoadVideoEngine(mp);
+    handle->family = handle->engine->family();
     *out = handle.release();
     ClearError();
     return VLLM_OK;
@@ -1458,6 +1554,10 @@ VLLM_API vllm_status vllm_video_engine_load(const vllm_video_model_params* param
 }
 
 VLLM_API void vllm_video_engine_free(vllm_video_engine* engine) { delete engine; }
+
+VLLM_API const char* vllm_video_engine_family(const vllm_video_engine* engine) {
+  return engine == nullptr ? nullptr : engine->family.c_str();
+}
 
 namespace {
 
@@ -1498,8 +1598,16 @@ VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
     SetError("vllm_video_generate: output_dir is required (frames + WAV land there)");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
+  vllm::multimodal::VideoGenParams gen;
+  {
+    std::string extras_error;
+    if (!VideoExtrasFromArrays(params->extra_keys, params->extra_values, params->n_extras,
+                               "vllm_video_generate", &gen.extras, &extras_error)) {
+      SetError(extras_error);
+      return VLLM_ERR_INVALID_ARGUMENT;
+    }
+  }
   try {
-    vllm::multimodal::MiniMaxH3VideoGenParams gen;
     gen.prompt = OrEmpty(params->prompt);
     gen.width = params->width;
     gen.height = params->height;
@@ -1519,7 +1627,7 @@ VLLM_API vllm_status vllm_video_generate(vllm_video_engine* engine,
     gen.ref_audio_path = OrEmpty(params->ref_audio);
     gen.output_dir = params->output_dir;
 
-    const vllm::multimodal::MiniMaxH3VideoResult result = engine->engine->Generate(gen);
+    const vllm::multimodal::VideoResult result = engine->engine->Generate(gen);
 
     vllm_video_result r;
     std::memset(&r, 0, sizeof(r));
@@ -1556,6 +1664,205 @@ VLLM_API void vllm_video_result_free(vllm_video_result* out) {
     for (int32_t i = 0; i < out->mux_argc; ++i) std::free(out->mux_argv[i]);
     std::free(out->mux_argv);
   }
+  std::memset(out, 0, sizeof(*out));
+}
+
+// ── Speech + music generation (ABI v20) ─────────────────────────────────────
+// The C face of vllm::multimodal::SpeechEngine. See include/vllm.h for the
+// contract and .agents/specs/minimax-music3.md §4.1 for why a music family
+// needs two texts rather than one.
+
+struct vllm_speech_engine {
+  std::unique_ptr<vllm::multimodal::SpeechEngine> engine;
+  std::string family;
+  int64_t sample_rate = 0;
+  bool requires_reference_audio = false;
+  // Staged weights are shared state, and the ABI promises one blocking call per
+  // handle: serialize here rather than trusting every family to.
+  std::mutex mutex;
+};
+
+namespace {
+
+// The process-global registry, populated ONCE. A half-populated registry would
+// make detection depend on which entry point ran first, which is the
+// never-guess guarantee defeated by construction.
+vllm::multimodal::SpeechRegistry& SpeechRegistry() {
+  static vllm::multimodal::SpeechRegistry& registry = [] () -> vllm::multimodal::SpeechRegistry& {
+    vllm::multimodal::SpeechRegistry& global = vllm::multimodal::GlobalSpeechRegistry();
+    vllm::models::music3::RegisterBuiltinSpeechFamilies(global);
+    return global;
+  }();
+  return registry;
+}
+
+}  // namespace
+
+VLLM_API vllm_speech_model_params vllm_speech_model_params_default(void) {
+  vllm_speech_model_params p;
+  std::memset(&p, 0, sizeof(p));
+  return p;
+}
+
+VLLM_API vllm_speech_params vllm_speech_params_default(void) {
+  vllm_speech_params p;
+  std::memset(&p, 0, sizeof(p));
+  return p;
+}
+
+VLLM_API vllm_status vllm_speech_engine_load(const vllm_speech_model_params* params,
+                                             vllm_speech_engine** out) {
+  if (out == nullptr) {
+    SetError("vllm_speech_engine_load: out handle pointer is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  *out = nullptr;
+  if (params == nullptr || params->path == nullptr || params->path[0] == '\0') {
+    SetError("vllm_speech_engine_load: params or params->path is null/empty (it is the "
+             "checkpoint SET directory)");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  vllm::multimodal::SpeechModelParams mp;
+  mp.path = OrEmpty(params->path);
+  mp.family = OrEmpty(params->family);
+  try {
+    std::string why;
+    std::unique_ptr<vllm::multimodal::SpeechEngine> engine =
+        SpeechRegistry().Load(mp, &why);
+    if (engine == nullptr) {
+      // `why` NAMES every family that was tried and the path, so the refusal is
+      // evidence rather than a verdict.
+      SetError("vllm_speech_engine_load: " + why +
+               " (a TEXT model directory belongs to vllm_engine_load)");
+      return VLLM_ERR_MODEL_LOAD;
+    }
+    auto handle = std::make_unique<vllm_speech_engine>();
+    handle->family = engine->family();
+    handle->sample_rate = engine->sample_rate();
+    handle->requires_reference_audio = engine->requires_reference_audio();
+    handle->engine = std::move(engine);
+    *out = handle.release();
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_speech_engine_load: ") + e.what());
+    return VLLM_ERR_MODEL_LOAD;
+  } catch (...) {
+    SetError("vllm_speech_engine_load: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API void vllm_speech_engine_free(vllm_speech_engine* engine) { delete engine; }
+
+VLLM_API const char* vllm_speech_engine_family(const vllm_speech_engine* engine) {
+  return engine == nullptr ? nullptr : engine->family.c_str();
+}
+
+VLLM_API int32_t vllm_speech_engine_sample_rate(const vllm_speech_engine* engine) {
+  return engine == nullptr ? 0 : static_cast<int32_t>(engine->sample_rate);
+}
+
+VLLM_API int32_t vllm_speech_engine_requires_reference_audio(const vllm_speech_engine* engine) {
+  return (engine != nullptr && engine->requires_reference_audio) ? 1 : 0;
+}
+
+VLLM_API vllm_status vllm_synthesize(vllm_speech_engine* engine,
+                                     const vllm_speech_params* params,
+                                     vllm_speech_result* out) {
+  if (out == nullptr) {
+    SetError("vllm_synthesize: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  std::memset(out, 0, sizeof(*out));
+  if (engine == nullptr || params == nullptr) {
+    SetError("vllm_synthesize: engine or params is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (params->n_reference_audio < 0) {
+    SetError("vllm_synthesize: n_reference_audio is negative");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (params->n_reference_audio > 0 && params->reference_audio == nullptr) {
+    SetError("vllm_synthesize: n_reference_audio > 0 but reference_audio is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    vllm::multimodal::SpeechGenParams gen;
+    gen.text = OrEmpty(params->text);
+    gen.language = OrEmpty(params->language);
+    gen.lyrics = OrEmpty(params->lyrics);
+    gen.description = OrEmpty(params->description);
+    if (params->n_reference_audio > 0) {
+      gen.reference_audio.assign(params->reference_audio,
+                                 params->reference_audio + params->n_reference_audio);
+    }
+    gen.reference_sample_rate = params->reference_sample_rate;
+    gen.audio_duration_s = params->audio_duration_s;
+    gen.num_inference_steps = params->num_inference_steps;
+    // A zeroed struct must preserve "the family decides", and 0 is a LEGAL
+    // guidance scale — so the flag, not the value, is what selects it.
+    gen.guidance_scale = params->has_guidance_scale != 0 ? params->guidance_scale : -1.0;
+    gen.seed = params->seed;
+
+    vllm::multimodal::SpeechResult result;
+    {
+      std::lock_guard<std::mutex> guard(engine->mutex);
+      result = engine->engine->Synthesize(gen);
+    }
+    if (result.channels <= 0 || result.sample_rate <= 0) {
+      SetError("vllm_synthesize: the family returned " + std::to_string(result.channels) +
+               " channels at " + std::to_string(result.sample_rate) + " Hz");
+      return VLLM_ERR_RUNTIME;
+    }
+    const int64_t per_channel = static_cast<int64_t>(result.samples.size()) / result.channels;
+    if (per_channel * result.channels != static_cast<int64_t>(result.samples.size())) {
+      SetError("vllm_synthesize: the family returned " + std::to_string(result.samples.size()) +
+               " samples, which is not a multiple of " + std::to_string(result.channels) +
+               " channels");
+      return VLLM_ERR_RUNTIME;
+    }
+
+    vllm_speech_result r;
+    std::memset(&r, 0, sizeof(r));
+    const size_t bytes = result.samples.size() * sizeof(float);
+    r.samples = static_cast<float*>(std::malloc(bytes == 0 ? 1 : bytes));
+    if (r.samples == nullptr) {
+      SetError("vllm_synthesize: out-of-memory copying the waveform");
+      return VLLM_ERR_RUNTIME;
+    }
+    std::memcpy(r.samples, result.samples.data(), bytes);
+    r.n_samples = per_channel;
+    r.sample_rate = static_cast<int32_t>(result.sample_rate);
+    r.channels = static_cast<int32_t>(result.channels);
+    // The RIFF bytes come from the SHARED writer the H3 and LTX-2.5 audio paths
+    // already use, so there is no second encoder to keep in step.
+    const std::string wav = vllm::MiniMaxH3WriteWav(result.samples, result.channels, per_channel,
+                                                    result.sample_rate);
+    r.wav = static_cast<char*>(std::malloc(wav.size() == 0 ? 1 : wav.size()));
+    if (r.wav == nullptr) {
+      std::free(r.samples);
+      SetError("vllm_synthesize: out-of-memory encoding the WAV");
+      return VLLM_ERR_RUNTIME;
+    }
+    std::memcpy(r.wav, wav.data(), wav.size());
+    r.n_wav = static_cast<int64_t>(wav.size());
+    *out = r;
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_synthesize: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_synthesize: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API void vllm_speech_result_free(vllm_speech_result* out) {
+  if (out == nullptr) return;
+  std::free(out->samples);
+  std::free(out->wav);
   std::memset(out, 0, sizeof(*out));
 }
 

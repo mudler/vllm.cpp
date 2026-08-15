@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Enforce explicit path classification and the checker-evidence contract.
 
-The per-class LINE BUDGETS this file used to enforce were retired 2026-08-10;
-see the note where they stood. What remains: every changed path must classify
-explicitly, binaries fail closed, a governance-checker change must carry
-executable mutation evidence, and product paths must arrive on a PR."""
+The per-class LINE BUDGETS this file used to enforce were retired 2026-08-10,
+and the fail-closed BINARY GUARD was retired 2026-08-13; see the notes where
+each stood. What remains: every changed path must classify explicitly, a
+governance-checker change must carry executable mutation evidence, and product
+paths must arrive on a PR. Nothing here measures the size of a diff."""
 
 from __future__ import annotations
 
@@ -54,8 +55,8 @@ PATH_CLASSES = frozenset(
 #
 # Everything else this checker enforces is unchanged and is NOT a size rule:
 # explicit path classification (no blanket directory exemptions), the
-# fail-closed binary guard, the checker-change mutation-evidence contract, and
-# the role checks that keep product paths on a PR.
+# checker-change mutation-evidence contract, and the role checks that keep
+# product paths on a PR.
 
 # Machine-generated artifacts, each of which MUST be (a) emitted by a tracked
 # generator in this repository, (b) reproduced byte-for-byte by a gate that runs
@@ -85,6 +86,11 @@ PROJECT_RECORD_FILES = frozenset(
         ".agents/NOW.md",
         ".agents/coordination.md",
         ".agents/roadmap_v1.md",
+        # The intake surface moved out of roadmap_v1.md into its own append-only
+        # file (#840) and was never classified here. Classification is a hard
+        # error by design, so pr-size aborted on EVERY pull request that appends
+        # an index row, which under the same policy is nearly all of them (#856).
+        ".agents/issue-index.md",
         ".agents/porting-inventory.md",
         ".agents/engine-matrix.md",
         ".agents/feature-matrix.md",
@@ -111,6 +117,14 @@ PROCEDURE_FILES = frozenset(
         ".agents/porting-a-model.md",
         ".agents/benchmarking.md",
         ".agents/bugfixing.md",
+        # The writing guides AGENTS.md delegates to, and the skill routes that
+        # point at them (#827). Same procedure class as their sibling guides.
+        # They were never classified, so classify_path FAILED CLOSED and this
+        # test has been red on main ever since that row landed (#856).
+        ".agents/style/commits.md",
+        ".agents/style/prose.md",
+        ".claude/skills/writing-commits-and-prs/SKILL.md",
+        ".claude/skills/writing-technical-english/SKILL.md",
         ".agents/prompts/implementer.md",
         ".agents/prompts/operator.md",
         ".agents/prompts/reviewer.md",
@@ -173,6 +187,12 @@ COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
 # this. A claim in its own file has one writer and cannot collide. Classified
 # with the other per-row records it now resembles.
 CLAIM = re.compile(r"\.agents/claims/[A-Za-z0-9_.-]+\.md\Z")
+# One file per secondary oracle (AGENTS.md, "When vLLM has no implementation").
+# Same shape and therefore the same class as SPEC and CLAIM: a per-key record
+# globbed for reading, deliberately NOT a shared table every change must write.
+# Absent until #668 -- the registry landed with no pattern here, so every one of
+# its files was unclassified and a required check refused any PR touching a pin.
+ORACLE = re.compile(r"\.agents/oracles/[A-Za-z0-9_.-]+\.md\Z")
 # Retired state evidence, moved wholesale under completed/ when history became
 # git. It is archived evidence, classified like every other completed record.
 COMPLETED_STATE_EVENT = re.compile(
@@ -367,6 +387,7 @@ def classify_path(path: str) -> str:
         path in PROCEDURE_FILES
         or SPEC.fullmatch(path)
         or CLAIM.fullmatch(path)
+        or ORACLE.fullmatch(path)
         or COMPLETED.fullmatch(path)
         or COMPLETED_STATE_EVENT.fullmatch(path)
     ):
@@ -477,9 +498,15 @@ def change_errors(
         except ValueError as exc:
             errors.append(str(exc))
             continue
-        if change.lines is None:
-            errors.append(f"binary change {change.path!r} is not reviewable as text")
-            continue
+        # NO BINARY GUARD. A `lines is None` path used to error here as "not
+        # reviewable as text" (GATE-PR-SIZE-BINARY, #615). Retired 2026-08-13:
+        # it made every golden-bearing PR unmergeable by construction -- parity
+        # goldens are binary by nature -- while adding nothing, because the
+        # protection that matters is classification, which runs directly above
+        # and still refuses any path without a class. The classifier was always
+        # built to give binaries a class; see the `SITE_ASSET` note. Note
+        # `lines is None` still matters downstream: the evidence contract below
+        # tests it, so a binary cannot serve as mutation evidence.
         if path_class == "governance_checker":
             evidence = recognized_evidence(change.path)
             evidence_change = changed_paths.get(evidence)
@@ -534,16 +561,39 @@ def resolve_commit(repo: Path, revision: str) -> str:
     return oid
 
 
-def require_ancestor(repo: Path, base_oid: str, head_oid: str) -> None:
+def range_base(repo: Path, base_oid: str, head_oid: str) -> str:
+    """The merge base of base and head -- i.e. what a pull request actually is.
+
+    This used to demand that `base_oid` be an ANCESTOR of head (#773). CI passes
+    `pull_request.base.sha`, the TIP of the base branch, which stops being an
+    ancestor the moment main advances after the branch was cut -- continuously,
+    on this repo. So the checker aborted BEFORE classifying anything, and no
+    fork PR was ever checked. The sibling trailer gate aborted the same way,
+    which is why CI has never validated an external contributor's trailers.
+
+    Diffing two-dot against a moved main is not merely stricter, it is WRONG:
+    main's own commits appear as reversions inside the contributor's diff, so
+    paths they never touched get classified and charged to them. `git diff
+    A...B` is defined as `git diff $(git merge-base A B) B` and is what GitHub
+    itself shows.
+
+    Unrelated histories still fail closed. No merge base means there is no range
+    to compute, and reporting one would be an invention -- absence of
+    information must never look like absence of work.
+    """
     result = subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", base_oid, head_oid],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        ["git", "-C", str(repo), "merge-base", base_oid, head_oid],
+        capture_output=True,
+        text=True,
         timeout=EVIDENCE_TIMEOUT_SECONDS,
         shell=False,
     )
-    if result.returncode == 1:
-        raise ValueError("base must be an ancestor of head")
+    if result.returncode != 0:
+        raise ValueError("base and head have no merge base (unrelated histories)")
+    oid = result.stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}", oid) is None:
+        raise ValueError("merge base did not resolve to one commit")
+    return oid
     if result.returncode != 0:
         raise ValueError("could not establish base/head ancestry")
 
@@ -551,9 +601,10 @@ def require_ancestor(repo: Path, base_oid: str, head_oid: str) -> None:
 def changed_paths(base: str, head: str, *, repo: Path = ROOT) -> list[ChangedPath]:
     base_oid = resolve_commit(repo, base)
     head_oid = resolve_commit(repo, head)
-    require_ancestor(repo, base_oid, head_oid)
+    # From the MERGE BASE, not the base tip -- see range_base() (#773).
     return parse_numstat(
-        git("diff", "--no-renames", "--numstat", base_oid, head_oid, repo=repo)
+        git("diff", "--no-renames", "--numstat",
+            range_base(repo, base_oid, head_oid), head_oid, repo=repo)
     )
 
 
@@ -653,7 +704,9 @@ def executable_evidence(
 
     base_oid = resolve_commit(repo, base)
     head_oid = resolve_commit(repo, head)
-    require_ancestor(repo, base_oid, head_oid)
+    # The BASE version of a checker, for the red-before half, is the one at the
+    # merge base -- not at a base tip that has moved past this branch (#773).
+    base_oid = range_base(repo, base_oid, head_oid)
     changed = {item.path for item in changes}
     checkers = sorted(
         item.path

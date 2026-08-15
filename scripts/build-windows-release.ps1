@@ -19,11 +19,176 @@ if ($ArtifactId -ne "windows-x86_64-msvc-$Backend") {
 }
 function Invoke-Checked {
     param([Parameter(Mandatory)][string]$Program,
-          [Parameter(Mandatory)][string[]]$Arguments)
-    & $Program @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Program exited with status $LASTEXITCODE"
+          [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
+          [scriptblock]$Runner)
+    if ($null -eq $Runner) {
+        & $Program @Arguments
+        $exitCode = $LASTEXITCODE
+    } else {
+        $exitCode = [int](& $Runner $Program $Arguments)
     }
+    if ($exitCode -ne 0) {
+        throw "$Program exited with status $exitCode"
+    }
+}
+
+# `Arguments` is mandatory *and* `[AllowEmptyCollection()]` rather than defaulted
+# to `@()`, so that an explicitly empty list binds while an omitted or null one
+# stays a hard binding error. A default would silently turn "forwarded nothing"
+# into "forwarded an empty list", which is the confusion #512 came from, so both
+# halves of that design are pinned here.
+function Invoke-CheckedBindingContractTests {
+    $recorder = { param([string]$Program, [string[]]$Arguments) return 0 }
+
+    $nullRejected = $false
+    try {
+        Invoke-Checked "fake-null.exe" $null -Runner $recorder
+    } catch {
+        $nullRejected = $true
+    }
+    if (-not $nullRejected) {
+        throw "checked invocation bound a null argument list"
+    }
+
+    # An omitted mandatory parameter *prompts* in an interactive console host, so
+    # asserting the omission in-process would hang a developer's terminal. An API
+    # runspace has a host that cannot prompt and reports the binding failure
+    # instead. The function under test is rebuilt from the live definition's own
+    # source text, so any edit to the real parameter block is what gets asserted.
+    $runspace = [powershell]::Create()
+    $omissionRejected = $false
+    try {
+        $null = $runspace.AddScript(@'
+param([string]$Body)
+Set-Item -LiteralPath function:Invoke-Checked -Value ([scriptblock]::Create($Body))
+Invoke-Checked "fake-omitted.exe" -Runner { param([string]$Program, [string[]]$Arguments) return 0 }
+'@).AddArgument(${function:Invoke-Checked}.ToString())
+        try {
+            $null = $runspace.Invoke()
+        } catch {
+            $omissionRejected =
+                $_.Exception.InnerException -is [System.Management.Automation.ParameterBindingException]
+            if (-not $omissionRejected) { throw }
+        }
+        $omissionRejected = $omissionRejected -or @($runspace.Streams.Error | Where-Object {
+            $_.Exception -is [System.Management.Automation.ParameterBindingException]
+        }).Count -gt 0
+    } finally {
+        $runspace.Dispose()
+    }
+    if (-not $omissionRejected) {
+        throw "omitting the argument list was not a mandatory-parameter binding error"
+    }
+}
+
+# The fake-runner arm below never executes `& $Program @Arguments`, so on its own
+# it cannot catch an edit that stops propagating the child's exit status or stops
+# forwarding argv. This arm drives the real branch end to end.
+#
+# The program it drives is the PowerShell host executing this script. That is the
+# one executable guaranteed to exist wherever this script can run, so the same
+# assertions execute on the Windows runners and on POSIX developer boxes with no
+# platform branch that could silently no-op on one of them (#512).
+function Invoke-CheckedRealProcessContractTests {
+    $pwshPath = (Get-Process -Id $PID).Path
+    if (-not $pwshPath) {
+        throw "real-process contract test could not resolve the running PowerShell host"
+    }
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) `
+        ("vllm-cpp-checked-" + [guid]::NewGuid().ToString("n"))
+    New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+    try {
+        Invoke-Checked $pwshPath @("-NoProfile", "-Command", "exit 0")
+
+        $nonzeroRejected = $false
+        try {
+            Invoke-Checked $pwshPath @("-NoProfile", "-Command", "exit 3")
+        } catch {
+            $nonzeroRejected = $true
+            if ($_.Exception.Message -notmatch 'exited with status 3$') {
+                throw "real-process failure did not report the child's own exit status: $($_.Exception.Message)"
+            }
+        }
+        if (-not $nonzeroRejected) {
+            throw "real-process nonzero exit status was accepted"
+        }
+
+        # Exits 0 only for three *distinct* argv entries, the first of which holds
+        # a space: joining, re-quoting, truncating or reordering the forwarded
+        # list all land on a different exit status.
+        $argvProbe = Join-Path $scratch "argv-probe.ps1"
+        @'
+if ($args.Count -ne 3) { exit 21 }
+if ($args[0] -ne 'one two' -or $args[1] -ne 'three' -or $args[2] -ne 'four') { exit 22 }
+exit 0
+'@ | Set-Content -LiteralPath $argvProbe -Encoding utf8NoBOM
+        Invoke-Checked $pwshPath @("-NoProfile", "-File", $argvProbe, "one two", "three", "four")
+
+        # The production calls this branch exists for forward an explicitly empty
+        # list to a program that takes no arguments, so drive that shape for real
+        # rather than only through the fake runner (#512).
+        $emptyProbe = Join-Path $scratch "empty-probe.ps1"
+        @'
+if ($args.Count -ne 0) { exit 23 }
+exit 0
+'@ | Set-Content -LiteralPath $emptyProbe -Encoding utf8NoBOM
+        Invoke-Checked $emptyProbe @()
+    } finally {
+        Remove-Item -Recurse -Force -LiteralPath $scratch -ErrorAction SilentlyContinue
+    }
+}
+
+# Most of this script's checked invocations run a test executable that takes no
+# arguments, so `Invoke-Checked` must bind an explicitly empty argument list and
+# still forward it verbatim (#512).
+function Invoke-CheckedContractTests {
+    $calls = [System.Collections.Generic.List[object]]::new()
+    $recorder = {
+        param([string]$Program, [string[]]$Arguments)
+        $calls.Add([pscustomobject]@{
+            Program = $Program
+            Arguments = @($Arguments)
+        }) | Out-Null
+        return 0
+    }.GetNewClosure()
+
+    Invoke-Checked "fake-empty.exe" @() -Runner $recorder
+    Invoke-Checked "fake-args.exe" @("--help", "--verbose") -Runner $recorder
+
+    if ($calls.Count -ne 2) {
+        throw "checked-invocation fake runner was not invoked exactly twice"
+    }
+    if ($calls[0].Program -ne "fake-empty.exe" -or $calls[1].Program -ne "fake-args.exe") {
+        throw "checked invocation did not forward its exact program"
+    }
+    if ($calls[0].Arguments.Count -ne 0) {
+        throw "checked invocation did not forward an explicitly empty argument list"
+    }
+    if ($calls[1].Arguments.Count -ne 2 -or
+        $calls[1].Arguments[0] -ne "--help" -or
+        $calls[1].Arguments[1] -ne "--verbose") {
+        throw "checked invocation did not forward its exact argument list"
+    }
+
+    $failing = { param([string]$Program, [string[]]$Arguments) return 3 }
+    foreach ($rejectedName in @("empty", "non-empty")) {
+        $rejected = $false
+        try {
+            if ($rejectedName -eq "empty") {
+                Invoke-Checked "fake-fail.exe" @() -Runner $failing
+            } else {
+                Invoke-Checked "fake-fail.exe" @("--help") -Runner $failing
+            }
+        } catch {
+            $rejected = $true
+        }
+        if (-not $rejected) {
+            throw "nonzero $rejectedName-argument exit status was accepted"
+        }
+    }
+
+    Invoke-CheckedBindingContractTests
+    Invoke-CheckedRealProcessContractTests
 }
 
 function Assert-CrtPolicy {
@@ -157,6 +322,7 @@ function Invoke-UnsupportedTierContractTests {
 }
 
 if ($ContractTest) {
+    Invoke-CheckedContractTests
     Invoke-CrtContractTests
     Invoke-UnsupportedTierContractTests
     Write-Host "Windows PowerShell/CRT contract tests OK"

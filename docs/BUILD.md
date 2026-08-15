@@ -270,9 +270,9 @@ of operations. Per-op detail is in the
 |---|---|
 | NVFP4 W4A4 / W4A16 | Both gate-model paths run on GB10, token-exact. FP4 tactics match vLLM; Marlin NVFP4 W4A16 grouped-MoE is the 35B expert path |
 | compressed-tensors NVFP4A16 (W4A16), dense | Correctness-complete via the Marlin weight-only path; speed not yet measured |
-| GGUF F32 / F16 / Q4_0 / Q8_0 / Q3_K / Q4_K / Q5_K / Q6_K | Supported. On CPU the six block encodings compute directly on the compressed blocks (`VT_GGUF_KEEP_QUANT=0` disables it). GPU builds still expand GGUF weights |
+| GGUF F32 / F16 and block quantization | Supported. CPU keeps the supported Q, IQ, and MXFP4 blocks compressed through the matrix multiply. CUDA also keeps the supported Q8_K-activation formats compressed; other formats fall back to expansion or CPU compute. Set `VT_GGUF_KEEP_QUANT=0` to disable the direct path. See [STATUS.md](STATUS.md) for the exact format and backend coverage |
 | FP8 (W8A8) | The 35B ModelOpt static per-tensor projection slice is implemented; generic FP8 modes and FP8 KV remain open |
-| MXFP4 / MXFP8 | Planned |
+| compressed-tensors MXFP4 (W4A16) | Qwen3 dense weights load and run through the Marlin path on CUDA. Qwen3-8B is correctness-gated and benchmarked against vLLM; c1 passes the speed floor, while c2-c8 remain below it. MXFP8 compute remains open |
 
 ## Environment variables
 

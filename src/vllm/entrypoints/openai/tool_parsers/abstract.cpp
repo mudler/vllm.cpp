@@ -38,6 +38,7 @@
 #include "vllm/entrypoints/openai/tool_parsers/llama.h"
 #include "vllm/entrypoints/openai/tool_parsers/llama4_pythonic.h"
 #include "vllm/entrypoints/openai/tool_parsers/olmo3.h"
+#include "vllm/entrypoints/openai/tool_parsers/parser_engine_adapter.h"
 #include "vllm/entrypoints/openai/tool_parsers/pythonic.h"
 #include "vllm/entrypoints/openai/tool_parsers/qwen3.h"
 #include "vllm/entrypoints/openai/tool_parsers/qwen3_coder.h"
@@ -258,6 +259,17 @@ std::unique_ptr<ToolParser> get_tool_parser(const std::string& name) {
   if (name == "muse_glimmer") {
     return std::make_unique<MuseGlimmerToolParser>();
   }
+  // inkling_tool_parser.py:7 (name "inkling", __init__.py:177) - Inkling's typed
+  // content blocks (<|content_thinking|>/<|content_text|>/
+  // <|content_invoke_tool_json|>) parsed by the SHARED ParserEngine, not a
+  // hand-rolled text parser: upstream's class is a bare
+  // make_adapters(InklingParser) tool adapter, and our engine + config already
+  // ship (parser/inkling.cpp, engine/configs.cpp inkling_config, golden-gated in
+  // test_parser_engine_assembly). This branch is the registry face over it -
+  // without it the name threw at startup and the ported dialect was unreachable.
+  if (name == "inkling") {
+    return std::make_unique<InklingEngineToolParser>();
+  }
   return nullptr;
 }
 
@@ -288,7 +300,7 @@ const std::vector<std::string>& tool_parser_names() {
       "kimi_k2",        "glm45",
       "glm47",          "minimax_m2",
       "gemma4",         "seed_oss",
-      "muse_glimmer",
+      "muse_glimmer",   "inkling",
   };
   return names;
 }

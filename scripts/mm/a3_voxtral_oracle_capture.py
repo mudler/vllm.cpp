@@ -30,7 +30,7 @@ Provenance (cite file:line):
   vllm/model_executor/models/whisper.py:458-535 WhisperEncoder (encoder tower).
 
 Run (CPU phase):  ~/venvs/vllm-oracle/bin/python a3_voxtral_oracle_capture.py --phase 1
-Run (GPU phase):  flock $HOME/gpu.lock ~/venvs/vllm-oracle/bin/python \
+Run (GPU phase):  flock "${GPU_LOCK:-$HOME/gpu.lock}" ~/venvs/vllm-oracle/bin/python \
                     a3_voxtral_oracle_capture.py --phase 2
 Fixtures land in ~/a3_fixture, then are copied into
 tests/vllm/multimodal/fixtures/voxtral_audio/.

@@ -189,6 +189,47 @@ if(VLLM_CPP_SERVER)
     add_test(NAME test_server_help COMMAND $<TARGET_FILE:server> --help)
     set_tests_properties(test_server_help PROPERTIES
       PASS_REGULAR_EXPRESSION "--max-num-seqs N.*--max-num-batched-tokens N.*--cuda-profile-graph-replays N.*--cuda-profile-graph-batch N.*--benchmark-shutdown-fifo F.*--enable-force-include-usage.*--\\[no-\\]enable-prefix-caching")
+
+    # --video-family (row MODEL-DIFFUSION-LTX25 / #435). Black-box, because the
+    # flag table lives in an anonymous namespace inside server_main.cpp and there
+    # is no unit seam onto it: the binary IS the surface under test. Both cases
+    # exit during ParseArgs, so neither loads a model, a checkpoint or a byte of
+    # weights, and both run in milliseconds.
+    #
+    # 1. AN UNREGISTERED NAME IS REFUSED, and the refusal NAMES what is
+    #    registered. Before the flag existed this printed "unknown argument
+    #    '--video-family'" instead, which is the RED.
+    add_test(NAME test_server_video_family_unregistered
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --video-family not-a-registered-family)
+    set_tests_properties(test_server_video_family_unregistered PROPERTIES
+      PASS_REGULAR_EXPRESSION "--video-family 'not-a-registered-family' is not a registered video family. Registered families:.*ltx-2\\.5.*minimax-h3")
+
+    # 2. A REGISTERED name is ACCEPTED — and specifically, the check consults the
+    #    REGISTRY rather than a list written out here, so the family LTX-2.5
+    #    registers from its own file passes. Proven by getting PAST the family
+    #    check to the next validation in ParseArgs (the tool-parser dialect),
+    #    with the family refusal absent from the output. A hardcoded list that
+    #    omitted ltx-2.5 REDs on the FAIL expression, and a check accidentally
+    #    dropped altogether REDs on it too (the unknown-argument spelling).
+    add_test(NAME test_server_video_family_registered
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --video-family ltx-2.5
+              --tool-call-parser definitely-not-a-registered-parser)
+    set_tests_properties(test_server_video_family_registered PROPERTIES
+      PASS_REGULAR_EXPRESSION "unknown tool-call parser \"definitely-not-a-registered-parser\""
+      FAIL_REGULAR_EXPRESSION "not a registered video family;unknown argument")
+
+    # 3. --video-extra takes KEY=VALUE, and a bare KEY is REFUSED rather than
+    #    read as an empty value. An extra that silently became "" is how a
+    #    mistyped knob renders the default and looks like the feature not
+    #    working — the same failure the families' own unknown-extra refusals
+    #    exist to stop, and it would be defeated one layer earlier here.
+    add_test(NAME test_server_video_extra_needs_a_value
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --video-extra dit_config_path)
+    set_tests_properties(test_server_video_extra_needs_a_value PROPERTIES
+      PASS_REGULAR_EXPRESSION "--video-extra takes KEY=VALUE, got 'dit_config_path'")
   endif()
 endif()
 
@@ -210,6 +251,16 @@ vllm_cpp_set_warnings(minimax-h3-mux)
 add_executable(minimax-h3-gen minimax_h3_gen/main.cpp)
 target_link_libraries(minimax-h3-gen PRIVATE vllm::shared)
 vllm_cpp_set_warnings(minimax-h3-gen)
+
+# ltx2-gen: an LTX-2.5 render end to end, the SECOND family behind the generic
+# video seam and a THIN client of the same C ABI. It exists rather than a flag on
+# minimax-h3-gen because LTX-2.5 cannot load without the v18 family-specific
+# extras (the audio-stream prompt embeds, the DiT config the shipped FP8
+# checkpoint does not carry, the latent upsampler) and that example drives
+# neither `family` nor the extras arrays. Row MODEL-DIFFUSION-LTX25 / #435.
+add_executable(ltx2-gen ltx2_gen/main.cpp)
+target_link_libraries(ltx2-gen PRIVATE vllm::shared)
+vllm_cpp_set_warnings(ltx2-gen)
 
 # vulkan-gemm-ab: the VK-C tactic A/B — cooperative matrix vs the portable scalar
 # GEMM, SAME BINARY with VT_VULKAN_COOPMAT as the only variable. Built only in a

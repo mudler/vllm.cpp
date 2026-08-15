@@ -20,7 +20,9 @@ re-merge, re-run the gate, and push again.
 
 For each row: confirm the issue, commit the spec, dispatch an implementer,
 dispatch a *different* reviewer, return findings to a new implementer, rerun the
-gate yourself, then merge or close.
+gate yourself, then merge or close. A dispatched helper needs a spec that is
+reachable from its base before dispatch. This mechanical requirement does not
+select the pull request shape for work that does not use helper dispatch.
 
 ## Isolation
 

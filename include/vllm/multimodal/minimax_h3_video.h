@@ -28,6 +28,15 @@
 // Byte-identity contract: on the committed fold fixture the CPU t2va render is
 // byte-identical to the PRE-fold `minimax-h3-gen` binary at fc636c76
 // (tests/vllm/models/test_minimax_h3_video_fold.cpp, three-arm gate).
+//
+// LTX-2.5 L1 (.agents/specs/ltx-2-5.md §5, issue #435): H3 is now ONE FAMILY
+// behind the generalized `vllm::multimodal::VideoEngine` seam, registered as
+// "minimax-h3" and reached through `LoadVideoEngine`. Nothing below changed
+// behaviourally — the H3-typed params/result structs, `Load`, and the H3-typed
+// `Generate` are the same entry points on the same code path, and the fold
+// gate above still holds them to the same golden bytes. What is new is that the
+// same handle also satisfies the abstract seam, and that the H3-specific
+// `partition` field maps to/from the generic `extras["partition"]`.
 #pragma once
 
 #include <cstdint>
@@ -35,6 +44,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/multimodal/video_engine.h"
 #include "vt/device.h"
 
 namespace vllm::openai {
@@ -42,6 +52,10 @@ struct VideoRequest;  // entrypoints/openai/video_api.h
 }
 
 namespace vllm::multimodal {
+
+// The stable registry name this family is reached under (VideoModelParams::family
+// / vllm_video_model_params.family).
+inline constexpr char kMiniMaxH3VideoFamily[] = "minimax-h3";
 
 // Map the stable public video ABI device selector onto the runtime's generic
 // backend key. The ABI remains 0=CPU / 1=CUDA; callers below this seam dispatch
@@ -118,31 +132,51 @@ struct MiniMaxH3VideoResult {
 
 // A loaded H3 video checkpoint set, weights staged once, ready to generate.
 // Construction throws std::runtime_error naming the problem on any mismatch.
-class MiniMaxH3VideoEngine {
+//
+// It IS a VideoEngine (L1): the generic overrides below are thin adapters over
+// the H3-typed members — same Impl, same forward, same bytes.
+class MiniMaxH3VideoEngine final : public VideoEngine {
  public:
   static std::unique_ptr<MiniMaxH3VideoEngine> Load(const MiniMaxH3VideoModelParams& params);
 
   MiniMaxH3VideoEngine(MiniMaxH3VideoEngine&&) noexcept;
   MiniMaxH3VideoEngine& operator=(MiniMaxH3VideoEngine&&) noexcept;
-  ~MiniMaxH3VideoEngine();
+  ~MiniMaxH3VideoEngine() override;
+
+  // Always kMiniMaxH3VideoFamily.
+  std::string family() const override;
 
   // The device selected by the queue created during Load().
-  vt::Device device() const;
+  vt::Device device() const override;
 
   // True when an encoder tower is loaded (the request PROMPT conditions the
   // render); false => prompt_embeds_path conditioning (or Generate refuses).
-  bool has_encoder() const;
-  bool has_prompt_embeds() const;
+  bool has_encoder() const override;
+  bool has_prompt_embeds() const override;
 
   // Run one blocking generation. Serialized internally (the staged weights are
   // shared state); throws std::runtime_error to fail the request.
   MiniMaxH3VideoResult Generate(const MiniMaxH3VideoGenParams& params);
+
+  // The generic spelling: converts, calls the H3-typed Generate above, converts
+  // back. There is no second code path.
+  VideoResult Generate(const VideoGenParams& params) override;
 
  private:
   MiniMaxH3VideoEngine();
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+// ── The generic <-> H3 param mapping (single-sourced so the C ABI, the HTTP
+// route and the registry loader cannot drift). `partition` is the ONE
+// H3-specific load field, and it rides in the generic `extras` under the key
+// "partition" — absent means declared-but-unknown, exactly as an empty
+// MiniMaxH3VideoModelParams::partition does (the #77 guard). ───────────────────
+MiniMaxH3VideoModelParams MiniMaxH3VideoModelParamsFromGeneric(const VideoModelParams& params);
+VideoModelParams MiniMaxH3VideoModelParamsToGeneric(const MiniMaxH3VideoModelParams& params);
+MiniMaxH3VideoGenParams MiniMaxH3VideoGenParamsFromGeneric(const VideoGenParams& params);
+VideoResult MiniMaxH3VideoResultToGeneric(const MiniMaxH3VideoResult& result);
 
 // The ONE mapping from a parsed /v1/videos request onto the seam's params —
 // library-owned so the HTTP route and the FFI cannot drift (the pre-fold

@@ -184,11 +184,15 @@ GdnLayerWeights LoadQwen3_5DenseGdn(const TensorResolver& get,
                                     const std::string& layer_base);
 
 // Load one dense decoder layer. `layer_type` is "linear_attention" or
-// "full_attention". Prefix is "model.language_model.layers.{layer_idx}.". Routes
-// each Linear to ordinary BF16 or compressed NVFP4 based on tensor presence.
-Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
-                                               const std::string& layer_type,
-                                               int64_t layer_idx);
+// "full_attention". Prefix is "{backbone_prefix}layers.{layer_idx}.", defaulting
+// to the VL spelling every checkpoint we gate today uses, so this seam is
+// byte-identical for the 27B/35B/Coder callers; `LoadQwen3_5Dense` passes the
+// prefix it resolved ONCE from the shard index
+// (`ResolveQwen3_5BackbonePrefix`). Routes each Linear to ordinary BF16 or
+// compressed NVFP4 based on tensor presence.
+Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
+    const TensorResolver& get, const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix = std::string(kQwen3_5VlBackbonePrefix));
 
 // The same load with an EXPLICIT presence probe — what `LoadQwen3_5Dense` calls
 // per layer. The resolver-only overload above answers `has` with a constant
@@ -199,7 +203,8 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(const TensorResolver& get,
 // production takes.
 Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const TensorResolver& get, const std::function<bool(const std::string&)>& has,
-    const std::string& layer_type, int64_t layer_idx);
+    const std::string& layer_type, int64_t layer_idx,
+    const std::string& backbone_prefix = std::string(kQwen3_5VlBackbonePrefix));
 
 // Full dense-model load across the given shards. Uses config.num_hidden_layers
 // and config.layer_types. Text path only — the vision tower (model.visual.*)

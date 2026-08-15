@@ -98,13 +98,19 @@ OwnedTensor DeinterleaveWqkv(const StTensor& wqkv, const HfConfig& cfg,
   VT_CHECK(wqkv.nbytes == expected, "internlm2: byte-size mismatch for " + name);
 
   OwnedTensor merged = MakeOwned(vt::DType::kBF16, {out_rows, H});
-  const auto* src = reinterpret_cast<const uint16_t*>(wqkv.data);
+  // `src` stays BYTE-typed: it points into the mmap'd safetensors payload, whose
+  // per-tensor offset is the running total of everything ahead of it and so need
+  // not be even, and a `const uint16_t*` onto an odd byte is undefined to form
+  // (issue #627). Every read below is a bulk memcpy, so byte offsets — the same
+  // arithmetic scaled by sizeof(uint16_t) — copy the identical bytes.
+  const uint8_t* src = wqkv.data;
   auto* dst = reinterpret_cast<uint16_t*>(merged.bytes.data());
-  const size_t row = static_cast<size_t>(H);  // elems per output row
+  const size_t row = static_cast<size_t>(H);        // elems per output row
+  const size_t row_bytes = row * sizeof(uint16_t);  // bytes per output row
   if (WrongSplitRed()) {
     // RED path: copy wqkv straight through (naive [q|k|v] concat, NO
     // de-interleave) — the WRONG split; heads end up scrambled.
-    std::memcpy(dst, src, static_cast<size_t>(out_rows) * row * sizeof(uint16_t));
+    std::memcpy(dst, src, static_cast<size_t>(out_rows) * row_bytes);
     MaybeReleaseSourcePages(wqkv.data, wqkv.nbytes);
     merged.nk = true;
     return merged;
@@ -113,16 +119,16 @@ OwnedTensor DeinterleaveWqkv(const StTensor& wqkv, const HfConfig& cfg,
     const int64_t block = g * (groups + 2) * Dh;  // first wqkv row of kv-group g
     // q: groups*Dh rows -> q section at g*groups*Dh
     std::memcpy(dst + static_cast<size_t>(g * groups * Dh) * row,
-                src + static_cast<size_t>(block) * row,
-                static_cast<size_t>(groups * Dh) * row * sizeof(uint16_t));
+                src + static_cast<size_t>(block) * row_bytes,
+                static_cast<size_t>(groups * Dh) * row_bytes);
     // k: Dh rows -> k section (after q_rows) at g*Dh
     std::memcpy(dst + static_cast<size_t>(q_rows + g * Dh) * row,
-                src + static_cast<size_t>(block + groups * Dh) * row,
-                static_cast<size_t>(Dh) * row * sizeof(uint16_t));
+                src + static_cast<size_t>(block + groups * Dh) * row_bytes,
+                static_cast<size_t>(Dh) * row_bytes);
     // v: Dh rows -> v section (after q_rows+kv_rows) at g*Dh
     std::memcpy(dst + static_cast<size_t>(q_rows + kv_rows + g * Dh) * row,
-                src + static_cast<size_t>(block + (groups + 1) * Dh) * row,
-                static_cast<size_t>(Dh) * row * sizeof(uint16_t));
+                src + static_cast<size_t>(block + (groups + 1) * Dh) * row_bytes,
+                static_cast<size_t>(Dh) * row_bytes);
   }
   MaybeReleaseSourcePages(wqkv.data, wqkv.nbytes);
   merged.nk = true;  // raw [N=out_rows, K=H] for vt::MatmulBT

@@ -128,6 +128,32 @@ context is never torn down, so the pointers stayed mapped — it simply produced
 corrupted or zeroed output tokens, intermittently
 ([#237](https://github.com/mudler/vllm.cpp/issues/237)).
 
+More than one **backend** in one process is likewise supported — a CPU forward
+running beside a CUDA one, which is what a diffusion pipeline with a host-side
+stage does. Until
+[#516](https://github.com/mudler/vllm.cpp/issues/516) it was not: the shared
+device-scratch pool was a single process-wide free list keyed by byte size class
+with no device in the key, so a block allocated through one backend was handed
+to the next caller of that size class on another. It has two symptoms and the
+direction picks which: a `cudaMalloc` block reaching a CPU forward segfaults in
+the host `memcpy`, and a host block reaching a CUDA forward produces output that
+is uniformly NaN rather than wrong. Neither can happen now — a scratch pool is
+bound to one backend and refuses any other with a `std::logic_error` naming both
+— and no user-facing flag or env var selects the behaviour: it is unconditional.
+
+One consequence is worth knowing before you add a backend. The scratch pool's
+residency cap now comes from *that device's* platform rather than from whichever
+device resolved first, so constructing a buffer on a backend whose platform was
+never registered raises instead of silently inheriting another platform's cap. A
+cap read off the wrong platform is a wrong number, not a default, and every
+backend the tree ships registers one.
+
+`VT_POOL_BYPASS=1` and `VT_POOL_EXACT=1` keep exactly the meanings
+[ENVIRONMENT.md](ENVIRONMENT.md) records for them. They are debugging lanes, not
+timing configurations, and the pool's own test suite is green under both, so
+either one stays usable as a discriminator when something else is under
+suspicion.
+
 ## Starting an agent-assisted contribution
 
 Run `scripts/agent-start.py` first. It reports an inherited worktree role or,
@@ -143,6 +169,36 @@ refused, `scripts/agent-role.py show` lists the other live coordinators, and
 `scripts/agent-role.py release` removes only this worktree's record. What keeps
 concurrent coordinators safe is that `main` is never force-pushed, so a plain
 `git push` refuses any non-fast-forward.
+
+### `GPU_LOCK`: one file mutex, and only one
+
+Copy `.env.example` to `.env` and load it with `set -a; . ./.env; set +a`. Every
+key there may be left empty to mean "my setup does not have this" — **except
+`GPU_LOCK`**, which ships a real default:
+
+```sh
+GPU_LOCK=$HOME/gpu.lock
+```
+
+On a shared box, every GPU job takes that file for the whole job or the whole
+benchmark series:
+
+```sh
+flock "${GPU_LOCK:-$HOME/gpu.lock}" -c '<command>'
+```
+
+Do not point it somewhere else. A mutex only works if everyone opens the **same
+file**, and `flock` on a different path *succeeds* — that is what a mutex does —
+so a divergent value serialises you with nobody and never says so. The damage
+shows up much later as timing noise, and it does not read as "my number is
+wrong", it reads as "someone else misbehaved": a whole benchmark series was lost
+to this, with every absolute timing downgraded to an upper bound because only
+interleaved ratios survive contention (#777). Every script in this repo falls
+back to the same default, so change it only if every agent and harness on the
+box moves with you.
+
+If your `.env` predates this default and names another path, fix it by hand —
+`.env` is untracked, so a shipped default cannot reach it.
 
 ## Running inference (CLI)
 
@@ -171,6 +227,33 @@ build/examples/vllm-cli \
 | `--max-num-seqs N` | engine default (32) | Max concurrent sequences. Under speculative decoding on a GDN model the recurrent state is `max-num-seqs x (k+1)` per slot, so this is the knob to lower when a run is refused for state budget |
 | `--repeat N` | `1` | Load once, then run N blocking completions. Use it to read a warm decode tok/s without paying model load each time. Not supported with `--stream`, which falls back to 1 |
 | `-h`, `--help` | | Print usage and exit |
+
+`--model` resolves a Qwen3.5-family checkpoint's backbone under EITHER weight
+namespace. The multimodal wrappers (`Qwen3_5ForConditionalGeneration`,
+`Qwen3_5MoeForConditionalGeneration`) publish the text backbone nested under
+`model.language_model.`; the text-only arms (`Qwen3_5ForCausalLM`,
+`Qwen3_5MoeForCausalLM`) publish it flat under `model.`. The loader decides which
+ONCE per checkpoint from the shard index, and REFUSES a checkpoint that carries
+backbone tensors under both rather than binding half the model from each.
+
+**Resolving the namespace is not the same as loading the checkpoint, and the
+MoE and dense arms differ.** The dense loader routes each projection to BF16,
+FP8 or NVFP4 by tensor presence, so a flat bf16 `Qwen3_5ForCausalLM` checkpoint
+is expected to load. The **MoE** loader reads two ROUTED-EXPERT layouts and
+decides between them ONCE per checkpoint from the shard index: per-expert NVFP4
+(`experts.<e>.<proj>.weight` U8 + `.weight_scale` + `.weight_scale_2`, what an
+NVFP4 requant ships) and the 3-D stacked BF16
+`experts.{gate_up_proj,down_proj}` the published repos (`Qwen/Qwen3.8-2.4T-A95B`,
+`Qwen/Qwen3.6-35B-A3B`) ship. A checkpoint carrying BOTH spellings under its
+backbone is refused rather than half-bound.
+
+**A published bf16 MoE repo still does not load end to end.** It is bf16
+*throughout*, and the MoE arm implements only per-tensor FP8 for the
+attention/GDN tower and NVFP4 for the shared expert and `lm_head`; those arms are
+OWED, and such a checkpoint is refused at load with a message naming what is
+missing. Use an NVFP4 requant (e.g. `nvidia/Qwen3.6-35B-A3B-NVFP4`) for the MoE
+path. No text-only Qwen3.5 checkpoint has been RUN here at all — see
+[STATUS.md](STATUS.md) for the owed run gates.
 
 GGUF and safetensors mapped-payload paths, plus safetensors index paths, use the
 host's native filesystem encoding, including Unicode paths on Windows. Native
@@ -342,9 +425,292 @@ tokens quietly.
 | Architecture | Why it refuses |
 |---|---|
 | `KimiK3ForConditionalGeneration` | Needs ~1.56 TB (MXFP4); no host here can run it |
+| `NemotronHForCausalLM` | The hybrid forward is ported (#517 W4) but there is no weight LOADER yet, so a checkpoint still cannot be run: loading leaves the weights unmaterialized and the forward refuses by name. Safetensors resolve and parse; a GGUF file is refused by name, since no GGUF arm exists for it |
 
 This is a deliberate state, not a bug: registering the architecture is what lets
 the config parse and weight-name mapping be tested before the forward exists.
+
+### LTX-2.5: what runs, and what it cannot do
+
+LTX-2.5 is reachable as video family `ltx-2.5`, through the same
+`vllm_video_engine_load` / `vllm_video_generate` C ABI that serves MiniMax-H3,
+and through the `ltx2-gen` example that drives it. Its two VAE decoders, its two
+VAE ENCODERS with the mel front-end, the conditioning items that place encoded
+latents into the token stream, and its pipeline layer (the sigma schedule, the
+diffusion steps, guidance, the latent spatial x2 upsampler, the duration head and
+the embeddings connector) are implemented and gated. Several limits decide what
+you can actually ask for, and each refuses by name rather than rendering
+something else.
+
+**Image conditioning (image-to-video) runs at `image_crf=0`, and only there.**
+Pass a first frame as binary PPM (`first_frame_path` / `first_frame_ppm`) plus
+the per-generation extra `image_crf=0`; the engine decodes it, aspect-fills and
+centre-crops it to each phase's own resolution, VAE-encodes it, and replaces
+latent frame 0's clean tokens. `noise_aug` is the pinning strength (`1.0`, the
+default, pins the frame exactly).
+
+`image_crf=0` must be asked for **explicitly**, and it is **out of
+distribution**. Upstream re-compresses a conditioning image through H.264 at the
+CRF the checkpoint's generation was trained with, and an LTX-2.5 checkpoint
+resolves that to **18**. That round trip needs libx264 and no codec is vendored
+here, so a non-zero CRF — including the default a caller gets by saying nothing —
+is refused by name. `image_crf=0` is upstream-legal (upstream short-circuits it
+and documents an explicit `0` as "skip re-compression entirely") but conditions
+the model on pixels it was not trained to see. That is a render-quality cost, and
+it is stated rather than applied silently.
+
+Keyframe, reference-image, reference-video and reference-audio conditioning are
+still refused, each naming a different missing piece: a last-frame keyframe needs
+the token-APPEND machinery — a keyframe is appended to the sequence with its own
+positions and a rebuilt attention mask, then trimmed back off, and this engine's
+phase loop is fixed at the target grid's token count — while the served
+first-frame arm only REPLACES tokens that already exist; the reference arms need
+the IC-LoRA's scale factors, which live in LoRA metadata this project does not
+read; reference audio additionally needs the AUDIO VAE's encoder key filter,
+which is not built. (Until 2026-08-13 this said a last-frame keyframe needs the
+DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyframe
+is appended unmarked, so the embedding never applies to it. Where the embedding
+does bite is the FIRST latent frame of every render, which is a separate gap,
+tracked as issue #658.) Three encoder-level limits are worth
+stating in advance because they are refusals rather than approximations. A
+reference waveform whose sample rate differs from the audio VAE's is refused
+rather than resampled, since upstream uses a polyphase kaiser resampler this
+project does not carry. A VAE configured with `latent_log_var: none` is
+refused, because upstream itself raises on it. And a video-VAE `res_x` encoder
+block that declares no `num_layers` is refused rather than defaulted, because
+upstream subscripts that key and raises `KeyError` on it; no other encoder block
+kind reads it.
+
+**A typed prompt works.** `--encoder` names the Gemma-4 12B text tower and
+`--prompt` carries the words. The tower tokenizes them with its OWN embedded
+tokenizer — the shipped encoder stores `tokenizer.json` as a TENSOR, so there is
+no sibling file to point at — runs, aggregates all 49 hidden states, projects
+them to 4096 and 2048, and passes both streams through the embeddings connector
+before cross-attention. The tower is ~24 GB of host bf16 and stays resident,
+because a prompt arrives per request.
+
+One tokenization detail is a KNOWN DIVERGENCE rather than a mirror, and it is
+checkpoint-conditional: upstream tokenizes through the HuggingFace `__call__`
+with its default `add_special_tokens=True`, so it runs the tokenizer's
+post_processor, while this port calls the plain encode and prepends BOS by hand.
+On the shipped checkpoint the two are identical — its post_processor declares an
+EMPTY special-token map, measured on the shipped file rather than assumed — so
+nothing is lost today. A checkpoint whose post_processor DID add tokens would
+tokenize differently here.
+
+`--encoder-config` supplies the Gemma config, and it is required for the only
+shipped encoder: `vonkaiser`'s
+`gemma4-12b-with-proj-nvfp4-torchao.safetensors` carries no `__metadata__` at
+all. An encoder that declares one (the official bf16 build does, under
+`__metadata__["gemma_config"]`) needs no flag, and supplying both is refused
+rather than resolved — `layer_types`, `global_head_dim`,
+`num_global_key_value_heads` and `attention_k_eq_v` each resolve a different
+tower out of a byte-identical tensor set.
+
+Without `--encoder`, conditioning comes from `--prompt-embeds` plus
+`--audio-prompt-embeds`: rows of little-endian f32, 4096 wide for the video
+stream and 2048 for the audio stream, with the same row count in both. A
+`--prompt` with no tower is refused, and supplying only one of the two files is
+refused, because a stream left unconditioned renders instead of failing.
+
+**Asking what a clip was conditioned on.** `Ltx2VideoEngine::last_conditioning()`
+returns the trace of the last `Generate()` — whether the conditioning came from a
+prompt or from embeds, the prompt string, the row count and both stream widths, an
+FNV-1a digest over the exact f32 buffers cross-attention read, and each stream's
+absmax. When the request carried an image it also reports the CRF and strength it
+was conditioned at, how many tokens the encoded image replaced, and a digest over
+**those tokens as written into the state** — not over the encoder's output, so a
+build that encoded an image and never placed it reads as unconditioned rather
+than healthy. It is returned **by value, under the engine's own lock**, so it is safe to
+call from a server thread while another thread renders — but `Generate` holds that
+same lock for the WHOLE render, so such a call blocks for minutes rather than
+returning a stale answer immediately. `completed` is true only if that
+`Generate()` returned: the trace is filled before the denoise loop, so a
+render that throws later leaves a populated trace behind, and this flag is what
+separates the two.
+
+It is a **change detector, not a quality measure**. It answers "did this render
+depend on this prompt, through these weights" and nothing else — it does not say
+the conditioning values are the ones upstream would produce.
+
+The text path runs on the CPU even when `--device cuda` puts the DiT on the GPU:
+everything in the text encoder is f32 by declaration and its device arm is owed.
+That is one host-side 12B forward over the prompt's own tokens per request,
+against a denoise loop of many 21B forwards.
+
+**Either source goes through the embeddings connector.** Both shipped LTX-2.5 DiTs
+carry two `*_embeddings_connector` families, 129 tensors each, and they are the
+8-layer 1-D transformer upstream runs between the caption projections and the
+DiT's cross-attention. The render applies it with the checkpoint's own weights,
+under the checkpoint's own `connector_*` configuration. Two consequences for the
+command line: the row count must be a multiple of the connector's learnable
+register count (128 on the shipped files), and `--prompt-valid-rows N` says how
+many of those rows are real tokens. The rest are padding, and padding is not
+inert here: the connector REPLACES it with its learnable register table, so a
+run that leaves the default renders as if every supplied row were caption.
+`--prompt-valid-rows` applies to the embeds path only — with `--encoder` the
+tokenizer supplies the mask, which is what that flag exists to stand in for.
+
+**The DiT config is required when the checkpoint does not carry one.** The
+shipped `vonkaiser` FP8 transformer has no `__metadata__` at all, and the values
+a config decides are ones no tensor shape encodes: `frequencies_precision` and
+`av_ca_timestep_scale_multiplier` move every RoPE angle and every audio/video
+modulation. Defaulting them resolves a different model from the same file, so
+the loader refuses and `--dit-config` supplies LTX-2.5's declared values.
+
+```sh
+ltx2-gen --dit  ltx-2.5-22b-distilled-fp8.safetensors \
+         --dit-config ltx-2.5-transformer-config.json \
+         --model-version 2.5 --allow-unported \
+         --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+         --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+         --upsampler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+         --encoder gemma4-12b-with-proj-nvfp4-torchao.safetensors \
+         --encoder-config ltx-2.5-gemma4-text-config.json \
+         --prompt "a red fox running through deep snow at sunrise" \
+         --frames 25 --width 320 --height 192 --seed 20260812 \
+         --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
+```
+
+Swap the two `--encoder*` flags and `--prompt` for `--prompt-embeds` +
+`--audio-prompt-embeds` to condition from files instead.
+
+Add `--first-frame frame.ppm --image-crf 0` for image-to-video. The PPM is
+binary P6 at maxval 255 (no PNG/JPEG codec is vendored); `--image-crf 0` is
+required and is not the default, because omitting it resolves the checkpoint's
+own CRF 18 and refuses — see the out-of-distribution note above.
+
+`--frames` must satisfy `(frames - 1) % 8 == 0` and width/height must divide by
+64 (32 for the VAE, twice that because the distilled recipe's first phase runs at
+half resolution). Omitting all three renders the recipe default, which is
+1024x1536 at 121 frames and is a much larger request than it looks.
+
+`--upsampler` is what the distilled recipe's second phase needs. Without it that
+phase refuses rather than skipping: its three-step refinement is what makes the
+upscaled latent valid, and decoding the half-resolution latent instead would hand
+back a smaller clip that looks like a completed request. `--max-phase 0` stops
+after the first phase deliberately.
+
+On the server, `--video-family ltx-2.5` pins the family instead of detecting it,
+and `--video-extra KEY=VALUE` (repeatable) carries the same family-specific load
+knobs the flags above map onto. Both are described under
+[the server's video flags](#video-family-and-family-specific-load-knobs).
+
+**Three things about that command are worth knowing before you run it.**
+
+*It is bounded by the VIDEO DECODE, well below the recipe's own defaults.*
+Staging the 21.00B FP8 transformer costs about 44 GB on a 119 GB GB10, and
+`--encoder` adds the text tower on top of that — roughly 24 GB of host bf16 that
+stays resident, because a prompt arrives per request. Every memory figure here
+was measured WITHOUT the tower, on the prompt-embeds path, so budget for both.
+**320x192 at 25 frames completes** through both distilled phases; 448x256 at 25
+frames finishes its denoise and then loses about 59 GB in 24 seconds inside the decode
+and has to be stopped. The denoise itself is flat at either size. Unified memory
+makes those host bytes and this class of box reboots rather than OOM-killing, so
+start small and grow, and put a memory watchdog in front of anything larger. The
+recipe default (1024x1536 at 121 frames) is far beyond what one GB10 holds today.
+Expect minutes, not seconds: most of a 320x192/25f render is spent single-threaded
+in the host VAE decode at 0% GPU.
+
+*The render behind those numbers was NOT prompted, and it renders a scene without
+rendering YOUR scene.* It was the EMBEDS path — `--prompt-embeds` with
+`--prompt-valid-rows 24`, over synthetic N(0, 0.2) rows, with no text tower on the
+path at all. With the connector wired the shipped 21.00B FP8 transformer produced
+a temporally coherent photorealistic clip at 320x192 / 25 frames: consistent
+subject, consistent background, frame-to-frame motion, where before the connector
+the same weights at the same settings produced smooth colour fields. But 104 of
+its 128 connector rows were the connector's own trained `learnable_registers`
+table, which is what upstream substitutes at PADDED positions, and the other 24
+were noise. So what conditioned that clip is the checkpoint's own learned default,
+not a depiction of anything anyone asked for — and on the embeds path it could not
+be otherwise, because rows read from a file are whatever you put in them rather
+than an encoded caption. Ask a `--prompt-embeds` run for a subject and you will
+not get it.
+
+*Nobody has yet run the command above end to end, and this page claims nothing
+about what it renders.* The typed-prompt path is gated all the way through —
+tokenizer, Gemma-4 tower, connector, cross-attention — but the gate is a
+REDUCED-DIMENSION synthetic encoder under CPU Release, with no real checkpoint
+anywhere in it. A real-checkpoint prompted render is OWED. Until it runs, neither
+claim is available: not that `--prompt "a red fox…"` puts a fox on the screen, and
+not that it fails to. `last_conditioning()` answers a narrower question — that the
+render depended on your prompt, through these weights — which is not the same
+question as whether the frames depict it.
+
+LTX-2.5 ships two video decoders behind one checkpoint field. The convolutional
+one is implemented; the higher quality diffusion one (`NADiffusionDecoder`) is
+not, and asking for it fails with a message naming the missing
+neighborhood-attention kernel. It never falls back to the convolutional decoder,
+because that would hand back a lower quality render as if it were the one you
+asked for. Keyframe and reference conditioning is refused for the same reason: it
+runs through the video VAE's encoder, and only the decoder is ported.
+
+**The convolutional decode is TILED and STREAMED, on upstream's own defaults, and
+there is no knob.** The layout is the one `ltx_pipelines` builds for a Conv VAE
+when you pass `AUTO_TILING`: a 768 px tile with a 64 px overlap on the long side,
+aspect coupled to the short one, and 80 frame temporal chunks overlapping by 24.
+Each temporal chunk is written to its PPM files and dropped, so the full pixel
+volume never exists at once. Two consequences worth knowing before you read a
+memory number:
+
+- **Below a 768 px long side and 81 frames the layout does not tile at all.** A
+  single tile comes out, and that path reproduces the untiled decode bit for bit
+  (`test_ltx2_tiling`'s one tile control, on both causality settings). So
+  448x256/25f renders byte identically to how it rendered before tiling existed,
+  and its memory is unchanged. Tiling starts doing something at 896x512, and
+  temporal chunking at 81 frames.
+- **A tiled render is not the same image as an untiled one**, and that is
+  upstream's behaviour, not a defect here. Each tile decodes a crop of the latent,
+  the decoder's receptive field is wider than the 64 px overlap, and the seam is
+  blended rather than eliminated. Do not compare a 1920x1088 render against a
+  hypothetical untiled one and read the difference as an error.
+- **81 to 120 frames is already the tiled regime, and the recipe default is
+  inside it.** The default request is 1024x1536 at 121 frames. At 81 frames the
+  latent is 11 frames deep against a 10 frame temporal tile, so it splits into two
+  chunks. Measured on the shipped conv VAE at 64x64 / 81 frames: max abs diff
+  0.0503 against the untiled decode, on an output whose own max is 0.7513 — 6.70%
+  of that range — with 962983 of 995328 channel values (96.75%) not bit identical.
+  So nearly every value moves, by a few percent of the signal. If you need the pre
+  tiling render back, ask for 73 frames or fewer.
+
+**The refusal that used to stand here is gone, and what replaced it is an owed
+ORACLE rather than an owed feature.** Through L10 this page said a prompt was
+refused because the `Embeddings1DConnector` weights, which ship inside the DiT
+file, were among the modules the DiT loader would not load. They are loaded
+(`ltx2_loader.cpp:416-427` carries them as their own contract, outside the DiT's),
+so `encoder_path` is accepted, `has_encoder()` is true, and a prompt no longer
+needs a matching pair of embeds files. The gap that remains is a numeric one: the
+tower, the connector's forward and both caption projections each have an oracle
+against executed upstream, and the two JOINS between them —
+`create_embeddings`, and the render composition that chains it onto the tower's
+output — have none. Upstream's `EmbeddingsProcessor.process_hidden_states` is
+that whole chain in one function and is the oracle this owes; until it is
+executed, the composition's VALUES rest on the per-brick oracles either side of
+it. That is also why `last_conditioning()` is described above as a change
+detector and not as a check on the conditioning.
+### GDN checkpoints: the `output_gate_type` key
+
+A Gated DeltaNet checkpoint (the Qwen3.5 / Qwen3-Next family) chooses its
+output-gate activation in `config.json`:
+
+| `output_gate_type` | Gate applied |
+|---|---|
+| absent | `silu` — the upstream default |
+| `"silu"` or `"swish"` | `silu` — `swish` is an alias, collapsed at load |
+| `"sigmoid"` | `sigmoid` |
+| present but `null`, `""`, or not a string | refused |
+
+The key is read from the **resolved text config**, so a flat text-only
+`config.json` and a multimodal wrapper that nests the text model under
+`text_config` behave identically. Any other value is **refused at load** with a
+message naming the key and the accepted set — never silently defaulted, because
+the wrong gate is a numerics change that still emits plausible tokens
+([#489](https://github.com/mudler/vllm.cpp/issues/489)).
+
+Only an **absent** key takes the default. A key that is present but `null` or
+empty is a value, not an absence: upstream hands it straight to its
+`assert output_gate_type in ["silu", "swish", "sigmoid"]` and errors, so this
+loader refuses it as well rather than quietly reading it as `silu`.
 
 ### Muse Glimmer: exactly what has been checked
 
@@ -794,6 +1160,61 @@ Registered in
 | POST | `/v1/videos/sync` | Same, but runs to completion before answering |
 | GET | `/v1/videos/{id}` | Job status |
 | GET | `/v1/videos/{id}/content` | The finished MP4 (`video/mp4`) |
+| POST | `/v1/audio/speech` | Text (or lyrics + a music description) to audio; responds with `audio/wav` bytes. Registered **only** when a synthesizer is attached (`--speech-model`) |
+
+The reference-audio side of IndexTTS-2.5 is complete in the library -- a 16 kHz
+clip goes through the SeamlessM4T feature extractor, the w2v-bert Conformer, the
+layer-17 hidden-state tap, the checkpoint's stored-statistics normalization and
+the semantic codec to discrete codes, and the talker's prompt is assembled from
+that conditioning plus the text -- but none of it is reachable from a command or
+a route yet. The greedy generate loop that turns the prompt into mel codes is
+ported too, and so is the STATED-emotion path -- eight weights selecting rows
+from the checkpoint's own speaker and emotion matrices by cosine similarity -- so
+text plus a reference clip and an emotion reaches mel CODES in the library. What
+is still missing is a COMMAND or ROUTE. TEXT DOES REACH AUDIO in the library:
+`test_indextts2_e2e` tokenizes with the checkpoint's own vocabulary, runs the
+talker to mel codes, and drives those through the length regulator, the CFM loop
+and BigVGAN to samples. Point it at all four checkpoint paths:
+
+```sh
+VLLM_CPP_INDEXTTS2_S2MEL=... VLLM_CPP_INDEXTTS2_BIGVGAN=... \
+VLLM_CPP_INDEXTTS2_GPT=... VLLM_CPP_INDEXTTS2_TIKTOKEN=... \
+  ./build/tests/test_indextts2_e2e
+```
+
+A REAL LIMITATION to know before using it: the reference clip is required and
+then IGNORED. Its encoders are ported and their checkpoints are staged, but the
+conditioning rows are zeros, so two different reference voices give the same
+output today. `campplus::LoadCampplus` reads its weights but
+`campplus::Forward` returns NaN on them, which is an open defect recorded in
+the spec and blocks the wiring.
+
+It asserts STRUCTURE, not quality: nothing is compared against vLLM-Omni, which
+is unpinned (#633). The TOKENIZER it uses:
+`tiktoken::LoadRanks` reads the shipped `.tiktoken` vocabulary and
+`tiktoken::Encode` reproduces python tiktoken's ids exactly on the cases
+gated, CJK included. The checkpoint now
+LOADS through `vllm::multimodal::SpeechRegistry`, reports its family and its
+22.05 kHz output rate, and states that a reference clip is required; asking
+it to synthesize refuses by naming the one gap between text and the render
+path, which is that the shipped vocabulary is tiktoken and this tree has no
+reader for one. The pipeline itself renders on the real
+checkpoints: the talker emits its own mel codes, the length regulator resamples
+them to the mel frame rate, a classifier-free guided CFM Euler loop integrates
+the S2Mel estimator, and BigVGAN turns the mel into a bounded 22.05 kHz
+waveform. `indextts2::Render` is the entry point, and
+`test_indextts2_render` drives it end to end when the three checkpoint
+environment variables are set. It is NOT yet measured against the vLLM-Omni
+oracle, which is unpinned (#633), so nothing here is a quality claim. Inferring the emotion from a clip instead of stating it needs a
+Conformer and a Perceiver that are not ported.
+
+There is **no `/v1/audio/speech`**. Text to speech is not servable: the
+IndexTTS-2.5 stages are ported and gated at reduced dimensions, with further
+stages named as missing by the checkpoint's own manifest, and no route is
+registered, the public ABI carries no synthesis entry point, and loading the
+family refuses with a message naming the missing pieces (#634). Asking a running server for speech
+today is a 404 at the route table, not a runtime error, and that is the accurate
+signal: the capability does not reach any surface yet.
 
 `prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
 and the engine computes it — every prompt position is scored against the token
@@ -818,6 +1239,87 @@ The four `/v1/videos` routes are registered **only** when the server was started
 with `--video-dit`; without it they are absent (404) and the server is identical
 to one built without video support. See
 [MiniMax-H3: video + audio generation](#minimax-h3-video--audio-generation).
+
+`/v1/audio/speech` is registered **only** when the server was started with
+`--speech-model`; without it the route is absent (404) and the server is
+identical to one built before it existed. See
+[Speech and music generation](#speech-and-music-generation).
+
+### Speech and music generation
+
+    vllm-server --model /path/to/text-model \
+      --speech-model /path/to/minimax-music3 \
+      [--speech-family minimax-music3]
+
+`--speech-model` names the checkpoint **set** — MiniMax-Music3 ships six
+component directories beside a `modular_model_index.json`, so this is not a
+single model directory. `--speech-family` is optional: omitted, the family is
+**detected** by inspecting the artifact, and a directory no registered family
+claims is refused at startup naming every family that was tried. A name that is
+not registered is refused too; it is never treated as a hint, because the wrong
+family would not fail — it would render noise.
+
+The route is OpenAI's `createSpeech` shape, with the two **music** inputs as
+additional named fields:
+
+    curl http://localhost:8000/v1/audio/speech \
+      -H 'Content-Type: application/json' \
+      -d '{"model": "minimax-music3",
+           "lyrics": "[Verse]\nMorning light filtering through the pine\n",
+           "description": "Genre: acoustic pop. BPM: 96. Key: C major.",
+           "audio_duration": 30, "num_inference_steps": 30, "seed": 7}' \
+      --output song.wav
+
+The response body is RIFF/WAVE 16-bit PCM at the family's **native** rate
+(44100 Hz stereo for MiniMax-Music3, never resampled), with content type
+`audio/wav`.
+
+`lyrics` and `description` are separate fields rather than one `input` behind a
+separator because upstream runs a different normalizer over each. A
+one-utterance family keeps using OpenAI's `input`. `prompt` is the documented
+alias for `description`, and supplying both with different values is a 400
+rather than a silent winner.
+
+Refused by name rather than ignored, because honouring any of them silently
+would return audio the caller did not ask for: `voice` (no registered family
+exposes named voices), `speed` (no family implements a rate control), `stream` /
+`stream_format` (MiniMax-Music3 generates the whole song before the first sample
+exists, so buffering it would be a stream in name only) and any
+`response_format` other than `"wav"` (no mp3/opus/aac/flac encoder is vendored).
+
+A family with no text-only synthesis — IndexTTS-2.5 is one — is refused
+**before** anything stages: the route asks the loaded engine's
+`requires_reference_audio()` and answers 400 naming the family and the missing
+`reference_audio`, which is supplied as a `data:` URL carrying a 16-bit PCM mono
+WAV.
+
+**Every stage of MiniMax-Music3 is implemented and gated**, and a request
+reaches all of them: the 8.6B `Qwen3ForCausalLM` autoregressive stage, the RVQ
+depth decoder, the learned condition mix, the flow-matching DiT and the DAC
+Flow-VAE vocoder. **A composed request has not yet been observed to completion
+on CPU** — see the caveat below, and `.agents/specs/minimax-music3.md`. There is
+no by-name refusal left: nothing here is unimplemented. IndexTTS-2.5 still
+refuses naming its own missing pieces.
+
+**It runs on CPU and it is slow.** Every gate this row has was taken on CPU
+(`dgx.casa` was down throughout), and the acoustic half is upstream's own fp32.
+A 0.1 s request takes tens of minutes; no speed number exists and none is
+claimed. Ask for a short duration and few `num_inference_steps` while you are
+checking that it works.
+
+The part that dominates is *not* the one you would guess. The 8.6B language
+model goes through `vt` and uses the CPU threadpool; the RVQ depth decoder and
+the DiT do not — they are scalar host loops with a double accumulator, written
+that way in W2-W5 so their reduction order is reproducible against torch, and
+they run single-threaded. In one 0.1 s request the depth decoder alone is the
+majority of the wall clock.
+
+The same seam is reachable from the C ABI at v20 — `vllm_speech_engine_load`,
+`vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio`,
+`vllm_synthesize` and `vllm_speech_result_free` — so HTTP and FFI drive one
+implementation. `vllm_speech_result` carries both the float waveform and the
+RIFF/WAVE bytes, so an embedder writes a playable file without a second encoder.
+
 
 ### `max_tokens`: what a non-positive value means
 
@@ -874,10 +1376,13 @@ a stop token early.
 | `--enable-radix-attention` / `--disable-radix-attention` | model default | SGLang-named alias for the prefix-cache toggle |
 | `--enable-jump-forward` | off | Jump-forward decoding for structured output (token-unique subset) |
 | `--enable-force-include-usage` | off | Force the usage block in responses |
-| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (41 names over 37 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls` |
-| `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`). `auto` detects, `none` disables |
+| `--tool-call-parser <name>` | `hermes` | Tool-call dialect (42 names over 38 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls`. **`inkling` needs `"skip_special_tokens": false` on the request today** — its whole grammar is special tokens and we have no `adjust_request` seam to force the flag off for you, so at the `true` default the detokenizer strips the markers before the parser runs ([#695](https://github.com/mudler/vllm.cpp/issues/695)). `--reasoning-parser inkling` is not registered at all ([#703](https://github.com/mudler/vllm.cpp/issues/703)) |
+| `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
+| `--offload-config '<json>'` | (unset) | vLLM's `OffloadConfig` for **weight** offload, the same JSON vLLM takes (distinct from `--kv-transfer-config`, which offloads KV blocks). `offload_backend` is `auto` (default), `uva` or `prefetch`; `uva.cpu_offload_gb` sets the per-GPU budget and `uva.cpu_offload_params` targets parameters by dotted name SEGMENT (`"experts"` matches `mlp.experts.w2_weight`, `"w2"` does not). Parsed AND validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a WARNING, as upstream. **Accepted and inert today: nothing moves a weight yet** (`ENG-WEIGHT-OFFLOAD` W0b wires config end to end; the offloader is W2/W5), so setting `cpu_offload_gb` frees no memory. Said plainly because a silently-ignored budget is worse than a documented one ([spec](../.agents/specs/weight-offload-uva.md), [#797](https://github.com/mudler/vllm.cpp/issues/797)) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed (currently ~2% behind at c1). A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
+| `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
+| `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |
 | `--enable-log-requests` / `--disable-log-requests` | on | Log each incoming request. Mirrors vLLM's flag of the same name |
 | `--enable-log-outputs` | off | Also log the generated output, not just the request |
 | `--max-log-len N` | `256` | Truncate logged prompts and outputs to N characters |
@@ -887,6 +1392,41 @@ a stop token early.
 | `--cuda-profile-graph-replays N` | `0` (off) | Trace-only diagnostic: arm the CUDA-graph-replay profiler and stop after N replays, printing a pid to signal with `SIGUSR2`. Requires a build with `VT_BENCH_PROFILE_CONTROL` |
 | `--cuda-profile-graph-batch N` | `16` when replays are armed | Batch size the profiler traces. Must not exceed `--max-num-seqs` |
 | `-h`, `--help` | | Print usage and exit |
+
+#### Accepted for recipe compatibility — these flags have NO effect
+
+A published `vllm serve` line has to reach model load. The flags below appear in
+most official [vllm-project/recipes](https://github.com/vllm-project/recipes)
+commands, mean nothing to this engine, and are therefore **accepted and ignored**
+rather than rejected. Each one prints a notice on startup naming itself and the
+reason it does nothing, so a log never implies it took effect.
+
+| Flag | Effect here | Why it is inert |
+|---|---|---|
+| `--enable-auto-tool-choice` | **none** | Tool parsing is already unconditional once `--tool-call-parser` resolves; there is no second gate to open. Note `--tool-call-parser` defaults to `hermes` here, where upstream's defaults to unset, so the two flags do not line up when the parser is omitted. Upstream's validation is still mirrored: combining it with `--tool-call-parser none` is refused, as in `vllm/entrypoints/openai/cli_args.py:395` |
+| `--trust-remote-code` | **none** | It authorizes executing Python from the checkpoint. This engine has no Python runtime, so there is nothing to authorize — N/A by construction, not unimplemented |
+
+The notice is on stderr at startup, one line per flag actually passed, so what
+you see in a log matches this table:
+
+```text
+server: accepted '--trust-remote-code' for published-recipe compatibility; it has no effect here: no Python runtime, so there is no remote code to trust
+```
+
+The mirrored validation is reported before the parser dialect is checked, so a
+contradiction is named as a contradiction rather than passing silently (`none` is
+itself a valid selection):
+
+```text
+server: Error: --enable-auto-tool-choice requires --tool-call-parser
+server: (--tool-call-parser none selects NO parser; name a parser, or drop --tool-call-parser to keep the hermes default)
+```
+
+This list is **enumerated, not a catch-all**. Any other unrecognized flag still
+aborts with `server: unknown argument '<flag>'`, including flags that are inert
+only because the capability is missing (`--tensor-parallel-size` and the other
+parallelism flags) — silently accepting those would let you believe you got
+tensor parallelism when you did not.
 
 #### Context length vs the KV pool
 
@@ -1237,11 +1777,47 @@ The library never spawns a process, so generation and muxing enter through a
 caller-supplied `VideoRunner` callback (`examples/server/main.cpp` supplies one
 that invokes `ffmpeg`, path configurable with `--video-ffmpeg`).
 
+### Video family, and family-specific load knobs
+
+`/v1/videos` serves whichever video family the `--video-dit` checkpoint belongs
+to. By default the family is **detected** from what the checkpoint holds, and
+that is unchanged.
+
+`--video-family NAME` pins it instead. Two registered families exist,
+`minimax-h3` and `ltx-2.5`, and a name outside that set is refused at argument
+parsing, before the text model loads, with the registered names printed. It is
+never a hint: a declared family that cannot load the checkpoint fails loudly
+rather than falling back to detection, because a checkpoint handed to the wrong
+family does not fail, it renders noise.
+
+`--video-extra KEY=VALUE`, repeatable, carries a family's own load knobs. LTX-2.5
+cannot load without `dit_config_path`, and it needs `encoder_config_path` beside
+`--video-encoder` when the text encoder declares no `gemma_config` (the shipped
+one does not); MiniMax-H3
+defines `partition`, for which `--video-partition` remains the documented alias.
+A bare `KEY` with no `=` is refused rather than read as an empty value, and a
+`--video-extra partition=X` contradicting `--video-partition Y` is refused rather
+than resolved by whichever assignment ran last. A family refuses any key it does
+not define, so a mistyped knob is an error instead of a silently defaulted
+render.
+
+```sh
+vllm-server --model /path/to/text-model \
+  --video-family ltx-2.5 \
+  --video-dit ltx-2.5-22b-distilled-fp8.safetensors \
+  --video-vae ltx-2.5-video-vae-conv-bf16.safetensors \
+  --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+  --video-encoder gemma4-12b-with-proj-nvfp4-torchao.safetensors \
+  --video-extra encoder_config_path=ltx-2.5-gemma4-text-config.json \
+  --video-extra dit_config_path=ltx-2.5-transformer-config.json \
+  --video-extra model_version=2.5 --video-extra allow_unported_modules=1
+```
+
 ## Consuming it as a library (C ABI)
 
 Link `libvllm` (static or shared) and include [`include/vllm.h`](../include/vllm.h).
-It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 17`,
-35 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
+It exposes a flat, exception-free, llama.cpp-style C ABI (`VLLM_ABI_VERSION 19`,
+36 exported functions) suitable for `dlopen` / FFI / LocalAI integration.
 
 ```c
 #include "vllm.h"
@@ -1287,6 +1863,7 @@ concurrent requests, memory helpers, and diagnostics. Later ABI versions add:
 | v15 | Embeddings through `vllm_embed` |
 | v16 | Absolute KV-cache memory sizing |
 | v17 | The OpenAI server as a thin ABI client through `vllm_server_main` |
+| v18 | Video model-family selection (`family`, `vllm_video_engine_family`) and family-specific `extra_keys`/`extra_values` on `vllm_video_*` |
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.
@@ -1310,6 +1887,64 @@ auto engine = vllm::entrypoints::LoadedEngine::FromModelDir(model_dir, ep);
 
 The underlying portable tensor runtime is `vt::` ([`include/vt/`](../include/vt/)),
 which carries no ggml or PyTorch dependency.
+
+Video and audio generation is reached through `vllm::multimodal::VideoEngine`
+([`multimodal/video_engine.h`](../include/vllm/multimodal/video_engine.h)).
+`LoadVideoEngine` resolves the model family from what the checkpoint HOLDS, never
+from a filename, and refuses rather than guessing: zero claimants, several
+claimants, and an unregistered declared `family` are all errors that name what was
+seen and what is registered. A caller who supplies no `dit_path` is told which
+artifact is missing rather than being advised to declare a family, which would not
+help. A family adds itself with `RegisterVideoFamily`, which refuses a name that
+is already registered, because two families under one name would collapse into a
+single claimant and leave the choice of loader to link order.
+
+Two families are registered. `minimax-h3` is detected by `video_patch_proj` plus
+`audio_patch_proj`; `ltx-2.5` by `patchify_proj` plus `audio_patchify_proj`, with
+or without the ComfyUI `model.diffusion_model.` prefix. Each family reads its own
+knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
+`audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
+seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
+(default `distilled_two_stage`), `model_version` (only for a checkpoint that
+declares none), `dit_config_path`, `allow_unported_modules`, `max_phase`,
+`prompt_embeds_valid_rows`, `upsampler_path` and `duration_head_path`. An extra a
+family does not define is refused, never ignored. One caveat inside that set:
+`duration_head_path` is accepted but INERT — the duration head is ported and gated
+as a brick, nothing in the video engine constructs one, and no code reads that
+key, so supplying it neither loads a head nor enables an AUTO duration. Give
+`num_frames` (or `duration`, which is exact arithmetic against the recipe's frame
+rate) instead.
+
+`prompt_embeds_valid_rows` is how many of the supplied conditioning rows are real
+tokens; absent, every row is. It matters because the embeddings connector
+substitutes its learnable register table at PADDED positions, so padding decides
+which of the connector's inputs are learned constants rather than caption
+features. Upstream always knows this because its tokenizer produced the mask;
+this seam reads conditioning from a file, which carries none.
+
+`dit_config_path` names a JSON file holding the DiT's `{"transformer": {...}}`
+configuration, and it exists because only one of the two shipped LTX-2.5 DiTs
+carries one. The first-party NVFP4 file embeds it in `__metadata__["config"]`;
+the ungated `vonkaiser/LTX-2.5-FP8-NVFP4` FP8 DiT has no `__metadata__` at all.
+Tensor shapes resolve the geometry but not the values no shape encodes, so
+without a config `double_precision_rope` would default to false and
+`av_ca_timestep_scale_multiplier` to 1, where LTX-2.5 declares `float64` and
+`1000`. Both move every RoPE angle and every audio-to-video modulation, so a DiT
+that declares no config is refused until one is supplied rather than rendered
+under defaults that contradict the model family. A supplied config is adopted
+only when it reproduces the identical weight contract the shapes describe, and
+supplying one for a checkpoint that already declares its own is refused rather
+than ordered.
+
+The LTX-2.5 arm runs on the CPU in f32 and on CUDA in bf16. `device = 0` takes
+the f32 parity forward; `device = 1` stages the DiT to the GPU one tensor at a
+time and runs the device-resident forward, so a CUDA handle means a CUDA forward.
+On a build with no CUDA backend, `device = 1` is refused by name rather than
+served the CPU forward behind a CUDA handle. `encoder_path` loads the Gemma-4
+text tower, and the request's own `prompt` then conditions the render; the tower
+itself runs on the CPU in f32 whichever device the DiT is on. Without one,
+conditioning comes from the two prompt-embeds files, which must agree on their
+row count.
 
 `Sampler`'s `logprobs_mode` selects which tensor the returned logprobs are read
 from, and all four of vLLM's values now work: `raw_logprobs` (the default) and
@@ -1423,6 +2058,55 @@ Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
 | `video_url` | video |
 | `input_audio` / `audio_url` | audio |
 
+### Per-prompt input limits
+
+vLLM caps how many items of each modality one prompt may carry
+(`--limit-mm-per-prompt`), and `--language-model-only` is sugar for setting every
+one of those limits to 0. Both flags are accepted (#607, waves L1+L2) and both
+are enforced **on this server's chat path**, which is the one place that installs
+the multimodal chat seam the check runs behind.
+
+Both are also C ABI fields (`vllm_model_params.language_model_only` /
+`.limit_mm_per_prompt`, ABI v19), and there they configure the engine — including
+a server built on it — but they do not change what a `vllm_chat` call returns:
+the C ABI has no multimodal request path yet, so an `image_url` content part sent
+through it is dropped and answered as text. The refusals below are the server's.
+
+The limits are the mechanism and the flag is the sugar, so it is worth stating
+what the flag actually does: it does not "skip the encoder", it makes the server
+**refuse** multimodal requests.
+
+```console
+$ curl -s localhost:8000/v1/chat/completions -d '{... three image_url parts ...}'
+{"error":{"type":"BadRequestError",
+          "message":"At most 1 image(s) may be provided in one prompt."}}   # HTTP 400
+
+$ vllm-server --model … --language-model-only     # then any image request:
+{"error":{"type":"BadRequestError",
+          "message":"At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit."}}
+```
+
+Two things follow from how the limit is computed
+(`min(user limit, what the model/seam supports)`):
+
+- A user limit can only **lower** the ceiling. `--limit-mm-per-prompt
+  '{"image": 99}'` on this server still refuses a second image, because the
+  OpenAI chat seam handles exactly one image today (video and audio parts are
+  not routed at all, so their limit is 0 and they are refused by name rather
+  than dropped — this is what closed
+  [#686](https://github.com/mudler/vllm.cpp/issues/686)).
+- The ``Set `--limit-mm-per-prompt` to increase this limit.`` hint appears only
+  when raising the limit would actually help — that is, when the seam could take
+  the items and the configuration is what refused them. Its absence is currently
+  the only way to tell an unimplemented arm from a configured limit; the
+  refusal message itself does not say which
+  ([#758](https://github.com/mudler/vllm.cpp/issues/758)).
+
+**Not yet:** `--language-model-only` frees no memory. Nothing gates vision-tower
+construction on the limits, so the flag today changes what the server accepts,
+not what it allocates ([#607](https://github.com/mudler/vllm.cpp/issues/607)
+wave L3, owed with a measured RSS reduction).
+
 ## MiniMax-H3 browser console (`vllm-video-studio`)
 
 A standalone browser console for MiniMax-H3, deliberately **separate** from the
@@ -1531,6 +2215,202 @@ Served over HTTP too: pass `--video-dit` (plus the VAEs and configs) to `example
 `POST /v1/videos`, `POST /v1/videos/sync` and `GET /v1/videos/{id}` register. Without it the
 routes stay unregistered.
 
+## LTX-2.5: reproducing the DiT parity gate
+
+**This section is the DiT's own parity gate, not the way to run LTX-2.5.** The
+render path ships and is documented above under
+[LTX-2.5: what runs, and what it cannot do](#ltx-25-what-runs-and-what-it-cannot-do):
+`ltx-2.5` is one of the two registered video families
+(`REGISTER_VLLM_VIDEO_FAMILY` at `src/vllm/multimodal/ltx2_video.cpp:1529`), the
+Gemma-4 text tower loads from `--encoder` and sets `has_encoder`
+(`ltx2_video.cpp:893`), both VAEs and the pipeline layer are implemented
+(`ltx2_video_vae.cpp`, `ltx2_audio_vae.cpp`, `ltx2_pipeline.cpp`), and the
+`/v1/videos` routes register for whatever family `--video-dit` resolves —
+`server_main.cpp` calls the family-agnostic `LoadVideoEngine` and then prints the
+resolved family. What follows here is how to regenerate the DiT's goldens. The
+C++ surface is `include/vllm/model_executor/models/ltx2.h`, and it refuses by
+name every arm it does not carry (a non-f32 stream dtype, the 19B
+caption-projection checkpoint form, keyframe absolute-position embeddings, the
+video-only / audio-only model types).
+
+Provenance, so this can be re-checked rather than trusted: the paragraph above
+replaces one that arrived at `3d89f6fc4` — the first LTX commit, where it was
+true — and was never revisited as L3 through L13 built each of the six pieces it
+denied.
+
+The prompt-K/V cache (`Ltx2PromptKvCache`) is reusable across the DENOISE STEPS of
+one prompt, and only those. It records a fingerprint of the prompt it was filled
+for, and a forward whose context tensors, context geometry or prompt masks differ
+from that prompt is refused by name rather than served K/V that would render the
+cached prompt. Call `Ltx2PromptKvCache::Reset()` to rebind the same allocation to
+a new request.
+
+The gate runs the UPSTREAM modules at reduced dimensions on CPU, so it needs a
+Lightricks LTX-2 checkout and the system `python3` with torch — **no checkpoint, no
+venv and no gated download**. Regenerate the goldens and run it:
+
+```sh
+git clone https://github.com/Lightricks/LTX-2 ~/_git/LTX-2
+python3 scripts/gen-ltx2-goldens.py \
+  --ltx2 ~/_git/LTX-2 \
+  --out tests/vllm/models/ltx2_goldens.inc
+cmake --build build --target test_ltx2 && ./build/tests/test_ltx2
+```
+
+The generator asserts the `ltx_core` it imported came from that checkout and not
+from anything installed in site-packages, and it writes the upstream revision it
+executed into the generated header. Neither side checks in a weight byte: both
+rebuild every tensor from one deterministic stream keyed by the parameter's name.
+
+The pipeline layer has its own gate, and it needs a second checkout: the recipe
+table is read from vLLM-Omni, which is the binding oracle for LTX even though it
+carries no 2.5 row of its own. Both checkouts must be CLEAN, because a revision
+anchor read from a tree with uncommitted edits stamps a SHA the goldens do not
+come from.
+
+```sh
+git clone https://github.com/vllm-project/vllm-omni ~/_git/vllm-omni
+python3 scripts/gen-ltx2-pipeline-goldens.py \
+  --ltx2 ~/_git/LTX-2 \
+  --vllm-omni ~/_git/vllm-omni \
+  --out tests/vllm/models/ltx2_pipeline_goldens.inc
+cmake --build build --target test_ltx2_pipeline && ./build/tests/test_ltx2_pipeline
+```
+
+If you regenerate that `.inc` against a moved upstream, expect the goldens to
+carry the change rather than only the pin cases. The pipeline goldens reach the
+GroupNorm eps and group count in the latent upsampler, the connector's
+`rms_norm` eps, the `BlurDownsample` width (on the 1.5 arm only, since the blur
+runs on the rational denominator) and the Res2s `sigma_up` clamp — that last one
+on the eta = 1 arm, where the clamp binds on every step. A regeneration that
+moves one of those constants alone reds a value comparison; one that moves the
+constant AND the tensors together passes it, and is caught only by the cases that
+compare each constant against upstream's own signature. Both layers are there
+deliberately, and neither is redundant.
+### The Gemma-4 text tower gate, and the interpreter it needs
+
+The text tower is gated against the UPSTREAM HuggingFace implementation built and
+run at reduced dimensions. It needs a `transformers` that registers
+`gemma4_unified` in `CONFIG_MAPPING` — **5.8 or newer; 5.3.0 does not have it and
+fails in a way that reads exactly like "Gemma-4 is unsupported"**. The generator
+refuses such an interpreter by name rather than emitting goldens from a tower it
+could not build.
+
+```sh
+/path/to/venv/bin/python scripts/gen-ltx2-gemma-tower-goldens.py \
+  --out tests/vllm/models/ltx2_gemma_tower_goldens.inc
+cmake --build build --target test_ltx2_text_encoder && ./build/tests/test_ltx2_text_encoder
+```
+
+No checkpoint and no download: the reduced config comes from
+`tests/vllm/models/ltx2_gemma4_text_config.json`, which is the
+`__metadata__["gemma_config"]` of the official bf16 text encoder, and every weight
+is rebuilt on both sides from the deterministic stream. The tolerance is not a
+constant — the generator MEASURES how far upstream's own answer moves between f32
+and bf16 and emits that per state as the bound.
+
+Two more gates want the real checkpoint. The prompt-token goldens are regenerated
+from the tokenizer the text encoder ships **as a tensor**, and the end-to-end case
+dequantizes the 12B tower to roughly 24 GB of host bf16, so it is opt-in rather
+than checkpoint-presence gated:
+
+```sh
+TE=$CHECKPOINT_ROOT/ltx-2.5/vonkaiser-fp8-nvfp4/text_encoders/gemma4-12b-with-proj-nvfp4-torchao.safetensors
+/path/to/venv/bin/python scripts/gen-ltx2-prompt-tokens-goldens.py \
+  --text-encoder "$TE" \
+  --out tests/vllm/models/ltx2_prompt_tokens_goldens.inc
+
+# real vocab, token-exact vs HuggingFace
+CHECKPOINT_ROOT=... ./build/tests/test_ltx2_text_encoder --test-case="ltx2 prompt: REAL*"
+
+# the full 12B vertical: ~33 GB host, minutes of CPU
+CHECKPOINT_ROOT=... VLLM_CPP_LTX2_TOWER_E2E=1 \
+  ./build/tests/test_ltx2_text_encoder --test-case="ltx2 e2e*"
+```
+
+`VLLM_CPP_LTX2_TEXT_ENCODER` names the file directly when it does not sit under
+`CHECKPOINT_ROOT` at the path above.
+
+Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
+anything else by name rather than defaulting, because a plausible but wrong sigma
+schedule or guidance scale renders a video instead of failing. The pairs that
+resolve are `one_stage` at 2, 2.3, 2.4 and 2.5, `distilled_two_stage` at 2 and
+2.5, and `dmd2` at 2 and 2.3.
+
+`Ltx2Guidance` serves `CFGGuider`, `STGGuider` and `MultiModalGuider`. It refuses
+`CFGStarRescalingGuider`, `LtxAPGGuider` and `LegacyStatefulAPGGuider` by name,
+because nothing upstream constructs them: all three appear in the Lightricks tree
+only at their own `class` statements. Two known gaps in the schedule are open:
+`Ltx2SigmaSchedule(1, ...)` returns a NaN first sigma where upstream returns
+0.10000002, and the suite's `MaxAbsDiff` drops NaN so a golden alone will not
+catch it.
+
+## LTX-2.5 quantized loaders
+
+`include/vllm/model_executor/models/ltx2_loader.h` materializes the shipped
+LTX-2.5 checkpoints: the FP8 DiT, both NVFP4 DiTs, and the torchao-NVFP4 Gemma-4
+text encoder with its embedded tokenizer. These are the entry points the render
+path itself drives: `--dit` (`--video-dit` on the server) reaches
+`Ltx2StreamDitToDevice` / `Ltx2LoadDitFromSafetensors` at
+`ltx2_video.cpp:576-577`, and `--encoder` (`--video-encoder`) reaches
+`Ltx2LoadTextEncoderFromSafetensors` at `ltx2_video.cpp:851`. This section
+documents them at the library level, where the gate below runs.
+
+The two NVFP4 checkpoints were written by different producers that disagree about
+both the group-scale framing and which nibble holds which weight, so the loader
+resolves the producer from the `torchao_nvfp4` marker: present means torchao
+(`to_blocked` framing, low-nibble-first), absent means the Lightricks
+`nvfp4-prequant` tool (cuBLAS-padded framing, high-nibble-first). A marker whose
+stored scale shape contradicts it, and a marker-less file whose shape is the
+`to_blocked` framing or neither framing, are refused by name rather than guessed,
+because both readings type-check and produce finite, correctly scaled, wrong
+weights.
+
+The refusal cannot cover everything, and the limit is worth knowing before you
+point this loader at a checkpoint it was not built for. A marker-less NVFP4 file
+whose `weight_scale` is stored **linear** `[N, K/16]` — what ModelOpt,
+llm-compressor and compressed-tensors write, none of which emit a
+`torchao_nvfp4` sidecar — has, whenever `N % 128 == 0` and `K/16 % 4 == 0`, a
+shape indistinguishable from the cuBLAS-padded one. Such a file is resolved as
+`nvfp4-prequant` and read swizzled and high-first: it loads, and it is wrong.
+Only the LTX-2.5 DiT is gated against an independent oracle here, so treat any
+other marker-less NVFP4 checkpoint as unsupported until it is. See
+`.agents/specs/nvfp4-nibble-order.md`.
+
+Two behaviours a caller has to know. `Ltx2LoadDitFromSafetensors` REFUSES the
+shipped DiT by default, because that file carries **one** module family this port
+does not carry (`keyframes_abs_pos_embedding`); pass
+`Ltx2DitLoadOptions::allow_unported_modules`
+to load the ported subset, which still reports every one of them in
+`Ltx2DitCheckpoint::unported`. `prompt_adaln_single` and
+`audio_prompt_adaln_single` were on that list until 2026-08-13 and are now
+PORTED, so a checkpoint carrying them needs no opt-in on their account, and the
+opt-in no longer disables them. The two `*_embeddings_connector` towers are
+**not** among them and never will be:
+`UnportedFamilies` filters them out at `ltx2_loader.cpp:439` (`LoadedElsewhere`),
+`RefuseUnported`'s own message says so in capitals at `ltx2_loader.cpp:461-464`,
+and `Ltx2LoadConnectorWeights` loads them under their own contract — which is
+what the video engine calls, so a checkpoint this port reads completely is never
+made to ask for `allow_unported_modules` on their account. (The "five" this
+paragraph used to say arrived at `5966ffef3` and was true until `e48c86253`
+added `LoadedElsewhere` — the same claim the "what runs" section above already
+retired, which survived here because it was never swept for.) And loading is
+**bf16** by default, the checkpoint's own model dtype; `widen_to_f32` is opt-in
+and exists only for the f32 parity forward.
+
+`Ltx2StreamDitToDevice` is the GB10 arm. It dequantizes and uploads one tensor at
+a time so peak residency is the device copy plus one tensor, and it stages at
+load because host-resident weights measure 20 to 30 percent slower there.
+
+The gate needs the three checkpoint headers, a vLLM checkout and an LTX-2
+checkout (the two nibble-order authorities); it reads a few hundred bytes at
+their own offsets and never a payload:
+
+```sh
+python3 scripts/gen-ltx2-quant-goldens.py --vllm ~/_git/vllm --ltx2 ~/_git/LTX-2 --checkpoint-root /mnt/nas_share/checkpoints --out tests/vllm/models/ltx2_quant_goldens.inc
+cmake --build build --target test_ltx2_loader && ./build/tests/test_ltx2_loader
+```
+
 ## SSE keepalives on long prefill
 
 Async chat/completion streams may emit SSE **comment** frames (`:\n\n`) while
@@ -1545,3 +2425,577 @@ Dual-GPU resident FP8 MoE and SharedK-WMMA prefill are controlled via
 ENVIRONMENT.md (`VT_GEMMA4_RESIDENT_*`, `VT_ATTN_*`). Defaults stay safe off RDNA4.
 This PR does **not** restructure the Gemma-4 layer loop or enable decode hipGraph
 (those stay lab-only until a CUDA token-exact gate can land them).
+
+## LTX-2.5 text conditioning
+
+This documents **one brick of the shipped render path** — the text conditioning
+the DiT consumes — and how to reproduce its gate. The render itself is above
+under [LTX-2.5: what runs, and what it cannot do](#ltx-25-what-runs-and-what-it-cannot-do);
+`--encoder` is what puts this brick on that path, and `has_encoder` is set at
+`ltx2_video.cpp:893` once the tower loads.
+
+LTX-2.5 does not condition on a text encoder's last hidden state. It takes every
+Gemma-4 hidden state (the embedding output plus all 48 decoder outputs, 49 in
+total), normalizes them, concatenates across the layer axis, and projects the
+result twice: a 4096-wide video caption projection and a 2048-wide audio one.
+That is why the shipped projections take 3840 x 49 = 188160 inputs.
+
+Two things about the shipped checkpoint are easy to trip over:
+
+* the tokenizer is stored **as a tensor**, `tokenizer_json`, alongside
+  `hf_asset__*` sidecars, so a loader that expects a sibling `tokenizer.json`
+  file cannot read it;
+* `vonkaiser/LTX-2.5-FP8-NVFP4`'s text encoder carries **no** safetensors
+  `__metadata__` block, so the Gemma config has to be supplied out of band.
+  `Ltx2LoadGemmaAssets(file, /*require_config=*/false)` is the opt-out; the
+  default refuses, exactly as upstream does.
+
+Reproduce the parity gate (CPU only, no checkpoint and no gated download; needs
+torch, numpy and einops plus a Lightricks LTX-2 checkout):
+
+```sh
+python3 scripts/gen-ltx2-text-goldens.py \
+    --ltx2 ~/_git/LTX-2 \
+    --out tests/vllm/models/ltx2_text_goldens.inc
+cmake --build build --target test_ltx2_text_encoder
+./build/tests/test_ltx2_text_encoder
+```
+
+The generator imports the upstream modules by path and executes them at reduced
+dimensions; both sides rebuild every weight from one deterministic stream, so no
+weight byte is checked in. It also runs four degenerate inputs through upstream
+and emits each one's full output tensor, not a "still finite" flag, because the
+normalization epsilons and the width they are added in are invisible to a random
+fixture. The mean's denominator is one of those: upstream adds it in float32
+(`sequence_lengths * d` is an int64 tensor and `eps` a python float, which
+promotes to the default dtype), so computing it in float64 is finer arithmetic
+and the wrong answer.
+
+A third thing to know if you are wiring a loader to it: the feature extractor
+refuses, by name, any disagreement between what the checkpoint config declares
+and what the weights actually carry. That covers the declared bias against
+`bias.empty()`, the declared `out_features` against the weight's own width, and
+`embedding_dim x (num_hidden_layers + 1)` against the weight's `in_features`. The
+case worth naming is a loader that binds `video_aggregate_embed.weight` (U8,
+NVFP4) and misses `.bias` (BF16, so a different unpack path) while the config
+still says the projection is biased. Without the refusal that renders a plausible
+video for the wrong prompt: every conditioning row is shifted by the missing bias
+and every padded row projects to 0 instead of to the bias.
+
+## MiniMax-Music3: the checkpoint loader
+
+**It loads, it does not generate.** `include/vllm/model_executor/models/`
+`minimax_music3_loader.h` is phase W1 of #672 — it resolves the shipped
+`diffusers` layout, parses the six component configs, and accounts every tensor
+in the files against what those configs owe. No forward, no scheduler step and
+no audio; those are W2-W7, and nothing below produces a song.
+
+Point it at the **diffusers arm**, the six-component tree:
+
+```
+minimax-music3/
+  modular_model_index.json
+  transformer/           config.json + 2 shards + index   441 tensors  F32
+  condition_encoder/     config.json + 1 file               4 tensors  F32
+  rvq_depth_decoder/     config.json + 1 file              47 tensors  BF16
+  vocoder/               config.json + 1 file             121 tensors  F32
+  language_model/        config.json + 4 shards + index   399 tensors  BF16
+  scheduler/scheduler_config.json
+  tokenizer/
+```
+
+`MiniMaxMusic3ResolveCheckpoint` refuses anything else **by name**, and the
+refusal you are most likely to hit is the useful one. The same repository also
+ships a **native** arm — `qwen_7B/qwen_7B/`, `flowmatching_vae.pth`, `dav.pth` —
+which SGLang-Omni serves and which holds every weight this port needs in a layout
+nothing here reads. Pointed at that tree the loader names it as the native arm,
+lists the diffusers components it lacks, and tells you to convert it with
+diffusers' `scripts/convert_minimax_music3_to_diffusers.py`. It is never
+silently mis-loaded.
+
+Two things the loader enforces that a correctness gate later could not catch:
+
+**On-disk dtype and runtime dtype are different things, and the loader keeps
+them apart.** The files store F32 for the transformer, condition encoder and
+vocoder and BF16 for the RVQ depth decoder and language model, and
+`MiniMaxMusic3AccountTensors` refuses a file that disagrees. That set is *not* a
+runnable configuration. Upstream casts in exactly two places, `denoise.py:83`
+(condition encoder output into the transformer) and `decoders.py:84` (latents
+into the vocoder), and never on the way in: `denoise.py:82` hands the language
+model's hidden states to the condition encoder with a device move and no dtype
+move. So the autoregressive half must share one dtype, and loading the on-disk
+set raises `Input type (c10::BFloat16) and bias type (float) should be the same`
+from `condition_embedder_minimax_music3.py:64`.
+
+`MiniMaxMusic3ResolveRuntimeDtypes` answers the runtime question.
+`kBf16ArFp32Acoustic` is the gated configuration: language model, depth decoder
+and condition encoder in bf16, transformer and vocoder in fp32.
+`MiniMaxMusic3CheckRuntimeDtypes` refuses a violation by name, listing all three
+autoregressive components with their dtypes, because upstream's own error names
+a bias dtype and never says which component disagreed with which.
+`kAsStored` is kept selectable so that failure stays reproducible; it is
+reported as not runnable rather than quietly repaired.
+
+**The vocoder's weight norm is folded at load.** Its 30 weight-normed
+convolutions ship as torch's legacy `weight_g`/`weight_v` pairs;
+`MiniMaxMusic3LoadVocoderWeights` collapses each to a single `<module>.weight`
+through `vocoder1d::MaterializeWeightNorm`, so no `_g`/`_v` name survives and
+nothing downstream can read the direction `v` as if it were the weight. Four of
+the thirty are `ConvTranspose1d`, whose weight is `[C_in, C_out, K]` — torch
+reduces over dimension 0 either way, which for those four is the *input* channel.
+
+### Running its gate
+
+The suite needs no checkpoint. `tests/vllm/models/minimax_music3_manifest.inc`
+carries the real checkpoint's own safetensors headers — 1012 entries of names,
+dtypes and shapes, no weight bytes — and every geometry claim is asserted
+against it:
+
+```sh
+cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON
+cmake --build build -j 8 --target test_minimax_music3_loader
+./build/tests/test_minimax_music3_loader
+```
+
+One test case additionally exercises the real 27 GB tree when you name it, and
+loudly skips when you do not:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_loader
+```
+
+Regenerate the manifest after a checkpoint revision moves — it reads headers
+only, so it does not stream the weights:
+
+```sh
+python3 scripts/gen-minimax-music3-manifest.py \
+  --checkpoint /path/to/minimax-music3 \
+  --output tests/vllm/models/minimax_music3_manifest.inc
+```
+
+### MiniMax-Music3: the quantized arms
+
+**One quantized arm loads: the RVQ depth decoder from a GGUF Q4_K file.**
+Everything else is the bf16/fp32 diffusers checkpoint — bf16 `language_model` +
+`rvq_depth_decoder` + `condition_encoder`, fp32 `transformer` + `vocoder`,
+~28.5 GB resident.
+
+The implemented arm is pinned to a specific artifact, because an unpinned
+quantized checkpoint is not reproducible:
+
+| Field | Value |
+|---|---|
+| repo | `audio-cpp/MiniMax-Music3-GGUF` |
+| revision | `c36aaeed683f33b05796788e4204f4eeba8fa547` |
+| file | `rvq_depth_decoder_q4_k.gguf` (405 752 480 bytes) |
+| sha256 | `4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0` |
+
+`MiniMaxMusic3LoadRvqDepthDecoderFromGguf` reads it: 47 tensors as 36 Q4_K
+projections, 9 BF16 norms and 2 F16 embedding tables, dequantized to bf16
+through the shared `gguf_dequant.h` seam. Only the **audio-cpp lineage** is
+read, keyed on `audiocpp.model_spec.family == "minimax_music3"` — not on
+`general.architecture`, which reads `audiocpp`, `mm3`, `qwen3` *and* `wan` across
+GGUFs of this one model and collides with genuine Wan video checkpoints. The
+other two published lineages are refused by name.
+
+**The other quantized formats still refuse**, and quantized MiniMax-Music3
+checkpoints do exist in five formats — a survey on 2026-08-14 found fourteen
+community repositories. Rather than mis-loading one or failing with a confusing
+shape error, `MiniMaxMusic3ResolveCheckpoint`, `MiniMaxMusic3AccountTensors` and
+`MiniMaxMusic3LoadConfig` each refuse **by name**:
+
+```
+minimax_music3: this checkpoint is QUANTIZED -- GGUF (evidence:
+condition_encoder.gguf, language_model_q4_k.gguf, ...; 5 of 5 entries examined
+carry the marker). NO quantized arm is implemented for MiniMax-Music3, so this
+is REFUSED rather than mis-loaded: a GGUF arm needs a name map, the
+GGUF-vs-torch dim reversal, a geometry source, and k-quant dequantization routed
+through vllm/model_executor/model_loader/gguf_dequant.h ...
+The supported arm is the bf16/fp32 diffusers arm ... The quantized arms are owed
+rather than forgotten: phase W7 of .agents/specs/minimax-music3.md, issue #672.
+```
+
+Eight formats are diagnosed — GGUF, NVFP4, MXFP4, FP8, INT8, AWQ/GPTQ,
+bitsandbytes and MLX — plus an `UNIDENTIFIED` case. Each message names the
+evidence found in *your* file, how many entries carried it, what a working arm
+would need, and the arm that does load. Detection happens in three places,
+because a quantized checkpoint announces itself in three different ways:
+
+| You point us at | Caught by | Because |
+|---|---|---|
+| a directory of `.gguf` files | the tree walk (depth 2, so `diffusion_models/` and `text_encoders/` count) | there is no component directory and no config to inspect |
+| a diffusers-shaped tree whose tensors are quantized | the manifest scan, from safetensors headers only | the sidecars (`weight_scale_2`, `weight_packed`, `qweight`, `absmax`) and the dtype-only formats (fp8, int8) are invisible to a shape check |
+| a checkpoint that *declares* it | the config parse | `quantization_config.quant_method`, or MLX's bare `quantization` |
+
+A bare `weight_scale` with no `weight_scale_2` and no `weight_packed` is
+reported as unidentified and the message names all three candidate schemes. It
+never picks one: guessing yields a finite, correctly shaped, correctly scaled,
+**wrong** result that no shape gate can see.
+
+Note if you hold a ComfyUI-format Music3 GGUF: those ship the DiT and condition
+encoder only — no language model, no depth decoder, no vocoder — so they cannot
+generate audio even once a GGUF arm lands.
+
+The refusal gate needs no checkpoint and no network:
+
+```sh
+cmake --build build -j 8 --target test_minimax_music3_quant
+./build/tests/test_minimax_music3_quant
+```
+
+The Q4_K arm's own gate needs the pinned GGUF and the bf16 checkpoint, and skips
+loudly without them:
+
+```sh
+CHECKPOINT_ROOT=/mnt/nas_share/checkpoints \
+  ./build/tests/test_minimax_music3_quant_real
+```
+
+It does not merely check that the numbers land inside a tolerance. It asserts
+the **resident ggml type** of all 47 tensors, checks the dequantized values lie
+on the **Q4_K lattice** (at most 16 distinct values per 32-element sub-block —
+a structure a bf16 read cannot produce), and bounds the output **two-sidedly**.
+The lower bound is the important one: a silent dequant fallback to the bf16
+weights lands *closer* to the golden (mean|d| 0.00182) than the genuine
+quantized arm (0.0324), so upper bounds alone cannot tell them apart.
+
+### IndexTTS-2.5 goldens and checkpoint manifests
+
+The speech lane is not servable yet (see `/v1/audio/speech` above); these
+regenerate its gates. `read-torch-manifest.py` reads a torch `.pth`'s tensor
+names and shapes from its pickle header over HTTP range requests, so it inspects
+a multi-GB checkpoint without downloading the weights:
+
+```sh
+python3 scripts/read-torch-manifest.py \
+  https://huggingface.co/IndexTeam/IndexTTS-2.5/resolve/main/s2mel.pth
+```
+
+The stage goldens need the upstream source checked out, and emit `.inc` files
+that carry no weight bytes: both sides rebuild parameters from one shared
+pseudo-random stream.
+
+```sh
+WAVENET_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-wavenet-goldens.py --out tests/vllm/models/wavenet_goldens.inc
+
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-tail-goldens.py --out tests/vllm/models/dit_tail_goldens.inc
+
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-front-goldens.py --out tests/vllm/models/dit_front_goldens.inc
+
+DIT_SRC=/path/to/index-tts/indextts/s2mel/modules \
+  python3 scripts/gen-dit-stack-goldens.py --out tests/vllm/models/dit_stack_goldens.inc
+
+BIGVGAN_SRC=/path/to/index-tts/indextts/s2mel/modules/bigvgan \
+  python3 scripts/gen-bigvgan-goldens.py --out tests/vllm/models/bigvgan_goldens.inc
+
+CODEC_SRC=/path/to/index-tts/indextts \
+  python3 scripts/gen-codec-encoder-goldens.py --out tests/vllm/models/codec_encoder_goldens.inc
+
+python3 scripts/gen-w2v-fbank-goldens.py --out tests/vllm/models/w2v_fbank_goldens.inc
+```
+
+The U-Net skip routing is recorded rather than generated into an `.inc`: this
+prints the schedule upstream's own Transformer actually performs, at several
+depths, and the expected values are quoted in `tests/vllm/models/test_dit_skip.cpp`.
+
+```sh
+python3 scripts/gen-dit-skip-schedule.py /path/to/index-tts/indextts/s2mel/modules
+```
+
+Convert the checkpoints once, then point the loader gate at the result to check
+the real weights (it is skipped, loudly, when the variable is unset):
+
+```sh
+python3 scripts/convert-indextts2-checkpoint.py \
+  --checkpoint $CHECKPOINT_ROOT/IndexTTS-2.5 \
+  --out $CHECKPOINT_ROOT/IndexTTS-2.5-safetensors \
+  --manifest tests/vllm/models/indextts2_pth_manifest.json
+
+VLLM_CPP_INDEXTTS2_S2MEL=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/s2mel.safetensors \
+  ./build/tests/test_indextts2_s2mel_loader
+
+VLLM_CPP_INDEXTTS2_GPT=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/gpt.safetensors \
+  ./build/tests/test_indextts2_talker_loader
+
+VLLM_CPP_INDEXTTS2_AUX=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/aux.safetensors \
+  ./build/tests/test_emovec
+
+The vocoder is a SEPARATE download (`nvidia/bigvgan_v2_22khz_80band_256x`),
+which IndexTTS-2.5 fetches rather than ships. Convert it the same way, then:
+
+```sh
+VLLM_CPP_INDEXTTS2_BIGVGAN=$CHECKPOINT_ROOT/IndexTTS-2.5-safetensors/bigvgan.safetensors \
+  ./build/tests/test_bigvgan
+```
+```
+
+## MiniMax-Music3: the autoregressive half
+
+Phases W2 and W3 of #672.
+`include/vllm/model_executor/models/minimax_music3_ar.h` is what consumes three
+of W1's six components: the prompt the `language_model` is driven with, the
+semantic stage's classifier-free-guidance logit pipeline, the learned 8-layer
+condition mix, and the 4-layer RVQ depth decoder. **It still does not generate a
+song** — the DiT, the scheduler and the vocoder are W4–W5, and the 8.6B
+`Qwen3ForCausalLM` forward itself is the remainder of W2.
+
+### The token gate the spec promised does not exist
+
+Worth stating plainly, because the spec said otherwise until this phase measured
+it. MiniMax-Music3's autoregressive stage has **no greedy path**:
+`_sample_top_k` (`encoders.py:94-103`) is the only sampler either stage uses, it
+has no temperature and no argmax branch, and it ends in
+`torch.multinomial(probs, 1, generator=generator)`. The oracle's
+`rvq_codes.npy` is a *seeded sample*, so matching it token-for-token would be
+reproducing torch's RNG rather than this model. Independently: both stages sample
+from a CFG mix of a conditional and an unconditional row, and the goldens store
+the conditional row only, so the guided distribution is not reconstructible from
+what is committed.
+
+The codes are therefore **inputs** to these gates, and the AR half is gated on
+tensors.
+
+### Running the gates
+
+The reduced-dimension gate needs no checkpoint. Its goldens come from executing
+upstream's own `MiniMaxMusic3ConditionEncoder` and `MiniMaxMusic3RVQDepthDecoder`
+at small dimensions in float32, so it isolates an algebra defect from rounding:
+
+```sh
+cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON
+cmake --build build -j 8 --target test_minimax_music3_ar
+./build/tests/test_minimax_music3_ar
+```
+
+The full-scale gate drives the real bf16 weights on the oracle capture's own
+inputs and skips loudly without the checkpoint:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_ar_real
+```
+
+It compares 176 128 values for the condition mix (against `condition_chunk0.npy`)
+and 716 800 for the depth decoder (against `frame_hiddens[:, 4096:]`, 25 frames ×
+7 depth steps), and it reports the counts rather than only a verdict.
+
+Regenerate the reduced-dimension goldens with the pinned oracle's interpreter
+(see `tools/oracle/README.md`) after an upstream change:
+
+```sh
+~/venvs/music3-oracle/bin/python scripts/gen-minimax-music3-ar-goldens.py \
+  --out tests/vllm/models/minimax_music3_ar_goldens.inc
+```
+
+### Two things that will bite a later phase
+
+**The code rows are offset by one from the frames.** `rvq_codes.npy` is `[26, 8]`
+and `frame_hiddens` is `[25, ...]`: row 0 of the codes is the priming decode step,
+which emits no frame (`encoders.py:342`). `rows[1:]` align with the frames.
+Comparing the unshifted sequences yields two individually plausible tensors and a
+wrong gate.
+
+**`ArCompute` is not a precision knob.** The autoregressive half runs bf16, and a
+bf16 torch module rounds at *every* op boundary, so an fp32 host forward is a
+different computation rather than a more precise one — measured, it leaves
+448 450 of 716 800 values beyond one bf16 ULP. `ArCompute::kBFloat16` mirrors the
+rounding; `kFloat32` is the reduced-dimension goldens' dtype. A caller at
+`kBFloat16` also owes its weights at bf16, *including* the condition encoder,
+whose file is fp32 while its runtime is not.
+
+And bit-exactness against torch is not on offer here, which is worth knowing
+before a later phase spends a day chasing it. torch's bf16 `nn.Linear` on CPU
+reproduces to 32 759 of 32 768 values, but its dispatched attention reproduces to
+only 25 736: the CPU kernel runs a blocked online softmax, and four candidate
+rounding models (pre-scaled q, bf16-rounded scores, bf16-rounded probabilities,
+and their combinations) were all *worse* than the plain form. The full-scale
+bound is therefore
+calibrated against torch's own `sdpa_kernel(MATH)` arm on the identical inputs
+(46.34% bit-identical, mean absolute error 1.659e-03) rather than against a
+bit-exactness that no second implementation can reach.
+
+## MiniMax-Music3: the acoustic half
+
+Phases W4 and W5 of #672.
+`include/vllm/model_executor/models/minimax_music3_acoustic.h` is the rest of the
+pipeline: the 2.4B fp32 flow-matching DiT, the `FlowMatchEulerDiscreteScheduler`
+with `invert_sigmas`, the classifier-free-guidance mix, the denoise loop's
+overlapping-window bookkeeping, and the DAC Flow-VAE vocoder that turns latents
+into a **44100 Hz stereo** waveform. Joining the two halves through
+`SpeechRegistry`, the `vllm_speech_*` ABI and the example server is W6, and the
+8.6B `Qwen3ForCausalLM` forward at the front of the pipeline is the rest of W2 —
+see [the language model](#minimax-music3-the-language-model-and-the-end-to-end-path).
+
+Configs are W1's (`MiniMaxMusic3TransformerConfig`,
+`MiniMaxMusic3VocoderConfig`, `MiniMaxMusic3SchedulerConfig`) rather than new
+ones, and every convolution, transposed convolution, pad and activation is a
+call into the shared `vllm::vocoder1d` primitives. Nothing in `vocoder1d` is
+modified, so MiniMax-H3 and IndexTTS-2.5 are byte-identical.
+
+### There is no token gate on this half, and that is not a gap
+
+A flow-matching denoise loop has no logits, no vocabulary and no sampler, so no
+token gate exists to have. (That is a *different* fact from the autoregressive
+half's withdrawn token gate above, which was withdrawn because upstream has no
+greedy path there. Two withdrawals, two causes.) What binds instead is per-stage
+tensor parity against the oracle capture, each stage against its own entry.
+
+### Running the gates
+
+The reduced-dimension gate needs no checkpoint. Its goldens come from executing
+upstream's own `MiniMaxMusic3Transformer1DModel`, `MiniMaxMusic3Vocoder`,
+`FlowMatchEulerDiscreteScheduler` and `ClassifierFreeGuidance` at small
+dimensions in float32:
+
+```sh
+cmake -S . -B build -DVLLM_CPP_BUILD_TESTS=ON
+cmake --build build -j 8 --target test_minimax_music3_acoustic
+./build/tests/test_minimax_music3_acoustic
+```
+
+The full-scale gate drives the real fp32 weights on the capture's own inputs and
+skips loudly without the checkpoint. Its scheduler and vocoder cases run in
+about ninety seconds:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_acoustic_real
+```
+
+The **DiT** cases are opt-in behind a second variable, because they load 9.1 GB
+of fp32 weights and run four 2.4B forwards on the host — about fifteen minutes,
+not ninety seconds:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 VLLM_CPP_MUSIC3_DIT=1 \
+  ./build/tests/test_minimax_music3_acoustic_real
+```
+
+Regenerate the reduced-dimension goldens with the pinned oracle's interpreter
+(see `tools/oracle/README.md`) after an upstream change:
+
+```sh
+~/venvs/music3-oracle/bin/python \
+  scripts/gen-minimax-music3-acoustic-goldens.py \
+  --out tests/vllm/models/minimax_music3_acoustic_goldens.inc
+```
+
+### Three things that will bite a later phase
+
+**float32 here is not a precision knob either, but it is the opposite polarity
+from the AR half.** The acoustic half runs fp32 because upstream does; there is
+no `Compute` parameter, because there is no second configuration. Separately,
+and on a different axis: every reduction accumulates in `double` and stores
+`float`, which is the tree's existing host-reference convention
+(`vocoder1d::Conv1d`, `music3::LinearNoBias`) and costs no memory. Short
+*elementwise* expressions — the sigma shift, the Euler step, the CFG mix, the
+overlap blend — are computed in `float` on purpose, because upstream computes
+them in float32 and the results are bit-exact there. Widening those to double
+produces a different number: `shift * s / (1 + (shift - 1) * s)` at shift 3 is
+`0.100000024` in float32 and `0.100000001` in double, and the goldens say the
+former.
+
+**A close-enough bound on an exactly-reproducible quantity hides real defects.**
+Measured here: at a 1e-5 relative tolerance, dropping upstream's `(1 - 1e-6)`
+factor from the overlap blend moves values by only 3.3e-07 relative and the
+mutation stays **green**. The blend has no reduction, so its gate is bit-exact
+instead. The same reasoning makes the Euler step and the DiT-to-vocoder handoff
+bit-exact assertions rather than tolerances.
+
+**The stereo fold is a contiguous split, not an interleave.** The 128 latent
+channels reshape into two 64-channel streams: the *first* 64 become the left
+channel and the second 64 the right, and each stream is decoded independently by
+the same weights (`minimax_music3_vocoder.py:110,115`). Interleaving them is the
+other obvious reading of "fold 128 into 2 x 64" and produces a correctly shaped,
+correctly ranged, wrong waveform that no length or dtype check can see.
+
+## MiniMax-Music3: the language model, and the end-to-end path
+
+The rest of phase W2 of #672, and the piece that made the pipeline whole.
+`include/vllm/model_executor/models/minimax_music3_llm.h` carries the
+autoregressive loop itself (`encoders.py:299-353`) and the 8.6B
+`Qwen3ForCausalLM` at its centre. With it, a request generates a song.
+
+### The `inputs_embeds` entry the dense path did not have
+
+Upstream calls `language_model.model(inputs_embeds=...)` twice and
+`input_ids` never (`encoders.py:311`, `:353`), because the frame feedback
+`_embed_audio_frame` is a *sum* of one language-model embedding row and seven
+depth-decoder rows scaled by `num_codebooks^-0.5` — a continuous vector that
+corresponds to no vocabulary entry and that no token id can spell.
+
+`Qwen3DenseModel::ForwardEmbeds` is that door. The Qwen3 family already had it
+on its multimodal siblings — `qwen3_vl.h` takes `inputs_embeds_bf16` after
+scattering the vision tower's rows into it, and Gemma-4 and Muse-Glimmer do the
+same — because upstream's own `Qwen3Model.forward` accepts either input. Only the
+**dense** registration had never wired it.
+
+It is additive, and that is asserted rather than argued: feeding the embedding
+*of the same token ids* through the new entry reproduces `Forward` **bit for
+bit**, in the logits and in the paged KV it wrote, and
+`tests/vllm/models/test_qwen3_forward.cpp` checks both. `Qwen3ForCausalLM`,
+`LlamaForCausalLM`, `MistralForCausalLM`, `InternLM2ForCausalLM` and
+`InternLM3ForCausalLM` all ride that one forward, so nothing less than
+bit-identity would do.
+
+`out_hidden` is the second half of the same entry: the post-final-norm rows,
+returned from the forward that produced the logits. Music3 reads
+`last_hidden_state[:, -1]` and then applies `lm_head` to that very row, so
+fetching the two halves with two 8.6B passes would be pure waste.
+
+### `num_condition_layers: 8` does not mean eight transformer layers
+
+Worth stating because it is the reading a fresh implementer reaches for. The
+eight rows of a `frame_hiddens` entry are `cat(last_hidden, depth_hidden_1..7)`
+(`encoders.py:343`) — **one** language-model hidden state and the **seven**
+per-depth-step states of the RVQ decoder. Nothing captures per-layer outputs
+from the Qwen3 stack, and nothing needs to.
+
+### Running the gates
+
+The language-model gate drives the real 8.6B bf16 weights **teacher-forced** on
+the capture's own `rvq_codes.npy`, and skips loudly without the checkpoint:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  ./build/tests/test_minimax_music3_llm_real
+```
+
+It stages ~18.5 GB and runs 25 decode steps on CPU — several minutes, most of it
+the prefill. It compares 102 400 values against `frame_hiddens[:, :4096]`, ranks
+the oracle's own sampled codes under the reproduced guided logits, and pushes the
+result through the condition mix to `condition_chunk0.npy`.
+
+The end-to-end gate posts a request at `POST /v1/audio/speech` and asserts the
+WAV that comes back:
+
+```sh
+VLLM_CPP_MUSIC3_CHECKPOINT=/path/to/minimax-music3 \
+  VLLM_CPP_MUSIC3_DIT=1 \
+  ./build/tests/test_minimax_music3_e2e_real
+```
+
+`VLLM_CPP_MUSIC3_DIT=1` is required because the DiT arm is four to eight 2.4B
+fp32 host forwards. The generated WAV is written to `build/music3/` so you can
+listen to it; nothing under `tests/parity/goldens/` is created or replaced.
+
+### Why no gate compares a generated song to the oracle's
+
+Twice over, and both reasons are structural. The autoregressive codes are a
+seeded `torch.multinomial` draw (`encoders.py:94-103`) and the denoise loop's
+initial latents are a seeded `randn_tensor` (`denoise.py:117-121`). So both the
+code draw and the noise draw are **parameters** — `Music3CodeSampler` and
+`Music3NoiseSource` — and a gate supplies the capture's own values where the
+engine supplies a seeded draw of its own. That is the only entry at which this
+pipeline is comparable to the oracle at all.
+
+What an end-to-end request can honestly be held to is therefore what the gate
+asserts: that every stage runs, that the WAV is 44100 Hz 16-bit stereo, that its
+length is the one the request's duration implies, and that it is **real audio** —
+non-zero, unclipped, non-constant, and with two channels that differ (the stereo
+fold is a contiguous split of the 128 latent channels, and an interleave produces
+a correctly shaped, correctly ranged, wrong song).

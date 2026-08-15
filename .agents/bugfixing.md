@@ -4,7 +4,9 @@ The rules are in [`AGENTS.md`](../AGENTS.md); this is the method.
 
 ## Open the issue first
 
-Every fix has a GitHub issue, linked from the roadmap issue table and the PR.
+Every fix has a GitHub issue, appended to the issue index and linked from the
+PR. The index row names an owning row ID, or names a spec that lists the issue
+under `## Owed`.
 If you found the bug while doing something else, open its own issue rather than
 folding a silent fix into an unrelated change.
 

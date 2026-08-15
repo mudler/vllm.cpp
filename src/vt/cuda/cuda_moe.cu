@@ -469,9 +469,28 @@ void MoeRouterTopKKernelCuda(Queue& q, Tensor& weights, Tensor& indices, const T
 // Upstream counterpart: layers/fused_moe/ (moe_sum reduction over the topk
 // weighted w2 outputs) — M2.2 replaces this correctness-grade path.
 
+// `routed_scale` multiplies the ROUTED sum only, BEFORE the shared term is added
+// — upstream's apply_routed_scale_to_output arm (layers/fused_moe/runner/
+// moe_runner.py:390-407 (:402-406) scales `fused_output`, leaves `shared_output` alone,
+// then :722-725 adds them). Applied in the same f32 accumulator the CPU
+// reference (cpu_ops.cpp MoeCombineKernel) uses, in the same order. The scale
+// itself is ONE standalone f32 multiply on the finished accumulator, with
+// nothing adjacent to contract into, so THIS step is bit-identical to the CPU
+// reference. That does not extend to the `acc += w * Load(...)` reduction above
+// it: only CXX/HIP/OBJCXX carry -ffp-contract=off (CMakeLists.txt:55, :393,
+// :467) and nothing passes nvcc --fmad=false, so device code may contract that
+// multiply-add into an FMA where the host may not. See #591, which tracks that
+// repo-wide flag gap. Default 1.0f == the landed fold-into-weights arm.
+// Like the CPU reference it scales the ASSEMBLED sum, not each router weight
+// (:404 `fused_output *= factor` is one multiply on the finished tensor); the
+// fold is equal in exact arithmetic and a different f32 value. Upstream's fp16
+// arm (:403-406, divide `shared_output` instead) is unreachable here — `out` is
+// gated to f32/bf16 by `IsOutFloat` (ops.cpp:22). See cpu_ops.cpp for the full
+// note.
 template <typename Teo, typename Tsh, typename Tout>
 __global__ void MoeCombineKernel(Tout* out, const Teo* expert_out, const float* weights,
-                                 const Tsh* shared, int64_t t, int64_t h, int k) {
+                                 const Tsh* shared, int64_t t, int64_t h, int k,
+                                 float routed_scale) {
   const int64_t n = t * h;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
@@ -481,6 +500,7 @@ __global__ void MoeCombineKernel(Tout* out, const Teo* expert_out, const float* 
     float acc = 0.0f;
     for (int j = 0; j < k; ++j)
       acc += weights[row * k + j] * Load(expert_out, (row * k + j) * h + col);
+    if (routed_scale != 1.0f) acc *= routed_scale;
     if (shared != nullptr) acc += Load(shared, idx);
     Store(out, idx, acc);
   }
@@ -488,36 +508,37 @@ __global__ void MoeCombineKernel(Tout* out, const Teo* expert_out, const float* 
 
 template <typename Teo, typename Tsh, typename Tout>
 void LaunchCombine(cudaStream_t s, Tensor& out, const Tensor& expert_out, const Tensor& weights,
-                   const Tensor* shared, int64_t t, int64_t h, int k) {
+                   const Tensor* shared, int64_t t, int64_t h, int k, float routed_scale) {
   MoeCombineKernel<Teo, Tsh, Tout><<<GridFor(t * h), kBlock, 0, s>>>(
       out.Ptr<Tout>(), expert_out.Ptr<Teo>(), weights.Ptr<float>(),
-      shared != nullptr ? shared->Ptr<Tsh>() : nullptr, t, h, k);
+      shared != nullptr ? shared->Ptr<Tsh>() : nullptr, t, h, k, routed_scale);
   Check(cudaGetLastError(), "moe_combine launch");
 }
 
 // Dispatch shared dtype (or the no-shared path, where Tsh is unused).
 template <typename Teo, typename Tout>
 void DispatchShared(cudaStream_t s, Tensor& out, const Tensor& expert_out, const Tensor& weights,
-                    const Tensor* shared, int64_t t, int64_t h, int k) {
+                    const Tensor* shared, int64_t t, int64_t h, int k, float routed_scale) {
   if (shared == nullptr || shared->dtype == DType::kF32) {
-    LaunchCombine<Teo, float, Tout>(s, out, expert_out, weights, shared, t, h, k);
+    LaunchCombine<Teo, float, Tout>(s, out, expert_out, weights, shared, t, h, k, routed_scale);
   } else {
-    LaunchCombine<Teo, __nv_bfloat16, Tout>(s, out, expert_out, weights, shared, t, h, k);
+    LaunchCombine<Teo, __nv_bfloat16, Tout>(s, out, expert_out, weights, shared, t, h, k,
+                                            routed_scale);
   }
 }
 
 template <typename Teo>
 void DispatchOut(cudaStream_t s, Tensor& out, const Tensor& expert_out, const Tensor& weights,
-                 const Tensor* shared, int64_t t, int64_t h, int k) {
+                 const Tensor* shared, int64_t t, int64_t h, int k, float routed_scale) {
   if (out.dtype == DType::kF32) {
-    DispatchShared<Teo, float>(s, out, expert_out, weights, shared, t, h, k);
+    DispatchShared<Teo, float>(s, out, expert_out, weights, shared, t, h, k, routed_scale);
   } else {
-    DispatchShared<Teo, __nv_bfloat16>(s, out, expert_out, weights, shared, t, h, k);
+    DispatchShared<Teo, __nv_bfloat16>(s, out, expert_out, weights, shared, t, h, k, routed_scale);
   }
 }
 
 void MoeCombineKernelCuda(Queue& q, Tensor& out, const Tensor& expert_out, const Tensor& weights,
-                          const Tensor* shared) {
+                          const Tensor* shared, float routed_scale) {
   VT_CHECK(expert_out.dtype == DType::kF32 || expert_out.dtype == DType::kBF16,
            "cuda moe_combine: unsupported expert_out dtype (f32/bf16 only)");
   VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
@@ -528,9 +549,11 @@ void MoeCombineKernelCuda(Queue& q, Tensor& out, const Tensor& expert_out, const
   if (t == 0 || h == 0) return;
   cudaStream_t s = AsStream(q);
   if (expert_out.dtype == DType::kF32) {
-    DispatchOut<float>(s, out, expert_out, weights, shared, t, h, static_cast<int>(k));
+    DispatchOut<float>(s, out, expert_out, weights, shared, t, h, static_cast<int>(k),
+                       routed_scale);
   } else {
-    DispatchOut<__nv_bfloat16>(s, out, expert_out, weights, shared, t, h, static_cast<int>(k));
+    DispatchOut<__nv_bfloat16>(s, out, expert_out, weights, shared, t, h, static_cast<int>(k),
+                               routed_scale);
   }
 }
 
@@ -672,6 +695,58 @@ void MoeSiluMulKernelCuda(Queue& q, Tensor& out, const Tensor& gate, const Tenso
   }
 }
 
+// ---------------------------------------------------------------------------
+// moe_relu2: out[i] = relu(x[i])^2, the NON-GATED MoE activation (NemotronH's
+// expert epilogue — nemotron_h.py:227 activation_without_mul("relu2") ->
+// MoEActivation.RELU2_NO_MUL). Sibling of moe_silu_mul with ONE input, because a
+// non-gated expert has no gate half. Dtype order is upstream's relu_squared_kernel
+// (csrc/libtorch_stable/activation_kernels.cu:673-678) verbatim: widen to f32,
+// clamp at zero in f32, square in f32, ONE round on the store — so a bf16 input
+// with an f32 output keeps the full f32 square. Byte-identical to the CPU
+// reference (cpu_ops.cpp MoeRelu2Kernel): both are exact f32 ops, no expf —
+// and unlike the combine reduction above there is no multiply-add here for
+// nvcc to contract into an FMA (a compare-select and ONE multiply), so this
+// one holds without --fmad=false. See #591 for the flag gap itself.
+template <typename Tx, typename Tout>
+__global__ void MoeRelu2Kernel(Tout* out, const Tx* x, int64_t n) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step) {
+    const float f = Load(x, i);
+    const float v = f > 0.0f ? f : 0.0f;
+    Store(out, i, v * v);
+  }
+}
+
+template <typename Tx, typename Tout>
+void LaunchRelu2(cudaStream_t s, Tensor& out, const Tensor& x, int64_t n) {
+  MoeRelu2Kernel<Tx, Tout><<<GridFor(n), kBlock, 0, s>>>(out.Ptr<Tout>(), x.Ptr<Tx>(), n);
+  Check(cudaGetLastError(), "moe_relu2 launch");
+}
+
+template <typename Tx>
+void Relu2ByOut(cudaStream_t s, Tensor& out, const Tensor& x, int64_t n) {
+  if (out.dtype == DType::kF32) {
+    LaunchRelu2<Tx, float>(s, out, x, n);
+  } else {
+    LaunchRelu2<Tx, __nv_bfloat16>(s, out, x, n);
+  }
+}
+
+void MoeRelu2KernelCuda(Queue& q, Tensor& out, const Tensor& x) {
+  VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16,
+           "cuda moe_relu2: unsupported x dtype (f32/bf16 only)");
+  VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
+           "cuda moe_relu2: unsupported out dtype (f32/bf16 only)");
+  const int64_t n = out.Numel();
+  if (n == 0) return;
+  cudaStream_t s = AsStream(q);
+  if (x.dtype == DType::kF32) {
+    Relu2ByOut<float>(s, out, x, n);
+  } else {
+    Relu2ByOut<__nv_bfloat16>(s, out, x, n);
+  }
+}
+
 // Registers the CUDA MoE kernels during static init (pre-main, like the M0.6
 // ops in cuda_ops.cu). Filling the op table is harmless on machines without a
 // GPU: the kCUDA backend never registers there, so no CUDA queue can dispatch.
@@ -685,6 +760,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<MoeCombineGateFn>(&MoeCombineGateKernelCuda)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernelCuda)));
+    RegisterOp(OpId::kMoeRelu2, DeviceType::kCUDA,
+               reinterpret_cast<void*>(static_cast<MoeRelu2Fn>(&MoeRelu2KernelCuda)));
   }
 } registrar;
 

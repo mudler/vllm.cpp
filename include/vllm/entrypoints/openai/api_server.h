@@ -36,6 +36,7 @@
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
 #include "vllm/entrypoints/openai/video_api.h"
+#include "vllm/entrypoints/openai/speech_api.h"
 #include "vllm/multimodal/parakeet_transcription.h"
 
 namespace vllm::tok {
@@ -150,6 +151,19 @@ class ApiServer {
   // route table.
   DispatchResult handle_embeddings(const std::string& request_body) const;
 
+  // POST /v1/audio/speech (W6 of #672). OpenAI's createSpeech spelling, with
+  // the two MUSIC inputs (`lyrics`, `description`) as ADDITIONAL named fields
+  // — see speech_api.h for why they are not one `input` behind a separator.
+  // Returns the RIFF/WAVE bytes with content type audio/wav; `voice`, `speed`,
+  // streaming and a non-wav `response_format` are NAMED RESIDUALS -> 400.
+  // Registered ONLY when a synthesizer is attached (the transcriber precedent),
+  // so a text server answers 404 at the route table exactly as before.
+  //
+  // The reference-clip refusal happens HERE, before the runner is called: the
+  // attached family's `requires_reference_audio` is known without synthesizing,
+  // which is the whole reason SpeechEngine exposes it.
+  DispatchResult handle_audio_speech(const std::string& request_body) const;
+
   DispatchResult handle_videos(const std::string& request_body);
   DispatchResult handle_videos_sync(const std::string& request_body);
   DispatchResult handle_video_status(const std::string& job_id) const;
@@ -235,6 +249,23 @@ class ApiServer {
       std::function<EmbeddingBatch(const std::vector<std::string>& inputs)>;
   void set_embedder(EmbedFn embedder) { embedder_ = std::move(embedder); }
 
+  // Attach the speech/music synthesis seam backing POST /v1/audio/speech (W6 of
+  // #672). ADDITIVE and OPT-IN like the embedder above: absent => route
+  // unregistered => 404, byte-identical to a server without a speech model. The
+  // callback wraps the ONE library seam (multimodal::SpeechEngine::Synthesize)
+  // — the SAME seam vllm_synthesize drives — so HTTP and FFI cannot drift.
+  //
+  // `capabilities` is what the server knows WITHOUT synthesizing, so a request
+  // can be refused before the weights stage. It is taken with the runner rather
+  // than separately, because a runner without them would make the route guess.
+  using SynthesizeFn =
+      std::function<::vllm::openai::SpeechResponse(const ::vllm::openai::SpeechRequest&)>;
+  void set_synthesizer(SynthesizeFn synthesizer,
+                       ::vllm::openai::SpeechCapabilities capabilities) {
+    synthesizer_ = std::move(synthesizer);
+    speech_capabilities_ = std::move(capabilities);
+  }
+
   // Attach the tokenizer + max_model_len backing /tokenize and /detokenize
   // (non-owning; must outlive the server).
   void set_tokenizer(const vllm::tok::Tokenizer* tokenizer,
@@ -298,6 +329,8 @@ class ApiServer {
   ::vllm::openai::VideoRunner video_runner_;
   TranscribeFn transcriber_;
   EmbedFn embedder_;
+  SynthesizeFn synthesizer_;
+  ::vllm::openai::SpeechCapabilities speech_capabilities_;
   mutable ::vllm::openai::VideoJobStore video_jobs_;
   // Background workers for the ASYNC endpoint. Joined in ~ApiServer, which is
   // why they are joinable threads and not detached: a detached worker would

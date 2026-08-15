@@ -30,6 +30,7 @@
 
 #include "capi/engine_handle.h"
 #include "vllm/config/device.h"
+#include "vllm/config/multimodal.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/platforms/interface.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
@@ -252,10 +253,10 @@ vllm_engine* MakeSyntheticEngine() {
 // Chat-capable synthetic engine: same stack, but the chat serving is built with
 // an IN-VOCAB prompt seam (the tiny fixture vocab cannot spell a real chat
 // template), mirroring the api-server harness's InVocabChatPrompt.
-vllm_engine* MakeSyntheticChatEngine() {
+vllm_engine* MakeSyntheticChatEngine(EngineParams p) {
   const HfConfig c = MakeConfig();
-  auto loaded = std::make_unique<LoadedEngine>(c, MakeWeights(c), BuildFixture(),
-                                               SyntheticParams());
+  auto loaded =
+      std::make_unique<LoadedEngine>(c, MakeWeights(c), BuildFixture(), p);
   return vllm::capi::MakeEngineHandle(
       std::move(loaded),
       [](const std::vector<vllm::entrypoints::openai::ChatMessage>& messages,
@@ -267,6 +268,10 @@ vllm_engine* MakeSyntheticChatEngine() {
           if (m.content.has_value()) p += *m.content;
         return p;
       });
+}
+
+vllm_engine* MakeSyntheticChatEngine() {
+  return MakeSyntheticChatEngine(SyntheticParams());
 }
 
 vllm_sampling_params GreedyParams(int32_t max_tokens) {
@@ -1245,6 +1250,207 @@ TEST_CASE("capi: enable_jump_forward=on reaches the engine; default is inert (AB
   }
 }
 
+// ── ABI v19: the multimodal input limits (#607 wave L2) ────────────────────
+//
+// Ported from vllm/config/multimodal.py:78,81,212-236,321-336 and the two flags
+// that set them (vllm/engine/arg_utils.py:555-556,1276-1279,1691-1692) @
+// 5559679229bc. Two fields, and the load-bearing property is that they and the
+// SERVER FLAGS land on ONE config object — EngineParams::multimodal ->
+// LoadedEngine::mm_config() — so the two entry points cannot resolve a limit
+// differently.
+TEST_CASE("capi: multimodal input limits (ABI v19)") {
+  // The zero values keep a pre-v19 caller byte-identical: the flag off and NO
+  // limits configured, which resolves to 999 per modality (multimodal.py:331-333)
+  // — NOT 0. An empty map is "no limits", not "nothing allowed".
+  vllm_model_params def = vllm_model_params_default();
+  CHECK(def.language_model_only == 0);
+  CHECK(def.limit_mm_per_prompt == nullptr);
+
+  // A well-formed limit reaches model load (which then fails on the missing
+  // directory) rather than being rejected as a caller error.
+  vllm_model_params ok = vllm_model_params_default();
+  ok.model_path = "/nonexistent/vllm-cpp/model/dir";
+  ok.limit_mm_per_prompt = "{\"image\": 2, \"video\": 0}";
+  vllm_engine* eng = nullptr;
+  CHECK(vllm_engine_load(&ok, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+
+  // ...and so does the flag, which needs no value at all.
+  vllm_model_params lm_only = vllm_model_params_default();
+  lm_only.model_path = "/nonexistent/vllm-cpp/model/dir";
+  lm_only.language_model_only = 1;
+  vllm_engine* eng_lm = nullptr;
+  CHECK(vllm_engine_load(&lm_only, &eng_lm) == VLLM_ERR_MODEL_LOAD);
+
+  // Every upstream validation is a CALLER error here, reported before any model
+  // I/O — never a silent default to 999, which would leave the caller believing
+  // they set a limit they did not.
+  for (const char* bad_value :
+       {"{not json", "[1,2]", "{\"image\": \"two\"}", "{\"image\": -1}",
+        "{\"video\": {\"fps\": 2}}", "{\"video\": {\"num_frames\": 0}}"}) {
+    CAPTURE(bad_value);
+    vllm_model_params bad = vllm_model_params_default();
+    bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+    bad.limit_mm_per_prompt = bad_value;
+    vllm_engine* eng_bad = reinterpret_cast<vllm_engine*>(0x1);
+    CHECK(vllm_engine_load(&bad, &eng_bad) == VLLM_ERR_INVALID_ARGUMENT);
+    CHECK(eng_bad == nullptr);
+  }
+  CHECK(std::string(vllm_last_error()).find("limit_mm_per_prompt") !=
+        std::string::npos);
+}
+
+TEST_CASE("capi: EngineParams::multimodal reaches LoadedEngine::mm_config()") {
+  // The hop the ABI field and the two server flags SHARE. Without it the flags
+  // would be recorded on a struct nobody reads, which is exactly the
+  // "accepted and inert" failure the limits wave exists to avoid.
+  const HfConfig c = MakeConfig();
+  {
+    EngineParams p = SyntheticParams();
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    // Default: no limits configured => 999 per modality, the pre-L2 behaviour.
+    CHECK(e.mm_config().GetLimitPerPrompt("image") ==
+          vllm::kDefaultLimitPerPrompt);
+  }
+  {
+    EngineParams p = SyntheticParams();
+    p.multimodal.limit_per_prompt = {{"image", 2}};
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.mm_config().GetLimitPerPrompt("image") == 2);
+    // A modality nobody named keeps the default — an explicit limit for one
+    // modality is not a global switch.
+    CHECK(e.mm_config().GetLimitPerPrompt("video") ==
+          vllm::kDefaultLimitPerPrompt);
+  }
+  {
+    // The precedence that matters (multimodal.py:326-327): the flag is checked
+    // BEFORE the map, so an explicit non-zero entry does not survive it.
+    EngineParams p = SyntheticParams();
+    p.multimodal.language_model_only = true;
+    p.multimodal.limit_per_prompt = {{"image", 4}};
+    LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+    CHECK(e.mm_config().GetLimitPerPrompt("image") == 0);
+    CHECK(e.mm_config().GetLimitPerPrompt("video") == 0);
+  }
+}
+
+// The PIN for the ABI v19 paragraph in include/vllm.h. That paragraph is a
+// permanent public contract, and the thing it must not claim is that setting
+// these fields makes a C-ABI call REFUSE a multimodal request. It does not:
+// ValidateNumItems is reached only behind the multimodal chat seam, and
+// server_main.cpp is the sole caller of set_multimodal_chat_fn — vllm_chat and
+// vllm_chat_stream never install one, so serving_chat.cpp's `if (mm_chat_fn_)`
+// gate is never taken on this path and no MultiModalInputs is ever built.
+//
+// What a C-ABI caller gets today, asserted rather than described: the request
+// PARSES (protocol.cpp does read `image_url` content parts), the image part is
+// DROPPED, its text siblings still form the prompt, and the answer is an
+// ordinary 200-shaped chat.completion — with language_model_only set, which on
+// the server path would be an HTTP 400. Wire the seam into the ABI without
+// revisiting that paragraph and this case goes red, which is the point.
+TEST_CASE("capi: the v19 limits are RECORDED on a C-ABI engine; there is no "
+          "multimodal request path to enforce them on") {
+  EngineParams p = SyntheticParams();
+  p.multimodal.language_model_only = true;  // every modality limit => 0
+  vllm_engine* eng = MakeSyntheticChatEngine(p);
+  REQUIRE(eng != nullptr);
+
+  // A real OpenAI multimodal chat body: one text part, one image_url part.
+  const char* request =
+      "{\"messages\":[{\"role\":\"user\",\"content\":["
+      "{\"type\":\"text\",\"text\":\"hello\"},"
+      "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,"
+      "iVBORw0KGgo=\"}}"
+      "]}],\"temperature\":0,\"max_tokens\":6}";
+  char* response = nullptr;
+  const vllm_status st = vllm_chat(eng, request, &response);
+  CAPTURE(std::string(vllm_last_error() == nullptr ? "" : vllm_last_error()));
+  REQUIRE(st == VLLM_OK);
+  REQUIRE(response != nullptr);
+  const json body = json::parse(response);
+  CAPTURE(std::string(response));
+  // NOT a refusal: served as text, exactly as if the image part were absent.
+  CHECK(body.at("object") == "chat.completion");
+  CHECK(body.at("choices").size() == 1);
+  CHECK(!body.at("choices").at(0).at("message").at("content")
+             .get<std::string>()
+             .empty());
+  CHECK(body.count("error") == 0);
+  vllm_string_free(response);
+  vllm_engine_free(eng);
+
+  // The limits ARE on the config all the same — recorded, just not consulted by
+  // anything this ABI can reach. That is the exact wording include/vllm.h owes.
+  const HfConfig c = MakeConfig();
+  LoadedEngine e(c, MakeWeights(c), BuildFixture(), p);
+  CHECK(e.mm_config().GetLimitPerPrompt("image") == 0);
+}
+
+TEST_CASE("capi: offload_config defaults to NULL and is parsed+validated (ABI v21)") {
+  // ENG-WEIGHT-OFFLOAD W0b. The field carries vLLM's OffloadConfig JSON. It is
+  // parsed AND run through Validate() at the ABI boundary, so a caller error is
+  // reported before any model I/O — the same contract kv_transfer_config and
+  // limit_mm_per_prompt already hold.
+
+  // Default is NULL == no offloading == the byte-identical engine.
+  vllm_model_params def = vllm_model_params_default();
+  CHECK(def.offload_config == nullptr);
+
+  // A well-formed config gets PAST the argument gate and fails at model load,
+  // which is how we prove it was accepted rather than rejected.
+  vllm_model_params ok = vllm_model_params_default();
+  ok.model_path = "/nonexistent/vllm-cpp/model/dir";
+  ok.offload_config =
+      "{\"offload_backend\":\"uva\",\"uva\":{\"cpu_offload_gb\":10,"
+      "\"cpu_offload_params\":[\"experts\"]}}";
+  vllm_engine* eng = nullptr;
+  CHECK(vllm_engine_load(&ok, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+
+  // Empty string is the same as NULL: inert, still reaches model load.
+  vllm_model_params empty = vllm_model_params_default();
+  empty.model_path = "/nonexistent/vllm-cpp/model/dir";
+  empty.offload_config = "";
+  vllm_engine* eng_empty = nullptr;
+  CHECK(vllm_engine_load(&empty, &eng_empty) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng_empty == nullptr);
+
+  // Every rejection below must be INVALID_ARGUMENT, never MODEL_LOAD: the
+  // distinction is the whole point of validating at the boundary.
+  struct Bad { const char* json; const char* why; };
+  const Bad bad_cases[] = {
+      {"{not json", "malformed document"},
+      {"{\"offload_backend\":\"disk\"}", "unknown backend (disk is ENG-EXPERT-STREAM's idea, not this row's)"},
+      {"{\"uva\":{\"cpu_offload_gb\":\"ten\"}}", "wrong-typed field"},
+      {"{\"uva\":5}", "sub-config that is not an object"},
+      {"{\"uva\":{\"cpu_offload_gb\":-1}}", "negative budget (the ge=0 bound)"},
+      {"{\"prefetch\":{\"offload_group_size\":4,\"offload_num_in_group\":5}}",
+       "num_in_group > group_size (upstream validator error 1)"},
+      {"{\"prefetch\":{\"offload_group_size\":8,\"offload_num_in_group\":2,"
+       "\"offload_prefetch_step\":0}}",
+       "prefetch_step < 1 while enabled (upstream validator error 2)"},
+  };
+  for (const Bad& b : bad_cases) {
+    vllm_model_params bad = vllm_model_params_default();
+    bad.model_path = "/nonexistent/vllm-cpp/model/dir";
+    bad.offload_config = b.json;
+    vllm_engine* e = reinterpret_cast<vllm_engine*>(0x1);
+    CHECK_MESSAGE(vllm_engine_load(&bad, &e) == VLLM_ERR_INVALID_ARGUMENT, b.why);
+    CHECK_MESSAGE(e == nullptr, b.why);
+  }
+
+  // A backend/field MISMATCH is a warning upstream, so it must NOT be refused:
+  // uva backend with prefetch fields set still reaches model load.
+  vllm_model_params warn = vllm_model_params_default();
+  warn.model_path = "/nonexistent/vllm-cpp/model/dir";
+  warn.offload_config =
+      "{\"offload_backend\":\"uva\",\"uva\":{\"cpu_offload_gb\":1},"
+      "\"prefetch\":{\"offload_group_size\":8,\"offload_num_in_group\":2}}";
+  vllm_engine* eng_warn = nullptr;
+  CHECK(vllm_engine_load(&warn, &eng_warn) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng_warn == nullptr);
+}
+
 TEST_CASE("capi: kv_transfer_config parses and validates the connector name") {
   // A well-formed config naming a REGISTERED connector passes the gate and
   // reaches model load.
@@ -1307,6 +1513,9 @@ TEST_CASE("capi: version and abi-version are exposed") {
   // test_dlopen compare against the same macro and move with it (the #121
   // lesson: an == floor moves with the macro and proves nothing).
   CHECK(vllm_abi_version() >= 16);
+  // The multimodal input limits are ABI v19; the speech/music slice
+  // (vllm_speech_* / vllm_synthesize) is ABI v20.
+  CHECK(vllm_abi_version() >= 20);
 }
 
 // ─── ABI v16: KV-pool sizing knobs (ROAD-V1-MEM M1) ──────────────────────────
@@ -1722,6 +1931,202 @@ TEST_CASE("capi v12: video argument contract") {
   vllm_video_mux_argv_free(nullptr, 3);  // no-op
 }
 
+// ─── ABI v18: the generalized video seam (LTX-2.5 L1, issue #435) ────────────
+// The v12 cases above are the byte-identity guard: they drive the SAME zeroed
+// structs a v12 caller does, and they still reach the H3 goldens. These cases
+// gate the ADDITIONS — the family selector, the extras arrays, and the refusals
+// that keep "detect" from decaying into "guess".
+
+TEST_CASE("capi v18: the added fields default to detect/none") {
+  const vllm_video_model_params mp = vllm_video_model_params_default();
+  CHECK(mp.family == nullptr);  // NULL => detect from the checkpoint
+  CHECK(mp.extra_keys == nullptr);
+  CHECK(mp.extra_values == nullptr);
+  CHECK(mp.n_extras == 0);
+
+  const vllm_video_params vp = vllm_video_params_default();
+  CHECK(vp.extra_keys == nullptr);
+  CHECK(vp.extra_values == nullptr);
+  CHECK(vp.n_extras == 0);
+
+  CHECK(vllm_video_engine_family(nullptr) == nullptr);
+}
+
+TEST_CASE("capi v18: a v12 zeroed load DETECTS minimax-h3") {
+  VideoFoldWorkspace ws;
+  VideoFixtureParams fp(ws.fixture);  // family NULL, n_extras 0 — the v12 shape
+  vllm_video_engine* eng = nullptr;
+  REQUIRE_MESSAGE(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK, vllm_last_error());
+  REQUIRE(eng != nullptr);
+  REQUIRE(vllm_video_engine_family(eng) != nullptr);
+  CHECK(std::string(vllm_video_engine_family(eng)) == "minimax-h3");
+  vllm_video_engine_free(eng);
+}
+
+TEST_CASE("capi v18: an EXPLICIT family selector loads, an unregistered one is refused") {
+  VideoFoldWorkspace ws;
+  vllm_video_engine* eng = nullptr;
+
+  VideoFixtureParams declared(ws.fixture);
+  declared.mp.family = "minimax-h3";
+  REQUIRE_MESSAGE(vllm_video_engine_load(&declared.mp, &eng) == VLLM_OK, vllm_last_error());
+  CHECK(std::string(vllm_video_engine_family(eng)) == "minimax-h3");
+  vllm_video_engine_free(eng);
+
+  // An unregistered name is REFUSED naming what is registered — never treated
+  // as a hint and never detected around.
+  //
+  // THE NAME MUST BE ONE THAT CANNOT BECOME REGISTERED. This case was written at
+  // L1 against "ltx-2.5" while H3 was the only family, and phase L7 registered
+  // exactly that name: the load then resolved to the LTX loader, which failed on
+  // an H3 fixture, so the unregistered-family branch under test was never taken
+  // at all. Note how it failed — the "ltx-2.5" assertion kept PASSING the whole
+  // time, matching the LTX loader's own failure text rather than a registry
+  // listing. A test whose premise can expire is a test that goes green for the
+  // wrong reason first and red second. Its C++-seam twin
+  // (test_video_engine.cpp, "an unknown family names what was asked and what
+  // exists") was repaired at L7; this C-ABI copy was missed because the phase
+  // baselines ran `test_capi -tc='capi v12*'` and never executed the v18 section.
+  VideoFixtureParams unknown(ws.fixture);
+  unknown.mp.family = "not-a-video-family";
+  eng = reinterpret_cast<vllm_video_engine*>(0x1);
+  CHECK(vllm_video_engine_load(&unknown.mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  const std::string refusal = vllm_last_error();
+  INFO("refusal: ", refusal);
+  CHECK(refusal.find("not-a-video-family") != std::string::npos);
+  // Pin the BRANCH, not just the words in it. Without this the case cannot tell
+  // "the registry refused an unregistered name" from "a family loader was
+  // reached and threw", which is precisely the confusion that let the premise
+  // above rot undetected: a name that quietly becomes registered now fails here,
+  // naming the reason, instead of passing on a loader's error text.
+  CHECK(refusal.find("no family named") != std::string::npos);
+  // EVERY registered family is listed, not just the first. That is a stronger
+  // guarantee than this case could state at L1 with one family registered: a
+  // refusal is how a caller learns what it could have asked for instead, so one
+  // that named only some of the registry would send them away from a family that
+  // would have loaded their checkpoint.
+  CHECK(refusal.find("minimax-h3") != std::string::npos);
+  CHECK(refusal.find("ltx-2.5") != std::string::npos);
+}
+
+TEST_CASE("capi v18: an unrecognizable checkpoint is refused, and no family is guessed") {
+  VideoFoldWorkspace ws;
+  // A real safetensors file that is a VAE, not a DiT: readable, well-formed, and
+  // carrying no family's DiT signature, so ZERO detectors claim it.
+  //
+  // This case read "not handed to the ONLY family" at L1, when H3 was the sole
+  // registrant and the hazard was the "there is only one, so it must be that
+  // one" fallback. Phase L7 registered a second family, which makes that exact
+  // fallback unreachable in this binary — so the old title now overstates what
+  // the case can prove. What it still gates, and what it is renamed to state, is
+  // the zero-claimant refusal itself: nothing is loaded, and the message carries
+  // both halves a caller needs — the artifact that was inspected and the whole
+  // registry it failed to match.
+  const std::string not_a_dit = ws.fixture + "/video_vae.safetensors";
+  vllm_video_model_params mp = vllm_video_model_params_default();
+  mp.dit_path = not_a_dit.c_str();
+  vllm_video_engine* eng = reinterpret_cast<vllm_video_engine*>(0x1);
+  CHECK(vllm_video_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  const std::string refusal = vllm_last_error();
+  INFO("refusal: ", refusal);
+  CHECK(refusal.find("video_vae.safetensors") != std::string::npos);
+  // Both registered families, for the same reason as the case above: the listing
+  // is the caller's only route out of the refusal.
+  CHECK(refusal.find("minimax-h3") != std::string::npos);
+  CHECK(refusal.find("ltx-2.5") != std::string::npos);
+}
+
+TEST_CASE("capi v18: the extras arrays carry the family knob, and disagreement is refused") {
+  VideoFoldWorkspace ws;
+  const char* keys[] = {"partition"};
+
+  SUBCASE("the partition arrives through extras alone and still guards") {
+    const char* values[] = {"ref2va"};
+    VideoFixtureParams fp(ws.fixture);
+    fp.mp.partition = nullptr;  // ONLY the extra declares it
+    fp.mp.extra_keys = keys;
+    fp.mp.extra_values = values;
+    fp.mp.n_extras = 1;
+    vllm_video_engine* eng = nullptr;
+    REQUIRE_MESSAGE(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK, vllm_last_error());
+    const std::string out_dir = ws.root + "/out";
+    vllm_video_params vp = vllm_video_params_default();
+    vp.num_frames = 5;
+    vp.height = 32;
+    vp.width = 32;
+    vp.steps = 3;
+    vp.output_dir = out_dir.c_str();
+    vllm_video_result out;
+    CHECK(vllm_video_generate(eng, &vp, &out) == VLLM_ERR_RUNTIME);
+    CHECK(std::string(vllm_last_error()).find("ref2va") != std::string::npos);
+    vllm_video_engine_free(eng);
+  }
+
+  SUBCASE("the v12 field and an AGREEING extra are accepted") {
+    const char* values[] = {"fl2va"};
+    VideoFixtureParams fp(ws.fixture);  // its .partition is already "fl2va"
+    fp.mp.extra_keys = keys;
+    fp.mp.extra_values = values;
+    fp.mp.n_extras = 1;
+    vllm_video_engine* eng = nullptr;
+    CHECK(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK);
+    vllm_video_engine_free(eng);
+  }
+
+  SUBCASE("the v12 field and a DISAGREEING extra are refused, not silently resolved") {
+    const char* values[] = {"ref2va"};
+    VideoFixtureParams fp(ws.fixture);  // .partition == "fl2va"
+    fp.mp.extra_keys = keys;
+    fp.mp.extra_values = values;
+    fp.mp.n_extras = 1;
+    vllm_video_engine* eng = reinterpret_cast<vllm_video_engine*>(0x1);
+    CHECK(vllm_video_engine_load(&fp.mp, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+    CHECK(eng == nullptr);
+    CHECK(std::string(vllm_last_error()).find("disagree") != std::string::npos);
+  }
+
+  SUBCASE("malformed extras arrays are a caller error, never a read past the end") {
+    VideoFixtureParams fp(ws.fixture);
+    fp.mp.n_extras = 1;  // ...with NULL arrays
+    vllm_video_engine* eng = nullptr;
+    CHECK(vllm_video_engine_load(&fp.mp, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+    fp.mp.n_extras = -1;
+    fp.mp.extra_keys = keys;
+    const char* values[] = {"fl2va"};
+    fp.mp.extra_values = values;
+    CHECK(vllm_video_engine_load(&fp.mp, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+    const char* null_key[] = {nullptr};
+    fp.mp.n_extras = 1;
+    fp.mp.extra_keys = null_key;
+    CHECK(vllm_video_engine_load(&fp.mp, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  }
+}
+
+TEST_CASE("capi v18: an unknown per-generation extra is refused, not ignored") {
+  VideoFoldWorkspace ws;
+  VideoFixtureParams fp(ws.fixture);
+  vllm_video_engine* eng = nullptr;
+  REQUIRE(vllm_video_engine_load(&fp.mp, &eng) == VLLM_OK);
+
+  const std::string out_dir = ws.root + "/out";
+  const char* keys[] = {"pipeline_kind"};  // an LTX key, on an H3 engine
+  const char* values[] = {"distilled_two_stage"};
+  vllm_video_params vp = vllm_video_params_default();
+  vp.num_frames = 5;
+  vp.height = 32;
+  vp.width = 32;
+  vp.steps = 3;
+  vp.output_dir = out_dir.c_str();
+  vp.extra_keys = keys;
+  vp.extra_values = values;
+  vp.n_extras = 1;
+  vllm_video_result out;
+  CHECK(vllm_video_generate(eng, &vp, &out) == VLLM_ERR_RUNTIME);
+  CHECK(std::string(vllm_last_error()).find("pipeline_kind") != std::string::npos);
+  vllm_video_engine_free(eng);
+}
 
 // ─── ABI v14: explicit device selection (ARCH-ONE-SURFACE ROW 8) ─────────────
 // The device knob: 0=auto (the byte-identical accelerator-first probe), 1=cpu,
@@ -1980,4 +2385,224 @@ TEST_CASE("capi v15: vllm_embed argument contract") {
   CHECK(out.values == nullptr);
   CHECK(out.n_embeddings == 0);
   vllm_engine_free(eng);
+}
+
+// ─── ABI v20: speech + music generation (W6 of #672) ─────────────────────────
+//
+// The C face of vllm::multimodal::SpeechEngine. These cases use a SYNTHETIC
+// MiniMax-Music3 component tree (configs only, zero-byte shard placeholders):
+// the engine resolves the checkpoint, parses all six configs and enforces the
+// dtype invariant before a weight byte is read, so its declared contract is
+// reachable without the 28.5 GB asset.
+
+namespace {
+
+void WriteCapiFile(const std::filesystem::path& path, const std::string& text) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::binary);
+  REQUIRE(out.good());
+  out << text;
+}
+
+// The RELEASED checkpoint's own configs, so a drift in the shipped values is a
+// CI failure rather than a surprise on the box that has the weights.
+std::filesystem::path WriteSyntheticMusic3(const char* tag) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / (std::string("vllm_capi_music3_") + tag);
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  WriteCapiFile(root / "modular_model_index.json",
+                R"({"_class_name": "MiniMaxMusic3ModularPipeline"})");
+  WriteCapiFile(root / "condition_encoder" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3ConditionEncoder", "condition_hidden_dim": 4096,
+                    "input_hop_length": 960, "input_sampling_rate": 24000,
+                    "num_condition_layers": 8, "out_dim": 2048, "output_hop_length": 512,
+                    "output_sampling_rate": 44100})");
+  WriteCapiFile(root / "condition_encoder" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "vocoder" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3Vocoder", "decoder_hidden_dim": 1536,
+                    "decoder_input_dim": 1024, "latent_channels": 128, "sampling_rate": 44100,
+                    "upsampling_ratios": [8, 8, 4, 2]})");
+  WriteCapiFile(root / "vocoder" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "rvq_depth_decoder" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3RVQDepthDecoder", "audio_vocab_size": 1024,
+                    "hidden_size": 4096, "intermediate_size": 6144,
+                    "max_position_embeddings": 16, "num_attention_heads": 16,
+                    "num_codebooks": 8, "num_layers": 4})");
+  WriteCapiFile(root / "rvq_depth_decoder" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "transformer" / "config.json",
+                R"({"_class_name": "MiniMaxMusic3Transformer1DModel", "attention_head_dim": 64,
+                    "condition_dim": 2048, "ff_inner_dim": 8192, "fourier_embedding_dim": 256,
+                    "in_channels": 128, "num_attention_heads": 32, "num_layers": 36,
+                    "rotary_dim": 32})");
+  WriteCapiFile(root / "transformer" / "diffusion_pytorch_model.safetensors", "");
+  WriteCapiFile(root / "language_model" / "config.json",
+                R"({"architectures": ["Qwen3ForCausalLM"], "dtype": "bfloat16", "head_dim": 128,
+                    "hidden_size": 4096, "intermediate_size": 12288,
+                    "max_position_embeddings": 10240, "model_type": "qwen3",
+                    "num_attention_heads": 32, "num_hidden_layers": 36,
+                    "num_key_value_heads": 8, "rms_norm_eps": 1e-06,
+                    "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"},
+                    "tie_word_embeddings": false, "vocab_size": 200000})");
+  WriteCapiFile(root / "language_model" / "model.safetensors", "");
+  WriteCapiFile(root / "scheduler" / "scheduler_config.json",
+                R"({"_class_name": "FlowMatchEulerDiscreteScheduler", "invert_sigmas": true,
+                    "num_train_timesteps": 1, "shift": 1.0, "shift_terminal": null,
+                    "stochastic_sampling": false, "time_shift_type": "exponential",
+                    "use_dynamic_shifting": false})");
+  WriteCapiFile(root / "tokenizer" / "tokenizer_config.json", "{}");
+  return root;
+}
+
+}  // namespace
+
+TEST_CASE("capi: v20 speech params zero-fill to the FAMILY's defaults") {
+  const vllm_speech_model_params mp = vllm_speech_model_params_default();
+  CHECK(mp.path == nullptr);
+  CHECK(mp.family == nullptr);  // NULL => detect by inspecting the artifact
+
+  const vllm_speech_params p = vllm_speech_params_default();
+  CHECK(p.text == nullptr);
+  CHECK(p.lyrics == nullptr);
+  CHECK(p.description == nullptr);
+  CHECK(p.reference_audio == nullptr);
+  CHECK(p.n_reference_audio == 0);
+  CHECK(p.audio_duration_s == doctest::Approx(0.0));
+  CHECK(p.num_inference_steps == 0);
+  CHECK(p.seed == 0);
+  // 0 IS A LEGAL guidance scale, so the "family decides" signal is the FLAG.
+  // A zeroed struct must therefore leave the flag clear rather than requesting
+  // guidance 0, which would select the unconditional branch.
+  CHECK(p.has_guidance_scale == 0);
+}
+
+TEST_CASE("capi: v20 speech handles refuse null arguments without touching *out") {
+  vllm_speech_engine* eng = nullptr;
+  CHECK(vllm_speech_engine_load(nullptr, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(eng == nullptr);
+  vllm_speech_model_params empty = vllm_speech_model_params_default();
+  CHECK(vllm_speech_engine_load(&empty, &eng) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_speech_engine_load(&empty, nullptr) == VLLM_ERR_INVALID_ARGUMENT);
+
+  // A NULL handle answers, rather than crashing, and answers the SAFE value.
+  CHECK(vllm_speech_engine_family(nullptr) == nullptr);
+  CHECK(vllm_speech_engine_sample_rate(nullptr) == 0);
+  CHECK(vllm_speech_engine_requires_reference_audio(nullptr) == 0);
+  vllm_speech_engine_free(nullptr);
+
+  vllm_speech_result out;
+  std::memset(&out, 0xAB, sizeof(out));
+  const vllm_speech_params params = vllm_speech_params_default();
+  CHECK(vllm_synthesize(nullptr, &params, &out) == VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(out.samples == nullptr);  // zeroed even though it arrived poisoned
+  CHECK(out.wav == nullptr);
+  CHECK(out.n_samples == 0);
+  vllm_speech_result_free(nullptr);
+  vllm_speech_result_free(&out);
+}
+
+TEST_CASE("capi: v20 refuses a directory no speech family claims, NAMING what was tried") {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / "vllm_capi_speech_unclaimed";
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  std::filesystem::create_directories(root);
+  WriteCapiFile(root / "config.json", R"({"architectures": ["Qwen3ForCausalLM"]})");
+
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  const std::string path = root.string();
+  mp.path = path.c_str();
+  vllm_speech_engine* eng = nullptr;
+  CHECK(vllm_speech_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  const std::string why = vllm_last_error();
+  // The refusal is EVIDENCE: it names every family that was tried and points a
+  // text checkpoint at the entry point that does serve it.
+  CHECK(why.find("minimax-music3") != std::string::npos);
+  CHECK(why.find("indextts2") != std::string::npos);
+  CHECK(why.find("vllm_engine_load") != std::string::npos);
+
+  // An UNREGISTERED family name is refused too, never treated as a hint.
+  mp.family = "sora-audio";
+  CHECK(vllm_speech_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(std::string(vllm_last_error()).find("sora-audio") != std::string::npos);
+  std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference clip") {
+  const std::filesystem::path root = WriteSyntheticMusic3("declared");
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  const std::string path = root.string();
+  mp.path = path.c_str();
+  vllm_speech_engine* eng = nullptr;
+  REQUIRE_MESSAGE(vllm_speech_engine_load(&mp, &eng) == VLLM_OK, vllm_last_error());
+  REQUIRE(eng != nullptr);
+
+  // Detection resolved it without being told, which is what NULL family means.
+  CHECK(std::string(vllm_speech_engine_family(eng)) == "minimax-music3");
+  // The NATIVE rate (spec §1.1), not 22050 and not SGLang-Omni's 32000.
+  CHECK(vllm_speech_engine_sample_rate(eng) == 44100);
+  // 0 — Music3 conditions on text alone. This is the value that DIFFERS from a
+  // voice-cloning family's, so a pass proves the override was reached.
+  CHECK(vllm_speech_engine_requires_reference_audio(eng) == 0);
+
+  // A DECLARED family loads the same checkpoint identically.
+  vllm_speech_engine* declared = nullptr;
+  mp.family = "minimax-music3";
+  REQUIRE_MESSAGE(vllm_speech_engine_load(&mp, &declared) == VLLM_OK, vllm_last_error());
+  CHECK(std::string(vllm_speech_engine_family(declared)) == "minimax-music3");
+  vllm_speech_engine_free(declared);
+
+  // W6 refused HERE by name, because the 8.6B `Qwen3ForCausalLM` forward it
+  // needed had no `inputs_embeds` entry on the landed dense path. That entry
+  // exists now (`Qwen3DenseModel::ForwardEmbeds`) and the loop that drives it is
+  // `Music3GenerateFrameHiddens`, so this assertion is INVERTED: a valid request
+  // must no longer stop at a missing stage.
+  //
+  // This checkpoint is SYNTHETIC — valid configs, empty weight files — so the
+  // request runs the whole contract and then fails ON THE ARTIFACT, naming the
+  // file it could not read. Pinning that boundary is the point: the message must
+  // be about these bytes and must NOT be about an unimplemented forward. Whether
+  // the pipeline produces a song is a question only the real 28.5 GB checkpoint
+  // answers, and tests/parity/test_minimax_music3_e2e_real.cpp asks it.
+  vllm_speech_params params = vllm_speech_params_default();
+  params.lyrics = "[Verse]\nMorning light\n";
+  params.description = "Genre: acoustic pop. BPM: 96.";
+  params.audio_duration_s = 12.5;   // differs from the family's 60.0
+  params.num_inference_steps = 4;   // differs from the family's 30
+  params.seed = 7;
+  vllm_speech_result out;
+  std::memset(&out, 0xAB, sizeof(out));
+  CHECK(vllm_synthesize(eng, &params, &out) == VLLM_ERR_RUNTIME);
+  CHECK(out.samples == nullptr);
+  CHECK(out.wav == nullptr);
+  {
+    const std::string message = vllm_last_error();
+    MESSAGE("a valid request against a synthetic checkpoint stops at: " << message);
+    // It reached the LANGUAGE MODEL's own weight file — the first thing the AR
+    // head touches, and the thing this checkpoint does not really have.
+    CHECK(message.find("language_model") != std::string::npos);
+    // And it is NOT the by-name refusal W6 shipped. Both spellings are asserted
+    // absent because either surviving would mean the stage is still owed; the
+    // message is printed above so a reader can check rather than trust.
+    CHECK(message.find("inputs_embeds") == std::string::npos);
+    CHECK(message.find("not implemented") == std::string::npos);
+  }
+
+  // A field the family cannot honour is refused BY NAME rather than dropped.
+  vllm_speech_params with_text = params;
+  with_text.text = "sing something";
+  CHECK(vllm_synthesize(eng, &with_text, &out) == VLLM_ERR_RUNTIME);
+  CHECK(std::string(vllm_last_error()).find("`text` is not this family's input") !=
+        std::string::npos);
+
+  // n_reference_audio without a buffer is a CALLER error, caught before the
+  // family sees it.
+  vllm_speech_params bad_ref = params;
+  bad_ref.n_reference_audio = 4;
+  CHECK(vllm_synthesize(eng, &bad_ref, &out) == VLLM_ERR_INVALID_ARGUMENT);
+
+  vllm_speech_engine_free(eng);
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
 }

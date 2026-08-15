@@ -9,12 +9,51 @@ contain today.
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
+import shutil
+import subprocess
 import tempfile
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 CHECKER = REPO_ROOT / "scripts" / "check-snapshot-pins.py"
+PIN_HEADER = REPO_ROOT / "tests" / "parity" / "hf_snapshot.h"
+
+# A candidate that could not be LAUNCHED, as opposed to one that ran and
+# rejected the header: 127 is "not found", 126 is "found, not executable". Only
+# these fall through to the next candidate; any other status is a compiler's
+# verdict on the header and is reported as such.
+_CANNOT_LAUNCH = (126, 127)
+
+
+def _cxx_candidates() -> list[list[str]]:
+    """C++ commands to syntax-check the pin header with, best first.
+
+    `$CXX` is honored as a WHOLE command, not as its first token. `ccache g++`,
+    `sccache clang++` and `distcc g++` are ordinary spellings of it, and keeping
+    only the first token runs the LAUNCHER with the compiler's flags and no
+    compiler behind it -- a red that names this header while the real complaint
+    is `/usr/bin/env: invalid option -- 's'`. Fail-closed, so never dangerous,
+    but it accuses the wrong file.
+
+    Each entry is a full argv prefix whose executable is resolved through PATH;
+    an unresolvable one is dropped here rather than raising later.
+    """
+
+    wanted: list[list[str]] = []
+    configured = os.environ.get("CXX", "").split()
+    if configured:
+        wanted.append(configured)
+    wanted += [["c++"], ["g++"], ["clang++"]]
+
+    resolved: list[list[str]] = []
+    for command in wanted:
+        found = shutil.which(command[0])
+        if found is not None:
+            resolved.append([found, *command[1:]])
+    return resolved
+
 
 _spec = importlib.util.spec_from_file_location("check_snapshot_pins", CHECKER)
 assert _spec is not None and _spec.loader is not None
@@ -354,6 +393,83 @@ class SnapshotPinChecker(unittest.TestCase):
                     len(re.findall(rf"\b{name}\b,", header)),
                     f"{name} is never passed to HfSnapshot; it pins nothing",
                 )
+
+    def _no_compiler(self, why: str) -> None:
+        """Skip on a developer box, FAIL in CI.
+
+        `skipTest` exits 0, and `scripts/agent-preflight.sh`'s `run()` prints a
+        green `ok` while swallowing stdout, so a host with no C++ compiler turns
+        the guard below into a silent no-op that LOOKS like it ran. Measured:
+        `env PATH=/nonexistent python3 -m unittest ...` reported `OK (skipped=1)`
+        and exit 0. That is tolerable on a laptop and is not tolerable in the
+        lane that is supposed to be the backstop, so `CI` makes it a failure --
+        CI's runner ships `g++`, so this can only fire if that stops being true.
+        """
+
+        if os.environ.get("CI", "").strip():
+            self.fail(
+                "CI must be able to syntax-check "
+                f"{PIN_HEADER.relative_to(REPO_ROOT)}, and cannot: {why}. "
+                "A skip here exits 0 and reads as a pass."
+            )
+        self.skipTest(why)
+
+    def test_the_pin_header_compiles_on_its_own(self) -> None:
+        """Issue #558 (guard) / #551, #546 (the defect it is a guard against).
+
+        `af8170154` added `Nemotron35LightningSnapshot()` eleven lines ABOVE the
+        `HfSnapshot` it calls, and `main` went red: 14 translation units failed
+        with `'HfSnapshot' was not declared in this scope`. Every one of them is
+        checkpoint-gated, so a serial `ctest` reported them `***Not Run` -- which
+        reads as a missing checkpoint on a box that has none, not as a compile
+        break. `fafa16f0f` (PR #556) fixed the ordering; this is the guard, which
+        that fix did not carry.
+
+        A full C++ build does catch it (`test_hf_snapshot_pinning` includes this
+        header and always builds), and that is exactly why the guard belongs
+        here instead: the change that broke it never built C++ at all. This suite
+        runs from `scripts/agent-preflight.sh` and from CI's record lane, needs
+        no CMake, no build tree, no GPU and no checkpoint, and takes about a
+        quarter of a second -- so the header cannot go back to being validated
+        only by a build that a records-and-evidence commit has no reason to run.
+
+        Compiling the header ALONE, rather than as part of some TU that happens
+        to include other things first, is the property under test: a pin nobody
+        can include is a pin nobody resolves through. It also catches the
+        merge hazard the two independent repairs of #551 produced -- moving the
+        same block to two different places auto-merges with no conflict into a
+        header that DEFINES the accessor twice.
+        """
+        candidates = _cxx_candidates()
+        if not candidates:
+            self._no_compiler("no C++ compiler on PATH")
+        with tempfile.TemporaryDirectory() as raw:
+            tu = pathlib.Path(raw) / "hf_snapshot_alone.cc"
+            tu.write_text(f'#include "{PIN_HEADER.name}"\n', encoding="utf-8")
+            attempted: list[str] = []
+            for command in candidates:
+                proc = subprocess.run(
+                    [
+                        *command,
+                        "-std=c++20",
+                        "-fsyntax-only",
+                        f"-I{PIN_HEADER.parent}",
+                        str(tu),
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                attempted.append(" ".join(command))
+                if proc.returncode not in _CANNOT_LAUNCH:
+                    break
+            else:
+                self._no_compiler(f"none of {attempted} could be launched")
+        self.assertEqual(
+            0,
+            proc.returncode,
+            f"{PIN_HEADER.relative_to(REPO_ROOT)} does not compile on its own "
+            f"under {' '.join(command)}:\n{proc.stderr.strip()}",
+        )
 
 
 if __name__ == "__main__":

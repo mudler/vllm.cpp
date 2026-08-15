@@ -75,6 +75,7 @@ CHECKERS=(
   check-surface-coverage
   check-test-registration
   check-snapshot-pins
+  check-oracle-pins
   check-now-current
   check-gate-commands
 )
@@ -83,6 +84,7 @@ SUITES=(
   test_check_prompt_contract
   test_agent_gates
   test_agent_record
+  test_check_issue_index_append_only
   test_check_release_binary_contract
   test_release_manifest
   test_release_archive
@@ -115,9 +117,11 @@ SUITES=(
   test_check_surface_coverage
   test_check_test_registration
   test_check_snapshot_pins
+  test_check_oracle_pins
   test_cpu_x86_llamacpp_floor
   test_audit_live_rows
   test_check_gate_commands
+  test_gpu_lock_one_truth
   test_main_baseline
 )
 
@@ -198,6 +202,8 @@ for suite in "${SUITES[@]}"; do
 done
 run "trailer suites" python3 -m unittest \
   tests.scripts.test_check_commit_trailers
+run "commit style suites" python3 -m unittest \
+  tests.scripts.test_check_commit_style
 
 # The COMMITTED range, checked the way CI checks it. Deliberately OUTSIDE the
 # --staged block: `--staged` inspects staged paths and is therefore VACUOUS after
@@ -212,6 +218,8 @@ if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
     --base origin/main --head HEAD
   run "doc-checkpoint range" python3 scripts/check-doc-checkpoint.py \
     --base origin/main --head HEAD
+  run "issue-index append-only" python3 scripts/check-issue-index-append-only.py \
+    --base origin/main --head HEAD
 fi
 
 # Trailer enforcement reads only committed Git objects.
@@ -220,6 +228,8 @@ if git rev-parse --verify -q origin/main >/dev/null 2>&1 &&
    [ "$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)" -gt 0 ]; then
   echo "Commit trailers vs origin/main:"
   run "commit-trailers" python3 scripts/check-commit-trailers.py \
+    --range "origin/main..HEAD"
+  run "commit-style" python3 scripts/check-commit-style.py \
     --range "origin/main..HEAD"
 fi
 

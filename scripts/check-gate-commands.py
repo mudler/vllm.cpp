@@ -87,9 +87,10 @@ _TOOL = re.compile(
 )
 # `flock <lock> -c '<gate>'` is this repo's MANDATED shape for any gate touching
 # the GPU, and the wrapper QUOTES the real command, putting it out of reach of
-# every other rule here. It needs a lockfile AND something to run: the bare
-# `flock` and `flock /tmp/gpu` that appear in three specs name the idiom, not a
-# gate, and a plain vocabulary entry credits all three with a command.
+# every other rule here. It needs a lockfile AND something to run: a bare
+# `flock`, and a `flock` plus a lockfile with nothing after it, appear in three
+# specs naming the idiom rather than a gate, and a plain vocabulary entry would
+# credit all three with a command.
 _WRAPPER = re.compile(r"(?:^|\s)flock\s+\S+\s+\S")
 # `./anything` is an explicit invocation, arguments or not -- a built test binary
 # (`./build-cuda-121a/tests/test_dropin_abi`) is run, not referred to. A bare
@@ -284,8 +285,15 @@ def audit() -> list[dict]:
 # agent-integration invocations plus the per-commit re-verification of
 # f64f2b71, and records that no CUDA/GPU/SACRED gate is implicated because no
 # product source is touched. Growth, so the set is re-pinned in the same change.
+# 2026-08-13: +SERVE-RECIPE-ARGS. The row leaves SPIKE for ACTIVE on its
+# implementation (issue #606), which puts it in GATED_STATES for the first time;
+# its spec's Gates section names `scripts/agent-preflight.sh --staged` plus the
+# focused test file, and records that no CUDA/GPU/SACRED/oracle gate is
+# implicated because the change is argument parsing and reaches no forward pass.
+# Growth from a lifecycle move, so the set is re-pinned in the same change.
 RUNNABLE_BASELINE = frozenset({
     "ATTN-CHUNKED-LOCAL",
+    "SERVE-RECIPE-ARGS",
     "ENG-FORGE-COAUTHOR",
     "ENG-RECORD-CONFLICT-SURFACES",
     "SAMPLE-PROMPT-LOGPROBS",

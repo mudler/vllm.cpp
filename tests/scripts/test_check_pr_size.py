@@ -110,6 +110,19 @@ class PathClassification(unittest.TestCase):
             "docker/Dockerfile.arm64": "configuration",
             "docker/healthcheck.sh": "configuration",
             "tests/scripts/fixtures/release_manifest/v1/cpu-input.json": "asset",
+            # Same failure as the Dockerfile entries above, one row later.
+            # #840 moved the intake table out of roadmap_v1.md into its own
+            # append-only file and never classified it, and classify_path FAILS
+            # CLOSED -- so pr-size aborted on every pull request that appends an
+            # index row, which under that same policy is nearly all of them
+            # (#856). It is a project record for the same reason roadmap_v1.md
+            # is: it IS the table roadmap_v1.md used to hold.
+            ".agents/roadmap_v1.md": "project_record",
+            ".agents/issue-index.md": "project_record",
+            ".agents/style/commits.md": "procedure",
+            ".agents/style/prose.md": "procedure",
+            ".claude/skills/writing-commits-and-prs/SKILL.md": "procedure",
+            ".claude/skills/writing-technical-english/SKILL.md": "procedure",
         }
         for path, path_class in expected.items():
             with self.subTest(path=path):
@@ -341,27 +354,92 @@ class BudgetEnforcement(unittest.TestCase):
         self.assertEqual(checker.change_errors([huge]), [])
 
     def test_retiring_the_budget_did_not_retire_the_other_contracts(self) -> None:
-        """The three rules that share this checker must still bite.
+        """The rules that share this checker must still bite.
 
-        Dropping a size gate is not licence to drop classification, the binary
-        guard, or checker-evidence with it, which is exactly the kind of thing
-        that goes unnoticed when a constant is deleted.
+        Dropping a size gate is not licence to drop classification or
+        checker-evidence with it, which is exactly the kind of thing that goes
+        unnoticed when a constant is deleted.
         """
         unknown = checker.ChangedPath("no/such/surface.txt", 1, 0)
         self.assertTrue(checker.change_errors([unknown]))
-        # Asserted on the ERROR, not its wording: this is a regression guard
-        # that must hold on both sides of the retirement, so it must not be
-        # coupled to a message string that the retirement itself reworded.
-        binary = checker.ChangedPath("assets/logo.png", None, None)
-        self.assertTrue(checker.change_errors([binary]))
         lone_checker = self.change("scripts/check-pr-size.py", 10)
         self.assertTrue(
             any("mutation evidence" in e for e in checker.change_errors([lone_checker]))
         )
 
-    def test_binary_changes_fail_closed_instead_of_becoming_free(self) -> None:
-        errors = checker.change_errors([checker.ChangedPath("docs/image.png", None, None)])
-        self.assertTrue(any("binary" in error for error in errors), errors)
+    def test_every_secondary_oracle_file_classifies(self) -> None:
+        """One file per oracle must classify (GATE-PR-SIZE-BINARY follow-on, #668).
+
+        RED before the fix on EVERY tracked file under .agents/oracles/: the
+        secondary-oracle registry landed with no pattern in the checker, so a
+        required check refused any PR that recorded a pin -- which is the one
+        thing the registry exists to make cheap. Asserted on the whole tracked
+        set rather than a sample, so a ninth oracle added without a class is
+        caught here and not in someone's PR.
+        """
+        tracked = subprocess.run(
+            ["git", "ls-files", ".agents/oracles/"],
+            capture_output=True, text=True, check=True, cwd=checker.ROOT,
+        ).stdout.split()
+        self.assertTrue(tracked, "expected tracked .agents/oracles/ files")
+        for path in tracked:
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "procedure")
+
+    def test_oracles_is_a_pattern_not_a_blanket_directory_exemption(self) -> None:
+        """The class is earned by shape, not by living under .agents/oracles/.
+
+        AGENTS.md forbids hiding mutable files behind a blanket directory
+        exemption, so a non-.md file or a nested path there must still fail
+        closed rather than inherit `procedure`.
+        """
+        for path in (
+            ".agents/oracles/pin.txt",
+            ".agents/oracles/vllm.json",
+            ".agents/oracles/nested/dir.md",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
+    def test_a_classified_binary_is_accepted(self) -> None:
+        """A binary at a classified path is not an error (GATE-PR-SIZE-BINARY, #615).
+
+        RED before the retirement: `change_errors` short-circuited on every
+        `lines is None` path, so a captured parity golden could not reach main
+        at all and #431 was unmergeable by construction. The classifier was
+        always built to give binaries a class -- the `SITE_ASSET` comment says
+        so in as many words -- and the guard refused them anyway.
+        """
+        for path in (
+            "tests/parity/goldens/qwen3_greedy_0_6b/our_ids.npy",
+            "tests/parity/goldens/qwen35_greedy_0_8b/neartie_gap_mnats.npy",
+            "tests/parity/goldens/qwen3_greedy_0_6b/p0_prompt.i32",
+            "website/static/fonts/sora-700.woff2",
+        ):
+            with self.subTest(path=path):
+                # Asserted through classify_path rather than a hardcoded class
+                # so this stays true if a golden is later reclassified.
+                checker.classify_path(path)
+                binary = checker.ChangedPath(path, None, None)
+                self.assertEqual(checker.change_errors([binary]), [])
+
+    def test_an_unclassified_binary_is_still_refused(self) -> None:
+        """Retiring the guard must not turn an unclassified path into a free one.
+
+        This is the rail that keeps the retirement scoped: the protection was
+        never "binaries are unreviewable", it was "every path earns a class".
+        Green on both sides of the change -- classification runs first -- so it
+        is a regression pin, not the evidence for the retirement.
+        """
+        errors = checker.change_errors([checker.ChangedPath("no/such/surface.png", None, None)])
+        self.assertTrue(errors)
+        # The message must name the real defect. "Not reviewable as text" told
+        # the author to fix something about the file; an unclassified path is
+        # something they can actually act on.
+        self.assertFalse(
+            any("not reviewable as text" in error for error in errors), errors
+        )
 
     def test_checker_change_requires_its_recognized_mutation_test(self) -> None:
         changed = [
@@ -620,6 +698,58 @@ class BudgetEnforcement(unittest.TestCase):
             )
             self.assertFalse(any("{" in change.path or "=>" in change.path for change in changes))
 
+    def test_changed_paths_uses_the_merge_base_when_the_base_branch_moved(self) -> None:
+        """A PR diff is merge_base..head, not base_tip..head (#773).
+
+        RED before GATE-FORK-ANCESTRY: CI passes `pull_request.base.sha`, the
+        TIP of the base branch, which stops being an ancestor of head the moment
+        main advances -- so `changed_paths` raised and classification never ran
+        on any fork PR. Worse than strict: two-dot diffing a moved main renders
+        MAIN's own commits as reversions inside the contributor's diff, so paths
+        they never touched get classified and charged to them. This asserts both
+        halves: the PR's path is present, main's is absent.
+        """
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
+            repo = Path(directory)
+            run = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            run("config", "user.name", "Test")
+            run("config", "user.email", "test@example.com")
+            (repo / "src").mkdir()
+            (repo / "src" / "root.cpp").write_text("root\n", encoding="utf-8")
+            run("add", ".")
+            run("commit", "-qm", "root")
+            root = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            # The contributor's branch, cut from root.
+            run("checkout", "-q", "-b", "pr", root)
+            (repo / "src" / "from_pr.cpp").write_text("pr\n", encoding="utf-8")
+            run("add", ".")
+            run("commit", "-qm", "pr work")
+            head = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            # main moves on afterwards -- the ordinary case, not an edge case.
+            run("checkout", "-q", "-B", "main", root)
+            (repo / "src" / "from_main.cpp").write_text("main\n", encoding="utf-8")
+            run("add", ".")
+            run("commit", "-qm", "mainline work")
+            moved_main = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+            ).strip()
+            self.assertNotEqual(moved_main, root)
+
+            paths = {c.path for c in checker.changed_paths(moved_main, head, repo=repo)}
+            self.assertIn("src/from_pr.cpp", paths)
+            self.assertNotIn(
+                "src/from_main.cpp",
+                paths,
+                "main's own commit must not appear in the contributor's diff",
+            )
+
     def test_missing_and_nonancestor_objects_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory(dir="/dev/shm") as directory:
             repo = Path(directory)
@@ -640,7 +770,12 @@ class BudgetEnforcement(unittest.TestCase):
             side = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
             with self.assertRaises(ValueError):
                 checker.changed_paths("missing", side, repo=repo)
-            with self.assertRaisesRegex(ValueError, "ancestor"):
+            # Still RAISES -- the fail-closed half of the old non-ancestor rule
+            # is deliberately preserved (#773). `side` here is an ORPHAN branch,
+            # so there is no merge base and therefore no range to compute. Only
+            # the message changed: what used to be reported as "not an ancestor"
+            # is now named for what it actually is.
+            with self.assertRaisesRegex(ValueError, "no merge base"):
                 checker.changed_paths(base, side, repo=repo)
 
     def test_production_pr_classifier_covers_every_governed_path_class(self) -> None:

@@ -67,8 +67,12 @@
           # entry (idempotent — skipped if already populated). This is the
           # one Nix-specific step; a standard /opt/rocm install needs none of
           # it.
+          # rocwmma is header-only and rides the same overlay: rocm_paged_attn.hip
+          # includes <rocwmma/rocwmma.hpp> whenever the target is gfx1200/gfx1201
+          # (arch-gated, not availability-gated), and clr alone does not ship it,
+          # so a gfx12 build fails at that include without this. See issue #444.
           rocmOverlayInputs =
-            [ rocm.hipblas rocm.hipblaslt rocm.hipblas-common ];
+            [ rocm.hipblas rocm.hipblaslt rocm.hipblas-common rocm.rocwmma ];
         in {
           default = pkgs.mkShell {
             packages = commonPackages ++ [ pkgs.gcc ];
@@ -122,6 +126,7 @@
               rocm.hipblas
               rocm.hipblaslt
               rocm.hipblas-common
+              rocm.rocwmma
               rocm.rocminfo
             ];
 

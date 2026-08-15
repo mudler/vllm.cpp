@@ -375,18 +375,13 @@ std::vector<int32_t> ReadGenerationConfigEosIds(const std::string& path) {
 
 }  // namespace
 
-HfConfig LoadHfConfig(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    throw std::runtime_error("hf_config: cannot open " + path);
-  }
-  nlohmann::json doc;
-  try {
-    doc = nlohmann::json::parse(in);
-  } catch (const nlohmann::json::exception& e) {
-    throw std::runtime_error("hf_config: JSON parse error in " + path + ": " +
-                             e.what());
-  }
+namespace {
+
+// The whole parse, shared by the path and the in-memory entry points. `path` is
+// what error messages name; `sibling_generation_config` is false when there is
+// no file and therefore no sibling generation_config.json to read.
+HfConfig ParseHfConfigDoc(nlohmann::json doc, const std::string& path,
+                          bool sibling_generation_config) {
   if (!doc.is_object()) {
     throw std::runtime_error("hf_config: top-level JSON is not an object in " +
                              path);
@@ -436,6 +431,46 @@ HfConfig LoadHfConfig(const std::string& path) {
     cfg.linear_key_head_dim = GetInt(text, "linear_key_head_dim", 0);
     cfg.linear_value_head_dim = GetInt(text, "linear_value_head_dim", 0);
     cfg.linear_conv_kernel_dim = GetInt(text, "linear_conv_kernel_dim", 0);
+    // GDN output-gate activation, mirroring
+    // vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:452-456
+    // @555967922:
+    //   output_gate_type = getattr(config, "output_gate_type", "silu")
+    //   if output_gate_type == "swish": output_gate_type = "silu"
+    //   assert output_gate_type in ["silu", "swish", "sigmoid"]
+    // Read from the RESOLVED text config so a nested VL wrapper and a flat
+    // text-only config behave alike, and canonicalized HERE so no consumer can
+    // reintroduce the default by forgetting to normalize. Upstream asserts on
+    // an unrecognized value; we refuse at load naming the key and the accepted
+    // set, because a silent fallback to silu is a numerics change no token gate
+    // over today's (all-silu) checkpoints could ever see.
+    //
+    // ABSENT and PRESENT-BUT-UNUSABLE are different states, so this cannot go
+    // through GetString(), which flattens both to "": `getattr` substitutes the
+    // default ONLY when the attribute is missing, and a present None / "" /
+    // non-string is handed straight to the assert and errors. Probing for the
+    // key keeps null and "" on the refusal path.
+    //
+    // The refusal is unconditional rather than gated on the architecture being
+    // GDN, where upstream's assert lives. No checkpoint we know of carries the
+    // key outside the GDN family, and refusing a value nothing can honor is the
+    // safer direction; if one ever appears, that is a scoped follow-up with its
+    // own test, not a silent widening here.
+    const auto gate_it = text.find("output_gate_type");
+    if (gate_it == text.end()) {
+      cfg.output_gate_type = "silu";  // upstream's getattr default
+    } else {
+      // A non-string value is dumped verbatim (`null`, `3`) so the refusal
+      // names what was actually found; it can never match silu/sigmoid.
+      cfg.output_gate_type =
+          gate_it->is_string() ? gate_it->get<std::string>() : gate_it->dump();
+      if (cfg.output_gate_type == "swish") cfg.output_gate_type = "silu";
+      if (cfg.output_gate_type != "silu" && cfg.output_gate_type != "sigmoid") {
+        throw std::runtime_error(
+            "hf_config: unsupported output_gate_type \"" +
+            cfg.output_gate_type +
+            "\" (expected one of: silu, swish, sigmoid) in " + path);
+      }
+    }
     cfg.mamba_ssm_dtype = GetString(text, "mamba_ssm_dtype");
 
     // Kimi-Linear (`KimiLinearForCausalLM`) KV enablement for the shared paged
@@ -527,8 +562,31 @@ HfConfig LoadHfConfig(const std::string& path) {
   }
 
   cfg.raw = std::move(doc);
-  cfg.generation_config_eos_ids = ReadGenerationConfigEosIds(path);
+  if (sibling_generation_config) {
+    cfg.generation_config_eos_ids = ReadGenerationConfigEosIds(path);
+  }
   return cfg;
+}
+
+}  // namespace
+
+HfConfig LoadHfConfig(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    throw std::runtime_error("hf_config: cannot open " + path);
+  }
+  nlohmann::json doc;
+  try {
+    doc = nlohmann::json::parse(in);
+  } catch (const nlohmann::json::exception& e) {
+    throw std::runtime_error("hf_config: JSON parse error in " + path + ": " +
+                             e.what());
+  }
+  return ParseHfConfigDoc(std::move(doc), path, /*sibling_generation_config=*/true);
+}
+
+HfConfig ParseHfConfig(const nlohmann::json& doc, const std::string& source) {
+  return ParseHfConfigDoc(doc, source, /*sibling_generation_config=*/false);
 }
 
 }  // namespace vllm

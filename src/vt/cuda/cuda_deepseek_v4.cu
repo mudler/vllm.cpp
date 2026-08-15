@@ -635,36 +635,69 @@ __global__ void DsaTopkKernel(const float* logits, const int64_t* ws, const int6
     for (int64_t s = s0; s < s1; ++s) dst[w++] = s;
     return;
   }
-  // Pick `topk` best by (logit desc, index asc); chosen tracked in a local mask.
-  bool chosen[512];  // nk (candidate window) small in the structural gate
-  for (int64_t s = 0; s < n; ++s) chosen[s] = false;
-  int64_t picked[64];  // topk small
-  for (int j = 0; j < topk; ++j) {
+  // Pick the `topk` best under the SAME total order the host reference sorts by
+  // (`DsaTopkSelect`: logit desc, then index asc — a total order because the
+  // candidate indices are distinct). Two passes, NO per-thread scratch:
+  //
+  //   pass 1 walks the order downwards `topk` times to land on the topk-th best
+  //          element, which is the selection THRESHOLD;
+  //   pass 2 scans the window once in ascending index order and emits every
+  //          element better-or-equal to that threshold.
+  //
+  // Pass 2 emits exactly `topk` entries already in ascending key order, so the
+  // ascending sort the previous revision needed is gone with the buffers.
+  //
+  // This replaces a `bool chosen[512]` + `int64_t picked[64]` pair of literals
+  // that could not represent the real `index_topk` (512 on V4-Flash, 1024 on
+  // V4-Pro). `n > topk` only selects THIS branch; the overflow itself needed
+  // `n > 512` for `chosen` or `topk > 64` for `picked`, which is why the old
+  // gate shape (topk=3, nk=5) was ASan-clean and the bound stayed invisible
+  // (#505, #552).
+  //
+  // Cost is unchanged at O(topk*n) for pass 1 and cheaper than the revision it
+  // replaces, which also paid an O(topk^2) emit sort. That is a comparison to the
+  // old kernel ONLY, not a claim of fitness for the real geometry: this is one
+  // thread per token row with a dependent global load per iteration, so a real
+  // long-context row stays expensive. See `.agents/specs/dsa-topk-bounds.md` §5.
+  const int64_t row = static_cast<int64_t>(t) * nk;
+  // `better(va, a, vb, b)` == "(va, a) outranks (vb, b)".
+  auto better = [](float va, int64_t a, float vb, int64_t b) -> bool {
+    return va > vb || (va == vb && a < b);
+  };
+  float th_val = 0.0f;
+  int64_t th_idx = -1;
+  for (int64_t j = 0; j < topk; ++j) {
+    float best_val = 0.0f;
     int64_t best = -1;
-    float bestv = -INFINITY;
     for (int64_t s = s0; s < s1; ++s) {
-      if (chosen[s - s0]) continue;
-      const float v = logits[static_cast<int64_t>(t) * nk + s];
-      if (best < 0 || v > bestv) {  // strict > keeps the SMALLER index on a tie
-        bestv = v;
+      const float v = logits[row + s];
+      // Skip anything at or above the previous step's element, so each step
+      // descends exactly one rank.
+      if (th_idx >= 0 && !better(th_val, th_idx, v, s)) continue;
+      if (best < 0 || better(v, s, best_val, best)) {
+        best_val = v;
         best = s;
       }
     }
-    chosen[best - s0] = true;
-    picked[j] = best;
+    // n > topk holds here, so a strictly worse element always exists under a
+    // total order. `best < 0` is therefore unreachable on ordered input; it can
+    // only arise if the row carries NaN, which makes every comparison false. Stop
+    // rather than reset the threshold, so the descent cannot restart from the top.
+    if (best < 0) break;
+    th_val = best_val;
+    th_idx = best;
   }
-  // Emit ascending key order (insertion sort of `topk` picks).
-  for (int a = 0; a < topk; ++a) {
-    int64_t mn = picked[a];
-    int mi = a;
-    for (int b = a + 1; b < topk; ++b)
-      if (picked[b] < mn) {
-        mn = picked[b];
-        mi = b;
-      }
-    picked[mi] = picked[a];
-    picked[a] = mn;
-    dst[a] = mn;
+  if (th_idx < 0) return;  // every candidate was NaN: leave the -1 padding
+  // Exactly `rank(th)` elements outrank-or-equal the threshold and `rank(th)` is
+  // at most `topk`, so `w` cannot exceed `topk` for ANY input — a NaN never
+  // satisfies this predicate either, since `better(x, NaN)` is false. The
+  // `w < topk` bound is therefore belt-and-braces, not a defence against a known
+  // way to overrun the row: the emit count is bounded by construction (#552;
+  // removing the bound leaves both the device suite and a 3M-shape fuzz clean).
+  int64_t w = 0;
+  for (int64_t s = s0; s < s1 && w < topk; ++s) {
+    const float v = logits[row + s];
+    if (better(v, s, th_val, th_idx) || (v == th_val && s == th_idx)) dst[w++] = s;
   }
 }
 
@@ -1155,6 +1188,12 @@ std::vector<int64_t> DsaTopkLaunch(Queue& q, const std::vector<float>& logits,
                                    const std::vector<int64_t>& ws,
                                    const std::vector<int64_t>& we, int64_t T, int64_t nk,
                                    int64_t topk) {
+  // Mirror the host reference's precondition (`deepseek_v4_dsa.cpp:76`
+  // `VT_CHECK(topk > 0, ...)`). Without this the device arm silently returned an
+  // empty vector where the host throws, so the two arms disagreed on a case no
+  // test covered (#552).
+  if (topk <= 0)
+    throw std::runtime_error("vt cuda deepseek_v4: dsa topk: topk must be positive");
   cudaStream_t s = AsStream(q);
   Dev dl = Upload(logits, s), dws = Upload(ws, s), dwe = Upload(we, s);
   std::vector<int64_t> out(static_cast<size_t>(T * topk), -1);
@@ -1164,6 +1203,15 @@ std::vector<int64_t> DsaTopkLaunch(Queue& q, const std::vector<float>& logits,
       static_cast<const float*>(dl.p), static_cast<const int64_t*>(dws.p),
       static_cast<const int64_t*>(dwe.p), static_cast<int>(T), static_cast<int>(nk),
       static_cast<int>(topk), static_cast<int64_t*>(dout.p));
+  // Catches LAUNCH-CONFIGURATION errors (bad grid/block, shared-memory over
+  // budget) at the call site, and matches every sibling launcher here
+  // (e.g. `hc_head_ip`). It does NOT catch an asynchronous execution fault:
+  // MEASURED on GB10 (#552), the pre-fix #505 kernel with this very check in
+  // place still surfaced its illegal access later, as
+  // `cudaStreamDestroy: an illegal memory access`. So this does not make a
+  // device-side fault in the kernel attributable to this launch — a claim an
+  // earlier revision of this comment made and the measurement refuted.
+  Check(cudaGetLastError(), "dsa_topk launch");
   Download(out, dout.p, s);
   Check(cudaStreamSynchronize(s), "sync topk");
   return out;

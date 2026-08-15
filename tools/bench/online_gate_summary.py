@@ -44,6 +44,11 @@ from tools.bench.online_gate import (
     validate_raw_result,
     _fingerprint_tree,
 )
+from tools.bench.gpu_clock_state import (
+    clock_reasons,
+    compare_clock_records,
+    merge_clock_records,
+)
 from tools.bench.serve_low_common import (
     HarnessError,
     VLLM_COMMIT,
@@ -111,6 +116,103 @@ def _run_metrics(record: Mapping[str, Any]) -> dict[str, float]:
         / duration
     )
     return metrics
+
+
+def _clock_for_leg(
+    evidence_root: pathlib.Path,
+    model: str,
+    engine: str,
+    repetition: int,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Read one leg's SM-clock record, or say why the leg is not established.
+
+    Same shape and same seam as ``_memory_for_leg``: a defect becomes a reason,
+    and a reason clears ``binding_eligible``. A leg with no clock record is not
+    a leg with a default clock -- it is a number nobody can attribute to a box
+    state, which is the whole of #543.
+    """
+
+    base = evidence_root / "clocks" / model / engine
+    summary_path = base / f"r{repetition}.summary.json"
+    samples_path = base / f"r{repetition}.samples.jsonl"
+    label = f"{engine} r{repetition}"
+    try:
+        record = _load_json(summary_path)
+    except HarnessError as error:
+        return None, [f"clock: {error}"]
+    reasons = list(clock_reasons(record, label=label))
+    try:
+        samples = list(read_jsonl(samples_path))
+    except (HarnessError, FileNotFoundError, OSError) as error:
+        samples = []
+        reasons.append(f"clock: {label} SM-clock samples are missing or invalid: {error}")
+    summary = record.get("sm_clock_mhz")
+    counted: int | None = None
+    if isinstance(summary, Mapping) and isinstance(summary.get("n"), int):
+        excluded = record.get("idle_samples_excluded")
+        if isinstance(excluded, int) and not isinstance(excluded, bool):
+            counted = summary["n"] + excluded
+    if not samples:
+        reasons.append(f"clock: {label} SM-clock sample stream is empty")
+    elif counted != len(samples):
+        reasons.append(
+            f"clock: {label} summary accounts for {counted} samples; "
+            f"the stream holds {len(samples)}"
+        )
+    return record, reasons
+
+
+def _clock_for_arm(
+    legs: Sequence[dict[str, Any] | None], *, engine: str
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Fold an arm's legs into the record the ratio is qualified by."""
+
+    if any(record is None for record in legs):
+        return None, []
+    try:
+        return merge_clock_records([record for record in legs if record is not None]), []
+    except HarnessError as error:
+        return None, [f"clock: {engine} {error}"]
+
+
+def _clock_comparison(
+    ours: Mapping[str, Any] | None,
+    floor: Mapping[str, Any] | None,
+    *,
+    allow_cross_boot: bool,
+) -> dict[str, Any]:
+    """The clock block that sits next to every ratio."""
+
+    missing = [
+        engine
+        for engine, record in (("ours", ours), ("vllm", floor))
+        if record is None
+    ]
+    if missing:
+        return {
+            "allow_cross_boot": bool(allow_cross_boot),
+            "caveats": [],
+            "cross_boot_override": False,
+            "estimated_effect_pct": None,
+            "median_offset_pct": None,
+            "ours_boot_id": None if ours is None else ours.get("boot_id"),
+            "ours_busy_samples": None,
+            "ours_idle_samples_excluded": None,
+            "ours_median_sm_mhz": None,
+            "ours_spread_pct": None,
+            "reasons": [
+                f"clock: the {engine} arm has no usable SM-clock record, so the "
+                "ratio cannot be attributed to a box state (#543)"
+                for engine in missing
+            ],
+            "same_boot": False,
+            "vllm_boot_id": None if floor is None else floor.get("boot_id"),
+            "vllm_busy_samples": None,
+            "vllm_idle_samples_excluded": None,
+            "vllm_median_sm_mhz": None,
+            "vllm_spread_pct": None,
+        }
+    return compare_clock_records(ours, floor, allow_cross_boot=allow_cross_boot)
 
 
 def _memory_for_leg(
@@ -668,6 +770,7 @@ def summarize_evidence(
     evidence_root: pathlib.Path,
     *,
     models: Sequence[str] | None = None,
+    allow_cross_boot: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     selected_models = _select_models(models)
     grouped: dict[tuple[str, str, int], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
@@ -825,6 +928,24 @@ def summarize_evidence(
                     evidence_root, model, engine, repetition
                 )
 
+    leg_clock: dict[tuple[str, str, int], dict[str, Any] | None] = {}
+    clock_leg_reasons: dict[tuple[str, str, int], list[str]] = {}
+    arm_clock: dict[tuple[str, str], dict[str, Any] | None] = {}
+    arm_clock_reasons: dict[tuple[str, str], list[str]] = {}
+    for model in selected_models:
+        for engine in ENGINES:
+            for repetition in REPETITIONS:
+                key = (model, engine, repetition)
+                leg_clock[key], clock_leg_reasons[key] = _clock_for_leg(
+                    evidence_root, model, engine, repetition
+                )
+            arm_clock[(model, engine)], arm_clock_reasons[(model, engine)] = (
+                _clock_for_arm(
+                    [leg_clock[(model, engine, rep)] for rep in REPETITIONS],
+                    engine=engine,
+                )
+            )
+
     raw_runs: list[dict[str, Any]] = []
     aggregates: list[dict[str, Any]] = []
     aggregate_index: dict[tuple[str, str, int], dict[str, Any]] = {}
@@ -845,7 +966,9 @@ def summarize_evidence(
             run["binding_eligible"] = not run["reasons"]
             reasons.extend(run["reasons"])
             reasons.extend(leg_reasons[(key[0], key[1], run["repetition"])] )
+            reasons.extend(clock_leg_reasons[(key[0], key[1], run["repetition"])])
             raw_runs.append(run)
+        reasons.extend(arm_clock_reasons[(key[0], key[1])])
         axes: dict[str, dict[str, float] | None] = {}
         for axis in (*HIGHER_AXES, *LOWER_AXES):
             values = [run["metrics"].get(axis) for run in runs]
@@ -900,7 +1023,19 @@ def summarize_evidence(
             memory_index[(model, engine)] = aggregate
 
     ratios: list[dict[str, Any]] = []
+    clock_comparisons: dict[str, dict[str, Any]] = {}
     for model in selected_models:
+        # ONE clock block per model, attached to every ratio it qualifies. A
+        # reader must be able to size the clock against the effect without
+        # leaving the row: a 12.79% offset moved a byte-identical kernel 9.65%,
+        # which is larger than most deficits this grid is used to rank (#543).
+        clock_comparisons[model] = _clock_comparison(
+            arm_clock[(model, "ours")],
+            arm_clock[(model, "vllm")],
+            allow_cross_boot=allow_cross_boot,
+        )
+        clock = clock_comparisons[model]
+        clock_established = not clock["reasons"]
         for concurrency, _ in points_for(model):
             ours = aggregate_index[(model, "ours", concurrency)]
             floor = aggregate_index[(model, "vllm", concurrency)]
@@ -922,7 +1057,9 @@ def summarize_evidence(
                             ours["binding_eligible"]
                             and floor["binding_eligible"]
                             and normalized is not None
+                            and clock_established
                         ),
+                        "clock": clock,
                         "concurrency": concurrency,
                         "direction": "higher" if higher else "lower",
                         "model": model,
@@ -951,7 +1088,9 @@ def summarize_evidence(
                         ours_memory["binding_eligible"]
                         and floor_memory["binding_eligible"]
                         and normalized is not None
+                        and clock_established
                     ),
+                    "clock": clock,
                     "concurrency": None,
                     "direction": "lower",
                     "model": model,
@@ -978,6 +1117,8 @@ def summarize_evidence(
         "raw_runs": raw_runs,
     }
     ratios_document = {
+        "allow_cross_boot": bool(allow_cross_boot),
+        "clocks": clock_comparisons,
         "gate_pass": gate_pass,
         "models": list(selected_models),
         "ratios": ratios,
@@ -1005,6 +1146,44 @@ def _report(runs: Mapping[str, Any], ratios: Mapping[str, Any]) -> str:
     ]
     lines.append(f"Every-axis ratios failing or void: {len(failed)}/{len(ratios['ratios'])}.")
     lines.append("")
+    # The clock sits NEXT TO the verdict, not in an appendix: a ratio quoted
+    # without the clock it was measured at is what #543 retracted.
+
+    def _sample_count(block: Mapping[str, Any], key: str) -> str:
+        value = block.get(key)
+        return "?" if value is None else str(value)
+
+    for model, clock in sorted(ratios.get("clocks", {}).items()):
+        ours = clock.get("ours_median_sm_mhz")
+        floor = clock.get("vllm_median_sm_mhz")
+        offset = clock.get("median_offset_pct")
+        effect = clock.get("estimated_effect_pct")
+        if ours is None or floor is None or offset is None:
+            lines.append(f"- {model}: SM clock NOT RECORDED — the ratio is not attributable.")
+        else:
+            lines.append(
+                f"- {model}: SM clock ours {ours:.0f} MHz vs vLLM {floor:.0f} MHz "
+                f"({offset:+.2f}%, estimated {effect:+.2f}% of kernel time); "
+                f"boot {'SAME' if clock['same_boot'] else 'DIFFERS'}"
+                + (" (OVERRIDDEN)" if clock.get("cross_boot_override") else "")
+            )
+            # How much of the window each arm was observed over. A +0.00% offset
+            # taken over one busy sample in three hundred is the cleanest line
+            # this report can print and the emptiest; the counts are what tell
+            # the two apart, so they are printed beside the offset, not filed in
+            # `r<N>.summary.json` where nothing reads them.
+            lines.append(
+                "  - observed: ours "
+                f"{_sample_count(clock, 'ours_busy_samples')} busy / "
+                f"{_sample_count(clock, 'ours_idle_samples_excluded')} idle, vLLM "
+                f"{_sample_count(clock, 'vllm_busy_samples')} busy / "
+                f"{_sample_count(clock, 'vllm_idle_samples_excluded')} idle"
+            )
+        for reason in clock.get("reasons", []):
+            lines.append(f"  - {reason}")
+        for caveat in clock.get("caveats", []):
+            lines.append(f"  - CAVEAT: {caveat}")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -1012,9 +1191,21 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--evidence", type=pathlib.Path, required=True)
     parser.add_argument("--model", choices=tuple(MODEL_REVISIONS))
+    parser.add_argument(
+        "--allow-cross-boot",
+        action="store_true",
+        help=(
+            "waive the requirement that both arms ran on the SAME BOOT. It "
+            "waives identity, never state: the spread and offset rules still "
+            "apply, and the comparison is stamped with a recorded caveat "
+            "rather than passing silently (#543, #545)."
+        ),
+    )
     args = parser.parse_args()
     models = (args.model,) if args.model is not None else None
-    runs, ratios = summarize_evidence(args.evidence, models=models)
+    runs, ratios = summarize_evidence(
+        args.evidence, models=models, allow_cross_boot=args.allow_cross_boot
+    )
     output = args.evidence / (f"summary-{args.model}" if args.model else "summary")
     if output.exists() and any(output.iterdir()):
         raise HarnessError(f"refusing to overwrite summary evidence in {output}")

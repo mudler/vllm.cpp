@@ -492,6 +492,46 @@ ApiServer::DispatchResult ApiServer::handle_embeddings(
   }
 }
 
+ApiServer::DispatchResult ApiServer::handle_audio_speech(
+    const std::string& request_body) const {
+  // OpenAI's createSpeech, extended with the two MUSIC inputs. See
+  // speech_api.h for why `lyrics` and `description` are separate fields.
+  if (!synthesizer_) {
+    return MakeError(500, "InternalServerError", "No speech synthesizer configured.");
+  }
+  ::vllm::openai::SpeechRequest request;
+  try {
+    request = ::vllm::openai::ParseSpeechRequest(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError", e.what());
+  }
+  // THE REFUSAL BEFORE STAGING. `requires_reference_audio()` exists so a server
+  // can answer this without loading or synthesizing anything; a family with no
+  // text-only synthesis must not be handed a request it can only fail.
+  if (speech_capabilities_.requires_reference_audio && request.reference_audio.empty()) {
+    return MakeError(400, "BadRequestError",
+                     "The loaded speech family '" + speech_capabilities_.family +
+                         "' has no text-only synthesis: `reference_audio` (a data: URL "
+                         "carrying a 16-bit PCM mono WAV) is required.");
+  }
+  ::vllm::openai::SpeechResponse response;
+  try {
+    response = synthesizer_(request);
+  } catch (const std::exception& e) {
+    // The family's refusal reaches the client verbatim: it names the field or
+    // the missing stage, which a generic 500 body would throw away.
+    return MakeError(500, "InternalServerError", e.what());
+  }
+  if (response.wav.empty()) {
+    return MakeError(500, "InternalServerError", "The speech family returned no audio.");
+  }
+  DispatchResult out;
+  out.status = 200;
+  out.content_type = "audio/wav";
+  out.body = std::move(response.wav);
+  return out;
+}
+
 ApiServer::DispatchResult ApiServer::handle_videos(
     const std::string& request_body) {
   // vLLM-Omni's ASYNC video endpoint: validate, enqueue, and return the job id
@@ -1065,6 +1105,18 @@ void ApiServer::register_routes() {
                             req.form.get_file("file").content,
                             req.form.get_field("response_format")),
                         res);
+                });
+  }
+
+  if (synthesizer_) {
+    // Speech + music (W6 of #672). Registered ONLY when a synthesizer is
+    // attached, so a text server answers 404 exactly as before. The body is
+    // JSON and the RESPONSE is audio/wav bytes, which is OpenAI's own shape for
+    // createSpeech.
+    server.Post("/v1/audio/speech",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_audio_speech(req.body), res);
                 });
   }
 

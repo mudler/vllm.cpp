@@ -4,6 +4,7 @@
 #include "vllm/entrypoints/openai/chat_mm.h"
 
 #include <array>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -246,16 +247,72 @@ std::string BuildMarkerInjectedContent(const ChatMessage& message) {
   return out;
 }
 
+// chat_utils.py:1478-1483 (MM_PARSER_MAP), reduced to the part types protocol.h
+// parses. See the header for why `*_embeds` passes straight through.
+std::optional<std::string> ChatPartModality(const ChatContentPart& part) {
+  if (part.type == "image_url") return std::string("image");
+  if (part.type == "video_url") return std::string("video");
+  if (part.type == "input_audio" || part.type == "audio_url") {
+    return std::string("audio");
+  }
+  // "text" is not multimodal input; anything else that names an embeds kind is
+  // handed to ValidateTrackedChatItem verbatim so it owns the suffix strip.
+  if (part.type.size() > 7 &&
+      part.type.compare(part.type.size() - 7, 7, "_embeds") == 0) {
+    return part.type;
+  }
+  return std::nullopt;
+}
+
+// chat_utils.py:648-662.
+void ValidateChatMmLimits(const multimodal::BaseProcessingInfo& info,
+                          const std::vector<ChatMessage>& messages) {
+  // The running item count, keyed by the ORIGINAL (as-written) modality —
+  // `self._items_by_modality[original_modality]` (chat_utils.py:625,652). Note
+  // it is NOT keyed by the input modality: `image` and `image_embeds` keep
+  // separate counters upstream, and only the LIMIT is looked up under the
+  // stripped name (:633,662). Keying on the stripped name here would refuse a
+  // request upstream serves.
+  //
+  // The map lives for the whole `messages` walk, not per message, because
+  // upstream's tracker does: two images across two turns of one request are two
+  // images, so the limit cannot be evaded by splitting them up.
+  std::map<std::string, int> items_by_modality;
+  for (const ChatMessage& message : messages) {
+    if (!message.content_parts.has_value()) continue;
+    for (const ChatContentPart& part : *message.content_parts) {
+      const std::optional<std::string> modality = ChatPartModality(part);
+      if (!modality.has_value()) continue;
+      // The count INCLUDES this item (`len(...) + 1`, :652): upstream validates
+      // the length the item WOULD make, so the refusal names the limit the
+      // request crossed rather than the one it was already at.
+      const int num_items = ++items_by_modality[*modality];
+      info.ValidateTrackedChatItem(*modality, num_items);
+    }
+  }
+}
+
+std::map<std::string, std::optional<int>> Qwen3VLChatSupportedMmLimits() {
+  return {{"image", std::optional<int>(1)}};
+}
+
 std::function<std::optional<multimodal::MultiModalInputs>(
     const std::vector<ChatMessage>&)>
 MakeQwen3VLImageChatFn(const multimodal::Qwen3VLImageProcessor& proc,
                        const vllm::tok::Tokenizer& tokenizer,
-                       ChatPromptRenderFn prompt_fn, ImageCodecFn codec) {
-  return [&proc, &tokenizer, prompt_fn = std::move(prompt_fn),
+                       ChatPromptRenderFn prompt_fn, ImageCodecFn codec,
+                       const multimodal::BaseProcessingInfo& info) {
+  return [&proc, &tokenizer, &info, prompt_fn = std::move(prompt_fn),
           codec = std::move(codec)](const std::vector<ChatMessage>& messages)
              -> std::optional<multimodal::MultiModalInputs> {
-    // Locate the FIRST image part across the messages (single-image; multiple
-    // images / video / audio are named residuals).
+    // STEP 0 (#607 L2, #686): the per-item limit check, BEFORE anything is
+    // decoded or dropped. chat_utils.py:662 validates as it tracks, for the same
+    // reason: refusing costs nothing, and truncating is invisible.
+    ValidateChatMmLimits(info, messages);
+
+    // Locate the image part across the messages. At most ONE survives the check
+    // above (Qwen3VLChatSupportedMmLimits caps image at 1), so this loop no
+    // longer silently drops a second one — there cannot be one.
     const ChatContentPart* image_part = nullptr;
     for (const ChatMessage& m : messages) {
       if (!m.content_parts.has_value()) continue;

@@ -19,10 +19,14 @@
 // backend, written out by hand so a reader can diff the two.
 //
 // SCOPE / what is NOT here, stated plainly:
-//   * `SupportsGraphCapture()` stays FALSE. hipGraph exists and is the eventual
-//     mapping, but a graph that captures a wrong stream is a silent correctness
-//     bug (see .agents/ on CUDA-graph capture baking stack addresses), so it is
-//     not something to write blind.
+//   * `SupportsGraphCapture()` is TRUE as of BACKEND-ROCM W1 — see the hipGraph
+//     capture/replay block below and .agents/specs/rocm-decode-graph.md. The
+//     concern that kept it false (a capture that bakes addresses instead of
+//     re-executing over persistent buffers is a SILENT correctness bug) is now
+//     an assertion rather than a worry: the mutate-src-then-replay step in
+//     tests/vt/test_rocm_backend.cpp fails if replay ever returns a snapshot.
+//     What is NOT claimed here is the model-level path — Platform's
+//     support_static_graph_mode() still gates that, and flipping it is W2.
 //   * The async-output primitives (AllocPinned / events) inherit the vt::Backend
 //     defaults. src/vt/backend.cpp documents those as already correct for
 //     unified-memory backends; on a discrete AMD card they are correct but
@@ -218,6 +222,89 @@ class RocmBackend final : public Backend {
     Check(hipStreamSynchronize(AsStream(q)), "hipStreamSynchronize");
   }
 
+  // --- hipGraph capture/replay (BACKEND-ROCM W1) ------------------------------
+  // The hipGraph mirror of cuda_backend.cu's capture block, call for call. Every
+  // name below is a long-stable HIP runtime API with the same signature and
+  // semantics as its CUDA counterpart — the property that lets upstream compile
+  // csrc/ for both through hipify.
+  //
+  // Capture contract, identical to the CUDA one (the caller must honour it, else
+  // capture aborts):
+  //   * every op in the region runs ASYNC on THIS stream (no Synchronize, no
+  //     null-stream work, no host<->device blocking copies);
+  //   * NO hipMalloc/hipFree inside the region — the scratch pool must be
+  //     pre-warmed so every allocation is a pool hit. hipBLASLt's workspace is
+  //     the known hazard here: LtWorkspace() in rocm_matmul_hipblaslt.hip grows
+  //     it lazily inside the GEMM path, so a shape first seen during capture
+  //     allocates and invalidates the capture. It fails loudly at
+  //     hipStreamEndCapture rather than corrupting, which is the acceptable
+  //     direction (spec .agents/specs/rocm-decode-graph.md, D1);
+  //   * captured pointers stay valid + FIXED across replays (persistent
+  //     buffers); only their CONTENTS change between replays.
+  //
+  // hipStreamCaptureModeThreadLocal matches CUDA's choice deliberately: it makes
+  // an illegal op during capture a loud failure on THIS thread rather than a
+  // process-wide mode change.
+  bool SupportsGraphCapture() const override { return true; }
+  void BeginCapture(Queue& q) override {
+    Check(hipStreamBeginCapture(AsStream(q), hipStreamCaptureModeThreadLocal),
+          "hipStreamBeginCapture");
+  }
+  void EndCapture(Queue& q) override {
+    hipGraph_t graph = nullptr;
+    Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
+    if (exec_ != nullptr) {
+      Check(hipGraphExecDestroy(exec_), "hipGraphExecDestroy");
+      exec_ = nullptr;
+    }
+    Check(hipGraphInstantiate(&exec_, graph, nullptr, nullptr, 0),
+          "hipGraphInstantiate");
+    Check(hipGraphDestroy(graph), "hipGraphDestroy");
+  }
+  void Replay(Queue& q) override {
+    Check(hipGraphLaunch(exec_, AsStream(q)), "hipGraphLaunch");
+  }
+
+  // Multi-graph handle API (batched decode graph): instantiate the just-captured
+  // stream graph and hand the exec back as an opaque handle the caller owns and
+  // selects per padded batch size. Unlike EndCapture, nothing is stored here.
+  void* EndCaptureGraph(Queue& q) override {
+    hipGraph_t graph = nullptr;
+    Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
+    hipGraphExec_t exec = nullptr;
+    Check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
+          "hipGraphInstantiate");
+    Check(hipGraphDestroy(graph), "hipGraphDestroy");
+    return reinterpret_cast<void*>(exec);
+  }
+  // NOT ported: the CUDA leg's VT_BENCH_PROFILE_CONTROL block, which drives
+  // cudaProfilerStart/Stop around a chosen replay. A rocprofiler equivalent is
+  // later work and deliberately out of W1's scope (spec §2).
+  void ReplayGraph(Queue& q, void* graph) override {
+    Check(hipGraphLaunch(reinterpret_cast<hipGraphExec_t>(graph), AsStream(q)),
+          "hipGraphLaunch");
+  }
+  // hipError_t itself — not hipGraphExecDestroy specifically — is
+  // [[nodiscard]] at C++17+ ($ROCM_PATH/include/hip/hip_runtime_api.h:293-305,
+  // __HIP_NODISCARD on the `typedef enum ... hipError_t` line; the function
+  // declaration at line ~8321 carries no attribute of its own). CUDA's
+  // cudaError_t has no such attribute, so the mirrored bare call diagnoses
+  // here (-Wunused-value) and not there. This project's -Werror does NOT
+  // reach it, though: vllm_cpp_set_warnings (cmake/CompilerWarnings.cmake)
+  // gates -Werror on COMPILE_LANGUAGE CXX/OBJCXX/CUDA only, no HIP branch, so
+  // a bare call here would warn, not fail the build (verified against the
+  // actual compile_commands.json entry for this file, and by building a
+  // scratch bare-call mutation through this project's own cmake target).
+  // Checked anyway, matching Free/FreePinned above: a failing destroy is a
+  // leak this backend would rather report than swallow, independent of what
+  // the build flags happen to enforce.
+  void DestroyGraph(void* graph) override {
+    if (graph != nullptr) {
+      Check(hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph)),
+            "hipGraphExecDestroy");
+    }
+  }
+
   // THE LOAD-BEARING BOOL. This is what decides whether the portable CPU
   // reference tier installs for kROCM (include/vt/op_provider.h:197-201): a CPU
   // kernel dereferences HOST pointers, so it is correct only where host and
@@ -263,6 +350,9 @@ class RocmBackend final : public Backend {
   bool managed_alloc_ = false;
   int major_ = 0;
   int minor_ = 0;
+  // Single-graph slot for the EndCapture/Replay pair. The handle API
+  // (EndCaptureGraph) stores nothing here — its caller owns the exec.
+  hipGraphExec_t exec_ = nullptr;
 };
 
 // Registers every visible AMD GPU at its own Device{kROCM, i} slot, mirroring

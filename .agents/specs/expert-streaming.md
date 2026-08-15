@@ -37,7 +37,7 @@ Verdict up front (from the bandwidth math in §3, all inputs measured):
 |---|---|
 | Row IDs | `ENG-EXPERT-STREAM` (this spike; work-breakdown leaves W0-W8 below). Mirror-floor context row: `ENG-WEIGHT-OFFLOAD` (INVENTORIED, not claimed here) |
 | In | Routed-MoE expert weights only (gate/up/down per expert per layer) for MoE models, first target Qwen3.6-35B-A3B NVFP4 (safetensors): versioned NVMe Marlin-layout expert bank, bank-only loader, fixed-capacity contiguous Marlin slot arrays, logical-expert→slot remap after router D2H, async O_DIRECT pread/copy pool, hotness-decayed-LFU + LRU-tiebreak eviction with in-flight/selected protection, chunked slot sweeps for long prefill + decode-cache seeding, optional hotlist preload, `--simulate-used-memory`-style honest measurement mode |
-| Out (this row) | Dense weights, shared experts, router, norms, KV cache (all stay resident); GGUF expert streaming (needs per-expert slicing of 3D tensors — follow-up leaf after `QUANT-GGUF-KEEPQ-LOADER`); host-RAM tier for discrete GPUs (W7, after gate); vLLM UVA `cpu_offload_gb` mirror (own row `ENG-WEIGHT-OFFLOAD`); expert-parallel EPLB (`PAR-EP-EPLB`) |
+| Out (this row) | Dense weights, shared experts, router, norms, KV cache (all stay resident); GGUF expert streaming (a follow-up leaf, but NOT for the reason first recorded — see the GGUF reconciliation note below: the slicer LANDED 2026-07-22 and only the residency policy remains); host-RAM tier for discrete GPUs (W7, after gate); vLLM UVA `cpu_offload_gb` mirror (own row `ENG-WEIGHT-OFFLOAD`); expert-parallel EPLB (`PAR-EP-EPLB`) |
 | Supported modes | `off` (default, unchanged engine); `nvme` (expert bank file + device cache). Budget accepted as expert count or `NGB` (ds4 CLI semantics `--ssd-streaming-cache-experts 32GB`, ds4_ssd.c:46-70); auto budget = fraction of free device memory minus non-streamed needs (ds4_ssd.c:80-106) |
 | Dispatch behavior | Streaming engages only when enabled AND the model is MoE. It branches before `BuildMoeMarlinResident`, never builds the full `[E,...]` resident, copies router IDs device→host and synchronizes once per MoE layer in phase 1, maps logical IDs to fixed cache slots, then runs the unchanged dense-stride Marlin kernel over slot IDs. Engine WARNS and refuses (or auto-disables per config) when max concurrency exceeds the regime bound (§3, default warn at conc>4, hard cap configurable); dense models reject the flag |
 | Regimes served | c1-c4 capacity/single-user; models larger than device memory. Explicitly NOT the high-concurrency throughput gate |
@@ -141,9 +141,10 @@ candidate, not a mechanical port: our selected GB10 Marlin kernel uses dense
 expert strides and has no address table or pair-mask input.
 **ds4-specific, not portable**: Metal no-copy mmap buffer wrapping +
 `F_RDADVISE`; hash-layer lookahead (DeepSeek `tid2eid`; Qwen3.6 has none);
-top-6 bitmasks (we are top-8); GGUF 3D-tensor slicing arithmetic (our first
-target is safetensors where each expert is already a separate tensor —
-simpler for us).
+top-6 bitmasks (we are top-8). GGUF 3D-tensor slicing arithmetic was listed
+here as non-portable on the grounds that safetensors, where each expert is a
+separate tensor, is simpler for us. That is now WRONG in both directions and is
+corrected below.
 
 ## Upstream chain
 
@@ -358,7 +359,7 @@ idle box, ≥2-3 reps, exact commands into the ledger.
 | Safetensors source metadata + bank-only loader representation | current `StTensor` lacks public owning path/fd/absolute offset, and `LoadNvfp4Raw` always copies bytes | W2 owns the narrow metadata/representation change; hard dependency before paging |
 | Router D2H + logical-to-slot op | current `dtid` is device-only and Marlin consumes dense expert IDs | W3; phase 1 intentionally non-graphed |
 | `SERVE-GATE-ONLINE` c1 baseline numbers | G3 needs the honest non-streamed c1 denominator | in flight (`CLAIM-SERVE-GATE-1`); W6 can measure its own baseline if still open |
-| `QUANT-GGUF-KEEPQ-LOADER` (`specs/gguf-keep-quant-loader.md`) | only for the LATER GGUF-streaming leaf (3D-tensor slicing); not needed for safetensors/W1-W6 | READY, unclaimed |
+| `QUANT-GGUF-KEEPQ-LOADER` (`specs/gguf-keep-quant-loader.md`) | **SATISFIED, not pending.** L2+L3 landed `429e19d6a` 2026-07-22 and shipped the per-expert row slicer this spec was waiting for; still not needed for safetensors/W1-W6 | L1/L2/L3/L5/L6 landed |
 | No new third-party deps | plain pread/O_DIRECT + pthreads + CUDA runtime; io_uring explicitly NOT required (measured 5 GB/s with 4 threads) | - |
 | Licenses | ds4 is MIT with llama.cpp/GGML attribution retained; we port design + cite, keeping our header discipline | OK |
 
@@ -380,6 +381,59 @@ critical runtime/gating path.
 | W7 per-regime campaign + closure | c1 curve, prefill, whole-system memory, OFF-path both-model vLLM A/B, ledger/README/matrix/state | W3-W5 | G3 + G6, all benchmark-protocol axes |
 | W8 post-gate host-RAM tier | bank-file vs pinned-host backing store on discrete GPU; distinct from vLLM `cpu_offload_gb` mirror | W3 | separate hardware mini-gate |
 
+## GGUF reconciliation (2026-08-14, issue #824)
+
+**This spec was written 2026-07-10 and put GGUF expert streaming out of scope
+because it "needs per-expert slicing of 3D tensors" and had to wait for
+`QUANT-GGUF-KEEPQ-LOADER`. That slicer landed 2026-07-22, twelve days later,
+under exactly that row, and is now the production decode path.** The record was
+never reconciled, so until this note the spec directed a reader to wait for
+something that already existed.
+
+What exists, with anchors re-derived at HEAD:
+
+- `OwnGgufQuantBlocks(tensor, n, k, row_offset, ...)`
+  (`src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp:57`) slices a stacked
+  GGUF quant tensor by ROW OFFSET, deriving the byte offset from
+  `vt::RowSizeBytes(dt, k)` and bounds-checking it against `tensor.nbytes`. Landed
+  `429e19d6a` (L2+L3), refined `f6be46eda` (L6) and `d967733d2` (NVFP4).
+- `GemmRowSlice(be, w, x, T, N, K, row_off)`
+  (`src/vllm/model_executor/models/deepseek_v4.cpp:468`) runs a keep-quant GEMM
+  against a row-slice of a stacked `[E*out, K]` weight, on DEVICE when the weight
+  is block-quant.
+- It is already called PER EXPERT at runtime: `deepseek_v4.cpp:1004,1005,2487,2489,2493`
+  with `row_off = e * mi`, and `laguna.cpp:1225` with `id * moe_I`.
+- The layout contract is stated on the role itself: `gguf_keep_quant.cpp:27`,
+  `kStackedExpertWeight` is `[E, out, in]` and "each expert slice is whole rows of
+  the same K".
+
+**The consequence is a scheduling inversion, not just a tidy-up.** This spec
+designs a safetensors -> Marlin BANK (versioned bank file, manifest, repack)
+because that path needs one: safetensors experts are separate tensors in a
+non-Marlin layout. On the GGUF path the mmap'd file ALREADY IS the bank — block
+quantized, per-expert rows contiguous, offsets computable, and the GEMM already
+takes a base pointer plus a row offset. No bank build, no manifest, no repack,
+and no second on-disk copy of the expert bytes (the ~17 GiB cost this spec
+accepts under Risks for the safetensors lane).
+
+So the GGUF lane is plausibly the CHEAPER of the two, and it is the one that
+matters commercially: every Qwen3.8-class checkpoint that exists today is GGUF
+(`unsloth/Qwen3.8-2.4T-A95B-GGUF`), so nothing in that lane runs at all until
+GGUF is served.
+
+**What genuinely remains for GGUF is the residency policy, not the slicer.**
+Today every caller passes `row_offset=0` and makes the WHOLE stacked
+`[E*out, K]` tensor resident; streaming needs a bounded cache that materializes
+only the touched expert slices and evicts under a byte budget. That is W1's
+cache policy applied to a different backing store, which is what the original
+"same cache, different slicer" note was reaching for — it was right about the
+cache and wrong about needing a new slicer.
+
+This note does NOT re-scope W1-W7, claim the GGUF leaf, or promise a date. It
+corrects the record so the next person to cost that leaf starts from what is
+true. Re-verify these anchors before implementing: they were re-derived at HEAD
+on 2026-08-14 and this spec has already been wrong about them once.
+
 ## Risks/decisions
 
 | Risk / decision | Call |
@@ -388,7 +442,7 @@ critical runtime/gating path.
 | Per-layer sync adds ~40 waits/token | Phase 1 accepts the structural cost but does not assume margin; W0 measures c1 and W3 has its own checkpoint. Any resident/missing overlap is W6 and requires a fresh spike, not an in-place optimization promise |
 | Uniform-routing h≈f may undershoot G3 | W5 measures h(f), but G3 stays fixed at f=0.5/12 tok/s. A miss is an open gap; changing the fraction is a new recorded gate, never silent rebasing |
 | Expert bank = second copy of expert bytes on disk (~17 GiB) | Accepted: one-time build, keyed+versioned, evictable file; alternative (per-miss repack kernel) taxes every miss forever |
-| GGUF checkpoints (APEX 35B) not covered by W1-W6 | Explicit out-of-scope; follow-up leaf after `QUANT-GGUF-KEEPQ-LOADER` lands (same cache, different slicer) |
+| GGUF checkpoints (APEX 35B, and every Qwen3.8-class checkpoint that exists) not covered by W1-W6 | Still out of scope for W1-W6, but the stated blocker is GONE: the slicer landed 2026-07-22. What remains is the residency policy, and the GGUF lane needs NO bank at all (see the reconciliation note) |
 | tmpfs "tier" temptation on GB10 | Rejected with reasons (§Scope verdict): tmpfs is the same unified memory; documented so it is not re-proposed |
 | CUDA graphs vs data-dependent miss handling | Phase 1 explicitly disables graphs. Current Marlin has no address table; graph compatibility would require a separately spiked kernel/dispatch change after W3 profiling |
 | Full-layer prefill with C<E | A single unmodified Marlin launch cannot address experts absent from slots. W4 uses exact chunk filters + scatter accumulation and proves every routed pair once; it may not allocate a hidden E-sized buffer |

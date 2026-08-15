@@ -18,6 +18,9 @@ struct NpyArray {
   std::vector<char> data;
   std::vector<int64_t> shape;
   std::string dtype;  // numpy descr, e.g. "<f4", "<u2", "<i8"
+  // True only when LoadNpy was asked to accept a column-major buffer. `data` is
+  // then in FORTRAN order against `shape` and the caller owes the transpose.
+  bool fortran_order = false;
 };
 
 namespace detail {
@@ -38,7 +41,7 @@ inline bool IsDigit(char c) {
 
 }  // namespace detail
 
-inline NpyArray LoadNpy(const std::string& path) {
+inline NpyArray LoadNpy(const std::string& path, bool allow_fortran_order = false) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("npy: cannot open " + path);
 
@@ -86,7 +89,15 @@ inline NpyArray LoadNpy(const std::string& path) {
   if (fb != std::string::npos && fo.compare(fb, 5, "False") == 0) {
     // C-order: supported.
   } else if (fb != std::string::npos && fo.compare(fb, 4, "True") == 0) {
-    throw std::runtime_error("npy: fortran order unsupported in " + path);
+    // A torch tensor saved through a `.T` / `.transpose()` view lands here —
+    // the MiniMax-Music3 oracle's condition_chunk0.npy is one. The bytes are
+    // readable, but the caller has to know the axes are reversed, so this is
+    // OPT-IN and the flag is reported rather than silently normalized: reading
+    // an [86, 2048] F-order buffer as C-order yields the right VALUE COUNT and
+    // the wrong tensor, which is exactly the failure the throw was guarding.
+    if (!allow_fortran_order)
+      throw std::runtime_error("npy: fortran order unsupported in " + path);
+    arr.fortran_order = true;
   } else {
     throw std::runtime_error("npy: malformed fortran_order in " + path);
   }

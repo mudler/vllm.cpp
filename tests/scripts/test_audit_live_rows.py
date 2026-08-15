@@ -112,6 +112,7 @@ class ClassifierTests(unittest.TestCase):
             branches=["row/ENG-FOO"],
             unmerged_by_branch={"row/ENG-FOO": ["abc1234 wip"]},
             commits=[],
+            head_commits=[],
         )
         self.assertEqual(verdict, "IN-FLIGHT")
         self.assertIn("row/ENG-FOO", reason)
@@ -121,6 +122,7 @@ class ClassifierTests(unittest.TestCase):
             branches=["row/ENG-FOO"],
             unmerged_by_branch={"row/ENG-FOO": []},
             commits=[],
+            head_commits=[],
         )
         self.assertEqual(verdict, "LANDED")
         # "unmerged" contains "merged", so a substring check on the bare word
@@ -132,13 +134,14 @@ class ClassifierTests(unittest.TestCase):
             branches=[],
             unmerged_by_branch={},
             commits=["def5678 feat(eng): ENG-FOO"],
+            head_commits=[],
         )
         self.assertEqual(verdict, "LANDED")
         self.assertIn("def5678", reason)
 
     def test_no_evidence_at_all_means_abandoned(self):
         verdict, reason = audit.classify_active(
-            branches=[], unmerged_by_branch={}, commits=[]
+            branches=[], unmerged_by_branch={}, commits=[], head_commits=[]
         )
         self.assertEqual(verdict, "ABANDONED")
         self.assertIn("no branch", reason.lower())
@@ -150,6 +153,7 @@ class ClassifierTests(unittest.TestCase):
             branches=["row/ENG-FOO"],
             unmerged_by_branch={"row/ENG-FOO": ["abc1234 wip"]},
             commits=["def5678 feat(eng): ENG-FOO groundwork"],
+            head_commits=[],
         )
         self.assertEqual(verdict, "IN-FLIGHT")
 
@@ -161,6 +165,7 @@ class ClassifierTests(unittest.TestCase):
             branches=["row/B-LIVE", "row/A-MERGED"],
             unmerged_by_branch={"row/B-LIVE": ["abc1234 wip"], "row/A-MERGED": []},
             commits=[],
+            head_commits=[],
         )
         self.assertEqual(verdict, "IN-FLIGHT")
         self.assertIn("row/B-LIVE", reason)
@@ -177,8 +182,8 @@ class ClassifierTests(unittest.TestCase):
             ("landed", {"row/B": [], "row/A": []}),
         ]:
             with self.subTest(label):
-                forward = audit.classify_active(["row/A", "row/B"], by_branch, [])
-                reverse = audit.classify_active(["row/B", "row/A"], by_branch, [])
+                forward = audit.classify_active(["row/A", "row/B"], by_branch, [], [])
+                reverse = audit.classify_active(["row/B", "row/A"], by_branch, [], [])
                 self.assertEqual(forward, reverse)
                 self.assertIn("row/A, row/B", forward[1])
 
@@ -187,18 +192,91 @@ class ClassifierTests(unittest.TestCase):
         # claim as finished -- the exact false negative this tool prevents.
         with self.assertRaises(KeyError):
             audit.classify_active(
-                branches=["row/NEVER-GATHERED"], unmerged_by_branch={}, commits=[]
+                branches=["row/NEVER-GATHERED"],
+                unmerged_by_branch={},
+                commits=[],
+                head_commits=[],
             )
 
     def test_every_verdict_is_declared(self):
-        for branches, by_branch, commits in [
-            (["row/X"], {"row/X": ["a b"]}, []),
-            (["row/X"], {"row/X": []}, []),
-            ([], {}, ["a b"]),
-            ([], {}, []),
+        for branches, by_branch, commits, head in [
+            (["row/X"], {"row/X": ["a b"]}, [], []),
+            (["row/X"], {"row/X": []}, [], []),
+            ([], {}, ["a b"], []),
+            ([], {}, [], ["a b"]),
+            ([], {}, [], []),
         ]:
-            verdict, _ = audit.classify_active(branches, by_branch, commits)
+            verdict, _ = audit.classify_active(branches, by_branch, commits, head)
             self.assertIn(verdict, audit.VERDICTS)
+
+
+class HeadEvidenceClassifierTests(unittest.TestCase):
+    """HEAD carries the work of the pull request being built (#726).
+
+    A fork's `row/<ID>` branch is a ref `origin` can never hold, so on the PR
+    that actually does the work HEAD -- the merge commit -- is the ONLY place
+    the row's commits exist in the checkout. Without this arm every PR that
+    moves a row to ACTIVE and carries its implementation reads ABANDONED.
+    """
+
+    def test_head_commits_alone_mean_in_flight(self):
+        verdict, reason = audit.classify_active(
+            branches=[],
+            unmerged_by_branch={},
+            commits=[],
+            head_commits=["abc1234 feat(eng): ENG-FOO lands"],
+        )
+        self.assertEqual(verdict, "IN-FLIGHT")
+        # The reason must say WHERE, or a reader cannot tell this apart from
+        # branch evidence when chasing why a row was not flagged.
+        self.assertIn("HEAD", reason)
+        self.assertIn("abc1234", reason)
+
+    def test_head_evidence_beats_a_landed_main_commit(self):
+        # Same rule the branch arm already obeys: a row with landed groundwork
+        # and follow-up work in THIS pull request is in flight, not finished.
+        verdict, reason = audit.classify_active(
+            branches=[],
+            unmerged_by_branch={},
+            commits=["def5678 feat(eng): ENG-FOO groundwork"],
+            head_commits=["abc1234 feat(eng): ENG-FOO follow-up"],
+        )
+        self.assertEqual(verdict, "IN-FLIGHT")
+        self.assertNotIn("def5678", reason)
+
+    def test_head_evidence_beats_a_fully_merged_branch(self):
+        # Ordering pin: putting the HEAD arm AFTER the merged-branch LANDED arm
+        # still passes every test above, and reports a row whose follow-up is
+        # in this very PR as finished.
+        verdict, _ = audit.classify_active(
+            branches=["row/ENG-FOO"],
+            unmerged_by_branch={"row/ENG-FOO": []},
+            commits=[],
+            head_commits=["abc1234 feat(eng): ENG-FOO follow-up"],
+        )
+        self.assertEqual(verdict, "IN-FLIGHT")
+
+    def test_a_live_branch_still_outranks_head(self):
+        # Both are IN-FLIGHT, so the verdict cannot discriminate; the REASON
+        # must, and the branch is the more specific evidence.
+        _, reason = audit.classify_active(
+            branches=["row/ENG-FOO"],
+            unmerged_by_branch={"row/ENG-FOO": ["9999999 wip"]},
+            commits=[],
+            head_commits=["abc1234 feat(eng): ENG-FOO follow-up"],
+        )
+        self.assertIn("row/ENG-FOO", reason)
+        self.assertNotIn("HEAD", reason)
+
+    def test_a_pull_request_carrying_no_evidence_rescues_nothing(self):
+        # The whole point of gathering HEAD evidence PER ROW. If the arm keyed
+        # on "this checkout is ahead of main" instead of "a commit names this
+        # row", every unrelated PR would silently clear every abandoned row and
+        # the gate would never fire again.
+        verdict, _ = audit.classify_active(
+            branches=[], unmerged_by_branch={}, commits=[], head_commits=[]
+        )
+        self.assertEqual(verdict, "ABANDONED")
 
 
 class PartialGapTests(unittest.TestCase):
@@ -429,6 +507,167 @@ class AuditGuardTests(unittest.TestCase):
         self.assertIn("ENG-X", str(caught.exception))
 
 
+class HeadCommitGatheringTests(unittest.TestCase):
+    """What `head_commits` actually asks git."""
+
+    @staticmethod
+    def _capture(output: str) -> tuple[list, list]:
+        calls: list = []
+
+        def fake_git(*args: str) -> str:
+            calls.append(args)
+            return output
+
+        return calls, [fake_git]
+
+    def test_it_asks_only_for_the_range_not_yet_on_main(self):
+        # `origin/main..HEAD`, never bare HEAD: on the push-to-main lane HEAD
+        # IS origin/main, so a bare HEAD would re-report every landed commit as
+        # in-flight work and no ACTIVE row could ever be reported stale.
+        calls, (fake_git,) = self._capture("abc1234 feat(eng): ENG-FOO\n")
+        with mock.patch.object(audit, "git", fake_git):
+            got = audit.head_commits("ENG-FOO")
+        self.assertEqual(got, ["abc1234 feat(eng): ENG-FOO"])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("origin/main..HEAD", calls[0])
+
+    def test_it_matches_the_id_as_a_whole_token_like_the_main_arm(self):
+        # 55 pairs of live row IDs are prefixes of longer ones. The HEAD arm
+        # returns IN-FLIGHT, so a prefix match here would clear an abandoned
+        # MODEL-MM because the PR happened to touch MODEL-MM-voxtral.
+        calls, (fake_git,) = self._capture("")
+        with mock.patch.object(audit, "git", fake_git):
+            audit.head_commits("MODEL-MM")
+        grep = [arg for arg in calls[0] if arg.startswith("--grep=")]
+        self.assertEqual(grep, ["--grep=" + audit.id_grep_pattern("MODEL-MM")])
+        self.assertIn("-E", calls[0])
+        pattern = re.compile(audit.id_grep_pattern("MODEL-MM"))
+        self.assertIsNone(pattern.search("feat: MODEL-MM-voxtral lands"))
+
+    def test_a_failed_git_call_yields_no_evidence(self):
+        # git() maps failure to "". That must read as "no HEAD evidence" and
+        # fall through to the other arms, never as a crash or a phantom commit.
+        with mock.patch.object(audit, "git", lambda *a: ""):
+            self.assertEqual(audit.head_commits("ENG-FOO"), [])
+
+
+class BranchInformationGuardTests(unittest.TestCase):
+    """The guard `require_origin_main` has and the branch side never had (#726).
+
+    `row_branches()` returning {} means either "nobody holds a branch" or "this
+    checkout was never told about branches". The classifier reads both as the
+    first, which is how CI -- fetching `main` and nothing else -- called every
+    in-flight row ABANDONED.
+    """
+
+    @staticmethod
+    def _refs(*names: str):
+        return lambda *args: "".join(name + "\n" for name in names)
+
+    def test_it_raises_when_the_checkout_holds_no_row_ref(self):
+        with mock.patch.object(audit, "git", self._refs("main", "origin/main")):
+            with self.assertRaises(SystemExit) as caught:
+                audit.require_branch_information()
+        message = str(caught.exception)
+        # Actionable, like the origin/main guard: name the refspec, or the
+        # reader is told only that something is missing.
+        self.assertIn("refs/heads/row/*", message)
+
+    def test_a_single_remote_row_ref_is_enough(self):
+        with mock.patch.object(
+            audit, "git", self._refs("main", "origin/main", "origin/row/ENG-FOO")
+        ):
+            audit.require_branch_information()
+
+    def test_a_local_row_branch_is_enough(self):
+        with mock.patch.object(audit, "git", self._refs("row/ENG-FOO")):
+            audit.require_branch_information()
+
+    def test_head_does_not_satisfy_it(self):
+        # HEAD carries evidence about the row THIS pull request advances and no
+        # other, so counting it would make the guard vacuous -- it always
+        # resolves -- while every other row stayed silently misclassified.
+        with mock.patch.object(audit, "git", self._refs("HEAD", "main")):
+            with self.assertRaises(SystemExit):
+                audit.require_branch_information()
+
+
+class GuardOrderingTests(unittest.TestCase):
+    def test_both_guards_run_before_any_row_is_read(self):
+        # A guard that fires after the census is built still emits the wrong
+        # census on the way there, and `live_rows` is the expensive step.
+        calls: list[str] = []
+
+        with mock.patch.object(
+            audit, "require_origin_main", lambda: calls.append("origin")
+        ), mock.patch.object(
+            audit, "require_branch_information", lambda: calls.append("branches")
+        ), mock.patch.object(
+            audit, "live_rows", lambda errors=None: calls.append("rows") or []
+        ):
+            audit.audit()
+        self.assertEqual(calls[:2], ["origin", "branches"])
+        self.assertEqual(calls, ["origin", "branches", "rows"])
+
+
+class AuditWiringTests(unittest.TestCase):
+    """audit() must actually hand the HEAD evidence to the classifier.
+
+    Adding the arm to `classify_active` and forgetting to gather it leaves
+    every classifier test above green and #726 entirely unfixed.
+    """
+
+    def _row(self, item_id: str):
+        return audit.record.ClaimRow(
+            path=audit.record.AGENTS / "engine-matrix.md",
+            line_no=9,
+            item_id=item_id,
+            state="ACTIVE",
+            header=(),
+            cells=(),
+            raw="",
+        )
+
+    def test_head_evidence_reaches_the_verdict(self):
+        with mock.patch.object(
+            audit, "require_origin_main", lambda: None
+        ), mock.patch.object(
+            audit, "require_branch_information", lambda: None
+        ), mock.patch.object(
+            audit, "live_rows", lambda errors=None: [self._row("ENG-FOO")]
+        ), mock.patch.object(
+            audit, "row_branches", dict
+        ), mock.patch.object(
+            audit, "main_commits", lambda item_id: []
+        ), mock.patch.object(
+            audit, "head_commits", lambda item_id: ["abc1234 feat(eng): ENG-FOO"]
+        ):
+            records = audit.audit()
+        self.assertEqual([r["verdict"] for r in records], ["IN-FLIGHT"])
+        self.assertEqual(audit.exit_code(records, check=True), 0)
+
+    def test_without_head_evidence_the_same_row_still_fails_the_check(self):
+        # The paired half: the fix must not make --check unable to fail. This
+        # is the same row, same absent branch, same absent main commit -- only
+        # the HEAD evidence is gone.
+        with mock.patch.object(
+            audit, "require_origin_main", lambda: None
+        ), mock.patch.object(
+            audit, "require_branch_information", lambda: None
+        ), mock.patch.object(
+            audit, "live_rows", lambda errors=None: [self._row("ENG-FOO")]
+        ), mock.patch.object(
+            audit, "row_branches", dict
+        ), mock.patch.object(
+            audit, "main_commits", lambda item_id: []
+        ), mock.patch.object(
+            audit, "head_commits", lambda item_id: []
+        ):
+            records = audit.audit()
+        self.assertEqual([r["verdict"] for r in records], ["ABANDONED"])
+        self.assertEqual(audit.exit_code(records, check=True), 1)
+
+
 class DuplicateLiveIdTests(unittest.TestCase):
     @staticmethod
     def _row(item_id: str, matrix: str, line_no: int):
@@ -475,6 +714,15 @@ class GateWiringTests(unittest.TestCase):
         text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("scripts/audit-live-rows.py --check", text)
         self.assertIn("tests/scripts/test_audit_live_rows.py", text)
+
+    def test_ci_fetches_the_branch_refs_the_classifier_reads(self):
+        # #726: the step fetched `main` and nothing else, so no `row/<ID>` ref
+        # existed and the IN-FLIGHT verdict was UNREACHABLE -- in-flight work
+        # and abandoned work produced the same verdict. With the guard in place
+        # dropping this refspec no longer misreports, it aborts, so this pins
+        # the step that keeps the gate able to run at all.
+        text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("+refs/heads/row/*:refs/remotes/origin/row/*", text)
 
     def test_shipped_record_has_no_abandoned_active_row(self):
         records = audit.audit()

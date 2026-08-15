@@ -8,7 +8,7 @@ head parity`` case in ``test_op_parity``.
 
 Run on dgx.casa after acquiring the project GPU lock::
 
-    flock /tmp/gpu bash -lc '
+    flock "${GPU_LOCK:-$HOME/gpu.lock}" bash -lc '
       cd ~/work/vllm.cpp
       VLLM_ENABLE_V1_MULTIPROCESSING=0 \
         ~/venvs/vllm-oracle/bin/python \

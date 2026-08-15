@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ADDITIVE-MODEL W4 dgx gate runner for OPT-125m (`OPTForCausalLM`).
 #
-# Runs the whole gate series under ONE `flock /tmp/gpu` so the measurements are
+# Runs the whole gate series under ONE `flock ${GPU_LOCK:-$HOME/gpu.lock}` so the measurements are
 # uncontended and a concurrent agent queues rather than interleaves:
 #   1. the OPT SACRED correctness gate + loader gate + the new-op unit test;
 #   2. the NON-NEGOTIABLE regressions — 27B 235/235, 35B 315/315,

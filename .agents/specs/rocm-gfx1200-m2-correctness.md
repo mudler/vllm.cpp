@@ -9,7 +9,12 @@ near-tie prompt is not a defect on either of our backends — see Outcome.
 gfx1200 M0/M1 report, first M2 attempt on this board. Distinct defect from
 #201 (`hipblasGemmEx` overload) and #132 (`-O0` teardown deadlock), neither of
 which reproduced here (and both since fixed on main, `ce134e1d`, picked up
-when this investigation rebased onto `origin/main` 2026-08-10).
+when this investigation rebased onto `origin/main` 2026-08-10). Also distinct
+from [#444](https://github.com/mudler/vllm.cpp/issues/444) (rocWMMA headers
+absent from the dev shell, so a gfx12 build configures and then fails midway) —
+a build-environment defect on this same board, not a correctness one. Its narrow
+half, adding `rocwmma` to `rocm-shell`, lands in PR #638; #444 stays open for
+the rest.
 **Board:** AMD Radeon RX 9060 XT (`gfx1200`, Navi 44, RDNA4, discrete — no
 reference tier). ROCm 7.2.3 (nixpkgs `rocmPackages.*`), hipClang/Clang 22.0.0.
 M0/M1 independently MET on this board (separate report to #41).
@@ -216,9 +221,14 @@ doesn't hold still on it.
 
 ## Environment note (reproducibility)
 
-This board is accessed through `nix develop .#rocm-shell` (local, uncommitted
-`flake.nix` addition — see the M0/M1 report) for the ROCm/HIP `build-hip`
-build itself; the oracle containers are unrelated to that and need no ROCm
+This board is accessed through `nix develop .#rocm-shell` for the ROCm/HIP
+`build-hip` build itself. That shell has been committed since `f93a1290a`
+(2026-08-10); the "local, uncommitted `flake.nix` addition" this paragraph used
+to describe is stale. One caveat if you already have the shell: the overlay is
+cached behind a `$ROCM_OVERLAY/.complete` sentinel, so an existing checkout
+keeps its rocWMMA-free overlay after #638 merges and fails with the identical
+`'rocwmma/rocwmma.hpp' file not found`. Remove `$ROCM_OVERLAY` to
+re-materialise it. The oracle containers are unrelated to that and need no ROCm
 toolchain on the host beyond the kernel driver + `/dev/kfd`/`/dev/dri`.
 `ROCM_PATH` for `build-hip` is nixpkgs' `clr` output (has
 `lib/cmake/hip-lang`); hipBLAS/hipBLASLt/hipblas-common are merged into a

@@ -25,9 +25,11 @@
 #include "vllm/model_executor/models/dense_attn_block.h"   // AttnBlock, BuildStepInputs, ResidentWeight
 #include "vllm/model_executor/models/dense_weight_loaders.h"
 #include "vllm/model_executor/models/qwen3_vl_text.h"       // Qwen3VLMergeMultimodal (modality-agnostic merge)
+#include "vllm/model_executor/models/voxtral_loader_internal.h"  // the two mmap-reading loader steps (#772)
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
+#include "vt/unaligned.h"  // LoadUnaligned — mmap'd payloads have no alignment guarantee
 
 namespace vllm {
 namespace {
@@ -44,16 +46,6 @@ using vt::DType;
 using vt::Queue;
 using vt::Tensor;
 using v1::CommonAttentionMetadata;
-
-// --- bf16 StTensor -> host f32 vector (encoder + adapter weights). --------------
-std::vector<float> StBf16ToF32(const StTensor& t) {
-  VT_CHECK(t.dtype == "BF16", "voxtral: expected BF16 tensor");
-  const auto* src = reinterpret_cast<const uint16_t*>(t.data);
-  const size_t n = t.nbytes / sizeof(uint16_t);
-  std::vector<float> out(n);
-  for (size_t i = 0; i < n; ++i) out[i] = vt::BF16ToF32(src[i]);
-  return out;
-}
 
 std::vector<float> Bf16BitsToF32(const uint16_t* p, int64_t n) {
   std::vector<float> o(static_cast<size_t>(n));
@@ -274,10 +266,7 @@ ForwardLogits WrapDeviceLogits(Dev d, DBuf&& dlogits, int64_t rows, int64_t voca
   fl.rows = rows;
   fl.vocab = vocab;
   fl.device_tensor = dlogits.t();
-  const size_t alloc = dlogits.alloc_bytes();
-  void* p = dlogits.Release();
-  fl.device_storage =
-      std::shared_ptr<void>(p, [alloc](void* q) { Pool().Put(alloc, q); });
+  fl.device_storage = dlogits.ReleaseShared();
   (void)d;
   return fl;
 }
@@ -304,58 +293,33 @@ void LoadEncoderWeights(const TensorResolver& get, const std::vector<float>& emb
                         const multimodal::WhisperAudioEncoderConfig& cfg,
                         multimodal::WhisperAudioEncoderWeights& w) {
   const std::string E = "mm_whisper_embeddings.whisper_encoder.";
-  w.conv1_w = StBf16ToF32(get(E + "conv_layers.0.weight"));
-  w.conv1_b = StBf16ToF32(get(E + "conv_layers.0.bias"));
-  w.conv2_w = StBf16ToF32(get(E + "conv_layers.1.weight"));
-  w.conv2_b = StBf16ToF32(get(E + "conv_layers.1.bias"));
+  w.conv1_w = VoxtralStBf16ToF32(get(E + "conv_layers.0.weight"));
+  w.conv1_b = VoxtralStBf16ToF32(get(E + "conv_layers.0.bias"));
+  w.conv2_w = VoxtralStBf16ToF32(get(E + "conv_layers.1.weight"));
+  w.conv2_b = VoxtralStBf16ToF32(get(E + "conv_layers.1.bias"));
   w.embed_positions_w = embed_positions;
-  w.final_ln_w = StBf16ToF32(get(E + "transformer.norm.weight"));
-  w.final_ln_b = StBf16ToF32(get(E + "transformer.norm.bias"));
+  w.final_ln_w = VoxtralStBf16ToF32(get(E + "transformer.norm.weight"));
+  w.final_ln_b = VoxtralStBf16ToF32(get(E + "transformer.norm.bias"));
   w.layers.resize(static_cast<size_t>(cfg.num_layers));
   for (int64_t l = 0; l < cfg.num_layers; ++l) {
     const std::string p = E + "transformer.layers." + std::to_string(l) + ".";
     multimodal::WhisperEncoderLayerWeights& lw = w.layers[static_cast<size_t>(l)];
-    lw.attn_ln_w = StBf16ToF32(get(p + "attention_norm.weight"));
-    lw.attn_ln_b = StBf16ToF32(get(p + "attention_norm.bias"));
-    lw.final_ln_w = StBf16ToF32(get(p + "ffn_norm.weight"));
-    lw.final_ln_b = StBf16ToF32(get(p + "ffn_norm.bias"));
-    lw.q_w = StBf16ToF32(get(p + "attention.wq.weight"));
-    lw.q_b = StBf16ToF32(get(p + "attention.wq.bias"));
-    lw.k_w = StBf16ToF32(get(p + "attention.wk.weight"));  // k_proj: NO bias
-    lw.v_w = StBf16ToF32(get(p + "attention.wv.weight"));
-    lw.v_b = StBf16ToF32(get(p + "attention.wv.bias"));
-    lw.out_w = StBf16ToF32(get(p + "attention.wo.weight"));
-    lw.out_b = StBf16ToF32(get(p + "attention.wo.bias"));
-    lw.fc1_w = StBf16ToF32(get(p + "feed_forward.w1.weight"));
-    lw.fc1_b = StBf16ToF32(get(p + "feed_forward.w1.bias"));
-    lw.fc2_w = StBf16ToF32(get(p + "feed_forward.w2.weight"));
-    lw.fc2_b = StBf16ToF32(get(p + "feed_forward.w2.bias"));
+    lw.attn_ln_w = VoxtralStBf16ToF32(get(p + "attention_norm.weight"));
+    lw.attn_ln_b = VoxtralStBf16ToF32(get(p + "attention_norm.bias"));
+    lw.final_ln_w = VoxtralStBf16ToF32(get(p + "ffn_norm.weight"));
+    lw.final_ln_b = VoxtralStBf16ToF32(get(p + "ffn_norm.bias"));
+    lw.q_w = VoxtralStBf16ToF32(get(p + "attention.wq.weight"));
+    lw.q_b = VoxtralStBf16ToF32(get(p + "attention.wq.bias"));
+    lw.k_w = VoxtralStBf16ToF32(get(p + "attention.wk.weight"));  // k_proj: NO bias
+    lw.v_w = VoxtralStBf16ToF32(get(p + "attention.wv.weight"));
+    lw.v_b = VoxtralStBf16ToF32(get(p + "attention.wv.bias"));
+    lw.out_w = VoxtralStBf16ToF32(get(p + "attention.wo.weight"));
+    lw.out_b = VoxtralStBf16ToF32(get(p + "attention.wo.bias"));
+    lw.fc1_w = VoxtralStBf16ToF32(get(p + "feed_forward.w1.weight"));
+    lw.fc1_b = VoxtralStBf16ToF32(get(p + "feed_forward.w1.bias"));
+    lw.fc2_w = VoxtralStBf16ToF32(get(p + "feed_forward.w2.weight"));
+    lw.fc2_b = VoxtralStBf16ToF32(get(p + "feed_forward.w2.bias"));
   }
-}
-
-// Permute the rows of a bf16 [n_heads*head_dim, K] q/k weight from the Meta-
-// interleaved rope layout (mistral consolidated) to the HF NeoX layout vLLM's
-// rotary_emb (is_neox_style=True) expects — the EXACT transform vLLM applies on
-// the mistral load path (verified bit-exact: permute(wq)==vLLM q_proj). Row map
-// per head: out(j*hd2 + i) <- in(2i + j), hd2 = head_dim/2. Pure byte reorder of
-// bf16 values (no arithmetic) => bit-exact. wv/wo are NOT permuted.
-std::vector<uint16_t> PermuteQKBf16(const StTensor& t, int64_t n_heads) {
-  VT_CHECK(t.dtype == "BF16" && t.shape.size() == 2, "voxtral: q/k permute needs 2-D BF16");
-  const int64_t d1 = t.shape[0], K = t.shape[1];
-  const int64_t hd = d1 / n_heads, hd2 = hd / 2;
-  VT_CHECK(hd * n_heads == d1 && hd2 * 2 == hd, "voxtral: q/k permute head split mismatch");
-  const auto* src = reinterpret_cast<const uint16_t*>(t.data);
-  std::vector<uint16_t> out(static_cast<size_t>(d1) * K);
-  for (int64_t h = 0; h < n_heads; ++h)
-    for (int64_t i = 0; i < hd2; ++i)
-      for (int64_t j = 0; j < 2; ++j) {
-        const int64_t out_row = h * hd + j * hd2 + i;
-        const int64_t in_row = h * hd + 2 * i + j;
-        std::memcpy(&out[static_cast<size_t>(out_row) * K],
-                    &src[static_cast<size_t>(in_row) * K],
-                    static_cast<size_t>(K) * sizeof(uint16_t));
-      }
-  return out;
 }
 
 // Build the merged qkv OwnedTensor [Hq*Dh + 2*Hkv*Dh, K] (rows q|k|v) with q/k
@@ -367,8 +331,8 @@ OwnedTensor BuildPermutedQKV(const TensorResolver& get, const std::string& b,
   const StTensor& wv = get(b + "attention.wv.weight");
   const int64_t K = wq.shape[1];
   const int64_t qd = wq.shape[0], kd = wk.shape[0], vd = wv.shape[0];
-  std::vector<uint16_t> pq = PermuteQKBf16(wq, config.num_attention_heads);
-  std::vector<uint16_t> pk = PermuteQKBf16(wk, config.num_key_value_heads);
+  std::vector<uint16_t> pq = VoxtralPermuteQKBf16(wq, config.num_attention_heads);
+  std::vector<uint16_t> pk = VoxtralPermuteQKBf16(wk, config.num_key_value_heads);
   OwnedTensor m = dense_loaders::MakeOwned(DType::kBF16, {qd + kd + vd, K});
   auto* dst = reinterpret_cast<uint16_t*>(m.bytes.data());
   std::memcpy(dst, pq.data(), static_cast<size_t>(qd) * K * sizeof(uint16_t));
@@ -401,6 +365,56 @@ void LoadTextWeights(const TensorResolver& get, const HfConfig& config,
 }
 
 }  // namespace
+
+// --- bf16 StTensor -> host f32 vector (encoder + adapter weights). --------------
+// `t.data` points into the safetensors mmap, whose payload offset carries NO
+// alignment guarantee (issue #772), so the bytes are read through
+// vt::LoadUnaligned rather than a `const uint16_t*` — the same treatment
+// dense_loaders::TransposeBf16 and minimax_h3_vae_loader.cpp already use, and
+// free: at -O2 it emits the identical `movzwl` and no call.
+std::vector<float> VoxtralStBf16ToF32(const StTensor& t) {
+  VT_CHECK(t.dtype == "BF16", "voxtral: expected BF16 tensor");
+  const auto* src = static_cast<const unsigned char*>(static_cast<const void*>(t.data));
+  const size_t n = t.nbytes / sizeof(uint16_t);
+  std::vector<float> out(n);
+  for (size_t i = 0; i < n; ++i)
+    out[i] = vt::BF16ToF32(vt::LoadUnaligned<uint16_t>(src + i * 2));
+  return out;
+}
+
+// Permute the rows of a bf16 [n_heads*head_dim, K] q/k weight from the Meta-
+// interleaved rope layout (mistral consolidated) to the HF NeoX layout vLLM's
+// rotary_emb (is_neox_style=True) expects — the EXACT transform vLLM applies on
+// the mistral load path (verified bit-exact: permute(wq)==vLLM q_proj). Row map
+// per head: out(j*hd2 + i) <- in(2i + j), hd2 = head_dim/2. Pure byte reorder of
+// bf16 values (no arithmetic) => bit-exact. wv/wo are NOT permuted.
+//
+// The source row address is computed in `unsigned char` (issue #772): the
+// safetensors payload has no alignment guarantee, and forming
+// `reinterpret_cast<const uint16_t*>(t.data)` — let alone indexing it — is
+// undefined even though every access here is a memcpy that never dereferences
+// it as a uint16_t. That memcpy laundering is exactly why UBSan never reported
+// this site while it reported its two siblings. NOT vt::LoadUnaligned: this is a
+// bulk row copy, not a scalar load, so the `* sizeof(uint16_t)` that used to be
+// implicit in the pointer type is now explicit in the byte offset.
+std::vector<uint16_t> VoxtralPermuteQKBf16(const StTensor& t, int64_t n_heads) {
+  VT_CHECK(t.dtype == "BF16" && t.shape.size() == 2, "voxtral: q/k permute needs 2-D BF16");
+  const int64_t d1 = t.shape[0], K = t.shape[1];
+  const int64_t hd = d1 / n_heads, hd2 = hd / 2;
+  VT_CHECK(hd * n_heads == d1 && hd2 * 2 == hd, "voxtral: q/k permute head split mismatch");
+  const auto* src = static_cast<const unsigned char*>(static_cast<const void*>(t.data));
+  std::vector<uint16_t> out(static_cast<size_t>(d1) * K);
+  for (int64_t h = 0; h < n_heads; ++h)
+    for (int64_t i = 0; i < hd2; ++i)
+      for (int64_t j = 0; j < 2; ++j) {
+        const int64_t out_row = h * hd + j * hd2 + i;
+        const int64_t in_row = h * hd + 2 * i + j;
+        std::memcpy(&out[static_cast<size_t>(out_row) * K],
+                    src + static_cast<size_t>(in_row) * K * sizeof(uint16_t),
+                    static_cast<size_t>(K) * sizeof(uint16_t));
+      }
+  return out;
+}
 
 // ─── VoxtralDecodeGraph (BF16 Mistral/Llama full-attention decode CUDA-graph) ──
 // The Voxtral-text sibling of Qwen3MoeDecodeGraph (qwen3_moe.cpp) and
@@ -624,8 +638,8 @@ VoxtralWeights LoadVoxtralWeights(const SafetensorsFile& st,
   w.downsample_factor = 4;
   w.text_hidden = text_config.hidden_size;
   LoadEncoderWeights(get, embed_positions, w.encoder_cfg, w.encoder);
-  w.adapter_w_in = StBf16ToF32(get("mm_whisper_embeddings.audio_language_projection.0.weight"));
-  w.adapter_w_out = StBf16ToF32(get("mm_whisper_embeddings.audio_language_projection.2.weight"));
+  w.adapter_w_in = VoxtralStBf16ToF32(get("mm_whisper_embeddings.audio_language_projection.0.weight"));
+  w.adapter_w_out = VoxtralStBf16ToF32(get("mm_whisper_embeddings.audio_language_projection.2.weight"));
   LoadTextWeights(get, text_config, w.text);
   return w;
 }

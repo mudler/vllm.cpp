@@ -218,6 +218,30 @@ std::string safe_arg_prefix(
 
 }  // namespace
 
+// See parser_engine.h. Relocated here from serving_chat.cpp's anonymous
+// namespace so the tool_parsers ParserEngineToolAdapter shares ONE projection
+// with the serving path rather than carrying a second copy of it.
+ParserRequest ParserRequestFromChatCompletion(
+    const oai::ChatCompletionRequest& request) {
+  ParserRequest pr;
+  pr.include_reasoning = request.include_reasoning;
+  pr.tool_choice = request.tool_choice.has_value() ? request.tool_choice->mode
+                                                   : std::string("auto");
+  if (request.tools.has_value()) {
+    for (const oai::ChatCompletionToolsParam& t : *request.tools) {
+      ParserTool pt;
+      pt.name = t.function.name;
+      // Carry the function's JSON-Schema parameters so the assembly can coerce
+      // argument values to their declared types (parser_engine.py _fix_arg_types /
+      // find_tool_properties). Absent parameters => no schema (identity path).
+      pt.parameters = t.function.parameters;
+      pr.tools.push_back(std::move(pt));
+    }
+  }
+  pr.history_tool_call_cnt = 0;
+  return pr;
+}
+
 ParserEngine::ParserEngine(ParserEngineConfig config,
                            const EngineTokenizer* tokenizer)
     : config_(std::move(config)),
@@ -343,6 +367,31 @@ std::optional<oai::DeltaMessage> ParserEngine::parse_delta(
     if (!result->content && no_tools) result = std::nullopt;
   }
   return result;
+}
+
+// parser_engine.py:519 extract_reasoning_streaming.
+std::optional<oai::DeltaMessage> ParserEngine::extract_reasoning_streaming(
+    const std::string& delta_text, const std::vector<int>& delta_token_ids) {
+  initialize_streaming();
+  std::vector<SemanticEvent> events = feed(delta_text, delta_token_ids);
+  return strip_trailing_reasoning(events_to_delta(events, /*finished=*/false));
+}
+
+// parser_engine.py:595 is_reasoning_end — TEXT form. Upstream walks the token
+// ids BACKWARDS and returns True at the first reasoning-end token, False at the
+// first reasoning-start token. Over text that is exactly "the LAST end marker
+// lies after the LAST start marker" (neither literal is a substring of the
+// other, so their occurrences cannot alias).
+bool ParserEngine::is_reasoning_end(const std::string& text) const {
+  const std::optional<std::string> end = reasoning_end_str();
+  if (!end) return reasoning_ended_;
+  if (text.empty()) return config_.initial_state != ParserState::REASONING;
+  const std::size_t pe = text.rfind(*end);
+  if (pe == std::string::npos) return false;
+  const std::optional<std::string> start = reasoning_start_str();
+  if (!start) return true;
+  const std::size_t ps = text.rfind(*start);
+  return ps == std::string::npos || pe > ps;
 }
 
 std::optional<oai::DeltaMessage> ParserEngine::extract_tool_calls_streaming(

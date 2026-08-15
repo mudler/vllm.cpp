@@ -68,7 +68,17 @@ OwnedTensor CopyRawNK(const StTensor& source, int64_t offset, int64_t n,
            "qwen3_5 MTP: stacked slice out of bounds for " + name);
   OwnedTensor out = MakeOwned(vt::DType::kBF16, {n, k});
   out.nk = true;
-  const auto* begin = reinterpret_cast<const uint16_t*>(source.data) + offset;
+  // Byte arithmetic, NOT `reinterpret_cast<const uint16_t*>(source.data) +
+  // offset` (issue #772). `source.data` points into the safetensors mmap, whose
+  // payload offset carries no alignment guarantee, and forming — let alone
+  // advancing — a misaligned `uint16_t*` is undefined even though the payload is
+  // then moved by memcpy and never dereferenced as a uint16_t. That memcpy
+  // laundering is why UBSan never reported this site: it is the one of the four
+  // in #772 that a sanitizer sweep provably cannot find. `offset` counts BF16
+  // ELEMENTS, so the byte advance carries the `sizeof(uint16_t)` the pointer
+  // type used to supply.
+  const auto* begin = static_cast<const unsigned char*>(static_cast<const void*>(source.data)) +
+                      static_cast<size_t>(offset) * sizeof(uint16_t);
   std::memcpy(out.bytes.data(), begin, out.bytes.size());
   return out;
 }

@@ -142,7 +142,114 @@ extern "C" {
  * permanent. The flag surface mirrors vLLM's cli_args.py, which is the real
  * contract. Embedders wanting programmatic control keep the granular entry
  * points. Purely additive. */
-#define VLLM_ABI_VERSION 17
+/* v18 — THE GENERALIZED VIDEO SEAM (LTX-2.5 L1, .agents/specs/ltx-2-5.md §5,
+ * issue #435). The v12 video slice was H3-typed inside; it is now the C face of
+ * vllm::multimodal::VideoEngine, an abstract seam with a checkpoint-detected
+ * family registry, so a second video family (LTX-2.5) is an additive file
+ * rather than a second ABI. Three additions, all APPENDED:
+ *   - vllm_video_model_params.family — the family to load. NULL/empty (the
+ *     zero value) means DETECT it from the checkpoint, which is what v12
+ *     callers already get, since MiniMax-H3 is what a v12 checkpoint set is.
+ *     A name that is not registered is REFUSED naming what is registered; it
+ *     is never treated as a hint, and a checkpoint no family claims is refused
+ *     rather than handed to the only family present — an H3 DiT loaded as LTX
+ *     would not fail, it would render noise.
+ *   - extra_keys / extra_values / n_extras on vllm_video_model_params and on
+ *     vllm_video_params — parallel arrays carrying FAMILY-SPECIFIC settings as
+ *     strings, so a new family adds no permanent field to a struct every other
+ *     family must then ignore. n_extras 0 (the zero value) is "none".
+ *     vllm_video_model_params.partition is now the documented ALIAS for the
+ *     load extra "partition"; supplying both with DIFFERENT values is
+ *     VLLM_ERR_INVALID_ARGUMENT rather than a silent winner.
+ *   - vllm_video_engine_family() — which family a handle actually resolved to,
+ *     so detection is visible to a C caller rather than implicit.
+ * A v12 caller is byte-identical: it zero-fills the struct growth, so family
+ * stays NULL (detect), n_extras stays 0, `partition` keeps its exact v12
+ * meaning, and every v12 status/message contract is unchanged (the
+ * text-checkpoint refusal still names vllm_engine_load). */
+/* v19 — MULTIMODAL INPUT LIMITS on vllm_model_params (ENG-MM-INPUT-PIPELINE
+ * wave L2, issue #607). Two APPENDED fields mirroring vLLM's MultiModalConfig
+ * (vllm/config/multimodal.py:78,81) as its own two serve flags expose it
+ * (vllm/engine/arg_utils.py:555-556,1276-1279,1691-1692):
+ *   - vllm_model_params.language_model_only — the flag whose name misleads and
+ *     whose docstring does not: it "disables all multimodal inputs by setting
+ *     all modality limits to 0" (multimodal.py:78-80). It is sugar; the limits
+ *     are the mechanism.
+ *   - vllm_model_params.limit_mm_per_prompt — the per-modality input-count
+ *     limits, as the SAME JSON object the flag takes ('{"image": 2,
+ *     "video": 0}', or the option form '{"video": {"count": 1}}'), following
+ *     the v9 precedent that a dict-valued vLLM flag crosses this ABI as its own
+ *     JSON rather than as a fixed struct of modalities the ABI would then owe
+ *     forever. A malformed document, a negative count, or an unknown option on
+ *     one of the three modalities upstream gives an `extra="forbid"` dataclass
+ *     (image/video/audio) fails vllm_engine_load with
+ *     VLLM_ERR_INVALID_ARGUMENT rather than defaulting — mirroring the pydantic
+ *     validation upstream does at parse time (multimodal.py:17-45,212-236).
+ *     An unknown option on any OTHER modality is dropped, not refused, because
+ *     the BaseDummyOptions it falls back to (:17-21,233) is the one such
+ *     dataclass declared without extra="forbid".
+ * WHERE THEY BITE, stated exactly, because this contract is permanent. Both
+ * fields land on the engine's ONE MultiModalConfig
+ * (vllm_engine_load -> EngineParams::multimodal -> LoadedEngine::mm_config()),
+ * and that config is what BaseProcessingInfo::ValidateNumItems refuses against.
+ * The caller that reaches ValidateNumItems on a live request is the OPENAI
+ * SERVER: it is the one place that installs the multimodal chat seam
+ * (server_main.cpp `chat.set_multimodal_chat_fn(...)`), and serving_chat.cpp
+ * gates the whole multimodal branch on that seam being set. So a server started
+ * with --language-model-only answers a multimodal chat request with HTTP 400
+ * "At most 0 image(s) may be provided in one prompt." rather than serving it.
+ *
+ * THIS ABI HAS NO MULTIMODAL CHAT REQUEST PATH YET, so on a C-ABI engine the
+ * two fields are RECORDED and read by nothing the ABI itself can reach.
+ * vllm_chat / vllm_chat_stream never install that seam. A chat request whose
+ * content array carries an `image_url` part is therefore answered as TEXT: the
+ * part is dropped, its text siblings still form the prompt, no limit is
+ * consulted, and language_model_only changes neither the status nor the body.
+ * Setting these fields configures the ENGINE — including an OpenAI server built
+ * on one — but it does not make a C-ABI chat call refuse an image. Carrying
+ * media across this ABI is a later version, and the refusal arm becomes
+ * reachable from here only when it lands. That is pinned behaviourally by
+ * tests/capi/test_capi.cpp ("capi: the v19 limits are RECORDED on a C-ABI
+ * engine; there is no multimodal request path to enforce them on"), so this
+ * paragraph cannot silently become false.
+ * The memory win upstream also gets from zero limits (skipping the vision tower
+ * weights, interfaces.py:293) is NOT in this version — it is wave L3, and until
+ * it lands and is MEASURED this field must not be described as freeing VRAM.
+ * Appended at the END of vllm_model_params, so a zero-initialized v18 struct is
+ * byte-identical: language_model_only 0 (off) and limit_mm_per_prompt NULL (no
+ * limits configured => the 999-per-modality default, multimodal.py:331-333). */
+/* v20 — SPEECH AND MUSIC GENERATION (.agents/specs/minimax-music3.md §4.1 W6,
+ * issue #672). The C face of vllm::multimodal::SpeechEngine, the seam the
+ * IndexTTS-2.5 lane landed and MiniMax-Music3 is the first family to implement:
+ * an opaque vllm_speech_engine loaded from a checkpoint SET
+ * (vllm_speech_engine_load/free, vllm_speech_model_params + _default), one
+ * blocking vllm_synthesize (vllm_speech_params + _default) producing a
+ * vllm_speech_result — the float waveform AND the RIFF/WAVE bytes, so a server
+ * hands a client a playable file without a second encoder — plus
+ * vllm_speech_result_free, and three interrogations of the loaded handle
+ * (vllm_speech_engine_family / _sample_rate / _requires_reference_audio).
+ *
+ * WHY THE HANDLE ANSWERS QUESTIONS. `sample_rate` is the family's NATIVE rate
+ * (44100 stereo for Music3, 22050 mono for IndexTTS-2.5) and never a resampled
+ * one, so the caller decides whether to resample.
+ * `requires_reference_audio` exists so a server can REFUSE a request before
+ * staging tens of gigabytes: true for a family with no text-only synthesis,
+ * false for one conditioned on text alone.
+ *
+ * A MUSIC family takes TWO texts. `lyrics` and `description` are separate
+ * fields rather than one `text` behind a separator, because upstream runs a
+ * DIFFERENT normalizer over each (encoders.py:54-91); a one-utterance family
+ * keeps using `text` and ignores them. Every generation control is inert at its
+ * zero value, which selects the family's own default — EXCEPT `guidance_scale`,
+ * which carries `has_guidance_scale` beside it (the vllm_video_params.has_seed
+ * precedent) because 0 IS A LEGAL GUIDANCE SCALE and a 0-means-default sentinel
+ * would make the unconditional branch unreachable.
+ *
+ * Purely additive: no struct changed, no existing signature moved, and a pre-v19
+ * caller that never touches a speech symbol is byte-identical. A directory no
+ * speech family claims is refused NAMING every family that was tried, because
+ * the wrong family does not fail, it renders noise. */
+#define VLLM_ABI_VERSION 20
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -278,6 +385,30 @@ typedef struct vllm_model_params {
    * engine construction (VLLM_ERR_MODEL_LOAD). `kv_role` is REQUIRED whenever
    * `kv_connector` is set. Borrowed for the call only. See docs/KV-OFFLOAD.md. */
   const char* kv_transfer_config;
+  /* ── Weight offload / OffloadConfig (ABI v21) ──────────────────────────────
+   * The JSON object vLLM's OffloadConfig takes, selecting the WEIGHT-offload
+   * backend. This is a DIFFERENT subject from kv_transfer_config above, which
+   * offloads KV blocks: this one offloads model WEIGHTS. Example:
+   *   {"offload_backend":"uva","uva":{"cpu_offload_gb":10,
+   *                                   "cpu_offload_params":["experts"]}}
+   * NULL or "" => the default inert config: no backend selected, nothing
+   * offloaded, the byte-identical engine. Mirrors vllm/config/offload.py at the
+   * pin: `offload_backend` is one of "auto" (default; prefetch when
+   * offload_group_size > 0, else uva when cpu_offload_gb > 0, else nothing),
+   * "uva" or "prefetch". A malformed document, an unknown backend name, a
+   * wrong-typed field, or a config that fails upstream's validator
+   * (offload_num_in_group > offload_group_size, or offload_prefetch_step < 1
+   * when prefetch is enabled) fails vllm_engine_load with
+   * VLLM_ERR_INVALID_ARGUMENT.
+   *
+   * ACCEPTED BUT NOT YET ACTED ON: `ENG-WEIGHT-OFFLOAD` W0b wires the config
+   * surface end to end (CLI -> ABI -> EngineParams) and validates it; the
+   * offloader that would MOVE a weight is W2/W5. So a valid config parses,
+   * validates and is recorded, and no weight moves yet. It is spelled out here
+   * rather than left silent because a user who sets cpu_offload_gb and sees no
+   * memory change deserves to know it was accepted and is inert, not ignored.
+   * Borrowed for the call only. */
+  const char* offload_config;
   /* ── Jump-forward decoding (ABI v10) ───────────────────────────────────────
    * Tri-state toggle for jump-forward decoding — the SGLang grammar-speed
    * behavior (ENG-SGLANG-BEHAVIOR-FLAG SW3): when the structured-output grammar
@@ -334,6 +465,45 @@ typedef struct vllm_model_params {
    * (cache.py:182,189). 0 => unset. A budget smaller than a single KV block
    * fails vllm_engine_load with VLLM_ERR_INVALID_ARGUMENT. */
   int64_t kv_cache_memory_bytes;
+  /* ── Multimodal input limits (ABI v19) ────────────────────────────────────
+   * The mirror of vLLM's --language-model-only / --limit-mm-per-prompt
+   * (arg_utils.py:555-556,1276-1279,1691-1692) over MultiModalConfig
+   * (multimodal.py:78,81). These are ONE mechanism, not two: the flag is
+   * defined as "disables all multimodal inputs by setting all modality limits
+   * to 0" (:78-80), so it is checked BEFORE the map and an explicit non-zero
+   * entry does not survive it (get_limit_per_prompt, :321-336).
+   *
+   * language_model_only: 0 => off (the zero value, byte-identical to pre-v19);
+   * nonzero => every modality limit resolves to 0 on this engine's
+   * MultiModalConfig. On the OPENAI-SERVER path that is a refusal — HTTP 400
+   * "At most 0 <modality>(s) may be provided in one prompt." — because the
+   * server installs the multimodal chat seam that reaches ValidateNumItems. On
+   * this ABI's own vllm_chat there is no multimodal request to refuse yet, so
+   * the field configures the engine without changing any C-ABI call's result;
+   * see the v19 note in the version log above for exactly what a C-ABI caller
+   * gets today. The tower-skip memory win upstream also produces is not here
+   * either (wave L3). */
+  int32_t language_model_only;
+  /* limit_mm_per_prompt: the per-modality maximum input-item count, as the same
+   * JSON object the flag takes. NULL/empty (the zero value) => no limit
+   * configured => 999 per modality (:331-333), NOT zero — an empty map is "no
+   * limits", not "nothing allowed". Accepted spellings, all upstream's own
+   * (:87-96,212-236):
+   *     {"image": 16, "video": 2}                        (count only)
+   *     {"video": {"count": 1, "num_frames": 32}}        (with options)
+   *     {"image": 16, "video": {"count": 1}}             (mixed)
+   * The option keys are validated exactly as upstream's per-modality
+   * dataclasses do (video: num_frames/width/height, image: width/height, audio:
+   * length; each an integer > 0; anything else on those three is refused,
+   * `extra="forbid"`, :24,33,41) and then DROPPED: they size dummy inputs for
+   * memory profiling, which this engine does not do, and only `count` feeds the
+   * limit (:335). A modality outside those three is upstream's bare
+   * BaseDummyOptions (:233), which has no `extra="forbid"`, so its unknown keys
+   * are dropped rather than refused — mirrored, not invented.
+   * Invalid JSON, a non-object document, a negative count, or a refused option
+   * per the paragraph above fails vllm_engine_load with
+   * VLLM_ERR_INVALID_ARGUMENT. Borrowed for the call only. */
+  const char* limit_mm_per_prompt;
 } vllm_model_params;
 
 /* ── Custom logits processor (ABI v8) ─────────────────────────────────────────
@@ -707,6 +877,19 @@ typedef struct vllm_video_model_params {
   int32_t device;       /* 0 cpu, 1 cuda */
   int32_t dequant_bf16; /* 0 keep-quant, 1 dequant/stream bf16 */
   int32_t fp4_resident; /* NVFP4+cuda: keep FP4 packed, Marlin W4A16 GEMM */
+  /* ── v18 additions (the generalized seam) ─────────────────────────────────
+   * The model family to load, e.g. "minimax-h3". NULL/empty DETECTS it from
+   * what the checkpoint holds; an unregistered name is refused naming the
+   * registered ones. Never a hint — a checkpoint no family claims is refused,
+   * because the wrong family does not fail, it renders noise. */
+  const char* family;
+  /* FAMILY-SPECIFIC load settings as parallel arrays of n_extras borrowed
+   * key/value strings (both arrays must hold n_extras non-NULL entries).
+   * `partition` above is the documented alias for the key "partition";
+   * supplying both with DIFFERENT values is VLLM_ERR_INVALID_ARGUMENT. */
+  const char* const* extra_keys;
+  const char* const* extra_values;
+  int32_t n_extras; /* 0 => none */
 } vllm_video_model_params;
 
 typedef struct vllm_video_params {
@@ -724,6 +907,20 @@ typedef struct vllm_video_params {
   float noise_aug;           /* keyframe pinning strength; <= 0 => 1.0 */
   /* Where frame_%06d.ppm + audio.wav land (created if absent). REQUIRED. */
   const char* output_dir;
+  /* v18: FAMILY-SPECIFIC per-generation settings, same parallel-array shape as
+   * the load-time extras. Every family refuses a key it does not know rather
+   * than ignoring it. 0 => none.
+   *   MiniMax-H3: none.
+   *   LTX-2.5:    "image_crf" — the H.264 CRF an image conditioning is
+   *               re-compressed at. Only "0" is served; an LTX-2.5 checkpoint
+   *               RESOLVES 18 when this is absent and the codec round trip is
+   *               unported, so leaving it out refuses BY NAME rather than
+   *               rendering. "0" is upstream-legal and out of distribution;
+   *               see docs/USAGE.md. No ABI change was needed for it, which is
+   *               what this parallel-array shape exists for. */
+  const char* const* extra_keys;
+  const char* const* extra_values;
+  int32_t n_extras;
 } vllm_video_params;
 
 /* One finished generation. OWNERSHIP: every member is library-allocated;
@@ -751,6 +948,11 @@ VLLM_API vllm_video_params vllm_video_params_default(void);
 VLLM_API vllm_status vllm_video_engine_load(const vllm_video_model_params* params,
                                             vllm_video_engine** out);
 VLLM_API void vllm_video_engine_free(vllm_video_engine* engine);
+
+/* v18: the family this handle RESOLVED to ("minimax-h3", ...) — the answer to
+ * "what did detection decide?". Points at storage the library owns for the
+ * lifetime of the handle; the caller must NOT free it. NULL engine => NULL. */
+VLLM_API const char* vllm_video_engine_family(const vllm_video_engine* engine);
 
 /* Run one BLOCKING generation, filling *out. Serialized per engine handle.
  * VLLM_ERR_INVALID_ARGUMENT for a missing output_dir / illegal reference
@@ -784,6 +986,112 @@ VLLM_API vllm_video_mux_params vllm_video_mux_params_default(void);
 VLLM_API vllm_status vllm_video_mux_argv(const vllm_video_mux_params* params,
                                          char*** out_argv, int32_t* out_argc);
 VLLM_API void vllm_video_mux_argv_free(char** argv, int32_t argc);
+
+/* ── Speech + music generation (ABI v20) ─────────────────────────────────────
+ * The C face of vllm::multimodal::SpeechEngine: text (and, for a music family,
+ * lyrics + a structured description) in, a waveform out, through the SAME
+ * library seam the bundled server's /v1/audio/speech route drives — so HTTP and
+ * FFI cannot drift.
+ *
+ * A speech engine is loaded from a checkpoint SET (MiniMax-Music3 ships six
+ * component directories beside a modular_model_index.json), not from one model
+ * directory, which is why this is a separate handle from vllm_engine. Loading a
+ * TEXT checkpoint here fails naming vllm_engine_load; a directory NO registered
+ * family claims is refused naming every family that was tried, because the
+ * wrong family would not fail — it would render noise. */
+typedef struct vllm_speech_engine vllm_speech_engine;
+
+typedef struct vllm_speech_model_params {
+  /* The checkpoint set's root directory. REQUIRED. */
+  const char* path;
+  /* The family to load, e.g. "minimax-music3". NULL/empty (the zero value)
+   * DETECTS it by inspecting the artifact. An unregistered name is refused
+   * naming what IS registered; it is never treated as a hint. */
+  const char* family;
+} vllm_speech_model_params;
+
+typedef struct vllm_speech_params {
+  /* ── One-utterance families (IndexTTS-2.5) ─────────────────────────────── */
+  const char* text;
+  const char* language; /* NULL/empty => the family's default */
+  /* The reference clip, for a family whose requires_reference_audio() is 1.
+   * `reference_audio` is n_reference_audio interleaved-free mono f32 samples in
+   * [-1, 1); NULL/0 means none. Borrowed for the call. */
+  const float* reference_audio;
+  int64_t n_reference_audio;
+  int32_t reference_sample_rate;
+
+  /* ── Music families (MiniMax-Music3) ───────────────────────────────────────
+   * TWO texts, not one: upstream normalizes the sung lyrics and the structured
+   * description differently, so packing both into `text` behind a separator
+   * would be a private protocol. A one-utterance family ignores both. */
+  const char* lyrics;      /* with [Verse]/[Chorus] section tags */
+  const char* description; /* genre, BPM, key, instrumentation, mood */
+
+  /* ── Generation controls; every zero selects the family's own default ───── */
+  double audio_duration_s;     /* <= 0 => family default */
+  int32_t num_inference_steps; /* <= 0 => family default */
+  double guidance_scale;       /* honoured ONLY when has_guidance_scale != 0 */
+  /* 0 IS A LEGAL guidance scale (it selects the unconditional branch), so the
+   * "use the family default" signal cannot be the value 0 and is this flag
+   * instead — the vllm_video_params.has_seed precedent. */
+  int32_t has_guidance_scale;
+  int64_t seed;
+} vllm_speech_params;
+
+/* One rendered waveform. OWNERSHIP: every pointer is library-allocated; free
+ * the struct's members via vllm_speech_result_free(out).
+ *   - samples: CHANNEL-MAJOR f32, channels * n_samples entries — channel c
+ *     occupies samples[c*n_samples .. (c+1)*n_samples);
+ *   - n_samples: samples PER CHANNEL;
+ *   - sample_rate: the family's NATIVE rate, never resampled;
+ *   - wav / n_wav: the same waveform as RIFF/WAVE 16-bit PCM, interleaved, so
+ *     a caller can write or serve a playable file without a second encoder. */
+typedef struct vllm_speech_result {
+  float* samples;
+  int64_t n_samples;
+  int32_t sample_rate;
+  int32_t channels;
+  char* wav;
+  int64_t n_wav;
+} vllm_speech_result;
+
+/* Zero-initialized params. For the model params that means "detect the family";
+ * for the generation params it means every control at its family default. */
+VLLM_API vllm_speech_model_params vllm_speech_model_params_default(void);
+VLLM_API vllm_speech_params vllm_speech_params_default(void);
+
+/* Resolve the checkpoint set to a registered family and stage its weights once.
+ * On VLLM_OK, *out is a handle the caller frees via vllm_speech_engine_free.
+ * On error, *out is NULL and vllm_last_error() carries the detail: a directory
+ * nothing claims maps to VLLM_ERR_MODEL_LOAD listing the families tried. */
+VLLM_API vllm_status vllm_speech_engine_load(const vllm_speech_model_params* params,
+                                             vllm_speech_engine** out);
+VLLM_API void vllm_speech_engine_free(vllm_speech_engine* engine);
+
+/* Which family this handle RESOLVED to. Library-owned storage, valid for the
+ * lifetime of the handle; the caller must NOT free it. NULL engine => NULL. */
+VLLM_API const char* vllm_speech_engine_family(const vllm_speech_engine* engine);
+/* The family's NATIVE output rate in Hz (44100 for MiniMax-Music3). 0 for a
+ * NULL handle. */
+VLLM_API int32_t vllm_speech_engine_sample_rate(const vllm_speech_engine* engine);
+/* 1 when the family cannot synthesize without a reference clip, 0 when it can
+ * synthesize from text alone, and 0 for a NULL handle. Ask BEFORE building a
+ * request, so a missing clip is a caller-side refusal rather than a failed job. */
+VLLM_API int32_t vllm_speech_engine_requires_reference_audio(const vllm_speech_engine* engine);
+
+/* Run one BLOCKING synthesis, filling *out. Serialized per engine handle.
+ * VLLM_ERR_INVALID_ARGUMENT for a NULL engine/params/out;
+ * VLLM_ERR_RUNTIME when the family refuses the request (a field it cannot
+ * honour, a missing reference clip, a stage that is not implemented) or the
+ * forward fails. On any non-OK status *out is zeroed. */
+VLLM_API vllm_status vllm_synthesize(vllm_speech_engine* engine,
+                                     const vllm_speech_params* params,
+                                     vllm_speech_result* out);
+
+/* Free the owned members of a result and zero the struct. The struct itself is
+ * caller storage. NULL is a no-op. */
+VLLM_API void vllm_speech_result_free(vllm_speech_result* out);
 
 /* ── Memory helpers ───────────────────────────────────────────────────────────
  * Free a heap string returned by the library. NULL is a no-op. */

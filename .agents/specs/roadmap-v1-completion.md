@@ -228,8 +228,12 @@ gate → size (S/M/L) → vehicle model. `[H]` = user-directed headline.
     En route it fixed an engine-wide defect: `EngineCoreProc` never threaded
     `check_for_draft_tokens`, so EVERY speculator's drafts were dropped on the
     CLI and server paths. Measured against the pinned graphed oracle under
-    pinned clocks the 35B-A3B MoE lane is **0.975x** (code cell,
-    non-overlapping distributions) and **1.012x** (prose cell), with the
+    pinned clocks the 35B-A3B MoE lane measured **0.975x** (code cell,
+    non-overlapping distributions) and **1.012x** (prose cell) ON THE
+    PRE-REIMAGE BOX. Both figures are SUPERSEDED: that machine no longer
+    exists, and on the rebuilt stack the matched-and-warm paired ratio is
+    **0.834** -- see the benchmark record entries of 2026-08-15, which also
+    record that every earlier ratio used a single COLD oracle invocation. With the
     residual localised to one kernel and attributed to a **12.9%
     effective-DRAM-bandwidth** gap on byte-equivalent machine code (94 registers
     / 3664 SASS instructions on both sides, spec §§6t–6aa). **Remaining is a

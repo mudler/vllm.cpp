@@ -28,8 +28,57 @@ from tools.bench.online_gate import (
     VLLM_GENERATION_WINDOW_CONTRACTS,
     _fingerprint_tree,
 )
-from tools.bench.online_gate_summary import summarize_evidence
+from tools.bench.gpu_clock_state import MIN_BUSY_SAMPLES, build_clock_record
+from tools.bench.online_gate_summary import _report, summarize_evidence
 from tools.bench.serve_low_common import HarnessError, VLLM_COMMIT, sha256_file
+
+# One boot id for the whole fixture grid: a clean four-leg capture is same-boot
+# by construction, and every clock case below perturbs exactly one field of it.
+FIXTURE_BOOT_ID = "f6bbbfc6-0000-4000-8000-000000000000"
+OTHER_BOOT_ID = "2fca2b02-0000-4000-8000-000000000000"
+
+
+def _clock_samples(values, *, utilization=97, throttle="0x0000000000000000"):
+    return [
+        {
+            "clocks_applications_graphics_mhz": 2418,
+            "clocks_max_sm_mhz": 3003,
+            "driver_version": "580.159.03",
+            "gpu_name": "NVIDIA GB10",
+            "persistence_mode": "Enabled",
+            "sm_clock_mhz": value,
+            "throttle_reasons_active": throttle,
+            "utilization_gpu_pct": utilization,
+        }
+        for value in values
+    ]
+
+
+def _clock_window(values):
+    """Repeat a clock pattern until it clears the sampler's coverage floor.
+
+    Whole-list repetition leaves min, median, max and `spread_pct` untouched, so
+    every clock case below still asserts exactly what it asserted; only the
+    sample COUNT changes. The driver samples at 1 Hz across a bench loop of
+    minutes, so a three-sample leg was never a leg anyone could have captured.
+    """
+
+    values = list(values)
+    return values * -(-MIN_BUSY_SAMPLES // len(values))
+
+
+def _write_clock_leg(root, engine, repetition, values, *, boot_id=FIXTURE_BOOT_ID, **kwargs):
+    """Write one leg's clock evidence the way the sampler does."""
+
+    samples = _clock_samples(_clock_window(values), **kwargs)
+    base = root / "clocks" / "27" / engine
+    base.mkdir(parents=True, exist_ok=True)
+    (base / f"r{repetition}.samples.jsonl").write_text(
+        "".join(json.dumps(sample) + "\n" for sample in samples), encoding="utf-8"
+    )
+    (base / f"r{repetition}.summary.json").write_text(
+        json.dumps(build_clock_record(samples, boot_id=boot_id)), encoding="utf-8"
+    )
 
 
 def _record(*, faster: bool, repetition: int) -> dict:
@@ -362,6 +411,10 @@ def _write_fixture(root: pathlib.Path) -> None:
                 encoding="utf-8",
             )
 
+            # The clock the leg was measured at. Its absence is the #543
+            # defect: a number nobody can attribute to a clock state.
+            _write_clock_leg(root, engine, repetition, [2470, 2470, 2470])
+
             thermal = root / "thermal" / "27" / engine
             thermal.mkdir(parents=True, exist_ok=True)
             for suffix in ("before", "after"):
@@ -402,7 +455,7 @@ class OnlineGateSummaryTests(unittest.TestCase):
         window_patch.start()
         self.addCleanup(window_patch.stop)
 
-    def _summarize(self, root: pathlib.Path):
+    def _summarize(self, root: pathlib.Path, *, allow_cross_boot: bool = False):
         patches = (
             mock.patch("tools.bench.online_gate.POINTS", ((1, 2),)),
             mock.patch("tools.bench.online_gate_summary.POINTS", ((1, 2),)),
@@ -412,7 +465,7 @@ class OnlineGateSummaryTests(unittest.TestCase):
             ),
         )
         with patches[0], patches[1], patches[2]:
-            return summarize_evidence(root)
+            return summarize_evidence(root, allow_cross_boot=allow_cross_boot)
 
     def _summarize_model(self, root: pathlib.Path):
         with (
@@ -632,6 +685,324 @@ class OnlineGateSummaryTests(unittest.TestCase):
             )
             runs, _ = self._summarize(root)
             self.assertFalse(runs["gate_pass"])
+
+    def test_every_ratio_carries_the_clock_it_was_measured_at(self) -> None:
+        """A ratio without its clock is not quotable (#543)."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            _, ratios = self._summarize(root)
+            self.assertTrue(ratios["ratios"])
+            for ratio in ratios["ratios"]:
+                clock = ratio["clock"]
+                self.assertTrue(clock["same_boot"])
+                self.assertEqual(clock["reasons"], [])
+                self.assertEqual(clock["ours_median_sm_mhz"], 2470.0)
+                self.assertEqual(clock["vllm_median_sm_mhz"], 2470.0)
+                self.assertAlmostEqual(clock["median_offset_pct"], 0.0)
+                self.assertAlmostEqual(clock["estimated_effect_pct"], 0.0)
+
+    def test_a_missing_clock_record_cannot_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            (root / "clocks" / "27" / "ours" / "r2.summary.json").unlink()
+            runs, ratios = self._summarize(root)
+            self.assertFalse(runs["gate_pass"])
+            self.assertFalse(ratios["gate_pass"])
+            self.assertTrue(
+                any(
+                    "clock" in reason
+                    for aggregate in runs["aggregates"]
+                    for reason in aggregate["reasons"]
+                )
+            )
+
+    def test_a_missing_clock_record_names_the_offending_arm_in_every_ratio(self) -> None:
+        """The leg reason already voids the gate; the READER still needs to know.
+
+        Nothing else in the summary says WHICH arm lost its clock, so this is
+        the only site that can be gutted without any gate going green-to-red.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            (root / "clocks" / "27" / "vllm" / "r1.summary.json").unlink()
+            _, ratios = self._summarize(root)
+            self.assertTrue(ratios["ratios"])
+            for ratio in ratios["ratios"]:
+                named = [
+                    reason
+                    for reason in ratio["clock"]["reasons"]
+                    if "no usable SM-clock record" in reason
+                ]
+                self.assertTrue(named, ratio["clock"]["reasons"])
+                self.assertIn("vllm", named[0])
+                self.assertNotIn("ours arm", named[0])
+
+    def test_a_cross_boot_pair_cannot_pass(self) -> None:
+        """The exact shape that produced the retracted #543 findings."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            for repetition in (1, 2, 3):
+                _write_clock_leg(
+                    root,
+                    "vllm",
+                    repetition,
+                    [2470, 2470, 2470],
+                    boot_id=OTHER_BOOT_ID,
+                )
+            runs, ratios = self._summarize(root)
+            self.assertFalse(ratios["gate_pass"])
+            self.assertFalse(runs["gate_pass"])
+            offenders = [
+                reason
+                for ratio in ratios["ratios"]
+                for reason in ratio["clock"]["reasons"]
+                if "DIFFERENT boots" in reason
+            ]
+            self.assertTrue(offenders)
+            self.assertIn(OTHER_BOOT_ID, offenders[0])
+            # Each arm is internally clean here, so NOTHING at leg or arm level
+            # voids these ratios -- only the ratio's own clock term can. The two
+            # ratio families are asserted SEPARATELY because they carry that
+            # term at two different call sites, and a single gate_pass assertion
+            # lets either site mask the other's removal (the #520 lesson).
+            throughput = [
+                ratio for ratio in ratios["ratios"] if ratio["concurrency"] is not None
+            ]
+            memory = [
+                ratio for ratio in ratios["ratios"] if ratio["concurrency"] is None
+            ]
+            self.assertTrue(throughput)
+            self.assertTrue(memory)
+            self.assertFalse(any(ratio["binding_eligible"] for ratio in throughput))
+            self.assertFalse(any(ratio["binding_eligible"] for ratio in memory))
+
+    def test_the_cross_boot_override_records_a_caveat_rather_than_silence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            for repetition in (1, 2, 3):
+                _write_clock_leg(
+                    root,
+                    "vllm",
+                    repetition,
+                    [2470, 2470, 2470],
+                    boot_id=OTHER_BOOT_ID,
+                )
+            runs, ratios = self._summarize(root, allow_cross_boot=True)
+            self.assertTrue(runs["gate_pass"])
+            self.assertTrue(ratios["gate_pass"])
+            for ratio in ratios["ratios"]:
+                self.assertTrue(ratio["clock"]["cross_boot_override"])
+                self.assertFalse(ratio["clock"]["same_boot"])
+                self.assertTrue(ratio["clock"]["caveats"])
+
+    def test_the_override_does_not_waive_a_staircase_arm(self) -> None:
+        """Three individually-flat legs at three DIFFERENT clocks, one boot.
+
+        This is the only check that lives ONLY at the compare site.
+        `_clock_for_leg` sees three steady legs and says nothing;
+        `merge_clock_records` folds them without complaint because they share a
+        boot and every static field; `_clock_for_arm` raises only on those two.
+        The merged spread -- (2470 - 2190) / 2300 = 12.17% -- is first evaluated
+        inside `compare_clock_records`, so rewriting that call's reason list to
+        `[] if allow_cross_boot else [...]` is invisible to every other case.
+
+        The vLLM arm is pinned flat at the merged median so the CROSS-ARM OFFSET
+        stays 0.00%: the offset reason is appended outside that expression and
+        would otherwise mask the removal, which is how the two tests that name
+        this guarantee came to be dominated.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            for repetition, clock in zip((1, 2, 3), (2470, 2300, 2190)):
+                _write_clock_leg(root, "ours", repetition, [clock])
+            for repetition in (1, 2, 3):
+                _write_clock_leg(root, "vllm", repetition, [2300], boot_id=OTHER_BOOT_ID)
+            runs, ratios = self._summarize(root, allow_cross_boot=True)
+
+            # Nothing below the compare site objects: every leg is steady, the
+            # fold succeeds, and no aggregate carries a clock reason. Asserted so
+            # a future edit that moves the check earlier makes this case say so
+            # rather than passing for a new reason.
+            self.assertEqual(runs["campaign_reasons"], [])
+            self.assertEqual(
+                [
+                    reason
+                    for aggregate in runs["aggregates"]
+                    for reason in aggregate["reasons"]
+                    if "clock" in reason
+                ],
+                [],
+            )
+            clock = ratios["clocks"]["27"]
+            self.assertTrue(clock["cross_boot_override"])
+            self.assertAlmostEqual(clock["median_offset_pct"], 0.0)
+            self.assertAlmostEqual(clock["ours_spread_pct"], 280.0 / 2300.0 * 100.0)
+            self.assertFalse(
+                any("offset" in reason for reason in clock["reasons"]), clock["reasons"]
+            )
+
+            self.assertFalse(ratios["gate_pass"])
+            spread = [reason for reason in clock["reasons"] if "spread" in reason]
+            self.assertTrue(spread, clock["reasons"])
+            self.assertIn("ours", spread[0])
+            # The two ratio families carry the clock term at two different call
+            # sites, so they are asserted SEPARATELY (the #520 lesson).
+            throughput = [
+                ratio for ratio in ratios["ratios"] if ratio["concurrency"] is not None
+            ]
+            memory = [ratio for ratio in ratios["ratios"] if ratio["concurrency"] is None]
+            self.assertTrue(throughput)
+            self.assertTrue(memory)
+            self.assertFalse(any(ratio["binding_eligible"] for ratio in throughput))
+            self.assertFalse(any(ratio["binding_eligible"] for ratio in memory))
+
+    def test_a_diluted_window_cannot_pass_and_says_so_in_the_report(self) -> None:
+        """One busy sample among three hundred scored a perfect +0.00%.
+
+        The record every leg wrote already counted the exclusions; nothing
+        asserted them, folded them into the ratio's clock block, or printed
+        them, so the window the sampler barely observed outscored the one it
+        watched.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            for engine in ("ours", "vllm"):
+                for repetition in (1, 2, 3):
+                    base = root / "clocks" / "27" / engine
+                    samples = _clock_samples([2470]) + _clock_samples(
+                        [300] * 300, utilization=0
+                    )
+                    (base / f"r{repetition}.samples.jsonl").write_text(
+                        "".join(json.dumps(sample) + "\n" for sample in samples),
+                        encoding="utf-8",
+                    )
+                    (base / f"r{repetition}.summary.json").write_text(
+                        json.dumps(build_clock_record(samples, boot_id=FIXTURE_BOOT_ID)),
+                        encoding="utf-8",
+                    )
+            runs, ratios = self._summarize(root)
+            clock = ratios["clocks"]["27"]
+            self.assertEqual(clock["ours_busy_samples"], 3)
+            self.assertEqual(clock["ours_idle_samples_excluded"], 900)
+            self.assertAlmostEqual(clock["ours_spread_pct"], 0.0)
+            self.assertFalse(runs["gate_pass"])
+            self.assertFalse(ratios["gate_pass"])
+            report = _report(runs, ratios)
+            self.assertIn("3 busy / 900 idle", report)
+
+    def test_the_override_does_not_waive_an_over_spread_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            _write_clock_leg(
+                root, "ours", 1, [1781, 2100, 2398], boot_id=OTHER_BOOT_ID
+            )
+            runs, _ = self._summarize(root, allow_cross_boot=True)
+            self.assertFalse(runs["gate_pass"])
+
+    def test_an_over_spread_window_cannot_pass(self) -> None:
+        """Two probes eight minutes apart inside ONE boot: 2398 against 1781."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            _write_clock_leg(root, "ours", 3, [1781, 2100, 2398])
+            runs, ratios = self._summarize(root)
+            self.assertFalse(runs["gate_pass"])
+            self.assertFalse(ratios["gate_pass"])
+            self.assertTrue(
+                any(
+                    "spread" in reason
+                    for aggregate in runs["aggregates"]
+                    for reason in aggregate["reasons"]
+                )
+            )
+
+    def test_a_cross_arm_clock_offset_cannot_pass_even_same_boot(self) -> None:
+        """The measured pair: 2470 against 2190, one boot apart in reality."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            for repetition in (1, 2, 3):
+                _write_clock_leg(root, "vllm", repetition, [2190, 2190, 2190])
+            runs, ratios = self._summarize(root)
+            self.assertFalse(ratios["gate_pass"])
+            self.assertFalse(runs["gate_pass"])
+            clock = ratios["ratios"][0]["clock"]
+            self.assertTrue(clock["same_boot"])
+            self.assertAlmostEqual(clock["median_offset_pct"], 12.7854, places=3)
+            self.assertAlmostEqual(clock["estimated_effect_pct"], 9.65, places=1)
+            self.assertTrue(any("offset" in reason for reason in clock["reasons"]))
+
+    def test_a_throttled_window_cannot_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            _write_clock_leg(
+                root, "ours", 2, [2470, 2470], throttle="0x0000000000000040"
+            )
+            runs, _ = self._summarize(root)
+            self.assertFalse(runs["gate_pass"])
+            self.assertTrue(
+                any(
+                    "throttl" in reason
+                    for aggregate in runs["aggregates"]
+                    for reason in aggregate["reasons"]
+                )
+            )
+
+    def test_a_clock_summary_that_disagrees_with_its_stream_cannot_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            path = root / "clocks" / "27" / "ours" / "r1.summary.json"
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["sm_clock_mhz"]["n"] = 99
+            path.write_text(json.dumps(record), encoding="utf-8")
+            runs, _ = self._summarize(root)
+            self.assertFalse(runs["gate_pass"])
+
+    def test_one_arm_may_not_straddle_two_boots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            _write_clock_leg(
+                root, "ours", 2, [2470, 2470, 2470], boot_id=OTHER_BOOT_ID
+            )
+            runs, _ = self._summarize(root)
+            self.assertFalse(runs["gate_pass"])
+            self.assertTrue(
+                any(
+                    "boot" in reason
+                    for aggregate in runs["aggregates"]
+                    for reason in aggregate["reasons"]
+                )
+            )
+
+    def test_the_report_prints_the_clock_next_to_the_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            _write_fixture(root)
+            for repetition in (1, 2, 3):
+                _write_clock_leg(root, "vllm", repetition, [2190, 2190, 2190])
+            runs, ratios = self._summarize(root)
+            report = _report(runs, ratios)
+            self.assertIn("SM clock", report)
+            self.assertIn("2470", report)
+            self.assertIn("2190", report)
 
     def test_hash_drifted_corpus_cannot_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

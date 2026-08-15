@@ -23,6 +23,11 @@ evidence=""
 build_dir=""
 configure_log=""
 client="${HOME}/venvs/vllm-oracle/bin/vllm"
+# THE box mutex, one truth (#777). This driver used to open a private lock file
+# of its own, which serialised against nothing else in the tree; `flock` succeeds
+# on any path, so a divergent lock never announces itself -- it only shows up
+# later as timing noise blamed on whoever else was on the box.
+gpu_lock="${GPU_LOCK:-$HOME/gpu.lock}"
 vllm_cpp_sha=""
 port=8001
 num_blocks=4736
@@ -521,14 +526,14 @@ run_diagnostic_leg() {
 }
 
 if [[ ${mode} == diagnostic-c16 ]]; then
-  exec 9>/tmp/gpu
+  exec 9>"${gpu_lock}"
   flock 9
-  record_order "gpu_lock_acquired path=/tmp/gpu"
-  gpu_idle || { echo "GPU is busy despite acquiring /tmp/gpu" >&2; exit 1; }
+  record_order "gpu_lock_acquired path=${gpu_lock}"
+  gpu_idle || { echo "GPU is busy despite acquiring ${gpu_lock}" >&2; exit 1; }
   diagnostic_reps=""
   run_diagnostic_leg
   flock -u 9
-  record_order "gpu_lock_released path=/tmp/gpu"
+  record_order "gpu_lock_released path=${gpu_lock}"
   printf '{"diagnostic":true,"mode":"diagnostic-c16","repetitions":[%s]}\n' \
     "${diagnostic_reps}" >"${evidence}/component-diagnostic.json"
   record_order "diagnostic_complete"
@@ -540,10 +545,10 @@ python3 "${repo_root}/tools/bench/gdn_packed_component.py" validate-corpus \
   --evidence "${evidence}" --vllm-cpp-sha "${vllm_cpp_sha}" >/dev/null
 record_order "corpus_validated"
 
-exec 9>/tmp/gpu
+exec 9>"${gpu_lock}"
 flock 9
-record_order "gpu_lock_acquired path=/tmp/gpu"
-gpu_idle || { echo "GPU is busy despite acquiring /tmp/gpu" >&2; exit 1; }
+record_order "gpu_lock_acquired path=${gpu_lock}"
+gpu_idle || { echo "GPU is busy despite acquiring ${gpu_lock}" >&2; exit 1; }
 run_model_gate packed
 run_model_gate rollback
 python3 "${repo_root}/tools/bench/gdn_packed_component.py" validate-model-gates \
@@ -566,7 +571,7 @@ for concurrency in 2 16; do
 done
 record_order "gpu_series_complete"
 flock -u 9
-record_order "gpu_lock_released path=/tmp/gpu"
+record_order "gpu_lock_released path=${gpu_lock}"
 
 exec 1>&3 2>&4
 exec 3>&- 4>&-

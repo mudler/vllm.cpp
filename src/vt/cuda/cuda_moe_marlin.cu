@@ -135,9 +135,21 @@ void MoeGroupedGemmNvfp4MarlinKernelCuda(Queue& q, Tensor& c, const Tensor& a,
   Check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev),
         "cudaDeviceGetAttribute(sms)");
 
-  // C_tmp for the fp32 global reduce (use_fp32_reduce && !use_atomic_add). Size
-  // per vLLM ops.cu:709 upper bound (size_n * sorted_token_ids) — always >= the
-  // capped size the kernel indexes.
+  // C_tmp for the fp32 global reduce (use_fp32_reduce && !use_atomic_add).
+  //
+  // We used to allocate vLLM's UPPER bound (size_n * sorted_token_ids) and note
+  // that it is "always >= the capped size the kernel indexes". Safe, but not
+  // free: upstream takes the MIN of that bound and a CTA-derived cap
+  // (ops.cu:709-713), because the grid is at most `sms * 4` CTAs and each writes
+  // at most `moe_block_size * max_thread_n` floats, so the cap IS the true
+  // requirement. On the 35B/GB10 decode shape the difference is 15.3 MB vs
+  // 3.15 MB (gate_up) and 30.5 MB vs 3.15 MB (down) -- 4.9x and 9.7x.
+  //
+  // That is not just wasted memory: the split-K reduce WRITES partial sums here
+  // and READS them back, so an oversized buffer turns a cache-resident working
+  // set into DRAM traffic on every launch. This kernel is DRAM-bound (measured
+  // L2 hit rate 9.5%), which is why the same weight bytes were being read at
+  // lower effective bandwidth than upstream (186.6 vs 210.7 GB/s, #442).
   const bool use_atomic_add = false;
   const bool use_fp32_reduce = true;
   const int64_t sorted_len = sorted_token_ids.shape[0];
@@ -145,7 +157,22 @@ void MoeGroupedGemmNvfp4MarlinKernelCuda(Queue& q, Tensor& c, const Tensor& a,
   int64_t c_tmp_elems = 0;
   bool c_tmp_pooled = false;
   if (use_fp32_reduce && !use_atomic_add) {
-    c_tmp_elems = static_cast<int64_t>(size_n) * sorted_len;
+    // marlin.cuh:28 `max_thread_n` (256). Spelled locally because that constant
+    // lives in the QUANTIZATION marlin namespace, not the MoE one this TU uses.
+    constexpr int64_t kMarlinMaxThreadN = 256;
+    const int64_t cta_cap =
+        static_cast<int64_t>(sms) * 4 * moe_block_size * kMarlinMaxThreadN;
+    // VT_MARLIN_CTMP_UNCAPPED=1 restores the pre-fix upper-bound sizing, so the
+    // cap can be A/B'd WITHIN one session. GB10 cannot lock memory clocks
+    // ("Setting locked Memory clocks is not supported"), so a DRAM-bound kernel's
+    // absolute throughput drifts between sessions and a before/after taken across
+    // two runs cannot attribute anything.
+    static const bool ctmp_uncapped = [] {
+      const char* v = std::getenv("VT_MARLIN_CTMP_UNCAPPED");
+      return v != nullptr && v[0] == '1';
+    }();
+    const int64_t upper = static_cast<int64_t>(size_n) * sorted_len;
+    c_tmp_elems = ctmp_uncapped ? upper : std::min(upper, cta_cap);
     if (moe_block_size == 8) c_tmp_elems *= 2;
     const size_t c_tmp_bytes = static_cast<size_t>(c_tmp_elems) * sizeof(float);
     if (MarlinWsPoolEnabled()) {

@@ -219,3 +219,4 @@ rather than merged. `scripts/check-agent-record.py` gates both.
 | [#442](https://github.com/mudler/vllm.cpp/issues/442) | `SPEC-DSPARK` | W8: capture the T=1+k speculative VERIFY shape (the measured 0.870x-0.981x gap) | perf |
 | [#513](https://github.com/mudler/vllm.cpp/issues/513) | `SPEC-DSPARK` | DFlash/DSpark draft loading hardcodes the VL weight prefix, so a text-only Qwen3.5 target cannot share its embedding | bug |
 | [#536](https://github.com/mudler/vllm.cpp/issues/536) | `ROAD-V1-C3` | C3's named tail records DSpark as unspiked three days after it landed, and files TLI under the wrong lane | bug |
+| [#886](https://github.com/mudler/vllm.cpp/issues/886) | `POLICY-NOTHING-LANDS-DEAD` | The seam checkers police where a capability routes and nothing polices whether anything reaches it, so a change can land wired downward and driven only by its own test, as tensor parallelism did (guide [`reachability.md`](reachability.md)) | feature |

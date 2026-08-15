@@ -100,6 +100,10 @@ llama.cpp comparison needs.
 - [ ] Numeric bounds, not just token equality. A mechanism can be missing while
       the argmax is unchanged — that has happened here — so a tokens-only gate
       can pass a model that dropped one.
+- [ ] A production entry point reaches each mechanism, and a test enters through
+      that entry point rather than constructing the type by hand. Anything not
+      reached yet names its owning row and issue in the commit and under
+      `## Owed` in the spec ([`reachability.md`](reachability.md)).
 
 ## 4. Correctness gates
 

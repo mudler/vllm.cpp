@@ -24,6 +24,13 @@ gate yourself, then merge or close. A dispatched helper needs a spec that is
 reachable from its base before dispatch. This mechanical requirement does not
 select the pull request shape for work that does not use helper dispatch.
 
+Write the reachability mutation into the reviewer's `Required evidence` when you
+dispatch. The versioned contract in [`prompts/reviewer.md`](prompts/reviewer.md)
+is a closed grammar that `check-prompt-contract.py` pins, so it carries no rule
+row for this, and the envelope is where the obligation reaches the reviewer. An
+envelope that omits it gets a review that cannot report an unreached change
+([`reachability.md`](reachability.md)).
+
 ## Isolation
 
 Parallel agents get their own worktree. Never let two agents write the same

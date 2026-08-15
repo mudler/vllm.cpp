@@ -318,6 +318,31 @@ unimplemented arm with a message that names the missing part. Record the arm as
 owed. Never leave the missing path to be discovered later. Use
 [`.agents/porting-a-model.md`](.agents/porting-a-model.md) as the checklist.
 
+## Nothing lands dead
+
+A shared seam says where a capability routes. This section says whether anything
+reaches it. The two failures are different, and this tree has carried the second
+one green.
+
+What lands is reachable from a production entry point at its own merge commit:
+`include/vllm.h`, the loader, `ModelRegistry::Forward`, or a registered server
+or command-line path on its default configuration. An example's internals are
+not one, and a test is not one. The smallest failing test enters the new code
+through that entry point. A unit test that constructs the type by hand proves
+that the class works, never that anything reaches it.
+
+A staged slice may land unreached only when the commit body and the pull request
+body name what is unreached, the row ID that owns the wiring, and the issue that
+tracks it, and the row's spec lists it under `## Owed`. There is no registry, and
+silence is not an exception.
+
+The fresh reviewer mutates for this. Delete the production call site in a scratch
+copy and rerun the focused gate. A gate that stays green without the call site
+measures a class, not a capability.
+
+Method, the shapes dead code takes, and why no checker enforces this:
+[`.agents/reachability.md`](.agents/reachability.md).
+
 ## Records
 
 Every inventory item has a stable ID. It records the upstream source, local
@@ -485,6 +510,7 @@ Read the guide for the current job.
 | Porting a MODEL (the coverage checklist) | [`.agents/porting-a-model.md`](.agents/porting-a-model.md) |
 | Porting a model, kernel, or feature from vLLM | [`.agents/porting.md`](.agents/porting.md) |
 | Running gates, proving correctness, reviewing | [`.agents/verification.md`](.agents/verification.md) |
+| Proving a change is reached | [`.agents/reachability.md`](.agents/reachability.md) |
 | Measuring performance | [`.agents/benchmarking.md`](.agents/benchmarking.md) |
 | Fixing a bug | [`.agents/bugfixing.md`](.agents/bugfixing.md) |
 | Working on a specific host or GPU | [`.agents/environment.md`](.agents/environment.md) |

@@ -22,9 +22,11 @@ Commit the spike spec with source and dependency anchors. Then implement.
 ## The port cycle
 
 Implement the smallest coherent *vertical* slice — something that runs
-end-to-end, not a layer that nothing calls yet. Keep local names and structure
-mechanically traceable to upstream so the next person can diff them by eye.
-Record every C++ adaptation you had to make and why.
+end-to-end, not a layer that nothing calls yet. That is a rule, not a
+preference: see [`reachability.md`](reachability.md) for what counts as reached,
+and for how to land a staged slice that is not reached yet. Keep local names and
+structure mechanically traceable to upstream so the next person can diff them by
+eye. Record every C++ adaptation you had to make and why.
 
 Port the upstream test before the behavior. Capture the red. Implement. Get
 focused green. Run the full gate. Then hand to a fresh reviewer.
@@ -86,7 +88,9 @@ Route through the shared path or record one exact tracked exception:
 
 A capability reachable only through an example's internals is not shipped. Grow
 the ABI first, then rewrite the example as a thin client, then delete the
-parallel implementation.
+parallel implementation. The same holds for the shapes no checker sees: a
+parameter no caller passes, a branch no released config selects, a flag with no
+default path through it.
 
 New hardware and new models are additive files mirroring vLLM's structure — not
 edits that special-case an existing path.

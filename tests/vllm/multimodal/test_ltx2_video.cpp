@@ -417,6 +417,38 @@ TEST_CASE("ltx2 video: the second phase upsamples, and refuses when it cannot") 
       CHECK(msg.find("refine") != std::string::npos);
     }
   }
+  SUBCASE("a TEMPORAL upsampler checkpoint is refused BY NAME, not shape-mismatched") {
+    // The temporal x2 arm is ported and gated (test_ltx2_pipeline.cpp, "ltx2 the
+    // latent temporal upsampler reproduces upstream") but NOTHING drives it. It
+    // shares the class name and the `upsampler.0.*` tensor names with the
+    // spatial arm, so this checkpoint loads and runs; what it returns is
+    // [c, 2f-1, h, w] where the phase needs [c, f, 2h, 2w]. Without the guard
+    // the caller gets a shape mismatch and has to work out that they handed over
+    // the wrong file.
+    vllm::Ltx2UpsamplerConfig temporal =
+        ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+    temporal.spatial_upsample = false;
+    temporal.temporal_upsample = true;
+    const std::string path = ws.root + "/temporal_upsampler.safetensors";
+    ltx2_fixture::WriteReducedUpsampler(temporal, path);
+
+    vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+    mp.extras["upsampler_path"] = path;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    try {
+      (void)engine->Generate(FixtureGen(ws.root + "/temporal_ups"));
+      FAIL("a temporal upsampler checkpoint must be refused, not run for this phase");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("temporal_upsample=true") != std::string::npos);
+      CHECK(msg.find("SPATIAL") != std::string::npos);
+      // The message must not be the generic shape complaint — that is the
+      // failure mode this guard exists to replace.
+      CHECK(msg.find("the upsampled latent is") == std::string::npos);
+    }
+  }
   SUBCASE("with one, the render lands at the FULL requested size") {
     vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
     mp.extras["upsampler_path"] = ws.paths.upsampler;

@@ -1032,6 +1032,12 @@ def _detect_params_for(constants, parsed: tuple):
 # group) rather than changing it.
 _UPS_IN, _UPS_MID, _UPS_BLOCKS = 6, 32, 1
 _UPS_F, _UPS_H, _UPS_W = 2, 4, 6
+# The TEMPORAL arm gets its own frame count. 3 is the smallest that makes the
+# frame axis carry information the other two axes cannot supply: it differs from
+# H (4) and W (6), so an axis mix-up is a SHAPE failure rather than a value one,
+# and `2F - 1 = 5` differs from `2F = 6`, so the dropped first frame
+# (model.py:113) is visible in the shape as well as in the values.
+_UPS_TEMPORAL_F = 3
 
 
 def section_upsampler(out) -> None:
@@ -1120,6 +1126,65 @@ def section_upsampler(out) -> None:
     for size in (3, 5, 7):
         blur = BlurDownsample(dims=2, stride=2, kernel_size=size)
         emit_f32(out, f"kLtx2UpsBlurKernel{size}", blur.kernel.numpy())
+
+    # ---- the TEMPORAL x2 arm (model.py:68-71, 109-113) --------------------
+    #
+    # `spatial_upsample=False, temporal_upsample=True` selects
+    # `Conv3d(mid, 2*mid, k=3, p=1)` + `PixelShuffleND(1)`, and then `forward`
+    # DROPS THE FIRST FRAME. Everything else in the class is the same modules the
+    # three spatial arms above already gate.
+    from ltx_core.model.upsampler.pixel_shuffle import PixelShuffleND  # noqa: PLC0415
+
+    emit_scalar(out, "kLtx2UpsTemporalFrames", _UPS_TEMPORAL_F)
+    # `PixelShuffleND.__init__`'s `upscale_factors` default (pixel_shuffle.py:25),
+    # READ OFF upstream's own signature. No construction site passes one, so
+    # element 0 IS the shipped temporal factor and a change to it silently
+    # changes how many frames come out.
+    emit_scalar(
+        out,
+        "kLtx2UpsTemporalFactor",
+        inspect.signature(PixelShuffleND.__init__).parameters["upscale_factors"].default[0],
+    )
+    tcount = _UPS_IN * _UPS_TEMPORAL_F * _UPS_H * _UPS_W
+    tlatent = torch.from_numpy(make("ltx2.ups.temporal.latent", tcount, 1.0)).reshape(
+        1, _UPS_IN, _UPS_TEMPORAL_F, _UPS_H, _UPS_W
+    )
+    emit_f32(out, "kLtx2UpsTemporalLatent", tlatent.numpy())
+
+    temporal = LatentUpsampler(
+        in_channels=_UPS_IN,
+        mid_channels=_UPS_MID,
+        num_blocks_per_stage=_UPS_BLOCKS,
+        dims=3,
+        spatial_upsample=False,
+        temporal_upsample=True,
+        spatial_scale=2.0,
+        rational_resampler=False,
+    )
+    temporal.eval()
+    tmanifest = fill_module(temporal, "ltx2.ups.Temporal.")
+    tresult = temporal(tlatent)
+    emit_i64(out, "kLtx2UpsTemporalOutShape", list(tresult.shape))
+    emit_manifest(out, "kLtx2UpsTemporalParam", tmanifest)
+    emit_f32(out, "kLtx2UpsTemporalGolden", tresult.numpy())
+
+    # The spatial+temporal arm stays REFUSED (model.py:55-59: `8 * mid_channels`
+    # and `PixelShuffleND(3)`, a different operator). Its parameter shape is
+    # emitted anyway so the C++ refusal is gated against what upstream would
+    # actually build, not against a remembered description of it.
+    spatiotemporal = LatentUpsampler(
+        in_channels=_UPS_IN,
+        mid_channels=_UPS_MID,
+        num_blocks_per_stage=_UPS_BLOCKS,
+        dims=3,
+        spatial_upsample=True,
+        temporal_upsample=True,
+    )
+    emit_i64(
+        out,
+        "kLtx2UpsSpatiotemporalUpsamplerShape",
+        list(spatiotemporal.upsampler[0].weight.shape),
+    )
 
 
 # ---------------------------------------------------------------------------

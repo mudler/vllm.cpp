@@ -94,9 +94,11 @@ GDN-hybrid models call. Compressed conv/SSM state (bf16, the vLLM
 MoE-path coverage: `MoeRouterTopK` (f32/bf16 logits, ungrouped softmax, no
 bias), `MoeSiluMul`, `SharedExpertGate`, `MoeCombine`, and `MoeCombineGate`
 are native. All three combine/gate ops accept f32 and bf16 operands and
-refuse anything else with a named message (f16 is not a supported arm). The grouped quant expert GEMM (`kMatmulBTQuantGrouped`) is not
-registered yet, so models whose experts run keep-quant grouped GEMMs still
-throw there. On a
+refuse anything else with a named message (f16 is not a supported arm). The grouped quant expert GEMM (`kMatmulBTQuantGrouped`) and the non-grouped
+`kMatmulBTQuant` are native for the formats the lane's GGUFs carry
+(Q8_0/Q4_K/Q5_K/Q6_K); other keep-quant formats (Q4_0, Q2_K, Q3_K, the IQ
+family, MXFP4) keep their expand-bf16 residency on ROCm rather than throwing
+at forward time. On a
 discrete card there is no CPU fallback tier, so a model whose layers call an op
 that is not registered yet fails loudly with `vt: no kernel for op N on device
 type 5` — that is the memory-safety design working, not a crash. Run with

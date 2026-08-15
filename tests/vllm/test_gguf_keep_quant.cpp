@@ -60,8 +60,8 @@ using vllm::RouteGgufTensor;
 namespace {
 
 // ggml type ids (ggml/include/ggml.h:390-432).
-constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ8_0 = 8, kQ3_K = 11,
-                   kQ4_K = 12, kQ5_K = 13, kQ6_K = 14, kQ8_K = 15,
+constexpr uint32_t kF32 = 0, kF16 = 1, kQ4_0 = 2, kQ8_0 = 8, kQ2_K = 10,
+                   kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14, kQ8_K = 15,
                    kIQ2_S = 22, kIQ4_XS = 23, kBF16 = 30, kMXFP4 = 39;
 
 // Every executable weight encoding, with a K that is a whole number of blocks.
@@ -231,6 +231,40 @@ TEST_CASE("keep-quant expert split is lossless per expert") {
     CHECK(std::memcmp(slice.data(), whole.data() + e * per,
                       static_cast<size_t>(per) * sizeof(float)) == 0);
   }
+}
+
+TEST_CASE("keep-quant routing respects the RUNNING DEVICE's format set (review #523)") {
+  // Registering kMatmulBTQuant flips keep-quant loader-wide via the boolean
+  // GgufQuantComputeAvailable(), but a device's kernel set can be narrower
+  // than the CPU admission list. On ROCm exactly {Q8_0, Q4_K, Q5_K, Q6_K} are
+  // implemented; with no CPU fallback tier on a discrete card, an unsupported
+  // format that flipped to keep-quant would throw at FORWARD time with the
+  // model fully resident. The loader must keep the pre-existing expand_bf16
+  // residency for those formats instead.
+  const vt::DeviceType dev =
+      vllm::platforms::CurrentPlatform().device_type();
+  if (dev != vt::DeviceType::kROCM) {
+    MESSAGE("non-ROCm host (the device set is full there); the device-gated "
+            "arms are asserted on gfx1100");
+    return;
+  }
+  const std::vector<int64_t> shape = {4, 256};  // [out, in]: K = shape[1] = 256 elems, whole blocks
+  const auto route = [&](uint32_t ty) {
+    return RouteGgufTensor(/*keep_quant=*/true, /*keep_f16=*/true,
+                           /*nvfp4_fp4=*/false, /*cpu_ref=*/false,
+                           GgufTensorRole::kMatmulWeight, ty, shape);
+  };
+  // The supported set keeps quant residency (ggml type ids per the constants
+  // at the top of this file).
+  CHECK(route(kQ4_0) == GgufResidency::kExpandBf16);  // unsupported -> expand
+  CHECK(route(kQ8_0) == GgufResidency::kKeepQuant);
+  CHECK(route(kQ4_K) == GgufResidency::kKeepQuant);
+  CHECK(route(kQ5_K) == GgufResidency::kKeepQuant);
+  CHECK(route(kQ6_K) == GgufResidency::kKeepQuant);
+  CHECK(route(kQ2_K) == GgufResidency::kExpandBf16);  // owed, not silently kept
+  // keep-f16 must be OFF on ROCm: MatmulBTKernelRocm accepts bf16/f32 only.
+  const GgufLoadPolicy pol = GgufLoadPolicy::FromEnv();
+  CHECK(!pol.keep_f16);
 }
 
 TEST_CASE("keep-quant residency refuses ragged K and out-of-span slices") {
@@ -405,9 +439,19 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
         // --- the independent expectation ---
         // IQ2_S (256-elem, Q8_K-act) and MXFP4 (32-elem, Q8_0-act) are keep-quant
         // capable as of the UD-IQ2_M vehicle, so they route like the others.
-        const bool block_capable =
+        // The DEVICE axis (review #523): the running device's kernel set can be
+        // narrower than the loader's CPU-derived list — ROCm implements exactly
+        // {Q8_0, Q4_K, Q5_K, Q6_K}; the rest keep expand_bf16 there.
+        const bool cpu_capable =
             type == kQ4_0 || type == kQ8_0 || type == kQ3_K || type == kQ4_K ||
             type == kQ5_K || type == kQ6_K || type == kIQ2_S || type == kMXFP4;
+        const bool rocm =
+            vllm::platforms::CurrentPlatform().device_type() ==
+            vt::DeviceType::kROCM;
+        const bool device_capable =
+            !rocm || type == kQ8_0 || type == kQ4_K || type == kQ5_K ||
+            type == kQ6_K;
+        const bool block_capable = cpu_capable && device_capable;
         const int64_t blk =
             (type == kQ4_0 || type == kQ8_0 || type == kMXFP4) ? 32 : 256;
         bool expect_keep = false;
@@ -440,9 +484,13 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
     }
   }
   // Both outcomes are actually exercised (a table that never keeps anything
-  // would pass every assertion above vacuously).
-  CHECK(kept == 16);          // 8 block-capable encodings x 2 keep-capable roles
-  CHECK(expanded == 13 * 36 - 16);  // 13 types x (6 roles x 6 shapes) - kept
+  // would pass every assertion above vacuously). The kept count is
+  // device-dependent (review #523): 8 block-capable encodings x 2 keep-capable
+  // roles where the device covers the CPU list; 4 x 2 on ROCm.
+  const bool rocm_host =
+      vllm::platforms::CurrentPlatform().device_type() == vt::DeviceType::kROCM;
+  CHECK(kept == (rocm_host ? 8 : 16));
+  CHECK(expanded == 13 * 36 - (rocm_host ? 8 : 16));
 }
 
 TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {
@@ -466,6 +514,14 @@ TEST_CASE("tensors that are value- or layout-rewritten NEVER keep quant") {
 TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   ::unsetenv("VT_CPU_REF");
   ::unsetenv("VT_GGUF_KEEP_QUANT");
+  // keep_f16 additionally requires an f16-capable MatmulBT on the running
+  // device (review #523): the ROCm kernel accepts bf16/f32 only, so keep_f16
+  // is OFF on ROCm regardless of expand_nk.
+  const bool f16_device_ok =
+      vllm::platforms::CurrentPlatform().device_type() != vt::DeviceType::kROCM;
+  const auto keep_f16_expected = [&](const GgufLoadPolicy& q) {
+    return q.expand_nk && f16_device_ok;
+  };
   {
     // PRODUCTION DEFAULT SINCE CIQ G4: keep-quant follows the running device's
     // ability to EXECUTE the quantized GEMM. The expectation is derived from
@@ -493,7 +549,7 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
     // becomes a live question for QUANT-GGUF-KEEPQ-LOADER. Should that happen,
     // THIS assertion is one of the things that has to change, so it is flagged
     // here rather than discovered when it goes red.
-    CHECK(p.keep_f16 == vllm::GgufQuantComputeAvailable());
+    CHECK(p.keep_f16 == (vllm::GgufQuantComputeAvailable() && f16_device_ok));
     CHECK_FALSE(p.cpu_ref);
   }
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
@@ -503,7 +559,7 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   // NB compare to expand_nk, NOT GgufQuantComputeAvailable(): with keep-quant
   // env-forced, expand_nk holds even on a CUDA build where the quant GEMM is
   // unregistered (GgufQuantComputeAvailable() is false there).
-  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == GgufLoadPolicy::FromEnv().expand_nk);
+  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == keep_f16_expected(GgufLoadPolicy::FromEnv()));
   // The opt-out must work after the default flip.
   ::setenv("VT_GGUF_KEEP_F16", "0", 1);
   CHECK_FALSE(GgufLoadPolicy::FromEnv().keep_f16);
@@ -520,11 +576,11 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
   // it is inert with keep-quant off (nothing to keep) or under VT_CPU_REF.
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);
   ::setenv("VT_GGUF_KEEP_F16", "1", 1);
-  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == GgufLoadPolicy::FromEnv().expand_nk);
+  CHECK(GgufLoadPolicy::FromEnv().keep_f16 == keep_f16_expected(GgufLoadPolicy::FromEnv()));
   for (const char* on : {"1", "true", "on"}) {
     ::setenv("VT_GGUF_KEEP_F16", on, 1);
     CAPTURE(on);
-    CHECK(GgufLoadPolicy::FromEnv().keep_f16 == GgufLoadPolicy::FromEnv().expand_nk);
+    CHECK(GgufLoadPolicy::FromEnv().keep_f16 == keep_f16_expected(GgufLoadPolicy::FromEnv()));
   }
   ::unsetenv("VT_GGUF_KEEP_F16");
   ::setenv("VT_GGUF_KEEP_QUANT", "1", 1);

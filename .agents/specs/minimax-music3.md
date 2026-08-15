@@ -1185,6 +1185,22 @@ checkpoint itself instead — 44100 Hz, hop 512, vocab 200000, 8 codebooks, read
 from the component `config.json` files in milliseconds — which holds under any
 invocation.
 
+**All three arms, measured on this box 2026-08-15**, so the difference between
+them is visible rather than asserted:
+
+| arm | cases | assertions | what ran |
+|---|---|---|---|
+| no env vars | 9 | **37** | the checkpoint-free half only. Was 5 / **0** |
+| `VLLM_CPP_MUSIC3_CHECKPOINT` | 9 | **86** | + decode, WAV and condition-mix; `checkpoint_arms_run=3` |
+| + `VLLM_CPP_MUSIC3_DIT=1` | 9 | **582** | + the full tail and the music-only server over a real socket; `checkpoint_arms_run=5` |
+
+The full arm's own numbers: `POST /v1/audio/speech -> 200 audio/wav, 12332 bytes
+in 518.0 s wall`; 2 AR frames -> 6 latent frames -> 3072 samples per channel
+(0.0697 s); 6144 int16 samples, all non-zero, 0 clipped, 2818 of 3072 positions
+differing between left and right; and `/v1/completions` and
+`/v1/chat/completions` both 404 from the route table, which is the music-only
+claim made over the wire against the real 28.5 GB engine rather than a stub.
+
 ### 10.4 The weights are documented (porting-a-model.md §2.1)
 
 `docs/USAGE.md` carries the tables the H3 sections already carried, one row per

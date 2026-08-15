@@ -549,10 +549,10 @@ jobs:
           if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
             echo "no usable diff range on the $EVENT_NAME lane: base=${base:-<empty>}"
             echo "checking the tip commit alone rather than passing vacuously."
-            git log -1 --format=%B "$head" > "$(mktemp)" &&               python3 scripts/check-commit-trailers.py --range "${head}~1..${head}"
+            python3 scripts/check-commit-trailers.py --range "$head~1..$head"
           else
             echo "strict trailer walk over ${base}..${head}"
-            python3 scripts/check-commit-trailers.py --range "${base}..${head}"
+            python3 scripts/check-commit-trailers.py --range "$base..$head"
           fi
           # `squash_merge_commit_message = PR_BODY` makes the pull request body
           # the landed commit message, so it is held to the contract its commit

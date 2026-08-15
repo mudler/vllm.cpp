@@ -21606,3 +21606,56 @@ Note the asymmetry with the row's sibling `ENG-HYBRID-PLACEMENT`: there, W0/W1
 are the blocked measurements and the correctness work follows them. Here it is
 inverted, W0-W5 are all reachable on GB10 and only W6 is blocked, which is why
 this row is the safer of the two to start.
+
+## SPEC-DSPARK: the ORACLE varies 20% BETWEEN INVOCATIONS, and every recorded ratio used ONE (2026-08-15)
+
+The environment was rebuilt from nothing after the reimage (our engine, both
+checkpoints at the pinned revision, and the TRUE pinned oracle
+`0.23.1rc1.dev1511+g555967922` + torch 2.13.0+cu130 + flashinfer 0.6.15.post1,
+built from source because `vllm==0.26.0` hard-pins torch==2.11.0 and would have
+been a different denominator). The first paired run on it produced this:
+
+| arm | median tok/s |
+|---|---|
+| ours (4 arms) | 141.9 / 140.7 / 141.8 / 142.3 -- **~1% total spread** |
+| ORACLE invocation 1 | **145.4** (bimodal 145/154, cold draws 108.8 and 128.6) |
+| ORACLE invocation 2 | **174.3** (tight, unimodal) |
+
+Same boot, same stack, same prompt, minutes apart. **The ratio is 0.98 against
+invocation 1 and 0.82 against invocation 2**, so which oracle you run decides the
+answer.
+
+HYPOTHESIS TESTED AND REFUTED. The obvious explanation was a torch.compile /
+flashinfer cache warming between invocations. It is wrong: the caches live at
+`/root/.cache/vllm` and `/root/.cache/flashinfer` INSIDE the container, which
+`docker run --rm` discards, and the host's `~/.cache/vllm` stayed at **24K**
+across all four invocations. Both the 145 and the 174 run paid FULL JIT
+compilation. The spread is therefore unexplained, not benign.
+
+The confirmation probe (invocations 3 and 4) could not settle it: both died
+RC=1 with flashinfer JIT emitting 2 `FAILED` compiles for `gen_gemm_sm120`
+kernels, an unrelated failure.
+
+WHY THIS MATTERS BEYOND THIS RUN: **every ratio this row has recorded --
+0.9757, 0.9646, 0.9569, 0.9889 -- was taken with exactly ONE oracle invocation
+per paired run.** If the oracle can vary 20% between invocations, a single draw
+does not characterise the denominator, and the drift gate this row applies to
+OUR arms has no counterpart on the oracle side. The recorded ratios are not
+thereby wrong, but their error bars are unknown and are wider than the +/-0.01
+this file has been quoting.
+
+WHAT IS SOLID: our engine measures extremely stably on the rebuilt stack -- four
+independent arms within ~1%, medians within 0.4%, tighter than anything before
+the reimage. The instability is on the ORACLE side and it is now visible instead
+of hidden inside a single cold invocation.
+
+OWED BEFORE ANY FURTHER PARITY CLAIM:
+  1. N>=5 oracle invocations per paired run, with the same drift/dispersion gate
+     applied to the oracle that is applied to ours.
+  2. A fix or explanation for the flashinfer `gen_gemm_sm120` JIT failures, since
+     a partial fallback would change which kernels the oracle actually runs.
+  3. Persisting the container caches (mount `/root/.cache`) so JIT cost is not
+     re-paid per invocation, and re-testing whether the spread survives that.
+
+STATUS: parity remains UNMEASURED on the rebuilt stack. Not 0.98, not 0.82 --
+unmeasured, because picking between them is picking the answer.

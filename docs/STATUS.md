@@ -580,15 +580,24 @@ take can only raise the plateau; any MoE comparison that lets routing vary
 between arms measures the draw, not the change; and both blocks AND distinct
 experts must be controlled, since cost per distinct expert spans 4.47-7.50 us
 and is flat only above ~40 experts. NOT parity, and the row stays open.
-MEASUREMENT IS CURRENTLY IMPOSSIBLE: the gate host was REIMAGED on 2026-08-14
-(new COS partition layout, /home created 13:37 UTC, ~/work empty), destroying
-the pinned oracle venv, the pinned vLLM source, the 35B and draft checkpoints,
-our engine build and every run log, so the Evidence paths in the benchmark
-record point at nothing. The RESULTS stand, because the harnesses
-(scripts/marlin-moe-standalone.py, benchmarks/marlin_moe_standalone.cpp,
-scripts/dspark-paired-e2e.sh) and the per-rep values are in-tree; resuming
-needs the checkpoints re-fetched, the oracle rebuilt at pinned commit
-555967922, and its identity re-asserted before any number is trusted.
+The environment was REBUILT after the reimage (engine, both checkpoints at the
+pinned revision, and the TRUE pinned oracle 555967922 + torch 2.13.0 +
+flashinfer 0.6.15.post1, built from source because vllm==0.26.0 hard-pins
+torch==2.11.0 and would be a different denominator). On it our engine measures
+very stably -- four arms within ~1%, medians within 0.4% -- but THE ORACLE
+VARIES 20% BETWEEN INVOCATIONS on one boot (145.4 then 174.3 tok/s), which
+puts the ratio at 0.98 or 0.82 depending on which invocation is used. The
+compile-cache explanation is REFUTED: those caches live inside the container
+and are discarded by --rm, and the host cache stayed at 24K, so both
+invocations paid full JIT. This matters beyond one run, because every ratio
+this row has recorded used exactly ONE oracle invocation, so the drift gate
+applied to our arms has no counterpart on the denominator and the quoted
++/-0.01 error bars are too narrow. Parity is therefore UNMEASURED on the
+rebuilt stack -- not 0.98, not 0.82 -- pending N>=5 oracle invocations per
+pair with a dispersion gate, an explanation for the flashinfer gen_gemm_sm120
+JIT failures, and persisted container caches.
+
+
 
 Multimodal
 (image/video/audio) is correctness-complete and its OpenAI-server wiring has

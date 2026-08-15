@@ -1330,9 +1330,24 @@ identical to one built before it existed. See
 
 ### Speech and music generation
 
+A **music-only server**, which is what you almost certainly want:
+
+    vllm-server --speech-model /path/to/minimax-music3 \
+      [--speech-family minimax-music3] [--port 8000]
+
+**`--model` is not required here**, and that is deliberate. Upstream's own recipe
+is `sgl-omni serve --model MiniMaxAI/MiniMax-Music3` and nothing else: a music
+model is not an accessory to a text model. With `--speech-model` alone this
+server loads the music checkpoint, registers `/v1/audio/speech`, and registers
+**nothing else** — no `/v1/completions`, no `/v1/chat/completions`. That is the
+same task-conditional shape a pooling checkpoint (`/v1/embeddings` only) and a
+Parakeet checkpoint (`/v1/audio/transcriptions` only) already take here, and the
+same one vLLM's `api_server.py:255-265` uses.
+
+Attach it to a text server instead, and one process serves both surfaces:
+
     vllm-server --model /path/to/text-model \
-      --speech-model /path/to/minimax-music3 \
-      [--speech-family minimax-music3]
+      --speech-model /path/to/minimax-music3
 
 `--speech-model` names the checkpoint **set** — MiniMax-Music3 ships six
 component directories beside a `modular_model_index.json`, so this is not a
@@ -1340,7 +1355,25 @@ single model directory. `--speech-family` is optional: omitted, the family is
 **detected** by inspecting the artifact, and a directory no registered family
 claims is refused at startup naming every family that was tried. A name that is
 not registered is refused too; it is never treated as a hint, because the wrong
-family would not fail — it would render noise.
+family would not fail — it would render noise. `--speech-family` without
+`--speech-model` is still an error: there is nothing to load it from.
+
+In the speech-only form the served model name defaults to the **family**
+(`minimax-music3`) rather than to a directory basename, because there is no
+`config.json` to take one from. `--served-model-name` still wins.
+
+Or skip HTTP entirely. `minimax-music3-gen` drives the same seam through the C
+ABI and writes the WAV itself:
+
+    minimax-music3-gen --model /path/to/minimax-music3 --out song.wav \
+      --lyrics @lyrics.txt --description "Genre: acoustic pop. BPM: 96." \
+      --duration 8 --steps 8 --seed 7
+
+`--lyrics` and `--description` take literal text or `@path` to read a file,
+because lyrics are multi-line and a `[Verse]` tag inside an argv is easy to
+mangle. It prints the delivered length, rate, channels, RMS, peak and wall clock
+to stderr — the *delivered* length, not the requested one, because a duration
+resolves to a whole number of 25 Hz frames and is therefore quantized.
 
 The route is OpenAI's `createSpeech` shape, with the two **music** inputs as
 additional named fields:
@@ -1357,26 +1390,45 @@ The response body is RIFF/WAVE 16-bit PCM at the family's **native** rate
 (44100 Hz stereo for MiniMax-Music3, never resampled), with content type
 `audio/wav`.
 
+**Every field, and what it does.** Anything not in this table is refused by name
+rather than ignored — see below the table for why that polarity matters here.
+
+| field | type | default | what it does |
+|---|---|---|---|
+| `lyrics` | string | **required** for MiniMax-Music3 | the sung text, with `[Verse]` / `[Chorus]` section tags. An empty lyric normalizes to a bare `[start]` prompt, so it is a 400 rather than an instrumental |
+| `description` (alias `prompt`) | string | **required** for MiniMax-Music3 | genre, BPM, key, instrumentation, mood. NOT a voice or speaker description. Supplying both spellings with different values is a 400, never a silent winner |
+| `audio_duration` (alias `duration`) | number, seconds | `60` | resolved to `int(seconds x 25)` autoregressive frames, then **clamped** to the 9000-frame ceiling — the same silent clamp upstream applies (`encoders.py:287`). Shorter than one frame (0.04 s) is a 400 |
+| `num_inference_steps` | integer | `30` | flow-matching Euler steps in the acoustic half. Must be > 0 |
+| `guidance_scale` | number | `1.7` | classifier-free guidance on the DiT. **0 is legal** and selects the unconditional branch, so omitting the field is how you ask for the default — not sending 0 |
+| `seed` | integer | `0` | seeds the autoregressive top-k draw *and* the initial denoise latents. A fixed seed, not a random one: 0 is as deterministic as any other value |
+| `model` | string | — | echoed; the route does not check it |
+| `response_format` | string | `"wav"` | `"wav"` is the only accepted value |
+
 `lyrics` and `description` are separate fields rather than one `input` behind a
-separator because upstream runs a different normalizer over each. A
-one-utterance family keeps using OpenAI's `input`. `prompt` is the documented
-alias for `description`, and supplying both with different values is a 400
-rather than a silent winner.
+separator because upstream runs a different normalizer over each — `_clean_caption`
+on the description, `_normalize_lyrics` on the lyrics (`encoders.py:54-91`). A
+one-utterance family keeps using OpenAI's `input`; MiniMax-Music3 refuses it, so
+a request cannot half-arrive.
 
-The duration key is `audio_duration`, in seconds, with `duration` accepted as an
-alias. Omit it and the family's own default applies, which is 60 s for
-MiniMax-Music3. **`audio_duration_s` is refused**: that is the name of the field
-the key fills, not a key, and accepting it would return the default duration
-behind a 200 with nothing to tell the caller its request had been dropped. That
-is not hypothetical, it cost this project's own end-to-end gate four multi-hour
-runs, because 0.1 s silently became 60 s.
+**We expose `guidance_scale` where neither upstream arm does.** In diffusers it
+is frozen into the guider component at 1.7 (`denoise.py:180`); in SGLang-Omni it
+is a serve-time knob (`dit_cfg_scale`) and not a request field. It is a genuine
+per-request control here, and its default is upstream's 1.7.
 
-Refused by name rather than ignored, because honouring any of them silently
-would return audio the caller did not ask for: `voice` (no registered family
-exposes named voices), `speed` (no family implements a rate control), `stream` /
-`stream_format` (MiniMax-Music3 generates the whole song before the first sample
-exists, so buffering it would be a stream in name only) and any
-`response_format` other than `"wav"` (no mp3/opus/aac/flac encoder is vendored).
+**Every refusal, and the one rule behind them.** A knob the server will not
+honour must not come back behind a 200. Silently dropping one returns audio the
+caller did not ask for with nothing to say so — and this project has already paid
+for that once (#925), which is why the list is long rather than convenient.
+
+| refused | why |
+|---|---|
+| `audio_duration_s` | the name of the *field* the key fills, not a key. It is the misspelling you reach for by reading the struct instead of the docs, and dropping it silently returned the 60 s default: 0.1 s became 60 s, 2 autoregressive frames became 1500, and this project's own e2e gate spent four multi-hour runs inside a 750x job it read as a hung weight load (#852, #925) |
+| `voice` | no registered family exposes named voices, and there is no enumeration endpoint to pick one from. Upstream refuses it too (`request_builders.py:90-92`) |
+| `speed` | no family implements a rate control. Upstream accepts only `1.0` (`request_builders.py:83-89`) |
+| `stream`, `stream_format` | MiniMax-Music3 generates the whole song before the first sample exists, so buffering it into chunks would be a stream in name only. **Upstream has no streaming either** — SGLang-Omni declares `supports_streaming_vocoder=False` and rejects `stream=true` by name (`request_builders.py:115-116`) |
+| `response_format` other than `"wav"` | no mp3/opus/aac/flac encoder is vendored, and relabelling RIFF bytes is worse than refusing |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty` | this model's autoregressive stage has ONE sampler — a fixed top-50 draw (`encoders.py:48,94-103`). There is no temperature to set and no nucleus branch to widen, so the knob can be neither honoured nor honestly ignored. Upstream refuses all four (`request_builders.py:14-19,109-114`). Use `seed` to control the draw |
+| `max_new_tokens` | SGLang-Omni's spelling of the length, counted in 25 Hz **frames** rather than seconds (`request_builders.py:56-68`). This route takes `audio_duration` in seconds — divide by 25. Two spellings of one meaning on one route is exactly what #925 was |
 
 A family with no text-only synthesis — IndexTTS-2.5 is one — is refused
 **before** anything stages: the route asks the loaded engine's
@@ -1387,10 +1439,26 @@ WAV.
 **Every stage of MiniMax-Music3 is implemented and gated**, and a request
 reaches all of them: the 8.6B `Qwen3ForCausalLM` autoregressive stage, the RVQ
 depth decoder, the learned condition mix, the flow-matching DiT and the DAC
-Flow-VAE vocoder. **A composed request has not yet been observed to completion
-on CPU** — see the caveat below, and `.agents/specs/minimax-music3.md`. There is
-no by-name refusal left: nothing here is unimplemented. IndexTTS-2.5 still
-refuses naming its own missing pieces.
+Flow-VAE vocoder. **A composed request has been observed to completion** — an
+HTTP POST returns a real 44100 Hz stereo WAV (#852) — and the end-to-end gate
+now runs it over a real socket against a music-only server. There is no by-name
+refusal left: nothing here is unimplemented. IndexTTS-2.5 still refuses naming
+its own missing pieces.
+
+**What no gate compares is the music itself.** The autoregressive codes are a
+seeded `torch.multinomial` draw and the denoise loop's initial latents are a
+seeded normal draw, so a request's waveform can never equal the oracle's golden
+— twice over, and structurally rather than by omission. Every *stage* is gated
+against the capture on the capture's own recorded inputs; a **generated** song
+is evidence that the pipeline runs, not that the notes are right. Believe the
+stage gates, and listen with that in mind.
+
+**Ask for less than 8 seconds while you are exploring.** `Music3ChunkPlan` only
+splits past 200 autoregressive frames, which is 8 s of audio, and the
+multi-window composition — the overlap blend, the carry span, the waveform crop
+across windows — is this row's one named coverage gap: each primitive is gated
+individually, the composition across windows is not, because the oracle capture
+is a single 25-frame window.
 
 **It runs on CPU and it is slow.** Every gate this row has was taken on CPU
 (`dgx.casa` was down throughout), and the acoustic half is upstream's own fp32.
@@ -2633,6 +2701,112 @@ NVFP4) and misses `.bias` (BF16, so a different unpack path) while the config
 still says the projection is biased. Without the refusal that renders a plausible
 video for the wrong prompt: every conditioning row is shifted by the missing bias
 and every padded row projects to 0 instead of to the bias.
+
+## MiniMax-Music3: the exact weights (so a song is reproducible)
+
+**The repository is 57.4 GB and the arm we load is 28.5 GB**, because
+`MiniMaxAI/MiniMax-Music3` ships the same weights **twice**: a native
+`AbabForCausalLM` + `.pth` layout that SGLang-Omni serves, and a `diffusers`
+six-component layout. They are the same numbers in a different arrangement —
+diffusers' own `scripts/convert_minimax_music3_to_diffusers.py` renames tensors
+and does nothing else — and this port loads the diffusers one. So the download
+is 57.4 GB unless you filter, and what has to fit is 28.5 GB.
+
+### The arm that loads: `diffusers`, bf16 + fp32
+
+Repository [MiniMaxAI/MiniMax-Music3](https://huggingface.co/MiniMaxAI/MiniMax-Music3),
+revision **`fbdf52fbaaca799592917417eb05f1899f1255ec`**. First-party. A repo id
+alone is not a pin — checkpoints do get re-quantized in place under an unchanged
+name — so the revision is recorded, and it was verified rather than copied:
+`condition_encoder/diffusion_pytorch_model.safetensors` on disk here hashes to
+`83179c5eaa9a68a370affe0c1b96c2179f659ea4175666b31071490a202c2a4d`, which is
+that revision's own LFS record for the file.
+
+| component | file(s) | size | dtype on disk |
+|---|---|---|---|
+| `language_model/` | `model-0000{1,2,3,4}-of-00004.safetensors` + index | **17.17 GB** | BF16 |
+| `transformer/` | `diffusion_pytorch_model-0000{1,2}-of-00002.safetensors` + index | **9.73 GB** | **F32** |
+| `rvq_depth_decoder/` | `diffusion_pytorch_model.safetensors` | **1.29 GB** | BF16 |
+| `vocoder/` | `diffusion_pytorch_model.safetensors` | **217 MB** | F32 |
+| `condition_encoder/` | `diffusion_pytorch_model.safetensors` | **101 MB** | F32 |
+| `tokenizer/` | `tokenizer.json` + `tokenizer_config.json` + `chat_template.jinja` | **11 MB** | — |
+| `scheduler/` | `scheduler_config.json` | 483 B | — |
+| `` (root) | `modular_model_index.json`, `config.json`, `README.md` | 14 KB | — |
+| | **resident total** | **28.5 GB** (28 517 617 303 B) | |
+
+The transformer being 9.73 GB for a 2.4B model is **fp32 storage, not a 4.9B
+model** — that is upstream's own choice for the acoustic half and we mirror it.
+The download:
+
+    hf download MiniMaxAI/MiniMax-Music3 --revision fbdf52fb \
+      --local-dir "$CHECKPOINT_ROOT/minimax-music3" \
+      --exclude 'qwen_7B/*' '*.pth'
+
+Two components are BF16 and three are F32, and **that set is not runnable as
+stored**. Upstream casts in exactly two places, so the language model, the RVQ
+depth decoder and the condition encoder must share one dtype; the gated
+configuration is bf16 for those three and fp32 for the transformer and vocoder.
+The loader enforces it and refuses a violation by name. The section below has
+the detail.
+
+### The arm that is REFUSED: the native `.pth` layout
+
+The same repository's other 28.9 GB. **We refuse it by name** — a tree in this
+shape is diagnosed as the native arm, told which diffusers components it lacks,
+and pointed at the conversion script. It is never silently mis-loaded.
+
+| file | size | what it holds |
+|---|---|---|
+| `qwen_7B/qwen_7B/` | ~17 GB | `AbabForCausalLM` shards; the RVQ depth decoder and the audio embedding live *inside* them as `model.audio_decoder.*` / `model.audio_extra_embedding` |
+| `flowmatching_vae.pth` | ~9.7 GB | the DiT plus the condition projection |
+| `dav.pth` | ~0.2 GB | the DAC Flow-VAE decoder |
+
+**SGLang-Omni serves this arm exclusively.** If you are comparing against
+`sgl-omni serve`, that is the layout it reads — same weights, so the comparison
+is valid, but not the same files.
+
+### The quantized arm that IS implemented: GGUF Q4_K, one component
+
+| field | value |
+|---|---|
+| repo | [audio-cpp/MiniMax-Music3-GGUF](https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF) — **third party**, not MiniMaxAI |
+| revision | `c36aaeed683f33b05796788e4204f4eeba8fa547` |
+| file | `rvq_depth_decoder_q4_k.gguf` |
+| size | 405 752 480 bytes (406 MB, against 1.29 GB bf16) |
+| sha256 | `4c5d41b27418d9c1046345f649cb61d7cde0e3bbda4af7f7cb142df2c70cbdd0` |
+| contents | 47 tensors: 36 Q4_K projections, 9 BF16 norms, 2 F16 embedding tables |
+
+It is the **only** quantized arm implemented, and one component is not a
+quantized model. The remaining four are refused by name and owed; the section
+"MiniMax-Music3: the quantized arms" below records what each refusal says.
+
+### The quantized arms that are REFUSED — and they are all third-party
+
+**MiniMaxAI ships bf16/fp32 only.** A HuggingFace survey on 2026-08-14 found
+**fourteen community repositories in five formats**, published within days of the
+release, and none of them is from the model's authors. Every one carries
+different provenance from a first-party release, and every one except the single
+Q4_K file above is refused by name.
+
+| format | repositories | coverage | state |
+|---|---|---|---|
+| GGUF, `audiocpp` lineage | [audio-cpp/MiniMax-Music3-GGUF](https://huggingface.co/audio-cpp/MiniMax-Music3-GGUF) | all five components, bf16 and Q4_K arms | `rvq_depth_decoder_q4_k` **LOADS**; `transformer_q4_k` (1 396 MB), `language_model_q4_k` (7 184 MB), `vocoder` (217 MB) and `condition_encoder` (101 MB) are **OWED**. Note the last two are bf16 GGUF, not k-quant — same size as the safetensors, so they buy nothing |
+| GGUF, `mm3` lineage | [scragnog/MiniMax-Music3-GGUF](https://huggingface.co/scragnog/MiniMax-Music3-GGUF) | 2-file split (`mm3-lm-*` / `mm3-synth-*`), 13 tiers incl. MXFP4 and NVFP4 as GGML tensor types | **REFUSED**: needs a rename table *plus* fused QKV to split and folded weight-norm to invert. Its NVFP4 tier uses GGML type id 40, which is not a standard llama.cpp id |
+| GGUF, ComfyUI lineage | [Abiray](https://huggingface.co/Abiray), [realrebelai/MiniMax-Music-3_GGUFs](https://huggingface.co/realrebelai/MiniMax-Music-3_GGUFs), [molbal](https://huggingface.co/molbal), [ChrisColeTech](https://huggingface.co/ChrisColeTech) | the 2.46B **DiT alone**, Q2_K…Q8_0, 0.9-2.7 GB | **REFUSED, and it can never be a complete arm**: these files carry the DiT and condition encoder only — no language model, no depth decoder, no vocoder — so even a finished GGUF arm would not make them generate audio |
+| int8 / w4a8 | [Comfy-Org/MiniMax-Music-3](https://huggingface.co/Comfy-Org/MiniMax-Music-3) (`_int8_convrot`), [NidAll/MiniMax-Music3-W4A8](https://huggingface.co/NidAll/MiniMax-Music3-W4A8), [dummy9996/…-w4a8-bf16-comfyui](https://huggingface.co/dummy9996) | DiT | **REFUSED** by name |
+| MLX 4/6/8-bit | [ddalcu](https://huggingface.co/ddalcu), [vanch007](https://huggingface.co/vanch007), [elishabjm](https://huggingface.co/elishabjm) | | **REFUSED**: MLX is a shared seam this project implements for no model, so it is not a per-model addition |
+| proprietary | [infosave/MiniMax-Music-3-cmf](https://huggingface.co/infosave/MiniMax-Music-3-cmf) (Cortiq 4-bit) | | **not implementable**, recorded rather than owed |
+
+**"The GGUF arm" is three mutually incompatible lineages, and
+`general.architecture` cannot separate them** — it reads `audiocpp`, `mm3`,
+`qwen3` and `wan` across files of the same model, and `wan` collides with genuine
+Wan video GGUFs. That is why the detector keys on
+`audiocpp.model_spec.family` instead, and why pointing a `.gguf` at this loader
+gets a refusal naming the lineage rather than a shape error.
+
+**NOT found** by those queries on that date: AWQ, GPTQ, compressed-tensors, fp8 /
+`fp8_e4m3fn` / `fp8_scaled`, bitsandbytes. That is "not found by these queries on
+this date", never "does not exist".
 
 ## MiniMax-Music3: the checkpoint loader
 

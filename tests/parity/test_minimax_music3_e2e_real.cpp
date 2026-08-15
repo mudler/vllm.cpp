@@ -55,7 +55,14 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+
+// The socket cases below drive the REAL cpp-httplib transport, the same one
+// `vllm-server` binds. This file already depends on the server being built
+// (`ApiServer::handle_audio_speech` lives behind the same gate), so the client
+// header adds no dependency the suite did not already have.
+#include <httplib/httplib.h>
 
 #include "npy.h"
 #include "vllm/entrypoints/openai/api_server.h"
@@ -83,6 +90,26 @@ constexpr int64_t kFrames = 25;
 constexpr int64_t kFrameHiddenRow = 8 * 4096;
 constexpr int64_t kDenoiseSteps = 4;
 constexpr int64_t kSampleRate = 44100;
+
+// ONE request body, used by the stub-synthesizer socket case AND by the real
+// checkpoint case, so the two cannot drift into testing different requests.
+//
+// The duration key is `audio_duration`. This body used to spell it
+// `audio_duration_s` — the name of the FIELD it fills — which the parser did not
+// read, so the request fell back to the family's 60 s default: 1500 AR frames
+// instead of 2, eight denoise windows instead of one, and 5167 vocoder latents
+// instead of 6. That is the 750x job three runs were killed inside and reported
+// as a hung weight load (#852). The parser now REFUSES the misspelling, and the
+// checkpoint-free case above asserts that refusal.
+constexpr const char* kMusic3RequestBody = R"({
+    "model": "minimax-music3",
+    "lyrics": "[verse]\nMorning light\n",
+    "description": "Genre: acoustic pop. BPM: 96.",
+    "audio_duration": 0.1,
+    "num_inference_steps": 2,
+    "seed": 7,
+    "response_format": "wav"
+  })";
 
 // ─── The bounds ─────────────────────────────────────────────────────────────
 //
@@ -323,7 +350,157 @@ uint16_t ReadU16(const std::string& wav, size_t offset) {
                                (static_cast<unsigned char>(wav[offset + 1]) << 8));
 }
 
+// Set by every case that actually examined the 27 GB checkpoint, and READ by
+// the coverage-report case at the bottom of this file. It is what turns "this
+// suite reported no failures" into "this suite reported what it examined": with
+// the checkpoint present but the checkpoint cases hollowed out, the report
+// REDS, and with the checkpoint absent it says so in one line a human and a log
+// scraper can both find.
+int g_checkpoint_arms_run = 0;
+
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// THE CHECKPOINT-FREE HALF — runs in CI, unconditionally, every time.
+//
+// Everything below this banner needs no weights, no network and no goldens, and
+// it is separated out for a reason that is not tidiness. Before it existed this
+// file reported `test cases: 5 | 5 passed | 0 failed` and `assertions: 0`
+// whenever the checkpoint was absent, which is a skip wearing a pass: five
+// green case names, nothing examined. Splitting the suite means the parts a
+// machine can always check are always checked, and the parts that need 27 GB
+// are visibly the only ones that can go unexamined.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("music3 e2e: the REQUEST CONTRACT holds with no checkpoint") {
+  // The exact body the checkpoint case posts, parsed through the code HTTP
+  // runs. A field that stopped landing here would make every downstream
+  // assertion in this file a claim about the wrong request.
+  const vllm::openai::SpeechRequest request = vllm::openai::ParseSpeechRequest(R"({
+    "model": "minimax-music3",
+    "lyrics": "[verse]\nMorning light\n",
+    "description": "Genre: acoustic pop. BPM: 96.",
+    "audio_duration": 0.1,
+    "num_inference_steps": 2,
+    "seed": 7,
+    "response_format": "wav"
+  })");
+  CHECK(request.lyrics == "[verse]\nMorning light\n");
+  CHECK(request.description == "Genre: acoustic pop. BPM: 96.");
+  CHECK(request.audio_duration_s == doctest::Approx(0.1));
+  CHECK(request.num_inference_steps == 2);
+  CHECK(request.seed == 7);
+  CHECK(request.text.empty());  // Music3 REFUSES `input`; it must not arrive filled
+
+  // The near-miss key that cost this row four multi-hour runs (#852, #925). It
+  // is asserted HERE, in the file whose own body carried the misspelling, so
+  // the regression cannot come back through the door it came through.
+  CHECK_THROWS(vllm::openai::ParseSpeechRequest(
+      R"({"lyrics":"x","audio_duration_s":0.1})"));
+
+  // The knobs upstream refuses and we used to drop silently (#672 parity sweep).
+  CHECK_THROWS(vllm::openai::ParseSpeechRequest(R"({"lyrics":"x","temperature":0.7})"));
+  CHECK_THROWS(vllm::openai::ParseSpeechRequest(R"({"lyrics":"x","top_p":0.9})"));
+  CHECK_THROWS(vllm::openai::ParseSpeechRequest(R"({"lyrics":"x","max_new_tokens":250})"));
+  CHECK_THROWS(vllm::openai::ParseSpeechRequest(R"({"lyrics":"x","stream":true})"));
+  CHECK_THROWS(vllm::openai::ParseSpeechRequest(R"({"lyrics":"x","voice":"alloy"})"));
+  CHECK_THROWS(vllm::openai::ParseSpeechRequest(R"({"lyrics":"x","speed":1.5})"));
+  CHECK_THROWS(
+      vllm::openai::ParseSpeechRequest(R"({"lyrics":"x","response_format":"mp3"})"));
+}
+
+TEST_CASE("music3 e2e: the DURATION arithmetic holds with no checkpoint") {
+  // The request's `audio_duration` becomes AR frames, and this is the step that
+  // turned 0.1 s into 60 s when the key was dropped. It is pure arithmetic over
+  // the 25 Hz frame rate, so it needs no weights — and it pins the two ceilings
+  // spec §7 says are "enforced, not discovered".
+  constexpr double kFrameRate = 25.0;  // condition_encoder 24000 / 960
+  CHECK(m3::MaxArFrames(0.1, kFrameRate) == 2);
+  CHECK(m3::MaxArFrames(60.0, kFrameRate) == 1500);  // the family default
+  // The 9000-frame ceiling CLAMPS rather than throwing, which is upstream's own
+  // behaviour (`min(int(audio_duration * frame_rate), 9000)`, encoders.py:287).
+  // Refusing where upstream clamps would be a divergence a user hits at six
+  // minutes of music.
+  CHECK(m3::MaxArFrames(360.0, kFrameRate) == 9000);
+  CHECK(m3::MaxArFrames(3600.0, kFrameRate) == 9000);
+  // Below one frame, and non-positive, are upstream's two errors.
+  CHECK_THROWS(m3::MaxArFrames(0.01, kFrameRate));
+  CHECK_THROWS(m3::MaxArFrames(0.0, kFrameRate));
+  CHECK_THROWS(m3::MaxArFrames(-1.0, kFrameRate));
+}
+
+TEST_CASE("music3 e2e: a SPEECH-ONLY server serves a WAV over a real socket") {
+  // `vllm-server --speech-model <dir>` with NO `--model` (#672). The ROUTE
+  // TABLE that invocation produces, over a real socket, with a stub synthesizer
+  // so it needs no weights: the music route is ours and the text routes are
+  // ABSENT rather than present-and-broken.
+  //
+  // The construction is the server's own: an `ApiServer` from serving-models
+  // alone — no completion handler, no chat handler — plus a synthesizer. The
+  // checkpoint case below builds the identical shape around the REAL engine, so
+  // this one gates the shape and that one gates the weights.
+  vllm::entrypoints::openai::OpenAIServingModels models{"minimax-music3"};
+  vllm::entrypoints::openai::ApiServer server{models, "music3-speech-only"};
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "minimax-music3";
+  caps.sample_rate = kSampleRate;
+  caps.channels = kWaveformChannels;
+  caps.requires_reference_audio = false;
+  server.set_synthesizer(
+      [](const vllm::openai::SpeechRequest&) {
+        vllm::openai::SpeechResponse out;
+        std::vector<float> samples(2 * 1024, 0.25F);
+        out.wav = ::vllm::MiniMaxH3WriteWav(samples, kWaveformChannels, 1024, kSampleRate);
+        out.sample_rate = kSampleRate;
+        out.channels = kWaveformChannels;
+        out.samples_per_channel = 1024;
+        return out;
+      },
+      caps);
+
+  const int port = server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  std::thread server_thread([&server]() { server.serve(); });
+  for (int i = 0; i < 500 && !server.is_running(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  REQUIRE(server.is_running());
+  {
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(30, 0);
+    auto speech = client.Post("/v1/audio/speech", kMusic3RequestBody, "application/json");
+    REQUIRE(speech);
+    CHECK(speech->status == 200);
+    CHECK(speech->get_header_value("Content-Type") == "audio/wav");
+    REQUIRE(speech->body.size() > 44);
+    CHECK(speech->body.compare(0, 4, "RIFF") == 0);
+    CHECK(ReadU16(speech->body, 22) == kWaveformChannels);
+    CHECK(ReadU32(speech->body, 24) == kSampleRate);
+
+    // A well-formed generate body — exactly what the route would accept if it
+    // existed — falls through to httplib's own 404. That is what proves the
+    // route was never REGISTERED, rather than that a handler rejected it.
+    auto completions = client.Post("/v1/completions",
+                                   R"({"model":"minimax-music3","prompt":"hi"})",
+                                   "application/json");
+    REQUIRE(completions);
+    CHECK(completions->status == 404);
+    auto chat = client.Post(
+        "/v1/chat/completions",
+        R"({"model":"minimax-music3","messages":[{"role":"user","content":"hi"}]})",
+        "application/json");
+    REQUIRE(chat);
+    CHECK(chat->status == 404);
+
+    // And the server is alive, so those 404s are about the routes.
+    auto health = client.Get("/health");
+    REQUIRE(health);
+    CHECK(health->status == 200);
+  }
+  server.stop();
+  server_thread.join();
+}
 
 // ---------------------------------------------------------------------------
 // The DELIVERY path: latents -> waveform -> the WAV a request receives
@@ -331,6 +508,7 @@ uint16_t ReadU16(const std::string& wav, size_t offset) {
 
 TEST_CASE("music3 e2e real: the decode reaches waveform.npy at 44100 stereo") {
   if (SkipIfMissing("music3 e2e decode")) return;
+  ++g_checkpoint_arms_run;
   const vllm::MiniMaxMusic3Config config = vllm::MiniMaxMusic3LoadConfig(Paths());
   // spec §1.1, read from the CHECKPOINT rather than assumed by this file.
   CHECK(config.vocoder.sampling_rate == kSampleRate);
@@ -377,6 +555,7 @@ TEST_CASE("music3 e2e real: the decode reaches waveform.npy at 44100 stereo") {
 
 TEST_CASE("music3 e2e real: the WAV a request receives is 44100 Hz 16-bit STEREO") {
   if (SkipIfMissing("music3 e2e wav")) return;
+  ++g_checkpoint_arms_run;
   std::vector<int64_t> shape;
   const std::vector<float> waveform = LoadF32Npy("waveform.npy", &shape);
   REQUIRE(shape[0] == kWaveformChannels);
@@ -427,6 +606,7 @@ TEST_CASE("music3 e2e real: the WAV a request receives is 44100 Hz 16-bit STEREO
 
 TEST_CASE("music3 e2e real: the tail's first stage still reproduces condition_chunk0") {
   if (SkipIfMissing("music3 e2e condition")) return;
+  ++g_checkpoint_arms_run;
   std::vector<int64_t> shape;
   const std::vector<float> frame_hiddens = LoadF32Npy("frame_hiddens.npy", &shape);
   REQUIRE(shape.size() == 2);
@@ -457,6 +637,7 @@ TEST_CASE("music3 e2e real: the tail's first stage still reproduces condition_ch
 TEST_CASE("music3 e2e real: the whole tail reaches waveform.npy from frame_hiddens") {
   if (SkipIfMissing("music3 e2e full tail")) return;
   if (SkipIfDitNotRequested("music3 e2e full tail")) return;
+  ++g_checkpoint_arms_run;
 
   const vllm::MiniMaxMusic3Config config = vllm::MiniMaxMusic3LoadConfig(Paths());
   std::vector<int64_t> shape;
@@ -563,18 +744,26 @@ TEST_CASE("music3 e2e real: the whole tail reaches waveform.npy from frame_hidde
 // splits past 200 frames, which is 8 s of audio and hours of scalar CPU, and
 // the multi-window composition is W6's named coverage gap either way.
 //
-// ─── WHY IT GOES THROUGH `handle_audio_speech` ──────────────────────────────
+// ─── WHY IT GOES OVER A REAL SOCKET ─────────────────────────────────────────
 //
-// Because the claim is about an HTTP request. `ApiServer::handle_audio_speech`
-// is the route's own body: it parses the JSON, applies the
-// `requires_reference_audio` pre-refusal, calls the synthesizer and sets the
-// `audio/wav` content type. The synthesizer it is handed here is
-// `vllm::openai::SynthesizeSpeechRequest` — the SAME function `server_main.cpp`
-// hands it — so nothing on this path is a test-only reimplementation of the
-// server.
-TEST_CASE("music3 e2e real: an HTTP request generates a real 44100 Hz stereo WAV") {
+// Because the claim is about an HTTP request, and the shape a user runs is
+// `vllm-server --speech-model <dir>` with no `--model` at all (#672). This case
+// builds exactly what that invocation builds — an `ApiServer` from
+// serving-models alone, no completion handler and no chat handler, plus the
+// REAL loaded engine behind `vllm::openai::SynthesizeSpeechRequest`, which is
+// the same function `server_main.cpp` hands it — binds an ephemeral port and
+// posts over the wire.
+//
+// A direct `handle_audio_speech` call, which is what this case used to do,
+// exercises the handler but never the ROUTE TABLE: it cannot tell a registered
+// route from an unregistered one, and the speech-only server's whole claim is
+// about which routes exist. The checkpoint-free twin at the top of this file
+// gates that table with a stub; this one gates it with 28.5 GB of weights
+// behind it.
+TEST_CASE("music3 e2e real: a music-only server generates a real 44100 Hz stereo WAV") {
   if (SkipIfMissing("music3 e2e http")) return;
   if (SkipIfDitNotRequested("music3 e2e http")) return;
+  ++g_checkpoint_arms_run;
 
   vllm::multimodal::SpeechRegistry registry;
   m3::RegisterBuiltinSpeechFamilies(registry);
@@ -601,35 +790,73 @@ TEST_CASE("music3 e2e real: an HTTP request generates a real 44100 Hz stereo WAV
       },
       caps);
 
-  // The body a client posts. `lyrics` and `description` are the two music
-  // inputs; `input` is deliberately absent, because Music3 REFUSES it.
+  // ── over the wire, on an ephemeral port ──────────────────────────────────
   //
-  // The duration key is `audio_duration`, which is what `ParseSpeechRequest`
-  // reads and what docs/USAGE.md documents. This body used to spell it
-  // `audio_duration_s` — the name of the FIELD it fills — which the parser did
-  // not read, so the request fell back to the family's 60 s default: 1500 AR
-  // frames instead of 2, eight denoise windows instead of one, and 5167 vocoder
-  // latents instead of 6. That is the 750x job three runs were killed inside
-  // and reported as a hung weight load (#852). The parser now REFUSES the
-  // misspelling instead of defaulting past it.
-  const std::string body = R"({
-    "model": "minimax-music3",
-    "lyrics": "[verse]\nMorning light\n",
-    "description": "Genre: acoustic pop. BPM: 96.",
-    "audio_duration": 0.1,
-    "num_inference_steps": 2,
-    "seed": 7,
-    "response_format": "wav"
-  })";
+  // The body is `kMusic3RequestBody`, shared with the stub-synthesizer case at
+  // the top of this file so the two cannot drift into testing different
+  // requests. `lyrics` and `description` are the two music inputs; `input` is
+  // deliberately absent, because Music3 REFUSES it.
+  //
+  // The read timeout is generous because this synthesis is 8.6B + 2.4B of
+  // scalar host float on CPU: a 0.1 s request is minutes, not milliseconds, and
+  // a client timeout would present as a transport failure rather than as the
+  // slow model it is.
+  const int port = server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  std::thread server_thread([&server]() { server.serve(); });
+  for (int i = 0; i < 500 && !server.is_running(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  REQUIRE(server.is_running());
 
-  const vllm::entrypoints::openai::ApiServer::DispatchResult response = server.handle_audio_speech(body);
-  MESSAGE("POST /v1/audio/speech -> " << response.status << " " << response.content_type << ", "
-                                      << response.body.size() << " bytes");
-  REQUIRE_MESSAGE(response.status == 200, response.body);
-  CHECK(response.content_type == "audio/wav");
+  std::string wav;
+  int status = 0;
+  std::string content_type;
+  int completions_status = 0;
+  int chat_status = 0;
+  {
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(10, 0);
+    client.set_read_timeout(7200, 0);  // hours: this is scalar fp32 on CPU
+
+    // The TEXT routes first, and BEFORE the long synthesis, so the route-table
+    // claim is recorded even if the generation is interrupted.
+    auto completions = client.Post("/v1/completions",
+                                   R"({"model":"minimax-music3","prompt":"hi"})",
+                                   "application/json");
+    REQUIRE(completions);
+    completions_status = completions->status;
+    auto chat = client.Post(
+        "/v1/chat/completions",
+        R"({"model":"minimax-music3","messages":[{"role":"user","content":"hi"}]})",
+        "application/json");
+    REQUIRE(chat);
+    chat_status = chat->status;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto response = client.Post("/v1/audio/speech", kMusic3RequestBody, "application/json");
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    REQUIRE_MESSAGE(response, "POST /v1/audio/speech did not complete over the socket");
+    status = response->status;
+    content_type = response->get_header_value("Content-Type");
+    wav = response->body;
+    MESSAGE("POST /v1/audio/speech -> " << status << " " << content_type << ", " << wav.size()
+                                        << " bytes in " << seconds << " s wall");
+  }
+  server.stop();
+  server_thread.join();
+
+  // A music-only server registers ONE route and NOT the generate pair. A
+  // well-formed generate body falling through to httplib's own 404 is what
+  // proves the route was never registered.
+  CHECK(completions_status == 404);
+  CHECK(chat_status == 404);
+
+  REQUIRE_MESSAGE(status == 200, wav);
+  CHECK(content_type == "audio/wav");
 
   // ── the RIFF header ──────────────────────────────────────────────────────
-  const std::string& wav = response.body;
   REQUIRE(wav.size() > 44);
   CHECK(wav.compare(0, 4, "RIFF") == 0);
   CHECK(wav.compare(8, 4, "WAVE") == 0);
@@ -713,4 +940,93 @@ TEST_CASE("music3 e2e real: an HTTP request generates a real 44100 Hz stereo WAV
   sink.close();
   MESSAGE("wrote " << wav.size() << " bytes to " << out.string());
   CHECK(fs::is_regular_file(out, ec));
+}
+
+// ---------------------------------------------------------------------------
+// THE COVERAGE REPORT — registered LAST, and the reason it exists
+//
+// With neither `VLLM_CPP_MUSIC3_CHECKPOINT` nor `VLLM_CPP_MUSIC3_DIT` set, this
+// file used to report:
+//
+//     test cases: 5 | 5 passed | 0 failed | 0 skipped
+//     assertions: 0 | 0 passed | 0 failed
+//
+// Five green case names over an empty run. That is a SKIP WEARING A PASS, and
+// this project has already been fooled by the identical shape on
+// test_qwen3_paged_engine, which "passes 2/2" while asserting nothing because
+// its snapshots are dgx-only. A gate that cannot say HOW MANY things it
+// examined has not reported.
+//
+// Two changes fix it, and both are needed:
+//
+//   1. the checkpoint-free half at the top of this file runs unconditionally,
+//      so `assertions: 0` is now structurally impossible — the suite always
+//      examines the request contract, the duration arithmetic and the
+//      speech-only route table, and REDS in CI if any of them breaks;
+//   2. this case prints WHICH arms ran, every run, and asserts the one
+//      invariant a hollowed-out suite would violate: with the checkpoint
+//      PRESENT, at least one checkpoint arm must have executed. Delete the
+//      bodies of the four cases above and this one goes RED on a box that has
+//      the weights, where a case count alone would still read green.
+//
+// It cannot fail on a box that legitimately lacks the 27 GB checkpoint, because
+// that is not a defect — it is the reason the env gate exists. What it refuses
+// to do is stay silent about it.
+// ---------------------------------------------------------------------------
+TEST_CASE("music3 e2e: THE COVERAGE THIS RUN ACTUALLY TOOK, reported not implied") {
+  const std::string reason = MissingReason();
+  const char* dit = std::getenv("VLLM_CPP_MUSIC3_DIT");
+  const bool dit_on = dit != nullptr && std::string(dit) != "0" && !std::string(dit).empty();
+
+  std::printf(
+      "[music3 e2e COVERAGE] checkpoint=%s dit=%s checkpoint_arms_run=%d\n",
+      reason.empty() ? "PRESENT" : "ABSENT", dit_on ? "ON" : "OFF", g_checkpoint_arms_run);
+  if (!reason.empty()) {
+    std::printf(
+        "[music3 e2e COVERAGE] the CHECKPOINT arms did not run: %s\n"
+        "[music3 e2e COVERAGE] what DID run is the checkpoint-free half — the request\n"
+        "[music3 e2e COVERAGE] contract, the duration arithmetic and the speech-only route\n"
+        "[music3 e2e COVERAGE] table over a real socket. Set VLLM_CPP_MUSIC3_CHECKPOINT (and\n"
+        "[music3 e2e COVERAGE] VLLM_CPP_MUSIC3_DIT=1) to run the rest.\n",
+        reason.c_str());
+  } else if (!dit_on) {
+    std::printf(
+        "[music3 e2e COVERAGE] the two DiT arms did not run: VLLM_CPP_MUSIC3_DIT is unset\n"
+        "[music3 e2e COVERAGE] (eight 2.4B fp32 host forwards, hours on CPU).\n");
+  }
+  const std::string checkpoint_state = reason.empty() ? std::string("PRESENT") : reason;
+  const std::string dit_state = dit_on ? std::string("ON") : std::string("OFF");
+  MESSAGE("coverage: checkpoint=" << checkpoint_state << " dit=" << dit_state
+                                  << " checkpoint_arms_run=" << g_checkpoint_arms_run);
+
+  // ── The invariant, and why it asserts the CHECKPOINT rather than the counter
+  //
+  // The obvious guard is `g_checkpoint_arms_run > 0` when the checkpoint is
+  // present. It is REJECTED here, because it is a claim about test ORDERING
+  // rather than about the tree: `-tc="…COVERAGE…"` runs this case alone, the
+  // counter is legitimately 0, and the gate reds for the filter rather than for
+  // a defect. A gate that reds for the way it was invoked is a gate someone
+  // deletes.
+  //
+  // What is asserted instead is a fact about the checkpoint ITSELF, read from
+  // the seven component `config.json` files — milliseconds, no weight byte —
+  // so it holds under any invocation and reds only if the checkpoint the other
+  // cases were about is absent, unreadable or not this model. The counter stays
+  // as REPORTED context above, which is what it is good for.
+  if (reason.empty()) {
+    const vllm::MiniMaxMusic3Config config = vllm::MiniMaxMusic3LoadConfig(Paths());
+    // 44100 stereo is spec §1.1's resolved rate, and it is DERIVED rather than
+    // declared: 8*8*4*2 = 512 upsampling over 86.133 Hz latent frames.
+    CHECK(config.vocoder.sampling_rate == kSampleRate);
+    CHECK(config.vocoder.hop_length() == 512);
+    // The 200000-entry music vocabulary is what makes this Music3's language
+    // model rather than a stock Qwen3.
+    CHECK(config.language_model.vocab_size == 200000);
+    // And the eight RVQ codebooks the depth decoder expands each frame into.
+    CHECK(config.rvq_depth_decoder.num_codebooks == 8);
+  } else {
+    // Still an assertion, so this case can never contribute zero: an absence
+    // reported with no reason is the thing this whole case exists to prevent.
+    CHECK(reason.find_first_not_of(" \t") != std::string::npos);
+  }
 }

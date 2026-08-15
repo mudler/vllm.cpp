@@ -230,6 +230,42 @@ if(VLLM_CPP_SERVER)
               --video-extra dit_config_path)
     set_tests_properties(test_server_video_extra_needs_a_value PROPERTIES
       PASS_REGULAR_EXPRESSION "--video-extra takes KEY=VALUE, got 'dit_config_path'")
+
+    # A SPEECH-ONLY server (#672): --speech-model with NO --model. Upstream's own
+    # recipe is `sgl-omni serve --model MiniMaxAI/MiniMax-Music3` and nothing
+    # else, and requiring --model here meant serving a 28.5 GB music model also
+    # staged an unrelated text model no request would touch. Black-box for the
+    # same reason the --video-family cases above are: the flag table lives in an
+    # anonymous namespace and the binary IS the surface.
+    #
+    # 1. NEITHER flag is still an error, and the message now names the second
+    #    way to satisfy it. The pre-change spelling had no --speech-model
+    #    clause, so this expression is the RED.
+    add_test(NAME test_server_neither_model_flag
+      COMMAND $<TARGET_FILE:server>)
+    set_tests_properties(test_server_neither_model_flag PROPERTIES
+      PASS_REGULAR_EXPRESSION "--model <dir> is required \\(or --speech-model <dir> for a speech/music-only server\\)")
+
+    # 2. --speech-model ALONE gets PAST the argument check and into the speech
+    #    LOAD, which is the whole claim: before the change it exited at
+    #    "--model <dir> is required" without ever reaching a checkpoint. Proven
+    #    by the load refusal for a directory nothing claims, which is evidence
+    #    that the speech branch ran, and by asserting the --model demand is
+    #    ABSENT from the output.
+    add_test(NAME test_server_speech_only_reaches_the_speech_load
+      COMMAND $<TARGET_FILE:server> --speech-model /nonexistent-speech-dir)
+    set_tests_properties(test_server_speech_only_reaches_the_speech_load PROPERTIES
+      PASS_REGULAR_EXPRESSION "--speech-model /nonexistent-speech-dir"
+      FAIL_REGULAR_EXPRESSION "--model <dir> is required")
+
+    # 3. --speech-family STILL requires --speech-model. The new accepted
+    #    combination must not have widened this one into "a family with no
+    #    checkpoint is fine now".
+    add_test(NAME test_server_speech_family_still_needs_a_checkpoint
+      COMMAND $<TARGET_FILE:server> --model /nonexistent-model-dir
+              --speech-family minimax-music3)
+    set_tests_properties(test_server_speech_family_still_needs_a_checkpoint PROPERTIES
+      PASS_REGULAR_EXPRESSION "--speech-family names a family but --speech-model names no checkpoint")
   endif()
 endif()
 
@@ -302,3 +338,12 @@ endif()
 add_executable(parakeet-transcribe parakeet_transcribe/main.cpp)
 target_link_libraries(parakeet-transcribe PRIVATE vllm::shared)
 vllm_cpp_set_warnings(parakeet-transcribe)
+
+# minimax-music3-gen: MiniMax-Music3 text-to-music end to end — a THIN client of
+# the public C ABI (include/vllm.h + vllm::shared ONLY, like vllm-cli and
+# parakeet-transcribe). It exists because the music family was the one
+# generative family in this tree with NO example: hearing the model needed a
+# running server plus a curl, or a C ABI caller nobody had written (#672).
+add_executable(minimax-music3-gen minimax_music3_gen/main.cpp)
+target_link_libraries(minimax-music3-gen PRIVATE vllm::shared)
+vllm_cpp_set_warnings(minimax-music3-gen)

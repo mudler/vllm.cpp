@@ -1092,3 +1092,111 @@ do; it is recorded here because the obvious first read of a slow run is "the
 language model is slow", and the language model is not the part that is slow —
 the LM's own weight load is 180 s of I/O and its forward is 12-14% of the AR
 profile.
+
+---
+
+## 10. The parity sweep, the music-only server, and the weights record (#672)
+
+**Developer directive (2026-08-15):** parity on what upstream supports —
+"we want to be a good reference" — usage docs for MiniMax-Music3, and in those
+docs the models and weights used and supported, the way MiniMax-H3 already does
+it. Then, mid-flight: **"we should allow to load only the music model"** and
+**"we need to have an e2e test working"**. The first two lines are the scope;
+the last two fixed two of its answers as requirements rather than judgements.
+
+### 10.1 The upstream surface, enumerated
+
+SGLang-Omni `748a0b43` at `sglang_omni/models/minimax_music3/` and the diffusers
+PR at `c6da9936` were read field by field. What a user can set upstream, and
+where each lands here:
+
+| upstream field | upstream default and anchor | here |
+|---|---|---|
+| `prompt` / `instructions` (the description) | required, `encoders.py:194-198`; SGLang `request_builders.py:104-106` | `description` (alias `prompt`) — **PARITY** |
+| `lyrics` / `input` | required, `encoders.py:199-200`; `request_builders.py:103` | `lyrics` — **PARITY** |
+| `audio_duration` | 60.0 s, `encoders.py:251-259` | `audio_duration` (alias `duration`) — **PARITY**, same default |
+| `num_inference_steps` | 30, `denoise.py:141-148` | `num_inference_steps` — **PARITY**, same default |
+| CFG scale | **not a request field** — frozen at 1.7 into the guider component, `denoise.py:180`; a serve-time knob `dit_cfg_scale` in SGLang, `stages.py:76-95` | `guidance_scale`, a real per-request control defaulting to 1.7. **AHEAD of both arms** |
+| `generator` / `seed` | a `torch.Generator` in diffusers (`encoders.py:260`, `denoise.py:111`); an integer defaulting to 0 in SGLang (`payload_types.py:25`) | `seed`, integer, default 0 — **PARITY** with the SGLang spelling |
+| `max_new_tokens` (frames) | 9000 cap, `request_builders.py:56-68` | **REFUSED BY NAME**, pointing at `audio_duration` and the /25 conversion |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty` | **refused** by upstream, `request_builders.py:14-19,109-114` | **REFUSED BY NAME** — was SILENT, and that silence was the #925 class |
+| `voice`, `speed` | refused, `request_builders.py:83-92` | refused — **PARITY** |
+| `stream` | refused, `request_builders.py:115-116`; `supports_streaming_vocoder=False` | refused — **PARITY**. Upstream has no streaming in either arm |
+| `response_format` | wav/mp3/flac/pcm/aac/opus, `protocol.py:291` | `"wav"` only — **OWED**, no encoder is vendored. Note upstream **downmixes to mono** for any non-wav format (`client/audio.py:328-334`) |
+| prompt ceiling 5000 tokens | `encoders.py:42,212-215` | enforced, `minimax_music3_ar.cpp:226` — **PARITY** |
+| frame ceiling 9000 | diffusers **CLAMPS** silently (`encoders.py:287`); SGLang **REJECTS** (`request_builders.py:64-67`) | we CLAMP, mirroring the primary oracle. Gated at 360 s and 3600 s |
+| output rate | diffusers 44100, no resample; SGLang resamples to 32000 (`acoustic.py:55-58,423`) | 44100 native — the §1.1 decision. The 32 kHz delivery transform stays **OWED** |
+| N samples per request | **neither arm supports it** (`denoise.py:117-122` is batch 1; no `n` field on `protocol.py:334-368`) | one waveform per request — **PARITY** |
+| N concurrent requests batched | SGLang only: continuous batching at 16, **two engine rows per request** for the CFG twin (`engine_builder.py:74-77`), plus `POST /v1/audio/speech/batch` (`openai_api.py:1277`) | we serialize per engine handle — **OWED** |
+| `sgl-omni serve --model <music-model>` and nothing else | the norm: the pipeline is three stages with no chat LLM, `models/minimax_music3/config.py:29-63` | **CLOSED** — see §10.2 |
+
+**Closed by this change:** the music-only server, the missing example, the four
+sampling refusals, the `max_new_tokens` refusal.
+**Refused by name and recorded as owed:** the non-wav response formats, request
+batching and the `/batch` route, the 32 kHz delivery resample, the native `.pth`
+arm, streaming (which upstream does not have either, so it is a permanent
+refusal rather than a debt).
+
+### 10.2 `--model` is optional when `--speech-model` is given
+
+Serving a 28.5 GB music model also forced loading an unrelated text model,
+because `--model <dir>` was unconditionally required. On this box the smallest
+available text checkpoint is 35B, so **the recipe this project documented was
+effectively unrunnable**, and upstream's own is `sgl-omni serve --model
+MiniMaxAI/MiniMax-Music3` with no text tower anywhere.
+
+`--speech-model` alone now loads only the speech engine and registers only
+`/v1/audio/speech`. It is the third instance of a shape already in
+`server_main.cpp` — a pooling checkpoint serves `/v1/embeddings` alone, a
+Parakeet checkpoint serves `/v1/audio/transcriptions` alone — and it mirrors
+vLLM's task-conditional registration (`api_server.py:255-265`).
+
+**It is ADDITIVE and that is proved, not argued.** The only case whose verdict
+changes is `--model` absent *and* `--speech-model` absent, which was an error
+and remains one, with a message that now names both ways to satisfy it.
+`--model` alone and `--model` + `--speech-model` take byte-identical paths.
+
+The route table is gated **in both directions over a real socket**, because a
+handler-dispatch test cannot see route registration at all: with no synthesizer
+`/v1/audio/speech` is a 404 from the route table with no envelope leaked, and on
+a speech-only server `/v1/completions` and `/v1/chat/completions` are 404 while
+`/v1/audio/speech` returns `audio/wav`.
+
+### 10.3 The e2e gate: what it examined, reported rather than implied
+
+The gate reported `test cases: 5 | 5 passed` and **`assertions: 0`** whenever the
+checkpoint was absent. Five green case names over an empty run — the same shape
+that fooled this project on `test_qwen3_paged_engine`, which "passes 2/2" while
+asserting nothing because its snapshots are dgx-only.
+
+The file is now split. **The checkpoint-free half runs unconditionally in CI**:
+the request contract on the exact body the real case posts, the near-miss
+refusals, the duration arithmetic including both ceilings, and the speech-only
+route table over a real socket with a stub synthesizer. `assertions: 0` is
+therefore structurally impossible. **The checkpoint half** keeps its env gate,
+and the real case now runs over a real socket against the music-only server
+shape rather than calling `handle_audio_speech` directly.
+
+A **coverage-report case** prints, every run, which arms ran and why any did not.
+Its assertion deliberately is **not** a cross-case counter: `-tc="…COVERAGE…"`
+runs it alone, the counter is legitimately zero, and a gate that reds for the way
+it was invoked is a gate somebody deletes. It asserts a cheap fact about the
+checkpoint itself instead — 44100 Hz, hop 512, vocab 200000, 8 codebooks, read
+from the component `config.json` files in milliseconds — which holds under any
+invocation.
+
+### 10.4 The weights are documented (porting-a-model.md §2.1)
+
+`docs/USAGE.md` carries the tables the H3 sections already carried, one row per
+artifact, with the repo **and revision**: the diffusers arm at
+`MiniMaxAI/MiniMax-Music3` @ `fbdf52fbaaca799592917417eb05f1899f1255ec`,
+component by component, **28.5 GB resident** (28 517 617 303 B, measured) out of
+a 57.4 GB repository and why the two differ; the native `.pth` arm we refuse and
+that SGLang-Omni serves; the one implemented GGUF Q4_K artifact with its sha256;
+and the fourteen third-party quantized repositories in five formats, each marked
+refused and each marked third-party.
+
+The revision is **verified rather than copied**:
+`condition_encoder/diffusion_pytorch_model.safetensors` on disk hashes to
+`83179c5eaa9a68a370affe0c1b96c2179f659ea4175666b31071490a202c2a4d`, which is that
+revision's own LFS record for the file.

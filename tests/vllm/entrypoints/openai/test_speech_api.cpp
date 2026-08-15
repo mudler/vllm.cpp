@@ -169,6 +169,50 @@ TEST_CASE("speech api: every unsupported field is REFUSED, never ignored") {
   CHECK_NOTHROW(ParseSpeechRequest(R"({"input":"hi","response_format":"wav"})"));
 }
 
+// The parity sweep of #672: SGLang-Omni serves this same model on this same
+// route and REFUSES four sampling knobs and its own length spelling. We were
+// SILENT on all five, which is the #925 failure class one case above — a knob
+// the server will not honour must not come back behind a 200.
+TEST_CASE("speech api: the sampling knobs UPSTREAM refuses are refused here too") {
+  // `request_builders.py:14-19,109-114`. This model's AR stage has ONE sampler,
+  // a fixed top-50 draw (`encoders.py:48,94-103`): there is no temperature to
+  // set and no nucleus branch to widen, so honouring any of these is impossible
+  // and ignoring them is dishonest.
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","temperature":0.7})"),
+                    doctest::Contains("`temperature` is not supported"));
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","top_p":0.9})"),
+                    doctest::Contains("`top_p` is not supported"));
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","top_k":40})"),
+                    doctest::Contains("`top_k` is not supported"));
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","repetition_penalty":1.1})"),
+                    doctest::Contains("`repetition_penalty` is not supported"));
+  // Nested under `extra_params` too, because that is the second place every
+  // other generation knob on this route is read from.
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","extra_params":{"temperature":0.7}})"),
+                    doctest::Contains("`temperature` is not supported"));
+
+  // `max_new_tokens` is SGLang-Omni's LENGTH, in 25 Hz audio frames rather than
+  // in seconds (`request_builders.py:56-68`). Accepting it as a near-synonym of
+  // `audio_duration` would put two spellings of one meaning on one route, and
+  // dropping it silently is how a 250-frame (10 s) request becomes the family's
+  // 60 s default. The refusal names the key to use AND the conversion.
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","max_new_tokens":250})"),
+                    doctest::Contains("`max_new_tokens` is SGLang-Omni's spelling"));
+  CHECK_THROWS_WITH(ParseSpeechRequest(R"({"lyrics":"x","max_new_tokens":250})"),
+                    doctest::Contains("`audio_duration` in SECONDS"));
+
+  // The NEGATIVE side, because a guard that fired on an ordinary request would
+  // refuse every real one: a body carrying none of the five still parses, and
+  // the knobs this route DOES honour are untouched by the guards above.
+  const SpeechRequest ok = ParseSpeechRequest(
+      R"({"lyrics":"[Verse]\nx\n","description":"pop","audio_duration":12.5,
+          "num_inference_steps":8,"guidance_scale":1.7,"seed":7})");
+  CHECK(ok.audio_duration_s == doctest::Approx(12.5));
+  CHECK(ok.num_inference_steps == 8);
+  CHECK(ok.guidance_scale == doctest::Approx(1.7));
+  CHECK(ok.seed == 7);
+}
+
 TEST_CASE("speech api: a malformed body is a 400, never a silent default") {
   CHECK_THROWS(ParseSpeechRequest("not json"));
   CHECK_THROWS(ParseSpeechRequest("[]"));

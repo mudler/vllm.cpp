@@ -3125,3 +3125,99 @@ TEST_CASE("api_server: /v1/audio/speech route registration is ADDITIVE over a re
     });
   }
 }
+
+// ─── The SPEECH-ONLY server (#672) ──────────────────────────────────────────
+//
+// `vllm-server --speech-model <dir>` with NO `--model` is now a valid
+// invocation, because upstream's own recipe is `sgl-omni serve --model
+// MiniMaxAI/MiniMax-Music3` and nothing else — a music model is not an
+// accessory to a text model. Requiring a text checkpoint beside a 28.5 GB music
+// one made the documented recipe unrunnable on any box whose smallest text
+// model is tens of gigabytes.
+//
+// This case pins the ROUTE TABLE that invocation produces, which is the half a
+// handler-dispatch test cannot see. It is the exact twin of the ASR pair above
+// ("transcriptions socket smoke … generate routes 404" / "the audio routes do
+// not exist on a TEXT server"), and it uses the SAME construction the server's
+// speech-only branch does: an `ApiServer` built from serving-models alone, with
+// no completion and no chat handler, plus a synthesizer.
+//
+// It needs no checkpoint and no engine, so it runs in CI unconditionally.
+TEST_CASE("api_server: a SPEECH-ONLY server serves speech and 404s the generate routes") {
+  OpenAIServingModels models{"minimax-music3"};
+  ApiServer server{models, "speech-only"};
+  vllm::openai::SpeechCapabilities caps;
+  caps.family = "minimax-music3";
+  caps.sample_rate = 44100;
+  caps.channels = 2;
+  caps.requires_reference_audio = false;
+  server.set_synthesizer([](const vllm::openai::SpeechRequest&) { return StereoWav(1024); },
+                         caps);
+
+  const int port = server.bind_to_any_port("127.0.0.1");
+  REQUIRE(port > 0);
+  std::thread server_thread([&server]() { server.serve(); });
+  for (int i = 0; i < 500 && !server.is_running(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(server.is_running());
+
+  {
+    httplib::Client client("127.0.0.1", port);
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(15, 0);
+
+    // The route this server exists to serve.
+    auto speech = client.Post("/v1/audio/speech", MusicBody(), "application/json");
+    REQUIRE(speech);
+    CHECK(speech->status == 200);
+    CHECK(speech->get_header_value("Content-Type") == "audio/wav");
+    REQUIRE(speech->body.size() == 44u + 1024u * 2u * 2u);
+    CHECK(speech->body.compare(0, 4, "RIFF") == 0);
+    CHECK(WavU16(speech->body, 22) == 2);       // STEREO
+    CHECK(WavU32(speech->body, 24) == 44100u);  // the family's NATIVE rate
+
+    // The TEXT routes are ABSENT, not present-and-broken. A well-formed body —
+    // exactly what the route would accept if it existed — must fall through to
+    // httplib's own 404, which is what proves the route was never registered
+    // rather than that a handler rejected the payload.
+    auto completions = client.Post("/v1/completions",
+                                   R"({"model":"minimax-music3","prompt":"hi"})",
+                                   "application/json");
+    REQUIRE(completions);
+    CHECK(completions->status == 404);
+    auto chat = client.Post(
+        "/v1/chat/completions",
+        R"({"model":"minimax-music3","messages":[{"role":"user","content":"hi"}]})",
+        "application/json");
+    REQUIRE(chat);
+    CHECK(chat->status == 404);
+    // Not OUR 404 either: no error envelope is emitted, so nothing tells a
+    // client the route half-exists.
+    CHECK(completions->body.find("\"object\"") == std::string::npos);
+    CHECK(chat->body.find("\"object\"") == std::string::npos);
+
+    // The OTHER opt-in surfaces stay unregistered too — attaching a synthesizer
+    // adds ONE endpoint, not a family of them.
+    auto videos = client.Post("/v1/videos", R"({"prompt":"x"})", "application/json");
+    REQUIRE(videos);
+    CHECK(videos->status == 404);
+    auto embeddings =
+        client.Post("/v1/embeddings", R"({"input":"x"})", "application/json");
+    REQUIRE(embeddings);
+    CHECK(embeddings->status == 404);
+
+    // Liveness and discovery still serve, so the 404s above are about the
+    // routes and not about a dead server — and `/v1/models` reports the FAMILY,
+    // which is what the speech-only branch defaults the served name to.
+    auto health = client.Get("/health");
+    REQUIRE(health);
+    CHECK(health->status == 200);
+    auto models_res = client.Get("/v1/models");
+    REQUIRE(models_res);
+    CHECK(models_res->status == 200);
+    CHECK(json::parse(models_res->body).at("data").at(0).at("id") == "minimax-music3");
+  }
+
+  server.stop();
+  server_thread.join();
+}

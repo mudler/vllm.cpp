@@ -707,6 +707,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/weight_offload_policy.cpp
   src/vllm/model_executor/expert_slot_cache.cpp
   src/vllm/model_executor/model_loader/gguf_expert_span.cpp
+  src/vllm/model_executor/expert_streamer.cpp
   src/vllm/config/multimodal.cpp
   src/vllm/config/speculative.cpp
   src/vllm/outputs.cpp

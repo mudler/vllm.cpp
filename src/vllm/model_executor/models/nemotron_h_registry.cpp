@@ -26,6 +26,7 @@
 
 #include "vllm/model_executor/models/nemotron_h.h"
 #include "vllm/model_executor/models/nemotron_h_forward.h"
+#include "vllm/model_executor/models/nemotron_h_loader.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
@@ -64,10 +65,17 @@ class NemotronHLoadedModel final : public LoadedModel {
   // (the unit gate) constructs the weights itself and reaches the same forward.
   NemotronHHostWeights& weights() { return weights_; }
   const NemotronHHostWeights& weights() const { return weights_; }
+  // What the load did, in numbers. Kept on the model rather than returned by
+  // value because the load happens inside the type-erased registry factory and
+  // a gate has no other way to reach it; `NemotronHLoadReportOf` is the
+  // accessor.
+  NemotronHLoadReport& report() { return report_; }
+  const NemotronHLoadReport& report() const { return report_; }
 
  private:
   NemotronHParams params_;
   NemotronHHostWeights weights_;
+  NemotronHLoadReport report_;
 };
 
 std::unique_ptr<LoadedModel> LoadNemotronHForCausalLM(
@@ -83,11 +91,23 @@ std::unique_ptr<LoadedModel> LoadNemotronHForCausalLM(
         ".agents/specs/nemotron-h-model.md §5b W7)");
   }
   // The config descent IS the validation, and it refuses by name on anything
-  // this bring-up cannot represent. W4 owns materializing the tensors
-  // EnumerateNemotronHTensors names.
+  // this bring-up cannot represent.
   NemotronHParams params = ParseNemotronHParams(config);
-  return std::make_unique<NemotronHLoadedModel>(registration,
-                                                std::move(params));
+  auto model =
+      std::make_unique<NemotronHLoadedModel>(registration, params);
+  if (source.safetensors == nullptr) {
+    throw std::runtime_error(
+        "Model architecture NemotronHForCausalLM: the safetensors source "
+        "carries no shards");
+  }
+  // MATERIALIZE. The 18487 enumerated tensors are read into the host weights in
+  // the memory format the checkpoint SHIPS them in — NVFP4 W4A16 g16 experts and
+  // lm_head, FP8 W8A8 static mamba projections, bf16 everything else — and the
+  // MTP tower is deferred by name (W5). See nemotron_h_loader.h.
+  model->weights() = LoadNemotronHHostWeights(
+      *source.safetensors, params, ResolveNemotronHModelDType(config),
+      &model->report());
+  return model;
 }
 
 void PrepareNemotronHForCausalLM(LoadedModel& model, const HfConfig& config,
@@ -122,6 +142,15 @@ const ModelFactory kNemotronHFactory{
 };
 
 }  // namespace
+
+const NemotronHLoadReport& NemotronHLoadReportOf(const LoadedModel& model) {
+  const auto* nh = dynamic_cast<const NemotronHLoadedModel*>(&model);
+  if (nh == nullptr) {
+    throw std::runtime_error(
+        "NemotronHLoadReportOf: this LoadedModel is not a NemotronH model");
+  }
+  return nh->report();
+}
 
 v1::KVCacheConfig MakeNemotronHKVCache(const HfConfig& config, int block_size,
                                        int num_blocks) {

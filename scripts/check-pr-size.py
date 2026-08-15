@@ -86,6 +86,11 @@ PROJECT_RECORD_FILES = frozenset(
         ".agents/NOW.md",
         ".agents/coordination.md",
         ".agents/roadmap_v1.md",
+        # The intake surface moved out of roadmap_v1.md into its own append-only
+        # file (#840) and was never classified here. Classification is a hard
+        # error by design, so pr-size aborted on EVERY pull request that appends
+        # an index row, which under the same policy is nearly all of them (#856).
+        ".agents/issue-index.md",
         ".agents/porting-inventory.md",
         ".agents/engine-matrix.md",
         ".agents/feature-matrix.md",
@@ -112,6 +117,14 @@ PROCEDURE_FILES = frozenset(
         ".agents/porting-a-model.md",
         ".agents/benchmarking.md",
         ".agents/bugfixing.md",
+        # The writing guides AGENTS.md delegates to, and the skill routes that
+        # point at them (#827). Same procedure class as their sibling guides.
+        # They were never classified, so classify_path FAILED CLOSED and this
+        # test has been red on main ever since that row landed (#856).
+        ".agents/style/commits.md",
+        ".agents/style/prose.md",
+        ".claude/skills/writing-commits-and-prs/SKILL.md",
+        ".claude/skills/writing-technical-english/SKILL.md",
         ".agents/prompts/implementer.md",
         ".agents/prompts/operator.md",
         ".agents/prompts/reviewer.md",

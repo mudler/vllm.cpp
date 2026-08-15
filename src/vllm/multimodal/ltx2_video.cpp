@@ -5,6 +5,7 @@
 #include "vllm/multimodal/ltx2_video.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +35,7 @@
 #include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
+#include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 #include "vllm/model_executor/models/minimax_h3.h"
@@ -1742,10 +1744,134 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   }
 
   // ── decode (distilled.py:314-315) ─────────────────────────────────────────
+  //
+  // STREAMED, through upstream's own AUTO tiling, mirroring
+  // `ti2vid_two_stages.py:365-376`: the pipeline passes `AUTO_TILING` and the
+  // consumer takes chunks straight out of `decode_video` instead of a whole clip.
+  //
+  // AT THE SIZES THIS PROJECT HAS RUN, THIS CHANGES NOTHING, and that is a
+  // measured statement rather than a hope. `Ltx2AutoTileSizeConfig` is upstream's
+  // Conv layout (768px tile / 64px overlap on the long side, 80 frames / 24
+  // overlap — helpers.py:59-88), and `split_by_size` returns ONE interval when the
+  // axis is no bigger than the tile (tiling.py:199-200). At 448x256/25f the latent
+  // is 8x14 against a 14x24 grid tile and 4 frames against a 10-latent-frame
+  // temporal tile, so exactly one tile and one chunk come out — and the ONE-TILE
+  // CONTROL in tests/vllm/models/test_ltx2_tiling.cpp proves that path reproduces
+  // the untiled decode BIT FOR BIT (max|diff| == 0, on both causality arms, and
+  // upstream's own value for the same control is 0 too).
+  //
+  // TILING FIRST DOES ANYTHING AT 896x512 SPATIALLY AND AT **81 FRAMES**
+  // TEMPORALLY — 81, not 121. `latent_t = (frames - 1) / 8 + 1` is 11 at 81
+  // frames and `split_temporal_causal` short-circuits only while `latent_t <= 10`
+  // (tiling.py:239-240). The row's own golden `kLtx2AutoCases` has said so since
+  // it was generated (`768x768/81f -> t_intervals = 2`); the prose here said 121
+  // because the probe sweep that produced it stepped 25 -> 121 and never sampled
+  // the binding point.
+  //
+  // SO THE "CHANGES NOTHING" ABOVE IS BOUNDED BY 81 FRAMES, AND A DEFAULT REQUEST
+  // IS NOT INSIDE THAT BOUND. `docs/USAGE.md` records the recipe default as
+  // 1024x1536 at 121 frames. Between 81 and 120 frames the render is tiled and is
+  // NOT the render this path produced before tiling existed — measured on the
+  // SHIPPED conv VAE at the AUTO layout, 64x64 / 81 frames, latent 11,2,2, by
+  // scripts/probe_ltx2_tiled_equivalence.cpp: 2 tiles, 2 chunks, max|diff|
+  // 0.0503043234 against the untiled decode on an output whose own |max| is
+  // 0.7512672544 — 6.70% of that range — with 962983 of 995328 floats (96.75%)
+  // not bit-identical. That is upstream's own behaviour (a receptive field wider
+  // than the overlap, blended at the seam) and not a defect here — but it is a
+  // different image, and the one-tile control does not cover it.
+  //
+  // (This said 0.716 and "95% of the range" until the probe was re-derived: it
+  // reassembled the streamed chunks with a FLAT append, and a chunk is
+  // [C, t, H, W] channel-major, so the append is not [C, T, H, W] at C = 3 with
+  // 2 chunks. The 14x was the probe's own transposition. The conclusion stands,
+  // the magnitude did not — see ltx2_tiling.h for the full record.)
+  //
+  // What it buys, ABOVE ONE CHUNK: the full pixel volume is never materialized.
+  // Each temporal chunk is written to disk and dropped, so the peak is about two
+  // chunks rather than [3, F, H, W] — which is what makes the long clips
+  // upstream's 80/24 layout exists for reachable at all. At exactly one chunk the
+  // chunk IS the volume and nothing is saved; that is the regime below 81 frames,
+  // and it is no worse than the buffered path it replaced.
   EngineNoiseStream decode_noise(seed ^ 0x1D7Cull);
-  const Ltx2VideoFrames rendered =
-      Ltx2VideoDecode(im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc,
-                      video_lf, video_lh, video_lw, &decode_noise);
+  const Ltx2ScaleFactors video_factors =
+      Ltx2VideoScaleFactorsFromBlocks(im.video_cfg.decoder_blocks, im.video_cfg.patch_size);
+  const int64_t rendered_h = video_lh * video_factors.height;
+  const int64_t rendered_w = video_lw * video_factors.width;
+
+  // ── artifacts (the library WRITES these, spawns nothing) ──────────────────
+  // Hoisted ABOVE the decode because the decode now writes into it chunk by
+  // chunk; a directory created after the first chunk arrived would be too late.
+  std::error_code ec;
+  std::filesystem::create_directories(gen.output_dir, ec);
+  if (ec) Fail("cannot create " + gen.output_dir + ": " + ec.message());
+
+  // A PREVIOUS RENDER'S TAIL IS DELETED BEFORE THIS ONE STARTS, and it has to be.
+  //
+  // The muxer is handed `frame_%06d.ppm` with no frame count (see `mux.frame_pattern`
+  // below), so it takes whatever consecutive files it finds. A 121-frame render
+  // followed by a 25-frame render into the same directory would leave
+  // frame_000025..frame_000120 on disk and mux a clip that runs 96 frames past its
+  // own end — silently, and looking like the longer render succeeded. Streaming
+  // widened this: a chunk that throws now also leaves a partial render behind,
+  // where the old buffered path wrote nothing until the whole decode had finished.
+  //
+  // Scoped deliberately: only `frame_<digits>.ppm`, only in the directory this
+  // render is about to write, and nothing else in it is touched. Collected first
+  // and removed after, because unlinking the entry the iterator is standing on is
+  // not something the directory iterator promises to survive.
+  {
+    std::vector<std::filesystem::path> stale;
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(gen.output_dir, ec)) {
+      if (ec) break;
+      if (!entry.is_regular_file()) continue;
+      const std::string name = entry.path().filename().string();
+      // "frame_" + at least one digit + ".ppm" is 11 characters.
+      if (name.size() < 11) continue;
+      if (name.rfind("frame_", 0) != 0) continue;
+      if (name.compare(name.size() - 4, 4, ".ppm") != 0) continue;
+      bool all_digits = true;
+      for (size_t i = 6; i + 4 < name.size(); ++i) {
+        if (std::isdigit(static_cast<unsigned char>(name[i])) == 0) all_digits = false;
+      }
+      if (!all_digits) continue;
+      stale.push_back(entry.path());
+    }
+    for (const std::filesystem::path& p : stale) {
+      std::error_code rm;
+      std::filesystem::remove(p, rm);
+    }
+    ec.clear();
+  }
+
+  int64_t rendered_frames = 0;
+  int64_t rendered_channels = 0;
+  Ltx2VideoDecodeStreaming(
+      im.video_kind, im.video_cfg, im.video_weights, video_latent_volume, video_lc, video_lf,
+      video_lh, video_lw, &decode_noise,
+      Ltx2AutoTileSizeConfig(rendered_h, rendered_w, video_factors),
+      [&](const Ltx2VideoChunk& chunk) {
+        MiniMaxH3VideoFrameShape shape;
+        shape.channels = chunk.frames.channels;
+        shape.t = chunk.frames.frames;
+        shape.h = chunk.frames.height;
+        shape.w = chunk.frames.width;
+        for (int64_t f = 0; f < chunk.frames.frames; ++f) {
+          char name[64];
+          // The GLOBAL frame index, which the chunk carries so the writer does not
+          // have to count. Numbering per-chunk would silently reorder the clip.
+          std::snprintf(name, sizeof(name), "frame_%06lld.ppm",
+                        static_cast<long long>(chunk.first_frame + f));
+          // The PPM/WAV/mux writers are the SHARED serialization the spec's §5
+          // reuse list names, not H3 behaviour: they take a buffer and a shape and
+          // contain no model. Reimplementing them here would be the parallel path
+          // §"Shared seams" forbids.
+          WriteFileBytes(JoinPath(gen.output_dir, name),
+                         MiniMaxH3WritePpmFrame(chunk.frames.data, shape, f));
+        }
+        rendered_frames += chunk.frames.frames;
+        rendered_channels = chunk.frames.channels;
+      });
 
   const Ltx2AudioSpectrogram mel = Ltx2AudioDecoderForward(
       im.audio_cfg, im.audio_weights, audio_latent_volume, audio_lc, audio_lf, audio_lm);
@@ -1754,35 +1880,24 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       Ltx2VocoderWithBweForward(im.vocoder_cfg, im.vocoder_weights, mel.data, mel.channels,
                                 mel.frames, mel.mel_bins, &audio_samples);
 
-  // ── artifacts (the library WRITES these, spawns nothing) ──────────────────
-  std::error_code ec;
-  std::filesystem::create_directories(gen.output_dir, ec);
-  if (ec) Fail("cannot create " + gen.output_dir + ": " + ec.message());
-
   VideoResult result;
   result.frame_dir = gen.output_dir;
-  MiniMaxH3VideoFrameShape shape;
-  shape.channels = rendered.channels;
-  shape.t = rendered.frames;
-  shape.h = rendered.height;
-  shape.w = rendered.width;
-  for (int64_t f = 0; f < rendered.frames; ++f) {
-    char name[64];
-    std::snprintf(name, sizeof(name), "frame_%06lld.ppm", static_cast<long long>(f));
-    // The PPM/WAV/mux writers are the SHARED serialization the spec's §5 reuse
-    // list names, not H3 behaviour: they take a buffer and a shape and contain
-    // no model. Reimplementing them here would be the parallel path §"Shared
-    // seams" forbids.
-    WriteFileBytes(JoinPath(gen.output_dir, name),
-                   MiniMaxH3WritePpmFrame(rendered.data, shape, f));
+  // The streamed chunks must have covered exactly the clip the latent implies. A
+  // decode that dropped or duplicated a temporal group would otherwise show up
+  // only as a short mp4.
+  const int64_t expect_frames = (video_lf - 1) * video_factors.time + 1;
+  if (rendered_frames != expect_frames || rendered_channels != im.video_cfg.out_channels) {
+    Fail("the streamed video decode produced " + std::to_string(rendered_frames) + " frames x " +
+         std::to_string(rendered_channels) + " channels, but the latent implies " +
+         std::to_string(expect_frames) + " x " + std::to_string(im.video_cfg.out_channels));
   }
   result.audio_path = JoinPath(gen.output_dir, "audio.wav");
   WriteFileBytes(result.audio_path,
                  MiniMaxH3WriteWav(waveform, mel.channels, audio_samples,
                                    im.vocoder_cfg.output_sampling_rate));
-  result.frame_count = rendered.frames;
-  result.width = rendered.width;
-  result.height = rendered.height;
+  result.frame_count = rendered_frames;
+  result.width = rendered_w;
+  result.height = rendered_h;
   result.fps = static_cast<int64_t>(std::llround(fps));
   result.sample_rate = im.vocoder_cfg.output_sampling_rate;
 

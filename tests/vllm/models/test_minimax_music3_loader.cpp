@@ -43,6 +43,7 @@
 #include "vllm/model_executor/models/minimax_music3_loader.h"
 #include "vllm/model_executor/models/vocoder1d.h"
 
+#include "support/process_id.h"
 using vllm::MiniMaxMusic3AccountReport;
 using vllm::MiniMaxMusic3AccountTensors;
 using vllm::MiniMaxMusic3Config;
@@ -164,7 +165,7 @@ std::vector<StEntry> EntriesFor(const std::vector<MiniMaxMusic3TensorSpec>& spec
 
 std::string TempPath(const char* stem) {
   return (std::filesystem::temp_directory_path() /
-          (std::string("music3_") + stem + "_" + std::to_string(::getpid()) + ".safetensors"))
+          (std::string("music3_") + stem + "_" + std::to_string(vllm_test::ProcessId()) + ".safetensors"))
       .string();
 }
 
@@ -733,7 +734,7 @@ TEST_CASE("music3 load: a component whose file lost a tensor throws BY NAME") {
 TEST_CASE("music3 resolve: a NATIVE-arm checkpoint is refused, naming what is missing") {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() /
-      ("music3_native_" + std::to_string(::getpid()));
+      ("music3_native_" + std::to_string(vllm_test::ProcessId()));
   std::filesystem::remove_all(root);
   // The layout convert_minimax_music3_to_diffusers.py:30,34,38 reads, and the
   // one sglang_omni/models/minimax_music3/checkpoint.py:35-56 serves.
@@ -776,7 +777,7 @@ TEST_CASE("music3 resolve: ONE native marker is enough to be diagnosed as the na
   for (const char* marker : {"flowmatching_vae.pth", "dav.pth", "qwen_7B"}) {
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() /
-        ("music3_partial_" + std::string(marker) + "_" + std::to_string(::getpid()));
+        ("music3_partial_" + std::string(marker) + "_" + std::to_string(vllm_test::ProcessId()));
     std::filesystem::remove_all(root);
     std::filesystem::create_directories(root);
     if (std::string(marker) == "qwen_7B") {
@@ -804,7 +805,7 @@ TEST_CASE("music3 resolve: ONE native marker is enough to be diagnosed as the na
 
 TEST_CASE("music3 resolve: a tree that is NEITHER arm names the components it lacks") {
   const std::filesystem::path root =
-      std::filesystem::temp_directory_path() / ("music3_empty_" + std::to_string(::getpid()));
+      std::filesystem::temp_directory_path() / ("music3_empty_" + std::to_string(vllm_test::ProcessId()));
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
   CHECK(!vllm::MiniMaxMusic3IsNativeArm(root.string()));

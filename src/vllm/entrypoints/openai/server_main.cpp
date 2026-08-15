@@ -57,6 +57,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>  // ::getpid below; guarded because MSVC has no such header
 #include <thread>
 #endif
 

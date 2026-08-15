@@ -16,6 +16,7 @@
 #include "vllm/model_executor/models/indextts2_config.h"
 #include "vllm/model_executor/models/indextts2_talker_loader.h"
 
+#include "support/process_id.h"
 namespace {
 
 std::string U64Le(uint64_t v) {
@@ -79,7 +80,7 @@ std::string BuildTalker(int64_t H = 8, int64_t L = 2, int64_t I = 16, int64_t TV
 
 std::string WriteTemp(const std::string& bytes, const std::string& tag) {
   const std::filesystem::path p = std::filesystem::temp_directory_path() /
-      ("indextts2_talker_" + tag + "_" + std::to_string(::getpid()) + ".safetensors");
+      ("indextts2_talker_" + tag + "_" + std::to_string(vllm_test::ProcessId()) + ".safetensors");
   std::ofstream out(p, std::ios::binary);
   out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   return p.string();

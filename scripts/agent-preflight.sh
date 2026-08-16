@@ -11,6 +11,7 @@
 #   scripts/agent-preflight.sh --quiet      # gates only, no digest
 #   scripts/agent-preflight.sh --no-require-role  # tolerate an undeclared role
 #   scripts/agent-preflight.sh --role-only  # ONLY the role gate; NOT a preflight
+#   scripts/agent-preflight.sh --fail-on-skip  # exit 1 when any gate was SKIPPED
 #
 # A session declares a role, and an UNDECLARED one is a failing gate by default:
 # the obligation used to live in prose and in an opt-in flag, and neither fired.
@@ -31,6 +32,14 @@
 # FAIL list AND an empty SKIP list, because a banner over a block that never
 # executed is a false report rather than a weaker gate (#998).
 #
+# The exit status carries only TWO of those states, so a SKIP still exits 0 and
+# a reader who wants the third has to read the report. That is right for a human
+# on a branch behind main and wrong for a program: `scripts/agent-ready.py` read
+# preflight by exit code alone and called a run with two unexecuted trailer gates
+# "green". --fail-on-skip is the opt-in for a machine consumer -- it exits 1 when
+# anything was skipped, and it does not change what any gate demands or what a
+# plain run reports. Ask for it when a skip must not read as success.
+#
 # It never writes anything, so it is always safe to run.
 
 set -uo pipefail
@@ -41,6 +50,12 @@ cd "$ROOT"
 STAGED=0
 QUIET=0
 ROLE_ONLY=0
+# OFF by default, and that default is the decision argued in the spec's §3.4: a
+# branch behind origin/main is ordinary work, and a gate that fires on ordinary
+# work is the defect. The flag exists because the exit status cannot carry the
+# third state, so every consumer that reads only the return code reads a SKIP as
+# success. There was exactly one such consumer (#998).
+FAIL_ON_SKIP=0
 # ON by default: an undeclared session is a FAILING gate. The mutation suite
 # anchors on THIS line (`^REQUIRE_ROLE=1$`) and refuses any line-anchored
 # assignment of zero, quoted or not, so a silent revert of the default goes red
@@ -54,7 +69,8 @@ for arg in "$@"; do
     --require-role) REQUIRE_ROLE=1 ;;
     --no-require-role) REQUIRE_ROLE=0 ;;
     --role-only) ROLE_ONLY=1 ;;
-    -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --fail-on-skip) FAIL_ON_SKIP=1 ;;
+    -h|--help) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -181,6 +197,38 @@ BASE_UNRESOLVED="${BASE_REF} does not resolve here, so this run cannot tell whic
 commits are new. Fetch the remote, or name the remote that carries the base
 branch, then rerun. Unknown is not absence."
 
+# The other two questions about the pinned base, asked ONCE and beside the pin,
+# with the git exit status kept rather than collapsed.
+#
+# `--is-ancestor` answers 1 for "no" and 128 for "that question cannot be asked
+# here" -- an unborn HEAD (`git checkout --orphan`) is one way to reach it. Both
+# used to take the same arm, so the report named a cause ("is not an ancestor of
+# HEAD") that was not the cause.
+#
+# `rev-list --count` used to be spelled `|| echo 0`, which filed a FAILED count
+# under the deliberate empty-range exemption of §3.6. An empty range withholds
+# nothing and keeps the banner. A count that could not be taken withholds
+# everything and must not. Mapping the second onto the first is the same
+# unknown-as-success conflation this row exists to remove.
+ANCESTRY_ERROR=""
+ANCESTRY_STATUS=0
+RANGE_COUNT=""
+RANGE_STATUS=0
+if [ -n "$BASE_SHA" ]; then
+  ANCESTRY_ERROR="$(git merge-base --is-ancestor "$BASE_SHA" HEAD 2>&1)"
+  ANCESTRY_STATUS=$?
+  RANGE_COUNT="$(git rev-list --count "${BASE_SHA}..HEAD" 2>&1)"
+  RANGE_STATUS=$?
+fi
+ANCESTRY_UNKNOWN="git merge-base --is-ancestor ${BASE_SHA} HEAD exited
+${ANCESTRY_STATUS}, so this run could not ask whether the base is behind HEAD:
+${ANCESTRY_ERROR}
+An unborn HEAD is one way to reach this. Unknown is not a verdict on ancestry."
+RANGE_UNKNOWN="git rev-list --count ${BASE_SHA}..HEAD exited ${RANGE_STATUS}, so
+this run could not count the commits under judgement:
+${RANGE_COUNT}
+An unborn HEAD is one way to reach this. Unknown is not an empty range."
+
 echo "Session role:"
 if role_line=$(python3 scripts/agent-role.py show 2>&1); then
   printf '  \033[32mok\033[0m   %s\n' "$role_line"
@@ -264,7 +312,12 @@ if [ -z "$BASE_SHA" ]; then
   skip "now-current range" "$BASE_UNRESOLVED"
   skip "doc-checkpoint range" "$BASE_UNRESOLVED"
   skip "issue-index append-only" "$BASE_UNRESOLVED"
-elif [ "$(git rev-list --count "${BASE_SHA}..HEAD" 2>/dev/null || echo 0)" -gt 0 ]; then
+elif [ "$RANGE_STATUS" -ne 0 ]; then
+  echo "Committed range vs ${BASE_REF} ${BASE_SHA}:"
+  skip "now-current range" "$RANGE_UNKNOWN"
+  skip "doc-checkpoint range" "$RANGE_UNKNOWN"
+  skip "issue-index append-only" "$RANGE_UNKNOWN"
+elif [ "$RANGE_COUNT" -gt 0 ]; then
   echo "Committed range vs ${BASE_REF} ${BASE_SHA}:"
   run "now-current range" python3 scripts/check-now-current.py \
     --base "$BASE_SHA" --head HEAD
@@ -289,14 +342,22 @@ if [ -z "$BASE_SHA" ]; then
   echo "Commit trailers vs ${BASE_REF}:"
   skip "commit-trailers" "$BASE_UNRESOLVED"
   skip "commit-style" "$BASE_UNRESOLVED"
-elif ! git merge-base --is-ancestor "$BASE_SHA" HEAD; then
+elif [ "$ANCESTRY_STATUS" -gt 1 ]; then
+  echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
+  skip "commit-trailers" "$ANCESTRY_UNKNOWN"
+  skip "commit-style" "$ANCESTRY_UNKNOWN"
+elif [ "$ANCESTRY_STATUS" -ne 0 ]; then
   echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
   TRAILER_BEHIND="${BASE_REF} ${BASE_SHA} is not an ancestor of HEAD, so this
 branch is behind it and the trailer gates did NOT run. Merge ${BASE_REF} and
 rerun. Neither gate reported anything about this tree."
   skip "commit-trailers" "$TRAILER_BEHIND"
   skip "commit-style" "$TRAILER_BEHIND"
-elif [ "$(git rev-list --count "${BASE_SHA}..HEAD" 2>/dev/null || echo 0)" -gt 0 ]; then
+elif [ "$RANGE_STATUS" -ne 0 ]; then
+  echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
+  skip "commit-trailers" "$RANGE_UNKNOWN"
+  skip "commit-style" "$RANGE_UNKNOWN"
+elif [ "$RANGE_COUNT" -gt 0 ]; then
   echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
   run "commit-trailers" python3 scripts/check-commit-trailers.py \
     --range "${BASE_SHA}..HEAD"
@@ -328,12 +389,23 @@ if [ "${#failed[@]}" -ne 0 ]; then
   exit 1
 fi
 
+# The opt-in, and the only thing that changes the exit status for a skip. The
+# report above already says everything this line says. A caller reaches here
+# because it reads the STATUS and not the report, which is what agent-ready.py
+# did while printing the word "green" over two gates that never ran.
+if [ "${#skipped[@]}" -ne 0 ] && [ "$FAIL_ON_SKIP" -eq 1 ]; then
+  echo
+  echo "--fail-on-skip: ${#skipped[@]} gate(s) did not run, so this run cannot"
+  echo "answer the question that was asked of it. Exit 1 for the caller that"
+  echo "reads only the status. Nothing here failed, and nothing here passed."
+  exit 1
+fi
+
 # Reachable ONLY when both arrays are empty. A skip used to survive this line,
-# which made the banner a claim the run had not earned (#998). The exit status
-# stays 0 for a skip: a branch behind origin/main is ordinary work, and exit 1
-# would merge "a gate did not run" into the signal that means "a gate ran and
-# failed". --role-only is the older precedent for the same call, an honest
-# partial run that refuses the banner and exits 0.
+# which made the banner a claim the run had not earned (#998). The DEFAULT exit
+# status stays 0 for a skip: a branch behind origin/main is ordinary work, and
+# exit 1 would merge "a gate did not run" into the signal that means "a gate ran
+# and failed". A caller that cannot read the report asks for --fail-on-skip.
 if [ "${#skipped[@]}" -eq 0 ]; then
   echo
   echo "All gates green."

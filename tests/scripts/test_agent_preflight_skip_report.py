@@ -47,6 +47,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,13 +55,39 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 PREFLIGHT = ROOT / "scripts/agent-preflight.sh"
+READY = ROOT / "scripts/agent-ready.py"
 CI = ROOT / ".github/workflows/ci.yml"
 SUITE_NAME = Path(__file__).stem
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 # Exits 0 for every checker and every suite. The script's `run()` reports `ok`.
-INERT_PYTHON3 = "#!/bin/sh\nexit 0\n"
+#
+# It also RECORDS its argv, one invocation per line, when the test asks for it.
+# Without that, this suite pins the ancestry decision against the pinned SHA and
+# says nothing about the SHA the five range checkers are actually handed: putting
+# `--base origin/main` back on all three range gates, and `--range
+# origin/main..HEAD` back on both trailer gates, parses and leaves every other
+# case here green. The script's own comment above `BASE_REF` states the guarantee
+# ("Every range block below compares against this SHA and never against the
+# ref"), and nothing detected its loss. `scripts/check-test-registration.py`
+# traces preflight the same way for the same reason.
+INERT_PYTHON3 = """#!/bin/sh
+if [ -n "${VLLM_TEST_ARGV_LOG:-}" ]; then
+  printf '%s\\n' "$*" >> "$VLLM_TEST_ARGV_LOG"
+fi
+exit 0
+"""
+
+# The five gates that take the pinned base as an argument, by the script name
+# each one is invoked with. Every one of them must be handed `BASE_SHA`.
+BASE_ARGUMENT_GATES = (
+    "scripts/check-now-current.py",
+    "scripts/check-doc-checkpoint.py",
+    "scripts/check-issue-index-append-only.py",
+    "scripts/check-commit-trailers.py",
+    "scripts/check-commit-style.py",
+)
 
 # Advances `refs/remotes/origin/main` on its FIRST call and then goes inert.
 # This is what another worktree of the same checkout does when it fetches while
@@ -106,6 +133,7 @@ class PreflightHarness(unittest.TestCase):
         (self.tmp / "bin").mkdir()
         shutil.copy2(PREFLIGHT, self.tmp / "scripts" / PREFLIGHT.name)
         self.script = self.tmp / "scripts" / PREFLIGHT.name
+        self.argv_log = self.tmp / "argv.log"
         self.set_python3(INERT_PYTHON3)
 
         self.git("init", "--quiet", ".")
@@ -155,19 +183,36 @@ class PreflightHarness(unittest.TestCase):
         stub.write_text(body, encoding="utf-8")
         stub.chmod(0o755)
 
-    def preflight(self, *args: str, **env: str) -> Report:
+    def environment(self, **env: str) -> dict[str, str]:
         environment = dict(os.environ)
         environment["PATH"] = f"{self.tmp / 'bin'}{os.pathsep}{environment['PATH']}"
+        # Truncated per run, so a log always describes exactly one invocation of
+        # the script even in the cases that run it twice.
+        self.argv_log.write_text("", encoding="utf-8")
+        environment["VLLM_TEST_ARGV_LOG"] = str(self.argv_log)
         environment.update(env)
+        return environment
+
+    def preflight(self, *args: str, **env: str) -> Report:
         result = subprocess.run(
             ["bash", str(self.script), "--quiet", *args],
             cwd=self.tmp,
             capture_output=True,
             text=True,
             check=False,
-            env=environment,
+            env=self.environment(**env),
         )
         return Report(result.returncode, result.stdout + result.stderr)
+
+    def base_arguments(self, gate: str) -> list[str]:
+        """Every recorded `python3` invocation of `gate` that carried a base."""
+
+        recorded = self.argv_log.read_text(encoding="utf-8").splitlines()
+        return [
+            line
+            for line in recorded
+            if line.startswith(gate) and ("--base " in line or "--range " in line)
+        ]
 
     # -- preconditions -------------------------------------------------------
 
@@ -400,6 +445,261 @@ class TheBannerStaysReachableTests(PreflightHarness):
             f"every gate failed and the run exited 0:\n{failing}",
         )
         self.assertFalse(failing.green, f"a failing run printed the banner:\n{failing}")
+
+
+class ThePinnedBaseReachesTheCheckersTests(PreflightHarness):
+    def test_every_range_gate_is_handed_the_pinned_sha_and_never_the_ref(self) -> None:
+        """The pin is worth nothing if the checkers are still passed the ref.
+
+        Every other case in this file reads the script's REPORT, so all of them
+        stay green when `--base "$BASE_SHA"` reverts to `--base origin/main` on
+        the three range gates or `--range "${BASE_SHA}..HEAD"` reverts to
+        `--range origin/main..HEAD` on the two trailer gates. The ancestry
+        decision would still be made against the pinned SHA, the heading would
+        still name it, and the five checkers would judge whatever the ref points
+        at when each one starts. With `origin/main` moving mid-run, that is a
+        report whose heading and whose verdict are about different revisions.
+        """
+
+        self.set_origin_main(self.base)
+        report = self.preflight()
+        self.assert_ran_something(report)
+        self.assertEqual([], report.skip, f"an ordinary run skipped a gate:\n{report}")
+
+        recorded = {gate: self.base_arguments(gate) for gate in BASE_ARGUMENT_GATES}
+
+        # PRECONDITION: a log that recorded nothing satisfies every `assertNotIn`
+        # below. Count first, and count ALL of them, so a gate that stops being
+        # invoked at all cannot pass as a gate invoked correctly.
+        self.assertEqual(
+            5,
+            sum(len(lines) for lines in recorded.values()),
+            f"precondition failed: the stub recorded {recorded}, which is not "
+            f"one base-carrying invocation per gate.\n{report}",
+        )
+
+        for gate, lines in recorded.items():
+            with self.subTest(gate=gate):
+                self.assertEqual(
+                    1,
+                    len(lines),
+                    f"{gate} was invoked with a base {len(lines)} time(s): {lines}",
+                )
+                self.assertIn(
+                    self.base,
+                    lines[0],
+                    f"{gate} was not handed the pinned SHA {self.base}: {lines[0]}",
+                )
+                self.assertNotIn(
+                    "origin/main",
+                    lines[0],
+                    f"{gate} was handed the moving ref instead of the pinned "
+                    f"SHA: {lines[0]}",
+                )
+
+
+class AnUnknownIsNotAnEmptyRangeTests(PreflightHarness):
+    def test_an_unborn_head_reports_skip_rather_than_an_empty_range(self) -> None:
+        """RED before: three gates take the empty-range exemption and say nothing.
+
+        `git rev-list --count` was spelled `|| echo 0`, which maps a FAILED
+        count onto the deliberate exemption for a range with no commits in it.
+        The two are opposite facts: an empty range withholds nothing, and a
+        count that could not be taken withholds everything. `git checkout
+        --orphan` reaches it with `origin/main` perfectly resolvable.
+
+        The same run also pins the ancestry reason. `--is-ancestor` answers 1
+        for "no" and 128 for "that question cannot be asked here", and both used
+        to take the arm that says the branch is behind `origin/main`. That names
+        a cause which is not the cause, and it sends the reader to `git merge`
+        for a tree that has no commit to merge into.
+        """
+
+        self.set_origin_main(self.base)
+        self.git("checkout", "--orphan", "unborn")
+
+        # PRECONDITION: this reproduces nothing unless HEAD really is unborn
+        # while the base still resolves.
+        self.assertNotEqual(
+            0,
+            subprocess.run(
+                ["git", "rev-parse", "--verify", "-q", "HEAD"],
+                cwd=self.tmp, capture_output=True, text=True, check=False,
+            ).returncode,
+            "precondition failed: HEAD still resolves, so the git queries under "
+            "test do not fail and this test asserts nothing.",
+        )
+
+        report = self.preflight()
+        self.assert_ran_something(report)
+
+        for label in (
+            "now-current range",
+            "doc-checkpoint range",
+            "issue-index append-only",
+            "commit-trailers",
+            "commit-style",
+        ):
+            with self.subTest(gate=label):
+                self.assertTrue(
+                    any(label in line for line in report.skip),
+                    f"{label} did not report a SKIP:\n{report}",
+                )
+        self.assertFalse(report.green, f"five unknown gates printed green:\n{report}")
+        self.assertNotIn(
+            "empty, HEAD adds no commits",
+            report.text,
+            f"a failed count was reported as an empty range:\n{report}",
+        )
+        self.assertNotIn(
+            "is not an ancestor of HEAD",
+            report.text,
+            "a failed ancestry query was reported as a branch behind the base, "
+            f"which names the wrong cause:\n{report}",
+        )
+        self.assertIn(
+            "Unknown is not an empty range.",
+            report.text,
+            f"the range skip does not say what is unknown:\n{report}",
+        )
+        self.assertIn(
+            "Unknown is not a verdict on ancestry.",
+            report.text,
+            f"the ancestry skip does not say what is unknown:\n{report}",
+        )
+
+
+class FailOnSkipTests(PreflightHarness):
+    """The third state has to reach a caller that can only read the exit status."""
+
+    def test_the_flag_makes_a_skip_exit_1_and_the_default_still_exits_0(self) -> None:
+        """Both facts in one case, because each is the other's justification.
+
+        Exit 0 by default is the row's own §3.4 decision: a branch behind
+        `origin/main` is ordinary work. Exit 1 under the flag is what a program
+        needs, because the exit status carries two of the three states and a
+        program cannot read the report that carries the third.
+        """
+
+        self.set_origin_main(self.divergent)
+
+        plain = self.preflight()
+        self.assert_ran_something(plain)
+        self.assertNotEqual([], plain.skip, f"nothing was skipped:\n{plain}")
+        self.assertEqual(0, plain.returncode, f"the default failed a skip:\n{plain}")
+
+        strict = self.preflight("--fail-on-skip")
+        self.assert_ran_something(strict)
+        self.assertEqual(
+            plain.skip,
+            strict.skip,
+            "the flag changed WHAT was reported, and it must change only the "
+            f"exit status:\n{strict}",
+        )
+        self.assertEqual(
+            1,
+            strict.returncode,
+            f"--fail-on-skip exited 0 over {len(strict.skip)} skipped "
+            f"gate(s):\n{strict}",
+        )
+        self.assertFalse(strict.green, f"a skipped run printed the banner:\n{strict}")
+        self.assertIn(
+            "--fail-on-skip",
+            strict.text,
+            f"the refusal does not name the flag that caused it:\n{strict}",
+        )
+
+    def test_the_flag_does_not_fire_on_a_run_that_skipped_nothing(self) -> None:
+        """A flag that reds an ordinary run is the defect, not the discipline."""
+
+        self.set_origin_main(self.base)
+        report = self.preflight("--fail-on-skip")
+        self.assert_ran_something(report)
+        self.assertEqual([], report.skip, f"an ordinary run skipped:\n{report}")
+        self.assertTrue(report.green, f"an ordinary run lost the banner:\n{report}")
+        self.assertEqual(0, report.returncode, f"an ordinary run exited 1:\n{report}")
+
+
+class AgentReadyRefusesASkipTests(PreflightHarness):
+    """`scripts/agent-ready.py` is the one consumer that reads the exit status.
+
+    It is `AGENTS.md`'s documented gate before a remote handoff, and it read
+    preflight by return code alone. So a branch behind `origin/main`, or any
+    checkout where `origin/main` does not resolve, reached
+    `READY: local and live PR/CI evidence are green` with two or five gates
+    never run. The word "green" was in the output over a trailer check that had
+    not executed, which is this row's own thesis failing one layer up.
+
+    These cases run the real `agent-ready.py` against the scratch repo, so what
+    is proved is that the refusal REACHES it, not that a flag exists.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        shutil.copy2(READY, self.tmp / "scripts" / READY.name)
+        self.ready_script = self.tmp / "scripts" / READY.name
+
+    def ready(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(self.ready_script)],
+            cwd=self.tmp,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.environment(),
+        )
+
+    def test_a_skipped_preflight_stops_the_handoff_gate(self) -> None:
+        """RED before: preflight exits 0 over two skipped gates and this passes."""
+
+        self.set_origin_main(self.divergent)
+
+        # PRECONDITION: the same tree must actually make preflight skip, or the
+        # case below proves nothing about a skip.
+        report = self.preflight()
+        self.assert_ran_something(report)
+        self.assertNotEqual([], report.skip, f"nothing was skipped:\n{report}")
+
+        result = self.ready()
+        output = result.stdout + result.stderr
+        self.assertNotEqual(0, result.returncode, f"agent-ready passed a skip:\n{output}")
+        self.assertIn(
+            "READY FAILED: local preflight",
+            result.stderr,
+            f"agent-ready did not stop at the local preflight:\n{output}",
+        )
+        self.assertIn(
+            "SKIPPED",
+            result.stdout,
+            f"agent-ready did not relay the skip report to its caller:\n{output}",
+        )
+        # It stopped at the preflight and never reached the remote question. If
+        # it had, the refusal below would be the one that appeared instead, and
+        # a skip would be indistinguishable from having no remote.
+        self.assertNotIn("REMOTE_UNVERIFIED", output)
+        self.assertNotIn("READY:", output)
+
+    def test_an_unskipped_preflight_lets_the_handoff_gate_continue(self) -> None:
+        """The control. A flag that refuses every run gates nothing.
+
+        The scratch repo has no `origin` remote, so a run that gets past the
+        local preflight fails at the remote question instead. That refusal is
+        the proof that the local one did not fire.
+        """
+
+        self.set_origin_main(self.base)
+        report = self.preflight()
+        self.assert_ran_something(report)
+        self.assertEqual([], report.skip, f"the control run skipped:\n{report}")
+
+        result = self.ready()
+        output = result.stdout + result.stderr
+        self.assertIn(
+            "REMOTE_UNVERIFIED",
+            result.stderr,
+            f"agent-ready did not get past the local preflight:\n{output}",
+        )
+        self.assertNotIn("READY FAILED: local preflight", output)
 
 
 class RegistrationTests(unittest.TestCase):

@@ -15,9 +15,12 @@ revision:
   nothing failed.
 - The two blocks that compare against `origin/main` resolve that ref once, at
   the start of the run, and the run names the resolved SHA.
+- An opt-in `--fail-on-skip` carries the third state into the exit status, for
+  the callers that can read only the exit status. The default is unchanged.
 
 **In scope.** The two range blocks in `scripts/agent-preflight.sh`, the new
-`skip` reporting path, the summary, and a new executable suite
+`skip` reporting path, the summary, the `--fail-on-skip` flag and its one
+production caller in `scripts/agent-ready.py`, and a new executable suite
 `tests/scripts/test_agent_preflight_skip_report.py` that runs the script and
 reads its report.
 
@@ -40,6 +43,9 @@ Local governance script. There is no vLLM counterpart.
 | The banner a skip survives today | `scripts/agent-preflight.sh`, `echo "All gates green."` |
 | The principle already settled in tree | `scripts/agent-preflight.sh`, the comment above `run "audit-live-rows"` |
 | The in-tree precedent for an honest partial run | `scripts/agent-preflight.sh`, the `ROLE_ONLY` branch |
+| The one consumer that read the exit status as a verdict | `scripts/agent-ready.py` `run_local_preflight` |
+| The consumer that inherits that verdict | `scripts/agent-integration.py` `run_ready` |
+| The consumer that requires exit 0 over five skips | `scripts/check-test-registration.py` `_preflight_execution_errors` |
 | The checker that already merge-bases | `scripts/check-commit-trailers.py` `validate_range` |
 | The checker that does not | `scripts/check-commit-style.py` `validate_range` |
 
@@ -97,32 +103,64 @@ verified. It is not `FAIL`, because nothing was found wrong.
 and the line `NOT a green preflight` whenever `skipped` is non-empty. The banner
 `All gates green.` is reachable only when both arrays are empty.
 
-### 3.4 Exit code: 0, and never the banner
+### 3.4 Exit code: 0 by default, 1 under `--fail-on-skip`, never the banner
 
-The run exits 0 when a block was skipped and nothing failed. Four things in the
+The run exits 0 when a block was skipped and nothing failed. Three things in the
 tree settle this.
 
-1. `--role-only` is the existing precedent for an honest partial run. It runs
-   one block, prints `ROLE CHECK ONLY -- this is NOT a full preflight; no record
-   gate ran.`, refuses the banner, and exits 0. Its own comment states the
-   reason: it "never prints the 'All gates green.' banner, because it skips
-   every record gate and mutation suite". The defect was never the exit code.
-   The defect was the banner.
-2. `AGENTS.md` on gate design: "A gate that fires on ordinary work is the
+1. `AGENTS.md` on gate design: "A gate that fires on ordinary work is the
    defect, not the discipline." A branch behind `main` is ordinary. Every helper
    worktree is behind `main` within minutes of being cut. A preflight that exits
    1 there would be red on most first runs of most sessions, and an agent would
    read that red as a broken record rather than as a missing merge.
-3. The `audit-live-rows` comment objects to a skip "surviving" the banner, not
-   to a skip existing. After this change no skip survives the banner. The
-   objection is answered by the report, not by the exit status.
-4. `AGENTS.md` on unknown state: "Unknown is not absence or success". A `SKIP`
+2. `AGENTS.md` on unknown state: "Unknown is not absence or success". A `SKIP`
    line with a reason records the unknown. Exit 0 with a banner claims success.
-   Exit 0 without a banner, with the unknown named, is the accurate report.
+   Exit 0 without a banner, with the unknown named, is the accurate report. The
+   `audit-live-rows` comment objects to a skip *surviving the banner*, not to a
+   skip existing, and after this change no skip survives it.
+3. Nothing enforces anything on this exit status by itself. `AGENTS.md`: hooks
+   and local runs are "bypassable convenience, not evidence". A hand-chained
+   `scripts/agent-preflight.sh && git push` is exactly that convenience, and CI
+   runs `check-commit-trailers.py` over the pull request range whatever this
+   script returned.
 
 Exit 1 keeps its meaning: a gate ran and failed. Widening exit 1 to cover "a
 gate did not run" would merge two different facts into one signal, which is the
 conflation this row exists to remove.
+
+**`--role-only` is not a precedent here, and the first version of this section
+said it was.** The reviewer of this row rejected that argument and was right.
+`--role-only` is a narrowing the caller *asked for*, so its caller knows exactly
+what will not run before the run starts. A `SKIP` is imposed on a caller who
+asked for a full run and finds out afterwards, and only if it reads the report.
+The two cases share what an honest partial run should *print*, which is where
+`--role-only` really is the model. They share nothing about what an unrequested
+partial run should *return*. The three arguments above stand without it.
+
+### 3.4.1 Who reads the exit status
+
+§3.5 enumerated every conditional in the script and never asked the other
+question, which is who consumes the number the script returns. There are four
+consumers, and exactly one of them treated that number as a verdict about the
+tree.
+
+| Consumer | How it reads preflight | Verdict |
+|---|---|---|
+| `scripts/agent-ready.py` `run_local_preflight` | `returncode == 0`, nothing else | **The defect.** `AGENTS.md` names it the gate to run "before remote handoff". The `SKIP` lines, the `N gate(s) SKIPPED` summary and the missing banner are all invisible to it, so a behind branch reached `READY: local and live PR/CI evidence are green` with two gates never run, and an unresolvable base reached it with five. The word "green" printed over a trailer check that had not executed. Fixed by passing `--fail-on-skip`. |
+| `scripts/agent-integration.py` `run_ready` | the exit status of `agent-ready.py` | Inherits the repair. It never calls preflight itself. |
+| `scripts/check-test-registration.py` `_preflight_execution_errors` | requires `rc == 0` from an instrumented run | Reads the status as a fact about the *script's own execution*, never as a verdict about a tree. Its `git` shim fails every call, so `BASE_SHA` is empty and five gates skip on every run of it. This consumer is why the default cannot flip: making a skip exit 1 unconditionally turns `check-test-registration` red, and that checker is itself in `CHECKERS`. |
+| a human at a shell, plus the `scripts/agent-preflight.sh passes` checkbox in `.github/pull_request_template.md` | reads the report | Unchanged, and the reason the default stays 0. |
+
+So the flag is opt-in because the population splits cleanly: one machine
+consumer that must not read a skip as success, one instrumented consumer that
+must keep reading exit 0, and a human who reads the report either way. A default
+that satisfied the first would break the second.
+
+`--fail-on-skip` changes nothing else. It does not change what any gate demands,
+what any block prints, or which blocks run. It fires only after the failure
+summary, so a run that both failed and skipped still exits 1 with the failure
+message, and it names itself in its own refusal so a reader is never left
+guessing which flag turned an ordinary run red.
 
 ### 3.5 Audit of every other conditional block
 
@@ -131,14 +169,15 @@ Nothing enumerated these before. This is the full list, in file order.
 | Block | Guard | Verdict |
 |---|---|---|
 | argument loop | `case "$arg"` | Not a gate. An unknown argument exits 2. |
-| role resolution | `if role_line=$(agent-role.py show)` | Reported. The failure arm prints `--` plus two lines of explanation, and appends `role-undeclared` when `REQUIRE_ROLE` is 1. Under `--no-require-role` the state is still printed, and the flag is a documented opt-out the caller chose. Unchanged. |
+| role resolution | `if role_line=$(agent-role.py show)` | Reported. The failure arm prints `--` plus two lines of explanation, and appends `role-undeclared` when `REQUIRE_ROLE` is 1. Under `--no-require-role` the state is still printed, and the flag is a documented opt-out the caller chose. Unchanged. Named here because `--` is now the only state that is neither `ok`, `FAIL` nor `SKIP`, and the only one `All gates green.` can print over: the check ran and reported, so it is not a skip, and the caller asked for the exemption, so it is not a failure. That verdict is accepted rather than overlooked, and a reader who greps for the three states should not conclude this fourth mark is a gap. |
 | read-only plus `--staged` | `[ "$STAGED" -eq 1 ] && grep role=read-only` | Adds a `FAIL`. Unchanged. |
 | `--role-only` early exit | `[ "$ROLE_ONLY" -eq 1 ]` | Already honest, and the model for this fix. It names what did not run and refuses the banner. Unchanged. |
 | per-checker dispatch | `case "$checker"` in the `CHECKERS` loop | Selects `--check` for two checkers. Every checker still runs. Not a skip. |
-| `Committed range vs origin/main` | `git rev-parse --verify -q origin/main` and `rev-list --count -gt 0` | **Same shape, fixed here.** The unresolvable-ref arm drops three gates silently. |
+| `Committed range vs origin/main` | `git rev-parse --verify -q origin/main` and `rev-list --count -gt 0` | **Same shape, fixed here.** The unresolvable-ref arm drops three gates silently here, and two more in the trailer block below, so an unresolvable base costs **five** gates in one run and not the three this row first recorded. Measured on the reviewer's independent harness and on case 4 of §5. |
 | `Commit trailers vs origin/main` | the same, plus `--is-ancestor` | **The reported defect, fixed here.** |
 | `Staged change` | `[ "$STAGED" -eq 1 ]` | A mode the caller selects, documented in the usage text at the top of the file. Running without `--staged` is not a skipped gate, it is a different run. Unchanged. |
 | digest print | `[ "$QUIET" -eq 0 ]` | Not a gate. Unchanged. |
+| the `--fail-on-skip` exit | `[ "${#skipped[@]}" -ne 0 ] && [ "$FAIL_ON_SKIP" -eq 1 ]` | Added here. Not a gate and it runs nothing. It converts a report the caller cannot read into an exit status the caller can, after the failure summary, so a failing run keeps its own message. See §3.4.1. |
 
 So two blocks share the shape, and both are repaired in this change.
 
@@ -151,10 +190,34 @@ verdicts:
 | Situation | Verdict | Why |
 |---|---|---|
 | `origin/main` does not resolve | `SKIP` | The input is *unknown*. There are commits to check and the script cannot tell which. |
+| `git rev-list --count` fails with the base resolved | `SKIP` | Also *unknown*, and the first version of this change did not say so. See below. |
+| `git merge-base --is-ancestor` exits above 1 | `SKIP`, with the ancestry reason and not the behind-the-base reason | Also *unknown*. The query failed, so the run has no verdict on ancestry to report. |
 | `HEAD` adds no commits over the pinned base | reported as an empty range, not a skip | The input is *empty*. A gate over zero commits has nothing to report, and calling that a skip would print `SKIP` on the ordinary session-start run of a freshly cut branch. |
 
 The empty-range case prints one line naming the pinned SHA, so the reader still
 learns why no gate line followed the heading. It does not suppress the banner.
+
+**Two guards filed an unknown under the empty-range exemption.** Both were found
+in the fresh review of this row and both are repaired here.
+
+`[ "$(git rev-list --count "${BASE_SHA}..HEAD" 2>/dev/null || echo 0)" -gt 0 ]`
+maps a *failed* count onto the count `0`, which is the arm this section
+deliberately exempts from `SKIP`. The two facts are opposites. An empty range
+withholds nothing, and a count that could not be taken withholds everything.
+`git checkout --orphan` reaches it with `origin/main` perfectly resolvable: the
+base resolves, `HEAD` is unborn, `rev-list` exits 128, and three gates took the
+exemption in silence while the banner printed. The count and its exit status are
+now kept separately, and a non-zero status is its own `SKIP` arm.
+
+`git merge-base --is-ancestor` answers 1 for "the base is not an ancestor" and
+128 for "that question cannot be asked here". Both took the arm whose reason
+reads "is not an ancestor of HEAD, so this branch is behind it", which names a
+cause that is not the cause and sends the reader to `git merge` for a tree that
+has no commit to merge into. The status above 1 now reports the failed query.
+
+Both bugs failed in the honest direction, which is why the repair stays this
+small. Neither produced a wrong verdict about a tree. One filed an unknown as an
+exemption and the other filed an unknown under the wrong name.
 
 ## 4. Risks and decisions
 
@@ -183,6 +246,21 @@ because the blocks under test are the last two in the file.
 and put a stub `python3` on `PATH` that exits 0. Every `run` then reports `ok`
 without executing a checker, no suite re-enters this one, and the git-shaped
 control flow under test runs for real against refs the test controls.
+`scripts/agent-ready.py` is copied in beside it, so the cases that exercise the
+handoff gate run the real script against the same scratch refs.
+
+**The stub records its argv**, appending each invocation to
+`$VLLM_TEST_ARGV_LOG`. Without that the suite reads only the script's *report*,
+and the report is silent about the SHA the five range checkers are handed.
+Putting `--base origin/main` back on the three range gates, or
+`--range origin/main..HEAD` back on the two trailer gates, then leaves every
+other case in the file green while the heading names pinned SHA X and the
+checkers judge whatever the moving ref points at, which is the exact defect this
+row was filed for wearing the fix as a disguise. The script states the guarantee
+in the comment above `BASE_REF` ("Every range block below compares against this
+SHA and never against the ref"), and nothing detected its loss.
+`scripts/check-test-registration.py` traces preflight the same way for the same
+reason.
 
 RED-first cases, each failing on the unmodified script:
 
@@ -214,11 +292,43 @@ RED-first cases, each failing on the unmodified script:
 6. `test_an_ancestor_base_still_earns_the_banner` is the control. It must print
    `All gates green.` and exit 0, so a fix that suppresses the banner
    unconditionally cannot pass.
-7. `test_the_run_names_the_base_it_gated_against` asserts the pinned SHA appears
-   in the output.
-8. `test_the_suite_is_registered` asserts this file's name appears in the
-   `SUITES` array and in `.github/workflows/ci.yml`, because a suite wired into
-   neither runs on no machine.
+7. The pinned SHA has to appear in the output, asserted inside case 3 rather
+   than in a case of its own.
+8. `test_the_suite_runs_in_preflight_and_in_ci` asserts this file's name appears
+   in the `SUITES` array and in `.github/workflows/ci.yml`, because a suite
+   wired into neither runs on no machine.
+
+Cases added by the fresh review of this row:
+
+9. `test_every_range_gate_is_handed_the_pinned_sha_and_never_the_ref` reads the
+   argv log after an ordinary run and asserts that each of the five gates that
+   take a base was invoked exactly once with one, that the invocation carries
+   the pinned SHA, and that it names no ref. It counts all five first, because
+   a log that recorded nothing satisfies every `assertNotIn` in the case. Green
+   before and after, like case 5: it is a regression guard, and its red-before
+   is the pair of mutations below.
+10. `test_an_unborn_head_reports_skip_rather_than_an_empty_range` runs
+    `git checkout --orphan` with `origin/main` still resolvable. **RED before:**
+    the three range gates take the empty-range exemption and print
+    `empty, HEAD adds no commits`, and the trailer block skips with the reason
+    `is not an ancestor of HEAD`, which is not the reason. **After:** five
+    `SKIP` lines, no banner, and each reason names the git query that failed.
+11. `test_the_flag_makes_a_skip_exit_1_and_the_default_still_exits_0` runs the
+    same behind-base tree twice, once plain and once with `--fail-on-skip`, and
+    asserts the reports are identical while the exit statuses differ. Both facts
+    live in one case because each is the other's justification.
+12. `test_the_flag_does_not_fire_on_a_run_that_skipped_nothing` is the control
+    for the flag. A flag that reds an ordinary run gates nothing.
+13. `test_a_skipped_preflight_stops_the_handoff_gate` runs the real
+    `scripts/agent-ready.py` against a scratch repo whose base is divergent.
+    **RED before:** preflight exits 0 over two skipped gates, `agent-ready`
+    reads that as success and walks straight past it. **After:** it stops at the
+    local preflight, relays the `SKIPPED` report to its own caller, and never
+    reaches the remote question.
+14. `test_an_unskipped_preflight_lets_the_handoff_gate_continue` is the control
+    for case 13. The scratch repo has no `origin` remote, so a run that gets
+    past the local preflight refuses with `REMOTE_UNVERIFIED` instead. That
+    second refusal is the proof the first one did not fire.
 
 Mutation cases, each restoring the tree byte-for-byte afterwards:
 
@@ -227,6 +337,10 @@ Mutation cases, each restoring the tree byte-for-byte afterwards:
   red.
 - Make `skip` print `ok`. Cases 1, 2 and 4 must go red.
 - Report `SKIP` for the empty range. Case 5 must go red.
+- Replace `--base "$BASE_SHA"` with `--base origin/main` at all three range
+  gates. Case 9 must go red on all three.
+- Replace `--range "${BASE_SHA}..HEAD"` with `--range "origin/main..HEAD"` at
+  both trailer gates. Case 9 must go red on both.
 
 ## 6. Gates
 
@@ -237,7 +351,12 @@ Mutation cases, each restoring the tree byte-for-byte afterwards:
   block, which is the same claim this row is about.
 - `python3 scripts/check-test-registration.py` and
   `python3 tests/scripts/test_check_gate_commands.py`, because the change edits
-  the script both of them read.
+  the script both of them read. `check-test-registration.py` is the sharper of
+  the two here: it executes preflight under a `git` shim that fails every call
+  and requires exit 0, so it fails if the default exit status for a skip ever
+  flips.
+- `python3 tests/scripts/test_agent_gates.py`, because the change edits
+  `scripts/agent-ready.py`, which that suite loads.
 - No CUDA, GPU, oracle, checkpoint or SACRED gate is implicated. The change
   touches one shell script and one test file, reaches no forward pass, and loads
   no weights.

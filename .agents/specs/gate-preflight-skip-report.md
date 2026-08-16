@@ -391,7 +391,9 @@ reported as skipped. Every gate that stops running has to say so.
 
 ### 7.3 GREEN after
 
-Same suite on the repaired script: `Ran 8 tests`, `OK`.
+Same suite on the repaired script: `Ran 8 tests`, `OK`. The fresh review of this
+row added six more cases, so the suite now reports `Ran 14 tests`, `OK`. Their
+own red-before is §7.7 and §7.8.
 
 The same scratch comparison, rerun against the repaired script. The `ok` totals
 are one higher than in §7.1 because the new suite joined `SUITES`:
@@ -424,30 +426,92 @@ afterwards, confirmed by a sha256 match against the pre-mutation file.
 
 ### 7.5 The row's own preflight run
 
-`bash scripts/agent-preflight.sh --quiet` on this branch, gated against
-`origin/main 3ce1cf7c74b930d1ce00612d0e15293ed139762c`, which both range block
-headings name.
+`bash scripts/agent-preflight.sh --quiet` on this branch after the review
+repairs, gated against `origin/main 332aed738a40050fd3fe677bc12ac1bcdc8e4bb5`,
+which both range block headings name.
 
 | Block heading | `ok` | `FAIL` | `SKIP` |
 |---|---:|---:|---:|
 | `Session role:` | 1 | 0 | 0 |
 | `Record gates:` | 25 | 1 | 0 |
 | `Mutation suites:` | 44 | 1 | 0 |
-| `Committed range vs origin/main 3ce1cf7c7:` | 3 | 0 | 0 |
-| `Commit trailers vs origin/main 3ce1cf7c7:` | 2 | 0 | 0 |
+| `Committed range vs origin/main 332aed738:` | 3 | 0 | 0 |
+| `Commit trailers vs origin/main 332aed738:` | 2 | 0 | 0 |
 | total | 75 | 2 | 0 |
 
 `SKIP` is 0, so this run did not itself skip a block, which is the same claim
-the row is about.
+the row is about. The trailer block reports two `ok` rather than two `SKIP`
+because the branch merged `origin/main` first, which is the repair the skip
+reason names.
 
 The two failures are `check-env-doc` and `test_check_env_doc`, and they are
-**pre-existing on `main`**, not caused by this change. Reproduced in a detached
-worktree at `origin/main 3ce1cf7c7` with an empty `git status --porcelain`:
+**pre-existing on `main`**, not caused by this change.
 `VT_MOE_EXPERT_STREAM`, `VT_MOE_EXPERT_STREAM_SLOTS` and
 `VT_MOE_EXPERT_STREAM_SLOT_BYTES` arrived with `3005447f8` (#993) and are
 neither documented nor allowlisted. Filed as
 [#1000](https://github.com/mudler/vllm.cpp/issues/1000) and owned by
-`ENG-EXPERT-STREAM`. This branch touches no path under `src/` or `include/`.
+`ENG-EXPERT-STREAM`, and independently as
+[#995](https://github.com/mudler/vllm.cpp/issues/995) against the same row by
+another branch. The attribution here is measured rather than asserted:
+`git diff origin/main...HEAD --stat` names six paths, none of them under `src/`
+or `include/`, so this branch cannot have introduced an env var read from those
+trees.
+
+One earlier run of `test_cpu_x86_llamacpp_floor` also failed, and two focused
+gates reported unrelated errors, while the filesystem holding the temporary
+directories was at zero bytes free. All three passed on a rerun with space
+available. An instrument out of disk fails toward a verdict about the code, so
+a red measured under `ENOSPC` is not a result.
+
+### 7.6 `agent-ready.py` refuses a skip while a human preflight does not
+
+Both scripts copied into one scratch repository, one `HEAD`, `origin/main` set
+to a divergent commit, stub `python3` on `PATH`. The only difference between the
+two rows is which program asked.
+
+| Caller | Report | Exit |
+|---|---|---:|
+| `bash scripts/agent-preflight.sh --quiet` | `2 gate(s) SKIPPED: commit-trailers commit-style`, no banner | 0 |
+| `python3 scripts/agent-ready.py` | the same report, then `READY FAILED: local preflight did not report every gate green.` | 1 |
+
+`agent-ready.py` never reached the remote question, which is the proof that it
+stopped at the local one. On the unrepaired pair it walked straight past the
+skip and refused with `REMOTE_UNVERIFIED: error: No such remote 'origin'`
+instead, which is case 13's red-before in one line.
+
+### 7.7 Red-before for the review repairs
+
+The new cases run against the tree as it was before this repair, restored with
+`git show HEAD:scripts/agent-preflight.sh` and
+`git show HEAD:scripts/agent-ready.py` while the new suite stayed in place:
+`Ran 14 tests`, `FAILED (failures=7)`.
+
+| Case | Red-before |
+|---|---|
+| 10, unborn `HEAD` | the three range gates never reported, and `empty, HEAD adds no commits` was printed over them |
+| 10, the ancestry reason | `is not an ancestor of HEAD` printed for a query that failed with `fatal: Not a valid object name HEAD` |
+| 11 and 12, `--fail-on-skip` | `unknown argument`, exit 2, and the harness precondition caught it as a run that reported nothing |
+| 13, the handoff gate | `'READY FAILED: local preflight' not found in "REMOTE_UNVERIFIED: error: No such remote 'origin'"` |
+
+Cases 9 and 14 are green before and after by design. Case 9 is a regression
+guard whose red-before is §7.8, and case 14 is the control that proves case 13
+is not a script that refuses everything.
+
+### 7.8 The two mutations the suite could not see before
+
+Both are the reviewer's, applied to the repaired script, each verified to have
+applied (`git diff --stat` changed) and to still parse (`bash -n` returned 0),
+each restored byte-for-byte afterwards and confirmed by a sha256 match.
+
+| Mutation | Sites | Result |
+|---|---:|---|
+| `--base "$BASE_SHA"` becomes `--base origin/main` | 3 | case 9 red on all three range gates, `FAILED (failures=3)` |
+| `--range "${BASE_SHA}..HEAD"` becomes `--range "origin/main..HEAD"` | 2 | case 9 red on both trailer gates, `FAILED (failures=2)` |
+
+Before the argv log, both mutations left the suite at `Ran 8 tests`, `OK`.
+
+Restored: `sha256sum -c` reports `OK` for all three files, and the suite returns
+to `Ran 14 tests`, `OK`.
 
 ## 8. Stop conditions
 

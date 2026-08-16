@@ -191,6 +191,14 @@ Disk 319 G free before and after.
 | base `0e1bee42f` | `6b4d4df071a6…` | `test cases: 2 \| 1 passed \| 1 failed \| 2 skipped` · `assertions: 43 \| 43 passed \| 0 failed` · `Status: FAILURE!` · **exit 139 (SIGSEGV)** |
 | base + G4 only (RED-first) | `63b7940e8609…` | G4 isolated: `test cases: 1 \| 0 passed \| 1 failed \| 4 skipped` · `assertions: 2 \| 1 passed \| 1 failed` · `Status: FAILURE!` · exit 1 |
 | base + G4 + fix | `690bf71448ea…` | `test cases: 5 \| 5 passed \| 0 failed \| 0 skipped` · `assertions: 62 \| 62 passed \| 0 failed` · `Status: SUCCESS!` · exit 0 |
+| HEAD, FRESH tree + clean build | `dc83e683f4fd…` | same: `5 \| 5 passed \| 0 failed \| 0 skipped` · `62 \| 62 passed \| 0 failed` · `Status: SUCCESS!` · exit 0 |
+
+The last row exists because the three above it are incremental rebuilds of one
+tree, and an incremental build is not proof that the committed tree builds. It is
+a fresh `git archive` of the branch into a new directory with no build state,
+configured and built from scratch. It is at `b9a99ba11`; the only later commit
+touches `tests/scripts/test_check_cuda_op_arch_gate.py`, which is in no C++
+target (`git diff --name-only b9a99ba11 HEAD`).
 
 The base run reproduces #960 verbatim, including the trap it names:
 `assertions: 43 | 43 passed | 0 failed` printed beside `Status: FAILURE!`, so
@@ -211,16 +219,103 @@ assertions this suite reports on GB10, plus G4's 2.
 
 ### GB10 (sm_121a), `-DVLLM_CPP_CUDA_ARCHITECTURES=121a`, CUTLASS `$HOME/cutlass`
 
-<!-- BEFORE/AFTER TABLE: filled from the two runs below. -->
+Configure asserted on BOTH builds: `CUDA target architectures: 121a` and
+`CUDA feature cutlass-fp8: ENABLED for [121a]`. A `DISABLED` line here would void
+the result — it would measure the bug rather than the fix. `BUILD_EXIT=0`,
+`warnings: 0`, `enospc: 0` both times, `-j 4`, disk 2.7 T free throughout. Every
+binary sha differs between the two columns, so neither column is a stale artifact.
+
+| suite | BEFORE (`0e1bee42f`) | AFTER (branch) |
+|---|---|---|
+| `test_ops_fp8_cpu` | `4 \| 4 passed \| 0 failed` · `60 \| 60 passed \| 0 failed` · `SUCCESS!` | `5 \| 5 passed \| 0 failed` · `62 \| 62 passed \| 0 failed` · `SUCCESS!` |
+| `test_ops_fp8_cutlass` | `8 \| 8 passed \| 0 failed` · `86 \| 86 passed \| 0 failed` · `SUCCESS!` | identical |
+| `test_linear_method` | `10 \| 9 passed \| 1 failed` · `97 \| 95 passed \| 2 failed` · `FAILURE!` | identical |
+| `test_ops_fused_chain` | `10 \| 10 passed \| 0 failed` · `583 \| 583 passed \| 0 failed` · `SUCCESS!` | identical |
+
+**GB10 is unchanged.** The only delta is `test_ops_fp8_cpu` gaining exactly G4:
++1 case, +2 assertions. The four pre-existing cases and their 60 assertions are
+untouched, which is the claim — the registration moved translation units on a
+host that already had it, and nothing about its behaviour moved with it.
+
+`test_linear_method` fails **identically in both columns**, which is how this run
+proves it is not ours: `linear_method: MXFP4 fused gate_up ~= split (numerically)
++ fused path ran`, `test_linear_method.cpp:247`, `CHECK( after == before + 1 )` —
+a Marlin dispatch counter, twice, on a suite with no fp8 arm. That is #907's
+`test_linear_method` row, at the cutlass-enabled build's shape (10/97 rather than
+the 8/85 #907 recorded, because `VT_MARLIN_NVFP4` adds cases). It is red at the
+BASE SHA on this box, measured, not assumed.
+
+**A trap worth recording, because it nearly produced a false result.** The first
+AFTER build reported `test_ops_fp8_cpu` at 4 cases / 60 assertions — G4 missing
+from a binary whose sha had changed. `tar` had restored the test file with its
+LOCAL mtime (06:46 UTC), older than the object compiled during the BASE build
+(07:10 UTC), so ninja skipped the compile and only relinked because `libvllm.a`
+had changed. The suite reported on a binary containing the fix but not the test.
+The numbers above are from a rebuild after `touch`. Verify the case COUNT, never
+just the sha.
 
 ### Local (CPU-only)
 
-`check-cuda-op-arch-gate --report`, its 14-case suite, `check-device-leakage`
-(DSR 32 == baseline 32), and the full preflight.
+Release-equivalent CPU build (`-DVLLM_CPP_BUILD_TESTS=ON`), `BUILD_EXIT=0`,
+**0 warnings**: `ctest` **489/489 passed, 0 failed** (2 skipped for absent
+checkpoints: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`).
+`test_ops_fp8_cpu` reads 4 cases / 56 assertions here — G4 compiles out on a
+non-CUDA build, which is correct and is why it is `#if defined(VLLM_CPP_CUDA)`.
+
+`scripts/agent-preflight.sh`: every gate green except
+`test_cpu_x86_llamacpp_floor`, which exited `NO_QUIET_WINDOW` (4) at loadavg
+77.49 while this box was building — the harness refusing to measure under
+contention, #618, inherited.
+
+`check-cuda-op-arch-gate --report` OK, its 14-case suite OK, `check-device-leakage`
+DSR 32 == baseline 32, `check-agent-record`, `check-public-doc-tables`,
+`check-test-registration`, `check-surface-coverage`, `check-fusion-consistency`,
+`check-fp4-resident-consistency`, `check-now-current`, `check-env-doc` all OK.
+
+### The checker's own mutation evidence, executed rather than described
+
+`scripts/check-pr-size.py --base <merge-base> --head HEAD` **passes**, and that
+is not a formality: its evidence contract checks out the branch into a scratch
+worktree, runs `tests/scripts/test_check_cuda_op_arch_gate.py` at HEAD (must
+pass, non-zero case count), then overwrites the checker with a disabled stub and
+re-runs the same module (must fail, non-zero case count). Both halves are
+required and both are machine-verified. The same contract runs for
+`scripts/check-pr-size.py` itself against `tests/scripts/test_check_pr_size.py`.
+
+That contract also caught a defect in the first version of the suite: it bound
+`unconditional_cuda_sources` / `cuda_registrations` / `check` at import time, so
+the stub produced an ImportError instead of failing cases, and the contract
+reported `semantic evidence did not execute tests` — neither red nor green, the
+instrument declining to say. Fixed by binding the module and going through
+`checker.` inside each case, which is what the container-matrix and
+container-workflow suites already do for the same reason.
 
 ## Outcome
 
-<!-- Filled at DONE. -->
+**What was measured.** The relocation is behaviour-preserving on a host that
+already had the op (GB10: four fp8 suites, identical case and assertion counts,
+identical pre-existing failure) and is the difference between a crash and a pass
+on a host that did not (Thor: `exit 139` → `5 | 5 passed`, `62 | 62 passed`).
+
+**What was rejected.** `cuda_matmul.cu` and `cuda_ops.cu` as homes, argued under
+[Design](#design): both would re-couple a cutlass-free kernel's compilation to an
+unrelated file. Also rejected: fixing this by widening `MatmulFp8CutlassD`'s
+guard or by making the reference tier refuse — the first hides the missing kernel
+behind a refusal on a path that does work, and the second is #844's class, which
+is a larger change to the tier and is deliberately still open.
+
+**Why the checker is written the way it is.** It asserts placement, not need. A
+version that tried to infer "does this kernel require cutlass" by scanning the
+body for `cutlass` tokens was rejected before it was written: it is transitive
+through helpers, so it would be both false-positive and false-negative, and a
+fuzzy gate is worse than none. The `REQUIRED` table is an argued list of two-line
+entries instead, and adding a genuinely arch-specific kernel to it would be wrong.
+
+**What this did NOT close.** #844. The portable reference tier still accepts
+`DeviceType::kCUDA` tensors and still calls itself "correct but slow" while
+dereferencing device pointers. This row removed the one instance that was live on
+a shipping path; the next feature-gated op to lose its native kernel will
+reproduce it exactly.
 
 ## Now
 

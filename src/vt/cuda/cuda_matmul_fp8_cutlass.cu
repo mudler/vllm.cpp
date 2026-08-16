@@ -18,9 +18,12 @@
 // tolerance of the two-stage form; the checkpoint scales ARE per-tensor.
 //
 // Isolated TU (heavy cutlass templates) — built only for sm_12{0,1}a. Pairs with
-// QuantFp8Static (below), the static per-tensor activation quant that mirrors
-// vLLM's static_scaled_fp8_quant (is_scale_inverted=False: x/input_scale, clamp,
-// RNE hardware cvt). See .agents/specs/cutlass-dropin-feasibility.md.
+// QuantFp8Static, the static per-tensor activation quant that mirrors vLLM's
+// static_scaled_fp8_quant (is_scale_inverted=False: x/input_scale, clamp, RNE
+// hardware cvt) — which lives in `src/vt/cuda/cuda_quant_fp8.cu` and is compiled
+// UNCONDITIONALLY for CUDA, because it needs no cutlass and this TU's arch gate
+// was silently withholding it from every other CUDA arch (issue #960).
+// See .agents/specs/cutlass-dropin-feasibility.md.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -316,65 +319,22 @@ void MatmulFp8CutlassKernelCuda(Queue& q, Tensor& out, const Tensor& a_fp8, cons
   Check(cudaGetLastError(), "matmul_fp8_cutlass launch");
 }
 
-// ---- Static per-tensor fp8 activation quant (vLLM static_scaled_fp8_quant) ---
-// inv = 1/input_scale; out_fp8[i] = fp8_e4m3(clamp(x[i]*inv, -448, 448)).
-// A RECIPROCAL MULTIPLY, not a divide, and the reciprocal is hoisted out of the
-// loop — that is upstream's shipped form (`x = val * scale` with the inverse
-// formed by the caller: csrc/quantization/w8a8/fp8/common.cuh:62 and
-// csrc/libtorch_stable/quantization/w8a8/fp8/common.cu:31). The code below is
-// RIGHT; do not "fix" it into `x / input_scale` to match a prose formula. The two
-// differ by up to one f32 ulp before the fp8 round, and near an e4m3 tie that
-// ulp changes the emitted byte on a default-ON 35B path.
-// __NV_SATFINITE cvt saturates == clamp-then-cvt; RNE == vLLM's hardware cvt.
-// Tin f32/bf16.
-//
-// The CPU arm (src/vt/cpu/cpu_ops.cpp QuantFp8StaticKernel) is INTENDED to be the
-// byte-for-byte mirror of this kernel, and that equivalence is DECLARED AND OWED,
-// not measured. It is gate G2 of .agents/specs/vt-fp8-w8a8-cpu-arm.md, which is
-// PENDING for want of a GPU (#468). What IS measured is weaker and lives on the
-// CPU side: G1 proves the CPU kernel matches an independent e4m3 reference derived
-// from the format. Two implementations each matching a reference is not the same
-// claim as the two matching each other, so do not cite this comment as evidence
-// that they agree. Run tests/vt/test_ops_fp8_cpu.cpp on a CUDA host to close it.
-__device__ __forceinline__ uint8_t F32ToFp8Dev(float f) {
-  return static_cast<uint8_t>(__nv_cvt_float_to_fp8(f, __NV_SATFINITE, __NV_E4M3));
-}
-__device__ inline float LoadIn(const float* p, int64_t i) { return p[i]; }
-__device__ inline float LoadIn(const __nv_bfloat16* p, int64_t i) { return __bfloat162float(p[i]); }
-
-template <typename Tin>
-__global__ void QuantFp8StaticKernel(uint8_t* out, const Tin* x, float input_scale, int64_t n) {
-  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  const float inv = 1.0f / input_scale;
-  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += step)
-    out[i] = F32ToFp8Dev(LoadIn(x, i) * inv);
-}
-
-void QuantFp8StaticKernelCuda(Queue& q, Tensor& out_fp8, const Tensor& x, float input_scale) {
-  const int64_t n = x.shape[0] * x.shape[1];
-  if (n == 0) return;
-  cudaStream_t s = AsStream(q);
-  const int blocks = static_cast<int>(std::min<int64_t>((n + 255) / 256, 65535));
-  switch (x.dtype) {
-    case DType::kF32:
-      QuantFp8StaticKernel<float><<<blocks, 256, 0, s>>>(out_fp8.Ptr<uint8_t>(), x.Ptr<float>(),
-                                                         input_scale, n);
-      break;
-    case DType::kBF16:
-      QuantFp8StaticKernel<__nv_bfloat16><<<blocks, 256, 0, s>>>(
-          out_fp8.Ptr<uint8_t>(), x.Ptr<__nv_bfloat16>(), input_scale, n);
-      break;
-    default: VT_CHECK(false, "cuda quant_fp8_static: unsupported x dtype (f32/bf16 only)");
-  }
-  Check(cudaGetLastError(), "quant_fp8_static launch");
-}
+// ---- Static per-tensor fp8 activation quant: NOT HERE ANY MORE (issue #960) --
+// `QuantFp8Static`'s CUDA kernel used to live below this line, and that was the
+// defect. This TU is compiled ONLY when `VT_CUTLASS_FP8_ARCHS` is non-empty, so
+// a kernel with no cutlass dependency whatsoever inherited cutlass's arch set
+// and `OpId::kQuantFp8Static` went UNREGISTERED for `DeviceType::kCUDA` on every
+// other CUDA arch — where the resolver then fell through to the portable CPU
+// reference tier and dereferenced device pointers (SIGSEGV; #844 is the same
+// defect from the fallback's end). It now lives in
+// `src/vt/cuda/cuda_quant_fp8.cu`, which is in the unconditional
+// `if(VLLM_CPP_CUDA)` source list. Do not move it back:
+// `scripts/check-cuda-op-arch-gate.py` fails if you do.
 
 struct Registrar {
   Registrar() {
     RegisterOp(OpId::kMatmulFp8Cutlass, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<MatmulFp8CutlassFn>(&MatmulFp8CutlassKernelCuda)));
-    RegisterOp(OpId::kQuantFp8Static, DeviceType::kCUDA,
-               reinterpret_cast<void*>(static_cast<QuantFp8StaticFn>(&QuantFp8StaticKernelCuda)));
   }
 };
 Registrar g_registrar;

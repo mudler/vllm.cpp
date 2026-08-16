@@ -113,11 +113,22 @@ std::vector<float> DequantGgufRowToF32(uint32_t ggml_type, const uint8_t* data,
     case 14:   // Q6_K
     case 22:   // IQ2_S  (~2.5-bit codebook; UD-IQ2_M ffn_gate/up experts)
     case 39:   // MXFP4  (OCP micro-scaling fp4; UD-IQ2_M ffn_down experts)
+    case 18:   // IQ3_XXS (~3-bit codebook; UD-IQ2_XXS ffn_down)
+    case 19:   // IQ1_S    (1.5625 bpw; Qwen3.8-2.4T-A95B UD-IQ1_S experts)
+    case 66:   // IQ1_XXXS (1.1875 bpw; UD-Q1_0 experts, fork-anchored)
     case 16: {  // IQ2_XXS (~2-bit codebook; UD-IQ2_XXS DeepSeek-V4 vehicle)
       // The block decoders moved to vt (src/vt/cpu/cpu_quant_dequant.cpp) so
       // the loader oracle and the compute-in-quant GEMM's generic fallback
       // share ONE implementation. The code is byte-identical to what lived
       // here, so numerics are unchanged; this test suite gates that.
+      // This list is the loader's EXPANSION path, and it has drifted behind
+      // `BlockDTypeFromGgmlTypeId` twice: 18, 19 and 66 were all decodable in
+      // vt while this switch still threw "unsupported ggml type" for them. The
+      // drift is not a corner case, because `RouteGgufTensor` routes a tensor
+      // here whenever the VT_CPU_REF oracle switch is on, keep-quant is off, K
+      // is ragged, or the role is not a verbatim one. A missing case is
+      // therefore a refusal to load the checkpoint on the reference lane.
+      // Keep this list in step with vt/dtype.cpp `kBlockDTypes`.
       // NOTE: MXFP4 (39) decodes here through the vt kMXFP4 block dtype — the
       // GGML micro-scaling form (kvalues_mxfp4 == 2*e2m1, scale 2^(byte-128)) —
       // NOT through the compressed-tensors E8M0ToF32 path used for NVFP4 (40)

@@ -277,6 +277,69 @@ TEST_CASE("KeepQuantDType covers the executable encodings") {
   }
 }
 
+namespace {
+
+// One row of a checkpoint census: an encoding, how many tensor records carry
+// it, and whether the loader is expected to keep it in blocks or expand it.
+// `keep_quant == false` is a real entry, not an omission: F32 is 838 of the
+// 1702 records in both target checkpoints, it is served by the expansion path,
+// and leaving it out is what let an incomplete list call itself total.
+struct CensusRow {
+  uint32_t ggml_type;
+  const char* name;
+  int tensors;
+  bool keep_quant;
+};
+
+// `split.tensors.count` from the shard headers, the same number on both
+// checkpoints. The list below must add up to exactly this.
+constexpr int kQwen38DeclaredTensors = 1702;
+
+// unsloth/Qwen3.8-2.4T-A95B-GGUF @ 567d3e6ac2, quant UD-IQ1_S, all 12 shards.
+constexpr CensusRow kUdIq1sCensus[] = {
+    {19, "iq1_s", 276, true},  // 96.92 % of params
+    {13, "q5_k", 420, true},   {10, "q2_k", 3, true},
+    {14, "q6_k", 162, true},   {12, "q4_k", 2, true},
+    {8, "q8_0", 1, true},      {0, "f32", 838, false},
+};
+
+// The same census over UD-Q1_0, all 10 shards. Identical apart from the expert
+// encoding: ggml 66 where UD-IQ1_S has ggml 19.
+constexpr CensusRow kUdQ10Census[] = {
+    {66, "iq1_xxxs", 276, true},  // 96.92 % of params
+    {13, "q5_k", 420, true},      {10, "q2_k", 3, true},
+    {14, "q6_k", 162, true},      {12, "q4_k", 2, true},
+    {8, "q8_0", 1, true},         {0, "f32", 838, false},
+};
+
+template <size_t N>
+void CheckCheckpointCensus(const CensusRow (&census)[N], const char* quant) {
+  CAPTURE(std::string(quant));
+  vt::DType dt = vt::DType::kF32;
+  int counted = 0;
+  for (const CensusRow& p : census) {
+    CAPTURE(p.name);
+    CAPTURE(p.ggml_type);
+    CAPTURE(p.tensors);
+    counted += p.tensors;
+    // Assert the ROUTING both ways. A row expected to keep its blocks must
+    // have a dot kernel, and a row expected to expand must NOT silently be
+    // reclassified as keep-quant by a later change.
+    if (p.keep_quant) {
+      CHECK(KeepQuantDType(p.ggml_type, &dt));
+      CHECK(vt::cpu::HasQuantDotKernel(dt));
+    } else {
+      CHECK_FALSE(KeepQuantDType(p.ggml_type, &dt));
+    }
+  }
+  // The list accounts for every declared record, so "this checkpoint needs
+  // nothing else" is a measurement rather than a claim.
+  CAPTURE(counted);
+  CHECK(counted == kQwen38DeclaredTensors);
+}
+
+}  // namespace
+
 TEST_CASE("every encoding in the Qwen3.8-2.4T UD-IQ1_S checkpoint decodes") {
   // Census of unsloth/Qwen3.8-2.4T-A95B-GGUF @ 567d3e6ac2, quant UD-IQ1_S,
   // taken by parsing the tensor header of all 12 shards: 1702 tensor records
@@ -289,24 +352,14 @@ TEST_CASE("every encoding in the Qwen3.8-2.4T UD-IQ1_S checkpoint decodes") {
   // bytes for nothing. IQ1_S alone is 96.92 % of the parameters (the
   // ffn_{down,gate,up}_exps of all 92 non-MTP layers), so an unsupported
   // encoding here is a refusal to run the model, never a slow path.
-  struct Present {
-    uint32_t ggml_type;
-    const char* name;
-    int tensors;
-  };
-  constexpr Present kCheckpoint[] = {
-      {19, "iq1_s", 276},  // 96.92 % of params
-      {13, "q5_k", 420},  {10, "q2_k", 3}, {14, "q6_k", 162},
-      {12, "q4_k", 2},    {8, "q8_0", 1},
-  };
-  vt::DType dt = vt::DType::kF32;
-  for (const Present& p : kCheckpoint) {
-    CAPTURE(p.name);
-    CAPTURE(p.ggml_type);
-    CAPTURE(p.tensors);
-    CHECK(KeepQuantDType(p.ggml_type, &dt));
-    CHECK(vt::cpu::HasQuantDotKernel(dt));
-  }
+  //
+  // The list has to SUM to the declared record count, and this case asserts
+  // that it does. An earlier revision claimed total coverage while enumerating
+  // six of the seven encodings: F32 was left out and the counts summed to 864,
+  // not 1702. A census that cannot say how many records it accounted for has
+  // not reported a census, and a list that is short by 838 tensors while
+  // calling itself TOTAL is the more misleading of the two states.
+  CheckCheckpointCensus(kUdIq1sCensus, "UD-IQ1_S");
 }
 
 TEST_CASE("every encoding in the Qwen3.8-2.4T UD-Q1_0 checkpoint decodes") {
@@ -320,24 +373,7 @@ TEST_CASE("every encoding in the Qwen3.8-2.4T UD-Q1_0 checkpoint decodes") {
   // oracle `llama-cpp-unsloth` (.agents/oracles/llama-cpp-unsloth.md), which is
   // admitted for this encoding family alone and is `gateable = no` until #933
   // measures it.
-  struct Present {
-    uint32_t ggml_type;
-    const char* name;
-    int tensors;
-  };
-  constexpr Present kCheckpoint[] = {
-      {66, "iq1_xxxs", 276},  // 96.92 % of params
-      {13, "q5_k", 420}, {10, "q2_k", 3}, {14, "q6_k", 162},
-      {12, "q4_k", 2},   {8, "q8_0", 1},
-  };
-  vt::DType dt = vt::DType::kF32;
-  for (const Present& p : kCheckpoint) {
-    CAPTURE(p.name);
-    CAPTURE(p.ggml_type);
-    CAPTURE(p.tensors);
-    CHECK(KeepQuantDType(p.ggml_type, &dt));
-    CHECK(vt::cpu::HasQuantDotKernel(dt));
-  }
+  CheckCheckpointCensus(kUdQ10Census, "UD-Q1_0");
 }
 
 TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {

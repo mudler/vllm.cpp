@@ -588,11 +588,14 @@ void VecDotIQ3_XXSQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
 // bits from `qh[ib]`; kIq1sGrid entries are packed TERNARY (-1/0/+1) bytes, so
 // there is no sign array to apply.
 //
-// The delta term is why this kernel reads `bsums` and the others do not. IQ1_S
-// reconstructs a weight as dl*(grid[j] + delta), so the dot splits into
-// sum(dl*grid*q8) plus delta*dl*sum(q8), and that second sum over each group of
-// 16 is exactly what Q8_K already caches in `bsums`. Recomputing it from `qs`
-// would be arithmetically identical but would read the activation twice.
+// The delta term is why this kernel reads `bsums`. IQ1_S reconstructs a weight
+// as dl*(grid[j] + delta), so the dot splits into sum(dl*grid*q8) plus
+// delta*dl*sum(q8), and that second sum over each group of 16 is exactly what
+// Q8_K already caches in `bsums`. Recomputing it from `qs` would be
+// arithmetically identical but would read the activation twice.
+//
+// The reason is specific to the delta; the FIELD is not. Q2_K, Q4_K and Q5_K
+// read `bsums` too, for their own per-sub-block minimum term.
 void VecDotIQ1_SQ8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
                      const void* vy, size_t by, int nrc) {
   VT_CHECK(n % kQK_K == 0, "vec_dot_iq1_s_q8_K: n must be a multiple of 256");

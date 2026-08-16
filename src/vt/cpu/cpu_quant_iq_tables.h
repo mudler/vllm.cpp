@@ -1,8 +1,16 @@
-// I-quant codebook + sign tables — a 1:1 mirror of llama.cpp @ 237ad9b96
-// `ggml/src/ggml-common.h`:
+// I-quant codebook + sign tables. Every table here but one mirrors llama.cpp
+// @ 237ad9b96 `ggml/src/ggml-common.h` 1:1:
 //   :499 kmask_iq2xs (8)    :503 ksigns_iq2xs (128)
 //   :550 iq2xxs_grid (256)  :1007 iq3xxs_grid (256)
 //   :748 iq2s_grid (1024)   :1116 kvalues_mxfp4 (16)
+//   :1121 IQ1S_DELTA        :1124 iq1s_grid (2048)
+//
+// The exception is `kIq1xxxsGrid` (256), which comes from a DIFFERENT tree:
+// the pinned fork oracle unslothai/llama.cpp @ 36fe8e1cc,
+// `ggml-common.h:2095 iq1_xxxs_grid`, because ggml type 66 is declared by no
+// upstream llama.cpp. See .agents/oracles/llama-cpp-unsloth.md and the note
+// above that table. IQ1_XXXS reuses upstream's own IQ1S_DELTA unchanged, so the
+// one delta constant serves both IQ1 encodings.
 //
 // These are the shared decode tables for the IQ2_XXS / IQ3_XXS / IQ2_S / MXFP4
 // block encodings. They were originally private to cpu_quant_dequant.cpp (the

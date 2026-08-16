@@ -244,10 +244,91 @@ Mutation cases, each restoring the tree byte-for-byte afterwards:
 
 ## 7. Evidence
 
-Recorded on completion: the red-before capture reproduced in a scratch
-repository, the green-after capture with the skip reported, the full preflight
-run with per-block counts and the pinned SHA, and the final SHA with a clean
-`git status --porcelain`.
+### 7.1 The defect reproduced on the unmodified script
+
+Scratch repository, stub `python3`, one `HEAD` and two settings of
+`refs/remotes/origin/main`. The only difference between the two runs is which
+commit that ref names.
+
+| `origin/main` | `ok` lines | `SKIP` lines | banner | exit |
+|---|---:|---:|---|---:|
+| an ancestor of `HEAD` | 76 | 0 | `All gates green.` | 0 |
+| a divergent commit | 74 | 0 | `All gates green.` | 0 |
+
+Two gates left the report and every observable in the output stayed the same.
+This is occurrence 3, at the same counts that were seen live.
+
+### 7.2 RED before
+
+`python3 tests/scripts/test_agent_preflight_skip_report.py` on the unmodified
+script: `Ran 8 tests`, `FAILED (failures=11)`. Five of the eight are red, and
+the three controls in `TheBannerStaysReachableTests` that must stay green
+already are. The count case reports the defect in one line:
+
+```
+AssertionError: 2 != 0 : 2 gate(s) disappeared from the report and 0 were
+reported as skipped. Every gate that stops running has to say so.
+```
+
+### 7.3 GREEN after
+
+Same suite on the repaired script: `Ran 8 tests`, `OK`.
+
+The same scratch comparison, rerun against the repaired script. The `ok` totals
+are one higher than in §7.1 because the new suite joined `SUITES`:
+
+| `origin/main` | `ok` | `SKIP` | banner | exit |
+|---|---:|---:|---|---:|
+| an ancestor of `HEAD` | 77 | 0 | `All gates green.` | 0 |
+| a divergent commit | 75 | 2 | none | 0 |
+
+The drop of two is now fully accounted for by two `SKIP` lines, and the run
+prints the reason and the pinned SHA:
+
+```
+2 gate(s) SKIPPED: commit-trailers commit-style
+NOT a green preflight: a skipped gate reported nothing about this tree.
+```
+
+### 7.4 Mutations
+
+Four mutations, each verified to have applied (`git diff --stat` changed) and to
+still compile (`bash -n` returned 0), each restoring the file byte-for-byte
+afterwards, confirmed by a sha256 match against the pre-mutation file.
+
+| Mutation | Cases turned red |
+|---|---|
+| the banner ignores the `skipped` array | 2: the non-ancestor case and the unresolvable-base case |
+| the trailer guard reads `origin/main` again instead of `$BASE_SHA` | 1: the mid-run move case |
+| `skip()` prints `ok` | 4: both skip cases, the count case, and the exit-code case |
+| the empty range reports `SKIP` | 1: the empty-range case |
+
+### 7.5 The row's own preflight run
+
+`bash scripts/agent-preflight.sh --quiet` on this branch, gated against
+`origin/main 3ce1cf7c74b930d1ce00612d0e15293ed139762c`, which both range block
+headings name.
+
+| Block heading | `ok` | `FAIL` | `SKIP` |
+|---|---:|---:|---:|
+| `Session role:` | 1 | 0 | 0 |
+| `Record gates:` | 25 | 1 | 0 |
+| `Mutation suites:` | 44 | 1 | 0 |
+| `Committed range vs origin/main 3ce1cf7c7:` | 3 | 0 | 0 |
+| `Commit trailers vs origin/main 3ce1cf7c7:` | 2 | 0 | 0 |
+| total | 75 | 2 | 0 |
+
+`SKIP` is 0, so this run did not itself skip a block, which is the same claim
+the row is about.
+
+The two failures are `check-env-doc` and `test_check_env_doc`, and they are
+**pre-existing on `main`**, not caused by this change. Reproduced in a detached
+worktree at `origin/main 3ce1cf7c7` with an empty `git status --porcelain`:
+`VT_MOE_EXPERT_STREAM`, `VT_MOE_EXPERT_STREAM_SLOTS` and
+`VT_MOE_EXPERT_STREAM_SLOT_BYTES` arrived with `3005447f8` (#993) and are
+neither documented nor allowlisted. Filed as
+[#1000](https://github.com/mudler/vllm.cpp/issues/1000) and owned by
+`ENG-EXPERT-STREAM`. This branch touches no path under `src/` or `include/`.
 
 ## 8. Stop conditions
 

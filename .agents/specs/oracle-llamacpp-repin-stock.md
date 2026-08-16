@@ -429,23 +429,38 @@ fork.
 - `scripts/agent-preflight.sh` on the committed head, with `origin/main` merged
   first so the commit-trailer block executes rather than silently skipping.
 - `git status --porcelain` empty.
-- Two gates are **inherited red** from `3005447f8` (#993), which added
-  `VT_MOE_EXPERT_STREAM`, `VT_MOE_EXPERT_STREAM_SLOTS`, and
-  `VT_MOE_EXPERT_STREAM_SLOT_BYTES` undocumented: `check-env-doc` and
-  `test_check_env_doc`. Filed as #1000, owned by `ENG-EXPERT-STREAM`, fix in
-  flight as PR #997. This row touches nothing under `src/` or `include/`, and
-  the same two gates fail identically on a pristine `origin/main` tree with
-  `git status --porcelain` empty. They are not this row's and are not repaired
-  here.
-- A **third** gate is inherited red, and an earlier draft of this section named
-  only two while runs produced three. `test_cpu_x86_llamacpp_floor` is
+- `check-env-doc` and `test_check_env_doc` were **inherited red** from
+  `3005447f8` (#993), which added `VT_MOE_EXPERT_STREAM`,
+  `VT_MOE_EXPERT_STREAM_SLOTS`, and `VT_MOE_EXPERT_STREAM_SLOT_BYTES`
+  undocumented. Filed as #1000 and #995, owned by `ENG-EXPERT-STREAM`. **Both
+  are now green here.** PR #997 landed as `45b022cdc` while this branch was in
+  flight, `origin/main` was merged again, and `python3 scripts/check-env-doc.py`
+  passes on a pristine `origin/main` worktree. The record says so rather than
+  keeping a stale waiver, because a stale exception is the same defect this row
+  removes from the oracle.
+- `check-agent-record` and `test_agent_record` are **inherited red from
+  `origin/main` itself**, and they arrived with that same landing.
+  `.agents/issue-index.md` now carries two rows for #995, one appended by this
+  branch's base and one by `45b022cdc`, and the checker refuses a duplicate with
+  "under `merge=union` a duplicate is what two branches appending the same issue
+  look like". Proved on a pristine detached worktree at `45b022cdc` with
+  `git status --porcelain` empty, not attributed: `scripts/check-agent-record.py`
+  returns `rc=1` there with the identical message. It is not this row's, and it
+  is not repaired here for two reasons. The index is append-only and a landed
+  row may not be edited or deleted, and choosing which of the two #995 texts
+  survives is a judgement for `ENG-EXPERT-STREAM`, which owns both.
+- `test_cpu_x86_llamacpp_floor` is a **third** inherited red, and an earlier
+  draft of this section named only two while runs produced three. It is
   load-dependent: at high loadavg its contended-leg case takes the
   `NO_QUIET_WINDOW` (4) exit instead of the `GIVING_UP` (2) it asserts, so the
   guarantee goes untested and the red presents as a defect in whatever diff is in
   flight. Filed as [#618](https://github.com/mudler/vllm.cpp/issues/618) and
   owned by `BACKEND-GATE-CPU-LLAMACPP`, which is the row this spec defers its
   lifecycle judgement to. Naming it here matters for that reason: the same row
-  owns both the flake and the re-measurement this repin makes owed.
+  owns both the flake and the re-measurement this repin makes owed. Measured in
+  both directions rather than asserted, on this branch and on a pristine
+  `origin/main` worktree: it PASSED at loadavg 12.47 and FAILED at 46, 61 and
+  216, with the failure text naming the load each time.
 - **No benchmark gate.** Recorded `PENDING` on #1003 and on host access, not
   waived.
 

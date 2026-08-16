@@ -805,7 +805,12 @@ the synthetic weights can turn it red for a reason that is not a defect. It fail
 LOUDLY when that happens, which is the failure mode to prefer.
 
 **Corrected, by a fourth fresh review: a non-zero acceptance COUNT at depth does
-NOT prove per-column provenance, and six sites said it did.** This is the claim
+NOT prove per-column provenance, and EIGHT sites said it did.** The review named
+six. A sweep for the claim in any phrasing found two more, in `roadmap_v1.md:87`
+and `engine-matrix.md:166`, which are exactly the surfaces someone scoping the
+owed gate would read. A claim is withdrawn from the sites someone lists and it
+survives wherever nobody grepped, so the count is recorded as measured rather
+than as reported. This is the claim
 this section previously carried as the closure, and it does not hold. Acceptance
 is accept-iff-equal on a PREFIX (`rejection_sampler.h:23-33`), and
 `spec_drafts_accepted_by_depth_[d]` increments exactly when `d < ns - 1`

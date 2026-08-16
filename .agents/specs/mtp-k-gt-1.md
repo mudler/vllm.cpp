@@ -531,6 +531,74 @@ is how it was attributed rather than assumed. `45b022cdc` (#997) landed the
 documentation on `origin/main` mid-flow and is merged in, so the final gate on
 this branch has both green.
 
+### Final gate, on `3bf1c4db8` against `origin/main` `d1b0ea3a8`
+
+This is the gate the row lands on. The section above is kept as history.
+
+The branch was merged with `origin/main` `d1b0ea3a8` first, and the merge was the
+point of the exercise rather than housekeeping. The base was `ff264cb82`, so
+`git merge-base --is-ancestor origin/main HEAD` FAILED, and that predicate is the
+guard on preflight's trailer block. The block was therefore skipping while the run
+still printed green. Two commits came in with the merge, and one of them is the
+repair for exactly that shape: `6621576ac` (#998, #1030) makes a skipped preflight
+gate report itself. `d1b0ea3a8` (#1008, #1036) is the LTX-2.5 decode dtype fix.
+Neither is on this row's code path.
+
+`scripts/agent-preflight.sh`, exit code `0`, by block. The base SHA is now printed
+in the block headings themselves, which is the #998 change. Every gate reported a
+RESULT and none skipped, counted rather than read: 77 `ok` lines, 0 `FAIL` and 0
+`SKIP`.
+
+| Block | ok | FAIL | SKIP |
+|---|---:|---:|---:|
+| Session role | 1 | 0 | 0 |
+| Record gates | 26 | 0 | 0 |
+| Mutation suites | 45 | 0 | 0 |
+| Committed range vs `origin/main` `d1b0ea3a8` | 3 | 0 | 0 |
+| Commit trailers vs `origin/main` `d1b0ea3a8` | 2 | 0 | 0 |
+
+The trailer block EXECUTED, and this time the ancestry was asserted rather than
+inferred from the block being present: `git merge-base --is-ancestor origin/main
+HEAD` succeeds against `d1b0ea3a8`, which is the SHA the two range blocks name in
+their own headings. Mutation suites are 45 rather than the 44 above because #998
+brought `tests/scripts/test_agent_preflight_skip_report.py` with it.
+
+`ctest -j 8` on the same head: 493 passed / 0 failed / 2 skipped of 495, exit code
+0, 180.68 s wall. The two skips are the same checkpoint-gated pair
+(`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`). Full `Release`
+rebuild first, exit 0, zero warnings. The three focused suites, run UNFILTERED
+because two case names contain commas and doctest's `-tc=` splits on them:
+`test_mtp_depth` 5 cases / 63 assertions, `test_prepare_decode_inputs` 8 / 33,
+`test_speculative_mtp_depth` 4 / 20, each `Status: SUCCESS!` and exit 0.
+
+A first `ctest` run was STARTED and then KILLED rather than reported, because a
+comment-only edit to `speculator.h` landed after that build. A comment cannot
+change behaviour, and a suite run against binaries built from a different tree is
+still a suite run against a different tree, which is the stale-binary shape this
+row already paid for once. The tree was rebuilt and `ctest` re-run whole.
+
+`test_cpu_x86_llamacpp_floor` FAILED once here and is #618, measured rather than
+asserted. Its contended-leg case reported `NO_QUIET_WINDOW` (4) instead of
+`GIVING_UP` (2) at loadavg 59.93, with two OTHER worktrees compiling at the time
+(one `cc1plus` pair on `ltx2_pipeline.cpp` and `ltx2_video.cpp`, plus an unrelated
+`minimax-music3-gen` holding a core). It PASSED on the rerun at loadavg 4.18 with
+zero builders, on the same tree and the same binaries. Nothing in this change is
+on that harness's path.
+
+Disk and load were checked before attributing anything to code: 30 GB free with
+the `build-cpu` tree at 9.8 GB, and loadavg 4.22 at the start of the final
+preflight. The GPU was not touched and no GPU lock was taken at any point in this
+flow.
+
+`doc-checkpoint --staged` FAILED once and was repaired rather than argued around.
+`include/vllm/` is a `user_usage` prefix
+(`check-doc-checkpoint.py:94-99`), so the `speculator.h` comment correction owed a
+`docs/USAGE.md` line in the SAME commit, and the range checker walks per commit so
+no later commit could pay it. The repair is a real one rather than a token edit:
+the USAGE row asserted that the delivered drafts "vary with depth" without saying
+that the rule is an AGGREGATE over a run, which reads as a per-call claim that
+would be false on this fixture.
+
 ### Records this row deliberately does NOT write
 
 `.agents/porting-inventory.md` section 9 gains no entry. The one deviation this

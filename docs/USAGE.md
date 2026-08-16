@@ -2594,9 +2594,14 @@ effect is to delete your own worst latencies from a measurement
 ([#931](https://github.com/mudler/vllm.cpp/issues/931),
 [#577](https://github.com/mudler/vllm.cpp/issues/577)).
 
-Comment frames are not `data:` events and carry no tokens. Token streaming uses
-a timed wait on the request collector either way, so deltas are never collapsed
-by a poll loop.
+Comment frames are not `data:` events and carry no tokens, and neither setting
+turns token streaming into a poll loop. At the `0` default both streams take the
+blocking `get_output()` on that request's own collector
+(`serving_completion.cpp:39-43`, `serving_chat.cpp:333-337`), which returns the
+instant the engine has something for that request. A positive interval swaps in
+`get_output_for()`, the same wait with a timeout attached, and the timeout only
+expires when the collector produced nothing at all. Deltas are therefore never
+collapsed or delayed either way.
 
 **A value the server cannot parse disables the keepalive; it is not an error.**
 `VT_SERVER_SSE_PING_S=fifteen`, an empty value and an unset variable all resolve

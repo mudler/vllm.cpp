@@ -194,6 +194,7 @@ record. The same P0 hit classic dense `Qwen3ForCausalLM` (quant-independent), fi
 | Requests completed, ours / vLLM | 5,5,5 / 6,6,6 of 6 | 24,24,24 / 24,24,24 of 24 | 36,37,36 / 48,48,48 of 48 |
 | Output token throughput | NOT ESTABLISHED, we dropped requests ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | **0.963x** | NOT ESTABLISHED, we dropped requests ([#931](https://github.com/mudler/vllm.cpp/issues/931)) |
 | Total token throughput | NOT ESTABLISHED | **0.918x** | NOT ESTABLISHED |
+| Status of the two withheld cells | cause LANDED: the drop was our own SSE keepalive frame, and `VT_SERVER_SSE_PING_S` now defaults to 0 ([#931](https://github.com/mudler/vllm.cpp/issues/931)) | (cell stands) | still withheld, now awaiting the paired 3-rep re-run owed by [#915](https://github.com/mudler/vllm.cpp/issues/915), not a diagnosis |
 | Median ITL, over completed only | 1.013x | **1.008x** | 1.021x |
 | Median TPOT, over completed only | 1.014x | 0.980x | 0.925x |
 | Median TTFT, over completed only | 0.733x | 0.881x | 1.268x |

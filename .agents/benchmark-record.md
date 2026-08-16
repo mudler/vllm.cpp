@@ -21914,3 +21914,45 @@ UNVERIFIED, stated so it is not re-derived as fact: whether dropping the page
 cache before every leg makes the first request fault in the ~55 GB of weights.
 The loader runs before `listen`, so the read is nominally inside the 53 s; no
 claim here depends on the answer.
+## Q38-27B-BF16 SSE KEEPALIVE A/B, CORRECTION: the c8 imputation error band does not follow from its own columns (2026-08-16, `row/FIX-SERVER-CONCURRENCY-931`, GB10 sm_121a, #931, #915)
+
+APPENDED, NOT EDITED. This file is append-only, so lines 21881 and 21884 of the
+preceding section stand as written and are SUPERSEDED here. Both say the c8
+slot-packing imputation ran `+25% to +40%` high. The high end is right. The low
+end follows from no pairing of the numbers printed beside it, and this is the
+table whose whole purpose is to let the next person price the technique before
+reusing it.
+
+THE CONVENTION IS THE ONE THE c1 ROW ALREADY USES, and that row is exact:
+error = (imputed - measured) / measured, denominator MEASURED.
+
+  c1  (93.9 - 91.613) / 91.613 = +2.4964% -> +2.50%, as recorded
+
+At c8 the imputation produced ONE number per rep (47.0 / 47.5 / 46.7 s over three
+reps) while the measurement is a RANGE over the eleven failed requests
+(33.8-40.8 s), so the band is the extremes of that pairing:
+
+  low   (46.7 - 40.8) / 40.8 = +14.4608% -> +14.5%
+  high  (47.5 - 33.8) / 33.8 = +40.5325% -> +40.5%
+
+CORRECTED BAND: **+14.5% to +40.5% high, against the MEASURED TTFT.** All six
+pairings of an imputed value with an end of the measured range lie inside it and
+none reaches +25%: 47.0 vs 40.8 = +15.20, 47.0 vs 33.8 = +39.05, 47.5 vs 40.8 =
++16.42, 47.5 vs 33.8 = +40.53, 46.7 vs 40.8 = +14.46, 46.7 vs 33.8 = +38.17
+percent. There is no denominator under which +25% is the low end. It was a slip
+and not a different convention, and the exact c1 row is what establishes that.
+
+NOTHING ELSE IN THE SUPERSEDED SECTION CHANGES. The A/B, the completion counts,
+the single error string, the 11-of-11 and 11-of-12 implications, the withdrawn
+15 s threshold claim, the INDICATIVE-ONLY throughput rows and the cold-start
+caveat all stand exactly as recorded. The only quantity that moves is how badly
+the imputation is priced, and it moves in the imputation's favour: it was less
+wrong at the low end than the section says. Recorded anyway, because a table
+that misprices its own technique cannot be used to decide whether to reuse it.
+
+RELATED WITHDRAWAL, for the reader who arrives from the count. The spec section
+that carries the same table said "Two earlier per-request figures for c8 are
+withdrawn" and then withdrew THREE (the ~3.7 / 5.9 / 6.4 s spans for indices
+2 / 12 / 18, measured at 40.8 / 37.6 / 38.6 s). Three is the count. That figure
+set is a different derivation from the 47.0 / 47.5 / 46.7 s wall-duration
+imputation above and is not part of this band.

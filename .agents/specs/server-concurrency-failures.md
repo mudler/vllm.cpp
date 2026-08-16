@@ -249,7 +249,7 @@ failures:
   is recorded under `## Owed` rather than explained away.
 - Failing requests' real TTFTs at c8: **33.8–40.8 s**.
 
-Two earlier per-request figures for c8 are withdrawn outright: the ≈3.7 / 5.9 /
+Three earlier per-request figures for c8 are withdrawn outright: the ≈3.7 / 5.9 /
 6.4 s spans once derived for indices 2 / 12 / 18 were artefacts of a crude `+8`
 slot mapping, flagged as approximate when it was made. Measured, those three are
 **40.8 / 37.6 / 38.6 s** — all well above the interval, not below it.
@@ -257,15 +257,31 @@ slot mapping, flagged as approximate when it was made. Measured, those three are
 **Imputation against measurement, kept visible because it calibrates the
 method:**
 
-| leg | imputed from wall duration | measured | error |
+| leg | imputed from wall duration | measured | error, `(imputed - measured) / measured` |
 |---|---|---|---|
-| c1 | 93.9 s | **91.613 s** | +2.5% |
-| c8 | 47.0 / 47.5 / 46.7 s | **33.8–40.8 s** | +25% to +40% |
+| c1 | 93.9 s | **91.613 s** | **+2.50%**, from `(93.9 - 91.613) / 91.613` |
+| c8 | 47.0 / 47.5 / 46.7 s | **33.8 to 40.8 s** | **+14.5% to +40.5%**, from `(46.7 - 40.8) / 40.8` at the low end and `(47.5 - 33.8) / 33.8` at the high end |
+
+The denominator is the MEASURED TTFT in both rows, which is the convention the
+exact c1 row already uses. The two rows are not the same shape, and the band
+depends on that. At c1 one imputed number faces one measurement. At c8 the
+imputation produced one number PER REP, three of them, and the measurement is a
+RANGE over the eleven failed requests, so the band is the two extremes of that
+pairing: smallest imputed against largest measured, and largest imputed against
+smallest measured. It is not a per-request error. All six pairings fall inside
+it, and none reaches +25%: +15.2, +39.1, +16.4, +40.5, +14.5 and +38.2 percent.
+
+**An earlier `+25% to +40%` is withdrawn.** Its high end was right. Its low end
+follows from no pairing of the columns printed beside it, and this table exists
+so the next person can price the imputation technique before relying on it. A
+band that does not follow from its own adjacent columns cannot serve that
+purpose. The correction is carried in `.agents/benchmark-record.md`, which is
+append-only, as an appended entry that cites the superseded lines.
 
 At c1 the semaphore serialises and the arithmetic was nearly exact. At c8 the
-imputation assumed perfectly packed slots and ran 25–40% high, exactly the way it
-was flagged it might. The imputed row is not deleted; it is left beside the
-measurement so the next person can price the technique before relying on it.
+imputation assumed perfectly packed slots and ran 14.5% to 40.5% high, exactly
+the way it was flagged it might. The imputed row is not deleted. It is left beside
+the measurement so the next person can price the technique before relying on it.
 
 **Why the threshold was never the mechanism, even though it correlates.**
 `SsePingIntervalSec()` bounds a wait on **that request's collector**, and the

@@ -824,6 +824,11 @@ those throughput cells are **withheld, not quoted**
 tokens by a duration that still contains the dead request, which is why c1 reads
 0.677x while median TPOT in the same file reads 1.014x in our favour.
 
+**That cause has landed, and the two cells are now waiting on a re-run rather
+than on a diagnosis.** The dropped requests were our own SSE keepalive comment
+frame, and `VT_SERVER_SSE_PING_S` now defaults to `0`. Both cells stay withheld
+until [#915](https://github.com/mudler/vllm.cpp/issues/915) re-runs them paired.
+
 Resource axes on the same series: cold start to first `/health` **53 s vs
 780 s = 14.7x**, and host memory after warmup **42.5 vs 110.1 GiB = 2.59x** —
 the latter with the caveat that vLLM's figure is set by

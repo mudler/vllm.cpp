@@ -5,6 +5,9 @@
 // .agents/specs/qwen36-forward-notes.md (assembly, §2 mRoPE->NeoX, §5 attention),
 // .agents/specs/gdn-semantics.md (§1 layout, §6 g/beta prep, §7 recurrence),
 // .agents/specs/moe-semantics.md (§1-§6 MoE block + activated-expert gather).
+#include "vllm/model_executor/host_expert_slot_store.h"
+#include "vllm/model_executor/expert_streamer.h"
+#include "vllm/model_executor/expert_slot_cache.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 
 #include "vllm/model_executor/models/decode_graph_sizes.h"
@@ -5118,12 +5121,139 @@ Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
   return wt;
 }
 
+// ENG-EXPERT-STREAM W4: serve an expert slice from a BOUNDED slot cache instead
+// of reading it straight out of the mmap'd tower.
+//
+// Default OFF (`VT_MOE_EXPERT_STREAM=1` turns it on, `VT_MOE_EXPERT_STREAM_SLOTS`
+// sets the budget), so every existing path keeps its bytes and its numbers.
+//
+// Why this exists, measured rather than assumed. On `Qwen3.8-2.4T-A95B UD-Q1_0`
+// the borrowed tower already makes a 370 GiB model FIT in 119 GiB, because the
+// weights are never copied. What it does not do is make it fast: each token
+// needs ~6.7 GB of expert bytes and the kernel serves them as 4 KiB faults in
+// ROUTER order, measured near 100 MB/s against an NVMe that sustains ~5 GB/s.
+// A slot is filled by ONE contiguous copy of a whole slice, so the read is
+// sequential, and a slice already resident costs nothing at all.
+//
+// The cache is keyed by (tower, expert). A tower's identity is its base
+// pointer, which is stable for the model's life because the tower is a borrowed
+// view into the mapping; the id map is built once per pointer.
+class Qwen35ExpertStream {
+ public:
+  static Qwen35ExpertStream* Get(size_t slot_bytes) {
+    static const bool on = [] {
+      const char* v = std::getenv("VT_MOE_EXPERT_STREAM");
+      return v != nullptr && v[0] != '0' && v[0] != '\0';
+    }();
+    if (!on) return nullptr;
+    static Qwen35ExpertStream* inst = nullptr;
+    if (inst == nullptr) inst = new Qwen35ExpertStream(slot_bytes);
+    // A tower larger than the slot cannot be served by THIS store. Refuse by
+    // name rather than silently falling back, which would make a streaming
+    // benchmark quietly measure the mmap path instead.
+    VT_CHECK(slot_bytes <= inst->store_->slot_bytes(),
+             "expert stream: a slice of " + std::to_string(slot_bytes) +
+                 " bytes exceeds the slot budget of " +
+                 std::to_string(inst->store_->slot_bytes()) +
+                 "; raise VT_MOE_EXPERT_STREAM_SLOT_BYTES");
+    return inst;
+  }
+
+  // Returns the slot's bytes for `expert` of the tower based at `base`, or
+  // nullptr when the cache is exhausted for this step (the caller then reads
+  // the tower directly, which is correct but slow, and is counted).
+  uint8_t* Slice(const uint8_t* base, int64_t expert, size_t offset,
+                 size_t bytes) {
+    const int32_t tower = TowerId(base);
+    const ExpertStreamer::Result r = streamer_->EnsureSpan(
+        ExpertKey{tower, static_cast<int32_t>(expert)}, base + offset, bytes);
+    if (r.slot < 0) {
+      ++exhausted_;
+      return nullptr;
+    }
+    return store_->Slot(r.slot);
+  }
+
+  void EndStep() { streamer_->EndStep(); }
+  const ExpertStreamer& streamer() const { return *streamer_; }
+  int64_t exhausted() const { return exhausted_; }
+
+ private:
+  explicit Qwen35ExpertStream(size_t slot_bytes) {
+    const char* sb = std::getenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES");
+    if (sb != nullptr && *sb != '\0') {
+      const long long v = std::atoll(sb);
+      if (v > 0) slot_bytes = static_cast<size_t>(v);
+    }
+    int32_t slots = 64;
+    const char* sv = std::getenv("VT_MOE_EXPERT_STREAM_SLOTS");
+    if (sv != nullptr && *sv != '\0') {
+      const long v = std::atol(sv);
+      if (v > 0) slots = static_cast<int32_t>(v);
+    }
+    store_ = std::make_unique<HostExpertSlotStore>(slots, slot_bytes);
+    cache_ = std::make_unique<ExpertSlotCache>(slots);
+    streamer_ = std::make_unique<ExpertStreamer>(*cache_, *store_);
+    std::fprintf(stderr,
+                 "[expert-stream] ON slots=%d slot_bytes=%zu resident=%.2f GiB\n",
+                 slots, slot_bytes, store_->resident_bytes() / 1073741824.0);
+  }
+
+  int32_t TowerId(const uint8_t* base) {
+    auto it = tower_ids_.find(base);
+    if (it != tower_ids_.end()) return it->second;
+    const int32_t id = next_tower_id_++;
+    tower_ids_.emplace(base, id);
+    return id;
+  }
+
+  std::unique_ptr<HostExpertSlotStore> store_;
+  std::unique_ptr<ExpertSlotCache> cache_;
+  std::unique_ptr<ExpertStreamer> streamer_;
+  std::unordered_map<const uint8_t*, int32_t> tower_ids_;
+  int32_t next_tower_id_ = 0;
+  int64_t exhausted_ = 0;
+};
+
+// The expert-slice seam. Identical to KqResidentSlice except that, when
+// streaming is on, the returned tensor points at a SLOT holding a contiguous
+// copy of the slice rather than into the tower itself.
+Tensor KqExpertSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
+                     int64_t row_off, int64_t expert) {
+  const size_t row_bytes = vt::RowSizeBytes(w.dtype, K);
+  const size_t bytes = static_cast<size_t>(N) * row_bytes;
+  // Streaming only serves a CPU-resident borrowed tower: a staged device weight
+  // is already resident on the device, and copying it through host slots would
+  // move MORE bytes, not fewer.
+  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
+    if (Qwen35ExpertStream* st = Qwen35ExpertStream::Get(bytes)) {
+      const uint8_t* base = w.bytes.data();
+      if (uint8_t* slot = st->Slice(base, expert,
+                                    static_cast<size_t>(row_off) * row_bytes,
+                                    bytes)) {
+        Tensor wt = ResidentWeight(d, w);  // inherit dtype/device/repack markers
+        wt.data = static_cast<void*>(slot);
+        wt.rank = 2;
+        wt.shape[0] = N;
+        wt.shape[1] = K;
+        wt.stride[0] = K;
+        wt.stride[1] = 1;
+        return wt;
+      }
+    }
+  }
+  return KqResidentSlice(d, w, N, K, row_off);
+}
+
 std::vector<float> MatmulF32Slice(Dev d, const std::vector<uint16_t>& x, int64_t M,
                                   int64_t N, int64_t K, const OwnedTensor& w,
-                                  int64_t row_off) {
+                                  int64_t row_off, int64_t expert) {
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
   DBuf dout(d, DType::kF32, {M, N});
-  Tensor dw = KqResidentSlice(d, w, N, K, row_off);
+  // expert >= 0 marks a routed-expert slice, which is the only thing the
+  // streaming slot cache serves; everything else keeps the tower view.
+  Tensor dw = expert >= 0 ? KqExpertSlice(d, w, N, K, row_off, expert)
+                          : KqResidentSlice(d, w, N, K, row_off);
   vt::MatmulBT(d.q, dout.t(), dx.t(), dw);
   std::vector<float> out(static_cast<size_t>(M) * N);
   dout.Download(d, out.data());
@@ -5132,10 +5262,11 @@ std::vector<float> MatmulF32Slice(Dev d, const std::vector<uint16_t>& x, int64_t
 
 std::vector<uint16_t> MatmulBf16Slice(Dev d, const std::vector<uint16_t>& x, int64_t M,
                                       int64_t N, int64_t K, const OwnedTensor& w,
-                                      int64_t row_off) {
+                                      int64_t row_off, int64_t expert) {
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
   DBuf dout(d, DType::kBF16, {M, N});
-  Tensor dw = KqResidentSlice(d, w, N, K, row_off);
+  Tensor dw = expert >= 0 ? KqExpertSlice(d, w, N, K, row_off, expert)
+                          : KqResidentSlice(d, w, N, K, row_off);
   vt::MatmulBT(d.q, dout.t(), dx.t(), dw);
   std::vector<uint16_t> out(static_cast<size_t>(M) * N);
   dout.Download(d, out.data());
@@ -5152,12 +5283,12 @@ std::vector<uint16_t> ExpertMlpKq(Dev d, const OwnedTensor& gate_kq,
                                   const OwnedTensor& up_kq, const OwnedTensor& down_kq,
                                   const std::vector<uint16_t>& x, int64_t e, int64_t n,
                                   int64_t H, int64_t I) {
-  std::vector<float> hg = MatmulF32Slice(d, x, n, I, H, gate_kq, e * I);  // [n,I]
-  std::vector<float> hu = MatmulF32Slice(d, x, n, I, H, up_kq, e * I);    // [n,I]
+  std::vector<float> hg = MatmulF32Slice(d, x, n, I, H, gate_kq, e * I, e);  // [n,I]
+  std::vector<float> hu = MatmulF32Slice(d, x, n, I, H, up_kq, e * I, e);    // [n,I]
   std::vector<uint16_t> act(static_cast<size_t>(n) * I);
   for (size_t i = 0; i < act.size(); ++i)
     act[i] = vt::F32ToBF16(Silu(hg[i]) * hu[i]);
-  return MatmulBf16Slice(d, act, n, H, I, down_kq, e * H);  // [n,H]
+  return MatmulBf16Slice(d, act, n, H, I, down_kq, e * H, e);  // [n,H]
 }
 
 // W3b: keep-quant grouped MoE — default-ON, VT_QWEN35_GROUPED_MOE=0 restores the

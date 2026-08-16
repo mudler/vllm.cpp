@@ -20,6 +20,44 @@ ExpertStreamer::ExpertStreamer(ExpertSlotCache& cache, ExpertSlotStore& store)
   }
 }
 
+ExpertStreamer::Result ExpertStreamer::EnsureSpan(const ExpertKey& key,
+                                                  const uint8_t* src,
+                                                  size_t bytes) {
+  Result out;
+
+  // Same ordering rule as the tensor overload, and for the same reason: check
+  // the size BEFORE acquiring, or a slice that cannot be stored still evicts a
+  // resident expert on its way to being refused.
+  if (bytes > store_.slot_bytes()) {
+    throw std::invalid_argument(
+        "expert streamer: expert span is " + std::to_string(bytes) +
+        " bytes but a slot holds " + std::to_string(store_.slot_bytes()));
+  }
+  if (src == nullptr && bytes > 0) {
+    throw std::invalid_argument("expert streamer: null span with bytes > 0");
+  }
+
+  const ExpertAcquisition acq = cache_.Acquire(key);
+  if (acq.slot < 0) return out;  // exhausted: caller reports, never works around
+  if (acq.slot >= store_.slot_count()) {
+    throw std::out_of_range(
+        "expert streamer: cache returned slot " + std::to_string(acq.slot) +
+        " but the store holds " + std::to_string(store_.slot_count()));
+  }
+
+  out.slot = acq.slot;
+  if (acq.hit) {
+    out.hit = true;  // resident: no bytes move, which is the entire saving
+    return out;
+  }
+
+  store_.WriteSlot(acq.slot, src, bytes);
+  bytes_filled_ += static_cast<int64_t>(bytes);
+  ++fills_;
+  out.filled = true;
+  return out;
+}
+
 ExpertStreamer::Result ExpertStreamer::Ensure(const ExpertKey& key,
                                               const GgufTensorInfo& tensor,
                                               const GgufExpertLayout& layout) {

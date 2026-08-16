@@ -71,6 +71,16 @@ class ExpertStreamer {
   Result Ensure(const ExpertKey& key, const GgufTensorInfo& tensor,
                 const GgufExpertLayout& layout);
 
+  // Same contract, for a caller that already holds the expert's SPAN rather
+  // than the GGUF record it came from. The decode path is such a caller: by the
+  // time a model runs, an expert tower is a borrowed byte range plus a row
+  // offset, and the `GgufTensorInfo` that produced it is long gone. Routing
+  // that caller through the tensor overload would mean reconstructing a record
+  // just to be taken apart again.
+  //
+  // `src` must stay valid for the call; the slot owns a copy afterwards.
+  Result EnsureSpan(const ExpertKey& key, const uint8_t* src, size_t bytes);
+
   void EndStep() { cache_.EndStep(); }
 
   // Bytes actually moved, which is the number a streaming benchmark reports.

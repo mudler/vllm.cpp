@@ -160,7 +160,7 @@ appear in any artifact this project holds. This project's own record contains
 down here with its provenance attached rather than carried forward as a target.
 
 Our binding quantized-27B cell is 10.756 against vLLM's 11.250 at c1
-(`docs/BENCHMARKS.md:97`, Qwen3.6-27B NVFP4). That is a **raw** decode number.
+(`docs/BENCHMARKS.md:96-97`, Qwen3.6-27B NVFP4). That is a **raw** decode number.
 Dividing 38.28 by it compares a drafted arm against a raw one and is refused by
 this spec.
 

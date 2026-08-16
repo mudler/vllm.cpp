@@ -686,6 +686,23 @@ Established: **the model does not load in 119 GiB today, and expert streaming is
 REQUIRED rather than an optimisation.** The row's original premise stands
 unchanged; the "the kernel already does this" shortcut does not exist.
 
+**Narrowed 16 August 2026, same run.** The anonymous memory is ONE merged VMA,
+not many small ones: at t+300 s the process held a single 12.9 GiB anonymous
+region, fully resident, alongside a 209 MiB heap and nothing else above 64 MiB.
+Linux merges adjacent anonymous VMAs with identical flags, so that signature is
+a run of large sequential allocations coalescing, which is what
+`AllocAligned64` (`src/vt/cpu/cpu_backend.cpp:15`) produces one weight at a
+time. It is NOT an arena (the CPU backend has none), and it is NOT the KV cache
+(`num_blocks` auto-resolves to 256, about 4 GiB).
+
+So the weights are being copied into CPU device memory even though
+`qwen3_5.cpp:976` aliases them when `GetPlatform(d.q.device.type).is_cpu()`, and
+`--device cpu` demonstrably reaches the loader (`server_main.cpp:1034` sets
+`engine_params.device` before the `FromModelDir` at :1103). Those two facts still
+disagree, and THAT is the remaining question: instrument the branch and find out
+whether `is_cpu()` is false at that point, or whether a second copy happens
+elsewhere.
+
 NOT established: the exact allocation site. The evidence bounds the OUTCOME
 (linear anonymous growth proportional to load progress) without identifying
 which call allocates. Routing says borrow, the process says anonymous, and those

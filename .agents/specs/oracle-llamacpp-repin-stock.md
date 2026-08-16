@@ -429,8 +429,13 @@ ROW, SEP = re.compile(r"^\s*\|"), re.compile(r"^\s*\|[\s:|-]+\|\s*$")
 # below by name. Each ratio is TWO alternatives, `x` and U+00D7 `×`, because
 # one of them died on its own once. A ratio is favourable whatever its value:
 # this tree writes `0.758x` for an RSS win and `0.204x` for a decode loss, so
-# a bare ratio has no polarity the sweep can read.
-FAV = {r"[0-9]+(?:\.[0-9]+)? *x\b": ["1.18x llama.cpp", "0.461x RSS"],
+# a bare ratio has no polarity the sweep can read. A control carries SHAPES and
+# not only tokens, because a NARROWING keeps a token live while dropping a
+# shape: `15x` guards the integer ratio and `0.69%` the spaceless percentage,
+# and both shapes are written in this tree. See §"A live token is not a covered
+# shape" for what this still does not cover.
+FAV = {r"[0-9]+(?:\.[0-9]+)? *x\b": ["1.18x llama.cpp", "0.461x RSS",
+                                     "a 15x to 18x target"],
        r"[0-9]+(?:\.[0-9]+)? *×": ["| 1.023× |", "2× over llama.cpp", "3.9×decode"],
        r"\bMET\b": ["decode MET"], r"\bPARITY\b": ["peak memory PARITY"],
        r"\bPASS\b": ["prefill PASS"], r"\btie\b": ["a tie on decode"],
@@ -439,39 +444,21 @@ FAV = {r"[0-9]+(?:\.[0-9]+)? *x\b": ["1.18x llama.cpp", "0.461x RSS"],
        r"\bwin\b": ["a win on prefill"], r"\bwins\b": ["ours wins here"],
        r"\bless\b": ["24.2 % less"], r"\bfaster\b": ["decode is faster"],
        r"\bmatch(?:es|ed)?\b": ["matches llama.cpp", "matched it", "an exact match"]}
-REST = {r"[0-9]+(?:\.[0-9]+)? ?%": ["96.92 % of it"],   # a bare percentage, or
+REST = {r"[0-9]+(?:\.[0-9]+)? ?%": ["96.92 % of it",    # a bare percentage, or
+                                    "0.69% of the total"],
         r"\bFAIL(?:ED|S)?\b": ["the axis FAILS", "one FAIL"],   # a verdict that
         r"\bbehind\b": ["behind on decode"],            # can only be against us
         r"\bslower\b": ["24.4 t/s slower"]}
 CMP = re.compile("|".join([*FAV, *REST]))               # stage 1
 FAVOURABLE = re.compile("|".join(FAV))                  # stage 2
 
-# SELF-TEST, and the sweep refuses to run without it. See §"A token can be
-# WRONG as well as MISSING". A control that no other alternative in its own
-# list matches is what makes a single dead token detectable: a shared MUST
-# list cannot do it, because a neighbouring token rescues the string and the
-# defect reads green. The two counts are the other half, since deleting an
-# entry outright would take its own control away with it.
-MUST_NOT = ["the llama.cpp build recipe", "unpacked at ~/lcpp-vk",
-            "llama-bench was built with GGML_CUDA=OFF",       # recipe prose,
-            "matching the upstream layout", "winner takes the lock"]  # 2 misses
-bad = [(t, s, own) for g in (FAV, REST) for t, ctl in g.items() for s in ctl
-       for own in [[u for u in g if re.search(u, s)]]
-       if own != [t] or not CMP.search(s)
-       or (g is REST) == bool(FAVOURABLE.search(s))]
-bad += [("MUST_NOT", s, None) for s in MUST_NOT if CMP.search(s)]
-assert (len(FAV), len(REST)) == (15, 4) and not bad, (len(FAV), len(REST), bad)
-
-cand, fav = [], 0
-for path in subprocess.run(["git", "ls-files"],           # NO path arguments
-                           capture_output=True, text=True).stdout.split():
-    lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
-    header, i = {}, 0
-    while i < len(lines):                 # map every table body row to its header
+def scan(lines):       # ONE spelling of the attribution rule, so the fixtures
+    header, i, out = {}, 0, []           # below bind the code that RUNS rather
+    while i < len(lines):                # than a copy of it. Stage 1 is
         if ROW.match(lines[i]) and i + 1 < len(lines) and SEP.match(lines[i + 1]):
-            j = i + 2
+            j = i + 2                    # unmoved by this extraction, measured
             while j < len(lines) and ROW.match(lines[j]):
-                header[j], j = i, j + 1
+                header[j], j = i, j + 1  # map every table body row to its header
             i = j
         else:
             i += 1
@@ -481,11 +468,51 @@ for path in subprocess.run(["git", "ls-files"],           # NO path arguments
         near = any(LLAMA.search(lines[k])
                    for k in range(max(0, n - 3), min(len(lines), n + 4)))
         if near or (n in header and LLAMA.search(lines[header[n]])):
-            cand.append(f"{path}:{n + 1}:{ln.strip()}")
-            fav += bool(FAVOURABLE.search(ln))    # the BODY. Never the printed
-print("\n".join(cand))                            # line: a PATH can carry
+            out.append((n, bool(FAVOURABLE.search(ln))))   # the BODY. Never the
+    return out                            # printed line: a PATH can carry
+                                          # `parity`, and one does
+# SELF-TEST, and the sweep refuses to run without it. See §"A token can be
+# WRONG as well as MISSING". A control that no other alternative in its own
+# list matches is what makes a single dead token detectable: a shared MUST
+# list cannot do it, because a neighbouring token rescues the string and the
+# defect reads green. The two counts are the other half, since deleting an
+# entry outright would take its own control away with it.
+MUST_NOT = ["the llama.cpp build recipe", "unpacked at ~/lcpp-vk",
+            "llama-bench was built with GGML_CUDA=OFF",       # recipe prose,
+            "matching the upstream layout", "winner takes the lock"]  # 2 misses
+# The ATTRIBUTION half carried NO control while the token half carried 19, and
+# a sweep is both halves. WINDOW binds the +-3 reach in both directions and its
+# far edge, which is the line at 4 that must NOT be a candidate. TABLE binds
+# the header clause with llama.cpp out of window reach, so only the header can
+# find it. BENCH binds `llama-bench` as a spelling of LLAMA, and a REST-only
+# body as NOT favourable.
+WINDOW = ["a tie on decode", "", "", "llama.cpp built fresh", "", "",
+          "1.18x on prefill", "", "", "", "a win on prefill"]
+TABLE = ["| axis | ours | llama.cpp |", "|---|---|---|", "| pad | 1 | 2 |",
+         "| pad | 3 | 4 |", "| pad | 5 | 6 |",
+         "| prefill | 223.8 tok/s | 1.18x |", "", ""]
+BENCH = ["llama-bench -p 128", "", "", "24.4 t/s slower"]
+bad = [(t, s, own) for g in (FAV, REST) for t, ctl in g.items() for s in ctl
+       for own in [[u for u in g if re.search(u, s)]]
+       if own != [t] or not CMP.search(s)
+       or (g is REST) == bool(FAVOURABLE.search(s))]
+bad += [("MUST_NOT", s, None) for s in MUST_NOT if CMP.search(s)]
+bad += [(nm, got, want) for nm, got, want in
+        [("WINDOW", scan(WINDOW), [(0, True), (6, True)]),
+         ("TABLE", scan(TABLE), [(5, True)]),
+         ("BENCH", scan(BENCH), [(3, False)])] if got != want]
+assert (len(FAV), len(REST)) == (15, 4) and not bad, (len(FAV), len(REST), bad)
+
+cand, fav = [], 0
+for path in subprocess.run(["git", "ls-files"],           # NO path arguments
+                           capture_output=True, text=True).stdout.split():
+    lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+    for n, f in scan(lines):
+        cand.append(f"{path}:{n + 1}:{lines[n].strip()}")
+        fav += f
+print("\n".join(cand))
 print(f"stage 1 {len(cand)} in {len({c.split(':')[0] for c in cand})} files, "
-      f"stage 2 {fav}")                           # `parity`, and one does
+      f"stage 2 {fav}")
 ```
 
 ### The token set was the fifth hole, and it is the same defect
@@ -589,11 +616,25 @@ downstream, where under-counting is the direction that matters.
 Stage 1 carried `\bfaster\b`, `\bwins\b`, `\bties\b` and `\bless\b`. Stage 2
 carried none of them, only the literal `% less`. Measured at `85a9a7ae7` over the
 identical 1225-candidate set, the retired stage-2 pipe returns 958 and the
-derived `FAVOURABLE` returns **1007**, and the 49 lines it never saw decompose
-exactly: **11 `faster`, 11 `wins`, 3 bare `less`, 2 `ties`**, plus **22 ratios
-below 1.0** that its `\b[1-9]` prefix was written to exclude.
+derived `FAVOURABLE` returns **1007**. The 49 lines it never saw split **27 on a
+word token and 22 on a ratio**: the word half is **11 `faster`, 11 `wins`, 3 bare
+`less`, 2 `ties`**, and it is the whole of what the four missing tokens cost.
 
-Two things follow, and the second is worse than the first.
+**The 22 are not what an earlier draft of this paragraph called them, and the
+correction runs the other way.** That draft read "22 ratios below 1.0 that its
+`\b[1-9]` prefix was written to exclude". Re-derived at `85a9a7ae7` on a clean
+detached worktree with `git status --porcelain` empty, **only 4** of the 22 carry
+a ratio below 1.0. The other **18** carry no ratio at all. They are ratio-shaped
+text glued to a preceding word character, and they are architecture names and a
+quantization type rather than measurements:
+
+| shape | where | count |
+|---|---|---:|
+| `C2x`, `C3x`, the CUTLASS API generations | `.agents/backend-matrix.md`, `.agents/parity-ledger.md`, `.agents/specs/cuda-arch-ampere-fastpath.md`, `.agents/specs/best-gemm-path-2026-07-30.md`, `docs/STATUS.md`, `.agents/completed/state-events/0000-00/STATE-LEGACY-000001.md` | 13 |
+| `sm_12x`, `sm8x`, arch wildcards | `.agents/specs/metal-mlx-reuse-study.md`, `.agents/specs/cuda-arch-ampere-fastpath.md`, `STATE-LEGACY-000001.md` | 3 |
+| `Q8_0 x Q8_0`, `Q8_0×Q8_0` | `src/vt/cpu/cpu_quant_dot_sdot.cpp:1`, `src/vt/cuda/cuda_quant_dot.cu:1067` | 2 |
+
+Three things follow, and the last two are worse than the first.
 
 **A favourable verdict could not reach adjudication.** "Ours is 24% faster than
 llama.cpp" is a stage-1 candidate and was never a stage-2 one. None of the 27
@@ -601,14 +642,38 @@ word-token lines turns out to be a llama.cpp verdict, so no obligation was lost
 today. What was lost is the guarantee, and the enumeration in this spec is built
 on stage 2.
 
-**The exclusion stage 2 was written to perform never worked.** `\b[1-9]` was
-meant to keep ratios at or above 1.0 by the page's convention. In `0.204x` the
-`\b` is satisfied after the decimal point, so `204x` matched and the deficit
-counted as a win anyway. Two defects were cancelling: a rule that did not fire,
-and a rule that would have been wrong if it had, since `0.758x` is the Pi 5 RSS
-**win**. The repair removes the intent rather than fixing the bug, because the
-axis, not the value, decides a ratio's polarity and the sweep cannot see the
-axis.
+**The exclusion stage 2 was written to perform never worked, and the size of the
+miss is now counted rather than illustrated.** `\b[1-9]` was meant to keep ratios
+at or above 1.0 by the page's convention. In `0.204x` the `\b` is satisfied after
+the decimal point, so `204x` matched and the deficit counted as a win anyway.
+Counted over the same candidate set: it carries **208** occurrences of a ratio
+below 1.0, and the retired pipe matched **201** of them. The **7** it dropped are
+the only spellings where no `[1-9]` digit sits at a word boundary, which is the
+fractional leading zero: `0.029×`, `0.057x`, `0.058x`, `0.086×`. An exclusion
+that admits 201 of 208 is not a weak rule, it is a rule that is not there. Two
+defects were cancelling: a rule that did not fire, and a rule that would have
+been wrong if it had, since `0.758x` is the Pi 5 RSS **win**. The repair removes
+the intent rather than fixing the bug, because the axis, not the value, decides a
+ratio's polarity and the sweep cannot see the axis.
+
+**Dropping that prefix is a stage-2 PRECISION regression, and no earlier draft
+named it.** The retired pipe read `\b[1-9][0-9]*(\.[0-9]+)? *[x×]`, and `FAV`
+reads `[0-9]+(?:\.[0-9]+)? *x\b` beside `[0-9]+(?:\.[0-9]+)? *×`. The leading `\b` is gone
+along with the value rule, and the leading `\b` is what kept `C2x` out. Separated
+by measurement rather than by reading, because the two changes are in one
+expression: restoring the leading `\b` to `FAV`'s ratio branch and changing
+nothing else recovers **20 of the 22**. The remaining two are the `Q8_0` comments,
+where the digit that has to match is the `0` of `Q8_0`, so they need the
+`[1-9]`-to-`[0-9]` relaxation as well. **No obligation is lost by this**, for the
+reason stated at the head of this section: the narrower expression sat downstream
+and under-counting is the direction that matters, so 18 extra lines arriving at
+adjudication cost a reader eighteen rejections and cost the enumeration nothing.
+It is still a real loss of precision that this spec asserted the opposite of, and
+that is the same conclusion-right, evidence-wrong shape as §"176.6 is not a number
+this tree measured" two sections down. **The tightening is not taken in this
+pass** and is recorded under `## Owed`, because re-narrowing the gating
+expression a second time in one pass owes its own before-and-after count and its
+own mutation sweep, and the error runs in the safe direction meanwhile.
 
 **The fix is not to add four tokens to stage 2.** That leaves two spellings that
 can drift again, which is the whole defect. Stage 2 is now `FAVOURABLE`, compiled
@@ -624,6 +689,61 @@ were one rule with two spellings. `176.6` and `173.2` are one denominator with
 two spellings. Each time the copies disagreed, each time the disagreement was
 invisible until something forced the two into the same expression, and each time
 the repair was to delete a copy rather than to reconcile it.
+
+### A live token is not a covered shape, and that is the eighth hole
+
+The sixth hole was a token that was **present and dead**. This one is narrower
+and it is the reason that framing was too generous: the `[x×]\b` branch was never
+dead. It **hit**, on `3.9×decode`, and on nothing else. So a token can stay live
+under the assertion while losing every shape the token exists for, and the
+per-alternative control the seventh hole installed does not detect that. **The
+assertion proves liveness per alternative. It does not prove shape coverage.**
+
+Measured at `fa94b10ae` on a clean detached worktree, against a baseline of
+**1263 candidates in 145 files and 1033 favourable**. Each row is a one-token
+narrowing applied to the block in this spec, and every one left the self-test
+**green** before this pass:
+
+| narrowing | self-test | stage 1 | stage 2 |
+|---|---|---:|---:|
+| baseline | ok | 1263 in 145 | 1033 |
+| ratio: require a decimal, `[0-9]+\.[0-9]+ *x\b` | **green** | 1231 in 144 | 993 |
+| percentage: require the space, `[0-9]+(?:\.[0-9]+)? %` | **green** | 1131 in 143 | 1033 |
+| attribution: `range(n-3, n+4)` to `range(n, n+1)` | **green** | **460 in 86** | 408 |
+| attribution: `SEP` stops matching a header rule | **green** | 1229 in 145 | 1006 |
+| attribution: `LLAMA` loses `llama-bench` | **green** | 1258 in 145 | 1029 |
+
+The third row is the one to read twice. **Removing 803 of 1263 candidates, 64% of
+the instrument's output, left the controls of all nineteen alternatives
+satisfied**, because every control was a string and the attribution half is not a
+string. Nineteen alternatives were guarded and nothing at all guarded the half of
+the sweep that decides which lines the tokens are applied to.
+
+**Both cheap known-live shapes are now controlled, and the controls are proved by
+mutation.** The integer ratio is live because row 13 of the enumeration writes the
+Laguna campaign's `15x` and `18x` target, and the spaceless percentage is live
+because this spec's own argument at §"The token set was the fifth hole" rests on a
+`0.69%` line. `a 15x to 18x target` and `0.69% of the total` join the control
+lists, and `scan()` is extracted so that three line fixtures bind the attribution
+half: `WINDOW` for the plus-or-minus-3 reach in both directions **and its far
+edge**, `TABLE` for the header clause with llama.cpp deliberately out of window
+reach so only the header can find it, and `BENCH` for `llama-bench` as a spelling
+of `LLAMA`. All six narrowings above now exit `rc=1`, and the 38 token mutations
+still do, so the sweep is **43 mutations red, one unmutated run green**.
+
+**The residual is real, it is not closed here, and a later reader should assume
+it rather than trust the green.** Two shapes are covered because they were known
+live. Nothing establishes that the other seventeen alternatives carry the shapes
+this tree writes, exhaustive shape coverage is not reachable for a token set whose
+whole purpose is to match prose nobody has written yet, and the same argument
+applies to the attribution half, where three fixtures bind three rules and not
+the general case. This is the **fifth** defect found in this one instrument, after
+the path set (the fourth miss), the token set, the dead `×` branch and the
+duplicated stage 2, and all five were found by somebody reading the instrument
+rather than by the instrument reporting anything. Every pass has hardened it and
+every pass has found the previous pass incomplete. The useful record is therefore
+not the current green. It is that the base rate of a further hole in this sweep is
+high, so re-derive a count before you build on it and read §"Owed".
 
 ### What the four sweeps measure, side by side
 
@@ -1181,11 +1301,15 @@ each kind rather than a list written from memory.
    every figure ran and names what the sweep found instead, in place, because a
    new paragraph would cost somebody else's.
 
-   `docs/STATUS.md:159` and `:502` and `docs/BUILD.md:247` get the same marker.
-   They were found by the sweep rather than by this row's original scope, and
-   `:502` is the same Muse Glimmer verdict the page carries, so leaving it
-   unmarked would reproduce in `STATUS` exactly the projection-versus-record
-   disagreement item 3 exists to prevent.
+   `docs/STATUS.md:159`, `docs/STATUS.md:502` and `docs/BUILD.md:247` get the
+   same marker. Both `STATUS` anchors are written in full on purpose: a bare
+   `:502` after a `docs/BUILD.md` reference in the same sentence resolves
+   mechanically to `docs/BUILD.md:502`, and that file is 280 lines long, so the
+   shorthand names a line that does not exist. They were found by the sweep
+   rather than by this row's original scope, and `docs/STATUS.md:502` is the same
+   Muse Glimmer verdict the page carries, so leaving it unmarked would reproduce
+   in `STATUS` exactly the projection-versus-record disagreement item 3 exists to
+   prevent.
 
    `docs/FEATURES.md` carries the same two defects in its Vulkan paragraph, which
    reads "decode 4.36 tok/s vs llama.cpp's 4.35, parity met narrowly" with an
@@ -1276,14 +1400,27 @@ says, so asserting it would not be enough:
    exactly the first of those: it reported 19 clean passes while its own
    `applied` column read `False` for every row, because it searched for a
    `repr()` of the token rather than the `r"..."` literal in the source.
-2. **The earlier self-test would have survived 12 of those 38.** The flat `MUST`
-   list covered 6 of 18 alternatives, measured the same way. That is what a
-   per-alternative control buys and an aggregate one does not.
-3. **Stage 1 is unmoved by the restructure, and that is measured, not argued.**
+2. **Being armed for every alternative is not being armed for every shape, and
+   five NARROWINGS are the red-before pair for this pass.** At `fa94b10ae`, before
+   this pass, an integer-only ratio, a spaceless percentage, the plus-or-minus-3
+   attribution window, the table-header `SEP` clause and `llama-bench` could each
+   be removed with the self-test **green**, the third of them taking stage 1 from
+   1263 to 460. All five now exit `rc=1` against the same tree, so the pass is
+   **43 mutations red** rather than 38. The counts and the residual are
+   §"A live token is not a covered shape".
+3. **The earlier self-test covered 6 of 18 alternatives**, measured the same way,
+   so 12 alternatives could be neutered with it still passing. An earlier draft
+   of this line wrote "would have survived 12 of those 38", which counts 12
+   alternatives against 38 mutations and compares two different things. That is
+   what a per-alternative control buys and an aggregate one does not.
+4. **Stage 1 is unmoved by the restructure, and that is measured, not argued.**
    The derived `FAV` plus `REST` returns 1225 candidates in 144 files at
    `85a9a7ae7`, identical to the single hand-written `CMP` it replaces, so the
-   only behaviour that changed is stage 2's.
-4. **The block in this spec is the block that was run.** It is extracted from the
+   only behaviour that changed is stage 2's. Extracting `scan()` in this pass is
+   measured the same way and the same direction: the new block returns **1263 in
+   145 files and 1033 favourable** on the `fa94b10ae` tree, identical to the block
+   it replaces on that tree, so the refactor moved neither stage.
+5. **The block in this spec is the block that was run.** It is extracted from the
    committed markdown and executed, not retyped, so the code a reader copies is
    the code the evidence covers.
 
@@ -1365,6 +1502,16 @@ burned by twice.
   216, with the failure text naming the load each time. It FAILED again at 21.07
   and PASSED at 14.82 and 8.36 during this pass, which is four more datapoints on
   the same threshold and no new information about the diff.
+
+  **A later review then FAILED it at loadavg 11.99, and that retires the
+  threshold reading of this list.** 11.99 is below every load this section
+  records as a failure and below three it records as passes, so no cut on the
+  one-minute average separates the two outcomes: 8.36, 12.47, 14.82, 26.48 and
+  54.45 pass, and 11.99, 21.07, 46, 61, 64.88, 84.95 and 216 fail. That is
+  consistent with the paragraph below, which says the harness gates on
+  instantaneous contention, and it is what the earlier sentence read as a
+  threshold. Read the list as evidence that the outcome tracks the box, and not
+  as a load below which the test is safe to trust.
 
   **The review-repair pass adds a control pair rather than another datapoint.**
   It FAILED inside the full gate at loadavg 64.88 and again at 84.95, with
@@ -1466,6 +1613,25 @@ burned by twice.
   `.agents/environment.md:435` is marked by this pass, but it was found by
   reading row 7's Evidence column rather than by the sweep, and the general case
   is not closed. See §"The sweep sees verdicts, not recipes".
+- **The sweep's self-test proves liveness per alternative and not SHAPE
+  coverage, and this pass narrows that gap without closing it.** See §"A live
+  token is not a covered shape". Two shapes are controlled because they were
+  known live, `15x` and `0.69%`, and three line fixtures now bind the attribution
+  half. Nothing establishes that the other seventeen alternatives carry the
+  shapes this tree writes, and exhaustive coverage is not reachable for a token
+  set whose purpose is to match prose nobody has written yet. Two concrete pieces
+  are owed and neither is taken here. **First**, restore a leading `\b` to `FAV`'s
+  two ratio branches. Applied to both at `fa94b10ae` it takes stage 1 from 1263
+  in 145 files to **1245 in 144** and stage 2 from 1033 to **1015**, which is 18
+  lines each way and the same size as the false-positive set §"The two stages
+  were one idea spelled twice" names. Whether it is the same 18 is not measured
+  here, and it owes a mutation pass of its own because it re-narrows the gating
+  expression. **Second**, decide whether a per-shape control belongs on
+  every alternative or whether this instrument should stop living in a document.
+  Tracked under [#1003](https://github.com/mudler/vllm.cpp/issues/1003), because
+  the enumeration that issue owes is what rests on the sweep. Until one of those
+  lands, treat a green self-test as evidence that the tokens fire and as no
+  evidence at all about what they cover.
 
 ## Now
 
@@ -1476,7 +1642,11 @@ scans **every tracked file** rather than three named directories, and it now
 **self-tests every alternative before it runs**, because its `×` token was
 present and dead and that is a defect no amount of re-reading the list would
 find. Its two stages are compiled from **one** token list, because they were two
-and they disagreed. Thirteen
+and they disagreed. Its attribution half now carries controls too, because that
+half had none while the token half had nineteen, and a narrowing there could
+delete 64% of the output with the self-test green. **That green still proves
+liveness and not shape coverage**, which is the standing bound under `## Owed`.
+Thirteen
 contaminated measurements, seven favourable verdicts, five llama.cpp revisions,
 one of which is a branch name with no commit behind it. No row changes lifecycle
 state, and no number is re-taken. The oracle is deliberately ungateable until

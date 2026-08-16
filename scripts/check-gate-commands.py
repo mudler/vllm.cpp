@@ -293,7 +293,8 @@ def audit() -> list[dict]:
 # Growth from a lifecycle move, so the set is re-pinned in the same change.
 # 2026-08-16: +SPEC-MTP-K-GT-1. A NEW row arriving at ACTIVE (issue #81), so it
 # enters GATED_STATES for the first time. Its spec's Gates section names
-# `scripts/agent-preflight.sh` plus the built CPU suite (495/495) and the three
+# `scripts/agent-preflight.sh` plus the built CPU suite (493 passed / 0 failed /
+# 2 skipped of 495, the two skips checkpoint-gated and unrelated) and the three
 # focused doctest binaries, and records what is NOT implicated and why: the
 # change reaches a GPU forward only through paths the CPU tier already runs, so
 # no CUDA or SACRED gate is claimed here, and the DGX three-way at k=2..4 is

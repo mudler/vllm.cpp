@@ -103,9 +103,18 @@ std::vector<int32_t> MtpProposePrefill(
 // `draft_tokens[r * k .. r * k + k)` in draft order. This is the flattened form
 // of upstream's `self.draft_tokens[:num_reqs]` (:274).
 //
-// `num_draft_decode_forwards` is NOT diagnostics. It is the only value a caller
-// can assert that a propose which did NOT run the loop cannot satisfy, and it
-// exists because the obvious witnesses do not work:
+// `num_draft_decode_forwards` is NOT diagnostics. It is a value a caller can
+// assert that a propose which did NOT run the loop cannot satisfy, and it exists
+// because the obvious witnesses do not work.
+//
+// It is NOT the ONLY such value, and an earlier revision of this comment said it
+// was. `GPUModelRunner::spec_mtp_proposals_with_varied_drafts()`, named at the end
+// of this block, is a second one, and a mutation that short-circuits the loop reds
+// BOTH. The "only" reading matters because it argues against adding another
+// assertion, and that is the reasoning a padded propose already walked through
+// once on this row. A further witness here is in scope, not redundant.
+//
+// The witnesses this field replaced, and why each one fails:
 //
 //   * The draft LIST LENGTH cannot serve. Whatever this function returns is
 //     sliced into k-token lists by the runner, so a propose that ran ONE forward

@@ -38,10 +38,17 @@ detail below and in [BENCHMARKS.md](BENCHMARKS.md) says which is which.
   decoding plus accept-if-equal rejection makes the emitted tokens identical at
   every k, which is proven on CPU for k=1..4 against speculative-off. That
   identity is exactly why a token gate cannot see a clamped depth, so each CPU arm
-  also asserts the DRAFT DECODE FORWARDS the propose ran, which is `k-1` per
-  propose call and is the one witness a padded propose cannot produce. What the
+  asserts TWO positive witnesses instead, because neither one alone is enough. The
+  DRAFT DECODE FORWARDS the propose ran, `k-1` per propose call, catch a propose
+  that never entered the loop. They do NOT catch padding: a propose that runs
+  every forward and then overwrites all k columns with its step-0 draft reports
+  `k-1` truthfully. The second witness counts the propose calls whose DELIVERED
+  draft row was not a pure function of its own first column, which is what a
+  padded row is, and it is measured non-zero at every k >= 2. Neither witness
+  proves PER-COLUMN PROVENANCE, that column j came from forward j. What the
   CPU tier does NOT show is acceptance at depth: no draft is accepted at any depth
-  on the synthetic gate model, so the accept path at k>1 is unexercised there. The
+  on the synthetic gate model, so the accept path at k>1 is unexercised there, and
+  acceptance at depth is the assertion that would close provenance. The
   cross-engine speed comparison at k>1 and the DGX three-way at k=2..4, which must
   show non-zero acceptance at every depth, are still owed
   ([#81](https://github.com/mudler/vllm.cpp/issues/81) M1/M2), as are

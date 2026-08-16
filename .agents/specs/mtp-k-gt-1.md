@@ -442,7 +442,12 @@ then PASS at 21, 25, 23 and 22. That is
 asserted, which matters because a single red would otherwise read as this diff's
 fault: nothing in this change is on that harness's path.
 
-### Final gate, on the `67088c987` tree plus this spec edit, against `origin/main` `ff264cb82`
+### Gate on the `67088c987` tree, against `origin/main` `ff264cb82` (SUPERSEDED)
+
+Kept because it records how three reds were closed and how the amend was verified.
+The gate that this row lands on is the one after it, run against `origin/main`
+`d1b0ea3a8`.
+
 
 The gate ran on the code tree of `67088c987` with this documentation-only spec
 edit in the working tree, which is on no gate's code path. It was run TWICE by
@@ -718,6 +723,51 @@ column is what non-zero acceptance AT DEPTH proves, acceptance is 0 at every dep
 here, and closing it is therefore part of the owed DGX gate rather than something
 this tier can reach. This bound is recorded the same way the zero-acceptance gap
 is, because an honest bound beats a false claim.
+
+**Corroboration for the carry, measured but NOT promoted to an assertion.** A
+fresh review noticed that the delivered rows are strict prefixes of each other
+across depths and did not claim it, so it is checked here rather than inherited.
+The k=2, k=3 and k=4 arms run the same prompt on the same fixture and make the
+same eight propose calls each. Measured on the merged head by a temporary dump of
+`proposal.draft_tokens` at the counting site in `propose_drafts`, every one of the
+eight k=2 rows is a strict prefix of its k=3 row, which is a strict prefix of its
+k=4 row: `6 18` inside `6 18 5` inside `6 18 5 20`, then `0 2` / `0 2 2` /
+`0 2 2 2`, `5 12` / `5 12 19` / `5 12 19 1`, `10 3` / `10 3 5` / `10 3 5 5`,
+`16 0` / `16 0 16` / `16 0 16 15` on calls 5 and 6 alike, `2 2` / `2 2 2` /
+`2 2 2 2`, and `11 7` / `11 7 22` / `11 7 22 12`. Eight triples, 24 rows, no
+exception. The same run reproduces the two counts already recorded above rather
+than restating them: call 7 delivers the constant row at each depth, which is the
+7-of-8 varied split at k=2, k=3 and k=4, and the k=3 identity arm's ten calls all
+vary. The dump was then removed, the tree verified back to its pristine
+`sha256sum`, and the rebuild FORCED with `touch`, because `cp -p` preserves the
+mtime and ninja would otherwise have re-run the instrumented binary.
+
+What that shows is that column j carries the same token at every k that reaches
+it, so raising the depth EXTENDS the previous depth's work instead of computing a
+different sequence. What it does NOT show is per-column provenance, and it is
+recorded as evidence for exactly that reason. A padded propose produces prefixes
+trivially, since `6 6` sits inside `6 6 6`, and a uniform off-by-one in the column
+index would produce them too. It therefore excludes nothing the varied-draft
+counter does not already have to exclude, and it is stated with its bound rather
+than added as a fifth thing a mutation "cannot" do.
+
+**Corrected: the four `qwen3_5.cpp` anchors in `issue-index.md` are
+STALE-WITHIN-PR, not wrong from the start.** `5d0aff39c`'s body classifies them as
+"wrong at EVERY commit in the branch and not merely stale". That is falsified by
+reading the objects. At `cb0bb2579` all four were correct: `:9253` is the
+`const int64_t S = spec_step ? B : PadToCaptureSize(...)` assignment, and `:9276`
+and `:9698` are both `Impl::SlotRing& ring = impl_->slots[S];`. They broke at
+`0d37de1ed`, which is the same commit that wrote them into `issue-index.md` and
+shifted `qwen3_5.cpp` by five lines. At that commit the three lines read a comment,
+a comment, and a `DenseForwardBody` call instead. So they are the class this branch
+already hit once at `mtp-k-gt-1.md:310-311`, and the difference is not pedantic:
+"wrong from the start" reads as a reviewer who never checked, while
+stale-within-PR carries the mechanical lesson, which is to re-derive every
+repo-local anchor at FINAL head and not at the head it was read on. The remedy is
+unchanged and stays correct. `issue-index.md` is append-only, a second `#1020` row
+would trip `check-agent-record`, so reporting rather than editing was the only
+legal move. The commit body cannot be rewritten, and the pull request body is the
+landed commit message, so this section is where the correction lives.
 
 **What the CPU half therefore establishes, and what it does not.** It establishes
 that k drafts are PROPOSED, that k-1 draft decode forwards run per propose call at

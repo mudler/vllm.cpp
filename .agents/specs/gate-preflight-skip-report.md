@@ -140,15 +140,20 @@ partial run should *return*. The three arguments above stand without it.
 ### 3.4.1 Who reads the exit status
 
 §3.5 enumerated every conditional in the script and never asked the other
-question, which is who consumes the number the script returns. There are four
+question, which is who consumes the number the script returns. There are five
 consumers, and exactly one of them treated that number as a verdict about the
 tree.
+
+The fifth was missing from the first version of this table, which listed four.
+A census that stops when it has found the defect is not a census, and this row's
+whole subject is a report that omits what it did not examine.
 
 | Consumer | How it reads preflight | Verdict |
 |---|---|---|
 | `scripts/agent-ready.py` `run_local_preflight` | `returncode == 0`, nothing else | **The defect.** `AGENTS.md` names it the gate to run "before remote handoff". The `SKIP` lines, the `N gate(s) SKIPPED` summary and the missing banner are all invisible to it, so a behind branch reached `READY: local and live PR/CI evidence are green` with two gates never run, and an unresolvable base reached it with five. The word "green" printed over a trailer check that had not executed. Fixed by passing `--fail-on-skip`. |
 | `scripts/agent-integration.py` `run_ready` | the exit status of `agent-ready.py` | Inherits the repair. It never calls preflight itself. |
 | `scripts/check-test-registration.py` `_preflight_execution_errors` | requires `rc == 0` from an instrumented run | Reads the status as a fact about the *script's own execution*, never as a verdict about a tree. Its `git` shim fails every call, so `BASE_SHA` is empty and five gates skip on every run of it. This consumer is why the default cannot flip: making a skip exit 1 unconditionally turns `check-test-registration` red, and that checker is itself in `CHECKERS`. |
+| `tests/scripts/test_agent_onboard.py` `:485` and `:500` | executes `scripts/agent-preflight.sh --role-only` and asserts on the exit status and the output | Unaffected, and named here to complete the census rather than because it is at risk. `--role-only` returns from the role block, above every record gate and both range blocks, so no `skip` can have been recorded by the time either call reads the status. Verified by reading the two call sites, not inferred from the flag's name. |
 | a human at a shell, plus the `scripts/agent-preflight.sh passes` checkbox in `.github/pull_request_template.md` | reads the report | Unchanged, and the reason the default stays 0. |
 
 So the flag is opt-in because the population splits cleanly: one machine
@@ -191,6 +196,7 @@ verdicts:
 |---|---|---|
 | `origin/main` does not resolve | `SKIP` | The input is *unknown*. There are commits to check and the script cannot tell which. |
 | `git rev-list --count` fails with the base resolved | `SKIP` | Also *unknown*, and the first version of this change did not say so. See below. |
+| `git rev-list --count` succeeds and prints something that is not a count | `SKIP` | Also *unknown*. The exit status is not evidence about stdout. See below. |
 | `git merge-base --is-ancestor` exits above 1 | `SKIP`, with the ancestry reason and not the behind-the-base reason | Also *unknown*. The query failed, so the run has no verdict on ancestry to report. |
 | `HEAD` adds no commits over the pinned base | reported as an empty range, not a skip | The input is *empty*. A gate over zero commits has nothing to report, and calling that a skip would print `SKIP` on the ordinary session-start run of a freshly cut branch. |
 
@@ -215,9 +221,75 @@ reads "is not an ancestor of HEAD, so this branch is behind it", which names a
 cause that is not the cause and sends the reader to `git merge` for a tree that
 has no commit to merge into. The status above 1 now reports the failed query.
 
-Both bugs failed in the honest direction, which is why the repair stays this
-small. Neither produced a wrong verdict about a tree. One filed an unknown as an
-exemption and the other filed an unknown under the wrong name.
+Both of those bugs failed in the honest direction. Neither produced a wrong
+verdict about a tree. One filed an unknown as an exemption and the other filed
+an unknown under the wrong name.
+
+### 3.6.1 The third bug, which this row itself introduced
+
+**An earlier version of this section claimed "Both bugs failed in the honest
+direction", and by the time it was written that was already untrue.** The repair
+for `|| echo 0` was spelled
+
+```sh
+RANGE_COUNT="$(git rev-list --count "${BASE_SHA}..HEAD" 2>&1)"
+RANGE_STATUS=$?
+```
+
+and folding stderr into the *value* reintroduced the exact defect this row
+exists to remove, through a narrower door and in the **dishonest** direction. It
+arrived in `05f6dc04e` and the fresh review of this row found it.
+
+`RANGE_STATUS` then catches only the case where git **fails**. Git can write to
+stderr and still exit 0, and the value is the error text with the count after
+it. `[ "$RANGE_COUNT" -gt 0 ]` does not evaluate false there. It **errors** with
+status 2, bash prints `integer expression expected` on stderr, a `[` that errors
+reads as false, and both range blocks fall through to their empty-range arm. Five
+gates leave the report, nothing says so, and `All gates green.` prints with exit
+0. That is occurrence 3 again, at five gates instead of two.
+
+A `.git/objects/info/alternates` naming a path that does not exist reaches it
+with no shim at all: git prints `error: unable to normalize alternate object
+path: ...` on nearly every object-reading command, writes its ordinary answer to
+stdout, and exits 0. Measured on the shipped script at `23d28243f`:
+
+```
+Committed range vs origin/main 5adc7de9e: empty, HEAD adds no commits.
+Commit trailers vs origin/main 5adc7de9e: empty, HEAD adds no commits.
+
+All gates green.        rc=0
+```
+
+72 `ok`, 0 `FAIL`, 0 `SKIP`, banner, exit 0. The pre-repair script at `ad8dcad8b`
+reports 77 `ok` and runs all five gates on the identical scratch repository,
+because it discarded stderr. So this is a regression and not an inherited
+defect, and §7.9 records both runs.
+
+**The repair is two halves, because they cover different failures.** Neither
+alone is enough, and the mutations in §7.9 show each half failing on its own.
+
+1. **Keep stderr out of the value**, with `2>/dev/null`. This is what makes the
+   value correct in the reproduced case, where the count was perfectly readable
+   on stdout all along. It is also what stops a git that merely *warns* from
+   costing five gates a `SKIP` they do not deserve, which validation alone would
+   do. The correct report for a noisy git with a readable count is the ordinary
+   run, not a skip.
+2. **Validate the value** against `^[0-9]+$`, in one `case` predicate that both
+   range blocks read, so they cannot drift apart on what counts as unknown. This
+   is what makes an arm *exist* for a count that is not a count. Without it any
+   non-numeric value still reaches `-gt`, and its status-2 error is
+   indistinguishable from "zero commits". Inferring from exit 0 that stdout is a
+   decimal integer is the assumption that produced this defect, and the repair
+   should not keep making it.
+
+**`ANCESTRY_ERROR` merges stderr the same way and is correct as it stands.**
+Checked rather than assumed. Under the same broken-alternates repository
+`git merge-base --is-ancestor` also writes to stderr and exits 0. The difference
+is that `ANCESTRY_ERROR` is a **message and never a value**: nothing compares it,
+and every ancestry arm is selected by `ANCESTRY_STATUS` alone. The only read of
+it is inside the `ANCESTRY_UNKNOWN` string, which a run prints only when the
+query failed, and where the stderr text is the useful part. It is left merged
+deliberately, and the script now says so beside the call.
 
 ## 4. Risks and decisions
 
@@ -330,6 +402,29 @@ Cases added by the fresh review of this row:
     past the local preflight refuses with `REMOTE_UNVERIFIED` instead. That
     second refusal is the proof the first one did not fire.
 
+Cases added by the second fresh review of this row, both in
+`StderrIsNotTheValueTests` and both red on `23d28243f`:
+
+15. `test_a_git_that_warns_and_exits_zero_still_runs_every_range_gate` breaks
+    `.git/objects/info/alternates` so git writes to stderr, prints the count on
+    stdout, and exits 0. It asserts a precondition first, and asserts all three
+    parts of it: exit 0, stderr non-empty, stdout exactly `1`. Without that, a
+    git that simply failed would satisfy the case through the arm
+    `test_an_unborn_head_...` already covers. **RED before:** the five range
+    gates report neither `ok` nor `SKIP`, `empty, HEAD adds no commits` prints
+    over both blocks, and the banner prints. **After:** all five run, nothing is
+    skipped, and the run keeps the banner it earned. It also compares the `ok`
+    count against a control run of the same repository, which is the same
+    invariant as case 2: a gate may leave the report only by saying that it did.
+16. `test_a_count_that_is_not_a_number_reports_skip_rather_than_empty` puts a
+    `git` shim on `PATH` that answers `rev-list` with a non-numeric line and
+    exit 0, and forwards every other subcommand to the real program. Its
+    precondition asserts both halves of that, so a shim that broke `rev-parse`
+    could not pass as a shim that only broke the count. **RED before**, and red
+    against a repair that only discards stderr, which is why both halves of
+    §3.6.1 are in the change. No real git behaves this way. The case pins the
+    *arm*, not a git.
+
 Mutation cases, each restoring the tree byte-for-byte afterwards:
 
 - Delete the `skipped` check from the summary. Cases 1 and 4 must go red.
@@ -341,6 +436,15 @@ Mutation cases, each restoring the tree byte-for-byte afterwards:
   gates. Case 9 must go red on all three.
 - Replace `--range "${BASE_SHA}..HEAD"` with `--range "origin/main..HEAD"` at
   both trailer gates. Case 9 must go red on both.
+- Restore `2>&1` on the count, which is the regression itself. Case 15 must go
+  red and case 16 must stay green.
+- Make the numeric predicate unmatchable, and separately delete the
+  `RANGE_NUMERIC` term from both range arms. Case 16 must go red for each and
+  case 15 must stay green.
+
+The last two pairs are the evidence that the two halves of §3.6.1 are not
+redundant. If either half covered the other, one of these mutations would leave
+the suite green.
 
 ## 6. Gates
 
@@ -391,9 +495,10 @@ reported as skipped. Every gate that stops running has to say so.
 
 ### 7.3 GREEN after
 
-Same suite on the repaired script: `Ran 8 tests`, `OK`. The fresh review of this
-row added six more cases, so the suite now reports `Ran 14 tests`, `OK`. Their
-own red-before is §7.7 and §7.8.
+Same suite on the repaired script: `Ran 8 tests`, `OK`. The first fresh review of
+this row added six more cases, taking the suite to `Ran 14 tests`, `OK`. Their
+own red-before is §7.7 and §7.8. The second fresh review added two more, so the
+suite now reports `Ran 16 tests`, `OK`, and their red-before is §7.9.
 
 The same scratch comparison, rerun against the repaired script. The `ok` totals
 are one higher than in §7.1 because the new suite joined `SUITES`:
@@ -457,11 +562,66 @@ another branch. The attribution here is measured rather than asserted:
 or `include/`, so this branch cannot have introduced an env var read from those
 trees.
 
-One earlier run of `test_cpu_x86_llamacpp_floor` also failed, and two focused
-gates reported unrelated errors, while the filesystem holding the temporary
-directories was at zero bytes free. All three passed on a rerun with space
-available. An instrument out of disk fails toward a verdict about the code, so
-a red measured under `ENOSPC` is not a result.
+### 7.5.1 The three reds measured under `ENOSPC`
+
+The first version of this section said that `test_cpu_x86_llamacpp_floor` failed
+and that "two focused gates reported unrelated errors". It named one of the
+three, quoted no `df`, no error text and no rerun output. That is thinner than
+what this project asks of an attribution, and an unnamed gate cannot be checked
+by a reader. The attribution stands. The evidence for it is below.
+
+The three, named, with what each printed in that run:
+
+| Gate | Symptom in the original `ENOSPC` run |
+|---|---|
+| `test_cpu_x86_llamacpp_floor` | failed. Load-dependent and pre-existing, [#618](https://github.com/mudler/vllm.cpp/issues/618) |
+| `python3 scripts/check-test-registration.py` | `ERROR: CMake configure failed while proving required test registration`, then `ERROR: missing required test target test_device_selection in configured codemodel`, exit 1 |
+| `python3 tests/scripts/test_check_test_registration.py` | 65 errors, exit 1 |
+
+**Why an out-of-disk instrument accuses the code here.**
+`scripts/check-test-registration.py` does its work in a temporary directory at
+`:300`, `:489` and `:737`, each under `tempfile.TemporaryDirectory`, and
+`_configure_cmake` at `:72-91` runs a real `cmake -S . -B <tempdir>` after
+requesting the CMake File API codemodel, then reads the reply back out of that
+directory. When the write fails there is no reply to read, the target list is
+empty, and the checker reports precisely a **missing cmake target**: a verdict
+about the tree, phrased in the vocabulary of the tree, produced by a full disk.
+
+That mechanism is measured rather than argued. Deliberately reproduced on a
+1 MiB `tmpfs` filled to zero bytes and pointed at by `TMPDIR`, on this tree, at
+this SHA:
+
+```
+tmpfs  1.0M  1.0M  0  100%  .../scratchpad/fullfs
+$ TMPDIR=<full> python3 scripts/check-test-registration.py          # rc=1
+ERROR: CMake configure failed while proving required test registration
+ERROR: missing required test target test_device_selection in configured codemodel
+ERROR: vllm_cpp_add_test does not create an executable with its configured sources
+$ TMPDIR=<full> python3 tests/scripts/test_check_test_registration.py  # rc=1
+Ran 52 tests -- FAILED (failures=12)
+```
+
+The checker's verdict reproduces word for word. The suite's *count* does not,
+because a 1 MiB `tmpfs` is milder pressure than the whole filesystem at zero:
+some temporary directories still get created, so cases fail rather than error.
+The count is therefore not the evidence and is not offered as such. The
+mechanism is, and it reproduces on demand.
+
+**Green on the identical tree with space available**, measured immediately
+before this run, `TMPDIR` unset so both use `/tmp`:
+
+```
+$ df -h /tmp   ->  447G size, 66G avail, 85% used
+$ python3 scripts/check-test-registration.py            # rc=0
+OK: required regression tests have executable + CTest registration and the
+guard is wired into preflight/CI.
+$ python3 tests/scripts/test_check_test_registration.py # rc=0
+Ran 52 tests -- OK
+```
+
+So a red measured under `ENOSPC` is not a result. Check free disk before
+attributing any failure to the code, because a broken instrument does not report
+as a broken instrument. It reports as a verdict about the code.
 
 ### 7.6 `agent-ready.py` refuses a skip while a human preflight does not
 
@@ -512,6 +672,96 @@ Before the argv log, both mutations left the suite at `Ran 8 tests`, `OK`.
 
 Restored: `sha256sum -c` reports `OK` for all three files, and the suite returns
 to `Ran 14 tests`, `OK`.
+
+### 7.9 The regression this row introduced, and its repair
+
+**The defect on the shipped script**, `23d28243f`, reproduced end to end before
+anything was edited. One scratch repository, stub `python3` on `PATH`,
+`origin/main` an ancestor, `HEAD` one commit ahead, and a
+`.git/objects/info/alternates` naming a path that does not exist. The only
+difference between the rows is which script ran against it:
+
+| Script | `ok` | `FAIL` | `SKIP` | the five range gates | banner | exit |
+|---|---:|---:|---:|---|---|---:|
+| `ad8dcad8b`, before the `2>&1` | 77 | 0 | 0 | all five `ok` | `All gates green.` | 0 |
+| `23d28243f`, as shipped | 72 | 0 | 0 | **absent from the report** | `All gates green.` | 0 |
+| this repair | 77 | 0 | 0 | all five `ok` | `All gates green.` | 0 |
+
+The shipped script also wrote two lines to stderr that no reader of the report
+sees:
+
+```
+agent-preflight.sh: line 320: [: error: unable to normalize alternate object path: ...
+1: integer expression expected
+```
+
+`git log -S` places the `2>&1` in `05f6dc04e` and nowhere earlier, so the
+regression is this row's own and not something it inherited.
+
+**RED before.** The two new cases against the script restored to `23d28243f`
+with the new suite in place, the restore verified by `git diff --quiet` and the
+file verified to parse with `bash -n`:
+
+```
+Ran 16 tests -- FAILED (failures=12)
+```
+
+The 12 are the two new cases and their ten `subTest` gates. The other 14 cases
+were green, so the red is scoped to what this repair is about:
+
+```
+AssertionError: False is not true : commit-trailers did not run although the
+count was readable on stdout:
+AssertionError: 'empty, HEAD adds no commits' unexpectedly found in ... :
+HEAD adds a commit and the run reported an empty range:
+AssertionError: True is not false : five unknown gates printed green:
+```
+
+**GREEN after.** `Ran 16 tests`, `OK`.
+
+One correct report was red on the first green-after run, and the message was
+repaired rather than the assertion. Rewrapping `RANGE_UNKNOWN` had split the
+sentence `Unknown is not an empty range.` across a newline, which cases 10 and
+16 assert verbatim. The behaviour was right and the prose was wrong. The line is
+now kept unwrapped and the script says why beside it.
+
+**Mutations**, each verified to have applied by a diff against the pre-mutation
+file rather than against `HEAD`, each verified to parse, each restored
+byte-for-byte and confirmed by `sha256sum -c`:
+
+| Mutation | Sites | Result |
+|---|---:|---|
+| `2>/dev/null` becomes `2>&1`, the regression itself | 1 | case 15 red, `FAILED (failures=6)`. Case 16 stays green |
+| the numeric `case` pattern is made unmatchable | 1 | case 16 red, `FAILED (failures=6)`. Case 15 stays green |
+| the `RANGE_NUMERIC` term is deleted from both range arms | 2 | case 16 red, `FAILED (failures=6)`. Case 15 stays green |
+
+The last two rows are why the repair has two halves. Each half has a mutation
+that only the other half's case detects, so neither is covering for the other.
+
+A first attempt at the second mutation was written with `sed` and a delimiter
+that collided with the `|` in the pattern. `sed` exited non-zero, nothing was
+edited, and the suite reported `Ran 16 tests`, `OK`. That `OK` was a mutation
+that never applied wearing a passing test. The harness was rewritten to diff
+against the saved pre-mutation copy and to refuse to report a suite result at
+all when the pattern matched zero sites. Every result above ran under that
+harness.
+
+### 7.10 Two corrections to the merge commit body
+
+`5b95e221e` is a merge and its body is not amendable, so the corrections live
+here. The squash body will be the landed record.
+
+- The body says main brought "#986, #995 and #987". It brought **#986 and
+  #995**. `#987` was already in the merge base: `3ce1cf7c7`, this row's own
+  base, is `feat(LTX25-RETAKE) ... (#924, #987) (#992)`. Diffing
+  `.agents/issue-index.md` at the merge base against each parent shows main's
+  side adding exactly two rows.
+- The body says "this branch's #998 and #999". There are **three**: #998, #999
+  and #1000. The same diff shows all three on the branch side, and all three are
+  on `HEAD` at lines 272 through 274.
+
+Both are miscounts in a description of a union merge that was itself correct.
+The merged file is unchanged by this correction.
 
 ## 8. Stop conditions
 

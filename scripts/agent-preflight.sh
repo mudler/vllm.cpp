@@ -210,24 +210,57 @@ branch, then rerun. Unknown is not absence."
 # nothing and keeps the banner. A count that could not be taken withholds
 # everything and must not. Mapping the second onto the first is the same
 # unknown-as-success conflation this row exists to remove.
+#
+# The count keeps stderr OUT of its value, and the value is then validated. The
+# repair for `|| echo 0` was first written as `2>&1`, which reintroduced the very
+# defect through a narrower door: git can write to stderr AND exit 0, so the
+# status catches nothing while the value carries the error text ahead of the
+# number. `[ "$RANGE_COUNT" -gt 0 ]` does not evaluate false there, it ERRORS
+# with status 2, which reads as false, and both range blocks fell through to
+# their empty-range arm while "All gates green." printed over five dropped
+# gates. A `.git/objects/info/alternates` naming a path that does not exist is
+# one way to reach it: `error: unable to normalize alternate object path: ...`
+# on stderr, the count on stdout, exit 0.
+#
+# Discarding stderr is what makes the VALUE right, and it is also what keeps a
+# git that merely warns from costing five gates a SKIP it does not deserve.
+# Validating the value is what makes an arm exist at all for a count that is not
+# a count: without it, any non-numeric value reaches `-gt` and its status-2 error
+# is indistinguishable from "zero commits". The two halves cover different
+# failures, so both are here.
 ANCESTRY_ERROR=""
 ANCESTRY_STATUS=0
 RANGE_COUNT=""
 RANGE_STATUS=0
 if [ -n "$BASE_SHA" ]; then
+  # stderr stays merged HERE deliberately. ANCESTRY_ERROR is a MESSAGE and never
+  # a value: nothing compares it, and only ANCESTRY_STATUS selects an arm below.
+  # Checked rather than assumed -- under the broken-alternates case above this
+  # call also writes to stderr and exits 0, and every ancestry arm is unaffected.
   ANCESTRY_ERROR="$(git merge-base --is-ancestor "$BASE_SHA" HEAD 2>&1)"
   ANCESTRY_STATUS=$?
-  RANGE_COUNT="$(git rev-list --count "${BASE_SHA}..HEAD" 2>&1)"
+  RANGE_COUNT="$(git rev-list --count "${BASE_SHA}..HEAD" 2>/dev/null)"
   RANGE_STATUS=$?
 fi
+# One predicate for "this run holds a usable commit count", so the two range
+# blocks below cannot drift apart on what counts as unknown.
+RANGE_NUMERIC=1
+case "$RANGE_COUNT" in
+  '' | *[!0-9]*) RANGE_NUMERIC=0 ;;
+esac
 ANCESTRY_UNKNOWN="git merge-base --is-ancestor ${BASE_SHA} HEAD exited
 ${ANCESTRY_STATUS}, so this run could not ask whether the base is behind HEAD:
 ${ANCESTRY_ERROR}
 An unborn HEAD is one way to reach this. Unknown is not a verdict on ancestry."
-RANGE_UNKNOWN="git rev-list --count ${BASE_SHA}..HEAD exited ${RANGE_STATUS}, so
-this run could not count the commits under judgement:
-${RANGE_COUNT}
-An unborn HEAD is one way to reach this. Unknown is not an empty range."
+# The closing sentence stays on ONE line deliberately. The suite asserts it
+# verbatim, and a rewrap that splits it across a newline turns a correct report
+# into a red gate rather than into a weaker one.
+RANGE_UNKNOWN="git rev-list --count ${BASE_SHA}..HEAD exited ${RANGE_STATUS} and
+printed [${RANGE_COUNT}] on stdout, which is not a commit count, so this run
+could not count the commits under judgement. An unborn HEAD is one way to reach
+this, and so is a git that writes an error to stderr and still exits 0. Rerun
+that command to read what it printed.
+Unknown is not an empty range."
 
 echo "Session role:"
 if role_line=$(python3 scripts/agent-role.py show 2>&1); then
@@ -312,7 +345,7 @@ if [ -z "$BASE_SHA" ]; then
   skip "now-current range" "$BASE_UNRESOLVED"
   skip "doc-checkpoint range" "$BASE_UNRESOLVED"
   skip "issue-index append-only" "$BASE_UNRESOLVED"
-elif [ "$RANGE_STATUS" -ne 0 ]; then
+elif [ "$RANGE_STATUS" -ne 0 ] || [ "$RANGE_NUMERIC" -eq 0 ]; then
   echo "Committed range vs ${BASE_REF} ${BASE_SHA}:"
   skip "now-current range" "$RANGE_UNKNOWN"
   skip "doc-checkpoint range" "$RANGE_UNKNOWN"
@@ -353,7 +386,7 @@ branch is behind it and the trailer gates did NOT run. Merge ${BASE_REF} and
 rerun. Neither gate reported anything about this tree."
   skip "commit-trailers" "$TRAILER_BEHIND"
   skip "commit-style" "$TRAILER_BEHIND"
-elif [ "$RANGE_STATUS" -ne 0 ]; then
+elif [ "$RANGE_STATUS" -ne 0 ] || [ "$RANGE_NUMERIC" -eq 0 ]; then
   echo "Commit trailers vs ${BASE_REF} ${BASE_SHA}:"
   skip "commit-trailers" "$RANGE_UNKNOWN"
   skip "commit-style" "$RANGE_UNKNOWN"

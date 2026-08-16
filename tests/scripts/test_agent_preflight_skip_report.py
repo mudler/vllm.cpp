@@ -59,6 +59,10 @@ READY = ROOT / "scripts/agent-ready.py"
 CI = ROOT / ".github/workflows/ci.yml"
 SUITE_NAME = Path(__file__).stem
 
+# Resolved BEFORE any test prepends its scratch `bin` to PATH, so the shim in
+# `NON_NUMERIC_GIT` can forward to the real program rather than to itself.
+GIT = shutil.which("git")
+
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 # Exits 0 for every checker and every suite. The script's `run()` reports `ok`.
@@ -101,6 +105,26 @@ if [ ! -e "$VLLM_TEST_MOVE_MARKER" ]; then
 fi
 exit 0
 """
+
+# Answers `rev-list` with a line that is not a number and exits 0, and forwards
+# every other subcommand to the real program. No git known to this suite behaves
+# this way, and that is the point: the script must hold an arm for a count it
+# cannot read, rather than inferring from exit 0 that stdout is a decimal
+# integer. That inference is what produced the defect this class pins.
+NON_NUMERIC_GIT = """#!/bin/sh
+if [ "$1" = "rev-list" ]; then
+  echo "not-a-commit-count"
+  exit 0
+fi
+exec {git} "$@"
+"""
+
+# A path that does not exist, named as an alternate object database. Git prints
+# `error: unable to normalize alternate object path: ...` to stderr on nearly
+# every object-reading command, writes its ordinary answer to stdout, and exits
+# 0. It is the cheapest reproduction of "stderr without a failure" and it needs
+# no shim at all.
+MISSING_ALTERNATE = "/nonexistent/vllm-cpp-preflight-alternate/objects"
 
 
 class Report:
@@ -566,6 +590,166 @@ class AnUnknownIsNotAnEmptyRangeTests(PreflightHarness):
             "Unknown is not a verdict on ancestry.",
             report.text,
             f"the ancestry skip does not say what is unknown:\n{report}",
+        )
+
+
+class StderrIsNotTheValueTests(PreflightHarness):
+    """A git that writes to stderr and exits 0 must not delete a range block.
+
+    The `|| echo 0` repair above was first written as
+    `RANGE_COUNT="$(git rev-list --count ... 2>&1)"`, which reintroduced the
+    silence this row exists to remove, through a narrower door and in the
+    DISHONEST direction. Folding stderr into the value leaves `RANGE_STATUS`
+    catching only the case where git FAILS. When git exits 0 and also writes to
+    stderr, the status is 0 and the value is the error text with the number
+    after it, so `[ "$RANGE_COUNT" -gt 0 ]` does not evaluate false, it ERRORS
+    with status 2. A `[` that errors reads as false, both range blocks take
+    their empty-range arm, and the run prints `All gates green.` over five gates
+    that never executed.
+
+    Neither case here is exotic. `test_an_unborn_head_...` above covers a git
+    that fails. Nothing covered a git that succeeds noisily, and the pre-repair
+    script handled it correctly because it discarded stderr.
+    """
+
+    def break_alternates(self) -> None:
+        alternates = self.tmp / ".git" / "objects" / "info" / "alternates"
+        alternates.parent.mkdir(parents=True, exist_ok=True)
+        alternates.write_text(f"{MISSING_ALTERNATE}\n", encoding="utf-8")
+
+    def raw_git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """A git run the way the script runs it, through the scratch PATH."""
+
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.tmp,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self.environment(),
+        )
+
+    def test_a_git_that_warns_and_exits_zero_still_runs_every_range_gate(self) -> None:
+        """RED before: five gates vanish, `empty` is printed, the banner prints.
+
+        The count is perfectly readable on stdout here, so the correct report is
+        not a SKIP. It is the ordinary run, with all five gates executed. A
+        repair that answered this case with a SKIP would cost five gates to a
+        stderr line that changed no answer.
+        """
+
+        self.set_origin_main(self.base)
+        control = self.preflight()
+        self.assert_ran_something(control)
+        self.assertEqual([], control.skip, f"the control run skipped:\n{control}")
+
+        self.break_alternates()
+
+        # PRECONDITION, asserted and never assumed: this reproduces nothing
+        # unless git really does exit 0, write to stderr, and print the count.
+        probe = self.raw_git("rev-list", "--count", f"{self.base}..HEAD")
+        self.assertEqual(
+            0,
+            probe.returncode,
+            "precondition failed: git did not exit 0, so this case is the "
+            f"already-covered failing-git case instead: {probe.stderr}",
+        )
+        self.assertNotEqual(
+            "",
+            probe.stderr.strip(),
+            "precondition failed: git wrote nothing to stderr, so there is no "
+            "stderr for the value to absorb and this case asserts nothing.",
+        )
+        self.assertEqual(
+            "1",
+            probe.stdout.strip(),
+            "precondition failed: stdout is not the count, so the repair under "
+            "test is not the one being exercised.",
+        )
+
+        report = self.preflight()
+        self.assert_ran_something(report)
+
+        for label in (
+            "now-current range",
+            "doc-checkpoint range",
+            "issue-index append-only",
+            "commit-trailers",
+            "commit-style",
+        ):
+            with self.subTest(gate=label):
+                self.assertTrue(
+                    any(label in line for line in report.ok),
+                    f"{label} did not run although the count was readable on "
+                    f"stdout:\n{report}",
+                )
+        self.assertEqual([], report.skip, f"a readable count reported a SKIP:\n{report}")
+        self.assertNotIn(
+            "empty, HEAD adds no commits",
+            report.text,
+            f"HEAD adds a commit and the run reported an empty range:\n{report}",
+        )
+        # The same invariant as the ok-count case, against the same control: a
+        # gate may leave the report only by saying that it did.
+        self.assertEqual(
+            len(control.ok),
+            len(report.ok),
+            f"{len(control.ok) - len(report.ok)} gate(s) disappeared and "
+            f"{len(report.skip)} were reported as skipped:\n{report}",
+        )
+        self.assertTrue(report.green, f"the run earned the banner and withheld it:\n{report}")
+
+    def test_a_count_that_is_not_a_number_reports_skip_rather_than_empty(self) -> None:
+        """RED before, and red against a repair that only discards stderr.
+
+        Keeping stderr out of the value fixes the case above and leaves this arm
+        missing: any value that is not a decimal integer still reaches `-gt`,
+        where the status-2 error is indistinguishable from "zero commits". The
+        exit status is not evidence about stdout, and reading it as evidence is
+        the assumption that produced this defect twice.
+        """
+
+        self.assertIsNotNone(GIT, "precondition failed: no git on PATH to forward to")
+        shim = self.tmp / "bin" / "git"
+        shim.write_text(NON_NUMERIC_GIT.format(git=GIT), encoding="utf-8")
+        shim.chmod(0o755)
+        self.set_origin_main(self.base)
+
+        # PRECONDITION: the shim has to be the git the script finds, it has to
+        # exit 0, and it has to answer with something that is not a count.
+        probe = self.raw_git("rev-list", "--count", f"{self.base}..HEAD")
+        self.assertEqual(0, probe.returncode, f"precondition failed: {probe.stderr}")
+        self.assertEqual("not-a-commit-count", probe.stdout.strip())
+        # And it must still forward everything else, or the run under test fails
+        # for a reason that has nothing to do with the count.
+        self.assertEqual(self.base, self.raw_git("rev-parse", "refs/remotes/origin/main").stdout.strip())
+
+        report = self.preflight()
+        self.assert_ran_something(report)
+
+        for label in (
+            "now-current range",
+            "doc-checkpoint range",
+            "issue-index append-only",
+            "commit-trailers",
+            "commit-style",
+        ):
+            with self.subTest(gate=label):
+                self.assertTrue(
+                    any(label in line for line in report.skip),
+                    f"{label} did not report a SKIP for a count that is not a "
+                    f"count:\n{report}",
+                )
+        self.assertFalse(report.green, f"five unknown gates printed green:\n{report}")
+        self.assertNotIn(
+            "empty, HEAD adds no commits",
+            report.text,
+            f"an unreadable count was reported as an empty range:\n{report}",
+        )
+        self.assertIn(
+            "Unknown is not an empty range.",
+            report.text,
+            f"the range skip does not say what is unknown:\n{report}",
         )
 
 

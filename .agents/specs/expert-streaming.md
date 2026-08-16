@@ -766,6 +766,76 @@ into the stack (`blk.87.ffn_up_exps.weight` in the incomplete-checkpoint dry
 run). Architecture resolution, split merging, tensor naming and both new
 encodings are not the blocker. Capacity is.
 
+## First run: Qwen3.8-2.4T-A95B loads and generates on one DGX Spark
+
+16 August 2026, dgx.casa, GB10, 119 GiB unified memory, `UD-Q1_0` (370 GiB, 10
+shards, sha256-verified) on local NVMe, CPU device, `--max-num-seqs 1
+--max-model-len 512`, `VT_GGUF_PREFAULT=0`, server entry point.
+
+**It loads, it serves, and it is correct.**
+
+```
+prompt: "Q: What is the capital of France? A:"
+output: " Paris. Q: What"
+```
+
+| Axis | Measured |
+|---|---|
+| load to serving | 13 min |
+| resident anonymous memory | **62 GiB** of 119 GiB |
+| TTFT (token 1) | **3318 s** |
+| steady decode | **66.7 s/token** (66.5, 66.9, 66.8) |
+| decode rate | **0.015 tok/s** |
+| expert read bandwidth during decode | ~100 MB/s (measured 50 MiB/s at one sample, 914 % CPU) |
+
+### Why a 370 GiB model fits in 119 GiB
+
+Because the experts are never copied. They are BORROWED from the mmap and
+demand-paged by the kernel, costing zero anonymous memory. What is resident is
+the dense remainder, and it matches the prediction from the checkpoint's own
+tensor table:
+
+| Component | Predicted |
+|---|---|
+| `attn_qkv` expanded to bf16 | 21.56 GiB |
+| `ssm_out` expanded to bf16 | 17.25 GiB |
+| `token_embd` + F32 norms | 5.81 GiB |
+| predicted total | 44.6 GiB |
+| measured, with KV and runtime | **62 GiB** |
+
+This closes the question the earlier measurement left open, and corrects the
+conclusion drawn from it. The load was previously stopped at 53 GiB on the
+extrapolation that it was heading for 370 GiB. It was not; it plateaus. The
+extrapolation was wrong, the data was not, and the difference was letting it
+finish.
+
+### What the speed says, precisely
+
+0.015 tok/s is not a streaming result. It is the result of having NO streaming
+lane: every token needs roughly 6.7 GB of expert bytes (10 experts x 3 matrices
+x 93 layers), and the kernel serves them as 4 KiB demand faults in router order.
+That yields about 100 MB/s against an NVMe that sustains ~5 GB/s, so **the gap
+is about 50x and it is entirely access pattern.**
+
+The steady-state number is the useful one. 66.5, 66.9 and 66.8 seconds for three
+consecutive tokens is not noise; it is the same working set being re-faulted
+every step, which is exactly the behaviour a resident expert cache removes.
+
+TTFT of 3318 s is prefill plus the cold set and should not be quoted as a decode
+number.
+
+### What this changes for the row
+
+Streaming is NOT what makes this model fit. Borrowing already does. Streaming is
+what makes it FAST, and the size of that prize is now measured rather than
+assumed: 50x of pure I/O access pattern, before any cache-hit benefit. The c1
+target of 3 to 6 tok/s needs roughly a 200 to 400x improvement, so it needs both
+the explicit batched reads AND the hit rate the hotness cache is designed for.
+
+Everything the lane needs is already in tree and unwired: `ExpertSlotCache`
+(W1), `GgufExpertSpanOf` (W2) and `ExpertStreamer` (W3). W4 now has a measured
+baseline to beat and a working end-to-end vehicle to beat it on.
+
 ## Risks/decisions
 
 | Risk / decision | Call |

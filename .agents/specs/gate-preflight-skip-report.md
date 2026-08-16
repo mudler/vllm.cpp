@@ -763,6 +763,44 @@ here. The squash body will be the landed record.
 Both are miscounts in a description of a union merge that was itself correct.
 The merged file is unchanged by this correction.
 
+### 7.11 The row's own preflight run after the second review repair
+
+`bash scripts/agent-preflight.sh --quiet`, gated against
+`origin/main 45b022cdc138ae15b77b0149093071353de8ad4e`, which both range block
+headings name. `/tmp` had 65 GiB free at the start and 44 GiB at the end, so no
+gate here ran out of disk and §7.5.1 does not apply to any red below.
+
+| Block heading | `ok` | `FAIL` | `SKIP` |
+|---|---:|---:|---:|
+| `Session role:` | 1 | 0 | 0 |
+| `Record gates:` | 25 | 1 | 0 |
+| `Mutation suites:` | 43 | 2 | 0 |
+| `Committed range vs origin/main 45b022cdc:` | 3 | 0 | 0 |
+| `Commit trailers vs origin/main 45b022cdc:` | 2 | 0 | 0 |
+| total | 74 | 3 | 0 |
+
+**`SKIP` is 0**, so this run did not itself skip a block, which is the same
+claim the row is about. The trailer block reports two `ok` rather than two
+`SKIP` because the branch merged `origin/main` first, which is the repair the
+skip reason names.
+
+`check-env-doc` and `test_check_env_doc` are green here. They were red on the
+run before the merge, and they were proved red on **pristine** `332aed738` in a
+detached worktree with no local edits, naming the same three
+`VT_MOE_EXPERT_STREAM` variables. The incoming `45b022cdc` (#997) documents
+them, so the merge cleared a red this branch never caused.
+
+The three remaining failures are pre-existing, and each is **measured** on a
+tree this branch does not control rather than attributed:
+
+| Failure | Proof it is not this change |
+|---|---|
+| `check-agent-record` | `.agents/issue-index.md` lists issue #995 twice. Reproduced on a **pristine detached worktree at `origin/main` `45b022cdc`** with an empty `git status --porcelain`, printing the identical message. The branch side at `ca1f5ad59` had no duplicate row at all, so the merge inherited it. Branch `fix/issue-index-995-dup` already owns the repair |
+| `test_agent_record` | Same cause, same pristine worktree, `Ran 74 tests`, `FAILED (failures=1)`, on the one case that reads that index |
+| `test_cpu_x86_llamacpp_floor` | Load-dependent, [#618](https://github.com/mudler/vllm.cpp/issues/618). It reported `ok` in this branch's own pre-merge preflight run, and `Ran 10 tests`, `OK` in 80s on pristine `332aed738` earlier in the same session. It fails now with the box at load 126 to 180, and every failing assertion carries the harness's own reason: `waiting for quiet: 15s busy=110% builders=0 load=172.07`. The suite refuses to measure a contended box, which is the behaviour it is built for, so this red is the instrument declining to produce a number rather than a verdict about the tree |
+
+Disk was checked before any of these attributions, as §7.5.1 requires.
+
 ## 8. Stop conditions
 
 - Stop if `All gates green.` can still print after any block was skipped. That

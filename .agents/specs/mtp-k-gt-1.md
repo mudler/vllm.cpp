@@ -364,13 +364,15 @@ therefore run at `Release`, which is the configuration `scripts/build-cpu-releas
 itself uses. The three new suites were additionally run under `Debug` while they
 were being written, so the assertion-bearing arm is covered too.
 
-Known pre-existing red, NOT caused by this row and not repaired here:
-`check-env-doc` and `test_check_env_doc` fail on pristine `332aed738`
+Known pre-existing red, NOT caused by this row and not repaired here.
+`check-env-doc` and `test_check_env_doc` failed on pristine `332aed738`
 (`VT_MOE_EXPERT_STREAM`, `VT_MOE_EXPERT_STREAM_SLOTS`,
-`VT_MOE_EXPERT_STREAM_SLOT_BYTES` undocumented, arrived with #993). Tracked by
+`VT_MOE_EXPERT_STREAM_SLOT_BYTES` undocumented, arrived with #993), tracked by
 [#995](https://github.com/mudler/vllm.cpp/issues/995) and owned by
-`ENG-EXPERT-STREAM`. Reproduced on the pristine base before any edit in this
-worktree.
+`ENG-EXPERT-STREAM`. Reproduced on the pristine base before any edit here, which
+is how it was attributed rather than assumed. `45b022cdc` (#997) landed the
+documentation on `origin/main` mid-flow and is merged in, so the final gate on
+this branch has both green.
 
 ### 6a. Records this row deliberately does NOT write
 

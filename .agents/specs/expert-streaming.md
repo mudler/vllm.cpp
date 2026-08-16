@@ -571,7 +571,8 @@ records why the target checkpoint changed.
 |---|---|---|---|
 | W9 IQ1_S decode | `DType::kIQ1_S`, geometry `{256, 50, 19}`, `BlockDTypeFromGgmlTypeId` row, CPU `iq1s_grid` + `VecDotIQ1_SQ8_K` traits row, dequant path | - | CPU tests green against upstream-derived vectors; `KeepQuantDType(19)` true |
 | W10 IQ1_S device decode | `iq1s_grid_gpu` + CUDA `vec_dot`, so streamed slices dot on device. NOT optional polish: `cuda_quant_dot.cu:1531` maps an unknown weight dtype to `return false`, which is a SILENT CPU fallback. Tokens would still be correct, so no token gate can see it, and a 2.4 T model would simply run at CPU speed while looking healthy | W9 | CUDA tests; parity with the CPU arm; the fallback must be observable rather than inferred |
-| W11 checkpoint load | UD-Q1_0 first, then UD-IQ1_S, loads end to end on dgx.casa, refusing any encoding it cannot honour by name | W9, W10, W12 | model loads; token output captured |
+| W11 checkpoint load | UD-Q1_0 first, then UD-IQ1_S, loads end to end on dgx.casa, refusing any encoding it cannot honour by name. BLOCKED on W4: measured 16 August 2026, the load needs memory of the order of the whole file (4 GiB per 110 s, linear, no plateau) and cannot complete in 119 GiB | W9, W10, W12, W4 | model loads; token output captured |
+| W4a allocation attribution | Settle WHERE the anonymous memory comes from before wiring anything. Routing says the weights borrow the mmap and the process says anonymous, and those disagree. If the borrowed `OwnedTensor` is copied again when the model materialises its buffers, then a streamer under that loader changes nothing | - | the allocating call named, with a measurement |
 | W12 IQ1_XXXS decode | `DType::kIQ1_XXXS`, geometry `{256, 38, 66}`, the 256-entry fork codebook, `VecDotIQ1_XXXSQ8_K`, dequant, traits row and the reader's `case 66`. Grounded in the pinned fork oracle, cited per site | - | CPU tests green; `KeepQuantDType(66)` true; grid digest sealed |
 | W13 IQ1_XXXS device decode | the CUDA arm, for the same silent-fallback reason as W10 | W12 | CUDA tests; parity with the CPU arm |
 
@@ -630,6 +631,79 @@ connection can decay to under 1 MiB/s while a fresh connection to the same file
 runs at 20 MiB/s and the NAS writes at 97 MiB/s. Both endpoints measure healthy,
 so a stalled fetch is indistinguishable from a slow one without a rate check.
 Killing the curl lets the fetch script's `-C -` resume open a fresh connection.
+
+## The 370 GiB load was MEASURED, and the page cache does not do this for free
+
+16 August 2026, dgx.casa, 119 GiB of unified memory, `UD-Q1_0` complete and
+sha256-verified, run from LOCAL NVMe so the network filesystem is not a variable.
+
+**This section exists to record a refuted hypothesis, because it was mine and it
+was load-bearing.** Reading the loader, the keep-quant path BORROWS weights from
+the mmap (`p.mmap_residency = EnvOnOr("VT_GGUF_MMAP", p.keep_quant)`,
+`gguf_keep_quant.cpp:208`, then the `OwnedBytes::Borrow` branch). From that it
+seemed to follow that a model larger than memory would simply be demand-paged by
+the kernel, and that the streaming lane was an optimisation rather than a
+requirement. That is not what happens.
+
+### What was measured
+
+Routing is CORRECT. A probe that asks the policy directly, rather than inferring
+it, reports `keep_quant = 1`, `mmap_residency = 1`, `quant_repack = 0`, and:
+
+| Tensor | ggml | Routed to |
+|---|---|---|
+| `blk.0.ffn_gate_exps.weight` | 66 | `keep_quant` |
+| `blk.0.ffn_down_exps.weight` | 66 | `keep_quant` |
+| `blk.0.attn_qkv.weight` | 13 | `keep_quant` |
+| `blk.0.ssm_out.weight` | 14 | `keep_quant` |
+| `output.weight` | 12 | `keep_quant` |
+| `token_embd.weight` | 12 | `expand_bf16` (2.03 G params, about 4 GiB) |
+
+And yet the process accumulates ANONYMOUS memory linearly with load progress:
+
+| t | anon | shared_clean | avail |
+|---|---|---|---|
+| 300 s | 21 GiB | 0 | 93 GiB |
+| 600 s | 32 GiB | 0 | 82 GiB |
+| 1360 s | 37 GiB | 0 | 77 GiB |
+| 1800 s | 53 GiB | 0 | 60 GiB |
+
+**4 GiB per 110 s, dead linear for 30 minutes, no inflection.** Extrapolated,
+the load needs memory of the order of the whole 370 GiB file and cannot complete
+in 119 GiB. The run was stopped at 53 GiB rather than allowed to reach the OOM
+guard, because on GB10 an out-of-memory kill takes the MACHINE down and not just
+the process.
+
+`shared_clean` stayed at 0 for the entire run. No file pages were ever resident
+in the process, which is what a borrow with `VT_GGUF_PREFAULT=0` should look
+like, and is also why RSS alone cannot answer this question: RSS counts resident
+file pages, so it conflates the two hypotheses. Anonymous versus file-backed is
+the measurement that separates them.
+
+### What this establishes, and what it does not
+
+Established: **the model does not load in 119 GiB today, and expert streaming is
+REQUIRED rather than an optimisation.** The row's original premise stands
+unchanged; the "the kernel already does this" shortcut does not exist.
+
+NOT established: the exact allocation site. The evidence bounds the OUTCOME
+(linear anonymous growth proportional to load progress) without identifying
+which call allocates. Routing says borrow, the process says anonymous, and those
+two facts are not yet reconciled. The likely candidates, in order, are that the
+borrowed `OwnedTensor` is copied again when the model materialises its own
+weight buffers, or that a per-expert path re-materialises what the stacked path
+would have borrowed. Whoever takes W4 should settle that FIRST, because if it is
+the former then wiring `ExpertStreamer` under a loader that copies afterwards
+changes nothing.
+
+### What the load DID prove
+
+Everything above the byte read works on the real checkpoint. The loader merged
+all 10 split shards, parsed the metadata, resolved `qwen35moe` with no
+architecture refusal, did NOT refuse IQ1_XXXS, and walked tensors by name deep
+into the stack (`blk.87.ffn_up_exps.weight` in the incomplete-checkpoint dry
+run). Architecture resolution, split merging, tensor naming and both new
+encodings are not the blocker. Capacity is.
 
 ## Risks/decisions
 

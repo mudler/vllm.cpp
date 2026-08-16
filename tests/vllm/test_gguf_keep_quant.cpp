@@ -478,7 +478,11 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
     // L7 (2026-07-23): keep-f16 is now DEFAULT ON wherever expand_nk holds — the
     // repack-source release + load-time prefault removed L6's two objections
     // (RSS-neutral, prefill regression), so it measures 1.01x llama.cpp RSS with
-    // prefill/decode at-or-ahead and byte-identical tokens.
+    // prefill/decode at-or-ahead and byte-identical tokens. That llama.cpp
+    // denominator is SUPERSEDED (fork 237ad9b96, re-take owed under #1003, see
+    // gguf_keep_quant.cpp). It is NOT what this CHECK rests on: the default is
+    // justified by the same-binary ours-versus-ours A/B (3.885 -> 2.832 GiB,
+    // tokens byte-identical), which survives the repin unchanged.
     CHECK(p.keep_f16 == vllm::GgufQuantComputeAvailable());
     CHECK_FALSE(p.cpu_ref);
   }

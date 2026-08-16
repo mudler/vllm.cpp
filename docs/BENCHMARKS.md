@@ -300,19 +300,21 @@ Decode lands inside llama.cpp's own run-to-run spread, and the memory difference
 is 30 MiB on a 2.8 GiB working set. Prefill is the only axis with a real gap and
 it goes our way. Output tokens are **byte-identical** to llama.cpp's greedy
 decode and to our own CPU reference path. Single-stream only: we have not
-measured concurrent serving against llama.cpp's server. Six favourable llama.cpp
-verdicts can flip when the denominator is re-taken, five of them on this page,
-and prefill is not the most exposed. #1003 owes all six. The set is swept, not
-listed: the query is in the [spec](../.agents/specs/oracle-llamacpp-repin-stock.md).
+measured concurrent serving against llama.cpp's server. Seven favourable
+llama.cpp verdicts can flip when the denominator is re-taken, five on this page,
+one on the README, and prefill is not the most exposed. #1003 owes all seven. The
+set is swept over every tracked file, not listed: the query is in the
+[spec](../.agents/specs/oracle-llamacpp-repin-stock.md).
 
 | Flips first | Verdict | Exposure |
 |---|---|---|
-| 1 | Vulkan `BENCH-VK-LLAMA` decode 4.36 vs 4.35, `MET` | 0.23% margin inside a 0.69% 7-leg spread. Its own source calls it "a narrow pass, not a comfortable one", so any denominator move can flip it |
+| 1 | Vulkan `BENCH-VK-LLAMA` decode 4.36 vs 4.35, `MET` | 0.23% margin inside a 0.69% 7-leg spread. Its own source calls it "a narrow pass, not a comfortable one", so any move can flip it. The README states it as "matches" |
 | 2 | Muse Glimmer in128 prefill `1.023x` (also `STATUS.md`) | 2.3% margin inside our own arm's 4.5% leg spread, n=4. Its denominator is already stock `7044859`, 84 commits from `b10451`, so the noise floor is what exposes it |
 | 3 | This table's peak memory `1.01x` PARITY and decode `0.97x` tie | ties by declaration, not wins. A denominator that moves at all in llama.cpp's favour turns both into recorded gaps |
-| 4 | `KERNEL-GEMM-CPU-TILED` NEON vs stock ggml sgemm, "at parity, ahead on 4 of 6 shapes" | off this page, in the kernel matrix. Bands overlap, 216-242 vs 208-215 GFLOP/s, and one shape is already behind |
-| 5 | This table's prefill `1.18x` PASS | an 18% margin. Flipping it needs upstream's 624-commit window to beat our fork's CPU GDN and SSM_CONV work outright |
-| 6 | Pi 5 peak RSS 2.841 vs 3.747 GiB, `0.758x` | a 24.2% margin, and its denominator was already stock `b9892`, so only the 559 commits of `b9892`-to-`b10451` drift apply |
+| 4 | keep-f16's "RSS gap CLOSED to `1.01x`" and "prefill `1.18x` AHEAD" | same 2.798 GiB denominator as row 3, and the only one quoted in product code, where it justifies `VT_GGUF_KEEP_F16` shipping default ON. The default stands on an ours-vs-ours A/B. The wording does not |
+| 5 | `KERNEL-GEMM-CPU-TILED` NEON vs stock ggml sgemm, "at parity, ahead on 4 of 6 shapes" | off this page, in the kernel matrix. Bands overlap, 216-242 vs 208-215 GFLOP/s, and one shape is already behind |
+| 6 | This table's prefill `1.18x` PASS, and the same figure on the README | an 18% margin. Flipping it needs upstream's 624-commit window to beat our fork's CPU GDN and SSM_CONV work outright |
+| 7 | Pi 5 peak RSS 2.841 vs 3.747 GiB, `0.758x` | a 24.2% margin, and its denominator was already stock `b9892`, so only the 559 commits of `b9892`-to-`b10451` drift apply |
 
 **x86_64 arm, first measured 2026-08-11 (#433).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, a hairline OPEN GAP**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
 

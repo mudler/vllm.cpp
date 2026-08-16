@@ -188,6 +188,19 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // off the timed path, restoring prefill to ~205 t/s = 1.16x AHEAD of pp128
   // 176.6 (was 0.72x behind). Net: RSS parity, prefill/decode at-or-ahead,
   // greedy tokens byte-identical (native-f16 compute, md5 d235db1... unchanged).
+  //
+  // BOTH llama.cpp DENOMINATORS ABOVE (2.798 GiB, pp128 176.6) ARE SUPERSEDED,
+  // and this is the one place the contamination reaches a shipped DEFAULT rather
+  // than a document. They were measured against 237ad9b96, our own local-only
+  // fork, 65 of this project's performance commits past upstream tag b9827, six
+  // of them in ggml/src/ggml-cpu/ (fused gated_delta_net and a discriminated
+  // ssm_conv, both DEFAULT-ON, neither of which stock upstream carries at that
+  // point). The CPU floor arm ran a qwen35 model whose CPU graph reaches exactly
+  // those ops. The oracle is now stock b10451; keep-f16 stays default ON because
+  // the L7 A/B that justifies it is same-binary and OURS-versus-OURS (3.885 ->
+  // 2.832 GiB, tokens byte-identical), which no denominator move touches. What
+  // is owed is the "1.01x llama.cpp" and "1.16x AHEAD" framing, re-taken under
+  // #1003. Do not quote either ratio without re-measuring the reference arm.
   // VT_GGUF_KEEP_F16=0 is the opt-out; rides expand_nk so it is CPU-only and off
   // under VT_CPU_REF regardless (the oracle load stays byte-identical).
   p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk;

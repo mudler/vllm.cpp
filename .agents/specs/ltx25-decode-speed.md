@@ -518,12 +518,13 @@ draft cited `3a2f35d4e`, which is the SHA the local checkout happens to sit on
 and is **16 commits behind the pin** — `git rev-list --count
 3a2f35d4e..c6da9936e` is 16 with and without `--no-merges`. An earlier count of
 17 came from `git rev-list --count c6da9936e` in a **shallow** clone whose
-`.git/shallow` holds exactly `3a2f35d4e`, so the boundary commit was counted;
-the number was measured across a shallow boundary. `3a2f35d4e` is an ancestor of the pin,
-and the pin is on no branch in that checkout, so a `git pull` there would not
-reach it. Re-checked at the pin, every line below holds byte-identically, so
-nothing in the finding changes; the citation was simply off-pin, and AGENTS.md's
-reason for pinning is that an unpinned upstream is not reproducible.
+`.git/shallow` holds exactly `3a2f35d4e` — it was measured across the shallow
+boundary, and so counted the boundary commit itself. `3a2f35d4e` is an ancestor
+of the pin, and the pin is on no branch in that checkout, so a `git pull` there
+would not reach it. Re-checked at the pin, every line below holds
+byte-identically, so nothing in the finding changes; the citation was simply
+off-pin, and AGENTS.md's reason for pinning is that an unpinned upstream is not
+reproducible.
 
 `diffusers` at the pin implements **both** LTX-2.5 video decode arms:
 

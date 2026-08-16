@@ -362,6 +362,57 @@ class RatchetTests(unittest.TestCase):
         self.assertNotEqual(runnable, reduced)
         self.assertEqual(runnable - reduced, {"SERVE-RECIPE-ARGS"})
 
+    def test_mtp_depth_is_credited_for_real_commands(self):
+        # SPEC-MTP-K-GT-1 (#81) is a NEW row arriving at ACTIVE, which is the
+        # first state that puts it in GATED_STATES at all, so it joins the
+        # runnable population on arrival and earns the credit the same way the
+        # three rows above earn it. TWO things are pinned here rather than one:
+        # the row is in the exact pin, AND its Gates section really does yield a
+        # command that can fail. A row pinned without the second half is a
+        # certificate for nothing, which is the failure the checker's own header
+        # admits to for five older credits.
+        self.assertIn("SPEC-MTP-K-GT-1", gates.RUNNABLE_BASELINE)
+        verdicts = {r["id"]: r["verdict"] for r in gates.audit()}
+        self.assertEqual(verdicts.get("SPEC-MTP-K-GT-1"), "runnable")
+
+        spec = (ROOT / ".agents/specs/mtp-k-gt-1.md").read_text(encoding="utf-8")
+        section = gates.gates_section(spec)
+        self.assertIsNotNone(section)
+        self.assertIn("scripts/agent-preflight.sh", gates.runnable_commands(section))
+        # The row's GPU leg is OWED, not skipped, and the spec has to say so.
+        # Without this the credit could rest on a CPU gate while the record
+        # stayed silent about the arm nobody ran, which reads as coverage.
+        self.assertIn("DGX three-way greedy gate at k=2, 3, 4", spec)
+
+    def test_dropping_mtp_depth_from_the_pin_breaks_it(self):
+        # MUTATION, in the direction this re-pin actually moved: the entry added
+        # for #81 must be what keeps the exact pin agreeing with the audit.
+        # Remove it and set equality has to go red, which is what proves the row
+        # was pinned because it entered the population and not to quiet a gate.
+        reduced = set(gates.RUNNABLE_BASELINE) - {"SPEC-MTP-K-GT-1"}
+        self.assertNotEqual(reduced, set(gates.RUNNABLE_BASELINE))
+        runnable = {r["id"] for r in gates.audit() if r["verdict"] == "runnable"}
+        self.assertNotEqual(runnable, reduced)
+        self.assertEqual(runnable - reduced, {"SPEC-MTP-K-GT-1"})
+        self.assertEqual(runnable, set(gates.RUNNABLE_BASELINE))
+
+    def test_mtp_depth_losing_its_command_is_refused_by_name(self):
+        # The OTHER direction the same set equality binds. The case above moves
+        # the BASELINE and holds the record still; this one moves the RECORD and
+        # holds the baseline still, which is the half `ratchet_errors` owns and
+        # the half that ships in CI. Only a row the baseline already names can
+        # be reported as having LOST its command, so a pin taken without this
+        # row would report nothing at all here -- a regression on a row nobody
+        # pinned is silent, not green.
+        records = [dict(item) for item in gates.audit()]
+        victim = next(item for item in records if item["id"] == "SPEC-MTP-K-GT-1")
+        self.assertEqual(victim["verdict"], "runnable")
+        victim["verdict"] = "gates-no-command"
+        errors = gates.ratchet_errors(records)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("SPEC-MTP-K-GT-1", errors[0])
+        self.assertIn("Repair the row", errors[0])
+
     def test_the_baseline_re_pin_is_load_bearing(self):
         # MUTATION: the re-pin that added this row must be what makes the audit
         # agree with the baseline. Drop the entry and the exact-pin assertion

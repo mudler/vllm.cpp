@@ -1193,6 +1193,78 @@ class CudaLlamacppRowIsCounted(TenstorrentMistralRowIsCounted):
         self.assertEqual(len(loose), 2, "the prefix spans both rows")
 
 
+class MtpDepthRowIsCounted(unittest.TestCase):
+    """The ENGINE ratchet bump 156 -> 157 is backed by a real row (#81).
+
+    Same shape and the same reason as the BACKEND classes above, applied to the
+    pin that actually moved in this change. `ENGINE_ROWS` is re-pinned by hand,
+    so a bump with nothing behind it is indistinguishable from a bump for a row
+    that landed. `test_engine_row_ratchet_is_load_bearing` proves the pin BINDS
+    by moving it, which holds for any value of the pin and cannot say whether
+    157 is the right value. This class says that, by tying the pin to the row
+    the matrix carries.
+
+    The ENGINE pin is not in `MATRICES`, it is the module constant
+    `ENGINE_ROWS` counted over rows whose `path` equals `ENGINE_MATRIX`, so the
+    removal mutation redirects `ENGINE_MATRIX` and `MATRIX_PATHS` TOGETHER.
+    Rows are parsed from the list while the count is taken against the
+    constant, so patching one alone counts zero engine rows for a reason that
+    has nothing to do with the removal, and the case would go red for the wrong
+    reason.
+    """
+
+    ROW = "SPEC-MTP-K-GT-1"
+
+    def test_the_row_exists_in_the_engine_matrix(self) -> None:
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        matching = [
+            line for line in text.splitlines() if line.startswith(f"| `{self.ROW}` |")
+        ]
+        self.assertEqual(len(matching), 1, f"{self.ROW} must appear exactly once")
+
+    def test_the_row_names_its_issue_and_its_spec(self) -> None:
+        """A row whose issue lives only in the PR body is untraceable."""
+        text = (ROOT / ".agents/engine-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("mtp-k-gt-1.md", row)
+        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        self.assertIn("issues/81)", index)
+
+    def test_the_engine_pin_is_load_bearing_for_this_row(self) -> None:
+        """MUTATION: with this row removed, the pinned count must disagree.
+
+        Redirects only the ENGINE matrix at a mutated copy on disk, for the
+        reason `TenstorrentMistralRowIsCounted` records: patching `read_text`
+        globally would feed engine content to every matrix, and this case would
+        then pass on errors that have nothing to do with the removal.
+        """
+        clean: list[str] = []
+        agent_record.check_matrices(clean)
+        self.assertEqual([e for e in clean if "engine rows" in e], [])
+
+        path = agent_record.ENGINE_MATRIX
+        text = path.read_text(encoding="utf-8")
+        without = "\n".join(
+            l for l in text.splitlines() if not l.startswith(f"| `{self.ROW}` |")
+        )
+        self.assertNotEqual(without, text, "the row must be present to remove")
+
+        # Under ROOT, not /tmp: check_matrices reports through
+        # `relative_to(ROOT)`, which raises on a path outside the repository.
+        with tempfile.TemporaryDirectory(dir=agent_record.ROOT) as tmp:
+            mutated = Path(tmp) / "engine-matrix.md"
+            mutated.write_text(without, encoding="utf-8")
+            paths = [mutated if q == path else q for q in agent_record.MATRIX_PATHS]
+            errors: list[str] = []
+            with mock.patch.object(agent_record, "MATRIX_PATHS", paths), \
+                 mock.patch.object(agent_record, "ENGINE_MATRIX", mutated):
+                agent_record.check_matrices(errors)
+        self.assertTrue(
+            any("engine rows" in e for e in errors),
+            f"removing {self.ROW} must break the engine count; got {errors}",
+        )
+
+
 class IssueIndexTests(unittest.TestCase):
     """Every guarantee of the issue index, mutated rather than read.
 

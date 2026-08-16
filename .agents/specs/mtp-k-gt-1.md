@@ -599,6 +599,63 @@ the USAGE row asserted that the delivered drafts "vary with depth" without sayin
 that the rule is an AGGREGATE over a run, which reads as a per-call claim that
 would be false on this fixture.
 
+### The checker-evidence obligation this row owed, and how it is paid
+
+The two checkers this row re-pins are `governance_checker` paths, and a change to
+one owes executable mutation evidence in its paired suite. This branch changed
+both and shipped neither, so `pr-size` refused the pull request with two errors:
+
+```text
+ERROR: checker change 'scripts/check-agent-record.py' requires semantic mutation
+       evidence in tests/scripts/test_agent_record.py
+ERROR: checker change 'scripts/check-gate-commands.py' requires semantic mutation
+       evidence in tests/scripts/test_check_gate_commands.py
+```
+
+The local preflight could not see it, and that is worth recording rather than
+excusing. `check-pr-size.py` takes `--base` and `--head` and is dispatched only
+from the `pr-size` job in `.github/workflows/ci.yml`, so no preflight block runs
+it and the 77 `ok` lines above were a true count of a set that never contained
+this gate. A gate that only exists in CI is a gate the local run reports nothing
+about, which is the same shape as a block that skips while the run prints green.
+
+Neither checker was weakened. The evidence added is one case per checker, in the
+shape each suite already uses for a hand-re-pinned count:
+
+`tests/scripts/test_agent_record.py` gains `MtpDepthRowIsCounted`, which follows
+`TenstorrentMistralRowIsCounted` and `CudaLlamacppRowIsCounted`. The existing
+`test_engine_row_ratchet_is_load_bearing` moves the pin and proves it binds for
+ANY value, which cannot say whether 157 is the right one. The new class says
+that by removing `SPEC-MTP-K-GT-1` from a mutated copy of the matrix and
+requiring the count to disagree. `ENGINE_ROWS` is not in `MATRICES`, so the
+mutation redirects `ENGINE_MATRIX` and `MATRIX_PATHS` together. Patching one
+alone counts zero engine rows and the case would then go red for a reason
+unrelated to the removal.
+
+`tests/scripts/test_check_gate_commands.py` gains three cases, because the
+baseline is an EXACT set and a set equality binds from two sides. Dropping the id
+from `RUNNABLE_BASELINE` breaks the pin, and the row losing its command must be
+refused BY NAME through `ratchet_errors`, which only reports a row the baseline
+already carries. The credit case asserts the specific invocation rather than the
+verdict alone. Stripping `scripts/agent-preflight.sh` from the Gates section
+leaves the verdict `runnable` on a bare `ctest` harvested from surrounding prose,
+which is the weak-credit debt the checker's own header admits to, so a verdict
+assertion by itself would stay green while the named credit was gone.
+
+Each mutation was applied to the tree, run, and restored from a pristine copy
+verified by hash, with `git diff --stat` printed beside every result so a
+mutation that never applied could not read as a passing test.
+
+| Mutation | Result |
+|---|---|
+| Delete the `SPEC-MTP-K-GT-1` row from `engine-matrix.md` (1 line) | `FAILED (failures=2, errors=2)`, exit 1. `AssertionError: .agents/engine-matrix.md: 156 engine rows; expected 157` |
+| Drop `SPEC-MTP-K-GT-1` from `RUNNABLE_BASELINE` (1 line) | `FAILED (failures=7)`, exit 1. All three new cases red, including `ratchet_errors` returning `[]` for a row it no longer pins |
+| Strip the credited `scripts/agent-preflight.sh` from the row's Gates section | `FAILED (failures=1)`, exit 1, and the message names what survived: `['ctest', 'scripts/build-cpu-release.sh', 'git merge-tree', 'git merge-tree']` |
+| Demote the `## Gates` heading to prose | `FAILED (failures=7)`, exit 1, verdict `no-gates-section`, and `check-gate-commands.py --check` exits 1 naming the row |
+
+Restored and green: `tests.scripts.test_agent_record` 77 tests OK, up from 74,
+and `tests.scripts.test_check_gate_commands` 37 tests OK, up from 34.
+
 ### Records this row deliberately does NOT write
 
 `.agents/porting-inventory.md` section 9 gains no entry. The one deviation this

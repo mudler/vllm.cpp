@@ -5138,14 +5138,20 @@ Tensor KqResidentSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
 // The cache is keyed by (tower, expert). A tower's identity is its base
 // pointer, which is stable for the model's life because the tower is a borrowed
 // view into the mapping; the id map is built once per pointer.
+// Whether the operator ASKED for streaming, independent of whether a store has
+// been built yet. The grouped-MoE gate needs this before any expert is touched.
+inline bool Qwen35ExpertStreamRequested() {
+  static const bool on = [] {
+    const char* v = std::getenv("VT_MOE_EXPERT_STREAM");
+    return v != nullptr && v[0] != '0' && v[0] != '\0';
+  }();
+  return on;
+}
+
 class Qwen35ExpertStream {
  public:
   static Qwen35ExpertStream* Get(size_t slot_bytes) {
-    static const bool on = [] {
-      const char* v = std::getenv("VT_MOE_EXPERT_STREAM");
-      return v != nullptr && v[0] != '0' && v[0] != '\0';
-    }();
-    if (!on) return nullptr;
+    if (!Qwen35ExpertStreamRequested()) return nullptr;
     static Qwen35ExpertStream* inst = nullptr;
     if (inst == nullptr) inst = new Qwen35ExpertStream(slot_bytes);
     // A tower larger than the slot cannot be served by THIS store. Refuse by
@@ -5296,7 +5302,20 @@ std::vector<uint16_t> ExpertMlpKq(Dev d, const OwnedTensor& gate_kq,
 inline bool Qwen35GroupedMoeEnabled() {
   static const bool on = [] {
     const char* e = std::getenv("VT_QWEN35_GROUPED_MOE");
-    return e == nullptr || std::string(e) != "0";
+    const bool grouped = (e == nullptr || std::string(e) != "0");
+    // The grouped path stages the WHOLE tower through ResidentWeight, so it
+    // bypasses the expert slot cache entirely. Leaving both on would silently
+    // do no streaming at all while the operator believes it is streaming, which
+    // is the invisible-fallback shape this tree refuses elsewhere. Streaming is
+    // explicit and opt-in, so it wins, and it says so once.
+    if (grouped && Qwen35ExpertStreamRequested()) {
+      std::fprintf(stderr,
+                   "[expert-stream] VT_MOE_EXPERT_STREAM=1 disables the grouped "
+                   "MoE path (it stages the whole tower and cannot stream); set "
+                   "VT_MOE_EXPERT_STREAM=0 to keep grouping\n");
+      return false;
+    }
+    return grouped;
   }();
   return on;
 }

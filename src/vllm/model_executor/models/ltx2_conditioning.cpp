@@ -59,6 +59,21 @@ void AppendTokens(Ltx2LatentState* state, const std::vector<float>& tokens, int6
   const int64_t before = state->tokens;
   const int64_t after = before + token_count;
 
+  // BEFORE anything else, because upstream hands `extend_keyframes_mask` the
+  // PRE-append state (keyframe_cond.py:85, reference_video_cond.py:103) and the
+  // None-and-marked branch sizes its fresh mask from that state's denoise mask.
+  // Both video items ported here pass `marked=False`; the one construct that
+  // passes true is `VideoGeneratedKeyframeSlots` (keyframe_slots.py:121), which
+  // is not ported.
+  //
+  // It lives INSIDE this helper rather than at the three call sites because
+  // upstream's docstring makes the call an obligation of appending itself
+  // (mask_utils.py:83-85), and an obligation spread over three sites is one the
+  // fourth site forgets. The desynchronisation it prevents is invisible to every
+  // shape check: the render stays the right size and simply applies a trained
+  // term to the wrong tokens.
+  Ltx2ExtendKeyframesMask(state, token_count, /*marked=*/false);
+
   state->latent.resize(static_cast<size_t>(after * state->width), 0.0f);
   state->clean.insert(state->clean.end(), tokens.begin(), tokens.end());
   state->mask.insert(state->mask.end(), static_cast<size_t>(token_count),
@@ -102,10 +117,78 @@ Ltx2LatentState Ltx2CreateVideoLatentState(const Ltx2VideoLatentShape& shape, in
   state.positions = VideoPositions(shape, patch_size, factors, causal_fix, tokens);
   DivideTemporalByFps(&state.positions, tokens, fps);
 
+  // tools.py:184 — `create_initial_state` returns
+  // `replace(state, keyframes_mask=self._first_frame_keyframes_mask(state))` on
+  // the same line that builds the state, unconditionally. Carried ON the state
+  // so that an append can extend it; `out_keyframes_mask` stays for the callers
+  // that only want the vector.
+  state.keyframes_mask = Ltx2FirstFrameKeyframesMask(shape, patch_size);
   if (out_keyframes_mask != nullptr) {
-    *out_keyframes_mask = Ltx2FirstFrameKeyframesMask(shape, patch_size);
+    *out_keyframes_mask = state.keyframes_mask;
   }
   return state;
+}
+
+void Ltx2ExtendKeyframesMask(Ltx2LatentState* state, int64_t num_new_tokens, bool marked) {
+  VT_CHECK(state != nullptr, "ltx2 conditioning: null state");
+  VT_CHECK(num_new_tokens >= 0, "ltx2 conditioning: cannot extend the keyframes mask by a "
+                                "negative token count");
+  // `existing is None and not marked` -> `return None` (mask_utils.py:98-99).
+  // The empty vector IS None here, so an audio state and an unmarked append onto
+  // an unmarked state both stay empty rather than materialising a zero mask that
+  // the DiT would then read as "a marker was supplied".
+  if (state->keyframes_mask.empty() && !marked) return;
+  // `existing is None` and marked -> `zeros_like(denoise_mask)` first
+  // (mask_utils.py:100-101), sized by the state as it stands BEFORE the append.
+  if (state->keyframes_mask.empty()) {
+    state->keyframes_mask.assign(static_cast<size_t>(state->tokens), 0.0f);
+  }
+  VT_CHECK(static_cast<int64_t>(state->keyframes_mask.size()) == state->tokens,
+           "ltx2 conditioning: the keyframes mask must have one value per token BEFORE the "
+           "append — a mask that already disagrees with the token count has been extended by "
+           "something that did not go through AppendTokens");
+  state->keyframes_mask.insert(state->keyframes_mask.end(),
+                               static_cast<size_t>(num_new_tokens), marked ? 1.0f : 0.0f);
+}
+
+void Ltx2ClearConditioning(Ltx2LatentState* state, int64_t target_tokens) {
+  VT_CHECK(state != nullptr, "ltx2 conditioning: null state");
+  VT_CHECK(target_tokens >= 0 && target_tokens <= state->tokens,
+           "ltx2 conditioning: clear_conditioning TRUNCATES to the target token count "
+           "(tools.py:101-105), so the target cannot exceed what the state carries. A state "
+           "smaller than its own target means an appending item wrote somewhere other than the "
+           "END, which is the one thing clear_conditioning's docstring forbids");
+
+  state->latent.resize(static_cast<size_t>(target_tokens * state->width));
+  state->clean.resize(static_cast<size_t>(target_tokens * state->width));
+
+  // ALL ONES, not the conditioned mask sliced (tools.py:104 —
+  // `torch.ones_like(latent_state.denoise_mask)[:, :num_tokens]`). The returned
+  // state describes a FINISHED latent, in which every target token is denoised;
+  // slicing the conditioned mask instead would carry `1 - strength` on the
+  // conditioned tokens into whatever reads the state next, and on the two-stage
+  // recipe that next reader is the following phase's initial latent.
+  state->mask.assign(static_cast<size_t>(target_tokens), 1.0f);
+
+  // Positions are [pos_dims, tokens, 2], so the truncation is per DIMENSION
+  // (`positions[:, :, :num_tokens]`, tools.py:105). A plain resize would keep
+  // the first dimension's appended tokens and drop the last dimension's real
+  // ones, and the result still type-checks.
+  std::vector<float> trimmed(static_cast<size_t>(state->pos_dims * target_tokens * 2));
+  for (int64_t d = 0; d < state->pos_dims; ++d) {
+    std::copy(state->positions.begin() + static_cast<ptrdiff_t>(d * state->tokens * 2),
+              state->positions.begin() +
+                  static_cast<ptrdiff_t>(d * state->tokens * 2 + target_tokens * 2),
+              trimmed.begin() + static_cast<ptrdiff_t>(d * target_tokens * 2));
+  }
+  state->positions.swap(trimmed);
+
+  // `keyframes_mask=None` (tools.py:113). The marker described a sequence that
+  // no longer exists, and a sliced one would claim the trimmed state still
+  // carries markers for tokens that were removed.
+  state->keyframes_mask.clear();
+
+  state->tokens = target_tokens;
 }
 
 std::vector<float> Ltx2FirstFrameKeyframesMask(const Ltx2VideoLatentShape& shape,

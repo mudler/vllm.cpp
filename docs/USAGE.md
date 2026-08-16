@@ -501,20 +501,28 @@ and documents an explicit `0` as "skip re-compression entirely") but conditions
 the model on pixels it was not trained to see. That is a render-quality cost, and
 it is stated rather than applied silently.
 
-Keyframe, reference-image, reference-video and reference-audio conditioning are
-still refused, each naming a different missing piece: a last-frame keyframe needs
-the token-APPEND machinery — a keyframe is appended to the sequence with its own
-positions and a rebuilt attention mask, then trimmed back off, and this engine's
-phase loop is fixed at the target grid's token count — while the served
-first-frame arm only REPLACES tokens that already exist; the reference arms need
-the IC-LoRA's scale factors, which live in LoRA metadata this project does not
+A **last-frame keyframe is served** as of the token-APPEND seam. A keyframe is
+*appended* to the token sequence with its own pixel positions, denoised as part
+of a longer sequence, and trimmed back off before the latent is unpatchified,
+where the first-frame arm only REPLACES tokens that already exist. It takes the
+same `image_crf=0` and `noise_aug` as the first-frame arm, and both may be
+supplied at once. Two things a previous version of this paragraph got wrong are
+worth naming, because a reader may have acted on them: there is no rebuilt
+attention mask — a supplied keyframe passes `attention_mask=None` and upstream
+returns no mask for it — and the sigma schedule keeps reading the TARGET token
+count rather than the grown one, because upstream derives its shift from the
+unpatchified target. (Until 2026-08-13 this paragraph said a last-frame keyframe
+needs the DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a
+supplied keyframe is appended unmarked, so the embedding never applies to it.
+Where the embedding does bite is the FIRST latent frame of every render, which
+was a separate gap; it was closed on 2026-08-14 under issue #658, so the marker
+is now applied on every render.)
+
+Reference-image, reference-video and reference-audio conditioning are still
+refused, each naming a different missing piece: the reference arms need the
+IC-LoRA's scale factors, which live in LoRA metadata this project does not
 read; reference audio additionally needs the AUDIO VAE's encoder key filter,
-which is not built. (Until 2026-08-13 this said a last-frame keyframe needs the
-DiT's unported `keyframes_abs_pos_embedding`. That was wrong: a supplied keyframe
-is appended unmarked, so the embedding never applies to it. Where the embedding
-does bite is the FIRST latent frame of every render, which was a separate gap;
-it was closed on 2026-08-14 under issue #658, so the marker is now applied on
-every render.) Three encoder-level limits are worth
+which is not built. Three encoder-level limits are worth
 stating in advance because they are refusals rather than approximations. A
 reference waveform whose sample rate differs from the audio VAE's is refused
 rather than resampled, since upstream uses a polyphase kaiser resampler this
@@ -1470,7 +1478,7 @@ a stop token early.
 | `--tool-call-parser <name>` | `hermes` | Tool-call dialect (42 names over 38 families). `auto` detects from the chat template, `none` disables. For `gemma4`, OpenAI chat uses the text-seam parser (wrapped `<\|tool_call>` **or** bare `call:NAME{ARGS}`) so free-form / detokenized tool bodies still become `tool_calls`. **`inkling` needs `"skip_special_tokens": false` on the request today** — its whole grammar is special tokens and we have no `adjust_request` seam to force the flag off for you, so at the `true` default the detokenizer strips the markers before the parser runs ([#695](https://github.com/mudler/vllm.cpp/issues/695)). `--reasoning-parser inkling` is not registered at all ([#703](https://github.com/mudler/vllm.cpp/issues/703)) |
 | `--reasoning-parser <name>` | `none` | Reasoning parser (`think_auto`, `deepseek_r1`, `deepseek_v3`, `holo2`, `mistral`, `minimax_m2`, `minimax_m2_append_think`, `step3`, `olmo3`, `muse_glimmer`, `qwen3`, `mimo`). `auto` detects, `none` disables. `qwen3` and its `mimo` alias are the engine-backed adapter (one upstream class, two registry names): thinking is ON, so a marker-less stream is reasoning and a `<tool_call>` ends reasoning with no `</think>`. `auto` never selects it — a generic `<think>` template resolves to `think_auto`, which is the right default for hybrid-thinking models that may answer with no think block at all |
 | `--kv-transfer-config '<json>'` | (unset) | External KV connector, same JSON as vLLM's flag. See [docs/KV-OFFLOAD.md](KV-OFFLOAD.md) |
-| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Accepted and inert today: no weight moves yet**, and on unified memory such as GB10 it cannot help at all because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
+| `--offload-config '<json>'` | (unset) | Weight offload, the same JSON vLLM's `OffloadConfig` takes (distinct from `--kv-transfer-config`, which offloads KV blocks). Parsed and validated at startup, so a malformed document, an unknown backend or a validator violation is refused before any model I/O; a backend/field mismatch is a warning, as upstream. **Enabling it fails startup on every model today**: no loader consults the offloader, so the engine refuses the configuration by architecture name rather than accept a budget that frees nothing. A config that leaves offloading disabled still parses and reports normally. On unified memory such as GB10 offload cannot help at all, because host and device share one pool. See [docs/WEIGHT-OFFLOAD.md](WEIGHT-OFFLOAD.md) |
 | `--speculative-config '<json>'` | (unset) | Speculative decoding (`mtp`, `dflash`, `ngram`), same JSON as vLLM's flag. `dspark` speculates on the Qwen3.6 gate models (native + Speculators drafts), token-identically to speculative-off, but is not gated on speed: the cross-engine ratio is UNSETTLED, with a matched-and-warm paired measurement of 0.834x against the pinned oracle and the earlier 0.957x-0.989x figures taken against a single COLD oracle invocation on a machine that has since been reimaged. A GGUF target, or a target with no aux multi-tap, is refused by name (`SPEC-DSPARK`). Its sequential Markov sampling runs on device by default; `VT_DSPARK_DEVICE_SAMPLE=0` restores the host loop (token-identical, cost only). The speculative verify runs from a captured CUDA graph, worth +12.2%/+3.5% on the 35B cells; `VT_SPEC_DECODE_GRAPH=0` restores the eager verify (also token-identical). See [docs/SPECULATIVE-DECODING.md](SPECULATIVE-DECODING.md) |
 | `--language-model-only` / `--no-language-model-only` | off | Disable all multimodal input by setting **every** modality limit to 0, mirroring vLLM's flag of the same name. It is not a "skip the encoder" switch: the server then **refuses** a multimodal request with ``400 At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit.`` It does **not** free VRAM yet — nothing gates tower construction on it ([#607](https://github.com/mudler/vllm.cpp/issues/607) wave L3) |
 | `--limit-mm-per-prompt '<json>'` | (unset ⇒ 999 per modality) | Maximum multimodal input items per prompt, per modality, as the same JSON object vLLM's flag takes: `'{"image": 2, "video": 0}'`, or with profiling options `'{"video": {"count": 1, "num_frames": 32}}'` (the options are validated and ignored — they size dummy inputs for memory profiling, which this engine does not do). A limit can only **lower** what the model/seam supports, never raise it. Malformed JSON, a negative count, or an unknown option on `image` / `video` / `audio` is refused at startup rather than defaulted. An unknown option on any other modality name is dropped rather than refused, mirroring upstream, whose fallback `BaseDummyOptions` is the one such dataclass without `extra="forbid"`. Upstream's dotted spelling (`--limit-mm-per-prompt.image 2`) is not accepted here, as for `--kv-transfer-config` and `--speculative-config` |

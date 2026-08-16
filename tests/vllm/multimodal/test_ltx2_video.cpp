@@ -117,6 +117,12 @@ std::vector<float> ReadFloats(const std::string& path) {
   return out;
 }
 
+void WriteBytes(const std::string& path, const std::string& bytes) {
+  std::ofstream out(path, std::ios::binary);
+  REQUIRE_MESSAGE(out.good(), "cannot write ", path);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
 void WriteFloats(const std::string& path, const std::vector<float>& values) {
   std::ofstream out(path, std::ios::binary);
   REQUIRE_MESSAGE(out.good(), "cannot write ", path);
@@ -1153,36 +1159,31 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS
     }
   };
 
-  SUBCASE("a LAST-frame keyframe names the TOKEN-APPEND machinery, not the embedding") {
-    const std::string msg = refusal("a last-frame keyframe",
-                                    [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
-                                      g.last_frame_path = w.paths.video_embeds;
-                                    });
-    INFO(msg);
-    // THIS ASSERTION USED TO PIN A FALSE REASON. It required the message to
-    // blame `keyframes_abs_pos_embedding`, and at pin `fd4ded7f` that is not
-    // what blocks a supplied keyframe: `apply_to` appends it with
-    // `marked=False` (keyframe_cond.py:84-86) and the sole consumer adds
-    // `mask * embedding` (transformer_args.py:42-43, called at :269), so the
-    // embedding contributes exactly nothing to those tokens. Porting it would
-    // not serve this arm. The gate enforced the wrong thing, which is worse
-    // than not gating the message at all.
+  SUBCASE("a LAST-frame keyframe is no longer refused — it is SERVED") {
+    // THIS SUBCASE USED TO ASSERT A REFUSAL, and before that it asserted a FALSE
+    // one: it required the message to blame `keyframes_abs_pos_embedding`, which
+    // at pin `fd4ded7f` is not what blocks a supplied keyframe — `apply_to`
+    // appends it with `marked=False` (keyframe_cond.py:84-86) and the sole
+    // consumer adds `mask * embedding` (transformer_args.py:42-43, called at
+    // :269), so the embedding contributes nothing to those tokens.
     //
-    // What actually blocks it is the append: extended `positions`,
-    // `update_attention_mask`, extended `clean_latent` / `denoise_mask`, and
-    // `clear_conditioning` trimming back — none of which this engine's
-    // fixed-length phase loop can express.
-    CHECK(msg.find("update_attention_mask") != std::string::npos);
-    CHECK(msg.find("clear_conditioning") != std::string::npos);
-    CHECK(msg.find("keyframe_cond.py") != std::string::npos);
-    CHECK(msg.find("VAE_ENCODER_COMFY_KEYS_FILTER") == std::string::npos);
-    // The refuted reason may still be NAMED — it is worth telling a reader that
-    // it was ruled out — but never as the thing that is missing, and only next
-    // to the issue that tracks where the embedding really does bite (#658).
-    if (msg.find("keyframes_abs_pos_embedding") != std::string::npos) {
-      CHECK(msg.find("NOT* THE REASON") != std::string::npos);
-      CHECK(msg.find("#658") != std::string::npos);
-    }
+    // The reason it then named — the token-APPEND machinery — was the true one,
+    // and row LTX25-TOKEN-APPEND (#930) built it. So the arm is checked here for
+    // NOT refusing, and what it actually does is gated by "a LAST-frame keyframe
+    // is APPENDED, and the sequence is trimmed back", which compares rendered
+    // bytes against a no-op control.
+    //
+    // The check is kept in THIS case rather than only in that one because this
+    // is the case a reader consults to ask "which conditioning arms are refused
+    // today", and an arm that silently disappeared from it would leave that
+    // question answered wrongly.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/served_last_frame");
+    const std::string ppm = ws.root + "/served_last_frame.ppm";
+    WriteBytes(ppm, ConditioningPpm(20, 28, 9));
+    gen.last_frame_path = ppm;
+    gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.frame_count == 9);
   }
   SUBCASE("a reference video names the IC-LoRA metadata this project does not read") {
     const std::string msg = refusal("a reference video",
@@ -2034,6 +2035,25 @@ std::string RenderBytes(vllm::multimodal::VideoModelParams mp, const std::string
   return all;
 }
 
+// The same render, driven by a REQUEST the caller chose. `RenderBytes` fixes the
+// request at `FixtureGen`, which is what the connector cases want and what a
+// conditioning case cannot use.
+std::string RenderBytesWithGen(vllm::multimodal::VideoModelParams mp,
+                               const vllm::multimodal::VideoGenParams& gen) {
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  std::string all;
+  for (int64_t f = 0; f < result.frame_count; ++f) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06lld.ppm", static_cast<long long>(f));
+    all += ReadAll(gen.output_dir + name);
+  }
+  all += ReadAll(result.audio_path);
+  return all;
+}
+
 std::string RefusalOf(const vllm::multimodal::VideoModelParams& mp) {
   try {
     (void)vllm::multimodal::LoadVideoEngine(mp);
@@ -2142,6 +2162,160 @@ TEST_CASE("ltx2 video: the keyframe marker reaches the PIXELS with no image supp
   // ...and the same DiT twice is byte-identical, which is what makes the
   // inequality a statement about the marker rather than about noise.
   CHECK(RenderBytes(with_marker, ws.root + "/kf_marked2") == with);
+}
+
+// ─── the token-APPEND seam (row LTX25-TOKEN-APPEND, issue #930) ─────────────
+//
+// UPSTREAM SHIPS NO TESTS at pin `fd4ded7f` — `find /home/mudler/_git/LTX-2
+// -name 'test_*.py'` returns 0 across the whole repository — so nothing is
+// ported here. Every assertion cites the upstream `file:line` that justifies it
+// instead.
+//
+// THE WITNESS IS ON RENDERED BYTES, and that is the whole design. `Ltx2ConditioningTrace`
+// is filled before the denoise loop for every field except the handful written
+// inside it, so a witness built on the trace cannot observe what the loop does —
+// a sibling row's first attempt at exactly this found every arm identical for
+// that reason.
+//
+// AND IT CARRIES A NO-OP CONTROL, which is the correction that made the sibling's
+// result diagnosable. Their arms came out identical INCLUDING the control, which
+// is what said "the instrument is blind" rather than "the feature is weak".
+// Without the control those two read the same, and the wrong one is the one that
+// ships. So the comparison set below is {no keyframe, keyframe A, keyframe B}:
+//
+//   * every arm equal, control included  => the instrument is blind;
+//   * kf_a != noop                       => the append reached the maths;
+//   * kf_a != kf_b                       => the appended CONTENT reached it,
+//                                           not merely the token count.
+TEST_CASE("ltx2 video: a LAST-frame keyframe is APPENDED, and the sequence is trimmed back") {
+  Workspace ws;
+
+  // Deliberately not the render's own resolution: `load_image_and_preprocess`
+  // aspect-fills and centre-crops to the phase's height/width
+  // (media_io/resize.py:41-73).
+  const std::string kf_a_path = ws.root + "/kf_a.ppm";
+  const std::string kf_b_path = ws.root + "/kf_b.ppm";
+  WriteBytes(kf_a_path, ConditioningPpm(20, 28, 21));
+  WriteBytes(kf_b_path, ConditioningPpm(20, 28, 22));
+
+  auto request = [&](const std::string& tag, const std::string& keyframe) {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + tag);
+    if (!keyframe.empty()) {
+      gen.last_frame_path = keyframe;
+      // The codec round trip is unported and an LTX-2.5 checkpoint RESOLVES 18,
+      // so the supported arm has to be asked for. Same rule as the first-frame
+      // arm, because upstream resolves the CRF once for the whole `images` list
+      // (blocks.py:966-983).
+      gen.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
+    }
+    return gen;
+  };
+
+  const vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  const std::string noop = RenderBytesWithGen(mp, request("kf_noop", ""));
+  const std::string kf_a = RenderBytesWithGen(mp, request("kf_a", kf_a_path));
+  const std::string kf_b = RenderBytesWithGen(mp, request("kf_b", kf_b_path));
+  REQUIRE(noop.size() == kf_a.size());
+  REQUIRE(noop.size() == kf_b.size());
+
+  // THE CONTROL FIRST. A re-render of the no-keyframe request must be byte
+  // identical, otherwise every inequality below is noise and this case says
+  // nothing about appends.
+  REQUIRE_MESSAGE(RenderBytesWithGen(mp, request("kf_noop2", "")) == noop,
+                  "the same request rendered twice is not byte-identical, so this instrument "
+                  "cannot measure anything");
+
+  auto differing = [](const std::string& a, const std::string& b) {
+    size_t n = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (a[i] != b[i]) ++n;
+    }
+    return n;
+  };
+  MESSAGE("kf_a vs noop: " << differing(kf_a, noop) << " of " << noop.size() << " bytes; "
+                           << "kf_a vs kf_b: " << differing(kf_a, kf_b));
+
+  // The appended tokens take part in self-attention over the WHOLE sequence, so
+  // a keyframe that reached the maths moves the target tokens' own output. This
+  // is the claim the refusal that stood here was about: the engine could not
+  // grow the sequence through the DiT.
+  CHECK_MESSAGE(differing(kf_a, noop) > 0,
+                "a last-frame keyframe rendered the same bytes as a render with no keyframe at "
+                "all, so the appended tokens never reached the forward");
+  // ...and it is the keyframe's CONTENT that reached it. Two keyframes append
+  // the same NUMBER of tokens, so a build that grew the sequence with zeros —
+  // or that appended the wrong buffer — passes the check above and fails this
+  // one.
+  CHECK_MESSAGE(differing(kf_a, kf_b) > 0,
+                "two DIFFERENT last-frame keyframes rendered identical bytes, so the appended "
+                "tokens carry no content from the keyframe");
+
+  SUBCASE("the sequence GROWS through the DiT and comes back to the target grid") {
+    vllm::multimodal::VideoModelParams capped = FixtureParams(ws.paths);
+    capped.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+
+    auto tokens_of = [&](const std::string& tag, const std::string& keyframe) {
+      const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+          vllm::multimodal::LoadVideoEngine(capped);
+      auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+      REQUIRE(ltx2 != nullptr);
+      const vllm::multimodal::VideoResult result = engine->Generate(request(tag, keyframe));
+      // The artifact is the other half of the claim: the trim is what lets
+      // `Ltx2VideoUnpatchify` produce a target-shaped volume, and the frame
+      // count is that shape observed from outside.
+      CHECK(result.frame_count == 9);
+      return ltx2->last_conditioning().video_tokens;
+    };
+
+    const int64_t plain = tokens_of("tok_noop", "");
+    const int64_t with_kf = tokens_of("tok_kf", kf_a_path);
+
+    // The fixture's phase 0 runs at `spatial_downscale = 2`, so 64x64 pixels is a
+    // 1x1 latent grid and 9 frames is 2 latent frames: 2 target tokens. One
+    // encoded keyframe is one latent frame at that grid, so it appends exactly
+    // `tokens_per_latent_frame` = 1 (tools.py:198-201).
+    CHECK(plain == 2);
+    CHECK_MESSAGE(with_kf == plain + 1,
+                  "a keyframe must append one latent frame's worth of tokens "
+                  "(keyframe_cond.py:79-82); got " << with_kf << " against a target of " << plain);
+  }
+
+  SUBCASE("the sigma schedule keeps reading the TARGET count, not the grown one") {
+    // The distilled two-stage recipe carries its own frozen sigmas
+    // (distilled.py:200-201 defaults both stages to the `DISTILLED_SIGMAS` /
+    // `STAGE_2_DISTILLED_SIGMAS` constants of utils/constants.py:17-23), so it
+    // never computes a schedule and cannot show
+    // this. `one_stage` does: `phase.sigmas` is empty, so the engine calls
+    // `Ltx2SigmaSchedule`, whose shift is a function of the token count
+    // (schedulers.py:37-39).
+    //
+    // Upstream fixes that count at the TARGET twice over: the argument is
+    // `math.prod(latent.shape[2:])` of the UNPATCHIFIED target, which cannot
+    // contain appended tokens, and `ti2vid_one_stage.py:207` computes the
+    // schedule before any state exists. A port that read the grown count would
+    // re-shift the entire trajectory the moment a keyframe was supplied.
+    vllm::multimodal::VideoModelParams one_stage = FixtureParams(ws.paths);
+    one_stage.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "one_stage";
+
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(one_stage);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = request("one_stage_kf", kf_a_path);
+    gen.steps = 2;  // one_stage admits a step override; 50 would gate nothing extra
+    (void)engine->Generate(gen);
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+
+    // Both numbers are MEASURED, and the statement is the relation between them.
+    // Pinning either to a literal would pass on a build that read the grown
+    // count everywhere.
+    CHECK(trace.schedule_tokens > 0);
+    CHECK_MESSAGE(trace.video_tokens > trace.schedule_tokens,
+                  "the DiT ran over " << trace.video_tokens << " tokens and the schedule was "
+                                      << "built for " << trace.schedule_tokens
+                                      << "; equal means the append re-shifted the schedule");
+  }
 }
 
 TEST_CASE("ltx2 video: the connector's positional bound comes from the CONFIG") {

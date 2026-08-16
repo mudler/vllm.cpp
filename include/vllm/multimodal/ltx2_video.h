@@ -402,6 +402,34 @@ struct Ltx2ConditioningTrace {
   int64_t image_crf = 0;      // the CRF this render actually preprocessed at
   double image_strength = 0.0;  // `ImageConditioningInput.strength` (args.py:64)
 
+  // ── the token-APPEND seam (row LTX25-TOKEN-APPEND, issue #930) ───────────
+  //
+  // TWO token counts, because after this row they are no longer the same number
+  // and the difference between them IS the row.
+  //
+  // `video_tokens` is the length of the sequence the DiT forward actually ran
+  // over on the LAST phase — the target grid plus whatever an appending
+  // conditioning item added (keyframe_cond.py:79-82). `schedule_tokens` is the
+  // count the sigma schedule read, which upstream fixes at the TARGET: its shift
+  // comes from `math.prod(latent.shape[2:])` (schedulers.py:32), the
+  // UNPATCHIFIED target latent, and the pipelines compute sigmas before any state
+  // exists (ti2vid_one_stage.py:207, distilled.py:200-201). So a render that
+  // appends must show `video_tokens > schedule_tokens`, and a build that let the
+  // append re-shift the schedule shows them equal.
+  //
+  // Both are written INSIDE the phase loop, like `image_tokens` and unlike every
+  // field above them. That distinction is the whole reason they exist: the rest
+  // of this trace is filled before denoise and therefore cannot observe anything
+  // the loop does, so a witness built on those fields finds every arm identical
+  // and reads as a weak effect rather than as a blind instrument.
+  //
+  // `schedule_tokens` stays 0 on a recipe that carries its own distilled sigmas
+  // (`Ltx2PhaseRecipe::sigmas` non-empty), because on that path no schedule is
+  // computed and there is nothing to report. Zero here means "not measured", not
+  // "zero tokens".
+  int64_t video_tokens = 0;
+  int64_t schedule_tokens = 0;
+
   // ── AUDIO-TO-VIDEO: the supplied take, as the DiT received it (#922) ───────
   //
   // Zero and false everywhere when the request carried no `audio_path`.

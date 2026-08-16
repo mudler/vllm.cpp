@@ -404,9 +404,32 @@ What Thor *is* good for on this row: sm_110 runtime coverage (it is our only
 non-GB10 CUDA host), our own low-bit arm end to end, and every unit/brick gate in
 §7 — none of which need the 290 GB checkpoint.
 
-### 6.4 The three ways this row can proceed
+### 6.4 How this row proceeds — DECIDED
 
-Recorded as options, not chosen here; picking one is a developer decision.
+**Developer decision, 2026-08-15: option B.** The row ports brick by brick
+against independent references, ships our own low-bit arm on Thor, and carries
+the end-to-end parity gate as an OPEN GAP rather than a satisfied one. A and C
+below are recorded because the reasoning stays useful if the hardware position
+changes.
+
+What choosing B commits this row to, stated plainly so no later reader has to
+infer it:
+
+- **No performance number for dots3-note is claimable, on any axis, for as long
+  as B holds.** Not a ratio, not a floor, not "comparable to". The oracle cannot
+  run here (§6.2), so there is no denominator. A number measured against our own
+  arm alone is a self-comparison and says nothing about parity.
+- **Correctness claims are bounded by their instrument.** Each brick gates
+  against an independent in-test double-precision reference written from the
+  upstream source. That establishes that two implementations agree; it does not
+  establish that either matches vLLM. Every brick says so in its own evidence
+  cell rather than relying on this paragraph.
+- **The e2e gate is owed, not waived.** It stays an open gap on the row until
+  either the pin advances onto hardware that runs the model, or a smaller
+  checkpoint appears. `## Owed` in this spec is where it lives.
+- **No ceiling is declared** — unchanged, and the reason B is acceptable at all.
+
+The alternatives, kept for the record:
 
 - **A — rent 8×H100.** The only path to a real parity gate. Cost and data-egress
   are the developer's call; nothing in-repo authorizes it.
@@ -493,6 +516,17 @@ Measured by mutating the row's state to `ACTIVE` in a scratch copy and reading
 the seven errors it produced. Whoever takes W1 owes that restructure in the same
 change as the lifecycle move, not afterwards.
 
+## Owed
+
+Carried openly under option B (§6.4), not waived:
+
+- **The end-to-end parity gate against vLLM** — token-exact or the ratified
+  near-tie form, chosen by measurement. Blocked on §6.2 (no host we own runs the
+  oracle at any published precision) and on the beyond-pin position of §6.1.
+  Owner: this row. Issue [#699](https://github.com/mudler/vllm.cpp/issues/699).
+- **Every throughput, latency and memory axis.** Open by construction while the
+  gate above is owed; see §6.4 for why no number is claimable meanwhile.
+
 ## 9. Stop conditions
 
 - Any brick whose only available comparison is a shared helper stops and says so
@@ -506,8 +540,21 @@ change as the lifecycle move, not afterwards.
 
 ## Now
 
-W0 — spec committed, rows added, no engine code and no build. The row is
-`SPIKE` and **blocked on §6.4**: there is no hardware here that runs the oracle,
-and the architecture is past our parity pin. Next action is a developer decision
-between options A, B and C, not an implementation brick. If B is chosen, W0.5
-(provision Thor at `192.168.68.23`) is the first dispatchable task.
+W0 complete; **§6.4 answered on 2026-08-15 with option B**, so the row is no
+longer blocked on a decision. It stays `SPIKE` until W1 lands code.
+
+In flight: **W0.5 — provision Thor at `192.168.68.23`**. Measured 2026-08-15,
+and it shapes the work: Thor runs a Kairos-style immutable OS with `/` mounted
+READ-ONLY (4.4G loop, 1.3G free), so `apt install` is unavailable; but Docker is
+present, `/home` has 362G, the driver is at
+`/opt/nvidia/l4t-gpu-libs/nvgpu/libcuda.so*`, and `nvidia-smi` under `sudo`
+reports `NVIDIA Thor, 11.0` — compute capability **11.0 = sm_110**. The earlier
+"NvRmMemInitNvmap failed: Permission denied" was a privilege problem, not a
+broken driver. There is no CUDA toolkit on the box at all.
+
+W0.5 is not dots3-specific: Thor is the project's only non-GB10 CUDA host, so
+its recipe and `ctest` baseline belong in `.agents/environment.md` and unblock
+any row that wants sm_110 coverage.
+
+After W0.5, W1 (config + registry, with the six §4 traps RED-first) is the first
+dots3 brick.

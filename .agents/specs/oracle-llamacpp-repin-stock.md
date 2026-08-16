@@ -1217,10 +1217,16 @@ burned by twice.
 - **What the gate run reports, by block.** On the merged head at the review-repair
   pass: `Session role` 1, `Record gates` 26, `Mutation suites` **45**,
   `Committed range vs origin/main` 3, and `Commit trailers vs origin/main` 2, so
-  **77 results, 76 `ok`, 1 `FAIL`** (the #618 flake above), and **zero SKIP**.
-  Mutation suites moved 44 to 45 because `origin/main` landed
-  `test_agent_preflight_skip_report` with #1030, which is another count in this
-  file that a foreign merge changes.
+  **77 results and zero SKIP**. Mutation suites moved 44 to 45 because
+  `origin/main` landed `test_agent_preflight_skip_report` with #1030, which is
+  another count in this file that a foreign merge changes.
+
+  **The same head reports two different results, and the difference is the box,
+  not the tree.** At loadavg 64.88 and again at 84.95 it returns `rc=1` with
+  **76 `ok` and 1 `FAIL`**, the #618 flake. At loadavg **15.47** the identical
+  commit returns `rc=0`, **`All gates green`, 77 of 77 `ok`**. That is the
+  cleanest available statement of what #618 costs: a gate whose verdict depends
+  on who else is using the machine reports on the machine, not on the diff.
 
   **The last two block headings now name the SHA they gated against**, reading
   `... vs origin/main d1b0ea3a8e64740c20ba46cd4506794113dda61b`. That is #1030's

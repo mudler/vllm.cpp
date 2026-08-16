@@ -202,7 +202,13 @@ Ltx2LatentState ToLatentState(const StreamState& s, int64_t pos_dims) {
   out.latent = s.latent;
   out.clean = s.clean;
   out.mask = s.mask;
-  out.positions.assign(s.positions.begin(), s.positions.end());
+  // Explicit cast: StreamState stores positions as double for the DiT surface,
+  // Ltx2LatentState keeps float32. Range-assign would narrow implicitly and
+  // trip MSVC C4244 under /WX (mudler/vllm.cpp#968).
+  out.positions.resize(s.positions.size());
+  for (size_t i = 0; i < s.positions.size(); ++i) {
+    out.positions[i] = static_cast<float>(s.positions[i]);
+  }
   out.keyframes_mask = s.keyframes_mask;
   return out;
 }
@@ -213,7 +219,10 @@ void FromLatentState(const Ltx2LatentState& in, StreamState* s) {
   s->latent = in.latent;
   s->clean = in.clean;
   s->mask = in.mask;
-  s->positions.assign(in.positions.begin(), in.positions.end());
+  s->positions.resize(in.positions.size());
+  for (size_t i = 0; i < in.positions.size(); ++i) {
+    s->positions[i] = static_cast<double>(in.positions[i]);
+  }
   s->keyframes_mask = in.keyframes_mask;
 }
 

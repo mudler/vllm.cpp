@@ -21956,3 +21956,41 @@ withdrawn" and then withdrew THREE (the ~3.7 / 5.9 / 6.4 s spans for indices
 2 / 12 / 18, measured at 40.8 / 37.6 / 38.6 s). Three is the count. That figure
 set is a different derivation from the 47.0 / 47.5 / 46.7 s wall-duration
 imputation above and is not part of this band.
+
+## Qwen3.8-2.4T-A95B on one DGX Spark
+
+A 2.4 trillion parameter model, 370 GiB on disk, loads and generates on a single
+119 GiB GB10. This is a capability result with a slow number attached, not a
+competitive one, and the number is the point: it prices the work that follows.
+
+| Axis | Measured (16 August 2026) |
+|---|---|
+| checkpoint | `unsloth/Qwen3.8-2.4T-A95B-GGUF UD-Q1_0` @ `567d3e6ac2`, 370 GiB, 10 shards, sha256-verified |
+| host | dgx.casa, GB10, 119 GiB unified, local NVMe, CPU device |
+| config | `--max-num-seqs 1 --max-model-len 512`, `VT_GGUF_PREFAULT=0` |
+| load to serving | 13 min |
+| resident anonymous memory | **62 GiB** of 119 GiB |
+| output | `"Q: What is the capital of France? A:"` -> `" Paris."` |
+| TTFT | 3318 s (prefill + cold expert set; NOT a decode number) |
+| steady decode | **66.7 s/token** (66.5, 66.9, 66.8 consecutive) |
+| decode rate | **0.015 tok/s** |
+
+**Why it fits.** The routed experts, about 330 GiB, are never copied: the
+keep-quant loader BORROWS them from the mmap and the kernel demand-pages them,
+at zero anonymous cost. What is resident is the dense remainder, predicted at
+44.6 GiB from the checkpoint's own tensor table (`attn_qkv` 21.56 + `ssm_out`
+17.25 + embeddings and norms 5.81) and measured at 62 GiB with KV and runtime.
+
+**Why it is slow, and by how much.** There is no streaming lane wired yet. Each
+token needs roughly 6.7 GB of expert bytes (10 experts x 3 matrices x 93
+layers), and the kernel serves them as 4 KiB demand faults in router order, so
+the expert read path runs at about 100 MB/s against an NVMe that sustains ~5
+GB/s. **The gap is about 50x and it is entirely access pattern.** Three
+consecutive tokens within 0.4 s of each other is the same working set being
+re-faulted every step, which is what a resident expert cache exists to remove.
+
+Reaching the row's c1 target of 3 to 6 tok/s needs roughly 200 to 400x, so it
+needs both the explicit batched reads and the cache hit rate together. The
+pieces are in tree and unwired: `ExpertSlotCache`, `GgufExpertSpanOf` and
+`ExpertStreamer`. See [`.agents/specs/expert-streaming.md`](../.agents/specs/expert-streaming.md).
+

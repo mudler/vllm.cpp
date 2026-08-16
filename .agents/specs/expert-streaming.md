@@ -572,7 +572,8 @@ records why the target checkpoint changed.
 | W9 IQ1_S decode | `DType::kIQ1_S`, geometry `{256, 50, 19}`, `BlockDTypeFromGgmlTypeId` row, CPU `iq1s_grid` + `VecDotIQ1_SQ8_K` traits row, dequant path | - | CPU tests green against upstream-derived vectors; `KeepQuantDType(19)` true |
 | W10 IQ1_S device decode | `iq1s_grid_gpu` + CUDA `vec_dot`, so streamed slices dot on device. NOT optional polish: `cuda_quant_dot.cu:1531` maps an unknown weight dtype to `return false`, which is a SILENT CPU fallback. Tokens would still be correct, so no token gate can see it, and a 2.4 T model would simply run at CPU speed while looking healthy | W9 | CUDA tests; parity with the CPU arm; the fallback must be observable rather than inferred |
 | W11 checkpoint load | UD-Q1_0 first, then UD-IQ1_S, loads end to end on dgx.casa, refusing any encoding it cannot honour by name. BLOCKED on W4: measured 16 August 2026, the load needs memory of the order of the whole file (4 GiB per 110 s, linear, no plateau) and cannot complete in 119 GiB | W9, W10, W12, W4 | model loads; token output captured |
-| W4a allocation attribution | Settle WHERE the anonymous memory comes from before wiring anything. Routing says the weights borrow the mmap and the process says anonymous, and those disagree. If the borrowed `OwnedTensor` is copied again when the model materialises its buffers, then a streamer under that loader changes nothing | - | the allocating call named, with a measurement |
+| W4a allocation attribution | **DONE 16 August 2026.** The allocator is the GDN V-head reorder forcing `attn_qkv` and `ssm_out` to `kTransformedWeight`, which expands them to bf16: about 50 GiB across 93 layers. Experts were never the problem; they borrow with 0 copies | - | measured, see the census section |
+| W4b transformed-weight residency | Stop the V-head reorder from costing ~50 GiB. Either apply the reorder at RUNTIME so the stored blocks stay borrowed, or confine it inside block boundaries so a block-typed weight survives it. Without this, streaming the experts still does not fit | W4a | the two projections stay block-resident, measured on the same load |
 | W12 IQ1_XXXS decode | `DType::kIQ1_XXXS`, geometry `{256, 38, 66}`, the 256-entry fork codebook, `VecDotIQ1_XXXSQ8_K`, dequant, traits row and the reader's `case 66`. Grounded in the pinned fork oracle, cited per site | - | CPU tests green; `KeepQuantDType(66)` true; grid digest sealed |
 | W13 IQ1_XXXS device decode | the CUDA arm, for the same silent-fallback reason as W10 | W12 | CUDA tests; parity with the CPU arm |
 
@@ -703,7 +704,50 @@ disagree, and THAT is the remaining question: instrument the branch and find out
 whether `is_cpu()` is false at that point, or whether a second copy happens
 elsewhere.
 
-NOT established: the exact allocation site. The evidence bounds the OUTCOME
+**ANSWERED 16 August 2026 by instrumenting the load. The allocator is the
+GatedDeltaNet V-head reorder, and it has nothing to do with the experts.**
+
+Counters placed at each candidate, then run on both hosts, eliminated every
+other explanation and found the real one:
+
+| Candidate | Verdict |
+|---|---|
+| keep-quant copy branch (`OwnGgufQuantBlocks`) | **0 copies**, 281 borrows, 147.6 GiB borrowed |
+| q8_0 repack branch | only accepts `kQ8_0`; this checkpoint has ONE such tensor |
+| model materialisation (`qwen3_5.cpp:976`) | instrument NEVER fired during load |
+| vt CPU and CUDA allocators | never reached the 2 GiB print threshold |
+| `OwnedBytes` copy | shallow; a borrow shares its owner |
+| **expand-to-bf16 (`DqBf16`)** | **69 calls by layer 9**, on `attn_qkv` and `ssm_out` |
+
+`in_proj` (`attn_qkv`) and `out_proj` (`ssm_out`) become `kTransformedWeight`
+whenever the V-head reorder is active (`num_v != num_k`, `qwen3_5_gguf_weights
+.cpp:1020`). A transformed weight is LAYOUT-REWRITTEN at load, so it "can never
+keep its blocks" and expands to bf16. For this model that is 8192x16384 plus
+16384x8192 per layer, about 268 MiB each after expansion, so roughly 536 MiB per
+layer across 93 layers, or **about 50 GiB** — which matches the measured 53 GiB
+almost exactly.
+
+The two hosts disagreed for a reason worth keeping: on x86 without the reorder
+path taken the same load holds **anon = 0 GiB across 281 borrows**, and on GB10
+it climbs. The reorder is what separates them, not CUDA, not the filesystem, and
+not the expert encoding.
+
+**The consequence changes the plan.** Expert streaming alone does NOT make this
+model load. The experts already borrow correctly and cost no anonymous memory;
+the blocker is ~50 GiB of DENSE weights inflating from about 5.5 bits to 16.
+Streaming the experts and leaving this in place still exceeds the box. Whoever
+takes this needs BOTH: the streaming lane for the ~330 GiB of experts, and a
+transformed-weight path that does not expand, by doing the reorder at runtime or
+by confining it inside block boundaries.
+
+Instrument note, because it nearly cost the diagnosis: the first loader counter
+printed on `(n % 300) == 1`, so it fired once and read as "1 borrow" when there
+were 281. A counter that samples cannot answer "how many". The second flaw was
+placing that counter AFTER the repack early-return, which would have hidden
+every repack copy had there been any.
+
+NOT established previously, now closed. The remaining unknown is not the
+allocation site. The evidence bounds the OUTCOME
 (linear anonymous growth proportional to load progress) without identifying
 which call allocates. Routing says borrow, the process says anonymous, and those
 two facts are not yet reconciled. The likely candidates, in order, are that the

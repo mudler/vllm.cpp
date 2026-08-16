@@ -34,7 +34,7 @@ Verified against `332aed738` in this worktree, not taken from the issue text.
   (`MtpProposePrefill`) returns `std::vector<int32_t>` of length `num_reqs`.
   There is one value per request and no place to put a second.
 - The rest of the engine honours the configured k.
-  `src/vllm/v1/core/kv_cache_utils.cpp:1002` sizes snapshot slots by
+  `src/vllm/v1/core/kv_cache_utils.cpp:977-981,994` sizes snapshot slots by
   `num_speculative_tokens`. `src/vllm/v1/worker/gpu/cudagraph_dispatch.h:45-46`
   captures the verify shape at `1 + num_speculative_tokens`.
   `src/vllm/entrypoints/model_loader.cpp:842-843` widens the KV spec by
@@ -91,7 +91,7 @@ Every anchor below was read at that revision.
 
 | Anchor | What it defines |
 |---|---|
-| `:129-275` `propose` | The whole shape: one prefill forward, then the k=1 early exit at `:238-240`, then `prepare_decode_inputs`, then `_multi_step_decode`, then `return self.draft_tokens[:num_reqs]` |
+| `:129-274` `propose` | The whole shape: one prefill forward, then the k=1 early exit at `:238-240`, then `prepare_decode_inputs`, then `_multi_step_decode`, then `return self.draft_tokens[:num_reqs]` |
 | `:238-240` | The early exit this tree ported. `num_speculative_steps == 1` returns `draft_tokens[:num_reqs, :1]` |
 | `:335-370` `_prefill` | Sample step 0 from the `last_token_indices` rows, then carry BOTH the sampled hidden and the positions of those rows into the per-request decode buffers |
 | `:374-419` `_multi_step_decode` | `for step in range(1, num_speculative_steps)`: rebuild slot mappings and draft attention metadata each step, set `current_draft_step`, generate |
@@ -116,7 +116,7 @@ the DEFAULT after this row. k>1 becomes reachable, not automatic.
 ### 4.1 Phase 1, where the refusal goes and why
 
 At `LoadedEngine::ResolveSpecConfig`, on the `mtp` arm
-(`src/vllm/entrypoints/model_loader.cpp:812-833`), beside the per-method
+(`src/vllm/entrypoints/model_loader.cpp:812-839`), beside the per-method
 requirements the other three arms already carry.
 
 Four reasons, and two rejected alternatives.
@@ -124,7 +124,7 @@ Four reasons, and two rejected alternatives.
 1. Every entry point reaches it. The CLI, the `--speculative-config` JSON, the
    C ABI and the in-memory `LoadedEngine` constructors all resolve here, and the
    `LoadedEngine` constructor runs it as its FIRST member initialisation
-   (`src/vllm/entrypoints/model_loader.cpp:971`). One check covers all of them.
+   (`src/vllm/entrypoints/model_loader.cpp:994`). One check covers all of them.
 2. It fails at engine construction, BEFORE the KV pool is widened for a depth
    that will not be used (`resolved_spec_config_` is initialised before
    `kv_cfg_` in the same member list) and before any graph capture.
@@ -200,8 +200,8 @@ rather than accepted, and they resolve differently.
 it does NOT collide at all is WITHDRAWN, because it was over-strong and a fresh
 review was right to reject it.**
 
-`src/vllm/model_executor/models/qwen3_5.cpp:9276` (and its dense sibling at
-`:9698`) keys the slot ring on `S` alone, and `:9253` sets `S = B` exactly on a
+`src/vllm/model_executor/models/qwen3_5.cpp:9281` (and its dense sibling at
+`:9708`) keys the slot ring on `S` alone, and `:9257-9258` sets `S = B` exactly on a
 spec step while padding `B` onto the capture ladder otherwise, so `4 x (1+1)` and
 `2 x (1+3)` are the same key.
 
@@ -217,7 +217,7 @@ predicate that reaches the ring is
 BOTH disjuncts, so two query lengths do reach one map: at k=1, 8 requests
 pure-decode and 4 requests spec both give `S = 8`, and at k=3, 2 requests spec
 gives `S = 8` as well. `SizeSlot` invalidates on `fa_cols` and on `aux_taps`
-(`qwen3_5.cpp:9280-9330`) and on nothing keyed to spec-versus-pure.
+(`qwen3_5.cpp:9309-9316` and `:9361-9367`) and on nothing keyed to spec-versus-pure.
 
 What survives is the claim this row actually needs: the ambiguity is PRE-EXISTING
 and this row does not widen it. It arrived with SPEC-DSPARK W8 (#442), which made
@@ -238,7 +238,7 @@ lengths, and the ring needs to distinguish them only because both branches share
 it.
 
 One stale comment the same audit found IS repaired in flow, because it is a false
-statement rather than a design question. `qwen3_5.cpp:9177` and `:9601` both said
+statement rather than a design question. `qwen3_5.cpp:9176-9184` and `:9605-9613` both said
 "spec never captures, ValidateGdnDecodeGraphState rejects a spec batch" and
 concluded that the spec-segmentation copies beside them are inert. #442 made both
 halves false. The comment now says those copies are inert on the pure-decode path
@@ -309,7 +309,7 @@ Nothing here needs a seam that cannot represent the behaviour.
 ### 4.4 Telemetry
 
 `spec_drafts_proposed_` and `spec_drafts_accepted_`
-(`include/vllm/v1/worker/gpu/runner.h:671-672`) count tokens and cannot answer
+(`include/vllm/v1/worker/gpu/runner.h:743-744`) count tokens and cannot answer
 "how deep did acceptance reach". #81's M1 asks for per-depth acceptance, and
 M4's controller needs exactly that signal, so this row adds per-depth counters
 beside them and exposes them read-only.
@@ -366,7 +366,7 @@ none needs a checkpoint or a GPU.
 |---|---|---|
 | `test_speculative_mtp_depth` (new) | The mirrored config type: the k=1 default, the upstream divisibility rule, and that the type CARRIES a depth rather than clamping it | 4 cases, 20 assertions |
 | `test_prepare_decode_inputs` (new) | The two Triton-kernel ports: the step-1 entry state, the between-step advance, the final-step early return, both `max_model_len` clamps, and the draft slot mapping | 8 cases, 33 assertions |
-| `test_mtp_depth` (new) | Depth through the PRODUCTION loader at k=1, 2, 3, 4, with a real `mtp.*` head loaded by `LoadQwen3_5MTP`, the greedy equivalence of spec-OFF, k=1 and k=3, and the draft-decode-forward equality that is the actual depth witness | 5 cases, 47 assertions |
+| `test_mtp_depth` (new) | Depth through the PRODUCTION loader at k=1, 2, 3, 4, with a real `mtp.*` head loaded by `LoadQwen3_5MTP`, the greedy equivalence of spec-OFF, k=1 and k=3, and the TWO depth witnesses: the draft-decode-forward equality (the work RAN) and the varied-draft counter (the work's RESULT was delivered) | 5 cases, 63 assertions |
 
 Red-before evidence, all with real counts:
 
@@ -389,7 +389,7 @@ Red-before evidence, all with real counts:
 
 ## Gates
 
-Full CPU gate: `scripts/agent-preflight.sh` plus the built test suite. The suite result is `100% tests passed, 0 tests failed out of 495`, with 2 checkpoint-gated skips (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`).
+Full CPU gate: `scripts/agent-preflight.sh` plus the built test suite. The suite result is 493 passed / 0 failed / 2 skipped of 495, exit 0. CTest prints that as `100% tests passed, 0 tests failed out of 495`, which counts a SKIP as neither, so the three buckets are reported here instead. Both skips are checkpoint-gated and unrelated to this row: `test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`.
 
 Build note, recorded because it changed the evidence's arm. The first full CPU
 build here was `CMAKE_BUILD_TYPE=Debug` and reached 49 GB across roughly 500 test
@@ -476,11 +476,14 @@ it silently because `origin/main` had advanced mid-flow. Checked explicitly this
 time: `git merge-base --is-ancestor origin/main HEAD` succeeds against
 `ff264cb82`, which is the SHA the block gated on.
 
-`ctest` on the same head: `100% tests passed, 0 tests failed out of 495`, exit
-code 0, with two checkpoint-gated skips (`test_modelopt_mixed_precision_checkpoint`,
-`test_voxtral_e2e`). Full `Release` rebuild first, `compile_err = 0`, zero
+`ctest` on the same head: 493 passed / 0 failed / 2 skipped of 495, exit
+code 0. The two skips are checkpoint-gated and unrelated
+(`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`); they are named
+as skips rather than folded into a 495/495 because a count that cannot say how
+many things it examined has not reported. Full `Release` rebuild first,
+`compile_err = 0`, zero
 warnings. The three focused suites on that build: `test_mtp_depth` 5 cases /
-47 assertions, `test_prepare_decode_inputs` 8 / 33,
+63 assertions, `test_prepare_decode_inputs` 8 / 33,
 `test_speculative_mtp_depth` 4 / 20, each `Status: SUCCESS!` and exit 0.
 
 Disk was checked before attributing anything to code, because the previous review
@@ -586,7 +589,7 @@ upstream's own supported configuration.
 | Owed | What it must show | Who |
 |---|---|---|
 | DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | our-ON == our-OFF == vLLM-ON, token for token on the golden prefix, at EACH depth, with nonzero acceptance and the per-depth counters populated at every depth up to k, plus spec-OFF byte-identical. It must run the DEFAULT bf16 GDN state, because the CPU gate here runs the f32 arm for the reason in section 4.5, so the GDN speculative rollback at depth is UNEXERCISED until this runs | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
-| Silent de-graphing when the actual depth differs from the configured k, AND the `S`-only slot-ring key ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change. The re-key is owed on its own merits and NOT only as a consequence of widening the predicate, which is the correction section 4.2a records: `uniform_decode = input.pure_decode \|\| (spec_graph && ...)` (`qwen3_5_moe.cpp:143-148`, `qwen3_5_dense.cpp:172-177`) already routes TWO query lengths to one `impl_->slots[S]` (`qwen3_5.cpp:9276`, dense `:9698`), and `SizeSlot` invalidates on `fa_cols` and `aux_taps` only (`:9280-9330`). At k=1, 8 requests pure-decode and 4 requests spec both key on `S = 8`. That is pre-existing since SPEC-DSPARK W8 (#442) and this row does not widen it, but it is not the benign thing the first spec revision claimed. Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
+| Silent de-graphing when the actual depth differs from the configured k, AND the `S`-only slot-ring key ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change. The re-key is owed on its own merits and NOT only as a consequence of widening the predicate, which is the correction section 4.2a records: `uniform_decode = input.pure_decode \|\| (spec_graph && ...)` (`qwen3_5_moe.cpp:143-148`, `qwen3_5_dense.cpp:172-177`) already routes TWO query lengths to one `impl_->slots[S]` (`qwen3_5.cpp:9281`, dense `:9708`), and `SizeSlot` invalidates on `fa_cols` and `aux_taps` only (`:9309-9316` and `:9361-9367`). At k=1, 8 requests pure-decode and 4 requests spec both key on `S = 8`. That is pre-existing since SPEC-DSPARK W8 (#442) and this row does not widen it, but it is not the benign thing the first spec revision claimed. Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
 | Close [#1027](https://github.com/mudler/vllm.cpp/issues/1027) as a duplicate of [#1022](https://github.com/mudler/vllm.cpp/issues/1022) | NOT a code or record debt. The defect #1027 describes is FIXED on `origin/main` by [#1025](https://github.com/mudler/vllm.cpp/pull/1025), and this branch takes main's single well-formed row rather than resurrecting the duplicate, so `check-agent-record` and `check-issue-index-append-only` are BOTH green here. What remains is one remote write this flow has no authority for. Detail and the mechanism are in `## Gates` | operator, [#1027](https://github.com/mudler/vllm.cpp/issues/1027) |
 | M2 speed A/B at matched k | concurrency-1 and concurrency>1 throughput against vLLM same-config at matched k, plus the acceptance-versus-depth curve for prose and for code | [#81](https://github.com/mudler/vllm.cpp/issues/81) M2 |
 | M3 `SPEC-DYNAMIC` | `num_speculative_tokens_per_batch_size` and the dense batch-size to k lookup, mirrored from `vllm/config/speculative.py:177` and `vllm/v1/spec_decode/dynamic/utils.py:7,77` | [#81](https://github.com/mudler/vllm.cpp/issues/81) M3 |
@@ -604,7 +607,7 @@ number is claimed at k>1, which is the whole point of depth.
 
 **Measured.** Depth reaches the verify path at k=1, 2, 3 and 4 through
 `LoadedEngine`, and the greedy token stream is identical to speculative-off at
-every one of them (`test_mtp_depth` 5/5, 47 assertions).
+every one of them (`test_mtp_depth` 5/5, 63 assertions).
 
 **Corrected: the per-depth counters do NOT distinguish "the loop ran k times"
 from "the loop ran more than once", and an earlier revision of this section
@@ -615,7 +618,7 @@ in total, and the suite stayed green at 5/5, 34/34, `Status: SUCCESS`, with
 `spec_drafts_proposed_by_depth().size()`, grown from
 `step.num_draft_tokens_per_req[i]` (`runner.cpp:1780-1782`), which is the LENGTH
 of the emitted draft list and therefore a pure function of the runner's slicing at
-`runner.cpp:2209-2212`. Anything that hands the verify path k tokens satisfies it.
+`runner.cpp:2243-2246`. Anything that hands the verify path k tokens satisfies it.
 The reviewer also probed the counters in both arms at k=3 and got identical
 output, `proposed: 7 7 7 accepted: 0 0 0` on the real loop and
 `proposed: 7 7 7 accepted: 0 0 0` on the padded fake. The equality across depths
@@ -655,9 +658,66 @@ right assertion and it is unavailable here. Acceptance is measured at ZERO at
 every depth on the synthetic gate model, in both arms, so the acceptance profile
 cannot separate them.
 
-**Rejected: distinctness of the k drafted tokens.** A correct drafter may repeat
-a token, and on this 24-entry vocabulary it often does, so the property belongs to
-the model rather than to the loop.
+**Rejected: PER-CALL distinctness of the k drafted tokens.** A correct drafter may
+repeat a token, and on this 24-entry vocabulary it does. MEASURED on the fixture:
+a `2 2 2` row at k=3, so a per-call assertion would be red on correct code. Its
+AGGREGATE form survives and is the second witness recorded below.
+
+**Corrected again, by a third fresh review: the forwards equality does NOT see
+PADDING, and two comments said it did.** The equality answers "did the work run".
+It cannot answer "did the work's results reach the caller", and those are
+different questions. The review's own mutation proves the gap: let the loop run
+all k-1 forwards and COUNT THEM HONESTLY, then discard what they sampled and pad
+all k columns with the step-0 draft. `forwards == calls * (k - 1)` holds exactly
+on that, and the suite was fully green, 5 passed / 0 failed, 47 of 47 assertions,
+`Status: SUCCESS!`, exit 0. The claim in `test_mtp_depth.cpp` that the equality
+"fails on any propose that short-circuits, PADS, or clamps", the matching claim at
+`speculator.cpp`, and the claim in `runner.h` that it "is the only assertion in
+this class that a padded propose fails" were all false and are withdrawn.
+
+**The second witness: `spec_mtp_proposals_with_varied_drafts()`, read at the
+CONSUMER.** The runner counts the propose calls whose DELIVERED draft row was not
+a pure function of its own first column. A padded row is exactly such a function,
+so the counter is 0 at every k under the padding mutation, while the real loop
+leaves it non-zero. It is computed in `propose_drafts` on `proposal.draft_tokens`
+rather than inside the propose, which is what makes it unforgeable by a propose
+that overwrites its own output after counting its forwards.
+
+Measured on the fixture, so the assertion is grounded rather than assumed: at k=3
+the first case has 8 propose calls of which 7 delivered a varied row and 1 did
+not. The k=3 identity arm has 10 of 10, and k=2 and k=4 have 7 each. At k=1 it is 0
+BY CONSTRUCTION, because a one-column row has nothing to differ from, and the
+suite asserts that exactly, so a counter that fired at k=1 would be caught.
+Because one call in eight legitimately delivers a constant row, the assertion is
+`> 0` over a RUN and never a per-call one.
+
+Red-before for it, written from the finding's words rather than from any prior
+patch: the padding mutation applied to `MtpProposeDrafts` (11 insertions,
+`compile_err = 0`, `git diff --stat` confirming 21 insertions / 7 deletions total
+against the pre-mutation copy) gave `Status: FAILURE!`, 3 of 5 cases failed, 4 of
+63 assertions failed, exit 1, and the four failures are EXACTLY the four
+`varied > 0` checks (k=3 with 8 calls, k=3 with 10 calls, k=2, k=4). Every
+forwards equality and every list-length and token-identity assertion still PASSED
+under it, which is the mirror image of the earlier finding. The tree was restored
+from a pristine COPY and verified by `sha256sum`, and because `cp -p` preserves
+the mtime the rebuild had to be FORCED with `touch`. The first restore ran the
+MUTATED binary and reported the same red, which is
+[[mtime-restore-makes-ninja-skip-the-rebuild]] presenting as a code verdict. The
+forced rebuild re-ran 5/5, 63/63, exit 0.
+
+**The residual, bounded rather than claimed closed.** Neither CPU witness proves
+PER-COLUMN PROVENANCE: that column j came from forward j. An off-by-one in the
+`update_draft_inputs` column index, or a broken carry handoff, satisfies both the
+forwards equality and the varied-draft counter and would ship green today. The
+varied-draft counter is also a NECESSARY and not a sufficient condition, and the
+fixture participates in it: a drafter that resampled the same token on every step
+of every call would leave it 0 while running the loop correctly, so a change to
+the synthetic weights can turn it red for a reason that is not a defect. It fails
+LOUDLY when that happens, which is the failure mode to prefer. Provenance per
+column is what non-zero acceptance AT DEPTH proves, acceptance is 0 at every depth
+here, and closing it is therefore part of the owed DGX gate rather than something
+this tier can reach. This bound is recorded the same way the zero-acceptance gap
+is, because an honest bound beats a false claim.
 
 **What the CPU half therefore establishes, and what it does not.** It establishes
 that k drafts are PROPOSED, that k-1 draft decode forwards run per propose call at

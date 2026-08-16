@@ -510,7 +510,7 @@ ENGINE_PREFIXES = (
 # Issue #632; `SPIKE` on its committed spec. The row claims no implementation: no
 # parser, no baseline and no test exists yet.
 # Bumped for a real new row, never to make a failing state transition pass.
-ENGINE_ROWS = 156
+ENGINE_ROWS = 157
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),

@@ -182,17 +182,15 @@ token-for-token correctness against the pinned oracle.
 
 ## Speculative decoding
 
+**MTP draft DEPTH is configurable** as of `SPEC-MTP-K-GT-1` (`ACTIVE`,
+2026-08-16, [spec](../.agents/specs/mtp-k-gt-1.md), #81):
+`num_speculative_tokens` loops the single MTP head autoregressively, CPU-gated
+at k=1..4 with per-depth acceptance as the witness. The DEFAULT is unchanged at
+k=1 and **no speed number is claimed above it**. Before this the engine accepted
+a depth above 1, sized KV and the verify graph for it, and drafted one token.
+
 Speculative decoding is available on the Qwen3.5/3.6 checkpoints via
-`--speculative-config`. **MTP draft DEPTH is configurable** as of
-`SPEC-MTP-K-GT-1` (`ACTIVE`, 2026-08-16,
-[spec](../.agents/specs/mtp-k-gt-1.md), #81): `num_speculative_tokens` loops the
-single MTP head autoregressively, gated on CPU through the production loader at
-k=1, 2, 3 and 4 with per-depth acceptance as the witness that the configured
-depth reached the verify path. The DEFAULT is unchanged at k=1, the checkpoints'
-own `n_predict`, and **no speed number is claimed above k=1**: the DGX three-way
-at k=2..4 and the matched-k throughput A/B are owed. Before this the engine
-accepted a depth above 1, reserved KV and captured the verify graph for it, and
-drafted one token silently. **MTP (k=1)** is end-to-end token-exact vs vLLM on
+`--speculative-config`. **MTP (k=1)** is end-to-end token-exact vs vLLM on
 both gate models (the 27B GDN hybrid `Qwen3_5MTP` and the 35B MoE `Qwen3_5MoeMTP`):
 three-way identical at concurrency 1 (our spec-ON == our spec-OFF == vLLM
 `--speculative-config mtp` greedy) and faster than vLLM there, on par or above

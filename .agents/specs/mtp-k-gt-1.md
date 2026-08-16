@@ -13,7 +13,7 @@ Git integration: no `.agents/developer-preferences.md` exists in the shared
 checkout, and no split case applies, so this row uses the repository default of
 ONE pull request. Commit order proves the spec came first.
 
-## 0. Verdict
+## Verdict
 
 `--num-speculative-tokens 3` is accepted today and silently produces one draft
 token per request. Nothing refuses it and nothing logs it, so a user who
@@ -23,7 +23,7 @@ receives depth 1 in throughput.
 This row makes MTP depth genuinely configurable. Setting k gives k. The
 deliverable is the working depth, not the refusal.
 
-## 1. The present-tense defect, verified
+## Our baseline: the present-tense defect, verified
 
 Verified against `332aed738` in this worktree, not taken from the issue text.
 
@@ -59,7 +59,7 @@ refusal, checked rather than assumed:
 Each of those resolves its config through its own `Resolve*` entry point, so a
 refusal placed on the MTP entry point cannot reach them.
 
-## 2. Scope
+## Scope
 
 IN:
 
@@ -81,7 +81,7 @@ OUT, and recorded under `## Owed`:
 - Any llama.cpp-side work. llama.cpp is comparison context for WHY depth
   matters, never a mirror source here.
 
-## 3. Upstream anchors
+## Upstream chain
 
 Pinned oracle `5559679229bc961848b121ccdeaa8fa5d79bec98`
 ([upstream-sync.md](../upstream-sync.md)), checkout `/home/mudler/_git/vllm`.
@@ -111,7 +111,7 @@ buffer shape and only one of them is our mirror.
 architecture to `n_predict`, which both gate checkpoints set to 1. So k=1 stays
 the DEFAULT after this row. k>1 becomes reachable, not automatic.
 
-## 4. Design
+## Port map (design)
 
 ### 4.1 Phase 1, where the refusal goes and why
 
@@ -310,7 +310,7 @@ not only a billing one. It is also the same class of defect as
 below the configured one silently de-graphs, so both have one root: the engine
 is sized from the configured k and nothing checks that the propose delivered it.
 
-## 5. Risks
+## Risks/decisions
 
 | Risk | Why it matters | Control |
 |---|---|---|
@@ -321,7 +321,7 @@ is sized from the configured k and nothing checks that the propose delivered it.
 | A discarded (still-prefilling) row's draft-decode steps write draft KV at positions the target has not reached | Its draft is thrown away, but the k-1 decode forwards still carry its row, so they write `position+1 .. position+k-1` into the draft KV layer | Mirrors upstream, which carries every row through `_multi_step_decode` for the same reason (a uniform batch shape). The scheduler reserves `num_lookahead_tokens` blocks for every scheduled request, so those positions are allocated, and `draft_decode_slot_mapping` refuses loudly rather than silently addressing another request's page if that ever stops holding |
 | The GPU is held by another session | The k=2..4 three-way on real checkpoints cannot run in this flow | Recorded under `## Owed` with the exact conditions it must show. Not silently skipped |
 
-## 6. Tests and gates
+## Tests to port
 
 Red-before is captured for every claimed guarantee.
 
@@ -353,6 +353,8 @@ Red-before evidence, all with real counts:
    `position / block_size` (2), and the between-step `seq_len` advance removed
    (3). Restored byte-for-byte and green afterwards.
 
+## Gates
+
 Full CPU gate: `scripts/agent-preflight.sh` plus the built test suite. The suite result is `100% tests passed, 0 tests failed out of 495`, with 2 checkpoint-gated skips (`test_modelopt_mixed_precision_checkpoint`, `test_voxtral_e2e`).
 
 Build note, recorded because it changed the evidence's arm. The first full CPU
@@ -374,7 +376,7 @@ is how it was attributed rather than assumed. `45b022cdc` (#997) landed the
 documentation on `origin/main` mid-flow and is merged in, so the final gate on
 this branch has both green.
 
-### 6a. Records this row deliberately does NOT write
+### Records this row deliberately does NOT write
 
 `.agents/porting-inventory.md` section 9 gains no entry. The one deviation this
 port carries is that the draft-decode arrays are built at the request count
@@ -386,15 +388,45 @@ precedent is in-tree: the prefill sibling's own tail-pad deviation lives in
 are architecture-scale choices. A reviewer who disagrees should say so rather
 than assume it was missed.
 
-`.agents/engine-matrix.md` gains no row. #81's owning row in
-[`issue-index.md`](../issue-index.md) is `SPEC-MTP`, whose matrix row is `DONE`
-and describes the k=1 port that landed. Adding a second matrix row for depth
-would edit a file that every concurrent pull request also edits, which AGENTS.md
-names as a lock, and the per-row surface this row already has is this spec plus
-roadmap row 12a. Both are updated here. `.agents/NOW.md` is written at operator
-cadence only and is not a per-row lifecycle write.
+`.agents/NOW.md` is written at operator cadence only and is not a per-row
+lifecycle write, so it stays untouched.
 
-## 7. Stop conditions
+`.agents/engine-matrix.md` DOES gain a row, and the first attempt here argued it
+should not. The argument was that a matrix row edits a file every concurrent pull
+request also edits, which AGENTS.md names as a lock, and that this spec plus
+roadmap row 12a were already a sufficient per-row surface. `check-agent-record`
+refused that immediately: `roadmap_v1.md: references unknown stable row
+SPEC-MTP-K-GT-1`. It is right and the argument was wrong. AGENTS.md's Records
+section says every inventory item records its state in the correct matrix, and a
+stable ID that only the roadmap knows about is exactly the dangling record the
+checker exists to catch. Recorded because a reviewer will otherwise wonder
+whether the row was added deliberately or by trial and error. It was the second,
+and the checker was the one that knew.
+
+## Dependencies
+
+Nothing new. The row consumes what already landed: `prepare_prefill_inputs`
+(SPEC-MTP I5b), `Qwen3_5MTPModel::ForwardPaged` (I5c), the `fa_draft` draft KV
+group, the greedy rejection sampler and its `num_rejected` accounting (I3), and
+the `DraftTokenIds` / `take_draft_token_ids` seam, which already carried
+variable-length drafts for the n-gram proposer. No new `vt` op, no new CUDA
+kernel, no new upstream pin. The OWED GPU gate depends on `dgx.casa` and on the
+pinned oracle being able to run `--speculative-config mtp` at k=2..4, which is
+upstream's own supported configuration.
+
+## Work breakdown
+
+| Step | What | State |
+|---|---|---|
+| W1 | The spec, its upstream anchors, and the two graph-layer hazards checked rather than assumed | LANDED (`98ab752f5`) |
+| W2 | The refusal at `LoadedEngine::ResolveSpecConfig`, red-first at the engine seam. Independently landable, so the defect closes even if W3 stalls | LANDED (`4ad2bec87`) |
+| W3 | `prepare_decode_inputs` + `update_draft_inputs` + `draft_decode_slot_mapping`, the two Triton-kernel ports, mutation-gated | LANDED (`93d6bc329`) |
+| W4 | `MtpProposeDrafts` (the multi-step loop) + `Qwen3_5MTPModel::GatherHiddenRows` + the runner emitting k drafts + per-depth telemetry, and the W2 refusal REMOVED rather than widened | LANDED (`93d6bc329`) |
+| W5 | The CPU depth gate through the production loader at k=1..4, plus the public-document projections | LANDED (`93d6bc329`) |
+| W6 | The DGX three-way at k=2..4 on the 27B and 35B, on the DEFAULT bf16 GDN state | OWED, see below. The GPU lock was held for the whole flow |
+| W7 | The matched-k throughput A/B and the acceptance-versus-depth curve | OWED, #81 M2 |
+
+## Stop conditions
 
 - Return `NEEDS_DECISION` if the k>1 semantics cannot be settled against the
   pinned vLLM rather than guessing them.
@@ -402,7 +434,7 @@ cadence only and is not a per-row lifecycle write.
   GPU gate as owed and land the CPU evidence.
 - Do not widen or delete a checker to make a red green.
 
-## 8. Owed
+## Owed
 
 | Owed | What it must show | Who |
 |---|---|---|

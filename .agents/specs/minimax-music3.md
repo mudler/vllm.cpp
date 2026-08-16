@@ -1253,3 +1253,32 @@ implied by this"). Widening either pattern would be widening a checker's scope
 to make a change pass, which AGENTS.md forbids without its own spec and
 red-before evidence, and this clip does not justify one. Regenerating it is one
 command.
+
+### 10.6 A red that belonged to nobody, found by checking a matched arm (#965)
+
+`windows-msvc-cpu` and `windows-msvc-vulkan` failed on this row's pull request.
+Both are habitually red and both are habitually attributed to
+[#645](https://github.com/mudler/vllm.cpp/issues/645). **They were not #645.**
+#645 is the `M_PI` portability regression in three LTX2 sources; this was:
+
+```
+server_main.cpp(1315,55): error C2220: the following warning is treated as an error
+server_main.cpp(1315,55): warning C4456: declaration of 'loaded' hides previous local declaration
+```
+
+— W6's own speech-attach block declaring `loaded` inside the scope of the text
+engine's `loaded` at `:1025`. The only warning in the job, and on `main` since
+W6 landed.
+
+**What found it was the matched-arm check, not the label.** Three unrelated open
+pull requests — #956, #950, #939, none touching the speech surface — fail with
+the identical `C4456`. That is what separates "pre-existing" from "mine", and it
+is the step that a known-red list invites you to skip. Because `windows-msvc-*`
+are PR-only ([#584](https://github.com/mudler/vllm.cpp/issues/584)), `main`
+carries no baseline, so the failure presents to every author in turn as a red
+their own diff caused — and a second cause sitting behind a known one is
+invisible for exactly as long as nobody reads the log.
+
+Fixed in flow: the inner declaration is renamed, with a comment saying why the
+name is not `loaded`. No detector weakened, no warning suppressed, no behaviour
+changed.

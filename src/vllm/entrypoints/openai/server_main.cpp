@@ -1389,13 +1389,18 @@ int VllmServerMain(int argc, char** argv) {
       smp.path = args.speech_model;
       smp.family = args.speech_family;  // empty => DETECT by inspecting the artifact
       std::string why;
-      std::unique_ptr<vllm::multimodal::SpeechEngine> loaded = registry.Load(smp, &why);
-      if (loaded == nullptr) {
+      // NOT `loaded`: that name is already taken by the TEXT engine in the
+      // enclosing scope, and MSVC's C4456 is a warning-as-error there, so the
+      // shadow red every pull request's `windows-msvc-*` pair with a failure
+      // about a line the author had not touched (#965).
+      std::unique_ptr<vllm::multimodal::SpeechEngine> loaded_speech_engine =
+          registry.Load(smp, &why);
+      if (loaded_speech_engine == nullptr) {
         // `why` names every family that was tried and the path, so a startup
         // failure is evidence rather than a verdict.
         throw std::runtime_error("server: --speech-model " + args.speech_model + ": " + why);
       }
-      speech_engine = std::move(loaded);
+      speech_engine = std::move(loaded_speech_engine);
       vllm::openai::SpeechCapabilities caps;
       caps.family = speech_engine->family();
       caps.sample_rate = speech_engine->sample_rate();

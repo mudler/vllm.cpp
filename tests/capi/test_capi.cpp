@@ -2460,6 +2460,12 @@ TEST_CASE("capi: v20 speech params zero-fill to the FAMILY's defaults") {
   const vllm_speech_model_params mp = vllm_speech_model_params_default();
   CHECK(mp.path == nullptr);
   CHECK(mp.family == nullptr);  // NULL => detect by inspecting the artifact
+  // v21. ZERO IS CPU, and that is the whole point of choosing this encoding
+  // over vllm_model_params.device's 0=auto: every pre-v21 caller zero-fills
+  // this struct, and every Music3 correctness gate was taken on the CPU arm, so
+  // an `auto` here would silently move those callers onto an ungated path the
+  // day the box grows a GPU.
+  CHECK(mp.device == 0);
 
   const vllm_speech_params p = vllm_speech_params_default();
   CHECK(p.text == nullptr);
@@ -2488,6 +2494,7 @@ TEST_CASE("capi: v20 speech handles refuse null arguments without touching *out"
   CHECK(vllm_speech_engine_family(nullptr) == nullptr);
   CHECK(vllm_speech_engine_sample_rate(nullptr) == 0);
   CHECK(vllm_speech_engine_requires_reference_audio(nullptr) == 0);
+  CHECK(vllm_speech_engine_device(nullptr) == 0);
   vllm_speech_engine_free(nullptr);
 
   vllm_speech_result out;
@@ -2545,6 +2552,9 @@ TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference cl
   // 0 — Music3 conditions on text alone. This is the value that DIFFERS from a
   // voice-cloning family's, so a pass proves the override was reached.
   CHECK(vllm_speech_engine_requires_reference_audio(eng) == 0);
+  // v21: the DEFAULT request (device 0) is GRANTED the CPU arm. `mp.device` was
+  // never set, which is exactly the pre-v21 caller.
+  CHECK(vllm_speech_engine_device(eng) == 0);
 
   // A DECLARED family loads the same checkpoint identically.
   vllm_speech_engine* declared = nullptr;
@@ -2603,6 +2613,62 @@ TEST_CASE("capi: v20 a loaded Music3 handle answers 44100 Hz and NO reference cl
   CHECK(vllm_synthesize(eng, &bad_ref, &out) == VLLM_ERR_INVALID_ARGUMENT);
 
   vllm_speech_engine_free(eng);
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+}
+
+// ─── ABI v21: the speech lane's device selector (#672) ────────────────────────
+
+TEST_CASE("capi: v21 an unrepresentable speech device is refused BY NAME at load") {
+  // The mapping is a MAPPING, not a cast. `static_cast<vt::DeviceType>(device)`
+  // is the defect the shared helper exists to prevent: it reads the ABI selector
+  // as an enum value, so device 2 would bind whichever backend happens to sit at
+  // index 2 of vt::DeviceType and the load would succeed against the wrong
+  // hardware. The refusal must arrive as MODEL_LOAD with the value in it.
+  const std::filesystem::path root = WriteSyntheticMusic3("device-refusal");
+  const std::string path = root.string();
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  mp.path = path.c_str();
+  mp.device = 2;
+  vllm_speech_engine* eng = nullptr;
+  CHECK(vllm_speech_engine_load(&mp, &eng) == VLLM_ERR_MODEL_LOAD);
+  CHECK(eng == nullptr);
+  const std::string why = vllm_last_error();
+  CHECK(why.find("device must be 0 (cpu) or 1") != std::string::npos);
+  CHECK(why.find("2") != std::string::npos);
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+}
+
+TEST_CASE("capi: v21 speech device 1 is GRANTED or REFUSED, and the handle says which") {
+  // The one assertion that holds on every build: whatever happens, the handle
+  // NEVER reports a device the load did not grant. On a CPU-only build device 1
+  // must fail rather than fall back — a silent fallback is how a "GPU" benchmark
+  // measures the CPU arm — and on an accelerator build the handle must report 1,
+  // or the arm this row added is unobservable from the ABI.
+  //
+  // The case REPORTS which arm it examined instead of assuming one, because a
+  // gate that cannot say what it looked at has not reported.
+  const std::filesystem::path root = WriteSyntheticMusic3("device-one");
+  const std::string path = root.string();
+  vllm_speech_model_params mp = vllm_speech_model_params_default();
+  mp.path = path.c_str();
+  mp.device = 1;
+  vllm_speech_engine* eng = nullptr;
+  const vllm_status status = vllm_speech_engine_load(&mp, &eng);
+  if (status == VLLM_OK) {
+    REQUIRE(eng != nullptr);
+    MESSAGE("capi speech device 1 was GRANTED on this build");
+    CHECK(vllm_speech_engine_device(eng) == 1);
+    vllm_speech_engine_free(eng);
+  } else {
+    MESSAGE("capi speech device 1 was REFUSED on this build: " << vllm_last_error());
+    CHECK(status == VLLM_ERR_MODEL_LOAD);
+    CHECK(eng == nullptr);
+    // Named, so the caller learns which piece is missing rather than that
+    // something went wrong.
+    CHECK(std::string(vllm_last_error()).find("accelerator") != std::string::npos);
+  }
   std::error_code ec;
   std::filesystem::remove_all(root, ec);
 }

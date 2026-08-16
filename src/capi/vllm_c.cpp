@@ -1693,6 +1693,10 @@ struct vllm_speech_engine {
   std::string family;
   int64_t sample_rate = 0;
   bool requires_reference_audio = false;
+  // What the load RESOLVED to, in the ABI's own 0=cpu/1=accelerator encoding —
+  // recorded at load rather than re-derived per query, so the handle answers
+  // with what was granted even if the platform state later changes.
+  int32_t device = 0;
   // Staged weights are shared state, and the ABI promises one blocking call per
   // handle: serialize here rather than trusting every family to.
   std::mutex mutex;
@@ -1725,6 +1729,11 @@ VLLM_API vllm_status vllm_speech_engine_load(const vllm_speech_model_params* par
   vllm::multimodal::SpeechModelParams mp;
   mp.path = OrEmpty(params->path);
   mp.family = OrEmpty(params->family);
+  // 0 = CPU (the zero value: byte-identical to every pre-v21 caller), 1 = the
+  // accelerator this build resolves. The seam refuses anything else, and
+  // refuses device 1 this build cannot serve, BY NAME — here, before 28.5 GB
+  // of weights are read.
+  mp.device = params->device;
   try {
     std::string why;
     std::unique_ptr<vllm::multimodal::SpeechEngine> engine =
@@ -1740,6 +1749,10 @@ VLLM_API vllm_status vllm_speech_engine_load(const vllm_speech_model_params* par
     handle->family = engine->family();
     handle->sample_rate = engine->sample_rate();
     handle->requires_reference_audio = engine->requires_reference_audio();
+    // GRANTED, not requested: a family with no device arm reports CPU here
+    // whatever `params->device` said, which is exactly the distinction a
+    // two-arm speed comparison depends on.
+    handle->device = engine->device().type == vt::DeviceType::kCPU ? 0 : 1;
     handle->engine = std::move(engine);
     *out = handle.release();
     ClearError();
@@ -1765,6 +1778,10 @@ VLLM_API int32_t vllm_speech_engine_sample_rate(const vllm_speech_engine* engine
 
 VLLM_API int32_t vllm_speech_engine_requires_reference_audio(const vllm_speech_engine* engine) {
   return (engine != nullptr && engine->requires_reference_audio) ? 1 : 0;
+}
+
+VLLM_API int32_t vllm_speech_engine_device(const vllm_speech_engine* engine) {
+  return engine == nullptr ? 0 : engine->device;
 }
 
 VLLM_API vllm_status vllm_synthesize(vllm_speech_engine* engine,

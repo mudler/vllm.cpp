@@ -61,6 +61,9 @@
 #include "vllm/model_executor/models/minimax_music3_ar.h"
 #include "vllm/model_executor/models/minimax_music3_llm.h"
 #include "vllm/model_executor/models/minimax_music3_loader.h"
+#include "vllm/model_executor/models/minimax_music3_speech.h"  // kMusic3SpeechFamily
+#include "vllm/multimodal/speech_engine.h"                     // SpeechEngineDeviceType
+#include "vt/backend.h"
 #include "vt/dtype.h"
 
 namespace fs = std::filesystem;
@@ -298,7 +301,29 @@ TeacherForced RunTeacherForced(const std::vector<int32_t>& codes, int64_t code_r
   const std::vector<bool> blocked = m3::SemanticVocabMask(
       vocab, m3::kAudioCodeOffset, m3::kSemanticVocabSize, m3::kAudioEndTokenId);
 
-  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  // WHERE this gate runs the 8.6B forward. Default 0 = CPU, so an unset
+  // environment reproduces every number this file has ever printed, byte for
+  // byte. `VLLM_CPP_MUSIC3_DEVICE=1` runs the SAME comparison on the device arm
+  // (#672) — the only numeric gate that arm has, because a generated waveform
+  // cannot be compared to anything (spec §5: the codes are a seeded draw).
+  //
+  // Resolved through the SHARED `multimodal::SpeechEngineDeviceType` the engine
+  // itself calls, not a private copy: a gate that resolved the device its own
+  // way could pass while the engine bound a different one.
+  const char* device_env = std::getenv("VLLM_CPP_MUSIC3_DEVICE");
+  const int32_t device_sel = (device_env != nullptr && device_env[0] == '1') ? 1 : 0;
+  const vt::DeviceType device_type =
+      vllm::multimodal::SpeechEngineDeviceType(device_sel, m3::kMusic3SpeechFamily);
+  vt::Queue queue = device_type == vt::DeviceType::kCPU
+                        ? vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr}
+                        : vt::GetBackend(device_type).CreateQueue();
+  // REPORTED, not assumed: a gate that cannot say which arm it examined has not
+  // reported, and the two arms print different numbers below.
+  const std::string arm_line =
+      std::string("music3 llm real: the 8.6B forward ran on '") +
+      vt::DeviceTypeName(queue.device.type) + "' (VLLM_CPP_MUSIC3_DEVICE=" +
+      (device_env == nullptr ? std::string("unset") : std::string(device_env)) + ")";
+  MESSAGE(arm_line);
   m3::Music3LmSession session(ar, queue, kPromptTokens + steps + 1);
 
   std::vector<float> hidden;

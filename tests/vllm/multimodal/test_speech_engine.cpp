@@ -16,6 +16,8 @@
 
 #include "doctest/doctest.h"
 #include "vllm/multimodal/speech_engine.h"
+#include "vllm/platforms/interface.h"
+#include "vt/backend.h"
 
 namespace {
 
@@ -162,4 +164,97 @@ TEST_CASE("synthesis refuses when the mandatory reference clip is absent") {
   const SpeechResult out = engine->Synthesize(gen);
   CHECK(out.sample_rate == 22050);
   CHECK(out.samples.size() == 4U);
+}
+
+// ── The device selector (#672) ────────────────────────────────────────────────
+//
+// The seam grew a place to say WHERE a family runs, because MiniMax-Music3's
+// queue used to be a compile-time constant and a 28.5 GB music model was
+// therefore host-only whatever hardware the box had.
+//
+// Everything below is checkpoint-free and runs in CI on every build. What it
+// CANNOT see is a granted accelerator — on a CPU-only build there is none to
+// grant — so the device-1 arm is gated here only for its REFUSAL, and the
+// granted arm is gated on hardware (see the row's evidence).
+
+TEST_CASE("speech: the device selector's zero value is the CPU arm") {
+  // Load-bearing, not cosmetic. Every Music3 correctness gate was taken on the
+  // CPU path, so a zero-initialized `SpeechModelParams` — which is what every
+  // pre-#672 caller has — must keep resolving to it. This is also why the field
+  // is NOT `vllm_model_params.device`'s 0=auto spelling: `auto` would flip an
+  // accelerator build's default under exactly those callers.
+  const SpeechModelParams defaults;
+  CHECK(defaults.device == 0);
+  CHECK(vllm::multimodal::SpeechEngineDeviceType(0, "minimax-music3") ==
+        vt::DeviceType::kCPU);
+}
+
+TEST_CASE("speech: a family with no device arm reports CPU rather than being edited") {
+  // `SpeechEngine::device()` is non-pure with a CPU default precisely so that
+  // IndexTTS-2.5 — and every family after it that has no device arm — answers
+  // honestly without a line changing. FakeEngine overrides nothing.
+  FakeEngine engine("no-device-arm");
+  CHECK(engine.device().type == vt::DeviceType::kCPU);
+  CHECK(engine.device().index == 0);
+}
+
+TEST_CASE("speech: a device selector that is neither 0 nor 1 is refused BY NAME") {
+  // NOT clamped and NOT defaulted. `static_cast<vt::DeviceType>(device)` is the
+  // mistake this helper exists to prevent (minimax_h3_video.cpp:230-237): it
+  // reads the ABI selector AS AN ENUM VALUE, so device 2 would silently bind
+  // whichever backend sits at index 2 in vt::DeviceType.
+  for (const int32_t bad : {-1, 2, 7}) {
+    CHECK_THROWS_AS(vllm::multimodal::SpeechEngineDeviceType(bad, "minimax-music3"),
+                    std::runtime_error);
+    std::string message;
+    try {
+      vllm::multimodal::SpeechEngineDeviceType(bad, "minimax-music3");
+    } catch (const std::runtime_error& e) {
+      message = e.what();
+    }
+    // The refusal must name BOTH legal values, or it tells the caller it was
+    // wrong without telling it what right looks like.
+    CHECK(message.find("0 (cpu)") != std::string::npos);
+    CHECK(message.find("1 (") != std::string::npos);
+    CHECK(message.find(std::to_string(bad)) != std::string::npos);
+  }
+}
+
+TEST_CASE("speech: device 1 on a build with no accelerator is refused, never substituted") {
+  // On a CPU-only build this asserts the refusal and its wording; on an
+  // accelerator build the same call GRANTS a device, and asserting a throw
+  // there would be asserting that the arm this row added does not work. The
+  // case therefore reports which arm it examined rather than assuming one — a
+  // gate that cannot say what it looked at has not reported.
+  const vt::DeviceType accelerator = vllm::platforms::CurrentPlatform().device_type();
+  const bool have_accelerator =
+      accelerator != vt::DeviceType::kCPU && vt::TryGetBackend(accelerator) != nullptr;
+  MESSAGE("speech device-1 arm examined on a build whose platform resolves to '"
+          << vt::DeviceTypeName(accelerator) << "', accelerator backend registered: "
+          << (have_accelerator ? "yes" : "no"));
+  if (!have_accelerator) {
+    std::string message;
+    try {
+      vllm::multimodal::SpeechEngineDeviceType(1, "minimax-music3");
+      FAIL("device 1 was GRANTED on a build with no accelerator backend");
+    } catch (const std::runtime_error& e) {
+      message = e.what();
+    }
+    // Naming the piece that is missing is what separates owed debt from a
+    // mystery: "no accelerator backend is registered in this build".
+    CHECK(message.find("no accelerator backend") != std::string::npos);
+    CHECK(message.find("Refusing") != std::string::npos);
+  } else {
+    // The architecture key reaches the platform: an accelerator that DECLINES
+    // this family must refuse by name rather than hand back a queue that dies
+    // inside a kernel bind.
+    const bool accepted =
+        vllm::platforms::CurrentPlatform().supports_model_architecture("minimax-music3");
+    if (accepted) {
+      CHECK(vllm::multimodal::SpeechEngineDeviceType(1, "minimax-music3") == accelerator);
+    } else {
+      CHECK_THROWS_AS(vllm::multimodal::SpeechEngineDeviceType(1, "minimax-music3"),
+                      std::runtime_error);
+    }
+  }
 }

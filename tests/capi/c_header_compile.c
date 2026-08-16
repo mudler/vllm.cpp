@@ -116,6 +116,17 @@ int vllm_capi_c_header_check(vllm_engine* eng, const char* prompt) {
     }
   }
 
+  {
+    /* v21: the speech lane's device selector must be spellable from PURE C —
+     * an int32_t field and an int32_t query, no C++ type leaking through the
+     * header. Nothing is loaded here; this compiles and links the surface. */
+    vllm_speech_model_params smp = vllm_speech_model_params_default();
+    smp.path = "/nonexistent";
+    smp.device = 0; /* CPU, the zero value */
+    (void)smp.device;
+    (void)vllm_speech_engine_device(NULL);
+  }
+
   (void)vllm_last_error();
   (void)vllm_version();
   (void)vllm_abi_version();

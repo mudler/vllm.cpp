@@ -10,7 +10,7 @@
 [#14456](https://github.com/huggingface/diffusers/pull/14456), head
 `c6da9936e4bda83107943a16eb8682e9a37d8527` — **OPEN, not merged**.
 **Cross-check:** SGLang-Omni `748a0b437e4a8faad44d7bbfd5a0ae55d1fef830`.
-**Status:** **W0-W7 DONE, W2 INCLUDED.** Every stage is implemented and gated; a COMPOSED request is not yet observed to completion on CPU (see `## Now`). Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. W7 has landed (§9): quantized checkpoints for this model exist in five formats; the RVQ depth decoder's GGUF Q4_K arm IS implemented and value-gated against a pinned artifact, and every other format and lineage is refused by name with the missing piece rather than surfacing as a confusing shape error. The 8.6B language-model forward and the other four components' GGUF arms are owed.
+**Status:** **W0-W7 DONE, W2 INCLUDED; a PARTIAL DEVICE ARM landed 2026-08-16 (§11).** Every stage is implemented and gated; a COMPOSED request is not yet observed to completion on CPU (see `## Now`). Spec committed, both oracles pinned, §1.1 resolved and confirmed at runtime, the diffusers oracle gateable against committed goldens, the modular loader in the tree, the autoregressive half's compute gated at reduced dimensions and against the real bf16 checkpoint, and the ACOUSTIC half — flow-matching DiT, scheduler, CFG, window bookkeeping, DAC Flow-VAE vocoder — gated at both scales against the committed capture. §5's token-exact gate is WITHDRAWN: upstream's AR stage has no greedy path, and the acoustic half never had one to withdraw. W6 has landed: the model is a registered `SpeechRegistry` family reachable through the new `vllm_speech_*` C ABI (v20) and `POST /v1/audio/speech`, and the denoise+decode composition reproduces the capture's waveform. W7 has landed (§9): quantized checkpoints for this model exist in five formats; the RVQ depth decoder's GGUF Q4_K arm IS implemented and value-gated against a pinned artifact, and every other format and lineage is refused by name with the missing piece rather than surfacing as a confusing shape error. The 8.6B language-model forward and the other four components' GGUF arms are owed.
 **Developer directive (2026-08-13):** "land minimax music 3 support complete, to
 vllm.cpp, wired to the ABI and to the example http server, merge to main, tested
 e2e." That fixes W6's shape (the ABI surface and the example server are in scope,
@@ -860,7 +860,8 @@ can never generate audio however complete our arm becomes.
 all ten files measured.
 
 **No speed number is claimed** and none was measured; the box is CPU-only for
-this row.
+this row. (SUPERSEDED IN PART by §11: a device arm and a two-arm wall clock on
+Jetson Thor exist as of 2026-08-16. Still no comparison to a reference.)
 
 ---
 
@@ -1297,3 +1298,236 @@ Two independent causes were stacked behind one habitually-red job name and the
 first hid the second, which is the finding worth carrying: **a known-red list
 tells you a job is often red, never that today's red is the same one.** Only
 reading the log does.
+
+---
+
+## 11. The device arm (#672) — what a queue bought, and what it did not
+
+**Developer directive (2026-08-16):** give MiniMax-Music3 a device arm so it runs
+on the GPU, "use the thor device, with a docker container". That fixes the
+hardware and the shape of the evidence; it does not enlarge the scope past what
+a queue can reach.
+
+### 11.1 The finding this closes, and the one it does not
+
+`minimax_music3_speech.cpp:492` carried a `vt::Queue` built from a **compile-time
+constant CPU device**, under a comment that already named the seam: *"CPU is what
+W2 ships and what every gate for this row has been taken on; a device arm is a
+queue, not a fork."* That was true and it was also unreachable — nothing could
+supply a different queue, so a 28.5 GB music model was a host-only model whatever
+hardware the box had.
+
+It is now literally a queue. `multimodal::SpeechModelParams` grew `device`, the
+engine builds its queue once in the constructor, and `Music3GenerateFrameHiddens`
+receives it. **No model file was forked, and no numeric path was rewritten.**
+
+**What the queue does NOT reach is the majority of the profile, and pretending
+otherwise would be the whole failure mode.** §"Now" records it: `LinearNoBias`
+42-57 % of the AR half, `vocoder1d::ConvTranspose1d` 88.5 % of the acoustic half.
+Those are host `std::vector<float>` scalar loops that take no queue at all.
+
+| stage | device 1 runs it | why |
+|---|---|---|
+| 8.6B `Qwen3ForCausalLM`, prefill + every decode step + its paged KV | **device** | already on the shared `Qwen3DenseModel::ForwardEmbeds` that five text registrations ride |
+| guided logits, top-k draw, frame feedback | host | two 200 000-wide rows per step; not the cost |
+| 0.646B RVQ depth decoder | **host** | scalar loop; OWED (§11.4) |
+| condition mix + 2.4B fp32 DiT + scheduler | **host** | scalar loops; OWED |
+| DAC Flow-VAE vocoder | **host** | **BLOCKED on a missing op, not on effort** (§11.4) |
+
+### 11.2 Three things the change had to get right
+
+**The device selector is a MAPPING, not a cast.** `static_cast<vt::DeviceType>`
+is the defect `minimax_h3_video.cpp:230-237` records: it reads the ABI selector
+as an enum value, correct only while `kCUDA` stays 1. The tree already carried
+two copies of the correct three-question mapping (`minimax_h3_video.cpp:255`,
+`ltx2_video.cpp:706`), so a **third** copy was the point at which they start to
+disagree. It went on the seam instead, as `multimodal::SpeechEngineDeviceType`,
+keyed on the family string because that is this lane's stable registry name.
+
+**Zero is CPU, and that is not the ABI's other spelling.**
+`vllm_model_params.device` is 0=auto / 1=cpu / 2=cuda, mirroring vLLM's
+`DeviceConfig`. Reusing it here would have made an accelerator build's DEFAULT an
+ungated path for every caller that zero-fills the struct — which is every caller
+written before this. `VideoModelParams::device`'s 0=cpu / 1=accelerator is the
+polarity a generative engine seam already chose, for this reason.
+
+**The paged KV had to move with the forward, and this is the piece that would
+have failed silently.** `Music3LmSession` allocated 36 layers of
+`std::vector<uint16_t>`. `dense_attn::KvSlice` (`dense_attn_block.h:233`) builds
+its tensor view with `d.q.device`, so on a CUDA queue that host pointer becomes a
+**host pointer wearing a device tensor's label** — the exact shape of defect
+[[keepquant-device-slice-needs-residentweight]] records. The cache is now
+allocated on the queue's device and zeroed there, because `KvSlice` hands the
+whole `[num_blocks, block_size, Hkv, Dh]` view to the kernel and the unwritten
+tail of the last block is real memory.
+
+Two things did NOT need doing, and both were checked rather than assumed:
+`ResidentWeight` stores its device copy **on the `OwnedTensor` itself** (`w.d_dev`,
+`dense_attn_block.h:190-199`), so the weights upload once and are freed with the
+AR scope rather than cached against a host address that can be reused; and
+`ForwardEmbeds` already owns its own H2D/D2H for the embeds and the logits.
+
+### 11.3 What the CPU arm is, after
+
+**Bit-identical, and structurally so rather than by measurement luck.** Device 0
+takes the same `std::vector` KV allocation, the same host loops and the same
+`vt::Queue{kCPU, 0}` the constant used to build. Every existing Music3 gate is
+unchanged (§11.5).
+
+### 11.4 What is OWED, named here rather than discovered later
+
+| owed | what it needs | blocked on |
+|---|---|---|
+| RVQ depth decoder on device | route `LinearNoBias` through `vt::MatmulBT` with device-resident weights, keeping the host loop as the CPU arm so W2/W3's reduction order survives | nothing but the work; 42-57 % of the AR half |
+| flow-matching DiT on device | same, plus its attention | nothing but the work |
+| DAC Flow-VAE vocoder on device | **a `vt` transposed 1-D convolution, which does not exist** | see below |
+
+**The vocoder is the one that is not merely unfinished.** `vt` has no
+`ConvTranspose1d` op of any kind — the 1-D convolutions it does carry are
+`vt::CausalConv1dFwd` (causal, stateful, SiLU-folded) and `vt::DepthwiseConv1d`
+(centre-padded, depthwise), and neither expresses a transposed convolution.
+`vt::Conv2d` and `vt::DepthwiseConv1d` are moreover registered for the **CPU
+only** (`src/vt/cpu/cpu_conv2d.cpp:111`,
+`src/vt/cpu/cpu_conv1d_depthwise.cpp:95`; no CUDA registration exists for
+either). So the stage that is 88.5 % of the acoustic half has **no CUDA kernel
+behind any op it could route through**, and hand-rolling one outside the shared
+seam is what AGENTS.md forbids. Adding `vt::ConvTranspose1d` with a CUDA provider
+is its own row: `vocoder1d` is shared with MiniMax-H3 and the LTX-2 audio VAE, so
+that op has three consumers rather than one.
+
+**A cheaper, arm-independent win is also owed and is recorded so it is not
+re-derived**: `LinearNoBias` parallelised over OUTPUT ROWS is bit-identical —
+each output's dot product stays a single sequential double accumulator, so no
+reduction order moves — and the same restructure is available for
+`vocoder1d::ConvTranspose1d`, whose scatter is indexed by `(out_channel,
+position)` and therefore partitions by output channel with its `(ic, t, k)` visit
+order intact. Neither is in this change, because a bit-identity claim needs its
+own measurement and this change's evidence budget went to the device seam.
+
+### 11.5 Evidence — Jetson Thor, sm_110, in the container
+
+Host `kairos-4db2` (`192.168.68.23`), Jetson Thor, **sm_110**, aarch64, 14 cores,
+~122 GB UNIFIED, driver 595.78. Image `vllmcpp-thor:cuda13.0.1`, nvcc 13.0.88,
+`--runtime=nvidia -e NVIDIA_DISABLE_REQUIRE=1`, configured
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF
+-DVLLM_CPP_SERVER=ON`, no cutlass. Checkpoint mounted read-only from
+`/usr/local/nas_share/checkpoints/minimax-music3`. Every run held
+`flock $HOME/gpu.lock`, so no two arms ever overlapped, and `uptime` is recorded
+on both sides of each.
+
+#### The numeric gate, both arms, SAME BOX AND SAME BINARY
+
+`tests/parity/test_minimax_music3_llm_real.cpp` now takes
+`VLLM_CPP_MUSIC3_DEVICE` (default 0 = CPU, so an unset environment reproduces
+every number this file ever printed) and resolves it through the SAME
+`multimodal::SpeechEngineDeviceType` the engine calls. **This is the device
+arm's only numeric gate, and it exists because a generated waveform cannot be
+compared to anything** — §5 withdrew the token gate, and both the codes and the
+initial latents are seeded draws, so the two arms produce DIFFERENT SONGS by
+construction and a sample-wise comparison of them would be meaningless.
+
+25 teacher-forced steps against `frame_hiddens[:, :4096]`, 102 400 values:
+
+| arm | bit-identical | mean\|d\| | outside 2 bf16 ULP | golden-code mean rank | negative control mean\|d\| |
+|---|---|---|---|---|---|
+| **Thor CPU** (`device 0`) | 9337 (9.118 %) | **1.76348e-02** | 37 572 (36.69 %) | 2.48, worst 15 | 0.802531, 98.20 % outside |
+| **Thor CUDA** (`device 1`) | 9324 (9.105 %) | **1.71668e-02** | 36 509 (35.65 %) | 2.44, worst 15 | 0.802583, 98.18 % outside |
+| CONTROL (§"Now": upstream's own model under `sdpa_kernel(MATH)`) | 12 036 (11.75 %) | 1.475e-02 | 29 968 (29.27 %) | — | — |
+
+Both arms **4 cases / 220 assertions / 0 failed**, at the bounds that were
+already there — no tolerance was widened for the device arm, which is the claim
+that matters. The CUDA arm is marginally CLOSER to the golden than the CPU arm
+(1.717e-02 vs 1.763e-02) and both sit inside the measured torch-vs-torch control,
+which is the near-tie regime AGENTS.md says not to chase below.
+
+**The condition mix, downstream of those rows:** CPU 16 319 of 176 128
+bit-identical, mean\|d\| 3.91549e-03, max\|d\| 0.046875; CUDA 16 736,
+3.78351e-03, 0.0498047.
+
+**Two things this table proves that a single arm could not.** The negative
+control fires identically on both (98.2 % outside, mean\|d\| 0.80), so the bound
+still discriminates on the device arm rather than having become slack. And the
+**Thor CPU arm reproduces the x86-64 numbers this spec already recorded — 9337
+bit-identical, mean\|d\| 1.763e-02, 37 572 outside, rank 2.48 — value for value**,
+so the CPU path is unchanged by this row across two architectures, not merely
+unchanged on the box that measured it.
+
+#### Wall clock, both arms, same request
+
+`minimax-music3-gen`, identical lyrics/description/seed, `--steps 2`,
+alternating arms, one checkpoint resident at a time:
+
+| request | AR frames | delivered | `--device 0` (CPU) | `--device 1` (CUDA) | ratio |
+|---|---|---|---|---|---|
+| `--duration 0.1` | 2 | 0.070 s / 3072 samples per channel | **835.1 s** | **846.6 s** | **1.014x — the device arm is SLOWER** |
+| `--duration 0.4` | 10 | 0.395 s / 17 408 samples per channel | **1512.1 s** | **1430.4 s** | **0.946x — 5.4 % faster** |
+
+Load averages, before -> after: 3.96 -> 6.78 and 4.29 -> 4.87 for the first pair,
+3.31 -> 4.72 and 4.00 -> 5.29 for the second; the box was otherwise idle
+(`vmstat` 99 % idle before the series) and no other container ran.
+
+**The honest reading, and it is not "the GPU made it faster".** The DIFFERENCE
+between the arms is what isolates the language model, because every other stage
+is the same host code on both and cancels:
+
+    D(2 frames)  = +11.5 s      D(10 frames) = -81.7 s
+    slope     = -11.65 s per AR frame        intercept = +34.8 s
+
+So the device arm **saves ~11.7 s of wall clock per autoregressive frame and pays
+a fixed ~34.8 s**, breaking even at about **three AR frames (~0.12 s of audio)**.
+Two points determine a line exactly, so this is an attribution with no residual
+and no error bar — it is stated as a fit, not as a bound, and a third duration
+would be needed to claim more.
+
+The fixed cost is consistent with the one-time host->device upload of the 8.6B
+model (`ResidentWeight`, 17.2 GB) plus context creation, but **that attribution
+was NOT measured separately** and is offered as the plausible reading rather than
+as a result.
+
+**Neither number is a speed claim against a reference.** There is still no
+SGLang-Omni comparison: it is `gateable = no`, it serves the native layout, and
+its production configuration is CUDA-graphed and compiled while five of our six
+stages are scalar host loops. The denominator in §5 is unchanged and every axis
+in `docs/BENCHMARKS.md` stays `PENDING`.
+
+#### Gate counts
+
+Local x86-64 CPU build, this tree: `test_speech_engine` 11/38,
+`test_capi` 65/653, `test_minimax_music3_speech` 9/223,
+`test_minimax_music3_loader` 21/1413, `test_minimax_music3_ar` 25/338,
+`test_minimax_music3_acoustic` 27/265, `test_minimax_music3_quant` 29/125,
+`test_minimax_music3_ar_real` 4/894, `test_minimax_music3_acoustic_real` 6/76,
+`test_minimax_music3_quant_real` 6/319, `test_minimax_music3_llm_real` 4/220,
+`test_minimax_h3` 79/57395, `test_indextts2_family` 7/22,
+`test_openai_api_server` 62/733, `test_speech_api` 6/67. All green, **and every
+one of them reports a non-zero assertion count** — `assertions: 0` is a skip
+wearing a pass.
+
+Thor CUDA build: `test_speech_engine` 11/37 (one fewer assertion than the CPU
+build BY DESIGN — the device-1 case takes its GRANTED branch there and its
+REFUSED branch on a CPU-only build, and it prints which), `test_minimax_music3_speech`
+9/223, `test_minimax_music3_llm_real` 4/220 on both arms.
+
+`test_capi` on the Thor CUDA build is **RED, and it is red on pristine `main`
+too**. A matched-arm control was built in the same container from a `git archive`
+of `origin/main` `c07526aa1`: identical SIGSEGV at `:487` (the ABI v8 logits
+processor case already recorded in `docs/STATUS.md` and in the Thor baseline
+[#955](https://github.com/mudler/vllm.cpp/issues/955)) and, once that case is
+excluded by name, the identical two `structured_choice` failures at `:910`/`:932`
+— main 62 cases / 60 passed / 587 assertions / 2 failed, this tree 64 / 62 / 622
+/ 2, the delta being exactly the two cases and 35 assertions this row adds. The
+`structured_choice` pair was **not** in any baseline because the SIGSEGV aborts
+the run before it, so it was filed as
+[#994](https://github.com/mudler/vllm.cpp/issues/994) rather than left behind a
+known-red name (§10.6's lesson, applied).
+
+#### One instrument defect, found and fixed inside this change
+
+The first version of the gate's arm banner read
+`MESSAGE("... ran on '" << vt::DeviceTypeName(...) << "' (VLLM_CPP_MUSIC3_DEVICE=" << ... << ")")`
+and printed **`ran on '1' (VLLM_CPP_MUSIC3_DEVICE=1)` on a CPU-only build with
+the variable unset** — both fields collapsed to `1` inside doctest's `MESSAGE`
+chain. Had it not been read, the CPU arm's numbers would have been recorded as
+the device arm's. Rebuilt as one `std::string` and it prints
+`ran on 'cpu' (VLLM_CPP_MUSIC3_DEVICE=unset)`. An instrument reports on the state
+it was GIVEN, and a banner nobody reads is not a report.

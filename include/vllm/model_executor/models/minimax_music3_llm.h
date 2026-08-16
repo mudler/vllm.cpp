@@ -186,7 +186,21 @@ class Music3LmSession {
   // feedback step. Throws when it exceeds the checkpoint's
   // `max_position_embeddings`, which is a context limit on our side too and is
   // ENFORCED rather than discovered (spec §7).
+  //
+  // The cache lands WHERE THE QUEUE POINTS. `dense_attn::KvSlice` builds its
+  // tensor views with `d.q.device` (dense_attn_block.h:233), so a host
+  // `std::vector` handed to a CUDA forward is a host pointer wearing a device
+  // tensor's label — finite, correctly shaped, and read by a kernel that cannot
+  // dereference it. That is why this constructor branches on the queue instead
+  // of always allocating the vectors it always allocated.
   Music3LmSession(const Music3ArWeights& weights, vt::Queue& queue, int64_t max_positions);
+
+  // Frees the paged KV when it lives on a DEVICE. The CPU arm's cache is
+  // `std::vector` storage and needs no destructor at all; this exists because
+  // `vt::Backend::Alloc` has no owner of its own.
+  ~Music3LmSession();
+  Music3LmSession(const Music3LmSession&) = delete;
+  Music3LmSession& operator=(const Music3LmSession&) = delete;
 
   // `language_model.model(inputs_embeds=embed_tokens(text_ids), use_cache=True)`
   // (encoders.py:310-311). Both rows carry the SAME number of tokens because the
@@ -220,7 +234,12 @@ class Music3LmSession {
   int64_t block_size_ = 0;
   int64_t blocks_per_row_ = 0;
   int64_t position_ = 0;  // tokens already in the cache, per row
+  // Exactly ONE of these carries the cache. `kv_storage_` is the CPU arm's,
+  // untouched; `device_kv_` holds one `vt::Backend::Alloc` block per layer on a
+  // device arm and is empty on CPU. They are not both populated, and the
+  // destructor frees only what the device arm took.
   std::vector<std::vector<uint16_t>> kv_storage_;
+  std::vector<void*> device_kv_;
   std::vector<PagedKvCache> attn_kv_;
 };
 

@@ -1512,7 +1512,7 @@ identical to one built before it existed. See
 A **music-only server**, which is what you almost certainly want:
 
     vllm-server --speech-model /path/to/minimax-music3 \
-      [--speech-family minimax-music3] [--port 8000]
+      [--speech-family minimax-music3] [--speech-device 0|1] [--port 8000]
 
 **`--model` is not required here**, and that is deliberate. Upstream's own recipe
 is `sgl-omni serve --model MiniMaxAI/MiniMax-Music3` and nothing else: a music
@@ -1537,6 +1537,17 @@ not registered is refused too; it is never treated as a hint, because the wrong
 family would not fail — it would render noise. `--speech-family` without
 `--speech-model` is still an error: there is nothing to load it from.
 
+`--speech-device` says **where** the family runs. `0` is the default and the CPU
+arm; `1` is the accelerator this build resolves. It is refused rather than
+substituted: `--speech-device 1` on a build with no accelerator backend, or on a
+partial backend that has not registered this family's kernels, fails at startup
+naming the piece that is missing. `--speech-device` without `--speech-model` is
+an error for the same reason `--speech-family` is — a knob that applies to
+nothing reads as one that was honoured. What device 1 currently moves for
+MiniMax-Music3 is documented under
+[What runs on the device](#what-runs-on-the-device-and-what-does-not), and it is
+**not the whole model**.
+
 In the speech-only form the served model name defaults to the **family**
 (`minimax-music3`) rather than to a directory basename, because there is no
 `config.json` to take one from. `--served-model-name` still wins.
@@ -1545,27 +1556,33 @@ A successful music-only start prints what it resolved, so you can tell a working
 server from a listening one without sending a request:
 
     server: speech/music-only model (family=minimax-music3, 44100 Hz,
-            text-only synthesis, family DETECTED); serving /v1/audio/speech
+            text-only synthesis, family DETECTED, device cpu);
+            serving /v1/audio/speech
     server: listening on http://0.0.0.0:8000 (model 'minimax-music3')
 
 `family DETECTED` means the artifact was inspected; `family DECLARED` means you
 passed `--speech-family`. `text-only synthesis` is the answer to
 `requires_reference_audio()` — a family that needs a reference clip says
 `reference clip REQUIRED` there instead, and refuses a clipless request before
-anything stages.
+anything stages. `device` is what the load **granted**, not what you asked for:
+a build that cannot serve `--speech-device 1` refuses at startup rather than
+printing `cuda` and running on the CPU.
 
 Or skip HTTP entirely. `minimax-music3-gen` drives the same seam through the C
 ABI and writes the WAV itself:
 
     minimax-music3-gen --model /path/to/minimax-music3 --out song.wav \
       --lyrics @lyrics.txt --description "Genre: acoustic pop. BPM: 96." \
-      --duration 8 --steps 8 --seed 7
+      --duration 8 --steps 8 --seed 7 [--device 0|1]
 
 `--lyrics` and `--description` take literal text or `@path` to read a file,
 because lyrics are multi-line and a `[Verse]` tag inside an argv is easy to
 mangle. It prints the delivered length, rate, channels, RMS, peak and wall clock
 to stderr — the *delivered* length, not the requested one, because a duration
-resolves to a whole number of 25 Hz frames and is therefore quantized.
+resolves to a whole number of 25 Hz frames and is therefore quantized. It also
+prints the device the handle **resolved to** rather than the one `--device`
+asked for, which is the difference between timing two arms and timing one arm
+twice.
 
 The route is OpenAI's `createSpeech` shape, with the two **music** inputs as
 additional named fields:
@@ -1665,6 +1682,62 @@ that way in W2-W5 so their reduction order is reproducible against torch, and
 they run single-threaded. In one 0.1 s request the depth decoder alone is the
 majority of the wall clock.
 
+#### What runs on the device, and what does not
+
+`--speech-device 1` (or `minimax-music3-gen --device 1`, or
+`vllm_speech_model_params.device = 1`) is **a partial arm, and this table is the
+whole of it**. Reading it as "the model runs on the GPU" would be wrong in the
+direction that matters.
+
+| stage | where `--speech-device 1` runs it |
+|---|---|
+| 8.6B `Qwen3ForCausalLM` (prefill + every decode step, its paged KV) | **device** |
+| guided-logit pipeline, top-k draw, frame feedback embedding | host (two 200 000-wide rows per step; not the cost) |
+| 0.646B RVQ depth decoder (7 steps per frame) | **host**, scalar loops |
+| condition mix, 2.4B fp32 flow-matching DiT, scheduler | **host**, scalar loops |
+| DAC Flow-VAE vocoder (`Conv1d` / `ConvTranspose1d`) | **host**, scalar loops |
+
+The language model reaches the device because it is already routed through the
+shared `Qwen3DenseModel` forward that five text registrations ride — nothing was
+forked for it, and the only thing this option changes is which queue that
+forward is handed and where its KV cache is allocated. The other stages do not,
+for two different reasons, and both are owed rather than hidden:
+
+* the depth decoder and the DiT are host `std::vector<float>` reference loops
+  under `-ffp-contract=off`, kept that way so their reduction order stays
+  reproducible against torch. Moving them means routing them through the shared
+  `vt` GEMM seam with device-resident weights, not adding a flag;
+* the vocoder needs `ConvTranspose1d`, and **`vt` has no such op at all** — the
+  1-D convolutions it does have (`vt::DepthwiseConv1d`, `vt::CausalConv1dFwd`)
+  are depthwise or causal-with-state, and `vt::Conv2d` and `vt::DepthwiseConv1d`
+  are registered for the **CPU only**. There is no CUDA kernel behind the op
+  this stage would need, so it is named here rather than hand-rolled outside the
+  seam.
+
+Because the host stages are unchanged, the CPU arm is **bit-identical** to the
+one every Music3 correctness gate was taken on, and the device arm's output
+differs from it exactly where the language model's own arithmetic differs — one
+stage, not five.
+
+**The two arms do not produce the same song, and that is structural.** The
+autoregressive stage has no greedy path upstream: it ends every draw in a seeded
+multinomial, so a different logit changes the drawn code and everything after it.
+Do not compare the two WAVs sample by sample. What *is* comparable is the
+language model's own hidden state against the oracle capture, and
+`tests/parity/test_minimax_music3_llm_real.cpp` runs that comparison on either
+arm — `VLLM_CPP_MUSIC3_DEVICE=1` selects the device one, unset is the CPU one —
+at the same bounds, with the same negative control. Numbers for both are in
+[BENCHMARKS](BENCHMARKS.md).
+
+**Measured, so expectations are calibrated rather than hoped for.** On a Jetson
+Thor (sm_110, 14 cores) the device arm was *slower* on a two-frame request
+(846.6 s vs 835.1 s) and 5.4 % faster on a ten-frame one (1430.4 s vs 1512.1 s).
+The difference between the arms works out to about 11.7 s saved per
+autoregressive frame against a fixed cost of about 35 s, so it breaks even
+around three frames — roughly 0.12 s of audio. If you are generating an actual
+song the device arm helps; if you are smoke-testing the shortest request that
+enters every stage, it does not.
+
 **A first sample, measured.** Two seconds of stereo music, generated by this
 engine through `minimax-music3-gen` on an idle-to-busy 20-core x86 CPU box:
 
@@ -1690,10 +1763,12 @@ repository path, and no classified path accepts a `.wav` outside `tests/`, where
 a file compared to nothing would sit beside the goldens and imply it was one.
 Regenerate it instead — the command above is the whole recipe.
 
-The same seam is reachable from the C ABI at v20 — `vllm_speech_engine_load`,
-`vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio`,
-`vllm_synthesize` and `vllm_speech_result_free` — so HTTP and FFI drive one
-implementation. `vllm_speech_result` carries both the float waveform and the
+The same seam is reachable from the C ABI at v21 — `vllm_speech_engine_load`,
+`vllm_speech_engine_family` / `_sample_rate` / `_requires_reference_audio` /
+`_device`, `vllm_synthesize` and `vllm_speech_result_free` — so HTTP and FFI
+drive one implementation. `vllm_speech_model_params.device` is the same 0 = CPU
+/ 1 = accelerator selector `--speech-device` sets, and
+`vllm_speech_engine_device` reports what the load granted. `vllm_speech_result` carries both the float waveform and the
 RIFF/WAVE bytes, so an embedder writes a playable file without a second encoder.
 
 

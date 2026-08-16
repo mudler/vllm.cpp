@@ -451,7 +451,14 @@ namespace {
 
 class Music3SpeechEngine final : public multimodal::SpeechEngine {
  public:
-  explicit Music3SpeechEngine(std::string path) : path_(std::move(path)) {
+  Music3SpeechEngine(std::string path, int32_t device) : path_(std::move(path)) {
+    // FIRST, before a single file is opened. The device refusal is free and the
+    // checkpoint resolution is not, and a caller that asked for a device this
+    // build cannot serve should not learn it after three minutes of NAS I/O.
+    // Same ordering rule as `Synthesize`'s "validate FIRST".
+    const vt::DeviceType type =
+        multimodal::SpeechEngineDeviceType(device, kMusic3SpeechFamily);
+
     paths_ = MiniMaxMusic3ResolveCheckpoint(path_);
     config_ = MiniMaxMusic3LoadConfig(paths_);
     // The dtype invariant of spec §2.1, enforced BEFORE anything stages, so a
@@ -459,9 +466,27 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
     // shaped type error inside a forward.
     MiniMaxMusic3CheckRuntimeDtypes(
         MiniMaxMusic3ResolveRuntimeDtypes(MiniMaxMusic3DtypePolicy::kBf16ArFp32Acoustic));
+
+    if (type == vt::DeviceType::kCPU) {
+      // The DEFAULT arm, and the one every Music3 gate was taken on. Constructed
+      // exactly as the hardcoded queue this replaced.
+      queue_ = vt::Queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    } else {
+      // The device context is created BEFORE any weight is read — the
+      // unified-memory load recipe minimax_h3_video.cpp:349-353 records, and
+      // Jetson Thor (sm_110, ~122 GB UNIFIED) is exactly the box it was written
+      // for: the driver's reservation has to land before host allocations fill
+      // the one pool both sides draw from.
+      queue_ = vt::GetBackend(type).CreateQueue();
+    }
   }
 
   std::string family() const override { return kMusic3SpeechFamily; }
+  // WHERE this engine resolved to run, reported rather than echoed back from
+  // the request: "device 1 was asked for" and "device 1 was granted" are
+  // different facts, and a benchmark that conflates them measures the CPU arm
+  // twice.
+  vt::Device device() const override { return queue_.device; }
   int64_t sample_rate() const override { return config_.vocoder.sampling_rate; }
   // FALSE, and it is load-bearing rather than a default: Music3 conditions on
   // text alone (spec §4.1), where IndexTTS-2 has no text-only synthesis at all.
@@ -487,13 +512,21 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
     int64_t calls = 0;
     {
       // The AR stage's language model runs through `vt`, so the queue is the
-      // only thing that decides where. CPU is what W2 ships and what every gate
-      // for this row has been taken on; a device arm is a queue, not a fork.
-      vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+      // only thing that decides where. CPU is what W2 shipped and what every
+      // gate for this row was taken on; a device arm is a queue, not a fork —
+      // and that is now literally true rather than an intention, because the
+      // queue this line used to construct as a constant is the engine's
+      // `queue_` and the ONLY thing the device selector changes.
+      //
+      // WHAT MOVES: the 8.6B `Qwen3ForCausalLM` half, through the shared
+      // `Qwen3DenseModel::ForwardEmbeds` five registrations already ride. WHAT
+      // DOES NOT: the 0.65B RVQ depth decoder and the whole acoustic half,
+      // which are host reference loops — see minimax_music3_ar.h and
+      // vocoder1d.h for exactly which pieces are owed and why.
       const Music3ArWeights ar = Music3LoadArWeights(paths_, config_);
       const std::vector<int32_t> prompt_ids = ar.Encode(request.prompt);
       Music3ArResult generated = Music3GenerateFrameHiddens(
-          prompt_ids, request.max_frames, ar, Music3SeededSampler(request.seed), queue);
+          prompt_ids, request.max_frames, ar, Music3SeededSampler(request.seed), queue_);
       frame_hiddens = std::move(generated.frame_hiddens);
       frames = generated.frames;
       calls = generated.calls;
@@ -531,6 +564,10 @@ class Music3SpeechEngine final : public multimodal::SpeechEngine {
   std::string path_;
   MiniMaxMusic3Paths paths_;
   MiniMaxMusic3Config config_;
+  // Built ONCE, in the constructor, and reused by every request: on an
+  // accelerator this owns the stream, and creating one per `Synthesize` would
+  // put a context creation inside the request path.
+  vt::Queue queue_{};
 };
 
 }  // namespace
@@ -543,7 +580,7 @@ void RegisterMiniMaxMusic3SpeechFamily(multimodal::SpeechRegistry& registry) {
   };
   reg.load = [](const multimodal::SpeechModelParams& params)
       -> std::unique_ptr<multimodal::SpeechEngine> {
-    return std::make_unique<Music3SpeechEngine>(params.path);
+    return std::make_unique<Music3SpeechEngine>(params.path, params.device);
   };
   registry.Register(std::move(reg));
 }

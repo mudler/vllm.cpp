@@ -13,8 +13,8 @@ upstream llama.cpp:
 
 | Tree | Revision | Highest type |
 |---|---|---|
-| vllm.cpp pin | `237ad9b96` | `GGML_TYPE_Q1_0 = 41` |
-| `ggml-org/llama.cpp` master, 2026-08-15 | `ad1de39e0` | `GGML_TYPE_Q2_0 = 42`, `COUNT = 43` |
+| vllm.cpp `llama-cpp` pin, tag `b10451` | `10bf611e5` | `GGML_TYPE_Q2_0 = 42`, `COUNT = 43` |
+| the former `llama-cpp` pin, our local fork | `237ad9b96` | `GGML_TYPE_Q1_0 = 41` |
 | this fork, branch `iq1-narrow` | `36fe8e1cc` | `GGML_TYPE_IQ1_XXXS = 66`, `COUNT = 67` |
 
 The fork declares three encodings below IQ1_S, all added by the branch head

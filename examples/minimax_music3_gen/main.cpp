@@ -14,7 +14,7 @@
 //   minimax-music3-gen --model <checkpoint-set-dir> --out <song.wav>
 //                      --lyrics <text|@file> [--description <text|@file>]
 //                      [--duration SECONDS] [--steps N] [--guidance F]
-//                      [--seed N] [--family <name>]
+//                      [--seed N] [--family <name>] [--device 0|1]
 //
 // `--model` names the checkpoint SET, not a file: the diffusers arm ships six
 // component directories beside a `modular_model_index.json`. `--family` is
@@ -74,7 +74,7 @@ void Usage(const char* argv0) {
                "usage: %s --model <checkpoint-set-dir> --out <song.wav>\n"
                "          --lyrics <text|@file> [--description <text|@file>]\n"
                "          [--duration SECONDS] [--steps N] [--guidance F]\n"
-               "          [--seed N] [--family <name>]\n"
+               "          [--seed N] [--family <name>] [--device 0|1]\n"
                "\n"
                "  --model      the checkpoint SET directory (six component dirs +\n"
                "               modular_model_index.json), NOT a single file\n"
@@ -85,7 +85,9 @@ void Usage(const char* argv0) {
                "  --steps      denoise steps; omitted => the family default (30)\n"
                "  --guidance   CFG scale; 0 IS legal, so omitted (not 0) means default\n"
                "  --seed       seeds the AR sampling and the initial denoise latents\n"
-               "  --family     skip detection and name the family\n",
+               "  --family     skip detection and name the family\n"
+               "  --device     0 (default) the CPU arm, 1 the accelerator this build\n"
+               "               resolves. Refused BY NAME when this build cannot serve it\n",
                argv0);
 }
 
@@ -99,6 +101,7 @@ int main(int argc, char** argv) {
   double guidance = 0.0;      // only honoured when guidance_given
   bool guidance_given = false;  // 0 is a LEGAL guidance scale, so presence is a flag
   int64_t seed = 0;
+  int device = 0;  // 0 => the CPU arm, which is the default everywhere
 
   for (int i = 1; i < argc; ++i) {
     const std::string flag = argv[i];
@@ -129,6 +132,8 @@ int main(int argc, char** argv) {
       seed = std::atoll(next("--seed").c_str());
     } else if (flag == "--family") {
       family = next("--family");
+    } else if (flag == "--device") {
+      device = std::atoi(next("--device").c_str());
     } else if (flag == "--help" || flag == "-h") {
       Usage(argv[0]);
       return 0;
@@ -151,6 +156,7 @@ int main(int argc, char** argv) {
   vllm_speech_model_params mp = vllm_speech_model_params_default();
   mp.path = model.c_str();
   if (!family.empty()) mp.family = family.c_str();
+  mp.device = device;
 
   const auto load_t0 = std::chrono::steady_clock::now();
   vllm_speech_engine* engine = nullptr;
@@ -160,9 +166,12 @@ int main(int argc, char** argv) {
   }
   const double load_s =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count();
-  std::fprintf(stderr, "loaded family '%s' at %d Hz in %.1f s\n",
+  // The device is reported from the HANDLE, never echoed back from `device`:
+  // "asked for 1" and "got 1" are different facts, and a timing run that prints
+  // the first has no way to notice it measured the CPU arm twice.
+  std::fprintf(stderr, "loaded family '%s' at %d Hz on %s in %.1f s\n",
                vllm_speech_engine_family(engine), vllm_speech_engine_sample_rate(engine),
-               load_s);
+               vllm_speech_engine_device(engine) == 0 ? "cpu" : "the accelerator", load_s);
 
   // Ask BEFORE synthesizing, which is the whole reason this interrogation is on
   // the ABI: a family with no text-only synthesis is a caller-side refusal

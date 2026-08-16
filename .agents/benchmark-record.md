@@ -21994,3 +21994,100 @@ needs both the explicit batched reads and the cache hit rate together. The
 pieces are in tree and unwired: `ExpertSlotCache`, `GgufExpertSpanOf` and
 `ExpertStreamer`. See [`.agents/specs/expert-streaming.md`](../.agents/specs/expert-streaming.md).
 
+
+## MUSIC3-DEVICE-ARM — MiniMax-Music3 on Jetson Thor, CPU vs accelerator, both arms same box and same binary (2026-08-16, `row/MUSIC3-DEVICE-ARM`, base `origin/main` `c07526aa1`, Thor sm_110, #672)
+
+**Not a parity ratio.** There is no reference leg here: SGLang-Omni is
+`gateable = no` and its production configuration is CUDA-graphed and compiled,
+while five of our six stages are scalar host loops. This is an INTERNAL two-arm
+number about a PARTIAL device arm, and every axis in `docs/BENCHMARKS.md`
+against the reference stays `PENDING`.
+
+### Recipe
+
+Host `kairos-4db2` (`192.168.68.23`), Jetson Thor **sm_110**, aarch64, 14 cores,
+~122 GB unified, driver 595.78, Ubuntu 24.04 under Kairos. Image
+`vllmcpp-thor:cuda13.0.1` (nvcc 13.0.88), run
+`sudo -n docker run --rm --runtime=nvidia -e NVIDIA_DISABLE_REQUIRE=1`
+— `--gpus all` is refused outright by the hook, and `NVIDIA_DISABLE_REQUIRE=1`
+is required because the image's `NVIDIA_REQUIRE_CUDA` tops out at `driver<576`.
+
+    cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 \
+      -DVLLM_CPP_TRITON=OFF -DVLLM_CPP_SERVER=ON      # no cutlass
+
+Checkpoint `MiniMaxAI/MiniMax-Music3` diffusers arm, mounted read-only from
+`/usr/local/nas_share/checkpoints/minimax-music3`. Source moved with
+`git archive`, never rsync. Each run took `flock $HOME/gpu.lock` for its whole
+duration, so no two arms overlapped, and ONE checkpoint was resident at a time —
+this box has `vm.overcommit_memory=1` with zero swap and reboots instead of
+OOM-killing.
+
+    minimax-music3-gen --model /nas/checkpoints/minimax-music3 --out <wav> \
+      --lyrics '[Verse]\nMorning light through the pines' \
+      --description 'Genre: acoustic pop. BPM: 96. Key: C major.' \
+      --duration <0.1|0.4> --steps 2 --seed 7 --device <0|1>
+
+### Wall clock
+
+| request | AR frames | delivered | `--device 0` CPU | `--device 1` CUDA | ratio dev/cpu | load before -> after (cpu) | (cuda) |
+|---|---|---|---|---|---|---|---|
+| `--duration 0.1` | 2 | 0.070 s, 3072 samples/ch | **835.1 s** | **846.6 s** | **1.014x SLOWER** | 4.29 -> 4.87 | 3.96 -> 6.78 |
+| `--duration 0.4` | 10 | 0.395 s, 17 408 samples/ch | **1512.1 s** | **1430.4 s** | **0.946x** | 4.00 -> 5.29 | 3.31 -> 4.72 |
+
+`vmstat` showed the box 99 % idle before the series and no other container ran.
+Runs were alternated (cuda, cpu, cuda, cpu) rather than grouped.
+
+### Attribution — the difference is what isolates the language model
+
+Every stage except the 8.6B LM is the same host code on both arms, so it cancels
+in `D(n) = T_cuda(n) - T_cpu(n)`:
+
+    D(2)  = +11.5 s        D(10) = -81.7 s
+    slope     = -11.65 s per AR frame
+    intercept = +34.8 s      =>  break-even at ~3 AR frames (~0.12 s of audio)
+
+**Two points determine a line exactly**, so this is a fit with no residual and no
+error band. It is an attribution, not a bound; a third duration is owed before
+anything stronger is claimed.
+
+The fixed cost is CONSISTENT WITH the one-time host->device upload of the 8.6B
+model (`ResidentWeight`, 17.2 GB) plus context creation. **That was not measured
+separately** and is recorded as the plausible reading rather than as a result.
+
+### Why the ratio is small, and why that is the honest headline
+
+`--device 1` moves ONE of six stages. The profile this row inherited
+(`.agents/specs/minimax-music3.md` §"Now", `perf record -g`, 173 K samples) puts
+`LinearNoBias` — the RVQ depth decoder, a scalar host triple loop under
+`-ffp-contract=off` — at 42-57 % of the autoregressive half, and
+`vocoder1d::ConvTranspose1d` at 88.5 % of the acoustic half. Neither takes a
+queue. The vocoder cannot take one yet at all: **`vt` has no `ConvTranspose1d`
+op**, and `vt::Conv2d` / `vt::DepthwiseConv1d` are registered CPU-only
+(`src/vt/cpu/cpu_conv2d.cpp:111`, `src/vt/cpu/cpu_conv1d_depthwise.cpp:95`), so
+there is no CUDA kernel behind any op that stage could route through.
+
+### The correctness leg, same box and same binary
+
+`test_minimax_music3_llm_real` with `VLLM_CPP_MUSIC3_DEVICE` 0 and 1, 25
+teacher-forced steps vs `frame_hiddens[:, :4096]`, 102 400 values, at the bounds
+that were already there — **no tolerance was widened for the device arm**:
+
+| arm | bit-identical | mean\|d\| | outside 2 bf16 ULP | golden-code mean rank | negative control |
+|---|---|---|---|---|---|
+| Thor CPU | 9337 (9.118 %) | 1.76348e-02 | 37 572 (36.69 %) | 2.48 | mean\|d\| 0.802531, 98.20 % outside |
+| Thor CUDA | 9324 (9.105 %) | 1.71668e-02 | 36 509 (35.65 %) | 2.44 | mean\|d\| 0.802583, 98.18 % outside |
+| control (torch `sdpa_kernel(MATH)`, recorded) | 12 036 (11.75 %) | 1.475e-02 | 29 968 (29.27 %) | — | — |
+
+Both 4 cases / 220 assertions / 0 failed. The CUDA arm is marginally CLOSER to
+the golden than the CPU arm, and both are inside the measured torch-vs-torch
+control. The negative control fires identically on both, so the bound still
+discriminates rather than having gone slack. **The Thor CPU arm reproduces the
+x86-64 numbers this row recorded in 2026-08-15 value for value**, which is the
+CPU path being unchanged across two architectures rather than on one box.
+
+**The two arms produce DIFFERENT SONGS and that is structural, not a defect**:
+spec §5 withdrew the token gate because the AR codes are a seeded
+`torch.multinomial` draw, so a different logit changes the drawn code and
+everything downstream. Sample-wise comparison of the two WAVs is meaningless and
+none is offered; the RMS/peak of each run are recorded in the spec instead.

@@ -217,6 +217,10 @@ struct Args {
   // never treated as a hint, because the wrong family would not fail — it would
   // render noise.
   std::string speech_family;
+  // WHERE the speech family runs. 0 = CPU, the default and the arm every Music3
+  // correctness gate was taken on; 1 = the accelerator this build resolves.
+  // A value the seam cannot serve is refused BY NAME at load, not substituted.
+  int32_t speech_device = 0;
   // FAMILY-SPECIFIC load knobs, `--video-extra KEY=VALUE`, repeatable. Pinning a
   // family is useless if that family's required load knobs are unreachable:
   // LTX-2.5 cannot load without `dit_config_path` (the shipped FP8 DiT carries
@@ -399,9 +403,12 @@ const InertArg* FindAcceptedInertArg(const std::string& flag) {
          "               [--limit-mm-per-prompt '<json>']\n"
          "               [--speech-model <checkpoint-dir>] "
          "[--speech-family <name>]\n"
+         "               [--speech-device 0|1]\n"
          "               [--version]\n"
          "  --speech-model WITHOUT --model serves /v1/audio/speech ALONE (no "
          "text model is loaded)\n"
+         "  --speech-device 0 (default) runs the speech family on the CPU, 1 on "
+         "the accelerator this build resolves\n"
          "  accepted for published-recipe compatibility, NO effect: "
          "--enable-auto-tool-choice, --trust-remote-code\n";
   std::exit(code);
@@ -489,6 +496,8 @@ Args ParseArgs(int argc, char** argv) {
       a.speech_model = NextArg(argc, argv, i, argv[0]);
     } else if (flag == "--speech-family") {
       a.speech_family = NextArg(argc, argv, i, argv[0]);
+    } else if (flag == "--speech-device") {
+      a.speech_device = std::stoi(NextArg(argc, argv, i, argv[0]));
     } else if (flag == "--video-extra") {
       const std::string kv = NextArg(argc, argv, i, argv[0]);
       const std::string::size_type eq = kv.find('=');
@@ -719,6 +728,13 @@ Args ParseArgs(int argc, char** argv) {
                  "checkpoint; there is nothing to load it from\n";
     Usage(argv[0], 2);
   }
+  if (a.speech_device != 0 && a.speech_model.empty()) {
+    // Same shape as the --speech-family check above, and for the same reason: a
+    // knob that silently applies to nothing reads as "it was honoured".
+    std::cerr << "server: --speech-device selects where the speech family runs but "
+                 "--speech-model names no checkpoint; there is nothing to place\n";
+    Usage(argv[0], 2);
+  }
   // Mirrors vllm/entrypoints/openai/cli_args.py:395 — upstream raises
   //   TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
   // when the flag is set and `args.tool_call_parser` is falsy. Upstream's falsy
@@ -830,6 +846,7 @@ int VllmServerMain(int argc, char** argv) {
       vllm::multimodal::SpeechModelParams smp;
       smp.path = args.speech_model;
       smp.family = args.speech_family;  // empty => DETECT by inspecting the artifact
+      smp.device = args.speech_device;   // 0 => CPU, the byte-identical default
       std::string why;
       std::unique_ptr<vllm::multimodal::SpeechEngine> loaded_speech = registry.Load(smp, &why);
       if (loaded_speech == nullptr) {
@@ -852,6 +869,9 @@ int VllmServerMain(int argc, char** argv) {
                                                   : "text-only synthesis")
                 << ", family "
                 << (args.speech_family.empty() ? "DETECTED" : "DECLARED (--speech-family)")
+                // GRANTED, not requested. A log that echoed --speech-device back
+                // would say "cuda" on a build that resolved CPU.
+                << ", device " << vt::DeviceTypeName(speech_only->device().type)
                 << "); serving /v1/audio/speech\n";
       namespace oai = vllm::entrypoints::openai;
       oai::OpenAIServingModels speech_models(speech_served_name);
@@ -1388,6 +1408,7 @@ int VllmServerMain(int argc, char** argv) {
       vllm::multimodal::SpeechModelParams smp;
       smp.path = args.speech_model;
       smp.family = args.speech_family;  // empty => DETECT by inspecting the artifact
+      smp.device = args.speech_device;   // 0 => CPU, the byte-identical default
       std::string why;
       // NOT `loaded`: that name is already taken by the TEXT engine in the
       // enclosing scope, and MSVC's C4456 is a warning-as-error there, so the
@@ -1411,6 +1432,7 @@ int VllmServerMain(int argc, char** argv) {
                                                   : "text-only synthesis")
                 << ", speech family "
                 << (args.speech_family.empty() ? "DETECTED" : "DECLARED (--speech-family)")
+                << ", device " << vt::DeviceTypeName(speech_engine->device().type)
                 << ")\n";
       // The request mapping is `vllm::openai::SynthesizeSpeechRequest` (library,
       // speech_api.h) rather than a lambda body here: a mapping that only a

@@ -43,9 +43,9 @@
   use Q4_K_M.
 - **2026-08** **MXFP4 holds parity with vLLM.** Qwen3-8B MXFP4 runs W4A16 Marlin by default,
   matches the vLLM oracle token for token, and decodes **45.45 vs 41.94 tok/s**.
-- **2026-08** **Vulkan matches llama.cpp on a 27B.** `opt-125m` greedy is STRICT token-exact;
-  Qwen3.6-27B decodes **4.36 vs llama.cpp Vulkan 4.35 tok/s** on GB10, up from 2.40 at the start of
-  the campaign. A narrow pass: the 0.69% leg spread is the noise floor. Prefill **21.5x**.
+- **2026-08** **Vulkan matches llama.cpp on a 27B.** Qwen3.6-27B decodes **4.36 vs llama.cpp Vulkan
+  4.35 tok/s** on GB10, up from 2.40. A narrow pass: the 0.69% leg spread is the noise floor.
+  Prefill **21.5x**, a self-ratio. Denominator SUPERSEDED.
 
 vllm.cpp is a from-scratch C++20 inference engine chasing three things at once: be the
 **smallest** thing you can deploy, be the **fastest** on the hardware you already own, and still
@@ -73,11 +73,10 @@ Where that stands today:
 - **Small.** **66 MiB** of binary against a **9.1 GiB** vLLM install, both measured on the same GB10:
   about **140x less to deploy**, serving the same model in **24.88 GiB of peak host memory against
   vLLM's 28.18**. No interpreter in the process, and 0 bytes of bundled CUDA userspace.
-- **Fast.** On Qwen3.6-27B we **match vLLM's throughput** against its graphed production config.
-  We are ahead at all six concurrencies we measured, but only **c1 (4.5%)** is outside our noise
-  band; the other five, 0.7% to 1.7%, are ties. Also **1.18x llama.cpp's prefill** on the same
-  GGUF file, and **ahead of MLX-LM on prefill** on Apple Silicon. Most other architectures are
-  correct but speed-pending, and each one says so.
+- **Fast.** On Qwen3.6-27B we **match vLLM's throughput** against its graphed production config,
+  ahead at all six concurrencies but only c1 outside our noise band. Also **1.18x llama.cpp's
+  prefill** on the same GGUF file (denominator SUPERSEDED, see below), and **ahead of MLX-LM on
+  prefill** on Apple Silicon. Most other architectures are speed-pending, and say so.
 - **Everything.** 37 registered architectures, 36 tool-parser families, structured output including
   GBNF, three speculative decoders, image and video and audio input, external KV offload, Prometheus
   metrics, and the SGLang knobs, all in a library you can `dlopen`.
@@ -116,10 +115,13 @@ And we hold every other engine to the same treatment: same model, same workload,
 | decode | 24.7 tok/s | 25.4 | 0.97x (tie) |
 | peak memory | 2.83 GiB | 2.80 GiB | 1.01x |
 
-Decode lands inside llama.cpp's own run-to-run spread, so that row is a tie, and the memory gap is
-30 MiB on a 2.8 GiB working set. Prefill is the only real gap, and it goes our way. The tokens are
-**byte-identical to llama.cpp's greedy decode**. Single-stream only: we have not measured concurrent
-serving against llama.cpp's server.
+Decode lands inside llama.cpp's own spread, and the memory gap is 30 MiB. Tokens are
+**byte-identical to llama.cpp's greedy decode**. Single-stream only: concurrent serving against
+llama.cpp's server is unmeasured.
+
+> **Every llama.cpp denominator here is SUPERSEDED**: they came from `237ad9b96`, our own local-only
+> fork, 65 performance commits deep. The pin is now stock `b10451` and each figure is owed a re-take
+> that can move it either way ([#1003](https://github.com/mudler/vllm.cpp/issues/1003)).
 
 ### vs MLX-LM, on Apple M4, warm b=1
 
@@ -151,10 +153,9 @@ numbers by [`benchmarks/demo/`](benchmarks/demo/), which reads its values from a
 every figure traces back to the run that produced it.
 
 > **Pre-release, under heavy development.** Correctness is gated token-for-token against a pinned
-> vLLM oracle across 27 gated architectures. Speed is proven on one GPU (NVIDIA GB10 / DGX Spark,
-> sm_121a) plus a CPU path that matches or beats llama.cpp on GGUF. Every capability is labelled
-> honestly in [docs/STATUS.md](docs/STATUS.md): *correctness-complete*, *speed-pending*,
-> *build-only*, or *hardware-blocked*.
+> vLLM oracle across 27 gated architectures. Speed is proven on one GPU (GB10, sm_121a) plus a CPU
+> path that matches or beats llama.cpp on GGUF, against a SUPERSEDED fork denominator (#1003).
+> Every capability is labelled honestly in [docs/STATUS.md](docs/STATUS.md).
 
 ## Quickstart
 
@@ -305,9 +306,9 @@ hardware-blocked and why, is in [docs/STATUS.md](docs/STATUS.md).
 |---|---|---|
 | **CUDA** | GB10 / DGX Spark (sm_121a) | Runtime-gated. 27B at/above vLLM throughput, 35B prefill-pending |
 | **CUDA** | Blackwell, Hopper, Ampere, Ada (sm_80 to sm_121a) | Per-arch builds pass; ten-SM archive candidate awaits hosted cubin audit; no runtime proof here |
-| **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis, Arm i8mm quant-GEMM tier |
+| **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis (SUPERSEDED, #1003), Arm i8mm tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
-| **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35). Op coverage: [docs/STATUS.md](docs/STATUS.md) |
+| **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35, denominator SUPERSEDED, #1003) |
 | **ROCm** | AMD GPUs | W0 skeleton, gfx1201/2xR9700 contrib-run ([#140](https://github.com/mudler/vllm.cpp/pull/140)); no board: [detail](docs/ROCM.md) |
 | **Tenstorrent** | Blackhole | OPT-125m strict 6/6; Qwen3 gate wired, full rerun pending |
 | **Intel XPU / ANE** | Intel, Apple NPU | Spiked or roadmap |

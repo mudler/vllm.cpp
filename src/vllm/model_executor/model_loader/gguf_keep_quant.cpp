@@ -185,9 +185,49 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   // (2.798), a real weight-residency win, NOT neutral. (2) the prefill regression
   // was borrowed-weight first-touch faults landing in the timed prefill; the
   // load-time PrefaultBorrowedSpan (port of llama.cpp's mmap prefetch) faults them
-  // off the timed path, restoring prefill to ~205 t/s = 1.16x AHEAD of pp128
-  // 176.6 (was 0.72x behind). Net: RSS parity, prefill/decode at-or-ahead,
+  // off the timed path, restoring prefill (was 0.72x behind). Net: RSS parity,
   // greedy tokens byte-identical (native-f16 compute, md5 d235db1... unchanged).
+  //
+  // THE llama.cpp DENOMINATORS ABOVE ARE SUPERSEDED, and this is the one place
+  // the contamination reaches a shipped DEFAULT rather than a document. They were
+  // measured against 237ad9b96, our own local-only fork, 65 of this project's
+  // performance commits past upstream tag b9827, six of them in ggml/src/ggml-cpu/
+  // (fused gated_delta_net and a discriminated ssm_conv, both DEFAULT-ON, neither
+  // of which stock upstream carries at that point). The CPU floor arm ran a qwen35
+  // model whose CPU graph reaches exactly those ops. The oracle is now stock
+  // b10451, and the re-take is owed under #1003.
+  //
+  // TWO CORRECTIONS TO WHAT THIS COMMENT USED TO SAY, both from the #1003 sweep:
+  //
+  // (a) THE PREFILL FIGURES HERE WERE UNSOURCED. This comment read "~205 t/s =
+  //     1.16x AHEAD of pp128 176.6". NO recorded run produces either operand:
+  //     `git grep -F 176.6` finds it in four other files, none of them a
+  //     llama.cpp prefill number: a MoE microbenchmark mean in MICROSECONDS
+  //     (benchmark-record.md), a 176.69 in an ours-vs-vLLM ledger row
+  //     (parity-ledger.md), two LTX golden floats, and #1003's own index row.
+  //     Do not grep the regex `176.6`: the `.` matches any character and buries
+  //     these in ~360 hits. No arm of ours recorded 205 t/s. The owning record
+  //     (gguf-keep-quant-loader.md:595, benchmark-record.md:10722) says 204 t/s
+  //     against pp128 173.2 = 1.18x. The numbers are NOT reconciled here, because
+  //     picking one would assert an attribution nobody measured; #1003 owes a
+  //     single re-measured pair. Do not quote any of these ratios.
+  //
+  // (b) THIS DEFAULT IS NOT INDEPENDENT OF THAT FLOOR. An earlier pass claimed it
+  //     was, on the grounds that the L7 acceptance is a same-binary OURS-vs-OURS
+  //     A/B. That reads one row of a three-row table. The A/B trades ~10% of
+  //     prefill (224 -> 204 t/s, TTFT 571 -> 625 ms) and ~1.4% of decode for
+  //     1.05 GiB of peak RSS, and the recorded reason the PREFILL loss is
+  //     acceptable is stated in llama.cpp's own terms: "comfortably above the
+  //     competitor floor" (gguf-keep-quant-loader.md:595). That floor is the
+  //     contaminated pp128 173.2. b10451 is 624 commits past b9827 and carries
+  //     upstream's own fused_gdn, so the direction is NOT established: if a
+  //     re-taken stock pp128 lands above 204 t/s, that clause fails and this
+  //     default's only recorded justification for its prefill regression is gone.
+  //     The RSS leg would still stand alone and may well suffice. Keep-f16 stays
+  //     DEFAULT ON here because this is a record pass that measured nothing;
+  //     revisiting it is QUANT-GGUF-KEEPQ-LOADER's decision and needs the re-take
+  //     first. See .agents/specs/oracle-llamacpp-repin-stock.md, row 12.
+  //
   // VT_GGUF_KEEP_F16=0 is the opt-out; rides expand_nk so it is CPU-only and off
   // under VT_CPU_REF regardless (the oracle load stays byte-identical).
   p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk;

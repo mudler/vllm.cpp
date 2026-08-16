@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vt/backend.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -223,22 +224,57 @@ Music3LmSession::Music3LmSession(const Music3ArWeights& weights, vt::Queue& queu
   const HfConfig& c = weights_.lm_config;
   const int64_t per_block =
       2 * block_size_ * c.num_key_value_heads * c.head_dim;  // k and v
-  kv_storage_.resize(static_cast<size_t>(c.num_hidden_layers));
+  const size_t elems = static_cast<size_t>(kRows * blocks_per_row_ * per_block);
+  // WHERE the cache lands is the queue's decision and nothing else's.
+  // `dense_attn::KvSlice` labels this pointer with `d.q.device`
+  // (dense_attn_block.h:233), so a host `std::vector` handed to a CUDA forward
+  // is a host pointer wearing a device tensor's label: finite, correctly shaped,
+  // and read by a kernel that cannot dereference it.
+  const bool on_device = queue_.device.type != vt::DeviceType::kCPU;
+  if (on_device) {
+    device_kv_.assign(static_cast<size_t>(c.num_hidden_layers), nullptr);
+  } else {
+    kv_storage_.resize(static_cast<size_t>(c.num_hidden_layers));
+  }
   attn_kv_.reserve(static_cast<size_t>(c.num_hidden_layers));
   for (int64_t layer = 0; layer < c.num_hidden_layers; ++layer) {
     // BF16, which is what the dense forward WRITES (qwen3_5.h: the paged store
     // down-casts K/V to bf16). An f32 cache here would be a wider memory format
     // than the path that fills it.
-    kv_storage_[static_cast<size_t>(layer)].assign(
-        static_cast<size_t>(kRows * blocks_per_row_ * per_block), 0);
     PagedKvCache kv;
-    kv.data = kv_storage_[static_cast<size_t>(layer)].data();
+    if (on_device) {
+      // ZEROED, and the zero matters as much as the allocation: `KvSlice` hands
+      // the whole [num_blocks, block_size, Hkv, Dh] view to the kernel, so the
+      // unwritten tail of the last block is real memory. Uninitialised device
+      // bytes there are the classic NaN nobody can localize; the CPU arm's
+      // `assign(elems, 0)` has always zeroed for the same reason.
+      vt::Backend& backend = vt::GetBackend(queue_.device.type);
+      void* p = backend.Alloc(elems * sizeof(uint16_t));
+      device_kv_[static_cast<size_t>(layer)] = p;
+      backend.Memset(queue_, p, 0, elems * sizeof(uint16_t));
+      kv.data = p;
+    } else {
+      kv_storage_[static_cast<size_t>(layer)].assign(elems, 0);
+      kv.data = kv_storage_[static_cast<size_t>(layer)].data();
+    }
     kv.dtype = vt::DType::kBF16;
     kv.num_blocks = kRows * blocks_per_row_;
     kv.block_size = block_size_;
     kv.num_kv_heads = c.num_key_value_heads;
     kv.head_size = c.head_dim;
     attn_kv_.push_back(kv);
+  }
+}
+
+Music3LmSession::~Music3LmSession() {
+  if (device_kv_.empty()) return;  // the CPU arm owns nothing to free
+  vt::Backend& backend = vt::GetBackend(queue_.device.type);
+  // Synchronize before freeing: the last step's kernels can still be reading the
+  // cache when the request returns, and a free racing a live kernel surfaces as
+  // a fault attributed to whatever allocates next.
+  backend.Synchronize(queue_);
+  for (void* p : device_kv_) {
+    if (p != nullptr) backend.Free(p);
   }
 }
 

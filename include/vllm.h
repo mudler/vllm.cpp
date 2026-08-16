@@ -249,7 +249,28 @@ extern "C" {
  * caller that never touches a speech symbol is byte-identical. A directory no
  * speech family claims is refused NAMING every family that was tried, because
  * the wrong family does not fail, it renders noise. */
-#define VLLM_ABI_VERSION 20
+/* v21 — vllm_speech_model_params.device + vllm_speech_engine_device, THE SPEECH
+ * LANE'S DEVICE SELECTOR (issue #672). v20 could only run a speech family on the
+ * CPU: MiniMax-Music3's queue was a compile-time constant, so a 28.5 GB music
+ * model was a host-only model whatever hardware the box had.
+ *
+ * 0 = CPU, 1 = the accelerator this build resolves. That is the
+ * vllm_video_model_params.device spelling, NOT vllm_model_params.device's
+ * 0=auto/1=cpu/2=cuda: the text engine's `auto` selects an accelerator when one
+ * exists, whereas a speech family's CPU path is what its correctness gates were
+ * taken on, so a ZERO-VALUE CALLER MUST KEEP GETTING THE CPU ARM. Device 1 on a
+ * build with no accelerator backend, or on a PARTIAL backend that declines the
+ * family's architecture, is REFUSED BY NAME at load rather than substituted.
+ *
+ * vllm_speech_engine_device reports what was GRANTED, not what was asked for —
+ * two different facts, and a benchmark that conflates them measures the CPU arm
+ * twice.
+ *
+ * Appended at the END of vllm_speech_model_params, so a zero-initialized v20
+ * struct keeps the CPU engine byte-identical. WHAT DEVICE 1 MOVES for Music3 is
+ * the 8.6B language model and nothing else yet; the RVQ depth decoder and the
+ * acoustic half are still host reference loops (see docs/FEATURES.md). */
+#define VLLM_ABI_VERSION 21
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -1019,6 +1040,13 @@ typedef struct vllm_speech_model_params {
    * DETECTS it by inspecting the artifact. An unregistered name is refused
    * naming what IS registered; it is never treated as a hint. */
   const char* family;
+  /* v21 — WHERE the family runs. 0 = CPU (the zero value, and the arm every
+   * Music3 correctness gate was taken on), 1 = the accelerator this build
+   * resolves. Anything else is refused. Device 1 with no accelerator backend
+   * registered, or on a PARTIAL backend that declines this family's
+   * architecture, is refused BY NAME at load — never silently substituted.
+   * Appended, so a zero-initialized v20 struct is byte-identical. */
+  int32_t device;
 } vllm_speech_model_params;
 
 typedef struct vllm_speech_params {
@@ -1090,6 +1118,14 @@ VLLM_API int32_t vllm_speech_engine_sample_rate(const vllm_speech_engine* engine
  * synthesize from text alone, and 0 for a NULL handle. Ask BEFORE building a
  * request, so a missing clip is a caller-side refusal rather than a failed job. */
 VLLM_API int32_t vllm_speech_engine_requires_reference_audio(const vllm_speech_engine* engine);
+/* v21 — the device this handle actually RESOLVED to, in the same encoding
+ * vllm_speech_model_params.device uses: 0 = CPU, 1 = an accelerator. 0 for a
+ * NULL handle.
+ *
+ * It reports what was GRANTED, which is not what was asked for. A caller that
+ * echoes back its own request cannot tell a device arm from a CPU arm with a
+ * flag set, and a speed comparison built on that measures one arm twice. */
+VLLM_API int32_t vllm_speech_engine_device(const vllm_speech_engine* engine);
 
 /* Run one BLOCKING synthesis, filling *out. Serialized per engine handle.
  * VLLM_ERR_INVALID_ARGUMENT for a NULL engine/params/out;

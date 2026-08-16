@@ -26,7 +26,7 @@
 | **MLX-LM** | Qwen3-0.6B, Apple M4 | 97.6% warm total, prefill ahead | near-tie |
 | **DwarfStar** | DeepSeek-V4-Flash GGUF, GB10 | **beats ds4, 1.144x** (18.69 vs 16.33 tok/s, byte-exact, default config) | n/a, GGUF peer |
 | **vLLM** | Kimi-Linear-48B-A3B, GB10 | no binding number: the published checkpoint is tiktoken-only, so it cannot drive the warm-server harness | golden 122/128, near-tie profile |
-| **Muse Glimmer 30B (#268)** | no vLLM denominator (pin lacks `muse_glimmer`); SECONDARY llama.cpp, same GGUF, idle GB10 | **vLLM axis is an OPEN GAP.** vs llama.cpp after the [#391](../.agents/specs/cpu-decode-barrier-and-attn-dispatch.md) fix: in128 prefill **1.023x** (was 0.878x); in512 decode **0.194x** (3.41x), prefill 0.175x flat | coherent, NOT token-exact |
+| **Muse Glimmer 30B (#268)** | no vLLM denominator (pin lacks `muse_glimmer`); SECONDARY llama.cpp, same GGUF, idle GB10, after the [#391 fix](../.agents/specs/cpu-decode-barrier-and-attn-dispatch.md) | **vLLM axis is an OPEN GAP.** vs llama.cpp: in128 prefill **1.023x** (was 0.878x); in512 decode **0.194x** (3.41x), prefill 0.175x flat. Denominator stock `7044859`, SUPERSEDED (#1003) | coherent, NOT token-exact |
 
 Reading the ratios: throughput is ours/reference, latency is reference/ours, so
 **1.0 or higher is a win** everywhere on this page. Which architecture each number
@@ -280,24 +280,41 @@ host mirror is freed once the device Marlin resident is built.
 | Scope | 4-core A76, DotProd, no i8mm; 20-core binding arm does NOT transfer. buildx/QEMU-built, Pi-executed unthrottled; hashes pinned in the [campaign spec](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md) |
 | Assembly vs compiler SDOT (one GCC 13.3 binary) | AAPCS64 leaf wall +3.66% M1/T1, +5.08% M128/T1, +3.69% M128/T4, with 9.74-10.24% fewer instructions; M1/T4 is the -2.43% residual ([assembly evidence](bench-evidence/rpi5-a76-q8-dot-20260806.md)) |
 | 64-token Qwen model gate | Byte-identical across x86, portable, SDOT and assembly arms; asm vs SDOT median TTFT -1.55%, TPOT neutral, E2E -0.13%; vs portable TTFT -33.40%, E2E -2.67%. Cortex-A76+DotProd selects assembly by default |
-| Same-file llama.cpp floor (pp17/tg64) | **NOT MET on speed**: prefill 12.81 vs 27.77 tok/s (0.461x), decode 2.55 vs 3.91 (0.653x), E2E 26,018.39 vs 16,998.49 ms ([competitor evidence](bench-evidence/rpi5-a76-llamacpp-20260806.md)) |
+| Same-file llama.cpp floor (pp17/tg64) | **NOT MET on speed**: prefill 12.81 vs 27.77 tok/s (0.461x), decode 2.55 vs 3.91 (0.653x), E2E 26,018.39 vs 16,998.49 ms ([competitor evidence](bench-evidence/rpi5-a76-llamacpp-20260806.md)); vs stock `b9892`, SUPERSEDED |
 | Peak RSS | **2.841 vs 3.747 GiB, 24.2% less**; 3 clean unthrottled reps; same-text 64-token greedy output byte-identical after trailing-newline normalization |
 | `PENDING` | Pi concurrency; BF16 GEMM / speed closure (the 2.17x prefill, 1.53x decode gap profiling is W6) |
 
 Same GGUF file both arms, `dgx.casa` GB10 aarch64 (20 cores), idle, 3 reps,
-llama.cpp `237ad9b96` built fresh on the same host.
+llama.cpp built fresh on the same host from `237ad9b96`. That commit is our own
+local-only fork, 65 performance commits deep, six of them on the CPU path, so
+this denominator is **SUPERSEDED** and every llama.cpp number on this page is
+owed a re-take against the new stock pin (#1003).
 
 | Axis | vllm.cpp | llama.cpp | Ratio | Result |
 |---|---:|---:|---:|---|
-| Prefill | **223.8 tok/s** | 177.3 | **1.18x** | **PASS** |
-| Decode | 24.7 tok/s | 25.4 | 0.97x | tie |
-| Peak memory | 2.83 GiB | 2.80 GiB | 1.01x | **PARITY** |
+| Prefill | **223.8 tok/s** | 177.3 | **1.18x** | **PASS**, denominator SUPERSEDED |
+| Decode | 24.7 tok/s | 25.4 | 0.97x | tie, denominator SUPERSEDED |
+| Peak memory | 2.83 GiB | 2.80 GiB | 1.01x | **PARITY**, denominator SUPERSEDED |
 
 Decode lands inside llama.cpp's own run-to-run spread, and the memory difference
 is 30 MiB on a 2.8 GiB working set. Prefill is the only axis with a real gap and
 it goes our way. Output tokens are **byte-identical** to llama.cpp's greedy
 decode and to our own CPU reference path. Single-stream only: we have not
-measured concurrent serving against llama.cpp's server.
+measured concurrent serving against llama.cpp's server. Seven favourable
+llama.cpp verdicts can flip when the denominator is re-taken, five on this page,
+one on the README, and prefill is not the most exposed. #1003 owes all seven. The
+set is swept over every tracked file, not listed: the query is in the
+[spec](../.agents/specs/oracle-llamacpp-repin-stock.md).
+
+| Flips first | Verdict | Exposure |
+|---|---|---|
+| 1 | Vulkan `BENCH-VK-LLAMA` decode 4.36 vs 4.35, `MET` | 0.23% margin inside a 0.69% 7-leg spread. Its own source calls it "a narrow pass, not a comfortable one", so any move can flip it. The README states it as "matches" |
+| 2 | Muse Glimmer in128 prefill `1.023x` (also `STATUS.md`) | 2.3% margin inside our own arm's 4.5% leg spread, n=4. Its denominator is already stock `7044859`, 84 commits from `b10451`, so the noise floor is what exposes it |
+| 3 | This table's peak memory `1.01x` PARITY and decode `0.97x` tie | ties by declaration, not wins. A denominator that moves at all in llama.cpp's favour turns both into recorded gaps |
+| 4 | keep-f16's `1.01x` RSS and "prefill `1.18x` AHEAD", quoted in product code for `VT_GGUF_KEEP_F16` default ON | that A/B trades ~10% prefill and ~1.4% decode for 1.05 GiB, and the recorded reason the prefill loss is OK IS this floor. The default is owed a decision, not just a re-wording |
+| 5 | `KERNEL-GEMM-CPU-TILED` NEON vs stock ggml sgemm, "at parity, ahead on 4 of 6 shapes" | off this page, in the kernel matrix. Bands overlap, 216-242 vs 208-215 GFLOP/s, and one shape is already behind |
+| 6 | This table's prefill `1.18x` PASS, and the same figure on the README | an 18% margin. Flipping it needs upstream's 624-commit window to beat our fork's CPU GDN and SSM_CONV work outright |
+| 7 | Pi 5 peak RSS 2.841 vs 3.747 GiB, `0.758x` | a 24.2% margin, and its denominator was already stock `b9892`, so only the 559 commits of `b9892`-to-`b10451` drift apply |
 
 **x86_64 arm, first measured 2026-08-11 (#433).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, a hairline OPEN GAP**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
 
@@ -403,6 +420,10 @@ FlashInfer `0.6.15.post1`, and the binding series selects it by explicit path an
 asserts that identity per leg. Speed figures labelled 0.25.0 ran the ROLLBACK the
 harness enforced until 2026-08-12 and are SUPERSEDED, never binding (#520).
 Correctness re-validated bit-identical across the advance, zero golden drift.
+The llama.cpp oracle is stock `b10451` since 2026-08-16, `gateable = no` until
+someone builds it (#857). Every llama.cpp figure here is SUPERSEDED and owed a
+re-take (#1003), and a sweep finds it ran one of **three** revisions, none of
+them the pin. The Reproduce table names all three.
 
 **Protocol.** Greedy, closed loop, three interleaved repetitions per point, one
 `flock` across the whole series, same-binary A/B for every lever, cold legs
@@ -463,7 +484,8 @@ built on it rather than keeping the flattering one.
 | vLLM 0.26 re-benchmark | Pending | Re-run the binding grids on the advanced pin |
 | MiniMax-H3 FP4 speed (W-FP4a) | **Measured GB10 (`row/H3-FP4-GPU-E2E`).** Marlin W4A16 byte-exact vs bf16; fp4 a memory win, 0.8x bf16/forward. Real-ckpt fp4-resident e2e RUNS (mp4/wav) | fp4 speed CLOSED. bf16-vs-quant A/B: ENCODER half MEASURED (§8.15), DiT half NOT (no bf16 render exists). Detail: benchmark-record + spec §8 |
 | LTX-2.5 axes | Speed `PENDING` (vllm-omni#6066 has no native 2.5), binding oracle too. **SIZE: 320x192/25f completes on GB10, 448x256 does not**; that render was REGISTER-conditioned, not prompted | Wall is the HOST VAE decode, not the pool: drain returns 0.11 GiB, byte-inert. 2 baselines UNRESOLVED (lock). A real-checkpoint PROMPTED render is OWED |
-| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`) | **Every axis `PENDING`, now OWED.** The pipeline runs end to end, so a forward pass exists to time; every gate was taken on CPU with `dgx.casa` down, and a CPU number against a graphed denominator is dishonest | Denominator: SGLang-Omni `748a0b43` in its production configuration (both CUDA graphs, compiled DIT and DAV, batched seeded sampling) |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`) | **Every axis vs the reference stays `PENDING`.** A PARTIAL device arm now exists (#672): only the 8.6B LM runs on the accelerator, so this is an internal two-arm number and NOT a parity ratio | Denominator: SGLang-Omni `748a0b43` in its production configuration (both CUDA graphs, compiled DIT and DAV, batched seeded sampling) |
+| MiniMax-Music3 device arm, Jetson Thor sm_110 (#672) | `--device 1` vs `--device 0`, same request/seed, idle box: 2 AR frames **846.6 vs 835.1 s (1.014x SLOWER)**; 10 frames **1430.4 vs 1512.1 s (0.946x)**. Fit: **-11.65 s/frame, +34.8 s fixed** | A third duration (the fit has no residual), and moving the depth decoder + DiT + vocoder, which are 5 of 6 stages and still host scalar loops |
 | MiniMax-H3 render coherence (`row/H3-RENDER-CLOSE` #77) | **CLOSED: a COHERENT scene on GB10.** #70/#74 white was wrong-PARTITION usage (t2va on the ref2va ckpt); t2va on the FL2VA GGUF renders a prompt-matched orange cat (adj-cos 0.95 vs 0.06, no patch-grid) | Verified first: t2va inputs byte-exact vs upstream; CUDA device==host at seq 1920. Follow-up `H3-TASK-PARTITION-GUARD`: the task/partition mismatch now RAISES 1:1 with `_resolve_task` (spec §8.6-8.7) |
 | MiniMax-H3 image conditioning (`row/H3-CONDITIONED-E2E`, `row/H3-VISION-SCATTER`, `row/H3-REF2VA-ASSEMBLY`) | **fl2va COHERENT; ref2va assembly bug FIXED+gated.** vision→cond scatter gated; ref2va block-dim double-division fixed + RED-first gated (128 vs 512) + a permanent ref2va DiT-forward rung (§8.10) | grid RE-ATTRIBUTED: with the fix ref2va grids in fp4 AND bf16, and t2va with no refs on the ref2va NVFP4 also grids while FL2VA-GGUF renders, so it is the **NVFP4 checkpoint/loader**, NOT assembly/fp4 (§8.10) |
 | MiniMax-H3 Thor render speed (sm_110, no FA2) | **34.6 s/step** at 864x480/124f/50 steps on Q4_K_M, **16.6x** off 574.5 (render ~28 min, was ~8 h). Landed: warp-per-query, chunked warp reduce-scatter (1.76x), bf16 `mma.sync` (9.82x) | Shared-memory K/V tiling (23% SLOWER) and register Q-blocking (-0.8%) both measured and REVERTED: memory traffic is not the bound (one head's K+V is 3.9 MB against 32 MB of L2) |
@@ -476,7 +498,7 @@ built on it rather than keeping the flattering one.
 | Memory footprint vs declared workload (`ROAD-V1-MEM`, #83) | **Never measured, and not measurable today**: there is no auto-sizing to compare against, because the KV pool is a hand-typed `--num-blocks`, so "what the run actually needed" has no number | Once M1's `MemoryBudget` lands: predicted-vs-actual bytes per allocation class, then peak footprint ours-auto vs vLLM at its 0.9 default on the same model and config |
 | Startup latency (cold to first `/health`) | **36.51 s vs vLLM 0.25.0's 221.51 s = 6.07x** (medians of 3, 27B-NVFP4, GB10). PROVISIONAL: 3 of 6 legs contended, repeat killed by a host reboot. [Detail](../.agents/benchmark-record.md) | Uncontended 3-rep re-run on a quiet box |
 | Speculation depth (`ROAD-V1-D3-SPEC-K`, #81) | **PENDING.** Depth is configurable (`SPEC-MTP-K-GT-1`) and CPU-gated at k=1..4. NO speed number at any k>1: the GPU was held throughout ([spec](../.agents/specs/mtp-k-gt-1.md)) | k=2..4 three-way greedy gate on 27B and 35B (our-ON == our-OFF == vLLM-ON), then the c1/c>1 A/B at matched k + the per-workload (prose vs code) acceptance-vs-depth curve any depth policy needs |
-| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | 25 NATIVE (+8 GDN). **27B prefill 21.5x**; decode **4.36 vs 4.35, MET** (7 clean legs). Smart barriers skip 19.8%/tok, GPU -1.09 ms; e2e 8/12, unresolved. OFF. [source](../benchmarks/demo/vulkan_27b_llamacpp.json) | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not vs a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, same GGUF, three columns |
+| Vulkan vs llama.cpp Vulkan ([`BENCH-VK-LLAMA`](../benchmarks/demo/vulkan_27b_llamacpp.json)) | 25 NATIVE (+8 GDN). **27B prefill 21.5x, a SELF-ratio not a llama.cpp one**; decode **4.36 vs 4.35, MET**, denominator SUPERSEDED (7 clean legs). Smart barriers skip 19.8%/tok, GPU -1.09 ms; e2e 8/12, unresolved. OFF. | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, SUPERSEDED, same GGUF, 3 columns |
 | ROCm (`BACKEND-GATE-ROCM-VLLM` / `-SGLANG`) | **PENDING: no binding throughput number.** Runtime-green on 5 gfx archs. Gemma-3 is 48/48 exact vs two vLLM-ROCm oracles; Qwen3.5-0.8B correctness remains open | Same model, quantization, request shape and cache policy vs pinned vLLM-ROCm on one idle AMD host. Add equivalent SGLang; close correctness first ([#41](https://github.com/mudler/vllm.cpp/issues/41)) |
 | Tenstorrent Blackhole (`BACKEND-TENSTORRENT`) | **NOT APPLICABLE (speed).** Correctness: OPT-125m STRICT 6/6 e2e on real hardware. Qwen3-0.6B has a device-specific golden and short 4-token warm smoke (~0.28 tok/s), not a completed speed run | Full 16x16 Qwen3 gate, then device-resident tensors + `ttnn::sdpa_decode` before any performance comparison. [Spec](../.agents/specs/tenstorrent-backend.md) |
 | Mistral-7B-v0.3 on Tenstorrent (`BACKEND-TENSTORRENT-MISTRAL`) | **PENDING (speed).** First data point: 4.26 tok/s warm, batch 1, 32 tok, single run on a P150. Not a gate, not reproduced. No vLLM ratio exists or can (no TT backend). Correctness 16/16 | Reproduce idle with a same-binary A/B before quoting. [Record](../.agents/benchmark-record.md), [spec](../.agents/specs/tenstorrent-mistral.md) |
@@ -501,7 +523,9 @@ built on it rather than keeping the flattering one.
 | Laguna NVFP4 decode | `flock $HOME/gpu.lock ./build-cuda/examples/laguna-gen --model ~/laguna-xs-nvfp4 --gpu` (that directory holds the S-2.1 checkpoint); `drop_caches` first, create the CUDA context before loading weights |
 | DeepSeek-V4-Flash decode | `deepseek-v4-gen --gpu --kv-cache` on `ds4flash.gguf`, captured under tmux |
 | Metal vs MLX-LM | Paired A/B harness, interleaved runs, cold legs discarded |
-| Vulkan vs llama.cpp Vulkan | Same GGUF both arms: ours `-DVLLM_CPP_VULKAN=ON`, llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` via `llama-bench`; clean legs only, one `flock $HOME/gpu.lock`. GEMV sweep: `benchmarks/vulkan_gemv_ab.cpp` |
+| Vulkan vs llama.cpp Vulkan | Same GGUF both arms: ours `-DVLLM_CPP_VULKAN=ON`, llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96`, SUPERSEDED, via `llama-bench`; clean legs only, one `flock $HOME/gpu.lock`. GEMV sweep: `benchmarks/vulkan_gemv_ab.cpp` |
+| Which llama.cpp a figure ran | Three revisions on this page, all SUPERSEDED (#1003): fork `237ad9b96` (GB10 CPU, Vulkan, x86, kernel matrix), stock `b9892` (Pi 5), stock `7044859` (Muse Glimmer, #391). Pin is stock `b10451`, unbuilt (#857) |
+| Revisions repo-wide | **Five**, not three, enumerated in the [spec](../.agents/specs/oracle-llamacpp-repin-stock.md). Absent here: stock `030ebb5` (NON-BINDING) and a Poolside fork BRANCH with no commit recorded, behind Laguna's `27.8 tok/s` |
 
 Build flags, environment variables, and the full gate list are in
 [BUILD.md](BUILD.md) and [ENVIRONMENT.md](ENVIRONMENT.md).

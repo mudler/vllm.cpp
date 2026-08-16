@@ -11,7 +11,7 @@ the agent-facing parity inventory with upstream file references see
 **Legend.** ✅ supported and gated. ◐ partial, usable with named gaps. ☐ not yet.
 n/a means the feature does not apply to that engine's design.
 
-Reference versions: vLLM 0.26.0.dev0, SGLang v0.5.15, llama.cpp `237ad9b96`,
+Reference versions: vLLM 0.26.0.dev0, SGLang v0.5.15, llama.cpp `b10451`,
 MLX-LM as of 2026-07. Competitor columns describe what those projects ship, and
 are our reading of their documented behavior, not measurements.
 
@@ -66,7 +66,7 @@ are our reading of their documented behavior, not measurements.
 
 | Format | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
-| NVFP4 (W4A4 and W4A16 Marlin) | ✅ | ✅ | ✅ | ✅ in GGUF, not safetensors (#979). Was wrongly ☐: `GGML_TYPE_NVFP4 = 40` (`ggml.h:430`), CUDA MMQ and the ModelOpt repacking converter are UPSTREAM at pin `237ad9b96`, the sm_121a GEMMs fork-local |
+| NVFP4 (W4A4 and W4A16 Marlin) | ✅ | ✅ | ✅ | ✅ in GGUF, not safetensors (#979). Was wrongly ☐: `GGML_TYPE_NVFP4 = 40` (`ggml.h:430`), CUDA MMQ and the ModelOpt repacking converter are UPSTREAM at pin `b10451`, the sm_121a GEMMs fork-local |
 | NVFP4 dense sinks take vLLM's dense Marlin, not the single-expert MoE route | ✅ `VT_MARLIN_DENSE` (single projection, `efa6e40d`) + `VT_MARLIN_DENSE_PAIR` (fused shared-expert gate_up), both default-ON; the pair sink measured +1.31% at c8 / +1.38% at c4 on 35B-A3B, SACRED 315/315 + 235/235 | ☐ | ☐ | ☐ |
 | Dense W4A16 MLP runs ONE merged `gate_up` Marlin GEMM (vLLM's `MergedColumnParallelLinear` topology) | ✅ `VT_DENSE_MARLIN_GATEUP`, **default ON** (opt out `=0`): the A/B measured +2.12% c1 / +1.70% c8 on the 27B, arms separated, tokens identical (#365). Replaces the split pair's 193 Marlin calls/step vs the oracle's 129 | ✅ | ☐ | ☐ |
 | NVFP4 shared-expert `down_proj` kept bf16 (no f32 round-trip) | ✅ `VT_SHARED_DOWN_BF16` default-ON; bit-identical (both consumers widen bf16 in-kernel and re-round on store), SACRED 315/315 + 235/235 on BOTH arms with unchanged assertion counts; +2.05% c8 / +0.79% c4 on 35B-A3B | ☐ | ☐ | ☐ |
@@ -165,7 +165,7 @@ in `ltx2_text_encoder.cpp` is the call that would have to change.
 | Whisper audio encoder | openai/whisper-small; whisper-large-v3 (Voxtral cfg) | encoder tower 77/77; large-v3 tower 203/203 | pending |
 | MiniMax-H3 DiT (`MiniMaxH3DiTModel`, vllm-omni lane) | MiniMax-H3 (33.1B video+audio) | portable 79/79; all three modalities COHERENT on Q4_K_M (§8.20); PRUNED ckpts run, Q8_0 seam 0.9941 (§8.21); ref2va grid was NVFP4 quant error, §8.9 REFUTED; GGUF/NVFP4/bf16 shards stream | FP4/Marlin landed; speed pending; no bf16 render yet. Render from the Q4_K_M GGUF, not the NVFP4 arm. Krea 2 text-to-image (roadmap C11) is scoped to reuse these DiT seams |
 | LTX-2.5 DiT (`LTX2VideoTransformer3DModel`, Lightricks lane) | LTX-2.5 (21.00B video+audio) | `SPIKE`. DiT, VAEs+ENCs, cond, pipeline, quant loaders gated, reduced dims. Prompt AdaLN host+dev; Gemma-4->xattn FIXTURE-gated. Img chain PPM->resize->encode->place->noise. Temporal x2 ups gated, UNDRIVEN. Render OWED | `ltx-2.5`/`ltx2-gen`. ~29 GB NVFP4/GB10, FP8 ~44 GB, +24 GB tower. FP8/torchao/NVFP4; kf abs-pos ported; BOTH DiTs load, NO `allow_unported`. IMG+LAST kf SERVED `crf=0`, A2V WAV+LoRA; DiffVAE/ref refused. PENDING |
-| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, diffusers lane) | MiniMax-Music3 (8.6B Qwen3 LLM + 0.646B RVQ decoder + 2.4B fp32 DiT + DAC Flow-VAE); diffusers arm, ~28.5 GB | `ACTIVE`. Loader 1413/1413; AR, acoustic and the 8.6B LM forward all gated vs real weights; `SpeechRegistry` + `vllm_speech_*` v20 + `/v1/audio/speech`; GGUF Q4_K depth decoder value-gated. HTTP request OBSERVED (#852) | Not measured. The denominator will be SGLang-Omni in its production configuration (both CUDA graphs, compiled DIT and DAV, batched seeded sampling) |
+| MiniMax-Music3 (`MiniMaxMusic3ForConditionalGeneration`, diffusers lane) | MiniMax-Music3 (8.6B Qwen3 LLM + 0.646B RVQ decoder + 2.4B fp32 DiT + DAC Flow-VAE); diffusers arm, ~28.5 GB | `ACTIVE`. Loader 1413/1413; AR, acoustic and the 8.6B LM forward all gated vs real weights; `SpeechRegistry` + `vllm_speech_*` v21 + `/v1/audio/speech`; GGUF Q4_K depth decoder value-gated. HTTP request OBSERVED (#852) | Not compared to a reference. PARTIAL device arm (`--speech-device 1`, #672): the 8.6B LM only; see BENCHMARKS. Denominator will be SGLang-Omni in production configuration |
 | LTX-2.5 DFR base + generated keyframe slots | LTX-2.5 (21.00B video+audio) | gated vs EXECUTED upstream `dfr_layout` + 3 `dfr_pipeline` helpers @ `fd4ded7f` (`test_ltx2_dfr` 11/11, 652 assertions); canvas, tiles, stitch, carry-forward as EXACT index vectors, since each defect is plausible| `--pipeline-kind dfr`. Canvas PADS 9 to 25 then trims back; slots on the x8 grid, MARKED, read back BEFORE the trim. `num_generated_keyframes` SERVED elsewhere. Temporal ROUNDS refused (#986); detail LoRA refused (#975)|
 | LTX-2.5 tiled + streaming Conv VAE decode | LTX-2.5 video VAE | gated vs executed upstream `ltx_core` @ `fd4ded7f` (`test_ltx2_tiling` 10/10, 915 assertions); one-tile and untiled-spatial controls BIT-EXACT vs untiled on both causality arms; an untiled frames axis is REFUSED | Streams temporal chunks through upstream's AUTO layout (768/64 px, 80/24 frames); above one tile the pixel volume is never materialized. NO-OP below 768px and 81 frames; 81-120 IS tiled, differing 6.70% of range |
 | LTX-2.5 Conv VAE decode arithmetic width | LTX-2.5 video VAE | `test_ltx2_vae` "the decode's convolution accumulates in f32", entering through `Ltx2VideoDecodeStreaming`; widening the accumulator to `double`, or deleting the production call site, each turns it RED | **f32**, the width `F.conv3d` uses at f32 AND bf16 (MEASURED). Was f64 at 8 sites ([#1008](https://github.com/mudler/vllm.cpp/issues/1008)). Conv sums BLOCKED per input channel, as torch's. STORAGE stays f32; bf16 owed |
@@ -248,7 +248,7 @@ both refuse, naming what is missing.
 | Backend | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
 | CUDA | ✅ sm_80 to sm_121a | ✅ | ✅ | ✅ |
-| CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open) | ✅ | ◐ | ☐ | ✅ |
+| CPU (x86, Arm i8mm; A76 assembly correct/default, llama speed gate open, and the closed 20-core floor ran a SUPERSEDED fork denominator rather than the stock `b10451` pin, re-take owed #1003) | ✅ | ◐ | ☐ | ✅ |
 | Metal (Apple Silicon) | ✅ | ☐ | ☐ | ✅ |
 | Vulkan | ◐ | ☐ | ☐ | ✅ |
 | ROCm | W0 verified on 5 gfx archs; dense and GDN models run all-native. Strict CPU parity is open in the measured near-tie regime (#269) | 44 registered ops including full GDN; ctest-green gfx1151/1103/1100/1201/1200 ([#41](https://github.com/mudler/vllm.cpp/issues/41)). APU managed allocation is unverified. [ROCM.md](ROCM.md) | ✅ | ✅ |
@@ -264,14 +264,14 @@ Qwen3-1.7B-NVFP4A16). That is a kernel-level result, not a token-exact
 model-level gate.
 
 Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact,
-6/6 prompts vs the vLLM 0.25.0 oracle, every op of that model dispatched
-natively with **zero provider declines**. Qwen3.6-27B runs too, both GDN
-recurrences and the fused attention preamble native: **decode 4.36 tok/s vs
-llama.cpp's 4.35, parity met narrowly**, and **prefill 21.5x** (GB10). A load
-keeps **one** copy of the weights, not two, and is 1.54x faster warm: 27B peak
-RSS 100.8 GiB before, **53.4 GiB** now. Still partial at 25 natively registered
-ops of 112 (8 are GDN), the rest on the portable CPU tier; quant/MoE/MLA have
-none at all.
+6/6 prompts vs the vLLM 0.25.0 oracle, every op dispatched natively with **zero
+provider declines**. Qwen3.6-27B runs too, both GDN recurrences and the fused
+attention preamble native: **decode 4.36 tok/s vs llama.cpp's 4.35, parity met
+narrowly**, denominator SUPERSEDED (#1003), and prefill **21.5x**, a SELF-ratio
+(GB10). A load keeps **one** copy of the weights, not two, and is 1.54x faster
+warm: 27B peak RSS 100.8 -> **53.4 GiB**. Still partial at 25 natively
+registered ops of 112 (8 GDN), the rest on the portable CPU tier; quant/MoE/MLA
+have none.
 Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 
 ## Serving, API and operations

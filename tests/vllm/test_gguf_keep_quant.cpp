@@ -477,8 +477,21 @@ TEST_CASE("GgufLoadPolicy::FromEnv reads VT_CPU_REF and VT_GGUF_KEEP_QUANT") {
     CHECK(p.expand_nk == vllm::GgufQuantComputeAvailable());
     // L7 (2026-07-23): keep-f16 is now DEFAULT ON wherever expand_nk holds — the
     // repack-source release + load-time prefault removed L6's two objections
-    // (RSS-neutral, prefill regression), so it measures 1.01x llama.cpp RSS with
-    // prefill/decode at-or-ahead and byte-identical tokens.
+    // (RSS-neutral, prefill regression), so it buys 1.05 GiB of peak RSS with
+    // byte-identical tokens. Its llama.cpp denominators are SUPERSEDED (fork
+    // 237ad9b96, re-take owed under #1003, see gguf_keep_quant.cpp).
+    //
+    // This CHECK pins the DEFAULT, not the trade behind it, and separating the
+    // two matters here. An earlier pass recorded the default as independent of
+    // the contaminated floor, because the L7 acceptance is a same-binary
+    // ours-versus-ours A/B. That reads one row of a three-row table: prefill
+    // (~10%, 224 -> 204 t/s) and decode (~1.4%) BOTH regress to buy that RSS, and
+    // the recorded reason the prefill loss is acceptable is "comfortably above
+    // the competitor floor", which IS the contaminated pp128. If #1003's re-take
+    // puts stock above 204 t/s, that justification is gone and the default
+    // becomes a live question for QUANT-GGUF-KEEPQ-LOADER. Should that happen,
+    // THIS assertion is one of the things that has to change, so it is flagged
+    // here rather than discovered when it goes red.
     CHECK(p.keep_f16 == vllm::GgufQuantComputeAvailable());
     CHECK_FALSE(p.cpu_ref);
   }

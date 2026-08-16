@@ -280,24 +280,29 @@ host mirror is freed once the device Marlin resident is built.
 | Scope | 4-core A76, DotProd, no i8mm; 20-core binding arm does NOT transfer. buildx/QEMU-built, Pi-executed unthrottled; hashes pinned in the [campaign spec](../.agents/specs/rpi5-cortex-a76-cpu-optimization.md) |
 | Assembly vs compiler SDOT (one GCC 13.3 binary) | AAPCS64 leaf wall +3.66% M1/T1, +5.08% M128/T1, +3.69% M128/T4, with 9.74-10.24% fewer instructions; M1/T4 is the -2.43% residual ([assembly evidence](bench-evidence/rpi5-a76-q8-dot-20260806.md)) |
 | 64-token Qwen model gate | Byte-identical across x86, portable, SDOT and assembly arms; asm vs SDOT median TTFT -1.55%, TPOT neutral, E2E -0.13%; vs portable TTFT -33.40%, E2E -2.67%. Cortex-A76+DotProd selects assembly by default |
-| Same-file llama.cpp floor (pp17/tg64) | **NOT MET on speed**: prefill 12.81 vs 27.77 tok/s (0.461x), decode 2.55 vs 3.91 (0.653x), E2E 26,018.39 vs 16,998.49 ms ([competitor evidence](bench-evidence/rpi5-a76-llamacpp-20260806.md)) |
+| Same-file llama.cpp floor (pp17/tg64) | **NOT MET on speed**: prefill 12.81 vs 27.77 tok/s (0.461x), decode 2.55 vs 3.91 (0.653x), E2E 26,018.39 vs 16,998.49 ms ([competitor evidence](bench-evidence/rpi5-a76-llamacpp-20260806.md)); vs stock `b9892`, SUPERSEDED |
 | Peak RSS | **2.841 vs 3.747 GiB, 24.2% less**; 3 clean unthrottled reps; same-text 64-token greedy output byte-identical after trailing-newline normalization |
 | `PENDING` | Pi concurrency; BF16 GEMM / speed closure (the 2.17x prefill, 1.53x decode gap profiling is W6) |
 
 Same GGUF file both arms, `dgx.casa` GB10 aarch64 (20 cores), idle, 3 reps,
-llama.cpp `237ad9b96` built fresh on the same host.
+llama.cpp built fresh on the same host from `237ad9b96`. That commit is our own
+local-only fork, 65 performance commits deep, six of them on the CPU path, so
+this denominator is **SUPERSEDED** and every llama.cpp number on this page is
+owed a re-take against the new stock pin (#1003).
 
 | Axis | vllm.cpp | llama.cpp | Ratio | Result |
 |---|---:|---:|---:|---|
-| Prefill | **223.8 tok/s** | 177.3 | **1.18x** | **PASS** |
-| Decode | 24.7 tok/s | 25.4 | 0.97x | tie |
-| Peak memory | 2.83 GiB | 2.80 GiB | 1.01x | **PARITY** |
+| Prefill | **223.8 tok/s** | 177.3 | **1.18x** | **PASS**, denominator SUPERSEDED |
+| Decode | 24.7 tok/s | 25.4 | 0.97x | tie, denominator SUPERSEDED |
+| Peak memory | 2.83 GiB | 2.80 GiB | 1.01x | **PARITY**, denominator SUPERSEDED |
 
 Decode lands inside llama.cpp's own run-to-run spread, and the memory difference
 is 30 MiB on a 2.8 GiB working set. Prefill is the only axis with a real gap and
 it goes our way. Output tokens are **byte-identical** to llama.cpp's greedy
 decode and to our own CPU reference path. Single-stream only: we have not
-measured concurrent serving against llama.cpp's server.
+measured concurrent serving against llama.cpp's server. The prefill `1.18x` is
+the only llama.cpp verdict on this page recorded as a win, so it is the only one
+the re-take can flip against us.
 
 **x86_64 arm, first measured 2026-08-11 (#433).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, a hairline OPEN GAP**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
 
@@ -403,6 +408,9 @@ FlashInfer `0.6.15.post1`, and the binding series selects it by explicit path an
 asserts that identity per leg. Speed figures labelled 0.25.0 ran the ROLLBACK the
 harness enforced until 2026-08-12 and are SUPERSEDED, never binding (#520).
 Correctness re-validated bit-identical across the advance, zero golden drift.
+The llama.cpp oracle is stock `b10451` since 2026-08-16, `gateable = no` until
+someone builds it (#857). Every llama.cpp figure here ran the former pin
+`237ad9b96`, our own fork, so all are SUPERSEDED and owed a re-take (#1003).
 
 **Protocol.** Greedy, closed loop, three interleaved repetitions per point, one
 `flock` across the whole series, same-binary A/B for every lever, cold legs
@@ -501,7 +509,7 @@ built on it rather than keeping the flattering one.
 | Laguna NVFP4 decode | `flock $HOME/gpu.lock ./build-cuda/examples/laguna-gen --model ~/laguna-xs-nvfp4 --gpu` (that directory holds the S-2.1 checkpoint); `drop_caches` first, create the CUDA context before loading weights |
 | DeepSeek-V4-Flash decode | `deepseek-v4-gen --gpu --kv-cache` on `ds4flash.gguf`, captured under tmux |
 | Metal vs MLX-LM | Paired A/B harness, interleaved runs, cold legs discarded |
-| Vulkan vs llama.cpp Vulkan | Same GGUF both arms: ours `-DVLLM_CPP_VULKAN=ON`, llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` via `llama-bench`; clean legs only, one `flock $HOME/gpu.lock`. GEMV sweep: `benchmarks/vulkan_gemv_ab.cpp` |
+| Vulkan vs llama.cpp Vulkan | Same GGUF both arms: ours `-DVLLM_CPP_VULKAN=ON`, llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96`, SUPERSEDED, via `llama-bench`; clean legs only, one `flock $HOME/gpu.lock`. GEMV sweep: `benchmarks/vulkan_gemv_ab.cpp` |
 
 Build flags, environment variables, and the full gate list are in
 [BUILD.md](BUILD.md) and [ENVIRONMENT.md](ENVIRONMENT.md).

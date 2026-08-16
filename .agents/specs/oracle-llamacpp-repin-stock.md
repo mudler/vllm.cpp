@@ -84,12 +84,10 @@ upstream does not have.
 1. `.agents/oracles/llama-cpp.md`: the pin, the label, `gateable`, the evidence
    pointer, the two factual errors in its prose, and a new clean-tree
    requirement.
-2. `.agents/upstream-inventory.json`: the `llamacpp` value, which is a second
-   live transcription of the same pin.
-3. `docs/BENCHMARKS.md`, `docs/FEATURES.md`: the present-tense claims that name
+2. `docs/BENCHMARKS.md`, `docs/FEATURES.md`: the present-tense claims that name
    `237ad9b96` as the reference a reader can build.
-4. `.agents/issue-index.md`: append two rows, for #857 and #1003.
-5. This spec, which carries the enumeration of every contaminated measurement.
+3. `.agents/issue-index.md`: append two rows, for #857 and #1003.
+4. This spec, which carries the enumeration of every contaminated measurement.
 
 **Out of scope, deliberately.**
 
@@ -104,6 +102,17 @@ upstream does not have.
 - **Touching the developer's llama.cpp checkouts.** `/home/mudler/_git/llama.cpp`
   and `/home/mudler/_git/llama.cpp-mtp-imatrix` are read-only to this row. No
   fetch, no commit, no build.
+- **`.agents/upstream-inventory.json`.** Its `pins.llamacpp` value reads
+  `237ad9b96` and looks like a second transcription of the oracle pin. It is
+  not. `scripts/upstream-inventory.py:206` emits it as
+  `head_of(path)[:9]` over `$LLAMACPP_SOURCE`, which defaults to
+  `~/_git/llama.cpp`, so it is a derived snapshot of the developer's checkout
+  HEAD. The two values coincide today only because that checkout sits on branch
+  `localai-paged`. Editing it would assert something false and turn the
+  `upstream-inventory --check` gate red, because the checkout has not moved.
+  Recorded here because the coincidence is exactly the kind that gets
+  "reconciled" by a later reader into a defect.
+
 - **Any lifecycle state change.** No matrix row moves state here, so this row
   owes no `docs/STATUS.md` edit and writes no `## Now` lifecycle transition into
   another row's spec. Whether `BACKEND-GATE-CPU-LLAMACPP` should leave its closed
@@ -248,7 +257,7 @@ because every other one is already recorded as a gap or a tie.
 
 ## Design
 
-Four record edits, no code.
+Three record edits, no code.
 
 1. **`.agents/oracles/llama-cpp.md`.** Rewrite the prose to state what the
    oracle is, drop the circular fork justification, add the clean-tree
@@ -269,12 +278,7 @@ Four record edits, no code.
    the replacement on dgx.casa". #1003 owes the re-take of the numbers, which is
    the later obligation.
 
-2. **`.agents/upstream-inventory.json`.** Its `llamacpp` key is a live second
-   transcription of the pin. Leaving it would leave the tree contradicting
-   itself, and `scripts/agent-preflight.sh` runs an `upstream-inventory` check
-   over it.
-
-3. **`docs/FEATURES.md` and `docs/BENCHMARKS.md`.** Both carry present-tense
+2. **`docs/FEATURES.md` and `docs/BENCHMARKS.md`.** Both carry present-tense
    claims naming `237ad9b96` as a reference a reader can build.
    `docs/FEATURES.md:14` states the reference version. `docs/BENCHMARKS.md:288`
    states the denominator "built fresh on the same host", and `:479` and `:504`
@@ -284,7 +288,7 @@ Four record edits, no code.
    present-tense claim about which oracle is pinned is not narrative, and a past
    run keeps saying what it ran.
 
-4. **`.agents/issue-index.md`.** Append two rows at end of file, for #857 and
+3. **`.agents/issue-index.md`.** Append two rows at end of file, for #857 and
    #1003, both naming row `ORACLE-LLAMACPP-REPIN-STOCK`. Append only. Neither
    raises the unowned-row count that `scripts/check-agent-record.py` ratchets,
    because both name an owning row.

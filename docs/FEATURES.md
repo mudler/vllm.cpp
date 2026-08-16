@@ -11,7 +11,7 @@ the agent-facing parity inventory with upstream file references see
 **Legend.** ✅ supported and gated. ◐ partial, usable with named gaps. ☐ not yet.
 n/a means the feature does not apply to that engine's design.
 
-Reference versions: vLLM 0.26.0.dev0, SGLang v0.5.15, llama.cpp `237ad9b96`,
+Reference versions: vLLM 0.26.0.dev0, SGLang v0.5.15, llama.cpp `b10451`,
 MLX-LM as of 2026-07. Competitor columns describe what those projects ship, and
 are our reading of their documented behavior, not measurements.
 
@@ -66,7 +66,7 @@ are our reading of their documented behavior, not measurements.
 
 | Format | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|
-| NVFP4 (W4A4 and W4A16 Marlin) | ✅ | ✅ | ✅ | ✅ in GGUF, not safetensors (#979). Was wrongly ☐: `GGML_TYPE_NVFP4 = 40` (`ggml.h:430`), CUDA MMQ and the ModelOpt repacking converter are UPSTREAM at pin `237ad9b96`, the sm_121a GEMMs fork-local |
+| NVFP4 (W4A4 and W4A16 Marlin) | ✅ | ✅ | ✅ | ✅ in GGUF, not safetensors (#979). Was wrongly ☐: `GGML_TYPE_NVFP4 = 40` (`ggml.h:430`), CUDA MMQ and the ModelOpt repacking converter are UPSTREAM at pin `b10451`, the sm_121a GEMMs fork-local |
 | NVFP4 dense sinks take vLLM's dense Marlin, not the single-expert MoE route | ✅ `VT_MARLIN_DENSE` (single projection, `efa6e40d`) + `VT_MARLIN_DENSE_PAIR` (fused shared-expert gate_up), both default-ON; the pair sink measured +1.31% at c8 / +1.38% at c4 on 35B-A3B, SACRED 315/315 + 235/235 | ☐ | ☐ | ☐ |
 | Dense W4A16 MLP runs ONE merged `gate_up` Marlin GEMM (vLLM's `MergedColumnParallelLinear` topology) | ✅ `VT_DENSE_MARLIN_GATEUP`, **default ON** (opt out `=0`): the A/B measured +2.12% c1 / +1.70% c8 on the 27B, arms separated, tokens identical (#365). Replaces the split pair's 193 Marlin calls/step vs the oracle's 129 | ✅ | ☐ | ☐ |
 | NVFP4 shared-expert `down_proj` kept bf16 (no f32 round-trip) | ✅ `VT_SHARED_DOWN_BF16` default-ON; bit-identical (both consumers widen bf16 in-kernel and re-round on store), SACRED 315/315 + 235/235 on BOTH arms with unchanged assertion counts; +2.05% c8 / +0.79% c4 on 35B-A3B | ☐ | ☐ | ☐ |

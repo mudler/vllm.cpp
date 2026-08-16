@@ -1570,34 +1570,452 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS
   }
 }
 
-TEST_CASE("ltx2 video: GENERATED keyframe slots are refused BY WHAT IS MISSING, not as a typo") {
-  // Row LTX25-GENERATED-KEYFRAMES (#920). This is the OTHER feature called
-  // "keyframe", and the distinction is the whole point of the case above:
+TEST_CASE("ltx2 video: GENERATED keyframe slots are SERVED, and the marker reaches them") {
+  // Row LTX25-DFR-PIPELINE (#986). This case REPLACES the refusal case row
+  // LTX25-GENERATED-KEYFRAMES (#920) landed, and the replacement is itself the
+  // record of what changed.
+  //
+  // #920 defined `num_generated_keyframes` and refused any positive count,
+  // naming ONE blocker: the READBACK. Its message declared `ABSENT HERE:
+  // GeneratedKeyframe, generated_keyframe` and this suite re-derived those names
+  // against `ltx2_conditioning.h` — a tripwire whose own spec (section 4a of
+  // `.agents/specs/ltx25-generated-keyframes.md`) said in terms: "If the readback
+  // lands, `GeneratedKeyframe` appears in the header, ABSENT goes red, and
+  // whoever landed it is told the refusal is now false."
+  //
+  // It landed, the tripwire fired, and the assertions are RETIRED WITH THE
+  // REFUSAL THEY DESCRIBED rather than widened. `AGENTS.md` forbids making a red
+  // gate green by deleting an assertion; this is the other case, where the
+  // SUBJECT of the assertion no longer exists, so each one is replaced by an
+  // assertion about what replaced it.
+  //
+  // This is still the OTHER feature called "keyframe", and the distinction is
+  // still the point:
   //
   //   supplied  -> `VideoConditionByKeyframeIndex`, content from the caller,
   //                appended with `marked=False` (keyframe_cond.py:84-86)
   //   GENERATED -> `VideoGeneratedKeyframeSlots`, content from the MODEL,
   //                appended with `marked=True` (keyframe_slots.py:121)
   //
-  // `extend_keyframes_mask`'s `marked` argument (conditioning/mask_utils.py:76-107)
-  // is the only difference, and `keyframe_slots.py:121` is upstream's only call
-  // site that passes True. So generated slots are the ONLY user-facing feature
-  // that puts #658's trained marker on a token other than the target's own first
-  // latent frame -- and `KeyframeInterpolationPipeline` is NOT that feature: it
-  // builds only `VideoConditionByKeyframeIndex` items through
-  // `image_conditionings_by_adding_guiding_latent` (utils/helpers.py:343-367)
-  // and does not appear in the feature's own applies-to list
-  // (ltx-pipelines/docs/conditioning.md:47-51).
-  //
-  // Upstream reaches it as `--num-generated-keyframes`, `type=int`, `default=0`
-  // (ltx-pipelines/utils/args.py:833-844), forwarded to the FIRST diffusion
-  // stage only. That is a per-CALL argument, so it is a per-generation extra
-  // here rather than a load option.
+  // WHY THIS CASE LEANS ON THE TRACE AND NOT ON PIXELS. A generated keyframe
+  // slot is INVISIBLE to the rendered clip: its tokens are appended, denoised,
+  // read back, and then trimmed away before unpatchify. A build that placed no
+  // slots at all returns a video of the same shape, the same frame count and the
+  // same byte size. There is nothing in the artifact to compare, which is why
+  // the engine reports what it did to the STATE.
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
-  // Phase 0 only: this case is about the REQUEST being resolved, and the
-  // zero-is-off arm has to complete a render to prove it. The upsampler is a
-  // second, unrelated refusal.
+  // Phase 0 only: the second phase needs the latent spatial upsampler, which is
+  // a separate and unrelated refusal.
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  auto refusal = [&](const char* key, const char* value, const char* dir) {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + dir);
+    gen.extras[key] = value;
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK(key << "=" << value << " must be refused, never dropped");
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+
+  SUBCASE("a positive count places slots, reads them back, and MARKS every token") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/gk2");
+    gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = "2";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+    // The clip is unchanged in every dimension a caller can see. Asserted rather
+    // than assumed, because it is what makes the trace the only instrument.
+    CHECK(result.frame_count == 9);
+    CHECK(result.width == 32);
+    CHECK(result.height == 32);
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    REQUIRE(trace.slot_positions.size() == 2);
+    // `evenly_spaced_keyframe_positions` (utils/helpers.py:370-381) on 9 frames
+    // with n=2 is `linspace(0, 8, 4).round()[1:-1]` = {3, 5}. Written out here
+    // rather than recomputed from the implementation, so the two are independent
+    // expressions and a mutation of one does not move the other.
+    CHECK(trace.slot_positions[0] == 3);
+    CHECK(trace.slot_positions[1] == 5);
+    // THE ENDPOINTS ARE DROPPED (`[1:-1]`, helpers.py:381). Frame 0 already spans
+    // a single pixel frame under causal encoding and the terminal frame is the
+    // clip's own end, so a slot at either buys nothing. A port that kept them
+    // would place 4 slots and still render.
+    for (int64_t position : trace.slot_positions) {
+      CHECK(position > 0);
+      CHECK(position < result.frame_count - 1);
+    }
+
+    // One latent frame of tokens per slot (keyframe_slots.py:83-84). At 32x32
+    // with VIDEO_SCALE_FACTORS (8, 32, 32) the latent grid is 1x1, so one latent
+    // frame is one token and two slots are two tokens. Derived from the geometry
+    // rather than hard-coded, so a fixture resized later moves both sides.
+    const int64_t per_frame = (result.width / 32) * (result.height / 32);
+    REQUIRE(per_frame >= 1);
+    CHECK(trace.slot_marked_tokens == 2 * per_frame);
+
+    // THE READBACK RAN, and returned one latent frame per slot. This is the half
+    // #920 named as its blocker: `clear_conditioning` extracts into
+    // `generated_keyframes` BEFORE it trims (ltx_core/tools.py:97, :115, and
+    // `extract_generated_keyframes` at :203-230). A build that trimmed first
+    // reports slots placed and ZERO extracted, with a byte-identical video.
+    CHECK(trace.slot_tokens_extracted == 2);
+
+    // AND THE MARKER REACHED THEM. `extend_keyframes_mask(..., marked=True)`
+    // (keyframe_slots.py:121) is upstream's single marked call site and is the
+    // ONLY thing separating a generated slot from an ordinary append. An
+    // unmarked slot costs the same tokens, renders the same clip, and silently
+    // omits #658's trained embedding — so this is the assertion with no
+    // observable proxy anywhere else in the tree.
+    CHECK(trace.slot_marked_tokens > 0);
+  }
+
+  SUBCASE("zero is upstream's DEFAULT and places nothing") {
+    // args.py:836 is `default=0`, and `has_generated_keyframes`
+    // (utils/helpers.py:384-391) reads 0 as off. A caller that plumbs the
+    // default through must get an ordinary render. This is the half a naive port
+    // breaks — "the key is present, so act" is one line shorter and wrong, and
+    // it stays wrong now that the arm is served rather than refused.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/gk0");
+    gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = "0";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.frame_count == 9);
+    CHECK(result.width == 32);
+    CHECK(result.height == 32);
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    CHECK(trace.slot_positions.empty());
+    CHECK(trace.slot_marked_tokens == 0);
+    CHECK(trace.slot_tokens_extracted == 0);
+  }
+
+  SUBCASE("a negative count gets upstream's OWN reason") {
+    // `evenly_spaced_keyframe_positions` raises "num_keyframes must be
+    // non-negative" (utils/helpers.py:372-373) before anything looks at the
+    // checkpoint.
+    const std::string msg =
+        refusal(vllm::multimodal::kLtx2GeneratedKeyframesExtra, "-1", "gkneg");
+    INFO(msg);
+    CHECK(msg.find("non-negative") != std::string::npos);
+    CHECK(msg.find("helpers.py:372-373") != std::string::npos);
+  }
+
+  SUBCASE("a count the clip is too short for gets upstream's SECOND reason") {
+    // `num_frames < num_keyframes + 2` (helpers.py:374-378). Every slot is an
+    // INTERIOR position, so the two endpoints are not available to it and a
+    // request for 8 slots in a 9-frame clip has nowhere to put them. Distinct
+    // from the negative refusal: a port that collapsed the two would tell a
+    // caller who asked for too many that they asked for a negative number.
+    const std::string msg =
+        refusal(vllm::multimodal::kLtx2GeneratedKeyframesExtra, "8", "gktoomany");
+    INFO(msg);
+    CHECK(msg.find("num_keyframes + 2") != std::string::npos);
+    CHECK(msg.find("non-negative") == std::string::npos);
+  }
+
+  SUBCASE("the key is still DEFINED, so a neighbouring typo is answered differently") {
+    // Carried over from the refusal case this replaces, because the property it
+    // guards survives the change: the family DEFINES this key, so a caller who
+    // mistypes it must not get the same answer as one who typed it correctly.
+    // That is the distinction `CheckUnservedExtras` was written for on the load
+    // side (#611).
+    const std::string msg = refusal("num_generated_keyframe", "1", "gktypo");
+    INFO(msg);
+    CHECK(msg.find("unknown per-generation extra") != std::string::npos);
+    CHECK(msg.find("num_generated_keyframes") != std::string::npos);
+  }
+}
+
+TEST_CASE("ltx2 video: the DFR pipeline pads its canvas, places slots on it, and trims back") {
+  // Row LTX25-DFR-PIPELINE (#986), and this is the row's REACHABILITY PROOF.
+  //
+  // It enters through the production entry point — `LoadVideoEngine` then
+  // `VideoEngine::Generate`, the chain `vllm_video_generate` takes — and reaches
+  // `Ltx2DfrResolveCanvas` and `Ltx2ConditionVideoByGeneratedKeyframeSlots`
+  // through the `pipeline_kind` load extra, which `ltx2-gen --pipeline-kind`
+  // and the ABI's `extra_keys`/`extra_values` both carry.
+  // `.agents/reachability.md` asks for exactly this: the smallest failing test
+  // starts at the entry point rather than constructing the type, because a unit
+  // test proves the class works and never that anything reaches it. The unit
+  // suite `test_ltx2_dfr` is kept beside this one — it localizes a failure — and
+  // it is not the proof.
+  //
+  // WHAT THE CANVAS DOES TO A 9-FRAME REQUEST, derived rather than asserted from
+  // the implementation: `resolve_canvas` (dfr_layout.py:60-81) works on
+  // `content = num_frames - 1 = 8`. `choose_segment_length` pads 8 by 16 against
+  // segment 24 and by 24 against 32, so 24 wins outright, and the canvas becomes
+  // `8 + 16 + 1 = 25` frames with one keyframe position at 24 — the terminal
+  // frame. The pipeline therefore DENOISES 25 frames and hands the caller back
+  // 9, which is the whole point of `dfr_pipeline.py:531-540` and the single
+  // most surprising thing about this pipeline.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+  // Phase 0 only: phase 1 needs the latent spatial upsampler, and this case is
+  // about the canvas and the slots rather than about the detailing stage.
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  CHECK(ltx2->pipeline_kind() == "dfr");
+
+  SUBCASE("the canvas pads, the slots land on its segment grid, and the caller gets 9 frames") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr");
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+
+    // THE CONTRACT. `(requested - 1) * 2**0 + 1 == requested`
+    // (dfr_pipeline.py:534). The caller asked for 9 and gets 9, even though the
+    // pipeline denoised more.
+    CHECK(result.frame_count == 9);
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    // AND THE CANVAS WAS BIGGER, which is the half no output can show. A build
+    // that skipped the pad renders 9 frames too, from a 9-frame canvas, with a
+    // keyframe grid that does not divide it.
+    CHECK(trace.canvas_frames == 25);
+    CHECK(trace.canvas_segment == 24);
+    CHECK(trace.canvas_frames > result.frame_count);
+
+    // The slots sit on the segment grid `resolve_canvas` returned: `[S, 2S, ...,
+    // N'-1]`, which for this canvas is the single terminal position 24. Frame 0
+    // is EXCLUDED — it already spans a single pixel frame under causal encoding
+    // (dfr_layout.py:66-68).
+    REQUIRE(trace.slot_positions.size() == 1);
+    CHECK(trace.slot_positions[0] == 24);
+    CHECK(trace.slot_positions[0] == trace.canvas_frames - 1);
+    CHECK(trace.slot_positions[0] % 8 == 0);
+
+    // The slots were placed, MARKED and read back. Each of the three is a
+    // separate failure mode and none of them moves a pixel: see the
+    // generated-keyframe case above for why the trace is the only instrument.
+    CHECK(trace.slot_marked_tokens > 0);
+    CHECK(trace.slot_tokens_extracted == 1);
+  }
+
+  SUBCASE("a frame count off the x8 border is REFUSED, where the ordinary pipeline floors it") {
+    // The asymmetry is upstream's and it is the reason DFR needs its own guard.
+    // `resolve_num_frames` returns an explicit count verbatim and
+    // `VideoLatentShape.from_pixel_shape` FLOORS it, which `docs/USAGE.md`
+    // documents as this engine's behaviour (#919). DFR cannot live with that:
+    // every keyframe position it emits has to land on a latent border, and a
+    // floored count moves the terminal position off one. So `resolve_canvas`
+    // raises (dfr_layout.py:71-72) and so does this.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfroff");
+    gen.num_frames = 10;
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("a frame count off the x8 border must be refused on the dfr pipeline");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("dfr_layout.py:71-72") != std::string::npos);
+      CHECK(msg.find("#919") != std::string::npos);
+    }
+  }
+
+  SUBCASE("BOTH stages run, and stage 2's slots are SEEDED from stage 1's") {
+    // The two-stage DFR flow, through the production entry point, with the
+    // fixture spatial upsampler. Upstream's stage 2 passes
+    // `initial_keyframes=upsampled_slot_keyframes` (dfr_pipeline.py:364), which
+    // are stage 1's own denoised slots run through the SPATIAL latent upsampler
+    // (:348) — the same object and the same call as the video latent on the line
+    // after it.
+    //
+    // WHAT THIS CASE DOES AND DOES NOT ESTABLISH, stated because the first
+    // version of this comment claimed more. It REACHES the seeded path: without
+    // it, `initial_keyframes` is null on every engine test, because phase 0 has
+    // no previous phase to seed from. It does NOT DETECT the seed's content.
+    // Measured, not assumed: mutation M5, which stops the seed reaching
+    // `latent`, leaves this suite at 52/52, exit 0, WITH this case present.
+    //
+    // The reason is a property of the pipeline rather than a hole in this file.
+    // Stage 2 re-noises to `stage_2_sigmas[0]`, about 0.909, so the seed is
+    // almost entirely replaced by noise before the first step and the denoise
+    // loop generates the rest; the assertions available here are structural —
+    // counts, positions, resolutions — and the seed moves none of them. Where
+    // the seed IS gated is `test_ltx2_dfr`, which checks that it lands in
+    // `latent` and not in `clean`, and where M5 goes RED.
+    //
+    // A separate engine is loaded because `max_phase` is a LOAD extra and the
+    // outer one pins phase 0.
+    vllm::multimodal::VideoModelParams two = FixtureParams(ws.paths);
+    two.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "dfr";
+    two.extras["upsampler_path"] = ws.paths.upsampler;
+    const std::unique_ptr<vllm::multimodal::VideoEngine> full =
+        vllm::multimodal::LoadVideoEngine(two);
+    REQUIRE(full != nullptr);
+    auto* ltx2_full = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(full.get());
+    REQUIRE(ltx2_full != nullptr);
+
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfr2");
+    const vllm::multimodal::VideoResult result = full->Generate(gen);
+
+    // Stage 2 renders at FULL resolution, where phase 0 alone renders at half.
+    // That is what proves both phases ran, and it is read off the artifact
+    // rather than off a flag.
+    CHECK(result.frame_count == 9);
+    CHECK(result.width == 64);
+    CHECK(result.height == 64);
+
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2_full->last_conditioning();
+    // The trace describes the LAST phase that ran, so a slot count here means
+    // stage 2 placed slots of its own rather than inheriting stage 1's tokens.
+    REQUIRE(trace.slot_positions.size() == 1);
+    CHECK(trace.slot_positions[0] == 24);
+    CHECK(trace.canvas_frames == 25);
+    // And stage 2 read its slots back too, which is what the next round would
+    // carry forward if the rounds were served.
+    CHECK(trace.slot_tokens_extracted == 1);
+    // Stage 2's slot is 4 tokens where stage 1's is 1: the latent grid is 2x2 at
+    // full resolution against 1x1 at half. Derived from the result's own size so
+    // a mutation of the phase geometry moves this and not just the count.
+    const int64_t per_frame = (result.width / 32) * (result.height / 32);
+    CHECK(per_frame == 4);
+    CHECK(trace.slot_marked_tokens == per_frame);
+  }
+
+  SUBCASE("the soundtrack is CUT to the picture, not to the padded canvas") {
+    // `dfr_pipeline.py:552-560`, whose own reason is the consequence rather than
+    // the mechanism: "Audio was generated for the padded canvas, so cut it to
+    // the video's duration or the muxed container outlasts the picture."
+    //
+    // This case exists because the first version of this row got it wrong and
+    // said so in a comment. The video trim moves `frames`; the audio latent's
+    // frame count was derived from the PADDED `frames` inside the phase loop and
+    // the vocoder runs over all of it, so trimming the video touches nothing
+    // about the sound. A 9-frame DFR request emitted 9 frames of picture beside
+    // 25 frames' worth of audio, and NOTHING about the render's shape, its frame
+    // count or its exit status could see it — it shows up only in a muxed
+    // container this library does not produce.
+    //
+    // The bound is derived from the RESULT's own fields rather than from the
+    // canvas, so a mutation of the cut cannot move both sides together.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfraudio");
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    REQUIRE(result.frame_count == 9);
+    REQUIRE(result.sample_rate > 0);
+    REQUIRE(result.fps > 0);
+
+    const std::string wav = ReadAll(result.audio_path);
+    REQUIRE(wav.size() > 44);  // canonical RIFF/WAVE header
+    const double seconds_of_picture =
+        static_cast<double>(result.frame_count) / static_cast<double>(result.fps);
+
+    // The duration is READ OUT OF THE FILE rather than assumed, and the first
+    // draft of this case got that wrong in a way worth recording: it took the
+    // channel count as 1, calling that "the loosest reading and therefore the
+    // safe direction". It is the opposite. Dividing by too FEW channels reports
+    // a longer file than exists, so the bound false-fails on a correct cut,
+    // which is exactly what it did — 0.375 s of picture against a reported
+    // 0.75 s of sound on a 2-channel file that was already the right length.
+    auto u16 = [&](size_t at) {
+      return static_cast<int64_t>(static_cast<unsigned char>(wav[at])) |
+             (static_cast<int64_t>(static_cast<unsigned char>(wav[at + 1])) << 8);
+    };
+    auto u32 = [&](size_t at) { return u16(at) | (u16(at + 2) << 16); };
+    REQUIRE(wav.compare(0, 4, "RIFF") == 0);
+    REQUIRE(wav.compare(8, 4, "WAVE") == 0);
+    const int64_t channels = u16(22);
+    const int64_t rate = u32(24);
+    const int64_t bits = u16(34);
+    const int64_t data_bytes = u32(40);
+    REQUIRE(channels >= 1);
+    REQUIRE(bits == 16);
+    REQUIRE(rate == result.sample_rate);
+    REQUIRE(data_bytes > 0);
+    REQUIRE(static_cast<size_t>(data_bytes) <= wav.size() - 44);
+    const double seconds_of_sound = static_cast<double>(data_bytes) /
+                                    (static_cast<double>(bits / 8) *
+                                     static_cast<double>(channels) * static_cast<double>(rate));
+    INFO("picture ", seconds_of_picture, "s, sound ", seconds_of_sound, "s, ", channels,
+         " channels at ", rate, " Hz");
+    // One frame of slack for the rounding in `llround`, and no more. Before the
+    // cut this was the PADDED canvas's duration, about 2.8x the picture.
+    CHECK(seconds_of_sound <= seconds_of_picture + (1.0 / static_cast<double>(result.fps)) + 1e-6);
+    // And it is not EMPTY, which a cut that computed zero would also satisfy.
+    CHECK(seconds_of_sound > 0.0);
+  }
+
+  SUBCASE("a request wrong on BOTH axes hears about the RESOLUTION first") {
+    // Upstream's order, and it is an order rather than a set: `assert_resolution`
+    // is at dfr_pipeline.py:291 and `resolve_canvas` at :314. A request that is
+    // wrong on both the resolution and the frame count therefore gets the
+    // resolution refusal upstream, and must get it here too.
+    //
+    // This is gated because it is invisible otherwise. Both refusals are
+    // correct, both name a real defect in the request, and a port that resolved
+    // the canvas first would look completely healthy to every other case in this
+    // file while giving a different answer from the reference to the same input.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfrboth");
+    gen.width = 96;      // not a multiple of 64, which a two-stage recipe needs
+    gen.num_frames = 10; // and not on the x8 border either
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("a request wrong on both axes must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      // The RESOLUTION refusal, not the canvas one.
+      CHECK(msg.find("96") != std::string::npos);
+      CHECK(msg.find("dfr_layout.py:71-72") == std::string::npos);
+    }
+  }
+
+  SUBCASE("num_generated_keyframes is refused on dfr, which owns its own grid") {
+    // `DFRPipeline.__call__` takes no such argument and its CLI exposes no
+    // `--num-generated-keyframes` (dfr_pipeline.py:268-283, :565-591). Honouring
+    // an override would detach the slots from the canvas that indexes them —
+    // the tile ranges and the carry-forward bag are built on that same grid —
+    // and the render would still finish.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfrgk");
+    gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = "2";
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("num_generated_keyframes must be refused on the dfr pipeline");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("resolve_canvas") != std::string::npos);
+      CHECK(msg.find("not accepted on the 'dfr' pipeline") != std::string::npos);
+      // Explicit 0 is upstream's default and must still pass through.
+      CHECK(msg.find("unknown per-generation extra") == std::string::npos);
+    }
+  }
+
+  SUBCASE("an explicit 0 for num_generated_keyframes still renders on dfr") {
+    // The refusal above is keyed on `count != 0`, not on the key's presence. A
+    // caller that plumbs upstream's own default through must not be refused —
+    // the same half a naive port breaks on the ordinary pipelines.
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/dfrgk0");
+    gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = "0";
+    const vllm::multimodal::VideoResult result = engine->Generate(gen);
+    CHECK(result.frame_count == 9);
+    // And the canvas still placed ITS OWN slot, which is what distinguishes
+    // "generated keyframes off" from "DFR without its keyframe grid". A port
+    // that read the 0 as "no slots" would render a DFR clip with no slots at
+    // all, at the right size, and nothing else would show it.
+    const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+    CHECK(trace.slot_positions.size() == 1);
+  }
+}
+
+TEST_CASE("ltx2 video: DFR's temporal rounds are refused BY WHAT IS MISSING") {
+  // Row LTX25-DFR-PIPELINE (#986). The rounds LOOP is unported; the upsampler it
+  // drives is not, and neither is the canvas layout it tiles with. That
+  // distinction is the entire content of the refusal, and it is the distinction
+  // this campaign has now got wrong twice — `ltx2_video.cpp` keeps a tally of
+  // refusals whose stated reason turned out false.
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
       vllm::multimodal::LoadVideoEngine(mp);
@@ -1605,74 +2023,66 @@ TEST_CASE("ltx2 video: GENERATED keyframe slots are refused BY WHAT IS MISSING, 
 
   auto refusal = [&](const char* value, const char* dir) {
     vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/" + dir);
-    gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = value;
+    gen.extras[vllm::multimodal::kLtx2TemporalRoundsExtra] = value;
     try {
       (void)engine->Generate(gen);
-      FAIL_CHECK("num_generated_keyframes=" << value << " must be refused, never dropped");
+      FAIL_CHECK("temporal_upsample_rounds=" << value << " must be refused, never dropped");
       return std::string();
     } catch (const std::exception& e) {
       return std::string(e.what());
     }
   };
 
-  SUBCASE("a positive count names the READBACK, and rules the other reasons out") {
-    const std::string msg = refusal("2", "gk2");
+  SUBCASE("a value outside {0,1,2} gets upstream's OWN refusal first") {
+    // `dfr_pipeline.py:284-285` raises at the top of `__call__`, before any work
+    // is paid for. A malformed request and an unported loop are different
+    // answers, and upstream gives the malformed one first.
+    const std::string msg = refusal("3", "tr3");
     INFO(msg);
-    // The upstream symbols, so a later reader can go and check whether the
-    // reason still holds rather than re-deriving it. This is the bar the
-    // LAST-frame refusal set and the one six refusals in this campaign failed.
-    CHECK(msg.find("VideoGeneratedKeyframeSlots") != std::string::npos);
-    CHECK(msg.find("keyframe_slots.py") != std::string::npos);
-    // The BLOCKER: the readback, which the SUPPLIED arm needs none of.
-    CHECK(msg.find("GeneratedKeyframeLayout") != std::string::npos);
-    CHECK(msg.find("generated_keyframes") != std::string::npos);
-    CHECK(msg.find("extract_generated_keyframes") != std::string::npos);
-    // The two RULED-OUT reasons, each of which a reader would otherwise reach
-    // for first. Both must be present and both must be marked as ruled out.
-    CHECK(msg.find("RULED OUT") != std::string::npos);
-    CHECK(msg.find("update_attention_mask") != std::string::npos);
-    CHECK(msg.find("clear_conditioning") != std::string::npos);
-    CHECK(msg.find("#930") != std::string::npos);
-    const bool names_the_served_arm = msg.find("last-frame") != std::string::npos ||
-                                      msg.find("LAST-frame") != std::string::npos;
-    CHECK(names_the_served_arm);
-    // The refuted reason may be NAMED -- it is worth telling a reader the marker
-    // was ruled out -- but never as the thing that is missing. Same guard the
-    // LAST-frame case carries.
-    if (msg.find("keyframes_abs_pos_embedding") != std::string::npos) {
-      CHECK(msg.find("NOT* THE REASON") != std::string::npos);
-      CHECK(msg.find("#658") != std::string::npos);
-    }
+    CHECK(msg.find("must be 0, 1, or 2") != std::string::npos);
+    CHECK(msg.find("dfr_pipeline.py:284-285") != std::string::npos);
+    // NOT the unported-loop message: that would send a caller who typed 3 off to
+    // read about tiling.
+    CHECK(msg.find("ROUNDS LOOP") == std::string::npos);
   }
-  SUBCASE("its claims about THIS tree are re-derived from this tree") {
-    // THE ASSERTION THIS REPAIR EXISTS FOR, and it is a different assertion from
-    // every one above.
+
+  SUBCASE("a legal count names the LOOP, and rules three other causes OUT") {
+    const std::string msg = refusal("1", "tr1");
+    INFO(msg);
+    // The upstream span a reader can go and check.
+    CHECK(msg.find("dfr_pipeline.py:402-529") != std::string::npos);
+    CHECK(msg.find("ROUNDS LOOP") != std::string::npos);
+    // WHAT IS NOT THE REASON — the shape this campaign requires for a ruled-out
+    // cause, so the next reader RE-CHECKS the refutation rather than re-deriving
+    // it. All three must be named.
+    CHECK(msg.find("NOT* THE REASON") != std::string::npos);
+    CHECK(msg.find("LTX25-TEMPORAL-UPSAMPLER") != std::string::npos);
+    CHECK(msg.find("PixelShuffle1d") != std::string::npos);
+    CHECK(msg.find("resolve_canvas") != std::string::npos);
+    // And the one thing no code can supply.
+    CHECK(msg.find("latent-temporal-upscaler") != std::string::npos);
+    CHECK(msg.find("#986") != std::string::npos);
+  }
+
+  SUBCASE("its LOCAL claims are re-derived from this tree, not read back from the message") {
+    // THE ASSERTION THE #920 REPAIR EXISTS FOR, carried forward to this refusal
+    // because the failure it guards is a property of refusals in general rather
+    // than of that one. Every assertion above is on an UPSTREAM symbol name, and
+    // no change to THIS tree can move one — so a suite built only on them stays
+    // green through exactly the event that falsifies the message.
     //
-    // The refusal this one replaces named the token-append machinery as its
-    // first blocker. That was true when it was written and FALSE by the time it
-    // reached review: `c7cb59fbb` (row LTX25-TOKEN-APPEND, #930) landed the
-    // append seam, served the LAST-frame arm through it, and turned the clear
-    // step from an identity into a real trim. Nothing went red. Every assertion
-    // in the case above is on an UPSTREAM symbol name -- `update_attention_mask`,
-    // `clear_conditioning` -- and no change to THIS tree can move one, so the
-    // suite could not see it. A reviewer's mutation confirmed the hole directly:
-    // replacing the local-cause sentence with a self-declared falsehood, leaving
-    // the upstream names alone, kept the suite GREEN at 18/18.
+    // Measured on this campaign: a mutation that replaced the local-cause clause
+    // with a self-declared falsehood, leaving the upstream names alone, kept the
+    // #920 suite GREEN at 18/18, exit 0.
     //
-    // So the message states its local claims in a form the gate can re-derive,
-    // and re-derives them from `ltx2_conditioning.h` -- a DIFFERENT file from the
-    // one the message lives in, which is what stops the check from being the
-    // tautology .agents/issue-index.md #911 records (reading a span out of the
-    // file it validates reports everything fresh).
-    //
-    // Comment lines are stripped before the scan. Without that the ABSENT half
-    // is answered by prose: this very header's comment at `Ltx2ExtendKeyframesMask`
-    // names upstream's `VideoGeneratedKeyframeSlots`, so an unstripped search for
-    // `GeneratedKeyframe` finds a hit and the check silently inverts.
-    const std::string msg = refusal("2", "gkclaims");
+    // The refusal claims the canvas layout is ported HERE. That is a claim about
+    // this tree, so it is checked against this tree — and against a DIFFERENT
+    // file from the one that makes it, which is what stops the check from being
+    // the tautology #911 records.
+    const std::string msg = refusal("2", "trclaims");
     INFO(msg);
     const std::vector<std::string> header_lines =
-        SplitLines(ReadSourceFile(LTX2_CONDITIONING_HEADER_PATH));
+        SplitLines(ReadSourceFile(LTX2_DFR_HEADER_PATH));
     REQUIRE(header_lines.size() > 100);
     std::string declarations;
     for (const std::string& line : header_lines) {
@@ -1681,93 +2091,25 @@ TEST_CASE("ltx2 video: GENERATED keyframe slots are refused BY WHAT IS MISSING, 
       declarations += line;
       declarations += '\n';
     }
-    // The header must still be mostly declarations after stripping, or a
-    // reformat that turned it into one comment block would answer ABSENT for
-    // free. Positive control on the instrument itself.
-    REQUIRE_MESSAGE(declarations.find("struct Ltx2LatentState") != std::string::npos,
+    // Positive control on the instrument: the header must still be mostly
+    // declarations after stripping, or a reformat that turned it into one
+    // comment block would answer every check below for free.
+    REQUIRE_MESSAGE(declarations.find("struct Ltx2DfrTileRange") != std::string::npos,
                     "comment stripping removed the declarations it was meant to keep");
-
-    // The claimed names are read OUT OF THE MESSAGE, never listed here: a list
-    // here would be a second place the claim lives, and the two would drift.
-    auto names_after = [&](const std::string& marker) {
-      std::vector<std::string> out;
-      const size_t at = msg.find(marker);
-      REQUIRE_MESSAGE(at != std::string::npos,
-                      "the refusal no longer carries its '" << marker << "' clause");
-      const size_t start = at + marker.size();
-      const size_t stop = msg.find('.', start);
-      REQUIRE(stop != std::string::npos);
-      std::string list = msg.substr(start, stop - start);
-      size_t from = 0;
-      while (from <= list.size()) {
-        const size_t comma = list.find(',', from);
-        std::string name = list.substr(from, comma == std::string::npos ? std::string::npos
-                                                                        : comma - from);
-        const size_t b = name.find_first_not_of(" \t");
-        const size_t e = name.find_last_not_of(" \t");
-        if (b != std::string::npos) out.push_back(name.substr(b, e - b + 1));
-        if (comma == std::string::npos) break;
-        from = comma + 1;
-      }
-      return out;
-    };
-
-    const std::vector<std::string> declared = names_after("DECLARED HERE: ");
-    const std::vector<std::string> absent = names_after("ABSENT HERE: ");
-    // A count floor, because an empty list satisfies every "for each" below and
-    // reports a pass over nothing.
-    CHECK(declared.size() >= 3);
-    CHECK(absent.size() >= 2);
-    for (const std::string& name : declared) {
-      INFO("claimed DECLARED: " << name);
+    // The message rules the canvas layout out as a blocker BECAUSE it is ported
+    // here. If a later change removes one of these, that clause becomes false
+    // and this goes red with the reason attached.
+    CHECK(msg.find("canvas layout") != std::string::npos);
+    for (const char* name : {"Ltx2DfrResolveCanvas", "Ltx2DfrTileRanges",
+                             "Ltx2DfrStitchTileLatents", "Ltx2DfrMergeCarryForwardKeyframes"}) {
+      INFO("claimed ported HERE: " << name);
       CHECK_MESSAGE(declarations.find(name) != std::string::npos,
-                    "the refusal claims ltx2_conditioning.h declares '"
-                        << name << "', and it does not. The message is stale about THIS tree");
-    }
-    for (const std::string& name : absent) {
-      INFO("claimed ABSENT: " << name);
-      CHECK_MESSAGE(declarations.find(name) == std::string::npos,
-                    "the refusal claims ltx2_conditioning.h has no '"
+                    "the refusal rules the canvas layout out as a blocker because it is ported "
+                    "here, and '"
                         << name
-                        << "', and it does. If the readback landed, this refusal is no longer "
-                           "true and must be rewritten or removed");
+                        << "' is no longer declared in ltx2_dfr.h. The message is stale about "
+                           "THIS tree");
     }
-  }
-  SUBCASE("and it is NOT the generic unknown-extra message") {
-    // THE ASSERTION THIS ROW EXISTS FOR. Without it the case above passes
-    // against the message the tree already has, because "unknown per-generation
-    // extra 'num_generated_keyframes'. This family defines: image_crf" contains
-    // no upstream symbol at all -- and a refusal that says the family does not
-    // define the key sends the reader looking for a typo instead of for the
-    // unported machinery. That is the distinction `CheckUnservedExtras` was
-    // written for on the load side (#611).
-    const std::string msg = refusal("1", "gk1");
-    INFO(msg);
-    CHECK(msg.find("unknown per-generation extra") == std::string::npos);
-  }
-  SUBCASE("zero is upstream's DEFAULT and must not refuse") {
-    // args.py:836 is `default=0`, and `has_generated_keyframes`
-    // (utils/helpers.py:384-391) reads 0 as off. A caller that plumbs the
-    // default through must get a render, not a refusal. This is the half a
-    // naive port breaks -- "the key is present, so refuse" is one line shorter
-    // and wrong.
-    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/gk0");
-    gen.extras[vllm::multimodal::kLtx2GeneratedKeyframesExtra] = "0";
-    const vllm::multimodal::VideoResult result = engine->Generate(gen);
-    CHECK(result.frame_count == 9);
-    CHECK(result.width == 32);
-    CHECK(result.height == 32);
-  }
-  SUBCASE("a negative count gets upstream's OWN reason, not the unported one") {
-    // `evenly_spaced_keyframe_positions` raises "num_keyframes must be
-    // non-negative" (utils/helpers.py:372-373) before anything looks at the
-    // checkpoint. A malformed request and an unported arm are different
-    // answers, and collapsing them would tell a caller who typed `-1` to go
-    // read about attention masks.
-    const std::string msg = refusal("-1", "gkneg");
-    INFO(msg);
-    CHECK(msg.find("non-negative") != std::string::npos);
-    CHECK(msg.find("update_attention_mask") == std::string::npos);
   }
 }
 

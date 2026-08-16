@@ -31,6 +31,7 @@
 #include "vllm/model_executor/models/ltx2_conditioning.h"
 #include "vllm/model_executor/models/ltx2_connector.h"
 #include "vllm/model_executor/models/ltx2_device.h"
+#include "vllm/model_executor/models/ltx2_dfr.h"
 #include "vllm/model_executor/models/ltx2_image_preprocess.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
@@ -362,7 +363,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 780 790 791 853 949 965 967 1045 1070 1175 1216
+// 781 791 792 854 950 966 968 1046 1071 1176 1217
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
@@ -1251,7 +1252,33 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
 
 namespace {
 
-// GENERATED keyframe slots, refused BY WHAT IS MISSING.
+// GENERATED keyframe slots — SERVED as of row LTX25-DFR-PIPELINE (#986), and the
+// DFR canvas that drives them.
+//
+// The refusal this block replaces is recorded rather than deleted, because the
+// retirement IS the record. Row LTX25-GENERATED-KEYFRAMES (#920) defined
+// `num_generated_keyframes` and refused any positive count, naming ONE blocker:
+// the READBACK — `GeneratedKeyframeLayout`, the extraction into
+// `generated_keyframes` before the trim, and a standalone single-frame decode of
+// each slot. That refusal was CORRECT when it was written and it is now false in
+// its first two thirds, which #986 landed:
+// `Ltx2ConditionVideoByGeneratedKeyframeSlots` and
+// `Ltx2ExtractGeneratedKeyframes` in `ltx2_conditioning.h`, with
+// `Ltx2ClearConditioning` extracting BEFORE it trims.
+//
+// The third piece — the standalone decode — is still owed, and it is NOT a
+// blocker for anything served here. It belongs to a surface that would hand slot
+// PIXELS back to a caller, and neither DFR nor this engine has one: DFR keeps
+// its slots in latent space from end to end, upsampling them
+// (dfr_pipeline.py:348) and feeding them back as `initial_keyframes` (:364).
+// Tracked as owed under #986.
+//
+// The refusal carried a gated tripwire aimed at exactly this change —
+// `ABSENT HERE: GeneratedKeyframe, generated_keyframe`, re-derived by
+// `test_ltx2_video` against `ltx2_conditioning.h`'s declarations. It fired, as
+// its own spec (`.agents/specs/ltx25-generated-keyframes.md` section 4a)
+// predicted in terms. The assertion was retired with the refusal it described,
+// never widened.
 //
 // Deliberately a second anonymous namespace rather than an addition to the one
 // at the top of this file: the READER ANCHORS comment above `kKnownLoadExtras`
@@ -1263,79 +1290,124 @@ namespace {
 // This resolves the request BEFORE any arm is selected, so the FP8, NVFP4 and
 // bf16 arms cannot reach the unported machinery by different routes — there is
 // one answer for the family, not one per arm.
-void CheckGeneratedKeyframes(const std::map<std::string, std::string>& extras) {
+// `evenly_spaced_keyframe_positions` (ltx-pipelines/utils/helpers.py:370-381):
+// `linspace(0, num_frames - 1, n + 2).round().to(int64)[1:-1]` — interior
+// positions with BOTH ENDPOINTS DROPPED.
+//
+// THE ENDPOINT DROP IS THE WHOLE FUNCTION. `linspace` puts its first sample on
+// frame 0 and its last on `num_frames - 1`, and both are excluded: frame 0
+// already spans a single pixel frame under causal encoding, so a slot there buys
+// nothing, and the terminal frame is the clip's own end. A port that kept them
+// would place `n + 2` slots, cost two extra latent frames of tokens, and render.
+//
+// `torch.linspace` divides by `steps - 1` in f64 and `.round()` is half-to-even,
+// mirrored here for the same reason `Ltx2DfrSlotInitialsFromVideo` mirrors it.
+std::vector<int64_t> EvenlySpacedKeyframePositions(int64_t num_keyframes, int64_t num_frames) {
+  if (num_keyframes < 0) {
+    Fail("the '" + std::string(kLtx2GeneratedKeyframesExtra) + "' extra is " +
+         std::to_string(num_keyframes) +
+         ", and num_keyframes must be non-negative — upstream's own refusal, raised by "
+         "`evenly_spaced_keyframe_positions` (ltx-pipelines/utils/helpers.py:372-373) before "
+         "the checkpoint is consulted. Use 0 to turn generated keyframes off, which is "
+         "upstream's default (utils/args.py:836).");
+  }
+  if (num_keyframes == 0) return {};
+  if (num_frames < num_keyframes + 2) {
+    Fail("generated keyframes need at least num_keyframes + 2 target frames, got "
+         "num_keyframes=" +
+         std::to_string(num_keyframes) + ", num_frames=" + std::to_string(num_frames) +
+         " (ltx-pipelines/utils/helpers.py:374-378). Each slot is an INTERIOR position, so the "
+         "two endpoints are not available to it.");
+  }
+  const int64_t steps = num_keyframes + 2;
+  std::vector<int64_t> positions;
+  positions.reserve(static_cast<size_t>(num_keyframes));
+  for (int64_t i = 1; i + 1 < steps; ++i) {
+    const double value = static_cast<double>(num_frames - 1) * static_cast<double>(i) /
+                         static_cast<double>(steps - 1);
+    positions.push_back(static_cast<int64_t>(std::nearbyint(value)));
+  }
+  return positions;
+}
+
+void CheckGeneratedKeyframes(const std::map<std::string, std::string>& extras,
+                             const std::string& pipeline_kind) {
   if (VideoExtra(extras, kLtx2GeneratedKeyframesExtra).empty()) return;
   const int64_t count = ExtraInt(extras, kLtx2GeneratedKeyframesExtra, 0);
+
+  // DFR OWNS ITS OWN SLOT POSITIONS. `DFRPipeline.__call__` takes no
+  // `generated_keyframes` argument at all: the positions come from
+  // `resolve_canvas` (dfr_pipeline.py:314), one per x8-border segment boundary,
+  // and the whole pipeline — the tile ranges, the carry-forward bag, the
+  // anchor seams — is built on that grid. Honouring an override here would
+  // detach the slots from the canvas that indexes them, and every later stage
+  // would still run.
+  if (pipeline_kind == "dfr" && count != 0) {
+    Fail("the '" + std::string(kLtx2GeneratedKeyframesExtra) +
+         "' extra is not accepted on the 'dfr' pipeline, which chooses its own keyframe "
+         "positions. `DFRPipeline.__call__` takes no such argument and its CLI exposes no "
+         "`--num-generated-keyframes` (ltx-pipelines/dfr_pipeline.py:268-283, :565-591): the "
+         "slots sit on the segment grid `resolve_canvas` returns (:314, dfr_layout.py:60-81), "
+         "one per x8 border, and the tile ranges and carry-forward bag are indexed by that same "
+         "grid. Refused rather than honoured, because an override would leave the slots and the "
+         "canvas describing different frames and the render would still finish. Use "
+         "'pipeline_kind' 'distilled_two_stage' or 'one_stage' to place slots by count.");
+  }
 
   // ZERO IS UPSTREAM'S DEFAULT, AND IT IS OFF. `args.py:836` is `default=0` and
   // `has_generated_keyframes` (utils/helpers.py:384-391) reads 0 as "no slots
   // requested". A caller that plumbs the default through must get a render.
-  // Refusing on the mere presence of the key is one line shorter and wrong.
+  // Refusing on the mere presence of the key is one line shorter and wrong, and
+  // it stays wrong now that the arm is served: the DFR refusal above is keyed on
+  // `count != 0` for the same reason.
   if (count == 0) return;
 
   // A MALFORMED REQUEST AND AN UNPORTED ARM ARE DIFFERENT ANSWERS, and upstream
   // gives this one first: `evenly_spaced_keyframe_positions` raises
   // "num_keyframes must be non-negative" (utils/helpers.py:372-373) before
-  // anything looks at the checkpoint. Collapsing the two would tell a caller who
-  // typed -1 to go and read about attention masks.
-  if (count < 0) {
-    Fail("the '" + std::string(kLtx2GeneratedKeyframesExtra) + "' extra is " +
-         std::to_string(count) + ", and num_keyframes must be non-negative — upstream's own "
-         "refusal, raised by `evenly_spaced_keyframe_positions` "
-         "(ltx-pipelines/utils/helpers.py:370-381) before the checkpoint is consulted. Use 0 "
-         "to turn generated keyframes off, which is upstream's default (utils/args.py:836).");
-  }
+  // anything looks at the checkpoint. Resolved through the shared helper so the
+  // request surface and the render path cannot disagree about what is legal.
+  (void)EvenlySpacedKeyframePositions(count, /*num_frames=*/count + 2);
+}
 
-  Fail(
-      "generated keyframe slots are not served. This is upstream's "
-      "`VideoGeneratedKeyframeSlots` (ltx-core/conditioning/types/keyframe_slots.py:27-174), "
-      "reached from the CLI as `--num-generated-keyframes` (ltx-pipelines/utils/args.py:833-844) "
-      "and documented at ltx-pipelines/docs/conditioning.md:29-61 — the model GENERATES extra "
-      "frames at interior positions, which is a different feature from a SUPPLIED keyframe "
-      "image and is refused for a different reason. WHAT IS MISSING IS THE READBACK, and the "
-      "supplied arm needs none of it. The slots are the OUTPUT rather than conditioning, so "
-      "`apply_to` (keyframe_slots.py:71-150) records a `GeneratedKeyframeLayout` (:143-147, "
-      "defined at ltx_core/types.py:220-247) that locates them EXACTLY rather than assuming they "
-      "trail — items are applied in list order and each appends, so a state carrying slots AND a "
-      "supplied keyframe has no fixed trailing layout. `clear_conditioning` (ltx_core/"
-      "tools.py:88-117) then extracts them into `LatentState.generated_keyframes` as "
-      "(B, C, K, H, W) BEFORE it trims the extra tokens (tools.py:97, :115, by "
-      "`extract_generated_keyframes` at :203-230, which validates the layout against the live "
-      "token count and the target resolution), and each frame must then be decoded as a "
-      "STANDALONE one-frame clip — a K-frame causal decode would blend slots that were never "
-      "temporally adjacent (ltx_core/types.py:269-272, docs/conditioning.md:59-61). None of that "
-      "exists here, so a port that grew the sequence and stopped would generate the slots and "
-      "then throw them away, which is worse than refusing. "
-      "TWO PLAUSIBLE REASONS ARE RULED OUT, each with what ruled it out, so the next reader "
-      "re-checks the claim instead of re-deriving the refutation. FIRST, NOT the TOKEN-APPEND "
-      "machinery. Row LTX25-TOKEN-APPEND (issue #930) landed it and the LAST-frame "
-      "supplied-keyframe arm is SERVED through it today: `Ltx2ExtendKeyframesMask` and "
-      "`Ltx2ClearConditioning` grow the sequence and trim it back, and the phase loop binds a "
-      "`target_tokens` the grown count is measured against, so `apply_to`'s concatenation onto "
-      "`latent`, `denoise_mask`, `positions` and `clean_latent` (keyframe_slots.py:136-140), its "
-      "explicit [t, t+1) span with `causal_fix=False` (:152-174) and its `denoise_mask = 1` "
-      "(:118-119) all have a seam to land on. Two SMALL pieces of that seam are owed to THIS row "
-      "rather than to #930, and neither is the blocker above: the `marked=true` branch of "
-      "`Ltx2ExtendKeyframesMask` (upstream `keyframe_slots.py:121`) has no production caller yet, "
-      "and `update_attention_mask` (:123-131) has no local counterpart because `Ltx2LatentState` "
-      "carries no attention-mask field — deliberately, since the only upstream route to a "
-      "non-None mask is the IC-LoRA wrapper this engine does not mirror. SECOND, and this is the "
-      "one this campaign pinned falsely once already, WHAT IS *NOT* THE REASON: "
-      "`keyframes_abs_pos_embedding`. It is ported and applied on every render (row "
-      "LTX25-KEYFRAMES-ABS-POS, issue #658), because `_first_frame_keyframes_mask` "
-      "(ltx_core/tools.py:184-196) marks the target's first latent frame unconditionally. What "
-      "generated slots would add is MORE marked tokens — `keyframe_slots.py:121` is upstream's "
-      "only `extend_keyframes_mask(..., marked=True)` call site, against `marked=False` for "
-      "supplied content at keyframe_cond.py:84-86 — not the marker itself. "
-      "LOCAL FACTS, and the gate re-derives every one of them from "
-      "`ltx2_conditioning.h`'s DECLARATIONS with comment lines stripped, because a comment can "
-      "name a symbol the header does not declare. This clause exists because the reason above is "
-      "the part that goes stale: the refusal this one replaces named a token-append gap that "
-      "#930 had already closed, and the suite stayed GREEN through it because every assertion was "
-      "on an UPSTREAM symbol name, which no change to this tree can move. DECLARED HERE: "
-      "Ltx2ExtendKeyframesMask, Ltx2ClearConditioning, Ltx2LatentState. ABSENT HERE: "
-      "GeneratedKeyframe, generated_keyframe. "
-      "Tracked as owed by issue #920.");
+// `DiffusionStage.assert_generated_keyframes_supported`
+// (ltx-pipelines/utils/blocks.py:405-419), called from a pipeline's `__call__`
+// preamble (dfr_pipeline.py:315) BEFORE any weight is built.
+//
+// It reads the DECLARED config flag and refuses rather than degrading, and
+// upstream states the reason at keyframe_slots.py:9-12: on a checkpoint without
+// the marker "the slots would be denoised as unmarked tokens and the extra
+// compute would be wasted". Each slot costs one latent frame of tokens to buy
+// ONE pixel frame, so a silent degradation is not a smaller feature — it is the
+// same bill for nothing.
+//
+// OURS RESOLVES TO SHAPES, NOT TO THE DECLARATION, and the difference is
+// recorded because #902 asked about exactly it. `Ltx2AdoptDeclaredDitParams`
+// mirrors `LTXModel.supports_keyframes_abs_pos_embedding`
+// (model/transformer/model.py:166-173), which reads the MATERIALIZED tensor, so
+// a checkpoint that declares the flag and ships no keyframe tensor resolves
+// FALSE here and refuses. Upstream's admission gate reads the declaration alone
+// and would let that request through, then reach `embedding.to(dtype=...)` on a
+// meta tensor. Ours is the safer of the two and the divergence is deliberate.
+void AssertGeneratedKeyframesSupported(bool has_embedding, const std::string& dit_path) {
+  if (has_embedding) return;
+  Fail("generated keyframe slots were requested, but the DiT at '" + dit_path +
+       "' carries no keyframe absolute-position embedding, so it has no trained marker to put "
+       "on them. Upstream refuses the same request at the same point "
+       "(`assert_generated_keyframes_supported`, ltx-pipelines/utils/blocks.py:405-419, called "
+       "from the pipeline preamble before any weight is built) and says why at "
+       "ltx-core/conditioning/types/keyframe_slots.py:9-12: without the marker the slots are "
+       "denoised as ORDINARY tokens while still costing one latent frame of tokens each to buy "
+       "one pixel frame. Degrading silently would charge the full bill for nothing. "
+       "WHAT IS *NOT* THE REASON: the marker is not unported. `keyframes_abs_pos_embedding` "
+       "landed under row LTX25-KEYFRAMES-ABS-POS (#658) and is applied on EVERY render, because "
+       "`_first_frame_keyframes_mask` (ltx_core/tools.py:184-196) marks the target's first "
+       "latent frame unconditionally. What is absent is this CHECKPOINT's tensor. "
+       "This engine resolves the capability from the materialized tensor rather than from the "
+       "declared config flag, mirroring `LTXModel.supports_keyframes_abs_pos_embedding` "
+       "(model/transformer/model.py:166-173) rather than the pipeline-side gate, so a "
+       "checkpoint that DECLARES the flag and ships no tensor is refused here and would be "
+       "admitted upstream (#902). Supply a generated-keyframe checkpoint, or drop the request.");
 }
 
 }  // namespace
@@ -1348,19 +1420,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   for (const auto& kv : gen.extras) {
     // The per-generation extras this family DEFINES, and the list is the one
     // below rather than this sentence: `image_crf` (row LTX25-IMAGE-COND), the
-    // three audio-to-video knobs (row LTX25-A2V-AUDIO-INPUT, #922) and
-    // `num_generated_keyframes` (row LTX25-GENERATED-KEYFRAMES, #920). DEFINED
-    // is not SERVED — the last one is defined so that its own refusal can name
-    // what is missing, exactly as `CheckUnservedExtras` does on the load side
-    // (#611). Everything OUTSIDE the list is refused rather than ignored, for the
-    // reason `CheckKnownExtras` gives for the load side: a mistyped knob that is
-    // silently dropped renders the DEFAULT and looks like the feature not
-    // working — and for THIS knob the default is a refusal, so a typo would turn
-    // a served request into an unexplained one.
+    // three audio-to-video knobs (row LTX25-A2V-AUDIO-INPUT, #922),
+    // `num_generated_keyframes` (defined by row LTX25-GENERATED-KEYFRAMES #920,
+    // SERVED by row LTX25-DFR-PIPELINE #986) and `temporal_upsample_rounds`
+    // (#986). DEFINED is still not SERVED — the last one is defined so that its
+    // own refusal can name the missing loop, exactly as `CheckUnservedExtras`
+    // does on the load side (#611). Everything OUTSIDE the list is refused
+    // rather than ignored, for the reason `CheckKnownExtras` gives for the load
+    // side: a mistyped knob that is silently dropped renders the DEFAULT and
+    // looks like the feature not working.
     const bool known = kv.first == kLtx2ImageCrfExtra || kv.first == kLtx2AudioPathExtra ||
                        kv.first == kLtx2AudioStartTimeExtra ||
                        kv.first == kLtx2AudioMaxDurationExtra ||
                        kv.first == kLtx2GeneratedKeyframesExtra ||
+                       kv.first == kLtx2TemporalRoundsExtra ||
                        kv.first == kLtx2RetakeStartTimeExtra ||
                        kv.first == kLtx2RetakeEndTimeExtra ||
                        kv.first == kLtx2RetakeFrameRateExtra ||
@@ -1370,9 +1443,10 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
            std::string(kLtx2ImageCrfExtra) + ", " + kLtx2AudioPathExtra + ", " +
            kLtx2AudioStartTimeExtra + ", " + kLtx2AudioMaxDurationExtra + ", " +
-           kLtx2GeneratedKeyframesExtra + ", " + kLtx2RetakeStartTimeExtra + ", " +
-           kLtx2RetakeEndTimeExtra + ", " + kLtx2RetakeFrameRateExtra + ", " +
-           kLtx2RegenerateVideoExtra + ", " + kLtx2RegenerateAudioExtra);
+           kLtx2GeneratedKeyframesExtra + ", " + kLtx2TemporalRoundsExtra + ", " +
+           kLtx2RetakeStartTimeExtra + ", " + kLtx2RetakeEndTimeExtra + ", " +
+           kLtx2RetakeFrameRateExtra + ", " + kLtx2RegenerateVideoExtra + ", " +
+           kLtx2RegenerateAudioExtra);
     }
   }
   // The two audio WINDOW knobs only mean something alongside a file. Accepting
@@ -1388,7 +1462,72 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       }
     }
   }
-  CheckGeneratedKeyframes(gen.extras);
+  CheckGeneratedKeyframes(gen.extras, im.pipeline_kind);
+
+  // ── DFR's temporal x2/x4 rounds — DEFINED, refused above 0 (#986) ──────────
+  //
+  // `temporal_upsample_rounds` (dfr_pipeline.py:277, :584-590), `choices=(0, 1,
+  // 2)`, `default=0`. Two answers, and giving the same one to both would be
+  // wrong: a value outside the set is a MALFORMED REQUEST and upstream refuses
+  // it first (:284-285), before the pipeline looks at anything; a value INSIDE
+  // the set is a legal request for a loop this port does not have.
+  {
+    const std::string raw = VideoExtra(gen.extras, kLtx2TemporalRoundsExtra);
+    if (!raw.empty()) {
+      const int64_t rounds = ExtraInt(gen.extras, kLtx2TemporalRoundsExtra, 0);
+      if (rounds < 0 || rounds > kLtx2DfrMaxTemporalRounds) {
+        Fail("the '" + std::string(kLtx2TemporalRoundsExtra) + "' extra is " +
+             std::to_string(rounds) +
+             "; upstream's own refusal is `temporal_upsample_rounds must be 0, 1, or 2` "
+             "(ltx-pipelines/dfr_pipeline.py:284-285), raised at the top of `__call__` before "
+             "any work is paid for.");
+      }
+      // DELIBERATELY NOT GUARDED ON `pipeline_kind` FIRST. A "this knob only
+      // means something on the dfr pipeline" refusal would be true, and it would
+      // be UNREACHABLE: the rounds loop is unported on every pipeline including
+      // `dfr`, so the check below already answers every caller and the
+      // pipeline-specific branch could never fire. That is the unselected-branch
+      // shape `.agents/reachability.md` enumerates, and writing it now would
+      // land a refusal nothing can trip. It belongs to whichever row serves the
+      // rounds, and the message below says the knob is DFR's so a caller on
+      // another pipeline still learns it.
+      if (rounds != 0) {
+        Fail(
+            "DFR's temporal refinement rounds are not served. This knob is `DFRPipeline`'s alone "
+            "(ltx-pipelines/dfr_pipeline.py:277); no other pipeline `__call__` takes one. "
+            "WHAT IS MISSING IS THE ROUNDS "
+            "LOOP (ltx-pipelines/dfr_pipeline.py:402-529), not the upsampler it calls. Each "
+            "round temporally x2-upsamples the video latent (:407), doubles both the playback "
+            "and the conditioning fps under a 60 fps cap (:409, :414, :74-78), re-tiles the "
+            "canvas into `2**round` keyframe-seam windows (:415), invents mid-segment slots per "
+            "tile (:470-478), denoises each tile with an ancestral Euler step at eta 0.5 and a "
+            "PER-TILE noise seed (:495-499), stitches the tiles back (:508) and merges the "
+            "denoised slots into the next round's anchor bag (:527-529). "
+            "WHAT IS *NOT* THE REASON, and each of these was re-derived at this tree rather "
+            "than inherited. FIRST, NOT the temporal x2 latent upsampler: it is ported and "
+            "gated against executed upstream at reduced dimensions (row "
+            "LTX25-TEMPORAL-UPSAMPLER, `.agents/specs/ltx25-temporal-upsampler.md`), including "
+            "`PixelShuffle1d` and the first-frame drop (model/upsampler/model.py:68-71, "
+            "109-113), and `Ltx2ParseUpsamplerConfig` already reads `temporal_upsample` off a "
+            "checkpoint config. SECOND, NOT the canvas layout: `resolve_canvas`, `tile_ranges`, "
+            "`stitch_tile_latents` and the carry-forward merge are ported and gated in this "
+            "same row (`ltx2_dfr.h`, `test_ltx2_dfr`), so the tile geometry every round needs "
+            "already exists and is checked against upstream's own return values. THIRD, NOT the "
+            "generated keyframe slots: they are SERVED here, which is what the base and detail "
+            "stages run on. What has no local counterpart is the DENOISE PASS AS A CALLABLE — "
+            "upstream's rounds loop invokes the same `DiffusionStage.__call__` the two stages "
+            "use, per tile, with its own sigmas, stepper and seed, and this engine's denoise is "
+            "written inline in one per-phase loop with no seam a tile can enter through. "
+            "AND ONE THING IS MISSING THAT NO CODE CAN SUPPLY: the checkpoint. "
+            "`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors` "
+            "(ltx-pipelines/docs/pipelines.md:176) is NOT on the NAS — the "
+            "`latent_upscale_models/` directory holds the SPATIAL upscaler and nothing else, "
+            "re-verified 2026-08-16 — so even a complete loop would have no real weights to "
+            "run. Use 0, which is upstream's default and the served path. "
+            "Tracked as owed by issue #986.");
+      }
+    }
+  }
 
   // ── RETAKE: the request knobs (#924) ──────────────────────────────────────
   //
@@ -1855,6 +1994,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                                    // arm's fixed (8, 32, 32), not derived
                                    // (utils/helpers.py:66-72)
 
+  // ── DFR: the canvas, and the slot grid it decides (#986) ──────────────────
+  //
+  // Declared here and RESOLVED below `Ltx2AssertResolution`, because upstream's
+  // order is `assert_resolution` at dfr_pipeline.py:291 and `resolve_canvas` at
+  // :314, in that order. A request that is wrong on BOTH axes must hear about
+  // the resolution first, exactly as it would upstream; otherwise the two ports
+  // give different answers to the same bad request and only one of them matches
+  // the reference.
+  //
+  // `requested_frames` is captured BEFORE the pad, because it is the contract.
+  const bool is_dfr = im.pipeline_kind == "dfr";
+  const int64_t requested_frames = frames;
+  std::vector<int64_t> slot_positions;
+
   // `assert_resolution` (utils/helpers.py:540-551), at the position upstream
   // calls it from: the top of `__call__`, before any work is paid for. The
   // divisor is DERIVED — the VAE spatial factor times the worst downscale this
@@ -1897,6 +2050,39 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   }
   Ltx2AssertResolution(height, width, factors.height * recipe.max_spatial_downscale());
 
+  // ── DFR: resolve the canvas (#986) ────────────────────────────────────────
+  //
+  // `resolve_canvas` (dfr_layout.py:60-81) at `dfr_pipeline.py:314`, after
+  // `assert_resolution` and before the first stage. It PADS the request up to a
+  // whole number of keyframe segments, so the canvas this engine denoises is
+  // generally LONGER than what the caller asked for, and `:534` trims back at
+  // the end. Both halves are needed: dropping the pad would put the terminal
+  // keyframe off a segment boundary, and dropping the trim would hand the caller
+  // a clip longer than the one they requested.
+  if (is_dfr) {
+    // Upstream's admission gate, at upstream's position: the pipeline preamble,
+    // before any weight is built (`assert_generated_keyframes_supported`,
+    // utils/blocks.py:405-419, called from dfr_pipeline.py:315).
+    AssertGeneratedKeyframesSupported(im.dit.params.use_keyframes_abs_pos_embedding,
+                                      im.params.dit_path);
+    const Ltx2DfrCanvas canvas = Ltx2DfrResolveCanvas(frames, factors.time);
+    frames = canvas.num_frames;
+    slot_positions = canvas.positions;
+    im.trace.canvas_frames = canvas.num_frames;
+    im.trace.canvas_segment = canvas.segment;
+  } else {
+    // Every other pipeline takes the slot COUNT and spaces the positions evenly
+    // (`resolve_generated_keyframes`, utils/helpers.py:394-411). Resolved here
+    // rather than in the extras check because the count needs `frames`, which is
+    // not known at that point.
+    slot_positions = EvenlySpacedKeyframePositions(
+        ExtraInt(gen.extras, kLtx2GeneratedKeyframesExtra, 0), frames);
+    if (!slot_positions.empty()) {
+      AssertGeneratedKeyframesSupported(im.dit.params.use_keyframes_abs_pos_embedding,
+                                        im.params.dit_path);
+    }
+  }
+
   // `AudioLatentShape.from_video_pixel_shape` (types.py:184-200) and
   // `VideoLatentShape.from_pixel_shape` (:108-123) defaults. Asserted against the
   // DiT rather than assumed: the audio latent's channels x mel_bins IS the audio
@@ -1921,6 +2107,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
 
   std::vector<float> video_latent_volume;  // [C, F, H, W], unpatchified
   int64_t video_lc = 0, video_lf = 0, video_lh = 0, video_lw = 0;
+  // The generated keyframe slots as the LAST phase that ran produced them, and
+  // the layout that locates them. Carried ACROSS phases: stage 2 seeds its slots
+  // with stage 1's, spatially upsampled (dfr_pipeline.py:348, :364).
+  Ltx2LatentVolume slot_keyframes;
+  Ltx2GeneratedKeyframeLayout slot_layout;
   std::vector<float> audio_latent_volume;  // [C, F, M], unpatchified
   int64_t audio_lc = 0, audio_lf = 0, audio_lm = 0;
 
@@ -2153,6 +2344,39 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
              std::to_string(vshape.height) + "x" + std::to_string(vshape.width));
       }
       video_initial = up.data;
+
+      // THE SLOTS TAKE THE SAME UPSAMPLER (#986). `dfr_pipeline.py:348` runs the
+      // stage-1 slots through `self.upsampler` — the SPATIAL one, the same
+      // object and the same call as the video latent on the line after it
+      // (:349) — before stage 2 uses them as `initial_keyframes` (:364).
+      //
+      // Each slot is one latent frame, and they are upsampled as a K-frame
+      // volume here because that is what upstream hands over: `self.upsampler`
+      // takes the whole `(B, C, K, H, W)` tensor. That is safe for the SPATIAL
+      // arm in a way it would not be for a decode — the operator is
+      // convolutional in H and W and the temporal axis only rides along, which
+      // is why upstream can upsample slots together and must still DECODE them
+      // apart (types.py:269-272).
+      if (slot_keyframes.frames > 0) {
+        const Ltx2LatentVolume up_slots = Ltx2UpsampleVideoLatent(
+            im.upsampler_cfg, im.upsampler_weights, slot_keyframes,
+            im.video_weights.Get("per_channel_statistics.std-of-means"),
+            im.video_weights.Get("per_channel_statistics.mean-of-means"));
+        if (up_slots.height != vshape.height || up_slots.width != vshape.width ||
+            up_slots.channels != vshape.channels ||
+            up_slots.frames != static_cast<int64_t>(slot_positions.size())) {
+          Fail("the upsampled generated keyframe slots are " +
+               std::to_string(up_slots.channels) + "x" + std::to_string(up_slots.frames) + "x" +
+               std::to_string(up_slots.height) + "x" + std::to_string(up_slots.width) +
+               " but phase '" + phase.name + "' needs " + std::to_string(vshape.channels) + "x" +
+               std::to_string(slot_positions.size()) + "x" + std::to_string(vshape.height) + "x" +
+               std::to_string(vshape.width) +
+               ". The slots take the SAME spatial upsampler as the video latent "
+               "(dfr_pipeline.py:348-349), so a disagreement here means the two took different "
+               "paths.");
+        }
+        slot_keyframes = up_slots;
+      }
     }
 
     // ── build the two states (create_noised_state, helpers.py:428-445) ───────
@@ -2484,6 +2708,68 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                    "renders a clip of the right length that pins the image to the wrong end");
     }
 
+    // ── GENERATED KEYFRAME SLOTS (#986) ─────────────────────────────────────
+    //
+    // LAST among the appending items, and the order is upstream's: DFR builds
+    // `combined_image_conditionings` first and then `append`s the slot item
+    // (dfr_pipeline.py:320-330, :353-365). Items are applied in list order and
+    // each appends to the END, so putting the slots last is what makes their
+    // recorded `first_token` describe the tokens they actually occupy. A slot
+    // item applied BEFORE a supplied keyframe would record a layout that the
+    // keyframe's own append then pushes nothing off — the layout would still be
+    // correct — but the reverse ordering makes the trailing-token assumption
+    // look true, and the whole point of the layout is that it is not.
+    //
+    // SEEDED FROM THE PREVIOUS PHASE on every phase but the first. Upstream's
+    // stage 2 passes `initial_keyframes=upsampled_slot_keyframes` (:364), which
+    // are stage 1's own denoised slots run through the SPATIAL latent upsampler
+    // (:348) — the same operator the video latent takes. Dropping the seed would
+    // regenerate every slot from noise at full resolution and lose the base
+    // stage's composition, which renders a clip whose keyframes simply disagree
+    // with the video around them.
+    if (!slot_positions.empty()) {
+      Ltx2LatentState state = ToLatentState(video, /*pos_dims=*/3);
+      Ltx2ConditionVideoByGeneratedKeyframeSlots(
+          &state, vshape, /*patch_size=*/1, factors, fps, slot_positions,
+          slot_keyframes.frames > 0 ? &slot_keyframes : nullptr);
+      slot_layout = state.generated_keyframe_layout;
+      FromLatentState(state, &video);
+
+      VT_CHECK(video.tokens ==
+                   target_tokens + static_cast<int64_t>(slot_positions.size()) *
+                                       slot_layout.tokens_per_keyframe,
+               "ltx2 video: the generated keyframe slots must APPEND one latent frame of tokens "
+               "per slot (keyframe_slots.py:83-84, :136-140), and the sequence did not grow by "
+               "that many");
+      // THE MARKER REACHED THE NEW TOKENS. This is the one thing the slot arm
+      // buys over an ordinary append, it is what `marked=true` exists for
+      // (keyframe_slots.py:121), and nothing about the render's shape, its token
+      // count or its frame count can see whether it happened. A slot appended
+      // with `marked=false` costs the same tokens, renders the same size, and
+      // silently omits the trained embedding — which is precisely the polarity
+      // `ltx2_conditioning.h` warns about for the first-frame mask.
+      VT_CHECK(static_cast<int64_t>(video.keyframes_mask.size()) == video.tokens,
+               "ltx2 video: the keyframes mask must cover every token after the slot append");
+      int64_t marked = 0;
+      for (int64_t t = slot_layout.first_token; t < video.tokens; ++t) {
+        if (video.keyframes_mask[static_cast<size_t>(t)] != 0.0F) ++marked;
+      }
+      // Read off the state the loop will actually run over, not off the request.
+      // A trace that restated the request would report a healthy slot count on a
+      // build that appended nothing — the failure mode `audio_frozen` already
+      // paid for on this struct.
+      im.trace.slot_positions = slot_positions;
+      im.trace.slot_marked_tokens = marked;
+      VT_CHECK(marked == slot_layout.num_tokens(),
+               "ltx2 video: every generated keyframe slot token must be MARKED in "
+               "`keyframes_mask` (`extend_keyframes_mask(..., marked=True)`, "
+               "keyframe_slots.py:121) — upstream's only marked call site, and the whole reason "
+               "a slot differs from a supplied keyframe. " +
+                   std::to_string(marked) + " of " + std::to_string(slot_layout.num_tokens()) +
+                   " are marked. An unmarked slot costs the same tokens and renders the same "
+                   "size while omitting the trained embedding.");
+    }
+
     // The noiser draws VIDEO first, AUDIO second, from one generator
     // (blocks.py:554-563 builds the video state before the audio one; :576-580,
     // which this used to cite, is the TEARDOWN and proves nothing about order).
@@ -2716,10 +3002,42 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // instrument that can see the difference. The check is what turns "the head
     // happens to be right" into "the buffer IS the target grid", and it is what
     // makes deleting the trim a RED rather than a silent pass.
+    //
+    // AND IT EXTRACTS THE GENERATED KEYFRAME SLOTS BEFORE IT TRIMS (#986).
+    // Upstream's order, `tools.py:97` against `:115`, and the order is the whole
+    // content: the slots live OUTSIDE the target grid, so this trim is exactly
+    // what destroys them. Extracting afterwards returns a perfectly correct
+    // video latent and no slots, with nothing in the shape, the token count or
+    // the frame count to show for it.
     {
       Ltx2LatentState finished = ToLatentState(video, /*pos_dims=*/3);
-      Ltx2ClearConditioning(&finished, target_tokens);
+      finished.generated_keyframe_layout = slot_layout;
+      Ltx2LatentVolume extracted;
+      Ltx2ClearConditioning(&finished, target_tokens, &vshape, /*patch_size=*/1, &extracted);
       FromLatentState(finished, &video);
+
+      if (!slot_positions.empty()) {
+        VT_CHECK(extracted.frames == static_cast<int64_t>(slot_positions.size()),
+                 "ltx2 video: `clear_conditioning` must return one latent frame per generated "
+                 "keyframe slot (ltx_core/tools.py:203-230) and it returned " +
+                     std::to_string(extracted.frames) + " for " +
+                     std::to_string(slot_positions.size()) + " slots");
+        // THE SLOTS CARRY CONTENT. The extraction can be structurally perfect
+        // and still read a range the denoise never touched — a slot seeded with
+        // zeros, held at denoise mask 0 by a wrong polarity, comes back as
+        // exactly the zeros it went in as, in the right shape, at the right
+        // count. Upstream pins the slots at `denoise_mask = 1`
+        // (keyframe_slots.py:118-119) precisely so the loop fills them, so an
+        // all-zero readback means the mask, not the layout, is wrong.
+        VT_CHECK(AbsMax(extracted.data) > 0.0,
+                 "ltx2 video: every extracted generated keyframe slot is exactly zero. The "
+                 "layout located a token range the denoise loop never wrote, which is what a "
+                 "slot pinned at denoise mask 0 looks like — upstream sets the slot mask to ONE "
+                 "(keyframe_slots.py:118-119) so the loop generates into it, and the clean "
+                 "tensor it would otherwise lerp toward is deliberately zeros (:139).");
+        im.trace.slot_tokens_extracted = extracted.frames;
+        slot_keyframes = extracted;
+      }
     }
     VT_CHECK(video.tokens == target_tokens &&
                  static_cast<int64_t>(video.latent.size()) == target_tokens * video.width,
@@ -2776,6 +3094,62 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         }
       }
     }
+  }
+
+  // ── DFR: trim the padded canvas back to the caller's contract (#986) ──────
+  //
+  // `dfr_pipeline.py:531-540`. The canvas padded its tail up to a whole number
+  // of keyframe segments, and what the caller is owed is
+  // `(requested - 1) * 2**rounds + 1`. With the rounds arm refused above, that
+  // is `requested` itself — written through `Ltx2DfrTargetFrames` anyway rather
+  // than as `requested_frames`, so the two expressions cannot drift apart when
+  // the rounds land.
+  //
+  // `requested - 1` is a multiple of the VAE temporal scale — `resolve_canvas`
+  // refuses anything else (dfr_layout.py:71-72) — so the trim always lands on a
+  // latent boundary and is a SLICE rather than a resample. Upstream RAISES when
+  // the target exceeds the canvas (:535-536), which is a statement about the
+  // arithmetic rather than a defensive check: the canvas only ever pads UP.
+  if (is_dfr) {
+    const int64_t target_frames = Ltx2DfrTargetFrames(requested_frames, /*rounds=*/0);
+    if (target_frames > frames) {
+      Fail("target " + std::to_string(target_frames) + " frames exceeds the generated canvas " +
+           std::to_string(frames) +
+           " (ltx-pipelines/dfr_pipeline.py:535-536). The canvas only ever pads UP, so this "
+           "means the segment grid and the trim disagree.");
+    }
+    if (target_frames != frames) {
+      const int64_t keep = (target_frames - 1) / factors.time + 1;
+      if (keep > video_lf) {
+        Fail("the DFR trim wants " + std::to_string(keep) + " latent frames and the canvas has " +
+             std::to_string(video_lf));
+      }
+      // [C, F, H, W] row-major, so the trim is a per-CHANNEL copy of the leading
+      // `keep` frames rather than a truncation of the flat buffer. A plain
+      // resize would keep channel 0's whole time axis and drop the last
+      // channel's entirely, and the result is still a correctly shaped latent.
+      const int64_t plane = video_lh * video_lw;
+      std::vector<float> trimmed(static_cast<size_t>(video_lc * keep * plane));
+      for (int64_t c = 0; c < video_lc; ++c) {
+        const size_t src = static_cast<size_t>(c * video_lf * plane);
+        std::copy(video_latent_volume.begin() + static_cast<ptrdiff_t>(src),
+                  video_latent_volume.begin() + static_cast<ptrdiff_t>(src) +
+                      static_cast<ptrdiff_t>(keep * plane),
+                  trimmed.begin() + static_cast<ptrdiff_t>(c * keep * plane));
+      }
+      video_latent_volume.swap(trimmed);
+      video_lf = keep;
+      frames = target_frames;
+    }
+    // The audio was generated for the PADDED canvas, so it outlasts the picture
+    // and upstream cuts it to the video's duration (dfr_pipeline.py:552-560).
+    // That cut is done AFTER the vocoder, beside the waveform it applies to;
+    // see the block above `VideoResult result` at the end of this function.
+    //
+    // This comment used to say the cut was "already implied by the trimmed
+    // `frames`" and that was FALSE: `audio_lf` carries the padded count out of
+    // the phase loop and the vocoder runs over all of it, so trimming the video
+    // latent here changes nothing about the soundtrack.
   }
 
   // ── decode (distilled.py:314-315) ─────────────────────────────────────────
@@ -2933,6 +3307,45 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                                          mel.channels, mel.frames, mel.mel_bins, &audio_samples);
     audio_channels = mel.channels;
     audio_rate = im.vocoder_cfg.output_sampling_rate;
+  }
+
+  // ── DFR: cut the soundtrack to the picture (#986) ─────────────────────────
+  //
+  // `dfr_pipeline.py:552-560`, and upstream states the consequence rather than
+  // the mechanism: "Audio was generated for the padded canvas, so cut it to the
+  // video's duration or the muxed container outlasts the picture."
+  //
+  // THE AUDIO IS NOT COVERED BY THE VIDEO TRIM ABOVE, and a comment here claimed
+  // it was until this was checked. `ashape.frames` is derived from the PADDED
+  // `frames` inside the phase loop, `audio_lf` carries that padded count out of
+  // the loop, and the vocoder above runs over all of it. Trimming the video
+  // latent moves `frames` and touches none of that, so a 9-frame DFR request
+  // would emit 9 frames of picture beside 25 frames' worth of sound. Nothing in
+  // the render's shape, its frame count or its exit status can see it; it shows
+  // up only in the muxed container, which this library does not produce.
+  //
+  // `min` because the waveform may already be shorter — upstream takes the same
+  // min, and a cut that grew the buffer would read past its end.
+  if (is_dfr && audio_rate > 0 && audio_samples > 0) {
+    const double video_seconds = static_cast<double>(frames) / fps;
+    const int64_t want = std::min<int64_t>(
+        audio_samples, static_cast<int64_t>(std::llround(video_seconds *
+                                                         static_cast<double>(audio_rate))));
+    if (want > 0 && want != audio_samples) {
+      // The waveform is [channels, samples_per_channel] and the cut is per
+      // CHANNEL, which is upstream's `waveform[..., :audio_samples]`. A flat
+      // resize would keep channel 0 whole and truncate the last one to nothing,
+      // and the result is still a playable file.
+      std::vector<float> cut(static_cast<size_t>(audio_channels * want));
+      for (int64_t c = 0; c < audio_channels; ++c) {
+        const size_t src = static_cast<size_t>(c * audio_samples);
+        std::copy(waveform.begin() + static_cast<ptrdiff_t>(src),
+                  waveform.begin() + static_cast<ptrdiff_t>(src) + static_cast<ptrdiff_t>(want),
+                  cut.begin() + static_cast<ptrdiff_t>(c * want));
+      }
+      waveform.swap(cut);
+      audio_samples = want;
+    }
   }
 
   VideoResult result;

@@ -201,8 +201,12 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv() {
   //
   // (a) THE PREFILL FIGURES HERE WERE UNSOURCED. This comment read "~205 t/s =
   //     1.16x AHEAD of pp128 176.6". NO recorded run produces either operand:
-  //     `git grep 176.6` finds only an unrelated MoE microbenchmark mean in
-  //     MICROSECONDS, and no arm of ours recorded 205 t/s. The owning record
+  //     `git grep -F 176.6` finds it in four other files, none of them a
+  //     llama.cpp prefill number: a MoE microbenchmark mean in MICROSECONDS
+  //     (benchmark-record.md), a 176.69 in an ours-vs-vLLM ledger row
+  //     (parity-ledger.md), two LTX golden floats, and #1003's own index row.
+  //     Do not grep the regex `176.6`: the `.` matches any character and buries
+  //     these in ~360 hits. No arm of ours recorded 205 t/s. The owning record
   //     (gguf-keep-quant-loader.md:595, benchmark-record.md:10722) says 204 t/s
   //     against pp128 173.2 = 1.18x. The numbers are NOT reconciled here, because
   //     picking one would assert an attribution nobody measured; #1003 owes a

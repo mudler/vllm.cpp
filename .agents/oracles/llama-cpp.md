@@ -35,9 +35,13 @@ and then thirteen. A count of one file kept inside another goes stale the moment
 the first file grows, which `AGENTS.md` §Records names as the coupling to avoid,
 and this is the first surface a reader of the pin reaches. The set has grown
 three times, each time because a sweep instrument was widened rather than because
-anything new was measured, so any number you remember is a lower bound. That spec
-also records **five** llama.cpp revisions in play, one of which is a fork branch
-with no commit recorded anywhere in this tree.
+anything new was measured, so any number you remember is a lower bound.
+
+That spec also enumerates the distinct llama.cpp revisions those measurements ran
+against, and one of them is a fork **branch** with no commit recorded anywhere in
+this tree. Read the count there rather than here, for the reason above and for a
+sharper one: that spec's own `## Owed` already schedules another entry, so a
+number written here would be stale against a change it can already see coming.
 
 [#1003](https://github.com/mudler/vllm.cpp/issues/1003) owes the re-take. The
 superseded measurements stay where they are, with their provenance, including

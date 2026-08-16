@@ -257,6 +257,18 @@ refused naming both sides rather than bound half from each. Different components
 MAY disagree with each other: a `modelopt_mixed` checkpoint really does ship an
 FP8 tower beside an NVFP4 MLP, and the dense arm reads exactly that.
 
+**Which code runs an FP8 projection is no longer a Qwen3.5 detail.** The
+per-tensor FP8 W8A8 residency and GEMM entry points live in
+`include/vllm/model_executor/models/dense_fp8_gemm.h`, with the scheme policy in
+`include/vllm/model_executor/layers/quantization/fp8.h`, so any model binds them
+through `layers::MakeLinearMethod(bf16_weight, fp8_weight)` — the same shape the
+NVFP4 W4A16 seam already had. The bound method exposes two arms: `Apply`, which
+quantizes the activation itself with the checkpoint's `input_scale`, and
+`ApplyPreQuantized`, which takes an activation a preceding fused epilogue already
+quantized and runs only the GEMM. Nothing about running Qwen3.5 changes: the
+levers (`VT_DENSE_NATIVE`, `VT_DENSE_CUBLASLT_FP8`) keep their names and
+defaults, and the path stays CUDA-only.
+
 Still OWED for the MoE arm, and refused BY NAME rather than discovered as a dtype
 complaint: an NVFP4 attention or GDN tower, an FP8 shared expert, an FP8
 `lm_head`, a per-expert-but-unquantized routed layout, and a non-BF16 stacked

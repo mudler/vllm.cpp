@@ -35,6 +35,7 @@
 #include <optional>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_fp8_gemm.h"   // dense_fp8:: FP8 W8A8 seam (#940)
 #include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // dense_nvfp4::MarlinDenseEnabled
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vt/backend.h"
@@ -1452,79 +1453,27 @@ const OwnedTensor& DenseLmHead(const Qwen3_5DenseWeights& weights) {
   return weights.tied_lm_head ? weights.embed_tokens : weights.lm_head;
 }
 
-// Device-resident view over an Fp8Weight's raw fp8 [N,K] bytes, uploaded ONCE
-// (lazily) and reused across every forward step (mirror ResidentNvfp4). The
-// shared_ptr in the (const) weight owns the device buffer for the model lifetime.
-Tensor ResidentFp8(Dev d, const Fp8Weight& w) {
-  if (!w.d_packed) {
-    const size_t pb = w.packed.bytes.size();
-    void* p = d.b.Alloc(pb);
-    d.b.Copy(d.q, p, w.packed.bytes.data(), pb);
-    Backend* bk = &d.b;
-    w.d_packed = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
-  }
-  return MakeTensor(w.d_packed.get(), DType::kI8, d.q.device, {w.n, w.k});
-}
+// --- FP8 W8A8 dense seam (issue #940) ---------------------------------------
+// `ResidentFp8`, `DenseCublasLtFp8Enabled`, `MatmulFp8CutlassD` and
+// `MatmulFp8CutlassPreQuantD` USED to be defined right here, in this anonymous
+// namespace, which meant a second model could not reach them at all — the exact
+// "hand-roll a parallel path" trap AGENTS.md §"Shared seams" forbids. Their ONE
+// definition now lives in dense_fp8_gemm.h (the FP8 sibling of
+// dense_nvfp4_gemm.h) and the three names below are pure type adapters: this
+// file keeps its own anonymous-namespace `Dev`/`DBuf` (the KNOWN DUPLICATION
+// dense_nvfp4_gemm.h records), so it instantiates the shared template with THOSE
+// types and the generated code is what it was. No logic lives here; a change to
+// the seam changes this model's arithmetic, which is what makes the extraction
+// provable rather than decorative.
+using dense_fp8::DenseCublasLtFp8Enabled;
 
-// cuBLASLt FP8 dense GEMM toggle (VT_DENSE_CUBLASLT_FP8, DEFAULT ON when the fp8
-// weights are resident). Routes the fp8 dense projections through vt::
-// MatmulFp8CublasLt (cuBLASLt e4m3 — the native equivalent of vLLM's measured-
-// FASTER nvjet_sm121_qqtst fp8 kernels) instead of vt::MatmulFp8Cutlass (our
-// cutlass sm120 fp8 GEMM, measured NEUTRAL vs bf16 at M=64/sm_121a). The
-// activation quant + fp8-resident weight are IDENTICAL for both — only the GEMM
-// backend differs, so both are the same fp8 W8A8 math (vLLM's scheme).
-// VT_DENSE_CUBLASLT_FP8=0 restores the cutlass fp8 GEMM (the previous, validated
-// path) for the parent's authoritative A/B.
-bool DenseCublasLtFp8Enabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("VT_DENSE_CUBLASLT_FP8");
-    return !(e != nullptr && e[0] == '0');
-  }();
-  return on;
-}
-
-// y[M,N] = x[M,K] (bf16/f32 device) @ dequant(w).T via a per-tensor W8A8 fp8
-// GEMM: static per-tensor activation quant (vt::QuantFp8Static with the
-// checkpoint input_scale) then an fp8 GEMM with the folded alpha
-// (= input_scale·weight_scale). By DEFAULT the GEMM is cuBLASLt fp8 (vt::
-// MatmulFp8CublasLt — mirrors vLLM's nvjet_qqtst fp8 dense); VT_DENSE_CUBLASLT_
-// FP8=0 selects the cutlass sm120 fp8 GEMM (vt::MatmulFp8Cutlass). out dtype f32
-// (q/k/v, in_proj_qkv/z sinks) or bf16 (o/out_proj residual sinks). CUDA-only
-// (the 35B W8A8 path is CUDA-resident — fp8 fields are populated by DEFAULT on
-// the CUDA+cutlass load, VT_DENSE_NATIVE).
 DBuf MatmulFp8CutlassD(Dev d, const Tensor& x, const Fp8Weight& w, DType out_dtype) {
-  const int64_t M = x.shape[0], K = x.shape[1], N = w.n;
-  VT_CHECK(vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, d.q.device.type),
-           "MatmulFp8CutlassD: the fp8 W8A8 path is CUDA-only");
-  DBuf a_fp8(d, DType::kI8, {M, K});
-  vt::QuantFp8Static(d.q, a_fp8.t(), x, w.input_scale);
-  Tensor wdev = ResidentFp8(d, w);
-  DBuf dout(d, out_dtype, {M, N});
-  if (DenseCublasLtFp8Enabled())
-    vt::MatmulFp8CublasLt(d.q, dout.t(), a_fp8.t(), wdev, w.alpha);
-  else
-    vt::MatmulFp8Cutlass(d.q, dout.t(), a_fp8.t(), wdev, w.alpha);
-  return dout;
+  return dense_fp8::MatmulFp8CutlassD<DBuf>(d, x, w, out_dtype);
 }
 
-// Pre-quantized fp8 analog of MatmulFp8CutlassD: the activation is ALREADY the
-// static-quant fp8 [M,K] (produced ONCE — either by RmsNormQuantFp8 or a shared
-// quant — and fed to every projection reading it), so this SKIPS the internal
-// QuantFp8Static and runs only the fp8 GEMM. The fp8 counterpart of
-// MatmulNvfp4Fp4DirectD; each GEMM still applies its own folded alpha (= shared
-// input_scale · this projection's weight_scale), so the result is identical to
-// MatmulFp8CutlassD(x) when a_fp8 == QuantFp8Static(x, w.input_scale).
-DBuf MatmulFp8CutlassPreQuantD(Dev d, const Tensor& a_fp8, const Fp8Weight& w, DType out_dtype) {
-  const int64_t M = a_fp8.shape[0], N = w.n;
-  VT_CHECK(vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, d.q.device.type),
-           "MatmulFp8CutlassPreQuantD: the fp8 W8A8 path is CUDA-only");
-  Tensor wdev = ResidentFp8(d, w);
-  DBuf dout(d, out_dtype, {M, N});
-  if (DenseCublasLtFp8Enabled())
-    vt::MatmulFp8CublasLt(d.q, dout.t(), a_fp8, wdev, w.alpha);
-  else
-    vt::MatmulFp8Cutlass(d.q, dout.t(), a_fp8, wdev, w.alpha);
-  return dout;
+DBuf MatmulFp8CutlassPreQuantD(Dev d, const Tensor& a_fp8, const Fp8Weight& w,
+                               DType out_dtype) {
+  return dense_fp8::MatmulFp8CutlassPreQuantD<DBuf>(d, a_fp8, w, out_dtype);
 }
 
 // --- Merged FP8 QKVParallelLinear (VT_FP8_MERGED_QKV, opt-in). The FP8 (W8A8)

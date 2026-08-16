@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/schemes/nvfp4.h"
+#include "vllm/model_executor/layers/quantization/fp8.h"
 #include "vllm/model_executor/model_loader/mxfp4_dequant.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -453,4 +454,108 @@ TEST_CASE("linear_method: bf16 UnquantizedLinearMethod apply == reference Matmul
       CHECK(got[static_cast<size_t>(m) * N + n] == doctest::Approx(acc).epsilon(0.02));
     }
   }
+}
+
+// ===========================================================================
+// FP8 W8A8 (per-tensor) — the seam extracted from qwen3_5.cpp by #940.
+//
+// Same two questions this file already asks of NVFP4, asked of FP8: does the
+// factory pick the scheme ONCE from the checkpoint (get_quant_method), and is
+// the extracted compute REACHED rather than sitting dead beside the model. The
+// numeric arm runs on dgx (the fp8 GEMM is CUDA-only, see below); what a host
+// build can prove is selection and the inherited device refusal, and both of
+// those go red if the guard or the wiring in dense_fp8_gemm.h moves.
+namespace {
+
+// A minimal non-empty per-tensor FP8 W8A8 weight in the shape `LoadFp8Raw`
+// produces (qwen3_5_weights.cpp:423): raw e4m3fn [N,K] bytes, per-tensor
+// weight_scale + input_scale, folded alpha. Powers of two, so nothing here
+// rounds. Bytes stay below 0x7E — 0x7F/0xFF are NaN in e4m3fn.
+vllm::Fp8Weight MakeFp8W8A8(int64_t N, int64_t K, uint32_t seed) {
+  vllm::Fp8Weight w;
+  w.n = N;
+  w.k = K;
+  w.weight_scale = 0.00390625F;
+  w.input_scale = 0.0078125F;
+  w.alpha = w.input_scale * w.weight_scale;
+  w.packed.dtype = DType::kI8;
+  w.packed.rank = 2;
+  w.packed.shape[0] = N;
+  w.packed.shape[1] = K;
+  w.packed.bytes.resize(static_cast<size_t>(N * K));
+  uint32_t s = seed;
+  auto* bytes = reinterpret_cast<uint8_t*>(w.packed.bytes.data());
+  for (int64_t i = 0; i < N * K; ++i) {
+    s = s * 1664525u + 1013904223u;
+    bytes[static_cast<size_t>(i)] = static_cast<uint8_t>((s >> 16) % 0x7EU);
+  }
+  return w;
+}
+
+}  // namespace
+
+TEST_CASE("linear_method: factory selects bf16 vs fp8-w8a8 by weight presence") {
+  OwnedTensor bf16 = MakeBf16({4, 16}, 3);
+  vllm::Fp8Weight empty_fp8;  // Empty() == true
+  vllm::Fp8Weight fp8 = MakeFp8W8A8(4, 16, 31);
+  REQUIRE(empty_fp8.Empty());
+  REQUIRE_FALSE(fp8.Empty());
+
+  // get_quant_method analogue: a bf16 checkpoint => UnquantizedLinearMethod.
+  auto m_bf16 = layers::MakeLinearMethod(bf16, empty_fp8);
+  CHECK(std::string(m_bf16->Name()) == "bf16-unquantized");
+
+  // An fp8-resident checkpoint => the per-tensor W8A8 method, chosen ONCE here.
+  auto m_fp8 = layers::MakeLinearMethod(bf16, fp8);
+  CHECK(std::string(m_fp8->Name()) == "fp8-w8a8-per-tensor");
+
+  // The two overloads coexist: same call spelling, different weight type, and
+  // the NVFP4 one is unaffected by the FP8 one being in scope.
+  auto m_fp4 = layers::MakeLinearMethod(bf16, MakeNvfp4W4A16(4, 16));
+  CHECK(std::string(m_fp4->Name()) == "compressed-tensors-nvfp4-w4a16");
+}
+
+// REACHABILITY of the extracted seam from the POLICY layer. Both arms of
+// dense_fp8_gemm.h run their `kMatmulFp8CublasLt`-registered guard first, and
+// that op is CUDA-only (tests/vt/test_ops_fp8_cpu.cpp:445-453 pins that), so on
+// a host queue each must THROW that exact refusal. This is not a test of the
+// refusal for its own sake: it is the assertion that `Fp8W8A8LinearMethod::
+// Apply` / `ApplyPreQuantized` actually execute the shared template bodies.
+// Deleting either VT_CHECK from dense_fp8_gemm.h, or pointing the method at
+// something else, turns this case red.
+TEST_CASE("linear_method: the fp8 w8a8 method reaches the shared seam in both arms") {
+  const int64_t M = 2, K = 16, N = 4;
+  OwnedTensor bf16 = MakeBf16({N, K}, 11);
+  OwnedTensor xw = MakeBf16({M, K}, 13);
+  vllm::Fp8Weight fp8 = MakeFp8W8A8(N, K, 17);
+
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  vt::Backend& b = vt::GetBackend(vt::DeviceType::kCPU);
+  vllm::dense_attn::Dev d{b, q};
+  vllm::dense_attn::DBuf x(d, DType::kBF16, {M, K}, xw.bytes.data());
+
+  auto method = layers::MakeLinearMethod(bf16, fp8);
+  REQUIRE(std::string(method->Name()) == "fp8-w8a8-per-tensor");
+
+  CHECK_THROWS_WITH_AS(method->Apply(d, x.t(), DType::kF32),
+                       doctest::Contains("MatmulFp8CutlassD: the fp8 W8A8 path is CUDA-only"),
+                       std::runtime_error);
+
+  // The pre-quantized arm (the `QuantizedActivation` overload) reaches its own
+  // entry point, not the plain one — the message names which.
+  const auto* fp8_method =
+      dynamic_cast<const layers::Fp8W8A8LinearMethod*>(method.get());
+  REQUIRE(fp8_method != nullptr);
+  vllm::dense_attn::DBuf a_fp8(d, DType::kI8, {M, K});
+  CHECK_THROWS_WITH_AS(
+      fp8_method->ApplyPreQuantized(d, a_fp8.t(), DType::kBF16),
+      doctest::Contains("MatmulFp8CutlassPreQuantD: the fp8 W8A8 path is CUDA-only"),
+      std::runtime_error);
+
+  // The refusal is the OP TABLE's answer, not a hardcoded device test: the two
+  // CPU reference arms #468/#842 registered DO resolve here, and the model-layer
+  // predicate still names the cuBLASLt op. That is the residual gap, pinned.
+  CHECK(vt::OpRegistered(vt::OpId::kQuantFp8Static, vt::DeviceType::kCPU));
+  CHECK(vt::OpRegistered(vt::OpId::kMatmulFp8Cutlass, vt::DeviceType::kCPU));
+  CHECK_FALSE(vt::OpRegistered(vt::OpId::kMatmulFp8CublasLt, vt::DeviceType::kCPU));
 }

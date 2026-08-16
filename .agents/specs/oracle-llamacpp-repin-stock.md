@@ -675,10 +675,11 @@ It is still a real loss of precision that this spec asserted the opposite of, an
 that is the same conclusion-right, evidence-wrong shape as §"176.6 is not a number
 this tree measured" two sections down. **The tightening was deferred when this
 section was written**, because re-narrowing the gating expression a second time
-in one pass owes its own before-and-after count and its own mutation sweep, and
-the error runs in the safe direction meanwhile. **It is taken now**, and it
-carries all three. See §"The leading word boundary is restored", which also
-answers the question this section left open about whether the 18 are the same 18.
+in one pass owes three things: its own before-and-after count, an adjudication of
+every line the narrowing drops, and its own mutation sweep. The error runs in the
+safe direction meanwhile. **It is taken now**, and it carries all three. See
+§"The leading word boundary is restored", which also answers the question this
+section left open about whether the 18 are the same 18.
 
 **The fix is not to add four tokens to stage 2.** That leaves two spellings that
 can drift again, which is the whole defect. Stage 2 is now `FAVOURABLE`, compiled
@@ -811,38 +812,98 @@ architecture names, a CUTLASS API generation, or a quantization type. The one
 file that leaves the sweep, `src/vt/cpu/cpu_quant_dot_sdot.cpp`, reached it on
 that single `Q8_0 x Q8_0` comment and on nothing else.
 
-**Two of those anchors went stale inside this pull request, which is the same
-warning §"The SHA is load-bearing" gives about the counts.** Merging
-`origin/main` at `b493f4981` added 67 lines to `src/vt/cuda/cuda_quant_dot.cu`,
-so its `Q8_0×Q8_0` comment moved from `:1067` to `:1068`, and this section's own
-new prose entered the sweep as a nineteenth removal. Re-run on the merged tree
-the drop reads 19 removals and still **zero** insertions, still no verdict, and
-the largest single contributor to the change is again this spec. The table above
-stays as it was read at `0f8580e269`. Re-derive rather than quote it.
+**The table files each line under one shape, so its counts are LINE counts and
+not token counts.** `sm_12x` is on five of the 18 and the arch row names one of
+them. The other four carry a CUTLASS generation in the same line and are filed
+above: `.agents/backend-matrix.md:172`, `.agents/parity-ledger.md:768`,
+`STATE-LEGACY-000001.md:27492` and `:27493`. Reading `2` off the arch row as the
+number of `sm_12x` matches therefore under-counts it by four. Nothing about the
+adjudication moves, because all five are glued text under either filing, which is
+the property that decides them. Count a token with `grep` over the removal list
+rather than off this table.
+
+**One anchor went stale inside this pull request and a nineteenth removal joined
+the list, which is the same warning §"The SHA is load-bearing" gives about the
+counts.** Merging `origin/main` at `b493f4981` added 67 lines to
+`src/vt/cuda/cuda_quant_dot.cu`, so its `Q8_0×Q8_0` comment moved from `:1067` to
+`:1068`. That is the anchor, and it is the only one that moved. This section's
+own new prose then entered the sweep as a nineteenth removal, which is a new line
+rather than a stale anchor. Re-run on the merged tree the drop reads 19 removals
+and still **zero** insertions, still no verdict, and the largest single
+contributor to the change is again this spec. The table above stays as it was
+read at `0f8580e269`. Re-derive rather than quote it.
 
 **Is it the same 18 that §"The two stages were one idea spelled twice" names?**
 That section could not say, because its 18 were read at `85a9a7ae7` and it had
-no second reading to compare against. Re-derived at `0f8580e269`, where the
-question does have an answer: **yes in kind, and the answer that matters is the
-one about the ratios the `\b` KEEPS.** Of the baseline's 1278 candidates, **38**
-match a ratio branch and are invisible to the retired pipe's
-`\b[1-9][0-9]*(\.[0-9]+)? *[x×]`. The leading `\b` drops **34** of those 38 and
-keeps **4**. The four it keeps are `0.058x` twice, `0.086×` and `0.029×`, which
-are exactly the fractional-leading-zero measurements §"The two stages" identified
-as the retired pipe's own 7-line miss. So the two changes really are separable:
-**restoring the boundary removes the glued text and leaves every real ratio,
-including every ratio below 1.0.** The value rule stays deleted, because the axis
-and not the value decides a ratio's polarity.
+no second reading to compare against. Re-derived at `0f8580e269` with the two
+files the recipe above wrote, which is what a reader has to run to get the same
+partition rather than a number to take on trust:
+
+```sh
+cd /tmp/sweep && python3 - <<'PY'          # the partition, and the two splits
+import contextlib, io, re
+def run(p):                        # the recipe's own two files, imported rather
+    d = {"__name__": "__main__"}   # than re-spelled, so this cannot drift
+    with contextlib.redirect_stdout(io.StringIO()):
+        exec(open(p).read(), d)
+    return d
+b, a = run("/tmp/before.py"), run("/tmp/after.py")
+pick = lambda d: [k for k in d["FAV"] if "[0-9]" in k]     # the ratio branches,
+assert len(pick(b)) == len(pick(a)) == 2, (pick(b), pick(a))   # counted, not read
+rb, ra = (re.compile("|".join(pick(d))) for d in (b, a))
+old = re.compile(r"\b[1-9][0-9]*(\.[0-9]+)? *[x×]")     # the retired stage-2 pipe
+key = lambda c: (c.split(":", 2)[0], int(c.split(":", 2)[1]))
+cand, keep, src = list(map(key, b["cand"])), set(map(key, a["cand"])), {}
+def line(p, n):
+    src.setdefault(p, open(p, errors="replace").read().splitlines())
+    return src[p][n - 1]
+stop = [k for k in cand if rb.search(line(*k)) and not ra.search(line(*k))]
+blind = [k for k in cand if rb.search(line(*k)) and not old.search(line(*k))]
+print("stop", len(stop), "leave", sum(k not in keep for k in stop),
+      "survive", sum(k in keep for k in stop))
+print("blind", len(blind), "dropped", sum(not ra.search(line(*k)) for k in blind))
+print(*[f"{p}:{n} {ra.findall(line(p, n))}"
+        for p, n in blind if ra.search(line(p, n))], sep="\n")
+PY
+```
+
+**Yes in kind, and the answer that matters is the one about the ratios the `\b`
+KEEPS.** Of the baseline's 1278 candidates, **38** match a ratio branch and are
+invisible to the retired pipe's `\b[1-9][0-9]*(\.[0-9]+)? *[x×]`. The leading
+`\b` drops **34** of those 38 and keeps **4**. The four are four LINES carrying
+three spellings, because one line carries two ratios:
+
+| kept line | ratios on it |
+|---|---|
+| `.agents/benchmark-record.md:19021` | `0.058x` |
+| `.agents/specs/cpu-decode-barrier-and-attn-dispatch.md:33` | `0.058x` |
+| `.agents/specs/muse-glimmer.md:918` | `0.058x` |
+| `.agents/specs/gguf-compute-in-quant-gemm.md:528` | `0.086×` and `0.029×` |
+
+An earlier draft wrote that set as "`0.058x` twice, `0.086×` and `0.029×`", which
+is a 2+1+1 partition of four lines. The composition is 3+1. The spellings and the
+total are the parts that were right, and the spellings are exactly the
+fractional-leading-zero measurements §"The two stages" identified as the retired
+pipe's own 7-line miss. So the two changes really are separable: **restoring the
+boundary removes the glued text and leaves every real ratio, including every
+ratio below 1.0.** The value rule stays deleted, because the axis and not the
+value decides a ratio's polarity.
 
 The 34 and the 18 differ for a reason worth stating, since a reader will
 otherwise read one of them as wrong. A line can lose its ratio match and stay a
-candidate on another comparison token. **34 candidate lines stop matching a
-ratio. 18 of them had no other token and leave the sweep.** Stage 2 falls by the
-same 18, so the other 16 kept their favourable verdict on a word token.
+candidate on another comparison token. Over every baseline candidate, with no
+scope on it: **35 candidate lines stop matching a ratio, 18 of them had no other
+token and leave the sweep, and 17 survive.** Stage 2 falls by the same 18. Inside
+the 38 above the same split reads 34, 18 and 16, and an earlier draft gave that
+scoped pair with the scope left off. The line the two readings differ by is
+`.agents/coordination.md:1759`, which the retired pipe already saw on the `2x` of
+`SM100_MMA_F8F6F4_{SS,2x1SM_SS}`, so it is outside the 38 and it survives on
+another token.
 
 **The mutation pass this owed.** Re-narrowing the gating expression owes proof
 that the self-test still detects a dead alternative, so all 43 were re-run
-against the block above rather than against a copy of it, at `0f8580e269`:
+against the python block this spec carries rather than against a copy of it, at
+`0f8580e269`:
 **43 red, 0 defects.** The 38 token mutations are each alternative neutered to
 `(?!)` and each deleted outright. The 5 narrowings are the rows of the table in
 the section before this one, with the ratio row now spelled
@@ -896,6 +957,28 @@ standing gate. Its consumer is #1003, and it has no reader after #1003 discharge
 the thirteen re-takes. `AGENTS.md` §"Nothing lands dead" is about exactly this
 shape: a class reachable only from its own test proves the class works and never
 that anything reaches it.
+
+**The fresh review agreed with the refusal and ranked the three reasons in a
+different order, which is recorded here because it makes the refusal conditional
+rather than absolute.** It reads the §"Nothing lands dead" argument as the
+decisive one and the `row/*` friction as second, and it calls "raises its
+authority" the weakest of the three, because that reason is about how a reader
+weighs a green rather than about the tree. It also names what the paragraph above
+under-weights: a scheduled self-test WOULD catch a recurrence of the sixth hole,
+a token that is present and dead, which is a real defect class this instrument
+has already carried once. **The condition to revisit is therefore stated rather
+than left implicit. If #1003 gains a second consumer, the decisive argument
+evaporates and the move to `tools/` is to be taken again.**
+
+**Keeping the instrument in a markdown fence has one cost a later editor has to
+know about.** The extraction in the section above ends
+`[block] = [x for x in b if "FAVOURABLE" in x and "ls-files" in x]`, so a second
+python fence in this file carrying both strings makes that unpacking raise
+`ValueError` and the recipe stops. It fails loud rather than selecting the wrong
+block, which is the acceptable direction and is why the filter stays as it is. No
+fence in this spec matches today, and the derivation fence the section above adds
+is `sh` and cannot. An editor who adds a second matching one narrows the filter
+rather than deleting it.
 
 **A per-shape control on every alternative is refused because a control is a
 string its author writes.** It proves the shape the author thought of is matched.
@@ -1819,8 +1902,9 @@ half had none while the token half had nineteen, and a narrowing there could
 delete 64% of the output with the self-test green. **That green still proves
 liveness and not shape coverage**, which is the standing bound under `## Owed`.
 Its ratio branches carry a leading `\b` again, which costs 18 false positives
-and keeps every real ratio including the four below 1.0, and the instrument
-stays in this document for a decided reason rather than an undecided one.
+and keeps every real ratio, including the four lines below 1.0 that the retired
+stage-2 pipe could not see, and the instrument stays in this document for a
+decided reason rather than an undecided one.
 Thirteen
 contaminated measurements, seven favourable verdicts, five llama.cpp revisions,
 one of which is a branch name with no commit behind it. No row changes lifecycle

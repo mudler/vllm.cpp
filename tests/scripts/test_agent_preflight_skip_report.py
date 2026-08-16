@@ -238,6 +238,28 @@ class PreflightHarness(unittest.TestCase):
             if line.startswith(gate) and ("--base " in line or "--range " in line)
         ]
 
+    def skip_reason(self, report: Report, label: str) -> str:
+        """The indented reason block printed under one SKIP label.
+
+        `report.skip` carries the labels only, so an assertion made against
+        `report.text` cannot tell a reason printed under the gate it explains
+        from the same words printed anywhere else in the run. This reads the
+        block `skip()` indents by nine columns, which is the reason and nothing
+        else.
+        """
+
+        lines = report.text.splitlines()
+        for index, line in enumerate(lines):
+            if not (line.startswith("  SKIP ") and line[7:].strip() == label):
+                continue
+            reason = []
+            for following in lines[index + 1 :]:
+                if not following.startswith("         "):
+                    break
+                reason.append(following[9:])
+            return "\n".join(reason)
+        return ""
+
     # -- preconditions -------------------------------------------------------
 
     def assert_ran_something(self, report: Report) -> None:
@@ -591,6 +613,77 @@ class AnUnknownIsNotAnEmptyRangeTests(PreflightHarness):
             report.text,
             f"the ancestry skip does not say what is unknown:\n{report}",
         )
+
+    def test_a_range_skip_carries_the_message_git_printed(self) -> None:
+        """RED before: the reason named a status and showed an empty value.
+
+        Discarding stderr is what keeps it out of the VALUE, and `2>/dev/null`
+        also threw the message away. The reader was told that the count
+        `exited 128 and printed [] on stdout` and never told why, although git
+        had already said why in one line. A skip that names no cause is honest
+        and not actionable, and this row owes both halves.
+
+        The fix is the discipline the same block already uses two lines above
+        for `ANCESTRY_ERROR`: the message goes into its OWN variable, never into
+        the value that an arm is selected from. `2>&1 >/dev/null` is the
+        ordering that yields the message alone, because stderr is duplicated
+        onto the capture before stdout leaves for `/dev/null`.
+        """
+
+        self.set_origin_main(self.base)
+        self.git("checkout", "--orphan", "unborn")
+
+        # PRECONDITION: git has to actually write a diagnostic to stderr for the
+        # exact command the script runs. If it prints nothing there is no
+        # message to carry and this case asserts nothing.
+        probe = subprocess.run(
+            ["git", "rev-list", "--count", f"{self.base}..HEAD"],
+            cwd=self.tmp, capture_output=True, text=True, check=False,
+        )
+        self.assertNotEqual(
+            0,
+            probe.returncode,
+            "precondition failed: the count succeeded, so no skip is reported "
+            "and this case asserts nothing.",
+        )
+        printed = probe.stderr.strip().splitlines()
+        self.assertNotEqual(
+            [],
+            printed,
+            "precondition failed: git wrote nothing to stderr, so there is no "
+            "message for the reason to carry.",
+        )
+        message = printed[0]
+        self.assertIn(
+            "fatal:",
+            message,
+            f"precondition failed: git's first stderr line is not a diagnostic: {message}",
+        )
+
+        report = self.preflight()
+        self.assert_ran_something(report)
+
+        # The trailer gates take the ANCESTRY arm here (`--is-ancestor` exits
+        # 128 on an unborn HEAD), so `RANGE_UNKNOWN` reaches exactly these
+        # three. Asserting it on the other two would pass on the wrong message.
+        for label in (
+            "now-current range",
+            "doc-checkpoint range",
+            "issue-index append-only",
+        ):
+            with self.subTest(gate=label):
+                reason = self.skip_reason(report, label)
+                self.assertNotEqual(
+                    "",
+                    reason,
+                    f"{label} reported no SKIP with a reason:\n{report}",
+                )
+                self.assertIn(
+                    message,
+                    reason,
+                    f"{label} skipped without the message git printed, so the "
+                    f"reader is told a status and not a cause:\n{report}",
+                )
 
 
 class StderrIsNotTheValueTests(PreflightHarness):

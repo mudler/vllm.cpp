@@ -228,9 +228,18 @@ branch, then rerun. Unknown is not absence."
 # a count: without it, any non-numeric value reaches `-gt` and its status-2 error
 # is indistinguishable from "zero commits". The two halves cover different
 # failures, so both are here.
+#
+# Discarding stderr also had a COST, and the cost is paid separately rather than
+# argued away. `2>/dev/null` threw the message away along with its influence on
+# the value, so an unborn HEAD reported "exited 128 and printed [] on stdout"
+# while git had already named the cause in one line. That report is honest and
+# not actionable, and this row owes both. The rule is message-NOT-a-value, not
+# no-message: the text goes into its own variable, which nothing compares and no
+# arm reads, exactly as ANCESTRY_ERROR already did one line above.
 ANCESTRY_ERROR=""
 ANCESTRY_STATUS=0
 RANGE_COUNT=""
+RANGE_ERROR=""
 RANGE_STATUS=0
 if [ -n "$BASE_SHA" ]; then
   # stderr stays merged HERE deliberately. ANCESTRY_ERROR is a MESSAGE and never
@@ -239,6 +248,12 @@ if [ -n "$BASE_SHA" ]; then
   # call also writes to stderr and exits 0, and every ancestry arm is unaffected.
   ANCESTRY_ERROR="$(git merge-base --is-ancestor "$BASE_SHA" HEAD 2>&1)"
   ANCESTRY_STATUS=$?
+  # The count is asked TWICE, for two different things, and the order matters
+  # twice over. `2>&1 >/dev/null` duplicates stderr onto the capture BEFORE
+  # stdout leaves for /dev/null, so this call yields the message alone and never
+  # the count. The value call runs second so RANGE_STATUS still describes the
+  # command the value came from. Nothing selects an arm from RANGE_ERROR.
+  RANGE_ERROR="$(git rev-list --count "${BASE_SHA}..HEAD" 2>&1 >/dev/null)"
   RANGE_COUNT="$(git rev-list --count "${BASE_SHA}..HEAD" 2>/dev/null)"
   RANGE_STATUS=$?
 fi
@@ -258,8 +273,9 @@ An unborn HEAD is one way to reach this. Unknown is not a verdict on ancestry."
 RANGE_UNKNOWN="git rev-list --count ${BASE_SHA}..HEAD exited ${RANGE_STATUS} and
 printed [${RANGE_COUNT}] on stdout, which is not a commit count, so this run
 could not count the commits under judgement. An unborn HEAD is one way to reach
-this, and so is a git that writes an error to stderr and still exits 0. Rerun
-that command to read what it printed.
+this, and so is a git that writes an error to stderr and still exits 0. git
+wrote this to stderr:
+${RANGE_ERROR}
 Unknown is not an empty range."
 
 echo "Session role:"

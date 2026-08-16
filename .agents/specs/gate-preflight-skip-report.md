@@ -148,6 +148,11 @@ The fifth was missing from the first version of this table, which listed four.
 A census that stops when it has found the defect is not a census, and this row's
 whole subject is a report that omits what it did not examine.
 
+The table carries a sixth row that is not a sixth consumer. This row's own suite
+reads `returncode` too, and it is listed so that a reader who greps for that
+field finds every match accounted for rather than one match unexplained. It
+defines the contract instead of consuming it, and the verdict column says so.
+
 | Consumer | How it reads preflight | Verdict |
 |---|---|---|
 | `scripts/agent-ready.py` `run_local_preflight` | `returncode == 0`, nothing else | **The defect.** `AGENTS.md` names it the gate to run "before remote handoff". The `SKIP` lines, the `N gate(s) SKIPPED` summary and the missing banner are all invisible to it, so a behind branch reached `READY: local and live PR/CI evidence are green` with two gates never run, and an unresolvable base reached it with five. The word "green" printed over a trailer check that had not executed. Fixed by passing `--fail-on-skip`. |
@@ -155,6 +160,7 @@ whole subject is a report that omits what it did not examine.
 | `scripts/check-test-registration.py` `_preflight_execution_errors` | requires `rc == 0` from an instrumented run | Reads the status as a fact about the *script's own execution*, never as a verdict about a tree. Its `git` shim fails every call, so `BASE_SHA` is empty and five gates skip on every run of it. This consumer is why the default cannot flip: making a skip exit 1 unconditionally turns `check-test-registration` red, and that checker is itself in `CHECKERS`. |
 | `tests/scripts/test_agent_onboard.py` `:485` and `:500` | executes `scripts/agent-preflight.sh --role-only` and asserts on the exit status and the output | Unaffected, and named here to complete the census rather than because it is at risk. `--role-only` returns from the role block, above every record gate and both range blocks, so no `skip` can have been recorded by the time either call reads the status. Verified by reading the two call sites, not inferred from the flag's name. |
 | a human at a shell, plus the `scripts/agent-preflight.sh passes` checkbox in `.github/pull_request_template.md` | reads the report | Unchanged, and the reason the default stays 0. |
+| `tests/scripts/test_agent_preflight_skip_report.py`, through `Report.returncode` | asserts on the exit status in the `--fail-on-skip` and empty-range cases | Named for completeness only, and not a sixth consumer. It **defines** the contract the five above consume rather than depending on it, so it cannot be broken by a change to the exit status: a change there makes this suite red by construction, which is the point of it. |
 
 So the flag is opt-in because the population splits cleanly: one machine
 consumer that must not read a skip as success, one instrumented consumer that
@@ -281,6 +287,53 @@ alone is enough, and the mutations in §7.9 show each half failing on its own.
    indistinguishable from "zero commits". Inferring from exit 0 that stdout is a
    decimal integer is the assumption that produced this defect, and the repair
    should not keep making it.
+
+### 3.6.2 What `2>/dev/null` cost, and how the cost is paid
+
+The list above states the benefit of discarding stderr and stops there. The
+redirect also had a **cost**, and this section records it, because a trade-off
+written down as only its upside is the shape of an argument rather than the
+shape of a measurement.
+
+`2>/dev/null` keeps stderr out of the value **and throws the message away**. An
+unborn HEAD then reported
+
+```
+git rev-list --count <sha>..HEAD exited 128 and printed [] on stdout, which is
+not a commit count, so this run could not count the commits under judgement.
+```
+
+while git had already named the cause in one line, `fatal: ambiguous argument
+'<sha>..HEAD': unknown revision or path not in the working tree`. Before the
+repair for `|| echo 0`, that text reached the terminal by accident, because
+nothing captured it. The repair captured the call and silenced it in the same
+stroke. The report was still honest, and it lost the half a reader can act on.
+This row exists for a report that is honest **and** actionable, so half of it is
+not the goal met.
+
+**The rule is message-not-a-value, not no-message.** Both are satisfied at once
+by capturing the text into its own variable, which nothing compares and no arm
+reads:
+
+```sh
+RANGE_ERROR="$(git rev-list --count "${BASE_SHA}..HEAD" 2>&1 >/dev/null)"
+RANGE_COUNT="$(git rev-list --count "${BASE_SHA}..HEAD" 2>/dev/null)"
+RANGE_STATUS=$?
+```
+
+Two details carry the correctness. `2>&1 >/dev/null` duplicates stderr onto the
+capture **before** stdout is sent to `/dev/null`, so the message arrives alone
+and the count can never enter it. The reverse order would capture the count and
+discard the message, which is the defect wearing the fix as a disguise. And the
+value call runs **second**, so `RANGE_STATUS` still describes the command the
+value came from rather than the diagnostic call beside it.
+
+`ANCESTRY_ERROR` at the same site is the precedent this follows, so the two
+queries beside each other now report the same way. The captured text prints
+inside `RANGE_UNKNOWN`, which a run reaches only when the count is unusable, and
+case 17 asserts that it is there. Two mutations pin it: dropping `${RANGE_ERROR}`
+from the reason, and reverting the capture to a discard, each reddening case 17
+alone.
 
 **`ANCESTRY_ERROR` merges stderr the same way and is correct as it stands.**
 Checked rather than assumed. Under the same broken-alternates repository
@@ -425,6 +478,24 @@ Cases added by the second fresh review of this row, both in
     §3.6.1 are in the change. No real git behaves this way. The case pins the
     *arm*, not a git.
 
+Case added by the third fresh review of this row, in
+`AnUnknownIsNotAnEmptyRangeTests` and red on `3fd734a5b`:
+
+17. `test_a_range_skip_carries_the_message_git_printed` runs the unborn-HEAD
+    scenario and asserts that the reason printed under each of the three range
+    gates **contains the line git wrote to stderr**. It reads the reason through
+    the new `skip_reason` harness helper, which returns the nine-column block
+    `skip` indents under one label, rather than matching against the whole
+    transcript: the same words printed anywhere else in a long report would
+    otherwise satisfy the assertion. Its precondition asserts that git really
+    fails and really writes a `fatal:` line for that exact command, so a git that
+    printed nothing could not pass the case by leaving nothing to carry. It
+    asserts only the three range gates, because `--is-ancestor` exits 128 on an
+    unborn HEAD and the two trailer gates take the ancestry arm, whose reason
+    carries a different message. **RED before:** the reason names exit 128 and an
+    empty value and no cause. **After:** it carries `fatal: ambiguous argument
+    ...` beside each gate. §3.6.2 records the trade-off this case pins.
+
 Mutation cases, each restoring the tree byte-for-byte afterwards:
 
 - Delete the `skipped` check from the summary. Cases 1 and 4 must go red.
@@ -441,10 +512,23 @@ Mutation cases, each restoring the tree byte-for-byte afterwards:
 - Make the numeric predicate unmatchable, and separately delete the
   `RANGE_NUMERIC` term from both range arms. Case 16 must go red for each and
   case 15 must stay green.
+- Drop `${RANGE_ERROR}` from the `RANGE_UNKNOWN` reason, and separately revert
+  the capture to `2>/dev/null` so there is no message to print. Case 17 must go
+  red for each, and cases 15 and 16 must stay green.
 
 The last two pairs are the evidence that the two halves of §3.6.1 are not
 redundant. If either half covered the other, one of these mutations would leave
 the suite green.
+
+The mutation harness restores from a **pristine copy taken before the first
+mutation**, never with `git checkout --`. The first run of this row's matrix used
+`git checkout -- scripts/agent-preflight.sh`, which reverts to the committed file
+and therefore deleted the uncommitted repair under test. The first mutation was
+then measured against the repair and the next two against its absence, so case 17
+reddened under mutations that have nothing to do with it and the result read as a
+finding about the code. The per-mutation hash comparison is what exposed it. An
+instrument that restores from `HEAD` injects exactly the defect it was built to
+detect, and the cost of getting this wrong is a verdict, not an error message.
 
 ## 6. Gates
 
@@ -580,12 +664,22 @@ The three, named, with what each printed in that run:
 
 **Why an out-of-disk instrument accuses the code here.**
 `scripts/check-test-registration.py` does its work in a temporary directory at
-`:300`, `:489` and `:737`, each under `tempfile.TemporaryDirectory`, and
-`_configure_cmake` at `:72-91` runs a real `cmake -S . -B <tempdir>` after
-requesting the CMake File API codemodel, then reads the reply back out of that
-directory. When the write fails there is no reply to read, the target list is
-empty, and the checker reports precisely a **missing cmake target**: a verdict
-about the tree, phrased in the vocabulary of the tree, produced by a full disk.
+`:300`, `:489` and `:737`, each under `tempfile.TemporaryDirectory`. `_configure`
+at `:67-78` requests the CMake File API codemodel at `:72-74` and then runs a
+real `cmake -S . -B <tempdir>` at `:75-78`, and `_codemodel_targets` at `:81-110`
+reads the reply back out of that same directory at `:91-97`, returning an empty
+target map at `:93-94` when no `index-*.json` is there. When the write fails
+there is no reply to read, the target list is empty, and the checker reports
+precisely a **missing cmake target**: a verdict about the tree, phrased in the
+vocabulary of the tree, produced by a full disk.
+
+Each fact above is anchored to the function that carries it, because the earlier
+version of this paragraph cited `_configure_cmake` at `:72-91`, and that symbol
+does not exist anywhere in the tree. The span also straddled two functions, so
+half of what it claimed was in the other one. This is the section that was
+rewritten precisely because its evidence was thin, and a reader who greps the
+cited symbol and finds nothing cannot tell a wrong anchor from a wrong claim.
+`grep -rn '_configure_cmake' .` now matches nothing.
 
 That mechanism is measured rather than argued. Deliberately reproduced on a
 1 MiB `tmpfs` filled to zero bytes and pointed at by `TMPDIR`, on this tree, at
@@ -800,6 +894,97 @@ tree this branch does not control rather than attributed:
 | `test_cpu_x86_llamacpp_floor` | Load-dependent, [#618](https://github.com/mudler/vllm.cpp/issues/618). It reported `ok` in this branch's own pre-merge preflight run, and `Ran 10 tests`, `OK` in 80s on pristine `332aed738` earlier in the same session. It fails now with the box at load 126 to 180, and every failing assertion carries the harness's own reason: `waiting for quiet: 15s busy=110% builders=0 load=172.07`. The suite refuses to measure a contended box, which is the behaviour it is built for, so this red is the instrument declining to produce a number rather than a verdict about the tree |
 
 Disk was checked before any of these attributions, as §7.5.1 requires.
+
+### 7.12 The third review's two repairs
+
+The third fresh review returned `PASS` and raised two `LOW` observations. Both
+are on this row's own theme, a report that is honest **and** actionable, so both
+were taken.
+
+**The wrong anchor.** `grep -rn '_configure_cmake' .` matched exactly one line in
+the tree, the §7.5.1 sentence that cited it. The functions that carry those facts
+are `_configure` at `scripts/check-test-registration.py:67-78` and
+`_codemodel_targets` at `:81-110`, so the cited span `:72-91` also straddled two
+of them. §7.5.1 now anchors each fact to the function that carries it, and the
+grep matches nothing.
+
+**The discarded message.** RED before, on `3fd734a5b`:
+
+```
+$ python3 tests/scripts/test_agent_preflight_skip_report.py
+Ran 17 tests -- FAILED (failures=3)
+FAIL: test_a_range_skip_carries_the_message_git_printed (gate='now-current range')
+FAIL: test_a_range_skip_carries_the_message_git_printed (gate='doc-checkpoint range')
+FAIL: test_a_range_skip_carries_the_message_git_printed (gate='issue-index append-only')
+```
+
+Three failures and one case, because the case reports one `subTest` per range
+gate. Every other case stayed green, so the new assertion is the only thing this
+red measures. GREEN after: `Ran 17 tests -- OK`.
+
+What the reader now gets, from the unborn-HEAD scenario reproduced by hand
+against a scratch repository and the stub `python3`:
+
+```
+  SKIP now-current range
+         git rev-list --count 78d72e768..HEAD exited 128 and
+         printed [] on stdout, which is not a commit count, so this run
+         could not count the commits under judgement. An unborn HEAD is one way to reach
+         this, and so is a git that writes an error to stderr and still exits 0. git
+         wrote this to stderr:
+         fatal: ambiguous argument '78d72e768..HEAD': unknown revision or path not in the working tree.
+```
+
+**The mutation matrix, rerun in full.** Every mutation is shown applied by a diff
+against a pristine copy, the script is shown parsing before any result is read,
+and each run's case count is asserted non-zero, because a suite that never ran
+prints no failures and reads as a pass:
+
+| Mutation | Applied | Parses | Cases ran | Red |
+|---|---|---|---:|---|
+| `2>/dev/null` reverted to `2>&1` on the value | 1 line | yes | 17 | case 15 only, `failures=6` |
+| numeric `case` pattern made unmatchable | 1 line | yes | 17 | case 16 only, `failures=6` |
+| `RANGE_NUMERIC` dropped from both arms | 2 lines | yes | 17 | case 16 only, `failures=6` |
+| `${RANGE_ERROR}` dropped from the reason | 1 line | yes | 17 | case 17 only, `failures=3` |
+| `RANGE_ERROR` capture reverted to a discard | 1 line | yes | 17 | case 17 only, `failures=3` |
+
+The three prior mutations still redden exactly their own case, so the new
+assertion is not coupled to them and they are not coupled to it. After each
+mutation the script was restored and its sha256 compared against the
+pre-mutation value `a7437384ea7fd9b60b3e8daf86885866a2eaeec3a3a967908261c21f91e60d88`,
+matching every time.
+
+**The harness ate the tree once, and the hash check is why that is known.** The
+first version of the matrix restored with `git checkout --`, which reverted to
+the committed file and deleted the uncommitted repair under test. Mutations 2 and
+3 were then measured against a script with no repair in it, and case 17 reddened
+under both. Read at face value that is a finding about the code, and it is
+entirely an artefact of the instrument. §5 records the rule that follows.
+
+**The row's own preflight run**, `bash scripts/agent-preflight.sh --quiet`, gated
+against `origin/main 45b022cdc138ae15b77b0149093071353de8ad4e`, which both range
+block headings name:
+
+| Block heading | `ok` | `FAIL` | `SKIP` |
+|---|---:|---:|---:|
+| `Session role:` | 1 | 0 | 0 |
+| `Record gates:` | 25 | 1 | 0 |
+| `Mutation suites:` | 44 | 1 | 0 |
+| `Committed range vs origin/main 45b022cdc:` | 3 | 0 | 0 |
+| `Commit trailers vs origin/main 45b022cdc:` | 2 | 0 | 0 |
+| total | 75 | 2 | 0 |
+
+**`SKIP` is 0**, so this run skipped nothing, which is the claim the row is
+about. The two failures are `check-agent-record` and `test_agent_record`, the
+inherited duplicate `#995` row that §7.11 already measured on a pristine
+worktree and that `fix/issue-index-995-dup` owns. `test_cpu_x86_llamacpp_floor`
+is green in this run, one block up from where §7.11 recorded it red, which is
+the load dependence [#618](https://github.com/mudler/vllm.cpp/issues/618)
+describes rather than a change in the tree.
+
+Disk was checked before any attribution, as §7.5.1 requires: the root filesystem
+held 49 GiB free before the run and 39 GiB after, at load 41 to 77. No gate here
+ran out of space, so §7.5.1 does not apply to either red.
 
 ## 8. Stop conditions
 

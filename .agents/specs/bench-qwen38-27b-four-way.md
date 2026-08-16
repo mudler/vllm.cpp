@@ -62,8 +62,9 @@ not-comparable verdicts of section 2.4 that leaned on it.
 `6635279d8` (vllm#39612, 2026-06-13) removed the whole surface and moved it out
 of tree. At `555967922`:
 
-- `vllm/model_executor/model_loader/__init__.py:33-48` lists every load format and
-  `gguf` is not among them, and `_LOAD_FORMAT_TO_MODEL_LOADER` at `:49-66` agrees.
+- the `LoadFormats` `Literal` at `vllm/model_executor/model_loader/__init__.py:33-49`
+  lists every load format and `gguf` is not among them, and
+  `_LOAD_FORMAT_TO_MODEL_LOADER` at `:50-66` agrees.
 - `vllm/model_executor/layers/quantization/__init__.py:12-46` has no `gguf` entry
   in `QuantizationMethods`.
 - `vllm/config/load.py:30-58` documents the same set and ends with "Other custom
@@ -104,9 +105,9 @@ which is the same missing underscore the `qwen3_moe` entry exists to paper over.
 is its own class. The second and third are one class over different parameters
 of the same module, which the inverted wording of blocker 3 previously obscured:
 
-1. `GGUFConfig.get_quant_method` (`layers/quantization/gguf.py:106-124`) handles
-   `LinearBase`, `VocabParallelEmbedding` and `FusedMoE`, and returns `None` for
-   everything else. There is no gated-delta-net state path.
+1. `GGUFConfig.get_quant_method` (`layers/quantization/gguf.py:105-125`) handles
+   `LinearBase`, `VocabParallelEmbedding` and `FusedMoE`, and returns `None` at
+   `:125` for everything else. There is no gated-delta-net state path.
 2. `Qwen3_5GatedDeltaNet` holds `A_log` and `dt_bias` as bare parameters with
    custom sharded loaders (`models/qwen3_5.py:250,253,257-258`). In
    `_get_gguf_weights_map` (`loader.py:2149-2153`) an unresolvable name yields
@@ -135,8 +136,8 @@ refused. Its own citation refutes it. At `f63458b5`:
 `GGUFConfig.get_quant_method` is therefore never reached for `conv1d`, no
 `GGUFLinearMethod` is ever attached, and the module stays a dense layer of the
 model dtype. If it failed it would fail loudly on the weight, not quietly on the
-method. The withdrawn wording also reached `.agents/issue-index.md:266`, which is
-append-only and cannot carry the correction, see the note under `## Now`.
+method. The withdrawn wording also reached `.agents/issue-index.md:266`, and that
+row is corrected in place because it has not landed, see the note under `## Now`.
 
 **Where the silence actually lives is a property of the load path, and it is not
 yet attributed to a named parameter.** Three facts about `f63458b5` are
@@ -344,7 +345,10 @@ this section the project's own record contains **zero** occurrences of the strin
 attached rather than carried forward as a target.
 
 Our binding quantized-27B cell is 10.756 against vLLM's 11.250 at c1
-(`docs/BENCHMARKS.md:96-97`, Qwen3.6-27B NVFP4). That is a **raw** decode number.
+(`docs/BENCHMARKS.md:97-98`, Qwen3.6-27B NVFP4). The anchor covers both rows on
+purpose, because the refusal below turns on the pair rather than on either half:
+`:97` is our own row and carries 10.756, `:98` is the vLLM 0.25.0 row and carries
+11.250, and `:96` is the table separator. That is a **raw** decode number.
 Dividing 38.28 by it compares a drafted arm against a raw one and is refused by
 this spec.
 
@@ -369,8 +373,33 @@ output tokens with zero errors, three repetitions each:
 
 Both directions are load-bearing. Ours wins aggregate throughput by 2.21x at c16
 and 1.44x at c8 and wins TTFT by 6x to 12x. **SGLang wins the steady-state
-per-token decode-latency axis**, and that TPOT and ITL deficit is a reproduced
-open gap recorded as such, not explained away.
+per-token decode-latency axis at the configuration this table measured**, and
+that TPOT and ITL result is reproduced rather than explained away.
+
+**Its cause is attributed, which this section understated until 2026-08-16.** A
+same-day follow-up, `CLAIM-DECODE-LATENCY-EXPLORE`
+([sglang-matrix.md](../sglang-matrix.md) lines 210-224, full curve in
+[decode-latency-lever.md](decode-latency-lever.md)), confirmed by direct
+measurement that the gap is **batch composition, not per-token kernel cost**.
+Sweeping our own decode batch over 1, 2, 4, 8 and 16 on the same 27B-NVFP4 arm
+gives an ITL of 101.75 ms at batch 1, already at or below SGLang's 104 to 105 ms
+operating point, rising monotonically to 158.5 ms at batch 16. nsys shows every
+hot decode kernel sublinear in batch, 1.6x to 1.8x wall time for 16 times the
+tokens, so per-token GPU cost falls rather than rises. SGLang's effective decode
+concurrency at its own operating point is about 4 rather than 16, because its
+prefill-first admission queue keeps few requests decoding at once. The throughput
+win and the ITL loss are therefore the same lever, and the knob is named and
+already exists: `max_num_seqs` and `max_num_batched_tokens`, with a
+latency-oriented point at `max_num_seqs` about 8 measured at 21 percent lower ITL
+while still holding 1.38x SGLang's throughput.
+
+**What that does and does not settle.** Our shipped default stays
+throughput-oriented and is unchanged, so at the configuration the table above
+measured the deficit is real and stands as recorded. What changes is its
+description: it is a declared trade with an attributed cause and a named knob,
+not an unexplained per-token deficiency. No ceiling is declared either. The batch-1
+point already sits at SGLang's operating point, so what a latency-oriented default
+would cost on the other axes is open and unmeasured.
 
 **This is not this campaign's subject and is not a rebuttal of 38.28.** It is
 Qwen3.6-27B-NVFP4 at `890bdef7`, cache-neutral, c8 and c16 only, both arms
@@ -392,9 +421,11 @@ named `dspark`. That is the claim, and it is the same one
 
 **Two wider claims that stood here until 2026-08-16 are withdrawn**, because
 neither survives a check against the pin. The same overreach reached
-`.agents/issue-index.md:266` ("DSpark does not exist at our SGLang pin") and the
-body of commit `17187f134`, neither of which can carry a correction, see the
-note under `## Now`.
+`.agents/issue-index.md:266` ("DSpark does not exist at our SGLang pin"),
+[`../oracles/sglang.md`](../oracles/sglang.md) ("the pin also predates SGLang's
+DSpark speculator"), and the body of commit `17187f134`. Both records are
+corrected in place, because neither has landed. The commit body is the one carrier
+that cannot be, see the note under `## Now`.
 
 - "A repo-wide search for `dspark` returns nothing" is false.
   `git grep -il dspark f63458b5` returns `docs_new/index.mdx`, tracked at the
@@ -403,7 +434,11 @@ note under `## Now`.
   Speculative Decoding with Confidence-Driven, Variable-Length Verification".
 - "The announcement says Day-0 support, so that code postdates the pin" is
   contradicted by the pin's own documents. That blog post is dated 2026-07-06,
-  three weeks **before** the 2026-07-27 pin. Day-0 support for the Qwen3.8-27B
+  three days **before** the pinned tree itself, because `f63458b5` is dated
+  2026-07-09. The `pinned_on = 2026-07-27` in
+  [`../oracles/sglang.md`](../oracles/sglang.md) is when this project recorded
+  the pin, not when the pinned commit was written, and the earlier wording here
+  compared the blog against the recording date. Day-0 support for the Qwen3.8-27B
   checkpoint is not the same event as DSpark's arrival, and this spec conflated
   them.
 - "Not in `speculative/`" is also not the same as "not reachable". `f63458b5`
@@ -522,8 +557,12 @@ them at `.agents/issue-index.md:193`, and they are `sglang`, `diffusers` and
 2026-08-16, which was simply a miscount.
 
 **The 2026-07-28 run predates the #931 fix and is not voided by it.** The
-keepalive fires only after 15 seconds with no output on a request
-(`serving_utils.h:42` and the `AssignSseWaitResult` call sites). That run's worst
+keepalive then fired only after 15 seconds with no output on a request
+(`include/vllm/entrypoints/openai/serving_utils.h:40 @ 638eba27f~1`, and the
+`AssignSseWaitResult` call sites). That anchor is deliberately historical.
+`638eba27f` replaced the 15-second default with 0, so at HEAD the same file
+records the default as off at `:40-41`, and a reader who follows a HEAD anchor
+finds the opposite value and concludes this argument is wrong. That run's worst
 observed p99 TTFT was 7220 ms at c16 and 3589 ms at c8, with ITL near 154 ms, so
 no frame could have been emitted, and the harness independently recorded zero
 errors on every leg. This is stated because a silent assumption in the other
@@ -579,7 +618,7 @@ stated as a change.
 | Risk | Handling |
 |---|---|
 | The 38.28 figure is treated as a target and drives work | Section 3 gives it a retrievable citation, names the unverified parts, and puts this project's own measured head-to-head beside it. It is never a denominator. |
-| A reader takes 38.28 versus 10.756 as the state of the comparison | Section 3 records the direct measurement on byte-identical NVFP4 weights: ours 2.21x at c16 and 1.44x at c8 on output throughput, 6x to 12x on TTFT, with TPOT and ITL a reproduced gap in SGLang's favour. Its narrower scope is stated in the same paragraph. |
+| A reader takes 38.28 versus 10.756 as the state of the comparison | Section 3 records the direct measurement on byte-identical NVFP4 weights: ours 2.21x at c16 and 1.44x at c8 on output throughput, 6x to 12x on TTFT, with TPOT and ITL a reproduced result in SGLang's favour whose cause `CLAIM-DECODE-LATENCY-EXPLORE` attributed to batch composition and whose knob is named. Its narrower scope is stated in the same paragraph. |
 | Someone adds the two-line SGLang GGUF alias and reports a load | Section 2.2 names three further blockers, and separately proves that the load path has **no completeness guard** at `loader.py:2149-2153`, `weight_utils.py:1280,1321` and `qwen3_5.py:1359-1412,1405`. A load that prints no error is not evidence that every parameter arrived. |
 | A false capability claim survives because it is quoted rather than checked | Two of them did, for weeks: llama.cpp NVFP4 recorded as absent, and `conv1d` recorded as silently wrong by a citation that says the opposite. Both are re-derived at the pin in sections 2.2 and 2.5, with the withdrawn wording kept visible. |
 | Someone installs `vllm-gguf-plugin` to create a vLLM GGUF cell | That plugin is unpinned and has no oracle record. Pinning it is a separate decision. |
@@ -644,23 +683,41 @@ The SGLang oracle moves to `gateable = yes`.
 source facts this spec asserted were re-derived at the pins and three of them
 were wrong: llama.cpp does have NVFP4 at `237ad9b96` (section 2.5), SGLang's
 `conv1d` is not silently quantized and the polarity was inverted (section 2.2),
-and `dspark` does appear at `f63458b5`, in the pin's own documents, dated before
-the pin (section 3). The two not-comparable verdicts are re-derived and survive
-on the container disjunction. Sections 2.6 and 3 add the artifact-name caveat,
-the citation for 38.28, and this project's own measured SGLang head-to-head.
+and `dspark` does appear at `f63458b5`, in the pin's own documents, dated three
+days before the pinned tree itself (section 3). The two not-comparable verdicts
+are re-derived and survive on the container disjunction. Sections 2.6 and 3 add
+the artifact-name caveat, the citation for 38.28, and this project's own measured
+SGLang head-to-head. Section 3 also stops understating that head-to-head: the
+TPOT and ITL result has an attributed cause and a named knob, from a same-day
+follow-up this spec had not reconciled.
 
-**Two carriers of the withdrawn wording cannot be repaired in place, and that is
-recorded rather than worked around.** `.agents/issue-index.md:266` still says
-that `conv1d` "is SILENTLY WRONG rather than refused" and that "DSpark does not
-exist at our SGLang pin", and commit `17187f134`'s body says the same. Neither
-can be corrected where it sits. That index is append-only by policy and a landed
-row is never edited, and `scripts/check-agent-record.py:1439` additionally
-refuses a second row for an issue already listed, because under `merge=union` a
-duplicate number is exactly what two branches appending the same issue look
-like. A landed commit body is immutable. So the index has no mechanism for
-correcting a row once it lands, and this spec is the correction of record for
-both, which is what the protocol means by history being git and the spec.
-Anyone reading that row should read sections 2.2 and 3 here before quoting it.
+**The index row is corrected in place, and the reason the earlier round thought
+it could not be is worth recording, because that reason inverted the premise it
+acted on.** `.agents/issue-index.md:266` carried both withdrawn claims, and the
+previous round recorded the row as uncorrectable on the grounds that the index is
+append-only and a landed row is never edited. **That row has not landed.**
+`git merge-base --is-ancestor 17187f134 origin/main` is false, `origin/main`
+carries 265 index lines and zero `#979` rows, and no other local or remote branch
+carries one. The row exists only on this branch, introduced by this branch's own
+unmerged commit.
+
+The append-only rule's own rationale is what settles it. `AGENTS.md` and
+`scripts/check-issue-index-append-only.py:2-16` both give the same reason: under
+`merge=union` an EDITED line is duplicated rather than merged. That hazard needs
+the line to exist at the merge base. This one does not, and the checker measures
+exactly that, diffing the merge base against the head rather than reading the
+tree. It passes on the edit, and `scripts/check-agent-record.py` passes with it.
+The duplicate-row refusal at `check-agent-record.py:1437-1441` is real and was
+correctly described, and it is simply the wrong instrument here, because this
+corrects the first row before it lands rather than appending a second.
+
+**The commit bodies are the one carrier that stays wrong.** `17187f134` and
+`dadb3d396` both assert the withdrawn wording, and `dadb3d396` additionally
+asserts that the index correction is impossible. A commit body cannot be edited
+without a rewrite this branch is forbidden to perform. Under
+`squash_merge_commit_message = PR_BODY` no individual commit body reaches `main`
+on a squash in any case, so the pull request body is the correction of record for
+those, and sections 2.2 and 3 here are the correction of record for the substance.
 
 ## Owed
 

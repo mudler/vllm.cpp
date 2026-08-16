@@ -51,9 +51,17 @@ SGLang third of the three gateability debts
 correctness cross-check (`SGLANG-ORACLE-CORRECT`, `INVENTORIED`), so SGLang binds
 as a performance floor only for a model whose own correctness gate passed. The
 c1, c2 and c4 points, the 35B arm and the shared-prefix cache-on arm are unrun.
-The pin also predates SGLang's DSpark speculator: `python/sglang/srt/speculative/`
-at `f63458b5` carries DFlash, EAGLE, ngram and frozen-KV MTP and nothing named
-`dspark`, so any drafted SGLang arm needs a deliberate pin advance first.
+No DSpark speculator ships in the pinned tree: `python/sglang/srt/speculative/` at
+`f63458b5` carries DFlash, EAGLE, ngram and frozen-KV MTP and nothing named
+`dspark`, so any drafted SGLang arm needs a deliberate pin advance first. That
+claim is scoped to the directory on purpose. DSpark does NOT postdate this pin.
+`docs_new/index.mdx:86,107,108,127` is tracked at `f63458b5` and links the
+2026-07-06 lmsys blog announcing it, three days before the pinned commit's own
+2026-07-09 date, and `speculative/spec_info.py:60-70` registers out-of-tree
+algorithms at runtime, so absence from the directory listing is not absence at
+runtime. This file said the pin predated DSpark until 2026-08-16. That wider
+wording is withdrawn under
+[#979](https://github.com/mudler/vllm.cpp/issues/979).
 
 ```oracle-pin
 id = sglang

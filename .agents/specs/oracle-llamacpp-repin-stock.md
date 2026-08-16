@@ -811,6 +811,15 @@ architecture names, a CUTLASS API generation, or a quantization type. The one
 file that leaves the sweep, `src/vt/cpu/cpu_quant_dot_sdot.cpp`, reached it on
 that single `Q8_0 x Q8_0` comment and on nothing else.
 
+**Two of those anchors went stale inside this pull request, which is the same
+warning §"The SHA is load-bearing" gives about the counts.** Merging
+`origin/main` at `b493f4981` added 67 lines to `src/vt/cuda/cuda_quant_dot.cu`,
+so its `Q8_0×Q8_0` comment moved from `:1067` to `:1068`, and this section's own
+new prose entered the sweep as a nineteenth removal. Re-run on the merged tree
+the drop reads 19 removals and still **zero** insertions, still no verdict, and
+the largest single contributor to the change is again this spec. The table above
+stays as it was read at `0f8580e269`. Re-derive rather than quote it.
+
 **Is it the same 18 that §"The two stages were one idea spelled twice" names?**
 That section could not say, because its 18 were read at `85a9a7ae7` and it had
 no second reading to compare against. Re-derived at `0f8580e269`, where the

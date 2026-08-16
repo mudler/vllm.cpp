@@ -1199,15 +1199,37 @@ burned by twice.
   216, with the failure text naming the load each time. It FAILED again at 21.07
   and PASSED at 14.82 and 8.36 during this pass, which is four more datapoints on
   the same threshold and no new information about the diff.
+
+  **The review-repair pass adds a control pair rather than another datapoint.**
+  It FAILED inside the full gate at loadavg 64.88 and again at 84.95, with
+  `waiting for quiet: 15s busy=109%` in the failure text, which is the
+  `NO_QUIET_WINDOW` path by name. It then PASSED standalone **on this branch** at
+  loadavg 26.48, and PASSED on a **pristine detached `origin/main` worktree** at
+  `d1b0ea3a8` with `git status --porcelain` empty at loadavg 54.45. Both arms
+  therefore pass and fail on load rather than on tree. The structural half is
+  stronger than either run: `git diff --stat origin/main..HEAD -- scripts/
+  tests/scripts/` is **empty**, so this branch changes neither the harness nor
+  the script it exercises, and it cannot be the cause. The threshold is not
+  monotonic in the one-minute average, which is expected, because the harness
+  gates on instantaneous contention.
 - **No benchmark gate.** Recorded `PENDING` on #1003 and on host access, not
   waived.
-- **What the gate run reports, by block.** The full run on the merged head is
-  `Session role` 1, `Record gates` 26, `Mutation suites` 44,
+- **What the gate run reports, by block.** On the merged head at the review-repair
+  pass: `Session role` 1, `Record gates` 26, `Mutation suites` **45**,
   `Committed range vs origin/main` 3, and `Commit trailers vs origin/main` 2, so
-  76 results, all `ok`, and **zero SKIP**. The last block is the one this section
-  cares about: it is guarded on `git merge-base --is-ancestor origin/main HEAD`
-  (`scripts/agent-preflight.sh:226-234`) and it printed nothing at all before the
-  merge, which is what "silently skipping" looks like. It examined every commit in
+  **77 results, 76 `ok`, 1 `FAIL`** (the #618 flake above), and **zero SKIP**.
+  Mutation suites moved 44 to 45 because `origin/main` landed
+  `test_agent_preflight_skip_report` with #1030, which is another count in this
+  file that a foreign merge changes.
+
+  **The last two block headings now name the SHA they gated against**, reading
+  `... vs origin/main d1b0ea3a8e64740c20ba46cd4506794113dda61b`. That is #1030's
+  repair landing, and it is the direct fix for what this bullet was written
+  about. It is guarded on `git merge-base --is-ancestor origin/main HEAD`
+  (`scripts/agent-preflight.sh:226-234`), and this pass reproduced the original
+  failure mode once more before merging: `origin/main` advanced by two commits
+  mid-session, the guard went false, and the trailer block **printed nothing at
+  all**. A gate that is silent is not a gate that passed. It examined every commit in
   `origin/main..HEAD`, **11** of them at `85a9a7ae7`, and the count is the thing
   to re-derive rather than trust, for the same reason the anchor counts are. It
   read 9 two commits earlier and the paragraph was not updated, which is the

@@ -47,10 +47,13 @@ detail below and in [BENCHMARKS.md](BENCHMARKS.md) says which is which.
   padded row is, and it is measured non-zero at every k >= 2. Neither witness
   proves PER-COLUMN PROVENANCE, that column j came from forward j. What the
   CPU tier does NOT show is acceptance at depth: no draft is accepted at any depth
-  on the synthetic gate model, so the accept path at k>1 is unexercised there, and
-  acceptance at depth is the assertion that would close provenance. The
-  cross-engine speed comparison at k>1 and the DGX three-way at k=2..4, which must
-  show non-zero acceptance at every depth, are still owed
+  on the synthetic gate model, so the accept path at k>1 is unexercised there. A
+  non-zero acceptance COUNT at depth would not close provenance either, because a
+  padded row is accepted at column 1 whenever the target's own greedy continuation
+  repeats a token, which real text does routinely. Closing it needs an acceptance
+  RATE measured against a PADDED CONTROL on the same workload. The cross-engine
+  speed comparison at k>1 and the DGX three-way at k=2..4, which must run that
+  control, are still owed
   ([#81](https://github.com/mudler/vllm.cpp/issues/81) M1/M2), as are
   batch-size-keyed dynamic depth and acceptance-driven adaptive depth.
 - **Correctness:** at concurrency 1 the speculative-on greedy output is

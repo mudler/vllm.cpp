@@ -126,8 +126,16 @@ std::vector<int32_t> MtpProposePrefill(
 //   * Non-zero acceptance at depth >= 2 cannot serve on CPU. Acceptance is
 //     measured at ZERO at every depth on the synthetic gate model, so the
 //     acceptance profile is identical between the real loop and the padded fake.
-//     It remains the right assertion for the owed DGX gate, on real weights, and
-//     it is the ONLY one of these that proves per-column provenance.
+//     It does not serve on real weights either, and an earlier revision of this
+//     comment called it the ONLY one of these that PROVES per-column provenance.
+//     It proves no such thing. A padded row is `t0 t0 ...`, so its column 1 is
+//     accepted exactly when the target's own greedy continuation repeats `t0`
+//     (accept-iff-equal, `rejection_sampler.h`), which real text does routinely
+//     on runs of whitespace, punctuation and indentation. A padded drafter can
+//     therefore report `spec_drafts_accepted_by_depth()[1] > 0` on real weights,
+//     and a broken carry only lowers the RATE rather than zeroing the count.
+//     What closes provenance is an acceptance-RATE comparison against a PADDED
+//     CONTROL on the identical workload, which the owed DGX gate specifies.
 //   * PER-CALL distinctness of the k drafts cannot serve. A correct drafter may
 //     repeat a token, and on a 24-entry vocabulary it does: a `2 2 2` row at k=3
 //     is measured on the synthetic gate model. That property is the model's

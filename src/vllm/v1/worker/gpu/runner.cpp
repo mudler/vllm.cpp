@@ -2213,7 +2213,10 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
   // CONSUMER, on the bytes the proposer handed over, such a row is a pure
   // function of its own first column and this counter stays 0 at every k. The
   // accessor in runner.h states what it does NOT prove: per-column provenance,
-  // which only acceptance at depth can show and which the DGX gate owes.
+  // which the DGX gate owes. A non-zero acceptance count at depth does not show
+  // it either, because a padded row is accepted at column 1 whenever the
+  // target's greedy continuation repeats its own token. Only an acceptance-RATE
+  // comparison against a padded control separates the two.
   for (int i = 0; i < num_reqs; ++i) {
     const size_t base = static_cast<size_t>(i) * static_cast<size_t>(k);
     bool varied = false;

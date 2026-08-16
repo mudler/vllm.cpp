@@ -438,10 +438,13 @@ void CheckDraftDecodeForwards(const LoadedEngine& eng, int k) {
 // The bound, stated because the assertion is easy to over-read. `varied > 0`
 // says the delivered array carries information the step-0 draft alone does not
 // determine. It does NOT say column j came from forward j, so an off-by-one in
-// the `update_draft_inputs` column index or a broken carry still passes. Only
-// acceptance AT DEPTH proves that, and acceptance is measured 0 at every depth
-// here, so per-column provenance stays owed to the DGX gate exactly as the
-// zero-acceptance gap below does.
+// the `update_draft_inputs` column index or a broken carry still passes. A non-zero
+// acceptance count AT DEPTH does not prove it either, here or on real weights: a
+// padded row `t0 t0 ...` is accepted at column 1 exactly when the target's greedy
+// continuation repeats `t0`, which is a property of the target rather than of the
+// drafter. What separates them is an acceptance-RATE comparison against a PADDED
+// CONTROL, so per-column provenance stays owed to the DGX gate in that shape, exactly
+// as the zero-acceptance gap below does.
 //
 // The assertion is an AGGREGATE over the run and never a per-call one, because a
 // correct drafter may resample the same token: a `2 2 2` row at k=3 is MEASURED

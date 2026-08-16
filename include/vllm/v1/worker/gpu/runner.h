@@ -306,9 +306,12 @@ class GPUModelRunner final : public ModelRunnerBase {
   // every call would leave it 0 while running the loop correctly. Measured on
   // the synthetic CPU gate model that does happen on individual calls (a
   // `2 2 2` row at k=3) and never on all of them, so the assertion the depth
-  // suite makes is `> 0` over a run and never a per-call one. Provenance per
-  // column is what non-zero acceptance AT DEPTH proves, and that is owed to the
-  // DGX gate on real weights.
+  // suite makes is `> 0` over a run and never a per-call one. Per-column
+  // provenance stays owed to the DGX gate on real weights, and NOT as a
+  // non-zero acceptance count at depth, which a padded row also earns whenever
+  // the target's greedy continuation repeats a token. It is owed as an
+  // acceptance-RATE comparison against a padded control, specified in the
+  // row spec under `## Owed`.
   int64_t spec_mtp_proposals_with_varied_drafts() const {
     return spec_mtp_proposals_with_varied_drafts_;
   }

@@ -661,7 +661,8 @@ upstream's own supported configuration.
 
 | Owed | What it must show | Who |
 |---|---|---|
-| DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | our-ON == our-OFF == vLLM-ON, token for token on the golden prefix, at EACH depth, with nonzero acceptance and the per-depth counters populated at every depth up to k, plus spec-OFF byte-identical. It must run the DEFAULT bf16 GDN state, because the CPU gate here runs the f32 arm for the reason in section 4.5, so the GDN speculative rollback at depth is UNEXERCISED until this runs | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | our-ON == our-OFF == vLLM-ON, token for token on the golden prefix, at EACH depth, with the per-depth counters populated at every depth up to k, plus spec-OFF byte-identical. It must run the DEFAULT bf16 GDN state, because the CPU gate here runs the f32 arm for the reason in section 4.5, so the GDN speculative rollback at depth is UNEXERCISED until this runs. **Do NOT gate provenance on `spec_drafts_accepted_by_depth()[1] > 0`.** Build the PADDED CONTROL below instead, and gate on the RATE | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
+| The PADDED CONTROL arm of that gate, and the RATE assertion it carries | Run the gate workload a second time on real weights with the padding mutation this row already wrote applied to `MtpProposeDrafts`: run all `k-1` draft decode forwards, DISCARD the sampled tokens, and write the step-0 draft into all k columns. Identical model, prompt, token count, k, batching and sampling in both arms. Record `spec_drafts_accepted_by_depth()` and `spec_drafts_proposed_by_depth()` for BOTH arms and report the per-depth RATE, accepted over proposed, at every depth. The reason this arm exists: a padded row is `t0 t0 ...`, so its column-1 entry is accepted exactly when the target's own greedy continuation repeats `t0`, which real text does routinely, and a non-zero entry at depth >= 1 in this CONTROL falsifies the naive count assertion outright. Expect that falsification and record the control's numbers even when they come back 0, because a control that measures 0 on ONE prompt is a fact about that prompt and never a licence to restore the count assertion. The gate PASSES when the real loop's rate at each depth >= 1 exceeds the control's by a margin stated before the run, and it FAILS on a real-loop rate that the control matches. A broken carry or an off-by-one column index lowers the real arm's rate toward the control without ever zeroing its count, which is exactly what a count cannot see | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
 | Silent de-graphing when the actual depth differs from the configured k, AND the `S`-only slot-ring key ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change. The re-key is owed on its own merits and NOT only as a consequence of widening the predicate, which is the correction section 4.2a records: `uniform_decode = input.pure_decode \|\| (spec_graph && ...)` (`qwen3_5_moe.cpp:143-148`, `qwen3_5_dense.cpp:172-177`) already routes TWO query lengths to one `impl_->slots[S]` (`qwen3_5.cpp:9281`, dense `:9708`), and `SizeSlot` invalidates on `fa_cols` and `aux_taps` only (`:9309-9316` and `:9361-9367`). At k=1, 8 requests pure-decode and 4 requests spec both key on `S = 8`. That is pre-existing since SPEC-DSPARK W8 (#442) and this row does not widen it, but it is not the benign thing the first spec revision claimed. Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
 | Close [#1027](https://github.com/mudler/vllm.cpp/issues/1027) as a duplicate of [#1022](https://github.com/mudler/vllm.cpp/issues/1022) | NOT a code or record debt. The defect #1027 describes is FIXED on `origin/main` by [#1025](https://github.com/mudler/vllm.cpp/pull/1025), and this branch takes main's single well-formed row rather than resurrecting the duplicate, so `check-agent-record` and `check-issue-index-append-only` are BOTH green here. What remains is one remote write this flow has no authority for. Detail and the mechanism are in `## Gates` | operator, [#1027](https://github.com/mudler/vllm.cpp/issues/1027) |
 | M2 speed A/B at matched k | concurrency-1 and concurrency>1 throughput against vLLM same-config at matched k, plus the acceptance-versus-depth curve for prose and for code | [#81](https://github.com/mudler/vllm.cpp/issues/81) M2 |
@@ -681,6 +682,18 @@ number is claimed at k>1, which is the whole point of depth.
 **Measured.** Depth reaches the verify path at k=1, 2, 3 and 4 through
 `LoadedEngine`, and the greedy token stream is identical to speculative-off at
 every one of them (`test_mtp_depth` 5/5, 63 assertions).
+
+**The pattern this row kept producing, recorded so the next reader does not add
+the seventh.** Six times on this branch a claim of the form "X is the ONLY thing
+that proves Y" was written and then withdrawn: the per-depth counters, the draft
+list length, the forwards equality, the prefix corroboration, the varied-draft
+counter, and finally acceptance at depth itself. Not one of them was caught by
+reading the claim. Every one was caught by EXECUTING it, by building the cheapest
+thing that satisfies the claim while violating what it asserts, and seeing the
+gate stay green. The instinct a strong witness produces is to argue that no
+further assertion is needed, and that instinct was wrong six times out of six
+here. Treat "only X proves Y" as an unrun experiment rather than a conclusion,
+and run it.
 
 **Corrected: the per-depth counters do NOT distinguish "the loop ran k times"
 from "the loop ran more than once", and an earlier revision of this section
@@ -726,10 +739,13 @@ than by `git checkout --`, which would have discarded uncommitted spec work, and
 the restored build re-ran 5/5, 47/47, exit 0. Two agents, two independently
 written mutations, one verdict.
 
-**Rejected: non-zero acceptance at depth >= 2 as the CPU witness.** It is the
-right assertion and it is unavailable here. Acceptance is measured at ZERO at
-every depth on the synthetic gate model, in both arms, so the acceptance profile
-cannot separate them.
+**Rejected: non-zero acceptance at depth >= 2 as the CPU witness.** It is
+unavailable here, and it is also weaker than it looks. Acceptance is measured at
+ZERO at every depth on the synthetic gate model, in both arms, so the acceptance
+profile cannot separate them. It would not separate them on real weights either,
+for the reason recorded in the residual below: a padded row earns acceptance at
+column 1 whenever the target repeats a token. The usable form is a RATE against a
+padded control, and that is what `## Owed` asks the DGX gate for.
 
 **Rejected: PER-CALL distinctness of the k drafted tokens.** A correct drafter may
 repeat a token, and on this 24-entry vocabulary it does. MEASURED on the fixture:
@@ -786,11 +802,39 @@ varied-draft counter is also a NECESSARY and not a sufficient condition, and the
 fixture participates in it: a drafter that resampled the same token on every step
 of every call would leave it 0 while running the loop correctly, so a change to
 the synthetic weights can turn it red for a reason that is not a defect. It fails
-LOUDLY when that happens, which is the failure mode to prefer. Provenance per
-column is what non-zero acceptance AT DEPTH proves, acceptance is 0 at every depth
-here, and closing it is therefore part of the owed DGX gate rather than something
-this tier can reach. This bound is recorded the same way the zero-acceptance gap
-is, because an honest bound beats a false claim.
+LOUDLY when that happens, which is the failure mode to prefer.
+
+**Corrected, by a fourth fresh review: a non-zero acceptance COUNT at depth does
+NOT prove per-column provenance, and six sites said it did.** This is the claim
+this section previously carried as the closure, and it does not hold. Acceptance
+is accept-iff-equal on a PREFIX (`rejection_sampler.h:23-33`), and
+`spec_drafts_accepted_by_depth_[d]` increments exactly when `d < ns - 1`
+(`runner.cpp:1797-1802`). A padded row is `t0 t0 ...`, so its column-1 entry
+increments exactly when the target's own greedy continuation emits `t0` a second
+time. That is a token REPEAT in the target, not evidence about the drafter, and
+greedy decoding on real weights repeats routinely, on runs of whitespace, on
+indentation, on punctuation and in the degenerate loops greedy decode is known
+for. So a padded drafter can satisfy `spec_drafts_accepted_by_depth()[1] > 0` on
+real weights, and a broken carry lowers the acceptance RATE without zeroing the
+COUNT.
+
+That is EXECUTED here rather than argued, because arguing is what produced the
+claim in the first place. A scratch case appended to
+`tests/vllm/v1/spec_decode/test_rejection_sampler.cpp` ran the shipped
+`RejectionSampler` on a PADDED row `7 7 7` against a target whose own greedy
+argmax sequence is `7 7 9 4`, which is a target that repeats its token once.
+Measured: `num_sampled=3`, so `accepted_drafts = 2`, so `1 < accepted_drafts`
+and `spec_drafts_accepted_by_depth_[1]` increments. The naive assertion is TRUE
+for a padded drafter. `compile_err = 0`, `git diff --stat` confirmed the 16
+inserted lines applied, and the suite ran 11 cases and 144 assertions with the
+case present against 10 and 139 without it, so the case demonstrably RAN. The
+tree was then restored from a pristine copy verified by `sha256sum`
+(`c48710847...`) and the rebuild FORCED with `touch`, because `cp -p` preserves
+the mtime and ninja would otherwise have kept the instrumented binary.
+
+The gate shape that closes provenance is therefore a RATE comparison against a
+PADDED CONTROL, specified under `## Owed`. Recording the bound honestly beats
+recording a false closure, which is what the previous wording was.
 
 **Corroboration for the carry, measured but NOT promoted to an assertion.** A
 fresh review noticed that the delivered rows are strict prefixes of each other
@@ -826,7 +870,12 @@ reading the objects. At `cb0bb2579` all four were correct: `:9253` is the
 `const int64_t S = spec_step ? B : PadToCaptureSize(...)` assignment, and `:9276`
 and `:9698` are both `Impl::SlotRing& ring = impl_->slots[S];`. They broke at
 `0d37de1ed`, which is the same commit that wrote them into `issue-index.md` and
-shifted `qwen3_5.cpp` by five lines. At that commit the three lines read a comment,
+shifted `qwen3_5.cpp` by TWO hunks of +5 each, at `:9176` and at `:9600`. The
+shift is therefore not one number: `:9253` and `:9276` sit between the hunks and
+move +5, to `:9258` and `:9281`, while `:9698` sits after both and moves +10, to
+`:9708`. An earlier revision of this paragraph recorded a single five-line shift,
+which sends anyone re-deriving the third anchor to `:9703` and unrelated code. At
+that commit the three lines read a comment,
 a comment, and a `DenseForwardBody` call instead. So they are the class this branch
 already hit once at `mtp-k-gt-1.md:310-311`, and the difference is not pedantic:
 "wrong from the start" reads as a reviewer who never checked, while
@@ -844,8 +893,10 @@ does not move. It does NOT establish that the accept path works at depth, becaus
 not one draft is ever accepted at any depth on this model. The prefix-monotonicity
 assertions over `spec_drafts_accepted_by_depth()` are consequently vacuous, and
 they are kept because the invariant is the right one to state. The owed DGX gate
-demanding non-zero acceptance at every depth is not belt-and-braces. It is the
-only place the accept path at depth is exercised at all.
+is not belt-and-braces. It is the only place the accept path at depth is
+exercised at all. What it must demand there is the per-depth acceptance RATE
+against the padded control under `## Owed`, and never a non-zero acceptance
+count, which the control can earn on its own.
 
 **Rejected: the refusal inside `SpeculativeConfig::ResolveMtp`.** It reddened
 the scheduler tests, which build an MTP config at k=3 to exercise a scheduler

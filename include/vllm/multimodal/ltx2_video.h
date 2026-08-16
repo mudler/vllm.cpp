@@ -344,6 +344,49 @@ inline constexpr char kLtx2AudioMaxDurationExtra[] = "audio_max_duration";
 // — an explicit 0 must therefore RENDER, not refuse.
 inline constexpr char kLtx2GeneratedKeyframesExtra[] = "num_generated_keyframes";
 
+// ── RETAKE: regenerate a time window of an existing clip. Row LTX25-RETAKE ──
+// (#924), spec .agents/specs/ltx25-retake.md.
+//
+// `RetakePipeline` (retake.py:53, `__call__` at :151) keeps the source clip
+// outside `[start_time, end_time)` and regenerates what is inside it from the
+// prompt. The SOURCE is `vllm_video_params::ref_video` — a DIRECTORY of
+// `frame_%06d.ppm`, which is what that ABI field has always meant
+// (include/vllm.h:912) and which the LTX-2.5 engine used to only test for
+// emptiness in order to refuse.
+//
+// A frame DIRECTORY rather than a container, and that is upstream's second
+// ingestion arm rather than a local substitute: upstream reads containers with
+// PyAV (media_io/decode.py:226) and carries a folder arm for the case where
+// there is none. Three consequences follow from upstream's own lines and are
+// mirrored, not invented — the frame rate must be supplied because there is no
+// container to read it from (decode.py:213-215), the folder has no audio stream
+// (utils/helpers.py:261-262), and therefore BOTH of retake's audio predicates
+// are false whatever `regenerate_audio` says (retake.py:279,282).
+//
+// Seconds, inclusive (retake.py:155, noise_mask_cond.py:19). Supplying it
+// selects the retake path; leaving it out is the ordinary render.
+inline constexpr char kLtx2RetakeStartTimeExtra[] = "retake_start_time";
+
+// Seconds, EXCLUSIVE (retake.py:156, noise_mask_cond.py:20). Required alongside
+// the start: `start_time >= end_time` is upstream's first refusal
+// (retake.py:211-212) and an absent end would have to be defaulted to something
+// upstream never defaults.
+inline constexpr char kLtx2RetakeEndTimeExtra[] = "retake_end_time";
+
+// The source folder's frame rate (`--frame-rate`, utils/args.py:865-873).
+// REQUIRED for a folder and refused for a container by upstream's own parser
+// help; here the container arm does not exist, so it is simply required. The
+// whole temporal mask is `pixel_bounds / fps` (noise_mask_cond.py:35), so a
+// wrong one regenerates the wrong seconds and still renders.
+inline constexpr char kLtx2RetakeFrameRateExtra[] = "retake_frame_rate";
+
+// `regenerate_video` (retake.py:164, default True) and `regenerate_audio`
+// (:165, default True), spelled `0` / `1`. `regenerate_video=0` freezes the
+// source video and regenerates nothing, which is upstream-legal and is what
+// makes the four-way plan four-way rather than two-way.
+inline constexpr char kLtx2RegenerateVideoExtra[] = "regenerate_video";
+inline constexpr char kLtx2RegenerateAudioExtra[] = "regenerate_audio";
+
 // WHAT THE LAST `Generate()` ACTUALLY HANDED THE DiT's CROSS-ATTENTION.
 //
 // Every field is read off the exact f32 buffers `Ltx2ModalityInput::context`
@@ -520,6 +563,30 @@ struct Ltx2ConditioningTrace {
   // — telling the DiT the caller's clean take is noisy — left this suite green.
   // The claim was made in a comment and observed by nothing.
   double audio_sigma_max = 0.0;
+
+  // ── RETAKE (row LTX25-RETAKE, #924) ────────────────────────────────────────
+  //
+  // Observed for the same reason the audio freeze above is: the whole mechanism
+  // is a denoise MASK, and a mask is invisible in a frame count, a token count
+  // and a rendered clip. A build that read the source clip, encoded it, and then
+  // denoised every token anyway produces a finished video of the right length
+  // with the right soundtrack and nothing outside the window preserved.
+  bool retake_conditioned = false;
+  // Tokens the `TemporalRegionMask` left at 1.0 — the regenerated region — and
+  // the total it chose from. BOTH are recorded, because a mask that is all ones
+  // and a mask that is all zeros are each a plausible-looking failure and a
+  // count on its own cannot tell either from a correct one.
+  int64_t retake_masked_tokens = 0;
+  int64_t retake_total_tokens = 0;
+  // The video stream's scalar sigma, max over every step of every phase — the
+  // SECOND half of `frozen` on the video side (utils/types.py:104-106), which
+  // the denoise mask cannot reach. `regenerate_video=0` must drive this to 0.
+  double video_sigma_max = 0.0;
+  // The encoded source clip, before any denoising. `absmax` is the lower bound a
+  // token- or shape-shaped check cannot make: a zeroed or constant latent has
+  // the right size and the right token count.
+  uint64_t retake_latent_digest = 0;
+  double retake_latent_absmax = 0.0;
 
   // True only once the `Generate` that produced this conditioning RETURNED. The
   // trace is filled immediately after the connector and BEFORE the denoise loop,

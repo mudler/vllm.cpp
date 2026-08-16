@@ -157,7 +157,19 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "--audio-start-time seeks into the file (default 0) and --audio-max-duration caps\n"
       "how much is read (default: the clip\'s own duration). Either without\n"
       "--audio-path is refused rather than ignored. The rendered audio.wav is your own\n"
-      "input, not a VAE round trip, which is upstream\'s deliberate choice.\n");
+      "input, not a VAE round trip, which is upstream\'s deliberate choice.\n\n"
+      "RETAKE regenerates a time window of an existing clip and keeps the rest.\n"
+      "--ref-video names a DIRECTORY of frame_%%06d.ppm (the layout minimax-h3-gen\n"
+      "writes), not a container file: upstream opens one with PyAV and no demuxer is\n"
+      "vendored here, so a .mp4 is refused. --retake-start-time and --retake-end-time\n"
+      "are seconds, the end exclusive, and --retake-frame-rate is required because a\n"
+      "frame folder carries no container frame rate. Needs --pipeline-kind retake: a\n"
+      "retake is ONE stage at the clip\'s own resolution, and the distilled two-stage\n"
+      "recipe renders its first stage at half. The geometry comes from the clip, so\n"
+      "--width, --height and --frames are refused alongside it. --regenerate-video 0\n"
+      "freezes the clip instead; --regenerate-audio has no effect while the source is\n"
+      "a frame folder, because a folder carries no audio and both of upstream\'s audio\n"
+      "predicates test for one.\n");
   std::exit(code);
 }
 
@@ -171,6 +183,9 @@ int main(int argc, char** argv) {
   // here and pointed at only after parsing.
   std::string prompt, first_frame, image_crf;
   std::string audio_path, audio_start_time, audio_max_duration;
+  // RETAKE (row LTX25-RETAKE, #924): a source clip DIRECTORY and the window to
+  // regenerate. `--ref-video` is a directory of frame_%06d.ppm, not a container.
+  std::string ref_video, retake_start, retake_end, retake_fps, regen_video, regen_audio;
 
   // The extras are BORROWED by the load call, so the strings must outlive it.
   // Kept as two parallel vectors of owned strings plus the char* views the ABI
@@ -240,6 +255,17 @@ int main(int argc, char** argv) {
     // here one binary serves every LTX-2.5 path, so supplying it is what selects
     // the audio-conditioned one. Per-generation, so it rides vp.extra_* too.
     else if (f == "--audio-path") audio_path = Need(argc, argv, ++i, "--audio-path");
+    else if (f == "--ref-video") ref_video = Need(argc, argv, ++i, "--ref-video");
+    else if (f == "--retake-start-time")
+      retake_start = Need(argc, argv, ++i, "--retake-start-time");
+    else if (f == "--retake-end-time")
+      retake_end = Need(argc, argv, ++i, "--retake-end-time");
+    else if (f == "--retake-frame-rate")
+      retake_fps = Need(argc, argv, ++i, "--retake-frame-rate");
+    else if (f == "--regenerate-video")
+      regen_video = Need(argc, argv, ++i, "--regenerate-video");
+    else if (f == "--regenerate-audio")
+      regen_audio = Need(argc, argv, ++i, "--regenerate-audio");
     else if (f == "--audio-start-time")
       audio_start_time = Need(argc, argv, ++i, "--audio-start-time");
     else if (f == "--audio-max-duration")
@@ -274,6 +300,7 @@ int main(int argc, char** argv) {
   vp.output_dir = workdir.c_str();
   if (!prompt.empty()) vp.prompt = prompt.c_str();
   if (!first_frame.empty()) vp.first_frame = first_frame.c_str();
+  if (!ref_video.empty()) vp.ref_video = ref_video.c_str();
 
   // The PER-GENERATION extras are a SEPARATE array from the load-time ones, and
   // conflating them is the whole failure this keeps apart: `image_crf` handed to
@@ -295,6 +322,18 @@ int main(int argc, char** argv) {
   if (!audio_max_duration.empty()) {
     gen_keys.emplace_back("audio_max_duration");
     gen_values.push_back(audio_max_duration);
+  }
+  // Each retake knob rides the SAME per-generation array. Supplying one without
+  // the window is refused by the engine rather than ignored, so a half-typed
+  // retake reports what is missing instead of rendering the ordinary path.
+  for (const auto& kv : {std::make_pair("retake_start_time", &retake_start),
+                         std::make_pair("retake_end_time", &retake_end),
+                         std::make_pair("retake_frame_rate", &retake_fps),
+                         std::make_pair("regenerate_video", &regen_video),
+                         std::make_pair("regenerate_audio", &regen_audio)}) {
+    if (kv.second->empty()) continue;
+    gen_keys.emplace_back(kv.first);
+    gen_values.push_back(*kv.second);
   }
   std::vector<const char*> gkeys, gvalues;
   for (size_t i = 0; i < gen_keys.size(); ++i) {

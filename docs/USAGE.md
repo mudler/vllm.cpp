@@ -2706,7 +2706,44 @@ Recipes resolve on an EXACT `(pipeline_kind, model_version)` pair and refuse
 anything else by name rather than defaulting, because a plausible but wrong sigma
 schedule or guidance scale renders a video instead of failing. The pairs that
 resolve are `one_stage` at 2, 2.3, 2.4 and 2.5, `distilled_two_stage` at 2 and
-2.5, and `dmd2` at 2 and 2.3.
+2.5, `dmd2` at 2 and 2.3, and `retake` at 2 and 2.5.
+
+### Retake: regenerating a time window of an existing clip
+
+`retake` is `RetakePipeline`: it keeps the source clip outside a window and
+regenerates what is inside it from the prompt. It is one diffusion stage at the
+source's own resolution, so it needs `--pipeline-kind retake` — the distilled
+two-stage recipe renders its first stage at half resolution and refuses a retake
+by name rather than putting a full-resolution latent into a half-resolution grid.
+
+The source is `--ref-video`, a **directory** of `frame_%06d.ppm` numbered from
+000000, which is the layout `minimax-h3-gen` writes so one run's frames chain
+into the next request. A container file (`.mp4`) is refused: upstream opens one
+with PyAV and no demuxer is vendored here. That is upstream's own second
+ingestion arm rather than a substitute, and three things follow from it:
+`retake_frame_rate` is required because a folder has no container frame rate; a
+folder carries no audio, so the soundtrack is generated fresh; and
+`regenerate_audio` therefore has no observable effect on this arm.
+
+| `ltx2-gen` flag | per-generation extra | meaning |
+|---|---|---|
+| `--ref-video` | `vllm_video_params::ref_video` | the source clip DIRECTORY |
+| `--retake-start-time` | `retake_start_time` | window start in seconds, inclusive; supplying it selects the retake path |
+| `--retake-end-time` | `retake_end_time` | window end in seconds, exclusive; must be greater than the start |
+| `--retake-frame-rate` | `retake_frame_rate` | the source folder's frame rate; required |
+| `--regenerate-video` | `regenerate_video` | `1` (default) regenerates inside the window, `0` freezes the clip |
+| `--regenerate-audio` | `regenerate_audio` | `1` (default); no effect while the source is a frame folder |
+
+The extras ride the per-generation `extra_keys` / `extra_values` array on
+`vllm_video_params`, so the C ABI reaches the same path with no new field.
+`/v1/videos` forwards no engine extras today ([#928](https://github.com/mudler/vllm.cpp/issues/928)),
+so the CLI and the C ABI are the reachable surfaces.
+
+A retake takes its width, height, frame count and duration from the clip and
+refuses a request that also names any of them. The clip's frame count must
+satisfy `8k + 1` and both axes must be multiples of 32; both refusals name the
+value that would have worked. `audio_path` alongside a retake is refused rather
+than resolved to one of two soundtracks.
 
 `Ltx2Guidance` serves `CFGGuider`, `STGGuider` and `MultiModalGuider`. It refuses
 `CFGStarRescalingGuider`, `LtxAPGGuider` and `LegacyStatefulAPGGuider` by name,

@@ -615,6 +615,31 @@ void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
 //   ("distilled_two_stage","2.5")  Lightricks distilled.py + constants.py:17-23
 //   ("dmd2",               "2")    vLLM-Omni LTX_POSITIVE_ONLY_RECIPE (:116-124)
 //   ("dmd2",               "2.3")  same
+//   ("retake",             "2")    Lightricks retake.py:85,287,290-294,313-324
+//   ("retake",             "2.5")  same
+//
+// The `retake` rows are Lightricks' `RetakePipeline` and have no vLLM-Omni
+// counterpart at all. Every value on them is read off `retake.py` rather than
+// adapted from a neighbouring recipe, because the neighbouring recipe is wrong
+// in a way that renders: `distilled_two_stage` runs its first stage at
+// `spatial_downscale = 2`, and retake seeds the video stream with a latent
+// encoded from the source clip at FULL resolution (retake.py:317-318 passes
+// `output_shape.width` / `.height` straight through). Riding that recipe would
+// put a full-resolution latent into a half-resolution grid.
+//
+// ONE phase (one `DiffusionStage` call at retake.py:313-324), `DISTILLED_SIGMAS`
+// (:287, because `distilled` defaults True at :85 and the CLI hard-codes it at
+// :359), plain Euler — `DiffusionStage.__call__` defaults to
+// `euler_denoising_loop` and `EulerDiffusionStep()` (utils/blocks.py:524-527)
+// and retake overrides neither, so the ancestral sampler that `distilled.py`
+// selects for 2.5 reaches retake through nothing — and no negative prompt,
+// because the distilled arm builds a `SimpleDenoiser` (:290-294) and encodes
+// `[prompt]` alone (:259).
+//
+// The geometry fields on a `retake` recipe are the params table's, and the
+// engine OVERRIDES all four from the source clip, which is what upstream does
+// (`output_shape` from `get_videostream_metadata`, retake.py:220, passed at
+// :317-320).
 //
 // The 2.4 and 2.5 rows exist here and not upstream in vLLM-Omni, which carries no
 // row past 2.3 (spec section 3). Their VALUES are Lightricks', not invented: the

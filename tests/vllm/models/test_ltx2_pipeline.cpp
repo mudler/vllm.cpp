@@ -1141,12 +1141,48 @@ TEST_CASE("ltx2 the recipe table mirrors vLLM-Omni's, and refuses everything els
   CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("one_stage", "2.5"));
   CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5"));
 
+  // The `retake` rows (row LTX25-RETAKE, #924), also Lightricks' and with no
+  // vLLM-Omni counterpart at all. Every value is read off `retake.py` rather than
+  // adapted from a neighbour, so each is asserted rather than assumed.
+  CHECK_NOTHROW((void)vllm::ResolveLtx2PipelineRecipe("retake", "2"));
+  {
+    const vllm::Ltx2PipelineRecipe retake = vllm::ResolveLtx2PipelineRecipe("retake", "2.5");
+    // ONE `DiffusionStage` call (retake.py:313-324), at the source clip's own
+    // resolution because `__call__` passes `output_shape.width` / `.height`
+    // straight through (:317-318). A second phase, or a downscale, would put the
+    // encoded source latent into a grid it does not fit.
+    REQUIRE(retake.phases.size() == 1);
+    CHECK(retake.phases[0].spatial_downscale == 1);
+    CHECK(retake.max_spatial_downscale() == 1);
+    CHECK(retake.phases[0].input_transform == vllm::Ltx2PhaseInputTransform::kInitial);
+    // `sigmas = DISTILLED_SIGMAS` (:287): `distilled` defaults True (:85) and the
+    // CLI hard-codes it (:359).
+    CHECK(retake.phases[0].sigmas == vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5")
+                                         .phases[0]
+                                         .sigmas);
+    // NOT the ancestral sampler. `DiffusionStage.__call__` defaults `stepper` to
+    // `EulerDiffusionStep()` (utils/blocks.py:526-527) and retake overrides
+    // neither `stepper` nor `loop`, so the sampler `distilled.py` selects for 2.5
+    // reaches retake through nothing. Asserted against the sibling recipe, which
+    // DOES select it at 2.5, so this cannot pass by both being the same value.
+    CHECK(retake.phases[0].stepper == vllm::Ltx2StepperKind::kEuler);
+    CHECK(vllm::ResolveLtx2PipelineRecipe("distilled_two_stage", "2.5").phases[0].stepper ==
+          vllm::Ltx2StepperKind::kEulerAncestral);
+    // `SimpleDenoiser` (:290-294) takes no negative context, and
+    // `prompts_to_encode` is `[prompt]` alone in the distilled arm (:259).
+    CHECK(retake.negative_prompt.empty());
+    CHECK_FALSE(retake.phases[0].allow_guidance_override);
+    CHECK(retake.video_output_phase == 0);
+    CHECK(retake.audio_output_phase == 0);
+  }
+
   // ...and the refusal, which is the point. A plausible-but-wrong recipe RENDERS.
   for (const auto& pair : std::vector<std::pair<std::string, std::string>>{
            {"one_stage", "3"},
            {"one_stage", "2.6"},
            {"distilled_two_stage", "2.3"},
            {"dmd2", "2.5"},
+           {"retake", "2.3"},
            {"res2s_two_stage", "2.5"},
            {"", ""},
        }) {

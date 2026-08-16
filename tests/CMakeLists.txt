@@ -342,6 +342,12 @@ target_compile_definitions(test_ltx2_pipeline PRIVATE
 # own manifests, a few hundred of their own bytes against torch, and synthetic
 # files for whole-model materialization. All three .inc files live beside the
 # test source.
+# LTX25-RETAKE (#924): the ported pieces at value level — the temporal region
+# mask under both coordinate conventions, the truncate-or-pad conform and the
+# CLI-stage validations. Its own target rather than cases inside
+# test_ltx2_pipeline, which several concurrent rows of this campaign edit. The
+# REACHABILITY proof for the same row lives in test_ltx2_video.
+vllm_cpp_add_test(test_ltx2_retake vllm/models/test_ltx2_retake.cpp)
 vllm_cpp_add_test(test_ltx2_lora vllm/models/test_ltx2_lora.cpp)
 vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
 target_include_directories(test_ltx2_loader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)

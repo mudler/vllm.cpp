@@ -4133,3 +4133,322 @@ TEST_CASE("ltx2 video: audio_path on a decoder-only checkpoint names the missing
   // And it must NOT send the reader after unwritten code: the forward is ported.
   CHECK(message.find("audio_vae.py:190-246") != std::string::npos);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RETAKE — row LTX25-RETAKE (#924), spec .agents/specs/ltx25-retake.md
+//
+// These are the REACHABILITY cases. They enter through `LoadVideoEngine` and
+// `Generate`, which is where `vllm_video_generate` arrives, and not through
+// `Ltx2TemporalRegionMaskVideo`. The value-level cases for the ported pieces are
+// `test_ltx2_retake`; per .agents/reachability.md those localize a failure and
+// are not the proof, because they stay green when the production call site is
+// deleted.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// A `retake` engine. The kind is a LOAD extra and it has to be this one: the
+// distilled two-stage recipe renders its first stage at half resolution
+// (`spatial_downscale = 2`), and a full-resolution source latent does not fit
+// that grid.
+vllm::multimodal::VideoModelParams RetakeParams(const ltx2_fixture::Paths& paths) {
+  vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "retake";
+  return mp;
+}
+
+// The source clip: `frame_%06d.ppm` numbered from 0, which is what
+// `vllm_video_params::ref_video` has always meant and what `minimax-h3-gen`
+// writes. 9 frames satisfies 8k+1 and 64x64 is a multiple of 32, so the
+// fixture's (8, 32, 32) factors give a 2 x 2 x 2 latent — 8 tokens.
+std::string WriteRetakeClip(const std::string& dir, int frames, int height, int width,
+                            unsigned seed_base = 41) {
+  ::mkdir(dir.c_str(), 0755);
+  for (int i = 0; i < frames; ++i) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06d.ppm", i);
+    WriteBytes(dir + name, ConditioningPpm(height, width, seed_base + static_cast<unsigned>(i)));
+  }
+  return dir;
+}
+
+// NOT `FixtureGen`: a retake takes its geometry from the source clip and refuses
+// an explicit width, height, frame count or duration, because upstream's own
+// parser omits all of them ("no height/width/num-frames; resolution comes from
+// input video", utils/args.py:851-854).
+vllm::multimodal::VideoGenParams RetakeGen(const std::string& out_dir, const std::string& clip,
+                                           double start, double end) {
+  vllm::multimodal::VideoGenParams gen;
+  gen.has_seed = true;
+  gen.seed = 7;
+  gen.output_dir = out_dir;
+  gen.ref_video_dir = clip;
+  gen.extras[vllm::multimodal::kLtx2RetakeStartTimeExtra] = std::to_string(start);
+  gen.extras[vllm::multimodal::kLtx2RetakeEndTimeExtra] = std::to_string(end);
+  gen.extras[vllm::multimodal::kLtx2RetakeFrameRateExtra] = "24";
+  return gen;
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 retake: a time window REGENERATES and the render carries the source clip") {
+  // THE RED-FIRST CASE. Before this row the retake extras were refused as
+  // unknown per-generation extras and `ref_video_dir` was refused outright, so
+  // nothing here could reach the new code at all.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(RetakeParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  const std::string clip = WriteRetakeClip(ws.root + "/clip", 9, 64, 64);
+  // 24 fps against the fixture's temporal factor 8. With `causal_fix` — the CALL
+  // SITE's default at noise_mask_cond.py:33, not `get_pixel_coords`'s own —
+  // latent frame 0 spans pixel frames [0, 1) and latent frame 1 spans [1, 9),
+  // i.e. [0, 1/24) s and [1/24, 9/24) s. The window [0.05, 0.10) therefore
+  // overlaps frame 1 alone: 4 of the 8 tokens.
+  const vllm::multimodal::VideoResult result =
+      engine->Generate(RetakeGen(ws.root + "/out", clip, 0.05, 0.10));
+
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  CHECK(trace.completed);
+  CHECK(trace.retake_conditioned);
+  // BOTH numbers, because an all-ones mask and an all-zeros mask are each a
+  // plausible failure that one count cannot tell from a correct one.
+  CHECK(trace.retake_total_tokens == 8);
+  CHECK(trace.retake_masked_tokens == 4);
+  // The lower bound: a source clip that encoded to zeros has the right shape,
+  // the right token count and the right mask, and renders.
+  CHECK(trace.retake_latent_absmax > 0.0);
+  CHECK(trace.retake_latent_digest != 0);
+  // The geometry came from the CLIP, not from the recipe's params table and not
+  // from the request, which carried none.
+  CHECK(result.frame_count == 9);
+
+  // THE RENDER DEPENDS ON THE SOURCE CLIP'S PIXELS, and this is the assertion
+  // the trace above cannot make. `retake_latent_absmax` observes the ENCODE; it
+  // says nothing about whether the encoded latent was ever handed to the phase.
+  // A build that read the clip, encoded it, recorded the digest and then seeded
+  // the stream with zeros satisfies every other check in this case and renders a
+  // clip of the right length with the right mask. Two DIFFERENT sources at the
+  // same seed and the same window must therefore produce different pixels; on
+  // that build both start from zeros and produce identical ones.
+  //
+  // This survived as a mutation before it was written (M2 in the row's table),
+  // which is why it is here rather than in a comment.
+  const std::string other = WriteRetakeClip(ws.root + "/clip_b", 9, 64, 64, /*seed_base=*/113);
+  REQUIRE(ReadAll(clip + "/frame_000000.ppm") != ReadAll(other + "/frame_000000.ppm"));
+  const vllm::multimodal::VideoResult from_other =
+      engine->Generate(RetakeGen(ws.root + "/out_b", other, 0.05, 0.10));
+  const std::string frame_a = ReadAll(std::string(result.frame_dir) + "/frame_000000.ppm");
+  const std::string frame_b = ReadAll(std::string(from_other.frame_dir) + "/frame_000000.ppm");
+  REQUIRE(frame_a.size() == frame_b.size());
+  size_t differing = 0;
+  for (size_t i = 0; i < frame_a.size(); ++i) {
+    if (frame_a[i] != frame_b[i]) ++differing;
+  }
+  CHECK_MESSAGE(differing > 0,
+                "two different source clips rendered byte-identical frames at the same seed and "
+                "window, so the encoded source latent never reached the phase");
+}
+
+TEST_CASE("ltx2 retake: the mask takes the CALL SITE's causal_fix, not the function's") {
+  // The two upstream defaults disagree — `get_pixel_coords` declares False
+  // (patchifiers.py:140) and `TemporalRegionMask` calls it with True
+  // (noise_mask_cond.py:33) — and the case above cannot tell them apart: at 24
+  // fps the window [0.05, 0.10) selects one latent frame either way. This one
+  // picks a window where the two DISAGREE about the count.
+  //
+  // 9 pixel frames is a 2-frame latent. WITH the fix, frame 0 spans pixel frames
+  // [0, 1) and frame 1 spans [1, 9), i.e. [0, 0.0417) s and [0.0417, 0.375) s.
+  // WITHOUT it, frame 0 spans [0, 8) and frame 1 spans [8, 16), i.e. [0, 0.333) s
+  // and [0.333, 0.667) s. The window [0.30, 0.40) therefore selects ONE frame
+  // with the fix and BOTH without it.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(RetakeParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  const std::string clip = WriteRetakeClip(ws.root + "/clip", 9, 64, 64);
+
+  (void)engine->Generate(RetakeGen(ws.root + "/late", clip, 0.30, 0.40));
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  CHECK(trace.retake_total_tokens == 8);
+  CHECK_MESSAGE(trace.retake_masked_tokens == 4,
+                "the production call site passed causal_fix=false: without the causal rewrite "
+                "this window overlaps BOTH latent frames and masks all 8 tokens");
+}
+
+TEST_CASE("ltx2 retake: regenerate_video=0 FREEZES the clip, mask and scalar sigma both") {
+  // `frozen = not regenerate_video` (retake.py:274) has two halves and upstream
+  // says so in as many words: it "zeros the denoise mask and marks the resulting
+  // LatentState so Modality.sigma is forced to 0 (not only per-token
+  // timesteps)" (utils/types.py:104-106). A build that zeroed only the mask
+  // tells the DiT the clean source clip is noisy, and still renders.
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(RetakeParams(ws.paths));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+  const std::string clip = WriteRetakeClip(ws.root + "/clip", 9, 64, 64);
+
+  vllm::multimodal::VideoGenParams gen = RetakeGen(ws.root + "/frozen", clip, 0.05, 0.10);
+  gen.extras[vllm::multimodal::kLtx2RegenerateVideoExtra] = "0";
+  const vllm::multimodal::VideoResult result = engine->Generate(gen);
+  const vllm::multimodal::Ltx2ConditioningTrace frozen = ltx2->last_conditioning();
+  CHECK(frozen.completed);
+  CHECK_FALSE(frozen.retake_conditioned);
+  CHECK(frozen.video_sigma_max == 0.0);
+  CHECK(result.frame_count == 9);
+
+  // The CONTROL, so the assertion above is not satisfied by a build that never
+  // raises the video sigma at all.
+  const vllm::multimodal::VideoResult live =
+      engine->Generate(RetakeGen(ws.root + "/live", clip, 0.05, 0.10));
+  CHECK(live.frame_count == 9);
+  CHECK(ltx2->last_conditioning().video_sigma_max > 0.0);
+}
+
+TEST_CASE("ltx2 retake: every refusal names what is wrong") {
+  Workspace ws;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(RetakeParams(ws.paths));
+  const std::string clip = WriteRetakeClip(ws.root + "/clip", 9, 64, 64);
+
+  auto refusal = [&](const char* what,
+                     const std::function<void(vllm::multimodal::VideoGenParams&)>& tweak) {
+    vllm::multimodal::VideoGenParams gen =
+        RetakeGen(ws.root + "/ref_" + what, clip, 0.05, 0.10);
+    tweak(gen);
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("expected a refusal for " << what);
+      return std::string();
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+  };
+
+  SUBCASE("an inverted window reports BOTH values, as upstream does") {
+    const std::string msg = refusal("window", [](vllm::multimodal::VideoGenParams& g) {
+      g.extras[vllm::multimodal::kLtx2RetakeEndTimeExtra] = "0.010000";
+    });
+    INFO(msg);
+    CHECK(msg.find("must be less than end_time") != std::string::npos);
+  }
+
+  SUBCASE("a frame count off the 8k+1 grid NAMES the snapped value") {
+    const std::string other = WriteRetakeClip(ws.root + "/ragged", 10, 64, 64);
+    const std::string msg = refusal("frames", [&](vllm::multimodal::VideoGenParams& g) {
+      g.ref_video_dir = other;
+    });
+    INFO(msg);
+    CHECK(msg.find("8k+1") != std::string::npos);
+    CHECK(msg.find("use a video with 9 frames") != std::string::npos);
+  }
+
+  SUBCASE("a resolution off the 32 grid names both axes") {
+    const std::string other = WriteRetakeClip(ws.root + "/odd", 9, 64, 48);
+    const std::string msg = refusal("resolution", [&](vllm::multimodal::VideoGenParams& g) {
+      g.ref_video_dir = other;
+    });
+    INFO(msg);
+    CHECK(msg.find("multiples of 32") != std::string::npos);
+    CHECK(msg.find("48x64") != std::string::npos);
+  }
+
+  SUBCASE("a missing frame rate names the knob and why it cannot be defaulted") {
+    const std::string msg = refusal("fps", [](vllm::multimodal::VideoGenParams& g) {
+      g.extras.erase(vllm::multimodal::kLtx2RetakeFrameRateExtra);
+    });
+    INFO(msg);
+    CHECK(msg.find(vllm::multimodal::kLtx2RetakeFrameRateExtra) != std::string::npos);
+    CHECK(msg.find("decode.py:213-215") != std::string::npos);
+  }
+
+  SUBCASE("no source clip refuses the CONTAINER by name") {
+    const std::string msg = refusal("noclip", [](vllm::multimodal::VideoGenParams& g) {
+      g.ref_video_dir.clear();
+    });
+    INFO(msg);
+    CHECK(msg.find("frame_%06d.ppm") != std::string::npos);
+    CHECK(msg.find("no demuxer is vendored") != std::string::npos);
+  }
+
+  SUBCASE("an explicit geometry is refused rather than silently preferred") {
+    const std::string msg = refusal("geometry", [](vllm::multimodal::VideoGenParams& g) {
+      g.height = 64;
+      g.width = 64;
+    });
+    INFO(msg);
+    CHECK(msg.find("takes its geometry from the SOURCE clip") != std::string::npos);
+  }
+
+  SUBCASE("retake plus an audio file refuses rather than picking one soundtrack") {
+    const std::string wav = WriteWav(ws.root + "/both.wav", 2, kFixtureAudioRate, 1.0);
+    const std::string msg = refusal("both", [&](vllm::multimodal::VideoGenParams& g) {
+      g.extras[vllm::multimodal::kLtx2AudioPathExtra] = wav;
+    });
+    INFO(msg);
+    CHECK(msg.find("retake.py:250-256") != std::string::npos);
+  }
+
+  SUBCASE("a retake knob with no retake window is refused rather than ignored") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/orphan");
+    gen.extras[vllm::multimodal::kLtx2RegenerateAudioExtra] = "0";
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("a regenerate_audio with no retake window must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("no retake for it to configure") != std::string::npos);
+    }
+  }
+}
+
+TEST_CASE("ltx2 retake: the wrong recipe refuses, and the reference arm still does") {
+  Workspace ws;
+  // The DEFAULT recipe, not the retake one.
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+  const std::string clip = WriteRetakeClip(ws.root + "/clip", 9, 64, 64);
+
+  SUBCASE("the distilled two-stage recipe cannot carry a retake") {
+    try {
+      (void)engine->Generate(RetakeGen(ws.root + "/wrongkind", clip, 0.05, 0.10));
+      FAIL_CHECK("a retake on distilled_two_stage must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("'retake' pipeline recipe") != std::string::npos);
+      CHECK(msg.find("first stage at half") != std::string::npos);
+    }
+  }
+
+  SUBCASE("a reference clip WITHOUT the retake knobs is still refused, and #975 stays open") {
+    // THE LOCAL FACT this row's refusal edit turns on: the LTX side now reads
+    // `ref_video_dir`, so the sentence claiming nothing did is gone. A case that
+    // asserted only upstream symbol names could not see that going stale — which
+    // is exactly how the sentence survived (#987).
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/refstill");
+    gen.ref_video_dir = clip;
+    try {
+      (void)engine->Generate(gen);
+      FAIL_CHECK("reference-video conditioning must still be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      const size_t ruled_out = msg.find("WHAT IS *NOT* THE REASON");
+      REQUIRE(ruled_out != std::string::npos);
+      const size_t stale = msg.find("nothing reads `ref_video_dir` at all");
+      const bool only_as_ruled_out = (stale == std::string::npos) || (stale > ruled_out);
+      CHECK_MESSAGE(only_as_ruled_out,
+                    "the refusal states as a CAUSE that nothing reads ref_video_dir, and this "
+                    "suite has just rendered a retake that reads it");
+      // And it names the reader that DOES exist, so the next reader goes looking
+      // for the reference item's geometry rather than for a file walker.
+      CHECK(msg.find("Ltx2ReadFrameDirectory") != std::string::npos);
+    }
+  }
+}

@@ -34,6 +34,7 @@
 #include "vllm/model_executor/models/ltx2_image_preprocess.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
+#include "vllm/model_executor/models/ltx2_retake.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_tiling.h"
@@ -361,7 +362,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 779 789 790 852 948 964 966 1044 1069 1174 1215
+// 780 790 791 853 949 965 967 1045 1070 1175 1216
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
@@ -1359,12 +1360,19 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     const bool known = kv.first == kLtx2ImageCrfExtra || kv.first == kLtx2AudioPathExtra ||
                        kv.first == kLtx2AudioStartTimeExtra ||
                        kv.first == kLtx2AudioMaxDurationExtra ||
-                       kv.first == kLtx2GeneratedKeyframesExtra;
+                       kv.first == kLtx2GeneratedKeyframesExtra ||
+                       kv.first == kLtx2RetakeStartTimeExtra ||
+                       kv.first == kLtx2RetakeEndTimeExtra ||
+                       kv.first == kLtx2RetakeFrameRateExtra ||
+                       kv.first == kLtx2RegenerateVideoExtra ||
+                       kv.first == kLtx2RegenerateAudioExtra;
     if (!known) {
       Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
            std::string(kLtx2ImageCrfExtra) + ", " + kLtx2AudioPathExtra + ", " +
            kLtx2AudioStartTimeExtra + ", " + kLtx2AudioMaxDurationExtra + ", " +
-           kLtx2GeneratedKeyframesExtra);
+           kLtx2GeneratedKeyframesExtra + ", " + kLtx2RetakeStartTimeExtra + ", " +
+           kLtx2RetakeEndTimeExtra + ", " + kLtx2RetakeFrameRateExtra + ", " +
+           kLtx2RegenerateVideoExtra + ", " + kLtx2RegenerateAudioExtra);
     }
   }
   // The two audio WINDOW knobs only mean something alongside a file. Accepting
@@ -1381,6 +1389,104 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     }
   }
   CheckGeneratedKeyframes(gen.extras);
+
+  // ── RETAKE: the request knobs (#924) ──────────────────────────────────────
+  //
+  // `RetakePipeline.__call__` (retake.py:151-329). Parsed here, at the top of
+  // `Generate`, because upstream refuses an inverted window as its FIRST
+  // statement (:211-212) and its CLI refuses the source geometry before the
+  // pipeline is even constructed (:340-353) — both before any model work is
+  // paid for.
+  const bool wants_retake = !VideoExtra(gen.extras, kLtx2RetakeStartTimeExtra).empty() ||
+                            !VideoExtra(gen.extras, kLtx2RetakeEndTimeExtra).empty();
+  double retake_start = 0.0, retake_end = 0.0, retake_fps = 0.0;
+  bool regenerate_video = true, regenerate_audio = true;
+  Ltx2RetakeSourceGeometry retake_source;
+  if (wants_retake) {
+    // Every retake knob is meaningless without the others, and a knob that
+    // silently does nothing is the defect this whole surface refuses by name —
+    // the precedent is the audio window pair immediately below.
+    for (const char* required :
+         {kLtx2RetakeStartTimeExtra, kLtx2RetakeEndTimeExtra, kLtx2RetakeFrameRateExtra}) {
+      if (VideoExtra(gen.extras, required).empty()) {
+        Fail("this is a retake request and the '" + std::string(required) +
+             "' extra is missing. A retake needs the window's start and end in seconds "
+             "(retake.py:155-156) and the source folder's frame rate, which has no container "
+             "to be read from (media_io/decode.py:213-215) and which the whole temporal mask "
+             "is divided by (noise_mask_cond.py:35) — defaulting any of the three would "
+             "regenerate the wrong seconds and still render");
+      }
+    }
+    if (gen.ref_video_dir.empty()) {
+      Fail("this is a retake request and no source clip was supplied. Set `ref_video` to a "
+           "DIRECTORY of frame_%06d.ppm. A container file is REFUSED rather than read: "
+           "upstream opens one with PyAV (media_io/decode.py:226) and no demuxer is vendored "
+           "here. That is upstream's own second ingestion arm, not a substitute — it carries "
+           "a frame-folder path for exactly the no-container case (utils/helpers.py:197-220)");
+    }
+    if (!VideoExtra(gen.extras, kLtx2AudioPathExtra).empty()) {
+      Fail("a retake request cannot also carry '" + std::string(kLtx2AudioPathExtra) +
+           "'. Retake takes its audio from the SOURCE file and from nowhere else "
+           "(retake.py:250-256), so accepting both would silently pick one of two "
+           "soundtracks and render");
+    }
+    retake_start = ExtraDouble(gen.extras, kLtx2RetakeStartTimeExtra, 0.0);
+    retake_end = ExtraDouble(gen.extras, kLtx2RetakeEndTimeExtra, 0.0);
+    retake_fps = ExtraDouble(gen.extras, kLtx2RetakeFrameRateExtra, 0.0);
+    Ltx2RetakeAssertWindow(retake_start, retake_end);
+    if (retake_fps <= 0.0) {
+      Fail("the '" + std::string(kLtx2RetakeFrameRateExtra) + "' extra is " +
+           std::to_string(retake_fps) + ", and a frame rate must be positive");
+    }
+    // `regenerate_video` / `regenerate_audio` (retake.py:164-165), both
+    // defaulting True. Spelled 0/1 rather than parsed as a word, so a typo is an
+    // integer refusal rather than a silent False.
+    regenerate_video = ExtraInt(gen.extras, kLtx2RegenerateVideoExtra, 1) != 0;
+    regenerate_audio = ExtraInt(gen.extras, kLtx2RegenerateAudioExtra, 1) != 0;
+    if (im.pipeline_kind != "retake") {
+      Fail("a retake request needs the 'retake' pipeline recipe, and this engine was loaded "
+           "with pipeline_kind '" + im.pipeline_kind +
+           "'. Upstream's retake runs ONE diffusion stage at the source clip's own resolution "
+           "(retake.py:313-324, :317-318), and the distilled two-stage recipe renders its "
+           "first stage at half — seeding that stage with a full-resolution source latent "
+           "would put the clip into the wrong grid rather than fail");
+    }
+    if (!im.has_video_encoder) {
+      Fail("this is a retake request and the video VAE checkpoint loaded here carries no "
+           "encoder weights, so the source clip cannot become a latent at all "
+           "(utils/helpers.py:229). Load a `video_vae_path` whose bag matches "
+           "VAE_ENCODER_COMFY_KEYS_FILTER (video_vae/model_configurator.py:267-276)");
+    }
+    // The CLI-stage geometry validation, at the layer upstream runs it from:
+    // BEFORE the pipeline is constructed (retake.py:344-353), so a clip off the
+    // causal temporal grid or off the 32-pixel spatial grid costs no model work.
+    retake_source = Ltx2ProbeFrameDirectory(gen.ref_video_dir);
+    Ltx2RetakeAssertSourceGeometry(retake_source.frames, retake_source.height,
+                                   retake_source.width, Ltx2ScaleFactors{}.time);
+    // Upstream's retake CLI has no --height/--width/--num-frames at all
+    // (`video_editing_arg_parser`, utils/args.py:848-877 omits them and says
+    // "resolution comes from input video"). Preferring one of two geometries
+    // silently is what this refuses.
+    if (gen.height > 0 || gen.width > 0 || gen.num_frames > 1 || gen.duration_seconds > 0.0) {
+      Fail("a retake request takes its geometry from the SOURCE clip and cannot also carry an "
+           "explicit width, height, frame count or duration. Upstream's retake parser omits "
+           "all of them for this reason (utils/args.py:848-877: \"no height/width/num-frames; "
+           "resolution comes from input video\"), and the clip here is " +
+           std::to_string(retake_source.width) + "x" + std::to_string(retake_source.height) +
+           " at " + std::to_string(retake_source.frames) + " frames");
+    }
+  } else {
+    for (const char* dependent : {kLtx2RetakeFrameRateExtra, kLtx2RegenerateVideoExtra,
+                                  kLtx2RegenerateAudioExtra}) {
+      if (!VideoExtra(gen.extras, dependent).empty()) {
+        Fail("the '" + std::string(dependent) +
+             "' extra was supplied without '" + std::string(kLtx2RetakeStartTimeExtra) +
+             "' and '" + kLtx2RetakeEndTimeExtra +
+             "', so there is no retake for it to configure. Refused rather than ignored");
+      }
+    }
+  }
+
   if (!gen.prompt.empty() && !im.has_encoder) {
     Fail(
         "a prompt was supplied but no text tower is loaded, so it cannot condition this "
@@ -1563,7 +1669,16 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const bool wants_first_frame = !gen.first_frame_path.empty() || !gen.first_frame_ppm.empty();
   const bool wants_last_frame = !gen.last_frame_path.empty();
   const bool wants_image = wants_first_frame || wants_last_frame;
-  if (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty()) {
+  // `!wants_retake` IS LOAD-BEARING, and it narrows this refusal rather than
+  // weakening it. Retake and IC-LoRA reference conditioning both arrive as
+  // `ref_video_dir`, and they consume it in completely different ways: retake
+  // encodes the clip at its OWN resolution and seeds the video stream's initial
+  // latent with it (retake.py:238-247, :273), while the reference item is
+  // downscaled by the adapter's factor, temporally subsampled, and APPENDED as
+  // extra tokens to a stage-1-only adapter (iclora_utils.py:112-117, :87-89,
+  // :144-148). Serving the first says nothing about the second, so the second
+  // stays refused and #975 stays open.
+  if (!wants_retake && (!gen.ref_image_paths.empty() || !gen.ref_video_dir.empty())) {
     // TWO CAUSES REMAIN, AND NEITHER IS ONE THIS MESSAGE HAS EVER GIVEN. The
     // message names both, and then names the three ruled-out reasons with what
     // ruled each one out, because a reader who arrives here in a month should
@@ -1574,11 +1689,20 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     //    refuses a target either axis of which the factor does not divide
     //    (:112-115), keeps frame 0 and then every Nth frame (`temporal_subsample`,
     //    :87-89, called at :144), and encodes the whole clip (:145-148). This
-    //    engine's only pixel-to-latent route is `Ltx2LoadImageAndPreprocess`
-    //    followed by `Ltx2ConvVideoEncode` at `frame_count = 1` and the phase's
-    //    OWN height and width, and it refuses an encode that returns more than
-    //    one latent frame. Nothing anywhere reads `ref_video_dir`, which is a
-    //    directory of `frame_%06d.ppm`.
+    //    engine's only pixel-to-latent route for a REFERENCE item is
+    //    `Ltx2LoadImageAndPreprocess` followed by `Ltx2ConvVideoEncode` at
+    //    `frame_count = 1` and the phase's OWN height and width, and it refuses
+    //    an encode that returns more than one latent frame.
+    //
+    //    THIS USED TO SAY "nothing anywhere reads `ref_video_dir`", and that was
+    //    false about the tree even when it was written (#987): MiniMax-H3 has
+    //    always consumed the directory in full — `ReadReferenceClipChw`,
+    //    `minimax_h3_video.cpp:135`, called at `:650`. Since row LTX25-RETAKE
+    //    (#924) the LTX-2.5 side reads it too, through
+    //    `Ltx2ReadFrameDirectory`. So the missing piece is NOT a reader. It is
+    //    the reference item's own geometry: the downscale-factor resize and the
+    //    temporal subsample, neither of which retake performs and neither of
+    //    which any reader supplies.
     //
     // 2. THE REFERENCE ITEM BELONGS TO STAGE 1, AND STAGE 2 MUST RUN UNFUSED.
     //    `ICLoraPipeline` builds two `DiffusionStage`s from the same checkpoint
@@ -1604,8 +1728,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         "(iclora_utils.py:116-117), refuses a target the factor does not divide (:112-115), "
         "keeps frame 0 and then every Nth frame (`temporal_subsample`, :87-89, called at "
         ":144) and encodes the whole clip (:145-148), while this engine's only "
-        "pixel-to-latent route encodes exactly ONE frame at the phase's own resolution and "
-        "nothing reads `ref_video_dir` at all. SECOND, the reference item is a STAGE-1 item "
+        "pixel-to-latent route for a REFERENCE item encodes exactly ONE frame at the phase's "
+        "own resolution. WHAT IS *NOT* THE REASON here: the READER. This message used to say "
+        "\"nothing reads `ref_video_dir` at all\", which was false about the tree when it was "
+        "written (#987) — MiniMax-H3 consumes the directory in full at "
+        "`minimax_h3_video.cpp:650` — and is doubly false now that row LTX25-RETAKE (#924) "
+        "reads it on this side through `Ltx2ReadFrameDirectory`. What is missing is the "
+        "reference item's own geometry, the downscale resize and the temporal subsample, "
+        "which no reader supplies. SECOND, the reference item is a STAGE-1 item "
         "and stage 2 must run with NO adapter: `ICLoraPipeline` gives stage 1 "
         "`loras=tuple(loras)` (ic_lora.py:108) and the reference conditioning (:269-278), "
         "and gives stage 2 `loras=()` (:119) and `combined_image_conditionings` with no "
@@ -1633,9 +1763,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         "reference-AUDIO conditioning is not served. `Ltx2ConditionAudioByReference` is ported "
         "and gated (conditioning/types/reference_audio_cond.py:34-65), and what it needs is an "
         "encoded waveform: `encode_audio` through the audio VAE's ENCODER "
-        "(ltx-pipelines/utils/helpers.py:264-269). This row built the VIDEO encoder's load "
-        "path only — there is no AUDIO_VAE_ENCODER key filter — so nothing can turn a WAV into "
-        "audio latents here. Recorded as owed.");
+        "(ltx-pipelines/utils/helpers.py:264-269). What is missing is the CONDITIONING ITEM's "
+        "delivery: `Ltx2ConditionAudioByReference` appends reference tokens to the audio "
+        "stream, and nothing in this phase loop constructs one from a request. WHAT IS *NOT* "
+        "THE REASON: the audio VAE ENCODER. This message used to say \"there is no "
+        "AUDIO_VAE_ENCODER key filter\", and row LTX25-A2V-AUDIO-INPUT (#922) landed one in "
+        "`c2019b0e3` — `Ltx2AudioVaeEncoderKeyRules()` is loaded above and "
+        "`Ltx2EncodeAudioToLatent` is called on the audio-to-video path in this same "
+        "function, which is the executable proof it exists (#987). Recorded as owed.");
   }
 
   // The CRF, resolved the way `ImageConditioner.resolve_crf` resolves it
@@ -1687,10 +1822,18 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
 
   // ── geometry ──────────────────────────────────────────────────────────────
   const Ltx2PipelineRecipe& recipe = im.recipe;
-  const double fps = recipe.frame_rate;
-  const int64_t height = gen.height > 0 ? gen.height : recipe.height;
-  const int64_t width = gen.width > 0 ? gen.width : recipe.width;
-  int64_t frames = gen.num_frames > 1 ? gen.num_frames : recipe.num_frames;
+  // A retake's geometry is the SOURCE clip's, not the recipe's and not the
+  // request's: `output_shape = get_videostream_metadata(video_path, fps=fps)`
+  // (retake.py:220) and every one of the four is passed straight to the stage
+  // (:317-320). The request cannot carry a conflicting one — that is refused
+  // above — so this is a substitution rather than a precedence rule.
+  const double fps = wants_retake ? retake_fps : recipe.frame_rate;
+  const int64_t height = wants_retake ? retake_source.height
+                                      : (gen.height > 0 ? gen.height : recipe.height);
+  const int64_t width = wants_retake ? retake_source.width
+                                     : (gen.width > 0 ? gen.width : recipe.width);
+  int64_t frames =
+      wants_retake ? retake_source.frames : (gen.num_frames > 1 ? gen.num_frames : recipe.num_frames);
   if (gen.duration_seconds > 0.0) {
     // `resolve_num_frames` (utils/blocks.py) turns an AUTO duration into frames
     // through the DURATION HEAD. THE REASON THIS IS UNSERVED MOVED IN L13 and the
@@ -1860,6 +2003,44 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     a2v_audio_volume = encoded.data;
   }
 
+  // ── RETAKE: the source clip becomes the initial video latent (#924) ───────
+  //
+  // `RetakePipeline.__call__` lines 238-247: read the clip and encode it through
+  // the video VAE, then `_conform_latent_length` it to the frame count the
+  // target grid needs (utils/helpers.py:230-233). Done ONCE, before the loop,
+  // because upstream encodes once and the latent cannot change.
+  //
+  // THE AUDIO HALF DOES NOT EXIST ON THIS ARM, and that is upstream's rather
+  // than an omission: `audio_latent_from_file` returns None for a frame folder
+  // before it opens anything (utils/helpers.py:261-262), so
+  // `initial_audio_latent` is None, and BOTH of retake's audio predicates are
+  // conjunctions with `initial_audio_latent is not None` (retake.py:279, :282).
+  // `Ltx2RetakePlanModalities` is where that is expressed, and the soundtrack is
+  // generated fresh.
+  std::vector<float> retake_video_volume;  // [C, F, H, W], unpatchified
+  Ltx2RetakePlan retake_plan;
+  if (wants_retake) {
+    const std::vector<float> pixels =
+        Ltx2ReadFrameDirectory(gen.ref_video_dir, retake_source.height, retake_source.width);
+    int64_t cropped = 0;
+    const Ltx2LatentVolume encoded = Ltx2ConvVideoEncode(
+        im.video_encoder_cfg, im.video_encoder_weights, pixels, im.video_encoder_cfg.in_channels,
+        retake_source.frames, retake_source.height, retake_source.width, &cropped);
+    // `VideoLatentShape.from_pixel_shape(output_shape).frames`
+    // (utils/helpers.py:230-232), which is the same `(frames - 1) / time + 1`
+    // the phase loop below derives — computed here from the SOURCE so the
+    // conform has something to conform to.
+    const int64_t want_latent_frames = (retake_source.frames - 1) / factors.time + 1;
+    retake_video_volume =
+        Ltx2ConformLatentLength(encoded.data, encoded.channels, encoded.frames,
+                                encoded.height * encoded.width, want_latent_frames);
+    retake_plan = Ltx2RetakePlanModalities(regenerate_video, regenerate_audio,
+                                           /*has_audio_latent=*/false);
+    im.trace.retake_conditioned = retake_plan.video_conditioned;
+    im.trace.retake_latent_digest = DigestF32(retake_video_volume);
+    im.trace.retake_latent_absmax = AbsMax(retake_video_volume);
+  }
+
   for (int64_t phase_index = 0; phase_index <= last_phase; ++phase_index) {
     const Ltx2PhaseRecipe& phase = recipe.phases[static_cast<size_t>(phase_index)];
     const int64_t phase_h = height / phase.spatial_downscale;
@@ -1895,6 +2076,14 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
 
     // ── the input transform (ltx2_recipes.py:38) ────────────────────────────
     std::vector<float> video_initial;
+    if (wants_retake) {
+      // `ModalitySpec(initial_latent=initial_video_latent)` (retake.py:273).
+      // The `retake` recipe is one phase with no input transform, so this is
+      // the only producer of `video_initial` on this path; the refusal at load
+      // makes any other recipe unreachable from a retake request.
+      if (retake_video_volume.empty()) Fail("the retake source produced no latent");
+      video_initial = retake_video_volume;
+    }
     if (phase.input_transform == Ltx2PhaseInputTransform::kSpatialUpsample) {
       if (video_latent_volume.empty()) {
         Fail("phase '" + phase.name +
@@ -1993,6 +2182,45 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       video.latent = Ltx2VideoPatchify(volume.data(), vshape, 1);
       video.clean = video.latent;
       video.mask.assign(static_cast<size_t>(video.tokens), 1.0F);
+      // ── RETAKE: TemporalRegionMask (noise_mask_cond.py:23-45) ─────────────
+      //
+      // `state.denoise_mask.copy_(mask_val)` (:44) REPLACES the all-ones
+      // `create_initial_state` just wrote (ltx-core/tools.py:158-161), which is
+      // why this sits here rather than multiplying into the vector.
+      //
+      // Nothing else in the loop changes, and that is the design. Every consumer
+      // of `mask` already broadcasts it: `ApplyGaussianNoise` leaves the latent
+      // at `clean` where the mask is 0, `TimestepsFromMask` yields per-token
+      // timestep 0 there, and `PostProcessLatent` blends `clean` back every
+      // step. `video.clean = video.latent` above is what makes that blend
+      // restore the SOURCE rather than zeros — `clean_latent =
+      // initial_latent.clone()` (ltx-core/tools.py:156).
+      if (wants_retake && retake_plan.video_conditioned) {
+        // `causal_fix` TRUE, which is the CALL SITE's default
+        // (noise_mask_cond.py:33 reads `getattr(latent_tools, "causal_fix",
+        // True)`) and NOT `get_pixel_coords`'s own, which is False
+        // (patchifiers.py:140). Taking the function's would move every boundary
+        // by `time - 1` = 7 pixel frames and still render.
+        video.mask = Ltx2TemporalRegionMaskVideo(vshape, /*patch_size=*/1, factors, fps,
+                                                 retake_start, retake_end, /*causal_fix=*/true);
+        if (static_cast<int64_t>(video.mask.size()) != video.tokens) {
+          Fail("the temporal region mask is " + std::to_string(video.mask.size()) +
+               " tokens and the video stream is " + std::to_string(video.tokens));
+        }
+        int64_t inside = 0;
+        for (const float value : video.mask) {
+          if (value != 0.0F) ++inside;
+        }
+        im.trace.retake_masked_tokens = inside;
+        im.trace.retake_total_tokens = video.tokens;
+      } else if (wants_retake && retake_plan.video_frozen) {
+        // `frozen=not regenerate_video` with an empty conditioning list
+        // (retake.py:274, :271-272). The zeroed mask is the first half; the
+        // scalar `Modality.sigma` is the second and is applied at the forward,
+        // exactly as the audio side already does — upstream's parenthesis at
+        // utils/types.py:104-106 says the two are different.
+        video.mask.assign(static_cast<size_t>(video.tokens), 0.0F);
+      }
       // tools.py:184 — `create_initial_state` returns the state with
       // `keyframes_mask=self._first_frame_keyframes_mask(state)` ALWAYS, on the
       // same line that builds it. Not conditioned on `wants_image`, not
@@ -2332,7 +2560,16 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
       const float sigma = sigmas[static_cast<size_t>(step)];
       const std::vector<float> v_timesteps = TimestepsFromMask(video, sigma);
       const std::vector<float> a_timesteps = TimestepsFromMask(audio, sigma);
-      const float sigma_row = sigma;
+      // The SECOND half of upstream's `frozen` on the VIDEO side
+      // (retake.py:274, utils/types.py:104-106), by the same argument the audio
+      // side gives below: the zeroed denoise mask carries the per-token half,
+      // and this scalar is a separate DiT input the mask cannot reach.
+      const float sigma_row = (wants_retake && retake_plan.video_frozen) ? 0.0F : sigma;
+      // Observed rather than asserted in prose, for the reason `audio_sigma_max`
+      // records below its own field: on the audio side the same claim survived a
+      // mutation while it was only a comment.
+      im.trace.video_sigma_max =
+          std::max(im.trace.video_sigma_max, static_cast<double>(sigma_row));
 
       Ltx2ModalityInput vin;
       vin.batch = 1;

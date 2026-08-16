@@ -1149,6 +1149,56 @@ Ltx2PipelineRecipe DistilledTwoStageRecipe(const std::string& version) {
   return recipe;
 }
 
+// `RetakePipeline` (retake.py:53). ONE stage at the SOURCE clip's own
+// resolution, distilled sigmas, plain Euler, no guidance — see the table comment
+// in the header for the line behind each of those, and in particular for why
+// this is not `DistilledTwoStageRecipe` with one phase removed.
+Ltx2PipelineRecipe RetakeRecipe(const std::string& version) {
+  Ltx2PipelineRecipe recipe;
+  const Ltx2PipelineParams params = Ltx2DetectPipelineParams(version);
+
+  Ltx2PhaseRecipe stage;
+  stage.name = "retake";
+  // retake.py:317-318 passes `output_shape.width` / `.height` through, so there
+  // is no downscale and no input transform. The engine seeds this phase's
+  // initial latent with the encoded source clip.
+  stage.spatial_downscale = 1;
+  stage.sigmas = DistilledSigmas();
+  stage.noise_scale = 1.0;
+  stage.allow_guidance_override = false;
+  stage.use_official_sigma_schedule = false;
+  // NOT the ancestral sampler. `Ltx2ShouldUseAncestralSampler` is
+  // `distilled.py:76-84` and reaches retake through nothing:
+  // `DiffusionStage.__call__` defaults `stepper` to `EulerDiffusionStep()`
+  // (utils/blocks.py:526-527) and `retake.py:313-324` passes neither `stepper`
+  // nor `loop`. Selecting it here because the SIGMAS are the distilled ones
+  // would be inferring a sampler from a schedule, and the two are chosen by
+  // different upstream files.
+  stage.stepper = Ltx2StepperKind::kEuler;
+
+  recipe.phases = {stage};
+  // Defaults only — the engine overrides all four from the source clip
+  // (retake.py:220 -> :317-320). They are populated rather than left at zero so
+  // a `retake` recipe inspected on its own reports this checkpoint's geometry
+  // instead of nothing.
+  recipe.height = params.stage_2_height();
+  recipe.width = params.stage_2_width();
+  recipe.num_frames = params.num_frames;
+  recipe.frame_rate = params.frame_rate;
+  recipe.num_inference_steps = static_cast<int64_t>(DistilledSigmas().size()) - 1;
+  recipe.default_image_crf = params.default_image_crf;
+  // `SimpleDenoiser` (retake.py:291-294) takes no negative context, and
+  // `prompts_to_encode` is `[prompt]` alone in the distilled arm (:259).
+  recipe.negative_prompt = "";
+  recipe.video_output_phase = 0;
+  recipe.audio_output_phase = 0;
+  recipe.allow_request_sigmas = false;
+  recipe.allow_request_latents = false;
+  recipe.allow_negative_prompt = false;
+  recipe.fixed_num_inference_steps = true;
+  return recipe;
+}
+
 }  // namespace
 
 Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
@@ -1171,6 +1221,8 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
     }
   } else if (pipeline_kind == "dmd2") {
     if (model_version == "2" || model_version == "2.3") return PositiveOnlyRecipe();
+  } else if (pipeline_kind == "retake") {
+    if (model_version == "2" || model_version == "2.5") return RetakeRecipe(model_version);
   }
   Refuse("Unsupported LTX pipeline kind/version: '" + pipeline_kind + "'/'" + model_version +
          "'. Recipes are resolved from an EXACT (kind, version) table "

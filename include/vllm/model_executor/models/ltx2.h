@@ -39,11 +39,28 @@
 // message naming the missing phase rather than silently computing in f32.
 //
 // NOT PORTED IN L2, recorded here so it cannot be discovered later:
-//   - Guidance perturbations (guidance/perturbations.py BatchedPerturbationConfig,
-//     transformer.py:330-397 `*_perturbation_mask` / `cross_attn_skip_all` and
-//     attention.py:545-552 `perturbation_mask`). L2 runs the no-perturbation
-//     configuration, whose masks are all-ones and whose flags are all false —
-//     upstream's own `perturbations=None` path (model.py:509-511).
+//   - The CROSS-attention guidance perturbations only, as of row
+//     LTX25-T2A-ONE-STAGE (#1005): `SKIP_A2V_CROSS_ATTN` and
+//     `SKIP_V2A_CROSS_ATTN` (guidance/perturbations.py:8-16,
+//     transformer.py:330-397 `cross_attn_skip_all`). Nothing upstream that this
+//     port serves constructs them — STG is built from `stg_blocks` and reaches
+//     the SELF-attention types alone (utils/constants.py:49-68 through
+//     guiders.py:194-211) — and `Ltx2Attention` refuses the flag on a cross call
+//     by name rather than applying the self-attention rule to it.
+//
+//     THE SELF-ATTENTION HALF IS NOW PORTED, and this entry said the whole
+//     mechanism was unported until #1005. `Ltx2DitPerturbation` is upstream's
+//     `perturbations` argument (model.py:492) at the one batch size this port
+//     serves, and `Ltx2AttentionArgs::all_perturbed` is
+//     `use_attention = not all_perturbed` (attention.py:557). `nullptr` remains
+//     upstream's `perturbations=None` path (model.py:509-511) and is what every
+//     caller but text-to-audio passes.
+//
+//     The BATCHED form (`BatchedPerturbationConfig`, perturbations.py:53-143,
+//     indexed [type, block, SAMPLE]) is still unported, and so is the partial
+//     blend it exists for (`out * mask + v * (1 - mask)`, attention.py:571-572).
+//     Both are degenerate at `Ltx2ModalityInput::batch == 1`, which is the only
+//     batch any path here runs.
 //   - The caption projections (text_projection.py:31-38). LTX-2.5 is a 22B-form
 //     checkpoint: `caption_proj_before_connector=true` puts them in the TEXT
 //     ENCODER, so the DiT has none (model_configurator.py:199-219). They are
@@ -430,6 +447,24 @@ struct Ltx2AttentionArgs {
   // a path whose K/V really are timestep-independent — the caller owns that.
   const Ltx2CrossKv* kv_in = nullptr;
   Ltx2CrossKv* kv_out = nullptr;
+
+  // `all_perturbed` (attention.py:552-553, `use_attention = not all_perturbed`
+  // at :557). The STG perturbation: the attention output is REPLACED by the raw
+  // value projection, `out = v`, and `to_q` / `to_k` / the q,k RMSNorms / RoPE /
+  // the attention itself never run. `to_out` still does (`:579`), and the gate
+  // still does (`:576-578`) — the substitution happens INSIDE the attention, not
+  // around it, so a port that returned `v` to the caller and skipped `to_out`
+  // would be a different operator.
+  //
+  // Upstream also carries a PARTIAL form, `out = out * mask + v * (1 - mask)`
+  // (`:571-572`), which blends per BATCH ROW. It is not ported here and it is not
+  // needed: it exists so one batch can mix perturbed and unperturbed samples,
+  // and this port runs `max_batch_size = 1` (`Ltx2ModalityInput::batch`), where
+  // the mask is all-ones or all-zeros and the blend degenerates to exactly the
+  // two cases this flag expresses. Recorded rather than assumed, because a
+  // batched arm that reached this field would need the blend and would get the
+  // all-or-nothing answer silently.
+  bool all_perturbed = false;
 };
 std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& w, const float* x,
                                  const float* context, const Ltx2AttentionArgs& args);
@@ -498,14 +533,59 @@ struct Ltx2DitOutputs {
   std::vector<float> audio;  // [batch, audio tokens, audio_out_channels]
 };
 
-// LTXModel.forward (model.py:492-538) for model_type=AudioVideo, plus the
-// preprocessors it drives (transformer_args.py:263-411). BOTH streams are
-// required: LTX-2.5 is an AudioVideo checkpoint, and the VideoOnly / AudioOnly
-// model types (model.py:31-33) build a different parameter set, so they are
-// refused rather than served by an ungated path. To run one stream of an AV model
-// — which is what upstream's own pipeline does — clear `enabled` on the other;
-// the audio<->video cross attention still reads its state, exactly as
-// transformer.py:265-269 does.
+// `perturbations` on LTXModel.forward (model.py:492), reduced to what this port
+// can express. One entry per BLOCK; `true` means that block's self-attention is
+// replaced by its value projection, which is STG.
+//
+// A `BatchedPerturbationConfig` upstream (guidance/perturbations.py:53-143) is
+// indexed [type, block, SAMPLE]; this is indexed [block] alone, because
+// `Ltx2ModalityInput::batch` is 1 on every path here and the sample axis is a
+// degenerate one. `Ltx2BatchedPerturbationConfig` (ltx2_pipeline.h) is the
+// batched form and stays ungated by any product caller — recorded as owed in
+// .agents/specs/ltx25-t2a-one-stage.md rather than silently bypassed.
+//
+// EMPTY IS NOT "NOTHING PERTURBED BY COINCIDENCE": a vector of the wrong length
+// is REFUSED, so a config built for a different layer count cannot silently
+// perturb the first N blocks and leave the rest alone.
+//
+// The two CROSS-attention perturbation types upstream defines
+// (SKIP_A2V_CROSS_ATTN, SKIP_V2A_CROSS_ATTN, perturbations.py:8-16) have no
+// field here and are not ported. Nothing upstream that this port serves
+// constructs them: STG is built from `stg_blocks` and reaches the self-attention
+// types only (utils/constants.py:49-68 through guiders.py:194-211).
+struct Ltx2DitPerturbation {
+  std::vector<uint8_t> video_self_attn;  // [num_layers], empty = none
+  std::vector<uint8_t> audio_self_attn;  // [num_layers], empty = none
+};
+
+// LTXModel.forward (model.py:492-538), plus the preprocessors it drives
+// (transformer_args.py:263-411).
+//
+// EXACTLY ONE OF THE TWO STREAMS MAY BE NULL, which is upstream's own
+// `video_args = ... if video is not None else None` (model.py:505) and the
+// shape `T2AOneStagePipeline` runs (t2a_one_stage.py:167 passes `video=None`).
+// Both null is refused: upstream refuses it too (transformer.py:259-260, "At
+// least one of video or audio must be provided").
+//
+// `video = nullptr` IS NOT `video->enabled = false`, and the difference renders
+// rather than failing. Upstream's predicate is `run_v2a = run_ax and (video is
+// not None and vx.numel() > 0)` (transformer.py:269) — it tests PRESENCE, not
+// `enabled` — so a disabled-but-present video stream still feeds video->audio
+// cross attention from that stream's latent. This header used to advise
+// `enabled` as the way to run one stream, and for the audio-only case that
+// advice was wrong. `enabled` remains correct for running one stream of a JOINT
+// render, where the cross attention reading the other stream's state is the
+// intent.
+//
+// WHAT IS *NOT* THE REASON, re-derived at this tree rather than inherited: the
+// AudioOnly / VideoOnly WEIGHT CONTRACT is not what blocks a one-stream call, and
+// this check used to say it was. `T2AOneStagePipeline` loads the ordinary
+// AudioVideo checkpoint FILE and merely restricts which keys are read
+// (LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP, model_configurator.py:228-239), so
+// the contract `EnumerateLtx2DitTensors` describes is the one it satisfies. What
+// remains true is a statement about the LOADER: a checkpoint saved with only the
+// audio subset still cannot be materialized here, and that refusal lives at
+// `Ltx2LoadDitFromSafetensors`, where it is about the file.
 //
 // `compute_dtype` must be vt::DType::kF32 — see the DTYPE note at the top of this
 // file. Anything else is REFUSED with a message naming phase L6.
@@ -521,7 +601,8 @@ struct Ltx2DitOutputs {
 Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                               const Ltx2DitWeights& weights, const Ltx2ModalityInput* video,
                               const Ltx2ModalityInput* audio, vt::DType compute_dtype,
-                              Ltx2PromptKvCache* cache = nullptr);
+                              Ltx2PromptKvCache* cache = nullptr,
+                              const Ltx2DitPerturbation* perturbations = nullptr);
 
 // One BasicAVTransformerBlock (transformer.py:254-417), exposed so the block is
 // gateable on its own. `video_x` / `audio_x` are updated IN PLACE.
@@ -541,6 +622,9 @@ struct Ltx2BlockArgs {
   // only the static per-block table applies (:441).
   const float* video_prompt_modulation = nullptr;
   const float* audio_prompt_modulation = nullptr;
+  // STG for THIS block (attention.py:552-577). See `Ltx2DitPerturbation`.
+  bool video_self_attn_perturbed = false;
+  bool audio_self_attn_perturbed = false;
   // Audio<->video cross-attention AdaLN inputs (transformer_args.py:388-411).
   const float* video_cross_scale_shift = nullptr;  // [batch, video tokens, 4 * dim]
   const float* video_cross_gate = nullptr;         // [batch, 1, dim]

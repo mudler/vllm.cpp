@@ -31,10 +31,13 @@
 // and no resample off the family's native 44100 Hz stereo. Those are the same
 // refusals `/v1/audio/speech` makes, for the same reasons.
 //
-// IT IS SLOW ON CPU and no speed number is claimed. The acoustic half is
-// upstream's own fp32 and the AR half's host GEMM is a scalar loop written for
-// a reproducible reduction order (.agents/specs/minimax-music3.md `## Now`).
-// Ask for a short `--duration` and few `--steps` while checking that it works.
+// IT IS STILL SLOW ON CPU. The acoustic half is upstream's own fp32 and five of
+// the six stages are host loops (.agents/specs/minimax-music3.md §11.4). Those
+// loops DO use every core now — the three hot ones partition their output
+// elements across the CPU threadpool, so `VLLM_CPP_CPU_THREADS` governs them
+// (§12) — but the reduction order inside each output is unchanged and so is
+// every sample this program writes. Ask for a short `--duration` and few
+// `--steps` while checking that it works.
 #include <chrono>
 #include <cmath>
 #include <cstdint>

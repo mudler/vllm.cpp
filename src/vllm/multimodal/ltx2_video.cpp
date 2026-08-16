@@ -36,6 +36,7 @@
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_retake.h"
+#include "vllm/model_executor/models/ltx2_t2a.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
 #include "vllm/model_executor/models/ltx2_upsampler.h"
 #include "vllm/model_executor/models/ltx2_tiling.h"
@@ -363,7 +364,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 781 791 792 854 950 966 968 1046 1071 1176 1217
+// 782 792 793 855 951 967 969 1060 1085 1190 1231
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
     kLtx2AllowUnportedExtra,     kLtx2MaxPhaseExtra,       kLtx2DitConfigPathExtra,
@@ -974,8 +975,21 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
   }
 
   // ── the video VAE ─────────────────────────────────────────────────────────
-  if (params.video_vae_path.empty()) Fail("video_vae_path is required");
-  {
+  //
+  // REQUIRED, EXCEPT ON AN AUDIO-ONLY RECIPE, and the exception is upstream's
+  // shape rather than a convenience: `T2AOneStagePipeline.__init__` constructs a
+  // `PromptEncoder`, a `DiffusionStage`, an `AudioDecoder` and a
+  // `DurationPredictor` (t2a_one_stage.py:68-107) and never calls
+  // `model_paths.video_vae()`. Demanding one would make a text-to-audio load ask
+  // for a checkpoint the pipeline cannot use.
+  //
+  // Keyed on `recipe.audio_only` rather than on the kind STRING, so the next
+  // audio-only recipe inherits it instead of silently failing here. Supplying a
+  // video VAE anyway is accepted and loaded — it costs the caller memory and
+  // nothing else, and refusing it would break a caller who reuses one params
+  // object across pipelines.
+  if (params.video_vae_path.empty() && !im.recipe.audio_only) Fail("video_vae_path is required");
+  if (!params.video_vae_path.empty()) {
     const SafetensorsFile f = SafetensorsFile::Open(params.video_vae_path);
     const nlohmann::json vae_config = Ltx2ReadCheckpointConfig(f);
     im.video_cfg = Ltx2ParseConvVideoDecoderConfig(vae_config, &im.video_kind);
@@ -1018,7 +1032,7 @@ std::unique_ptr<Ltx2VideoEngine> Ltx2VideoEngine::Load(const VideoModelParams& p
       }
     }
   }
-  if (im.video_cfg.in_channels != im.dit.params.out_channels) {
+  if (!params.video_vae_path.empty() && im.video_cfg.in_channels != im.dit.params.out_channels) {
     Fail("the video VAE takes " + std::to_string(im.video_cfg.in_channels) +
          " latent channels but the DiT emits " + std::to_string(im.dit.params.out_channels));
   }
@@ -1438,7 +1452,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
                        kv.first == kLtx2RetakeEndTimeExtra ||
                        kv.first == kLtx2RetakeFrameRateExtra ||
                        kv.first == kLtx2RegenerateVideoExtra ||
-                       kv.first == kLtx2RegenerateAudioExtra;
+                       kv.first == kLtx2RegenerateAudioExtra ||
+                       kv.first == kLtx2NegativePromptExtra ||
+                       kv.first == kLtx2AudioCfgScaleExtra ||
+                       kv.first == kLtx2AudioStgScaleExtra ||
+                       kv.first == kLtx2AudioRescaleScaleExtra ||
+                       kv.first == kLtx2AudioSkipStepExtra ||
+                       kv.first == kLtx2AudioStgBlocksExtra;
     if (!known) {
       Fail("unknown per-generation extra '" + kv.first + "'. This family defines: " +
            std::string(kLtx2ImageCrfExtra) + ", " + kLtx2AudioPathExtra + ", " +
@@ -1446,7 +1466,52 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
            kLtx2GeneratedKeyframesExtra + ", " + kLtx2TemporalRoundsExtra + ", " +
            kLtx2RetakeStartTimeExtra + ", " + kLtx2RetakeEndTimeExtra + ", " +
            kLtx2RetakeFrameRateExtra + ", " + kLtx2RegenerateVideoExtra + ", " +
-           kLtx2RegenerateAudioExtra);
+           kLtx2RegenerateAudioExtra + ", " + kLtx2NegativePromptExtra + ", " +
+           kLtx2AudioCfgScaleExtra + ", " + kLtx2AudioStgScaleExtra + ", " +
+           kLtx2AudioRescaleScaleExtra + ", " + kLtx2AudioSkipStepExtra + ", " +
+           kLtx2AudioStgBlocksExtra);
+    }
+  }
+  // ── the TEXT-TO-AUDIO knobs belong to ONE pipeline (#1005) ────────────────
+  //
+  // `pipeline_kind` is a LOAD extra, so which pipeline runs is settled before a
+  // request arrives and this is a decidable question rather than a guess. The
+  // guard runs in BOTH directions: the six T2A knobs are refused off a
+  // `t2a_one_stage` engine, and every other per-generation knob is refused ON
+  // one. Neither is padding. Upstream's `T2AOneStagePipeline.__call__` takes no
+  // image, no reference, no keyframe and no window (t2a_one_stage.py:109-122),
+  // and its guider arguments have no counterpart in any other `__call__`, so a
+  // knob crossing either way would silently do nothing to a render that still
+  // finishes.
+  {
+    const char* const kT2aOnly[] = {kLtx2NegativePromptExtra,   kLtx2AudioCfgScaleExtra,
+                                    kLtx2AudioStgScaleExtra,    kLtx2AudioRescaleScaleExtra,
+                                    kLtx2AudioSkipStepExtra,    kLtx2AudioStgBlocksExtra};
+    const char* const kNotOnT2a[] = {kLtx2ImageCrfExtra,        kLtx2AudioPathExtra,
+                                     kLtx2AudioStartTimeExtra,  kLtx2AudioMaxDurationExtra,
+                                     kLtx2GeneratedKeyframesExtra, kLtx2TemporalRoundsExtra,
+                                     kLtx2RetakeStartTimeExtra, kLtx2RetakeEndTimeExtra,
+                                     kLtx2RetakeFrameRateExtra, kLtx2RegenerateVideoExtra,
+                                     kLtx2RegenerateAudioExtra};
+    for (const char* key : kT2aOnly) {
+      if (!im.recipe.audio_only && !VideoExtra(gen.extras, key).empty()) {
+        Fail("the '" + std::string(key) +
+             "' extra is text-to-audio's alone (ltx-pipelines utils/args.py:1083-1119, the "
+             "`default_1_stage_t2a_arg_parser`), and this engine was loaded with pipeline_kind '" +
+             im.pipeline_kind +
+             "'. Refused rather than ignored: no other pipeline `__call__` upstream takes a "
+             "guider argument at all, so accepting it here would report a configured render "
+             "that ran the recipe's own values");
+      }
+    }
+    for (const char* key : kNotOnT2a) {
+      if (im.recipe.audio_only && !VideoExtra(gen.extras, key).empty()) {
+        Fail("the '" + std::string(key) +
+             "' extra has no meaning on a text-to-audio render, which produces no picture at "
+             "all. `T2AOneStagePipeline.__call__` takes a prompt, a negative prompt, a seed, a "
+             "frame rate, a step count, the audio guider and a frame count "
+             "(t2a_one_stage.py:109-122) and nothing else. Refused rather than ignored");
+      }
     }
   }
   // The two audio WINDOW knobs only mean something alongside a file. Accepting
@@ -1752,6 +1817,23 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     im.trace.video_absmax = AbsMax(v);
     im.trace.audio_absmax = AbsMax(a);
   }
+
+  // ── TEXT-TO-AUDIO: the render that has no picture (#1005) ─────────────────
+  //
+  // `T2AOneStagePipeline.__call__` (t2a_one_stage.py:109-172), in its own
+  // translation unit (ltx2_t2a.h) mirroring upstream's own file.
+  //
+  // THE BRANCH SITS HERE, after the conditioning and before ANY video geometry.
+  // After, because T2A encodes a prompt exactly as every other pipeline does
+  // (`:127-135`) and duplicating that chain would give the audio-only arm its own
+  // copy of the connector composition. Before, because everything below this
+  // point — the resolution guard, the canvas, the phase loop, the decode — is
+  // about a video stream this pipeline does not have, and a `t2a` request that
+  // fell through would be refused by a message about latent grids.
+  if (im.recipe.audio_only) {
+    return GenerateAudioOnly(im, gen, audio_context, context_tokens);
+  }
+
   // ── conditioning on pixels (row LTX25-IMAGE-COND, issue #644) ─────────────
   //
   // Upstream this is `ImageConditioner` (ltx-pipelines/utils/blocks.py:936-993,
@@ -3380,6 +3462,243 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // and here can throw, so `completed` is set HERE and nowhere else: it is what
   // separates "this conditioning produced that clip" from "this conditioning was
   // built for a render that then failed".
+  im.trace.completed = true;
+  return result;
+}
+
+// ── TEXT-TO-AUDIO (row LTX25-T2A-ONE-STAGE, #1005) ──────────────────────────
+//
+// `T2AOneStagePipeline.__call__` (ltx-pipelines t2a_one_stage.py:109-172). The
+// numerics live in `ltx2_t2a.cpp`, mirroring upstream's own file; this resolves
+// the request, encodes the negative prompt and writes the artifact.
+//
+// PLACED BELOW `Generate` ON PURPOSE. The READER ANCHORS comment near the top of
+// this file carries derived LINE NUMBERS into it and is gated by
+// `test_ltx2_video`, so a definition inserted above the last anchored line would
+// move every anchor under it for a reason that has nothing to do with this row.
+VideoResult Ltx2VideoEngine::GenerateAudioOnly(Impl& im, const VideoGenParams& gen,
+                                               const float* audio_context,
+                                               int64_t context_tokens) {
+  const Ltx2PipelineRecipe& recipe = im.recipe;
+  VT_CHECK(recipe.audio_only, "ltx2 t2a: reached the audio-only path on a video recipe");
+
+  // Upstream's T2A CLI has no --height/--width, and its pipeline substitutes a
+  // 512x512 PLACEHOLDER whose height and width it documents as unused
+  // (t2a_one_stage.py:37-40, :163-164). Accepting a resolution here would take a
+  // number from the caller, ignore it, and return successfully.
+  if (gen.height > 0 || gen.width > 0) {
+    Fail("a text-to-audio request cannot carry a width or a height: there is no picture. "
+         "Upstream passes a 512x512 PLACEHOLDER into the stage and says so in as many words — "
+         "\"Audio-only generation reads `frames` and `fps` from the pixel shape via "
+         "`AudioLatentShape.from_video_pixel_shape` (height/width are unused)\" "
+         "(t2a_one_stage.py:37-40). Accepting one would ignore it and still succeed");
+  }
+  if (!gen.first_frame_path.empty() || !gen.last_frame_path.empty() ||
+      !gen.first_frame_ppm.empty() || !gen.ref_image_paths.empty() ||
+      !gen.ref_video_dir.empty() || !gen.ref_audio_path.empty() || !gen.ref_audio_wav.empty()) {
+    Fail("a text-to-audio request cannot carry a keyframe, a reference image, a reference clip "
+         "or a reference waveform. `T2AOneStagePipeline.__call__` takes none of them "
+         "(t2a_one_stage.py:109-122) and its `DiffusionStage` call passes `video=None` "
+         "(`:167`), so there is no stream for any of them to condition");
+  }
+
+  // `num_frames` / `frame_rate` — the only two fields of the placeholder pixel
+  // shape T2A reads, and they exist to derive the audio DURATION.
+  const double fps = recipe.frame_rate;
+  int64_t frames = gen.num_frames > 1 ? gen.num_frames : recipe.num_frames;
+  if (gen.duration_seconds > 0.0) {
+    frames = static_cast<int64_t>(std::llround(gen.duration_seconds * fps));
+  }
+
+  // ── the guider (t2a_one_stage.py:196-205) ─────────────────────────────────
+  //
+  // The recipe already carries the params table's audio guider with
+  // `modality_scale` pinned to 1.0; each extra overrides ONE field, exactly as
+  // one CLI flag does.
+  Ltx2MultiModalGuiderParams guidance = recipe.phases.front().audio_guidance;
+  guidance.cfg_scale = ExtraDouble(gen.extras, kLtx2AudioCfgScaleExtra, guidance.cfg_scale);
+  guidance.stg_scale = ExtraDouble(gen.extras, kLtx2AudioStgScaleExtra, guidance.stg_scale);
+  guidance.rescale_scale =
+      ExtraDouble(gen.extras, kLtx2AudioRescaleScaleExtra, guidance.rescale_scale);
+  guidance.skip_step = ExtraInt(gen.extras, kLtx2AudioSkipStepExtra, guidance.skip_step);
+  if (guidance.skip_step < 0) {
+    Fail("'" + std::string(kLtx2AudioSkipStepExtra) + "' is " +
+         std::to_string(guidance.skip_step) +
+         "; `should_skip_step` is `step % (skip_step + 1)` (guiders.py:287-291) and a negative "
+         "value would take the modulus of a non-positive divisor");
+  }
+  {
+    // `--audio-stg-blocks`, `nargs="*"` (utils/args.py:1107-1113). An extra that
+    // is PRESENT and empty is upstream's empty list — "perturb nothing" — and is
+    // kept distinct from an ABSENT extra, which takes the params table's own
+    // [28]. Collapsing the two would make `audio_stg_blocks=` silently mean
+    // block 28.
+    const auto at = gen.extras.find(kLtx2AudioStgBlocksExtra);
+    if (at != gen.extras.end()) {
+      guidance.stg_blocks.clear();
+      const std::string& raw = at->second;
+      for (size_t i = 0; i < raw.size();) {
+        const size_t comma = raw.find(',', i);
+        const std::string token = raw.substr(i, comma == std::string::npos ? comma : comma - i);
+        if (!token.empty()) {
+          try {
+            guidance.stg_blocks.push_back(std::stoll(token));
+          } catch (const std::exception&) {
+            Fail("'" + std::string(kLtx2AudioStgBlocksExtra) + "' holds '" + token +
+                 "', which is not an integer block index");
+          }
+        }
+        if (comma == std::string::npos) break;
+        i = comma + 1;
+      }
+    }
+  }
+
+  // ── the negative conditioning (t2a_one_stage.py:127-135) ──────────────────
+  //
+  // Upstream encodes `[prompt, negative_prompt]` in ONE `PromptEncoder` call and
+  // takes `.audio_encoding` from each. Here the positive half was already
+  // resolved by `Generate`; this is the second half, through the same
+  // `Ltx2EncodePromptToConditioning` and the same connector.
+  //
+  // ONLY WHEN THE GUIDER ASKS FOR IT. `do_unconditional_generation` is
+  // `not isclose(cfg_scale, 1.0)` (guiders.py:275-277), so at scale 1.0 there is
+  // no unconditional forward and encoding a negative prompt would be a wasted
+  // 12B host-side pass per request.
+  std::vector<float> negative_audio;
+  const float* negative_context = nullptr;
+  if (!guidance.DoUnconditionalGeneration()) {
+    // Nothing to do: the guidance delta's `uncond_text` term is switched off.
+  } else if (!im.has_encoder) {
+    Fail("this text-to-audio request needs an unconditional forward (`cfg_scale` = " +
+         std::to_string(guidance.cfg_scale) +
+         "), which needs the NEGATIVE prompt encoded — and no text tower is loaded, so this "
+         "engine can encode neither prompt. The `" +
+         std::string(kLtx2AudioPromptEmbedsExtra) +
+         "' fallback carries ONE conditioning stream and there is no second file for the "
+         "negative one. Load with encoder_path, or set '" +
+         std::string(kLtx2AudioCfgScaleExtra) +
+         "' to 1.0, which turns the unconditional pass off (guiders.py:275-277)");
+  } else {
+    const std::string negative =
+        VideoExtra(gen.extras, kLtx2NegativePromptExtra, recipe.negative_prompt);
+    if (negative.empty()) {
+      Fail("this text-to-audio request needs a negative prompt and neither the '" +
+           std::string(kLtx2NegativePromptExtra) +
+           "' extra nor the recipe carries one. An EMPTY negative prompt is not the same as no "
+           "CFG: it still encodes and still steers, and upstream's CLI always supplies "
+           "`DEFAULT_NEGATIVE_PROMPT` (utils/args.py:1083-1088)");
+    }
+    vt::Queue text_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+    const Ltx2PromptConditioning encoded = Ltx2EncodePromptToConditioning(
+        *im.tower, *im.tokenizer, im.gemma_ids, im.caption_projections, im.feature_cfg, negative,
+        text_queue);
+    negative_audio = encoded.conditioning.audio;
+    if (encoded.seq != context_tokens) {
+      // Upstream's two encodings come from ONE tokenization of a two-element
+      // list (t2a_one_stage.py:127-133), so they share a padded width by
+      // construction. A mismatch here means the two ran different geometries and
+      // the guidance delta would subtract tensors that do not correspond.
+      Fail("the negative prompt encoded to " + std::to_string(encoded.seq) +
+           " context rows and the prompt to " + std::to_string(context_tokens) +
+           "; upstream encodes both in one call and they cannot differ");
+    }
+    if (im.has_connector) {
+      const Ltx2ConnectorEmbeddings through =
+          RunConnector(SafetensorsFile::Open(im.params.dit_path), im.video_connector_cfg,
+                       im.audio_connector_cfg, encoded.conditioning.video,
+                       encoded.conditioning.audio, encoded.conditioning.additive_mask,
+                       context_tokens);
+      negative_audio = through.audio;
+    }
+    negative_context = negative_audio.data();
+  }
+
+  // ── the render ────────────────────────────────────────────────────────────
+  if (im.on_device) {
+    // REFUSED BY NAME rather than served the host forward behind a device
+    // handle, which is the substitution this engine's header names as the thing
+    // that would make every later timing claim false.
+    //
+    // WHAT IS *NOT* THE REASON: not the STG perturbation and not the guider.
+    // `Ltx2DitPerturbation` is a plain argument either forward could take, and
+    // `Ltx2MultiModalGuidance` runs on host buffers on both arms. What is
+    // missing is narrower and is a fact about THIS tree:
+    // `Ltx2DitForwardDevice` dereferences `*video` unconditionally — both
+    // `PrepareStreamDev` calls take it by reference, and the per-block
+    // `a.batch = video->batch` reads through it — so a one-stream device forward
+    // is a rewrite of that function rather than the lifted check the host
+    // forward needed. Owed by #1005.
+    Fail("text-to-audio is not served on the accelerator. `Ltx2DitForwardDevice` takes BOTH "
+         "streams by reference and this pipeline has no video stream to give it "
+         "(`video=None`, t2a_one_stage.py:167). Refusing rather than running the host forward "
+         "behind a device handle. Load with device 0.");
+  }
+
+  EngineNoiseStream noise(gen.has_seed ? gen.seed : static_cast<uint64_t>(recipe.num_frames));
+  Ltx2T2aRequest req;
+  req.device = im.device;
+  req.compute_dtype = im.compute_dtype;
+  req.dit_params = &im.dit.params;
+  req.dit_weights = &im.dit.weights;
+  req.context = audio_context;
+  req.negative_context = negative_context;
+  req.context_tokens = context_tokens;
+  req.num_frames = frames;
+  req.frame_rate = fps;
+  req.steps = gen.steps > 0 ? gen.steps : recipe.num_inference_steps;
+  req.noise = &noise;
+  req.guidance = guidance;
+  req.audio_cfg = &im.audio_cfg;
+  req.audio_weights = &im.audio_weights;
+  req.vocoder_cfg = &im.vocoder_cfg;
+  req.vocoder_weights = &im.vocoder_weights;
+
+  const Ltx2T2aResult rendered = Ltx2T2aGenerate(req);
+
+  im.trace.t2a_rendered = true;
+  im.trace.t2a_video_stream_present = rendered.video_stream_present;
+  im.trace.t2a_cond_forwards = rendered.cond_forwards;
+  im.trace.t2a_uncond_forwards = rendered.uncond_forwards;
+  im.trace.t2a_perturbed_forwards = rendered.perturbed_forwards;
+  im.trace.t2a_perturbed_blocks = rendered.perturbed_blocks;
+  im.trace.t2a_first_latent = rendered.first_step_latent;
+  im.trace.t2a_first_velocity = rendered.first_step_velocity;
+  im.trace.t2a_first_cond = rendered.first_step_cond;
+  im.trace.t2a_first_uncond_velocity = rendered.first_step_uncond_velocity;
+  im.trace.t2a_first_uncond = rendered.first_step_uncond;
+  im.trace.t2a_first_perturbed_velocity = rendered.first_step_perturbed_velocity;
+  im.trace.t2a_first_perturbed = rendered.first_step_perturbed;
+  im.trace.t2a_first_denoised = rendered.first_step_denoised;
+  im.trace.t2a_first_next_latent = rendered.first_step_next_latent;
+  im.trace.t2a_first_sigma = rendered.first_step_sigma;
+  im.trace.audio_tokens = rendered.audio_tokens;
+  im.trace.audio_latent_digest = rendered.latent_digest;
+  im.trace.audio_latent_absmax = rendered.latent_absmax;
+
+  // ── the artifact ──────────────────────────────────────────────────────────
+  std::error_code ec;
+  std::filesystem::create_directories(gen.output_dir, ec);
+  if (ec) Fail("cannot create " + gen.output_dir + ": " + ec.message());
+
+  VideoResult result;
+  // `frame_dir` STAYS EMPTY, and that is the contract rather than an omission: a
+  // directory naming a frame pattern that matches no file is what a caller
+  // iterates and finds nothing in. `frame_count == 0` says the same thing, and
+  // saying it twice is what lets a consumer notice the disagreement if one of
+  // them is ever filled by accident.
+  result.frame_count = 0;
+  result.width = 0;
+  result.height = 0;
+  result.fps = 0;
+  result.audio_path = JoinPath(gen.output_dir, "audio.wav");
+  WriteFileBytes(result.audio_path,
+                 MiniMaxH3WriteWav(rendered.waveform, rendered.channels,
+                                   rendered.samples_per_channel, rendered.sample_rate));
+  result.sample_rate = rendered.sample_rate;
+  // NO `mux_argv`, and none is composed. The argv this seam builds muxes a frame
+  // pattern with a soundtrack; over an empty pattern ffmpeg fails, so composing
+  // one would hand the caller a command that cannot run and call it a result.
   im.trace.completed = true;
   return result;
 }

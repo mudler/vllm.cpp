@@ -562,6 +562,17 @@ struct Ltx2PipelineRecipe {
   bool allow_negative_prompt = true;
   bool fixed_num_inference_steps = false;
 
+  // `T2AOneStagePipeline` (t2a_one_stage.py:43). TRUE means the pipeline passes
+  // `video=None` to the stage (`:167`) and returns a waveform and nothing else
+  // (`:172`) — there is no video latent, no video VAE decode and no frame.
+  //
+  // A FLAG ON THE RECIPE RATHER THAN A STRING COMPARE AT THE CALL SITE, because
+  // the engine has to answer "is there a picture" in four places (geometry,
+  // resolution guard, decode, artifacts) and four independent `kind ==
+  // "t2a_one_stage"` tests are four chances for one of them to be missed on the
+  // next audio-only recipe. The recipe table is the one place that knows.
+  bool audio_only = false;
+
   int64_t max_spatial_downscale() const;
 };
 
@@ -627,6 +638,21 @@ void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
 //                                  `use_keyframes_abs_pos_embedding`
 //   ("retake",             "2")    Lightricks retake.py:85,287,290-294,313-324
 //   ("retake",             "2.5")  same
+//   ("t2a_one_stage",      "2")    Lightricks t2a_one_stage.py:43,109 (row
+//   ("t2a_one_stage",      "2.3")  LTX25-T2A-ONE-STAGE, #1005). The one_stage
+//   ("t2a_one_stage",      "2.4")  rows' own schedule with `audio_only` set:
+//   ("t2a_one_stage",      "2.5")  T2A hard-codes the SAME `LTX2Scheduler()`
+//                                  (t2a_one_stage.py:67 against
+//                                  ti2vid_one_stage.py:81) and the same
+//                                  `detect_params` step count, and differs in
+//                                  carrying no video stream at all
+//
+// The four `t2a_one_stage` rows mirror the four `one_stage` rows one for one, and
+// the negative prompt follows the same split for the same reason: it travels with
+// the GENERATION, not with the pipeline. There is no "which versions support
+// text-to-audio" question upstream — `T2AOneStagePipeline` takes whatever
+// `resolve_cli_params` read off the checkpoint (t2a_one_stage.py:178-179), so
+// restricting these rows to 2.5 would be a local invention.
 //
 // The `retake` rows are Lightricks' `RetakePipeline` and have no vLLM-Omni
 // counterpart at all. Every value on them is read off `retake.py` rather than

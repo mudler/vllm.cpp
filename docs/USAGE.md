@@ -842,6 +842,74 @@ The two knobs beside it are per-GENERATION and therefore CLI and ABI only, becau
 `num_generated_keyframes` on the other pipelines, and `temporal_upsample_rounds`
 below.
 
+### LTX-2.5 text-to-audio: a render with no picture
+
+`--pipeline-kind t2a_one_stage` runs upstream's `T2AOneStagePipeline`, which
+generates a soundtrack and no video at all. The result carries an `audio.wav`,
+`frame_count = 0`, an empty frame directory and **no ffmpeg argv**, because there
+is nothing to mux.
+
+```sh
+ltx2-gen --dit ltx-2.5-dit.safetensors \
+         --audio-vae ltx-2.5-audio-vae-bf16.safetensors \
+         --encoder gemma4-12b-with-proj.safetensors --encoder-config gemma4.json \
+         --pipeline-kind t2a_one_stage --device cpu \
+         --frames 121 --steps 30 --prompt "rain on a tin roof, distant thunder" \
+         --workdir /tmp/t2a
+```
+
+**These file names are not a checkpoint pin, and no LTX-2.5 recipe in this
+document is.** None of them names a HuggingFace repo, a revision or a sha256,
+which AGENTS.md § *Say which weights, and from where* requires; MiniMax-H3 and
+MiniMax-Music3 below each carry a full table and LTX-2.5 carries none. That is
+campaign-wide and pre-existing rather than particular to this recipe, and it is
+recorded rather than invented, because no LTX-2.5 arm here has been rendered on
+real weights yet. Tracked by
+[#1048](https://github.com/mudler/vllm.cpp/issues/1048); read `--dit` above as
+"the LTX-2.5 transformer", which the other recipes on this page spell as
+`ltx-2.5-22b-distilled-fp8.safetensors` together with the `--dit-config` its
+missing `__metadata__` requires.
+
+**No `--video-vae` is needed**, and none is loaded: upstream's pipeline never
+constructs a video VAE. `--width` and `--height` are **refused** rather than
+ignored — upstream passes a 512x512 placeholder whose height and width it
+documents as unused, and only the frame count and the recipe's frame rate are
+read, to derive the duration.
+
+**It is the only GUIDED arm, and that changes what it costs and what it needs.**
+The distilled video recipes run one DiT forward per step. This one runs
+**three** by default — conditional, unconditional, and one with the audio
+self-attention perturbed (STG) — so it is roughly 3x the work per step, and it
+**requires a text tower**, because the unconditional pass conditions on the
+negative prompt. Loading with `prompt_embeds_path` alone gets a refusal naming
+`--audio-cfg-guidance-scale 1.0` as the way to turn the unconditional pass off.
+
+Six per-generation knobs mirror upstream's own CLI, and each takes the
+checkpoint generation's value when absent: `--negative-prompt`,
+`--audio-cfg-guidance-scale` (7.0), `--audio-stg-guidance-scale` (1.0),
+`--audio-rescale-scale` (0.7), `--audio-skip-step` (0) and `--audio-stg-blocks`
+(28 on the 2.3-and-later lineage), which is comma separated. A block index
+outside the DiT's own layer count is refused rather than clamped. There is no
+`modality_scale` knob: upstream pins it to 1.0 for this pipeline, because
+audio-only generation has no video modality to isolate.
+
+`--audio-rescale-scale` acts on the **denoised (x0) prediction**, not on the
+DiT's velocity, because upstream's guider sits behind an `X0Model` and combines
+already-converted tensors. The distinction is invisible at `0.0`, where the two
+readings agree exactly, and it changes the render at every other value — so a
+recipe or a script that was tuned against the velocity reading will not
+reproduce here at the default `0.7` (issue #1039).
+
+Being per-generation, those six reach the CLI and the C ABI and **not**
+`/v1/videos`, which forwards no per-generation extra to any engine (issue #928).
+`pipeline_kind` is a LOAD knob and does reach the server, so a server started
+with `--video-extra pipeline_kind=t2a_one_stage` renders every request as audio
+at the recipe's own guider values.
+
+**The accelerator is refused by name.** `device = 1` gets a refusal on this
+pipeline: the device forward takes both streams by reference and this pipeline
+has no video stream to give it. Use `--device cpu`.
+
 **What is not served.** `temporal_upsample_rounds` is defined and refused above
 `0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and
 stitches it back is not ported. The refusal names it, and it names three things
@@ -870,8 +938,21 @@ and has to be stopped. The denoise itself is flat at either size. Unified memory
 makes those host bytes and this class of box reboots rather than OOM-killing, so
 start small and grow, and put a memory watchdog in front of anything larger. The
 recipe default (1024x1536 at 121 frames) is far beyond what one GB10 holds today.
-Expect minutes, not seconds: most of a 320x192/25f render is spent single-threaded
-in the host VAE decode at 0% GPU.
+Expect minutes, not seconds: most of a 320x192/25f render is spent in the host
+VAE decode at 0% GPU, because that decode has no device arm
+([#1007](https://github.com/mudler/vllm.cpp/issues/1007)).
+
+It is no longer *single-threaded*, which is what this paragraph used to say. The
+decode's convolutions now dispatch across `VLLM_CPP_CPU_THREADS` workers
+(default `hardware_concurrency`), bit-identical at every worker count —
+[#1009](https://github.com/mudler/vllm.cpp/issues/1009), measured at **roughly
+9x on 16 to 20 workers** against one. Take the band rather than a decimal: the
+medians are 9.15x at 16 and 9.14x at 20, but those two counts spread 21-23% run
+to run on a box that was not idle, where every count at or below 8 spreads under
+7%. Read it as a decode figure and not a render one: the wall above was recorded
+on GB10 before the change and has not been re-measured, and the ~9x was taken on
+a synthetic decode shape on a contended 20-core x86 host. Set
+`VLLM_CPP_CPU_THREADS` lower if the render has to share the box.
 
 *The render behind those numbers was NOT prompted, and it renders a scene without
 rendering YOUR scene.* It was the EMBEDS path — `--prompt-embeds` with
@@ -2361,7 +2442,8 @@ or without the ComfyUI `model.diffusion_model.` prefix. Each family reads its ow
 knobs from `extras`. H3 takes `partition`. LTX-2.5 takes
 `audio_prompt_embeds_path` (the audio stream's conditioning, the twin of the
 seam's `prompt_embeds_path`, which carries the video stream), `pipeline_kind`
-(default `distilled_two_stage`), `model_version` (only for a checkpoint that
+(default `distilled_two_stage`; also `one_stage`, `dmd2`, `dfr`, `retake` and
+`t2a_one_stage`), `model_version` (only for a checkpoint that
 declares none), `dit_config_path`, `encoder_config_path`,
 `allow_unported_modules`, `max_phase`, `prompt_embeds_valid_rows`,
 `upsampler_path` and `duration_head_path`. An extra a family does not define is

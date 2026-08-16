@@ -557,6 +557,70 @@ oracle gateable: both sides are transcriptions of the same source, so a defect i
 the FORK would be reproduced identically by both. Only building and running the
 fork closes that, which is what #933 owes.
 
+### The decode is now sealed against the ORACLES, not against itself (#1023)
+
+An independent review of #946 found that this seal covered the CODEBOOKS and
+nothing else. `kIq1sGrid` and `kIq1xxxsGrid` each carry an FNV-1a digest and a
+lane census, and corrupting a grid entry does fail. Every other decode parameter
+was pinned only by self-consistency, because `ReferenceDotF64` and the G3
+`MatmulBTQuant` NMSE reference both decode the weight with
+`vt::cpu::BlockToFloat`, the function under test. They are independent in the
+SUMMATION and nowhere else. Three defects were injected, each applied and
+compiled, and the whole gate stayed green with an unchanged assertion count:
+
+| Mutation | Before #1023 | After |
+|---|---|---|
+| `kIq1sDelta` `0.125F` to `0.25F`, which hits BOTH encodings | UNCAUGHT | 3 cases, 2049 assertions fail |
+| IQ1_S delta sign inverted in dequant AND vec_dot | UNCAUGHT | 1 case, 1024 assertions fail |
+| IQ1_S scale from `qh` bits 13-15 instead of 12-14, both paths | UNCAUGHT | 1 case, 960 assertions fail |
+
+What closes it is a committed golden-vector fixture,
+`tests/vt/iq1_golden_vectors.h`, whose EXPECTED values are produced by the
+oracles themselves rather than by this tree:
+`ggml_get_type_traits(type)->to_float`, called in a build of
+`ggml-org/llama.cpp @ 237ad9b96` for IQ1_S and IQ3_XXS, and of
+`unslothai/llama.cpp @ 36fe8e1cc7f2b3b8c92fdda0ab07600141921786` for IQ1_XXXS.
+The IQ1 inputs are real `blk.0.ffn_gate_exps.weight` bytes, four 256-element
+blocks from shard 2 of each split, so this commits a reproducible slice of the
+1179648-weight run above. Agreement is BIT-EXACT on all 1024 values per
+encoding, and `kIq1sDelta` is additionally sealed by value against upstream
+`IQ1S_DELTA` (`ggml-common.h:1121`).
+
+This is stronger than the 15 August run, and it is worth saying how. That run
+compared our C++ against a hand transcription of the fork, so BOTH sides were
+transcriptions and a defect in the FORK would have been reproduced identically
+by each. These vectors are decoded by the fork's own compiled code. That still
+does not make the fork gateable in the sense #933 owes, which is running the
+MODEL, but the fork's decoder is no longer transcribed at all.
+
+The same review found the NMSE ceiling widened past the point where it
+discriminates. It was `2e-3`, described as about 4x the residual. Re-measured 16
+August 2026 over all 12 shapes per type, with the ceiling forced to `1e-12` so
+doctest prints every captured value:
+
+| Type | Unmutated max | With `kIq1sDelta = 0.25` |
+|---|---|---|
+| `iq1_s` | 5.240e-4 (m=4, n=1) | 6.967e-4 |
+| `iq1_xxxs` | 3.109e-4 (m=1, n=1) | 1.420e-4 |
+
+So `2e-3` passed that defect and `6e-4`, the value now set, fails it. The
+`iq1_xxxs` column is the more useful half: the defect moves that statistic the
+WRONG WAY, so NO ceiling catches it there. An NMSE against a dequant-f32
+reference cannot seal a decode parameter at all when both sides decode through
+the same function. The ceiling bounds quantization error, which is its own job;
+the goldens carry the decode.
+
+Two further findings, repaired in the same flow. `DequantGgufRowToF32` listed no
+`case 19` and no `case 66`, so the expansion path threw `unsupported ggml type`
+for the two encodings the target checkpoints are 96.92 % made of, and
+`RouteGgufTensor` routes a tensor there whenever `VT_CPU_REF` is set, keep-quant
+is off, K is ragged, or the role is not verbatim: a refusal to load on the
+reference lane. `case 18` (IQ3_XXS, the DeepSeek-V4 UD-IQ2_XXS `ffn_down`
+encoding) carried the same omission and is fixed with it, gated on its own
+oracle-produced golden. And both checkpoint-census cases claimed TOTAL coverage
+of 1702 tensor records while enumerating six of the seven encodings and summing
+to 864; they now carry F32's 838 tensors and assert that the buckets sum.
+
 Why this is in this spec rather than its own row: the encoding is the load
 path's half of the same capability. A streamer that can address an expert slice
 it cannot decode moves bytes for nothing, so the row's own gate cannot be met

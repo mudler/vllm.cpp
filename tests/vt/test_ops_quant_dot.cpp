@@ -42,6 +42,7 @@
 
 #include <iterator>
 
+#include "iq1_golden_vectors.h"  // oracle-produced IQ1_S / IQ1_XXXS goldens
 #include "vt/cpu/cpu_threadpool.h"  // Threadpool::SwapForTesting (via -I src)
 #include "vt/cpu/cpu_quant_iq_tables.h"  // kIq1sGrid provenance check
 #include "vt/device.h"
@@ -133,24 +134,39 @@ const WeightCase kWeightCases[] = {
     {vt::DType::kIQ3_XXS, 256, 98, 0, -1, -1, "iq3_xxs"},
     {vt::DType::kIQ2_S, 256, 82, 0, -1, -1, "iq2_s"},
     // IQ1_S (1.5625 bpw) is 96.92 % of the parameters of the
-    // Qwen3.8-2.4T-A95B UD-IQ1_S checkpoint ENG-EXPERT-STREAM targets.
-    // IQ1_S needs its own ceiling, measured not guessed. Its weights are
-    // ternary times a per-32 scale, so a super-block spans a wider dynamic
-    // range than a 4-6 bit codebook does, while Q8_K gives the activation ONE
-    // scale per 256 elements. The residual sits at ~5.2e-4 on the thinnest
-    // shape here (m=4, n=1 is FOUR dot products, so the statistic is noisy),
-    // against 5e-4. Set to 2e-3: ~4x the observed residual, and still an order
-    // of magnitude below the WEAKEST decode defect measured by mutation.
-    // Dropping the delta term reads 2.7e-2 (the smallest signal of the nine),
-    // the wrong delta sign bit 3.0e-1, ignoring the qh scale 9.4e-1, dropping
-    // the delta sign 5.7, and ignoring the 3 high grid-index bits 5.7e+1. So
-    // the ceiling sits in the empty band between noise and every defect.
-    {vt::DType::kIQ1_S, 256, 50, 0, -1, -1, "iq1_s", 2e-3},
-    // IQ1_XXXS (1.1875 bpw) is 96.92 % of the Qwen3.8-2.4T-A95B UD-Q1_0
-    // checkpoint. Type 66, from the pinned FORK oracle `llama-cpp-unsloth`.
-    // Same ceiling and the same reason as IQ1_S: ternary lanes times a per-32
-    // scale against a Q8_K activation that gets one scale per 256.
-    {vt::DType::kIQ1_XXXS, 256, 38, 0, -1, -1, "iq1_xxxs", 2e-3},
+    // Qwen3.8-2.4T-A95B UD-IQ1_S checkpoint ENG-EXPERT-STREAM targets, and
+    // IQ1_XXXS (1.1875 bpw) is 96.92 % of the UD-Q1_0 one. Both need a ceiling
+    // above upstream's 5e-4: their weights are ternary times a per-32 scale, so
+    // a super-block spans a wider dynamic range than a 4-6 bit codebook does,
+    // while Q8_K gives the activation ONE scale per 256 elements.
+    //
+    // 6e-4, set from the measurement rather than chosen for headroom. Every
+    // shape in this case, all 12 per type, re-measured 16 August 2026 with the
+    // ceiling forced to 1e-12 so doctest prints each captured value:
+    //
+    //   iq1_s     max 5.240e-4 at m=4  n=1, then 3.498e-4 at m=1 n=1
+    //   iq1_xxxs  max 3.109e-4 at m=1  n=1, then 2.637e-5 at m=1 n=7
+    //
+    // The n=1 column is where both the signal and the noise live: the NMSE
+    // denominator there is a single dot product, so it neither averages nor
+    // cancels. Every n=7 and n=16 shape sits below 3e-5.
+    //
+    // An earlier revision set this to 2e-3, described as ~4x the residual. That
+    // was a relaxation past the point where the statistic can discriminate.
+    // Doubling kIq1sDelta to 0.25 moves iq1_s to 6.967e-4, which 6e-4 fails and
+    // 2e-3 passes. Measure before widening a bound.
+    //
+    // Be precise about what this bound is worth, because the same mutation
+    // moves iq1_xxxs the WRONG WAY: 3.109e-4 unmutated against 1.420e-4 with the
+    // doubled delta, so NO ceiling catches that defect on this statistic. An
+    // NMSE against a dequant-f32 reference cannot seal a decode parameter at
+    // all, since both sides decode through the same `BlockToFloat`. What seals
+    // it is the pair of golden-vector cases below, which compare against the
+    // ORACLES bit for bit. This ceiling bounds quantization error, which is its
+    // own job, and is kept tight enough to stay a second signal where it can be
+    // one.
+    {vt::DType::kIQ1_S, 256, 50, 0, -1, -1, "iq1_s", 6e-4},
+    {vt::DType::kIQ1_XXXS, 256, 38, 0, -1, -1, "iq1_xxxs", 6e-4},
     {vt::DType::kMXFP4, 32, 17, -1, -1, 0, "mxfp4"},
 };
 
@@ -663,6 +679,79 @@ TEST_CASE("kIq1xxxsGrid is the PINNED FORK table, not a look-alike") {
   CHECK(lanes[0] == 408);   // -1
   CHECK(lanes[1] == 1243);  //  0
   CHECK(lanes[2] == 397);   // +1
+}
+
+TEST_CASE("kIq1sDelta is upstream IQ1S_DELTA, not a value this tree chose") {
+  // `ggml/src/ggml-common.h:1121` at the pinned 237ad9b96 is
+  // `#define IQ1S_DELTA 0.125f`. The FORK reuses that same macro for IQ1_XXXS
+  // (`dequantize_row_iq1_xxxs` and `ggml_vec_dot_iq1_xxxs_q8_K` both spell
+  // IQ1S_DELTA), so one constant serves BOTH encodings here and one wrong value
+  // corrupts both at once.
+  //
+  // Sealed by value for exactly the reason the two grids are sealed by digest:
+  // `DequantIQ1_S`, `DequantIQ1_XXXS`, `VecDotIQ1_SQ8_K` and
+  // `VecDotIQ1_XXXSQ8_K` all read THIS definition, so every one of them agrees
+  // with every other whatever it holds. Consistency is not correctness. The
+  // grid seal stopped one table short of this constant, and a doubled delta
+  // survived the whole suite until the golden vectors below were added.
+  CHECK(vt::cpu::kIq1sDelta == 0.125F);
+}
+
+// Compare a decode against the oracle-produced goldens, BIT for BIT. Both sides
+// evaluate the same f32 expression `dl * (grid[j] + delta)`, so equality is
+// exact and any difference means a decode PARAMETER diverged, not that rounding
+// moved. Asserting per element (rather than on a digest or a mismatch count)
+// makes the assertion total say how many values were actually examined.
+void CheckAgainstOracle(vt::DType dtype, const uint8_t* blocks,
+                        const uint32_t* golden_bits, size_t n) {
+  std::vector<float> got(n);
+  vt::cpu::BlockToFloat(dtype)(blocks, got.data(), static_cast<int64_t>(n));
+  for (size_t i = 0; i < n; ++i) {
+    CAPTURE(i);
+    uint32_t bits = 0;
+    std::memcpy(&bits, &got[i], sizeof(bits));
+    CHECK(bits == golden_bits[i]);
+  }
+}
+
+TEST_CASE("IQ1_S decodes REAL checkpoint bytes as the PINNED ORACLE does") {
+  // The first independent reference this encoding has. Everything else in this
+  // file decodes the weight with `vt::cpu::BlockToFloat`, the function under
+  // test, so it is independent only in the summation: a wrong scale field, a
+  // wrong delta magnitude or a flipped delta sign moves the reference and the
+  // kernel together and they still agree.
+  //
+  // Here the expected values come from ggml-org/llama.cpp @ 237ad9b96 running
+  // its OWN `ggml_get_type_traits(GGML_TYPE_IQ1_S)->to_float`, and the inputs
+  // are real `blk.0.ffn_gate_exps.weight` bytes from the UD-IQ1_S checkpoint.
+  // Provenance and the reproduction recipe are in iq1_golden_vectors.h.
+  //
+  // This seals the DEQUANT arm. The vec_dot arm is tied to it by the G3
+  // "vec_dot matches f64 dequantize-then-dot" case above, so a defect injected
+  // into either one alone now fails somewhere, and a defect injected into both
+  // fails here.
+  CHECK(std::size(vllm_test::kIq1sGoldenBlocks) == 4 * 50);  // 4 blocks
+  CHECK(std::size(vllm_test::kIq1sGoldenBits) == 4 * 256);
+  CheckAgainstOracle(vt::DType::kIQ1_S, vllm_test::kIq1sGoldenBlocks,
+                     vllm_test::kIq1sGoldenBits,
+                     std::size(vllm_test::kIq1sGoldenBits));
+}
+
+TEST_CASE("IQ1_XXXS decodes REAL checkpoint bytes as the PINNED FORK does") {
+  // Same argument as the IQ1_S case above. The oracle is the fork,
+  // unslothai/llama.cpp @ 36fe8e1cc, because no upstream llama.cpp defines ggml
+  // type 66 at all; the inputs are real UD-Q1_0 bytes.
+  //
+  // What this does and does not establish is the same as the spec's
+  // 1179648-weight run, of which these four blocks are the committed slice: it
+  // removes transcription error from OUR C++ and proves the block layout is
+  // read correctly. It does NOT make the fork gateable, because the fork's own
+  // decode is still unvalidated against anything but itself (#933).
+  CHECK(std::size(vllm_test::kIq1xxxsGoldenBlocks) == 4 * 38);  // 4 blocks
+  CHECK(std::size(vllm_test::kIq1xxxsGoldenBits) == 4 * 256);
+  CheckAgainstOracle(vt::DType::kIQ1_XXXS, vllm_test::kIq1xxxsGoldenBlocks,
+                     vllm_test::kIq1xxxsGoldenBits,
+                     std::size(vllm_test::kIq1xxxsGoldenBits));
 }
 
 TEST_CASE("G3 vec_dot is bit-exact run to run (fixed reduction order)") {

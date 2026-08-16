@@ -262,14 +262,14 @@ Qwen3-1.7B-NVFP4A16). That is a kernel-level result, not a token-exact
 model-level gate.
 
 Vulkan **runs a model end to end**: `opt-125m` greedy is STRICT token-exact,
-6/6 prompts vs the vLLM 0.25.0 oracle, every op of that model dispatched
-natively with **zero provider declines**. Qwen3.6-27B runs too, both GDN
-recurrences and the fused attention preamble native: **decode 4.36 tok/s vs
-llama.cpp's 4.35, parity met narrowly**, and **prefill 21.5x** (GB10). A load
-keeps **one** copy of the weights, not two, and is 1.54x faster warm: 27B peak
-RSS 100.8 GiB before, **53.4 GiB** now. Still partial at 25 natively registered
-ops of 112 (8 are GDN), the rest on the portable CPU tier; quant/MoE/MLA have
-none at all.
+6/6 prompts vs the vLLM 0.25.0 oracle, every op dispatched natively with **zero
+provider declines**. Qwen3.6-27B runs too, both GDN recurrences and the fused
+attention preamble native: **decode 4.36 tok/s vs llama.cpp's 4.35, parity met
+narrowly**, denominator SUPERSEDED (#1003), and prefill **21.5x**, a SELF-ratio
+(GB10). A load keeps **one** copy of the weights, not two, and is 1.54x faster
+warm: 27B peak RSS 100.8 -> **53.4 GiB**. Still partial at 25 natively
+registered ops of 112 (8 GDN), the rest on the portable CPU tier; quant/MoE/MLA
+have none.
 Build with `-DVLLM_CPP_VULKAN=ON`; off by default.
 
 ## Serving, API and operations

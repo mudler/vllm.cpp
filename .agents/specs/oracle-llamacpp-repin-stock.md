@@ -62,7 +62,10 @@ reuse, fused residual-add plus RMSNorm, chunked parallel-scan GDN prefill, a TTF
 prefill-first scheduler mode, and tracing.
 
 The scope of this oracle is CPU, so the CUDA work looks irrelevant. It is not.
-Six of the 65 touch `ggml/src/ggml-cpu/`, adding 320 net lines to `ops.cpp` in
+Six of the 65 touch `ggml/src/ggml-cpu/`.
+`git diff --numstat b9827 237ad9b96 -- ggml/src/ggml-cpu/` returns two files,
+`ops.cpp` at +318/-13 and `ggml-cpu.c` at +2/-1, so the insertions total 320 and
+the net is +306, of which `ops.cpp` carries +305. The changed bodies are
 `ggml_compute_forward_ssm_conv_f32`, `ggml_compute_forward_gated_delta_net_*`,
 `ggml_compute_forward_flash_attn_ext_f16*`, and `ggml_compute_forward_scale`.
 Commit `570aadd7a` states the consequence in its own body: the fused Gated Delta
@@ -86,8 +89,18 @@ upstream does not have.
    requirement.
 2. `docs/BENCHMARKS.md`, `docs/FEATURES.md`: the present-tense claims that name
    `237ad9b96` as the reference a reader can build.
-3. `.agents/issue-index.md`: append two rows, for #857 and #1003.
-4. This spec, which carries the enumeration of every contaminated measurement.
+3. `.agents/backend-matrix.md`, `.agents/feature-matrix.md`: the same
+   present-tense claims in the authoritative records that the public documents
+   project. `BACKEND-GATE-CUDA-LLAMACPP` states the pin and links to the very
+   oracle file this row repins, and `BACKEND-GATE-CPU-LLAMACPP` carries the live
+   "at OR ahead of llama.cpp on every axis" verdict against the fork, which
+   `.agents/quantization-matrix.md` names as "the one place this gate's live
+   position lives". Leaving them unmarked makes the public projection read
+   SUPERSEDED while the record it projects reads closed. Marking a denominator is
+   not a lifecycle change, so this is not the state move the deferral below
+   excludes.
+4. `.agents/issue-index.md`: append two rows, for #857 and #1003.
+5. This spec, which carries the enumeration of every contaminated measurement.
 
 **Out of scope, deliberately.**
 
@@ -95,10 +108,17 @@ upstream does not have.
   box. This row has none of them and holds no GPU-lock authority. #1003 owns it.
 - **Building or running stock `b10451`.** Same reason, and it is exactly why
   `gateable` becomes `no` rather than moving across unchanged.
-- **Re-anchoring the `file:line @ 237ad9b96` source citations.** There are
-  roughly 50 files carrying them. They are a real defect, because a reviewer
-  cannot fetch the object a citation names, but they are a mechanical sweep with
-  its own risk of silently re-pointing a line that moved. Listed under `## Owed`.
+- **Re-anchoring the `file:line @ 237ad9b96` source citations.** Measured at this
+  branch's head, not estimated. `git grep -l '237ad9b96'` returns **109 files**.
+  ``git grep -lE '@ *`?237ad9b96'`` returns **67**, which is the subset that
+  attributes a path or a source tree to the object rather than merely discussing
+  the SHA. **52** of the 109 carry a `path.ext:LINE` anchor within three lines of
+  the mention. The sweep is therefore 67 files, not the "roughly 50" an earlier
+  draft of this spec wrote, which counted only the narrowest reading and
+  undercounted the work by about a third. They are a real defect, because a
+  reviewer cannot fetch the object a citation names, but they are a mechanical
+  sweep with its own risk of silently re-pointing a line that moved. Listed under
+  `## Owed`.
 - **Touching the developer's llama.cpp checkouts.** `/home/mudler/_git/llama.cpp`
   and `/home/mudler/_git/llama.cpp-mtp-imatrix` are read-only to this row. No
   fetch, no commit, no build.
@@ -106,12 +126,25 @@ upstream does not have.
   `237ad9b96` and looks like a second transcription of the oracle pin. It is
   not. `scripts/upstream-inventory.py:206` emits it as
   `head_of(path)[:9]` over `$LLAMACPP_SOURCE`, which defaults to
-  `~/_git/llama.cpp`, so it is a derived snapshot of the developer's checkout
-  HEAD. The two values coincide today only because that checkout sits on branch
-  `localai-paged`. Editing it would assert something false and turn the
-  `upstream-inventory --check` gate red, because the checkout has not moved.
-  Recorded here because the coincidence is exactly the kind that gets
-  "reconciled" by a later reader into a defect.
+  `~/_git/llama.cpp` at `scripts/upstream-inventory.py:40`, so it is a derived
+  snapshot of the developer's checkout HEAD. The two values coincide today only
+  because that checkout sits on branch `localai-paged`. Editing it would assert
+  something false about a checkout that has not moved.
+
+  **No gate would catch that edit, and the truth is worse than a red gate.** An
+  earlier draft of this spec claimed the edit "would turn the
+  `upstream-inventory --check` gate red". It would not. `--check` compares
+  exactly four things against the stored snapshot: `registry.missing_count`,
+  `arch_floor.supported`, `arch_floor.supported_with_no_row`, and the two
+  `devices.*_uncovered` lists (`scripts/upstream-inventory.py:282-317`). It never
+  reads `pins`. Mutation-disproved rather than asserted: setting
+  `pins.llamacpp` to `10bf611e5` and running
+  `python3 scripts/upstream-inventory.py --check` printed
+  `OK: the agent record matches the upstream inventory snapshot` and returned
+  `rc=0`, with `git diff --stat` confirming the one-line edit had applied. Only
+  this paragraph protects the field, so a later reader who "reconciles" the two
+  values meets no resistance at all. That is exactly why the coincidence is
+  recorded here.
 
 - **Any lifecycle state change.** No matrix row moves state here, so this row
   owes no `docs/STATUS.md` edit and writes no `## Now` lifecycle transition into
@@ -164,7 +197,7 @@ the re-measurement safe, it makes it honest.
 **The fork is not needed to run the model.** Stock `origin/master` carries
 `src/models/qwen35.cpp` and `src/models/qwen35moe.cpp`, the `qwen35` and
 `qwen35moe` arch strings at `src/llama-arch.cpp:41-42`, the eight `NEXTN` tensor
-entries at `src/llama-arch.cpp:525-531`, and
+entries at `src/llama-arch.cpp:525-532`, and
 `common_speculative_impl_draft_mtp` at `common/speculative.cpp:1274`. Nothing in
 the model path forces the fork.
 
@@ -213,7 +246,7 @@ each comparison is untouched.
 | 4 | `.agents/specs/cpu-gdn-proj-orientation-2026-07-23.md` | its llama.cpp denominator, 5 reps under one `flock` | **yes** | highest risk of the set. The row is about the GDN projection path and the fork's CPU delta is precisely in `gated_delta_net` and `ssm_conv` |
 | 5 | `.agents/specs/cpu-elementwise-gemm.md` | its llama.cpp comparison legs at `237ad9b96` | **yes** for the comparison legs, **no** for the E1-E4 gate | the E1-E4 gate is bit-exactness plus our own GFLOP/s, which never touched llama.cpp |
 | 6 | `.agents/specs/gguf-cpu-threadpool.md` W4 | its llama.cpp context numbers | **yes** for the context, **no** for W4 itself | W4's acceptance is a same-binary A/B of our arm at 1 versus 20 threads. It is ours-only and unaffected |
-| 7 | `docs/BENCHMARKS.md` Vulkan `BENCH-VK-LLAMA`, with `.agents/environment.md:435` | 27B prefill `21.5x`, decode 4.36 versus 4.35 `MET`, 7 clean legs | **yes** | none of the 65 commits touch `ggml/src/ggml-vulkan/`, so the Vulkan sources match `b9827`. The build still came from the same dirty working tree, so the tree is unidentified and the number is unreproducible |
+| 7 | `docs/BENCHMARKS.md` Vulkan `BENCH-VK-LLAMA`, with `.agents/environment.md:435` | decode 4.36 versus 4.35 `MET`, 7 clean legs, spread 0.69% | **yes**, and it is the most fragile verdict in this table | none of the 65 commits touch `ggml/src/ggml-vulkan/`, so the Vulkan sources match `b9827`. The build still came from the same dirty working tree, so the tree is unidentified and the number is unreproducible. The `21.5x` prefill quoted in the same cell is **not** a llama.cpp number: the source JSON says "Prefill is 21.5x its pre-campaign value on the same model", a self-comparison, so it survives the repin untouched |
 | 8 | `docs/bench-evidence/cpu-x86-llamacpp-20260811.md` | peak RSS 2.8281 GiB, giving `1.0022x` open gap. Its three throughput axes are already `PENDING` | **yes** | its provenance line names "local fork `237ad9b96`, build number 9892, the recorded pin". RSS is the axis least likely to move, because the fork's deltas are compute, but the binary is still unidentified |
 | 9 | `docs/bench-evidence/rpi5-a76-llamacpp-20260806.md` | prefill 27.77, decode 3.91, E2E 3.77 tok/s, peak RSS 3.747 GiB, giving `0.461x`, `0.653x`, `0.758x` | **yes**, for a different reason | **not fork-contaminated.** This file measured stock tag `b9892` at `ee445f93d` and recorded the substitution. It is a stock number against a revision that is neither the old pin nor the new one, and its record wrongly presents that tag as the project pin |
 
@@ -224,9 +257,11 @@ pinned. The defect is the registry, not that file.
 
 ### Source anchors are a separate class
 
-Roughly 50 files carry `file:line @ 237ad9b96` citations, including the Vulkan
-port map in `.agents/specs/vulkan-full-support.md`, the Arm quant dot anchors in
-`.agents/kernel-matrix.md`, `repack.cpp:4683`, `sgemm.cpp`, and the
+**67 files** attribute a path or a source tree to `237ad9b96` in the `@ <sha>`
+form, out of **109** that mention the SHA at all, and **52** carry a
+`path.ext:LINE` anchor within three lines of the mention. The set includes the
+Vulkan port map in `.agents/specs/vulkan-full-support.md`, the Arm quant dot
+anchors in `.agents/kernel-matrix.md`, `repack.cpp:4683`, `sgemm.cpp`, and the
 `ggml-quants.c` IQ2_S and MXFP4 ports. These are not measurements and the ports
 they justify are not invalidated. They are still broken, because no reviewer can
 fetch the object a citation names, so no citation in that set is checkable. Owed,
@@ -248,16 +283,40 @@ Against `b10451` the direction is **not established**, and this row does not
 claim it. 122 stock commits landed after `b9827`, upstream now carries its own
 `fused_gdn`, and a re-measurement can move a ratio in either direction.
 
-**One recorded conclusion depends on the floor staying where it is.** The GB10
-prefill `1.18x PASS` in `docs/BENCHMARKS.md` is a pass by 0.18, and it is the
-only llama.cpp comparison in the tree recorded as a win. If upstream's own work
-in the 122-commit window exceeds our fork's on that path, the `PASS` becomes a
-tie or a gap. No other recorded verdict can flip from favourable to unfavourable,
-because every other one is already recorded as a gap or a tie.
+**Four recorded verdicts can flip against us, and the prefill `1.18x` is not the
+most exposed of them.** An earlier draft of this spec said the GB10 prefill was
+"the only llama.cpp comparison in the tree recorded as a win", and #1003 was
+scoped by that sentence, so an agent reading it would have re-taken prefill
+alone. The counterexamples sit on the same page. Ordered by fragility, which is
+the margin measured against its own noise floor and against how much of the
+denominator moves, not by the size of the margin:
+
+1. **Vulkan `BENCH-VK-LLAMA` decode, 4.36 versus 4.35 tok/s, `MET`** (row 7).
+   The margin is 0.23%. Its own source,
+   `benchmarks/demo/vulkan_27b_llamacpp.json`, puts the 7-leg spread at 0.69% and
+   states that "that spread IS the noise floor, so this is a narrow pass, not a
+   comfortable one". The verdict is already inside its own measurement
+   resolution, which makes it far more exposed than an 18% prefill margin. Any
+   denominator movement can flip it.
+2. **GB10 20-core peak memory `1.01x` PARITY and decode `0.97x` tie** (rows 1 and
+   2). Neither is a win, and both are load-bearing for
+   `BACKEND-GATE-CPU-LLAMACPP` reading closed. They are ties by declaration, so a
+   denominator that moves at all in llama.cpp's favour converts them into
+   recorded gaps.
+3. **GB10 20-core prefill `1.18x` PASS** (row 1). A pass by 0.18. Flipping it
+   needs upstream's own work in the 122-commit window to exceed our fork's on the
+   CPU Gated Delta Net and SSM_CONV path outright.
+4. **Pi 5 peak RSS 2.841 versus 3.747 GiB, 24.2% less, `0.758x`** (row 9). A
+   second favourable comparison, and the least fragile of the four: its
+   denominator was already stock `b9892`, so its only exposure is upstream drift
+   between `b9892` and `b10451` rather than the removal of 65 of our own commits.
+
+The x86 peak RSS `1.0022x` (row 8) is recorded as an open gap against us, so it
+cannot flip from favourable to unfavourable. It can only widen or close.
 
 ## Design
 
-Three record edits, no code.
+Four record edits, no code.
 
 1. **`.agents/oracles/llama-cpp.md`.** Rewrite the prose to state what the
    oracle is, drop the circular fork justification, add the clean-tree
@@ -281,14 +340,53 @@ Three record edits, no code.
 2. **`docs/FEATURES.md` and `docs/BENCHMARKS.md`.** Both carry present-tense
    claims naming `237ad9b96` as a reference a reader can build.
    `docs/FEATURES.md:14` states the reference version. `docs/BENCHMARKS.md:288`
-   states the denominator "built fresh on the same host", and `:479` and `:504`
-   state the Vulkan denominator. Each is corrected to name the fork it actually
+   states the denominator "built fresh on the same host", and the `BENCH-VK-LLAMA`
+   result row plus the `Reproduce` table state the Vulkan denominator. Both
+   Vulkan sites must be marked, not only the recipe one: the result row is the
+   one carrying the `MET` verdict. Each is corrected to name the fork it actually
    was, and to point at #1003 for the re-take. The historical numbers stay. This
    is the `bench-oracle-pin-reconcile.md` distinction applied again: a
    present-tense claim about which oracle is pinned is not narrative, and a past
    run keeps saying what it ran.
 
-3. **`.agents/issue-index.md`.** Append two rows at end of file, for #857 and
+   `docs/BENCHMARKS.md` also gains the four-row fragility ranking from
+   §"Direction of the error", so a reader of the page reaches the same scope
+   #1003 has. It goes in as a table rather than prose because
+   `scripts/check-public-doc-tables.py` holds that page at 35 of 35 prose
+   paragraphs, and a table row costs none. The `BENCH-VK-LLAMA` row pays for its
+   own new marker inside the 220-character cell cap by moving its `[source]` link
+   into the key cell, which is what the checker's `MAX_ROW_CHARS` comment asks
+   for: shorten your own row, never delete somebody else's.
+
+   `docs/FEATURES.md` carries the same two defects in its Vulkan paragraph, which
+   reads "decode 4.36 tok/s vs llama.cpp's 4.35, parity met narrowly" with an
+   unmarked denominator and quotes the `21.5x` as though it were a llama.cpp
+   ratio. Both are marked there too. That edit is also what
+   `scripts/check-doc-checkpoint.py` requires: editing `.agents/backend-matrix.md`
+   or `.agents/feature-matrix.md` classifies the change as `feature_surface`, and
+   a `feature_surface` change owes `docs/FEATURES.md`. The paragraph is trimmed
+   elsewhere to stay under the 700-character cap rather than the cap being
+   raised.
+
+3. **`.agents/backend-matrix.md` and `.agents/feature-matrix.md`.** The public
+   documents are projections of these records, so marking only the projection
+   leaves the two disagreeing while one links to the other.
+   `BACKEND-GATE-CUDA-LLAMACPP` states the pin as `237ad9b96` and links to
+   `oracles/llama-cpp.md`, so it is restated as `b10451` with the fork named as
+   what it was, and its source anchors are marked as superseded locations owed
+   re-anchoring rather than silently re-derived.
+   `BACKEND-GATE-CPU-LLAMACPP` carries the live "at OR ahead of llama.cpp on
+   every axis" verdict, so the denominator behind it is marked SUPERSEDED, the
+   RPi5 clause in the same cell is marked separately because it ran stock
+   `b9892`, and the verdicts are ordered by how easily the re-take flips them.
+   `QUANT-GGUF` in the feature matrix repeats the same "parity or better on
+   every axis" claim and gets the same marker. The lifecycle state of every row
+   is left where it is, because that judgement belongs to the re-measurement.
+   `.agents/quantization-matrix.md` needs no edit: its `QUANT-GGUF-COMPUTE` cell
+   already defers to the backend matrix as the one place the live position
+   lives, so marking the backend matrix is what marks it.
+
+4. **`.agents/issue-index.md`.** Append two rows at end of file, for #857 and
    #1003, both naming row `ORACLE-LLAMACPP-REPIN-STOCK`. Append only. Neither
    raises the unowned-row count that `scripts/check-agent-record.py` ratchets,
    because both name an owning row.
@@ -339,6 +437,15 @@ fork.
   the same two gates fail identically on a pristine `origin/main` tree with
   `git status --porcelain` empty. They are not this row's and are not repaired
   here.
+- A **third** gate is inherited red, and an earlier draft of this section named
+  only two while runs produced three. `test_cpu_x86_llamacpp_floor` is
+  load-dependent: at high loadavg its contended-leg case takes the
+  `NO_QUIET_WINDOW` (4) exit instead of the `GIVING_UP` (2) it asserts, so the
+  guarantee goes untested and the red presents as a defect in whatever diff is in
+  flight. Filed as [#618](https://github.com/mudler/vllm.cpp/issues/618) and
+  owned by `BACKEND-GATE-CPU-LLAMACPP`, which is the row this spec defers its
+  lifecycle judgement to. Naming it here matters for that reason: the same row
+  owns both the flake and the re-measurement this repin makes owed.
 - **No benchmark gate.** Recorded `PENDING` on #1003 and on host access, not
   waived.
 

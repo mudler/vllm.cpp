@@ -300,9 +300,16 @@ Decode lands inside llama.cpp's own run-to-run spread, and the memory difference
 is 30 MiB on a 2.8 GiB working set. Prefill is the only axis with a real gap and
 it goes our way. Output tokens are **byte-identical** to llama.cpp's greedy
 decode and to our own CPU reference path. Single-stream only: we have not
-measured concurrent serving against llama.cpp's server. The prefill `1.18x` is
-the only llama.cpp verdict on this page recorded as a win, so it is the only one
-the re-take can flip against us.
+measured concurrent serving against llama.cpp's server. Four favourable
+llama.cpp verdicts on this page can flip when the denominator is re-taken, and
+prefill is not the most exposed of them. #1003 owes all four.
+
+| Flips first | Verdict | Exposure |
+|---|---|---|
+| 1 | Vulkan `BENCH-VK-LLAMA` decode 4.36 vs 4.35, `MET` | 0.23% margin inside a 0.69% 7-leg spread. Its own source calls it "a narrow pass, not a comfortable one", so any denominator move can flip it |
+| 2 | This table's peak memory `1.01x` PARITY and decode `0.97x` tie | ties by declaration, not wins. A denominator that moves at all in llama.cpp's favour turns both into recorded gaps |
+| 3 | This table's prefill `1.18x` PASS | an 18% margin. Flipping it needs upstream's 122-commit window to beat our fork's CPU GDN and SSM_CONV work outright |
+| 4 | Pi 5 peak RSS 2.841 vs 3.747 GiB, `0.758x` | a 24.2% margin, and its denominator was already stock `b9892`, so only `b9892`-to-`b10451` drift applies |
 
 **x86_64 arm, first measured 2026-08-11 (#433).** Both arms above are AArch64 and their levers are Arm-only. Peak RSS **1.0022x, a hairline OPEN GAP**; prefill/decode/E2E **`PENDING` a quiet host**; CIQ `G5` open ([evidence](bench-evidence/cpu-x86-llamacpp-20260811.md)).
 
@@ -409,8 +416,9 @@ asserts that identity per leg. Speed figures labelled 0.25.0 ran the ROLLBACK th
 harness enforced until 2026-08-12 and are SUPERSEDED, never binding (#520).
 Correctness re-validated bit-identical across the advance, zero golden drift.
 The llama.cpp oracle is stock `b10451` since 2026-08-16, `gateable = no` until
-someone builds it (#857). Every llama.cpp figure here ran the former pin
-`237ad9b96`, our own fork, so all are SUPERSEDED and owed a re-take (#1003).
+someone builds it (#857). Every llama.cpp figure here is SUPERSEDED and owed a
+re-take (#1003): all but the Pi 5 arm ran the former pin `237ad9b96`, our own
+fork, and the Pi 5 arm ran stock `b9892`, which is neither pin.
 
 **Protocol.** Greedy, closed loop, three interleaved repetitions per point, one
 `flock` across the whole series, same-binary A/B for every lever, cold legs
@@ -484,7 +492,7 @@ built on it rather than keeping the flattering one.
 | Memory footprint vs declared workload (`ROAD-V1-MEM`, #83) | **Never measured, and not measurable today**: there is no auto-sizing to compare against, because the KV pool is a hand-typed `--num-blocks`, so "what the run actually needed" has no number | Once M1's `MemoryBudget` lands: predicted-vs-actual bytes per allocation class, then peak footprint ours-auto vs vLLM at its 0.9 default on the same model and config |
 | Startup latency (cold to first `/health`) | **36.51 s vs vLLM 0.25.0's 221.51 s = 6.07x** (medians of 3, 27B-NVFP4, GB10). PROVISIONAL: 3 of 6 legs contended, repeat killed by a host reboot. [Detail](../.agents/benchmark-record.md) | Uncontended 3-rep re-run on a quiet box |
 | Speculation depth (`ROAD-V1-D3-SPEC-K`, #81) | **Never measured, MTP is k=1** (our port covers vLLM's k=1 branch only), so no acceptance-vs-depth curve exists | k=2..4 three-way greedy gate, then the c1/c>1 A/B + the per-workload (prose vs code) acceptance-vs-depth curve any dynamic or adaptive depth policy needs |
-| Vulkan vs llama.cpp Vulkan (`BENCH-VK-LLAMA`) | 25 NATIVE (+8 GDN). **27B prefill 21.5x**; decode **4.36 vs 4.35, MET** (7 clean legs). Smart barriers skip 19.8%/tok, GPU -1.09 ms; e2e 8/12, unresolved. OFF. [source](../benchmarks/demo/vulkan_27b_llamacpp.json) | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not vs a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, same GGUF, three columns |
+| Vulkan vs llama.cpp Vulkan ([`BENCH-VK-LLAMA`](../benchmarks/demo/vulkan_27b_llamacpp.json)) | 25 NATIVE (+8 GDN). **27B prefill 21.5x, a SELF-ratio not a llama.cpp one**; decode **4.36 vs 4.35, MET**, denominator SUPERSEDED (7 clean legs). Smart barriers skip 19.8%/tok, GPU -1.09 ms; e2e 8/12, unresolved. OFF. | `VK-C` coopmat A/B on Thor (`VT_VULKAN_COOPMAT=0` A/Bs it): **11.1x-32.9x** vs our UNTILED scalar kernel, not a competent GEMM. `VK-E`: llama.cpp `-DGGML_VULKAN=ON` at `237ad9b96` on dgx, SUPERSEDED, same GGUF, 3 columns |
 | ROCm (`BACKEND-GATE-ROCM-VLLM` / `-SGLANG`) | **PENDING: no binding throughput number.** Runtime-green on 5 gfx archs. Gemma-3 is 48/48 exact vs two vLLM-ROCm oracles; Qwen3.5-0.8B correctness remains open | Same model, quantization, request shape and cache policy vs pinned vLLM-ROCm on one idle AMD host. Add equivalent SGLang; close correctness first ([#41](https://github.com/mudler/vllm.cpp/issues/41)) |
 | Tenstorrent Blackhole (`BACKEND-TENSTORRENT`) | **NOT APPLICABLE (speed).** Correctness: OPT-125m STRICT 6/6 e2e on real hardware. Qwen3-0.6B has a device-specific golden and short 4-token warm smoke (~0.28 tok/s), not a completed speed run | Full 16x16 Qwen3 gate, then device-resident tensors + `ttnn::sdpa_decode` before any performance comparison. [Spec](../.agents/specs/tenstorrent-backend.md) |
 | Mistral-7B-v0.3 on Tenstorrent (`BACKEND-TENSTORRENT-MISTRAL`) | **PENDING (speed).** First data point: 4.26 tok/s warm, batch 1, 32 tok, single run on a P150. Not a gate, not reproduced. No vLLM ratio exists or can (no TT backend). Correctness 16/16 | Reproduce idle with a same-binary A/B before quoting. [Record](../.agents/benchmark-record.md), [spec](../.agents/specs/tenstorrent-mistral.md) |

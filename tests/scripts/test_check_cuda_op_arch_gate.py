@@ -33,13 +33,16 @@ ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/check-cuda-op-arch-gate.py"
 SPEC = importlib.util.spec_from_file_location("check_cuda_op_arch_gate", CHECKER)
 assert SPEC is not None and SPEC.loader is not None
-mod = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = mod
-SPEC.loader.exec_module(mod)
+checker = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = checker
+SPEC.loader.exec_module(checker)
 
-unconditional_cuda_sources = mod.unconditional_cuda_sources
-cuda_registrations = mod.cuda_registrations
-check = mod.check
+# BOUND AS A MODULE, NOT AS THREE NAMES. `scripts/check-pr-size.py` proves a new
+# checker red-before by replacing it with a disabled stub and re-running THIS
+# module; pulling the functions out at import time would make that an ImportError
+# rather than a run of failing cases, and the evidence contract reads an
+# unimportable module as "executed no tests" instead of as a red. Every reference
+# below goes through `checker.` so the stub fails each case on its own.
 
 HOME = "src/vt/cuda/cuda_quant_fp8.cu"
 GATED = "src/vt/cuda/cuda_matmul_fp8_cutlass.cu"
@@ -118,12 +121,12 @@ Registrar g_registrar;
 
 def run(cmake: str = BASE_CMAKE, home: str = BASE_HOME, gated: str = BASE_GATED) -> list[str]:
     with FakeTree(cmake, home, gated) as root:
-        return check(root=root)
+        return checker.check(root=root)
 
 
 class TestCmakeParse(unittest.TestCase):
     def test_reads_the_unconditional_list_only(self) -> None:
-        srcs = unconditional_cuda_sources(BASE_CMAKE)
+        srcs = checker.unconditional_cuda_sources(BASE_CMAKE)
         self.assertIn("src/vt/cuda/cuda_quant_fp8.cu", srcs)
         # The cutlass TU is added under a NESTED if(), never at depth [VLLM_CPP_CUDA].
         self.assertNotIn("src/vt/cuda/cuda_matmul_fp8_cutlass.cu", srcs)
@@ -135,14 +138,14 @@ class TestCmakeParse(unittest.TestCase):
             "if(VLLM_CPP_CUDA)\n  target_sources",
             "if(VLLM_CPP_HIP)\nelse()\n  target_sources",
         )
-        self.assertNotIn("src/vt/cuda/cuda_quant_fp8.cu", unconditional_cuda_sources(cmake))
+        self.assertNotIn("src/vt/cuda/cuda_quant_fp8.cu", checker.unconditional_cuda_sources(cmake))
 
     def test_cmake_comment_is_not_a_source(self) -> None:
         cmake = BASE_CMAKE.replace(
             "    src/vt/cuda/cuda_quant_fp8.cu\n",
             "    # src/vt/cuda/cuda_quant_fp8.cu\n",
         )
-        self.assertNotIn("src/vt/cuda/cuda_quant_fp8.cu", unconditional_cuda_sources(cmake))
+        self.assertNotIn("src/vt/cuda/cuda_quant_fp8.cu", checker.unconditional_cuda_sources(cmake))
 
 
 class TestMutations(unittest.TestCase):
@@ -205,12 +208,12 @@ class TestMutations(unittest.TestCase):
 
 class TestLiveTree(unittest.TestCase):
     def test_live_tree_passes(self) -> None:
-        self.assertEqual(check(root=ROOT), [])
+        self.assertEqual(checker.check(root=ROOT), [])
 
     def test_live_registration_is_where_the_checker_says(self) -> None:
         # Pins the checker to the REAL file rather than only to miniatures: if the
         # kernel is renamed or the TU disappears, this fails rather than drifting.
-        regs = cuda_registrations("kQuantFp8Static", ROOT)
+        regs = checker.cuda_registrations("kQuantFp8Static", ROOT)
         self.assertEqual(list(regs), [HOME], regs)
         self.assertEqual([depth for _, depth in regs[HOME]], [0], regs)
         self.assertFalse((ROOT / GATED).read_text(encoding="utf-8").count("kQuantFp8Static,"))

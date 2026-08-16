@@ -506,7 +506,7 @@ this row's business, but every comparison below is about the **conv** arm and
 says so, because the two have different ops, different tiling defaults and
 different memory profiles.
 
-### 2.2 `diffusers` — implements LTX-2.5, and no LTX-2.5 record in this tree considers it
+### 2.2 `diffusers` — implements LTX-2.5, and no LTX-2.5 record in this tree treats it as the oracle
 
 This is the first of the two contradictions, and it is the one that changes the
 denominator answer.
@@ -515,7 +515,11 @@ denominator answer.
 this section is cited at `c6da9936e4bda83107943a16eb8682e9a37d8527`, the
 revision [`oracles/diffusers.md`](../oracles/diffusers.md) records. An earlier
 draft cited `3a2f35d4e`, which is the SHA the local checkout happens to sit on
-and is **17 commits behind the pin** — `3a2f35d4e` is an ancestor of the pin,
+and is **16 commits behind the pin** — `git rev-list --count
+3a2f35d4e..c6da9936e` is 16 with and without `--no-merges`. An earlier count of
+17 came from `git rev-list --count c6da9936e` in a **shallow** clone whose
+`.git/shallow` holds exactly `3a2f35d4e`, so the boundary commit was counted;
+the number was measured across a shallow boundary. `3a2f35d4e` is an ancestor of the pin,
 and the pin is on no branch in that checkout, so a `git pull` there would not
 reach it. Re-checked at the pin, every line below holds byte-identically, so
 nothing in the finding changes; the citation was simply off-pin, and AGENTS.md's
@@ -1129,8 +1133,10 @@ was recorded:
 * therefore **every sample after t = 251 s reads 0**, with `capp_mib` flat at
   36396 MiB throughout;
 * across that same stretch the process holds **exactly 1.00 core** of 20 in the
-  two consecutive `utime` windows that were sampled — `+116.7 s over 117 s` and
-  `+142.2 s over 142 s`, **259 s of measurement in total**;
+  two `utime` windows this figure covers — `+116.7 s over 117 s` and
+  `+142.2 s over 142 s`, **259 s of measurement in total**; §1.3's table records
+  a third window in the same regime (`+648.9 s over 649 s`), so 259 s is what
+  these two cover and not the sampler's total;
 * no frame had been written.
 
 **The two halves of that are not equally strong, and an earlier draft did not
@@ -1292,14 +1298,20 @@ row does not have the authority to make alone:
   carries 2.5" in those words, and this row does not claim one does. What the
   records say is narrower and adds up to the same working assumption:
   `roadmap_v1.md:92` at `332aed738` scopes its negative to one oracle —
-  *"vLLM-Omni does NOT yet carry 2.5 (recipes stop at 2.3 …)"* — and names
-  Lightricks `ltx-pipelines`, which is **not** admitted, as the cross-check;
+  *"vLLM-Omni does NOT yet carry 2.5 (recipes stop at 2.3 …), so the binding
+  oracle is vLLM-Omni's GENERIC diffusers adapter and the immediate cross-check
+  is Lightricks `ltx-pipelines`"* — so that line **does** name `diffusers`,
+  twice, but both times as vLLM-Omni's *adapter* rather than as a repo at its own
+  pin (the second: *"the diffusers adapter is a black box
+  (`supports_step_execution=False`)"*), and the cross-check it names, Lightricks
+  `ltx-pipelines`, is **not** admitted;
   `docs/BENCHMARKS.md:465` leaves the LTX-2.5 speed axis *and* the binding oracle
-  both `PENDING`. **Neither line names `diffusers` at all**, and the campaign has
+  both `PENDING`, and does not name `diffusers` at all. **No record treats the
+  `diffusers` repo at its own pin as the LTX-2.5 oracle**, and the campaign has
   been proceeding as though no admitted oracle covered 2.5. That is the record
   defect [#1012](https://github.com/mudler/vllm.cpp/issues/1012) files: not a
-  false sentence to strike, but an admitted oracle that no LTX-2.5 record
-  considers.
+  false sentence to strike, but an admitted oracle that no LTX-2.5 record has
+  ever reached for.
 
 **Does #655 block measurement here? Split the question, because the answer
 differs by axis.**

@@ -7823,6 +7823,45 @@ Qwen3_5MTPHiddenStates Qwen3_5MTPModel::ForwardPaged(
   return MtpFinalize(device, *weights_, *config_, hidden, residual, tokens);
 }
 
+// SPEC-MTP-K-GT-1 (#81): the device row gather the multi-step draft needs
+// between its prefill and its first decode step — the mirror of
+// `self.hidden_states[:num_reqs] = hidden_states[last_token_indices]`
+// (autoregressive/speculator.py:367-371). Row-by-row device-to-device copies,
+// the same idiom MtpHeadHidden uses for torch.cat, so the whole hidden carry
+// stays on the queue's device and never round-trips the host.
+Qwen3_5MTPHiddenStates Qwen3_5MTPModel::GatherHiddenRows(
+    const vt::Tensor& hidden_states, const std::vector<int64_t>& rows,
+    vt::Queue& queue) const {
+  const int64_t hidden_size = config_->hidden_size;
+  const int64_t num_rows = static_cast<int64_t>(rows.size());
+  VT_CHECK(num_rows > 0, "qwen3_5 MTP gather: empty row list");
+  VT_CHECK(hidden_states.rank == 2 && hidden_states.shape[1] == hidden_size &&
+               hidden_states.dtype == DType::kBF16 &&
+               hidden_states.IsContiguous() &&
+               hidden_states.device == queue.device,
+           "qwen3_5 MTP gather: hidden states must be contiguous bf16 [T,H] on "
+           "the queue device");
+  const int64_t tokens = hidden_states.shape[0];
+
+  Dev device{vt::GetBackend(queue.device.type), queue};
+  DBuf out(device, DType::kBF16, {num_rows, hidden_size});
+  const size_t row_bytes =
+      static_cast<size_t>(hidden_size) * vt::SizeOf(DType::kBF16);
+  auto* dst = static_cast<uint8_t*>(out.ptr());
+  const auto* src = static_cast<const uint8_t*>(hidden_states.data);
+  for (int64_t i = 0; i < num_rows; ++i) {
+    const int64_t row = rows[static_cast<size_t>(i)];
+    VT_CHECK(row >= 0 && row < tokens,
+             "qwen3_5 MTP gather: row index out of range");
+    device.b.Copy(device.q, dst + static_cast<size_t>(i) * row_bytes,
+                  src + static_cast<size_t>(row) * row_bytes, row_bytes);
+  }
+  Qwen3_5MTPHiddenStates gathered;
+  gathered.tensor = out.t();
+  gathered.storage = out.ReleaseShared();
+  return gathered;
+}
+
 ForwardLogits Qwen3_5MTPModel::ComputeLogits(
     const vt::Tensor& hidden_states, vt::Queue& queue) const {
   const int64_t hidden_size = config_->hidden_size;

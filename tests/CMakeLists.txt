@@ -1098,6 +1098,9 @@ vllm_cpp_add_test(test_mtp_speculator vllm/v1/spec_decode/test_mtp_speculator.cp
 vllm_cpp_add_test(test_mtp_depth vllm/v1/spec_decode/test_mtp_depth.cpp)
 vllm_cpp_add_test(test_rejection_sampler vllm/v1/spec_decode/test_rejection_sampler.cpp)
 vllm_cpp_add_test(test_prepare_prefill_inputs vllm/v1/spec_decode/test_prepare_prefill_inputs.cpp)
+# SPEC-MTP-K-GT-1 (#81): the draft-DECODE half of the autoregressive propose —
+# the step-1 entry state, the between-step advance, and both max_model_len clamps.
+vllm_cpp_add_test(test_prepare_decode_inputs vllm/v1/spec_decode/test_prepare_decode_inputs.cpp)
 vllm_cpp_add_test(test_dflash_kvprep vllm/v1/spec_decode/test_dflash_kvprep.cpp)
 target_include_directories(test_dflash_kvprep PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_dflash_propose vllm/v1/spec_decode/test_dflash_propose.cpp)

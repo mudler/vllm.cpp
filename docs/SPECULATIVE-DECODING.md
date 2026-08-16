@@ -30,9 +30,16 @@ detail below and in [BENCHMARKS.md](BENCHMARKS.md) says which is which.
   in their safetensors (Qwen3.6-27B and Qwen3.6-35B-A3B). Both are GDN hybrids,
   and the speculative path is wired through the linear-attention (GDN) recurrence
   and short causal convolution as well as the attention layers.
-- **k = 1 only.** `num_speculative_tokens` greater than 1 is not accepted for
-  this method. Depth (k>1, dynamic, adaptive) is unbuilt and tracked in
-  [#81](https://github.com/mudler/vllm.cpp/issues/81).
+- **Depth is configurable.** `num_speculative_tokens` sets how many tokens the
+  MTP head drafts per step, by looping the single head autoregressively. It
+  defaults to the checkpoint's `mtp_num_hidden_layers`, which is 1 on both gate
+  checkpoints, so the default is unchanged. A value above `n_predict` must be a
+  multiple of it, mirroring vLLM. Depth is a pure throughput lever: greedy
+  decoding plus accept-if-equal rejection makes the emitted tokens identical at
+  every k, which is proven on CPU for k=1..4 against speculative-off. The
+  cross-engine speed comparison at k>1 and the DGX three-way at k=2..4 are still
+  owed ([#81](https://github.com/mudler/vllm.cpp/issues/81) M1/M2), as are
+  batch-size-keyed dynamic depth and acceptance-driven adaptive depth.
 - **Correctness:** at concurrency 1 the speculative-on greedy output is
   token-for-token identical to both the speculative-off output and vLLM's own MTP
   speculative greedy output on the same prompt.
@@ -145,8 +152,8 @@ vllm_engine_load(&mp, &engine);   /* NULL/"" speculative_config => no speculatio
 
 The JSON is parsed into the same `vllm::SpeculativeConfig` the C++ API takes
 programmatically (`EngineParams::speculative_config`). The examples above use
-`mtp`, where `num_speculative_tokens` must be 1; see [Methods](#methods) for the
-other spellings and what each one requires. A malformed document, an unsupported
+`mtp`, where `num_speculative_tokens` defaults to the checkpoint's head depth.
+See [Methods](#methods) for the other spellings and what each one requires. A malformed document, an unsupported
 method, a missing `num_speculative_tokens` where the method needs one, or a
 checkpoint with no `mtp.*` head fails the load loudly at startup rather than
 running silently without speculation.
@@ -185,10 +192,15 @@ and 8 on the 27B (about 1.5x our own speculative-off throughput).
 
 Each of these names the method it applies to.
 
-- **MTP is k=1 only.** `num_speculative_tokens` greater than 1 is not accepted
-  for `mtp`. The block drafters take their k from the draft's block size
-  instead, and `ngram` requires one. Depth for MTP (k>1, dynamic, adaptive) is
-  unbuilt, [#81](https://github.com/mudler/vllm.cpp/issues/81).
+- **MTP depth above 1 has no speed number yet.** The multi-step propose is
+  built and token-exactness at k=1..4 is proven on CPU, but the DGX three-way at
+  k=2..4 on the 27B and 35B and the cross-engine throughput A/B at matched k are
+  both owed ([#81](https://github.com/mudler/vllm.cpp/issues/81) M1/M2), so no
+  speed claim is made for k>1. Batch-size-keyed dynamic depth and
+  acceptance-driven adaptive depth are unbuilt. A step whose actual draft count
+  differs from the configured k (the scheduler clamps drafts to the step's token
+  budget) falls out of the captured verify graph silently,
+  [#1020](https://github.com/mudler/vllm.cpp/issues/1020).
 - **EAGLE, EAGLE3, Medusa and the rest are not wired.** Of vLLM's thirteen
   `SpeculativeMethod` strings the engine accepts five, and `draft_model` among
   those is config-only. The remainder are inventoried, not implemented.

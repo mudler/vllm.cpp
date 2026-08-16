@@ -240,6 +240,21 @@ class GPUModelRunner final : public ModelRunnerBase {
   // SPEC-MTP I5d acceptance telemetry accessors (the gate reads these).
   int64_t spec_drafts_proposed() const { return spec_drafts_proposed_; }
   int64_t spec_drafts_accepted() const { return spec_drafts_accepted_; }
+  // SPEC-MTP-K-GT-1 (#81) PER-DEPTH acceptance. Index d counts the drafts
+  // verified and accepted at draft depth d+1, so `[0]` is each request's first
+  // drafted token and `[k-1]` its deepest. The aggregate counters above cannot
+  // answer "how deep did acceptance actually reach", which is what #81's M1 asks
+  // for and the only signal an acceptance-driven depth policy could use. The
+  // vectors grow to the deepest draft the engine has verified, so their SIZE is
+  // itself a positive witness that the configured depth reached the verify path
+  // — an identity gate cannot see depth, because greedy plus accept-iff-equal
+  // makes the emitted sequence independent of k.
+  const std::vector<int64_t>& spec_drafts_proposed_by_depth() const {
+    return spec_drafts_proposed_by_depth_;
+  }
+  const std::vector<int64_t>& spec_drafts_accepted_by_depth() const {
+    return spec_drafts_accepted_by_depth_;
+  }
   int full_attn_group_id() const { return full_attn_group_id_; }
   int gdn_group_id() const { return gdn_group_id_; }
   int64_t num_blocks() const { return num_blocks_; }
@@ -670,6 +685,11 @@ class GPUModelRunner final : public ModelRunnerBase {
   // rate; total generated / total verify steps is the effective speedup proxy.
   int64_t spec_drafts_proposed_ = 0;
   int64_t spec_drafts_accepted_ = 0;
+  // SPEC-MTP-K-GT-1 (#81): the same two counts, split by draft depth. Grown on
+  // demand to the deepest draft verified, so they stay EMPTY on the default
+  // no-speculation path.
+  std::vector<int64_t> spec_drafts_proposed_by_depth_;
+  std::vector<int64_t> spec_drafts_accepted_by_depth_;
   // ── SPEC-DFLASH D5 (DF-ENGINE-INTEGRATION) ──────────────────────────────────
   // The separately-loaded DFlash draft (borrows owned by LoadedEngine; null
   // unless method=="dflash"). use_dflash() gates the aux-tap capture + the DFlash

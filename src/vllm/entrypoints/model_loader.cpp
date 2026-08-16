@@ -828,40 +828,14 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
       mtp_layers = text->value("mtp_num_hidden_layers", int64_t{1});
     }
   }
-  vllm::SpeculativeConfig mtp = vllm::SpeculativeConfig::ResolveMtp(
-      static_cast<int>(mtp_layers), cli.num_speculative_tokens);
-  // SPEC-MTP-K-GT-1 (#81): the MTP PROPOSE is k=1 only. This tree ported
-  // upstream's k=1 early exit (autoregressive/speculator.py:236-238) and not the
-  // autoregressive multi-step loop behind it (prepare_decode_inputs :597-671 plus
-  // the k-1 draft decode steps :374-419), so GPUModelRunner::propose_drafts
-  // stashes exactly ONE draft per request (runner.cpp:2174). Everything around it
-  // already honours k: the scheduler reserves k lookahead slots, the KV spec
-  // widens by k (MakeKVCacheMaybeSpec below) and the verify graph captures 1 + k
-  // (cudagraph_dispatch.h:45-46). Accepting k>1 therefore buys the COST of depth
-  // k and delivers depth 1, with no error and no log.
-  //
-  // The refusal lives HERE, beside the per-method requirements above, and not in
-  // SpeculativeConfig::ResolveMtp. Two reasons. ResolveMtp is a faithful mirror
-  // of speculative.py's resolution and upstream does not refuse depth there, so a
-  // throw inside it would be a divergence in the mirrored type. And the thing
-  // that cannot serve depth is THIS ENGINE's propose path, not the config value,
-  // so the capability gate belongs on the engine's resolution seam. Every entry
-  // point reaches it: the LoadedEngine constructor runs ResolveSpecConfig as its
-  // FIRST member initialisation, before the KV pool is widened for a depth that
-  // would go unused, so the CLI, --speculative-config JSON, the C ABI and the
-  // in-memory constructors all fail at construction rather than at the first
-  // propose. The n-gram, DFlash and DSpark branches above return before reaching
-  // this line and genuinely serve k>1, so they are untouched.
-  if (mtp.ResolvedNumSpeculativeTokens() > 1) {
-    throw std::invalid_argument(
-        "speculative-config: method \"mtp\" does not implement "
-        "num_speculative_tokens > 1 (resolved " +
-        std::to_string(mtp.ResolvedNumSpeculativeTokens()) +
-        "). The autoregressive multi-step draft propose is not ported, so only "
-        "num_speculative_tokens=1 is served. Use 1, or use a method that drafts "
-        "deeper (\"ngram\", \"dflash\", \"dspark\"). Tracked by issue #81");
-  }
-  return mtp;
+  // SPEC-MTP-K-GT-1 (#81): the resolved k is SERVED, at any depth. Depth above 1
+  // was refused on this line between commits, because the propose path carried
+  // only upstream's k=1 early exit (autoregressive/speculator.py:236-238) and
+  // would have billed the user for a depth it drafted one token for. The
+  // multi-step propose (MtpProposeDrafts) landed the loop behind that early
+  // exit, so the refusal is GONE rather than widened.
+  return vllm::SpeculativeConfig::ResolveMtp(static_cast<int>(mtp_layers),
+                                             cli.num_speculative_tokens);
 }
 
 vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheMaybeSpec(
@@ -978,16 +952,33 @@ int LoadedEngine::ResolveMaxModelLen(const EngineParams& params,
   return static_cast<int>(fitted);
 }
 
+// SPEC-MTP-K-GT-1 (#81): the in-memory mirror of FromModelDir's
+// `maybe_attach_mtp`. A caller holding weights in memory had no way to supply
+// the `mtp.*` draft head, so an in-memory speculative engine could only run with
+// a NULL drafter -- which a depth gate must never mistake for working
+// speculation. Attaching before the LoadedEngine body runs is what matters: the
+// constructor asks `model_->supports_mtp_draft()` and calls BuildMtpDraft in its
+// member-initialiser list, so a later attach would be too late.
+std::unique_ptr<LoadedModel> AttachMtp(std::unique_ptr<LoadedModel> model,
+                                       std::optional<Qwen3_5MTPWeights> mtp) {
+  if (mtp.has_value()) model->AttachMtpDraftWeights(std::move(*mtp));
+  return model;
+}
+
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
-                           tok::Tokenizer tokenizer, const EngineParams& params)
+                           tok::Tokenizer tokenizer, const EngineParams& params,
+                           std::optional<Qwen3_5MTPWeights> mtp_weights)
     : LoadedEngine(std::move(config),
-                   MakeQwen3_5MoeLoadedModel(std::move(weights)),
+                   AttachMtp(MakeQwen3_5MoeLoadedModel(std::move(weights)),
+                             std::move(mtp_weights)),
                    std::move(tokenizer), params) {}
 
 LoadedEngine::LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
-                           tok::Tokenizer tokenizer, const EngineParams& params)
+                           tok::Tokenizer tokenizer, const EngineParams& params,
+                           std::optional<Qwen3_5MTPWeights> mtp_weights)
     : LoadedEngine(std::move(config),
-                   MakeQwen3_5DenseLoadedModel(std::move(weights)),
+                   AttachMtp(MakeQwen3_5DenseLoadedModel(std::move(weights)),
+                             std::move(mtp_weights)),
                    std::move(tokenizer), params) {}
 
 LoadedEngine::LoadedEngine(HfConfig config,

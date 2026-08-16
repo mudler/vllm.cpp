@@ -70,6 +70,46 @@ std::vector<int32_t> MtpProposePrefill(
     const std::vector<int32_t>& num_rejected, int max_num_reqs,
     vt::Queue& queue);
 
+// The FULL greedy MTP propose at any depth (SPEC-MTP-K-GT-1, issue #81) —
+// upstream `AutoRegressiveSpeculator.propose` (:129-274 @ 555967922) end to end:
+// the one paged draft prefill above, the `num_speculative_steps == 1` EARLY EXIT
+// (:236-238), and otherwise `prepare_decode_inputs` (:240-249) followed by
+// `_multi_step_decode` (:266-272), which runs k-1 single-token draft decode
+// steps over the draft's OWN paged KV layer.
+//
+// The extra arguments over MtpProposePrefill are exactly what the decode half
+// needs and the prefill half does not:
+//
+//   num_speculative_tokens  k (>= 1). k == 1 reproduces MtpProposePrefill
+//                           EXACTLY, and runs no further forward.
+//   max_model_len           the position / seq_len clamp bound
+//                           (speculator.py:638,644,733,737)
+//   block_size              the draft KV group's page size, for the per-step
+//                           slot mapping (see draft_decode_slot_mapping)
+//
+// `num_speculative_tokens` is a PARAMETER, not a value read from a config inside
+// the loop, so the depth a step drafts at is a decision the CALLER owns. That is
+// the seam a scheduler-supplied depth would use (upstream decides it in
+// `vllm/v1/core/sched/scheduler.py:1122-1126`). No depth policy is implemented
+// here.
+//
+// Returns [num_reqs * k] ROW-MAJOR: request r's drafts are
+// `draft_tokens[r * k .. r * k + k)` in draft order. This is the flattened form
+// of upstream's `self.draft_tokens[:num_reqs]` (:274).
+std::vector<int32_t> MtpProposeDrafts(
+    const vllm::Qwen3_5MTPModel& draft,
+    const CommonAttentionMetadata& target_attn_meta,
+    vllm::PagedKvCache& draft_kv, const vt::Tensor& target_hidden,
+    const std::vector<int32_t>& target_input_ids,
+    const std::vector<int64_t>& target_positions,
+    const std::vector<int32_t>& idx_mapping,
+    const std::vector<int32_t>& last_sampled,
+    const std::vector<int32_t>& next_prefill_tokens,
+    const std::vector<int32_t>& num_sampled,
+    const std::vector<int32_t>& num_rejected, int max_num_reqs,
+    int num_speculative_tokens, int max_model_len, int block_size,
+    vt::Queue& queue);
+
 }  // namespace vllm::v1
 
 #endif  // VLLM_V1_WORKER_GPU_SPEC_DECODE_MTP_SPECULATOR_H_

@@ -22,6 +22,7 @@
 #include "vllm/config/speculative.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 #include "vllm/model_executor/models/qwen3_dflash.h"
 #include "vllm/model_executor/models/qwen3_dspark.h"  // SPEC-DSPARK W5 draft bundle
@@ -214,13 +215,23 @@ class LoadedEngine {
   // tests construct it directly with synthetic in-memory weights (no disk). The
   // pieces are moved into members that outlive every collaborator that
   // references them.
+  // `mtp_weights` is the in-memory mirror of FromModelDir's `maybe_attach_mtp`
+  // (SPEC-MTP-K-GT-1, #81): with a speculative config of method "mtp", the
+  // checkpoint path reads the `mtp.*` tensors off the same shards and attaches
+  // them so the runner can build the draft. A caller holding weights in memory
+  // had no way to supply that head, so a synthetic spec engine could only ever
+  // run with a NULL drafter, which is exactly the state a depth gate must not
+  // mistake for working speculation. Defaulted to nullopt, so every existing
+  // construction is unchanged.
   LoadedEngine(HfConfig config, Qwen3_5MoeWeights weights,
-               tok::Tokenizer tokenizer, const EngineParams& params);
+               tok::Tokenizer tokenizer, const EngineParams& params,
+               std::optional<Qwen3_5MTPWeights> mtp_weights = std::nullopt);
 
   // DENSE-arch overload (27B). Identical stack; the runner runs the dense
   // Qwen3_5DenseModel::Forward over the dense weights instead of the MoE forward.
   LoadedEngine(HfConfig config, Qwen3_5DenseWeights weights,
-               tok::Tokenizer tokenizer, const EngineParams& params);
+               tok::Tokenizer tokenizer, const EngineParams& params,
+               std::optional<Qwen3_5MTPWeights> mtp_weights = std::nullopt);
 
   LoadedEngine(const LoadedEngine&) = delete;
   LoadedEngine& operator=(const LoadedEngine&) = delete;

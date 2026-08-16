@@ -335,7 +335,11 @@ typedef struct vllm_model_params {
   const char* reasoning_parser;
   /* ── Speculative-decoding config (ABI v6) ──────────────────────────────────
    * The JSON object vLLM's --speculative-config takes, e.g.
-   * '{"method":"mtp"}' or '{"method":"mtp","num_speculative_tokens":1}'.
+   * '{"method":"mtp"}' or '{"method":"mtp","num_speculative_tokens":3}'.
+   * For "mtp", num_speculative_tokens is the draft DEPTH. It defaults to the
+   * checkpoint's mtp_num_hidden_layers, which is 1 on both gate checkpoints, and
+   * a deeper value loops the single head autoregressively. Depth cannot change
+   * the emitted tokens under greedy sampling, so it is a throughput knob.
    * NULL or "" => speculation DISABLED, the byte-identical default engine.
    * A malformed document or unsupported method fails vllm_engine_load with
    * VLLM_ERR_INVALID_ARGUMENT. Only MTP is supported today, on the Qwen3.5/3.6

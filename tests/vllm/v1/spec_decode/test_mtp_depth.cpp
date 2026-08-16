@@ -3,27 +3,36 @@
 // This is the reachability gate for the row. It builds a real engine stack
 // (LoadedEngine -> EngineCore -> Scheduler -> GPUModelRunner) over a small
 // synthetic Qwen3.5 DENSE model on CPU, exactly as
-// tests/vllm/entrypoints/test_loaded_engine_dense.cpp does, and configures depth
-// the way a user does: through EngineParams::speculative_config. Nothing here
-// constructs a proposer by hand, because a test that does proves the class works
-// and never that the configured depth reaches it.
+// tests/vllm/entrypoints/test_loaded_engine_dense.cpp does, attaches a real
+// `mtp.*` draft head through the production head loader (LoadQwen3_5MTP), and
+// configures depth the way a user does: through EngineParams::speculative_config.
+// Nothing here constructs a proposer by hand, because a test that does proves the
+// class works and never that the configured depth reaches it.
 //
-// PHASE 1, the refusal. The MTP propose is k=1 only: this tree ported upstream's
-// k=1 early exit (autoregressive/speculator.py:236-238 @ 555967922) and not the
-// autoregressive multi-step loop behind it, so
-// GPUModelRunner::propose_drafts stashes exactly ONE draft per request
-// (runner.cpp:2174) while the KV pool and the verify graph are both sized for k.
-// The engine must therefore refuse depth by name instead of billing for it.
+// ─── WHY IDENTITY IS NOT ENOUGH, AND WHAT IS ────────────────────────────────
+// Greedy target plus accept-iff-equal rejection makes the emitted token sequence
+// INDEPENDENT of k. That is the property that lets depth be a pure throughput
+// lever, and it is also why a token-identity gate CANNOT see a silently clamped
+// depth: a drafter pinned to k=1 passes every identity check at k=3. That was the
+// exact defect this row closes.
 //
-// RED-first for this file: before the refusal, constructing the engine with
-// `{"method":"mtp","num_speculative_tokens":3}` SUCCEEDS and silently drafts one
-// token, so the CHECK_THROWS_AS below does not throw at all.
+// So every depth case pairs the identity with a POSITIVE WITNESS of depth taken
+// from the verify path itself: `spec_drafts_proposed_by_depth()`, whose SIZE is
+// the deepest draft the rejection sampler has ever verified. At k=3 it must reach
+// index 2; at k=1 it must stop at index 0. Together they say the emitted tokens
+// did not move AND the drafter really went three deep.
+//
+// RED-first for this file: before the multi-step propose, the k=3 case built an
+// engine that reserved KV for 3 and drafted ONE token, so the per-depth witness
+// had size 1 and the depth-3 proposal count was absent entirely.
 #include <doctest/doctest.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -34,6 +43,8 @@
 #include "vllm/config/speculative.h"
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
+#include "vllm/model_executor/models/qwen3_5_mtp.h"
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/sampling_params.h"
 #include "vllm/tokenizer/bpe.h"
 #include "vllm/tokenizer/tokenizer.h"
@@ -46,6 +57,10 @@ using vllm::HfConfig;
 using vllm::OwnedTensor;
 using vllm::Qwen3_5DenseLayerWeights;
 using vllm::Qwen3_5DenseWeights;
+using vllm::Qwen3_5MTPKind;
+using vllm::Qwen3_5MTPWeights;
+using vllm::StTensor;
+using vllm::TensorResolver;
 using vllm::RequestOutput;
 using vllm::RequestOutputKind;
 using vllm::SamplingParams;
@@ -177,6 +192,71 @@ Qwen3_5DenseWeights MakeDenseWeights(const HfConfig& c) {
   return w;
 }
 
+// ─── The synthetic `mtp.*` draft head ───────────────────────────────────────
+// Built through the PRODUCTION head loader (LoadQwen3_5MTP), not by filling
+// Qwen3_5MTPWeights by hand, so the tensor names, the BF16-only rule and the
+// dedicated-embedding refusal are all the ones a real checkpoint meets. The head
+// is one full_attention decoder layer, which is what qwen3_5_mtp.py:105-112
+// declares and what both gate checkpoints ship (mtp_num_hidden_layers == 1).
+class MtpTensorStore {
+ public:
+  void Add(const std::string& name, std::vector<int64_t> shape, uint64_t seed) {
+    int64_t n = 1;
+    for (int64_t d : shape) n *= d;
+    Stored& st = tensors_[name];
+    st.values.resize(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i)
+      st.values[static_cast<size_t>(i)] =
+          vt::F32ToBF16(RandV(seed * 977 + static_cast<uint64_t>(i)));
+    st.view.dtype = "BF16";
+    st.view.shape = std::move(shape);
+    st.view.data = reinterpret_cast<const uint8_t*>(st.values.data());
+    st.view.nbytes = st.values.size() * sizeof(uint16_t);
+  }
+  TensorResolver Resolver() const {
+    return [this](const std::string& name) -> const StTensor& {
+      return tensors_.at(name).view;
+    };
+  }
+
+ private:
+  struct Stored {
+    std::vector<uint16_t> values;
+    StTensor view;
+  };
+  std::map<std::string, Stored> tensors_;
+};
+
+Qwen3_5MTPWeights MakeMtpHead(const HfConfig& c) {
+  static MtpTensorStore store;
+  static bool filled = false;
+  if (!filled) {
+    const int64_t H = c.hidden_size;
+    const int64_t Dh = c.head_dim;
+    const int64_t q_out = 2 * c.num_attention_heads * Dh;  // gated Q projection
+    const int64_t kv_out = c.num_key_value_heads * Dh;
+    const int64_t I = c.intermediate_size;
+    store.Add("mtp.fc.weight", {H, 2 * H}, 1);
+    store.Add("mtp.pre_fc_norm_embedding.weight", {H}, 2);
+    store.Add("mtp.pre_fc_norm_hidden.weight", {H}, 3);
+    store.Add("mtp.layers.0.input_layernorm.weight", {H}, 4);
+    store.Add("mtp.layers.0.self_attn.q_proj.weight", {q_out, H}, 5);
+    store.Add("mtp.layers.0.self_attn.k_proj.weight", {kv_out, H}, 6);
+    store.Add("mtp.layers.0.self_attn.v_proj.weight", {kv_out, H}, 7);
+    store.Add("mtp.layers.0.self_attn.o_proj.weight",
+              {H, c.num_attention_heads * Dh}, 8);
+    store.Add("mtp.layers.0.self_attn.q_norm.weight", {Dh}, 9);
+    store.Add("mtp.layers.0.self_attn.k_norm.weight", {Dh}, 10);
+    store.Add("mtp.layers.0.post_attention_layernorm.weight", {H}, 11);
+    store.Add("mtp.norm.weight", {H}, 12);
+    store.Add("mtp.layers.0.mlp.gate_proj.weight", {I, H}, 13);
+    store.Add("mtp.layers.0.mlp.up_proj.weight", {I, H}, 14);
+    store.Add("mtp.layers.0.mlp.down_proj.weight", {H, I}, 15);
+    filled = true;
+  }
+  return vllm::LoadQwen3_5MTP(store.Resolver(), c, Qwen3_5MTPKind::kDense);
+}
+
 // The tiny oracle-verified BPE fixture (ids 0..23, no holes).
 Tokenizer BuildFixture() {
   static int counter = 0;
@@ -236,6 +316,23 @@ SamplingParams Greedy(int max_tokens) {
   return sp;
 }
 
+// The GDN state dtype the CPU tier can run a spec VERIFY in.
+//
+// The gate checkpoints are GDN hybrids and their state storage is bf16 (the
+// model dtype), but `vt::CausalConv1dSpecUpdate` requires an f32 conv state and
+// rejects bf16 off CUDA (src/vt/ops.cpp:1806). That is a property of the GDN
+// speculative ROLLBACK path, which this row does not touch: the MTP head is
+// itself declared layer_type="full_attention" (qwen3_5_mtp.py:105-112) and every
+// draft decode step reads and writes only the draft's own paged full-attention
+// KV layer. So the CPU depth gate runs the f32-state arm through the existing
+// same-binary escape MakeQwen3_5KVCacheSpec already reads
+// (qwen3_5_common.cpp:54-63), and the bf16 arm stays covered by the DGX gate
+// this row records as owed. Set once per process, before any engine is built.
+struct F32GdnState {
+  F32GdnState() { setenv("VT_GDN_STATE_BF16", "0", /*overwrite=*/1); }
+};
+const F32GdnState kF32GdnState;
+
 EngineParams SpecParams(int k) {
   EngineParams p;  // defaults: block_size 32 == max_model_len 32.
   p.speculative_config = vllm::ParseSpeculativeConfigJson(
@@ -243,62 +340,138 @@ EngineParams SpecParams(int k) {
   return p;
 }
 
-}  // namespace
-
-TEST_CASE("mtp depth: a configured depth above 1 is REFUSED by name") {
-  const HfConfig c = MakeDenseConfig();
-
-  // The whole defect in one construction: this used to build an engine that
-  // reserved KV for 3 and drafted 1, silently.
-  CHECK_THROWS_AS(
-      LoadedEngine(c, MakeDenseWeights(c), BuildFixture(), SpecParams(3)),
-      std::invalid_argument);
-
-  // The message must NAME the missing part, so a reader learns WHAT is absent
-  // rather than that "something is unsupported".
-  std::string what;
-  try {
-    LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(2));
-  } catch (const std::invalid_argument& e) {
-    what = e.what();
-  }
-  CHECK(what.find("num_speculative_tokens") != std::string::npos);
-  CHECK(what.find("multi-step") != std::string::npos);
-  CHECK(what.find("#81") != std::string::npos);
+// The deepest draft the rejection sampler has ever verified on this engine. It
+// is the SIZE of the per-depth counter, which the verify path grows on demand,
+// so it reports what the drafter actually produced rather than what was asked
+// for. 0 means nothing ever speculated.
+int VerifiedDepth(const LoadedEngine& eng) {
+  return static_cast<int>(eng.runner().spec_drafts_proposed_by_depth().size());
 }
 
-TEST_CASE("mtp depth: k=1 still builds and generates, and spec-OFF is unmoved") {
-  // The refusal must be a depth gate and nothing wider: the served depth and the
-  // no-speculation default both keep working, and greedy MTP is exactness
-  // preserving, so the two agree token for token.
+}  // namespace
+
+TEST_CASE("mtp depth: a configured depth of 3 actually drafts 3") {
   const HfConfig c = MakeDenseConfig();
   const std::string prompt = "hello";
-  const int kN = 6;
+  const int kN = 8;
 
-  RequestOutput off;
-  RequestOutput k1;
+  LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(3),
+                   MakeMtpHead(c));
+  const RequestOutput out = eng.engine().generate(prompt, Greedy(kN), "req");
+
+  REQUIRE(out.finished);
+  REQUIRE(out.outputs.size() == 1);
+  CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == kN);
+
+  // THE WITNESS. The drafter proposed at depths 1, 2 and 3, so the configured
+  // depth reached the verify path. This is the assertion that failed before the
+  // multi-step propose: the drafter stopped at depth 1 and the emitted tokens
+  // were identical either way, so nothing else could have told the difference.
+  const std::vector<int64_t>& by_depth =
+      eng.runner().spec_drafts_proposed_by_depth();
+  REQUIRE(VerifiedDepth(eng) == 3);
+  CHECK(by_depth[0] > 0);
+  CHECK(by_depth[1] > 0);
+  CHECK(by_depth[2] > 0);
+  // Every request drafts the full depth every step, so the three depths are
+  // proposed EQUALLY often. A drafter that ran out of steps early would show a
+  // decreasing profile here even with a non-zero deepest count.
+  CHECK(by_depth[0] == by_depth[1]);
+  CHECK(by_depth[1] == by_depth[2]);
+
+  // The aggregate must agree with the split, or one of the two is lying.
+  int64_t summed = 0;
+  for (int64_t n : by_depth) summed += n;
+  CHECK(summed == eng.runner().spec_drafts_proposed());
+  int64_t summed_accepted = 0;
+  for (int64_t n : eng.runner().spec_drafts_accepted_by_depth())
+    summed_accepted += n;
+  CHECK(summed_accepted == eng.runner().spec_drafts_accepted());
+  // Acceptance is a prefix, so it can never grow with depth.
+  const std::vector<int64_t>& acc =
+      eng.runner().spec_drafts_accepted_by_depth();
+  REQUIRE(acc.size() == 3);
+  CHECK(acc[0] >= acc[1]);
+  CHECK(acc[1] >= acc[2]);
+}
+
+TEST_CASE("mtp depth: k=1, k=3 and spec-OFF emit the SAME greedy tokens") {
+  // Greedy target plus accept-iff-equal rejection makes the emitted sequence
+  // independent of k, so depth is a pure throughput lever that cannot move a
+  // token gate. The equality is exact, not a tolerance.
+  //
+  // On its own this passes on a drafter clamped to k=1, which is why each arm
+  // also asserts the depth it actually reached. Identity plus witness is the
+  // pair; either alone proves the wrong thing.
+  const HfConfig c = MakeDenseConfig();
+  const std::string prompt = "hello world";
+  const int kN = 10;
+
+  std::vector<int32_t> off_ids;
+  std::vector<int32_t> k1_ids;
+  std::vector<int32_t> k3_ids;
   {
     EngineParams p;  // no speculative_config: the production default.
     LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), p);
-    off = eng.engine().generate(prompt, Greedy(kN), "req");
+    off_ids = eng.engine().generate(prompt, Greedy(kN), "req")
+                  .outputs[0].token_ids;
+    // Nothing speculated, so the per-depth counters were never grown.
+    CHECK(VerifiedDepth(eng) == 0);
   }
   {
-    LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(1));
-    k1 = eng.engine().generate(prompt, Greedy(kN), "req");
+    LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(1),
+                     MakeMtpHead(c));
+    k1_ids = eng.engine().generate(prompt, Greedy(kN), "req")
+                 .outputs[0].token_ids;
+    CHECK(VerifiedDepth(eng) == 1);
+  }
+  {
+    LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(3),
+                     MakeMtpHead(c));
+    k3_ids = eng.engine().generate(prompt, Greedy(kN), "req")
+                 .outputs[0].token_ids;
+    CHECK(VerifiedDepth(eng) == 3);
   }
 
-  REQUIRE(off.finished);
-  REQUIRE(off.outputs.size() == 1);
-  CHECK(static_cast<int>(off.outputs[0].token_ids.size()) == kN);
-  REQUIRE(k1.finished);
-  REQUIRE(k1.outputs.size() == 1);
-  CHECK(k1.outputs[0].token_ids == off.outputs[0].token_ids);
+  REQUIRE(static_cast<int>(off_ids.size()) == kN);
+  CHECK(k1_ids == off_ids);
+  CHECK(k3_ids == off_ids);
 }
 
-TEST_CASE("mtp depth: the refusal is MTP-only and does not catch ngram") {
-  // The n-gram proposer genuinely returns 0..k drafts per request per step
-  // (runner.cpp:2273-2282 moves the whole per-request vector), so a depth gate
-  // that caught it would be a regression rather than a safety net.
+TEST_CASE("mtp depth: k=2 and k=4 both reach their configured depth") {
+  // Two more depths, because a loop that runs "more than once" and a loop that
+  // runs exactly k times are different implementations and only the second is
+  // configurable depth. #81's M1 asks for k=2..4.
+  const HfConfig c = MakeDenseConfig();
+  const std::string prompt = "hello";
+
+  for (const int k : {2, 4}) {
+    CAPTURE(k);
+    LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(k),
+                     MakeMtpHead(c));
+    const RequestOutput out = eng.engine().generate("hello", Greedy(8), "req");
+    REQUIRE(out.finished);
+    CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == 8);
+    CHECK(VerifiedDepth(eng) == k);
+  }
+}
+
+TEST_CASE("mtp depth: a depth engine still refuses nothing it can serve") {
+  // The Phase 1 refusal existed only between commits. A configured depth above 1
+  // now CONSTRUCTS, which is the observable difference between "removed" and
+  // "widened": a widened bound would still throw somewhere above it.
+  const HfConfig c = MakeDenseConfig();
+  for (const int k : {1, 2, 3, 4, 8}) {
+    CAPTURE(k);
+    CHECK_NOTHROW(LoadedEngine(c, MakeDenseWeights(c), BuildFixture(),
+                               SpecParams(k), MakeMtpHead(c)));
+  }
+}
+
+TEST_CASE("mtp depth: the ngram proposer is unaffected by the MTP depth work") {
+  // The n-gram proposer returns 0..k drafts per request per step through the SAME
+  // DraftTokenIds seam the MTP propose now fills with k tokens
+  // (runner.cpp:2273-2282). Its depth must keep working across that change.
   const HfConfig c = MakeDenseConfig();
   EngineParams p;
   p.speculative_config = vllm::ParseSpeculativeConfigJson(

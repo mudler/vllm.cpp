@@ -122,6 +122,10 @@ TEST_CASE("gate backends self-register per DeviceType") {
   CHECK(HasAttentionBackend(DeviceType::kCPU, "FLASH_ATTN"));
   CHECK(HasAttentionBackend(DeviceType::kCUDA, "GDN_ATTN"));
   CHECK(HasAttentionBackend(DeviceType::kCPU, "GDN_ATTN"));
+  // M3 (issue #41): ROCM_ATTN registers for kROCM on the same name-only footing
+  // as the Metal/Vulkan/Tenstorrent rows — the host metadata is device-agnostic
+  // and the ROCm paged-attn kernel reads the shared NHD layout.
+  CHECK(HasAttentionBackend(DeviceType::kROCM, "ROCM_ATTN"));
 
   // Backends we name in the priority lists but do not implement are NOT
   // registered — the selection walk must skip them.

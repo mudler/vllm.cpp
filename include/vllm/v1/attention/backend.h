@@ -255,6 +255,41 @@ class FlashAttentionBackend final : public AttentionBackend {
       const std::string& cache_dtype_str = "auto") const override;
 };
 
+// The dense ROCm paged-attention backend (issue #41 M3). Upstream ROCM_ATTN
+// (vllm/v1/attention/backends/rocm_attn.py) is the FlashAttention-family
+// backend the ROCm platform prefers on non-AITER boards, and its NAME is what
+// rocm.py:424-434 puts first in _get_backend_priorities. The concrete kernel is
+// selected at the vt:: op-table level (vt::PagedAttention -> GetOp(kPagedAttention,
+// kROCM), registered in src/vt/rocm/rocm_ops.hip) — exactly the FlashAttention
+// division of labour on CUDA. The host metadata here is device-agnostic, so the
+// class lives alongside FLASH_ATTN and self-registers for kROCM in backend.cpp
+// (same footing as the kMETAL / kVULKAN / kTENSTORRENT rows).
+//
+// --- KV-LAYOUT DEVIATION (deliberate, recorded): ---
+// Upstream rocm_attn.py:188-194 returns (2, num_blocks, block_size,
+// num_kv_heads, head_size) — K/V split OUTERMOST. Our ROCm paged-attn kernel
+// (src/vt/rocm/rocm_paged_attn.hip) is a port of the CPU/CUDA pair and reads
+// the SAME NHD layout FlashAttentionBackend::get_kv_cache_shape allocates
+// (num_blocks, 2, block_size, num_kv_heads, head_size), indexed by TENSOR
+// strides (kc_blk/kc_pg/kc_hd) — the identical precondition the Metal and
+// Vulkan legs document at their registration lines. So the honest shape here
+// is the NHD one: claiming upstream's (2, num_blocks, ...) would describe a
+// cache the local engine does not allocate and the local kernel does not read.
+// The NAME matches upstream; the SHAPE matches the shared runtime layout. When
+// (if) a real upstream-layout ROCm attention kernel lands, this shape flips
+// with it.
+class RocmAttentionBackend final : public AttentionBackend {
+ public:
+  static constexpr const char* kName = "ROCM_ATTN";
+
+  std::string get_name() const override { return kName; }
+
+  std::vector<int64_t> get_kv_cache_shape(
+      int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
+      int64_t head_size,
+      const std::string& cache_dtype_str = "auto") const override;
+};
+
 // The dense-MLA backend, and the ONLY one reachable on GB10 — read from
 // vllm/platforms/cuda.py:129-133 (sm_12x → [TRITON_MLA,
 // FLASHINFER_MLA_SPARSE_SM120]) and OBSERVED at W0 from the vLLM 0.25.0 oracle

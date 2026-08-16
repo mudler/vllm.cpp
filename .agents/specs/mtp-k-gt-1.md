@@ -1072,3 +1072,41 @@ least 45 GiB is available, samples the device before and after every leg so a
 leg that raced a foreign allocation can be voided by name, and releases the lock
 rather than holding one it cannot use. This box REBOOTS rather than OOM-killing,
 so that check protects both sessions' work and not just this measurement.
+
+### Gate for the DGX half, on `b4e9acd65` against `origin/main` `a332fb98d`
+
+`scripts/agent-preflight.sh`, exit 1. Counted rather than read: 79 result lines,
+76 `ok`, 3 `FAIL`, 0 `SKIP`.
+
+| Block | ok | FAIL | SKIP |
+|---|---:|---:|---:|
+| Session role | 1 | 0 | 0 |
+| Record gates | 26 | 1 | 0 |
+| Mutation suites | 44 | 2 | 0 |
+| Committed range vs `origin/main` `a332fb98d` | 3 | 0 | 0 |
+| Commit trailers vs `origin/main` `a332fb98d` | 2 | 0 | 0 |
+
+Both range blocks EXECUTED rather than skipping, and the branch was merged with
+`origin/main` first for exactly that reason: they are guarded on
+`git merge-base --is-ancestor origin/main HEAD`, this branch was cut at
+`b493f4981` while main advanced to `a332fb98d`, and a block that skips while the
+run prints green is the shape this row already paid for once. The predicate is
+asserted, not inferred from the block being present.
+
+**All three reds are INHERITED, and that is measured rather than argued.** Each
+was reproduced on a pristine `origin/main` worktree on the SAME host, before
+attributing anything to this diff, which touches two markdown files and no code:
+
+| Red | On pristine `origin/main`, same host | Cause |
+|---|---|---|
+| `check-test-registration` | exit 1, `FileNotFoundError: 'cmake'` | the checker CONFIGURES cmake, and `dgx.casa` carries no cmake on the host: it lives in the build container |
+| `test_check_test_registration` | exit 1, 52 tests, 20 errors | same absent `cmake`, reached through `registration_errors` |
+| `test_release_metadata` | exit 1, 1 of 4 failed | `ELF host architecture does not match manifest`, aarch64 host against an x86_64 manifest |
+
+An earlier run of this same gate also reported `role-undeclared`. That one was
+this session's own and was repaired by claiming the role rather than waived.
+
+Disk and load were checked before attributing anything to code, because ENOSPC
+on this project presents as a policy refusal rather than as a full disk: 2.66 TB
+free on `$HOME`, loadavg 1.59 at launch. The GPU lock was NOT held during the
+gate, and no GPU work ran inside it.

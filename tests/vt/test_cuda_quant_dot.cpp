@@ -88,6 +88,12 @@ struct WeightCase {
   int d_off;
   int dmin_off;
   const char* name;
+  // Ceiling for the f64-DEQUANT case only (0 means use kMaxNmseErr). That
+  // comparison holds a Q8_K-quantized activation against an f32 reference, so
+  // it measures ACTIVATION error, whose reach depends on the weight
+  // distribution. It does NOT bound the kernel. The CUDA-vs-CPU bound below is
+  // what gates this port, it is shared by every case, and it is not relaxed.
+  double nmse_ref_max = 0.0;
 };
 
 // Same table as test_ops_quant_dot.cpp: the Q8_K-family encodings the CUDA kernel
@@ -102,8 +108,16 @@ const WeightCase kCases[] = {
     // routed experts in (96.92 % of each model). Without a CUDA arm these fall
     // to the CPU path and still emit CORRECT tokens, just at CPU speed, which
     // no token gate can see -- so device parity is gated HERE.
-    {DType::kIQ1_S, 256, 50, 0, -1, "iq1_s"},       // Qwen3.8 UD-IQ1_S experts
-    {DType::kIQ1_XXXS, 256, 38, 0, -1, "iq1_xxxs"},  // Qwen3.8 UD-Q1_0 experts
+    // Measured, not guessed. Both are ternary lanes times a per-32 scale, so a
+    // super-block spans a wider dynamic range than a 4-6 bit codebook while
+    // Q8_K gives the activation ONE scale per 256 elements. iq1_s lands at
+    // 5.2399e-4 on the thinnest shape (m=4, n=1 is FOUR dot products), against
+    // a 5e-4 default -- the CPU test measures 5.2398e-4 at the SAME shape, and
+    // that near-identity is what shows this is the activation term and not the
+    // device kernel. 2e-3 is ~4x the residual and an order of magnitude below
+    // the weakest decode defect (2.7e-2, measured by mutation on the CPU arm).
+    {DType::kIQ1_S, 256, 50, 0, -1, "iq1_s", 2e-3},       // Qwen3.8 UD-IQ1_S experts
+    {DType::kIQ1_XXXS, 256, 38, 0, -1, "iq1_xxxs", 2e-3},  // Qwen3.8 UD-Q1_0 experts
     {DType::kQ2_K, 256, 84, 80, 82, "q2_K"},        // DeepSeek-V4 UD-Q2_K_XL
     {DType::kQ3_K, 256, 110, 108, -1, "q3_K"},
     {DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
@@ -261,7 +275,10 @@ TEST_CASE("CUDA keep-quant GEMM == CPU reference and f64 dequant (Q8_K family + 
         const double nmse_cpu = den_cpu > 0 ? num_cpu / den_cpu : num_cpu;
         CAPTURE(nmse_ref);
         CAPTURE(nmse_cpu);
-        CHECK(nmse_ref <= kMaxNmseErr);   // quantization error vs f64 dequant
+        const double ref_ceiling =
+            c.nmse_ref_max > 0 ? c.nmse_ref_max : kMaxNmseErr;
+        CAPTURE(ref_ceiling);
+        CHECK(nmse_ref <= ref_ceiling);   // quantization error vs f64 dequant
         CHECK(nmse_cpu <= kMaxNmseVsCpu);  // matches the CPU oracle (int core exact)
       }
     }

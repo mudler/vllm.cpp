@@ -247,3 +247,147 @@ TEST_CASE("a realistic top-k step: repeated experts cost one slot, not k") {
   // The same step again is now free.
   for (int32_t e : selected) CHECK(c.Acquire(K(5, e)).hit);
 }
+
+TEST_CASE("IsResident is a PURE probe: it must not change what gets evicted") {
+  // The prefetch caller asks "will this be a fill?" before every slice. If the
+  // asking scored the entry, the probe would decide the eviction order it was
+  // only meant to observe, and the hotness policy would be measuring itself.
+  vllm::ExpertSlotCache c(2);
+  REQUIRE(c.Acquire(K(0, 1)).slot >= 0);  // A
+  REQUIRE(c.Acquire(K(0, 2)).slot >= 0);  // B
+  c.EndStep();
+
+  const int64_t hits_before = c.hits();
+  for (int i = 0; i < 50; ++i) CHECK(c.IsResident(K(0, 2)));
+  CHECK_FALSE(c.IsResident(K(0, 99)));
+  // A probe is not a hit: the counters a benchmark reads must not move.
+  CHECK(c.hits() == hits_before);
+
+  // Make A genuinely hotter by ACQUIRING it, then admit C. The victim must be
+  // B, which only the probe ever touched. If IsResident had scored, those 50
+  // probes would have made B the survivor and A the victim instead.
+  REQUIRE(c.Acquire(K(0, 1)).hit);
+  c.EndStep();
+  const vllm::ExpertAcquisition ev = c.Acquire(K(0, 3));
+  REQUIRE(ev.slot >= 0);
+  REQUIRE(ev.evicted.has_value());
+  CHECK(ev.evicted->expert == 2);
+  CHECK(c.IsResident(K(0, 1)));
+  CHECK_FALSE(c.IsResident(K(0, 2)));
+}
+
+TEST_CASE("N steps of K distinct slices never exhaust a K-slot cache") {
+  // THE PROPERTY THE STEP CLOCK EXISTS FOR, and the one whose absence made this
+  // row's decode measurement void.
+  //
+  // Acquire marks every entry it serves `protected_this_step`, and only EndStep
+  // clears that mark. A caller that never ends a step therefore accumulates
+  // protection forever: once the cache is full, ColdestEvictable finds nothing
+  // evictable, Acquire returns slot -1, and every later slice is refused. The
+  // cache stops serving and says so only through `capacity_exhausted()`, which
+  // the production caller was not reading either.
+  //
+  // Stated as a property so it holds for any budget: a step whose working set
+  // FITS the budget must be servable, no matter how many steps precede it.
+  const int32_t slots = 8;
+  const int steps = 10;
+  ExpertSlotCache c(slots);
+
+  int64_t served = 0, refused = 0;
+  for (int s = 0; s < steps; ++s) {
+    // Each step asks for `slots` DISTINCT experts, disjoint from every other
+    // step's, so every step is a full turnover of the cache.
+    for (int32_t i = 0; i < slots; ++i) {
+      const ExpertAcquisition a = c.Acquire(K(0, s * slots + i));
+      if (a.slot >= 0) {
+        ++served;
+        CHECK(a.slot < slots);
+      } else {
+        ++refused;
+      }
+    }
+    c.EndStep();
+  }
+
+  CHECK(served == static_cast<int64_t>(steps) * slots);
+  CHECK(refused == 0);
+  CHECK_FALSE(c.capacity_exhausted());
+  // The clock really advanced, which is what makes the decay a function of time.
+  CHECK(c.steps() == steps);
+  // Every step after the first had to evict the previous step's residents. If
+  // this is zero the cache never recycled a slot and the count above is wrong
+  // for a different reason.
+  CHECK(c.evictions() == static_cast<int64_t>(steps - 1) * slots);
+
+  // And the counter-case, to prove the assertion above is not vacuous: the same
+  // traffic WITHOUT a step boundary dies as soon as the cache is full.
+  ExpertSlotCache stuck(slots);
+  int64_t stuck_served = 0, stuck_refused = 0;
+  for (int s = 0; s < steps; ++s)
+    for (int32_t i = 0; i < slots; ++i) {
+      if (stuck.Acquire(K(0, s * slots + i)).slot >= 0)
+        ++stuck_served;
+      else
+        ++stuck_refused;
+    }
+  CHECK(stuck_served == slots);                          // exactly one step's worth
+  CHECK(stuck_refused == static_cast<int64_t>(steps - 1) * slots);
+  CHECK(stuck.capacity_exhausted());
+  CHECK(stuck.steps() == 0);
+  CHECK(stuck.evictions() == 0);
+}
+
+TEST_CASE("Invalidate drops the entry and returns its slot to the budget") {
+  // The undo a failed fill needs. Without it the key stays resident over a slot
+  // holding a prefix of the right bytes, and the retry is a HIT that moves no
+  // bytes at all.
+  ExpertSlotCache c(2);
+  const ExpertAcquisition a = c.Acquire(K(0, 1));
+  REQUIRE(a.slot >= 0);
+  REQUIRE(c.IsResident(K(0, 1)));
+
+  CHECK(c.Invalidate(K(0, 1)));
+  CHECK_FALSE(c.IsResident(K(0, 1)));
+  CHECK_FALSE(c.SlotOf(K(0, 1)).has_value());
+  CHECK(c.resident() == 0);
+  // Invalidating something absent is not an error and changes nothing.
+  CHECK_FALSE(c.Invalidate(K(0, 1)));
+  CHECK_FALSE(c.Invalidate(K(9, 9)));
+
+  // THE SLOT CAME BACK. A budget that shrank by one on every failed fill would
+  // starve a long run, and would do it silently.
+  const ExpertAcquisition b = c.Acquire(K(0, 2));
+  const ExpertAcquisition d = c.Acquire(K(0, 3));
+  REQUIRE(b.slot >= 0);
+  REQUIRE(d.slot >= 0);
+  CHECK(b.slot != d.slot);
+  CHECK(c.resident() == 2);
+
+  // The re-acquisition is a MISS, so the caller is told to fill it, which is the
+  // whole point of undoing the acquisition.
+  c.EndStep();
+  CHECK(c.Invalidate(K(0, 2)));
+  CHECK_FALSE(c.Acquire(K(0, 2)).hit);
+}
+
+TEST_CASE("Invalidate keeps the entry table dense for every other key") {
+  // The compaction moves the LAST entry into the hole. If the index were not
+  // repaired, the moved key would point at a stranger's slot -- the silently
+  // wrong-expert failure this cache exists to prevent.
+  ExpertSlotCache c(4);
+  std::vector<int32_t> slots;
+  for (int32_t e = 0; e < 4; ++e) {
+    const ExpertAcquisition a = c.Acquire(K(1, e));
+    REQUIRE(a.slot >= 0);
+    slots.push_back(a.slot);
+  }
+  // Drop a MIDDLE entry, so the last one is moved into its place.
+  REQUIRE(c.Invalidate(K(1, 1)));
+  CHECK(c.resident() == 3);
+  for (int32_t e : {0, 2, 3}) {
+    CHECK(c.IsResident(K(1, e)));
+    REQUIRE(c.SlotOf(K(1, e)).has_value());
+    CHECK(*c.SlotOf(K(1, e)) == slots[static_cast<size_t>(e)]);
+  }
+  CHECK_FALSE(c.IsResident(K(1, 1)));
+}

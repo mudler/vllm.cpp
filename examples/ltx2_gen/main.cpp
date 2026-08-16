@@ -169,7 +169,21 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "--width, --height and --frames are refused alongside it. --regenerate-video 0\n"
       "freezes the clip instead; --regenerate-audio has no effect while the source is\n"
       "a frame folder, because a folder carries no audio and both of upstream\'s audio\n"
-      "predicates test for one.\n");
+      "predicates test for one.\n\n"
+      "TEXT-TO-AUDIO renders a soundtrack and NO PICTURE. --pipeline-kind\n"
+      "t2a_one_stage selects it; the result carries an audio.wav, zero frames and no\n"
+      "ffmpeg argv, because there is nothing to mux. --video-vae is not needed and\n"
+      "--width/--height are refused: upstream passes a 512x512 placeholder whose\n"
+      "height and width it documents as unused, and only --frames and the recipe\'s\n"
+      "frame rate are read, to derive the DURATION. Unlike the distilled video\n"
+      "recipes this one is GUIDED: it runs three DiT forwards per step by default\n"
+      "(conditional, unconditional, and one with the audio self-attention perturbed),\n"
+      "so it needs a text tower for the negative prompt. --negative-prompt,\n"
+      "--audio-cfg-guidance-scale, --audio-stg-guidance-scale, --audio-rescale-scale,\n"
+      "--audio-skip-step and --audio-stg-blocks are upstream\'s own flags; absent, each\n"
+      "takes the checkpoint generation\'s own value. --audio-stg-blocks is comma\n"
+      "separated and a block index outside the DiT\'s layer count is refused rather\n"
+      "than clamped. The accelerator is REFUSED by name on this pipeline.\n");
   std::exit(code);
 }
 
@@ -186,6 +200,10 @@ int main(int argc, char** argv) {
   // RETAKE (row LTX25-RETAKE, #924): a source clip DIRECTORY and the window to
   // regenerate. `--ref-video` is a directory of frame_%06d.ppm, not a container.
   std::string ref_video, retake_start, retake_end, retake_fps, regen_video, regen_audio;
+  // TEXT-TO-AUDIO (row LTX25-T2A-ONE-STAGE, #1005): one flag per argument of
+  // upstream's `default_1_stage_t2a_arg_parser` (utils/args.py:1070-1120).
+  std::string negative_prompt, audio_cfg_scale, audio_stg_scale, audio_rescale;
+  std::string audio_skip_step, audio_stg_blocks;
 
   // The extras are BORROWED by the load call, so the strings must outlive it.
   // Kept as two parallel vectors of owned strings plus the char* views the ABI
@@ -262,6 +280,21 @@ int main(int argc, char** argv) {
       retake_end = Need(argc, argv, ++i, "--retake-end-time");
     else if (f == "--retake-frame-rate")
       retake_fps = Need(argc, argv, ++i, "--retake-frame-rate");
+    // TEXT-TO-AUDIO (#1005). Selected by `--pipeline-kind t2a_one_stage`, which
+    // is a LOAD extra; these six are per-generation and are refused by name on
+    // any other pipeline rather than accepted and ignored.
+    else if (f == "--negative-prompt")
+      negative_prompt = Need(argc, argv, ++i, "--negative-prompt");
+    else if (f == "--audio-cfg-guidance-scale")
+      audio_cfg_scale = Need(argc, argv, ++i, "--audio-cfg-guidance-scale");
+    else if (f == "--audio-stg-guidance-scale")
+      audio_stg_scale = Need(argc, argv, ++i, "--audio-stg-guidance-scale");
+    else if (f == "--audio-rescale-scale")
+      audio_rescale = Need(argc, argv, ++i, "--audio-rescale-scale");
+    else if (f == "--audio-skip-step")
+      audio_skip_step = Need(argc, argv, ++i, "--audio-skip-step");
+    else if (f == "--audio-stg-blocks")
+      audio_stg_blocks = Need(argc, argv, ++i, "--audio-stg-blocks");
     else if (f == "--regenerate-video")
       regen_video = Need(argc, argv, ++i, "--regenerate-video");
     else if (f == "--regenerate-audio")
@@ -330,7 +363,20 @@ int main(int argc, char** argv) {
                          std::make_pair("retake_end_time", &retake_end),
                          std::make_pair("retake_frame_rate", &retake_fps),
                          std::make_pair("regenerate_video", &regen_video),
-                         std::make_pair("regenerate_audio", &regen_audio)}) {
+                         std::make_pair("regenerate_audio", &regen_audio),
+                         // TEXT-TO-AUDIO (#1005). One flag per upstream CLI
+                         // argument (`default_1_stage_t2a_arg_parser`,
+                         // ltx-pipelines utils/args.py:1070-1120). They are
+                         // per-generation, so they ride this array rather than
+                         // the load one; `--pipeline-kind t2a_one_stage` is the
+                         // LOAD knob that selects the pipeline, and supplying
+                         // these without it is refused by name.
+                         std::make_pair("negative_prompt", &negative_prompt),
+                         std::make_pair("audio_cfg_guidance_scale", &audio_cfg_scale),
+                         std::make_pair("audio_stg_guidance_scale", &audio_stg_scale),
+                         std::make_pair("audio_rescale_scale", &audio_rescale),
+                         std::make_pair("audio_skip_step", &audio_skip_step),
+                         std::make_pair("audio_stg_blocks", &audio_stg_blocks)}) {
     if (kv.second->empty()) continue;
     gen_keys.emplace_back(kv.first);
     gen_values.push_back(*kv.second);

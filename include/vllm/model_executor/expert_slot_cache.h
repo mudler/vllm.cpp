@@ -81,12 +81,36 @@ class ExpertSlotCache {
   // which is what makes the decay a function of TIME rather than of call count.
   void EndStep();
 
+  // Drop `key`'s entry and return its slot to the free list, if it is resident.
+  // Returns true when something was dropped.
+  //
+  // This exists for exactly one caller: a fill that FAILED partway. Acquire has
+  // to run before the read, because the read needs somewhere to land, so a read
+  // that throws leaves the key marked resident over a slot holding a prefix of
+  // the right bytes and a tail of whatever the slot held before. The next
+  // acquisition of that key is then a HIT, and the kernel silently multiplies
+  // half an expert. Undoing the acquisition is what makes a failed fill safe,
+  // and it is the difference between a loud failure and a quiet one.
+  //
+  // Counters are NOT rewound. hits/misses/evictions describe what the run did,
+  // and the miss really did happen.
+  bool Invalidate(const ExpertKey& key);
+
   // True when the last Acquire could not be served because every slot was
   // protected by the current step. That means the budget is smaller than one
   // step's working set, which is a configuration error the caller must refuse
   // rather than work around.
   bool capacity_exhausted() const { return capacity_exhausted_; }
 
+  // Is `key` resident RIGHT NOW, without touching its hotness or LRU order?
+  //
+  // A pure query, deliberately separate from Acquire: a caller that wants to
+  // know whether a fill is coming (to prefetch, or to count) must not perturb
+  // the eviction order by asking. Acquire is the only thing that scores.
+  //
+  // There is deliberately only ONE of these. An earlier revision carried a
+  // byte-identical `Contains` beside it, which is how the doc comment above
+  // `capacity_exhausted()` came to sit in front of the wrong declaration.
   bool IsResident(const ExpertKey& key) const {
     return index_.find(key) != index_.end();
   }

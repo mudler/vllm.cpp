@@ -359,4 +359,56 @@ struct DeviceTokenIdsScope {
   DeviceTokenIds prev;
 };
 
+// ─── ENG-EXPERT-STREAM (#912): the streamed-expert lane, seen from outside ───
+//
+// The lane lives in the anonymous namespace of qwen3_5.cpp because nothing
+// outside the forward may construct it. Two things still have to reach it.
+//
+// A BENCHMARK has to be able to prove the lane stayed live. The row's published
+// "streaming ON: no decode gain" number was measured on a cache that had
+// switched itself off partway through the third token, and nothing in the run
+// could have said so: the process printed one line at startup and none
+// afterwards. `steps` and `exhausted` are the two fields that make that state
+// visible — steps==0 means the step clock never advanced, exhausted>0 means
+// slices were refused and served from the mapping instead.
+//
+// A GATE has to be able to prove decode still REACHES the lane. Counters that
+// stay at zero when the production call site is deleted are what turns "the
+// class works" into "the capability is wired", which is the distinction this
+// row previously failed.
+struct ExpertStreamStats {
+  // A slot store exists. False when streaming was never requested, and also
+  // when it was requested but no expert slice was ever taken — which is itself
+  // the reachability failure worth catching.
+  bool active = false;
+  int64_t steps = 0;
+  int64_t hits = 0;
+  int64_t misses = 0;
+  int64_t evictions = 0;
+  int64_t fills = 0;
+  int64_t bytes_filled = 0;
+  // Slices the cache could not serve, which fell back to the mapping. Nonzero
+  // means the budget is smaller than one step's working set, OR that the step
+  // boundary is not being called at all.
+  int64_t exhausted = 0;
+  // madvise(MADV_WILLNEED) calls the kernel ACCEPTED. Zero while slices are
+  // being filled from a mapping means the hint is being rejected, which is what
+  // an unaligned address does silently.
+  int64_t advised = 0;
+};
+
+ExpertStreamStats ExpertStreamSnapshot();
+
+// Force every slice to take the cache-exhaustion fallback, i.e. the resident
+// tower view. A real production state (a budget below one step's working set
+// reaches it), exposed so one process can compare the streamed and unstreamed
+// arms and prove they produce identical bytes.
+void ExpertStreamSetForceFallback(bool on);
+
+// End one decode step for the streamed-expert cache. The Qwen3.5 MoE forward
+// runs this from its own layer driver; a SECOND full-attention MoE model
+// (qwen3_moe.cpp) composes the same block from another translation unit and
+// calls it from its layer driver for the same reason.
+void EndExpertStreamStep();
+
 }  // namespace vllm::detail

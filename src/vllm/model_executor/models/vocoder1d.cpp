@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "vllm/model_executor/models/host_parallel.h"
+
 namespace vllm {
 namespace vocoder1d {
 
@@ -71,21 +73,35 @@ std::vector<float> Conv1d(const std::vector<float>& in, int64_t in_channels,
   const int64_t in_per_group = in_channels / groups;
   const int64_t out_per_group = out_channels / groups;
   std::vector<float> out(static_cast<size_t>(out_channels * length), 0.0f);
-  for (int64_t oc = 0; oc < out_channels; ++oc) {
-    const int64_t g = oc / out_per_group;
-    for (int64_t t = 0; t < length; ++t) {
-      double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
-      for (int64_t ic = 0; ic < in_per_group; ++ic) {
-        const int64_t src_c = g * in_per_group + ic;
-        for (int64_t k = 0; k < kernel; ++k) {
-          const int64_t pos = t * stride + k * dilation;
-          acc += static_cast<double>(in[static_cast<size_t>(src_c * in_len + pos)]) *
-                 static_cast<double>(weight[static_cast<size_t>((oc * in_per_group + ic) * kernel + k)]);
+  // Parallel over OUTPUT CHANNELS. Nothing inside the body moves: each output
+  // element already owned one sequential double accumulator seeded with the
+  // bias and walked in (ic, k) order, and it still does. The outer loop was
+  // ALREADY indexed by the output channel, so this is a partition of it and not
+  // a pivot — see `ConvTranspose1d` below, which needed the harder argument.
+  //
+  // Conv1d is 7.7 % of the acoustic half against ConvTranspose1d's 88.5 %, and
+  // that is exactly why it is here rather than left: once the 88.5 % divides by
+  // the core count, the untouched 7.7 % is what the total converges to.
+  host_parallel::ForOutputRows(
+      out_channels, length * in_per_group * kernel, [&](int64_t c0, int64_t c1) {
+        for (int64_t oc = c0; oc < c1; ++oc) {
+          const int64_t g = oc / out_per_group;
+          for (int64_t t = 0; t < length; ++t) {
+            double acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0;
+            for (int64_t ic = 0; ic < in_per_group; ++ic) {
+              const int64_t src_c = g * in_per_group + ic;
+              for (int64_t k = 0; k < kernel; ++k) {
+                const int64_t pos = t * stride + k * dilation;
+                acc +=
+                    static_cast<double>(in[static_cast<size_t>(src_c * in_len + pos)]) *
+                    static_cast<double>(
+                        weight[static_cast<size_t>((oc * in_per_group + ic) * kernel + k)]);
+              }
+            }
+            out[static_cast<size_t>(oc * length + t)] = static_cast<float>(acc);
+          }
         }
-      }
-      out[static_cast<size_t>(oc * length + t)] = static_cast<float>(acc);
-    }
-  }
+      });
   *out_len = length;
   return out;
 }
@@ -102,29 +118,44 @@ std::vector<float> ConvTranspose1d(const std::vector<float>& in, int64_t in_chan
   VT_CHECK(length > 0, "minimax_h3 audio vae: conv_transpose1d output length is empty");
   const int64_t in_per_group = in_channels / groups;
   const int64_t out_per_group = out_channels / groups;
-  std::vector<double> acc(static_cast<size_t>(out_channels * full), 0.0);
-  for (int64_t ic = 0; ic < in_channels; ++ic) {
-    const int64_t g = ic / in_per_group;
-    for (int64_t t = 0; t < in_len; ++t) {
-      const double value = in[static_cast<size_t>(ic * in_len + t)];
-      if (value == 0.0) continue;
-      for (int64_t oc = 0; oc < out_per_group; ++oc) {
-        const int64_t dst_c = g * out_per_group + oc;
-        for (int64_t k = 0; k < kernel; ++k) {
-          acc[static_cast<size_t>(dst_c * full + t * stride + k)] +=
-              value * static_cast<double>(weight[static_cast<size_t>((ic * out_per_group + oc) * kernel + k)]);
-        }
-      }
-    }
-  }
   std::vector<float> out(static_cast<size_t>(out_channels * length));
-  for (int64_t c = 0; c < out_channels; ++c) {
-    for (int64_t t = 0; t < length; ++t) {
-      double value = acc[static_cast<size_t>(c * full + t + padding)];
-      if (bias != nullptr) value += (*bias)[static_cast<size_t>(c)];
-      out[static_cast<size_t>(c * length + t)] = static_cast<float>(value);
-    }
-  }
+  // Parallel over OUTPUT CHANNELS. The scatter this replaced ran `ic` outermost
+  // and touched every destination channel, but each destination accumulator is
+  // reached ONLY from its own group's inputs, so pivoting the loops to
+  // (dst_c, ic, t, k) leaves the sequence of additions into any one accumulator
+  // exactly as it was: ic ascending, then t ascending, then the single k with
+  // `t*stride + k == p`. The `value == 0.0` skip is a property of (ic, t) and
+  // is likewise unmoved. Bit-identical to the serial loop by construction — see
+  // host_parallel.h for the contract and `test_host_parallel` for the proof
+  // against a verbatim copy of the serial code.
+  //
+  // The scratch accumulator is now ONE channel wide rather than `out_channels`
+  // wide, so peak scratch drops from `out_channels * full` doubles to
+  // `threads * full`. That is a byte count, not a number: every value written
+  // through it is the same value in the same order.
+  host_parallel::ForOutputRows(
+      out_channels, in_per_group * in_len * kernel, [&](int64_t c0, int64_t c1) {
+        std::vector<double> acc(static_cast<size_t>(full));
+        for (int64_t dst_c = c0; dst_c < c1; ++dst_c) {
+          std::fill(acc.begin(), acc.end(), 0.0);
+          const int64_t g = dst_c / out_per_group;
+          const int64_t oc = dst_c - g * out_per_group;
+          for (int64_t ic = g * in_per_group; ic < (g + 1) * in_per_group; ++ic) {
+            const float* w = weight.data() + (ic * out_per_group + oc) * kernel;
+            for (int64_t t = 0; t < in_len; ++t) {
+              const double value = in[static_cast<size_t>(ic * in_len + t)];
+              if (value == 0.0) continue;
+              double* dst = acc.data() + t * stride;
+              for (int64_t k = 0; k < kernel; ++k) dst[k] += value * static_cast<double>(w[k]);
+            }
+          }
+          for (int64_t t = 0; t < length; ++t) {
+            double value = acc[static_cast<size_t>(t + padding)];
+            if (bias != nullptr) value += (*bias)[static_cast<size_t>(dst_c)];
+            out[static_cast<size_t>(dst_c * length + t)] = static_cast<float>(value);
+          }
+        }
+      });
   *out_len = length;
   return out;
 }

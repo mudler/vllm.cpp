@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,10 @@
 
 #include "doctest/doctest.h"
 #include "support/max_abs_diff.h"
+// LTX25-DECODE-THREADS (issue #1009): Threadpool::SwapForTesting and the pool's
+// work-stealing cursor, reached via -I src the way every other threading A/B in
+// this tree does (tests/vt/test_ops_conv2d.cpp:25).
+#include "vt/cpu/cpu_threadpool.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_audio_vae_encoder.h"
 #include "vllm/model_executor/models/ltx2_conditioning.h"
@@ -1182,6 +1187,222 @@ TEST_CASE("ltx2 vae: the decode's convolution accumulates in f32, the width torc
   // drifting if the accumulator is ever widened again. 1.03473 is what this
   // decode returned before #1008 narrowed it.
   CHECK(err < 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// LTX25-DECODE-THREADS (issue #1009): the decode had 20 cores and used one.
+// .agents/specs/ltx25-decode-threads.md
+// ---------------------------------------------------------------------------
+
+// The fixture both threading cases decode. Deliberately shared, so the case that
+// proves the dispatch happens and the case that proves the result does not
+// depend on it are looking at the SAME work.
+//
+// It is the accumulator-width fixture's derivation at a size where the
+// convolution has many output lines: `decoder_blocks` empty, patch_size 1,
+// replicate padding and an all-ones latent, so every conv tap reads exactly 1.0
+// at every output voxel including the borders and one reduction is repeated
+// everywhere. conv_in channel 0 carries the f32/f64 separable reduction, channel
+// 1 is all-zero weights with bias 1, conv_out selects channel 0's centre tap and
+// adds a bias of 7.
+struct Ltx2ThreadFixture {
+  vllm::Ltx2ConvVideoDecoderConfig cfg;
+  vllm::Ltx2VaeWeights weights;
+  std::vector<float> latent;
+  int64_t lt = 0, lh = 0, lw = 0;
+};
+
+Ltx2ThreadFixture MakeLtx2ThreadFixture() {
+  Ltx2ThreadFixture f;
+  f.cfg.prefix = "ltx2.videodec.threads.";
+  f.cfg.in_channels = 1;
+  f.cfg.out_channels = 1;
+  f.cfg.patch_size = 1;
+  // 24 output channels, so conv_in's parallel row count is 24 * out.t * out.h and
+  // no thread count under test degenerates to one chunk.
+  f.cfg.base_channels = 24;
+  f.cfg.causal = false;
+  f.cfg.timestep_conditioning = false;
+  f.cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  f.cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kReplicate;
+  f.cfg.decoder_blocks = {};
+
+  const std::string p = f.cfg.prefix;
+  f.weights.tensors[p + "per_channel_statistics.std-of-means"] = {1.0f};
+  f.weights.tensors[p + "per_channel_statistics.mean-of-means"] = {0.0f};
+
+  // conv_in is [out=24, in=1, 3, 3, 3]. Channel 0 carries the separable
+  // reduction in the exact order CausalConv3d walks it; channels 1..23 are
+  // all-zero weights with bias 1, which gives PixelNorm 23 unit channels to
+  // divide by and keeps channel 0 at zero on an f32 accumulator.
+  constexpr float kBig = 1e8f;
+  constexpr float kSmall = 0.1f;
+  std::vector<float> conv_in(static_cast<size_t>(24 * 1 * 27), 0.0f);
+  conv_in[0] = kBig;
+  for (size_t i = 1; i < 26; ++i) conv_in[i] = kSmall;
+  conv_in[26] = -kBig;
+  f.weights.tensors[p + "conv_in.conv.weight"] = conv_in;
+  std::vector<float> conv_in_bias(24, 1.0f);
+  conv_in_bias[0] = 0.0f;
+  f.weights.tensors[p + "conv_in.conv.bias"] = conv_in_bias;
+
+  // conv_out is [out=1, in=24, 3, 3, 3]; it selects channel 0's centre tap and
+  // nothing else. THE BIAS IS 7 for the reason #1008 recorded: with a bias of 0
+  // the expected value is zero, and a decode that never ran hands back a
+  // zero-filled buffer, so the case would pass while measuring nothing.
+  std::vector<float> conv_out(static_cast<size_t>(1 * 24 * 27), 0.0f);
+  conv_out[13] = 1.0f;  // ic = 0, a = b = d = 1
+  f.weights.tensors[p + "conv_out.conv.weight"] = conv_out;
+  f.weights.tensors[p + "conv_out.conv.bias"] = {7.0f};
+
+  f.lt = 3;
+  f.lh = 5;
+  f.lw = 4;
+  f.latent.assign(static_cast<size_t>(f.lt * f.lh * f.lw), 1.0f);
+  return f;
+}
+
+// Untiled, so the ONE decode call the streaming entry point makes is the whole
+// measurement.
+vllm::Ltx2TileSizeConfig Ltx2ThreadUntiled() {
+  vllm::Ltx2TileSizeConfig tiling;
+  tiling.frames = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  tiling.height = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  tiling.width = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  return tiling;
+}
+
+vllm::Ltx2VideoFrames Ltx2ThreadDecode(const Ltx2ThreadFixture& f, int64_t* chunks) {
+  // ENTERS THROUGH THE PRODUCTION ENTRY POINT. `Ltx2VideoDecodeStreaming` is what
+  // the render path calls (src/vllm/multimodal/ltx2_video.cpp:3258) and it reaches
+  // Ltx2ConvVideoDecode at ltx2_video_vae_tiled.cpp:113. A case that called
+  // Ltx2ConvVideoDecode directly would prove the function works, never that the
+  // shipping path reaches the threaded one.
+  vllm::Ltx2VideoFrames got;
+  *chunks = 0;
+  vllm::Ltx2VideoDecodeStreaming(
+      vllm::Ltx2VideoDecoderKind::kConv, f.cfg, f.weights, f.latent, f.cfg.in_channels, f.lt, f.lh,
+      f.lw, /*noise=*/nullptr, Ltx2ThreadUntiled(), [&](const vllm::Ltx2VideoChunk& chunk) {
+        ++*chunks;
+        got = chunk.frames;
+      });
+  return got;
+}
+
+TEST_CASE("ltx2 vae: the decode DISPATCHES its convolutions to the CPU threadpool") {
+  // THE CASE THAT IS RED BEFORE #1009, and the reason the determinism case below
+  // is not enough on its own: two runs of a SERIAL decode are also bit-identical,
+  // so a thread-count A/B is green on an implementation that never threads
+  // anything. This case observes the dispatch itself.
+  //
+  // THE INSTRUMENT. `ParallelForRows` (src/vt/cpu/cpu_threadpool.cpp:413-458)
+  // partitions its rows through the pool's shared work-stealing cursor: worker 0
+  // seeds it with `ChunkSet(nth)` and every steal advances it with `ChunkAdd(1)`.
+  // `ChunkAdd(0)` is a public non-mutating read of that cursor — `fetch_add(0)`
+  // returns the current value. A fresh pool reads 0; a pool that has run at least
+  // one multi-chunk partitioned dispatch reads at least `nth`. So the read is a
+  // direct observation of "partitioned work ran on THIS pool", and the assertion
+  // before the decode is its own positive control: the instrument demonstrably
+  // reads zero when nothing has dispatched, which is exactly the state this row
+  // removes.
+  const Ltx2ThreadFixture f = MakeLtx2ThreadFixture();
+
+  vt::cpu::Threadpool tp(4);
+  REQUIRE(tp.NThreads() == 4);
+  // Positive control: the cursor reads zero on a pool nothing has dispatched to.
+  REQUIRE(tp.ChunkAdd(0) == 0);
+
+  vt::cpu::Threadpool* prev = vt::cpu::Threadpool::SwapForTesting(&tp);
+  int64_t chunks = 0;
+  vllm::Ltx2VideoFrames got;
+  try {
+    got = Ltx2ThreadDecode(f, &chunks);
+  } catch (...) {
+    vt::cpu::Threadpool::SwapForTesting(prev);
+    throw;
+  }
+  const int cursor = tp.ChunkAdd(0);
+  vt::cpu::Threadpool::SwapForTesting(prev);
+
+  REQUIRE(chunks == 1);
+  REQUIRE(got.data.size() == static_cast<size_t>(f.lt * f.lh * f.lw));
+
+  // The decode ran, and it ran through the pool.
+  CHECK(cursor > 0);
+
+  // AND IT PRODUCED THE RIGHT PIXELS. The derivation, so a reader can check the
+  // number rather than trust it: conv_in channel 0 accumulates to 0 in f32,
+  // channels 1..23 to their bias of 1; PixelNorm leaves channel 0 at 0; SiLU(0)
+  // is 0; conv_out forwards channel 0 and adds its bias. Every output element is
+  // therefore exactly 7. A stubbed or deleted decode returns zeros and fails
+  // here; an f64 accumulator keeps channel 0's 2.5 and fails here too.
+  const std::vector<float> want(got.data.size(), 7.0f);
+  const double err = MaxAbsDiff(got.data, want.data(), got.data.size());
+  INFO("threaded decode max|out - 7| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+}
+
+TEST_CASE("ltx2 vae: the decode is BIT-IDENTICAL across thread counts") {
+  // The determinism half of #1009. `ParallelForRows` steals work through an
+  // atomic cursor, so which worker takes which output line is genuinely
+  // non-deterministic run to run; the partition is over OUTPUT lines only and the
+  // whole `ci * kernel^3` reduction stays inside one output element's body, so
+  // every element is produced by the same instruction sequence on the same values
+  // whatever the worker count is. That is the contract cpu_threadpool.h:39-43
+  // states for the whole CPU backend, and this case holds the decode to it.
+  //
+  // A decode that returns different pixels at 1 thread and at 8 is a defect even
+  // with every golden green, and no golden here would see it: the goldens run at
+  // one thread count, the global pool's.
+  //
+  // Worker count 1 short-circuits ParallelForRows to `body(0, nr)` on the caller
+  // (cpu_threadpool.cpp:423-426), so the 1-thread arm IS the pre-#1009 serial code
+  // path byte for byte, and every other arm is compared against it.
+  //
+  // WHY 3 AND 5, STATED CORRECTLY. It is NOT that they fail to divide the row
+  // counts — they divide both of this fixture's conv row counts exactly. conv_in
+  // partitions 24*3*5 = 360 output lines and conv_out 1*3*5 = 15, and 3 and 5
+  // divide each of those. The mechanism is that a chunk boundary is a function of
+  // `nth * 4`, not of `nth`: ParallelForRows takes four chunks per thread
+  // (cpu_threadpool.cpp:428-431), so `dr = ceil(nr / nchunk)` (:443) with
+  // `nchunk = ceil(nr / ceil(nr / (nth*4)))`. At nr = 360 that is a stride of 45
+  // at 2 workers, 30 at 3, 18 at 5 and 12 at 8 — four DIFFERENT partitions of the
+  // same output, which is what the memcmp needs. Do NOT "fix" the fixture's row
+  // counts to make them indivisible by 3 and 5: that would change the shape for a
+  // reason that was never true, and 4 distinct strides is the property that
+  // matters.
+  const Ltx2ThreadFixture f = MakeLtx2ThreadFixture();
+
+  std::vector<float> base;
+  for (int nth : {1, 2, 3, 5, 8}) {
+    vt::cpu::Threadpool tp(nth);
+    vt::cpu::Threadpool* prev = vt::cpu::Threadpool::SwapForTesting(&tp);
+    int64_t chunks = 0;
+    vllm::Ltx2VideoFrames got;
+    try {
+      got = Ltx2ThreadDecode(f, &chunks);
+    } catch (...) {
+      vt::cpu::Threadpool::SwapForTesting(prev);
+      throw;
+    }
+    vt::cpu::Threadpool::SwapForTesting(prev);
+
+    REQUIRE(chunks == 1);
+    REQUIRE(got.data.size() == static_cast<size_t>(f.lt * f.lh * f.lw));
+    if (base.empty()) {
+      // NOT DEGENERATE, so a stubbed decode cannot satisfy the comparison below.
+      // An all-zero buffer is bit-identical to another all-zero buffer, so
+      // "every arm agrees" is a vacuous statement about a decode that never ran.
+      // This fixture's answer is 7 everywhere, which no absent computation
+      // produces.
+      const std::vector<float> want(got.data.size(), 7.0f);
+      REQUIRE(MaxAbsDiff(got.data, want.data(), got.data.size()) <= kLtx2GoldenTol);
+      base = got.data;
+    } else {
+      INFO("worker count " << nth);
+      CHECK(std::memcmp(base.data(), got.data.data(), base.size() * sizeof(float)) == 0);
+    }
+  }
 }
 
 TEST_CASE("ltx2 vae: the video decoder's norm_eps is gated where it BINDS") {

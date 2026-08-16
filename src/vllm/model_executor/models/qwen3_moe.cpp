@@ -33,6 +33,7 @@
 #include "vllm/model_executor/models/decode_graph_sizes.h"  // DecodeGraphSizes/PadToCaptureSize
 #include "vllm/model_executor/models/dense_attn_block.h"    // shared AttnBlock + device glue
 #include "vllm/model_executor/models/device_pool.h"         // DevicePool/Pool/ActivePool (shared)
+#include "vllm/model_executor/models/qwen3_5_internal.h"    // detail::EndExpertStreamStep
 #include "vllm/model_executor/models/qwen3_5_moe_block.h"   // RunMoeBlock (SEAM GAP #2)
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
@@ -141,6 +142,14 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                    const std::vector<PagedKvCache>& attn_kv,
                    const Qwen3MoeWeights& weights, const HfConfig& config,
                    const std::vector<int32_t>& logits_indices) {
+  // ONE decode step, for the same reason the Qwen3.5 layer driver marks one:
+  // this model composes the SAME MoE block (RunMoeBlock), so its experts reach
+  // the same slot cache, and a cache whose step never ends protects every entry
+  // forever and stops serving once it fills. Inert unless streaming is on.
+  const struct EndStepGuard {
+    ~EndStepGuard() { detail::EndExpertStreamStep(); }
+  } expert_stream_step;
+  (void)expert_stream_step;
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const int64_t vocab = config.vocab_size;

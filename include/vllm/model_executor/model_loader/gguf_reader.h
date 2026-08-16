@@ -143,6 +143,19 @@ class GgufFile {
   // precondition for borrowing those bytes in place.
   bool OwnsSpan(const uint8_t* data, size_t nbytes) const;
 
+  // Where a borrowed span physically LIVES: the descriptor of the shard that
+  // owns it and its byte offset within that shard. `fd` is -1 when the span is
+  // not inside any mapping this file owns, which a caller must treat as "read
+  // it through the mapping instead" rather than as an error.
+  //
+  // A split GGUF is why this is not just `ptr - base`: the span may sit in any
+  // sibling shard, each with its own descriptor and its own zero.
+  struct SpanSource {
+    int fd = -1;
+    size_t offset = 0;
+  };
+  SpanSource SourceOfSpan(const uint8_t* data, size_t nbytes) const;
+
   // Drop the resident pages of a span that has been read for the LAST time —
   // i.e. a tensor the loader EXPANDED, whose file bytes nothing will look at
   // again. This is llama.cpp's `unmap_fragment` idea

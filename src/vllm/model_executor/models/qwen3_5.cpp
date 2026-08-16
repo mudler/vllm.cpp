@@ -1,3 +1,6 @@
+#if defined(__unix__)
+#include <sys/mman.h>
+#endif
 // vllm.cpp original; see qwen3_5.h. Forward math mirrored 1:1 from the pinned
 // upstream (qwen3_next.py::Qwen3NextDecoderLayer / Qwen3NextModel.forward,
 // qwen_gdn_linear_attn.py, qwen3_next.py::Qwen3NextAttention /
@@ -5150,13 +5153,53 @@ inline bool Qwen35ExpertStreamRequested() {
 
 class Qwen35ExpertStream {
  public:
+  // The store, or nullptr when nothing has built one. NEVER constructs, which
+  // is the whole reason it is separate from Get: the once-per-step hook and the
+  // stats reader must be able to ask "is this lane live?" without allocating an
+  // 18 GiB slot array behind a model that is not streaming at all.
+  static Qwen35ExpertStream* Existing() { return Slot().get(); }
+
+  // The largest slice a caller is about to take, declared BEFORE it takes any.
+  //
+  // gate/up and down are not the same size whenever a dynamic (UD) quant keeps
+  // `down_proj` at a higher precision than the gate/up pair, which is exactly
+  // what the checkpoints this row targets do. Sizing the store from whichever
+  // slice happened to arrive first then makes the FIRST down slice exceed the
+  // slot and trip the check below in the middle of decode. Declaring the
+  // maximum up front sizes the store once, correctly, before anything is
+  // stored, so the only remaining way to trip that check is a genuinely
+  // unforeseen slice.
+  static void Reserve(size_t slot_bytes) {
+    if (!Qwen35ExpertStreamRequested()) return;
+    std::lock_guard<std::mutex> lk(Mutex());
+    if (slot_bytes > Reserved()) Reserved() = slot_bytes;
+  }
+
   static Qwen35ExpertStream* Get(size_t slot_bytes) {
     if (!Qwen35ExpertStreamRequested()) return nullptr;
-    static Qwen35ExpertStream* inst = nullptr;
-    if (inst == nullptr) inst = new Qwen35ExpertStream(slot_bytes);
+    Qwen35ExpertStream* inst = nullptr;
+    {
+      // Construction only. The lock does NOT cover Slice: a decode step runs on
+      // one host thread, and holding a process-wide mutex across every expert
+      // slice would serialise the lane it exists to speed up.
+      //
+      // It does have to cover construction. The previous `static T* inst =
+      // nullptr; if (inst == nullptr) inst = new T(...)` is not the magic-static
+      // idiom used a few lines above and carries none of its guarantees: two
+      // concurrent first calls both see null, both construct, and one ~18 GiB
+      // store is leaked while the two halves of the model disagree about which
+      // cache they are using.
+      std::lock_guard<std::mutex> lk(Mutex());
+      std::unique_ptr<Qwen35ExpertStream>& slot = Slot();
+      if (slot == nullptr) {
+        slot.reset(new Qwen35ExpertStream(std::max(slot_bytes, Reserved())));
+      }
+      inst = slot.get();
+    }
     // A tower larger than the slot cannot be served by THIS store. Refuse by
     // name rather than silently falling back, which would make a streaming
-    // benchmark quietly measure the mmap path instead.
+    // benchmark quietly measure the mmap path instead. Both sizes are named,
+    // because "too big" without the budget it exceeded is not actionable.
     VT_CHECK(slot_bytes <= inst->store_->slot_bytes(),
              "expert stream: a slice of " + std::to_string(slot_bytes) +
                  " bytes exceeds the slot budget of " +
@@ -5165,14 +5208,86 @@ class Qwen35ExpertStream {
     return inst;
   }
 
+  // The decode step boundary. Calling it is what clears per-step eviction
+  // protection and advances the hotness clock; see the note on the RAII guard
+  // below for what happens when nobody does.
+  static void EndStepIfActive() {
+    if (Qwen35ExpertStream* s = Existing()) s->EndStep();
+  }
+
+  // Force the cache-exhaustion branch, which makes every Slice return nullptr
+  // and every caller fall back to the resident tower view. This is a REAL
+  // production state (a budget smaller than one step's working set reaches it),
+  // and having a switch for it is what lets a gate prove the streamed and
+  // unstreamed arms produce the same bytes inside one process.
+  static void SetForceFallback(bool on) { ForceFallback() = on; }
+
   // Returns the slot's bytes for `expert` of the tower based at `base`, or
   // nullptr when the cache is exhausted for this step (the caller then reads
   // the tower directly, which is correct but slow, and is counted).
-  uint8_t* Slice(const uint8_t* base, int64_t expert, size_t offset,
-                 size_t bytes) {
-    const int32_t tower = TowerId(base);
-    const ExpertStreamer::Result r = streamer_->EnsureSpan(
-        ExpertKey{tower, static_cast<int32_t>(expert)}, base + offset, bytes);
+  // `fd`/`file_offset` describe where the slice lives on DISK. When they are
+  // valid the slot is filled by pread, which is the form the design specified
+  // and the only one that changes the I/O: a memcpy from the mapping still
+  // traps every 4 KiB page of its source, which is why W4 measured no decode
+  // gain. The mapping copy stays as the fallback for a weight with no
+  // descriptor (an expanded or repacked tensor owns its bytes outright).
+  uint8_t* Slice(const uint8_t* base, uint64_t tower_uid, int64_t expert,
+                 size_t offset, size_t bytes, int fd, size_t file_offset) {
+    if (ForceFallback()) {
+      ++exhausted_;
+      return nullptr;
+    }
+    const int32_t tower = TowerId(tower_uid);
+    const ExpertKey key{tower, static_cast<int32_t>(expert)};
+    if (fd >= 0) {
+      const ExpertStreamer::Result r =
+          streamer_->EnsureFile(key, fd, file_offset + offset, bytes);
+      if (r.slot < 0) {
+        ++exhausted_;
+        return nullptr;
+      }
+      return store_->Slot(r.slot);
+    }
+    // Ask the kernel for the WHOLE slice up front, before the copy touches it.
+    //
+    // This is the difference between one readahead and 608 demand faults. The
+    // W4 measurement showed that filling a slot by memcpy from the mapping
+    // inherits the fault path streaming exists to bypass: the copy is
+    // sequential, but each 4 KiB page still traps. MADV_WILLNEED hands the
+    // range to the kernel's readahead in one call, which is the same lever
+    // `PrefaultBorrowedSpan` already uses at load, applied per slice at decode.
+    //
+    // Advisory and read-only, so it cannot change a byte. Skipped on a hit,
+    // where nothing will be read at all.
+    //
+    // THE ADDRESS MUST BE PAGE-ALIGNED. madvise(2) returns EINVAL when it is
+    // not, and a GGUF tensor is aligned to `general.alignment`, which defaults
+    // to 32 (gguf_reader.cpp:401) — so the slice address is essentially never a
+    // page boundary and the unaligned form was a no-op that reported nothing,
+    // because the return value was discarded too. Round the start DOWN and the
+    // end UP: the extra bytes belong to a neighbouring expert that this step is
+    // very likely to want as well, and MADV_WILLNEED cannot harm them either
+    // way. `advised_` counts the calls that were actually accepted, so a run
+    // can tell a working hint from a silently rejected one.
+    //
+    // NO SPEEDUP IS CLAIMED HERE. This makes the call well-formed; whether
+    // readahead moves decode is a measurement the spec records as owed.
+#if defined(__unix__)
+    if (!cache_->IsResident(key)) {
+      const long ps_l = ::sysconf(_SC_PAGESIZE);
+      const auto ps = static_cast<uintptr_t>(ps_l > 0 ? ps_l : 4096);
+      const auto begin = reinterpret_cast<uintptr_t>(base + offset);
+      const uintptr_t page_begin = begin & ~(ps - 1);
+      const uintptr_t page_end = (begin + bytes + ps - 1) & ~(ps - 1);
+      if (::madvise(reinterpret_cast<void*>(page_begin),
+                    static_cast<size_t>(page_end - page_begin),
+                    MADV_WILLNEED) == 0) {
+        ++advised_;
+      }
+    }
+#endif
+    const ExpertStreamer::Result r =
+        streamer_->EnsureSpan(key, base + offset, bytes);
     if (r.slot < 0) {
       ++exhausted_;
       return nullptr;
@@ -5180,11 +5295,66 @@ class Qwen35ExpertStream {
     return store_->Slot(r.slot);
   }
 
-  void EndStep() { streamer_->EndStep(); }
+  void EndStep() {
+    streamer_->EndStep();
+    ReportStats(/*final=*/false);
+  }
   const ExpertStreamer& streamer() const { return *streamer_; }
+  const ExpertSlotCache& cache() const { return *cache_; }
   int64_t exhausted() const { return exhausted_; }
+  int64_t advised() const { return advised_; }
+
+  // ONE line a benchmark can read to prove the lane stayed live.
+  //
+  // This exists because of how the row's published decode number went wrong.
+  // The run printed `[expert-stream] ON ...` once at startup and then nothing,
+  // so a cache that switched itself off partway through token 3 looked exactly
+  // like one that worked for the whole run, and "streaming ON: no decode gain"
+  // was measured against a dead lane. The two numbers that would have caught it
+  // immediately are `steps` and `exhausted`: steps==0 means the step clock never
+  // advanced, and exhausted>0 means slices were refused and silently served from
+  // the mapping instead. Both are on this line, and either is wrong at a glance.
+  void ReportStats(bool final) const {
+    const int64_t steps = cache_->steps();
+    if (!final) {
+      if (stats_every_ <= 0) return;
+      if (steps == 0 || steps % stats_every_ != 0) return;
+    }
+    std::fprintf(stderr,
+                 "[expert-stream] steps=%lld hits=%lld misses=%lld "
+                 "evictions=%lld fills=%lld bytes=%lld exhausted=%lld "
+                 "advised=%lld\n",
+                 static_cast<long long>(steps),
+                 static_cast<long long>(cache_->hits()),
+                 static_cast<long long>(cache_->misses()),
+                 static_cast<long long>(cache_->evictions()),
+                 static_cast<long long>(streamer_->fills()),
+                 static_cast<long long>(streamer_->bytes_filled()),
+                 static_cast<long long>(exhausted_),
+                 static_cast<long long>(advised_));
+  }
 
  private:
+  // The single instance, and the lock that makes creating it safe. Both are
+  // function-local statics so their own initialisation is the thread-safe magic
+  // static this class failed to use for the instance itself.
+  static std::unique_ptr<Qwen35ExpertStream>& Slot() {
+    static std::unique_ptr<Qwen35ExpertStream> inst;
+    return inst;
+  }
+  static std::mutex& Mutex() {
+    static std::mutex m;
+    return m;
+  }
+  static size_t& Reserved() {
+    static size_t bytes = 0;
+    return bytes;
+  }
+  static bool& ForceFallback() {
+    static bool on = false;
+    return on;
+  }
+
   explicit Qwen35ExpertStream(size_t slot_bytes) {
     const char* sb = std::getenv("VT_MOE_EXPERT_STREAM_SLOT_BYTES");
     if (sb != nullptr && *sb != '\0') {
@@ -5197,6 +5367,11 @@ class Qwen35ExpertStream {
       const long v = std::atol(sv);
       if (v > 0) slots = static_cast<int32_t>(v);
     }
+    const char* se = std::getenv("VT_MOE_EXPERT_STREAM_STATS_EVERY");
+    if (se != nullptr && *se != '\0') {
+      const long v = std::atol(se);
+      if (v >= 0) stats_every_ = static_cast<int64_t>(v);
+    }
     store_ = std::make_unique<HostExpertSlotStore>(slots, slot_bytes);
     cache_ = std::make_unique<ExpertSlotCache>(slots);
     streamer_ = std::make_unique<ExpertStreamer>(*cache_, *store_);
@@ -5205,20 +5380,58 @@ class Qwen35ExpertStream {
                  slots, slot_bytes, store_->resident_bytes() / 1073741824.0);
   }
 
-  int32_t TowerId(const uint8_t* base) {
-    auto it = tower_ids_.find(base);
+  // A tower's cache identity, compacted into the int32 the key carries.
+  //
+  // The argument is the tensor's PROCESS-UNIQUE uid, not its base pointer. A
+  // pointer was wrong here in a way no single-model test could see. This store
+  // is a process-lifetime singleton, so it outlives any one model, and the
+  // allocator hands out an address again as soon as the first model is freed.
+  // The second model's tower then hit the FIRST model's entries and was served
+  // another checkpoint's weights, as a HIT, which by contract moves no bytes and
+  // so leaves nothing downstream to notice. Measured on two synthetic models in
+  // one process: 24 towers occupied 21 distinct addresses, and 20 of 222 slices
+  // came back wrong. The comment this replaces asserted the opposite, and its
+  // premise ("stable for the model's life") was true; the CACHE is simply not
+  // scoped to one model's life.
+  int32_t TowerId(uint64_t uid) {
+    auto it = tower_ids_.find(uid);
     if (it != tower_ids_.end()) return it->second;
     const int32_t id = next_tower_id_++;
-    tower_ids_.emplace(base, id);
+    tower_ids_.emplace(uid, id);
     return id;
   }
 
   std::unique_ptr<HostExpertSlotStore> store_;
   std::unique_ptr<ExpertSlotCache> cache_;
   std::unique_ptr<ExpertStreamer> streamer_;
-  std::unordered_map<const uint8_t*, int32_t> tower_ids_;
+  std::unordered_map<uint64_t, int32_t> tower_ids_;
   int32_t next_tower_id_ = 0;
   int64_t exhausted_ = 0;
+  int64_t advised_ = 0;
+  int64_t stats_every_ = 16;
+};
+
+// The decode step boundary, as a scope guard.
+//
+// WHY THIS EXISTS AT ALL. `ExpertSlotCache::Acquire` marks every entry it
+// serves `protected_this_step`, because evicting a slot the current step is
+// about to read would hand the kernel bytes that are being overwritten. ONLY
+// EndStep clears that mark. Without a caller, the protection is permanent: once
+// the cache fills, `ColdestEvictable` finds every entry protected and returns
+// -1, `Acquire` returns slot -1, `Slice` returns nullptr, and every later slice
+// falls back to the mmap path. The lane switches itself off and says nothing,
+// the step clock never advances, and so the hotness decay, the LFU score, the
+// LRU tiebreak and eviction never run in production at all. On the live
+// configuration (8000 slots, ~2790 slices per token) that happens partway
+// through the third token.
+//
+// A guard rather than a call at the end of the body: ForwardLayers has two
+// returns and can throw, and a step that ended by throwing still ended.
+struct Qwen35ExpertStreamStep {
+  Qwen35ExpertStreamStep() = default;
+  ~Qwen35ExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }
+  Qwen35ExpertStreamStep(const Qwen35ExpertStreamStep&) = delete;
+  Qwen35ExpertStreamStep& operator=(const Qwen35ExpertStreamStep&) = delete;
 };
 
 // The expert-slice seam. Identical to KqResidentSlice except that, when
@@ -5234,9 +5447,9 @@ Tensor KqExpertSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
   if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
     if (Qwen35ExpertStream* st = Qwen35ExpertStream::Get(bytes)) {
       const uint8_t* base = w.bytes.data();
-      if (uint8_t* slot = st->Slice(base, expert,
+      if (uint8_t* slot = st->Slice(base, w.TowerUid(), expert,
                                     static_cast<size_t>(row_off) * row_bytes,
-                                    bytes)) {
+                                    bytes, w.mmap_fd, w.mmap_file_offset)) {
         Tensor wt = ResidentWeight(d, w);  // inherit dtype/device/repack markers
         wt.data = static_cast<void*>(slot);
         wt.rank = 2;
@@ -5256,10 +5469,15 @@ std::vector<float> MatmulF32Slice(Dev d, const std::vector<uint16_t>& x, int64_t
                                   int64_t row_off, int64_t expert) {
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
   DBuf dout(d, DType::kF32, {M, N});
-  // expert >= 0 marks a routed-expert slice, which is the only thing the
-  // streaming slot cache serves; everything else keeps the tower view.
-  Tensor dw = expert >= 0 ? KqExpertSlice(d, w, N, K, row_off, expert)
-                          : KqResidentSlice(d, w, N, K, row_off);
+  // `expert` is a routed-expert index and is never negative: every call comes
+  // from ExpertMlpKq's `for (e = 0; e < E; ++e)`. An earlier revision branched
+  // to KqResidentSlice on `expert < 0`, which no caller could reach; the check
+  // now states the precondition instead of pretending to handle its negation,
+  // because an unreachable fallback is a place for a defect to hide rather than
+  // a safety net. KqExpertSlice itself falls back to the tower view whenever
+  // streaming is off or the cache cannot serve the slice.
+  VT_CHECK(expert >= 0, "qwen3_5: MatmulF32Slice needs a routed expert index");
+  Tensor dw = KqExpertSlice(d, w, N, K, row_off, expert);
   vt::MatmulBT(d.q, dout.t(), dx.t(), dw);
   std::vector<float> out(static_cast<size_t>(M) * N);
   dout.Download(d, out.data());
@@ -5271,8 +5489,9 @@ std::vector<uint16_t> MatmulBf16Slice(Dev d, const std::vector<uint16_t>& x, int
                                       int64_t row_off, int64_t expert) {
   DBuf dx(d, DType::kBF16, {M, K}, x.data());
   DBuf dout(d, DType::kBF16, {M, N});
-  Tensor dw = expert >= 0 ? KqExpertSlice(d, w, N, K, row_off, expert)
-                          : KqResidentSlice(d, w, N, K, row_off);
+  // See MatmulF32Slice: `expert` is always a real routed index here.
+  VT_CHECK(expert >= 0, "qwen3_5: MatmulBf16Slice needs a routed expert index");
+  Tensor dw = KqExpertSlice(d, w, N, K, row_off, expert);
   vt::MatmulBT(d.q, dout.t(), dx.t(), dw);
   std::vector<uint16_t> out(static_cast<size_t>(M) * N);
   dout.Download(d, out.data());
@@ -5289,6 +5508,15 @@ std::vector<uint16_t> ExpertMlpKq(Dev d, const OwnedTensor& gate_kq,
                                   const OwnedTensor& up_kq, const OwnedTensor& down_kq,
                                   const std::vector<uint16_t>& x, int64_t e, int64_t n,
                                   int64_t H, int64_t I) {
+  // Declare the LARGEST of the three slices before taking any of them, so the
+  // slot store is sized once and correctly. gate/up and down differ in size
+  // whenever a UD (dynamic) quant keeps down_proj at a higher precision, and
+  // sizing from whichever slice arrived first would then refuse the first down
+  // slice mid-decode. Inert unless streaming was asked for.
+  Qwen35ExpertStream::Reserve(
+      std::max({static_cast<size_t>(I) * vt::RowSizeBytes(gate_kq.dtype, H),
+                static_cast<size_t>(I) * vt::RowSizeBytes(up_kq.dtype, H),
+                static_cast<size_t>(H) * vt::RowSizeBytes(down_kq.dtype, I)}));
   std::vector<float> hg = MatmulF32Slice(d, x, n, I, H, gate_kq, e * I, e);  // [n,I]
   std::vector<float> hu = MatmulF32Slice(d, x, n, I, H, up_kq, e * I, e);    // [n,I]
   std::vector<uint16_t> act(static_cast<size_t>(n) * I);
@@ -6979,6 +7207,30 @@ MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
   return r;
 }
 
+// ENG-EXPERT-STREAM (#912): the streamed-expert lane seen from outside this TU.
+// See qwen3_5_internal.h for why a benchmark and a gate both need to reach it.
+detail::ExpertStreamStats detail::ExpertStreamSnapshot() {
+  ExpertStreamStats s;
+  const Qwen35ExpertStream* st = Qwen35ExpertStream::Existing();
+  if (st == nullptr) return s;  // never requested, or requested and never used
+  s.active = true;
+  s.steps = st->cache().steps();
+  s.hits = st->cache().hits();
+  s.misses = st->cache().misses();
+  s.evictions = st->cache().evictions();
+  s.fills = st->streamer().fills();
+  s.bytes_filled = st->streamer().bytes_filled();
+  s.exhausted = st->exhausted();
+  s.advised = st->advised();
+  return s;
+}
+
+void detail::ExpertStreamSetForceFallback(bool on) {
+  Qwen35ExpertStream::SetForceFallback(on);
+}
+
+void detail::EndExpertStreamStep() { Qwen35ExpertStream::EndStepIfActive(); }
+
 // ENG-ASYNC-SCHED W4: overwrite the REAL prefix of a freshly uploaded input-id
 // buffer with the device-resident ids the async runner's combine produced.
 //
@@ -7106,6 +7358,12 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
                           const std::vector<int32_t>* aux_layer_ids = nullptr,
                           const Tensor* aux_out = nullptr,
                           StepDevInputs* persistent_sdi = nullptr) {
+  // ONE decode step. Every MoE entry point funnels through here exactly once
+  // per forward — ForwardBody, the VL path, and the graph driver's eager
+  // fallback — so this is the step boundary the expert slot cache is defined
+  // against, and it is neither once per layer nor once per expert. Inert unless
+  // a store exists, which needs both VT_MOE_EXPERT_STREAM and a slice taken.
+  const Qwen35ExpertStreamStep expert_stream_step;
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
   const float eps = static_cast<float>(config.rms_norm_eps);

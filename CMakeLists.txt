@@ -873,6 +873,12 @@ add_library(vllm STATIC
   # truncate-or-pad conform, and the frame-directory source. Its own TU for the
   # same reason the two above are: ltx2_video.cpp is a concurrent-edit lock.
   src/vllm/model_executor/models/ltx2_retake.cpp
+  # LTX-2.5 (ROW LTX25-T2A-ONE-STAGE, issue #1005): text-to-audio — the
+  # audio-only pipeline and its guided denoiser. Its own TU for the same reason
+  # the two above are, plus one this row adds: it is the only LTX pipeline that
+  # runs the DiT with `video = nullptr`, and keeping that call in one file is
+  # what makes "does anything else pass a video stream" a readable question.
+  src/vllm/model_executor/models/ltx2_t2a.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L6): the quantized loaders — the
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
   # load-time device staging GB10's ATS penalty makes the default.
@@ -1596,6 +1602,12 @@ if(VLLM_CPP_CUDA)
     src/vt/cuda/cuda_dropin.cu
     src/vt/cuda/cuda_matmul.cu
     src/vt/cuda/cuda_quant_dot.cu
+    # UNCONDITIONAL ON PURPOSE (issue #960). The static per-tensor fp8 activation
+    # quant has no cutlass dependency; it lived in the cutlass-fp8 TU below and so
+    # went unregistered for kCUDA on every arch outside VT_CUTLASS_FP8_ARCHS,
+    # where the resolver then ran the portable CPU tier over device pointers and
+    # segfaulted. scripts/check-cuda-op-arch-gate.py fails if it leaves this list.
+    src/vt/cuda/cuda_quant_fp8.cu
     src/vt/cuda/cuda_matmul_nvfp4.cu
     src/vt/cuda/cuda_ops.cu
     src/vt/cuda/cuda_gdn.cu

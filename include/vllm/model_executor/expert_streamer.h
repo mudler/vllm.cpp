@@ -44,6 +44,11 @@ class ExpertSlotStore {
   // Copy `bytes` from `src` into `slot`. Implementations may assume the
   // streamer has already validated the slot index and the size.
   virtual void WriteSlot(int32_t slot, const uint8_t* src, size_t bytes) = 0;
+
+  // The slot's writable bytes, for a filler that produces them in place (a
+  // pread writes straight here, so the data never passes through a staging
+  // buffer). Must return at least `slot_bytes()` writable bytes or throw.
+  virtual uint8_t* SlotForWrite(int32_t slot) = 0;
 };
 
 class ExpertStreamer {
@@ -80,6 +85,17 @@ class ExpertStreamer {
   //
   // `src` must stay valid for the call; the slot owns a copy afterwards.
   Result EnsureSpan(const ExpertKey& key, const uint8_t* src, size_t bytes);
+
+  // Fill from the FILE rather than from a mapping. This is the form the design
+  // always specified ("reads are plain pread(2) against the model fd") and the
+  // one that actually changes the I/O: EnsureSpan's memcpy still traps every
+  // 4 KiB page of its source on the way, so it inherits the fault path the
+  // whole lane exists to bypass.
+  //
+  // Falls back to nothing: a short read or a bad descriptor throws, because a
+  // partially filled slot decodes to garbage silently.
+  Result EnsureFile(const ExpertKey& key, int fd, size_t file_offset,
+                    size_t bytes);
 
   void EndStep() { cache_.EndStep(); }
 

@@ -48,6 +48,16 @@ class RecordingStore final : public ExpertSlotStore {
     last_slot = slot;
   }
 
+  // The pread filler writes in place rather than handing over a buffer, so the
+  // double has to expose the same destination WriteSlot would have copied into.
+  uint8_t* SlotForWrite(int32_t slot) override {
+    REQUIRE(slot >= 0);
+    REQUIRE(slot < slots_);
+    ++writes;
+    last_slot = slot;
+    return mem_.data() + static_cast<size_t>(slot) * bytes_;
+  }
+
   const uint8_t* slot(int32_t s) const { return mem_.data() + static_cast<size_t>(s) * bytes_; }
 
   int writes = 0;

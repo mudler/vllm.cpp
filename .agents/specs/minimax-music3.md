@@ -1404,6 +1404,10 @@ position)` and therefore partitions by output channel with its `(ic, t, k)` visi
 order intact. Neither is in this change, because a bit-identity claim needs its
 own measurement and this change's evidence budget went to the device seam.
 
+**That last paragraph is now DONE — §12.** It landed with its own measurement and
+its own gate, and it took `vocoder1d::Conv1d` with it. The two device rows above
+are still owed and unchanged.
+
 ### 11.5 Evidence — Jetson Thor, sm_110, in the container
 
 Host `kairos-4db2` (`192.168.68.23`), Jetson Thor, **sm_110**, aarch64, 14 cores,
@@ -1531,3 +1535,231 @@ chain. Had it not been read, the CPU arm's numbers would have been recorded as
 the device arm's. Rebuilt as one `std::string` and it prints
 `ran on 'cpu' (VLLM_CPP_MUSIC3_DEVICE=unset)`. An instrument reports on the state
 it was GIVEN, and a banner nobody reads is not a report.
+---
+
+## 12. The CPU arm gets its cores back (#672) — row-wise parallelisation, bit-identical
+
+§11.4 named this as owed and said why it was not in the device arm's change: *"a
+bit-identity claim needs its own measurement"*. This is that change and that
+measurement. It is **arm-independent** — it makes the CPU path faster on every
+box, with or without an accelerator, and it is the only one of §11.4's three
+items that helps a user who has no GPU at all.
+
+### 12.1 What moved, and the argument that no number can
+
+Three host-reference kernels now partition their **output elements** across the
+one threadpool `vt::cpu` already owns (`src/vt/cpu/cpu_threadpool.h`, the 1:1
+ggml port). Nothing else changed: no op was rerouted, no dtype narrowed, no
+tolerance touched.
+
+| kernel | profile share | how it partitions |
+|---|---|---|
+| `vocoder1d::ConvTranspose1d` | **88.5 % of the acoustic half** | by OUTPUT CHANNEL |
+| `vocoder1d::Conv1d` | 7.7 % of the acoustic half | by OUTPUT CHANNEL |
+| `music3::LinearNoBias` | **42-57 % of the AR half** | by flat (row, out) OUTPUT ELEMENT |
+
+**Why no gated number can move, stated as a property rather than a hope.**
+`LinearNoBias` and `Conv1d` were already indexed by their output: each output
+element owned one sequential `double` accumulator, and it still does, walked in
+the same ascending order. Partitioning those loops cannot reassociate a sum it
+does not touch.
+
+`ConvTranspose1d` is the one that needed an argument, because it was a SCATTER:
+the old loop ran `ic` outermost and wrote into every destination channel. The
+pivot to `(dst_c, ic, t, k)` is safe because **a destination accumulator is only
+ever reached from its own group's inputs**, so for any one accumulator the
+sequence of additions is unchanged — `ic` ascending, then `t` ascending, then
+the single `k` with `t*stride + k == p`. The `value == 0.0` skip is a property of
+`(ic, t)` and moves with them.
+
+`LinearNoBias` is deliberately compiled `-ffp-contract=off` so W2/W3 could gate
+its reduction order against torch. That pinning is untouched, and so is the
+order.
+
+**A size guard, and it is a scheduling decision only.** `ParallelForRows` kicks
+the pool for any `nr > 1`, and this row's AR half already spends ~25 % of its
+wall clock inside `Threadpool::Barrier`; handing it more sub-microsecond
+dispatches would make it slower. Below `host_parallel::kMinParallelWork` (2^16
+scalar multiply-accumulates) the body runs inline on the caller — the same body
+over the same range.
+
+### 12.2 The gate, and the finding that a first draft of it would have missed
+
+`tests/vllm/models/test_host_parallel.cpp` compares each shipped kernel against
+a **VERBATIM copy of its own pre-parallel loop**, carried in the test file, at
+five thread counts (1, 2, 3, 7, 13), with **bitwise** equality. The oracle is
+the old code rather than the new code at another thread count: comparing the
+shipped function to itself would prove determinism, and a consistently
+reassociated sum is still consistent.
+
+**THE FINDING: for these kernels a `double` accumulator stored through a `float`
+CANNOT SEE a reduction-order change at all, so the obvious version of this gate
+is green under the exact defect it exists to catch.** Mutating `LinearNoBias`
+into two interleaved accumulators — the textbook reassociation — left every
+assertion of the ordinary shapes GREEN, and so did reversing `Conv1d`'s input-
+channel walk. The reason is arithmetic, not luck: a reassociated sum of
+well-scaled terms differs by ~2^-53 relative while the `float` store rounds at
+2^-24, so the narrowing swallows it. (This is the same class as the recorded
+`bf16 store absorbs reduction-order defects` finding, one dtype up.)
+
+What restores the teeth is engineering the cancellation the wide accumulator
+otherwise hides. Two cases do it, and both were added because a mutation stayed
+green:
+
+* `LinearNoBias`: taps 0 and 1 carry `+2^30` and `-2^30`, so the serial order
+  cancels them immediately and accumulates the remainder exactly, while any
+  split carries `2^30` through the remainder and quantises it.
+* `Conv1d`: the bias is `-2^40` and input channel 0 is all ones against a
+  `+2^40` tap, so the serial `(ic, k)` walk cancels on its FIRST tap.
+
+**And a second leg, because bit-identity alone is satisfied by never
+parallelising at all.** The guard case asserts that above the threshold the body
+actually ran on more than one thread — deterministic, not a race that usually
+wins, because `ParallelForRows` seeds worker `ith` with chunk `ith` and the grid
+is 4x-oversubscribed. Hard-wiring the helper to run inline leaves every
+bit-identity assertion green and reds exactly that case.
+
+**Mutations: 8 applied, 7 RED, 1 unmoved and explained.**
+
+| # | mutation | result |
+|---|---|---|
+| M1 | `LinearNoBias` dot split into two interleaved accumulators | **RED** (5) — only after the cancellation case existed; see above |
+| M1b | `LinearNoBias` drops the first term of every dot | **RED** (15) |
+| M2 | `ConvTranspose1d` walks its group's `ic` descending | **RED** (5) |
+| M3 | `ConvTranspose1d` walks `k` descending | **GREEN, correctly** — those taps land in DIFFERENT accumulators, so the order between them is not a reduction order. Recorded rather than counted, because it says what the gate does not claim |
+| M4 | the size guard hard-wired to run inline | **RED** (4) on the thread-distinctness leg only, which is why that leg exists |
+| M5 | the guard drops the last row of every range | **RED** (114) |
+| M6 | `ConvTranspose1d`'s reused per-thread scratch not cleared between channels | **RED** (24) |
+| M7 | `Conv1d` walks `ic` descending | **RED** (5) — again only after its cancellation case |
+
+M4 was **invalid as first written**: neutering the guard by deleting its use of
+`work_per_row` tripped `-Werror=unused-parameter`, so the compiler refused it and
+the gate never got to speak. A build failure is not a red gate; it was re-run in a
+form that keeps the parameter used. That is the same trap §9.4 recorded, hit
+again.
+
+Sources restored and verified `sha256`-identical after every mutation.
+
+### 12.3 The CPU path is BIT-IDENTICAL, proved end to end on the real checkpoint
+
+The unit gate above proves each kernel against its own pre-parallel loop. What
+proves the *composition* — five stages, three touched kernels, a 28.5 GB
+checkpoint and 3072 stereo samples of actual music — is that the two binaries
+write **the same file**.
+
+`minimax-music3-gen`, x86-64, 20 cores, `--duration 0.1 --steps 2 --seed 7
+--device 0`, identical lyrics and description, checkpoint
+`/mnt/nas_share/checkpoints/minimax-music3`:
+
+| binary | output | sha256 |
+|---|---|---|
+| `origin/main` `d9441ef3` | `base-0.1.wav`, 12 332 bytes | `12452152876072b280a7a2551dd182731a8475decc625758de28c345f194de9d` |
+| this branch | `new-0.1.wav`, 12 332 bytes | `12452152876072b280a7a2551dd182731a8475decc625758de28c345f194de9d` |
+
+`cmp` reports no difference. Both runs report `0.070 s, 44100 Hz, 2 channel(s),
+3072 samples/channel, RMS 0.00265, peak 0.00474`.
+
+**That is the claim this change owes, and it is the strong form of it.** Not "the
+tolerances still pass" and not "the RMS agrees to five digits" — the same bytes.
+Every gated Music3 number was taken on this path, so a path that emits identical
+bytes cannot have moved one.
+
+### 12.4 Speed — a KERNEL A/B, because the e2e pair was spoiled twice
+
+**The whole vocoder convolution chain runs 10.7x faster on a 20-core box, and it
+emits the same bytes.** That number is a KERNEL measurement, said so plainly,
+and it is not offered as an end-to-end speedup.
+
+**Why not the e2e pair.** It was attempted first and both attempts are VOID, and
+naming which runs were spoiled is what makes the replacement honest. The 27 GB
+checkpoint is mmap'd from a CIFS mount, so the FIRST run of a series pays a
+fault-in no later run pays: `--duration 0.1` gave `d9441ef3` 369.5 s COLD
+against this tree 311.8 s warm, which is a statement about the page cache as
+much as about the kernels. The `--duration 0.4` pair (786.2 s against 524.0 s)
+was taken while another session's full `ctest` sat on the same 20 cores at a
+1-minute load average of **76.6**. A contention-guarded re-run is queued.
+
+**What replaces it, and why the statistic is defensible.** A kernel loop is
+short enough to repeat, so the MINIMUM over repetitions is available — and a
+minimum is the least-disturbed sample rather than an average of somebody else's
+contention. Five interleaved rounds (base, new, base, new, ...), the same driver
+source compiled twice against the two `libvllm.a` builds, at the vocoder's REAL
+geometry (`decoder_hidden_dim` 1536, ratios `[8,8,4,2]`, `kernel = 2*stride`,
+`padding = ceil(stride/2)`, exactly as `minimax_music3_acoustic.cpp:738-744`
+builds them) and the depth decoder's real 4096 -> 6144 projection.
+
+| kernel | shape | `d9441ef3` | this branch | speedup |
+|---|---|---|---|---|
+| `ConvTranspose1d` stage 0 | 1536->768, L=128, stride 8 | 0.3812 s | 0.1935 s | 1.97x |
+| `ConvTranspose1d` stage 1 | 768->384, L=1024, stride 8 | 0.7707 s | 0.4023 s | 1.92x |
+| `ConvTranspose1d` stage 2 | 384->192, L=8192, stride 4 | 8.4197 s | 0.4239 s | **19.86x** |
+| `ConvTranspose1d` stage 3 | 192->96, L=32768, stride 2 | 3.7413 s | 0.2342 s | **15.98x** |
+| `Conv1d` k=7 | 1536->1536, L=134 | 1.0334 s | 0.0859 s | **12.03x** |
+| `LinearNoBias` | 4096->6144, 16 rows, bf16 | 0.2045 s | 0.0188 s | **10.88x** |
+| **the convolution chain** | the five rows above it | **13.36 s** | **1.25 s** | **10.7x** |
+
+`uptime` 3.36 before the series and 12.64 after; the noisy rounds are visibly
+higher on BOTH arms, which is what the minimum exists to discard.
+
+**And the bit-identity holds AT THESE SHAPES**, which is a third leg under the
+correctness claim and the one taken where the vocoder actually calls. Each
+kernel printed an FNV-1a fingerprint of its raw output bytes and all six matched
+between the arms in every round: `8117c200e328c320`, `f85b530c211840c8`,
+`7ec0b57567ae1d1b`, `aebd8d61c6c7539e`, `9e23c0016f1b1cf3`, `be2376b0ebe5177e`.
+§12.2 gates small shapes against the serial loop, §12.3 gates the composition,
+and this gates production geometry.
+
+#### The two stages that are only ~2x, recorded because it is a finding
+
+Stages 0 and 1 gain 1.9x on 20 cores while stages 2 and 3 gain 16-20x, and the
+parallelism is identical in all four. What differs is which array each version
+streams. The old scatter's accumulator is `out_channels * full` doubles — **50 MB**
+at stage 2 — written in an order that touches every destination channel per
+input; the pivot gives each worker a scratch ONE channel wide (262 KB at stage
+2, L2-resident), so stages 2 and 3 collect a locality win on top of the thread
+win. Stages 0 and 1 do not: their accumulator was already small (6.4 MB) and
+their WEIGHTS are large (75 MB at stage 0) and are now read with a stride of
+`out_per_group * kernel` floats instead of contiguously.
+
+**The pivot trades weight locality for accumulator locality.** Named rather than
+left implicit: a weight pre-transpose, or blocking the `ic` loop, would recover
+stage 0/1's contiguity without touching a reduction order, and it is worth its
+own measurement. It is not in this change.
+
+### 12.5 The e2e pair — still PENDING, and said so rather than fudged
+
+The wall-clock pair this change owes is **not reported yet**, because the two
+runs that exist are not comparable and pretending otherwise would be worse than
+waiting.
+
+| run | wall (`gen_s`) | page cache |
+|---|---|---|
+| `d9441ef3`, `--duration 0.1` | 369.5 s | **COLD** — first touch of a 27 GB checkpoint over CIFS |
+| this branch, `--duration 0.1` | 311.8 s | warm |
+
+The checkpoint is mmap'd from a CIFS mount, so the first run of a series pays a
+fault-in that no later run pays. The ratio those two numbers form is therefore
+about the page cache as much as about the kernels, and it is recorded here as a
+confound rather than as a result. A second series then had another session's
+full `ctest` land on the box mid-run (1-minute load average 76.6 on 20 cores),
+which voided the `--duration 0.4` pair as well.
+
+The re-measurement is guarded: it waits for two consecutive quiet samples with
+no foreign compiler or test binary running before each arm, alternates the arms,
+takes two samples of each, and records `uptime` on both sides. Until it lands,
+the honest statement is that **the e2e axis is PENDING, the KERNEL axis is
+MEASURED at 10.7x on the convolution chain (§12.4), and the correctness axis is
+CLOSED (§12.3)**.
+
+**And the e2e axis will not be a large number even when it lands**, which is
+worth saying in advance so the result is not read as a disappointment. Five of
+six stages are host loops and only three of their kernels moved; the 8.6B
+language model's decode is elsewhere, the 2.4B fp32 DiT is untouched, and a
+short request is dominated by faulting in 27 GB of weights. The kernel A/B is
+the number that isolates what this change did; the e2e pair will be the number
+that says how much of a whole request that was, and the two answer different
+questions.
+
+What is *not* pending: the parallelism is real and asserted, not hoped for. The
+gate's thread-distinctness leg fails if the body runs on one thread, and
+`VLLM_CPP_CPU_THREADS` now governs these three kernels.

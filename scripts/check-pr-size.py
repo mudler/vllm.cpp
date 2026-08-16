@@ -110,6 +110,14 @@ PROCEDURE_FILES = frozenset(
         "CLAUDE.md",
         ".agents/workflow.md",
         ".agents/verification.md",
+        # The "nothing lands dead" task guide (#888, `8f49ac3be`). Never
+        # classified, and classify_path FAILS CLOSED, so pr-size refused every
+        # PR that touched it and this file's own suite has been red on main ever
+        # since -- silently, because that suite runs in no CI job and only the
+        # next checker change loads it (#989). Third instance of the same class
+        # after #856 and #668; listed explicitly rather than letting .agents/
+        # become a blanket exemption.
+        ".agents/reachability.md",
         ".agents/porting.md",
         # The per-model coverage checklist that porting.md points at (#318). Same
         # procedure class as its sibling guides; listed explicitly rather than
@@ -309,6 +317,11 @@ CREATION_MUTATIONS = {
     # reduced one.
     "scripts/check-container-matrix.py": DISABLED_CREATION_CHECKER,
     "scripts/check-container-workflow.py": DISABLED_CREATION_CHECKER,
+    # 2026-08-16: the CUDA arch-gate registration guard (#960). Created in the
+    # same PR, so there is no BASE version to mutate; its own suite loads the
+    # checker as a module and calls into it, so the disabled stub fails at import
+    # rather than quietly passing a reduced set of cases.
+    "scripts/check-cuda-op-arch-gate.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120

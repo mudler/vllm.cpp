@@ -610,6 +610,32 @@ bool GgufFile::OwnsSpan(const uint8_t* data, size_t nbytes) const {
   return false;
 }
 
+GgufFile::SpanSource GgufFile::SourceOfSpan(const uint8_t* data,
+                                            size_t nbytes) const {
+  SpanSource out;
+#if !defined(_WIN32)
+  const auto try_map = [&](const GgufMapping* m) {
+    if (m == nullptr || m->file == nullptr) return false;
+    const uint8_t* base = m->file->data();
+    const size_t size = m->file->size();
+    if (base == nullptr || data < base) return false;
+    const size_t off = static_cast<size_t>(data - base);
+    if (nbytes > size || off > size - nbytes) return false;
+    out.fd = m->file->fd();
+    out.offset = off;
+    return out.fd >= 0;
+  };
+  if (try_map(map_.get())) return out;
+  if (map_ != nullptr)
+    for (const auto& s : map_->siblings)
+      if (try_map(s.get())) return out;
+#else
+  (void)data;
+  (void)nbytes;
+#endif
+  return out;
+}
+
 void GgufFile::DropSpanResidency(const uint8_t* data, size_t nbytes) const {
 #if defined(__unix__)
   if (!release_expanded_ || !OwnsSpan(data, nbytes)) return;

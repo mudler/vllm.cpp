@@ -135,6 +135,14 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
            "qwen3_5 gguf: keep-quant mmap span is not block-aligned for " +
                tensor.name);
   o.bytes = OwnedBytes::Borrow(src, bytes, mmap_src->Mapping());
+  // Remember WHERE these bytes live, so a later consumer can pread them instead
+  // of faulting them through the mapping. Two fields and one lookup at load;
+  // saves a page trap per 4 KiB at decode.
+  {
+    const GgufFile::SpanSource ss = mmap_src->SourceOfSpan(src, bytes);
+    o.mmap_fd = ss.fd;
+    o.mmap_file_offset = ss.offset;
+  }
   PrefaultBorrowedSpan(src, bytes);  // fault at load, not in the timed prefill
   return o;
 }
@@ -191,6 +199,14 @@ OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
            "qwen3_5 gguf: keep-f16 mmap span is not 2-byte aligned for " +
                tensor.name);
   o.bytes = OwnedBytes::Borrow(src, bytes, mmap_src->Mapping());
+  // Remember WHERE these bytes live, so a later consumer can pread them instead
+  // of faulting them through the mapping. Two fields and one lookup at load;
+  // saves a page trap per 4 KiB at decode.
+  {
+    const GgufFile::SpanSource ss = mmap_src->SourceOfSpan(src, bytes);
+    o.mmap_fd = ss.fd;
+    o.mmap_file_offset = ss.offset;
+  }
   PrefaultBorrowedSpan(src, bytes);  // fault at load, not in the timed prefill
   return o;
 }

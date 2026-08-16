@@ -3,6 +3,7 @@
 // (.agents/specs/qwen36-forward-notes.md §6).
 #include "vllm/model_executor/models/qwen3_5_weights.h"
 
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -34,6 +35,19 @@ int64_t OwnedTensor::Numel() const {
   return n;
 }
 
+uint64_t OwnedTensor::TowerUid() const {
+  // See the field comment: an ADDRESS is not an identity for a cache that
+  // outlives the model, because the allocator reuses addresses. A counter is,
+  // because it never goes backwards.
+  static std::atomic<uint64_t> next{1};
+  const uint8_t* p = bytes.data();
+  if (tower_uid == 0 || tower_uid_for != p) {
+    tower_uid = next.fetch_add(1, std::memory_order_relaxed);
+    tower_uid_for = p;
+  }
+  return tower_uid;
+}
+
 void OwnedTensor::ReleaseHost() const {
   // Free the host mirror once the device-resident copy is authoritative
   // (residency_policy().release_host_weights_after_upload; BACKEND-PLATFORM
@@ -49,6 +63,13 @@ void OwnedTensor::ReleaseHost() const {
     self.bytes.Reset();
     self.mmap_src = nullptr;  // nothing borrows the mapping through this tensor now
     self.mmap_src_bytes = 0;
+    // The FILE descriptor goes with the mapping. It describes where these host
+    // bytes came from, and there are no host bytes now. Left set, it outlives
+    // its own subject: `bytes.data()` is null, so an expert-stream slice would
+    // pread the recorded offset (which belongs to a tensor nothing is reading
+    // any more) and would key every released tower on TowerId(nullptr) == 0.
+    self.mmap_fd = -1;
+    self.mmap_file_offset = 0;
     self.host_released = true;
     return;
   }
@@ -148,6 +169,11 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
                                     nb, std::move(keep));
     self.mmap_src = nullptr;
     self.mmap_src_bytes = 0;
+    // `bytes` now points at DEVICE memory, so the file offset no longer
+    // describes it. See the note in ReleaseHost: a descriptor that outlives its
+    // mapping reads as a valid source and is not one.
+    self.mmap_fd = -1;
+    self.mmap_file_offset = 0;
     return;
   }
   if (!backend.DeviceMemoryIsHostAddressable()) return;

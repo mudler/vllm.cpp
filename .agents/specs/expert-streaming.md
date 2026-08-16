@@ -1035,6 +1035,169 @@ at all about the other seven tables. The seal now exists
 (`src/vt/cuda/cuda_iq_table_seal.h` plus the gate case), it covers all eight
 device codebooks byte for byte, and both false comments were corrected.
 
+## Readahead attempt: landed, UNMEASURED, blocked on host contention
+
+16 August 2026. W4's decode result showed that filling a slot by memcpy from the
+mapping keeps the fault path: sequential order, but still 608 four-KiB traps per
+2.49 MiB slice. The spec's answer is `pread(2)` from the fd, which needs an fd
+accessor on `ReadOnlyFileMapping` and a path from the model's `OwnedTensor` back
+to its file offset, because `OwnedBytes::owner` is a type-erased
+`shared_ptr<const void>`. That is a real plumbing change.
+
+`madvise(MADV_WILLNEED)` attacks the same root cause in three lines: it hands
+the whole slice to the kernel's readahead in ONE call instead of trapping page
+by page, which is the same lever `PrefaultBorrowedSpan` already uses at load,
+applied per slice at decode. It is advisory and read-only, so it cannot change a
+byte.
+
+**It is not measured, and this note exists so nobody assumes otherwise.** Three
+consecutive attempts on dgx.casa were killed by the kernel OOM at 48.6 GiB anon,
+because another session's `ltx2-gen` holds 32.6 GiB and this model needs about
+62 GiB on a 119 GiB box. Further attempts were stopped rather than retried: the
+OOM killer picks the largest consumer, and repeatedly loading a 62 GiB model
+next to someone else's 33 GiB job risks taking THEIR work down.
+
+So the readahead lever is landed behind the default-off streaming flag with its
+reasoning stated, and its number is owed. Re-run when dgx is quiet. If it does
+NOT move decode, that is the evidence that the fault path itself must be
+bypassed and the `pread` plumbing is necessary rather than merely preferable.
+
+One supporting piece IS tested. `ExpertSlotCache::Contains` is a pure residency
+probe so the prefetch can ask "will this be a fill?" without scoring the entry.
+If asking scored, the probe would decide the eviction order it was only meant to
+observe, and the hotness policy would be measuring itself. The test probes one
+entry fifty times and asserts the OTHER one is still the survivor.
+
+An operational note that cost a diagnosis: the first attempt ran with
+`docker --rm`, so when it died the logs died with it and the failure was
+unreadable. A container that erases its own evidence on failure is not a usable
+instrument for a run that might fail.
+
+## The wiring review (#912 F1-F11): what was measured on a dead cache
+
+16 August 2026. An independent review of the W4 wiring returned FAIL on eleven
+findings. Four of them were the same defect at different depths, and the first
+one invalidates the decode number recorded two sections above.
+
+**F1. `Qwen35ExpertStream::EndStep()` had no caller.** `grep -rn EndStep src
+include` found definitions only, and deleting the definition still compiled.
+`ExpertSlotCache::Acquire` marks every entry it serves `protected_this_step`,
+and ONLY `EndStep` clears that mark, so protection was permanent: once the cache
+filled, `ColdestEvictable` found nothing evictable and returned -1, `Acquire`
+returned slot -1, `Slice` returned nullptr, and `KqExpertSlice` fell back to the
+mmap path. The step clock never advanced, so the hotness decay, the LFU score,
+the LRU tiebreak and eviction never ran in production at all. A reviewer probe
+against unmodified sources: 8 slots, 40 distinct slices asked, **8 served and 32
+REFUSED**, 0 evictions, 0 steps; with `EndStep()` called, 40 served, 0 refused,
+32 evictions, 10 steps.
+
+**THE ARITHMETIC MATCHES THE PUBLISHED RUN EXACTLY, and that is the point.** The
+run above used 8000 slots against 2790 slices per token, so the cache had
+8000/2790 = **2.87 tokens** of capacity before every slot was permanently
+protected. Prefill is ONE forward and therefore one step, and its working set fit
+inside that budget, which is why TTFT really did improve 4.5x. Decode is one
+forward per token, and from partway through token 3 onward every slice was
+refused and served from the mapping instead. **The "steady decode: unchanged"
+row was measured on a lane that had switched itself off**, and it is VOID.
+
+The cause the section above assigned to that result -- that `EnsureSpan` memcpy's
+from the mapping and so inherits the fault path -- is a true statement about the
+code and was **not established by that measurement**. It remains a plausible
+bound and it is now unmeasured rather than measured. Both it and the readahead
+lever are owed a re-run on a live cache.
+
+Nothing in the run could have shown this, and that is the second finding worth
+recording. The process printed `[expert-stream] ON ...` once at startup and
+nothing afterwards, so a cache that died in token 3 looked exactly like one that
+worked for 200 tokens. There is now one stderr line carrying `steps`, `hits`,
+`misses`, `evictions`, `fills`, `bytes`, `exhausted` and `advised`; `steps == 0`
+and `exhausted > 0` are precisely the F1 signature and both are wrong at a
+glance.
+
+**F2. A failed fill left the key resident over a half-written slot.**
+`EnsureFile` has to acquire before it preads, because the read needs a
+destination. A throw then unwound past a cache entry that claimed residency over
+`done` correct bytes followed by the tail of whatever the slot held before, and
+nothing downstream reads an exception as data: the next acquisition of that key
+was an ordinary HIT, a hit moves no bytes by contract, and the GEMM multiplied
+half of one expert spliced onto half of another. The commit that added the pread
+claimed the opposite ("a read that hits EOF THROWS rather than leaving a
+partially filled slot"). `ExpertSlotCache::Invalidate` now undoes the
+acquisition and returns the slot to the budget.
+
+**F3. Nothing reached any of it from a gate.** `Qwen35ExpertStream`,
+`KqExpertSlice`, `VT_MOE_EXPERT_STREAM`, `SourceOfSpan` and `fd()` appeared
+nowhere under `tests/`; replacing the production call site with `nullptr` and
+forcing streaming unconditionally ON both left the full gate green. Every test
+this row had constructed the cache, the store and the streamer by hand, which
+proves the classes work and never proves anything reaches them.
+
+**And the gate that closed F3 immediately found something nobody was looking
+for, which is the strongest argument in this section for writing it.** Its
+byte-identity case failed on all 160 logits while each arm was internally
+deterministic, so the streamed and unstreamed arms genuinely disagreed.
+`Qwen35ExpertStream` is a process-lifetime singleton and keyed its cache on the
+tower's host buffer ADDRESS. Its comment stated the premise and drew the wrong
+conclusion: a tower's base pointer IS stable for the model's life, but the CACHE
+is not scoped to one model's life. Free a model, load another, and the allocator
+hands the new towers addresses the old ones held, so the new model's expert
+resolved to an entry filled from a different checkpoint -- as a HIT, silently.
+Instrumenting `KqExpertSlice` to memcmp each slot against the slice it claims to
+be: **24 towers occupied 21 distinct addresses, and 20 of 222 slices returned
+another tower's bytes**. Filed as [#1066](https://github.com/mudler/vllm.cpp/issues/1066)
+and fixed by `OwnedTensor::TowerUid()`, a process-unique counter that cannot
+collide because it never goes backwards.
+
+**F4. `GgufFile::SourceOfSpan` had zero coverage** and it is the one place in
+the chain that decides WHICH FILE a weight is read from. Deleting the sibling
+walk (every span resolves to shard 0's descriptor) and forcing `out.offset = 0`
+both survived the full gate. Both are the "wrong shard at a plausible offset"
+failure: the pread succeeds, returns exactly the bytes asked for, and the model
+multiplies another tensor.
+
+**F5. The `MADV_WILLNEED` hint was inert.** madvise(2) returns EINVAL on an
+address that is not page-aligned, GGUF tensor data is aligned to
+`general.alignment` (default 32, `gguf_reader.cpp:401`), and the return value was
+discarded. Confirmed by mutation: reverting to the unaligned address drops the
+accepted-call count to zero. It is now aligned down, extended, and counted. **No
+speedup is claimed** -- this makes the call well formed, nothing more.
+
+**F7.** The singleton used `static T* inst = nullptr; if (inst == nullptr) inst
+= new T(...)`, which is not the magic-static idiom fourteen lines above and
+double-constructs an ~18 GiB store under two concurrent first calls. Separately,
+gate/up and down slices differ in size whenever a UD quant keeps `down_proj` at
+higher precision, and the store was sized from whichever slice arrived first, so
+a UD checkpoint refused its own first down slice mid-decode. `ExpertMlpKq` now
+declares max(gate, up, down) before taking any of them.
+
+**F8-F11.** `Contains` was byte-identical to the pre-existing `IsResident`, and
+its doc comment had been spliced in front of `capacity_exhausted()`, orphaning
+that one; the duplicate is gone. The size-before-acquire ordering is now pinned
+on a FULL cache, where it is observable -- the existing 2-slot case would have
+taken a free slot and evicted nothing either way. `ReleaseHost` and
+`AdoptDeviceBytesAsHost` cleared `mmap_src` but not `mmap_fd`, leaving a
+descriptor that outlived its own subject. The `expert >= 0` ternary had an
+unreachable arm: all three callers pass a loop index.
+
+The step boundary now lives in `ForwardLayers`, which every MoE entry point
+funnels through exactly once per forward, as an RAII guard so a step that ends by
+throwing still ends. `qwen3_moe.cpp` composes the same MoE block from another
+translation unit and marks its own step for the same reason.
+
+## Owed
+
+Carried debt for this row. Each item names why it is not closed here.
+
+| Owed | Why it is open |
+|---|---|
+| **Re-measure decode on a LIVE cache.** The `docs/BENCHMARKS.md` decode figure for this row was taken with the step clock dead from token 3 onward and is void. | Needs `dgx.casa` and the 370 GiB checkpoint. The box was unreachable for this repair (`No route to host`), and this host has no CUDA device and cannot hold the model. |
+| **The `pread` path has never run on the model.** `EnsureFile` is gated by unit tests only. | Same host. Three earlier attempts were OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. |
+| **The `MADV_WILLNEED` readahead is unmeasured.** It is now well formed and counted; whether it moves decode is unknown. | Same host and the same OOM contention. No speedup is claimed anywhere for it. |
+| **Windows has no streaming.** `EnsureFile` throws `"EnsureFile needs pread"` on `_WIN32`, and `SourceOfSpan` returns `fd = -1` there, so the lane falls back to the mapping copy. | No `pread(2)`; needs an `OVERLAPPED`/`ReadFile` arm. Refused by name rather than silently degraded. |
+| **The CUDA arms of [#1029](https://github.com/mudler/vllm.cpp/issues/1029)'s grouped gate have not run on a device.** | Recorded in that issue, which stays open for it. Unchanged by this repair. |
+| **Streaming serves the CPU-resident borrowed tower only.** A staged device weight takes `KqResidentSlice`, so there is no device-slot arm. | Deliberate for phase 1 (copying a device-resident weight through host slots moves MORE bytes); W7 owns the pluggable backing store. |
+| **The grouped keep-quant MoE path and streaming are mutually exclusive.** `VT_MOE_EXPERT_STREAM=1` disables grouping and says so once on stderr. | Grouping stages the whole tower, which is what streaming exists to avoid. Making them compose needs a slot-aware grouped GEMM, which is its own row. |
+
 ## Risks/decisions
 
 | Risk / decision | Call |

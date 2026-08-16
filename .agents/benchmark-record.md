@@ -22091,3 +22091,167 @@ spec §5 withdrew the token gate because the AR codes are a seeded
 `torch.multinomial` draw, so a different logit changes the drawn code and
 everything downstream. Sample-wise comparison of the two WAVs is meaningless and
 none is offered; the RMS/peak of each run are recorded in the spec instead.
+
+
+## MUSIC3-CPU-PARALLEL — the three host kernels, base vs parallelised, x86-64 20-core (2026-08-16, `row/MUSIC3-DEVICE-KERNELS`, base `origin/main` `0f8580e26`, #672)
+
+**Not a parity ratio, and not an end-to-end number.** This is a KERNEL A/B
+between two builds of this project: `d9441ef3` (the row-wise parallelisation's
+parent for these three files, byte-identical to `0f8580e26` in all four of them)
+and this branch. There is no reference leg; SGLang-Omni is still
+`gateable = no` and every axis in `docs/BENCHMARKS.md` against it stays
+`PENDING`.
+
+### Why a kernel A/B and not the e2e pair
+
+The e2e pair was attempted first and is recorded as VOID, because saying which
+runs were spoiled is the only thing that makes the replacement honest:
+
+* `--duration 0.1`: `d9441ef3` 369.5 s against this tree 311.8 s — but the 27 GB
+  checkpoint is mmap'd from a CIFS mount and the FIRST run of a series pays a
+  fault-in no later run pays. The base arm was cold and the new arm warm, so
+  that ratio is about the page cache as much as the kernels.
+* `--duration 0.4`: 786.2 s against 524.0 s — taken while another session's full
+  `ctest` was on the same 20-core box at a 1-minute load average of **76.6**.
+
+A short kernel loop can be repeated, so the MINIMUM over repetitions is
+available, and a minimum is the least-disturbed sample rather than an average of
+someone else's contention. Five interleaved rounds (base, new, base, new, ...),
+four to five repetitions inside each.
+
+### Recipe
+
+x86-64, 20 cores, 84 GB. Both arms are the SAME driver source compiled twice and
+linked against the two `libvllm.a` builds:
+
+    g++ -O3 -std=c++20 -ffp-contract=off -I<wt>/include -I<wt>/src \
+        -I<wt>/build/include -isystem <wt>/third_party \
+        kbench.cpp -o kbench-<arm> <wt>/build/libvllm.a \
+        <wt>/build/libblake3_vendored.a -lpthread
+
+Shapes are the vocoder's REAL geometry — `decoder_hidden_dim` 1536, upsampling
+ratios `[8,8,4,2]`, `kernel = 2*stride`, `padding = ceil(stride/2)`, exactly as
+`minimax_music3_acoustic.cpp:738-744` builds them — and the RVQ depth decoder's
+real 4096 -> 6144 projection at its 16-position window. `uptime` before the
+series 3.36, after 12.64; the timed minimums come from the quiet rounds and the
+noisy ones are visibly higher on BOTH arms.
+
+### Result — minimum of 5 interleaved rounds
+
+| kernel | shape | `d9441ef3` | this branch | speedup |
+|---|---|---|---|---|
+| `ConvTranspose1d` stage 0 | 1536->768, L=128, stride 8 | 0.3812 s | 0.1935 s | **1.97x** |
+| `ConvTranspose1d` stage 1 | 768->384, L=1024, stride 8 | 0.7707 s | 0.4023 s | **1.92x** |
+| `ConvTranspose1d` stage 2 | 384->192, L=8192, stride 4 | 8.4197 s | 0.4239 s | **19.86x** |
+| `ConvTranspose1d` stage 3 | 192->96, L=32768, stride 2 | 3.7413 s | 0.2342 s | **15.98x** |
+| `Conv1d` k=7 | 1536->1536, L=134 | 1.0334 s | 0.0859 s | **12.03x** |
+| `LinearNoBias` | 4096->6144, 16 rows, bf16 | 0.2045 s | 0.0188 s | **10.88x** |
+| **the whole vocoder convolution chain** | the five rows above it | **13.36 s** | **1.25 s** | **10.7x** |
+
+### The two stages that are only ~2x, and why that is a finding rather than noise
+
+Stages 0 and 1 gain 1.9x on 20 cores while stages 2 and 3 gain 16-20x. The
+difference is not parallelism, which is the same in all four; it is WHICH array
+each version streams.
+
+The old scatter's accumulator is `out_channels * full` doubles — **50 MB** at
+stage 2 — and it is written in an order that touches every destination channel
+per input. The pivot gives each worker a scratch ONE channel wide (262 KB at
+stage 2, an L2 resident), so stages 2 and 3 collect a locality win on top of the
+thread win. Stages 0 and 1 do not, because their accumulator was small already
+(6.4 MB) and their WEIGHTS are large (75 MB at stage 0) and are now read with a
+stride of `out_per_group * kernel` floats instead of contiguously. The pivot
+trades weight locality for accumulator locality, and the net is 2x where the
+weights dominate and 20x where the accumulator does.
+
+**Named as the next step rather than left implicit:** a weight pre-transpose (or
+blocking the `ic` loop) would recover stage 0/1's contiguity without touching a
+reduction order, and it is worth its own measurement. It is not in this change.
+
+### Bit-identity, at THESE shapes
+
+Every kernel above also printed an FNV-1a fingerprint of its raw output bytes,
+and **all six matched between the arms in every round**:
+
+    ConvTranspose1d stage0  8117c200e328c320      Conv1d k=7      9e23c0016f1b1cf3
+    ConvTranspose1d stage1  f85b530c211840c8      LinearNoBias    be2376b0ebe5177e
+    ConvTranspose1d stage2  7ec0b57567ae1d1b
+    ConvTranspose1d stage3  aebd8d61c6c7539e
+
+That is a third independent leg under the correctness claim, and it is the one
+taken at the PRODUCTION geometry: `test_host_parallel` gates small shapes
+against a verbatim copy of the serial loop, the e2e run gates the composition
+(`base-0.1.wav` and `new-0.1.wav` share sha256
+`12452152876072b280a7a2551dd182731a8475decc625758de28c345f194de9d`), and this
+gates the exact shapes the vocoder actually calls.
+
+### What is NOT claimed
+
+No end-to-end speedup is claimed from these numbers. The vocoder is one of six
+stages, the 8.6B language model's decode is elsewhere, and the checkpoint load
+dominates a short request. A contention-guarded e2e pair is running and will be
+appended when it lands. No reference comparison exists.
+
+## ENG-EXPERT-STREAM — RETRACTION: the "streaming ON, no decode gain" figure was measured on a cache that had switched itself off (2026-08-16, `row/ENG-EXPERT-STREAM-WIRING-REPAIR2`, #912, #1066)
+
+The W4 run recorded on 16 August 2026 (`[expert-stream] ON slots=8000
+slot_bytes=2490368 resident=18.55 GiB`, Qwen3.8-2.4T-A95B `UD-Q1_0` on one GB10)
+reported:
+
+| Axis | Baseline (no streaming) | Streaming ON |
+|---|---|---|
+| output | `" Paris. Q: What"` | `" Paris. Q:"` (identical tokens) |
+| TTFT | 3318.1 s | 733.4 s (4.5x) |
+| steady decode | 66.5 / 66.9 / 66.8 s | 68.7 / 67.7 s (unchanged) |
+
+**The decode row is VOID. The TTFT row stands.** An independent wiring review
+(#912, findings F1-F11) established that `Qwen35ExpertStream::EndStep()` had no
+caller anywhere in `src/` or `include/`; deleting its definition still compiled.
+
+Why that voids exactly one of the two rows, and why the arithmetic is worth
+recording rather than just the verdict:
+
+`ExpertSlotCache::Acquire` marks every entry it serves `protected_this_step`,
+because evicting a slot the current step is about to read would hand the kernel
+bytes being overwritten. ONLY `EndStep` clears that mark. With no caller the
+protection is permanent, so once the cache fills, `ColdestEvictable` returns -1,
+`Acquire` returns slot -1, `Slice` returns nullptr, and `KqExpertSlice` falls
+back to the mmap path — which IS the baseline.
+
+The run's own numbers say when that happened. 8000 slots against **2790 slices
+per token** (10 experts x 3 matrices x 93 layers) is **2.87 tokens** of capacity.
+
+- **Prefill is ONE forward and therefore one step.** Its working set fit inside
+  the budget, the cache served it, and the 4.5x TTFT is a real measurement of
+  the streaming path.
+- **Decode is one forward per token.** From partway through token 3 onward every
+  slice was refused and served from the mapping. The three decode samples were
+  taken after that point, so they measure the lane being OFF — which is why they
+  match the baseline to within noise (68.7 / 67.7 vs 66.5 / 66.9 / 66.8).
+
+Reviewer probe against unmodified sources, 8 slots and 40 distinct slices:
+`served=8 REFUSED=32, hits=0 misses=40 evictions=0 steps=0, exhausted=1`. With
+`EndStep()` called: `40 slices over 10 steps -> refused=0 evictions=32 steps=10`.
+Independently reproduced by the operator on current `main` with matching numbers.
+
+**A causal claim recorded alongside that figure is also retracted as
+unestablished.** The W4 section attributed the flat decode to `EnsureSpan`
+copying from `base + offset`, a pointer into the mmap, so that filling a slot
+still takes the page fault it was meant to avoid. That is a true statement about
+the code and it was **not established by this measurement**, because the
+measurement never exercised the fill path it blames. It stays on the list as a
+plausible bound, now unmeasured.
+
+**Nothing in the run could have revealed this**, which is the second lesson. The
+process printed `[expert-stream] ON ...` once at startup and nothing afterwards,
+so a cache that died in token 3 was indistinguishable from one that worked for
+the whole run. The lane now emits one line carrying `steps`, `hits`, `misses`,
+`evictions`, `fills`, `bytes`, `exhausted` and `advised`. `steps == 0` and
+`exhausted > 0` are exactly the F1 signature, and either is wrong at a glance.
+
+**Owed, and unmeasurable from here:** a re-run of both axes on a live cache.
+`dgx.casa` was unreachable throughout this repair, this host has no CUDA device
+and cannot hold a 370 GiB checkpoint, and three earlier attempts on that box were
+OOM-killed at 48.6 GiB anon beside another session's 32.6 GiB job. Tracked under
+`## Owed` in [`expert-streaming.md`](specs/expert-streaming.md). No new
+performance number is claimed by the repair that produced this retraction.

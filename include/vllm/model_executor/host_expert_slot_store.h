@@ -57,6 +57,8 @@ class HostExpertSlotStore final : public ExpertSlotStore {
   // The slot's bytes, for a kernel to read in place. Non-const because the
   // GEMM's weight handle is non-const in this tree; the store never writes
   // through it.
+  uint8_t* SlotForWrite(int32_t slot) override { return Slot(slot); }
+
   uint8_t* Slot(int32_t slot) {
     if (slot < 0 || slot >= slots_)
       throw std::out_of_range("HostExpertSlotStore: slot " +

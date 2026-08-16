@@ -20,6 +20,8 @@
 #include "vllm/model_executor/models/vocoder1d.h"
 #include "vt/dtype.h"
 
+#include "vllm/model_executor/models/host_parallel.h"
+
 namespace vllm {
 namespace models {
 namespace music3 {
@@ -561,15 +563,24 @@ std::vector<float> LinearNoBias(const std::vector<float>& x, int64_t rows, int64
          " values, expected out_dim*in_dim = " + std::to_string(out_dim * in_dim));
   }
   std::vector<float> out(static_cast<size_t>(rows * out_dim));
-  for (int64_t r = 0; r < rows; ++r) {
-    for (int64_t o = 0; o < out_dim; ++o) {
+  // Parallel over OUTPUT elements, one flat index per (row, out_dim) pair.
+  // EACH output keeps its OWN sequential double accumulator over `in_dim` in
+  // ascending `i` — exactly the loop this replaced — so the reduction order
+  // W2/W3 gated against torch, and the `-ffp-contract=off` pinning that makes
+  // it reproducible, are untouched. Bit-identical to the serial loop by
+  // construction, not within a tolerance; `test_host_parallel` proves it
+  // against a verbatim copy of the serial code at five thread counts.
+  host_parallel::ForOutputRows(rows * out_dim, in_dim, [&](int64_t e0, int64_t e1) {
+    for (int64_t e = e0; e < e1; ++e) {
+      const int64_t r = e / out_dim;
+      const int64_t o = e - r * out_dim;
       double acc = 0.0;
       const float* xr = x.data() + r * in_dim;
       const float* wo = weight.data() + o * in_dim;
       for (int64_t i = 0; i < in_dim; ++i) acc += static_cast<double>(xr[i]) * wo[i];
-      out[static_cast<size_t>(r * out_dim + o)] = Store(acc, compute);
+      out[static_cast<size_t>(e)] = Store(acc, compute);
     }
-  }
+  });
   return out;
 }
 

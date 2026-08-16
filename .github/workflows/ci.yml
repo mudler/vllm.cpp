@@ -186,6 +186,10 @@ jobs:
         run: |
           python3 scripts/check-fp4-resident-consistency.py
           python3 tests/scripts/test_check_fp4_resident_consistency.py
+      - name: An arch-independent CUDA op is registered from an unconditional TU
+        run: |
+          python3 scripts/check-cuda-op-arch-gate.py --report
+          python3 tests/scripts/test_check_cuda_op_arch_gate.py
       - name: Model decode is born on the runner (device-resident logits)
         run: |
           python3 scripts/check-runner-routing-consistency.py

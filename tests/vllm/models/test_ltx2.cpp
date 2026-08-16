@@ -1325,13 +1325,67 @@ TEST_CASE("ltx2 keyframes: a bf16 embedding view is REFUSED by the f32 forward")
   CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32));
 }
 
-TEST_CASE("ltx2 forward: a single-stream model type is REFUSED") {
+// REWRITTEN by row LTX25-T2A-ONE-STAGE (#1005), and the rewrite is the point
+// rather than an accommodation.
+//
+// This case used to assert that a single-stream call THROWS, pinning a refusal
+// whose stated reason was "LTXModelType.VideoOnly and LTXModelType.AudioOnly
+// carry a different weight contract". That reason is about the CHECKPOINT, and
+// it does not describe `T2AOneStagePipeline`: upstream loads the ordinary
+// AudioVideo file and restricts which keys it reads
+// (LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP, model_configurator.py:228-239),
+// then calls `LTXModel.forward(video=None, ...)` (t2a_one_stage.py:167).
+//
+// So the assertion is not widened, it is REPLACED with the contract upstream
+// actually has (transformer.py:259-260, "At least one of video or audio must be
+// provided") — and the new form is strictly stronger, because it also pins what
+// a one-stream call RETURNS. The old one could not tell a served one-stream
+// forward from a broken one; both threw.
+TEST_CASE("ltx2 forward: ONE stream runs, and both-null is refused") {
   const Ltx2DitParams p = ReducedParams(Ltx2RopeType::kSplit, false);
   WeightSet set = BuildWeights(p);
   Modalities m;
   BuildModalities(&m, false);
-  CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, &m.video, nullptr, vt::DType::kF32));
-  CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, nullptr, &m.audio, vt::DType::kF32));
+
+  // Upstream's own refusal, and the only one left.
+  CHECK_THROWS(Ltx2DitForward(Cpu(), p, set.weights, nullptr, nullptr, vt::DType::kF32));
+
+  // VIDEO ALONE. `run_a2v` is false because there is no audio state, so the
+  // video output must still be the full sequence and the audio one EMPTY —
+  // `Ltx2DitOutputs` carries two vectors and a build that filled both would be
+  // reporting a stream it never ran.
+  const vllm::Ltx2DitOutputs v_only =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, nullptr, vt::DType::kF32);
+  CHECK(v_only.audio.empty());
+  REQUIRE(v_only.video.size() ==
+          static_cast<size_t>(m.video.batch * m.video.tokens * p.out_channels));
+  for (const float x : v_only.video) REQUIRE(std::isfinite(x));
+
+  // AUDIO ALONE — the shape `T2AOneStagePipeline` runs.
+  const vllm::Ltx2DitOutputs a_only =
+      Ltx2DitForward(Cpu(), p, set.weights, nullptr, &m.audio, vt::DType::kF32);
+  CHECK(a_only.video.empty());
+  REQUIRE(a_only.audio.size() ==
+          static_cast<size_t>(m.audio.batch * m.audio.tokens * p.audio_out_channels));
+  for (const float x : a_only.audio) REQUIRE(std::isfinite(x));
+
+  // AND ONE STREAM IS NOT THE JOINT FORWARD WITH THE OTHER IGNORED. This is the
+  // assertion the old case had no way to make, and it is the whole reason
+  // `video = nullptr` is not `video->enabled = false`: upstream's `run_v2a` is
+  // `run_ax and (video is not None and vx.numel() > 0)` (transformer.py:269), so
+  // a present video stream — enabled or not — still feeds video->audio cross
+  // attention. If these were equal, the cross-modal path would be dead on the
+  // joint arm instead.
+  const vllm::Ltx2DitOutputs joint =
+      Ltx2DitForward(Cpu(), p, set.weights, &m.video, &m.audio, vt::DType::kF32);
+  REQUIRE(joint.audio.size() == a_only.audio.size());
+  bool audio_differs = false;
+  for (size_t i = 0; i < joint.audio.size(); ++i) {
+    if (joint.audio[i] != a_only.audio[i]) audio_differs = true;
+  }
+  CHECK_MESSAGE(audio_differs,
+                "the audio-only forward equals the joint one, so video->audio cross attention "
+                "contributed nothing on the joint arm");
 }
 
 // ---------------------------------------------------------------------------

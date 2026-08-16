@@ -60,6 +60,18 @@
 // TimestepEmbedding frequency table, which is a constant precompute rather than
 // a data path.
 //
+// ─── AND IT IS PARALLEL, WHICH IT ALSO USED NOT TO BE (#1009) ────────────────
+// The convolutions dispatch through `vt::cpu::ParallelForRows`, the synchronous
+// row-chunked parallel-for 10+ CPU kernels in this tree already use and that no
+// line of this file used before. The partition is over OUTPUT lines only: the
+// whole `ci * kernel^3` reduction stays inside one output element's body, so the
+// blocked f32 order above is untouched and the result is bit-identical at any
+// thread count and under any work-stealing assignment. Splitting the reduction
+// axis `ic` instead would make the summation order a function of the thread
+// count; it is rejected at the site. "the decode DISPATCHES its convolutions to
+// the CPU threadpool" and "the decode is BIT-IDENTICAL across thread counts" in
+// tests/vllm/models/test_ltx2_vae.cpp are the two instruments.
+//
 // PHASE L6 OWES THE PRODUCTION ARM — the bf16/NVFP4 decode that inherits the
 // checkpoint dtype the way upstream does. Until it lands, this file is a
 // correctness reference, not the shipping path, and no memory or throughput
@@ -75,6 +87,7 @@
 #include <vector>
 
 #include "vllm/model_executor/models/minimax_h3.h"
+#include "vt/cpu/cpu_threadpool.h"
 #include "vt/dtype.h"
 
 namespace vllm {
@@ -149,23 +162,30 @@ Volume CausalConv3d(const Volume& in, int64_t out_channels, int64_t kernel, bool
   const int64_t pw = in.w + 2 * pad_spatial;
 
   std::vector<float> padded(static_cast<size_t>(ci * pt * ph * pw), 0.0f);
-  for (int64_t c = 0; c < ci; ++c) {
-    for (int64_t ti = 0; ti < pt; ++ti) {
-      // Temporal padding REPLICATES the edge frame, never zeros.
-      const int64_t st = std::max<int64_t>(0, std::min<int64_t>(in.t - 1, ti - pad_front));
-      for (int64_t hi = 0; hi < ph; ++hi) {
-        bool zero_h = false;
-        const int64_t sh = SpatialIndex(hi - pad_spatial, in.h, mode, &zero_h);
-        for (int64_t wi = 0; wi < pw; ++wi) {
-          bool zero_w = false;
-          const int64_t sw = SpatialIndex(wi - pad_spatial, in.w, mode, &zero_w);
-          if (zero_h || zero_w) continue;
-          padded[static_cast<size_t>(((c * pt + ti) * ph + hi) * pw + wi)] =
-              in.data[in.At(c, st, sh, sw)];
+  // One "row" is one padded line (c, ti, hi) of `pw` elements. A pure GATHER —
+  // one source element per destination element, no reduction at all — so the
+  // partition cannot change any arithmetic. It is parallel because it is
+  // O(ci * pt * ph * pw) inside the hot function, and a serial section here
+  // would bound the convolution's speedup by Amdahl's law (#1009).
+  vt::cpu::ParallelForRows(
+      vt::cpu::CurrentThreadpool(), ci * pt * ph, [&](int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; ++r) {
+          const int64_t hi = r % ph;
+          const int64_t ti = (r / ph) % pt;
+          const int64_t c = r / (ph * pt);
+          // Temporal padding REPLICATES the edge frame, never zeros.
+          const int64_t st = std::max<int64_t>(0, std::min<int64_t>(in.t - 1, ti - pad_front));
+          bool zero_h = false;
+          const int64_t sh = SpatialIndex(hi - pad_spatial, in.h, mode, &zero_h);
+          for (int64_t wi = 0; wi < pw; ++wi) {
+            bool zero_w = false;
+            const int64_t sw = SpatialIndex(wi - pad_spatial, in.w, mode, &zero_w);
+            if (zero_h || zero_w) continue;
+            padded[static_cast<size_t>(((c * pt + ti) * ph + hi) * pw + wi)] =
+                in.data[in.At(c, st, sh, sw)];
+          }
         }
-      }
-    }
-  }
+      });
 
   Volume out;
   out.channels = out_channels;
@@ -175,46 +195,67 @@ Volume CausalConv3d(const Volume& in, int64_t out_channels, int64_t kernel, bool
   VT_CHECK(pt >= kernel && ph >= kernel && pw >= kernel && out.t > 0 && out.h > 0 && out.w > 0,
            "ltx2 conv3d: empty output");
   out.data.resize(static_cast<size_t>(out_channels * out.spatial()));
-  for (int64_t oc = 0; oc < out_channels; ++oc) {
-    for (int64_t ti = 0; ti < out.t; ++ti) {
-      for (int64_t hi = 0; hi < out.h; ++hi) {
-        for (int64_t wi = 0; wi < out.w; ++wi) {
-          // f32, because that is the width `nn.Conv3d` accumulates in — MEASURED,
-          // not assumed: F.conv3d returns 0.0 on the separable reduction in
-          // tests/vllm/models/test_ltx2_vae.cpp for f32 AND for bf16 tensors,
-          // where an f64 accumulator returns 2.5 (#1008).
-          float acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0f;
-          for (int64_t ic = 0; ic < ci; ++ic) {
-            // BLOCKED, one partial sum per input channel, and this is the ORDER
-            // as well as the width. A single naive serial f32 sum over all
-            // `ci * kernel^3` taps accumulates error with sqrt of the whole
-            // length; splitting it into `ci` blocks of `kernel^3` accumulates
-            // with sqrt of each. That is not a local optimisation — torch's f32
-            // convolution is a blocked GEMM and sums exactly this way, which is
-            // why `torch.sum` on the separable reduction returns 2.0999999 where
-            // a naive serial f32 sum returns 0.0. Narrowing the width alone,
-            // with the naive order kept, pushed the non-causal tiled golden to
-            // 5.00679e-06 against a 5e-06 tolerance — MEASURED, and the reason
-            // this loop is shaped this way.
-            float tap = 0.0f;
-            for (int64_t a = 0; a < kernel; ++a) {
-              for (int64_t b = 0; b < kernel; ++b) {
-                for (int64_t d = 0; d < kernel; ++d) {
-                  tap += padded[static_cast<size_t>(
-                             ((ic * pt + ti * stride_t + a) * ph + hi * stride_h + b) * pw +
-                             wi * stride_w + d)] *
-                         weight[static_cast<size_t>(
-                             (((oc * ci + ic) * kernel + a) * kernel + b) * kernel + d)];
-                }
+  // THE PARALLEL AXIS IS THE OUTPUT LINE (oc, ti, hi), AND THAT CHOICE IS THE
+  // WHOLE OF THIS ROW'S RISK (#1009, .agents/specs/ltx25-decode-threads.md).
+  //
+  // `Volume::At(oc, ti, hi, wi)` is `((oc*t + ti)*h + hi)*w + wi`, so row `r` is
+  // exactly the contiguous span [r*out.w, (r+1)*out.w) of `out.data`: no output
+  // element is written by more than one worker. And the entire `ci * kernel^3`
+  // reduction below stays inside one `wi` iteration of one row, so a worker
+  // executes precisely the serial arm's instruction sequence, in the serial
+  // arm's order, for every element it owns. The result is therefore bit-identical
+  // at any thread count AND under any row-to-thread assignment — which matters,
+  // because ParallelForRows STEALS work through an atomic cursor and the
+  // assignment is genuinely non-deterministic run to run.
+  //
+  // Splitting the REDUCTION axis `ic` into per-thread partials would also be a
+  // legal convolution, and it is deliberately not taken: it would make the
+  // summation order a function of the thread count, which is the defect #1008
+  // spent its whole budget removing. `cpu_conv2d.cpp:75-78` partitions 2-D
+  // convolution the same way, and `cpu_threadpool.h:39-43` states the contract
+  // for the whole CPU backend.
+  const int64_t rows = out_channels * out.t * out.h;
+  vt::cpu::ParallelForRows(vt::cpu::CurrentThreadpool(), rows, [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r) {
+      const int64_t hi = r % out.h;
+      const int64_t ti = (r / out.h) % out.t;
+      const int64_t oc = r / (out.h * out.t);
+      for (int64_t wi = 0; wi < out.w; ++wi) {
+        // f32, because that is the width `nn.Conv3d` accumulates in — MEASURED,
+        // not assumed: F.conv3d returns 0.0 on the separable reduction in
+        // tests/vllm/models/test_ltx2_vae.cpp for f32 AND for bf16 tensors,
+        // where an f64 accumulator returns 2.5 (#1008).
+        float acc = bias != nullptr ? (*bias)[static_cast<size_t>(oc)] : 0.0f;
+        for (int64_t ic = 0; ic < ci; ++ic) {
+          // BLOCKED, one partial sum per input channel, and this is the ORDER
+          // as well as the width. A single naive serial f32 sum over all
+          // `ci * kernel^3` taps accumulates error with sqrt of the whole
+          // length; splitting it into `ci` blocks of `kernel^3` accumulates
+          // with sqrt of each. That is not a local optimisation — torch's f32
+          // convolution is a blocked GEMM and sums exactly this way, which is
+          // why `torch.sum` on the separable reduction returns 2.0999999 where
+          // a naive serial f32 sum returns 0.0. Narrowing the width alone,
+          // with the naive order kept, pushed the non-causal tiled golden to
+          // 5.00679e-06 against a 5e-06 tolerance — MEASURED, and the reason
+          // this loop is shaped this way. The partition above does not touch it.
+          float tap = 0.0f;
+          for (int64_t a = 0; a < kernel; ++a) {
+            for (int64_t b = 0; b < kernel; ++b) {
+              for (int64_t d = 0; d < kernel; ++d) {
+                tap += padded[static_cast<size_t>(
+                           ((ic * pt + ti * stride_t + a) * ph + hi * stride_h + b) * pw +
+                           wi * stride_w + d)] *
+                       weight[static_cast<size_t>(
+                           (((oc * ci + ic) * kernel + a) * kernel + b) * kernel + d)];
               }
             }
-            acc += tap;
           }
-          out.data[out.At(oc, ti, hi, wi)] = acc;
+          acc += tap;
         }
+        out.data[out.At(oc, ti, hi, wi)] = acc;
       }
     }
-  }
+  });
   return out;
 }
 
@@ -228,19 +269,26 @@ Volume Linear3d(const Volume& in, int64_t out_channels, const std::vector<float>
   out.w = in.w;
   out.data.resize(static_cast<size_t>(out_channels * in.spatial()));
   const int64_t n = in.spatial();
-  for (int64_t oc = 0; oc < out_channels; ++oc) {
-    for (int64_t i = 0; i < n; ++i) {
-      // f32: this is an `nn.Conv3d` upstream too (make_linear_nd's dims==3
-      // branch, convolution.py:84-85), so it accumulates at the same width as
-      // every other conv on the path.
-      float acc = bias[static_cast<size_t>(oc)];
-      for (int64_t ic = 0; ic < in.channels; ++ic) {
-        acc += in.data[static_cast<size_t>(ic * n + i)] *
-               weight[static_cast<size_t>(oc * in.channels + ic)];
-      }
-      out.data[static_cast<size_t>(oc * n + i)] = acc;
-    }
-  }
+  // One "row" is one output ELEMENT (oc, i), and the `in.channels` reduction
+  // stays inside it — the same partition-the-outputs discipline CausalConv3d
+  // above uses, for the same reason (#1009). `out.data[oc * n + i]` means a
+  // chunk of consecutive `r` is a contiguous span of the output.
+  vt::cpu::ParallelForRows(
+      vt::cpu::CurrentThreadpool(), out_channels * n, [&](int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; ++r) {
+          const int64_t oc = r / n;
+          const int64_t i = r - oc * n;
+          // f32: this is an `nn.Conv3d` upstream too (make_linear_nd's dims==3
+          // branch, convolution.py:84-85), so it accumulates at the same width as
+          // every other conv on the path.
+          float acc = bias[static_cast<size_t>(oc)];
+          for (int64_t ic = 0; ic < in.channels; ++ic) {
+            acc += in.data[static_cast<size_t>(ic * n + i)] *
+                   weight[static_cast<size_t>(oc * in.channels + ic)];
+          }
+          out.data[static_cast<size_t>(oc * n + i)] = acc;
+        }
+      });
   return out;
 }
 

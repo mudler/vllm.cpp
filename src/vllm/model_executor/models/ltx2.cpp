@@ -822,6 +822,41 @@ std::vector<float> Ltx2FeedForward(vt::Device device, const Ltx2FeedForwardWeigh
   return out;
 }
 
+// attention.py:575-579 — everything the ordinary path and the STG-perturbed path
+// share, which is the gate and `to_out`. Factored out rather than duplicated
+// because the two arms differing HERE is the defect that would be invisible: a
+// perturbed pass that skipped `to_out` returns a tensor of the right shape at the
+// wrong width-space, and the block would add it to the residual and render.
+static std::vector<float> Ltx2AttentionEpilogue(vt::Queue& q, const Ltx2AttentionWeights& w,
+                                                const float* x, std::vector<float> attn,
+                                                const Ltx2AttentionArgs& args,
+                                                vt::Device /*device*/) {
+  const int64_t batch = args.batch;
+  const int64_t tq = args.tokens;
+  const int64_t heads = args.heads;
+  const int64_t dim_head = args.dim_head;
+  const int64_t inner = heads * dim_head;
+
+  // PytorchGatedAttention (ops.py:94-106), applied to the attention output BEFORE
+  // `to_out` (attention.py:576-579) and driven by the RAW input `x`, not by the
+  // attention output. Gating after `to_out` would be a different model.
+  if (w.to_gate_logits.weight.data != nullptr) {
+    std::vector<float> logits(static_cast<size_t>(batch * tq * heads));
+    Linear(q, x, batch * tq, args.query_dim, w.to_gate_logits, logits.data());
+    for (int64_t r = 0; r < batch * tq; ++r) {
+      for (int64_t h = 0; h < heads; ++h) {
+        const float gate = 2.0f / (1.0f + std::exp(-logits[static_cast<size_t>(r * heads + h)]));
+        float* dst = attn.data() + r * inner + h * dim_head;
+        for (int64_t e = 0; e < dim_head; ++e) dst[e] *= gate;
+      }
+    }
+  }
+
+  std::vector<float> out(static_cast<size_t>(batch * tq * args.query_dim));
+  Linear(q, attn.data(), batch * tq, inner, w.to_out, out.data());
+  return out;
+}
+
 std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& w, const float* x,
                                  const float* context, const Ltx2AttentionArgs& args) {
   vt::Queue q{device, nullptr};
@@ -834,6 +869,28 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
   const float* ctx = context != nullptr ? context : x;
   const int64_t s = context != nullptr ? args.context_tokens : tq;
   const int64_t ctx_dim = context != nullptr ? args.context_dim : args.query_dim;
+
+  // attention.py:557 — `use_attention = not all_perturbed`. The STG arm computes
+  // `to_v` and NOTHING else of the attention: no `to_q`, no `to_k`, no q/k
+  // RMSNorm, no RoPE, no scores. Written as an early exit rather than as a chain
+  // of `if (!perturbed)` guards so the skipped work is visibly skipped; a guarded
+  // form that still projected q and threw the result away would be numerically
+  // identical and would hide the whole point of the perturbation, which is that
+  // the query/key path does not run.
+  if (args.all_perturbed) {
+    VT_CHECK(context == nullptr,
+             "ltx2 attention: `all_perturbed` is upstream's SELF-attention STG perturbation "
+             "(guidance/perturbations.py:8-16 names SKIP_VIDEO_SELF_ATTN and "
+             "SKIP_AUDIO_SELF_ATTN). The CROSS-attention perturbations exist upstream "
+             "(SKIP_A2V_CROSS_ATTN, SKIP_V2A_CROSS_ATTN) and are NOT ported, so a cross call "
+             "carrying this flag is refused rather than served the self-attention rule");
+    VT_CHECK(args.kv_in == nullptr && args.kv_out == nullptr,
+             "ltx2 attention: a perturbed pass computes no K, so it can neither fill nor read a "
+             "prompt K/V cache");
+    std::vector<float> vp(static_cast<size_t>(batch * tq * inner));
+    Linear(q, ctx, batch * s, ctx_dim, w.to_v, vp.data());
+    return Ltx2AttentionEpilogue(q, w, x, std::move(vp), args, device);
+  }
 
   // attention.py:559-565: v first, then q and k. The K/V half is exactly what the
   // prompt cache holds, so `kv_in` skips all three of to_v / to_k / k_norm.
@@ -912,24 +969,7 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
     }
   }
 
-  // PytorchGatedAttention (ops.py:94-106), applied to the attention output BEFORE
-  // `to_out` (attention.py:576-579) and driven by the RAW input `x`, not by the
-  // attention output. Gating after `to_out` would be a different model.
-  if (w.to_gate_logits.weight.data != nullptr) {
-    std::vector<float> logits(static_cast<size_t>(batch * tq * heads));
-    Linear(q, x, batch * tq, args.query_dim, w.to_gate_logits, logits.data());
-    for (int64_t r = 0; r < batch * tq; ++r) {
-      for (int64_t h = 0; h < heads; ++h) {
-        const float gate = 2.0f / (1.0f + std::exp(-logits[static_cast<size_t>(r * heads + h)]));
-        float* dst = attn.data() + r * inner + h * dim_head;
-        for (int64_t e = 0; e < dim_head; ++e) dst[e] *= gate;
-      }
-    }
-  }
-
-  std::vector<float> out(static_cast<size_t>(batch * tq * args.query_dim));
-  Linear(q, attn.data(), batch * tq, inner, w.to_out, out.data());
-  return out;
+  return Ltx2AttentionEpilogue(q, w, x, std::move(attn), args, device);
 }
 
 }  // namespace vllm

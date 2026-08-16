@@ -848,6 +848,13 @@ add_library(vllm STATIC
   # connector. Additive files mirroring ltx_core's own structure.
   src/vllm/model_executor/models/ltx2_pipeline.cpp
   src/vllm/model_executor/models/ltx2_upsampler.cpp
+  # LTX-2.5 (ROW LTX25-DFR-PIPELINE, issue #986): the DFR canvas layout — the
+  # keyframe segment grid, the temporal tile ranges and the latent stitch. Its
+  # own TU because it holds no weights and runs no kernel: it is pure index
+  # arithmetic whose every failure mode returns a correctly shaped, finite,
+  # plausible latent, so it is gated by exact index vectors rather than by a
+  # numeric band, which is a different kind of test from the rest of L5.
+  src/vllm/model_executor/models/ltx2_dfr.cpp
   src/vllm/model_executor/models/ltx2_duration_head.cpp
   src/vllm/model_executor/models/ltx2_connector.cpp
   # LTX-2.5 (ROW MODEL-DIFFUSION-LTX25, phase L11): the conditioning items that

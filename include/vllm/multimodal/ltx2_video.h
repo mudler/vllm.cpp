@@ -311,8 +311,9 @@ inline constexpr char kLtx2AudioStartTimeExtra[] = "audio_start_time";
 // audio as the clip is long.
 inline constexpr char kLtx2AudioMaxDurationExtra[] = "audio_max_duration";
 
-// GENERATED keyframe slots — the OTHER upstream feature called "keyframe", and
-// the one this port does not serve. Row LTX25-GENERATED-KEYFRAMES (#920).
+// GENERATED keyframe slots — the OTHER upstream feature called "keyframe".
+// Row LTX25-GENERATED-KEYFRAMES (#920) DEFINED this key and refused it; row
+// LTX25-DFR-PIPELINE (#986) SERVES it.
 //
 // Not to be confused with the SUPPLIED keyframe arm. The two differ by one
 // argument, and it is the argument that decides whether the trained marker is
@@ -330,11 +331,14 @@ inline constexpr char kLtx2AudioMaxDurationExtra[] = "audio_max_duration";
 // latent frame — which `Ltx2FirstFrameKeyframesMask` already marks on every
 // render, unconditionally, mirroring `tools.py:184-196`.
 //
-// THIS KEY IS DEFINED AND NOT SERVED, and it is defined precisely so the refusal
-// can name what is missing. Falling through the per-generation extras check
-// would produce "unknown per-generation extra", which asserts the family does
-// not define the key and sends the reader hunting a typo — the distinction
-// `CheckUnservedExtras` exists for on the load side (#611).
+// THIS KEY IS NOW SERVED. #920 defined it and refused it, naming the READBACK as
+// its one blocker: `GeneratedKeyframeLayout`, the extraction into
+// `generated_keyframes` before the trim, and a standalone single-frame decode.
+// #986 landed the first two, which is what DFR needs, and the refusal it
+// replaced is retired rather than widened — a refusal for a served capability is
+// worse than none. The third piece is still owed and is a SEPARATE surface: it
+// would return slot PIXELS to a caller, and nothing here does that, because
+// upstream's own consumers keep the slots in latent space.
 //
 // Spelled and typed as upstream's CLI spells it: `--num-generated-keyframes`,
 // `type=int`, `default=0` (ltx-pipelines/utils/args.py:833-844). It is a
@@ -342,7 +346,36 @@ inline constexpr char kLtx2AudioMaxDurationExtra[] = "audio_max_duration";
 // belongs on the per-generation surface rather than on load. `0` is upstream's
 // own default and means OFF (`has_generated_keyframes`, utils/helpers.py:384-391)
 // — an explicit 0 must therefore RENDER, not refuse.
+//
+// The positions are `evenly_spaced_keyframe_positions` (utils/helpers.py:370-381):
+// `linspace(0, num_frames - 1, n + 2)` rounded, with the ENDPOINTS DROPPED. A
+// negative count and a target shorter than `n + 2` are upstream's own two
+// refusals and are mirrored.
+//
+// ON A `dfr` PIPELINE THIS KEY IS REFUSED, and that is not an omission.
+// `DFRPipeline` does not take it: its slot positions come from `resolve_canvas`
+// (dfr_pipeline.py:314), which puts one keyframe on every x8-border segment
+// boundary, and its CLI exposes no `--num-generated-keyframes` at all. Accepting
+// both would let a caller silently override the canvas the whole pipeline is
+// built around.
 inline constexpr char kLtx2GeneratedKeyframesExtra[] = "num_generated_keyframes";
+
+// DFR's temporal x2/x4 refinement rounds — `temporal_upsample_rounds`,
+// `type=int`, `choices=(0, 1, 2)`, `default=0`
+// (ltx-pipelines/dfr_pipeline.py:277, :584-590). Row LTX25-DFR-PIPELINE (#986).
+//
+// DEFINED, and REFUSED above 0. `0` is upstream's default and is the served
+// path; a positive count is refused by name, and what it names is the rounds
+// LOOP rather than the upsampler. The operator itself is ported and gated
+// (row LTX25-TEMPORAL-UPSAMPLER, `.agents/specs/ltx25-temporal-upsampler.md`) —
+// `PixelShuffle1d`, the first-frame drop, and the loader arm that reads
+// `temporal_upsample` off the checkpoint config all exist and pass.
+//
+// The key is defined here rather than left to the generic "unknown extra"
+// message for the reason #611 established: that message asserts the family does
+// not define the key, which is false, and sends the reader looking for a typo
+// instead of for the unported loop.
+inline constexpr char kLtx2TemporalRoundsExtra[] = "temporal_upsample_rounds";
 
 // ── RETAKE: regenerate a time window of an existing clip. Row LTX25-RETAKE ──
 // (#924), spec .agents/specs/ltx25-retake.md.
@@ -521,6 +554,45 @@ struct Ltx2ConditioningTrace {
   // "zero tokens".
   int64_t video_tokens = 0;
   int64_t schedule_tokens = 0;
+
+  // ── GENERATED KEYFRAME SLOTS AND THE DFR CANVAS (#986) ────────────────────
+  //
+  // Zero everywhere when the request asked for no slots, which is every
+  // `one_stage` and `distilled_two_stage` render that omits
+  // `num_generated_keyframes`.
+  //
+  // These exist for the reason `image_digest` does, and the reason is sharper
+  // here than anywhere else on this struct: a generated keyframe slot is
+  // INVISIBLE to the rendered clip. It appends tokens that are trimmed away
+  // before unpatchify, so a build that placed no slots, or placed them and threw
+  // them away, or placed them UNMARKED, returns a video of exactly the same
+  // shape, the same frame count and the same file size. There is no pixel to
+  // compare and no digest of the output that moves.
+  //
+  // `slot_positions` is the resolved PIXEL frame of each slot — from
+  // `resolve_canvas` on a `dfr` pipeline (dfr_layout.py:60-81) and from
+  // `evenly_spaced_keyframe_positions` on the others (utils/helpers.py:370-381).
+  // `slot_tokens_extracted` is how many token-frames `clear_conditioning`
+  // actually read back BEFORE the trim (ltx_core/tools.py:97, :203-230), so a
+  // build that placed slots and then dropped them reports a positive
+  // `slot_positions` beside a zero here.
+  //
+  // `slot_marked_tokens` is the one that cannot be inferred from the others. It
+  // counts the slot tokens that carry the keyframe marker, and the marker is the
+  // ONLY thing that distinguishes a generated slot from an ordinary append
+  // (`extend_keyframes_mask(..., marked=True)`, keyframe_slots.py:121 —
+  // upstream's single marked call site). An unmarked slot costs the same tokens
+  // and renders the same clip while silently omitting the trained embedding.
+  //
+  // `canvas_frames` is the PADDED canvas a `dfr` request denoised, before the
+  // trim back to the caller's own count (dfr_pipeline.py:531-540), and
+  // `canvas_segment` is the keyframe segment length `choose_segment_length`
+  // picked. Zero on every non-DFR pipeline.
+  std::vector<int64_t> slot_positions;
+  int64_t slot_tokens_extracted = 0;
+  int64_t slot_marked_tokens = 0;
+  int64_t canvas_frames = 0;
+  int64_t canvas_segment = 0;
 
   // ── AUDIO-TO-VIDEO: the supplied take, as the DiT received it (#922) ───────
   //

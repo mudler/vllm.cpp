@@ -615,6 +615,16 @@ void Ltx2AssertResolution(int64_t height, int64_t width, int64_t divisor);
 //   ("distilled_two_stage","2.5")  Lightricks distilled.py + constants.py:17-23
 //   ("dmd2",               "2")    vLLM-Omni LTX_POSITIVE_ONLY_RECIPE (:116-124)
 //   ("dmd2",               "2.3")  same
+//   ("dfr",                "2.5")  Lightricks dfr_pipeline.py:155-561 (row
+//                                  LTX25-DFR-PIPELINE, #986). The distilled
+//                                  two-stage SCHEDULE with DFR's phase names —
+//                                  upstream defaults stage 1 to DISTILLED_SIGMAS
+//                                  and stage 2 to STAGE_2_DISTILLED_SIGMAS
+//                                  (:281-282) and halves stage 1 (:319), so DFR
+//                                  differs in its CONDITIONING and its rounds
+//                                  loop rather than in its schedule. 2.5 only:
+//                                  its base stage needs a checkpoint declaring
+//                                  `use_keyframes_abs_pos_embedding`
 //   ("retake",             "2")    Lightricks retake.py:85,287,290-294,313-324
 //   ("retake",             "2.5")  same
 //

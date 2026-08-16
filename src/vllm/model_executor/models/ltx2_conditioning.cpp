@@ -151,8 +151,268 @@ void Ltx2ExtendKeyframesMask(Ltx2LatentState* state, int64_t num_new_tokens, boo
                                static_cast<size_t>(num_new_tokens), marked ? 1.0f : 0.0f);
 }
 
-void Ltx2ClearConditioning(Ltx2LatentState* state, int64_t target_tokens) {
+void Ltx2ConditionVideoByGeneratedKeyframeSlots(Ltx2LatentState* state,
+                                                const Ltx2VideoLatentShape& target,
+                                                int64_t patch_size,
+                                                const Ltx2ScaleFactors& factors, double fps,
+                                                const std::vector<int64_t>& pixel_frame_indices,
+                                                const Ltx2LatentVolume* initial_keyframes) {
   VT_CHECK(state != nullptr, "ltx2 conditioning: null state");
+
+  // `__init__` validates before anything is built (keyframe_slots.py:52-59), so
+  // a malformed request is refused before a token is allocated.
+  VT_CHECK(!pixel_frame_indices.empty(),
+           "ltx2 conditioning: pixel_frame_indices must be non-empty (keyframe_slots.py:52-53)");
+  for (size_t i = 0; i < pixel_frame_indices.size(); ++i) {
+    VT_CHECK(pixel_frame_indices[i] >= 0,
+             "ltx2 conditioning: pixel_frame_indices must be non-negative "
+             "(keyframe_slots.py:54-55)");
+    VT_CHECK(i == 0 || pixel_frame_indices[i] > pixel_frame_indices[i - 1],
+             "ltx2 conditioning: pixel_frame_indices must be strictly increasing "
+             "(keyframe_slots.py:56-57). Upstream records ONE contiguous token range for all "
+             "slots, so a repeated or out-of-order index would make the layout describe a "
+             "different frame from the one the token carries");
+  }
+
+  // `apply_to`'s first act (keyframe_slots.py:76-81): the target's PIXEL frame
+  // count, which is the latent count upscaled by the temporal factor — not the
+  // latent count itself.
+  const int64_t num_pixel_frames = target.frames * factors.time;
+  VT_CHECK(pixel_frame_indices.back() < num_pixel_frames,
+           "ltx2 conditioning: generated keyframe at pixel frame " +
+               std::to_string(pixel_frame_indices.back()) + " is outside the target's " +
+               std::to_string(num_pixel_frames) + " frames (keyframe_slots.py:77-81)");
+
+  // keyframe_slots.py:133-134 — a SECOND application is refused rather than
+  // merged, because the layout is one contiguous range and a second item would
+  // silently orphan the first one's tokens.
+  VT_CHECK(!state->generated_keyframe_layout.applied(),
+           "ltx2 conditioning: generated keyframe slots were already applied to this state; use "
+           "a single item (keyframe_slots.py:133-134)");
+
+  Ltx2VideoLatentShape frame_shape = target;
+  frame_shape.frames = 1;
+  const int64_t tokens_per_keyframe = Ltx2VideoTokenCount(frame_shape, patch_size);
+  const int64_t slots = static_cast<int64_t>(pixel_frame_indices.size());
+  const int64_t num_new_tokens = tokens_per_keyframe * slots;
+
+  // ── the slot tokens ───────────────────────────────────────────────────────
+  //
+  // ZEROS, or the caller's seed patchified one frame at a time
+  // (keyframe_slots.py:98-116). Patchifying per frame rather than as a K-frame
+  // volume is upstream's own loop, and it matters: a K-frame patchify would
+  // interleave the slots' spatial tokens instead of laying them out
+  // slot-by-slot, and the layout below would then describe the wrong tokens.
+  std::vector<float> slot_tokens(static_cast<size_t>(num_new_tokens * state->width), 0.0f);
+  if (initial_keyframes != nullptr) {
+    VT_CHECK(initial_keyframes->frames == slots,
+             "ltx2 conditioning: initial_keyframes K=" +
+                 std::to_string(initial_keyframes->frames) + " must match " +
+                 std::to_string(slots) + " pixel_frame_indices (keyframe_slots.py:65-68)");
+    VT_CHECK(initial_keyframes->height == target.height &&
+                 initial_keyframes->width == target.width,
+             "ltx2 conditioning: initial_keyframes spatial size " +
+                 std::to_string(initial_keyframes->height) + "x" +
+                 std::to_string(initial_keyframes->width) +
+                 " does not match the target latent spatial size " +
+                 std::to_string(target.height) + "x" + std::to_string(target.width) +
+                 " (keyframe_slots.py:107-112)");
+    VT_CHECK(initial_keyframes->channels == target.channels,
+             "ltx2 conditioning: initial_keyframes carry " +
+                 std::to_string(initial_keyframes->channels) + " channels and the target has " +
+                 std::to_string(target.channels));
+    const int64_t plane = target.height * target.width;
+    for (int64_t k = 0; k < slots; ++k) {
+      // One frame, gathered into a [C, 1, H, W] volume so `Ltx2VideoPatchify`
+      // sees exactly what upstream's `initials[:, :, k:k+1]` slice is.
+      std::vector<float> one(static_cast<size_t>(target.channels * plane));
+      for (int64_t c = 0; c < target.channels; ++c) {
+        const size_t src = static_cast<size_t>((c * slots + k) * plane);
+        std::copy(initial_keyframes->data.begin() + static_cast<ptrdiff_t>(src),
+                  initial_keyframes->data.begin() + static_cast<ptrdiff_t>(src) +
+                      static_cast<ptrdiff_t>(plane),
+                  one.begin() + static_cast<ptrdiff_t>(c * plane));
+      }
+      const std::vector<float> patched = Ltx2VideoPatchify(one.data(), frame_shape, patch_size);
+      VT_CHECK(static_cast<int64_t>(patched.size()) == tokens_per_keyframe * state->width,
+               "ltx2 conditioning: a patchified slot seed does not match one latent frame");
+      std::copy(patched.begin(), patched.end(),
+                slot_tokens.begin() +
+                    static_cast<ptrdiff_t>(k * tokens_per_keyframe * state->width));
+    }
+  }
+
+  // ── the slot positions (keyframe_slots.py:152-174) ────────────────────────
+  //
+  // `causal_fix=False`, mirroring upstream's argument at :161-163 — whose
+  // comment says the fix "must not also be applied" because the span is set
+  // explicitly below.
+  //
+  // THAT COMMENT OVERSTATES IT, and the overstatement is worth recording because
+  // it is the kind a port inherits. Measured against EXECUTED upstream at the
+  // pin: computing these positions with `causal_fix=True` and then applying the
+  // explicit span below yields a BYTE-IDENTICAL tensor. The causal fix touches
+  // only the temporal axis, and the span overwrites that axis in full, so the
+  // flag cannot survive it either way. The mutation that flips it stays GREEN
+  // for that reason rather than for a missing test, and `false` is kept to
+  // mirror upstream's text.
+  std::vector<float> positions(static_cast<size_t>(3 * num_new_tokens * 2));
+  {
+    const std::vector<float> one_frame =
+        VideoPositions(frame_shape, patch_size, factors, /*causal_fix=*/false,
+                       tokens_per_keyframe);
+    for (int64_t k = 0; k < slots; ++k) {
+      const double t = static_cast<double>(pixel_frame_indices[static_cast<size_t>(k)]);
+      for (int64_t d = 0; d < 3; ++d) {
+        for (int64_t i = 0; i < tokens_per_keyframe; ++i) {
+          const size_t dst = static_cast<size_t>(
+              d * num_new_tokens * 2 + (k * tokens_per_keyframe + i) * 2);
+          if (d == 0) {
+            // `positions[:, 0, ...] = t`, then `[..., 1:] = [..., :1] + 1`, then
+            // `/= fps` (keyframe_slots.py:166-170). The span is exactly one
+            // pixel frame, which is what distinguishes a slot from a regular
+            // latent frame (spanning `factors.time`) in RoPE space. The division
+            // is f32 upstream and is done in float here for the same reason
+            // `Ltx2CreateVideoLatentState` does.
+            positions[dst] = static_cast<float>(t / fps);
+            positions[dst + 1] = static_cast<float>((t + 1.0) / fps);
+          } else {
+            // The spatial axes are the frame's own grid, untouched and NOT
+            // divided by fps.
+            const size_t src = static_cast<size_t>(d * tokens_per_keyframe * 2 + i * 2);
+            positions[dst] = one_frame[src];
+            positions[dst + 1] = one_frame[src + 1];
+          }
+        }
+      }
+    }
+  }
+
+  // ── the append (keyframe_slots.py:118-121, :136-140) ──────────────────────
+  //
+  // DELIBERATELY NOT `AppendTokens`. That helper implements the polarity every
+  // OTHER appending item has — zeros into `latent`, content into `clean`, mask
+  // `1 - strength` — and a slot inverts all three. Routing this through it would
+  // place the seed where the noiser never reads it and pin the slot at
+  // `1 - strength` instead of 1, producing a finite, correctly shaped, empty
+  // slot.
+  const int64_t before = state->tokens;
+  const int64_t after = before + num_new_tokens;
+
+  // BEFORE the append, on the pre-append state, and MARKED. This is the
+  // production caller `Ltx2ExtendKeyframesMask`'s `marked=true` branch was
+  // landed for and had none until this row (#930's spec assigned it to #920;
+  // #986 pays it).
+  Ltx2ExtendKeyframesMask(state, num_new_tokens, /*marked=*/true);
+
+  state->latent.insert(state->latent.end(), slot_tokens.begin(), slot_tokens.end());
+  // `torch.zeros_like(slot_tokens)` (keyframe_slots.py:139). The clean tensor is
+  // IGNORED at denoise_mask 1, and writing the seed here as well would make the
+  // two agree by accident and hide a mask defect.
+  state->clean.resize(static_cast<size_t>(after * state->width), 0.0f);
+  // `torch.ones` (keyframe_slots.py:119), not `1 - strength`: a slot has no
+  // strength, because it is output rather than guidance.
+  state->mask.insert(state->mask.end(), static_cast<size_t>(num_new_tokens), 1.0f);
+
+  std::vector<float> grown(static_cast<size_t>(3 * after * 2));
+  for (int64_t d = 0; d < 3; ++d) {
+    std::copy(state->positions.begin() + static_cast<ptrdiff_t>(d * before * 2),
+              state->positions.begin() + static_cast<ptrdiff_t>((d + 1) * before * 2),
+              grown.begin() + static_cast<ptrdiff_t>(d * after * 2));
+    std::copy(positions.begin() + static_cast<ptrdiff_t>(d * num_new_tokens * 2),
+              positions.begin() + static_cast<ptrdiff_t>((d + 1) * num_new_tokens * 2),
+              grown.begin() + static_cast<ptrdiff_t>(d * after * 2 + before * 2));
+  }
+  state->positions.swap(grown);
+  state->tokens = after;
+
+  // `GeneratedKeyframeLayout(...)` (keyframe_slots.py:143-147). `first_token` is
+  // `latent_state.latent.shape[1]` — the count BEFORE the append, captured
+  // above, which is the only moment it is knowable without searching.
+  state->generated_keyframe_layout.pixel_frame_indices = pixel_frame_indices;
+  state->generated_keyframe_layout.tokens_per_keyframe = tokens_per_keyframe;
+  state->generated_keyframe_layout.first_token = before;
+}
+
+Ltx2LatentVolume Ltx2ExtractGeneratedKeyframes(const Ltx2LatentState& state,
+                                               const Ltx2VideoLatentShape& target,
+                                               int64_t patch_size) {
+  const Ltx2GeneratedKeyframeLayout& layout = state.generated_keyframe_layout;
+  // `if layout is None: return None` (tools.py:205-206). An empty volume is that
+  // None, and every caller checks `frames == 0` rather than treating the absence
+  // as an error — a state without slots is the ordinary case.
+  if (!layout.applied()) return Ltx2LatentVolume{};
+
+  VT_CHECK(layout.first_token + layout.num_tokens() <= state.tokens,
+           "ltx2 conditioning: generated keyframe layout spans tokens [" +
+               std::to_string(layout.first_token) + ", " +
+               std::to_string(layout.first_token + layout.num_tokens()) +
+               ") but the state has only " + std::to_string(state.tokens) +
+               " tokens. The layout was recorded against a different token sequence "
+               "(tools.py:208-214)");
+
+  Ltx2VideoLatentShape frame_shape = target;
+  frame_shape.frames = 1;
+  const int64_t per_frame = Ltx2VideoTokenCount(frame_shape, patch_size);
+  VT_CHECK(layout.tokens_per_keyframe == per_frame,
+           "ltx2 conditioning: generated keyframe layout has " +
+               std::to_string(layout.tokens_per_keyframe) +
+               " tokens per keyframe, but this target shape uses " + std::to_string(per_frame) +
+               ". The layout belongs to a different resolution (tools.py:215-220). Reading it "
+               "anyway would unpatchify the right NUMBER of values into the wrong grid, which "
+               "produces a keyframe rather than an error");
+
+  const int64_t slots = layout.num_keyframes();
+  Ltx2LatentVolume out;
+  out.batch = 1;
+  out.channels = target.channels;
+  out.frames = slots;
+  out.height = target.height;
+  out.width = target.width;
+  out.data.assign(static_cast<size_t>(out.elems()), 0.0f);
+
+  // `unpatchify` PER SLOT into a one-frame shape, then `torch.cat(frames, dim=2)`
+  // (tools.py:222-230). Per slot rather than over the whole range, because each
+  // slot is an independent single-pixel-frame latent — the same reason upstream
+  // warns that a K-frame causal DECODE of the result would blend slots that were
+  // never adjacent (types.py:269-272).
+  const int64_t plane = target.height * target.width;
+  for (int64_t k = 0; k < slots; ++k) {
+    const size_t first = static_cast<size_t>(
+        (layout.first_token + k * layout.tokens_per_keyframe) * state.width);
+    std::vector<float> tokens(
+        state.latent.begin() + static_cast<ptrdiff_t>(first),
+        state.latent.begin() + static_cast<ptrdiff_t>(first) +
+            static_cast<ptrdiff_t>(layout.tokens_per_keyframe * state.width));
+    const std::vector<float> frame = Ltx2VideoUnpatchify(tokens.data(), frame_shape, patch_size);
+    VT_CHECK(static_cast<int64_t>(frame.size()) == target.channels * plane,
+             "ltx2 conditioning: an unpatchified slot is not one latent frame");
+    for (int64_t c = 0; c < target.channels; ++c) {
+      std::copy(frame.begin() + static_cast<ptrdiff_t>(c * plane),
+                frame.begin() + static_cast<ptrdiff_t>((c + 1) * plane),
+                out.data.begin() + static_cast<ptrdiff_t>((c * slots + k) * plane));
+    }
+  }
+  return out;
+}
+
+void Ltx2ClearConditioning(Ltx2LatentState* state, int64_t target_tokens,
+                           const Ltx2VideoLatentShape* target, int64_t patch_size,
+                           Ltx2LatentVolume* out_generated_keyframes) {
+  VT_CHECK(state != nullptr, "ltx2 conditioning: null state");
+
+  // BEFORE THE TRIM (tools.py:97 against :115). The slots live outside the
+  // target grid, so the truncation below is exactly what destroys them. Order is
+  // the entire content of this block: a port that extracted afterwards would
+  // return a correct video latent and no slots, with nothing about the shape or
+  // the token count to show for it.
+  if (out_generated_keyframes != nullptr && state->generated_keyframe_layout.applied()) {
+    VT_CHECK(target != nullptr,
+             "ltx2 conditioning: this state carries generated keyframe slots and a caller asked "
+             "for them, but no target shape was supplied to unpatchify them with");
+    *out_generated_keyframes = Ltx2ExtractGeneratedKeyframes(*state, *target, patch_size);
+  }
+
   VT_CHECK(target_tokens >= 0 && target_tokens <= state->tokens,
            "ltx2 conditioning: clear_conditioning TRUNCATES to the target token count "
            "(tools.py:101-105), so the target cannot exceed what the state carries. A state "

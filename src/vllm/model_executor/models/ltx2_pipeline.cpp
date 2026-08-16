@@ -1149,6 +1149,36 @@ Ltx2PipelineRecipe DistilledTwoStageRecipe(const std::string& version) {
   return recipe;
 }
 
+// DFRPipeline (ltx-pipelines/dfr_pipeline.py:155-561). Row LTX25-DFR-PIPELINE,
+// issue #986.
+//
+// THE SCHEDULE IS THE DISTILLED TWO-STAGE ONE, EXACTLY, and that is a finding
+// rather than a shortcut. `DFRPipeline.__call__` defaults `stage_1_sigmas` to
+// `DISTILLED_SIGMAS` and `stage_2_sigmas` to `STAGE_2_DISTILLED_SIGMAS`
+// (:281-282), runs stage 1 at `width // 2, height // 2` (:319), and re-noises
+// stage 2 to `stage_2_sigmas[0]` (:386-391). Every one of those is what
+// `DistilledTwoStageRecipe` already carries. DFR differs from the distilled
+// two-stage pipeline in its CONDITIONING and its rounds loop, not in its
+// schedule — recorded here so a reader does not go looking for a DFR-specific
+// sigma set that upstream does not have.
+//
+// What the recipe DOES carry differently is the phase NAMES, because they are
+// what the engine's refusals quote back to a caller, and "generate_lowres" would
+// describe the wrong thing on a pipeline whose first stage also invents keyframe
+// slots.
+Ltx2PipelineRecipe DfrRecipe(const std::string& version) {
+  Ltx2PipelineRecipe recipe = DistilledTwoStageRecipe(version);
+  if (recipe.phases.size() != 2) {
+    Refuse("The DFR recipe is the distilled two-stage recipe with DFR's phase names, and that "
+           "recipe just returned " + std::to_string(recipe.phases.size()) +
+           " phases. DFR's stage 1 and stage 2 are addressed by INDEX below, so a changed phase "
+           "count would rename the wrong ones.");
+  }
+  recipe.phases[0].name = "dfr_base";
+  recipe.phases[1].name = "dfr_detail";
+  return recipe;
+}
+
 // `RetakePipeline` (retake.py:53). ONE stage at the SOURCE clip's own
 // resolution, distilled sigmas, plain Euler, no guidance — see the table comment
 // in the header for the line behind each of those, and in particular for why
@@ -1219,6 +1249,14 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
     if (model_version == "2" || model_version == "2.5") {
       return DistilledTwoStageRecipe(model_version);
     }
+  } else if (pipeline_kind == "dfr") {
+    // 2.5 only, and deliberately not 2.0. DFR's whole base stage rests on
+    // generated keyframe slots, which need a checkpoint declaring
+    // `use_keyframes_abs_pos_embedding` (blocks.py:395-419); the 2.0 distilled
+    // row exists here for a generation that predates that parameter, so
+    // resolving DFR onto it would build a recipe whose first stage the engine
+    // must then refuse at load. Refusing at the recipe table names the version.
+    if (model_version == "2.5") return DfrRecipe(model_version);
   } else if (pipeline_kind == "dmd2") {
     if (model_version == "2" || model_version == "2.3") return PositiveOnlyRecipe();
   } else if (pipeline_kind == "retake") {

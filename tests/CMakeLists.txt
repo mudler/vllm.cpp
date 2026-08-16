@@ -275,9 +275,16 @@ vllm_cpp_add_test(test_ltx2_video vllm/multimodal/test_ltx2_video.cpp)
 # claims about this tree as a list of names, and the suite re-derives each one
 # from these declarations. Reading the claim out of the file that makes it is the
 # tautology issue #911 records, so the two files are deliberately not the same.
+#
+# The third path is the DFR canvas header (row LTX25-DFR-PIPELINE, #986), read
+# for the same reason and by the same rule. The temporal-rounds refusal rules the
+# canvas layout OUT as a blocker on the grounds that it is ported here, which is
+# a claim about THIS tree; the suite re-derives it from these declarations rather
+# than from the message that makes it.
 target_compile_definitions(test_ltx2_video PRIVATE
   LTX2_VIDEO_SOURCE_PATH="${CMAKE_SOURCE_DIR}/src/vllm/multimodal/ltx2_video.cpp"
-  LTX2_CONDITIONING_HEADER_PATH="${CMAKE_SOURCE_DIR}/include/vllm/model_executor/models/ltx2_conditioning.h")
+  LTX2_CONDITIONING_HEADER_PATH="${CMAKE_SOURCE_DIR}/include/vllm/model_executor/models/ltx2_conditioning.h"
+  LTX2_DFR_HEADER_PATH="${CMAKE_SOURCE_DIR}/include/vllm/model_executor/models/ltx2_dfr.h")
 # LTX-2.5 image conditioning (row LTX25-IMAGE-COND, issue #644): the CHAIN from
 # PPM bytes to conditioned, noised tokens, gated against upstream ltx_core AND
 # ltx_pipelines executed at reduced dimensions. ltx2_image_cond_goldens.inc
@@ -319,6 +326,14 @@ target_include_directories(test_ltx2_text_encoder PRIVATE ${CMAKE_CURRENT_SOURCE
 # guidance, patchifiers, the recipe table, the latent spatial upsampler, the
 # duration head and the embeddings connector. ltx2_pipeline_goldens.inc lives
 # next to the test source.
+# LTX-2.5 DFR canvas layout (ROW LTX25-DFR-PIPELINE, issue #986). Gated against
+# EXECUTED upstream `dfr_layout` and the three pure-index `dfr_pipeline` helpers;
+# ltx2_dfr_goldens.inc lives next to the test source. Every value is an INDEX, so
+# the suite compares exact vectors rather than bounding a magnitude — there is no
+# NaN, no shape disagreement and no scale for a looser gate to notice.
+vllm_cpp_add_test(test_ltx2_dfr vllm/models/test_ltx2_dfr.cpp)
+target_include_directories(test_ltx2_dfr PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
 vllm_cpp_add_test(test_ltx2_pipeline vllm/models/test_ltx2_pipeline.cpp)
 target_include_directories(test_ltx2_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 # The out-of-scope ledger separates a REACHABLE refusal from a declared marker, and

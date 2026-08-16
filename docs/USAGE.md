@@ -530,22 +530,32 @@ Where the embedding does bite is the FIRST latent frame of every render, which
 was a separate gap; it was closed on 2026-08-14 under issue #658, so the marker
 is now applied on every render.)
 
-**Generated keyframe slots are a different feature, and they are refused.**
-Upstream also lets the model *generate* extra frames at interior positions —
-`--num-generated-keyframes N` there, the per-generation extra
+**Generated keyframe slots are a different feature, and they are now SERVED.**
+Upstream also lets the model *generate* extra frames at interior positions,
+`--num-generated-keyframes N` there and the per-generation extra
 `num_generated_keyframes` here. That is not a keyframe you supply; it is one you
 ask the model to invent, and each slot buys one pixel frame at the cost of a
 full latent frame of tokens. `0` is upstream's own default and means off, so
-passing it explicitly renders normally. A positive count is refused by name, and
-what the refusal names is the **readback**: the slots are the OUTPUT, so they
-have to be located by the layout the append recorded, extracted before the extra
-tokens are trimmed off, and then each decoded as a standalone one-frame clip,
-because a multi-frame causal decode would blend slots that were never temporally
-adjacent. Two plausible reasons are ruled out rather than left for a reader to
-re-derive: the token-APPEND machinery, which the last-frame arm above uses
-today, and the trained keyframe marker, which issue #658 landed and which every
-render already applies. A negative count is refused separately with upstream's
-own reason, since a malformed request and an unported arm are different answers.
+passing it explicitly renders normally. A positive count places that many
+evenly spaced INTERIOR slots: both endpoints are dropped, because frame 0
+already spans a single pixel frame under causal encoding and the last frame is
+the clip's own end. The slots are marked with the trained keyframe embedding,
+denoised with the video, and read back out of the state before the extra tokens
+are trimmed away.
+
+Two refusals remain, and they are upstream's own rather than ours. A negative
+count is refused, and so is a count the clip is too short for: every slot is an
+interior position, so `N + 2` frames are the minimum.
+
+**This page said until 2026-08-16 that a positive count was refused, and it is
+recorded rather than deleted** because a reader may have planned around it. The
+refusal named the readback as its one blocker, and it was right: what landed
+under issue #986 is the layout that locates the slots exactly and the extraction
+that runs before the trim. One third of what that refusal named is still owed,
+and it is a different surface rather than a smaller version of this one, the
+standalone single-frame decode that would hand you slot PIXELS. Nothing here
+returns those: the slots stay in latent space, which is what DFR below wants
+from them.
 
 Reference-image, reference-video and reference-audio conditioning are still
 refused, each naming a different missing piece. **Two reasons this page used to
@@ -788,8 +798,59 @@ doubles the frame axis and then drops the first frame, which upstream encodes as
 a single pixel frame. Passing it is refused by name rather than
 reported as a shape mismatch. The temporal arm itself is implemented and gated
 against upstream, but **nothing drives it**: its only upstream consumer is
-`DFRPipeline`'s multi-round loop, which is not ported, so there is no flag that
-makes a request use it and no reason to pass that file today.
+`DFRPipeline`'s multi-round loop. The DFR pipeline's BASE is ported as of issue
+#986 and is described below, and the rounds loop is not, so there is still no
+flag that makes a request use that file and no reason to pass it today. The
+checkpoint is also not published beside the spatial one on the mirror this port
+was built against, so nothing here has run it on real weights.
+
+### The DFR pipeline: `--pipeline-kind dfr`
+
+Detail-fidelity rendering. It is upstream's `DFRPipeline`, and it differs from
+the ordinary distilled two-stage recipe in its CONDITIONING rather than in its
+schedule: both stages run the same sigmas, and stage 1 is the same half
+resolution. What DFR adds is a keyframe grid.
+
+**The canvas is padded, and this is the part that surprises people.** DFR lays
+keyframes on a segment grid, 24 or 32 frames per segment, whichever pads least,
+and it pads `num_frames - 1` up to a whole number of segments before it renders
+anything. A 9-frame request therefore denoises a 25-frame canvas and is trimmed
+back to 9 before you see it. Ask for 121 frames and you get 121; ask for 9 and
+the machine does about three times the work you might expect.
+
+**Frame counts are refused here rather than floored.** Everywhere else in this
+engine a frame count that is not `8k + 1` is floored onto the latent grid, and
+that is documented above as the behaviour. DFR cannot live with it: every
+keyframe position it emits has to land on a latent border, so `--frames 10` is
+refused with the reason rather than quietly rendered as 9.
+
+**`num_generated_keyframes` is refused on this pipeline.** DFR chooses its own
+slot positions from the canvas, one per segment boundary, and the whole pipeline
+is indexed by that grid. An override would leave the slots and the canvas
+describing different frames, and the render would still finish. Use
+`--pipeline-kind distilled_two_stage` or `one_stage` if you want to place slots
+by count. An explicit `0` still passes, because that is upstream's default.
+
+**How to reach it.** `pipeline_kind` is a LOAD knob, not a per-generation one, so
+all three surfaces carry it: `ltx2-gen --pipeline-kind dfr`, the C ABI's
+`vllm_video_model_params.extra_keys` / `extra_values`, and the server's
+`--video-extra pipeline_kind=dfr` at launch. A server started that way renders
+every `/v1/videos` request through DFR.
+
+The two knobs beside it are per-GENERATION and therefore CLI and ABI only, because
+`/v1/videos` forwards no per-generation extra to any engine yet (issue #928):
+`num_generated_keyframes` on the other pipelines, and `temporal_upsample_rounds`
+below.
+
+**What is not served.** `temporal_upsample_rounds` is defined and refused above
+`0`: the rounds loop that temporally doubles the latent, re-tiles the canvas and
+stitches it back is not ported. The refusal names it, and it names three things
+that are NOT the reason, because each is the one a reader reaches for first: the
+temporal upsampler operator is ported and gated, the canvas and tiling
+arithmetic is ported and gated in this same change, and the generated keyframe
+slots are served. What has no counterpart here is the per-tile denoise pass as a
+callable. Stage 2's x2 spatial detailing IC-LoRA is refused separately, for the
+reasons the reference-video arm is refused above.
 
 On the server, `--video-family ltx-2.5` pins the family instead of detecting it,
 and `--video-extra KEY=VALUE` (repeatable) carries the same family-specific load

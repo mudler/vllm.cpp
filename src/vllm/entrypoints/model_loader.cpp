@@ -828,8 +828,40 @@ std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
       mtp_layers = text->value("mtp_num_hidden_layers", int64_t{1});
     }
   }
-  return vllm::SpeculativeConfig::ResolveMtp(static_cast<int>(mtp_layers),
-                                             cli.num_speculative_tokens);
+  vllm::SpeculativeConfig mtp = vllm::SpeculativeConfig::ResolveMtp(
+      static_cast<int>(mtp_layers), cli.num_speculative_tokens);
+  // SPEC-MTP-K-GT-1 (#81): the MTP PROPOSE is k=1 only. This tree ported
+  // upstream's k=1 early exit (autoregressive/speculator.py:236-238) and not the
+  // autoregressive multi-step loop behind it (prepare_decode_inputs :597-671 plus
+  // the k-1 draft decode steps :374-419), so GPUModelRunner::propose_drafts
+  // stashes exactly ONE draft per request (runner.cpp:2174). Everything around it
+  // already honours k: the scheduler reserves k lookahead slots, the KV spec
+  // widens by k (MakeKVCacheMaybeSpec below) and the verify graph captures 1 + k
+  // (cudagraph_dispatch.h:45-46). Accepting k>1 therefore buys the COST of depth
+  // k and delivers depth 1, with no error and no log.
+  //
+  // The refusal lives HERE, beside the per-method requirements above, and not in
+  // SpeculativeConfig::ResolveMtp. Two reasons. ResolveMtp is a faithful mirror
+  // of speculative.py's resolution and upstream does not refuse depth there, so a
+  // throw inside it would be a divergence in the mirrored type. And the thing
+  // that cannot serve depth is THIS ENGINE's propose path, not the config value,
+  // so the capability gate belongs on the engine's resolution seam. Every entry
+  // point reaches it: the LoadedEngine constructor runs ResolveSpecConfig as its
+  // FIRST member initialisation, before the KV pool is widened for a depth that
+  // would go unused, so the CLI, --speculative-config JSON, the C ABI and the
+  // in-memory constructors all fail at construction rather than at the first
+  // propose. The n-gram, DFlash and DSpark branches above return before reaching
+  // this line and genuinely serve k>1, so they are untouched.
+  if (mtp.ResolvedNumSpeculativeTokens() > 1) {
+    throw std::invalid_argument(
+        "speculative-config: method \"mtp\" does not implement "
+        "num_speculative_tokens > 1 (resolved " +
+        std::to_string(mtp.ResolvedNumSpeculativeTokens()) +
+        "). The autoregressive multi-step draft propose is not ported, so only "
+        "num_speculative_tokens=1 is served. Use 1, or use a method that drafts "
+        "deeper (\"ngram\", \"dflash\", \"dspark\"). Tracked by issue #81");
+  }
+  return mtp;
 }
 
 vllm::v1::KVCacheConfig LoadedEngine::MakeKVCacheMaybeSpec(

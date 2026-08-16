@@ -48,6 +48,7 @@
 #include <unordered_map>
 
 #include "vt/cpu/cpu_quant_blocks.h"        // vt::cpu::Block* struct mirror (single source)
+#include "vt/cuda/cuda_iq_table_seal.h"      // IqTableSnapshot (the device-codebook drift seal)
 #include "vt/cuda/cuda_quant_iq_tables.cuh"  // d_iq2xxs_grid / d_iq3xxs_grid / d_ksigns / d_kmask
 #include "vt/cuda/graph_safe_scratch.h"      // RetireGraphScratch (cudagraph-safe grow-only)
 #include "vt/ops.h"
@@ -1871,6 +1872,14 @@ void MatmulBTQuantKernelCuda(Queue& q, Tensor& out, const Tensor& a,
     case WType::kIQ2_S: LaunchGemm<WType::kIQ2_S>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     case WType::kIQ1_S: LaunchGemm<WType::kIQ1_S>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     case WType::kIQ1_XXXS: LaunchGemm<WType::kIQ1_XXXS>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    // See the identical arm in MatmulBTQuantGroupedKernelCuda below: past the
+    // IsCudaKeepQuantSupported gate there is no CPU fallback left, so a missing
+    // case launches nothing, leaves `out` untouched, and CheckCuda still reports
+    // success. Throw instead of returning a stale buffer.
+    default:
+      throw std::runtime_error(
+          std::string("vt cuda: matmul_bt_quant: no keep-quant kernel for dtype ") +
+          Name(b.dtype));
   }
   CheckCuda(cudaGetLastError(), "matmul_bt_quant launch");
 }
@@ -1954,6 +1963,19 @@ void MatmulBTQuantGroupedKernelCuda(Queue& q, Tensor& out, const Tensor& act,
     case WType::kQ5_K: LaunchGroupedGemm<WType::kQ5_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
     case WType::kQ6_K: LaunchGroupedGemm<WType::kQ6_K>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
     case WType::kIQ2_S: LaunchGroupedGemm<WType::kIQ2_S>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kIQ1_S: LaunchGroupedGemm<WType::kIQ1_S>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kIQ1_XXXS: LaunchGroupedGemm<WType::kIQ1_XXXS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    // IsCudaKeepQuantSupported already answered yes, so the CPU fallback above is
+    // skipped. A `w` with no case here launches NOTHING, leaves `out` exactly as
+    // the caller left it, and the CheckCuda below reports SUCCESS because there
+    // was no launch to fail. That is how #967 shipped silently wrong IQ1_S /
+    // IQ1_XXXS routed experts: the predicate grew two dtypes and only the dense
+    // switch grew with it. Throw, so the next omission is loud.
+    default:
+      throw std::runtime_error(
+          std::string("vt cuda: matmul_bt_quant_grouped: no grouped kernel for keep-quant "
+                      "dtype ") +
+          Name(weight.dtype));
   }
   CheckCuda(cudaGetLastError(), "matmul_bt_quant_grouped launch");
 }
@@ -1976,6 +1998,39 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// Device-codebook drift seal (see cuda_iq_table_seal.h). `cudaMemcpyFromSymbol`
+// needs the host-side shadow of a `__device__` array, which only this TU has, so
+// the copy lives here and the memcmp against the CPU tables lives in
+// tests/vt/test_cuda_quant_dot.cpp. The static_asserts pin the snapshot extents
+// to the device arrays: a table that changes length breaks the build rather than
+// sealing a prefix of itself.
+void SnapshotIqTablesFromDevice(IqTableSnapshot* out) {
+  static_assert(sizeof(out->kmask_iq2xs) == sizeof(d_kmask_iq2xs), "kmask extent");
+  static_assert(sizeof(out->ksigns_iq2xs) == sizeof(d_ksigns_iq2xs), "ksigns extent");
+  static_assert(sizeof(out->iq1s_grid) == sizeof(d_iq1s_grid), "iq1s grid extent");
+  static_assert(sizeof(out->iq1xxxs_grid) == sizeof(d_iq1xxxs_grid), "iq1xxxs grid extent");
+  static_assert(sizeof(out->iq2xxs_grid) == sizeof(d_iq2xxs_grid), "iq2xxs grid extent");
+  static_assert(sizeof(out->iq3xxs_grid) == sizeof(d_iq3xxs_grid), "iq3xxs grid extent");
+  static_assert(sizeof(out->iq2s_grid) == sizeof(d_iq2s_grid), "iq2s grid extent");
+  static_assert(sizeof(out->kvalues_mxfp4) == sizeof(d_kvalues_mxfp4), "mxfp4 values extent");
+  CheckCuda(cudaMemcpyFromSymbol(out->kmask_iq2xs, d_kmask_iq2xs, sizeof(d_kmask_iq2xs)),
+            "snapshot d_kmask_iq2xs");
+  CheckCuda(cudaMemcpyFromSymbol(out->ksigns_iq2xs, d_ksigns_iq2xs, sizeof(d_ksigns_iq2xs)),
+            "snapshot d_ksigns_iq2xs");
+  CheckCuda(cudaMemcpyFromSymbol(out->iq1s_grid, d_iq1s_grid, sizeof(d_iq1s_grid)),
+            "snapshot d_iq1s_grid");
+  CheckCuda(cudaMemcpyFromSymbol(out->iq1xxxs_grid, d_iq1xxxs_grid, sizeof(d_iq1xxxs_grid)),
+            "snapshot d_iq1xxxs_grid");
+  CheckCuda(cudaMemcpyFromSymbol(out->iq2xxs_grid, d_iq2xxs_grid, sizeof(d_iq2xxs_grid)),
+            "snapshot d_iq2xxs_grid");
+  CheckCuda(cudaMemcpyFromSymbol(out->iq3xxs_grid, d_iq3xxs_grid, sizeof(d_iq3xxs_grid)),
+            "snapshot d_iq3xxs_grid");
+  CheckCuda(cudaMemcpyFromSymbol(out->iq2s_grid, d_iq2s_grid, sizeof(d_iq2s_grid)),
+            "snapshot d_iq2s_grid");
+  CheckCuda(cudaMemcpyFromSymbol(out->kvalues_mxfp4, d_kvalues_mxfp4, sizeof(d_kvalues_mxfp4)),
+            "snapshot d_kvalues_mxfp4");
+}
 
 // Brick 12 (ds4-gap "launch consolidation"): PAIRED Q8_0 decode GEMV (external linkage,
 // called from cuda_deepseek_v4.cu's DsaDeviceKernels wrapper — same CUDA library). One
@@ -2123,6 +2178,18 @@ void MoeGateUpSwiGLUGroupedCuda(Queue& q, Tensor& out, const Tensor& act, const 
     case WType::kQ5_K: LaunchGroupedFusedSwiGLU<WType::kQ5_K>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
     case WType::kQ6_K: LaunchGroupedFusedSwiGLU<WType::kQ6_K>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
     case WType::kIQ2_S: LaunchGroupedFusedSwiGLU<WType::kIQ2_S>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kIQ1_S: LaunchGroupedFusedSwiGLU<WType::kIQ1_S>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    case WType::kIQ1_XXXS: LaunchGroupedFusedSwiGLU<WType::kIQ1_XXXS>(out, gw, uw, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, limit, bcast, s); break;
+    // Before #967 the guard above THREW for these two dtypes, because
+    // IsCudaKeepQuantSupported returned false and the named "same CUDA
+    // keep-quant dtype" error fired. #967 made the predicate say yes without
+    // adding the arms, which turned that named error into a silent no-op:
+    // nothing launches, `out` keeps whatever it held, CheckCuda sees no launch
+    // to fail. Same failure mode as the grouped GEMM above.
+    default:
+      throw std::runtime_error(
+          std::string("vt cuda: moe_gate_up_swiglu: no fused kernel for keep-quant dtype ") +
+          Name(gate_w.dtype));
   }
   CheckCuda(cudaGetLastError(), "moe_gate_up_swiglu launch");
 }

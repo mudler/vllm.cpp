@@ -53,11 +53,21 @@
 namespace vllm {
 
 // LatentState (types.py:251-287) at batch 1, carrying only the fields a
-// conditioning item touches. `attention_mask` is deliberately absent: every item
-// ported here passes `attention_mask=None` and there is no pre-existing mask, so
-// `update_attention_mask` returns None (conditioning/mask_utils.py:110-140). An
-// item that DID need one would have to grow this struct rather than silently
-// dropping it, which is why the omission is stated here.
+// conditioning item touches.
+//
+// `attention_mask` is deliberately absent, and the reason is a fact about the
+// ported items rather than a simplification. Both appending VIDEO items pass a
+// literal `attention_mask=None` (keyframe_cond.py:68-76,
+// reference_video_cond.py:88-96), and `update_attention_mask` returns None when
+// its argument is None and the state carries no mask
+// (conditioning/mask_utils.py:110-143). The ONLY upstream route to a non-None
+// mask is `ConditioningItemAttentionStrengthWrapper`, whose sole application
+// site is the IC-LoRA path (ltx-pipelines/iclora_utils.py:169);
+// `combined_image_conditionings` (ltx-pipelines/utils/helpers.py:272-308), which
+// is the route this engine mirrors, never wraps. So a field here would be one no
+// ported item can populate — the unpassed-parameter shape .agents/reachability.md
+// enumerates. An item that DID need one would have to grow this struct rather
+// than silently dropping it, which is why the omission is stated here.
 struct Ltx2LatentState {
   int64_t tokens = 0;
   int64_t width = 0;     // channels per token
@@ -66,6 +76,17 @@ struct Ltx2LatentState {
   std::vector<float> clean;      // [tokens, width]
   std::vector<float> mask;       // [tokens] — the denoise mask, 1 = fully denoised
   std::vector<float> positions;  // [pos_dims, tokens, 2] — [start, end)
+  // `LatentState.keyframes_mask` (types.py:251-287), [tokens] in {0, 1}. EMPTY
+  // is upstream's `None`, which is what an audio state carries and what a video
+  // state carries before `create_initial_state` marks the first latent frame.
+  //
+  // It lives HERE rather than beside the state because every appending item has
+  // to extend it — upstream's own docstring says "Every conditioning item that
+  // appends tokens must call this, otherwise the per-token marker goes out of
+  // sync with the token sequence" (mask_utils.py:83-85). A marker held next to a
+  // state that grows is a marker that silently stops describing it, and nothing
+  // about the render's SHAPE can see the difference.
+  std::vector<float> keyframes_mask;
 };
 
 // VideoLatentTools.create_initial_state (tools.py:139-186) at batch 1.
@@ -134,6 +155,44 @@ void Ltx2ConditionVideoByReference(Ltx2LatentState* state, const Ltx2LatentVolum
                                    int64_t patch_size, const Ltx2ScaleFactors& factors, double fps,
                                    int64_t downscale_factor, int64_t temporal_scale_factor,
                                    double strength, bool causal_fix);
+
+// `extend_keyframes_mask` (conditioning/mask_utils.py:74-105). Extends the state's
+// per-token marker to cover `num_new_tokens` tokens the caller is about to
+// append. Call it with the state as it stands BEFORE the append, which is the
+// state upstream hands it.
+//
+// The two None branches are upstream's and are mirrored exactly. No existing
+// mask and `marked` false leaves the mask empty (`return None`, :98-99) — an
+// audio state and any unmarked append onto an unmarked state. No existing mask
+// and `marked` TRUE zero-fills a fresh one first (:100-101), so the appended
+// tokens are the only marked ones.
+//
+// `marked` is TRUE for exactly one upstream construct, `VideoGeneratedKeyframeSlots`
+// (conditioning/types/keyframe_slots.py:121); every other appending item passes
+// false, because given keyframe content and reference latents are ordinary
+// guidance rather than a generated single-pixel-frame slot
+// (keyframe_cond.py:85-86, reference_video_cond.py:103-105).
+void Ltx2ExtendKeyframesMask(Ltx2LatentState* state, int64_t num_new_tokens, bool marked);
+
+// `LatentTools.clear_conditioning` (tools.py:88-117), called immediately before
+// unpatchify (ltx-pipelines/utils/blocks.py:576, :579). Truncates `latent`,
+// `clean` and `positions` back to `target_tokens`, which is
+// `patchifier.get_token_count(target_shape)` — so an appending item MUST add its
+// tokens at the END, which is what upstream's docstring requires in terms.
+//
+// TWO THINGS HERE ARE NOT A TRUNCATION and a port that only slices gets both
+// wrong. The denoise mask comes back as `torch.ones_like(...)[:, :num_tokens]`
+// (tools.py:104) — ALL ONES, not the conditioned mask sliced — because the
+// returned state describes a finished latent in which every target token is
+// denoised. And `keyframes_mask` is dropped to None (tools.py:113), because the
+// marker described a sequence that no longer exists.
+//
+// Both anchors are spelled with their FILE rather than left as bare `:NN`
+// continuations. The nearest file named above them is `blocks.py`, and
+// `blocks.py:104` and `blocks.py:113` are both real import statements, so a bare
+// form would send a reader who checks to a plausible wrong place rather than to
+// nothing — which is the failure mode worth spending eight characters on.
+void Ltx2ClearConditioning(Ltx2LatentState* state, int64_t target_tokens);
 
 // AudioConditionByReferenceLatent (reference_audio_cond.py:33-65): APPEND already
 // patchified reference-audio tokens with their own timings. Takes the patchified

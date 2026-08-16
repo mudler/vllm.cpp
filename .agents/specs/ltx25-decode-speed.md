@@ -506,7 +506,7 @@ this row's business, but every comparison below is about the **conv** arm and
 says so, because the two have different ops, different tiling defaults and
 different memory profiles.
 
-### 2.2 `diffusers` — implements LTX-2.5, and this campaign has been recording otherwise
+### 2.2 `diffusers` — implements LTX-2.5, and no LTX-2.5 record in this tree considers it
 
 This is the first of the two contradictions, and it is the one that changes the
 denominator answer.
@@ -569,10 +569,11 @@ hits under `src/diffusers` and 25 repo-wide** — the other 10 are LTX pipeline 
 LoRA tests setting it to `False` — and three **other** VAEs do set it True
 (`autoencoder_kl_hunyuan_video.py:712`, `autoencoder_kl_mochi.py:834`,
 `autoencoder_kl_magvit.py:798`) — neither LTX VAE ever does.
-**`autoencoder_kl_magvit.py:799` is a different symbol**, `use_framewise_**encoding**
-= True`, and an earlier draft cited it: an off-by-one that lands on a line
-reading `use_framewise_*coding = True` is invisible to a reader checking the
-shape rather than the string.
+**`autoencoder_kl_magvit.py:799` is a different symbol** —
+`self.use_framewise_encoding = True`, *encoding* rather than *decoding* — and an
+earlier draft cited it. An off-by-one that lands on a line reading
+`use_framewise_?coding = True` is invisible to a reader checking the shape
+rather than the string, which is why the string is quoted here.
 
 **The one quantified memory statement in any oracle** is diffusers' own, and it
 is about the *diffusion* arm at a size an order of magnitude past ours —

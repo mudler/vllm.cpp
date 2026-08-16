@@ -1144,6 +1144,55 @@ class TenstorrentMistralRowIsCounted(unittest.TestCase):
         )
 
 
+class CudaLlamacppRowIsCounted(TenstorrentMistralRowIsCounted):
+    """The BACKEND ratchet bump to 83 is backed by a real row (#979).
+
+    Same shape and same reason as the two cases above: the count is re-pinned
+    by hand, so a bump with no row behind it is indistinguishable from a bump
+    for a new row. Inherits the removal mutation unchanged so only the row and
+    its two required links differ.
+
+    This row exists because the llama.cpp comparator on a CURRENT CUDA card had
+    no owner at all. `BACKEND-GATE-CPU-LLAMACPP` is the CPU floor and
+    `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` is scoped to the pre-Ampere arches vLLM
+    drops, so a GB10 GGUF comparison fell between them, which is how
+    `bench-27b-five-way.md` came to list a llama.cpp CUDA arm with nothing
+    tracking it.
+    """
+
+    ROW = "BACKEND-GATE-CUDA-LLAMACPP"
+
+    def test_the_row_names_its_issue_and_its_spec(self) -> None:
+        text = (ROOT / ".agents/backend-matrix.md").read_text(encoding="utf-8")
+        row = next(l for l in text.splitlines() if l.startswith(f"| `{self.ROW}` |"))
+        self.assertIn("bench-qwen38-27b-four-way.md", row)
+        index = (ROOT / ".agents/issue-index.md").read_text(encoding="utf-8")
+        self.assertIn("issues/979", index)
+
+    def test_the_row_is_not_confused_with_the_legacy_one(self) -> None:
+        """The trailing pipe in every match above is load-bearing here.
+
+        `BACKEND-GATE-CUDA-LLAMACPP` is a strict prefix of
+        `BACKEND-GATE-CUDA-LLAMACPP-LEGACY`. A match written without the
+        trailing pipe would count both rows as this one, and the removal
+        mutation above would then delete two rows while claiming to delete one
+        -- red for the right reason by accident. Pin that the exact match finds
+        one row, the loose match finds two, and the two are different lines.
+        """
+        lines = (
+            (ROOT / ".agents/backend-matrix.md")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        exact = [l for l in lines if l.startswith(f"| `{self.ROW}` |")]
+        legacy = [l for l in lines if l.startswith(f"| `{self.ROW}-LEGACY` |")]
+        loose = [l for l in lines if l.startswith(f"| `{self.ROW}")]
+        self.assertEqual(len(exact), 1, f"{self.ROW} must appear exactly once")
+        self.assertEqual(len(legacy), 1, f"{self.ROW}-LEGACY must still exist")
+        self.assertNotEqual(exact[0], legacy[0])
+        self.assertEqual(len(loose), 2, "the prefix spans both rows")
+
+
 class IssueIndexTests(unittest.TestCase):
     """Every guarantee of the issue index, mutated rather than read.
 

@@ -72,6 +72,7 @@ are our reading of their documented behavior, not measurements.
 | NVFP4 shared-expert `down_proj` kept bf16 (no f32 round-trip) | ✅ `VT_SHARED_DOWN_BF16` default-ON; bit-identical (both consumers widen bf16 in-kernel and re-round on store), SACRED 315/315 + 235/235 on BOTH arms with unchanged assertion counts; +2.05% c8 / +0.79% c4 on 35B-A3B | ☐ | ☐ | ☐ |
 | NVFP4 `lm_head` kept packed (no dequant at load) | ✅ `VT_LMHEAD_FP4` default-ON, #213; CUDA-gated on `nvidia`@`0893e160` (continuations byte-identical packed vs dequant, 235/235; RSS -1.70 GiB on CUDA, owed a re-measure; a no-fp4-GEMM backend keeps one bf16 operand too) | ✅ | ☐ | ☐ |
 | GGUF k-quants and i-quants | ✅ (CPU grouped keep-quant MoE bf16 regression in `b4f5610a` fixed 2026-08-06). **CPU quant compute is ISA-tiered:** Arm has i8mm + repack; x86_64 portable-only, MEASURED open on every axis (CIQ `G5`, #433) | ☐ | ☐ | ✅ |
+| GGUF is a TWO-engine comparison at these pins (#979) | ✅ text-only `qwen35`, no `clip` projector (#821) | ☐ REMOVED from the tree in `6635279d8`, now an unpinned out-of-tree `vllm-gguf-plugin` | ☐ full stack present, `qwen3_5` unreachable behind FOUR blockers, one of them silent | ✅ native, `LLM_ARCH_QWEN35` |
 | AWQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | GPTQ | ◐ CPU dequant | ✅ | ✅ | ☐ |
 | MXFP4 compressed-tensors | ◐ W4A16 Marlin, mem 2.63x less. gate_up FUSION + decode-graph default-ON; #44 3/3, 32B 6/6. **`VT_MARLIN_DENSE` DEFAULT-ON** (`KERNEL-MARLIN-DENSE-EXEC`): dense marlin 48-CTA, byte-faithful, beats MoE (c8 0.969) | ✅ | ✅ | ☐ |

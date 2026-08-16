@@ -11,6 +11,14 @@ incremental HTTP streaming. The fully scoped shared-prefix row is `READY` for
 harness/instrumentation work, while its binding run is dependency-blocked on
 exact SGLang v0.5.15 equivalence, `KV-MAMBA-ALIGN`, and async serving.
 
+> **SUPERSEDED 2026-08-16 for the cache-neutral row only, see the reconciliation
+> addendum at the end of this file ([#979](https://github.com/mudler/vllm.cpp/issues/979)).**
+> `SERVE-ASYNC-LLM` is discharged and `BACKEND-GATE-CUDA-SGLANG` is now `PARTIAL`
+> rather than `BLOCKED`. Every statement below that our SSE is buffered, that
+> client-observed TTFT is full-generation latency, or that the streaming probe is
+> expected to fail, describes the tree as it was on 2026-07-10 and is no longer
+> true. The shared-prefix row's dependencies are unchanged.
+
 This is the leaf spike required by the
 [competitive benchmark matrix](competitive-benchmarks.md) and the
 [benchmark protocol](../verification.md). It fixes the competitor,
@@ -670,3 +678,94 @@ The new `BACKEND-GATE-CUDA-SGLANG-PREFIX` row is `READY` for PX1 work; PX2
 starts by writing the dedicated `KV-MAMBA-ALIGN` leaf spike. Its binding
 performance run remains dependency-blocked as specified above. The
 35B SGLang floor remains conditional on exact-artifact compatibility evidence.
+
+## Reconciliation addendum, 2026-08-16 ([#979](https://github.com/mudler/vllm.cpp/issues/979))
+
+Two things this spike recorded as pending had already happened, and the record
+did not follow. Both are corrected here, and neither reinterprets a number.
+
+### The `SERVE-ASYNC-LLM` dependency is discharged
+
+The spike was written on 2026-07-10 against a server that ran the engine to
+completion and precomputed every SSE chunk. That is no longer the production
+path. Four independent lines of evidence, none of them a state field quoting
+another state field:
+
+1. `include/vllm/entrypoints/openai/serving_completion.h:9-11` says the live
+   pull-based `SseStream` over `AsyncLLM` is the production path and the
+   buffered `LLMEngine` constructor is a compatibility and test seam.
+   `src/vllm/entrypoints/openai/api_server.cpp:971-981` takes
+   `result.sse_stream` and drives `set_chunked_content_provider` off
+   `SseStream::next`, one chunk at a time.
+2. The harness enforces the property rather than trusting it.
+   `tools/bench/run_serve_low.py:296-310` refuses a probe with no token-bearing
+   event, refuses a chunk count other than the requested completion length,
+   refuses `first_chunk_s >= total_s`, and refuses a spread below a configured
+   floor. The `incremental_streaming` precondition in the dry-run manifest is
+   therefore executable, not aspirational.
+3. It was demonstrated on hardware. The 2026-07-28 floor run
+   (`CLAIM-SGLANG-PERF-BENCH`, [sglang-matrix.md](../sglang-matrix.md)) measured
+   our c16 mean TTFT at 2980 ms against a mean ITL of 154.4 ms over 128 tokens.
+   First byte preceded completion by roughly twenty seconds, which a buffered
+   server cannot produce.
+4. `engine-matrix.md:207` carries `SERVE-ASYNC-LLM` as `GATING` with live
+   completion and chat SSE, disconnect abort and deterministic c32 capacity, and
+   `async-metrics.md:196` records the frontend plus `ENG-CORE-BUSY-LOOP` as
+   `DONE`.
+
+Consequently the "Streaming timing" and "Concurrent HTTP requests" rows of the
+"Our baseline and known gaps" table, the fourth correctness precondition's note
+that the streaming probe "is expected to fail for today's buffered vllm.cpp
+server", the `SERVE-ASYNC-LLM` row of the dependencies table, and the vllm.cpp
+server-arm note about serializing complete requests are all **retracted as
+descriptions of the current tree**. They are kept in place because they are the
+reason the harness has the precondition at all.
+
+[#931](https://github.com/mudler/vllm.cpp/issues/931), landed as `638eba27f`,
+strengthens this rather than establishing it. It defaults `VT_SERVER_SSE_PING_S`
+to 0 so vLLM's own bench client can parse our stream, and it adds
+`require_complete_request_set` (`tools/bench/serve_low_common.py:234`) so no rate
+is derived from an incomplete request set.
+
+### The 2026-07-28 floor run is partial evidence, and is not voided by #931
+
+It predates the keepalive fix, so the question has to be asked rather than
+assumed. The keepalive fires only after 15 seconds with no output on a request
+(`include/vllm/entrypoints/openai/serving_utils.h:40-47`). That run's worst
+observed p99 TTFT was 7220 ms at c16 and 3589 ms at c8, with ITL near 154 ms, so
+no comment frame could have been emitted, and the harness independently recorded
+zero errors and exactly 80 by 128 output tokens on every leg.
+
+`BACKEND-GATE-CUDA-SGLANG` therefore moves `BLOCKED` to `PARTIAL`. Named
+residuals, in the spike's own vocabulary: P2 exact-equivalence classification is
+still open, the c1, c2 and c4 points are unrun (SGLang c1 measured about 13.3
+seconds per iteration, which is a real scheduling problem rather than an
+oversight), the vLLM arm was absent from that series, the 35B arm is unrun, the
+token-ID cross-check `SGLANG-ORACLE-CORRECT` is `INVENTORIED`, and the paired
+nsys traces are uncaptured. The shared-prefix row `BACKEND-GATE-CUDA-SGLANG-PREFIX`
+is untouched by all of this.
+
+### The subject this spike names is not the only subject any more
+
+A separate leaf, [bench-qwen38-27b-four-way.md](bench-qwen38-27b-four-way.md),
+carries the Qwen3.8-27B four-way campaign, which adds llama.cpp on CUDA and
+produces a per-pair common-denominator matrix instead of a single every-axis
+gate. This spike stays authoritative for the Qwen3.6 27B and 35B snapshots and
+its evidence is not reinterpreted there.
+
+## Now
+
+Three owned rows, three different states.
+
+- `BACKEND-BENCH-CUDA-SGLANG-PREFLIGHT` is `GATING`, unchanged. P1 CPU harness
+  implemented, P2 image and model and GPU classification open.
+- `BACKEND-GATE-CUDA-SGLANG` is **`PARTIAL` as of 2026-08-16**, moved from
+  `BLOCKED` by [#979](https://github.com/mudler/vllm.cpp/issues/979). Its
+  `SERVE-ASYNC-LLM` blocker is discharged and 27B-NVFP4 c8 and c16 are measured
+  over three repetitions with zero errors. Not supported yet: c1, c2 and c4, the
+  vLLM arm inside the same series, the 35B arm, the `SGLANG-ORACLE-CORRECT`
+  token-ID cross-check, paired nsys traces, and any Qwen3.8-27B point.
+- `BACKEND-GATE-CUDA-SGLANG-PREFIX` is `READY`, unchanged. Its binding run still
+  needs `KV-MAMBA-ALIGN` and exact v0.5.15 equivalence.
+
+The SGLang oracle is now `gateable = yes` ([pin](../oracles/sglang.md)).

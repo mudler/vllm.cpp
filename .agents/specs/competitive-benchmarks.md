@@ -68,6 +68,17 @@ ratio. Do not reduce results to one throughput number.
 - The exact SGLang recipe is [spiked](cuda-sglang-low-concurrency.md). Its
   preflight waits for the current PR #3 GPU claim; binding TTFT/ITL execution
   also depends on `SERVE-ASYNC-LLM`. Overlapping data is void.
+  **Updated 2026-08-16 ([#979](https://github.com/mudler/vllm.cpp/issues/979)):**
+  the `SERVE-ASYNC-LLM` dependency is discharged and SGLang has run here, so
+  `BACKEND-GATE-CUDA-SGLANG` is `PARTIAL` rather than `BLOCKED`. See that
+  spike's reconciliation addendum for the evidence.
+- **The four-way Qwen3.8-27B campaign is a separate leaf**,
+  [bench-qwen38-27b-four-way.md](bench-qwen38-27b-four-way.md). It adds
+  llama.cpp on CUDA under the new `BACKEND-GATE-CUDA-LLAMACPP` row and produces
+  a per-pair common-denominator matrix, because at the four engines' recorded
+  pins **no single quantization is common to all four**. vLLM removed GGUF from
+  its tree at our pin, and SGLang cannot load a `qwen3_5` GGUF for four
+  independent reasons, so two of the six pairs are recorded not-comparable.
 
 ## Folded: spark-bench (external GB10 operator bench) — what we adopt / ignore
 

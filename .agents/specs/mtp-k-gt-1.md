@@ -378,10 +378,45 @@ explicitly excludes from the in-flow rule. `check-agent-record` is therefore red
 on this branch AND on `origin/main`, from the same two rows.
 
 `test_cpu_x86_llamacpp_floor`'s contended-leg case is load-dependent and is not
-repaired here either. It failed at loadavg 157 with `NO_QUIET_WINDOW` (4) instead
-of `GIVING_UP` (2) and passed at loadavg 21 on the same tree, which is
-[#618](https://github.com/mudler/vllm.cpp/issues/618) verbatim. The load was this
-branch's own full build, so the attribution is measured rather than assumed.
+repaired here either. Measured on ONE tree at `1554494c3`, five runs: FAIL at
+loadavg 157 with `NO_QUIET_WINDOW` (4) instead of `GIVING_UP` (2), FAIL at 19,
+then PASS at 21, 25, 23 and 22. That is
+[#618](https://github.com/mudler/vllm.cpp/issues/618) verbatim, and the loadavg
+157 run was this branch's own full build. The attribution is measured rather than
+asserted, which matters because a single red would otherwise read as this diff's
+fault: nothing in this change is on that harness's path.
+
+### Final gate, at `1554494c3` against `origin/main` `4f2d91756`
+
+`scripts/agent-preflight.sh`, by block:
+
+| Block | ok | FAIL |
+|---|---:|---:|
+| Session role | 1 | 0 |
+| Record gates | 25 | 1 (`check-agent-record`, the inherited #995 duplicate) |
+| Mutation suites | 42 | 2 (`test_agent_record`, same duplicate; `test_cpu_x86_llamacpp_floor`, the load flake above) |
+| Committed range vs `origin/main` | 2 | 1 (`doc-checkpoint range`, below) |
+| Commit trailers vs `origin/main` | 2 | 0 |
+
+The trailer block EXECUTED rather than skipping. It is guarded on
+`git merge-base --is-ancestor origin/main HEAD`
+(`scripts/agent-preflight.sh:226-228`), and an earlier run on this branch skipped
+it silently because `origin/main` had advanced mid-flow. That is why this branch
+carries two merges rather than one.
+
+`ctest` on the same head: `100% tests passed, 0 tests failed out of 495`, with
+two checkpoint-gated skips.
+
+`doc-checkpoint range` names commit `4ad2bec87`, the Phase 1 refusal: it changed
+`src/vllm/entrypoints/` and did not update `docs/USAGE.md` in the SAME commit,
+which it genuinely owed, because it changed what `--speculative-config` accepts.
+The check runs per commit over the range, so no later commit can satisfy it, and
+the only in-branch repair is to amend that commit. This flow was directed not to
+rebase, so it is reported rather than done. It is moot on `main`, which is
+squash-only: the single landed commit does update `docs/USAGE.md`. The line
+`4ad2bec87` owed is: for `mtp`, `num_speculative_tokens` above 1 is refused at
+load because the multi-step draft propose is not ported, which the Phase 2 commit
+then replaces with the depth text now shipping.
 
 Known pre-existing red, NOT caused by this row and not repaired here.
 `check-env-doc` and `test_check_env_doc` failed on pristine `332aed738`

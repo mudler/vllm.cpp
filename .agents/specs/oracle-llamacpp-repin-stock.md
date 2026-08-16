@@ -1782,12 +1782,16 @@ burned by twice.
   gates on instantaneous contention.
 - **No benchmark gate.** Recorded `PENDING` on #1003 and on host access, not
   waived.
-- **What the gate run reports, by block.** On the merged head at the review-repair
-  pass: `Session role` 1, `Record gates` 26, `Mutation suites` **45**,
+- **What the gate run reports, by block.** On the merged head at the F1-F3 repair
+  pass: `Session role` 1, `Record gates` **27**, `Mutation suites` **46**,
   `Committed range vs origin/main` 3, and `Commit trailers vs origin/main` 2, so
-  **77 results and zero SKIP**. Mutation suites moved 44 to 45 because
-  `origin/main` landed `test_agent_preflight_skip_report` with #1030, which is
-  another count in this file that a foreign merge changes.
+  **79 results, zero FAIL and zero SKIP**, against `origin/main`
+  `10002648199cfbbaf1e423f7c80cacb2f4b56366`. The two moving blocks have now
+  moved twice for the same reason. Mutation suites read 44, then 45 when
+  `origin/main` landed `test_agent_preflight_skip_report` with #1030, and 46 with
+  `test_check_cuda_op_arch_gate`, whose checker takes `Record gates` from 26 to 27
+  at the same time (#960, merged as `d607fec4c`). Re-derive this pair per run.
+  Neither number says anything about this branch.
 
   **The same head reports two different results, and the difference is the box,
   not the tree.** At loadavg 64.88 and again at 84.95 it returns `rc=1` with

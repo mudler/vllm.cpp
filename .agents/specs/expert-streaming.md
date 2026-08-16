@@ -575,6 +575,62 @@ records why the target checkpoint changed.
 | W12 IQ1_XXXS decode | `DType::kIQ1_XXXS`, geometry `{256, 38, 66}`, the 256-entry fork codebook, `VecDotIQ1_XXXSQ8_K`, dequant, traits row and the reader's `case 66`. Grounded in the pinned fork oracle, cited per site | - | CPU tests green; `KeepQuantDType(66)` true; grid digest sealed |
 | W13 IQ1_XXXS device decode | the CUDA arm, for the same silent-fallback reason as W10 | W12 | CUDA tests; parity with the CPU arm |
 
+## Loading a 370 GiB split GGUF: the recipe, and what it cost to find
+
+Recorded 16 August 2026 from two dry runs against the partially downloaded
+`UD-Q1_0`, because each failure was cheap to hit and expensive to guess.
+
+**The model path must be a `.gguf` FILE, not a directory.** `--model <dir>`
+sends the server down the HuggingFace branch, which fatals on a missing
+`config.json` before it ever looks for GGUFs (`model_loader.cpp:1287` takes the
+GGUF branch only for `fs::is_regular_file(dir) && extension == ".gguf"`). For a
+split model, point at shard 1; the reader finds its siblings by the
+`-NNNNN-of-MMMMM.gguf` naming and cross-checks `split.count`.
+
+**The container needs `--gpus all` even for `--help`.** `libcuda.so.1` is
+injected by the NVIDIA Container Toolkit, so a CUDA-linked binary cannot load
+without it. This is not about using the GPU; a build or a usage message fails
+the same way.
+
+**Paths on dgx.casa after the 14 August reimage:** the NAS is mounted at
+`/usr/local/nas_share`, not `/mnt/nas_share`. There is no host CUDA toolkit, so
+builds run inside `vllmcpp-build:gb10`, and `docker` needs `sudo`.
+
+Working invocation:
+
+```sh
+docker run --gpus all -v /usr/local/nas_share:/nas:ro -e VT_GGUF_PREFAULT=0 \
+  vllmcpp-build:gb10 ./build-srv/examples/vllm-server \
+  --model /nas/checkpoints/<model>/<model>-00001-of-000NN.gguf \
+  --device cpu --max-num-seqs 1 --max-model-len 512
+```
+
+`VT_GGUF_PREFAULT=0` is the load-bearing flag for a model larger than memory.
+Keep-quant weights are BORROWED from the mmap rather than copied
+(`p.mmap_residency = EnvOnOr("VT_GGUF_MMAP", p.keep_quant)`,
+`gguf_keep_quant.cpp:208`, then the `OwnedBytes::Borrow` branch), so the tower
+costs address space rather than anonymous memory. The load-time prefault would
+undo that by touching every page, which is right for a model that FITS and wrong
+for one that does not.
+
+`--max-num-seqs 1` follows this spec's own regime bound. At high concurrency
+every step touches most experts, so the working set stops being a working set.
+
+**What the second dry run proved, before the checkpoint was complete.** Pointed
+at shard 1 with 9 of 10 shards present, the loader merged the split, parsed the
+metadata, resolved `qwen35moe` with no architecture refusal, did NOT refuse
+IQ1_XXXS, and walked tensors by name to `blk.87.ffn_up_exps.weight` before
+stopping on a span that exceeded the incomplete shard 9. Everything above the
+byte read therefore works: architecture resolution, split merging, tensor naming
+and the new encoding. What remains untested is what happens AFTER the last
+tensor is read.
+
+**One operational note that is not about this tree.** A long-lived HuggingFace
+connection can decay to under 1 MiB/s while a fresh connection to the same file
+runs at 20 MiB/s and the NAS writes at 97 MiB/s. Both endpoints measure healthy,
+so a stalled fetch is indistinguishable from a slow one without a rate check.
+Killing the curl lets the fetch script's `-C -` resume open a fresh connection.
+
 ## Risks/decisions
 
 | Risk / decision | Call |

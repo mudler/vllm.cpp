@@ -836,6 +836,52 @@ Everything the lane needs is already in tree and unwired: `ExpertSlotCache`
 (W1), `GgufExpertSpanOf` (W2) and `ExpertStreamer` (W3). W4 now has a measured
 baseline to beat and a working end-to-end vehicle to beat it on.
 
+## W4 measured: correct, 4.5x on TTFT, and NO steady-state gain (and why)
+
+16 August 2026, dgx.casa, same vehicle and config as the first run, streaming
+enabled with 8000 slots (`[expert-stream] ON slots=8000 slot_bytes=2490368
+resident=18.55 GiB`).
+
+| Axis | Baseline (no streaming) | Streaming ON |
+|---|---|---|
+| output | `" Paris. Q: What"` | `" Paris. Q:"` (**identical tokens**) |
+| TTFT | 3318.1 s | **733.4 s** (4.5x) |
+| steady decode | 66.5 / 66.9 / 66.8 s | 68.7 / 67.7 s (**unchanged**) |
+
+**Correctness holds**: the slot path is byte-faithful, which is the precondition
+for caring about the rest.
+
+**The steady-state result is a negative one, and the cause is this
+implementation rather than the design.** `EnsureSpan` copies from `base +
+offset`, a pointer INTO the mmap, so filling a slot still takes the page fault
+it was meant to avoid. What was actually changed is fault ORDER (random to
+sequential) plus an extra 2.49 MiB memcpy, and that combination measures the
+same ~103 MB/s the mmap path already did.
+
+The spec said this on the first page and the implementation did not follow it:
+"Reads are plain `pread(2)` against the model fd", with an O_DIRECT variant and
+an aligned staging buffer. ds4 preads from the FILE DESCRIPTOR. Copying from the
+mapping inherits the exact fault path the lane exists to bypass.
+
+**A second bound is independent of that fix.** Each token needs 2790 slices
+(10 experts x 3 matrices x 93 layers) at 2.49 MiB, so **6.9 GB per token**,
+against a 19.9 GiB cache: under three tokens of working set, with top-10-of-512
+routing making consecutive tokens rarely reuse an expert. Even perfect
+sequential I/O leaves the hit rate to be won separately, by a larger budget, the
+hotlist preload (W5) or lookahead prefetch.
+
+So the ordering for the next attempt is now measured rather than guessed:
+
+1. **pread from the fd**, not memcpy from the mapping. This is the one that
+   makes the I/O rate move at all, and until it lands no cache size matters.
+2. **Overlap** the read with compute, which is what the async pool in the
+   original design is for; a synchronous fill serialises I/O behind every layer.
+3. **Hit rate** last, because it multiplies a bandwidth that is currently wrong.
+
+TTFT improving 4.5x while decode did not is consistent with all of this: prefill
+touches a wide expert set once, where sequential order and slot reuse both help,
+while decode re-reads a fresh 6.9 GB every step.
+
 ## Risks/decisions
 
 | Risk / decision | Call |

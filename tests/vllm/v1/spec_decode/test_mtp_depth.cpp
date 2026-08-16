@@ -16,15 +16,48 @@
 // depth: a drafter pinned to k=1 passes every identity check at k=3. That was the
 // exact defect this row closes.
 //
-// So every depth case pairs the identity with a POSITIVE WITNESS of depth taken
-// from the verify path itself: `spec_drafts_proposed_by_depth()`, whose SIZE is
-// the deepest draft the rejection sampler has ever verified. At k=3 it must reach
-// index 2; at k=1 it must stop at index 0. Together they say the emitted tokens
-// did not move AND the drafter really went three deep.
+// So every depth case pairs the identity with a POSITIVE WITNESS of depth. The
+// first witness this file used was `spec_drafts_proposed_by_depth().size()`, and
+// A FRESH REVIEW PROVED IT CANNOT SEE THE REGRESSION IT EXISTS TO CATCH.
+//
+// The mutation: make `MtpProposeDrafts` return straight after the prefill and pad
+// all k columns with the step-0 draft. No decode step runs and ONE forward
+// happens in total. The suite stayed green, 5/5, 34/34, `Status: SUCCESS`, with
+// `compile_err=0` and the mutation demonstrably applied. The reason is
+// mechanical: the per-depth vectors are grown from
+// `step.num_draft_tokens_per_req[i]` (`runner.cpp`), which is the LENGTH of the
+// emitted draft list, and that length is decided by the runner's slicing of
+// whatever the proposer returned. Anything that hands the verify path k tokens
+// satisfies it. The reviewer also probed the per-depth counters in both arms at
+// k=3 and got IDENTICAL output, `proposed: 7 7 7 accepted: 0 0 0` on the real
+// loop and `proposed: 7 7 7 accepted: 0 0 0` on the padded fake.
+//
+// Note the second half of that: ACCEPTANCE IS ZERO AT EVERY DEPTH on this
+// synthetic model, in both arms. So no acceptance figure can be the witness here
+// either, and the accept path at depth is UNEXERCISED by this suite. What the CPU
+// tier establishes is that k drafts are PROPOSED and VERIFIED, not that a draft
+// is ever accepted at depth. The owed DGX gate demands non-zero acceptance at
+// every depth for exactly this reason.
+//
+// The witness that survives is the one counted where the work happens:
+// `spec_mtp_draft_decode_forwards()`, incremented after each draft decode forward
+// RETURNS, against `spec_mtp_propose_calls()`. Upstream runs
+// `num_speculative_steps - 1` decode forwards per propose, so the assertion is
+// the exact equality
+//
+//     forwards == calls * (k - 1)
+//
+// and no draft-list shape can produce it. Under the reviewer's mutation the
+// forward count is 0 while `calls` is not, so at every k above 1 the equality
+// fails and the suite goes RED. A third candidate, distinctness of the k drafted
+// tokens, was rejected: a correct drafter may legitimately repeat a token, and on
+// this 24-entry vocabulary it often does, so that property belongs to the model
+// rather than to the loop.
 //
 // RED-first for this file: before the multi-step propose, the k=3 case built an
-// engine that reserved KV for 3 and drafted ONE token, so the per-depth witness
-// had size 1 and the depth-3 proposal count was absent entirely.
+// engine that reserved KV for 3 and drafted ONE token, so the depth witness read
+// 1 against 3. RED again for the repaired witness: with the reviewer's padding
+// mutation applied, `forwards` reads 0 against `calls * 2`.
 #include <doctest/doctest.h>
 
 #include <cstdint>
@@ -341,11 +374,29 @@ EngineParams SpecParams(int k) {
 }
 
 // The deepest draft the rejection sampler has ever verified on this engine. It
-// is the SIZE of the per-depth counter, which the verify path grows on demand,
-// so it reports what the drafter actually produced rather than what was asked
-// for. 0 means nothing ever speculated.
+// is the SIZE of the per-depth counter, which the verify path grows on demand.
+// It reports the LENGTH OF THE EMITTED DRAFT LIST and NOT the work the propose
+// did, so it is a necessary condition and never a sufficient one: see the file
+// header for the mutation it passes. 0 means nothing ever speculated.
 int VerifiedDepth(const LoadedEngine& eng) {
   return static_cast<int>(eng.runner().spec_drafts_proposed_by_depth().size());
+}
+
+// THE DEPTH WITNESS. `k - 1` draft decode forwards run per propose call, counted
+// after each forward returns, so this equality holds exactly when the multi-step
+// loop ran to depth on every call and fails on any propose that short-circuits,
+// pads, or clamps. It is the assertion the padded mutation cannot satisfy.
+void CheckDraftDecodeForwards(const LoadedEngine& eng, int k) {
+  const int64_t calls = eng.runner().spec_mtp_propose_calls();
+  const int64_t forwards = eng.runner().spec_mtp_draft_decode_forwards();
+  CAPTURE(k);
+  CAPTURE(calls);
+  CAPTURE(forwards);
+  // A zero-call engine would make the equality below hold vacuously at every k,
+  // which is the "a gate that cannot say how many things it examined has not
+  // reported" shape. Require the work to have happened first.
+  REQUIRE(calls > 0);
+  CHECK(forwards == calls * static_cast<int64_t>(k - 1));
 }
 
 }  // namespace
@@ -363,10 +414,14 @@ TEST_CASE("mtp depth: a configured depth of 3 actually drafts 3") {
   REQUIRE(out.outputs.size() == 1);
   CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == kN);
 
-  // THE WITNESS. The drafter proposed at depths 1, 2 and 3, so the configured
-  // depth reached the verify path. This is the assertion that failed before the
-  // multi-step propose: the drafter stopped at depth 1 and the emitted tokens
-  // were identical either way, so nothing else could have told the difference.
+  // THE WITNESS. Two draft decode forwards ran per propose call, which only a
+  // loop that went to depth 3 can produce. This is the assertion the reviewer's
+  // padding mutation fails and every list-shape assertion below passes.
+  CheckDraftDecodeForwards(eng, 3);
+
+  // The list-shape assertions, kept as NECESSARY conditions. They say the verify
+  // path received three drafts per request. They do not say three were drafted,
+  // which is why the forward count above leads.
   const std::vector<int64_t>& by_depth =
       eng.runner().spec_drafts_proposed_by_depth();
   REQUIRE(VerifiedDepth(eng) == 3);
@@ -387,12 +442,20 @@ TEST_CASE("mtp depth: a configured depth of 3 actually drafts 3") {
   for (int64_t n : eng.runner().spec_drafts_accepted_by_depth())
     summed_accepted += n;
   CHECK(summed_accepted == eng.runner().spec_drafts_accepted());
-  // Acceptance is a prefix, so it can never grow with depth.
+  // Acceptance is a prefix, so it can never grow with depth. MEASURED HERE: this
+  // profile is `0 0 0`, on the real loop and on the padded mutation alike, so
+  // these two assertions are VACUOUS and the accept path at depth is unexercised
+  // by the CPU tier. Kept because the invariant is the right one to state, and
+  // recorded because it bounds what this suite proves: k drafts are proposed and
+  // verified, not accepted. The owed DGX gate demands non-zero acceptance at
+  // every depth on real weights, which is the only place that can be shown.
   const std::vector<int64_t>& acc =
       eng.runner().spec_drafts_accepted_by_depth();
   REQUIRE(acc.size() == 3);
   CHECK(acc[0] >= acc[1]);
   CHECK(acc[1] >= acc[2]);
+  CHECK(eng.runner().spec_drafts_accepted() <=
+        eng.runner().spec_drafts_proposed());
 }
 
 TEST_CASE("mtp depth: k=1, k=3 and spec-OFF emit the SAME greedy tokens") {
@@ -415,8 +478,10 @@ TEST_CASE("mtp depth: k=1, k=3 and spec-OFF emit the SAME greedy tokens") {
     LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), p);
     off_ids = eng.engine().generate(prompt, Greedy(kN), "req")
                   .outputs[0].token_ids;
-    // Nothing speculated, so the per-depth counters were never grown.
+    // Nothing speculated, so no propose ran and no counter was ever grown.
     CHECK(VerifiedDepth(eng) == 0);
+    CHECK(eng.runner().spec_mtp_propose_calls() == 0);
+    CHECK(eng.runner().spec_mtp_draft_decode_forwards() == 0);
   }
   {
     LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(1),
@@ -424,6 +489,9 @@ TEST_CASE("mtp depth: k=1, k=3 and spec-OFF emit the SAME greedy tokens") {
     k1_ids = eng.engine().generate(prompt, Greedy(kN), "req")
                  .outputs[0].token_ids;
     CHECK(VerifiedDepth(eng) == 1);
+    // k=1 is the early exit: the propose ran, and it ran NO decode forward. The
+    // same equality as every other arm, at k-1 == 0.
+    CheckDraftDecodeForwards(eng, 1);
   }
   {
     LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(3),
@@ -431,6 +499,7 @@ TEST_CASE("mtp depth: k=1, k=3 and spec-OFF emit the SAME greedy tokens") {
     k3_ids = eng.engine().generate(prompt, Greedy(kN), "req")
                  .outputs[0].token_ids;
     CHECK(VerifiedDepth(eng) == 3);
+    CheckDraftDecodeForwards(eng, 3);
   }
 
   REQUIRE(static_cast<int>(off_ids.size()) == kN);
@@ -453,6 +522,9 @@ TEST_CASE("mtp depth: k=2 and k=4 both reach their configured depth") {
     REQUIRE(out.finished);
     CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == 8);
     CHECK(VerifiedDepth(eng) == k);
+    // k-1 forwards per call at k=2 and at k=4, which is what separates "the loop
+    // ran more than once" from "the loop ran exactly k times".
+    CheckDraftDecodeForwards(eng, k);
   }
 }
 

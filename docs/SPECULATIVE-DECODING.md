@@ -36,9 +36,15 @@ detail below and in [BENCHMARKS.md](BENCHMARKS.md) says which is which.
   checkpoints, so the default is unchanged. A value above `n_predict` must be a
   multiple of it, mirroring vLLM. Depth is a pure throughput lever: greedy
   decoding plus accept-if-equal rejection makes the emitted tokens identical at
-  every k, which is proven on CPU for k=1..4 against speculative-off. The
-  cross-engine speed comparison at k>1 and the DGX three-way at k=2..4 are still
-  owed ([#81](https://github.com/mudler/vllm.cpp/issues/81) M1/M2), as are
+  every k, which is proven on CPU for k=1..4 against speculative-off. That
+  identity is exactly why a token gate cannot see a clamped depth, so each CPU arm
+  also asserts the DRAFT DECODE FORWARDS the propose ran, which is `k-1` per
+  propose call and is the one witness a padded propose cannot produce. What the
+  CPU tier does NOT show is acceptance at depth: no draft is accepted at any depth
+  on the synthetic gate model, so the accept path at k>1 is unexercised there. The
+  cross-engine speed comparison at k>1 and the DGX three-way at k=2..4, which must
+  show non-zero acceptance at every depth, are still owed
+  ([#81](https://github.com/mudler/vllm.cpp/issues/81) M1/M2), as are
   batch-size-keyed dynamic depth and acceptance-driven adaptive depth.
 - **Correctness:** at concurrency 1 the speculative-on greedy output is
   token-for-token identical to both the speculative-off output and vLLM's own MTP

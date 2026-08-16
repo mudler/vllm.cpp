@@ -2,7 +2,7 @@
 // — the greedy MTP propose. The k=1 prefill half landed as SPEC-MTP increment
 // I5c against pin e24d1b24; the multi-step decode half is SPEC-MTP-K-GT-1
 // (issue #81) against pin 555967922, where the same file carries the loop at
-// :240-274. See the header for scope and the exact upstream anchors.
+// :242-275. See the header for scope and the exact upstream anchors.
 #include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"
 
 #include <cstddef>
@@ -16,10 +16,12 @@
 namespace vllm::v1 {
 namespace {
 
-// _greedy_sample_draft (:255-259): argmax over each named row of a device
-// [rows, vocab] logits buffer, downloaded once. Lowest-index tie-break, matching
-// our sampler's argmax. `rows` names which logits row each request samples from:
-// the prefill's last_token_indices, and the identity on a decode step.
+// `_greedy_sample_draft` (spec_decode/speculator.py:276-280 @ 555967922, on the
+// BASE class, not on autoregressive/speculator.py): argmax over each named row of
+// a device [rows, vocab] logits buffer, downloaded once. Lowest-index tie-break,
+// matching our sampler's argmax. `rows` names which logits row each request
+// samples from: the prefill's last_token_indices, and the identity on a decode
+// step.
 std::vector<int32_t> GreedySampleDraft(const vllm::ForwardLogits& logits,
                                        const std::vector<int64_t>& rows,
                                        vt::Queue& queue) {
@@ -54,7 +56,7 @@ std::vector<int32_t> GreedySampleDraft(const vllm::ForwardLogits& logits,
 
 // What `_prefill` (:335-371) leaves behind for the decode steps: the step-0
 // draft token, the draft model's hidden state at each request's
-// last_token_indices row (:367-371), and that row's POSITION (:353), which
+// last_token_indices row (:367-371), and that row's POSITION (:346), which
 // prepare_decode_inputs advances from.
 struct PrefillOutcome {
   std::vector<int32_t> draft_tokens;    // [num_reqs]
@@ -108,14 +110,15 @@ PrefillOutcome ProposePrefill(
            "MtpProposePrefill: unexpected draft logits shape");
 
   PrefillOutcome out;
-  // ── Greedy draft pick over each request's last (sampled) row (:255-259). ────
+  // ── Greedy draft pick over each request's last (sampled) row
+  // (spec_decode/speculator.py:276-280). ──────────────────────────────────────
   out.sampled_rows.assign(
       spi.last_token_indices.begin(),
       spi.last_token_indices.begin() + static_cast<size_t>(num_reqs));
   out.draft_tokens = GreedySampleDraft(logits, out.sampled_rows, queue);
 
-  // :353 — the positions of those same rows. The decode half advances from them;
-  // the k=1 caller drops them, and dropping a host vector costs nothing.
+  // :346 — the positions of those same rows. The decode half advances from them.
+  // The k=1 caller drops them, and dropping a host vector costs nothing.
   out.positions.resize(static_cast<size_t>(num_reqs));
   for (int64_t r = 0; r < num_reqs; ++r) {
     out.positions[static_cast<size_t>(r)] =
@@ -183,7 +186,7 @@ std::vector<int32_t> MtpProposePrefill(
       .draft_tokens;
 }
 
-std::vector<int32_t> MtpProposeDrafts(
+MtpDraftProposal MtpProposeDrafts(
     const vllm::Qwen3_5MTPModel& draft,
     const CommonAttentionMetadata& target_attn_meta,
     vllm::PagedKvCache& draft_kv, const vt::Tensor& target_hidden,
@@ -201,19 +204,25 @@ std::vector<int32_t> MtpProposeDrafts(
   const int num_reqs = target_attn_meta.num_reqs;
   const int k = num_speculative_tokens;
 
+  MtpDraftProposal result;
+
   PrefillOutcome prefill = ProposePrefill(
       draft, target_attn_meta, draft_kv, target_hidden, target_input_ids,
       target_positions, idx_mapping, last_sampled, next_prefill_tokens,
       num_sampled, num_rejected, max_num_reqs, queue);
 
-  // :236-238 — the k=1 EARLY EXIT. Byte-for-byte the pre-depth path: one
-  // forward, one argmax, no decode state and no second gather.
-  if (k == 1) return std::move(prefill.draft_tokens);
+  // :238-240 — the k=1 EARLY EXIT. Byte-for-byte the pre-depth path: one
+  // forward, one argmax, no decode state and no second gather. No decode
+  // forward runs, so the reported count stays 0, which is what k-1 is at k=1.
+  if (k == 1) {
+    result.draft_tokens = std::move(prefill.draft_tokens);
+    return result;
+  }
 
   std::vector<int32_t> drafts(static_cast<size_t>(num_reqs) *
                               static_cast<size_t>(k));
 
-  // :240-249 — the decode entry state, built from what the prefill left behind.
+  // :242-251 — the decode entry state, built from what the prefill left behind.
   SpecDecodeInputs inputs = prepare_decode_inputs(
       prefill.draft_tokens, target_attn_meta.seq_lens, num_rejected,
       prefill.positions, max_model_len);
@@ -251,6 +260,11 @@ std::vector<int32_t> MtpProposeDrafts(
     vllm::Qwen3_5MTPHiddenStates hidden =
         draft.ForwardPaged(inputs.input_ids, inputs.positions, carry.tensor,
                            decode_meta, draft_kv, queue);
+    // Counted AFTER the forward returns, so this reports work performed. It is
+    // the caller's only depth witness that a padded or clamped propose cannot
+    // forge: see the MtpDraftProposal comment for the three witnesses that
+    // cannot serve and why.
+    ++result.num_draft_decode_forwards;
     vllm::ForwardLogits logits = draft.ComputeLogits(hidden.tensor, queue);
     VT_CHECK(logits.on_device() && logits.rows == num_reqs,
              "MtpProposeDrafts: unexpected draft decode logits shape");
@@ -267,7 +281,8 @@ std::vector<int32_t> MtpProposeDrafts(
     carry = std::move(hidden);
     if (!more) break;
   }
-  return drafts;
+  result.draft_tokens = std::move(drafts);
+  return result;
 }
 
 }  // namespace vllm::v1

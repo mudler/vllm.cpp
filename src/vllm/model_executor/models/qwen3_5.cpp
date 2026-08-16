@@ -9173,11 +9173,16 @@ struct Qwen3_5DecodeGraph::Impl {
       gdn_meta.num_decode_tokens = gm.num_decode_tokens;
       gdn_meta.num_spec_decodes = gm.num_spec_decodes;
       gdn_meta.num_spec_decode_tokens = gm.num_spec_decode_tokens;
-      // Spec-decode segmentation (SPEC-MTP I5a). All empty on the pure-decode
-      // graph path (spec never captures — ValidateGdnDecodeGraphState rejects a
-      // spec batch), so these copies are inert here; carried for completeness so
-      // a future spec-capable graph slot refreshes the full metadata. CopyInPlace
-      // on an empty optional is a no-op, keeping the default path byte-identical.
+      // Spec-decode segmentation (SPEC-MTP I5a). This comment used to say "spec
+      // never captures -- ValidateGdnDecodeGraphState rejects a spec batch", and
+      // that stopped being true when SPEC-DSPARK W8 (#442) RE-EXPRESSED that
+      // assertion to admit a uniform pure spec batch (`:469-497`). These copies
+      // are therefore INERT ONLY on the pure-decode path, where the optionals are
+      // empty and CopyInPlace is a no-op. On a captured SPEC step they carry the
+      // step's real segmentation and are load-bearing. Corrected while auditing
+      // the graph layer for MTP depth (#81), and the residual ambiguity that
+      // audit found is [#1020]: the slot ring is keyed on S alone, and two
+      // different uniform query lengths can now reach one key.
       CopyInPlace(gdn_meta.spec_state_indices_tensor, gm.spec_state_indices_tensor);
       CopyInPlace(gdn_meta.spec_query_start_loc, gm.spec_query_start_loc);
       CopyInPlace(gdn_meta.spec_sequence_masks, gm.spec_sequence_masks);
@@ -9597,11 +9602,16 @@ struct Qwen3_5DenseDecodeGraph::Impl {
       gdn_meta.num_decode_tokens = gm.num_decode_tokens;
       gdn_meta.num_spec_decodes = gm.num_spec_decodes;
       gdn_meta.num_spec_decode_tokens = gm.num_spec_decode_tokens;
-      // Spec-decode segmentation (SPEC-MTP I5a). All empty on the pure-decode
-      // graph path (spec never captures — ValidateGdnDecodeGraphState rejects a
-      // spec batch), so these copies are inert here; carried for completeness so
-      // a future spec-capable graph slot refreshes the full metadata. CopyInPlace
-      // on an empty optional is a no-op, keeping the default path byte-identical.
+      // Spec-decode segmentation (SPEC-MTP I5a). This comment used to say "spec
+      // never captures -- ValidateGdnDecodeGraphState rejects a spec batch", and
+      // that stopped being true when SPEC-DSPARK W8 (#442) RE-EXPRESSED that
+      // assertion to admit a uniform pure spec batch (`:469-497`). These copies
+      // are therefore INERT ONLY on the pure-decode path, where the optionals are
+      // empty and CopyInPlace is a no-op. On a captured SPEC step they carry the
+      // step's real segmentation and are load-bearing. Corrected while auditing
+      // the graph layer for MTP depth (#81), and the residual ambiguity that
+      // audit found is [#1020]: the slot ring is keyed on S alone, and two
+      // different uniform query lengths can now reach one key.
       CopyInPlace(gdn_meta.spec_state_indices_tensor, gm.spec_state_indices_tensor);
       CopyInPlace(gdn_meta.spec_query_start_loc, gm.spec_query_start_loc);
       CopyInPlace(gdn_meta.spec_sequence_masks, gm.spec_sequence_masks);

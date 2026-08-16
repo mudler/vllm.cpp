@@ -2180,7 +2180,7 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
   VT_CHECK(!draft_attn_kv_.empty() && draft_attn_kv_[0].block_size > 0,
            "propose_drafts: the draft KV group has no block geometry");
 
-  const std::vector<int32_t> drafts = MtpProposeDrafts(
+  const MtpDraftProposal proposal = MtpProposeDrafts(
       *draft_model_, exec_state_.attn_meta, draft_attn_kv_[0],
       exec_state_.spec_hidden.tensor, exec_state_.step.input_token_ids,
       exec_state_.step.positions, idx_mapping,
@@ -2188,9 +2188,21 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
       /*max_num_reqs=*/num_reqs, /*num_speculative_tokens=*/k,
       /*max_model_len=*/input_batch_.max_model_len,
       /*block_size=*/static_cast<int>(draft_attn_kv_[0].block_size), queue_);
+  const std::vector<int32_t>& drafts = proposal.draft_tokens;
   VT_CHECK(drafts.size() ==
                static_cast<size_t>(num_reqs) * static_cast<size_t>(k),
            "propose_drafts: the MTP propose must return k drafts per request");
+  // SPEC-MTP-K-GT-1 (#81): the DEPTH witness, recorded here because this is the
+  // only place that knows both the configured k and the forwards the propose
+  // actually ran. The check above is a SHAPE check and cannot stand in for it:
+  // a propose that ran one forward and padded all k columns passes it, emits the
+  // same greedy tokens, and grows the per-depth counters to size k. The exact
+  // relation these two counters carry is
+  // `spec_mtp_draft_decode_forwards_ == spec_mtp_propose_calls_ * (k - 1)`,
+  // which no draft-list shape can produce. Counted on every reaching call,
+  // including the discarded-row case below, because the forwards ran either way.
+  ++spec_mtp_propose_calls_;
+  spec_mtp_draft_decode_forwards_ += proposal.num_draft_decode_forwards;
 
   // Stash each request's k drafts, in draft order, for the out-of-band pull. The
   // DraftTokenIds seam already carries variable-length drafts (the n-gram

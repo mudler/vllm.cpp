@@ -196,20 +196,54 @@ create a parallel path.
 Two hazards were raised against this row. Both were checked against the tree
 rather than accepted, and they resolve differently.
 
-**The spec graph slot key does NOT collide, and this row does not make it
-collide.** `src/vllm/model_executor/models/qwen3_5.cpp:9237` keys the slot ring
-on `S` alone, and `:9214` sets `S = B` exactly on a spec step, so `4 x (1+1)`
-and `2 x (1+3)` are the same key. That is only reachable if two different
-uniform query lengths can reach the same slot map. They cannot. The spec graph
-is admitted only by `IsUniformDecodeBatch(..., num_speculative_tokens)`
-(`src/vllm/model_executor/models/qwen3_5_moe.cpp:145-148` and the dense sibling
-`qwen3_5_dense.cpp:174-177`), which requires the uniform query length to equal
-`1 + num_spec()` EXACTLY. `num_spec()` is a constant for the engine's lifetime,
-so within one slot map the query length is fixed and `S` determines the request
-count uniquely. The slot map is a member of `Qwen3_5DecodeGraph::Impl`, reached
-through `qwen.decode_graph()`, so it is per-model and two engines at different
-depths do not share one. This row changes none of that: it makes depth
-configurable, not variable within a process.
+**This row does not make the spec graph slot key collide. The stronger claim that
+it does NOT collide at all is WITHDRAWN, because it was over-strong and a fresh
+review was right to reject it.**
+
+`src/vllm/model_executor/models/qwen3_5.cpp:9276` (and its dense sibling at
+`:9698`) keys the slot ring on `S` alone, and `:9253` sets `S = B` exactly on a
+spec step while padding `B` onto the capture ladder otherwise, so `4 x (1+1)` and
+`2 x (1+3)` are the same key.
+
+The withdrawn argument reasoned only INSIDE the spec-admission branch. It said
+that the spec graph is admitted only by
+`IsUniformDecodeBatch(..., num_speculative_tokens)`, that `num_spec()` is a
+constant for the engine's lifetime, and therefore that within one slot map the
+query length is fixed and `S` determines the request count uniquely. Each step is
+true about the spec branch and the conclusion still does not follow, because the
+predicate that reaches the ring is
+`uniform_decode = input.pure_decode || (spec_graph && ...)`
+(`qwen3_5_moe.cpp:143-148`, `qwen3_5_dense.cpp:172-177`). The ring is shared by
+BOTH disjuncts, so two query lengths do reach one map: at k=1, 8 requests
+pure-decode and 4 requests spec both give `S = 8`, and at k=3, 2 requests spec
+gives `S = 8` as well. `SizeSlot` invalidates on `fa_cols` and on `aux_taps`
+(`qwen3_5.cpp:9280-9330`) and on nothing keyed to spec-versus-pure.
+
+What survives is the claim this row actually needs: the ambiguity is PRE-EXISTING
+and this row does not widen it. It arrived with SPEC-DSPARK W8 (#442), which made
+a uniform spec batch capturable at all by re-expressing
+`ValidateGdnDecodeGraphState` (`qwen3_5.cpp:469-497`). Configurable depth adds no
+new way for two query lengths to share one key, because `num_spec()` is still one
+value per engine and the slot map is a member of `Qwen3_5DecodeGraph::Impl`, so
+two engines at different depths do not share one. It is also CPU-untestable here,
+for the same reason the rest of the graph layer is: no CPU gate observes graph
+capture.
+
+The residual is folded into
+[#1020](https://github.com/mudler/vllm.cpp/issues/1020), which already owes the
+`(S, q)` re-key, and the `## Owed` entry below states it. Folded rather than filed
+separately because it is one repair in one commit: a predicate widened to the
+step's actual query length is safe only once the ring distinguishes those query
+lengths, and the ring needs to distinguish them only because both branches share
+it.
+
+One stale comment the same audit found IS repaired in flow, because it is a false
+statement rather than a design question. `qwen3_5.cpp:9177` and `:9601` both said
+"spec never captures, ValidateGdnDecodeGraphState rejects a spec batch" and
+concluded that the spec-segmentation copies beside them are inert. #442 made both
+halves false. The comment now says those copies are inert on the pure-decode path
+only and load-bearing on a captured spec step, and it names #1020 for the
+residual.
 
 **Shape COUNT is unchanged, shape SIZE grows with depth.** A spec step takes
 `S = num_reqs x (1 + k)` with `num_reqs` bounded by `max_num_seqs`, so the
@@ -314,7 +348,7 @@ is sized from the configured k and nothing checks that the propose delivered it.
 
 | Risk | Why it matters | Control |
 |---|---|---|
-| A token-identity gate cannot see a silently clamped k | It is exactly today's bug: k=3 emits the same greedy tokens as k=1 because greedy plus accept-iff-equal is depth-independent | Every depth test asserts a POSITIVE witness of depth (drafts of length k, and per-depth counters above zero) beside the identity |
+| A token-identity gate cannot see a silently clamped k | It is exactly today's bug: k=3 emits the same greedy tokens as k=1 because greedy plus accept-iff-equal is depth-independent | Every depth test asserts a POSITIVE witness of depth beside the identity. The witness has to be counted where the WORK happens, not read off the emitted draft list: `spec_mtp_draft_decode_forwards() == spec_mtp_propose_calls() * (k - 1)`. Draft-list length and per-depth counter size were tried first and a fresh review broke both with a one-forward padded propose, recorded in `## Outcome` |
 | The draft KV slot for an advanced position may collide with the target's | The draft writes at positions the target has not reached | Mirrors upstream exactly, which writes the same slots in its own draft KV layer. The draft KV is a separate group (`fa_draft`) |
 | `max_model_len` overrun at depth | Position and `seq_len` can pass the bound at the tail of a sequence | Mirrored clamps from `speculator.py:637-645` and `:732-737` |
 | A test that constructs the proposer by hand proves nothing about reachability | AGENTS.md "Nothing lands dead" | The depth tests drive `GPUModelRunner::execute_model`, the runner the loader builds, with the depth arriving through the same `SpeculativeConfig` the loader resolves |
@@ -332,7 +366,7 @@ none needs a checkpoint or a GPU.
 |---|---|---|
 | `test_speculative_mtp_depth` (new) | The mirrored config type: the k=1 default, the upstream divisibility rule, and that the type CARRIES a depth rather than clamping it | 4 cases, 20 assertions |
 | `test_prepare_decode_inputs` (new) | The two Triton-kernel ports: the step-1 entry state, the between-step advance, the final-step early return, both `max_model_len` clamps, and the draft slot mapping | 8 cases, 33 assertions |
-| `test_mtp_depth` (new) | Depth through the PRODUCTION loader at k=1, 2, 3, 4, with a real `mtp.*` head loaded by `LoadQwen3_5MTP`, plus the greedy equivalence of spec-OFF, k=1 and k=3 | 5 cases, 34 assertions |
+| `test_mtp_depth` (new) | Depth through the PRODUCTION loader at k=1, 2, 3, 4, with a real `mtp.*` head loaded by `LoadQwen3_5MTP`, the greedy equivalence of spec-OFF, k=1 and k=3, and the draft-decode-forward equality that is the actual depth witness | 5 cases, 47 assertions |
 
 Red-before evidence, all with real counts:
 
@@ -366,16 +400,38 @@ therefore run at `Release`, which is the configuration `scripts/build-cpu-releas
 itself uses. The three new suites were additionally run under `Debug` while they
 were being written, so the assertion-bearing arm is covered too.
 
-TWO checkers disagree about `.agents/issue-index.md` and neither is weakened
-here. `check-agent-record` refuses the duplicated `#995` row that arrived with
-the `origin/main` merge; `check-issue-index-append-only` refuses the deletion
-that would resolve it. Removing the line made the first green and the second red,
-so the line was RESTORED and the conflict is filed as
-[#1027](https://github.com/mudler/vllm.cpp/issues/1027) and listed under
-`## Owed`. Deciding which checker gives way is a semantic checker change, which
-AGENTS.md routes through its own spec, red-before test and fresh review, and
-explicitly excludes from the in-flow rule. `check-agent-record` is therefore red
-on this branch AND on `origin/main`, from the same two rows.
+**The `.agents/issue-index.md` checker conflict is RESOLVED, and the premise this
+row recorded for it was wrong.** An earlier revision of this section said the two
+checkers cannot both be satisfied by any edit to that file, so the duplicated
+`#995` row was RESTORED after being collapsed, and the conflict was filed as
+[#1027](https://github.com/mudler/vllm.cpp/issues/1027) and listed as owed.
+[#1025](https://github.com/mudler/vllm.cpp/pull/1025) landed on `origin/main` and
+falsified that premise.
+
+The mechanism is worth stating, because it is the union-merge hazard this
+repository already knows about seen from the checker's side.
+`check-issue-index-append-only.py:47-56` diffs
+`merge-base(origin/main, HEAD)..HEAD`, NOT the file's own history. The two
+checkers therefore conflict only while the duplicate sits in the MERGE BASE. Once
+`main` itself merged the two rows by key, the merge base became a file with one
+well-formed `#995` row, and a branch that takes main's version and appends its own
+rows removes nothing at all. Both checkers are then green on one tree, with
+neither widened nor argued away.
+
+Taking main's version is also what the Records rule requires of a keyed record:
+take the complete target-branch version, apply the scoped edit again, and verify
+that unrelated keys stay byte-for-byte equal. The union driver's automatic result
+is the wrong one here and it is wrong in the silent direction. `git merge-tree`
+against `origin/main` produced a tree with TWO `#995` rows again, because a union
+merge re-adds a line one side deleted. That is what this branch would have
+resurrected, and it would have turned an INHERITED red into this branch's own
+defect. After the repair the same `git merge-tree` yields one row.
+
+#1027 is now a duplicate of #1022, which #1025 closed. It is still OPEN on GitHub
+and this flow has no authority to close it, so that remains an operator action.
+Its index row is written to say what actually happened rather than to repeat the
+false premise, which is safe because the row has never reached `origin` and no
+other branch carries it, so no union merge can duplicate it.
 
 `test_cpu_x86_llamacpp_floor`'s contended-leg case is load-dependent and is not
 repaired here either. Measured on ONE tree at `1554494c3`, five runs: FAIL at
@@ -407,16 +463,26 @@ carries two merges rather than one.
 `ctest` on the same head: `100% tests passed, 0 tests failed out of 495`, with
 two checkpoint-gated skips.
 
-`doc-checkpoint range` names commit `4ad2bec87`, the Phase 1 refusal: it changed
+`doc-checkpoint range` named commit `4ad2bec87`, the Phase 1 refusal: it changed
 `src/vllm/entrypoints/` and did not update `docs/USAGE.md` in the SAME commit,
 which it genuinely owed, because it changed what `--speculative-config` accepts.
-The check runs per commit over the range, so no later commit can satisfy it, and
-the only in-branch repair is to amend that commit. This flow was directed not to
-rebase, so it is reported rather than done. It is moot on `main`, which is
-squash-only: the single landed commit does update `docs/USAGE.md`. The line
-`4ad2bec87` owed is: for `mtp`, `num_speculative_tokens` above 1 is refused at
-load because the multi-step draft propose is not ported, which the Phase 2 commit
-then replaces with the depth text now shipping.
+`check-doc-checkpoint.py:401` walks `rev-list --reverse --no-merges base..head`
+(`:374`) PER COMMIT, so no later commit can pay that debt, and the only in-branch
+repair is to amend the commit. The earlier flow was directed not to rebase and
+reported it. It is now REPAIRED: the branch was unpushed, the amend was
+authorised for this branch only, and the commit (now `c5511d12f`) carries the
+`docs/USAGE.md` line it owed, which is that for `mtp` a `num_speculative_tokens`
+above the resolved default of 1 is refused at load because the multi-step draft
+propose is not ported. The Phase 2 commit replaces that text with the depth text
+now shipping, so the flag row is correct after every commit in the range rather
+than only at the end.
+
+The amend was verified by TREE IDENTITY, not by inspection. The rebase preserved
+both merge commits (`git rebase -i --rebase-merges`), and
+`git diff <old-head> <new-head>` is EMPTY: the rewritten branch's final tree is
+`3ad6ecfe0` on both sides, byte for byte. So the only thing the history edit
+changed is which commit carries the documentation line, which is exactly what the
+checker measures.
 
 Known pre-existing red, NOT caused by this row and not repaired here.
 `check-env-doc` and `test_check_env_doc` failed on pristine `332aed738`
@@ -491,8 +557,8 @@ upstream's own supported configuration.
 | Owed | What it must show | Who |
 |---|---|---|
 | DGX three-way greedy gate at k=2, 3, 4 on Qwen3.6-27B and 35B | our-ON == our-OFF == vLLM-ON, token for token on the golden prefix, at EACH depth, with nonzero acceptance and the per-depth counters populated at every depth up to k, plus spec-OFF byte-identical. It must run the DEFAULT bf16 GDN state, because the CPU gate here runs the f32 arm for the reason in section 4.5, so the GDN speculative rollback at depth is UNEXERCISED until this runs | `SPEC-MTP-K-GT-1`, [#81](https://github.com/mudler/vllm.cpp/issues/81) M1 |
-| Silent de-graphing when the actual depth differs from the configured k ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change, because today's single-query-length admission is the only thing that keeps the `S`-only key unambiguous (`qwen3_5.cpp:9214,9237`). Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
-| The duplicated `#995` row in `.agents/issue-index.md` ([#1027](https://github.com/mudler/vllm.cpp/issues/1027)) | A decision on WHICH checker gives way, with the spec, red-before test and fresh review a semantic checker change needs. `check-agent-record` refuses the duplicate; `check-issue-index-append-only` refuses the deletion that resolves it. The file cannot be made green by any edit to itself, so this is not an in-flow fix. When taken, delete the LATER row, for the merge-stability reason in the issue | `SPEC-MTP-K-GT-1`, [#1027](https://github.com/mudler/vllm.cpp/issues/1027) |
+| Silent de-graphing when the actual depth differs from the configured k, AND the `S`-only slot-ring key ([#1020](https://github.com/mudler/vllm.cpp/issues/1020)) | The spec-graph predicate reads the step's ACTUAL uniform query length instead of `num_spec()` (`runner.cpp:1383`), and the graph slot ring is keyed on `(S, q)` in the SAME change. The re-key is owed on its own merits and NOT only as a consequence of widening the predicate, which is the correction section 4.2a records: `uniform_decode = input.pure_decode \|\| (spec_graph && ...)` (`qwen3_5_moe.cpp:143-148`, `qwen3_5_dense.cpp:172-177`) already routes TWO query lengths to one `impl_->slots[S]` (`qwen3_5.cpp:9276`, dense `:9698`), and `SizeSlot` invalidates on `fa_cols` and `aux_taps` only (`:9280-9330`). At k=1, 8 requests pure-decode and 4 requests spec both key on `S = 8`. That is pre-existing since SPEC-DSPARK W8 (#442) and this row does not widen it, but it is not the benign thing the first spec revision claimed. Plus a measured before-and-after on the capture-set size and persistent logits memory, and a counter or log for the eager fallback so it can never again be invisible | `SPEC-MTP-K-GT-1`, [#1020](https://github.com/mudler/vllm.cpp/issues/1020) |
+| Close [#1027](https://github.com/mudler/vllm.cpp/issues/1027) as a duplicate of [#1022](https://github.com/mudler/vllm.cpp/issues/1022) | NOT a code or record debt. The defect #1027 describes is FIXED on `origin/main` by [#1025](https://github.com/mudler/vllm.cpp/pull/1025), and this branch takes main's single well-formed row rather than resurrecting the duplicate, so `check-agent-record` and `check-issue-index-append-only` are BOTH green here. What remains is one remote write this flow has no authority for. Detail and the mechanism are in `## Gates` | operator, [#1027](https://github.com/mudler/vllm.cpp/issues/1027) |
 | M2 speed A/B at matched k | concurrency-1 and concurrency>1 throughput against vLLM same-config at matched k, plus the acceptance-versus-depth curve for prose and for code | [#81](https://github.com/mudler/vllm.cpp/issues/81) M2 |
 | M3 `SPEC-DYNAMIC` | `num_speculative_tokens_per_batch_size` and the dense batch-size to k lookup, mirrored from `vllm/config/speculative.py:177` and `vllm/v1/spec_decode/dynamic/utils.py:7,77` | [#81](https://github.com/mudler/vllm.cpp/issues/81) M3 |
 | M4 adaptive depth (acceptance EMA) | The controller is EXPLICITLY optional and out of scope here. It needs: an acceptance EMA that rises slowly and decays about twice as fast, a mapping from that EMA to a depth, default OFF, and an A/B on a mixed prose and code workload that it must WIN before it ships as a default. It is from-scratch, so it also owes a [porting-inventory.md](../porting-inventory.md) section 9 record. CONSTRAINT carried from #81: if the spec verify step is ever graphed, a graph is captured per K (`vllm/v1/worker/gpu/cudagraph_utils.py:200-220`), so K must be quantised to a small captured ladder and never a free 1..9. The ladder and the capture set are therefore designed together, not separately | [#81](https://github.com/mudler/vllm.cpp/issues/81) M4 |
@@ -509,10 +575,58 @@ number is claimed at k>1, which is the whole point of depth.
 
 **Measured.** Depth reaches the verify path at k=1, 2, 3 and 4 through
 `LoadedEngine`, and the greedy token stream is identical to speculative-off at
-every one of them (`test_mtp_depth` 5/5, 34 assertions). The per-depth
-acceptance counters reach index k-1 in each arm and are equal across depths,
-which is what distinguishes "the loop ran k times" from "the loop ran more than
-once".
+every one of them (`test_mtp_depth` 5/5, 47 assertions).
+
+**Corrected: the per-depth counters do NOT distinguish "the loop ran k times"
+from "the loop ran more than once", and an earlier revision of this section
+claimed they do.** A fresh review disproved it by mutation. Return straight after
+the prefill and pad all k columns with the step-0 draft, so that ONE forward runs
+in total, and the suite stayed green at 5/5, 34/34, `Status: SUCCESS`, with
+`compile_err = 0` and the mutation demonstrably applied. The witness was
+`spec_drafts_proposed_by_depth().size()`, grown from
+`step.num_draft_tokens_per_req[i]` (`runner.cpp:1780-1782`), which is the LENGTH
+of the emitted draft list and therefore a pure function of the runner's slicing at
+`runner.cpp:2209-2212`. Anything that hands the verify path k tokens satisfies it.
+The reviewer also probed the counters in both arms at k=3 and got identical
+output, `proposed: 7 7 7 accepted: 0 0 0` on the real loop and
+`proposed: 7 7 7 accepted: 0 0 0` on the padded fake. The equality across depths
+held trivially at zero, and index k-1 was reached by list length alone. The
+shipped code did run k steps. The GATE was the defect.
+
+**The witness that replaced it: draft decode forwards, counted where the work
+happens.** `MtpProposeDrafts` returns `MtpDraftProposal`, whose
+`num_draft_decode_forwards` is incremented AFTER each draft decode forward
+returns. The runner accumulates it beside a count of propose calls and exposes
+both read-only, so the depth assertion is the exact equality
+`spec_mtp_draft_decode_forwards() == spec_mtp_propose_calls() * (k - 1)`, with
+`spec_mtp_propose_calls() > 0` required first so the equality cannot hold
+vacuously. No draft-list shape produces that equality. Re-run of the reviewer's
+exact mutation against it: `Status: FAILURE!`, 3 of 5 cases failed, 4 of 47
+assertions failed, `compile_err = 0`, exit code 1, and the four failures are
+exactly the four depth equalities (`0 == 16` at k=3 with 8 calls, `0 == 20` at
+k=3 with 10 calls, `0 == 8` at k=2, `0 == 24` at k=4). Every one of the other 43
+assertions, including every list-length and every token-identity assertion, still
+PASSED under the mutation, which is the reviewer's finding reproduced rather than
+argued.
+
+**Rejected: non-zero acceptance at depth >= 2 as the CPU witness.** It is the
+right assertion and it is unavailable here. Acceptance is measured at ZERO at
+every depth on the synthetic gate model, in both arms, so the acceptance profile
+cannot separate them.
+
+**Rejected: distinctness of the k drafted tokens.** A correct drafter may repeat
+a token, and on this 24-entry vocabulary it often does, so the property belongs to
+the model rather than to the loop.
+
+**What the CPU half therefore establishes, and what it does not.** It establishes
+that k drafts are PROPOSED, that k-1 draft decode forwards run per propose call at
+every k tested, that k drafts reach the verify path, and that the greedy stream
+does not move. It does NOT establish that the accept path works at depth, because
+not one draft is ever accepted at any depth on this model. The prefix-monotonicity
+assertions over `spec_drafts_accepted_by_depth()` are consequently vacuous, and
+they are kept because the invariant is the right one to state. The owed DGX gate
+demanding non-zero acceptance at every depth is not belt-and-braces. It is the
+only place the accept path at depth is exercised at all.
 
 **Rejected: the refusal inside `SpeculativeConfig::ResolveMtp`.** It reddened
 the scheduler tests, which build an MTP config at k=3 to exercise a scheduler

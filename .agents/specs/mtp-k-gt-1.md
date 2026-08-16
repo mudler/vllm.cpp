@@ -91,8 +91,8 @@ Every anchor below was read at that revision.
 
 | Anchor | What it defines |
 |---|---|
-| `:129-274` `propose` | The whole shape: one prefill forward, then the k=1 early exit at `:236-238`, then `prepare_decode_inputs`, then `_multi_step_decode`, then `return self.draft_tokens[:num_reqs]` |
-| `:236-238` | The early exit this tree ported. `num_speculative_steps == 1` returns `draft_tokens[:num_reqs, :1]` |
+| `:129-275` `propose` | The whole shape: one prefill forward, then the k=1 early exit at `:238-240`, then `prepare_decode_inputs`, then `_multi_step_decode`, then `return self.draft_tokens[:num_reqs]` |
+| `:238-240` | The early exit this tree ported. `num_speculative_steps == 1` returns `draft_tokens[:num_reqs, :1]` |
 | `:335-370` `_prefill` | Sample step 0 from the `last_token_indices` rows, then carry BOTH the sampled hidden and the positions of those rows into the per-request decode buffers |
 | `:374-419` `_multi_step_decode` | `for step in range(1, num_speculative_steps)`: rebuild slot mappings and draft attention metadata each step, set `current_draft_step`, generate |
 | `:426-471` `_generate_draft` | One draft forward over `num_reqs` tokens, sample, then `update_draft_inputs` |
@@ -442,26 +442,55 @@ then PASS at 21, 25, 23 and 22. That is
 asserted, which matters because a single red would otherwise read as this diff's
 fault: nothing in this change is on that harness's path.
 
-### Final gate, at `1554494c3` against `origin/main` `4f2d91756`
+### Final gate, on the `67088c987` tree plus this spec edit, against `origin/main` `ff264cb82`
 
-`scripts/agent-preflight.sh`, by block:
+The gate ran on the code tree of `67088c987` with this documentation-only spec
+edit in the working tree, which is on no gate's code path. It was run TWICE by
+two different agents, and the second run was a fresh implementer reproducing the
+first rather than transcribing it, because the agent that recorded these numbers
+was killed before it committed them and an uncommitted number is a claim.
 
-| Block | ok | FAIL |
-|---|---:|---:|
-| Session role | 1 | 0 |
-| Record gates | 25 | 1 (`check-agent-record`, the inherited #995 duplicate) |
-| Mutation suites | 42 | 2 (`test_agent_record`, same duplicate; `test_cpu_x86_llamacpp_floor`, the load flake above) |
-| Committed range vs `origin/main` | 2 | 1 (`doc-checkpoint range`, below) |
-| Commit trailers vs `origin/main` | 2 | 0 |
+`scripts/agent-preflight.sh`, exit code `0`, by block. Every gate reported a
+RESULT and none skipped, checked by counting rather than by reading: 76 `ok` lines
+and `grep -cE '^  (FAIL|SKIP)'` returns 0.
+
+| Block | ok | FAIL | SKIP |
+|---|---:|---:|---:|
+| Session role | 1 | 0 | 0 |
+| Record gates | 26 | 0 | 0 |
+| Mutation suites | 44 | 0 | 0 |
+| Committed range vs `origin/main` | 3 | 0 | 0 |
+| Commit trailers vs `origin/main` | 2 | 0 | 0 |
+
+Three reds the previous gate reported are gone, and none of them was waived.
+`check-agent-record` and `test_agent_record` are green because this branch now
+takes main's single well-formed `#995` row instead of resurrecting the duplicate.
+`doc-checkpoint range` is green because the Phase 1 commit was amended to carry
+the `docs/USAGE.md` line it owed. `test_cpu_x86_llamacpp_floor` passed on an
+uncontended host, which is the #618 behaviour recorded above.
 
 The trailer block EXECUTED rather than skipping. It is guarded on
 `git merge-base --is-ancestor origin/main HEAD`
 (`scripts/agent-preflight.sh:226-228`), and an earlier run on this branch skipped
-it silently because `origin/main` had advanced mid-flow. That is why this branch
-carries two merges rather than one.
+it silently because `origin/main` had advanced mid-flow. Checked explicitly this
+time: `git merge-base --is-ancestor origin/main HEAD` succeeds against
+`ff264cb82`, which is the SHA the block gated on.
 
-`ctest` on the same head: `100% tests passed, 0 tests failed out of 495`, with
-two checkpoint-gated skips.
+`ctest` on the same head: `100% tests passed, 0 tests failed out of 495`, exit
+code 0, with two checkpoint-gated skips (`test_modelopt_mixed_precision_checkpoint`,
+`test_voxtral_e2e`). Full `Release` rebuild first, `compile_err = 0`, zero
+warnings. The three focused suites on that build: `test_mtp_depth` 5 cases /
+47 assertions, `test_prepare_decode_inputs` 8 / 33,
+`test_speculative_mtp_depth` 4 / 20, each `Status: SUCCESS!` and exit 0.
+
+Disk was checked before attributing anything to code, because the previous review
+hit ENOSPC mid-run: 30 to 31 GB free across both runs, with the `build-cpu` tree
+at 9.8 GB. Loadavg was checked for the same reason, because
+`test_cpu_x86_llamacpp_floor` reds under contention (#618) and a host red reads
+as a code red: 2.0 at the start of the second run on 20 cores, rising to 8.3 as
+`ctest -j 8` finished, and another session's unrelated `minimax-music3` process
+held about one core throughout. Neither run had the GPU lock, which stayed with
+the session that held it for this whole flow.
 
 `doc-checkpoint range` named commit `4ad2bec87`, the Phase 1 refusal: it changed
 `src/vllm/entrypoints/` and did not update `docs/USAGE.md` in the SAME commit,
@@ -537,10 +566,10 @@ upstream's own supported configuration.
 | Step | What | State |
 |---|---|---|
 | W1 | The spec, its upstream anchors, and the two graph-layer hazards checked rather than assumed | LANDED (`98ab752f5`) |
-| W2 | The refusal at `LoadedEngine::ResolveSpecConfig`, red-first at the engine seam. Independently landable, so the defect closes even if W3 stalls | LANDED (`4ad2bec87`) |
-| W3 | `prepare_decode_inputs` + `update_draft_inputs` + `draft_decode_slot_mapping`, the two Triton-kernel ports, mutation-gated | LANDED (`93d6bc329`) |
-| W4 | `MtpProposeDrafts` (the multi-step loop) + `Qwen3_5MTPModel::GatherHiddenRows` + the runner emitting k drafts + per-depth telemetry, and the W2 refusal REMOVED rather than widened | LANDED (`93d6bc329`) |
-| W5 | The CPU depth gate through the production loader at k=1..4, plus the public-document projections | LANDED (`93d6bc329`) |
+| W2 | The refusal at `LoadedEngine::ResolveSpecConfig`, red-first at the engine seam. Independently landable, so the defect closes even if W3 stalls | LANDED (`c5511d12f`) |
+| W3 | `prepare_decode_inputs` + `update_draft_inputs` + `draft_decode_slot_mapping`, the two Triton-kernel ports, mutation-gated | LANDED (`cb0bb2579`) |
+| W4 | `MtpProposeDrafts` (the multi-step loop) + `Qwen3_5MTPModel::GatherHiddenRows` + the runner emitting k drafts + per-depth telemetry, and the W2 refusal REMOVED rather than widened | LANDED (`cb0bb2579`) |
+| W5 | The CPU depth gate through the production loader at k=1..4, plus the public-document projections | LANDED (`cb0bb2579`), witness REPAIRED in `0d37de1ed` after a fresh review proved the first one blind: see `## Outcome` |
 | W6 | The DGX three-way at k=2..4 on the 27B and 35B, on the DEFAULT bf16 GDN state | OWED, see below. The GPU lock was held for the whole flow |
 | W7 | The matched-k throughput A/B and the acceptance-versus-depth curve | OWED, #81 M2 |
 
@@ -608,6 +637,18 @@ k=3 with 10 calls, `0 == 8` at k=2, `0 == 24` at k=4). Every one of the other 43
 assertions, including every list-length and every token-identity assertion, still
 PASSED under the mutation, which is the reviewer's finding reproduced rather than
 argued.
+
+That mutation was then re-run INDEPENDENTLY by a second fresh implementer, from
+the finding's own words rather than from the first agent's patch, and it landed
+on the same four failures: `git diff --stat` 14 insertions to
+`speculator.cpp` (a different shape from the first re-run's 45, since the
+mutation is described by behaviour and not by diff), the build linked with
+`compile_err = 0`, and the run gave `Status: FAILURE!`, 3 of 5 cases failed, 4 of
+47 assertions failed, exit 1, on `0 == 16`, `0 == 20`, `0 == 8` and `0 == 24`.
+The tree was restored from a pristine COPY and verified by `sha256sum` rather
+than by `git checkout --`, which would have discarded uncommitted spec work, and
+the restored build re-ran 5/5, 47/47, exit 0. Two agents, two independently
+written mutations, one verdict.
 
 **Rejected: non-zero acceptance at depth >= 2 as the CPU witness.** It is the
 right assertion and it is unavailable here. Acceptance is measured at ZERO at

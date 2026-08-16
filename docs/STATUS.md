@@ -185,8 +185,10 @@ token-for-token correctness against the pinned oracle.
 **MTP draft DEPTH is configurable** as of `SPEC-MTP-K-GT-1` (`ACTIVE`,
 2026-08-16, [spec](../.agents/specs/mtp-k-gt-1.md), #81):
 `num_speculative_tokens` loops the single MTP head autoregressively, CPU-gated
-at k=1..4 with per-depth acceptance as the witness. The DEFAULT is unchanged at
-k=1 and **no speed number is claimed above it**. Before this the engine accepted
+at k=1..4 and witnessed per arm by the `k-1` draft decode forwards each propose
+runs, because a token-identity gate cannot see a clamped drafter. No draft is
+ACCEPTED at any depth there, so the accept path awaits the owed DGX gate. The
+DEFAULT is unchanged at k=1 and **no speed number is claimed above it**. Before this the engine accepted
 a depth above 1, sized KV and the verify graph for it, and drafted one token.
 
 Speculative decoding is available on the Qwen3.5/3.6 checkpoints via

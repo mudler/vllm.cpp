@@ -251,6 +251,14 @@ jobs:
         # whether a checker should catch the class; this closes the instance.
         run: |
           python3 tests/scripts/test_main_baseline.py
+      - name: Preflight never reports green over a block that did not run
+        # Registered in TWO places, like the baseline suite above: here and in
+        # the `SUITES` array of `scripts/agent-preflight.sh`. This lane is the
+        # one that matters more of the two, because the defect it pins (#998)
+        # is preflight lying about ITSELF, and a suite that only ever runs from
+        # the script it audits is checked by exactly the run it cannot trust.
+        run: |
+          python3 tests/scripts/test_agent_preflight_skip_report.py
       - name: Protocol prose matches the checkers that enforce it
         # PART tree-scoped, PART diff-scoped, and the two must be told apart on
         # the baseline lane (#274). `documentation-checkpoint` and

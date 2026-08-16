@@ -26,6 +26,9 @@
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
 #include "vllm/model_executor/models/ltx2_audio_vae_encoder.h"
 #include "vllm/model_executor/models/ltx2_conditioning.h"
+// The accumulator-width case enters the decode through the PRODUCTION streaming
+// entry point rather than through Ltx2ConvVideoDecode (issue #1008).
+#include "vllm/model_executor/models/ltx2_tiling.h"
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_video_vae_encoder.h"
 // vocoder1d::kSnakeEps: the Snake/SnakeBeta stabilizer is SHARED with MiniMax-H3's
@@ -1057,6 +1060,128 @@ TEST_CASE("ltx2 vae: the NON-causal Conv video decoder matches upstream ltx_core
       causal_cfg, causal_bag.weights, latent, lc, lt, lh, lw, &causal_noise);
   REQUIRE(causal_frames.data.size() == frames.data.size());
   CHECK(causal_frames.data != frames.data);
+}
+
+TEST_CASE("ltx2 vae: the decode's convolution accumulates in f32, the width torch uses") {
+  // THE ONE DEFECT THE GOLDENS STRUCTURALLY CANNOT REPORT, so it gets its own
+  // instrument (issue #1008, .agents/specs/ltx25-decode-dtype.md).
+  //
+  // Every golden in this file is vacuous on accumulator WIDTH by construction:
+  // scripts/gen-ltx2-vae-goldens.py:223 casts every upstream parameter with
+  // `values.astype(np.float32)`, so the oracle ran f32 end to end and a dtype
+  // comparison against it compares nothing. A decode that accumulated in f64 —
+  // as this one did until #1008 — stays numerically plausible, keeps every
+  // golden green, and moves twice the bytes. AGENTS.md says a token gate cannot
+  // detect a dtype that is too wide; this case is what detects it here.
+  //
+  // THE REDUCTION IS ENGINEERED SO THE TWO WIDTHS ARE SEPARABLE, and the
+  // expected value is UPSTREAM'S, not a recording of what this port emits.
+  // MEASURED with torch 2.11.0 on exactly the taps below:
+  //   F.conv3d, f32 tensors  -> 0.0
+  //   F.conv3d, bf16 tensors -> 0.0   (upstream's own dtype, distilled.py:109)
+  //   F.conv3d, f64 tensors  -> 2.500000014901161
+  // Why 0.0 holds for ANY f32 summation order: half an ulp of 1e8 is 4.0, and
+  // the 25 small taps sum to 2.5, so every partial sum rounds back to exactly
+  // 1e8 and the closing -1e8 cancels it exactly. An f64 accumulator keeps the
+  // 2.5. There is no order in which an f32 accumulator does.
+  constexpr float kBig = 1e8f;
+  constexpr float kSmall = 0.1f;
+
+  vllm::Ltx2ConvVideoDecoderConfig cfg;
+  cfg.prefix = "ltx2.videodec.accwidth.";
+  cfg.in_channels = 1;
+  cfg.out_channels = 1;
+  cfg.patch_size = 1;
+  cfg.base_channels = 2;
+  cfg.causal = false;
+  cfg.timestep_conditioning = false;
+  cfg.norm_layer = vllm::Ltx2NormLayer::kPixelNorm;
+  // REPLICATE, not the fixtures' reflect: with a uniform input every conv tap
+  // then reads exactly 1.0 at every output voxel INCLUDING the borders, so one
+  // reduction is repeated everywhere and no voxel is a special case. `kZeros`
+  // would zero the border taps and break the derivation below.
+  cfg.spatial_padding_mode = vllm::Ltx2PaddingMode::kReplicate;
+  // No blocks at all. The decode is then conv_in -> PixelNorm -> SiLU ->
+  // conv_out, which is short enough to carry an ANALYTIC expectation end to end
+  // rather than a checked-in vector that only records today's behaviour.
+  cfg.decoder_blocks = {};
+
+  const std::string p = cfg.prefix;
+  vllm::Ltx2VaeWeights weights;
+  weights.tensors[p + "per_channel_statistics.std-of-means"] = {1.0f};
+  weights.tensors[p + "per_channel_statistics.mean-of-means"] = {0.0f};
+
+  // conv_in is [out=2, in=1, 3, 3, 3]. Output channel 0 carries the separable
+  // reduction in the exact order CausalConv3d walks it (ic, then a, b, d, so
+  // flat 0..26); output channel 1 is all-zero with a bias of 1, purely to give
+  // PixelNorm a second channel with a known norm.
+  std::vector<float> conv_in(2 * 1 * 27, 0.0f);
+  conv_in[0] = kBig;
+  for (size_t i = 1; i < 26; ++i) conv_in[i] = kSmall;
+  conv_in[26] = -kBig;
+  weights.tensors[p + "conv_in.conv.weight"] = conv_in;
+  weights.tensors[p + "conv_in.conv.bias"] = {0.0f, 1.0f};
+
+  // conv_out is [out=1, in=2, 3, 3, 3]; it selects channel 0's centre tap and
+  // nothing else, so it forwards the value under test without adding a second
+  // reduction that could mask it.
+  //
+  // THE BIAS IS 7, AND THAT IS NOT COSMETIC. With a bias of 0 the f32 answer is
+  // zero, and a decode that never ran — a deleted call site handing back a
+  // zero-filled buffer — produces zero as well, so the case would pass while
+  // measuring nothing. This was not hypothetical: the reachability mutation was
+  // run, the stub returned zeros, and an earlier draft of this case PASSED.
+  // Offsetting the expectation off zero is what separates "accumulated in f32"
+  // from "nothing reached this at all".
+  constexpr float kOutBias = 7.0f;
+  std::vector<float> conv_out(1 * 2 * 27, 0.0f);
+  conv_out[13] = 1.0f;  // ic=0, a=b=d=1
+  weights.tensors[p + "conv_out.conv.weight"] = conv_out;
+  weights.tensors[p + "conv_out.conv.bias"] = {kOutBias};
+
+  const int64_t lt = 1, lh = 2, lw = 2;
+  const std::vector<float> latent(static_cast<size_t>(lt * lh * lw), 1.0f);
+
+  vllm::Ltx2TileSizeConfig tiling;
+  tiling.frames = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  tiling.height = vllm::Ltx2DimensionSizeConfig{10000, 0};
+  tiling.width = vllm::Ltx2DimensionSizeConfig{10000, 0};
+
+  // ENTERS THROUGH THE PRODUCTION ENTRY POINT. `Ltx2VideoDecodeStreaming` is
+  // what the render path calls (src/vllm/multimodal/ltx2_video.cpp:3258), and it
+  // reaches Ltx2ConvVideoDecode through ltx2_video_vae_tiled.cpp:113. Deleting
+  // that call site turns this case RED, which is the reachability proof; a case
+  // that called Ltx2ConvVideoDecode directly would prove only that the function
+  // works. A null noise stream is deliberate: this configuration must not draw,
+  // and the decode's own VT_CHECK fails loudly if that ever changes.
+  int64_t chunks = 0;
+  vllm::Ltx2VideoFrames got;
+  vllm::Ltx2VideoDecodeStreaming(
+      vllm::Ltx2VideoDecoderKind::kConv, cfg, weights, latent, cfg.in_channels, lt, lh, lw,
+      /*noise=*/nullptr, tiling, [&](const vllm::Ltx2VideoChunk& chunk) {
+        ++chunks;
+        got = chunk.frames;
+      });
+  REQUIRE(chunks == 1);
+  REQUIRE(got.data.size() == 4u);
+
+  // THE DERIVATION, so a reader can check the number rather than trust it.
+  //   conv_in ch0 = 0 (f32) or 2.5 (f64);  conv_in ch1 = bias = 1
+  //   PixelNorm over 2 channels: f32 mean_sq = 0.5, and 0 * anything = 0
+  //   SiLU(0) = 0;  conv_out forwards ch0 and adds its bias
+  // so an f32 accumulator makes EVERY output element exactly the bias. An f64
+  // one gives 2.5 -> 2.5/sqrt(3.625) = 1.31306 -> SiLU -> ~1.03473 on top of it,
+  // a gap of 1.03, which is 200000x the golden tolerance. Nothing between the
+  // two arms is a matter of tolerance.
+  const std::vector<float> want(4, kOutBias);
+  const double err = MaxAbsDiff(got.data, want.data(), got.data.size());
+  INFO("conv accumulator width probe max|out - bias| = " << err);
+  CHECK(err <= kLtx2GoldenTol);
+
+  // The f64 answer stated as a value, so this case fails LOUDLY rather than
+  // drifting if the accumulator is ever widened again. 1.03473 is what this
+  // decode returned before #1008 narrowed it.
+  CHECK(err < 1.0);
 }
 
 TEST_CASE("ltx2 vae: the video decoder's norm_eps is gated where it BINDS") {

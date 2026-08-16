@@ -1,8 +1,11 @@
 // Ported from: vllm/v1/worker/gpu/spec_decode/mtp/speculator.py (MTPSpeculator)
 // + vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py (propose :126-271,
 //   _prefill :332-370) @ e24d1b24. `sample_draft` / `_greedy_sample_draft` are NOT
-//   in that file: they are inherited from the base class in
-//   vllm/v1/worker/gpu/spec_decode/speculator.py (:276-280 @ 555967922).
+//   in that file: they are inherited from `DraftModelSpeculator` in
+//   vllm/v1/worker/gpu/spec_decode/speculator.py (class :69, `_greedy_sample_draft`
+//   :276-280 @ 555967922). The chain is
+//   MTPSpeculator -> AutoRegressiveSpeculator -> DraftModelSpeculator ->
+//   BaseSpeculator, and the ABC at :29 declares no such method.
 //
 // Scope (SPEC-MTP increment I5c, row SPEC-MTP): the k=1 greedy MTP propose — the
 // paged draft-prefill forward + argmax draft-token pick — assembled from the
@@ -74,7 +77,7 @@ std::vector<int32_t> MtpProposePrefill(
     vt::Queue& queue);
 
 // The FULL greedy MTP propose at any depth (SPEC-MTP-K-GT-1, issue #81) —
-// upstream `AutoRegressiveSpeculator.propose` (:129-275 @ 555967922) end to end:
+// upstream `AutoRegressiveSpeculator.propose` (:129-274 @ 555967922) end to end:
 // the one paged draft prefill above, the `num_speculative_steps == 1` EARLY EXIT
 // (:238-240), and otherwise `prepare_decode_inputs` (:242-251) followed by
 // `_multi_step_decode` (:266-272), which runs k-1 single-token draft decode
@@ -98,7 +101,7 @@ std::vector<int32_t> MtpProposePrefill(
 //
 // `draft_tokens` is [num_reqs * k] ROW-MAJOR: request r's drafts are
 // `draft_tokens[r * k .. r * k + k)` in draft order. This is the flattened form
-// of upstream's `self.draft_tokens[:num_reqs]` (:275).
+// of upstream's `self.draft_tokens[:num_reqs]` (:274).
 //
 // `num_draft_decode_forwards` is NOT diagnostics. It is the only value a caller
 // can assert that a propose which did NOT run the loop cannot satisfy, and it
@@ -114,13 +117,25 @@ std::vector<int32_t> MtpProposePrefill(
 //   * Non-zero acceptance at depth >= 2 cannot serve on CPU. Acceptance is
 //     measured at ZERO at every depth on the synthetic gate model, so the
 //     acceptance profile is identical between the real loop and the padded fake.
-//     It remains the right assertion for the owed DGX gate, on real weights.
-//   * Distinctness of the k drafts cannot serve. A correct drafter may repeat a
-//     token, and on a 24-entry vocabulary it often does, so the property is the
-//     model's rather than the loop's.
+//     It remains the right assertion for the owed DGX gate, on real weights, and
+//     it is the ONLY one of these that proves per-column provenance.
+//   * PER-CALL distinctness of the k drafts cannot serve. A correct drafter may
+//     repeat a token, and on a 24-entry vocabulary it does: a `2 2 2` row at k=3
+//     is measured on the synthetic gate model. That property is the model's
+//     rather than the loop's.
 //
 // It is incremented AFTER each draft decode forward RETURNS, so it counts work
 // performed rather than intent, and it is exactly `k - 1` on every call.
+//
+// It is NOT a witness against padding, and it never was. A propose that runs
+// every step and then overwrites `draft_tokens` with its step-0 draft reports
+// `k - 1` here truthfully. What that mutation cannot survive is a check on the
+// DELIVERED array, so the runner keeps one:
+// `GPUModelRunner::spec_mtp_proposals_with_varied_drafts()` counts the calls
+// whose returned row was not a pure function of its own first column. That is
+// the AGGREGATE form of the per-call distinctness rejected above, it is measured
+// non-zero at every k >= 2 on the gate model, and its own bound is recorded
+// beside it in runner.h.
 struct MtpDraftProposal {
   std::vector<int32_t> draft_tokens;      // [num_reqs * k] row-major
   int64_t num_draft_decode_forwards = 0;  // == k - 1, one per executed step

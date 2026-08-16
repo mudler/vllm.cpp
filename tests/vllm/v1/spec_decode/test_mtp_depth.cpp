@@ -39,25 +39,49 @@
 // is ever accepted at depth. The owed DGX gate demands non-zero acceptance at
 // every depth for exactly this reason.
 //
-// The witness that survives is the one counted where the work happens:
-// `spec_mtp_draft_decode_forwards()`, incremented after each draft decode forward
-// RETURNS, against `spec_mtp_propose_calls()`. Upstream runs
-// `num_speculative_steps - 1` decode forwards per propose, so the assertion is
-// the exact equality
+// ─── TWO WITNESSES, BECAUSE ONE DOES NOT COVER BOTH FAILURES ────────────────
+// The first is counted where the work happens: `spec_mtp_draft_decode_forwards()`,
+// incremented after each draft decode forward RETURNS, against
+// `spec_mtp_propose_calls()`. Upstream runs `num_speculative_steps - 1` decode
+// forwards per propose, so the assertion is the exact equality
 //
 //     forwards == calls * (k - 1)
 //
-// and no draft-list shape can produce it. Under the reviewer's mutation the
+// and no draft-list shape can produce it. Under the mutation described above the
 // forward count is 0 while `calls` is not, so at every k above 1 the equality
-// fails and the suite goes RED. A third candidate, distinctness of the k drafted
-// tokens, was rejected: a correct drafter may legitimately repeat a token, and on
-// this 24-entry vocabulary it often does, so that property belongs to the model
-// rather than to the loop.
+// fails and the suite goes RED.
+//
+// THAT EQUALITY DOES NOT SEE PADDING, and an earlier revision of this header
+// claimed it did. A SECOND fresh review wrote the mutation that proves it: let
+// the loop run all k-1 forwards and count them honestly, then discard what they
+// sampled and pad every column with the step-0 draft. The equality holds exactly
+// on that, and the suite was fully green, 5 passed / 0 failed, 47/47 assertions.
+// The forwards witness answers "did the work run", never "did its results reach
+// the caller", and those are different questions.
+//
+// The second witness answers the second question, and it is read at the CONSUMER
+// rather than inside the loop: `spec_mtp_proposals_with_varied_drafts()` counts
+// the propose calls whose DELIVERED row was not a pure function of its own first
+// column. A padded row is exactly such a function, so the counter is 0 at every k
+// under that mutation while the real loop leaves it non-zero.
+//
+// What NEITHER shows is per-column provenance: that column j came from forward j.
+// An off-by-one in the `update_draft_inputs` column index, or a broken carry,
+// still satisfies both. That is the same bound as the zero-acceptance gap above
+// and it closes in the same place: acceptance AT DEPTH on real weights, which is
+// what the owed DGX gate demands.
+//
+// PER-CALL distinctness of the k drafts was rejected and stays rejected: a
+// correct drafter may legitimately repeat a token, and on this 24-entry
+// vocabulary it does, a `2 2 2` row at k=3 being MEASURED here. The counter above
+// is the AGGREGATE form of it, asserted over a run and never per call.
 //
 // RED-first for this file: before the multi-step propose, the k=3 case built an
 // engine that reserved KV for 3 and drafted ONE token, so the depth witness read
-// 1 against 3. RED again for the repaired witness: with the reviewer's padding
-// mutation applied, `forwards` reads 0 against `calls * 2`.
+// 1 against 3. RED again for the forwards witness: with a propose that returns
+// straight after the prefill, `forwards` reads 0 against `calls * 2`. RED again
+// for the result witness: with the padding mutation that keeps the forwards
+// honest, `varied` reads 0 against a required non-zero.
 #include <doctest/doctest.h>
 
 #include <cstdint>
@@ -382,10 +406,16 @@ int VerifiedDepth(const LoadedEngine& eng) {
   return static_cast<int>(eng.runner().spec_drafts_proposed_by_depth().size());
 }
 
-// THE DEPTH WITNESS. `k - 1` draft decode forwards run per propose call, counted
-// after each forward returns, so this equality holds exactly when the multi-step
-// loop ran to depth on every call and fails on any propose that short-circuits,
-// pads, or clamps. It is the assertion the padded mutation cannot satisfy.
+// WITNESS 1, THE WORK. `k - 1` draft decode forwards run per propose call,
+// counted after each forward returns, so this equality holds exactly when the
+// multi-step loop RAN to depth on every call and fails on any propose that
+// short-circuits or clamps.
+//
+// It does NOT fail on a propose that pads, and an earlier revision of this
+// comment said it did. The reviewer's mutation runs every forward, counts them
+// honestly, then discards the sampled tokens and writes the step-0 draft into
+// all k columns: this equality holds exactly on it. Witness 2 is the one that
+// does not.
 void CheckDraftDecodeForwards(const LoadedEngine& eng, int k) {
   const int64_t calls = eng.runner().spec_mtp_propose_calls();
   const int64_t forwards = eng.runner().spec_mtp_draft_decode_forwards();
@@ -397,6 +427,43 @@ void CheckDraftDecodeForwards(const LoadedEngine& eng, int k) {
   // reported" shape. Require the work to have happened first.
   REQUIRE(calls > 0);
   CHECK(forwards == calls * static_cast<int64_t>(k - 1));
+}
+
+// WITNESS 2, THE RESULT. Read at the CONSUMER, on the array the propose handed
+// the runner: how many calls delivered a row that was not a pure function of its
+// own first column. A padded propose leaves this 0 at every k, because every
+// column of a padded row IS its first column, and no amount of honest forward
+// counting changes that.
+//
+// The bound, stated because the assertion is easy to over-read. `varied > 0`
+// says the delivered array carries information the step-0 draft alone does not
+// determine. It does NOT say column j came from forward j, so an off-by-one in
+// the `update_draft_inputs` column index or a broken carry still passes. Only
+// acceptance AT DEPTH proves that, and acceptance is measured 0 at every depth
+// here, so per-column provenance stays owed to the DGX gate exactly as the
+// zero-acceptance gap below does.
+//
+// The assertion is an AGGREGATE over the run and never a per-call one, because a
+// correct drafter may resample the same token: a `2 2 2` row at k=3 is MEASURED
+// on this fixture. Measured over a whole run it never happens on every call, and
+// the two buckets are captured below so a report says how many of how many.
+void CheckDraftsCarryDepth(const LoadedEngine& eng, int k) {
+  const int64_t calls = eng.runner().spec_mtp_propose_calls();
+  const int64_t varied = eng.runner().spec_mtp_proposals_with_varied_drafts();
+  CAPTURE(k);
+  CAPTURE(calls);
+  CAPTURE(varied);
+  CAPTURE(calls - varied);  // the constant-row bucket. The two SUM to calls.
+  REQUIRE(calls > 0);
+  CHECK(varied <= calls);
+  if (k == 1) {
+    // A one-column row has nothing to differ from, so the counter is 0 BY
+    // CONSTRUCTION here. Asserted rather than skipped, because a counter that
+    // fired at k=1 would be counting something other than depth.
+    CHECK(varied == 0);
+  } else {
+    CHECK(varied > 0);
+  }
 }
 
 }  // namespace
@@ -414,10 +481,12 @@ TEST_CASE("mtp depth: a configured depth of 3 actually drafts 3") {
   REQUIRE(out.outputs.size() == 1);
   CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == kN);
 
-  // THE WITNESS. Two draft decode forwards ran per propose call, which only a
-  // loop that went to depth 3 can produce. This is the assertion the reviewer's
-  // padding mutation fails and every list-shape assertion below passes.
+  // THE WITNESSES. Two draft decode forwards ran per propose call, which only a
+  // loop that went to depth 3 can produce, AND what those forwards sampled
+  // reached the array the runner was handed. Every list-shape assertion below
+  // passes on a propose that satisfies neither.
   CheckDraftDecodeForwards(eng, 3);
+  CheckDraftsCarryDepth(eng, 3);
 
   // The list-shape assertions, kept as NECESSARY conditions. They say the verify
   // path received three drafts per request. They do not say three were drafted,
@@ -482,6 +551,7 @@ TEST_CASE("mtp depth: k=1, k=3 and spec-OFF emit the SAME greedy tokens") {
     CHECK(VerifiedDepth(eng) == 0);
     CHECK(eng.runner().spec_mtp_propose_calls() == 0);
     CHECK(eng.runner().spec_mtp_draft_decode_forwards() == 0);
+    CHECK(eng.runner().spec_mtp_proposals_with_varied_drafts() == 0);
   }
   {
     LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(1),
@@ -490,8 +560,10 @@ TEST_CASE("mtp depth: k=1, k=3 and spec-OFF emit the SAME greedy tokens") {
                  .outputs[0].token_ids;
     CHECK(VerifiedDepth(eng) == 1);
     // k=1 is the early exit: the propose ran, and it ran NO decode forward. The
-    // same equality as every other arm, at k-1 == 0.
+    // same equality as every other arm, at k-1 == 0, and the same result witness
+    // at its own k=1 value of 0.
     CheckDraftDecodeForwards(eng, 1);
+    CheckDraftsCarryDepth(eng, 1);
   }
   {
     LoadedEngine eng(c, MakeDenseWeights(c), BuildFixture(), SpecParams(3),
@@ -500,6 +572,7 @@ TEST_CASE("mtp depth: k=1, k=3 and spec-OFF emit the SAME greedy tokens") {
                  .outputs[0].token_ids;
     CHECK(VerifiedDepth(eng) == 3);
     CheckDraftDecodeForwards(eng, 3);
+    CheckDraftsCarryDepth(eng, 3);
   }
 
   REQUIRE(static_cast<int>(off_ids.size()) == kN);
@@ -523,8 +596,10 @@ TEST_CASE("mtp depth: k=2 and k=4 both reach their configured depth") {
     CHECK(static_cast<int>(out.outputs[0].token_ids.size()) == 8);
     CHECK(VerifiedDepth(eng) == k);
     // k-1 forwards per call at k=2 and at k=4, which is what separates "the loop
-    // ran more than once" from "the loop ran exactly k times".
+    // ran more than once" from "the loop ran exactly k times", plus the result
+    // witness at both depths.
     CheckDraftDecodeForwards(eng, k);
+    CheckDraftsCarryDepth(eng, k);
   }
 }
 

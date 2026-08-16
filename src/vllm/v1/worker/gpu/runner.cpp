@@ -2192,7 +2192,7 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
   VT_CHECK(drafts.size() ==
                static_cast<size_t>(num_reqs) * static_cast<size_t>(k),
            "propose_drafts: the MTP propose must return k drafts per request");
-  // SPEC-MTP-K-GT-1 (#81): the DEPTH witness, recorded here because this is the
+  // SPEC-MTP-K-GT-1 (#81): the WORK witness, recorded here because this is the
   // only place that knows both the configured k and the forwards the propose
   // actually ran. The check above is a SHAPE check and cannot stand in for it:
   // a propose that ran one forward and padded all k columns passes it, emits the
@@ -2203,6 +2203,28 @@ void GPUModelRunner::propose_drafts(const std::vector<int32_t>& num_sampled_in,
   // including the discarded-row case below, because the forwards ran either way.
   ++spec_mtp_propose_calls_;
   spec_mtp_draft_decode_forwards_ += proposal.num_draft_decode_forwards;
+
+  // SPEC-MTP-K-GT-1 (#81): the RESULT witness, and the reason it is computed
+  // HERE rather than inside the propose. The equality above counts the forwards
+  // a propose RAN, and says nothing about whether their results reached this
+  // array. A propose that runs all k-1 forwards, throws the sampled tokens away
+  // and writes its step-0 draft into every column satisfies that equality
+  // exactly, and was measured green on the whole depth suite. Read at the
+  // CONSUMER, on the bytes the proposer handed over, such a row is a pure
+  // function of its own first column and this counter stays 0 at every k. The
+  // accessor in runner.h states what it does NOT prove: per-column provenance,
+  // which only acceptance at depth can show and which the DGX gate owes.
+  for (int i = 0; i < num_reqs; ++i) {
+    const size_t base = static_cast<size_t>(i) * static_cast<size_t>(k);
+    bool varied = false;
+    for (int j = 1; j < k && !varied; ++j) {
+      varied = drafts[base + static_cast<size_t>(j)] != drafts[base];
+    }
+    if (varied) {
+      ++spec_mtp_proposals_with_varied_drafts_;
+      break;
+    }
+  }
 
   // Stash each request's k drafts, in draft order, for the out-of-band pull. The
   // DraftTokenIds seam already carries variable-length drafts (the n-gram

@@ -2,7 +2,7 @@
 // — the greedy MTP propose. The k=1 prefill half landed as SPEC-MTP increment
 // I5c against pin e24d1b24; the multi-step decode half is SPEC-MTP-K-GT-1
 // (issue #81) against pin 555967922, where the same file carries the loop at
-// :242-275. See the header for scope and the exact upstream anchors.
+// :242-274. See the header for scope and the exact upstream anchors.
 #include "vllm/v1/worker/gpu/spec_decode/mtp/speculator.h"
 
 #include <cstddef>
@@ -16,8 +16,9 @@
 namespace vllm::v1 {
 namespace {
 
-// `_greedy_sample_draft` (spec_decode/speculator.py:276-280 @ 555967922, on the
-// BASE class, not on autoregressive/speculator.py): argmax over each named row of
+// `_greedy_sample_draft` (spec_decode/speculator.py:276-280 @ 555967922, on
+// `DraftModelSpeculator` (:69), which AutoRegressiveSpeculator inherits it from,
+// and not on autoregressive/speculator.py): argmax over each named row of
 // a device [rows, vocab] logits buffer, downloaded once. Lowest-index tie-break,
 // matching our sampler's argmax. `rows` names which logits row each request
 // samples from: the prefill's last_token_indices, and the identity on a decode
@@ -260,10 +261,13 @@ MtpDraftProposal MtpProposeDrafts(
     vllm::Qwen3_5MTPHiddenStates hidden =
         draft.ForwardPaged(inputs.input_ids, inputs.positions, carry.tensor,
                            decode_meta, draft_kv, queue);
-    // Counted AFTER the forward returns, so this reports work performed. It is
-    // the caller's only depth witness that a padded or clamped propose cannot
-    // forge: see the MtpDraftProposal comment for the three witnesses that
-    // cannot serve and why.
+    // Counted AFTER the forward returns, so this reports work PERFORMED rather
+    // than intent. It is the witness a propose that short-circuits or clamps the
+    // loop cannot forge. It is not a witness against PADDING, because a loop
+    // that runs every step and then discards what it sampled increments it just
+    // the same. The caller reads the delivered array for that. See the
+    // MtpDraftProposal comment for what each witness sees and what none of them
+    // do.
     ++result.num_draft_decode_forwards;
     vllm::ForwardLogits logits = draft.ComputeLogits(hidden.tensor, queue);
     VT_CHECK(logits.on_device() && logits.rows == num_reqs,

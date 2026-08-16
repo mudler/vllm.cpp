@@ -88,6 +88,12 @@ struct WeightCase {
   int d_off;
   int dmin_off;
   const char* name;
+  // Ceiling for the f64-DEQUANT case only (0 means use kMaxNmseErr). That
+  // comparison holds a Q8_K-quantized activation against an f32 reference, so
+  // it measures ACTIVATION error, whose reach depends on the weight
+  // distribution. It does NOT bound the kernel. The CUDA-vs-CPU bound below is
+  // what gates this port, it is shared by every case, and it is not relaxed.
+  double nmse_ref_max = 0.0;
 };
 
 // Same table as test_ops_quant_dot.cpp: the Q8_K-family encodings the CUDA kernel
@@ -98,6 +104,20 @@ const WeightCase kCases[] = {
     {DType::kIQ2_XXS, 256, 66, 0, -1, "iq2_xxs"},   // DeepSeek-V4 gate/up
     {DType::kIQ3_XXS, 256, 98, 0, -1, "iq3_xxs"},   // DeepSeek-V4 down
     {DType::kIQ2_S, 256, 82, 0, -1, "iq2_s"},       // DeepSeek-V4 UD-IQ2_M gate/up
+    // The two sub-2-bit codebooks the Qwen3.8-2.4T checkpoints store their
+    // routed experts in (96.92 % of each model). Without a CUDA arm these fall
+    // to the CPU path and still emit CORRECT tokens, just at CPU speed, which
+    // no token gate can see -- so device parity is gated HERE.
+    // Measured, not guessed. Both are ternary lanes times a per-32 scale, so a
+    // super-block spans a wider dynamic range than a 4-6 bit codebook while
+    // Q8_K gives the activation ONE scale per 256 elements. iq1_s lands at
+    // 5.2399e-4 on the thinnest shape (m=4, n=1 is FOUR dot products), against
+    // a 5e-4 default -- the CPU test measures 5.2398e-4 at the SAME shape, and
+    // that near-identity is what shows this is the activation term and not the
+    // device kernel. 2e-3 is ~4x the residual and an order of magnitude below
+    // the weakest decode defect (2.7e-2, measured by mutation on the CPU arm).
+    {DType::kIQ1_S, 256, 50, 0, -1, "iq1_s", 2e-3},       // Qwen3.8 UD-IQ1_S experts
+    {DType::kIQ1_XXXS, 256, 38, 0, -1, "iq1_xxxs", 2e-3},  // Qwen3.8 UD-Q1_0 experts
     {DType::kQ2_K, 256, 84, 80, 82, "q2_K"},        // DeepSeek-V4 UD-Q2_K_XL
     {DType::kQ3_K, 256, 110, 108, -1, "q3_K"},
     {DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
@@ -128,6 +148,33 @@ std::vector<uint8_t> RandomBlocks(const WeightCase& c, int64_t nblocks,
     const float jitter = 1.0F + 0.05F * static_cast<float>(i % 7);
     if (c.d_off >= 0) put_f16(c.d_off, 0.0125F * jitter);
     if (c.dmin_off >= 0) put_f16(c.dmin_off, 0.0075F * jitter);
+    // IQ1_S and IQ1_XXXS carry their per-32 sub-block scale INSIDE the weight
+    // (qh bits 12-14, and the sc nibble's bits 0-2). Uniformly random bits
+    // spread neighbouring 32-groups over a 15x scale range, which no encoder
+    // emits, and Q8_K gives the ACTIVATION one scale per 256 elements -- so the
+    // f64-dequant bound below would measure that synthetic dynamic range rather
+    // than the kernel. The scale still VARIES per sub-block, so a kernel that
+    // dropped or hoisted it is still caught; the delta sign bit stays random.
+    // Mirrors the identical narrowing in tests/vt/test_ops_quant_dot.cpp.
+    if (c.dtype == DType::kIQ1_S) {
+      for (int ib = 0; ib < 8; ++ib) {
+        uint16_t qh = 0;
+        std::memcpy(&qh, blk + 34 + 2 * ib, sizeof(qh));
+        const uint16_t ls = static_cast<uint16_t>(2 + ((i + ib) % 3));
+        qh = static_cast<uint16_t>((qh & 0x8FFFU) | (ls << 12));
+        std::memcpy(blk + 34 + 2 * ib, &qh, sizeof(qh));
+      }
+    }
+    if (c.dtype == DType::kIQ1_XXXS) {
+      for (int ib = 0; ib < 8; ++ib) {
+        uint8_t& byte = blk[34 + ib / 2];
+        const int shift = 4 * (ib & 1);
+        const uint8_t ls = static_cast<uint8_t>(2 + ((i + ib) % 3));
+        const uint8_t keep_sign = static_cast<uint8_t>((byte >> shift) & 0x8);
+        byte = static_cast<uint8_t>((byte & ~(0xFU << shift)) |
+                                    ((keep_sign | ls) << shift));
+      }
+    }
   }
   return bytes;
 }
@@ -228,7 +275,10 @@ TEST_CASE("CUDA keep-quant GEMM == CPU reference and f64 dequant (Q8_K family + 
         const double nmse_cpu = den_cpu > 0 ? num_cpu / den_cpu : num_cpu;
         CAPTURE(nmse_ref);
         CAPTURE(nmse_cpu);
-        CHECK(nmse_ref <= kMaxNmseErr);   // quantization error vs f64 dequant
+        const double ref_ceiling =
+            c.nmse_ref_max > 0 ? c.nmse_ref_max : kMaxNmseErr;
+        CAPTURE(ref_ceiling);
+        CHECK(nmse_ref <= ref_ceiling);   // quantization error vs f64 dequant
         CHECK(nmse_cpu <= kMaxNmseVsCpu);  // matches the CPU oracle (int core exact)
       }
     }

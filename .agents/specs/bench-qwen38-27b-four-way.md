@@ -7,7 +7,7 @@
 | Roadmap | `ROAD-V1-A` (the perf and SGLang floor lane) |
 | Umbrella | [competitive-benchmarks.md](competitive-benchmarks.md) fixes the workload vocabulary and the per-backend leaf-spike contract |
 | Sibling leaf | [cuda-sglang-low-concurrency.md](cuda-sglang-low-concurrency.md) owns the three-arm cache-neutral SGLang gate on the Qwen3.6 snapshots and stays authoritative for it |
-| Subject | `Qwen/Qwen3.8-27B` @ `1d4bf0f2`, `unsloth/Qwen3.8-27B-NVFP4` @ `a767244d`, `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23` |
+| Subject | `Qwen/Qwen3.8-27B` @ `1d4bf0f2`, `unsloth/Qwen3.8-27B-NVFP4` @ `a767244d`, `unsloth/Qwen3.8-27B-GGUF` @ `fe1e2a23`. The two `unsloth` revisions are **named, not inspected**, see section 2.6 |
 | Host | `dgx.casa`, GB10 sm_121a, one `flock $GPU_LOCK` for the whole series |
 | Role | helper, branch `row/BENCH-QWEN38-27B-FOUR-WAY`, base `598226e962ddd4a83292e3d9264bbea9f41603d2` |
 | Status | `SPIKE`. Scoping and record reconciliation only. No number is measured by this spec. |
@@ -51,7 +51,11 @@ table is inferred from a model card or a release note.
 | ours | GATED, [#915](https://github.com/mudler/vllm.cpp/issues/915) | owed, [#821](https://github.com/mudler/vllm.cpp/issues/821) | text-only loader only, no `clip` projector, [#821](https://github.com/mudler/vllm.cpp/issues/821) |
 | vLLM `555967922` | yes | yes | **absent from the tree** |
 | SGLang `f63458b5` v0.5.15 | yes | yes | stack present, this architecture unreachable |
-| llama.cpp `237ad9b96` | convertible, not its representative arm | no | its native arm |
+| llama.cpp `237ad9b96` | convertible, not its representative arm | yes, in the GGUF container, see 2.5 | its native arm |
+
+This table said `no` for llama.cpp NVFP4 until 2026-08-16. That was false at the
+recorded pin, and section 2.5 both re-derives it and re-derives the two
+not-comparable verdicts of section 2.4 that leaned on it.
 
 ### 2.1 vLLM at our pin has no GGUF path at all
 
@@ -96,8 +100,9 @@ The alias table is real and is exactly two entries wide. `python/sglang/srt/mode
 
 `qwen3_5` misses because `gguf.MODEL_ARCH_NAMES` spells the family `qwen35`,
 which is the same missing underscore the `qwen3_moe` entry exists to paper over.
-**Adding the alias would not make it load.** Three further blockers, each
-independent:
+**Adding the alias would not make it load.** Three further blockers. The first
+is its own class. The second and third are one class over different parameters
+of the same module, which the inverted wording of blocker 3 previously obscured:
 
 1. `GGUFConfig.get_quant_method` (`layers/quantization/gguf.py:106-124`) handles
    `LinearBase`, `VocabParallelEmbedding` and `FusedMoE`, and returns `None` for
@@ -107,16 +112,69 @@ independent:
    `_get_gguf_weights_map` (`loader.py:2149-2153`) an unresolvable name yields
    `None`, producing colliding `None.weight` keys, and there is no guard.
 3. `conv1d` is declared a `ColumnParallelLinear` and reshaped to three dimensions
-   (`models/qwen3_5.py:195-204`). Being a `LinearBase` subclass it would receive a
-   `GGUFLinearMethod` and be **silently wrong** rather than refused, which is the
-   worst of the three failure modes.
+   (`models/qwen3_5.py:195-204`), and its weight loader is replaced with
+   `mamba_v2_sharded_weight_loader` (`:236-247`), which is written against the HF
+   safetensors layout. It has no GGUF counterpart, exactly as in blocker 2.
+
+**Blocker 3 was recorded with its polarity inverted until 2026-08-16**, and the
+correction matters because the inverted version was the stated reason a load
+report could not be trusted. The old wording said `conv1d`, being a `LinearBase`
+subclass, would receive a `GGUFLinearMethod` and be silently wrong rather than
+refused. Its own citation refutes it. At `f63458b5`:
+
+- `models/qwen3_5.py:199` passes `quant_config=None` to that
+  `ColumnParallelLinear`, inside the very range `:195-204` the claim cited.
+- `layers/linear.py:176-179` takes the `quant_config is None` branch, assigns
+  `UnquantizedLinearMethod()`, and never calls `quant_config.get_quant_method`.
+  The `else` at `:180-181` is the only call site and it is not taken.
+- `ColumnParallelLinear.__init__` forwards the argument unchanged to that
+  constructor (`layers/linear.py:331-333`).
+- Nothing re-wraps the module afterwards. The only other `conv1d` references in
+  the file are `qwen3_5.py:204,237,260-261,272`, and none touches `quant_method`.
+
+`GGUFConfig.get_quant_method` is therefore never reached for `conv1d`, no
+`GGUFLinearMethod` is ever attached, and the module stays a dense layer of the
+model dtype. If it failed it would fail loudly on the weight, not quietly on the
+method. The withdrawn wording also reached `.agents/issue-index.md:266`, which is
+append-only and cannot carry the correction, see the note under `## Now`.
+
+**Where the silence actually lives is a property of the load path, and it is not
+yet attributed to a named parameter.** Three facts about `f63458b5` are
+established here from source, and one question is left open rather than answered
+by assertion.
+
+Established:
+
+- `_get_gguf_weights_map` writes `gguf_to_hf_name_map[f"{gguf_name}.{suffix}"]`
+  with no check that `gguf_name` resolved (`model_loader/loader.py:2149-2153`).
+  Every parameter the name map cannot resolve therefore collapses onto the single
+  literal key `None.weight`, and all but the last one are lost from the map.
+- `gguf_quant_weights_iterator` is driven by the tensors present in the file and
+  gates each one on `tensor_name in gguf_to_hf_name_map`
+  (`model_loader/weight_utils.py:1253,1280` and `:1289,1321`). There is no `else`
+  and no counter, so an unmapped tensor is skipped without a message.
+- `Qwen3_5ForCausalLM.load_weights` accumulates `loaded_params` but never
+  compares it against `params_dict` (`models/qwen3_5.py:1359-1412`), and an
+  unmatched name only reaches `logger.warning` at `:1405`. A parameter that is
+  never yielded keeps its constructor value and nothing refuses the load.
+
+Open, and owed to whoever adds the alias: **which** Qwen3.5 parameters actually
+fail to resolve. That depends on `gguf.MODEL_ARCH_NAMES` and
+`gguf.get_tensor_name_map`, and on a `transformers` able to build the meta model
+at `loader.py:2146`. This project pins neither package, so the question cannot be
+settled from the SGLang tree alone. The experiment is small and named:
+instrument `loader.py:2152` to count `gguf_name is None`, print the collision set,
+and diff `loaded_params` against `params_dict` after the load. Until that runs,
+this spec claims the load path **cannot detect** an unloaded parameter, and
+claims nothing about which parameter that is.
 
 There is also an earlier gate at
 `utils/hf_transformers/config.py:237-239`, which with a newer `transformers`
 passes and lets the failure land on `loader.py:2142`.
 
 Consequence: **the ours-versus-SGLang GGUF pair is recorded not-comparable**, and
-the SGLang-versus-llama.cpp pair with it.
+the SGLang-versus-llama.cpp pair with it. Neither verdict rested on blocker 3's
+polarity. The alias gate at `loader.py:2141-2142` alone is sufficient for both.
 
 ### 2.3 llama.cpp is the only comparator that runs the GGUF arm
 
@@ -142,27 +200,184 @@ Each cell states the common denominator, or says not-comparable and why.
 | ours vs SGLang | NVFP4 `a767244d` | **comparable after [#821](https://github.com/mudler/vllm.cpp/issues/821) and a load preflight.** |
 | ours vs llama.cpp | Q4_K_M `fe1e2a23` | **comparable after [#821](https://github.com/mudler/vllm.cpp/issues/821).** The one pair where GGUF is the shared native arm. |
 | vLLM vs SGLang | bf16 and NVFP4 | comparable in principle, and informational here. Neither is our engine, so no gate turns on it. |
-| vLLM vs llama.cpp | none | **NOT COMPARABLE.** vLLM has no in-tree GGUF and llama.cpp has no NVFP4. bf16 GGUF would be a conversion on one side and is non-binding under the umbrella spike's fallback rule. |
-| SGLang vs llama.cpp | none | **NOT COMPARABLE.** Same reason, plus section 2.2. |
+| vLLM vs llama.cpp | none | **NOT COMPARABLE**, on the container, not the quantization. Both engines implement NVFP4. Neither can read the other's container, and every candidate shared artifact needs a conversion on one side. Re-derived in section 2.5. |
+| SGLang vs llama.cpp | none | **NOT COMPARABLE.** The same container disjunction, plus section 2.2 for the GGUF direction. Re-derived in section 2.5. |
+
+### 2.5 llama.cpp has NVFP4, and the two verdicts survive on a different reason
+
+The table above and both not-comparable cells previously rested in part on
+"llama.cpp has no NVFP4". At `237ad9b96` that is false, and section 2's own
+preamble claims every cell was established from source at the recorded pin, so
+the error falsified the section's stated method on the engine this campaign's
+fourth arm is. The verdicts are therefore re-derived from scratch below rather
+than patched.
+
+**What is present at the pin.** NVFP4 is a first-class ggml type, not a
+scaffold:
+
+- `GGML_TYPE_NVFP4 = 40` (`ggml/include/ggml.h:430`) and
+  `GGML_FTYPE_MOSTLY_NVFP4 = 26` (`:474`).
+- `LLAMA_FTYPE_MOSTLY_NVFP4` in the loader (`src/llama-model-loader.cpp:46,763`).
+- Type traits with `blck_size = QK_NVFP4`, `type_size = sizeof(block_nvfp4)`,
+  `dequantize_row_nvfp4` and `quantize_row_nvfp4_ref`
+  (`ggml/src/ggml.c:741-747`), the ftype mapping at `:1414`, and `quantize_nvfp4`
+  at `:8012`.
+- CUDA dispatch at `ggml/src/ggml-cuda/ggml-cuda.cu:1695,1717,1726,5583`, an MMQ
+  instantiation at `ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu`,
+  and a Vulkan dequant shader at
+  `ggml/src/ggml-vulkan/vulkan-shaders/dequant_nvfp4.comp`.
+- A 493-line native W4A4 FP4-MMA GEMM whose header names **Blackwell sm_121a
+  (GB10)**, this campaign's exact card, and states that it consumes the same
+  e2m1 nibbles and e4m3 scale bytes from the GGUF `block_nvfp4`
+  (`ggml/src/ggml-cuda/fp4-gemm.cu:1-16`, `fp4-gemm.cuh:5-37`).
+- A Marlin-style W4A16 grouped MoE prefill GEMM over the same NVFP4 weights
+  (`ggml/src/ggml-cuda/w4a16-gemm.cuh:5-25`).
+
+**Upstream or fork.** Our llama.cpp pin is a local fork, as
+[`../oracles/llama-cpp.md`](../oracles/llama-cpp.md) records, so the split is
+stated rather than assumed. The type, the loader ftype, the CPU quants, the CUDA
+MMQ instantiation and the ModelOpt-to-GGUF converter are **upstream**: they are
+present in `ggml-org/llama.cpp` `master` at `0d9ceae1e` as well
+(`GGML_TYPE_NVFP4 = 40` at the same `ggml/include/ggml.h:430`, and
+`conversion/base.py:699` there). The two GB10 prefill GEMMs, patches 0034 and
+0035, are **fork-local** at our pin. Upstream llama.cpp already runs NVFP4 on
+CUDA without them.
+
+**Why the verdicts still hold: the container, not the quantization.** llama.cpp
+reads GGUF and only GGUF. vLLM at `555967922` reads safetensors and has no GGUF
+reader at all, per section 2.1. So for every quantization, including NVFP4, there
+is no single artifact both engines can open. The barrier is the container
+format, and the previous wording never made that argument. SGLang is the same
+disjunction from the other side: it does have a GGUF loader, but section 2.2
+shows that loader cannot reach `qwen3_5`, and on the NVFP4 side it reads
+safetensors while llama.cpp reads `block_nvfp4`.
+
+**Could an `us` / vLLM / llama.cpp NVFP4 comparison exist?** The honest answer is
+that it is closer than the old wording implied and is still not available, for
+two reasons of different weight.
+
+The conversion side is unusually favourable, and this is worth recording because
+it is not the ordinary re-quantization case. llama.cpp's converter does not
+re-quantize an NVFP4 checkpoint. `_nvfp4_pack` (`conversion/base.py:654-676`)
+**repacks** ModelOpt and compressed-tensors NVFP4 tensors into the ggml
+super-block layout: it unpacks the same nibble-packed e2m1 codes (`:664-665,669`)
+and regroups four 16-element blocks into one 36-byte super-block (`:671-675`).
+The per-tensor `scale2` and `input_scale` are written out as separate tensors and
+applied at inference (`:657`, `:685-686`). So a conversion-equivalence proof here
+is a **layout** proof over identical code points, not a numerical-agreement
+argument across two independent quantizers, which is what the umbrella spike's
+fallback rule was written for.
+
+Two things stop it from being free, and both are named rather than waved past:
+
+1. `_nvfp4_pack` preserves the original e4m3 scale bits "as UE4M3 (strip sign
+   bit)" (`conversion/base.py:656,668`). That is lossless only if every scale is
+   non-negative. Nothing in the pinned tree proves that, so a conversion
+   equivalence proof owes an assertion over the actual checkpoint that no scale
+   byte has its sign bit set.
+2. `Qwen3_5Model._transform_nvfp4_weight` (`conversion/qwen.py:378-386`)
+   **permutes** five GDN projections before repacking, to reorder value heads
+   inside key-head groups. It is a permutation of the same codes, so it is
+   value-preserving, but the proof has to cover it explicitly rather than assert
+   the file is a byte-for-byte carry.
+
+The blocking reason is simpler and is on our side. Our NVFP4 arm for this
+checkpoint is owed under [#821](https://github.com/mudler/vllm.cpp/issues/821),
+so no three-way NVFP4 cell can run today regardless of the conversion argument.
+When #821 lands, the `ours vs llama.cpp` NVFP4 pair becomes reachable on a
+converted GGUF and is `converted-nonbinding` under the umbrella rule until the
+two proofs above are produced, at which point it is worth arguing for binding
+status in its own change. The `vLLM vs llama.cpp` cell does not benefit at all,
+because it needs vLLM to read a GGUF and vLLM cannot.
+
+**Recorded consequence.** Both cells stay NOT COMPARABLE. The reason on the
+record is now the container disjunction plus a conversion this spec does not
+accept as binding, and no longer a false statement about llama.cpp's
+capabilities.
+
+### 2.6 The NVFP4 column presumes a revision it has not inspected
+
+The `unsloth/Qwen3.8-27B-NVFP4` revision `a767244d` and
+`unsloth/Qwen3.8-27B-GGUF` revision `fe1e2a23` appear in no other file in this
+repository. Nothing here has read either one. The NVFP4 column of section 2 is
+built from the four engines' source, and the assumption that `a767244d` actually
+carries NVFP4 weights rests on the repository name alone.
+
+That assumption has already failed once for this vendor.
+`docs/BENCHMARKS.md:50` records the same `unsloth` repository family silently
+re-quantized: revision `ccdaab7e` of `Qwen3.6-27B-NVFP4` is "the same repo name
+re-quantized to FP8 W8A8 throughout, not NVFP4", which is why that gate is
+revision-pinned rather than name-pinned.
+
+Section 10's first item, the sorted `sha256sum` manifest for every resolved file
+of all three artifact families, is what discharges this. It is a precondition of
+quoting any number in this campaign, and the resolved quantization from item 2
+has to be checked against the name before a cell is filled in.
 
 ## 3. Drafted or raw, declared per arm
 
-SGLang published **38.28 tok/s decode on DGX Spark** for Qwen3.8-27B. Confirmed
-as a single-source project claim on X, whose own wording is "our NVFP4 plus
-DSpark", so it is a **speculative-decoding** result. An NVIDIA developer-forum
-thread reports 34 to 38 tok/s for the same SGLang plus NVFP4 plus DSpark recipe.
+SGLang published **38.28 tok/s decode on DGX Spark** for Qwen3.8-27B. Its
+wording is "our NVFP4 plus DSpark", so it is a **speculative-decoding** result.
+
+**Provenance, so the number is retrievable rather than remembered.**
+
+| Field | Value |
+|---|---|
+| Primary source | `@sgl_project` on X, post `2088281320422322413`, <https://x.com/sgl_project/status/2088281320422322413> |
+| Date | 2026-08-14 UTC. Derived from the status ID, because the post itself returned HTTP 402 to this session and was read only through a search index. |
+| Quoted wording | "Day-0 support is live in SGLang: 206.1 tok/s decode on a single RTX 5090, with our NVFP4 plus DSpark, 38.28 tok/s decode on DGX Spark" |
+| Corroborating source | NVIDIA Developer Forums thread 380257, "Qwen3.8-27B at 34-38 tok/s on DGX Spark, open-source one-command setup (SGLang + NVFP4 + DSpark)", <https://forums.developer.nvidia.com/t/qwen3-8-27b-at-34-38-tok-s-on-dgx-spark-open-source-one-command-setup-sglang-nvfp4-dspark/380257> |
+| Corroborating date and handle | 2026-08-15, `basbunarhasan`. Retrieved and read on 2026-08-16. |
+| What that thread says | "~34 tok/s real-world, 38.0 average on eval-style workloads, 46.7 peak (GSM8K-style)", and a reply from `helge` reporting 32.8 tok/s on code against 19.5 tok/s on multilingual mixed prose |
+
+Note that the corroborating thread's own headline figure is 38.0 on eval-style
+workloads, not 38.28, and that its highest and lowest quoted values differ by
+more than a factor of two on content alone.
 
 **UNVERIFIED and not to be repeated as fact until sourced:** the drafter's
-parameter count, whether TTFT is excluded from that figure, the batch size, and
-the reported 16.6 to 46.7 tok/s spread of independent reproductions. None of those
-appear in any artifact this project holds. This project's own record contains
-**zero** occurrences of the string `38.28`, which is exactly why it is written
-down here with its provenance attached rather than carried forward as a target.
+parameter count, whether TTFT is excluded from that figure, and the batch size.
+The 46.7 tok/s upper end and the 19.5 tok/s low are the forum thread's, on
+declared-but-unspecified workloads, and neither is a reproduction of the 38.28
+configuration. None of this appears in any artifact this project holds. Outside
+this section the project's own record contains **zero** occurrences of the string
+`38.28`, which is exactly why it is written down here with its provenance
+attached rather than carried forward as a target.
 
 Our binding quantized-27B cell is 10.756 against vLLM's 11.250 at c1
 (`docs/BENCHMARKS.md:96-97`, Qwen3.6-27B NVFP4). That is a **raw** decode number.
 Dividing 38.28 by it compares a drafted arm against a raw one and is refused by
 this spec.
+
+**And that contrast on its own leaves a reader with the wrong picture, so the
+measured head-to-head belongs here too.** A reader who meets "SGLang published
+38.28" beside "ours is 10.756", with drafted-versus-raw as the only objection,
+can leave believing SGLang is simply the faster engine. This project has
+measured the two engines directly, and it is not what the measurement says.
+
+On 2026-07-28, under `CLAIM-SGLANG-PERF-BENCH`
+([sglang-matrix.md](../sglang-matrix.md), "Perf oracle results"), SGLang v0.5.15
+and ours ran **byte-identical NVFP4 weights** on the same idle GB10 under one
+lock, driving the identical deterministic corpus, both emitting exactly 80 by 128
+output tokens with zero errors, three repetitions each:
+
+| Axis | c16 SGLang | c16 ours | c16 | c8 SGLang | c8 ours | c8 |
+|---|---:|---:|---|---:|---:|---|
+| Output throughput tok/s | 40.8 | **90.3** | **2.21x ours** | 40.8 | **58.8** | **1.44x ours** |
+| Mean TTFT ms | 33425 | **2980** | **11.2x ours** | 11289 | **1775** | **6.4x ours** |
+| Mean TPOT ms | **104.0** | 154.4 | 0.67x, our gap | **104.0** | 122.9 | 0.85x, our gap |
+| Mean ITL ms | **105.6** | 154.4 | 0.68x, our gap | **105.7** | 122.9 | 0.86x, our gap |
+
+Both directions are load-bearing. Ours wins aggregate throughput by 2.21x at c16
+and 1.44x at c8 and wins TTFT by 6x to 12x. **SGLang wins the steady-state
+per-token decode-latency axis**, and that TPOT and ITL deficit is a reproduced
+open gap recorded as such, not explained away.
+
+**This is not this campaign's subject and is not a rebuttal of 38.28.** It is
+Qwen3.6-27B-NVFP4 at `890bdef7`, cache-neutral, c8 and c16 only, both arms
+**raw**. It says nothing about Qwen3.8-27B, nothing about c1, and nothing about a
+drafted arm. It is placed here for one purpose: a published single number from
+one engine is not the state of the comparison, and this project's own direct
+measurement of the same two engines is the nearest thing it holds to one.
 
 **Rule.** Every arm declares `drafted` or `raw` in its manifest before it runs. A
 cell whose two arms disagree on that field is void, not a ratio. We hold the
@@ -170,15 +385,49 @@ technique on our side: `SPEC-DFLASH` is `DONE`, and `SPEC-DSPARK` is `ACTIVE` wi
 W1 through W8 landed and GPU-gated
 ([dspark-spec-decode.md](dspark-spec-decode.md)).
 
-**The 38.28 configuration is not reachable at our SGLang pin.** v0.5.15
-`f63458b5` ships DFlash, EAGLE, ngram and frozen-KV MTP under
-`python/sglang/srt/speculative/`, and a repo-wide search for `dspark` returns
-nothing. The announcement says Day-0 support, so that code postdates the pin.
-A drafted SGLang arm therefore requires **advancing the SGLang oracle pin first**,
-under `.agents/oracles/sglang.md`, with every affected row reconciled. It is not
-a substitution made inside a measurement run.
+**No DSpark speculator ships in `python/sglang/srt/speculative/` at our pin.**
+`f63458b5` carries DFlash, EAGLE, ngram and frozen-KV MTP there, and nothing
+named `dspark`. That is the claim, and it is the same one
+[`../oracles/sglang.md`](../oracles/sglang.md) makes.
 
-Until that pin moves, the SGLang arms in this campaign are `raw`, and the only
+**Two wider claims that stood here until 2026-08-16 are withdrawn**, because
+neither survives a check against the pin. The same overreach reached
+`.agents/issue-index.md:266` ("DSpark does not exist at our SGLang pin") and the
+body of commit `17187f134`, neither of which can carry a correction, see the
+note under `## Now`.
+
+- "A repo-wide search for `dspark` returns nothing" is false.
+  `git grep -il dspark f63458b5` returns `docs_new/index.mdx`, tracked at the
+  pin, with four hits at `:86,107,108,127` linking
+  `lmsys.org/blog/2026-07-06-dspark-sglang/` and naming "DSpark in SGLang:
+  Speculative Decoding with Confidence-Driven, Variable-Length Verification".
+- "The announcement says Day-0 support, so that code postdates the pin" is
+  contradicted by the pin's own documents. That blog post is dated 2026-07-06,
+  three weeks **before** the 2026-07-27 pin. Day-0 support for the Qwen3.8-27B
+  checkpoint is not the same event as DSpark's arrival, and this spec conflated
+  them.
+- "Not in `speculative/`" is also not the same as "not reachable". `f63458b5`
+  ships a plugin registration API for out-of-tree speculative algorithms:
+  `SpeculativeAlgorithm.register` (`python/sglang/srt/speculative/spec_info.py:60-70`)
+  over the `CustomSpecAlgo` storage in `speculative/spec_registry.py:24-56,189-222`,
+  whose own docstring says plugins register through that classmethod. An
+  algorithm can therefore be present at runtime while absent from the directory
+  listing.
+
+**The operational conclusion is unchanged, and now rests on an argument rather
+than on an absence.** A drafted SGLang arm needs a configuration this project
+can pin, name and re-run. Three things are missing for that, independently of
+where the code lives. No `dspark` implementation is in the pinned tree. If it
+arrives as a plugin then the plugin is a second unpinned upstream needing its own
+`.agents/oracles/` record, under the same rule that refuses `vllm-gguf-plugin` in
+section 2.1. And the pinned v0.5.15 image this project has actually run
+(`lmsysorg/sglang:v0.5.15-cu130@sha256:d0a667e`) is what section 5.2 measured
+gateability on. Reaching the published configuration therefore means
+**advancing the SGLang oracle pin, or pinning a plugin, as its own reconciled
+change**, with every affected row reconciled first. It is not a substitution made
+inside a measurement run.
+
+Until that happens, the SGLang arms in this campaign are `raw`, and the only
 honest statement about 38.28 is that it belongs to a configuration we have not
 pinned.
 
@@ -237,6 +486,9 @@ is derived from an incomplete request set.
 **New state: `PARTIAL`, not `DONE` and not still `BLOCKED`.** The named blocker is
 discharged and partial evidence exists. What is still missing, named:
 
+- The P2 exact-equivalence classification of the image, the model and the GPU,
+  which the sibling spike's own dependency table carries and which its
+  reconciliation addendum lists first among the residuals.
 - The c1, c2 and c4 points. Only c8 and c16 ran, and SGLang c1 measured about
   13.3 seconds per iteration, so three-repetition reproduction there is a real
   scheduling problem and not an oversight.
@@ -263,8 +515,11 @@ measurement. `docs/BENCHMARKS.md:485` still said "SGLang floor arms | Never ran"
 AGENTS.md sets the bar at "demonstrably builds and runs the model". The image
 needed no from-source build and it ran the model. **`gateable` moves to `yes`**,
 with `.agents/sglang-matrix.md` as the evidence path. This discharges the SGLang
-half of the three gateability debts [#647](https://github.com/mudler/vllm.cpp/issues/647)
-holds open.
+**third** of the three gateability debts
+[#647](https://github.com/mudler/vllm.cpp/issues/647) holds open. That row names
+them at `.agents/issue-index.md:193`, and they are `sglang`, `diffusers` and
+`tt-forge`, so two remain after this change. This spec said "half" until
+2026-08-16, which was simply a miscount.
 
 **The 2026-07-28 run predates the #931 fix and is not voided by it.** The
 keepalive fires only after 15 seconds with no output on a request
@@ -323,8 +578,10 @@ stated as a change.
 
 | Risk | Handling |
 |---|---|
-| The 38.28 figure is treated as a target and drives work | Its provenance is written down in section 3 with the unverified parts named. It is never a denominator. |
-| Someone adds the two-line SGLang GGUF alias and reports a load | Section 2.2 names three further blockers, one of which fails silently. A load is not evidence. |
+| The 38.28 figure is treated as a target and drives work | Section 3 gives it a retrievable citation, names the unverified parts, and puts this project's own measured head-to-head beside it. It is never a denominator. |
+| A reader takes 38.28 versus 10.756 as the state of the comparison | Section 3 records the direct measurement on byte-identical NVFP4 weights: ours 2.21x at c16 and 1.44x at c8 on output throughput, 6x to 12x on TTFT, with TPOT and ITL a reproduced gap in SGLang's favour. Its narrower scope is stated in the same paragraph. |
+| Someone adds the two-line SGLang GGUF alias and reports a load | Section 2.2 names three further blockers, and separately proves that the load path has **no completeness guard** at `loader.py:2149-2153`, `weight_utils.py:1280,1321` and `qwen3_5.py:1359-1412,1405`. A load that prints no error is not evidence that every parameter arrived. |
+| A false capability claim survives because it is quoted rather than checked | Two of them did, for weeks: llama.cpp NVFP4 recorded as absent, and `conv1d` recorded as silently wrong by a citation that says the opposite. Both are re-derived at the pin in sections 2.2 and 2.5, with the withdrawn wording kept visible. |
 | Someone installs `vllm-gguf-plugin` to create a vLLM GGUF cell | That plugin is unpinned and has no oracle record. Pinning it is a separate decision. |
 | The SGLang pin is advanced mid-campaign to reach DSpark | Forbidden here. Advancing it reconciles every affected row first. |
 | bf16 GGUF is substituted to manufacture a vLLM-versus-llama.cpp cell | A converted checkpoint is `converted-nonbinding` under the umbrella spike's fallback rule and cannot produce a ratio. |
@@ -350,9 +607,12 @@ them:
 ## 10. Evidence required before any number is quoted
 
 1. Sorted `sha256sum` manifest for every resolved file of all three Qwen3.8-27B
-   artifact families.
+   artifact families. This is also what discharges section 2.6: the NVFP4 column
+   of section 2 presumes `a767244d` is NVFP4 on the strength of its repository
+   name, and that presumption is not carried into any number.
 2. Startup log, resolved architecture, resolved quantization and weight-loader
-   warnings for every engine and every arm.
+   warnings for every engine and every arm. The resolved quantization is compared
+   against the artifact name before a cell is filled in, per section 2.6.
 3. Four-way tokenizer agreement on every corpus prompt, with stored token IDs and
    hashes.
 4. Native output IDs per engine, never a detokenize-and-retokenize round trip.
@@ -380,6 +640,28 @@ the whole deliverable. Nothing is measured. `BACKEND-GATE-CUDA-SGLANG` moves
 evidence exists. `BACKEND-GATE-CUDA-LLAMACPP` is added `INVENTORIED` with no run.
 The SGLang oracle moves to `gateable = yes`.
 
+**Corrected 2026-08-16, after a fresh review, before any measurement.** Four
+source facts this spec asserted were re-derived at the pins and three of them
+were wrong: llama.cpp does have NVFP4 at `237ad9b96` (section 2.5), SGLang's
+`conv1d` is not silently quantized and the polarity was inverted (section 2.2),
+and `dspark` does appear at `f63458b5`, in the pin's own documents, dated before
+the pin (section 3). The two not-comparable verdicts are re-derived and survive
+on the container disjunction. Sections 2.6 and 3 add the artifact-name caveat,
+the citation for 38.28, and this project's own measured SGLang head-to-head.
+
+**Two carriers of the withdrawn wording cannot be repaired in place, and that is
+recorded rather than worked around.** `.agents/issue-index.md:266` still says
+that `conv1d` "is SILENTLY WRONG rather than refused" and that "DSpark does not
+exist at our SGLang pin", and commit `17187f134`'s body says the same. Neither
+can be corrected where it sits. That index is append-only by policy and a landed
+row is never edited, and `scripts/check-agent-record.py:1439` additionally
+refuses a second row for an issue already listed, because under `merge=union` a
+duplicate number is exactly what two branches appending the same issue look
+like. A landed commit body is immutable. So the index has no mechanism for
+correcting a row once it lands, and this spec is the correction of record for
+both, which is what the protocol means by history being git and the spec.
+Anyone reading that row should read sections 2.2 and 3 here before quoting it.
+
 ## Owed
 
 - [#979](https://github.com/mudler/vllm.cpp/issues/979) owns this campaign and is
@@ -391,5 +673,15 @@ The SGLang oracle moves to `gateable = yes`.
   re-measure on a binary carrying the #931 fix.
 - The SGLang token-ID correctness cross-check, `SGLANG-ORACLE-CORRECT`, is
   `INVENTORIED` in [sglang-matrix.md](../sglang-matrix.md).
-- Advancing the SGLang pin past v0.5.15 to reach DSpark, if a drafted SGLang arm
+- Advancing the SGLang pin past v0.5.15 to reach DSpark, or pinning it as a
+  plugin upstream with its own `.agents/oracles/` record, if a drafted SGLang arm
   is ever wanted. Unowned today and deliberately not started here.
+- Which Qwen3.5 parameters actually fail to resolve in SGLang's GGUF name map
+  (section 2.2). Unowned, and only answerable by instrumenting `loader.py:2152`
+  against a pinned `gguf` and `transformers`, neither of which this project pins.
+  Recorded as an open question rather than asserted.
+- A conversion-equivalence proof for an `ours vs llama.cpp` NVFP4 cell, blocked
+  behind [#821](https://github.com/mudler/vllm.cpp/issues/821) and owing the two
+  assertions named in section 2.5: no e4m3 scale byte with its sign bit set, and
+  the GDN head permutation at `conversion/qwen.py:378-386` shown to be a
+  permutation of the same codes.
